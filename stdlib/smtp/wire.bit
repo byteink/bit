@@ -1,0 +1,204 @@
+// Bit standard library — smtp module: the byte stream and the command/reply
+// framing on top of it (#3967).
+//
+// `Stream` exists so the rest of the module never asks whether it is talking
+// cleartext or TLS. STARTTLS swaps one implementation for another inside a live
+// `Client`; every command path above is unchanged, and — the point — `Client`'s
+// `secure` flag is set by that swap rather than tracked in parallel with it, so
+// there is no state for an AUTH guard to disagree with.
+
+import { indexOfFrom, join } from "std/strings"
+import { Conn as TcpConn } from "std/net"
+import { TlsConn } from "std/tls"
+
+// The transport under an SMTP session: exactly the three things the protocol
+// needs from a byte stream.
+export interface Stream {
+  send(s: string): ()!,
+  recv(max: int): string!,
+  shut(),
+}
+
+// A cleartext TCP stream. Everything a server says over one is public, and
+// `Client.secure` is false while it is in place.
+class plainStream {
+  c: TcpConn
+  export send(s: string): ()! { this.c.write(s)? }
+  export recv(max: int): string! { return this.c.read(max) }
+  export shut() { this.c.close() }
+}
+
+// A TLS stream — an implicit-TLS dial or the result of STARTTLS. `TlsConn`
+// speaks bytes, so the two conversions here are the whole difference.
+class tlsStream {
+  c: TlsConn
+  export send(s: string): ()! { this.c.write([]byte(s))? }
+  export recv(max: int): string! { return string(this.c.read(max)?) }
+  export shut() { this.c.close() }
+}
+
+// The most bytes one reply may occupy. A server that has not terminated a
+// reply by here is not one worth waiting on, and the bound is what keeps
+// `readReply` provably finite against a peer that streams continuation lines
+// forever.
+const maxReplyBytes: int = 65536
+
+// The longest single command this module will transmit. Commands are built
+// here, never by the caller; the check is a guard against a future path that
+// forgets, not against the server.
+const maxCommandBytes: int = maxLineOctets
+
+// One SMTP reply: the three-digit code and every line's text, joined by "\n".
+// `lines` is kept because the EHLO capability list is a reply body and nothing
+// else would be able to read it.
+class Reply {
+  code: int,
+  lines: []string,
+}
+
+// A buffered line reader over a `Stream`. SMTP is line-framed and a `recv` cuts
+// wherever the network did, so the leftover of one reply is the beginning of
+// the next; a reader that dropped it would lose a pipelined server's greeting.
+class Wire {
+  s: Stream
+  buf: string
+
+  // The next CRLF-terminated line, without its terminator. Fails on a peer that
+  // closes mid-line and on a line over `maxReplyBytes` — an unterminated stream
+  // must not become an unbounded buffer.
+  readLine(): string! {
+    let guard = 0
+    while (guard < maxReplyBytes) {
+      guard = guard + 1
+      let at = indexOf(this.buf, "\r\n")
+      if (at >= 0) {
+        let line = this.buf[0:at]
+        this.buf = this.buf[at + 2:]
+        return line
+      }
+      if (len(this.buf) > maxReplyBytes) {
+        fail newError("smtp: reply line exceeded ${maxReplyBytes} bytes")
+      }
+      let chunk = this.s.recv(4096)?
+      if (len(chunk) == 0) {
+        fail newError("smtp: connection closed mid-reply")
+      }
+      this.buf = this.buf + chunk
+    }
+    fail newError("smtp: reply did not terminate")
+  }
+
+  // A full reply, continuation lines included. RFC 5321 §4.2: `250-text` is a
+  // continuation, `250 text` is the last line, and every line of one reply
+  // carries the same code — a server that changes it mid-reply is refused
+  // rather than believed.
+  readReply(): Reply! {
+    let lines = []string(0)
+    let code = 0
+    let guard = 0
+    while (guard < 256) {
+      guard = guard + 1
+      let line = this.readLine()?
+      let (thisCode, more) = parseReplyLine(line)?
+      if (code != 0 && thisCode != code) {
+        fail newError("smtp: reply changed code from ${code} to ${thisCode}")
+      }
+      code = thisCode
+      lines = append(lines, line[4:])
+      if (!more) {
+        return Reply{ code: code, lines: lines }
+      }
+    }
+    fail newError("smtp: reply had more than 256 lines")
+  }
+
+  // Send `cmd` as one CRLF-terminated line and read the reply it draws.
+  command(cmd: string): Reply! {
+    this.sendLine(cmd)?
+    return this.readReply()?
+  }
+
+  // Send one command line. Refuses a CR or LF inside `cmd` and a line over the
+  // octet ceiling: a command is assembled from validated pieces upstream, so
+  // either would mean a bug here rather than hostile input, and a bug that puts
+  // an attacker-shaped line on the wire is the one worth failing loudly.
+  sendLine(cmd: string): ()! {
+    if (hasControlByte(cmd)) {
+      fail newError("smtp: refusing to send a command containing CR, LF or NUL")
+    }
+    if (len(cmd) > maxCommandBytes) {
+      fail newError("smtp: command of ${len(cmd)} octets exceeds ${maxCommandBytes}")
+    }
+    this.s.send(cmd + "\r\n")?
+  }
+}
+
+// The code and the continuation flag of one reply line. RFC 5321 §4.2.1: three
+// digits, then `-` (more lines) or a space (last line).
+fn parseReplyLine(line: string): (int, bool)! {
+  if (len(line) < 4) {
+    fail newError("smtp: reply line '${line}' is shorter than a status code")
+  }
+  let code = 0
+  let i = 0
+  while (i < 3) {
+    let c = line[i]
+    if (c < u8(48) || c > u8(57)) {
+      fail newError("smtp: reply line '${line}' does not start with three digits")
+    }
+    code = code * 10 + int(c) - 48
+    i = i + 1
+  }
+  if (line[3] == u8(45)) {
+    return (code, true)
+  }
+  if (line[3] == u8(32)) {
+    return (code, false)
+  }
+  fail newError("smtp: reply line '${line}' has no separator after the code")
+}
+
+// Fail unless `r` carries one of the two codes the caller expects. Every
+// command site goes through this rather than testing `r.code` itself, so a
+// server's own text reaches the error instead of being replaced by a generic
+// one — an authentication refusal is only diagnosable from what the server
+// said.
+fn expect(what: string, r: Reply, want: int, alsoWant: int): ()! {
+  if (r.code == want || r.code == alsoWant) {
+    return
+  }
+  fail newError("smtp: ${what} got ${r.code}: ${join(r.lines, " ")}")
+}
+
+// Transmit `msg` as a DATA payload: dot-stuffed, CRLF-normalised, and closed by
+// the `.` line (RFC 5321 §4.5.2). Dot-stuffing is here rather than in the
+// message renderer because it is a property of the transmission, not of the
+// message: the same rendered message is byte-identical in a file and stuffed on
+// the wire.
+fn writeData(w: Wire, msg: string): ()! {
+  let body = toCrlf(msg)
+  let out = ""
+  let at = 0
+  let guard = 0
+  while (at < len(body) && guard <= len(body)) {
+    guard = guard + 1
+    let nl = indexOfFrom(body, "\r\n", at)
+    if (nl < 0) {
+      out = out + stuff(body[at:]) + "\r\n"
+      at = len(body) + 1
+    } else {
+      out = out + stuff(body[at:nl]) + "\r\n"
+      at = nl + 2
+    }
+  }
+  w.s.send(out + ".\r\n")?
+}
+
+// One body line, with the leading `.` doubled so it cannot be read as the
+// end-of-data marker.
+fn stuff(line: string): string {
+  if (len(line) > 0 && line[0] == u8(46)) {
+    return "." + line
+  }
+  return line
+}

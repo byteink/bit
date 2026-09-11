@@ -1,0 +1,235 @@
+// Bit standard library — smtp module: header values, encoded words and
+// envelope addresses (#3967).
+//
+// Header injection is the vulnerability this file exists to close. A CR or LF
+// inside a caller-supplied subject, display name or recipient closes the
+// header the caller was given and opens one of its own — a `Bcc` to an address
+// the sender never approved is the classic payload. Every value that reaches a
+// header goes through `checkHeaderValue` and is REJECTED, never stripped: a
+// stripped value silently sends different mail than the caller asked for, and
+// a rewritten input hides the attack from the log that would have shown it.
+//
+// The 998-octet line ceiling (RFC 5321 §4.5.3.1.6) is the other rule. A header
+// is never emitted over it: a value that does not fit is encoded as RFC 2047
+// base64 words, one per line, which bounds the line by construction instead of
+// by hope. `checkLines` (wire.bit) is the backstop that refuses to transmit a
+// longer line whatever produced it.
+
+import { indexOf, lastIndexOf } from "std/strings"
+import { encodeBase64 } from "std/crypto"
+
+// The longest line this module may put on the wire, CRLF excluded
+// (RFC 5321 §4.5.3.1.6). A server may refuse anything longer.
+const maxLineOctets: int = 998
+
+// Where a folded header line wants to break, well under `maxLineOctets` so a
+// reader (and a relay that re-folds) has room. RFC 5322 §2.1.1's "recommended"
+// 78.
+const foldTarget: int = 78
+
+// Raw input bytes per RFC 2047 word. 45 bytes encode to 60 base64 characters;
+// with the 10-byte `=?UTF-8?B?` prefix, the 2-byte suffix and a leading fold
+// space that is 73 octets, inside `foldTarget`.
+const encodedWordRaw: int = 45
+
+// Whether `v` carries a byte no header value may: CR, LF or NUL. The first two
+// are the injection vector; NUL truncates the field in a C-string relay.
+fn hasControlByte(v: string): bool {
+  let i = 0
+  while (i < len(v)) {
+    let c = v[i]
+    if (c == u8(13) || c == u8(10) || c == u8(0)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Reject `value` outright when it carries a CR, LF or NUL. `name` is the field
+// it was destined for, so the message names the caller's own input rather than
+// a position in a rendered blob. Called before a single byte of the message is
+// built, which is what makes "rejected before anything was sent" true.
+fn checkHeaderValue(name: string, value: string): ()! {
+  if (hasControlByte(value)) {
+    fail newError("smtp: header ${name} contains a CR, LF or NUL byte")
+  }
+}
+
+// Whether `s` is entirely printable US-ASCII (plus tab): the condition for
+// putting it in a header, or a body line, as-is. Anything else is encoded.
+fn isPrintableAscii(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c >= u8(127)) {
+      return false
+    }
+    if (c < u8(32) && c != u8(9)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The end of a chunk of at most `want` bytes starting at `at`, moved back off a
+// UTF-8 continuation byte so a multi-byte rune is never split across two
+// encoded words (RFC 2047 §5 forbids it, and a split rune decodes to mojibake).
+fn chunkEnd(s: string, at: int, want: int): int {
+  let end = at + want
+  if (end >= len(s)) {
+    return len(s)
+  }
+  let guard = 0
+  while (guard < 4 && end > at + 1 && s[end] >= u8(128) && s[end] < u8(192)) {
+    guard = guard + 1
+    end = end - 1
+  }
+  return end
+}
+
+// `v` as one or more RFC 2047 base64 encoded words, folded one per line. Used
+// for any value that is not printable ASCII, and for any value too long to
+// fold at whitespace: both cases need a representation whose line length is a
+// function of the encoder rather than of the input.
+fn encodedWords(v: string): string {
+  let out = ""
+  let i = 0
+  let guard = 0
+  while (i < len(v) && guard <= len(v)) {
+    guard = guard + 1
+    let end = chunkEnd(v, i, encodedWordRaw)
+    let word = "=?UTF-8?B?" + encodeBase64([]byte(v[i:end])) + "?="
+    if (len(out) == 0) {
+      out = word
+    } else {
+      out = out + "\r\n " + word
+    }
+    i = end
+  }
+  return out
+}
+
+// Fold `v` at spaces so no produced line exceeds `foldTarget`, `first` being
+// the octets already on the opening line (the `Name: ` prefix). Returns the
+// folded value, or `("", false)` when a single unbreakable run is itself too
+// long — the caller then encodes instead, which always fits.
+fn foldAtSpaces(v: string, first: int): (string, bool) {
+  let out = ""
+  let line = first
+  let at = 0
+  let guard = 0
+  while (guard <= len(v)) {
+    guard = guard + 1
+    let sp = indexOf(v[at:], " ")
+    let end = len(v)
+    if (sp >= 0) {
+      end = at + sp
+    }
+    let (nextOut, nextLine, ok) = foldAppend(out, line, v[at:end], at == 0)
+    if (!ok) {
+      return ("", false)
+    }
+    out = nextOut
+    line = nextLine
+    if (sp < 0) {
+      return (out, true)
+    }
+    at = end + 1
+  }
+  return ("", false)
+}
+
+// Place one whitespace-delimited `word` on the folded output: continue the
+// current line when it still fits inside `foldTarget`, else break and indent by
+// one space (RFC 5322 §2.2.3 folding). Refuses a word that cannot fit on a line
+// of its own, which is what sends the caller to `encodedWords`.
+fn foldAppend(out: string, line: int, word: string, firstWord: bool): (string, int, bool) {
+  if (len(word) + 1 > maxLineOctets) {
+    return ("", 0, false)
+  }
+  if (firstWord) {
+    return (word, line + len(word), true)
+  }
+  if (line + 1 + len(word) <= foldTarget) {
+    return (out + " " + word, line + 1 + len(word), true)
+  }
+  return (out + "\r\n " + word, 1 + len(word), true)
+}
+
+// One rendered header field, CRLF-terminated and never over `maxLineOctets` on
+// any line. Rejects a CR/LF/NUL in `value` first — the check is here, on the
+// single funnel every field goes through, rather than repeated at each caller.
+fn renderHeader(name: string, value: string): string! {
+  checkHeaderValue(name, value)?
+  if (!isPrintableAscii(value)) {
+    return "${name}: ${encodedWords(value)}\r\n"
+  }
+  let (folded, ok) = foldAtSpaces(value, len(name) + 2)
+  if (!ok) {
+    return "${name}: ${encodedWords(value)}\r\n"
+  }
+  return "${name}: ${folded}\r\n"
+}
+
+// Whether `c` may appear in the addr-spec of an envelope address. Deliberately
+// narrower than RFC 5321's quoted-string grammar: this is what goes inside
+// `MAIL FROM:<...>`, so a space, an angle bracket, a comma, a semicolon, a
+// quote or a backslash would let a caller close the envelope and append a
+// command parameter. Rejecting them costs a handful of legal-but-exotic
+// addresses and closes the whole class.
+fn isAddressByte(c: u8): bool {
+  if (c <= u8(32) || c >= u8(127)) {
+    return false
+  }
+  if (c == u8(60) || c == u8(62) || c == u8(44) || c == u8(59)) {
+    return false
+  }
+  return c != u8(34) && c != u8(92)
+}
+
+// `domain` is a dot-separated run of non-empty labels of legal address bytes.
+// No empty label, no leading or trailing dot: `a@.com` and `a@b..c` are the
+// shapes a naive `indexOf("@")` split lets through.
+fn checkDomain(domain: string): ()! {
+  if (len(domain) == 0 || domain[0] == u8(46) || domain[len(domain) - 1] == u8(46)) {
+    fail newError("smtp: address domain '${domain}' is malformed")
+  }
+  let i = 0
+  while (i < len(domain)) {
+    if (!isAddressByte(domain[i])) {
+      fail newError("smtp: address domain '${domain}' has a forbidden byte")
+    }
+    if (i + 1 < len(domain) && domain[i] == u8(46) && domain[i + 1] == u8(46)) {
+      fail newError("smtp: address domain '${domain}' has an empty label")
+    }
+    i = i + 1
+  }
+}
+
+// Validate an envelope address before it is trusted: exactly one `@`, a
+// non-empty local part of legal bytes, a well-formed domain, and inside RFC
+// 5321 §4.5.3.1's 64/254 octet ceilings. `kind` names the field for the error.
+// The envelope is validated here, not by the caller, because the caller is
+// exactly who cannot be trusted with it.
+fn checkAddress(kind: string, email: string): ()! {
+  if (len(email) == 0 || len(email) > 254) {
+    fail newError("smtp: ${kind} address must be 1..254 octets, got ${len(email)}")
+  }
+  let at = indexOf(email, "@")
+  if (at <= 0 || at != lastIndexOf(email, "@")) {
+    fail newError("smtp: ${kind} address '${email}' needs exactly one @ with a local part")
+  }
+  if (at > 64) {
+    fail newError("smtp: ${kind} address local part exceeds 64 octets")
+  }
+  let i = 0
+  while (i < at) {
+    if (!isAddressByte(email[i])) {
+      fail newError("smtp: ${kind} address '${email}' has a forbidden byte")
+    }
+    i = i + 1
+  }
+  checkDomain(email[at + 1:])?
+}

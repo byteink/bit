@@ -1,0 +1,495 @@
+// stdlib/smtp/smtp.test.bit — the client against an in-process fake server
+// (#3967).
+//
+// Every assertion here is about BYTES: the transcript the fake server recorded,
+// or the message the renderer produced. Nothing waits on a clock — the two
+// deadlines in this file are deadlock guards on `accept`, not measurements —
+// because this repo runs several agents at once and a wall-clock bound under
+// that load measures the machine rather than the code.
+//
+// The fake server is a `std/net` listener on 127.0.0.1:0, spawned per test, in
+// the shape stdlib/http's client tests use: the kernel picks the port, so no
+// test races another process for a number.
+//
+// `checkAddress`, `renderHeader`, `is7bit`, `encodeBase64` and the whole client
+// surface are module siblings (SPEC §19), so nothing below imports them.
+
+import { listen, Listener } from "std/net"
+import { decodeBase64 } from "std/crypto"
+import { contains, indexOf as strIndexOf, repeat, split } from "std/strings"
+
+// One scripted server: `replies` are handed out in order, one per client line
+// (a DATA payload counts as one "line" — the script's DATA entry answers the
+// terminating dot). `log` collects every byte the client sent, which is the
+// evidence for every assertion about what was NOT transmitted.
+class fake {
+  ln: Listener,
+  replies: []string,
+  log: chan<string>,
+}
+
+// Serve exactly one connection: greeting, then one scripted reply per command,
+// then publish the transcript. Ends on the client closing, on the script
+// running out, or after `maxTurns` — never on a timer.
+fn serveFake(f: fake) {
+  let c = f.ln.accept() catch _ {
+    f.log <- "accept-failed"
+    return
+  }
+  let transcript = runFake(f, c) catch e {
+    c.close()
+    f.log <- "server-error: ${e.message()}"
+    return
+  }
+  c.close()
+  f.log <- transcript
+}
+
+// The most command turns one fake session may take. Every test here uses well
+// under ten; the bound is what makes the loop provably finite against a client
+// bug that never stops talking.
+const maxTurns: int = 32
+
+// Drive one connection to the end of its script, returning everything the
+// client sent. `inData` is the DATA payload mode: while it is on, lines are
+// accumulated and no reply is sent until the lone `.` line arrives.
+fn runFake(f: fake, c: TcpConn): string! {
+  c.write("220 fake.example.com ESMTP\r\n")?
+  let seen = ""
+  let step = 0
+  let inData = false
+  let turns = 0
+  while (turns < maxTurns && step < len(f.replies)) {
+    turns = turns + 1
+    let chunk = c.read(65536)
+    if (len(chunk) == 0) {
+      return seen
+    }
+    seen = seen + chunk
+    if (inData) {
+      if (!contains(seen, "\r\n.\r\n")) {
+        continue
+      }
+      inData = false
+    }
+    c.write(f.replies[step])?
+    inData = replyStartsData(f.replies[step])
+    step = step + 1
+  }
+  return seen
+}
+
+// Whether a scripted reply is the `354` that opens a DATA payload.
+fn replyStartsData(reply: string): bool {
+  return len(reply) >= 3 && reply[0] == u8(51) && reply[1] == u8(53) && reply[2] == u8(52)
+}
+
+// Bind a fake server on a kernel-chosen port and start serving. Returns the
+// port and the channel the transcript arrives on.
+fn startFake(replies: []string): (int, chan<string>)! {
+  let ln = listen("127.0.0.1", 0)?
+  let port = ln.port()?
+  let log = chan<string>(1)
+  let f = fake{ ln: ln, replies: replies, log: log }
+  spawn serveFake(f)
+  return (port, log)
+}
+
+// The EHLO reply a plain (no STARTTLS, no AUTH) server gives.
+fn ehloPlain(): string {
+  return "250-fake.example.com\r\n250-PIPELINING\r\n250 SIZE 35882577\r\n"
+}
+
+// The EHLO reply of a server offering AUTH but no STARTTLS — the downgrade
+// shape the credential guard exists for.
+fn ehloAuthNoTls(): string {
+  return "250-fake.example.com\r\n250-AUTH PLAIN LOGIN\r\n250 SIZE 35882577\r\n"
+}
+
+// A message with one recipient and a short ASCII body: the simplest thing that
+// exercises the whole envelope.
+fn plainMessage(): Message {
+  let m = newMessage(Address{ name: "Billing", email: "billing@example.com" })
+  m.addTo(Address{ name: "", email: "customer@example.net" })
+  m.setSubject("Your invoice")
+  m.setText("Hello.\r\nThe invoice is ready.\r\n")
+  m.setBoundary("bit-test-boundary")
+  return m
+}
+
+test "a plain-text message produces the exact SMTP command transcript" {
+  let (port, log) = startFake(
+    [
+      ehloPlain(), "250 OK\r\n", "250 OK\r\n", "354 Send it\r\n", "250 Queued\r\n",
+      "221 Bye\r\n",
+    ],
+  ) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  runPlainSession(c, plainMessage()) catch e {
+    assert(false, "session: ${e.message()}")
+    return
+  }
+  let sent = <- log
+  let lines = split(sent, "\r\n")
+  assert(lines[0] == "EHLO client.example.com", "line 0 = '${lines[0]}'")
+  assert(lines[1] == "MAIL FROM:<billing@example.com>", "line 1 = '${lines[1]}'")
+  assert(lines[2] == "RCPT TO:<customer@example.net>", "line 2 = '${lines[2]}'")
+  assert(lines[3] == "DATA", "line 3 = '${lines[3]}'")
+  let dot = strIndexOf(sent, "\r\n.\r\n")
+  assert(dot > 0, "no end-of-DATA dot in the transcript")
+  assert(contains(sent, "\r\nQUIT\r\n"), "no QUIT after the payload")
+  assert(contains(sent, "From: \"Billing\" <billing@example.com>\r\n"), "From header")
+  assert(contains(sent, "To: <customer@example.net>\r\n"), "To header")
+  assert(contains(sent, "Subject: Your invoice\r\n"), "Subject header")
+  assert(contains(sent, "\r\n\r\nHello.\r\nThe invoice is ready.\r\n"), "body")
+}
+
+// EHLO, send, QUIT — the three calls every happy-path test makes, so a change
+// to the sequence is made in one place.
+fn runPlainSession(c: Client, m: Message): ()! {
+  c.ehlo("client.example.com")?
+  c.send(m)?
+  c.quit()?
+}
+
+test "an attachment renders as multipart/mixed whose part decodes to the original bytes" {
+  let raw = []byte(300)
+  let i = 0
+  while (i < 300) {
+    raw[i] = u8(i % 256)
+    i = i + 1
+  }
+  let m = plainMessage()
+  m.attach(newAttachment("data.bin", "application/octet-stream", raw))
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  assert(
+    contains(rendered, "Content-Type: multipart/mixed; boundary=\"bit-test-boundary\""),
+    "no multipart/mixed content type",
+  )
+  assert(
+    contains(rendered, "Content-Disposition: attachment; filename=\"data.bin\""),
+    "no attachment disposition",
+  )
+  assert(contains(rendered, "\r\n--bit-test-boundary--\r\n"), "no close delimiter")
+  let back = decodeBase64(lastPartBody(rendered)) catch e {
+    assert(false, "decodeBase64: ${e.message()}")
+    return
+  }
+  assert(len(back) == 300, "decoded ${len(back)} bytes, want 300")
+  let j = 0
+  while (j < 300) {
+    assert(back[j] == raw[j], "byte ${j} decoded to ${int(back[j])}, want ${int(raw[j])}")
+    j = j + 1
+  }
+}
+
+// The base64 content of the last MIME part of `rendered`, with its line breaks
+// removed: everything between the blank line that ends the last part's headers
+// and the closing delimiter.
+fn lastPartBody(rendered: string): string {
+  let closeAt = strIndexOf(rendered, "\r\n--bit-test-boundary--")
+  let head = rendered[0:closeAt]
+  let start = lastIndexOf(head, "\r\n\r\n") + 4
+  let joined = split(head[start:], "\r\n")
+  let out = ""
+  let i = 0
+  while (i < len(joined)) {
+    out = out + joined[i]
+    i = i + 1
+  }
+  return out
+}
+
+test "a CR or LF in a subject or a display name is rejected before any bytes are sent" {
+  let cases = [
+    "Invoice\rBcc: attacker@example.com",
+    "Invoice\nBcc: attacker@example.com",
+  ]
+  let i = 0
+  while (i < len(cases)) {
+    assertSubjectRejected(cases[i])
+    i = i + 1
+  }
+  let named = plainMessage()
+  named.addCc(Address{ name: "Ops\r\nBcc: attacker@example.com", email: "ops@example.com" })
+  let out = named.render() catch e {
+    assert(
+      contains(e.message(), "contains a CR, LF or NUL byte"),
+      "display name: ${e.message()}",
+    )
+    return
+  }
+  assert(false, "a CRLF display name rendered ${len(out)} bytes instead of failing")
+}
+
+// One injected subject: the render must fail, and the transcript must prove
+// that a client that tried to send it transmitted no envelope at all.
+fn assertSubjectRejected(subject: string) {
+  let m = plainMessage()
+  m.setSubject(subject)
+  let (port, log) = startFake([ehloPlain(), "250 OK\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let ok = attemptSend(c, m)
+  c.close()
+  assert(!ok, "'${subject}' was accepted")
+  let sent = <- log
+  assert(!contains(sent, "MAIL FROM"), "MAIL FROM was sent for '${subject}': ${sent}")
+  assert(!contains(sent, "Bcc"), "the injected header reached the wire: ${sent}")
+}
+
+// Whether `c.send(m)` succeeded. A `catch` that returns a bool keeps the
+// caller's assertion about the transcript, not about control flow.
+fn attemptSend(c: Client, m: Message): bool {
+  c.ehlo("client.example.com") catch _ {
+    return false
+  }
+  c.send(m) catch _ {
+    return false
+  }
+  return true
+}
+
+test "AUTH against a server offering no STARTTLS transmits no credential" {
+  let (port, log) = startFake([ehloAuthNoTls(), "235 OK\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  assert(c.supports("AUTH"), "the fake server did not advertise AUTH")
+  assert(!c.isSecure(), "a cleartext dial reported itself secure")
+  assertAuthRefused(c)
+  c.close()
+  let sent = <- log
+  assert(!contains(sent, "AUTH"), "an AUTH command reached the wire: ${sent}")
+  assert(!contains(sent, "hunter2"), "the password reached the wire: ${sent}")
+  assert(!contains(sent, "bXVzdGFmYQ=="), "the base64 username reached the wire: ${sent}")
+  assert(!contains(sent, "aHVudGVyMg=="), "the base64 password reached the wire: ${sent}")
+}
+
+// Both mechanisms must refuse the same cleartext connection, and both must say
+// why. LOGIN is checked separately from PLAIN because its credential leaves in
+// two later commands rather than one initial response — a guard placed after
+// `AUTH LOGIN` would pass a PLAIN-only test and still leak the username.
+fn assertAuthRefused(c: Client) {
+  c.authPlain("mustafa", "hunter2") catch e {
+    assert(contains(e.message(), "not TLS"), "authPlain said: ${e.message()}")
+    c.authLogin("mustafa", "hunter2") catch e2 {
+      assert(contains(e2.message(), "not TLS"), "authLogin said: ${e2.message()}")
+      return
+    }
+    assert(false, "authLogin succeeded on a cleartext connection")
+    return
+  }
+  assert(false, "authPlain succeeded on a cleartext connection")
+}
+
+test "a 1200-character body line is encoded so no transmitted line exceeds 998 octets" {
+  let long = repeat("x", 1200)
+  let m = plainMessage()
+  m.setText(long + "\r\n")
+  let (port, log) = startFake(
+    [
+      ehloPlain(), "250 OK\r\n", "250 OK\r\n", "354 Send it\r\n", "250 Queued\r\n",
+      "221 Bye\r\n",
+    ],
+  ) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  runPlainSession(c, m) catch e {
+    assert(false, "session: ${e.message()}")
+    return
+  }
+  let sent = <- log
+  assert(
+    contains(sent, "Content-Transfer-Encoding: base64"),
+    "the long line was not encoded",
+  )
+  assert(!contains(sent, long), "the 1200-octet line was transmitted verbatim")
+  let lines = split(sent, "\r\n")
+  let worst = longestLine(lines)
+  assert(worst <= 998, "the longest transmitted line is ${worst} octets")
+  assert(worst > 0, "the transcript had no lines at all")
+}
+
+// The longest element of `lines`, so a vacuous "nothing exceeded the limit" on
+// an empty transcript is distinguishable from a real pass.
+fn longestLine(lines: []string): int {
+  let worst = 0
+  let i = 0
+  while (i < len(lines)) {
+    if (len(lines[i]) > worst) {
+      worst = len(lines[i])
+    }
+    i = i + 1
+  }
+  return worst
+}
+
+test "an over-long subject is folded or encoded rather than emitted as one line" {
+  let m = plainMessage()
+  m.setSubject(repeat("s", 1200))
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  let worst = longestLine(split(rendered, "\r\n"))
+  assert(worst <= 998, "the longest rendered line is ${worst} octets")
+  assert(contains(rendered, "=?UTF-8?B?"), "the unbreakable subject was not encoded")
+}
+
+test "a malformed envelope address is refused before the envelope is opened" {
+  let cases = [
+    "no-at-sign", "two@at@signs.example", "spaced address@example.com",
+    "bracket<@example.com", "empty@", "@example.com", "dot@.example.com",
+  ]
+  let i = 0
+  while (i < len(cases)) {
+    let m = newMessage(Address{ name: "", email: "ok@example.com" })
+    m.addTo(Address{ name: "", email: cases[i] })
+    let out = m.render() catch _ {
+      i = i + 1
+      continue
+    }
+    assert(false, "'${cases[i]}' rendered ${len(out)} bytes instead of failing")
+    return
+  }
+  assert(i == len(cases), "only ${i} of ${len(cases)} bad addresses were refused")
+}
+
+test "a text and html message is a multipart/alternative carrying both parts" {
+  let m = plainMessage()
+  m.setHtml("<p>The invoice is ready.</p>\r\n")
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  assert(
+    contains(rendered, "Content-Type: multipart/alternative; boundary=\"bit-test-boundary\""),
+    "no multipart/alternative content type",
+  )
+  assert(contains(rendered, "Content-Type: text/plain; charset=utf-8"), "no text part")
+  assert(contains(rendered, "Content-Type: text/html; charset=utf-8"), "no html part")
+  assert(contains(rendered, "<p>The invoice is ready.</p>"), "the html body was lost")
+}
+
+test "a body line beginning with a dot is stuffed on the wire and only on the wire" {
+  let m = plainMessage()
+  m.setText(".\r\n.leading dot\r\nplain\r\n")
+  let (port, log) = startFake(
+    [
+      ehloPlain(), "250 OK\r\n", "250 OK\r\n", "354 Send it\r\n", "250 Queued\r\n",
+      "221 Bye\r\n",
+    ],
+  ) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  runPlainSession(c, m) catch e {
+    assert(false, "session: ${e.message()}")
+    return
+  }
+  let sent = <- log
+  assert(
+    contains(sent, "\r\n..\r\n..leading dot\r\nplain\r\n.\r\n"),
+    "the dot lines were not stuffed: ${sent}",
+  )
+  let rendered = m.render() catch e {
+    assert(false, "render: ${e.message()}")
+    return
+  }
+  assert(
+    contains(rendered, "\r\n\r\n.\r\n.leading dot\r\n"),
+    "the rendered message was stuffed too, which it must not be",
+  )
+}
+
+// A server offering STARTTLS. Used only by the two guards below, which both
+// refuse before any handshake, so no certificate is involved.
+fn ehloStartTls(): string {
+  return "250-fake.example.com\r\n250-STARTTLS\r\n250 SIZE 35882577\r\n"
+}
+
+test "startTls on a server that does not advertise it sends no STARTTLS command" {
+  let (port, log) = startFake([ehloPlain(), "220 Ready\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  assertStartTlsRefused(c, "does not advertise STARTTLS")
+  c.close()
+  let sent = <- log
+  assert(!contains(sent, "STARTTLS"), "a STARTTLS command reached the wire: ${sent}")
+}
+
+test "startTls refuses a server that pipelines bytes across the handshake" {
+  // CVE-2011-0411: bytes sent before the handshake would be read back as if
+  // the TLS peer had sent them, so a plaintext injection becomes an
+  // authenticated command. The fake writes the 220 and an extra line in ONE
+  // write, which is exactly how the attack arrives.
+  let (port, log) = startFake([ehloStartTls(), "220 Ready\r\n250 injected\r\n"]) catch e {
+    assert(false, "startFake: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  c.ehlo("client.example.com") catch e {
+    assert(false, "ehlo: ${e.message()}")
+    return
+  }
+  assert(c.supports("STARTTLS"), "the fake server did not advertise STARTTLS")
+  assertStartTlsRefused(c, "sent data before the TLS handshake")
+  assert(!c.isSecure(), "the client reported itself secure after a refused upgrade")
+  c.close()
+  let sent = <- log
+  assert(contains(sent, "STARTTLS\r\n"), "the STARTTLS command was never sent: ${sent}")
+}
+
+// `c.startTls` must fail, and its message must name `want`. A shared helper so
+// both guards assert the same shape rather than each inventing one.
+fn assertStartTlsRefused(c: Client, want: string) {
+  c.startTls(newOptions()) catch e {
+    assert(contains(e.message(), want), "startTls said: ${e.message()}")
+    return
+  }
+  assert(false, "startTls succeeded where it had to refuse '${want}'")
+}

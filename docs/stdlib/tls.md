@@ -1553,6 +1553,18 @@ underlying `Conn`; the handshake and record-layer reads/writes reuse that same
 value automatically. A timeout fails with an error naming it (`"... timed
 out"`), distinct from every other connect/handshake/read/write failure.
 
+### `client(conn: Conn, host: string, config: TlsConfig): TlsConn!`
+
+Run the client handshake over an already-connected [`std/net`](net.md) `Conn`:
+`dial` minus the TCP connect. This is the shape a protocol that negotiates its
+own upgrade in cleartext needs - SMTP's `STARTTLS`
+([`std/smtp`](smtp.md)) - where the socket is already carrying a session when
+the switch happens and there is nothing left to dial. `host` is the SNI and the
+name the certificate must match unless `config.serverName` names one;
+verification follows `config` exactly as it does for `dial`, so an upgraded
+connection is authenticated the same way a direct one is. The socket is closed
+on a handshake failure.
+
 ### `listen(host: string, port: int, config: TlsConfig): TlsListener!`
 
 Bind a TLS listener on `host:port`. `config.certPem` and `config.keyPem` (the

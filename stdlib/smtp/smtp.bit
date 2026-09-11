@@ -1,0 +1,307 @@
+// Bit standard library — smtp module: an ESMTP submission client (#3967).
+//
+// Sending only. There is no IMAP, no POP3 and no server here: this is the
+// layer a service needs to put a password reset, a verification link or an
+// alert into a relay, and nothing else.
+//
+//     let m = newMessage(Address{ name: "Billing", email: "billing@example.com" })
+//     m.addTo(Address{ name: "", email: "customer@example.net" })
+//     m.setSubject("Your invoice")
+//     m.setText("The invoice is attached.\n")
+//     m.attach(newAttachment("invoice.pdf", "application/pdf", pdfBytes))
+//
+//     let c = dial("mail.example.com", 587)?
+//     defer c.close()
+//     c.ehlo("client.example.com")?
+//     c.startTls(newOptions())?          // certificate verified by default
+//     c.ehlo("client.example.com")?      // RFC 3207: re-issue after the upgrade
+//     c.authPlain(user, pass)?
+//     c.send(m)?
+//     c.quit()?
+//
+// Port 465 is implicit TLS: `dialTls` instead, and no `startTls`.
+//
+// Three rules are enforced here and are not configurable:
+//
+//   1. `AUTH` never runs on a connection that is not TLS (auth.bit). There is
+//      no argument that turns this off.
+//   2. A header value carrying a CR or LF is rejected, never stripped, and the
+//      whole message is rendered and validated before `MAIL FROM` is sent, so a
+//      rejected value costs zero transmitted bytes (header.bit, message.bit).
+//   3. No transmitted line reaches 998 octets (mime.bit's `checkLines`,
+//      wire.bit's `sendLine`).
+//
+// Certificate verification is on by default. `Options.insecureSkipVerify` turns
+// it off and is the only way to; it is an explicit argument at the call site,
+// never a default and never inferred.
+
+import { dial as tcpDial } from "std/net"
+import {
+  TlsConfig, TrustStore, newTlsConfig, emptyTrustStore, client as tlsUpgrade,
+} from "std/tls"
+import { systemRoots, bundled } from "std/crypto"
+import { hasPrefix, toUpper } from "std/strings"
+
+// How a TLS leg of a session is set up. The zero value verifies: `newOptions`
+// is the recommended constructor, but a bare `Options{}` is equally safe,
+// because "verify" is `insecureSkipVerify`'s zero value rather than something a
+// constructor has to remember to set.
+//
+//   insecureSkipVerify  skip chain AND hostname verification. Setting it true
+//                       means the connection proves nothing about who the peer
+//                       is; a credential sent over one is a credential given to
+//                       whoever answered. For tests and pinned lab servers.
+//   serverName          SNI and the name the certificate must match; empty
+//                       means the host that was dialed.
+//   roots               trust anchors. Empty means the operating system store,
+//                       with the bundled roots as the fallback.
+export class Options {
+  export insecureSkipVerify: bool,
+  export serverName: string,
+  export roots: TrustStore,
+}
+
+// Secure-by-default TLS options: verification on, system trust anchors, SNI
+// taken from the dialed host.
+export fn newOptions(): Options {
+  return Options{ insecureSkipVerify: false, serverName: "", roots: emptyTrustStore() }
+}
+
+// The operating system's trust anchors, falling back to the small bundled root
+// set when the OS store cannot be read. Rewrapped for `std/tls`: both stores
+// hold the same parsed X.509 roots, so there is no PEM round trip.
+fn defaultRoots(): TrustStore {
+  let sys = systemRoots() catch _ {
+    return TrustStore{ roots: bundled().roots }
+  }
+  return TrustStore{ roots: sys.roots }
+}
+
+// The `std/tls` config `o` describes for a session with `host`.
+fn tlsConfigOf(o: Options, host: string): TlsConfig {
+  let anchors = o.roots
+  if (len(anchors.roots) == 0) {
+    anchors = defaultRoots()
+  }
+  let cfg = newTlsConfig(anchors)
+  cfg.insecureSkipVerify = o.insecureSkipVerify
+  cfg.serverName = host
+  if (len(o.serverName) > 0) {
+    cfg.serverName = o.serverName
+  }
+  return cfg
+}
+
+// One SMTP session. `secure` is true only while the stream underneath really is
+// TLS — it is written by the same statement that swaps the stream, so no code
+// path can set one without the other.
+export class Client {
+  w: Wire
+  tcp: TcpConn
+  host: string
+  secure: bool
+  greeted: bool
+  exts: []string
+
+  // Whether the server advertised `ext` in its last EHLO reply. The name is
+  // matched case-insensitively against the first word of each capability line,
+  // so `supports("AUTH")` answers for `AUTH PLAIN LOGIN`.
+  export supports(ext: string): bool {
+    let want = toUpper(ext)
+    let i = 0
+    while (i < len(this.exts)) {
+      let line = toUpper(this.exts[i])
+      if (line == want || hasPrefix(line, want + " ")) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  // Whether this connection is TLS — an implicit-TLS dial, or a completed
+  // `startTls`. `authPlain`/`authLogin` refuse to run while it is false.
+  export isSecure(): bool {
+    return this.secure
+  }
+
+  // Send `EHLO name` and record the capabilities it returns. `name` is the
+  // client's own domain; it must be printable ASCII with no spaces, since it
+  // goes on the command line unquoted. Must be re-issued after `startTls`:
+  // the capability list a server offers in cleartext is not authenticated and
+  // is discarded by the upgrade (RFC 3207 §4.2).
+  export ehlo(name: string): ()! {
+    checkEhloName(name)?
+    let r = this.w.command("EHLO ${name}")?
+    expect("EHLO", r, 250, 250)?
+    this.exts = []string(0)
+    let i = 1
+    while (i < len(r.lines)) {
+      this.exts = append(this.exts, r.lines[i])
+      i = i + 1
+    }
+    this.greeted = true
+  }
+
+  // Upgrade this cleartext connection to TLS (RFC 3207). Fails when the server
+  // did not advertise STARTTLS — a client that tries anyway on a downgraded
+  // capability list learns nothing it can act on — and fails when the server
+  // has sent bytes that would sit in the read buffer across the handshake,
+  // which is the plaintext command-injection shape (CVE-2011-0411), not a
+  // buffer to quietly discard. The caller must `ehlo` again afterwards.
+  export startTls(o: Options): ()! {
+    if (this.secure) {
+      fail newError("smtp: the connection is already TLS")
+    }
+    if (!this.supports("STARTTLS")) {
+      fail newError("smtp: the server does not advertise STARTTLS")
+    }
+    let r = this.w.command("STARTTLS")?
+    expect("STARTTLS", r, 220, 220)?
+    if (len(this.w.buf) > 0) {
+      fail newError("smtp: the server sent data before the TLS handshake")
+    }
+    let t = tlsUpgrade(this.tcp, this.host, tlsConfigOf(o, this.host))?
+    this.w.s = tlsStream{ c: t }
+    this.secure = true
+    this.exts = []string(0)
+    this.greeted = false
+  }
+
+  // Authenticate with SASL PLAIN (RFC 4616). Refused outright, before the
+  // command is built, on a connection that is not TLS.
+  export authPlain(user: string, pass: string): ()! {
+    this.prepareAuth("PLAIN", user, pass)?
+    let r = this.w.command("AUTH PLAIN ${plainResponse(user, pass)}")?
+    expect("AUTH PLAIN", r, 235, 235)?
+  }
+
+  // Authenticate with SASL LOGIN — the username and the password as two base64
+  // challenge responses. Same refusal on a non-TLS connection, and it fires
+  // before the `AUTH LOGIN` command, so not even the username is transmitted.
+  export authLogin(user: string, pass: string): ()! {
+    this.prepareAuth("LOGIN", user, pass)?
+    let start = this.w.command("AUTH LOGIN")?
+    expect("AUTH LOGIN", start, 334, 334)?
+    let userStep = this.w.command(encodeBase64([]byte(user)))?
+    expect("AUTH LOGIN username", userStep, 334, 334)?
+    let done = this.w.command(encodeBase64([]byte(pass)))?
+    expect("AUTH LOGIN password", done, 235, 235)?
+  }
+
+  // The three checks every mechanism owes before a credential byte exists: the
+  // connection is TLS, the session has been greeted, and neither credential
+  // carries a byte that could end the AUTH line.
+  prepareAuth(mechanism: string, user: string, pass: string): ()! {
+    requireSecure(this.secure, mechanism)?
+    checkCredential("username", user)?
+    checkCredential("password", pass)?
+    this.requireGreeting()?
+  }
+
+  // Render, validate and send `m`. The whole message is built and checked
+  // first: a CR in a subject, a malformed recipient or an over-long line fails
+  // here, with `MAIL FROM` never sent.
+  export send(m: Message): ()! {
+    let rendered = m.render()?
+    let rcpts = m.recipients()
+    if (len(rcpts) == 0) {
+      fail newError("smtp: the message has no recipients")
+    }
+    this.requireGreeting()?
+    let mailFrom = this.w.command("MAIL FROM:<${m.sender.email}>")?
+    expect("MAIL FROM", mailFrom, 250, 250)?
+    let i = 0
+    while (i < len(rcpts)) {
+      let r = this.w.command("RCPT TO:<${rcpts[i].email}>")?
+      expect("RCPT TO", r, 250, 251)?
+      i = i + 1
+    }
+    let data = this.w.command("DATA")?
+    expect("DATA", data, 354, 354)?
+    writeData(this.w, rendered)?
+    expect("end of DATA", this.w.readReply()?, 250, 250)?
+  }
+
+  // End the session politely: `QUIT`, then close the socket. The socket is
+  // closed even when the server's reply is not a 221, because the alternative
+  // is leaking the descriptor over a server's bad manners.
+  export quit(): ()! {
+    let r = this.w.command("QUIT") catch e {
+      this.close()
+      fail e
+    }
+    this.close()
+    expect("QUIT", r, 221, 221)?
+  }
+
+  // Close the connection without a `QUIT`. Idempotent, like the `std/net` and
+  // `std/tls` closes underneath it.
+  export close() {
+    this.w.s.shut()
+    this.tcp.close()
+  }
+
+  // Fail a command that requires a completed EHLO. Separate from the command
+  // itself so `send` and the AUTH mechanisms give the same answer.
+  requireGreeting(): ()! {
+    if (!this.greeted) {
+      fail newError("smtp: call ehlo() before this command")
+    }
+  }
+}
+
+// The EHLO argument is the client's own domain and goes on the command line
+// unquoted, so a space, a control byte or a non-ASCII byte in it would be a
+// second command parameter rather than part of the name.
+fn checkEhloName(name: string): ()! {
+  if (len(name) == 0 || len(name) > 255) {
+    fail newError("smtp: the EHLO name must be 1..255 octets, got ${len(name)}")
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (!isAddressByte(name[i])) {
+      fail newError("smtp: the EHLO name '${name}' has a forbidden byte")
+    }
+    i = i + 1
+  }
+}
+
+// Read the server's opening greeting and build the session around `s`.
+fn openSession(tcp: TcpConn, s: Stream, host: string, secure: bool): Client! {
+  let w = Wire{ s: s, buf: "" }
+  let greeting = w.readReply() catch e {
+    s.shut()
+    tcp.close()
+    fail e
+  }
+  expect("greeting", greeting, 220, 220) catch e {
+    s.shut()
+    tcp.close()
+    fail e
+  }
+  return Client{
+    w: w, tcp: tcp, host: host, secure: secure, greeted: false, exts: []string(0),
+  }
+}
+
+// Connect to a cleartext submission port (587, or 25 for a relay) and read the
+// greeting. The session is NOT secure yet: `startTls` makes it so, and until it
+// does, `authPlain`/`authLogin` refuse to run.
+export fn dial(host: string, port: int): Client! {
+  let tcp = tcpDial(host, port)?
+  return openSession(tcp, plainStream{ c: tcp }, host, false)?
+}
+
+// Connect to an implicit-TLS submission port (465): the TLS handshake happens
+// before the greeting, so there is no cleartext phase and no `startTls`. The
+// server's certificate is verified against `o` — by default, against the system
+// trust anchors, for the dialed host.
+export fn dialTls(host: string, port: int, o: Options): Client! {
+  let tcp = tcpDial(host, port)?
+  let t = tlsUpgrade(tcp, host, tlsConfigOf(o, host)) catch e {
+    tcp.close()
+    fail e
+  }
+  return openSession(tcp, tlsStream{ c: t }, host, true)?
+}
