@@ -1,0 +1,413 @@
+// pkg/postgres/query.bit — the extended query protocol: Parse, Bind, Describe,
+// Execute, Sync, the typed server error, and the opt-in named-statement cache
+// (#3988).
+//
+// THE EXTENDED PROTOCOL IS NOT A CHOICE HERE. Postgres's simple query protocol
+// ("Q") carries a statement and nothing else: it has no field for a parameter.
+// A driver that wanted to use it for `where id = $1` would have to build the
+// text by substituting the value, which is the injection hole `std/sql` exists
+// to make unreachable. So every statement this driver runs — parameters or not
+// — goes out as Parse/Bind/Describe/Execute/Sync, and the caller's values
+// travel in Bind's own fields, never in the statement text.
+//
+// NOTHING IS REWRITTEN. `$1` is Postgres's native placeholder and `std/sql`
+// passes the caller's text through untouched, so `$1` appearing twice is ONE
+// parameter bound to both positions — the server's own rule, not a thing this
+// driver implements. The MySQL adapter rewrites `$N` to `?` because MySQL has
+// no numbered form; there is nothing to rewrite on this wire.
+//
+// ONE ROUND TRIP. All five messages are built into one string and written
+// once: the server reads them all, works, and answers once. Writing them
+// separately would be five flushes and (with Nagle and a real network) up to
+// five latencies for what is one request.
+//
+// UNNAMED BY DEFAULT. Parse's statement name is "" unless
+// `Datasource.statementCache` asked for the cache (stmtcache.bit). The unnamed
+// statement is destroyed by the next Parse on the connection, which is exactly
+// what makes this driver safe behind pgbouncer in transaction mode.
+//
+// THE FAILURE IS TYPED. A server error becomes a `pgError` carrying the
+// SQLSTATE, so a caller tells a unique violation (23505) from a deadlock
+// (40P01) or a serialization failure (40001) — the last two retryable, the
+// first never — by matching a code rather than parsing English that changes
+// with the server's version and locale.
+
+// Format codes. Every RESULT column is requested in text (0): turning those
+// bytes into Bit types is the codec ticket (#3989), and this one delivers the
+// bytes with their type OIDs.
+const fmtText: int = 0
+const fmtBinary: int = 1
+
+// `bytea`'s type OID. The one parameter type this driver DECLARES rather than
+// leaving for the server to infer: a `Value.Blob` goes out as raw bytes in the
+// binary format, and raw bytes sent to a parameter the server resolved as
+// `text` would be rejected the moment they are not valid UTF-8.
+const oidBytea: int = 17
+
+// A result column: its name, and the OID of its type. The OID is the whole
+// reason this class exists — the name alone is what the simple protocol gave,
+// and a decoder cannot work without the type.
+class pgColumn {
+  name: string,
+  oid: int,
+}
+
+// A server-side error, carrying what a caller can branch on. A caller asks for
+// the shape it needs rather than for this class:
+//
+//     interface SqlError { message(): string, sqlState(): string }
+//     db.exec(...) catch e {
+//       let (pg, ok) = e.(SqlError)
+//       if (ok && pg.sqlState() == "40001") { retry() }
+//     }
+//
+// Not exported: `adapter` stays this package's only exported symbol
+// (adapter.bit), and a caller matching on a shape still compiles after a
+// driver swap.
+class pgError {
+  severity: string
+  state: string
+  text: string
+  // The `std/sql` error surface. The SQLSTATE is repeated in the text because
+  // it is what an operator looks up.
+  message(): string {
+    return "postgres: ${this.severity} ${this.state}: ${this.text}"
+  }
+
+  // The five-character SQLSTATE: "23505" unique violation, "40P01" deadlock
+  // detected, "40001" serialization failure. Empty only if the server sent an
+  // ErrorResponse with no `C` field, which the protocol forbids.
+  sqlState(): string {
+    return this.state
+  }
+}
+
+// An ErrorResponse/NoticeResponse body as an error: `\0`-terminated fields,
+// each a one-byte type code and its value, closed by a bare `\0`. Only `S`,
+// `C` and `M` are read — the rest locate the failure in the SERVER's source,
+// which says nothing to the caller.
+//
+// Bounded by `len(body)`: every iteration advances `off` past at least a type
+// byte and a terminator.
+fn serverError(body: string): error {
+  let e = pgError{ severity: "", state: "", text: "" }
+  let b = []byte(body)
+  let off = 0
+  while (off < len(b) && b[off] != 0) {
+    let kind = body[off:off + 1]
+    let (value, next) = readCstr(body, off + 1) catch _ {
+      return newError("postgres: malformed error response from the server")
+    }
+    absorbField(e, kind, value)
+    off = next
+  }
+  return e
+}
+
+// One ErrorResponse field into `e`. Split out of `serverError` so the loop
+// stays one job.
+fn absorbField(e: pgError, kind: string, value: string) {
+  if (kind == "S") {
+    e.severity = value
+  }
+  if (kind == "C") {
+    e.state = value
+  }
+  if (kind == "M") {
+    e.text = value
+  }
+}
+
+// One parameter, ready for Bind: the type to declare in Parse, the format the
+// bytes are in, and the bytes. `isNull` is not "no bytes" — SQL NULL is a
+// length of -1 on the wire and an empty string is a length of 0, and erasing
+// that distinction would turn `''` into NULL.
+class boundParam {
+  oid: int,
+  format: int,
+  bytes: string,
+  isNull: bool,
+}
+
+// A `Value` as a bound parameter. Everything but `Blob` goes out in the text
+// format with its type left for the server to infer, which is what makes
+// `where id = $1` work against an `int`, a `bigint` or a `numeric` column
+// without the driver being told which.
+fn bindParam(v: Value): boundParam {
+  match (v) {
+    Null => return boundParam{ oid: 0, format: fmtText, bytes: "", isNull: true }
+    Int(n) => return textParam("${n}")
+    Float(f) => return textParam("${f}")
+    Text(s) => return textParam(s)
+    Blob(b) => return blobParam(b)
+  }
+}
+
+// A `bytea` parameter: raw bytes, binary format, and the ONE declared type.
+fn blobParam(b: []byte): boundParam {
+  return boundParam{ oid: oidBytea, format: fmtBinary, bytes: string(b), isNull: false }
+}
+
+// A parameter the server may type for itself, sent as text.
+fn textParam(s: string): boundParam {
+  return boundParam{ oid: 0, format: fmtText, bytes: s, isNull: false }
+}
+
+// Every parameter, in the caller's order.
+//
+// Bounded by `len(params)`.
+fn bindAll(params: []Value): []boundParam {
+  let out = []boundParam(0)
+  for v of params {
+    out = append(out, bindParam(v))
+  }
+  return out
+}
+
+// The parameter type OIDs to declare in Parse, or an empty list when there is
+// nothing to declare. An all-zero array and an empty one mean the same thing
+// to the server — infer everything — and the empty one is four bytes per
+// parameter shorter.
+fn declaredTypes(bound: []boundParam): []int {
+  let out = []int(0)
+  let declared = false
+  for p of bound {
+    out = append(out, p.oid)
+    if (p.oid != 0) {
+      declared = true
+    }
+  }
+  if (!declared) {
+    return []int(0)
+  }
+  return out
+}
+
+// The cache key for a statement: its text and the parameter types this driver
+// declared for it. Not the text alone — see stmtcache.bit's header.
+fn cacheKey(sqlText: string, types: []int): string {
+  let key = sqlText
+  for t of types {
+    key = key + ":${t}"
+  }
+  return key
+}
+
+// Parse: the statement name, the SQL, and the parameter types (0 = infer).
+fn parseFrame(name: string, sqlText: string, types: []int): string {
+  let body = cstr(name) + cstr(sqlText) + be16(len(types))
+  for t of types {
+    body = body + be32(t)
+  }
+  return frame("P", body)
+}
+
+// Bind: the UNNAMED portal (a portal outlives nothing here — Execute reads it
+// to exhaustion in the same batch), the statement to bind, a format code per
+// parameter, the values, and one result format code standing for every column.
+fn bindFrame(name: string, bound: []boundParam): string {
+  let body = cstr("") + cstr(name) + be16(len(bound))
+  for p of bound {
+    body = body + be16(p.format)
+  }
+  body = body + be16(len(bound))
+  for p of bound {
+    body = body + paramField(p)
+  }
+  return frame("B", body + be16(1) + be16(fmtText))
+}
+
+// One Bind parameter field: a four-byte length then the bytes, or the
+// all-ones length that is SQL NULL and carries nothing.
+fn paramField(p: boundParam): string {
+  if (p.isNull) {
+    return be32(nullColumn)
+  }
+  return be32(len(p.bytes)) + p.bytes
+}
+
+// Describe the PORTAL, not the statement: it answers with the RowDescription
+// this execution's columns actually have. Describing the statement instead
+// would also answer with the parameter types, which this driver does not need,
+// and would be read from a cached statement that a schema change since the
+// Parse has made stale.
+fn describeFrame(): string {
+  return frame("D", "P" + cstr(""))
+}
+
+// Execute the unnamed portal with no row limit: the whole result set comes
+// back, which is what `pgRows` materializes.
+fn executeFrame(): string {
+  return frame("E", cstr("") + be32(0))
+}
+
+// Sync: ends the implicit transaction and makes the server answer
+// ReadyForQuery, which is the only thing that puts the connection back in a
+// known state after an error.
+fn syncFrame(): string {
+  return frame("S", "")
+}
+
+// Close a named prepared statement.
+fn closeFrame(name: string): string {
+  return frame("C", "S" + cstr(name))
+}
+
+// What one exchange produced: the rows, the affected count, and the server's
+// failure if it sent one. The failure is carried rather than thrown so the
+// caller keeps reading to ReadyForQuery — see `collectResponse`.
+class pgResponse {
+  rows: pgRows
+  affected: int
+  failure: error
+  failed: bool
+  // The exchange as a result: the server's own error when it sent one, and
+  // the response otherwise. Separating this from `collectResponse` is what
+  // lets the reader drain to ReadyForQuery before anything fails.
+  result(): pgResponse! {
+    if (this.failed) {
+      fail this.failure
+    }
+    return this
+  }
+}
+
+// The whole parameterized path, and the only one `Conn.query`/`Conn.exec` take.
+//
+// THE ORDER MATTERS. The parameters are encoded before anything is written, so
+// a caller's bad value fails while the connection is still idle. The cache
+// entry is committed only AFTER ReadyForQuery arrived without an error,
+// because a statement parsed in a batch that then failed was rolled back with
+// the implicit transaction it was parsed in — remembering its name would make
+// every later execution ask for a statement the server does not have.
+fn runExtended(c: pgConn, sqlText: string, params: []Value): pgResponse! {
+  let bound = bindAll(params)
+  let types = declaredTypes(bound)
+  let key = cacheKey(sqlText, types)
+  let name = c.cache.lookup(key)
+  let batch = ""
+  if (name == "" && c.cache.enabled()) {
+    let (fresh, evicted) = c.cache.reserve()?
+    name = fresh
+    if (evicted != "") {
+      batch = closeFrame(evicted)
+    }
+  }
+  if (!c.cache.holds(key)) {
+    batch = batch + parseFrame(name, sqlText, types)
+  }
+  let out = exchange(c, batch + bindFrame(name, bound) + describeFrame() + executeFrame() + syncFrame())?
+  if (!out.failed && name != "") {
+    c.cache.commit(key, name)
+  }
+  return out.result()?
+}
+
+// Write one batch and read everything it produced.
+fn exchange(c: pgConn, batch: string): pgResponse! {
+  c.s.writeAll(batch) catch e {
+    fail transportError(e.message())
+  }
+  return collectResponse(c)?
+}
+
+// Read to ReadyForQuery, whatever happened.
+//
+// A SERVER ERROR IS NOT A TRANSPORT ERROR. The server answers an error by
+// skipping the rest of the batch and sending ReadyForQuery, so a failed
+// statement — a syntax error, a constraint violation, an error raised halfway
+// through a result set — leaves the connection exactly as usable as a
+// successful one. Draining to ReadyForQuery is what makes that true: a
+// connection returned to the pool with messages still queued would hand the
+// next borrower this statement's rows.
+//
+// Bounded by `queryMessageBudget`.
+fn collectResponse(c: pgConn): pgResponse! {
+  let out = pgResponse{
+    rows: newRows(),
+    affected: 0,
+    failure: pgError{ severity: "", state: "", text: "" },
+    failed: false,
+  }
+  let seen = 0
+  while (seen < queryMessageBudget) {
+    seen = seen + 1
+    let m = c.r.next() catch e {
+      fail transportError(e.message())
+    }
+    if (m.tag == "Z") {
+      return out
+    }
+    absorb(out, m)?
+  }
+  fail transportError("the server sent ${queryMessageBudget} messages " + "without reaching ReadyForQuery")
+}
+
+// Fold one backend message into `out`. `1` ParseComplete, `2` BindComplete,
+// `3` CloseComplete, `n` NoData and `s` PortalSuspended carry nothing this
+// driver reads, and neither do the `N`/`S`/`K` asynchronous messages; an
+// unknown tag is ignored for the same reason the protocol gives one — a
+// message this driver does not implement is not a reason to poison a
+// connection.
+fn absorb(out: pgResponse, m: pgMessage): ()! {
+  if (m.tag == "T") {
+    out.rows.cols = describeColumns(m.body)?
+    return
+  }
+  if (m.tag == "D") {
+    out.rows.rows = append(out.rows.rows, decodeRow(m.body)?)
+    return
+  }
+  if (m.tag == "C") {
+    out.affected = affectedRows(m.body)?
+    return
+  }
+  if (m.tag == "E" && !out.failed) {
+    out.failed = true
+    out.failure = serverError(m.body)
+  }
+}
+
+// A CommandComplete tag's row count: "INSERT 0 3", "UPDATE 2", "DELETE 0",
+// "SELECT 5". The count is the last field, and a tag that has no numeric last
+// field ("BEGIN", "CREATE TABLE") affected nothing.
+fn affectedRows(body: string): int! {
+  let (tag, _) = readCstr(body, 0)?
+  let fields = split(tag, " ")
+  if (len(fields) < 2) {
+    return 0
+  }
+  return parseInt(fields[len(fields) - 1]) catch _ {
+    return 0
+  }
+}
+
+// An empty result set, which is what a statement returning no rows leaves.
+fn newRows(): pgRows {
+  return pgRows{ cols: []pgColumn(0), rows: [][]Value(0), at: 0 - 1 }
+}
+
+// A prepared statement (`std/sql.Stmt`).
+//
+// IT HOLDS TEXT, NOT A NAME. `Conn.prepare` does not create a named statement
+// on the server: `std/sql` hands a `Stmt` out of a POOLED connection, and a
+// name is meaningful only on the one backend that parsed it — the same reason
+// the cache is off by default, arriving through a different door. Each
+// execution takes the ordinary path, so a `Stmt` is unnamed unless
+// `statementCache` turned the cache on, in which case the first execution
+// populates it and every later one reuses it.
+class pgStmt {
+  c: pgConn
+  text: string
+  query(params: []Value): Rows! {
+    return this.c.query(this.text, params)?
+  }
+
+  exec(params: []Value): int! {
+    return this.c.exec(this.text, params)?
+  }
+
+  // Nothing is allocated on the server that this handle owns — the cache owns
+  // every named statement and closes them on eviction.
+  close() {}
+}

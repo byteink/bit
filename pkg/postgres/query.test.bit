@@ -1,0 +1,381 @@
+// pkg/postgres/query.test.bit — the extended protocol and the statement cache,
+// driven against an in-process backend that reads the frontend's messages and
+// answers them (#3988).
+//
+// THE CLAIMS HERE ARE ABOUT WHAT WENT ON THE WIRE. "Unnamed statements by
+// default" is not a property of a flag, it is a property of the bytes: the
+// trace backend below records the statement NAME out of every Parse it
+// receives, so "no named Parse across 100 executions" is asserted against the
+// hundred messages the driver actually sent, and a cache that silently turned
+// itself on fails the test.
+//
+// THE BACKEND PARSES, IT DOES NOT REPLAY. It decodes each frontend frame from
+// its tag and length, exactly as a server does, so a driver that miscounted a
+// message's length would desync here rather than matching a recorded script.
+
+// A backend that answers the extended protocol and remembers what it was
+// asked. `sqlstate` non-empty makes every Execute fail with that code, which
+// is how the error cases below are made without a server.
+class traceBackend {
+  out: string
+  parsed: []string
+  bound: []string
+  closed: []string
+  executes: int
+  sqlstate: string
+  // Bytes the client has not consumed yet.
+  readUp(n: int): string! {
+    let take = n
+    if (take > len(this.out)) {
+      take = len(this.out)
+    }
+    let head = this.out[0:take]
+    this.out = this.out[take:len(this.out)]
+    return head
+  }
+
+  // One batch of frontend messages, answered in order.
+  //
+  // Bounded by `len(s)`: every iteration consumes a whole frame, and a frame
+  // is at least five bytes.
+  writeAll(s: string): ()! {
+    let at = 0
+    while (at + 5 <= len(s)) {
+      let size = readBe32(s, at + 1)?
+      let body = s[at + 5:at + 1 + size]
+      this.out = this.out + this.answer(s[at:at + 1], body)?
+      at = at + 1 + size
+    }
+  }
+
+  shut() {}
+
+  // The answer to one frontend message.
+  answer(tag: string, body: string): string! {
+    if (tag == "P") {
+      let (name, _) = readCstr(body, 0)?
+      this.parsed = append(this.parsed, name)
+      return backendMessage("1", "")
+    }
+    if (tag == "B") {
+      return this.answerBind(body)?
+    }
+    if (tag == "C") {
+      let (name, _) = readCstr(body, 1)?
+      this.closed = append(this.closed, name)
+      return backendMessage("3", "")
+    }
+    return this.answerRun(tag)?
+  }
+
+  // Bind names the portal first, then the statement it binds.
+  answerBind(body: string): string! {
+    let (_, afterPortal) = readCstr(body, 0)?
+    let (name, _) = readCstr(body, afterPortal)?
+    this.bound = append(this.bound, name)
+    return backendMessage("2", "")
+  }
+
+  // Describe, Execute and Sync. Execute answers with one row of one `int4`
+  // column, or with the SQLSTATE this backend was built to fail with.
+  answerRun(tag: string): string! {
+    if (tag == "D") {
+      return rowDescription("n", 23)
+    }
+    if (tag == "E") {
+      this.executes = this.executes + 1
+      if (this.sqlstate != "") {
+        return errorResponse(this.sqlstate, "it failed")
+      }
+      return dataRow("1") + commandComplete("SELECT 1")
+    }
+    return readyForQuery()
+  }
+}
+
+// A `RowDescription` with one field: its name, table OID and attribute number,
+// its type OID, then the width, modifier and format code.
+fn rowDescription(name: string, oid: int): string {
+  return backendMessage(
+    "T",
+    be16(1) + cstr(name) + be32(0) + be16(0) + be32(oid) + be16(4) + be32(0 - 1) + be16(0),
+  )
+}
+
+// A `DataRow` with one non-NULL column.
+fn dataRow(value: string): string {
+  return backendMessage("D", be16(1) + be32(len(value)) + value)
+}
+
+// A `CommandComplete` carrying its tag.
+fn commandComplete(tag: string): string {
+  return backendMessage("C", cstr(tag))
+}
+
+// A connection onto `b`, with a cache of `limit` statements.
+fn tracedConn(b: traceBackend, limit: int): pgConn {
+  return pgConn{
+    r: pgReader{ s: b, buf: "" }, s: b, closed: false, cache: newStmtCache(limit),
+  }
+}
+
+// A fresh backend that succeeds.
+fn newTrace(): traceBackend {
+  return traceBackend{
+    out: "", parsed: []string(0), bound: []string(0), closed: []string(0),
+    executes: 0, sqlstate: "",
+  }
+}
+
+// How many of `names` are named statements rather than the unnamed one.
+fn namedCount(names: []string): int {
+  let n = 0
+  for name of names {
+    if (name != "") {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// Run `sqlText` `times` times on a connection with the given cache limit, and
+// hand back the backend so the caller can read the trace.
+fn runTimes(sqlText: string, limit: int, times: int): traceBackend {
+  let b = newTrace()
+  let c = tracedConn(b, limit)
+  let i = 0
+  while (i < times) {
+    let rows = c.query(sqlText, []Value{ Value.Int(i) }) catch e {
+      panic("query ${i}: ${e.message()}")
+    }
+    rows.close()
+    i = i + 1
+  }
+  return b
+}
+
+test "with no statement cache, a hundred executions send a hundred unnamed Parses" {
+  let b = runTimes("select $1", 0, 100)
+  assert(len(b.parsed) == 100, "${len(b.parsed)} Parse messages for 100 executions")
+  assert(namedCount(b.parsed) == 0, "${namedCount(b.parsed)} of them were named")
+  assert(b.executes == 100, "${b.executes} Execute messages")
+}
+
+test "with statementCache on, a hundred executions of one statement Parse exactly once" {
+  let b = runTimes("select $1", 8, 100)
+  assert(len(b.parsed) == 1, "${len(b.parsed)} Parse messages for 100 executions")
+  assert(namedCount(b.parsed) == 1, "the one Parse was unnamed: '${b.parsed[0]}'")
+  assert(len(b.bound) == 100, "${len(b.bound)} Bind messages")
+  assert(b.bound[99] == b.parsed[0], "the hundredth Bind named '${b.bound[99]}'")
+}
+
+test "a cache of two running three statements evicts rather than growing" {
+  let b = newTrace()
+  let c = tracedConn(b, 2)
+  let texts = []string{ "select 1", "select 2", "select 3" }
+  let i = 0
+  while (i < 9) {
+    let rows = c.query(texts[i % 3], []Value(0)) catch e {
+      panic("query ${i}: ${e.message()}")
+    }
+    rows.close()
+    i = i + 1
+  }
+  assert(c.cache.size() == 2, "a cache of 2 holds ${c.cache.size()} statements")
+  assert(len(b.closed) == len(b.parsed) - 2, "${len(b.parsed)} parses, ${len(b.closed)} closes")
+}
+
+test "the cache evicts the least recently used statement, not the oldest" {
+  let b = newTrace()
+  let c = tracedConn(b, 2)
+  // a, b, a, c: FIFO evicts `a`, LRU evicts `b`, because the third query used
+  // `a` again. The two policies disagree on exactly this trace.
+  for text of []string{ "select 1", "select 2", "select 1", "select 3" } {
+    let rows = c.query(text, []Value(0)) catch e {
+      panic("query: ${e.message()}")
+    }
+    rows.close()
+  }
+  assert(c.cache.holds("select 1"), "the reused statement was evicted")
+  assert(!c.cache.holds("select 2"), "the least recently used statement survived")
+  assert(len(b.closed) == 1, "${len(b.closed)} statements were closed on the server")
+  assert(b.closed[0] == "s2", "the driver closed '${b.closed[0]}' on the server, not s2")
+}
+
+test "a statement is cached only after the server has actually parsed it" {
+  let b = newTrace()
+  b.sqlstate = "42601"
+  let c = tracedConn(b, 4)
+  let err = queryFailure(c, "select $1")
+  assert(contains(err, "42601"), "the failure lost the SQLSTATE: ${err}")
+  assert(!c.cache.holds("select $1"), "a statement that failed was cached")
+  let second = queryFailure(c, "select $1")
+  assert(len(b.parsed) == 2, "the second execution did not re-Parse: ${len(b.parsed)}")
+  assert(second != "", "the second execution passed")
+}
+
+// Whether `rows` has a first row. A `catch` on a value-producing call has to
+// divert (E0067), so this cannot be written inline in an `assert`.
+fn hasRow(rows: Rows): bool {
+  return rows.next() catch _ {
+    return false
+  }
+}
+
+// The message `query` failed with, or "".
+fn queryFailure(c: pgConn, sqlText: string): string {
+  let rows = c.query(sqlText, []Value{ Value.Int(1) }) catch e {
+    return e.message()
+  }
+  rows.close()
+  return ""
+}
+
+// The SQLSTATE a caller reads off a failure, as the interface a caller would
+// declare for itself — renaming the method fails this test.
+interface sqlError {
+  message(): string,
+  sqlState(): string,
+}
+
+test "a server error carries its SQLSTATE, and the codes are told apart by code" {
+  let unique = serverError(
+    "S" + cstr("ERROR") + "C" + cstr("23505") + "M" + cstr("duplicate key value") +
+      string([]byte(1)),
+  )
+  let (pg, ok) = unique.(sqlError)
+  assert(ok, "the error does not expose sqlState: ${unique.message()}")
+  assert(pg.sqlState() == "23505", "sqlstate: '${pg.sqlState()}'")
+  let deadlock = serverError(
+    "S" + cstr("ERROR") + "C" + cstr("40P01") + "M" + cstr("deadlock detected") +
+      string([]byte(1)),
+  )
+  let (dl, dlOk) = deadlock.(sqlError)
+  assert(dlOk, "the deadlock error does not expose sqlState")
+  assert(dl.sqlState() == "40P01", "sqlstate: '${dl.sqlState()}'")
+  assert(dl.sqlState() != pg.sqlState(), "two SQLSTATEs compared equal")
+}
+
+test "an error mid-result-set leaves the connection usable for the next query" {
+  let b = newTrace()
+  b.sqlstate = "22012"
+  let c = tracedConn(b, 0)
+  let err = queryFailure(c, "select 1/$1")
+  assert(contains(err, "22012"), "the failure lost the SQLSTATE: ${err}")
+  b.sqlstate = ""
+  let rows = c.query("select $1", []Value{ Value.Int(7) }) catch e {
+    panic("the connection was unusable after a statement error: ${e.message()}")
+  }
+  assert(hasRow(rows), "no row after the failed statement")
+  rows.close()
+}
+
+test "a query reports the column type OID the server described" {
+  let b = newTrace()
+  let c = tracedConn(b, 0)
+  let rows = c.query("select $1", []Value{ Value.Int(1) }) catch e {
+    panic("query: ${e.message()}")
+  }
+  let (typed, ok) = rows.(typedRows)
+  assert(ok, "Rows does not expose oids()")
+  let oids = typed.oids()
+  assert(len(oids) == 1 && oids[0] == 23, "oids: ${len(oids)} columns, first ${oids[0]}")
+  assert(len(rows.columns()) == 1, "${len(rows.columns())} column names")
+  rows.close()
+}
+
+// The shape a decoder asks a result set for: everything `std/sql.Rows` has,
+// plus the type OIDs. A type assertion may only narrow to an interface that
+// still satisfies the one in hand (E0041), so the four inherited methods are
+// spelled out rather than implied.
+interface typedRows {
+  next(): bool!,
+  columns(): []string,
+  value(col: int): Value,
+  close(),
+  oids(): []int,
+}
+
+test "the three parameter kinds are bound as fields, never as statement text" {
+  let bound = bindAll([]Value{ Value.Int(0 - 5), Value.Text("o'brien"), Value.Null })
+  let body = bindFrame("", bound)
+  assert(!contains(body, "o'brien" + "'"), "a value was quoted into the message")
+  assert(contains(body, "o'brien"), "the text value is not in the Bind message")
+  assert(contains(body, "-5"), "the int value is not in the Bind message")
+  // Portal, statement, three text format codes, three values, one result
+  // format code: the NULL contributes its four length bytes and nothing else.
+  assert(
+    len(body) == 5 + 1 + 1 + 2 + 6 + 2 + 6 + 11 + 4 + 4,
+    "the Bind message is ${len(body)} bytes",
+  )
+}
+
+test "a bytea parameter declares its type, because binary bytes need one" {
+  let bound = bindAll([]Value{ Value.Blob([]byte(3)) })
+  assert(bound[0].oid == oidBytea, "a Blob declared OID ${bound[0].oid}")
+  assert(bound[0].format == fmtBinary, "a Blob was bound in format ${bound[0].format}")
+  let types = declaredTypes(bound)
+  assert(len(types) == 1 && types[0] == oidBytea, "declared types: ${len(types)}")
+  assert(
+    len(declaredTypes(bindAll([]Value{ Value.Int(1) }))) == 0,
+    "an inferrable parameter declared a type",
+  )
+}
+
+test "the same text with different parameter types is a different cache entry" {
+  let text = "select $1"
+  let keyText = cacheKey(text, declaredTypes(bindAll([]Value{ Value.Text("x") })))
+  let keyBlob = cacheKey(text, declaredTypes(bindAll([]Value{ Value.Blob([]byte(1)) })))
+  assert(keyText != keyBlob, "a text and a bytea parameter share a cache key")
+}
+
+test "a NULL column keeps its distinction from an empty one" {
+  let row = decodeRow(be16(2) + be32(nullColumn) + be32(0)) catch e {
+    panic("decodeRow: ${e.message()}")
+  }
+  assert(len(row) == 2, "${len(row)} columns")
+  assert(isNull(row[0]), "a -1 length did not decode as NULL")
+  let empty = asText(row[1]) catch e {
+    panic("column 1: ${e.message()}")
+  }
+  assert(empty == "", "a zero-length column decoded as '${empty}'")
+}
+
+test "a CommandComplete tag reports the rows it names, and only when it names one" {
+  let insert = affectedRows(cstr("INSERT 0 3")) catch e {
+    panic("INSERT: ${e.message()}")
+  }
+  assert(insert == 3, "INSERT 0 3 reported ${insert}")
+  let update = affectedRows(cstr("UPDATE 12")) catch e {
+    panic("UPDATE: ${e.message()}")
+  }
+  assert(update == 12, "UPDATE 12 reported ${update}")
+  let create = affectedRows(cstr("CREATE TABLE")) catch e {
+    panic("CREATE: ${e.message()}")
+  }
+  assert(create == 0, "CREATE TABLE reported ${create}")
+}
+
+test "an exec reports the server's own affected count" {
+  let b = newTrace()
+  let c = tracedConn(b, 0)
+  let n = c.exec("delete from t where id = $1", []Value{ Value.Int(4) }) catch e {
+    panic("exec: ${e.message()}")
+  }
+  assert(n == 1, "exec reported ${n} affected rows")
+}
+
+test "a prepared statement runs unnamed too, and a second run reuses nothing" {
+  let b = newTrace()
+  let c = tracedConn(b, 0)
+  let st = c.prepare("select $1") catch e {
+    panic("prepare: ${e.message()}")
+  }
+  assert(len(b.parsed) == 0, "prepare sent ${len(b.parsed)} Parse messages of its own")
+  let rows = st.query([]Value{ Value.Int(1) }) catch e {
+    panic("stmt.query: ${e.message()}")
+  }
+  rows.close()
+  st.close()
+  assert(namedCount(b.parsed) == 0, "a prepared statement was named without a cache")
+}

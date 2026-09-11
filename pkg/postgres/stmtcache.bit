@@ -1,0 +1,134 @@
+// pkg/postgres/stmtcache.bit — the per-connection cache of NAMED prepared
+// statements, and the reasons it is both per-connection and off by default
+// (#3988).
+//
+// OFF UNLESS ASKED FOR. `Datasource.statementCache` (stdlib/sql/config.bit) is
+// 0 by default and 0 means "remember nothing": every execution parses an
+// UNNAMED statement, which the server discards at the next Parse. That default
+// is not timidity. A named statement lives on ONE backend, and the pooler in
+// front of the database — pgbouncer in transaction mode — hands the next query
+// to a different backend, which answers `prepared statement "s1" does not
+// exist`: an error naming neither the pooler nor the cache. RDS Proxy fails
+// more quietly still, pinning the connection to the session instead, so the
+// pooling the deployment was for silently stops happening. pgx and sqlx both
+// shipped this on by default and both walked it back.
+//
+// PER CONNECTION, NEVER SHARED. A statement name is meaningful only on the
+// connection that parsed it, so a cache shared between two connections would
+// bind a caller's parameters to whatever `s4` happens to mean on the one the
+// pool handed out. The cache is a field of `pgConn` and dies with it.
+//
+// EVICTION IS LRU, not FIFO. The workload this cache exists for is a service
+// running a small set of statements over and over with an occasional one-off
+// report query in between; FIFO would evict the hot statement the report
+// happened to arrive behind. `lookup` is what moves an entry to the front, so
+// USE is what keeps a statement alive, which is the whole difference.
+//
+// THE KEY IS NOT THE SQL TEXT ALONE. It is the text plus the parameter type
+// OIDs this driver declared in Parse (`cacheKey`, query.bit). The same text
+// executed with a `Blob` where it once had a `Text` declares a different
+// parameter type, and reusing the statement parsed under the old one would
+// send binary bytes to a parameter the server resolved as text.
+
+// A connection's named statements, most-recently-used last.
+//
+// `names` maps a cache key to the statement name on the wire (`s1`, `s2`, ...)
+// and `keys` carries the order; both hold exactly the same keys, which
+// `reserve` and `commit` are the only two places that change.
+class stmtCache {
+  // How many statements this connection may hold. 0 (or less) is off.
+  limit: int
+  // Names handed out so far. Only ever increases, so a name is never reused
+  // for a different statement even after its entry was evicted and the server
+  // was told to close it.
+  seq: int
+  keys: []string
+  names: map<string, string>
+  // Whether caching is on at all. With it off every caller parses unnamed.
+  enabled(): bool {
+    return this.limit > 0
+  }
+
+  // The statement name held for `key`, or "" — and on a hit, `key` becomes the
+  // most recently used entry. That side effect is the LRU policy: a `lookup`
+  // that did not reorder would make this a FIFO cache with an LRU comment.
+  lookup(key: string): string {
+    let (name, ok) = this.names[key]
+    if (!ok) {
+      return ""
+    }
+    this.keys = append(without(this.keys, key), key)
+    return name
+  }
+
+  // A fresh statement name, plus the name of whatever had to be evicted to
+  // make room for it ("" when nothing was). Evicting BEFORE the statement is
+  // parsed is deliberate: the alternative is deciding after the exchange, by
+  // which point the `Close` for the evicted statement can no longer ride in
+  // the same batch as the `Parse` that displaced it. The cost of an exchange
+  // that then fails is one lost cache entry, never a wrong one.
+  reserve(): (string, string)! {
+    if (!this.enabled()) {
+      fail newError("postgres: reserve on a disabled statement cache")
+    }
+    let evicted = ""
+    if (len(this.keys) >= this.limit) {
+      evicted = this.drop(this.keys[0])
+    }
+    this.seq = this.seq + 1
+    return ("s${this.seq}", evicted)
+  }
+
+  // Remember `name` for `key`, as the most recently used entry. Called only
+  // after the server has actually parsed it — see query.bit's `runExtended`.
+  commit(key: string, name: string) {
+    if (!this.enabled()) {
+      return
+    }
+    this.keys = append(without(this.keys, key), key)
+    this.names[key] = name
+  }
+
+  // Forget `key`, returning the statement name it held ("" if it held none).
+  drop(key: string): string {
+    let (name, ok) = this.names[key]
+    if (!ok) {
+      return ""
+    }
+    delete(this.names, key)
+    this.keys = without(this.keys, key)
+    return name
+  }
+
+  // Whether `key` is held, without touching the order — the question a test
+  // asks, and the one `lookup` cannot answer because asking it would be a use.
+  holds(key: string): bool {
+    let (_, ok) = this.names[key]
+    return ok
+  }
+
+  // How many statements are held. Never above `limit`, which is the claim
+  // "evicts rather than growing" is made of.
+  size(): int {
+    return len(this.keys)
+  }
+}
+
+// An empty cache. `limit` 0 is off, which is what `Datasource.statementCache`
+// defaults to.
+fn newStmtCache(limit: int): stmtCache {
+  return stmtCache{ limit: limit, seq: 0, keys: []string(0), names: map<string, string>() }
+}
+
+// `keys` without `key`, order otherwise untouched.
+//
+// Bounded by `len(keys)`.
+fn without(keys: []string, key: string): []string {
+  let out = []string(0)
+  for k of keys {
+    if (k != key) {
+      out = append(out, k)
+    }
+  }
+  return out
+}
