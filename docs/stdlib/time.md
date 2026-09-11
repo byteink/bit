@@ -1049,7 +1049,10 @@ to say `AM` or `PM`. A field the pattern does not name keeps its default, so
 A display conversion, not a second calendar system. Values are stored and computed
 in the Gregorian calendar; `hijri()` produces a rendering.
 
-### `Date.hijri(): HijriDate`
+### `HijriDate`
+
+A Hijri calendar day in the Umm al-Qura variant, as a rendering of a `Date`.
+Immutable, like every other value in this module.
 
 | Method | Returns |
 |---|---|
@@ -1058,9 +1061,50 @@ in the Gregorian calendar; `hijri()` produces a rendering.
 | `toString()` | `1448-03-19` |
 | `gregorian()` | back to a `Date` |
 
+### `Date.hijri(): HijriDate!`
+
+This day in the Umm al-Qura calendar. Fails outside the tabulated span, which in
+Gregorian terms is 1882-11-12 to 2077-11-16.
+
 ### `hijriDate(year: int, month: int, day: int): HijriDate!`
 
-Builds one directly, for parsing a Hijri date off a document.
+Builds one directly, for parsing a Hijri date off a document. Fails on a year
+outside the span, a month outside 1..12, or a day past that month's tabulated
+length — `hijriDate(1445, 10, 30)` fails, because Shawwal 1445 has 29 days.
+
+### `HijriDate.year(): int`
+
+The Hijri year, 1300..1500.
+
+### `HijriDate.month(): int`
+
+The Hijri month, 1 Muharram through 12 Dhu al-Hijjah.
+
+### `HijriDate.day(): int`
+
+The day of the Hijri month, 1..29 or 1..30 as the table says.
+
+### `HijriDate.gregorian(): Date`
+
+Back to the `Date` this renders. Never fails: the whole tabulated span lies
+inside `Date`'s own range.
+
+### `HijriDate.toString(): string`
+
+`1448-03-19` — the Hijri fields, zero-padded, in the order `Date.toString()` uses.
+
+### `HijriDate.format(pattern: string): string!`
+
+The same LDML tokens [`Date.format`](#formatting) takes, reading the Hijri fields
+and the Hijri month names: Muharram, Safar, Rabi al-Awwal, Rabi al-Thani, Jumada
+al-Awwal, Jumada al-Thani, Rajab, Shaban, Ramadan, Shawwal, Dhu al-Qadah, Dhu
+al-Hijjah. `MMM` is the first three letters of the name and `MMMM` the whole of
+it, so `d MMMM yyyy` on 2024-03-11 gives `1 Ramadan 1445`. `E` reads the weekday
+of the Gregorian day, which is the same day. Fails on a time or zone field, on
+`Y` and `D` for the reasons [Formatting](#formatting) gives, and on `Q` — a
+quarter is a division of the Gregorian year and names no Hijri period. Month and
+day names are Latin script; Arabic script and Arabic-Indic digits are out of
+scope for this module.
 
 The variant is **Umm al-Qura**, the calendar used for official and civil purposes
 in Saudi Arabia and across the Gulf. Other Hijri variants exist — a purely
@@ -1069,7 +1113,10 @@ by a day. A document that must match a government record needs Umm al-Qura, so
 that is the only variant provided.
 
 Umm al-Qura is tabulated, not computed, and its published tables cover roughly
-1300 to 1500 AH. `hijri()` fails outside that span rather than extrapolating.
+1300 to 1500 AH. Both `hijri()` and `hijriDate()` fail outside that span rather
+than extrapolating. The table shipped here is 1300..1500 AH, transcribed from
+ICU4C's `UMALQURA_MONTHLENGTH` with the commit and three independent
+cross-checks recorded in `stdlib/time/hijri.bit`'s header.
 
 There is no Hijri **arithmetic**. Add months to the `Date` and convert for display.
 
