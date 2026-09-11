@@ -199,3 +199,152 @@ test "live: caching_sha2_password full authentication without TLS fails naming T
   assert(err != "", "full authentication completed with no TLS")
   assert(contains(err, "TLS"), "the refusal does not name TLS: ${err}")
 }
+
+// The rewriter's end-to-end acceptance (#3994): a `$1` reused twice must select
+// exactly the rows the hand-written `?` form selects. The `?` form goes through
+// `prepared`/`executeStmt` directly — the same COM_STMT_PREPARE/COM_STMT_EXECUTE
+// path, with the rewriter as the only difference — so a mismatch can only be the
+// rewriting.
+fn liveConn(uri: string): myConn {
+  let a = newMyAdapter()
+  let c = a.connect(Datasource{ uri: uri }) catch e {
+    panic("connect: ${e.message()}")
+  }
+  let (my, ok) = c.(myConn)
+  assert(ok, "connect returned something other than a myConn")
+  return my
+}
+
+// Every `id` in `rows`, in order, as one string to compare.
+fn idsOf(rows: Rows): string {
+  let out = ""
+  let seen = 0
+  while ((rows.next() catch e {
+      panic("next: ${e.message()}")
+    }) &&
+    seen < 64) {
+    seen = seen + 1
+    match (rows.value(0)) {
+      Int(n) => out = out + " ${n}"
+      Text(s) => out = out + " ${s}"
+      _ => panic("an id came back as neither Int nor Text")
+    }
+  }
+  rows.close()
+  return out
+}
+
+// Run `sqlText` on `c`, panicking with the statement on failure.
+fn liveQuery(c: myConn, sqlText: string, params: []Value): Rows {
+  return c.query(sqlText, params) catch e {
+    panic("${sqlText}: ${e.message()}")
+  }
+}
+
+test "a reused $1 selects exactly what the hand-written ? form selects" {
+  let uri = liveUri("MY_TEST_MYSQL_URI")
+  if (uri == "") {
+    return
+  }
+  let c = liveConn(uri)
+  c.exec("drop table if exists t3994", []Value(0)) catch e {
+    panic("drop: ${e.message()}")
+  }
+  c.exec("create table t3994 (id int primary key, a varchar(8), b varchar(8))", []Value(0)) catch e {
+    panic("create: ${e.message()}")
+  }
+  let inserted = c.exec(
+    "insert into t3994 (id, a, b) values ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
+    []Value{
+      Value.Int(1), Value.Text("x"), Value.Text("q"),
+      Value.Int(2), Value.Text("q"), Value.Text("x"),
+      Value.Int(3), Value.Text("q"), Value.Text("q"),
+    },
+  ) catch e {
+    panic("insert: ${e.message()}")
+  }
+  assert(inserted == 3, "insert reported ${inserted} affected rows")
+  let got = idsOf(
+    liveQuery(
+      c,
+      "select id from t3994 where a = $1 or b = $1 order by id",
+      []Value{ Value.Text("x") },
+    ),
+  )
+  let st = prepared(c, "select id from t3994 where a = ? or b = ? order by id") catch e {
+    panic("prepare: ${e.message()}")
+  }
+  let handWritten = executeStmt(c, st, []Value{ Value.Text("x"), Value.Text("x") }) catch e {
+    panic("execute: ${e.message()}")
+  }
+  let want = idsOf(handWritten.rows)
+  assert(got == want, "the rewritten form selected '${got}', the ? form '${want}'")
+  assert(got == " 1 2", "the rewritten form selected '${got}', wanted ' 1 2'")
+  c.exec("drop table t3994", []Value(0)) catch e {
+    panic("drop: ${e.message()}")
+  }
+  c.close()
+}
+
+test "a duplicate key arrives as 1062 with its SQLSTATE, and a count mismatch sends nothing" {
+  let uri = liveUri("MY_TEST_MYSQL_URI")
+  if (uri == "") {
+    return
+  }
+  let c = liveConn(uri)
+  c.exec("drop table if exists t3994b", []Value(0)) catch e {
+    panic("drop: ${e.message()}")
+  }
+  c.exec("create table t3994b (id int primary key)", []Value(0)) catch e {
+    panic("create: ${e.message()}")
+  }
+  c.exec("insert into t3994b (id) values ($1)", []Value{ Value.Int(1) }) catch e {
+    panic("insert: ${e.message()}")
+  }
+  let (code, state) = execFailure(c, "insert into t3994b (id) values ($1)", []Value{ Value.Int(1) })
+  assert(code == 1062, "duplicate key reported code ${code}")
+  assert(state == "23000", "duplicate key reported SQLSTATE '${state}'")
+  let err = queryFailure(
+    c,
+    "select id from t3994b where id = $1 or id = $2",
+    []Value{ Value.Int(1) },
+  )
+  assert(contains(err, "2 parameter") && contains(err, "1 value"), "count mismatch: ${err}")
+  // The connection is still usable, which is the proof nothing was sent: a
+  // half-sent statement would have desynced the packet stream.
+  let ids = idsOf(liveQuery(c, "select id from t3994b where id = $1", []Value{ Value.Int(1) }))
+  assert(ids == " 1", "the connection after a count mismatch returned '${ids}'")
+  c.exec("drop table t3994b", []Value(0)) catch e {
+    panic("drop: ${e.message()}")
+  }
+  c.close()
+}
+
+// The code and SQLSTATE of the error `sqlText` produced, or (0, "") when it ran.
+fn execFailure(c: myConn, sqlText: string, params: []Value): (int, string) {
+  c.exec(sqlText, params) catch e {
+    let (my, ok) = e.(liveSqlError)
+    if (!ok) {
+      panic("a server error came back without a code: ${e.message()}")
+    }
+    return (my.errorCode(), my.sqlState())
+  }
+  return (0, "")
+}
+
+// The message `sqlText` failed with, or "" when it ran.
+fn queryFailure(c: myConn, sqlText: string, params: []Value): string {
+  let rows = c.query(sqlText, params) catch e {
+    return e.message()
+  }
+  rows.close()
+  return ""
+}
+
+// What a caller declares to read a MySQL error's number — the same shape
+// `query.test.bit` asserts, here against a real server's ERR packet.
+interface liveSqlError {
+  message(): string,
+  errorCode(): int,
+  sqlState(): string,
+}
