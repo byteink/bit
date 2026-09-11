@@ -1,0 +1,359 @@
+// pkg/mysql/rewrite.bit — `std/sql`'s `$1` placeholders rendered into MySQL's `?`.
+//
+// `std/sql` takes NUMBERED placeholders whatever the database (#3978); MySQL's
+// protocol takes positional `?`. This is the translation, and the direction was
+// chosen because it is the ASYMMETRICALLY SAFE one: `$1` essentially never
+// occurs in SQL outside a string literal, while `?` is ordinary English
+// punctuation (`note = 'why?'`). Rewriting `?` into `$1` would be a minefield.
+//
+// WHY THIS FILE IS A SCANNER AND NOT A `replace` CALL. A rewriter that misfires
+// — that turns a `$1` inside a literal or a comment into a `?` — shifts every
+// following parameter by one position, so `id = $1` receives the value meant for
+// the next placeholder. NOTHING ERRORS. The statement runs and returns the wrong
+// rows. Every construct MySQL can hide a `$1` inside is therefore skipped here
+// explicitly, and `rewrite.test.bit` is a corpus of statements that must survive
+// it byte-identical.
+//
+// MYSQL'S STRING RULES ARE NOT STANDARD SQL'S. Two differences bite a scanner
+// written against Postgres:
+//
+//   - BACKSLASH IS AN ESCAPE inside a quoted string by default, so `'it\'s $1'`
+//     is ONE string and a scanner that ends it at the second quote rewrites the
+//     `$1` that follows.
+//   - `#` STARTS A COMMENT, as well as `-- ` and `/* */`.
+//
+// And `"` means two different things depending on the server's SQL mode: a
+// string by default, a quoted IDENTIFIER under `ANSI_QUOTES`. Both are skipped,
+// so this scanner does not need to know which mode is in force — but the escape
+// rules inside them differ, which is what `ansiQuotes` selects.
+
+// The bytes this scanner branches on. Named because `39` in a condition is a
+// puzzle and `byteSingleQuote` is not.
+const byteDoubleQuote: int = 34
+const byteHash: int = 35
+const byteDollar: int = 36
+const byteSingleQuote: int = 39
+const byteStar: int = 42
+const byteDash: int = 45
+const byteSlash: int = 47
+const byteZero: int = 48
+const byteNine: int = 57
+const byteUpperA: int = 65
+const byteUpperZ: int = 90
+const byteBackslash: int = 92
+const byteUnderscore: int = 95
+const byteBacktick: int = 96
+const byteLowerA: int = 97
+const byteLowerZ: int = 122
+const byteSpace: int = 32
+const byteNewline: int = 10
+
+// The highest `$N` this will accept. MySQL's own protocol caps a prepared
+// statement at 65535 parameters, so a larger number is a typo — or a hostile
+// string — rather than a statement any server would run.
+const maxPlaceholderIndex: int = 65535
+
+// A rewritten statement: the text to send, and the parameter each `?` in it
+// wants, in wire order. `order` is what makes reuse work — `where a = $1 or b =
+// $1` is two `?` and `[1, 1]`, so the value is supplied twice.
+class rewritten {
+  text: string
+  order: []int
+  // How many distinct parameters the statement uses: the highest `$N` in it.
+  // The HIGHEST rather than the count of `?`, because a reused placeholder is
+  // one parameter written twice and a gap (`$1, $3`) still needs three values
+  // supplied for the third to be reachable.
+  arity(): int {
+    let out = 0
+    for n of this.order {
+      if (n > out) {
+        out = n
+      }
+    }
+    return out
+  }
+
+  // The caller's values in the order the `?` markers want them, or a failure
+  // naming BOTH counts. This is the check that must happen before a single byte
+  // reaches the server: a statement prepared with the wrong number of parameters
+  // is a protocol desync, and one bound with the wrong number is a wrong answer.
+  values(params: []Value): []Value! {
+    let want = this.arity()
+    if (want != len(params)) {
+      fail newError(
+          "mysql: the statement uses ${want} parameter(s) and " +
+          "${len(params)} value(s) were supplied; every $1..$${want} needs " +
+          "exactly one value, in order",
+      )
+    }
+    let out = []Value(0)
+    for n of this.order {
+      out = append(out, params[n - 1])
+    }
+    return out
+  }
+}
+
+// Rewrite `$N` into `?` everywhere it is a placeholder and nowhere else.
+//
+// `ansiQuotes` says what `"` means on the server this text is headed for: a
+// string literal (false, MySQL's default) or a quoted identifier (true, under
+// the `ANSI_QUOTES` SQL mode). Either way the run is skipped; the flag decides
+// only whether a backslash inside it escapes the next byte.
+//
+// Bounded: every `step` consumes at least one byte, so at most `len(sqlText)`
+// iterations — the guard asserts it rather than trusting it.
+fn rewriteQuery(sqlText: string, ansiQuotes: bool): rewritten! {
+  let sc = sqlScanner{
+    s: sqlText,
+    b: []byte(sqlText),
+    at: 0,
+    mark: 0,
+    out: "",
+    order: []int(0),
+    prev: 0,
+    ansi: ansiQuotes,
+  }
+  let guard = 0
+  while (sc.at < len(sc.b) && guard <= len(sc.b)) {
+    guard = guard + 1
+    sc.step()?
+  }
+  if (sc.at < len(sc.b)) {
+    fail newError("mysql: the placeholder scanner stalled at byte ${sc.at}")
+  }
+  return rewritten{ text: sc.out + sqlText[sc.mark:len(sqlText)], order: sc.order }
+}
+
+// One pass over one statement.
+//
+// `mark` is the first byte not yet copied into `out`: the text between
+// placeholders is copied in whole spans rather than byte by byte, so a statement
+// with no placeholders does no string building at all.
+//
+// `prev` is the last byte of INPUT before `at`, and it is what stops `a$1` — a
+// perfectly legal unquoted MySQL identifier, since `$` is an identifier
+// character here unlike in Postgres — from being read as the identifier `a`
+// followed by a placeholder. After a quoted run, a comment or a placeholder it
+// is reset to a space: no unquoted identifier can continue across one.
+class sqlScanner {
+  s: string
+  b: []byte
+  at: int
+  mark: int
+  out: string
+  order: []int
+  prev: int
+  ansi: bool
+  // Consume the one construct that starts at `at`.
+  step(): ()! {
+    let c = int(this.b[this.at])
+    if (this.quoted(c)?) {
+      return
+    }
+    if (this.comment(c)?) {
+      return
+    }
+    if (this.placeholder(c)?) {
+      return
+    }
+    this.prev = c
+    this.at = this.at + 1
+  }
+
+  // A quoted run: a string literal, a backtick identifier, or whichever of the
+  // two a double quote means under the server's SQL mode.
+  //
+  // BACKSLASH ESCAPES APPLY IN STRINGS, NOT IN IDENTIFIERS. A backtick
+  // identifier ends at the next backtick whatever precedes it (`` `a\` `` is the
+  // identifier `a\`), and so does a double-quoted identifier under ANSI_QUOTES;
+  // a backslash inside either is an ordinary character.
+  quoted(c: int): bool! {
+    if (c == byteSingleQuote) {
+      this.skipQuoted(c, true)?
+      return true
+    }
+    if (c == byteDoubleQuote) {
+      this.skipQuoted(c, !this.ansi)?
+      return true
+    }
+    if (c == byteBacktick) {
+      this.skipQuoted(c, false)?
+      return true
+    }
+    return false
+  }
+
+  // Everything up to and including the closing `q`. A doubled quote (`'it''s'`,
+  // ``ident`` ``) is an escaped quote, not the end of the run.
+  //
+  // An unterminated run FAILS rather than swallowing the rest of the statement:
+  // no server would run it either, and a scanner that quietly hid the remaining
+  // placeholders would report a parameter count that disagreed with the caller's
+  // for a reason nothing in the message explained.
+  //
+  // Bounded by `len(this.b)`: every iteration advances `at`.
+  skipQuoted(q: int, escapes: bool): ()! {
+    this.at = this.at + 1
+    while (this.at < len(this.b)) {
+      let c = int(this.b[this.at])
+      this.at = this.at + 1
+      if (escapes && c == byteBackslash) {
+        this.at = this.at + 1
+        continue
+      }
+      if (c == q && this.peek(0) == q) {
+        this.at = this.at + 1
+        continue
+      }
+      if (c == q) {
+        this.prev = byteSpace
+        return
+      }
+    }
+    fail newError("mysql: the statement ends inside " + quoteName(q))
+  }
+
+  // A comment, in any of MySQL's three spellings.
+  //
+  // `--` IS A COMMENT ONLY WHEN A SPACE FOLLOWS (MySQL requires it, unlike
+  // standard SQL), so `x--1` stays arithmetic. `/*!...*/` — MySQL's executable
+  // comment, whose contents the server really does run — is skipped like any
+  // other block comment: a placeholder inside one is not supported, and the
+  // server rejects the `$1` that reaches it loudly rather than binding the wrong
+  // value quietly.
+  comment(c: int): bool! {
+    if (c == byteHash) {
+      this.skipLine()
+      return true
+    }
+    if (c == byteDash && this.peek(1) == byteDash && spaceish(this.peek(2))) {
+      this.skipLine()
+      return true
+    }
+    if (c == byteSlash && this.peek(1) == byteStar) {
+      this.skipBlock()?
+      return true
+    }
+    return false
+  }
+
+  // To the end of the line, the newline left in place — it is whitespace the
+  // statement still needs.
+  //
+  // Bounded by `len(this.b)`.
+  skipLine() {
+    while (this.at < len(this.b) && int(this.b[this.at]) != byteNewline) {
+      this.at = this.at + 1
+    }
+    this.prev = byteSpace
+  }
+
+  // To the closing `*/`. Unterminated fails, for the reason `skipQuoted` gives.
+  //
+  // Bounded by `len(this.b)`.
+  skipBlock(): ()! {
+    this.at = this.at + 2
+    while (this.at < len(this.b)) {
+      if (int(this.b[this.at]) == byteStar && this.peek(1) == byteSlash) {
+        this.at = this.at + 2
+        this.prev = byteSpace
+        return
+      }
+      this.at = this.at + 1
+    }
+    fail newError("mysql: the statement ends inside a /* */ comment")
+  }
+
+  // `$N`, if this really is one. A `$` that follows an identifier character is
+  // part of that identifier (`col$1`), and a `$` with no digit after it is an
+  // ordinary byte; both return false and are copied through by `step`.
+  placeholder(c: int): bool! {
+    if (c != byteDollar || identByte(this.prev) || !digitByte(this.peek(1))) {
+      return false
+    }
+    let start = this.at
+    let n = this.readIndex()?
+    this.out = this.out + this.s[this.mark:start] + "?"
+    this.mark = this.at
+    this.order = append(this.order, n)
+    this.prev = byteSpace
+    return true
+  }
+
+  // The digits after the `$`, as a number, with `end` left one past the last of
+  // them. `$10` IS PARAMETER TEN — reading it as `$1` followed by a literal `0`
+  // is the classic version of this bug, and it corrupts every statement with ten
+  // or more parameters.
+  //
+  // Bounded by `len(this.b)`. `at` is left one past the last digit.
+  readIndex(): int! {
+    let i = this.at + 1
+    let n = 0
+    while (i < len(this.b) && digitByte(int(this.b[i]))) {
+      n = n * 10 + int(this.b[i]) - byteZero
+      i = i + 1
+      if (n > maxPlaceholderIndex) {
+        fail newError(
+            "mysql: placeholder index above " +
+            "${maxPlaceholderIndex} at byte ${this.at}; MySQL takes at most " +
+            "that many parameters",
+        )
+      }
+    }
+    if (n < 1) {
+      fail newError("mysql: $0 is not a placeholder; std/sql numbers " + "parameters from $1")
+    }
+    this.at = i
+    return n
+  }
+
+  // The byte `k` ahead of `at`, or -1 past the end. One accessor rather than a
+  // bounds test at every peek site.
+  peek(k: int): int {
+    if (this.at + k >= len(this.b)) {
+      return 0 - 1
+    }
+    return int(this.b[this.at + k])
+  }
+}
+
+// Which quoted run was left open, for `skipQuoted`'s failure.
+fn quoteName(q: int): string {
+  if (q == byteSingleQuote) {
+    return "a single-quoted string literal"
+  }
+  if (q == byteBacktick) {
+    return "a backtick-quoted identifier"
+  }
+  return "a double-quoted string or identifier"
+}
+
+// An identifier byte in MySQL's sense: letters, digits, `_`, `$`, and anything
+// above ASCII (MySQL allows extended characters in unquoted identifiers). This
+// is deliberately GENEROUS — every byte it accepts is a byte that stops a `$1`
+// from being rewritten, so a false positive costs a loud server-side syntax
+// error and a false negative costs a silently wrong query.
+fn identByte(c: int): bool {
+  if (c >= byteLowerA && c <= byteLowerZ) {
+    return true
+  }
+  if (c >= byteUpperA && c <= byteUpperZ) {
+    return true
+  }
+  if (digitByte(c)) {
+    return true
+  }
+  return c == byteUnderscore || c == byteDollar || c >= 128
+}
+
+// An ASCII digit.
+fn digitByte(c: int): bool {
+  return c >= byteZero && c <= byteNine
+}
+
+// Whitespace, a control character, or the end of the statement: what MySQL
+// requires after `--` before it will call it a comment.
+fn spaceish(c: int): bool {
+  return c < 0 || c <= byteSpace
+}
