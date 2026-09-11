@@ -990,8 +990,8 @@ fixed-offset zone. Call `.withZone(z)` when the real zone is known from elsewher
 This is why storing a zone name alongside a timestamp matters for anything that
 must later be re-rendered in local time.
 
-```bit ignore
-import { parseDate, parseDateTime, parseWith } from "std/time"
+```bit
+import { parseDate, parseWith, Date, NaiveDateTime } from "std/time"
 
 fn fromCsv(field: string): Date! {
   return parseDate(field)?
@@ -1001,6 +1001,46 @@ fn fromUkCsv(field: string): NaiveDateTime! {
   return parseWith("dd/MM/yyyy", field)?
 }
 ```
+
+### `parseDate(s: string): Date!`
+
+The calendar date `s` names, which must be exactly `YYYY-MM-DD` — what
+`Date.toString` writes. Any other length fails, which is what rejects surrounding
+whitespace and a trailing character. The month and day bounds are `date`'s own,
+leap years included, so `parseDate("2026-02-30")` fails rather than rolling into
+March.
+
+### `parseTime(s: string): Time!`
+
+The time of day `s` names: `HH:MM:SS`, with an optional `.` and 1 to 9
+fractional-second digits. A `:60` leap second fails, by `timeNs`'s own bound.
+
+### `parseNaiveDateTime(s: string): NaiveDateTime!`
+
+The wall-clock reading `s` names: a date, an uppercase `T`, and a time of day. A
+lowercase `t` fails.
+
+### `parseDateTime(s: string): DateTime!`
+
+The zoned value `s` names: a wall clock, then `Z` or a `+HH:MM` / `-HH:MM`
+offset. The zone is a **fixed offset**, named by the offset itself — `+04:00` —
+with `isDst()` false; `Z` yields `utc()`. An IANA zone name is not recoverable
+from an offset and is never guessed at.
+
+### `parseWith(pattern: string, s: string): NaiveDateTime!`
+
+The wall clock `s` names when read against the LDML `pattern`, the same pattern
+language and the same token table `format` writes with ([Formatting](#formatting)).
+
+A numeric field written `width` times reads exactly `width` digits, and at width 1
+reads a greedy run of one or two — four for `y`. `yy` reads a two-digit year as
+2000..2099. `MMM`/`MMMM` and `E`/`EEEE` read the English month and day names
+`format` writes; a weekday name that contradicts the date fails. `h` needs an `a`
+to say `AM` or `PM`. A field the pattern does not name keeps its default, so
+`dd/MM/yyyy` gives midnight on that day.
+
+`Y` and `D` are rejected exactly as they are when formatting. So are `Z`, `X` and
+`V` — the result carries no zone — and `Q`, which names no month.
 
 ---
 

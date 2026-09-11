@@ -1,0 +1,578 @@
+// Bit standard library — time module, parsing (#4081).
+//
+// The inverse of the four canonical `toString` forms, plus `parseWith`, a
+// pattern-driven reader for foreign formats (docs/stdlib/time.md,
+// "Parsing", which is normative for everything below).
+//
+// Sibling of ./date.bit, ./timeofday.bit, ./naive.bit, ./zoned.bit,
+// ./zone.bit and ./zoneif.bit, same module (SPEC §17.1): `Date`, `Time`,
+// `NaiveDateTime`, `DateTime`, `Zone`, `ZoneData`, `Transition`, `date`,
+// `timeNs`, `utc`, `newError` and ./zoned.bit's `zonedFormatOffset` are
+// used here unqualified, no import, no redeclaration. Every private helper
+// is prefixed `ldmlp` to stay out of that flat namespace, the convention
+// ./civil.bit (`civil*`) and ./ldmlfmt.bit (`ldml*`) already follow.
+//
+// PARSING IS STRICT, DELIBERATELY. The input must match exactly and reach
+// the end of the string. Leading or trailing whitespace, a lowercase `t`
+// or `z`, an offset without its colon (`+0400`), a `:60` leap second, a
+// fractional second of ten or more digits, and any trailing character all
+// FAIL rather than being guessed at or truncated. Silent acceptance of
+// nearly-right input is how a wrong date reaches a ledger.
+//
+// A fractional second is accepted at 1 to 9 digits and zero-padded on the
+// right, so `.5` is 500000000 nanoseconds.
+//
+// Every calendar range check is delegated: `date` (./date.bit) owns the
+// month and day-in-month bounds, leap years included, and `timeNs`
+// (./timeofday.bit) owns hour, minute, second — which is what rejects a
+// `:60` leap second, with no second rule written here — and nanosecond.
+// This file validates the GRAMMAR: separators, field widths, digit runs,
+// and the zone.
+//
+// THE TOKEN TABLE IS ./ldmlfmt.bit's, NOT A SECOND ONE. `parseWith` calls
+// that file's `ldmlNextToken`, `ldmlIsDateSym`, `ldmlIsTimeSym`,
+// `ldmlIsZoneSym`, `ldmlMonthNames`, `ldmlDayNames` and
+// `ldmlRejectMessage` directly — a parser and a formatter that disagree
+// about `MMM` is a bug that shows up on one month of the year. `Y` and `D`
+// are rejected here with that file's own message, for the same reason it
+// rejects them.
+
+// The widths `parseWith` reads a numeric field at, one per symbol: a field
+// written `width` times reads exactly `width` digits, except at width 1,
+// which reads a greedy run of 1 up to the field's own maximum. So `yyyy`
+// reads four digits, `dd` two, and `d` one or two.
+const ldmlpYearDigits: int = 4
+const ldmlpFieldDigits: int = 2
+
+// "HH:MM:SS", the shortest time of day, and "YYYY-MM-DDTHH:MM:SS", the
+// shortest date-time — both before any fractional second or zone.
+const ldmlpTimeLen: int = 8
+const ldmlpDateLen: int = 10
+const ldmlpNaiveLen: int = 19
+
+// The nine digits a nanosecond field holds, and the six characters of a
+// `+HH:MM` zone offset.
+const ldmlpNanoDigits: int = 9
+const ldmlpOffsetLen: int = 6
+
+// A zone recovered from the end of a date-time, and where the wall clock
+// it belongs to ends: `wallEnd` is the index of the first character of the
+// zone, so `s[0:wallEnd]` is the wall-clock text.
+class LdmlpZone {
+  readonly z: Zone,
+  readonly wallEnd: int,
+}
+
+// A number read off the input: its value, and the index just past the last
+// digit consumed.
+class LdmlpNum {
+  readonly value: int,
+  readonly next: int,
+}
+
+// A name matched against a table (./ldmlfmt.bit's month or day names): its
+// index in that table, and the index just past it in the input.
+class LdmlpName {
+  readonly index: int,
+  readonly next: int,
+}
+
+// What `parseWith` has read so far. Defaults are 0001-01-01T00:00:00: a
+// pattern naming no date field parses to the first representable day
+// rather than failing, which is what makes a time-only pattern usable.
+// `dow` is 0 until an `E` field sets it, `hour12` says the hour came from
+// an `h` field and still needs its `a`, and `pm` is only read when
+// `hasMeridiem` is true.
+class LdmlpFields {
+  y: int,
+  mo: int,
+  d: int,
+  h: int,
+  min: int,
+  sec: int,
+  nanos: int,
+  dow: int,
+  hour12: bool,
+  pm: bool,
+  hasMeridiem: bool,
+}
+
+// Whether `s[i]` exists and is `c`. Every separator check goes through
+// this rather than indexing directly, so a short input fails with the
+// grammar's own message instead of reading past the end.
+fn ldmlpSep(s: string, i: int, c: u8): bool {
+  return i < len(s) && s[i] == c
+}
+
+// Whether `want` occurs in `s` starting at `p`, false when it would run
+// past the end.
+fn ldmlpHasAt(s: string, p: int, want: string): bool {
+  if (p + len(want) > len(s)) {
+    return false
+  }
+  return s[p:p + len(want)] == want
+}
+
+// Exactly `n` decimal digits at `s[start]`, as a nonnegative int. Fails on
+// a short input or the first non-digit — there is no sign and no space:
+// `parseDate(" 2026-09-01")` must fail, not skip.
+fn ldmlpDigits(s: string, start: int, n: int): int! {
+  if (start + n > len(s)) {
+    fail newError("parse: input ends inside a ${n}-digit field")
+  }
+  let v = 0
+  let i = 0
+  while (i < n) {
+    let c = s[start + i]
+    if (c < '0' || c > '9') {
+      fail newError("parse: '" + s[start + i:start + i + 1] + "' is not a digit")
+    }
+    v = v * 10 + i64(c - '0')
+    i = i + 1
+  }
+  return v
+}
+
+// The length of the run of ASCII digits starting at `s[start]`, 0 when
+// there is none. Never fails: an empty run is a valid answer the caller
+// checks against the width the grammar asked for.
+fn ldmlpRunLen(s: string, start: int): int {
+  let i = start
+  while (i < len(s) && s[i] >= '0' && s[i] <= '9') {
+    i = i + 1
+  }
+  return i - start
+}
+
+// 10^n for 0 <= n <= 9 — the right-padding factor for a fractional second
+// shorter than nine digits.
+fn ldmlpPow10(n: int): int {
+  let v = 1
+  let i = 0
+  while (i < n) {
+    v = v * 10
+    i = i + 1
+  }
+  return v
+}
+
+// --- The canonical forms -----------------------------------------------------
+
+// The calendar date `s` names, which must be exactly `YYYY-MM-DD`
+// (`Date.toString`'s own output). Fails on any other length — that is what
+// rejects surrounding whitespace and a trailing character — on a non-digit
+// or a wrong separator, and on a date no calendar has: `date` (./date.bit)
+// owns the month and day-in-month bounds, leap years included, so
+// `parseDate("2026-02-30")` fails rather than rolling into March.
+export fn parseDate(s: string): Date! {
+  if (len(s) != ldmlpDateLen) {
+    fail newError("parse: a date is exactly ${ldmlpDateLen} characters, YYYY-MM-DD")
+  }
+  return ldmlpDateAt(s, 0)?
+}
+
+// The `YYYY-MM-DD` at `s[p]`. The caller has already proved `s` is long
+// enough to hold it.
+fn ldmlpDateAt(s: string, p: int): Date! {
+  let y = ldmlpDigits(s, p, 4)?
+  if (!ldmlpSep(s, p + 4, '-')) {
+    fail newError("parse: expected '-' after the year")
+  }
+  let mo = ldmlpDigits(s, p + 5, 2)?
+  if (!ldmlpSep(s, p + 7, '-')) {
+    fail newError("parse: expected '-' after the month")
+  }
+  let d = ldmlpDigits(s, p + 8, 2)?
+  return date(y, mo, d)?
+}
+
+// The time of day `s` names: `HH:MM:SS`, with an optional `.` and 1 to 9
+// fractional-second digits (`Time.toString`'s own output, which writes
+// nine when the nanosecond field is nonzero). Fails on a `:60` leap second
+// — `timeNs` (./timeofday.bit) rejects any second above 59 — and on a
+// fraction of ten or more digits, which is never truncated.
+export fn parseTime(s: string): Time! {
+  return ldmlpTimeAt(s, 0, len(s))?
+}
+
+// The time of day in `s[p:end]`, which must fill it exactly.
+fn ldmlpTimeAt(s: string, p: int, end: int): Time! {
+  if (end - p < ldmlpTimeLen) {
+    fail newError("parse: a time of day is at least ${ldmlpTimeLen} characters, HH:MM:SS")
+  }
+  let h = ldmlpDigits(s, p, 2)?
+  if (!ldmlpSep(s, p + 2, ':')) {
+    fail newError("parse: expected ':' after the hour")
+  }
+  let min = ldmlpDigits(s, p + 3, 2)?
+  if (!ldmlpSep(s, p + 5, ':')) {
+    fail newError("parse: expected ':' after the minute")
+  }
+  let sec = ldmlpDigits(s, p + 6, 2)?
+  let nanos = ldmlpFraction(s, p + ldmlpTimeLen, end)?
+  return timeNs(h, min, sec, nanos)?
+}
+
+// The optional fractional second filling `s[p:end]`: nothing at all, or a
+// `.` and 1 to 9 digits zero-padded on the right, so `.5` is 500000000.
+// Ten digits fails rather than truncating — a truncated fraction is a
+// wrong instant that looks deliberate. Anything else at `p` is a trailing
+// character, which is also a failure.
+fn ldmlpFraction(s: string, p: int, end: int): int! {
+  if (p == end) {
+    return 0
+  }
+  if (s[p] != '.') {
+    fail newError("parse: unexpected characters after the seconds field")
+  }
+  let digits = end - p - 1
+  if (digits < 1 || digits > ldmlpNanoDigits) {
+    fail newError("parse: a fractional second is 1 to ${ldmlpNanoDigits} digits, never truncated")
+  }
+  return ldmlpDigits(s, p + 1, digits)? * ldmlpPow10(ldmlpNanoDigits - digits)
+}
+
+// The wall-clock reading `s` names: `YYYY-MM-DDTHH:MM:SS` with the
+// optional fraction (`NaiveDateTime.toString`'s own output). The `T` is
+// uppercase only; a lowercase `t` fails, as ISO 8601 permits it and this
+// module does not.
+export fn parseNaiveDateTime(s: string): NaiveDateTime! {
+  return ldmlpNaiveAt(s, len(s))?
+}
+
+// The wall clock filling `s[0:end]`.
+fn ldmlpNaiveAt(s: string, end: int): NaiveDateTime! {
+  if (end < ldmlpNaiveLen) {
+    fail newError("parse: a date-time is at least ${ldmlpNaiveLen} characters, YYYY-MM-DDTHH:MM:SS")
+  }
+  if (!ldmlpSep(s, ldmlpDateLen, 'T')) {
+    fail newError("parse: expected an uppercase 'T' between the date and the time of day")
+  }
+  let d = ldmlpDateAt(s, 0)?
+  let t = ldmlpTimeAt(s, ldmlpDateLen + 1, end)?
+  return NaiveDateTime{ dt: d, tm: t }
+}
+
+// The zoned value `s` names: a wall clock, then `Z` or a `+HH:MM` /
+// `-HH:MM` offset (`DateTime.toString`'s own output, which always writes
+// the numeric form).
+//
+// THE RESULT'S ZONE IS A FIXED OFFSET, NOT AN IANA ZONE. `+04:00` does not
+// say which zone it came from — Asia/Dubai, Europe/Samara and Asia/Baku
+// all write it — so `zone().name` is the offset itself, `"+04:00"`, and
+// `isDst()` is false. `Asia/Dubai` is NOT recoverable from this text and
+// this function never guesses it; a caller who knows the real zone from
+// elsewhere calls `.withZone(z)`. `Z` yields the `utc()` zone, whose name
+// is `"UTC"`.
+export fn parseDateTime(s: string): DateTime! {
+  let z = ldmlpZoneAt(s)?
+  let wall = ldmlpNaiveAt(s, z.wallEnd)?
+  return wall.inZone(z.z)
+}
+
+// The zone at the END of `s`: an uppercase `Z`, or a signed `HH:MM`
+// offset. A lowercase `z`, and an offset without its colon, both fall
+// through to the failure below rather than being accepted — `+0400` is
+// exactly the input a lenient parser reads as `+04:00` and a stricter one
+// reads as garbage, so it is refused.
+fn ldmlpZoneAt(s: string): LdmlpZone! {
+  let n = len(s)
+  if (n > 0 && s[n - 1] == 'Z') {
+    return LdmlpZone{ z: utc(), wallEnd: n - 1 }
+  }
+  if (n < ldmlpOffsetLen) {
+    fail newError("parse: missing zone; expected an uppercase 'Z' or a +HH:MM offset")
+  }
+  let at = n - ldmlpOffsetLen
+  if (s[at] != '+' && s[at] != '-') {
+    fail newError("parse: expected an uppercase 'Z' or a +HH:MM offset with its colon")
+  }
+  return LdmlpZone{ z: ldmlpFixedZone(ldmlpOffset(s, at)?), wallEnd: at }
+}
+
+// The signed `HH:MM` offset at `s[at]`, in seconds east of UTC, which is
+// the sign convention `DateTime.offset()` reports and `Zone` stores.
+fn ldmlpOffset(s: string, at: int): int! {
+  let sign = 1
+  if (s[at] == '-') {
+    sign = -1
+  }
+  let oh = ldmlpDigits(s, at + 1, 2)?
+  if (!ldmlpSep(s, at + 3, ':')) {
+    fail newError("parse: a zone offset needs its colon, as in +04:00")
+  }
+  let om = ldmlpDigits(s, at + 4, 2)?
+  if (oh > 23) {
+    fail newError("parse: zone offset hour out of range")
+  }
+  if (om > 59) {
+    fail newError("parse: zone offset minute out of range")
+  }
+  return sign * (oh * 3600 + om * 60)
+}
+
+// A zone with no transitions and `off` in effect at every instant, named
+// by the offset it carries — `zonedFormatOffset` (./zoned.bit) renders the
+// name, so the name and the offset cannot drift apart, and `-00:00` comes
+// back as `"+00:00"`. Never touches the filesystem and never fails; with
+// no transitions, `zoneIsDstAt` (./zone.bit) answers false everywhere.
+fn ldmlpFixedZone(off: int): Zone {
+  return Zone{
+    name: zonedFormatOffset(off),
+    data: ZoneData{ transitions: []Transition(0), fallback: off },
+  }
+}
+
+// --- parseWith ---------------------------------------------------------------
+
+// The wall clock `s` names when read against the LDML pattern `pattern`,
+// the same pattern language `format` writes (docs/stdlib/time.md,
+// "Formatting"), scanned by ./ldmlfmt.bit's own tokeniser.
+//
+// A numeric field written `width` times reads exactly `width` digits, and
+// at width 1 reads a greedy run of one or two (four for `y`). `MMM` and
+// `MMMM` read ./ldmlfmt.bit's English month names, `E`/`EEE` and `EEEE`
+// its day names — the same tables `format` writes, never a second copy.
+// `yy` reads a two-digit year as 2000..2099. `h` needs an `a` to say AM or
+// PM. A weekday name is checked against the date the other fields give,
+// rather than trusted or ignored.
+//
+// A field the pattern does not name keeps its default, so `dd/MM/yyyy`
+// gives midnight on that day and `HH:mm` gives that time on 0001-01-01.
+// Fails on `Y` and `D` with ./ldmlfmt.bit's own message, on a zone symbol
+// (`Z`, `X`, `V` — the result carries no zone), on `Q`, on an unknown
+// pattern letter, on any literal the input does not match, and on input
+// left over once the pattern is satisfied.
+export fn parseWith(pattern: string, s: string): NaiveDateTime! {
+  let f = ldmlpScan(pattern, s)?
+  let d = date(f.y, f.mo, f.d)?
+  if (f.dow > 0 && d.dayOfWeek() != f.dow) {
+    fail newError("parse: the weekday name does not match the date it was read with")
+  }
+  let t = timeNs(ldmlpHour(f)?, f.min, f.sec, f.nanos)?
+  return NaiveDateTime{ dt: d, tm: t }
+}
+
+// `pattern` read against `s`, field by field. The scan is bounded: every
+// token's `next` is strictly greater than the index it started at
+// (./ldmlfmt.bit's `ldmlNextToken`), so `i` reaches `len(pattern)` in at
+// most that many steps.
+fn ldmlpScan(pattern: string, s: string): LdmlpFields! {
+  let f = LdmlpFields{
+    y: 1, mo: 1, d: 1, h: 0, min: 0, sec: 0, nanos: 0,
+    dow: 0, hour12: false, pm: false, hasMeridiem: false,
+  }
+  let i = 0
+  let p = 0
+  while (i < len(pattern)) {
+    let tok = ldmlNextToken(pattern, i)?
+    if (tok.isField) {
+      p = ldmlpField(f, tok.text, tok.width, s, p)?
+    } else {
+      p = ldmlpLiteral(tok.text, s, p)?
+    }
+    i = tok.next
+  }
+  if (p != len(s)) {
+    fail newError("parse: input left over once the pattern was satisfied")
+  }
+  return f
+}
+
+// A literal run of the pattern, which the input must carry verbatim.
+fn ldmlpLiteral(text: string, s: string, p: int): int! {
+  if (!ldmlpHasAt(s, p, text)) {
+    fail newError("parse: expected '" + text + "' at index ${p}")
+  }
+  return p + len(text)
+}
+
+// One field, `sym` repeated `width` times, read into `f`. Returns the
+// index just past what it consumed.
+fn ldmlpField(f: LdmlpFields, sym: string, width: int, s: string, p: int): int! {
+  if (sym == "Y" || sym == "D") {
+    fail newError(ldmlRejectMessage(sym))
+  }
+  if (ldmlIsZoneSym(sym)) {
+    fail newError("parse: '${sym}' is a zone field and a NaiveDateTime has no zone")
+  }
+  if (ldmlIsDateSym(sym)) {
+    return ldmlpDateField(f, sym, width, s, p)?
+  }
+  if (ldmlIsTimeSym(sym)) {
+    return ldmlpTimeField(f, sym, width, s, p)?
+  }
+  fail newError("parse: '" + sym + "' is not an LDML pattern symbol this module implements")
+}
+
+// `y`, `M`, `d` and `E`. `Q` is the one date symbol `format` writes that
+// nothing can be read back from — a quarter names no month — so it is
+// rejected rather than silently ignored.
+fn ldmlpDateField(f: LdmlpFields, sym: string, width: int, s: string, p: int): int! {
+  if (sym == "y") {
+    let r = ldmlpNumber(s, p, width, ldmlpYearDigits)?
+    f.y = ldmlpYear(r.value, width)
+    return r.next
+  }
+  if (sym == "M") {
+    return ldmlpMonthField(f, width, s, p)?
+  }
+  if (sym == "d") {
+    let r = ldmlpNumber(s, p, width, ldmlpFieldDigits)?
+    f.d = r.value
+    return r.next
+  }
+  if (sym == "E") {
+    return ldmlpWeekdayField(f, width, s, p)?
+  }
+  fail newError("parse: 'Q' is a quarter, which names no month; a date cannot be read back from it")
+}
+
+// `yy` is 2000..2099 — the century a two-digit year is written with today,
+// and the only reading that round-trips `format("yy")` inside it. Any
+// other width is the year as written.
+fn ldmlpYear(v: int, width: int): int {
+  if (width == 2) {
+    return 2000 + v
+  }
+  return v
+}
+
+// `M`/`MM` numeric, `MMM` the three-letter English abbreviation, `MMMM`
+// the full English name — ./ldmlfmt.bit's table both times. `MMMMM` is not
+// implemented there and is not read here.
+fn ldmlpMonthField(f: LdmlpFields, width: int, s: string, p: int): int! {
+  if (width <= 2) {
+    let r = ldmlpNumber(s, p, width, ldmlpFieldDigits)?
+    f.mo = r.value
+    return r.next
+  }
+  if (width > 4) {
+    fail newError("parse: 'MMMMM' and wider are not implemented; use M, MM, MMM or MMMM")
+  }
+  let m = ldmlpMatchName(ldmlMonthNames(), width, s, p, "month")?
+  f.mo = m.index + 1
+  return m.next
+}
+
+// `E`, `EE` and `EEE` the three-letter English abbreviation, `EEEE` the
+// full name — ./ldmlfmt.bit's day table, Monday first. The match is
+// recorded as an ISO weekday (1 for Monday) and checked against the parsed
+// date in `parseWith`: a name that contradicts the date is a corrupt row,
+// not a detail to drop.
+fn ldmlpWeekdayField(f: LdmlpFields, width: int, s: string, p: int): int! {
+  if (width > 4) {
+    fail newError("parse: 'EEEEE' and wider are not implemented; use E, EEE or EEEE")
+  }
+  let m = ldmlpMatchName(ldmlDayNames(), width, s, p, "weekday")?
+  f.dow = m.index + 1
+  return m.next
+}
+
+// The first of `names` that matches at `s[p]` — abbreviated to its first
+// three letters at width 3 or less, in full at width 4, the same split
+// ./ldmlfmt.bit renders with. `label` names the field in the failure.
+fn ldmlpMatchName(names: []string, width: int, s: string, p: int, label: string): LdmlpName! {
+  let i = 0
+  while (i < len(names)) {
+    let want = names[i]
+    if (width <= 3) {
+      want = want[0:3]
+    }
+    if (ldmlpHasAt(s, p, want)) {
+      return LdmlpName{ index: i, next: p + len(want) }
+    }
+    i = i + 1
+  }
+  fail newError("parse: no " + label + " name matches at index ${p}")
+}
+
+// `H`, `h`, `m`, `s`, `S` and `a`.
+fn ldmlpTimeField(f: LdmlpFields, sym: string, width: int, s: string, p: int): int! {
+  if (sym == "S") {
+    return ldmlpFractionField(f, width, s, p)?
+  }
+  if (sym == "a") {
+    return ldmlpMeridiemField(f, s, p)?
+  }
+  let r = ldmlpNumber(s, p, width, ldmlpFieldDigits)?
+  if (sym == "H") {
+    f.h = r.value
+  } else if (sym == "h") {
+    f.h = r.value
+    f.hour12 = true
+  } else if (sym == "m") {
+    f.min = r.value
+  } else {
+    f.sec = r.value
+  }
+  return r.next
+}
+
+// `S` repeated `width` times: exactly `width` digits of the fractional
+// second, zero-padded on the right, so `SSS` on `123` is 123000000
+// nanoseconds. At most nine, the same ceiling `format` writes.
+fn ldmlpFractionField(f: LdmlpFields, width: int, s: string, p: int): int! {
+  if (width > ldmlpNanoDigits) {
+    fail newError("parse: 'S' repeats at most ${ldmlpNanoDigits} times, one per nanosecond place")
+  }
+  f.nanos = ldmlpDigits(s, p, width)? * ldmlpPow10(ldmlpNanoDigits - width)
+  return p + width
+}
+
+// `a`: `AM` or `PM`, uppercase only — the only spelling `format` writes,
+// and this module does not accept input it would not have produced.
+fn ldmlpMeridiemField(f: LdmlpFields, s: string, p: int): int! {
+  if (ldmlpHasAt(s, p, "AM")) {
+    f.hasMeridiem = true
+    f.pm = false
+    return p + 2
+  }
+  if (ldmlpHasAt(s, p, "PM")) {
+    f.hasMeridiem = true
+    f.pm = true
+    return p + 2
+  }
+  fail newError("parse: expected 'AM' or 'PM' at index ${p}")
+}
+
+// A numeric field: exactly `width` digits, or at width 1 a greedy run of 1
+// up to `maxDigits`. Fails when the pattern asks for more digits than the
+// field can hold, and when the input has fewer than the width demands —
+// `dd` on `1/9/2026` fails rather than reading `1/`.
+fn ldmlpNumber(s: string, p: int, width: int, maxDigits: int): LdmlpNum! {
+  if (width > maxDigits) {
+    fail newError("parse: a numeric field of this kind is at most ${maxDigits} digits wide")
+  }
+  let n = width
+  if (width == 1) {
+    n = ldmlpRunLen(s, p)
+    if (n > maxDigits) {
+      n = maxDigits
+    }
+  }
+  if (n < 1) {
+    fail newError("parse: expected a digit at index ${p}")
+  }
+  return LdmlpNum{ value: ldmlpDigits(s, p, n)?, next: p + n }
+}
+
+// The 0..23 hour `f` holds. An `h` field carries a 1..12 reading that only
+// becomes an hour once `a` says which half of the day it is in, so a
+// pattern with `h` and no `a` fails rather than assuming the morning.
+fn ldmlpHour(f: LdmlpFields): int! {
+  if (!f.hour12) {
+    return f.h
+  }
+  if (!f.hasMeridiem) {
+    fail newError("parse: 'h' is the 12-hour clock and needs an 'a' field to say AM or PM")
+  }
+  if (f.h < 1 || f.h > 12) {
+    fail newError("parse: a 12-hour clock hour is 1 to 12")
+  }
+  let h = f.h % 12
+  if (f.pm) {
+    return h + 12
+  }
+  return h
+}
