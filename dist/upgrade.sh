@@ -85,7 +85,13 @@ if [ -n "${BIT_VERSION:-}" ]; then
   version="$BIT_VERSION"
 else
   latest_url="https://api.github.com/repos/${REPO}/releases/latest"
-  tag="$(curl -fsSL "$latest_url" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  # The body is captured whole and parsed after, rather than piped into a
+  # `grep -m1` that exits on the first match: the early exit leaves curl
+  # writing into a closed pipe, and curl reports that on stderr as
+  # `curl: (56) Failure writing output to destination` on every single run.
+  latest_json="$(curl -fsSL "$latest_url")" \
+    || die "could not reach $latest_url"
+  tag="$(printf '%s\n' "$latest_json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$tag" ] || die "could not resolve latest release tag from $latest_url"
   version="${tag#v}"
 fi
