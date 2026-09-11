@@ -1,0 +1,345 @@
+// Parser: the literal and access productions of the expression grammar —
+// `[`-led primaries (slice/array types used as values, slice literals),
+// composite literals and their field/map entries, interpolated strings, and
+// index/slice postfix. Split out of parserexpr.bit (#3943) to keep that file
+// under the 800-line ceiling; sibling .bit files are the same module, so this
+// is a pure move.
+
+// A `[`-led primary: a `[]T`/`[N]T` type used as a value (conversion/composite
+// callee, e.g. `[]byte(x)`), or a slice literal `[a, b, c]`. Lookahead picks the
+// shape (`bracketOpensType`) and speculation confirms it, matching the seed on
+// both counts.
+fn parseBracketPrimary(p: Parser): int {
+  // The `[` bounds these types and is not a kid — same explicit-Span rule as
+  // parseSliceOrArrayType below.
+  let open = peekTok(p)
+  if (bracketOpensType(p)) {
+    // The lookahead above decides the SHAPE; the seed additionally requires the
+    // whole `[]T{…}` / `[]T(…)` to parse CLEANLY, because its `fail` aborts
+    // speculation, so one diagnostic anywhere inside re-parses the `[` as a bare
+    // slice literal. Mirror that with the mark/dmark idiom (as `catch` binds do):
+    // on truncated input the body never closes, and without this the two
+    // compilers report entirely different parses (#1515).
+    let mark = p.pos
+    let dmark = len(p.diags.list)
+    let node = parseSliceOrArrayTypePrimary(p, open)
+    if (len(p.diags.list) == dmark) {
+      return node
+    }
+    truncateDiags(p.diags, dmark)
+    p.pos = mark
+  }
+  // Both brackets bound the literal and neither is a kid, so `mkNode` would span
+  // `1, 2, 3` where the seed spans `[1, 2, 3]`.
+  advance(p)
+  let items = []int(0)
+  while (!atListClose(p, Kind.RBracket)) {
+    items = append(items, parseArgItem(p))
+    if (!acceptTok(p, Kind.Comma)) {
+      break
+    }
+  }
+  let rbEnd = peekTok(p).end
+  expect(p, Kind.RBracket)
+  return addNode(
+    p.tree, Tag.SliceLit,
+    Span{ file: p.file, start: open.start, end: rbEnd }, 0, items,
+  )
+}
+
+// Does the `[` at the cursor open a slice/array TYPE rather than a slice literal?
+// The element type is what distinguishes `[]T` from the EMPTY literal `[]`: a
+// slice type must name one, so a token after `]` that cannot start a type means
+// this is `[]`. Without this guard `let xs: []string = []` consumed the NEXT
+// statement as its element type (#1441).
+fn bracketOpensType(p: Parser): bool {
+  if (peekKindAt(p, 1) == Kind.RBracket && canStartType(peekKindAt(p, 2))) {
+    return true
+  }
+  return peekKindAt(p, 1) == Kind.IntLit &&
+    peekKindAt(p, 2) == Kind.RBracket &&
+    canStartType(peekKindAt(p, 3))
+}
+
+// `[]T` / `[N]T` in value position, plus the `{…}` composite body or `(…)`
+// conversion that may follow it (the seed's `trySliceOrArrayTypePrimary`). The
+// body is parsed HERE, not left to the postfix loop, so that the caller's
+// speculation covers it — which is the whole point of speculating.
+fn parseSliceOrArrayTypePrimary(p: Parser, open: Token): int {
+  advance(p)
+  let size = 0
+  let tag = Tag.SliceType
+  if (peekKind(p) == Kind.IntLit) {
+    size = leaf(p, Tag.IntLit)
+    tag = Tag.ArrayType
+  }
+  advance(p)
+  let elem = parseType(p)
+  let tySpan = Span{ file: p.file, start: open.start, end: getNode(p.tree, elem).span.end }
+  let kids = [elem]
+  if (tag == Tag.ArrayType) {
+    kids = [size, elem]
+  }
+  let ty = addNode(p.tree, tag, tySpan, 0, kids)
+  if (peekKind(p) == Kind.LBrace) {
+    return parseCompositeLit(p, ty)
+  }
+  if (peekKind(p) != Kind.LParen) {
+    return ty
+  }
+  advance(p)
+  let argNodes = []int(0)
+  while (!atListClose(p, Kind.RParen)) {
+    argNodes = append(argNodes, parseArgItem(p))
+    if (!acceptTok(p, Kind.Comma)) {
+      break
+    }
+  }
+  let rpEnd = peekTok(p).end
+  expect(p, Kind.RParen)
+  let args = mkNode(p, Tag.Args, 0, argNodes)
+  return addNode(
+    p.tree, Tag.Call,
+    Span{ file: p.file, start: open.start, end: rpEnd }, 0, [ty, 0, args],
+  )
+}
+
+// `field_init = IDENT [ ( ":" | "=" ) expression ]` (SPEC §12.2, #3840). `=` is
+// the target spelling — `:` means "has type", `=` means "gets value" — but the
+// pinned stage0 that builds this very tree still knows only `:`, so both are
+// accepted here and NOTHING is renamed: the 4350 existing `:` sites stay `:`.
+// The formatter keeps emitting `:` regardless of which spelling the source
+// used (see fmtexpr.bit's `Tag.FieldInit` case, which is unconditional on
+// `main != 1` and never looks at which token was consumed) — flipping that is
+// the sweep, not this step. A bare `IDENT` is shorthand for `IDENT: IDENT`
+// (#3735): desugar it here, before type checking, by synthesizing a second
+// Ident node over the SAME span as the name — every later stage (resolve,
+// check, lower) already treats a FieldInit's second kid as an ordinary value
+// expression, so it resolves and type-checks exactly as the explicit form
+// would, with no downstream change. `main: 1` marks the node as shorthand for
+// the formatter, which must print it back as `IDENT`, not `IDENT: IDENT` (the
+// same `main`-as-flag shape `Tag.LetDecl` uses for `@threadlocal`, see
+// fmtdispatch.bit).
+//
+// The shorthand branch only fires when `,` or `}` immediately follows — the
+// two tokens that can legitimately close a field_init item. Anything else
+// means this IDENT was never a real field_init in the first place (found by
+// #3735's own diagnostic differential: malformed input like `for (a, b) in m
+// { print(...) }` recovers through composite-literal parsing and reaches here
+// with `print` as `name` and `(` next). That case must fall through to the
+// original `expect(p, Kind.Colon)` + `parseExpr(p)` path unchanged, since
+// `expect` is lenient (does not consume on mismatch, compiler/parser.bit:282)
+// and the pinned oracle's diagnostic stream depends on `parseExpr` then
+// running from the unconsumed token — silently swallowing that here regressed
+// `_tests_/cases/check_forin_pair_binder.bit` against the oracle. The oracle
+// knows only `:`, so the fallback error still probes `Kind.Colon` — keeping
+// that diagnostic text unchanged is what keeps `selfhost-diffcheck` matching.
+fn parseFieldInit(p: Parser): int {
+  let name = expectIdent(p)
+  if (!acceptTok(p, Kind.Colon) && !acceptTok(p, Kind.Eq)) {
+    if (peekKind(p) == Kind.Comma || peekKind(p) == Kind.RBrace) {
+      let valueRef = addLeaf(p.tree, Tag.Ident, getNode(p.tree, name).span)
+      return mkNode(p, Tag.FieldInit, 1, [name, valueRef])
+    }
+    expect(p, Kind.Colon)
+  }
+  let e = parseExpr(p)
+  return mkNode(p, Tag.FieldInit, 0, [name, e])
+}
+
+// `key : val` — one map composite-literal entry.
+fn parseMapEntry(p: Parser): int {
+  let key = parseExpr(p)
+  expect(p, Kind.Colon)
+  let val = parseExpr(p)
+  return mkNode(p, Tag.MapEntry, 0, [key, val])
+}
+
+// A composite literal `Type{ ... }` — `[type, body]`. The body shape follows the
+// type: a class name/generic-inst has keyed `field_inits`; a `map<K,V>` has
+// `map_entries`; a slice/array type has positional `args`.
+fn parseCompositeLit(p: Parser, typeNode: int): int {
+  advance(p)
+  let tt = getNode(p.tree, typeNode).tag
+  let items = []int(0)
+  let bodyTag = Tag.FieldInits
+  if (tt == Tag.MapType) {
+    bodyTag = Tag.MapEntries
+    while (!atListClose(p, Kind.RBrace)) {
+      items = append(items, parseMapEntry(p))
+      if (!acceptTok(p, Kind.Comma)) {
+        break
+      }
+    }
+  } else if (tt == Tag.SliceType || tt == Tag.ArrayType) {
+    bodyTag = Tag.Args
+    while (!atListClose(p, Kind.RBrace)) {
+      items = append(items, parseArgItem(p))
+      if (!acceptTok(p, Kind.Comma)) {
+        break
+      }
+    }
+  } else {
+    while (!atListClose(p, Kind.RBrace)) {
+      items = append(items, parseFieldInit(p))
+      if (!acceptTok(p, Kind.Comma)) {
+        break
+      }
+    }
+  }
+  // The literal runs from its TYPE to the closing `}`, and neither delimiter is a
+  // kid — `mkNode` would end the span at the last field, one `}` short of the
+  // seed (E0075 underlining `S{ a: 1` for `S{ a: 1 }`). The seed gives the body
+  // node the same whole-literal span, so mirror that too.
+  let closeEnd = peekTok(p).end
+  expect(p, Kind.RBrace)
+  let lit = Span{ file: p.file, start: getNode(p.tree, typeNode).span.start, end: closeEnd }
+  let body = addNode(p.tree, bodyTag, lit, 0, items)
+  return addNode(p.tree, Tag.CompositeLit, lit, 0, [typeNode, body])
+}
+
+// `str_interp = str_part { interp_start expression interp_end str_part }`.
+fn parseInterpString(p: Parser): int {
+  let parts = []int(0)
+  let guard = 0
+  while (guard < 4096) {
+    parts = append(parts, leaf(p, Tag.StrPart))
+    if (!acceptTok(p, Kind.InterpStart)) {
+      break
+    }
+    parts = append(parts, parseExpr(p))
+    // Named, not `expect`: `describe(InterpEnd)` is "a string", but what the
+    // user must actually close the interpolation with is `}`.
+    expectMsg(p, Kind.InterpEnd, "'}'")
+    guard = guard + 1
+  }
+  return mkNode(p, Tag.StrInterp, 0, parts)
+}
+
+// `recv[i]` index or `recv[lo:hi]` slice (either bound optional).
+fn parseIndexOrSlice(p: Parser, recv: int): int {
+  advance(p)
+  let lo = 0
+  if (peekKind(p) != Kind.Colon) {
+    lo = parseExpr(p)
+  }
+  // Both forms run from the receiver through the closing `]`, which is not a kid
+  // — `mkNode` would stop at the last index expression, one column short of the
+  // seed (and for `xs[:]` the bounds are absent entirely).
+  let recvStart = getNode(p.tree, recv).span.start
+  if (acceptTok(p, Kind.Colon)) {
+    let hi = 0
+    if (peekKind(p) != Kind.RBracket) {
+      hi = parseExpr(p)
+    }
+    let sliceEnd = peekTok(p).end
+    expect(p, Kind.RBracket)
+    return addNode(
+      p.tree, Tag.SliceExpr,
+      Span{ file: p.file, start: recvStart, end: sliceEnd }, 0, [recv, lo, hi],
+    )
+  }
+  let idxEnd = peekTok(p).end
+  expect(p, Kind.RBracket)
+  return addNode(
+    p.tree, Tag.Index,
+    Span{ file: p.file, start: recvStart, end: idxEnd }, 0, [recv, lo],
+  )
+}
+
+// The parameter list of a SPECULATED arrow, starting just inside the `(`.
+// Returns the `arrow_p` nodes and whether every item had a parameter's shape;
+// `false` means this was never an arrow and the caller must roll back. The
+// cursor is left wherever the attempt stopped — only the caller knows whether
+// to keep it.
+//
+// Terminating: each turn either consumes an identifier or sets `done`.
+fn parseArrowParamList(p: Parser): ([]int, bool) {
+  let params = []int(0)
+  if (peekKind(p) == Kind.RParen) {
+    return params, true
+  }
+  let ok = true
+  let done = false
+  while (!done) {
+    if (peekKind(p) != Kind.Ident) {
+      ok = false
+      done = true
+    } else {
+      let name = leaf(p, Tag.Ident)
+      let ty = 0
+      if (acceptTok(p, Kind.Colon)) {
+        ty = parseType(p)
+      }
+      params = append(params, mkNode(p, Tag.ArrowP, 0, [name, ty]))
+      if (!acceptTok(p, Kind.Comma)) {
+        done = true
+      }
+    }
+  }
+  return params, ok
+}
+
+// Speculates a parenthesized arrow `(a, b) => body` / `(a: T) => body` from
+// the `(` at the cursor. On failure every effect is undone — the diagnostics
+// the attempt reported are truncated away and the cursor is restored to the
+// `(` — and 0 is returned, which is what makes the attempt transparent to the
+// plain parenthesized expression the caller falls back to.
+fn tryParenArrowFn(p: Parser): int {
+  let mark = p.pos
+  let dmark = len(p.diags.list)
+  advance(p)
+  let (params, ok) = parseArrowParamList(p)
+  if (ok && peekKind(p) == Kind.RParen) {
+    advance(p)
+    if (acceptTok(p, Kind.FatArrow)) {
+      let ap = mkNode(p, Tag.ArrowParams, 0, params)
+      let body = 0
+      if (peekKind(p) == Kind.LBrace) {
+        body = parseBlock(p)
+      } else {
+        body = parseExpr(p)
+      }
+      return mkNode(p, Tag.ArrowFn, 0, [ap, body])
+    }
+  }
+  truncateDiags(p.diags, dmark)
+  p.pos = mark
+  return 0
+}
+
+// The `(`-led primary: a parenthesized arrow function, a plain parenthesized
+// expression, or a tuple literal. Lifted out of `parsePrimary` (#3943) — it
+// was two thirds of that function's branch count and all of it is one token's
+// business.
+fn parseParenPrimary(p: Parser): int {
+  let arrow = tryParenArrowFn(p)
+  if (arrow != 0) {
+    return arrow
+  }
+  // `tryParenArrowFn` restored the cursor to the `(` it speculated from.
+  let openTok = peekTok(p)
+  advance(p)
+  // `(a, b, ...)` is a tuple literal (SPEC §12.10, #4105) once two or more
+  // elements appear — the same arity rule `tuple_type`/`tuple_pat` already
+  // enforce, so a trailing comma after a single element (`(a,)`) degrades
+  // back to plain grouping rather than becoming a 1-tuple, matching
+  // `parseParenType`'s identical `len(items) == 1` decision below.
+  let items = []int(0)
+  items = append(items, parseExpr(p))
+  while (acceptTok(p, Kind.Comma)) {
+    if (atListClose(p, Kind.RParen)) {
+      break
+    }
+    items = append(items, parseExpr(p))
+  }
+  let closeTok = peekTok(p)
+  expect(p, Kind.RParen)
+  if (len(items) == 1) {
+    return items[0]
+  }
+  // Both parens bound the literal and neither is a kid, so `mkNode`'s
+  // kids-only span would drop them (mirrors SliceLit's brackets,
+  // parseBracketPrimary above).
+  return mkSpanNode(p, Tag.TupleLit, 0, items, openTok.start, closeTok.end)
+}
