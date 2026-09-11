@@ -10,6 +10,13 @@ conversions, and operators. (Spec: §5.4–§5.8, §11, §12.2–§12.9, §13.3,
 - Signed integers: `i8 i16 i32 i64`
 - Unsigned integers: `u8 u16 u32 u64`
 - Floats: `f32 f64` (IEEE-754)
+- `decimal` - exact base-10, a signed 128-bit mantissa with a scale (~28
+  significant digits). A value two `i64` words wide: no allocation, no GC
+  pointer. Its own numeric family, neither integer nor float, so every
+  conversion to or from it is explicit. *(Today the type, its literals and its
+  conversions are checked; arithmetic, comparison and formatting are not
+  implemented, and a program that evaluates a `decimal` value is refused at
+  build.)*
 - `bool` - `true` or `false`
 - `string` - immutable UTF-8; indexing yields a `byte`, `len(s)` is byte length
 - Aliases: `int` = `i64`, `uint` = `u64`, `byte` = `u8`, `rune` = `i32`
@@ -172,6 +179,23 @@ fn conversions() {
 
   let big: u8 = 200 // ok: untyped constant, representable in u8
   // let bad: u8 = 300       // error: 300 not representable in u8
+}
+```
+
+`decimal` follows the same rule, with floats excluded in both directions: an
+`f64` cannot represent `19.99`, so converting one would carry the float's error
+into the type that exists not to have it.
+
+```bit
+fn decimals() {
+  let price: decimal = 19.99 // exact: an untyped constant, not an f64
+  let qty: decimal = 3       // an integer constant adapts too
+  let x = 19.99              // no annotation, so the default type: f64
+  let n: i64 = 7
+  let d = decimal(n) // from an integer: always exact
+  let t = i64(d)     // to an integer: truncates toward zero
+  // let bad = decimal(x)      // error: no decimal(f64), in either direction
+  // let also: decimal = n     // error: no implicit conversion, as everywhere
 }
 ```
 
