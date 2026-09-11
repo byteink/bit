@@ -38,6 +38,16 @@ runtime, no VM, no libc dependency. Check it:
 bit --version
 ```
 
+Later, move an `install.sh` install to the newest release in place - `--check`
+reports what it would do and changes nothing. A Homebrew install is upgraded
+with `brew upgrade byteink/tap/bit`, and `bit upgrade` says so rather than
+overwriting what brew owns:
+
+```
+bit upgrade --check
+bit upgrade
+```
+
 Or run the toolchain as a container, no install at all:
 
 ```

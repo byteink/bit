@@ -78,6 +78,10 @@ bit-<version>-<os>-<arch>/
                                         #   README.md's relative docs/ links
                                         #   resolve inside the install instead
                                         #   of 404ing
+  libexec/upgrade.sh                   # what `bit upgrade` runs (#4329) — it
+                                        #   must live in the install, because
+                                        #   an artifact is all a curl|sh user
+                                        #   has on disk
   LICENSE
   README.md
   ARTIFACT.md                          # this file
