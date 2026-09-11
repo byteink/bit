@@ -421,19 +421,16 @@ which case this is a savepoint inside it, not a second transaction.
 import { Pool, Value, tx } from "std/sql"
 
 fn transfer(db: Pool, payer: string, payee: string, cents: int): ()! {
-  tx(
-    db,
-    (t) => {
-      t.exec(
-        "UPDATE accounts SET balance = balance - ? WHERE id = ?",
-        [Value.Int(cents), Value.Text(payer)],
-      )?
-      t.exec(
-        "UPDATE accounts SET balance = balance + ? WHERE id = ?",
-        [Value.Int(cents), Value.Text(payee)],
-      )?
-    },
-  )?
+  tx(db, (t) => {
+    t.exec(
+      "UPDATE accounts SET balance = balance - ? WHERE id = ?",
+      [Value.Int(cents), Value.Text(payer)],
+    )?
+    t.exec(
+      "UPDATE accounts SET balance = balance + ? WHERE id = ?",
+      [Value.Int(cents), Value.Text(payee)],
+    )?
+  })?
 }
 ```
 
@@ -456,13 +453,9 @@ back too, and is then re-raised; `tx` installs the panic boundary itself
 import { Pool, Isolation, Value, txAt } from "std/sql"
 
 fn post(db: Pool, batch: string): ()! {
-  txAt(
-    db,
-    Isolation.Serializable,
-    (t) => {
-      t.exec("UPDATE ledger SET posted = 1 WHERE batch = ?", [Value.Text(batch)])?
-    },
-  )?
+  txAt(db, Isolation.Serializable, (t) => {
+    t.exec("UPDATE ledger SET posted = 1 WHERE batch = ?", [Value.Text(batch)])?
+  })?
 }
 ```
 
@@ -481,21 +474,18 @@ nothing goes through `tx`.
 import { Pool, Value, asInt, txValue } from "std/sql"
 
 fn placeOrder(db: Pool, sku: string): int! {
-  return txValue<int>(
-    db,
-    (t) => {
-      let rows = t.query(
-        "INSERT INTO orders (sku) VALUES (?) RETURNING id",
-        [Value.Text(sku)],
-      )?
-      defer rows.close()
-      let has = rows.next()?
-      if (!has) {
-        fail newError("insert returned no id")
-      }
-      return asInt(rows.value(0))?
-    },
-  )?
+  return txValue<int>(db, (t) => {
+    let rows = t.query(
+      "INSERT INTO orders (sku) VALUES (?) RETURNING id",
+      [Value.Text(sku)],
+    )?
+    defer rows.close()
+    let has = rows.next()?
+    if (!has) {
+      fail newError("insert returned no id")
+    }
+    return asInt(rows.value(0))?
+  })?
 }
 ```
 
@@ -521,16 +511,13 @@ import { Executor, Value, tx } from "std/sql"
 // Runs standalone when it is given the pool, and as a savepoint of the
 // caller's transaction when it is given that transaction's handle.
 fn archive(db: Executor, id: string): ()! {
-  tx(
-    db,
-    (t) => {
-      t.exec(
-        "INSERT INTO archive SELECT * FROM orders WHERE id = ?",
-        [Value.Text(id)],
-      )?
-      t.exec("DELETE FROM orders WHERE id = ?", [Value.Text(id)])?
-    },
-  )?
+  tx(db, (t) => {
+    t.exec(
+      "INSERT INTO archive SELECT * FROM orders WHERE id = ?",
+      [Value.Text(id)],
+    )?
+    t.exec("DELETE FROM orders WHERE id = ?", [Value.Text(id)])?
+  })?
 }
 ```
 

@@ -176,11 +176,9 @@ until that first run has completed.
 import { Once, newOnce } from "std/sync"
 
 fn initOnce(o: Once, ready: []i64) {
-  o.do(
-    () => {
-      ready[0] = 1
-    },
-  )
+  o.do(() => {
+    ready[0] = 1
+  })
 }
 ```
 
