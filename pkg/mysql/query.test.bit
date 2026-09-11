@@ -1,0 +1,298 @@
+// pkg/mysql/query.test.bit — the prepared-statement pieces that need no server
+// (#3994): the error packet's code and SQLSTATE, the statement cache's policy,
+// and the binary codec in both directions.
+//
+// EVERY PACKET HERE IS SPELLED OUT AS BYTES, never built with the encoder the
+// test is checking. A decoder tested against its own encoder agrees with itself
+// about a wrong layout, and the binary protocol's failure mode — one wrong width
+// and every following column reads from the wrong offset — is exactly the kind
+// that survives such a test.
+
+import { asInt, asFloat } from "std/sql"
+
+// A packet from a list of byte values.
+fn bytesOf(vals: []int): string {
+  let b = []byte(len(vals))
+  let i = 0
+  while (i < len(vals)) {
+    b[i] = byte(vals[i])
+    i = i + 1
+  }
+  return string(b)
+}
+
+// A cursor over a spelled-out packet.
+fn cursorOf(vals: []int): cursor {
+  return cursor{ s: bytesOf(vals), at: 0 }
+}
+
+// The error an ERR packet carries, as the interface a caller would declare for
+// itself — this is the exact shape README-level code matches on, so the test
+// fails if the methods are renamed.
+interface sqlError {
+  message(): string,
+  errorCode(): int,
+  sqlState(): string,
+}
+
+test "an ERR packet becomes an error carrying the code and the SQLSTATE" {
+  // 0xFF, 1062 little-endian, '#', "23000", then the message.
+  let payload = bytesOf([]int{ 255, 38, 4, 35, 50, 51, 48, 48, 48 }) +
+    "Duplicate entry 'x' for key 'u'"
+  let e = serverError(payload)
+  let (my, ok) = e.(sqlError)
+  assert(ok, "the error does not expose errorCode/sqlState: ${e.message()}")
+  assert(my.errorCode() == 1062, "code: ${my.errorCode()}")
+  assert(my.sqlState() == "23000", "sqlstate: '${my.sqlState()}'")
+  assert(contains(my.message(), "Duplicate entry"), "message: ${my.message()}")
+  assert(contains(my.message(), "1062"), "the message drops the code: ${my.message()}")
+}
+
+test "a deadlock and a duplicate key are told apart by number, not by text" {
+  let deadlock = serverError(
+    bytesOf([]int{ 255, 189, 4, 35, 52, 48, 48, 48, 49 }) + "Deadlock found",
+  )
+  let (my, ok) = deadlock.(sqlError)
+  assert(ok, "no code on a deadlock error")
+  assert(my.errorCode() == 1213 && my.sqlState() == "40001", "${my.errorCode()} ${my.sqlState()}")
+}
+
+test "a truncated ERR packet is reported as malformed, never parsed into zeros" {
+  let e = serverError(bytesOf([]int{ 255, 38 }))
+  let (_, ok) = e.(sqlError)
+  assert(!ok, "a two-byte error packet produced a code")
+  assert(contains(e.message(), "malformed"), "message: ${e.message()}")
+}
+
+test "the statement cache is off until a limit asks for it" {
+  let c = newStmtCache(0)
+  assert(
+    c.put("select 1", preparedStmt{ id: 7, params: 0, cols: []column(0) }) == 0,
+    "evicted from an off cache",
+  )
+  assert(!c.has("select 1"), "a cache with limit 0 kept a statement")
+}
+
+test "the cache evicts the oldest statement and names the id to close" {
+  let c = newStmtCache(2)
+  assert(
+    c.put("a", preparedStmt{ id: 1, params: 0, cols: []column(0) }) == 0,
+    "evicted on the first put",
+  )
+  assert(
+    c.put("b", preparedStmt{ id: 2, params: 0, cols: []column(0) }) == 0,
+    "evicted on the second put",
+  )
+  assert(
+    c.put("c", preparedStmt{ id: 3, params: 0, cols: []column(0) }) == 1,
+    "the third put did not evict id 1",
+  )
+  assert(!c.has("a"), "the evicted statement is still cached")
+  assert(c.has("b") && c.has("c"), "an unevicted statement was dropped")
+  let st = c.get("c") catch e {
+    panic("get: ${e.message()}")
+  }
+  assert(st.id == 3, "id: ${st.id}")
+}
+
+test "two caches share nothing, which is what makes a statement id meaningful" {
+  let a = newStmtCache(4)
+  let b = newStmtCache(4)
+  a.put("select 1", preparedStmt{ id: 9, params: 0, cols: []column(0) })
+  assert(!b.has("select 1"), "a second connection's cache saw the first's statement")
+}
+
+test "a re-put of a cached statement does not grow the cache or evict" {
+  let c = newStmtCache(1)
+  c.put("a", preparedStmt{ id: 1, params: 0, cols: []column(0) })
+  assert(
+    c.put("a", preparedStmt{ id: 2, params: 0, cols: []column(0) }) == 0,
+    "a repeat put evicted",
+  )
+  let held = c.get("a") catch e {
+    panic("get: ${e.message()}")
+  }
+  assert(held.id == 1, "a repeat put replaced the held statement")
+}
+
+test "bound parameters carry their own NULL bitmap, types and values" {
+  let out = bindParams(
+    []Value{ Value.Int(0 - 2), Value.Text("ab"), Value.Null },
+  ) catch e {
+    panic("bindParams: ${e.message()}")
+  }
+  // One bitmap byte with bit 2 set (NO two-bit offset here), the
+  // new-params-bound flag, three two-byte types, then the values.
+  let want = bytesOf(
+    []int{
+      4, 1, 8, 0, 253, 0, 6, 0, 254, 255, 255, 255, 255, 255, 255, 255, 2, 97, 98,
+    },
+  )
+  assert(out == want, "bound block is ${len(out)} bytes, wanted ${len(want)}")
+}
+
+test "no parameters means no parameter block at all" {
+  let out = bindParams([]Value(0)) catch e {
+    panic("bindParams: ${e.message()}")
+  }
+  assert(out == "", "an empty binding produced ${len(out)} bytes")
+}
+
+// A column of `kind`, signed and textual, which is what most of these decode as.
+fn textCol(kind: int): column {
+  return column{ name: "c", kind: kind, unsigned: false, binary: false }
+}
+
+test "a binary row reads its NULL bitmap from bit two, not bit zero" {
+  let cols = []column{ textCol(8), textCol(253), textCol(5) }
+  // Header 0x00, bitmap 0x08 (column 1 is NULL: bit 1 + 2), 7 as a LONGLONG,
+  // then 1.5 as a double.
+  let payload = bytesOf(
+    []int{
+      0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 248, 63,
+    },
+  )
+  let row = binaryRow(payload, cols) catch e {
+    panic("binaryRow: ${e.message()}")
+  }
+  assert(len(row) == 3, "${len(row)} values for three columns")
+  assert(
+      (asInt(row[0]) catch e {
+        panic("column 0: ${e.message()}")
+      }) ==
+      7,
+    "column 0 is not 7",
+  )
+  assert(isNull(row[1]), "column 1 is not NULL")
+  assert(
+      (asFloat(row[2]) catch e {
+        panic("column 2: ${e.message()}")
+      }) ==
+      1.5,
+    "column 2 is not 1.5",
+  )
+}
+
+test "integer widths and signedness are decoded, not guessed" {
+  let c = cursorOf([]int{ 255, 255, 255, 255, 255, 255 })
+  assert(
+      (asInt(
+        binaryValue(c, textCol(1)) catch e {
+          panic("tiny: ${e.message()}")
+        },
+      ) catch _ {
+        panic("tiny is not an Int")
+      }) ==
+      0 - 1,
+    "a signed TINY of 0xFF is not -1",
+  )
+  assert(
+    (asInt(
+      binaryValue(c, column{ name: "c", kind: 2, unsigned: true, binary: false }) catch e {
+        panic("short: ${e.message()}")
+      },
+    ) catch _ {
+      panic("short is not an Int")
+    }) == 65535,
+    "an unsigned SHORT of 0xFFFF is not 65535",
+  )
+}
+
+test "an unsigned BIGINT that does not fit a signed 64-bit int fails loudly" {
+  let c = cursorOf([]int{ 0, 0, 0, 0, 0, 0, 0, 255 })
+  let err = ""
+  binaryValue(c, column{ name: "c", kind: 8, unsigned: true, binary: false }) catch e {
+    err = e.message()
+    assert(contains(err, "does not fit"), "message: ${err}")
+    return
+  }
+  panic("an unsigned BIGINT above 2^63-1 decoded silently")
+}
+
+test "a FLOAT widens to the double it is, exactly" {
+  // 1.5f and -0.25f as four-byte IEEE singles.
+  let c = cursorOf([]int{ 0, 0, 192, 63, 0, 0, 128, 190 })
+  let a = asFloat(
+    binaryValue(c, textCol(4)) catch e {
+      panic("float: ${e.message()}")
+    },
+  ) catch _ {
+    panic("a FLOAT is not a Float")
+  }
+  let b = asFloat(
+    binaryValue(c, textCol(4)) catch e {
+      panic("float: ${e.message()}")
+    },
+  ) catch _ {
+    panic("a FLOAT is not a Float")
+  }
+  assert(a == 1.5, "1.5f decoded as ${a}")
+  assert(b == 0.0 - 0.25, "-0.25f decoded as ${b}")
+}
+
+test "a binary column with the binary collation comes back as bytes" {
+  let c = cursorOf([]int{ 2, 1, 2 })
+  let v = binaryValue(c, column{ name: "c", kind: 252, unsigned: false, binary: true }) catch e {
+    panic("blob: ${e.message()}")
+  }
+  match (v) {
+    Blob(b) => assert(len(b) == 2 && int(b[0]) == 1, "blob bytes: ${len(b)}")
+    _ => panic("a binary BLOB did not decode as Blob")
+  }
+}
+
+test "temporal columns come back in the text the server itself would print" {
+  let dt = cursorOf([]int{ 11, 234, 7, 9, 11, 14, 3, 5, 144, 208, 3, 0 })
+  let got = temporalText(dt, 12) catch e {
+    panic("datetime: ${e.message()}")
+  }
+  assert(got == "2026-09-11 14:03:05.250000", "datetime: '${got}'")
+  let d = cursorOf([]int{ 4, 234, 7, 9, 11 })
+  assert(
+      (temporalText(d, 10) catch e {
+        panic("date: ${e.message()}")
+      }) ==
+      "2026-09-11",
+    "date",
+  )
+  let t = cursorOf([]int{ 8, 1, 1, 0, 0, 0, 2, 3, 4 })
+  assert(
+      (temporalText(t, 11) catch e {
+        panic("time: ${e.message()}")
+      }) ==
+      "-26:03:04",
+    "a negative TIME with a day count",
+  )
+  let zero = cursorOf([]int{ 0 })
+  assert(
+      (temporalText(zero, 10) catch e {
+        panic("zero date: ${e.message()}")
+      }) ==
+      "0000-00-00",
+    "the zero date",
+  )
+}
+
+test "a column definition yields the name, the type and the unsigned flag" {
+  // Six length-encoded strings (catalog..org_name), the 0x0c length, charset 63,
+  // a four-byte column length, type 3 (LONG), flags 32 (UNSIGNED), decimals.
+  let payload = bytesOf([]int{ 1, 100, 0, 0, 0, 2, 105, 100, 0 }) +
+    bytesOf([]int{ 12, 63, 0, 4, 0, 0, 0, 3, 32, 0, 0, 0, 0 })
+  let col = parseColumn(payload) catch e {
+    panic("parseColumn: ${e.message()}")
+  }
+  assert(col.name == "id", "name: '${col.name}'")
+  assert(col.kind == 3, "kind: ${col.kind}")
+  assert(col.unsigned, "the UNSIGNED flag was dropped")
+  assert(col.binary, "charset 63 was not read as binary")
+}
+
+test "a row too short for its NULL bitmap is a transport failure, not a decode" {
+  let err = ""
+  binaryRow(bytesOf([]int{ 0 }), []column{ textCol(8) }) catch e {
+    err = e.message()
+    assert(contains(err, "NULL bitmap"), "message: ${err}")
+    return
+  }
+  panic("a one-byte row decoded")
+}
