@@ -2498,9 +2498,25 @@ bit_rt_fatal(msg: *const RtBytes)               -> noreturn
   for an argument-free door; `code` is the reason code of §12.1.
 - `bit_rt_panic_boundary_code` / `bit_rt_panic_boundary_msg` read the pair the
   last `take` recorded. They are meaningful only in the armed frame after a
-  resume, and the message bytes must be copied out immediately: a runtime
-  panic's message is a module-static buffer that the next panic of the same
-  kind overwrites.
+  resume, and the message bytes must be copied out immediately: the record is
+  reused by the next `take` and dies with the arming frame.
+- **The message bytes live in the record, copied at `take` time (#4957).**
+  `take` does not keep the caller's `*const RtBytes`: it copies the bytes it
+  points at into the record and `bit_rt_panic_boundary_msg` answers a
+  `{ptr, len}` header inside that same record. It must, because a
+  `panic("... ${x}")` message is a heap string rooted only by the frames the
+  resume discards — they are below `sp` afterwards and no longer scanned, and
+  the record is a scalar buffer the collector does not scan for references. The
+  recovering side cannot copy it safely instead: turning a raw header into a
+  `string` allocates first (§11.7 forbids an `extern fn` returning a managed
+  type) and that allocation is a collection point between the read of the
+  header and the copy of the bytes. **The inline capacity is 256 bytes and a
+  longer message is TRUNCATED to it** — the copy runs inside a panic door and
+  may not allocate a bigger destination. That capacity is why a record is
+  `bndWords` = 59 words (`runtime/sched/boundary.bit`): 22 context words,
+  `prev`/`code`/`msg`, the two-word header, then the 32 words of bytes. A
+  message-free door (§12.1) passes `msg` as 0, nothing is copied, and
+  `bit_rt_panic_boundary_msg` answers 0.
 - `bit_rt_fatal` is the always-fatal door — today's `rootPanic` body verbatim
   (the `panic: <msg>\n` line, the opt-in backtrace, exit 2) with **no boundary
   consult**, for a failure no program may catch: a runtime-internal invariant

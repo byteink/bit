@@ -1,0 +1,195 @@
+// A RECOVERED PANIC MESSAGE OUTLIVES A COLLECTION (#4957, epic #4739).
+//
+// `panic("... ${x}")` builds its message on the heap, and the only reference to
+// it is in the frames between the panic site and the boundary. A resume moves
+// `sp` back above those frames, so `stwScanOwnStack` (runtime/stw/stwscan.bit)
+// stops scanning them, and the boundary record is a `[]i64` — a scalar buffer
+// the collector does not scan for references. Nothing roots the message object
+// after the resume.
+//
+// `std/runtime`'s `copyMessage` cannot close that on its own: its destination
+// (`[]byte(n)`) has to be allocated before the bytes can be copied, and that
+// allocation is a collection point sitting between the read of the message
+// header and the read of its bytes. The fix is in `boundaryTake`
+// (runtime/sched/boundary.bit), which copies the bytes into the record while
+// the panicking frame still roots them; this program is the oracle for it.
+//
+// WHAT MAKES THE WINDOW BITE HERE: the stress harness runs every program a
+// second time under `BIT_GC=stress`, which collects at every safepoint, so the
+// allocation inside `copyMessage` IS a collection with the panicking frames
+// already discarded. `churn` below runs first so that collection has real work
+// to do — a sweep that finds nothing free cannot reuse the message's bytes.
+//
+// It is not a test of the boundary mechanism itself: `../panicboundary` covers
+// the save/resume halves and calls `take` directly. This one goes through the
+// real `bit_rt_panic` door and the real `std/runtime` surface, which is the
+// only path a program takes.
+
+import { runRecovering } from "std/runtime"
+
+// The low-level half (`rawPhase` below) talks to the boundary directly, the way
+// `../panicboundary` does and for the same reason: a local `extern fn` in a test
+// program links against the freshly built archive and needs no stdlib surface.
+// Here it buys the one thing `runRecovering` cannot express — an arbitrary
+// amount of allocation BETWEEN the resume and the read of the message bytes.
+extern fn bit_rt_panic_boundary_arm(rec: int): int
+extern fn bit_rt_panic_boundary_disarm()
+extern fn bit_rt_panic_boundary_msg(): int
+
+// `bndWords` in runtime/sched/boundary.bit.
+const recWords: int = 59
+
+// `strPtr`/`strLen` (runtime/root/root.bit): the header shape §12 calls
+// `*const RtBytes`.
+const msgPtrOffset: int = 0
+const msgLenOffset: int = 8
+
+// Allocations made before the panic, so the heap the recovery point collects is
+// not empty. The count is arbitrary; it only has to be enough that a sweep has
+// something to reclaim and the message object is not the newest block.
+const churnRounds: int = 512
+const churnBytes: int = 96
+
+// The interpolated value in the message. Any value works; a recognizable one
+// makes a garbled read obvious rather than plausible.
+const messageTag: int = 4957
+
+// `bndMsgCap` in runtime/sched/boundary.bit, the cap runtime/ABI.md §12 states:
+// a message longer than this is truncated to it. `longMessageBytes` is over the
+// cap so the truncation is exercised, not assumed.
+const messageCap: int = 256
+const longMessageBytes: int = 400
+
+fn churn(rounds: int): int {
+  let live = 0
+  let i = 0
+  while (i < rounds) {
+    let block = []byte(churnBytes)
+    live = live + len(block)
+    i = i + 1
+  }
+  return live
+}
+
+// `rounds` dead strings of exactly `n` bytes — see `textAfterChurn`.
+fn churnStrings(n: int, rounds: int): int {
+  let live = 0
+  let i = 0
+  while (i < rounds) {
+    let s = repeat("Z", n)
+    live = live + len(s)
+    i = i + 1
+  }
+  return live
+}
+
+// `n` copies of one byte, built the way a program builds a long diagnostic.
+fn repeat(b: string, n: int): string {
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = b[0]
+    i = i + 1
+  }
+  return string(out)
+}
+
+// The word and the byte at a raw address. `bit_rt_panic_boundary_msg` answers
+// an address, not a managed value, and these read it back.
+fn wordAt(addr: int): int {
+  let z: *i64 = nil
+  return int(*(z + (addr >> 3)))
+}
+
+fn byteAt(addr: int): int {
+  let z: *byte = nil
+  return int(*(z + addr))
+}
+
+// The bytes of the header at `addr`, as a string — `copyMessage`'s shape, with
+// the collection made EXPLICIT instead of hoped for. `churn` between the resume
+// and the read is what `std/runtime` cannot do differently: its own destination
+// allocation is a collection point in exactly this position, and this is that
+// window widened until a sweep must have run and the freed block must have been
+// handed out again.
+//
+// With the message copied into the record (#4957) this reads the record's own
+// bytes and the churn is irrelevant. With the pre-#4957 bare address it reads a
+// heap string whose last reference died with the frames the resume discarded.
+fn textAfterChurn(addr: int, rounds: int): string {
+  if (addr == 0) {
+    return ""
+  }
+  let n = wordAt(addr + msgLenOffset)
+  if (n <= 0) {
+    return ""
+  }
+  // Same-SIZED garbage, not just garbage: a freed block is handed back to a
+  // request of its own size class, so churning 96-byte blocks past a 41-byte
+  // corpse never reuses it and reads its bytes back intact. `repeat` allocates a
+  // string of exactly the message's shape and length, which is the request the
+  // freed message answers.
+  let _ = churnStrings(n, rounds)
+  let p = wordAt(addr + msgPtrOffset)
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = byte(byteAt(p + i))
+    i = i + 1
+  }
+  return string(out)
+}
+
+// A panic raised below a boundary armed by hand, with the message read only
+// after `churnRounds` more allocations. Prints the message it recovered.
+fn rawPhase(): string {
+  let rec = []i64(recWords)
+  if (bit_rt_panic_boundary_arm(int(ptrOf(rec))) == 0) {
+    let _ = churn(churnRounds)
+    panic("raw message ${messageTag} of ${recWords} words")
+  }
+  // Reached only by a resume.
+  let msg = textAfterChurn(bit_rt_panic_boundary_msg(), churnRounds)
+  bit_rt_panic_boundary_disarm()
+  // A trailing read of the record, so its rooting does not depend on the stack
+  // map happening to widen this binding's live interval (#4097).
+  if (len(rec) != recWords) {
+    return "record shrank"
+  }
+  return msg
+}
+
+fn main() {
+  let (panicked, msg) = runRecovering(
+    () => {
+      let _ = churn(churnRounds)
+      panic("boundary message ${messageTag} after ${churnRounds} rounds")
+    },
+  )
+  print("panicked ${panicked} msg ${msg}\n")
+
+  // The same message read again after more allocation: the string `msg` is a
+  // fresh object of this frame, so it must survive whatever runs next.
+  let _ = churn(churnRounds)
+  print("again ${msg}\n")
+
+  let (longPanicked, longMsg) = runRecovering(
+    () => {
+      let _ = churn(churnRounds)
+      panic(repeat("L", longMessageBytes))
+    },
+  )
+  print("long ${longPanicked} len ${len(longMsg)} cap ${messageCap}\n")
+  print("head ${longMsg[0:8]} tail ${longMsg[len(longMsg) - 8:len(longMsg)]}\n")
+
+  print("raw ${rawPhase()}\n")
+
+  // A boundary that is never taken still reports the normal outcome, and the
+  // record it armed is reusable memory afterwards.
+  let (quiet, quietMsg) = runRecovering(
+    () => {
+      let _ = churn(16)
+    },
+  )
+  print("quiet ${quiet} msg \"${quietMsg}\"\n")
+}
