@@ -99,8 +99,22 @@ git -C "${ROOT}" rev-parse --verify "${TAG}" >/dev/null 2>&1 || {
 }
 
 WORK="$(mktemp -d)"
+# #4955: every failure path below names the build log, and this trap deletes
+# ${WORK} the instant after the message is printed — so the log the user is
+# told to read is already gone when they read the line. On a non-zero exit,
+# copy it somewhere that outlives ${WORK} and print THAT path; a clean run
+# keeps nothing. TAG is parsed before this trap is installed, so ${TAG:-} can
+# only be empty if the shell dies between those two points.
 cleanup() {
+  rc=$?
   git -C "${ROOT}" worktree remove --force "${WORK}/src" >/dev/null 2>&1 || true
+  if [ "${rc}" -ne 0 ] && [ -s "${WORK}/build.log" ]; then
+    keepdir="${TMPDIR:-/tmp}"
+    kept="${keepdir%/}/verify-reproducible-${TAG:-unknown}.build.log"
+    if cp "${WORK}/build.log" "${kept}" 2>/dev/null; then
+      echo "verify-reproducible-release.sh: build log kept at ${kept}" >&2
+    fi
+  fi
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -183,7 +197,7 @@ if [ "${L0_RC}" -ne 0 ]; then
       }
       echo "verify-reproducible-release.sh: two-pass bootstrap, pass-1 base ${TWOPASS_BASE}" >&2
       ( cd "${WORK}/src" && bash dist/abitwopass-boot.sh "${TWOPASS_BASE}" ) >>"${WORK}/build.log" 2>&1 ||
-        { echo "verify-reproducible-release.sh: dist/abitwopass-boot.sh (${TWOPASS_ORIGIN}) failed, see ${WORK}/build.log" >&2; exit 1; }
+        { echo "verify-reproducible-release.sh: dist/abitwopass-boot.sh (${TWOPASS_ORIGIN}) failed; the build log path is printed at exit" >&2; exit 1; }
       L0_RC=0
     else
       echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
@@ -193,7 +207,7 @@ if [ "${L0_RC}" -ne 0 ]; then
       exit "${EXIT_ABI_SEAM}"
     fi
   else
-    echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2
+    echo "verify-reproducible-release.sh: ./make libbitrt failed; the build log path is printed at exit" >&2
     exit 1
   fi
 fi
@@ -273,7 +287,7 @@ else
   mkdir -p "$(dirname "${BIT1}")"
   ( cd "${WORK}/src" && BIT_LIBBITRT="${l0host}" "${STAGE0}" build compiler -o "${BIT1}" ) \
     >>"${WORK}/build.log" 2>&1 ||
-    { echo "verify-reproducible-release.sh: stage0 build of bit1 failed, see ${WORK}/build.log" >&2; exit 1; }
+    { echo "verify-reproducible-release.sh: stage0 build of bit1 failed; the build log path is printed at exit" >&2; exit 1; }
   chmod +x "${BIT1}"
 fi
 echo "bit1 = ${BIT1}"
