@@ -36,6 +36,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [sql](sql.md) | `"std/sql"` | The database driver contract — interface, registry, no driver |
 | [jwt](jwt.md) | `"std/jwt"` | JWS sign/verify, RFC 7519 claim validation, JWKS key selection |
 | [smtp](smtp.md) | `"std/smtp"` | ESMTP submission client — STARTTLS, AUTH, MIME messages |
+| [runtime](runtime.md) | `"std/runtime"` | `runRecovering` — the per-task panic boundary |
 
 ## Conventions
 
