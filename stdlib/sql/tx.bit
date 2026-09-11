@@ -1,0 +1,331 @@
+// Bit standard library — sql module: transactions, and the only way to run one.
+//
+// THE ONLY TRANSACTION API IS A CLOSURE (owner decision, #3979). `tx` takes a
+// block, runs it on the one connection the pool pinned to it, and ends the
+// transaction itself: COMMIT when the block returns normally, ROLLBACK on a
+// failure or a panic, and the connection back in the pool either way. There is
+// no `begin` for a caller to pair with a `commit` by hand.
+//
+// WHY THE EXPLICIT FORM IS NOT OFFERED. `?` returns early, so in
+//
+//     let t = db.begin()?
+//     t.exec("update ...")?      // fails here
+//     t.commit()?
+//
+// every `?` between the begin and the commit is an exit that skips the
+// rollback: the transaction stays open and the pooled connection is never
+// returned. Under load the pool exhausts and the service stops, with nothing
+// in the logs pointing at this function. `defer` can guard it, but a
+// correctness property that depends on every caller remembering a line is not
+// a property. The closure form makes that failure unreachable rather than
+// unlikely — sqlx and Ecto converged here for the same reason.
+//
+// THE HANDLE DIES WITH THE BLOCK. A `Tx` that outlived its block would run
+// statements outside the transaction — on a connection the pool has already
+// handed to somebody else — so every method on the handle fails once the block
+// has returned, rather than quietly doing the wrong thing on the wrong
+// connection. `commit`/`rollback` are part of the `Tx` contract (./sql.bit) and
+// so exist on the handle; both fail whenever a caller reaches for them, because
+// ending the transaction is this file's job, not the block's.
+//
+// A NESTED `tx` IS A SAVEPOINT, AND THE SCOPE IS PASSED, NOT AMBIENT. Joining
+// the outer transaction silently would let an inner rollback take the outer
+// work with it, so a nested scope is a SAVEPOINT/RELEASE pair and an inner
+// failure rolls back exactly that scope. Which transaction an inner `tx` is
+// nested in is named by passing the handle — `tx(t, ...)` — and not by any
+// ambient "current transaction": Bit has no task-local storage, and a `Pool` is
+// shared by every green thread using it, so a pool-level "am I in a
+// transaction?" flag would answer with some other task's transaction. That is
+// what `Executor` is for: `Pool` and the transaction handle both have
+// `query`/`exec`, so a function that takes an `Executor` runs standalone or
+// inside a caller's transaction with no second entry point and no second
+// spelling.
+//
+// FOUR ENTRY POINTS, BECAUSE BIT HAS NEITHER DEFAULT ARGUMENTS NOR A `()` TYPE
+// ARGUMENT. `tx`/`txAt` take a block that returns nothing; `txValue`/
+// `txValueAt` return the block's own value on commit, so a transaction can
+// produce an inserted id without a mutable captured outside it. The `*At` pair
+// takes the isolation level; the other two run at the database's own default.
+// A type parameter cannot be instantiated at `()` (E0068), which is why the
+// value form cannot also serve the block that returns nothing, and there are no
+// default arguments (SPEC §10.3's `param` production has no default-value form)
+// to fold the level into one name.
+//
+// THE ONLY SQL THIS FILE BUILDS BY INTERPOLATION IS A SAVEPOINT NAME, AND THAT
+// NAME IS AN INTEGER THIS MODULE COUNTED OUT ITSELF (`bit_sp_1`, `bit_sp_2`,
+// ...). No caller value reaches any statement text here — ./sql.bit's rule is
+// intact, and it has to be built this way because no SQL dialect accepts a
+// placeholder where a savepoint name goes.
+//
+// THE ISOLATION LEVEL IS SET INSIDE THE TRANSACTION, with SQL-92's `SET
+// TRANSACTION ISOLATION LEVEL x` as the first statement after the BEGIN, because
+// the driver contract's `Conn.begin()` takes no argument and this module knows
+// no dialect. That is what Postgres wants. MySQL refuses the statement once a
+// transaction is open and wants it beforehand, so a MySQL driver that means to
+// support levels does it by honouring this statement in its own `Tx.exec` —
+// which is the driver's job, the same way placeholder syntax already is.
+
+import { runRecovering } from "std/runtime"
+
+// How much of other transactions' work a transaction may see. `Default` is
+// variant 0 AND MUST STAY VARIANT 0: it is what an omitted level means, and it
+// is the only value that issues no statement at all, leaving whatever the
+// database and its driver are configured for in force. Nothing here picks a
+// level for the caller — an ERP has both read-committed reporting and
+// serializable posting, and either one chosen invisibly is wrong for the other.
+export enum Isolation {
+  Default,
+  ReadUncommitted,
+  ReadCommitted,
+  RepeatableRead,
+  Serializable,
+}
+
+// Anything statements can be run on: a `Pool`, or a transaction already running
+// on one. A function that takes an `Executor` instead of a `Pool` composes —
+// the caller decides whether it runs on its own or inside a transaction, and
+// passing it the handle its block was given is exactly what makes a `tx` inside
+// it a savepoint of that transaction.
+export interface Executor {
+  query(sqlText: string, params: []Value): Rows!,
+  exec(sqlText: string, params: []Value): int!,
+}
+
+// Runs `f` in a transaction at the database's own isolation level. COMMIT on a
+// normal return; ROLLBACK on a failure or a panic, with the failure propagated
+// unchanged. `db` is the pool, or the handle of a transaction already running —
+// in which case this is a savepoint inside it.
+export fn tx(db: Executor, f: (Tx) => ()!): ()! {
+  txAt(db, Isolation.Default, f)?
+}
+
+// `tx`, at the isolation level `level` instead of the database's own.
+export fn txAt(db: Executor, level: Isolation, f: (Tx) => ()!): ()! {
+  let _ = txValueAt<bool>(
+    db,
+    level,
+    (t) => {
+      f(t)?
+      return true
+    },
+  )?
+}
+
+// `tx`, returning what the block returned once the transaction has committed.
+// Nothing is returned on a failure: the value is only a result if the work it
+// describes is durable.
+export fn txValue<T>(db: Executor, f: (Tx) => T!): T! {
+  return txValueAt<T>(db, Isolation.Default, f)?
+}
+
+// `txValue`, at the isolation level `level` instead of the database's own. This
+// is the one implementation; the other three are spellings of it.
+export fn txValueAt<T>(db: Executor, level: Isolation, f: (Tx) => T!): T! {
+  let scope = enter(db, level)?
+  let out: T
+  let failed = false
+  let cause = newError("sql: tx: the block failed without reporting an error")
+  // The panic boundary is what makes "a panic rolls back" true. Nothing here
+  // relies on `defer`: a recovered panic runs no deferred call (SPEC §18.5),
+  // so the rollback below is reached by ordinary control flow instead.
+  let (panicked, msg) = runRecovering(
+    () => {
+      let v = f(scope) catch e {
+        failed = true
+        cause = e
+        return
+      }
+      out = v
+    },
+  )
+  scope.retire()
+  if (panicked) {
+    scope.undo()
+    panic(msg)
+  }
+  if (failed) {
+    scope.undo()
+    fail cause
+  }
+  scope.finish()?
+  return out
+}
+
+// The one transaction, shared by the root scope and every savepoint under it.
+// One `Tx`, made on one connection, is the whole of rule 1 (./pool.bit): a
+// savepoint cannot reach another connection because there is no other `Tx`
+// here to reach it with.
+class txState {
+  inner: Tx,
+  // The savepoint name source: `bit_sp_1`, `bit_sp_2`, ... Counted per
+  // transaction, so a name is never reused while the one it named is live.
+  seq: i64 = 0,
+  // A savepoint rollback did not answer, so what the server still holds under
+  // this transaction is unknown. The root refuses to commit on this, and rolls
+  // back instead — committing a transaction whose inner undo failed is exactly
+  // the silent wrong answer savepoints exist to prevent.
+  poisoned: bool = false,
+}
+
+// One scope of one transaction: the root (`name` empty) or a savepoint. It is
+// the `Tx` (./sql.bit) the block is given — not a second transaction type —
+// and it stops working the moment that block returns.
+class scopedTx {
+  st: txState
+  // "" for the root transaction; the savepoint name for a nested scope.
+  name: string
+  live: bool = true
+  query(sqlText: string, params: []Value): Rows! {
+    this.usable()?
+    return this.st.inner.query(sqlText, params)?
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.usable()?
+    return this.st.inner.exec(sqlText, params)?
+  }
+
+  // Part of `Tx`, and never a caller's to call: returning from the block is
+  // what commits.
+  commit(): ()! {
+    fail newError("sql: tx: commit is not yours to call; returning from the block commits")
+  }
+
+  // Part of `Tx`, and never a caller's to call: failing out of the block is
+  // what rolls back.
+  rollback(): ()! {
+    fail newError("sql: tx: rollback is not yours to call; fail out of the block to roll back")
+  }
+
+  // Whether a statement may still be issued through this handle.
+  usable(): ()! {
+    if (!this.live) {
+      fail newError(
+          "sql: tx: this transaction handle is dead; it works only inside the " +
+          "block it was given to",
+      )
+    }
+    if (this.st.poisoned) {
+      fail poisonedError()
+    }
+  }
+
+  // Opens a savepoint inside this scope. A level cannot be given: isolation is
+  // a property of the transaction, and a savepoint is not a transaction — a
+  // nested call that asked for one would be asking for something SQL cannot do,
+  // and silently ignoring it would be worse.
+  nest(level: Isolation): scopedTx! {
+    this.usable()?
+    match (level) {
+      Default => {}
+      _ => fail newError(
+          "sql: tx: a transaction already running cannot change isolation " +
+          "level; the nested block is a savepoint of it",
+      )
+    }
+    this.st.seq = this.st.seq + 1
+    let name = "bit_sp_${this.st.seq}"
+    this.st.inner.exec("SAVEPOINT ${name}", []Value(0))?
+    return scopedTx{ st: this.st, name: name }
+  }
+
+  // The block returned: the handle stops working, whatever happens next.
+  retire() {
+    this.live = false
+  }
+
+  // COMMIT for the root scope, RELEASE SAVEPOINT for a nested one.
+  finish(): ()! {
+    if (this.name != "") {
+      if (this.st.poisoned) {
+        fail poisonedError()
+      }
+      this.st.inner.exec("RELEASE SAVEPOINT ${this.name}", []Value(0))?
+      return
+    }
+    if (this.st.poisoned) {
+      abandon(this.st.inner)
+      fail poisonedError()
+    }
+    // A commit that fails has already returned the connection to the pool,
+    // which closes it rather than reusing it (./pool.bit rule 2). Nothing may
+    // be issued on it after this, which is why there is no rollback here.
+    this.st.inner.commit()?
+  }
+
+  // Undoes this scope: ROLLBACK for the root, ROLLBACK TO SAVEPOINT plus
+  // RELEASE for a nested one. Never fails, because the caller is already
+  // reporting the failure that got here and the original error is the one
+  // worth having. A root rollback that fails still returns its connection —
+  // ./pool.bit closes it instead of reusing it — and a savepoint rollback that
+  // fails poisons the transaction so the outer scope cannot commit over it.
+  undo() {
+    if (this.name == "") {
+      abandon(this.st.inner)
+      return
+    }
+    this.st.inner.exec("ROLLBACK TO SAVEPOINT ${this.name}", []Value(0)) catch _ {
+      this.st.poisoned = true
+      return
+    }
+    this.st.inner.exec("RELEASE SAVEPOINT ${this.name}", []Value(0)) catch _ {
+      this.st.poisoned = true
+      return
+    }
+  }
+}
+
+// Opens the scope a block runs in: a transaction on a connection the pool pins
+// to it, or a savepoint inside the transaction `db` is the handle of.
+fn enter(db: Executor, level: Isolation): scopedTx! {
+  let (outer, nested) = db.(scopedTx)
+  if (nested) {
+    return outer.nest(level)?
+  }
+  let (p, isPool) = db.(Pool)
+  if (!isPool) {
+    fail newError(
+        "sql: tx: no transaction can be started on this executor; pass the " +
+        "Pool, or the handle the enclosing block was given",
+    )
+  }
+  let inner = p.begin()?
+  let stmt = isolationStatement(level)
+  if (stmt != "") {
+    inner.exec(stmt, []Value(0)) catch e {
+      abandon(inner)
+      fail e
+    }
+  }
+  return scopedTx{ st: txState{ inner: inner }, name: "" }
+}
+
+// The statement that puts a transaction at `level`, or "" for the database's
+// own default — which is set by issuing nothing at all.
+fn isolationStatement(level: Isolation): string {
+  match (level) {
+    Default => return ""
+    ReadUncommitted => return "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+    ReadCommitted => return "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    RepeatableRead => return "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    Serializable => return "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+  }
+}
+
+// Rolls the transaction back, ignoring a rollback failure: this is only ever
+// reached while a more useful error is already on its way to the caller, and
+// the pool closes a connection whose transaction did not end cleanly rather
+// than handing it to the next caller.
+fn abandon(inner: Tx) {
+  inner.rollback() catch _ {
+    return
+  }
+}
+
+// The one message for "an inner rollback failed, so this transaction can only
+// be rolled back".
+fn poisonedError(): error {
+  return newError(
+    "sql: tx: a savepoint rollback failed; this transaction can no longer " + "commit",
+  )
+}

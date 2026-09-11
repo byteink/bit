@@ -140,9 +140,11 @@ commit(): ()!
 rollback(): ()!
 ```
 
-`query`/`exec` behave exactly as `Conn`'s do, scoped to this transaction;
-exactly one of `commit`/`rollback` must be called to end it, and using the
-`Tx` afterward is a caller bug, same as using a `Conn` after `close`.
+`query`/`exec` behave exactly as `Conn`'s do, scoped to this transaction.
+`commit`/`rollback` are the **driver's** side of the contract: a driver
+implements them, and `tx` (below) is the only thing that calls them. Application
+code never ends a transaction by hand — the handle `tx` gives a block fails both
+calls, and fails every call once that block has returned.
 
 ## The registry
 
@@ -367,36 +369,6 @@ fn firstName(db: Pool, id: string): string! {
 Runs `sqlText` for its effect and returns the number of rows it changed. The
 connection is back in the pool before this returns.
 
-### `Pool.begin(): Tx!`
-
-Starts a transaction on one connection and keeps that connection until
-`commit` or `rollback` ends it. Every statement issued through the returned
-`Tx` runs on that one connection — rule 1, held by the object graph rather
-than by a check.
-
-```bit
-import { Pool, Value } from "std/sql"
-
-fn transfer(db: Pool, payer: string, payee: string, cents: int): ()! {
-  let tx = db.begin()?
-  tx.exec(
-    "UPDATE accounts SET balance = balance - ? WHERE id = ?",
-    [Value.Int(cents), Value.Text(payer)],
-  ) catch e {
-    tx.rollback()?
-    fail e
-  }
-  tx.exec(
-    "UPDATE accounts SET balance = balance + ? WHERE id = ?",
-    [Value.Int(cents), Value.Text(payee)],
-  ) catch e {
-    tx.rollback()?
-    fail e
-  }
-  tx.commit()?
-}
-```
-
 ### `Pool.close()`
 
 Closes every idle connection and fails every parked caller. Connections
@@ -420,3 +392,177 @@ is the common case and needs no cooperation from the driver at all.
 
 A ready-made `FatalError`, for a driver with no error type of its own to
 extend.
+
+## Transactions
+
+**The only transaction API is a closure.** `tx` takes a block, runs it on one
+pinned connection and ends the transaction itself: COMMIT when the block
+returns, ROLLBACK on a failure or a panic, and the connection back in the pool
+on every path. There is no `begin` for a caller to pair with a `commit`.
+
+The reason is `?`. In the hand-written form every `?` between the begin and the
+commit is an early return that skips the rollback, so the transaction stays open
+and the pooled connection is never returned; under load the pool exhausts and
+the service stops, with nothing in the logs naming the function that did it.
+`defer` can guard it, but a correctness property that depends on every caller
+remembering a line is not a property. The closure form makes that failure
+unreachable rather than unlikely.
+
+`stdlib/sql/tx.test.bit` asserts each promise below against a fake driver that
+logs every statement tagged with the connection that ran it.
+
+### `tx(db: Executor, f: (Tx) => ()!): ()!`
+
+Runs `f` in a transaction at the database's own isolation level and returns
+nothing. `db` is the `Pool`, or the handle of a transaction already running — in
+which case this is a savepoint inside it, not a second transaction.
+
+```bit
+import { Pool, Value, tx } from "std/sql"
+
+fn transfer(db: Pool, payer: string, payee: string, cents: int): ()! {
+  tx(
+    db,
+    (t) => {
+      t.exec(
+        "UPDATE accounts SET balance = balance - ? WHERE id = ?",
+        [Value.Int(cents), Value.Text(payer)],
+      )?
+      t.exec(
+        "UPDATE accounts SET balance = balance + ? WHERE id = ?",
+        [Value.Int(cents), Value.Text(payee)],
+      )?
+    },
+  )?
+}
+```
+
+The handle `t` works only inside the block. Every method on it fails once the
+block has returned — a handle that still worked would run statements outside the
+transaction, on a connection the pool has since given to somebody else — and
+`t.commit()`/`t.rollback()` fail whenever they are called, because ending the
+transaction is `tx`'s job.
+
+A failure inside the block propagates **unchanged**: the caller gets the
+driver's own error, never a transaction error wrapped around it. A panic rolls
+back too, and is then re-raised; `tx` installs the panic boundary itself
+(`std/runtime`), because a recovered panic runs no deferred call.
+
+### `txAt(db: Executor, level: Isolation, f: (Tx) => ()!): ()!`
+
+`tx`, at `level` instead of the database's own isolation level.
+
+```bit
+import { Pool, Isolation, Value, txAt } from "std/sql"
+
+fn post(db: Pool, batch: string): ()! {
+  txAt(
+    db,
+    Isolation.Serializable,
+    (t) => {
+      t.exec("UPDATE ledger SET posted = 1 WHERE batch = ?", [Value.Text(batch)])?
+    },
+  )?
+}
+```
+
+### `txValue<T>(db: Executor, f: (Tx) => T!): T!`
+
+`tx`, returning what the block returned once the transaction has committed — so
+a transaction can produce an inserted id without a mutable captured outside it.
+Nothing is returned on a failure: a value is a result only if the work behind it
+is durable.
+
+The type argument is written out because a block's result type is not inferred
+through a generic parameter, and it cannot be `()` — a block that returns
+nothing goes through `tx`.
+
+```bit
+import { Pool, Value, asInt, txValue } from "std/sql"
+
+fn placeOrder(db: Pool, sku: string): int! {
+  return txValue<int>(
+    db,
+    (t) => {
+      let rows = t.query(
+        "INSERT INTO orders (sku) VALUES (?) RETURNING id",
+        [Value.Text(sku)],
+      )?
+      defer rows.close()
+      let has = rows.next()?
+      if (!has) {
+        fail newError("insert returned no id")
+      }
+      return asInt(rows.value(0))?
+    },
+  )?
+}
+```
+
+### `txValueAt<T>(db: Executor, level: Isolation, f: (Tx) => T!): T!`
+
+`txValue`, at `level` instead of the database's own isolation level. The other
+three entry points are spellings of this one.
+
+### `Executor`
+
+```
+query(sqlText: string, params: []Value): Rows!
+exec(sqlText: string, params: []Value): int!
+```
+
+Anything statements can run on: a `Pool`, or a transaction already running on
+one. A function that takes an `Executor` rather than a `Pool` composes — the
+caller decides whether it runs on its own or inside a transaction:
+
+```bit
+import { Executor, Value, tx } from "std/sql"
+
+// Runs standalone when it is given the pool, and as a savepoint of the
+// caller's transaction when it is given that transaction's handle.
+fn archive(db: Executor, id: string): ()! {
+  tx(
+    db,
+    (t) => {
+      t.exec(
+        "INSERT INTO archive SELECT * FROM orders WHERE id = ?",
+        [Value.Text(id)],
+      )?
+      t.exec("DELETE FROM orders WHERE id = ?", [Value.Text(id)])?
+    },
+  )?
+}
+```
+
+**A nested `tx` is a savepoint, never a second transaction.** It issues
+`SAVEPOINT bit_sp_N` on the same connection, `RELEASE SAVEPOINT bit_sp_N` when
+its block returns, and `ROLLBACK TO SAVEPOINT bit_sp_N` when its block fails —
+so an inner failure undoes exactly the inner block and the outer one goes on to
+commit. Joining the outer transaction silently would let an inner rollback take
+the outer work with it.
+
+Which transaction a nested `tx` belongs to is named by **passing the handle**,
+because there is no ambient "current transaction" to consult: Bit has no
+task-local storage, and one `Pool` is shared by every green thread using it, so
+pool-level state would answer with some other task's transaction. If a savepoint
+rollback itself fails, the transaction is marked: the outer block cannot commit
+over it and is rolled back instead.
+
+### `Isolation`
+
+```
+Default | ReadUncommitted | ReadCommitted | RepeatableRead | Serializable
+```
+
+How much of other transactions' work a transaction may see. `Default` issues no
+statement at all, leaving whatever the database and its driver are configured
+for in force — `std/sql` picks no level for you, because an ERP has both
+read-committed reporting and serializable posting and either one chosen
+invisibly is wrong for the other.
+
+Any other level is issued as SQL-92's `SET TRANSACTION ISOLATION LEVEL x`, as
+the first statement after the BEGIN: the driver contract's `Conn.begin()` takes
+no argument, and this module knows no dialect. That is what Postgres wants.
+MySQL refuses the statement once a transaction is open, so a MySQL driver that
+means to support levels honours it in its own `Tx.exec` — the driver's job, the
+same way placeholder syntax already is.

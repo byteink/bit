@@ -1,0 +1,491 @@
+// stdlib/sql/tx.test.bit — what `tx` promises, against a fake driver (#3979).
+//
+// `tx`, `txAt`, `txValue`, `txValueAt`, `Isolation`, `Executor`, `Pool` and
+// `Datasource` are all siblings in this one module (SPEC §17.1), so nothing of
+// std/sql is imported here.
+//
+// EVERY ASSERTION IS ABOUT STATEMENTS THE DRIVER SAW, not about the
+// implementation's own bookkeeping. `fkAdapter` logs each statement tagged with
+// the connection that ran it — "update one@1" — so "it committed", "it rolled
+// back to the savepoint", "it never opened a second transaction" and "it all
+// ran on one connection" are each a claim about the log, and the connection
+// count says whether the connection came back to the pool afterwards.
+//
+// THE FAKE TAKES NO LOCK. Nothing here spawns: `tx` runs its block on the
+// calling task, and the concurrency the pool itself has to survive is
+// ./pool.test.bit's subject, not this file's.
+//
+// The names here are all `fk*` because ./pool.test.bit's `stub*` fakes are
+// declarations in this same module. `runRecovering` needs no import here:
+// ./tx.bit imports it, and an import is module-wide (a second one is E0042).
+
+// The fake driver: one physical connection per `connect`, and a log of every
+// statement any of them ran.
+class fkAdapter {
+  connects: i64 = 0
+  closes: i64 = 0
+  // One entry per statement, "<sql>@<connection id>", in order.
+  log: []string
+  // `exec` fails on exactly this statement text; "" fails nothing. A plain
+  // error, never a `FatalError`, so the connection stays usable and a test can
+  // tell "the pool got its connection back" from "the pool threw it away".
+  failOn: string = ""
+
+  connect(cfg: Datasource): Conn! {
+    this.connects = this.connects + 1
+    return fkConn{ a: this, id: this.connects }
+  }
+
+  record(entry: string) {
+    this.log = append(this.log, entry)
+  }
+
+  // The log as one line, which is what an assertion message has to print to be
+  // worth reading when it fires.
+  joined(): string {
+    let out = ""
+    for e of this.log {
+      if (out != "") {
+        out = out + " | "
+      }
+      out = out + e
+    }
+    return out
+  }
+}
+
+// One physical connection. `id` is what every statement it runs is tagged with.
+class fkConn {
+  a: fkAdapter
+  id: i64
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.record("${sqlText}@${this.id}")
+    return fkRows{ pos: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.record("${sqlText}@${this.id}")
+    return 1
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare is not part of this test")
+  }
+
+  begin(): Tx! {
+    this.a.record("begin@${this.id}")
+    return fkTx{ a: this.a, id: this.id }
+  }
+
+  close() {
+    this.a.closes = this.a.closes + 1
+  }
+}
+
+// The driver's own transaction. Every statement lands in the same log, so a
+// savepoint statement and a business statement are compared the same way.
+class fkTx {
+  a: fkAdapter
+  id: i64
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.record("${sqlText}@${this.id}")
+    return fkRows{ pos: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.record("${sqlText}@${this.id}")
+    if (sqlText == this.a.failOn) {
+      fail newError("fake: ${sqlText} was refused")
+    }
+    return 1
+  }
+
+  commit(): ()! {
+    this.a.record("commit@${this.id}")
+  }
+
+  rollback(): ()! {
+    this.a.record("rollback@${this.id}")
+  }
+}
+
+// A one-row cursor: enough for a `Rows` to exist.
+class fkRows {
+  pos: i64
+  next(): bool! {
+    this.pos = this.pos + 1
+    return this.pos < 1
+  }
+
+  columns(): []string {
+    return ["n"]
+  }
+
+  value(col: int): Value {
+    return Value.Int(1)
+  }
+
+  close() {}
+}
+
+fn newFk(): fkAdapter {
+  return fkAdapter{ log: []string(0) }
+}
+
+// A pool over `a`, with room for a second connection so that "one connection
+// for the whole transaction" is a result and not the only thing possible.
+fn fkPool(a: fkAdapter): Pool! {
+  return pool(a, Datasource{ host: "fake", maxOpen: 4, acquireTimeout: 5_000 })?
+}
+
+// The log, checked against what the transaction should have issued.
+fn sameLog(a: fkAdapter, want: []string): bool {
+  if (len(a.log) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (a.log[i] != want[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// How many entries are that statement, on any connection.
+fn issued(a: fkAdapter, sqlText: string): int {
+  let n = 0
+  for e of a.log {
+    if (contains(e, sqlText)) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+test "a block that returns normally commits and hands the connection back" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  tx(
+    p,
+    (t) => {
+      t.exec("update one", []Value(0))?
+      t.exec("update two", []Value(0))?
+    },
+  ) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  assert(
+    sameLog(a, ["begin@1", "update one@1", "update two@1", "commit@1"]),
+    "log: ${a.joined()}",
+  )
+  // The connection is back: the next statement reuses it rather than dialing.
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "after commit: ${e.message()}")
+    return
+  }
+  assert(n == 1, "exec returned ${n}")
+  assert(a.connects == 1, "opened ${a.connects} connections")
+  p.close()
+}
+
+test "a failed statement rolls back, propagates the original error and frees the connection" {
+  let a = newFk()
+  a.failOn = "update two"
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let failed = false
+  tx(
+    p,
+    (t) => {
+      t.exec("update one", []Value(0))?
+      t.exec("update two", []Value(0))?
+      t.exec("update three", []Value(0))?
+    },
+  ) catch e {
+    failed = true
+    assert(
+      e.message() == "fake: update two was refused",
+      "error was '${e.message()}', not the driver's own",
+    )
+  }
+  assert(failed, "tx returned successfully after a failed statement")
+  assert(
+    sameLog(
+      a,
+      ["begin@1", "update one@1", "update two@1", "rollback@1"],
+    ),
+    "log: ${a.joined()}",
+  )
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "after rollback: ${e.message()}")
+    return
+  }
+  assert(n == 1 && a.connects == 1, "exec ${n}, ${a.connects} connections")
+  p.close()
+}
+
+test "a panic inside the block rolls back and frees the connection" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let (panicked, msg) = runRecovering(
+    () => {
+      tx(
+        p,
+        (t) => {
+          t.exec("update one", []Value(0))?
+          panic("the block's own bug")
+        },
+      ) catch _ {
+        return
+      }
+    },
+  )
+  assert(panicked, "the panic did not reach the caller")
+  assert(msg == "the block's own bug", "message was '${msg}'")
+  assert(
+    sameLog(a, ["begin@1", "update one@1", "rollback@1"]),
+    "log: ${a.joined()}",
+  )
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "after a panic: ${e.message()}")
+    return
+  }
+  assert(n == 1 && a.connects == 1, "exec ${n}, ${a.connects} connections")
+  p.close()
+}
+
+test "every statement of a block runs on the one connection" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  // A second connection, opened and parked idle before the transaction starts:
+  // a transaction that could migrate has somewhere to migrate to.
+  let other = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  p.release(other)
+  tx(
+    p,
+    (t) => {
+      t.exec("update one", []Value(0))?
+      let rows = t.query("select 2", []Value(0))?
+      rows.close()
+      t.exec("update three", []Value(0))?
+    },
+  ) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  assert(len(a.log) == 5, "log: ${a.joined()}")
+  let on = a.log[0]
+  for e of a.log {
+    assert(contains(e, "@1"), "entry '${e}' did not run on the connection '${on}' did")
+  }
+  p.close()
+}
+
+test "a nested tx is a savepoint, and its failure leaves the outer block committing" {
+  let a = newFk()
+  a.failOn = "inner two"
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let innerFailed = false
+  tx(
+    p,
+    (t) => {
+      t.exec("outer one", []Value(0))?
+      tx(
+        t,
+        (inner) => {
+          inner.exec("inner one", []Value(0))?
+          inner.exec("inner two", []Value(0))?
+        },
+      ) catch _ {
+        innerFailed = true
+      }
+      t.exec("outer two", []Value(0))?
+    },
+  ) catch e {
+    assert(false, "outer tx: ${e.message()}")
+    return
+  }
+  assert(innerFailed, "the nested block did not report its failure")
+  assert(
+    sameLog(
+      a,
+      [
+        "begin@1",
+        "outer one@1",
+        "SAVEPOINT bit_sp_1@1",
+        "inner one@1",
+        "inner two@1",
+        "ROLLBACK TO SAVEPOINT bit_sp_1@1",
+        "RELEASE SAVEPOINT bit_sp_1@1",
+        "outer two@1",
+        "commit@1",
+      ],
+    ),
+    "log: ${a.joined()}",
+  )
+  assert(issued(a, "begin@") == 1, "a nested tx opened a second transaction")
+  p.close()
+}
+
+test "a nested tx that returns normally releases its savepoint and commits once" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  tx(
+    p,
+    (t) => {
+      tx(
+        t,
+        (inner) => {
+          inner.exec("inner one", []Value(0))?
+        },
+      )?
+    },
+  ) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  assert(
+    sameLog(
+      a,
+      [
+        "begin@1",
+        "SAVEPOINT bit_sp_1@1",
+        "inner one@1",
+        "RELEASE SAVEPOINT bit_sp_1@1",
+        "commit@1",
+      ],
+    ),
+    "log: ${a.joined()}",
+  )
+  assert(issued(a, "commit@") == 1, "the nested block committed on its own")
+  p.close()
+}
+
+test "the isolation level is issued when it is not the database's own" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  txAt(
+    p,
+    Isolation.Serializable,
+    (t) => {
+      t.exec("post", []Value(0))?
+    },
+  ) catch e {
+    assert(false, "txAt: ${e.message()}")
+    return
+  }
+  assert(
+    sameLog(
+      a,
+      [
+        "begin@1",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE@1",
+        "post@1",
+        "commit@1",
+      ],
+    ),
+    "log: ${a.joined()}",
+  )
+  p.close()
+}
+
+test "the default isolation level issues no statement of its own" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  tx(
+    p,
+    (t) => {
+      t.exec("report", []Value(0))?
+    },
+  ) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  assert(issued(a, "SET TRANSACTION") == 0, "log: ${a.joined()}")
+  assert(sameLog(a, ["begin@1", "report@1", "commit@1"]), "log: ${a.joined()}")
+  p.close()
+}
+
+test "the block's value is returned once the transaction has committed" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let id = txValue<int>(
+    p,
+    (t) => {
+      let rows = t.query("insert returning id", []Value(0))?
+      defer rows.close()
+      let more = rows.next()?
+      assert(more, "the fake cursor produced no row")
+      return asInt(rows.value(0))?
+    },
+  ) catch e {
+    assert(false, "txValue: ${e.message()}")
+    return
+  }
+  assert(id == 1, "the block's value came back as ${id}")
+  assert(issued(a, "commit@") == 1, "log: ${a.joined()}")
+  p.close()
+}
+
+test "the handle is dead once its block has returned" {
+  let a = newFk()
+  let p = fkPool(a) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let escaped: Tx
+  tx(
+    p,
+    (t) => {
+      escaped = t
+      t.exec("update one", []Value(0))?
+      // Ending the transaction is never the block's to do.
+      t.commit() catch _ {
+        return
+      }
+      assert(false, "commit inside the block succeeded")
+    },
+  ) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  escaped.exec("update late", []Value(0)) catch _ {
+    assert(issued(a, "update late") == 0, "log: ${a.joined()}")
+    p.close()
+    return
+  }
+  assert(false, "the handle ran a statement after its block returned")
+  p.close()
+}
