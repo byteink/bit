@@ -81,6 +81,15 @@ cp -R "${ROOT}/stdlib" "${STAGE}/stdlib"
 # enumerated list goes stale the next time a doc is added, silently, the
 # way this repo's release steps keep going stale when hand-maintained.
 cp -R "${ROOT}/docs" "${STAGE}/docs"
+# `bit upgrade` executes this from the install it is replacing
+# (compiler/upgrade.bit's upgradeScriptPath), so it has to be IN the install —
+# the artifact is the only thing a user who installed with the curl|sh one
+# liner has on disk. Same reason the stdlib and docs are shipped rather than
+# resolved out of a checkout.
+mkdir -p "${STAGE}/libexec"
+cp "${ROOT}/dist/upgrade.sh" "${STAGE}/libexec/upgrade.sh"
+chmod +x "${STAGE}/libexec/upgrade.sh"
+
 cp "${ROOT}/LICENSE" "${ROOT}/README.md" "${STAGE}/"
 cp "${ROOT}/dist/README.md" "${STAGE}/ARTIFACT.md"
 
