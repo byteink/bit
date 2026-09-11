@@ -532,6 +532,20 @@ The Handshake-framed encoding of `c`.
 
 Parse a Handshake-framed Certificate.
 
+### `CertificateRequest`
+
+A CertificateRequest message: an opaque `certRequestContext` the client echoes
+in its Certificate reply, and the server's `extensions` (signature algorithms,
+certificate authorities).
+
+### `encodeCertificateRequest(cr: CertificateRequest): []byte`
+
+The Handshake-framed encoding of `cr`.
+
+### `parseCertificateRequest(msg: []byte): CertificateRequest!`
+
+Parse a Handshake-framed CertificateRequest.
+
 ### `CertificateVerify`
 
 A CertificateVerify message: the signature `algorithm` and the `signature` over
@@ -678,6 +692,10 @@ HandshakeType encrypted_extensions (8).
 ### `hsCertificate: int`
 
 HandshakeType certificate (11).
+
+### `hsCertificateRequest: int`
+
+HandshakeType certificate_request (13).
 
 ### `hsCertificateVerify: int`
 
