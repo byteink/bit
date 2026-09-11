@@ -1,0 +1,469 @@
+// pkg/mysql/binary.bit — the binary protocol's value codec: column definitions,
+// bound parameters on the way out, result values on the way in (#3994).
+//
+// COM_STMT_EXECUTE and its reply do not speak the text protocol. A parameter
+// goes out as a type code and that type's own bytes, and a result column comes
+// back the same way — so the decoding of a value depends on its COLUMN'S type,
+// read from the definition packets, and not on anything in the value itself.
+// Get a width wrong and the packet does not fail: every following column reads
+// from the wrong offset and the row comes back full of plausible garbage.
+//
+// TWO NULL ENCODINGS, TWO RULES. A result row's NULL bitmap is offset by two
+// reserved bits, a parameter block's is not. They are a few lines apart below on
+// purpose: writing one rule twice is how a driver ends up binding every value
+// one position over.
+
+// The column types this driver decodes by width rather than as a
+// length-encoded string. MySQL's own `enum_field_types` numbering.
+const typeTiny: int = 1
+const typeShort: int = 2
+const typeLong: int = 3
+const typeFloat: int = 4
+const typeDouble: int = 5
+const typeNull: int = 6
+const typeTimestamp: int = 7
+const typeLongLong: int = 8
+const typeInt24: int = 9
+const typeDate: int = 10
+const typeTime: int = 11
+const typeDatetime: int = 12
+const typeYear: int = 13
+const typeBlob: int = 252
+const typeVarString: int = 253
+
+// UNSIGNED_FLAG in a column definition's flags, and the collation id that means
+// "these bytes are not text" — the two facts a value's decoding depends on
+// beyond its type.
+const flagUnsigned: int = 32
+const charsetBinary: int = 63
+
+// One result column, in the only three respects decoding depends on.
+class column {
+  name: string,
+  kind: int,
+  unsigned: bool,
+  binary: bool,
+}
+
+// A column definition packet: six length-encoded strings, then a length byte
+// and the fixed tail — charset, length, type, flags, decimals — of which the
+// name, the charset, the type and the unsigned flag are read.
+fn parseColumn(payload: string): column! {
+  let c = cursor{ s: payload, at: 0 }
+  let name = ""
+  let i = 0
+  while (i < 6) {
+    let s = lenEncString(c)?
+    if (i == 4) {
+      name = s
+    }
+    i = i + 1
+  }
+  readLenEnc(c)?
+  let charset = c.int(2)?
+  c.int(4)?
+  let kind = c.int(1)?
+  let flags = c.int(2)?
+  return column{
+    name: name,
+    kind: kind,
+    unsigned: (flags & flagUnsigned) != 0,
+    binary: charset == charsetBinary,
+  }
+}
+
+// One binary-protocol row: a 0x00 header, a NULL bitmap, then the non-NULL
+// values in column order, each in its own type's encoding.
+//
+// THE BITMAP IS OFFSET BY TWO BITS. The binary row format reserves the first two
+// bits, so column `i` is bit `i + 2` — an off-by-two here would report the wrong
+// columns NULL and shift every value after them.
+fn binaryRow(payload: string, cols: []column): []Value! {
+  let bitmapLen = (len(cols) + 9) / 8
+  if (len(payload) < 1 + bitmapLen) {
+    fail transportError("a binary row of ${len(payload)} bytes cannot hold a " + "${len(cols)}-column NULL bitmap")
+  }
+  let bitmap = []byte(payload[1:1 + bitmapLen])
+  let c = cursor{ s: payload, at: 1 + bitmapLen }
+  let out = []Value(0)
+  let i = 0
+  while (i < len(cols)) {
+    if (nullAt(bitmap, i)) {
+      out = append(out, Value.Null)
+    } else {
+      out = append(out, binaryValue(c, cols[i])?)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Whether column `i` is NULL, from the row's bitmap.
+fn nullAt(bitmap: []byte, i: int): bool {
+  let bit = i + 2
+  return (int(bitmap[bit / 8]) & twoPow(bit % 8)) != 0
+}
+
+// 2^k for a small k. Bit has no exponent operator and this is clearer than a
+// shift that has to be reasoned about against the sign bit.
+//
+// Bounded by `k`, which every caller keeps under 63.
+fn twoPow(k: int): int {
+  let out = 1
+  let i = 0
+  while (i < k && i < 63) {
+    out = out * 2
+    i = i + 1
+  }
+  return out
+}
+
+// One value in the binary protocol, by its column's type.
+//
+// EVERY TYPE NOT NAMED HERE IS A LENGTH-ENCODED STRING — DECIMAL, VARCHAR, the
+// BLOBs, JSON, BIT, ENUM, SET, GEOMETRY — which is why an unknown type is safe
+// to fall through to rather than a desync waiting to happen: the protocol gives
+// all of them an explicit length.
+fn binaryValue(c: cursor, col: column): Value! {
+  let width = fixedWidth(col.kind)
+  if (width > 0) {
+    return Value.Int(intOfWidth(c.take(width)?, col.unsigned)?)
+  }
+  if (col.kind == typeFloat) {
+    return Value.Float(float32Value(c.take(4)?)?)
+  }
+  if (col.kind == typeDouble) {
+    return Value.Float(bitsToFloat(u64FromLe(c.take(8)?)))
+  }
+  if (col.kind == typeNull) {
+    return Value.Null
+  }
+  if (temporalKind(col.kind)) {
+    return Value.Text(temporalText(c, col.kind)?)
+  }
+  let s = lenEncString(c)?
+  if (col.binary && blobKind(col.kind)) {
+    return Value.Blob([]byte(s))
+  }
+  return Value.Text(s)
+}
+
+// The byte width of a fixed-width integer type, or 0 for everything else.
+fn fixedWidth(kind: int): int {
+  if (kind == typeTiny) {
+    return 1
+  }
+  if (kind == typeShort || kind == typeYear) {
+    return 2
+  }
+  if (kind == typeLong || kind == typeInt24) {
+    return 4
+  }
+  if (kind == typeLongLong) {
+    return 8
+  }
+  return 0
+}
+
+// A date, a time, or one of the two date-times.
+fn temporalKind(kind: int): bool {
+  return kind == typeDate || kind == typeDatetime || kind == typeTimestamp || kind == typeTime
+}
+
+// A BLOB-family type, whose bytes are binary when the column's collation says so.
+fn blobKind(kind: int): bool {
+  return kind >= 249 && kind <= typeBlob
+}
+
+// A little-endian integer of 1, 2, 4 or 8 bytes, sign-extended unless the column
+// is UNSIGNED.
+//
+// AN UNSIGNED BIGINT ABOVE 2^63-1 FAILS rather than wrapping to a negative. Bit's
+// `int` is signed 64-bit, so the value genuinely does not fit; wrapping it would
+// hand the caller a negative row count or a negative id and nothing would say so.
+fn intOfWidth(s: string, unsigned: bool): int! {
+  let b = []byte(s)
+  let n = len(b)
+  let low = 0
+  let i = n - 2
+  let scale = twoPow(8 * (n - 1))
+  while (i >= 0) {
+    low = low * 256 + int(b[i])
+    i = i - 1
+  }
+  let top = int(b[n - 1])
+  if (!unsigned && top >= 128) {
+    return low + (top - 256) * scale
+  }
+  if (n == 8 && top >= 128) {
+    fail newError("mysql: an unsigned BIGINT above 2^63-1 does not fit " + "Bit's signed 64-bit int")
+  }
+  return low + top * scale
+}
+
+// Eight little-endian bytes as the u64 bit pattern they are. Kept in u64 the
+// whole way: an `int` cannot hold the half of the range whose top bit is set,
+// and a double's sign bit is exactly that bit.
+fn u64FromLe(s: string): u64 {
+  let b = []byte(s)
+  let out = u64(0)
+  let i = len(b) - 1
+  while (i >= 0) {
+    out = (out << u64(8)) | u64(int(b[i]))
+    i = i - 1
+  }
+  return out
+}
+
+// A four-byte IEEE-754 single as the double it widens to, exactly. The bit
+// patterns are not the same shape — 8 exponent bits against 11, 23 mantissa bits
+// against 52 — so the fields are taken apart and rebuilt rather than cast.
+//
+// A subnormal single is normalized into the double's much wider exponent range
+// (every subnormal single is an ordinary normal double); an infinity or a NaN
+// fails, because no MySQL column can hold one and a silent NaN in a result set
+// is a wrong answer that propagates.
+fn float32Value(s: string): f64! {
+  let bits = intOfWidth(s, true)?
+  let sign = (bits / twoPow(31)) & 1
+  let exp = (bits / twoPow(23)) & 255
+  let mant = bits & 8388607
+  if (exp == 255) {
+    fail newError("mysql: the server sent a non-finite FLOAT")
+  }
+  if (exp == 0 && mant == 0) {
+    return signed(0.0, sign)
+  }
+  let (m, e) = normalizeSingle(mant, exp)
+  return signed(bitsToFloat(doubleBits(m, e)), sign)
+}
+
+// A single's mantissa and exponent as (mantissa without its implied bit,
+// unbiased exponent). A subnormal is shifted left until the implied bit appears,
+// which is what makes it normal in the double's range.
+//
+// Bounded by 24 iterations: `mant` is under 2^23 and doubles every time.
+fn normalizeSingle(mant: int, exp: int): (int, int) {
+  if (exp != 0) {
+    return (mant, exp - 127)
+  }
+  let m = mant
+  let e = 0 - 126
+  let i = 0
+  while (m < 8388608 && i < 24) {
+    m = m * 2
+    e = e - 1
+    i = i + 1
+  }
+  return (m - 8388608, e)
+}
+
+// The u64 bit pattern of the double with mantissa `mant` (23 significant bits,
+// implied bit removed) and unbiased exponent `e`.
+fn doubleBits(mant: int, e: int): u64 {
+  return (u64(e + 1023) << u64(52)) | (u64(mant) << u64(29))
+}
+
+// `v` with `sign` applied, 1 meaning negative.
+fn signed(v: f64, sign: int): f64 {
+  if (sign == 1) {
+    return 0.0 - v
+  }
+  return v
+}
+
+// A DATE, DATETIME, TIMESTAMP or TIME in the text form the server itself would
+// print: `2026-09-11`, `2026-09-11 14:03:05.250000`, `-34 12:00:00`.
+//
+// The binary encoding is a length byte and that many bytes of struct, with the
+// trailing fields simply ABSENT when they are zero — a DATETIME at midnight is
+// four bytes, not eleven — so every field past the length is conditional.
+fn temporalText(c: cursor, kind: int): string! {
+  let n = readLenEnc(c)?
+  if (n <= 0) {
+    return zeroTemporal(kind)
+  }
+  let body = c.take(n)?
+  if (kind == typeTime) {
+    return timeText(body)?
+  }
+  return dateText(body, kind)?
+}
+
+// What a zero-length temporal means: the server's own zero value.
+fn zeroTemporal(kind: int): string {
+  if (kind == typeDate) {
+    return "0000-00-00"
+  }
+  if (kind == typeTime) {
+    return "00:00:00"
+  }
+  return "0000-00-00 00:00:00"
+}
+
+// A DATE/DATETIME/TIMESTAMP body: year, month, day, then optionally
+// hour/minute/second and microseconds.
+fn dateText(body: string, kind: int): string! {
+  let c = cursor{ s: body, at: 0 }
+  let out = "${pad(c.int(2)?, 4)}-${pad(c.int(1)?, 2)}-${pad(c.int(1)?, 2)}"
+  if (kind == typeDate || c.rest() == 0) {
+    return out
+  }
+  return out + " " + clockText(c)?
+}
+
+// A TIME body: a sign byte, a day count, then the clock. MySQL's TIME spans
+// -838:59:59 to 838:59:59, so the days are folded into the hours rather than
+// printed separately.
+fn timeText(body: string): string! {
+  let c = cursor{ s: body, at: 0 }
+  let neg = c.int(1)? == 1
+  let days = c.int(4)?
+  let hours = c.int(1)? + days * 24
+  let out = "${pad(hours, 2)}:${pad(c.int(1)?, 2)}:${pad(c.int(1)?, 2)}" + microText(c)?
+  if (neg) {
+    return "-" + out
+  }
+  return out
+}
+
+// `HH:MM:SS` and, when the server sent them, `.ffffff`.
+fn clockText(c: cursor): string! {
+  return "${pad(c.int(1)?, 2)}:${pad(c.int(1)?, 2)}:${pad(c.int(1)?, 2)}" + microText(c)?
+}
+
+// The fractional seconds, or nothing at all when the server omitted them.
+fn microText(c: cursor): string! {
+  if (c.rest() < 4) {
+    return ""
+  }
+  return "." + pad(c.int(4)?, 6)
+}
+
+// `n` as text, zero-padded to `width` digits.
+//
+// Bounded by `width`.
+fn pad(n: int, width: int): string {
+  let out = "${n}"
+  let i = len(out)
+  while (i < width) {
+    out = "0" + out
+    i = i + 1
+  }
+  return out
+}
+
+// The parameter block of a COM_STMT_EXECUTE: the NULL bitmap, the
+// new-parameters-bound flag, every parameter's type, and then their values.
+//
+// The flag is always 1 — this driver sends the types with every execute rather
+// than relying on the server to remember the last binding. A cached statement
+// executed with a NULL where it previously had a string is exactly the case
+// where remembering goes wrong.
+fn bindParams(vals: []Value): string! {
+  if (len(vals) == 0) {
+    return ""
+  }
+  let out = nullBitmap(vals) + writeLe(1, 1)
+  for v of vals {
+    out = out + writeLe(paramType(v), 2)
+  }
+  for v of vals {
+    out = out + paramData(v)?
+  }
+  return out
+}
+
+// One bit per parameter, set when it is NULL. No two-bit offset here — that is
+// the ROW format's rule, not the parameter block's, and using it in both places
+// is a classic way to bind every value one column over.
+fn nullBitmap(vals: []Value): string {
+  let b = []byte((len(vals) + 7) / 8)
+  let i = 0
+  for v of vals {
+    if (isNull(v)) {
+      b[i / 8] = byte(int(b[i / 8]) | twoPow(i % 8))
+    }
+    i = i + 1
+  }
+  return string(b)
+}
+
+// The wire type this driver sends each `Value` variant as. The high byte of the
+// two-byte field is the unsigned flag, which is 0 for everything here: an `int`
+// is signed, and a string carries no signedness at all.
+fn paramType(v: Value): int {
+  match (v) {
+    Null => return typeNull
+    Int(_) => return typeLongLong
+    Float(_) => return typeDouble
+    Text(_) => return typeVarString
+    Blob(_) => return typeBlob
+  }
+}
+
+// One parameter's bytes. A NULL contributes none — it is in the bitmap — which
+// is why this returns "" for it rather than a placeholder byte that would push
+// every following value out of position.
+fn paramData(v: Value): string! {
+  match (v) {
+    Null => return ""
+    Int(n) => return writeI64(n)
+    Float(f) => return writeU64(floatBits(f))
+    Text(s) => return writeLenEncString(s)?
+    Blob(b) => return writeLenEncString(string(b))?
+  }
+}
+
+// A signed 64-bit integer, little-endian, two's complement. `writeLe` cannot be
+// used: Bit's `%` keeps the sign of its left operand, so a negative value there
+// would produce a negative byte.
+fn writeI64(v: int): string {
+  let b = []byte(8)
+  let rest = v
+  let i = 0
+  while (i < 8) {
+    let d = rest % 256
+    if (d < 0) {
+      d = d + 256
+    }
+    b[i] = byte(d)
+    rest = (rest - d) / 256
+    i = i + 1
+  }
+  return string(b)
+}
+
+// A u64 bit pattern as eight little-endian bytes.
+fn writeU64(v: u64): string {
+  let b = []byte(8)
+  let rest = v
+  let i = 0
+  while (i < 8) {
+    b[i] = byte(int(rest & u64(255)))
+    rest = rest >> u64(8)
+    i = i + 1
+  }
+  return string(b)
+}
+
+// A length-encoded string: the protocol's own variable-width length, then the
+// bytes. A value larger than one packet fails here rather than being truncated
+// into a statement that would run against the wrong data.
+fn writeLenEncString(s: string): string! {
+  let n = len(s)
+  if (n >= maxPacket) {
+    fail newError(
+        "mysql: a parameter of ${n} bytes exceeds the " +
+        "${maxPacket}-byte packet this driver sends in one piece",
+    )
+  }
+  if (n < 251) {
+    return writeLe(n, 1) + s
+  }
+  if (n < 65536) {
+    return writeLe(252, 1) + writeLe(n, 2) + s
+  }
+  return writeLe(253, 1) + writeLe(n, 3) + s
+}
+

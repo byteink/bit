@@ -1,0 +1,400 @@
+// pkg/mysql/query.bit — prepared statements: COM_STMT_PREPARE, parameter
+// binding, the binary result protocol, and the per-connection statement cache
+// (#3994).
+//
+// A PARAMETER NEVER TOUCHES THE STATEMENT TEXT. `std/sql` hands a driver the SQL
+// the caller wrote and an ordered `[]Value`, separately, and this file keeps them
+// separate all the way to the socket: the text goes out in COM_STMT_PREPARE, the
+// values go out in COM_STMT_EXECUTE as typed binary fields, and the server binds
+// them. There is no code path here that concatenates a value into SQL, which is
+// what makes injection structurally impossible rather than merely avoided.
+//
+// THE COUNT IS CHECKED BEFORE ANYTHING IS SENT. `rewritten.values` (rewrite.bit)
+// fails naming both counts while the connection is still idle. Doing it after
+// the prepare would leave a statement allocated on the server and — worse — turn
+// a caller's bug into a protocol desync on a connection the pool would hand out
+// again.
+//
+// A PARAMETERLESS STATEMENT KEEPS THE TEXT PROTOCOL. COM_QUERY is one round trip
+// and COM_STMT_PREPARE + COM_STMT_EXECUTE is two, with nothing to bind and
+// nothing to gain; `conn.bit`'s `query` takes that path when the rewriter found
+// no placeholders. The visible consequence is the value TYPE: the text protocol
+// reports every column as `Value.Text`, the binary protocol reports a column's
+// real type, so `asInt` works on a parameterized query's integer column and
+// `asText` works on a parameterless one's. That is loud in either direction — a
+// mismatched accessor fails — and it is the price of not paying a round trip per
+// `select 1`.
+//
+// ERRORS CARRY THE SERVER'S NUMBER. `myError` below has the error code and the
+// SQLSTATE as fields, so a caller telling a duplicate key (1062) from a deadlock
+// (1213, retryable) matches on a number rather than on English text that changes
+// between server versions and locales.
+
+// COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_CLOSE.
+const comStmtPrepare: int = 22
+const comStmtExecute: int = 23
+const comStmtClose: int = 25
+
+// CURSOR_TYPE_NO_CURSOR: the whole result set comes back in the reply, which is
+// what `myRows` already materializes.
+const cursorNone: int = 0
+
+// A server-side error, with the two things a caller can branch on. A caller that
+// wants them declares the shape it needs and asks:
+//
+//     interface SqlError { message(): string, errorCode(): int, sqlState(): string }
+//     db.exec(...) catch e {
+//       let (my, ok) = e.(SqlError)
+//       if (ok && my.errorCode() == 1213) { retry() }
+//     }
+//
+// The class itself is deliberately NOT exported: `adapter` stays this package's
+// only exported symbol (adapter.bit), and a caller matching on a shape rather
+// than on a driver's concrete type is a caller that still compiles after a
+// driver swap.
+class myError {
+  code: int
+  state: string
+  text: string
+  // The `std/sql` error surface. The numbers are repeated in the text because
+  // they are what an operator looks up.
+  message(): string {
+    return "mysql: error ${this.code} ${this.state}: ${this.text}"
+  }
+
+  // The server's own error number: 1062 duplicate key, 1213 deadlock, and so on.
+  errorCode(): int {
+    return this.code
+  }
+
+  // The five-character SQLSTATE, `#` stripped — "23000", "40001". Empty only if
+  // the server sent an ERR packet without one, which CLIENT_PROTOCOL_41 forbids.
+  sqlState(): string {
+    return this.state
+  }
+}
+
+// An ERR packet as an error: 0xFF, a two-byte code, `#` and a five-byte
+// SQLSTATE, then the message. A packet too short to hold them is reported as
+// malformed rather than parsed into zeros.
+fn serverError(payload: string): error {
+  let c = cursor{ s: payload, at: 1 }
+  let code = c.int(2) catch _ {
+    return newError("mysql: malformed error packet from the server")
+  }
+  let state = ""
+  if (c.rest() > 6 && c.s[c.at:c.at + 1] == "#") {
+    state = c.take(6) catch _ {
+      return newError("mysql: malformed error packet from the server")
+    }
+    state = state[1:len(state)]
+  }
+  return myError{ code: code, state: state, text: c.s[c.at:len(c.s)] }
+}
+
+// A statement the server has prepared and is holding for this connection.
+class preparedStmt {
+  id: int,
+  params: int,
+  cols: []column,
+}
+
+// The per-connection cache of prepared statements, and the reason it is
+// per-connection: a statement id is meaningless on any other connection, and a
+// pool that shared one would execute a caller's statement against whatever the
+// id happens to mean on the connection it landed on. This is the bug operators
+// meet as pgbouncer's "prepared statement does not exist"; MySQL's own proxies
+// have it too.
+//
+// OFF BY DEFAULT (`limit` 0). `Datasource.statementCache` opts in, per
+// `std/sql`'s config (stdlib/sql/config.bit). Caching is not free: every cached
+// statement holds server-side memory and a table lock reference for the life of
+// the connection, and a pool of 10 connections multiplies whatever N is by ten.
+//
+// EVICTION IS FIFO, not LRU: the order a workload prepares statements in is
+// usually the order it reuses them, and the clock a true LRU needs would be one
+// more thing to keep right for a cache whose whole job is to be bounded.
+class stmtCache {
+  limit: int
+  keys: []string
+  byKey: map<string, preparedStmt>
+  // The statement prepared from `text`, if it is held.
+  get(text: string): preparedStmt! {
+    let (st, ok) = this.byKey[text]
+    if (!ok) {
+      fail newError("mysql: statement not cached")
+    }
+    return st
+  }
+
+  // Whether `text` is held, without the failure.
+  has(text: string): bool {
+    let (_, ok) = this.byKey[text]
+    return ok
+  }
+
+  // Keep `st` under `text`, evicting the oldest entry when the cache is full.
+  // The evicted statement's id is returned so the caller can close it on the
+  // server; 0 means nothing was evicted.
+  put(text: string, st: preparedStmt): int {
+    if (this.limit < 1 || this.has(text)) {
+      return 0
+    }
+    let evicted = 0
+    if (len(this.keys) >= this.limit) {
+      let oldest = this.keys[0]
+      let (old, ok) = this.byKey[oldest]
+      if (ok) {
+        evicted = old.id
+      }
+      delete(this.byKey, oldest)
+      this.keys = this.keys[1:len(this.keys)]
+    }
+    this.byKey[text] = st
+    this.keys = append(this.keys, text)
+    return evicted
+  }
+}
+
+// An empty cache. `limit` 0 is off, which is what `Datasource.statementCache`
+// defaults to.
+fn newStmtCache(limit: int): stmtCache {
+  return stmtCache{ limit: limit, keys: []string(0), byKey: map<string, preparedStmt>() }
+}
+
+// What one COM_STMT_EXECUTE produced: rows for a query, an affected count for an
+// update. The protocol answers with one or the other — an OK packet or a result
+// set — so both live here rather than in two nearly identical call paths.
+class stmtResult {
+  rows: myRows,
+  affected: int,
+}
+
+// A prepared statement handed back to the caller (`std/sql.Stmt`). It keeps the
+// rewrite it was prepared from, so its `params` are numbered exactly as the
+// caller wrote them and the count check is the same one `Conn.query` makes.
+class myStmt {
+  c: myConn
+  st: preparedStmt
+  r: rewritten
+  query(params: []Value): Rows! {
+    return executeStmt(this.c, this.st, this.r.values(params)?)?.rows
+  }
+
+  exec(params: []Value): int! {
+    return executeStmt(this.c, this.st, this.r.values(params)?)?.affected
+  }
+
+  // COM_STMT_CLOSE, unless the cache is holding this statement: closing it
+  // would free an id the cache would go on handing out, and the server answers
+  // the next execute with "unknown prepared statement handler".
+  close() {
+    if (!this.c.cache.has(this.r.text)) {
+      closeStmt(this.c, this.st.id)
+    }
+  }
+}
+
+// Prepare `r` on `c` and wrap it as a `std/sql.Stmt`.
+fn newStmt(c: myConn, r: rewritten): Stmt! {
+  let st = prepared(c, r.text)?
+  checkArity(st, r)?
+  return myStmt{ c: c, st: st, r: r }
+}
+
+// The server's parameter count against the rewriter's. They can only disagree if
+// the rewriter turned a `$N` into a `?` the server did not see as a parameter —
+// or missed one it did — which is the misfire rewrite.test.bit exists to
+// prevent, and binding through it would put every following value in the wrong
+// column.
+fn checkArity(st: preparedStmt, r: rewritten): ()! {
+  if (st.params != r.arity()) {
+    fail newError(
+        "mysql: the server prepared ${st.params} parameters for a " +
+        "statement this driver rewrote to ${r.arity()}; refusing to bind",
+    )
+  }
+}
+
+// The whole parameterized path: bind, prepare (or reuse), execute.
+//
+// The order is the security property. `values` runs before `prepared` — the
+// count check happens while the connection is still idle, so a caller passing
+// three values for two placeholders gets an error and the socket never moves.
+fn execPrepared(c: myConn, r: rewritten, params: []Value): stmtResult! {
+  let bound = r.values(params)?
+  let st = prepared(c, r.text)?
+  checkArity(st, r)?
+  return executeStmt(c, st, bound)?
+}
+
+// The prepared statement for `text`: the cached one if the cache is on and holds
+// it, otherwise a fresh COM_STMT_PREPARE, cached if there is room.
+fn prepared(c: myConn, text: string): preparedStmt! {
+  if (c.cache.has(text)) {
+    return c.cache.get(text)?
+  }
+  let st = prepareStmt(c, text)?
+  let evicted = c.cache.put(text, st)
+  if (evicted != 0) {
+    closeStmt(c, evicted)
+  }
+  return st
+}
+
+// COM_STMT_PREPARE and its reply: the statement id, how many parameters it
+// takes, and the columns it will return.
+fn prepareStmt(c: myConn, text: string): preparedStmt! {
+  c.w.startCommand()
+  c.w.send(writeLe(comStmtPrepare, 1) + text) catch e {
+    fail transportError(e.message())
+  }
+  let head = c.recv()?
+  if (packetKind(head) == 255) {
+    fail serverError(head)
+  }
+  if (packetKind(head) != 0) {
+    fail transportError("the server answered COM_STMT_PREPARE with packet type " + "${packetKind(head)}")
+  }
+  let cur = cursor{ s: head, at: 1 }
+  let id = cur.int(4)?
+  let cols = cur.int(2)?
+  let params = cur.int(2)?
+  skipDefs(c, params)?
+  return preparedStmt{ id: id, params: params, cols: readDefs(c, cols)? }
+}
+
+// `n` column definition packets and the EOF that closes them, kept.
+//
+// Bounded by `n`, which the server declared.
+fn readDefs(c: myConn, n: int): []column! {
+  let out = []column(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, parseColumn(c.recv()?)?)
+    i = i + 1
+  }
+  if (n > 0 && !isEof(c.recv()?)) {
+    fail transportError("the server sent no EOF after ${n} column definitions")
+  }
+  return out
+}
+
+// The same packets, discarded: the parameter definitions carry nothing this
+// driver uses (it sends its own types), but they are on the wire and skipping
+// them wrongly would desync every following packet.
+fn skipDefs(c: myConn, n: int): ()! {
+  readDefs(c, n)?
+}
+
+// COM_STMT_CLOSE. The server never answers it, so there is nothing to read and
+// nothing to report: a failed write is dropped, and the next command on this
+// connection fails loudly on its own.
+fn closeStmt(c: myConn, id: int) {
+  c.w.startCommand()
+  c.w.send(writeLe(comStmtClose, 1) + writeLe(id, 4)) catch _ {
+    return
+  }
+}
+
+// COM_STMT_EXECUTE with `vals` bound, and whatever comes back.
+fn executeStmt(c: myConn, st: preparedStmt, vals: []Value): stmtResult! {
+  let body = writeLe(comStmtExecute, 1) +
+    writeLe(st.id, 4) +
+    writeLe(cursorNone, 1) +
+    writeLe(1, 4) +
+    bindParams(vals)?
+  if (len(body) >= maxPacket) {
+    fail newError(
+        "mysql: the bound statement is ${len(body)} bytes, which " +
+        "exceeds the ${maxPacket}-byte packet this driver sends in one piece",
+    )
+  }
+  c.w.startCommand()
+  c.w.send(body) catch e {
+    fail transportError(e.message())
+  }
+  return collectStmt(c, st)?
+}
+
+// The reply to an execute: an OK packet, an ERR packet, or a result set whose
+// column definitions replace the ones the prepare reported (they are the same
+// columns, but a statement re-prepared by the server after a schema change
+// answers with the new ones).
+fn collectStmt(c: myConn, st: preparedStmt): stmtResult! {
+  let head = c.recv()?
+  if (packetKind(head) == 255) {
+    fail serverError(head)
+  }
+  if (packetKind(head) == 0) {
+    return stmtResult{ rows: emptyRows(), affected: affectedRows(head)? }
+  }
+  let count = readLenEnc(cursor{ s: head, at: 0 })?
+  let cols = readDefs(c, count)?
+  let out = myRows{ cols: columnNames(cols), rows: [][]Value(0), at: 0 - 1 }
+  binaryRows(c, out, cols)?
+  return stmtResult{ rows: out, affected: 0 }
+}
+
+// An OK packet's affected-row count: 0x00, then the count as a
+// length-encoded integer.
+fn affectedRows(payload: string): int! {
+  let c = cursor{ s: payload, at: 1 }
+  let n = readLenEnc(c)?
+  if (n < 0) {
+    return 0
+  }
+  return n
+}
+
+// A result set with no rows and no columns, which is what an OK packet means.
+fn emptyRows(): myRows {
+  return myRows{ cols: []string(0), rows: [][]Value(0), at: 0 - 1 }
+}
+
+// Just the names, for `Rows.columns`.
+fn columnNames(cols: []column): []string {
+  let out = []string(0)
+  for c of cols {
+    out = append(out, c.name)
+  }
+  return out
+}
+
+// Binary row packets until the closing EOF or OK.
+//
+// Bounded by `queryPacketBudget`.
+fn binaryRows(c: myConn, out: myRows, cols: []column): ()! {
+  let seen = 0
+  while (seen < queryPacketBudget) {
+    seen = seen + 1
+    let p = c.recv()?
+    if (packetKind(p) == 255) {
+      fail serverError(p)
+    }
+    if (isEof(p)) {
+      return
+    }
+    out.rows = append(out.rows, binaryRow(p, cols)?)
+  }
+  fail transportError("the server sent ${queryPacketBudget} packets without " + "ending the result set")
+}
+
+// Whether this connection's server is running with ANSI_QUOTES, which decides
+// what `"` means to the placeholder scanner (rewrite.bit).
+//
+// ONE ROUND TRIP PER CONNECTION, at connect time. There is no capability bit and
+// no status flag for the SQL mode — the only way to know is to ask — and the
+// alternative is assuming the default and silently rewriting a `$1` inside a
+// quoted identifier on every server that does not run it.
+fn ansiQuotesOn(c: myConn): bool! {
+  let rows = c.query("select @@sql_mode", []Value(0))?
+  if (!rows.next()?) {
+    fail transportError("the server returned no row for @@sql_mode")
+  }
+  let mode = asText(rows.value(0)) catch e {
+    fail transportError("@@sql_mode came back as something other than text: " + "${e.message()}")
+  }
+  rows.close()
+  return contains(mode, "ANSI_QUOTES")
+}
