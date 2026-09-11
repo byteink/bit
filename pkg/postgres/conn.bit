@@ -1,17 +1,20 @@
 // pkg/postgres/conn.bit — the `std/sql.Conn` an authenticated session becomes.
 //
-// SCOPE: ONE STATEMENT SHAPE, DELIBERATELY. This ticket (#3987) gets a
-// connected, authenticated session; the query layer — the extended protocol,
-// parameter binding, typed result decoding and the statement cache — is #3988.
-// What is here is the simple-query protocol with no parameters, which is
-// exactly what a `select 1` liveness check needs and nothing more. `exec`,
-// `prepare` and `begin` FAIL naming #3988 rather than half-working: a
-// parameter path that silently interpolated would be an injection hole, and
-// the one thing `std/sql` guarantees structurally is that it cannot exist.
+// EVERY STATEMENT TAKES THE EXTENDED PROTOCOL (query.bit), parameters or not.
+// The simple query protocol has no field a parameter could travel in, so using
+// it for anything the caller supplied a value for would mean building the SQL
+// text around that value; running it for the parameterless case too would be a
+// second code path whose only merit is saving a message on `select 1`.
 //
-// Values come back in the protocol's TEXT format, so every non-NULL column is
-// `Value.Text` whatever its column type. Binary format and per-type decoding
-// are #3988's, not a gap to be papered over here.
+// VALUES COME BACK IN THE PROTOCOL'S TEXT FORMAT, so every non-NULL column is
+// `Value.Text` whatever its column type, and `pgRows` carries the columns' type
+// OIDs beside them. Turning those bytes into `Value.Int`/`Value.Float`/... is
+// the codec ticket (#3989); this file delivers the bytes and the OID that says
+// what they are.
+//
+// `begin` STILL FAILS. Transactions are the rest of epic #3986: `std/sql` runs
+// them through a closure (stdlib/sql/tx.bit) and a half-working `begin` would
+// be worse than one that says so.
 
 // The column length a DataRow uses for SQL NULL: -1, read out of an unsigned
 // four-byte field.
@@ -22,71 +25,50 @@ class pgConn {
   r: pgReader
   s: pgStream
   closed: bool
-  // The simple-query protocol: one `Query` message, then everything the server
-  // sends back until `ReadyForQuery`.
+  // The named statements this connection is holding. Per connection, never
+  // shared, and empty unless `Datasource.statementCache` asked for it
+  // (stmtcache.bit).
+  cache: stmtCache
+  // A statement expected to produce rows.
   //
-  // A failure below this point has left the connection's message stream at an
-  // unknown offset, so every one of them is a `transportError` — `std/sql`'s
-  // marker for "do not hand this connection out again" (stdlib/sql/config.bit).
+  // A failure BELOW the write is a `transportError` — `std/sql`'s marker for
+  // "do not hand this connection out again" (stdlib/sql/config.bit) — because
+  // the message stream is then at an unknown offset. A failure the SERVER
+  // reported is not: the batch's `Sync` means the exchange ended at
+  // `ReadyForQuery` and the connection is as usable as it was before.
   query(sqlText: string, params: []Value): Rows! {
-    if (len(params) != 0) {
-      fail newError(
-          "postgres: parameter binding is not implemented yet " +
-          "(#3988); this connection runs parameterless statements only",
-      )
-    }
     if (this.closed) {
       fail transportError("query on a closed connection")
     }
-    writeMessage(this.s, "Q", cstr(sqlText)) catch e {
-      fail transportError(e.message())
-    }
-    return this.collect()?
+    return runExtended(this, sqlText, params)?.rows
   }
 
-  // Read the whole response. Bounded by `queryMessageBudget`.
-  collect(): Rows! {
-    let out = pgRows{ cols: []string(0), rows: [][]Value(0), at: 0 - 1 }
-    let failure = ""
-    let seen = 0
-    while (seen < queryMessageBudget) {
-      seen = seen + 1
-      let m = this.r.next() catch e {
-        fail transportError(e.message())
-      }
-      if (m.tag == "Z") {
-        return this.done(out, failure)?
-      }
-      failure = absorb(out, m, failure)?
-    }
-    fail transportError("the server sent ${queryMessageBudget} messages " + "without reaching ReadyForQuery")
-  }
-
-  // `ReadyForQuery` arrived, so the connection is usable again whichever way
-  // this ends — an `ErrorResponse` for a bad statement is NOT a transport
-  // failure and must leave the connection in the pool.
-  done(out: pgRows, failure: string): Rows! {
-    if (failure != "") {
-      fail newError(failure)
-    }
-    return out
-  }
-
+  // A statement expected only to change rows. The count comes from the
+  // server's own CommandComplete tag, never from counting anything here.
   exec(sqlText: string, params: []Value): int! {
-    fail newError("postgres: exec is not implemented yet (#3988)")
+    if (this.closed) {
+      fail transportError("exec on a closed connection")
+    }
+    return runExtended(this, sqlText, params)?.affected
   }
 
+  // A statement handle. It holds the text, not a server-side name — see
+  // `pgStmt` (query.bit).
   prepare(sqlText: string): Stmt! {
-    fail newError("postgres: prepare is not implemented yet (#3988)")
+    if (this.closed) {
+      fail transportError("prepare on a closed connection")
+    }
+    return pgStmt{ c: this, text: sqlText }
   }
 
   begin(): Tx! {
-    fail newError("postgres: begin is not implemented yet (#3988)")
+    fail newError("postgres: begin is not implemented yet (epic #3986)")
   }
 
   // Best effort: tell the server we are going (`Terminate`), then drop the
   // socket. A write failure here is ignored — the socket is being closed
-  // either way and `Conn.close` cannot report anything.
+  // either way and `Conn.close` cannot report anything. The cache goes with
+  // the connection; a statement name means nothing without it.
   close() {
     if (this.closed) {
       return
@@ -100,35 +82,21 @@ class pgConn {
   }
 }
 
-// Fold one response message into `out`, returning the failure text so far.
-// `T` describes the columns, `D` is a row, `E` is a statement error that is
-// reported only after `ReadyForQuery` (the server keeps sending until then);
-// `C`, `I`, `N`, `S` and `K` carry nothing this driver reads.
-fn absorb(out: pgRows, m: pgMessage, failure: string): string! {
-  if (m.tag == "T") {
-    out.cols = describeColumns(m.body)?
-    return failure
-  }
-  if (m.tag == "D") {
-    out.rows = append(out.rows, decodeRow(m.body)?)
-    return failure
-  }
-  if (m.tag == "E" && failure == "") {
-    return errorText(m.body)
-  }
-  return failure
-}
-
 // `RowDescription`: a two-byte field count, then per field a `\0`-terminated
-// name and eighteen bytes of type information this driver does not read.
-fn describeColumns(body: string): []string! {
+// name and eighteen bytes of type information, of which this driver reads the
+// four that are the type OID (bytes 6..10: the table OID and the column's
+// attribute number come first). The OID is what #3989's decoder will dispatch
+// on, and reading it here is why `Describe` is in every batch.
+//
+// Bounded by the field count the server declared.
+fn describeColumns(body: string): []pgColumn! {
   let count = readBe16(body, 0)?
-  let out = []string(0)
+  let out = []pgColumn(0)
   let off = 2
   let i = 0
   while (i < count) {
     let (name, next) = readCstr(body, off)?
-    out = append(out, name)
+    out = append(out, pgColumn{ name: name, oid: readBe32(body, next + 6)? })
     off = next + 18
     i = i + 1
   }
@@ -171,11 +139,11 @@ fn readBe16(s: string, off: int): int! {
   return int(b[off]) * 256 + int(b[off + 1])
 }
 
-// A materialized result set. The whole response is already in memory by the
-// time `query` returns — the simple-query protocol has no cursor — so `next`
-// is a walk over rows already read, and `close` has nothing to release.
+// A materialized result set. `Execute` was sent with no row limit, so the
+// whole response is already in memory by the time `query` returns: `next` is a
+// walk over rows already read, and `close` has nothing to release.
 class pgRows {
-  cols: []string
+  cols: []pgColumn
   rows: [][]Value
   at: int
   next(): bool! {
@@ -184,7 +152,26 @@ class pgRows {
   }
 
   columns(): []string {
-    return this.cols
+    let out = []string(0)
+    for c of this.cols {
+      out = append(out, c.name)
+    }
+    return out
+  }
+
+  // The PostgreSQL type OID of each column, in the same order as `columns`.
+  // Not part of `std/sql.Rows` — a caller that wants it asks for the shape:
+  //
+  //     interface TypedRows { oids(): []int }
+  //
+  // which is how #3989's codec will reach it, and how this package's own
+  // tests assert what the server said a column is.
+  oids(): []int {
+    let out = []int(0)
+    for c of this.cols {
+      out = append(out, c.oid)
+    }
+    return out
   }
 
   value(col: int): Value {

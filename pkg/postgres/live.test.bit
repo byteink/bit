@@ -17,7 +17,7 @@
 // read `warn.sslLines`/`warn.authLines` — the counts ARE the claim "one warning
 // line per pool, not one per connection", and an `Adapter` has no fields.
 
-import { pool, Pool, asText } from "std/sql"
+import { pool, Pool, asText, isNull } from "std/sql"
 import { env } from "std/os"
 
 // The URI under `name`, or "" — printed once so a skipped run is visible as a
@@ -194,4 +194,296 @@ test "live: the field form with port 0 connects identically to the uri form" {
     },
   )
   db.close()
+}
+
+// The SQLSTATE a caller reads off a failure. The same shape `query.test.bit`
+// declares, asked of a REAL server's error here.
+interface liveError {
+  message(): string,
+  sqlState(): string,
+}
+
+// The result set's column type OIDs, beside `std/sql.Rows`'s own methods (a
+// type assertion may only narrow to an interface that still satisfies the one
+// in hand, E0041).
+interface liveTypedRows {
+  next(): bool!,
+  columns(): []string,
+  value(col: int): Value,
+  close(),
+  oids(): []int,
+}
+
+// One physical connection to the live server, taken from the adapter itself.
+//
+// NOT THROUGH `pool` FOR THE OID CASE. `std/sql`'s pool wraps a driver's `Rows`
+// in its own (stdlib/sql/pool.bit), and that wrapper implements exactly the
+// `Rows` contract — so `oids()`, which is this driver's own extension, is not
+// reachable through a `Pool` by design. The codec (#3989) decodes inside the
+// driver for the same reason; this test asks the driver directly because the
+// OIDs are what it is asserting.
+fn liveConn(uri: string): Conn {
+  return newPgAdapter().connect(Datasource{ uri: uri }) catch e {
+    panic("connect(${uri}): ${e.message()}")
+  }
+}
+
+// A pool on the live server, or a panic naming why not.
+fn livePool(uri: string, cache: i64): Pool {
+  return pool(newPgAdapter(), Datasource{ uri: uri, maxOpen: 1, statementCache: cache }) catch e {
+    panic("pool(${uri}): ${e.message()}")
+  }
+}
+
+// The SQLSTATE of the failure `exec` produced, or "" if it succeeded. A
+// failure carrying no SQLSTATE panics: reporting "" for it would let a
+// transport error pass as "the statement did not fail".
+fn execState(db: Pool, sqlText: string, params: []Value): string {
+  db.exec(sqlText, params) catch e {
+    let (pg, ok) = e.(liveError)
+    if (!ok) {
+      panic("the failure carries no SQLSTATE: ${e.message()}")
+    }
+    return pg.sqlState()
+  }
+  return ""
+}
+
+test "live: three parameters come back as the bytes and OIDs the server named" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  let c = liveConn(uri)
+  let rows = c.query(
+    "select $1::int4 as a, $2::text as b, $3::bool as c",
+    []Value{ Value.Int(42), Value.Text("o'brien"), Value.Text("t") },
+  ) catch e {
+    panic("query: ${e.message()}")
+  }
+  let (typed, ok) = rows.(liveTypedRows)
+  assert(ok, "Rows does not expose oids()")
+  let oids = typed.oids()
+  assert(len(oids) == 3, "${len(oids)} columns came back")
+  // int4, text, bool: the OIDs are Postgres's own, stable since 7.x.
+  assert(oids[0] == 23, "column a is OID ${oids[0]}, not int4")
+  assert(oids[1] == 25, "column b is OID ${oids[1]}, not text")
+  assert(oids[2] == 16, "column c is OID ${oids[2]}, not bool")
+  assert(hasRow(rows), "no row came back")
+  assertText(rows.value(0), "42")
+  assertText(rows.value(1), "o'brien")
+  assertText(rows.value(2), "t")
+  assert(sameNames(rows.columns(), []string{ "a", "b", "c" }), "column names")
+  rows.close()
+  c.close()
+}
+
+// One column's bytes, as the text format delivers them.
+fn assertText(v: Value, want: string) {
+  let got = asText(v) catch e {
+    panic("column: ${e.message()}")
+  }
+  assert(got == want, "column carried '${got}', wanted '${want}'")
+}
+
+// Whether two name lists match, element for element.
+fn sameNames(got: []string, want: []string): bool {
+  if (len(got) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(got)) {
+    if (got[i] != want[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+test "live: a placeholder used twice binds the one supplied value to both" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  let db = livePool(uri, 0)
+  let rows = db.query(
+    "select $1::int4 as l, $1::int4 as r, $2::text as t",
+    []Value{ Value.Int(7), Value.Text("x") },
+  ) catch e {
+    panic("query: ${e.message()}")
+  }
+  assert(hasRow(rows), "no row came back")
+  assertText(rows.value(0), "7")
+  assertText(rows.value(1), "7")
+  assertText(rows.value(2), "x")
+  rows.close()
+  db.close()
+}
+
+test "live: NULL survives the round trip as NULL, not as an empty string" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  let db = livePool(uri, 0)
+  let rows = db.query(
+    "select $1::text as n, $2::text as e",
+    []Value{ Value.Null, Value.Text("") },
+  ) catch e {
+    panic("query: ${e.message()}")
+  }
+  assert(hasRow(rows), "no row came back")
+  assert(isNull(rows.value(0)), "a NULL parameter came back as ${asTextOr(rows.value(0))}")
+  assert(!isNull(rows.value(1)), "an empty string came back as NULL")
+  assertText(rows.value(1), "")
+  rows.close()
+  db.close()
+}
+
+// A value's text, or a note that it was NULL — for assertion messages only.
+fn asTextOr(v: Value): string {
+  return asText(v) catch _ {
+    return "NULL"
+  }
+}
+
+test "live: a unique violation surfaces SQLSTATE 23505, matched on the code" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  let db = livePool(uri, 0)
+  setUp(db, "drop table if exists live_unique")
+  setUp(db, "create table live_unique (id int primary key)")
+  let inserted = db.exec("insert into live_unique (id) values ($1)", []Value{ Value.Int(1) }) catch e {
+    panic("insert: ${e.message()}")
+  }
+  assert(inserted == 1, "the first insert reported ${inserted} affected rows")
+  let state = execState(db, "insert into live_unique (id) values ($1)", []Value{ Value.Int(1) })
+  assert(state == "23505", "the duplicate key reported SQLSTATE '${state}'")
+  setUp(db, "drop table live_unique")
+  db.close()
+}
+
+test "live: a deadlock arrives as 40P01 and a syntax error as 42601, by code" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  let db = livePool(uri, 0)
+  // The deadlock code is raised rather than provoked: a real deadlock needs
+  // two sessions holding each other's rows, which needs transactions, and
+  // `begin` is the rest of epic #3986. What this asserts is the whole path a
+  // deadlock takes to the caller — the server's ErrorResponse, its `C` field,
+  // and the code reaching `sqlState()` — on an error the server really did
+  // produce, with the retryable code a retry loop branches on.
+  let deadlock = execState(
+    db,
+    "do $$ begin raise exception 'deadlock detected' using errcode = '40P01'; end $$",
+    []Value(0),
+  )
+  assert(deadlock == "40P01", "the raised deadlock reported SQLSTATE '${deadlock}'")
+  let syntax = execState(db, "select from where", []Value(0))
+  assert(syntax == "42601", "a syntax error reported SQLSTATE '${syntax}'")
+  assert(syntax != deadlock, "two different failures reported one SQLSTATE")
+  db.close()
+}
+
+// A statement run for its effect, failing the test if the server refused it.
+fn setUp(db: Pool, sqlText: string) {
+  db.exec(sqlText, []Value(0)) catch e {
+    panic("${sqlText}: ${e.message()}")
+  }
+}
+
+test "live: an error halfway through a result set leaves the connection usable" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  // maxOpen 1: the connection the failing query poisoned is the only one the
+  // next query can get, so a driver that left the stream half-consumed fails
+  // here rather than being handed a fresh connection that hides it.
+  let db = livePool(uri, 0)
+  let state = queryState(
+    db,
+    "select case when i < 5 then i else 1 / 0 end from generate_series(1, 10) as g(i)",
+    []Value(0),
+  )
+  assert(state == "22012", "the mid-stream failure reported SQLSTATE '${state}'")
+  let rows = db.query("select $1::int4", []Value{ Value.Int(3) }) catch e {
+    panic("the connection was unusable after a mid-stream error: ${e.message()}")
+  }
+  assert(hasRow(rows), "no row from the query after the failure")
+  assertText(rows.value(0), "3")
+  rows.close()
+  db.close()
+}
+
+// The SQLSTATE of the failure `query` produced, or "".
+fn queryState(db: Pool, sqlText: string, params: []Value): string {
+  let rows = db.query(sqlText, params) catch e {
+    let (pg, ok) = e.(liveError)
+    if (!ok) {
+      panic("the failure carries no SQLSTATE: ${e.message()}")
+    }
+    return pg.sqlState()
+  }
+  rows.close()
+  return ""
+}
+
+test "live: the statement cache reuses one server-side statement, and is off by default" {
+  let uri = liveUri("PG_TEST_TRUST_URI")
+  if (uri == "") {
+    return
+  }
+  // pg_prepared_statements lists what the CURRENT session holds, so it is the
+  // server's own account of what this driver left behind: 0 with the cache
+  // off, 1 with it on, after the same twenty executions either way.
+  assert(preparedCount(uri, 0, 20) == 0, "the default cache left named statements behind")
+  assert(preparedCount(uri, 8, 20) == 1, "the cache did not reuse one statement")
+}
+
+// Run `workloadSql` `times` times on a pool of ONE connection, then ask that
+// same session how many prepared statements it is holding FOR THAT TEXT.
+//
+// The filter matters: with the cache on, the counting statement is itself
+// cached, so a bare `count(*)` would answer 2 and the extra one would be this
+// query rather than anything the workload left behind.
+fn preparedCount(uri: string, cache: i64, times: int): int {
+  let db = livePool(uri, cache)
+  let i = 0
+  while (i < times) {
+    let rows = db.query(workloadSql, []Value{ Value.Int(i) }) catch e {
+      panic("query ${i}: ${e.message()}")
+    }
+    rows.close()
+    i = i + 1
+  }
+  let held = countHeld(db)
+  db.close()
+  return held
+}
+
+// The statement the cache test runs over and over.
+const workloadSql: string = "select $1::int4 as v"
+
+// How many prepared statements this session holds for `workloadSql`.
+fn countHeld(db: Pool): int {
+  let rows = db.query(
+    "select count(*)::text from pg_prepared_statements where statement = $1",
+    []Value{ Value.Text(workloadSql) },
+  ) catch e {
+    panic("pg_prepared_statements: ${e.message()}")
+  }
+  assert(hasRow(rows), "pg_prepared_statements returned no row")
+  let held = asText(rows.value(0)) catch e {
+    panic("count: ${e.message()}")
+  }
+  rows.close()
+  return parseInt(held) catch e {
+    panic("count '${held}': ${e.message()}")
+  }
 }

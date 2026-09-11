@@ -7,7 +7,7 @@ import { pool, Datasource } from "std/sql"
 import { adapter } from "bitlang.org/pkg/postgres"
 
 let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
-let rows = db.query("select 1", []Value(0))?
+let rows = db.query("select * from users where id = $1", []Value{ Value.Int(7) })?
 ```
 
 Install with `bit add bitlang.org/pkg/postgres@v0.1.0`.
@@ -75,12 +75,89 @@ Each of the three warns once per pool, naming the method and the fix.
 The SCRAM exchange verifies the **server's** signature before accepting
 `AuthenticationOk`, and every comparison in it goes through `crypto/subtle`.
 
+## Queries
+
+Every statement goes out on the **extended query protocol** — Parse, Bind,
+Describe, Execute, Sync, written as one batch, one round trip. The simple query
+protocol has no field a parameter could travel in, so a driver using it for
+`where id = $1` would have to build the statement text around the caller's
+value; nothing here ever does.
+
+`$1` is Postgres's own placeholder and the text is passed through untouched, so
+a placeholder used twice is **one** parameter bound to both positions:
+
+```bit
+db.query("select $1::int4 as l, $1::int4 as r", []Value{ Value.Int(7) })?
+```
+
+Values come back in the protocol's **text format**, so every non-NULL column is
+`Value.Text` whatever its type, and the result set carries each column's type
+OID beside it. Turning those bytes into `Value.Int`/`Value.Float`/... is
+`#3989`.
+
+`exec` reports the count from the server's own `CommandComplete` tag.
+Parameters are sent with their types left for the server to infer, except a
+`Value.Blob`, which is declared `bytea` and sent as raw binary.
+
+## The statement cache is off by default
+
+With `statementCache` unset, every execution parses an **unnamed** statement,
+which the server discards at the next Parse:
+
+```bit
+let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL")?, maxOpen: 20 })?
+```
+
+A named prepared statement lives on **one** backend. pgbouncer in transaction
+mode hands the next query to a different one, which answers `prepared statement
+"s1" does not exist` — an error naming neither the pooler nor the cache. RDS
+Proxy instead pins the connection, so the pooling silently stops happening.
+Opt in when you know neither is in front of you:
+
+```bit
+let db = pool(adapter(), Datasource{
+  uri: env("DATABASE_URL")?, maxOpen: 20, statementCache: 256,
+})?
+```
+
+The number is how many distinct statements **each** connection remembers. The
+cache is per connection, never shared, evicts least-recently-used, closes what
+it evicts, and dies with the connection. A statement is remembered only after
+the server has actually parsed it: a Parse in a batch that then failed was
+rolled back with its implicit transaction.
+
+## Errors carry the SQLSTATE
+
+A failure the server reported is a typed error, not a sentence. Ask it for the
+shape you need:
+
+```bit
+interface SqlError { message(): string, sqlState(): string }
+
+db.exec(sql, params) catch e {
+  let (pg, ok) = e.(SqlError)
+  if (ok && (pg.sqlState() == "40001" || pg.sqlState() == "40P01")) { retry() }
+}
+```
+
+`23505` is a unique violation and is not retryable; `40001` (serialization
+failure) and `40P01` (deadlock detected) are. Telling them apart by message
+text is how retry loops get written wrong.
+
+Every exchange is drained to `ReadyForQuery`, so a statement that failed —
+including one that failed halfway through a result set — leaves the connection
+usable, and the next borrower from the pool never inherits a half-read stream.
+
 ## Limitations, and where each one is going
 
-- **Queries are `#3988`.** `query` runs the simple-query protocol with no
-  parameters — enough for a `select 1` liveness check. `exec`, `prepare` and
-  `begin` fail naming `#3988`. Values come back in the protocol's text format,
-  so every non-NULL column is `Value.Text` whatever its column type.
+- **Typed decoding is `#3989`.** Columns arrive as text bytes with their type
+  OIDs; `asInt` on an `int4` column fails today, `asText` works.
+- **Transactions are the rest of `#3986`.** `begin` fails naming the epic;
+  `std/sql` runs transactions through a closure (`stdlib/sql/tx.bit`).
+- **`Conn.prepare` does not name a statement on the server.** It holds the
+  text and runs the ordinary path, so a `Stmt` is unnamed unless
+  `statementCache` turned the cache on. A name is meaningful only on the one
+  backend that parsed it, which is the same reason the cache is opt-in.
 - **`verify-ca` checks the chain against the trust store and deliberately does
   not check the name.** It does that by handing `x509VerifyChain` the leaf's own
   first SubjectAltName, so the name test is vacuous by construction rather than
@@ -95,10 +172,12 @@ The SCRAM exchange verifies the **server's** signature before accepting
 ## Tests
 
 `./make test-package-postgres` runs everything that needs no server: the URI
-parser, and the startup exchange against an in-process fake backend that is a
-real SCRAM server side (it derives `StoredKey`/`ServerKey` and verifies the
-client's proof), so a forged server signature, a replayed nonce, a weak
-iteration count and a missing server proof each fail.
+parser, the startup exchange against an in-process fake backend that is a real
+SCRAM server side (it derives `StoredKey`/`ServerKey` and verifies the client's
+proof), so a forged server signature, a replayed nonce, a weak iteration count
+and a missing server proof each fail — and the query layer against a backend
+that decodes each frontend frame and answers it, which is where "no named Parse
+across a hundred executions" is asserted against the bytes that were sent.
 
 `live.test.bit` adds the cases that need a real server. Each is skipped, out
 loud, when its URI is unset:
@@ -122,6 +201,18 @@ PG_TEST_SCRAM_URI=postgres://postgres:pw@127.0.0.1:55000/postgres \
 PG_TEST_MD5_URI=postgres://postgres:pw@127.0.0.1:55001/postgres \
 PG_TEST_PASSWORD_URI=postgres://postgres:pw@127.0.0.1:55003/postgres \
   bit test pkg/postgres
+```
+
+`PG_TEST_TRUST_URI` alone covers the query layer: the parameter round trip and
+its OIDs, the SQLSTATEs, the mid-result-set failure, and the cache, which is
+counted from the server's own `pg_prepared_statements`. Any port works — the
+one field-form test that needs 5432 skips out loud elsewhere:
+
+```sh
+docker run --rm -d --name pg-3988 -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -p 127.0.0.1:55010:5432 postgres:16-alpine
+PG_TEST_TRUST_URI=postgres://postgres@127.0.0.1:55010/postgres ./make test-package-postgres
+docker rm -f pg-3988
 ```
 
 For `PG_TEST_TLS_URI`, turn `ssl` on in a container with a self-signed
