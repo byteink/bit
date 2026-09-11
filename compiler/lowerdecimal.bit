@@ -1,0 +1,175 @@
+// compiler/lowerdecimal.bit — #3982 slice 1: the `decimal` VALUE in the
+// lowerer. Sibling of lower.bit: same module, so this needs no imports and no
+// call-site changes.
+//
+// THE REPRESENTATION. A `decimal` is two i64 words, sign-magnitude, laid out as
+// .NET `System.Decimal`: word 0 is mantissa bits 0..63; word 1 carries mantissa
+// bits 64..95 in its bits 0..31, the scale (0..28) in its bits 32..39 and the
+// sign in its bit 63, with bits 40..62 zero. SPEC §11.1 pins both ends of that
+// — "roughly 28 significant digits" is 2^96 (7.9e28), not 2^127 (38 digits),
+// and "two `i64` words wide" leaves nowhere for a third word to hold the scale.
+// Zero is both words zero, which is `0` at scale 0, so a zeroed object's
+// `decimal` field already reads as zero with no init code (§13.4).
+//
+// WHY A DECIMAL VALUE'S IR TYPE IS THE TUPLE `(i64, i64)` AND NEVER `decimal`.
+// Every SSA value in this IR is one register and `widthOf` answers 16 bytes for
+// prim 12 (#3981, slice 1a), so a value typed `decimal` cannot reach either
+// backend at all — by design, so that one falls off the end of a 1/2/4/8 switch
+// instead of silently becoming one register. #4404 already built the mechanism
+// a two-word value needs: the aggregate is taken apart IN THE LOWERER into
+// independent single-word values, so `marshalArgs`, `PLoc`, `LiveInterval`,
+// `StackMapEntry` and the `.bit_gc` wire format are untouched and both backends
+// handle a decimal by handling i64 — which is why this design is right on
+// aarch64 and x86_64 at once rather than twice. A decimal value is therefore a
+// two-word aggregate of exactly the shape that path opened with.
+//
+// The DECLARED type stays `decimal` everywhere a programmer wrote one; the
+// checker never sees the tuple. `explodedWordTypes` maps the declared type to
+// the two words, so a decimal local is two i64 locals and a decimal parameter
+// is two i64 parameters, and the box `localRead` materializes for a use that
+// wants the whole value is cancelled by store-to-load forwarding and
+// dead-allocation elimination at every use this slice can build.
+
+// Is `ty` the §5.3 `decimal` prim (types.bit, prim 12)? `ty == 0` is "not
+// inferred", never a decimal. The ONE predicate — a second copy is how one
+// consumer gets widened and another does not (#4412).
+fn isDecimalPrim(ctx: TypeContext, ty: int): bool {
+  if (ty == 0) {
+    return false
+  }
+  return ctx.types[ty].kind == TypeKind.Prim && ctx.types[ty].prim == 12
+}
+
+// The per-word types of a decimal value: two i64s (prim 3).
+fn decimalWordTypes(ctx: TypeContext): []int {
+  return [primType(ctx, 3), primType(ctx, 3)]
+}
+
+// The IR type a decimal VALUE carries: the two-word tuple of the banner.
+fn decimalTupleType(ctx: TypeContext): int {
+  return mkTuple(ctx, decimalWordTypes(ctx))
+}
+
+// One decimal constant's two words, or `ok: false` for literal text this slice
+// cannot turn into words exactly.
+class DecimalConst {
+  lo: int,
+  hi: int,
+  ok: bool,
+}
+
+// The running state of a scan over a literal's text: the mantissa so far, the
+// digits seen after the point, and whether the text is still representable.
+class DecimalScan {
+  mant: int,
+  scale: int,
+  digits: int,
+  point: bool,
+  ok: bool,
+}
+
+// Folds one byte of the literal into the scan. The digits and the point,
+// nothing else: `_` is §5.4's separator and any other byte refuses.
+//
+// REFUSING IS THE POINT of the `digits` limit. The accumulator is an i64, so
+// past 18 digits the mantissa would wrap into word 1's territory silently; the
+// 96-bit multiply-accumulate that carries a longer literal into word 1 belongs
+// to the arithmetic slice. A scale above 28 is outside §11.1's range.
+fn decimalScanByte(sc: DecimalScan, ch: u8) {
+  if (ch == '_') {
+    return
+  }
+  if (ch == '.') {
+    if (sc.point) {
+      sc.ok = false
+    }
+    sc.point = true
+    return
+  }
+  let d = digitValue(ch)
+  if (d < 0 || d > 9 || sc.digits >= 18) {
+    sc.ok = false
+    return
+  }
+  sc.mant = sc.mant * 10 + d
+  sc.digits = sc.digits + 1
+  if (sc.point) {
+    sc.scale = sc.scale + 1
+  }
+}
+
+// The two words of the decimal constant whose literal text is `text`.
+//
+// The TEXT decides the scale, never a float: `19.99` is mantissa 1999 at scale
+// 2 and `3` is mantissa 3 at scale 0, because `parseFloat("19.99")` is already
+// 19.989999999999998 and not doing that is the reason the type exists. An
+// exponent or a radix prefix (`1e9`, `0x10`) is not decimal text and refuses
+// through `decimalScanByte`'s digit test.
+//
+// The mantissa fits word 0 whole (18 digits is under 2^63), so word 1 carries
+// only the scale here. The sign is never set: a literal's text is unsigned and
+// unary minus on a decimal is arithmetic, which this slice still refuses.
+fn decimalConstOf(text: string): DecimalConst {
+  let sc = DecimalScan{ mant: 0, scale: 0, digits: 0, point: false, ok: true }
+  let i = 0
+  while (i < len(text)) {
+    decimalScanByte(sc, text[i])
+    i = i + 1
+  }
+  if (!sc.ok || sc.digits == 0 || sc.scale > 28) {
+    return DecimalConst{ lo: 0, hi: 0, ok: false }
+  }
+  return DecimalConst{ lo: sc.mant, hi: sc.scale << 32, ok: true }
+}
+
+// Lowers a decimal literal to its two words. `const_int` twice and the
+// aggregate the words go into; the explosion at the binding reads them straight
+// back out, in this block, where forwarding answers both reads and the box dies.
+fn lowerDecimalConst(fc: FnCtx, n: Node): int {
+  let text = fc.c.source[n.span.start:n.span.end]
+  let dc = decimalConstOf(text)
+  if (!dc.ok) {
+    fcFail(fc, n.span, "a 'decimal' literal this wide (§11.1): at most 18 digits and scale 28")
+    return 0
+  }
+  let i64Ty = primType(fc.c.ctx, 3)
+  let lo = mkInstr(Op.ConstInt, i64Ty)
+  lo.ival = dc.lo
+  let hi = mkInstr(Op.ConstInt, i64Ty)
+  hi.ival = dc.hi
+  let vals = [builderEmit(fc.b, lo), builderEmit(fc.b, hi)]
+  return buildTuple(fc, decimalTupleType(fc.c.ctx), vals)
+}
+
+// Lowers an expression whose type — or whose context type — is `decimal`.
+//
+// WHAT THIS SLICE LOWERS, and why everything else still fails with a span
+// rather than falling through. #3981 put a blanket refusal on every decimal
+// value because a decimal in one register is a silent
+// wrong answer. Slice 1 replaces the blanket with a list: a literal becomes its
+// words here, and an identifier reaches `localRead`, which already answers a
+// decimal local and a decimal parameter from their words. Arithmetic is NOT on
+// the list and must not be — `binOpFor` has no decimal case, so `a + b` on two
+// decimals would emit `Op.Add` on two POINTERS and print nondeterministic
+// garbage at exit 0, which is #4438's failure exactly. It comes off the list
+// with the arithmetic slice, not before.
+fn lowerDecimalExpr(fc: FnCtx, node: int, hint: int, n: Node): int {
+  if (n.tag == Tag.IntLit || n.tag == Tag.FloatLit) {
+    return lowerDecimalConst(fc, n)
+  }
+  if (n.tag == Tag.Ident) {
+    return lowerExprByTag(fc, node, hint, n)
+  }
+  fcFail(fc, n.span, "this 'decimal' operation (§5.3): its codegen is not implemented yet")
+  return 0
+}
+
+// The `string_from_decimal` call one interpolated decimal takes (§5.7): the
+// value's two words, read out here, and the runtime renders the exact text from
+// them. A decimal never reaches `lowerPrimToString`'s one-argument shape.
+fn lowerDecimalToString(fc: FnCtx, v: int): int {
+  let ins = mkInstr(Op.RtCall, primType(fc.c.ctx, 11))
+  ins.name = "string_from_decimal"
+  ins.args = explodeValueWords(fc.c.ctx, fc.b, v, decimalWordTypes(fc.c.ctx))
+  return emitRtCall(fc, ins)
+}
