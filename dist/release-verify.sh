@@ -129,7 +129,12 @@ fi
 # previous release (caught on 0.1.12).
 n="$(grep -cE "^[0-9a-f]{64}  bit-$X-" "$WS/bit/dist/stage0/SHA256SUMS" 2>/dev/null)"
 n="${n:-0}"
-[ "$n" = "3" ] || fail "stage0 not repinned to $X ($n digest line(s) for $X, want 3)"
+# One line per triple, all of them for $X: derived from the file, never a
+# hardcoded count — `3` false-failed on 0.14.0 once #3344 pinned the fourth
+# (windows) triple, the same shape as the asset count before #2748.
+total="$(grep -cE "^[0-9a-f]{64}  bit-" "$WS/bit/dist/stage0/SHA256SUMS" 2>/dev/null)"
+total="${total:-0}"
+[ "$n" -ge 3 ] && [ "$n" = "$total" ] || fail "stage0 not repinned to $X ($n of $total digest line(s) are for $X, want all and at least 3)"
 
 # ---- 7. bitlang.org: both pins moved, committed, and pushed ----
 vb_head="$(git -C "$WS/bit-website/vendor/bit" rev-parse HEAD 2>/dev/null)"
