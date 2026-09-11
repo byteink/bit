@@ -283,13 +283,6 @@ reloc_sites_seen=0
 # shows each former callee's body at the former call site. Empties at the
 # next repin.
 RELOC_DECLARED="
-runtime/gc - ARM64_RELOC_BRANCH26 _idxDisable
-runtime/gc - ARM64_RELOC_BRANCH26 _noteBody
-runtime/root + ARM64_RELOC_BRANCH26 _strBytes
-runtime/root - ARM64_RELOC_BRANCH26 _bit_rt_port_root_gc_env_min_trigger
-runtime/root - ARM64_RELOC_BRANCH26 _bit_rt_value_eq
-runtime/root - ARM64_RELOC_BRANCH26 _packLowBytes
-runtime/root - ARM64_RELOC_BRANCH26 _powIsOddInteger
 "
 
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —
