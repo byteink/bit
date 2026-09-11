@@ -164,7 +164,7 @@ symbol the linked runtime resolves externally is rejected outright (**E0096**,
 changes what the linker binds the runtime's own call to. Every other module is
 unaffected, since only the root module's link names are left bare.
 
-- Types: `i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  int uint  byte rune  bool string  error`
+- Types: `i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  decimal  int uint  byte rune  bool string  error`
 - Constants: none beyond the `true`/`false`/`nil` literals.
 - Builtin functions: `len cap append delete close panic assert` (§16),
   and `parseFloat` (below).
@@ -1242,6 +1242,15 @@ interface is a separate extension this section does not make.
   release builds, trap in debug builds — see §13.5).
 - Unsigned integers: `u8 u16 u32 u64` (modular arithmetic).
 - Floats: `f32 f64` (IEEE-754 binary32 / binary64).
+- `decimal`: exact base-10 arithmetic — a signed 128-bit mantissa with a scale,
+  roughly 28 significant digits. A **value**, two `i64` words wide: no
+  allocation, no header, no GC pointer. It is its own numeric family, neither an
+  integer nor a float, which is what keeps every conversion to and from it
+  explicit (§12.9). Money is what it is for: `0.1 + 0.2` is `0.3` in a
+  `decimal` and is not in an `f64`. *(v1 status: the type, its literals and its
+  conversions are checked; arithmetic, comparison and formatting are not
+  implemented, and a program that evaluates a `decimal` value is refused at
+  build with **E0092**.)*
 - `bool` (`true` / `false`).
 - `string`: immutable, UTF-8 byte sequence; indexing yields a `byte`; `len(s)` is
   the byte length. Strings are reference types but deeply immutable.
@@ -2374,6 +2383,25 @@ the destination width; float→int truncates toward zero. *(v1 limit: converting
 `u64` whose top bit is set to or from a float uses the signed path, so such a
 value is out of range — fixed when a full unsigned float path lands.)*
 
+`decimal` (§11.1) takes part in exactly three of these:
+
+```
+decimal(n)        // from any integer type — always exact
+i64(d)            // decimal -> integer, truncating toward zero
+decimal(d)        // identity
+```
+
+Every float pairing is **rejected** in both directions — `decimal(f)`,
+`decimal(0.1 + 0.2)` and `f64(d)` are all compile errors. An `f64` cannot
+represent `19.99`, so converting one would carry the float's error into a type
+whose entire purpose is not having one, and converting the other way would drop
+the exactness with nothing at the call site saying so. The spelling for an exact
+decimal value is the constant itself, `let p: decimal = 19.99` (§15.4).
+
+An `extern function` (§11.7) may not name `decimal` in its signature: it is 128
+bits wide, and the C ABI's rule for passing that is the C prototype's to state,
+not this language's to assume.
+
 ### 12.10 Tuple Literals
 
 ```
@@ -2713,7 +2741,8 @@ construction site instead.
 
 Every declared binding without an initializer is deterministically zero-valued:
 
-- numeric → `0`; `bool` → `false`; `string` → `""`.
+- numeric → `0`; `bool` → `false`; `string` → `""`. A `decimal`'s zero is `0`
+  at scale 0, so a `decimal` field needs no special handling anywhere.
 - `[N]T` array → all elements zero-valued; tuple → each element zero-valued.
 - `class` → a live instance with each field at its **default value** if it
   declares one (§10.5), and otherwise zero-valued (classes are references, so
@@ -3288,7 +3317,12 @@ context. Each has a **default type** used when no other type is implied:
 | bool          | `bool`       |
 
 A constant is usable in any type in which it is **representable** (e.g. `200` is
-usable as `u8`, `300` is not — compile error). Constant expressions are evaluated
+usable as `u8`, `300` is not — compile error). `decimal` is placed by this same
+rule and no other: `let p: decimal = 19.99` is exact, `let q: decimal = 3`
+adapts an integer constant, and a constant needing more than the ~28 significant
+digits a `decimal` holds is the same representability error `300` for `u8` is.
+There is no literal suffix. A float constant with no typed context still takes
+its default type, so `let x = 19.99` is an `f64`. Constant expressions are evaluated
 at compile time with no overflow (overflow of the *final* target type is the
 representability error). This is the sole implicit-conversion path.
 
