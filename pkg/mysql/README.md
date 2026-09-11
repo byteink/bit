@@ -125,6 +125,16 @@ greeting's six-byte filler. They are read as such.
   `COM_QUERY` with no parameters — enough for a `select 1` liveness check. `exec`,
   `prepare` and `begin` fail naming the epic. Values come back in the protocol's
   text format, so every non-NULL column is `Value.Text` whatever its column type.
+- **TLS to a stock MySQL 8.4 or MariaDB 11.4 does not complete today, and the
+  cause is in `std/tls`, not here.** Both servers send a TLS 1.3
+  `CertificateRequest` (handshake type 13, optional client authentication) and
+  `std/tls.client` fails on it — `tls client: unexpected handshake message type
+  13` (stdlib/tls/client.bit). Every rung of the ladder therefore fails against a
+  server that advertises `CLIENT_SSL`, and the driver does NOT fall back to
+  cleartext, so such a server is reached only with an explicit
+  `ssl-mode=DISABLED` until `std/tls` handles that message. The TLS code here is
+  exercised against the fake server and against the ladder's own decisions; its
+  live proof is blocked on that gap.
 - **Single packets only.** A 16 MiB payload (the protocol's multi-packet form) is
   named rather than truncated.
 - **`VERIFY_CA` checks the chain against the trust store and deliberately does
