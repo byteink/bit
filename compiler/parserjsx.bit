@@ -1,0 +1,324 @@
+// Parser: JSX elements and fragments (SPEC §12.13, epic #3942 step one,
+// #3943). Parsing ONLY — these nodes are produced and nothing downstream
+// consumes them yet: no typing, no desugaring, no formatting.
+//
+// THE DISAMBIGUATION RULE, which is the whole of #3943. `<` opens JSX only at
+// EXPRESSION START (`parsePrimary`, parserexpr.bit) and only when the very
+// next token is an identifier or `>`. Everywhere else `<` stays what it was:
+//
+//   `a < b`          — parseBinary already has `a`, so this `<` is read as an
+//                      infix operator and never reaches parsePrimary.
+//   `map<string,i64>`— a TYPE, parsed by parsertype.bit.
+//   `f<T>(x)`        — the turbofish postfix, parsePostfix.
+//
+// so none of them can reach `atJsxStart`. Bit needs no `.tsx` dialect for
+// this: TypeScript's ambiguity was `<T>expr`, its cast syntax, and Bit spells
+// a type assertion `x.(T)` instead (SPEC §14.4). One token of lookahead is
+// then enough — the same test Babel applies.
+//
+// `<-` is a single token (Kind.ArrowLeft, lexer.bit), so a channel receive at
+// expression start cannot reach the lookahead at all, and the `>`-splitting
+// rule of SPEC §6 is untouched: a generic call inside a JSX child runs through
+// `expectGenericClose` exactly as it does anywhere else.
+
+// A closing tag naming a different element than its opener. In the parser's
+// own band (20-22 taken by E0021/E0022); 23 was unused.
+const ecJsxTagMismatch = 23
+
+// Is the cursor on a `<` that opens JSX? The caller must already be at
+// expression start — this function answers the second half of the rule only.
+fn atJsxStart(p: Parser): bool {
+  if (peekKind(p) != Kind.Lt) {
+    return false
+  }
+  let next = peekKindAt(p, 1)
+  return next == Kind.Ident || next == Kind.Gt
+}
+
+// `jsx_elem | jsx_fragment`, cursor on the `<`.
+fn parseJsx(p: Parser): int {
+  let open = peekTok(p)
+  advance(p)
+  if (peekKind(p) == Kind.Gt) {
+    return parseJsxFragment(p, open)
+  }
+  return parseJsxElement(p, open)
+}
+
+// `"<>" { jsx_child } "</>"` — `[jsx_children]`. Both `<>` and `</>` are two
+// and three ordinary tokens; the lexer has no JSX mode and needs none.
+fn parseJsxFragment(p: Parser, open: Token): int {
+  advance(p) // '>'
+  let kids = parseJsxChildren(p)
+  let endTok = peekTok(p)
+  if (peekKind(p) == Kind.Lt && peekKindAt(p, 1) == Kind.Slash) {
+    advance(p)
+    advance(p)
+    endTok = peekTok(p)
+    expect(p, Kind.Gt)
+  } else {
+    parseFail(p, "'</>' closing the fragment")
+  }
+  return mkSpanNode(p, Tag.JsxFrag, 0, [kids], open.start, endTok.end)
+}
+
+// `"<" IDENT { jsx_attr } ( "/>" | ">" { jsx_child } "</" IDENT ">" )` —
+// `[name, jsx_attrs, jsx_children]`. A self-closing element has no children
+// kid at all (`none`), which is what distinguishes it from `<div></div>`.
+fn parseJsxElement(p: Parser, open: Token): int {
+  let name = expectIdent(p)
+  let attrs = parseJsxAttrs(p)
+  if (peekKind(p) == Kind.Slash && peekKindAt(p, 1) == Kind.Gt) {
+    advance(p)
+    let selfEnd = peekTok(p)
+    advance(p)
+    return mkSpanNode(p, Tag.JsxElem, 0, [name, attrs, 0], open.start, selfEnd.end)
+  }
+  expect(p, Kind.Gt)
+  let kids = parseJsxChildren(p)
+  let endTok = expectJsxClose(p, name)
+  return mkSpanNode(p, Tag.JsxElem, 0, [name, attrs, kids], open.start, endTok.end)
+}
+
+// `</name>` for an element opened as `<name>`, returning the token the element
+// ends on. A MISMATCH is E0023 naming both tags and pointing at the closer;
+// the closer is still consumed so the enclosing tree stays in step, but no tag
+// is invented and no child is re-parented — an unbalanced tree rendered
+// silently is worse than a refusal (#3943).
+fn expectJsxClose(p: Parser, openName: int): Token {
+  let here = peekTok(p)
+  if (peekKind(p) != Kind.Lt || peekKindAt(p, 1) != Kind.Slash) {
+    parseFail(p, "a closing tag")
+    return here
+  }
+  advance(p) // '<'
+  advance(p) // '/'
+  let closeName = expectIdent(p)
+  jsxCheckTags(p, openName, closeName)
+  let gt = peekTok(p)
+  expect(p, Kind.Gt)
+  return gt
+}
+
+// The source text a name leaf covers. A poisoned name (index 0) has no text.
+fn jsxNameText(p: Parser, node: int): string {
+  let s = getNode(p.tree, node).span
+  return p.src[s.start:s.end]
+}
+
+// E0023. Silent when either name was already poisoned by `expectIdent`, which
+// has reported its own E0021 at that span — one mistake, one diagnostic.
+fn jsxCheckTags(p: Parser, openName: int, closeName: int) {
+  if (openName == 0 || closeName == 0) {
+    return
+  }
+  let o = jsxNameText(p, openName)
+  let c = jsxNameText(p, closeName)
+  if (o == c) {
+    return
+  }
+  report(p.diags, ecJsxTagMismatch, getNode(p.tree, closeName).span,
+    "closing tag '</${c}>' does not match opening tag '<${o}>'",
+    "close this element with '</${o}>'")
+}
+
+// The attribute list, closed by `>` or `/>`. Terminating: `parseJsxAttr`
+// consumes at least the identifier `jsxAtAttr` saw, so each turn advances.
+fn parseJsxAttrs(p: Parser): int {
+  let items = []int(0)
+  while (jsxAtAttr(p)) {
+    items = append(items, parseJsxAttr(p))
+  }
+  return mkNode(p, Tag.JsxAttrs, 0, items)
+}
+
+// An attribute list may wrap across lines, and the lexer's §7 semicolon
+// insertion fires after the tag name and after every attribute value, so the
+// synthesized `;` is skipped here rather than being read as the list's end.
+fn jsxAtAttr(p: Parser): bool {
+  skipSemis(p)
+  return peekKind(p) == Kind.Ident
+}
+
+// `IDENT [ "=" ( STRING_LIT | "{" expression "}" ) ]` — `[name, value]`. A
+// bare attribute has no value kid; SPEC §12.13 gives it the value `true`,
+// which is the desugaring's job (#3942), not the parser's.
+fn parseJsxAttr(p: Parser): int {
+  let name = leaf(p, Tag.Ident)
+  if (!acceptTok(p, Kind.Eq)) {
+    return mkNode(p, Tag.JsxAttr, 0, [name, 0])
+  }
+  if (peekKind(p) == Kind.LBrace) {
+    return mkNode(p, Tag.JsxAttr, 0, [name, parseJsxBraced(p)])
+  }
+  if (peekKind(p) == Kind.StringLit) {
+    return mkNode(p, Tag.JsxAttr, 0, [name, leaf(p, Tag.StringLit)])
+  }
+  parseFail(p, "a string or '{'")
+  return mkNode(p, Tag.JsxAttr, 0, [name, 0])
+}
+
+// `{ expression }` — an attribute value or an expression child. The braces
+// bound the node and are not kids, so the span is explicit.
+fn parseJsxBraced(p: Parser): int {
+  let open = peekTok(p)
+  advance(p)
+  skipSemis(p)
+  let e = parseExpr(p)
+  skipSemis(p)
+  let closeTok = peekTok(p)
+  expect(p, Kind.RBrace)
+  return mkSpanNode(p, Tag.JsxExpr, 0, [e], open.start, closeTok.end)
+}
+
+// Is the cursor on something that ends a run of text children?
+fn jsxAtChildEnd(p: Parser): bool {
+  let k = peekKind(p)
+  return k == Kind.Eof || k == Kind.Lt || k == Kind.LBrace
+}
+
+// `{ jsx_child }` up to the closing tag (or EOF, which the caller reports).
+// Terminating: every branch consumes at least one token — `parseJsxText`
+// unconditionally, `parseJsx` its `<`, `parseJsxBraced` its `{` — so the
+// cursor strictly advances and the loop is bounded by the token count.
+fn parseJsxChildren(p: Parser): int {
+  let items = []int(0)
+  let done = false
+  while (!done) {
+    if (peekKind(p) == Kind.Eof) {
+      done = true
+    } else if (peekKind(p) == Kind.Lt && peekKindAt(p, 1) == Kind.Slash) {
+      items = jsxAppend(items, jsxGapText(p))
+      done = true
+    } else if (atJsxStart(p)) {
+      items = jsxAppend(items, jsxGapText(p))
+      items = append(items, parseJsx(p))
+    } else if (peekKind(p) == Kind.LBrace) {
+      items = jsxAppend(items, jsxGapText(p))
+      items = append(items, parseJsxBraced(p))
+    } else {
+      items = jsxAppend(items, parseJsxText(p))
+    }
+  }
+  return mkNode(p, Tag.JsxChildren, 0, items)
+}
+
+// Appends a child unless it is the `none` a discarded text run returns.
+fn jsxAppend(items: []int, child: int): []int {
+  if (child == 0) {
+    return items
+  }
+  return append(items, child)
+}
+
+// The whitespace GAP between the element or `{...}` child that just ended and
+// the delimiter that starts the next one. A run of text covers its own leading
+// whitespace (`parseJsxText` reads from the previous token's end), but two
+// adjacent delimiters have no token between them at all, so without this
+// `<a/> <b/>` would silently lose the space the author typed between two
+// inline elements. Judged by the same §12.13 rule, so children written on
+// their own lines still contribute nothing.
+//
+// Guarded on the previous token being the `>` or `}` that ENDED a child: after
+// a text run the same byte range was already consumed and trimmed by
+// `parseJsxText`, and re-reading it here would emit the separator twice.
+fn jsxGapText(p: Parser): int {
+  if (p.pos == 0) {
+    return 0
+  }
+  let prev = p.toks[p.pos - 1]
+  if (prev.kind != Kind.Gt && prev.kind != Kind.RBrace) {
+    return 0
+  }
+  let (lo, hi) = jsxTrimText(p.src, prev.end, peekTok(p).start)
+  if (lo >= hi) {
+    return 0
+  }
+  return addLeaf(p.tree, Tag.JsxText, Span{ file: p.file, start: lo, end: hi })
+}
+
+// One run of text between two delimiters, as a `jsx_text` leaf — or 0 when the
+// run is whitespace the §12.13 rule discards.
+//
+// The run is taken from the SOURCE, not from the tokens: `[end of the previous
+// token, start of the next delimiter)`. That keeps interior spacing exactly as
+// written (tokens have no spacing between them) and makes the lexer's
+// synthesized semicolons, which are zero-width, invisible here.
+//
+// Progress: the first token is consumed unconditionally, before the loop, so
+// `<` followed by something that is not a tag (`<3`) is read as text rather
+// than spinning on a zero-length run.
+fn parseJsxText(p: Parser): int {
+  let runStart = 0
+  if (p.pos > 0) {
+    runStart = p.toks[p.pos - 1].end
+  }
+  advance(p)
+  while (!jsxAtChildEnd(p)) {
+    advance(p)
+  }
+  let (lo, hi) = jsxTrimText(p.src, runStart, peekTok(p).start)
+  if (lo >= hi) {
+    return 0
+  }
+  return addLeaf(p.tree, Tag.JsxText, Span{ file: p.file, start: lo, end: hi })
+}
+
+// SPEC §12.13's whitespace rule over the raw run `[lo0, hi0)`: a LEADING
+// whitespace run containing a line terminator is dropped, so is a TRAILING
+// one, and everything between is kept byte for byte.
+//
+// Two consequences, which are the whole reason the rule is written down: the
+// indentation between two children on their own lines is not a child at all
+// (the run is whitespace and contains a newline, so both ends eat it and
+// nothing is left), while `<a/> <b/>` on ONE line keeps its space, because a
+// whitespace run with no line terminator is text the author typed on purpose.
+fn jsxTrimText(src: string, lo0: int, hi0: int): (int, int) {
+  let lo = lo0
+  let hi = hi0
+  let afterWs = jsxSpaceRunEnd(src, lo, hi)
+  if (afterWs > lo && jsxRunHasNewline(src, lo, afterWs)) {
+    lo = afterWs
+  }
+  let beforeWs = jsxSpaceRunStart(src, lo, hi)
+  if (beforeWs < hi && jsxRunHasNewline(src, beforeWs, hi)) {
+    hi = beforeWs
+  }
+  return lo, hi
+}
+
+// The first index in `[lo, hi)` that is not whitespace (`hi` if all of it is).
+// Terminating: `i` strictly increases toward `hi`.
+fn jsxSpaceRunEnd(src: string, lo: int, hi: int): int {
+  let i = lo
+  while (i < hi && jsxIsSpace(src[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+// The index just past the last non-whitespace byte in `[lo, hi)` (`lo` if all
+// of it is whitespace). Terminating: `i` strictly decreases toward `lo`.
+fn jsxSpaceRunStart(src: string, lo: int, hi: int): int {
+  let i = hi
+  while (i > lo && jsxIsSpace(src[i - 1])) {
+    i = i - 1
+  }
+  return i
+}
+
+// Terminating: `i` strictly increases toward `hi`.
+fn jsxRunHasNewline(src: string, lo: int, hi: int): bool {
+  let i = lo
+  while (i < hi) {
+    if (src[i] == '\n') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn jsxIsSpace(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
