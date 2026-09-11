@@ -60,6 +60,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# The tree whose `./make dump-abi-symbols` / `./make dump-layout-consts`
+# reads a candidate commit's declared arities and layout constants
+# (stepDumpAbiSymbols in tools/build/abiarity.bit, stepDumpLayoutConsts in
+# tools/build/abilayout.bit). ROOT by default -- the git repo being walked
+# is also the driver, as for dist/abitwopass-run.sh.
+#
+# #3971: scripts/verify-reproducible-release.sh installs THIS file into the
+# worktree of a tag cut before #4197 so that ROOT (and hence every `git`
+# lookup, and dist/abitwopass-boot.sh's build) resolves to that tag's tree,
+# which is the only correct repo to derive a pass-1 base from. Those tags
+# have no dump steps at all, so that ONE lookup -- a pure parse of the
+# source handed to it in BIT_ABI_SCAN_DIR, not a property of the tag -- is
+# pointed back at the caller's own checkout through this variable.
+DRIVER_ROOT = Path(os.environ.get("BIT_ABITWOPASS_DRIVER_ROOT") or ROOT).resolve()
+
 REFUSAL_MARKER = "refusing to link — runtime ABI arity mismatch against the pinned stage0"
 
 # Mirrors tools/build/abiarity.bit's checkRuntimeAbiArity exactly:
@@ -385,8 +400,8 @@ def run_arity(mismatches: list) -> int:
         file=sys.stderr,
     )
     try:
-        base = derive_base(ROOT, ROOT, mismatches)
-        verify_base(ROOT, ROOT, base, mismatches)
+        base = derive_base(ROOT, DRIVER_ROOT, mismatches)
+        verify_base(ROOT, DRIVER_ROOT, base, mismatches)
     except RuntimeError as e:
         print(f"abitwopass.py: {e}", file=sys.stderr)
         return 1
@@ -407,8 +422,8 @@ def run_layout(mismatches: list) -> int:
         file=sys.stderr,
     )
     try:
-        base = derive_layout_base(ROOT, ROOT, mismatches)
-        verify_layout_base(ROOT, ROOT, base, mismatches)
+        base = derive_layout_base(ROOT, DRIVER_ROOT, mismatches)
+        verify_layout_base(ROOT, DRIVER_ROOT, base, mismatches)
     except RuntimeError as e:
         print(f"abitwopass.py: {e}", file=sys.stderr)
         return 1
