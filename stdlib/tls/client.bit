@@ -74,6 +74,10 @@ export class TlsClientHandshake {
   connected: bool
   extraHelloExts: []Extension
   serverEEExts: []Extension
+  // Optional client authentication (RFC 8446 §4.3.2): set when the server sent a
+  // CertificateRequest, with the context its answering Certificate must echo.
+  certRequested: bool
+  certReqContext: []byte
   // Session resumption (#1209): set by `tlsClientStartResume`; a zero-value
   // `pskSuite`/empty `pskEarly` means no PSK was offered.
   offeredSuites: []int
@@ -303,9 +307,9 @@ export class TlsClientHandshake {
   }
 
   // Parse and authenticate the server's Handshake-level messages —
-  // EncryptedExtensions, Certificate, CertificateVerify, Finished — in order,
-  // deriving the application-traffic material and returning the client Finished
-  // *message* bytes. The security core: it verifies the certificate chain +
+  // EncryptedExtensions, an optional CertificateRequest, Certificate,
+  // CertificateVerify, Finished — in order, deriving the application-traffic
+  // material and returning the client's answering flight bytes. The security core: it verifies the certificate chain +
   // hostname (unless `insecureSkipVerify`), the CertificateVerify signature, and
   // the server Finished MAC exactly as record mode. Shared by record mode
   // (`clientProcessAuthFlight`, which seals the message into a record) and the QUIC
@@ -332,6 +336,14 @@ export class TlsClientHandshake {
         if (!this.config.insecureSkipVerify) {
           this.clientVerifyChain()?
         }
+      } else if (t == hsCertificateRequest) {
+        // Client authentication is optional here (RFC 8446 §4.3.2): record the
+        // context to echo, hash the message like any other, and answer in the
+        // client flight with an empty Certificate.
+        let cr = parseCertificateRequest(msg)?
+        this.certRequested = true
+        this.certReqContext = cr.certRequestContext
+        this.transcript = tlsHsPutBytes(this.transcript, msg)
       } else if (t == hsCertificateVerify) {
         let cv = parseCertificateVerify(msg)?
         this.clientVerifyCertVerify(cv)?
@@ -340,7 +352,7 @@ export class TlsClientHandshake {
         let fin = parseFinished(msg)?
         this.clientVerifyServerFinished(fin)?
         this.transcript = tlsHsPutBytes(this.transcript, msg)
-        return this.clientFinishMessage()
+        return this.clientFinishFlight()
       } else {
         fail newError("tls client: unexpected handshake message type ${t}")
       }
@@ -352,7 +364,7 @@ export class TlsClientHandshake {
   // client Finished message into a handshake record to send. When 0-RTT early
   // data was accepted (#1209), an EndOfEarlyData record — sealed under the early
   // traffic key, the RFC 8446 §4.5 signal that the record layer is switching back
-  // to handshake keys — precedes it; `clientFinishMessage` already folded its
+  // to handshake keys — precedes it; `clientFinishFlight` already folded its
   // bytes into the transcript the Finished MAC covers.
   clientProcessAuthFlight(stream: []byte): TlsClientStep! {
     let finMsg = this.clientConsumeAuthFlight(stream)?
@@ -416,12 +428,12 @@ export class TlsClientHandshake {
     }
   }
 
-  // Produce the client Finished *message* and derive the application-traffic
-  // material. The transcript already includes the server Finished, so its hash
+  // Produce the client's answering flight — an empty Certificate when the server
+  // asked for one, then Finished — and derive the application-traffic material. The transcript already includes the server Finished, so its hash
   // `thSF` seeds both the client Finished MAC and the application secrets (RFC 8446
   // §7.1). Marks the handshake connected. Record mode seals the returned message
   // into a record; the QUIC path carries it verbatim in a CRYPTO frame.
-  clientFinishMessage(): []byte {
+  clientFinishFlight(): []byte {
     let mk = this.clientNewHash
     // RFC 8446 §7.1 fixes the application-traffic/exporter secrets to
     // "ClientHello...server Finished", never extended by EndOfEarlyData — that
@@ -437,13 +449,20 @@ export class TlsClientHandshake {
     if (this.earlyDataAccepted) {
       this.transcript = tlsHsPutBytes(this.transcript, encodeEndOfEarlyData())
     }
+    let out = []byte(0)
+    if (this.certRequested) {
+      let certMsg = clientEmptyCertificate(this.certReqContext)
+      this.transcript = tlsHsPutBytes(this.transcript, certMsg)
+      out = tlsHsPutBytes(out, certMsg)
+    }
     let verify = finishedMac(mk, this.chs, this.clientTh())
     let finMsg = encodeFinished(Finished{ verifyData: verify })
+    out = tlsHsPutBytes(out, finMsg)
 
     this.transcript = tlsHsPutBytes(this.transcript, finMsg)
     this.resumptionSec = resumptionMasterSecret(mk, master, this.clientTh())
     this.connected = true
-    return finMsg
+    return out
   }
 
   // The completed connection, valid once `processServerFlight` returned a `done`
@@ -551,11 +570,12 @@ export class TlsClientHandshake {
     return []byte(0)
   }
 
-  // Consume the server's Handshake-level messages — EncryptedExtensions,
-  // Certificate, CertificateVerify, Finished — as one plaintext `stream` (the
-  // concatenated messages std/quic reassembled from Handshake-level CRYPTO frames),
-  // and return the client Finished *message* to carry in a Handshake-level CRYPTO
-  // frame. Runs the full security core: it verifies the certificate chain +
+  // Consume the server's Handshake-level messages — EncryptedExtensions, an
+  // optional CertificateRequest, Certificate, CertificateVerify, Finished — as one
+  // plaintext `stream` (the concatenated messages std/quic reassembled from
+  // Handshake-level CRYPTO frames), and return the client's answering flight (an
+  // empty Certificate when one was requested, then Finished) to carry in a
+  // Handshake-level CRYPTO frame. Runs the full security core: it verifies the certificate chain +
   // hostname (unless `insecureSkipVerify`), the CertificateVerify signature, and
   // the server Finished MAC, then derives the application-traffic secrets. Fails
   // fatally on any parse or authentication failure.
@@ -649,17 +669,6 @@ export class TlsClientHandshake {
 }
 
 // ---------------------------------------------------------------------------
-// Small hash-constructor wrappers (`() => Hash`)
-// ---------------------------------------------------------------------------
-
-// The concrete SHA constructors expose as `() => Hash` values — a `newShaN`
-// returns its concrete type, which is not itself a `() => Hash`, so the signature
-// verifiers that take a hash constructor are handed these wrappers.
-fn clientSha256(): Hash { return newSha256() }
-fn clientSha384(): Hash { return newSha384() }
-fn clientSha512(): Hash { return newSha512() }
-
-// ---------------------------------------------------------------------------
 // Start: build the ClientHello
 // ---------------------------------------------------------------------------
 
@@ -740,6 +749,8 @@ export fn tlsClientStartExts(config: TlsClientConfig, extraExts: []Extension): T
     connected: false,
     extraHelloExts: extraExts,
     serverEEExts: []Extension(0),
+    certRequested: false,
+    certReqContext: []byte(0),
     offeredSuites: []int(0),
     pskUsed: false,
     pskEarly: []byte(0),
