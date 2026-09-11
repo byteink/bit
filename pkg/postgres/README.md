@@ -42,7 +42,7 @@ unrecognised `sslmode` value is rejected, never defaulted.
 Postgres has no TLS port and no ALPN. The driver opens a cleartext socket,
 sends the eight-byte `SSLRequest` packet, and reads the server's one-byte
 answer — `S` (handshake now, on this socket) or `N` (this server has no TLS).
-`std/tls.upgrade` runs the handshake from there.
+`std/tls.client` runs the handshake from there.
 
 **With no `sslmode`,** the strongest rung that works is taken: `verify-full`,
 then `verify-ca`, then `require`, then plaintext. A stock local server with no
@@ -108,8 +108,12 @@ docker run --rm -d --name pg-trust -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p 127.0.0.1:5432:5432 postgres:16-alpine
 docker run --rm -d --name pg-scram -e POSTGRES_PASSWORD=pw \
   -e POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256" -p 127.0.0.1:55000:5432 postgres:16-alpine
+# --auth-host=md5 matters: it makes initdb store the superuser's password as
+# md5. With the default password_encryption=scram-sha-256, Postgres 14+ answers
+# an md5 line in pg_hba.conf with SASL anyway, and the md5 path is never taken.
 docker run --rm -d --name pg-md5 -e POSTGRES_PASSWORD=pw \
-  -e POSTGRES_HOST_AUTH_METHOD=md5 -p 127.0.0.1:55001:5432 postgres:16-alpine
+  -e POSTGRES_HOST_AUTH_METHOD=md5 -e POSTGRES_INITDB_ARGS="--auth-host=md5" \
+  -p 127.0.0.1:55001:5432 postgres:16-alpine
 docker run --rm -d --name pg-password -e POSTGRES_PASSWORD=pw \
   -e POSTGRES_HOST_AUTH_METHOD=password -p 127.0.0.1:55003:5432 postgres:16-alpine
 
