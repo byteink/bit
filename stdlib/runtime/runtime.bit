@@ -1,0 +1,194 @@
+// Bit standard library — runtime module: the panic boundary (#4745, epic
+// #4739).
+//
+// `runRecovering(f)` runs `f` with a panic boundary installed on the current
+// task. A panic raised in `f`, or in anything `f` calls on the same task,
+// discards the frames between the panic site and this call and returns
+// `(true, message)`; a normal return gives `(false, "")`.
+//
+// WHAT SPEC §18.4 GUARANTEES, restated here because a caller reads this file
+// and not the spec:
+//
+//   - RECOVERY IS PER TASK. A boundary installed on one task never catches a
+//     panic raised on another. A `spawn`ed task needs its own boundary.
+//   - BOUNDARIES NEST, INNERMOST FIRST. The innermost boundary on the current
+//     task wins; a panic raised inside a boundary's own handler — after
+//     `runRecovering` has resumed and before it returns — reaches the next
+//     boundary OUT, never the one already unwound.
+//   - DEFERRED CALLS DO NOT RUN (§18.5). There is no unwinding of any kind, so
+//     nothing between the panic site and this call gets to clean up. Anything a
+//     panic path must release has to be released explicitly, before the call
+//     that may panic.
+//   - A HELD `std/sync` MUTEX STAYS HELD. That follows from the line above:
+//     `unlock` is not run for the frames that are discarded, so a recovered
+//     panic inside a critical section leaves the mutex locked forever. Do not
+//     wrap a critical section in `runRecovering`; wrap the work, take the lock
+//     around the result.
+//   - FOUR CLASSES STAY FATAL whatever this function does: a runtime-internal
+//     invariant failure (`bit_rt_fatal`), out of memory, a panic raised while
+//     the task is blocked in a syscall, and a panic raised on a thread that is
+//     not running a task. In the last case `bit_rt_panic_boundary_arm` declines
+//     to arm and answers 0, `f` runs unguarded, and a panic in it ends the
+//     program exactly as it would without this call — a boundary this module
+//     cannot keep is never promised.
+//
+// Panics are for programmer errors and broken invariants (§18.4). This call
+// exists so one failing unit of work — a connection task, a test case — can be
+// contained instead of taking the process with it; it is not an error-handling
+// mechanism. Expected failures use the Result model (§18).
+//
+// THE BODY IS SETJMP-SHAPED and is written the way it is on purpose. `arm`
+// returns twice: 0 from the call, 1 from a resume through the same call site.
+// Everything read after a resume comes from the runtime (`_code`/`_msg`), never
+// from a local, because a local written after the arm has no defined value on
+// the resumed path — the frame is the same frame, so a store the discarded
+// frames never made is simply not there.
+//
+// THE RECORD IS ROOTED BY THE RUNTIME, NOT BY THIS FRAME. `arm` publishes the
+// record's address in the current task's scratch word `scrPanicBoundary`
+// (runtime/sched/scratch.bit), and `stwScanScratch` (runtime/stw/stwscan.bit)
+// marks every scratch word conservatively, so the buffer cannot be swept while
+// a boundary names it. This module therefore needs no keepalive read of `rec`
+// after the arm — the one thing a dead-code pass could have removed.
+//
+// THE MESSAGE BYTES ARE COPIED OUT IMMEDIATELY, because a runtime panic's
+// message is a module-static buffer (`boundsMsg` in runtime/root/slices.bit and
+// its siblings) that the next panic of the same kind overwrites. The four
+// argument-free doors (§12.1) carry no message at all — they cannot allocate on
+// a path that is reporting a broken invariant — so they hand over a reason code
+// and `reasonMessage` maps it to a literal here, which is the only place a
+// string for one of those panics may be built.
+
+// The record `bit_rt_panic_boundary_arm` fills: `bndWords` in
+// runtime/sched/boundary.bit — 22 context words plus prev/code/msg. A record
+// SHORTER than the runtime expects would let the arm write past the buffer, so
+// this constant tracks that one.
+const recordWords: int = 25
+
+// `{ptr, len}` at the front of a string object (runtime/ABI.md §2, `strPtr` and
+// `strLen` in runtime/root/root.bit). `bit_rt_panic_boundary_msg` answers a
+// `*const RtBytes` as an integer, and these two offsets are how its bytes are
+// found. A third word (`strBase`) follows on a heap string and is not read
+// here: the static buffers the runtime panics with have only the two.
+const msgPtrOffset: int = 0
+const msgLenOffset: int = 8
+
+// The reason codes of runtime/ABI.md §12.1, and the text each one stands for.
+// The literals are the wording the corresponding fatal door writes to stderr
+// (`divZeroWord0` and its siblings in runtime/root/<os>/io.bit), so a recovered
+// message and an unrecovered one read the same. Codes are append-only: a new
+// argument-free door takes the next integer and never reuses one.
+const reasonDivZero: int = 1
+const reasonOverflow: int = 2
+const reasonNilCall: int = 3
+const reasonNilIface: int = 4
+
+// The five boundary entry points of runtime/ABI.md §12. Declared here rather
+// than imported because they are runtime symbols, not Bit functions: they live
+// in `libbitrt`, which this module links against (SPEC §11.7).
+extern fn bit_rt_panic_boundary_arm(rec: int): int
+extern fn bit_rt_panic_boundary_disarm()
+extern fn bit_rt_panic_boundary_code(): int
+extern fn bit_rt_panic_boundary_msg(): int
+
+// The bulk byte copy (runtime/ABI.md §11.4/§11.7). Regions are disjoint here:
+// the destination is a slice this module has just allocated.
+extern fn bit_rt_bytes_copy(dst: *byte, src: *byte, n: int)
+
+// The word at raw address `addr`. The runtime hands back the message header as
+// an integer — the ABI has no Bit type for "a pointer to a string object I did
+// not allocate" — and this is the read that gets its two words back out.
+fn wordAt(addr: int): int {
+  let zero: *i64 = nil
+  let p = zero + (addr >> 3)
+  return *p
+}
+
+// Raw address `addr` as a byte pointer, for the one call that takes one.
+fn bytesAt(addr: int): *byte {
+  let zero: *byte = nil
+  return zero + addr
+}
+
+// The literal for an argument-free door's reason code (§12.1). An unknown code
+// cannot happen today — the runtime passes one of the four — and reads as the
+// generic word rather than asserting: reporting a recovered panic is the wrong
+// place to raise a second one.
+fn reasonMessage(code: int): string {
+  if (code == reasonDivZero) {
+    return "integer division by zero"
+  }
+  if (code == reasonOverflow) {
+    return "integer overflow"
+  }
+  if (code == reasonNilCall) {
+    return "call of a nil function"
+  }
+  if (code == reasonNilIface) {
+    return "method call on a nil interface value"
+  }
+  return "panic"
+}
+
+// A fresh copy of the bytes of the message header at `addr`. A null header, or
+// one with no bytes, reads as `""` — the same reading `bit_rt_print` gives a
+// zeroed `string` field (runtime/root/io.bit's `strBytesOf`).
+//
+// THE COPY IS THE POINT: `addr` is either a module-static buffer the next panic
+// of the same kind overwrites, or an object in a frame the resume has already
+// discarded. Neither survives being returned.
+fn copyMessage(addr: int): string {
+  if (addr == 0) {
+    return ""
+  }
+  let n = wordAt(addr + msgLenOffset)
+  if (n <= 0) {
+    return ""
+  }
+  let out = []byte(n)
+  bit_rt_bytes_copy(ptrOf(out), bytesAt(wordAt(addr + msgPtrOffset)), n)
+  return string(out)
+}
+
+// The message of the panic the runtime has just resumed through. Read BEFORE
+// the boundary is disarmed: `bit_rt_panic_boundary_code`/`_msg` find the record
+// through the task's scratch head, which `disarm` pops.
+fn recoveredMessage(): string {
+  let code = bit_rt_panic_boundary_code()
+  if (code != 0) {
+    return reasonMessage(code)
+  }
+  return copyMessage(bit_rt_panic_boundary_msg())
+}
+
+// Run `f` with a panic boundary installed on the current task, and report
+// whether it panicked and with what message. See this file's header for what
+// the boundary does and does not promise — in particular that deferred calls do
+// not run and a held mutex stays held.
+//
+//     let (panicked, msg) = runRecovering(
+//       () => {
+//         risky(req)
+//       },
+//     )
+//     if (panicked) {
+//       log("request failed: ${msg}")
+//     }
+//
+// `f` takes no arguments and returns nothing: anything it must hand back goes
+// through a captured binding, which is also the only way to tell how far it got
+// before it panicked.
+export fn runRecovering(f: () => ()): (bool, string) {
+  let rec = []i64(recordWords)
+  if (bit_rt_panic_boundary_arm(int(ptrOf(rec))) != 0) {
+    // Reached only by a resume. The message is copied out first, then the taken
+    // record is popped, so a panic raised by a caller after this returns finds
+    // the next boundary out rather than this dead frame.
+    let msg = recoveredMessage()
+    bit_rt_panic_boundary_disarm()
+    return true, msg
+  }
+  f()
+  bit_rt_panic_boundary_disarm()
+  return false, ""
+}
