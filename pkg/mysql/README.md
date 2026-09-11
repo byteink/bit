@@ -158,9 +158,15 @@ when its URI is unset:
 docker run --rm -d --name my -e MYSQL_ROOT_PASSWORD=pw -p 127.0.0.1:13306:3306 mysql:8.4
 docker run --rm -d --name maria -e MARIADB_ROOT_PASSWORD=pw -p 127.0.0.1:13307:3306 mariadb:11.4
 
-# Both images generate a self-signed certificate on first start, so both are the
-# one-rung-down case: the connection is encrypted and the certificate does not
+# Both stock images generate a self-signed certificate on first start, so both are
+# the one-rung-down case: the connection is encrypted and the certificate does not
 # verify.
+
+# MY_TEST_STRICT_URI needs a server that never offers TLS, which neither stock
+# image is. `--skip-ssl` starts one: it reports `have_ssl = DISABLED` and never
+# advertises CLIENT_SSL, so a pinned ssl-mode has nothing to downgrade to.
+docker run --rm -d --name notls -e MARIADB_ROOT_PASSWORD=pw -p 127.0.0.1:13308:3306 mariadb:11.4 --skip-ssl
+
 docker exec my mysql -uroot -ppw -e \
   "create user n@'%' identified with mysql_native_password by 'pw'; grant all on *.* to n@'%'"
 docker exec maria mariadb -uroot -ppw -e \
@@ -170,7 +176,7 @@ MY_TEST_MYSQL_URI=mysql://root:pw@127.0.0.1:13306/mysql \
 MY_TEST_MARIADB_URI=mariadb://root:pw@127.0.0.1:13307/mysql \
 MY_TEST_NATIVE_URI=mysql://n:pw@127.0.0.1:13306/mysql \
 MY_TEST_ED25519_URI=mariadb://e:pw@127.0.0.1:13307/mysql \
-MY_TEST_STRICT_URI=mariadb://root:pw@127.0.0.1:13307/mysql?ssl-mode=VERIFY_IDENTITY \
+MY_TEST_STRICT_URI=mariadb://root:pw@127.0.0.1:13308/mysql?ssl-mode=VERIFY_IDENTITY \
 MY_TEST_FIELDS_HOST=127.0.0.1 MY_TEST_FIELDS_USER=root \
 MY_TEST_FIELDS_PASSWORD=pw MY_TEST_FIELDS_DATABASE=mysql \
   bit test pkg/mysql
