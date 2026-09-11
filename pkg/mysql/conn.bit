@@ -1,18 +1,18 @@
 // pkg/mysql/conn.bit — the `std/sql.Conn` an authenticated session becomes.
 //
-// SCOPE: ONE STATEMENT SHAPE, DELIBERATELY. This ticket (#3993) gets a
-// connected, authenticated session; the query layer — the prepared-statement
-// protocol, parameter binding, typed result decoding and the statement cache —
-// is a ticket of its own under epic #3986. What is here is COM_QUERY with no
-// parameters, which is exactly what the `select 1` liveness check needs and
-// nothing more. `exec`, `prepare` and `begin` FAIL naming the epic rather than
-// half-working: a parameter path that silently interpolated would be an
-// injection hole, and the one thing `std/sql` guarantees structurally is that it
-// cannot exist.
+// TWO PROTOCOLS, ONE RULE FOR CHOOSING. A statement with no parameters goes out
+// as COM_QUERY, one round trip, and its values come back in the TEXT format —
+// every non-NULL column is `Value.Text` whatever its column type. A statement
+// with parameters goes through COM_STMT_PREPARE/COM_STMT_EXECUTE (query.bit),
+// which binds the values server-side and answers in the BINARY format, so its
+// columns come back as the types they are. `query.bit`'s header argues the
+// trade; what matters here is that the choice is made from the rewritten
+// statement's placeholder count and nothing else.
 //
-// Values come back in the protocol's TEXT format, so every non-NULL column is
-// `Value.Text` whatever its column type. The binary protocol and per-type
-// decoding belong to the query ticket, not to a half-measure here.
+// NOTHING ON THIS PATH CONCATENATES A VALUE INTO SQL. `std/sql` hands over the
+// caller's text and the caller's values as two arguments and they stay two
+// arguments: the placeholder rewriter (rewrite.bit) only ever replaces `$N` with
+// `?`, and the values travel in their own packet fields.
 
 // How many packets one query response may consist of. `select 1` uses five.
 const queryPacketBudget: int = 4096
@@ -35,21 +35,34 @@ class myConn {
   w: myWire
   info: serverInfo
   closed: bool
-  // COM_QUERY with no parameters, and everything the server sends back.
+  // Prepared statements this connection is holding. Per connection and never
+  // shared: a statement id means nothing on any other one. Off unless
+  // `Datasource.statementCache` says otherwise (query.bit).
+  cache: stmtCache
+  // Whether this server runs with ANSI_QUOTES, read once at connect time
+  // (`ansiQuotesOn`, query.bit). It decides what `"` means to the placeholder
+  // scanner, and there is no capability bit that says.
+  ansi: bool
+  // A query, by whichever protocol its parameter count calls for.
   //
-  // A failure below this point has left the packet stream at an unknown offset,
-  // so every one of them is a `transportError` — `std/sql`'s marker for "do not
-  // hand this connection out again" (stdlib/sql/config.bit).
+  // A failure below the send is a `transportError` — `std/sql`'s marker for "do
+  // not hand this connection out again" (stdlib/sql/config.bit) — because the
+  // packet stream is then at an unknown offset. A failure BEFORE it (a bad
+  // placeholder, a count mismatch) is an ordinary error: nothing was sent and
+  // the connection is untouched.
   query(sqlText: string, params: []Value): Rows! {
-    if (len(params) != 0) {
-      fail newError(
-          "mysql: parameter binding is not implemented yet (epic " +
-          "#3986); this connection runs parameterless statements only",
-      )
-    }
     if (this.closed) {
       fail transportError("query on a closed connection")
     }
+    let r = rewriteQuery(sqlText, this.ansi)?
+    if (r.arity() == 0 && len(params) == 0) {
+      return this.textQuery(r.text)?
+    }
+    return execPrepared(this, r, params)?.rows
+  }
+
+  // COM_QUERY: the text protocol, for a statement with nothing to bind.
+  textQuery(sqlText: string): Rows! {
     this.w.startCommand()
     this.w.send(writeLe(comQuery, 1) + sqlText) catch e {
       fail transportError(e.message())
@@ -124,12 +137,29 @@ class myConn {
     fail transportError("the server sent ${queryPacketBudget} packets without " + "ending the result set")
   }
 
+  // A statement run for its effect, reporting the server's own affected-row
+  // count from the OK packet.
+  //
+  // ALWAYS THE PREPARED PATH, even with nothing to bind, unlike `query`. The
+  // text protocol carries the count in an OK packet that `collect` has already
+  // consumed into an empty result set, so a text-protocol `exec` could only
+  // report 0 — a silently wrong answer to the one question `exec` is asked. The
+  // second round trip buys the right number.
   exec(sqlText: string, params: []Value): int! {
-    fail newError("mysql: exec is not implemented yet (epic #3986)")
+    if (this.closed) {
+      fail transportError("exec on a closed connection")
+    }
+    return execPrepared(this, rewriteQuery(sqlText, this.ansi)?, params)?.affected
   }
 
+  // A statement prepared once and executed many times. It carries its own
+  // rewrite, so its `params` are numbered exactly as the caller wrote them.
   prepare(sqlText: string): Stmt! {
-    fail newError("mysql: prepare is not implemented yet (epic #3986)")
+    if (this.closed) {
+      fail transportError("prepare on a closed connection")
+    }
+    let r = rewriteQuery(sqlText, this.ansi)?
+    return newStmt(this, r)?
   }
 
   begin(): Tx! {
