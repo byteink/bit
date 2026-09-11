@@ -1,0 +1,473 @@
+// pkg/mysql/wire.bit — the MySQL/MariaDB client/server protocol framing.
+//
+// Every payload on this wire is wrapped in a four-byte header: three bytes of
+// little-endian length (the payload's own, header excluded) and one byte of
+// SEQUENCE NUMBER. The sequence is not decoration — the server rejects a packet
+// whose number is not the one it expects, and the count restarts at 0 for every
+// command — so it lives in `myWire` beside the stream rather than being passed
+// around.
+//
+// EVERYTHING IS BEHIND `myStream`. A connection is a plain socket before the
+// SSLRequest packet and a TLS connection after it, the authentication exchange
+// is identical either way, and a test drives the same code over an in-process
+// fake server with no socket at all. That is one interface, not three copies of
+// the framing.
+//
+// THE SERVER SPEAKS FIRST, unlike Postgres: the greeting arrives before the
+// client has said anything, and the client's FIRST packet is either the
+// SSLRequest or the handshake response. That ordering is why TLS negotiation
+// here has to parse the greeting before it can know whether TLS is on offer.
+
+import { Conn as NetConn } from "std/net"
+import { TlsConn } from "std/tls"
+
+// Capability bits, lower 32. Only the ones this driver sets or tests are named;
+// the rest are read as part of the field and never inspected.
+const capLongPassword: int = 1
+const capLongFlag: int = 4
+const capConnectWithDb: int = 8
+const capProtocol41: int = 512
+const capSsl: int = 2048
+const capTransactions: int = 8192
+const capSecureConnection: int = 32768
+const capPluginAuth: int = 524288
+
+// The first capability bit of MariaDB's own half of the field. MariaDB puts its
+// extended capabilities in the UPPER 32 bits of a 64-bit field, in four bytes a
+// MySQL server leaves as zero filler — reading only the lower 32 makes every
+// MariaDB extension invisible, which is the second half of the version trap
+// `serverFamily` handles below.
+const mariadbCapabilityShift: int = 4294967296
+
+// utf8mb4_general_ci. Old enough that both servers have always had it, and
+// specific enough that the connection's character set is not whatever the
+// server's default happens to be.
+const charsetUtf8mb4: int = 45
+
+// The largest payload this driver will send in one packet, and the length that
+// means "a continuation packet follows" when one is received.
+const maxPacket: int = 16777215
+
+// A byte source and sink. `readUp` returns at most `n` bytes and an empty string
+// at end of stream (never a failure — a closed peer is a condition, not an
+// error, exactly as `std/net.Conn.read` reports it); `writeAll` writes every
+// byte or fails.
+interface myStream {
+  readUp(n: int): string!,
+  writeAll(s: string): ()!,
+  shut(),
+}
+
+// `myStream` over a cleartext socket.
+class plainStream {
+  c: NetConn
+  readUp(n: int): string! {
+    return this.c.read(n)
+  }
+
+  writeAll(s: string): ()! {
+    this.c.write(s)?
+  }
+
+  shut() {
+    this.c.close()
+  }
+}
+
+// `myStream` over a TLS connection, after the SSLRequest packet and
+// `std/tls.client`'s handshake on the same socket.
+class tlsStream {
+  c: TlsConn
+  readUp(n: int): string! {
+    return string(this.c.read(n)?)
+  }
+
+  writeAll(s: string): ()! {
+    this.c.write([]byte(s))?
+  }
+
+  shut() {
+    this.c.close()
+  }
+}
+
+// One packet: its payload and the sequence number its header carried.
+class myPacket {
+  payload: string,
+  seq: int,
+}
+
+// The framing reader. `buf` holds bytes pulled off the stream that the current
+// packet did not need — a single `read` can return any mixture of whole and
+// partial packets, so the leftover has to live somewhere that outlives one call.
+class myReader {
+  s: myStream
+  buf: string
+  // Exactly `n` bytes. Fails if the peer closes first: the length header
+  // promised them, so a short read is a truncated packet, not an end of stream.
+  //
+  // Bounded: every iteration either returns or adds at least one byte, so at
+  // most `n` iterations.
+  take(n: int): string! {
+    let guard = 0
+    while (len(this.buf) < n && guard <= n) {
+      guard = guard + 1
+      let chunk = this.s.readUp(n - len(this.buf))?
+      if (len(chunk) == 0) {
+        fail newError("mysql: server closed the connection mid-packet")
+      }
+      this.buf = this.buf + chunk
+    }
+    let out = this.buf[0:n]
+    this.buf = this.buf[n:len(this.buf)]
+    return out
+  }
+
+  // The next packet. A payload of exactly `maxPacket` bytes means the server
+  // split a larger one across continuation packets; this driver connects and
+  // runs `select 1`, neither of which can produce one, so it is named rather
+  // than silently truncated.
+  next(): myPacket! {
+    let head = this.take(4)?
+    let size = readLe(head, 0, 3)?
+    let seq = int([]byte(head)[3])
+    if (size == maxPacket) {
+      fail newError(
+          "mysql: the server sent a 16 MiB packet, which means a " +
+          "multi-packet payload; this driver reads single packets only",
+      )
+    }
+    return myPacket{ payload: this.take(size)?, seq: seq }
+  }
+}
+
+// One connection's framing: the reader, the stream, and the sequence number of
+// the last packet that crossed it. Every send is the last sequence plus one,
+// which is the rule the server enforces.
+class myWire {
+  r: myReader
+  s: myStream
+  seq: int
+  // The next packet from the server, remembering its sequence number.
+  recv(): string! {
+    let p = this.r.next()?
+    this.seq = p.seq
+    return p.payload
+  }
+
+  // One packet to the server, numbered one past whatever came last.
+  send(payload: string): ()! {
+    this.seq = this.seq + 1
+    this.s.writeAll(framePacket(payload, this.seq))?
+  }
+
+  // A new command starts the count again: the first packet of a COM_* exchange
+  // is sequence 0, so the next `send` has to produce it.
+  startCommand() {
+    this.seq = 0 - 1
+  }
+}
+
+// Wrap a payload in its four-byte header.
+fn framePacket(payload: string, seq: int): string {
+  return writeLe(len(payload), 3) + writeLe(seq % 256, 1) + payload
+}
+
+// An `n`-byte little-endian integer at `off`.
+fn readLe(s: string, off: int, n: int): int! {
+  if (off + n > len(s)) {
+    fail newError("mysql: truncated packet: wanted ${n} bytes at ${off}, " + "have ${len(s)}")
+  }
+  let b = []byte(s)
+  let out = 0
+  let scale = 1
+  let i = 0
+  while (i < n) {
+    out = out + int(b[off + i]) * scale
+    scale = scale * 256
+    i = i + 1
+  }
+  return out
+}
+
+// An `n`-byte little-endian integer.
+fn writeLe(v: int, n: int): string {
+  let b = []byte(n)
+  let rest = v
+  let i = 0
+  while (i < n) {
+    b[i] = byte(rest % 256)
+    rest = rest / 256
+    i = i + 1
+  }
+  return string(b)
+}
+
+// A walk over one packet's payload. The protocol is a sequence of fields whose
+// widths depend on fields already read, so a cursor is the shape that keeps each
+// parse step a single line and every bounds check in one place.
+class cursor {
+  s: string
+  at: int
+  // The next `n` bytes.
+  take(n: int): string! {
+    if (this.at + n > len(this.s)) {
+      fail newError("mysql: packet ends after ${len(this.s)} bytes, wanted " + "${n} more at ${this.at}")
+    }
+    let out = this.s[this.at:this.at + n]
+    this.at = this.at + n
+    return out
+  }
+
+  // The next `n` bytes as a little-endian integer.
+  int(n: int): int! {
+    return readLe(this.take(n)?, 0, n)?
+  }
+
+  // The next `\0`-terminated string, or everything that is left when the server
+  // omitted the terminator — some builds do, at the very end of the greeting.
+  cstr(): string! {
+    let b = []byte(this.s)
+    let i = this.at
+    while (i < len(b)) {
+      if (b[i] == 0) {
+        let out = this.s[this.at:i]
+        this.at = i + 1
+        return out
+      }
+      i = i + 1
+    }
+    let rest = this.s[this.at:len(this.s)]
+    this.at = len(this.s)
+    return rest
+  }
+
+  // How many bytes are left.
+  rest(): int {
+    return len(this.s) - this.at
+  }
+}
+
+// A length-encoded integer (the protocol's own variable-width count): one byte
+// below 0xFB, then 0xFC/0xFD/0xFE introducing 2, 3 or 8 more. 0xFB is NULL in a
+// row and is reported as -1 rather than as a length.
+fn readLenEnc(c: cursor): int! {
+  let first = c.int(1)?
+  if (first < 251) {
+    return first
+  }
+  if (first == 251) {
+    return 0 - 1
+  }
+  if (first == 252) {
+    return c.int(2)?
+  }
+  if (first == 253) {
+    return c.int(3)?
+  }
+  return c.int(8)?
+}
+
+// What the server said about itself in the greeting, after the version trap has
+// been defused.
+class serverInfo {
+  family: string,
+  version: string,
+  versionMajor: int,
+  capabilities: int,
+  scramble: string,
+  plugin: string,
+}
+
+// Parse the initial handshake packet (protocol version 10).
+//
+// THE VERSION FIELD IS BOOBY-TRAPPED. MariaDB reports itself as `5.5.5-10.11.2`
+// — a compatibility hack from when old clients refused a leading `10.` — so a
+// naive parse reads MySQL 5.5.5 and takes every legacy code path on a modern
+// server. The prefix is stripped here and the family is decided explicitly.
+fn parseHandshake(payload: string): serverInfo! {
+  let c = cursor{ s: payload, at: 0 }
+  let protocol = c.int(1)?
+  if (protocol != 10) {
+    fail newError(
+        "mysql: the server speaks handshake protocol version " +
+        "${protocol}; this driver speaks version 10 (MySQL 4.1 and newer)",
+    )
+  }
+  let raw = c.cstr()?
+  let info = newServerInfo(raw)
+  c.int(4)?
+  let salt1 = c.take(8)?
+  c.take(1)?
+  let capLow = c.int(2)?
+  if (c.rest() == 0) {
+    fail newError("mysql: the server offers no 4.1 capabilities at all; " + "this driver needs CLIENT_PROTOCOL_41")
+  }
+  let authDataLen = readCapabilities(c, info, capLow)?
+  readScramble(c, info, salt1, authDataLen)?
+  return info
+}
+
+// The version string, split into family and number. `5.5.5-` is stripped; a
+// version carrying `MariaDB` anywhere (`10.11.2-MariaDB-1:10.11.2+maria~ubu`)
+// is MariaDB too, which is how the prefix-less builds identify themselves.
+fn newServerInfo(raw: string): serverInfo {
+  let version = raw
+  let family = "MySQL"
+  if (hasPrefix(version, "5.5.5-")) {
+    version = version[6:len(version)]
+    family = "MariaDB"
+  }
+  if (contains(version, "MariaDB")) {
+    family = "MariaDB"
+  }
+  return serverInfo{
+    family: family,
+    version: version,
+    versionMajor: majorOf(version),
+    capabilities: 0,
+    scramble: "",
+    plugin: "mysql_native_password",
+  }
+}
+
+// The leading number of a version string. A version this cannot read reports 0
+// rather than guessing — nothing in this driver branches on it, and a wrong
+// number in a report is worse than an obviously absent one.
+fn majorOf(version: string): int {
+  let b = []byte(version)
+  let out = 0
+  let i = 0
+  while (i < len(b) && b[i] >= 48 && b[i] <= 57) {
+    out = out * 10 + int(b[i]) - 48
+    i = i + 1
+  }
+  return out
+}
+
+// The rest of the capability field, the character set and the status flags.
+//
+// The six filler bytes after the auth-data length are followed by four bytes
+// that MySQL leaves zero and MARIADB USES FOR ITS OWN CAPABILITIES. They are the
+// upper 32 bits of one 64-bit field, so they are read as such here; a driver
+// that stopped at the lower 32 would see a MariaDB server advertising nothing.
+fn readCapabilities(c: cursor, info: serverInfo, capLow: int): int! {
+  c.int(1)?
+  c.int(2)?
+  let capHigh = c.int(2)?
+  let authDataLen = c.int(1)?
+  c.take(6)?
+  let mariadbCaps = c.int(4)?
+  info.capabilities = capLow + capHigh * 65536 + mariadbCaps * mariadbCapabilityShift
+  return authDataLen
+}
+
+// The 20-byte scramble, in two pieces, and the plugin name that says what to do
+// with it. `authDataLen` counts both pieces and its own NUL; the second piece is
+// never shorter than 13 bytes even when the count says otherwise, which is what
+// every server actually sends.
+fn readScramble(c: cursor, info: serverInfo, salt1: string, authDataLen: int): ()! {
+  let want = authDataLen - 8
+  if (want < 13) {
+    want = 13
+  }
+  let salt2 = c.take(want)?
+  info.scramble = salt1 + salt2[0:len(salt2) - 1]
+  if ((info.capabilities & capPluginAuth) != 0) {
+    info.plugin = c.cstr()?
+  }
+}
+
+// MariaDB's own capability bits: the upper 32 of the 64-bit field, as a number
+// in their own right. Nothing in this driver branches on them yet; the function
+// exists so the claim "MariaDB's flags are read from the upper half" is
+// something a test can check rather than something a comment asserts.
+fn mariadbCapabilities(info: serverInfo): int {
+  return info.capabilities / mariadbCapabilityShift
+}
+
+// The capabilities this client asks for, kept to what the server also offers.
+// CLIENT_PROTOCOL_41 and CLIENT_SECURE_CONNECTION are not optional — a server
+// without them predates 2001 — so their absence fails rather than falling back
+// to a protocol this driver does not implement.
+fn clientCapabilities(info: serverInfo, t: target, useTls: bool): int! {
+  if ((info.capabilities & capProtocol41) == 0) {
+    fail newError("mysql: the server does not offer CLIENT_PROTOCOL_41")
+  }
+  let caps = capLongPassword | capLongFlag | capProtocol41 | capTransactions | capSecureConnection
+  if ((info.capabilities & capPluginAuth) != 0) {
+    caps = caps | capPluginAuth
+  }
+  if (t.database != "") {
+    caps = caps | capConnectWithDb
+  }
+  if (useTls) {
+    caps = caps | capSsl
+  }
+  return caps
+}
+
+// The first 32 bytes of a handshake response: capabilities, the maximum packet
+// size this client accepts, the character set and 23 reserved bytes.
+//
+// Sent ALONE as the SSLRequest packet — the server reads exactly this much,
+// sees CLIENT_SSL, and the next byte on the socket is the start of the TLS
+// handshake — and then again as the head of the real response inside TLS.
+fn handshakeHead(caps: int): string {
+  return writeLe(caps % mariadbCapabilityShift, 4) +
+    writeLe(maxPacket, 4) +
+    writeLe(charsetUtf8mb4, 1) +
+    string([]byte(23))
+}
+
+// HandshakeResponse41: the head, the user name, the authentication response
+// counted by a single length byte (CLIENT_SECURE_CONNECTION's form), the
+// database, and the plugin whose rules produced the response.
+fn handshakeResponse(caps: int, t: target, authResponse: string, plugin: string): string! {
+  if (len(authResponse) > 255) {
+    fail newError(
+        "mysql: authentication response of ${len(authResponse)} " +
+        "bytes does not fit the protocol's length byte",
+    )
+  }
+  let out = handshakeHead(caps) + cstr(t.user) + writeLe(len(authResponse), 1) + authResponse
+  if ((caps & capConnectWithDb) != 0) {
+    out = out + cstr(t.database)
+  }
+  if ((caps & capPluginAuth) != 0) {
+    out = out + cstr(plugin)
+  }
+  return out
+}
+
+// A NUL-terminated string, the protocol's string framing. `[]byte(1)` is a
+// one-element zero-filled slice, which is the NUL — Bit string literals carry no
+// `\0` escape.
+fn cstr(s: string): string {
+  return s + string([]byte(1))
+}
+
+// The first byte of a server packet, which is what says which packet it is.
+fn packetKind(payload: string): int {
+  if (len(payload) == 0) {
+    return 0 - 1
+  }
+  return int([]byte(payload)[0])
+}
+
+// An ERR packet: 0xFF, a two-byte error code, then (with CLIENT_PROTOCOL_41)
+// `#` and a five-byte SQLSTATE, then the message. The server's own numbers are
+// kept in the text because they are what an operator looks up.
+fn errorText(payload: string): string {
+  let c = cursor{ s: payload, at: 1 }
+  let code = c.int(2) catch _ {
+    return "mysql: malformed error packet from the server"
+  }
+  let state = ""
+  if (c.rest() > 6 && c.s[c.at:c.at + 1] == "#") {
+    state = c.take(6) catch _ {
+      return "mysql: malformed error packet from the server"
+    }
+  }
+  return "mysql: error ${code} ${state}: ${c.s[c.at:len(c.s)]}"
+}

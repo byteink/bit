@@ -1,0 +1,186 @@
+// pkg/mysql/auth.bit — the four authentication plugins, as pure functions of
+// the password and the server's nonce.
+//
+// ALL FOUR CONNECT. The first draft gated `mysql_native_password` behind TLS and
+// refused `old_password` outright, which meant a stock local MariaDB — no TLS
+// configured — would not connect at all. That was rejected by the owner on
+// 2026-08-30: handing this driver a URI must connect, to anything, and THE URI
+// IS THE ONLY PLACE STRICTNESS IS CONFIGURED. The two weak plugins each cost one
+// warning line per pool (see `warnAuthPlugin` in adapter.bit), never a refusal.
+//
+// What each one is worth:
+//
+//   caching_sha2_password  strong; MySQL 8's default. Its full-authentication
+//                          path is TLS-only here, for the reason set out in
+//                          authsha2.bit.
+//   ed25519                strong; MariaDB's. A signature over the server's
+//                          nonce — the server stores only a public key, so a
+//                          dump of `mysql.global_priv` is not a credential.
+//   mysql_native_password  weak; SHA-1, and the exchange is replayable by
+//                          anyone who has the server's stored hash.
+//   old_password           weak; the pre-4.1 hash, a 64-bit keyspace.
+//
+// Nothing here reads a socket: every function takes the nonce and returns the
+// bytes to send, which is what lets `auth.test.bit` check each one against a
+// known-answer vector with no server at all.
+
+import { newSha1 } from "std/crypto"
+import { newSha256, digest, ed25519Sign } from "std/crypto"
+
+// The response one plugin computes for one nonce. An unknown plugin is named
+// rather than being answered with an empty packet the server would read as a
+// wrong password — "authentication failed" would then be a lie about what
+// happened.
+fn authResponse(plugin: string, password: string, scramble: string): string! {
+  if (plugin == "caching_sha2_password") {
+    return cachingSha2Response(password, scramble)
+  }
+  if (plugin == "mysql_native_password") {
+    return nativeResponse(password, scramble)
+  }
+  if (plugin == "client_ed25519" || plugin == "ed25519") {
+    return ed25519Response(password, scramble)
+  }
+  if (plugin == "mysql_old_password" || plugin == "old_password") {
+    return oldResponse(password, scramble)
+  }
+  fail newError(
+      "mysql: the server asked for authentication plugin '${plugin}', " +
+      "which this driver does not implement; it implements " +
+      "caching_sha2_password, client_ed25519, mysql_native_password and " +
+      "mysql_old_password",
+  )
+}
+
+// `mysql_native_password`: SHA1(password) XOR SHA1(scramble || SHA1(SHA1(password))).
+//
+// The server stores SHA1(SHA1(password)), so anyone who reads the user table can
+// answer this challenge without knowing the password — that is what "weak" means
+// here, and no amount of TLS changes it.
+fn nativeResponse(password: string, scramble: string): string {
+  if (password == "") {
+    return ""
+  }
+  let stage1 = digest(newSha1(), []byte(password))
+  let stage2 = digest(newSha1(), stage1)
+  return string(xorBytes(stage1, digest(newSha1(), []byte(scramble + string(stage2)))))
+}
+
+// `caching_sha2_password`, fast path: SHA256(password) XOR
+// SHA256(SHA256(SHA256(password)) || scramble).
+//
+// The server answers it with `fast_auth_success` when the password is in its
+// cache, and with `perform_full_authentication` when it is not — which is where
+// authsha2.bit takes over.
+fn cachingSha2Response(password: string, scramble: string): string {
+  if (password == "") {
+    return ""
+  }
+  let stage1 = digest(newSha256(), []byte(password))
+  let stage2 = digest(newSha256(), stage1)
+  return string(xorBytes(stage1, digest(newSha256(), []byte(string(stage2) + scramble))))
+}
+
+// `client_ed25519` (MariaDB): an Ed25519 signature over the server's 32-byte
+// nonce.
+//
+// The private scalar and the nonce prefix are the two halves of SHA-512 OF THE
+// PASSWORD, where RFC 8032 has SHA-512 of a 32-byte seed — so `ed25519Sign`,
+// whose first act is that same SHA-512, computes exactly MariaDB's scheme when
+// it is handed the password itself. The server stores only the public key.
+fn ed25519Response(password: string, scramble: string): string {
+  if (password == "") {
+    return ""
+  }
+  return string(ed25519Sign([]byte(password), []byte(scramble)))
+}
+
+// `mysql_old_password`: the pre-4.1 hash, NUL-terminated.
+//
+// Kept because a server still configured for it must connect; it is 64 bits of
+// keyspace and a bespoke PRNG, which is what the warning says.
+fn oldResponse(password: string, scramble: string): string {
+  if (password == "") {
+    return ""
+  }
+  return cstr(scramble323(scramble, password))
+}
+
+// The pre-4.1 password hash: two 31-bit words from a byte-at-a-time mix. Spaces
+// and tabs are skipped, which is part of the algorithm and not a tidy-up.
+fn hash323(s: string): (u32, u32) {
+  let nr = u32(1345345333)
+  let add = u32(7)
+  let nr2 = u32(0x12345671)
+  let b = []byte(s)
+  let i = 0
+  while (i < len(b)) {
+    let c = b[i]
+    i = i + 1
+    if (c == 32 || c == 9) {
+      continue
+    }
+    let ch = u32(c)
+    nr = nr ^ (((nr & u32(63)) + add) * ch + (nr << 8))
+    nr2 = nr2 + ((nr2 << 8) ^ nr)
+    add = add + ch
+  }
+  return (nr & u32(0x7FFFFFFF), nr2 & u32(0x7FFFFFFF))
+}
+
+// The pre-4.1 challenge response: eight printable bytes from a PRNG seeded with
+// the password hash XOR the nonce hash, then XOR'd by one final extra byte.
+//
+// The multiply-and-divide is the integer form of the original's
+// `floor((seed1 / max) * 31)`: `seed1` is below `max`, so `seed1 * 31 / max` is
+// the same number without a float anywhere.
+fn scramble323(message: string, password: string): string {
+  let maxValue = 1073741823
+  let (ph1, ph2) = hash323(password)
+  let (mh1, mh2) = hash323(message[0:8])
+  let seed1 = int(ph1 ^ mh1) % maxValue
+  let seed2 = int(ph2 ^ mh2) % maxValue
+  let out = []byte(8)
+  let i = 0
+  while (i < 8) {
+    seed1 = (seed1 * 3 + seed2) % maxValue
+    seed2 = (seed1 + seed2 + 33) % maxValue
+    out[i] = byte(seed1 * 31 / maxValue + 64)
+    i = i + 1
+  }
+  seed1 = (seed1 * 3 + seed2) % maxValue
+  seed2 = (seed1 + seed2 + 33) % maxValue
+  let extra = byte(seed1 * 31 / maxValue)
+  let j = 0
+  while (j < 8) {
+    out[j] = out[j] ^ extra
+    j = j + 1
+  }
+  return string(out)
+}
+
+// XOR two equal-length byte strings. A length mismatch cannot occur — both
+// callers pass two digests of the same hash — so the shorter length bounds the
+// loop rather than a failure being invented for a case that does not exist.
+fn xorBytes(a: []byte, b: []byte): []byte {
+  let n = len(a)
+  if (len(b) < n) {
+    n = len(b)
+  }
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = a[i] ^ b[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Whether a plugin's exchange is one an attacker who has the server's stored
+// value can replay. The two that are get one warning line per pool; the two that
+// are not get silence.
+fn weakPlugin(plugin: string): bool {
+  return plugin == "mysql_native_password" ||
+    plugin == "old_password" ||
+    plugin == "mysql_old_password"
+}
