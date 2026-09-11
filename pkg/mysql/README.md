@@ -91,9 +91,10 @@ Four plugins, all of which connect:
 | `mysql_old_password` | weak — the pre-4.1 hash, 64 bits of keyspace |
 
 The two weak ones each warn **once per pool**, naming the plugin and the fix.
-Refusing them was the first draft and was rejected: a stock local MariaDB has no
-TLS and may well have a native-password account, and a driver that will not talk
-to it is a driver nobody can start with. The URI is the only place strictness is
+Refusing them was the first draft and was rejected: a stock local MariaDB
+verifies nothing — its certificate is self-signed — and may well have a
+native-password account, and a driver that will not talk to it is a driver
+nobody can start with. The URI is the only place strictness is
 configured.
 
 **`caching_sha2_password`'s full-authentication path is implemented over TLS
@@ -125,16 +126,10 @@ greeting's six-byte filler. They are read as such.
   `COM_QUERY` with no parameters — enough for a `select 1` liveness check. `exec`,
   `prepare` and `begin` fail naming the epic. Values come back in the protocol's
   text format, so every non-NULL column is `Value.Text` whatever its column type.
-- **TLS to a stock MySQL 8.4 or MariaDB 11.4 does not complete today, and the
-  cause is in `std/tls`, not here.** Both servers send a TLS 1.3
-  `CertificateRequest` (handshake type 13, optional client authentication) and
-  `std/tls.client` fails on it — `tls client: unexpected handshake message type
-  13` (stdlib/tls/client.bit). Every rung of the ladder therefore fails against a
-  server that advertises `CLIENT_SSL`, and the driver does NOT fall back to
-  cleartext, so such a server is reached only with an explicit
-  `ssl-mode=DISABLED` until `std/tls` handles that message. The TLS code here is
-  exercised against the fake server and against the ladder's own decisions; its
-  live proof is blocked on that gap.
+- **Neither stock image verifies.** `mysql:8.4` and `mariadb:11.4` each generate
+  a self-signed certificate on first start, so the ladder lands on `REQUIRED`
+  against both: encrypted, unverified. `VERIFY_CA` and `VERIFY_IDENTITY` need a
+  certificate your trust store can chain, which is a server you configured.
 - **Single packets only.** A 16 MiB payload (the protocol's multi-packet form) is
   named rather than truncated.
 - **`VERIFY_CA` checks the chain against the trust store and deliberately does
@@ -163,8 +158,9 @@ when its URI is unset:
 docker run --rm -d --name my -e MYSQL_ROOT_PASSWORD=pw -p 127.0.0.1:13306:3306 mysql:8.4
 docker run --rm -d --name maria -e MARIADB_ROOT_PASSWORD=pw -p 127.0.0.1:13307:3306 mariadb:11.4
 
-# mysql:8.4 generates a self-signed certificate on first start, so it is the
-# one-rung-down case. mariadb:11.4 starts with no TLS at all.
+# Both images generate a self-signed certificate on first start, so both are the
+# one-rung-down case: the connection is encrypted and the certificate does not
+# verify.
 docker exec my mysql -uroot -ppw -e \
   "create user n@'%' identified with mysql_native_password by 'pw'; grant all on *.* to n@'%'"
 docker exec maria mariadb -uroot -ppw -e \
