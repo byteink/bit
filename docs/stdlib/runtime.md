@@ -29,11 +29,9 @@ fn parseAge(s: string): int {
 
 fn handle(s: string): string {
   let age = 0
-  let (panicked, msg) = runRecovering(
-    () => {
-      age = parseAge(s)
-    },
-  )
+  let (panicked, msg) = runRecovering(() => {
+    age = parseAge(s)
+  })
   if (panicked) {
     return "rejected: ${msg}"
   }
