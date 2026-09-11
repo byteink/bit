@@ -105,13 +105,16 @@
 //
 // Words 0..`ctxWords`-1 are `schedSwitch`'s context format unchanged (./sched.bit,
 // "Saved register context"), so there is one context layout in this runtime and
-// not two. The three words after it are this file's own:
+// not two. The words after it are this file's own:
 //
 //   0..21   saved context: sp, resume address, fp, lr/rbx, the integer file,
 //           the FP file — `ctxSp`/`ctxPc` name the first two
 //   22      prev: the next boundary out on this task, or 0
 //   23      code: the reason code the last `take` recorded (§12.1)
-//   24      msg:  the `*const RtBytes` the last `take` recorded, as an integer
+//   24      msg:  0, or the address of word 25 — the record's OWN `RtBytes`
+//   25..26  the message header `msg` points at: `{ptr, len}`, with `ptr`
+//           addressing word 27 of this same record
+//   27..58  the message bytes themselves, `bndMsgCap` of them
 //
 // The caller owns the memory and must keep it alive across the guarded call:
 // the arming function's own frame is the natural home (it sits above every
@@ -120,9 +123,49 @@ export const bndPrev: int = 22
 export const bndCode: int = 23
 export const bndMsg: int = 24
 
+// ---------------------------------------------------------------------------
+// WHY THE BYTES LIVE IN THE RECORD AND ARE COPIED AT `take` TIME (#4957)
+// ---------------------------------------------------------------------------
+//
+// `take` used to store the caller's `*const RtBytes` verbatim and let the
+// recovering side copy the bytes out after the resume. For a runtime panic that
+// address is a module-static buffer, but `panic("... ${x}")` hands over a HEAP
+// STRING whose only reference is in the frames the resume discards: they sit
+// below `sp` afterwards, so `stwScanOwnStack` (../stw/stwscan.bit) no longer
+// scans them, and the record is a scalar buffer the collector does not scan for
+// references either. The recovering side cannot close that window from where it
+// stands — turning a raw header into a `string` allocates first (SPEC §11.7
+// forbids an `extern fn` returning a managed type), and that allocation is a
+// collection point sitting between the read of the header and the copy of the
+// bytes.
+//
+// So the copy happens HERE, in the one place the object is still rooted: the
+// panicking frame is still live when a door calls `take`. The destination is
+// inline in the record, because the take path runs inside a panic door and must
+// not allocate — the door may be reporting that allocation itself failed.
+// `bit_rt_panic_boundary_msg` then answers a header the runtime owns, pointing
+// at bytes the runtime owns.
+//
+// THE CAPACITY IS A CEILING, AND A LONGER MESSAGE IS TRUNCATED TO IT (ABI.md
+// §12). 256 bytes is chosen against the two populations that reach here: every
+// message the runtime itself builds is far shorter (the longest, the slice
+// bounds line of `runtime/root/slices.bit`, is under 64 bytes even with
+// three formatted integers), and an interpolated program message is a
+// diagnostic a human reads — 256 bytes is three lines of terminal. The cost is
+// paid per RECORD, on the arming frame, so it is a fixed 256 bytes per guarded
+// call rather than anything that scales.
+const bndMsgCap: int = 256
+
+// The `{ptr, len}` pair `bndMsg` points at, laid out as `strPtr`/`strLen`
+// (runtime/root/root.bit) so a reader that already knows how to read a string
+// header needs no second shape, and the bytes it addresses.
+const bndMsgPtr: int = 25
+const bndMsgLen: int = 26
+const bndMsgBytes: int = 27
+
 // Words in a boundary record — what a caller of `bit_rt_panic_boundary_arm`
-// must reserve.
-export const bndWords: int = 25
+// must reserve. 27 words of context and header, then `bndMsgCap` bytes.
+export const bndWords: int = 59
 
 // ---------------------------------------------------------------------------
 // The head word, and the one tag bit in it
@@ -192,6 +235,71 @@ const bndMaxDepth: int = 64
     i = i + 1
   }
   return 0
+}
+
+// The byte at `addr`, and the store that puts one back. `*u8` arithmetic scales
+// by 1, so the offset IS the address — `loadByte`/`storeByte` in ../gc/mem.bit
+// verbatim, duplicated rather than imported for the reason this file's header
+// gives: `runtime/gc` imports `runtime/sched`, so the edge would be a cycle.
+@nosplit fn bndLoadByte(addr: int): int {
+  let z: *u8 = nil
+  let v = *(z + addr)
+  return int(v)
+}
+
+@nosplit fn bndStoreByte(addr: int, v: int) {
+  let z: *u8 = nil
+  *(z + addr) = u8(v)
+}
+
+// Copy the bytes of the `*const RtBytes` at `msg` into the record at `rec` and
+// answer what `bndMsg` should hold: the address of the record's own header, or
+// 0 when there was no message at all (an argument-free door, §12.1, which
+// passes `msg` as 0 and a non-zero code).
+//
+// ALLOCATION-FREE AND SAFEPOINT-FREE by construction: a bounded byte loop into
+// memory the caller already owns. The bound is `bndMsgCap`, so an over-long
+// message is truncated rather than overrunning the record — Power of 10 rule 2,
+// and the contract ABI.md §12 states.
+//
+// A null header, or one with no bytes, records an EMPTY message rather than
+// none: the reason code still says a message-carrying door reported this, and a
+// reader that maps 0 to "no message" would otherwise be told the wrong thing.
+@nosplit fn boundaryCopyMsg(rec: int, msg: int): int {
+  if (msg == 0) {
+    return 0
+  }
+  let h = taskAt(msg)
+  let src = *h
+  let n = *(h + 1)
+  let dst = rec + bndMsgBytes * 8
+  let count = boundaryCopyBytes(dst, src, n)
+  let r = taskAt(rec)
+  *(r + bndMsgPtr) = dst
+  *(r + bndMsgLen) = count
+  return rec + bndMsgPtr * 8
+}
+
+// `count` bytes of `src` into `dst`, where `count` is `n` clamped to
+// `bndMsgCap`. A null source or a non-positive length copies nothing and
+// answers 0 — the empty message, not a fault.
+@nosplit fn boundaryCopyBytes(dst: int, src: int, n: int): int {
+  if (src == 0) {
+    return 0
+  }
+  if (n <= 0) {
+    return 0
+  }
+  let count = n
+  if (count > bndMsgCap) {
+    count = bndMsgCap
+  }
+  let i = 0
+  while (i < count) {
+    bndStoreByte(dst + i, bndLoadByte(src + i))
+    i = i + 1
+  }
+  return count
 }
 
 // ---------------------------------------------------------------------------
@@ -341,8 +449,8 @@ export @nosplit @symbol("bit_rt_panic_boundary_disarm") fn boundaryDisarm() {
 // The consult every recoverable panic door makes BEFORE it writes anything.
 // Returns 0 when this task has no armed boundary, and the door then runs today's
 // write-the-line, optional-backtrace, exit-2 path byte for byte. Otherwise it
-// records `{code, msg}`, marks the record taken and resumes in the arming frame
-// — it does not return on that path.
+// records the code, COPIES the message bytes into the record, marks the record
+// taken and resumes in the arming frame — it does not return on that path.
 //
 // `scrErr` (word 7) is cleared before the resume: a half-completed fallible call
 // can have left a pending error there that the next `?` in the resumed frame
@@ -360,7 +468,10 @@ export @nosplit @symbol("bit_rt_panic_boundary_take") fn boundaryTake(code: int,
   }
   let r = taskAt(rec)
   *(r + bndCode) = code
-  *(r + bndMsg) = msg
+  // BEFORE the resume, while the panicking frame still roots the message
+  // object — see "WHY THE BYTES LIVE IN THE RECORD" above. After the resume
+  // that frame is below `sp` and nothing scans it.
+  *(r + bndMsg) = boundaryCopyMsg(rec, msg)
   *(s + scrPanicBoundary) = rec | bndTag
   *(s + scrErr) = 0
   boundaryResume(rec)
@@ -396,9 +507,11 @@ export @nosplit @symbol("bit_rt_panic_boundary_code") fn boundaryCode(): int {
 }
 
 // The `*const RtBytes` of the panic the last `take` recorded, as an integer, or
-// 0 for an argument-free door. The BYTES must be copied out immediately: a
-// runtime panic's message is a module-static buffer the next panic of the same
-// kind overwrites.
+// 0 for an argument-free door. The header and the bytes are both INSIDE the
+// record (#4957): `take` copied them there while the panicking frame still
+// rooted the original, truncated to `bndMsgCap`. They must still be copied out
+// before the record is reused — the next `take` on this record overwrites them,
+// and the record itself dies with the arming frame.
 export @nosplit @symbol("bit_rt_panic_boundary_msg") fn boundaryMsg(): int {
   let rec = boundaryTaken()
   if (rec == 0) {

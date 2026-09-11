@@ -18,10 +18,12 @@
 //       recurses `depth` frames deep before consulting the boundary, so a
 //       resume that restored the wrong `sp` lands in the middle of that
 //       recursion instead of in `main` and cannot print the line below.
-//   (b) The `{code, msg}` pair survives the resume verbatim. `msg` here is a
-//       plain sentinel word rather than a real `*const RtBytes`: the boundary
-//       core stores and returns the word without dereferencing it, and the door
-//       that supplies a real one is #4743.
+//   (b) The `{code, msg}` pair survives the resume verbatim, message BYTES
+//       included. `take` copies them into the record while the panicking frame
+//       still roots them (#4957), so `msg` here is a real `*const RtBytes` —
+//       a `{ptr, len}` header this program builds over bytes it owns — and the
+//       text read back after the resume is read out of the record, not out of
+//       the frames the resume discarded.
 //   (c) A CALLEE-SAVED REGISTER LIVE ACROSS THE GUARDED CALL survives it.
 //       `keep` is read after the resume, so the compiler must hold it somewhere
 //       the restore has to get right — this is the half `gcSaveCalleeRegs` does
@@ -40,23 +42,75 @@
 // consults the boundary yet (#4743), so `guarded` plays the door's part itself.
 
 // Words in a boundary record: `bndWords` in runtime/sched/boundary.bit — 22
-// context words (`ctxWords`, runtime/sched/sched.bit) plus prev/code/msg.
-const recWords: int = 25
+// context words (`ctxWords`, runtime/sched/sched.bit), prev/code/msg, the
+// message header `take` fills and the 256 bytes it copies the message into
+// (#4957).
+const recWords: int = 59
 
 // How deep below the boundary the panic is raised. Any depth proves the same
 // thing; several frames make a wrong `sp` land somewhere visibly wrong rather
 // than one frame off.
 const guardDepth: int = 4
 
-// The sentinel this program hands `take` as the panic's `msg`, and gets back
-// through `bit_rt_panic_boundary_msg`. Not a pointer: see (b) above.
-const msgSentinel: int = 0x5A17
+// The message this program hands `take` as the panic's `msg`, and reads back
+// through `bit_rt_panic_boundary_msg`. A real header over real bytes: see (b)
+// above.
+const msgText: string = "boundary sentinel 23063"
+
+// `{ptr, len}` at the front of a string object — `strPtr`/`strLen` in
+// runtime/root/root.bit, the shape runtime/ABI.md §12 calls `*const RtBytes`.
+const msgPtrOffset: int = 0
+const msgLenOffset: int = 8
 
 // The reason code, §12.1's 0 — "a message-carrying panic".
 const codeSentinel: int = 0
 
 // The value held live across the guarded call, checked after the resume (c).
 const keepSentinel: int = 987654321
+
+// The word and the byte at a raw address. `bit_rt_panic_boundary_msg` answers
+// an address, not a managed value — the ABI has no Bit type for "a header the
+// runtime owns" — and these are how its two words and its bytes are read back.
+fn wordAt(addr: int): int {
+  let z: *i64 = nil
+  return int(*(z + (addr >> 3)))
+}
+
+fn byteAt(addr: int): int {
+  let z: *byte = nil
+  return int(*(z + addr))
+}
+
+fn storeWordAt(addr: int, v: int) {
+  let z: *i64 = nil
+  *(z + (addr >> 3)) = i64(v)
+}
+
+// A `*const RtBytes` over `bytes`, as an integer — the one way a Bit program
+// can hand a door the shape a real panic message has. `hdr` and `bytes` are
+// both alive in the caller for as long as the header is used.
+fn headerOver(hdr: []i64, bytes: []byte): int {
+  let at = int(ptrOf(hdr))
+  storeWordAt(at + msgPtrOffset, int(ptrOf(bytes)))
+  storeWordAt(at + msgLenOffset, len(bytes))
+  return at
+}
+
+// The bytes of the header at `addr`, as a string.
+fn textAt(addr: int): string {
+  if (addr == 0) {
+    return ""
+  }
+  let n = wordAt(addr + msgLenOffset)
+  let p = wordAt(addr + msgPtrOffset)
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = byte(byteAt(p + i))
+    i = i + 1
+  }
+  return string(out)
+}
 
 extern fn bit_rt_panic_boundary_arm(rec: int): int
 extern fn bit_rt_panic_boundary_disarm()
@@ -68,12 +122,12 @@ extern fn bit_rt_panic_boundary_msg(): int
 // panic door will make. `take` does not return when a boundary is armed — it
 // resumes in `main`. When none is armed it returns 0 and this takes the
 // ordinary panic door, which is case (e).
-fn guarded(depth: int): int {
+fn guarded(depth: int, msg: int): int {
   if (depth > 0) {
-    let inner = guarded(depth - 1)
+    let inner = guarded(depth - 1, msg)
     return inner + 1
   }
-  let taken = bit_rt_panic_boundary_take(codeSentinel, msgSentinel)
+  let taken = bit_rt_panic_boundary_take(codeSentinel, msg)
   if (taken == 0) {
     panic("panicboundary: no boundary")
   }
@@ -101,6 +155,9 @@ fn main() {
   // (`stwScanScratch`, runtime/stw/stwscan.bit), so it cannot be swept while a
   // boundary names it.
   let rec = []i64(recWords)
+  let hdr = []i64(2)
+  let bytes = []byte(msgText)
+  let msgArg = headerOver(hdr, bytes)
   let keep = keepSentinel
   let armed = 0
   if (!unarmed) {
@@ -110,17 +167,20 @@ fn main() {
     // Either the arm itself (armed == 0 is its normal-path answer) or the
     // unarmed run. Both go down the guarded call; only the unarmed one comes
     // back, and it comes back through `panic`, not through here.
-    let got = guarded(guardDepth)
+    let got = guarded(guardDepth, msgArg)
     print("unreachable ${got}\n")
     return
   }
   // Reached only by a resume: `armed` is the 1 the arm call site yields the
   // second time (a).
   let code = bit_rt_panic_boundary_code()
-  let msg = bit_rt_panic_boundary_msg()
+  let msg = textAt(bit_rt_panic_boundary_msg())
   bit_rt_panic_boundary_disarm()
   print("resumed ${armed} code ${code} msg ${msg}\n")
   print("keep ${keep} quiet ${quiet(10)}\n")
+  // The header and its bytes, read after the resume: they are the program's
+  // own, and the copy the runtime took must not depend on them.
+  print("arg ${len(hdr)} ${len(bytes)}\n")
   // A trailing read of the record, so its rooting does not depend on the stack
   // map happening to widen this binding's live interval (#4097).
   print("rec ${len(rec)} taken ${bit_rt_panic_boundary_code()}\n")
