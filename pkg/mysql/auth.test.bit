@@ -1,0 +1,428 @@
+// pkg/mysql/auth.test.bit — the greeting, the authentication exchanges and the
+// TLS refusal, driven against an in-process fake server (#3993).
+//
+// `fakeServer` is a `myStream`, so `authenticate` runs here byte for byte as it
+// runs over a socket. Where it checks a credential it checks it THE WAY A SERVER
+// DOES — recovering the client's hash from the response and comparing it with
+// what the server stores — rather than by calling this driver's own function
+// back, which would be blind to any bug the two shared. The three response
+// formats are additionally pinned to vectors computed outside Bit, from MySQL's
+// own definition of each algorithm.
+
+import { ed25519PublicKey, ed25519Verify, decodeHex, encodeHex, ctEq } from "std/crypto"
+
+// The nonce every fake exchange uses. Twenty bytes, as the greeting carries.
+const testScramble: string = "01234567890123456789"
+
+// The three response vectors, computed outside this codebase from MySQL's own
+// definitions for password "pw" and the nonce above:
+//
+//   mysql_native_password  SHA1(pw) XOR SHA1(nonce || SHA1(SHA1(pw)))
+//   caching_sha2_password  SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) || nonce)
+//   mysql_old_password     scramble_323(nonce[0:8], pw)   (sql/password.c)
+const vectorNative: string = "9bf5a4e0c440182fc8fb2d90ad2a095b7a0945f3"
+const vectorSha2: string = "63eb551e746feb809f369c8b8cea9d6ee9136a054bfebd8eb4bcd1665d3e95ff"
+const vectorOld: string = "5d514e41504a4556"
+
+// A server that answers one connection. `mode` selects which exchange it runs.
+class fakeServer {
+  mode: string
+  password: string
+  version: string
+  plugin: string
+  mariaCaps: int
+  out: string
+  seq: int
+  stage: int
+  afterFull: int
+  // Bytes the client has not yet consumed. Empty means end of stream, which is
+  // what a read past the transcript must see.
+  readUp(n: int): string! {
+    let take = n
+    if (take > len(this.out)) {
+      take = len(this.out)
+    }
+    let head = this.out[0:take]
+    this.out = this.out[take:len(this.out)]
+    return head
+  }
+
+  // One client packet: the four-byte header, then the payload this fake answers.
+  writeAll(s: string): ()! {
+    this.seq = int([]byte(s)[3])
+    let payload = s[4:len(s)]
+    if (this.stage == 0) {
+      this.stage = 1
+      return this.opening(payload)?
+    }
+    this.stage = this.stage + 1
+    this.second(payload)?
+  }
+
+  shut() {}
+
+  // Queue one packet, numbered one past whatever the client just sent.
+  push(payload: string) {
+    this.seq = this.seq + 1
+    this.out = this.out + framePacket(payload, this.seq)
+  }
+
+  // The answer to the handshake response.
+  opening(payload: string): ()! {
+    if (this.mode == "native") {
+      return this.judge(serverCheckNative(authOf(payload), this.password))
+    }
+    if (this.mode == "sha2-fast") {
+      this.push(authMoreData(3))
+      return this.judge(serverCheckSha2(authOf(payload), this.password))
+    }
+    if (this.mode == "sha2-full") {
+      this.push(authMoreData(4))
+      return
+    }
+    if (this.mode == "ed25519") {
+      this.push(authSwitch("client_ed25519", ed25519Nonce()))
+      return
+    }
+    // The pre-4.1 AuthSwitchRequest is a single 0xFE byte: it names no plugin
+    // and reuses the greeting's own nonce.
+    this.push(writeLe(254, 1))
+  }
+
+  // The answer to whatever the client sent after the first exchange.
+  second(payload: string): ()! {
+    if (this.mode == "sha2-full") {
+      this.afterFull = this.afterFull + len(payload)
+      return this.judge(payload == cstr(this.password))
+    }
+    if (this.mode == "ed25519") {
+      return this.judge(
+        ed25519Verify(
+          ed25519PublicKey([]byte(this.password)), []byte(ed25519Nonce()),
+          []byte(payload),
+        ),
+      )
+    }
+    this.judge(payload == cstr(string(decodeHex(vectorOld)?)))
+  }
+
+  // Every check ends the same way: the server's OK packet, or its ERR.
+  judge(ok: bool) {
+    if (ok) {
+      this.push(okPacket())
+      return
+    }
+    this.push(errPacket(1045, "28000", "Access denied for user"))
+  }
+}
+
+// The authentication response inside a HandshakeResponse41: the 32-byte head,
+// the user name, then a single length byte and that many bytes.
+fn authOf(payload: string): string {
+  let c = cursor{ s: payload, at: 32 }
+  c.cstr() catch _ {
+    return ""
+  }
+  let n = c.int(1) catch _ {
+    return ""
+  }
+  return c.take(n) catch _ {
+    return ""
+  }
+}
+
+// The server side of `mysql_native_password`: the server stores
+// SHA1(SHA1(password)), recovers SHA1(password) from the response, and checks
+// that hashing it once more reproduces what it stored. This is the check a real
+// server makes, not this driver's own function called back on itself.
+fn serverCheckNative(response: string, password: string): bool {
+  let stored = digest(newSha1(), digest(newSha1(), []byte(password)))
+  let recovered = xorBytes(
+    []byte(response),
+    digest(newSha1(), []byte(testScramble + string(stored))),
+  )
+  return ctEq(digest(newSha1(), recovered), stored)
+}
+
+// The server side of `caching_sha2_password`'s fast path, the same shape one
+// hash up: the server holds SHA256(SHA256(password)).
+fn serverCheckSha2(response: string, password: string): bool {
+  let stored = digest(newSha256(), digest(newSha256(), []byte(password)))
+  let recovered = xorBytes(
+    []byte(response),
+    digest(newSha256(), []byte(string(stored) + testScramble)),
+  )
+  return ctEq(digest(newSha256(), recovered), stored)
+}
+
+// MariaDB sends ed25519 a 32-byte nonce of its own in the switch request.
+fn ed25519Nonce(): string {
+  return "0123456789abcdef0123456789abcdef"
+}
+
+// An OK packet: header, affected rows, last insert id, status flags, warnings.
+fn okPacket(): string {
+  return string([]byte(3)) + writeLe(2, 2) + writeLe(0, 2)
+}
+
+// An ERR packet with the 4.1 SQLSTATE marker.
+fn errPacket(code: int, state: string, message: string): string {
+  return writeLe(255, 1) + writeLe(code, 2) + "#" + state + message
+}
+
+// An AuthMoreData packet carrying one plugin status byte.
+fn authMoreData(status: int): string {
+  return writeLe(1, 1) + writeLe(status, 1)
+}
+
+// An AuthSwitchRequest: 0xFE, the plugin name, the new nonce, a NUL.
+fn authSwitch(plugin: string, nonce: string): string {
+  return writeLe(254, 1) + cstr(plugin) + cstr(nonce)
+}
+
+// The greeting a server of this family sends. `mariaCaps` goes where MariaDB
+// puts its own capabilities — the four bytes after the six-byte filler, the
+// upper half of the 64-bit field, which MySQL leaves as zeroes.
+fn greeting(version: string, plugin: string, caps: int, mariaCaps: int): string {
+  let low = caps % 65536
+  let high = caps / 65536 % 65536
+  return writeLe(10, 1) +
+    cstr(version) +
+    writeLe(7, 4) +
+    testScramble[0:8] +
+    string([]byte(1)) +
+    writeLe(low, 2) +
+    writeLe(45, 1) +
+    writeLe(2, 2) +
+    writeLe(high, 2) +
+    writeLe(21, 1) +
+    string([]byte(6)) +
+    writeLe(mariaCaps, 4) +
+    testScramble[8:20] +
+    string([]byte(1)) +
+    cstr(plugin)
+}
+
+// Everything a fake server needs before the client says anything: the greeting,
+// already framed as packet 0.
+fn newFake(mode: string, password: string, version: string, plugin: string): fakeServer {
+  let caps = capLongPassword | capProtocol41 | capSecureConnection | capPluginAuth
+  return fakeServer{
+    mode: mode, password: password, version: version, plugin: plugin,
+    mariaCaps: 0, out: framePacket(greeting(version, plugin, caps, 0), 0),
+    seq: 0, stage: 0, afterFull: 0,
+  }
+}
+
+// Run one full exchange against `f` and report the warning state and the failure
+// message, "" when it succeeded.
+fn runAuth(f: fakeServer, password: string, tlsOn: bool): (warnOnce, string) {
+  let w = myWire{ r: myReader{ s: f, buf: "" }, s: f, seq: 0 }
+  let warn = newWarnOnce()
+  let t = target{
+    host: "fake", port: 3306, user: "app", password: password, database: "dev",
+    mode: SslMode.Negotiate, pinned: false,
+  }
+  let info = parseHandshake(
+    w.recv() catch e {
+      panic("greeting: ${e.message()}")
+    },
+  ) catch e {
+    panic("parseHandshake: ${e.message()}")
+  }
+  let s = session{ w: w, info: info, mode: SslMode.Disable, tlsOn: tlsOn }
+  let err = ""
+  authenticate(s, t, warn) catch e {
+    err = e.message()
+  }
+  return (warn, err)
+}
+
+test "a MariaDB greeting strips the 5.5.5- prefix and is not read as MySQL 5.5.5" {
+  let caps = capProtocol41 | capSecureConnection | capPluginAuth
+  let info = parseHandshake(greeting("5.5.5-10.11.2-MariaDB-1", "mysql_native_password", caps, 0)) catch e {
+    panic("parseHandshake: ${e.message()}")
+  }
+  assert(info.family == "MariaDB", "family is ${info.family}")
+  assert(info.versionMajor == 10, "version major is ${info.versionMajor}")
+  assert(
+    !hasPrefix(info.version, "5.5.5"),
+    "the version still reads ${info.version}",
+  )
+  assert(info.scramble == testScramble, "scramble is '${info.scramble}'")
+}
+
+test "a MariaDB 11 greeting without the prefix is still MariaDB" {
+  let caps = capProtocol41 | capSecureConnection | capPluginAuth
+  let info = parseHandshake(greeting("11.4.2-MariaDB", "mysql_native_password", caps, 0)) catch e {
+    panic("parseHandshake: ${e.message()}")
+  }
+  assert(info.family == "MariaDB", "family is ${info.family}")
+  assert(info.versionMajor == 11, "version major is ${info.versionMajor}")
+}
+
+test "MariaDB capability bits are read from the upper 32 of the field" {
+  let caps = capProtocol41 | capSecureConnection | capPluginAuth
+  let info = parseHandshake(greeting("5.5.5-10.11.2-MariaDB", "mysql_native_password", caps, 12)) catch e {
+    panic("parseHandshake: ${e.message()}")
+  }
+  assert(mariadbCapabilities(info) == 12, "upper half read as ${mariadbCapabilities(info)}")
+  assert(
+    info.capabilities % mariadbCapabilityShift == caps,
+    "the lower half changed to ${info.capabilities % mariadbCapabilityShift}",
+  )
+  let mysql = parseHandshake(greeting("8.4.0", "caching_sha2_password", caps, 0)) catch e {
+    panic("parseHandshake: ${e.message()}")
+  }
+  assert(mysql.family == "MySQL", "family is ${mysql.family}")
+  assert(mariadbCapabilities(mysql) == 0, "MySQL reported MariaDB capabilities")
+  assert(mysql.plugin == "caching_sha2_password", "plugin is ${mysql.plugin}")
+}
+
+test "the three response formats match vectors computed outside this codebase" {
+  assert(
+    encodeHex([]byte(nativeResponse("pw", testScramble))) == vectorNative,
+    "mysql_native_password: ${encodeHex([]byte(nativeResponse("pw", testScramble)))}",
+  )
+  assert(
+    encodeHex([]byte(cachingSha2Response("pw", testScramble))) == vectorSha2,
+    "caching_sha2_password: ${encodeHex([]byte(cachingSha2Response("pw", testScramble)))}",
+  )
+  assert(
+    encodeHex([]byte(scramble323(testScramble, "pw"))) == vectorOld,
+    "mysql_old_password: ${encodeHex([]byte(scramble323(testScramble, "pw")))}",
+  )
+  assert(nativeResponse("", testScramble) == "", "an empty password sent bytes")
+}
+
+test "mysql_native_password connects and warns once, naming the plugin" {
+  let (w, err) = runAuth(newFake("native", "pw", "8.4.0", "mysql_native_password"), "pw", false)
+  assert(err == "", "native password failed: ${err}")
+  assert(w.authLines == 1, "emitted ${w.authLines} auth warning lines")
+  assert(
+    contains(w.authLine, "mysql_native_password"),
+    "the warning does not name the plugin: ${w.authLine}",
+  )
+}
+
+test "a wrong password is reported as the server's own error" {
+  let (_, err) = runAuth(
+    newFake("native", "right", "8.4.0", "mysql_native_password"),
+    "wrong",
+    false,
+  )
+  assert(contains(err, "1045"), "expected the server's error number: ${err}")
+  assert(contains(err, "28000"), "expected the server's SQLSTATE: ${err}")
+}
+
+test "caching_sha2_password's fast path connects and warns not at all" {
+  let (w, err) = runAuth(newFake("sha2-fast", "pw", "8.4.0", "caching_sha2_password"), "pw", false)
+  assert(err == "", "caching_sha2_password failed: ${err}")
+  assert(w.authLines == 0, "emitted ${w.authLines} auth warning lines")
+}
+
+test "full authentication without TLS sends nothing and fails naming TLS" {
+  let f = newFake("sha2-full", "pw", "8.4.0", "caching_sha2_password")
+  let (w, err) = runAuth(f, "pw", false)
+  assert(contains(err, "TLS"), "the refusal does not name TLS: ${err}")
+  assert(
+    f.afterFull == 0,
+      "the client sent ${f.afterFull} bytes after perform_full_authentication; " +
+      "no public-key request or RSA exchange may leave this driver without TLS",
+  )
+  assert(w.authLines == 0, "a refused connection emitted a warning")
+}
+
+test "full authentication over TLS sends the password and completes" {
+  let f = newFake("sha2-full", "pw", "8.4.0", "caching_sha2_password")
+  let (_, err) = runAuth(f, "pw", true)
+  assert(err == "", "full authentication over TLS failed: ${err}")
+  assert(f.afterFull == 3, "the client sent ${f.afterFull} bytes, not 'pw' and a NUL")
+}
+
+test "ed25519 answers the switch request with a signature MariaDB verifies" {
+  let (w, err) = runAuth(
+    newFake("ed25519", "pw", "5.5.5-11.4.2-MariaDB", "mysql_native_password"),
+    "pw",
+    false,
+  )
+  assert(err == "", "ed25519 failed: ${err}")
+  assert(w.authLines == 0, "ed25519 emitted ${w.authLines} auth warning lines")
+}
+
+test "old_password answers the one-byte switch and warns once, naming the plugin" {
+  let (w, err) = runAuth(
+    newFake("old", "pw", "5.5.5-10.11.2-MariaDB", "mysql_native_password"),
+    "pw",
+    false,
+  )
+  assert(err == "", "old_password failed: ${err}")
+  assert(w.authLines == 1, "emitted ${w.authLines} auth warning lines")
+  assert(
+    contains(w.authLine, "mysql_old_password"),
+    "the warning does not name the plugin: ${w.authLine}",
+  )
+}
+
+test "the ssl warning fires once for ten connections, not ten times" {
+  let w = newWarnOnce()
+  let i = 0
+  while (i < 10) {
+    warnSslMode(w, SslMode.Disable)
+    warnAuthPlugin(w, "mysql_native_password")
+    i = i + 1
+  }
+  assert(w.sslLines == 1, "ten connections emitted ${w.sslLines} ssl lines")
+  assert(w.authLines == 1, "ten connections emitted ${w.authLines} auth lines")
+  assert(
+    contains(sslWarningText(SslMode.Disable), "ssl-mode=DISABLED"),
+    "the disable warning does not name ssl-mode=DISABLED",
+  )
+}
+
+test "VERIFY_IDENTITY and a strong plugin emit no warning at all" {
+  let w = newWarnOnce()
+  warnSslMode(w, SslMode.VerifyFull)
+  warnAuthPlugin(w, "caching_sha2_password")
+  warnAuthPlugin(w, "client_ed25519")
+  assert(w.sslLines == 0, "VERIFY_IDENTITY emitted ${w.sslLines} lines")
+  assert(w.authLines == 0, "a strong plugin emitted ${w.authLines} lines")
+}
+
+test "the handshake response sets CLIENT_SSL only when TLS is in use" {
+  let caps = capProtocol41 | capSecureConnection | capPluginAuth | capSsl
+  let info = parseHandshake(greeting("8.4.0", "caching_sha2_password", caps, 0)) catch e {
+    panic("parseHandshake: ${e.message()}")
+  }
+  let t = target{
+    host: "h", port: 3306, user: "app", password: "pw", database: "dev",
+    mode: SslMode.Negotiate, pinned: false,
+  }
+  let plain = clientCapabilities(info, t, false) catch e {
+    panic("clientCapabilities: ${e.message()}")
+  }
+  let secure = clientCapabilities(info, t, true) catch e {
+    panic("clientCapabilities: ${e.message()}")
+  }
+  assert((plain & capSsl) == 0, "a plaintext connection asked for CLIENT_SSL")
+  assert((secure & capSsl) != 0, "a TLS connection did not ask for CLIENT_SSL")
+  assert((plain & capConnectWithDb) != 0, "a named database did not set CLIENT_CONNECT_WITH_DB")
+  let head = handshakeHead(secure)
+  assert(len(head) == 32, "the SSLRequest packet is ${len(head)} bytes, not 32")
+}
+
+// The failure `authResponse` produced for `plugin`, or "" if it produced a
+// response instead. A helper because a `catch` on a value-producing call has to
+// divert (E0067), which a test body cannot do mid-way.
+fn responseError(plugin: string): string {
+  let out = authResponse(plugin, "pw", testScramble) catch e {
+    return e.message()
+  }
+  assert(len(out) > 0, "a response must not be empty")
+  return ""
+}
+
+test "an unknown authentication plugin is named, never answered with silence" {
+  let err = responseError("sha256_password_v9")
+  assert(contains(err, "sha256_password_v9"), "the failure does not name it: ${err}")
+}

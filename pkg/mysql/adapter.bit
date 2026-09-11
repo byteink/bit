@@ -1,0 +1,278 @@
+// pkg/mysql/adapter.bit — the package's entire public surface, and the exchange
+// that turns a greeted socket into an authenticated session.
+//
+//     import { pool, Datasource } from "std/sql"
+//     import { adapter } from "bitlang.org/pkg/mysql"
+//
+//     let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL")? })?
+//
+// ONE EXPORTED SYMBOL, `adapter`. URI parsing is not exported beside it on
+// purpose: the one-line driver swap is the whole design of `std/sql`, and a
+// second import from this package would break it. Everything else in this module
+// is private.
+//
+// WHY A FUNCTION AND NOT `export let adapter: Adapter`. A module-level `let` may
+// only hold an untraced scalar (SPEC §11.11) — an interface value is a compile
+// error there, not a style preference — so a package-level singleton adapter is
+// not expressible. Returning a fresh value per call is also the more correct
+// shape for the warn-once state below: "once per pool" is what the ticket asks
+// for, and a process-wide singleton would silently make it "once per process",
+// so the second pool in a program would connect with ssl-mode=DISABLED and say
+// nothing.
+//
+// ONE PACKAGE FOR BOTH SERVERS. MySQL and MariaDB share this protocol; the
+// differences are a version prefix, a second half of the capability field and
+// one extra authentication plugin, all of which are handled where they occur.
+// Two packages would be two copies of everything else.
+
+import { Adapter, Conn, Rows, Stmt, Tx, Value, transportError } from "std/sql"
+import { Mutex, newMutex } from "std/sync"
+import { systemRoots } from "std/crypto"
+import { stderr } from "std/io"
+
+// How many packets one authentication exchange may take before this gives up. A
+// real one is at most five (the response, an auth switch, its answer, a status
+// byte, the OK), and finite means a server that answers forever cannot park a
+// caller.
+const authPacketBudget: int = 64
+
+// A MySQL/MariaDB `Adapter` for `std/sql.pool`, plus the state that makes a
+// warning fire once for the whole pool rather than once per connection. `pool`
+// opens connections from several green threads, so the flags are behind a mutex
+// — two threads racing the first connect would otherwise print the same line
+// twice, which is the exact thing being avoided.
+class myAdapter {
+  warn: warnOnce
+  roots: TrustStore
+  rootsLoaded: bool
+  mu: Mutex
+  // `Adapter.connect`: one physical connection, negotiated, authenticated and
+  // ready for a command.
+  connect(cfg: Datasource): Conn! {
+    let t = targetOf(cfg)?
+    let s = openSession(t, this.warn, this.trustRoots()?)?
+    authenticate(s, t, this.warn) catch e {
+      s.w.s.shut()
+      fail e
+    }
+    return myConn{ w: s.w, info: s.info, closed: false }
+  }
+
+  // The OS trust store, parsed once per adapter. `systemRoots()` reads and
+  // parses the whole CA bundle (~170ms), so paying it per connection would
+  // dominate the connect time of an entire pool.
+  trustRoots(): TrustStore! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (!this.rootsLoaded) {
+      let sys = systemRoots()?
+      this.roots = TrustStore{ roots: sys.roots }
+      this.rootsLoaded = true
+    }
+    return this.roots
+  }
+}
+
+// The MySQL and MariaDB adapter. Pass it to `std/sql.pool`; one value per pool.
+export fn adapter(): Adapter {
+  return newMyAdapter()
+}
+
+// The concrete adapter, so this module's own tests can reach `warn` — the
+// exported `adapter` deliberately hands back an `Adapter`, which has no fields.
+fn newMyAdapter(): myAdapter {
+  return myAdapter{
+    warn: newWarnOnce(),
+    roots: TrustStore{ roots: []Certificate(0) },
+    rootsLoaded: false,
+    mu: newMutex(),
+  }
+}
+
+// A pool's warning state, nothing said yet.
+fn newWarnOnce(): warnOnce {
+  return warnOnce{
+    mu: newMutex(), sslLines: 0, authLines: 0, sslLine: "", authLine: "",
+  }
+}
+
+// The two once-per-pool warnings: one for a TLS rung below VERIFY_IDENTITY, one
+// for a replayable authentication plugin. Two flags, not one, because they are
+// independent facts and a connection can be weak in either dimension.
+class warnOnce {
+  mu: Mutex,
+  // How many lines of each kind have actually been emitted. A counter rather
+  // than a bool because "once per pool, not once per connection" is a claim
+  // about a NUMBER of lines, and a bool cannot fail the way the claim can —
+  // `auth.test.bit` and `live.test.bit` assert these are 1 after ten
+  // connections.
+  sslLines: int,
+  authLines: int,
+  // The exact lines emitted, kept so a test can assert what a warning SAID —
+  // "warns once naming the plugin" is a claim about the text, and a count alone
+  // cannot fail it.
+  sslLine: string,
+  authLine: string,
+}
+
+// Warn about the negotiated TLS rung, at most once for this pool.
+// VERIFY_IDENTITY is the goal and says nothing.
+fn warnSslMode(w: warnOnce, mode: SslMode) {
+  if (mode == SslMode.VerifyFull) {
+    return
+  }
+  w.mu.lock()
+  defer w.mu.unlock()
+  if (w.sslLines != 0) {
+    return
+  }
+  w.sslLines = 1
+  w.sslLine = sslWarningText(mode)
+  emit(w.sslLine)
+}
+
+// One line per rung, saying what an operator loses by being on it.
+fn sslWarningText(mode: SslMode): string {
+  let name = sslModeName(mode)
+  if (mode == SslMode.Disable) {
+    return "mysql: connected with ssl-mode=${name} — credentials and query " +
+      "results cross the network in the clear."
+  }
+  if (mode == SslMode.VerifyCa) {
+    return "mysql: connected with ssl-mode=${name} — the certificate chain is " +
+      "verified, but the name on it is not checked against the host that was " +
+      "dialled."
+  }
+  return "mysql: connected with ssl-mode=${name} — encrypted, but the " +
+    "server's certificate is not verified; an active man-in-the-middle is not " +
+    "detected."
+}
+
+// Warn about the authentication plugin, at most once for this pool. The two
+// strong plugins say nothing.
+fn warnAuthPlugin(w: warnOnce, plugin: string) {
+  if (!weakPlugin(plugin)) {
+    return
+  }
+  w.mu.lock()
+  defer w.mu.unlock()
+  if (w.authLines != 0) {
+    return
+  }
+  w.authLines = 1
+  w.authLine = authWarningText(plugin)
+  emit(w.authLine)
+}
+
+// One line per plugin, naming the plugin and the fix.
+fn authWarningText(plugin: string): string {
+  if (plugin == "mysql_native_password") {
+    return "mysql: authenticated with ${plugin} — the server's stored value " +
+      "is SHA-1 and answers this challenge on its own, so anyone who can read " +
+      "the user table can log in as this user. Move the account to " +
+      "caching_sha2_password (MySQL) or ed25519 (MariaDB)."
+  }
+  return "mysql: authenticated with ${plugin} — the pre-4.1 hash, 64 bits of " +
+    "keyspace and a bespoke PRNG. Move the account to caching_sha2_password " +
+    "(MySQL) or ed25519 (MariaDB)."
+}
+
+// Warnings go to stderr, never stdout: stdout is a program's output and a driver
+// has no business writing to it. A failed write is dropped — losing a warning
+// must never fail a connection that otherwise succeeded.
+fn emit(line: string) {
+  stderr().write(line + "\n") catch _ {
+    return
+  }
+}
+
+// The state one authentication exchange carries between packets: which plugin is
+// in force and which nonce it is answering. Both change when the server sends an
+// AuthSwitchRequest, which is the normal case for `ed25519` and for any account
+// whose plugin is not the server's default.
+class authState {
+  s: session
+  t: target
+  plugin: string
+  scramble: string
+  // An AuthSwitchRequest: a plugin name and a fresh nonce, answered in that
+  // plugin's own terms. A one-byte packet is the pre-4.1 form of the same
+  // request, which names no plugin and reuses the greeting's nonce.
+  switchPlugin(payload: string): ()! {
+    if (len(payload) == 1) {
+      this.plugin = "mysql_old_password"
+    } else {
+      let c = cursor{ s: payload, at: 1 }
+      this.plugin = c.cstr()?
+      this.scramble = trimNul(c.s[c.at:len(c.s)])
+    }
+    this.s.w.send(authResponse(this.plugin, this.t.password, this.scramble)?)?
+  }
+}
+
+// Send the handshake response and drive the exchange to the server's OK packet.
+//
+// Bounded by `authPacketBudget`.
+fn authenticate(s: session, t: target, warn: warnOnce): ()! {
+  let st = authState{
+    s: s, t: t, plugin: s.info.plugin, scramble: s.info.scramble,
+  }
+  let caps = clientCapabilities(s.info, t, s.tlsOn)?
+  let first = authResponse(st.plugin, t.password, st.scramble)?
+  s.w.send(handshakeResponse(caps, t, first, st.plugin)?)?
+  let seen = 0
+  while (seen < authPacketBudget) {
+    seen = seen + 1
+    if (authStep(st, s.w.recv()?)?) {
+      warnAuthPlugin(warn, st.plugin)
+      return
+    }
+  }
+  fail newError("mysql: the server sent ${authPacketBudget} packets without " + "ever finishing authentication")
+}
+
+// One packet of the exchange, true when it was the final OK.
+fn authStep(st: authState, payload: string): bool! {
+  let kind = packetKind(payload)
+  if (kind == 0) {
+    return true
+  }
+  if (kind == 255) {
+    fail newError(errorText(payload))
+  }
+  if (kind == 254) {
+    st.switchPlugin(payload)?
+    return false
+  }
+  if (kind == 1) {
+    return moreData(st, payload)?
+  }
+  fail newError("mysql: unexpected packet type ${kind} during authentication")
+}
+
+// AuthMoreData. Only `caching_sha2_password` sends it; any other plugin doing so
+// is named rather than answered, because answering would mean guessing what the
+// bytes meant.
+fn moreData(st: authState, payload: string): bool! {
+  if (st.plugin != "caching_sha2_password") {
+    fail newError(
+        "mysql: the server sent plugin data mid-exchange for " +
+        "'${st.plugin}', which has no such message",
+    )
+  }
+  cachingSha2More(st.s.w, st.t.password, payload, st.s.tlsOn)?
+  return false
+}
+
+// Drop one trailing NUL. The nonce in an AuthSwitchRequest is NUL-terminated,
+// and feeding that byte to a scramble would derive the wrong answer for every
+// plugin.
+fn trimNul(s: string): string {
+  if (len(s) == 0) {
+    return s
+  }
+  if ([]byte(s)[len(s) - 1] != 0) {
+    return s
+  }
+  return s[0:len(s) - 1]
+}

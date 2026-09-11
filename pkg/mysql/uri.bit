@@ -1,0 +1,276 @@
+// pkg/mysql/uri.bit — turning a `Datasource` into something to connect to.
+//
+// `std/sql` deliberately exports no `parseUrl` (stdlib/sql/config.bit): every
+// database spells its TLS setting differently, so reading the URI is the
+// adapter's job. Nothing here is exported — `adapter` is this package's only
+// public symbol, so URI parsing stays behind the `Adapter` interface where the
+// one-line driver swap needs it.
+//
+// THE MYSQL SPELLING, NOT POSTGRES'S. MySQL and MariaDB name the setting
+// `ssl-mode=` and spell its values in upper case: `DISABLED`, `REQUIRED`,
+// `VERIFY_CA`, `VERIFY_IDENTITY`. Those four map onto `std/sql`'s shared
+// `SslMode`, which is what keeps one `Datasource` type across every driver.
+//
+// AN UNRECOGNISED `ssl-mode=` IS REJECTED, NOT DEFAULTED. The typed half of
+// the configuration (`Datasource.sslmode`) cannot hold a wrong value; the
+// string half can, and a typo falling back to the ladder would turn a
+// production `ssl-mode=VERIFY_IDENTITYY` into an unauthenticated connection.
+//
+// `PREFERRED` — MySQL's own default — is deliberately absent from `sslModeOf`'s
+// table rather than special-cased: it names the fallback policy that omitting
+// `ssl-mode` already asks for, and it is rejected by the same line every typo
+// is.
+
+// Imports are per MODULE, not per file (SPEC §17.1): every `.bit` file under
+// `pkg/mysql/` shares one namespace, so a symbol may be imported in exactly one
+// of them. These are the module's configuration types and string helpers, used
+// from here, `auth.bit`, `tlsnegotiate.bit`, `conn.bit` and `adapter.bit` alike.
+import { Datasource, SslMode } from "std/sql"
+import { hasPrefix, indexOf, lastIndexOf, split, parseInt, toUpper } from "std/strings"
+// `contains` is used only by this module's tests; the import is here because
+// imports are per module and a `.test.bit` file shares this namespace.
+import { contains } from "std/strings"
+
+// MySQL's assigned port, shared with MariaDB. `std/sql` knows no port numbers —
+// `Datasource.port` is 0 by default and each adapter supplies its own.
+const defaultPort: int = 3306
+
+// Where to connect and how hard to insist on TLS, after both forms of
+// `Datasource` have been reduced to one shape.
+//
+// `pinned` is the whole point of the type: it records that the *caller* named a
+// TLS mode, in the URI or in the field, which makes `mode` a floor that fails
+// rather than a preference that downgrades.
+class target {
+  host: string,
+  port: int,
+  user: string,
+  password: string,
+  database: string,
+  mode: SslMode,
+  pinned: bool,
+}
+
+// Reduce either form of `Datasource` — `uri`, or the individual fields — to one
+// `target`. `pool` has already called `cfg.validate()`, so exactly one of the
+// two forms is in use and this never sees both or neither.
+fn targetOf(cfg: Datasource): target! {
+  if (cfg.uri != "") {
+    return parseUri(cfg.uri)?
+  }
+  return target{
+    host: cfg.host,
+    port: portOr(cfg.port),
+    user: cfg.user,
+    password: cfg.password,
+    database: cfg.database,
+    mode: cfg.sslmode,
+    pinned: cfg.sslmode != SslMode.Negotiate,
+  }
+}
+
+// 0 means "the adapter's own default", which is 3306 here.
+fn portOr(p: i64): int {
+  if (p == 0) {
+    return defaultPort
+  }
+  return p
+}
+
+// `mysql://user:password@host:port/database?ssl-mode=...`, with `mariadb://`
+// accepted for exactly the same thing: one package serves both servers because
+// the wire protocol is one protocol, and refusing the scheme a MariaDB user
+// would naturally write would be a difference with nothing behind it.
+fn parseUri(uri: string): target! {
+  let rest = afterScheme(uri)?
+  let (beforeQuery, query) = cut(rest, "?")
+  let (authority, database) = cut(beforeQuery, "/")
+  let (userinfo, hostport, _) = cutLast(authority, "@")
+  let t = target{
+    host: "", port: defaultPort, user: "", password: "",
+    database: pctDecode(database)?, mode: SslMode.Negotiate, pinned: false,
+  }
+  splitUserinfo(t, userinfo)?
+  splitHostPort(t, hostport)?
+  applyQuery(t, query)?
+  if (t.host == "") {
+    fail newError("mysql: connection URI names no host: ${uri}")
+  }
+  return t
+}
+
+// Strip `mysql://` or `mariadb://`. Anything else is not this driver's URI and
+// is refused by scheme rather than misparsed as a host.
+fn afterScheme(uri: string): string! {
+  if (hasPrefix(uri, "mysql://")) {
+    return uri[8:len(uri)]
+  }
+  if (hasPrefix(uri, "mariadb://")) {
+    return uri[10:len(uri)]
+  }
+  fail newError(
+    "mysql: connection URI must start with mysql:// or mariadb://, " + "got: ${uri}",
+  )
+}
+
+// `user`, `user:password`, or empty. Percent-decoded, because a password
+// containing `@`, `/` or `?` can only appear in a URI escaped.
+fn splitUserinfo(t: target, userinfo: string): ()! {
+  if (userinfo == "") {
+    return
+  }
+  let (user, password) = cut(userinfo, ":")
+  t.user = pctDecode(user)?
+  t.password = pctDecode(password)?
+}
+
+// `host`, or `host:port`. The port must be a number in range — a URI naming
+// `:3306x` is a typo, and defaulting it would connect somewhere unintended.
+fn splitHostPort(t: target, hostport: string): ()! {
+  let (host, port, hasPort) = cutLast(hostport, ":")
+  if (!hasPort) {
+    t.host = pctDecode(hostport)?
+    return
+  }
+  t.host = pctDecode(host)?
+  if (port == "") {
+    return
+  }
+  let n = parseInt(port) catch _ {
+    fail newError("mysql: connection URI port is not a number: ${port}")
+  }
+  if (n < 1 || n > 65535) {
+    fail newError("mysql: connection URI port is out of range: ${n}")
+  }
+  t.port = n
+}
+
+// The query string. Only `ssl-mode` is understood; every other key fails naming
+// itself, because silently dropping a parameter the caller wrote is how a
+// connection ends up not doing what its URI says.
+fn applyQuery(t: target, query: string): ()! {
+  if (query == "") {
+    return
+  }
+  let parts = split(query, "&")
+  let i = 0
+  while (i < len(parts)) {
+    applyParam(t, parts[i])?
+    i = i + 1
+  }
+}
+
+// One `key=value` pair.
+fn applyParam(t: target, param: string): ()! {
+  if (param == "") {
+    return
+  }
+  let (key, value) = cut(param, "=")
+  if (key != "ssl-mode") {
+    fail newError(
+        "mysql: connection URI parameter '${key}' is not supported; " +
+        "this driver reads ssl-mode only",
+    )
+  }
+  t.mode = sslModeOf(pctDecode(value)?)?
+  t.pinned = true
+}
+
+// The four spellings that name a mode, upper-cased first because a URI copied
+// out of a shell history is as likely to read `ssl-mode=required`. Everything
+// else — including MySQL's own `PREFERRED`, which asks for the fallback
+// behaviour that omitting `ssl-mode` already gives — is rejected naming the
+// accepted set.
+fn sslModeOf(value: string): SslMode! {
+  let want = toUpper(value)
+  if (want == "DISABLED") {
+    return SslMode.Disable
+  }
+  if (want == "REQUIRED") {
+    return SslMode.Require
+  }
+  if (want == "VERIFY_CA") {
+    return SslMode.VerifyCa
+  }
+  if (want == "VERIFY_IDENTITY") {
+    return SslMode.VerifyFull
+  }
+  fail newError(
+      "mysql: unrecognised ssl-mode value '${value}'; expected one of " +
+      "DISABLED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY, or no ssl-mode at all " +
+      "to negotiate the strongest the server accepts",
+  )
+}
+
+// The name a mode is reported by, in warnings and in failures. One table, so a
+// message can never disagree with what was actually negotiated.
+fn sslModeName(mode: SslMode): string {
+  match (mode) {
+    Negotiate => return "negotiate"
+    VerifyFull => return "VERIFY_IDENTITY"
+    VerifyCa => return "VERIFY_CA"
+    Require => return "REQUIRED"
+    Disable => return "DISABLED"
+  }
+}
+
+// Split at the FIRST `sep`; the separator and everything after it is the second
+// half, and an absent separator leaves it empty.
+fn cut(s: string, sep: string): (string, string) {
+  let at = indexOf(s, sep)
+  if (at < 0) {
+    return (s, "")
+  }
+  return (s[0:at], s[at + len(sep):len(s)])
+}
+
+// Split at the LAST `sep`, reporting whether there was one. `@` in a userinfo
+// and `:` in a host:port both bind rightmost — a password may legally contain
+// an unescaped `@` in practice, and binding leftmost would cut the authority in
+// the wrong place.
+fn cutLast(s: string, sep: string): (string, string, bool) {
+  let at = lastIndexOf(s, sep)
+  if (at < 0) {
+    return ("", s, false)
+  }
+  return (s[0:at], s[at + len(sep):len(s)], true)
+}
+
+// Percent-decoding (RFC 3986 §2.1). A truncated or non-hex escape fails rather
+// than being passed through: `%zz` in a password is a broken URI, and treating
+// it literally would send the wrong credential to the server.
+fn pctDecode(s: string): string! {
+  if (indexOf(s, "%") < 0) {
+    return s
+  }
+  let src = []byte(s)
+  let out = []byte(0)
+  let i = 0
+  while (i < len(src)) {
+    if (src[i] != 37) {
+      out = append(out, src[i])
+      i = i + 1
+      continue
+    }
+    if (i + 2 >= len(src)) {
+      fail newError("mysql: truncated percent-escape in connection URI")
+    }
+    out = append(out, byte(hexNibble(src[i + 1])? * 16 + hexNibble(src[i + 2])?))
+    i = i + 3
+  }
+  return string(out)
+}
+
+// One hex digit as 0..15.
+fn hexNibble(c: byte): int! {
+  if (c >= 48 && c <= 57) {
+    return int(c) - 48
+  }
+  if (c >= 97 && c <= 102) {
+    return int(c) - 97 + 10
+  }
+  if (c >= 65 && c <= 70) {
+    return int(c) - 65 + 10
+  }
+  fail newError("mysql: bad percent-escape in connection URI")
+}

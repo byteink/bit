@@ -1,0 +1,218 @@
+// pkg/mysql/tlsnegotiate.bit — getting from a bare TCP socket to a stream the
+// handshake response can be written to.
+//
+// MYSQL DOES NOT NEGOTIATE TLS THE WAY HTTPS DOES. There is no TLS port and no
+// ALPN. The server speaks first, sending its greeting in the clear; if the
+// client wants TLS it answers with the FIRST 32 BYTES of a handshake response —
+// capabilities, packet size, character set, filler — with CLIENT_SSL set, and
+// the next byte on the same socket is the start of the TLS handshake. The real
+// handshake response, carrying the user name and the authentication data, is
+// then sent inside TLS. That is why `std/tls.dial` cannot be used and
+// `std/tls.client` — the handshake without the connect — exists.
+//
+// THE LADDER, AND WHY A PIN IS DIFFERENT. With no `ssl-mode` the driver takes
+// the strongest rung that works — VERIFY_IDENTITY, then VERIFY_CA, then
+// REQUIRED, then plaintext — so a stock local server with no TLS configured
+// connects, which is the behaviour the owner ruled for on 2026-08-30. With an
+// explicit `ssl-mode` it does exactly that one thing and FAILS otherwise: a
+// production URI carrying `ssl-mode=VERIFY_IDENTITY` is a guarantee, and a
+// guarantee that downgrades under pressure is not one.
+//
+// A SERVER THAT ADVERTISES CLIENT_SSL AND THEN FAILS THE HANDSHAKE IS NOT
+// DOWNGRADED TO PLAINTEXT. The plaintext rung belongs to a server whose greeting
+// offers no CLIENT_SSL at all. A server that offered it and then broke is either
+// misconfigured or being interfered with, and sending credentials to it in the
+// clear is precisely the strip attack the ladder must not perform.
+
+import { dial as myTcpDial, resolve as myResolve } from "std/net"
+// `TrustStore` is std/tls's own (stdlib/tls/clientstate.bit), NOT std/crypto's
+// same-named class: `TlsConfig.roots` is typed by the former. Both hold the same
+// parsed `Certificate` values, so `x509VerifyChain` takes `.roots` straight
+// across with no re-parse.
+import { TlsConfig, TrustStore, client as tlsHandshake } from "std/tls"
+import { Certificate, x509Parse, x509VerifyChain } from "std/crypto"
+import { now as clockNow } from "std/time"
+
+// A greeted connection: the framing, what the server said about itself, the TLS
+// rung it was reached at, and whether the stream is encrypted — which
+// `caching_sha2_password` needs to know before it will consider full
+// authentication.
+class session {
+  w: myWire,
+  info: serverInfo,
+  mode: SslMode,
+  tlsOn: bool,
+}
+
+// Open a session to `t` at the strongest rung its configuration allows, warning
+// once per pool for anything below VERIFY_IDENTITY.
+fn openSession(t: target, warn: warnOnce, roots: TrustStore): session! {
+  if (t.pinned) {
+    return openPinned(t, warn, roots)?
+  }
+  return openNegotiate(t, warn, roots)?
+}
+
+// An explicit `ssl-mode`: this mode or nothing. Every failure names the pin, so
+// the message says both what was asked for and what the server offered.
+fn openPinned(t: target, warn: warnOnce, roots: TrustStore): session! {
+  let conn = dialFresh(t)?
+  let s = greet(conn)?
+  if (t.mode == SslMode.Disable) {
+    warnSslMode(warn, SslMode.Disable)
+    s.mode = SslMode.Disable
+    return s
+  }
+  if ((s.info.capabilities & capSsl) == 0) {
+    conn.close()
+    fail newError(
+        "mysql: the URI pins ssl-mode=${sslModeName(t.mode)}, but " +
+        "${t.host}:${t.port} advertises no CLIENT_SSL — that server has no TLS " +
+        "configured, so this connection failed rather than downgrading to " +
+        "ssl-mode=DISABLED",
+    )
+  }
+  upgrade(s, conn, t, t.mode, roots)?
+  warnSslMode(warn, t.mode)
+  s.mode = t.mode
+  return s
+}
+
+// No `ssl-mode`: the strongest rung that works. Each TLS rung needs its own
+// socket — a failed handshake has already written bytes the server will not read
+// past — so a rung that fails verification is retried on a fresh connect, with a
+// fresh greeting.
+//
+// Bounded by the rung list, which is a literal.
+fn openNegotiate(t: target, warn: warnOnce, roots: TrustStore): session! {
+  let rungs = [SslMode.VerifyFull, SslMode.VerifyCa, SslMode.Require]
+  let detail = "the server advertises no CLIENT_SSL"
+  let i = 0
+  while (i < len(rungs)) {
+    let conn = dialFresh(t)?
+    let s = greet(conn)?
+    if ((s.info.capabilities & capSsl) == 0) {
+      warnSslMode(warn, SslMode.Disable)
+      s.mode = SslMode.Disable
+      return s
+    }
+    upgrade(s, conn, t, rungs[i], roots) catch e {
+      detail = e.message()
+      conn.close()
+      i = i + 1
+      continue
+    }
+    warnSslMode(warn, rungs[i])
+    s.mode = rungs[i]
+    return s
+  }
+  fail newError(
+      "mysql: ${t.host}:${t.port} advertises CLIENT_SSL but no TLS " +
+      "mode completed a handshake, and a server that offers TLS is never " +
+      "downgraded to cleartext: ${detail}",
+  )
+}
+
+// A fresh TCP connection to the target. `std/net` speaks dotted quads only, so
+// the name is resolved first — the same two steps `std/tls.dial` takes.
+fn dialFresh(t: target): NetConn! {
+  let ip = myResolve(t.host)?
+  return myTcpDial(ip, t.port)?
+}
+
+// Read the greeting off a fresh socket. A server that refuses the connection
+// outright — a blocked host, too many connections — sends an ERR packet instead
+// of a greeting, and its own words are the useful message.
+fn greet(conn: NetConn): session! {
+  let st = plainStream{ c: conn }
+  let w = myWire{ r: myReader{ s: st, buf: "" }, s: st, seq: 0 }
+  let payload = w.recv()?
+  if (packetKind(payload) == 255) {
+    conn.close()
+    fail newError(errorText(payload))
+  }
+  return session{
+    w: w, info: parseHandshake(payload)?, mode: SslMode.Disable, tlsOn: false,
+  }
+}
+
+// Send the SSLRequest packet and run the handshake for one rung on the same
+// socket, replacing the session's stream with the encrypted one. The sequence
+// number is deliberately carried across: the SSLRequest was packet 1 of this
+// connection and the handshake response has to be packet 2.
+fn upgrade(s: session, conn: NetConn, t: target, mode: SslMode, roots: TrustStore): ()! {
+  s.w.send(handshakeHead(clientCapabilities(s.info, t, true)?))?
+  if (len(s.w.r.buf) != 0) {
+    fail newError(
+        "mysql: the server sent ${len(s.w.r.buf)} bytes after its " +
+        "greeting and before the TLS handshake, which no version of this protocol does",
+    )
+  }
+  let tc = tlsHandshake(conn, t.host, tlsConfigFor(t, mode, roots))?
+  if (mode == SslMode.VerifyCa) {
+    verifyChainOnly(tc, roots) catch e {
+      tc.close()
+      fail e
+    }
+  }
+  let st = tlsStream{ c: tc }
+  s.w.s = st
+  s.w.r = myReader{ s: st, buf: "" }
+  s.tlsOn = true
+}
+
+// One rung's TLS configuration. REQUIRED sets `insecureSkipVerify` because that
+// is exactly what it means: encrypted, unauthenticated. VERIFY_CA does the same
+// and then verifies the chain itself against `roots`, which is the only way to
+// get a chain check without a hostname check — `TlsConfig.insecureSkipVerify`
+// covers both.
+fn tlsConfigFor(t: target, mode: SslMode, roots: TrustStore): TlsConfig {
+  return TlsConfig{
+    roots: roots,
+    insecureSkipVerify: mode != SslMode.VerifyFull,
+    alpn: []string(0),
+    serverName: t.host,
+    minVersion: 0,
+    nowUnix: 0,
+    certPem: "",
+    keyPem: "",
+  }
+}
+
+// VERIFY_CA: the chain must reach a trust anchor, but the name on it need not be
+// the name we dialled — that difference is the whole distinction from
+// VERIFY_IDENTITY, and it is what lets a certificate issued for an internal name
+// be used through a load balancer.
+//
+// `x509VerifyChain` takes the hostname as a required argument, so the name
+// checked is the leaf's OWN first SubjectAltName. That makes the hostname test
+// vacuous BY CONSTRUCTION rather than by omission: there is no code path here
+// where a name check silently stops happening.
+fn verifyChainOnly(tc: TlsConn, roots: TrustStore): ()! {
+  let der = tc.peerCertificates()
+  if (len(der) == 0) {
+    fail newError("mysql: ssl-mode=VERIFY_CA, but the server sent no " + "certificate chain")
+  }
+  let leaf = x509Parse(der[0])?
+  if (len(leaf.dnsNames) == 0) {
+    fail newError(
+        "mysql: ssl-mode=VERIFY_CA, but the server's certificate " +
+        "carries no SubjectAltName, so there is no name to build a chain for",
+    )
+  }
+  x509VerifyChain(
+    leaf, parseRest(der)?, roots.roots, leaf.dnsNames[0],
+    clockNow().ns / 1000000000,
+  )?
+}
+
+// The chain after the leaf, as intermediates.
+fn parseRest(der: [][]byte): []Certificate! {
+  let out = []Certificate(0)
+  let i = 1
+  while (i < len(der)) {
+    out = append(out, x509Parse(der[i])?)
+    i = i + 1
+  }
+  return out
+}

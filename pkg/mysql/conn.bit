@@ -1,0 +1,232 @@
+// pkg/mysql/conn.bit — the `std/sql.Conn` an authenticated session becomes.
+//
+// SCOPE: ONE STATEMENT SHAPE, DELIBERATELY. This ticket (#3993) gets a
+// connected, authenticated session; the query layer — the prepared-statement
+// protocol, parameter binding, typed result decoding and the statement cache —
+// is a ticket of its own under epic #3986. What is here is COM_QUERY with no
+// parameters, which is exactly what the `select 1` liveness check needs and
+// nothing more. `exec`, `prepare` and `begin` FAIL naming the epic rather than
+// half-working: a parameter path that silently interpolated would be an
+// injection hole, and the one thing `std/sql` guarantees structurally is that it
+// cannot exist.
+//
+// Values come back in the protocol's TEXT format, so every non-NULL column is
+// `Value.Text` whatever its column type. The binary protocol and per-type
+// decoding belong to the query ticket, not to a half-measure here.
+
+// How many packets one query response may consist of. `select 1` uses five.
+const queryPacketBudget: int = 4096
+
+// COM_QUERY. The command byte a text query is sent under.
+const comQuery: int = 3
+
+// COM_QUIT. Sent on close, best effort.
+const comQuit: int = 1
+
+// The first byte of a LOCAL INFILE request, which asks the CLIENT to open a file
+// and send it. This driver never does: a server — or anything that has taken its
+// place — that can make a client read arbitrary local paths is the `LOAD DATA
+// LOCAL` vulnerability, and the capability bit for it is not set in the
+// handshake either.
+const localInfileMarker: int = 251
+
+// One physical connection, authenticated and idle.
+class myConn {
+  w: myWire
+  info: serverInfo
+  closed: bool
+  // COM_QUERY with no parameters, and everything the server sends back.
+  //
+  // A failure below this point has left the packet stream at an unknown offset,
+  // so every one of them is a `transportError` — `std/sql`'s marker for "do not
+  // hand this connection out again" (stdlib/sql/config.bit).
+  query(sqlText: string, params: []Value): Rows! {
+    if (len(params) != 0) {
+      fail newError(
+          "mysql: parameter binding is not implemented yet (epic " +
+          "#3986); this connection runs parameterless statements only",
+      )
+    }
+    if (this.closed) {
+      fail transportError("query on a closed connection")
+    }
+    this.w.startCommand()
+    this.w.send(writeLe(comQuery, 1) + sqlText) catch e {
+      fail transportError(e.message())
+    }
+    return this.collect()?
+  }
+
+  // Read the whole response: a column count, that many column definitions, an
+  // EOF, the rows, and a final EOF or OK.
+  collect(): Rows! {
+    let head = this.recv()?
+    if (packetKind(head) == 255) {
+      fail newError(errorText(head))
+    }
+    if (packetKind(head) == 0) {
+      return myRows{ cols: []string(0), rows: [][]Value(0), at: 0 - 1 }
+    }
+    if (packetKind(head) == localInfileMarker) {
+      fail transportError(
+          "the server asked the client to send a local file " +
+          "(LOAD DATA LOCAL); this driver never does",
+      )
+    }
+    let count = readLenEnc(cursor{ s: head, at: 0 })?
+    let out = myRows{ cols: this.columns(count)?, rows: [][]Value(0), at: 0 - 1 }
+    this.rows(out)?
+    return out
+  }
+
+  // One packet, as a transport failure if the stream broke.
+  recv(): string! {
+    return this.w.recv() catch e {
+      fail transportError(e.message())
+    }
+  }
+
+  // `count` column definition packets, then the EOF that closes them. Only the
+  // column NAME is read; the type, length and flags belong to the typed-decoding
+  // ticket.
+  //
+  // Bounded by `count`, which the server declared.
+  columns(count: int): []string! {
+    let out = []string(0)
+    let i = 0
+    while (i < count) {
+      out = append(out, columnName(this.recv()?)?)
+      i = i + 1
+    }
+    let eof = this.recv()?
+    if (!isEof(eof)) {
+      fail transportError("the server sent no EOF after ${count} column " + "definitions")
+    }
+    return out
+  }
+
+  // Row packets until the closing EOF or OK.
+  //
+  // Bounded by `queryPacketBudget`.
+  rows(out: myRows): ()! {
+    let seen = 0
+    while (seen < queryPacketBudget) {
+      seen = seen + 1
+      let p = this.recv()?
+      if (packetKind(p) == 255) {
+        fail newError(errorText(p))
+      }
+      if (isEof(p)) {
+        return
+      }
+      out.rows = append(out.rows, decodeRow(p)?)
+    }
+    fail transportError("the server sent ${queryPacketBudget} packets without " + "ending the result set")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("mysql: exec is not implemented yet (epic #3986)")
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("mysql: prepare is not implemented yet (epic #3986)")
+  }
+
+  begin(): Tx! {
+    fail newError("mysql: begin is not implemented yet (epic #3986)")
+  }
+
+  // Best effort: tell the server we are going (COM_QUIT), then drop the socket.
+  // A write failure here is ignored — the socket is being closed either way and
+  // `Conn.close` cannot report anything.
+  close() {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    this.w.startCommand()
+    this.w.send(writeLe(comQuit, 1)) catch _ {
+      this.w.s.shut()
+      return
+    }
+    this.w.s.shut()
+  }
+}
+
+// An EOF packet: 0xFE in a payload shorter than nine bytes. The length test is
+// not optional — 0xFE also introduces an eight-byte length-encoded integer, so a
+// long row can legally start with the same byte.
+fn isEof(payload: string): bool {
+  return packetKind(payload) == 254 && len(payload) < 9
+}
+
+// A column definition: six length-encoded strings, of which the fifth is the
+// name the caller sees. The fixed-width tail after them is not read.
+fn columnName(payload: string): string! {
+  let c = cursor{ s: payload, at: 0 }
+  let i = 0
+  let name = ""
+  while (i < 5) {
+    name = lenEncString(c)?
+    i = i + 1
+  }
+  return name
+}
+
+// A length-encoded string: a length, then that many bytes.
+fn lenEncString(c: cursor): string! {
+  let n = readLenEnc(c)?
+  if (n < 0) {
+    return ""
+  }
+  return c.take(n)?
+}
+
+// A text-protocol row: one length-encoded string per column, with 0xFB meaning
+// SQL NULL — the distinction `Value.Null` exists to keep, and the one an empty
+// string would erase.
+//
+// Bounded: every iteration consumes at least one byte of the packet.
+fn decodeRow(payload: string): []Value! {
+  let c = cursor{ s: payload, at: 0 }
+  let out = []Value(0)
+  while (c.rest() > 0) {
+    let n = readLenEnc(c)?
+    if (n < 0) {
+      out = append(out, Value.Null)
+      continue
+    }
+    out = append(out, Value.Text(c.take(n)?))
+  }
+  return out
+}
+
+// A materialized result set. The whole response is already in memory by the time
+// `query` returns — COM_QUERY has no cursor — so `next` is a walk over rows
+// already read, and `close` has nothing to release.
+class myRows {
+  cols: []string
+  rows: [][]Value
+  at: int
+  next(): bool! {
+    this.at = this.at + 1
+    return this.at < len(this.rows)
+  }
+
+  columns(): []string {
+    return this.cols
+  }
+
+  value(col: int): Value {
+    if (this.at < 0 || this.at >= len(this.rows)) {
+      return Value.Null
+    }
+    let row = this.rows[this.at]
+    if (col < 0 || col >= len(row)) {
+      return Value.Null
+    }
+    return row[col]
+  }
+
+  close() {}
+}
