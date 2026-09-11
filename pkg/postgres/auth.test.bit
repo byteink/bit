@@ -1,0 +1,346 @@
+// pkg/postgres/auth.test.bit — the startup exchange, driven against an
+// in-process fake backend (#3987).
+//
+// `fakeBackend` is a `pgStream`, so `startup` runs here byte for byte as it
+// runs over a socket: it answers the frontend's messages the way a real server
+// does, and for SCRAM it is a REAL server side — it derives `StoredKey` and
+// `ServerKey` with PBKDF2/HMAC and verifies the client's proof, rather than
+// replaying a captured transcript. That is what makes the negative cases
+// meaningful: a client that skipped the server-signature check would still
+// pass a replayed transcript.
+
+// The SCRAM parameters the fake server uses. 4096 is RFC 7677's floor.
+const fakeIters: int = 4096
+
+// A backend that answers one startup exchange. `method` selects which
+// `Authentication*` message it opens with.
+class fakeBackend {
+  method: string
+  password: string
+  serverNonce: string
+  out: string
+  greeted: bool
+  clientFirstBare: string
+  serverFirst: string
+  // Bytes the client has not yet consumed. Empty means end of stream, which is
+  // what a `take` past the transcript must see.
+  readUp(n: int): string! {
+    let take = n
+    if (take > len(this.out)) {
+      take = len(this.out)
+    }
+    let head = this.out[0:take]
+    this.out = this.out[take:len(this.out)]
+    return head
+  }
+
+  // The first write is the StartupMessage (untagged); every later one is a
+  // tagged `PasswordMessage`/`SASLResponse`.
+  writeAll(s: string): ()! {
+    if (!this.greeted) {
+      this.greeted = true
+      this.out = this.out + this.challenge()
+      return
+    }
+    this.out = this.out + this.answer(s[5:len(s)])?
+  }
+
+  shut() {
+  }
+
+  // The `Authentication*` message this backend opens with.
+  challenge(): string {
+    if (this.method == "trust") {
+      return authMessage(0, "") + readyForQuery()
+    }
+    if (this.method == "password") {
+      return authMessage(3, "")
+    }
+    if (this.method == "md5") {
+      return authMessage(5, "SALT")
+    }
+    return authMessage(10, cstr("SCRAM-SHA-256") + string([]byte(1)))
+  }
+
+  // One frontend `p` message. `scram-silent` is the backend that opens with
+  // SASL and then answers nothing, used to build the "AuthenticationOk with no
+  // server signature" case below.
+  answer(body: string): string! {
+    if (this.method == "scram-silent") {
+      return ""
+    }
+    if (this.method == "password") {
+      return this.checkSecret(body, cstr(this.password))
+    }
+    if (this.method == "md5") {
+      return this.checkSecret(body, cstr(md5Expected(this.password)))
+    }
+    return this.scram(body)?
+  }
+
+  // Cleartext and md5 both come down to "is this the value we expected".
+  checkSecret(got: string, want: string): string {
+    if (got != want) {
+      return errorResponse("28P01", "password authentication failed") +
+        readyForQuery()
+    }
+    return authMessage(0, "") + readyForQuery()
+  }
+
+  // The two SCRAM round trips.
+  scram(body: string): string! {
+    if (this.clientFirstBare == "") {
+      return this.scramFirst(body)?
+    }
+    return this.scramFinal(body)?
+  }
+
+  // SASLInitialResponse: the mechanism name, a length, then the client-first
+  // message. The reply is `r=`, `s=`, `i=` with the client's nonce extended.
+  scramFirst(body: string): string! {
+    let (mech, after) = readCstr(body, 0)?
+    assert(mech == "SCRAM-SHA-256", "fake backend got mechanism ${mech}")
+    let clientFirst = body[after + 4:len(body)]
+    this.clientFirstBare = clientFirst[3:len(clientFirst)]
+    let nonce = clientNonceOf(this.clientFirstBare) + this.serverNonce
+    this.serverFirst = "r=${nonce},s=${encodeBase64([]byte("pgsalt"))},i=${fakeIters}"
+    return authMessage(11, this.serverFirst)
+  }
+
+  // SASLResponse: verify `ClientProof` the way RFC 5802 §5 says a server does
+  // — recover `ClientKey` from the proof and check its hash against
+  // `StoredKey` — then send `ServerSignature` back.
+  scramFinal(body: string): string! {
+    let withoutProof = beforeProof(body)
+    let auth = []byte("${this.clientFirstBare},${this.serverFirst},${withoutProof}")
+    let salted = fakeSalted(this.password)
+    let stored = digest(newSha256(), hmac(newSha256, salted, []byte("Client Key")))
+    let recovered = xorBytes(decodeBase64(proofOf(body))?,
+      hmac(newSha256, stored, auth))
+    if (!ctEq(digest(newSha256(), recovered), stored)) {
+      return errorResponse("28P01", "SCRAM proof mismatch") + readyForQuery()
+    }
+    let sig = hmac(newSha256, hmac(newSha256, salted, []byte("Server Key")), auth)
+    return authMessage(12, "v=${encodeBase64(sig)}") + authMessage(0, "") +
+      readyForQuery()
+  }
+}
+
+// The salted password both sides of the fake exchange derive.
+fn fakeSalted(password: string): []byte {
+  return pbkdf2(newSha256, []byte(password), []byte("pgsalt"), fakeIters, 32)
+}
+
+// The md5 response the fake backend expects, for salt "SALT" and user "app".
+fn md5Expected(password: string): string {
+  let inner = encodeHex(digest(newMd5(), []byte(password + "app")))
+  return "md5" + encodeHex(digest(newMd5(), []byte(inner + "SALT")))
+}
+
+// `r=<nonce>` out of a client-first-bare message.
+fn clientNonceOf(bare: string): string {
+  let attrs = split(bare, ",")
+  let i = 0
+  while (i < len(attrs)) {
+    if (hasPrefix(attrs[i], "r=")) {
+      return attrs[i][2:len(attrs[i])]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// Everything in a client-final message before `,p=`.
+fn beforeProof(body: string): string {
+  let at = indexOf(body, ",p=")
+  return body[0:at]
+}
+
+// The base64 `p=` proof out of a client-final message.
+fn proofOf(body: string): string {
+  let at = indexOf(body, ",p=")
+  return body[at + 3:len(body)]
+}
+
+// A tagged backend message.
+fn backendMessage(tag: string, body: string): string {
+  return tag + be32(len(body) + 4) + body
+}
+
+// An `Authentication*` message: the four-byte code, then its payload.
+fn authMessage(code: int, payload: string): string {
+  return backendMessage("R", be32(code) + payload)
+}
+
+// `ReadyForQuery`, idle.
+fn readyForQuery(): string {
+  return backendMessage("Z", "I")
+}
+
+// An `ErrorResponse` carrying severity, SQLSTATE and message.
+fn errorResponse(code: string, message: string): string {
+  return backendMessage("E", "S" + cstr("FATAL") + "C" + cstr(code) + "M" +
+    cstr(message) + string([]byte(1)))
+}
+
+// Run one startup exchange against a fake backend and report what happened.
+fn runStartup(method: string, password: string, nonce: string): (warnOnce, string) {
+  let b = fakeBackend{
+    method: method, password: password, serverNonce: nonce, out: "",
+    greeted: false, clientFirstBare: "", serverFirst: "",
+  }
+  let w = newWarnOnce()
+  let t = target{
+    host: "fake", port: 5432, user: "app", password: password,
+    database: "dev", mode: SslMode.Negotiate, pinned: false,
+  }
+  startup(pgReader{ s: b, buf: "" }, b, t, w) catch e {
+    return (w, e.message())
+  }
+  return (w, "")
+}
+
+test "trust: the exchange completes with no credential and warns once" {
+  let (w, err) = runStartup("trust", "", "srv")
+  assert(err == "", "trust failed: ${err}")
+  assert(w.authLines == 1, "trust emitted ${w.authLines} warning lines")
+}
+
+test "cleartext password: the exchange completes and warns once" {
+  let (w, err) = runStartup("password", "pw", "srv")
+  assert(err == "", "password failed: ${err}")
+  assert(w.authLines == 1, "password emitted ${w.authLines} warning lines")
+}
+
+test "md5: the exchange completes and warns once" {
+  let (w, err) = runStartup("md5", "pw", "srv")
+  assert(err == "", "md5 failed: ${err}")
+  assert(w.authLines == 1, "md5 emitted ${w.authLines} warning lines")
+}
+
+test "scram-sha-256: the exchange completes and warns not at all" {
+  let (w, err) = runStartup("scram", "pw", "srvnonce")
+  assert(err == "", "scram failed: ${err}")
+  assert(w.authLines == 0, "scram emitted ${w.authLines} warning lines")
+}
+
+test "a wrong password is reported as the server's own error" {
+  let b = fakeBackend{
+    method: "password", password: "right", serverNonce: "srv", out: "",
+    greeted: false, clientFirstBare: "", serverFirst: "",
+  }
+  let w = newWarnOnce()
+  let t = target{
+    host: "fake", port: 5432, user: "app", password: "wrong", database: "dev",
+    mode: SslMode.Negotiate, pinned: false,
+  }
+  let err = ""
+  startup(pgReader{ s: b, buf: "" }, b, t, w) catch e {
+    err = e.message()
+  }
+  assert(contains(err, "28P01"), "expected the server's SQLSTATE, got: ${err}")
+}
+
+test "a wrong SCRAM server signature is refused" {
+  let c = newScram("pw")
+  let first = scramClientFirst(c)
+  let bare = first[3:len(first)]
+  let serverFirst = "r=${clientNonceOf(bare)}srv,s=${encodeBase64([]byte("pgsalt"))}," +
+    "i=${fakeIters}"
+  let final = scramClientFinal(c, serverFirst) catch e {
+    panic("client-final: ${e.message()}")
+  }
+  assert(len(final) > 0, "no client-final message")
+  let err = ""
+  scramVerify(c, "v=${encodeBase64([]byte("not the server signature at all"))}") catch e {
+    err = e.message()
+  }
+  assert(contains(err, "server signature mismatch"),
+    "a forged server signature was accepted: '${err}'")
+  assert(!c.verified, "verified stayed true after a forged signature")
+}
+
+test "the right SCRAM server signature is accepted" {
+  let c = newScram("pw")
+  let first = scramClientFirst(c)
+  let bare = first[3:len(first)]
+  let serverFirst = "r=${clientNonceOf(bare)}srv,s=${encodeBase64([]byte("pgsalt"))}," +
+    "i=${fakeIters}"
+  let final = scramClientFinal(c, serverFirst) catch e {
+    panic("client-final: ${e.message()}")
+  }
+  let auth = []byte("${bare},${serverFirst},${beforeProof(final)}")
+  let sig = hmac(newSha256, hmac(newSha256, fakeSalted("pw"), []byte("Server Key")), auth)
+  scramVerify(c, "v=${encodeBase64(sig)}") catch e {
+    panic("a correct server signature was refused: ${e.message()}")
+  }
+  assert(c.verified, "verified stayed false after a correct signature")
+}
+
+// The failure message `scramClientFinal` produced for `serverFirst`, or "" if
+// it produced a message instead. A helper because a `catch` on a value-producing
+// call has to divert (E0067), which a test body cannot do mid-way.
+fn finalError(c: scramClient, serverFirst: string): string {
+  let out = scramClientFinal(c, serverFirst) catch e {
+    return e.message()
+  }
+  assert(len(out) > 0, "a client-final message must not be empty")
+  return ""
+}
+
+test "a SCRAM server nonce that does not extend the client's is a replay" {
+  let err = finalError(newScram("pw"),
+    "r=somebodyelse,s=${encodeBase64([]byte("pgsalt"))},i=${fakeIters}")
+  assert(contains(err, "does not extend the client"), "message: ${err}")
+}
+
+test "a SCRAM iteration count below RFC 7677's floor is refused" {
+  let c = newScram("pw")
+  let first = scramClientFirst(c)
+  let bare = first[3:len(first)]
+  let err = finalError(c,
+    "r=${clientNonceOf(bare)}srv,s=${encodeBase64([]byte("s"))},i=1024")
+  assert(contains(err, "below RFC 7677's floor"), "message: ${err}")
+}
+
+test "AuthenticationOk after a SCRAM run with no verified signature is refused" {
+  let b = fakeBackend{
+    method: "scram-silent", password: "pw", serverNonce: "srv", out: "",
+    greeted: false, clientFirstBare: "", serverFirst: "",
+  }
+  let w = newWarnOnce()
+  let t = target{
+    host: "fake", port: 5432, user: "app", password: "pw", database: "dev",
+    mode: SslMode.Negotiate, pinned: false,
+  }
+  // The backend opens with SASL, then jumps straight to AuthenticationOk,
+  // skipping the server-final message that carries its proof.
+  b.out = b.challenge() + authMessage(0, "") + readyForQuery()
+  b.greeted = true
+  let err = ""
+  startup(pgReader{ s: b, buf: "" }, b, t, w) catch e {
+    err = e.message()
+  }
+  assert(contains(err, "without ever proving its SCRAM server signature"),
+    "message: ${err}")
+}
+
+test "the ssl warning fires once for ten connections, not ten times" {
+  let w = newWarnOnce()
+  let i = 0
+  while (i < 10) {
+    warnSslMode(w, SslMode.Disable)
+    i = i + 1
+  }
+  assert(w.sslLines == 1, "ten connections emitted ${w.sslLines} lines")
+  assert(contains(sslWarningText(SslMode.Disable), "sslmode=disable"),
+    "the disable warning does not name sslmode=disable")
+  assert(contains(sslWarningText(SslMode.Require), "sslmode=require"),
+    "the require warning does not name sslmode=require")
+}
+
+test "verify-full emits no warning at all" {
+  let w = newWarnOnce()
+  warnSslMode(w, SslMode.VerifyFull)
+  assert(w.sslLines == 0, "verify-full emitted ${w.sslLines} lines")
+}

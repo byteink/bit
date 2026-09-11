@@ -1,0 +1,311 @@
+// pkg/postgres/adapter.bit — the package's entire public surface.
+//
+//     import { pool, Datasource } from "std/sql"
+//     import { adapter } from "bitlang.org/pkg/postgres"
+//
+//     let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL")? })?
+//
+// ONE EXPORTED SYMBOL, `adapter`. URI parsing is not exported beside it on
+// purpose: the one-line driver swap is the whole design of `std/sql`, and a
+// second import from this package would break it. Everything else in this
+// module is private.
+//
+// WHY A FUNCTION AND NOT `export let adapter: Adapter`. A module-level `let`
+// may only hold an untraced scalar (SPEC §11.11) — an interface value is a
+// compile error there, not a style preference — so a package-level singleton
+// adapter is not expressible. Returning a fresh value per call is also the
+// more correct shape for the warn-once state below: "once per pool" is what
+// the ticket asks for, and a process-wide singleton would silently make it
+// "once per process", so the second pool in a program would connect with
+// `sslmode=disable` and say nothing.
+//
+// AUTHENTICATION IS BEST-EFFORT-STRONGEST, NEVER REFUSING. SCRAM-SHA-256 is
+// used whenever the server offers it; md5, cleartext `password` and `trust`
+// all connect, each warning once. Refusing them was the first draft and was
+// rejected on 2026-08-30: a stock local Postgres uses `trust` or `md5`, and a
+// driver that will not talk to it is a driver nobody can start with.
+
+import { Adapter, Conn, Rows, Stmt, Tx, Value, transportError } from "std/sql"
+import { Mutex, newMutex } from "std/sync"
+import { systemRoots, encodeHex, newMd5 } from "std/crypto"
+import { stderr } from "std/io"
+
+// How many backend messages one startup exchange may take before this gives
+// up. Generous — a real one is under ten (a few `ParameterStatus`, the auth
+// round trips, `BackendKeyData`, `ReadyForQuery`) — and finite, so a server
+// that never sends `ReadyForQuery` cannot park a caller forever.
+const startupMessageBudget: int = 256
+
+// How many messages one simple query may return. `select 1` uses four.
+const queryMessageBudget: int = 4096
+
+// A Postgres `Adapter` for `std/sql.pool`, plus the state that makes a
+// downgrade warning fire once for the whole pool rather than once per
+// connection. `pool` opens connections from several green threads, so the
+// flags are behind a mutex — two threads racing the first connect would
+// otherwise print the same line twice, which is the exact thing being avoided.
+class pgAdapter {
+  warn: warnOnce
+  roots: TrustStore
+  rootsLoaded: bool
+  mu: Mutex
+  // `Adapter.connect`: one physical connection, negotiated, authenticated and
+  // idle at `ReadyForQuery`.
+  connect(cfg: Datasource): Conn! {
+    let t = targetOf(cfg)?
+    let (s, _) = openStream(t, this.warn, this.trustRoots()?)?
+    let c = pgConn{ r: pgReader{ s: s, buf: "" }, s: s, closed: false }
+    startup(c.r, s, t, this.warn) catch e {
+      s.shut()
+      fail e
+    }
+    return c
+  }
+
+  // The OS trust store, parsed once per adapter. `systemRoots()` reads and
+  // parses the whole CA bundle (~170ms), so paying it per connection would
+  // dominate the connect time of an entire pool.
+  trustRoots(): TrustStore! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (!this.rootsLoaded) {
+      let sys = systemRoots()?
+      this.roots = TrustStore{ roots: sys.roots }
+      this.rootsLoaded = true
+    }
+    return this.roots
+  }
+}
+
+// The Postgres adapter. Pass it to `std/sql.pool`; one value per pool.
+export fn adapter(): Adapter {
+  return newPgAdapter()
+}
+
+// The concrete adapter, so this module's own tests can reach `warn` — the
+// exported `adapter` deliberately hands back an `Adapter`, which has no fields.
+fn newPgAdapter(): pgAdapter {
+  return pgAdapter{
+    warn: newWarnOnce(),
+    roots: TrustStore{ roots: []Certificate(0) },
+    rootsLoaded: false,
+    mu: newMutex(),
+  }
+}
+
+// A pool's warning state, nothing said yet.
+fn newWarnOnce(): warnOnce {
+  return warnOnce{
+    mu: newMutex(), sslLines: 0, authLines: 0, sslLine: "", authLine: "",
+  }
+}
+
+// The two once-per-pool warnings: one for a TLS mode below verify-full, one
+// for an authentication method below SCRAM. Two flags, not one, because they
+// are independent facts and a connection can be weak in either dimension.
+class warnOnce {
+  mu: Mutex
+  // How many lines of each kind have actually been emitted. A counter rather
+  // than a bool because "once per pool, not once per connection" is a claim
+  // about a NUMBER of lines, and a bool cannot fail the way the claim can —
+  // `auth.test.bit` asserts these are 1 after ten connections.
+  sslLines: int
+  authLines: int
+  // The exact lines emitted, kept so a test can assert what a warning SAID —
+  // "warns once naming require" is a claim about the text, and a count alone
+  // cannot fail it.
+  sslLine: string
+  authLine: string
+}
+
+// Warn about the negotiated TLS mode, at most once for this pool. verify-full
+// is the goal and says nothing.
+fn warnSslMode(w: warnOnce, mode: SslMode) {
+  if (mode == SslMode.VerifyFull) {
+    return
+  }
+  w.mu.lock()
+  defer w.mu.unlock()
+  if (w.sslLines != 0) {
+    return
+  }
+  w.sslLines = 1
+  w.sslLine = sslWarningText(mode)
+  emit(w.sslLine)
+}
+
+// One line per mode, saying what an operator loses by being on that rung.
+fn sslWarningText(mode: SslMode): string {
+  let name = sslModeName(mode)
+  if (mode == SslMode.Disable) {
+    return "postgres: connected with sslmode=${name} — credentials and query " +
+      "results cross the network in the clear."
+  }
+  if (mode == SslMode.VerifyCa) {
+    return "postgres: connected with sslmode=${name} — the certificate chain " +
+      "is verified, but the name on it is not checked against the host that " +
+      "was dialled."
+  }
+  return "postgres: connected with sslmode=${name} — encrypted, but the " +
+    "server's certificate is not verified; an active man-in-the-middle is " +
+    "not detected."
+}
+
+// Warn about the authentication method, at most once for this pool.
+fn warnAuthMethod(w: warnOnce, method: string) {
+  if (method == "scram-sha-256") {
+    return
+  }
+  w.mu.lock()
+  defer w.mu.unlock()
+  if (w.authLines != 0) {
+    return
+  }
+  w.authLines = 1
+  w.authLine = authWarningText(method)
+  emit(w.authLine)
+}
+
+// One line per method, naming the method and the fix.
+fn authWarningText(method: string): string {
+  if (method == "md5") {
+    return "postgres: authenticated with md5 — the server's stored value is " +
+      "password-equivalent. Set password_encryption = scram-sha-256 and reset " +
+      "the role's password."
+  }
+  if (method == "password") {
+    return "postgres: authenticated with cleartext password — the password " +
+      "itself crossed the connection. Set password_encryption = " +
+      "scram-sha-256 and reset the role's password."
+  }
+  return "postgres: authenticated with ${method} — the server asked for no " +
+    "credential at all, so anything that can reach the port is this role. " +
+    "Set the role a password and require scram-sha-256 in pg_hba.conf."
+}
+
+// Warnings go to stderr, never stdout: stdout is a program's output and a
+// driver has no business writing to it. A failed write is dropped — losing a
+// warning must never fail a connection that otherwise succeeded.
+fn emit(line: string) {
+  stderr().write(line + "\n") catch _ {
+    return
+  }
+}
+
+// Send the StartupMessage and drive the exchange to `ReadyForQuery`.
+//
+// Bounded by `startupMessageBudget`.
+fn startup(r: pgReader, s: pgStream, t: target, w: warnOnce): ()! {
+  s.writeAll(startupMessage(t.user, t.database))?
+  let st = authSession{
+    r: r, s: s, t: t, w: w, sc: newScram(t.password), method: "trust",
+  }
+  let seen = 0
+  while (seen < startupMessageBudget) {
+    seen = seen + 1
+    let m = r.next()?
+    if (m.tag == "E") {
+      fail newError(errorText(m.body))
+    }
+    if (m.tag == "R") {
+      st.step(m.body)?
+      continue
+    }
+    if (m.tag == "Z") {
+      warnAuthMethod(w, st.method)
+      return
+    }
+  }
+  fail newError("postgres: the server sent ${startupMessageBudget} messages " +
+    "without ever reaching ReadyForQuery")
+}
+
+// The state one startup exchange carries between `Authentication*` messages:
+// the SCRAM run in progress and which method ended up being used. `sc` is
+// built eagerly (a nonce is 18 random bytes) so there is no unset case.
+class authSession {
+  r: pgReader
+  s: pgStream
+  t: target
+  w: warnOnce
+  sc: scramClient
+  method: string
+  // One `Authentication*` message. The code is the first four bytes of the
+  // body; everything after it is that code's own payload.
+  step(body: string): ()! {
+    let code = readBe32(body, 0)?
+    let rest = body[4:len(body)]
+    if (code == 0) {
+      return this.finish()?
+    }
+    if (code == 3) {
+      this.method = "password"
+      return writeMessage(this.s, "p", cstr(this.t.password))?
+    }
+    if (code == 5) {
+      this.method = "md5"
+      return writeMessage(this.s, "p", cstr(md5Response(this.t, rest)?))?
+    }
+    return this.sasl(code, rest)?
+  }
+
+  // AuthenticationOk. A `trust` connection reaches it without any exchange at
+  // all, which is exactly what `method` still being its initial value means.
+  // A SCRAM run that got here without a verified server signature is refused:
+  // that is the mutual half of SCRAM, and skipping it would accept an
+  // `AuthenticationOk` from anything that can answer the port.
+  finish(): ()! {
+    if (this.method == "scram-sha-256" && !this.sc.verified) {
+      fail newError("postgres: the server sent AuthenticationOk without ever " +
+        "proving its SCRAM server signature")
+    }
+  }
+
+  // The three SASL messages. Anything else — Kerberos, GSSAPI, SSPI — is named
+  // rather than reported as a generic protocol error.
+  sasl(code: int, rest: string): ()! {
+    if (code == 10) {
+      return this.saslInit(rest)?
+    }
+    if (code == 11) {
+      return writeMessage(this.s, "p", scramClientFinal(this.sc, rest)?)?
+    }
+    if (code == 12) {
+      return scramVerify(this.sc, rest)?
+    }
+    fail newError("postgres: the server asked for authentication method " +
+      "${code}, which this driver does not implement")
+  }
+
+  // AuthenticationSASL: a `\0`-terminated list of mechanism names, closed by a
+  // bare `\0`. Only `SCRAM-SHA-256` is offered back — `SCRAM-SHA-256-PLUS` is
+  // channel binding, a different mechanism this driver does not implement.
+  saslInit(rest: string): ()! {
+    if (!offersScram(mechanismList(rest))) {
+      fail newError("postgres: the server offers no SASL mechanism this " +
+        "driver implements; it asked for: ${rest}")
+    }
+    this.method = "scram-sha-256"
+    let first = scramClientFirst(this.sc)
+    writeMessage(this.s, "p", cstr(scramSha256) + be32(len(first)) + first)?
+  }
+}
+
+// Split the mechanism list on its `\0` separators. A trailing empty entry (the
+// list's own closing `\0`) never matches a mechanism name, so it needs no
+// special case.
+fn mechanismList(rest: string): []string {
+  return split(rest, string([]byte(1)))
+}
+
+// The md5 response: `md5` followed by the hex of
+// `md5(hex(md5(password + user)) + salt)`, where `salt` is the four bytes the
+// server sent. Kept because a stock server still ships it; the warning above
+// says what it costs.
+fn md5Response(t: target, rest: string): string! {
+  if (len(rest) < 4) {
+    fail newError("postgres: AuthenticationMD5Password carried no 4-byte salt")
+  }
+  let inner = encodeHex(digest(newMd5(), []byte(t.password + t.user)))
+  return "md5" + encodeHex(digest(newMd5(), []byte(inner + rest[0:4])))
+}

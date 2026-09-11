@@ -1,0 +1,268 @@
+// pkg/postgres/uri.bit — turning a `Datasource` into something to connect to.
+//
+// `std/sql` deliberately exports no `parseUrl` (see stdlib/sql/config.bit):
+// every database spells its TLS setting differently, so reading the URI is
+// the adapter's job. This file is that reading, and nothing here is exported
+// — `adapter` is the package's only public symbol, so URI parsing stays
+// behind the `Adapter` interface where the one-line driver swap needs it.
+//
+// AN UNRECOGNISED `sslmode=` IS REJECTED, NOT DEFAULTED. The typed half of
+// the configuration (`Datasource.sslmode`) cannot hold a wrong value; the
+// string half can, and a typo silently falling back to the ladder would turn
+// a production `sslmode=verify-fulll` into an unauthenticated connection.
+//
+// libpq's `prefer` and `allow` are deliberately absent from `sslModeOf`'s
+// table rather than special-cased: they name a *fallback* policy, which is
+// what omitting `sslmode` already asks for. Being absent, they are rejected
+// by the same line every other typo is.
+
+// Imports are per MODULE, not per file (SPEC 17.1): every `.bit` file under
+// `pkg/postgres/` shares one namespace, so a symbol may be imported in exactly
+// one of them. These are the module's `std/sql` configuration types and its
+// string helpers, used from here, `scram.bit`, `tlsnegotiate.bit` and
+// `adapter.bit` alike.
+import { Datasource, SslMode } from "std/sql"
+import { hasPrefix, indexOf, lastIndexOf, split, parseInt } from "std/strings"
+// `contains` is used only by this module's tests; the import is here because
+// imports are per module and a `.test.bit` file shares this namespace.
+import { contains } from "std/strings"
+
+// Postgres's assigned port. `std/sql` knows no port numbers — `Datasource.port`
+// is 0 by default and each adapter supplies its own.
+const defaultPort: int = 5432
+
+// Where to connect and how hard to insist on TLS, after both forms of
+// `Datasource` have been reduced to one shape.
+//
+// `pinned` is the whole point of the type: it records that the *caller* named
+// a TLS mode, in the URI or in the field, which makes `mode` a floor that
+// fails rather than a preference that downgrades.
+class target {
+  host: string
+  port: int
+  user: string
+  password: string
+  database: string
+  mode: SslMode
+  pinned: bool
+}
+
+// Reduce either form of `Datasource` — `uri`, or the individual fields — to
+// one `target`. `pool` has already called `cfg.validate()`, so exactly one of
+// the two forms is in use and this never sees both or neither.
+fn targetOf(cfg: Datasource): target! {
+  if (cfg.uri != "") {
+    return parseUri(cfg.uri)?
+  }
+  return target{
+    host: cfg.host,
+    port: portOr(cfg.port),
+    user: cfg.user,
+    password: cfg.password,
+    database: cfg.database,
+    mode: cfg.sslmode,
+    pinned: cfg.sslmode != SslMode.Negotiate,
+  }
+}
+
+// 0 means "the adapter's own default", which is 5432 here.
+fn portOr(p: i64): int {
+  if (p == 0) {
+    return defaultPort
+  }
+  return p
+}
+
+// `postgres://user:password@host:port/database?sslmode=...`, with
+// `postgresql://` accepted for the same thing — both spellings are in
+// Postgres's own documentation and a URI copied out of a connection string
+// generator uses either.
+fn parseUri(uri: string): target! {
+  let rest = afterScheme(uri)?
+  let (beforeQuery, query) = cut(rest, "?")
+  let (authority, database) = cut(beforeQuery, "/")
+  let (userinfo, hostport, _) = cutLast(authority, "@")
+  let t = target{
+    host: "", port: defaultPort, user: "", password: "",
+    database: pctDecode(database)?, mode: SslMode.Negotiate, pinned: false,
+  }
+  splitUserinfo(t, userinfo)?
+  splitHostPort(t, hostport)?
+  applyQuery(t, query)?
+  if (t.host == "") {
+    fail newError("postgres: connection URI names no host: ${uri}")
+  }
+  return t
+}
+
+// Strip `postgres://` or `postgresql://`. Anything else is not this driver's
+// URI and is refused by scheme rather than misparsed as a host.
+fn afterScheme(uri: string): string! {
+  if (hasPrefix(uri, "postgres://")) {
+    return uri[11:len(uri)]
+  }
+  if (hasPrefix(uri, "postgresql://")) {
+    return uri[13:len(uri)]
+  }
+  fail newError("postgres: connection URI must start with postgres:// or " +
+    "postgresql://, got: ${uri}")
+}
+
+// `user`, `user:password`, or empty. Percent-decoded, because a password
+// containing `@`, `/` or `?` can only appear in a URI escaped.
+fn splitUserinfo(t: target, userinfo: string): ()! {
+  if (userinfo == "") {
+    return
+  }
+  let (user, password) = cut(userinfo, ":")
+  t.user = pctDecode(user)?
+  t.password = pctDecode(password)?
+}
+
+// `host`, or `host:port`. The port must be a number in range — a URI naming
+// `:5432x` is a typo, and defaulting it would connect somewhere unintended.
+fn splitHostPort(t: target, hostport: string): ()! {
+  let (host, port, hasPort) = cutLast(hostport, ":")
+  if (!hasPort) {
+    t.host = pctDecode(hostport)?
+    return
+  }
+  t.host = pctDecode(host)?
+  if (port == "") {
+    return
+  }
+  let n = parseInt(port) catch _ {
+    fail newError("postgres: connection URI port is not a number: ${port}")
+  }
+  if (n < 1 || n > 65535) {
+    fail newError("postgres: connection URI port is out of range: ${n}")
+  }
+  t.port = n
+}
+
+// The query string. Only `sslmode` is understood; every other key fails
+// naming itself, because silently dropping a parameter the caller wrote is
+// how a connection ends up not doing what its URI says.
+fn applyQuery(t: target, query: string): ()! {
+  if (query == "") {
+    return
+  }
+  let parts = split(query, "&")
+  let i = 0
+  while (i < len(parts)) {
+    applyParam(t, parts[i])?
+    i = i + 1
+  }
+}
+
+// One `key=value` pair.
+fn applyParam(t: target, param: string): ()! {
+  if (param == "") {
+    return
+  }
+  let (key, value) = cut(param, "=")
+  if (key != "sslmode") {
+    fail newError("postgres: connection URI parameter '${key}' is not " +
+      "supported; this driver reads sslmode only")
+  }
+  t.mode = sslModeOf(pctDecode(value)?)?
+  t.pinned = true
+}
+
+// The four spellings that name a mode. Everything else — including libpq's
+// `prefer` and `allow`, which ask for the fallback behaviour that omitting
+// `sslmode` already gives — is rejected naming the accepted set.
+fn sslModeOf(value: string): SslMode! {
+  if (value == "disable") {
+    return SslMode.Disable
+  }
+  if (value == "require") {
+    return SslMode.Require
+  }
+  if (value == "verify-ca") {
+    return SslMode.VerifyCa
+  }
+  if (value == "verify-full") {
+    return SslMode.VerifyFull
+  }
+  fail newError("postgres: unrecognised sslmode value '${value}'; expected " +
+    "one of disable, require, verify-ca, verify-full, or no sslmode at all " +
+    "to negotiate the strongest the server accepts")
+}
+
+// The name a mode is reported by, in warnings and in failures. One table, so
+// a message can never disagree with what was actually negotiated.
+fn sslModeName(mode: SslMode): string {
+  match (mode) {
+    Negotiate => return "negotiate"
+    VerifyFull => return "verify-full"
+    VerifyCa => return "verify-ca"
+    Require => return "require"
+    Disable => return "disable"
+  }
+}
+
+// Split at the FIRST `sep`; the separator and everything after it is the
+// second half, and an absent separator leaves it empty.
+fn cut(s: string, sep: string): (string, string) {
+  let at = indexOf(s, sep)
+  if (at < 0) {
+    return (s, "")
+  }
+  return (s[0:at], s[at + len(sep):len(s)])
+}
+
+// Split at the LAST `sep`, reporting whether there was one. `@` in a userinfo
+// and `:` in a host:port both bind rightmost — a password may legally contain
+// an unescaped `@` in practice, and binding leftmost would cut the authority in
+// the wrong place.
+//
+// The third result is not decoration: `a@h` and `h` split the same way only if
+// the caller can tell an absent separator from an empty first half, and the two
+// callers below want opposite defaults for it.
+fn cutLast(s: string, sep: string): (string, string, bool) {
+  let at = lastIndexOf(s, sep)
+  if (at < 0) {
+    return ("", s, false)
+  }
+  return (s[0:at], s[at + len(sep):len(s)], true)
+}
+
+// Percent-decoding (RFC 3986 §2.1). A truncated or non-hex escape fails
+// rather than being passed through: `%zz` in a password is a broken URI, and
+// treating it literally would send the wrong credential to the server.
+fn pctDecode(s: string): string! {
+  if (indexOf(s, "%") < 0) {
+    return s
+  }
+  let src = []byte(s)
+  let out = []byte(0)
+  let i = 0
+  while (i < len(src)) {
+    if (src[i] != 37) {
+      out = append(out, src[i])
+      i = i + 1
+      continue
+    }
+    if (i + 2 >= len(src)) {
+      fail newError("postgres: truncated percent-escape in connection URI")
+    }
+    out = append(out, byte(hexNibble(src[i + 1])? * 16 + hexNibble(src[i + 2])?))
+    i = i + 3
+  }
+  return string(out)
+}
+
+// One hex digit as 0..15.
+fn hexNibble(c: byte): int! {
+  if (c >= 48 && c <= 57) {
+    return int(c) - 48
+  }
+  if (c >= 97 && c <= 102) {
+    return int(c) - 97 + 10
+  }
+  if (c >= 65 && c <= 70) {
+    return int(c) - 65 + 10
+  }
+  fail newError("postgres: bad percent-escape in connection URI")
+}
