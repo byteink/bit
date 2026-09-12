@@ -13,6 +13,15 @@ Reach for these first. They open, transfer, and close in one call.
 
 The entire contents of `path`.
 
+### `readFileNoFollow(path: string): string!`
+
+The entire contents of `path`, refusing the read outright when the final path
+component is a symlink instead of following it. Use this in place of
+`readFile` when the caller has already decided, from a separate check, that
+`path` must not be a link, and needs that decision to still hold at read
+time — `readFile` on the same path would follow whatever the name resolves to
+by then.
+
 ### `writeFile(path: string, content: string): ()!`
 
 Writes `content` to `path`, creating it or truncating what was there.
@@ -50,6 +59,11 @@ Opens `path` for reading.
 ### `create(path: string): File!`
 
 Creates or truncates `path` for writing.
+
+### `openNoFollow(path: string): File!`
+
+Opens `path` for reading, refusing the open outright when the final path
+component is a symlink — see `readFileNoFollow` above.
 
 ### `openReadWrite(path: string): File!`
 
