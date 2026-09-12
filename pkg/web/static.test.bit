@@ -540,75 +540,59 @@ test "on the wire, a static HEAD declares the file's real length and sends no co
   )
 }
 
-// --- symlink-swap race (#4554) ---------------------------------------------
+// --- open-time symlink refusal (#4554) --------------------------------------
 //
 // `staticServe`'s own `lstat(full)` sees a real file and accepts it; the
-// actual read happens afterwards, in `staticFileRes` -> `staticReadFile`. A
-// test that swaps the served path for a symlink BEFORE calling `app.handle`
-// proves nothing: that same `lstat` would see the symlink too, on the OLD
-// racy code exactly as on the fix. Only a swap that lands WHILE a request is
-// in flight -- after its `lstat`, before its read -- exercises the actual
-// race, so this hammers both sides concurrently: a detached shell script
-// flips `raced` between a real file and a symlink to the sentinel outside the
-// root, on its own clock, while the main loop fires requests at it for a
-// wall-clock budget. `assertRejected`-shaped: whatever a request's status,
-// `sentinelBody` must never appear.
+// actual read happens afterwards, via `staticReadFile` (`readFileNoFollow`).
+// Those are two separate syscalls a fraction of a second apart, so whoever
+// can swap `full` for a symlink in that gap races it -- and going through
+// `app.handle()` cannot force the swap into that exact gap deterministically,
+// because both syscalls run inside ONE synchronous call a test cannot pause
+// in the middle of. A test that swaps the file BEFORE calling `app.handle()`
+// proves nothing either: `staticServe`'s own fresh `lstat` would catch that
+// symlink on the OLD racy code exactly as on the fix, since lstat runs again
+// at request time regardless of which read primitive follows it.
 //
-// PROVEN CLOSED BY MUTATION, not by this test's own pass/fail alone (#4554
-// report): reverting the `readFileNoFollow as staticReadFile` import
-// (static.bit) back to plain `readFile` leaks `sentinelBody` inside this same
-// budget; the fix, run the same way, never does.
-const raceBudgetNs: i64 = 3000000000 // 3s wall clock, plenty for the shell loop below to run its course
-const raceIterations = 6000          // bounds the shell loop; each iteration forks rm/ln/rm/printf, so 6000 spans multiple seconds
+// So this reproduces the underlying primitive's contract directly instead:
+// lstat a real file (what `staticServe`'s check sees), swap it to a symlink
+// (what an attacker does in the gap a live race needs), then read it with
+// EXACTLY what `staticReadFile` is bound to. `readFileNoFollow` makes no
+// assumption about anything checked earlier -- the open itself decides, not
+// a prior stat -- so it refuses every time, not on a scheduling win. The
+// control read with plain `readFile` (module-wide from node.test.bit; the
+// exact primitive `staticReadFile` used before this ticket) proves the swap
+// is real: it follows the same symlink and returns the sentinel.
+import { readFileNoFollow, remove } from "std/fs"
 
-// `#!/bin/sh` script text: an unbounded `while true` never runs here — the
-// counter loop below is the shell-side bound matching `raceIterations`.
-fn raceScript(target: string, outside: string, content: string): string {
-  return "#!/bin/sh\n" +
-    "i=0\n" +
-    "while [ \$i -lt ${raceIterations} ]; do\n" +
-    "  rm -f '${target}'\n" +
-    "  ln -s '${outside}' '${target}'\n" +
-    "  rm -f '${target}'\n" +
-    "  printf '%s' '${content}' > '${target}'\n" +
-    "  i=\$((i+1))\n" +
-    "done\n"
-}
-
-test "a symlink swapped in mid-request never leaks the target's bytes" {
-  let f = newStaticFixture("race")
-  let target = "${f.root}/raced"
-  let outside = "${f.dir}/secret.txt"
+test "a file swapped to a symlink after being lstat'd is refused, not read" {
+  let f = newStaticFixture("swap")
+  let target = "${f.root}/swap.css"
   writeFixture(target, cssBody)
 
-  let attacker = "${f.dir}/attacker.sh"
-  writeFixture(attacker, raceScript(target, outside, cssBody))
-  // `nohup ... &` inside its own subshell: this outer /bin/sh exits the
-  // instant the background job is launched, so `run` (which waits for the
-  // process it directly spawned) returns almost immediately while the
-  // detached script keeps flipping the symlink independently.
-  let rc = run(
-    "/bin/sh",
-    ["-c", "chmod +x '${attacker}' && (nohup '${attacker}' >/dev/null 2>&1 &)"],
-  )
-  assert(rc == 0, "could not start the race attacker script: exit ${rc}")
+  let before = lstat(target) catch e {
+    panic("static.test: lstat ${target}: ${e.message()}")
+  }
+  assert(!before.isSymlink, "the fixture must start as a real file, not a symlink")
 
-  let deadline = timeMonoNs() + raceBudgetNs
-  let requests = 0
-  while (timeMonoNs() < deadline) {
-    let res = f.app.handle(staticReq("GET", "/assets/raced", ""))
-    assert(
-      !contains(res.body, sentinelBody),
-      "request ${requests}: the response carried content from OUTSIDE the served root (status ${res.status})",
-    )
-    assert(
-      res.status == 200 || res.status == 404,
-      "request ${requests}: want 200 or 404, got ${res.status}",
-    )
-    requests = requests + 1
+  // `mustLink` uses plain `ln -s`, which refuses an existing name -- remove
+  // the regular file `lstat` just accepted before swapping in the symlink.
+  remove(target) catch e {
+    panic("static.test: remove ${target}: ${e.message()}")
+  }
+  mustLink("${f.dir}/secret.txt", target)
+
+  let leaked = readFile(target) catch e {
+    panic("static.test: control read of ${target} unexpectedly failed: ${e.message()}")
   }
   assert(
-    requests > 100,
-    "only ${requests} requests fired in the race budget -- too few to exercise it",
+    leaked == sentinelBody,
+    "control: plain readFile must still follow the swapped symlink, got '${leaked}'",
   )
+
+  let refused = false
+  let _ = readFileNoFollow(target) catch _ {
+    refused = true
+    ""
+  }
+  assert(refused, "readFileNoFollow followed the swapped symlink instead of refusing it")
 }
