@@ -149,9 +149,11 @@ explicitly, before the call that may panic.
 
 ## Panics
 
-A panic is an immediate, unrecoverable abort with a message and stack trace to
-stderr and a non-zero exit code. Panics are for programmer errors and broken
-invariants, never for expected failures. Sources include:
+A panic aborts the task it was raised on: unless that task installed a panic
+boundary (below), that is an immediate abort of the whole program, with a
+message and stack trace to stderr and a non-zero exit code. Panics are for
+programmer errors and broken invariants, never for expected failures. Sources
+include:
 
 - index or slice out of range; integer divide-by-zero; signed overflow in debug
   builds
@@ -167,6 +169,13 @@ fn mustPositive(n: int): int {
 }
 ```
 
-There is **no `recover`** in v0.1: panics are fatal by design, which keeps
-control flow free of hidden unwinding. Recoverable conditions must use the result
-model above.
+A task installs a panic boundary with `std/runtime`'s `runRecovering(f)`
+(spec: §18.4): a panic raised in `f`, or in anything `f` calls on the same
+task, discards the frames between the panic site and the boundary and returns
+`(true, message)` instead of aborting the program. `pkg/web`'s `recover()`
+middleware is built on this call - it turns a handler panic into the same 500
+a `fail` would produce. Recovery has limits: a runtime-internal invariant
+failure, an out-of-memory condition, a panic raised while the task is blocked
+in a syscall, and a panic raised on a thread that is not running a task all
+stay fatal regardless of any boundary. Expected failures should still use the
+result model above, not a panic boundary.

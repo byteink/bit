@@ -4135,8 +4135,10 @@ functions return a result value, propagation is a single explicit postfix operat
 (`?`), and handling is a local expression (`catch`). Control flow stays visible and
 statically analyzable (every early exit is a `?` or `fail` you can see), while the
 common path stays terse. Truly unrecoverable conditions (bugs: index out of range,
-nil dereference, failed assertion) use `panic` (§18.4), which aborts the program
-rather than being silently caught.
+nil dereference, failed assertion) use `panic` (§18.4), which aborts the task it
+was raised on — the whole program, unless that task installed an explicit panic
+boundary — rather than being caught implicitly the way an exception handler
+elsewhere on the call stack would.
 
 ### 18.2 Fallible Functions
 

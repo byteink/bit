@@ -207,9 +207,12 @@ re-running is the only way to see the second. Each has a non-fatal twin, named
 with a `check` prefix, that prints the failure and *returns* instead of
 panicking, so a loop can keep going and report every bad row in one run.
 
-A non-fatal check does not fail the test by itself: v0.1 has no `recover`
-(SPEC.md §18.4), and `bit test` runs a test function and returns, with no
-automatic "did anything fail" step afterward. Call `checkDone()` to turn any
+A non-fatal check does not fail the test by itself: `bit test` does not wrap
+a test function in a panic boundary (SPEC.md §18.4 - `std/runtime`'s
+`runRecovering` exists, but the runner does not call it; each test gets its
+own process instead, and the runner reads its exit status), and running a
+test function only returns, with no automatic "did anything fail" step
+afterward. Call `checkDone()` to turn any
 failures the `checkX` calls recorded into a real test failure - normally
 `defer checkDone()` at the top of the function, so it runs on every return
 path. **A test that calls a `checkX` and never calls `checkDone()` silently
