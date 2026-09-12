@@ -4,8 +4,8 @@ The **panic boundary**: run a call so that a panic inside it ends the call
 instead of the program.
 
 A panic is for a programmer error or a broken invariant (SPEC §18.4), and by
-default it aborts the process. This module is how one failing unit of work — a
-connection task, a test case, a plugin — is contained instead of taking
+default it aborts the process. This module is how one failing unit of work - a
+connection task, a test case, a plugin - is contained instead of taking
 everything with it. It is not an error-handling mechanism: an expected failure
 still returns `T!` and propagates with `?`.
 
@@ -13,7 +13,7 @@ still returns `T!` and propagates with `?`.
 
 Run `f` with a panic boundary installed on the current task. Returns
 `(false, "")` when `f` returns normally, and `(true, message)` when a panic
-raised in `f` — or in anything `f` calls on the same task — was caught: the
+raised in `f` - or in anything `f` calls on the same task - was caught: the
 frames between the panic site and this call are discarded and control resumes
 here.
 
@@ -40,14 +40,14 @@ fn handle(s: string): string {
 ```
 
 `f` takes no arguments and returns nothing, so anything it produces travels
-through a captured binding — which is also how a caller sees how far `f` got
+through a captured binding - which is also how a caller sees how far `f` got
 before it panicked. A binding written before `f` was called keeps its value; a
 binding `f` wrote before panicking keeps what `f` wrote.
 
 The message is the panic's own: `panic(msg)`'s string, or the runtime's wording
 for an implicit panic (`index out of range`, `integer division by zero`,
 `integer overflow`, `call of a nil function`,
-`method call on a nil interface value`) — the same text an unrecovered panic
+`method call on a nil interface value`) - the same text an unrecovered panic
 writes to stderr. The bytes are copied, so the returned string stays valid after
 a later panic.
 
@@ -57,8 +57,8 @@ a later panic.
 raised on another; a `spawn`ed task needs its own `runRecovering`.
 
 **Boundaries nest, innermost first.** The innermost boundary on the current task
-wins. A panic raised inside a handler — after `runRecovering` has resumed and
-before it returns — reaches the next boundary out, never the one already
+wins. A panic raised inside a handler - after `runRecovering` has resumed and
+before it returns - reaches the next boundary out, never the one already
 unwound.
 
 **Deferred calls do not run** (SPEC §18.5). There is no unwinding of any kind,
@@ -68,7 +68,7 @@ release has to be released explicitly, before the call that may panic.
 **A held `std/sync` mutex stays held.** That is the previous rule applied to a
 lock: the `unlock` in a discarded frame never runs, so a recovered panic inside
 a critical section leaves the mutex locked forever. Do not wrap a critical
-section in `runRecovering` — wrap the work, and take the lock around the result.
+section in `runRecovering` - wrap the work, and take the lock around the result.
 
 **Four classes stay fatal** whatever the boundary does: a runtime-internal
 invariant failure, out of memory, a panic raised while the task is blocked in a
@@ -87,7 +87,7 @@ provided here.
 ### `taskLocalGet(): int`
 
 Returns the current task's task-local word. `0` for a task that has never set
-it, directly or by inheritance — in particular, the first task in the program.
+it, directly or by inheritance - in particular, the first task in the program.
 
 ### `taskLocalSet(v: int)`
 
@@ -109,17 +109,17 @@ fn main() {
   let results = chan<int>(0)
   spawn worker(1, results)
   let got = <- results
-  print("${got}\n")            // 7 — the value inherited at spawn time
-  print("${taskLocalGet()}\n") // 7 — the child's write never reaches the parent
+  print("${got}\n")            // 7 - the value inherited at spawn time
+  print("${taskLocalGet()}\n") // 7 - the child's write never reaches the parent
 }
 ```
 
 **Inheritance is copy-on-spawn, not a live link.** A child's later write is
 never visible to the task that spawned it, or to any sibling spawned from the
-same parent — each task's word is its own from the moment it is copied.
+same parent - each task's word is its own from the moment it is copied.
 
 **Survives a park/resume on the same task.** Blocking on a channel, a mutex, or
 a `WaitGroup` parks and resumes the same task (the same task identity), so
-task-local storage is unaffected by blocking — it is lost only if code runs
+task-local storage is unaffected by blocking - it is lost only if code runs
 outside any task, which ordinary Bit code cannot do (`spawn` is the only
 task-creation primitive in the language).

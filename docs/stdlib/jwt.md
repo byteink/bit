@@ -2,13 +2,13 @@
 
 JSON Web Signatures (RFC 7515), registered claim validation (RFC 7519), and
 JWKS key selection (RFC 7517). Every cryptographic primitive is `std/crypto`'s
-own (HMAC-SHA256, RSA PKCS#1 v1.5, ECDSA P-256, Ed25519) — this module is the
+own (HMAC-SHA256, RSA PKCS#1 v1.5, ECDSA P-256, Ed25519) - this module is the
 JOSE format and validation layer on top, not a second implementation of any
 primitive.
 
 Four algorithms: `HS256`, `RS256`, `ES256`, `EdDSA`. `alg: none` has no
 representation anywhere in this module and cannot be reached by
-configuration — the classic JWT vulnerability. The verifying party always
+configuration - the classic JWT vulnerability. The verifying party always
 supplies the expected algorithm as the shape of the key it passes
 (`VerifyKey`'s variants); the token's own `alg` header can only be compared
 against that expectation, never used to select behaviour, which is what
@@ -50,7 +50,7 @@ with `std/crypto`'s own key parsers/constructors, or `es256PrivateKey` below.
 
 The verifying counterpart of `SigningKey`: `Hs256Key([]byte)`, `Rs256Key(RsaPublicKey)`,
 `Es256Key(EcdsaPublicKey)`, `Ed25519Key([]byte)`. Which variant you pass to
-`verify`/`verifyToken` **is** the algorithm you are willing to accept — there
+`verify`/`verifyToken` **is** the algorithm you are willing to accept - there
 is no separate algorithm argument that a token could disagree with.
 
 ### `signAlgName(key: SigningKey): string`
@@ -78,7 +78,7 @@ The ES256 public key built from raw JWK `x`/`y` coordinates (32 bytes each).
 
 ### `ecdsaSigToRaw(sig: EcdsaSignature): []byte!`
 
-An ECDSA signature as the JWS raw `R || S` encoding (RFC 7518 §3.4) — never
+An ECDSA signature as the JWS raw `R || S` encoding (RFC 7518 §3.4) - never
 the ASN.1/DER form.
 
 ### `ecdsaSigFromRaw(raw: []byte): EcdsaSignature!`
@@ -96,7 +96,7 @@ Verify `token`'s signature under `key` and return its payload. Rejects a
 malformed token (wrong segment count, empty signature segment, non-URL-safe
 base64), an `alg` header that disagrees with `key`'s algorithm, or an invalid
 signature. The payload is decoded only after the signature has already been
-accepted — no standard-claim validation; see `verifyToken`.
+accepted - no standard-claim validation; see `verifyToken`.
 
 ## Claim validation
 
@@ -114,7 +114,7 @@ fn main() {}
 ### `ClaimsOptions`
 
 `{ now: int, leewaySeconds: int, expectedIss: Option<string>, expectedAud: Option<string> }`.
-`now` is the caller's own clock (Unix seconds) — never read from `std/time`
+`now` is the caller's own clock (Unix seconds) - never read from `std/time`
 internally, so validation is deterministic and testable. `expectedIss`/
 `expectedAud` default to `None`, meaning that check is skipped entirely.
 
@@ -166,5 +166,5 @@ The key whose `kid` equals `kid`. Fails when no entry matches.
 
 ### `refreshJwks(json: string): Jwks!`
 
-Re-parses a JWKS document — the refresh entry point. Fetching one over the
+Re-parses a JWKS document - the refresh entry point. Fetching one over the
 network, and scheduling when to call this, are the caller's responsibility.

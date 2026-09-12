@@ -19,7 +19,7 @@ The entire contents of `path`, refusing the read outright when the final path
 component is a symlink instead of following it. Use this in place of
 `readFile` when the caller has already decided, from a separate check, that
 `path` must not be a link, and needs that decision to still hold at read
-time — `readFile` on the same path would follow whatever the name resolves to
+time - `readFile` on the same path would follow whatever the name resolves to
 by then.
 
 ### `writeFile(path: string, content: string): ()!`
@@ -63,12 +63,12 @@ Creates or truncates `path` for writing.
 ### `openNoFollow(path: string): File!`
 
 Opens `path` for reading, refusing the open outright when the final path
-component is a symlink — see `readFileNoFollow` above.
+component is a symlink - see `readFileNoFollow` above.
 
 ### `openReadWrite(path: string): File!`
 
 Opens `path` for both reading and writing via `File.readAt`/`File.writeAt`,
-creating it if absent. Existing content is preserved — unlike `create`, this
+creating it if absent. Existing content is preserved - unlike `create`, this
 never truncates.
 
 ### `openAppend(path: string): File!`
@@ -92,7 +92,7 @@ Writes `s`.
 ### `File.readAt(buf: []byte, off: i64): int!`
 
 Reads into `buf` starting at byte offset `off`, without moving the file's own
-read/write cursor. A short result — including 0 at end of file — is not a
+read/write cursor. A short result - including 0 at end of file - is not a
 failure. Safe to call concurrently with other `readAt`/`writeAt` calls on the
 same fd from several green threads: there is no shared cursor to race.
 
@@ -113,7 +113,7 @@ power failure.
 
 Sets this file's length to `size`, without moving the file's own read/write
 cursor. Shrinking discards the trailing bytes; growing extends the file with
-a hole that reads as zeros. Neither direction itself flushes — call `sync`
+a hole that reads as zeros. Neither direction itself flushes - call `sync`
 for the new length to be durable.
 
 ### `File.size(): i64!`
@@ -123,7 +123,7 @@ This file's current length in bytes.
 ### `File.lock(): ()!`
 
 Takes a whole-file, advisory exclusive lock, blocking until it is available.
-Advisory only — it constrains nothing about `read`/`write`/`readAt`/`writeAt`
+Advisory only - it constrains nothing about `read`/`write`/`readAt`/`writeAt`
 on this or any other handle; only another `lock`/`tryLock`/`lockShared`/
 `tryLockShared` call observes it. Two `File` values open on the same path in
 one process contend with each other, same as two processes.
@@ -177,7 +177,7 @@ fn head(path: string, n: int): string! {
 ### `cwd(): string!`
 
 The absolute path of the process's current working directory. Fails if it
-could not be determined — the directory was removed out from under the
+could not be determined - the directory was removed out from under the
 running process, a path component became unreadable, or the resolved path
 exceeds the runtime's path length limit.
 
@@ -203,7 +203,7 @@ Whether `path` exists and is a directory. This **follows** a symbolic link, as
 
 ### `isSymlink(path: string): bool`
 
-Whether `path` is itself a symbolic link — the question asked of the link, not
+Whether `path` is itself a symbolic link - the question asked of the link, not
 of what it resolves to, so this is `lstat`-shaped where `exists` and `isDir` are
 `stat`-shaped. A link pointing at a directory answers `true` to **both**
 `isDir` and `isSymlink`; a link whose target does not exist is still a link, and
@@ -233,18 +233,18 @@ fn kind(path: string): string {
 
 `stat`/`lstat`'s result: `size` in bytes, `mtime` in seconds since the Unix
 epoch, `mode`'s low 12 bits (permission plus setuid/setgid/sticky), and
-`isDir`/`isSymlink` — computed from the same information `isDir(path)` and
+`isDir`/`isSymlink` - computed from the same information `isDir(path)` and
 `isSymlink(path)` above answer, but without a second syscall.
 
 ### `stat(path: string): FileInfo!`
 
-Metadata for `path`, **following** a trailing symbolic link — `stat(2)`-shaped,
+Metadata for `path`, **following** a trailing symbolic link - `stat(2)`-shaped,
 like `isDir` above. `isSymlink` in the result is always `false`: a followed
 link is indistinguishable from its target. Fails on a missing path.
 
 ### `lstat(path: string): FileInfo!`
 
-Metadata for `path`, **without** following a trailing symbolic link —
+Metadata for `path`, **without** following a trailing symbolic link -
 `lstat(2)`-shaped, like `isSymlink` above. `isSymlink` in the result reflects
 `path` itself. Fails on a missing path.
 
@@ -281,7 +281,7 @@ Removes a file, or an **empty** directory.
 ### `rename(oldPath: string, newPath: string): ()!`
 
 Renames (moves) `oldPath` to `newPath`. POSIX semantics: if `newPath`
-already exists it is replaced atomically — that is success, not a
+already exists it is replaced atomically - that is success, not a
 failure. Fails if `oldPath` does not exist.
 
 ### `readDir(path: string): []string!`
@@ -297,7 +297,7 @@ temporary file, syncing it, and renaming it into place, only `syncDir` on the
 containing directory makes the new name survive a power failure.
 
 A failed `syncDir` must not be retried, for the same reason `File.sync()` must
-not be — see that section.
+not be - see that section.
 
 Fails if `path` is not a directory, naming it.
 
@@ -308,13 +308,13 @@ themselves are not included.
 
 **Symbolic links are reported but never followed.** A link is yielded as a leaf
 path exactly like a file, whatever it points at, and `walk` does not descend
-through it — the behaviour of Go's `filepath.WalkDir` and the default of Rust's
+through it - the behaviour of Go's `filepath.WalkDir` and the default of Rust's
 `walkdir`. Two consequences the caller can rely on: no returned path can name
 data outside `root`, and a link pointing at one of its own ancestors cannot make
 the walk loop. Call `isSymlink` on a returned path to tell a link from a file.
 
 `root` itself is used as given, so naming a link as the root walks what it
-points at — an explicit request by the caller, not an escape.
+points at - an explicit request by the caller, not an escape.
 
 Nesting deeper than 64 **real** directories fails rather than recursing further.
 

@@ -2,7 +2,7 @@
 
 A RESP2 client for Redis (and RESP2-protocol-compatible servers) written in
 Bit, over `std/net`. The first first-party Bit package
-(`bitlang-ws/CLAUDE.md`'s "First-party packages" design, #3466) — read the
+(`bitlang-ws/CLAUDE.md`'s "First-party packages" design, #3466) - read the
 "Package layout precedent" section below before adding a second one.
 
 ## Install
@@ -18,7 +18,7 @@ Bit, over `std/net`. The first first-party Bit package
 Versioning, tags and the release procedure for every first-party package are
 in [`pkg/README.md`](../README.md). `bit add` derives the dependency key ("redis")
 from the vanity name's trailing path segment (`compiler/pmcli.bit`'s
-`pmLastSegment`) — that key is also the import path a consuming module uses,
+`pmLastSegment`) - that key is also the import path a consuming module uses,
 below.
 
 ## Usage

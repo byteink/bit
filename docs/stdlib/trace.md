@@ -6,7 +6,7 @@ Metrics (`std/metrics`) tell you a rate changed; a trace tells you why one
 specific request took 4 seconds, span by span, across every service it
 crossed.
 
-A `Tracer` is held explicitly by whatever code creates spans — the same
+A `Tracer` is held explicitly by whatever code creates spans - the same
 shape `std/metrics`' `Registry` uses (Bit's module-level `let` cannot hold a
 class, SPEC §11.11, so there is no hidden default tracer). What is
 **implicit** is the parent/child link between spans on the same task: it is
@@ -35,7 +35,7 @@ fn main() {
 
 Export never blocks or fails the caller that records a span: it runs on a
 background task, batches, and drops with a counted self-report
-(`Tracer.droppedSpans()`) when its queue is full — a tracing library that can
+(`Tracer.droppedSpans()`) when its queue is full - a tracing library that can
 take down the service it observes is worse than no tracing at all.
 
 ## Spans
@@ -47,7 +47,7 @@ One span attribute: a `key`/`value` string pair.
 ### `maxAttributes: int`
 
 The most attributes one span may carry. `Span.setAttribute` past this count
-increments `Span.droppedAttributes` instead of growing the span further — the
+increments `Span.droppedAttributes` instead of growing the span further - the
 same cardinality posture as `std/metrics`' label cap.
 
 ### `maxAttributeValueLen: int`
@@ -64,7 +64,7 @@ A span's final outcome: `Unset`, `Ok`, or `Error`. Maps directly to OTLP's
 
 One unit of work inside a trace: a name, a time range measured on the
 monotonic clock, a parent/child link, and a bounded attribute set. Construct
-only through `Tracer.startSpan`/`Tracer.startSpanFromHeader` — never a bare
+only through `Tracer.startSpan`/`Tracer.startSpanFromHeader` - never a bare
 `Span{...}` literal, which would skip the sampling decision and the
 task-local context push those methods perform.
 
@@ -96,7 +96,7 @@ span is the immediate parent, and whether the trace is sampled.
 
 Parses a `traceparent` header
 (https://www.w3.org/TR/trace-context/#traceparent-header). Returns `None` on
-*any* deviation from the spec — a version other than `00`, a field count
+*any* deviation from the spec - a version other than `00`, a field count
 other than 4, a field of the wrong length, an uppercase or non-hex
 character, or an all-zero trace id or parent id (both reserved-invalid).
 Never fails and never panics: the header is attacker-controlled, and a
@@ -115,7 +115,7 @@ A head-based ratio sampler. Construct with `newSampler`, never directly.
 ### `Sampler.shouldSample(): bool`
 
 Draws a fresh sampling decision. Only ever called for the root of a new
-trace — a span whose parent context already carries a decision (an incoming
+trace - a span whose parent context already carries a decision (an incoming
 valid `traceparent`, or a same-process parent span) inherits it instead, so
 every service on a trace agrees.
 
@@ -143,14 +143,14 @@ exports. Spawns the background exporter task immediately.
 ### `Tracer.startSpan(name: string): Span`
 
 Starts a span, a child of this task's ambient context if one is set
-(`std/runtime`'s task-local slot), or the root of a fresh trace — with a new
-sampling decision — otherwise.
+(`std/runtime`'s task-local slot), or the root of a fresh trace - with a new
+sampling decision - otherwise.
 
 ### `Tracer.startSpanFromHeader(name: string, traceparent: string): Span`
 
 Starts a span from an incoming `traceparent` header: continues that trace
 when the header is valid, or starts a fresh root trace when it is malformed.
-Never errors — see `parseTraceParent`.
+Never errors - see `parseTraceParent`.
 
 ### `Tracer.currentTraceParent(): Option<string>`
 
@@ -166,7 +166,7 @@ The count of spans dropped because the export queue was full at
 
 Flushes every queued span, force-closes (with `SpanStatus.Error`) and
 exports every span still open, then stops the background exporter. Call
-once, at process shutdown — an unfinished span is exported, never silently
+once, at process shutdown - an unfinished span is exported, never silently
 dropped.
 
 ## Low-level pieces
@@ -182,7 +182,7 @@ the parent of the next span this task starts.
 
 ### `isEmptyContext(c: SpanContext): bool`
 
-True for the zero context — no ambient trace on this task, directly or by
+True for the zero context - no ambient trace on this task, directly or by
 inheritance.
 
 ### `currentContext(): SpanContext`
@@ -202,7 +202,7 @@ previously returned.
 
 ### `hexEncodeU64(v: uint): string`
 
-`v` as 16 lowercase hex characters, most significant byte first — the wire
+`v` as 16 lowercase hex characters, most significant byte first - the wire
 form a W3C trace/span id field and an OTLP JSON id string both use.
 
 ### `isLowerHex(s: string, n: int): bool`

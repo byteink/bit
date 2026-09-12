@@ -19,13 +19,13 @@ two copies of everything else.
 
 ## The exported surface
 
-`adapter(): Adapter` — nothing else. URI parsing lives behind the `Adapter`
+`adapter(): Adapter` - nothing else. URI parsing lives behind the `Adapter`
 interface rather than beside it, because the one-line driver swap is the whole
 point of `std/sql`: a program that imported a second symbol from here could not
 change one line and be on a different database.
 
 It is a function and not `export let adapter: Adapter` because a module-level
-`let` may only hold an untraced scalar (SPEC §11.11) — an interface value there
+`let` may only hold an untraced scalar (SPEC §11.11) - an interface value there
 is a compile error, not a style preference. `adapter()` returns a fresh value per
 call, and the once-per-pool warnings below are counted on it, so two pools in one
 program each get their own warning rather than the second one connecting weakly
@@ -41,7 +41,7 @@ mariadb://app:pw@db.internal/erp?ssl-mode=VERIFY_IDENTITY
 Datasource{ host: "localhost", user: "app", database: "dev" }
 ```
 
-`port` 0 — the `Datasource` default — means 3306. `ssl-mode` is the only query
+`port` 0 - the `Datasource` default - means 3306. `ssl-mode` is the only query
 parameter read; any other fails naming itself rather than being dropped.
 
 ## TLS
@@ -58,7 +58,7 @@ The setting is spelled MySQL's way, `ssl-mode=`, and its values map onto
 
 Case does not matter. `PREFERRED` is **not** accepted: it names the fallback
 behaviour that omitting `ssl-mode` already gives. An unrecognised value is
-rejected, never defaulted — a typo silently falling back to the ladder would turn
+rejected, never defaulted - a typo silently falling back to the ladder would turn
 a production `ssl-mode=VERIFY_IDENTITYY` into an unauthenticated connection.
 
 **With no `ssl-mode`,** the strongest rung that works is taken: `VERIFY_IDENTITY`,
@@ -76,7 +76,7 @@ MySQL has no TLS port and no ALPN. The server greets in the clear; a client that
 wants TLS answers with the first 32 bytes of a handshake response with
 `CLIENT_SSL` set, and the next byte on the same socket starts the TLS handshake.
 A server that advertises `CLIENT_SSL` and then fails the handshake is **not**
-downgraded to plaintext — the plaintext rung belongs to a server that never
+downgraded to plaintext - the plaintext rung belongs to a server that never
 offered TLS at all.
 
 ## Authentication
@@ -87,24 +87,24 @@ Four plugins, all of which connect:
 |---|---|
 | `caching_sha2_password` (MySQL 8 default) | strong |
 | `client_ed25519` (MariaDB) | strong |
-| `mysql_native_password` | weak — SHA-1, and the server's stored value answers the challenge on its own |
-| `mysql_old_password` | weak — the pre-4.1 hash, 64 bits of keyspace |
+| `mysql_native_password` | weak - SHA-1, and the server's stored value answers the challenge on its own |
+| `mysql_old_password` | weak - the pre-4.1 hash, 64 bits of keyspace |
 
 The two weak ones each warn **once per pool**, naming the plugin and the fix.
 Refusing them was the first draft and was rejected: a stock local MariaDB
-verifies nothing — its certificate is self-signed — and may well have a
+verifies nothing - its certificate is self-signed - and may well have a
 native-password account, and a driver that will not talk to it is a driver
 nobody can start with. The URI is the only place strictness is
 configured.
 
 **`caching_sha2_password`'s full-authentication path is implemented over TLS
-only.** The fast path — the one that answers the server's cached hash — always
+only.** The fast path - the one that answers the server's cached hash - always
 runs, so a cached password over a plain socket connects like any other client.
 When the cache misses, the server asks for the password protected only by an RSA
 public key it supplies on the same connection; fetching a key from the party you
 are authenticating to and trusting it because it arrived is a key exchange with
 no authentication at all, so a man in the middle simply supplies its own. Without
-TLS this driver sends nothing further — no public-key request, no RSA operation —
+TLS this driver sends nothing further - no public-key request, no RSA operation -
 and fails with a message naming TLS. `auth.test.bit` asserts the byte count after
 the refusal is zero.
 
@@ -123,7 +123,7 @@ greeting's six-byte filler. They are read as such.
 ## Limitations, and where each one is going
 
 - **The query layer is a separate ticket under epic #3986.** `query` runs
-  `COM_QUERY` with no parameters — enough for a `select 1` liveness check. `exec`,
+  `COM_QUERY` with no parameters - enough for a `select 1` liveness check. `exec`,
   `prepare` and `begin` fail naming the epic. Values come back in the protocol's
   text format, so every non-NULL column is `Value.Text` whatever its column type.
 - **Neither stock image verifies.** `mysql:8.4` and `mariadb:11.4` each generate
@@ -146,8 +146,8 @@ greeting's six-byte filler. They are read as such.
 `./make test-package-mysql` runs everything that needs no server: the URI parser,
 the greeting parse (the `5.5.5-` prefix, the upper-half capability bits) and the
 authentication exchanges against an in-process fake server. The fake checks a
-credential the way a server does — recovering the client's hash from the response
-and comparing it with what the server stores — rather than calling this driver's
+credential the way a server does - recovering the client's hash from the response
+and comparing it with what the server stores - rather than calling this driver's
 own function back, and the three response formats are additionally pinned to
 vectors computed outside this codebase.
 

@@ -25,12 +25,12 @@ leaving the directory untouched, if a `bit.json` already exists there.
 $ bit init
 bit init: wrote bit.json
 $ bit init
-bit init: bit.json already exists — refusing to overwrite
+bit init: bit.json already exists - refusing to overwrite
 ```
 
 `[name]`, when given, is written verbatim: `{"name": "<name>", "dependencies":
 {}}`. Omitted, it defaults to the current directory's own basename
-(`defaultInitName`, `compiler/pmcliinit.bit:85`, via `std/fs`'s `cwd()` —
+(`defaultInitName`, `compiler/pmcliinit.bit:85`, via `std/fs`'s `cwd()` -
 #3502), the way `npm init -y` derives one from
 `path.basename(process.cwd())`. If that basename is not usable - empty, or
 holding a path separator (`isUsableProjectName`, same file) - `bit init`
@@ -314,7 +314,7 @@ apart:
 $ bit why nosuchpkg
 bit why: "nosuchpkg" is not a dependency of this project (no bit.lock entry)
 $ bit why orphanedpkg
-bit why: "orphanedpkg" is locked but unreachable from any dependency in bit.json — an orphan bit.lock entry; run `bit up` to relock
+bit why: "orphanedpkg" is locked but unreachable from any dependency in bit.json - an orphan bit.lock entry; run `bit up` to relock
 ```
 
 The first is a name `bit.lock` has never heard of. The second is a name

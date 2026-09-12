@@ -1,6 +1,6 @@
 # std/prof
 
-An in-process CPU sampling profiler. **aarch64-macos only** — the runtime half
+An in-process CPU sampling profiler. **aarch64-macos only** - the runtime half
 uses Darwin's `SIGPROF`/`setitimer`; calling this on another platform fails at
 link time.
 
@@ -8,7 +8,7 @@ Nothing here runs unless a program calls `startCpu`: no environment variable,
 no boot-time hook, no background cost when unused.
 
 Only a leaf program counter is recorded per tick, not a full call stack, and
-only one OS thread is sampled (whichever one happens to receive `SIGPROF` —
+only one OS thread is sampled (whichever one happens to receive `SIGPROF` -
 validated with `BIT_WORKERS=1`). Both are deliberate scope cuts for this first
 version, not silent gaps.
 
@@ -20,8 +20,8 @@ Mach-O symbol table and prints each function's share of samples.
 ### `startCpu(hz: int)`
 
 Start sampling this process's own CPU use at approximately `hz` samples per
-second (clamped to `[1, 100000]`). Must be paired with a later `stopCpu(path)`
-— this call only arms the timer. Calling `startCpu` again before `stopCpu`
+second (clamped to `[1, 100000]`). Must be paired with a later `stopCpu(path)` -
+this call only arms the timer. Calling `startCpu` again before `stopCpu`
 re-arms the timer and resets the sample ring; it does not stack.
 
 ### `stopCpu(path: string): int!`

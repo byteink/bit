@@ -3,14 +3,14 @@
 Epic #2354. A one-time snapshot of what `bit lint` currently reports over the
 project's own source, taken so #2453 (the count-ratchet gate, blocked on this
 ticket) has a starting number to compare against. It is not itself read by any
-gate — see "What this is for" below.
+gate - see "What this is for" below.
 
 ## Measured at
 
 - Commit: `6813e4844be17b0969764ee1c294ed809f066b3e` (`main`)
 - Date: 2026-08-18
 - Binary: `./bit-out/bin/bit` (dev build, freshly rebuilt with `./make selfhost`
-  in a worktree cloned from the shared checkout at this commit — not the
+  in a worktree cloned from the shared checkout at this commit - not the
   brew-installed `bit`, which is release 0.1.21)
 
 ## How this was produced
@@ -42,7 +42,7 @@ tail -1 /tmp/lint-stdlib.txt
 grep -A1 'warning\[E0214\]' /tmp/lint-compiler.txt /tmp/lint-stdlib.txt | grep -- '-->'
 ```
 
-Do not copy the numbers below into a later document without re-running this —
+Do not copy the numbers below into a later document without re-running this -
 this repo has had five figures go stale that way. State the commit you
 measured on, the way this file states `6813e484`.
 
@@ -77,12 +77,12 @@ stdlib:   lint: 114 findings, 41 overrides active
 
 19 + 41 = 60 active `// bit:lint allow` overrides across both scopes. An
 override suppresses a finding that would otherwise be counted above, so this
-number is evidence the 708 is not the whole story — some findings were
+number is evidence the 708 is not the whole story - some findings were
 already dispositioned before this snapshot (E0214 among them: see below) and
 are not sitting in the 708.
 
 `E0212 unreachable-code` reads 0 in both scopes because #3211 fixed the
-underlying dead code rather than suppressing the rule — see
+underlying dead code rather than suppressing the rule - see
 `docs/lint/policy.md`'s E0212 section (corrected by #3233 the same day). It is
 not a gap in this measurement.
 
@@ -100,13 +100,13 @@ $ grep -c 'warning\[E0214\]' /tmp/lint-stdlib.txt; echo $?
 1
 ```
 
-(`grep -c` on zero matches exits 1 — the `1` above is `grep`'s own exit code,
+(`grep -c` on zero matches exits 1 - the `1` above is `grep`'s own exit code,
 not a finding count. Recorded so a zero-count reading is never mistaken for a
 command that didn't run.)
 
 This is not an absence of scrutiny: #3209 (`compiler/`, merged `844967b9`)
 dispositioned all 8 findings the widened rule exposed there, and #3208
-(`stdlib/`, merged `92d03397`) dispositioned all 22 in `stdlib/` — one of
+(`stdlib/`, merged `92d03397`) dispositioned all 22 in `stdlib/` - one of
 which (`stdlib/tls/handshakewire.bit:144`, the TLS transcript aliasing bug)
 was FIXED with a defensive copy rather than overridden; the other 29 across
 both scopes carry a per-finding `// bit:lint allow E0214 -- <reason>`. Those
@@ -118,6 +118,6 @@ This file is a **snapshot**, not a live check. Nothing currently reads it.
 **#2453** ("Add the lint-self gate to tools/build/gates.bit as a count
 ratchet", blocked on this ticket) is expected to add a gate that compares a
 future `bit lint` run's totals against the numbers recorded here and fails on
-regression. Until #2453 lands, this document has no enforcement behind it —
+regression. Until #2453 lands, this document has no enforcement behind it -
 treat any number above as informational only, and re-run the commands in
 "Regenerating this file" before relying on it for anything.

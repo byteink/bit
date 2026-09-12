@@ -9,7 +9,7 @@ Metrics are held in an explicit `Registry` rather than a hidden global one:
 Bit's module-level `let` may hold only untraced scalars, fixed arrays of
 them, or raw pointers, never a class, slice or map (SPEC section 11.11), so
 there is no cell a default registry could live in. Construct one, keep it,
-and call its methods — the same shape `std/sync`'s `Mutex`, `WaitGroup` and
+and call its methods - the same shape `std/sync`'s `Mutex`, `WaitGroup` and
 `std/rand`'s `Rand` already use.
 
 ```bit
@@ -27,7 +27,7 @@ Registration (`counter`/`gauge`/`histogram`) is a startup-time act: an
 invalid metric or label name, or registering the same metric name twice,
 panics immediately rather than producing a corrupt scrape later. Recording
 a value (`inc`/`add`/`set`/`observe`) never panics on caller-supplied label
-values — an unbounded label (a user id, a raw request path) is the failure
+values - an unbounded label (a user id, a raw request path) is the failure
 mode this module exists to prevent, not to reproduce. Each metric's
 distinct label-value combinations are capped at the registry's own
 `capMax`; past the cap, the new series is silently dropped, every existing

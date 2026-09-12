@@ -11,7 +11,7 @@
 # installers post-#1452 (dist/README.md, "Path resolution").
 #
 # NOTE: x86_64-windows and aarch64-windows are not published yet (#1103's
-# runtime port + #358's release matrix are the remaining blockers) — until
+# runtime port + #358's release matrix are the remaining blockers) - until
 # they are, this script downloads a real URL built from the naming contract
 # and fails cleanly with a 404/"not found" rather than installing anything.
 #

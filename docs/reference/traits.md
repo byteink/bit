@@ -7,7 +7,7 @@ supplies method *bodies*, not just a method *set* to check a value against.
 
 ## Declaring a trait
 
-A trait member is either **required** (a signature with no body — the class
+A trait member is either **required** (a signature with no body - the class
 must supply it) or **provided** (has a body, and is injected):
 
 ```bit
@@ -18,7 +18,7 @@ trait Damageable {
 ```
 
 `this` inside a provided method works the same way it does in an ordinary
-in-body method — it is never independently type-checked as part of the trait;
+in-body method - it is never independently type-checked as part of the trait;
 it is checked once per class that actually uses the trait.
 
 ## Using a trait
@@ -42,7 +42,7 @@ fn checkEnemy() {
 ```
 
 `Enemy` never declares `dead()` itself; `use Damageable` injects it. `hurt` is
-required by the trait, and `Enemy`'s own in-body `hurt` satisfies it — a class
+required by the trait, and `Enemy`'s own in-body `hurt` satisfies it - a class
 declaring a method itself always wins over one a trait would otherwise supply,
 silently, with no `insteadof`/`as` syntax to choose between them.
 
@@ -70,7 +70,7 @@ fn reportOn(m: Mortal): string {
 ## Fields
 
 A trait can declare fields too, injected into the using class's own layout
-and GC pointer map exactly like a hand-written field — readable, writable,
+and GC pointer map exactly like a hand-written field - readable, writable,
 and settable in a composite literal:
 
 ```bit
@@ -92,7 +92,7 @@ fn greetGadget() {
 ```
 
 Field order is deterministic: the class's own declared fields first, then
-each `use`d trait's fields in `use` order — never dependent on iteration
+each `use`d trait's fields in `use` order - never dependent on iteration
 order, so two builds of the same source always agree on layout. A field name
 colliding between two traits, or between a trait and the class itself, is
 always a compile error naming both sources; unlike a method conflict, there
@@ -100,7 +100,7 @@ is no silent override.
 
 ## `Self`
 
-Inside a trait, `Self` names the class that ends up `use`ing it — resolved
+Inside a trait, `Self` names the class that ends up `use`ing it - resolved
 once, when `use` names it, unlike an interface's `Self` (§11.3), which stays
 abstract until a value is checked against the interface. It may appear only as
 a trait method's own parameter or result type: not a local variable's type, a
@@ -153,13 +153,13 @@ fn compareBoxes() {
 ```
 
 `withHp(n: i64): Self` injected into `Widget` becomes the ordinary, concrete
-`withHp(n: i64): Widget` — there is nothing abstract left once a class has
+`withHp(n: i64): Widget` - there is nothing abstract left once a class has
 `use`d the trait.
 
 ## What a trait is not
 
 A trait is never a type. It cannot be a variable's type, a parameter, a
-return type, a field type, a type-assertion target, or a generic argument —
+return type, a field type, a type-assertion target, or a generic argument -
 a function that needs "anything with these methods" declares a structural
 interface instead:
 
@@ -171,4 +171,4 @@ There is no vtable and no runtime dispatch: injection happens once, at check
 time, and an injected method is indistinguishable from one the class wrote by
 hand. Two `use`d traits providing the same method with neither overridden by
 the class, a required method nobody supplies, and a cycle of traits `use`ing
-each other are all compile errors — see §10.7 for the exact rules.
+each other are all compile errors - see §10.7 for the exact rules.

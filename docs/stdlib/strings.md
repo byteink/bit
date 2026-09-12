@@ -69,7 +69,7 @@ Code points in `s`. Differs from `len(s)` for any non-ASCII text.
 
 The code point starting at byte offset `i`, which must land on a rune
 boundary. Malformed or out-of-range input decodes as U+FFFD rather than
-panicking. Not indexed by rune count — to visit each rune in order, use
+panicking. Not indexed by rune count - to visit each rune in order, use
 `runes` or `runeCount`.
 
 ### `decodeRuneAt(s: string, i: int): (rune, int)`
@@ -96,7 +96,7 @@ True if every byte of `s` belongs to a complete, minimal, in-range UTF-8
 encoding. `runeCount`/`runes` do **not** give you this: they decode a
 malformed byte as U+FFFD and keep going, so a check built on top of them
 cannot tell malformed input apart from input that genuinely contains the
-replacement character. This matters most for overlong encodings — the classic
+replacement character. This matters most for overlong encodings - the classic
 UTF-8 filter bypass, where a rune-level reader can see a different string
 than a byte-level one (`\xc0\xaf` overlong-encodes `/`).
 
@@ -112,8 +112,8 @@ intend to keep; use `isValidUtf8` to reject input you intend to refuse.
 
 ### `padLeft(s: string, width: int): string`
 
-`s` left-padded with `U+0020` spaces until it is `width` **runes** — measured
-with `runeCount`, never `len` — so a multi-byte rune like `é` still counts as
+`s` left-padded with `U+0020` spaces until it is `width` **runes** - measured
+with `runeCount`, never `len` - so a multi-byte rune like `é` still counts as
 one column. Returns `s` unchanged, never truncated, when it is already
 `width` runes or longer or when `width` is `0` or less.
 
@@ -125,7 +125,7 @@ rules as `padLeft`.
 ### `padStart(s: string, width: int, pad: string): string`
 
 `s` left-padded with `pad`, repeated cyclically by code point (measured with
-`runeCount`, never `len`) until it is `width` runes long — matches JS's
+`runeCount`, never `len`) until it is `width` runes long - matches JS's
 `String.prototype.padStart`, generalised from UTF-16 units to code points. If
 `s` is already `width` runes or longer, `width` is `0` or less, or `pad` is
 empty, returns `s` unchanged; this never truncates `s`. A multi-rune `pad`
@@ -169,7 +169,7 @@ Whether `a` and `b` are equal under Unicode **simple** case folding: ASCII
 (`A`-`Z` treated as `a`-`z`) plus Latin-1 Supplement, Latin Extended-A/B,
 Greek and Coptic, and Cyrillic, so `equalFold("ÉCOLE", "école")` is `true`.
 Simple folding only, not full: it never expands a code point into more than
-one, so `equalFold("straße", "STRASSE")` stays `false` — `ß` has no simple
+one, so `equalFold("straße", "STRASSE")` stays `false` - `ß` has no simple
 fold partner. A code point outside the covered scripts folds to itself.
 
 ### `hasPrefix(s: string, prefix: string): bool`
@@ -190,14 +190,14 @@ The **byte** offset of the first `sub` in `s`, or `-1`. An empty `sub` is at `0`
 
 Like `indexOf`, but the search starts at byte offset `at`. A negative `at`
 clamps to `0` rather than reading out of bounds. An `at` beyond `len(s)`
-finds nothing, even for an empty `sub` — but an empty `sub` at exactly
+finds nothing, even for an empty `sub` - but an empty `sub` at exactly
 `len(s)` does match, returning `at`.
 
 ### `lastIndexOf(s: string, sub: string): i64`
 
 The **byte** offset of the *last* `sub` in `s`, or `-1`. An empty `sub`
 matches at `len(s)`. An overlapping candidate reports the rightmost start
-position — `lastIndexOf("aaa", "aa")` is `1`, not `0` — since the scan never
+position - `lastIndexOf("aaa", "aa")` is `1`, not `0` - since the scan never
 skips past a candidate the way `count`'s non-overlapping scan does.
 
 ### `contains(s: string, sub: string): bool`
@@ -261,7 +261,7 @@ yields `[s]`. The inverse of `join`.
 
 `s` split on `sep`, keeping at most `n` parts: the first `n - 1` parts are
 split as `split` would, and the last part keeps everything remaining,
-unsplit — so a limit larger than the number of matches behaves exactly like
+unsplit - so a limit larger than the number of matches behaves exactly like
 `split`. `n == 0` yields no parts at all (an empty slice, not `[s]`); `n < 0`
 is unlimited, identical to `split`. An empty `sep` yields `[s]` for any
 `n != 0`, same convention as `split`.
@@ -280,7 +280,7 @@ byte-level cutset membership as `trimLeft`.
 
 ### `trim(s: string, cutset: string): string`
 
-`s` trimmed on both ends against `cutset` — equivalent to
+`s` trimmed on both ends against `cutset` - equivalent to
 `trimRight(trimLeft(s, cutset), cutset)`.
 
 ### `trimSpace(s: string): string`
@@ -291,7 +291,7 @@ vertical tab, form feed, and carriage return.
 ### `replace(s: string, old: string, repl: string): string`
 
 `s` with every non-overlapping occurrence of `old` replaced by `repl`,
-scanned left to right. An empty `old` is a no-op, returning `s` unchanged —
+scanned left to right. An empty `old` is a no-op, returning `s` unchanged -
 unlike Go's `strings.ReplaceAll`, which instead inserts `repl` at every
 position including both ends.
 
@@ -326,11 +326,11 @@ fn sumCsv(line: string): int! {
 
 The `f64` decimal or hexadecimal float text `s` denotes, correctly rounded.
 Fails on an empty string, a bare sign, leading or trailing whitespace, and any
-text the predeclared `parseFloat` builtin (SPEC §5.3) cannot parse — a bad
+text the predeclared `parseFloat` builtin (SPEC §5.3) cannot parse - a bad
 parse never returns a valid-looking float. `parseFloat("0")` succeeds with
 value `0`, distinguishable from every failure.
 
-`1e400` and `1e-400` still succeed, rounding to `+Inf` / `0` under IEEE 754 —
+`1e400` and `1e-400` still succeed, rounding to `+Inf` / `0` under IEEE 754 -
 overflow and underflow are correctly-rounded conversion results, not parse
 failures.
 
@@ -357,7 +357,7 @@ treated as `0`, which omits the point entirely (`formatFloat(2.5, 0)` is
 zero (`formatFloat(-0.004, 2)` is `"-0.00"`). `NaN` is `"NaN"`; the infinities
 are `"+Inf"` / `"-Inf"`. Never uses exponent notation.
 
-Works on the decimal text of `x`, not `x` scaled by a power of ten — scaling
+Works on the decimal text of `x`, not `x` scaled by a power of ten - scaling
 with binary floating-point loses digits (`i64(150.15 * 100.0)` is `15014`,
 not `15015`).
 

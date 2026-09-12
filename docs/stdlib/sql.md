@@ -1,6 +1,6 @@
 # std/sql
 
-The database driver contract — an interface with **no driver behind it**.
+The database driver contract - an interface with **no driver behind it**.
 Nothing here talks to a database; `bit/pkg/` is where a concrete driver will
 eventually live, consumed by name through the `Registry` this module defines.
 Shipping the contract from stdlib rather than as a package is deliberate: a
@@ -15,7 +15,7 @@ pre-interpolated string with values already substituted in.
 
 **Placeholder syntax is not specified here.** Postgres numbers its
 placeholders (`$1`, `$2`, ...); MySQL and SQLite use a positional `?`. This
-module picks neither — `sqlText` carries whatever placeholder marker the
+module picks neither - `sqlText` carries whatever placeholder marker the
 caller and the target driver agree on, and each driver renders it into its
 own wire format from the ordered `params` list it is given.
 
@@ -55,7 +55,7 @@ True if `v` is SQL NULL.
 
 ### `asInt(v: Value): int!`
 
-The typed accessor for an `Int` value. Fails if `v` holds any other variant —
+The typed accessor for an `Int` value. Fails if `v` holds any other variant -
 `match (v)` directly when the column's type is not known ahead of time.
 
 ### `asFloat(v: Value): f64!`
@@ -74,14 +74,14 @@ The typed accessor for a `Blob` value. Fails on any other variant.
 
 ### `Driver`
 
-`open(dsn: string): Conn!` — the one thing every concrete driver package
+`open(dsn: string): Conn!` - the one thing every concrete driver package
 implements. `dsn` is a driver-specific connection string; its format is
 entirely the driver's own.
 
 ### `Conn`
 
 A single logical database connection, as handed back by `Registry.open`.
-Several green threads may hold and use the same `Conn` at once — see
+Several green threads may hold and use the same `Conn` at once - see
 `newRegistry`'s entry below for how that is made safe.
 
 ```
@@ -94,7 +94,7 @@ close()
 
 `query` runs SQL expected to produce a row set (`SELECT` and friends);
 `exec` runs SQL expected only to change rows and reports how many were
-affected — never a row set. Postgres's `RETURNING` clause can turn an
+affected - never a row set. Postgres's `RETURNING` clause can turn an
 insert into a query with rows and MySQL has no equivalent, so nothing in
 this module may assume an `exec` can return rows: a driver that wants to
 expose `RETURNING` does so through `query`, the same call any `SELECT` uses.
@@ -113,7 +113,7 @@ close()
 `next` advances to the next row, returning `false` (not an error) once the
 set is exhausted; a driver-side read failure mid-iteration is reported
 through the fallible result instead. `columns` is the result set's column
-names in order; `value` reads column `col` (0-based) of the current row —
+names in order; `value` reads column `col` (0-based) of the current row -
 match it, or pass it to `asInt`/`asText`/... above.
 
 ### `Stmt`
@@ -143,7 +143,7 @@ rollback(): ()!
 `query`/`exec` behave exactly as `Conn`'s do, scoped to this transaction.
 `commit`/`rollback` are the **driver's** side of the contract: a driver
 implements them, and `tx` (below) is the only thing that calls them. Application
-code never ends a transaction by hand — the handle `tx` gives a block fails both
+code never ends a transaction by hand - the handle `tx` gives a block fails both
 calls, and fails every call once that block has returned.
 
 ## The registry
@@ -174,7 +174,7 @@ Adds `d` under `name`. Fails if `name` is already registered.
 Looks up the driver registered as `driverName` and opens `dsn` with it.
 Fails if `driverName` was never registered, or if the driver's own `open`
 fails. The returned `Conn` is wrapped so that several green threads sharing
-it never interleave calls on the one underlying socket it represents — a
+it never interleave calls on the one underlying socket it represents - a
 single-slot connection pool, sized at exactly one physical connection per
 `open()` call, the minimum that satisfies "must not let two green threads
 interleave on one socket". A driver that wants true N-way concurrency pools
@@ -184,7 +184,7 @@ registry still serializes access to whichever one it gets.
 ```bit
 import { Registry, Driver, Conn, Value, asText } from "std/sql"
 
-// A program wires up a driver package's setup once, naming it by string —
+// A program wires up a driver package's setup once, naming it by string -
 // the only two places anything needs to import a concrete driver package
 // are the call that constructs `d` and this one, never the call sites that
 // go on to use the resulting Conn.
@@ -208,7 +208,7 @@ fn firstName(conn: Conn, id: string): string! {
 A server has two wrong ways to reach a database and one right one. Open a
 connection per request and every request pays a TCP handshake plus
 authentication, and a burst exhausts the database's own connection limit.
-Share one connection between requests and the application serialises on it —
+Share one connection between requests and the application serialises on it -
 and a transaction started by one request becomes visible to every other
 request using that connection. `pool` is the third way: a bounded set of
 physical connections, handed out one at a time, returned when the caller is
@@ -221,7 +221,7 @@ against a fake driver that counts every connection ever opened:
    `commit` or `rollback`. The `Tx` holds the driver's own transaction, made
    on one connection, and has no way to reach another.
 2. **A connection handed back with an open transaction is closed**, never
-   reused — including after a `commit` that failed, since the pool cannot
+   reused - including after a `commit` that failed, since the pool cannot
    know what the server did with it.
 3. **A connection a driver reported a transport failure on is discarded**
    (see `FatalError` below).
@@ -234,7 +234,7 @@ against a fake driver that counts every connection ever opened:
 A pool of connections to the database `cfg` names, opened through `a`.
 Nothing connects here: `cfg` is checked (`Datasource.validate`) and
 connections are opened on demand, up to `cfg.maxOpen`. This fails only on a
-configuration that cannot describe a pool — an unset `DATABASE_URL` surfaces
+configuration that cannot describe a pool - an unset `DATABASE_URL` surfaces
 here, not as a DNS error from inside a driver later.
 
 ```bit
@@ -260,7 +260,7 @@ fn fromFields(a: Adapter, password: string): Pool! {
 ### `Datasource`
 
 Everything a pool needs: one database to reach, and the shape of the pool
-that reaches it. One class, not two — splitting connection settings from
+that reaches it. One class, not two - splitting connection settings from
 pool settings puts a nested value and a second `?` at every call site.
 
 | field | default | meaning |
@@ -288,7 +288,7 @@ there is deliberately no `parseUrl` here.
 
 **`maxOpen` is 10, argued not guessed.** Postgres ships
 `max_connections = 100`, so one instance defaulting to 100 takes the
-server's whole budget and the second container — or the operator's `psql` —
+server's whole budget and the second container - or the operator's `psql` -
 cannot connect at all. A large pool is also slower: past a small pool,
 throughput drops as the database thrashes between processes competing for
 the same cores and disks (HikariCP's benchmarks are the citation; 10 is its
@@ -302,7 +302,7 @@ rejects it, as it rejects a `maxOpen` below 1.
 ### `Datasource.validate(): ()!`
 
 Rejects a `Datasource` that cannot describe a pool, before anything opens a
-socket: neither `uri` nor `host` set (nothing to connect to — the unset
+socket: neither `uri` nor `host` set (nothing to connect to - the unset
 `DATABASE_URL` case, which must not surface as a DNS or parse failure), both
 set (mutually exclusive), a `maxOpen` below 1, a negative `maxIdle`, or an
 `acquireTimeout` below 1. `pool` calls it, so a program that builds its pool
@@ -318,8 +318,8 @@ How the driver should negotiate TLS. The names are Bit's; each adapter
 renders them into whatever its own wire protocol spells.
 
 `Negotiate` is the first variant deliberately. A class field of enum type
-cannot carry an explicit default — a variant is not a constant expression
-(SPEC §10.5, `E0064`) — so an omitted `sslmode` takes the enum's *first
+cannot carry an explicit default - a variant is not a constant expression
+(SPEC §10.5, `E0064`) - so an omitted `sslmode` takes the enum's *first
 declared variant*. Ordering the connect-to-anything mode first is the only
 way that default survives, and reordering this enum silently changes what an
 omitted `sslmode` means.
@@ -346,8 +346,8 @@ threads. Built by `pool`; closed by `Pool.close`.
 ### `Pool.query(sqlText: string, params: []Value): Rows!`
 
 Runs `sqlText` and returns its rows. **The connection stays checked out
-until the returned `Rows` is closed** — a cursor lives on the connection
-that produced it — so a caller that never closes its `Rows` leaks a
+until the returned `Rows` is closed** - a cursor lives on the connection
+that produced it - so a caller that never closes its `Rows` leaks a
 connection exactly as one that never closes a file leaks a descriptor.
 
 ```bit
@@ -384,8 +384,8 @@ transportFatal(): bool
 The marker a driver failure carries when the failure has poisoned the
 *connection* rather than merely failing the statement: a closed socket, a
 short read, a protocol desync. The pool never hands such a connection out
-again (rule 3). A failure that does not implement `FatalError` — a
-constraint violation, a syntax error — leaves the connection usable, which
+again (rule 3). A failure that does not implement `FatalError` - a
+constraint violation, a syntax error - leaves the connection usable, which
 is the common case and needs no cooperation from the driver at all.
 
 ### `transportError(detail: string): error`
@@ -414,7 +414,7 @@ logs every statement tagged with the connection that ran it.
 ### `tx(db: Executor, f: (Tx) => ()!): ()!`
 
 Runs `f` in a transaction at the database's own isolation level and returns
-nothing. `db` is the `Pool`, or the handle of a transaction already running — in
+nothing. `db` is the `Pool`, or the handle of a transaction already running - in
 which case this is a savepoint inside it, not a second transaction.
 
 ```bit
@@ -435,8 +435,8 @@ fn transfer(db: Pool, payer: string, payee: string, cents: int): ()! {
 ```
 
 The handle `t` works only inside the block. Every method on it fails once the
-block has returned — a handle that still worked would run statements outside the
-transaction, on a connection the pool has since given to somebody else — and
+block has returned - a handle that still worked would run statements outside the
+transaction, on a connection the pool has since given to somebody else - and
 `t.commit()`/`t.rollback()` fail whenever they are called, because ending the
 transaction is `tx`'s job.
 
@@ -461,13 +461,13 @@ fn post(db: Pool, batch: string): ()! {
 
 ### `txValue<T>(db: Executor, f: (Tx) => T!): T!`
 
-`tx`, returning what the block returned once the transaction has committed — so
+`tx`, returning what the block returned once the transaction has committed - so
 a transaction can produce an inserted id without a mutable captured outside it.
 Nothing is returned on a failure: a value is a result only if the work behind it
 is durable.
 
 The type argument is written out because a block's result type is not inferred
-through a generic parameter, and it cannot be `()` — a block that returns
+through a generic parameter, and it cannot be `()` - a block that returns
 nothing goes through `tx`.
 
 ```bit
@@ -502,7 +502,7 @@ exec(sqlText: string, params: []Value): int!
 ```
 
 Anything statements can run on: a `Pool`, or a transaction already running on
-one. A function that takes an `Executor` rather than a `Pool` composes — the
+one. A function that takes an `Executor` rather than a `Pool` composes - the
 caller decides whether it runs on its own or inside a transaction:
 
 ```bit
@@ -523,7 +523,7 @@ fn archive(db: Executor, id: string): ()! {
 
 **A nested `tx` is a savepoint, never a second transaction.** It issues
 `SAVEPOINT bit_sp_N` on the same connection, `RELEASE SAVEPOINT bit_sp_N` when
-its block returns, and `ROLLBACK TO SAVEPOINT bit_sp_N` when its block fails —
+its block returns, and `ROLLBACK TO SAVEPOINT bit_sp_N` when its block fails -
 so an inner failure undoes exactly the inner block and the outer one goes on to
 commit. Joining the outer transaction silently would let an inner rollback take
 the outer work with it.
@@ -543,7 +543,7 @@ Default | ReadUncommitted | ReadCommitted | RepeatableRead | Serializable
 
 How much of other transactions' work a transaction may see. `Default` issues no
 statement at all, leaving whatever the database and its driver are configured
-for in force — `std/sql` picks no level for you, because an ERP has both
+for in force - `std/sql` picks no level for you, because an ERP has both
 read-committed reporting and serializable posting and either one chosen
 invisibly is wrong for the other.
 
@@ -551,5 +551,5 @@ Any other level is issued as SQL-92's `SET TRANSACTION ISOLATION LEVEL x`, as
 the first statement after the BEGIN: the driver contract's `Conn.begin()` takes
 no argument, and this module knows no dialect. That is what Postgres wants.
 MySQL refuses the statement once a transaction is open, so a MySQL driver that
-means to support levels honours it in its own `Tx.exec` — the driver's job, the
+means to support levels honours it in its own `Tx.exec` - the driver's job, the
 same way placeholder syntax already is.

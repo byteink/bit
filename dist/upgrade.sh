@@ -19,7 +19,7 @@
 #
 # NOTHING EXISTING IS TOUCHED UNTIL THE DOWNLOAD IS VERIFIED: the artifact is
 # fetched into a fresh directory inside $BITROOT, digest-checked, unpacked
-# there, and only then moved into place — and the live `bin/bit` symlink is
+# there, and only then moved into place - and the live `bin/bit` symlink is
 # replaced by renaming a second symlink over it, which is atomic, never by
 # writing through the running binary. A failure at any step leaves the previous
 # install runnable, and it is left on disk afterwards too.
@@ -102,7 +102,7 @@ if [ "$current" = "$version" ]; then
 fi
 
 if [ "$check_only" = yes ]; then
-  echo "upgrade.sh: installed ${current}, newest ${version} — run 'bit upgrade' to replace it"
+  echo "upgrade.sh: installed ${current}, newest ${version} - run 'bit upgrade' to replace it"
   exit 0
 fi
 

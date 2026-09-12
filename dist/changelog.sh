@@ -5,7 +5,7 @@
 #
 # <ref> is the commit the release is cut from (default HEAD). The range is the
 # previous `v*` tag reachable from <ref> to <ref>; with no previous tag the
-# whole history is used. Requires a full clone (fetch-depth: 0) — a shallow one
+# whole history is used. Requires a full clone (fetch-depth: 0) - a shallow one
 # silently yields an empty log, so this fails loudly on an empty range instead.
 set -euo pipefail
 
@@ -67,8 +67,8 @@ take '^perf(\([^)]*\))?:'              ; emit 'Performance'      "${BODY}"
 # commits carry none); the paths a commit changed are never absent. This
 # replaces a whitelist of conventional `type:` prefixes that had to be
 # maintained against a repo that coins new ones (it named `seed` and
-# `selfhost` — a directory deleted in #1593 and one renamed to `compiler` in
-# #1841 — and never named `compiler` itself, so 41 of 0.1.5's 59 commits were
+# `selfhost` - a directory deleted in #1593 and one renamed to `compiler` in
+# #1841 - and never named `compiler` itself, so 41 of 0.1.5's 59 commits were
 # reported nowhere and nothing said so, #2061) and a bare `Uncategorised`
 # catch-all that, on 0.1.17, swallowed 66 of 80 commits.
 #
@@ -78,9 +78,9 @@ take '^perf(\([^)]*\))?:'              ; emit 'Performance'      "${BODY}"
 # only touches `runtime/ABI.md` must not be filed under Runtime because of its
 # directory). Otherwise each touched path maps to a top-level area and the
 # commit is filed under whichever area touched the most files; a repo-root
-# file or any unrecognised top-level directory maps to Documentation. Ties —
+# file or any unrecognised top-level directory maps to Documentation. Ties -
 # including an all-unrecognised commit, which ties at Documentation by
-# definition — are broken by the listed order below, so the result is a pure
+# definition - are broken by the listed order below, so the result is a pure
 # function of the tree and is stable across reruns.
 CLASSIFICATION="$(git log --no-merges --reverse --name-only --pretty=format:'@@COMMIT@@%h' "${RANGE}" | awk '
   BEGIN {
@@ -146,7 +146,7 @@ CLASSIFICATION="$(git log --no-merges --reverse --name-only --pretty=format:'@@C
 # substitution), not by handing CLASSIFICATION to awk through `-v`: macOS's
 # /usr/bin/awk (the one-true-awk, not gawk) rejects a raw newline inside a
 # `-v` value with "newline in string ... at source line 1", and
-# CLASSIFICATION is exactly that — a multi-line sha->category table.
+# CLASSIFICATION is exactly that - a multi-line sha->category table.
 TAGGED="$(awk -F'\t' '
   FNR==NR { sha2cat[$1] = $2; next }
   {
@@ -160,7 +160,7 @@ TAGGED="$(awk -F'\t' '
 # split from emitting, a category whose emit call went missing would still
 # have its commits silently stripped out of REMAINING by the classification
 # step, so the accounting guard below would catch the shortfall but could
-# no longer name which commits caused it — the exact failure mode the guard
+# no longer name which commits caused it - the exact failure mode the guard
 # exists to rule out. Deleting one `emit_category` call must leave that
 # category's commits sitting in REMAINING, not vanished.
 emit_category() {
@@ -184,7 +184,7 @@ emit_category 'Examples'
 # THE POINT OF THE ACCOUNTING. Every commit in the range must appear exactly
 # once: `take` claims, so a duplicate is impossible and a shortfall means a
 # pattern lost something. Release notes that quietly omit a third of a release
-# read as complete, which is why this exits rather than warns —
+# read as complete, which is why this exits rather than warns -
 # dist/release.sh's fallback writes a minimal note when this fails.
 TOTAL="$(printf '%s\n' "${COMMITS}" | grep -c .)"
 if [ "${EMITTED}" -ne "${TOTAL}" ]; then

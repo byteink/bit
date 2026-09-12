@@ -3,7 +3,7 @@
 `_tests_/bit/stressparallel.bit` (#2538, epic #1253) builds and runs the five
 programs in `_tests_/stress/parallel/*.bit`. Together they prove three things
 about the runtime under real concurrency, each independently checked by a
-reconciling value (an exact count, a checksum, or an exactly-once tally) — not
+reconciling value (an exact count, a checksum, or an exactly-once tally) - not
 by "it did not crash": **no data race** (`mutexcounter`'s final count must be
 exactly `STRESS_WORKERS*50000`; a lost update from a race moves it), **no
 lost or duplicated channel message** (`chanhammer`'s close races every
@@ -22,7 +22,7 @@ Reproduce the whole table with:
 
 This is registered in `coreSteps()`, not `gateSteps()`
 (`tools/build/defs.bit:104`, `tools/build/gatestable2.bit:206`), so it is
-deliberately **not** part of `./make test` — same shape as
+deliberately **not** part of `./make test` - same shape as
 `test-stress`/`test-differentials`.
 
 Every build and every run is bounded to a **300-second base** deadline
@@ -30,7 +30,7 @@ Every build and every run is bounded to a **300-second base** deadline
 is scaled by currently observed host load (up to `loadScaleCap=8`,
 `_tests_/bit/stressparallel.bit:103`) and capped at `clampTimeoutMs=6000000`
 (`_tests_/bit/stressparallel.bit:109`, matching the runtime's own
-`osBoundedMaxMs` clamp in `runtime/root/{darwin,linux}/os.bit:450/458`) —
+`osBoundedMaxMs` clamp in `runtime/root/{darwin,linux}/os.bit:450/458`) -
 a fixed 300s wall was found to false-time-out under heavy fleet contention
 (load 41-50) while the same binary finished in 30.85s wall run alone. A
 genuinely hung program is still killed, just at a higher ceiling under load
@@ -45,8 +45,8 @@ run below names it explicitly rather than relying on the runtime's default
 
 ## Coverage table
 
-Each program is built once and executed twice — `BIT_WORKERS=8` then
-`BIT_WORKERS=1` — both passes always with `STRESS_WORKERS=8`
+Each program is built once and executed twice - `BIT_WORKERS=8` then
+`BIT_WORKERS=1` - both passes always with `STRESS_WORKERS=8`
 (`_tests_/bit/stressparallel.bit:289-291`, hardcoded regardless of
 `BIT_WORKERS`), so the `BIT_WORKERS` column below covers both runs for that
 program: a target only reads `pass` once **both** passes reported `PASS` in
@@ -60,18 +60,18 @@ the same run.
 | self-referential record graph + per-worker retention ring under `BIT_GC=stress`; each retained record must survive concurrent collection intact | gcalloc | 8 | 8, 1 | pass | not run | not run |
 | 3-stage producer/mapper/consumer pipeline sized so stage 2 is the bottleneck, forcing real backpressure; consumer verifies exactly-once delivery | pipeline | 8 | 8, 1 | pass | not run | not run |
 
-`not run` means exactly that — no Linux host was used for this ticket, not
+`not run` means exactly that - no Linux host was used for this ticket, not
 "expected to pass". Running the two Linux targets is #2540, a separate
 ticket; when it lands, replace these two columns with its recorded verdicts
 rather than inferring a Linux result from the macOS one.
 
-**aarch64-macos, measured 2026-08-24** — the reproduce command above, run via
+**aarch64-macos, measured 2026-08-24** - the reproduce command above, run via
 `boxlock.sh run` on this dev Mac, at commit `d0ba4ef6` (the load-scaled
 version described above; merged to `main` at `46f707cc`, confirmed with
 `git merge-base --is-ancestor d0ba4ef6 main`), under real heavy fleet
 contention (`uptime` load 38.79/64.60/70.83, 6/6 boxlock slots held by other
 agents' builds): all 10 runs (5 programs x `BIT_WORKERS` 8 and 1) reported
-`PASS`, `stress-parallel: all 10 runs passed`, exit 0, 7m55s wall — no
+`PASS`, `stress-parallel: all 10 runs passed`, exit 0, 7m55s wall - no
 `TIMEOUT`, the exact contention class that produced a false timeout before
 #3587's load-scaling. Recorded in #3587's engineer comment. A repeat attempt
 in this ticket's own worktree queued behind a `solo`-held lock (another

@@ -30,7 +30,7 @@ fn circleArea(r: f64): f64 {
 
 Magnitude of `x`: the sign bit cleared, IEEE 754-2019 §5.5.1. So `abs(-0.0)` is
 `+0.0` exactly, and `1.0 / abs(-0.0)` is `inf`, not `-inf`. Note that
-`abs(-0.0) == 0.0` is true either way — `-0.0 == 0.0` in IEEE 754 — so a test
+`abs(-0.0) == 0.0` is true either way - `-0.0 == 0.0` in IEEE 754 - so a test
 that compares against zero cannot tell a correct result from a wrong one.
 
 ### `sign(x: f64): f64`
@@ -41,7 +41,7 @@ that compares against zero cannot tell a correct result from a wrong one.
 
 The smaller of the two, matching Go's `math.Min`. If either argument is NaN,
 the result is NaN. Of the two zeros, `-0.0` is smaller: `min(-0.0, 0.0)` and
-`min(0.0, -0.0)` are both `-0.0` — note `1.0 / result` to see the sign, since
+`min(0.0, -0.0)` are both `-0.0` - note `1.0 / result` to see the sign, since
 `-0.0 == 0.0` is true.
 
 ### `max(a: f64, b: f64): f64`

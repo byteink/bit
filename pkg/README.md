@@ -46,7 +46,7 @@ gates. The language can break a package, so a compiler change owes
 writes is a plain `vX.Y.Z`; the package manager maps it to the repository tag
 `web/v0.1.0` (see Releasing, below) because the vanity document carries a
 `dir` field. Ranges (`^0.1.0`) work the same way and only ever match that
-package's own tags — a bare `vX.Y.Z` on this repository is a compiler
+package's own tags - a bare `vX.Y.Z` on this repository is a compiler
 release and is never a candidate. `bit.lock` records the tag that was
 matched, `"tag": "web/v0.1.0"`, beside `"version": "0.1.0"`, so the mapping
 is visible without re-querying the remote.

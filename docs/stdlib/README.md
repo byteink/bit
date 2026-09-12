@@ -20,8 +20,8 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
 | [http](http.md) | `"std/http"` | HTTP/1.1 server and client |
 | [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract |
-| [hash](hash.md) | `"std/hash"` | CRC-32C — error detection, NOT an integrity or security primitive |
-| [rand](rand.md) | `"std/rand"` | Seedable pseudo-random generation — NOT cryptographically secure |
+| [hash](hash.md) | `"std/hash"` | CRC-32C - error detection, NOT an integrity or security primitive |
+| [rand](rand.md) | `"std/rand"` | Seedable pseudo-random generation - NOT cryptographically secure |
 | [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake, record |
 | [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
 | [json](json.md) | `"std/json"` | JSON and JSONC parsing, encoding, and comment-preserving editing |
@@ -33,11 +33,11 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
 | [sync](sync.md) | `"std/sync"` | `Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics |
 | [prof](prof.md) | `"std/prof"` | In-process CPU sampling profiler (aarch64-macos only) |
-| [sql](sql.md) | `"std/sql"` | The database driver contract — interface, registry, no driver |
+| [sql](sql.md) | `"std/sql"` | The database driver contract - interface, registry, no driver |
 | [jwt](jwt.md) | `"std/jwt"` | JWS sign/verify, RFC 7519 claim validation, JWKS key selection |
-| [smtp](smtp.md) | `"std/smtp"` | ESMTP submission client — STARTTLS, AUTH, MIME messages |
-| [runtime](runtime.md) | `"std/runtime"` | `runRecovering` — the per-task panic boundary |
-| [trace](trace.md) | `"std/trace"` | Distributed tracing — spans, W3C `traceparent` propagation, an OTLP/HTTP exporter |
+| [smtp](smtp.md) | `"std/smtp"` | ESMTP submission client - STARTTLS, AUTH, MIME messages |
+| [runtime](runtime.md) | `"std/runtime"` | `runRecovering` - the per-task panic boundary |
+| [trace](trace.md) | `"std/trace"` | Distributed tracing - spans, W3C `traceparent` propagation, an OTLP/HTTP exporter |
 
 ## Conventions
 

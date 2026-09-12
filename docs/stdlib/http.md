@@ -74,7 +74,7 @@ line start, or `""` if absent.
 ### `atoi(s: string): int`
 
 The non-negative integer `s` denotes, or `-1` on any non-digit (including the
-empty string) or a magnitude that would overflow `int` — it never silently
+empty string) or a magnitude that would overflow `int` - it never silently
 wraps. Used internally for a request's `Content-Length`, a response status
 code, and a URL port; exported so callers parsing the same kind of untrusted,
 network-sourced decimal text get the same overflow-safe guard.
@@ -107,14 +107,14 @@ fn accepts(req: Request): string {
 
 Sets header `name` to `value` on `r.headers`, replacing any existing field of
 the same name. Fails, leaving `r.headers` untouched, on a non-token byte in
-`name` or a CR, LF or NUL byte in `value` — the bytes that would otherwise let
+`name` or a CR, LF or NUL byte in `value` - the bytes that would otherwise let
 a value reflected from a request inject an extra header line into the
 response `serializeResponse` writes to the wire verbatim.
 
 ### `Response.addHeader(name: string, value: string): ()!`
 
 Appends header `name: value` without removing any existing field of the same
-name — the spelling `Set-Cookie` needs, since a response can legitimately
+name - the spelling `Set-Cookie` needs, since a response can legitimately
 carry more than one. Same validation as `setHeader`.
 
 ### `Response.getHeader(name: string): string`
@@ -136,11 +136,11 @@ fn withRequestId(rid: string): Response! {
 ## Multipart
 
 `parseMultipart` (RFC 7578) turns a `Request.body` into named text fields and
-named file parts — the piece needed to receive a file upload. It lives in this
+named file parts - the piece needed to receive a file upload. It lives in this
 module, not a framework, so any plain `std/http` server can read one.
 
 **The body is attacker-controlled.** Every `Limits` field is required and none
-is disableable by passing zero — a zero limit rejects everything that would
+is disableable by passing zero - a zero limit rejects everything that would
 use it, it never means "unlimited". A malformed or missing boundary, an
 over-limit body/file/part-count, or a part whose headers exceed their own
 limit fails the whole parse: nothing is ever returned from a failed call, and
@@ -148,7 +148,7 @@ a bad part is never skipped in favor of the rest.
 
 `filename` and a file part's declared `contentType` are returned **exactly as
 received** and are never inspected, sanitised, decoded, or used to build a
-path — both are attacker-controlled, and a filename of `../../etc/passwd` is
+path - both are attacker-controlled, and a filename of `../../etc/passwd` is
 returned as that literal string. Joining it to a path, or trusting the
 declared content type, is the caller's decision to make deliberately.
 
@@ -173,7 +173,7 @@ One text field as sent: `name` and `value`.
 ### `FormFile`
 
 One file part as sent: `name`, the sender's declared `filename` and
-`contentType` (both untrusted — see above), and the raw `content` bytes.
+`contentType` (both untrusted - see above), and the raw `content` bytes.
 
 ### `Form`
 
@@ -209,7 +209,7 @@ fn handleUpload(body: []byte, boundary: string): Form! {
 ### `multipartField(body: []byte, boundary: string, name: string, limits: Limits): (string, bool)!`
 
 The value of the first text field named `name`, and whether such a field was
-there at all — `("", true)` for a present-but-empty field, `("", false)` for
+there at all - `("", true)` for a present-but-empty field, `("", false)` for
 an absent one. A part carrying a `filename` parameter is a file and is never
 returned as a field value, whatever its name.
 
@@ -217,13 +217,13 @@ This is `parseMultipart`'s walk with nothing built: no `Form`, and no part
 body materialised except the one returned, so reading a hidden `_csrf` field
 out of a body that also carries a 5 MiB upload does not copy the upload.
 
-The body itself is not copied either — the walk scans the `[]byte` it is
+The body itself is not copied either - the walk scans the `[]byte` it is
 given. The only bytes copied are the returned value and each part's own
 header block, which `maxPartHeaderBytes` bounds.
 
 What it does not skip is a check. The whole body is walked even after the
 field is found, and every limit applies to every part, so it fails on exactly
-the bodies `parseMultipart` fails on with the same message — a value is never
+the bodies `parseMultipart` fails on with the same message - a value is never
 returned out of a body that is malformed further along.
 
 ```bit
@@ -242,8 +242,8 @@ fn formToken(body: []byte, boundary: string): string {
 
 ## Query strings
 
-`Request.path` is the raw request target straight off the wire —
-`/todos?done=true&limit=10`, still percent-encoded — and stays that way for
+`Request.path` is the raw request target straight off the wire -
+`/todos?done=true&limit=10`, still percent-encoded - and stays that way for
 compatibility. These four functions are the parsing every handler and every
 client otherwise hand-rolls.
 
@@ -251,7 +251,7 @@ client otherwise hand-rolls.
 
 Splits a request target at its first `?` into `(path, rawQuery)`. A target
 with no `?` returns the whole target as the path and `""` as the query.
-Neither half is decoded — decode the pieces `parseQuery`/`percentDecode`
+Neither half is decoded - decode the pieces `parseQuery`/`percentDecode`
 return, never `target` as a whole, or an encoded `?`/`&`/`=` inside a value
 can be mistaken for a real separator.
 
@@ -267,17 +267,17 @@ duplicate key is last-wins: `parseQuery("limit=1&limit=999")` yields
 ### `percentDecode(s: string): string`
 
 Percent-decodes `s`: `%XX` becomes the byte `0xXX`, `+` becomes a space,
-everything else passes through unchanged. A malformed escape — a `%` not
-followed by two hex digits — is left exactly as it appears rather than
+everything else passes through unchanged. A malformed escape - a `%` not
+followed by two hex digits - is left exactly as it appears rather than
 failing, the same leniency mainstream HTTP servers apply.
 
 ### `percentEncode(s: string): string`
 
 Percent-encodes every byte of `s` other than the RFC 3986 unreserved set
-(`A-Z a-z 0-9 - . _ ~`) as `%XX`, uppercase hex — the exact inverse of
+(`A-Z a-z 0-9 - . _ ~`) as `%XX`, uppercase hex - the exact inverse of
 `percentDecode` for every byte 0-255, always emitting a space as `%20`
 rather than `+`. Escape any value interpolated into a query string with this
-before sending it — `std/http`'s own client has no other way to keep an
+before sending it - `std/http`'s own client has no other way to keep an
 unescaped value from corrupting the request line.
 
 ```bit
@@ -296,8 +296,8 @@ fn searchUrl(base: string, term: string): string {
 ## Server
 
 Drive the server with an `accept()` loop, spawning a green thread per exchange
-and calling `Exchange.read()` there. `accept()` only accepts — it returns as
-soon as a connection exists, before anything is read off it — so a slow or
+and calling `Exchange.read()` there. `accept()` only accepts - it returns as
+soon as a connection exists, before anything is read off it - so a slow or
 stalled client's read can only ever block its own exchange, never the next
 accept or another exchange's read.
 
@@ -322,7 +322,7 @@ The port the server is bound to.
 ### `Server.accept(): Exchange!`
 
 Accepts the next connection, parking until a client arrives. Returns
-immediately once the connection exists — it does not read anything off it;
+immediately once the connection exists - it does not read anything off it;
 call `Exchange.read()` for that, on its own spawned green thread.
 
 ### `Exchange.read(): Request!`
@@ -331,7 +331,7 @@ Reads the request (headers and body) off this exchange's connection. Parks
 until the whole request arrives. Fails on a malformed request (bad framing, a
 Content-Length/Transfer-Encoding conflict, a control character in a header, a
 header block over the 64 KiB cap, or a body over the owning server's
-`setMaxBodyBytes` budget) — answer 400 and drop the connection
+`setMaxBodyBytes` budget) - answer 400 and drop the connection
 rather than pass the failure to a handler. Call this on its own green thread
 (spawned right after `accept()`), never inline in the accept loop.
 
@@ -342,11 +342,11 @@ Writes `res` to the connection and closes it.
 ### `Exchange.hijack(): Conn`
 
 Takes ownership of the exchange's underlying `std/net` connection for a
-protocol upgrade (e.g. WebSocket, RFC 6455 §4.1 — see `std/websocket`'s
+protocol upgrade (e.g. WebSocket, RFC 6455 §4.1 - see `std/websocket`'s
 `upgrade`) that continues past the framing `respond()` assumes: `respond()`
 always writes exactly one HTTP response and closes the connection, which an
 upgraded connection must not do. Call `read()` first, check the request looks
-like the upgrade you expect, then call this instead of `respond()` — never
+like the upgrade you expect, then call this instead of `respond()` - never
 both on the same exchange, since the caller now owns the connection's
 lifetime, including closing it.
 
@@ -459,7 +459,7 @@ direct `Server.accept()`/`Exchange` API.
 
 ## Request headers
 
-`header(block, name)` only ever *reads* a raw header block — nothing lets a
+`header(block, name)` only ever *reads* a raw header block - nothing lets a
 caller *attach* one to an outgoing request. `Header` plus `requestWith` /
 `Client.setHeader` / `Client.requestWith` (below, under [Client](#client)) are
 the write side.
@@ -472,8 +472,8 @@ ever reaches the wire.
 ### `serializeHeaders(headers: []Header): string!`
 
 Validates every entry of `headers` and serializes them into one raw
-`"Name: value\r\n"`-per-line block — the exact wire form `header()` reads.
-Fails on the first invalid header — an empty name, a name with a byte outside
+`"Name: value\r\n"`-per-line block - the exact wire form `header()` reads.
+Fails on the first invalid header - an empty name, a name with a byte outside
 RFC 9110 §5.6.2's `token` set, a value containing a raw CR, LF or NUL (the
 request-side twin of the response-header-injection check `header()`'s own
 callers already need), or a name this module manages itself and never lets a
@@ -481,27 +481,27 @@ caller set: `Host`, `Connection`, `Content-Length`, `Transfer-Encoding`,
 `Keep-Alive`, `Proxy-Connection`, `Upgrade`, and `Accept-Encoding`.
 
 **`Accept-Encoding` is deliberately on that list.** There is no compression
-module anywhere in this stdlib — no `gzip`/`flate`/`zlib`/`compress` — so the
+module anywhere in this stdlib - no `gzip`/`flate`/`zlib`/`compress` - so the
 client sends no `Accept-Encoding` and a conforming server never compresses;
 `Response.body` is always exactly what the server sent. Letting a caller write
 `Accept-Encoding: gzip` by hand would make a conforming server compress, and
-`Response.body` would silently become a gzip stream nothing here can inflate —
+`Response.body` would silently become a gzip stream nothing here can inflate -
 a body-corruption bug, not a missing convenience. It stays rejected until a
 decoder exists.
 
 Because a `fail` here returns no value at all, a caller can never observe a
 partial block built from only the headers validated before the one that
-failed — the whole call comes back as one failure.
+failed - the whole call comes back as one failure.
 
 ### `validateHeaderName(name: string): ()!`
 
 Fails unless `name` is a non-empty RFC 9110 `token` (`!#$%&'*+-.^_`|~`, a
-digit, or an ASCII letter, one or more) — the same check `Response.setHeader`
+digit, or an ASCII letter, one or more) - the same check `Response.setHeader`
 runs on the response side, so a name is rejected identically either way.
 
 ### `validateHeaderValue(value: string): ()!`
 
-Fails if `value` contains a raw CR, LF or NUL — again the same check
+Fails if `value` contains a raw CR, LF or NUL - again the same check
 `Response.setHeader`/`addHeader` already run.
 
 ```bit
@@ -528,7 +528,7 @@ hostname against the default roots; an `http://` URL runs over cleartext TCP.
 ### `requestWith(method: string, url: string, headers: []Header, body: string): Response!`
 
 As `request`, but attaches `headers` (see [Request headers](#request-headers))
-to the outgoing request — `Authorization`, `Content-Type`, `Accept`, or any
+to the outgoing request - `Authorization`, `Content-Type`, `Accept`, or any
 custom header. Each is validated the same way `serializeHeaders` validates it;
 an invalid name or value, or a name this module manages itself (`Host`,
 `Accept-Encoding`, ...), fails the whole call before anything is sent. Covers

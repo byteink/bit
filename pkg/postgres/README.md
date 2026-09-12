@@ -14,7 +14,7 @@ Install with `bit add bitlang.org/pkg/postgres@v0.1.0`.
 
 ## The exported surface
 
-`adapter(): Adapter` — nothing else. URI parsing lives behind the `Adapter`
+`adapter(): Adapter` - nothing else. URI parsing lives behind the `Adapter`
 interface rather than beside it, because the one-line driver swap is the whole
 point of `std/sql`: a program that imported a second symbol from here could not
 change one line and be on a different database.
@@ -33,7 +33,7 @@ postgresql://app:pw@db.internal/erp?sslmode=verify-full
 Datasource{ host: "localhost", user: "app", database: "dev" }
 ```
 
-`port` 0 — the `Datasource` default — means 5432. `sslmode` is the only query
+`port` 0 - the `Datasource` default - means 5432. `sslmode` is the only query
 parameter read; any other fails naming itself rather than being dropped. An
 unrecognised `sslmode` value is rejected, never defaulted.
 
@@ -41,7 +41,7 @@ unrecognised `sslmode` value is rejected, never defaulted.
 
 Postgres has no TLS port and no ALPN. The driver opens a cleartext socket,
 sends the eight-byte `SSLRequest` packet, and reads the server's one-byte
-answer — `S` (handshake now, on this socket) or `N` (this server has no TLS).
+answer - `S` (handshake now, on this socket) or `N` (this server has no TLS).
 `std/tls.client` runs the handshake from there.
 
 **With no `sslmode`,** the strongest rung that works is taken: `verify-full`,
@@ -53,7 +53,7 @@ It fails rather than downgrading, which is what makes a production URI a
 guarantee.
 
 Accepted values: `disable`, `require`, `verify-ca`, `verify-full`. libpq's
-`prefer` and `allow` are not accepted — they name the fallback behaviour that
+`prefer` and `allow` are not accepted - they name the fallback behaviour that
 omitting `sslmode` already gives.
 
 Every rung below `verify-full` prints one line to stderr, **once per pool**,
@@ -68,7 +68,7 @@ to avoid.
 ## Authentication
 
 `scram-sha-256` (RFC 5802/7677) whenever the server offers it, and `md5`,
-cleartext `password` and `trust` all connect — a stock server uses one of the
+cleartext `password` and `trust` all connect - a stock server uses one of the
 last three, and a driver that refuses them is a driver nobody can start with.
 Each of the three warns once per pool, naming the method and the fix.
 
@@ -77,7 +77,7 @@ The SCRAM exchange verifies the **server's** signature before accepting
 
 ## Queries
 
-Every statement goes out on the **extended query protocol** — Parse, Bind,
+Every statement goes out on the **extended query protocol** - Parse, Bind,
 Describe, Execute, Sync, written as one batch, one round trip. The simple query
 protocol has no field a parameter could travel in, so a driver using it for
 `where id = $1` would have to build the statement text around the caller's
@@ -110,7 +110,7 @@ let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL")?, maxOpen: 20 })?
 
 A named prepared statement lives on **one** backend. pgbouncer in transaction
 mode hands the next query to a different one, which answers `prepared statement
-"s1" does not exist` — an error naming neither the pooler nor the cache. RDS
+"s1" does not exist` - an error naming neither the pooler nor the cache. RDS
 Proxy instead pins the connection, so the pooling silently stops happening.
 Opt in when you know neither is in front of you:
 
@@ -144,8 +144,8 @@ db.exec(sql, params) catch e {
 failure) and `40P01` (deadlock detected) are. Telling them apart by message
 text is how retry loops get written wrong.
 
-Every exchange is drained to `ReadyForQuery`, so a statement that failed —
-including one that failed halfway through a result set — leaves the connection
+Every exchange is drained to `ReadyForQuery`, so a statement that failed -
+including one that failed halfway through a result set - leaves the connection
 usable, and the next borrower from the pool never inherits a half-read stream.
 
 ## Limitations, and where each one is going
@@ -175,7 +175,7 @@ usable, and the next borrower from the pool never inherits a half-read stream.
 parser, the startup exchange against an in-process fake backend that is a real
 SCRAM server side (it derives `StoredKey`/`ServerKey` and verifies the client's
 proof), so a forged server signature, a replayed nonce, a weak iteration count
-and a missing server proof each fail — and the query layer against a backend
+and a missing server proof each fail - and the query layer against a backend
 that decodes each frontend frame and answers it, which is where "no named Parse
 across a hundred executions" is asserted against the bytes that were sent.
 
@@ -205,7 +205,7 @@ PG_TEST_PASSWORD_URI=postgres://postgres:pw@127.0.0.1:55003/postgres \
 
 `PG_TEST_TRUST_URI` alone covers the query layer: the parameter round trip and
 its OIDs, the SQLSTATEs, the mid-result-set failure, and the cache, which is
-counted from the server's own `pg_prepared_statements`. Any port works — the
+counted from the server's own `pg_prepared_statements`. Any port works - the
 one field-form test that needs 5432 skips out loud elsewhere:
 
 ```sh

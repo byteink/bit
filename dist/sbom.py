@@ -30,10 +30,10 @@ Bit has no ecosystem-specific CycloneDX generator and no package manifest for a
 scanner to read, so this is written directly against the model rather than an
 autodetecting scanner.
 
-The one real "component" in this build is the PINNED STAGE0 — the previous Bit
+The one real "component" in this build is the PINNED STAGE0 - the previous Bit
 release, which compiles this tree's compiler and every linked runtime archive.
 It is listed under metadata.tools, the schema's slot for build tooling, not as a
-shipped dependency — because it is not one. Nothing else occupies that slot:
+shipped dependency - because it is not one. Nothing else occupies that slot:
 the build needs no compiler other than a previous Bit release.
 """
 import sys

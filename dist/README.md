@@ -1,7 +1,7 @@
-# Bit release artifacts — the packaging contract
+# Bit release artifacts - the packaging contract
 
 This file is the contract between the release pipeline
-(`dist/release.sh`, run by hand from a maintainer machine, never from CI — this
+(`dist/release.sh`, run by hand from a maintainer machine, never from CI - this
 repo has no GitHub Actions and never will, see `CONTRIBUTING.md`'s "No GitHub
 Actions") and everything downstream that consumes a published release:
 the Homebrew tap (#359), the `curl | sh` installer (#360), and the
@@ -10,7 +10,7 @@ the consumers.
 
 ## Which targets actually ship
 
-The compiler has four build targets — `bit build --target` accepts exactly
+The compiler has four build targets - `bit build --target` accepts exactly
 `x86_64-linux`, `aarch64-linux`, `aarch64-macos`, `x86_64-windows`
 (`compiler/build.bit`, `parseBuildTarget`). Those four, and only those four,
 are published today.
@@ -21,8 +21,8 @@ are published today.
 | `aarch64-linux` | `bit-<version>-linux-aarch64.tar.xz` | shipping |
 | `aarch64-macos` | `bit-<version>-macos-aarch64.tar.xz` | shipping |
 | `x86_64-windows` | `bit-<version>-windows-x86_64.zip`  | shipping (#3342), smoke-tested on real hardware over SSH |
-| `x86_64-macos`  | `bit-<version>-macos-x86_64.tar.xz`  | **not built** — the Mach-O linker has no x86-64 relocation support; `./make libbitrt` emits the archive but no compiler target selects it |
-| `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** — out of scope for the Windows port (epic #3322 targets x86_64-windows only) |
+| `x86_64-macos`  | `bit-<version>-macos-x86_64.tar.xz`  | **not built** - the Mach-O linker has no x86-64 relocation support; `./make libbitrt` emits the archive but no compiler target selects it |
+| `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** - out of scope for the Windows port (epic #3322 targets x86_64-windows only) |
 
 `dist/release.sh` is a maintainer-run script with no CI behind it (this repo
 has no GitHub Actions and never will; see `CONTRIBUTING.md`'s "No GitHub
@@ -39,18 +39,18 @@ bit-<version>-<os>-<arch>.zip         # windows
 bit-<version>.cdx.json                # CycloneDX SBOM, one per release
 ```
 
-* `<version>` — the git tag with its leading `v` stripped. `v0.1.0-rc1` →
+* `<version>` - the git tag with its leading `v` stripped. `v0.1.0-rc1` →
   `0.1.0-rc1`.
-* `<os>` — `linux` | `macos` | `windows`.
-* `<arch>` — `x86_64` | `aarch64`. These match the compiler's own target
+* `<os>` - `linux` | `macos` | `windows`.
+* `<arch>` - `x86_64` | `aarch64`. These match the compiler's own target
   spelling, not `uname -m`. Installers must map: Linux `uname -m` already
   reports `x86_64`/`aarch64`, but macOS reports `arm64` for `aarch64`.
 
 ## SBOM
 
 `bit-<version>.cdx.json` is a CycloneDX 1.7 SBOM, one per release (not one per
-target — the three archives share the same toolchain and dependency set).
-Generated automatically, as one of `dist/release.sh`'s own steps (#2748) — no
+target - the three archives share the same toolchain and dependency set).
+Generated automatically, as one of `dist/release.sh`'s own steps (#2748) - no
 maintainer ever runs `dist/sbom.py` by hand or decides whether to. The script
 builds it via `cyclonedx-python-lib` (version pinned once, in
 `dist/sbom-requirements.txt`, read by both the release flow and
@@ -74,11 +74,11 @@ bit-<version>-<os>-<arch>/
   lib/aarch64-linux/libbitrt.a         #   can link, so a single install can
   lib/aarch64-macos/libbitrt.a         #   cross-produce the other targets
   stdlib/...                           # the Bit standard library source tree
-  docs/...                             # the docs/ tree, verbatim (#3500) — so
+  docs/...                             # the docs/ tree, verbatim (#3500) - so
                                         #   README.md's relative docs/ links
                                         #   resolve inside the install instead
                                         #   of 404ing
-  libexec/upgrade.sh                   # what `bit upgrade` runs (#4329) — it
+  libexec/upgrade.sh                   # what `bit upgrade` runs (#4329) - it
                                         #   must live in the install, because
                                         #   an artifact is all a curl|sh user
                                         #   has on disk
@@ -87,7 +87,7 @@ bit-<version>-<os>-<arch>/
   ARTIFACT.md                          # this file
 ```
 
-## Path resolution — installers need no wrapper
+## Path resolution - installers need no wrapper
 
 `bin/bit` resolves the standard library and the runtime archive from **its own
 location**, not the current working directory. Unpack the artifact anywhere and
@@ -110,7 +110,7 @@ of the two paths, independently:
    beside the binary, is tried second),
 3. the development-tree defaults, relative to the cwd.
 
-Each path is answered on its own evidence — the prefix is probed, not assumed —
+Each path is answered on its own evidence - the prefix is probed, not assumed -
 so a build tree, a flat unpack and a shipped artifact all work without a special
 case.
 
@@ -139,9 +139,9 @@ standard two-space format with bare filenames (no directory components):
 
 Consumers:
 
-* Linux — `sha256sum --check --ignore-missing SHA256SUMS`
-* macOS — `shasum -a 256 --check --ignore-missing SHA256SUMS`
-* Anywhere — `grep " <filename>$" SHA256SUMS | cut -d' ' -f1`
+* Linux - `sha256sum --check --ignore-missing SHA256SUMS`
+* macOS - `shasum -a 256 --check --ignore-missing SHA256SUMS`
+* Anywhere - `grep " <filename>$" SHA256SUMS | cut -d' ' -f1`
 
 A checksum mismatch must abort loudly; there is no signature layer behind it
 yet, so this file is the only integrity check a downloader gets.
@@ -153,7 +153,7 @@ artifact**, not the staging tree: it untars into an unrelated directory, sets
 `BIT_STDLIB`/`BIT_LIBBITRT` explicitly, and requires `bit` to compile and run a
 program from an unrelated cwd. Testing the shipped bytes rather than the build
 tree is what caught macOS `bsdtar` writing an AppleDouble `._<name>.bit` beside
-every stdlib source — files the shipped compiler then globbed as real input,
+every stdlib source - files the shipped compiler then globbed as real input,
 breaking every macOS artifact. A staging-tree test passed that build happily.
 Keep the ordering.
 
@@ -165,7 +165,7 @@ artifact is not a pass. No artifact is published without having executed at
 least once on hardware matching its target.
 
 Smoke-testing proves the shipped bytes run. It does not prove they are the
-bytes the published source actually produces — that is a separate claim, and
+bytes the published source actually produces - that is a separate claim, and
 **[`dist/REPRODUCIBLE.md`](REPRODUCIBLE.md)** is the document for it: a
 command sequence usable by a third party with no access to this repo's
 internal worktree or build-chain knowledge, starting from only a git clone at
@@ -174,7 +174,7 @@ the release tag and the published `SHA256SUMS`.
 ## Container image
 
 `ghcr.io/byteink/bit` is built from the release artifacts by
-`docker/toolchain.Dockerfile` — not from source, so the image ships exactly the
+`docker/toolchain.Dockerfile` - not from source, so the image ships exactly the
 bytes `dist/release.sh` already produced and verified. This is a separate,
 manual step, by decision: unlike a draft GitHub release, a pushed container tag
 is live on completion with no undraft step, so it stays out of
@@ -213,7 +213,7 @@ successful version query.
   `compiler/` to `dist/out/stagesrc/compiler` with `version.bit` excluded and a
   generated one written in its place, then cross-builds the four targets from
   that copy. The staging is the **only** difference between a release build and
-  a local one — nothing patches a source file, and the working tree stays clean.
+  a local one - nothing patches a source file, and the working tree stays clean.
 
 * Nothing consults git, a tag, or the network at build time. A release tarball
   with no `.git` in it builds and reports its own version correctly.

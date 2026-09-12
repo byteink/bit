@@ -31,7 +31,7 @@ them in one type is how a date shifts by a day when a server moves country.
 | `NaiveDateTime` | a `Date` and a `Time` | no | "9am on the 1st", somewhere |
 | `DateTime` | a `NaiveDateTime`, a `Zone`, an offset | **yes** | 9am on the 1st in Dubai |
 | `Timestamp` | nanoseconds since the Unix epoch | n/a | what a database column holds |
-| `Zone` | an IANA zone identity | — | `Asia/Dubai` |
+| `Zone` | an IANA zone identity | - | `Asia/Dubai` |
 
 `Mono`, the monotonic clock reading, is a seventh type and is unrelated to the
 calendar. It measures elapsed time and nothing else.
@@ -64,10 +64,10 @@ Construction and parsing are fallible and return `T!`. Everything else is total.
 
 | Operation | Fallible |
 |---|---|
-| `date`, `time`, `dateTime` | yes — out-of-range fields |
-| `parseDate`, `parseTime`, `parseNaiveDateTime`, `parseDateTime`, `parseWith` | yes — malformed input |
-| `zone` | yes — unknown identifier, or no zone data on the host |
-| `Date.toTimestamp`, `DateTime.toTimestamp` | yes — outside the representable instant range |
+| `date`, `time`, `dateTime` | yes - out-of-range fields |
+| `parseDate`, `parseTime`, `parseNaiveDateTime`, `parseDateTime`, `parseWith` | yes - malformed input |
+| `zone` | yes - unknown identifier, or no zone data on the host |
+| `Date.toTimestamp`, `DateTime.toTimestamp` | yes - outside the representable instant range |
 | arithmetic, snapping, comparison, differences, formatting | **no** |
 | `NaiveDateTime.inZone`, `DateTime.withZone` | **no** |
 
@@ -96,7 +96,7 @@ cannot be constructed. Every day is exactly 86,400 seconds of UTC.
 
 ### `Zone`
 
-An IANA time zone, identified by its canonical name — `Asia/Dubai`,
+An IANA time zone, identified by its canonical name - `Asia/Dubai`,
 `Europe/London`, `UTC`. Immutable and safe to share. Two `Zone` values naming the
 same zone are equal.
 
@@ -108,7 +108,7 @@ zone **at an instant**, never of the zone alone.
 ### `DateTime`
 
 A wall-clock reading, a zone, and the offset that zone has at the resulting
-instant, resolved once at construction — "9am on the 1st in Dubai" (see
+instant, resolved once at construction - "9am on the 1st in Dubai" (see
 [Six types](#six-types-because-a-moment-is-six-different-things)). Immutable:
 every field is readonly and reached only through methods, documented across
 [Converting between types](#converting-between-types),
@@ -118,8 +118,8 @@ every field is readonly and reached only through methods, documented across
 
 Loads the zone named `name`. Fails when the name is not a zone the host knows.
 
-Zone data is read from the host's own database — `/usr/share/zoneinfo` on Linux
-and macOS — not from a copy bundled into the binary. Governments change daylight
+Zone data is read from the host's own database - `/usr/share/zoneinfo` on Linux
+and macOS - not from a copy bundled into the binary. Governments change daylight
 saving rules around ten times a year, so a bundled copy would tie correctness to
 the compiler release schedule.
 
@@ -187,7 +187,7 @@ happen.
 `02:00` to `01:00`. The wall times `01:00:00` through `01:59:59.999999999` happen
 twice, once at `+01:00` and again at `+00:00`.
 
-> `inZone` **takes the first occurrence** — the one with the earlier offset.
+> `inZone` **takes the first occurrence** - the one with the earlier offset.
 
 Both rules are total and deterministic. A scheduled job that runs at `01:30` runs
 exactly once a day, every day, in every zone, and never raises an error on one day
@@ -217,7 +217,7 @@ fn twentyFiveHours(): int! {
   let before = date(2026, 10, 24)?.atTime(9, 0, 0)?.inZone(london)
   let after = before.addDays(1)
 
-  // after.hour() is 9 — the wall clock is unchanged.
+  // after.hour() is 9 - the wall clock is unchanged.
   // The elapsed real time is 25 hours, because the clocks went back.
   return after.toTimestamp()?.ns - before.toTimestamp()?.ns
 }
@@ -261,7 +261,7 @@ As `time`, with an explicit nanosecond field in 0..999999999.
 
 ### `today(z: Zone): Date`
 
-The calendar date it is right now in `z`. Total — the current instant is always
+The calendar date it is right now in `z`. Total - the current instant is always
 inside the representable range.
 
 ### `now(): Timestamp`
@@ -308,8 +308,8 @@ that drop information.
 
 ### `Date.atTime(hour: int, minute: int, second: int): NaiveDateTime!`
 
-Combines this date with a time of day: "this date, at this time, somewhere"
-— docs/stdlib/time.md, "Choosing a type". Fails exactly when
+Combines this date with a time of day: "this date, at this time, somewhere" -
+docs/stdlib/time.md, "Choosing a type". Fails exactly when
 `time(hour, minute, second)` fails; the field bounds are that constructor's.
 
 ### `Date.atStartOfDay(z: Zone): DateTime`
@@ -320,7 +320,7 @@ This date, at midnight, in `z`. Total: midnight is always `00:00:00`, which
 ### `NaiveDateTime.inZone(z: Zone): DateTime`
 
 Reads this wall clock **as** `z`: "this date, at this time, IN `z`". The wall
-clock is kept; the instant is derived from it. Total — the two awkward days
+clock is kept; the instant is derived from it. Total - the two awkward days
 (see [Daylight saving](#daylight-saving-the-two-awkward-days)) are resolved
 without failing: a wall time in a spring gap pushes forward past the gap, and
 a wall time in an autumn overlap takes the earlier offset.
@@ -329,11 +329,11 @@ a wall time in an autumn overlap takes the earlier offset.
 
 The instant this `DateTime` names, as nanoseconds since the Unix epoch. Fails
 when it falls outside `Timestamp`'s representable range (see
-[Ranges](#ranges)) — never wraps.
+[Ranges](#ranges)) - never wraps.
 
 ### `Timestamp.inZone(z: Zone): DateTime`
 
-This instant, read in `z`. Total — every instant has exactly one offset in any
+This instant, read in `z`. Total - every instant has exactly one offset in any
 zone, so there is nothing to disambiguate.
 
 ### `NaiveDateTime.date(): Date`
@@ -354,7 +354,7 @@ The `Time` half of the wall clock.
 
 ### `DateTime.naive(): NaiveDateTime`
 
-The `NaiveDateTime` half — the wall clock, with the zone dropped.
+The `NaiveDateTime` half - the wall clock, with the zone dropped.
 
 ### `inZone` and `withZone` are different operations
 
@@ -383,7 +383,7 @@ only, because only a `DateTime` already has an instant to preserve.
 ### `DateTime.withZone(z: Zone): DateTime`
 
 Same instant, a different zone's view of it: the instant is kept, the wall
-clock is recomputed for `z`. Total — every instant has exactly one offset in
+clock is recomputed for `z`. Total - every instant has exactly one offset in
 any zone.
 
 ---
@@ -396,7 +396,7 @@ any zone.
 `NaiveDateTime` and `DateTime`**: all eleven of the above, each forwarding to
 the matching `Date` or `Time` accessor (`DateTime` via its wall clock). The
 `DateTime`-only row below is shipped too; `.ns` (`Timestamp`-only) is a plain
-field, not a method — see [Clocks](#clocks).
+field, not a method - see [Clocks](#clocks).
 
 ### `Date.year(): int`
 
@@ -412,7 +412,7 @@ The day of month, 1..`daysInMonth()`.
 
 ### `Date.dayOfWeek(): int`
 
-1 for Monday through 7 for Sunday — ISO 8601 numbering. The superseded,
+1 for Monday through 7 for Sunday - ISO 8601 numbering. The superseded,
 now-deleted `Civil.weekday` was 0 for Sunday through 6 for Saturday; this is
 a deliberately different numbering, not a bug.
 
@@ -435,7 +435,7 @@ October-December is 4.
 the year's first Thursday, and weeks start on Monday. A date in the last
 days of December can fall in week 1 of the following ISO year, and a date
 in the first days of January can fall in the last week (52 or 53) of the
-previous one — the returned number is scoped to that ISO week-numbering
+previous one - the returned number is scoped to that ISO week-numbering
 year, which need not equal `year()`.
 
 ### `Time.hour(): int`
@@ -448,14 +448,14 @@ The minute, 0..59.
 
 ### `Time.second(): int`
 
-The second, 0..59. Never 60 — this module has no leap seconds.
+The second, 0..59. Never 60 - this module has no leap seconds.
 
 ### `Time.nanosecond(): int`
 
 The nanosecond, 0..999999999.
 
 Each of the following forwards to the matching accessor on `.date()` or
-`.time()` — same range, same meaning, no field re-derived here.
+`.time()` - same range, same meaning, no field re-derived here.
 
 ### `NaiveDateTime.year(): int`
 
@@ -481,7 +481,7 @@ Each of the following forwards to the matching accessor on `.date()` or
 
 ### `NaiveDateTime.weekOfYear(): int`
 
-Each of the following forwards to the wall clock — same range, same meaning,
+Each of the following forwards to the wall clock - same range, same meaning,
 no field re-derived here.
 
 ### `DateTime.year(): int`
@@ -630,13 +630,13 @@ Each returns the first or last representable instant of the named period.
 
 The week starts on **Monday**, matching ISO 8601. `startOfWeekOn(day)` and
 `endOfWeekOn(day)` take an explicit first day when a different convention is
-needed — many organisations in the Gulf and the United States start the week on
+needed - many organisations in the Gulf and the United States start the week on
 Sunday. `day` is 1 for Monday through 7 for Sunday, `dayOfWeek()`'s own
 numbering, and is clamped to that range. They are separate names rather than an
 extra argument to `startOfWeek` because Bit has no function overloading.
 
 On a `Date` these return a `Date`. On a `NaiveDateTime` or `DateTime` they set the
-time of day as well. `startOfDay` and `endOfDay` on a `Date` are the identity —
+time of day as well. `startOfDay` and `endOfDay` on a `Date` are the identity -
 a `Date` has no time of day to floor.
 
 None of them fails, and no month length is written down: `endOfMonth` is 28, 29,
@@ -659,12 +659,12 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 
 **Shipped**, on the types named in the tables below: `isLeapYear`, `isBefore`,
 `isAfter`, `isSame`, `isBetween`, `compare`, `isSameDay`, `isSameMonth`,
-`isSameYear`, `isPast`, `isFuture`, `isWeekend` and `isWeekday` — the last two
+`isSameYear`, `isPast`, `isFuture`, `isWeekend` and `isWeekday` - the last two
 take a `Weekend`, see [Business days](#business-days).
 
 ### `Date.isLeapYear(): bool`
 
-True when the year is divisible by 4, and not by 100 unless also by 400 —
+True when the year is divisible by 4, and not by 100 unless also by 400 -
 so 1900 is not a leap year and 2000 is.
 
 ### `NaiveDateTime.isLeapYear(): bool`
@@ -724,7 +724,7 @@ receiver to the argument.
 
 Truncation means partial units are dropped, which is what an age calculation
 wants: someone born 2000-06-15 is 25 on 2026-06-14 and 26 on 2026-06-15. It
-applies in both directions — toward zero, never away from it — so
+applies in both directions - toward zero, never away from it - so
 `a.differenceInDays(b)` is always exactly `-b.differenceInDays(a)`.
 
 A month is complete when `addMonths` has reached it, so `differenceInMonths`
@@ -735,7 +735,7 @@ rather than adding a second end-of-month rule: 2026-01-31 to 2026-02-28 is
 disagree.
 
 On a `DateTime`, **date units read the wall clock and time units read the
-instant** — the same split the rest of the module already makes, where `addDays`
+instant** - the same split the rest of the module already makes, where `addDays`
 moves the wall clock and `Timestamp.add` moves the instant. Across an autumn
 transition `differenceInDays` is 1 while `differenceInHours` is 25.
 
@@ -775,7 +775,7 @@ explicitly rather than reading one from the host, because the right answer is a
 property of the organisation, not of the machine the code runs on.
 
 `weekendOn` **fails** on a day number outside 1..7, and on a set covering all
-seven days — with no weekday left, every search below would run to its cap and
+seven days - with no weekday left, every search below would run to its cap and
 panic, so the empty week is rejected at construction instead. Repeated numbers
 are accepted and mean nothing extra, and an empty slice is a seven-day working
 week.
@@ -825,7 +825,7 @@ read the **wall-clock date** and return a `Date`: a business day is a property o
 the calendar day, so the time of day and the offset carry no information here and
 the answer is the same across a daylight saving transition.
 
-`nextBusinessDay` and `previousBusinessDay` are **strict** — the receiver is never
+`nextBusinessDay` and `previousBusinessDay` are **strict** - the receiver is never
 their own answer, even when it is a business day.
 
 `addBusinessDays(c, 0)` returns the receiver's date **unchanged**, even when that
@@ -842,7 +842,7 @@ it antisymmetric like the rest of the difference family:
 Going forward it is `addBusinessDays`' inverse from any date, weekend days
 included: `d.addBusinessDays(c, k)` is `k` business days from `d` for every
 `k >= 0`. Going back from a date that is **not itself a business day** the two
-differ by one — Saturday minus one business day is the Friday, but the count from
+differ by one - Saturday minus one business day is the Friday, but the count from
 that Saturday to that Friday is 0, because the Friday is the excluded earlier end.
 No half-open span can be both antisymmetric and count a non-business receiver as a
 step; the antisymmetry is the one kept.
@@ -873,7 +873,7 @@ fn paymentDue(invoiced: Date, holidays: []Date): Date {
 ## Formatting
 
 **Shipped**, on `Date`, `Time`, `NaiveDateTime` and `DateTime`. Parsing, the
-other direction, is shipped too — see [Parsing](#parsing).
+other direction, is shipped too - see [Parsing](#parsing).
 
 ### `format(pattern: string): string!`
 
@@ -882,7 +882,7 @@ Unicode Technical Standard #35 and used by Java, .NET, ICU and date-fns.
 
 Fallible only because a pattern can be invalid: it fails on `Y` or `D` (below), on
 a pattern letter this module does not implement, on an unterminated quoted
-literal, and on a symbol the receiver does not carry — `H` on a `Date`, `d` on a
+literal, and on a symbol the receiver does not carry - `H` on a `Date`, `d` on a
 `Time`, `Z` on either. A valid pattern applied to a type carrying every field in
 it never fails.
 
@@ -924,13 +924,13 @@ Use `weekOfYear()` and `dayOfYear()` when those values are genuinely wanted.
 
 ### `Date.toString(): string`
 
-`"2026-09-01"` — ISO 8601, zero-padded. The year is always exactly four
+`"2026-09-01"` - ISO 8601, zero-padded. The year is always exactly four
 digits: the representable range is 1..9999, so it is never shorter than
 four digits and never negative.
 
 ### `Time.toString(): string`
 
-`"09:00:00"` — zero-padded, always exactly two digits per field. When
+`"09:00:00"` - zero-padded, always exactly two digits per field. When
 `nanosecond()` is nonzero, a `.` followed by exactly nine zero-padded
 digits is appended: 500 nanoseconds prints `"09:00:00.000000500"`, never
 `"09:00:00.5"`. Matches the shipped `formatRfc3339`'s existing fractional
@@ -938,19 +938,19 @@ rule.
 
 ### `NaiveDateTime.toString(): string`
 
-`"2026-09-01T09:00:00"` — `.date().toString()` and `.time().toString()`
+`"2026-09-01T09:00:00"` - `.date().toString()` and `.time().toString()`
 joined by an uppercase `"T"`, RFC 3339's date-time separator. With
 nanoseconds: `"2026-09-01T09:00:00.000000500"`.
 
 ### `DateTime.toString(): string`
 
-`"2026-09-01T09:00:00+04:00"` — the wall clock's own canonical form
+`"2026-09-01T09:00:00+04:00"` - the wall clock's own canonical form
 (`.naive().toString()`) plus a numeric `±HH:MM` offset, never abbreviated to
 `Z` even at a zero offset (that shorthand is `Timestamp.toString`'s alone).
 
 ### `Timestamp.toString(): string`
 
-`"2026-09-01T05:00:00Z"` — RFC 3339, always UTC.
+`"2026-09-01T05:00:00Z"` - RFC 3339, always UTC.
 
 ### `toString()`
 
@@ -1022,7 +1022,7 @@ fn fromUkCsv(field: string): NaiveDateTime! {
 
 ### `parseDate(s: string): Date!`
 
-The calendar date `s` names, which must be exactly `YYYY-MM-DD` — what
+The calendar date `s` names, which must be exactly `YYYY-MM-DD` - what
 `Date.toString` writes. Any other length fails, which is what rejects surrounding
 whitespace and a trailing character. The month and day bounds are `date`'s own,
 leap years included, so `parseDate("2026-02-30")` fails rather than rolling into
@@ -1041,7 +1041,7 @@ lowercase `t` fails.
 ### `parseDateTime(s: string): DateTime!`
 
 The zoned value `s` names: a wall clock, then `Z` or a `+HH:MM` / `-HH:MM`
-offset. The zone is a **fixed offset**, named by the offset itself — `+04:00` —
+offset. The zone is a **fixed offset**, named by the offset itself - `+04:00` -
 with `isDst()` false; `Z` yields `utc()`. An IANA zone name is not recoverable
 from an offset and is never guessed at.
 
@@ -1051,14 +1051,14 @@ The wall clock `s` names when read against the LDML `pattern`, the same pattern
 language and the same token table `format` writes with ([Formatting](#formatting)).
 
 A numeric field written `width` times reads exactly `width` digits, and at width 1
-reads a greedy run of one or two — four for `y`. `yy` reads a two-digit year as
+reads a greedy run of one or two - four for `y`. `yy` reads a two-digit year as
 2000..2099. `MMM`/`MMMM` and `E`/`EEEE` read the English month and day names
 `format` writes; a weekday name that contradicts the date fails. `h` needs an `a`
 to say `AM` or `PM`. A field the pattern does not name keeps its default, so
 `dd/MM/yyyy` gives midnight on that day.
 
 `Y` and `D` are rejected exactly as they are when formatting. So are `Z`, `X` and
-`V` — the result carries no zone — and `Q`, which names no month.
+`V` - the result carries no zone - and `Q`, which names no month.
 
 ---
 
@@ -1088,7 +1088,7 @@ Gregorian terms is 1882-11-12 to 2077-11-16.
 
 Builds one directly, for parsing a Hijri date off a document. Fails on a year
 outside the span, a month outside 1..12, or a day past that month's tabulated
-length — `hijriDate(1445, 10, 30)` fails, because Shawwal 1445 has 29 days.
+length - `hijriDate(1445, 10, 30)` fails, because Shawwal 1445 has 29 days.
 
 ### `HijriDate.year(): int`
 
@@ -1109,7 +1109,7 @@ inside `Date`'s own range.
 
 ### `HijriDate.toString(): string`
 
-`1448-03-19` — the Hijri fields, zero-padded, in the order `Date.toString()` uses.
+`1448-03-19` - the Hijri fields, zero-padded, in the order `Date.toString()` uses.
 
 ### `HijriDate.format(pattern: string): string!`
 
@@ -1119,14 +1119,14 @@ al-Awwal, Jumada al-Thani, Rajab, Shaban, Ramadan, Shawwal, Dhu al-Qadah, Dhu
 al-Hijjah. `MMM` is the first three letters of the name and `MMMM` the whole of
 it, so `d MMMM yyyy` on 2024-03-11 gives `1 Ramadan 1445`. `E` reads the weekday
 of the Gregorian day, which is the same day. Fails on a time or zone field, on
-`Y` and `D` for the reasons [Formatting](#formatting) gives, and on `Q` — a
+`Y` and `D` for the reasons [Formatting](#formatting) gives, and on `Q` - a
 quarter is a division of the Gregorian year and names no Hijri period. Month and
 day names are Latin script; Arabic script and Arabic-Indic digits are out of
 scope for this module.
 
 The variant is **Umm al-Qura**, the calendar used for official and civil purposes
-in Saudi Arabia and across the Gulf. Other Hijri variants exist — a purely
-arithmetic one, and observation-based ones — and they can differ from Umm al-Qura
+in Saudi Arabia and across the Gulf. Other Hijri variants exist - a purely
+arithmetic one, and observation-based ones - and they can differ from Umm al-Qura
 by a day. A document that must match a government record needs Umm al-Qura, so
 that is the only variant provided.
 
@@ -1285,7 +1285,7 @@ needs an int.
 ### `Timestamp`
 
 A wall-clock reading, nanoseconds since the Unix epoch, returned by `now`.
-`.ns` is `readonly` and gives the raw nanoseconds. Never pass one to `since` —
+`.ns` is `readonly` and gives the raw nanoseconds. Never pass one to `since` -
 a `Timestamp` can jump backwards (NTP, an operator setting the clock), so it
 cannot measure an interval; use a `Mono` from `monotonic` instead.
 
@@ -1372,7 +1372,7 @@ fn fanOut() {
 ### `sleepUntil(deadlineNs: int)`
 
 Parks the calling green thread until `deadlineNs` on the clock `monotonic().ns`
-reads — an absolute instant, not a duration. Useful when several callers must
+reads - an absolute instant, not a duration. Useful when several callers must
 park on the exact same deadline: compute it once and hand it to every
 `sleepUntil` caller, rather than each recomputing `deadline - monotonic().ns`
 after acquiring a lock, which drifts. A `deadlineNs` already in the past
@@ -1405,7 +1405,7 @@ channel. A duration `d` is nanoseconds, the same unit `sleep` takes.
 
 ### `after(d: int): chan<bool>`
 
-A channel that receives `true` once, `d` nanoseconds from now — the
+A channel that receives `true` once, `d` nanoseconds from now - the
 idiomatic `select` timeout arm. If the timeout arm is never taken, the pool
 slot leaks only until its own deadline: it fires and self-frees regardless,
 so the leak is bounded by `d`, never permanent. In a loop, prefer `newTimer`
@@ -1423,7 +1423,7 @@ Starts a one-shot `Timer` that fires `d` nanoseconds from now.
 ### `Timer.stop(): bool`
 
 Cancels the timer. Returns `true` when it was still pending, `false` when it
-had already fired. Does not drain `c` — a fired timer's buffered `true`
+had already fired. Does not drain `c` - a fired timer's buffered `true`
 value stays there, matching Go's own `Timer.Stop`: `if !t.stop() { <-t.c }`
 drains it before reuse.
 
@@ -1438,7 +1438,7 @@ fired one.
 ### `Ticker`
 
 A repeating timer. `c` receives `true` every `d` nanoseconds until stopped.
-An un-stopped `Ticker` leaks its pool slot forever — the same caveat Go's own
+An un-stopped `Ticker` leaks its pool slot forever - the same caveat Go's own
 `time.Ticker` documents.
 
 ### `newTicker(d: int): Ticker`
@@ -1453,7 +1453,7 @@ otherwise. After this returns, `c` receives no further ticks.
 ### `tick(d: int): chan<bool>`
 
 A channel that receives `true` every `d` nanoseconds, forever. There is no
-way to stop it — the underlying `Ticker` is discarded, so its pool slot
+way to stop it - the underlying `Ticker` is discarded, so its pool slot
 leaks for the life of the program. Use `newTicker` directly when the ticker
 must ever be stopped.
 

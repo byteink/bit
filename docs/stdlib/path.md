@@ -109,11 +109,11 @@ the string `"/a/bc"` starts with `"/a/b"`. A path is always inside itself.
 
 `root == "."` and `root == ""` both mean "the current directory" (`""` cleans
 to `"."`, so an unset config field defaults to it). Every relative `p` that
-does not climb above it with a leading `..` is inside — `contains(".", "a/b")`
-is `true` — and an absolute `p` never is, since a relative root cannot contain
+does not climb above it with a leading `..` is inside - `contains(".", "a/b")`
+is `true` - and an absolute `p` never is, since a relative root cannot contain
 an absolute path.
 
-This comparison is purely lexical — no filesystem access, so a `..` that only
+This comparison is purely lexical - no filesystem access, so a `..` that only
 exists on disk (a symlink planted inside `root`, pointing back outside it) is
 not detected. `contains` alone is therefore not sufficient to decide whether
 serving a path is safe when the tree is attacker-writable.
@@ -138,7 +138,7 @@ fn escapesRoot(root: string, requested: string): bool {
 
 ### `safePath(path: string): bool`
 
-Whether `path` is safe to resolve under *any* root, once joined to it — a
+Whether `path` is safe to resolve under *any* root, once joined to it - a
 guard against untrusted input, not a general path utility. Unlike `contains`,
 which classifies an already-decoded, already-trusted path, `safePath` is
 meant to run directly on the raw string a caller received (an HTTP request
@@ -153,15 +153,15 @@ whatever it would decode to. `safePath` never percent-decodes: `%25` (which
 decodes to a harmless literal `%`) is rejected exactly like `%2e` (which
 decodes to `.`), because telling them apart needs the very decode step this
 function deliberately never performs. This also removes any
-double-decoding ambiguity — `%252e%252e` is rejected on its first `%25`, with
+double-decoding ambiguity - `%252e%252e` is rejected on its first `%25`, with
 no second decode pass needed to reach the inner `..`. A `%` that does **not**
 begin a well-formed escape (`%zz`, or a `%` in the last one or two bytes of
 `path`) is untouched by this rule and passes through like any other byte.
 
 Only after all of that does `path` still have to resolve inside its
 (otherwise unknown) root: it is joined to a synthetic anchor and run through
-`clean`/`contains`, so a raw `..` — doubled, deeply nested, or one that would
-climb past the root entirely — fails.
+`clean`/`contains`, so a raw `..` - doubled, deeply nested, or one that would
+climb past the root entirely - fails.
 
 A caller that needs to accept a literal filename shaped like a
 percent-escape must decode its own input before calling `safePath`, then

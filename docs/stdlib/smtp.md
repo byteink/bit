@@ -36,7 +36,7 @@ Port 465 is implicit TLS: `dialTls` instead, and no `startTls`.
 
 ## What this module refuses to do
 
-Four rules are structural — enforced by the code that would otherwise break
+Four rules are structural - enforced by the code that would otherwise break
 them, not by documentation:
 
 | Rule | Where |
@@ -48,20 +48,20 @@ them, not by documentation:
 
 Header injection is the reason for the first. A newline in a supplied subject,
 recipient or display name lets the caller close the header it was given and open
-one of its own — a `Bcc` to an address the sender never approved is the classic
+one of its own - a `Bcc` to an address the sender never approved is the classic
 payload. The value is refused rather than rewritten, and the whole message is
 rendered and validated before `MAIL FROM` is sent, so a rejected value costs
 zero transmitted bytes.
 
 The second has no opt-out at all. A downgrade that silently puts a password on a
 cleartext wire is worse than not sending the mail, so `AUTH` fails on a
-connection that is neither implicit TLS nor post-`STARTTLS` — and it fails
+connection that is neither implicit TLS nor post-`STARTTLS` - and it fails
 before the command is built, so not even a username is transmitted.
 
 The fourth is a property of the data rather than a flag. A part is sent `7bit`
 only when its own bytes prove it can be: printable ASCII, and every line inside
-the limit with room for the DATA dot-stuffing octet. Anything else — a non-ASCII
-byte, a 1200-character line — becomes base64 wrapped at 76 columns. A header
+the limit with room for the DATA dot-stuffing octet. Anything else - a non-ASCII
+byte, a 1200-character line - becomes base64 wrapped at 76 columns. A header
 value that cannot be folded at whitespace inside the limit becomes RFC 2047
 encoded words, one per line.
 
@@ -98,8 +98,8 @@ The body shape follows what the message carries, with no empty wrappers:
 ### `Address`
 
 A mailbox: `name` is the optional display name, `email` the addr-spec the
-envelope carries. `email` is validated before use — exactly one `@`, a non-empty
-local part, a well-formed domain, and inside RFC 5321's 64/254 octet ceilings —
+envelope carries. `email` is validated before use - exactly one `@`, a non-empty
+local part, a well-formed domain, and inside RFC 5321's 64/254 octet ceilings -
 and `name` is a header value, rejected for CR/LF/NUL like any other. A name that
 is not printable ASCII, or that carries a quote or a backslash, is sent as an
 RFC 2047 encoded word rather than a quoted string.
@@ -108,7 +108,7 @@ RFC 2047 encoded word rather than a quoted string.
 
 A file to attach: `filename`, `contentType` (empty means
 `application/octet-stream`) and `data`, the raw bytes. Attachments are always
-base64 — an attachment is opaque bytes, and choosing an encoding from a sample
+base64 - an attachment is opaque bytes, and choosing an encoding from a sample
 of them is how a binary file arrives corrupted.
 
 ### `newAttachment(filename: string, contentType: string, data: []byte): Attachment`
@@ -155,14 +155,14 @@ Attach `a`. The message becomes `multipart/mixed` at render time.
 ### `Message.setBoundary(b: string)`
 
 Override the MIME boundary. Exists so a test can assert an exact body; the
-default is random (UUIDv4), which is what a boundary must be — one derived from
+default is random (UUIDv4), which is what a boundary must be - one derived from
 the content is one an attacker who controls a part can reproduce and embed.
 Rejected at `render()` unless it is a legal RFC 2046 boundary.
 
 ### `Message.recipients(): []Address`
 
 Every address this message is delivered to, `To:` then `Cc:`, in the order
-added — the envelope `RCPT TO` list.
+added - the envelope `RCPT TO` list.
 
 ### `Message.render(): string!`
 
@@ -219,7 +219,7 @@ with no spaces. Must be re-issued after `startTls`.
 
 Upgrade a cleartext connection to TLS (RFC 3207). Fails when the server did not
 advertise `STARTTLS`, and fails when the server has sent bytes that would sit in
-the read buffer across the handshake — the plaintext command-injection shape
+the read buffer across the handshake - the plaintext command-injection shape
 (CVE-2011-0411), which is refused rather than quietly discarded. Call `ehlo`
 again afterwards.
 
@@ -231,7 +231,7 @@ case-insensitively against the first word of each capability line, so
 
 ### `Client.isSecure(): bool`
 
-Whether this connection is TLS — an implicit-TLS dial, or a completed
+Whether this connection is TLS - an implicit-TLS dial, or a completed
 `startTls`.
 
 ### `Client.authPlain(user: string, pass: string): ()!`
@@ -241,7 +241,7 @@ on a connection that is not TLS.
 
 ### `Client.authLogin(user: string, pass: string): ()!`
 
-Authenticate with SASL LOGIN — username and password as two base64 challenge
+Authenticate with SASL LOGIN - username and password as two base64 challenge
 responses. Same refusal on a non-TLS connection, and it fires before the
 `AUTH LOGIN` command, so not even the username is transmitted.
 
@@ -255,7 +255,7 @@ checked first, so a CR in a subject or a malformed recipient fails with
 ### `Client.quit(): ()!`
 
 End the session politely: `QUIT`, then close the socket. The socket is closed
-even when the reply is not a 221 — the alternative is leaking a descriptor over
+even when the reply is not a 221 - the alternative is leaking a descriptor over
 a server's bad manners.
 
 ### `Client.close()`
@@ -265,7 +265,7 @@ Close the connection without a `QUIT`. Idempotent.
 ### `Stream`
 
 The transport under a session: `send`, `recv` and `shut`. It exists so the rest
-of the module never asks whether it is talking cleartext or TLS — `startTls`
+of the module never asks whether it is talking cleartext or TLS - `startTls`
 swaps one implementation for another inside a live `Client`, and the flag that
 guards `AUTH` is written by that same swap, so there is no state for it to
 disagree with. A caller has no reason to implement it.
