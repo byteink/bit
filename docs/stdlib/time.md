@@ -143,8 +143,8 @@ The extension is *data*, not a handle: `ext` is a blob carrying its own kind tag
 and `extend` copies it into a fixed buffer. Module state may hold only untraced
 values, so a reference could not be kept there in the first place.
 
-Returns `false`, changing nothing, for a blob it cannot use — a bad tag, an
-unknown format version, an inconsistent index, or one larger than the buffer — and
+Returns `false`, changing nothing, for a blob it cannot use (a bad tag, an
+unknown format version, an inconsistent index, or one larger than the buffer) and
 for a second call once an extension is already installed. It never panics on a
 malformed blob, and a program that never calls it behaves exactly as it did
 before.
