@@ -35,9 +35,11 @@ fn main(): ()! {
 
   let (reply, _) = decodeReply(fixedSource{ data: "\$-1\r\n" }, "")?
   match (reply) {
-    Bulk(v) => match (v) {
-      Some(s) => println(s)
-      None => println("(nil)")
+    Bulk(v) => {
+      match (v) {
+        Some(s) => println(s)
+        None => println("(nil)")
+      }
     }
     _ => println("unexpected reply")
   }
