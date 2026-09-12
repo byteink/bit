@@ -12,10 +12,7 @@ has landed: this page documents the shipped `Date`/`Time`/`NaiveDateTime`/
 `unixFromCivil`, `formatUnix`, `formatRfc3339`, `parseRfc3339` and `utcOffset`
 have been deleted (#4084) rather than merely superseded.
 
-One function remains specified but not yet implemented: `today(z: Zone): Date`
-(see [Constructing](#constructing)). Its example stays fenced
-```` ```bit ignore ```` until it exists; every other example in this page
-compiles.
+Every function this page documents is implemented; every example compiles.
 
 ---
 
@@ -223,11 +220,9 @@ fn plusRealHours(t: DateTime, n: int): DateTime! {
 
 ## Constructing
 
-**`date()`, `time()`, `timeNs()` and `zone()` are shipped**, returning a
-`Date`, a `Time` or a `Zone` with the accessors and `toString()` documented
-below all implemented. `today` is not yet — the example at the end of this
-section mixes `date`/`time`/`timeNs`/`zone` with it and stays fenced
-`ignore` until `today` exists.
+`date()`, `time()`, `timeNs()`, `today()` and `zone()` return a `Date`, a
+`Time` or a `Zone` with the accessors and `toString()` documented below all
+implemented.
 
 ### `date(year: int, month: int, day: int): Date!`
 
@@ -252,8 +247,8 @@ inside the representable range.
 
 The current instant. See [Clocks](#clocks).
 
-```bit ignore
-import { date, time, timeNs, today, zone } from "std/time"
+```bit
+import { date, time, timeNs, today, zone, Date } from "std/time"
 
 fn build(): Date! {
   let d = date(2026, 9, 1)?
