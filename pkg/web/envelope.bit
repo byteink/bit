@@ -1,0 +1,245 @@
+// pkg/web/envelope.bit — #5079: `app.use(envelope())`, one `Middleware` that
+// gives every success and every failure the same top-level shape:
+//
+//   success:  { "data": <value> }
+//   list:     { "data": [...], "meta": { "total": ..., "limit": ..., "cursor": ... } }
+//   failure:  { "error": { "code": "not_found", "message": "..." } }
+//
+// #5078 IS WHAT MAKES THIS ONE MIDDLEWARE. `Res` (res.bit) holds a JSON-family
+// response's VALUE and defers `serialize` to the single `body()` call, so
+// `wrap`/`mapValue` reshape the value with no decode-and-re-encode round
+// trip. This file only ever touches the value through `mapValue` — never
+// `body()`, never a second serialization — so a response wrapped here still
+// serializes exactly once, at the adapter's one `body()` call.
+//
+// `Res.wrap`/`Res.mapValue` already pass a valueless response through
+// unchanged (`c.text`, `c.html`, `c.status`, ...) rather than panicking —
+// that is what makes `envelope()` safe to mount globally across a mixed app.
+// This file adds no guard of its own for that case; see `res.bit`'s own
+// comment on `wrap` for why.
+//
+// THE ERROR SHAPE IS THIS FILE'S, NOT #3876's. `errors.bit`'s `errorJson`
+// produces `{"status":...,"error":"..."}` for the framework's own negotiated
+// default — a different, older shape this ticket does not touch. `envelope()`
+// reuses #3876's DECISION (`mapFailure`: which status, which message a client
+// may read) and builds its own body around it, because a client parsing two
+// error shapes from the same app is exactly what this ticket exists to
+// prevent. Reusing `mapFailure` also means the security property is not
+// duplicated: an error that did not opt into `HttpError` still yields the
+// fixed `serverErrorBody` message, never `e.message()`.
+//
+// `envelope()` CATCHES THE FAILURE ITSELF, so a route mounted behind it never
+// reaches `failureRes`/`wrapRouteErrors` (adapter.bit/errors.bit) — those
+// still run unchanged for any route that did not opt into `envelope()`, which
+// is the whole point of "opt-in, per group".
+//
+// `JsonEntry`, `jsonAsObject` and `jsonGet` are new to the module under their
+// own names, but `res.test.bit` already binds `JsonEntry`/`jsonAsObject`/
+// `jsonGet` at module scope (a test file is part of this module when the
+// package's tests are built — res.bit's own header makes the identical
+// point), so importing the same names here would be E0042. Renamed on import
+// (SPEC §17.2), the way `errors.bit` already binds `JsonEntry` as `JsonPair`
+// for the same reason.
+import { JsonEntry as EnvEntry, jsonAsObject as jsonObjectFields, jsonGet as jsonField } from "std/json"
+
+// The marker key a `page()` value carries so `envelope()` can tell a
+// paginated result from an ordinary object that happens to have fields
+// named "total"/"limit"/"cursor". Reserved by this file: a value built any
+// other way never carries it, so the structural check below cannot mistake
+// a coincidence for the convention.
+const pageMarkerKey = "$page"
+
+const pageItemsKey = "items"
+const pageTotalKey = "total"
+const pageLimitKey = "limit"
+const pageCursorKey = "cursor"
+
+const envDataKey = "data"
+const envMetaKey = "meta"
+const envErrorKey = "error"
+const envCodeKey = "code"
+const envMessageKey = "message"
+
+// The one middleware. Mount it with `app.use(envelope())` or
+// `group.use(envelope())` — never registered by default, so an existing
+// route keeps its own shape until an app opts in, and a webhook route that
+// must answer with a third party's exact shape can sit in a group that
+// never mounts this.
+export fn envelope(): Middleware {
+  return (c, next) => {
+    let r = next(c) catch e {
+      return envelopeFailure(c, e)
+    }
+    return r.mapValue(envelopeValue)
+  }
+}
+
+// A handler's own value, reshaped into the envelope. `mapValue` is a
+// pass-through on a valueless `Res` and runs `envelopeValue` at most once —
+// see the file header — so this is the ONLY place a success is shaped, and
+// it costs nothing beyond the one `Json` restructuring.
+fn envelopeValue(v: Json): Json {
+  let fields = pageFields(v)
+  if (!isSome(fields)) {
+    return Json.JsonObject([EnvEntry{ key: envDataKey, value: v }])
+  }
+  let p = unwrap(fields)
+  return Json.JsonObject(
+    [
+      EnvEntry{ key: envDataKey, value: p.items },
+      EnvEntry{
+        key: envMetaKey,
+        value: Json.JsonObject(
+          [
+            EnvEntry{ key: pageTotalKey, value: p.total },
+            EnvEntry{ key: pageLimitKey, value: p.limit },
+            EnvEntry{ key: pageCursorKey, value: p.cursor },
+          ],
+        ),
+      },
+    ],
+  )
+}
+
+// The four fields a `page()` value carries, pulled apart so `envelopeValue`
+// never re-derives them. A plain class rather than a 4-way tuple: each field
+// is the same `Json` type, so a positional tuple would let a transposed pair
+// pass the checker silently.
+class PageFields {
+  items: Json,
+  total: Json,
+  limit: Json,
+  cursor: Json,
+}
+
+// `v`'s `PageFields` when it carries the `page()` marker and all four
+// fields, or `None` otherwise — including when `v` is an object that carries
+// the marker but, for whatever reason, not all four fields: falling back to
+// the plain `{"data": v}` shape is always safe, while trusting a partial
+// marker would risk building `meta` out of `JsonNull`s a client cannot use.
+fn pageFields(v: Json): Option<PageFields> {
+  if (!isSome(jsonObjectFields(v)) || !isSome(jsonField(v, pageMarkerKey))) {
+    return Option<PageFields>.None
+  }
+  let (items, hasItems) = requireField(v, pageItemsKey)
+  let (total, hasTotal) = requireField(v, pageTotalKey)
+  let (limit, hasLimit) = requireField(v, pageLimitKey)
+  let (cursor, hasCursor) = requireField(v, pageCursorKey)
+  if (!hasItems || !hasTotal || !hasLimit || !hasCursor) {
+    return Option<PageFields>.None
+  }
+  return Option<PageFields>.Some(
+    PageFields{ items: items, total: total, limit: limit, cursor: cursor },
+  )
+}
+
+fn requireField(v: Json, key: string): (Json, bool) {
+  let f = jsonField(v, key)
+  if (isSome(f)) {
+    return (unwrap(f), true)
+  }
+  return (Json.JsonNull, false)
+}
+
+// A handler's own value, as the array a paginated list answers with plus the
+// count, page size and cursor a caller would otherwise hand-assemble in
+// every list handler — the repetition this ticket removes. `T` mirrors
+// `Ctx.jsonList`'s own `<T: Jsonable>` shape (ctx.bit) and for the same
+// reason: the loop calling `it.toJson()` has to live where the type
+// parameter is bound, since a generic free function reached from a generic
+// METHOD's body does not lower (#4523) — this one is called directly from a
+// handler closure, never from another generic method, which is the case
+// #4495 says a bounded free function already handles.
+//
+// Returned as a `Res` built straight through the module-private
+// `jsonValueRes` (res.bit) — the same constructor `c.json`/`c.jsonList` use
+// — so a `page()` result carries the same 200 and `application/json`
+// `Content-Type` every other JSON response does, and still serializes
+// exactly once through `body()`.
+//
+// Meaningful only under `envelope()`: without it, a client sees this file's
+// internal marker key rather than "data"/"meta". An app that calls `page()`
+// on a route not behind `envelope()` has made a mistake this file does not
+// try to catch — the same trust `wrap`/`mapValue` already place in the
+// caller.
+export fn page<T: Jsonable>(items: []T, total: i64, limit: i64, cursor: string): Res {
+  let out = []Json(0)
+  for it of items {
+    out = append(out, it.toJson())
+  }
+  let value = Json.JsonObject(
+    [
+      EnvEntry{ key: pageMarkerKey, value: Json.JsonBool(true) },
+      EnvEntry{ key: pageItemsKey, value: Json.JsonArray(out) },
+      EnvEntry{ key: pageTotalKey, value: Json.JsonInt(total) },
+      EnvEntry{ key: pageLimitKey, value: Json.JsonInt(limit) },
+      EnvEntry{ key: pageCursorKey, value: Json.JsonString(cursor) },
+    ],
+  )
+  return jsonValueRes(value)
+}
+
+// A failed chain, reshaped into `{"error": {"code": ..., "message": ...}}`.
+// `mapFailure` (errors.bit) is #3876's decision and the ONLY thing this
+// function asks it for: which status, and which message a client may read.
+// An error that did not opt into `HttpError` maps to the fixed
+// `serverErrorBody` — never `e.message()` — so this function cannot leak
+// what `mapFailure` already redacted, the same property `failureRes`
+// (adapter.bit) holds for a route with no `envelope()`.
+//
+// LOGGED THE SAME WAY `failureRes` LOGS: only at or above `statusServerError`
+// — a 4xx is the response, not an incident — and to `c.config.logs`
+// (module-private, reached the same way `logger.bit` reaches it), never a
+// second sink.
+fn envelopeFailure(c: Ctx, e: error): Res {
+  let m = mapFailure(e)
+  if (m.code >= statusServerError) {
+    logLine(c.config.logs, "web: envelope: ${c.method()} ${c.path()}: ${e.message()}")
+  }
+  let body = jsonEncode(
+    Json.JsonObject(
+      [
+        EnvEntry{
+          key: envErrorKey,
+          value: Json.JsonObject(
+            [
+              EnvEntry{ key: envCodeKey, value: Json.JsonString(statusSlug(m.code)) },
+              EnvEntry{ key: envMessageKey, value: Json.JsonString(m.clientMsg) },
+            ],
+          ),
+        },
+      ],
+    ),
+  )
+  return newRes(m.code, jsonContentType, body)
+}
+
+// The `code` field's value for each status this package's own `HttpError`
+// constructors (errors.bit) can produce, plus the generic 500. Reuses those
+// files' own status constants rather than repeating the numbers — one
+// status, one spelling. A status this package never names of its own maps
+// to `"error"`: a slug this file cannot get wrong by omission.
+fn statusSlug(code: int): string {
+  if (code == statusBadRequest) {
+    return "bad_request"
+  }
+  if (code == statusUnauthorized) {
+    return "unauthorized"
+  }
+  if (code == statusForbidden) {
+    return "forbidden"
+  }
+  if (code == statusNotFound) {
+    return "not_found"
+  }
+  if (code == statusConflict) {
+    return "conflict"
+  }
+  if (code == statusUnprocessable) {
+    return "unprocessable_entity"
+  }
+  if (code == statusServerError) {
+    return "internal_error"
+  }
+  return "error"
+}
