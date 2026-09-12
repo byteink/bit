@@ -89,6 +89,17 @@ alarmrun_retry() {
 # here: a capture file IS the case that flag exists to serve, so there is no
 # branch to honor it against.
 #
+# Pick this or alarmrun_cap2 deliberately, not by habit (#5039): a
+# differential that text-compares this merged capture cannot tell "the
+# compared artefact changed" from "an unrelated line landed on the other
+# stream", so the next time either stream changes on its own the gate cannot
+# be trusted. Use this only when both streams together ARE the artefact under
+# test (selfhost-diffcheck.sh's rendered diagnostics, selfhost-difftests.sh's
+# panic-on-stderr); use alarmrun_cap2 and compare the .out file alone when the
+# artefact is stdout-only and the other stream can carry unrelated content
+# (a warning, a differently-worded decline) without the artefact itself
+# having changed.
+#
 # The redirect sits on the `perl` invocation itself (a simple command), not on
 # this function -- so it is performed in perl's forked child, and this shell's
 # own fd 2 is never bound to <capture>. That matters for alarmrun_retry_cap
