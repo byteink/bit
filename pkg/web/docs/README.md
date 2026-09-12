@@ -14,6 +14,7 @@ instead of dropped, so keeping it current is part of writing a chapter.
 | [Sessions, CSRF and security](security.md) | Server-side sessions, the CSRF token that binds to one, CORS and the standard security headers. |
 | [Operational middleware](operations.md) | Rate limiting, serving static files, gzip, request logging, tracing and panic recovery. |
 | [Errors](errors.md) | The `HttpError` opt-in that decides what a client is allowed to read. |
+| [Envelope](envelope.md) | `envelope()`'s one shape for every success and failure, and the `page()` pagination convention. |
 | [Configuration](configuration.md) | Every `Config` field, what has no default, and why. |
 
 For install and a minimal example, see [`pkg/web/README.md`](../README.md).
