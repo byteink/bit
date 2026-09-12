@@ -171,22 +171,30 @@ run_oracle_pair() {
   # (#3490) — a caller-owned `>"$work/seed.plain"` redirect opened once for
   # both attempts used to let a stalled first attempt's partial bytes survive
   # into the retried attempt's compared payload (#3478).
-  alarmrun_retry_cap ORACLE "" "$work/seed.plain" "$ORACLE" doc "$d"
+  #
+  # stdout/stderr captured SEPARATELY (#5039, alarmrun_cap2): the compared
+  # artefact is the exported SURFACE (this file's own header), which `doc`
+  # writes to stdout only — `reportCheckDiagnostics` (checkproject.bit) still
+  # renders a warnings-only diagnostic (E0048 shadowing) to stderr on an
+  # ACCEPTED module, and a wording difference there between the pinned oracle
+  # and bit2 is not a surface divergence. A merged capture made that
+  # indistinguishable from a real MISMATCH; only .out is compared below.
+  alarmrun_retry_cap2 ORACLE "" "$work/seed.plain.out" "$work/seed.plain.err" "$ORACLE" doc "$d"
   seed_rc=$?
   if [ "$seed_rc" -eq 0 ]; then
-    alarmrun_retry_cap ORACLE "" "$work/seed.json" "$ORACLE" doc --json "$d"
+    alarmrun_retry_cap2 ORACLE "" "$work/seed.json.out" "$work/seed.json.err" "$ORACLE" doc --json "$d"
     seed_json_rc=$?
   else
-    : > "$work/seed.json"
+    : > "$work/seed.json.out"
   fi
   printf '%s %s\n' "$seed_rc" "$seed_json_rc" >"$work/oracle.status"
 }
 
 run_bit2_pair() {
   local d=$1 bit_rc bit_json_rc
-  alarmrun_retry_cap BIT2 "" "$work/bit.plain" "$BIT2" doc "$d"
+  alarmrun_retry_cap2 BIT2 "" "$work/bit.plain.out" "$work/bit.plain.err" "$BIT2" doc "$d"
   bit_rc=$?
-  alarmrun_retry_cap BIT2 "" "$work/bit.json" "$BIT2" doc --json "$d"
+  alarmrun_retry_cap2 BIT2 "" "$work/bit.json.out" "$work/bit.json.err" "$BIT2" doc --json "$d"
   bit_json_rc=$?
   printf '%s %s\n' "$bit_rc" "$bit_json_rc" >"$work/bit2.status"
 }
@@ -224,7 +232,7 @@ for d in stdlib/*/ examples/*/ _tests_/imports/*/; do
   # $match/$mismatch, so the denominator always covers exactly the
   # $compared set, never a BIT2-timeout or an oracle SKIP.
   module_nonempty=0
-  doc_surface_nonempty "$work/seed.json" && module_nonempty=1
+  doc_surface_nonempty "$work/seed.json.out" && module_nonempty=1
 
   if [ "$bit_rc" -ge 128 ] || [ "$bit_json_rc" -ge 128 ]; then
     echo "$d (BIT2 timed out after ${TIMEOUT}s, rc=$bit_rc/$bit_json_rc)" >>"$work/timeout"
@@ -237,7 +245,7 @@ for d in stdlib/*/ examples/*/ _tests_/imports/*/; do
     continue
   fi
 
-  if cmp -s "$work/seed.plain" "$work/bit.plain" && cmp -s "$work/seed.json" "$work/bit.json"; then
+  if cmp -s "$work/seed.plain.out" "$work/bit.plain.out" && cmp -s "$work/seed.json.out" "$work/bit.json.out"; then
     match=$((match + 1))
   else
     echo "$d" >>"$work/mismatch"
