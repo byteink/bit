@@ -13,7 +13,8 @@ package; it does not restate this.
 - Tests are `<file>.test.bit` beside the file they test, run by
   `bit test pkg/<name>` (SPEC §19).
 - No `bit.json` unless the package has third-party dependencies of its own.
-- A `README.md` with install, usage and the exported surface.
+- A `README.md` with install, usage and the exported surface, and a `docs/`
+  tree of chapters beside it (see Documentation, below).
 - No separate repository. One repo, one gate, one atomic change when a
   package and the compiler move together.
 
@@ -111,6 +112,33 @@ The consumer never sees the prefix: `@v0.1.0` in `bit.json` resolves
 
 This repository has no CI workflows, so pushing a tag runs nothing and bills
 nothing. Keep it that way.
+
+## Documentation
+
+A package's `README.md` is its front page and stays short: what it is, how to
+install it, one sample that runs, and a link into the docs. Everything else
+lives in `pkg/<name>/docs/`, laid out exactly like the language's own
+`docs/reference/`, because bitlang.org renders both with the same code:
+
+- `docs/README.md` carries a table of the chapters in reading order. **That
+  table is the order.** A chapter it does not name is appended alphabetically
+  rather than dropped, so a new file is never invisible, but the curated
+  sequence is what a reader gets.
+- `docs/<chapter>.md` is one chapter. It opens with a `# ` title, and its first
+  paragraph is used as the chapter's blurb wherever the site lists it, so that
+  paragraph says what the chapter is for rather than restating the title.
+- Every fenced `bit` block is code a reader will copy. Write it to compile.
+
+The site publishes the tree at every release tag: `/packages/<name>/` is the
+latest release, `/packages/<name>/<version>/` is that release, and each chapter
+is a page beneath it carrying the sidebar, contents rail and pager the language
+documentation has. A package with no `docs/` renders as its README alone, which
+is the fallback and not the target.
+
+The split is the point. A README that has grown to hold routing, middleware,
+sessions and a caveat list is not documentation, it is a pile - nothing tells a
+reader where to start, and the page has no navigation because there is nothing
+to navigate. Chapters give the site a table of contents to build from.
 
 ## Adding a package
 
