@@ -11,6 +11,7 @@ the same `data` key.
 
 ```bit
 import { App, Ctx, Res, envelope } from "web"
+import { Json, JsonEntry } from "std/json"
 
 @json class User {
   id: int,
@@ -47,6 +48,9 @@ no `meta` key unless the value was built by `page()`. Returning a plain
 produced by the convention below.
 
 ## Pagination: page()
+
+A second route on the same `App` from [Mounting it](#mounting-it) above,
+reusing its `User` class and its `envelope()` mount:
 
 ```bit
 import { page } from "web"
