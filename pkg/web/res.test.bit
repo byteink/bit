@@ -267,6 +267,180 @@ test "jsonOpt() on an absent Option renders null" {
   )
 }
 
+// --- wrap() / mapValue() (#5078) -------------------------------------------
+//
+// The ticket's whole point: a value-backed `Res` is serialised at most once,
+// no matter how many times `wrap`/`mapValue` touch the value first, and
+// `wrap` never decodes anything to do it. Both are proved by a COUNTING
+// stand-in for the real function, not by eyeballing the output — the same
+// bytes come out whether `jsonEncode` ran once or three times, which is
+// exactly why a byte comparison alone cannot be the proof here.
+//
+// `CallCount` is a class, not a local counter, because a closure has to
+// mutate it after capture: classes are reference types (SPEC §13.3), the
+// same reason `ratelimit.test.bit`'s `RlClock` is one.
+class CallCount {
+  n: int,
+}
+
+// A `(Json) => string` that counts its own calls in `box` before deferring
+// to the real encoder. Wired into a `Res` via `newValueRes` directly (module-
+// private, callable here because a test file is part of this module — same
+// reasoning as `JsonEntry` above) rather than through `c.json`, which always
+// serialises with the real `jsonEncode`.
+fn countingEncode(box: CallCount): (Json) => string {
+  return (j) => {
+    box.n = box.n + 1
+    return jsonEncode(j)
+  }
+}
+
+// The decode-side counter. Nothing in `wrap`/`mapValue`/`body()` ever calls
+// this — there is no decode step in the design being tested — so the test
+// below first calls it directly to prove the counter itself is live (it is
+// not dead code that would read "0" no matter what ran), then proves the
+// wrap flow leaves it exactly where that one direct call left it.
+fn countingDecode(box: CallCount): (string) => Json! {
+  return (s) => {
+    box.n = box.n + 1
+    return jsonParse(s)?
+  }
+}
+
+test "wrap() envelopes the value: c.json(v).wrap(\"data\") body is {\"data\":<v>}" {
+  let u = User{ id: 42, name: "ada" }
+  let r = plainCtx().json(u).wrap("data")
+
+  assert(
+    r.headerValue("Content-Type") == "application/json",
+    "wrap must not disturb Content-Type: got '${r.headerValue("Content-Type")}'",
+  )
+  let parsed = jsonParse(r.body()) catch e {
+    panic("wrapped body must still parse as JSON ('${r.body()}'): ${e.message()}")
+  }
+  let inner = jsonGet(parsed, "data")
+  assert(isSome(inner), "wrapped body must carry a top-level 'data' key: got '${r.body()}'")
+  assert(
+    jsonEncode(unwrap(inner)) == jsonEncode(u.toJson()),
+    "the 'data' value must be the original value's own serialization: got '${r.body()}'",
+  )
+}
+
+test "wrap() serialises the value exactly once, proven by a counting serialiser" {
+  let calls = CallCount{ n: 0 }
+  let r = newValueRes(
+    200,
+    "application/json",
+    User{ id: 1, name: "ada" }.toJson(),
+    countingEncode(calls),
+  )
+  r.wrap("data")
+
+  assert(calls.n == 0, "wrap() must not serialise: got ${calls.n} call(s) before body()")
+  let first = r.body()
+  assert(calls.n == 1, "body() must serialise exactly once: got ${calls.n} call(s)")
+  let second = r.body()
+  assert(calls.n == 1, "a second body() must not serialise again: got ${calls.n} call(s)")
+  assert(
+    second == first,
+    "body() must return identical bytes on a second call: '${first}' vs '${second}'",
+  )
+}
+
+test "two chained wrap() calls nest correctly and still serialise exactly once" {
+  let calls = CallCount{ n: 0 }
+  let r = newValueRes(
+    200,
+    "application/json",
+    User{ id: 1, name: "ada" }.toJson(),
+    countingEncode(calls),
+  )
+  r.wrap("data").wrap("envelope")
+
+  let body = r.body()
+  assert(
+    calls.n == 1,
+    "two chained wrap() calls must still serialise exactly once: got ${calls.n} call(s)",
+  )
+
+  let parsed = jsonParse(body) catch e {
+    panic("chained-wrap body must parse as JSON ('${body}'): ${e.message()}")
+  }
+  let outer = jsonGet(parsed, "envelope")
+  assert(isSome(outer), "outer wrap must add the 'envelope' key: got '${body}'")
+  let inner = jsonGet(unwrap(outer), "data")
+  assert(isSome(inner), "inner wrap must still be nested under 'data': got '${body}'")
+}
+
+test "mapValue() replaces the value with what f returns, still serialising once" {
+  let calls = CallCount{ n: 0 }
+  let r = newValueRes(
+    200,
+    "application/json",
+    User{ id: 1, name: "ada" }.toJson(),
+    countingEncode(calls),
+  )
+  r.mapValue((j) => Json.JsonBool(true))
+
+  assert(r.body() == "true", "mapValue must replace the value entirely: got '${r.body()}'")
+  assert(calls.n == 1, "mapValue + body() must serialise exactly once: got ${calls.n} call(s)")
+}
+
+test "wrap() never decodes: a counter proven live elsewhere stays untouched by the wrap flow" {
+  let calls = CallCount{ n: 0 }
+  let decode = countingDecode(calls)
+
+  // Prove the counter counts a real call before trusting it to prove an
+  // absence of one.
+  decode("42") catch e {
+    panic("sanity decode must succeed: ${e.message()}")
+  }
+  assert(calls.n == 1, "sanity: a direct decode call must be counted: got ${calls.n}")
+
+  let before = calls.n
+  let r = plainCtx().json(User{ id: 1, name: "ada" }).wrap("data").wrap("outer")
+  r.body()
+  assert(
+    calls.n == before,
+    "wrap()/body() must never decode: counter moved from ${before} to ${calls.n}",
+  )
+}
+
+test "wrap() on a response with no value passes it through unchanged, for a global envelope middleware" {
+  let plain = plainCtx().text("hi").header("X-Trace", "abc")
+  let r = plain.wrap("data")
+
+  assert(
+    r.body() == "hi",
+    "wrap() on a valueless Res must leave the body untouched: got '${r.body()}'",
+  )
+  assert(r.statusCode() == 200, "wrap() must leave the status untouched: got ${r.statusCode()}")
+  assert(
+    r.headerValue("Content-Type") == "text/plain; charset=utf-8",
+    "wrap() must leave Content-Type untouched: got '${r.headerValue("Content-Type")}'",
+  )
+  assert(
+    r.headerValue("X-Trace") == "abc",
+    "wrap() must leave other headers untouched: got '${r.headerValue("X-Trace")}'",
+  )
+}
+
+test "mapValue() on a response with no value also passes it through unchanged" {
+  let baseline = plainCtx().html(text("hi")).body()
+  let r = plainCtx().html(text("hi")).mapValue((j) => j)
+  assert(
+    r.body() == baseline,
+    "mapValue() on a valueless Res must leave the body untouched: got '${r.body()}'",
+  )
+  assert(r.statusCode() == 200, "mapValue() must leave the status untouched: got ${r.statusCode()}")
+}
+
+test "testpanic_wrap_after_body_has_already_serialised" {
+  let r = plainCtx().json(User{ id: 1, name: "ada" })
+  r.body()
+  r.wrap("data")
+}
+
 // --- html() and text() ----------------------------------------------------
 
 test "html() escapes a Node built from user input, and raw() passes bytes through untouched" {
