@@ -32,6 +32,7 @@
 // path; the caller calls it once grading is done, pass or fail.
 
 import { readFile, writeFile } from "std/fs"
+import { trimSpace } from "std/strings"
 import { killTreeFnDef, pgrepPreflightScript } from "../../../tools/killtree"
 
 export const wave1: int = 1
@@ -72,12 +73,46 @@ export class FanCfg {
   timeoutMs: int,
   stdlib: string,
   libbitrt: string,
+  // 0 disables mid-run resampling entirely (`newFanCfg`'s default, unchanged
+  // behaviour for every existing caller). `newFanCfgResampled` sets both so a
+  // job's own watchdog re-reads host load once, `resampleAfterMs` into its
+  // OWN run, and rescales its remaining budget by up to `scaleCap` (#5124:
+  // a deadline sampled only before a batch's own subprocesses exist can
+  // never see the load they themselves create).
+  resampleAfterMs: int,
+  scaleCap: int,
 }
 
 export fn newFanCfg(scratch: string, timeoutMs: int, stdlib: string, libbitrt: string): FanCfg {
   return FanCfg{
     scratch: scratch, wdPath: "${scratch}/bit-gate-watchdog",
     timeoutMs: timeoutMs, stdlib: stdlib, libbitrt: libbitrt,
+    resampleAfterMs: 0, scaleCap: 1,
+  }
+}
+
+// Bundles the two resample knobs into one param so `newFanCfgResampled`
+// stays at the 5-param lint ceiling (E0202) alongside `scratch`/`timeoutMs`/
+// `stdlib`/`libbitrt`.
+export class ResampleCfg {
+  export afterMs: int,
+  export scaleCap: int,
+}
+
+// Like `newFanCfg`, but every staged job's OWN watchdog re-samples host load
+// `resample.afterMs` into that job's run and may extend its remaining budget
+// by up to `resample.scaleCap`x — see `FanCfg.resampleAfterMs`.
+export fn newFanCfgResampled(
+  scratch: string,
+  timeoutMs: int,
+  stdlib: string,
+  libbitrt: string,
+  resample: ResampleCfg,
+): FanCfg {
+  return FanCfg{
+    scratch: scratch, wdPath: "${scratch}/bit-gate-watchdog",
+    timeoutMs: timeoutMs, stdlib: stdlib, libbitrt: libbitrt,
+    resampleAfterMs: resample.afterMs, scaleCap: resample.scaleCap,
   }
 }
 
@@ -112,10 +147,49 @@ fn removeQuiet(path: string) {
 // by `driverPrelude` before any job forks — argv[0] must be that name for
 // the poll to survive a `/bin/sh` with no `exec -a` (dash rejects it,
 // #3231).
-fn watchdogText(wdPath: string, timeoutMs: int): string {
+//
+// `resampleAfterMs <= 0` returns exactly the fixed-budget script every
+// caller before #5124 got — byte-identical, so `golden`/`examplesgate`
+// (which never pass a resample cfg) are unaffected. Otherwise, once into
+// its OWN run, the watchdog re-reads host load itself (the same
+// load-average-over-cores idiom `verify.bit`'s `loadProbe` uses, inlined
+// here because this runs already-forked, with no Bit runtime to call back
+// into) and rescales its remaining budget by that reading, capped at
+// `scaleCap`. A parse failure on any step leaves `rscale` at awk's own
+// default (1), which is exactly the pre-#5124 fixed wall — a broken probe
+// can only fail closed. The reading is also dropped at `rescalePath` so a
+// caller can report it after the fact, once back in Bit code.
+fn watchdogText(
+  wdPath: string,
+  timeoutMs: int,
+  resampleAfterMs: int,
+  scaleCap: int,
+  rescalePath: string,
+): string {
   let secs = timeoutMs / 1000
+  if (resampleAfterMs <= 0) {
+    return killTreeFnDef() +
+      "n=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${secs} ]; then killtree \"$p\"; break; fi; \"${wdPath}\" 1 || sleep 1; n=$((n + 1)); done"
+  }
+  let warmupSecs = resampleAfterMs / 1000
   return killTreeFnDef() +
-    "n=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${secs} ]; then killtree \"$p\"; break; fi; \"${wdPath}\" 1 || sleep 1; n=$((n + 1)); done"
+    "n=0; limit=${secs}; resampled=0\n" +
+    "while kill -0 \"$p\" 2>/dev/null; do\n" +
+    "  if [ \"$resampled\" -eq 0 ] && [ \"$n\" -ge ${warmupSecs} ]; then\n" +
+    "    rcores=$(getconf _NPROCESSORS_ONLN 2>/dev/null); case \"$rcores\" in ''|*[!0-9]*) rcores=1 ;; esac\n" +
+    "    rload=$(uptime 2>/dev/null | sed -n 's/.*load averages*: *//p' | awk -F'[ ,]+' '{print $1}'); case \"$rload\" in ''|*[!0-9.]*) rload=0 ;; esac\n" +
+    "    rscale=$(awk -v l=\"$rload\" -v c=\"$rcores\" -v cap=${scaleCap}" +
+    " 'BEGIN{r=l/c; s=int(r); if(r>s)s++; if(s<1)s=1; if(s>cap)s=cap; print s}')\n" +
+    "    limit=$((${secs} * rscale))\n" +
+    "    printf '%s %s\\n' \"$rscale\" \"$rload\" > " +
+    shQuote(rescalePath) +
+    "\n" +
+    "    resampled=1\n" +
+    "  fi\n" +
+    "  if [ \"$n\" -ge \"$limit\" ]; then killtree \"$p\"; break; fi\n" +
+    "  \"${wdPath}\" 1 || sleep 1\n" +
+    "  n=$((n + 1))\n" +
+    "done\n"
 }
 
 // Writes ONE job's wrapper script: cd, export env if requested, background
@@ -147,6 +221,7 @@ export fn stageJob(cfg: FanCfg, j: Job) {
   let o = outPath(cfg.scratch, j.key)
   let e = errPath(cfg.scratch, j.key)
   let rc = rcPath(cfg.scratch, j.key)
+  let rescalePath = jobBase(cfg.scratch, j.key) + ".rescale"
   script = script +
     cmd +
     " >" +
@@ -155,7 +230,7 @@ export fn stageJob(cfg: FanCfg, j: Job) {
     shQuote(e) +
     " &\n" +
     "p=$!\n( " +
-    watchdogText(cfg.wdPath, cfg.timeoutMs) +
+    watchdogText(cfg.wdPath, cfg.timeoutMs, cfg.resampleAfterMs, cfg.scaleCap, rescalePath) +
     " ) </dev/null >/dev/null 2>&1 &\n" +
     "w=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\n" +
     "echo \"$rc\" > ${shQuote(rc)}\nexit \"$rc\"\n"
@@ -295,4 +370,12 @@ export fn cleanupJob(scratch: string, key: string) {
   removeQuiet(outPath(scratch, key))
   removeQuiet(errPath(scratch, key))
   removeQuiet(rcPath(scratch, key))
+  removeQuiet(jobBase(scratch, key) + ".rescale")
+}
+
+// Reads back the "<scale> <load>" line a resampled watchdog (#5124) wrote at
+// `jobBase(scratch,key) + ".rescale"`, or "" if the job's cfg never enabled
+// resampling, its warmup window never elapsed, or the job finished first.
+export fn readRescale(scratch: string, key: string): string {
+  return trimSpace(readText(jobBase(scratch, key) + ".rescale"))
 }

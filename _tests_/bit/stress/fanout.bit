@@ -62,10 +62,13 @@ import {
   FanCfg,
   Job,
   JobResult,
+  ResampleCfg,
   cleanupJob,
   commitWave,
   gradeJob,
   newFanCfg,
+  newFanCfgResampled,
+  readRescale,
   runDriver,
   stageJob,
   wave1,
@@ -92,6 +95,13 @@ class StressJob {
 }
 
 class BatchResult { ran: int, failures: int, inconclusive: int, oracled: int, proofs: int }
+
+// How far into its OWN run each wave-2 job's watchdog waits before taking its
+// one mid-run load reading (#5124). Long enough that `xargs -P` has started
+// every job in the wave and the kernel's runnable-queue sampling (what
+// `uptime`'s load average is built from) has caught up; short against a
+// 1200s-class base deadline either way.
+const wave2ResampleAfterMs: int = 15000
 
 // The `batch` partition's program list: `eligible` (already host-gated) minus
 // the four `exclusiveNames()`, further narrowed by `BIT_STRESSGATE_ONLY` when
@@ -249,6 +259,47 @@ fn gradeOutcome(
 }
 
 // Grades one already-run program: build, then both policy runs, then the
+// Parses a `readRescale` line ("<scale> <load>", gatefanout.bit's
+// `watchdogText`). `ok: false` covers both "never resampled" (empty string:
+// the job finished before its warmup window, or its cfg had resampling
+// disabled) and a malformed line — neither is worth reporting.
+fn parseRescale(raw: string): (bool, int, string) {
+  if (len(raw) == 0) {
+    return false, 1, ""
+  }
+  let sp = indexOfAt(raw, " ", 0)
+  if (sp < 0) {
+    return false, 1, ""
+  }
+  let scale = parseIntStrict(raw[0:sp])
+  if (scale < 1) {
+    return false, 1, ""
+  }
+  return true, scale, trim(raw[sp + 1:])
+}
+
+// Prints the mid-run reading a job's own watchdog took (#5124), but only
+// when it actually widened the deadline (`scale > 1`) — a quiet box stays
+// quiet, exactly like `runScript`'s own "TIMED OUT" line only fires when it
+// matters.
+fn reportRescale(scratch: string, name: string, label: string, key: string) {
+  let (ok, scale, loadText) = parseRescale(readRescale(scratch, key))
+  if (ok && scale > 1) {
+    say(
+        "stress '" +
+        name +
+        "' [" +
+        label +
+        "]: deadline rescaled to x" +
+        num(scale) +
+        " (host load " +
+        loadText +
+        ", sampled mid-run)",
+    )
+  }
+}
+
+// Grades one already-run program: build, then both policy runs, then the
 // shared `judgeVerdict` oracle — the batch counterpart of `checkProgram`.
 // `buildScratch`/`runScratch` are separate because wave 1 and wave 2 now run
 // as two separate `osRunBounded` calls, each staged into its own scratch
@@ -265,6 +316,7 @@ fn gradeOne(buildScratch: string, runScratch: string, plan: StressJob, idx: int)
     return badVerdict(br.ran && br.code == -2)
   }
 
+  reportRescale(runScratch, plan.name, "default", defaultKey(idx))
   let first = gradeOutcome(
     plan.name,
     "default",
@@ -282,6 +334,7 @@ fn gradeOne(buildScratch: string, runScratch: string, plan: StressJob, idx: int)
     say("  " + plan.waivedReason)
     label = "BIT_GC=off (waived)"
   }
+  reportRescale(runScratch, plan.name, label, stressKey(idx))
   let second = gradeOutcome(
     plan.name,
     label,
@@ -466,9 +519,20 @@ fn runBatch(cx: Ctx, corpus: string, names: []string): BatchResult {
   let probe2 = loadProbe(cx)
   let runMs = scaledDeadlineMs(baseMs, probe2.scale)
   sayWaveDeadline("wave 2 (run)", runMs, baseMs, probe2)
-  let cfg2 = newFanCfg(runScratch, runMs, cx.stdlib, cx.libbitrt)
+  // Wave 2's own jobs are the ones #5124 measured being killed (the batch's
+  // heaviest load, from 166 concurrent GC=stress runs, does not exist until
+  // THIS wave starts, so even this fresh `probe2` cannot see it). Each job's
+  // OWN watchdog re-samples `wave2ResampleAfterMs` into its own run and may
+  // widen its remaining budget up to `loadScaleCap`x — see
+  // `newFanCfgResampled` (gatefanout.bit). The outer driver bound must cover
+  // that worst case, not just `runMs`.
+  let cfg2 = newFanCfgResampled(
+    runScratch, runMs, cx.stdlib, cx.libbitrt,
+    ResampleCfg{ afterMs: wave2ResampleAfterMs, scaleCap: loadScaleCap },
+  )
   stageAllRuns(cfg2, cx, plans, bins)
-  runDriver(runScratch, 3 * len(plans) * runMs + 60000)
+  let worstJobMs = scaledDeadlineMs(baseMs, loadScaleCap)
+  runDriver(runScratch, 3 * len(plans) * worstJobMs + 60000)
 
   let result = gradeBatch(buildScratch, runScratch, plans, bins)
   fsRemove(buildScratch)
