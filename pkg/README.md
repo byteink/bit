@@ -113,6 +113,24 @@ The consumer never sees the prefix: `@v0.1.0` in `bit.json` resolves
 This repository has no CI workflows, so pushing a tag runs nothing and bills
 nothing. Keep it that way.
 
+### The tag is what publishes the documentation, not the merge
+
+`bitlang.org/packages/<name>/<version>/` is built from `git archive <tag>`, so
+each release's pages show that package's documentation exactly as it stood at
+that release. Merging a documentation change to `main` does not put it on the
+site; only a new tag does.
+
+Two consequences worth knowing before anyone goes looking for a missing page:
+
+* A published version's pages never change. `web/v0.1.0` still serves the
+  README it was cut with and always will, however much `main` has moved on.
+* Documentation written since the last tag is invisible on the site until the
+  next release. That is not a deployment fault and redeploying the website will
+  not fix it. Cut the tag.
+
+This is deliberate: a reader on `/packages/web/v0.1.0/` is reading the docs for
+the code they actually depend on, not for whatever `main` looks like today.
+
 ## Documentation
 
 A package's `README.md` is its front page and stays short: what it is, how to
