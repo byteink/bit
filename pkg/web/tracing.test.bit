@@ -1,0 +1,263 @@
+// pkg/web/tracing.test.bit — #3970's acceptance.
+//
+// `adapterApp`, `newSink`, `req`, `freezeOrPanic` (adapter.test.bit),
+// `Server`, `serve`, `listenAndServeOn` (adapterhead.test.bit), `Request`
+// (ctx.bit), `Response` (adapter.bit), `contains` (router.test.bit) and
+// `jsonParse`/`jsonAsInt`/`jsonAsString` (errors.test.bit)/`jsonAsArray`/
+// `jsonGet` (res.test.bit) are already bound module-wide (SPEC §17.1) —
+// reused, not re-imported (E0042).
+//
+// A `Span`'s final attributes and status are only observable once
+// exported: `Tracer`'s own fields are module-private to std/trace, so the
+// only seam is the same one std/trace's own tests use — a fake OTLP/HTTP
+// collector that captures the exported JSON body (stdlib/trace/
+// tracer.test.bit's `startCapture`, reimplemented here since it is
+// file-private to that module).
+import { currentContext, newTracer } from "std/trace"
+import { ok } from "std/http"
+
+class spanCaptureTarget {
+  ch: chan<string>
+  handle(req: Request): Response {
+    this.ch <- req.body
+    return ok("")
+  }
+}
+
+fn startSpanCapture(): (Server, chan<string>) {
+  let s = serve("127.0.0.1", 0) catch e {
+    panic("startSpanCapture: serve: ${e.message()}")
+  }
+  let ch = chan<string>(1)
+  let target = spanCaptureTarget{ ch: ch }
+  spawn runSpanCapture(s, target)
+  return s, ch
+}
+
+fn runSpanCapture(s: Server, target: spanCaptureTarget) {
+  listenAndServeOn(s, target.handle) catch _ {
+    return
+  }
+}
+
+// A `Tracer` exporting to a fresh fake collector at sampling ratio 1 (every
+// span sampled, deterministically), plus the channel its one captured
+// export body arrives on.
+fn tracingTracer(): (Tracer, chan<string>) {
+  let (s, ch) = startSpanCapture()
+  let port = s.port() catch e {
+    panic("tracingTracer: port: ${e.message()}")
+  }
+  let tr = newTracer("http://127.0.0.1:${port}/v1/traces", "test", 1.0)
+  return tr, ch
+}
+
+fn field(j: Json, key: string): Json {
+  return unwrap(jsonGet(j, key))
+}
+
+// Digs through one exported OTLP batch to its `spans` array.
+fn exportedSpans(body: string): []Json {
+  let doc = jsonParse(body) catch e {
+    panic("jsonParse: ${e.message()}")
+  }
+  let resourceSpans = unwrap(jsonAsArray(field(doc, "resourceSpans")))
+  let scopeSpans = unwrap(jsonAsArray(field(resourceSpans[0], "scopeSpans")))
+  return unwrap(jsonAsArray(field(scopeSpans[0], "spans")))
+}
+
+// An attribute's string value by key, or "" if `sp` carries no such
+// attribute.
+fn attr(sp: Json, key: string): string {
+  let attrs = unwrap(jsonAsArray(field(sp, "attributes")))
+  let i = 0
+  while (i < len(attrs)) {
+    if (unwrap(jsonAsString(field(attrs[i], "key"))) == key) {
+      let v = field(attrs[i], "value")
+      return unwrap(jsonAsString(field(v, "stringValue")))
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn spanStatusCode(sp: Json): int {
+  return int(unwrap(jsonAsInt(field(field(sp, "status"), "code"))))
+}
+
+fn usersHandler(c: Ctx): Res! {
+  return c.text("hello")
+}
+
+test "a request to the matched route produces one span carrying method, route, status and size, with no query-string secret" {
+  let (tr, ch) = tracingTracer()
+  let app = adapterApp(newSink())
+  app.use(tracing(tr))
+  app.get("/users/:id", usersHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/users/42?token=secret"))
+  assert(res.status == 200, "want 200, got ${res.status}")
+  tr.shutdown()
+
+  let body = <- ch
+  assert(
+    !contains(body, "secret"),
+    "the exported span must not carry the query-string secret: ${body}",
+  )
+
+  let spans = exportedSpans(body)
+  assert(len(spans) == 1, "want 1 exported span, got ${len(spans)}")
+  let sp = spans[0]
+  assert(
+    unwrap(jsonAsString(field(sp, "name"))) == "GET /users/:id",
+    "span must be named after the matched route pattern, not the resolved path",
+  )
+  assert(attr(sp, "http.method") == "GET", "http.method attribute wrong")
+  assert(attr(sp, "http.route") == "/users/:id", "http.route attribute wrong")
+  assert(attr(sp, "http.status_code") == "200", "http.status_code attribute wrong")
+  let gotSize = attr(sp, "http.response_size")
+  assert(gotSize == "5", "http.response_size attribute wrong: ${gotSize}")
+}
+
+test "a valid inbound traceparent produces a span sharing its trace id, parented on the inbound span id" {
+  let (tr, ch) = tracingTracer()
+  let app = adapterApp(newSink())
+  app.use(tracing(tr))
+  app.get("/users/:id", usersHandler)
+  freezeOrPanic(app)
+
+  let traceId = "4bf92f3577b34da6a3ce929d0e0e4736"
+  let inboundSpanId = "00f067aa0ba902b7"
+  let r = Request{
+    method: "GET",
+    path: "/users/42",
+    headers: "traceparent: 00-${traceId}-${inboundSpanId}-01",
+    body: "",
+  }
+  let res = app.handle(r)
+  assert(res.status == 200, "want 200, got ${res.status}")
+  tr.shutdown()
+
+  let spans = exportedSpans(<- ch)
+  assert(len(spans) == 1, "want 1 exported span, got ${len(spans)}")
+  let sp = spans[0]
+  assert(
+    unwrap(jsonAsString(field(sp, "traceId"))) == traceId,
+    "the span must continue the inbound trace id",
+  )
+  assert(
+    unwrap(jsonAsString(field(sp, "parentSpanId"))) == inboundSpanId,
+    "the span's parent must be the inbound span id",
+  )
+}
+
+test "a malformed inbound traceparent is ignored: the request still succeeds and a fresh trace starts" {
+  let (tr, ch) = tracingTracer()
+  let app = adapterApp(newSink())
+  app.use(tracing(tr))
+  app.get("/users/:id", usersHandler)
+  freezeOrPanic(app)
+
+  let r = Request{
+    method: "GET",
+    path: "/users/42",
+    headers: "traceparent: not-a-real-traceparent-header",
+    body: "",
+  }
+  let res = app.handle(r)
+  assert(
+    res.status == 200,
+    "a malformed traceparent must not reject the request, got ${res.status}",
+  )
+  tr.shutdown()
+
+  let spans = exportedSpans(<- ch)
+  assert(len(spans) == 1, "want 1 exported span, got ${len(spans)}")
+  assert(
+    unwrap(jsonAsString(field(spans[0], "parentSpanId"))) == "",
+    "a malformed traceparent must start a fresh ROOT trace, not adopt a parent",
+  )
+}
+
+test "a 500 sets the span status to error while a 404 does not" {
+  let (tr, ch) = tracingTracer()
+  let app = adapterApp(newSink())
+  app.use(tracing(tr))
+  app.get("/boom", (c) => c.status(500))
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/boom"))
+  assert(res.status == 500, "want 500, got ${res.status}")
+
+  let miss = app.handle(req("GET", "/missing"))
+  assert(miss.status == 404, "want 404, got ${miss.status}")
+  tr.shutdown()
+
+  let spans = exportedSpans(<- ch)
+  assert(len(spans) == 2, "want 2 exported spans, got ${len(spans)}")
+  assert(
+    spanStatusCode(spans[0]) == 2,
+    "a 500 must set the span status to ERROR (2), got ${spanStatusCode(spans[0])}",
+  )
+  assert(
+    spanStatusCode(spans[1]) != 2,
+    "a 404 must NOT set the span status to ERROR, got ${spanStatusCode(spans[1])}",
+  )
+}
+
+fn tracingPanicHandler(c: Ctx): Res! {
+  panic("db: connection refused")
+}
+
+test "a panicking handler still produces a closed span with an error status" {
+  let (tr, ch) = tracingTracer()
+  let app = adapterApp(newSink())
+  app.use(recover())
+  app.use(tracing(tr))
+  app.get("/boom", tracingPanicHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/boom"))
+  assert(res.status == 500, "want 500 from recover(), got ${res.status}")
+  tr.shutdown()
+
+  let spans = exportedSpans(<- ch)
+  assert(
+    len(spans) == 1,
+    "the panicking request must still close and export exactly one span, got ${len(spans)}",
+  )
+  assert(
+    spanStatusCode(spans[0]) == 2,
+    "a panic must leave the span status ERROR (2), got ${spanStatusCode(spans[0])}",
+  )
+}
+
+fn readAmbientContext(ch: chan<string>) {
+  let c = currentContext()
+  ch <- "${c.traceHi}:${c.traceLo}:${c.spanId}"
+}
+
+fn spawningHandler(c: Ctx): Res! {
+  let parent = currentContext()
+  let ch = chan<string>(1)
+  spawn readAmbientContext(ch)
+  let seenInTask = <- ch
+  let wantInTask = "${parent.traceHi}:${parent.traceLo}:${parent.spanId}"
+  if (seenInTask != wantInTask) {
+    panic("spawned task did not see the handler's span: want ${wantInTask}, got ${seenInTask}")
+  }
+  return c.status(200)
+}
+
+test "a span opened by tracing() is visible inside a task the handler spawns" {
+  let tr = newTracer("http://127.0.0.1:1/v1/traces", "test", 0.0)
+  let app = adapterApp(newSink())
+  app.use(tracing(tr))
+  app.get("/spawn", spawningHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/spawn"))
+  assert(res.status == 200, "want 200, got ${res.status}")
+  tr.shutdown()
+}
