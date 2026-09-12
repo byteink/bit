@@ -553,3 +553,63 @@ no argument, and this module knows no dialect. That is what Postgres wants.
 MySQL refuses the statement once a transaction is open, so a MySQL driver that
 means to support levels honours it in its own `Tx.exec` - the driver's job, the
 same way placeholder syntax already is.
+
+## `@table` descriptors - what the compiler hands a mapper
+
+A class carrying the `@table` attribute (SPEC §10.5) gains a synthesized
+`tableDescriptor(): []FieldDesc`, one entry per field in declaration order. The
+compiler fills these in; nothing here is written by hand.
+
+The compiler attaches no meaning to any of it. `unique` is a word it copied off
+a field and passed along. What an attribute name means, if anything at all, is
+decided by whatever reads the descriptor - `bitlang.org/pkg/orm` treats `@id` as
+a primary key, and a different mapper is free to treat it as nothing. That split
+is the point: a mapper can add `@check(...)` or `@collation(...)` without a
+compiler release, because the compiler never learned the first set of names
+either.
+
+### `FieldDesc`
+
+One field of a `@table` class: its name and declared type exactly as written,
+and the attributes the compiler recorded rather than called.
+
+An attribute is RECORDED when its name resolves to no function at all, which is
+what a marker like `@id` looks like. An attribute whose name does resolve is
+CALLED from the class's `validateFields()` instead, unchanged, and never appears
+in `attrs`. So a field carrying `@unique` and `@maxLen(255)` records the first
+and calls the second.
+
+```bit
+import { FieldDesc, AttrDesc } from "std/sql"
+
+@table class User {
+  @id
+  id: i64
+  @unique
+  email: string
+}
+
+fn columns(u: User): []string {
+  let out = []string(0)
+  for f of u.tableDescriptor() {
+    out = append(out, "${f.name} ${f.typeName}")
+  }
+  return out
+}
+```
+
+A module that declares a `@table` class without importing `FieldDesc` and
+`AttrDesc` is **E0150**, and a class that declares `tableDescriptor` itself is
+**E0148**, naming both.
+
+### `AttrDesc`
+
+One recorded attribute: its name, and its arguments as text.
+
+Arguments must be constant expressions - a non-constant one is **E0149**. Each
+is rendered to its source spelling and never interpreted here: a string
+literal's own decoded content, any other literal's raw text unchanged. So
+`@check("age > 0")` arrives as the nine characters `age > 0`, without the
+quotes, and `@scale(2, 3)` arrives as `"2"` and `"3"` in that order. Parsing
+them is the mapper's job, which is why they are `[]string` and not a value type
+this module would have to define.
