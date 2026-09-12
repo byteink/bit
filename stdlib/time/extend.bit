@@ -1,0 +1,201 @@
+// Bit standard library — time module: the extend() extension point (#5096).
+//
+// `std/time` ships no zone database of its own; `extend(ext)` lets a caller
+// hand one in as DATA:
+//
+//   import * as time from "std/time"
+//   import * as tz from "std/tz"
+//   time.extend(tz.data)
+//
+// `ext` is a `string`, not a class or a reference, because nothing else can
+// cross a module boundary and then be KEPT: SPEC §11.11 allows module-level
+// `let` to hold only untraced values (`let slot: string` is `E0082`,
+// verified against this worktree's `bit check`), and a `*T` into a managed
+// slice left in module state is the live interior-pointer hazard (#4406,
+// closed) — not a workaround. The one storage class module state DOES allow
+// is a fixed-size array of an untraced element type (a `[N]u8`, spec
+// §11.11). This file copies `stdlib/http/trustcache.bit`'s pattern exactly:
+// a fixed `[N]u8` at module scope plus atomic state words, filled once at
+// run time. Read that file's header before changing anything here.
+//
+//   1. Concurrency. Exactly one caller ever becomes the publisher, via
+//      atomicCmpxchg on `tzExtendState` (0 -> 1). A blob is fully validated
+//      BEFORE the CAS, so the publisher's own write can never fail partway:
+//      it copies the already-proven-good bytes into `tzExtendBuf`, THEN
+//      `atomicStore(state, 2)`. Bit's atomics are sequentially consistent
+//      (SPEC §11.5), so any thread that observes state == 2 sees the whole
+//      buffer, never a partial one. A second `extend()` call — whether it
+//      loses the race or arrives after publication — finds the CAS already
+//      taken and returns `false` without touching the buffer.
+//   2. Failure. `extend()` never panics on a malformed blob: a bad magic,
+//      an unsupported version byte, a truncated or self-inconsistent index
+//      (any offset+length past the blob), or a blob bigger than
+//      `tzExtendCap` all return `false` and store nothing — the CAS is
+//      never attempted for a blob that failed validation.
+//   3. Zero cost when unused. `tzExtendBuf` is zero-valued BSS: a program
+//      that never calls `extend()` never writes a byte of it, and `zone()`
+//      (./zone.bit) never even reads `tzExtendState` until its own
+//      `readFile` against the host's zoneinfo tree has already failed —
+//      host files win, always.
+//
+// Blob format (this ticket defines it; the generator, #5097, follows it):
+//
+//   magic   8 bytes   'B' 'I' 'T' 'T' 'Z' 0x00 0x00 <version>
+//   count   4 bytes   big-endian u32, number of zones
+//   index   count * (2 + name + 4 + 4): u16 big-endian name length, name
+//           bytes, u32 big-endian payload offset, u32 big-endian payload
+//           length — offset and length are both measured from the START of
+//           the blob, so they can point anywhere, including into the index
+//           itself; only "does not run past the end of the blob" is
+//           checked, matching every other TZif-adjacent reader in this
+//           module (./zoneif.bit's header comment makes the same call).
+//   payload concatenated TZif images, each exactly as
+//           /usr/share/zoneinfo holds it — handed to the existing
+//           `tzifParse` (./zoneif.bit) unmodified.
+//
+// The magic's trailing byte is a format version, checked separately from
+// the 7 fixed bytes before it so "wrong magic" and "unknown version" are
+// distinguishable failures, both non-panicking. Version 1 is the only one
+// this file accepts. The magic is matched byte-by-byte rather than kept as
+// a string constant containing embedded NUL bytes — a literal NUL in a
+// source file can be mangled by an editor (`stdlib/path/safepath.test.bit`
+// makes the same call for its own embedded-NUL test).
+
+// Generous headroom over a two-zone hand-built test blob while staying well
+// under a full IANA database's ~30-40 zones actually served per region; a
+// blob that does not fit is simply never stored (extend() returns false),
+// never truncated.
+const tzExtendCap: int = 1048576
+
+let tzExtendBuf: [tzExtendCap]u8
+let tzExtendLen: int
+let tzExtendState: int // 0 empty, 1 building, 2 ready
+
+// Own `extern fn` declaration: `stdlib/http` and `stdlib/time` are separate
+// modules, so trustcache.bit's own declaration of the same runtime symbol
+// does not reach here (trustcache.bit's header comment notes the same for
+// stdlib/crypto). Declared once in this file; zone.bit uses it unqualified
+// as a same-module (SPEC §17.1) sibling declaration.
+extern fn bit_rt_bytes_copy(dst: *byte, src: *byte, n: int)
+
+// One decoded index entry: `name`'s payload is `data[offset:offset+length]`
+// in the blob `data` the entry was parsed from.
+class tzExtendEntry {
+  name: string,
+  offset: int,
+  length: int,
+}
+
+fn tzExtendReadU32(data: []byte, pos: int): int {
+  return (int(data[pos]) << 24) | (int(data[pos + 1]) << 16) |
+    (int(data[pos + 2]) << 8) | int(data[pos + 3])
+}
+
+// Whether the first 7 bytes of `data` are the fixed magic prefix. The 8th
+// byte is the format version, checked separately by tzExtendParse so a bad
+// magic and an unknown version are distinguishable failures.
+fn tzExtendMagicOk(data: []byte): bool {
+  if (len(data) < 8) {
+    return false
+  }
+  return data[0] == 'B' && data[1] == 'I' && data[2] == 'T' && data[3] == 'T' &&
+    data[4] == 'Z' && data[5] == 0 && data[6] == 0
+}
+
+// Parses the index (12 bytes in from the start of `data`, `count` entries)
+// into `[]tzExtendEntry`. Every offset read from the blob is treated as
+// hostile: nothing is trusted until the bounds check against `len(data)`
+// that follows it — same discipline as ./zoneif.bit's own TZif reader.
+fn tzExtendParseIndex(data: []byte, count: int): []tzExtendEntry! {
+  let entries = []tzExtendEntry(0)
+  let pos = 12
+  let i = 0
+  while (i < count) {
+    if (pos + 2 > len(data)) {
+      fail newError("tzextend: truncated index")
+    }
+    let nameLen = (int(data[pos]) << 8) | int(data[pos + 1])
+    pos = pos + 2
+    if (nameLen < 0 || pos + nameLen > len(data)) {
+      fail newError("tzextend: truncated name")
+    }
+    let name = string(data[pos:pos + nameLen])
+    pos = pos + nameLen
+    if (pos + 8 > len(data)) {
+      fail newError("tzextend: truncated offset/length")
+    }
+    let off = tzExtendReadU32(data, pos)
+    let length = tzExtendReadU32(data, pos + 4)
+    pos = pos + 8
+    if (off > len(data) || length > len(data) - off) {
+      fail newError("tzextend: index entry runs past the end of the blob")
+    }
+    entries = append(entries, tzExtendEntry{ name: name, offset: off, length: length })
+    i = i + 1
+  }
+  return entries
+}
+
+// Full validation of a candidate blob: magic, version, and a self-consistent
+// index. Never panics — every rejection is a `fail`. Used both by extend()
+// before it will attempt to publish, and by tzExtendLookup() to re-decode
+// the already-published buffer.
+fn tzExtendParse(data: []byte): []tzExtendEntry! {
+  if (!tzExtendMagicOk(data)) {
+    fail newError("tzextend: bad magic")
+  }
+  if (data[7] != 1) {
+    fail newError("tzextend: unsupported version byte ${int(data[7])}")
+  }
+  if (len(data) < 12) {
+    fail newError("tzextend: truncated header")
+  }
+  let count = tzExtendReadU32(data, 8)
+  return tzExtendParseIndex(data, count)?
+}
+
+// The extension point (#5096, owner ruling). Validates `ext` completely
+// before ever attempting to publish, so a rejected blob changes nothing —
+// not the buffer, not the state word, not even a failed CAS attempt. A
+// second call, whether it loses a race with a concurrent first call or
+// simply arrives after one already succeeded, always returns `false`: this
+// extension point accepts exactly one blob per process.
+export fn extend(ext: string): bool {
+  let data = []byte(ext)
+  if (len(data) > tzExtendCap) {
+    return false
+  }
+  tzExtendParse(data) catch _ {
+    return false
+  }
+  if (!atomicCmpxchg(ptrOf(tzExtendState), 0, 1)) {
+    return false
+  }
+  bit_rt_bytes_copy(ptrOf(tzExtendBuf), ptrOf(data), len(data))
+  tzExtendLen = len(data)
+  atomicStore(ptrOf(tzExtendState), 2)
+  return true
+}
+
+// The TZif payload for `name` out of the published extension blob, copied
+// into a fresh heap slice (never a view into `tzExtendBuf` itself — module
+// state must never leak a reference the caller could hold past this call).
+// Fails when `extend()` has not published yet (state != 2, including the
+// empty and mid-build states) or `name` is not in the index. Module-
+// internal; ./zone.bit's `zone()` is the only caller, and only after its own
+// host-file read has already failed.
+fn tzExtendLookup(name: string): []byte! {
+  if (atomicLoad(ptrOf(tzExtendState)) != 2) {
+    fail newError("tzextend: no extension data published")
+  }
+  let n = int(tzExtendLen)
+  let data = []byte(n)
+  bit_rt_bytes_copy(ptrOf(data), ptrOf(tzExtendBuf), n)
+  let entries = tzExtendParse(data)?
+  for e of entries {
+    if (e.name == name) {
+      return data[e.offset:e.offset + e.length]
+    }
+  }
+  fail newError("tzextend: no zone named '${name}'")
+}
