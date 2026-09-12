@@ -458,15 +458,21 @@ test "a failing chain outside the mount propagates through static() to the adapt
   assert(res.body != fallthroughBody, "the failing handler's route must not have served a body")
 }
 
-// The other half: a failure raised INSIDE the mount, by `staticServe`, is
-// forwarded with the same `?`. `readFile` is the only thing under
-// `staticServe` that fails — every rejection it decides itself is a 404 `Res`,
-// not a failure — so the fixture makes one file unreadable.
+// The other half: a read failure raised INSIDE the mount, after `lstat` has
+// already accepted the file. Before #4554 this was a generic 500 — the only
+// way `staticServe` failed at all — but `bit_rt_fs_open_nofollow_w`
+// (`readFileNoFollow`, the read `staticFileRes` now uses to close the
+// symlink-swap race) does not say WHY an open failed: "the caller learns
+// only that it did not get a file" (runtime/root/darwin/fs.bit). A
+// permission change and a symlink swapped in mid-request reach this site
+// through the identical -1, so they get the identical answer, and 404 —
+// never confirming to the client which one happened, or that anything
+// changed on disk at all — is that answer.
 //
 // If this suite is ever run as root the chmod is not enforced, the file reads
 // back and this test FAILS on the 200. That is deliberate: a skip would make
 // the site look pinned when nothing checked it.
-test "a read failure under the mount propagates out of static() as the adapter's 500" {
+test "a read failure under the mount is a 404, not the adapter's 500 (#4554)" {
   let f = newStaticFixture("unreadable")
   let locked = "${f.root}/locked.css"
   writeFixture(locked, cssBody)
@@ -475,14 +481,7 @@ test "a read failure under the mount propagates out of static() as the adapter's
 
   let res = f.app.handle(staticReq("GET", "/assets/locked.css", ""))
 
-  assert(
-    res.status == 500,
-    "an unreadable file must fail out to the adapter's 500, got ${res.status}",
-  )
-  assert(
-    !contains(res.body, cssBody),
-    "the response must carry no file content, got '${res.body}'",
-  )
+  assertRejected(res, "/assets/locked.css")
 }
 
 // --- #4637: the length a static HEAD declares, on the wire ----------------
@@ -539,4 +538,61 @@ test "on the wire, a static HEAD declares the file's real length and sends no co
     len(wire) == blank + 4,
     "a HEAD carries no content, got ${len(wire) - blank - 4} octet(s) after the head",
   )
+}
+
+// --- open-time symlink refusal (#4554) --------------------------------------
+//
+// `staticServe`'s own `lstat(full)` sees a real file and accepts it; the
+// actual read happens afterwards, via `staticReadFile` (`readFileNoFollow`).
+// Those are two separate syscalls a fraction of a second apart, so whoever
+// can swap `full` for a symlink in that gap races it -- and going through
+// `app.handle()` cannot force the swap into that exact gap deterministically,
+// because both syscalls run inside ONE synchronous call a test cannot pause
+// in the middle of. A test that swaps the file BEFORE calling `app.handle()`
+// proves nothing either: `staticServe`'s own fresh `lstat` would catch that
+// symlink on the OLD racy code exactly as on the fix, since lstat runs again
+// at request time regardless of which read primitive follows it.
+//
+// So this reproduces the underlying primitive's contract directly instead:
+// lstat a real file (what `staticServe`'s check sees), swap it to a symlink
+// (what an attacker does in the gap a live race needs), then read it with
+// EXACTLY what `staticReadFile` is bound to. `readFileNoFollow` makes no
+// assumption about anything checked earlier -- the open itself decides, not
+// a prior stat -- so it refuses every time, not on a scheduling win. The
+// control read with plain `readFile` (module-wide from node.test.bit; the
+// exact primitive `staticReadFile` used before this ticket) proves the swap
+// is real: it follows the same symlink and returns the sentinel.
+import { readFileNoFollow, remove } from "std/fs"
+
+test "a file swapped to a symlink after being lstat'd is refused, not read" {
+  let f = newStaticFixture("swap")
+  let target = "${f.root}/swap.css"
+  writeFixture(target, cssBody)
+
+  let before = lstat(target) catch e {
+    panic("static.test: lstat ${target}: ${e.message()}")
+  }
+  assert(!before.isSymlink, "the fixture must start as a real file, not a symlink")
+
+  // `mustLink` uses plain `ln -s`, which refuses an existing name -- remove
+  // the regular file `lstat` just accepted before swapping in the symlink.
+  remove(target) catch e {
+    panic("static.test: remove ${target}: ${e.message()}")
+  }
+  mustLink("${f.dir}/secret.txt", target)
+
+  let leaked = readFile(target) catch e {
+    panic("static.test: control read of ${target} unexpectedly failed: ${e.message()}")
+  }
+  assert(
+    leaked == sentinelBody,
+    "control: plain readFile must still follow the swapped symlink, got '${leaked}'",
+  )
+
+  let refused = false
+  let _ = readFileNoFollow(target) catch _ {
+    refused = true
+    ""
+  }
+  assert(refused, "readFileNoFollow followed the swapped symlink instead of refusing it")
 }
