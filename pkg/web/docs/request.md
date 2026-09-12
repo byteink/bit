@@ -83,8 +83,17 @@ The app-level default is `Config.rejectUnknownFields` (`true`, see
 `bodyWith`, the only way to be lenient - there is no global switch that turns
 the check off invisibly:
 
-```
-let row = c.bodyWith<Legacy>(Bind{ unknown: Unknown.Ignore })?
+```bit
+import { Bind, Ctx, Res, Unknown } from "web"
+
+class Legacy {
+  name: string,
+}
+
+fn importRow(c: Ctx): Res! {
+  let row = c.bodyWith<Legacy>(Bind{ unknown: Unknown.Ignore })?
+  return c.text(row.name)
+}
 ```
 
 `Ignore` drops at most 32 unknown keys and then answers 400 - dropping them is
