@@ -458,15 +458,21 @@ test "a failing chain outside the mount propagates through static() to the adapt
   assert(res.body != fallthroughBody, "the failing handler's route must not have served a body")
 }
 
-// The other half: a failure raised INSIDE the mount, by `staticServe`, is
-// forwarded with the same `?`. `readFile` is the only thing under
-// `staticServe` that fails — every rejection it decides itself is a 404 `Res`,
-// not a failure — so the fixture makes one file unreadable.
+// The other half: a read failure raised INSIDE the mount, after `lstat` has
+// already accepted the file. Before #4554 this was a generic 500 — the only
+// way `staticServe` failed at all — but `bit_rt_fs_open_nofollow_w`
+// (`readFileNoFollow`, the read `staticFileRes` now uses to close the
+// symlink-swap race) does not say WHY an open failed: "the caller learns
+// only that it did not get a file" (runtime/root/darwin/fs.bit). A
+// permission change and a symlink swapped in mid-request reach this site
+// through the identical -1, so they get the identical answer, and 404 —
+// never confirming to the client which one happened, or that anything
+// changed on disk at all — is that answer.
 //
 // If this suite is ever run as root the chmod is not enforced, the file reads
 // back and this test FAILS on the 200. That is deliberate: a skip would make
 // the site look pinned when nothing checked it.
-test "a read failure under the mount propagates out of static() as the adapter's 500" {
+test "a read failure under the mount is a 404, not the adapter's 500 (#4554)" {
   let f = newStaticFixture("unreadable")
   let locked = "${f.root}/locked.css"
   writeFixture(locked, cssBody)
@@ -475,14 +481,7 @@ test "a read failure under the mount propagates out of static() as the adapter's
 
   let res = f.app.handle(staticReq("GET", "/assets/locked.css", ""))
 
-  assert(
-    res.status == 500,
-    "an unreadable file must fail out to the adapter's 500, got ${res.status}",
-  )
-  assert(
-    !contains(res.body, cssBody),
-    "the response must carry no file content, got '${res.body}'",
-  )
+  assertRejected(res, "/assets/locked.css")
 }
 
 // --- #4637: the length a static HEAD declares, on the wire ----------------
@@ -538,5 +537,78 @@ test "on the wire, a static HEAD declares the file's real length and sends no co
   assert(
     len(wire) == blank + 4,
     "a HEAD carries no content, got ${len(wire) - blank - 4} octet(s) after the head",
+  )
+}
+
+// --- symlink-swap race (#4554) ---------------------------------------------
+//
+// `staticServe`'s own `lstat(full)` sees a real file and accepts it; the
+// actual read happens afterwards, in `staticFileRes` -> `staticReadFile`. A
+// test that swaps the served path for a symlink BEFORE calling `app.handle`
+// proves nothing: that same `lstat` would see the symlink too, on the OLD
+// racy code exactly as on the fix. Only a swap that lands WHILE a request is
+// in flight -- after its `lstat`, before its read -- exercises the actual
+// race, so this hammers both sides concurrently: a detached shell script
+// flips `raced` between a real file and a symlink to the sentinel outside the
+// root, on its own clock, while the main loop fires requests at it for a
+// wall-clock budget. `assertRejected`-shaped: whatever a request's status,
+// `sentinelBody` must never appear.
+//
+// PROVEN CLOSED BY MUTATION, not by this test's own pass/fail alone (#4554
+// report): reverting the `readFileNoFollow as staticReadFile` import
+// (static.bit) back to plain `readFile` leaks `sentinelBody` inside this same
+// budget; the fix, run the same way, never does.
+const raceBudgetNs: i64 = 3000000000 // 3s wall clock, plenty for the shell loop below to run its course
+const raceIterations = 6000          // bounds the shell loop; each iteration forks rm/ln/rm/printf, so 6000 spans multiple seconds
+
+// `#!/bin/sh` script text: an unbounded `while true` never runs here — the
+// counter loop below is the shell-side bound matching `raceIterations`.
+fn raceScript(target: string, outside: string, content: string): string {
+  return "#!/bin/sh\n" +
+    "i=0\n" +
+    "while [ \$i -lt ${raceIterations} ]; do\n" +
+    "  rm -f '${target}'\n" +
+    "  ln -s '${outside}' '${target}'\n" +
+    "  rm -f '${target}'\n" +
+    "  printf '%s' '${content}' > '${target}'\n" +
+    "  i=\$((i+1))\n" +
+    "done\n"
+}
+
+test "a symlink swapped in mid-request never leaks the target's bytes" {
+  let f = newStaticFixture("race")
+  let target = "${f.root}/raced"
+  let outside = "${f.dir}/secret.txt"
+  writeFixture(target, cssBody)
+
+  let attacker = "${f.dir}/attacker.sh"
+  writeFixture(attacker, raceScript(target, outside, cssBody))
+  // `nohup ... &` inside its own subshell: this outer /bin/sh exits the
+  // instant the background job is launched, so `run` (which waits for the
+  // process it directly spawned) returns almost immediately while the
+  // detached script keeps flipping the symlink independently.
+  let rc = run(
+    "/bin/sh",
+    ["-c", "chmod +x '${attacker}' && (nohup '${attacker}' >/dev/null 2>&1 &)"],
+  )
+  assert(rc == 0, "could not start the race attacker script: exit ${rc}")
+
+  let deadline = timeMonoNs() + raceBudgetNs
+  let requests = 0
+  while (timeMonoNs() < deadline) {
+    let res = f.app.handle(staticReq("GET", "/assets/raced", ""))
+    assert(
+      !contains(res.body, sentinelBody),
+      "request ${requests}: the response carried content from OUTSIDE the served root (status ${res.status})",
+    )
+    assert(
+      res.status == 200 || res.status == 404,
+      "request ${requests}: want 200 or 404, got ${res.status}",
+    )
+    requests = requests + 1
+  }
+  assert(
+    requests > 100,
+    "only ${requests} requests fired in the race budget -- too few to exercise it",
   )
 }
