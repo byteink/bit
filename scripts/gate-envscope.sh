@@ -369,7 +369,7 @@ argvscope_floor_for_tree() {
     runtime) printf '%s\n' "test-abimembers test-lint-runtime test-lint-self test-fmt-citations" ;;
     stdlib) printf '%s\n' "test-lint-self test-lint-sweep test-release-surface" ;;
     examples) printf '%s\n' "test-examples test-lint-filelines" ;;
-    pkg) printf '%s\n' "test-packages test-lint-sweep test-lint-complexity" ;;
+    pkg) printf '%s\n' "test-packages test-lint-sweep test-lint-complexity test-package-release-drift" ;;
     *) return 1 ;;
   esac
 }
