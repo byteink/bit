@@ -1,0 +1,622 @@
+// #5045: every `schedTaskInit(<expr>, ...)` call site under `_tests_/stress/**`
+// and the three `runtime/root/<os>/` boot modules must resolve `<expr>` back to
+// a module-level `let NAME: [SIZE]TYPE` array declaration whose SIZE text
+// references `taskWords` (runtime/sched/task.bit). #5034 and #5042 fixed 35
+// sites by hand across 16 stress fixtures and all three boot modules after
+// `taskWords` grew 32 -> 33 (#5028): `schedTaskInit` (runtime/sched/task.bit)
+// unconditionally writes `*(task + taskLocal) = 0`, taskLocal = 32, one word
+// past any array still sized `[32]i64` or a stale `N*32` product — a live
+// out-of-bounds write into the next module global, proven on netpark.bit under
+// #5042 by a zeroed sentinel in the adjacent `obsRounds` global. This gate
+// exists so the 20th/21st site cannot recur silently the next time `taskWords`
+// grows.
+//
+// SCOPE IS THE MODULE (directory), NOT THE FILE (deviates from this ticket's
+// own step 2, "in the same file" — checked against source, not assumed):
+// `runtime/root/linux/` splits its boot sequence across `boot.bit` (declares
+// `mainTaskBlock`) and `boottail.bit` (calls `schedTaskInit` against it) —
+// sibling files in one directory are one module (spec/SPEC.md:68, "Every
+// `.bit` file directly inside that directory is part of it"), so a
+// same-FILE-only resolver would silently skip linux's own main-task site,
+// exactly the `_tests_/bit/lintfilelines.bit`-class trap this workspace has
+// already paid for once (`.claude/kb/file-splits.md`: "A SINGLE-FILE GATE
+// TARGET CANNOT TAKE A SIBLING"). `_tests_/stress/chan/props/` (props.bit +
+// propstail.bit) and `_tests_/stress/threadpool/props/` are the same shape on
+// the stress side. Array declarations and helper functions (see below) are
+// therefore collected across every `.bit` file directly inside a module
+// directory before any call site in that module is resolved; call-site
+// extraction and local-variable resolution stay PER FILE, since a Bit local
+// `let` cannot cross a file boundary.
+//
+// RESOLUTION, bounded by `maxResolveHops`: the call's first argument is
+// repeatedly reduced — unwrapping `taskAt(...)`/`ptrOf(...)`/`int(...)`
+// wrappers, substituting a known local `let X = <rhs>`/`X = <rhs>` assignment
+// found in the SAME file, substituting a known module helper function's first
+// `ptrOf(ARRAY)` reference (e.g. `taskAddrOf`/`taskAddr`), or reducing an
+// arithmetic expression (`taskBase + i * taskWords * 8`) to its leading
+// identifier — until it lands on a module-level array declaration, or the hop
+// budget is spent. A site whose pointer is opaque to this scan (a bare
+// function PARAMETER with no local assignment, or a heap allocation via
+// `mapPages(...)`) resolves to nothing and is SKIPPED, not flagged: #5042's
+// own commit message carves exactly this out for
+// schedgrowdarwin/schedgrowlinux/schedgrowdemanddarwin.bit ("spawn-allocated
+// with no local array") and for `runtime/root/{darwin,windows}/boot.bit`'s
+// `rtSpawn`, whose `taskAddr` comes from `mapPages((taskWords + 1) * 8)` —
+// there is no fixed-size array at those sites to check.
+//
+// WINDOWS COVERAGE: this Mac never builds `runtime/root/windows/` (no native
+// Windows target here), but this gate never builds anything — it is a pure
+// TEXT scan of the checked-in `.bit` source, so `runtime/root/windows/boot.bit`
+// is read and checked identically to the two platforms this Mac can build,
+// with no build step required to reach it.
+//
+// Run from the repository root: ./bit-out/bin/bit run _tests_/bit/taskwordssizing.bit
+// `BIT_REPO` overrides the repository root (default: search . / .. / ../.. /
+// ../../..), matching `_tests_/bit/threadtokenbytes.bit`'s own convention.
+
+import { env, exit } from "std/os"
+import { exists, isDir, readDir, readFile } from "std/fs"
+import { contains, hasPrefix, hasSuffix, indexOf, indexOfFrom, trimSpace, split } from "std/strings"
+
+fn die(msg: string) {
+  eprint("taskwordssizing: ${msg}\n")
+  exit(1)
+}
+
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/compiler/codegen.bit")) {
+      return c
+    }
+  }
+  die("cannot locate compiler/codegen.bit from this cwd; set BIT_REPO")
+  return ""
+}
+
+// Bounds (Power of 10 rule 2: every loop below is statically bounded by one
+// of these, never by "until the end of the file/tree").
+const maxSourceBytes: int = 200000
+const maxDirEntries: int = 300
+const maxScanDepth: int = 6
+const maxModules: int = 150
+const maxCallSitesPerFile: int = 24
+const maxResolveHops: int = 8
+const maxHelperBodyLines: int = 20
+
+fn readSource(path: string): string {
+  let src = readFile(path) catch e {
+    die("cannot read ${path}: ${e.message()}")
+    ""
+  }
+  if (len(src) > maxSourceBytes) {
+    die("${path} is ${len(src)} bytes, over the ${maxSourceBytes} bound")
+  }
+  return src
+}
+
+// ---------------------------------------------------------------------------
+// Module (directory) discovery
+// ---------------------------------------------------------------------------
+
+// Every directory at or beneath `dir` that has at least one `.bit` file
+// directly inside it — spec/SPEC.md:68's definition of a module.
+fn moduleDirs(root: string, dir: string, depth: int, out: []string): []string {
+  if (depth <= 0) {
+    die("${dir} nesting exceeds the ${maxScanDepth}-level bound")
+  }
+  let names = readDir("${root}/${dir}") catch e {
+    die("cannot list ${root}/${dir}: ${e.message()}")
+    []string(0)
+  }
+  if (len(names) > maxDirEntries) {
+    die("${dir} has ${len(names)} entries, over the ${maxDirEntries} bound")
+  }
+  let hasBit = false
+  for name of names {
+    if (hasSuffix(name, ".bit")) {
+      hasBit = true
+    }
+  }
+  if (hasBit) {
+    out = append(out, dir)
+  }
+  for name of names {
+    let rel = "${dir}/${name}"
+    if (isDir("${root}/${rel}")) {
+      out = moduleDirs(root, rel, depth - 1, out)
+    }
+  }
+  if (len(out) > maxModules) {
+    die("${len(out)} module directories found, over the ${maxModules} bound")
+  }
+  return out
+}
+
+// Every `.bit` file directly inside module directory `dir`.
+fn filesInModule(root: string, dir: string): []string {
+  let names = readDir("${root}/${dir}") catch e {
+    die("cannot list ${root}/${dir}: ${e.message()}")
+    []string(0)
+  }
+  let out = []string(0)
+  for name of names {
+    if (hasSuffix(name, ".bit")) {
+      out = append(out, "${dir}/${name}")
+    }
+  }
+  return out
+}
+
+fn targetModules(root: string): []string {
+  let mods = moduleDirs(root, "_tests_/stress", maxScanDepth, []string(0))
+  let bootDirs = ["runtime/root/darwin", "runtime/root/linux", "runtime/root/windows"]
+  for b of bootDirs {
+    if (!exists("${root}/${b}/boot.bit")) {
+      die("expected ${b}/boot.bit to exist")
+    }
+    mods = append(mods, b)
+  }
+  return mods
+}
+
+// ---------------------------------------------------------------------------
+// Byte/identifier primitives
+// ---------------------------------------------------------------------------
+
+fn isIdentByte(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// The leading run of identifier bytes in `s`, "" if `s` does not start with one.
+fn identPrefix(s: string): string {
+  let i = 0
+  while (i < len(s) && isIdentByte(s[i])) {
+    i = i + 1
+  }
+  return s[0:i]
+}
+
+// Whether `afterOpen` (everything after an opening '(' already consumed,
+// INCLUDING the candidate closing ')') closes that SAME paren only at its
+// last byte — i.e. `afterOpen` is not itself "x) + f(y)", which would mean
+// the outer '(' closed early and the trailing ')' belongs to something else.
+fn parenClosesAtEnd(afterOpen: string): bool {
+  let depth = 1
+  let i = 0
+  while (i < len(afterOpen)) {
+    let c = afterOpen[i]
+    if (c == '(') {
+      depth = depth + 1
+    } else if (c == ')') {
+      depth = depth - 1
+      if (depth == 0) {
+        return i == len(afterOpen) - 1
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Module-level array declarations: `let NAME: [SIZE]TYPE` at column 0.
+// ---------------------------------------------------------------------------
+
+class ArrayDecl { name: string, sizeText: string, file: string, line: int }
+
+fn parseArrayDeclLine(line: string): (string, string, bool) {
+  if (!hasPrefix(line, "let ")) {
+    return ("", "", false)
+  }
+  let colon = indexOf(line, ":")
+  if (colon < 0) {
+    return ("", "", false)
+  }
+  let name = trimSpace(line[4:colon])
+  if (len(name) == 0 || identPrefix(name) != name) {
+    return ("", "", false)
+  }
+  let open = indexOf(line, "[")
+  if (open < 0 || open < colon) {
+    return ("", "", false)
+  }
+  let closeAt = indexOf(line, "]")
+  if (closeAt < 0 || closeAt < open) {
+    return ("", "", false)
+  }
+  return (name, trimSpace(line[open + 1:closeAt]), true)
+}
+
+fn fileArrayDecls(file: string, lines: []string): []ArrayDecl {
+  let out = []ArrayDecl(0)
+  let i = 0
+  while (i < len(lines)) {
+    let (name, sizeText, ok) = parseArrayDeclLine(lines[i])
+    if (ok) {
+      out = append(out, ArrayDecl{ name: name, sizeText: sizeText, file: file, line: i + 1 })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn findArrayDecl(decls: []ArrayDecl, name: string): (ArrayDecl, bool) {
+  for d of decls {
+    if (d.name == name) {
+      return (d, true)
+    }
+  }
+  return (ArrayDecl{ name: "", sizeText: "", file: "", line: 0 }, false)
+}
+
+// ---------------------------------------------------------------------------
+// Module helper functions whose body's first `ptrOf(ARRAY)` names the array
+// they compute an address into or from (e.g. `taskAddrOf`/`taskAddr`).
+// ---------------------------------------------------------------------------
+
+class HelperFn { name: string, arrayExpr: string }
+
+fn parseHelperFnHeader(line: string): (string, bool) {
+  let t = trimSpace(line)
+  if (hasPrefix(t, "export ")) {
+    t = t[7:len(t)]
+  }
+  if (!hasPrefix(t, "fn ")) {
+    return ("", false)
+  }
+  let rest = t[3:len(t)]
+  let ident = identPrefix(rest)
+  if (len(ident) == 0 || len(rest) <= len(ident) || rest[len(ident)] != '(') {
+    return ("", false)
+  }
+  return (ident, true)
+}
+
+// The bare argument of the first `ptrOf(...)` found within `maxHelperBodyLines`
+// of `lines[startIdx]` (the `fn` header), stopping at that function's closing
+// brace so the scan cannot bleed into the next declaration.
+fn helperArrayExprFrom(lines: []string, startIdx: int): (string, bool) {
+  let i = startIdx
+  let limit = startIdx + maxHelperBodyLines
+  if (limit > len(lines)) {
+    limit = len(lines)
+  }
+  while (i < limit) {
+    let at = indexOf(lines[i], "ptrOf(")
+    if (at >= 0) {
+      let after = lines[i][at + 6:len(lines[i])]
+      let closeAt = indexOf(after, ")")
+      if (closeAt >= 0) {
+        return (trimSpace(after[0:closeAt]), true)
+      }
+    }
+    if (i > startIdx && lines[i] == "}") {
+      break
+    }
+    i = i + 1
+  }
+  return ("", false)
+}
+
+fn fileHelperFns(lines: []string): []HelperFn {
+  let out = []HelperFn(0)
+  let i = 0
+  while (i < len(lines)) {
+    let (name, ok) = parseHelperFnHeader(lines[i])
+    if (ok) {
+      let (expr, eok) = helperArrayExprFrom(lines, i)
+      if (eok) {
+        out = append(out, HelperFn{ name: name, arrayExpr: expr })
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn findHelperFn(helpers: []HelperFn, name: string): (HelperFn, bool) {
+  for h of helpers {
+    if (h.name == name) {
+      return (h, true)
+    }
+  }
+  return (HelperFn{ name: "", arrayExpr: "" }, false)
+}
+
+// ---------------------------------------------------------------------------
+// Local variable assignments (same file only — a Bit `let` cannot cross a
+// file boundary, unlike the module-level decls/helpers above).
+// ---------------------------------------------------------------------------
+
+fn extractRHSAfterEquals(t: string): (string, bool) {
+  let eq = indexOf(t, "=")
+  if (eq < 0) {
+    return ("", false)
+  }
+  let rhs = trimSpace(t[eq + 1:len(t)])
+  let cmt = indexOf(rhs, "//")
+  if (cmt >= 0) {
+    rhs = trimSpace(rhs[0:cmt])
+  }
+  if (len(rhs) == 0) {
+    return ("", false)
+  }
+  return (rhs, true)
+}
+
+// `let ${ident}` is a real prefix of `let ${ident}Suffix` as raw text, so this
+// requires the byte right after `${ident}` to end the identifier (':' or ' ',
+// never another identifier byte) before treating it as a match.
+fn hasLetBoundary(t: string, ident: string): bool {
+  let prefix = "let ${ident}"
+  if (!hasPrefix(t, prefix) || len(t) <= len(prefix)) {
+    return false
+  }
+  return !isIdentByte(t[len(prefix)])
+}
+
+fn assignRHSIfMatches(t: string, ident: string): (string, bool) {
+  if (hasLetBoundary(t, ident)) {
+    return extractRHSAfterEquals(t)
+  }
+  let bare = "${ident} ="
+  if (hasPrefix(t, bare) && !hasPrefix(t, "${ident} ==")) {
+    return extractRHSAfterEquals(t)
+  }
+  return ("", false)
+}
+
+// Searches backward from `beforeLine` (1-indexed, exclusive of itself) rather
+// than forward from the top of the file: more than one function in the same
+// file can bind the same local name (`_tests_/stress/schedpool/props/props.bit`
+// has three separate `let t = ...`, one per function), so the match must be
+// the NEAREST preceding one, not the first in file order.
+fn localAssignRHS(lines: []string, ident: string, beforeLine: int): (string, bool) {
+  let idx = beforeLine - 2
+  while (idx >= 0) {
+    let (rhs, ok) = assignRHSIfMatches(trimSpace(lines[idx]), ident)
+    if (ok) {
+      return (rhs, true)
+    }
+    idx = idx - 1
+  }
+  return ("", false)
+}
+
+// ---------------------------------------------------------------------------
+// Resolution: reduce a call-site expression to a module array declaration.
+// ---------------------------------------------------------------------------
+
+fn wrapperFns(): []string {
+  return ["taskAt", "ptrOf", "int"]
+}
+
+fn tryUnwrap(expr: string): (string, bool) {
+  for w of wrapperFns() {
+    let prefix = "${w}("
+    if (hasPrefix(expr, prefix) && hasSuffix(expr, ")")) {
+      if (parenClosesAtEnd(expr[len(prefix):len(expr)])) {
+        return (trimSpace(expr[len(prefix):len(expr) - 1]), true)
+      }
+    }
+  }
+  return (expr, false)
+}
+
+fn callFunctionName(expr: string): (string, bool) {
+  let ident = identPrefix(expr)
+  if (len(ident) == 0 || len(expr) <= len(ident) || expr[len(ident)] != '(') {
+    return ("", false)
+  }
+  if (!hasSuffix(expr, ")")) {
+    return ("", false)
+  }
+  if (!parenClosesAtEnd(expr[len(ident) + 1:len(expr)])) {
+    return ("", false)
+  }
+  return (ident, true)
+}
+
+// The leading identifier of an arithmetic expression (`taskBase + i * ...`
+// reduces to `taskBase`), or a same-file local assignment's RHS when `expr`
+// IS exactly one bare identifier. "" ok=false when neither applies (a
+// function PARAMETER with no local assignment: opaque, correctly unresolved).
+fn reduceToBase(lines: []string, expr: string, beforeLine: int): (string, bool) {
+  let ident = identPrefix(expr)
+  if (len(ident) == 0) {
+    return ("", false)
+  }
+  if (ident != expr) {
+    return (ident, true)
+  }
+  return localAssignRHS(lines, ident, beforeLine)
+}
+
+fn resolveArraySource(lines: []string, decls: []ArrayDecl, helpers: []HelperFn, initialExpr: string, beforeLine: int): (ArrayDecl, bool) {
+  let expr = trimSpace(initialExpr)
+  let hop = 0
+  while (hop < maxResolveHops) {
+    hop = hop + 1
+    let (d, dok) = findArrayDecl(decls, expr)
+    if (dok) {
+      return (d, true)
+    }
+    let (unwrapped, wok) = tryUnwrap(expr)
+    if (wok) {
+      expr = unwrapped
+      continue
+    }
+    let (fnName, cok) = callFunctionName(expr)
+    if (cok) {
+      let (h, hok) = findHelperFn(helpers, fnName)
+      if (!hok) {
+        return (ArrayDecl{ name: "", sizeText: "", file: "", line: 0 }, false)
+      }
+      expr = h.arrayExpr
+      continue
+    }
+    let (next, rok) = reduceToBase(lines, expr, beforeLine)
+    if (!rok) {
+      return (ArrayDecl{ name: "", sizeText: "", file: "", line: 0 }, false)
+    }
+    expr = next
+  }
+  return (ArrayDecl{ name: "", sizeText: "", file: "", line: 0 }, false)
+}
+
+// ---------------------------------------------------------------------------
+// Call-site extraction: `schedTaskInit(<first arg>, ...)`, paren-depth aware
+// so a first argument that itself spans multiple lines or nested calls (both
+// occur, e.g. `_tests_/stress/sched/sched.bit`, `runtime/root/darwin/boot.bit`)
+// is captured whole.
+// ---------------------------------------------------------------------------
+
+class CallSite { line: int, argExpr: string }
+
+const callMarker: string = "schedTaskInit("
+
+fn countNewlinesBefore(text: string, pos: int): int {
+  let n = 0
+  let i = 0
+  while (i < pos) {
+    if (text[i] == '\n') {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+fn extractFirstArg(text: string, openParen: int): string {
+  let depth = 1
+  let start = openParen + 1
+  let i = start
+  while (i < len(text) && depth > 0) {
+    let c = text[i]
+    if (c == '(') {
+      depth = depth + 1
+    } else if (c == ')') {
+      depth = depth - 1
+      if (depth == 0) {
+        break
+      }
+    } else if (c == ',' && depth == 1) {
+      break
+    }
+    i = i + 1
+  }
+  return trimSpace(text[start:i])
+}
+
+fn findCallSites(text: string): []CallSite {
+  let out = []CallSite(0)
+  let searchFrom = 0
+  let iterations = 0
+  while (iterations < maxCallSitesPerFile) {
+    iterations = iterations + 1
+    let at = indexOfFrom(text, callMarker, searchFrom)
+    if (at < 0) {
+      break
+    }
+    let openParen = at + len(callMarker) - 1
+    let argExpr = extractFirstArg(text, openParen)
+    let line = countNewlinesBefore(text, at) + 1
+    out = append(out, CallSite{ line: line, argExpr: argExpr })
+    searchFrom = at + len(callMarker)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+
+class Violation { file: string, line: int, sizeText: string, callFile: string, callLine: int }
+
+fn sizedFromTaskWords(sizeText: string): bool {
+  return contains(sizeText, "taskWords")
+}
+
+// Scans every file in module `files`, resolving each `schedTaskInit` call
+// site found in each file against the WHOLE module's combined `decls`/
+// `helpers`. Returns the violations found and the count of sites that
+// resolved to a concrete array declaration (checked either way).
+fn scanModule(root: string, files: []string, decls: []ArrayDecl, helpers: []HelperFn): ([]Violation, int) {
+  let violations = []Violation(0)
+  let checked = 0
+  for f of files {
+    let src = readSource("${root}/${f}")
+    let lines = split(src, "\n")
+    let sites = findCallSites(src)
+    for site of sites {
+      let (decl, ok) = resolveArraySource(lines, decls, helpers, site.argExpr, site.line)
+      if (!ok) {
+        continue
+      }
+      checked = checked + 1
+      if (!sizedFromTaskWords(decl.sizeText)) {
+        violations = append(violations, Violation{
+          file: decl.file, line: decl.line, sizeText: decl.sizeText,
+          callFile: f, callLine: site.line,
+        })
+      }
+    }
+  }
+  return (violations, checked)
+}
+
+fn moduleDeclsAndHelpers(root: string, files: []string): ([]ArrayDecl, []HelperFn) {
+  let decls = []ArrayDecl(0)
+  let helpers = []HelperFn(0)
+  for f of files {
+    let lines = split(readSource("${root}/${f}"), "\n")
+    for d of fileArrayDecls(f, lines) {
+      decls = append(decls, d)
+    }
+    for h of fileHelperFns(lines) {
+      helpers = append(helpers, h)
+    }
+  }
+  return (decls, helpers)
+}
+
+fn main() {
+  let root = repoRoot()
+  let modules = targetModules(root)
+  // A shrunk module list proves nothing (`_tests_/bit/threadtokenbytes.bit`'s
+  // own "shortened table" defense) — #5042 alone touched 16 stress fixtures,
+  // plus 3 more the ticket's own list missed.
+  assert(len(modules) >= 19)
+
+  let allViolations = []Violation(0)
+  let totalChecked = 0
+  for m of modules {
+    let files = filesInModule(root, m)
+    let (decls, helpers) = moduleDeclsAndHelpers(root, files)
+    let (violations, checked) = scanModule(root, files, decls, helpers)
+    for v of violations {
+      allViolations = append(allViolations, v)
+    }
+    totalChecked = totalChecked + checked
+  }
+
+  eprint("make: test-taskwords-sizing: ${totalChecked} schedTaskInit array-base site(s) resolved to a local array declaration across ${len(modules)} module(s)\n")
+  if (totalChecked == 0) {
+    eprint("make: test-taskwords-sizing: refusing — 0 sites resolved, indistinguishable from every site being correct\n")
+    exit(1)
+  }
+  if (len(allViolations) == 0) {
+    println("test-taskwords-sizing: PASS — ${totalChecked} site(s) all size their array via taskWords")
+    return
+  }
+  eprint("make: test-taskwords-sizing: refusing — schedTaskInit's unconditional taskLocal write (runtime/sched/task.bit) lands one word past an array not sized via taskWords:\n")
+  for v of allViolations {
+    eprint("make:   ${v.file}:${v.line}: [${v.sizeText}] does not reference taskWords (schedTaskInit call at ${v.callFile}:${v.callLine})\n")
+  }
+  exit(1)
+}
