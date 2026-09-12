@@ -4,14 +4,16 @@ A MySQL **and MariaDB** driver for `std/sql`. It exports one symbol.
 
 ```bit
 import { pool, Datasource, Pool } from "std/sql"
-import { adapter } from "bitlang.org/pkg/mysql"
+import { adapter } from "mysql"
 
 fn connect(url: string): Pool! {
   return pool(adapter(), Datasource{ uri: url })?
 }
 ```
 
-Install with `bit add bitlang.org/pkg/mysql@v0.1.0`.
+Install with `bit add bitlang.org/pkg/mysql@v0.1.0`, which writes the
+dependency into `bit.lock` under the key `mysql` - the vanity path's last
+segment, which is also the name every import above uses.
 
 One package serves both servers. The wire protocol is one protocol; the
 differences are a version prefix, a second half of the capability field and one

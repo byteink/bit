@@ -11,8 +11,7 @@ positional `?`. This driver rewrites one into the other before anything is
 sent:
 
 ```bit
-import { pool, Datasource, Pool, Value } from "std/sql"
-import { adapter } from "bitlang.org/pkg/mysql"
+import { Pool, Value } from "std/sql"
 
 fn byId(db: Pool, id: string): Value! {
   let rows = db.query("select name from users where id = $1", [Value.Text(id)])?

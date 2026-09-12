@@ -1,7 +1,10 @@
 # Connecting
 
 `bitlang.org/pkg/mysql` exports exactly one symbol, `adapter()`, which hands
-`std/sql`'s `pool` an `Adapter` for MySQL and MariaDB. It is a function and not
+`std/sql`'s `pool` an `Adapter` for MySQL and MariaDB. `bit add
+bitlang.org/pkg/mysql@v0.1.0` records it in `bit.lock` under the key `mysql` -
+the vanity path's last segment - so every import below reads `from "mysql"`,
+not the full vanity path. `adapter` is a function and not
 `export let adapter: Adapter` because a module-level `let` may only hold an
 untraced scalar (SPEC §11.11) - an interface value there is a compile error,
 not a style preference. Each call returns a fresh value, which is also the
@@ -14,7 +17,7 @@ connect on `ssl-mode=DISABLED` and say nothing.
 
 ```bit
 import { pool, Datasource, Pool, Value } from "std/sql"
-import { adapter } from "bitlang.org/pkg/mysql"
+import { adapter } from "mysql"
 
 fn firstRow(url: string): Value! {
   let db = pool(adapter(), Datasource{ uri: url })?
