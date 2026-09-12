@@ -6,18 +6,16 @@ Dates, times, time zones, durations, clocks and timers.
 
 ## Status of this document
 
-This page is **both** the reference for what ships today and the specification for
-the calendar rewrite that replaces the UTC-only calendar API.
+The calendar rewrite that replaces the superseded, UTC-only `Civil` API (#4062)
+has landed: this page documents the shipped `Date`/`Time`/`NaiveDateTime`/
+`DateTime`/`Timestamp`/`Zone` API throughout, and `Civil`, `civilFromUnix`,
+`unixFromCivil`, `formatUnix`, `formatRfc3339`, `parseRfc3339` and `utcOffset`
+have been deleted (#4084) rather than merely superseded.
 
-| Part | State |
-|---|---|
-| Durations, clocks, sleeping, timer channels | **Shipped.** Unchanged by the rewrite. |
-| Dates, times, zones, formatting, parsing | **Specified, not yet implemented.** |
-| The `Civil` calendar API | **Shipped, superseded.** See [Superseded API](#superseded-api). |
-
-Every example in a specified section is fenced ```` ```bit ignore ```` because the
-API it shows does not exist yet and would fail the doc-snippet gate. Examples in
-shipped sections compile.
+One function remains specified but not yet implemented: `today(z: Zone): Date`
+(see [Constructing](#constructing)). Its example stays fenced
+```` ```bit ignore ```` until it exists; every other example in this page
+compiles.
 
 ---
 
@@ -145,8 +143,8 @@ provides no zone information.
 Prefer an explicit `zone("Asia/Dubai")` in server code. The host's zone is a
 property of the machine, not of the business, and a machine moves.
 
-```bit ignore
-import { zone, utc, localZone } from "std/time"
+```bit
+import { zone, utc, localZone, Zone } from "std/time"
 
 fn zones(): Zone! {
   let dubai = zone("Asia/Dubai")?
@@ -177,8 +175,8 @@ Both rules are total and deterministic. A scheduled job that runs at `01:30` run
 exactly once a day, every day, in every zone, and never raises an error on one day
 a year in one country.
 
-```bit ignore
-import { zone, date } from "std/time"
+```bit
+import { zone, date, DateTime } from "std/time"
 
 fn springGap(): DateTime! {
   let london = zone("Europe/London")?
@@ -193,7 +191,7 @@ Calendar arithmetic on a `DateTime` keeps the **wall clock** and lets the elapse
 physical time absorb the transition. This is what a person means by "same time
 tomorrow".
 
-```bit ignore
+```bit
 import { zone, date } from "std/time"
 
 fn twentyFiveHours(): int! {
@@ -213,8 +211,8 @@ Both facts are true at once, and both matter. A daily 9am report must still run 
 
 To add real elapsed time instead, go through the instant:
 
-```bit ignore
-import { Hour } from "std/time"
+```bit
+import { Hour, DateTime } from "std/time"
 
 fn plusRealHours(t: DateTime, n: int): DateTime! {
   return t.toTimestamp()?.add(n * Hour).inZone(t.zone())
@@ -225,11 +223,11 @@ fn plusRealHours(t: DateTime, n: int): DateTime! {
 
 ## Constructing
 
-**`date()`, `time()` and `timeNs()` are shipped**, returning a `Date` or a
-`Time` with the accessors and `toString()` documented below all
-implemented. `today` and `zone` are not yet — the example at the end of
-this section mixes `date`/`time`/`timeNs` with them and stays fenced
-`ignore` until the rest of the rewrite lands.
+**`date()`, `time()`, `timeNs()` and `zone()` are shipped**, returning a
+`Date`, a `Time` or a `Zone` with the accessors and `toString()` documented
+below all implemented. `today` is not yet — the example at the end of this
+section mixes `date`/`time`/`timeNs`/`zone` with it and stays fenced
+`ignore` until `today` exists.
 
 ### `date(year: int, month: int, day: int): Date!`
 
@@ -398,9 +396,9 @@ The day of month, 1..`daysInMonth()`.
 
 ### `Date.dayOfWeek(): int`
 
-1 for Monday through 7 for Sunday — ISO 8601 numbering. The superseded
-`Civil.weekday` is 0 for Sunday through 6 for Saturday; this is a
-deliberately different numbering, not a bug.
+1 for Monday through 7 for Sunday — ISO 8601 numbering. The superseded,
+now-deleted `Civil.weekday` was 0 for Sunday through 6 for Saturday; this is
+a deliberately different numbering, not a bug.
 
 ### `Date.dayOfYear(): int`
 
@@ -590,8 +588,8 @@ from it, rather than stepping forward one month at a time from the last one.
 
 `withMonth` clamps: 2026-01-31 `withMonth(2)` is 2026-02-28.
 
-```bit ignore
-import { date } from "std/time"
+```bit
+import { Date } from "std/time"
 
 fn billingDates(start: Date): Date {
   // Anchored: every occurrence is computed from `start`, never from the
@@ -631,7 +629,9 @@ None of them fails, and no month length is written down: `endOfMonth` is 28, 29,
 `endOfDay` on a `DateTime` is the last representable nanosecond, not the next
 midnight. A range check on a whole day should prefer a half-open interval:
 
-```bit ignore
+```bit
+import { Timestamp } from "std/time"
+
 fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
   return !t.isBefore(dayStart) && t.isBefore(nextDayStart)
 }
@@ -643,8 +643,8 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 
 **Shipped**, on the types named in the tables below: `isLeapYear`, `isBefore`,
 `isAfter`, `isSame`, `isBetween`, `compare`, `isSameDay`, `isSameMonth`,
-`isSameYear`, `isPast` and `isFuture`. `isWeekend` and `isWeekday` are not yet
-implemented — they need a `Weekend`, see [Business days](#business-days).
+`isSameYear`, `isPast`, `isFuture`, `isWeekend` and `isWeekday` — the last two
+take a `Weekend`, see [Business days](#business-days).
 
 ### `Date.isLeapYear(): bool`
 
@@ -728,7 +728,9 @@ a daylight saving transition even though 25 hours of real time elapsed. Subtract
 two `Timestamp` values when real elapsed time is what matters. These two answers
 differing is correct, not a bug.
 
-```bit ignore
+```bit
+import { Date } from "std/time"
+
 fn ageInYears(birth: Date, on: Date): int {
   return birth.differenceInYears(on)
 }
@@ -841,8 +843,8 @@ holiday run is a caller error, not a runtime condition, so it is not reported as
 failure. The cap is on the consecutive non-business-day run, not on the whole call:
 `addBusinessDays(c, 5000)` is fine.
 
-```bit ignore
-import { date, calendar, weekendSatSun } from "std/time"
+```bit
+import { calendar, weekendSatSun, Date } from "std/time"
 
 fn paymentDue(invoiced: Date, holidays: []Date): Date {
   let c = calendar(weekendSatSun(), holidays)
@@ -855,7 +857,7 @@ fn paymentDue(invoiced: Date, holidays: []Date): Date {
 ## Formatting
 
 **Shipped**, on `Date`, `Time`, `NaiveDateTime` and `DateTime`. Parsing, the
-other direction, is not yet implemented.
+other direction, is shipped too — see [Parsing](#parsing).
 
 ### `format(pattern: string): string!`
 
@@ -1120,11 +1122,11 @@ cross-checks recorded in `stdlib/time/hijri.bit`'s header.
 
 There is no Hijri **arithmetic**. Add months to the `Date` and convert for display.
 
-```bit ignore
-import { date } from "std/time"
+```bit
+import { Date } from "std/time"
 
-fn invoiceHeader(d: Date): string {
-  return d.format("d MMMM yyyy") + " / " + d.hijri().format("d MMMM yyyy") + " AH"
+fn invoiceHeader(d: Date): string! {
+  return d.format("d MMMM yyyy")? + " / " + d.hijri()?.format("d MMMM yyyy")? + " AH"
 }
 ```
 
@@ -1519,195 +1521,3 @@ single list.
 | `Date.toTimestamp` on year 1600 | fails, outside the instant range |
 | `zone("Asia/Dubai")` with no host zone data | fails |
 | `hijri()` outside 1300–1500 AH | fails, tables do not cover it |
-
----
-
-## Superseded API
-
-Documented because it ships today and because code has to be migrated off it. It
-is UTC-only: it has no notion of a zone, `formatRfc3339` can only ever print `Z`,
-and `addDays` is fixed 86400-second arithmetic. It is replaced by the types above.
-
-### Migration
-
-| Superseded | Replacement |
-|---|---|
-| `Instant` | `Timestamp` |
-| `Civil` | `NaiveDateTime`, or `Date` when there is no time of day |
-| `civilFromUnix(ns)` | `Timestamp.inZone(utc()).naive()` |
-| `unixFromCivil(c)` | `NaiveDateTime.inZone(utc()).toTimestamp()` |
-| `formatUnix(ns, "%Y-%m-%d")` | `.format("yyyy-MM-dd")`, note the token change |
-| `formatRfc3339(ns)` | `.toString()` |
-| `parseRfc3339(s)` | `parseDateTime(s)` |
-| `startOfDay(ns)` | `.startOfDay()` |
-| `addDays(ns, n)` | `.addDays(n)`, now zone-aware |
-| `addMonths(ns, n)` | `.addMonths(n)`, clamping unchanged |
-| `utcOffset(ns)` | `DateTime.offset()`, or `localZone()` |
-| `Civil.weekday`, 0 = Sunday | `dayOfWeek()`, **1 = Monday** |
-
-Two behaviour changes to check for during migration. `dayOfWeek` renumbers, so any
-comparison against a weekday literal has to move. And format strings change from
-strftime `%Y-%m-%d` to LDML `yyyy-MM-dd`; the two are not interchangeable and a
-strftime pattern passed to `format` renders as literal text rather than failing.
-
-### `Civil`
-
-A broken-down UTC date and time: `year`, `month` (1..12), `day` (1..days in
-that month), `hour` (0..23), `minute` (0..59), `second` (0..59), `nanosecond`
-(0..999999999), `weekday` (0 for Sunday up to 6 for Saturday), and `yearDay`
-(1 for January 1).
-
-### `civilFromUnix(ns: int): Civil`
-
-`ns` nanoseconds since the Unix epoch, broken down into a UTC `Civil`. Exact
-for any instant, including before 1970 — the day/time split floors instead of
-truncating, so a negative `ns` still lands on the correct calendar day.
-
-```bit
-import { civilFromUnix } from "std/time"
-
-fn describe(ns: int) {
-  let c = civilFromUnix(ns)
-  println("${c.year}-${c.month}-${c.day} ${c.hour}:${c.minute}:${c.second}")
-}
-```
-
-### `unixFromCivil(c: Civil): int!`
-
-The inverse of `civilFromUnix`: nanoseconds since the Unix epoch for a UTC
-`Civil`. Fails when `month`, `day`, `hour`, `minute`, `second`, or
-`nanosecond` is out of range — `day` is checked against the actual length of
-`month` in `year`, leap years included. Ignores `weekday` and `yearDay`.
-
-```bit
-import { Civil, unixFromCivil } from "std/time"
-
-fn leapDaySeconds(): int! {
-  let c = Civil{
-    year: 2024, month: 2, day: 29, hour: 0, minute: 0, second: 0,
-    nanosecond: 0, weekday: 0, yearDay: 0,
-  }
-  return unixFromCivil(c)?
-}
-```
-
-### `formatUnix(ns: int, layout: string): string`
-
-Renders the UTC instant `ns` (nanoseconds since the Unix epoch) with a
-strftime subset. Every character in `layout` is copied through unchanged
-except: `%Y` the year (at least four digits, zero padded); `%m` the month
-(two digits); `%d` the day (two digits); `%H` the hour (two digits); `%M` the
-minute (two digits); `%S` the second (two digits); `%%` a literal `%`. Any
-other `%x` pair, and a trailing lone `%`, are copied through unchanged.
-
-```bit
-import { formatUnix } from "std/time"
-
-fn describe(ns: int) {
-  println(formatUnix(ns, "%Y-%m-%d %H:%M:%S"))
-}
-```
-
-### `formatRfc3339(ns: int): string`
-
-Renders the UTC instant `ns` as RFC 3339: `2026-08-02T14:03:11Z` when the
-nanosecond field is `0`. When it is not `0`, a `.` and exactly nine
-zero-padded digits are inserted before the `Z` — 500 nanoseconds prints
-`2026-08-02T14:03:11.000000500Z`, never `.5`.
-
-```bit
-import { formatRfc3339 } from "std/time"
-
-fn logLine(ns: int, msg: string) {
-  println("${formatRfc3339(ns)} ${msg}")
-}
-```
-
-### `startOfDay(ns: int): int`
-
-The UTC midnight that starts the day containing `ns`. Floors rather than
-truncates, so a negative `ns` still lands on the calendar day it belongs to.
-
-```bit
-import { startOfDay, formatRfc3339 } from "std/time"
-
-fn describe(ns: int) {
-  println(formatRfc3339(startOfDay(ns)))
-}
-```
-
-### `addDays(ns: int, n: int): int`
-
-`ns` shifted by `n` days of exactly 86400000000000 nanoseconds each. `n` may
-be negative.
-
-```bit
-import { addDays } from "std/time"
-
-fn tomorrow(ns: int): int {
-  return addDays(ns, 1)
-}
-```
-
-### `addMonths(ns: int, n: int): int`
-
-`ns` shifted by `n` calendar months, keeping the time-of-day fields
-unchanged. `n` may be negative. The day is clamped to the last valid day of
-the target month rather than overflowing into the next one:
-2026-01-31 plus one month is 2026-02-28, not 2026-03-03 (contrast Go's
-`time.AddDate`, which normalizes and would give 2026-03-03).
-
-```bit
-import { addMonths } from "std/time"
-
-fn nextMonthClamped(ns: int): int {
-  return addMonths(ns, 1)
-}
-```
-
-### `parseRfc3339(s: string): int!`
-
-The inverse of `formatRfc3339`: parses `YYYY-MM-DDTHH:MM:SS`, an optional `.`
-plus 1 to 9 fractional-second digits, then a zone (`Z`, or a signed `HH:MM`
-offset), into nanoseconds since the Unix epoch. Stricter than RFC 3339 in
-three ways: only uppercase `T` and `Z` are accepted; the zone offset always
-carries its `:` (`+HHMM` is rejected); and a leap-second `:60` is rejected,
-since `unixFromCivil` — which this function delegates every calendar range
-check to — rejects any second above 59. A fractional part shorter than nine
-digits is zero-padded on the right (`.5` is `500000000`); ten or more digits
-is a parse failure rather than a silent truncation.
-
-```bit
-import { parseRfc3339, formatRfc3339 } from "std/time"
-
-fn roundTrip(text: string): bool! {
-  let ns = parseRfc3339(text)?
-  return formatRfc3339(ns) == text
-}
-```
-
-### `utcOffset(ns: int): int`
-
-The host's offset from UTC, in seconds east of UTC, in effect at the instant
-`ns` (nanoseconds since the Unix epoch). Dubai returns `14400`, UTC returns
-`0`. Reads `/etc/localtime` — the version 1 (32-bit) block of the TZif format,
-RFC 8536 — directly: the path is the same on macOS and Linux, so there is no
-platform branch, and no copy of the tzdata database ships with this function.
-Returns `0`, rather than failing, when the file is missing, is a dangling
-symlink, is shorter than the header, or does not start with the TZif magic.
-
-Version 1's transition times are signed 32-bit seconds, which overflow in
-2038; an instant past then resolves against the last version 1 transition
-rather than the correct one. RFC 8536 §3.2's version 2 block, with 64-bit
-transition times, is the upgrade path.
-
-**This function has no callers anywhere in this repository.** The zone work
-replaces it, and the version 2 reader it needs is part of that work.
-
-```bit
-import { utcOffset, now } from "std/time"
-
-fn localOffsetSeconds(): int {
-  return utcOffset(now().ns)
-}
-```
