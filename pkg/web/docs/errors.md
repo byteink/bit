@@ -51,4 +51,5 @@ fn mount(app: App) {
 `onError` is refused after the app is frozen, and a second one on the same
 group is refused too - both fail at registration rather than on a request.
 
-Next: [Configuration](configuration.md).
+Next: [Envelope](envelope.md), for giving every response - success and
+failure alike - one shape.
