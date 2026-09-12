@@ -22,6 +22,12 @@
 // escape.bit, and `join` by router.bit (an import binds per MODULE, not per
 // file — SPEC §17.1); re-importing either here is E0042.
 //
+// `JsonEntry` IS NOT among them, and is used below (`Res.wrap`) anyway:
+// res.test.bit already imports it under its own name, and a test file is
+// part of this module when the package's tests are built (errors.bit's
+// header makes the identical point about its own `JsonPair` alias) — so
+// importing it again here would be that same E0042.
+//
 // WHAT PANICS AND WHY. Three things here abort instead of failing: a status
 // outside 100..599, a control byte in a header name or value, and a
 // `Location` that cannot be derived. All three are caller-contract
@@ -84,10 +90,36 @@ export class Header {
 // What a handler returns. Built only through `Ctx`'s helpers (ctx.bit) or
 // the constructors below, never by literal: every path through them sets a
 // status inside 100..599 and, where there is a body, a `Content-Type`.
+//
+// #5078: a JSON-family response (`jsonRes`/`jsonValueRes`, and through it
+// `jsonList`/`jsonOpt`) carries its VALUE (`value`/`hasValue`) and its
+// serialiser (`serialize`) instead of pre-encoded bytes, so a middleware on
+// the way out can `wrap`/`mapValue` the value with no decode-and-re-encode
+// round trip. `bodyText` is still where the answer ends up — as the direct
+// body for every non-value response (`text`/`html`/`status`/...,
+// unchanged), and as the ONE-TIME cache for a value response once `body()`
+// has run `serialize` (`bodySet` marks that this happened). `body()` is
+// therefore the single place serialisation happens, and the single place
+// that stops it happening twice.
 export class Res {
   code: int
   bodyText: string
   pairs: []Header
+
+  // #5078: the held value and its serialiser, for a response built through
+  // the JSON family. `hasValue` is false for every other constructor
+  // (`newRes`'s zero value), and `body()`/`wrap()`/`mapValue()` all gate on
+  // it so a text/html/status response is untouched by any of this.
+  hasValue: bool
+  value: Json
+  serialize: (Json) => string
+
+  // Set the first time `body()` runs `serialize`, so a second call returns
+  // the same bytes without running it again (the ticket's "do not let
+  // body() be called twice with different results") and so `wrap`/
+  // `mapValue` can refuse to mutate a value whose serialisation already
+  // went out (`requireWritableValue`).
+  bodySet: bool
 
   // The representation's length when this response deliberately carries no
   // body — a HEAD answered without reading the file (`staticFileRes`,
@@ -139,11 +171,60 @@ export class Res {
   // `status()`: a rule applied at the write would depend on the order a
   // handler chained its calls (`c.text("x").status(204)` versus
   // `c.status(204)` then a body), and this cannot.
+  //
+  // #5078: for a value-backed response this is also the ONE place
+  // `serialize` ever runs — never in `jsonValueRes`, never in `wrap`/
+  // `mapValue`. `bodySet` makes that a run-once: the first call encodes
+  // `value` into `bodyText` and every call after, on this same `Res`,
+  // returns that cached `bodyText` straight back, `serialize` untouched.
   export body(): string {
     if (this.code == statusNoContent || this.code == statusNotModified) {
       return ""
     }
+    if (this.hasValue && !this.bodySet) {
+      this.bodyText = this.serialize(this.value)
+      this.bodySet = true
+    }
     return this.bodyText
+  }
+
+  // Replaces this response's value with `{ key: <value> }` — the envelope
+  // shape a Nest-style interceptor middleware wraps a body in (#5078,
+  // #5079). Operates on the held `Json`, never on bytes: no decode, and
+  // `serialize` does not run until `body()` does, so two chained
+  // `.wrap(a).wrap(b)` calls still serialise exactly once.
+  export wrap(key: string): Res {
+    this.requireWritableValue("wrap")
+    this.value = Json.JsonObject([JsonEntry{ key: key, value: this.value }])
+    return this
+  }
+
+  // Replaces this response's value with whatever `f` returns, for a
+  // middleware that transforms rather than envelopes (#5078). Same
+  // no-decode, serialise-once guarantee as `wrap`.
+  export mapValue(f: (Json) => Json): Res {
+    this.requireWritableValue("mapValue")
+    this.value = f(this.value)
+    return this
+  }
+
+  // The shared guard behind `wrap`/`mapValue`. Two ways to misuse either are
+  // both a programming error with no correct recovery, so both panic rather
+  // than silently no-op: calling one on a response that was never built
+  // with a value (`c.text`/`c.html`/`c.status`/...) — there is no `value`
+  // for it to touch — and calling one AFTER `body()` already ran
+  // `serialize`, which is exactly the "body() returns two different
+  // results" the ticket forbids.
+  requireWritableValue(who: string) {
+    if (!this.hasValue) {
+      panic(
+          "web: res.${who}(): this response carries no value to wrap — it was built " +
+          "by c.text/c.html/c.status/..., not c.json/c.jsonList/c.jsonOpt",
+      )
+    }
+    if (this.bodySet) {
+      panic("web: res.${who}(): this response's body() has already run — its value can no longer be changed")
+    }
   }
 
   // The value set for `name` (case-insensitive), or "" if there is none.
@@ -221,8 +302,34 @@ fn jsonRes(v: Jsonable): Res {
 // still open, filed as #4523. So the `T`-dependent step — asking each element
 // for its `toJson()` — lives in the method body, where it lowers, and only
 // the finished `Json` crosses back here.
+//
+// #5078: no `jsonEncode(j)` here any more — that ran the encoder inside
+// `c.json`/`c.jsonList`/`c.jsonOpt`, before any wrapping middleware got a
+// chance to touch the value, forcing `wrap` to decode the bytes back out.
+// `newValueRes` holds `j` and `jsonEncode` itself instead; encoding happens
+// once, in `body()`.
 fn jsonValueRes(j: Json): Res {
-  return newRes(statusOK, jsonContentType, jsonEncode(j))
+  return newValueRes(statusOK, jsonContentType, j, jsonEncode)
+}
+
+// The value-backed counterpart to `newRes` (#5078): `contentType` is set the
+// same way, but the body is `value`, encoded by `serialize` no earlier than
+// the first `body()` call. `serialize` is a parameter — not always
+// `jsonEncode` inlined here — so a test can swap in a counting one and prove
+// how many times it ran (res.test.bit); production callers all pass
+// `jsonEncode` itself (see `jsonValueRes` above).
+fn newValueRes(code: int, contentType: string, value: Json, serialize: (Json) => string): Res {
+  let r = Res{
+    code: checkStatus(code),
+    hasValue: true,
+    value: value,
+    serialize: serialize,
+    pairs: []Header(0),
+  }
+  if (len(contentType) > 0) {
+    r.set(contentTypeName, contentType)
+  }
+  return r
 }
 
 fn textRes(s: string): Res {
