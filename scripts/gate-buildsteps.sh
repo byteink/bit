@@ -274,7 +274,19 @@ case "${BUCKET}" in
     # line reddens this gate — and until now only the `selfhost` bucket ran
     # it, for the spec/FMT.md row. Measured `./make test-fmt-citations` 0m29s
     # on this tree (3 documents, 805 source files, 755 citations).
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-fmt-citations)
+    #
+    # test-taskwords-sizing (#5045/#5087) — same shape as test-fmt-citations
+    # just above: scope in neither argv (names only its own fixture) nor an
+    # env entry, but hardcoded in the harness as
+    # `bootDirs = ["runtime/root/darwin", "runtime/root/linux",
+    # "runtime/root/windows"]` — a literal-directory-array spelling neither
+    # argvscope_pattern_for_tree()'s three arms (scripts/gate-envscope.sh)
+    # match nor is safe to widen for (that would turn every quoted
+    # "runtime/..." string anywhere under runtime/ into a candidate). So it
+    # is wired here by hand, and scripts/gate-envscope.sh's
+    # assert_taskwordssizing_scope_current() re-checks this membership on
+    # every run rather than leaving it unaudited.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-fmt-citations test-taskwords-sizing)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=

@@ -264,7 +264,13 @@ gates_for_file() {
       # stress:_tests_/stress (tools/build/gatestable2.bit), an env entry
       # naming this exact directory, so a _tests_/stress/**-only diff owes it
       # the same way it owes test-stress-exclusive.
-      printf 'test-stress-exclusive\ntest-fmt-stress\n'
+      # test-taskwords-sizing (#5045/#5087) scans this tree by inspection
+      # (moduleDirs(root, "_tests_/stress", ...) in its own harness), a
+      # spelling the argvscope machinery in scripts/gate-envscope.sh cannot
+      # route here (that tree has no single static bucket — see
+      # ARGVSCOPE_TREES's own comment there), so it is named by hand here
+      # too, same as its sibling arms above.
+      printf 'test-stress-exclusive\ntest-fmt-stress\ntest-taskwords-sizing\n'
       return 0
       ;;
     _tests_/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
