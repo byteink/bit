@@ -2571,6 +2571,45 @@ disappears — while `<b>bold</b> <i>italic</i>` on one line has three, the midd
 one being the single space, and `<p> hi </p>` has one child whose text is
 ` hi ` with both spaces intact.
 
+**Desugaring (#3944).** A JSX element's meaning depends only on its tag's first
+letter — case is the discriminator every JSX implementation uses and the one a
+reader already expects.
+
+A **lowercase** tag is an HTML element and desugars to a call to `elem`, its
+tag name as a quoted string, one call to `attr` per attribute (an attribute
+written with no value passes `true`), and the element's children as further
+arguments:
+
+```text
+<div id="a">{x}</div>   ==>   elem("id", attr("id", "a"), x)
+```
+
+An **uppercase** tag is a component call: an ordinary call to the function
+the tag names, with each attribute passed as a named argument (§12.11) and the
+children collected into a trailing `children` argument:
+
+```text
+<Layout title="Users"><UserList users={us} /></Layout>
+   ==>   Layout(title = "Users", children = [UserList(users = us)])
+```
+
+Because this is an ordinary call, a wrong attribute name, a missing required
+one, and a value of the wrong type are the same compile diagnostics an
+ordinary miscalled function gets — not a JSX-specific check.
+
+A fragment (`<>...</>`) desugars the same way a lowercase element does, but
+calling `frag` with no tag-name argument: `<>{a}{b}</> ==> frag(a, b)`.
+
+**Names resolve by ordinary scope rules.** `elem`, `attr`, and `frag` are not
+built in and the compiler never implicitly imports them or special-cases the
+module that defines them (`pkg/web`, or any other module exporting the same
+three names) — a file that writes a lowercase tag with none of the three in
+scope gets the ordinary unresolved-name diagnostic, exactly as a bare call to
+an unimported function would.
+
+A JSX expression's own type is whatever its desugared call returns; there is
+no built-in `Node` type.
+
 ---
 
 ## 13. Statements, Memory, and Types Semantics
