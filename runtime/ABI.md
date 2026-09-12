@@ -2046,6 +2046,50 @@ its one packed-argument pointer, never `f` and its raw arguments directly.
 Never fails visibly: OOM is fatal here (SPEC.md §16.1's `spawn` has no
 fallible surface form), so codegen never checks a return value.
 
+### Task-local storage slot (#5028, `docs/context-propagation.md` decision B)
+
+One word, **offset 32, size 8 bytes**, inside every task control block
+(`runtime/sched/task.bit`'s `taskLocal`, index `taskWords - 1` — `taskWords`
+grew from 32 to 33 words to hold it). Present on `main`'s task, every worker's
+idle-loop task, and every spawned task alike, because it lives in the same
+fixed-size block `schedTaskInit` zeroes for all of them, not in the one extra
+word `taskSpawnEntry` reserves for a spawned task only.
+
+**Semantics.** The slot is owned exclusively by the task it belongs to.
+`bit_rt_task_local_get()` and `bit_rt_task_local_set(v: i64)` read and write
+the CALLING task's own slot only — there is no cross-task accessor. At
+`bit_rt_spawn`, the runtime copies the spawning task's word into the new
+child's word once, synchronously, on the parent's own stack, after the
+child's task control block is initialised (`schedTaskInit`, which zeroes the
+word first) and before the child is published to any worker queue
+(`runtime/root/<os>/boot.bit`'s `rtSpawn`, immediately before its call to
+`schedSpawn`) — so no reader of the child's word can observe anything but
+either that snapshot or the child's own later write, and the parent's word is
+never written by anything but the parent itself. A task with no parent (there
+is exactly one: `main`) starts at 0.
+
+**The word is opaque to the runtime** — a plain `i64`, not a typed value. It
+may hold a small integer or the address of a GC-managed object; the runtime
+does not decode it either way. `runtime/stw/stwscan.bit`'s `stwScanTasks`
+marks it conservatively for every registered task on every collection
+(`runtime/stw/stw.bit` root class 5, alongside the pending-spawn `arg` word),
+so a live reference stored here survives a collection for as long as the
+owning task holds it — exactly the property a future typed `Context` value
+needs before it can be built on top of this slot.
+
+**Exported C symbols:**
+
+| Symbol | Signature |
+|--------|-----------|
+| `bit_rt_task_local_get` | `() -> i64` — the calling task's own word, or `0` off a task stack |
+| `bit_rt_task_local_set` | `(v: i64) -> void` — a no-op off a task stack |
+
+`stdlib/runtime`'s `taskLocalGet`/`taskLocalSet` (`docs/stdlib/runtime.md`)
+are the only sanctioned callers. **No public `Context` API lands with this
+slot** — see `docs/context-propagation.md`'s decision: this is the primitive
+`std/trace` (#3969) and later request-scoped mechanisms build on, not a
+finished feature.
+
 ### Exported C symbols (all `bit_rt_*`, one process-wide runtime instance)
 
 **This table is a selection, not a census.** Every row below is exported and
