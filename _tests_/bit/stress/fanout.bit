@@ -7,7 +7,7 @@
 // ~70 non-exclusive programs at #3776's baseline (4be40962). This file reuses
 // the shared `_tests_/bit/gatefanout` module the exact way `_tests_/bit/golden`
 // and `_tests_/bit/examplesgate.bit` already do (#1901): stage every program's
-// jobs (no execution yet), make the ONE outer `osRunBounded` call, then grade
+// jobs (no execution yet), make the outer `osRunBounded` call(s), then grade
 // every program in the SAME order every run — so the report is deterministic
 // no matter which program's job happened to finish first inside `xargs -P`.
 //
@@ -39,20 +39,36 @@
 // watchdog (`gatefanout.bit`'s `watchdogText`) still kills any ONE job
 // independently once the shared ceiling elapses.
 //
-// Similarly, the per-subprocess load probe (`verify.bit`'s `loadProbe`,
-// #2401) becomes ONE probe for the whole batch rather than one before every
-// subprocess: with every job now running concurrently instead of spread over
-// 21 minutes, the box's load at staging time is representative of the whole
-// run, not just of one moment inside a long serial loop.
+// The load probe (`verify.bit`'s `loadProbe`, #2401) runs ONCE PER WAVE, not
+// once for the whole batch (#5124 fixed the earlier one-probe design: a
+// sample taken before ANY of the batch's own subprocesses exist is always
+// idle-relative, no matter how loaded the box gets once they start — #5124
+// measured host load 5.96 at a launch-time-only probe, then a sustained
+// 100-113 for the run the single sample never saw). `runBatch` below stages
+// and runs wave 1 (compile) first, in its own `osRunBounded` call, against a
+// deadline scaled from a probe taken before wave 1 exists — there is no
+// earlier point to sample from for the FIRST wave. It then re-probes before
+// staging wave 2 (both GC-policy runs): by then wave 1's own compiles have
+// been the batch's own load for the whole build phase, so that second
+// sample is taken after the batch's own subprocesses were running, exactly
+// the contract verify.bit:169 already promises for the non-batch path.
+// Splitting the single driver call into one per wave costs nothing wave 1
+// and wave 2 were not already paying: the ETXTBSY barrier between them
+// (`gatefanout`'s header) already required wave 1 to fully finish before any
+// wave-2 exec, so two sequential `osRunBounded` calls enforce that same
+// barrier, just across a process boundary instead of inside one script.
 
 import {
   FanCfg,
   Job,
   JobResult,
+  ResampleCfg,
   cleanupJob,
   commitWave,
   gradeJob,
   newFanCfg,
+  newFanCfgResampled,
+  readRescale,
   runDriver,
   stageJob,
   wave1,
@@ -79,6 +95,13 @@ class StressJob {
 }
 
 class BatchResult { ran: int, failures: int, inconclusive: int, oracled: int, proofs: int }
+
+// How far into its OWN run each wave-2 job's watchdog waits before taking its
+// one mid-run load reading (#5124). Long enough that `xargs -P` has started
+// every job in the wave and the kernel's runnable-queue sampling (what
+// `uptime`'s load average is built from) has caught up; short against a
+// 1200s-class base deadline either way.
+const wave2ResampleAfterMs: int = 15000
 
 // The `batch` partition's program list: `eligible` (already host-gated) minus
 // the four `exclusiveNames()`, further narrowed by `BIT_STRESSGATE_ONLY` when
@@ -161,10 +184,10 @@ fn runArgv(bin: string, gcMode: string, workers: int): []string {
   return argv
 }
 
-// Stages one program's three jobs. The compile (wave 1) exports
-// BIT_STDLIB/BIT_LIBBITRT exactly like `buildProgram` does; the two runs
-// (wave 2) do not (`withEnv: false`), matching `runOnce`'s own wrapper.
-fn stageOne(cfg: FanCfg, cx: Ctx, plan: StressJob, idx: int, bin: string) {
+// Stages one program's compile job (wave 1, its own `osRunBounded` call —
+// see this file's header on why the batch is now two calls, not one).
+// Exports BIT_STDLIB/BIT_LIBBITRT exactly like `buildProgram` does.
+fn stageBuild(cfg: FanCfg, cx: Ctx, plan: StressJob, idx: int, bin: string) {
   stageJob(
     cfg,
     Job{
@@ -176,7 +199,12 @@ fn stageOne(cfg: FanCfg, cx: Ctx, plan: StressJob, idx: int, bin: string) {
     },
   )
   commitWave(cfg.scratch, buildKey(idx), wave1)
+}
 
+// Stages one program's two GC-policy runs (wave 2, its own `osRunBounded`
+// call, staged only after wave 1 has fully finished). Neither exports the
+// compiler's env (`withEnv: false`), matching `runOnce`'s own wrapper.
+fn stageRuns(cfg: FanCfg, cx: Ctx, plan: StressJob, idx: int, bin: string) {
   stageJob(
     cfg,
     Job{
@@ -231,9 +259,53 @@ fn gradeOutcome(
 }
 
 // Grades one already-run program: build, then both policy runs, then the
+// Parses a `readRescale` line ("<scale> <load>", gatefanout.bit's
+// `watchdogText`). `ok: false` covers both "never resampled" (empty string:
+// the job finished before its warmup window, or its cfg had resampling
+// disabled) and a malformed line — neither is worth reporting.
+fn parseRescale(raw: string): (bool, int, string) {
+  if (len(raw) == 0) {
+    return false, 1, ""
+  }
+  let sp = indexOfAt(raw, " ", 0)
+  if (sp < 0) {
+    return false, 1, ""
+  }
+  let scale = parseIntStrict(raw[0:sp])
+  if (scale < 1) {
+    return false, 1, ""
+  }
+  return true, scale, trim(raw[sp + 1:])
+}
+
+// Prints the mid-run reading a job's own watchdog took (#5124), but only
+// when it actually widened the deadline (`scale > 1`) — a quiet box stays
+// quiet, exactly like `runScript`'s own "TIMED OUT" line only fires when it
+// matters.
+fn reportRescale(scratch: string, name: string, label: string, key: string) {
+  let (ok, scale, loadText) = parseRescale(readRescale(scratch, key))
+  if (ok && scale > 1) {
+    say(
+        "stress '" +
+        name +
+        "' [" +
+        label +
+        "]: deadline rescaled to x" +
+        num(scale) +
+        " (host load " +
+        loadText +
+        ", sampled mid-run)",
+    )
+  }
+}
+
+// Grades one already-run program: build, then both policy runs, then the
 // shared `judgeVerdict` oracle — the batch counterpart of `checkProgram`.
-fn gradeOne(scratch: string, plan: StressJob, idx: int): Verdict {
-  let br = gradeJob(scratch, buildKey(idx))
+// `buildScratch`/`runScratch` are separate because wave 1 and wave 2 now run
+// as two separate `osRunBounded` calls, each staged into its own scratch
+// subdir (this file's header).
+fn gradeOne(buildScratch: string, runScratch: string, plan: StressJob, idx: int): Verdict {
+  let br = gradeJob(buildScratch, buildKey(idx))
   if (!br.ran || br.code != 0) {
     if (!br.ran) {
       say("stress '" + plan.name + "' [compile]: job never completed")
@@ -244,10 +316,11 @@ fn gradeOne(scratch: string, plan: StressJob, idx: int): Verdict {
     return badVerdict(br.ran && br.code == -2)
   }
 
+  reportRescale(runScratch, plan.name, "default", defaultKey(idx))
   let first = gradeOutcome(
     plan.name,
     "default",
-    gradeJob(scratch, defaultKey(idx)),
+    gradeJob(runScratch, defaultKey(idx)),
     plan.expected,
     plan.statsRequired,
   )
@@ -261,10 +334,11 @@ fn gradeOne(scratch: string, plan: StressJob, idx: int): Verdict {
     say("  " + plan.waivedReason)
     label = "BIT_GC=off (waived)"
   }
+  reportRescale(runScratch, plan.name, label, stressKey(idx))
   let second = gradeOutcome(
     plan.name,
     label,
-    gradeJob(scratch, stressKey(idx)),
+    gradeJob(runScratch, stressKey(idx)),
     plan.expected,
     plan.statsRequired,
   )
@@ -280,7 +354,12 @@ fn gradeOne(scratch: string, plan: StressJob, idx: int): Verdict {
 // same corpus-wide counts `stress.bit`'s `main` already tracks for the
 // serial path. An immediate-fail plan (`ok: false`) counts as `ran` and
 // `failed` with no jobs to grade, matching `main`'s own pre-#3776 accounting.
-fn gradeBatch(scratch: string, plans: []StressJob, bins: []string): BatchResult {
+fn gradeBatch(
+  buildScratch: string,
+  runScratch: string,
+  plans: []StressJob,
+  bins: []string,
+): BatchResult {
   let ran = 0
   let failures = 0
   let inconclusive = 0
@@ -294,7 +373,7 @@ fn gradeBatch(scratch: string, plans: []StressJob, bins: []string): BatchResult 
       i = i + 1
       continue
     }
-    let v = gradeOne(scratch, plans[i], i)
+    let v = gradeOne(buildScratch, runScratch, plans[i], i)
     failures = failures + v.failed
     inconclusive = inconclusive + v.inconclusive
     if (v.oracled) {
@@ -304,9 +383,9 @@ fn gradeBatch(scratch: string, plans: []StressJob, bins: []string): BatchResult 
       proofs = proofs + 1
     }
     fsRemove(bins[i])
-    cleanupJob(scratch, buildKey(i))
-    cleanupJob(scratch, defaultKey(i))
-    cleanupJob(scratch, stressKey(i))
+    cleanupJob(buildScratch, buildKey(i))
+    cleanupJob(runScratch, defaultKey(i))
+    cleanupJob(runScratch, stressKey(i))
     i = i + 1
   }
   return BatchResult{
@@ -344,17 +423,19 @@ fn maxTimeoutMs(cx: Ctx, plans: []StressJob): int {
   return maxMs
 }
 
-// Stages every plan (wave 1 + wave 2 scripts on disk, nothing run yet) and
-// returns each program's own compiled-binary path (or "" for a plan that
-// failed before staging).
-fn stageAll(cfg: FanCfg, cx: Ctx, plans: []StressJob): []string {
+// Stages every plan's wave-1 compile job (scripts on disk, nothing run
+// yet), each binary path built from `binScratch` rather than `cfg.scratch`
+// so the artifact survives into wave 2 regardless of which scratch subdir
+// wave 1's own job scripts lived in. Returns each program's own
+// compiled-binary path (or "" for a plan that failed before staging).
+fn stageAllBuilds(cfg: FanCfg, cx: Ctx, plans: []StressJob, binScratch: string): []string {
   let bins = []string(0)
   let i = 0
   while (i < len(plans)) {
     if (plans[i].ok) {
-      let bin = binPath(cfg.scratch, i)
+      let bin = binPath(binScratch, i)
       bins = append(bins, bin)
-      stageOne(cfg, cx, plans[i], i, bin)
+      stageBuild(cfg, cx, plans[i], i, bin)
     } else {
       bins = append(bins, "")
     }
@@ -363,40 +444,99 @@ fn stageAll(cfg: FanCfg, cx: Ctx, plans: []StressJob): []string {
   return bins
 }
 
-// Runs the `batch` partition's whole corpus through ONE `gatefanout` batch:
-// plan every program, stage its jobs, make the one outer `osRunBounded`
-// call, then grade everything back in order. Mirrors
-// `_tests_/bit/examplesgate.bit`'s `runAll` in shape.
-fn runBatch(cx: Ctx, corpus: string, names: []string): BatchResult {
-  let plans = planAll(cx, corpus, names)
-  let probe = loadProbe(cx)
-  let batchMs = maxTimeoutMs(cx, plans) * probe.scale
-  if (batchMs > clampTimeoutMs) {
-    batchMs = clampTimeoutMs
+// Stages every plan's wave-2 run jobs against the binaries `stageAllBuilds`
+// already produced.
+fn stageAllRuns(cfg: FanCfg, cx: Ctx, plans: []StressJob, bins: []string) {
+  let i = 0
+  while (i < len(plans)) {
+    if (plans[i].ok) {
+      stageRuns(cfg, cx, plans[i], i, bins[i])
+    }
+    i = i + 1
   }
+}
+
+fn scaledDeadlineMs(baseMs: int, scale: int): int {
+  let ms = baseMs * scale
+  if (ms > clampTimeoutMs) {
+    ms = clampTimeoutMs
+  }
+  return ms
+}
+
+fn sayWaveDeadline(label: string, effMs: int, baseMs: int, probe: LoadProbe) {
   say(
-      "stress: batch timeout " +
-      num(batchMs / 1000) +
+      "stress: " +
+      label +
+      " timeout " +
+      num(effMs / 1000) +
       "s (base " +
-      num(maxTimeoutMs(cx, plans) / 1000) +
+      num(baseMs / 1000) +
       "s x" +
       num(probe.scale) +
       " load scale; host load average " +
       probe.text +
-      " at launch)",
+      " at " +
+      label +
+      " launch)",
   )
+}
+
+// Runs the `batch` partition's whole corpus through TWO `gatefanout`
+// batches, one per wave (this file's header explains why one shared,
+// launch-time probe cannot see the batch's own load, and why the fix is a
+// second probe rather than a bigger constant, #5124). Plan every program,
+// stage and run wave 1 (compile) against a deadline scaled from load
+// sampled before wave 1, then stage and run wave 2 (both GC-policy runs)
+// against a deadline scaled from load re-sampled after wave 1's own
+// compiles have been driving the box — then grade everything back in
+// order. Mirrors `_tests_/bit/examplesgate.bit`'s `runAll` in shape, just
+// two waves instead of one call.
+fn runBatch(cx: Ctx, corpus: string, names: []string): BatchResult {
+  let plans = planAll(cx, corpus, names)
+  let baseMs = maxTimeoutMs(cx, plans)
 
   let scratch = cx.scratch + "/batch"
   if (fsMkdir(scratch) != 0) {
     die("cannot create batch scratch dir " + scratch)
   }
-  let cfg = newFanCfg(scratch, batchMs, cx.stdlib, cx.libbitrt)
-  let bins = stageAll(cfg, cx, plans)
+  let buildScratch = scratch + "/w1"
+  if (fsMkdir(buildScratch) != 0) {
+    die("cannot create batch scratch dir " + buildScratch)
+  }
+  let runScratch = scratch + "/w2"
+  if (fsMkdir(runScratch) != 0) {
+    die("cannot create batch scratch dir " + runScratch)
+  }
 
-  let outerMs = 3 * len(plans) * batchMs + 60000
-  runDriver(scratch, outerMs)
+  let probe1 = loadProbe(cx)
+  let buildMs = scaledDeadlineMs(baseMs, probe1.scale)
+  sayWaveDeadline("wave 1 (build)", buildMs, baseMs, probe1)
+  let cfg1 = newFanCfg(buildScratch, buildMs, cx.stdlib, cx.libbitrt)
+  let bins = stageAllBuilds(cfg1, cx, plans, scratch)
+  runDriver(buildScratch, 3 * len(plans) * buildMs + 60000)
 
-  let result = gradeBatch(scratch, plans, bins)
+  let probe2 = loadProbe(cx)
+  let runMs = scaledDeadlineMs(baseMs, probe2.scale)
+  sayWaveDeadline("wave 2 (run)", runMs, baseMs, probe2)
+  // Wave 2's own jobs are the ones #5124 measured being killed (the batch's
+  // heaviest load, from 166 concurrent GC=stress runs, does not exist until
+  // THIS wave starts, so even this fresh `probe2` cannot see it). Each job's
+  // OWN watchdog re-samples `wave2ResampleAfterMs` into its own run and may
+  // widen its remaining budget up to `loadScaleCap`x — see
+  // `newFanCfgResampled` (gatefanout.bit). The outer driver bound must cover
+  // that worst case, not just `runMs`.
+  let cfg2 = newFanCfgResampled(
+    runScratch, runMs, cx.stdlib, cx.libbitrt,
+    ResampleCfg{ afterMs: wave2ResampleAfterMs, scaleCap: loadScaleCap },
+  )
+  stageAllRuns(cfg2, cx, plans, bins)
+  let worstJobMs = scaledDeadlineMs(baseMs, loadScaleCap)
+  runDriver(runScratch, 3 * len(plans) * worstJobMs + 60000)
+
+  let result = gradeBatch(buildScratch, runScratch, plans, bins)
+  fsRemove(buildScratch)
+  fsRemove(runScratch)
   fsRemove(scratch)
   return result
 }
