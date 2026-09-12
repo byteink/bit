@@ -27,7 +27,7 @@ the HTTP/3 path). It reads no request header and never will: `X-Forwarded-For`,
 `X-Real-IP` and `Forwarded` are client-supplied strings, so keying a rate
 limit, a ban or an audit record on one keys it on whatever the caller chose to
 send. Behind a reverse proxy `c.peer()` is therefore the proxy, which is
-correct rather than a bug — preferring a forwarding header is only sound when
+correct rather than a bug - preferring a forwarding header is only sound when
 the proxy is known to overwrite it and the app cannot be reached except through
 that proxy, and both are facts about a deployment that this package cannot
 know. Handling them belongs in an opt-in middleware configured with the
@@ -77,7 +77,7 @@ and no body.
 ### You supply the counter store. There is no default.
 
 `Limit.store` has no default and `rateLimit()` panics at registration when it is
-absent — the same rule, for the same reason, as `Config.sessions`. An
+absent - the same rule, for the same reason, as `Config.sessions`. An
 in-process counter is correct on one server and silently wrong behind a load
 balancer, where each of N servers permits the whole quota and a limit of 100
 becomes 100N with nothing anywhere to indicate it.
@@ -102,13 +102,13 @@ dies `ttl` seconds after it was created, or the window stops sliding.
 `MemoryCounter` takes its cap as a required argument, with no default, because
 `byIp` keys on the client address: the map grows one window per distinct
 address, on the path an attacker is by definition already hammering. Past the
-cap an `incr` **evicts the soonest-expiring window and never fails** — expired
-windows go first, since an expired one expires soonest of all — and expired
+cap an `incr` **evicts the soonest-expiring window and never fails** - expired
+windows go first, since an expired one expires soonest of all - and expired
 windows are additionally swept every 64th `incr`, so a key seen once and never
 again does not hold its two integers until the process exits.
 
 Evicting a window loses a limit decision: **the evicted key starts a fresh
-quota.** That is the over-permissive direction, and it is deliberate — a
+quota.** That is the over-permissive direction, and it is deliberate - a
 limiter that refused requests when its own store filled up would turn a full
 map into an outage of the app it protects. So `maxKeys` is a bound on memory,
 not a second limit: size it above the number of distinct clients you expect in
@@ -120,7 +120,7 @@ the answer is a Redis-backed `RateStore`, not a bigger number here.
 Two adjacent fixed buckets, with the older weighted by how much of it is still
 inside the trailing window. A fixed window would let a client spend the whole
 quota in the last instant of one window and the whole quota again in the first
-instant of the next — twice the configured burst, at the boundary, every time.
+instant of the next - twice the configured burst, at the boundary, every time.
 
 A rejected request still counts. The increment is one atomic store operation, so
 two concurrent requests cannot both read the same count and both be admitted;
@@ -136,7 +136,7 @@ the price is that a client which keeps hammering extends its own lockout.
 
 `byIp` is the default choice and reads nothing a client can set. Behind a
 reverse proxy it is the proxy's address, so every client behind that proxy
-shares one bucket — which is why `byForwardedIp(hops)` exists.
+shares one bucket - which is why `byForwardedIp(hops)` exists.
 
 `hops` is the number of proxies between the client and this server, and it is
 required rather than a flag on `byIp` because there is no safe default for it.
@@ -150,7 +150,7 @@ back to `c.peer()` rather than to anything the header claimed.
 
 `bySession` keys on the session only when the cookie hits the session store. An
 absent, expired, destroyed or forged cookie is anonymous and is counted on the
-socket address — otherwise a client sending a fresh random cookie each time
+socket address - otherwise a client sending a fresh random cookie each time
 would mint a fresh bucket each time. It fails, naming `Config.sessions`, when no
 session store is configured.
 
@@ -168,7 +168,7 @@ store's own message.
 A bucket key carries the policy (`requests/window`), so the app-wide `100/60`
 limiter and the `5/300` login limiter above do not share counters even on one
 store. Two registrations with the **same** policy, the same store and the same
-key function would share one, and count together — set `name` on each to keep
+key function would share one, and count together - set `name` on each to keep
 them apart:
 
 ```
@@ -183,7 +183,7 @@ upgrading does not orphan the counters already in a shared store.
 ## Sessions, CSRF and anonymous visitors
 
 `c.csrfToken()` returns the value a form puts in its hidden `_csrf` field, and
-it is `HMAC(Config.secret, session id)` — so it needs a session, and a session
+it is `HMAC(Config.secret, session id)` - so it needs a session, and a session
 the store has never seen is one the next request replaces rather than adopts
 (adopting an unknown id is session fixation). A page that calls it therefore
 **creates a session for every anonymous visitor**, written to `Config.sessions`
@@ -191,7 +191,7 @@ for `sessionTTLSeconds` (24 hours). N requests to a public form page cost N
 store entries, with no authentication in front of them.
 
 That is inherent to binding the token to the session, not a defect in the
-store, so a page calling `c.csrfToken()` wants one of these — ideally both:
+store, so a page calling `c.csrfToken()` wants one of these - ideally both:
 
 ```
 let pages = app.group("/")
@@ -210,7 +210,7 @@ through, so an id nobody presents again does not sit there until the process
 exits.
 
 Eviction is not a substitute for the rate limit. At the cap a flood evicts real
-sessions — visitors get logged out — which is a better failure than the process
+sessions - visitors get logged out - which is a better failure than the process
 growing until it is killed, but it is still a failure. The rate limit is what
 stops the flood; the cap is what bounds what happens when one gets through.
 
@@ -254,7 +254,7 @@ fn createUser(c: Ctx): Res! {
 }
 ```
 
-`NewUser` has no `id` and no `isAdmin`, so no payload can reach either —
+`NewUser` has no `id` and no `isAdmin`, so no payload can reach either -
 whatever the unknown-field policy says. Rejecting unknown fields, below, is the
 **second** layer; the first is that the field does not exist on the bound type.
 
@@ -278,7 +278,7 @@ let app = App(Config{ secret: mySecret, rejectUnknownFields: true })
 ```
 
 A single route overrides it with `bodyWith`, and this is the only way to be
-lenient — there is no global switch that turns the check off in review-invisible
+lenient - there is no global switch that turns the check off in review-invisible
 fashion:
 
 ```
@@ -289,7 +289,7 @@ fn importLegacy(c: Ctx): Res! {
 ```
 
 `Bind{}` with the field omitted means `Reject`. `Ignore` drops at most 32
-unknown keys and then answers 400 — dropping them is a retry per key, so an
+unknown keys and then answers 400 - dropping them is a retry per key, so an
 unbounded version would be quadratic work on a body an attacker chose.
 
 ### Every failure names what is wrong
@@ -333,8 +333,8 @@ guess.
 ### What the size cap does and does not do
 
 `Config.maxBody` bounds what this framework will **parse**. The read itself is
-bounded separately, by `std/http`: a `Content-Length` — or a running total of
-chunk sizes — above the server's own budget is refused before the bytes are
+bounded separately, by `std/http`: a `Content-Length` - or a running total of
+chunk sizes - above the server's own budget is refused before the bytes are
 read, 32 MiB by default and settable with `Server.setMaxBodyBytes` (#4565).
 So a body over the server budget is answered 400 by `std/http` and never
 reaches a `Ctx`, and a body between that budget and `maxBody` is read, then
@@ -343,7 +343,7 @@ allocation.
 
 ## Validating the body
 
-Binding checks the **shape** — every field present, every field the right type —
+Binding checks the **shape** - every field present, every field the right type -
 and answers 400 when it is wrong. Validation checks the **values**, and answers
 422. The two statuses are worth keeping apart: 400 says "I could not read this",
 422 says "I read it and the values are unacceptable", and only the second is
@@ -375,7 +375,7 @@ something to show a user.
 An attribute is a call to an ordinary function: `@minLen(3)` on `name` is
 `minLen(this.name, 3)`. The compiler collects them into a `validateFields()` on
 the class, and `c.body` runs it, then `validate()` if the type has one. **Both
-run, and their failures are reported together** — a form is not corrected one
+run, and their failures are reported together** - a form is not corrected one
 message per round trip.
 
 ```
@@ -440,7 +440,7 @@ attributes over a fixed rule set.
 ### A rule decides what the client may read
 
 The framework's rule for errors applies here unchanged: a failure that satisfies
-`HttpError` — which `unprocessable(...)` and the other constructors return — has
+`HttpError` - which `unprocessable(...)` and the other constructors return - has
 its message sent. A rule that fails with anything else is a **500 with the
 message logged and never sent**, so a validator that called into a database and
 failed cannot paste a connection string into a 422.

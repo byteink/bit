@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# dist/release-notes.sh — pending-notes folding for dist/release.sh, split out
+# dist/release-notes.sh - pending-notes folding for dist/release.sh, split out
 # of it (#4132) so release.sh stays under the 800-line ceiling. It defines
 # foldPendingNotes() and nothing else; dist/release.sh owns the call site and
 # its position (after NOTES.md is generated, before the draft is created), so
 # this is not a second entry point. Refuses if invoked directly rather than
 # silently doing nothing.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-	echo "release-notes.sh: sourced-only, not a standalone script — it only" >&2
+	echo "release-notes.sh: sourced-only, not a standalone script - it only" >&2
 	echo "  defines foldPendingNotes() for dist/release.sh." >&2
 	echo "  Run: dist/release.sh <version> [--dry-run]" >&2
 	exit 2
 fi
 
 # Folds any entries from docs/release/PENDING-NOTES.md into the just-generated
-# NOTES.md (#3213, #3392). Entries live PAST the file's `---` separator —
+# NOTES.md (#3213, #3392). Entries live PAST the file's `---` separator -
 # everything above it is static usage documentation, never release content.
 # Appended right after the version heading, not at the end: a security
 # disclosure belongs at the top of the notes, not after "Artifacts".
@@ -22,7 +22,7 @@ fi
 # script only ever creates a DRAFT (see the header comment above), and a
 # draft can be abandoned or re-cut. Clearing here would let an abandoned
 # draft silently eat the disclosure, with nothing left to fold into the
-# release that actually ships it. So this prints an instruction instead —
+# release that actually ships it. So this prints an instruction instead -
 # the entry is removed by hand, in the commit that records the release notes
 # were actually published (see PENDING-NOTES.md's own "How to use this
 # file" section).
@@ -37,7 +37,7 @@ foldPendingNotes() { # <pending-notes-file> <notes-md-file>
 	# The release skill's own accounting check (grep -cE '^[-*] '
 	# dist/out/NOTES.md vs the non-merge commit count, bit-release
 	# SKILL.md step 1) would silently miscount a hand-written top-level
-	# bullet as a displaced commit bullet — refuse rather than let a
+	# bullet as a displaced commit bullet - refuse rather than let a
 	# pending entry corrupt that assertion into noise.
 	local bad
 	bad="$(printf '%s\n' "${raw}" | grep -E '^[-*] ' || true)"

@@ -319,7 +319,7 @@ test "testpanic_pop_on_empty" {
 ## Running a subset of tests: `--run <pattern>`
 
 `bit test <file.bit|dir> --run <pattern>` runs only the discovered tests
-whose name contains `<pattern>` as a **literal substring** — not a glob and
+whose name contains `<pattern>` as a **literal substring** - not a glob and
 not a regex, so nothing in `<pattern>` needs escaping and no `*`/`?`/`.` is
 special. The match is against the declaration's name string: `--run al`
 matches a test declared `test "alpha" { }` and nothing else. The match is
@@ -339,8 +339,8 @@ this line exists to keep visible.
 
 A pattern that matches no test is an error: `bit test` exits 1 with
 `bit test: no test matched --run <pattern>` on stderr, rather than quietly
-running — and passing — zero tests. `--run` with nothing after it is a
-different, narrower error — a missing value, not a missing match — with
+running - and passing - zero tests. `--run` with nothing after it is a
+different, narrower error - a missing value, not a missing match - with
 `bit test: --run needs a pattern` on stderr and exit 2.
 
 ## Exit codes
@@ -362,7 +362,7 @@ no tests in stdlib/quic (a test is a 'test "name" { }' declaration in a .test.bi
 discovered 0 tests, ran 0: 0 passed, 0 failed
 ```
 
-A path under which one module has tests and another has none is a pass — the
+A path under which one module has tests and another has none is a pass - the
 total is what counts, so a module without tests never drags a real run
 non-zero. `bit test` with no path is the whole-project form and exits `0` on a
 project that has not written its first test yet; only a path you named can

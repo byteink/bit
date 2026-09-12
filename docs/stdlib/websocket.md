@@ -5,13 +5,13 @@ plain-TCP `std/net` connection.
 
 A WebSocket connection begins life as an ordinary `std/http` request: accept it
 and read it the normal way, then hand the exchange and the parsed request to
-`upgrade` once it looks like a WebSocket handshake (`Upgrade: websocket`) — this
+`upgrade` once it looks like a WebSocket handshake (`Upgrade: websocket`) - this
 module never parses a request line itself. `upgrade` takes ownership of the
 exchange's connection (`Exchange.hijack`, `std/http`) and returns a `Conn` for
 framing from then on; `Exchange.respond` must not be called on the same
 exchange afterward. The client side is symmetric: `dial` opens a plain TCP
 connection and performs the client handshake itself, given a bare
-host/port/path the same way `std/net`'s own `dial` takes a bare host/port — no
+host/port/path the same way `std/net`'s own `dial` takes a bare host/port - no
 URL parsing here.
 
 Origin policy is the caller's decision, not this module's (RFC 6455 §4.2.1
@@ -21,15 +21,15 @@ that does not care can call `upgrade` unconditionally.
 
 Every frame read is bounded before its payload is read, never after
 (`Limits.maxFrameBytes`), and every reassembled message is bounded the same
-way across fragments (`Limits.maxMessageBytes`, `Limits.maxFragments`) — the
+way across fragments (`Limits.maxMessageBytes`, `Limits.maxFragments`) - the
 length in a frame header is attacker controlled and, unmasked, unbounded up to
 2^63.
 
 Per-message compression (permessage-deflate, RFC 7692) is out of scope. TLS
-(`wss://`) is not supported in this version — the same intentional limit
+(`wss://`) is not supported in this version - the same intentional limit
 `std/net` documents for itself.
 
-Outgoing messages are never fragmented by this module — every
+Outgoing messages are never fragmented by this module - every
 `sendText`/`sendBinary` call is a single, unfragmented frame, which is a fully
 RFC-conformant choice (fragmentation is a sender's option, never a receiver's
 requirement). Incoming fragmented messages ARE reassembled by `receive`, since
@@ -41,8 +41,8 @@ a peer's fragmentation choice is not this module's to make.
 
 ### `upgrade(ex: Exchange, req: Request, limits: Limits): Conn!`
 
-Completes the server-side handshake on `ex`/`req` — a request `Exchange.read()`
-already returned, checked to look like a WebSocket upgrade — and returns a
+Completes the server-side handshake on `ex`/`req` - a request `Exchange.read()`
+already returned, checked to look like a WebSocket upgrade - and returns a
 `Conn` ready for `sendText`/`sendBinary`/`receive`. Takes ownership of `ex`'s
 connection (`Exchange.hijack`, `std/http`): do not call `ex.respond` afterward,
 on success or failure alike; a failure here means the caller still owns `ex`
@@ -66,12 +66,12 @@ fn accept(ex: Exchange, req: Request): Conn! {
 Opens a plain-TCP client connection to `host:port`, performs the client
 handshake for `path`, and returns a `Conn` ready for
 `sendText`/`sendBinary`/`receive`. Takes a bare host/port the same way
-`std/net`'s own `dial` does — no URL parsing here; a caller with a `ws://` URL
+`std/net`'s own `dial` does - no URL parsing here; a caller with a `ws://` URL
 splits it first.
 
 Fails when the TCP connection cannot be opened, the handshake response is not
 `101 Switching Protocols`, or `Sec-WebSocket-Accept` does not match what
-`acceptKey` derives from the key this client sent — the one check that proves
+`acceptKey` derives from the key this client sent - the one check that proves
 the peer ran the real handshake rather than echoing headers back.
 
 ```bit
@@ -95,7 +95,7 @@ verifying a handshake by hand is the only reason to call it directly.
 ## Limits
 
 The bounds every `upgrade`/`dial` caller must set. None is disableable by
-passing zero — a zero limit rejects every frame or message that would
+passing zero - a zero limit rejects every frame or message that would
 otherwise use it, the same policy `std/http`'s multipart `Limits` uses, and
 for the same reason: the peer's declared lengths are never trusted before they
 are checked against these.
@@ -130,7 +130,7 @@ fn limits(): int {
 
 A complete, reassembled application message: `kind` (one of `MessageText`,
 `MessageBinary` or `MessageClose`), `code` (meaningful only for
-`MessageClose` — the status code the peer's close frame carried, or
+`MessageClose` - the status code the peer's close frame carried, or
 `closeNoStatus` if it carried none), and `data` (the message body for
 text/binary, or the close reason, already validated as UTF-8, for close).
 
@@ -157,13 +157,13 @@ the close status and reason.
 
 The live connection. `sendText`/`sendBinary`/`ping` write one frame each;
 `receive` reads the next complete message, reassembling fragments and
-answering ping/close frames transparently (§5.5.2, §5.5.3) — a caller never
+answering ping/close frames transparently (§5.5.2, §5.5.3) - a caller never
 sees a ping or an in-progress fragment, only a finished `Message`.
 
 ### `Conn.sendText(text: string): ()!`
 
 Sends `text` as one complete, unfragmented text frame. Fails rather than
-sending invalid UTF-8 — the same rule this module enforces on the way in
+sending invalid UTF-8 - the same rule this module enforces on the way in
 (§8.1 applies symmetrically to both directions).
 
 ### `Conn.sendBinary(data: []byte): ()!`
@@ -181,7 +181,7 @@ control-frame limit.
 Reads the next complete message. Pings are answered with a matching pong and
 never returned; a peer close frame is answered with this side's own close
 frame and returned as `MessageClose`, exactly the same shape a self-initiated
-`close()` reaches from the other direction — the close protocol is a
+`close()` reaches from the other direction - the close protocol is a
 handshake, not a disconnect, and either side may start it. Fails, and marks
 the connection closed, on a malformed frame or a read past the connection's
 end.
@@ -190,7 +190,7 @@ end.
 
 Sends a close frame carrying `code`/`reason`, then waits up to
 `limits.closeTimeoutNs` for the peer's own close frame before closing the
-socket — a close the peer never answers still ends the connection, just once
+socket - a close the peer never answers still ends the connection, just once
 the wait elapses rather than the instant the reply arrives. A second call is a
 no-op: the close frame was already sent. Fails if `reason` exceeds 123 bytes
 or is not valid UTF-8.
@@ -214,7 +214,7 @@ this implementation actually uses; the registry has more.
 
 ### `closeNormal: int`
 
-Normal closure — the purpose for which the connection was established has
+Normal closure - the purpose for which the connection was established has
 been fulfilled.
 
 ### `closeGoingAway: int`
@@ -234,7 +234,7 @@ The endpoint received a data type it cannot accept.
 
 Reserved: never sent on the wire. `receive` reports it in `Message.code`
 when the peer's close frame carried no status code at all (an empty payload
-is legal — RFC 6455 §7.1.5).
+is legal - RFC 6455 §7.1.5).
 
 ### `closeInvalidPayload: int`
 
@@ -247,7 +247,7 @@ The endpoint received a message that violates its policy.
 
 ### `closeMessageTooBig: int`
 
-The endpoint received a message too big to process — a single frame over
+The endpoint received a message too big to process - a single frame over
 `maxFrameBytes`, a reassembled message over `maxMessageBytes`, or a message
 split into more than `maxFragments` fragments.
 

@@ -3,7 +3,7 @@
 
     python3 dist/sbom_test.py
 
-Not wired into `./make test` — dist/*.sh has never been (changelog.sh,
+Not wired into `./make test` - dist/*.sh has never been (changelog.sh,
 package.sh aren't either); this exercises the one thing the suite can't:
 that the generator emits the fields the release pipeline and downstream
 consumers rely on. Installs cyclonedx-python-lib into a throwaway venv

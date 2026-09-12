@@ -6,27 +6,27 @@
 # <target> is a compiler target triple as `bit --target` spells it
 # (x86_64-linux | aarch64-linux | aarch64-macos | x86_64-windows). <version> is
 # the tag without its leading `v`. The staged binary must already exist at
-# <outdir>/stage/bin/bit (bit.exe for x86_64-windows) — the caller produces it,
+# <outdir>/stage/bin/bit (bit.exe for x86_64-windows) - the caller produces it,
 # because producing a self-hosted `bit` means EXECING the seed and only the
 # workflow knows which host it is on (see tools/build/artifacts.bit's
 # hostTriple note).
 #
 # [archivedir] is where the runtime archives (<triple>/libbitrt.a) are read
-# from, defaulting to `bit-out/lib` — the tree `./make libbitrt` writes, so
+# from, defaulting to `bit-out/lib` - the tree `./make libbitrt` writes, so
 # every existing caller is unaffected. `dist/release.sh` (#3034) passes its
 # own scratch directory instead: its shipped archives are built by THIS tree's
 # own compiler, not stage0, and writing them into `bit-out/lib` would make
-# `./make libbitrt`'s own staleness check blind to it — the fingerprint covers
+# `./make libbitrt`'s own staleness check blind to it - the fingerprint covers
 # runtime/** SOURCE, not which compiler last produced the archive on disk, so a
 # second run in the same tree would see "up to date" over an archive that is
 # actually a previous run's output, silently breaking release.sh's own
 # idempotency (and #3035's reproducibility check, which relies on a fresh
 # tree's `bit-out/lib` staying genuinely stage0-built).
 #
-# Emits <outdir>/bit-<version>-<os>-<arch>.tar.xz — except x86_64-windows,
+# Emits <outdir>/bit-<version>-<os>-<arch>.tar.xz - except x86_64-windows,
 # which emits a .zip (#3342: a Windows user has no tar.xz extractor by
-# default). The artifact contract this implements — layout, naming, the
-# BIT_STDLIB/BIT_LIBBITRT env requirement — is specified in dist/README.md and
+# default). The artifact contract this implements - layout, naming, the
+# BIT_STDLIB/BIT_LIBBITRT env requirement - is specified in dist/README.md and
 # consumed by the brew formula (#359), the curl|sh installer (#360) and the
 # winget package (#361). Change it there first.
 set -euo pipefail
@@ -82,7 +82,7 @@ cp -R "${ROOT}/stdlib" "${STAGE}/stdlib"
 # way this repo's release steps keep going stale when hand-maintained.
 cp -R "${ROOT}/docs" "${STAGE}/docs"
 # `bit upgrade` executes this from the install it is replacing
-# (compiler/upgrade.bit's upgradeScriptPath), so it has to be IN the install —
+# (compiler/upgrade.bit's upgradeScriptPath), so it has to be IN the install -
 # the artifact is the only thing a user who installed with the curl|sh one
 # liner has on disk. Same reason the stdlib and docs are shipped rather than
 # resolved out of a checkout.
@@ -102,8 +102,8 @@ mv "${STAGE}" "${OUTDIR}/${NAME}"
 # make an archive reproducible are a fixed mtime on every member and a fixed
 # member order, and both used to be requested through GNU-only flags
 # (`--mtime=@0`, `--sort=name`) that sat in the GNU branch below. Releases are
-# cut on macOS. bsdtar 3.5.3 implements NEITHER — `--mtime=@0` is rejected
-# outright ("Option --mtime=@0 is not supported") — so on the one host that
+# cut on macOS. bsdtar 3.5.3 implements NEITHER - `--mtime=@0` is rejected
+# outright ("Option --mtime=@0 is not supported") - so on the one host that
 # actually produces artifacts the comment promised determinism the code never
 # delivered. Measured: cutting 0.1.5 twice from the same commit, minutes apart,
 # gave six different digests for three files, because `cp` restamped every
@@ -125,7 +125,7 @@ MEMBERS="${OUTDIR}/.members"
 # the owner is spelled differently by each, and it was in the shared part: GNU
 # tar 1.34 answers `--uid` with "unrecognized option" and exits 64, so this
 # script could never have run on Linux at all. Nobody noticed because releases
-# are cut on macOS — but the GNU branch existed precisely for a host that would
+# are cut on macOS - but the GNU branch existed precisely for a host that would
 # have died on line one of it. Found while verifying #2060 on both tars.
 TARFLAGS=(--numeric-owner --exclude '._*' --exclude '.DS_Store')
 if tar --version 2>/dev/null | grep -q 'GNU tar'; then
@@ -140,7 +140,7 @@ else
   # suppresses the AppleDouble `._name` copyfile members; --no-xattrs suppresses
   # the pax `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*` headers. With only the first,
   # every member of a macOS-built artifact still carried
-  # `com.apple.provenance`, and GNU tar printed a warning per file on unpack —
+  # `com.apple.provenance`, and GNU tar printed a warning per file on unpack -
   # verified by unpacking one on Linux and on real x86-64 hardware.
   TARFLAGS+=(--uname "" --gname "" --no-mac-metadata --no-xattrs)
 fi
@@ -148,12 +148,12 @@ fi
 # COPYFILE_DISABLE stops bsdtar (macOS) from serialising each file's extended
 # attributes into an AppleDouble `._<name>` member. Without it every stdlib file
 # gains a `._foo.bit` sibling carrying `com.apple.provenance`, and the shipped
-# compiler globs those as real sources — a macOS-built artifact then fails to
+# compiler globs those as real sources - a macOS-built artifact then fails to
 # compile anything at all. Caught by unpacking a macOS-built package inside a
 # Linux container; the `--exclude`s above are the belt to this suspenders.
 #
 # A Windows user has no tar.xz extractor by default (#3342), so x86_64-windows
-# ships a .zip instead — everything above this line (staging, mtime
+# ships a .zip instead - everything above this line (staging, mtime
 # normalisation, member ordering) is format-agnostic and applies unchanged.
 if [ "${OS}" = "windows" ]; then
   ARTIFACT="${OUTDIR}/${NAME}.zip"

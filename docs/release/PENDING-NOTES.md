@@ -21,7 +21,7 @@ shipped in 0.1.21.
 **The fold-in half is automatic (#3392).** `dist/release.sh` reads this file
 right after `dist/changelog.sh` writes `dist/out/NOTES.md`, and if it finds
 any entries below the `---` separator, appends each one (heading demoted one
-level, under the version title) to `dist/out/NOTES.md` — on both a real run
+level, under the version title) to `dist/out/NOTES.md` - on both a real run
 and `--dry-run`. It prints an unmissable reminder when it does this.
 
 **The clear-out half is deliberately still manual.** `dist/release.sh` only

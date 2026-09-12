@@ -4,7 +4,7 @@
 # See docs/release/bootstrap.md §1 for why this exists and why it does not reuse
 # dist/install.sh's check. In one line: install.sh downloads SHA256SUMS from the
 # same base URL as the tarball, which catches corruption but is not a trust
-# anchor — anyone who can serve a modified artifact can serve a matching sum.
+# anchor - anyone who can serve a modified artifact can serve a matching sum.
 # Stage0 compiles the compiler, so its digest has to come from a reviewed commit
 # instead. That file is dist/stage0/SHA256SUMS and it is the ONLY digest this
 # script will consult.
@@ -13,7 +13,7 @@
 # check is a bootstrap with no digest check.
 #
 # STRICTLY POSIX, AND `sh` NOT `bash` (#1874). scripts/stage0.sh runs this with
-# an explicit `sh`, which overrides the shebang — so a `set -o pipefail` here
+# an explicit `sh`, which overrides the shebang - so a `set -o pipefail` here
 # was accepted by macOS (bash in POSIX mode) and rejected by dash on every Linux
 # gate host, killing the bootstrap with `Illegal option -o pipefail` before a
 # single digest was compared. This is the entry point to building the compiler;
@@ -33,7 +33,7 @@ artifact="$1"
 [ -f "${artifact}" ] || die "no such file: ${artifact}"
 [ -f "${SUMS}" ] || die "missing committed digest file: ${SUMS}
   Stage0 cannot be verified without it. Do not work around this by trusting a
-  downloaded SHA256SUMS — see docs/release/bootstrap.md §1."
+  downloaded SHA256SUMS - see docs/release/bootstrap.md §1."
 
 # One of the three supported triples, or nothing. Section 2 of the doc: an
 # unsupported host has no stage0 and must cross-compile from a supported one.
@@ -43,7 +43,7 @@ case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)          triple=linux-x86_64 ;;
   *) die "unsupported host $(uname -s)-$(uname -m); Bit ships macos-aarch64,
   linux-aarch64 and linux-x86_64 only. Cross-compile a stage0 from a supported
-  host — docs/release/bootstrap.md §2." ;;
+  host - docs/release/bootstrap.md §2." ;;
 esac
 
 base="$(basename "${artifact}")"
@@ -52,7 +52,7 @@ base="$(basename "${artifact}")"
 line="$(grep -E "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
 [ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
 [ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
-  || die "more than one digest for triple '${triple}' in ${SUMS} — ambiguous, refusing"
+  || die "more than one digest for triple '${triple}' in ${SUMS} - ambiguous, refusing"
 
 want="${line%% *}"
 named="${line##* }"
@@ -72,7 +72,7 @@ else
 fi
 
 # Checked rather than left to the comparison below. An empty `got` would still
-# refuse — as a DIGEST MISMATCH — which blames the artifact for a broken hasher.
+# refuse - as a DIGEST MISMATCH - which blames the artifact for a broken hasher.
 [ -n "${got}" ] || die "the checksum tool produced no digest for ${artifact}"
 
 [ "${got}" = "${want}" ] || die "DIGEST MISMATCH for ${base}

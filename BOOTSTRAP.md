@@ -16,7 +16,7 @@ against the digest committed in [`dist/stage0/SHA256SUMS`](dist/stage0/SHA256SUM
 
 `scripts/stage0.sh` does the resolving. It reads the artifact name out of the
 committed digest file, fetches it once into `bit-out/stage0/`, verifies it
-through `dist/stage0-verify.sh`, and refuses on any failure — a build never falls
+through `dist/stage0-verify.sh`, and refuses on any failure - a build never falls
 back to something unverified. Later runs are silent and offline.
 
 Two consequences worth stating plainly:
@@ -47,7 +47,7 @@ like a broken fixed point.
 ## What the differentials assert now
 
 The fifteen `scripts/selfhost-diff*.sh` compare the working tree against stage0.
-Green means **"this version did not change behaviour versus the last release"** —
+Green means **"this version did not change behaviour versus the last release"** -
 not "two independent implementations agree", which is what it meant while the
 seed existed. Version-over-version comparison cannot catch a bug present in both
 N-1 and N. `docs/release/bootstrap.md` §4 lists every gate; §5 records the loss.
@@ -70,5 +70,5 @@ stage2  ->  stage3     and stage2 == stage3, byte for byte
 ```
 
 A compiler that reproduces itself exactly when it compiles its own source depends
-on nothing but the language — not on whatever built it. That is what "self-hosted"
+on nothing but the language - not on whatever built it. That is what "self-hosted"
 means, and `scripts/selfhost-fixpoint.sh` checks it on every change.

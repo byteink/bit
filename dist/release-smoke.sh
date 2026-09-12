@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dist/release-smoke.sh — smoke-test helpers, extracted out of dist/release.sh
+# dist/release-smoke.sh - smoke-test helpers, extracted out of dist/release.sh
 # (#4132) as a pure move to bring release.sh back under the 800-line ceiling:
 # cpuCentis() and smoke() are unchanged below, only relocated. Sourced by
 # dist/release.sh, which still owns every invocation (native macOS call,
@@ -7,7 +7,7 @@
 # their order; not a new entry point. Refuses if invoked directly rather than
 # silently doing nothing.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-	echo "release-smoke.sh: sourced-only, not a standalone script — it only" >&2
+	echo "release-smoke.sh: sourced-only, not a standalone script - it only" >&2
 	echo "  defines cpuCentis()/smoke() for dist/release.sh. Run:" >&2
 	echo "  dist/release.sh <version> [--dry-run]" >&2
 	exit 2
@@ -56,7 +56,7 @@ smoke() { # <tarball> <target> <runner...>
 	# DOES `bin/bit` CARRY THIS TREE'S RUNTIME? (#2213) Everything above passes
 	# with a STALE runtime linked into the compiler: `run` exercises the archive
 	# in `lib/`, not the one inside `bin/bit`, and `--version` exercises neither.
-	# 0.1.6 and 0.1.7 both shipped that way — the GC fix they were cut for was
+	# 0.1.6 and 0.1.7 both shipped that way - the GC fix they were cut for was
 	# present in `lib/` and absent from the binary beside it.
 	#
 	# So probe the compiler's OWN runtime, using the cheapest property that

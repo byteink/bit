@@ -7,7 +7,7 @@
 # release `v<version>` must already exist on byteink/bit with a SHA256SUMS
 # asset covering bit-<version>-macos-aarch64.tar.xz (dist/package.sh +
 # `gh release upload` produce that artifact and checksum; this script does
-# not build or upload it — its job is the formula only).
+# not build or upload it - its job is the formula only).
 #
 # --dry-run prints the rendered formula to stdout and exits; it pushes
 # nothing to the tap.
@@ -32,7 +32,7 @@ if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]
 fi
 
 TAG="v${VERSION}"
-# ponytail: aarch64-macos only — the only macOS target that ships
+# ponytail: aarch64-macos only - the only macOS target that ships
 # (dist/README.md, "Which targets actually ship").
 ARTIFACT="bit-${VERSION}-macos-aarch64.tar.xz"
 

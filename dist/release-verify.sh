@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# dist/release-verify.sh <version>   (e.g. 0.1.24 — no leading v)
+# dist/release-verify.sh <version>   (e.g. 0.1.24 - no leading v)
 #
 # The release completion check: run it, do not remember it.
 #
 # A release is eight surfaces published by hand, in order, and the steps get
 # done out of order under pressure. 0.1.10 was cut, probed, un-drafted,
-# verified, brewed, imaged and repinned — and the website step was skipped,
+# verified, brewed, imaged and repinned - and the website step was skipped,
 # because the repin jumped the queue, and the site silently kept serving the
 # previous release's docs. See .claude/skills/bit-release/SKILL.md §9 for the
 # checklist this script replaces.
@@ -13,12 +13,12 @@
 # Silence + exit 0 means every surface serves <version>. Each failure prints
 # one "FAIL: ..." line naming the surface, and the exit code is 1.
 #
-# Design rules (do not undo these — see the ticket that added this script):
+# Design rules (do not undo these - see the ticket that added this script):
 #   - every count is DERIVED (from the release's own SHA256SUMS, from digest
-#     lines matched by pattern), never hardcoded — a hardcoded asset count
+#     lines matched by pattern), never hardcoded - a hardcoded asset count
 #     stayed wrong for six releases after #2748 added a new artifact.
 #   - every query that can legitimately return empty is checked for emptiness
-#     before being compared — an empty result is a fact about the query, not
+#     before being compared - an empty result is a fact about the query, not
 #     a pass.
 #   - every check that matters is done ANONYMOUSLY where the surface is
 #     public: a draft answers a token-bearing request and 404s an anonymous
@@ -28,14 +28,14 @@
 #   - this must work unchanged against an older, already-superseded tag.
 set -u
 
-usage() { echo "usage: $0 <version>   (e.g. 0.1.24 — no leading v)" >&2; exit 2; }
+usage() { echo "usage: $0 <version>   (e.g. 0.1.24 - no leading v)" >&2; exit 2; }
 [ "$#" -eq 1 ] || usage
 X="$1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIT_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 # The main worktree is always the first entry `git worktree list` prints, from
-# any worktree — so this resolves the real workspace root (bit/'s parent)
+# any worktree - so this resolves the real workspace root (bit/'s parent)
 # whether invoked from the shared checkout or a ticket worktree, with no
 # hardcoded username or path.
 MAIN_WORKTREE="$(git -C "$BIT_REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
@@ -55,7 +55,7 @@ fi
 # ---- 2. asset set: DERIVED from the release's own SHA256SUMS, never counted ----
 # `-f` is load-bearing: GitHub's 404 body is the two words "Not Found", and
 # without `-f` that survives `awk 'NF>=2{print $2}'` as a fake asset named
-# "Found" — a 404 must fail the fetch, not parse as one confusing asset.
+# "Found" - a 404 must fail the fetch, not parse as one confusing asset.
 if sums="$(curl -sfL "https://github.com/byteink/bit/releases/download/v$X/SHA256SUMS")" && [ -n "$sums" ]; then
   want_assets="$(printf '%s\n' "$sums" | awk 'NF>=2 {print $2}' | sort)"
   got_assets="$(gh release view "v$X" -R byteink/bit --json assets --jq '.assets[].name' 2>/dev/null | grep -vx SHA256SUMS | sort)"
@@ -123,14 +123,14 @@ else
   fi
 fi
 
-# ---- 6. stage0 pinned to it — match the DIGEST LINES only, never the whole file ----
+# ---- 6. stage0 pinned to it - match the DIGEST LINES only, never the whole file ----
 # `grep -q "$X"` false-passes: the header prose predicts the NEXT version, so a
 # plain text search can report the pin as moved while it still points at the
 # previous release (caught on 0.1.12).
 n="$(grep -cE "^[0-9a-f]{64}  bit-$X-" "$WS/bit/dist/stage0/SHA256SUMS" 2>/dev/null)"
 n="${n:-0}"
 # One line per triple, all of them for $X: derived from the file, never a
-# hardcoded count — `3` false-failed on 0.14.0 once #3344 pinned the fourth
+# hardcoded count - `3` false-failed on 0.14.0 once #3344 pinned the fourth
 # (windows) triple, the same shape as the asset count before #2748.
 total="$(grep -cE "^[0-9a-f]{64}  bit-" "$WS/bit/dist/stage0/SHA256SUMS" 2>/dev/null)"
 total="${total:-0}"

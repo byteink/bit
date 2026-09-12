@@ -42,7 +42,7 @@ bit run hello.bit      # compile to a temp binary and execute
 bit build hello.bit    # leaves ./hello
 ```
 
-Anything after the file is forwarded to the program as its own arguments —
+Anything after the file is forwarded to the program as its own arguments -
 `bit run hello.bit alpha beta` runs `hello` with `alpha` and `beta` in `argv`,
 just as `bit build hello.bit -o hello && ./hello alpha beta` would. Write `--`
 before an argument that would otherwise look like one of `bit run`'s own

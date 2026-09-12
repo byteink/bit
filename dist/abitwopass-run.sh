@@ -7,7 +7,7 @@
 #
 # Ordinary path, unchanged: `./make libbitrt` then `./make`. On the
 # documented runtime ABI arity refusal (checkRuntimeAbiArity,
-# tools/build/abiarity.bit — see #3152) this instead derives pass 1's base
+# tools/build/abiarity.bit - see #3152) this instead derives pass 1's base
 # MECHANICALLY (dist/abitwopass.py) and performs the two-pass
 # BIT_STAGE0_BIN bootstrap (dist/abitwopass-boot.sh, docs/development.md
 # "Landing a runtime ABI change") rather than accepting an opaque override,
@@ -34,7 +34,7 @@ else
 	echo "release.sh: ./make libbitrt failed (${LIBBITRT_RC}); checking whether this is the documented runtime ABI transition" >&2
 	PLAN="$(mktemp "${TMPDIR:-/tmp}/bitrelease-abiplan.XXXXXX")"
 	if ! python3 dist/abitwopass.py "${ABI_LOG}" >"${PLAN}"; then
-		echo "release.sh: ./make libbitrt failed for a reason other than the documented runtime ABI transition — see ${ABI_LOG}" >&2
+		echo "release.sh: ./make libbitrt failed for a reason other than the documented runtime ABI transition - see ${ABI_LOG}" >&2
 		rm -f "${PLAN}"
 		exit "${LIBBITRT_RC}"
 	fi

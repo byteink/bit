@@ -660,7 +660,7 @@ point. On 50,000 records of `{"id":N,"name":"userN","active":true,"tags":
 [1,2,3]}`, objects allocated per record: `jsonParse` alone 25.0, `jsonParse` +
 `jsonDecode` 45.0, `jsonDecodeText` **6.0**.
 
-Reach for `jsonDecode` when you already hold a `Json` — something inspected or
+Reach for `jsonDecode` when you already hold a `Json` - something inspected or
 routed the document first. Reach for `jsonDecodeText` when you hold the bytes,
 which is what a request handler holds.
 
@@ -762,7 +762,7 @@ anything after the decoded value is `trailing garbage after value`.
 reports the first fault in DOCUMENT order. `jsonDecode` reads a whole object
 before it decodes anything, so it reports an unknown key ahead of a type error
 in an earlier field, and a missing key ahead of both. Given a document with two
-faults the two entry points can name different ones — each a real fault, with
+faults the two entry points can name different ones - each a real fault, with
 the same message and the same path.
 
 `jsonDecodeText` is strict RFC 8259, like `jsonParse`: no comments and no
@@ -955,7 +955,7 @@ class.
 ### `jsonTextKey(r: JsonReader, n: i64): bool!`
 
 Advances to the `n`th member's value, recording its key on the reader, and
-answers whether there was one — false when the object closed instead. `n` is
+answers whether there was one - false when the object closed instead. `n` is
 the member's ordinal within this object, which is what distinguishes the first
 member from one that must be preceded by a `,`.
 
@@ -972,7 +972,7 @@ nothing.
 ### `jsonTextKeyText(r: JsonReader): string`
 
 The current member's key as a string. This is the one call that materialises a
-key, so use it where the key is data — a `map<string, T>`'s key — or where a
+key, so use it where the key is data - a `map<string, T>`'s key - or where a
 failure is already being built.
 
 ### `jsonTextUnknown(r: JsonReader, path: string): ()!`
@@ -985,7 +985,7 @@ unclaimed key is reported rather than skipped.
 
 Consumes an explicit `null` under the cursor and answers whether it did. A
 non-`Option` field left unset by one is a missing key; an `Option` left unset is
-`None` — the same pair `jsonDecMember` and `jsonDecOptMember` fold together.
+`None` - the same pair `jsonDecMember` and `jsonDecOptMember` fold together.
 
 ### `jsonTextNeed(seen: bool, path: string, key: string): ()!`
 

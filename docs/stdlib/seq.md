@@ -135,7 +135,7 @@ elements in place.
 ### `keys(m: map<K, V>): []K`
 
 `m`'s keys, as a slice. Iteration order is deterministic for a given build but
-is neither insertion order nor sorted — sort the result with `std/sort` if
+is neither insertion order nor sorted - sort the result with `std/sort` if
 callers need a stable printed order.
 
 ### `values(m: map<K, V>): []V`

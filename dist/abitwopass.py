@@ -75,7 +75,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # pointed back at the caller's own checkout through this variable.
 DRIVER_ROOT = Path(os.environ.get("BIT_ABITWOPASS_DRIVER_ROOT") or ROOT).resolve()
 
-REFUSAL_MARKER = "refusing to link — runtime ABI arity mismatch against the pinned stage0"
+REFUSAL_MARKER = "refusing to link - runtime ABI arity mismatch against the pinned stage0"
 
 # Mirrors tools/build/abiarity.bit's checkRuntimeAbiArity exactly:
 #   "make:   ${m.symbol} (${m.file}): stage0 (${tag}) emits calls for
@@ -88,7 +88,7 @@ MISMATCH_RE = re.compile(
 
 # #4416: tools/build/abilayout.bit's checkRuntimeAbiLayout -- the SECOND
 # refusal this guard family can print, distinct from REFUSAL_MARKER above.
-LAYOUT_REFUSAL_MARKER = "refusing to link — runtime object LAYOUT mismatch against the pinned stage0"
+LAYOUT_REFUSAL_MARKER = "refusing to link - runtime object LAYOUT mismatch against the pinned stage0"
 
 # Mirrors checkRuntimeAbiLayout exactly:
 #   "make:   ${m.name} (runtime/${m.file}): stage0 (${tag}) was built

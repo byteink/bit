@@ -205,7 +205,7 @@ def test_parse_mismatches():
     ok = True
     text = (
         "make: selfhost: runtime ABI arity scan: parsed=780 dropped=0\n"
-        "make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (v0.7.0):\n"
+        "make: selfhost: refusing to link - runtime ABI arity mismatch against the pinned stage0 (v0.7.0):\n"
         "make:   bit_rt_map_new (root/maps.bit): stage0 (v0.7.0) emits calls for 2 arg(s); this tree's runtime/** now declares 3\n"
         "make: stage0's call-site lowering for these symbols is baked into its own compiled machine code...\n"
     )
@@ -272,7 +272,7 @@ def test_parse_layout_mismatches():
     ok = True
     text = (
         "make: selfhost: runtime ABI arity scan: parsed=818 dropped=0\n"
-        "make: selfhost: refusing to link — runtime object LAYOUT mismatch against the pinned stage0 (v0.10.0):\n"
+        "make: selfhost: refusing to link - runtime object LAYOUT mismatch against the pinned stage0 (v0.10.0):\n"
         "make:   gcHeaderSize (runtime/gc/gc.bit): stage0 (v0.10.0) was built expecting 32; this tree's runtime/** now declares 16\n"
         "make: stage0 is the compiler that EMITS this object's layout...\n"
     )
@@ -291,7 +291,7 @@ def test_parse_layout_mismatches():
     # An ARITY refusal (the OTHER member of this guard family) must not be
     # mistaken for a LAYOUT one -- the two markers/regexes are disjoint.
     arity_text = (
-        "make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (v0.7.0):\n"
+        "make: selfhost: refusing to link - runtime ABI arity mismatch against the pinned stage0 (v0.7.0):\n"
         "make:   bit_rt_map_new (root/maps.bit): stage0 (v0.7.0) emits calls for 2 arg(s); "
         "this tree's runtime/** now declares 3\n"
     )

@@ -9,15 +9,15 @@
 # <version> is semver without the leading v, e.g. 0.1.0.
 #
 # This replaces the deleted .github/workflows/release.yml. It is not a
-# translation of it — a workflow can assume a clean runner per job, and this
+# translation of it - a workflow can assume a clean runner per job, and this
 # cannot, so every step that mattered there is done here explicitly:
 #
-#   1. bootstrap a native host `bit1` off the PINNED STAGE0 — compiler/ built by
+#   1. bootstrap a native host `bit1` off the PINNED STAGE0 - compiler/ built by
 #      stage0, linking a stage0-built runtime archive. That is stage0's only
 #      role below (#3034)
 #   2. bit1 builds the SHIPPED runtime archive and the SHIPPED `bit`, for every
 #      target (the packaged compiler carries all three runtime archives so one
-#      install can cross-compile) — this tree's own codegen, not stage0's; for
+#      install can cross-compile) - this tree's own codegen, not stage0's; for
 #      the host triple, the shipped `bit` must reproducibly build itself before
 #      anything is packaged
 #   3. dist/package.sh per target
@@ -65,8 +65,8 @@ git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; ex
 # The two checks above have just established that the tree equals HEAD, so HEAD
 # names the exact source of everything built below. `gh release create` defaults a
 # new tag to the DEFAULT BRANCH'S REMOTE HEAD, not to the local tree, so without
-# passing this explicitly a release cut while origin/main is ahead — or from any
-# branch at all — tags a commit whose source was never compiled. v0.1.3 shipped
+# passing this explicitly a release cut while origin/main is ahead - or from any
+# branch at all - tags a commit whose source was never compiled. v0.1.3 shipped
 # that way. Captured before the build rather than after so a commit landing mid-run
 # cannot move it.
 BUILT_COMMIT="$(git rev-parse HEAD)"
@@ -75,7 +75,7 @@ BUILT_COMMIT="$(git rev-parse HEAD)"
 # (#4192). Owner ruled 2026-09-02 that bench/run.sh's README block is
 # regenerated every release; .claude/skills/bit-release/SKILL.md's step 0.5
 # said so in prose only, and prose is exactly what got silently skipped for
-# 0.6.0 and 0.7.0 — README.md kept advertising a snapshot from 2026-08-31
+# 0.6.0 and 0.7.0 - README.md kept advertising a snapshot from 2026-08-31
 # that predated 0.5.0's allocator fix, understating Bit's own numbers by
 # roughly 2x on its four worst rows across two releases. A check that refuses
 # does not get silently skipped the way a checklist line does.
@@ -88,11 +88,11 @@ BUILT_COMMIT="$(git rev-parse HEAD)"
 BENCH_PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${BUILT_COMMIT}^" 2>/dev/null || true)"
 BENCH_COMMIT="$(git log -1 --format=%H -- bench/RESULTS.md 2>/dev/null || true)"
 [ -n "${BENCH_COMMIT}" ] || {
-	echo "release.sh: bench/RESULTS.md has no commit history — run bench/run.sh before releasing" >&2
+	echo "release.sh: bench/RESULTS.md has no commit history - run bench/run.sh before releasing" >&2
 	exit 1
 }
 if [ -n "${BENCH_PREV_TAG}" ] && git merge-base --is-ancestor "${BENCH_COMMIT}" "${BENCH_PREV_TAG}"; then
-	echo "release.sh: bench/RESULTS.md was last regenerated at ${BENCH_COMMIT:0:8}, at or before ${BENCH_PREV_TAG} — the benchmark tables were not regenerated for this release" >&2
+	echo "release.sh: bench/RESULTS.md was last regenerated at ${BENCH_COMMIT:0:8}, at or before ${BENCH_PREV_TAG} - the benchmark tables were not regenerated for this release" >&2
 	echo "  run: .claude/boxlock.sh solo bench/run.sh   (needs a quiet box: ps -eo comm= -A | grep -c make-driver == 0)" >&2
 	echo "  then: git add README.md bench/RESULTS.md bench/history.csv && git commit" >&2
 	echo "  then re-run: dist/release.sh ${VERSION}" >&2
@@ -104,7 +104,7 @@ echo "release.sh: benchmark tables regenerated at ${BENCH_COMMIT:0:8}, after ${B
 # (#4470). github-linguist submodules a grammar repository's ROOT, so
 # editors/vscode/syntaxes/ is not addressable by it; byteink/bit-tmlanguage
 # exists as a byte-copy publish target. THIS repo is the source of truth and
-# the mirror is a publish target like the brew tap or the ghcr image — the
+# the mirror is a publish target like the brew tap or the ghcr image - the
 # same "change one, change both" shape as examples/staticserver vs
 # bit-website/server/, which has no mechanical check at all, which is why this
 # one exists. A fetch failure refuses too: an unreachable mirror is not
@@ -136,11 +136,11 @@ checkGrammarMirror() {
 	done
 	rm -rf "${tmp}"
 	# An unreachable mirror and a diverged one are opposite conclusions, so
-	# they get opposite remediations — printing the sync recipe for a 404
+	# they get opposite remediations - printing the sync recipe for a 404
 	# would send the reader to push bytes that are probably already there.
-	[ "${unread}" -eq 1 ] && echo "release.sh: refusing — the mirror could not be read, which is not evidence of being in sync" >&2
+	[ "${unread}" -eq 1 ] && echo "release.sh: refusing - the mirror could not be read, which is not evidence of being in sync" >&2
 	if [ "${diffs}" -eq 1 ]; then
-		echo "release.sh: refusing — bit-tmlanguage is out of sync with this tree; publish it, then re-run:" >&2
+		echo "release.sh: refusing - bit-tmlanguage is out of sync with this tree; publish it, then re-run:" >&2
 		echo "release.sh:   git clone https://github.com/byteink/bit-tmlanguage \"\$TMPDIR/bit-tmlang\"" >&2
 		echo "release.sh:   cp editors/vscode/syntaxes/bit.tmLanguage.json \"\$TMPDIR/bit-tmlang/syntaxes/bit.tmLanguage.json\"" >&2
 		echo "release.sh:   cp editors/vscode/language-configuration.json \"\$TMPDIR/bit-tmlang/\"" >&2
@@ -153,7 +153,7 @@ checkGrammarMirror || exit 1
 
 # --resume-notes (#4124): everything down to SHA256SUMS below builds and
 # smoke-tests the artifacts. Skip it and reuse what a PRIOR run of this
-# command already left in ${OUT} — validated right before the changelog.sh
+# command already left in ${OUT} - validated right before the changelog.sh
 # call further down, which refuses loudly if ${OUT} is not actually populated.
 if [ "${RESUME_NOTES}" -eq 0 ]; then
 
@@ -161,7 +161,7 @@ if [ "${RESUME_NOTES}" -eq 0 ]; then
 # (#2930). "the artifact is broken" and "the verifier is not provisioned" are
 # opposite conclusions. Without this, a missing image is discovered ~11 minutes
 # in, at the smoke step ("verify the bytes that ship" further down in this
-# file) — and the remote docker daemon's own
+# file) - and the remote docker daemon's own
 # "Unable to find image ... locally" / "pull access denied" lines land in the
 # same log stream three lines above THIS script's failure message, reading as a
 # local defect in the release rather than an unprovisioned verifier. For an
@@ -182,11 +182,11 @@ docker image inspect "${GATE_IMAGE_LOCAL}" >/dev/null 2>&1 || {
 
 # Resolved once, here, deliberately BEFORE the "no x86-64 host reachable" check
 # further down (the real x86_64-linux smoke check, "verify the bytes that
-# ship"), which can be reached only after ~11 minutes of building — that
+# ship"), which can be reached only after ~11 minutes of building - that
 # refusal is correct but too late to save the time.
 X64_HOST="$(sh scripts/x64host.sh 2>/dev/null | head -1 || true)"
 if [ -z "${X64_HOST}" ]; then
-	echo "release.sh: no x86-64 host reachable — cannot verify x86_64-linux" >&2
+	echo "release.sh: no x86-64 host reachable - cannot verify x86_64-linux" >&2
 	echo "release.sh: refusing to publish an unverified release" >&2
 	exit 1
 fi
@@ -201,14 +201,14 @@ echo "release.sh: gate images present (${GATE_IMAGE_LOCAL} local, ${GATE_IMAGE_R
 
 # Resolved once, here, same reasoning as X64_HOST above: fail before ~11
 # minutes of cross-builds, not at the smoke step. No probing script for a
-# second host — BIT_WINDOWS_HOST/mustafa-desktop-win is already the one
+# second host - BIT_WINDOWS_HOST/mustafa-desktop-win is already the one
 # hardcoded name this repo uses for its single Windows box
-# (_tests_/bit/windowssmoke.bit's windowsHost()) — reused verbatim rather than
+# (_tests_/bit/windowssmoke.bit's windowsHost()) - reused verbatim rather than
 # inventing a second resolution mechanism for a fleet of one.
 # `</dev/null`: an ssh probe inherits stdin and can drain it (#3899).
 WINDOWS_HOST="${BIT_WINDOWS_HOST:-mustafa-desktop-win}"
 ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 "${WINDOWS_HOST}" 'exit 0' </dev/null >/dev/null 2>&1 || {
-	echo "release.sh: ${WINDOWS_HOST} is unreachable over SSH — cannot verify x86_64-windows" >&2
+	echo "release.sh: ${WINDOWS_HOST} is unreachable over SSH - cannot verify x86_64-windows" >&2
 	echo "release.sh: refusing to publish an unverified release" >&2
 	exit 1
 }
@@ -220,12 +220,12 @@ echo "release.sh: windows host reachable (${WINDOWS_HOST})"
 # system-wide (#2748). `pip install --require-hashes` against
 # dist/sbom-requirements.txt is the ONLY step in this whole release that
 # needs PyPI, and it used to run after the three cross-builds and their
-# on-hardware smoke tests — about 10 minutes in — so an unreachable PyPI or a
+# on-hardware smoke tests - about 10 minutes in - so an unreachable PyPI or a
 # stale mirror cost the operator the whole run, discovered far too late to be
 # useful. Resolve it now, before anything is built. ${SBOM_VENV} stays alive
 # across the whole build; the actual `dist/sbom.py` invocation still happens
 # at its original site near the checksums, since its output path depends on
-# ${OUT} — this only moves WHEN reachability and hash integrity are checked,
+# ${OUT} - this only moves WHEN reachability and hash integrity are checked,
 # never weakens --require-hashes, and never installs anything outside this
 # throwaway venv.
 echo "release.sh: preflighting the SBOM venv (dist/sbom-requirements.txt)"
@@ -255,11 +255,11 @@ echo "release.sh: stage0 = ${STAGE0}"
 # The SBOM's metadata.tools entry names stage0 by VERSION, not by path. Asking
 # the resolved binary itself (rather than re-parsing dist/stage0/SHA256SUMS'
 # header comment) means there is one source of truth for which release stage0
-# is — the same one scripts/stage0.sh already verified the digest of.
+# is - the same one scripts/stage0.sh already verified the digest of.
 STAGE0_VERSION="$("${STAGE0}" version | awk '{print $2}')"
 echo "release.sh: stage0 version = ${STAGE0_VERSION}"
 
-# C1 (#3034): stage0 builds compiler/ AS IT SITS ON DISK (unstamped — the
+# C1 (#3034): stage0 builds compiler/ AS IT SITS ON DISK (unstamped - the
 # version stamp below is for the STAGED copy the shipped binaries come from),
 # for the HOST triple only, linking the L0 archive `./make libbitrt` just
 # built. This is stage0's entire job in this script: bit1 is a native host
@@ -268,7 +268,7 @@ echo "release.sh: stage0 version = ${STAGE0_VERSION}"
 BIT1="${ROOT}/bit-out/bin/bit"
 [ -x "${BIT1}" ] || { echo "release.sh: ./make did not produce ${BIT1}" >&2; exit 1; }
 # `stepSelfhost` (tools/build/artifactsteps.bit) writes this on every `./make`
-# call, unconditionally, before its own up-to-date check — so it is reliably
+# call, unconditionally, before its own up-to-date check - so it is reliably
 # fresh here without release.sh reimplementing the uname table.
 HOST_TRIPLE="$(cat "${ROOT}/bit-out/make/host.triple" 2>/dev/null || true)"
 [ -n "${HOST_TRIPLE}" ] || {
@@ -283,11 +283,11 @@ mkdir -p "${OUT}"
 # Stamp the version into a STAGED COPY of compiler/, never into the source tree.
 #
 # `compiler/version.bit` holds the checked-in development version, and the
-# self-hosted compiler compiles that constant directly — so building compiler/ as
+# self-hosted compiler compiles that constant directly - so building compiler/ as
 # it sits on disk ships a binary that reports `0.1.0-dev` no matter what version we
 # are releasing. v0.1.0 shipped exactly that bug: `bit --version` said 0.1.0-dev.
 #
-# This IS the version-stamping mechanism — there is no build-driver option for
+# This IS the version-stamping mechanism - there is no build-driver option for
 # it, and there should not be: a release needs three CROSS-built targets, and a
 # driver flag would only ever stamp the one native compiler.
 #
@@ -309,21 +309,21 @@ decls="$(grep -l 'const bitVersion' "${STAGE_SRC}"/*.bit | wc -l | tr -d ' ')"
 staged="$(ls "${STAGE_SRC}"/*.bit | wc -l | tr -d ' ')"
 real="$(find compiler -maxdepth 1 -name '*.bit' | wc -l | tr -d ' ')"
 [ "${staged}" = "${real}" ] || {
-	echo "release.sh: staged ${staged} of ${real} selfhost files — the copy lost some" >&2
+	echo "release.sh: staged ${staged} of ${real} selfhost files - the copy lost some" >&2
 	exit 1
 }
 
-# L1 (#3034): bit1 — this tree's own codegen, not stage0's — compiles
+# L1 (#3034): bit1 - this tree's own codegen, not stage0's - compiles
 # runtime/ for every target. This is the half that reaches every user program
 # (#2213), so from here on it is built by THIS tree, not stage0.
 #
-# WRITTEN UNDER ${OUT}, NEVER INTO THE SHARED `bit-out/lib/` — a real defect
+# WRITTEN UNDER ${OUT}, NEVER INTO THE SHARED `bit-out/lib/` - a real defect
 # found by measurement, not review, in this ticket's first pass: `bit-out/lib`
 # is the same path `./make libbitrt` writes and staleness-checks by a
 # fingerprint over runtime/** SOURCE, not over which compiler produced the
 # archive on disk. Writing L1 there made a SECOND `release.sh` run in the same
 # tree see "up to date" over an archive that was actually the FIRST run's L1
-# output — silently turning "rooted at stage0" false on the second run, and
+# output - silently turning "rooted at stage0" false on the second run, and
 # blind to it. Building here, all three up front (mirroring how `./make
 # libbitrt` builds all three before anything reads them, since `package.sh`
 # below embeds all three archives in every target's tarball regardless of
@@ -347,13 +347,13 @@ for t in "${TARGETS[@]}"; do
 	archive="${LIB1}/${t}/libbitrt.a"
 
 	# C2 (#3034): bit1 builds the STAGED, version-stamped compiler/ for ${t},
-	# linking L1 — this IS the shipped `bin/bit`. Not stage0: a release is no
+	# linking L1 - this IS the shipped `bin/bit`. Not stage0: a release is no
 	# longer produced by the previous release now that this tree's own
 	# compiler is proven, once below, to reliably build itself.
 	#
 	# BIT_LIBBITRT IS STILL LOAD-BEARING (#2213, unchanged by #3034): bit1
 	# resolves `libbitrt.a` relative to itself absent an override, which is
-	# `bit-out/lib/${t}/libbitrt.a` (the L0 archive) — never ${archive}, since
+	# `bit-out/lib/${t}/libbitrt.a` (the L0 archive) - never ${archive}, since
 	# L1 now lives entirely under ${OUT} and bit1's sibling `lib/` cannot see
 	# it. Without this override the build would silently link L0 (stage0's
 	# codegen) instead of L1, defeating the whole point of this pass.
@@ -361,7 +361,7 @@ for t in "${TARGETS[@]}"; do
 		echo "release.sh: missing ${archive} (the L1 build above should have written it)" >&2
 		exit 1
 	}
-	# Windows needs the .exe suffix on the OUTPUT PATH — the compiler writes
+	# Windows needs the .exe suffix on the OUTPUT PATH - the compiler writes
 	# exactly what -o names, it does not append one itself (confirmed against
 	# _tests_/bit/windowssmoke.bit, which does the same). dist/package.sh looks
 	# for this same name (BIN_NAME).
@@ -376,7 +376,7 @@ for t in "${TARGETS[@]}"; do
 		# reproducibly build itself (bit3) from the same staged source and the
 		# same L1 archive, before anything is packaged. This is the standard
 		# fixed-point mitigation for a compiler that now compiles itself into
-		# what ships — reusing scripts/selfhost-fixpoint.sh's rule rather than
+		# what ships - reusing scripts/selfhost-fixpoint.sh's rule rather than
 		# re-deriving it: the Mach-O codesign identifier derives from the
 		# output FILENAME, so bit2 and bit3 are written to the SAME basename
 		# ("bit") in DIFFERENT directories, or the hashes differ for a reason
@@ -384,10 +384,10 @@ for t in "${TARGETS[@]}"; do
 		#
 		# HOST-ONLY, DELIBERATELY: a bit2 built for x86_64-linux or
 		# aarch64-linux cannot run on this Mac to build a bit3 of its own, so
-		# this proves nothing about those two targets' self-reproducibility —
+		# this proves nothing about those two targets' self-reproducibility -
 		# only that bit1 cross-produced them, the same guarantee stage0's
 		# cross-production always carried.
-		echo "release.sh: fixed-point check for ${t} — bit2 must reproducibly build bit3"
+		echo "release.sh: fixed-point check for ${t} - bit2 must reproducibly build bit3"
 		mkdir -p "${OUT}/fixpoint/bin"
 		BIT_LIBBITRT="${archive}" \
 			"${OUT}/stage/bin/bit" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/fixpoint/bin/bit"
@@ -397,11 +397,11 @@ for t in "${TARGETS[@]}"; do
 		echo "release.sh: bit3 sha256 = ${bit3Sha}"
 		rm -rf "${OUT}/fixpoint"
 		[ "${bit2Sha}" = "${bit3Sha}" ] || {
-			echo "release.sh: FIXED POINT BROKEN for ${t} — bit2 != bit3. This tree's compiler" >&2
+			echo "release.sh: FIXED POINT BROKEN for ${t} - bit2 != bit3. This tree's compiler" >&2
 			echo "  does not reliably build itself, so shipping it as bin/bit is unsafe. Refusing." >&2
 			exit 1
 		}
-		echo "release.sh: FIXED POINT OK for ${t} — bit2 == bit3"
+		echo "release.sh: FIXED POINT OK for ${t} - bit2 == bit3"
 	fi
 
 	bash dist/package.sh "${VERSION}" "${t}" "${OUT}" "${LIB1}"
@@ -418,7 +418,7 @@ done
 echo "release.sh: checking packaged aarch64 libbitrt.a for #2742's 64-bit-through-*i32 defect"
 atomicBad=0
 # package.sh embeds every RUNTIME_TRIPLE's libbitrt.a in every target's
-# tarball, so any produced tarball would do — each triple is still read from
+# tarball, so any produced tarball would do - each triple is still read from
 # ITS OWN tarball so a future package.sh that stops doing that does not
 # silently make this pass on the wrong bytes.
 for pair in "${OUT}/bit-${VERSION}-macos-aarch64.tar.xz aarch64-macos" \
@@ -439,7 +439,7 @@ for pair in "${OUT}/bit-${VERSION}-macos-aarch64.tar.xz aarch64-macos" \
 done
 if [ "${atomicBad}" -eq 1 ]; then
 	echo "release.sh: THIS TREE's own compiler (commit ${BUILT_COMMIT}) emits a 64-bit" >&2
-	echo "  atomic through what runtime/spinlock.bit declares *i32 — a real codegen" >&2
+	echo "  atomic through what runtime/spinlock.bit declares *i32 - a real codegen" >&2
 	echo "  defect, not the pinned-stage0 lag: the packaged libbitrt.a is built by bit1" >&2
 	echo "  (#3034), so this is not waiting on a stage0 repin. See #2742." >&2
 	exit 1
@@ -486,7 +486,7 @@ if command -v docker >/dev/null; then
 	echo "release.sh: aarch64-linux smoke ok"
 	rm -rf "${work}"
 else
-	echo "release.sh: docker absent — cannot verify aarch64-linux" >&2
+	echo "release.sh: docker absent - cannot verify aarch64-linux" >&2
 	exit 1
 fi
 
@@ -494,7 +494,7 @@ host="$(sh scripts/x64host.sh 2>/dev/null | head -1 || true)"
 if [ -n "${host}" ]; then
 	# A FRESH remote directory per run. This was hardcoded /tmp/rel, and the
 	# container wrote into it as root, so the next run's `rm -rf` hit Permission
-	# denied, the tarball never arrived, tar failed — and because the whole thing
+	# denied, the tarball never arrived, tar failed - and because the whole thing
 	# is `ssh … | grep -q && echo`, the failure was invisible and the release still
 	# exited 0. The x86-64 target went unverified with no warning at all. Same
 	# fixed-/tmp-path class of bug the linker once had (noted in CLAUDE.md).
@@ -517,7 +517,7 @@ SH
 	echo "release.sh: x86_64-linux smoke ok on real hardware (${host})"
 	ssh "${host}" "rm -rf ${rdir}" || true
 else
-	echo "release.sh: no x86-64 host reachable — cannot verify x86_64-linux" >&2
+	echo "release.sh: no x86-64 host reachable - cannot verify x86_64-linux" >&2
 	echo "release.sh: refusing to publish an unverified release" >&2
 	exit 1
 fi
@@ -551,8 +551,8 @@ winScratch="$(mktemp -d)"
 # fourth escaping shape. The multi-arg `printf '%s\n' 'a' 'b' 'c'` form this
 # replaced produced byte-identical output (verified with `cmp`) but was a
 # structurally different invocation that _tests_/bit/synthsmoke.bit's
-# extractPrintfBody/classifyReleaseSite — which assume ONE single-quoted
-# `printf '<body>'` argument — could not parse at all (#4259).
+# extractPrintfBody/classifyReleaseSite - which assume ONE single-quoted
+# `printf '<body>'` argument - could not parse at all (#4259).
 printf 'fn main() {\n  print("smoke ok\\n")\n}\n' > "${winScratch}/smoke.bit"
 
 winPs1="${winScratch}/${winRunId}.ps1"
@@ -598,7 +598,7 @@ echo "release.sh: x86_64-windows smoke ok on real hardware (${WINDOWS_HOST})"
 # system-wide (#2748: a fifth release artifact, dist/README.md's "## SBOM",
 # was never generated because nothing called the generator). The venv itself
 # and its `pip install --require-hashes` were preflighted at the top of this
-# script, before the cross-builds (#2802) — reachability and hash integrity
+# script, before the cross-builds (#2802) - reachability and hash integrity
 # are already proven by the time we get here, so only the actual generation,
 # whose output path depends on ${OUT}, happens at this site.
 echo "release.sh: generating SBOM"
@@ -624,7 +624,7 @@ if [ "${RESUME_NOTES}" -eq 0 ]; then
 		"$(head -n1 "${OUT}/NOTES.md")" "${STAGE0_VERSION}" "${PASS1_BASE}" "$(tail -n +2 "${OUT}/NOTES.md")" > "${OUT}/NOTES.md"
 else
 	# Publishes a NOTES.md that was edited by hand (#4124): reuse it AS-IS,
-	# never regenerate it — regenerating is exactly what clobbered the
+	# never regenerate it - regenerating is exactly what clobbered the
 	# hand-edit before this fix.
 	[ -f "${OUT}/NOTES.md" ] || {
 		echo "release.sh: --resume-notes given but ${OUT}/NOTES.md does not exist" >&2
@@ -657,7 +657,7 @@ fi
 # shellcheck source=dist/release-notes.sh
 . "${ROOT}/dist/release-notes.sh"
 # Skipped under --resume-notes: the reused NOTES.md was already folded once,
-# by the prior run that produced it — folding again would duplicate it.
+# by the prior run that produced it - folding again would duplicate it.
 [ "${RESUME_NOTES}" -eq 0 ] && foldPendingNotes "${ROOT}/docs/release/PENDING-NOTES.md" "${OUT}/NOTES.md"
 
 if [ "${DRY}" -eq 1 ]; then
@@ -677,7 +677,7 @@ if gh release view "v${VERSION}" >/dev/null 2>&1; then
 else
 	# --target pins the new tag to the tree that was actually built and smoke-tested
 	# (#1856). Only meaningful on this branch: for an existing tag gh ignores it,
-	# which is correct — the tag is already placed and re-cutting must not move it.
+	# which is correct - the tag is already placed and re-cutting must not move it.
 	echo "release.sh: tagging v${VERSION} at ${BUILT_COMMIT}"
 	gh release create "v${VERSION}" --target "${BUILT_COMMIT}" "${args[@]}" \
 		"${OUT}"/*.tar.xz "${OUT}"/*.zip "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS"
@@ -688,7 +688,7 @@ fi
 # leaves it published, and printing "review it, then publish" there is a lie that
 # reads as "nothing is live yet".
 if [ "$(gh release view "v${VERSION}" --json isDraft --jq .isDraft)" = "true" ]; then
-	echo "release.sh: DRAFT v${VERSION} ready — review, then publish:"
+	echo "release.sh: DRAFT v${VERSION} ready - review, then publish:"
 	echo "  gh release edit v${VERSION} --draft=false"
 else
 	echo "release.sh: v${VERSION} is PUBLISHED and its assets are now live:"
