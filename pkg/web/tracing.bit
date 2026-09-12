@@ -1,0 +1,128 @@
+// pkg/web/tracing.bit — `app.use(tracing(tr))`: opens one span per request
+// on std/trace's `Tracer` (#3969), continuing an inbound W3C `traceparent`
+// when the request carries a valid one and starting a fresh trace
+// otherwise, and closes the span with the response status whether the
+// handler returns, fails, or panics (#3970).
+//
+// TAKES A `Tracer` EXPLICITLY — not the ticket's literal `app.use(tracing())`.
+// std/trace ships no hidden default tracer on purpose (`docs/stdlib/
+// trace.md`: "A Tracer is held explicitly by whatever code creates spans
+// ... there is no hidden default tracer"), and #3970 was written before
+// std/trace's landed shape existed. The app owns the `Tracer` it built with
+// `newTracer(...)` and hands it in, the same way `rateLimit(Limit{ store:
+// ... })` (ratelimit.bit) takes its store rather than this package reaching
+// for one implicitly.
+//
+// ORDERING: register AFTER `recover()` — `app.use(recover()); app.use(
+// tracing(tr))` — so the span is only ever opened once `recover()`'s panic
+// boundary already wraps the call (the ticket's own constraint: "do not
+// open a span before recover() has wrapped the chain").
+//
+// THIS FILE ARMS ITS OWN PANIC BOUNDARY TOO, the same `runRecovering`
+// primitive `recover()` uses (stdlib/runtime/runtime.bit, epic #4739) — not
+// a second mechanism, the same one, nested. Panic boundaries nest,
+// innermost first (runtime.bit's own doc), and nesting is required here: a
+// panic raised in the handler discards every frame between the panic site
+// and the nearest ARMED boundary with no unwinding of any kind (SPEC
+// §18.4/§18.5 — "there is no unwinding ... deferred calls do not run"). If
+// this middleware relied only on `recover()`'s outer boundary, the panic
+// would jump straight past this file's own frame and `Span.end()` would
+// never run. Arming here lets this file close its span first, then
+// re-raise as an ordinary `fail` (exactly `recover()`'s own idiom) so
+// `recover()`'s boundary still converts it to the 500 it always has.
+import { Tracer, Span, SpanStatus } from "std/trace"
+
+const attrMethod = "http.method"
+const attrRoute = "http.route"
+const attrStatusCode = "http.status_code"
+const attrResponseSize = "http.response_size"
+
+const statusServerErrorMin = 500
+
+// The request tracing middleware. `tr` is the app's own `Tracer`
+// (`newTracer(...)`, std/trace) — construct it once at startup and pass the
+// same one to every `app.use(tracing(tr))`/`group.use(tracing(tr))`.
+export fn tracing(tr: Tracer): Middleware {
+  return (c, next) => {
+    let span = startRequestSpan(tr, c)
+    let res: Res
+    let failed: error
+    let (panicked, msg) = runRecovering(() => {
+      res = next(c) catch e {
+        failed = e
+        return
+      }
+    })
+    if (panicked) {
+      span.setStatus(SpanStatus.Error)
+      span.end()
+      fail newError(msg)
+    }
+    if (failed != nil) {
+      span.setStatus(SpanStatus.Error)
+      span.end()
+      fail failed
+    }
+    endRequestSpan(span, res)
+    return res
+  }
+}
+
+// Starts this request's span: continues the inbound trace when the
+// `traceparent` header is present and parses as valid, or starts a fresh
+// trace otherwise. `Tracer.startSpanFromHeader` never errors — a malformed
+// header starts a fresh root trace instead of failing the request
+// (std/trace's own rule: the header is attacker-controlled). No
+// `traceparent` header at all takes the plain `startSpan` path, which is
+// the same outcome `startSpanFromHeader("")` would reach, spelled directly
+// rather than routed through the parser for the common case.
+fn startRequestSpan(tr: Tracer, c: Ctx): Span {
+  let route = routeNameFor(c)
+  let name = "${c.method()} ${route}"
+  let span = spanForTraceparent(tr, name, c.header("traceparent"))
+  span.setAttribute(attrMethod, c.method())
+  span.setAttribute(attrRoute, route)
+  return span
+}
+
+fn spanForTraceparent(tr: Tracer, name: string, traceparent: string): Span {
+  if (len(traceparent) > 0) {
+    return tr.startSpanFromHeader(name, traceparent)
+  }
+  return tr.startSpan(name)
+}
+
+// The matched route pattern — `c.routePattern`, an unexported field of an
+// exported class, module-private rather than file-private (SPEC §17.3),
+// the same seam `logger.bit`'s `logTarget` already reaches through — or the
+// raw path on a request that matched no route (`routePattern` is "" there,
+// #4515). Never the resolved path on a matched request: using it makes
+// every id its own span name and explodes cardinality in the backend,
+// exactly the reasoning `logger()` (#3952) already documents for its own
+// path field.
+//
+// Reads no header, no query string and no body — the same posture
+// `logger()` takes, and for the same reason: a span ships to a third
+// party, and a token in a query string ends up in someone else's system
+// permanently.
+fn routeNameFor(c: Ctx): string {
+  if (c.routePattern == "") {
+    return c.path()
+  }
+  return c.routePattern
+}
+
+// Closes `span` with `res`'s status and body size. A 5xx sets the span's
+// status to error; a 4xx does not — a client sending a bad request is not
+// a server failure, and marking it one makes error dashboards useless
+// (the ticket's own rule). Left unset, `Span.end()` defaults a span to
+// `SpanStatus.Ok`.
+fn endRequestSpan(span: Span, res: Res) {
+  let status = res.statusCode()
+  span.setAttribute(attrStatusCode, "${status}")
+  span.setAttribute(attrResponseSize, "${len(res.body())}")
+  if (status >= statusServerErrorMin) {
+    span.setStatus(SpanStatus.Error)
+  }
+  span.end()
+}
