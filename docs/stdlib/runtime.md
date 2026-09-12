@@ -109,8 +109,8 @@ fn main() {
   let results = chan<int>(0)
   spawn worker(1, results)
   let got = <- results
-  print("${got}\n")             // 7 — the value inherited at spawn time
-  print("${taskLocalGet()}\n")  // 7 — the child's write never reaches the parent
+  print("${got}\n")            // 7 — the value inherited at spawn time
+  print("${taskLocalGet()}\n") // 7 — the child's write never reaches the parent
 }
 ```
 
