@@ -1110,6 +1110,56 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - Fields are ordered; that order is the memory layout order, exactly as
   `@json`'s is.
 
+**`find<T>`/`findOne<T>`/`findOneOrFail<T>` - mapping a query result.**
+
+- `std/sql` declares
+
+  ```
+  find<T>(db: Executor, sqlText: string, ...args: Value): []T!
+  findOne<T>(db: Executor, sqlText: string, ...args: Value): Option<T>!
+  findOneOrFail<T>(db: Executor, sqlText: string, ...args: Value): T!
+  ```
+
+  and the compiler **specialises each call**: at `find<User>(db, sql)` it
+  synthesises a mapper for `User`'s own fields and rewrites the call to the
+  shared generic driver with that mapper passed in as a value - the same
+  free-function shape `jsonDecode<T>` takes, for the identical reason (`T` is
+  a different class at every call, so the extraction has to name that
+  class's fields and no single body can).
+- **No class-level mark is required.** Unlike `@json`/`@table`, generation is
+  demand-driven by the call site itself: a class nobody passes to
+  `find`/`findOne`/`findOneOrFail` gets no mapper.
+- `T` is a **plain class**, or one of `i64`/`f64`/`bool`/`string`/`[]byte`
+  for a **single-column** result mapped by a fixed stdlib function rather
+  than a synthesised one. Anything else, or a call with no explicit type
+  argument, is **E0151**.
+- **`find<T>` refuses a `T` that declares `init`**, naming the class and the
+  `init` - **E0152**. The generated mapper assigns fields directly through a
+  composite literal, bypassing whatever invariant a hand-written `init`
+  enforces (`balance >= 0`), so a row could come back in a state the class
+  refuses to construct through its own `init`.
+- The module declaring `T` must import `Rows` from `"std/sql"`; the mapper's
+  signature is written in terms of it. Without it the class is **E0153** and
+  nothing is synthesized - the same rule `@table`'s **E0150** is.
+- **A field's column is its own name in snake_case**, unless the field
+  carries `@column("...")`: `createdAt` claims `created_at`,
+  `@column("e_mail")` claims `e_mail`. `@column` is compiler-known, matched
+  by name and excluded from #3879's field-attribute desugaring exactly as
+  `@key` is.
+- **A field's declared type must be one of the five scalars above, or
+  `Option<>` of one** - any other type is **E0154**. A field's column
+  argument that is not one string constant is **E0155**.
+- **Every failure names the column, and the causes are distinct**
+  (`std/sql`'s `SqlRowCause`): a claimed column absent from the result, a
+  type mismatch naming both types, a `NULL` landing in a field that is not
+  `Option`, a plain scalar `T` against a result that is not exactly one
+  column, and `findOne`/`findOneOrFail`'s own row-count contract (zero rows,
+  more than one row). A result column no field claims is **ignored** -
+  `select *` is ordinary, and a class is often a projection.
+- `findOne<T>` returns `Option.None` on zero rows; it is never fallible on a
+  missing row. `findOneOrFail<T>` is, distinguishably from every mapping
+  failure.
+
 ### 10.6 Interface Declarations
 
 ```

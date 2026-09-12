@@ -1,0 +1,440 @@
+// Bit standard library — sql module, mapping a query result into a typed `T`
+// (#5054, the floor of #5050's ORM).
+//
+//     let users = find<User>(db, "SELECT id, email FROM users WHERE active = ?", Value.Int(1))?
+//     let one = findOne<User>(db, "SELECT ... WHERE id = ?", Value.Int(id))?
+//     let must = findOneOrFail<User>(db, "SELECT ... WHERE id = ?", Value.Int(id))?
+//
+// NO MARK REQUIRED. `T` is a plain class; unlike `@json`/`@table` there is no
+// opt-in attribute, because generation is demand-driven by the `find<T>` call
+// site itself — no mapper is emitted for a class nobody passes, and unlike
+// `@json` there is no silent-leak risk, since adding a field makes a query
+// fail loudly for a missing column rather than silently widen what leaves the
+// program (owner decision, #5054, superseding #3978's `@row`).
+//
+// `find<T>`/`findOne<T>`/`findOneOrFail<T>` HAVE NO BODY A READER COULD WRITE,
+// for the identical reason `jsonDecode<T>` (stdlib/json/decode.bit) does not:
+// `T` is a different class at every call, and the extraction has to name that
+// class's fields. `compiler/checksqlrow.bit` specialises each call, generating
+// one row mapper per (module, class) pair and rewriting the call into the
+// shared generic driver below with that mapper passed in as a value.
+//
+// THE MAPPER ASSIGNS FIELDS DIRECTLY, NEVER THROUGH `init`. A class whose
+// `init` enforces an invariant (`balance >= 0`) could come back from a row in
+// a state it refuses to construct, so `find<T>` refuses any `T` that declares
+// `init` at compile time (E0152), naming the class and the `init`.
+//
+// COLUMN NAMES ARE THE FIELD NAME IN snake_case, unless the field carries
+// `@column("...")`. `createdAt` claims `created_at`; `@column("e_mail")`
+// claims `e_mail`. Case conversion is this layer's job (the epic's
+// three-namings decision), never the compiler's.
+//
+// NO SEPARATE BOOLEAN WIRE TYPE. `Value` (./sql.bit) has no `Bool` variant —
+// SQL itself has none universally, and SQLite/MySQL both represent one as an
+// integer column. A `bool` field reads an `Int` value as zero/nonzero; a
+// driver that maps a boolean column any other way is not one this can map.
+//
+// EVERY FAILURE NAMES THE COLUMN, and the causes are distinct: a claimed
+// column absent from the result, a type mismatch (naming both types), a NULL
+// landing in a field that is not `Option`, a plain scalar `T` against a
+// result that is not exactly one column, and `findOne`/`findOneOrFail`'s own
+// row-count contract (`NoRows`, `TooManyRows`). A result column no field
+// claims is ignored — `select *` is ordinary, and a class is often a
+// projection.
+
+// The ways a row cannot become a `T`, plus the two `findOne`/`findOneOrFail`
+// row-count causes. One error class with a cause enum (mirrors
+// `JsonDecodeCause`, stdlib/json/decode.bit) rather than one class per cause:
+// a caller branches on `.cause`, not on a type assertion per cause.
+export enum SqlRowCause {
+  MissingColumn,
+  TypeMismatch,
+  NullField,
+  ColumnCount,
+  NoRows,
+  TooManyRows,
+}
+
+// The error every row-mapping failure produces. `column` is the claimed
+// column name — empty for `NoRows`/`TooManyRows`, which name no column.
+// `expected`/`found` are filled for `TypeMismatch` and `ColumnCount`.
+export class SqlRowError {
+  export cause: SqlRowCause
+  export column: string
+  export expected: string
+  export found: string
+
+  // Satisfies the predeclared `error` interface (SPEC §10.6, §18.3).
+  message(): string {
+    match (this.cause) {
+      MissingColumn => return "sql: column '${this.column}' claimed by a field is not in the result"
+      TypeMismatch => return "sql: column '${this.column}' is ${this.found}, the field wants ${this.expected}"
+      NullField => return "sql: column '${this.column}' is NULL, and the field is not Option"
+      ColumnCount => return "sql: result has ${this.found} column(s), a plain type wants ${this.expected}"
+      NoRows => return "sql: no rows"
+      TooManyRows => return "sql: more than one row, exactly one was expected"
+    }
+  }
+}
+
+// The column index named `name` in `cols`, or -1.
+fn sqlColIndex(cols: []string, name: string): int {
+  let i = 0
+  while (i < len(cols)) {
+    if (cols[i] == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// A `Value`'s variant name, for a `TypeMismatch` message.
+fn sqlValueKind(v: Value): string {
+  match (v) {
+    Null => return "NULL"
+    Int(_) => return "Int"
+    Float(_) => return "Float"
+    Text(_) => return "Text"
+    Blob(_) => return "Blob"
+  }
+}
+
+// The claimed column's value, or `MissingColumn`. Shared by every typed
+// accessor below.
+fn sqlColumnValue(rows: Rows, cols: []string, col: string): Value! {
+  let idx = sqlColIndex(cols, col)
+  if (idx < 0) {
+    fail SqlRowError{ cause: SqlRowCause.MissingColumn, column: col, expected: "", found: "" }
+  }
+  return rows.value(idx)
+}
+
+// ---- required scalar fields -------------------------------------------
+
+export fn sqlReqInt(rows: Rows, cols: []string, col: string): i64! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Int(n) => return n
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Int", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlReqFloat(rows: Rows, cols: []string, col: string): f64! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Float(f) => return f
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Float", found: sqlValueKind(v),
+    }
+  }
+}
+
+// See the header comment: a `bool` field reads an `Int` column as zero/nonzero.
+export fn sqlReqBool(rows: Rows, cols: []string, col: string): bool! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Int(n) => return n != 0
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Bool", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlReqText(rows: Rows, cols: []string, col: string): string! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => return s
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Text", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlReqBlob(rows: Rows, cols: []string, col: string): []byte! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Blob(b) => return b
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Blob", found: sqlValueKind(v),
+    }
+  }
+}
+
+// ---- optional scalar fields ---------------------------------------------
+//
+// A key that is NULL decodes to `None`; every other failure is the required
+// accessor's own.
+
+export fn sqlOptInt(rows: Rows, cols: []string, col: string): Option<i64>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<i64>.None
+    Int(n) => return Option<i64>.Some(n)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Int", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptFloat(rows: Rows, cols: []string, col: string): Option<f64>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<f64>.None
+    Float(f) => return Option<f64>.Some(f)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Float", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptBool(rows: Rows, cols: []string, col: string): Option<bool>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<bool>.None
+    Int(n) => return Option<bool>.Some(n != 0)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Bool", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptText(rows: Rows, cols: []string, col: string): Option<string>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<string>.None
+    Text(s) => return Option<string>.Some(s)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Text", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptBlob(rows: Rows, cols: []string, col: string): Option<[]byte>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<[]byte>.None
+    Blob(b) => return Option<[]byte>.Some(b)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Blob", found: sqlValueKind(v),
+    }
+  }
+}
+
+// ---- a plain scalar T (a single-column result) ---------------------------
+//
+// Used as the `mapper` argument in place of a synthesised class mapper when
+// `T` is itself one of the five scalar types rather than a class.
+
+export fn sqlRowScalarInt(rows: Rows): i64! {
+  let cols = rows.columns()
+  if (len(cols) != 1) {
+    fail SqlRowError{
+      cause: SqlRowCause.ColumnCount, column: "", expected: "1", found: "${len(cols)}",
+    }
+  }
+  let v = rows.value(0)
+  match (v) {
+    Int(n) => return n
+    Null => fail SqlRowError{
+      cause: SqlRowCause.NullField,
+      column: cols[0],
+      expected: "",
+      found: "",
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: cols[0], expected: "Int", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlRowScalarFloat(rows: Rows): f64! {
+  let cols = rows.columns()
+  if (len(cols) != 1) {
+    fail SqlRowError{
+      cause: SqlRowCause.ColumnCount, column: "", expected: "1", found: "${len(cols)}",
+    }
+  }
+  let v = rows.value(0)
+  match (v) {
+    Float(f) => return f
+    Null => fail SqlRowError{
+      cause: SqlRowCause.NullField,
+      column: cols[0],
+      expected: "",
+      found: "",
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: cols[0], expected: "Float",
+      found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlRowScalarBool(rows: Rows): bool! {
+  let cols = rows.columns()
+  if (len(cols) != 1) {
+    fail SqlRowError{
+      cause: SqlRowCause.ColumnCount, column: "", expected: "1", found: "${len(cols)}",
+    }
+  }
+  let v = rows.value(0)
+  match (v) {
+    Int(n) => return n != 0
+    Null => fail SqlRowError{
+      cause: SqlRowCause.NullField,
+      column: cols[0],
+      expected: "",
+      found: "",
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: cols[0], expected: "Bool",
+      found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlRowScalarText(rows: Rows): string! {
+  let cols = rows.columns()
+  if (len(cols) != 1) {
+    fail SqlRowError{
+      cause: SqlRowCause.ColumnCount, column: "", expected: "1", found: "${len(cols)}",
+    }
+  }
+  let v = rows.value(0)
+  match (v) {
+    Text(s) => return s
+    Null => fail SqlRowError{
+      cause: SqlRowCause.NullField,
+      column: cols[0],
+      expected: "",
+      found: "",
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: cols[0], expected: "Text",
+      found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlRowScalarBlob(rows: Rows): []byte! {
+  let cols = rows.columns()
+  if (len(cols) != 1) {
+    fail SqlRowError{
+      cause: SqlRowCause.ColumnCount, column: "", expected: "1", found: "${len(cols)}",
+    }
+  }
+  let v = rows.value(0)
+  match (v) {
+    Blob(b) => return b
+    Null => fail SqlRowError{
+      cause: SqlRowCause.NullField,
+      column: cols[0],
+      expected: "",
+      found: "",
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: cols[0], expected: "Blob",
+      found: sqlValueKind(v),
+    }
+  }
+}
+
+// ---- the shared runtime the compiler's rewrite calls ---------------------
+//
+// One generic driver per entry point, taking the per-`T` mapper as a value
+// (SPEC §11's `func_type`) rather than being specialised itself: unlike
+// `find<T>`'s own body, nothing here has to name `T`'s fields, so an ordinary
+// generic function — the same shape stdlib/sql/tx.bit's `txValue<T>` already
+// takes a `(Tx) => T!` block — does the whole job.
+
+// `find<T>`: runs `sqlText`/`args` and maps every row through `mapper`.
+export fn sqlFindMany<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): []T! {
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  let out = []T(0)
+  while (rows.next()?) {
+    out = append(out, mapper(rows)?)
+  }
+  return out
+}
+
+// `findOne<T>`: the absent row is `None`, never an error. More than one row
+// is `SqlRowCause.TooManyRows` — a `findOne` caller is asking for at most one.
+export fn sqlFindOne<T>(
+  db: Executor,
+  sqlText: string,
+  args: []Value,
+  mapper: (Rows) => T!,
+): Option<T>! {
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  if (!rows.next()?) {
+    return Option<T>.None
+  }
+  let v = mapper(rows)?
+  if (rows.next()?) {
+    fail SqlRowError{ cause: SqlRowCause.TooManyRows, column: "", expected: "", found: "" }
+  }
+  return Option<T>.Some(v)
+}
+
+// `findOneOrFail<T>`: zero rows is `SqlRowCause.NoRows`; more than one is
+// `SqlRowCause.TooManyRows`.
+export fn sqlFindOneOrFail<T>(
+  db: Executor,
+  sqlText: string,
+  args: []Value,
+  mapper: (Rows) => T!,
+): T! {
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  if (!rows.next()?) {
+    fail SqlRowError{ cause: SqlRowCause.NoRows, column: "", expected: "", found: "" }
+  }
+  let v = mapper(rows)?
+  if (rows.next()?) {
+    fail SqlRowError{ cause: SqlRowCause.TooManyRows, column: "", expected: "", found: "" }
+  }
+  return v
+}
+
+// ---- the three entry points -----------------------------------------------
+//
+// Maps every row `sqlText`/`args` returns into `T`: a plain class refusing
+// one that declares `init` (E0152), or one of `i64`/`f64`/`bool`/`string`/
+// `[]byte` for a single-column result. THESE BODIES NEVER RUN — every call is
+// rewritten by the compiler (compiler/checksqlrow.bit) into a call to
+// `sqlFindMany`/`sqlFindOne`/`sqlFindOneOrFail` above, with the mapper
+// synthesised for the concrete `T` (or the matching `sqlRowScalar*` function)
+// passed in as a value. A `T` with no explicit type argument, or one this
+// cannot map, is refused at compile time (E0151/E0152) — never left to fail
+// here at runtime.
+
+export fn find<T>(db: Executor, sqlText: string, ...args: Value): []T! {
+  fail SqlRowError{
+    cause: SqlRowCause.TypeMismatch, column: "", expected: "a plain class or scalar type",
+    found: "unspecialised",
+  }
+}
+
+export fn findOne<T>(db: Executor, sqlText: string, ...args: Value): Option<T>! {
+  fail SqlRowError{
+    cause: SqlRowCause.TypeMismatch, column: "", expected: "a plain class or scalar type",
+    found: "unspecialised",
+  }
+}
+
+export fn findOneOrFail<T>(db: Executor, sqlText: string, ...args: Value): T! {
+  fail SqlRowError{
+    cause: SqlRowCause.TypeMismatch, column: "", expected: "a plain class or scalar type",
+    found: "unspecialised",
+  }
+}

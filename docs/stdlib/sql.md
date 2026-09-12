@@ -613,3 +613,177 @@ literal's own decoded content, any other literal's raw text unchanged. So
 quotes, and `@scale(2, 3)` arrives as `"2"` and `"3"` in that order. Parsing
 them is the mapper's job, which is why they are `[]string` and not a value type
 this module would have to define.
+
+## Mapping a query result into a typed `T`
+
+`find`/`findOne`/`findOneOrFail` map every row a query returns into `T`: a
+plain class, or one of `i64`/`f64`/`bool`/`string`/`[]byte` for a
+single-column result. **No mark is required** - unlike `@json`/`@table`,
+generation is demand-driven by the call site itself, so a class nobody
+passes to one of these three gets no mapper.
+
+```bit
+import { Executor, Rows, Value, find, findOne, findOneOrFail } from "std/sql"
+
+class User {
+  id: i64,
+  email: string,
+}
+
+fn activeUsers(db: Executor): []User! {
+  return find<User>(db, "SELECT id, email FROM users WHERE active = ?", Value.Int(1))?
+}
+
+fn userById(db: Executor, id: i64): Option<User>! {
+  return findOne<User>(db, "SELECT id, email FROM users WHERE id = ?", Value.Int(id))?
+}
+
+fn mustUserById(db: Executor, id: i64): User! {
+  return findOneOrFail<User>(db, "SELECT id, email FROM users WHERE id = ?", Value.Int(id))?
+}
+```
+
+A field's column is its own name in **snake_case** - `createdAt` claims
+`created_at` - unless the field carries `@column("...")`, which overrides it
+exactly: `@column("e_mail")` claims `e_mail`. `@column` is compiler-known,
+excluded from #3879's field-attribute call-desugaring the same way `@key`
+is, so a plain class needs no import to use it.
+
+A result column no field claims is **ignored**: `select *` is ordinary SQL,
+and a class is often a projection. A field whose type is not one of the five
+scalars, or `Option<>` of one, is a compile error (`E0154`) naming the field
+and its type.
+
+### `find<T>(db: Executor, sqlText: string, ...args: Value): []T!`
+
+Maps every row into `T`. `T` must be a plain class - refusing one that
+declares `init` (`E0152`, naming the class and the `init`: the mapper
+assigns fields directly through a composite literal, bypassing whatever
+invariant a hand-written `init` enforces) - or one of the five scalar types
+for a single-column result. Anything else, or a call with no explicit type
+argument, is `E0151`.
+
+### `findOne<T>(db: Executor, sqlText: string, ...args: Value): Option<T>!`
+
+`find`, for a query expected to match at most one row. The absent row is
+`Option.None`, never an error - a `GET /:id` miss is ordinary traffic, not a
+failure. More than one row is a `SqlRowError` (`TooManyRows`).
+
+### `findOneOrFail<T>(db: Executor, sqlText: string, ...args: Value): T!`
+
+`findOne`, requiring exactly one row: zero rows fails distinguishably
+(`SqlRowCause.NoRows`) from every mapping error, and more than one row fails
+with `TooManyRows`.
+
+### `SqlRowCause`
+
+```
+MissingColumn | TypeMismatch | NullField | ColumnCount | NoRows | TooManyRows
+```
+
+Why one row failed to become a `T`: a claimed column absent from the result,
+a type mismatch, a `NULL` landing in a field that is not `Option`, a plain
+scalar `T` against a result that is not exactly one column, and
+`findOne`/`findOneOrFail`'s own row-count contract.
+
+### `SqlRowError`
+
+```
+cause: SqlRowCause
+column: string
+expected: string
+found: string
+```
+
+The error every row-mapping failure produces, satisfying the predeclared
+`error` interface through `message()`. `column` is the claimed column name -
+empty for `NoRows`/`TooManyRows`, which name no column. `expected`/`found`
+are filled for `TypeMismatch` (the two type names) and `ColumnCount` (the
+wanted and the actual column count).
+
+## Row-mapping primitives
+
+The named functions the compiler's synthesised mapper is written in terms
+of. They are exported because the generated code lives in the CLASS's own
+module and calls them by name — and they are a usable API in their own
+right for a hand-written mapper over a shape `find<T>` does not cover: pass
+one as the `mapper` argument of `sqlFindMany`/`sqlFindOne`/
+`sqlFindOneOrFail` below in place of a synthesised one.
+
+Each scalar type has a **required** and an **Option** form, taking the
+result's columns (`Rows.columns()`, read once) and the column name to
+claim. The required form fails with `NullField` on `NULL`; the `Option` form
+decodes `NULL` to `None` instead. Both fail with `MissingColumn` when `col`
+is not in `cols`, and `TypeMismatch` when the column holds neither the
+wanted variant nor (for `sqlReqBool`/`sqlOptBool`) an `Int` — SQL has no
+boolean wire type (`Value`, ./sql.bit), so a `bool` field reads an `Int`
+column as zero/nonzero.
+
+### `sqlReqInt(rows: Rows, cols: []string, col: string): i64!`
+
+The integer claimed by column `col`.
+
+### `sqlReqFloat(rows: Rows, cols: []string, col: string): f64!`
+
+The float claimed by column `col`.
+
+### `sqlReqBool(rows: Rows, cols: []string, col: string): bool!`
+
+The boolean claimed by column `col`, read from an `Int` column as
+zero/nonzero.
+
+### `sqlReqText(rows: Rows, cols: []string, col: string): string!`
+
+The string claimed by column `col`.
+
+### `sqlReqBlob(rows: Rows, cols: []string, col: string): []byte!`
+
+The bytes claimed by column `col`.
+
+### `sqlOptInt(rows: Rows, cols: []string, col: string): Option<i64>!`
+
+The integer claimed by column `col`, or `None` on `NULL`.
+
+### `sqlOptFloat(rows: Rows, cols: []string, col: string): Option<f64>!`
+
+The float claimed by column `col`, or `None` on `NULL`.
+
+### `sqlOptBool(rows: Rows, cols: []string, col: string): Option<bool>!`
+
+The boolean claimed by column `col`, or `None` on `NULL`.
+
+### `sqlOptText(rows: Rows, cols: []string, col: string): Option<string>!`
+
+The string claimed by column `col`, or `None` on `NULL`.
+
+### `sqlOptBlob(rows: Rows, cols: []string, col: string): Option<[]byte>!`
+
+The bytes claimed by column `col`, or `None` on `NULL`.
+
+Five more functions serve `find<T>`/`findOne<T>`/`findOneOrFail<T>` for a
+**plain scalar `T`** (no class declared): each requires the result to carry
+**exactly one** column, failing with `ColumnCount` otherwise, then applies
+the matching required accessor above to column `0`.
+
+### `sqlRowScalarInt(rows: Rows): i64!`
+
+### `sqlRowScalarFloat(rows: Rows): f64!`
+
+### `sqlRowScalarBool(rows: Rows): bool!`
+
+### `sqlRowScalarText(rows: Rows): string!`
+
+### `sqlRowScalarBlob(rows: Rows): []byte!`
+
+### `sqlFindMany<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): []T!`
+
+`find<T>`'s own implementation: runs `sqlText`/`args` and maps every row
+through `mapper`.
+
+### `sqlFindOne<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): Option<T>!`
+
+`findOne<T>`'s own implementation.
+
+### `sqlFindOneOrFail<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): T!`
+
+`findOneOrFail<T>`'s own implementation.
