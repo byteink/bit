@@ -1,37 +1,43 @@
-// compiler/desugarjsx.bit — JSX desugaring, step one of #3944 (epic #3942,
-// depends on #3943's parser). #3943's own header says it plainly: "these
+// compiler/desugarjsx.bit — JSX desugaring (epic #3942, #3944), the whole of
+// SPEC §12.12's "Desugaring" rule. #3943's own header says it plainly: "these
 // nodes are produced and nothing downstream consumes them yet: no typing, no
-// desugaring, no formatting." This is the desugaring half.
+// desugaring, no formatting." This is the desugaring.
 //
-// SCOPE OF THIS STEP: a self-closing LOWERCASE element with any number of
-// attributes (string, `{expr}`, or bare/boolean) and NO children —
-// `<div id="a" open />` desugars to `elem("id_word_removed...`. A
-// non-self-closing element, a fragment, and an uppercase (component) tag are
-// left as raw `jsx_elem`/`jsx_frag` nodes for now: children recursion, the
-// named-argument component call, and the fragment spelling are each their own
-// follow-up (children need a text-literal synthesis this step deliberately
-// does not build; components need `Tag.NamedArg` wiring). Left alone, an
-// unsupported shape keeps TODAY's resolver behaviour (walking into the tag's
-// own `Ident` leaf) — not a regression, and not silently wrong: nothing here
-// claims to have desugared what it did not touch.
+// THE RULE, taken whole from the spec: a LOWERCASE tag desugars to a call to
+// `elem`, its tag name as a quoted string, one call to `attr` per attribute,
+// and the element's children as further positional arguments. An UPPERCASE
+// tag is a component call — an ordinary call to the function the tag names,
+// each attribute a named argument (SPEC §12.11), and (only when there is at
+// least one) the children collected into a trailing `children` argument. A
+// fragment desugars like a lowercase element but calls `frag` with no
+// tag-name argument. A text child becomes a quoted string literal; a `{expr}`
+// child unwraps to the expression; an element/fragment child is already a
+// `Call` by the time its parent is reached (below).
 //
 // THE REWRITE IS IN PLACE. `t.nodes[idx]` is reassigned wholesale rather than
 // building a new node and re-pointing every parent, mirroring the arena's own
 // append-only shape: every JSX descendant was parsed (and so indexed) before
-// its ancestor, so a single forward scan over `tree.nodes` visits attribute
-// values before the element that owns them, and by the time it reaches an
-// outer element any inner one has already become its Call.
+// its ancestor, so a single forward scan over `tree.nodes` visits a child
+// element/fragment/text/expr before the parent that owns it, and by the time
+// the scan reaches an outer element any inner one has already become its
+// `Call` — a child value is simply the child's own (by-then-rewritten) index,
+// no re-visiting needed.
 //
-// NAMES COME FROM THE SOURCE TEXT, NOT A REGISTRY (the ticket's own rule): the
-// callee is a literal `elem`/`attr` identifier, which the ORDINARY resolver
-// then looks up by ordinary scope rules — an unbound `elem` is the ordinary
-// E0040, not a JSX-specific diagnostic. `elem`/`attr` and every tag/attribute
-// name (quoted into a string literal) are words this module's source does not
-// contain until `appendSynthText` puts them there, exactly as
-// classfieldattr.bit's `validateFields` synthesis does for its own words.
+// NAMES COME FROM THE SOURCE TEXT, NOT A REGISTRY (the ticket's own rule):
+// `elem`/`attr`/`frag`/`children` are literal identifiers the ORDINARY
+// resolver looks up by ordinary scope rules — an unbound one is the ordinary
+// E0040, not a JSX-specific diagnostic. They and every lowercase tag/attribute
+// name (quoted into a string literal) or text child (escaped into one) are
+// words this module's source does not contain until `appendSynthText` puts
+// them there, exactly as classfieldattr.bit's `validateFields` synthesis does
+// for its own words. An UPPERCASE element's attribute names need no
+// synthesis at all: `parseJsxAttr` already built a real `Tag.Ident` leaf for
+// each one, reused directly as the named argument's name — `namedargs.bit`
+// matches it by TEXT and `resolvebody.bit` never resolves a `Tag.NamedArg`'s
+// name as a variable, so the existing node is exactly the right shape.
 
 // A lowercase-letter first byte marks an HTML-element tag; anything else
-// (including a non-letter) is left to the component-call step.
+// (including a non-letter) is a component call.
 fn jsxIsLowerTag(name: string): bool {
   return len(name) != 0 && name[0] >= 'a' && name[0] <= 'z'
 }
@@ -44,59 +50,189 @@ fn jsxQuoteWord(name: string): string {
   return "\"" + name + "\""
 }
 
-// Self-closing (no children kid) and lowercase: the only shape this step
-// desugars. A poisoned name (parser already reported E0021/E0023) is left
-// alone rather than desugared against empty text.
-fn jsxElemDesugarable(tree: Tree, source: string, node: int): bool {
-  let k = kidsOf(tree, node)
-  if (k[2] != 0 || k[0] == 0) {
-    return false
-  }
-  return jsxIsLowerTag(identText(tree, source, k[0]))
-}
-
-// Every word this module's desugarable elements need appended to the source:
-// `elem`/`attr` once each (only when at least one element needs them), `true`
-// for a bare attribute's default value (SPEC §12.12), and one quoted word per
-// distinct tag/attribute name. `appendSynthText` dedupes exact repeats, so
-// this collects every occurrence with no set of its own.
-fn jsxSynthWords(tree: Tree, source: string): []string {
-  let out = []string(0)
-  let needTrue = false
-  let i = 1
-  while (i < len(tree.nodes)) {
-    if (getNode(tree, i).tag == Tag.JsxElem && jsxElemDesugarable(tree, source, i)) {
-      let k = kidsOf(tree, i)
-      out = append(out, jsxQuoteWord(identText(tree, source, k[0])))
-      for a of kidsOf(tree, k[1]) {
-        let ak = kidsOf(tree, a)
-        out = append(out, jsxQuoteWord(identText(tree, source, ak[0])))
-        if (ak[1] == 0) {
-          needTrue = true
-        }
-      }
+// A JSX text child's raw bytes, quoted as an interpreted string literal (SPEC
+// §5.7). Only `\` and `"` need escaping: this span is never re-lexed (the
+// text is appended straight past parsing and read back only by
+// `decodeStringContent`/`decodeEscapes`, lower.bit), which does not treat a
+// literal newline as unterminating a string and does not touch `$` unless it
+// follows the backslash escaped away here — so every other byte, including an
+// embedded newline, survives unchanged.
+fn jsxQuoteText(text: string): string {
+  let out = []u8(0)
+  out = append(out, u8('"'))
+  let i = 0
+  while (i < len(text)) {
+    let c = text[i]
+    if (c == '\\' || c == '"') {
+      out = append(out, u8('\\'))
     }
+    out = append(out, c)
     i = i + 1
   }
-  if (len(out) == 0) {
+  out = append(out, u8('"'))
+  return string(out)
+}
+
+// A `jsx_elem`'s name is not poisoned (the parser already reported
+// E0021/E0023 on it) — the only reason an element is left alone, at any
+// arity of attributes or children. A `jsx_frag` has no name to poison and is
+// always desugarable.
+fn jsxIsDesugarable(tree: Tree, node: int): bool {
+  let tag = getNode(tree, node).tag
+  if (tag == Tag.JsxFrag) {
+    return true
+  }
+  return tag == Tag.JsxElem && kidsOf(tree, node)[0] != 0
+}
+
+// Every JSX text child of one `jsx_children` node (0 for a self-closing or
+// explicitly empty element/fragment), quoted and ready for `appendSynthText`.
+fn jsxChildTextWords(tree: Tree, source: string, childrenNode: int): []string {
+  let out = []string(0)
+  if (childrenNode == 0) {
     return out
   }
-  out = append(out, "elem")
-  out = append(out, "attr")
-  if (needTrue) {
-    out = append(out, "true")
+  for c of kidsOf(tree, childrenNode) {
+    if (getNode(tree, c).tag == Tag.JsxText) {
+      out = append(out, jsxQuoteText(identText(tree, source, c)))
+    }
   }
   return out
 }
 
+// The number of children a `jsx_children` node holds (0 when absent) — an
+// uppercase element needs the `children` word only when this is nonzero.
+fn jsxChildCount(tree: Tree, childrenNode: int): int {
+  if (childrenNode == 0) {
+    return 0
+  }
+  return len(kidsOf(tree, childrenNode))
+}
+
+// The words ONE desugarable `jsx_elem` needs: for a lowercase element, its
+// quoted tag name (and every synth pass needs `elem`/`attr` at all once one
+// exists); either case's quoted text children; and whether this element has
+// a bare attribute (`true`) or, for an uppercase one, any child at all
+// (`children`). A nested element/fragment's own requirements are collected on
+// ITS OWN turn by the caller's scan — never recursed into here.
+class JsxWordInfo {
+  words: []string,
+  needTrue: bool,
+  needElemAttr: bool,
+  needChildren: bool,
+}
+
+fn jsxElemSynthInfo(tree: Tree, source: string, node: int): JsxWordInfo {
+  let k = kidsOf(tree, node)
+  let lower = jsxIsLowerTag(identText(tree, source, k[0]))
+  let info = JsxWordInfo{
+    words: []string(0),
+    needTrue: false,
+    needElemAttr: lower,
+    needChildren: false,
+  }
+  if (lower) {
+    info.words = append(info.words, jsxQuoteWord(identText(tree, source, k[0])))
+  }
+  for a of kidsOf(tree, k[1]) {
+    let ak = kidsOf(tree, a)
+    if (lower) {
+      info.words = append(info.words, jsxQuoteWord(identText(tree, source, ak[0])))
+    }
+    if (ak[1] == 0) {
+      info.needTrue = true
+    }
+  }
+  for w of jsxChildTextWords(tree, source, k[2]) {
+    info.words = append(info.words, w)
+  }
+  if (!lower && jsxChildCount(tree, k[2]) != 0) {
+    info.needChildren = true
+  }
+  return info
+}
+
+// The running totals `jsxSynthWords`' scan builds up, one desugarable node at
+// a time, before the words that depend on a TOTAL (`elem`/`attr`, `frag`,
+// `children`, `true`) are appended once each.
+class JsxSynthState {
+  words: []string,
+  needElemAttr: bool,
+  needFrag: bool,
+  needChildren: bool,
+  needTrue: bool,
+}
+
+fn jsxCollectFragWords(tree: Tree, source: string, st: JsxSynthState, node: int) {
+  st.needFrag = true
+  for w of jsxChildTextWords(tree, source, kidsOf(tree, node)[0]) {
+    st.words = append(st.words, w)
+  }
+}
+
+fn jsxCollectElemWords(tree: Tree, source: string, st: JsxSynthState, node: int) {
+  let info = jsxElemSynthInfo(tree, source, node)
+  for w of info.words {
+    st.words = append(st.words, w)
+  }
+  if (info.needTrue) {
+    st.needTrue = true
+  }
+  if (info.needElemAttr) {
+    st.needElemAttr = true
+  }
+  if (info.needChildren) {
+    st.needChildren = true
+  }
+}
+
+fn jsxFinalWords(st: JsxSynthState): []string {
+  if (st.needElemAttr) {
+    st.words = append(st.words, "elem")
+    st.words = append(st.words, "attr")
+  }
+  if (st.needFrag) {
+    st.words = append(st.words, "frag")
+  }
+  if (st.needChildren) {
+    st.words = append(st.words, "children")
+  }
+  if (st.needTrue) {
+    st.words = append(st.words, "true")
+  }
+  return st.words
+}
+
+// Every word this module's desugarable JSX needs appended to the source.
+// `appendSynthText` dedupes exact repeats, so this collects every occurrence
+// with no set of its own.
+fn jsxSynthWords(tree: Tree, source: string): []string {
+  let st = JsxSynthState{
+    words: []string(0), needElemAttr: false, needFrag: false,
+    needChildren: false, needTrue: false,
+  }
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (jsxIsDesugarable(tree, i)) {
+      if (getNode(tree, i).tag == Tag.JsxFrag) {
+        jsxCollectFragWords(tree, source, st, i)
+      } else {
+        jsxCollectElemWords(tree, source, st, i)
+      }
+    }
+    i = i + 1
+  }
+  return jsxFinalWords(st)
+}
+
 // The file id every synthesized span in this module is stamped with — the
-// first desugarable element's own file, mirroring synthtext.bit's
+// first desugarable node's own file, mirroring synthtext.bit's
 // `synthFileId`. Spans are module-global here just as they are for that
 // pass, so the caller owes the identical `remapDiags` step.
 fn jsxSynthFileId(tree: Tree, source: string): int {
   let i = 1
   while (i < len(tree.nodes)) {
-    if (getNode(tree, i).tag == Tag.JsxElem && jsxElemDesugarable(tree, source, i)) {
+    if (jsxIsDesugarable(tree, i)) {
       return getNode(tree, i).span.file
     }
     i = i + 1
@@ -110,45 +246,107 @@ fn jsxArgWrap(tree: Tree, span: Span, expr: int): int {
   return addNode(tree, Tag.Arg, span, 0, [expr])
 }
 
-// `attr("name", value)` for one `jsx_attr` node — a bare attribute's value is
-// the literal `true` (SPEC §12.12), and a `{expr}` value unwraps to the
-// expression itself; a string-literal value is already a real `Tag.StringLit`
-// the parser built and needs no rewriting at all.
+// The VALUE half of one `jsx_attr` (SPEC §12.12): a bare attribute defaults to
+// the literal `true`, a `{expr}` value unwraps to the expression itself, and a
+// string-literal value is already a real `Tag.StringLit` the parser built and
+// needs no rewriting — shared by the lowercase `attr(...)` call and the
+// uppercase named argument, since the rule does not depend on case.
+//
+// NEVER `markSynth` here or anywhere else in this file. That mark is
+// `vCallArgExpect`'s (validatecall.bit) narrow #4583 exemption for a value
+// classfieldattrbuild.bit already validated once and does not want reported
+// twice — it is not a generic "the checker built this" flag, and setting it
+// on a JSX-desugared argument makes `vCallArgExpect` skip the ONLY type check
+// that argument will ever get (nothing validates a JSX attribute value before
+// it becomes a call argument, unlike a class field). A bare-attribute `true`
+// passed to a `string`-typed `attr` parameter must be an ordinary type
+// mismatch, not a silently accepted argument that then reads a bool's bit
+// pattern as a string header at runtime.
+fn jsxAttrValue(tree: Tree, st: SynthText, attrNode: int): int {
+  let value = kidsOf(tree, attrNode)[1]
+  if (value == 0) {
+    return addLeaf(tree, Tag.BoolLit, synthSpan(st, "true"))
+  }
+  if (getNode(tree, value).tag == Tag.JsxExpr) {
+    return kidsOf(tree, value)[0]
+  }
+  return value
+}
+
+// `attr("name", value)` for one `jsx_attr` node, on a lowercase element.
 fn jsxAttrCall(tree: Tree, source: string, st: SynthText, attrNode: int): int {
   let k = kidsOf(tree, attrNode)
   let sp = getNode(tree, attrNode).span
-  let nameLit = markSynth(
+  let nameLit = addLeaf(
     tree,
-    addLeaf(tree, Tag.StringLit, synthSpan(st, jsxQuoteWord(identText(tree, source, k[0])))),
+    Tag.StringLit,
+    synthSpan(st, jsxQuoteWord(identText(tree, source, k[0]))),
   )
-  let value = k[1]
-  if (value == 0) {
-    value = markSynth(tree, addLeaf(tree, Tag.BoolLit, synthSpan(st, "true")))
-  } else if (getNode(tree, value).tag == Tag.JsxExpr) {
-    value = kidsOf(tree, value)[0]
-  }
+  let value = jsxAttrValue(tree, st, attrNode)
   let callee = synthIdent(tree, st, "attr")
   let argsNode = addNode(
-    tree,
-    Tag.Args,
-    sp,
-    0,
+    tree, Tag.Args, sp, 0,
     [jsxArgWrap(tree, sp, nameLit), jsxArgWrap(tree, sp, value)],
   )
-  return markSynth(tree, addNode(tree, Tag.Call, sp, 0, [callee, 0, argsNode]))
+  return addNode(tree, Tag.Call, sp, 0, [callee, 0, argsNode])
 }
 
-// Rewrites one desugarable `jsx_elem` node IN PLACE into `elem("name", attr(...), ...)`.
-fn rewriteJsxElem(tree: Tree, source: string, st: SynthText, node: int) {
+// `name = value` for one `jsx_attr` node, on an uppercase (component)
+// element. The attribute's own `Ident` leaf is reused directly as the named
+// argument's name — see the file header for why nothing needs synthesizing
+// here — spanned at the ATTRIBUTE itself, matching `jsxAttrCall`, so an
+// unknown-name or wrong-type diagnostic points at the attribute the author
+// wrote, not at the whole element.
+fn jsxNamedArg(tree: Tree, st: SynthText, attrNode: int): int {
+  let k = kidsOf(tree, attrNode)
+  let sp = getNode(tree, attrNode).span
+  return addNode(tree, Tag.NamedArg, sp, 0, [k[0], jsxAttrValue(tree, st, attrNode)])
+}
+
+// One JSX child's VALUE node: raw text becomes a quoted string literal, a
+// `{expr}` child unwraps to the expression, and an element/fragment child has
+// ALREADY been rewritten to a `Call` in place by this same forward pass (see
+// the file header).
+fn jsxChildValue(tree: Tree, source: string, st: SynthText, child: int): int {
+  let tag = getNode(tree, child).tag
+  if (tag == Tag.JsxText) {
+    return addLeaf(tree, Tag.StringLit, synthSpan(st, jsxQuoteText(identText(tree, source, child))))
+  }
+  if (tag == Tag.JsxExpr) {
+    return kidsOf(tree, child)[0]
+  }
+  return child
+}
+
+// Every child VALUE of a `jsx_children` node (0 when the element/fragment is
+// self-closing or explicitly empty).
+fn jsxChildValues(tree: Tree, source: string, st: SynthText, childrenNode: int): []int {
+  let out = []int(0)
+  if (childrenNode == 0) {
+    return out
+  }
+  for c of kidsOf(tree, childrenNode) {
+    out = append(out, jsxChildValue(tree, source, st, c))
+  }
+  return out
+}
+
+// Rewrites one desugarable LOWERCASE `jsx_elem` IN PLACE into
+// `elem("name", attr(...), ..., child, ...)` (SPEC §12.12).
+fn rewriteJsxLowerElem(tree: Tree, source: string, st: SynthText, node: int) {
   let sp = getNode(tree, node).span
   let k = kidsOf(tree, node)
-  let nameLit = markSynth(
+  let nameLit = addLeaf(
     tree,
-    addLeaf(tree, Tag.StringLit, synthSpan(st, jsxQuoteWord(identText(tree, source, k[0])))),
+    Tag.StringLit,
+    synthSpan(st, jsxQuoteWord(identText(tree, source, k[0]))),
   )
   let argVals = [nameLit]
   for a of kidsOf(tree, k[1]) {
     argVals = append(argVals, jsxAttrCall(tree, source, st, a))
+  }
+  for v of jsxChildValues(tree, source, st, k[2]) {
+    argVals = append(argVals, v)
   }
   let argNodes = []int(0)
   for v of argVals {
@@ -156,16 +354,94 @@ fn rewriteJsxElem(tree: Tree, source: string, st: SynthText, node: int) {
   }
   let callee = synthIdent(tree, st, "elem")
   let argsNode = addNode(tree, Tag.Args, sp, 0, argNodes)
-  let call = markSynth(tree, addNode(tree, Tag.Call, sp, 0, [callee, 0, argsNode]))
+  let call = addNode(tree, Tag.Call, sp, 0, [callee, 0, argsNode])
   tree.nodes[node] = tree.nodes[call]
+}
+
+// Rewrites one desugarable UPPERCASE `jsx_elem` IN PLACE into an ordinary
+// named-argument call: `Tag(attr = value, ..., children = [child, ...])`
+// (SPEC §12.12) — `children` is added only when the element has at least one
+// child, so a leaf component desugars to a plain call with no empty tail.
+fn rewriteJsxUpperElem(tree: Tree, source: string, st: SynthText, node: int) {
+  let sp = getNode(tree, node).span
+  let k = kidsOf(tree, node)
+  let argNodes = []int(0)
+  for a of kidsOf(tree, k[1]) {
+    argNodes = append(argNodes, jsxNamedArg(tree, st, a))
+  }
+  let childVals = jsxChildValues(tree, source, st, k[2])
+  if (len(childVals) != 0) {
+    let items = []int(0)
+    for v of childVals {
+      items = append(items, jsxArgWrap(tree, sp, v))
+    }
+    let sliceLit = addNode(tree, Tag.SliceLit, sp, 0, items)
+    let childrenName = synthIdent(tree, st, "children")
+    argNodes = append(argNodes, addNode(tree, Tag.NamedArg, sp, 0, [childrenName, sliceLit]))
+  }
+  let argsNode = addNode(tree, Tag.Args, sp, 0, argNodes)
+  let call = addNode(tree, Tag.Call, sp, 0, [k[0], 0, argsNode])
+  tree.nodes[node] = tree.nodes[call]
+}
+
+// Rewrites one `jsx_frag` IN PLACE into `frag(child, ...)` (SPEC §12.12) —
+// the same shape a lowercase element's children take, with no tag-name
+// argument and no attributes (a fragment has none).
+fn rewriteJsxFrag(tree: Tree, source: string, st: SynthText, node: int) {
+  let sp = getNode(tree, node).span
+  let childrenNode = kidsOf(tree, node)[0]
+  let argNodes = []int(0)
+  for v of jsxChildValues(tree, source, st, childrenNode) {
+    argNodes = append(argNodes, jsxArgWrap(tree, sp, v))
+  }
+  let callee = synthIdent(tree, st, "frag")
+  let argsNode = addNode(tree, Tag.Args, sp, 0, argNodes)
+  let call = addNode(tree, Tag.Call, sp, 0, [callee, 0, argsNode])
+  tree.nodes[node] = tree.nodes[call]
+}
+
+// Dispatches one desugarable node (already filtered by `jsxIsDesugarable`) to
+// its rewrite: a fragment, else a lowercase or uppercase element by its own
+// tag's first letter.
+fn desugarJsxNode(tree: Tree, source: string, st: SynthText, node: int) {
+  if (getNode(tree, node).tag == Tag.JsxFrag) {
+    rewriteJsxFrag(tree, source, st, node)
+    return
+  }
+  if (jsxIsLowerTag(identText(tree, source, kidsOf(tree, node)[0]))) {
+    rewriteJsxLowerElem(tree, source, st, node)
+  } else {
+    rewriteJsxUpperElem(tree, source, st, node)
+  }
+}
+
+// Whether this module has ANY desugarable node at all. NOT the same question
+// as "does it need synthesized words": an uppercase element with only
+// explicit-value attributes and no children needs neither `elem`/`attr` nor
+// `children`/`true` — every name it needs is already a real source Ident,
+// reused as-is (see the file header) — so `jsxSynthWords` legitimately
+// returns empty for it while it still has a `jsx_elem` that must become a
+// `Call` before resolve ever sees the tree. Gating the rewrite on an empty
+// word list instead of this left such an element's raw `jsx_elem`/`jsx_attr`
+// nodes for the ordinary resolver to walk, which resolved the attribute's
+// own name as a plain variable reference and reported a spurious E0040.
+fn jsxModuleHasNodes(tree: Tree): bool {
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (jsxIsDesugarable(tree, i)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 // Entry point, called from `resolveProject` (checkproject.bit) right after
 // `injectSynthMembers` — same reason: every front end reaches the checker
 // through there, so this is the one place the rewrite has to happen before
 // resolve sees the tree. Each module either contains no desugarable JSX (the
-// common case: `words` is empty, nothing is touched) or gets one
-// `appendSynthText` call and one rewrite pass.
+// common case) or gets one `appendSynthText` call (a no-op source append when
+// no word is needed) and one rewrite pass.
 fn desugarJsxProject(p: Project) {
   let i = 0
   while (i < len(p.mods)) {
@@ -175,15 +451,15 @@ fn desugarJsxProject(p: Project) {
 }
 
 fn desugarJsxInModule(m: SrcModule) {
-  let words = jsxSynthWords(m.tree, m.source)
-  if (len(words) == 0) {
+  if (!jsxModuleHasNodes(m.tree)) {
     return
   }
+  let words = jsxSynthWords(m.tree, m.source)
   let st = appendSynthText(m, jsxSynthFileId(m.tree, m.source), words)
   let i = 1
   while (i < len(m.tree.nodes)) {
-    if (getNode(m.tree, i).tag == Tag.JsxElem && jsxElemDesugarable(m.tree, m.source, i)) {
-      rewriteJsxElem(m.tree, m.source, st, i)
+    if (jsxIsDesugarable(m.tree, i)) {
+      desugarJsxNode(m.tree, m.source, st, i)
     }
     i = i + 1
   }
