@@ -37,6 +37,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [jwt](jwt.md) | `"std/jwt"` | JWS sign/verify, RFC 7519 claim validation, JWKS key selection |
 | [smtp](smtp.md) | `"std/smtp"` | ESMTP submission client — STARTTLS, AUTH, MIME messages |
 | [runtime](runtime.md) | `"std/runtime"` | `runRecovering` — the per-task panic boundary |
+| [trace](trace.md) | `"std/trace"` | Distributed tracing — spans, W3C `traceparent` propagation, an OTLP/HTTP exporter |
 
 ## Conventions
 

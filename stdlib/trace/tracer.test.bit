@@ -1,0 +1,212 @@
+// stdlib/trace/tracer.test.bit — spans, export, propagation, shutdown,
+// concurrency (#3969).
+
+import { serve, listenAndServeOn, ok, Server, Request, Response } from "std/http"
+import { jsonParse, jsonGet, jsonAsArray, jsonAsString, jsonAsInt } from "std/json"
+
+// Captures the body of the one request it receives onto `ch`, so the test
+// task (which cannot itself run the server's accept loop) can read what the
+// exporter actually sent.
+class captureTarget {
+  ch: chan<string>
+  handle(req: Request): Response {
+    this.ch <- req.body
+    return ok("")
+  }
+}
+
+fn startCapture(): (Server, chan<string>) {
+  let s = serve("127.0.0.1", 0) catch e {
+    panic("startCapture: serve: ${e.message()}")
+  }
+  let ch = chan<string>(1)
+  let target = captureTarget{ ch: ch }
+  spawn runCapture(s, target)
+  return s, ch
+}
+
+fn runCapture(s: Server, target: captureTarget) {
+  listenAndServeOn(s, target.handle) catch _ {
+    return
+  }
+}
+
+fn field(j: Json, key: string): Json {
+  return unwrap(jsonGet(j, key))
+}
+
+test "a parent span with two nested children exports the correct shape to a fake OTLP endpoint" {
+  let (s, bodyCh) = startCapture()
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let tr = newTracer("http://127.0.0.1:${port}/v1/traces", "test", 1.0)
+
+  let parent = tr.startSpan("parent")
+  parent.setAttribute("http.method", "GET")
+  let child1 = tr.startSpan("child1")
+  child1.end()
+  let child2 = tr.startSpan("child2")
+  child2.end()
+  parent.end()
+  tr.shutdown()
+  s.close()
+
+  let body = <- bodyCh
+  let doc = jsonParse(body) catch e {
+    assert(false, "jsonParse: ${e.message()}")
+    return
+  }
+  let resourceSpans = unwrap(jsonAsArray(field(doc, "resourceSpans")))
+  let scopeSpans = unwrap(jsonAsArray(field(resourceSpans[0], "scopeSpans")))
+  let spans = unwrap(jsonAsArray(field(scopeSpans[0], "spans")))
+  assert(len(spans) == 3, "expected 3 spans, got ${len(spans)}")
+
+  // Spans are exported in the order `end()` was called, not the order
+  // `startSpan` was called: child1, child2, then parent last.
+  let parentTraceId = unwrap(jsonAsString(field(spans[2], "traceId")))
+  let parentSpanId = unwrap(jsonAsString(field(spans[2], "spanId")))
+  let i = 0
+  while (i < 3) {
+    let sp = spans[i]
+    assert(
+      unwrap(jsonAsString(field(sp, "traceId"))) == parentTraceId,
+      "every span must share the parent's trace id",
+    )
+    let dur = unwrap(jsonAsString(field(sp, "endTimeUnixNano")))
+    assert(len(dur) > 0, "endTimeUnixNano must be set")
+    i = i + 1
+  }
+  let name1 = unwrap(jsonAsString(field(spans[0], "name")))
+  let name2 = unwrap(jsonAsString(field(spans[1], "name")))
+  assert(name1 == "child1" && name2 == "child2", "child span names must be preserved")
+  assert(
+    unwrap(jsonAsString(field(spans[0], "parentSpanId"))) == parentSpanId,
+    "a child span's parentSpanId must be the parent's spanId",
+  )
+  assert(
+    unwrap(jsonAsString(field(spans[1], "parentSpanId"))) == parentSpanId,
+    "the second child's parentSpanId must also be the parent's spanId",
+  )
+
+  let attrs = unwrap(jsonAsArray(field(spans[2], "attributes")))
+  assert(len(attrs) == 1, "the parent span must carry its one attribute")
+}
+
+test "a valid incoming traceparent continues its trace; a malformed one starts a new one" {
+  let tr = newTracer("http://127.0.0.1:1/v1/traces", "test", 1.0)
+  let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  let continued = tr.startSpanFromHeader("handler", incoming)
+  assert(continued.traceHi == 0x4bf92f3577b34da6, "must continue the incoming trace id (hi)")
+  assert(continued.traceLo == 0xa3ce929d0e0e4736, "must continue the incoming trace id (lo)")
+  assert(continued.parentSpanId == 0x00f067aa0ba902b7, "must record the incoming span as parent")
+  continued.end()
+
+  let malformed = tr.startSpanFromHeader("handler", "not-a-traceparent")
+  assert(
+    malformed.traceHi != 0x4bf92f3577b34da6 || malformed.traceLo != 0xa3ce929d0e0e4736,
+    "a malformed header must start a fresh trace, not reuse any prior one",
+  )
+  malformed.end()
+  tr.shutdown()
+}
+
+test "an outgoing traceparent carries the current span's trace id" {
+  let tr = newTracer("http://127.0.0.1:1/v1/traces", "test", 1.0)
+  let sp = tr.startSpan("outbound")
+  let header = unwrap(tr.currentTraceParent())
+  let parsed = unwrap(parseTraceParent(header))
+  assert(
+    parsed.traceHi == sp.traceHi && parsed.traceLo == sp.traceLo,
+    "the outgoing traceparent's trace id must match the current span",
+  )
+  assert(
+    parsed.parentSpanId == sp.spanId,
+    "the outgoing traceparent's id must be the current span's own id",
+  )
+  sp.end()
+  tr.shutdown()
+}
+
+test "filling the export queue drops spans, counts the drop, and returns in bounded time" {
+  let tr = newTracer("http://127.0.0.1:1/v1/traces", "test", 1.0)
+  // The export loop is running but nothing ever drains the queue as fast as
+  // this floods it (no `after` fires mid-loop for 4096+1 tight iterations),
+  // so the queue fills and the +1th `end()` must drop rather than block.
+  let before = monotonicNowNs()
+  let i = 0
+  while (i < 5000) {
+    let sp = tr.startSpan("flood")
+    sp.end()
+    i = i + 1
+  }
+  let elapsedNs = monotonicNowNs() - before
+  assert(
+    elapsedNs < 5000000000,
+    "5000 end() calls must return well under 5s even with a full queue",
+  )
+  assert(tr.droppedSpans() > 0, "a queue this full must have dropped at least one span")
+  tr.shutdown()
+}
+
+fn monotonicNowNs(): int {
+  return monotonic().ns
+}
+
+test "a span left unfinished at shutdown is exported with an error status" {
+  let (s, bodyCh) = startCapture()
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let tr = newTracer("http://127.0.0.1:${port}/v1/traces", "test", 1.0)
+  let _ = tr.startSpan("never-ended") // deliberately never end()'d
+  tr.shutdown()
+  s.close()
+
+  let body = <- bodyCh
+  let doc = jsonParse(body) catch e {
+    assert(false, "jsonParse: ${e.message()}")
+    return
+  }
+  let resourceSpans = unwrap(jsonAsArray(field(doc, "resourceSpans")))
+  let scopeSpans = unwrap(jsonAsArray(field(resourceSpans[0], "scopeSpans")))
+  let spans = unwrap(jsonAsArray(field(scopeSpans[0], "spans")))
+  assert(len(spans) == 1, "the unfinished span must still be exported")
+  let status = field(spans[0], "status")
+  let code = unwrap(jsonAsInt(field(status, "code")))
+  assert(code == 2, "an unfinished span at shutdown must carry ERROR status, got ${code}")
+}
+
+fn concurrentWorker(tr: Tracer, done: chan<(uint, uint)>) {
+  let sp = tr.startSpan("worker")
+  sp.end()
+  done <- (sp.traceHi, sp.traceLo)
+}
+
+test "8 concurrent tasks each recording spans produce 8 separate traces with no id collisions" {
+  let tr = newTracer("http://127.0.0.1:1/v1/traces", "test", 1.0)
+  let done = chan<(uint, uint)>(8)
+  let n = 8
+  let i = 0
+  while (i < n) {
+    spawn concurrentWorker(tr, done)
+    i = i + 1
+  }
+  let ids = []string(0)
+  i = 0
+  while (i < n) {
+    let pair = <- done
+    let id = "${pair.0}:${pair.1}"
+    let j = 0
+    while (j < len(ids)) {
+      assert(ids[j] != id, "two tasks must never draw the same trace id")
+      j = j + 1
+    }
+    ids = append(ids, id)
+    i = i + 1
+  }
+  assert(len(ids) == n, "expected ${n} distinct traces, got ${len(ids)}")
+  tr.shutdown()
+}

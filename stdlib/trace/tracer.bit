@@ -1,0 +1,248 @@
+// Bit standard library — std/trace: Tracer, the public entry point (#3969).
+//
+// A `Tracer` is held explicitly by whatever code creates spans (the same
+// shape `std/metrics`' `Registry` uses — SPEC §11.11 forbids a class behind
+// a module-level `let`, so there is no hidden default tracer). What is
+// implicit is the PARENT/CHILD link between spans, carried through
+// `context.bit`'s task-local ambient context per #3968's decision — a
+// deeply nested call never needs a `Tracer` reference just to nest
+// correctly under whatever span is currently open on its task.
+
+import { requestWith, Header } from "std/http"
+import { newMutex, Mutex, AtomicI64, newAtomicI64 } from "std/sync"
+import { after } from "std/time"
+// `monotonic`/`now`/`since`/`Mono` are imported once for this module, in
+// `span.bit`.
+
+// Batch size and flush cadence for the background exporter. Not a tuning
+// knob (yet) — the ticket scopes configurability to the sampling ratio.
+const batchMax: int = 512
+const flushIntervalNs: int = 2000000000 // 2s
+const queueCapacity: int = 4096
+
+// Distributed tracing on the OTLP wire format. `endpoint` is the full OTLP/
+// HTTP JSON traces URL (e.g. "http://localhost:4318/v1/traces"). Export
+// runs on its own background task and never blocks or fails the caller
+// that records a span (the ticket's own rule) — a full queue drops the
+// span and counts it in `droppedSpans()` instead of parking.
+export class Tracer {
+  sampler: Sampler
+  endpoint: string
+  scopeName: string
+  queue: chan<Span>
+  dropped: AtomicI64
+  activeMu: Mutex
+  active: []Span
+  stopCh: chan<bool>
+  doneCh: chan<bool>
+
+  // Starts a new span, a child of this task's ambient context if one is
+  // set, or the root of a fresh trace (a new sampling decision) otherwise.
+  // Sets the ambient context to the new span for the duration of its work —
+  // `Span.end()` restores it.
+  export startSpan(name: string): Span {
+    let parent = currentContext()
+    if (isEmptyContext(parent)) {
+      return this.startRoot(name)
+    }
+    return this.startChild(name, parent)
+  }
+
+  // Starts a new span from an incoming `traceparent` header, continuing
+  // that trace when the header is valid or starting a fresh root trace
+  // when it is malformed — never erroring (the ticket's own rule; see
+  // `traceparent.bit`).
+  export startSpanFromHeader(name: string, traceparent: string): Span {
+    let parsed = parseTraceParent(traceparent)
+    if (!isSome(parsed)) {
+      return this.startRoot(name)
+    }
+    let tp = unwrap(parsed)
+    let parent = SpanContext{
+      traceHi: tp.traceHi,
+      traceLo: tp.traceLo,
+      spanId: tp.parentSpanId,
+      sampled: tp.sampled,
+    }
+    return this.startChild(name, parent)
+  }
+
+  startRoot(name: string): Span {
+    let (hi, lo) = newTraceId()
+    let ctx = SpanContext{
+      traceHi: hi, traceLo: lo, spanId: newSpanId(), sampled: this.sampler.shouldSample(),
+    }
+    return this.beginSpan(name, ctx, 0)
+  }
+
+  startChild(name: string, parent: SpanContext): Span {
+    let ctx = SpanContext{
+      traceHi: parent.traceHi, traceLo: parent.traceLo, spanId: newSpanId(), sampled: parent.sampled,
+    }
+    return this.beginSpan(name, ctx, parent.spanId)
+  }
+
+  beginSpan(name: string, ctx: SpanContext, parentSpanId: uint): Span {
+    let prevWord = setCurrentContext(ctx)
+    let sp = newSpan(name, ctx, parentSpanId, prevWord, this)
+    if (ctx.sampled) {
+      this.activeMu.lock()
+      this.active = append(this.active, sp)
+      this.activeMu.unlock()
+    }
+    return sp
+  }
+
+  // Builds the `traceparent` header value to attach to an outgoing request,
+  // from this task's ambient context — `Option<string>.None` when no span
+  // is open on this task (nothing to propagate).
+  export currentTraceParent(): Option<string> {
+    let c = currentContext()
+    if (isEmptyContext(c)) {
+      return Option<string>.None
+    }
+    return Option<string>.Some(formatTraceParent(c.traceHi, c.traceLo, c.spanId, c.sampled))
+  }
+
+  // Called by `Span.end()` only. Removes a finished sampled span from the
+  // active set and offers it to the export queue; a full queue drops it
+  // (counted, never blocked) — the non-blocking `select` below is what
+  // keeps `Span.end()` bounded-time even when the exporter is behind.
+  finishSpan(sp: Span) {
+    if (!sp.sampled) {
+      return
+    }
+    this.removeActive(sp)
+    select {
+      case this.queue <- sp:
+        return
+      default:
+        this.dropped.add(1)
+        return
+    }
+  }
+
+  removeActive(sp: Span) {
+    this.activeMu.lock()
+    let out = []Span(0)
+    let i = 0
+    while (i < len(this.active)) {
+      if (this.active[i].spanId != sp.spanId || this.active[i].traceLo != sp.traceLo) {
+        out = append(out, this.active[i])
+      }
+      i = i + 1
+    }
+    this.active = out
+    this.activeMu.unlock()
+  }
+
+  // The count of spans dropped because the export queue was full.
+  export droppedSpans(): i64 {
+    return this.dropped.load()
+  }
+
+  // Flushes every queued span, force-closes (with `SpanStatus.Error`) and
+  // exports every span still open at the time of the call, then stops the
+  // background exporter. Call once, at process shutdown — an unfinished
+  // span must be exported, never silently dropped (the ticket's own rule).
+  export shutdown() {
+    this.activeMu.lock()
+    let stillOpen = this.active
+    this.active = []Span(0)
+    this.activeMu.unlock()
+    let i = 0
+    while (i < len(stillOpen)) {
+      let sp = stillOpen[i]
+      sp.status = SpanStatus.Error
+      sp.durationNs = since(sp.startMono)
+      sp.endWallNs = now().ns
+      sp.ended = true
+      select {
+        case this.queue <- sp:
+        default:
+          this.dropped.add(1)
+      }
+      i = i + 1
+    }
+    this.stopCh <- true
+    <- this.doneCh
+  }
+
+  flush(batch: []Span) {
+    if (len(batch) == 0) {
+      return
+    }
+    let body = encodeOtlpBatch(batch, this.scopeName)
+    let headers = [Header{ name: "Content-Type", value: "application/json" }]
+    requestWith("POST", this.endpoint, headers, body) catch _ {
+      // Export must never fail or retry synchronously (the ticket's own
+      // rule) — an unreachable collector just loses this batch.
+      return
+    }
+  }
+
+  // The background export loop: batches queued spans up to `batchMax`,
+  // flushes early on that cap or every `flushIntervalNs`, and drains + sends
+  // one final batch on `shutdown`.
+  exportLoop() {
+    let batch = []Span(0)
+    while (true) {
+      select {
+        case sp = <- this.queue:
+          batch = append(batch, sp)
+          if (len(batch) >= batchMax) {
+            this.flush(batch)
+            batch = []Span(0)
+          }
+        case <- after(flushIntervalNs):
+          this.flush(batch)
+          batch = []Span(0)
+        case <- this.stopCh:
+          // Drain whatever `shutdown` already queued before this
+          // arrived — `select` picks uniformly among ready cases, so
+          // without this a span sitting in `this.queue` could be lost
+          // to the stop signal winning the race.
+          let draining = true
+          while (draining) {
+            select {
+              case sp = <- this.queue:
+                batch = append(batch, sp)
+              default:
+                draining = false
+            }
+          }
+          this.flush(batch)
+          this.doneCh <- true
+          return
+      }
+    }
+  }
+}
+
+// A `Tracer` exporting to the OTLP/HTTP JSON endpoint at `endpoint`
+// (e.g. "http://localhost:4318/v1/traces") at sampling ratio `ratio`
+// (clamped to `[0, 1]`, see `newSampler`). `scopeName` is the
+// instrumentation scope name OTLP attaches to every span this tracer
+// exports. Spawns the background exporter task immediately.
+export fn newTracer(endpoint: string, scopeName: string, ratio: f64): Tracer {
+  let t = Tracer{
+    sampler: newSampler(ratio),
+    endpoint: endpoint,
+    scopeName: scopeName,
+    queue: chan<Span>(queueCapacity),
+    dropped: newAtomicI64(0),
+    activeMu: newMutex(),
+    active: []Span(0),
+    stopCh: chan<bool>(0),
+    doneCh: chan<bool>(0),
+  }
+  spawn runExportLoop(t)
+  return t
+}
+
+// `spawn` lowers only a plain function name (SPEC §16.1), never a method
+// call — this is the free-function wrapper `newTracer` spawns instead of
+// `t.exportLoop()` directly.
+fn runExportLoop(t: Tracer) {
+  t.exportLoop()
+}
