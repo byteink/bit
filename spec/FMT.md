@@ -602,3 +602,55 @@ a true fixed point, not merely eventual convergence over repeated runs.
 inside the code, not just the comment gap) — the second pass must still be a
 no-op, proving the run's column was computed from the first pass's own
 canonical rendering rather than from the input text's incidental spacing.
+
+## 13. JSX elements and fragments (SPEC §12.12, #3945)
+
+**Rule.** `compiler/fmtjsx.bit` prints the seven JSX tags parserjsx.bit
+produces (`jsx_elem`, `jsx_frag`, `jsx_attrs`, `jsx_attr`, `jsx_children`,
+`jsx_expr`, `jsx_text`). Two layout decisions, both width-aware in the same
+flat-then-fits-or-wrap shape as every other list in this document (§1, §5,
+§10):
+
+- **Attributes.** Zero attributes stays flat. One tries to stay flat —
+  ` name` or ` name={expr}` joined onto the opening tag — and only falls
+  back on overflow or an embedded newline. Two or more *always* take the
+  stacked form: one attribute per line, one deeper indent, with the closer
+  (`>` or `/>`) alone on its own line at the outer indent.
+- **Children.** A single child tries to stay flat, joined onto the same line
+  as the tags: `<Name>child</Name>`. Two or more children, a child that does
+  not fit, or a child holding a comment take the stacked form: one child per
+  line, one deeper indent, with the closing tag on its own line.
+
+**Whitespace is never fmt's to reflow.** SPEC §12.12 makes the whitespace
+between JSX children part of the program's meaning, and the parser has
+already applied that rule once, at parse time: every `jsx_text` leaf holds
+exactly the source bytes that survive it (real text, or a same-line,
+no-newline significant gap such as the one space in `<a/> <b/>`), and no
+`jsx_text` leaf exists at all where the source had nothing there, or had
+only a whitespace run containing a newline. `fmtjsx.bit` prints every
+`jsx_text` leaf's span byte for byte and never touches it, and it only ever
+*inserts* a newline of its own — never a plain space — immediately beside a
+boundary no `jsx_text` leaf already occupies. That is always safe: on the
+next parse, a whitespace run containing a newline is dropped in full from
+whichever end it reaches, so an inserted newline collapses back to nothing
+wherever the source had nothing (or a run the first parse had already
+discarded), and it is never placed next to a `jsx_text` leaf in the first
+place, so a real significant gap is never touched.
+
+```text
+<Button
+  onClick={handleClick}
+  disabled
+>
+  <Icon name="close" />
+  Close
+</Button>
+```
+
+**Check:** format a fixture holding a self-closing element, a
+multi-attribute element that must break, a fragment, nested elements and an
+expression child; running `bit fmt` on it twice produces byte-identical
+output, and `bit fmt --check` is `rc=0` on the result. Format
+`<a/> <b/>` (a single significant space between two elements) and confirm
+`--dump-ast` reports the same tree before and after — the middle child's
+`jsx_text` leaf still reads `" "`, byte for byte.
