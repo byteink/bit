@@ -131,8 +131,11 @@ database of its own with `extend` below.
 ### `extend(ext: string): bool`
 
 Installs an extension, and returns whether it was accepted. Today the only
-extension is a zone database, which `zone` then falls back to.
+extension is a zone database, which `zone` then falls back to. `std/tz` ships
+one, checked in from the IANA database - import it and hand its `data` to
+`extend`:
 
+    import * as tz from "std/tz"
     time.extend(tz.data)
 
 **Host zone files always win.** `extend` is consulted only for a name the host
