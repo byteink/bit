@@ -608,10 +608,10 @@ name a function; `@min` on a `fn` is `E0076`. The grammar above is shared by
 every position, which is why the argument list is a general one; what an
 argument may be is decided per position.
 
-A **class** attribute sits on the compiler-known side. `@json` (§10.5) is the
-only one the language defines, and any other name in that position is
-**E0136** - not an undefined-function error, because nothing here is a function
-call. `@json` takes no arguments; giving it any is **E0137**.
+A **class** attribute sits on the compiler-known side. `@json` and `@table`
+(§10.5) are the only two the language defines, and any other name in that
+position is **E0136** - not an undefined-function error, because nothing here
+is a function call. Neither takes arguments; giving one any is **E0137**.
 
 **The one compiler-known FIELD attribute is `@key`** (§10.5). It is the single
 exception to the rule that a field attribute names a function: `@key("...")`
@@ -959,9 +959,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 
 **`@json` - synthesizing `toJson`.**
 
-- A class declaration may carry the attribute `@json` (§10.3.1). It is the only
-  class attribute the language defines; any other name there is **E0136**, and
-  `@json` with an argument is **E0137**.
+- A class declaration may carry the attribute `@json` (§10.3.1), one of the two
+  class attributes the language defines (`@table`, below, is the other); any
+  other name there is **E0136**, and `@json` with an argument is **E0137**.
 - A class carrying `@json` gains a synthesized member
 
   ```
@@ -1051,6 +1051,64 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
 - Classes are reference types with reference semantics on assignment (§13.3).
+
+**`@table` - synthesizing `tableDescriptor`.**
+
+- A class declaration may carry the attribute `@table` (§10.3.1), the other of
+  the two class attributes the language defines. Like `@json`, it is **opt-in
+  and the mark is the consent**: a class without it has no `tableDescriptor`
+  member at all, proven the only way absence can be proven - by calling it and
+  getting the ordinary undefined-member error.
+- A class carrying `@table` gains a synthesized member
+
+  ```
+  tableDescriptor(): []FieldDesc
+  ```
+
+  returning one `FieldDesc` per field, in declaration order. `FieldDesc` and
+  `AttrDesc` are declared in `std/sql`: `FieldDesc { name: string, typeName:
+  string, attrs: []AttrDesc }` and `AttrDesc { name: string, args: []string }`.
+  The compiler attaches no meaning to any of it - `unique` is a word it
+  copied, and a database concept never appears in this file. What an attribute
+  name means, if anything, is a library's decision (`pkg/orm`), never the
+  compiler's.
+- **Every field's `name` and `typeName` are its own name and declared type,
+  exactly as written** - no case conversion, the same rule `@json`'s key
+  follows.
+- **The CALL/RECORD split.** A field attribute is still sugar for a call,
+  resolved by ordinary name lookup (§10.5) exactly as it is on any other
+  class - `@maxLen(255)` still calls `maxLen(this.bio, 255)` from the
+  synthesized `validateFields()`, unchanged. What is new is what happens when
+  an attribute's name resolves to **no function at all**: on an ordinary class
+  that is still the plain **E0040** the desugared call reports. On a `@table`
+  class it is instead **recorded** in the descriptor's `attrs`, because a
+  marker like `@id` or `@unique` names no function anyone was ever going to
+  write. **The discriminator is resolution and nothing else** - whether the
+  name binds to some function, never a compiler-known list of which names are
+  metadata. A field attribute whose name DOES resolve to a function keeps
+  every one of #3879's own diagnostics (E0133/E0134/E0135) if that function is
+  the wrong shape; this split never widens or narrows those - a validator with
+  a typo'd signature is still a compile error, not a silently recorded
+  attribute. Both a called and a recorded attribute may appear on one field.
+- **A recorded attribute's arguments are constant expressions** (§15.4), the
+  same restriction a called attribute's carry. Each is rendered to its
+  **source spelling** - a string literal's own decoded content, any other
+  literal's raw text unchanged - so `@check("age > 0")` (a name resolving to
+  no function, and so recorded) would carry the argument as the seven-byte
+  string `age > 0`; `pkg/orm` parses that text itself, and this file never
+  interprets it. A non-constant argument is **E0149**, naming the attribute
+  and the field.
+- A class carrying `@table` that also declares `tableDescriptor` itself is
+  **E0148**, naming both - the same rule, and for the same reason, as
+  `toJson` (E0138) and `validateFields` (E0132): letting the hand-written one
+  win silently would make `@table` appear to work while `pkg/orm` never sees a
+  field it does not already know about.
+- The module declaring the class must import `FieldDesc` and `AttrDesc` from
+  `"std/sql"` under those names; the member is written in terms of both.
+  Without them the class is **E0150** and nothing is synthesized - the same
+  rule, for the same reason, `@json`'s **E0142** is.
+- Fields are ordered; that order is the memory layout order, exactly as
+  `@json`'s is.
 
 ### 10.6 Interface Declarations
 

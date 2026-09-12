@@ -1,0 +1,541 @@
+// compiler/classtabledesc.bit — `@table` on a class (SPEC §10.3.1, §10.5, #5051).
+//
+//     @table
+//     class User {
+//       @id id: i64
+//       @unique @index email: string
+//       @maxLen(255) bio: string
+//     }
+//
+// synthesizes `tableDescriptor(): []FieldDesc`, listing every field's name
+// and Bit type exactly as written, plus every attribute the field carries
+// that #3879's ordinary name lookup did NOT resolve to a callable validator.
+// `stdlib/sql/desc.bit`'s `FieldDesc`/`AttrDesc` are the only vocabulary this
+// file knows — it attaches no SQL meaning to any attribute name; `pkg/orm`
+// decides what `@unique` means, not the compiler.
+//
+// THE SPLIT (#3879 owns the other half). A field attribute is still sugar
+// for a call, resolved by ordinary name lookup (SPEC §10.5) — `@maxLen(255)`
+// keeps calling `maxLen(this.bio, 255)` from the synthesized
+// `validateFields()` exactly as it did before this feature existed. What is
+// NEW is what happens when a name resolves to NOTHING: on an ordinary class
+// that is still the plain E0040 the call reports. On a `@table` class it is
+// instead RECORDED in the descriptor, because a marker like `@id` names no
+// function anyone was ever going to write. THE DISCRIMINATOR IS RESOLUTION,
+// checked the same way #3879's own desugared call would resolve it — never a
+// list of attribute names this file or any other knows by heart.
+//
+// WHY THIS RUNS BEFORE ANY CHECKER EXISTS. Like `validateFields` and
+// `toJson`, `tableDescriptor` is spliced into the tree before `resolveProject`
+// ever calls `resolveModule`, so it is resolved, checked, lowered and
+// documented as one the class wrote itself. That means the CALL/RECORD split
+// has to be decided here too, syntactically — by the time a real Checker
+// could answer "does this name resolve", `resolveModule` has already walked
+// the very call site whose existence this file is deciding. `attrNameResolvesToFunc`
+// below answers only EXISTENCE (does the name bind to some free function at
+// all), by reading the same three places ordinary name lookup does: this
+// module's own declarations, its imports, and the prelude. Bit requires an
+// explicit result type on every function, so this needs no type inference —
+// the exact SHAPE ("fallible, yields unit, first parameter takes the field")
+// is unchanged #3879 territory, checked by `vOneFieldAttr` once the name is
+// routed to a call, exactly as it always was.
+
+// E0148 (§10.5): the class already declares the member synthesis would add —
+// the same rule, for the same reason, as `toJson` (E0138) and `validateFields`
+// (E0132).
+const ecTableDescDeclared = 148
+// E0149 (§10.5): a recorded attribute's argument is not a constant. #3879
+// already requires this of a CALLED attribute's arguments; a recorded one
+// carries no less a rule, since `pkg/orm` reads the argument text at compile
+// time and has no expression evaluator of its own.
+const ecTableAttrArgNotConst = 149
+// E0150 (§10.5): the module does not import the two names the synthesized
+// member is written in terms of. Reported INSTEAD of synthesizing, the same
+// shape `@json`'s E0142 (classjson.bit) takes for the identical reason: the
+// user gets one diagnostic naming the import rather than a cascade of
+// undefined-name errors against a signature they never wrote.
+const ecTableImportMissing = 150
+
+// The class attribute this file owns, and the member it synthesizes.
+const classAttrTable = "table"
+const synthTableDescriptorName = "tableDescriptor"
+
+// True iff the class declaration carries `@table`. The parser has already
+// rejected every class attribute but `@json` and `@table`
+// (parserdecl.bit's `checkClassAttrs`), so this only has to match by name —
+// the same reasoning `classHasJson` (classjson.bit) gives for its own mark.
+fn classHasTable(t: Tree, source: string, structDecl: int): bool {
+  let list = classAttrList(t, structDecl)
+  if (list == 0) {
+    return false
+  }
+  for a of kidsOf(t, list) {
+    if (identText(t, source, kidsOf(t, a)[0]) == classAttrTable) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---- resolution (the discriminator, and nothing else) ----------------------
+
+// True iff module `mid` declares a top-level FREE function (no receiver)
+// named `name` — purely syntactic: every function's result type is written
+// out (SPEC requires it), so no type context is needed to know one exists.
+fn moduleHasFreeFunc(tree: Tree, source: string, name: string): bool {
+  for d0 of kidsOf(tree, tree.root) {
+    let d = d0
+    if (d != 0 && getNode(tree, d).tag == Tag.Export) {
+      d = kidsOf(tree, d)[0]
+    }
+    if (d == 0 || getNode(tree, d).tag != Tag.FuncDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d)
+    if (k[0] != 0) {
+      continue // a method, never what a field attribute's call names
+    }
+    if (identText(tree, source, k[1]) == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether `name` binds to SOME free function by the same lookup a field
+// attribute's desugared call ultimately resolves through (SPEC §10.5,
+// §17.5): declared locally, imported by name, or exported by the prelude
+// that auto-imports into every module but itself. Answers existence only —
+// not fallibility, not result shape, not parameter count. Those stay
+// #3879's `vOneFieldAttr` diagnostics (E0133/E0134/E0135), run unchanged on
+// every attribute this sends to `validateFields`. Split across the three
+// places a name can bind (LINT.md complexity 10): local, imported, prelude.
+fn attrNameResolvesToFunc(p: Project, mid: int, name: string): bool {
+  let m = p.mods[mid]
+  if (moduleHasFreeFunc(m.tree, m.source, name)) {
+    return true
+  }
+  if (attrResolvesViaImport(p, mid, name)) {
+    return true
+  }
+  return attrResolvesViaPrelude(p, mid, name)
+}
+
+// `name`, imported into module `mid` by name (following the import to its
+// target module's own top-level declarations).
+fn attrResolvesViaImport(p: Project, mid: int, name: string): bool {
+  let m = p.mods[mid]
+  for d of kidsOf(m.tree, m.tree.root) {
+    if (d == 0 || getNode(m.tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let tid = importedModuleId(p, m, d)
+    if (tid < 0) {
+      continue
+    }
+    if (importBindsFreeFunc(m, p.mods[tid], kidsOf(m.tree, d)[0], name)) {
+      return true
+    }
+  }
+  return false
+}
+
+// The module `d` (an `ImportDecl`) resolves to, or -1 when the loader could
+// not resolve it — already reported by the loader, nothing to add here.
+fn importedModuleId(p: Project, m: SrcModule, d: int): int {
+  let path = stringLitText(m.source, getNode(m.tree, kidsOf(m.tree, d)[1]).span)
+  let (tid, ok) = m.imports[path]
+  if (!ok || tid < 0 || tid >= len(p.mods)) {
+    return -1
+  }
+  return tid
+}
+
+// Whether an `ImportGroup` body binds `name` to a free function `target`
+// declares — following the LOCAL alias back to the exported name
+// (`importItemLocalName`, classjson.bit) before checking `target`.
+fn importBindsFreeFunc(m: SrcModule, target: SrcModule, body: int, name: string): bool {
+  if (getNode(m.tree, body).tag != Tag.ImportGroup) {
+    return false
+  }
+  for item of kidsOf(m.tree, body) {
+    if (importItemLocalName(m.tree, m.source, item) != name) {
+      continue
+    }
+    let orig = identText(m.tree, m.source, kidsOf(m.tree, item)[0])
+    if (moduleHasFreeFunc(target.tree, target.source, orig)) {
+      return true
+    }
+  }
+  return false
+}
+
+// `name`, exported by the prelude that auto-imports into every module but
+// itself (project.bit's own note on `p.prelude`).
+fn attrResolvesViaPrelude(p: Project, mid: int, name: string): bool {
+  if (p.prelude < 0 || p.prelude == mid || p.prelude >= len(p.mods)) {
+    return false
+  }
+  let pm = p.mods[p.prelude]
+  return moduleHasFreeFunc(pm.tree, pm.source, name)
+}
+
+// ---- collection --------------------------------------------------------
+
+// `p`/`mid` bundled so the functions below stay inside LINT.md's max-params
+// (5): every one of them needs both, to resolve an attribute's name AND to
+// report a diagnostic against the right module.
+class AttrResolveCtx {
+  p: Project,
+  mid: int,
+}
+
+// One recorded attribute: the field's own `Tag.Attr` name node, and its
+// argument nodes, already validated as constants.
+class RecordedAttr {
+  nameNode: int,
+  args: []int,
+}
+
+// One `@table` class field: its own name and type nodes, plus the attributes
+// this file records rather than #3879 calling.
+class TableField {
+  nameNode: int,
+  typeNode: int,
+  attrs: []RecordedAttr,
+}
+
+// One class carrying `@table`, or `classNode == 0` when it was rejected.
+class TableClass {
+  classNode: int,
+  className: int,
+  exported: bool,
+  fields: []TableField,
+}
+
+// True iff the module imports both `FieldDesc` and `AttrDesc` from
+// "std/sql" under those exact names — mirrors classjson.bit's
+// `jsonImportBound`, same reasoning: purely syntactic, runs before any
+// Checker exists, and only has to decide whether synthesizing would produce
+// a cascade of undefined-name errors on a signature the user never wrote.
+fn tableImportBound(tree: Tree, source: string): bool {
+  let names = map<string, bool>{}
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d)
+    if (stringLitText(source, getNode(tree, k[1]).span) != "std/sql") {
+      continue
+    }
+    if (getNode(tree, k[0]).tag != Tag.ImportGroup) {
+      continue
+    }
+    for item of kidsOf(tree, k[0]) {
+      names[importItemLocalName(tree, source, item)] = true
+    }
+  }
+  let (_, hasField) = names["FieldDesc"]
+  let (_, hasAttr) = names["AttrDesc"]
+  return hasField && hasAttr
+}
+
+fn reportTableImportMissing(p: Project, tree: Tree, source: string, className: int) {
+  let cname = identText(tree, source, className)
+  report(
+    p.diags, ecTableImportMissing, getNode(tree, className).span,
+    "class '${cname}' carries '@table', but this module does not import 'FieldDesc' and 'AttrDesc'",
+    "add: import { FieldDesc, AttrDesc } from \"std/sql\"",
+  )
+}
+
+// Every class in the module carrying `@table`, in declaration order —
+// dropped, with `ecTableImportMissing`, when the module never imports the
+// vocabulary the synthesized member is written in terms of.
+fn collectTableClasses(p: Project, m: SrcModule, mid: int): []TableClass {
+  let rc = AttrResolveCtx{ p: p, mid: mid }
+  let tree = m.tree
+  let source = m.source
+  let out = []TableClass(0)
+  let hasImport = -1
+  for tc of topClassDecls(tree) {
+    if (!classHasTable(tree, source, tc.decl)) {
+      continue
+    }
+    let built = buildTableClass(rc, tree, source, tc.decl, tc.exported)
+    if (built.classNode == 0) {
+      continue
+    }
+    if (hasImport < 0) {
+      hasImport = 0
+      if (tableImportBound(tree, source)) {
+        hasImport = 1
+      }
+    }
+    if (hasImport == 0) {
+      reportTableImportMissing(p, tree, source, built.className)
+      continue
+    }
+    out = append(out, built)
+  }
+  return out
+}
+
+fn buildTableClass(
+  rc: AttrResolveCtx, tree: Tree, source: string, d: int, exported: bool,
+): TableClass {
+  let k = kidsOf(tree, d)
+  let bad = TableClass{
+    classNode: 0, className: 0, exported: false, fields: []TableField(0),
+  }
+  let own = declaredMember(tree, source, k[2], synthTableDescriptorName)
+  if (own != 0) {
+    let cname = identText(tree, source, k[0])
+    report(
+      rc.p.diags, ecTableDescDeclared, getNode(tree, own).span,
+      "class '${cname}' carries '@table' and also declares 'tableDescriptor', which '@table' synthesizes",
+      "drop '@table', or rename this method — a hand-written 'tableDescriptor' that silently won would make the synthesized one invisible to 'pkg/orm'",
+    )
+    return bad
+  }
+  let fields = []TableField(0)
+  let ok = true
+  for m0 of kidsOf(tree, k[2]) {
+    let f = memberField(tree, m0)
+    if (f == 0) {
+      continue
+    }
+    let (recorded, fieldOk) = collectRecordedAttrs(rc, tree, source, f)
+    if (!fieldOk) {
+      ok = false
+      continue
+    }
+    let fk = kidsOf(tree, f)
+    fields = append(fields, TableField{ nameNode: fk[0], typeNode: fk[1], attrs: recorded })
+  }
+  if (!ok) {
+    return bad
+  }
+  return TableClass{ classNode: d, className: k[0], exported: exported, fields: fields }
+}
+
+// One field's recorded attributes — every non-`@key` attribute whose name
+// does not resolve to a function — and whether they were all well-formed.
+fn collectRecordedAttrs(
+  rc: AttrResolveCtx, tree: Tree, source: string, field: int,
+): ([]RecordedAttr, bool) {
+  let out = []RecordedAttr(0)
+  let ok = true
+  for a of fieldAttrs(tree, field) {
+    let nameNode = kidsOf(tree, a)[0]
+    let name = identText(tree, source, nameNode)
+    if (attrNameResolvesToFunc(rc.p, rc.mid, name)) {
+      continue // #3879 calls this one; unchanged
+    }
+    let (args, argsOk) = tableAttrArgs(rc.p, tree, source, a, name)
+    if (!argsOk) {
+      ok = false
+      continue
+    }
+    out = append(out, RecordedAttr{ nameNode: nameNode, args: args })
+  }
+  return (out, ok)
+}
+
+// A recorded attribute's argument nodes, each required to be a literal
+// constant (SPEC §10.5, §15.4) — the same restriction #3879 already places
+// on a CALLED attribute's arguments, applied here because `pkg/orm` reads
+// the rendered text at compile time rather than evaluating an expression.
+fn tableAttrArgs(
+  p: Project, tree: Tree, source: string, attr: int, name: string,
+): ([]int, bool) {
+  let k = kidsOf(tree, attr)
+  let out = []int(0)
+  let ok = true
+  let i = 1
+  while (i < len(k)) {
+    if (isConstAttrArg(tree, k[i])) {
+      out = append(out, k[i])
+    } else {
+      let sp = getNode(tree, k[i]).span
+      report(
+        p.diags, ecTableAttrArgNotConst, sp,
+        "'@${name}' argument '${source[sp.start:sp.end]}' is not a constant",
+        "a recorded attribute's arguments are constant expressions (SPEC §10.5), rendered to their source spelling for 'pkg/orm' to read",
+      )
+      ok = false
+    }
+    i = i + 1
+  }
+  return (out, ok)
+}
+
+fn isConstAttrArg(tree: Tree, node: int): bool {
+  let tag = getNode(tree, node).tag
+  return tag == Tag.IntLit ||
+    tag == Tag.FloatLit ||
+    tag == Tag.StringLit ||
+    tag == Tag.RawStringLit ||
+    tag == Tag.BoolLit ||
+    tag == Tag.RuneLit
+}
+
+// ---- rendering ---------------------------------------------------------
+
+// An argument's rendered spelling (SPEC §10.5): a string literal's own
+// DECODED content, or any other literal's raw source text unchanged —
+// `@maxLen(255)`'s `255` (not applicable here, since it CALLS) stays the
+// three-character string "255" for a recorded attribute that had one.
+// `pkg/orm` parses this text itself; this file never interprets it.
+fn tableArgSpelling(tree: Tree, source: string, node: int): string {
+  let n = getNode(tree, node)
+  if (n.tag == Tag.StringLit || n.tag == Tag.RawStringLit) {
+    return decodeStringContent(source, n.span.start, n.span.end)
+  }
+  return source[n.span.start:n.span.end]
+}
+
+fn tableFieldNameWord(name: string): string {
+  return "\"" + name + "\""
+}
+
+fn tableTypeNameWord(typeText: string): string {
+  return "\"" + typeText + "\""
+}
+
+fn tableAttrNameWord(name: string): string {
+  return "\"" + name + "\""
+}
+
+// A rendered argument, quoted and escaped for embedding as a Bit string
+// literal — the argument's own text may contain quotes or backslashes
+// (`@collation("it's")`), which `jsonEscapeChars` (compiler/json.bit) escapes
+// the same way Bit's own string-literal grammar requires.
+fn tableArgWord(spelling: string): string {
+  return "\"" + jsonEscapeChars(spelling) + "\""
+}
+
+// Every distinct word `injectTableDescDecls` needs in the module source.
+fn tableDescSynthWords(tree: Tree, source: string, classes: []TableClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  let out = [
+    synthTableDescriptorName, "FieldDesc", "AttrDesc", "name", "typeName", "attrs", "args",
+  ]
+  for c of classes {
+    for f of c.fields {
+      out = append(out, tableFieldNameWord(identText(tree, source, f.nameNode)))
+      let tn = getNode(tree, f.typeNode).span
+      out = append(out, tableTypeNameWord(source[tn.start:tn.end]))
+      for a of f.attrs {
+        out = append(out, tableAttrNameWord(identText(tree, source, a.nameNode)))
+        for argNode of a.args {
+          out = append(out, tableArgWord(tableArgSpelling(tree, source, argNode)))
+        }
+      }
+    }
+  }
+  return out
+}
+
+// ---- building ------------------------------------------------------------
+
+// The tree being mutated, the module's synthesized words, and the span every
+// node built for the CURRENT field is stamped with — mirrors classjsonbuild's
+// `JsonBuild`.
+class TableBuild {
+  tree: Tree,
+  st: SynthText,
+  span: Span,
+}
+
+fn tbNode(b: TableBuild, tag: Tag, kids: []int): int {
+  return addNode(b.tree, tag, b.span, 0, kids)
+}
+
+fn tbIdent(b: TableBuild, word: string): int {
+  return synthIdent(b.tree, b.st, word)
+}
+
+fn tbStrLit(b: TableBuild, word: string): int {
+  return addLeaf(b.tree, Tag.StringLit, synthSpan(b.st, word))
+}
+
+fn tbFieldInit(b: TableBuild, name: string, value: int): int {
+  return tbNode(b, Tag.FieldInit, [tbIdent(b, name), value])
+}
+
+// `AttrDesc{ name: "...", args: [...] }`.
+fn tbAttrDescLit(b: TableBuild, tree: Tree, source: string, a: RecordedAttr): int {
+  let nameWord = tableAttrNameWord(identText(tree, source, a.nameNode))
+  let argExprs = []int(0)
+  for argNode of a.args {
+    let word = tableArgWord(tableArgSpelling(tree, source, argNode))
+    argExprs = append(argExprs, tbStrLit(b, word))
+  }
+  let inits = [
+    tbFieldInit(b, "name", tbStrLit(b, nameWord)),
+    tbFieldInit(b, "args", tbNode(b, Tag.SliceLit, argExprs)),
+  ]
+  return tbNode(b, Tag.CompositeLit, [tbIdent(b, "AttrDesc"), tbNode(b, Tag.FieldInits, inits)])
+}
+
+// `FieldDesc{ name: "...", typeName: "...", attrs: [...] }`.
+fn tbFieldDescLit(b: TableBuild, tree: Tree, source: string, f: TableField): int {
+  b.span = getNode(tree, f.nameNode).span
+  let nameWord = tableFieldNameWord(identText(tree, source, f.nameNode))
+  let tn = getNode(tree, f.typeNode).span
+  let typeWord = tableTypeNameWord(source[tn.start:tn.end])
+  let attrLits = []int(0)
+  for a of f.attrs {
+    attrLits = append(attrLits, tbAttrDescLit(b, tree, source, a))
+  }
+  let inits = [
+    tbFieldInit(b, "name", tbStrLit(b, nameWord)),
+    tbFieldInit(b, "typeName", tbStrLit(b, typeWord)),
+    tbFieldInit(b, "attrs", tbNode(b, Tag.SliceLit, attrLits)),
+  ]
+  return tbNode(b, Tag.CompositeLit, [tbIdent(b, "FieldDesc"), tbNode(b, Tag.FieldInits, inits)])
+}
+
+// `[export] fn (this: C) tableDescriptor(): []FieldDesc { return [...] }` —
+// the identical shape `synthToJson` (classjsonbuild.bit) produces, for the
+// same reason: every pass that discovers a method by walking the arena for a
+// func_decl-with-receiver picks this up with no change of its own.
+fn synthTableDescriptor(tree: Tree, source: string, st: SynthText, tc: TableClass): int {
+  let classSpan = getNode(tree, tc.className).span
+  let b = TableBuild{ tree: tree, st: st, span: classSpan }
+  let items = []int(0)
+  for f of tc.fields {
+    items = append(items, tbFieldDescLit(b, tree, source, f))
+  }
+  b.span = classSpan
+  let stmts = [tbNode(b, Tag.ReturnStmt, [tbNode(b, Tag.SliceLit, items)])]
+  let recv = addNode(
+    tree, Tag.Receiver, classSpan, 0, [0, traitClassTypeRef(tree, tc.className, 0)],
+  )
+  let resultTy = tbNode(b, Tag.SliceType, [tbIdent(b, "FieldDesc")])
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [
+      recv, synthIdent(tree, st, synthTableDescriptorName), 0,
+      addNode(tree, Tag.Params, classSpan, 0, []int(0)), resultTy,
+      addNode(tree, Tag.Block, classSpan, 0, stmts),
+    ],
+  )
+  if (!tc.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+// Every `@table` class's synthesized member, for the caller to attach
+// alongside #3879's and #3976's in one pass.
+fn injectTableDescDecls(tree: Tree, source: string, st: SynthText, classes: []TableClass): []int {
+  let out = []int(0)
+  for tc of classes {
+    out = append(out, synthTableDescriptor(tree, source, st, tc))
+  }
+  return out
+}
