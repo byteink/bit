@@ -149,26 +149,34 @@ print_bucket() {
 run_basic() {
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
-  ocap="$work/oracle.cap"
-  bcap="$work/bit2.cap"
-  match=0 mismatch=0 skip=0 timeout=0 oraclecrash=0 oraclepanic=0 firstbad=""
+  oout="$work/oracle.out"
+  oerr="$work/oracle.err"
+  bout="$work/bit2.out"
+  berr="$work/bit2.err"
+  match=0 mismatch=0 skip=0 timeout=0 oraclecrash=0 oraclepanic=0 exitdiff=0 firstbad="" firstexitdiff=""
   for f in $(find $CORPUS -name '*.bit' | sort); do
-    # Verdict-deciding (#3422): retry-once-on-stall, same as before.
-    alarmrun_retry_cap ORACLE "" "$ocap" "$ORACLE" "$FLAG" "$f"
-    rc=$?
-    case "$(classify_rc "$rc" "$ocap")" in
+    # Verdict-deciding (#3422): retry-once-on-stall, same as before. Stdout
+    # and stderr are captured SEPARATELY (#5037, alarmrun_cap2): a merged
+    # capture made the tree comparison below read a stderr-only diagnostic
+    # (a panic, or #5025's parse diagnostic) as a fabricated divergence in a
+    # dump that is byte-identical on stdout. classify_rc()/is_panic() read
+    # the .err file -- a panic (ABI.md §12) and #5025's diagnostics both
+    # write to fd 2 only, never fd 1.
+    alarmrun_retry_cap2 ORACLE "" "$oout" "$oerr" "$ORACLE" "$FLAG" "$f"
+    orc=$?
+    case "$(classify_rc "$orc" "$oerr")" in
       timeout)
         echo "$LABEL: ORACLE timed out after ${TIMEOUT}s on $f" >&2
         timeout=$((timeout + 1))
         continue
         ;;
       crash)
-        echo "$LABEL: ORACLE $(whydied "$rc") on $f" >&2
+        echo "$LABEL: ORACLE $(whydied "$orc") on $f" >&2
         oraclecrash=$((oraclecrash + 1))
         continue
         ;;
       panic)
-        echo "$LABEL: ORACLE PANICKED ($(head -n 1 "$ocap")) on $f" >&2
+        echo "$LABEL: ORACLE PANICKED ($(head -n 1 "$oerr")) on $f" >&2
         oraclepanic=$((oraclepanic + 1))
         continue
         ;;
@@ -179,28 +187,39 @@ run_basic() {
         fi
         ;;
     esac
-    seed=$(cat "$ocap")
+    seed=$(cat "$oout")
 
-    alarmrun_retry_cap BIT2 "" "$bcap" "$BIT2" "$FLAG" "$f"
-    rc=$?
-    case "$(classify_rc "$rc" "$bcap")" in
+    alarmrun_retry_cap2 BIT2 "" "$bout" "$berr" "$BIT2" "$FLAG" "$f"
+    brc=$?
+    case "$(classify_rc "$brc" "$berr")" in
       timeout)
         echo "$LABEL: BIT2 timed out after ${TIMEOUT}s on $f" >&2
         timeout=$((timeout + 1))
         continue
         ;;
       crash)
-        echo "$LABEL: BIT2 $(whydied "$rc") on $f" >&2
+        echo "$LABEL: BIT2 $(whydied "$brc") on $f" >&2
         timeout=$((timeout + 1))
         continue
         ;;
       panic)
-        echo "$LABEL: BIT2 PANICKED ($(head -n 1 "$bcap")) on $f" >&2
+        echo "$LABEL: BIT2 PANICKED ($(head -n 1 "$berr")) on $f" >&2
         timeout=$((timeout + 1))
         continue
         ;;
     esac
-    b2=$(cat "$bcap")
+    b2=$(cat "$bout")
+
+    # A differing exit status is its OWN row (#5037), never folded into
+    # MISMATCH: #5025 made BIT2 exit 1 with a stderr diagnostic on files the
+    # oracle still exits 0 on, while the dumped tree on stdout is unchanged.
+    # That is a deliberate exit-status change, not a tree divergence -- the
+    # `seed`/`b2` compare two lines below is still the one that can fail this
+    # gate for a REAL divergence on the same file.
+    if [ "$orc" -ne "$brc" ]; then
+      exitdiff=$((exitdiff + 1))
+      [ -z "$firstexitdiff" ] && firstexitdiff="$f"
+    fi
 
     if [ "$seed" = "$b2" ]; then
       match=$((match + 1))
@@ -211,9 +230,18 @@ run_basic() {
   done
 
   if [ -n "$SKIPLABEL" ]; then
-    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch SKIP($SKIPLABEL)=$skip TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXITDIFF=$exitdiff SKIP($SKIPLABEL)=$skip TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
   else
-    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXITDIFF=$exitdiff TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
+  fi
+
+  # Informational only, never fails the gate (unaffected by diffexit below):
+  # the dumped tree for each of these files was still compared above by
+  # `seed`/`b2`, on its own merits, and any real divergence among them
+  # already landed in MISMATCH.
+  if [ "$exitdiff" -gt 0 ]; then
+    echo
+    echo "EXITDIFF: $exitdiff file(s) where BIT2's exit status differs from the pinned stage0's (first: $firstexitdiff) -- tree still compared above, not itself a mismatch."
   fi
 
   # A phase that measured nothing must not pass (#1516). On an empty or unfindable

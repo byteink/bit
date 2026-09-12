@@ -134,3 +134,38 @@ alarmrun_retry_cap() {
   fi
   return "$rc"
 }
+
+# alarmrun_cap2 <out> <err> <cmd...> -- alarmrun_cap's sibling for a caller
+# that needs the child's stdout and stderr KEPT APART (#5037), not merged.
+# alarmrun_cap merges both into one file so a diagnostic on stderr (a panic,
+# or #5025's parse-diagnostic line) can be told apart from a clean success,
+# but that same merge makes stdout unusable on its own for a byte-for-byte
+# tree comparison: a call that still writes the identical dump to stdout
+# while ALSO writing a new line to stderr reads as a fabricated divergence.
+# Two redirects on the same perl invocation, for the same fd-2-never-rebound
+# reason alarmrun_cap's own comment gives.
+alarmrun_cap2() {
+  local out=$1 err=$2
+  shift 2
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$@" >"$out" 2>"$err"
+}
+
+# alarmrun_retry_cap2 <side> <outfile> <out> <err> <cmd...> --
+# alarmrun_retry_cap's separate-stream sibling, same retry-once-on-stall
+# contract and the same <outfile> meaning. <out>/<err> are each truncated by
+# the `>`/`2>` redirects on every attempt, exactly as <cap> is in
+# alarmrun_cap.
+alarmrun_retry_cap2() {
+  local side=$1 outfile=$2 out=$3 err=$4 rc
+  shift 4
+  [ -n "$outfile" ] && rm -f "$outfile"
+  alarmrun_cap2 "$out" "$err" "$@"
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "$side build stalled once (SIGALRM after ${TIMEOUT}s), retrying: $*" >&9
+    [ -n "$outfile" ] && rm -f "$outfile"
+    alarmrun_cap2 "$out" "$err" "$@"
+    rc=$?
+  fi
+  return "$rc"
+}
