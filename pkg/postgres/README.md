@@ -9,7 +9,7 @@ Install with `bit add bitlang.org/pkg/postgres@v0.1.0`.
 
 ```bit
 import { pool, Datasource, Value } from "std/sql"
-import { adapter } from "bitlang.org/pkg/postgres"
+import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn run(): ()! {

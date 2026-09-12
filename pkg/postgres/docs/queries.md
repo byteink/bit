@@ -34,7 +34,7 @@ statement, which the server discards at the next Parse:
 
 ```bit
 import { pool, Datasource } from "std/sql"
-import { adapter } from "bitlang.org/pkg/postgres"
+import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn openDefault(): ()! {
@@ -50,7 +50,7 @@ silently stops happening. Opt in when you know neither is in front of you:
 
 ```bit
 import { pool, Datasource } from "std/sql"
-import { adapter } from "bitlang.org/pkg/postgres"
+import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn openCached(): ()! {

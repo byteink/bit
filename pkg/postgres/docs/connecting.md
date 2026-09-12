@@ -13,7 +13,7 @@ A first query, through `std/sql`'s pool:
 
 ```bit
 import { pool, Datasource, Value } from "std/sql"
-import { adapter } from "bitlang.org/pkg/postgres"
+import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn run(): ()! {
