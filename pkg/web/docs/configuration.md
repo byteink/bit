@@ -6,7 +6,7 @@ environment variable itself - an app that wants `APP_SECRET` reads it and
 puts the result here.
 
 ```bit
-import { App, Config, MemoryStore } from "bitlang.org/pkg/web"
+import { App, Config, MemoryStore } from "web"
 import { env } from "std/os"
 
 fn build(): App {

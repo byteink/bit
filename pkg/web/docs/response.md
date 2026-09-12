@@ -7,7 +7,7 @@ that keeps a `Node` tree safe to render.
 ## Building a Res
 
 ```bit
-import { Ctx, Res } from "bitlang.org/pkg/web"
+import { Ctx, Res } from "web"
 
 fn showUser(c: Ctx): Res! {
   return c.text("ok").status(200).header("X-Request-Id", "abc-123")
@@ -32,7 +32,7 @@ appears among the other attributes; everything else becomes the body, in the
 order it appears among the other children.
 
 ```bit
-import { Ctx, Res, Node, div, a, text } from "bitlang.org/pkg/web"
+import { Ctx, Res, Node, div, a, text } from "web"
 
 fn page(c: Ctx): Res! {
   let body = div(
@@ -57,7 +57,7 @@ unconditionally by `render` itself, since there is no `attr()` wrapper to do
 it at construction time.
 
 ```bit
-import { text, raw, safeUrl, js } from "bitlang.org/pkg/web"
+import { text, raw, safeUrl, js } from "web"
 
 fn demo(): ()! {
   let escaped = text("<script>alert(1)</script>")

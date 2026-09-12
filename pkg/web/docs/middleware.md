@@ -9,7 +9,7 @@ returns to run code on the way out, or never call it and return your own
 ## Writing one
 
 ```bit
-import { Ctx, Res, Middleware, Next } from "bitlang.org/pkg/web"
+import { Ctx, Res, Middleware, Next } from "web"
 
 fn requestId(): Middleware {
   return (c: Ctx, next: Next) => {
@@ -35,7 +35,7 @@ route is on no group. Mount on the app when you want the middleware to see
 misses.
 
 ```bit
-import { App, Ctx, Res } from "bitlang.org/pkg/web"
+import { App, Ctx, Res } from "web"
 
 fn logMiss(c: Ctx): Res! {
   return c.text("miss")

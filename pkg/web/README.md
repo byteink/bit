@@ -21,7 +21,7 @@ Versioning, tags and the release procedure for every first-party package are in
 ## A minimal server
 
 ```bit
-import { App, Config } from "bitlang.org/pkg/web"
+import { App, Config } from "web"
 import { env } from "std/os"
 
 fn main(): ()! {

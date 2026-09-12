@@ -16,7 +16,7 @@ development, tests, and a single-process service content to log everyone out
 on restart - it is never the default, it is one line at the call site.
 
 ```bit
-import { App, Config, MemoryStore } from "bitlang.org/pkg/web"
+import { App, Config, MemoryStore } from "web"
 import { env } from "std/os"
 
 fn build(): App {
@@ -42,7 +42,7 @@ calling `c.csrfToken()` wants a rate limit in front of it, ideally alongside
 `csrf()`:
 
 ```bit
-import { App, Limit, MemoryCounter, byIp, rateLimit, csrf } from "bitlang.org/pkg/web"
+import { App, Limit, MemoryCounter, byIp, rateLimit, csrf } from "web"
 
 fn mount(app: App) {
   let pages = app.group("/")
@@ -64,7 +64,7 @@ left behind is the shape of every CORS incident in the wild. An origin is
 allowed when it is byte-for-byte one of the strings the app wrote down.
 
 ```bit
-import { App, Cors, cors } from "bitlang.org/pkg/web"
+import { App, Cors, cors } from "web"
 
 fn mount(app: App) {
   app.use(cors(Cors{
@@ -94,7 +94,7 @@ in a proxy is the only party that knows), and is what turns on
 `Strict-Transport-Security`.
 
 ```bit
-import { App, Headers, secureHeaders } from "bitlang.org/pkg/web"
+import { App, Headers, secureHeaders } from "web"
 
 fn mount(app: App) {
   app.use(secureHeaders(Headers{ https: true }))

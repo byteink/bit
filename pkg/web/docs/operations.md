@@ -7,7 +7,7 @@ production rather than what it answers.
 ## Rate limiting
 
 ```bit
-import { App, Limit, MemoryCounter, byIp, rateLimit } from "bitlang.org/pkg/web"
+import { App, Limit, MemoryCounter, byIp, rateLimit } from "web"
 
 fn mount(app: App) {
   let counter = MemoryCounter(10_000)
@@ -66,7 +66,7 @@ on one store.
 ## Static files
 
 ```bit
-import { App, static } from "bitlang.org/pkg/web"
+import { App, static } from "web"
 
 fn mount(app: App) {
   app.use(static("/assets", "./public"))
@@ -103,7 +103,7 @@ status whether the handler returns, fails, or panics. It takes the `Tracer`
 explicitly - `std/trace` ships no hidden default.
 
 ```bit
-import { App, tracing } from "bitlang.org/pkg/web"
+import { App, tracing } from "web"
 import { newTracer } from "std/trace"
 
 fn mount(app: App) {
@@ -121,7 +121,7 @@ logged and mapped exactly like an ordinary failure (see
 after it:
 
 ```bit
-import { App, recover, logger } from "bitlang.org/pkg/web"
+import { App, recover, logger } from "web"
 
 fn mount(app: App) {
   app.use(recover())

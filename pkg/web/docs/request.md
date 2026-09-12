@@ -27,7 +27,7 @@ itself returns.
 ## Route params, query and headers
 
 ```bit
-import { Ctx, Res } from "bitlang.org/pkg/web"
+import { Ctx, Res } from "web"
 
 fn showUser(c: Ctx): Res! {
   let id = c.param("id")
@@ -50,7 +50,7 @@ the handler looks wrong. So declare a type for the input, carrying only the
 fields a client is allowed to set, and map across explicitly:
 
 ```bit
-import { Ctx, Res } from "bitlang.org/pkg/web"
+import { Ctx, Res } from "web"
 import { Json, JsonEntry } from "std/json"
 
 @json class NewUser {
@@ -128,7 +128,7 @@ Rules go on the field as attributes, which are ordinary function calls
 `validate()` method for cross-field rules no per-field attribute can express:
 
 ```bit
-import { Ctx, Res, minLen, maxLen, email, unprocessable } from "bitlang.org/pkg/web"
+import { Ctx, Res, minLen, maxLen, email, unprocessable } from "web"
 import { Json, JsonEntry } from "std/json"
 
 @json class Signup {
@@ -166,7 +166,7 @@ characters), `@min(n)`/`@max(n)` (`i64` range), `@email`, `@url`, `@uuid`, and
 is an attribute:
 
 ```bit
-import { unprocessable } from "bitlang.org/pkg/web"
+import { unprocessable } from "web"
 import { Json, JsonEntry } from "std/json"
 
 export fn iban(v: string): ()! {

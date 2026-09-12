@@ -21,7 +21,7 @@ This chapter is the shortest path from `bit add` to a response.
 environment - the framework never reads an environment variable itself.
 
 ```bit
-import { App, Config } from "bitlang.org/pkg/web"
+import { App, Config } from "web"
 import { env } from "std/os"
 
 fn main(): ()! {
@@ -45,7 +45,7 @@ returns a `Response` in process, with nothing bound. It is the seam a test
 calls instead of standing up a server:
 
 ```bit
-import { App, Config, Ctx, Res } from "bitlang.org/pkg/web"
+import { App, Config, Ctx, Res } from "web"
 
 fn home(c: Ctx): Res! {
   return c.text("hello, bit")
@@ -66,7 +66,7 @@ on it to prefix a whole feature's routes at once, and see
 see.
 
 ```bit
-import { App, Ctx, Res } from "bitlang.org/pkg/web"
+import { App, Ctx, Res } from "web"
 
 fn listUsers(c: Ctx): Res! {
   return c.text("users")

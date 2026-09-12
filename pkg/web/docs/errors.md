@@ -7,7 +7,7 @@ decision that shows up in a diff - not a config flag, not a registry entry.
 ## Failing with a status
 
 ```bit
-import { Ctx, Res, notFound, badRequest, unprocessable } from "bitlang.org/pkg/web"
+import { Ctx, Res, notFound, badRequest, unprocessable } from "web"
 
 fn showUser(c: Ctx): Res! {
   fail notFound("no user with that id")
@@ -37,7 +37,7 @@ mapping for a scope. The handler never sees a failure that did not satisfy
 decides the body while the framework still owns the status:
 
 ```bit
-import { App, Ctx, Res, HttpError } from "bitlang.org/pkg/web"
+import { App, Ctx, Res, HttpError } from "web"
 
 fn renderError(c: Ctx, e: HttpError): Res {
   return c.text(e.message()).status(e.status())

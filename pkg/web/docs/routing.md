@@ -14,7 +14,7 @@ static, then param, then wildcard - decided at match time, never by
 registration order.
 
 ```bit
-import { App, Ctx, Res } from "bitlang.org/pkg/web"
+import { App, Ctx, Res } from "web"
 
 fn showUser(c: Ctx): Res! {
   return c.text("user ${c.param("id")}")
@@ -50,7 +50,7 @@ what would have worked.
 without hand-concatenating the path:
 
 ```bit
-import { App, Ctx, Res } from "bitlang.org/pkg/web"
+import { App, Ctx, Res } from "web"
 
 fn showUser(c: Ctx): Res! {
   return c.text("user ${c.param("id")}")
