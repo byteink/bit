@@ -1093,15 +1093,20 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - **A recorded attribute's arguments are constant expressions** (§15.4), the
   same restriction a called attribute's carry. Each is rendered to its
   **source spelling** - a string literal's own decoded content, any other
-  literal's raw text unchanged - so `@maxLen(255)`'s `255` would read as the
-  three-character string `"255"` were it ever recorded; `pkg/orm` parses that
-  text itself, and this file never interprets it. A non-constant argument is
-  **E0149**, naming the attribute and the field.
+  literal's raw text unchanged - so `@check("age > 0")` (a name resolving to
+  no function, and so recorded) would carry the argument as the seven-byte
+  string `age > 0`; `pkg/orm` parses that text itself, and this file never
+  interprets it. A non-constant argument is **E0149**, naming the attribute
+  and the field.
 - A class carrying `@table` that also declares `tableDescriptor` itself is
   **E0148**, naming both - the same rule, and for the same reason, as
   `toJson` (E0138) and `validateFields` (E0132): letting the hand-written one
   win silently would make `@table` appear to work while `pkg/orm` never sees a
   field it does not already know about.
+- The module declaring the class must import `FieldDesc` and `AttrDesc` from
+  `"std/sql"` under those names; the member is written in terms of both.
+  Without them the class is **E0150** and nothing is synthesized - the same
+  rule, for the same reason, `@json`'s **E0142** is.
 - Fields are ordered; that order is the memory layout order, exactly as
   `@json`'s is.
 
