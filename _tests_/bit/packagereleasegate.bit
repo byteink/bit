@@ -1,0 +1,526 @@
+// `./make test-package-release-drift` (#5129, closing the general hole
+// #5126 found): every `pkg/` package must import only `std/` modules AND
+// symbols the newest RELEASED compiler actually ships, not whatever this
+// tree's own `bit-out/bin/bit` happens to build today.
+//
+// THE INCIDENT THIS CLOSES. `web/v0.2.0` was tagged and published importing
+// `std/runtime` (no such module in `v0.14.0`) and `readFileNoFollow`/
+// `parseDateTime` (not exported by `v0.14.0`), and every gate was green —
+// `test-package-web` (`_tests_/bit/packagesgate.bit`) builds with
+// `BIT_BIN=bit-out/bin/bit`, THIS tree's compiler, so a package that has
+// drifted ahead of the last release is invisible to it. This gate is the
+// missing half: it never builds anything, it reads what the last release
+// actually shipped, straight from git.
+//
+// WHY GIT, NOT A SECOND COMPILER. The obvious "build against the release"
+// instrument is a trap. `bit-out/stage0/bit-oracle` IS the pinned last
+// release binary, but `scripts/stage0.sh`'s own header (its "WHY IT
+// REFUSES" section, and `emit_wrapper`) says outright that the wrapper it
+// produces points that binary at the WORKING TREE's `stdlib/` — it exists
+// so gates can ask "does this version's COMPILER behave differently",
+// never "does this version's STDLIB have this symbol". Run through that
+// wrapper, `std/runtime` resolves fine (it is right there in the tree) and
+// this exact bug reads green — an instrument that fails in the same
+// direction as the defect it exists to catch. `scripts/stage0.sh
+// --stdlib-root` is the one consumer that wants the release's OWN stdlib
+// copy (`_tests_/bit/releasesurface`), and even that still needs the
+// tarball machinery, a network fetch on a cold cache, and this tree's
+// compiler to read it. None of that is needed here: the newest `v0.*` git
+// tag already names an immutable commit, and `git archive <tag> --
+// stdlib | tar -x` materializes that release's stdlib SOURCE straight from
+// the object store in one subprocess, no build, no second toolchain, no
+// host path (`/opt/homebrew/bin/bit` or any other locally installed `bit`
+// would depend on what this one Mac happens to have).
+//
+// WHAT "EXPORTED" MEANS HERE. Every `std/` module in this repo exports
+// only five top-level forms: `export class`, `export const`, `export enum`,
+// `export fn`, `export interface` (verified: `grep -rhn '^export '
+// stdlib/ | ...` finds no other keyword and no `export { ... }`
+// re-export block anywhere). So "is `X` exported by `std/mod` at tag T" is
+// answered by a plain text scan of that module's `.bit` files extracted at
+// T for a line starting `export <keyword> X` — no parser, no `bit doc`.
+//
+// WHAT COUNTS AS A `pkg/` IMPORT. The named-list form, one production this
+// repo's imports ever use for a stdlib module:
+//
+//     import { readFileNoFollow as staticReadFile, lstat, FileInfo } from "std/fs"
+//
+// possibly split across lines (`pkg/web/body.bit`'s `std/json` import is
+// four lines). The name checked is the one BEFORE `as`, since that is the
+// export the compiler must actually resolve; the alias is a local rename.
+//
+// THIS GATE IS SUPPOSED TO BE RED RIGHT NOW. `pkg/web` imports `std/runtime`
+// and `std/trace`, and uses `readFileNoFollow`/`parseDateTime`, none of
+// which `v0.14.0` has. It goes green the day compiler 0.15.0 ships (#5126).
+// Weakening this check to make main green defeats the reason it exists.
+//
+// NO RELEASE TAG. A checkout before the first `v0.*` tag is a valid state —
+// PASS, the same "reddening on correctly-shaped empty input is worse than
+// never having run" convention `_tests_/bit/packagesgate.bit`'s header uses
+// for zero packages.
+//
+// Registered in `tools/build/defs.bit`'s `coreSteps()`, beside
+// `test-packages`, NOT `gateSteps()` — this is a release-drift check, not a
+// per-edit correctness gate, and must never grow the mandatory `./make
+// test` suite (`_tests_/bit/packagesgate.bit`'s header explains the same
+// exclusion for the sibling gate this one stands next to).
+//
+// Configure by environment, since `bit run` forwards no argv:
+//
+//     BIT_REPO                          repo root                (REQUIRED)
+//     BIT_TEST_TIMEOUT_S                 deadline for git/tar, seconds (default 120, max 3600)
+//     BIT_PACKAGERELEASEGATE_SCAN_DIR    scan this directory for `import`
+//                                        statements instead of `${BIT_REPO}/pkg`
+//                                        — exists so the "reads the tag, not
+//                                        hardcoded" mutation proof can point the
+//                                        scan at a throwaway fixture without
+//                                        touching real `pkg/` sources.
+
+import { isDir, mkdir, readFile, walk, writeFile } from "std/fs"
+import { env, envOr, exit } from "std/os"
+import { hasPrefix, hasSuffix, split, parseInt, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+const maxImportBlockLines: int = 20
+const defaultTimeoutS: int = 120
+const maxTimeoutS: int = 3600
+
+// std/strings exports no trimSuffix; _tests_/bit/releasesurface/releasesurface.bit
+// carries the same small local helper for the same reason.
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[0:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("packagereleasegate: BIT_REPO is not set — run this through `./make test-package-release-drift`")
+  }
+  return r
+}
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  if (s > maxTimeoutS) {
+    return maxTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+fn scanRoot(repo: string): string {
+  let override = envOr("BIT_PACKAGERELEASEGATE_SCAN_DIR", "")
+  if (len(override) > 0) {
+    return override
+  }
+  return "${repo}/pkg"
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel, never a program's exit status
+// (ABI.md §19).
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("packagereleasegate: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("packagereleasegate: TIMED OUT after ${ms}ms running git — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("packagereleasegate: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("packagereleasegate: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn makeScratch(ms: int): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-packagereleasegate-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("packagereleasegate: cannot create ${scratch}: ${e.message()}")
+  }
+  return scratch
+}
+
+// std/fs has no recursive remove; the scratch tree goes the way it came —
+// same convention as _tests_/bit/releasesurface/releasesurface.bit's `teardown`.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ {
+    return
+  }
+}
+
+// The first line of `git tag -l 'v0.*' --sort=-v:refname` — version order,
+// not creation order, so a retagged/backfilled release still sorts by what
+// it actually names. "" means no `v0.*` tag is reachable at all.
+fn resolveNewestTag(repo: string, scratch: string, ms: int): string {
+  let log = "${scratch}/tags.log"
+  let script = "#!/bin/sh\n" +
+    "exec >'${log}' 2>&1\n" +
+    "git -C '${repo}' tag -l 'v0.*' --sort=-v:refname\n"
+  let code = shell("${scratch}/tags.sh", script, ms) catch e {
+    panic("packagereleasegate: ${e.message()}")
+  }
+  if (code != 0) {
+    panic("packagereleasegate: git tag -l failed (exit ${code}); see ${log}")
+  }
+  let text = readFile(log) catch e {
+    panic("packagereleasegate: cannot read ${log}: ${e.message()}")
+  }
+  let lines = split(trimSpace(text), "\n")
+  if (len(lines) == 0) {
+    return ""
+  }
+  return trimSpace(lines[0])
+}
+
+// Materializes `stdlib/` exactly as it existed at `tag`, via `git archive`
+// straight from the object store — no working-tree checkout, no build.
+// Returns the path to the extracted `stdlib/` directory.
+fn extractStdlibAtTag(repo: string, tag: string, scratch: string, ms: int): string {
+  let atTag = "${scratch}/at-tag"
+  let tar = "${scratch}/stdlib.tar"
+  let log = "${scratch}/archive.log"
+  let script = "#!/bin/sh\n" +
+    "exec >'${log}' 2>&1\n" +
+    "git -C '${repo}' archive '${tag}' -- stdlib > '${tar}' || exit 91\n" +
+    "mkdir -p '${atTag}' || exit 92\n" +
+    "tar -xf '${tar}' -C '${atTag}' || exit 93\n"
+  let code = shell("${scratch}/archive.sh", script, ms) catch e {
+    panic("packagereleasegate: ${e.message()}")
+  }
+  if (code != 0) {
+    let text = readFile(log) catch _ {
+      ""
+    }
+    panic("packagereleasegate: cannot extract stdlib at ${tag} (exit ${code}): ${text}")
+  }
+  let stdlibDir = "${atTag}/stdlib"
+  if (!isDir(stdlibDir)) {
+    panic("packagereleasegate: ${stdlibDir} missing after extracting ${tag} — git archive produced no stdlib/")
+  }
+  return stdlibDir
+}
+
+// One `std/<mod>` symbol used from one `pkg/` source line.
+class ImportUse {
+  file: string,
+  line: int,
+  mod: string,
+  symbol: string,
+}
+
+fn isIdentChar(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// Length of the identifier run starting at `start`; 0 if `s[start]` is not
+// an identifier character (or `start` is out of range).
+fn identLen(s: string, start: int): int {
+  let i = start
+  while (i < len(s) && isIdentChar(s[i])) {
+    i = i + 1
+  }
+  return i - start
+}
+
+// The first index of `sub` in `s` at or after 0, or -1. Hand-rolled rather
+// than std/strings' `indexOf` (which returns `i64`) to keep every index in
+// this file plain `int`, matching _tests_/bit/releasesurface/releasesurface.bit's
+// own `cutAtGenerics`.
+fn find(s: string, sub: string): int {
+  let n = len(s)
+  let m = len(sub)
+  if (m == 0) {
+    return 0
+  }
+  let i = 0
+  while (i + m <= n) {
+    if (s[i:i + m] == sub) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+fn relTo(root: string, full: string): string {
+  let prefix = "${root}/"
+  if (hasPrefix(full, prefix)) {
+    return full[len(prefix):]
+  }
+  return full
+}
+
+fn containsStr(list: []string, s: string): bool {
+  for item of list {
+    if (item == s) {
+      return true
+    }
+  }
+  return false
+}
+
+fn isImportStart(line: string): bool {
+  return hasPrefix(trimSpace(line), "import {")
+}
+
+// Accumulates `lines[start..]` until the joined text contains `from "`, or
+// `maxImportBlockLines` lines have been consumed — an import statement that
+// never closes within that bound is malformed and the caller skips it.
+// Returns the joined text and the index of the last line consumed.
+fn accumulateImportBlock(lines: []string, start: int): (string, int) {
+  let n = len(lines)
+  let combined = lines[start]
+  let j = start
+  let limit = start + maxImportBlockLines
+  if (limit >= n) {
+    limit = n - 1
+  }
+  while (find(combined, "from \"") < 0 && j < limit) {
+    j = j + 1
+    combined = combined + "\n" + lines[j]
+  }
+  return combined, j
+}
+
+// The string between `from "` and the next `"` in an accumulated import
+// block. `ok` is false if the block never closed its `from "..."`.
+fn extractModule(combined: string): (string, bool) {
+  let fromIdx = find(combined, "from \"")
+  if (fromIdx < 0) {
+    return "", false
+  }
+  let after = combined[fromIdx + 6:len(combined)]
+  let endQuote = find(after, "\"")
+  if (endQuote < 0) {
+    return "", false
+  }
+  return after[0:endQuote], true
+}
+
+// Raw, untrimmed name tokens between the import block's first `{` and its
+// matching `}` — `import { a, b as c, ... } from "..."`. Empty if the block
+// has no brace pair.
+fn extractNames(combined: string): []string {
+  let openB = find(combined, "{")
+  if (openB < 0) {
+    return []string(0)
+  }
+  let rest = combined[openB + 1:len(combined)]
+  let closeB = find(rest, "}")
+  if (closeB < 0) {
+    return []string(0)
+  }
+  return split(rest[0:closeB], ",")
+}
+
+// The name before an optional ` as `: the export the compiler must actually
+// resolve, never the local alias.
+fn baseName(raw: string): string {
+  let name = trimSpace(raw)
+  let asAt = find(name, " as ")
+  if (asAt >= 0) {
+    return trimSpace(name[0:asAt])
+  }
+  return name
+}
+
+fn parseImportsInFile(relPath: string, text: string): []ImportUse {
+  let out = []ImportUse(0)
+  let lines = split(text, "\n")
+  let n = len(lines)
+  let i = 0
+  while (i < n) {
+    if (!isImportStart(lines[i])) {
+      i = i + 1
+      continue
+    }
+    let startLine = i + 1
+    let (combined, lastIdx) = accumulateImportBlock(lines, i)
+    let (modPath, modOk) = extractModule(combined)
+    if (modOk && hasPrefix(modPath, "std/")) {
+      let modName = modPath[4:len(modPath)]
+      for raw of extractNames(combined) {
+        let sym = baseName(raw)
+        if (len(sym) > 0) {
+          out = append(out, ImportUse{ file: relPath, line: startLine, mod: modName, symbol: sym })
+        }
+      }
+    }
+    i = lastIdx + 1
+  }
+  return out
+}
+
+// Every `std/` import used anywhere under `root`, relative paths reported
+// against `repo` (so a scan of the real `${repo}/pkg` reports
+// `pkg/web/recover.bit:15`, matching the ticket's own citation form).
+fn collectImports(repo: string, root: string): []ImportUse {
+  let files = walk(root) catch e {
+    panic("packagereleasegate: cannot walk ${root}: ${e.message()}")
+  }
+  let out = []ImportUse(0)
+  for f of files {
+    if (!hasSuffix(f, ".bit")) {
+      continue
+    }
+    let text = readFile(f) catch e {
+      panic("packagereleasegate: cannot read ${f}: ${e.message()}")
+    }
+    let rel = relTo(repo, f)
+    for u of parseImportsInFile(rel, text) {
+      out = append(out, u)
+    }
+  }
+  return out
+}
+
+fn uniqueModules(imports: []ImportUse): []string {
+  let out = []string(0)
+  for u of imports {
+    if (!containsStr(out, u.mod)) {
+      out = append(out, u.mod)
+    }
+  }
+  return out
+}
+
+// The top-level `export class|const|enum|fn|interface NAME` names across
+// every `.bit` file directly or indirectly under `dir` — the only five
+// export forms any `stdlib/` module uses (verified against the whole tree;
+// there is no `export { ... }` re-export block anywhere in it).
+fn exportedSymbols(dir: string): []string {
+  let files = walk(dir) catch e {
+    panic("packagereleasegate: cannot walk ${dir}: ${e.message()}")
+  }
+  let out = []string(0)
+  for f of files {
+    if (!hasSuffix(f, ".bit")) {
+      continue
+    }
+    let text = readFile(f) catch e {
+      panic("packagereleasegate: cannot read ${f}: ${e.message()}")
+    }
+    for line of split(text, "\n") {
+      let t = trimSpace(line)
+      if (!hasPrefix(t, "export ")) {
+        continue
+      }
+      let rest = t[7:len(t)]
+      let kwLen = identLen(rest, 0)
+      if (kwLen == 0) {
+        continue
+      }
+      let afterKw = trimSpace(rest[kwLen:len(rest)])
+      let nameLen = identLen(afterKw, 0)
+      if (nameLen == 0) {
+        continue
+      }
+      out = append(out, afterKw[0:nameLen])
+    }
+  }
+  return out
+}
+
+// Whether `std/<mod>` exists at the tag, and — if it does — everything it
+// exports.
+class ModuleInfo {
+  name: string,
+  present: bool,
+  symbols: []string,
+}
+
+fn loadModules(stdlibAtTag: string, names: []string): []ModuleInfo {
+  let out = []ModuleInfo(0)
+  for name of names {
+    let dir = "${stdlibAtTag}/${name}"
+    if (!isDir(dir)) {
+      out = append(out, ModuleInfo{ name: name, present: false, symbols: []string(0) })
+      continue
+    }
+    out = append(out, ModuleInfo{ name: name, present: true, symbols: exportedSymbols(dir) })
+  }
+  return out
+}
+
+fn moduleFor(mods: []ModuleInfo, name: string): ModuleInfo {
+  for m of mods {
+    if (m.name == name) {
+      return m
+    }
+  }
+  panic("packagereleasegate: internal error — no preloaded ModuleInfo for '${name}'")
+}
+
+// Every import that the tag does not satisfy, one line per (file, line,
+// module, symbol) — never collapsed into a count, per #5129's own
+// constraint: an aggregate is exactly what let web/v0.2.0's break through
+// unnoticed.
+fn checkImports(imports: []ImportUse, mods: []ModuleInfo, tag: string): []string {
+  let out = []string(0)
+  for u of imports {
+    let mi = moduleFor(mods, u.mod)
+    if (!mi.present) {
+      out = append(
+        out,
+        "${u.file}:${u.line} std/${u.mod} ${u.symbol} — module std/${u.mod} does not exist at ${tag}",
+      )
+      continue
+    }
+    if (!containsStr(mi.symbols, u.symbol)) {
+      out = append(
+        out,
+        "${u.file}:${u.line} std/${u.mod} ${u.symbol} — not exported by std/${u.mod} at ${tag}",
+      )
+    }
+  }
+  return out
+}
+
+fn main() {
+  let repo = repoRoot()
+  let ms = timeoutMs()
+  let scratch = makeScratch(ms)
+
+  let tag = resolveNewestTag(repo, scratch, ms)
+  if (len(tag) == 0) {
+    teardown(scratch, ms)
+    println("PASS packagereleasegate: no v0.* tag reachable — nothing to gate")
+    return
+  }
+
+  let root = scanRoot(repo)
+  if (!isDir(root)) {
+    teardown(scratch, ms)
+    println("PASS packagereleasegate: ${root} does not exist — nothing to gate")
+    return
+  }
+
+  let stdlibAtTag = extractStdlibAtTag(repo, tag, scratch, ms)
+  let imports = collectImports(repo, root)
+  let mods = loadModules(stdlibAtTag, uniqueModules(imports))
+  let failures = checkImports(imports, mods, tag)
+  teardown(scratch, ms)
+
+  if (len(failures) > 0) {
+    for f of failures {
+      eprint("${f}\n")
+    }
+    eprint("packagereleasegate: FAILED — ${len(failures)} std/ import(s) under ${root} not satisfied by ${tag}\n")
+    exit(1)
+    return
+  }
+  println("PASS packagereleasegate: ${len(imports)} std/ import(s) under ${root} checked against ${tag}, all satisfied")
+}

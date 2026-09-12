@@ -442,7 +442,12 @@ case "${BUCKET}" in
     # buckets for the same reason. Measured `./make test-lint-complexity`
     # 1m10s (267 of 8022 functions over the limit across 794 files, all
     # named in tools/build/complexity-debt.txt).
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity)
+    # test-package-release-drift (#5129) is the fourth: a pkg/**-only diff is
+    # exactly the change that can add a std/ import the newest RELEASED
+    # compiler does not have, and the owner's ruling on #5126 was a gate that
+    # "reddens the day it starts", not one only caught by a manual
+    # `./make test-package-release-drift` or at tag time.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift)
     ;;
   spec)
     BUILD_STEPS=(test-spec)
