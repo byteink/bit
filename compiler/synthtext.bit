@@ -91,6 +91,7 @@ class SynthPlan {
   textRootClasses: []JsonClass,
   instClasses: []JsonClass,
   tableClasses: []TableClass,
+  sqlRowClasses: []SqlRowClass,
   words: []string,
   file: int,
 }
@@ -104,9 +105,11 @@ class SynthPlan {
 // `@key` misuse is judged unconditionally, ahead of the plan: a `@key` on a
 // class that carries no `@json` synthesizes nothing at all, so there is no
 // later pass that could notice it.
-fn injectSynthMembersInModule(p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand) {
+fn injectSynthMembersInModule(
+  p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand, sqlDemand: SqlRowDemand,
+) {
   vStrayKeyAttrs(m.tree, m.source, p.diags)
-  let plan = planSynthMembers(p, m, mid, d)
+  let plan = planSynthMembers(p, m, mid, d, sqlDemand)
   if (len(plan.words) == 0) {
     return
   }
@@ -140,12 +143,35 @@ fn injectSynthMembersInModule(p: Project, m: SrcModule, mid: int, d: JsonDecodeD
     newDecls = append(newDecls, x)
   }
   rewriteJsonDecodeCalls(m, st, mid, d)
+  for x of injectSqlRowSynth(m, st, mid, plan, sqlDemand) {
+    newDecls = append(newDecls, x)
+  }
   attachNewDecls(m.tree, newDecls)
+}
+
+// #5054: `find<T>`/`findOne<T>`/`findOneOrFail<T>`'s row mappers and their
+// imports — the rewrite of every call site this module owns is a side
+// effect, run here too since both need the same inputs. Split out of
+// `injectSynthMembersInModule` to keep it under LINT.md's max-complexity.
+fn injectSqlRowSynth(
+  m: SrcModule, st: SynthText, mid: int, plan: SynthPlan, sqlDemand: SqlRowDemand,
+): []int {
+  let out = []int(0)
+  for x of injectSqlRowMapperDecls(m.tree, st, plan.sqlRowClasses) {
+    out = append(out, x)
+  }
+  for x of sqlRowImportDecls(m, st, mid, sqlDemand, len(plan.sqlRowClasses) != 0) {
+    out = append(out, x)
+  }
+  rewriteSqlRowCalls(m, st, mid, sqlDemand)
+  return out
 }
 
 // The plan: which classes each feature fired on, every word they need, and the
 // file id every synthesized span is stamped with.
-fn planSynthMembers(p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand): SynthPlan {
+fn planSynthMembers(
+  p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand, sqlDemand: SqlRowDemand,
+): SynthPlan {
   let jx = newJsonCtx(p, m)
   let attrClasses = collectAttrClasses(p, mid, m.tree, m.source)
   let jsonClasses = collectJsonClasses(p, m)
@@ -154,6 +180,7 @@ fn planSynthMembers(p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand): Sy
   let textRoots = moduleDecodeTextRootClasses(d, mid, jsonClasses, jx)
   let instClasses = moduleDecodeInstClasses(d, mid, jsonClasses, jx)
   let tableClasses = collectTableClasses(p, m, mid)
+  let sqlRowClasses = collectSqlRowClasses(p, m, mid, sqlDemand)
   let words = []string(0)
   for w of fieldAttrSynthWords(p, mid, m.tree, m.source, attrClasses) {
     words = append(words, w)
@@ -179,20 +206,40 @@ fn planSynthMembers(p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand): Sy
   for w of jsonDecInstWords(jx, instClasses) {
     words = append(words, w)
   }
+  for w of sqlRowWords(sqlRowClasses, sqlDemand, mid) {
+    words = append(words, w)
+  }
   return SynthPlan{
     attrClasses: attrClasses, jsonClasses: jsonClasses,
     decodeClasses: decodeClasses, textClasses: textClasses,
     textRootClasses: textRoots, instClasses: instClasses,
-    tableClasses: tableClasses, words: words,
-    file: synthFileId(m, firstSynthClassName(attrClasses, jsonClasses, tableClasses), d, mid),
+    tableClasses: tableClasses, sqlRowClasses: sqlRowClasses, words: words,
+    file: synthFileId(
+      m, firstSynthClassName(attrClasses, jsonClasses, tableClasses, sqlRowClasses), d, sqlDemand, mid,
+    ),
   }
 }
 
-// The className node of whichever of the three class-attribute features
-// fired first in the module, or 0 when none did — bundled so `synthFileId`
-// stays inside LINT.md's max-params (5).
+// #5054's own two word lists — the mappers this module builds, and the
+// names every call site it owns needs — merged into one so
+// `planSynthMembers` stays under LINT.md's max-complexity.
+fn sqlRowWords(sqlRowClasses: []SqlRowClass, sqlDemand: SqlRowDemand, mid: int): []string {
+  let out = []string(0)
+  for w of sqlRowSynthWords(sqlRowClasses) {
+    out = append(out, w)
+  }
+  for w of sqlRowCallWords(sqlDemand, mid) {
+    out = append(out, w)
+  }
+  return out
+}
+
+// The className node of whichever class-attribute or #5054 row-mapper
+// feature fired first in the module, or 0 when none did — bundled so
+// `synthFileId` stays inside LINT.md's max-params (5).
 fn firstSynthClassName(
   attrClasses: []AttrClass, jsonClasses: []JsonClass, tableClasses: []TableClass,
+  sqlRowClasses: []SqlRowClass,
 ): int {
   if (len(attrClasses) != 0) {
     return attrClasses[0].className
@@ -203,6 +250,9 @@ fn firstSynthClassName(
   if (len(tableClasses) != 0) {
     return tableClasses[0].className
   }
+  if (len(sqlRowClasses) != 0) {
+    return sqlRowClasses[0].className
+  }
   return 0
 }
 
@@ -210,11 +260,18 @@ fn firstSynthClassName(
 // at this point, so any node in this module answers it, and `remapDiags` in the
 // caller is what turns a module-global span back into a per-file one. Taken
 // from whichever feature actually fired.
-fn synthFileId(m: SrcModule, firstClassName: int, d: JsonDecodeDemand, mid: int): int {
+fn synthFileId(
+  m: SrcModule, firstClassName: int, d: JsonDecodeDemand, sqlDemand: SqlRowDemand, mid: int,
+): int {
   if (firstClassName != 0) {
     return getNode(m.tree, firstClassName).span.file
   }
   for site of d.sites {
+    if (site.callerMod == mid) {
+      return getNode(m.tree, site.callNode).span.file
+    }
+  }
+  for site of sqlDemand.sites {
     if (site.callerMod == mid) {
       return getNode(m.tree, site.callNode).span.file
     }
@@ -238,10 +295,11 @@ fn synthFileId(m: SrcModule, firstClassName: int, d: JsonDecodeDemand, mid: int)
 // file 0.
 fn injectSynthMembers(p: Project) {
   let demand = collectJsonDecodeDemand(p)
+  let sqlDemand = collectSqlRowDemand(p)
   let i = 0
   while (i < len(p.mods)) {
     let before = len(p.diags.list)
-    injectSynthMembersInModule(p, p.mods[i], i, demand)
+    injectSynthMembersInModule(p, p.mods[i], i, demand, sqlDemand)
     remapDiags(p.diags, before, p.mods[i].files, p.mods[i].fileStarts)
     i = i + 1
   }

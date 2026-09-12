@@ -1,0 +1,514 @@
+// compiler/checksqlrowbuild.bit — what `find<T>`/`findOne<T>`/`findOneOrFail<T>`
+// (checksqlrow.bit, #5054) synthesize and rewrite, once `T` is resolved.
+//
+// One mapper per (module, class) pair, `fn __sql_row_C(rows: Rows): C!`,
+// built the identical way `synthTableDescriptor` (classtabledesc.bit) is:
+// spliced into the tree before `resolveProject` ever calls `resolveModule`,
+// so it is resolved, checked, lowered, mangled and documented as one the
+// class wrote itself. The mapper assigns fields directly through a
+// `CompositeLit`, never through `init` — the whole reason `find<T>` refuses
+// a `T` that declares one (checksqlrow.bit's E0152).
+//
+//     fn __sql_row_User(rows: Rows): User! {
+//       let cols = rows.columns()
+//       return User{
+//         id: sqlReqInt(rows, cols, "id")?,
+//         email: sqlReqText(rows, cols, "e_mail")?,
+//       }
+//     }
+//
+// A call site rewrites in place, exactly as `rewriteJsonDecodeCalls`
+// (classjsondecodecall.bit) does: `find<User>(db, sql, a, b)` becomes
+// `sqlFindMany(db, sql, [a, b], __sql_row_User)`, and a plain scalar `T`
+// becomes the matching pre-written `sqlRowScalar*` function with no
+// synthesis at all.
+
+// The `@column` attribute on a field, or 0. Compiler-known (classjson.bit's
+// `classAttrColumn`), matched by NAME and excluded from #3879's desugaring
+// the same way `@key` is.
+fn sqlColumnAttr(tree: Tree, source: string, field: int): int {
+  for a of fieldAttrs(tree, field) {
+    if (identText(tree, source, kidsOf(tree, a)[0]) == classAttrColumn) {
+      return a
+    }
+  }
+  return 0
+}
+
+// `name` in snake_case: an uppercase letter starts a new word (`_` plus its
+// lowercase form), except the first character. `createdAt` -> `created_at`.
+fn toSnakeCase(name: string): string {
+  let src = []byte(name)
+  let out = []byte(0)
+  let i = 0
+  while (i < len(src)) {
+    let c = src[i]
+    if (c >= byte(65) && c <= byte(90)) {
+      if (i != 0) {
+        out = append(out, byte(95))
+      }
+      out = append(out, c + byte(32))
+    } else {
+      out = append(out, c)
+    }
+    i = i + 1
+  }
+  return string(out)
+}
+
+// The `@column("...")` string literal node to clone, or a fresh quoted word
+// for the field's own name in snake_case when it carries none. Mirrors
+// `jsonKeyOf` (classjson.bit).
+fn sqlColumnOf(p: Project, tree: Tree, source: string, field: int): (int, string, bool) {
+  let attr = sqlColumnAttr(tree, source, field)
+  let fname = identText(tree, source, kidsOf(tree, field)[0])
+  if (attr == 0) {
+    return (0, "\"" + toSnakeCase(fname) + "\"", true)
+  }
+  let k = kidsOf(tree, attr)
+  if (len(k) != 2) {
+    reportSqlColumnArgs(p, tree, attr, fname, "takes exactly one string")
+    return (0, "", false)
+  }
+  let argTag = getNode(tree, k[1]).tag
+  if (argTag != Tag.StringLit && argTag != Tag.RawStringLit) {
+    reportSqlColumnArgs(p, tree, attr, fname, "takes a string constant")
+    return (0, "", false)
+  }
+  return (k[1], "", true)
+}
+
+fn reportSqlColumnArgs(p: Project, tree: Tree, attr: int, fname: string, what: string) {
+  report(
+    p.diags, ecSqlRowColumnArg, getNode(tree, attr).span,
+    "'@column' on field '${fname}' ${what}",
+    "write '@column(\"column_name\")' with one string literal",
+  )
+}
+
+// ---- collection -------------------------------------------------------------
+
+// One row-mapped field: its accessor name (by scalar kind and optionality)
+// and the column it claims.
+class SqlRowField {
+  nameNode: int,
+  kind: int,
+  optional: bool,
+  columnLit: int,
+  columnWord: string,
+}
+
+// One class this module must build `__sql_row_<name>` for.
+class SqlRowClass {
+  classNode: int,
+  className: int,
+  name: string,
+  exported: bool,
+  fields: []SqlRowField,
+}
+
+// True iff the module imports `Rows` from "std/sql" under that exact name —
+// the one name the mapper's own signature is written in terms of. Mirrors
+// `tableImportBound` (classtabledesc.bit): an aliased import does not bind
+// it, and this runs before any Checker exists.
+fn sqlRowsImportBound(tree: Tree, source: string): bool {
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d)
+    if (stringLitText(source, getNode(tree, k[1]).span) != sqlRowModulePath) {
+      continue
+    }
+    if (getNode(tree, k[0]).tag != Tag.ImportGroup) {
+      continue
+    }
+    for item of kidsOf(tree, k[0]) {
+      if (importItemLocalName(tree, source, item) == "Rows") {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+fn reportSqlRowImportMissing(p: Project, tree: Tree, source: string, className: int) {
+  let cname = identText(tree, source, className)
+  report(
+    p.diags, ecSqlRowImportMissing, getNode(tree, className).span,
+    "class '${cname}' is mapped by 'find'/'findOne'/'findOneOrFail', but this module does not import 'Rows'",
+    "add: import { Rows } from \"std/sql\"",
+  )
+}
+
+// Every class THIS module must build a mapper for — the ones needed of it
+// that it also declares (`moduleSqlRowNeeds`, checksqlrow.bit) — or none at
+// all, reported once as E0153, when the module never imported `Rows`.
+fn collectSqlRowClasses(p: Project, m: SrcModule, mid: int, d: SqlRowDemand): []SqlRowClass {
+  let needs = moduleSqlRowNeeds(d, mid)
+  if (len(needs) == 0) {
+    return []SqlRowClass(0)
+  }
+  if (!sqlRowsImportBound(m.tree, m.source)) {
+    for n of needs {
+      let tc = sqlLocalClass(m.tree, m.source, n.className)
+      if (tc.decl != 0) {
+        reportSqlRowImportMissing(p, m.tree, m.source, kidsOf(m.tree, tc.decl)[0])
+      }
+    }
+    return []SqlRowClass(0)
+  }
+  let out = []SqlRowClass(0)
+  for n of needs {
+    let tc = sqlLocalClass(m.tree, m.source, n.className)
+    if (tc.decl == 0) {
+      continue
+    }
+    out = append(out, buildSqlRowClass(p, m, tc))
+  }
+  return out
+}
+
+fn buildSqlRowClass(p: Project, m: SrcModule, tc: TopClass): SqlRowClass {
+  let tree = m.tree
+  let source = m.source
+  let k = kidsOf(tree, tc.decl)
+  let fields = []SqlRowField(0)
+  for m0 of kidsOf(tree, k[2]) {
+    let f = memberField(tree, m0)
+    if (f == 0) {
+      continue
+    }
+    let fk = kidsOf(tree, f)
+    let (kind, optional) = classifySqlFieldType(tree, source, fk[1])
+    let (lit, word, ok) = sqlColumnOf(p, tree, source, f)
+    if (kind == sqlKindBad || !ok) {
+      continue // already reported: E0154 at collectSqlRowDemand, E0155 here
+    }
+    fields = append(
+      fields,
+      SqlRowField{
+        nameNode: fk[0],
+        kind: kind,
+        optional: optional,
+        columnLit: lit,
+        columnWord: word,
+      },
+    )
+  }
+  return SqlRowClass{
+    classNode: tc.decl, className: k[0], name: identText(tree, source, k[0]),
+    exported: tc.exported, fields: fields,
+  }
+}
+
+// ---- the words the synthesis needs ------------------------------------------
+
+fn sqlRowSynthWords(classes: []SqlRowClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  let out = ["Rows", "rows", "cols", "columns"]
+  for a of sqlFieldAccessorNames() {
+    out = append(out, a)
+  }
+  for c of classes {
+    out = append(out, sqlRowMapperName(c.name))
+    for f of c.fields {
+      if (f.columnLit == 0) {
+        out = append(out, f.columnWord)
+      }
+    }
+  }
+  return out
+}
+
+// Every name module `mid` calls at a rewritten site: the entry driver, and
+// the mapper — a scalar `sqlRowScalar*` function, or `__sql_row_C`, needed
+// as a WORD here regardless of whether `C` is declared in this module or
+// another (`rewriteSqlRowCall` spells the identifier either way) — the
+// caller-side counterpart of `sqlRowSynthWords`.
+fn sqlRowCallWords(d: SqlRowDemand, mid: int): []string {
+  let out = []string(0)
+  let sawDriver = map<int, bool>{}
+  for s of d.sites {
+    if (s.callerMod != mid) {
+      continue
+    }
+    let (_, already) = sawDriver[s.entry]
+    if (!already) {
+      sawDriver[s.entry] = true
+      out = append(out, sqlDriverFuncName(s.entry))
+    }
+    if (s.scalarKind != sqlKindBad) {
+      out = append(out, sqlScalarMapperName(s.scalarKind))
+      continue
+    }
+    out = append(out, sqlRowMapperName(s.className))
+  }
+  return out
+}
+
+// ---- building the mapper's AST ----------------------------------------------
+
+// The tree being mutated, the module's synthesized words, and the span every
+// node built for the CURRENT field is stamped with. Mirrors `TableBuild`
+// (classtabledesc.bit) and `JsonBuild` (classjsonbuild.bit).
+class SqlRowBuild {
+  tree: Tree,
+  st: SynthText,
+  span: Span,
+}
+
+fn srbIdent(b: SqlRowBuild, word: string): int {
+  return synthIdent(b.tree, b.st, word)
+}
+
+fn srbNode(b: SqlRowBuild, tag: Tag, kids: []int): int {
+  return addNode(b.tree, tag, b.span, 0, kids)
+}
+
+fn srbCall(b: SqlRowBuild, callee: int, args: []int): int {
+  let argNodes = []int(0)
+  for a of args {
+    argNodes = append(argNodes, srbNode(b, Tag.Arg, [a]))
+  }
+  return srbNode(b, Tag.Call, [callee, 0, srbNode(b, Tag.Args, argNodes)])
+}
+
+fn srbTry(b: SqlRowBuild, expr: int): int {
+  return srbNode(b, Tag.TryExpr, [expr])
+}
+
+// The column-literal expression for one field: a clone of its `@column`
+// string, or a fresh literal pointing at the quoted snake_case word
+// `appendSynthText` laid down.
+fn srbColumnExpr(b: SqlRowBuild, f: SqlRowField): int {
+  if (f.columnLit != 0) {
+    let n = getNode(b.tree, f.columnLit)
+    return addLeaf(b.tree, n.tag, n.span)
+  }
+  return addLeaf(b.tree, Tag.StringLit, synthSpan(b.st, f.columnWord))
+}
+
+// `sqlReqInt(rows, cols, "col")?` / `sqlOptInt(rows, cols, "col")?` for one
+// field.
+fn srbFieldValue(b: SqlRowBuild, f: SqlRowField): int {
+  b.span = getNode(b.tree, f.nameNode).span
+  let accessor = srbIdent(b, sqlFieldAccessorName(f.kind, f.optional))
+  let call = srbCall(
+    b, accessor, [srbIdent(b, "rows"), srbIdent(b, "cols"), srbColumnExpr(b, f)],
+  )
+  return srbTry(b, call)
+}
+
+// `<FieldName>: <value>,` for one field, keyed by the field's OWN name node
+// (a plain class field is never renamed — the column is what `@column`
+// overrides, never the Bit field name).
+fn srbFieldInit(b: SqlRowBuild, f: SqlRowField): int {
+  let nameLeaf = addLeaf(b.tree, Tag.Ident, getNode(b.tree, f.nameNode).span)
+  return srbNode(b, Tag.FieldInit, [nameLeaf, srbFieldValue(b, f)])
+}
+
+// `fn __sql_row_C(rows: Rows): C! { let cols = rows.columns(); return C{ ... } }`.
+fn synthSqlRowMapper(tree: Tree, st: SynthText, c: SqlRowClass): int {
+  let classSpan = getNode(tree, c.className).span
+  let b = SqlRowBuild{ tree: tree, st: st, span: classSpan }
+  let colsCall = srbCall(
+    b,
+    srbNode(b, Tag.Member, [srbIdent(b, "rows"), srbIdent(b, "columns")]),
+    []int(0),
+  )
+  let colsLet = srbNode(
+    b,
+    Tag.LetDecl,
+    [srbNode(b, Tag.Binding, [srbIdent(b, "cols"), 0, colsCall])],
+  )
+  let inits = []int(0)
+  for f of c.fields {
+    inits = append(inits, srbFieldInit(b, f))
+  }
+  b.span = classSpan
+  let ctor = srbNode(
+    b, Tag.CompositeLit,
+    [addLeaf(tree, Tag.Ident, classSpan), srbNode(b, Tag.FieldInits, inits)],
+  )
+  let body = srbNode(b, Tag.Block, [colsLet, srbNode(b, Tag.ReturnStmt, [ctor])])
+  let params = srbNode(
+    b,
+    Tag.Params,
+    [srbNode(b, Tag.Param, [srbIdent(b, "rows"), srbIdent(b, "Rows")])],
+  )
+  let result = srbNode(b, Tag.Fallible, [addLeaf(tree, Tag.Ident, classSpan), 0])
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [0, synthIdent(tree, st, sqlRowMapperName(c.name)), 0, params, result, body],
+  )
+  if (!c.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+fn injectSqlRowMapperDecls(tree: Tree, st: SynthText, classes: []SqlRowClass): []int {
+  let out = []int(0)
+  for c of classes {
+    out = append(out, synthSqlRowMapper(tree, st, c))
+  }
+  return out
+}
+
+// ---- imports -----------------------------------------------------------------
+
+// The accessor helpers this module's own mappers call, imported once —
+// `synthImportDecl`/`importedLocalNames` (classjsondecodeimports.bit,
+// classjsondecodecall.bit), same module, reused unchanged.
+fn sqlRowHelperImportDecl(m: SrcModule, st: SynthText, bound: map<string, bool>): int {
+  let helpers = []string(0)
+  for h of sqlFieldAccessorNames() {
+    let (_, already) = bound[h]
+    if (!already) {
+      helpers = append(helpers, h)
+      bound[h] = true
+    }
+  }
+  return synthImportDecl(m, st, sqlRowModulePath, helpers)
+}
+
+// One name per site this module calls that ANOTHER module declares: the
+// driver function for every entry point it uses, the scalar mapper for
+// every scalar `T`, and the class mapper for every class declared elsewhere.
+fn sqlRowCallImportDecls(
+  m: SrcModule,
+  st: SynthText,
+  mid: int,
+  d: SqlRowDemand,
+  bound: map<string, bool>,
+): []int {
+  let out = []int(0)
+  let sawDriver = map<int, bool>{}
+  for s of d.sites {
+    if (s.callerMod != mid) {
+      continue
+    }
+    for decl of sqlRowSiteImports(m, st, s, sawDriver, bound) {
+      out = append(out, decl)
+    }
+  }
+  return out
+}
+
+// One call site's own import needs, split out of `sqlRowCallImportDecls` to
+// keep its loop body a single call (LINT.md max-complexity).
+fn sqlRowSiteImports(
+  m: SrcModule, st: SynthText, s: SqlRowSite, sawDriver: map<int, bool>, bound: map<string, bool>,
+): []int {
+  let out = []int(0)
+  let (_, already) = sawDriver[s.entry]
+  if (!already) {
+    sawDriver[s.entry] = true
+    out = append(out, sqlRowImportOne(m, st, sqlRowModulePath, sqlDriverFuncName(s.entry), bound))
+  }
+  if (s.scalarKind != sqlKindBad) {
+    out = append(
+      out, sqlRowImportOne(m, st, sqlRowModulePath, sqlScalarMapperName(s.scalarKind), bound),
+    )
+    return out
+  }
+  // "" is `SqlClassSite`'s own local-declaration marker (checksqlrow.bit):
+  // the mapper is then a SIBLING declaration in this very module, never an
+  // import — `sqlRowModulePath` would be the wrong path for it entirely.
+  if (s.path == "") {
+    return out
+  }
+  out = append(out, sqlRowImportOne(m, st, s.path, sqlRowMapperName(s.className), bound))
+  return out
+}
+
+// One name, imported once — 0 filtered by the caller when already bound or
+// when the path is not one this module imports from at all.
+fn sqlRowImportOne(
+  m: SrcModule,
+  st: SynthText,
+  path: string,
+  word: string,
+  bound: map<string, bool>,
+): int {
+  let (_, already) = bound[word]
+  if (already) {
+    return 0
+  }
+  bound[word] = true
+  return synthImportDecl(m, st, path, [word])
+}
+
+// Every import declaration module `mid` needs for this feature: the
+// accessor helpers its own mappers call, plus one name per call site.
+fn sqlRowImportDecls(
+  m: SrcModule,
+  st: SynthText,
+  mid: int,
+  d: SqlRowDemand,
+  haveMappers: bool,
+): []int {
+  let out = []int(0)
+  let bound = importedLocalNames(m.tree, m.source)
+  if (haveMappers) {
+    let helperDecl = sqlRowHelperImportDecl(m, st, bound)
+    if (helperDecl != 0) {
+      out = append(out, helperDecl)
+    }
+  }
+  for decl of sqlRowCallImportDecls(m, st, mid, d, bound) {
+    if (decl != 0) {
+      out = append(out, decl)
+    }
+  }
+  return out
+}
+
+// ---- rewriting the calls ------------------------------------------------------
+
+// `find<User>(db, sql, a, b)` becomes `sqlFindMany(db, sql, [a, b], __sql_row_User)`,
+// in place: a call's child count is always `[callee, type_args, args]`
+// (`rewriteJsonDecodeCalls`, classjsondecodecall.bit — same reasoning, this
+// mirrors it exactly), so only the three slots move.
+fn rewriteSqlRowCalls(m: SrcModule, st: SynthText, mid: int, d: SqlRowDemand) {
+  let tree = m.tree
+  for s of d.sites {
+    if (s.callerMod != mid) {
+      continue
+    }
+    rewriteSqlRowCall(tree, st, s)
+  }
+}
+
+fn rewriteSqlRowCall(tree: Tree, st: SynthText, s: SqlRowSite) {
+  let span = getNode(tree, s.callNode).span
+  let start = getNode(tree, s.callNode).kidsStart
+  let origArgs = kidsOf(tree, tree.extra[start + 2])
+  let db = kidsOf(tree, origArgs[0])[0]
+  let sqlText = kidsOf(tree, origArgs[1])[0]
+  let trailing = []int(0)
+  let i = 2
+  while (i < len(origArgs)) {
+    trailing = append(trailing, kidsOf(tree, origArgs[i])[0])
+    i = i + 1
+  }
+  let mapperName = sqlScalarMapperName(s.scalarKind)
+  if (s.scalarKind == sqlKindBad) {
+    mapperName = sqlRowMapperName(s.className)
+  }
+  let args = addNode(
+    tree, Tag.Args, span, 0,
+    [
+      addNode(tree, Tag.Arg, span, 0, [db]),
+      addNode(tree, Tag.Arg, span, 0, [sqlText]),
+      addNode(tree, Tag.Arg, span, 0, [addNode(tree, Tag.SliceLit, span, 0, trailing)]),
+      addNode(tree, Tag.Arg, span, 0, [addLeaf(tree, Tag.Ident, synthSpan(st, mapperName))]),
+    ],
+  )
+  tree.extra[start] = addLeaf(tree, Tag.Ident, synthSpan(st, sqlDriverFuncName(s.entry)))
+  tree.extra[start + 1] = 0
+  tree.extra[start + 2] = args
+}
