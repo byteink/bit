@@ -31,6 +31,30 @@ fn main(): ()! {
 }
 ```
 
+## Views (JSX)
+
+`<div id="x">hi</div>` needs nothing beyond the ordinary install above: JSX
+(SPEC §12.12) desugars a lowercase tag to calls to `elem`, `attr`, `frag` and
+`text`, resolved by ordinary scope rules like any other call — so importing
+those four alongside the constructors they wrap is all a view needs.
+
+```bit
+import { Node, render, elem, attr, frag, text } from "web"
+
+fn Row(name: string): Node {
+  let item = <li>{text(name)}</li>
+  return item
+}
+
+fn page(name: string): string {
+  let tree = <div id="x"><Row name={name} /></div>
+  return render(tree)
+}
+```
+
+A component is a plain function returning `Node` (`Row` above); `el(tag,
+...kids)` stays the explicit way to build an element with a dynamic tag name.
+
 ## Documentation
 
 Start at [`docs/README.md`](docs/README.md): getting started, routing, the
