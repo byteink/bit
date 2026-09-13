@@ -1362,11 +1362,18 @@ interface is a separate extension this section does not make.
   `i64` words wide: no allocation, no header, no GC pointer. It is its own
   numeric family, neither an integer nor a float, which is what keeps every
   conversion to and from it explicit (§12.9). Money is what it is for:
-  `0.1 + 0.2` is `0.3` in a `decimal` and is not in an `f64`. *(v1 status: the
-  type, its literals, its conversions, locals/parameters/fields/returns,
-  interpolation, and unary `-`/`+` are implemented. Binary arithmetic
-  (`+ - * /`) and comparison are not, and a program that evaluates one is
-  refused at build with **E0092**.)*
+  `0.1 + 0.2` is `0.3` in a `decimal` and is not in an `f64`. `+`, `-` and the
+  six comparisons compare and combine by **value**, never by representation:
+  operands at different scales are aligned first (the smaller-scale side's
+  mantissa is scaled up to match), so `1.0 == 1.00` is `true` and `a < b`
+  agrees with `(a - b) < 0` regardless of how the two operands were scaled - a
+  `decimal`'s scale is display precision, not part of its identity. A result
+  whose mantissa would not fit 96 bits **panics** (§13.5) rather than
+  wrapping. *(v1 status: the type, its literals, its conversions,
+  locals/parameters/fields/returns, interpolation, unary `-`/`+`, binary
+  `+`/`-`, and the six comparisons are implemented. Multiplication, division
+  and half-even rounding are not, and a program that evaluates one is refused
+  at build with **E0092**.)*
 - `bool` (`true` / `false`).
 - `string`: immutable, UTF-8 byte sequence; indexing yields a `byte`; `len(s)` is
   the byte length. Strings are reference types but deeply immutable.
@@ -3062,6 +3069,10 @@ rejected outright, `E0047`). `Result<T, E>` has no such rescue - both `Ok` and
 - Integer division or remainder by zero **panics**.
 - Float arithmetic follows IEEE-754; division by zero yields ±∞ or NaN (no panic).
 - Shifts: the shift count is taken modulo the operand bit width.
+- `decimal` (§11.1) arithmetic overflow - a result whose 96-bit mantissa or
+  0-28 scale range is exceeded - **panics unconditionally**, in every build
+  mode: unlike signed integer overflow above, there is no wrapping
+  representation for it to fall back to.
 
 ### 13.6 Memory Model (GC)
 

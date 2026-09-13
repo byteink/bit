@@ -1,0 +1,464 @@
+// compiler/lowerdecimalarith.bit — #3982's second slice: scale alignment,
+// binary `+`/`-` and the six comparisons on `decimal`. Sibling of
+// lowerdecimal.bit: same module, so this needs no imports and no call-site
+// changes. Multiply, divide and half-even rounding are NOT here — they need
+// their own design pass (a 96x96 product and a long-division loop), and
+// alignment plus add/sub is already a full slice on its own.
+//
+// WHY THIS IS ITS OWN FILE rather than more of lowerdecimal.bit. That file is
+// the REPRESENTATION (literal, unary, field access, to-string) and was
+// already 367 lines; this slice alone is a comparable amount of new lowering,
+// and the 800-line ceiling means the two would have to split eventually
+// regardless — doing it at the seam between "what a decimal IS" and "what you
+// can DO with two of them" keeps each file's job nameable in one sentence.
+//
+// THE CORE TRICK, so the functions below read as one idea rather than a pile
+// of bit-twiddling: `decimal`'s 96-bit magnitude, once both operands are
+// scaled to agree, is added as an ordinary TWO'S-COMPLEMENT 96-bit integer —
+// negate the operand that is negative, add, then read the sign back off bit
+// 95 of the sum. That sidesteps every "which side is bigger, so which way do
+// we subtract, so what sign does a zero result get" branch a sign-magnitude
+// adder needs, because two's-complement addition already answers all of that
+// uniformly: `(-5) + 3` and `5 + (-3)` are the same one code path, and a
+// same-sign input pair whose sum flips sign is exactly the overflow this
+// slice must panic on (the classic CPU-flag overflow test, reused rather than
+// a second detector). Comparison reuses the identical core: `a - b`'s sign
+// (with the special case that comparison must never PANIC on the internal
+// 96-bit overflow this trick can hit even for two in-range operands, since
+// their exact difference can need up to 97 bits) decides the ordering.
+
+// ---- small emission helpers, shared by everything below -------------------
+
+// One `i64` constant, emitted into the current block.
+fn emitI64Const(fc: FnCtx, val: int): int {
+  let ins = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+  ins.ival = val
+  return builderEmit(fc.b, ins)
+}
+
+// One `bool` constant, emitted into the current block.
+fn emitBoolConst(fc: FnCtx, val: bool): int {
+  let ins = mkInstr(Op.ConstBool, primType(fc.c.ctx, 10))
+  ins.bval = val
+  return builderEmit(fc.b, ins)
+}
+
+// A binary IR op over two already-lowered operands — the boilerplate every
+// `mkInstr`/`builderEmit` pair below shares.
+fn emitBin(fc: FnCtx, op: Op, ty: int, lhs: int, rhs: int): int {
+  let ins = mkInstr(op, ty)
+  ins.lhs = lhs
+  ins.rhs = rhs
+  return builderEmit(fc.b, ins)
+}
+
+// `cond ? tVal : fVal` as a real branch and join, for a RUNTIME `cond` over
+// two already-computed values (so both must be side-effect-free to compute
+// eagerly — never a value from a path that can panic or loop, which is why
+// the alignment loop and the add/sub cores below build their own explicit
+// blocks instead of calling this). The smallest instance of the `cond ? a : b`
+// join `lowerDecimalNegate` (lowerdecimal.bit) already builds by hand; every
+// three-way merge in this file is this, called once or nested.
+fn emitCondVal(fc: FnCtx, cond: int, ty: int, tVal: int, fVal: int): int {
+  let tBlk = builderNewBlock(fc.b)
+  let fBlk = builderNewBlock(fc.b)
+  let join = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = tBlk
+  br.thenArgs = []int(0)
+  br.ival2 = fBlk
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, tBlk)
+  emitJump(fc, join, [tVal])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, fBlk)
+  emitJump(fc, join, [fVal])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, join)
+  return builderAddParam(fc.b, ty)
+}
+
+// Bit 63 of an `i64`, computed rather than written as a literal — the same
+// representability trap `lowerDecimalNegate` already documents (the positive
+// magnitude before negation is one past i64's positive range).
+fn emitSignBitConst(fc: FnCtx): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  return emitBin(fc, Op.Shl, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 63))
+}
+
+// ---- the hi-word layout, read and written at runtime -----------------------
+//
+// A decimal's hi word (this file's banner, and lowerdecimal.bit's) packs the
+// mantissa's top 32 bits (bits 0..31), the scale (bits 32..39) and the sign
+// (bit 63). These three are the only accessors every function below needs;
+// nothing here reaches into the low word, which is the mantissa's bottom 64
+// bits verbatim.
+
+fn decSignMasked(fc: FnCtx, hi: int): int {
+  return emitBin(fc, Op.BAnd, primType(fc.c.ctx, 3), hi, emitSignBitConst(fc))
+}
+
+fn decIsNeg(fc: FnCtx, hi: int): int {
+  return emitBin(fc, Op.ICmpNe, primType(fc.c.ctx, 10), decSignMasked(fc, hi), emitI64Const(fc, 0))
+}
+
+fn decMantHi32(fc: FnCtx, hi: int): int {
+  return emitBin(fc, Op.BAnd, primType(fc.c.ctx, 3), hi, emitI64Const(fc, 4294967295))
+}
+
+fn decScale(fc: FnCtx, hi: int): int {
+  let shifted = emitBin(fc, Op.LShr, primType(fc.c.ctx, 3), hi, emitI64Const(fc, 32))
+  return emitBin(fc, Op.BAnd, primType(fc.c.ctx, 3), shifted, emitI64Const(fc, 255))
+}
+
+// The inverse of the three reads above: one hi word from a mantissa-high
+// word, a scale and an already-masked sign (0 or `emitSignBitConst`'s value).
+fn decComposeHi(fc: FnCtx, mantHi32: int, scale: int, signMasked: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let scaleShifted = emitBin(fc, Op.Shl, i64ty, scale, emitI64Const(fc, 32))
+  let withScale = emitBin(fc, Op.BOr, i64ty, mantHi32, scaleShifted)
+  return emitBin(fc, Op.BOr, i64ty, withScale, signMasked)
+}
+
+// Panics "decimal arithmetic overflowed" unless `ok`. Same shape as
+// `emitBoundsCheck` (loweraccess.bit): mint both successor blocks up front,
+// the panic side never returns, and the caller's next instructions land in
+// the block this leaves current — which is what lets every call site below
+// just keep emitting as if the check were a no-op guard.
+fn emitDecimalOverflowPanic(fc: FnCtx, ok: int) {
+  let good = builderNewBlock(fc.b)
+  let bad = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = ok
+  br.ival = good
+  br.ival2 = bad
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, bad)
+  let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  msg.sval = "decimal arithmetic overflowed"
+  msg.ival = internPoolString(fc, msg.sval)
+  let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  pn.name = "panic"
+  pn.args = [builderEmit(fc.b, msg)]
+  emitRtCall(fc, pn)
+  builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, good)
+}
+
+// ---- scale alignment --------------------------------------------------------
+
+// Scales a 96-bit magnitude (`lo0`/`mant0`) up by `diff` decimal places —
+// multiply by 10, `diff` times, panicking the instant the mantissa would not
+// fit 96 bits. `diff` is a RUNTIME value (0-28, or up to 255 given the field
+// is 8 bits — bounded either way), so this is a real loop, not unrolled; 0
+// iterations is a no-op, which is what makes an equal-scale operand pair (and
+// so `0.1 + 0.2`) need no special case at all.
+//
+// PER-ITERATION, not just at the end: `hi32*10` alone can exceed 2^32 well
+// before 28 iterations, so checking only the final value would read a value
+// that already wrapped past i64 within the loop.
+//
+// `carry` (the high 64 bits of `lo*10`) is always 0-9: `lo < 2^64`, so
+// `lo*10 < 10 * 2^64`, so `floor(lo*10 / 2^64) < 10`.
+fn emitDecimalScaleUp(fc: FnCtx, lo0: int, mant0: int, diff: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let header = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let exit = builderNewBlock(fc.b)
+
+  emitJump(fc, header, [lo0, mant0, diff])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, header)
+  let loP = builderAddParam(fc.b, i64ty)
+  let mantP = builderAddParam(fc.b, i64ty)
+  let cntP = builderAddParam(fc.b, i64ty)
+  let cont = emitBin(fc, Op.ICmpSgt, boolTy, cntP, emitI64Const(fc, 0))
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cont
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = exit
+  br.elseArgs = [loP, mantP]
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  let ten = emitI64Const(fc, 10)
+  let loProd = emitBin(fc, Op.Mul, i64ty, loP, ten)
+  let carry = emitBin(fc, Op.UMulHi, i64ty, loP, ten)
+  let mantTimes10 = emitBin(fc, Op.Mul, i64ty, mantP, ten)
+  let newMant = emitBin(fc, Op.Add, i64ty, mantTimes10, carry)
+  let inRange = emitBin(fc, Op.ICmpSlt, boolTy, newMant, emitI64Const(fc, 4294967296))
+  emitDecimalOverflowPanic(fc, inRange)
+  let newCnt = emitBin(fc, Op.Sub, i64ty, cntP, emitI64Const(fc, 1))
+  emitJump(fc, header, [loProd, newMant, newCnt])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, exit)
+  let finalLo = builderAddParam(fc.b, i64ty)
+  let finalMant = builderAddParam(fc.b, i64ty)
+  return (finalLo, finalMant)
+}
+
+// Both operands' magnitudes, aligned to a shared scale (the larger of the
+// two), and that shared scale — needed by add/sub AND all six comparisons
+// (`1.0 == 1.00` must be `true`, which only holds once both sides read the
+// same 96-bit magnitude). Exactly one of the two `emitDecimalScaleUp` calls
+// below ever does real work; the other runs its loop zero times.
+class DecimalAligned {
+  loA: int,
+  mantA: int,
+  loB: int,
+  mantB: int,
+  scale: int,
+}
+
+fn emitDecimalAlign(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): DecimalAligned {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let scaleA = decScale(fc, hiA)
+  let scaleB = decScale(fc, hiB)
+  let mantA0 = decMantHi32(fc, hiA)
+  let mantB0 = decMantHi32(fc, hiB)
+  let aBigger = emitBin(fc, Op.ICmpSge, boolTy, scaleA, scaleB)
+
+  let aBiggerBlk = builderNewBlock(fc.b)
+  let bBiggerBlk = builderNewBlock(fc.b)
+  let join = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = aBigger
+  br.ival = aBiggerBlk
+  br.thenArgs = []int(0)
+  br.ival2 = bBiggerBlk
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  // A's scale is the larger (or they're equal, either arm is correct): scale
+  // B up by the difference, leave A alone.
+  builderBeginBlock(fc.b, aBiggerBlk)
+  let diffToB = emitBin(fc, Op.Sub, i64ty, scaleA, scaleB)
+  emitJump(fc, join, [emitI64Const(fc, 0), diffToB, scaleA])
+  builderEndBlock(fc.b)
+
+  // B's scale is strictly larger: scale A up instead.
+  builderBeginBlock(fc.b, bBiggerBlk)
+  let diffToA = emitBin(fc, Op.Sub, i64ty, scaleB, scaleA)
+  emitJump(fc, join, [diffToA, emitI64Const(fc, 0), scaleB])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, join)
+  let diffA = builderAddParam(fc.b, i64ty)
+  let diffB = builderAddParam(fc.b, i64ty)
+  let resultScale = builderAddParam(fc.b, i64ty)
+  let (loAa, mantAa) = emitDecimalScaleUp(fc, loA, mantA0, diffA)
+  let (loBa, mantBa) = emitDecimalScaleUp(fc, loB, mantB0, diffB)
+  return DecimalAligned{ loA: loAa, mantA: mantAa, loB: loBa, mantB: mantBa, scale: resultScale }
+}
+
+// ---- 96-bit two's-complement core, shared by add/sub and comparison -------
+
+// Two's-complement negation of a 96-bit magnitude held as (`lo`: bits 0-63,
+// `m`: bits 64-95 in its own low 32 bits, its high 32 always zero) — `~x + 1`,
+// masked back to 96 bits (a no-op for every input this ever receives, since
+// `m` is already < 2^32 on the way in).
+fn emitDecNegPair(fc: FnCtx, lo: int, m: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let mask32 = emitI64Const(fc, 4294967295)
+  let notLo = emitBin(fc, Op.BXor, i64ty, lo, emitI64Const(fc, 0 - 1))
+  let notM = emitBin(fc, Op.BXor, i64ty, m, mask32)
+  let newLo = emitBin(fc, Op.Add, i64ty, notLo, emitI64Const(fc, 1))
+  let wrapped = emitBin(fc, Op.ICmpEq, primType(fc.c.ctx, 10), newLo, emitI64Const(fc, 0))
+  let carry = emitCondVal(fc, wrapped, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 0))
+  let newM = emitBin(fc, Op.BAnd, i64ty, emitBin(fc, Op.Add, i64ty, notM, carry), mask32)
+  return (newLo, newM)
+}
+
+// `(lo, m)` if `isNeg` is false, its two's-complement negation otherwise.
+// Negation is pure and cheap, so both are computed unconditionally and
+// selected — never a real branch, unlike everything that can panic or loop.
+fn emitDecSignedPair(fc: FnCtx, lo: int, m: int, isNeg: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let (negLo, negM) = emitDecNegPair(fc, lo, m)
+  return (emitCondVal(fc, isNeg, i64ty, negLo, lo), emitCondVal(fc, isNeg, i64ty, negM, m))
+}
+
+// Unsigned 96-bit add, mod 2^96 (a carry out of bit 95 is simply dropped —
+// expected in two's-complement arithmetic; whether that dropped carry means
+// the true, unbounded result overflowed is `emitDecimalAddCore`'s job below,
+// via the sign of the inputs vs. the sign of this sum, not this function's).
+fn emitDecAddPair(fc: FnCtx, loA: int, mA: int, loB: int, mB: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let sumLo = emitBin(fc, Op.Add, i64ty, loA, loB)
+  let wrapped = emitBin(fc, Op.ICmpUlt, primType(fc.c.ctx, 10), sumLo, loA)
+  let carry = emitCondVal(fc, wrapped, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 0))
+  let mSum = emitBin(fc, Op.Add, i64ty, emitBin(fc, Op.Add, i64ty, mA, mB), carry)
+  let sumM = emitBin(fc, Op.BAnd, i64ty, mSum, emitI64Const(fc, 4294967295))
+  return (sumLo, sumM)
+}
+
+// The result of adding two decimals' ALIGNED magnitudes as signed 96-bit
+// two's-complement values: the raw sum, its scale, the sum's own sign bit
+// (`neg`, bit 95 — meaningless alone if the addition overflowed), whether the
+// two operands' true sign agreed with it (`agrees` — false means overflow,
+// by the standard rule: adding two same-signed values can only produce a
+// result of the opposite sign by overflowing), whether the raw sum is exactly
+// zero, and the input operands' shared sign (`inputSign`, valid only when
+// they in fact agreed — the fallback a comparison uses to recover the TRUE
+// sign of an internally-overflowed difference without panicking on it).
+class DecimalSum {
+  lo: int,
+  m: int,
+  scale: int,
+  neg: int,
+  agrees: int,
+  isZero: int,
+  inputSign: int,
+}
+
+fn emitDecimalAddCore(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): DecimalSum {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let signA = decIsNeg(fc, hiA)
+  let signB = decIsNeg(fc, hiB)
+  let aligned = emitDecimalAlign(fc, loA, hiA, loB, hiB)
+  let (sLoA, sMA) = emitDecSignedPair(fc, aligned.loA, aligned.mantA, signA)
+  let (sLoB, sMB) = emitDecSignedPair(fc, aligned.loB, aligned.mantB, signB)
+  let (sumLo, sumM) = emitDecAddPair(fc, sLoA, sMA, sLoB, sMB)
+  let resultNeg = emitBin(fc, Op.ICmpSge, boolTy, sumM, emitI64Const(fc, 2147483648))
+  let sameOperandSign = emitBin(fc, Op.ICmpEq, boolTy, signA, signB)
+  let matches = emitBin(fc, Op.ICmpEq, boolTy, resultNeg, signA)
+  let agrees = emitCondVal(fc, sameOperandSign, boolTy, matches, emitBoolConst(fc, true))
+  let isZero = emitBin(
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, sumLo, sumM), emitI64Const(fc, 0),
+  )
+  return DecimalSum{
+    lo: sumLo, m: sumM, scale: aligned.scale, neg: resultNeg, agrees: agrees, isZero: isZero,
+    inputSign: signA,
+  }
+}
+
+// ---- binary `+` / `-` --------------------------------------------------------
+
+// `a + b`: aligns, adds as signed 96-bit two's complement, panics if that
+// overflowed, then converts the sum back to sign-magnitude — negating it
+// (and marking it negative) only when the sum's own sign bit says so, which
+// also gives a `0` result the canonical positive-zero bit pattern for free
+// (zero's sign bit is always clear, whichever operands produced it).
+fn lowerDecimalAdd(fc: FnCtx, a: int, b: int): int {
+  let ctx = fc.c.ctx
+  let i64ty = primType(ctx, 3)
+  let words = decimalWordTypes(ctx)
+  let aw = explodeValueWords(ctx, fc.b, a, words)
+  let bw = explodeValueWords(ctx, fc.b, b, words)
+  let sum = emitDecimalAddCore(fc, aw[0], aw[1], bw[0], bw[1])
+  emitDecimalOverflowPanic(fc, sum.agrees)
+  let (negLo, negM) = emitDecNegPair(fc, sum.lo, sum.m)
+  let magLo = emitCondVal(fc, sum.neg, i64ty, negLo, sum.lo)
+  let magM = emitCondVal(fc, sum.neg, i64ty, negM, sum.m)
+  let signMasked = emitCondVal(fc, sum.neg, i64ty, emitSignBitConst(fc), emitI64Const(fc, 0))
+  let resultHi = decComposeHi(fc, magM, sum.scale, signMasked)
+  return buildTuple(fc, decimalTupleType(ctx), [magLo, resultHi])
+}
+
+// `a + b` / `a - b` (§12, precedence row 5). `-` is `a + (-b)`, reusing
+// #3982's already-shipped, already-gated unary negate (`lowerDecimalNegate`,
+// lowerdecimal.bit) rather than a second sign-flip. `*`/`/` reach neither
+// this nor `vBinary`'s decimal admission, so they still fail at `bit check`
+// with E0053 before lowering ever sees them.
+//
+// `ty` prefers the caller's `hint` over the node's own checked type when that
+// type is untyped — exactly `lowerExprByTag`'s float-widening rule
+// (lowerexpr.bit), for the identical reason: `0.1 + 0.2` with NEITHER operand
+// already decimal (both untyped-float literals) checks as `untyped float`
+// (`checkBinary` only special-cases decimal when the operands already joined
+// at decimal), so `let total: decimal = 0.1 + 0.2` reaches here with the
+// node's own type still untyped and the decimal-ness carried ONLY by `hint`
+// — the exact shape SPEC §11.1's money example is written in. Without this,
+// `defaultType(untyped float)` is `f64` and the whole expression would
+// silently compute in floating point.
+fn lowerDecimalBinary(fc: FnCtx, node: int, hint: int, n: Node): int {
+  let raw = nodeType(fc, node)
+  let ty = defaultType(fc.c, raw)
+  if (isUntyped(fc.c, raw) && lowerIsDecimal(fc, hint)) {
+    ty = hint
+  }
+  let kids = kidsOf(fc.c.tree, node)
+  let a = lowerExprH(fc, kids[0], ty)
+  let b = lowerExprH(fc, kids[1], ty)
+  if (fc.failed) {
+    return 0
+  }
+  if (n.main == int(Kind.Minus)) {
+    b = lowerDecimalNegate(fc, b)
+  } else if (n.main != int(Kind.Plus)) {
+    fcFail(fc, n.span, "an unsupported binary operator on 'decimal'")
+    return 0
+  }
+  return lowerDecimalAdd(fc, a, b)
+}
+
+// ---- the six comparisons ----------------------------------------------------
+
+// `hi` with its sign bit flipped, leaving scale and mantissa untouched — the
+// comparison path's stand-in for negating a whole decimal VALUE without the
+// canonical-zero guard `lowerDecimalNegate` pays for: flipping a zero
+// magnitude's sign bit here is harmless, because `emitDecSignedPair` reads
+// that flipped bit only to decide whether to two's-complement-negate the
+// magnitude, and negating zero is zero either way — the bogus "negative
+// zero" this could momentarily represent never escapes this function.
+fn emitFlippedSignHi(fc: FnCtx, hi: int): int {
+  return emitBin(fc, Op.BXor, primType(fc.c.ctx, 3), hi, emitSignBitConst(fc))
+}
+
+// The sign of `a - b`, as a plain `-1`/`0`/`1`, for all six relational
+// operators to share (mirroring `lowerCompare`'s string arm, which gets the
+// same three-way shape from `string_cmp`). Reuses `emitDecimalAddCore`
+// rather than a second, magnitude-comparing mechanism — with one correction
+// it does not need: `a`'s and `-b`'s exact difference can need up to 97 bits
+// (each operand's magnitude alone fits 96), so the core's internal 96-bit
+// "overflow" here is not a real arithmetic fault to panic on, only a sign
+// this function has to recover. `agrees == false` fires exactly when `a` and
+// `-b` share a sign and the sum flipped it — which can only happen by
+// genuinely exceeding the 96-bit range in that shared direction, so the
+// shared input sign (`inputSign`) IS the true sign of the difference in that
+// case, and the true difference is then certainly nonzero.
+fn emitDecimalCompareSign(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let diff = emitDecimalAddCore(fc, loA, hiA, loB, emitFlippedSignHi(fc, hiB))
+  let trueNeg = emitCondVal(fc, diff.agrees, boolTy, diff.neg, diff.inputSign)
+  let trueZero = emitCondVal(fc, diff.agrees, boolTy, diff.isZero, emitBoolConst(fc, false))
+  let nonZeroOrd = emitCondVal(fc, trueNeg, i64ty, emitI64Const(fc, 0 - 1), emitI64Const(fc, 1))
+  return emitCondVal(fc, trueZero, i64ty, emitI64Const(fc, 0), nonZeroOrd)
+}
+
+// `lowerCompare`'s (lowercond.bit) decimal arm: explode both operands, get
+// their sign, and dispatch through `cmpOpFor` exactly as the generic numeric
+// path does — `cmpOpFor(op, false, true)` covers all six relational kinds
+// (unlike `strCmpOpFor`, which only covers the four ordering ones), so there
+// is no separate equality case to special-case here the way strings need one.
+fn lowerDecimalCompare(fc: FnCtx, opKind: int, lhs: int, rhs: int): int {
+  let ctx = fc.c.ctx
+  let words = decimalWordTypes(ctx)
+  let lw = explodeValueWords(ctx, fc.b, lhs, words)
+  let rw = explodeValueWords(ctx, fc.b, rhs, words)
+  let sign = emitDecimalCompareSign(fc, lw[0], lw[1], rw[0], rw[1])
+  let cop = cmpOpFor(opKind, false, true)
+  let ins = mkInstr(cop, primType(ctx, 10))
+  ins.lhs = sign
+  ins.rhs = emitI64Const(fc, 0)
+  return builderEmit(fc.b, ins)
+}
