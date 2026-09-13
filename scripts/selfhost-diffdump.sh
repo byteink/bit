@@ -463,9 +463,21 @@ run_ir() {
     # bucket. Unlike the oracle's panic, this one is our own tree's and is a
     # real, actionable regression, so it stays in the no-verdict/exit-2 class
     # rather than being downgraded to purely informational.
+    #
+    # `decline` (#5175): BIT2's dump-ir now reports its own check errors and
+    # exits nonzero on them (compiler/main.bit's `dumpIrCmd`), which the
+    # ORACLE side of this loop already treated as SKIP a few lines up -- this
+    # is that same rule applied symmetrically, not a new one. Without it, any
+    # file only BIT2 declines (a feature the pinned, immutable oracle's own
+    # dump-ir can never gain) fell through to the raw text compare below and
+    # scored a fabricated MISMATCH: an oracle boilerplate empty main against
+    # BIT2's diagnostic text, for a file neither side produced comparable IR
+    # for. A real check-time regression on this file is the CHECK
+    # differential's job (selfhost-diffcheck.sh), not this one's.
     case "$(classify_rc "$rc" "$bcap")" in
       timeout|crash) echo "$f${sep}$(whydied "$rc")" >>"$work/timeout"; continue ;;
       panic)         echo "$f${sep}PANICKED: $(head -n 1 "$bcap")" >>"$work/timeout"; continue ;;
+      decline)       skip=$((skip + 1)); continue ;;
     esac
     b2=$(cat "$bcap")
 
