@@ -2675,11 +2675,11 @@ and `<input disabled={true} />` mean the same thing.
 `props` (a `pkg/web` `[]Node`) carries at the position it is written, mixed
 freely with ordinary attributes and children in the same tag: `<div
 {...props} class="card">hi</div>` renders `props`' own attributes, then
-`class="card"`, then `hi` — each JOINED to the flat list `elem`'s (lowercase)
+`class="card"`, then `hi` - each JOINED to the flat list `elem`'s (lowercase)
 or a component's `children` (uppercase) desugaring already keeps attributes
 and children in (`elem`/`attr`, above). A `{` is legal in attribute position
 ONLY as the start of a spread; a `{` not immediately followed by `...` is a
-compile error naming the mistake, not a `{expr}` value read out of context —
+compile error naming the mistake, not a `{expr}` value read out of context -
 `name={expr}` is still how an attribute's own value is written. `...` is not
 legal in a JSX CHILD position (`{...props}` between two tags is not a spread;
 §12.4's ordinary expression-position rule for `...` applies there unchanged)
@@ -2770,7 +2770,7 @@ call at all: its own expression already IS a `[]Node`, reused as the seed
 directly. Only a fold that STARTS with an ordinary attribute or child seeds
 with `kidFrom` instead (`<div class="card" {...extra} />` ==> `el("div",
 ...kids(kidFrom(attr("class", "card")), extra))`); every step after the
-first — ordinary or spread — extends the running list with `kid` (one item)
+first - ordinary or spread - extends the running list with `kid` (one item)
 or `kids` (a whole spread's slice).
 
 An **uppercase** tag is a component call: an ordinary call to the function
