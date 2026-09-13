@@ -49,14 +49,13 @@ pooler nor the cache. RDS Proxy instead pins the connection, so the pooling
 silently stops happening. Opt in when you know neither is in front of you:
 
 ```bit
-import { pool, Datasource } from "std/sql"
-import { adapter } from "postgres"
-import { env } from "std/os"
-
 fn openCached(): ()! {
-  let db = pool(adapter(), Datasource{
-    uri: env("DATABASE_URL"), maxOpen: 20, statementCache: 256,
-  })?
+  let db = pool(
+    adapter(),
+    Datasource{
+      uri: env("DATABASE_URL"), maxOpen: 20, statementCache: 256,
+    },
+  )?
 }
 ```
 

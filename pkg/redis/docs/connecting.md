@@ -1,5 +1,7 @@
 # Connecting
 
+<!-- doctest: per-block -->
+
 Open a connection to a Redis (or RESP2-compatible) server and run a first
 command against it.
 

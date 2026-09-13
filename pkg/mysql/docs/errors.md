@@ -11,9 +11,9 @@ than on a driver's concrete type, and still compiles after a driver swap:
 import { Pool, Value } from "std/sql"
 
 interface SqlError {
-  message(): string
-  errorCode(): int
-  sqlState(): string
+  message(): string,
+  errorCode(): int,
+  sqlState(): string,
 }
 
 fn isDeadlock(db: Pool, sqlText: string): bool! {
