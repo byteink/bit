@@ -1,0 +1,483 @@
+// `./make test-package-docs` (#5127).
+//
+// THE HOLE THIS CLOSES. `_tests_/bit/docs.bit` (`test-docs`) only ever scans
+// `BIT_DOCS`/`BIT_SPEC`, which default to `${repoRoot()}/docs` and
+// `${repoRoot()}/spec` (`docsrunner/runner.bit`'s `setup()`), and
+// `scripts/gate-buildsteps.sh`'s `pkg)` bucket never named it either — a
+// `pkg/**`-only diff runs `test-packages`/`test-lint-sweep`/`test-fmt`/
+// `test-lint-complexity`/`test-package-release-drift` and nothing else. So no
+// gate anywhere has ever compiled or format-checked a single fenced ```` ```bit
+// ```` block under `pkg/<name>/docs/` or `pkg/<name>/README.md`.
+//
+// CONCRETE, NOT HYPOTHETICAL. `pkg/web/docs/getting-started.md`'s three
+// blocks are a continuation series (block 2 uses `Ctx`/`Res` from block 1's
+// import, block 3 reuses `App`/`Ctx`/`Res` again) but re-declared `App` and
+// `Config` on every block's own `import { ... } from "web"` line — joined the
+// way a reader reads the chapter, that is `error[E0042]: 'App' is already
+// declared in this scope`, reproduced with the real compiler before this gate
+// existed. Separately, #5115's first draft of `pkg/web/docs/envelope.md`
+// shipped a block using `@json class User` with no `import { Json, JsonEntry }
+// from "std/json"` (E0142) and reached a committed branch tip with
+// `scripts/gate.sh` green, because this gate scope did not exist. Both
+// findings are on #5127.
+//
+// WHY A NEW FILE AND NOT A `BIT_DOCS` OVERRIDE ON `test-docs`. A page under
+// `pkg/<name>/docs/` writes `import { App, Config } from "web"` — a real
+// package import, exactly as a consumer of `pkg/<name>` would write it, not a
+// `std/*` import `docs.bit`'s harness already resolves for free. Checking
+// that against `BIT_STDLIB` alone reproduces exactly the E0045 "cannot find
+// module" this file's own probe hit first; checking it by copying the block
+// INTO a scratch copy of `pkg/<name>` (this ticket's first, wrong attempt, and
+// exactly how #5115's `@json` bug survived its author's own first
+// verification pass — a sibling file in the same module silently supplied the
+// missing import) reproduces the "reader pastes into their OWN project" case
+// backwards: a block must compile against only the imports it declares, in a
+// project that has `pkg/<name>` as its ONLY declared dependency, nothing else
+// borrowed. `compiler/pmfetch.bit`'s `scheme == "local"` dependency form
+// (#2244: a bare path or `file://` URL, no ref, no network, no git) is
+// exactly this: each job's scratch project's `bit.json`/`bit.lock` name
+// `<name>` as a local-path dependency pointing at this repo's own
+// `pkg/<name>/`, verified directly against a real `bit add <abs-path>` run
+// (never hand-guessed) to write:
+//   bit.json: {"name": "...", "dependencies": {"web": "/abs/path/to/pkg/web"}}
+//   bit.lock: {"web": {"path": "/abs/path/to/pkg/web", "requires": {}}}
+// A local dependency has no ref to resolve and nothing to fetch (per
+// `pmfetch.bit`'s own comment), so writing this pair directly is exactly what
+// `bit add` would produce, with no subprocess spent doing it.
+//
+// JOINING, NOT PER-BLOCK, BY DEFAULT — same precedent `docs.bit` already set
+// for `docs/`: a chapter's blocks are one module in document order unless the
+// page carries `<!-- doctest: per-block -->`, because that is how a reference
+// chapter is read (and how #5115's own `envelope.md` chapter is written).
+// `pkg/web/docs/getting-started.md` carries no such marker, so its fix is to
+// import each symbol once across the whole page, never to add the marker to
+// dodge the check.
+//
+// WHAT THIS GATE DOES NOT DO YET, ON PURPOSE (scope named, not hidden). It has
+// no `<!-- doctest: test-file -->` support (`docs.bit`'s #4615) — no current
+// `pkg/*/docs/` page declares a `test "..." { }` block, and a page that tried
+// would fail loudly with E0117 rather than pass silently, the same fail-safe
+// direction `docs.bit`'s own marker exists to guarantee. It does not audit
+// every `pkg/*/docs/` page for the E0042 pattern beyond `pkg/web` — #5127's
+// own acceptance is proving this gate catches `getting-started.md`'s E0042
+// red-before/green-after; a wider audit is separate follow-up work, filed as
+// its own ticket rather than silently exempting any file from this gate.
+//
+// Registered in `coreSteps()` (tools/build/defs.bit) beside `test-packages`,
+// deliberately NOT `gateSteps()` — same reason as every other package gate:
+// this must never grow the mandatory `./make test` suite. Added to the `pkg`
+// bucket's `BUILD_STEPS` in `scripts/gate-buildsteps.sh`, the same "examines
+// this bucket's content directly" exception `test-lint-sweep`/`test-fmt`/
+// `test-lint-complexity`/`test-package-release-drift` already are.
+//
+// Configure by environment, since `bit run` forwards no argv:
+//   BIT_REPO             repo root                          (required)
+//   BIT_BIN              compiler under test (default bit-out/bin/bit)
+//   BIT_STDLIB            stdlib root         (default ${BIT_REPO}/stdlib)
+//   BIT_TEST_TIMEOUT_S    per-job deadline, seconds (default 60, max 3600)
+
+import { exists, isDir, mkdir, readDir, readFile, remove, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { join } from "std/path"
+import { contains, hasSuffix, indexOf, parseInt } from "std/strings"
+import { now } from "std/time"
+import { repoRoot, trimInfo } from "./docsrunner"
+
+const defaultTimeoutS: int = 60
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+const fenceTag: string = "```bit"
+const fenceClose: string = "\n```"
+const perBlockMarker: string = "<!-- doctest: per-block -->"
+// A bound on the walk (Power of 10): no page in this corpus is remotely
+// close to it, and a page that somehow hit it would rather be truncated
+// loudly here than let the extractor run unbounded.
+const maxBlocksPerPage: int = 64
+
+// `osRunBounded`'s result encoding (ABI.md §19), same constants
+// `_tests_/bit/packagesgate.bit` already names.
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+// The compiler under test and the per-job deadline: bundled so `processPage`
+// and `runJob` each stay within spec/LINT.md's 5-param ceiling.
+class Cfg { bin: string, deadlineMs: int }
+
+class Block { src: string }
+
+// One check: a page (joined) or one page+block (per-block), the source to
+// check, which package it belongs to (for the local dependency the scratch
+// project declares), and where it came from for reporting.
+class Job {
+  page: string,
+  block: int, // 0 for a joined job, 1-based for a per-block job
+  src: string,
+  pkgName: string,
+  pkgAbsPath: string,
+}
+
+class Stats {
+  pages: int,
+  pagesWithBlocks: int,
+  totalBlocks: int,
+  jobs: int,
+  failures: int,
+  fmtFailures: int,
+  nextIdx: int, // the next scratch-dir index to hand out, so it survives across pages
+}
+
+fn zeroStats(): Stats {
+  return Stats{
+    pages: 0, pagesWithBlocks: 0, totalBlocks: 0, jobs: 0, failures: 0, fmtFailures: 0, nextIdx: 0,
+  }
+}
+
+// The `pkg/<name>/` directory names that exist right now, same
+// filesystem-driven discovery `tools/build/gates.bit`'s `packageNames()`
+// already uses, reproduced here rather than imported since that file is a
+// `tools/build/` module and this is a `_tests_/bit/` one.
+fn packageNames(pkgDir: string): []string {
+  let names = readDir(pkgDir) catch e {
+    fatal("cannot read ${pkgDir}: ${e.message()}")
+    return []string(0)
+  }
+  let out = []string(0)
+  for name of names {
+    if (len(name) > 0 && name[0] == '.') {
+      continue
+    }
+    if (isDir(join(pkgDir, name))) {
+      out = append(out, name)
+    }
+  }
+  return out
+}
+
+// A package's own doc pages: every `docs/*.md`, then `README.md` if it
+// exists — sorted within each group by `readDir`'s own contract, so a run's
+// output order is reproducible.
+fn packagePages(pkgDir: string, name: string): []string {
+  let out = []string(0)
+  let docsDir = join(join(pkgDir, name), "docs")
+  if (isDir(docsDir)) {
+    let entries = readDir(docsDir) catch e {
+      fatal("cannot read ${docsDir}: ${e.message()}")
+      return out
+    }
+    for f of entries {
+      if (hasSuffix(f, ".md")) {
+        out = append(out, join(docsDir, f))
+      }
+    }
+  }
+  let readme = join(join(pkgDir, name), "README.md")
+  if (exists(readme)) {
+    out = append(out, readme)
+  }
+  return out
+}
+
+// Every fenced ```` ```bit ```` block on the page whose info string is empty
+// (so ```` ```bit ignore ```` and a bare ```` ``` ```` are excluded, and
+// ```` ```bitrot ```` never matches the tag at all) — `docs.bit`'s own
+// `extractBlocks` contract, reproduced here since this file's corpus and
+// consumer (a per-package job, not a per-page one) differ enough that
+// sharing the function across a module boundary would need exporting the
+// whole extraction shape from `docsrunner`, which `docs.bit`'s own header
+// already assigns to itself, not to the batch runner.
+fn extractBlocks(md: string): []Block {
+  let blocks = []Block(0)
+  let rest = md
+  while (len(blocks) < maxBlocksPerPage) {
+    let tagRel = indexOf(rest, fenceTag)
+    if (tagRel < 0) {
+      break
+    }
+    let t = int(tagRel)
+    let atLineStart = t == 0 || rest[t - 1] == '\n'
+    let afterTag = rest[t + len(fenceTag):]
+    let nlRel = indexOf(afterTag, "\n")
+    if (nlRel < 0) {
+      break
+    }
+    let n = int(nlRel)
+    let info = trimInfo(afterTag[:n])
+    let body = afterTag[n + 1:]
+    let closeRel = indexOf(body, fenceClose)
+    if (closeRel < 0) {
+      break
+    }
+    let c = int(closeRel)
+    if (atLineStart && len(info) == 0) {
+      blocks = append(blocks, Block{ src: body[:c] })
+    }
+    rest = body[c:]
+  }
+  return blocks
+}
+
+fn joinBlocks(blocks: []Block): string {
+  let out = ""
+  for b of blocks {
+    out = out + b.src + "\n\n"
+  }
+  return normalizeTrailingNewline(out)
+}
+
+// A checkable module must end in exactly one newline, or `bit fmt --check`
+// reports drift that has nothing to do with the author's style — same reason
+// `docs.bit`'s own `normalizeTrailingNewline` exists.
+fn normalizeTrailingNewline(src: string): string {
+  let trimmed = src
+  while (len(trimmed) > 0 && trimmed[len(trimmed) - 1] == '\n') {
+    trimmed = trimmed[:len(trimmed) - 1]
+  }
+  return trimmed + "\n"
+}
+
+fn jobsForPage(
+  page: string,
+  md: string,
+  blocks: []Block,
+  pkgName: string,
+  pkgAbsPath: string,
+): []Job {
+  if (contains(md, perBlockMarker)) {
+    let out = []Job(0)
+    let i = 0
+    while (i < len(blocks)) {
+      out = append(
+        out,
+        Job{
+          page: page, block: i + 1, src: normalizeTrailingNewline(blocks[i].src),
+          pkgName: pkgName, pkgAbsPath: pkgAbsPath,
+        },
+      )
+      i = i + 1
+    }
+    return out
+  }
+  return [
+    Job{ page: page, block: 0, src: joinBlocks(blocks), pkgName: pkgName, pkgAbsPath: pkgAbsPath },
+  ]
+}
+
+fn fatal(msg: string) {
+  eprint("pkgdocsgate: ${msg}\n")
+  exit(1)
+}
+
+fn timeoutMs(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) {
+    return defaultTimeoutS * 1000
+  }
+  let n = parseInt(raw) catch _ {
+    eprint("pkgdocsgate: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS * 1000
+  }
+  if (n < 1) {
+    return 1000
+  }
+  if (n > maxTimeoutS) {
+    return maxTimeoutS * 1000
+  }
+  return n * 1000
+}
+
+// One job's scratch project: `bit.json`/`bit.lock` declaring `pkgName` as a
+// local-path dependency on `pkgAbsPath` (verified against a real `bit add
+// <abs-path>` run — see this file's header), and the job's own source as
+// `main.bit`. Nothing else — no sibling file can lend it an import that its
+// own source did not declare.
+fn writeJobProject(dir: string, pkgName: string, pkgAbsPath: string, src: string) {
+  mkdir(dir) catch e {
+    fatal("cannot create ${dir}: ${e.message()}")
+  }
+  let bitJson = "{\"name\": \"pkgdocsgate-check\", \"dependencies\": {\"${pkgName}\": \"${pkgAbsPath}\"}}\n"
+  let bitLock = "{\"${pkgName}\": {\"path\": \"${pkgAbsPath}\", \"requires\": {}}}\n"
+  writeFile(join(dir, "bit.json"), bitJson) catch e {
+    fatal("cannot write ${dir}/bit.json: ${e.message()}")
+  }
+  writeFile(join(dir, "bit.lock"), bitLock) catch e {
+    fatal("cannot write ${dir}/bit.lock: ${e.message()}")
+  }
+  writeFile(join(dir, "main.bit"), src) catch e {
+    fatal("cannot write ${dir}/main.bit: ${e.message()}")
+  }
+}
+
+fn dropProject(dir: string) {
+  for f of ["bit.json", "bit.lock", "main.bit"] {
+    let p = join(dir, f)
+    if (exists(p)) {
+      remove(p) catch e {
+        eprint("pkgdocsgate: warning: cannot remove ${p}: ${e.message()}\n")
+      }
+    }
+  }
+  if (exists(dir)) {
+    remove(dir) catch e {
+      eprint("pkgdocsgate: warning: cannot remove ${dir}: ${e.message()}\n")
+    }
+  }
+}
+
+// Runs `cmd` (already a full shell command line) as one bounded `/bin/sh`
+// child with its output captured to `log` — same shape as
+// `_tests_/bit/packagesgate.bit`'s own `runBounded`, since `osRunBounded`
+// takes a script path and no argv (ABI.md §19).
+fn runBounded(script: string, log: string, cmd: string, deadlineMs: int): int {
+  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
+    eprint("pkgdocsgate: cannot write ${script}: ${e.message()}\n")
+    return rcSpawnFailed
+  }
+  if (fsChmod(script, 493) != 0) {
+    eprint("pkgdocsgate: cannot make ${script} executable\n")
+    fsRemove(script)
+    return rcSpawnFailed
+  }
+  let r = osRunBounded(script, deadlineMs)
+  fsRemove(script)
+  return r
+}
+
+fn readLog(log: string): string {
+  let text = readFile(log) catch _ {
+    ""
+  }
+  fsRemove(log)
+  return text
+}
+
+fn describeFailure(r: int): string {
+  if (r == rcTimedOut) {
+    return "TIMED OUT"
+  }
+  if (r <= rcSignalBase) {
+    return "CRASHED — signal ${0 - r + rcSignalBase}"
+  }
+  if (r == rcSpawnFailed) {
+    return "could not spawn"
+  }
+  return "exited ${r}"
+}
+
+fn jobLabel(j: Job): string {
+  if (j.block == 0) {
+    return j.page
+  }
+  return "${j.page} block #${j.block}"
+}
+
+// Checks one job in its own scratch project, `bit check` then (only if that
+// passed) `bit fmt --check` — same two-verdict shape `docs.bit` runs against
+// `docs/`.
+fn runJob(cfg: Cfg, j: Job, idx: int, st: Stats): Stats {
+  let out = st
+  let dir = "/tmp/bit-pkgdocsgate-${j.pkgName}-${now().ns}-${idx}"
+  writeJobProject(dir, j.pkgName, j.pkgAbsPath, j.src)
+
+  let checkLog = "${dir}.check.log"
+  let checkCmd = "exec \"${cfg.bin}\" check \"${dir}\""
+  let checkR = runBounded("${dir}.check.sh", checkLog, checkCmd, cfg.deadlineMs)
+  if (checkR != 0) {
+    out.failures = out.failures + 1
+    let text = readLog(checkLog)
+    eprint("\npkgdocsgate: FAIL ${jobLabel(j)} does not typecheck (${describeFailure(checkR)}):\n${text}\n--- module ---\n${j.src}\n")
+    dropProject(dir)
+    return out
+  }
+  fsRemove(checkLog)
+
+  let fmtLog = "${dir}.fmt.log"
+  let fmtCmd = "exec \"${cfg.bin}\" fmt --check \"${dir}\""
+  let fmtR = runBounded("${dir}.fmt.sh", fmtLog, fmtCmd, cfg.deadlineMs)
+  if (fmtR != 0) {
+    out.fmtFailures = out.fmtFailures + 1
+    let text = readLog(fmtLog)
+    eprint("\npkgdocsgate: FAIL ${jobLabel(j)} is not canonically formatted (${describeFailure(fmtR)}):\n${text}\n--- module ---\n${j.src}\n")
+    dropProject(dir)
+    return out
+  }
+  fsRemove(fmtLog)
+
+  dropProject(dir)
+  return out
+}
+
+// One page's contribution: read it, extract its blocks, queue and run its
+// job(s). Split out of `main` to keep both functions under the complexity
+// ceiling (spec/LINT.md) — the walk itself (which packages, which pages) and
+// one page's own extract-and-check work are two different concerns.
+fn processPage(cfg: Cfg, pkgName: string, pkgAbsPath: string, page: string, st: Stats): Stats {
+  let out = st
+  out.pages = out.pages + 1
+  let md = readFile(page) catch e {
+    fatal("cannot read ${page}: ${e.message()}")
+    ""
+  }
+  let blocks = extractBlocks(md)
+  if (len(blocks) == 0) {
+    return out
+  }
+  if (len(blocks) >= maxBlocksPerPage) {
+    fatal("${page} hit the maxBlocksPerPage bound of ${maxBlocksPerPage}; blocks past it are silently unchecked")
+  }
+  out.pagesWithBlocks = out.pagesWithBlocks + 1
+  out.totalBlocks = out.totalBlocks + len(blocks)
+  for j of jobsForPage(page, md, blocks, pkgName, pkgAbsPath) {
+    out.jobs = out.jobs + 1
+    out = runJob(cfg, j, out.nextIdx, out)
+    out.nextIdx = out.nextIdx + 1
+  }
+  return out
+}
+
+// The floor and the final verdict, split out of `main` for the same
+// complexity reason `processPage` above is.
+fn reportResult(st: Stats, names: []string, pkgDir: string) {
+  // A corpus that produced zero checkable blocks across every package is the
+  // extractor silently finding nothing, not a legitimately empty corpus —
+  // every package under `pkg/` today ships at least one real ```bit block in
+  // its README or docs/.
+  if (st.jobs == 0) {
+    fatal("0 checkable block(s) across ${len(names)} package(s) under ${pkgDir} — the fence match broke, or every page lost its blocks")
+  }
+  if (st.failures != 0 || st.fmtFailures != 0) {
+    eprint("pkgdocsgate: FAILED — ${st.failures} typecheck failure(s), ${st.fmtFailures} fmt failure(s) of ${st.jobs} job(s) over ${st.pagesWithBlocks} page(s) in ${len(names)} package(s)\n")
+    exit(1)
+  }
+  print("pkgdocsgate: ok — ${st.totalBlocks} block(s) over ${st.pagesWithBlocks} page(s), ${st.jobs} job(s) checked across ${len(names)} package(s) under ${pkgDir}\n")
+}
+
+fn main() {
+  let root = repoRoot()
+  let bin = envOr("BIT_BIN", "${root}/bit-out/bin/bit")
+  if (!exists(bin)) {
+    fatal("compiler not found: ${bin} (set BIT_BIN)")
+  }
+  let pkgDir = "${root}/pkg"
+  if (!isDir(pkgDir)) {
+    fatal("not a directory: ${pkgDir}")
+  }
+
+  let names = packageNames(pkgDir)
+  if (len(names) == 0) {
+    print("pkgdocsgate: 0 package(s) under ${pkgDir} — nothing to check\n")
+    return
+  }
+
+  let cfg = Cfg{ bin: bin, deadlineMs: timeoutMs() }
+  let st = zeroStats()
+  for name of names {
+    let pkgAbsPath = join(pkgDir, name)
+    for page of packagePages(pkgDir, name) {
+      st = processPage(cfg, name, pkgAbsPath, page, st)
+    }
+  }
+
+  reportResult(st, names, pkgDir)
+}
