@@ -374,6 +374,18 @@ connection is back in the pool before this returns.
 Closes every idle connection and fails every parked caller. Connections
 still checked out are closed as they are returned. Idempotent.
 
+### `Pool.txValue<T>(f: (Tx) => T!): T!`
+
+`txValue` as a method: runs `f` in a transaction and returns what `f`
+returned, once the commit has succeeded. Nothing is returned on a failure,
+because the value is only a result if the work behind it is durable.
+`db.txValue(f)` and `txValue(db, f)` run the same code.
+
+### `Pool.txValueAt<T>(level: Isolation, f: (Tx) => T!): T!`
+
+`Pool.txValue` at the isolation level `level` instead of the database's own.
+This is the one implementation; the other three are spellings of it.
+
 ### `FatalError`
 
 ```
