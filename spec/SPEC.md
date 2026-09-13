@@ -2640,7 +2640,7 @@ jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) } .
 
 **`jsx_name` is not a Bit identifier (#5155).** JSX's own grammar names this
 production `JSXIdentifier`, and it differs from `IDENT` in exactly two ways,
-both permitted only here — in a tag's own name or one of its attribute
+both permitted only here, in a tag's own name or one of its attribute
 names, never anywhere else a Bit identifier is expected:
 
 1. **A reserved word is a legal `jsx_name`.** `<div class="card">`,
@@ -2660,7 +2660,7 @@ names, never anywhere else a Bit identifier is expected:
 
 `jsx_name`'s hyphenated, keyword-permitting spelling reaches `elem`/`attr`
 (the lowercase desugaring, below) as an ordinary quoted string exactly as
-written — `data-id` is the literal `attr("data-id", ...)` name — and reaches
+written: `data-id` is the literal `attr("data-id", ...)` name, and reaches
 an uppercase component call as the named argument's name, matched by text
 the same way any other named argument is (§12.11).
 
