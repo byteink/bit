@@ -39,21 +39,23 @@ fn main(): ()! {
 those four alongside the constructors they wrap is all a view needs.
 
 ```bit
-import { Node, render, elem, attr, frag, text } from "web"
+import { Node, elem, attr, frag, text } from "web"
 
 fn Row(name: string): Node {
   let item = <li>{text(name)}</li>
   return item
 }
 
-fn page(name: string): string {
-  let tree = <div id="x"><Row name={name} /></div>
-  return render(tree)
+fn page(name: string): Node {
+  return <div id="x"><Row name={name} /></div>
 }
 ```
 
-A component is a plain function returning `Node` (`Row` above); `el(tag,
-...kids)` stays the explicit way to build an element with a dynamic tag name.
+A component is a plain function returning `Node` (`Row` and `page` above); no
+`render()` call is needed to return JSX, only to flatten a tree into a string
+for something outside Bit - a file, stdout, a socket. `c.html(n)` takes the
+`Node` directly. `el(tag, ...kids)` stays the explicit way to build an
+element with a dynamic tag name.
 
 ## Documentation
 
