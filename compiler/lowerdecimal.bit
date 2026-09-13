@@ -153,10 +153,11 @@ fn lowerDecimalConst(fc: FnCtx, n: Node): int {
 // return value — decimal included, since `explodedWordTypes` admits it by
 // name — through the same `materializeExplodedIn` a field read uses; nothing
 // there is decimal-specific, so passing the node through is the whole fix.
-// Arithmetic is NOT on the list and must not be — `binOpFor` has no decimal
-// case, so `a + b` on two decimals would emit `Op.Add` on two POINTERS and
-// print nondeterministic garbage at exit 0, which is #4438's failure exactly.
-// It comes off the list with the arithmetic slice, not before.
+// Unary `-`/`+` (#3982) is on the list, via `lowerDecimalUnary` below. Binary
+// arithmetic and comparison are NOT — `binOpFor` has no decimal case, so
+// `a + b` on two decimals would emit `Op.Add` on two POINTERS and print
+// nondeterministic garbage at exit 0, which is #4438's failure exactly. They
+// stay off the list until scale alignment (needed by both) lands with them.
 fn lowerDecimalExpr(fc: FnCtx, node: int, hint: int, n: Node): int {
   if (n.tag == Tag.IntLit || n.tag == Tag.FloatLit) {
     return lowerDecimalConst(fc, n)
@@ -167,8 +168,112 @@ fn lowerDecimalExpr(fc: FnCtx, node: int, hint: int, n: Node): int {
   if (n.tag == Tag.Member) {
     return lowerDecimalFieldGet(fc, node, n)
   }
+  if (n.tag == Tag.Unary) {
+    return lowerDecimalUnary(fc, node, hint, n)
+  }
   fcFail(fc, n.span, "this 'decimal' operation (§5.3): its codegen is not implemented yet")
   return 0
+}
+
+// Unary `-d`/`+d` on a decimal (§12, precedence row 7). `+d` is the identity,
+// same as every other numeric type (`lowerUnary`, lowercond.bit). `-d` flips
+// the sign bit (hi word, bit 63) of the sign-magnitude representation —
+// UNLESS the magnitude is zero, because zero has no sign (§11.1: "a `decimal`
+// field needs no special handling anywhere" holds only if the zero value is
+// the single all-zero bit pattern). Without that guard, `-0.0` prints "-0.00"
+// (`rtStringFromDecimal`, runtime/root/decimal.bit, reads the sign bit
+// unconditionally) for a value the language never lets a programmer write
+// negative in the first place — `decimalConstOf` never sets the sign bit, so
+// this operator is the only way a negative decimal is ever produced, and
+// letting it mint a negative zero would be a new, avoidable wrong answer.
+fn lowerDecimalUnary(fc: FnCtx, node: int, hint: int, n: Node): int {
+  let opNode = kidsOf(fc.c.tree, node)[0]
+  let operand = lowerExprH(fc, opNode, hint)
+  if (fc.failed) {
+    return 0
+  }
+  if (n.main == int(Kind.Plus)) {
+    return operand
+  }
+  if (n.main != int(Kind.Minus)) {
+    fcFail(fc, n.span, "an unsupported unary operator on 'decimal'")
+    return 0
+  }
+  return lowerDecimalNegate(fc, operand)
+}
+
+// The sign flip itself, shared by nothing else yet — split out of
+// `lowerDecimalUnary` so that function stays a plain dispatch.
+fn lowerDecimalNegate(fc: FnCtx, v: int): int {
+  let ctx = fc.c.ctx
+  let i64ty = primType(ctx, 3)
+  let boolTy = primType(ctx, 10)
+  let words = explodeValueWords(ctx, fc.b, v, decimalWordTypes(ctx))
+  let lo = words[0]
+  let hi = words[1]
+
+  // The mantissa's top 32 bits live in hi's low 32 bits (the banner in this
+  // file's header); zero-test the whole 96-bit mantissa as `lo | (hi & mask)`
+  // so a single ICmpEq decides it.
+  let maskIns = mkInstr(Op.ConstInt, i64ty)
+  maskIns.ival = 4294967295
+  let maskV = builderEmit(fc.b, maskIns)
+  let mantHiIns = mkInstr(Op.BAnd, i64ty)
+  mantHiIns.lhs = hi
+  mantHiIns.rhs = maskV
+  let mantHiV = builderEmit(fc.b, mantHiIns)
+  let combinedIns = mkInstr(Op.BOr, i64ty)
+  combinedIns.lhs = lo
+  combinedIns.rhs = mantHiV
+  let combinedV = builderEmit(fc.b, combinedIns)
+  let zeroIns = mkInstr(Op.ConstInt, i64ty)
+  zeroIns.ival = 0
+  let zeroV = builderEmit(fc.b, zeroIns)
+  let isZeroIns = mkInstr(Op.ICmpEq, boolTy)
+  isZeroIns.lhs = combinedV
+  isZeroIns.rhs = zeroV
+  let isZeroV = builderEmit(fc.b, isZeroIns)
+
+  let keepBlk = builderNewBlock(fc.b)
+  let flipBlk = builderNewBlock(fc.b)
+  let join = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = isZeroV
+  br.ival = keepBlk
+  br.thenArgs = []int(0)
+  br.ival2 = flipBlk
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, keepBlk)
+  emitJump(fc, join, [hi])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, flipBlk)
+  // Bit 63 as `1i64 << 63` rather than the literal -9223372036854775808: the
+  // positive magnitude before negation (9223372036854775808) is itself one
+  // past i64's positive range, the same representability trap as C's INT_MIN.
+  let oneIns = mkInstr(Op.ConstInt, i64ty)
+  oneIns.ival = 1
+  let oneV = builderEmit(fc.b, oneIns)
+  let shamtIns = mkInstr(Op.ConstInt, i64ty)
+  shamtIns.ival = 63
+  let shamtV = builderEmit(fc.b, shamtIns)
+  let signBitIns = mkInstr(Op.Shl, i64ty)
+  signBitIns.lhs = oneV
+  signBitIns.rhs = shamtV
+  let signBitV = builderEmit(fc.b, signBitIns)
+  let flipIns = mkInstr(Op.BXor, i64ty)
+  flipIns.lhs = hi
+  flipIns.rhs = signBitV
+  let flippedV = builderEmit(fc.b, flipIns)
+  emitJump(fc, join, [flippedV])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, join)
+  let newHi = builderAddParam(fc.b, i64ty)
+  return buildTuple(fc, decimalTupleType(ctx), [lo, newHi])
 }
 
 // Lowers `s.f` where `f` is a decimal class field (§13.4): the field is 16
