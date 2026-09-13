@@ -39,8 +39,13 @@ class BuildResult { ok: bool, timedOut: bool }
 // is what `main`'s corpus-wide plumbing assertion counts. `inconclusive` (#2401)
 // marks a program the deadline could not judge at all, even after load-scaling —
 // counted separately from `failed` in `main`'s denominator so a busy-host
-// timeout never reads as the same claim as a wrong answer.
-class Verdict { failed: int, inconclusive: int, oracled: bool, proved: bool }
+// timeout never reads as the same claim as a wrong answer. `timeoutLine` is
+// non-empty exactly when `inconclusive == 1` (#5118): the harness's own
+// INCONCLUSIVE summary used to give a count with no names to re-run standalone,
+// so the identity is captured here, at the one site that still knows the
+// program's name, phase and elapsed time, for `verdict.bit`'s `reportJudged`
+// to print back out verbatim.
+class Verdict { failed: int, inconclusive: int, oracled: bool, proved: bool, timeoutLine: string }
 
 // The three oracle markers `judgeVerdict` needs, grouped into one class
 // (#3776) so that function and its `judgeOracled` helper stay at the 5-param
@@ -50,13 +55,45 @@ class Verdict { failed: int, inconclusive: int, oracled: bool, proved: bool }
 class JudgeMarkers { noCollect: bool, noAbandon: bool, waived: bool }
 
 // The shared "this program's verdict is bad" constructor for every early-return
-// site in `checkProgram`: `timedOut` routes the outcome to `inconclusive`
-// instead of `failed` (#2401) — every other failure reason is unchanged.
-fn badVerdict(timedOut: bool): Verdict {
+// site in `checkProgram`/`fanout.bit`'s `gradeOne`: `timedOut` routes the
+// outcome to `inconclusive` instead of `failed` (#2401) - every other failure
+// reason is unchanged. `timeoutLine` is the caller's own `buildTimeoutLine`
+// result when `timedOut` is true, "" otherwise (#5118) - never computed here,
+// since this function has neither the program's name nor its elapsed time.
+fn badVerdict(timedOut: bool, timeoutLine: string): Verdict {
   if (timedOut) {
-    return Verdict{ failed: 0, inconclusive: 1, oracled: false, proved: false }
+    return Verdict{
+      failed: 0,
+      inconclusive: 1,
+      oracled: false,
+      proved: false,
+      timeoutLine: timeoutLine,
+    }
   }
-  return Verdict{ failed: 1, inconclusive: 0, oracled: false, proved: false }
+  return Verdict{ failed: 1, inconclusive: 0, oracled: false, proved: false, timeoutLine: "" }
+}
+
+// Formats one inconclusive program's identity for the #5118 summary block.
+// `runScript`'s own "TIMED OUT after Xs" line (above) never names the program
+// or the phase - it is called before either is in scope there - so the
+// caller, which knows both plus the elapsed time `runScript`/the batch
+// deadline returned, builds this once and `badVerdict` carries it through
+// unchanged. `elapsedMs` for a TIMED OUT verdict is by definition the
+// deadline that elapsed, so "elapsed" and "deadline" are the same number.
+fn buildTimeoutLine(name: string, label: string, elapsedMs: int): string {
+  let secs = num(elapsedMs / 1000)
+  return "  " + name + "  [" + label + "]  " + secs + "s (deadline " + secs + "s)"
+}
+
+// Collapses the "badVerdict, but only compute the #5118 line when this call
+// actually timed out" shape every early-return site below shares - serial
+// (`checkProgram`) and batch (`fanout.bit`'s `gradeOne`) alike.
+fn timedOutVerdict(name: string, label: string, timedOut: bool, elapsedMs: int): Verdict {
+  let line = ""
+  if (timedOut) {
+    line = buildTimeoutLine(name, label, elapsedMs)
+  }
+  return badVerdict(timedOut, line)
 }
 
 // --- files ------------------------------------------------------------------
@@ -289,8 +326,11 @@ fn loadProbe(cx: Ctx): LoadProbe {
 // scaled by CURRENTLY observed host load (#2401). A timeout is reported here,
 // once, with the scale and the load average that produced the deadline - every
 // caller's own "TIMED OUT" message (via `runMsg`) still separately names the
-// program and the phase, unchanged.
-fn runScript(cx: Ctx, path: string, body: string): int {
+// program and the phase, unchanged. Returns (code, effMs): `effMs` is the
+// scaled deadline actually applied, which callers that know the program's
+// name and phase (`buildProgram`, `runOnce`) reuse as the elapsed time for
+// the #5118 INCONCLUSIVE summary - `runScript` itself never learns either.
+fn runScript(cx: Ctx, path: string, body: string): (int, int) {
   if (!writeText(path, body)) {
     die("cannot write wrapper script " + path)
   }
@@ -316,7 +356,7 @@ fn runScript(cx: Ctx, path: string, body: string): int {
         " at launch)",
     )
   }
-  return r
+  return r, effMs
 }
 
 // --- one program ------------------------------------------------------------
@@ -325,7 +365,7 @@ fn runScript(cx: Ctx, path: string, body: string): int {
 // archive and stdlib so the harness is independent of its working directory, and
 // a whole-PROJECT build (not a single module) is what `_tests_/stress/spinlock`
 // needs: it imports the lock under test straight out of `runtime/`.
-fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): BuildResult {
+fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): (BuildResult, int) {
   let base = cx.scratch + "/" + name
   let errPath = base + ".berr"
   let body = "#!/bin/sh\n" +
@@ -344,16 +384,16 @@ fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): BuildResult {
     " 2>" +
     shQuote(errPath) +
     "\n"
-  let r = runScript(cx, base + ".build.sh", body)
+  let (r, elapsedMs) = runScript(cx, base + ".build.sh", body)
   if (r == 0) {
-    return BuildResult{ ok: true, timedOut: false }
+    return BuildResult{ ok: true, timedOut: false }, elapsedMs
   }
   say("stress '" + name + "' [compile]: " + runMsg(r))
   let e = readText(errPath)
   if (e.ok) {
     say(trim(e.body))
   }
-  return BuildResult{ ok: false, timedOut: r == -2 }
+  return BuildResult{ ok: false, timedOut: r == -2 }, elapsedMs
 }
 
 // What one execution produced, bundled (#3776, E0202's 5-param ceiling) so
@@ -449,7 +489,7 @@ class ProgramRun {
 // one shared pair of paths, a second run whose redirect never happened would
 // read the FIRST run's output and its stats line, and report the default run's
 // numbers as the stress run's. Absent has to look absent.
-fn runOnce(cx: Ctx, pr: ProgramRun, slot: string, label: string, envLine: string): Outcome {
+fn runOnce(cx: Ctx, pr: ProgramRun, slot: string, label: string, envLine: string): (Outcome, int) {
   let base = cx.scratch + "/" + pr.name + "." + slot
   let outPath = base + ".out"
   let errPath = base + ".err"
@@ -462,7 +502,7 @@ fn runOnce(cx: Ctx, pr: ProgramRun, slot: string, label: string, envLine: string
     " 2>" +
     shQuote(errPath) +
     "\n"
-  let r = runScript(cx, base + ".run.sh", body)
+  let (r, elapsedMs) = runScript(cx, base + ".run.sh", body)
   let timedOut = r == -2
 
   let errText = readText(errPath)
@@ -476,20 +516,22 @@ fn runOnce(cx: Ctx, pr: ProgramRun, slot: string, label: string, envLine: string
         errPath +
         " - the wrapper never ran, so nothing about this program was verified",
     )
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: timedOut }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: timedOut },
+      elapsedMs
   }
   if (r != 0) {
     let bad = RunCapture{ code: r, timedOut: timedOut, outBody: "", errBody: errText.body }
-    return judgeRun(pr.name, label, bad, pr.expected, pr.statsRequired)
+    return judgeRun(pr.name, label, bad, pr.expected, pr.statsRequired), elapsedMs
   }
 
   let outText = readText(outPath)
   if (!outText.ok) {
     say("stress '" + pr.name + "' [" + label + "]: could not read captured stdout " + outPath)
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false },
+      elapsedMs
   }
   let ok = RunCapture{ code: r, timedOut: false, outBody: outText.body, errBody: errText.body }
-  return judgeRun(pr.name, label, ok, pr.expected, pr.statsRequired)
+  return judgeRun(pr.name, label, ok, pr.expected, pr.statsRequired), elapsedMs
 }
 
 // Both policies for one program, plus the oracles the second run must satisfy.
@@ -500,7 +542,7 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
     // A hard error, never a skip: a rename would otherwise delete a program from
     // the corpus in silence.
     say("stress '" + name + "': cannot read " + dir + "/" + name + ".expected")
-    return badVerdict(false)
+    return badVerdict(false, "")
   }
 
   let noCollect = readMarker(name, dir, "no-collect")
@@ -520,13 +562,13 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
   let workers = workersOverride(dir)
   if (workers == workersInvalid) {
     say("stress '" + name + "': bad workers file")
-    return badVerdict(false)
+    return badVerdict(false, "")
   }
 
   let bin = cx.scratch + "/bin-" + name
-  let build = buildProgram(cx, name, dir, bin)
+  let (build, buildElapsedMs) = buildProgram(cx, name, dir, bin)
   if (!build.ok) {
-    return badVerdict(build.timedOut)
+    return timedOutVerdict(name, "compile", build.timedOut, buildElapsedMs)
   }
 
   let base = "default"
@@ -540,10 +582,10 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
     expected: expected.body,
     statsRequired: !noStats.present,
   }
-  let first = runOnce(cx, pr, "a", base, firstEnv)
+  let (first, firstElapsedMs) = runOnce(cx, pr, "a", base, firstEnv)
   if (!first.ok) {
     fsRemove(bin)
-    return badVerdict(first.timedOut)
+    return timedOutVerdict(name, base, first.timedOut, firstElapsedMs)
   }
 
   let label = "BIT_GC=stress"
@@ -559,10 +601,10 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
   if (workers != workersAbsent) {
     envLine = "BIT_WORKERS=" + num(workers) + " " + envLine
   }
-  let second = runOnce(cx, pr, "b", label, envLine)
+  let (second, secondElapsedMs) = runOnce(cx, pr, "b", label, envLine)
   fsRemove(bin)
   if (!second.ok) {
-    return badVerdict(second.timedOut)
+    return timedOutVerdict(name, label, second.timedOut, secondElapsedMs)
   }
 
   let m = JudgeMarkers{
@@ -589,7 +631,7 @@ fn judgeVerdict(
   second: Outcome,
 ): Verdict {
   if (!second.statsOk) {
-    return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false }
+    return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false, timeoutLine: "" }
   }
   if (m.waived) {
     return judgeWaived(name, label, second)
@@ -611,9 +653,9 @@ fn judgeWaived(name: string, label: string, second: Outcome): Verdict {
         num(second.collections) +
         " collections under BIT_GC=off. The policy in the wrapper did not reach the child.",
     )
-    return badVerdict(false)
+    return badVerdict(false, "")
   }
-  return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false }
+  return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false, timeoutLine: "" }
 }
 
 // The non-waived case: the collection-oracle margin, then the `no-abandon`
@@ -634,7 +676,7 @@ fn judgeOracled(
       say("  nothing about rooting. Give the program a loop where the roots it cares about are")
       say("  live, or - if it proves something about emission or linking rather than rooting -")
       say("  add a 'no-collect' file to its directory stating why.")
-      return badVerdict(false)
+      return badVerdict(false, "")
     }
     // The policy differential, and the reason it is reported rather than
     // enforced HERE. Allocation-driven programs clear `stressRatio` by two to
@@ -681,7 +723,7 @@ fn judgeOracled(
     say("  program's 'no-abandon' marker says none may be. Something stayed in the mutator")
     say("  registry as 'running' that should not have - usually an OS thread that exited")
     say("  without its slot being released (ABI.md §6).")
-    return badVerdict(false)
+    return badVerdict(false, "")
   }
-  return Verdict{ failed: 0, inconclusive: 0, oracled: oracled, proved: proved }
+  return Verdict{ failed: 0, inconclusive: 0, oracled: oracled, proved: proved, timeoutLine: "" }
 }
