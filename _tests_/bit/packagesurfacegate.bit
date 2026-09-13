@@ -1,0 +1,371 @@
+// _tests_/bit/packagesurfacegate.bit — `./make test-package-surface-<name>`
+// (#5120): reports a `pkg/<name>` package's exported-surface delta against
+// its own newest `<name>/v*` release tag, classified ADDED / REMOVED /
+// CHANGED.
+//
+// THE INCIDENT THIS CLOSES. `web/v0.1.0 -> v0.2.0` read as six additions and
+// two removals — purely additive. It was not: `pkg/web/escape.bit`'s
+// escaper `url(s: string): string!` was renamed to `safeUrl(s)`, freeing the
+// bare name for `pkg/web/validate.bit`'s validator, which took it from
+// `httpUrl(v)`. Two renames crossing at one name — a name present on BOTH
+// sides with a DIFFERENT rendered signature — is exactly the shape a plain
+// set difference over rendered top-level lines hides: it never groups by
+// name, so `url`'s old line is filed as REMOVED and its new line as ADDED,
+// two entries that happen to share a name by coincidence as far as the diff
+// is concerned. `Bind.unknown` also became an exported FIELD in the same
+// release, which a top-level-declaration scan (`^export `) does not see at
+// all, since it collapses a class body to its opening line.
+//
+// WHY `bit doc --fields`, AND WHY THAT RENDERER IS NOT REWRITTEN HERE. Same
+// instrument and the same reason as `_tests_/bit/releasesurface/`'s own
+// header: `bit doc` derives the surface from the checker, so it sees class
+// fields a grep-based scan cannot. This file reuses that module's `Symbol`,
+// `parseSymbols`, `DocRun` and `docModule` verbatim (all now `export`ed
+// there for this reason) rather than writing a second renderer that could
+// drift from it and disagree invisibly. The only new code here is resolving
+// a per-PACKAGE tag prefix instead of the compiler's own bare `v*`, and the
+// three-way ADDED/REMOVED/CHANGED classification below — `releasesurface`'s
+// own `compareModule` only ever reports breaking changes (removed/changed)
+// because additions are never a compiler regression; a package release note
+// needs all three, since ADDED is exactly what decides a MINOR bump
+// (`pkg/README.md`, "Versioning").
+//
+// WHY GIT ARCHIVE, NOT A SECOND COMPILER OR THE STAGE0 TARBALL. Same
+// reasoning as `_tests_/bit/packagereleasegate.bit`'s header: the newest
+// `<name>/v*` git tag already names an immutable commit, and
+// `git archive <tag> -- pkg/<name> | tar -x` materializes that release's
+// package source straight from the object store, no build, no network, no
+// host path. Both sides — the tag's `pkg/<name>` and the working tree's — are
+// documented by the SAME current `bit doc --fields`, exactly like
+// `releasesurface.bit` documents both stdlib sides with the same compiler.
+//
+// WHY `<name>/v*`, NEVER A BARE `v*`. `v0.1.0` is already a compiler release
+// tag (`pkg/README.md`, "Tags are `<name>/vMAJOR.MINOR.PATCH`, never a bare
+// `vX.Y.Z`"); matching `v*` here would classify a compiler release as this
+// package's own and materialize the wrong tree entirely.
+//
+// THIS GATE REPORTS; IT NEVER FAILS THE BUILD. A release is expected to
+// change the surface — that is the entire point of cutting one — so a
+// permanent red here would teach people to ignore it, the same reasoning
+// `_tests_/bit/packagereleasegate.bit`'s sibling gates use for their own
+// non-fatal outcomes. It always exits 0 once it has produced a report or
+// determined there is nothing to report.
+//
+// NO PREVIOUS RELEASE. A package with no `<name>/v*` tag yet (or a checkout
+// before any package has ever been tagged) is a valid state: prints
+// "no previous release" and exits 0, never red on correctly-shaped empty
+// input — the same convention `_tests_/bit/packagesgate.bit`'s header uses
+// for zero packages.
+//
+// Registered in `tools/build/gates.bit`'s `packageSurfaceGates()`, one Gate
+// per `pkg/<name>/` directory the filesystem-driven `packageNames()` already
+// discovers — never registered by hand — beside `test-package-<name>`, in
+// `coreSteps()` (`tools/build/defs.bit`), NOT `gateSteps()`: a package's own
+// release-surface report must never grow the mandatory `./make test` suite,
+// the same exclusion `test-packages`/`test-package-release-drift` already
+// carry.
+//
+// Configure by environment, since `bit run` forwards no argv:
+//
+//     BIT_REPO              repo root                              (REQUIRED)
+//     BIT_PACKAGE_NAME       the package to gate, e.g. "web"         (REQUIRED)
+//     BIT_BIN                compiler under test    (default: BIT_REPO/bit-out/bin/bit)
+//     BIT_TEST_TIMEOUT_S     deadline per git/doc invocation, seconds (default 300, max 3600)
+
+import { exists, isDir, mkdir, readFile } from "std/fs"
+import { env, envOr } from "std/os"
+import { parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { runScript } from "./trampoline"
+import { DocRun, Symbol, docModule, parseSymbols } from "./releasesurface"
+
+const defaultTimeoutS: int = 300
+const maxTimeoutS: int = 3600
+
+// std/strings exports no trimSuffix; _tests_/bit/releasesurface/releasesurface.bit
+// carries the same small local helper for the same reason.
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[0:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("packagesurfacegate: BIT_REPO is not set — run this through `./make test-package-surface-<name>`")
+  }
+  return r
+}
+
+// The package to gate. Always set by `tools/build/gates.bit`'s
+// `packageSurfaceGates()`, one Gate per filesystem-discovered `pkg/<name>/` —
+// a blank value here means this file was invoked outside that registration.
+fn packageName(): string {
+  let n = env("BIT_PACKAGE_NAME")
+  if (len(n) == 0) {
+    panic("packagesurfacegate: BIT_PACKAGE_NAME is not set — run this through `./make test-package-surface-<name>`")
+  }
+  return n
+}
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  if (s > maxTimeoutS) {
+    return maxTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh via the shared trampoline (../trampoline) and
+// returns its exit code. Negative returns are `osRunBounded`'s own mechanism
+// channel, never a program's exit status (ABI.md §19).
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  let code = runScript(scriptPath, script, ms)?
+  if (code == -2) {
+    panic("packagesurfacegate: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("packagesurfacegate: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("packagesurfacegate: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn makeScratch(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-packagesurfacegate-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("packagesurfacegate: cannot create ${scratch}: ${e.message()}")
+  }
+  return scratch
+}
+
+// std/fs has no recursive remove; the scratch tree goes the way it came —
+// same convention as _tests_/bit/releasesurface/releasesurface.bit's `teardown`.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ {
+    return
+  }
+}
+
+// The first line of `git tag -l '<name>/v*' --sort=-v:refname` — version
+// order, not creation order. "" means this package has never been tagged.
+// NEVER a bare `v*`: that is the compiler's own tag namespace
+// (`pkg/README.md`, "Tags are `<name>/vMAJOR.MINOR.PATCH`, never a bare
+// `vX.Y.Z`") and would classify a compiler release as this package's own.
+fn resolveNewestTag(repo: string, name: string, scratch: string, ms: int): string {
+  let log = "${scratch}/tags.log"
+  let script = "#!/bin/sh\n" +
+    "exec >'${log}' 2>&1\n" +
+    "git -C '${repo}' tag -l '${name}/v*' --sort=-v:refname\n"
+  let code = shell("${scratch}/tags.sh", script, ms) catch e {
+    panic("packagesurfacegate: ${e.message()}")
+  }
+  if (code != 0) {
+    panic("packagesurfacegate: git tag -l failed (exit ${code}); see ${log}")
+  }
+  let text = readFile(log) catch e {
+    panic("packagesurfacegate: cannot read ${log}: ${e.message()}")
+  }
+  let lines = split(trimSpace(text), "\n")
+  if (len(lines) == 0) {
+    return ""
+  }
+  return trimSpace(lines[0])
+}
+
+// Materializes `pkg/<name>/` exactly as it existed at `tag`, via `git
+// archive` straight from the object store — no working-tree checkout, no
+// build. Documented against the WORKING TREE's `stdlib/`, same as every other
+// package gate (`_tests_/bit/packagesgate.bit`'s `test-package-<name>`):
+// a package is always built and tested against THIS tree's stdlib, whatever
+// tag it was cut at — release drift against an older *compiler* release is
+// `_tests_/bit/packagereleasegate.bit`'s separate job, not this comparison's.
+// An old tag whose own source no longer documents under the CURRENT stdlib
+// (a stdlib export it used has since been renamed or removed) is reported and
+// skipped by `main()` below, never silently passed and never a hard failure.
+fn extractPackageAtTag(repo: string, tag: string, name: string, scratch: string, ms: int): string {
+  let atTag = "${scratch}/at-tag"
+  let tar = "${scratch}/pkg.tar"
+  let log = "${scratch}/archive.log"
+  let script = "#!/bin/sh\n" +
+    "exec >'${log}' 2>&1\n" +
+    "git -C '${repo}' archive '${tag}' -- 'pkg/${name}' > '${tar}' || exit 91\n" +
+    "mkdir -p '${atTag}' || exit 92\n" +
+    "tar -xf '${tar}' -C '${atTag}' || exit 93\n"
+  let code = shell("${scratch}/archive.sh", script, ms) catch e {
+    panic("packagesurfacegate: ${e.message()}")
+  }
+  if (code != 0) {
+    let text = readFile(log) catch _ {
+      ""
+    }
+    panic("packagesurfacegate: cannot extract pkg/${name} at ${tag} (exit ${code}): ${text}")
+  }
+  let pkgDir = "${atTag}/pkg/${name}"
+  if (!isDir(pkgDir)) {
+    panic("packagesurfacegate: ${pkgDir} missing after extracting ${tag} — git archive produced no pkg/${name}")
+  }
+  return pkgDir
+}
+
+fn bitBinary(repo: string): string {
+  let bin = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
+  if (!exists(bin)) {
+    panic("packagesurfacegate: compiler not found: ${bin} (set BIT_BIN)")
+  }
+  return bin
+}
+
+// One renamed-or-resignatured symbol: present in both releases, rendering
+// differently. This is the bucket the incident this file closes falls into —
+// see this file's own header.
+class SurfaceChange {
+  name: string,
+  before: string,
+  after: string,
+}
+
+// `old`'s and `cur`'s symbols, grouped by NAME (never by whole rendered
+// line): a name on both sides with a different `kind`/`sig` is CHANGED, never
+// one ADDED plus one REMOVED — the exact classification `url`
+// (`pkg/web/escape.bit`'s escaper renamed away, `pkg/web/validate.bit`'s
+// validator renamed into the freed name) needs.
+class SurfaceDelta {
+  added: []Symbol,
+  removed: []Symbol,
+  changed: []SurfaceChange,
+}
+
+fn diffSurface(old: []Symbol, cur: []Symbol): SurfaceDelta {
+  let curByName = map<string, Symbol>{}
+  for s of cur {
+    curByName[s.name] = s
+  }
+  let oldByName = map<string, Symbol>{}
+  for s of old {
+    oldByName[s.name] = s
+  }
+
+  let removed = []Symbol(0)
+  let changed = []SurfaceChange(0)
+  for o of old {
+    let (n, ok) = curByName[o.name]
+    if (!ok) {
+      removed = append(removed, o)
+      continue
+    }
+    if (n.kind != o.kind || n.sig != o.sig) {
+      changed = append(
+        changed,
+        SurfaceChange{ name: o.name, before: "${o.kind} ${o.sig}", after: "${n.kind} ${n.sig}" },
+      )
+    }
+  }
+
+  let added = []Symbol(0)
+  for n of cur {
+    let (_, ok) = oldByName[n.name]
+    if (!ok) {
+      added = append(added, n)
+    }
+  }
+
+  return SurfaceDelta{ added: added, removed: removed, changed: changed }
+}
+
+fn printDelta(name: string, tag: string, d: SurfaceDelta) {
+  print("packagesurfacegate: ${name} surface delta vs ${tag}\n")
+  if (len(d.added) == 0 && len(d.removed) == 0 && len(d.changed) == 0) {
+    print("  no change\n")
+    return
+  }
+  if (len(d.added) > 0) {
+    print("ADDED\n")
+    for s of d.added {
+      print("  ${s.kind} ${s.sig}\n")
+    }
+  }
+  if (len(d.removed) > 0) {
+    print("REMOVED\n")
+    for s of d.removed {
+      print("  ${s.kind} ${s.sig}\n")
+    }
+  }
+  if (len(d.changed) > 0) {
+    print("CHANGED\n")
+    for c of d.changed {
+      print("  ${c.name}\n")
+      print("    before: ${c.before}\n")
+      print("    after:  ${c.after}\n")
+    }
+  }
+}
+
+fn main() {
+  let repo = repoRoot()
+  let name = packageName()
+  let ms = timeoutMs()
+  let scratch = makeScratch()
+
+  let tag = resolveNewestTag(repo, name, scratch, ms)
+  if (len(tag) == 0) {
+    teardown(scratch, ms)
+    println("PASS packagesurfacegate: ${name} has no previous release — no ${name}/v* tag reachable, nothing to report")
+    return
+  }
+
+  let bin = bitBinary(repo)
+  let stdlib = "${repo}/stdlib"
+  let curDir = "${repo}/pkg/${name}"
+  let oldDir = extractPackageAtTag(repo, tag, name, scratch, ms)
+
+  let (oldText, oldOk) = docModule(
+    bin,
+    stdlib,
+    oldDir,
+    DocRun{ scratch: scratch, tag: "old", ms: ms },
+  )
+  if (!oldOk) {
+    // The baseline release's OWN source, at ITS OWN tag, failed to document
+    // under the CURRENT compiler — historical source is expected to keep
+    // parsing under a newer compiler (the language evolves additively), so a
+    // baseline that no longer does is reported and SKIPPED here, the same
+    // "out of scope" treatment `_tests_/bit/releasesurface/releasesurface.bit`
+    // gives a baseline module its own oracle cannot document. Never folded
+    // silently into a pass with no explanation, and never a hard stop either
+    // — this gate reports, it does not fail the build (this file's own
+    // header).
+    teardown(scratch, ms)
+    println("PASS packagesurfacegate: ${name} at ${tag} does not document cleanly under the current compiler — SKIPPED, cannot compare")
+    return
+  }
+  // The CURRENT tree must always document cleanly — the same assumption
+  // `_tests_/bit/releasesurface/releasesurface.bit`'s `compareModules` makes
+  // for the working-tree side. A failure here is a harness/build problem,
+  // not a surface delta to report past.
+  let (curText, curOk) = docModule(
+    bin,
+    stdlib,
+    curDir,
+    DocRun{ scratch: scratch, tag: "cur", ms: ms },
+  )
+  if (!curOk) {
+    teardown(scratch, ms)
+    panic("packagesurfacegate: pkg/${name} does not document cleanly under the compiler being gated")
+  }
+
+  let delta = diffSurface(parseSymbols(oldText), parseSymbols(curText))
+  teardown(scratch, ms)
+  printDelta(name, tag, delta)
+  println("PASS packagesurfacegate: ${name} reported (this gate never fails on a delta — a release is expected to change the surface)")
+}
