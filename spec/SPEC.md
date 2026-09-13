@@ -2633,19 +2633,22 @@ does not reorder the side effects the two argument expressions produce.
 ### 12.12 JSX Elements and Fragments
 
 ```text
-jsx_elem     = "<" jsx_name { jsx_attr } ( "/>" | ">" { jsx_child } "</" jsx_name ">" ) .
+jsx_elem     = "<" jsx_tag_name { jsx_attr } ( "/>" | ">" { jsx_child } "</" jsx_tag_name ">" ) .
 jsx_fragment = "<>" { jsx_child } "</>" .
 jsx_attr     = jsx_name [ "=" ( STRING_LIT | "{" expression "}" ) ]
              | "{" "..." expression "}" .
-jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" expression "}" .
+jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" [ expression ] "}" .
 jsx_text     = { any source character except "<" and "{" } .
-jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) } .
+jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) }
+               [ ":" ( IDENT | keyword ) { "-" ( IDENT | keyword ) } ] .
+jsx_tag_name = jsx_name { "." jsx_name } .
 ```
 
-**`jsx_name` is not a Bit identifier (#5155).** JSX's own grammar names this
-production `JSXIdentifier`, and it differs from `IDENT` in exactly two ways,
-both permitted only here, in a tag's own name or one of its attribute
-names, never anywhere else a Bit identifier is expected:
+**`jsx_name` is not a Bit identifier (#5155, #5170).** JSX's own grammar
+names this production `JSXIdentifier`/`JSXNamespacedName`, and it differs
+from `IDENT` in exactly three ways, all permitted only here, in a tag's own
+name or one of its attribute names, never anywhere else a Bit identifier is
+expected:
 
 1. **A reserved word is a legal `jsx_name`.** `<div class="card">`,
    `<label for="x">` and `<input type="text">` are ordinary JSX; `class`,
@@ -2661,12 +2664,33 @@ names, never anywhere else a Bit identifier is expected:
    `data - id` (whitespace around the hyphen) does not form a `jsx_name` and
    is a compile error, since outside this exact production `-` is always the
    subtraction/negation operator (§8).
+3. **A colon joins a namespace onto a `jsx_name`, at most once, with no
+   whitespace on either side** - JSXNamespacedName (#5170) - so `<svg:circle
+   xlink:href="#a">` is ordinary JSX, both the tag's own name and an
+   attribute's. `xlink : href` (whitespace around the colon) does not merge,
+   and a SECOND colon (`a:b:c`) is a compile error: outside this exact
+   production `:` never joins two names, and `jsx_name` allows only the one
+   namespace segment, not a chain of them.
 
-`jsx_name`'s hyphenated, keyword-permitting spelling reaches `elem`/`attr`
-(the lowercase desugaring, below) as an ordinary quoted string exactly as
-written: `data-id` is the literal `attr("data-id", ...)` name, and reaches
+`jsx_name`'s hyphenated, namespaced, keyword-permitting spelling reaches
+`elem`/`attr` (the lowercase desugaring, below) as an ordinary quoted string
+exactly as written: `data-id` is the literal `attr("data-id", ...)` name,
+`xlink:href` is the literal `attr("xlink:href", ...)` name, and reaches
 an uppercase component call as the named argument's name, matched by text
 the same way any other named argument is (§12.11).
+
+**`jsx_tag_name` may chain `.jsx_name` onto itself** - JSXMemberExpression
+(#5171) - so `<Foo.Bar />` is ordinary JSX, reaching a component through a
+module path exactly as `Foo.Bar(...)` would as an ordinary call, each `.`
+glued with no whitespace on either side the same way a namespace's `:` is. A
+`jsx_tag_name` with at least one `.` is ALWAYS a component call, regardless
+of its leftmost segment's case: HTML has no dotted element names, so the
+lowercase/uppercase rule below (Desugaring) applies only to an undotted
+name. Only the ELEMENT name position chains this way; an attribute name
+never does (`jsx_attr` still reads a plain `jsx_name`, above) - JSX has no
+member-expression attribute. A closing tag must still name the SAME dotted
+path as its opener: `<Foo.Bar>x</Foo.Baz>` is E0023, comparing the two
+names' full text exactly as a plain tag's closer already is.
 
 An attribute written without `=` has the value `true`, so `<input disabled />`
 and `<input disabled={true} />` mean the same thing.
@@ -2735,9 +2759,20 @@ disappears - while `<b>bold</b> <i>italic</i>` on one line has three, the middle
 one being the single space, and `<p> hi </p>` has one child whose text is
 ` hi ` with both spaces intact.
 
-**Desugaring (#3944).** A JSX element's meaning depends only on its tag's first
-letter - case is the discriminator every JSX implementation uses and the one a
-reader already expects.
+**An empty expression child is not a child at all** (#5173) - `jsx_child`'s
+`"{" [ expression ] "}"` makes the expression OPTIONAL, unlike an
+attribute's own `{expr}` value (`jsx_attr`, above, which still requires one).
+`{}` and the standard `{/* comment */}` idiom - a comment leaves no
+expression behind either way - both parse and contribute nothing, the same
+verdict a whitespace-only run already gets: `<p>a{}b{/* note */}c</p>` has
+the single text child `abc`. An attribute's `{}` is unaffected and stays a
+compile error, since `jsx_attr`'s own production was not widened.
+
+**Desugaring (#3944).** A JSX element's meaning depends only on its tag's
+first letter, UNLESS it is a member-expression tag (`<Foo.Bar />`, above),
+which is always a component call regardless of case - case is the
+discriminator every JSX implementation uses for an undotted name, and the
+one a reader already expects.
 
 A **lowercase** tag is an HTML element and desugars to a call to `elem`, its
 tag name as a quoted string, one call to `attr` per attribute (an attribute
@@ -2785,6 +2820,15 @@ children collected into a trailing `children` argument:
 Because this is an ordinary call, a wrong attribute name, a missing required
 one, and a value of the wrong type are the same compile diagnostics an
 ordinary miscalled function gets - not a JSX-specific check.
+
+**A member-expression tag** (`<Foo.Bar />`, above) desugars the identical
+way, its `jsx_tag_name` reused unchanged as the call's own callee - the
+dotted name resolves exactly as `Foo.Bar(...)` would if written directly, by
+the ordinary scope and namespace-alias rules `Foo.Bar` follows anywhere else:
+
+```text
+<Lib.Bar label="x" />   ==>   Lib.Bar(label = "x")
+```
 
 A fragment (`<>...</>`) desugars the same way a lowercase element does, but
 calling `frag` with no tag-name argument: `<>{a}{b}</> ==> frag(a, b)`, and
