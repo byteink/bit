@@ -2632,15 +2632,14 @@ does not reorder the side effects the two argument expressions produce.
 
 ### 12.12 JSX Elements and Fragments
 
-```text
+```
 jsx_elem     = "<" jsx_tag_name { jsx_attr } ( "/>" | ">" { jsx_child } "</" jsx_tag_name ">" ) .
 jsx_fragment = "<>" { jsx_child } "</>" .
 jsx_attr     = jsx_name [ "=" ( STRING_LIT | "{" expression "}" ) ]
              | "{" "..." expression "}" .
 jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" [ expression ] "}" .
-jsx_text     = { any source character except "<" and "{" } .
-jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) }
-               [ ":" ( IDENT | keyword ) { "-" ( IDENT | keyword ) } ] .
+jsx_text     = { JSX_CHAR } .    (* any source byte but "<" or "{", a raw run, not tokenized *)
+jsx_name     = ( IDENT | KEYWORD ) { "-" ( IDENT | KEYWORD ) } [ ":" ( IDENT | KEYWORD ) { "-" ( IDENT | KEYWORD ) } ] .
 jsx_tag_name = jsx_name { "." jsx_name } .
 ```
 
@@ -2650,10 +2649,12 @@ from `IDENT` in exactly three ways, all permitted only here, in a tag's own
 name or one of its attribute names, never anywhere else a Bit identifier is
 expected:
 
-1. **A reserved word is a legal `jsx_name`.** `<div class="card">`,
-   `<label for="x">` and `<input type="text">` are ordinary JSX; `class`,
-   `for` and `type` stay reserved everywhere else, so `let class = 1` is
-   still a compile error (SPEC §5.2). Bit has no `className`-style
+1. **A reserved word is a legal `jsx_name`.** The grammar's `KEYWORD`
+   terminal is one token matching any of §5.2's reserved words.
+   `<div class="card">`, `<label for="x">` and `<input type="text">` are
+   ordinary JSX; `class`, `for` and `type` stay reserved everywhere else, so
+   `let class = 1` is still a compile error (SPEC §5.2). Bit has no
+   `className`-style
    alternate spelling: React's convention exists because `class` collides
    with a JavaScript reserved word at the point React assigns the DOM
    property, a constraint that does not exist here, since a JSX attribute's
