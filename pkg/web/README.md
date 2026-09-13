@@ -35,7 +35,7 @@ fn main(): ()! {
 
 `<div id="x">hi</div>` needs nothing beyond the ordinary install above: JSX
 (SPEC §12.12) desugars a lowercase tag to calls to `elem`, `attr`, `frag` and
-`text`, resolved by ordinary scope rules like any other call — so importing
+`text`, resolved by ordinary scope rules like any other call, so importing
 those four alongside the constructors they wrap is all a view needs.
 
 ```bit
