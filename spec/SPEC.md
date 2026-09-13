@@ -1367,13 +1367,16 @@ interface is a separate extension this section does not make.
   operands at different scales are aligned first (the smaller-scale side's
   mantissa is scaled up to match), so `1.0 == 1.00` is `true` and `a < b`
   agrees with `(a - b) < 0` regardless of how the two operands were scaled - a
-  `decimal`'s scale is display precision, not part of its identity. A result
-  whose mantissa would not fit 96 bits **panics** (§13.5) rather than
-  wrapping. *(v1 status: the type, its literals, its conversions,
-  locals/parameters/fields/returns, interpolation, unary `-`/`+`, binary
-  `+`/`-`, and the six comparisons are implemented. Multiplication, division
-  and half-even rounding are not, and a program that evaluates one is refused
-  at build with **E0092**.)*
+  `decimal`'s scale is display precision, not part of its identity. `*`
+  multiplies the two 96-bit mantissas and **sums** the operand scales instead
+  of aligning them (`1.5 * 2.5` is `3.75`, scale `1 + 1`) - multiplication's
+  scale is exact, not a display choice, so there is nothing to align. A
+  result whose mantissa would not fit 96 bits, or (for `*`) whose scale would
+  exceed 28, **panics** (§13.5) rather than wrapping. *(v1 status: the type,
+  its literals, its conversions, locals/parameters/fields/returns,
+  interpolation, unary `-`/`+`, binary `+`/`-`/`*`, and the six comparisons
+  are implemented. Division and half-even rounding are not, and a program
+  that evaluates one is refused at build with **E0092**.)*
 - `bool` (`true` / `false`).
 - `string`: immutable, UTF-8 byte sequence; indexing yields a `byte`; `len(s)` is
   the byte length. Strings are reference types but deeply immutable.

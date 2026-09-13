@@ -1,9 +1,9 @@
-// compiler/lowerdecimalarith.bit — #3982's second slice: scale alignment,
-// binary `+`/`-` and the six comparisons on `decimal`. Sibling of
-// lowerdecimal.bit: same module, so this needs no imports and no call-site
-// changes. Multiply, divide and half-even rounding are NOT here — they need
-// their own design pass (a 96x96 product and a long-division loop), and
-// alignment plus add/sub is already a full slice on its own.
+// compiler/lowerdecimalarith.bit — #3982's second and third slices: scale
+// alignment, binary `+`/`-`, the six comparisons, and binary `*` on
+// `decimal`. Sibling of lowerdecimal.bit: same module, so this needs no
+// imports and no call-site changes. Divide and half-even rounding are NOT
+// here — a 96-bit long division with correct rounding needs its own design
+// pass, and multiply is already a full slice alongside alignment/add/sub.
 //
 // WHY THIS IS ITS OWN FILE rather than more of lowerdecimal.bit. That file is
 // the REPRESENTATION (literal, unary, field access, to-string) and was
@@ -375,9 +375,9 @@ fn lowerDecimalAdd(fc: FnCtx, a: int, b: int): int {
 
 // `a + b` / `a - b` (§12, precedence row 5). `-` is `a + (-b)`, reusing
 // #3982's already-shipped, already-gated unary negate (`lowerDecimalNegate`,
-// lowerdecimal.bit) rather than a second sign-flip. `*`/`/` reach neither
-// this nor `vBinary`'s decimal admission, so they still fail at `bit check`
-// with E0053 before lowering ever sees them.
+// lowerdecimal.bit) rather than a second sign-flip. `/` reaches neither this
+// nor `vBinary`'s decimal admission, so it still fails at `bit check` with
+// E0053 before lowering ever sees it; `*` is `lowerDecimalMultiply` below.
 //
 // `ty` prefers the caller's `hint` over the node's own checked type when that
 // type is untyped — exactly `lowerExprByTag`'s float-widening rule
@@ -403,6 +403,8 @@ fn lowerDecimalBinary(fc: FnCtx, node: int, hint: int, n: Node): int {
   }
   if (n.main == int(Kind.Minus)) {
     b = lowerDecimalNegate(fc, b)
+  } else if (n.main == int(Kind.Star)) {
+    return lowerDecimalMultiply(fc, a, b)
   } else if (n.main != int(Kind.Plus)) {
     fcFail(fc, n.span, "an unsupported binary operator on 'decimal'")
     return 0
@@ -461,4 +463,114 @@ fn lowerDecimalCompare(fc: FnCtx, opKind: int, lhs: int, rhs: int): int {
   ins.lhs = sign
   ins.rhs = emitI64Const(fc, 0)
   return builderEmit(fc.b, ins)
+}
+
+// ---- binary `*` --------------------------------------------------------------
+
+// `a + b` and its carry-out (1 if the unsigned sum wrapped past `2^64`, else
+// 0) — the same unsigned-wraparound idiom `emitDecAddPair` already uses
+// inline (`sum < a`), pulled out here because the multiply below chains it
+// four times and inlining each would bury the schoolbook shape it is meant
+// to read as.
+fn emitAddWithCarry(fc: FnCtx, a: int, b: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let sum = emitBin(fc, Op.Add, i64ty, a, b)
+  let wrapped = emitBin(fc, Op.ICmpUlt, primType(fc.c.ctx, 10), sum, a)
+  let carry = emitCondVal(fc, wrapped, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 0))
+  return (sum, carry)
+}
+
+// The unsigned magnitude product of two 96-bit mantissas, each held the same
+// way `emitDecimalAlign`'s output is: `lo` (bits 0-63, the full register) and
+// `m` (bits 64-95, held in a 64-bit register whose own top 32 bits are always
+// zero — `decMantHi32`'s postcondition). Panics unless the true, unbounded
+// product fits 96 bits; returns the low 96 bits (`lo`, `m`) otherwise.
+//
+// SCHOOLBOOK, base 2^64, two limbs a side — `a = aLo + aM*2^64`,
+// `b = bLo + bM*2^64` — rather than three limbs of 32 bits, because `Mul`/
+// `UMulHi` already give a full 64x64->128 product natively (this file's
+// scale-alignment loop uses the identical pair for `lo*10`), so two limbs
+// need only 4 partial products instead of 3 limbs' 9. Every partial product
+// is a full 64x64->128 result (`pXXlo`/`pXXhi`) EXCEPT `p11` (`aM*bM`): both
+// factors are already `< 2^96`'s own high limb (`< 2^32`), so that one
+// product is `< 2^64` and needs no `UMulHi` at all — its `hi` half is always
+// 0, which is exactly why it never appears in the column-3 sum below (a
+// zero term contributes nothing to add).
+//
+// COLUMN ACCUMULATION (base `2^64`, so a "column" is one output limb, and
+// each column's overflow past `2^64` is that column's carry into the next):
+//   column 0 (bits   0- 63): p00lo                              = r0
+//   column 1 (bits  64-127): p00hi + p01lo + p10lo   + carry-in = r1, c1
+//   column 2 (bits 128-191): p01hi + p10hi + p11 + c1            = r2, c2
+//   column 3 (bits 192-255): c2 (p11's hi half is always 0)      = r3
+// The true 96-bit result is `r0` and `r1`'s low 32 bits; overflow is exactly
+// `r1`'s high 32 bits, or `r2`, or `r3`, being nonzero — anything landing at
+// bit 96 or above.
+fn emitDecMulPair(fc: FnCtx, aLo: int, aM: int, bLo: int, bM: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let p00lo = emitBin(fc, Op.Mul, i64ty, aLo, bLo)
+  let p00hi = emitBin(fc, Op.UMulHi, i64ty, aLo, bLo)
+  let p01lo = emitBin(fc, Op.Mul, i64ty, aLo, bM)
+  let p01hi = emitBin(fc, Op.UMulHi, i64ty, aLo, bM)
+  let p10lo = emitBin(fc, Op.Mul, i64ty, aM, bLo)
+  let p10hi = emitBin(fc, Op.UMulHi, i64ty, aM, bLo)
+  let p11 = emitBin(fc, Op.Mul, i64ty, aM, bM)
+
+  let (sum1, c1a) = emitAddWithCarry(fc, p00hi, p01lo)
+  let (r1, c1b) = emitAddWithCarry(fc, sum1, p10lo)
+  let c1 = emitBin(fc, Op.Add, i64ty, c1a, c1b)
+
+  let (sum2, c2a) = emitAddWithCarry(fc, p01hi, p10hi)
+  let (sum2b, c2b) = emitAddWithCarry(fc, sum2, p11)
+  let (r2, c2c) = emitAddWithCarry(fc, sum2b, c1)
+  let c2 = emitBin(fc, Op.Add, i64ty, emitBin(fc, Op.Add, i64ty, c2a, c2b), c2c)
+
+  let r3 = c2
+  let mask32 = emitI64Const(fc, 4294967295)
+  let r1Hi = emitBin(fc, Op.LShr, i64ty, r1, emitI64Const(fc, 32))
+  let noOverflow1 = emitBin(fc, Op.ICmpEq, boolTy, r1Hi, emitI64Const(fc, 0))
+  let noOverflow2 = emitBin(fc, Op.ICmpEq, boolTy, r2, emitI64Const(fc, 0))
+  let noOverflow3 = emitBin(fc, Op.ICmpEq, boolTy, r3, emitI64Const(fc, 0))
+  let ok12 = emitCondVal(fc, noOverflow1, boolTy, noOverflow2, emitBoolConst(fc, false))
+  let ok = emitCondVal(fc, ok12, boolTy, noOverflow3, emitBoolConst(fc, false))
+  emitDecimalOverflowPanic(fc, ok)
+
+  return (p00lo, emitBin(fc, Op.BAnd, i64ty, r1, mask32))
+}
+
+// `a * b` (§12, precedence row 6): the result scale is the SUM of the
+// operand scales (SPEC §11.1) — panicking past 28 rather than reducing
+// precision the way `System.Decimal` does, the same "overflow panics, it
+// does not silently narrow" posture §13.5 already commits to for the
+// mantissa. The sign is the operands' XOR, EXCEPT a zero magnitude always
+// canonicalizes positive (`lowerDecimalNegate`'s invariant, preserved here
+// exactly as `lowerDecimalAdd` preserves it across addition) — `-5 * 0` must
+// print `0`, not a `-0` the language could not otherwise produce.
+fn lowerDecimalMultiply(fc: FnCtx, a: int, b: int): int {
+  let ctx = fc.c.ctx
+  let i64ty = primType(ctx, 3)
+  let boolTy = primType(ctx, 10)
+  let words = decimalWordTypes(ctx)
+  let aw = explodeValueWords(ctx, fc.b, a, words)
+  let bw = explodeValueWords(ctx, fc.b, b, words)
+  let loA = aw[0]
+  let hiA = aw[1]
+  let loB = bw[0]
+  let hiB = bw[1]
+
+  let scaleSum = emitBin(fc, Op.Add, i64ty, decScale(fc, hiA), decScale(fc, hiB))
+  let scaleOk = emitBin(fc, Op.ICmpSle, boolTy, scaleSum, emitI64Const(fc, 28))
+  emitDecimalOverflowPanic(fc, scaleOk)
+
+  let (magLo, magM) = emitDecMulPair(fc, loA, decMantHi32(fc, hiA), loB, decMantHi32(fc, hiB))
+
+  let resultNeg = emitBin(fc, Op.ICmpNe, boolTy, decIsNeg(fc, hiA), decIsNeg(fc, hiB))
+  let isZero = emitBin(
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, magLo, magM), emitI64Const(fc, 0),
+  )
+  let signMasked = emitCondVal(fc, resultNeg, i64ty, emitSignBitConst(fc), emitI64Const(fc, 0))
+  let finalSignMasked = emitCondVal(fc, isZero, i64ty, emitI64Const(fc, 0), signMasked)
+  let resultHi = decComposeHi(fc, magM, scaleSum, finalSignMasked)
+  return buildTuple(fc, decimalTupleType(ctx), [magLo, resultHi])
 }
