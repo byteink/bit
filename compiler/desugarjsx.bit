@@ -39,6 +39,14 @@
 // never resolves a `Tag.NamedArg`'s name as a variable, so the existing node
 // is exactly the right shape.
 
+// A spread attribute on a component (uppercase) element (#5172): Bit's named
+// arguments are matched by a literal name at the call site (`namedargs.bit`),
+// and there is no runtime mechanism to spread a value into a set of names, so
+// `<Foo {...props} />` cannot desugar the way `<div {...props} />` does.
+// Reported rather than left to `jsxNamedArg`, which would index a 2-kid shape
+// on a 1-kid `JsxSpreadAttr` node and panic.
+const ecJsxSpreadOnComponent = 25
+
 // A lowercase-letter first byte marks an HTML-element tag; anything else
 // (including a non-letter) is a component call.
 fn jsxIsLowerTag(name: string): bool {
@@ -123,8 +131,29 @@ class JsxWordInfo {
   words: []string,
   needTrue: bool,
   needElemAttr: bool,
+  needElemSpread: bool,
   needChildren: bool,
   needText: bool,
+}
+
+// One attribute's own contribution to `info`: a spread attribute (#5172) has
+// no name to quote and no value slot, so it contributes nothing here at
+// all — its own expression feeds the fold `rewriteJsxLowerElemSpread`
+// builds instead, and `needElemSpread` (jsxElemSynthInfo) already requested
+// that fold's helper words once for the whole element. Split out of
+// `jsxElemSynthInfo`'s loop to keep that function's own complexity where it
+// was before this ticket (spec/LINT.md's `max-complexity`).
+fn jsxCollectAttrWord(tree: Tree, source: string, info: JsxWordInfo, lower: bool, a: int) {
+  if (getNode(tree, a).tag == Tag.JsxSpreadAttr) {
+    return
+  }
+  let ak = kidsOf(tree, a)
+  if (lower) {
+    info.words = append(info.words, jsxQuoteWord(identText(tree, source, ak[0])))
+  }
+  if (ak[1] == 0) {
+    info.needTrue = true
+  }
 }
 
 fn jsxElemSynthInfo(tree: Tree, source: string, node: int): JsxWordInfo {
@@ -134,6 +163,7 @@ fn jsxElemSynthInfo(tree: Tree, source: string, node: int): JsxWordInfo {
     words: []string(0),
     needTrue: false,
     needElemAttr: lower,
+    needElemSpread: lower && jsxHasSpreadAttr(tree, k[1]),
     needChildren: false,
     needText: false,
   }
@@ -141,13 +171,7 @@ fn jsxElemSynthInfo(tree: Tree, source: string, node: int): JsxWordInfo {
     info.words = append(info.words, jsxQuoteWord(identText(tree, source, k[0])))
   }
   for a of kidsOf(tree, k[1]) {
-    let ak = kidsOf(tree, a)
-    if (lower) {
-      info.words = append(info.words, jsxQuoteWord(identText(tree, source, ak[0])))
-    }
-    if (ak[1] == 0) {
-      info.needTrue = true
-    }
+    jsxCollectAttrWord(tree, source, info, lower, a)
   }
   let textWords = jsxChildTextWords(tree, source, k[2])
   for w of textWords {
@@ -168,6 +192,7 @@ fn jsxElemSynthInfo(tree: Tree, source: string, node: int): JsxWordInfo {
 class JsxSynthState {
   words: []string,
   needElemAttr: bool,
+  needElemSpread: bool,
   needFrag: bool,
   needChildren: bool,
   needTrue: bool,
@@ -196,6 +221,9 @@ fn jsxCollectElemWords(tree: Tree, source: string, st: JsxSynthState, node: int)
   if (info.needElemAttr) {
     st.needElemAttr = true
   }
+  if (info.needElemSpread) {
+    st.needElemSpread = true
+  }
   if (info.needChildren) {
     st.needChildren = true
   }
@@ -208,6 +236,16 @@ fn jsxFinalWords(st: JsxSynthState): []string {
   if (st.needElemAttr) {
     st.words = append(st.words, "elem")
     st.words = append(st.words, "attr")
+  }
+  // The fold `rewriteJsxLowerElemSpread` builds for a spread attribute
+  // (#5172) calls `el` directly (skipping `elem`'s thin wrapper) and threads
+  // its accumulator through `kidFrom`/`kid`/`kids` — four more names a module
+  // with at least one spread element must have in scope.
+  if (st.needElemSpread) {
+    st.words = append(st.words, "el")
+    st.words = append(st.words, "kidFrom")
+    st.words = append(st.words, "kid")
+    st.words = append(st.words, "kids")
   }
   if (st.needFrag) {
     st.words = append(st.words, "frag")
@@ -229,7 +267,7 @@ fn jsxFinalWords(st: JsxSynthState): []string {
 // with no set of its own.
 fn jsxSynthWords(tree: Tree, source: string): []string {
   let st = JsxSynthState{
-    words: []string(0), needElemAttr: false, needFrag: false,
+    words: []string(0), needElemAttr: false, needElemSpread: false, needFrag: false,
     needChildren: false, needTrue: false, needText: false,
   }
   let i = 1
@@ -376,25 +414,137 @@ fn jsxChildValues(tree: Tree, source: string, st: SynthText, childrenNode: int):
   return out
 }
 
+// Whether a lowercase element's attribute list has a spread (#5172), which
+// forces the FOLD desugaring (`rewriteJsxLowerElemSpread`) instead of the
+// flat `elem(...)` call every other element still takes.
+fn jsxHasSpreadAttr(tree: Tree, attrsNode: int): bool {
+  for a of kidsOf(tree, attrsNode) {
+    if (getNode(tree, a).tag == Tag.JsxSpreadAttr) {
+      return true
+    }
+  }
+  return false
+}
+
+// The three values every step of the spread fold (`rewriteJsxLowerElemSpread`
+// below) needs and none of them changes mid-fold — grouped into one class so
+// `jsxFoldStep` and its own helpers stay at 5 parameters or fewer (spec/
+// LINT.md's `max-params`), not because `tree`/`st`/`sp` are related any other
+// way than always traveling together here.
+class JsxFoldCtx {
+  tree: Tree,
+  st: SynthText,
+  sp: Span,
+}
+
+// One synthesized call `f(args...)`, the shape every `pkg/web` helper call in
+// this file takes.
+fn jsxHelperCall(fc: JsxFoldCtx, name: string, args: []int): int {
+  let callee = synthIdent(fc.tree, fc.st, name)
+  let argNodes = []int(0)
+  for a of args {
+    argNodes = append(argNodes, jsxArgWrap(fc.tree, fc.sp, a))
+  }
+  let argsNode = addNode(fc.tree, Tag.Args, fc.sp, 0, argNodes)
+  return addNode(fc.tree, Tag.Call, fc.sp, 0, [callee, 0, argsNode])
+}
+
+// One step of the fold `rewriteJsxLowerElemSpread` threads through every
+// attribute and child (#5172): `acc` is `0` before the first step, else the
+// running `[]Node` a prior step built. An ordinary item pushes with
+// `pkg/web`'s `kidFrom`/`kid`; a spread's own expression is ALREADY a
+// `[]Node` (`elem`/`attr` share one flat list, SPEC §12.12), so the first
+// step of a spread needs no call at all and a later one merges with `kids`.
+// Three small named steps rather than one, matching the codebase's own
+// per-purpose-function style (`jsxAttrCall`, `jsxNamedArg`, ...) instead of a
+// single function branching on both `acc == 0` and `isSpread`.
+fn jsxFoldFirst(fc: JsxFoldCtx, item: int, isSpread: bool): int {
+  if (isSpread) {
+    return item
+  }
+  return jsxHelperCall(fc, "kidFrom", [item])
+}
+
+fn jsxFoldNext(fc: JsxFoldCtx, acc: int, item: int, isSpread: bool): int {
+  if (isSpread) {
+    return jsxHelperCall(fc, "kids", [acc, item])
+  }
+  return jsxHelperCall(fc, "kid", [acc, item])
+}
+
+fn jsxFoldStep(fc: JsxFoldCtx, acc: int, item: int, isSpread: bool): int {
+  if (acc == 0) {
+    return jsxFoldFirst(fc, item, isSpread)
+  }
+  return jsxFoldNext(fc, acc, item, isSpread)
+}
+
+// Folds every attribute kid (spread or ordinary) into `acc`, one step per
+// attribute, in source order.
+fn jsxFoldAttrs(fc: JsxFoldCtx, source: string, attrsNode: int, acc0: int): int {
+  let acc = acc0
+  for a of kidsOf(fc.tree, attrsNode) {
+    if (getNode(fc.tree, a).tag == Tag.JsxSpreadAttr) {
+      acc = jsxFoldStep(fc, acc, kidsOf(fc.tree, a)[0], true)
+    } else {
+      acc = jsxFoldStep(fc, acc, jsxAttrCall(fc.tree, source, fc.st, a), false)
+    }
+  }
+  return acc
+}
+
+// Rewrites one desugarable LOWERCASE `jsx_elem` with at least one spread
+// attribute IN PLACE into `el("name", ...acc)` (SPEC §12.12, #5172), `acc`
+// built by `jsxFoldAttrs`/`jsxFoldStep` from every attribute and child IN
+// SOURCE ORDER. Necessary because Bit's call syntax allows a `...` spread
+// only as the SOLE argument into a variadic parameter (SPEC §12.4): a spread
+// attribute can never sit alongside an ordinary `attr(...)` call or a child
+// in `elem`'s own `...kids`, the way `rewriteJsxLowerElem` builds it for
+// every element with no spread at all.
+fn rewriteJsxLowerElemSpread(tree: Tree, source: string, st: SynthText, node: int) {
+  let sp = getNode(tree, node).span
+  let k = kidsOf(tree, node)
+  let fc = JsxFoldCtx{ tree: tree, st: st, sp: sp }
+  let nameLit = addLeaf(
+    tree, Tag.StringLit, synthSpan(st, jsxQuoteWord(identText(tree, source, k[0]))),
+  )
+  let acc = jsxFoldAttrs(fc, source, k[1], 0)
+  for v of jsxChildValues(tree, source, st, k[2]) {
+    acc = jsxFoldStep(fc, acc, v, false)
+  }
+  let callee = synthIdent(tree, st, "el")
+  let argsNode = addNode(
+    tree, Tag.Args, sp, 0, [
+      jsxArgWrap(tree, sp, nameLit),
+      addNode(tree, Tag.ArgSpread, sp, 0, [acc]),
+    ],
+  )
+  let call = addNode(tree, Tag.Call, sp, 0, [callee, 0, argsNode])
+  tree.nodes[node] = tree.nodes[call]
+}
+
 // Rewrites one desugarable LOWERCASE `jsx_elem` IN PLACE into
-// `elem("name", attr(...), ..., child, ...)` (SPEC §12.12).
+// `elem("name", attr(...), ..., child, ...)` (SPEC §12.12). A spread
+// attribute (#5172) is handled entirely by `rewriteJsxLowerElemSpread`
+// instead — this flat form is exactly what the seed already produced,
+// unchanged, for every element `jsxHasSpreadAttr` says has none.
 fn rewriteJsxLowerElem(tree: Tree, source: string, st: SynthText, node: int) {
   let sp = getNode(tree, node).span
   let k = kidsOf(tree, node)
+  if (jsxHasSpreadAttr(tree, k[1])) {
+    rewriteJsxLowerElemSpread(tree, source, st, node)
+    return
+  }
   let nameLit = addLeaf(
     tree,
     Tag.StringLit,
     synthSpan(st, jsxQuoteWord(identText(tree, source, k[0]))),
   )
-  let argVals = [nameLit]
+  let argNodes = [jsxArgWrap(tree, sp, nameLit)]
   for a of kidsOf(tree, k[1]) {
-    argVals = append(argVals, jsxAttrCall(tree, source, st, a))
+    argNodes = append(argNodes, jsxArgWrap(tree, sp, jsxAttrCall(tree, source, st, a)))
   }
   for v of jsxChildValues(tree, source, st, k[2]) {
-    argVals = append(argVals, v)
-  }
-  let argNodes = []int(0)
-  for v of argVals {
     argNodes = append(argNodes, jsxArgWrap(tree, sp, v))
   }
   let callee = synthIdent(tree, st, "elem")
@@ -406,12 +556,22 @@ fn rewriteJsxLowerElem(tree: Tree, source: string, st: SynthText, node: int) {
 // Rewrites one desugarable UPPERCASE `jsx_elem` IN PLACE into an ordinary
 // named-argument call: `Tag(attr = value, ..., children = [child, ...])`
 // (SPEC §12.12) — `children` is added only when the element has at least one
-// child, so a leaf component desugars to a plain call with no empty tail.
-fn rewriteJsxUpperElem(tree: Tree, source: string, st: SynthText, node: int) {
+// child, so a leaf component desugars to a plain call with no empty tail. A
+// spread attribute is reported (E0025, `ecJsxSpreadOnComponent`) and dropped
+// rather than passed to `jsxNamedArg`, which assumes every attribute has a
+// name and a value slot.
+fn rewriteJsxUpperElem(tree: Tree, source: string, st: SynthText, node: int, diags: Diagnostics) {
   let sp = getNode(tree, node).span
   let k = kidsOf(tree, node)
   let argNodes = []int(0)
   for a of kidsOf(tree, k[1]) {
+    if (getNode(tree, a).tag == Tag.JsxSpreadAttr) {
+      reportNoHint(
+        diags, ecJsxSpreadOnComponent, getNode(tree, a).span,
+        "a spread attribute cannot be used on a component element; Bit has no named-argument spread",
+      )
+      continue
+    }
     argNodes = append(argNodes, jsxNamedArg(tree, st, a))
   }
   let childVals = jsxChildValues(tree, source, st, k[2])
@@ -447,8 +607,9 @@ fn rewriteJsxFrag(tree: Tree, source: string, st: SynthText, node: int) {
 
 // Dispatches one desugarable node (already filtered by `jsxIsDesugarable`) to
 // its rewrite: a fragment, else a lowercase or uppercase element by its own
-// tag's first letter.
-fn desugarJsxNode(tree: Tree, source: string, st: SynthText, node: int) {
+// tag's first letter. `diags` reaches only `rewriteJsxUpperElem` (#5172's
+// spread-on-component diagnostic); every other rewrite cannot fail.
+fn desugarJsxNode(tree: Tree, source: string, st: SynthText, node: int, diags: Diagnostics) {
   if (getNode(tree, node).tag == Tag.JsxFrag) {
     rewriteJsxFrag(tree, source, st, node)
     return
@@ -456,7 +617,7 @@ fn desugarJsxNode(tree: Tree, source: string, st: SynthText, node: int) {
   if (jsxIsLowerTag(identText(tree, source, kidsOf(tree, node)[0]))) {
     rewriteJsxLowerElem(tree, source, st, node)
   } else {
-    rewriteJsxUpperElem(tree, source, st, node)
+    rewriteJsxUpperElem(tree, source, st, node, diags)
   }
 }
 
@@ -490,22 +651,35 @@ fn jsxModuleHasNodes(tree: Tree): bool {
 fn desugarJsxProject(p: Project) {
   let i = 0
   while (i < len(p.mods)) {
-    desugarJsxInModule(p.mods[i])
+    desugarJsxInModule(p.mods[i], p.diags)
     i = i + 1
   }
 }
 
-fn desugarJsxInModule(m: SrcModule) {
+// `diags` is only ever written to by a spread attribute on a component
+// element (#5172, `ecJsxSpreadOnComponent`). Its span, like every AST node's,
+// is a MODULE-GLOBAL offset into `m.source`'s concatenation of this module's
+// files (parser.bit never sees more than one file at a time, so that is the
+// only kind of span it can produce) — remapDiags's own comment: "left alone
+// they render against the wrong file and line the moment a module has more
+// than one [file]". `injectSynthMembers` owes the identical call for exactly
+// this reason; an earlier version of this comment claimed a real parsed span
+// needed no remap, which is what a spread attribute on `<Foo>` in a
+// single-file module with a prelude first proved wrong (E0025 rendered
+// against stdlib/core/core.bit, module 0, instead of the caller's own file).
+fn desugarJsxInModule(m: SrcModule, diags: Diagnostics) {
   if (!jsxModuleHasNodes(m.tree)) {
     return
   }
   let words = jsxSynthWords(m.tree, m.source)
   let st = appendSynthText(m, jsxSynthFileId(m.tree, m.source), words)
+  let before = len(diags.list)
   let i = 1
   while (i < len(m.tree.nodes)) {
     if (jsxIsDesugarable(m.tree, i)) {
-      desugarJsxNode(m.tree, m.source, st, i)
+      desugarJsxNode(m.tree, m.source, st, i, diags)
     }
     i = i + 1
   }
+  remapDiags(diags, before, m.files, m.fileStarts)
 }
