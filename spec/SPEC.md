@@ -1357,15 +1357,16 @@ interface is a separate extension this section does not make.
   release builds, trap in debug builds - see §13.5).
 - Unsigned integers: `u8 u16 u32 u64` (modular arithmetic).
 - Floats: `f32 f64` (IEEE-754 binary32 / binary64).
-- `decimal`: exact base-10 arithmetic - a signed 128-bit mantissa with a scale,
-  roughly 28 significant digits. A **value**, two `i64` words wide: no
-  allocation, no header, no GC pointer. It is its own numeric family, neither an
-  integer nor a float, which is what keeps every conversion to and from it
-  explicit (§12.9). Money is what it is for: `0.1 + 0.2` is `0.3` in a
-  `decimal` and is not in an `f64`. *(v1 status: the type, its literals and its
-  conversions are checked; arithmetic, comparison and formatting are not
-  implemented, and a program that evaluates a `decimal` value is refused at
-  build with **E0092**.)*
+- `decimal`: exact base-10 arithmetic - a 128-bit **value**: a sign, a scale
+  (0-28), and a 96-bit unsigned mantissa of roughly 28 significant digits. Two
+  `i64` words wide: no allocation, no header, no GC pointer. It is its own
+  numeric family, neither an integer nor a float, which is what keeps every
+  conversion to and from it explicit (§12.9). Money is what it is for:
+  `0.1 + 0.2` is `0.3` in a `decimal` and is not in an `f64`. *(v1 status: the
+  type, its literals, its conversions, locals/parameters/fields/returns,
+  interpolation, and unary `-`/`+` are implemented. Binary arithmetic
+  (`+ - * /`) and comparison are not, and a program that evaluates one is
+  refused at build with **E0092**.)*
 - `bool` (`true` / `false`).
 - `string`: immutable, UTF-8 byte sequence; indexing yields a `byte`; `len(s)` is
   the byte length. Strings are reference types but deeply immutable.
