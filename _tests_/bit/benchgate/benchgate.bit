@@ -144,6 +144,17 @@
 // in the sibling `benchrun.bit`, no `import`, same shared scope. This file
 // dropped from 800 to 522 lines and kept the ceiling math, the tally, the
 // per-case runner and `main`.
+//
+// #5095 made the CPU ceiling check load-aware, the way
+// _tests_/bit/stress/verify.bit's deadline already is: a case whose user CPU
+// exceeds its ceiling while the host was loaded (idle-relative load average
+// above the core count — `benchrun.bit`'s `loadProbe()`/`isLoaded()`, sampled
+// fresh immediately before EVERY rep's own subprocess, never once at gate
+// launch, #5124's mistake) reports INCONCLUSIVE and does not fail the gate.
+// RSS and object count are unaffected by contention (see WHY PEAK RSS above)
+// and stay hard failures regardless of the load reading, and an over-ceiling
+// CPU reading on a quiet host is still a hard FAIL — this narrows WHEN a
+// regression is reported, never whether a real one can be.
 
 import { env, envOr, exit } from "std/os"
 import { readFile, exists, mkdir } from "std/fs"
@@ -220,11 +231,19 @@ fn timeoutMs(): int {
 
 // --- tally -----------------------------------------------------------------
 
-class Tally { checks: int, failures: int }
+class Tally { checks: int, failures: int, inconclusive: int }
 
 fn markFail(t: Tally, msg: string) {
   t.failures = t.failures + 1
   eprint("FAIL benchgate: " + msg + "\n")
+}
+
+// #5095: an INCONCLUSIVE case is not counted as a failure — see this file's
+// header — but it must never be silent, so it prints the same way a FAIL
+// does and is tallied for the end-of-run summary in main().
+fn markInconclusive(t: Tally, msg: string) {
+  t.inconclusive = t.inconclusive + 1
+  println("INCONCLUSIVE benchgate: " + msg)
 }
 
 fn minInt(a: int, b: int): int {
@@ -366,11 +385,17 @@ fn validateRep(resText: string, outText: string, b: Baseline): RepCheck {
   return RepCheck{ ok: true, msg: "", cpu: m.cpuCentis, rss: m.rssBytes, obj: m.objects }
 }
 
+// One case's minimum readings plus the load this gate saw around whichever
+// rep produced `minCpu` (#5095) — bundled so reportAndCheck() stays at 3
+// params instead of growing a 6th past E0202's 5-parameter limit; see
+// runCase()'s reps loop for how `load` is chosen.
+class CaseMetrics { minCpu: int, minRss: int, minObj: int, load: LoadProbe }
+
 // Prints the unconditional per-case summary line (#2931) and runs the four
 // CPU/RSS/object-count checks against `b`'s ceilings and floor, marking `t`
 // for each one that trips. Pure reporting/comparison — no filesystem, no
 // subprocess. Extracted from runCase() (#3542).
-fn reportAndCheck(b: Baseline, minCpu: int, minRss: int, minObj: int, t: Tally) {
+fn reportAndCheck(b: Baseline, m: CaseMetrics, t: Tally) {
   // CPU reads its own per-case ceiling (#2982); RSS always uses the blanket
   // 1.5x — see cpuCeiling()'s and Baseline.cpuCeilingPct's comments above.
   let cpuCeil = cpuCeiling(b)
@@ -382,39 +407,58 @@ fn reportAndCheck(b: Baseline, minCpu: int, minRss: int, minObj: int, t: Tally) 
   let objCeil = objCeiling(b.objects)
   let objFlr = objFloor(b.objects)
   // Printed unconditionally, pass or fail, so a slow drift toward the
-  // ceiling is visible in the suite log before it ever trips (#2931).
+  // ceiling is visible in the suite log before it ever trips (#2931). The
+  // load reading is printed for every case, not only a failing one (#5095):
+  // without a quiet-host distribution to compare against there is no way to
+  // tell a working discriminator from a broken one.
   print(
-      "benchgate: ${b.name} cpu=${minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs) " +
-      "rss=${minRss}B (baseline ${b.rssBytes}B, ceiling ${rssCeil}B) " +
-      "obj=${minObj} (baseline ${b.objects}, floor ${objFlr}, ceiling ${objCeil})\n",
+      "benchgate: ${b.name} cpu=${m.minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs) " +
+      "rss=${m.minRss}B (baseline ${b.rssBytes}B, ceiling ${rssCeil}B) " +
+      "obj=${m.minObj} (baseline ${b.objects}, floor ${objFlr}, ceiling ${objCeil}) " +
+      "host load average ${m.load.text} (${m.load.scale}x cores)\n",
   )
 
-  if (minCpu > cpuCeil) {
-    markFail(
-      t,
-        "${b.name} user CPU regressed: ${minCpu}cs (min of ${reps}), " +
-        "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%)",
-    )
+  if (m.minCpu > cpuCeil) {
+    // #5095: contention can only ever inflate user CPU (see WHY USER CPU IS
+    // NOT IMMUNE TO CONTENTION above), so an over-ceiling reading taken
+    // while the host was loaded cannot be told apart from a real
+    // regression — report INCONCLUSIVE, naming the load, and do not fail
+    // the gate for it. A quiet-host reading over ceiling is unchanged: FAIL.
+    if (isLoaded(m.load)) {
+      markInconclusive(
+        t,
+          "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
+          "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%), " +
+          "host load average ${m.load.text} (${m.load.scale}x cores) at measurement — " +
+          "host contention or a genuine regression; re-run on a quiet host to tell them apart",
+      )
+    } else {
+      markFail(
+        t,
+          "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
+          "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%)",
+      )
+    }
   }
-  if (minRss > rssCeil) {
+  if (m.minRss > rssCeil) {
     markFail(
       t,
-        "${b.name} peak RSS regressed: ${minRss}B (min of ${reps}), " +
+        "${b.name} peak RSS regressed: ${m.minRss}B (min of ${reps}), " +
         "baseline ${b.rssBytes}B, ceiling ${rssCeil}B (150%)",
     )
   }
-  if (b.objects >= 0 && minObj > objCeil) {
+  if (b.objects >= 0 && m.minObj > objCeil) {
     markFail(
       t,
-        "${b.name} object count regressed: ${minObj} (min of ${reps}), " +
+        "${b.name} object count regressed: ${m.minObj} (min of ${reps}), " +
         "baseline ${b.objects}, ceiling ${objCeil} (${objCeilPct}%)",
     )
   }
-  if (b.objects >= 0 && minObj < objFlr) {
+  if (b.objects >= 0 && m.minObj < objFlr) {
     markFail(
       t,
         "${b.name} object count fell below floor — an unrecorded improvement: " +
-        "${minObj} (min of ${reps}), baseline ${b.objects}, floor ${objFlr} " +
+        "${m.minObj} (min of ${reps}), baseline ${b.objects}, floor ${objFlr} " +
         "(${objFloorPct}%) — re-measure and update Baseline.objects in " +
         "_tests_/bit/benchgate/baselines.bit if this is real",
     )
@@ -530,10 +574,19 @@ fn runCase(cc: CompilerEnv, benchDir: string, scratch: string, b: Baseline, t: T
   let minCpu = 1000000000
   let minRss = 1000000000
   let minObj = 1000000000
+  // #5095: the load reading paired with whichever rep's CPU became minCpu —
+  // RSS and object count are unaffected by contention (see reportAndCheck)
+  // so they need no reading of their own. "not sampled" is unreachable once
+  // sawOne is true, since every successful rep updates loadAtMin below.
+  let loadAtMin = LoadProbe{ scale: 1, text: "not sampled" }
   let sawOne = false
 
   let rep = 0
   while (rep < reps) {
+    // Sampled fresh immediately before this rep's own bounded subprocess —
+    // never once at gate launch (#5124's mistake, see benchrun.bit's header
+    // on loadProbe()) — so it reflects host state during THIS measurement.
+    let load = loadProbe(caseScratch)
     let rr = runRepOnce(binPath, caseScratch, rep, b.gcMinKb)
     if (!rr.launched) {
       markFail(t, "${b.name} rep ${rep}: ${rr.msg}")
@@ -546,7 +599,10 @@ fn runCase(cc: CompilerEnv, benchDir: string, scratch: string, b: Baseline, t: T
       rep = rep + 1
       continue
     }
-    minCpu = minInt(minCpu, rc.cpu)
+    if (rc.cpu < minCpu) {
+      minCpu = rc.cpu
+      loadAtMin = load
+    }
     minRss = minInt(minRss, rc.rss)
     minObj = minInt(minObj, rc.obj)
     sawOne = true
@@ -558,7 +614,11 @@ fn runCase(cc: CompilerEnv, benchDir: string, scratch: string, b: Baseline, t: T
     return
   }
 
-  reportAndCheck(b, minCpu, minRss, minObj, t)
+  reportAndCheck(
+    b,
+    CaseMetrics{ minCpu: minCpu, minRss: minRss, minObj: minObj, load: loadAtMin },
+    t,
+  )
   // #4508's second, flip-on build. After reportAndCheck so a case that is
   // already failing its shipped baselines says so first, and outside the
   // `t.checks` count deliberately — main() compares that against the table
@@ -605,7 +665,7 @@ fn main() {
   // explodeStrings: false — the shipped configuration. runFlipCase() builds
   // its own CompilerEnv with the flip on; nothing turns it on for this one.
   let cc = CompilerEnv{ bit: bit, libbitrt: libbitrt, stdlib: stdlib, explodeStrings: false }
-  let t = Tally{ checks: 0, failures: 0 }
+  let t = Tally{ checks: 0, failures: 0, inconclusive: 0 }
   for b of table {
     runCase(cc, benchDir, root, b, t)
   }
@@ -617,6 +677,15 @@ fn main() {
   if (t.checks < len(table)) {
     eprint("FAIL benchgate: only ${t.checks} of ${len(table)} cases completed\n")
     t.failures = t.failures + 1
+  }
+  // #5095: printed regardless of pass/fail, same reason stress's
+  // reportJudged() always prints its inconclusive count — an unjudged case
+  // must never look like a silent pass, and does not affect the exit code.
+  if (t.inconclusive > 0) {
+    println(
+        "benchgate: ${t.inconclusive} case(s) INCONCLUSIVE under host contention " +
+        "— re-run them on a quiet host to tell contention from a real regression",
+    )
   }
   if (t.failures > 0) {
     println("benchgate: FAIL — ${t.failures} problem(s) across ${t.checks} case(s)")
