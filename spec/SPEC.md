@@ -2637,7 +2637,7 @@ jsx_elem     = "<" jsx_tag_name { jsx_attr } ( "/>" | ">" { jsx_child } "</" jsx
 jsx_fragment = "<>" { jsx_child } "</>" .
 jsx_attr     = jsx_name [ "=" ( STRING_LIT | "{" expression "}" ) ]
              | "{" "..." expression "}" .
-jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" expression "}" .
+jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" [ expression ] "}" .
 jsx_text     = { any source character except "<" and "{" } .
 jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) }
                [ ":" ( IDENT | keyword ) { "-" ( IDENT | keyword ) } ] .
@@ -2758,6 +2758,15 @@ has exactly two children - the indentation around them contains line breaks and
 disappears - while `<b>bold</b> <i>italic</i>` on one line has three, the middle
 one being the single space, and `<p> hi </p>` has one child whose text is
 ` hi ` with both spaces intact.
+
+**An empty expression child is not a child at all** (#5173) - `jsx_child`'s
+`"{" [ expression ] "}"` makes the expression OPTIONAL, unlike an
+attribute's own `{expr}` value (`jsx_attr`, above, which still requires one).
+`{}` and the standard `{/* comment */}` idiom - a comment leaves no
+expression behind either way - both parse and contribute nothing, the same
+verdict a whitespace-only run already gets: `<p>a{}b{/* note */}c</p>` has
+the single text child `abc`. An attribute's `{}` is unaffected and stays a
+compile error, since `jsx_attr`'s own production was not widened.
 
 **Desugaring (#3944).** A JSX element's meaning depends only on its tag's
 first letter, UNLESS it is a member-expression tag (`<Foo.Bar />`, above),
