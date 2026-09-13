@@ -411,6 +411,17 @@ argvscope_floor_for_tree() {
 #     unexpanded template. Its expansions are one-package subsets of
 #     test-packages, which the pkg bucket already runs, and defs.bit marks them
 #     "not part of `test` or `test-packages`".
+#   stdlib/pkg test-package-surface-${p} — the same shape as the line above,
+#     and exempt for the same reason plus a stronger one (#5199). gates.bit's
+#     packageSurfaceGates() builds one Gate per package in the same
+#     `for p of packageNames()` loop, so the table again holds the unexpanded
+#     template rather than a gate name. It reports a package's exported-surface
+#     delta against that package's own newest `<name>/v*` release tag and
+#     NEVER FAILS on a delta (_tests_/bit/packagesurfacegate.bit's own header,
+#     #5120), so it cannot catch a regression a bucket would otherwise miss:
+#     wiring it into a bucket would buy nothing and cost every stdlib and pkg
+#     diff the run. It scans both trees because a package's surface is compared
+#     against the stdlib it builds on, which is why it lands in two scopes.
 #   compiler test-taskwords-sizing (#5087) — its sole compiler-pattern hit is
 #     `exists("${c}/compiler/codegen.bit")`, the repo-root-locator idiom
 #     _tests_/bit/threadtokenbytes.bit's own header cites as shared convention
@@ -430,6 +441,8 @@ argvscope_exempt_gate() {
     'stdlib test-pmimports' | 'stdlib test-pmvanity' | 'stdlib test-pmaddgit') return 0 ;;
     'stdlib test-pmrangegate' | 'stdlib test-stdlib-rebuild') return 0 ;;
     'pkg test-package-${p}') return 0 ;;
+    'stdlib test-package-surface-${p}') return 0 ;;
+    'pkg test-package-surface-${p}') return 0 ;;
     'compiler test-taskwords-sizing') return 0 ;;
   esac
   return 1
