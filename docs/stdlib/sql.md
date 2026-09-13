@@ -705,7 +705,7 @@ wanted and the actual column count).
 
 The named functions the compiler's synthesised mapper is written in terms
 of. They are exported because the generated code lives in the CLASS's own
-module and calls them by name — and they are a usable API in their own
+module and calls them by name, and they are a usable API in their own
 right for a hand-written mapper over a shape `find<T>` does not cover: pass
 one as the `mapper` argument of `sqlFindMany`/`sqlFindOne`/
 `sqlFindOneOrFail` below in place of a synthesised one.
@@ -715,7 +715,7 @@ result's columns (`Rows.columns()`, read once) and the column name to
 claim. The required form fails with `NullField` on `NULL`; the `Option` form
 decodes `NULL` to `None` instead. Both fail with `MissingColumn` when `col`
 is not in `cols`, and `TypeMismatch` when the column holds neither the
-wanted variant nor (for `sqlReqBool`/`sqlOptBool`) an `Int` — SQL has no
+wanted variant nor (for `sqlReqBool`/`sqlOptBool`) an `Int`. SQL has no
 boolean wire type (`Value`, ./sql.bit), so a `bool` field reads an `Int`
 column as zero/nonzero.
 
