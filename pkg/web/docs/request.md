@@ -50,7 +50,6 @@ the handler looks wrong. So declare a type for the input, carrying only the
 fields a client is allowed to set, and map across explicitly:
 
 ```bit
-import { Ctx, Res } from "web"
 import { Json, JsonEntry } from "std/json"
 
 @json class NewUser {
@@ -84,9 +83,9 @@ The app-level default is `Config.rejectUnknownFields` (`true`, see
 the check off invisibly:
 
 ```bit
-import { Bind, Ctx, Res, Unknown } from "web"
+import { Bind, Unknown } from "web"
 
-class Legacy {
+@json class Legacy {
   name: string,
 }
 
@@ -137,8 +136,7 @@ Rules go on the field as attributes, which are ordinary function calls
 `validate()` method for cross-field rules no per-field attribute can express:
 
 ```bit
-import { Ctx, Res, minLen, maxLen, email, unprocessable } from "web"
-import { Json, JsonEntry } from "std/json"
+import { minLen, maxLen, email, unprocessable } from "web"
 
 @json class Signup {
   @minLen(3)
@@ -175,9 +173,6 @@ characters), `@min(n)`/`@max(n)` (`i64` range), `@email`, `@url`, `@uuid`, and
 is an attribute:
 
 ```bit
-import { unprocessable } from "web"
-import { Json, JsonEntry } from "std/json"
-
 export fn iban(v: string): ()! {
   if (len(v) < 15) {
     fail unprocessable("must be an IBAN")

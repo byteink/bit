@@ -1,5 +1,7 @@
 # Operational middleware
 
+<!-- doctest: per-block -->
+
 Rate limiting, serving static files, compression, request logging, tracing
 and panic recovery - the middleware that shapes how an app behaves in
 production rather than what it answers.

@@ -37,7 +37,7 @@ mapping for a scope. The handler never sees a failure that did not satisfy
 decides the body while the framework still owns the status:
 
 ```bit
-import { App, Ctx, Res, HttpError } from "web"
+import { App, HttpError } from "web"
 
 fn renderError(c: Ctx, e: HttpError): Res {
   return c.text(e.message()).status(e.status())

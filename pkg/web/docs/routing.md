@@ -1,5 +1,7 @@
 # Routing
 
+<!-- doctest: per-block -->
+
 The router is a radix trie over path segments: lookup cost is the number of
 segments in the *request*, not the number of routes registered, and it
 short-circuits on the first segment that matches nothing. This chapter is
