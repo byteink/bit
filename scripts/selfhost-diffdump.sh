@@ -463,9 +463,21 @@ run_ir() {
     # bucket. Unlike the oracle's panic, this one is our own tree's and is a
     # real, actionable regression, so it stays in the no-verdict/exit-2 class
     # rather than being downgraded to purely informational.
+    #
+    # `decline` (#5175): BIT2's dump-ir now reports its own check errors and
+    # exits nonzero on them (compiler/main.bit's `dumpIrCmd`), which the
+    # ORACLE side of this loop already treated as SKIP a few lines up -- this
+    # is that same rule applied symmetrically, not a new one. Without it, any
+    # file only BIT2 declines (a feature the pinned, immutable oracle's own
+    # dump-ir can never gain) fell through to the raw text compare below and
+    # scored a fabricated MISMATCH: an oracle boilerplate empty main against
+    # BIT2's diagnostic text, for a file neither side produced comparable IR
+    # for. A real check-time regression on this file is the CHECK
+    # differential's job (selfhost-diffcheck.sh), not this one's.
     case "$(classify_rc "$rc" "$bcap")" in
       timeout|crash) echo "$f${sep}$(whydied "$rc")" >>"$work/timeout"; continue ;;
       panic)         echo "$f${sep}PANICKED: $(head -n 1 "$bcap")" >>"$work/timeout"; continue ;;
+      decline)       skip=$((skip + 1)); continue ;;
     esac
     b2=$(cat "$bcap")
 
@@ -476,9 +488,32 @@ run_ir() {
     if [ "$want" = "$b2" ] || [ "$(canon_ir_ids "$want")" = "$(canon_ir_ids "$b2")" ]; then
       match=$((match + 1))
     else
-      # A raw/canon mismatch is not automatically a regression: check it
-      # against the declared-transform-signature table first (see the block
-      # comment above explainMismatch). Only an UNEXPLAINED divergence is a
+      # #5175: a raw/canon mismatch can still be fabricated, not a regression.
+      # The pinned oracle is a PUBLISHED, IMMUTABLE binary: its `check` reports
+      # a real error honestly (rc!=0, the diagnostic), but its --dump-ir/-pre
+      # swallows that same error into an empty main with rc=0 -- classify_rc
+      # above scored that "ok", not "decline", and no future change to this
+      # tree can make the oracle's dump surface exit nonzero instead. Ask the
+      # oracle the question it DOES answer honestly before scoring a
+      # divergence: if `check` declines on this file, the disagreement is the
+      # oracle's own swallow, not a real difference in the compiled tree, so
+      # it is SKIP($SKIPLABEL) like any other declined file. Reserved for the
+      # disagreement path only (never run over the whole corpus): a fixture
+      # that hits this is rare (one at the time of writing,
+      # decimal_align_overflow.bit) and a single oracle `check` call measured
+      # ~0.4s, which is ~8min added to a 300s-per-file-bound gate if run for
+      # every one of ~1250 corpus files instead.
+      ccap="$work/oracle-check.cap"
+      alarmrun_retry_cap ORACLECHECK "" "$ccap" "$ORACLE" check "$f"
+      crc=$?
+      if [ "$(classify_rc "$crc" "$ccap")" = decline ]; then
+        skip=$((skip + 1))
+        continue
+      fi
+      # A raw/canon mismatch that the oracle's own check does NOT explain is
+      # not automatically a regression either: check it against the
+      # declared-transform-signature table first (see the block comment
+      # above explainMismatch). Only an UNEXPLAINED divergence is a
       # regression — this is the #3125 fix, so a real lowering improvement
       # like #3107's no longer fails this gate by construction.
       sig=$(explainMismatch "$want" "$b2" "$NAME")
