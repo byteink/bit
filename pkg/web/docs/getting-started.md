@@ -45,7 +45,7 @@ returns a `Response` in process, with nothing bound. It is the seam a test
 calls instead of standing up a server:
 
 ```bit
-import { App, Config, Ctx, Res } from "web"
+import { Ctx, Res } from "web"
 
 fn home(c: Ctx): Res! {
   return c.text("hello, bit")
@@ -66,8 +66,6 @@ on it to prefix a whole feature's routes at once, and see
 see.
 
 ```bit
-import { App, Ctx, Res } from "web"
-
 fn listUsers(c: Ctx): Res! {
   return c.text("users")
 }
