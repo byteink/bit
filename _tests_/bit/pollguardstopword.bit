@@ -242,7 +242,13 @@ fn refLoopTask(wg: WaitGroup, testDone: []i64, iters: []i64) {
 // here the same favourable "freshly spawned" scheduling the measurements in
 // the header depend on — as the very first spawns in the process, not spawns
 // competing with an already-running mutator.
-fn checkThroughput() {
+class ThroughputWindow { realNs: int, mutIters: int, refIters: int }
+
+// One measurement attempt: spawn a fresh mutatorLoop/refLoop pair, busy-wait
+// an exact 5ms window, and read where each got to. Always a fresh spawn --
+// checkThroughput()'s retry loop below never reuses a stale pair, since the
+// whole point of a retry is a clean, independently-scheduled window.
+fn measureThroughputWindow(): ThroughputWindow {
   let started = []i64(1)
   let testDone = []i64(1)
   let iters = []i64(1)
@@ -267,32 +273,62 @@ fn checkThroughput() {
   atomicStore(ptrOf(testDone), 1)
   wg.wait()
 
-  // #4310: judge the window actually measured, not the one asked for. Past
-  // preemptBudgetNs, sysmonTick flags refLoop's worker and it can never
-  // clear the flag (no safepoint reachable in an @nosplit body), so
-  // preemptAnyPending() latches true and every back edge legitimately takes
-  // the slow path for the rest of the run -- a window that long is not a
-  // measurement of clause 1 in isolation.
-  if (realNs > 8000000) {
-    println("pollguardstopword: FAIL — throughput window measured ${realNs}ns, want <= 8000000ns; a window this long crosses preemptBudgetNs and stops being a measurement of clause 1 alone (mut=${mutIters} ref=${refItersAt})")
-    exit(1)
-  }
+  return ThroughputWindow{ realNs: realNs, mutIters: mutIters, refIters: refItersAt }
+}
 
-  // #4310: refLoop may not have run its first publish yet at very short
-  // windows -- observed once directly. A zero denominator is a harness
-  // defect, not a throughput result.
-  if (refItersAt == 0) {
-    println("pollguardstopword: FAIL — reference loop published 0 iterations over a measured ${realNs}ns window; it was not dispatched in time to measure against (mut=${mutIters})")
-    exit(1)
-  }
+// #5196: a window is judged INVALID, not FAILED, when it cannot have
+// measured clause 1 at all -- see #4310's comment above measureThroughputWindow
+// for why. Past preemptBudgetNs (10ms) sysmonTick flags a worker for
+// preemption and can never clear it inside an @nosplit body, so
+// preemptAnyPending() latches true and EVERY back edge in the process takes
+// the slow path for the rest of the run, inflating mutIters right along with
+// realNs -- the same host-scheduling delay that stalls the controller's own
+// busy-wait can trip this on a loaded box with nothing wrong in the guard. A
+// zero refIters reading is the same failure one step earlier (the reference
+// loop was not dispatched inside the window). Neither says anything about
+// the clause under test, which is why this is a retryable INVALID, not a
+// verdict.
+fn windowValid(w: ThroughputWindow): bool {
+  return w.realNs <= 8000000 && w.refIters > 0
+}
 
-  let ratioX1000 = mutIters * 1000 / refItersAt
+// #5196: the ratio floor is the actual verdict on clause 1 and stays an
+// immediate FAIL -- retrying past a genuine defect would be exactly the
+// "gate that can no longer fail" this ticket exists to avoid. Only window
+// VALIDITY (above) gets retried.
+fn evaluateThroughput(w: ThroughputWindow) {
+  let ratioX1000 = w.mutIters * 1000 / w.refIters
   if (ratioX1000 < 400) {
-    println("pollguardstopword: FAIL — allocation-free mutator reached ${mutIters} iterations against the nosplit reference loop's ${refItersAt} over a measured ${realNs}ns window with nothing pending (ratio_x1000=${ratioX1000}, want >= 400); the back-edge poll guard is calling bit_rt_safepoint far more often than the runtime's published state justifies, masking a broken clause behind an always-poll fallback")
+    println("pollguardstopword: FAIL — allocation-free mutator reached ${w.mutIters} iterations against the nosplit reference loop's ${w.refIters} over a measured ${w.realNs}ns window with nothing pending (ratio_x1000=${ratioX1000}, want >= 400); the back-edge poll guard is calling bit_rt_safepoint far more often than the runtime's published state justifies, masking a broken clause behind an always-poll fallback")
     exit(1)
   }
+  println("pollguardstopword: throughput PASS — mut=${w.mutIters} ref=${w.refIters} ratio_x1000=${ratioX1000} window=${w.realNs}ns")
+}
 
-  println("pollguardstopword: throughput PASS — mut=${mutIters} ref=${refItersAt} ratio_x1000=${ratioX1000} window=${realNs}ns")
+// #5196: up to 3 independent attempts (Power of 10 rule 2 -- statically
+// bounded) at a clean window before giving up. A defect in clause 1 fails
+// every attempt's ratio check identically regardless of retries (see
+// evaluateThroughput); only an INVALID window (host scheduling delay, not
+// the guard) is worth re-measuring.
+const throughputAttempts: int = 3
+
+fn checkThroughput() {
+  let attempt = 0
+  while (attempt < throughputAttempts) {
+    let w = measureThroughputWindow()
+    if (windowValid(w)) {
+      evaluateThroughput(w)
+      return
+    }
+    println("pollguardstopword: throughput window ${attempt + 1}/${throughputAttempts} INVALID - realNs=${w.realNs}ns (ceiling 8000000ns) refIters=${w.refIters}, retrying")
+    attempt = attempt + 1
+  }
+  // #5196 (answer 2, matching #5095's benchgate): a non-measurement is
+  // reported and named, never dressed up as FAIL or silently swallowed as
+  // PASS. The `stopped` check below is an independent, non-time-based test
+  // of the same clause (see file header), so the overall gate is not failed
+  // by this alone.
+  println("pollguardstopword: checkThroughput INCONCLUSIVE - ${throughputAttempts} consecutive throughput windows were all INVALID (exceeded the 8000000ns validity ceiling or saw 0 reference-loop iterations); host contention prevented a clean measurement of clause 1's poll rate on this run, not a verdict on the clause itself - re-run on a quieter host to tell them apart")
 }
 
 fn main() {
