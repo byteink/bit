@@ -2630,19 +2630,46 @@ does not reorder the side effects the two argument expressions produce.
 ### 12.12 JSX Elements and Fragments
 
 ```text
-jsx_elem     = "<" IDENT { jsx_attr } ( "/>" | ">" { jsx_child } "</" IDENT ">" ) .
+jsx_elem     = "<" jsx_name { jsx_attr } ( "/>" | ">" { jsx_child } "</" jsx_name ">" ) .
 jsx_fragment = "<>" { jsx_child } "</>" .
-jsx_attr     = IDENT [ "=" ( STRING_LIT | "{" expression "}" ) ] .
+jsx_attr     = jsx_name [ "=" ( STRING_LIT | "{" expression "}" ) ] .
 jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" expression "}" .
 jsx_text     = { any source character except "<" and "{" } .
+jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) } .
 ```
+
+**`jsx_name` is not a Bit identifier (#5155).** JSX's own grammar names this
+production `JSXIdentifier`, and it differs from `IDENT` in exactly two ways,
+both permitted only here — in a tag's own name or one of its attribute
+names, never anywhere else a Bit identifier is expected:
+
+1. **A reserved word is a legal `jsx_name`.** `<div class="card">`,
+   `<label for="x">` and `<input type="text">` are ordinary JSX; `class`,
+   `for` and `type` stay reserved everywhere else, so `let class = 1` is
+   still a compile error (SPEC §5.2). Bit has no `className`-style
+   alternate spelling: React's convention exists because `class` collides
+   with a JavaScript reserved word at the point React assigns the DOM
+   property, a constraint that does not exist here, since a JSX attribute's
+   name reaches `attr`/a named argument as a plain string (below) with
+   nothing downstream caring that the token was ever a keyword.
+2. **A hyphen joins two runs of `jsx_name` with no whitespace on either
+   side**, so `data-id` and `aria-label` are one name, not a subtraction.
+   `data - id` (whitespace around the hyphen) does not form a `jsx_name` and
+   is a compile error, since outside this exact production `-` is always the
+   subtraction/negation operator (§8).
+
+`jsx_name`'s hyphenated, keyword-permitting spelling reaches `elem`/`attr`
+(the lowercase desugaring, below) as an ordinary quoted string exactly as
+written — `data-id` is the literal `attr("data-id", ...)` name — and reaches
+an uppercase component call as the named argument's name, matched by text
+the same way any other named argument is (§12.11).
 
 An attribute written without `=` has the value `true`, so `<input disabled />`
 and `<input disabled={true} />` mean the same thing.
 
 **When `<` opens an element.** Only at the start of an expression, and only
-when the token after `<` is an identifier or `>`. Nowhere else does `<` change
-meaning:
+when the token after `<` is an identifier, a keyword (`jsx_name` permits one;
+above) or `>`. Nowhere else does `<` change meaning:
 
 | Written            | Read as                                             |
 | ------------------ | --------------------------------------------------- |
