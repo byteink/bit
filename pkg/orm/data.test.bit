@@ -1,0 +1,196 @@
+// pkg/orm/data.test.bit — #5055's acceptance, against a FAKE driver.
+//
+// `fkAdapter` is the "database": `committed` holds every statement that has
+// durably landed. `fkConn.exec` (outside a transaction) commits immediately;
+// `fkTx.exec` only stages into `pending`, moved to `committed` by `commit`
+// and thrown away by `rollback` — so "the row is present/absent" is a claim
+// about `a.committed`, never about this fake's own bookkeeping, exactly as
+// stdlib/sql/tx.test.bit's own fake is built.
+//
+// `writeOne` is the ONE function taking `Data` the acceptance asks for: it
+// runs unchanged whether it is passed the `Pool` directly or the `Tx` a
+// transaction's block was given.
+
+import { pool, Pool, Datasource, Conn, Rows, Stmt, Tx, Value, Isolation } from "std/sql"
+
+// Whether `list` has an element byte-for-byte equal to `want` — `a.committed`
+// is a list of whole statements, so this is element membership, not
+// std/strings' substring `contains`.
+fn hasEntry(list: []string, want: string): bool {
+  for entry of list {
+    if (entry == want) {
+      return true
+    }
+  }
+  return false
+}
+
+// `a.committed` as one line, for an assertion message.
+fn joined(list: []string): string {
+  let out = ""
+  for entry of list {
+    if (out != "") {
+      out = out + " | "
+    }
+    out = out + entry
+  }
+  return out
+}
+
+// The fake database: every statement that has durably committed, in order.
+class fkAdapter {
+  committed: []string
+
+  connect(cfg: Datasource): Conn! {
+    return fkConn{ a: this }
+  }
+}
+
+// One physical connection. `exec` outside a transaction commits at once —
+// there is no separate autocommit transaction to model for this test.
+class fkConn {
+  a: fkAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    fail newError("fake: query not supported")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.committed = append(this.a.committed, sqlText)
+    return 1
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    return fkTx{ a: this.a, pending: []string(0) }
+  }
+
+  close() {}
+}
+
+// One transaction: writes stage into `pending` and only reach `a.committed`
+// on `commit`.
+class fkTx {
+  a: fkAdapter
+  pending: []string
+
+  query(sqlText: string, params: []Value): Rows! {
+    fail newError("fake: query not supported")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.pending = append(this.pending, sqlText)
+    return 1
+  }
+
+  commit(): ()! {
+    for stmtText of this.pending {
+      this.a.committed = append(this.a.committed, stmtText)
+    }
+  }
+
+  rollback(): ()! {
+    // Discarding `pending` (by never copying it into `a.committed`) IS the
+    // rollback; there is nothing else to undo in this fake.
+  }
+}
+
+fn newPool(a: fkAdapter): Pool {
+  let p = pool(a, Datasource{ host: "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+// Acceptance clause 1: one function taking `Data`, run against a `Pool`
+// directly and against the `Tx` a transaction's block is given, proving the
+// same function is transactional or not depending only on the handle.
+fn writeOne(db: Data, id: string): ()! {
+  db.exec("insert ${id}", []Value(0))?
+}
+
+test "a function taking Data commits standalone and rolls back inside a failed transaction" {
+  let a = fkAdapter{}
+  let p = newPool(a)
+
+  writeOne(p, "standalone") catch e {
+    panic("writeOne standalone: ${e.message()}")
+  }
+  assert(
+    hasEntry(a.committed, "insert standalone"),
+    "standalone write never committed: ${joined(a.committed)}",
+  )
+
+  p.tx((db) => {
+    writeOne(db, "rolled-back")?
+    fail newError("boom")
+  }) catch _ {
+    // expected: the block failed on purpose
+  }
+  assert(
+    !hasEntry(a.committed, "insert rolled-back"),
+    "a row from the failed block committed: ${joined(a.committed)}",
+  )
+}
+
+// Acceptance clause 2: `pool.txValue<T>` returns the block's value and
+// commits its writes.
+test "txValue returns the block's value and commits" {
+  let a = fkAdapter{}
+  let p = newPool(a)
+
+  let v = p.txValue<i64>((db) => {
+    writeOne(db, "valued")?
+    return 42
+  }) catch e {
+    panic("txValue: ${e.message()}")
+  }
+  assert(v == 42, "txValue returned ${v}, not 42")
+  assert(
+    hasEntry(a.committed, "insert valued"),
+    "txValue's write never committed: ${joined(a.committed)}",
+  )
+}
+
+// Acceptance clause 3: `pool.txAt` reaches the driver with the isolation
+// level given, read from the statement the fake recorded.
+test "txAt reaches the driver with the isolation level given" {
+  let a = fkAdapter{}
+  let p = newPool(a)
+
+  p.txAt(Isolation.Serializable, (db) => {
+    writeOne(db, "serializable")?
+  }) catch e {
+    panic("txAt: ${e.message()}")
+  }
+  assert(
+    hasEntry(a.committed, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+    "isolation statement never reached the driver: ${joined(a.committed)}",
+  )
+}
+
+// Acceptance clause 4: a failure inside the closure rolls back a row
+// written earlier in that same closure.
+test "a failure after a write in the same closure rolls that write back" {
+  let a = fkAdapter{}
+  let p = newPool(a)
+
+  p.tx((db) => {
+    writeOne(db, "first")?
+    writeOne(db, "second")?
+    fail newError("boom")
+  }) catch _ {
+    // expected
+  }
+  assert(
+    !hasEntry(a.committed, "insert first"),
+    "the earlier write in a failed closure committed: ${joined(a.committed)}",
+  )
+  assert(
+    !hasEntry(a.committed, "insert second"),
+    "the later write in a failed closure committed: ${joined(a.committed)}",
+  )
+}
