@@ -7,7 +7,7 @@ with no second version and no second entry point.
 
 ```bit
 import { Data } from "orm"
-import { Value } from "std/sql"
+import { Pool, Value } from "std/sql"
 
 fn transfer(db: Data, fromId: i64, toId: i64, amt: i64): ()! {
   db.exec("update accounts set balance = balance - ${amt} where id = ${fromId}", []Value(0))?
@@ -18,17 +18,11 @@ fn transfer(db: Data, fromId: i64, toId: i64, amt: i64): ()! {
 Call it either way:
 
 ```bit
-import { Data } from "orm"
-import { Pool, Value } from "std/sql"
-
-fn transfer(db: Data, fromId: i64, toId: i64, amt: i64): ()! {
-  db.exec("update accounts set balance = balance - ${amt} where id = ${fromId}", []Value(0))?
-  db.exec("update accounts set balance = balance + ${amt} where id = ${toId}", []Value(0))?
-}
-
 fn runIt(p: Pool): ()! {
-  transfer(p, 1, 2, 500)?                        // its own transaction, per statement
-  p.tx((db) => { transfer(db, 1, 2, 500)? })?     // inside the caller's transaction
+  transfer(p, 1, 2, 500)? // its own transaction, per statement
+  p.tx((db) => {
+    transfer(db, 1, 2, 500)?
+  })? // inside the caller's transaction
   return
 }
 ```

@@ -24,8 +24,13 @@ into a permanent stream of "why is this noun handled and not that one"
 reports. Pass the real name explicitly instead:
 
 ```bit
-tableName("Person", "people")   // "people"
-tableName("Person", "")         // "persons" - the four rules, no override
+import { tableName } from "orm"
+import { FieldDesc, AttrDesc } from "std/sql"
+
+fn showTableNames() {
+  println(tableName("Person", "people")) // "people"
+  println(tableName("Person", ""))       // "persons" - the four rules, no override
+}
 ```
 
 ## Column names
@@ -40,7 +45,10 @@ underscore.
 and unpluralised:
 
 ```bit
-@column("e_mail") email: string   // column name is "e_mail", not "email"
+@table class Contact {
+  @column("e_mail")
+  email: string // column name is "e_mail", not "email"
+}
 ```
 
 ## Reading a result back
