@@ -2694,10 +2694,14 @@ reader already expects.
 A **lowercase** tag is an HTML element and desugars to a call to `elem`, its
 tag name as a quoted string, one call to `attr` per attribute (an attribute
 written with no value passes `true`), and the element's children as further
-arguments:
+arguments. A text child becomes a call to `text` with its content as a
+quoted string literal - not the literal itself, since the desugaring has no
+target type to check a bare literal against (a class or enum `Node` accepts
+no untyped string constant; only `text`'s own `string` parameter can):
 
 ```text
-<div id="a">{x}</div>   ==>   elem("id", attr("id", "a"), x)
+<div id="a">{x}</div>   ==>   elem("div", attr("id", "a"), x)
+<div>hi</div>           ==>   elem("div", text("hi"))
 ```
 
 An **uppercase** tag is a component call: an ordinary call to the function
@@ -2714,14 +2718,18 @@ one, and a value of the wrong type are the same compile diagnostics an
 ordinary miscalled function gets - not a JSX-specific check.
 
 A fragment (`<>...</>`) desugars the same way a lowercase element does, but
-calling `frag` with no tag-name argument: `<>{a}{b}</> ==> frag(a, b)`.
+calling `frag` with no tag-name argument: `<>{a}{b}</> ==> frag(a, b)`, and
+`<>hi</> ==> frag(text("hi"))` for a text child.
 
-**Names resolve by ordinary scope rules.** `elem`, `attr`, and `frag` are not
-built in and the compiler never implicitly imports them or special-cases the
-module that defines them (`pkg/web`, or any other module exporting the same
-three names) - a file that writes a lowercase tag with none of the three in
-scope gets the ordinary unresolved-name diagnostic, exactly as a bare call to
-an unimported function would.
+**Names resolve by ordinary scope rules.** `elem`, `attr`, `frag`, and `text`
+are not built in and the compiler never implicitly imports them or
+special-cases the module that defines them (`pkg/web`, or any other module
+exporting the same four names) - a file that writes a lowercase tag with
+none of the four in scope gets the ordinary unresolved-name diagnostic,
+exactly as a bare call to an unimported function would. Only the names a
+given file's JSX actually needs are required in scope: a file with no text
+children never needs `text`, exactly as one with no fragments never needs
+`frag`.
 
 A JSX expression's own type is whatever its desugared call returns; there is
 no built-in `Node` type.
