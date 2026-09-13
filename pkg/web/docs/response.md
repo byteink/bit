@@ -32,7 +32,7 @@ appears among the other attributes; everything else becomes the body, in the
 order it appears among the other children.
 
 ```bit
-import { Ctx, Res, Node, div, a, text } from "web"
+import { Node, div, a, text } from "web"
 
 fn page(c: Ctx): Res! {
   let body = div(
@@ -57,7 +57,7 @@ unconditionally by `render` itself, since there is no `attr()` wrapper to do
 it at construction time.
 
 ```bit
-import { text, raw, safeUrl, js } from "web"
+import { raw, safeUrl, js } from "web"
 
 fn demo(): ()! {
   let escaped = text("<script>alert(1)</script>")

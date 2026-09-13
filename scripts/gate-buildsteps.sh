@@ -448,17 +448,15 @@ case "${BUCKET}" in
     # "reddens the day it starts", not one only caught by a manual
     # `./make test-package-release-drift` or at tag time.
     #
-    # `test-package-docs` (#5127, _tests_/bit/pkgdocsgate.bit) is
-    # DELIBERATELY NOT a fifth entry here yet, unlike the four above — it is
-    # registered (tools/build/defs.bit, tools/build/gatestable2.bit) and
-    # runnable standalone via `./make test-package-docs`, but running it over
-    # today's real corpus finds 11 pre-existing doc pages that do not pass it
-    # (#5151), none introduced by #5127's own fix. Adding it to BUILD_STEPS
-    # before #5151 lands would fail this bucket on every future pkg/**-only
-    # diff for defects the diff never touched — exactly the false-positive
-    # failure mode this whole exception list exists to avoid, not to cause.
-    # Add it here in the same commit that closes #5151.
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift)
+    # `test-package-docs` (#5127, _tests_/bit/pkgdocsgate.bit) is the fifth,
+    # same shape as the four above: it examines pkg/*/docs/*.md and
+    # pkg/*/README.md directly. It was registered (tools/build/defs.bit,
+    # tools/build/gatestable2.bit) but deliberately left out of this bucket
+    # until the 11 pre-existing doc pages it found failing (#5151), none
+    # introduced by #5127's own fix, were fixed — adding it here first would
+    # have failed this bucket on every pkg/**-only diff for defects the diff
+    # never touched. #5151 fixed all 11 and added it here in the same commit.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs)
     ;;
   spec)
     BUILD_STEPS=(test-spec)

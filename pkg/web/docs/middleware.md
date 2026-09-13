@@ -35,7 +35,7 @@ route is on no group. Mount on the app when you want the middleware to see
 misses.
 
 ```bit
-import { App, Ctx, Res } from "web"
+import { App } from "web"
 
 fn logMiss(c: Ctx): Res! {
   return c.text("miss")

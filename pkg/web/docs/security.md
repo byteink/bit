@@ -1,5 +1,7 @@
 # Sessions, CSRF and security
 
+<!-- doctest: per-block -->
+
 Server-side sessions, the CSRF token bound to one, cross-origin responses,
 and the standard security response headers - the package's opt-in security
 middleware, in the order an app usually reaches for them.
@@ -67,13 +69,17 @@ allowed when it is byte-for-byte one of the strings the app wrote down.
 import { App, Cors, cors } from "web"
 
 fn mount(app: App) {
-  app.use(cors(Cors{
-    origins: []string{ "https://app.example.com" },
-    methods: []string{ "GET", "POST" },
-    headers: []string{ "Content-Type", "Authorization" },
-    credentials: true,
-    maxAge: 600,
-  }))
+  app.use(
+    cors(
+      Cors{
+        origins: []string{ "https://app.example.com" },
+        methods: []string{ "GET", "POST" },
+        headers: []string{ "Content-Type", "Authorization" },
+        credentials: true,
+        maxAge: 600,
+      },
+    ),
+  )
 }
 ```
 
