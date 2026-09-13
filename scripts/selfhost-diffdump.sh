@@ -488,9 +488,32 @@ run_ir() {
     if [ "$want" = "$b2" ] || [ "$(canon_ir_ids "$want")" = "$(canon_ir_ids "$b2")" ]; then
       match=$((match + 1))
     else
-      # A raw/canon mismatch is not automatically a regression: check it
-      # against the declared-transform-signature table first (see the block
-      # comment above explainMismatch). Only an UNEXPLAINED divergence is a
+      # #5175: a raw/canon mismatch can still be fabricated, not a regression.
+      # The pinned oracle is a PUBLISHED, IMMUTABLE binary: its `check` reports
+      # a real error honestly (rc!=0, the diagnostic), but its --dump-ir/-pre
+      # swallows that same error into an empty main with rc=0 -- classify_rc
+      # above scored that "ok", not "decline", and no future change to this
+      # tree can make the oracle's dump surface exit nonzero instead. Ask the
+      # oracle the question it DOES answer honestly before scoring a
+      # divergence: if `check` declines on this file, the disagreement is the
+      # oracle's own swallow, not a real difference in the compiled tree, so
+      # it is SKIP($SKIPLABEL) like any other declined file. Reserved for the
+      # disagreement path only (never run over the whole corpus): a fixture
+      # that hits this is rare (one at the time of writing,
+      # decimal_align_overflow.bit) and a single oracle `check` call measured
+      # ~0.4s, which is ~8min added to a 300s-per-file-bound gate if run for
+      # every one of ~1250 corpus files instead.
+      ccap="$work/oracle-check.cap"
+      alarmrun_retry_cap ORACLECHECK "" "$ccap" "$ORACLE" check "$f"
+      crc=$?
+      if [ "$(classify_rc "$crc" "$ccap")" = decline ]; then
+        skip=$((skip + 1))
+        continue
+      fi
+      # A raw/canon mismatch that the oracle's own check does NOT explain is
+      # not automatically a regression either: check it against the
+      # declared-transform-signature table first (see the block comment
+      # above explainMismatch). Only an UNEXPLAINED divergence is a
       # regression — this is the #3125 fix, so a real lowering improvement
       # like #3107's no longer fails this gate by construction.
       sig=$(explainMismatch "$want" "$b2" "$NAME")
