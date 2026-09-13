@@ -2632,7 +2632,8 @@ does not reorder the side effects the two argument expressions produce.
 ```text
 jsx_elem     = "<" jsx_name { jsx_attr } ( "/>" | ">" { jsx_child } "</" jsx_name ">" ) .
 jsx_fragment = "<>" { jsx_child } "</>" .
-jsx_attr     = jsx_name [ "=" ( STRING_LIT | "{" expression "}" ) ] .
+jsx_attr     = jsx_name [ "=" ( STRING_LIT | "{" expression "}" ) ]
+             | "{" "..." expression "}" .
 jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" expression "}" .
 jsx_text     = { any source character except "<" and "{" } .
 jsx_name     = ( IDENT | keyword ) { "-" ( IDENT | keyword ) } .
@@ -2666,6 +2667,23 @@ the same way any other named argument is (§12.11).
 
 An attribute written without `=` has the value `true`, so `<input disabled />`
 and `<input disabled={true} />` mean the same thing.
+
+**A spread attribute** (`<div {...props} />`, #5172) inserts every attribute
+`props` (a `pkg/web` `[]Node`) carries at the position it is written, mixed
+freely with ordinary attributes and children in the same tag: `<div
+{...props} class="card">hi</div>` renders `props`' own attributes, then
+`class="card"`, then `hi` — each JOINED to the flat list `elem`'s (lowercase)
+or a component's `children` (uppercase) desugaring already keeps attributes
+and children in (`elem`/`attr`, above). A `{` is legal in attribute position
+ONLY as the start of a spread; a `{` not immediately followed by `...` is a
+compile error naming the mistake, not a `{expr}` value read out of context —
+`name={expr}` is still how an attribute's own value is written. `...` is not
+legal in a JSX CHILD position (`{...props}` between two tags is not a spread;
+§12.4's ordinary expression-position rule for `...` applies there unchanged)
+and a spread attribute on an UPPERCASE (component) tag is a compile error:
+Bit's named arguments (§12.11) are matched by a literal name at the call
+site, and there is no runtime mechanism to spread a value into a set of
+names, so `<Foo {...props} />` has no meaning to desugar to.
 
 **When `<` opens an element.** Only at the start of an expression, and only
 when the token after `<` is an identifier, a keyword (`jsx_name` permits one;
@@ -2730,6 +2748,27 @@ no untyped string constant; only `text`'s own `string` parameter can):
 <div id="a">{x}</div>   ==>   elem("div", attr("id", "a"), x)
 <div>hi</div>           ==>   elem("div", text("hi"))
 ```
+
+**A lowercase tag with a spread attribute** desugars differently: §12.4
+allows a `...` spread only as the SOLE argument filling a variadic parameter,
+so a spread attribute's `[]Node` can never sit alongside an ordinary
+`attr(...)` call or a child in `elem`'s own variadic list the way the plain
+form above does. It instead folds every attribute and child, in source
+order, through `pkg/web`'s `kidFrom`/`kid`/`kids` into one `[]Node`, spread
+into `el` (the same function `elem` itself calls) once, at the end:
+
+```text
+<div {...extra} class="card">hi</div>
+   ==>   el("div", ...kid(kid(extra, attr("class", "card")), text("hi")))
+```
+
+A spread that starts the fold (as `{...extra}` does above) needs no wrapping
+call at all: its own expression already IS a `[]Node`, reused as the seed
+directly. Only a fold that STARTS with an ordinary attribute or child seeds
+with `kidFrom` instead (`<div class="card" {...extra} />` ==> `el("div",
+...kids(kidFrom(attr("class", "card")), extra))`); every step after the
+first — ordinary or spread — extends the running list with `kid` (one item)
+or `kids` (a whole spread's slice).
 
 An **uppercase** tag is a component call: an ordinary call to the function
 the tag names, with each attribute passed as a named argument (§12.11) and the
