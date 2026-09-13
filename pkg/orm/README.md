@@ -3,7 +3,8 @@
 An ORM for `std/sql`, built on `@table` (SPEC section 10.5's class attribute)
 and the descriptor it synthesizes. This package is under active development
 (epic #5050); today it exports `Data`, the interface every ORM function is
-written against instead of a concrete `Pool`.
+written against instead of a concrete `Pool`, and the name mapping from a
+Bit field to its SQL table and column.
 
 ## Install
 
@@ -31,7 +32,9 @@ fn transfer(db: Data, fromId: i64, toId: i64, amt: i64): ()! {
 ```
 
 See [`docs/data.md`](docs/data.md) for `Data` and the call sites (`pool`
-alone, `pool.tx(...)`, `pool.txValue<T>(...)`).
+alone, `pool.tx(...)`, `pool.txValue<T>(...)`). Table and column names are
+mapped from a `@table` class's field names - see
+[`docs/naming.md`](docs/naming.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
