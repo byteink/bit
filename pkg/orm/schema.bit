@@ -1,0 +1,308 @@
+// pkg/orm/schema.bit — the schema builder (#5065, owner decision
+// 2026-09-12): tables, columns, indexes and foreign keys as an INTENT TREE,
+// Laravel-shaped, never SQL text.
+//
+//   table("users", (t) => {
+//     t.id("id")
+//     t.string("email", 255).unique()
+//     t.timestamp("created_at").nullable()
+//     t.index("created_at")
+//     t.foreign("team_id").references("teams", "id").onDelete(Cascade)
+//   })
+//
+//   alter("users", (t) => {
+//     t.addString("phone").nullable()
+//     t.dropColumn("legacy_flag")
+//     t.renameColumn("email", "email_address")
+//   })
+//
+//   drop("users")
+//
+// WHY A TREE, NOT TEXT. A `Dialect` (#5066 Postgres, #5070 MySQL) renders
+// this tree into DDL. One migration file, two engines: the tree carries
+// what changed, the dialect decides how a given engine spells it. Nothing
+// in this file may special-case a dialect - see `onDeleteAction`'s
+// `ReferentialAction` below, an engine-neutral vocabulary the renderer maps
+// to each engine's own keywords.
+//
+// RENAMECOLUMN IS ITS OWN OP, NEVER DROP-PLUS-ADD. A diff between two
+// schemas cannot tell a rename from a delete-and-create, and getting that
+// wrong drops the column's data (TypeORM's sync gets exactly this wrong).
+// `renameColumn` is declared by the caller, so `AlterOp.RenameColumn`
+// carries both names in one node - `#5067`'s generator and a hand-written
+// migration produce the identical node either way.
+//
+// RAW() IS THE ESCAPE HATCH, ON PURPOSE. No builder here expresses a
+// partial index, a trigger, a CHECK, or `CREATE INDEX CONCURRENTLY` - a
+// builder with no escape hatch is a ceiling instead of a convenience
+// (Laravel's `DB::statement`). `t.raw(...)` on `Table` and `AlterTable`
+// passes a statement through verbatim; the dialect decides what to do with
+// it.
+//
+// COLUMN TYPES MIRROR BIT'S OWN, NOT SQL'S. `int` is Bit's only integer
+// size in ordinary use (an alias for `i64`, SPEC §5.1), so there is one
+// `int` column, not Laravel's `integer`/`bigInteger` split - a dialect maps
+// it to whichever integer type it stores 64 bits in. `Id` is its own
+// variant rather than "int, primary, auto-increment": the exact mechanism
+// (`BIGSERIAL`, `IDENTITY`, `AUTO_INCREMENT`) is a dialect's to pick.
+//
+// `string`/`addString` TAKE `length` EXPLICITLY, WITH NO DEFAULT - a
+// COMPILER GAP, not a design choice. SPEC §10.3 documents a defaulted
+// parameter (`x: int = 1`) on a named `fn`; confirmed here that the
+// identical signature on a class **method** is rejected at the call site
+// (`E0050 expected 2 argument(s), found 1`) even though it parses and
+// checks on the method declaration itself - the same free function with
+// the same default resolves a call with the argument omitted. `t.string`
+// therefore always takes `(name, length)`; the length-optional
+// `t.addString("phone")` this ticket's own fenced example writes needs one
+// more argument (`t.addString("phone", 255)`) until method defaults work,
+// flagged here rather than filed, same as #5056's `@table("...")` gap.
+
+// One column's SQL type, engine-neutral. `String` carries its length;
+// every other variant is a fixed shape a dialect renders on its own.
+export enum ColumnType {
+  Id,
+  Int,
+  String(int),
+  Text,
+  Bool,
+  Timestamp,
+}
+
+// What happens to a row on this side of a foreign key when the referenced
+// row goes away. `NoAction` is first so it is also `ReferentialAction`'s
+// zero value - the ANSI default when a foreign key names no behaviour at
+// all.
+export enum ReferentialAction {
+  NoAction,
+  Cascade,
+  Restrict,
+  SetNull,
+}
+
+// One column, building through chained calls: `t.string("email",
+// 255).unique()`. `Table.string` and `AlterTable.addString` (etc.) both
+// return the same `Column` they already appended to their own list -
+// classes are reference types (SPEC §13.3), so a chained call mutates the
+// node already in the tree instead of building a second copy of it.
+export class Column {
+  export name: string
+  export colType: ColumnType
+  export isNullable: bool
+  export isUnique: bool
+  export isPrimary: bool
+
+  export nullable(): Column {
+    this.isNullable = true
+    return this
+  }
+
+  export unique(): Column {
+    this.isUnique = true
+    return this
+  }
+}
+
+// A column or composite index: `t.index("created_at")`,
+// `t.index("teamId", "createdAt")`.
+export class Index {
+  export columns: []string,
+}
+
+// A foreign key, building through chained calls:
+// `t.foreign("team_id").references("teams", "id").onDelete(Cascade)`.
+// `references` is expected before the node is read by a renderer; an
+// omitted call leaves `refTable`/`refColumn` empty, which is a structurally
+// incomplete node rather than a builder-time failure - this file validates
+// shape, never SQL semantics (constraint on #5065).
+export class ForeignKey {
+  export column: string
+  export refTable: string
+  export refColumn: string
+  export onDeleteAction: ReferentialAction
+
+  export references(table: string, column: string): ForeignKey {
+    this.refTable = table
+    this.refColumn = column
+    return this
+  }
+
+  export onDelete(action: ReferentialAction): ForeignKey {
+    this.onDeleteAction = action
+    return this
+  }
+}
+
+// A new column of `colType`, freshly built and not yet attached to
+// anything - shared by `Table`'s and `AlterTable`'s own column methods so
+// the zero-value shape of a `Column` is written in exactly one place.
+fn newColumn(name: string, colType: ColumnType, primary: bool): Column {
+  return Column{
+    name: name,
+    colType: colType,
+    isNullable: false,
+    isUnique: false,
+    isPrimary: primary,
+  }
+}
+
+// A table being created: every column, index, foreign key and raw
+// passthrough declared inside a `table(...)` call's closure, in the order
+// they were declared.
+export class Table {
+  export name: string
+  export columns: []Column
+  export indexes: []Index
+  export foreignKeys: []ForeignKey
+  export raws: []string
+
+  export id(name: string): Column {
+    return this.addColumn(name, ColumnType.Id, true)
+  }
+
+  export int(name: string): Column {
+    return this.addColumn(name, ColumnType.Int, false)
+  }
+
+  export string(name: string, length: int): Column {
+    return this.addColumn(name, ColumnType.String(length), false)
+  }
+
+  export text(name: string): Column {
+    return this.addColumn(name, ColumnType.Text, false)
+  }
+
+  export bool(name: string): Column {
+    return this.addColumn(name, ColumnType.Bool, false)
+  }
+
+  export timestamp(name: string): Column {
+    return this.addColumn(name, ColumnType.Timestamp, false)
+  }
+
+  addColumn(name: string, colType: ColumnType, primary: bool): Column {
+    let c = newColumn(name, colType, primary)
+    this.columns = append(this.columns, c)
+    return c
+  }
+
+  export index(...columns: string): Index {
+    let ix = Index{ columns: columns }
+    this.indexes = append(this.indexes, ix)
+    return ix
+  }
+
+  export foreign(column: string): ForeignKey {
+    let fk = ForeignKey{
+      column: column,
+      refTable: "",
+      refColumn: "",
+      onDeleteAction: ReferentialAction.NoAction,
+    }
+    this.foreignKeys = append(this.foreignKeys, fk)
+    return fk
+  }
+
+  // The passthrough for what no builder above expresses - a partial index,
+  // a trigger, a CHECK, `CREATE INDEX CONCURRENTLY`. Passed to the dialect
+  // verbatim, per dialect (#5066/#5070).
+  export raw(text: string) {
+    this.raws = append(this.raws, text)
+  }
+}
+
+// One change inside an `alter(...)` call. `RenameColumn` carries both names
+// in a single node - see this file's header for why that matters.
+export enum AlterOp {
+  AddColumn(Column),
+  DropColumn(string),
+  RenameColumn(string, string),
+}
+
+// A table being altered: every add, drop, rename and raw passthrough
+// declared inside an `alter(...)` call's closure, in declaration order.
+export class AlterTable {
+  export name: string
+  export ops: []AlterOp
+  export raws: []string
+
+  export addId(name: string): Column {
+    return this.addColumnOp(name, ColumnType.Id, true)
+  }
+
+  export addInt(name: string): Column {
+    return this.addColumnOp(name, ColumnType.Int, false)
+  }
+
+  export addString(name: string, length: int): Column {
+    return this.addColumnOp(name, ColumnType.String(length), false)
+  }
+
+  export addText(name: string): Column {
+    return this.addColumnOp(name, ColumnType.Text, false)
+  }
+
+  export addBool(name: string): Column {
+    return this.addColumnOp(name, ColumnType.Bool, false)
+  }
+
+  export addTimestamp(name: string): Column {
+    return this.addColumnOp(name, ColumnType.Timestamp, false)
+  }
+
+  addColumnOp(name: string, colType: ColumnType, primary: bool): Column {
+    let c = newColumn(name, colType, primary)
+    this.ops = append(this.ops, AlterOp.AddColumn(c))
+    return c
+  }
+
+  export dropColumn(name: string) {
+    this.ops = append(this.ops, AlterOp.DropColumn(name))
+  }
+
+  export renameColumn(oldName: string, newName: string) {
+    this.ops = append(this.ops, AlterOp.RenameColumn(oldName, newName))
+  }
+
+  // See `Table.raw` - the identical escape hatch for an alter.
+  export raw(text: string) {
+    this.raws = append(this.raws, text)
+  }
+}
+
+// One statement in a migration: create a table, alter one, or drop one.
+// `table`/`alter`/`drop` below are the only way to build one.
+export enum SchemaOp {
+  CreateTable(Table),
+  AlterTable(AlterTable),
+  DropTable(string),
+}
+
+// Declares a new table named `name`. `build` runs once, immediately,
+// against the fresh `Table`; whatever it called is what the returned
+// `SchemaOp.CreateTable` carries.
+export fn table(name: string, build: (Table) => ()): SchemaOp {
+  let t = Table{
+    name: name,
+    columns: []Column(0),
+    indexes: []Index(0),
+    foreignKeys: []ForeignKey(0),
+    raws: []string(0),
+  }
+  build(t)
+  return SchemaOp.CreateTable(t)
+}
+
+// Declares changes to the existing table named `name`. Same shape as
+// `table`, over `AlterTable`'s add/drop/rename/raw vocabulary instead of
+// `Table`'s create-time one.
+export fn alter(name: string, build: (AlterTable) => ()): SchemaOp {
+  let t = AlterTable{ name: name, ops: []AlterOp(0), raws: []string(0) }
+  build(t)
+  return SchemaOp.AlterTable(t)
+}
+
+// Declares that the table named `name` is dropped.
+export fn drop(name: string): SchemaOp {
+  return SchemaOp.DropTable(name)
+}
