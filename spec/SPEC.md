@@ -1188,7 +1188,8 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 ```
 interface_decl = "interface" IDENT [ generic_params ] "{" [ method_sig { ( ";" | "," ) method_sig } [ ";" | "," ] ] "}" .
 method_sig     = IDENT signature .
-enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_variant { ( ";" | "," ) enum_variant } [ ";" | "," ] ] "}" .
+enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_member { ( ";" | "," ) enum_member } [ ";" | "," ] ] "}" .
+enum_member    = enum_variant | method_decl .            (* method_decl, §10.4 *)
 enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* optional payload; §14.7 *)
 ```
 
@@ -3477,18 +3478,23 @@ Method sets:
   statement (§10.7) - an injected method is indistinguishable from a declared
   one for this purpose. A type alias has no method set of its own - aliases
   are transparent (§14.1), so a value typed through one satisfies an
-  interface exactly as its underlying class would.
+  interface exactly as its underlying class would. An enum type's method set
+  is, likewise, the methods declared in its body (§14.7) - a payload-carrying
+  variant name is never a method name (§9), so the two never collide.
 - Interfaces may not declare fields; only method signatures.
-- `S` must be a **class** type (or another interface, or `nil`). An interface
-  value *is* the receiver's object pointer - there is no boxed scalar - so only a
-  type that is already a reference (§13.3) can sit behind one. Storing anything
-  else would leave a non-pointer in a word the collector traces as a root and a
-  type assertion (§14.4) reads as an object header. This is a rule about the
-  value's representation, not its method set - though since a scalar can never
-  have a method at all (§10.4: methods are declared only in a class body), the
-  two rules are never actually in tension for a scalar; the empty interface
-  `interface {}` is what isolates the representation rule from a method-set
-  check, since every value's (trivially empty) method set satisfies it.
+- `S` must be a **class or enum** type (or another interface, or `nil`). An
+  interface value *is* the receiver's object pointer - there is no boxed
+  scalar - so only a type that is already a reference (§13.3) can sit behind
+  one; an enum value is always one (§14.7's representation note - even a
+  bare-tag, no-payload-carrying enum's own method receiver is boxed the same
+  way). Storing anything else would leave a non-pointer in a word the
+  collector traces as a root and a type assertion (§14.4) reads as an object
+  header. This is a rule about the value's representation, not its method set
+  - though since a scalar can never have a method at all (§10.4, §14.7:
+  methods are declared only in a class or enum body), the two rules are never
+  actually in tension for a scalar; the empty interface `interface {}` is
+  what isolates the representation rule from a method-set check, since every
+  value's (trivially empty) method set satisfies it.
 - `nil` is assignable to *any* interface, empty or not, and satisfaction is never
   consulted for it: `nil` has no method set, so testing it against `I`'s methods
   would reject it out of every non-empty interface and leave such a location's
@@ -3570,7 +3576,8 @@ See §15.4.
 ### 14.7 Enum Types
 
 An enum is a nominal type whose values are one of a fixed, named set of
-variants. Its grammar (`enum_decl`/`enum_variant`) is given in §10.6.
+variants. Its grammar (`enum_decl`/`enum_member`/`enum_variant`) is given in
+§10.6.
 
 ```
 enum Color { Red, Green, Blue }
@@ -3578,6 +3585,18 @@ let c = Color.Green            // no-payload variant: EnumName.Variant
 
 enum Shape { Circle(f64), Rect(f64, f64), Unit }
 let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
+
+enum Ticket {
+  Open(string),
+  Closed(string, string),
+
+  export summary(): string {
+    match (this) {
+      Open(title) => return title
+      Closed(title, resolution) => return "${title}: ${resolution}"
+    }
+  }
+}
 ```
 
 - **Nominal identity** (unlike classes/interfaces, §14.1): two enums with the same
@@ -3587,6 +3606,16 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
   tagged union / sum type. A payload variant is constructed by calling it with
   arguments (`Shape.Rect(3.0, 4.0)`); the argument types and count must match the
   declaration. A no-payload variant is written bare (`Shape.Unit`).
+- An enum body may declare **methods** (`enum_member`'s `method_decl`
+  alternative, §10.4) alongside its variants, in the same brace list, one
+  `method_decl` exactly as a class body writes one. The reserved receiver
+  `this` (§10.4) is bound to the enum value, so a method's body typically
+  opens with a `match (this)` over the variants. A method may call another
+  method on `this`, and `export` on an enum method means what it means on a
+  class method. Because interfaces are satisfied **structurally** (§14.3),
+  an enum with the right methods satisfies an interface exactly as a class
+  does - a value of that enum type is then storable wherever the interface
+  is expected, dispatched dynamically like any other interface value.
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
   variants and binds a variant's payload in its arm. Enums are not ordered.
   Equality is §14.6: a C-like enum compares by tag, a payload-carrying enum
@@ -5144,7 +5173,8 @@ trait_member  = use_stmt | trait_method | trait_field .
 use_stmt      = "use" IDENT { "," IDENT } .
 trait_method  = IDENT [ generic_params ] signature [ block ] .
 trait_field   = [ "export" ] IDENT ":" type .
-enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_variant { fsep enum_variant } [ fsep ] ] "}" .
+enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_member { fsep enum_member } [ fsep ] ] "}" .
+enum_member   = enum_variant | method_decl .
 enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 
 generic_params= "<" generic_param { "," generic_param } ">" .
