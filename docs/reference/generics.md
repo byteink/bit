@@ -150,13 +150,17 @@ fn main() {
 ## Why the store itself is not generic
 
 You might expect the next step to be a generic `MemoryStore<T>` that holds
-any record type, not just `Link`. It stays fixed on purpose. Two real gaps in
-the language today mean that generic version teaches you two things - the
-`Store` interface and the `Existence` trait - only to take them away again:
-a trait cannot be made generic, and a generic interface's own methods do not
-resolve through an interface-typed value once you have one. Until both are
-fixed, `Counter<T>` lives beside the store rather than replacing any part of
-it.
+any record type, not just `Link`. It stays fixed on purpose, and now for one
+reason instead of two. A generic interface's own methods resolve through an
+interface-typed value just fine today, so a generic `Store<T>` on its own
+would work. What still cannot follow is `Existence`: Bit decided a trait
+stays scoped to one concrete type per trait, because its type parameters
+would have nowhere unambiguous to come from - its own explicit argument at
+each `use`, or borrowed silently from whatever class uses it - and neither
+reading is obviously right. `MemoryStore` reaches for `Existence` to get
+`has` for free, so it and the `Store` it implements stay fixed on `Link`
+unless you are willing to write `has` by hand instead. `Counter<T>` lives
+beside the store rather than replacing any part of it.
 
 ## What to read next
 
