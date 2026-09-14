@@ -1,133 +1,127 @@
 # Errors
 
-Bit uses **result-style error values with explicit propagation**, not
-exceptions. A fallible function returns either an ok value or an error;
-propagation is the single postfix operator `?`, and handling is the local
-`catch` expression. Control flow stays visible - every early exit is a `?` or
-`fail` you can see. Unrecoverable bugs use `panic`. (Spec: §18.)
+`MemoryStore.get` has a problem: look up a code that was never stored, and it
+hands back a zero-valued `Link` with an empty URL. That is indistinguishable
+from a real link whose URL is somehow empty. "No such code" needs to be a
+different thing from "here is your link," visibly, at the type level - not a
+value the caller has to guess is fake.
 
-## Fallible functions
+<!-- doctest: per-block -->
 
-A result type carrying the `!` marker is fallible. `T!` is shorthand for
-`T ! error` (the default error type); `T ! E` names a concrete error type; `()!`
-returns nothing or an error.
+## Fallible returns
 
-```bit ignore
-fn readAll(path: string): string! { }           // string OR error
-fn fetch(url: string): Response ! HttpError { } // custom error type
-fn run(): ()! { }                               // nothing OR error
-```
-
-(Signatures only - the bodies are empty and `Response`/`HttpError` stand in for
-your own types, so this block is not doc-tested.)
-
-The value of a fallible function is a built-in result; you cannot construct it by
-hand, only via `return` (ok) and `fail` (err).
-
-## Producing results
-
-- `return v` in a fallible function wraps `v` as the **ok** result. `return`
-  alone in a `()!` function returns ok-void.
-- `fail e` returns the **err** result carrying `e`. Like `return`, it terminates
-  the function.
+Bit's answer is a return type that can be either a value or an error. Write
+`T!` instead of `T`, and return either `T` with `return` or an error with
+`fail`:
 
 ```bit
-import { readFile } from "std/fs"
-
-// A tiny decimal parser, so this page's examples are real code.
-fn toInt(s: string): int! {
-  if (len(s) == 0) {
-    fail newError("empty number")
-  }
-  let n = 0
-  let i = 0
-  while (i < len(s)) {
-    let c = int(s[i])
-    if (c < 48 || c > 57) {
-      fail newError("not a digit: ${s}")
-    }
-    n = n * 10 + (c - 48)
-    i = i + 1
-  }
-  return n
+class Link {
+  export url: string,
+  export created: i64,
+  export hits: int,
 }
 
-fn parsePort(s: string): int! {
-  let n = toInt(s)?
-  if (n < 0 || n > 65535) {
-    fail newError("port out of range") // err result
+class MemoryStore {
+  links: map<string, Link>
+  export get(code: string): Link! {
+    let (l, ok) = this.links[code]
+    if (!ok) {
+      fail newError("no such code: ${code}")
+    }
+    return l
   }
-  return n // ok result
+}
+
+fn main() {
+  let store = MemoryStore{ links: map<string, Link>() }
+  let l = store.get("abc123") catch Link{ url: "", created: 0, hits: 0 }
+  println("abc123 -> ${l.url}")
 }
 ```
 
-`error("...")` builds a value satisfying the predeclared `error` interface (see
-[Interfaces](interfaces.md#the-error-interface)).
+`Link!` is shorthand for "a `Link`, or an error." You cannot get a `Link` out
+of a `Link!` by just using it as one - see Sharp edges below. You have to say
+what happens on failure, either with `catch` (here) or with `?` (next).
 
 ## Propagating with `?`
 
-Postfix `?` evaluates a fallible expression: if it is err, the enclosing function
-immediately returns that err; if ok, `?` evaluates to the unwrapped value. `?` is
-legal only inside a fallible function, and the propagated error type must be
-assignable to the enclosing function's error type.
+A function that calls a fallible function usually cannot handle the failure
+itself - it just needs to pass it up. Postfix `?` does that: on success it
+unwraps the value, on failure it returns the error immediately from the
+enclosing function, which must itself be fallible.
 
 ```bit
-fn loadCount(path: string): int! {
-  let text = readFile(path)? // returns early on a read error
-  return parsePort(text)?    // returns early on a parse error
+class Link {
+  export url: string,
+  export created: i64,
+  export hits: int,
+}
+
+class MemoryStore {
+  links: map<string, Link>
+  export get(code: string): Link! {
+    let (l, ok) = this.links[code]
+    if (!ok) {
+      fail newError("no such code: ${code}")
+    }
+    return l
+  }
+}
+
+fn resolve(store: MemoryStore, code: string): Link! {
+  let l = store.get(code)?
+  return l
 }
 ```
+
+`resolve` has nothing useful to do if the code is missing, so it does not
+handle the error at all - `?` sends it straight to `resolve`'s own caller.
 
 ## Handling with `catch`
 
-`catch` consumes a fallible value locally. Two forms:
-
-- `expr catch default` - evaluates to the ok value, or to `default` (of type `T`)
-  if err. The error is discarded.
-- `expr catch e { ... }` - binds the error to `e` in a block; the block must
-  either produce a `T` (its final expression) or divert control with `return`,
-  `fail`, `panic`, `break`, or `continue`.
+`catch` is for the function that actually knows what to do when something
+fails. Two forms: `expr catch default` swaps in a fallback value and
+discards the error; `expr catch e { ... }` binds the error to `e` so you can
+look at it.
 
 ```bit
-class Config {
-  export port: int
+class Link {
+  export url: string,
+  export created: i64,
+  export hits: int,
+}
 
-  valid(): bool {
-    return this.port > 0
+class MemoryStore {
+  links: map<string, Link>
+  export get(code: string): Link! {
+    let (l, ok) = this.links[code]
+    if (!ok) {
+      fail newError("no such code: ${code}")
+    }
+    return l
   }
 }
 
-fn defaults(): Config {
-  return Config{ port: 8080 }
-}
+fn main() {
+  let store = MemoryStore{ links: map<string, Link>() }
 
-fn parseConfig(text: string): Config! {
-  return Config{ port: parsePort(text)? }
-}
-
-fn loadConfig(path: string): Config! {
-  let text = readFile(path)?
-  let cfg = parseConfig(text) catch e {
-    println("bad config: ${e.message()}")
-    return defaults() // recover with a default
+  store.get("zzz") catch e {
+    println("zzz -> unresolved: ${e.message()}")
+    Link{ url: "", created: 0, hits: 0 }
   }
-  if (!cfg.valid()) {
-    fail newError("config failed validation")
-  }
-  return cfg
-}
-
-fn quickCount(path: string): int {
-  return loadCount(path) catch 0 // fall back to 0 on any error
 }
 ```
 
-## Deferred cleanup with `defer`
+The block form still has to produce a `Link` (its last expression) or divert
+control entirely with `return`, `fail`, `panic`, `break`, or `continue` - you
+cannot fall off the end with nothing.
 
-`defer call` schedules a call to run when the enclosing function returns by any
-path - normal `return`, `fail`, or `?` propagation - in last-in-first-out order.
-Arguments are evaluated at the `defer` statement, not at execution time. This
-gives deterministic resource release without finalizers.
+## Cleanup with `defer`
+
+Once the shortener keeps a resource open - a file, a connection - closing it
+on every exit path gets repetitive. `defer call` schedules a call to run when
+the enclosing function returns, however it returns, in last-in-first-out
+order:
 
 ```bit
 import { open, create } from "std/fs"
@@ -142,40 +136,58 @@ fn copyFile(src: string, dst: string): ()! {
 }
 ```
 
-Deferred calls do **not** run on a panic path: a panic aborts the process
-immediately, with no unwinding of any kind. Cleanup that must happen before the
-process can die - releasing a lock, deleting a temp file - has to run
-explicitly, before the call that may panic.
+Arguments to a deferred call are evaluated at the `defer` statement, not when
+it eventually runs, so `f` and `g` above are pinned to the files this call
+opened.
 
 ## Panics
 
-A panic aborts the task it was raised on: unless that task installed a panic
-boundary (below), that is an immediate abort of the whole program, with a
-message and stack trace to stderr and a non-zero exit code. Panics are for
-programmer errors and broken invariants, never for expected failures. Sources
-include:
-
-- index or slice out of range; integer divide-by-zero; signed overflow in debug
-  builds
-- writing a `nil` map; closing a `nil` channel; send/close on a closed channel;
-  calling a `nil` function; a single-result type-assertion mismatch
-- an explicit `panic(msg)`
-- a failed `assert(cond)` or `assert(cond, msg)`
+Fallible returns are for failures you expect - a missing code is a normal
+outcome of running a link shortener. A panic is different: it means the
+program hit a state that should be impossible, and it aborts immediately,
+with no unwinding and no `defer` calls running. Use `assert` to state an
+invariant you believe must hold:
 
 ```bit
-fn mustPositive(n: int): int {
-  assert(n > 0, "n must be positive") // panics if the condition is false
-  return n
+class Link {
+  export url: string,
+  export created: i64,
+  export hits: int,
+}
+
+fn recordHit(l: Link): Link {
+  assert(l.hits >= 0, "hit count must not go negative")
+  return Link{ url: l.url, created: l.created, hits: l.hits + 1 }
 }
 ```
 
-A task installs a panic boundary with `std/runtime`'s `runRecovering(f)`
-(spec: §18.4): a panic raised in `f`, or in anything `f` calls on the same
-task, discards the frames between the panic site and the boundary and returns
-`(true, message)` instead of aborting the program. `pkg/web`'s `recover()`
-middleware is built on this call - it turns a handler panic into the same 500
-a `fail` would produce. Recovery has limits: a runtime-internal invariant
-failure, an out-of-memory condition, a panic raised while the task is blocked
-in a syscall, and a panic raised on a thread that is not running a task all
-stay fatal regardless of any boundary. Expected failures should still use the
-result model above, not a panic boundary.
+If `recordHit` is ever called with a link whose count already went negative,
+that is a bug somewhere else in the program, not a condition the caller
+should have to handle with `catch`.
+
+## Sharp edges
+
+A fallible value is not the value it wraps. You cannot use a `Link!` where a
+`Link` is expected without unwrapping it first:
+
+```bit ignore
+let l: Link = store.get("abc123") // error: Link! is not Link
+```
+
+```
+error[E0041]: expected 'Link', found 'Link!'
+```
+
+`?` only works inside a function whose own return type is fallible - you
+cannot propagate a failure out of `main() { }`, only out of a function
+declared `T!`.
+
+## What to read next
+
+The shortener now tells the truth about missing codes. Next:
+[Concurrency](concurrency.md), where a background task expires old links
+while the store keeps serving requests.
+
+---
+
+Specification: §18.

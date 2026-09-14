@@ -1,177 +1,240 @@
 # Concurrency
 
-Bit's concurrency is Go-like: lightweight green threads started with `spawn`,
-typed channels for communication, and `select` to wait on several channels. The
-discipline is *do not communicate by sharing memory; share memory by
-communicating.* (Spec: §13.7, §16.)
+Links should not live forever. You want old ones to expire, but you do not
+want every lookup to pay the cost of checking every link's age, and you do
+not want the store to stop serving requests while it cleans up. That calls
+for a background task that sweeps expired links on its own schedule while
+the rest of the program keeps running.
 
-## Green threads with `spawn`
+<!-- doctest: per-block -->
 
-`spawn` runs a call on a new green thread scheduled over a fixed pool of OS
-threads. The argument **must be a call expression**; its arguments are evaluated
-in the current thread before the new one starts. There is no thread handle in
-v0.1 - coordinate through channels.
+## Starting a background task with `spawn`
+
+`spawn` runs a call on a new green thread - lightweight, scheduled over a
+fixed pool of OS threads, not one per task. The argument must be a call
+expression:
 
 ```bit
-fn worker(id: int, out: chan<int>) {
-  out <- id * id
+fn sweepOnce(expiresAt: map<string, i64>, nowNs: i64): int {
+  let expired = []string(0)
+  for (code, at) of expiresAt {
+    if (at > 0 && at <= nowNs) {
+      expired = append(expired, code)
+    }
+  }
+  return len(expired)
 }
 
-fn fanOut(n: int) {
-  let results = chan<int>(n)
-  for (let i = 1; i <= n; i++) {
-    spawn worker(i, results) // starts a green thread
-  }
-  for (let k = 0; k < n; k++) {
-    let sq = <- results // collect results
-  }
+fn sweepLoop(expiresAt: map<string, i64>, done: chan<int>) {
+  done <- sweepOnce(expiresAt, 0)
+}
+
+fn main() {
+  let expiresAt = map<string, i64>()
+  let done = chan<int>(1)
+  spawn sweepLoop(expiresAt, done)
+  let removed = <- done
+  println("swept ${removed} link(s)")
 }
 ```
 
-The runtime fixes the number of OS worker threads at startup - no unbounded
-thread creation.
+There is no handle to a spawned task and nothing to join - the only way to
+find out what it did, or that it finished, is a channel.
 
-### Stack size, and what happens when you exceed it
+## Channels: send, receive, close
 
-**A green thread's stack is fixed at 64 KiB and does not grow.** `main` is the
-exception: it gets 8 MiB. So the same function recurses **128x deeper on `main`
-than inside `spawn`** - measured on arm64-macos with a 48-byte frame, 174,759
-calls succeed on `main` and 1,362 inside `spawn`.
-
-That is not the goroutine behaviour §16.1 compares green threads to, and it is
-not a number you can raise: 64 KiB is the *identity granule*. The runtime finds
-the running task by masking the stack pointer down to that boundary and reading
-a tag stored there, so the size is also the alignment unit and a stack cannot be
-larger than it. Raising or growing it is a change to how task identity works,
-not a constant edit.
-
-**Exceeding it is now usually a diagnosed crash (#2246).** The runtime installs
-a SIGSEGV/SIGBUS handler that recognizes a fault immediately below a stack's
-base and exits 2 with `bit: stack overflow` (on `main`) or
-`bit: stack overflow in a spawned task` (inside `spawn`), on stderr, from a
-built binary as well as `bit run`. It is not guaranteed: the guard page below
-a stack is a variable width (tracked separately as #2433), so a deep enough
-single frame can occasionally corrupt the task's own bookkeeping before
-reaching it, which surfaces as a raw `SIGTRAP`/`SIGILL` instead - still no
-message, though attributable from a crash report by program counter. There is
-no environment variable or flag that changes the limit.
+A channel is a typed pipe between tasks. `chan<int>(1)` above is buffered
+with room for one value; `chan<int>()` is unbuffered and forces the sender to
+wait for a receiver. Send is a statement, `c <- v`; receive is an expression,
+`<- c`:
 
 ```bit
-fn down(n: int): int {
-  if (n == 0) {
-    return 0
+fn pingPong() {
+  let c = chan<int>(1)
+  c <- 1       // send, does not block: the buffer has room
+  let x = <- c // receive
+}
+```
+
+## Stopping the sweep with `select`
+
+The sweep loop needs to keep going until told to stop, but it also should not
+block forever waiting for a stop signal between sweeps. `select` with a
+`default` case checks a channel without blocking:
+
+```bit
+import { sleep, Millisecond } from "std/time"
+
+fn sweepLoop(stop: chan<bool>, done: chan<int>) {
+  let removed = 0
+  let running = true
+  while (running) {
+    select {
+      case _ = <- stop:
+        running = false
+      default:
+        sleep(5 * Millisecond)
+        removed = removed + 1
+    }
   }
-  return 1 + down(n - 1)
-}
-
-fn deepWorker(depth: int, done: chan<int>) {
-  done <- down(depth) // 4000 frames: fine on main, SIGSEGV here
+  done <- removed
 }
 ```
 
-This matters outside synthetic recursion, because every server built on this
-runtime handles a request in a green thread - `serveTls` spawns one per
-connection. A recursive walk over request-shaped data (a category tree, a
-comment thread, a directory listing, a nested JSON document) is running on 64
-KiB, and roughly 1,300 frames is within reach of merely deep, not even hostile,
-input.
+Every pass through the loop, `select` checks whether `stop` has a value
+waiting. If it does not, `default` runs instead of blocking, so the loop can
+go do another sweep. Send `true` on `stop` from elsewhere and the next pass
+picks it up.
 
-Until the stack grows on demand, write recursion that runs inside `spawn` with
-an explicit depth bound and reject input past it, or convert the walk to an
-explicit heap-allocated worklist. The fixed size itself is tracked as
-**#2613**; nothing in this section is settled design.
+## Wired into the shortener
 
-## Channels
-
-A channel is a typed synchronization primitive. Unbuffered channels are
-synchronous; buffered channels hold up to their capacity.
+Put the pieces together: `Link` gets an `expiresAt`, `sweepLoop` walks the
+concrete `MemoryStore` directly (it needs the map, not just what `Store`
+exposes), and `main` starts it, lets it run for a while, then stops it and
+reads how many links it removed:
 
 ```bit
-fn channels() {
-  let c = chan<int>()   // unbuffered (synchronous)
-  let b = chan<int>(16) // buffered, capacity 16
+import { now, sleep, Millisecond } from "std/time"
+
+class Link {
+  export url: string,
+  export created: i64,
+  export hits: int,
+  export expiresAt: i64,
 }
-```
 
-### Send and receive
+const alphabet: string = "abcdefghijklmnopqrstuvwxyz0123456789"
 
-- **Send** is a statement: `c <- v`. It blocks until a receiver is ready
-  (unbuffered) or buffer space exists (buffered).
-- **Receive** is an expression: `<- c`. It blocks until a value is available. The
-  two-result form reports whether the channel is still open.
-
-```bit
-fn pingPong(c: chan<int>) {
-  c <- 1             // send
-  let x = <- c       // receive
-  let (v, ok) = <- c // ok is false if closed and drained
-}
-```
-
-### Close and range
-
-`close(c)` marks a channel closed: further sends panic, and receives drain any
-buffered values then yield `(zero, false)`. Only the sending side should close.
-Range over a channel with `for ... of` until it is closed and drained.
-
-```bit
-fn producer(out: chan<int>) {
-  for (let i = 0; i < 3; i++) {
-    out <- i
+fn shortCode(n: int): string {
+  let out = []byte(0)
+  let x = n
+  while (x > 0 || len(out) == 0) {
+    out = append(out, alphabet[x % len(alphabet)])
+    x = x / len(alphabet)
   }
-  close(out) // signal completion
+  return string(out)
 }
 
-fn consumer(input: chan<int>) {
-  for v of input { // receives until closed and drained
-    // handle v
-  }
-}
-```
-
-### `nil` channel behavior
-
-Sending on or receiving from a `nil` channel blocks forever; closing a `nil` or
-already-closed channel panics. Allocate with the constructor form first.
-
-## `select`
-
-`select` waits until one of its case communications can proceed, chooses one
-uniformly at random among those ready, and runs its clause. A `default` clause,
-if present, runs when no case is immediately ready, making the select
-non-blocking.
-
-```bit
-fn pump(input: chan<int>, out: chan<int>, next: int) {
-  select {
-    case v = <- input:
-      handle(v)
-    case out <- next:
-      advance()
-    default:
-      idle()
+trait Existence {
+  get(code: string): Link!
+  has(code: string): bool {
+    let l = this.get(code) catch Link{ url: "", created: 0, hits: 0, expiresAt: 0 }
+    return len(l.url) > 0
   }
 }
 
-fn handle(v: int) {}
-fn advance() {}
-fn idle() {}
+interface Store {
+  put(code: string, l: Link),
+  get(code: string): Link!,
+  has(code: string): bool,
+}
+
+class MemoryStore {
+  use Existence
+
+  links: map<string, Link>
+  export put(code: string, l: Link) {
+    this.links[code] = l
+  }
+  export get(code: string): Link! {
+    let (l, ok) = this.links[code]
+    if (!ok) {
+      fail newError("no such code: ${code}")
+    }
+    return l
+  }
+}
+
+fn memoryStore(): MemoryStore {
+  return MemoryStore{ links: map<string, Link>() }
+}
+
+// Removes every link whose expiresAt has passed nowNs, returning the count.
+fn sweepOnce(store: MemoryStore, nowNs: i64): int {
+  let expired = []string(0)
+  for (code, l) of store.links {
+    if (l.expiresAt > 0 && l.expiresAt <= nowNs) {
+      expired = append(expired, code)
+    }
+  }
+  for code of expired {
+    delete(store.links, code)
+  }
+  return len(expired)
+}
+
+fn sweepLoop(store: MemoryStore, stop: chan<bool>, done: chan<int>) {
+  let removed = 0
+  let running = true
+  while (running) {
+    select {
+      case _ = <- stop:
+        running = false
+      default:
+        sleep(5 * Millisecond)
+        removed = removed + sweepOnce(store, now().ns)
+    }
+  }
+  done <- removed
+}
+
+fn main() {
+  let ms = memoryStore()
+  let store: Store = ms
+
+  let expiring = "exp1"
+  store.put(
+    expiring,
+    Link{
+      url: "https://example.org",
+      created: now().ns,
+      hits: 0,
+      expiresAt: now().ns + 10 * Millisecond,
+    },
+  )
+
+  let stop = chan<bool>(1)
+  let done = chan<int>(1)
+  spawn sweepLoop(ms, stop, done)
+
+  println("has ${expiring} right after put: ${store.has(expiring)}")
+  sleep(40 * Millisecond)
+  stop <- true
+  let removed = <- done
+
+  println("swept ${removed} expired link(s)")
+  println("has ${expiring} after the sweep: ${store.has(expiring)}")
+}
 ```
 
-An empty `select {}` blocks forever. Case operands (and the sent value for a
-send case) are evaluated once, at entry to the select.
+## Sharp edges
 
-## Memory model
+- A green thread's stack is fixed at 64 KiB and does not grow, unlike
+  `main`'s 8 MiB. `sweepLoop` above is shallow, but a recursive walk spawned
+  the same way is not - keep recursion inside `spawn` bounded, or convert it
+  to an explicit worklist.
+- Accessing `store.links` from two tasks at once with no channel between them
+  is a data race with an unspecified result. `sweepLoop` above is safe only
+  because nothing else touches `ms` while it runs; a handler that also wrote
+  to the store while the sweep ran would need a channel to hand it off, not
+  direct access from both sides.
+- `close(c)` on an already-closed or `nil` channel panics. Only the sender
+  should close a channel.
 
-For programs that use channels correctly, Bit gives a sequentially consistent
-view through these happens-before edges (§13.7):
+## When not to reach for `spawn`
 
-1. `spawn f(...)` happens-before the spawned function begins.
-2. A send happens-before the corresponding receive completes.
-3. Closing a channel happens-before a receive that observes it closed.
-4. On an unbuffered channel, a receive happens-before the send completes.
+If the sweep only needs to happen once per request - check whether the link
+you just looked up is expired, right there - a plain function call is
+simpler and has no coordination to get wrong. Reach for `spawn` when the work
+genuinely needs to happen on its own schedule, independent of any single
+request.
 
-Accessing shared **mutable** memory from multiple threads without an ordering
-edge established through channels is a **data race**, and its result is
-unspecified. v0.1 provides channels as the only synchronization primitive;
-mutexes and atomics are deferred to a later release.
+## What to read next
+
+The shortener runs, stores, errors, and cleans up after itself, all in one
+file. Next: [Modules](modules.md), where it gets split across files as it
+grows.
+
+---
+
+Specification: §13.7, §16.
