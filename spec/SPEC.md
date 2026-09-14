@@ -1469,13 +1469,23 @@ interface is a separate extension this section does not make.
   `decimal`'s scale is display precision, not part of its identity. `*`
   multiplies the two 96-bit mantissas and **sums** the operand scales instead
   of aligning them (`1.5 * 2.5` is `3.75`, scale `1 + 1`) - multiplication's
-  scale is exact, not a display choice, so there is nothing to align. A
-  result whose mantissa would not fit 96 bits, or (for `*`) whose scale would
-  exceed 28, **panics** (§13.5) rather than wrapping. *(v1 status: the type,
-  its literals, its conversions, locals/parameters/fields/returns,
-  interpolation, unary `-`/`+`, binary `+`/`-`/`*`, and the six comparisons
-  are implemented. Division and half-even rounding are not, and a program
-  that evaluates one is refused at build with **E0092**.)*
+  scale is exact, not a display choice, so there is nothing to align. `/`
+  computes the exact quotient to the type's full 96-bit precision and then:
+  if the division **terminates** within that precision, trims trailing
+  zeros to the fewest digits that represent it exactly (`10 / 2` is `5`, not
+  `5.000...`; `1 / 8` is `0.125`); if it does not terminate, the result
+  keeps the full precision and the last digit is rounded **half-even** -
+  exactly halfway rounds to whichever of the two candidates is even, rather
+  than always up, so summing many rounded values does not drift (the IEEE
+  and ISO default, and the reason for it). `2.5` and `3.5` rounded to zero
+  decimal places are `2` and `4` for the same reason. Trimming a terminating
+  result is safe precisely because equality already ignores scale (above) -
+  no trim can change what a later `==` sees. A result whose mantissa would
+  not fit 96 bits, or (for `*`) whose scale would exceed 28, **panics**
+  (§13.5) rather than wrapping; dividing by a zero decimal panics too. *(v1
+  status: the type, its literals, its conversions,
+  locals/parameters/fields/returns, interpolation, unary `-`/`+`, binary
+  `+`/`-`/`*`/`/`, and the six comparisons are implemented.)*
 - `bool` (`true` / `false`).
 - `string`: immutable, UTF-8 byte sequence; indexing yields a `byte`; `len(s)` is
   the byte length. Strings are reference types but deeply immutable.
@@ -3293,7 +3303,8 @@ rejected outright, `E0047`). `Result<T, E>` has no such rescue - both `Ok` and
 - `decimal` (§11.1) arithmetic overflow - a result whose 96-bit mantissa or
   0-28 scale range is exceeded - **panics unconditionally**, in every build
   mode: unlike signed integer overflow above, there is no wrapping
-  representation for it to fall back to.
+  representation for it to fall back to. `decimal` division by a zero
+  `decimal` **panics**, the same posture as integer division by zero above.
 
 ### 13.6 Memory Model (GC)
 
