@@ -366,7 +366,12 @@ case "${BUCKET}" in
     # fails when a docs/stdlib/<mod>.md is missing a heading for an exported
     # symbol, the same check it runs from the stdlib side), so a
     # docs/stdlib/*.md-only edit ran test-docs but never it (#2962).
-    BUILD_STEPS=(test-docs test-stdlib-docs)
+    #
+    # test-fmt-docs (#5298): docs/examples/shortener/ (#5268, 10 `.bit`
+    # files) is a real `.bit` source tree like any other — assert_fmt_gate_
+    # per_bucket() (scripts/gate-bucketasserts.sh) refuses gate.sh --full
+    # outright when a tree holding `.bit` sources runs no fmt gate at all.
+    BUILD_STEPS=(test-docs test-stdlib-docs test-fmt-docs)
     ;;
   stdlibdocs)
     # THE UNION OF `stdlib` AND `docs` (#3055) — a stdlib export's page can be
