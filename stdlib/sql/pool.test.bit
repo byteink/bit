@@ -32,6 +32,10 @@ class stubAdapter {
   closes: i64 = 0
   // "uri" or "fields", one per connect, in order.
   forms: []string
+  // `cfg.uri` for connect number `i+1` (#5085: what a replica-routing test
+  // needs to tell "this connection is the writer's" from "this connection is
+  // replica N's" — `forms` alone only says uri vs fields, never which uri).
+  targets: []string
   // One entry per statement, "<sql>@<connection id>", in the order the
   // connections ran them.
   log: []string
@@ -39,6 +43,15 @@ class stubAdapter {
   poison: bool = false
   // commit fails, leaving the transaction open (rule 2).
   failCommit: bool = false
+  // query() fails (a plain, non-fatal error) on every connection whose
+  // target equals this, "" failing none (#5085: simulates a replica handing
+  // back a statement error without touching the driver's own transport
+  // failure path, which `poison` already covers for exec).
+  failQueryTarget: string = ""
+  // sqlText -> the `cfg.uri` of the connection that ran it (#5085): lets a
+  // replica-routing test ask "which target did THIS read land on" without
+  // parsing the connection id back out of `log`'s "<sql>@<id>" tags.
+  readTargets: map<string, string>
 
   connect(cfg: Datasource): Conn! {
     this.mu.lock()
@@ -49,8 +62,9 @@ class stubAdapter {
       form = "uri"
     }
     this.forms = append(this.forms, form)
+    this.targets = append(this.targets, cfg.uri)
     this.mu.unlock()
-    return stubConn{ a: this, id: id }
+    return stubConn{ a: this, id: id, target: cfg.uri }
   }
 
   record(entry: string) {
@@ -89,6 +103,13 @@ class stubAdapter {
     return this.forms
   }
 
+  // `cfg.uri` for every connect, in order (#5085).
+  targetsSeen(): []string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.targets
+  }
+
   poisoned(): bool {
     this.mu.lock()
     defer this.mu.unlock()
@@ -112,6 +133,43 @@ class stubAdapter {
     this.failCommit = on
     this.mu.unlock()
   }
+
+  // The `cfg.uri` connect number `id` (1-based) was opened for, or "" for an
+  // id out of range.
+  targetFor(id: i64): string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (id < 1 || id > i64(len(this.targets))) {
+      return ""
+    }
+    return this.targets[id - 1]
+  }
+
+  setFailQueryTarget(target: string) {
+    this.mu.lock()
+    this.failQueryTarget = target
+    this.mu.unlock()
+  }
+
+  queryFailsFor(target: string): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.failQueryTarget != "" && this.failQueryTarget == target
+  }
+
+  noteReadTarget(sqlText: string, target: string) {
+    this.mu.lock()
+    this.readTargets[sqlText] = target
+    this.mu.unlock()
+  }
+
+  // The target a successful read of `sqlText` landed on, or "" if it never
+  // ran (or failed before being recorded).
+  readTargetFor(sqlText: string): string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.readTargets[sqlText]
+  }
 }
 
 // One physical connection. `id` is what every statement in the log is tagged
@@ -119,8 +177,16 @@ class stubAdapter {
 class stubConn {
   a: stubAdapter
   id: i64
+  // The `cfg.uri` this connection was opened for (#5085); "" for the
+  // host/user/database form.
+  target: string = ""
   query(sqlText: string, params: []Value): Rows! {
+    if (this.a.queryFailsFor(this.target)) {
+      this.a.record("FAIL:${sqlText}@${this.id}")
+      fail newError("stub: query failed on ${this.target}")
+    }
     this.a.record("${sqlText}@${this.id}")
+    this.a.noteReadTarget(sqlText, this.target)
     return stubRows{ pos: -1 }
   }
 
@@ -138,7 +204,7 @@ class stubConn {
 
   begin(): Tx! {
     this.a.record("begin@${this.id}")
-    return stubTx{ a: this.a, id: this.id }
+    return stubTx{ a: this.a, id: this.id, target: this.target }
   }
 
   close() {
@@ -171,8 +237,12 @@ class stubRows {
 class stubTx {
   a: stubAdapter
   id: i64
+  // The `cfg.uri` the underlying connection was opened for (#5085); set by
+  // `stubConn.begin`.
+  target: string = ""
   query(sqlText: string, params: []Value): Rows! {
     this.a.record("${sqlText}@${this.id}")
+    this.a.noteReadTarget(sqlText, this.target)
     return stubRows{ pos: -1 }
   }
 
@@ -194,7 +264,10 @@ class stubTx {
 }
 
 fn newStub(): stubAdapter {
-  return stubAdapter{ mu: newMutex(), forms: []string(0), log: []string(0) }
+  return stubAdapter{
+    mu: newMutex(), forms: []string(0), targets: []string(0), log: []string(0),
+    readTargets: map<string, string>(),
+  }
 }
 
 // The connection id a log entry was tagged with: "insert@3" -> "3".

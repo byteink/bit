@@ -279,6 +279,8 @@ pool settings puts a nested value and a second `?` at every call site.
 | `maxIdleTime` | `600_000` | ms a connection may sit idle before it is retired; 0 or less, never |
 | `acquireTimeout` | `5_000` | ms a caller waits for a connection before failing |
 | `statementCache` | `0` | prepared statements kept per connection; 0 is off |
+| `replicas` | `[]` | read replica URIs (see "Read replicas" below); empty means every statement runs on the writer |
+| `replicaBackoff` | `2_000` | ms a replica that failed a statement stays out of rotation |
 
 **`uri` and the individual fields are mutually exclusive.** Setting both is
 an error naming both, not one silently winning. Parsing `uri` is the
@@ -374,6 +376,16 @@ connection is back in the pool before this returns.
 Closes every idle connection and fails every parked caller. Connections
 still checked out are closed as they are returned. Idempotent.
 
+### `Pool.tx(f: (Tx) => ()!): ()!`
+
+`tx` as a method: runs `f` in a transaction at the database's own isolation
+level. `db.tx(f)` and `tx(db, f)` (see "Transactions" below) run the same
+code - this is a call shape, not a second implementation.
+
+### `Pool.txAt(level: Isolation, f: (Tx) => ()!): ()!`
+
+`Pool.tx` at the isolation level `level` instead of the database's own.
+
 ### `Pool.txValue<T>(f: (Tx) => T!): T!`
 
 `txValue` as a method: runs `f` in a transaction and returns what `f`
@@ -385,6 +397,11 @@ because the value is only a result if the work behind it is durable.
 
 `Pool.txValue` at the isolation level `level` instead of the database's own.
 This is the one implementation; the other three are spellings of it.
+
+### `Pool.session(): Session`
+
+Opens a per-request read-your-own-writes handle. See "Read replicas" below
+for what it is for and what it costs to forget.
 
 ### `FatalError`
 
@@ -404,6 +421,63 @@ is the common case and needs no cooperation from the driver at all.
 
 A ready-made `FatalError`, for a driver with no error type of its own to
 extend.
+
+## Read replicas
+
+Reads go to a replica, writes to the writer, and **everything inside a
+transaction goes to the writer** - a read inside a transaction that landed on
+a replica would not see the transaction's own uncommitted writes. This needs
+no code at the call site: set `Datasource.replicas`, and `pool` opens one
+connection pool per replica URI alongside the writer's own.
+
+```bit
+import { Adapter, Datasource, Pool, pool } from "std/sql"
+
+fn withReplicas(a: Adapter, writerUrl: string, replicaUrls: []string): Pool! {
+  return pool(a, Datasource{ uri: writerUrl, replicas: replicaUrls })?
+}
+```
+
+**Read-your-own-writes** is the hard part: a read issued right after a write
+in the same request must not land on a replica that has not caught up, or the
+caller is shown stale data it just changed. `Pool` cannot hold that flag
+itself - a `Pool` is shared by every green thread using it, so a pool-level
+"has written" would answer with some other task's write.
+
+### `Pool.session(): Session`
+
+See above.
+
+### `Session`
+
+A per-request handle, from `Pool.session`. `written` starts false; once
+`Session.exec` has committed a write, every later `Session.query` on the
+SAME handle goes to the writer, never a replica, until the caller takes a
+fresh `Session`. A `query` on a `Session` that has not written may still land
+on a replica.
+
+**What it costs when it is wrong.** A handler that keeps calling
+`pool.query`/`pool.exec` directly instead of routing every statement through
+one `Session` gets no read-your-own-writes protection, silently - there is
+nothing to forget out loud. The next read then runs on a replica that may not
+have caught up, the caller sees data older than the write it just made, and
+nothing errors.
+
+### `Session.query(sqlText: string, params: []Value): Rows!`
+
+Routes to the writer once this handle has written; otherwise the same
+routing `Pool.query` itself uses.
+
+### `Session.exec(sqlText: string, params: []Value): int!`
+
+Always the writer. Marks this handle sticky only once the write has actually
+committed - a failed write leaves nothing to be stale about.
+
+**Replica health.** A replica that fails a statement is dropped from
+rotation for `Datasource.replicaBackoff` milliseconds and the statement is
+retried on the writer, so one dead replica degrades throughput rather than
+erroring the caller. A write is never retried on a replica: `Pool.exec`
+always runs on the writer and never consults the replica set at all.
 
 ## Transactions
 

@@ -34,6 +34,11 @@
 // name: it serialises concurrent callers onto ONE physical connection so a
 // driver's socket never sees two calls at once. It pools nothing. This file
 // is the pool.
+//
+// READ REPLICA ROUTING (#5085) IS ./replica.bit's, not this file's: `query`
+// below is one line into `replicaSet.read`, and every replica-specific
+// decision — which node, when it is down, read-your-own-writes via
+// `Session` — lives there. This file stays the writer's own pool.
 
 import { Mono, monotonic, since, after, Millisecond } from "std/time"
 
@@ -99,12 +104,26 @@ export class Pool {
   // The id source for both slots and waiters. Guarded by `mu`.
   seq: i64
   closed: bool
+  // Read replicas (#5085), built once by `pool` from `cfg.replicas`.
+  // ./replica.bit owns every routing decision this field is used for.
+  replicas: replicaSet
 
-  // Runs `sqlText` and returns its rows. THE CONNECTION STAYS CHECKED OUT
-  // UNTIL THE RETURNED `Rows` IS CLOSED — a cursor lives on the connection
-  // that produced it, so a caller that never closes its `Rows` leaks a
-  // connection exactly as one that never closes a file leaks a descriptor.
+  // Runs `sqlText` and returns its rows — on a read replica when one is in
+  // rotation, on the writer otherwise (./replica.bit's `replicaSet.read`).
+  // THE CONNECTION STAYS CHECKED OUT UNTIL THE RETURNED `Rows` IS CLOSED,
+  // whichever node it came from — a cursor lives on the connection that
+  // produced it, so a caller that never closes its `Rows` leaks a connection
+  // exactly as one that never closes a file leaks a descriptor.
   export query(sqlText: string, params: []Value): Rows! {
+    return this.replicas.read(sqlText, params, this)?
+  }
+
+  // The writer-only path: what `query` falls back to when no replica is in
+  // rotation, and the only path a `Session` (./replica.bit) that has written
+  // uses. Never consults `replicas` — this is also why a failed `exec`
+  // (below) is never retried on a replica: `exec` calls `this.acquire()`
+  // directly and has no route to this file's replica set at all.
+  queryWriter(sqlText: string, params: []Value): Rows! {
     let s = this.acquire()?
     let rows = s.inner.query(sqlText, params) catch e {
       this.failed(s, e)
@@ -157,8 +176,16 @@ export class Pool {
     return txValueAt<T>(this, level, f)?
   }
 
+  // A per-request read-your-own-writes handle (./replica.bit's `Session`),
+  // one line delegating to its constructor — the same shape as `tx`/`txAt`
+  // above.
+  export session(): Session {
+    return newSession(this)
+  }
+
   // Closes every idle connection and fails every parked caller. Connections
-  // still checked out are closed as they are returned. Idempotent.
+  // still checked out are closed as they are returned. Idempotent. Also
+  // closes every read replica's own pool (./replica.bit).
   export close() {
     this.mu.lock()
     this.closed = true
@@ -175,6 +202,7 @@ export class Pool {
       s.inner.close()
     }
     this.reap()
+    this.replicas.closeAll()
   }
 
   // Checks a connection out, opening one or waiting for one as the
@@ -425,10 +453,12 @@ fn expired(start: Mono, limitMs: i64): bool {
 // surfaces here, not as a DNS error later.
 export fn pool(a: Adapter, cfg: Datasource): Pool! {
   cfg.validate()?
+  let reps = buildReplicas(a, cfg)?
   return Pool{
     adapter: a, cfg: cfg, mu: newMutex(),
     idle: []slot(0), waiters: []waiter(0), dead: []slot(0),
     numOpen: 0, seq: 0, closed: false,
+    replicas: reps,
   }
 }
 
