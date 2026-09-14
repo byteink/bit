@@ -1288,6 +1288,24 @@ trait_method = IDENT [ generic_params ] signature [ block ] .
 trait_field  = [ "export" ] IDENT ":" type .    (* no `readonly` - §10.5 is class-only *)
 ```
 
+**A trait declares no type parameters of its own** - unlike `class_decl` (§10.1)
+and `interface_decl` (§14.3), `trait_decl` has no `[ generic_params ]` after the
+name. Writing `trait Existence<T> { ... }` is E0021, naming the rule rather than
+just the unexpected `<`. This was a deliberate choice (#5275), not an omission:
+a trait's type parameters would have to be either its own - instantiated with an
+explicit argument at each `use`, mirroring how a class names an interface's - or
+inherited from the `use`-ing type, so a trait body's `T` resolves to whichever
+type parameter the class declares under that name. These are different
+mechanisms, not two spellings of one, and the second is the one novel to Bit:
+nothing else in the language lets an inner declaration's identifier bind through
+an enclosing declaration's scope implicitly. It would also read a trait body's
+free type names through the same module-wide name table `buildSignatures`
+(checkbind.bit) already resolves every other generic through, which #4602
+documents as corrupting two unrelated generics that both spell a parameter `T` -
+a trait would be a further, unfixed reader of that table. A trait that needs to
+abstract over a type therefore stays scoped to one concrete type per trait; the
+class or interface it serves takes the type parameter instead.
+
 A trait declares methods to be **injected into a class at check time** by a
 `use` statement in that class's body, and may also declare **fields**,
 injected into the using class's own layout and GC pointer map exactly like a
@@ -3484,8 +3502,7 @@ variant_pat = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binder
 The subject expression must be an enum type. Each arm names one of the enum's
 variants (bare, unqualified - the subject's type disambiguates) and runs its
 body when the value is that variant. A payload variant's arm binds its payload:
-`Circle(r) => …` binds `r` to the `f64` inside; the binder count must match the
-variant's payload arity. A `match` is:
+`Circle(r) => …` binds `r` to the `f64` inside; the binder count must match the variant's payload arity. A `match` is:
 
 - **Exhaustive** - every variant of the enum must have an arm, or the arms
   that do not name one are covered by a trailing `_` (below); a missing
