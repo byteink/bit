@@ -444,10 +444,6 @@ caller is shown stale data it just changed. `Pool` cannot hold that flag
 itself - a `Pool` is shared by every green thread using it, so a pool-level
 "has written" would answer with some other task's write.
 
-### `Pool.session(): Session`
-
-See above.
-
 ### `Session`
 
 A per-request handle, from `Pool.session`. `written` starts false; once
