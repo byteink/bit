@@ -1156,6 +1156,26 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   further meaning to which one it is. One on a field of a class that does
   not carry `@table` is **E0160**, naming the field, the attribute and the
   class - the same reasoning `@key` outside `@json` (E0139) already gives.
+- **A relation field on a `@table` class starts "unloaded" and panics on
+  read until it is set** (#5053 steps 2/3, #5271). No hidden word is added
+  for this: a relation field is a normal `[]T` field with a normal
+  GC-traced pointer slot (`FieldLayout.isPtr`), and that slot is what holds
+  the reserved state - a non-8-aligned integer (`1`) no `gc_alloc`'d object
+  can ever legitimately occupy, so it can never collide with a real slice
+  header and is inert to the collector (never marked, never written back
+  through). A composite literal or any other zero-value construction site
+  that omits the field writes this reserved value instead of the ordinary
+  null/empty slice; assigning it a real value (a generated row mapper's
+  write, or an ordinary field assignment) overwrites it exactly as any
+  other field write would, with no separate "mark loaded" step. Reading a
+  relation field still carrying the reserved value panics, naming the field
+  and the class and the `.with("<field>")` call that would have loaded it -
+  before the read ever reaches `len`, iteration, or anything else that
+  would treat the reserved value as a real slice header. An explicitly
+  loaded but empty relation (`u.orders = []Order{}`) is a real (null,
+  per this section's own empty-slice representation) header, distinct from
+  the reserved value, so it reads as length 0 with no panic - "no rows" and
+  "never loaded" stay distinguishable.
 - **A hidden persisted-flag word, read and written by `isPersisted()`/
   `markPersisted(v: bool)`** (#5052). `db.save` must issue an INSERT for a
   new entity and an UPDATE for one that came from a query, decided WITHOUT
