@@ -1142,6 +1142,15 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   rule, for the same reason, `@json`'s **E0142** is.
 - Fields are ordered; that order is the memory layout order, exactly as
   `@json`'s is.
+- **`@hasMany`/`@hasOne`/`@belongsTo` are compiler-known relation marks**
+  (#5053), matched by name and excluded from #3879's field-attribute
+  desugaring exactly as `@key` is - a relation that reached the call path
+  would desugar to a call to a function nobody declared. Recognition is all
+  this buys today: a relation field is otherwise an ordinary recorded
+  attribute in `tableDescriptor()`'s `attrs`, the compiler attaching no
+  further meaning to which one it is. One on a field of a class that does
+  not carry `@table` is **E0160**, naming the field, the attribute and the
+  class - the same reasoning `@key` outside `@json` (E0139) already gives.
 
 **`find<T>`/`findOne<T>`/`findOneOrFail<T>` - mapping a query result.**
 
