@@ -1,118 +1,120 @@
 # Variables
 
-Bit has two ways to introduce a binding: `let` for mutable variables and
-`const` for immutable ones. Both infer their type from the initializer, so you
-rarely write a type annotation. (Spec: §10.1, §13.2, §13.4, §15.1.)
+Say you are building a link shortener. The first thing it needs is somewhere
+to keep the mapping from a short code to the URL it stands for. That
+somewhere is a binding, and Bit gives you two ways to make one.
 
-## `let` and `const`
+## The shortest thing that works
 
 ```bit
-let count = 0     // mutable, inferred type int
-const limit = 100 // immutable, inferred type int
-
-fn tick() {
-  count = count + 1 // ok: let is mutable
-  // limit = 200       // error: const cannot be reassigned
+fn shorten() {
+  let links = map<string, string>()
+  links["abc123"] = "https://example.com"
+  println("abc123 -> ${links["abc123"]}")
 }
 ```
 
-`let` bindings can be reassigned; `const` bindings cannot. A top-level `const`
-must be a compile-time constant (§15.4); a `const` inside a function is just a
-single-assignment immutable binding and may hold any expression.
+`let` declares `links` and gives it a starting value. `map<string, string>()`
+makes an empty map; you don't write its type again because Bit infers it from
+the call. `links["abc123"] = ...` stores into it, and `links` has to be `let`,
+not `const`, because storing into a map means changing what `links` holds.
 
-## Type annotations
+Run this and it prints `abc123 -> https://example.com`. This is exactly
+`docs/examples/shortener/01_map.bit`.
 
-Annotate with `: type` when you want a specific type or declare without an
-initializer. A `let` with no initializer is set to the type's **zero value**, so
-the annotation is then required.
+## `let` vs `const`
+
+`let` bindings can be reassigned. `const` bindings cannot:
 
 ```bit
-fn demo() {
-  let name: string = "bit" // explicit type, redundant here
-  let score: int           // no initializer -> zero value 0
-  let ready: bool          // -> false
-  let ratio = 3.0          // inferred f64 (float default type)
+fn baseUrlDemo() {
+  const baseUrl = "https://lnk.to"
+  let visits = 0
+  visits = visits + 1  // fine: visits is let
+  // baseUrl = "https://x.to" // error: const cannot be reassigned
 }
 ```
 
-If both an annotation and an initializer are present, the initializer must be
-assignable to the annotated type (§14.2). No implicit numeric conversion
-happens, so `let x: i64 = anI32Value` is an error - convert explicitly (see
-[Types](types.md#conversions)).
+The shortener's base domain never changes once the program starts, so it is a
+`const`. The count of visits a link has seen does, so it is a `let`. Reach for
+`const` first; only switch to `let` once you actually need to reassign, so the
+signature of the binding tells the next reader which ones can change.
+
+Try to reassign a `const` and the compiler stops you before the program runs:
+
+```
+error[E0062]: cannot assign to 'baseUrl': declared 'const'
+```
 
 ## Zero values
 
-Every binding without an initializer is deterministically zeroed (§13.4):
-
-- numbers → `0`, `bool` → `false`, `string` → `""`
-- arrays and tuples → each element zeroed
-- classes → a live instance with every field zeroed (classes are references but
-  a zeroed class is usable, not `nil`)
-- slices, maps, channels, functions, interfaces → `nil`
-
-One exception, and it is the only one: a class that has a **class-typed field**
-has no zero value, so it cannot be declared without an initializer and a literal
-cannot leave that field out. Both are `E0083`. A class is a reference, so zero
-bits in such a field would be a null rather than a live instance - see
-[Classes](classes.md#reference-type).
+What does `links["zzz999"]` give you before you have stored anything under
+that key? Not an error. A map read that misses returns the **zero value** of
+the value type, `""` for a `string`:
 
 ```bit
-class Point { x: f64, y: f64 }
-
-fn origin(): Point {
-  let p: Point // {x: 0.0, y: 0.0}, ready to use
-  return p
+fn missingCode(): string {
+  let links = map<string, string>()
+  return links["zzz999"] // "" - the zero value of string, not an error
 }
 ```
+
+Every type has a zero value: numbers are `0`, `bool` is `false`, `string` is
+`""`. It is what a `let` gets when you declare it without giving it one:
+
+```bit
+fn declared() {
+  let hits: int    // 0, no initializer needed once you annotate the type
+  let ready: bool  // false
+}
+```
+
+This is also the sharp edge to watch for: a missing key and a key whose value
+really is `""` look identical when you just read `links[code]`. If you need to
+tell the two apart, use the two-result index form covered on
+[Types](types.md#maps).
 
 ## Declaration vs assignment
 
-`let`/`const` **declare** a new binding; `=` **assigns** to one that already
-exists. There is no `:=`. To shadow a name in an inner scope, declare it again.
+`let` and `const` **declare** a binding that does not exist yet. `=` on its
+own **assigns** to one that already exists:
 
 ```bit
-fn scope() {
-  let x = 1
-  {
-    let x = 2 // a new binding shadows the outer x in this block
-    x = 3     // assigns to the inner x
-  }
-  // x is 1 again here
+fn rename() {
+  let code = "abc123"
+  code = "xyz789" // assigns; code already exists
+  // let code = "xyz789" would redeclare it, which only matters inside a
+  // new block: it shadows the outer one instead of erroring
 }
 ```
 
-## Multiple bindings and destructuring
+## When not to use `let`
 
-Declare several bindings at once, and destructure a tuple positionally with a
-tuple pattern. `_` is the **blank identifier**: it discards a value and may
-never be read.
+If a value is set once and never changes for the life of the program, like the
+shortener's base domain or a fixed retry limit, `const` says so directly.
+Using `let` for it is not wrong, but it makes every reader re-check whether it
+ever changes, and it silently gives up the compiler's guarantee that it will
+not.
+
+## Reference: the rest of binding syntax
+
+The shortener does not need the rest of this yet, but you will hit it once you
+write more than one function.
+
+### Multiple bindings and destructuring
 
 ```bit
 fn unpack(): (int, int) {
-  let a = 1, b = 2           // two bindings in one statement
+  let a = 1, b = 2           // two bindings, one statement
   let (lo, hi) = bounds()    // destructure a tuple result
-  let (_, second) = bounds() // discard the first element
+  let (_, second) = bounds() // _ discards; it can never be read
   return lo, hi
 }
 
 fn bounds(): (int, int) { return 0, 10 }
 ```
 
-## Assignment statements
-
-Assignment is a statement, never an expression, so `=` cannot appear inside an
-expression. Multi-assignment evaluates every right-hand side before assigning,
-which makes swaps clean:
-
-```bit
-fn swap() {
-  let a = 1, b = 2
-  a, b = b, a // simultaneous: a is now 2, b is 1
-}
-```
-
-Compound assignment operators combine an operation with a store and require a
-single target and value:
+### Compound assignment, increment, decrement
 
 ```bit
 fn accumulate() {
@@ -120,20 +122,17 @@ fn accumulate() {
   total += 5 // total = total + 5
   total *= 2
   total <<= 1
-}
-```
 
-Increment and decrement are statements too, not expressions:
-
-```bit
-fn counterDemo() {
   let n = 0
   n++
   n--
 }
 ```
 
-## Comments
+`=`, `+=`, `++` and friends are statements, never expressions - `x = (y = 1)`
+does not compile.
+
+### Comments
 
 ```bit
 // line comment: runs to end of line
@@ -142,12 +141,12 @@ fn counterDemo() {
    the first */ // closes it
 ```
 
-## Statement terminators (semicolons)
+### Statement terminators (semicolons)
 
-Statements end with `;`, but you almost never type one - the lexer inserts them
-at line ends (§7). The practical rule: **to continue a statement onto the next
-line, end the line with something that is not a value** - a binary operator, a
-comma, an opening bracket, `=`, `=>`, `.`, or `<-`.
+Statements end with `;`, but you almost never type one; the lexer inserts them
+at line ends. The rule: to continue a statement onto the next line, end the
+line with something that is not a value - a binary operator, a comma, an
+opening bracket, `=`, `=>`, `.`, or `<-`.
 
 ```bit
 import { newBuilder } from "std/strings"
@@ -163,8 +162,8 @@ fn continuation() {
 }
 ```
 
-Keep an opening brace on the same line as the construct it opens, or a semicolon
-is inserted before it:
+Keep an opening brace on the same line as the construct it opens, or a
+semicolon is inserted before it:
 
 ```bit
 fn braces(ready: bool) {
@@ -173,3 +172,9 @@ fn braces(ready: bool) {
   }
 }
 ```
+
+## Next
+
+The shortener now stores codes and URLs, but only because you already know
+what `map<string, string>` and `${...}` mean. Those belong to Bit's type
+system: read [Types](types.md) next.
