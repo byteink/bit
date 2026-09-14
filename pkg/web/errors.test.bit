@@ -110,6 +110,29 @@ test "an error with message() but no status() is a 500 whose message is logged, 
   assert(contains(logged, "/boom"), "the log line must carry the path: '${logged}'")
 }
 
+// THE ticket's security pin: a detail travels the IDENTICAL path a message
+// does. An error that opted into nothing gets no `detail` KEY at all, not an
+// empty one a careless client-side check could read past.
+test "a raw non-HttpError failure maps to a 500 body carrying no detail key and no original message" {
+  let app = adapterApp(newSink())
+  app.get("/boom", (c) => rethrow(PlainError{ msg: "postgres://u:p@h/db" }))
+  freezeOrPanic(app)
+
+  let res = app.handle(acceptReq("/boom", "application/json"))
+
+  let j = jsonParse(res.body) catch e {
+    panic("the error body must parse as JSON ('${res.body}'): ${e.message()}")
+  }
+  assert(
+    !isSome(jsonGet(j, "detail")),
+    "an un-opted-in error must carry no detail key at all: ${res.body}",
+  )
+  assert(
+    !contains(res.body, "postgres://"),
+    "the original message must not leak through detail either: '${res.body}'",
+  )
+}
+
 // The six named constructors, each mapping to its own status — one test
 // rather than six, because the assertion is identical and the table IS the
 // specification.
@@ -160,6 +183,27 @@ test "each named constructor defaults its message when called with none" {
   assert(notFound().status() == 404, "notFound(): got ${notFound().status()}")
 }
 
+// #5257's fix, pinned directly: the phrase NEVER moves, and the argument
+// NEVER replaces it — it is detail beside the phrase, reached through
+// `detailOf` since `HttpError` gained no third method.
+test "notFound() carries no detail, notFound(\"user\") keeps the phrase and adds detail" {
+  let bare = notFound()
+  assert(bare.status() == 404, "notFound(): got ${bare.status()}")
+  assert(bare.message() == "Not Found", "notFound(): got '${bare.message()}'")
+  assert(detailOf(bare) == "", "notFound(): want no detail, got '${detailOf(bare)}'")
+
+  let withDetail = notFound("user")
+  assert(withDetail.status() == 404, "notFound('user'): got ${withDetail.status()}")
+  assert(
+    withDetail.message() == "Not Found",
+    "notFound('user'): the phrase must survive, got '${withDetail.message()}'",
+  )
+  assert(
+    detailOf(withDetail) == "user",
+    "notFound('user'): want detail 'user', got '${detailOf(withDetail)}'",
+  )
+}
+
 // A caller who passes TWO arguments has one that is silently ignored under a
 // bare variadic — the trap this ticket must not ship. Panicking at the call
 // naming the helper is the same rule `checkStatus` (res.bit) already applies
@@ -188,6 +232,18 @@ test "a domain error carrying status() maps to that status with no wrapper call"
   assert(len(sinkText(sink)) == 0, "a 410 must not be logged: '${sinkText(sink)}'")
 }
 
+// `detailOf` reaches only this package's own concrete type. A domain type
+// that opts in structurally, with `message()`/`status()` and nothing else,
+// carries no detail to report — and never had to change to keep compiling,
+// which is the whole point of leaving `HttpError` at two methods (#5257).
+test "detailOf reports no detail for a domain type carrying none" {
+  let d = DomainError{ msg: "widget retired", code: 410 }
+  assert(
+    detailOf(d) == "",
+    "a domain HttpError with no detail concept must report none, got '${detailOf(d)}'",
+  )
+}
+
 // A 5xx the app asked for is still a server error: it is SENT (it opted in)
 // and it is also LOGGED, which is the half a 4xx does not get.
 test "a 5xx HttpError is both sent and logged" {
@@ -204,9 +260,10 @@ test "a 5xx HttpError is both sent and logged" {
 }
 
 // The body is JSON, not a string that happens to contain the message: it
-// parses, it carries exactly the two documented keys, and the message is the
-// VALUE of `error` rather than something pasted anywhere in the response.
-test "the JSON error body is an object carrying exactly status and error" {
+// parses, it carries exactly the three documented keys when a detail was
+// given, and the phrase and the detail are each the VALUE of their own key
+// rather than something pasted anywhere in the response.
+test "the JSON error body is an object carrying status, error and a non-empty detail" {
   let res = negotiationApp().handle(acceptReq("/missing", "application/json"))
 
   let j = jsonParse(res.body) catch e {
@@ -214,11 +271,30 @@ test "the JSON error body is an object carrying exactly status and error" {
   }
   let entries = objectEntries(j)
   assert(
-    len(entries) == 2,
-    "want exactly status and error, got ${len(entries)} key(s): ${res.body}",
+    len(entries) == 3,
+    "want status, error and detail, got ${len(entries)} key(s): ${res.body}",
   )
   assert(jsonInt(j, "status") == 404, "status: got ${jsonInt(j, "status")}")
-  assert(jsonStr(j, "error") == leakCanary, "error: got '${jsonStr(j, "error")}'")
+  assert(jsonStr(j, "error") == "Not Found", "error: got '${jsonStr(j, "error")}'")
+  assert(jsonStr(j, "detail") == leakCanary, "detail: got '${jsonStr(j, "detail")}'")
+}
+
+// The other half: `notFound()` given no detail omits the key entirely,
+// rather than sending `"detail":""` a client would have to test the value
+// of. This is `errorRes`'s (errors.bit) negotiated default and is the path
+// every request with no group renderer takes.
+test "the JSON error body omits detail entirely when notFound() was given none" {
+  let app = adapterApp(newSink())
+  app.get("/bare", (c) => rethrow(notFound()))
+  freezeOrPanic(app)
+
+  let res = app.handle(acceptReq("/bare", "application/json"))
+
+  let j = jsonParse(res.body) catch e {
+    panic("the error body must parse as JSON ('${res.body}'): ${e.message()}")
+  }
+  assert(jsonStr(j, "error") == "Not Found", "error: got '${jsonStr(j, "error")}'")
+  assert(!isSome(jsonGet(j, "detail")), "notFound() must omit detail entirely: ${res.body}")
 }
 
 // `key`'s integer value, or a panic naming the body — a test that read a
@@ -403,16 +479,24 @@ test "a 304 error carries no body, HTML negotiation notwithstanding" {
 // something.
 const onErrorCanary = "canary-order-77"
 
-// What the group's renderer prints — the status AND the message the framework
-// handed it, so a test asserts on both halves of what an error page is
-// allowed to see. One spelling, shared by the renderer and every assertion.
-fn echoBody(code: int, msg: string): string {
-  return "rendered ${code}: ${msg}"
+// What the group's renderer prints — the status, the phrase AND the detail
+// `detailOf` recovers, so a test asserts on all three of what an error page
+// is allowed to see. One spelling, shared by the renderer and every
+// assertion. `detail == ""` prints no parenthetical: an error carrying none
+// (the 500 substitute, in particular) must not grow one out of nowhere.
+fn echoBody(code: int, msg: string, detail: string): string {
+  if (detail == "") {
+    return "rendered ${code}: ${msg}"
+  }
+  return "rendered ${code}: ${msg} (${detail})"
 }
 
-// Installs that renderer on `g`.
+// Installs that renderer on `g`. `detailOf` is the seam #5257 adds: a
+// group's own renderer reaches the detail the same way the negotiated
+// default does, through the free function rather than a widened
+// `HttpError`.
 fn installEcho(g: Group) {
-  g.onError((c, e) => c.text(echoBody(e.status(), e.message())))
+  g.onError((c, e) => c.text(echoBody(e.status(), e.message(), detailOf(e))))
 }
 
 // The tree the inheritance tests share: `/pages` renders its own errors,
@@ -454,7 +538,7 @@ test "a group with onError renders its handler's body whatever Accept asks for" 
     let res = app.handle(acceptReq("/pages/missing", a))
     assert(res.status == 404, "Accept '${a}': want 404, got ${res.status}")
     assert(
-      res.body == echoBody(404, onErrorCanary),
+      res.body == echoBody(404, "Not Found", onErrorCanary),
       "Accept '${a}': want the group's body, got '${res.body}'",
     )
     assert(
@@ -469,7 +553,7 @@ test "a nested group with no handler of its own renders with its parent's" {
 
   assert(res.status == 404, "want 404, got ${res.status}")
   assert(
-    res.body == echoBody(404, onErrorCanary),
+    res.body == echoBody(404, "Not Found", onErrorCanary),
     "the nested group must inherit the parent's renderer, got '${res.body}'",
   )
 }
@@ -515,7 +599,7 @@ test "a non-HttpError failure reaches onError as the generic 500, the original o
 
   assert(res.status == 500, "want 500, got ${res.status}")
   assert(
-    res.body == echoBody(500, "Internal Server Error"),
+    res.body == echoBody(500, "Internal Server Error", ""),
     "the renderer must receive the generic substitute, got '${res.body}'",
   )
   assert(
@@ -545,8 +629,8 @@ test "the framework sets the status on the response the handler returned" {
 
   assert(res.status == 409, "the framework must set the mapped status, got ${res.status}")
   assert(
-    res.body == echoBody(409, "widget is locked"),
-    "an opted-in message must reach the renderer, got '${res.body}'",
+    res.body == echoBody(409, "Conflict", "widget is locked"),
+    "an opted-in detail must reach the renderer, got '${res.body}'",
   )
 }
 
@@ -588,7 +672,7 @@ test "the app's onError renders a failure raised by a middleware on a path with 
 
   assert(res.status == 409, "want the mapped 409, got ${res.status}")
   assert(
-    res.body == echoBody(409, onErrorCanary),
+    res.body == echoBody(409, "Conflict", onErrorCanary),
     "want the app's rendered body, got '${res.body}'",
   )
 }
