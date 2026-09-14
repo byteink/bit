@@ -3471,6 +3471,23 @@ A value of type `S` is assignable to a location of type `T` if:
 
 - `S` and `T` are identical; or
 - `T` is an interface and `S` satisfies `T` (§14.3); or
+- `S` and `T` are both function types with identical parameter lists, and
+  either their results are identical or `T`'s result is an interface that
+  `S`'s result satisfies (§14.3) - a function's RETURN type is covariant
+  under interface satisfaction, the same substitution the plain-value rule
+  above already allows:
+
+  ```bit
+  interface Reply { intoRes(): int }
+  class Res { code: int
+    export intoRes(): int { return this.code } }
+  fn old(x: int): Res { return Res{ code: x } }
+  fn takesHandler(h: (int) => Reply): int { return h(1).intoRes() }
+  fn main() { print("${takesHandler(old)}\n") }
+  ```
+
+  Parameters stay invariant - contravariance there is sound in principle but
+  is a separate rule this spec does not yet make; or
 - `S` is an untyped constant (§15.4) representable in `T`; or
 - `S` is `nil` and `T` is a reference type.
 
@@ -3512,6 +3529,12 @@ Method sets:
 - Satisfaction is checked at assignment/passing sites; there is no declaration of
   intent. Assigning a satisfying `S` into an `I`-typed location carries `S`'s
   dynamic type and method table with the pointer (its `TypeInfo`).
+- A function type's RESULT is one such assignment/passing site (§14.2): `(P)
+  => S` is assignable to `(P) => I` when `S` satisfies interface `I`, subject
+  to the same class-or-enum representation rule above - a function declared
+  to return a bare-tag enum does not become assignable to an interface
+  result, for exactly the reason a bare-tag enum value does not satisfy one
+  directly.
 
 ### 14.4 Type Assertions
 
