@@ -558,7 +558,7 @@ are no nominal newtypes in v0.1.
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
-param         = [ "..." ] IDENT ":" type .
+param         = [ "..." ] IDENT ":" type [ "=" const_expr ] .
 result_type   = type .            (* may carry the fallible marker, §18 *)
 ```
 
@@ -571,6 +571,16 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
 - A variadic parameter (`...name: T`) must be last; inside the body it has type
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
+- A parameter may carry a default value, `x: int = 1` (#5244): a call may omit
+  it and every parameter after it that also has one, and the default is used
+  instead. `const_expr` is a bare literal (int, float, string or bool; not a
+  compound expression, a call, or an allocation) - defaults evaluated at the
+  call site (Swift's `#file`/`#line` shape) were considered and rejected
+  (#2905). A defaulted parameter may not precede one with no default
+  (**E0158**): a call supplying only its own positional prefix could never
+  reach a later required parameter otherwise. A default whose value is not a
+  literal is **E0159**. `x = 1` with the type inferred from the default
+  (rather than written) is not yet implemented.
 
 #### 10.3.1 Function and Class Attributes
 
@@ -4734,12 +4744,15 @@ add such a marker is left to the implementation ticket.
   this problem even in principle.
 - **Default arguments evaluated at the call site**, plus predeclared `file`/
   `line` defaults (how Swift's `#file`/`#line` parameter defaults work). Bit
-  has **no default-argument feature at all**: §10.3's function-declaration
-  grammar (`param = [ "..." ] IDENT ":" type .`) has no default-value
-  production for any parameter, of any type. This route does not exist even
-  in principle without first shipping default arguments as their own,
-  unrelated, larger language feature - layering a whole feature onto the
-  back of one diagnostics fix was rejected as disproportionate.
+  does have a default-argument feature (§10.3, `param = ... [ "=" const_expr ]
+  .`, #5244), added after this decision, but deliberately not this shape: a
+  default there is a bare literal the CHECKER folds once, at the declaration,
+  identically regardless of where or how many times the function is called -
+  never an expression re-evaluated per call site the way `#file`/`#line`
+  would need to be. Building that call-site-evaluated form, plus predeclared
+  `file`/`line` tokens to fill it, would still be its own, unrelated, larger
+  feature - layering it onto the back of one diagnostics fix was rejected as
+  disproportionate.
 - **Passing a location down explicitly**, as an ordinary string argument. The
   only option available to a library today with no compiler change at all,
   and it fails on its own terms: with no `__LINE__` equivalent the caller
@@ -5017,9 +5030,9 @@ test "concat" {
   The benefit subtests are usually reached for, naming the failing row of a
   table-driven test, is delivered instead by the `label` parameter every
   `std/testing` assertion requires (`stdlib/testing/testing.bit`): it is a
-  positional, non-optional parameter - §10.3's `param = [ "..." ] IDENT ":"
-  type .` grammar has no default-value production for any parameter - so the
-  row a failure came from can never go unnamed.
+  positional parameter with no default (§10.3's `= const_expr` production,
+  #5244, is never written on it) - so the row a failure came from can never
+  go unnamed.
 - Tests are ordinary unreferenced declarations to `bit build`/`bit run`, so the
   linker's dead-strip drops them from a normal program's binary - every
   `test "..." { }` declaration in a `.test.bit` file.
@@ -5158,7 +5171,7 @@ attr_list     = attr { attr } .
 attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
-param         = [ "..." ] IDENT ":" type .
+param         = [ "..." ] IDENT ":" type [ "=" const_expr ] .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .

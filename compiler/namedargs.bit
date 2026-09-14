@@ -47,7 +47,7 @@ const ecNamedArgNotDirect = 128
 // this file's own named-argument path (same module, no import needed).
 class CallDecl {
   owner: Checker, decl: int, name: string, generic: bool,
-  params: []int, want: int, fixed: int, variadic: bool,
+  params: []int, want: int, fixed: int, variadic: bool, minWant: int,
 }
 
 // A `CallDecl` for `params` (nodes in `owner`'s tree). The variadic/fixed
@@ -56,6 +56,14 @@ class CallDecl {
 // arity (§12.4). One derivation, called by `vCall` (validatecall.bit) for a
 // free function and by `vMemberNamedArgs` below for a method, so the two
 // cannot disagree about where a call's fixed prefix ends.
+//
+// `minWant` (SPEC §10.3, #5244) is the smallest positional count a call may
+// supply: the index of the first FIXED parameter that carries a
+// `= const_expr` default, or `fixed` when none do. Only `vCallKnownDecl`'s
+// free-call path (`validatecall.bit`) actually relaxes arity against it —
+// `lowerArgsFor` (lower.bit) is the one lowering path that fills an omitted
+// default, so this field is computed here for every `CallDecl` but must not
+// be read anywhere lowering does not also fill the gap it describes.
 fn mkCallDecl(owner: Checker, decl: int, name: string, generic: bool, params: []int): CallDecl {
   let want = len(params)
   let variadic = want > 0 && getNode(owner.tree, params[want - 1]).tag == Tag.ParamRest
@@ -63,9 +71,69 @@ fn mkCallDecl(owner: Checker, decl: int, name: string, generic: bool, params: []
   if (variadic) {
     fixed = want - 1
   }
+  let minWant = fixed
+  let i = 0
+  while (i < fixed) {
+    if (len(kidsOf(owner.tree, params[i])) == 3) {
+      minWant = i
+      break
+    }
+    i = i + 1
+  }
   return CallDecl{
     owner: owner, decl: decl, name: name, generic: generic,
-    params: params, want: want, fixed: fixed, variadic: variadic,
+    params: params, want: want, fixed: fixed, variadic: variadic, minWant: minWant,
+  }
+}
+
+// `vCallArity`'s (validatecall.bit) own shape parameters, bundled to keep
+// that function at 5 or fewer (E0202) once `minWant` (SPEC §10.3, #5244)
+// joined `variadic`/`want`.
+class CallArity {
+  variadic: bool, want: int, minWant: int,
+}
+
+// `CallDecl.want`/`.minWant`/`.variadic` as a `CallArity`, for the one caller
+// (`vCallKnownDecl`, validatecall.bit) that may relax arity for a defaulted
+// call.
+fn callArityOf(cd: CallDecl): CallArity {
+  return CallArity{ variadic: cd.variadic, want: cd.want, minWant: cd.minWant }
+}
+
+// A `CallArity` with no relaxation: `minWant == want`, for a call site with
+// no declared parameter NODES to read `= const_expr` defaults off
+// (`vCallAgainstFuncSig`/`vClassConstructCall`) — behaves exactly as arity
+// checking did before `CallArity.minWant` existed.
+fn fixedCallArity(variadic: bool, want: int): CallArity {
+  return CallArity{ variadic: variadic, want: want, minWant: want }
+}
+
+// Reports E0050 for a non-variadic call's argument count against `want` and
+// `minWant` (SPEC §10.3, #5244) — split out of `vCallArity` purely to keep
+// that function's own branch count from growing with the defaulted-argument
+// range check.
+fn vNonVariadicArityMismatch(c: Checker, node: int, want: int, minWant: int, got: int) {
+  if (minWant == want) {
+    if (want != got) {
+      reportNoHint(
+        c.diags, ecArgCount, vSpan(c, node),
+        "expected ${want} argument(s), found ${got}",
+      )
+    }
+    return
+  }
+  if (got < minWant) {
+    reportNoHint(
+      c.diags, ecArgCount, vSpan(c, node),
+      "expected at least ${minWant} argument(s), found ${got}",
+    )
+    return
+  }
+  if (got > want) {
+    reportNoHint(
+      c.diags, ecArgCount, vSpan(c, node),
+      "expected ${want} argument(s), found ${got}",
+    )
   }
 }
 
@@ -440,4 +508,91 @@ fn vCallNamedArgs(c: Checker, node: int, cd: CallDecl, args: []int, namedStart: 
     return
   }
   vNamedArgTypeCheck(c, cd, args, namedStart, res)
+}
+
+// THE one definition of "`vCallArgTypes` judges every argument of this call"
+// (validatecall.bit): every spread in the shape `vSpreadsAreTyped` admits,
+// and an argument count the signature admits — every argument then has a
+// parameter to be judged against. `vCallArity` below returns it as its
+// verdict and `vCallArgIface` (validateiface.bit) reads it to stay OFF
+// exactly that shape, so the two cannot drift apart and double-report an
+// interface argument once as "cannot store" and again as E0041. `want` is
+// the declared parameter count; a variadic signature's fixed prefix is one
+// shorter, and everything past it lands in the rest parameter.
+//
+// `minWant` (SPEC §10.3, #5244): the smallest positional count a
+// non-variadic call may supply when a trailing prefix of `want`'s
+// parameters carry a `= const_expr` default — equal to `want` for any
+// signature with none, which collapses the range check below back to the
+// old `== want` exactly. Moved here from validatecall.bit (SPEC §10.3,
+// #5244) alongside `CallArity`/`CallDecl`, the shapes both this and
+// `vCallArity` read.
+fn vCallArgsAreTyped(c: Checker, args: []int, variadic: bool, want: int, minWant: int): bool {
+  if (!vSpreadsAreTyped(c, args, variadic, want)) {
+    return false
+  }
+  if (variadic) {
+    return len(args) >= want - 1
+  }
+  return len(args) >= minWant && len(args) <= want
+}
+
+// Spread POSITIONS (E0063) and arity (E0050) for one call's argument list,
+// judged against nothing but the callee's shape: `want` declared parameters,
+// `variadic` or not. REPORTS only — the verdict is `vCallArgsAreTyped`'s,
+// above, so the rule deciding whether the type loop runs is written once.
+//
+// Takes that shape as `CallArity` rather than a `CallDecl` so the METHOD and
+// func-value path can share it: `vCallAgainstFuncSig` (validateiface.bit) has
+// an interned signature, not a declaration, and no `CallDecl` it could
+// honestly build — its `params` are type ids, not the parameter NODES that
+// class documents. #4671 is what the split cost: that path reported E0050 on
+// its non-variadic arm only and judged no spread's position at all, so
+// `f.tag()` for `tag(label: string, ...xs: i64)` reached IR verification
+// with no diagnostic and `f.tag(...ys, 3)` reached the lowerer's E0092
+// catch-all.
+//
+// `vCallSpreadAt` (validatecall.bit) is called HERE, not by the callers: it
+// REPORTS as it scans, so it must run exactly once per call site, and this
+// is the one place both paths pass through.
+//
+// `arity.minWant` (SPEC §10.3, #5244): the smallest positional argument
+// count this call may supply without tripping E0050 — below `arity.want`
+// only when a trailing prefix of the callee's parameters carry a
+// `= const_expr` default. `vCallAgainstFuncSig` (validateiface.bit) has no
+// declared params to read defaults off and always passes `minWant == want`
+// (`fixedCallArity`), which disables the relaxation exactly as it did before
+// this field existed. Only `vCallKnownDecl`'s free-call path (validatecall.bit)
+// actually passes a `minWant` below `want`: `lowerArgsFor` (lower.bit) is the
+// one lowering path that fills an omitted default, so no other caller may
+// relax this and leave the gap unfilled at codegen.
+fn vCallArity(c: Checker, node: int, args: []int, arity: CallArity): bool {
+  let got = len(args)
+  // The fixed prefix the rest parameter absorbs everything past. Both callers
+  // derive `variadic` from a parameter list whose LAST entry is that rest
+  // parameter, so `want > 0` holds whenever it is set; guarded here anyway so
+  // the index cannot go negative on a caller that forgets.
+  let fixed = arity.want
+  if (arity.variadic && arity.want > 0) {
+    fixed = arity.want - 1
+  }
+  let spreadAt = vCallSpreadAt(c, args, arity.variadic, got)
+  if (spreadAt >= 0) {
+    if (spreadAt != fixed) {
+      reportNoHint(
+        c.diags, ecArgCount, vSpan(c, node),
+        "expected ${fixed} argument(s) before '...', found ${spreadAt}",
+      )
+    }
+  } else if (arity.variadic) {
+    if (got < fixed) {
+      reportNoHint(
+        c.diags, ecArgCount, vSpan(c, node),
+        "expected at least ${fixed} argument(s), found ${got}",
+      )
+    }
+  } else {
+    vNonVariadicArityMismatch(c, node, arity.want, arity.minWant, got)
+  }
+  return vCallArgsAreTyped(c, args, arity.variadic, arity.want, arity.minWant)
 }
