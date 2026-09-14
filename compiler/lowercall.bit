@@ -102,6 +102,218 @@ fn lowerGenericMethodCall(fc: FnCtx, node: int, mk: []int, recvTy: int, fr: Func
   return builderEmit(fc.b, ins)
 }
 
+// Lowers `recv.isPersisted()` to a `field_get` and `recv.markPersisted(v)` to
+// a `field_set`, both at the class's hidden persisted word
+// (`StructLayout.persistedOffset`, lowerlayout.bit) — or returns -1, the
+// value-id space's own "no id produced" sentinel (`buildEnumObj`,
+// lowerlayout.bit, is the same convention), when `recvTy`/`mk[1]` do not name
+// a persisted accessor on a `@table` class. `isPersistedAccessorOn`
+// (classtabledesc.bit) is the one check the checker's call-result inference
+// and E0057 judgement also ask, so lowering can never dispatch here for a
+// name the checker rejected, or skip a name the checker accepted.
+fn lowerPersistedAccessorCall(fc: FnCtx, node: int, mk: []int, recvTy: int): int {
+  if (recvTy == 0) {
+    return -1
+  }
+  let mn = getNode(fc.c.tree, mk[1])
+  let mname = fc.c.source[mn.span.start:mn.span.end]
+  if (!isPersistedAccessorOn(fc.c, recvTy, mname)) {
+    return -1
+  }
+  let decl = structDeclOf(fc.c, recvTy)
+  let oc = typeOwner(fc.c, recvTy)
+  let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, recvTy))
+  let recvV = lowerExpr(fc, mk[0])
+  if (fc.failed) {
+    return 0
+  }
+  let boolTy = primType(fc.c.ctx, 10)
+  if (mname == synthIsPersistedName) {
+    let ins = mkInstr(Op.FieldGet, boolTy)
+    ins.lhs = recvV
+    ins.ival = layout.persistedOffset
+    return builderEmit(fc.b, ins)
+  }
+  let a = lowerArgs(fc, node, [boolTy])
+  if (fc.failed) {
+    return 0
+  }
+  let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs.lhs = recvV
+  fs.ival = layout.persistedOffset
+  fs.rhs = a[0]
+  fs.ival2 = boolTy
+  return builderEmit(fc.b, fs)
+}
+
+// The namespaced-free-call and enum-variant-constructor shapes of a
+// `recv.name(...)` callee, or -1 when neither matches (the caller,
+// `lowerMemberCall`, then tries the method-call shapes).
+fn lowerMemberFreeOrVariantCall(fc: FnCtx, node: int, hint: int, callee: int, cn: Node): int {
+  // `ns.fn(...)` — a direct call to a namespaced module's exported function. The
+  // dotted key resolves to the same CallTarget a plain import of that symbol
+  // would, so generic instantiation and module qualification are unchanged.
+  let qn = nsQualifiedName(fc.c, callee)
+  if (qn != "" && funcDeclLookup(fc.c, qn) != 0) {
+    let t = resolveCallTarget(fc, qn, node)
+    if (!t.ok) {
+      fcFail(fc, cn.span, "a namespaced call whose target could not be resolved")
+      return 0
+    }
+    // `lowerArgsForCall` (#4686), as in the Ident arm above: it reads the
+    // parameter list off `t.decl`, the very declaration `vNsNamedArgs`
+    // (namedargs.bit) validated this call against.
+    let a = lowerArgsForCall(fc, node, t.owner, t.decl, t.paramTypes)
+    if (fc.failed) {
+      return 0
+    }
+    return emitResolvedCall(fc, t, a)
+  }
+  // A call whose callee is `Enum.Variant` constructs a payload-carrying variant.
+  let mk0 = kidsOf(fc.c.tree, callee)
+  let baseName = typeNodeName(fc.c, mk0[0])
+  if (baseName != "") {
+    let ut = userTypeLookup(fc.c, baseName)
+    if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum) {
+      return lowerVariantConstruction(fc, node, hint)
+    }
+  }
+  return -1
+}
+
+// A FUNC-TYPED FIELD called through its owner, `r.read(4096)` (SPEC 9.4): the
+// member is a closure value, not a method, so it dispatches through
+// `call_value` like any other first-class function. Checked BEFORE the
+// class-method branch in `lowerMemberMethodCall`, which would otherwise
+// mangle a `call @read$t<recvId>` against a method that does not exist and
+// fail at link. -1 when `callee` does not name a func-typed field.
+fn lowerMemberFuncFieldCall(fc: FnCtx, node: int, callee: int, mk: []int, recvTy: int): int {
+  let fldTy = nodeType(fc, callee)
+  if (fldTy == 0 || fc.c.ctx.types[fldTy].kind != TypeKind.Func) {
+    return -1
+  }
+  let mn = getNode(fc.c.tree, mk[1])
+  if (methodSigLookup(fc.c, "${recvTy}." + fc.c.source[mn.span.start:mn.span.end]) != 0) {
+    return -1
+  }
+  let members = fc.c.ctx.types[fldTy].members
+  let fv = lowerExpr(fc, callee)
+  let a = lowerArgs(fc, node, members)
+  if (fc.failed) {
+    return 0
+  }
+  let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, nodeType(fc, node)))
+  ins.lhs = fv
+  ins.args = a
+  return builderEmit(fc.b, ins)
+}
+
+// Every METHOD-call shape of a `recv.name(...)` callee — interface dispatch,
+// a func-typed field, `@table`'s two hidden-flag accessors, a class/enum
+// method, or a primitive-alias method — or -1 when none matches.
+fn lowerMemberMethodCall(fc: FnCtx, node: int, callee: int, mk: []int, recvTy: int): int {
+  // A method call `recv.method(...)` on an interface value dispatches dynamically
+  // via call_iface, using the method's stable dispatch index.
+  if (recvTy != 0 && fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
+    let mn = getNode(fc.c.tree, mk[1])
+    let mname = fc.c.source[mn.span.start:mn.span.end]
+    let recvV = lowerExpr(fc, mk[0])
+    let a = lowerArgsForMethod(fc, node, recvTy, mname)
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.CallIface, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
+    ins.lhs = recvV
+    ins.ival = methodId(fc.lowerer, mname)
+    ins.args = a
+    return builderEmit(fc.b, ins)
+  }
+  let ffv = lowerMemberFuncFieldCall(fc, node, callee, mk, recvTy)
+  if (ffv != -1) {
+    return ffv
+  }
+  // `recv.isPersisted()` / `recv.markPersisted(v)` on a `@table` class
+  // (#5052): a load or store at the class's hidden persisted word, never a
+  // real call — Bit source cannot name the offset, so there is no
+  // declaration to dispatch a `call`/`call_iface` against. Checked BEFORE
+  // the class-method branch below, which would otherwise mangle `call
+  // @isPersisted$t<recvId>` against a method that was never declared.
+  let pv = lowerPersistedAccessorCall(fc, node, mk, recvTy)
+  if (pv != -1) {
+    return pv
+  }
+  // A method call on a concrete class value, OR on a concrete enum value
+  // (owner ruling #5216: in-body enum methods, `this` bound to the value —
+  // parsertype.bit's `parseEnumMember` now synthesizes a receiver
+  // referencing the enclosing ENUM, exactly as a class body's
+  // `parseMethodMember` already did), dispatches statically to the mangled
+  // method `call @method$t<recvId>(recv, args)`; the receiver is the
+  // leading argument either way, so `lowerClassMethodCall` (receiver-type-
+  // agnostic: it reads `recvTy`/`mname`, never the receiver's own kind)
+  // needs no enum-specific twin. This used to read `== TypeKind.Struct`
+  // only, with TypeKind.Enum "deliberately excluded" as defense in depth
+  // for a receiver #3811 called "permanently unreachable" — #5216 is
+  // exactly the ticket that reaches it.
+  if (recvTy != 0 &&
+    (fc.c.ctx.types[recvTy].kind == TypeKind.Struct ||
+      fc.c.ctx.types[recvTy].kind == TypeKind.Enum)) {
+    return lowerClassMethodCall(fc, node, mk, recvTy)
+  }
+  return lowerMemberPrimMethodCall(fc, node, mk, recvTy)
+}
+
+// A method call on a primitive-alias receiver (`type Meters = i64`) dispatches
+// statically, identically to the class arm above: the receiver leads the
+// argument list to the mangled method `call @method$t<recvId>(recv, args)`.
+//
+// Guarded on `methodSigLookup(...) != 0`, unlike the class arm above: for a
+// class receiver the checker already rejects an unknown method with E0057
+// before lowering ever runs, but a primitive receiver's unknown method is NOT
+// currently caught at check time (#2641). Without this guard, an unresolved
+// name would still match `kind == TypeKind.Prim` and emit a direct call to a
+// symbol that was never declared, surfacing as a raw linker error
+// (`undefined symbol '_nope$t11'`) instead of a compiler diagnostic. Falling
+// through instead reaches the existing catch-all at the end of `lowerCall`,
+// which already renders a clean `cannot lower a call whose callee does not
+// resolve to a function` (E0092).
+fn lowerMemberPrimMethodCall(fc: FnCtx, node: int, mk: []int, recvTy: int): int {
+  if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Prim) {
+    return -1
+  }
+  let mn = getNode(fc.c.tree, mk[1])
+  let mname = fc.c.source[mn.span.start:mn.span.end]
+  if (methodSigLookup(fc.c, "${recvTy}.${mname}") == 0) {
+    return -1
+  }
+  let recvV = lowerExpr(fc, mk[0])
+  let a = lowerArgsForMethod(fc, node, recvTy, mname)
+  if (fc.failed) {
+    return 0
+  }
+  let all = [recvV]
+  let j = 0
+  while (j < len(a)) {
+    all = append(all, a[j])
+    j = j + 1
+  }
+  let ins = mkInstr(Op.Call, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
+  ins.name = methodSymbol(fc.lowerer, mname, recvTy)
+  ins.args = all
+  return builderEmit(fc.b, ins)
+}
+
+// Every `recv.name(...)` callee shape `lowerCall` must dispatch, or -1 when
+// none matches. Pure move (#5052) — see `lowerCall`'s own call site.
+fn lowerMemberCall(fc: FnCtx, node: int, hint: int, callee: int, cn: Node): int {
+  let fv = lowerMemberFreeOrVariantCall(fc, node, hint, callee, cn)
+  if (fv != -1) {
+    return fv
+  }
+  let mk = kidsOf(fc.c.tree, callee)
+  let recvTy = nodeType(fc, mk[0])
+  return lowerMemberMethodCall(fc, node, callee, mk, recvTy)
+}
+
 // `hint` is `lowerExprH`'s expected type for this call's RESULT (0 where there
 // is none). Only a variant construction reads it: an enum written without type
 // arguments has no other source for them (`lowerVariantConstruction`,
@@ -355,127 +567,20 @@ fn lowerCall(fc: FnCtx, node: int, hint: int): int {
   if (cn.tag == Tag.ChanType) {
     return lowerChanMake(fc, node)
   }
-  // `ns.fn(...)` — a direct call to a namespaced module's exported function. The
-  // dotted key resolves to the same CallTarget a plain import of that symbol
-  // would, so generic instantiation and module qualification are unchanged.
+  // `recv.name(...)` in every shape lowering must dispatch: a namespaced free
+  // call, an enum variant constructor, an interface/func-field/class/enum/
+  // prim method call, or one of `@table`'s two hidden-flag accessors. Pure
+  // move out of `lowerCall`'s own `Tag.Member` arms (#5052): that function is
+  // already at LINT.md's recorded complexity debt
+  // (`tools/build/complexity-debt.txt`), so the persisted-accessor addition
+  // had to go in a function of its own rather than grow it further. Returns
+  // -1 — the value-id space's own "no id produced" sentinel (`buildEnumObj`,
+  // lowerlayout.bit) — when none of these shapes match, so the caller falls
+  // through to the generic func-typed-value dispatch.
   if (cn.tag == Tag.Member) {
-    let qn = nsQualifiedName(fc.c, callee)
-    if (qn != "" && funcDeclLookup(fc.c, qn) != 0) {
-      let t = resolveCallTarget(fc, qn, node)
-      if (!t.ok) {
-        fcFail(fc, cn.span, "a namespaced call whose target could not be resolved")
-        return 0
-      }
-      // `lowerArgsForCall` (#4686), as in the Ident arm above: it reads the
-      // parameter list off `t.decl`, the very declaration `vNsNamedArgs`
-      // (namedargs.bit) validated this call against.
-      let a = lowerArgsForCall(fc, node, t.owner, t.decl, t.paramTypes)
-      if (fc.failed) {
-        return 0
-      }
-      return emitResolvedCall(fc, t, a)
-    }
-  }
-  // A call whose callee is `Enum.Variant` constructs a payload-carrying variant.
-  if (cn.tag == Tag.Member) {
-    let mk0 = kidsOf(fc.c.tree, callee)
-    let baseName = typeNodeName(fc.c, mk0[0])
-    if (baseName != "") {
-      let ut = userTypeLookup(fc.c, baseName)
-      if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum) {
-        return lowerVariantConstruction(fc, node, hint)
-      }
-    }
-  }
-  // A method call `recv.method(...)` on an interface value dispatches dynamically
-  // via call_iface, using the method's stable dispatch index.
-  if (cn.tag == Tag.Member) {
-    let mk = kidsOf(fc.c.tree, callee)
-    let recvTy = nodeType(fc, mk[0])
-    if (recvTy != 0 && fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
-      let mn = getNode(fc.c.tree, mk[1])
-      let mname = fc.c.source[mn.span.start:mn.span.end]
-      let recvV = lowerExpr(fc, mk[0])
-      let a = lowerArgsForMethod(fc, node, recvTy, mname)
-      if (fc.failed) {
-        return 0
-      }
-      let ins = mkInstr(Op.CallIface, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
-      ins.lhs = recvV
-      ins.ival = methodId(fc.lowerer, mname)
-      ins.args = a
-      return builderEmit(fc.b, ins)
-    }
-    // A FUNC-TYPED FIELD called through its owner, `r.read(4096)` (SPEC 9.4):
-    // the member is a closure value, not a method, so it dispatches through
-    // `call_value` like any other first-class function. Checked BEFORE the
-    // class-method branch below, which would otherwise mangle a `call
-    // @read$t<recvId>` against a method that does not exist and fail at link.
-    let fldTy = nodeType(fc, callee)
-    if (fldTy != 0 && fc.c.ctx.types[fldTy].kind == TypeKind.Func &&
-      methodSigLookup(fc.c, "${recvTy}." + fc.c.source[getNode(fc.c.tree, mk[1]).span.start:getNode(fc.c.tree, mk[1]).span.end]) == 0) {
-      let members = fc.c.ctx.types[fldTy].members
-      let fv = lowerExpr(fc, callee)
-      let a = lowerArgs(fc, node, members)
-      if (fc.failed) {
-        return 0
-      }
-      let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, nodeType(fc, node)))
-      ins.lhs = fv
-      ins.args = a
-      return builderEmit(fc.b, ins)
-    }
-    // A method call on a concrete class value, OR on a concrete enum value
-    // (owner ruling #5216: in-body enum methods, `this` bound to the value —
-    // parsertype.bit's `parseEnumMember` now synthesizes a receiver
-    // referencing the enclosing ENUM, exactly as a class body's
-    // `parseMethodMember` already did), dispatches statically to the mangled
-    // method `call @method$t<recvId>(recv, args)`; the receiver is the
-    // leading argument either way, so `lowerClassMethodCall` (receiver-type-
-    // agnostic: it reads `recvTy`/`mname`, never the receiver's own kind)
-    // needs no enum-specific twin. This used to read `== TypeKind.Struct`
-    // only, with TypeKind.Enum "deliberately excluded" as defense in depth
-    // for a receiver #3811 called "permanently unreachable" — #5216 is
-    // exactly the ticket that reaches it.
-    if (recvTy != 0 &&
-      (fc.c.ctx.types[recvTy].kind == TypeKind.Struct ||
-        fc.c.ctx.types[recvTy].kind == TypeKind.Enum)) {
-      return lowerClassMethodCall(fc, node, mk, recvTy)
-    }
-    // A method call on a primitive-alias receiver (`type Meters = i64`) dispatches
-    // statically, identically to the class arm above: the receiver leads the
-    // argument list to the mangled method `call @method$t<recvId>(recv, args)`.
-    //
-    // Guarded on `methodSigLookup(...) != 0`, unlike the class arm above: for a
-    // class receiver the checker already rejects an unknown method with E0057
-    // before lowering ever runs, but a primitive receiver's unknown method is NOT
-    // currently caught at check time (#2641). Without this guard, an unresolved
-    // name would still match `kind == TypeKind.Prim` and emit a direct call to a
-    // symbol that was never declared, surfacing as a raw linker error
-    // (`undefined symbol '_nope$t11'`) instead of a compiler diagnostic. Falling
-    // through instead reaches the existing catch-all at the end of this function,
-    // which already renders a clean `cannot lower a call whose callee does not
-    // resolve to a function` (E0092).
-    if (recvTy != 0 && fc.c.ctx.types[recvTy].kind == TypeKind.Prim) {
-      let mn = getNode(fc.c.tree, mk[1])
-      let mname = fc.c.source[mn.span.start:mn.span.end]
-      if (methodSigLookup(fc.c, "${recvTy}.${mname}") != 0) {
-        let recvV = lowerExpr(fc, mk[0])
-        let a = lowerArgsForMethod(fc, node, recvTy, mname)
-        if (fc.failed) {
-          return 0
-        }
-        let all = [recvV]
-        let j = 0
-        while (j < len(a)) {
-          all = append(all, a[j])
-          j = j + 1
-        }
-        let ins = mkInstr(Op.Call, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
-        ins.name = methodSymbol(fc.lowerer, mname, recvTy)
-        ins.args = all
-        return builderEmit(fc.b, ins)
-      }
+    let mv = lowerMemberCall(fc, node, hint, callee, cn)
+    if (mv != -1) {
+      return mv
     }
   }
   // Any OTHER callee expression that is itself a function VALUE: a slice
