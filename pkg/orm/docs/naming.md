@@ -29,7 +29,7 @@ import { tableName } from "orm"
 import { FieldDesc, AttrDesc } from "std/sql"
 
 @table("people") class Person {
-  id: i64
+  id: i64,
 }
 
 fn showTableNames() {
