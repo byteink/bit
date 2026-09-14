@@ -1,0 +1,215 @@
+// Bit standard library — sql module: read replicas (#5085), owner decision
+// 2026-09-12: routing lives inside `Pool` (./pool.bit), automatically.
+// `Data` (pkg/orm/data.bit) and every handler are unchanged.
+//
+// `Mono`, `monotonic`, `since` and `Millisecond` need no import here:
+// ./pool.bit already imports them from "std/time" and an import is
+// module-wide (a second one is E0042). `Mutex`/`newMutex` are likewise
+// already imported by ./sql.bit. `Pool`, `Datasource`, `Adapter`, `pool`,
+// `Rows` and `Value` are all siblings in this same module (SPEC §17.1).
+//
+// READS GO TO A REPLICA, WRITES TO THE WRITER, EVERYTHING INSIDE A
+// TRANSACTION GOES TO THE WRITER. The last part needs no code here at all:
+// `Pool.begin` (./pool.bit) only ever acquires from `this` — the writer's own
+// connection machinery — and a transaction's `Tx` runs every statement on
+// that one connection (./pool.bit rule 1). Nothing in this file's routing is
+// ever reachable from inside a `tx()`/`txAt()` block.
+//
+// READ-YOUR-OWN-WRITES, AND WHY `session()` IS THE MECHANISM. A read issued
+// right after a write in the same request must not land on a replica that
+// has not caught up, or the caller is shown stale data it just changed.
+// `Pool` cannot hold that flag itself: a `Pool` is shared by every green
+// thread using it, so a pool-level "has written" would answer with some
+// OTHER task's write — the same trap ./tx.bit:36 documents for transactions.
+// Bit has no task-local storage (#3968 chose copy-on-spawn for when one
+// exists, but nothing has built it — searching `runtime/` and `stdlib/` for
+// a task-local slot returns nothing). `Pool.session()` is the mechanism this
+// ticket ships instead: a handle the caller holds per request, carrying the
+// flag itself. `Session`'s own doc comment below states what it costs when a
+// caller forgets to use it.
+//
+// ROUTING NEVER PARSES SQL. The caller's `query` vs `exec` call is the only
+// signal: `Pool.exec` (./pool.bit, unchanged by this file) always acquires
+// from `this` and never consults `replicaSet` at all, so a write is never
+// retried on a replica or any other node — there is no code path from a
+// failed `exec` to anything but the writer's own error.
+//
+// REPLICA HEALTH. A replica that fails a statement is dropped from rotation
+// with a backoff (`replicaNode.healthy`) and the read is retried on the
+// writer, so one dead replica degrades throughput rather than erroring the
+// caller.
+
+// One configured read replica: its own connection pool, built exactly like
+// the writer's (./pool.bit's `pool`), plus whether it is currently in
+// rotation.
+class replicaNode {
+  target: Pool
+  mu: Mutex
+  // A statement failed on this replica; skipped by `replicaSet.pick` until
+  // `backoffMs` has passed since then.
+  down: bool = false
+  downSince: Mono
+  backoffMs: i64
+
+  // Whether `pick` may hand this node out: never down, or down long enough
+  // ago that it is worth trying again. Nothing here clears `down` on
+  // success, so a replica that keeps failing keeps failing this check every
+  // `backoffMs` and is retried, never spared outright.
+  healthy(): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    if (!this.down) {
+      return true
+    }
+    return since(this.downSince) > this.backoffMs * Millisecond
+  }
+
+  // A statement on this replica failed: out of rotation until the backoff
+  // passes.
+  markDown() {
+    this.mu.lock()
+    this.down = true
+    this.downSince = monotonic()
+    this.mu.unlock()
+  }
+}
+
+// The read replicas configured for one `Pool` (`Datasource.replicas`,
+// ./config.bit): zero or more `replicaNode`s, round-robined among the ones
+// currently healthy. Empty when `Datasource.replicas` is empty, in which
+// case `pick` always reports none and `read` falls straight to the writer.
+class replicaSet {
+  nodes: []replicaNode
+  mu: Mutex
+  next: i64 = 0
+
+  // The next node to try, round-robin among the ones `healthy()` allows,
+  // starting from `next` so consecutive calls spread across the set instead
+  // of hammering the first entry. `ok` is false with an empty set or when
+  // every node is down.
+  pick(): (i64, bool) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let n = len(this.nodes)
+    let i = 0
+    while (i < n) {
+      let idx = (this.next + i) % n
+      if (this.nodes[idx].healthy()) {
+        this.next = idx + 1
+        return (idx, true)
+      }
+      i = i + 1
+    }
+    return (0, false)
+  }
+
+  // Runs `sqlText` as a read: on a healthy replica if `pick` finds one, on
+  // `writer` (the `Pool` this set belongs to) otherwise. A replica that
+  // fails the statement is dropped from rotation and the SAME read is
+  // retried on the writer, so the caller never sees the replica's error.
+  read(sqlText: string, params: []Value, writer: Pool): Rows! {
+    let (idx, ok) = this.pick()
+    if (!ok) {
+      return writer.queryWriter(sqlText, params)?
+    }
+    let node = this.nodes[idx]
+    let rows = node.target.query(sqlText, params) catch _ {
+      node.markDown()
+      return writer.queryWriter(sqlText, params)?
+    }
+    return rows
+  }
+
+  // Closes every replica's own pool. Called by `Pool.close`.
+  closeAll() {
+    this.mu.lock()
+    let live = this.nodes
+    this.mu.unlock()
+    for n of live {
+      n.target.close()
+    }
+  }
+}
+
+// Builds one child `Pool` per `cfg.replicas` entry, sharing the adapter `a`
+// exactly as the writer does: a real driver picks the far end from
+// `Datasource.uri`/`host` (./config.bit's `Adapter` doc), so one `Adapter`
+// naturally serves both. Each child takes the writer's own pool limits, never
+// `cfg.replicas` itself — which is why recursing into `pool` here cannot
+// recurse again.
+fn buildReplicas(a: Adapter, cfg: Datasource): replicaSet! {
+  let nodes = []replicaNode(0)
+  for uri of cfg.replicas {
+    let childCfg = Datasource{
+      uri: uri,
+      connectTimeout: cfg.connectTimeout,
+      maxOpen: cfg.maxOpen,
+      maxIdle: cfg.maxIdle,
+      maxLifetime: cfg.maxLifetime,
+      maxIdleTime: cfg.maxIdleTime,
+      acquireTimeout: cfg.acquireTimeout,
+      statementCache: cfg.statementCache,
+    }
+    let target = pool(a, childCfg)?
+    nodes = append(
+      nodes,
+      replicaNode{
+        target: target, mu: newMutex(), downSince: monotonic(), backoffMs: cfg.replicaBackoff,
+      },
+    )
+  }
+  return replicaSet{ nodes: nodes, mu: newMutex() }
+}
+
+// A per-request read-your-own-writes handle (`Pool.session`, ./pool.bit).
+//
+// THE MECHANISM: `written` starts false. Once `exec` on THIS handle has
+// committed a write, every later `query` on the SAME handle goes to the
+// writer, never a replica, until the caller takes a fresh `Session`. A
+// `query` on a `Session` that has not written routes exactly like
+// `Pool.query` called directly — it may land on a replica.
+//
+// WHAT IT COSTS WHEN IT IS WRONG. `session()` is shipped instead of a
+// pool-level flag because `Pool` is shared by every green thread using it
+// (this file's header). That fixes the correctness trap, but it moves the
+// cost onto the caller: a handler that keeps calling `pool.query`/
+// `pool.exec` directly instead of routing every statement through one
+// `Session` gets no read-your-own-writes protection, silently — there is
+// nothing to forget out loud. The next read then runs on a replica that may
+// not have caught up, the caller sees data older than the write it just
+// made, and nothing errors. Task-local storage, once one exists (#3968 chose
+// the shape, nothing has built it), removes this cost without changing any
+// handler: `session()`'s call shape is deliberately the one task-local would
+// keep.
+export class Session {
+  p: Pool
+  mu: Mutex
+  written: bool = false
+
+  // Routes to the writer once this handle has written; otherwise the same
+  // routing `Pool.query` itself uses.
+  export query(sqlText: string, params: []Value): Rows! {
+    this.mu.lock()
+    let sticky = this.written
+    this.mu.unlock()
+    if (sticky) {
+      return this.p.queryWriter(sqlText, params)?
+    }
+    return this.p.query(sqlText, params)?
+  }
+
+  // Always the writer — `Pool.exec` already never touches a replica. Marks
+  // this handle sticky only once the write has actually committed: a failed
+  // write leaves nothing to be stale about.
+  export exec(sqlText: string, params: []Value): int! {
+    let n = this.p.exec(sqlText, params)?
+    this.mu.lock()
+    this.written = true
+    this.mu.unlock()
+    return n
+  }
+}
+
+fn newSession(p: Pool): Session {
+  return Session{ p: p, mu: newMutex() }
+}

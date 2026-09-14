@@ -1,0 +1,208 @@
+// stdlib/sql/replica.test.bit — read replica routing and read-your-own-writes
+// (#5085), against the same fake driver ./pool.test.bit already builds.
+//
+// `pool`, `Pool`, `Datasource`, `Session` and ./pool.test.bit's `stubAdapter`/
+// `newStub`/`ranStatement`/`taggedConn` are all siblings in this one module
+// (SPEC §17.1), so nothing of std/sql is imported here. `stubAdapter.
+// readTargetFor`/`targetFor` (./pool.test.bit, extended for this ticket) are
+// what every assertion below reads: "this statement landed on the writer" or
+// "on replica N" is a claim about which `cfg.uri` the connection that ran it
+// was opened for, never about the pool's own bookkeeping.
+//
+// EVERY POOL HERE IS BUILT WITH ONE SHARED `stubAdapter` AND THREE TARGETS —
+// "stub://writer" plus two replica URIs — exactly as a real adapter would
+// see one writer and N replicas as different `Datasource.uri` values on the
+// same driver (./config.bit's `Adapter` doc). `pool`'s own recursion into
+// itself (./replica.bit's `buildReplicas`) is what opens a replica's
+// connections; nothing here constructs a replica pool directly.
+
+fn replicaDatasource(): Datasource {
+  return Datasource{
+    uri: "stub://writer",
+    replicas: ["stub://r1", "stub://r2"],
+    maxOpen: 4,
+  }
+}
+
+test "reads with no prior write round-robin across both replicas, never the writer" {
+  let a = newStub()
+  let p = pool(a, replicaDatasource()) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let want = ["stub://r1", "stub://r2", "stub://r1", "stub://r2"]
+  let i = 0
+  while (i < len(want)) {
+    let label = "read${i}"
+    let rows = p.query(label, []Value(0)) catch e {
+      assert(false, "${label}: ${e.message()}")
+      return
+    }
+    rows.close()
+    let got = a.readTargetFor(label)
+    assert(got == want[i], "${label} landed on ${got}, expected ${want[i]}")
+    i = i + 1
+  }
+  p.close()
+}
+
+test "every statement inside tx() lands on the writer, including reads" {
+  let a = newStub()
+  let p = pool(a, replicaDatasource()) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  p.tx((t) => {
+    let rows = t.query("txread", []Value(0))?
+    rows.close()
+    t.exec("txwrite", []Value(0))?
+  }) catch e {
+    assert(false, "tx: ${e.message()}")
+    return
+  }
+  assert(
+    a.readTargetFor("txread") == "stub://writer",
+    "txread landed on ${a.readTargetFor("txread")}",
+  )
+  // Neither replica pool was ever dialed: the only connects are the
+  // writer's.
+  for t of a.targetsSeen() {
+    assert(t == "stub://writer", "a connection was opened against ${t} during a transaction")
+  }
+  p.close()
+}
+
+test "a write in the same session sticks reads to the writer; a fresh session still uses a replica" {
+  let a = newStub()
+  let p = pool(a, replicaDatasource()) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let s1 = p.session()
+  let n = s1.exec("write1", []Value(0)) catch e {
+    assert(false, "write1: ${e.message()}")
+    return
+  }
+  assert(n == 1, "write1 returned ${n}")
+  let afterWrite = s1.query("afterwrite", []Value(0)) catch e {
+    assert(false, "afterwrite: ${e.message()}")
+    return
+  }
+  afterWrite.close()
+  assert(
+    a.readTargetFor("afterwrite") == "stub://writer",
+    "afterwrite landed on ${a.readTargetFor("afterwrite")}",
+  )
+
+  let s2 = p.session()
+  let fresh = s2.query("freshread", []Value(0)) catch e {
+    assert(false, "freshread: ${e.message()}")
+    return
+  }
+  fresh.close()
+  let landedOn = a.readTargetFor("freshread")
+  assert(
+    landedOn == "stub://r1" || landedOn == "stub://r2",
+    "freshread landed on ${landedOn}, expected a replica",
+  )
+  p.close()
+}
+
+test "a replica that errors is dropped from rotation, retried on the writer, and the caller sees no error" {
+  let a = newStub()
+  let p = pool(a, replicaDatasource()) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  // The first read would round-robin to r1; make r1 fail every query.
+  a.setFailQueryTarget("stub://r1")
+  let rows = p.query("failover", []Value(0)) catch e {
+    assert(false, "failover: the replica's error reached the caller: ${e.message()}")
+    return
+  }
+  rows.close()
+  assert(
+    a.readTargetFor("failover") == "stub://writer",
+    "failover landed on ${a.readTargetFor("failover")}, expected the writer",
+  )
+  // r1 is now out of rotation. The next read goes to r2 by plain
+  // round-robin (r1 was tried first, r2 is next) — not yet proof r1 is
+  // skipped, since round-robin alone would land here too.
+  a.setFailQueryTarget("")
+  let rows2 = p.query("afterFailover", []Value(0)) catch e {
+    assert(false, "afterFailover: ${e.message()}")
+    return
+  }
+  rows2.close()
+  assert(
+    a.readTargetFor("afterFailover") == "stub://r2",
+    "afterFailover landed on ${a.readTargetFor("afterFailover")}, expected r2",
+  )
+  // A THIRD read is where round-robin alone would cycle back to r1. It
+  // must land on r2 again instead: this is the assertion that r1 is
+  // actually out of rotation, not merely skipped by round-robin order.
+  let rows3 = p.query("stillDown", []Value(0)) catch e {
+    assert(false, "stillDown: ${e.message()}")
+    return
+  }
+  rows3.close()
+  assert(
+    a.readTargetFor("stillDown") == "stub://r2",
+    "stillDown landed on ${a.readTargetFor("stillDown")}, expected r2 (r1 still in backoff)",
+  )
+  p.close()
+}
+
+test "a failing write is never retried on a replica" {
+  let a = newStub()
+  let p = pool(a, replicaDatasource()) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  a.setPoison(true)
+  let n = p.exec("badwrite", []Value(0)) catch _ {
+    assert(a.closeCount() == 1, "closed ${a.closeCount()} connections after the failed write")
+    // The failing statement ran exactly once, and only on the writer: no
+    // fallback attempt touched either replica.
+    let hits = 0
+    for entry of a.statements() {
+      if (ranStatement(entry, "badwrite")) {
+        hits = hits + 1
+      }
+    }
+    assert(hits == 1, "badwrite ran ${hits} times, expected exactly once")
+    for t of a.targetsSeen() {
+      assert(t == "stub://writer", "a connection was opened against ${t} for a write")
+    }
+    p.close()
+    return
+  }
+  assert(false, "the poisoned write returned ${n} instead of failing")
+  p.close()
+}
+
+test "a Datasource with an empty replicas list routes every statement to the writer" {
+  let a = newStub()
+  let p = pool(a, Datasource{ uri: "stub://writer", maxOpen: 2 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let i = 0
+  while (i < 3) {
+    let label = "onlywriter${i}"
+    let rows = p.query(label, []Value(0)) catch e {
+      assert(false, "${label}: ${e.message()}")
+      return
+    }
+    rows.close()
+    assert(
+      a.readTargetFor(label) == "stub://writer",
+      "${label} landed on ${a.readTargetFor(label)}",
+    )
+    i = i + 1
+  }
+  for t of a.targetsSeen() {
+    assert(t == "stub://writer", "a connection was opened against ${t} with no replicas configured")
+  }
+  p.close()
+}
