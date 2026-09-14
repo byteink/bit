@@ -1156,6 +1156,37 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   further meaning to which one it is. One on a field of a class that does
   not carry `@table` is **E0160**, naming the field, the attribute and the
   class - the same reasoning `@key` outside `@json` (E0139) already gives.
+- **A hidden persisted-flag word, read and written by `isPersisted()`/
+  `markPersisted(v: bool)`** (#5052). `db.save` must issue an INSERT for a
+  new entity and an UPDATE for one that came from a query, decided WITHOUT
+  inspecting the primary key - a UUID or application-assigned key already
+  has a non-zero value on a brand-new row, and a composite key has no single
+  id to test. A class carrying `@table` gains one hidden word, appended
+  after its own declared fields and never a declared or nameable field
+  itself: it does not appear in `tableDescriptor()`, in `@json`'s `toJson()`,
+  in `bit doc`, or in autocomplete, and Bit source cannot name it directly.
+  Two accessors reach it -
+
+  ```
+  isPersisted(): bool
+  markPersisted(v: bool)
+  ```
+
+  - neither has a surface-syntax equivalent, since no expression can name a
+    raw offset; the compiler recognizes a call to either by name on a
+    `@table`-class receiver. A composite literal leaves the flag `false`;
+    the generated row mapper sets it `true` at hydration; `delete` clears it
+    so a deleted entity re-saved inserts rather than updating zero rows.
+  - `isPersisted`/`markPersisted` named as a plain field is **E0161**,
+    naming the class and the field - source can never name the hidden slot
+    directly. A class carrying `@table` that declares either name as a
+    METHOD itself is **E0162**, naming both - the same rule, and for the
+    same reason, as `tableDescriptor`'s own E0148. The two diagnostics are
+    distinct: one is naming the reserved word directly, the other is a
+    hand-written accessor that would silently win and make the synthesized
+    one invisible to `pkg/orm`.
+  - A class without `@table` has no `isPersisted`/`markPersisted` member -
+    the ordinary E0057 every other unknown member gets.
 
 **`find<T>`/`findOne<T>`/`findOneOrFail<T>` - mapping a query result.**
 
