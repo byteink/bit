@@ -736,6 +736,36 @@ and a class is often a projection. A field whose type is not one of the five
 scalars, or `Option<>` of one, is a compile error (`E0154`) naming the field
 and its type.
 
+### A `@table` class is marked persisted at hydration
+
+When `T` also carries `@table`, the generated mapper calls
+`markPersisted(true)` (SPEC §10.5) on the value it built, right before
+handing it back - so anything `find`/`findOne`/`findOneOrFail` returns reads
+`isPersisted() == true`. A composite literal never does this: `User{ id: 1,
+email: "a@b.com" }` reads `isPersisted() == false` until something calls
+`markPersisted(true)` on it by hand. That distinction is what `db.save` (in
+`bitlang.org/pkg/orm`) needs to choose an UPDATE over an INSERT without
+inspecting the primary key, which a UUID or application-assigned key rules
+out.
+
+```bit
+import { Executor, Rows, Value, findOneOrFail, FieldDesc, AttrDesc } from "std/sql"
+
+@table class User {
+  @id
+  id: i64
+  email: string
+}
+
+fn firstActiveUser(db: Executor): User! {
+  return findOneOrFail<User>(db, "SELECT id, email FROM users WHERE active = ?", Value.Int(1))?
+}
+```
+
+`firstActiveUser`'s result has `isPersisted() == true`. A class with no
+`@table` has neither accessor at all - the mapper only ever calls a member
+the class actually declares.
+
 ### `find<T>(db: Executor, sqlText: string, ...args: Value): []T!`
 
 Maps every row into `T`. `T` must be a plain class - refusing one that
