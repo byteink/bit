@@ -1,0 +1,431 @@
+// compiler/lowerdecimaldiv.bit — #3982's last slice: binary `/` on `decimal`,
+// half-even. Sibling of lowerdecimal.bit/lowerdecimalarith.bit: same module,
+// no imports, no call-site changes beyond `lowerDecimalBinary`'s new `Slash`
+// arm (lowerdecimalarith.bit) and `numericOrDecimalOk` (checkexpr.bit)
+// admitting `/` alongside `+`/`-`/`*`.
+//
+// OWNER RULING (ticket #3982, comment 14), the rule this file implements
+// exactly: a division that TERMINATES returns the fewest digits that
+// represent the exact quotient (`10 / 2` is `5`, not `5.000...`); a division
+// that does not terminate fills the type's precision and rounds the last
+// digit half-even. Trimming is safe because equality already ignores scale
+// (§11.1) — trimming trailing zeros cannot change what a later `==` sees.
+//
+// THE ALGORITHM, in one pass over `emitDiv96` below (the one 96-bit/96-bit
+// division this file needs, reused for the trim step's divide-by-10 too, so
+// there is exactly one division primitive here rather than a general one
+// plus a constant-divisor special case).
+//
+//  1. Scale the dividend's 96-bit magnitude up by the largest power of 10
+//     that (a) still fits under 2^96 and (b) does not push the result past
+//     scale 28 — `emitDecimalScaleMax`'s `capShift` argument, computed once
+//     up front as `28 - scaleA + scaleB`, is exactly that second cap; that
+//     function's own overflow-fits check enforces (a) alone.
+//  2. Long-divide the scaled dividend by the divisor's magnitude
+//     (`emitDiv96`): an EXACT quotient and remainder, both integers, no
+//     rounding yet.
+//  3. Remainder zero means the division TERMINATED inside the scaled-up
+//     precision: trim trailing zeros off the quotient while the scale is
+//     still positive (`emitDecimalTrim`), which is what turns `10*10^27 / 2`
+//     (`= 5 * 10^27` at scale 27) into `5` at scale 0.
+//  4. Remainder nonzero means the true quotient has more digits than fit:
+//     round the LAST kept digit half-even, straight from the integer
+//     quotient and remainder — no extra "guard digit" needed. Comparing the
+//     DOUBLED remainder against the divisor decides it: below halfway
+//     truncates, above rounds up, exactly halfway ties to the quotient's own
+//     parity (`Q mod 2` IS the last decimal digit's parity, since `10*k` is
+//     always even, so `Q`'s evenness and its last digit's evenness agree for
+//     every integer `Q`) — the textbook definition of half-even, expressed
+//     without ever looking at a "next" digit.
+
+// ---- the one 96-bit division primitive -------------------------------------
+
+// Shifts the 96-bit pair (`lo`,`m`) left by one bit, OR-ing `bitIn` (0 or 1)
+// into the vacated low bit. `m` is left UNMASKED past its usual 32-bit
+// range — `emitDiv96`'s remainder needs a 33rd bit transiently right after a
+// shift, before the compare-and-maybe-subtract step below resolves it back
+// under the divisor's own 96-bit range.
+fn emitPairShl1In(fc: FnCtx, lo: int, m: int, bitIn: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let carryUp = emitBin(fc, Op.LShr, i64ty, lo, emitI64Const(fc, 63))
+  let newM = emitBin(fc, Op.BOr, i64ty, emitBin(fc, Op.Shl, i64ty, m, emitI64Const(fc, 1)), carryUp)
+  let newLo = emitBin(fc, Op.BOr, i64ty, emitBin(fc, Op.Shl, i64ty, lo, emitI64Const(fc, 1)), bitIn)
+  return (newLo, newM)
+}
+
+// Bit 95 of the 96-bit pair (bit 31 of `m`) — the one bit `emitDiv96` below
+// consumes from the dividend each round, most-significant first.
+fn decPairTopBit(fc: FnCtx, m: int): int {
+  let shifted = emitBin(fc, Op.LShr, primType(fc.c.ctx, 3), m, emitI64Const(fc, 31))
+  return emitBin(fc, Op.BAnd, primType(fc.c.ctx, 3), shifted, emitI64Const(fc, 1))
+}
+
+// Unsigned `(aLo,aM) >= (bLo,bM)`, most-significant limb first. `aM` may
+// carry the 33rd bit `emitPairShl1In`'s banner describes; that is still an
+// ordinary `i64` value far from wrapping, so the plain unsigned compares
+// below need no special case for it.
+fn emitPairCmpGe(fc: FnCtx, aLo: int, aM: int, bLo: int, bM: int): int {
+  let boolTy = primType(fc.c.ctx, 10)
+  let hiGt = emitBin(fc, Op.ICmpUgt, boolTy, aM, bM)
+  let hiEq = emitBin(fc, Op.ICmpEq, boolTy, aM, bM)
+  let loGe = emitBin(fc, Op.ICmpUge, boolTy, aLo, bLo)
+  let eqCase = emitCondVal(fc, hiEq, boolTy, loGe, emitBoolConst(fc, false))
+  return emitCondVal(fc, hiGt, boolTy, emitBoolConst(fc, true), eqCase)
+}
+
+// `(aLo,aM) - (bLo,bM)`, unsigned — `emitDiv96` only ever calls this once its
+// own `emitPairCmpGe` has confirmed `a >= b`, but the borrow is computed
+// rather than assumed, so the result is exact either way.
+fn emitPairSub(fc: FnCtx, aLo: int, aM: int, bLo: int, bM: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let diffLo = emitBin(fc, Op.Sub, i64ty, aLo, bLo)
+  let borrow = emitBin(fc, Op.ICmpUlt, boolTy, aLo, bLo)
+  let borrowV = emitCondVal(fc, borrow, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 0))
+  let diffM = emitBin(fc, Op.Sub, i64ty, emitBin(fc, Op.Sub, i64ty, aM, bM), borrowV)
+  return (diffLo, diffM)
+}
+
+// The quotient and remainder of a 96-bit unsigned division.
+class Div96Result {
+  qLo: int,
+  qM: int,
+  rLo: int,
+  rM: int,
+}
+
+// `(nLo,nM) / (dLo,dM)` and its remainder, 96-bit unsigned, by shift-and-
+// subtract restoring division — the textbook bit-serial algorithm, most
+// significant bit first: each of the 96 rounds shifts one bit of `n` into
+// the remainder, compares the remainder against `d`, subtracts and records a
+// `1` quotient bit if it fits, and shifts that bit into `q`. Bounded at
+// exactly 96 rounds (a 96-bit dividend has no more bits to consume), so this
+// terminates regardless of `n`/`d`; `d` a whole 96-bit zero is this
+// function's caller's problem, never checked here.
+fn emitDiv96(fc: FnCtx, nLo0: int, nM0: int, dLo: int, dM: int): Div96Result {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let header = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let exit = builderNewBlock(fc.b)
+
+  emitJump(
+    fc, header,
+    [
+      nLo0, nM0, emitI64Const(fc, 0), emitI64Const(fc, 0), emitI64Const(fc, 0), emitI64Const(fc, 0),
+      emitI64Const(fc, 96), dLo, dM,
+    ],
+  )
+  builderEndBlock(fc.b)
+
+  // `dLoP`/`dMP` carry the divisor through the loop as ordinary block
+  // params, unchanged every round: a value defined before this loop is not
+  // visible inside a block the loop's own back edge (body -> header)
+  // reaches, so even an invariant has to be threaded explicitly rather than
+  // just referenced from the call site's binding.
+  builderBeginBlock(fc.b, header)
+  let nLoP = builderAddParam(fc.b, i64ty)
+  let nMP = builderAddParam(fc.b, i64ty)
+  let rLoP = builderAddParam(fc.b, i64ty)
+  let rMP = builderAddParam(fc.b, i64ty)
+  let qLoP = builderAddParam(fc.b, i64ty)
+  let qMP = builderAddParam(fc.b, i64ty)
+  let cntP = builderAddParam(fc.b, i64ty)
+  let dLoP = builderAddParam(fc.b, i64ty)
+  let dMP = builderAddParam(fc.b, i64ty)
+  let cont = emitBin(fc, Op.ICmpSgt, boolTy, cntP, emitI64Const(fc, 0))
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cont
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = exit
+  br.elseArgs = [rLoP, rMP, qLoP, qMP]
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  let bitOut = decPairTopBit(fc, nMP)
+  let (nLo2, nM2raw) = emitPairShl1In(fc, nLoP, nMP, emitI64Const(fc, 0))
+  let nM2 = emitBin(fc, Op.BAnd, i64ty, nM2raw, emitI64Const(fc, 4294967295))
+  let (rLo2, rM2) = emitPairShl1In(fc, rLoP, rMP, bitOut)
+  let ge = emitPairCmpGe(fc, rLo2, rM2, dLoP, dMP)
+  let (rLo3, rM3) = emitPairSub(fc, rLo2, rM2, dLoP, dMP)
+  let rLoNext = emitCondVal(fc, ge, i64ty, rLo3, rLo2)
+  let rMNext = emitCondVal(fc, ge, i64ty, rM3, rM2)
+  let qBit = emitCondVal(fc, ge, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 0))
+  let (qLoNext, qMNext) = emitPairShl1In(fc, qLoP, qMP, qBit)
+  let newCnt = emitBin(fc, Op.Sub, i64ty, cntP, emitI64Const(fc, 1))
+  emitJump(fc, header, [nLo2, nM2, rLoNext, rMNext, qLoNext, qMNext, newCnt, dLoP, dMP])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, exit)
+  let finalRLo = builderAddParam(fc.b, i64ty)
+  let finalRM = builderAddParam(fc.b, i64ty)
+  let finalQLo = builderAddParam(fc.b, i64ty)
+  let finalQM = builderAddParam(fc.b, i64ty)
+  let mask32 = emitI64Const(fc, 4294967295)
+  return Div96Result{
+    qLo: finalQLo, qM: emitBin(fc, Op.BAnd, i64ty, finalQM, mask32),
+    rLo: finalRLo, rM: emitBin(fc, Op.BAnd, i64ty, finalRM, mask32),
+  }
+}
+
+// ---- guard-digit scale-up and trailing-zero trim ---------------------------
+
+// Scales a 96-bit magnitude up by the largest power of 10 that (a) still
+// fits under 2^96 and (b) does not exceed `capShift` rounds — UNLIKE
+// `emitDecimalScaleUp` (lowerdecimalarith.bit), which PANICS the instant a
+// round would not fit, this one just STOPS: losing further scale-up is
+// exactly how a large dividend ends up with fewer guard digits (and a small
+// one, more). `capShift` is `emitDiv96`'s only other caller's own cap (`28 -
+// scaleA + scaleB`, computed once by `lowerDecimalDivide` below) — always in
+// `[0, 56]` given both scales are themselves always in `[0, 28]`, which is
+// what makes this a statically bounded loop despite `capShift` being a
+// runtime value, the same reasoning `emitDecimalScaleUp`'s own `diff`
+// argument already relies on.
+fn emitDecimalScaleMax(fc: FnCtx, lo0: int, mant0: int, capShift: int): (int, int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let header = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let exit = builderNewBlock(fc.b)
+
+  emitJump(fc, header, [lo0, mant0, emitI64Const(fc, 0), capShift])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, header)
+  let loP = builderAddParam(fc.b, i64ty)
+  let mantP = builderAddParam(fc.b, i64ty)
+  let shiftP = builderAddParam(fc.b, i64ty)
+  let cntP = builderAddParam(fc.b, i64ty)
+  let cont = emitBin(fc, Op.ICmpSgt, boolTy, cntP, emitI64Const(fc, 0))
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cont
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = exit
+  br.elseArgs = [loP, mantP, shiftP]
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  let ten = emitI64Const(fc, 10)
+  let loProd = emitBin(fc, Op.Mul, i64ty, loP, ten)
+  let carry = emitBin(fc, Op.UMulHi, i64ty, loP, ten)
+  let mantTimes10 = emitBin(fc, Op.Mul, i64ty, mantP, ten)
+  let newMant = emitBin(fc, Op.Add, i64ty, mantTimes10, carry)
+  let fits = emitBin(fc, Op.ICmpSlt, boolTy, newMant, emitI64Const(fc, 4294967296))
+  let stopBlk = builderNewBlock(fc.b)
+  let goBlk = builderNewBlock(fc.b)
+  let br2 = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br2.lhs = fits
+  br2.ival = goBlk
+  br2.ival2 = stopBlk
+  builderEmit(fc.b, br2)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, stopBlk)
+  emitJump(fc, exit, [loP, mantP, shiftP])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, goBlk)
+  let newCnt = emitBin(fc, Op.Sub, i64ty, cntP, emitI64Const(fc, 1))
+  let newShift = emitBin(fc, Op.Add, i64ty, shiftP, emitI64Const(fc, 1))
+  emitJump(fc, header, [loProd, newMant, newShift, newCnt])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, exit)
+  let finalLo = builderAddParam(fc.b, i64ty)
+  let finalMant = builderAddParam(fc.b, i64ty)
+  let finalShift = builderAddParam(fc.b, i64ty)
+  return (finalLo, finalMant, finalShift)
+}
+
+// Divides a 96-bit magnitude by 10, repeatedly, while `scale > 0` AND the
+// division is exact — the owner ruling's "trim trailing zeros" step, and the
+// reason `emitDiv96` above is written generally rather than only for the
+// scale-up direction: this reuses it with a constant divisor of 10.
+fn emitDecimalTrim(fc: FnCtx, lo0: int, m0: int, scale0: int): (int, int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let header = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let exit = builderNewBlock(fc.b)
+
+  emitJump(fc, header, [lo0, m0, scale0])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, header)
+  let loP = builderAddParam(fc.b, i64ty)
+  let mP = builderAddParam(fc.b, i64ty)
+  let scaleP = builderAddParam(fc.b, i64ty)
+  let cont = emitBin(fc, Op.ICmpSgt, boolTy, scaleP, emitI64Const(fc, 0))
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cont
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = exit
+  br.elseArgs = [loP, mP, scaleP]
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  let dv = emitDiv96(fc, loP, mP, emitI64Const(fc, 10), emitI64Const(fc, 0))
+  let divisible = emitBin(
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, dv.rLo, dv.rM), emitI64Const(fc, 0),
+  )
+  let stopBlk = builderNewBlock(fc.b)
+  let goBlk = builderNewBlock(fc.b)
+  let br2 = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br2.lhs = divisible
+  br2.ival = goBlk
+  br2.ival2 = stopBlk
+  builderEmit(fc.b, br2)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, stopBlk)
+  emitJump(fc, exit, [loP, mP, scaleP])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, goBlk)
+  let newScale = emitBin(fc, Op.Sub, i64ty, scaleP, emitI64Const(fc, 1))
+  emitJump(fc, header, [dv.qLo, dv.qM, newScale])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, exit)
+  let finalLo = builderAddParam(fc.b, i64ty)
+  let finalM = builderAddParam(fc.b, i64ty)
+  let finalScale = builderAddParam(fc.b, i64ty)
+  return (finalLo, finalM, finalScale)
+}
+
+// Panics "decimal division by zero" unless `ok` — the divide-specific sibling
+// of `emitDecimalOverflowPanic` (lowerdecimalarith.bit), same shape, its own
+// message: SPEC §13.5 already gives integer division by zero and decimal
+// arithmetic overflow two DIFFERENT panic messages, so division by zero on a
+// decimal gets its own rather than reusing "decimal arithmetic overflowed"
+// for a fault that is not an overflow.
+fn emitDecimalDivZeroPanic(fc: FnCtx, ok: int) {
+  let good = builderNewBlock(fc.b)
+  let bad = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = ok
+  br.ival = good
+  br.ival2 = bad
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, bad)
+  let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  msg.sval = "decimal division by zero"
+  msg.ival = internPoolString(fc, msg.sval)
+  let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  pn.name = "panic"
+  pn.args = [builderEmit(fc.b, msg)]
+  emitRtCall(fc, pn)
+  builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, good)
+}
+
+// Half-even rounds `dv`'s raw quotient against the divisor `(magBLo,magBM)`:
+// doubles the remainder and compares it to the divisor (below halfway
+// truncates, above rounds up, exactly halfway ties to whichever of `Q`/`Q+1`
+// is even — `Q`'s own parity IS its last decimal digit's parity, this file's
+// banner), then applies that decision, panicking first if rounding up would
+// itself overflow 96 bits (only possible when `Q` was already the maximum
+// representable magnitude — checked directly rather than via a masked add,
+// which would silently wrap the very overflow this must panic on;
+// `emitDecAddPair`, lowerdecimalarith.bit, masks its `m` result). Split out
+// of `lowerDecimalDivide` to keep that function under the 80-line cap
+// (`spec/LINT.md` `max-fn-lines`).
+fn emitDecimalDivRound(fc: FnCtx, dv: Div96Result, magBLo: int, magBM: int): (int, int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let (dblLo, dblM) = emitPairShl1In(fc, dv.rLo, dv.rM, emitI64Const(fc, 0))
+  let dblGe = emitPairCmpGe(fc, dblLo, dblM, magBLo, magBM)
+  let isTie = emitCondVal(
+    fc, emitBin(fc, Op.ICmpEq, boolTy, dblM, magBM), boolTy,
+    emitBin(fc, Op.ICmpEq, boolTy, dblLo, magBLo), emitBoolConst(fc, false),
+  )
+  let qOdd = emitBin(
+    fc, Op.ICmpNe, boolTy, emitBin(fc, Op.BAnd, i64ty, dv.qLo, emitI64Const(fc, 1)), emitI64Const(
+      fc,
+      0,
+    ),
+  )
+  let roundUp = emitCondVal(fc, isTie, boolTy, qOdd, dblGe)
+
+  let atMax = emitCondVal(
+    fc, emitBin(fc, Op.ICmpEq, boolTy, dv.qLo, emitI64Const(fc, 0 - 1)), boolTy,
+    emitBin(fc, Op.ICmpEq, boolTy, dv.qM, emitI64Const(fc, 4294967295)), emitBoolConst(fc, false),
+  )
+  let roundOk = emitCondVal(
+    fc, emitCondVal(fc, roundUp, boolTy, atMax, emitBoolConst(fc, false)), boolTy,
+    emitBoolConst(fc, false), emitBoolConst(fc, true),
+  )
+  emitDecimalOverflowPanic(fc, roundOk)
+
+  let (incLo, incM) = emitDecAddPair(fc, dv.qLo, dv.qM, emitI64Const(fc, 1), emitI64Const(fc, 0))
+  return (
+    emitCondVal(fc, roundUp, i64ty, incLo, dv.qLo),
+    emitCondVal(fc, roundUp, i64ty, incM, dv.qM),
+  )
+}
+
+// ---- binary `/` --------------------------------------------------------------
+
+// `a / b` (§12, precedence row 6), half-even, per the algorithm this file's
+// banner walks through.
+fn lowerDecimalDivide(fc: FnCtx, a: int, b: int): int {
+  let ctx = fc.c.ctx
+  let i64ty = primType(ctx, 3)
+  let boolTy = primType(ctx, 10)
+  let words = decimalWordTypes(ctx)
+  let aw = explodeValueWords(ctx, fc.b, a, words)
+  let bw = explodeValueWords(ctx, fc.b, b, words)
+  let loA = aw[0]
+  let hiA = aw[1]
+  let loB = bw[0]
+  let hiB = bw[1]
+  let magBLo = loB
+  let magBM = decMantHi32(fc, hiB)
+
+  let divisorOk = emitBin(
+    fc, Op.ICmpNe, boolTy, emitBin(fc, Op.BOr, i64ty, magBLo, magBM), emitI64Const(fc, 0),
+  )
+  emitDecimalDivZeroPanic(fc, divisorOk)
+
+  let scaleA = decScale(fc, hiA)
+  let scaleB = decScale(fc, hiB)
+  let capShift = emitBin(
+    fc, Op.Sub, i64ty, emitBin(fc, Op.Add, i64ty, emitI64Const(fc, 28), scaleB), scaleA,
+  )
+  let (scaledLo, scaledM, guardShift) = emitDecimalScaleMax(fc, loA, decMantHi32(fc, hiA), capShift)
+  let dv = emitDiv96(fc, scaledLo, scaledM, magBLo, magBM)
+  let isExact = emitBin(
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, dv.rLo, dv.rM), emitI64Const(fc, 0),
+  )
+
+  let (roundedLo, roundedM) = emitDecimalDivRound(fc, dv, magBLo, magBM)
+
+  let naturalScale = emitBin(
+    fc, Op.Sub, i64ty, emitBin(fc, Op.Add, i64ty, guardShift, scaleA), scaleB,
+  )
+  emitDecimalOverflowPanic(fc, emitBin(fc, Op.ICmpSge, boolTy, naturalScale, emitI64Const(fc, 0)))
+
+  let (trimLo, trimM, trimScale) = emitDecimalTrim(fc, roundedLo, roundedM, naturalScale)
+  let outLo = emitCondVal(fc, isExact, i64ty, trimLo, roundedLo)
+  let outM = emitCondVal(fc, isExact, i64ty, trimM, roundedM)
+  let outScale = emitCondVal(fc, isExact, i64ty, trimScale, naturalScale)
+
+  let isZeroOut = emitBin(
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, outLo, outM), emitI64Const(fc, 0),
+  )
+  let resultNeg = emitBin(fc, Op.ICmpNe, boolTy, decIsNeg(fc, hiA), decIsNeg(fc, hiB))
+  let signMasked = emitCondVal(fc, resultNeg, i64ty, emitSignBitConst(fc), emitI64Const(fc, 0))
+  let finalSignMasked = emitCondVal(fc, isZeroOut, i64ty, emitI64Const(fc, 0), signMasked)
+  let resultHi = decComposeHi(fc, outM, outScale, finalSignMasked)
+  return buildTuple(fc, decimalTupleType(ctx), [outLo, resultHi])
+}
