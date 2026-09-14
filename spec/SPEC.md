@@ -558,29 +558,34 @@ are no nominal newtypes in v0.1.
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
-param         = [ "..." ] IDENT ":" type [ "=" const_expr ] .
+param         = [ "..." ] IDENT ( ":" type [ "=" const_expr ] | "=" const_expr ) .
 result_type   = type .            (* may carry the fallible marker, §18 *)
 ```
 
 - The return type is written after `:`. If omitted, the function returns nothing
   (its result type is the empty tuple `()`, i.e. "void").
 - Named `fn` declarations **require** type annotations on every parameter
-  and (unless void) on the result. This keeps checking modular and diagnostics
+  and (unless void) on the result, except a defaulted parameter with no
+  written type (`x = 1`, below). This keeps checking modular and diagnostics
   precise. Type inference applies to `let`/`const` initializers and to arrow
-  function bodies (§12.8), not to named-function signatures.
+  function bodies (§12.8), not otherwise to named-function signatures.
 - A variadic parameter (`...name: T`) must be last; inside the body it has type
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
-- A parameter may carry a default value, `x: int = 1` (#5244): a call may omit
-  it and every parameter after it that also has one, and the default is used
-  instead. `const_expr` is a bare literal (int, float, string or bool; not a
-  compound expression, a call, or an allocation) - defaults evaluated at the
-  call site (Swift's `#file`/`#line` shape) were considered and rejected
-  (#2905). A defaulted parameter may not precede one with no default
-  (**E0158**): a call supplying only its own positional prefix could never
-  reach a later required parameter otherwise. A default whose value is not a
-  literal is **E0159**. `x = 1` with the type inferred from the default
-  (rather than written) is not yet implemented.
+- A parameter may carry a default value, either with the type written,
+  `x: int = 1` (#5244), or read off the default, `x = 1` (#5258): a call may
+  omit it and every parameter after it that also has one, and the default is
+  used instead. `const_expr` is a bare literal (int, float, string, bool, or
+  `nil`; not a compound expression, a call, or an allocation) - defaults
+  evaluated at the call site (Swift's `#file`/`#line` shape) were considered
+  and rejected (#2905). A defaulted parameter may not precede one with no
+  default (**E0158**): a call supplying only its own positional prefix could
+  never reach a later required parameter otherwise. A default whose value is
+  not a literal is **E0159**. When the type is written, the default need only
+  be assignable to it (so `x: T = nil` is legal for any nil-accepting `T`).
+  When the type is inferred, the parameter takes the default's own **default
+  type** (§15.4: int → `i64`, float → `f64`, string → `string`, bool →
+  `bool`) - `nil` has none, so `x = nil` is **E0159** in this spelling only.
 
 #### 10.3.1 Function and Class Attributes
 
@@ -5171,7 +5176,7 @@ attr_list     = attr { attr } .
 attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
-param         = [ "..." ] IDENT ":" type [ "=" const_expr ] .
+param         = [ "..." ] IDENT ( ":" type [ "=" const_expr ] | "=" const_expr ) .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
