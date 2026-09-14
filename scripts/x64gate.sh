@@ -62,13 +62,15 @@ VOLUME="bit-gate-cache-amd64"
 ABI_BASELINE_DIR="bit-out/make/abiarity-gate-baseline"
 STAGE0_VERSION=$(git show HEAD:dist/stage0/SHA256SUMS | awk '
   /^[[:space:]]*#/ { next }
+  found { next }
   { for (i = 1; i <= NF; i++)
       if ($i ~ /^bit-.+-(linux-aarch64|linux-x86_64|macos-aarch64)\.tar\.xz$/) {
         v = $i
         sub(/^bit-/, "", v)
         sub(/-(linux-aarch64|linux-x86_64|macos-aarch64)\.tar\.xz$/, "", v)
         print v
-        exit
+        found = 1
+        next
       } }')
 [ -n "${STAGE0_VERSION}" ] || {
   echo "x64gate: cannot read the pinned stage0 version from HEAD:dist/stage0/SHA256SUMS" >&2; exit 127; }
