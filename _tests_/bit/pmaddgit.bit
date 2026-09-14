@@ -51,6 +51,7 @@
 import { exists, readFile, remove, writeFile } from "std/fs"
 import { envOr, exit } from "std/os"
 import { base as pathBase, dir as pathDir } from "std/path"
+import { parseInt, split, trimSpace } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 import { Json, jsonGet, jsonAsString, jsonParse, jsoncParse } from "std/json"
 import { monotonic, since, Millisecond } from "std/time"
@@ -58,11 +59,97 @@ import { monotonic, since, Millisecond } from "std/time"
 // Wall-clock ceiling on any one subprocess.
 const subprocessTimeoutMs: int = 120000
 
-// Ceiling on each of the two post-`add` `bit run` calls: generous slack over
-// a warm-cache compile+link+run, far below what a fallback to a real network
-// dial against `depHost` would add on top — the same budget-as-network-guard
+// Base ceiling on each of the two post-`add` `bit run` calls, before the
+// #5196 load scaling below: generous slack over a warm-cache
+// compile+link+run, far below what a fallback to a real network dial
+// against `depHost` would add on top — the same budget-as-network-guard
 // technique pmimports.bit's `warmRunBudgetMs` uses.
+//
+// #5196: this fixed number used to be the sole judge of elapsed time
+// (#4711 measured 61495ms against it at 16 concurrent gates, on a tree with
+// nothing wrong). `budgetMs()` below scales it by the observed host load
+// average, same idiom as pmimports.bit's `budgetMs()`/`loadProbe()` and
+// _tests_/bit/benchgate/benchrun.bit's loadProbe()/isLoaded() (#5095),
+// capped at `subprocessTimeoutMs` since `osRunBounded` already kills the
+// subprocess and reports TIMED OUT before any wider judge budget could ever
+// be observed. `exclusive: true` stays on this gate in tools/build/gates.bit
+// (#4711) — resampling fixes the correctness question (this constant can no
+// longer read a busy box as a network fallback), not the suite-parallelism
+// one, and dropping isolation is a separate decision this change does not make.
 const warmRunBudgetMs: int = 60000
+
+// Same idiom as pmimports.bit's/_tests_/bit/benchgate/benchrun.bit's
+// loadScaleCap/loadProbeTimeoutMs (#5095/#5196).
+const loadScaleCap: int = 8
+const loadProbeTimeoutMs: int = 5000
+
+class LoadProbe { scale: int, text: string }
+
+// One load sample via the uptime/getconf/awk idiom benchgate's loadProbe()
+// and pmimports.bit's loadProbe() already use: scale 1 at or under the core
+// count is "quiet". Never fatal to obtain — any failure (missing
+// uptime/getconf, malformed output, the probe's own timeout, a script that
+// could not even be written or made executable) falls back to scale 1, i.e.
+// the plain pre-#5196 budget: a broken probe can only fail CLOSED to the old
+// fixed number, never open into masking a real fallback-to-network hang.
+// Runs under its own short `loadProbeTimeoutMs`, not the 120s
+// `subprocessTimeoutMs` every `bit`/`git` invocation elsewhere in this file
+// gets — this is a handful of fast, local shell builtins.
+fn loadProbe(root: string): LoadProbe {
+  let fallback = LoadProbe{ scale: 1, text: "unknown" }
+  let outPath = root + "/loadprobe.out"
+  let scriptPath = root + "/loadprobe.sh"
+  let body = "#!/bin/sh\n" +
+    "cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null)\n" +
+    "case \"$cores\" in ''|*[!0-9]*) cores=1 ;; esac\n" +
+    "load=$(uptime 2>/dev/null | sed -n 's/.*load averages*: *//p' | awk -F'[ ,]+' '{print $1}')\n" +
+    "case \"$load\" in ''|*[!0-9.]*) load=0 ;; esac\n" +
+    "awk -v l=\"$load\" -v c=\"$cores\" -v cap=${loadScaleCap} " +
+    "'BEGIN{r=l/c; s=int(r); if(r>s)s++; if(s<1)s=1; if(s>cap)s=cap; printf \"%d %s\\n\", s, l}' > " +
+    shQuote(outPath) +
+    "\n"
+  writeFile(scriptPath, body) catch _ {
+    return fallback
+  }
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    return fallback
+  }
+  let code = osRunBounded(scriptPath, loadProbeTimeoutMs)
+  removeQuiet(scriptPath)
+  if (code != 0) {
+    return fallback
+  }
+  let raw = readFile(outPath) catch _ {
+    return fallback
+  }
+  let parts = split(trimSpace(trimEol(raw)), " ")
+  if (len(parts) != 2) {
+    return fallback
+  }
+  let scale = parseInt(parts[0]) catch _ {
+    return fallback
+  }
+  if (scale < 1) {
+    return fallback
+  }
+  let text = parts[1]
+  if (text == "") {
+    text = "unknown"
+  }
+  return LoadProbe{ scale: scale, text: text }
+}
+
+// baseMs scaled by the observed load, capped at subprocessTimeoutMs — past
+// that point osRunBounded's own watchdog already killed the subprocess and
+// reported TIMED OUT (a distinct outcome), so a wider judge budget could
+// never be observed anyway.
+fn budgetMs(baseMs: int, probe: LoadProbe): int {
+  let ms = baseMs * probe.scale
+  if (ms > subprocessTimeoutMs) {
+    ms = subprocessTimeoutMs
+  }
+  return ms
+}
 
 // The wrapper script's own reserved exit codes — a harness break, never the
 // compiler under test disagreeing.
@@ -215,9 +302,10 @@ fn checkDirectAdd(bitExe: string, stdRoot: string, tag: string, written: string)
 // just warmed. Neither needs `HOME` or any other extra env: the only git
 // this path can reach is `fetchSha`'s cache-hit branch, a LOCAL
 // `git rev-parse HEAD` inside the already-cached checkout — `url` is never
-// even read on that branch. A wall-clock budget (`warmRunBudgetMs`) backs
+// even read on that branch. A load-scaled budget (`budgetMs`, #5196) backs
 // up the exit-code/stdout checks: a regression that fell through to
-// `resolveDependencyRef` against the real `depHost` would blow well past it.
+// `resolveDependencyRef` against the real `depHost` would blow well past it
+// even at the widest scale this gate ever grants.
 fn checkWarmRuns(name: string, env: CliEnv, root: string) {
   writeFile(
     env.projDir + "/main.bit",
@@ -226,11 +314,20 @@ fn checkWarmRuns(name: string, env: CliEnv, root: string) {
     fatal(name, "cannot write main.bit: " + e.message())
   }
 
-  runWarmBitRun(name, env, Capture{ outPath: root + "/run1.out", errPath: root + "/run1.err" })
-  runWarmBitRun(name, env, Capture{ outPath: root + "/run2.out", errPath: root + "/run2.err" })
+  runWarmBitRun(
+    name, env, root, Capture{ outPath: root + "/run1.out", errPath: root + "/run1.err" },
+  )
+  runWarmBitRun(
+    name, env, root, Capture{ outPath: root + "/run2.out", errPath: root + "/run2.err" },
+  )
 }
 
-fn runWarmBitRun(name: string, env: CliEnv, capture: Capture) {
+fn runWarmBitRun(name: string, env: CliEnv, root: string, capture: Capture) {
+  // #5196: sampled immediately before the timed subprocess, same reason
+  // benchgate samples fresh before every rep rather than once at launch —
+  // a launch-time-only sample is idle-relative by construction.
+  let probe = loadProbe(root)
+  let budget = budgetMs(warmRunBudgetMs, probe)
   let started = monotonic()
   let r = runBitCli(name, env, []string(0), ["run", "main.bit"], capture)
   let elapsedMs = since(started) / Millisecond
@@ -247,10 +344,17 @@ fn runWarmBitRun(name: string, env: CliEnv, capture: Capture) {
       "stdout was '${r.stdout}', want exactly 'hi from direct pkg\\n'\n  stderr: ${r.stderr}",
     )
   }
-  if (elapsedMs >= warmRunBudgetMs) {
+  // Printed unconditionally, pass or fail (#2931/#5095's convention): a slow
+  // drift toward the budget must be visible before it ever trips.
+  print(
+      "pmaddgit: warm-cache run took ${elapsedMs}ms (budget ${budget}ms = base " +
+      "${warmRunBudgetMs}ms x${probe.scale} load, host load average ${probe.text})\n",
+  )
+  if (elapsedMs >= budget) {
     fatal(
       name,
-      "`bit run` took ${elapsedMs}ms (budget ${warmRunBudgetMs}ms) — it did not take the warm-cache path",
+        "`bit run` took ${elapsedMs}ms (scaled budget ${budget}ms = base ${warmRunBudgetMs}ms " +
+        "x${probe.scale} observed load ${probe.text}) — it did not take the warm-cache path",
     )
   }
 }
