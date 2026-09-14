@@ -1,176 +1,181 @@
 # Functions
 
-Functions are declared with `fn` and are first-class values. This chapter also
-covers the control-flow statements that live in function bodies. A method is
-different: it is declared in the class body with the implicit `this`
-receiver, not with a top-level `fn` - see [Methods](classes.md#methods) in
-the Classes chapter. (Spec: §10.3, §12.4, §12.8, §13.1.)
+<!-- doctest: per-block -->
 
-## Declaring functions
+[Classes](classes.md) gave every stored link its own `Link`, but the code
+that names it is still typed in by hand:
 
-A named function requires a type on every parameter and, unless it returns
-nothing, on the result. This keeps checking modular and diagnostics precise.
-
-```bit
-fn add(a: int, b: int): int {
-  return a + b
-}
-
-fn log(msg: string) { // no result type -> returns nothing (void)
-  // ...
-}
+```bit ignore
+links["abc123"] = Link{ url: "https://example.com", created: 0, hits: 0 }
 ```
 
-The result type follows `:`. Omitting it means the function returns nothing.
+A real shortener cannot ask someone to invent a code. It needs something
+that turns a number into one.
 
-### Multiple return values
+## The simplest version
 
-Return several values as a tuple; the result type is a tuple type.
-
-```bit
-fn divmod(a: int, b: int): (int, int) {
-  return a / b, a % b
-}
-
-fn useIt() {
-  let (q, r) = divmod(17, 5) // q = 3, r = 2
-}
-```
-
-## Parameters, variadics, and spread
-
-A variadic parameter (`...name: T`) must be last and has type `[]T` inside the
-body. Callers pass zero or more `T` arguments, or spread a `[]T` with `...`.
-Exactly one spread is allowed, and you cannot mix individual args with a spread.
+A function is declared with `fn`. Every parameter needs a type, and so does
+the result, unless the function returns nothing:
 
 ```bit
-fn sum(...xs: int): int {
-  let total = 0
-  for x of xs {
-    total += x
+const alphabet: string = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+fn shortCode(n: int): string {
+  let out = []byte(0)
+  let x = n
+  while (x > 0 || len(out) == 0) {
+    out = append(out, alphabet[x % len(alphabet)])
+    x = x / len(alphabet)
   }
-  return total
-}
-
-fn callers() {
-  let a = sum(1, 2, 3) // individual args
-  let nums = []int{ 4, 5, 6 }
-  let b = sum(...nums) // spread a slice
+  return string(out)
 }
 ```
 
-## Named arguments
+`shortCode` reads off one base-36 digit at a time from `alphabet` until `n`
+runs out, lowest digit first. `shortCode(12345)` is `"7sj"`; the
+`|| len(out) == 0` keeps the loop running at least once, so `shortCode(0)`
+still returns `"a"` instead of an empty string.
 
-A call may name its arguments instead of relying on position: `name =
-expression`, after any positional arguments. This is only legal where the
-callee's own declared parameter list is in scope - a free function (bare or
-through a namespace alias), a method, or a class constructor against its
-`init` - and each parameter may be supplied once, by position or by name.
-(Spec: §12.11.)
+Leaving out a parameter's type is not something the function body can fix
+later; it fails before the body is even checked:
 
-```bit
-fn serve(app: string, port: int, tls: bool) {
-  // ...
+```bit ignore
+fn shortCode(n): string {
+  return "x"
 }
-
-fn serveCallers() {
-  serve("web", 3000, true)                    // positional
-  serve(app = "web", port = 3000, tls = true) // fully named
-  serve("web", port = 3000, tls = true)       // positional prefix, then named
-}
+// error[E0021]: expected a type, found ')'
 ```
 
-A method takes them the same way, on a class receiver or through an interface
-value - the parameter names come from the declaration the call resolves to.
+## Generating a batch
+
+A single `shortCode` call is fine for one link. A bulk import needs many at
+once, so `shortCode` grows a companion that takes as many numbers as it's
+given. A parameter written `...name: T` collects every remaining argument
+into a `[]T`:
 
 ```bit
-interface Sink {
-  emit(label: string, count: int): string,
-}
+const alphabet: string = "abcdefghijklmnopqrstuvwxyz0123456789"
 
-class Log {
-  prefix: string
-  emit(label: string, count: int): string {
-    return "${this.prefix}:${label}=${count}"
+fn shortCode(n: int): string {
+  let out = []byte(0)
+  let x = n
+  while (x > 0 || len(out) == 0) {
+    out = append(out, alphabet[x % len(alphabet)])
+    x = x / len(alphabet)
   }
+  return string(out)
 }
 
-fn emitCallers(): string {
-  let log = Log{ prefix: "L" }
-  let sink: Sink = log
-  return log.emit(count = 7, label = "hits") + sink.emit(count = 1, label = "x")
-}
-```
-
-A class constructor takes them against its `init` declaration - the call whose
-bare positional arguments say the least.
-
-```bit
-class Acct {
-  bal: int
-  init(start: int, fee: int) {
-    this.bal = start - fee
+fn shortCodes(...ns: int): []string {
+  let out = []string(0)
+  for n of ns {
+    out = append(out, shortCode(n))
   }
+  return out
 }
 
-fn openAcct(): int {
-  return Acct(fee = 5, start = 100).bal
-}
-```
-
-A **generic** callee or receiver is positional only, and so is a call through a
-function value, a func-typed field, a builtin, or a type conversion. A generic
-declaration's parameter types still mention its open type parameters, so an
-argument named against one would be checked against `T` itself rather than
-against the type the call instantiates `T` with; for a type-parameter receiver
-the name would also resolve against the constraint interface while the call
-dispatches to the concrete implementation, and an implementation matches an
-interface by type, not by parameter name.
-
-```bit
-fn pick<T>(a: T, b: T): T {
-  return a
-}
-
-fn pickCallers(): int {
-  return pick<i64>(1, 2) // positional; `pick(b = 1, a = 2)` is an error
+fn demo() {
+  let a = shortCodes(1, 2, 3) // individual arguments
+  let batch = []int{ 4, 5, 6 }
+  let b = shortCodes(...batch) // spread an existing slice instead
 }
 ```
 
-## First-class functions and arrow functions
+A variadic parameter must be last, and a call either passes individual
+arguments or spreads one slice with `...` - never both.
 
-Functions are values. Arrow functions are concise anonymous functions; their
-parameter and return types are inferred from context when omitted.
+## Sorting the batch with a closure
+
+The batch comes back in call order, not a useful order. `std/sort`'s
+`sorted` takes the slice and a comparison function, and hands back a sorted
+copy:
 
 ```bit
-import { mapped } from "std/seq"
+import { sorted } from "std/sort"
 
-fn transform(xs: []int): []int {
-  // `mapped` is a free function, not a method: slices have no methods, and
-  // `map` is a reserved word (the map type).
-  return mapped<i64, i64>(xs, (x: i64) => x * 2)
-}
+const alphabet: string = "abcdefghijklmnopqrstuvwxyz0123456789"
 
-fn explicit(): (int, int) => int {
-  return (a: int, b: int) => a + b // explicit types
-}
-
-fn withBlock(): (int) => int {
-  return (x: int) => { // block body uses return
-    let y = x * x
-    return y + 1
+fn shortCode(n: int): string {
+  let out = []byte(0)
+  let x = n
+  while (x > 0 || len(out) == 0) {
+    out = append(out, alphabet[x % len(alphabet)])
+    x = x / len(alphabet)
   }
+  return string(out)
+}
+
+// Generates a code for every number in `ns` and remembers which number made
+// each one, so the codes can later be put back in that order.
+fn shortCodesFor(ns: []int): (map<string, int>, []string) {
+  let byCode = map<string, int>()
+  let codes = []string(0)
+  for n of ns {
+    let c = shortCode(n)
+    byCode[c] = n
+    codes = append(codes, c)
+  }
+  return byCode, codes
+}
+
+fn demo() {
+  let (byCode, codes) = shortCodesFor([]int{ 300, 5, 42 })
+  // (a: string, b: string) => byCode[a] < byCode[b] is an arrow function -
+  // a function value written inline. It closes over `byCode` from the
+  // enclosing scope, so `sorted` can compare codes by the number that made
+  // them without knowing anything about `byCode` itself.
+  let byNumber = sorted(codes, (a: string, b: string) => byCode[a] < byCode[b])
+  // byNumber is ["f", "gb", "mi"] - 5, 42, 300 in that order.
 }
 ```
 
-A `=> expression` body returns that expression; a `=> { ... }` block body uses
-`return`.
+`shortCodesFor` also shows a function returning more than one value: the
+result type is a tuple, `(map<string, int>, []string)`, and `let (byCode,
+codes) = ...` unpacks it.
+
+An arrow function with a `=> expression` body returns that expression
+directly. A `=> { ... }` body works like an ordinary function and needs its
+own `return`.
+
+## The real use case
+
+Stage 03 of the shortener puts `shortCode` to work: a `Link` still holds the
+URL, but the map key comes from `shortCode` instead of from a human.
+
+```bit
+class Link {
+  export url: string,
+  export created: i64,
+  export hits: int,
+}
+
+const alphabet: string = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+fn shortCode(n: int): string {
+  let out = []byte(0)
+  let x = n
+  while (x > 0 || len(out) == 0) {
+    out = append(out, alphabet[x % len(alphabet)])
+    x = x / len(alphabet)
+  }
+  return string(out)
+}
+
+fn main() {
+  let links = map<string, Link>()
+  let code = shortCode(12345)
+  links[code] = Link{ url: "https://example.com", created: 0, hits: 0 }
+
+  let l = links[code]
+  println("${code} -> ${l.url} (hits=${l.hits})")
+}
+// 7sj -> https://example.com (hits=0)
+```
 
 ## Control flow
 
-### `if` / `else`
-
-The condition is parenthesized; the body is always a brace block.
+Function bodies use the usual forms. `if`/`else` conditions and `while` and
+C-style `for` headers are parenthesized; every body is a brace block:
 
 ```bit
 fn classify(n: int): string {
@@ -182,42 +187,21 @@ fn classify(n: int): string {
     return "positive"
   }
 }
-```
 
-### `while`
-
-```bit
-fn countdown(n: int) {
-  while (n > 0) {
-    n -= 1
+fn sumUpTo(n: int): int {
+  let total = 0
+  let i = 0
+  while (i <= n) {
+    total += i
+    i += 1
   }
+  return total
 }
 ```
 
-### `for`
-
-Two documented forms: C-style counting and `for ... of` over a collection or
-channel. An empty `for { }` loops forever. (The grammar also reserves a
-`for ident in expr` form; its semantics are not yet fixed in the spec, so it is
-not documented here - this reference will add it when the spec does.)
-
-```bit
-fn loops(xs: []int, m: map<string, int>) {
-  for (let i = 0; i < len(xs); i++) { // C-style
-    // ...
-  }
-
-  for v of xs { // value iteration
-    // ...
-  }
-
-  for (k, val) of m { // key/value iteration over a map
-    // ...
-  }
-}
-```
-
-`break` exits the innermost loop; `continue` skips to the next iteration.
+`for ... of` walks a collection by value; over a map it gives back a
+`(key, value)` pair each time. `break` exits the innermost loop and
+`continue` skips to the next iteration:
 
 ```bit
 fn firstEven(xs: []int): int {
@@ -229,15 +213,21 @@ fn firstEven(xs: []int): int {
   }
   return -1
 }
+
+fn total(counts: map<string, int>): int {
+  let sum = 0
+  for (k, v) of counts {
+    sum += v
+  }
+  return sum
+}
 ```
 
-### `switch`
-
-An optional subject expression; each `case` may list several values. There is no
-implicit fallthrough.
+`switch` picks the first matching case, with no fallthrough, and a case can
+list several values:
 
 ```bit
-fn name(day: int): string {
+fn dayKind(day: int): string {
   switch (day) {
     case 0, 6:
       return "weekend"
@@ -249,18 +239,27 @@ fn name(day: int): string {
 }
 ```
 
-A subject-less `switch { case cond: ... }` chooses the first true case, replacing
-an `if`/`else` ladder.
+## Sharp edges
 
-## Expression statements
+A bare expression is only a valid statement when it can have an effect on
+its own - a call, a channel receive, or an error-propagation chain. A stray
+`a + b` with the result thrown away is a compile error, which catches typos
+that meant to call something:
 
-A bare expression is a valid statement only when it can have a standalone effect:
-a function call, a channel receive, or an error-propagation (`?`) chain. A lone
-`a + b` statement is a compile error, which catches mistakes.
-
-```bit
-fn effects() {
-  println("side effect") // ok: a call
-  // 1 + 2                 // error: no effect
+```bit ignore
+fn oops(a: int, b: int) {
+  a + b // error: expression statement has no effect
 }
 ```
+
+## When not to reach for a function
+
+If a value's behaviour only ever makes sense together with that value's own
+data, a method on a class reads better than a free function taking the
+value as its first argument - see [Classes](classes.md).
+
+## Next
+
+[Interfaces](interfaces.md): the shortener's storage is still a bare `map`,
+which means every future change to how links are stored has to touch
+`main` directly. Next: hiding that behind a `Store`.
