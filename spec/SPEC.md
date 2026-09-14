@@ -611,7 +611,9 @@ argument may be is decided per position.
 A **class** attribute sits on the compiler-known side. `@json` and `@table`
 (§10.5) are the only two the language defines, and any other name in that
 position is **E0136** - not an undefined-function error, because nothing here
-is a function call. Neither takes arguments; giving one any is **E0137**.
+is a function call. `@json` takes no arguments; giving it one is **E0137**.
+`@table` takes at most one - a table-name override (§10.5) - and a second
+argument is likewise **E0137**.
 
 **The one compiler-known FIELD attribute is `@key`** (§10.5). It is the single
 exception to the rule that a field attribute names a function: `@key("...")`
@@ -1103,6 +1105,27 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   `toJson` (E0138) and `validateFields` (E0132): letting the hand-written one
   win silently would make `@table` appear to work while `pkg/orm` never sees a
   field it does not already know about.
+- **`@table("...")` - a table-name override.** `@table` takes at most one
+  argument, a non-empty string literal (#5189): `@table("people")`. Anything
+  else that argument could be - an empty string, a non-literal expression, a
+  second argument - is **E0156**, naming the class; a second argument is
+  **E0137** at the position that defines the legal set (§10.3.1), before this
+  check ever runs. A class carrying `@table` gains a second synthesized
+  member alongside `tableDescriptor`
+
+  ```
+  tableAttrs(): []AttrDesc
+  ```
+
+  carrying `@table`'s own argument in the identical shape a field's recorded
+  attribute is - `[AttrDesc{ name: "table", args: ["people"] }]` when given,
+  `[]AttrDesc(0)` when `@table` carried none. The table's own name is not a
+  field, so it does not appear in `tableDescriptor`'s `[]FieldDesc` - that
+  return value stays exactly one entry per field. `pkg/orm`'s `tableName`
+  reads the override off `tableAttrs()` the same way `columnName` already
+  reads a field's `@column("...")` override off `FieldDesc.attrs`.
+- A class carrying `@table` that also declares `tableAttrs` itself is
+  **E0157**, naming both - the same rule as `tableDescriptor`'s own E0148.
 - The module declaring the class must import `FieldDesc` and `AttrDesc` from
   `"std/sql"` under those names; the member is written in terms of both.
   Without them the class is **E0150** and nothing is synthesized - the same
