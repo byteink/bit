@@ -1,0 +1,199 @@
+// E0217 `tx-captured-executor` (#5077, epic #5050). No import needed — module
+// files share one namespace and concatenate in bytewise filename order
+// (compiler/project.bit:7); this file sorts between compiler/lintprojectcheck.bit
+// and compiler/lintunused.bit. `lintTxExecutorEscape` is visible to
+// compiler/lintapply.bit's `runLintRules` and compiler/lint.bit's registry
+// regardless of where this file sorts (#3163: filename order controls only
+// diagnostic emission order and inlining depth, never name resolution).
+//
+// stdlib/sql/tx.bit's `tx`/`txAt`/`txValue`/`txValueAt` (plus their method
+// form on `Pool`, stdlib/sql/txmethods.bit's `Transactable` trait, and the
+// generic `Pool.txValue`/`Pool.txValueAt` in stdlib/sql/pool.bit) all share
+// one shape: a block `(Tx) => ...` run on the one connection the pool pinned
+// to the transaction. The documented call names that parameter `db`, which
+// SHADOWS whatever outer `Executor`/`Data` handle (pkg/orm/data.bit: `Data`
+// is a plain alias for `Executor`) started the transaction — the mistake
+// this rule catches is unwritable under that name. Naming the parameter
+// anything else (`t` is the ticket's own example) leaves the outer handle
+// reachable, and a write through it lands OUTSIDE the transaction: it
+// commits immediately, is never rolled back with the rest of the block, and
+// the failure is silent — nothing errors, the data is just inconsistent.
+//
+// DELIBERATELY SYNTACTIC, no type inference: this rule never asks "is this
+// identifier's static type Executor?" in general (the resolver
+// (compiler/symbols.bit) carries no type information at all, only
+// declarations — see #5053's own scoping comment on the same question for
+// rule 2). Instead it trusts the call shape itself: whichever expression is
+// passed as `tx`/`txAt`/`txValue`/`txValueAt`'s `db` parameter is
+// Executor-typed BY THAT FUNCTION'S OWN SIGNATURE, so if it type-checks at
+// all, it needed no separate proof here. Only a bare identifier is
+// considered "captured" (`getPool().tx(...)` has no name to re-use inside
+// the block and is silently out of scope, the same narrowness
+// compiler/lintappend.bit's E0214 accepts for its own parameter tracking).
+//
+// NARROW BY DESIGN, same append-aliasing shape: a local inside the block
+// that re-declares the outer name (`let pool = other; pool.save(a)`) is not
+// specially tracked — the false negative is accepted rather than chased,
+// since resolving it needs the same scoped name resolution the resolver
+// does not expose to lint rules today.
+
+const ecLintTxExecutorEscape = 217
+
+// `runLintRules` (compiler/lintapply.bit) dispatches every OTHER rule from a
+// single `if`/`else if` chain (its own doc comment: "the ONE place a rule is
+// dispatched"), but that function's complexity is already pinned at 22 in
+// tools/build/complexity-debt.txt, and paying debt down is never done by
+// raising an existing baseline (that file's own header). Enablement is
+// checked HERE instead, in a function of its own, so the call `runLintRules`
+// makes stays a single unconditional statement — zero added branches, zero
+// change to a number this rule is not the ticket to pay off.
+fn lintDispatchTxExecutorEscape(tree: Tree, src: string, file: int, cfg: LintConfig, d: Diagnostics) {
+  let idx = lintRuleIndex(lintRules(), "tx-captured-executor")
+  if (idx >= 0 && !cfg.disabled[idx]) {
+    lintTxExecutorEscape(tree, src, file, d)
+  }
+}
+
+// One call to `tx`/`txAt`/`txValue`/`txValueAt`, free-function or method
+// form, whose LAST argument is an arrow-function literal.
+fn lintTxExecutorEscape(tree: Tree, src: string, file: int, d: Diagnostics) {
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (getNode(tree, i).tag == Tag.Call) {
+      lintCheckTxCall(tree, src, file, i, d)
+    }
+    i = i + 1
+  }
+}
+
+fn lintIsTxCallName(name: string): bool {
+  return name == "tx" || name == "txAt" || name == "txValue" || name == "txValueAt"
+}
+
+// `call = [callee, type_args_or_none, args]` (compiler/parserexpr.bit's
+// `parsePostfix`). Unwraps one `arg`/`named_arg` item (never `arg_spread` —
+// a `db` or a block passed by `...` has no fixed position to trust).
+fn lintArgExprAt(tree: Tree, argsKids: []int, idx: int): int {
+  if (idx < 0 || idx >= len(argsKids)) {
+    return 0
+  }
+  let item = argsKids[idx]
+  let n = getNode(tree, item)
+  if (n.tag == Tag.Arg) {
+    return kidsOf(tree, item)[0]
+  }
+  if (n.tag == Tag.NamedArg) {
+    return kidsOf(tree, item)[1]
+  }
+  return 0
+}
+
+// The call's own method/function NAME and the `db` expression node it is
+// passing — `recv` for the method form (`pool.tx(f)`, never itself an
+// argument), `args[0]` for the free-function form (`tx(pool, f)`). "" / 0
+// when `callee` is neither shape this rule recognises.
+fn lintTxCallOuter(tree: Tree, src: string, calleeIdx: int, argsKids: []int): (string, int) {
+  let calleeNode = getNode(tree, calleeIdx)
+  if (calleeNode.tag == Tag.Member) {
+    let mk = kidsOf(tree, calleeIdx)
+    let nameIdx = mk[1]
+    if (nameIdx == 0) {
+      return "", 0
+    }
+    let nameNode = getNode(tree, nameIdx)
+    return src[nameNode.span.start:nameNode.span.end], mk[0]
+  }
+  if (calleeNode.tag == Tag.Ident) {
+    return src[calleeNode.span.start:calleeNode.span.end], lintArgExprAt(tree, argsKids, 0)
+  }
+  return "", 0
+}
+
+// The two nodes one qualifying tx call carries forward together, bundled so
+// `lintCheckTxClosure` stays at or under the 5-parameter limit (E0202)
+// rather than growing a 6th scalar parameter — the same reason
+// compiler/lintappend.bit's `LintAppendScope` exists.
+class TxEscapeCall {
+  outer: int,
+  closure: int,
+}
+
+fn lintCheckTxCall(tree: Tree, src: string, file: int, node: int, d: Diagnostics) {
+  let k = kidsOf(tree, node)
+  let argsKids = kidsOf(tree, k[2])
+  let (name, outerExpr) = lintTxCallOuter(tree, src, k[0], argsKids)
+  if (!lintIsTxCallName(name)) {
+    return
+  }
+  if (outerExpr == 0 || getNode(tree, outerExpr).tag != Tag.Ident) {
+    return // not a bare identifier — nothing captured under a name to re-use
+  }
+  let closureExpr = lintArgExprAt(tree, argsKids, len(argsKids) - 1)
+  if (closureExpr == 0 || getNode(tree, closureExpr).tag != Tag.ArrowFn) {
+    return
+  }
+  lintCheckTxClosure(tree, src, file, TxEscapeCall{ outer: outerExpr, closure: closureExpr }, d)
+}
+
+// `arrow_fn = [arrow_params, body]`, `arrow_params` holding `arrow_p = [name,
+// type_or_none]` nodes (compiler/parserlit.bit's `tryParenArrowFn`,
+// compiler/parserexpr.bit's single-ident form). Every `tx`-family block takes
+// exactly one parameter (`(Tx) => ...`); anything else cannot be the block
+// this rule means and is left alone.
+fn lintCheckTxClosure(tree: Tree, src: string, file: int, call: TxEscapeCall, d: Diagnostics) {
+  let ck = kidsOf(tree, call.closure)
+  let paramKids = kidsOf(tree, ck[0])
+  if (len(paramKids) != 1) {
+    return
+  }
+  let paramNameIdx = kidsOf(tree, paramKids[0])[0]
+  if (paramNameIdx == 0) {
+    return
+  }
+  let outerNode = getNode(tree, call.outer)
+  let outerName = src[outerNode.span.start:outerNode.span.end]
+  let paramNameNode = getNode(tree, paramNameIdx)
+  let paramName = src[paramNameNode.span.start:paramNameNode.span.end]
+  if (paramName == outerName) {
+    return // shadowed: the outer handle is unreachable by this name at all
+  }
+  let hit = lintFindIdentUse(tree, src, ck[1], outerName)
+  if (hit == 0) {
+    return
+  }
+  let hitNode = getNode(tree, hit)
+  warn(
+    d, ecLintTxExecutorEscape, Span{ file: file, start: hitNode.span.start, end: hitNode.span.end },
+    "'${outerName}' is used here, but this block already has its own transaction handle '${paramName}'",
+      "a write through the captured '${outerName}' runs OUTSIDE this transaction and is never rolled " +
+      "back with it; use '${paramName}' instead, or name the parameter '${outerName}' so it shadows " +
+      "the outer handle and the mistake cannot be written",
+  )
+}
+
+// The first `Tag.Ident` node under `node` whose text is `name`, or 0. A
+// `Tag.Member`'s second kid is a FIELD/METHOD NAME, never a value reference
+// (`x.pool` never reads a variable named `pool`), so only its receiver is
+// walked — the one shape this rule specifically must not misread as a use.
+fn lintFindIdentUse(tree: Tree, src: string, node: int, name: string): int {
+  if (node == 0) {
+    return 0
+  }
+  let n = getNode(tree, node)
+  if (n.tag == Tag.Ident) {
+    if (src[n.span.start:n.span.end] == name) {
+      return node
+    }
+    return 0
+  }
+  if (n.tag == Tag.Member) {
+    return lintFindIdentUse(tree, src, kidsOf(tree, node)[0], name)
+  }
+  for kid of kidsOf(tree, node) {
+    let hit = lintFindIdentUse(tree, src, kid, name)
+    if (hit != 0) {
+      return hit
+    }
+  }
+  return 0
+}

@@ -367,3 +367,25 @@ named like self-check helpers, e.g. `lintTestRead`, `rejectExternForTarget`,
 ```sh
 grep -c '^warning\[E0215\]' "$LOG"   # must be 0
 ```
+
+## E0217 `tx-captured-executor` - NOT REMEDIATION DEBT, NOT A DEFAULT ERROR
+
+> `'${name}' is used here, but this block already has its own transaction
+> handle '${param}'`
+
+New with #5077 (epic #5050, compiler/linttx.bit): like E0214
+`append-aliasing`, this is a correctness rule, not a readability one, and it
+is excluded from the "current findings, fix/raise/suppress" framing this
+document is otherwise for - there is no legacy debt to disposition, because
+the rule and the call shape it protects (`pool.tx((t) => { pool.save(a)? })`
+capturing the outer handle instead of using the block's own `t`) land in the
+same commit. `grep -c '^warning\[E0217\]' "$LOG"` against `compiler` and
+`stdlib` is 0 at landing and is expected to stay 0: a real finding here is a
+silent transaction bug, not a style objection, and the fix is always to use
+the block's own parameter (or name it so it shadows the outer handle, the
+documented safe form - see compiler/linttx.bit's own header).
+
+**Not added to any default-error escalation.** Like every other lint finding
+(compiler/lintapply.bit's own header), E0217 is severity=1 (warning) through
+`warn`, same as E0214 and everything else in this file - `bit lint`'s exit
+code is what a CI gate reads, never `bit build`'s.
