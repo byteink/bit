@@ -1,0 +1,340 @@
+// E0218 `relation-unloaded-read` (#5247, epic #5050, split from #5077 which
+// shipped rule 1 (E0217 `tx-captured-executor`, compiler/linttx.bit) and
+// proved this rule unbuildable that day: `@hasMany`/`@hasOne`/`@belongsTo`
+// were merely RECORDED strings then, so nothing could ask "is this field a
+// relation?". #5053 step 1 (compiler/classrelationattr.bit, merged 4a91fda2)
+// answers that at a field's DECLARATION — `fieldRelationAttr`/
+// `attrNameIsRelation`. It does not answer it at a READ site: this file
+// bridges the two the same way #5077's rule 1 bridges call shape to
+// Executor-ness, by trusting SOURCE SYNTAX rather than asking a resolver
+// that carries no type information (`compiler/symbols.bit`'s `Symbol` has no
+// type field, confirmed by linttx.bit's own header).
+//
+// THE SYNTACTIC ANCHOR. `std/sql/row.bit`'s `findOneOrFail<T>` is the one
+// function in this tree that hands back a single, concretely-typed entity —
+// `T` is written right there in the call (`findOneOrFail<User>(db, sql,
+// id)`), so which class a bound variable holds needs no inference at all,
+// only reading the type argument. `pkg/orm`'s own chain builder (`.where()`,
+// `.one()`, #5057) and eager-loading `.with()` (#5061) are both still `todo`
+// on epic #5050 — neither exists as a declared function anywhere in this
+// tree today (repo-wide grep, checked before writing this file). `bit lint`
+// never resolves a call's callee to a real declaration (`runLintRules`
+// above computes NOTHING but `LintUnusedAnalysis` from the resolver, and
+// only for the three `unused-*` rules), so a `.with("field")` call is
+// recognised by NAME alone, exactly as `linttx.bit`'s own `lintIsTxCallName`
+// trusts `tx`/`txAt`/`txValue`/`txValueAt` by name — the identical
+// methodology #5077's rule 1 used to sidestep the same missing type
+// information, not a new approximation invented for this rule. This is
+// consistent with this repo's own lint fixture precedent: rule 1's own
+// `lint_tx_escape_captured.bit` calls `pool.save(a)`, a method `Pool` does
+// not declare either (`pkg/orm`'s `save`/#5058 is also still `todo`) — a
+// `// lint exit=` fixture is graded by `bit lint` alone, never `bit build`,
+// so neither fixture needs its ORM calls to actually exist.
+//
+// SCOPE, mirroring #5077's own rule-2 description exactly: one function,
+// one binding, one chain. A binding whose initialiser is not literally
+// `findOneOrFail<T>(...)`, optionally wrapped in `.with("field")` links and
+// a trailing `?`, is not tracked — passing the entity through another
+// function, or pulling it out of a `find<T>` collection, are both outside
+// what this rule can see, the same accepted false negative `linttx.bit`
+// documents for a re-bound local. Reads are scanned only inside the SAME
+// `FuncDecl` the binding's `let` appears in, and only after that `let`'s own
+// span — `lintCollectFuncs`/`lintFuncInfo` (compiler/lintapply.bit) already
+// give every function's body without this file re-deriving it, and a
+// nested `FuncDecl`/`ArrowFn` inside that body is its own scope, not
+// descended into (mirrors `lintCollectFuncs`' own reason to treat a closure
+// as its own function: a variable inside it is not this function's binding).
+
+const ecLintRelationUnloadedRead = 218
+
+// The one function this rule recognises as producing a syntactically known
+// entity type — see this file's header for why `find<T>` (a collection) and
+// the not-yet-built chain builder are both out of scope.
+const relationFindFnName = "findOneOrFail"
+
+fn lintDispatchRelationUnloadedRead(
+  tree: Tree,
+  src: string,
+  file: int,
+  cfg: LintConfig,
+  d: Diagnostics,
+) {
+  let idx = lintRuleIndex(lintRules(), "relation-unloaded-read")
+  if (idx >= 0 && !cfg.disabled[idx]) {
+    lintRelationUnloadedRead(tree, src, file, d)
+  }
+}
+
+// One `let`-bound local this rule is tracking: the class it holds (found by
+// NAME among this file's own top-level classes — no cross-file resolution,
+// the same single-file reach `vStrayRelationAttrs` has), the field names its
+// own initialiser chain already `.with()`-loaded, and the source offset
+// after which a read counts (the binding's own `let`, so its initialiser's
+// `.with()` chain is never mistaken for a later read of itself).
+class RelationBinding {
+  varName: string,
+  className: string,
+  classDecl: int,
+  loadedFields: []string,
+  afterOffset: int,
+}
+
+// A parsed `findOneOrFail<T>(...)` chain: `T`'s own `Ident` node (0 when
+// `node` is not this shape at all) and every field name a `.with(...)` link
+// in the chain already named.
+class RelationLoadChain {
+  classIdent: int,
+  loadedFields: []string,
+}
+
+fn lintRelationUnloadedRead(tree: Tree, src: string, file: int, d: Diagnostics) {
+  for funcDecl of lintCollectFuncs(tree, tree.root, []int(0)) {
+    if (getNode(tree, funcDecl).tag != Tag.FuncDecl) {
+      continue // a closure is its own scope, walked separately as its own entry
+    }
+    let body = lintFuncInfo(tree, funcDecl).body
+    let bindings = lintCollectRelationBindings(tree, src, body, []RelationBinding(0))
+    if (len(bindings) == 0) {
+      continue
+    }
+    lintFlagUnloadedRelationReads(tree, src, body, bindings, d)
+  }
+}
+
+// True for a node this rule must not walk INTO when collecting bindings or
+// reads — a nested closure/function is its own scope, already visited as
+// its own top-level entry by `lintRelationUnloadedRead`'s own loop.
+fn lintIsNestedFuncBoundary(tag: Tag): bool {
+  return tag == Tag.FuncDecl || tag == Tag.ArrowFn
+}
+
+fn lintCollectRelationBindings(
+  tree: Tree, src: string, node: int, out: []RelationBinding,
+): []RelationBinding {
+  if (node == 0) {
+    return out
+  }
+  let n = getNode(tree, node)
+  if (lintIsNestedFuncBoundary(n.tag)) {
+    return out
+  }
+  if (n.tag == Tag.LetDecl) {
+    for b of kidsOf(tree, node) {
+      out = lintAddRelationBinding(tree, src, node, kidsOf(tree, b), out)
+    }
+    return out
+  }
+  for k of kidsOf(tree, node) {
+    out = lintCollectRelationBindings(tree, src, k, out)
+  }
+  return out
+}
+
+// `bindingKids = [pattern, type_or_none, init_or_none]` (compiler/parsertype.bit's
+// `parseOneBinding`). Appends nothing when the pattern is not a simple name,
+// there is no initialiser, or the initialiser is not a `findOneOrFail<T>`
+// chain this file's header scopes to.
+fn lintAddRelationBinding(
+  tree: Tree, src: string, letNode: int, bindingKids: []int, out: []RelationBinding,
+): []RelationBinding {
+  let pattern = bindingKids[0]
+  let init = bindingKids[2]
+  if (pattern == 0 || init == 0 || getNode(tree, pattern).tag != Tag.Ident) {
+    return out
+  }
+  let chain = lintParseRelationLoadChain(tree, src, lintUnwrapTry(tree, init))
+  if (chain.classIdent == 0) {
+    return out
+  }
+  let className = identText(tree, src, chain.classIdent)
+  let classDecl = lintFindClassDeclByName(tree, src, className)
+  if (classDecl == 0) {
+    return out
+  }
+  // bit:lint allow E0214 -- out is lintCollectRelationBindings' accumulator, reassigned by every caller from the return value
+  return append(
+    out,
+    RelationBinding{
+      varName: identText(tree, src, pattern), className: className, classDecl: classDecl,
+      loadedFields: chain.loadedFields, afterOffset: getNode(tree, letNode).span.end,
+    },
+  )
+}
+
+fn lintUnwrapTry(tree: Tree, node: int): int {
+  if (node != 0 && getNode(tree, node).tag == Tag.TryExpr) {
+    return kidsOf(tree, node)[0]
+  }
+  return node
+}
+
+// Recognises `findOneOrFail<T>(...)` and any number of `.with("field")`
+// links chained onto it, in either order relative to unwrapping. Returns
+// `classIdent: 0` for any other shape — the accepted false negative this
+// file's header names.
+fn lintParseRelationLoadChain(tree: Tree, src: string, node: int): RelationLoadChain {
+  let none = RelationLoadChain{ classIdent: 0, loadedFields: []string(0) }
+  if (node == 0 || getNode(tree, node).tag != Tag.Call) {
+    return none
+  }
+  let k = kidsOf(tree, node)
+  let calleeNode = getNode(tree, k[0])
+  if (calleeNode.tag == Tag.Ident) {
+    if (src[calleeNode.span.start:calleeNode.span.end] != relationFindFnName) {
+      return none
+    }
+    return lintRelationFindChainBase(tree, k[1])
+  }
+  if (calleeNode.tag == Tag.Member) {
+    return lintRelationWithLink(tree, src, k, kidsOf(tree, k[0]))
+  }
+  return none
+}
+
+// `findOneOrFail<T>`'s own `TypeArgs` node: `T`'s `Ident` when there is
+// exactly one type argument and it is a plain name, `none` otherwise (a
+// qualified or generic-instantiated type argument is out of scope — the
+// class this rule looks up is always a bare top-level name).
+fn lintRelationFindChainBase(tree: Tree, targs: int): RelationLoadChain {
+  let none = RelationLoadChain{ classIdent: 0, loadedFields: []string(0) }
+  if (targs == 0) {
+    return none
+  }
+  let tk = kidsOf(tree, targs)
+  if (len(tk) != 1 || getNode(tree, tk[0]).tag != Tag.Ident) {
+    return none
+  }
+  return RelationLoadChain{ classIdent: tk[0], loadedFields: []string(0) }
+}
+
+// One `.with("field")` link: `callKids = [callee, targs_or_none, args]`,
+// `memberKids = [receiver, nameIdent]` for that same callee. Recurses into
+// `receiver` for the rest of the chain, then prepends this link's own field
+// name — `none` when the callee is not literally named `with`, or its first
+// argument is not a string literal.
+fn lintRelationWithLink(
+  tree: Tree, src: string, callKids: []int, memberKids: []int,
+): RelationLoadChain {
+  let none = RelationLoadChain{ classIdent: 0, loadedFields: []string(0) }
+  let nameIdx = memberKids[1]
+  if (nameIdx == 0) {
+    return none
+  }
+  let nameNode = getNode(tree, nameIdx)
+  if (src[nameNode.span.start:nameNode.span.end] != "with") {
+    return none
+  }
+  let arg = lintArgExprAt(tree, kidsOf(tree, callKids[2]), 0)
+  if (arg == 0 || getNode(tree, arg).tag != Tag.StringLit) {
+    return none
+  }
+  let inner = lintParseRelationLoadChain(tree, src, memberKids[0])
+  if (inner.classIdent == 0) {
+    return none
+  }
+  return RelationLoadChain{
+    classIdent: inner.classIdent,
+    loadedFields: append(inner.loadedFields, stringLitText(src, getNode(tree, arg).span)),
+  }
+}
+
+// The current module's own top-level class named `name`, or 0 — no
+// cross-file resolution, the same single-file reach `classrelationattr.bit`'s
+// `vStrayRelationAttrs` has over `topClassDecls`.
+fn lintFindClassDeclByName(tree: Tree, src: string, name: string): int {
+  for tc of topClassDecls(tree) {
+    if (identText(tree, src, kidsOf(tree, tc.decl)[0]) == name) {
+      return tc.decl
+    }
+  }
+  return 0
+}
+
+fn lintFlagUnloadedRelationReads(
+  tree: Tree, src: string, node: int, bindings: []RelationBinding, d: Diagnostics,
+) {
+  if (node == 0) {
+    return
+  }
+  let n = getNode(tree, node)
+  if (lintIsNestedFuncBoundary(n.tag)) {
+    return
+  }
+  if (n.tag == Tag.Member) {
+    lintCheckRelationMemberRead(tree, src, node, bindings, d)
+  }
+  for k of kidsOf(tree, node) {
+    lintFlagUnloadedRelationReads(tree, src, k, bindings, d)
+  }
+}
+
+// `node` is `Tag.Member = [receiver, nameIdent]`. Flags the first tracked
+// binding `node` reads a relation field of, past that binding's own `let`
+// and not among the field names its own chain already `.with()`-loaded.
+fn lintCheckRelationMemberRead(
+  tree: Tree, src: string, node: int, bindings: []RelationBinding, d: Diagnostics,
+) {
+  let k = kidsOf(tree, node)
+  let recv = k[0]
+  let nameIdx = k[1]
+  if (recv == 0 || nameIdx == 0 || getNode(tree, recv).tag != Tag.Ident) {
+    return
+  }
+  let varName = identText(tree, src, recv)
+  let fieldName = identText(tree, src, nameIdx)
+  let readStart = getNode(tree, node).span.start
+  for b of bindings {
+    if (b.varName != varName || readStart <= b.afterOffset) {
+      continue
+    }
+    if (!lintFieldIsRelation(tree, src, b.classDecl, fieldName) ||
+      lintContainsString(b.loadedFields, fieldName)) {
+      continue
+    }
+    reportRelationUnloadedRead(d, getNode(tree, node).span, varName, fieldName, b.className)
+    return
+  }
+}
+
+// The field named `fieldName` on `classDecl`, or 0. Mirrors
+// `classrelationattr.bit`'s `vStrayRelationAttrs` member walk exactly.
+fn lintFieldByName(tree: Tree, src: string, classDecl: int, fieldName: string): int {
+  for m of kidsOf(tree, kidsOf(tree, classDecl)[2]) {
+    let f = memberField(tree, m)
+    if (f == 0) {
+      continue
+    }
+    if (identText(tree, src, kidsOf(tree, f)[0]) == fieldName) {
+      return f
+    }
+  }
+  return 0
+}
+
+// The real compiler-known predicate (#5053 step 1), never a string match on
+// the field's own type or name — that approximation is exactly what this
+// ticket's constraints forbid.
+fn lintFieldIsRelation(tree: Tree, src: string, classDecl: int, fieldName: string): bool {
+  let field = lintFieldByName(tree, src, classDecl, fieldName)
+  if (field == 0) {
+    return false
+  }
+  return fieldRelationAttr(tree, src, field) != 0
+}
+
+// `lintContainsString` (compiler/lintappend.bit) already gives the field-name
+// membership test this rule needs — reused as-is, not redeclared.
+
+// Wording agrees with #5053's own required panic text (its acceptance: "a
+// message containing the class name, the field name and the literal text
+// `.with(\"orders\")`") so a developer who sees one recognises the other.
+fn reportRelationUnloadedRead(
+  d: Diagnostics, span: Span, varName: string, fieldName: string, className: string,
+) {
+  warn(
+    d, ecLintRelationUnloadedRead, span,
+    "'${varName}.${fieldName}' reads relation field '${fieldName}' on '${className}' with no preceding '.with(\"${fieldName}\")' in this function",
+      "load it first: add '.with(\"${fieldName}\")' to the query that produced '${varName}' -- an unloaded " +
+      "relation read panics at run time naming the same field and call (#5053)",
+  )
+}

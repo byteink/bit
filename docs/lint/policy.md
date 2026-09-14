@@ -389,3 +389,25 @@ documented safe form - see compiler/linttx.bit's own header).
 (compiler/lintapply.bit's own header), E0217 is severity=1 (warning) through
 `warn`, same as E0214 and everything else in this file - `bit lint`'s exit
 code is what a CI gate reads, never `bit build`'s.
+
+## E0218 `relation-unloaded-read` - NOT REMEDIATION DEBT, NOT A DEFAULT ERROR
+
+> `'${var}.${field}' reads relation field '${field}' on '${class}' with no
+> preceding '.with("${field}")' in this function`
+
+New with #5247 (epic #5050, compiler/lintrelation.bit), the compile-time half
+of #5053's runtime panic on the same misuse - the two are meant to be
+recognisable as the same mistake, so their wording agrees on naming the
+class, the field, and the exact `.with("field")` call that is missing.
+Scoped narrowly, on purpose: it only sees a local bound straight from
+`findOneOrFail<T>(...)` (`T` written as an explicit type argument, needing no
+type inference the resolver cannot give it - see the file's own header) and
+only flags a read of that local's relation field, per
+`compiler/classrelationattr.bit`'s compiler-known predicate, later in the
+SAME function and not among the fields a `.with("field")` link already
+chained onto that same binding. Like E0217, there is no legacy debt to
+disposition: `grep -c '^warning\[E0218\]' "$LOG"` against `compiler` and
+`stdlib` is 0 at landing and is expected to stay 0.
+
+**Not added to any default-error escalation.** Severity=1 (warning) through
+`warn`, same as every other rule in this file.
