@@ -15,18 +15,24 @@
 //
 // THE CORE TRICK, so the functions below read as one idea rather than a pile
 // of bit-twiddling: `decimal`'s 96-bit magnitude, once both operands are
-// scaled to agree, is added as an ordinary TWO'S-COMPLEMENT 96-bit integer —
-// negate the operand that is negative, add, then read the sign back off bit
-// 95 of the sum. That sidesteps every "which side is bigger, so which way do
-// we subtract, so what sign does a zero result get" branch a sign-magnitude
-// adder needs, because two's-complement addition already answers all of that
-// uniformly: `(-5) + 3` and `5 + (-3)` are the same one code path, and a
-// same-sign input pair whose sum flips sign is exactly the overflow this
-// slice must panic on (the classic CPU-flag overflow test, reused rather than
-// a second detector). Comparison reuses the identical core: `a - b`'s sign
-// (with the special case that comparison must never PANIC on the internal
-// 96-bit overflow this trick can hit even for two in-range operands, since
-// their exact difference can need up to 97 bits) decides the ordering.
+// scaled to agree, is added SIGN-MAGNITUDE — same-sign operands add their
+// (unsigned) magnitudes, opposite-sign operands subtract the smaller
+// magnitude from the larger, mirroring the unsigned compare/subtract
+// `emitPairCmpGe`/`emitPairSub` (lowerdecimaldiv.bit) already use for
+// division. A two's-complement reading of the raw magnitude (negate the
+// negative operand, add, read the sign back off bit 95 of the sum) looks
+// simpler but is only valid for magnitudes below 2^95 — half the type's
+// documented 96-bit range has bit 95 set on its own unsigned bit pattern, so
+// that trick reads a perfectly positive magnitude as already negative
+// (#5288). Same-sign addition is the only arm that can overflow the type's
+// 96-bit ceiling (checked with a real carry-out of bit 95, not a sign
+// flip); opposite-sign subtraction is always exact. Comparison reuses the
+// identical core: `a - b`'s sign (via `a + (-b)`) decides the ordering,
+// with the special case that comparison must never PANIC on a same-sign
+// magnitude sum this core can hit even for two in-range operands, since
+// their exact difference can need up to 97 bits — the sum's sign is still
+// well-defined in that case (it is simply the operands' shared sign), so
+// only `lowerDecimalAdd`'s own overflow panic needs the carry-out check.
 
 // ---- small emission helpers, shared by everything below -------------------
 
@@ -269,37 +275,15 @@ fn emitDecimalAlign(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): DecimalA
   return DecimalAligned{ loA: loAa, mantA: mantAa, loB: loBa, mantB: mantBa, scale: resultScale }
 }
 
-// ---- 96-bit two's-complement core, shared by add/sub and comparison -------
+// ---- sign-magnitude core, shared by add/sub and comparison ----------------
 
-// Two's-complement negation of a 96-bit magnitude held as (`lo`: bits 0-63,
-// `m`: bits 64-95 in its own low 32 bits, its high 32 always zero) — `~x + 1`,
-// masked back to 96 bits (a no-op for every input this ever receives, since
-// `m` is already < 2^32 on the way in).
-fn emitDecNegPair(fc: FnCtx, lo: int, m: int): (int, int) {
-  let i64ty = primType(fc.c.ctx, 3)
-  let mask32 = emitI64Const(fc, 4294967295)
-  let notLo = emitBin(fc, Op.BXor, i64ty, lo, emitI64Const(fc, 0 - 1))
-  let notM = emitBin(fc, Op.BXor, i64ty, m, mask32)
-  let newLo = emitBin(fc, Op.Add, i64ty, notLo, emitI64Const(fc, 1))
-  let wrapped = emitBin(fc, Op.ICmpEq, primType(fc.c.ctx, 10), newLo, emitI64Const(fc, 0))
-  let carry = emitCondVal(fc, wrapped, i64ty, emitI64Const(fc, 1), emitI64Const(fc, 0))
-  let newM = emitBin(fc, Op.BAnd, i64ty, emitBin(fc, Op.Add, i64ty, notM, carry), mask32)
-  return (newLo, newM)
-}
-
-// `(lo, m)` if `isNeg` is false, its two's-complement negation otherwise.
-// Negation is pure and cheap, so both are computed unconditionally and
-// selected — never a real branch, unlike everything that can panic or loop.
-fn emitDecSignedPair(fc: FnCtx, lo: int, m: int, isNeg: int): (int, int) {
-  let i64ty = primType(fc.c.ctx, 3)
-  let (negLo, negM) = emitDecNegPair(fc, lo, m)
-  return (emitCondVal(fc, isNeg, i64ty, negLo, lo), emitCondVal(fc, isNeg, i64ty, negM, m))
-}
-
-// Unsigned 96-bit add, mod 2^96 (a carry out of bit 95 is simply dropped —
-// expected in two's-complement arithmetic; whether that dropped carry means
-// the true, unbounded result overflowed is `emitDecimalAddCore`'s job below,
-// via the sign of the inputs vs. the sign of this sum, not this function's).
+// Unsigned 96-bit add, mod 2^96 — a carry out of bit 95 is simply dropped.
+// The only caller that can legally hit that dropped carry is
+// `emitDecimalDivRound`'s (lowerdecimaldiv.bit) `quotient + 1`, which panics
+// first whenever the quotient is already the maximum representable
+// magnitude, so the drop is unreachable there; `emitDecimalAddCore` below
+// does its own carry-out check rather than calling this, since dropping the
+// carry is exactly what it must not do.
 fn emitDecAddPair(fc: FnCtx, loA: int, mA: int, loB: int, mB: int): (int, int) {
   let i64ty = primType(fc.c.ctx, 3)
   let sumLo = emitBin(fc, Op.Add, i64ty, loA, loB)
@@ -310,15 +294,14 @@ fn emitDecAddPair(fc: FnCtx, loA: int, mA: int, loB: int, mB: int): (int, int) {
   return (sumLo, sumM)
 }
 
-// The result of adding two decimals' ALIGNED magnitudes as signed 96-bit
-// two's-complement values: the raw sum, its scale, the sum's own sign bit
-// (`neg`, bit 95 — meaningless alone if the addition overflowed), whether the
-// two operands' true sign agreed with it (`agrees` — false means overflow,
-// by the standard rule: adding two same-signed values can only produce a
-// result of the opposite sign by overflowing), whether the raw sum is exactly
-// zero, and the input operands' shared sign (`inputSign`, valid only when
-// they in fact agreed — the fallback a comparison uses to recover the TRUE
-// sign of an internally-overflowed difference without panicking on it).
+// The result of adding two decimals' ALIGNED magnitudes sign-magnitude: the
+// raw result magnitude (`lo`/`m`), its scale, its true sign (`neg` — correct
+// even when `agrees` is false, since the sign of a same-sign sum is the
+// operands' shared sign regardless of whether the magnitude overflowed), and
+// whether the magnitude add genuinely overflowed the type's 96-bit ceiling
+// (`agrees` — false only for a same-sign magnitude sum that carries out of
+// bit 95; opposite-sign subtraction is always exact), and whether the raw
+// result is exactly zero.
 class DecimalSum {
   lo: int,
   m: int,
@@ -326,7 +309,6 @@ class DecimalSum {
   neg: int,
   agrees: int,
   isZero: int,
-  inputSign: int,
 }
 
 fn emitDecimalAddCore(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): DecimalSum {
@@ -334,30 +316,51 @@ fn emitDecimalAddCore(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): Decima
   let boolTy = primType(fc.c.ctx, 10)
   let signA = decIsNeg(fc, hiA)
   let signB = decIsNeg(fc, hiB)
+  let sameSign = emitBin(fc, Op.ICmpEq, boolTy, signA, signB)
   let aligned = emitDecimalAlign(fc, loA, hiA, loB, hiB)
-  let (sLoA, sMA) = emitDecSignedPair(fc, aligned.loA, aligned.mantA, signA)
-  let (sLoB, sMB) = emitDecSignedPair(fc, aligned.loB, aligned.mantB, signB)
-  let (sumLo, sumM) = emitDecAddPair(fc, sLoA, sMA, sLoB, sMB)
-  let resultNeg = emitBin(fc, Op.ICmpSge, boolTy, sumM, emitI64Const(fc, 2147483648))
-  let sameOperandSign = emitBin(fc, Op.ICmpEq, boolTy, signA, signB)
-  let matches = emitBin(fc, Op.ICmpEq, boolTy, resultNeg, signA)
-  let agrees = emitCondVal(fc, sameOperandSign, boolTy, matches, emitBoolConst(fc, true))
+
+  // Same sign: magnitudes ADD. The true sum can need a 97th bit — checked
+  // with a real carry-out of the unsigned add, since bit 95 of the low-32
+  // masked result is not a sign bit (#5288).
+  let (addLo, addCarry) = emitAddWithCarry(fc, aligned.loA, aligned.loB)
+  let addMRaw = emitBin(
+    fc, Op.Add, i64ty, emitBin(fc, Op.Add, i64ty, aligned.mantA, aligned.mantB), addCarry,
+  )
+  let addOk = emitBin(
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.LShr, i64ty, addMRaw, emitI64Const(fc, 32)),
+    emitI64Const(fc, 0),
+  )
+  let addM = emitBin(fc, Op.BAnd, i64ty, addMRaw, emitI64Const(fc, 4294967295))
+
+  // Opposite sign: magnitudes SUBTRACT, larger minus smaller — always exact,
+  // mirroring `emitPairCmpGe`/`emitPairSub` (lowerdecimaldiv.bit).
+  let ge = emitPairCmpGe(fc, aligned.loA, aligned.mantA, aligned.loB, aligned.mantB)
+  let (subLoGe, subMGe) = emitPairSub(fc, aligned.loA, aligned.mantA, aligned.loB, aligned.mantB)
+  let (subLoLt, subMLt) = emitPairSub(fc, aligned.loB, aligned.mantB, aligned.loA, aligned.mantA)
+  let subLo = emitCondVal(fc, ge, i64ty, subLoGe, subLoLt)
+  let subM = emitCondVal(fc, ge, i64ty, subMGe, subMLt)
+  let subSign = emitCondVal(fc, ge, boolTy, signA, signB)
+
+  let resultLo = emitCondVal(fc, sameSign, i64ty, addLo, subLo)
+  let resultM = emitCondVal(fc, sameSign, i64ty, addM, subM)
+  let resultNeg = emitCondVal(fc, sameSign, boolTy, signA, subSign)
+  let agrees = emitCondVal(fc, sameSign, boolTy, addOk, emitBoolConst(fc, true))
   let isZero = emitBin(
-    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, sumLo, sumM), emitI64Const(fc, 0),
+    fc, Op.ICmpEq, boolTy, emitBin(fc, Op.BOr, i64ty, resultLo, resultM), emitI64Const(fc, 0),
   )
   return DecimalSum{
-    lo: sumLo, m: sumM, scale: aligned.scale, neg: resultNeg, agrees: agrees, isZero: isZero,
-    inputSign: signA,
+    lo: resultLo, m: resultM, scale: aligned.scale, neg: resultNeg, agrees: agrees, isZero: isZero,
   }
 }
 
 // ---- binary `+` / `-` --------------------------------------------------------
 
-// `a + b`: aligns, adds as signed 96-bit two's complement, panics if that
-// overflowed, then converts the sum back to sign-magnitude — negating it
-// (and marking it negative) only when the sum's own sign bit says so, which
-// also gives a `0` result the canonical positive-zero bit pattern for free
-// (zero's sign bit is always clear, whichever operands produced it).
+// `a + b`: aligns, adds sign-magnitude, panics if that overflowed, then
+// composes the result's hi word — marking it negative only when the sum's
+// own true sign says so, and forcing a `0` result to the canonical
+// positive-zero bit pattern (mirroring `lowerDecimalMultiply`'s identical
+// `isZero` override below), since a same-magnitude opposite-sign subtraction
+// can otherwise land on the larger operand's sign at an exact-zero result.
 fn lowerDecimalAdd(fc: FnCtx, a: int, b: int): int {
   let ctx = fc.c.ctx
   let i64ty = primType(ctx, 3)
@@ -366,12 +369,10 @@ fn lowerDecimalAdd(fc: FnCtx, a: int, b: int): int {
   let bw = explodeValueWords(ctx, fc.b, b, words)
   let sum = emitDecimalAddCore(fc, aw[0], aw[1], bw[0], bw[1])
   emitDecimalOverflowPanic(fc, sum.agrees)
-  let (negLo, negM) = emitDecNegPair(fc, sum.lo, sum.m)
-  let magLo = emitCondVal(fc, sum.neg, i64ty, negLo, sum.lo)
-  let magM = emitCondVal(fc, sum.neg, i64ty, negM, sum.m)
   let signMasked = emitCondVal(fc, sum.neg, i64ty, emitSignBitConst(fc), emitI64Const(fc, 0))
-  let resultHi = decComposeHi(fc, magM, sum.scale, signMasked)
-  return buildTuple(fc, decimalTupleType(ctx), [magLo, resultHi])
+  let finalSignMasked = emitCondVal(fc, sum.isZero, i64ty, emitI64Const(fc, 0), signMasked)
+  let resultHi = decComposeHi(fc, sum.m, sum.scale, finalSignMasked)
+  return buildTuple(fc, decimalTupleType(ctx), [sum.lo, resultHi])
 }
 
 // `a + b` / `a - b` (§12, precedence row 5). `-` is `a + (-b)`, reusing
@@ -420,10 +421,11 @@ fn lowerDecimalBinary(fc: FnCtx, node: int, hint: int, n: Node): int {
 // `hi` with its sign bit flipped, leaving scale and mantissa untouched — the
 // comparison path's stand-in for negating a whole decimal VALUE without the
 // canonical-zero guard `lowerDecimalNegate` pays for: flipping a zero
-// magnitude's sign bit here is harmless, because `emitDecSignedPair` reads
-// that flipped bit only to decide whether to two's-complement-negate the
-// magnitude, and negating zero is zero either way — the bogus "negative
-// zero" this could momentarily represent never escapes this function.
+// magnitude's sign bit here is harmless, because `emitDecimalAddCore` only
+// ever reads that flipped bit to classify same-sign vs. opposite-sign, and
+// either classification of a zero magnitude still nets the correct magnitude
+// and sign out of that core — the bogus "negative zero" this could
+// momentarily represent never escapes this function.
 fn emitFlippedSignHi(fc: FnCtx, hi: int): int {
   return emitBin(fc, Op.BXor, primType(fc.c.ctx, 3), hi, emitSignBitConst(fc))
 }
@@ -433,20 +435,18 @@ fn emitFlippedSignHi(fc: FnCtx, hi: int): int {
 // same three-way shape from `string_cmp`). Reuses `emitDecimalAddCore`
 // rather than a second, magnitude-comparing mechanism — with one correction
 // it does not need: `a`'s and `-b`'s exact difference can need up to 97 bits
-// (each operand's magnitude alone fits 96), so the core's internal 96-bit
-// "overflow" here is not a real arithmetic fault to panic on, only a sign
-// this function has to recover. `agrees == false` fires exactly when `a` and
-// `-b` share a sign and the sum flipped it — which can only happen by
-// genuinely exceeding the 96-bit range in that shared direction, so the
-// shared input sign (`inputSign`) IS the true sign of the difference in that
-// case, and the true difference is then certainly nonzero.
+// (each operand's magnitude alone fits 96), so the core's `agrees` (false
+// only for a same-sign magnitude sum overflowing 96 bits) is not a real
+// arithmetic fault to panic on here, only a signal that the true difference
+// is certainly nonzero — `diff.neg` itself is already correct in that case
+// too, since a same-sign sum's sign is the operands' shared sign regardless
+// of whether the magnitude overflowed, so this needs no separate fallback.
 fn emitDecimalCompareSign(fc: FnCtx, loA: int, hiA: int, loB: int, hiB: int): int {
   let i64ty = primType(fc.c.ctx, 3)
   let boolTy = primType(fc.c.ctx, 10)
   let diff = emitDecimalAddCore(fc, loA, hiA, loB, emitFlippedSignHi(fc, hiB))
-  let trueNeg = emitCondVal(fc, diff.agrees, boolTy, diff.neg, diff.inputSign)
   let trueZero = emitCondVal(fc, diff.agrees, boolTy, diff.isZero, emitBoolConst(fc, false))
-  let nonZeroOrd = emitCondVal(fc, trueNeg, i64ty, emitI64Const(fc, 0 - 1), emitI64Const(fc, 1))
+  let nonZeroOrd = emitCondVal(fc, diff.neg, i64ty, emitI64Const(fc, 0 - 1), emitI64Const(fc, 1))
   return emitCondVal(fc, trueZero, i64ty, emitI64Const(fc, 0), nonZeroOrd)
 }
 
