@@ -80,6 +80,7 @@ envscope_bucket_for_tree() {
     stdlib) printf 'stdlib\n' ;;
     examples) printf 'examples\n' ;;
     pkg) printf 'pkg\n' ;;
+    docs) printf 'docs\n' ;;
     _tests_/cases) printf 'testcases\n' ;;
     _tests_/bit | _tests_/stress | _tests_/imports) printf 'testsbit\n' ;;
     *) return 1 ;;
@@ -102,8 +103,9 @@ envscope_bucket_for_tree() {
 #
 # SCOPE, STATED PRECISELY, so nobody assumes this catches more than it does:
 # this only covers a gate whose tree list is spelled out in gates.bit's own
-# env — today that is exactly the four BIT_FMTZERO_TREES gates
-# (test-fmt-strict/-stress/-testsbit/-cases). The other six gates #4445's
+# env — today that is exactly the five BIT_FMTZERO_TREES gates
+# (test-fmt-strict/-stress/-testsbit/-cases/-docs, #5298 added the last).
+# The other six gates #4445's
 # audit found dark (test-lint-self, test-lint-complexity, test-lint-sweep,
 # test-lint-tests, test-fmt-roundtrip, test-threadtokenbytes,
 # test-version-cli) declare their scope as a dirNames array or similar INSIDE
