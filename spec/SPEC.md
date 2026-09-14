@@ -3501,7 +3501,26 @@ A value of type `S` is assignable to a location of type `T` if:
   ```
 
   Parameters stay invariant - contravariance there is sound in principle but
-  is a separate rule this spec does not yet make; or
+  is a separate rule this spec does not yet make. The same covariance holds
+  one layer inside `!`: if both results are fallible, `S`'s result is
+  assignable to `T`'s result when their error types are identical and `S`'s
+  ok type is assignable to `T`'s ok type by this same rule - the error type
+  never widens, only the ok type does:
+
+  ```bit
+  interface Reply { intoRes(): int }
+  class Res { code: int
+    export intoRes(): int { return this.code } }
+  fn old(x: int): Res! { return Res{ code: x } }
+  fn takesHandler(h: (int) => Reply!): int {
+    let r = h(1) catch _ { panic("unreachable") }
+    return r.intoRes()
+  }
+  fn main() { print("${takesHandler(old)}\n") }
+  ```
+
+  Nesting stops at one `!`: a fallible function never returns another
+  fallible value, so this recursion does not go deeper; or
 - `S` is an untyped constant (§15.4) representable in `T`; or
 - `S` is `nil` and `T` is a reference type.
 
@@ -3548,7 +3567,9 @@ Method sets:
   to the same class-or-enum representation rule above - a function declared
   to return a bare-tag enum does not become assignable to an interface
   result, for exactly the reason a bare-tag enum value does not satisfy one
-  directly.
+  directly. This applies one layer inside `!` too: `(P) => S!` is assignable
+  to `(P) => I!` under the same conditions, checked against `S`, the ok type -
+  a fallible function returning a bare-tag enum is rejected the same way.
 
 ### 14.4 Type Assertions
 
