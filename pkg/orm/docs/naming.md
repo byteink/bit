@@ -21,17 +21,27 @@ Then the pluralised name is snake_cased: `OrderLine` -> `OrderLines` ->
 This gets `Person` -> `persons`, which is the wrong English word for it. That
 is accepted on purpose: an irregular-noun list is English-only and turns
 into a permanent stream of "why is this noun handled and not that one"
-reports. Pass the real name explicitly instead:
+reports. Write the real name on the class instead, with `@table("...")`'s
+own argument:
 
 ```bit
 import { tableName } from "orm"
 import { FieldDesc, AttrDesc } from "std/sql"
 
+@table("people") class Person {
+  id: i64
+}
+
 fn showTableNames() {
-  println(tableName("Person", "people")) // "people"
-  println(tableName("Person", ""))       // "persons" - the four rules, no override
+  println(tableName("Person", Person{ id: 0 }.tableAttrs())) // "people"
+  println(tableName("Order", []AttrDesc(0)))                 // "orders" - the four rules, no override
 }
 ```
+
+`tableName`'s second argument is the class's own synthesized
+`tableAttrs(): []AttrDesc` - `@column`'s counterpart for the class itself,
+carrying `@table`'s argument the identical way a field's `@column("...")`
+override reaches `FieldDesc.attrs`.
 
 ## Column names
 
