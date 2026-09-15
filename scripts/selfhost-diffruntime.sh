@@ -126,11 +126,26 @@ ATOMIC_MNEMONICS='ldar|ldarb|ldarh|ldaxr|ldaxrb|ldaxrh|ldapr|ldaprb|ldaprh|ldaxp
 # discriminators, not one mnemonic list:
 #
 #   RMW/CAS: `lock (xadd|cmpxchg) %REG,` — register class is the width.
-#   STORE:   a `mov %REG,MEM` immediately followed by `mfence` — register
-#            class of the mov's SOURCE operand is the width. Adjacency is
-#            safe because `xMfence` (compiler/x64select.bit) has exactly one
-#            call site, `xEmitAtomicStore`, and emits nothing between the
-#            mov and the fence.
+#   STORE:   EITHER a `mov %REG,MEM` immediately followed by `mfence`, OR a
+#            single `xchg %REG,MEM` — both are seq-cst stores and both report
+#            the width in the register operand's class. Adjacency is safe in
+#            the first form because nothing is emitted between the mov and the
+#            fence.
+#
+# BOTH STORE FORMS ARE MATCHED BECAUSE THE TWO SIDES DISAGREE ACROSS ONE
+# RE-PIN (#5317). `xEmitAtomicStore` emitted `mov`+`mfence` until #5317 and
+# emits `xchg` after it — `xchg` with a memory operand is implicitly `lock`ed,
+# so it is the same full barrier in one instruction at 2.3x less cost (the
+# measurement is on `xEmitAtomicStore`). This differential runs the PINNED
+# STAGE0 against the tree, so for exactly one release the oracle emits the old
+# form and the tree the new one. Normalising both to `store <class>` is what
+# keeps that from reading as a divergence — the width, which is the whole
+# invariant (#2569), is identical in both forms and is still compared.
+#
+# `AtomicRmwXchg` emits `xchg` too, so it now lands in the `store` bucket. It
+# does so on BOTH sides, so it can produce neither a false red nor a false
+# green; before #5317 it matched nothing at all and was simply absent from the
+# signature, so this is a widening of what is covered, not a narrowing.
 #
 # Output format matches the aarch64 arm's ("<mnemonic-ish> <class>", sorted,
 # one line per site) so both feed the same cmp-based multiset comparison
@@ -160,6 +175,15 @@ x86AtomicSignature() { # <objfile>
         reg = p[3]; sub(/^%/, "", reg); sub(/,$/, "", reg)
         cls = regClass(reg)
         if (cls != "") print p[2]" "cls
+        prevcls = ""
+        next
+      }
+      if (match($0, /xchg[ \t]+%[a-z0-9]+,[^\t]*\(%[a-z0-9]+\)/)) {
+        seg = substr($0, RSTART, RLENGTH)
+        match(seg, /%[a-z0-9]+/)
+        reg = substr(seg, RSTART + 1, RLENGTH - 1)
+        cls = regClass(reg)
+        if (cls != "") print "store " cls
         prevcls = ""
         next
       }
@@ -199,10 +223,15 @@ atomicSignature() { # <objfile>
 # sides and pass vacuously. 362 sites were extracted from the pinned oracle's
 # 23 modules on aarch64 when this floor was set (#3103); 300 is comfortably
 # under that while still catching an emptied extraction. x86-64's corpus is
-# structurally smaller — a store costs 2 instructions (mov+mfence) there
-# against 1 (stlr) on aarch64, but there are fewer RMW/CAS sites overall — and
+# structurally smaller — one `xchg` per store there (two, `mov`+`mfence`,
+# before #5317) against one `stlr` on aarch64, and there are fewer RMW/CAS
+# sites overall — and
 # measured independently on hl-master at 126 (#3110); 100 is the same margin
-# in spirit.
+# in spirit. #5317 added the `xchg` store form and with it the `AtomicRmwXchg`
+# sites this arm never saw, so the real corpus only grew (192 sites in
+# libbitrt-x86_64-linux.a on the tree build against 160 before); the floor is
+# left where it is rather than re-derived on a box this pass did not run the
+# full differential on.
 MIN_ATOMIC_SITES_DEFAULT=300
 [ "$ATOMIC_ISA" = x86_64 ] && MIN_ATOMIC_SITES_DEFAULT=100
 MIN_ATOMIC_SITES=${DIFFRUNTIME_MIN_ATOMIC_SITES:-$MIN_ATOMIC_SITES_DEFAULT}
