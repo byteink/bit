@@ -201,21 +201,29 @@ whether it succeeds or fails) is hardcoded to Postgres today - `Dialect`
 has no lock/unlock method yet, so a MySQL runner needs that interface
 widened first.
 
-### On MySQL, none of the paragraph above holds yet
+### On MySQL, the ledger row moves to the end (#5378)
 
-Everything above describes the Postgres path. MySQL DDL auto-commits, so
-`Mysql` honestly flags every statement it renders non-transactional - and
-that empties the `BEGIN`/`COMMIT` block, leaving only the `schema_history`
-row inside it. The ledger row therefore commits *before* the first line of
-DDL runs, which is the opposite of the guarantee this section describes: a
-migration that fails partway leaves the ledger claiming it applied
-cleanly, and the next `up` skips it. `up` on MySQL also takes no lock at
-all, because the lock is the Postgres statement above.
+MySQL DDL auto-commits, so `Mysql` honestly flags every statement it
+renders non-transactional - and that leaves no `BEGIN`/`COMMIT` block for
+the `schema_history` write to share with the DDL. The runner does not put
+it in an empty transaction: when a migration renders no transactional
+statements at all, `up` runs every statement first and writes the ledger
+row only once they have all succeeded. A statement failing anywhere in the
+migration leaves no `schema_history` row for it - the next `up` sees it as
+still pending, same as a Postgres migration that never started.
 
-This is tracked as #5378 and it is a bug in the seam between the runner
-and the renderer, not in either one alone. Until it is fixed, treat the
-runner as Postgres-only and use `sql <n>` to review and apply MySQL
-migrations by hand.
+The trade-off is the one every forward-only runner accepts: a crash
+between the last statement and the ledger write leaves the migration's DDL
+applied but unrecorded, so the next `up` re-runs it. On MySQL that re-run
+can hit a statement that already succeeded (MySQL's own implicit
+per-statement commit means a partially-applied migration cannot be rolled
+back either way) - write migrations whose statements are safe to repeat
+(`create table if not exists`, `add column if not exists` where your MySQL
+version supports it) if that matters to you.
+
+`up` on MySQL still takes no advisory lock, because the lock
+(`pg_advisory_lock`) is the Postgres statement above and `Dialect` has no
+lock/unlock method yet - a separate gap, not this one.
 
 ## When not to use `down`
 
