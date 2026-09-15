@@ -186,22 +186,31 @@ x86_64-linux hardware (hl-master), not guessed. x86-64's TSO model has no
 single per-instruction acquire/release mnemonic the way aarch64's
 `ldar`/`stlr` do, so the signal is structurally different, found by
 disassembling all 23 `runtime/**` archive modules built by the pinned
-oracle and grepping every `lock`-prefixed instruction plus every
-instruction immediately preceding an `mfence`:
+oracle and grepping every `lock`-prefixed instruction, every
+implicitly-`lock`ed `xchg`, and every instruction immediately preceding
+an `mfence`:
 
 - RMW (add/sub/xchg) and CAS (`atomicCmpxchg`, and the and/or retry loop -
   x86 has no native fetch-and-and/or) lower to `lock xadd`/`lock cmpxchg`
   (`compiler/x64select.bit`'s `xEmitAtomicRmw`/`xEmitAtomicCmpxchg`), width
   visible in the register operand's class - exactly the RMW mnemonic plus
   register-width signal #3110's own hypothesis guessed.
-- STORE is not `lock`-prefixed at all - x86-TSO already orders a store
-  against earlier stores, so there is no dedicated release-store mnemonic.
-  It lowers to a plain `mov <reg>,MEM` immediately followed by `mfence`
-  (`xEmitAtomicStore`; `xMfence`'s only call site in the whole backend, and
-  the only thing that ever emits `mfence` at all). Confirmed on real
-  disassembly: all 87 `mfence` occurrences across the 23 modules were
-  immediately preceded by exactly that store's own `mov`, zero exceptions -
-  adjacency is a safe discriminator here, not a guess.
+- STORE carries no `lock` PREFIX in the disassembly - x86-TSO already
+  orders a store against earlier stores, so there is no dedicated
+  release-store mnemonic, and the store-load barrier a seq-cst store still
+  owes is bought by making the store itself an implicitly-locked
+  `xchg <reg>,MEM` (`xEmitAtomicStore`, #5317; it was a plain
+  `mov <reg>,MEM` immediately followed by `mfence` until then, which cost
+  2.3x as much on the x86_64-linux gate host and is the whole of that
+  ticket). BOTH forms are still extracted and both normalise to one
+  `store <class>` token, because this differential runs the pinned stage0
+  against the tree: for exactly one release the oracle emits the old form
+  and the tree the new one, and normalising is what keeps that from reading
+  as a divergence. Verified on the same 25 modules built both ways -
+  identical 215-site signatures, so the width invariant is untouched.
+  `AtomicRmwXchg` emits `xchg` too and lands in the `store` bucket on BOTH
+  sides, so it can cause neither a false red nor a false green; it matched
+  nothing at all before, so the corpus only grew.
 - LOAD has no signal at all: a plain acquire load on x86-TSO is just `mov`,
   indistinguishable from any other load by mnemonic. Not a gap worth
   closing - `assertAtomicOperandWidth` (compiler/lowerprim.bit) never
