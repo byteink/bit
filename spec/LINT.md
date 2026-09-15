@@ -444,6 +444,27 @@ never visits a `LetDecl` written this way). The file-scoped `// bit:lint
 disable unused-result` directive (§5) is available too, for a file where the
 pattern is pervasive enough that call-by-call annotation is not worth it.
 
+### 4.4 Phase 3 - ORM misuse, syntactic (epic #5050)
+
+Neither rule here needs the resolver (both are AST-only, like phase 1), but
+each targets one specific `pkg/orm`/`std/sql` call shape rather than a
+general structural property, so they are grouped separately from phase 1's
+generic size/shape rules.
+
+| Code | Rule | Rationale |
+|---|---|---|
+| E0217 | `tx-captured-executor` | Inside `tx`/`txAt`/`txValue`/`txValueAt`'s block, a bare identifier reusing the outer `Executor`/`Data` handle's own name writes outside the transaction - see `compiler/linttx.bit`'s header. |
+| E0218 | `relation-unloaded-read` | A `find<T>(...).oneOrFail()`-bound local's `@hasMany`/`@hasOne`/`@belongsTo` field, read with no preceding `.with("field")` in the same function - see `compiler/lintrelation.bit`'s header. |
+
+Both rules are deliberately syntactic, trusting a call's own name and shape
+rather than resolving it to a real declaration - neither rule's target
+package needs to exist yet for the rule itself to fire correctly, since
+`bit lint` never resolves a callee (§1, and `compiler/linttx.bit`'s own
+header). Both are documented further in `docs/lint/policy.md`, which is
+where their exact message text and severity live; this table exists so a
+reader scanning "every E02xx code" (§3) finds them without already knowing
+to look there.
+
 ## 5. Overrides
 
 ### 5.1 Grammar
