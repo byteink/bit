@@ -1,0 +1,226 @@
+// pkg/orm/query.test.bit — #5057's acceptance, against a fake driver.
+//
+// `qryAdapter` records every statement `Query<T>` runs (`calls`) and hands
+// back one canned result set (`cols`/`rows`) to the next `query()` call —
+// enough to prove the SQL text and bound arguments a chain assembles, and,
+// with a real row in the set, that `all`/`one`/`oneOrFail` actually run the
+// mapper rather than staying lazy.
+//
+// `Widget{id}` is the one mapped class every test shares: the SQL-assembly
+// tests never return a row (the mapper never runs), and the row-mapping
+// tests need only the one column. `field(...)` (naming.test.bit, this
+// module's own sibling) builds the `FieldDesc`s `find<T>` takes.
+
+// SqlRowCause/SqlRowError are imported by ./query.bit, this file's sibling
+// in the same module — a second import here would be E0042.
+import { contains } from "std/strings"
+
+class Widget { id: i64 }
+
+fn widgetMapper(rows: Rows): Widget! {
+  let cols = rows.columns()
+  return Widget{ id: sqlReqInt(rows, cols, "id")? }
+}
+
+class qryCall { sql: string, args: []Value }
+
+// One canned result set, replayed by every `query()` call until replaced —
+// good enough for these tests, which issue at most one query per chain.
+class qryRows {
+  cols: []string
+  data: [][]Value
+  i: int
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.data)
+  }
+
+  columns(): []string {
+    return this.cols
+  }
+
+  value(col: int): Value {
+    return this.data[this.i][col]
+  }
+
+  close() {}
+}
+
+class qryAdapter {
+  calls: []qryCall
+  cols: []string
+  rows: [][]Value
+
+  connect(cfg: Datasource): Conn! {
+    return qryConn{ a: this }
+  }
+}
+
+class qryConn {
+  a: qryAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.calls = append(this.a.calls, qryCall{ sql: sqlText, args: params })
+    return qryRows{ cols: this.a.cols, data: this.a.rows, i: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec not supported")
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    fail newError("fake: begin not supported")
+  }
+
+  close() {}
+}
+
+fn newQryPool(a: qryAdapter): Pool {
+  let p = pool(a, Datasource{ host: "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+fn lastCall(a: qryAdapter): qryCall {
+  return a.calls[len(a.calls) - 1]
+}
+
+// A canonical text form for the three `Value` variants these tests use —
+// tag-prefixed so `Text("i:1")` can never collide with `Int(1)`. Reduces
+// `valueEq` to one string comparison instead of a nested match per variant
+// pair (LINT.md's max-complexity).
+fn valueRepr(v: Value): string {
+  match (v) {
+    Null => return "null"
+    Int(x) => return "i:${x}"
+    Float(x) => return "f:${x}"
+    Text(x) => return "s:${x}"
+    Blob(_) => return "b"
+  }
+}
+
+fn valueEq(a: Value, b: Value): bool {
+  return valueRepr(a) == valueRepr(b)
+}
+
+fn argsEq(got: []Value, want: []Value): bool {
+  if (len(got) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(got)) {
+    if (!valueEq(got[i], want[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+test "the chain assembles exact SQL with every value as a $n placeholder, none in the SQL text" {
+  let a = qryAdapter{ cols: []string(0), rows: [][]Value(0) }
+  let p = newQryPool(a)
+  let fields = [field("id"), field("email"), field("tier"), field("deletedAt"), field("createdAt")]
+
+  let q = find<Widget>(p, "widgets", fields, widgetMapper)
+  q = q.where("email", Value.Text("e@x.com"))
+  q = q.whereIn("tier", [Value.Text("gold"), Value.Text("silver")])
+  q = q.whereNull("deletedAt")
+  q = q.orderBy("createdAt", Dir.Desc)
+  q = q.limit(20)
+  q = q.offset(40)
+  q.all() catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let call = lastCall(a)
+  let want = "select * from widgets where email = $1 and tier in ($2, $3) and deleted_at is null order by created_at desc limit 20 offset 40"
+  assert(call.sql == want, "got: ${call.sql}")
+  assert(
+    argsEq(call.args, [Value.Text("e@x.com"), Value.Text("gold"), Value.Text("silver")]),
+    "bound args did not match",
+  )
+  assert(!contains(call.sql, "e@x.com"), "a value leaked into the SQL text")
+  assert(!contains(call.sql, "gold"), "a value leaked into the SQL text")
+}
+
+test "one() always carries a LIMIT" {
+  let a = qryAdapter{ cols: []string(0), rows: [][]Value(0) }
+  let p = newQryPool(a)
+  let fields = [field("id")]
+
+  find<Widget>(p, "widgets", fields, widgetMapper).one() catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(contains(lastCall(a).sql, "limit 2"), "got: ${lastCall(a).sql}")
+}
+
+test "one() against a two-row result errors rather than returning the first" {
+  let a = qryAdapter{ cols: ["id"], rows: [[Value.Int(1)], [Value.Int(2)]] }
+  let p = newQryPool(a)
+  let fields = [field("id")]
+
+  find<Widget>(p, "widgets", fields, widgetMapper).one() catch e {
+    let (re, ok) = e.(SqlRowError)
+    assert(ok, "a SqlRowError, got '${e.message()}'")
+    assert(re.cause == SqlRowCause.TooManyRows, "cause must be TooManyRows")
+    return
+  }
+  assert(false, "must error on a two-row result")
+}
+
+test "count() emits count(*)" {
+  let a = qryAdapter{ cols: ["n"], rows: [[Value.Int(3)]] }
+  let p = newQryPool(a)
+  let fields = [field("id")]
+
+  let n = find<Widget>(p, "widgets", fields, widgetMapper).where("id", Value.Int(1)).count() catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  assert(n == 3, "got ${n}")
+  assert(contains(lastCall(a).sql, "select count(*) as n from widgets"), "got: ${lastCall(a).sql}")
+}
+
+test "exists() emits a bounded existence query" {
+  let a = qryAdapter{ cols: []string(0), rows: [][]Value(0) }
+  let p = newQryPool(a)
+  let fields = [field("id")]
+
+  find<Widget>(p, "widgets", fields, widgetMapper).where("id", Value.Int(1)).exists() catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  let sql = lastCall(a).sql
+  assert(contains(sql, "select 1 from widgets"), "got: ${sql}")
+  assert(contains(sql, "limit 1"), "got: ${sql}")
+}
+
+test "a builder reassigned through a conditional branch produces the combined predicate" {
+  let a = qryAdapter{ cols: []string(0), rows: [][]Value(0) }
+  let p = newQryPool(a)
+  let fields = [field("id"), field("name")]
+
+  let q = find<Widget>(p, "widgets", fields, widgetMapper).where("id", Value.Int(1))
+  let term = "abc"
+  if (len(term) > 0) {
+    q = q.whereLike("name", Value.Text("%${term}%"))
+  }
+  q.limit(50).all() catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let want = "select * from widgets where id = $1 and name like $2 limit 50"
+  assert(lastCall(a).sql == want, "got: ${lastCall(a).sql}")
+  assert(argsEq(lastCall(a).args, [Value.Int(1), Value.Text("%abc%")]), "bound args did not match")
+}
