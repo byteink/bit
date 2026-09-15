@@ -1,0 +1,244 @@
+// pkg/orm/relation.bit — hasMany/hasOne/belongsTo and eager loading via
+// `with()` (#5061, owner decision 2026-09-12).
+//
+//   @table
+//   class Person {
+//     @id id: i64
+//     @hasMany("authorId") posts: []Post
+//     @hasOne("personId") profile: Profile
+//   }
+//
+//   @table
+//   class Post {
+//     @id id: i64
+//     @belongsTo("authorId") author: Person
+//     authorId: i64
+//   }
+//
+//   people(db).with("posts").all()?          // 2 statements for any parent count
+//
+// The attribute argument names the FOREIGN KEY COLUMN ON THE OWNING SIDE
+// (`Post.authorId`'s own Bit field name) — the compiler recognises
+// `@hasMany`/`@hasOne`/`@belongsTo` and infers the TARGET type from the
+// field's own type (`compiler/classrelationattr.bit`), but attaches no
+// further meaning: which field is the foreign key, and how to load and
+// assign it, is this file's job, not the compiler's or the attribute's.
+//
+// WHY A LOADER MAP, NOT SOMETHING DERIVED FROM THE FIELD ITSELF. Bit has no
+// reflection — no way to read or write a named field of a type parameter
+// `T` (`pkg/orm/query.bit`'s own header states the identical limitation for
+// `find<T>`'s mapper). `Query<T>.with(name)` only records the request;
+// `hasMany`/`hasOne`/`belongsTo` below build the actual `RelationLoader<T>`
+// from explicit accessor closures the caller supplies once per entity, the
+// same explicit-per-entity-wrapper shape `find`/`update`/`deleteMany`
+// already established (`pkg/orm/query.bit`, `pkg/orm/patch.bit`).
+//
+//   fn postsLoader(): RelationLoader<Person> {
+//     return hasMany<Person, Post>(
+//       (p) => p.id,                                             // parent key
+//       (db) => find<Post>(db, "posts", Post{ id: 0, authorId: 0 }.tableDescriptor(), postMapper),
+//       "authorId",                                               // FK column, the attribute's own argument
+//       (post) => post.authorId,                                  // reading the loaded child's FK
+//       (p, posts) => { p.posts = posts },                        // assigning the parent's relation field
+//     )
+//   }
+//
+//   fn people(db: Data): Query<Person> {
+//     let fields = Person{ id: 0, posts: []Post(0), profile: Profile{ id: 0, personId: 0 } }.tableDescriptor()
+//     return withRelations(
+//       find<Person>(db, "people", fields, personMapper),
+//       map<string, RelationLoader<Person>>{ "posts": postsLoader() },
+//     )
+//   }
+//
+// TWO QUERIES PER RELATION, NEVER ONE PER PARENT ROW. `hasMany`/`hasOne`
+// each run exactly one `whereIn` query (chunked, see below) against every
+// parent row's own key, then group the results in memory
+// (`std/seq`'s `groupBy`/`indexBy`) — 200 parents with `with("posts")` is
+// the query `find<Person>` already ran, plus one `select * from posts
+// where author_id in (...)`, never 201. `belongsTo` is the same shape from
+// the other direction: it queries DISTINCT foreign-key values
+// (`std/seq`'s `unique`), so 500 posts written by 12 people load exactly
+// 12 people, not 500.
+//
+// CHUNKED AT 1000 IDS PER STATEMENT (`maxRelationChunk`). A parent set (or
+// a distinct foreign-key set) larger than that would build one enormous
+// `IN (...)` list; `chunkI64` below splits it into as many
+// `ceil(n / 1000)` statements as needed, each still a single round trip
+// batching up to 1000 keys.
+//
+// WHY THIS FILE NEVER ENCODES "UNLOADED" FOR hasOne/belongsTo THE WAY
+// #5271 DOES FOR hasMany. `compiler/classrelationattr.bit`'s own
+// `fieldNeedsUnloadedSentinel` is scoped to `[]T` (slice) fields only — a
+// single-entity relation field's zero value is an ordinary (real,
+// zero-valued) `Profile`/`Person` instance, not the reserved sentinel, so
+// reading an unrequested `hasOne`/`belongsTo` field does not panic today.
+// This is a real, flagged gap (the same category `pkg/orm/schema.bit`'s
+// own header flags three of), not silently assumed covered: `hasOne`/
+// `belongsTo` below simply do not call `assign` for a parent with no
+// matching row, leaving whatever the row mapper already put there. The
+// `[]T` (`hasMany`) case IS fully covered — #5271's sentinel and panic are
+// exactly what an omitted, un-`with()`-ed slice field reads through.
+
+// Rows/Value are already imported by pkg/orm/data.test.bit, this module's
+// own sibling — a second import here would be E0042.
+import { concat, groupBy, indexBy, unique } from "std/seq"
+
+// What `Query<T>.with(name)` runs once the parent rows are back: given the
+// already-fetched parents, load and assign one relation's data. Registered
+// on a `Query<T>` by `withRelations` below, never called directly by a
+// caller.
+export type RelationLoader<T> = (Data, []T) => ()!
+
+// The most foreign-key values a single `IN (...)` list carries — see this
+// file's header for why a larger set is chunked instead.
+const maxRelationChunk: int = 1000
+
+// Registers `relations` on `q` and returns it, so a per-entity wrapper can
+// chain straight into `find<T>(...)`:
+//
+//     return withRelations(find<Person>(db, "people", fields, personMapper), map<string, RelationLoader<Person>>{...})
+export fn withRelations<T>(q: Query<T>, relations: map<string, RelationLoader<T>>): Query<T> {
+  q.relations = relations
+  return q
+}
+
+// The `hasMany` side: `TParent`'s relation field is `[]TChild`, one parent
+// row owning zero or more child rows. `parentKey` reads the parent's own
+// key; `childQuery` builds a FRESH `Query<TChild>` against the child table
+// (never pre-filtered — this file adds the `whereIn` itself, chunked);
+// `childForeignKey` is the FK's Bit field name on `TChild` (the relation
+// attribute's own argument); `childForeignKeyOf` reads a loaded child's own
+// FK value; `assign` writes the parent's relation field — called for EVERY
+// parent, with an empty slice when none matched, so a "no children" parent
+// reads as loaded-empty rather than staying in the unloaded (#5271)
+// representation.
+export fn hasMany<TParent, TChild>(
+  parentKey: (TParent) => i64,
+  childQuery: (Data) => Query<TChild>,
+  childForeignKey: string,
+  childForeignKeyOf: (TChild) => i64,
+  assign: (TParent, []TChild) => (),
+): RelationLoader<TParent> {
+  let loader: RelationLoader<TParent> = (db, parents) => {
+    if (len(parents) == 0) {
+      return
+    }
+    let ids = []i64(0)
+    for p of parents {
+      ids = append(ids, parentKey(p))
+    }
+    let children = fetchByForeignKey(db, childQuery, childForeignKey, ids)?
+    let grouped = groupBy<TChild, i64>(children, childForeignKeyOf)
+    for p of parents {
+      assign(p, grouped[parentKey(p)])
+    }
+  }
+  return loader
+}
+
+// The `hasOne` side: `TParent`'s relation field is a single `TChild`, at
+// most one child row per parent. Same shape as `hasMany`, but `assign` is
+// called only for a parent with a match — see this file's header for why
+// an unmatched parent is left as-is rather than encoded as "unloaded".
+export fn hasOne<TParent, TChild>(
+  parentKey: (TParent) => i64,
+  childQuery: (Data) => Query<TChild>,
+  childForeignKey: string,
+  childForeignKeyOf: (TChild) => i64,
+  assign: (TParent, TChild) => (),
+): RelationLoader<TParent> {
+  let loader: RelationLoader<TParent> = (db, parents) => {
+    if (len(parents) == 0) {
+      return
+    }
+    let ids = []i64(0)
+    for p of parents {
+      ids = append(ids, parentKey(p))
+    }
+    let children = fetchByForeignKey(db, childQuery, childForeignKey, ids)?
+    let byKey = indexBy<TChild, i64>(children, childForeignKeyOf)
+    for p of parents {
+      let (c, ok) = byKey[parentKey(p)]
+      if (ok) {
+        assign(p, c)
+      }
+    }
+  }
+  return loader
+}
+
+// The `belongsTo` side: `TChild`'s relation field is the single `TParent`
+// it points at. `childForeignKeyOf` reads the FK already on `TChild`;
+// `parentQuery` builds a fresh `Query<TParent>`; `parentKeyColumn` is the
+// parent's own key field name; `parentKeyOf` reads a loaded parent's key.
+// Queries DISTINCT foreign-key values (`unique`) — see this file's header
+// for why that is the whole point of this direction.
+export fn belongsTo<TChild, TParent>(
+  childForeignKeyOf: (TChild) => i64,
+  parentQuery: (Data) => Query<TParent>,
+  parentKeyColumn: string,
+  parentKeyOf: (TParent) => i64,
+  assign: (TChild, TParent) => (),
+): RelationLoader<TChild> {
+  let loader: RelationLoader<TChild> = (db, children) => {
+    if (len(children) == 0) {
+      return
+    }
+    let fks = []i64(0)
+    for c of children {
+      fks = append(fks, childForeignKeyOf(c))
+    }
+    let parents = fetchByForeignKey(db, parentQuery, parentKeyColumn, unique(fks))?
+    let byKey = indexBy<TParent, i64>(parents, parentKeyOf)
+    for c of children {
+      let (p, ok) = byKey[childForeignKeyOf(c)]
+      if (ok) {
+        assign(c, p)
+      }
+    }
+  }
+  return loader
+}
+
+// Runs `query(db).whereIn(column, ...)` once per `chunkI64`-sized chunk of
+// `ids`, concatenating every chunk's rows — the two-or-more-statements-but-
+// never-one-per-row shape every loader above shares.
+fn fetchByForeignKey<U>(
+  db: Data,
+  query: (Data) => Query<U>,
+  column: string,
+  ids: []i64,
+): []U! {
+  let out = []U(0)
+  for chunk of chunkI64(ids, maxRelationChunk) {
+    let got = query(db).whereIn(column, i64Values(chunk)).all()?
+    out = concat(out, got)
+  }
+  return out
+}
+
+// Splits `ids` into chunks of at most `size` elements, preserving order —
+// `ceil(len(ids) / size)` chunks, the last one short unless `len(ids)` is an
+// exact multiple.
+fn chunkI64(ids: []i64, size: int): [][]i64 {
+  let out = [][]i64(0)
+  let i = 0
+  while (i < len(ids)) {
+    let end = i + size
+    if (end > len(ids)) {
+      end = len(ids)
+    }
+    out = append(out, ids[i:end])
+    i = end
+  }
+  return out
+}
+
+fn i64Values(ids: []i64): []Value {
+  let out = []Value(0)
+  for id of ids {
+    out = append(out, Value.Int(id))
+  }
+  return out
+}

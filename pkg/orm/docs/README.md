@@ -13,3 +13,4 @@
 | [Errors](errors.md) | Turning a driver's constraint-violation error into a typed, catchable cause via `classify`, decided from SQLSTATE, never message text |
 | [Bulk insert](bulk.md) | `insertAll`: many rows in one statement, chunked at a computed placeholder limit, never one statement per row |
 | [Keyset pagination](keyset.md) | `after`: `WHERE id > $n` instead of `OFFSET`, so a deep page costs what page 1 costs |
+| [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |

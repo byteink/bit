@@ -20,6 +20,10 @@ statement per row, `Query<T>.after`, keyset pagination - `WHERE id >
 $n` instead of a growing `OFFSET`, so a deep page costs what page 1 does,
 and `@timestamps`, filling `createdAt` on INSERT and `updatedAt` on every
 write, single or bulk.
+refused unless `.all()` says so on purpose, and `hasMany`/`hasOne`/
+`belongsTo` relations with eager loading via `with()`, batched so loading N
+parent rows never issues more than one extra query per relation, never one
+per row.
 
 ## Install
 
@@ -61,6 +65,10 @@ driver's constraint-violation error into a typed, catchable cause is
 [`docs/errors.md`](docs/errors.md). Inserting many rows in one statement is
 [`docs/bulk.md`](docs/bulk.md). Paginating a large table without `OFFSET`'s
 cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
+[`docs/patch.md`](docs/patch.md). Turning a driver's constraint-violation
+error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
+`hasMany`/`hasOne`/`belongsTo` and eager loading with `with()` is
+[`docs/relation.md`](docs/relation.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
