@@ -6,6 +6,7 @@
 | [Naming](naming.md) | Mapping a `@table` class's field names to SQL table and column names |
 | [Schema](schema.md) | Declaring and altering tables, columns, indexes and foreign keys as an intent tree, never SQL text |
 | [Dialect](dialect.md) | Rendering that intent tree to real DDL behind a `Dialect` interface, `Postgres` first |
+| [MySQL](mysql.md) | The second `Dialect`: every place its DDL diverges from Postgres in one table, why every statement it renders is non-transactional, and why the migration runner has no lock on it |
 | [Query](query.md) | The find chain: where/whereIn/whereNull/whereLike/orderBy/limit/offset, with a compile-time check on a string-literal column name |
 | [Raw SQL and dynamic columns](raw.md) | `whereRaw`: a SQL fragment plus its own bound arguments. `orderByField`: a column name from outside your program, checked against an allowlist, never escaped |
 | [Write](write.md) | `save`, `delete` and `upsert`: INSERT vs UPDATE decided by the persisted flag, never the primary key, and why 0 rows matched is an error |
@@ -19,3 +20,4 @@
 | [Optimistic locking](version.md) | `@version`: `save`'s UPDATE checks the old version and raises it by one, `StaleWriteError` when another write landed first, distinct from a row-not-found |
 | [Generate migrations](generate.md) | `generate`: diffs your `@table` entities against the live schema and writes a reviewed migration file, never applying anything and never inferring a rename |
 | [Apply migrations](migrate.md) | `up`/`status`/`sql`/`down`: applies a checked-in migration registry against a live database, one transaction per migration with the ledger row inside it, an advisory lock around the whole run |
+| [Testing](testing.md) | `withRollback`: run a test inside a transaction that always rolls back, even on success, so nothing it wrote is ever there to clean up; `make`/`create`/`Seq` build deterministic per-test rows |
