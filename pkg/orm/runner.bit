@@ -44,20 +44,38 @@
 //    lock/unlock method today, so a MySQL runner needs that interface
 //    widened first. Flagged here rather than guessed at.
 //
-// 3. ONE TRANSACTION PER MIGRATION. `applyMigration` renders a migration's
-//    ops, splits the result into the statements the dialect flagged
-//    transactional and the ones it did not (`dialect.bit`'s own
-//    `Statement.transactional`), then issues, in order: `BEGIN`, every
-//    transactional statement, the `schema_history` row for THIS migration
-//    (so the ledger write is part of the same atomic unit as the DDL it
-//    describes), `COMMIT` — and only after that commits, each
-//    non-transactional statement individually, with no wrapping
-//    transaction (Postgres refuses `CREATE INDEX CONCURRENTLY` inside one).
-//    A failure before `COMMIT` issues `ROLLBACK` and leaves the migration
-//    unapplied. A non-transactional statement failing AFTER `COMMIT` cannot
-//    be rolled back either — inherent to what "non-transactional" means —
-//    and is reported as what it is: the migration's ledger row is already
-//    committed, but its trailing statement did not run.
+// 3. ONE TRANSACTION PER MIGRATION, WHEN THE DIALECT LEAVES ONE TO USE.
+//    `applyMigration` renders a migration's ops, splits the result into the
+//    statements the dialect flagged transactional and the ones it did not
+//    (`dialect.bit`'s own `Statement.transactional`), then issues, in
+//    order: `BEGIN`, every transactional statement, the `schema_history`
+//    row for THIS migration (so the ledger write is part of the same
+//    atomic unit as the DDL it describes), `COMMIT` — and only after that
+//    commits, each non-transactional statement individually, with no
+//    wrapping transaction (Postgres refuses `CREATE INDEX CONCURRENTLY`
+//    inside one). A failure before `COMMIT` issues `ROLLBACK` and leaves
+//    the migration unapplied. A non-transactional statement failing AFTER
+//    `COMMIT` cannot be rolled back either — inherent to what
+//    "non-transactional" means — and is reported as what it is: the
+//    migration's ledger row is already committed, but its trailing
+//    statement did not run.
+//
+//    WHEN THE DIALECT FLAGS EVERY STATEMENT NON-TRANSACTIONAL (#5378) —
+//    MySQL DDL auto-commits, so `mysql.bit` honestly renders every
+//    statement `transactional: false` — there is no `BEGIN`/`COMMIT` block
+//    left to carry the ledger write, and writing it first the way the
+//    transactional case does would commit `schema_history` before the
+//    first line of DDL ran: a migration failing on its third statement
+//    would leave the ledger claiming success. `applyMigration` instead
+//    runs every statement first and writes the ledger row only once they
+//    have all succeeded, with no wrapping transaction of its own — a
+//    failing statement leaves no row at all, matching what `up`'s next run
+//    and `verifyChecksums` both expect. THE COST: a crash between the last
+//    statement and the ledger write leaves the migration's DDL applied but
+//    unrecorded, so the next `up` re-runs it. That is the lesser failure —
+//    a possible re-run of already-applied DDL — against the one this fixes,
+//    a ledger that lies about a migration that never finished; every
+//    forward-only runner accepts the former.
 //
 // 4. `sql` PRINTS AND RUNS NOTHING. It renders one migration's DDL and
 //    returns it as a string — there is no `db` parameter on this function
@@ -195,26 +213,51 @@ export fn down(
   return RevertedMigration{ version: m.version, name: m.name }
 }
 
-// Renders `m`, applies it in its own transaction (see this file's header,
-// piece 3), and returns what got recorded.
+// Renders `m` and applies it (see this file's header, piece 3, for the two
+// shapes: a dialect with a transactional block to put the ledger write in,
+// and one — MySQL — without). Any failure is re-raised naming `m`'s file, so
+// the caller always knows which migration stopped the run.
 fn applyMigration(db: Data, dialect: Dialect, m: Migration, at: Timestamp): AppliedMigration! {
   let start = monotonic()
+  runMigrationStatements(db, dialect, m, at, start) catch e {
+    fail newError("pkg/orm: migrate: ${migrationFileName(m)}: ${e.message()}")
+  }
+  return AppliedMigration{
+    version: m.version,
+    name: m.name,
+    checksum: m.checksum,
+    appliedAt: at.ns,
+    durationMs: elapsedMs(start),
+  }
+}
+
+// Splits `m`'s rendered statements by `Statement.transactional` and runs
+// them: with a transactional block to write the ledger row inside (the
+// Postgres shape), or — when every statement is non-transactional (MySQL) —
+// by running every statement first and writing the ledger row only once
+// they have all succeeded. See this file's header, piece 3.
+fn runMigrationStatements(
+  db: Data,
+  dialect: Dialect,
+  m: Migration,
+  at: Timestamp,
+  start: Mono,
+): ()! {
   let stmts = renderOps(dialect, m.apply())
   let (transactional, nonTransactional) = splitByTransactional(stmts)
-  runTransactionalBlock(db, transactional, (d) => {
-    recordApplied(
-      d,
-      HistoryEntry{
-        version: m.version,
-        name: m.name,
-        checksum: m.checksum,
-        appliedAt: at.ns,
-        durationMs: elapsedMs(start),
-      },
-    )?
-  })?
+  if (len(transactional) > 0) {
+    runTransactionalBlock(db, transactional, (d) => {
+      recordApplied(d, historyEntryFor(m, at, start))?
+    })?
+    runNonTransactional(db, nonTransactional)?
+    return
+  }
   runNonTransactional(db, nonTransactional)?
-  return AppliedMigration{
+  recordApplied(db, historyEntryFor(m, at, start))?
+}
+
+fn historyEntryFor(m: Migration, at: Timestamp, start: Mono): HistoryEntry {
+  return HistoryEntry{
     version: m.version,
     name: m.name,
     checksum: m.checksum,
