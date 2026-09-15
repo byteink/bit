@@ -133,15 +133,17 @@ missing target would surface, not here.
 
 ## What this package does not do yet
 
-This chapter builds and reads a tree. It does not turn that tree into SQL:
-there is no dialect yet to render `people`'s `CREATE TABLE` into Postgres
-or MySQL text, and no runner to apply it to a database. Those are separate,
-later pieces of the same epic. Use this package today to see the exact
-shape a migration will carry; do not expect `migrate up` yet.
+This chapter builds and reads a tree; turning that tree into SQL is
+[Dialect](dialect.md)'s job, not this file's. Postgres is the first
+renderer; MySQL is separate, later work. There is still no runner to apply
+a rendered statement to a database. Use this package today to see the
+exact shape a migration will carry and, once you add a dialect, the exact
+DDL it renders to; do not expect `migrate up` yet.
 
 ## Where to go next
 
-[Naming](naming.md) covers how a `@table` class's field names become the
-table and column names you write here by hand. [Data](data.md) covers the
-interface an ORM function takes to actually run something against a
-database, once there is something here to run.
+[Dialect](dialect.md) turns the tree this chapter builds into real
+Postgres DDL. [Naming](naming.md) covers how a `@table` class's field
+names become the table and column names you write here by hand.
+[Data](data.md) covers the interface an ORM function takes to actually run
+something against a database, once there is something here to run.

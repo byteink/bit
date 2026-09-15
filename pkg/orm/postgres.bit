@@ -1,0 +1,215 @@
+// pkg/orm/postgres.bit — Postgres, the first `SchemaDialect` (#5066).
+//
+// TYPE MAPPING FOLLOWS SCHEMA.BIT'S OWN VOCABULARY, NOT A WIDER ONE.
+// `ColumnType` (schema.bit) has exactly six variants — `Id`, `Int`,
+// `String(length)`, `Text`, `Bool`, `Timestamp` — and its own header
+// explains why: "`int` is Bit's only integer size in ordinary use... one
+// `int` column, not Laravel's `integer`/`bigInteger` split - a dialect
+// maps it to whichever integer type it stores 64 bits in." So `Int` here
+// renders `bigint`, once, and there is no `i32`/`f64`/`decimal`/`[]byte`
+// variant to render because the landed intent tree carries none — adding
+// one would be a change to schema.bit's shape, out of this ticket's files
+// and against its own "nothing here may special-case a dialect" rule.
+// `Timestamp` renders `timestamptz`, never a bare `timestamp` — an instant
+// read from a zoneless column is invented (#3986).
+//
+// IDENTIFIERS ARE ALWAYS QUOTED AND ESCAPED. Every identifier this file
+// emits — table name, column name, a generated index or constraint name,
+// a foreign key's referenced table and column — goes through `quoteIdent`,
+// which double-quotes and doubles any embedded `"` (the standard SQL
+// escape for a quoted identifier, closing the injection vector rather than
+// rejecting specific characters). None of that input is trusted: `table`/
+// `alter` (schema.bit) take plain strings straight from whoever wrote the
+// migration, not necessarily the output of `naming.bit`'s snake_case
+// conversion — that conversion only runs for a `@table` class's reflected
+// descriptor (a completely different call path, pkg/orm/naming.bit), never
+// for a hand-written `table("...", ...)` call. `raw()`'s text is the one
+// exception, by design: it is passed to SQL verbatim, unquoted, unescaped
+// — the single place this file knowingly suspends that guarantee, exactly
+// as schema.bit's own header documents `raw()` to be.
+//
+// NO VALUE IS EVER RENDERED. schema.bit carries no default-value builder
+// yet, so there is nothing here that interpolates caller data into DDL —
+// this file's only job is identifiers and the fixed keywords a `ColumnType`/
+// `AlterOp`/`ReferentialAction` tag maps to.
+
+// `join` and `contains` are not imported here — query.bit/query.test.bit
+// already import them, and a Bit import binds package-wide (a second
+// import of the same name anywhere in pkg/orm is `E0042 already declared
+// in this scope`, confirmed against this exact pair while building this
+// file).
+import { replace, toUpper } from "std/strings"
+
+// Postgres, the first `SchemaDialect` implementation.
+export class Postgres {
+  export render(op: SchemaOp): []Statement {
+    match (op) {
+      CreateTable(t) => return renderCreateTable(t)
+      AlterTable(t) => return renderAlterTable(t)
+      DropTable(name) => return [dropTableStatement(name)]
+    }
+  }
+}
+
+// `CREATE TABLE`, then one `CREATE INDEX` per `t.index()`, then each
+// `raw()` passthrough, in declaration order — see dialect.bit's header for
+// why these are separate `Statement`s rather than one blob.
+fn renderCreateTable(t: Table): []Statement {
+  let defs = []string(0)
+  for c of t.columns {
+    defs = append(defs, columnDef(c))
+  }
+  for fk of t.foreignKeys {
+    defs = append(defs, foreignKeyDef(t.name, fk))
+  }
+  let body = join(defs, ",\n  ")
+  let sql = "create table ${quoteIdent(t.name)} (\n  ${body}\n);"
+  let stmts = [Statement{ sql: sql, transactional: true }]
+  for ix of t.indexes {
+    stmts = append(stmts, indexStatement(t.name, ix))
+  }
+  for r of t.raws {
+    stmts = append(stmts, rawStatement(r))
+  }
+  return stmts
+}
+
+// One `ALTER TABLE` statement per `AlterOp`, then each `raw()`
+// passthrough. Never batched into one multi-clause `ALTER TABLE` — keeping
+// one statement per op keeps a `RenameColumn` (or any op) individually
+// retryable and matches schema.bit's own one-node-per-change shape.
+fn renderAlterTable(t: AlterTable): []Statement {
+  let stmts = []Statement(0)
+  for op of t.ops {
+    stmts = append(stmts, alterOpStatement(t.name, op))
+  }
+  for r of t.raws {
+    stmts = append(stmts, rawStatement(r))
+  }
+  return stmts
+}
+
+fn alterOpStatement(table: string, op: AlterOp): Statement {
+  match (op) {
+    AddColumn(c) => return Statement{
+      sql: "alter table ${quoteIdent(table)} add column ${columnDef(c)};",
+      transactional: true,
+    }
+    DropColumn(name) => return Statement{
+      sql: "alter table ${quoteIdent(table)} drop column ${quoteIdent(name)};",
+      transactional: true,
+    }
+    RenameColumn(oldName, newName) => return Statement{
+      sql: "alter table ${quoteIdent(table)} rename column ${quoteIdent(oldName)} to ${quoteIdent(newName)};",
+      transactional: true,
+    }
+  }
+}
+
+fn dropTableStatement(name: string): Statement {
+  return Statement{ sql: "drop table ${quoteIdent(name)};", transactional: true }
+}
+
+// One column's definition inside a `CREATE TABLE`/`ADD COLUMN`. `Id` is
+// `bigint generated always as identity primary key` — never `serial`,
+// which Postgres' own docs discourage and which leaves a sequence with
+// separate ownership — and returns early: an identity primary key needs no
+// `not null`/`unique` suffix regardless of what `Column.isNullable`/
+// `isUnique` happen to hold on that node.
+fn columnDef(c: Column): string {
+  if (c.colType == ColumnType.Id) {
+    return "${quoteIdent(c.name)} bigint generated always as identity primary key"
+  }
+  let parts = [quoteIdent(c.name), pgType(c.colType)]
+  if (!c.isNullable) {
+    parts = append(parts, "not null")
+  }
+  if (c.isUnique) {
+    parts = append(parts, "unique")
+  }
+  return join(parts, " ")
+}
+
+// `ColumnType` -> Postgres type keyword. See this file's header for why
+// there is exactly one branch per variant and no wider mapping.
+fn pgType(colType: ColumnType): string {
+  match (colType) {
+    Id => return "bigint"
+    Int => return "bigint"
+    String(length) => return "varchar(${length})"
+    Text => return "text"
+    Bool => return "boolean"
+    Timestamp => return "timestamptz"
+  }
+}
+
+// `CONSTRAINT ... FOREIGN KEY ... REFERENCES ...`, named
+// `<table>_<column>_fkey` (Postgres' own naming convention). Panics naming
+// the column and table when `references(...)` was never called — schema.bit
+// builds that node but deliberately leaves it "a structurally incomplete
+// node rather than a builder-time failure" (schema.bit's own header): the
+// dialect is where a missing target must surface, and a panic (a caller
+// bug, not recoverable data) is the same category `pkg/orm/write.bit`'s own
+// `valueFor`/`primaryKeyField` already panic for.
+fn foreignKeyDef(table: string, fk: ForeignKey): string {
+  if (fk.refTable == "" || fk.refColumn == "") {
+    panic("pkg/orm: foreign key on '${fk.column}' of '${table}' has no references(...) target")
+  }
+  let name = quoteIdent("${table}_${fk.column}_fkey")
+  let clause = "constraint ${name} foreign key (${quoteIdent(fk.column)}) references ${quoteIdent(fk.refTable)} (${quoteIdent(fk.refColumn)})"
+  let action = onDeleteClause(fk.onDeleteAction)
+  if (action != "") {
+    return clause + " " + action
+  }
+  return clause
+}
+
+fn onDeleteClause(action: ReferentialAction): string {
+  match (action) {
+    NoAction => return ""
+    Cascade => return "on delete cascade"
+    Restrict => return "on delete restrict"
+    SetNull => return "on delete set null"
+  }
+}
+
+// `CREATE INDEX <table>_<cols>_idx ON <table> (<cols>)`, always
+// transactional — `t.index()` has no `CONCURRENTLY` option; only `raw()`
+// can ask for one (schema.bit's header).
+fn indexStatement(table: string, ix: Index): Statement {
+  let cols = []string(0)
+  for c of ix.columns {
+    cols = append(cols, quoteIdent(c))
+  }
+  let name = quoteIdent(indexName(table, ix.columns))
+  let colList = join(cols, ", ")
+  let sql = "create index ${name} on ${quoteIdent(table)} (${colList});"
+  return Statement{ sql: sql, transactional: true }
+}
+
+fn indexName(table: string, columns: []string): string {
+  let parts = [table]
+  for c of columns {
+    parts = append(parts, c)
+  }
+  parts = append(parts, "idx")
+  return join(parts, "_")
+}
+
+// A `raw()` passthrough, unquoted and unescaped by design (this file's
+// header) — flagged non-transactional exactly when its text names
+// `CREATE INDEX CONCURRENTLY`, case-insensitively, since that is the only
+// statement shape schema.bit's builders can produce that Postgres refuses
+// to run inside a transaction.
+fn rawStatement(text: string): Statement {
+  return Statement{ sql: text, transactional: !contains(toUpper(text), "CONCURRENTLY") }
+}
+
+// A SQL identifier, double-quoted with any embedded `"` doubled — the
+// standard escape for a quoted Postgres identifier. This is the only
+// quoting this file performs; see this file's header for why every
+// identifier goes through it and why `raw()` alone does not.
+fn quoteIdent(name: string): string {
+  let escaped = replace(name, "\"", "\"\"")
+  return "\"${escaped}\""
+}
