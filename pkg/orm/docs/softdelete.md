@@ -187,6 +187,82 @@ hard-delete what the single-row path only marks. On a class with no
 `@softDelete` at all, both functions behave exactly like the plain
 `update`/`deleteMany` they wrap - unchanged.
 
+## A relation's own child query respects the mark too
+
+The classic version of this bug: a banned account's orders reappear under
+`account.orders` because the relation loader forgot the filter. [Relations](relation.md)'s
+`hasMany`/`hasOne`/`belongsTo` take an ordinary `childQuery: (Data) =>
+Query<TChild>` closure, the same per-entity wrapper shape every function on
+this page already uses - so a `@softDelete` child table is just a choice of
+which function goes in that closure: `findScopedQuery`, not `find`.
+
+```bit
+import { Dir, Query, RelationLoader, find, findScopedQuery, hasMany, withRelations } from "orm"
+
+@table class Team {
+  @id
+  id: i64
+  @hasMany("teamId")
+  accounts: []Account
+}
+
+fn teamAccountsLoader(): RelationLoader<Team> {
+  return hasMany<Team, Account>(
+    (t) => t.id,
+    (db) => findScopedQuery<Account>(db, "accounts", accountFields(), accountAttrs(), accountMapper),
+    "teamId",
+    (a) => a.id,
+    (t, accts) => {
+      t.accounts = accts
+    },
+  )
+}
+
+fn teamMapper(rows: Rows): Team! {
+  return Team{ id: sqlReqInt(rows, rows.columns(), "id")? }
+}
+
+fn teams(db: Data): Query<Team> {
+  return withRelations(
+    find<Team>(
+      db,
+      "teams",
+      [FieldDesc{ name: "id", typeName: "i64", attrs: []AttrDesc(0) }],
+      teamMapper,
+    ),
+    map<string, RelationLoader<Team>>{ "accounts": teamAccountsLoader() },
+  )
+}
+
+fn teamWithLiveAccounts(db: Data, id: i64): Team! {
+  return teams(db).where("id", Value.Int(id)).with("accounts").oneOrFail()?
+}
+```
+
+`teamWithLiveAccounts` runs two statements - the team, then `select *
+from accounts where team_id in ($1) and deleted_at is null` - never a
+banned account slipping back in under a team it still belongs to on
+paper. `findScopedQuery` returns a plain `Query<T>`, not the
+`withTrashed`/`onlyTrashed`-carrying wrapper `findScoped` does: a relation
+load always respects the child's default scope, the same way every other
+read on this page does when a caller doesn't ask for trashed rows on
+purpose.
+
+`SoftQuery<T>` (what `findScoped` returns) carries `with()`/`after()`
+too, delegating straight to the wrapped `Query<T>` - a `@softDelete`
+PARENT paginating with [keyset pagination](keyset.md) or eager-loading a
+relation works exactly like `accounts(db)` above, no different spelling:
+
+```bit
+fn nextAccountsPage(db: Data, lastId: i64): []Account! {
+  return accounts(db)?.orderBy("id", Dir.Asc).after(Value.Int(lastId))?.limit(50).all()?
+}
+```
+
+`after()`'s own keyset predicate and the automatic `deleted_at is null`
+are both ordinary entries in the same `where` list - order never matters,
+both are `AND`ed.
+
 ## When not to use this
 
 **A unique column blocks re-registration.** `accounts.email unique` plus a
@@ -209,6 +285,8 @@ this page is built to protect the row it just marked.
 ## Where to go next
 
 [Query](query.md) covers the plain `find` chain this page's `findScoped`
-extends. [Patch](patch.md) covers `update`/`deleteMany` before the
+extends, and [keyset pagination](keyset.md)'s own `after()`. [Relations](relation.md)
+covers `hasMany`/`hasOne`/`belongsTo` and `with()` before `findScopedQuery`
+here. [Patch](patch.md) covers `update`/`deleteMany` before the
 soft-delete-aware wrappers here. [Write](write.md) covers `save`/`delete`/
 `upsert` and `TableDesc`, the shape `classAttrs` was added to for this page.
