@@ -48,10 +48,11 @@
 // so the two can never drift.
 //
 // `@id` MARKS THE PRIMARY KEY - `docs/stdlib/sql.md`'s own words: "`pkg/orm`
-// treats `@id` as a primary key". Composite keys are consciously out of
-// scope here (epic #5050's #5084): `primaryKeyField` below panics naming
-// the table if a class carries more than one `@id` field, rather than
-// picking one and updating or deleting by half a key.
+// treats `@id` as a primary key". More than one `@id` field is a composite
+// key (#5084): `pkg/orm/compositekey.bit`'s `keyFields` returns every one of
+// them, in declaration order, and every predicate below (`updateSql`,
+// `updateVersionedSql`, `deleteSql`) names every column that returns in its
+// own `WHERE` - never picking one and updating or deleting by half a key.
 //
 // UPDATE AND DELETE USE `db.exec`, NEVER `db.query` - `stdlib/sql/sql.bit`'s
 // own header: "`exec` REPORTS AFFECTED ROWS, NEVER A ROW SET", the exact
@@ -126,10 +127,10 @@ export enum WriteCause { NoRowsAffected }
 export class WriteError {
   export cause: WriteCause
   export table: string
-  export key: Value
+  export keys: []Value
 
   message(): string {
-    return "pkg/orm: update matched 0 rows in the class mapped to '${this.table}' with key ${valueText(this.key)}"
+    return "pkg/orm: update matched 0 rows in the class mapped to '${this.table}' with key ${keyText(this.keys)}"
   }
 }
 
@@ -158,16 +159,14 @@ export fn save(
 // caller's own wrapper clears the flag after a successful call, the way
 // `saveUser` above sets it after a successful `save`.
 export fn delete(db: Data, desc: TableDesc, values: map<string, Value>): ()! {
-  let pk = primaryKeyField(desc)
+  let kf = keyFields(desc)
   let col = softDeleteColumn(desc.classAttrs, desc.fields, desc.table)?
   if (col != "") {
-    db.exec(
-      softDeleteUpdateSql(desc.table, col, columnName(pk)),
-      [valueFor(values, pk, desc.table)],
-    )?
+    let (whereSql, args) = keyPredicate(kf, values, desc.table, 0)
+    db.exec(softDeleteUpdateSql(desc.table, col, whereSql), args)?
     return
   }
-  let (sqlText, args) = deleteSql(desc, pk, values)
+  let (sqlText, args) = deleteSql(desc, kf, values)
   db.exec(sqlText, args)?
 }
 
@@ -209,18 +208,18 @@ fn insertRow(db: Data, desc: TableDesc, values: map<string, Value>): SaveResult!
 // optimistic-locking branch; a table without it keeps the plain 0-rows-is-
 // an-error UPDATE #5058 already established.
 fn updateRow(db: Data, desc: TableDesc, values: map<string, Value>): SaveResult! {
-  let pk = primaryKeyField(desc)
+  let kf = keyFields(desc)
   let (vf, hasVersion) = versionField(desc.fields, desc.table)?
   if (hasVersion) {
-    return updateRowVersioned(db, desc, values, pk, vf)?
+    return updateRowVersioned(db, desc, values, kf, vf)?
   }
-  let (sqlText, args) = updateSql(desc, values, pk)
+  let (sqlText, args) = updateSql(desc, values, kf)
   let n = db.exec(sqlText, args)?
   if (n == 0) {
     fail WriteError{
       cause: WriteCause.NoRowsAffected,
       table: desc.table,
-      key: valueFor(values, pk, desc.table),
+      keys: keyValues(kf, values, desc.table),
     }
   }
   return SaveResult{ inserted: false, generated: map<string, Value>(0) }
@@ -239,17 +238,17 @@ fn updateRowVersioned(
   db: Data,
   desc: TableDesc,
   values: map<string, Value>,
-  pk: FieldDesc,
+  keyFields: []FieldDesc,
   vf: FieldDesc,
 ): SaveResult! {
   let oldVersion = versionValue(values, vf, desc.table)
   let newVersion = oldVersion + 1
-  let (sqlText, args) = updateVersionedSql(desc, values, pk, vf, newVersion)
+  let (sqlText, args) = updateVersionedSql(desc, values, keyFields, vf, newVersion)
   let n = db.exec(sqlText, args)?
   if (n == 0) {
     fail StaleWriteError{
       table: desc.table,
-      key: valueFor(values, pk, desc.table),
+      keys: keyValues(keyFields, values, desc.table),
       oldVersion: oldVersion,
       newVersion: newVersion,
     }
@@ -313,28 +312,33 @@ fn insertSql(desc: TableDesc, values: map<string, Value>): (string, []Value) {
   return (sqlText, args)
 }
 
-fn updateSql(desc: TableDesc, values: map<string, Value>, pk: FieldDesc): (string, []Value) {
+fn updateSql(
+  desc: TableDesc,
+  values: map<string, Value>,
+  keyFields: []FieldDesc,
+): (string, []Value) {
   let sets = []string(0)
   let args = []Value(0)
   for f of desc.fields {
     args = append(args, valueFor(values, f, desc.table))
     sets = append(sets, "${columnName(f)} = $${len(args)}")
   }
-  args = append(args, valueFor(values, pk, desc.table))
-  let sqlText = "update ${desc.table} set ${join(sets, ", ")} where ${columnName(pk)} = $${len(args)}"
-  return (sqlText, args)
+  let (whereSql, keyArgs) = keyPredicate(keyFields, values, desc.table, len(args))
+  let sqlText = "update ${desc.table} set ${join(sets, ", ")} where ${whereSql}"
+  return (sqlText, concat(args, keyArgs))
 }
 
 // `updateSql`'s `@version` sibling - every column still appears in `SET`
 // (this file's own "every column" convention), but the version column's
 // bound value is `newVersion`, not `values`'s own (still old) entry, and
-// the `WHERE` carries `pk = ... and version = ...` instead of `pk = ...`
-// alone - `pkg/orm/version.bit`'s header has the worked example and the
-// race argument.
+// the `WHERE` carries `key... and version = ...` instead of `key...` alone
+// - `pkg/orm/version.bit`'s header has the worked example and the race
+// argument. `keyFields` may be more than one column (#5084); every one of
+// them lands in the `WHERE` ahead of the version check.
 fn updateVersionedSql(
   desc: TableDesc,
   values: map<string, Value>,
-  pk: FieldDesc,
+  keyFields: []FieldDesc,
   vf: FieldDesc,
   newVersion: int,
 ): (string, []Value) {
@@ -348,17 +352,22 @@ fn updateVersionedSql(
     }
     sets = append(sets, "${columnName(f)} = $${len(args)}")
   }
-  args = append(args, valueFor(values, pk, desc.table))
-  let pkMark = "$${len(args)}"
-  args = append(args, valueFor(values, vf, desc.table))
-  let versionMark = "$${len(args)}"
-  let sqlText = "update ${desc.table} set ${join(sets, ", ")} where ${columnName(pk)} = ${pkMark} and ${columnName(vf)} = ${versionMark}"
-  return (sqlText, args)
+  let (keySql, keyArgs) = keyPredicate(keyFields, values, desc.table, len(args))
+  let args2 = concat(args, keyArgs)
+  args2 = append(args2, valueFor(values, vf, desc.table))
+  let versionMark = "$${len(args2)}"
+  let sqlText = "update ${desc.table} set ${join(sets, ", ")} where ${keySql} and ${columnName(vf)} = ${versionMark}"
+  return (sqlText, args2)
 }
 
-fn deleteSql(desc: TableDesc, pk: FieldDesc, values: map<string, Value>): (string, []Value) {
-  let sqlText = "delete from ${desc.table} where ${columnName(pk)} = $1"
-  return (sqlText, [valueFor(values, pk, desc.table)])
+fn deleteSql(
+  desc: TableDesc,
+  keyFields: []FieldDesc,
+  values: map<string, Value>,
+): (string, []Value) {
+  let (whereSql, args) = keyPredicate(keyFields, values, desc.table, 0)
+  let sqlText = "delete from ${desc.table} where ${whereSql}"
+  return (sqlText, args)
 }
 
 // `col = excluded.col` for every column but the conflict target, which
@@ -418,29 +427,10 @@ fn valueFor(values: map<string, Value>, field: FieldDesc, table: string): Value 
   return v
 }
 
-// The one field carrying `@id`, or a panic naming the table - for no
-// `@id` at all, or for more than one (a composite key, out of scope here;
-// see this file's header).
-fn primaryKeyField(desc: TableDesc): FieldDesc {
-  let idx = -1
-  let count = 0
-  for (i, f) in desc.fields {
-    if (hasIdAttr(f)) {
-      count = count + 1
-      if (idx < 0) {
-        idx = i
-      }
-    }
-  }
-  if (count == 0) {
-    panic("pkg/orm: no field of the class mapped to '${desc.table}' carries '@id'")
-  }
-  if (count > 1) {
-    panic("pkg/orm: the class mapped to '${desc.table}' carries more than one '@id' field - composite primary keys are not supported yet (#5084)")
-  }
-  return desc.fields[idx]
-}
-
+// Whether `f` carries `@id` - `pkg/orm/compositekey.bit`'s own `keyFields`
+// calls this (same package, no import, SPEC §17.1); `generate.bit`'s header
+// names this exact function as reused there too, so it stays here rather
+// than moving with the rest of the key-field logic.
 fn hasIdAttr(f: FieldDesc): bool {
   for a of f.attrs {
     if (a.name == "id") {
@@ -450,12 +440,23 @@ fn hasIdAttr(f: FieldDesc): bool {
   return false
 }
 
-// `on`'s field, or the primary key when `on` is empty (`upsert`'s own
-// default) - a panic naming both when `on` names no field of `desc.fields`,
-// the same category `columnFor` (pkg/orm/query.bit) panics for.
+// `on`'s field, or the single key field when `on` is empty and the class
+// carries exactly one `@id` (`upsert`'s own default) - a panic naming both
+// when `on` names no field of `desc.fields`, the same category `columnFor`
+// (pkg/orm/query.bit) panics for. `upsert` cannot default `on` against a
+// composite key: `ON CONFLICT`/`ON DUPLICATE KEY UPDATE` need an explicit
+// conflict target this file has no way to widen to every key column without
+// changing `upsert`'s own SQL-building shape (`upsertPostgresSql`/
+// `upsertMysqlSql`), out of this ticket's scope (#5084) - so that case
+// panics too, naming every key field, rather than silently picking the
+// first and upserting on half the key.
 fn onFieldOrPrimary(desc: TableDesc, on: string): FieldDesc {
   if (on == "") {
-    return primaryKeyField(desc)
+    let kf = keyFields(desc)
+    if (len(kf) > 1) {
+      panic("pkg/orm: upsert with no 'on' needs a single-column key; the class mapped to '${desc.table}' carries a composite key (${keyFieldNames(kf)}) - pass on explicitly naming one column (#5084)")
+    }
+    return kf[0]
   }
   for f of desc.fields {
     if (f.name == on) {

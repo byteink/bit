@@ -1,0 +1,198 @@
+// pkg/orm/compositekey.bit — composite primary keys, `@id` on more than one
+// field (#5084, owner decision 2026-09-12): every place this package used to
+// reach through a single `@id` field now reaches through `keyFields` below,
+// which is every `@id` field, in declaration order, one column or many.
+//
+//   @table
+//   class Membership {
+//     @id userId: i64
+//     @id teamId: i64
+//     role: string
+//   }
+//
+//   db.save(m)?      // WHERE user_id = $1 AND team_id = $2
+//   db.delete(m)?    // same
+//
+// WHY THIS IS A SEPARATE FILE FROM `write.bit`, NOT A WIDER
+// `primaryKeyField`. `write.bit`'s own predicate builders (`updateSql`,
+// `updateVersionedSql`, `deleteSql`) still live there — this file is the one
+// place that decides WHICH fields make up the key and HOW their values are
+// rendered, shared by `write.bit`, `softdelete.bit`'s `restore`/
+// `forceDelete`, and this file's own `byKey` — the same "group what always
+// travels together" reasoning `write.bit`'s own `TableDesc` already gives.
+//
+// `hasIdAttr` STAYS IN `write.bit`, UNCHANGED. `generate.bit`'s own header
+// calls it "write.bit's own `hasIdAttr`, reused here" — moving it would make
+// that comment name the wrong file. `keyFields` below calls it exactly the
+// way `write.bit`'s old `primaryKeyField` did (same package, no import,
+// SPEC §17.1).
+//
+// `byKey` IS A FREE FUNCTION OVER AN ALREADY-BUILT `Query<T>`, NEVER A
+// CHAIN METHOD. The ticket's own sketch reads `find<T>().byKey(...)`, which
+// would need a method declared inside `Query<T>` — but `pkg/orm/query.bit`
+// is held by another agent for this ticket's entire run (task brief,
+// 2026-09-16). A free function taking the caller's own `find<T>(...)`
+// result needs no change there: `byKey(find<Membership>(db, ...), desc,
+// key)?.oneOrFail()?` reads one call longer than a chain but touches no
+// locked file. Revisit folding this into `Query<T>` once that file is free.
+//
+// WHY A MISSING KEY PART FAILS BEFORE ANY `q.where(...)` CALL, NOT AFTER.
+// `byKey` checks every field `keyFields` names is present in the caller's
+// `key` map FIRST, in one pass, before calling `q.where(...)` for ANY of
+// them. A half-applied `where` chain (stop as soon as one part is missing)
+// would still leave the query narrowed by whichever key parts DID arrive —
+// exactly the "matches many rows instead of the one you meant" failure this
+// ticket exists to close, so this file never partially narrows: either every
+// part is there before the first `where`, or none of them run and the query
+// stays as the caller built it, with `q.where` never touched.
+//
+// AT-MOST-ONE-GENERATED IS ENFORCED AT THE SCHEMA-BUILDER LEVEL, NOT HERE.
+// This package has no per-field attribute marking a column database-
+// generated — the only place that concept exists at all is `ColumnType.Id`
+// (`schema.bit`), decided by whoever calls `t.id(...)` vs `t.int(...)`
+// while building DDL. `validateCompositeKey` below therefore takes a
+// `Table` (schema.bit's own builder tree), not a `TableDesc`/`[]FieldDesc`
+// — checking the ENTITY descriptor for "generated" cannot be done honestly
+// without guessing.
+//
+// `Query`/`Data`/`Value`/`FieldDesc` are imported by `query.bit`/`data.bit`/
+// `naming.bit`, this file's siblings in the same module (SPEC §17.1); a
+// second import here would be E0042. `newError` (errors.bit), `columnName`
+// (naming.bit), `valueFor`/`hasIdAttr` (write.bit), `join` (query.bit),
+// `columnTypeOf`/`ColumnType`/`Table` (schema.bit) likewise.
+
+// Every field carrying `@id`, in declaration order — one column for an
+// ordinary entity, more than one for a composite key. Panics naming the
+// table for zero `@id` fields at all, the same category `write.bit`'s own
+// `valueFor` panics for: a caller bug (a class mapped with no key at all),
+// never picking a column and silently proceeding.
+export fn keyFields(desc: TableDesc): []FieldDesc {
+  let out = []FieldDesc(0)
+  for f of desc.fields {
+    if (hasIdAttr(f)) {
+      out = append(out, f)
+    }
+  }
+  if (len(out) == 0) {
+    panic("pkg/orm: no field of the class mapped to '${desc.table}' carries '@id'")
+  }
+  return out
+}
+
+// Every key field's own name, comma-joined — what an error names when it
+// must list the whole key, e.g. a composite key `upsert` cannot default
+// `on` against.
+fn keyFieldNames(fields: []FieldDesc): string {
+  let names = []string(0)
+  for f of fields {
+    names = append(names, f.name)
+  }
+  return join(names, ", ")
+}
+
+// `col1 = $n1 and col2 = $n2 ...` over `keyFields`, in declaration order,
+// its own bound values numbered starting at `offset + 1` — the shared
+// WHERE-by-key predicate `write.bit`'s `updateSql`/`updateVersionedSql`/
+// `deleteSql` and `softdelete.bit`'s soft-delete `UPDATE` all build off, so
+// a composite key's UPDATE/DELETE never carries a WHERE naming only one of
+// its columns (this ticket's own worked failure mode). Returns its OWN
+// fresh `[]Value` rather than appending to a caller-supplied one — a
+// slice-typed parameter grown in place and handed back inside a tuple
+// return is exactly the aliasing shape `bit lint`'s E0214 flags
+// (`compiler/lintappend.bit`'s own header: it tracks a bare `return p` or
+// one hop through a returned composite literal FIELD, never a raw tuple
+// element), so a caller with an existing `args` list concatenates the two
+// itself (`concat`, `std/seq`, already imported package-wide by
+// `pkg/orm/relation.bit`) instead of this function mutating one in place.
+export fn keyPredicate(
+  keyFields: []FieldDesc, values: map<string, Value>, table: string, offset: int,
+): (string, []Value) {
+  let parts = []string(0)
+  let out = []Value(0)
+  let n = offset
+  for f of keyFields {
+    out = append(out, valueFor(values, f, table))
+    n = n + 1
+    parts = append(parts, "${columnName(f)} = $${n}")
+  }
+  return (join(parts, " and "), out)
+}
+
+// Every key field's current value out of `values`, in the same order as
+// `keyFields` — what `WriteError`/`StaleWriteError` carry instead of a
+// single `Value`, and what `keyText` below renders.
+export fn keyValues(keyFields: []FieldDesc, values: map<string, Value>, table: string): []Value {
+  let out = []Value(0)
+  for f of keyFields {
+    out = append(out, valueFor(values, f, table))
+  }
+  return out
+}
+
+// Every key value, rendered for an error message. A single value prints
+// exactly as `valueText` (write.bit) always has — byte-identical to before
+// this ticket for a plain, single-`@id` class; two or more print as
+// `(v1, v2, ...)`, so a composite key's error names every column, never
+// just the first.
+export fn keyText(keys: []Value): string {
+  if (len(keys) == 1) {
+    return valueText(keys[0])
+  }
+  let parts = []string(0)
+  for v of keys {
+    parts = append(parts, valueText(v))
+  }
+  return "(${join(parts, ", ")})"
+}
+
+// Narrows an already-built `Query<T>` to exactly the row(s) matching every
+// key field of `desc`, composite or not — the `find<T>(...).byKey(...)`
+// shape this ticket's own acceptance names (this file's header on why it is
+// a free function, not a `Query<T>` method). `key` must carry every field
+// `keyFields` returns; the first absent one fails naming it, before
+// `q.where(...)` runs for any part (this file's header).
+export fn byKey<T>(q: Query<T>, desc: TableDesc, key: map<string, Value>): Query<T>! {
+  let kf = keyFields(desc)
+  for f of kf {
+    let (_, ok) = key[f.name]
+    if (!ok) {
+      fail newError("pkg/orm: byKey on the class mapped to '${desc.table}' is missing key field '${f.name}'")
+    }
+  }
+  for f of kf {
+    let (v, _) = key[f.name]
+    q = q.where(f.name, v)
+  }
+  return q
+}
+
+// Refuses a `Table` (schema.bit) whose composite primary key names more
+// than one database-generated (`ColumnType.Id`) column — at most one may be
+// database-generated; the rest must be supplied by the caller (this
+// ticket's own constraint). Two generated columns in one key is not
+// expressible in either dialect: each would need its own independent
+// `GENERATED ALWAYS AS IDENTITY`/`AUTO_INCREMENT` sequence, so the pair
+// could never collide the way a real composite key's rows must. A table
+// with fewer than two `primaryKeyColumns` (the ordinary case) is never
+// checked — a single `t.id(...)` already carries its own inline `primary
+// key` and was never subject to this limit.
+export fn validateCompositeKey(t: Table): ()! {
+  if (len(t.primaryKeyColumns) < 2) {
+    return
+  }
+  let generated = []string(0)
+  for name of t.primaryKeyColumns {
+    let (colType, found) = columnTypeOf(t, name)
+    if (found && colType == ColumnType.Id) {
+      generated = append(generated, name)
+    }
+  }
+  if (len(generated) > 1) {
+    fail newError(
+      "pkg/orm: composite primary key on '${t.name}' names more than one database-generated column: ${join(
+        generated,
+        ", ",
+      )} - at most one may be database-generated (#5084)",
+    )
+  }
+}

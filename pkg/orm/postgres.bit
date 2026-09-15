@@ -65,12 +65,18 @@ export class Postgres {
 // `raw()` passthrough, in declaration order — see dialect.bit's header for
 // why these are separate `Statement`s rather than one blob.
 fn renderCreateTable(t: Table): []Statement {
+  validateCompositeKey(t) catch e {
+    panic(e.message())
+  }
   let defs = []string(0)
   for c of t.columns {
-    defs = append(defs, columnDef(c))
+    defs = append(defs, columnDef(c, inPrimaryKey(t, c.name)))
   }
   for fk of t.foreignKeys {
     defs = append(defs, foreignKeyDef(t.name, fk))
+  }
+  if (len(t.primaryKeyColumns) > 0) {
+    defs = append(defs, primaryKeyDef(t.primaryKeyColumns))
   }
   let body = join(defs, ",\n  ")
   let sql = "create table ${quoteIdent(t.name)} (\n  ${body}\n);"
@@ -102,7 +108,7 @@ fn renderAlterTable(t: AlterTable): []Statement {
 fn alterOpStatement(table: string, op: AlterOp): Statement {
   match (op) {
     AddColumn(c) => return Statement{
-      sql: "alter table ${quoteIdent(table)} add column ${columnDef(c)};",
+      sql: "alter table ${quoteIdent(table)} add column ${columnDef(c, false)};",
       transactional: true,
     }
     DropColumn(name) => return Statement{
@@ -125,9 +131,16 @@ fn dropTableStatement(name: string): Statement {
 // which Postgres' own docs discourage and which leaves a sequence with
 // separate ownership — and returns early: an identity primary key needs no
 // `not null`/`unique` suffix regardless of what `Column.isNullable`/
-// `isUnique` happen to hold on that node.
-fn columnDef(c: Column): string {
+// `isUnique` happen to hold on that node. `inCompositeKey` is true only when
+// `c.name` is one of `Table.primaryKeyColumns` (#5084) — that column's own
+// `primary key` moves to the table-level `primary key (...)` clause
+// `renderCreateTable` appends instead, so the two never both declare one
+// (Postgres rejects a table naming a primary key twice).
+fn columnDef(c: Column, inCompositeKey: bool): string {
   if (c.colType == ColumnType.Id) {
+    if (inCompositeKey) {
+      return "${quoteIdent(c.name)} bigint generated always as identity"
+    }
     return "${quoteIdent(c.name)} bigint generated always as identity primary key"
   }
   let parts = [quoteIdent(c.name), pgType(c.colType)]
@@ -138,6 +151,30 @@ fn columnDef(c: Column): string {
     parts = append(parts, "unique")
   }
   return join(parts, " ")
+}
+
+// Whether `name` is one of `t.primaryKeyColumns` — an empty
+// `primaryKeyColumns` (the ordinary, non-composite table) answers false for
+// every column, so `columnDef` above renders exactly as it always has.
+fn inPrimaryKey(t: Table, name: string): bool {
+  for c of t.primaryKeyColumns {
+    if (c == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// `primary key (col1, col2, ...)`, in `columns`'s own order — the
+// table-level constraint a composite key needs (#5084); a single-column key
+// never reaches this, since `Table.id`'s own inline `primary key` already
+// covers that case and `primaryKeyColumns` stays empty for it.
+fn primaryKeyDef(columns: []string): string {
+  let quoted = []string(0)
+  for c of columns {
+    quoted = append(quoted, quoteIdent(c))
+  }
+  return "primary key (${join(quoted, ", ")})"
 }
 
 // `ColumnType` -> Postgres type keyword. See this file's header for why
@@ -154,20 +191,39 @@ fn pgType(colType: ColumnType): string {
   }
 }
 
-// `CONSTRAINT ... FOREIGN KEY ... REFERENCES ...`, named
-// `<table>_<column>_fkey` (Postgres' own naming convention). Panics naming
-// the column and table when `references(...)` was never called — schema.bit
-// builds that node but deliberately leaves it "a structurally incomplete
-// node rather than a builder-time failure" (schema.bit's own header): the
-// dialect is where a missing target must surface, and a panic (a caller
-// bug, not recoverable data) is the same category `pkg/orm/write.bit`'s own
-// `valueFor`/`primaryKeyField` already panic for.
+// `CONSTRAINT ... FOREIGN KEY (...) REFERENCES ...(...)`, named
+// `<table>_<col1>_<col2>_fkey` (Postgres' own naming convention, extended to
+// every column for a composite reference, #5084). Panics naming the columns
+// and table when `references(...)` was never called, or named a different
+// number of columns than `foreign(...)` did — schema.bit builds that node
+// but deliberately leaves it "a structurally incomplete node rather than a
+// builder-time failure" (schema.bit's own header): the dialect is where a
+// missing or mismatched target must surface, and a panic (a caller bug, not
+// recoverable data) is the same category `pkg/orm/write.bit`'s own
+// `valueFor` already panics for. `columns`/`refColumns` are rendered in
+// their own given order on both sides, never reordered — matching the
+// referenced key's own column order is the caller's job (`ForeignKey`'s own
+// header on #5084).
 fn foreignKeyDef(table: string, fk: ForeignKey): string {
-  if (fk.refTable == "" || fk.refColumn == "") {
-    panic("pkg/orm: foreign key on '${fk.column}' of '${table}' has no references(...) target")
+  if (fk.refTable == "" || len(fk.refColumns) == 0) {
+    panic("pkg/orm: foreign key on '${join(fk.columns, ", ")}' of '${table}' has no references(...) target")
   }
-  let name = quoteIdent("${table}_${fk.column}_fkey")
-  let clause = "constraint ${name} foreign key (${quoteIdent(fk.column)}) references ${quoteIdent(fk.refTable)} (${quoteIdent(fk.refColumn)})"
+  if (len(fk.columns) != len(fk.refColumns)) {
+    panic("pkg/orm: foreign key on '${join(fk.columns, ", ")}' of '${table}' names ${len(fk.columns)} column(s) but references(...) named ${len(fk.refColumns)}")
+  }
+  let name = quoteIdent("${table}_${join(fk.columns, "_")}_fkey")
+  let cols = []string(0)
+  for c of fk.columns {
+    cols = append(cols, quoteIdent(c))
+  }
+  let refCols = []string(0)
+  for c of fk.refColumns {
+    refCols = append(refCols, quoteIdent(c))
+  }
+  let clause = "constraint ${name} foreign key (${join(cols, ", ")}) references ${quoteIdent(fk.refTable)} (${join(
+    refCols,
+    ", ",
+  )})"
   let action = onDeleteClause(fk.onDeleteAction)
   if (action != "") {
     return clause + " " + action
