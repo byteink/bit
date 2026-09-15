@@ -1,0 +1,149 @@
+// pkg/orm/bulk.bit — insertAll, one statement per chunk, never one per row
+// (#5072). A thousand rows through `save` (write.bit) in a loop is a
+// thousand round trips; this is `ceil(n / chunkSize)`.
+//
+//     let generated = insertAll(db, personDesc(), rows)?
+//     for (i, g) in generated {
+//       let (id, ok) = g["id"]
+//       if (ok) { people[i].id = intValue(id) }
+//       people[i].markPersisted(true)
+//     }
+//
+// WHY THIS TAKES `desc`/`rows` EXPLICITLY, NOT `[]T` — the identical limit
+// `pkg/orm/write.bit`'s own header documents for `save`/`upsert`:
+// `markPersisted`/`isPersisted` only resolve on a concrete `@table` class,
+// never inside a function generic over an unconstrained `T`. `rows` is
+// `[]map<string, Value>`, keyed by Bit field name exactly like `save`'s own
+// `values` — the caller applies the returned, per-row generated columns
+// back onto its concrete entities and marks them persisted itself, the same
+// division of labour `docs/write.md`'s `savePerson` already establishes.
+//
+// THE CHUNK SIZE IS COMPUTED, NEVER GUESSED (the ticket's own constraint).
+// Postgres caps a single statement's bound parameters at 65535
+// (`maxBoundParams` below); a row of `n` columns can carry at most
+// `65535 / n` rows before that statement would exceed the limit, so
+// `maxRowsPerChunk` divides rather than hardcoding a constant tuned to any
+// one entity's width.
+//
+// EVERY ROW ARRIVES EXACTLY ONCE, IN ORDER. `insertAll` walks `rows` in
+// fixed-size slices (the last one short when `len(rows)` is not a multiple
+// of the chunk size) and appends each chunk's `RETURNING *` rows, read back
+// in the order Postgres returns them for a single `INSERT ... VALUES
+// (...), (...), ...` — the same order the `VALUES` list was written in, so
+// `generated[i]` corresponds to `rows[i]`.
+//
+// SECURITY AND ERROR SHAPE MATCH `write.bit` EXACTLY. Every column name
+// comes from `desc.fields` via `columnName` — this file never takes a
+// caller-supplied column name at all, so there is no raw string to check
+// against `T`'s fields the way `compiler/checkormquery.bit` checks
+// `where`/`orderBy`; every value is a bound `$n` argument built by
+// `appendRowArgs` below, never pasted into SQL text. A row missing a
+// declared field panics via `valueFor` (write.bit), the same caller-bug
+// category every other write in this package panics for. A constraint
+// violation reaches the caller as `err`, unclassified here — call
+// `classify(err, desc.table)` (errors.bit) the same way a single `save`'s
+// caller would.
+//
+// `join` (std/strings), `Data`/`Value`/`Rows`, `TableDesc`, `columnName`,
+// `valueFor` and `rowByFields` are imported/declared by
+// ./query.bit/./data.test.bit/./write.bit/./naming.bit, this file's
+// siblings in the same module (SPEC §17.1) — importing or redeclaring any
+// of them here would be E0042.
+
+// Postgres's own bound-parameter ceiling per statement — the number
+// `maxRowsPerChunk` divides by `desc.fields`' width.
+const maxBoundParams: int = 65535
+
+// The most rows one INSERT can carry without exceeding `maxBoundParams`
+// bound parameters, for a row of `columns` values. Floor division: a
+// partial row's worth of headroom buys nothing. `columns <= 0` cannot
+// happen for a real `@table` class (it always carries `@id`), but returns 1
+// rather than dividing by zero, so a chunk still makes forward progress.
+fn maxRowsPerChunk(columns: int): int {
+  if (columns <= 0) {
+    return 1
+  }
+  let n = maxBoundParams / columns
+  if (n < 1) {
+    return 1
+  }
+  return n
+}
+
+// INSERT every row of `rows` in as few statements as `maxRowsPerChunk`
+// allows, in order, never one statement per row. Returns each inserted
+// row's database-written columns (`RETURNING *`), one map per input row, at
+// the same index — see this file's header for why the caller, not this
+// function, applies them onto a concrete entity.
+export fn insertAll(db: Data, desc: TableDesc, rows: []map<string, Value>): []map<string, Value>! {
+  let out = []map<string, Value>(0)
+  let chunkSize = maxRowsPerChunk(len(desc.fields))
+  let i = 0
+  while (i < len(rows)) {
+    let end = i + chunkSize
+    if (end > len(rows)) {
+      end = len(rows)
+    }
+    let generated = insertChunk(db, desc, rows[i:end])?
+    for g of generated {
+      out = append(out, g)
+    }
+    i = end
+  }
+  return out
+}
+
+// One `INSERT ... VALUES (...), (...), ... RETURNING *` for `chunk`, never
+// empty (`insertAll`'s own loop only calls this with a non-empty slice).
+fn insertChunk(db: Data, desc: TableDesc, chunk: []map<string, Value>): []map<string, Value>! {
+  let (sqlText, args) = insertAllSql(desc, chunk)
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  let out = []map<string, Value>(0)
+  while (rows.next()?) {
+    out = append(out, rowByFields(rows, desc.fields))
+  }
+  return out
+}
+
+// `insert into <table> (<cols>) values (<row0 marks>), (<row1 marks>), ...
+// returning *` — every column in `desc.fields` order, once per row in
+// `chunk`, with placeholders numbered continuously across the whole
+// statement (row 1 is `$1..$n`, row 2 is `$(n+1)..$(2n)`, and so on).
+fn insertAllSql(desc: TableDesc, chunk: []map<string, Value>): (string, []Value) {
+  let cols = []string(0)
+  for f of desc.fields {
+    cols = append(cols, columnName(f))
+  }
+  let groups = []string(0)
+  let args = []Value(0)
+  for row of chunk {
+    let (marks, vals) = rowMarksAndArgs(desc, row, len(args))
+    for v of vals {
+      args = append(args, v)
+    }
+    groups = append(groups, "(" + join(marks, ", ") + ")")
+  }
+  let sqlText = "insert into ${desc.table} (${join(cols, ", ")}) values ${join(groups, ", ")} returning *"
+  return (sqlText, args)
+}
+
+// One row's placeholders and bound values, numbered starting at
+// `startCount + 1` — `insertAllSql`'s own loop passes `len(args)` so
+// placeholders keep counting up across the whole statement (row 1 is
+// `$1..$n`, row 2 is `$(n+1)..$(2n)`, and so on) instead of each row
+// restarting at `$1` the way `write.bit`'s single-row `insertColumnsAndArgs`
+// does. Returns a freshly built `[]Value`, owned by this call alone, so the
+// caller's own `args` is only ever grown by an ordinary `append`, never
+// passed in and mutated through this function boundary.
+fn rowMarksAndArgs(desc: TableDesc, row: map<string, Value>, startCount: int): ([]string, []Value) {
+  let marks = []string(0)
+  let vals = []Value(0)
+  let n = startCount
+  for f of desc.fields {
+    vals = append(vals, valueFor(row, f, desc.table))
+    n = n + 1
+    marks = append(marks, "$${n}")
+  }
+  return (marks, vals)
+}

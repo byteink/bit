@@ -14,7 +14,10 @@ entity, decided by a hidden flag rather than the primary key, and 0 rows
 matched by an UPDATE is an error rather than a silent no-op, and
 `update`/`deleteMany`, the patch builder for writing or removing rows by a
 `where` clause with no instance loaded - a bare call touching every row is
-refused unless `.all()` says so on purpose.
+refused unless `.all()` says so on purpose, `insertAll`, many rows in one
+statement, chunked at a computed placeholder limit rather than one
+statement per row, and `Query<T>.after`, keyset pagination - `WHERE id >
+$n` instead of a growing `OFFSET`, so a deep page costs what page 1 does.
 
 ## Install
 
@@ -52,6 +55,9 @@ Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is
 [`docs/patch.md`](docs/patch.md). Turning a driver's constraint-violation
 error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
+Inserting many rows in one statement is [`docs/bulk.md`](docs/bulk.md).
+Paginating a large table without `OFFSET`'s cost growing with depth is
+[`docs/keyset.md`](docs/keyset.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
