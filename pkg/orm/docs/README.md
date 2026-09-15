@@ -10,3 +10,5 @@
 | [Write](write.md) | `save`, `delete` and `upsert`: INSERT vs UPDATE decided by the persisted flag, never the primary key, and why 0 rows matched is an error |
 | [Patch](patch.md) | `update`/`deleteMany`: writing or removing rows by a `where` clause with no instance loaded, for a single column or a bulk write |
 | [Errors](errors.md) | Turning a driver's constraint-violation error into a typed, catchable cause via `classify`, decided from SQLSTATE, never message text |
+| [Bulk insert](bulk.md) | `insertAll`: many rows in one statement, chunked at a computed placeholder limit, never one statement per row |
+| [Keyset pagination](keyset.md) | `after`: `WHERE id > $n` instead of `OFFSET`, so a deep page costs what page 1 costs |
