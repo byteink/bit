@@ -4,22 +4,22 @@
 //
 //     db.tx((db) => {
 //       let q = find<Account>(db, "accounts", fields, mapper).where("id", 1)
-//       let a = forUpdate<Account>(q, LockOpts{}).oneOrFail()?
+//       let a = forUpdate<Account>(q, LockOpts{}, LockDialect.Neutral).oneOrFail()?
 //       a.balance = a.balance - amt
 //       db.save(a)?
 //     })?
 //
 //     db.tx((db) => {
 //       let q = find<Job>(db, "jobs", fields, mapper).where("state", "pending").limit(1)
-//       let job = forUpdate<Job>(q, LockOpts{ skipLocked: true }).one()?
+//       let job = forUpdate<Job>(q, LockOpts{ skipLocked: true }, LockDialect.Neutral).one()?
 //     })?
 //
-// ON THE CHAIN TOO, AS OF #5383: `Query<T>.forUpdate(opts)`
+// ON THE CHAIN TOO, AS OF #5383: `Query<T>.forUpdate(opts, dialect)`
 // (`pkg/orm/query.bit`) is one line delegating into `forUpdate<T>` below —
 //
 //     db.tx((db) => {
 //       let a = find<Account>(db, "accounts", fields, mapper).where("id", 1)
-//         .forUpdate(LockOpts{}).oneOrFail()?
+//         .forUpdate(LockOpts{}, LockDialect.Neutral).oneOrFail()?
 //     })?
 //
 // — the same way `after()` (declared in query.bit) calls into
@@ -68,18 +68,28 @@
 // since a caller building a query dynamically can reasonably reach this path
 // and needs to recover from it.
 //
-// MYSQL'S VERSION GATE IS A SEPARATE, EXPLICIT-PARAMETER FUNCTION, THE SAME
-// SHAPE `write.bit`'s OWN `upsert` USES. Postgres and MySQL 8 render the
-// identical clause text (`lockClause` below is the whole story for both) —
-// only MySQL below 8.0 cannot run `SKIP LOCKED`/`NOWAIT` at all (mysql.bit's
-// own header names this exact trap: a spelling legal on one engine, a syntax
-// error on the other). Nothing in `Data`/`Executor` carries a server version
-// today — `write.bit`'s header gives the identical reason `upsert` takes
-// `dialect: UpsertDialect` explicitly instead of reading it off `db` — so
-// `mysqlLockClause` below takes the version explicitly too, exactly the gap
-// `mysql.bit`'s own header flags rather than guesses around (its `time_zone`
-// note). A caller who knows it is targeting MySQL calls this instead of
-// `lockClause`, supplying what it already knows about its own server.
+// MYSQL'S VERSION GATE IS AN EXPLICIT, REQUIRED PARAMETER ON `forUpdate`
+// ITSELF (#5391, fixed) — NOT A SEPARATE FUNCTION A CALLER MUST REMEMBER TO
+// RUN FIRST. `mysqlLockClause` (below) used to be exactly that: a public
+// function nothing in this file's own `guard()` ever called, so a caller who
+// forgot the separate pre-check got `SKIP LOCKED`/`NOWAIT` sent straight to
+// a MySQL 5.7 server and a syntax error back, with the guard built to
+// prevent exactly that never consulted. `forUpdate<T>`/`Query<T>.forUpdate`
+// now take `dialect: LockDialect` explicitly, the same "nothing on `Data`
+// carries a server version, so the caller supplies it" reasoning
+// `write.bit`'s `upsert` gives for `dialect: UpsertDialect` — but
+// `UpsertDialect` alone (`Postgres`/`Mysql`, no data) cannot express "MySQL
+// 5.7" vs "MySQL 8.0", which is the whole question this file's guard has to
+// answer, so `LockDialect` carries a `MysqlVersion` on its `Mysql` variant
+// instead of inventing a third shape: `LockDialect.Neutral` for Postgres or
+// MySQL 8+ (`lockClause` alone is already correct for both), `LockDialect.
+// Mysql(version)` for anything targeting MySQL, checked at `version` by
+// `LockedQuery<T>.guard()` before any SQL is built — the same "zero
+// statements issued on a refusal" guarantee `requireTx` already gives.
+// `mysqlLockClause` stays exported (a caller who wants the version-only
+// check without building a `LockedQuery` can still call it directly, the
+// same shape `pkg/orm/manytomany.bit`'s header cites this file's version
+// parameter for) — `guard()` below is now that same real caller.
 
 // `Query<T>`/`find<T>`/`Rows`/`Value` (query.bit), `sqlFindMany`/
 // `sqlFindOne`/`sqlFindOneOrFail` (imported by query.bit from "std/sql") and
@@ -131,6 +141,15 @@ export class MysqlVersion {
   export minor: int,
 }
 
+// Which server `forUpdate` is targeting, required on every call (this
+// file's header) — `Neutral` for Postgres or MySQL 8.0+, where `lockClause`
+// alone is already correct; `Mysql(version)` for MySQL, checked against
+// `version` before `skipLocked`/`nowait` are allowed through.
+export enum LockDialect {
+  Neutral,
+  Mysql(MysqlVersion),
+}
+
 // Fails unless `db` is a live transaction handle. `Pool` is the one concrete
 // type this file has to rule out — every other value reaching `Data` is
 // already inside a transaction (the handle `db.tx`'s own block receives, or
@@ -180,21 +199,72 @@ export fn mysqlLockClause(opts: LockOpts, version: MysqlVersion): string! {
   return lockClause(opts)?
 }
 
-// `LockedQuery<T>` itself is declared in `pkg/orm/query.bit`, not here — see
-// this file's header ("ON THE CHAIN TOO") for why: a checker defect (#5388)
-// misresolves a member call on the result of a METHOD whose declared return
-// type names a generic class declared in a sibling file of the same module,
-// even though the two files share one flat namespace (§17.1) and the
-// identical construct is fine in a single file or through a FREE function
-// across files (this file's own `forUpdate<T>` below proves the latter).
-// `Query<T>.forUpdate()` (query.bit) is such a method, so its return type
-// `LockedQuery<T>` has to live in query.bit, beside it, to type-check.
+// The one entry point: wraps `q` with `opts` and `dialect`, never failing
+// itself - every refusal in this file is deferred to the terminal that
+// already carries a `?` in every one of this file's own examples, the same
+// convention every other fallible `Query<T>` terminal
+// (`count`/`exists`/`one`/`oneOrFail`) already follows.
+export fn forUpdate<T>(q: Query<T>, opts: LockOpts, dialect: LockDialect): LockedQuery<T> {
+  return LockedQuery<T>{ inner: q, opts: opts, dialect: dialect }
+}
 
-// The one entry point: wraps `q` with `opts`, never failing itself - every
-// refusal in this file is deferred to the terminal that already carries a
-// `?` in every one of this file's own examples, the same convention every
-// other fallible `Query<T>` terminal (`count`/`exists`/`one`/`oneOrFail`)
-// already follows.
-export fn forUpdate<T>(q: Query<T>, opts: LockOpts): LockedQuery<T> {
-  return LockedQuery<T>{ inner: q, opts: opts }
+// Wraps an already-built `Query<T>` with a lock clause, applied by every
+// terminal (`all`/`one`/`oneOrFail`) after `requireTx` passes. `count`/
+// `exists` refuse instead of running — a row lock on either is meaningless
+// (this file's header). `Query<T>`'s own fields and private `selectSql`/
+// `boundedSql` builders are read directly here — legal cross-file access
+// within one module (§17.1), the identical access `softdelete.bit`'s
+// `SoftQuery<T>` already uses on `this.inner.wheres`.
+export class LockedQuery<T> {
+  inner: Query<T>
+  opts: LockOpts
+  dialect: LockDialect
+  export all(): []T! { // Every matching row, locked — the unbounded terminal, same as
+    // `Query<T>.all()`.
+    let clause = this.guard()?
+    return sqlFindMany(
+      this.inner.db,
+      this.inner.selectSql() + clause,
+      this.inner.args,
+      this.inner.mapper,
+    )?
+  }
+  export one(): Option<T>! { // At most one row, locked — `Query<T>.boundedSql()` still forces the
+    // LIMIT 2 that catches an unexpectedly wide match (this file's header).
+    let clause = this.guard()?
+    return sqlFindOne(
+      this.inner.db,
+      this.inner.boundedSql() + clause,
+      this.inner.args,
+      this.inner.mapper,
+    )?
+  }
+  export oneOrFail(): T! { // Exactly one row, locked, or the same `SqlRowError` `Query<T>.oneOrFail()`
+    // raises for zero or several.
+    let clause = this.guard()?
+    return sqlFindOneOrFail(
+      this.inner.db,
+      this.inner.boundedSql() + clause,
+      this.inner.args,
+      this.inner.mapper,
+    )?
+  }
+  export count(): i64! { // Refused - see this file's header.
+    fail LockError{ cause: LockCause.TerminalNotLockable, detail: "count()" }
+  }
+  export exists(): bool! { // Refused - see this file's header.
+    fail LockError{ cause: LockCause.TerminalNotLockable, detail: "exists()" }
+  }
+  guard(): string! { // `requireTx` then the dialect-appropriate clause, in that order, so a
+    // caller on a `Pool` never reaches SQL assembly at all - the "zero
+    // statements issued" the #5083 acceptance names. `Neutral` is
+    // `lockClause` alone; `Mysql(version)` is `mysqlLockClause`, which
+    // refuses `skipLocked`/`nowait` below MySQL 8.0 (#5391) - this is the
+    // one place either function actually runs against a real query.
+    requireTx(this.inner.db)?
+    match (this.dialect) {
+      Neutral => return lockClause(this.opts)?
+      Mysql(version) => return mysqlLockClause(this.opts, version)?
+    }
+  }
 }

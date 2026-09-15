@@ -16,6 +16,7 @@ what happens to it."
 import {
   Data,
   LockCause,
+  LockDialect,
   LockError,
   LockOpts,
   LockedQuery,
@@ -23,7 +24,6 @@ import {
   Query,
   find,
   forUpdate,
-  mysqlLockClause,
 } from "orm"
 import { AttrDesc, FieldDesc, Pool, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
 
@@ -43,7 +43,7 @@ fn pendingJobs(db: Data): Query<Job> {
 }
 
 fn claimOneJob(db: Data): Option<Job>! {
-  let job = forUpdate<Job>(pendingJobs(db).limit(1), LockOpts{}).one()?
+  let job = forUpdate<Job>(pendingJobs(db).limit(1), LockOpts{}, LockDialect.Neutral).one()?
   match (job) {
     Some(j) => {
       db.exec(
@@ -63,10 +63,12 @@ fn runClaimOneJob(p: Pool): Option<Job>! {
 }
 ```
 
-`forUpdate<T>(q, opts)` wraps a `Query<T>` chain you already built with
-`find` - `pendingJobs(db).limit(1)` above - and returns a `LockedQuery<T>`
-whose terminals (`all`/`one`/`oneOrFail`) run the same SQL with a lock
-clause appended. `LockOpts{}` is plain `FOR UPDATE`: it **blocks** until
+`forUpdate<T>(q, opts, dialect)` wraps a `Query<T>` chain you already built
+with `find` - `pendingJobs(db).limit(1)` above - and returns a
+`LockedQuery<T>` whose terminals (`all`/`one`/`oneOrFail`) run the same SQL
+with a lock clause appended. `dialect` is required and explicit - see
+"SKIP LOCKED and NOWAIT need MySQL 8.0" below for what it is for.
+`LockOpts{}` is plain `FOR UPDATE`: it **blocks** until
 whichever transaction currently holds the row commits or rolls back. Two
 workers both calling `claimOneJob` at once do not both get job 42 - the
 second one's `forUpdate(...).one()` simply waits its turn.
@@ -87,7 +89,7 @@ free, right now:
 
 ```bit
 fn claimUpTo(db: Data, n: int): LockedQuery<Job> {
-  return forUpdate<Job>(pendingJobs(db).limit(n), LockOpts{ skipLocked: true })
+  return forUpdate<Job>(pendingJobs(db).limit(n), LockOpts{ skipLocked: true }, LockDialect.Neutral)
 }
 
 fn claimBatch(db: Data, n: int): []Job! {
@@ -162,7 +164,7 @@ statements are sent to the database, so there is nothing to undo.
 
 ```bit
 fn pendingCountLocked(db: Data): i64! {
-  return forUpdate<Job>(pendingJobs(db), LockOpts{}).count()?
+  return forUpdate<Job>(pendingJobs(db), LockOpts{}, LockDialect.Neutral).count()?
 }
 
 fn pendingCount(db: Data): i64! {
@@ -191,32 +193,42 @@ pick one answer to "what happens when the row is already locked," not both.
 ### SKIP LOCKED and NOWAIT need MySQL 8.0
 
 Nothing reaching `Data` carries a server version today (#5384), so
-`forUpdate` itself never checks one - `LockedQuery`'s own SQL always
-renders the dialect-neutral clause, the one both Postgres and MySQL 8
-accept. If you are targeting MySQL and using `skipLocked` or `nowait`,
-check the version yourself first, with `mysqlLockClause`, the same
-explicit-parameter shape [MySQL](mysql.md)'s own `upsert` dialect argument
-uses:
+`forUpdate`'s third argument, `dialect: LockDialect`, is how you supply it -
+`LockDialect.Neutral` for Postgres or MySQL 8+ (every example above uses
+this; `lockClause` alone is already correct for both), `LockDialect.
+Mysql(version)` for anything targeting MySQL. `LockedQuery`'s own `guard()`
+checks `version` before building any SQL, the same "zero statements issued
+on a refusal" guarantee the transaction check above gives:
 
 ```bit
 fn claimBatchOnMysql(db: Data, n: int, version: MysqlVersion): []Job! {
-  mysqlLockClause(LockOpts{ skipLocked: true }, version)?
-  return claimBatch(db, n)?
+  let jobs = forUpdate<Job>(
+    pendingJobs(db).limit(n),
+    LockOpts{ skipLocked: true },
+    LockDialect.Mysql(version),
+  ).all()?
+  for j of jobs {
+    db.exec(
+      "update jobs set state = $1 where id = $2",
+      [Value.Text("processing"), Value.Int(j.id)],
+    )?
+  }
+  return jobs
 }
 ```
 
-Called with `MysqlVersion{ major: 5, minor: 7 }`, `mysqlLockClause` fails
-before `claimBatch` ever runs:
+Called with `MysqlVersion{ major: 5, minor: 7 }`, this fails before any SQL
+reaches the driver:
 
 ```text
 pkg/orm: MySQL 5.7 does not support FOR UPDATE SKIP LOCKED (added in MySQL 8.0); omit skipLocked or upgrade the server
 ```
 
-Skip this check and call `forUpdate` with `skipLocked`/`nowait` against a
-MySQL server older than 8.0 directly, and the failure comes back from the
-driver instead - a SQL syntax error, not this typed `LockError`. Postgres
-never needs `mysqlLockClause`: the plain `lockClause` `forUpdate` already
-uses is correct for every Postgres version this package targets.
+Pass `LockDialect.Neutral` against a MySQL server older than 8.0 instead of
+`Mysql(version)`, and the failure comes back from the driver - a SQL syntax
+error, not this typed `LockError`: `Neutral` means "render the
+dialect-neutral clause unconditionally," never "this is Postgres." Postgres
+should always pass `Neutral` - it has no version gate to check.
 
 ## When not to use this
 
@@ -240,4 +252,4 @@ statement that would look like it worked while protecting nothing - see
 [Data](data.md) covers `Pool.tx`/`Pool.txValue<T>` and why the closure
 parameter should shadow the outer handle. [MySQL](mysql.md) covers the
 other places Postgres and MySQL diverge, including the version gate
-`mysqlLockClause` closes here.
+`LockDialect.Mysql(version)` closes here.
