@@ -126,17 +126,25 @@ be a lie about what actually happens. `Mysql.render` flags all of them
 detect: MySQL has no non-blocking index keyword to scan a `raw()` statement's
 text for at all.
 
-That honesty has a real consequence in [the migration runner](migrate.md):
-because the runner puts a migration's `schema_history` row inside the same
-transaction as its *transactional* statements, and `Mysql` renders none,
-that ledger row now commits before the first line of the migration's actual
-DDL runs. A migration that fails partway through can leave `schema_history`
-recording it as applied when only some of it ran. This is tracked as #5378
-(open, not yet fixed as of this page) - a bug in the seam between the runner
-and this renderer, not something either one can fix alone. Until it lands,
-treat `up`/`down` against MySQL as unsafe for a multi-statement migration;
-[Migrate](migrate.md)'s own "On MySQL, none of the paragraph above holds yet"
-section covers the mechanism in full.
+That honesty had a real consequence in [the migration runner](migrate.md),
+and fixing it there rather than here was the point. The runner used to put a
+migration's `schema_history` row inside the same transaction as its
+*transactional* statements - and since `Mysql` renders none, that left the
+ledger row alone in an otherwise empty transaction, committing before the
+first line of the migration's actual DDL ran. A migration failing partway
+left `schema_history` recording it as applied.
+
+The runner no longer does that: when a migration renders no transactional
+statements at all, `up` runs every statement first and writes the ledger row
+only once they have all succeeded (#5378). A statement failing anywhere in a
+MySQL migration leaves no `schema_history` row for it, so the next `up` still
+sees it as pending. The trade-off is stated in
+[Migrate](migrate.md)'s own section on it: a crash between the last statement
+and the ledger write re-runs the migration.
+
+The fix belongs in the runner because the flag here is not the thing that is
+wrong - `false` is what MySQL actually does, and making this renderer lie to
+restore the old ordering would have traded a visible bug for an invisible one.
 
 ## The migration runner has no lock on MySQL
 
@@ -165,12 +173,13 @@ fix this.
 ## When not to use this
 
 `Mysql{}.render` only produces SQL text - it never opens a connection. Do not
-run [Migrate](migrate.md)'s `up`/`down` against a MySQL database in
-production today: the ledger can record a partially-applied MySQL migration
-as successful (#5378), and no lock stops two deploys from racing each other
-on MySQL the way `pg_advisory_lock` does on Postgres. Use
-`sql(Mysql{}, migrations(), n)` to render a migration's DDL for review, and
-apply it by hand, until both gaps close.
+run [Migrate](migrate.md)'s `up`/`down` against a MySQL database from more
+than one place at a time: the ledger-ordering bug is fixed (#5378), but no
+lock stops two deploys from racing each other on MySQL the way
+`pg_advisory_lock` does on Postgres. A single deploy applying a migration
+that fails partway is now recoverable - nothing records it as applied - but
+two concurrent ones are not. Use `sql(Mysql{}, migrations(), n)` to render a
+migration's DDL for review and apply it by hand until that gap closes.
 
 ## Where to go next
 
