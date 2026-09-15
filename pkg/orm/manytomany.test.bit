@@ -1,0 +1,296 @@
+// pkg/orm/manytomany.test.bit — #5081's acceptance, against a fake driver
+// combining relation.test.bit's "different result set per statement, in
+// call order" shape (needed to prove the parent query and the join query
+// are two distinct statements) with write.test.bit's exec-recording shape
+// (needed for attach/detach/sync).
+//
+// `mtmUser`/`mtmRole` carry a real `@manyToMany("user_roles")` field each,
+// proving the attribute compiles cleanly and is recorded (#5051), never
+// called — `manytomany.bit`'s own header explains why the loader
+// constructor below is `manyToManyLoader`, never the bare `manyToMany`
+// spelling the attribute itself uses.
+//
+// `field`/`contains`/`count`/`Datasource`/`Value`/`Rows`/`Pool`/`Conn`/
+// `Stmt`/`Tx` are already declared by naming.test.bit/raw.test.bit/
+// data.test.bit, this module's own siblings (SPEC §17.1) — importing or
+// redeclaring any of them here would be E0042.
+
+@table class mtmUser {
+  @id
+  id: i64
+  @manyToMany("user_roles")
+  roles: []mtmRole
+}
+
+@table class mtmRole {
+  @id
+  id: i64
+}
+
+fn mtmUserMapper(rows: Rows): mtmUser! {
+  let cols = rows.columns()
+  return mtmUser{ id: sqlReqInt(rows, cols, "id")?, roles: []mtmRole(0) }
+}
+
+fn mtmRoleMapper(rows: Rows): mtmRole! {
+  let cols = rows.columns()
+  return mtmRole{ id: sqlReqInt(rows, cols, "id")? }
+}
+
+fn mtmDesc(): ManyToManyDesc {
+  return ManyToManyDesc{
+    joinTable: "user_roles", ownerColumn: "user_id", ownerTable: "users", ownerIdColumn: "id",
+    targetColumn: "role_id", targetTable: "roles", targetIdColumn: "id",
+  }
+}
+
+fn rolesLoader(): RelationLoader<mtmUser> {
+  return manyToManyLoader<mtmUser, mtmRole>((u) => u.id, mtmDesc(), mtmRoleMapper, (u, roles) => {
+    u.roles = roles
+  })
+}
+
+fn mtmUsers(db: Data): Query<mtmUser> {
+  let fields = [field("id")]
+  return withRelations(
+    find<mtmUser>(db, "users", fields, mtmUserMapper),
+    map<string, RelationLoader<mtmUser>>{ "roles": rolesLoader() },
+  )
+}
+
+class mtmCall { sql: string, args: []Value }
+
+// One canned result set per `query()` call, replayed in call order — `relAdapter`'s
+// own shape (relation.test.bit), needed here for the identical reason: proving
+// the parent SELECT and the join SELECT are two distinct statements, not the
+// same one replayed.
+class mtmResult { cols: []string, rows: [][]Value }
+
+class mtmRows {
+  cols: []string
+  data: [][]Value
+  i: int
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.data)
+  }
+
+  columns(): []string {
+    return this.cols
+  }
+
+  value(col: int): Value {
+    return this.data[this.i][col]
+  }
+
+  close() {}
+}
+
+// The fake database: `query()` replays `results` in call order;
+// `exec()` records the call and answers with the one canned `affected`
+// count — `write.test.bit`'s own `wrAdapter` shape for the write side.
+class mtmAdapter {
+  calls: []mtmCall
+  results: []mtmResult
+  affected: int
+
+  connect(cfg: Datasource): Conn! {
+    return mtmConn{ a: this }
+  }
+}
+
+class mtmConn {
+  a: mtmAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    let idx = len(this.a.calls)
+    this.a.calls = append(this.a.calls, mtmCall{ sql: sqlText, args: params })
+    let rs = this.a.results[idx]
+    return mtmRows{ cols: rs.cols, data: rs.rows, i: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.calls = append(this.a.calls, mtmCall{ sql: sqlText, args: params })
+    return this.a.affected
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    fail newError("fake: begin not supported")
+  }
+
+  close() {}
+}
+
+fn newMtmPool(a: mtmAdapter): Pool {
+  let p = pool(a, Datasource{ host: "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+test "manyToManyTable(user_roles) DDL: both columns, a composite primary key, a foreign key per column with ON DELETE CASCADE, and an index on role_id" {
+  let stmts = Postgres{}.render(manyToManyTable(mtmDesc()))
+  let all = ""
+  for s of stmts {
+    all = all + s.sql + "\n"
+  }
+  assert(contains(all, "user_roles"), "DDL must name the join table: ${all}")
+  assert(contains(all, "\"user_id\""), "DDL must carry the owner column: ${all}")
+  assert(contains(all, "\"role_id\""), "DDL must carry the target column: ${all}")
+  assert(
+    contains(all, "primary key (user_id, role_id)"),
+    "DDL must add a composite primary key on both columns: ${all}",
+  )
+  assert(contains(all, "references \"users\""), "DDL must foreign-key the owner column: ${all}")
+  assert(contains(all, "references \"roles\""), "DDL must foreign-key the target column: ${all}")
+  assert(
+    count(all, "on delete cascade") == 2,
+    "want one ON DELETE CASCADE per foreign key, got: ${all}",
+  )
+  assert(
+    contains(all, "create index \"user_roles_role_id_idx\" on \"user_roles\" (\"role_id\")"),
+    "DDL must index the target column: ${all}",
+  )
+}
+
+test "with(\"roles\") on 200 users issues exactly 2 statements, the second joining through user_roles with an IN list" {
+  let userRows = [][]Value(0)
+  let i: i64 = 1
+  while (i <= 200) {
+    userRows = append(userRows, [Value.Int(i)])
+    i = i + 1
+  }
+  // Only user 1 has roles (two of them, ids 10 and 20).
+  let roleRows = [[Value.Int(10), Value.Int(1)], [Value.Int(20), Value.Int(1)]]
+  let a = mtmAdapter{
+    calls: []mtmCall(0),
+    results: [
+      mtmResult{ cols: ["id"], rows: userRows },
+      mtmResult{ cols: ["id", mtmOwnerAlias], rows: roleRows },
+    ],
+    affected: 0,
+  }
+  let p = newMtmPool(a)
+
+  let users = mtmUsers(p).with("roles").all() catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 2, "want 2 statements for 200 users (never 201), got ${len(a.calls)}")
+  assert(
+    contains(a.calls[1].sql, "in ("),
+    "the second statement must carry an IN list: ${a.calls[1].sql}",
+  )
+  assert(
+    contains(a.calls[1].sql, "user_roles"),
+    "the second statement must join through user_roles: ${a.calls[1].sql}",
+  )
+  assert(len(users) == 200, "want 200 users, got ${len(users)}")
+  assert(len(users[0].roles) == 2, "user 1 must have 2 roles, got ${len(users[0].roles)}")
+  assert(
+    len(users[1].roles) == 0,
+    "user 2 has no roles and must read as a loaded-empty slice, got ${len(users[1].roles)}",
+  )
+}
+
+test "attach with 3 roles issues 1 statement inserting 3 pairs" {
+  let a = mtmAdapter{ calls: []mtmCall(0), results: []mtmResult(0), affected: 3 }
+  let p = newMtmPool(a)
+
+  attach(p, mtmDesc(), 1, [10, 20, 30]) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 1, "want 1 statement, got ${len(a.calls)}")
+  assert(contains(a.calls[0].sql, "insert into user_roles"), "sql: ${a.calls[0].sql}")
+  assert(contains(a.calls[0].sql, "on conflict"), "attach must be idempotent: ${a.calls[0].sql}")
+  assert(len(a.calls[0].args) == 6, "want 3 pairs bound (6 args), got ${len(a.calls[0].args)}")
+}
+
+test "attach called twice with the same roles issues a statement that inserts 0 new pairs and does not error" {
+  let a = mtmAdapter{ calls: []mtmCall(0), results: []mtmResult(0), affected: 3 }
+  let p = newMtmPool(a)
+
+  attach(p, mtmDesc(), 1, [10, 20, 30]) catch e {
+    assert(false, "first attach must not error: ${e.message()}")
+    return
+  }
+  // A real ON CONFLICT DO NOTHING finds every pair already present and
+  // reports 0 affected rows on the repeat.
+  a.affected = 0
+  attach(p, mtmDesc(), 1, [10, 20, 30]) catch e {
+    assert(false, "repeat attach must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 2, "want 2 statements total, got ${len(a.calls)}")
+  assert(
+    a.calls[1].sql == a.calls[0].sql,
+    "the repeat attach must issue the identical idempotent statement",
+  )
+}
+
+test "detach issues 1 DELETE naming both keys" {
+  let a = mtmAdapter{ calls: []mtmCall(0), results: []mtmResult(0), affected: 1 }
+  let p = newMtmPool(a)
+
+  detach(p, mtmDesc(), 1, [20]) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 1, "want 1 statement, got ${len(a.calls)}")
+  assert(contains(a.calls[0].sql, "delete from user_roles"), "sql: ${a.calls[0].sql}")
+  assert(
+    contains(a.calls[0].sql, "user_id = $1"),
+    "must filter on the owner key: ${a.calls[0].sql}",
+  )
+  assert(
+    contains(a.calls[0].sql, "role_id in ("),
+    "must filter on the target key: ${a.calls[0].sql}",
+  )
+  assert(len(a.calls[0].args) == 2, "must bind both keys, got ${len(a.calls[0].args)}")
+}
+
+test "detach with no target ids issues no statement, never an unfiltered DELETE" {
+  let a = mtmAdapter{ calls: []mtmCall(0), results: []mtmResult(0), affected: 0 }
+  let p = newMtmPool(a)
+
+  detach(p, mtmDesc(), 1, []i64(0)) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 0, "an empty target list must issue no statement, got ${len(a.calls)}")
+}
+
+test "sync(u, \"roles\", set) produces the exact set, proven by one insert and one delete statement" {
+  let a = mtmAdapter{ calls: []mtmCall(0), results: []mtmResult(0), affected: 1 }
+  let p = newMtmPool(a)
+
+  sync(p, mtmDesc(), 1, [10, 30]) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 2, "want 1 insert + 1 delete, got ${len(a.calls)}")
+  assert(
+    contains(a.calls[0].sql, "insert into user_roles"),
+    "the first statement must be the insert: ${a.calls[0].sql}",
+  )
+  assert(
+    contains(a.calls[1].sql, "delete from user_roles"),
+    "the second statement must be the delete: ${a.calls[1].sql}",
+  )
+  assert(
+    contains(a.calls[1].sql, "not in ("),
+    "the delete must exclude exactly the synced set: ${a.calls[1].sql}",
+  )
+}

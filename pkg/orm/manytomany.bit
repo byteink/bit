@@ -1,0 +1,329 @@
+// pkg/orm/manytomany.bit — many-to-many via `@manyToMany`, attach and
+// detach (#5081, owner decision 2026-09-12): the join table is IMPLICIT and
+// named on the attribute; the ORM manages it.
+//
+//   @table
+//   class User { @id id: i64 @manyToMany("user_roles") roles: []Role }
+//   @table
+//   class Role { @id id: i64 @manyToMany("user_roles") users: []User }
+//
+//   let desc = ManyToManyDesc{
+//     joinTable: "user_roles", ownerColumn: "user_id", ownerTable: "users",
+//     ownerIdColumn: "id", targetColumn: "role_id", targetTable: "roles",
+//     targetIdColumn: "id",
+//   }
+//   db.find<User>().with("roles").all()?      // 2 statements, any parent count
+//   attach(db, desc, u.id, [1, 2, 3])?         // insert the missing pairs
+//   detach(db, desc, u.id, [2])?               // delete those pairs
+//   sync(db, desc, u.id, [1, 3])?              // make the set exactly this
+//
+// `@manyToMany`'s ARGUMENT IS THE JOIN TABLE NAME, NEVER INFERRED. Bit has
+// no reflection — a convention-derived name (`posts_tags` vs `tags_posts`)
+// is a guess that silently reads an empty table when wrong, the same
+// reasoning `pkg/orm/generate.bit` refuses a name-inferred rename for.
+// `@manyToMany` is NOT added to `compiler/classrelationattr.bit`'s
+// `attrNameIsRelation` — unlike `@hasMany`/`@hasOne`/`@belongsTo` it needs
+// no compiler-known mark: #5051's own discriminator
+// (`classtabledesc.bit`'s `attrNameResolvesToFunc`) already records it as
+// plain metadata on `tableDescriptor()`, the identical path `@column`
+// already takes (`pkg/orm/naming.bit`'s header) — PROVIDED no free
+// function spelled `manyToMany` exists ANYWHERE in this package.
+// `attrNameResolvesToFunc`'s `moduleHasFreeFunc` walks the whole package's
+// merged declaration set, not one physical file (confirmed against this
+// exact name: a loader once named `manyToMany` here made `bit test
+// pkg/orm` report E0133 on every `@manyToMany` field, in a DIFFERENT
+// file), so the eager-load constructor below is named `manyToManyLoader`
+// instead — never the bare attribute spelling, unlike `hasMany`/`hasOne`/
+// `belongsTo` (relation.bit), which get away with reusing it only because
+// they are on that compiler-known list and never reach
+// `attrNameResolvesToFunc` at all. Reading the compiler-recorded argument
+// into a `ManyToManyDesc` and wiring it to `with()` automatically is
+// future work (`generate.bit`, out of this ticket's file scope), not
+// attempted here.
+//
+// THE HONEST BOUNDARY. The moment the join carries its own data
+// (`assignedAt`, `assignedBy`), this is outgrown: declare a real `@table`
+// entity with two `@belongsTo` and traverse it as two hops instead. There
+// is nowhere on an implicit join table to put an extra column, and this
+// file refuses to grow one — `manyToManyTable` below emits exactly two
+// columns, never more.
+//
+// ATTACH IS IDEMPOTENT, NEVER AN ERROR ON A REPEAT PAIR. `attachSql` emits
+// one `INSERT ... ON CONFLICT (owner, target) DO NOTHING`, relying on the
+// composite primary key `manyToManyTable` gives the join table — a form
+// resubmit that attaches the same roles twice inserts zero new rows and
+// raises nothing.
+//
+// DETACH NEVER MEANS "CLEAR EVERYTHING" BY ACCIDENT. `detach` takes an
+// explicit, non-variadic `targetIds` and returns with NO statement at all
+// when it is empty — never an unfiltered `DELETE`. A full clear is `sync`'s
+// own job (below), never an accidental empty `detach`.
+//
+// SYNC IS TWO STATEMENTS, NEVER A READ-THEN-DIFF. Computing "what is
+// missing" and "what is extra" against the CALLER's own target set needs no
+// prior SELECT: `sync` runs `attach`'s idempotent INSERT for the given set,
+// then one `DELETE ... WHERE owner = $1 AND target NOT IN (...)` (or, for
+// an empty set, `WHERE owner = $1` alone) to remove anything not in it —
+// exactly the set the caller asked for, in one insert and one delete, never
+// a statement per pair.
+//
+// THE COMPOSITE PRIMARY KEY IS `raw()`, ON PURPOSE. `pkg/orm/schema.bit`'s
+// `Table` has no builder for a multi-column primary key — `t.id()` is a
+// single auto-increment column and `Column` carries no `.primary()` chain
+// method — so `manyToManyTable` below declares both key columns as plain
+// `t.int(...)` and adds the constraint via `t.raw("alter table ... add
+// primary key (...)")`, schema.bit's own documented escape hatch for
+// exactly this: "a builder with no escape hatch is a ceiling instead of a
+// convenience." The identifiers embedded in that raw text are the
+// attribute's own compile-time argument and the caller's own explicit
+// column names — never end-user input — the same trust level schema.bit's
+// header already draws for `raw()`: "raw strings a developer writes once,
+// in a migration... authored by the same person who wrote the migration."
+//
+// THE EAGER-LOAD QUERY IS ONE JOIN, NEVER A SEPARATE PIVOT ROUND TRIP.
+// `manyToManyLoader` below runs `select <target>.*, <join>.<owner> as
+// mtmOwnerAlias from <target> join <join> on <target>.<targetIdColumn> =
+// <join>.<targetColumn> where <join>.<owner> in (...)`, chunked at
+// `maxRelationChunk` exactly like `hasMany`/`hasOne`/`belongsTo`
+// (`relation.bit`, reused here unqualified — same package, same file
+// scanning rule this header already cites) — 200 parents with `with()` is
+// the parent SELECT plus this one join, never 201 and never a second
+// pivot-only query. `childMapper` is the ordinary per-entity row mapper
+// (the one `find<TChild>` already takes) — it reads its own named columns
+// off `Rows` and simply ignores the extra owner-id alias column the join
+// adds, so no new mapper shape is needed.
+//
+// `RelationLoader`, `chunkI64`, `maxRelationChunk`, `i64Values`, `concat`
+// (relation.bit); `Data`/`Executor` (data.bit/data.test.bit);
+// `Value`/`Rows`/`Pool` (data.test.bit); `FieldDesc`/`AttrDesc`
+// (naming.bit); `Table`/`Column`/`ColumnType`/`ReferentialAction`/`table`
+// (schema.bit); `join`/`sqlReqInt` (query.bit) are all already
+// imported/declared by this module's own siblings in the same package
+// (SPEC §17.1) — importing or redeclaring any of them here would be E0042.
+
+// The SQL alias the eager-load JOIN carries the owner's own key under —
+// distinct from any real column name a target table is likely to declare.
+const mtmOwnerAlias = "mtm_owner_id"
+
+// Everything one `@manyToMany` pair needs, on both sides: the join table
+// and its two columns (query/write's own concern), plus the owner and
+// target tables and their id columns (DDL's own concern) — one class,
+// never split, the same "group the arguments" answer `pkg/orm/write.bit`'s
+// `TableDesc` already gives for the identical `bit lint` max-params finding.
+export class ManyToManyDesc {
+  export joinTable: string,
+  export ownerColumn: string,
+  export ownerTable: string,
+  export ownerIdColumn: string,
+  export targetColumn: string,
+  export targetTable: string,
+  export targetIdColumn: string,
+}
+
+// One (owner id, loaded target row) pair read off the eager-load JOIN — the
+// pairing information the join row alone carries; `TChild` itself (e.g.
+// `Role`) never has an owner-id field to read, unlike `hasMany`'s child
+// side.
+class ManyToManyPair<T> {
+  ownerId: i64,
+  child: T,
+}
+
+// The join table's own DDL: two `int` columns, a composite primary key
+// (this file's header explains the `raw()` choice), a foreign key per
+// column with `ON DELETE CASCADE`, and an index on the target column so
+// traversal from either side is fast — the exact shape #5081's own ticket
+// names, never a caller-supplied class.
+export fn manyToManyTable(desc: ManyToManyDesc): SchemaOp {
+  return table(desc.joinTable, (t) => {
+    t.int(desc.ownerColumn)
+    t.int(desc.targetColumn)
+    t.raw("alter table ${desc.joinTable} add primary key (${desc.ownerColumn}, ${desc.targetColumn})")
+    t.foreign(desc.ownerColumn).references(desc.ownerTable, desc.ownerIdColumn).onDelete(
+      ReferentialAction.Cascade,
+    )
+    t.foreign(desc.targetColumn).references(desc.targetTable, desc.targetIdColumn).onDelete(
+      ReferentialAction.Cascade,
+    )
+    t.index(desc.targetColumn)
+  })
+}
+
+// The `@manyToMany` eager-load side: `TParent`'s relation field is
+// `[]TChild`, loaded through the join table named on `desc`. See this
+// file's header for why this is one JOIN query, chunked, never a
+// pivot-then-target pair of round trips, and for why this is not named
+// `manyToMany` the way `hasMany`/`hasOne`/`belongsTo` reuse their own
+// attribute's spelling.
+export fn manyToManyLoader<TParent, TChild>(
+  parentKey: (TParent) => i64,
+  desc: ManyToManyDesc,
+  childMapper: (Rows) => TChild!,
+  assign: (TParent, []TChild) => (),
+): RelationLoader<TParent> {
+  let loader: RelationLoader<TParent> = (db, parents) => {
+    if (len(parents) == 0) {
+      return
+    }
+    let ids = []i64(0)
+    for p of parents {
+      ids = append(ids, parentKey(p))
+    }
+    let pairs = fetchManyToMany<TChild>(db, desc, childMapper, ids)?
+    let grouped = groupManyToMany<TChild>(pairs)
+    for p of parents {
+      assign(p, grouped[parentKey(p)])
+    }
+  }
+  return loader
+}
+
+// Runs the join query once per `chunkI64`-sized chunk of `ids`
+// (`relation.bit`'s own chunking, reused unqualified), concatenating every
+// chunk's pairs.
+fn fetchManyToMany<TChild>(
+  db: Data,
+  desc: ManyToManyDesc,
+  childMapper: (Rows) => TChild!,
+  ids: []i64,
+): []ManyToManyPair<TChild>! {
+  let out = []ManyToManyPair<TChild>(0)
+  for chunk of chunkI64(ids, maxRelationChunk) {
+    let got = fetchManyToManyChunk<TChild>(db, desc, childMapper, chunk)?
+    out = concat(out, got)
+  }
+  return out
+}
+
+// One JOIN statement for one chunk of owner ids, mapping every row into an
+// (owner id, child) pair — `childMapper` reads its own named columns off
+// `rows` and never sees the extra `mtmOwnerAlias` column this file adds.
+fn fetchManyToManyChunk<TChild>(
+  db: Data,
+  desc: ManyToManyDesc,
+  childMapper: (Rows) => TChild!,
+  ids: []i64,
+): []ManyToManyPair<TChild>! {
+  let sqlText = manyToManySelectSql(desc, len(ids))
+  let rows = db.query(sqlText, i64Values(ids))?
+  defer rows.close()
+  let out = []ManyToManyPair<TChild>(0)
+  while (rows.next()?) {
+    let cols = rows.columns()
+    let ownerId = sqlReqInt(rows, cols, mtmOwnerAlias)?
+    let child = childMapper(rows)?
+    out = append(out, ManyToManyPair<TChild>{ ownerId: ownerId, child: child })
+  }
+  return out
+}
+
+fn manyToManySelectSql(desc: ManyToManyDesc, n: int): string {
+  let marks = []string(0)
+  let i = 1
+  while (i <= n) {
+    marks = append(marks, "$${i}")
+    i = i + 1
+  }
+  let list = join(marks, ", ")
+  return "select ${desc.targetTable}.*, ${desc.joinTable}.${desc.ownerColumn} as ${mtmOwnerAlias} from ${desc.targetTable} join ${desc.joinTable} on ${desc.targetTable}.${desc.targetIdColumn} = ${desc.joinTable}.${desc.targetColumn} where ${desc.joinTable}.${desc.ownerColumn} in (${list})"
+}
+
+// Every pair grouped by owner id — a plain `map<i64, []TChild>`, read with
+// a single-value index (missing key reads as the zero-value empty slice,
+// the same "loaded-empty" shape `relation.bit`'s `hasMany` assign loop
+// relies on) rather than `std/seq`'s `groupBy`, which groups `TChild`
+// itself and has no way to key on data that lives only in the join row.
+fn groupManyToMany<TChild>(pairs: []ManyToManyPair<TChild>): map<i64, []TChild> {
+  let out = map<i64, []TChild>(0)
+  for pr of pairs {
+    let (existing, ok) = out[pr.ownerId]
+    if (ok) {
+      out[pr.ownerId] = append(existing, pr.child)
+    } else {
+      out[pr.ownerId] = [pr.child]
+    }
+  }
+  return out
+}
+
+// Inserts the missing `(ownerId, targetId)` pairs for every id in
+// `targetIds`, one statement, idempotent — see this file's header for the
+// `ON CONFLICT DO NOTHING` shape. A caller passing an empty `targetIds`
+// issues no statement at all.
+export fn attach(db: Data, desc: ManyToManyDesc, ownerId: i64, targetIds: []i64): ()! {
+  if (len(targetIds) == 0) {
+    return
+  }
+  let (sqlText, args) = attachSql(desc, ownerId, targetIds)
+  db.exec(sqlText, args)?
+}
+
+fn attachSql(desc: ManyToManyDesc, ownerId: i64, targetIds: []i64): (string, []Value) {
+  let args = []Value(0)
+  let groups = []string(0)
+  for id of targetIds {
+    args = append(args, Value.Int(ownerId))
+    let ownerMark = "$${len(args)}"
+    args = append(args, Value.Int(id))
+    let targetMark = "$${len(args)}"
+    groups = append(groups, "(${ownerMark}, ${targetMark})")
+  }
+  let sqlText = "insert into ${desc.joinTable} (${desc.ownerColumn}, ${desc.targetColumn}) values ${join(
+    groups,
+    ", ",
+  )} on conflict (${desc.ownerColumn}, ${desc.targetColumn}) do nothing"
+  return (sqlText, args)
+}
+
+// Deletes exactly the `(ownerId, targetId)` pairs named by `targetIds`, one
+// statement naming BOTH keys in its `WHERE` — never a single-sided `WHERE
+// owner = $1`, which would detach every pair for that owner. An empty
+// `targetIds` issues no statement at all — see this file's header for why
+// that guard exists.
+export fn detach(db: Data, desc: ManyToManyDesc, ownerId: i64, targetIds: []i64): ()! {
+  if (len(targetIds) == 0) {
+    return
+  }
+  let (sqlText, args) = detachSql(desc, ownerId, targetIds)
+  db.exec(sqlText, args)?
+}
+
+fn detachSql(desc: ManyToManyDesc, ownerId: i64, targetIds: []i64): (string, []Value) {
+  let args = [Value.Int(ownerId)]
+  let marks = []string(0)
+  for id of targetIds {
+    args = append(args, Value.Int(id))
+    marks = append(marks, "$${len(args)}")
+  }
+  let list = join(marks, ", ")
+  let sqlText = "delete from ${desc.joinTable} where ${desc.ownerColumn} = $1 and ${desc.targetColumn} in (${list})"
+  return (sqlText, args)
+}
+
+// Makes the owner's set of pairs exactly `targetIds` — `attach`'s own
+// idempotent insert for the given set, then one `DELETE` removing anything
+// else already attached, never a prior SELECT to compute the difference
+// (this file's header). An empty `targetIds` issues no INSERT and a `DELETE
+// ... WHERE owner = $1` alone, clearing the owner's pairs entirely — the
+// one path in this file that behaves like a bulk clear, reached only
+// through this explicitly-named call, never through `detach`.
+export fn sync(db: Data, desc: ManyToManyDesc, ownerId: i64, targetIds: []i64): ()! {
+  attach(db, desc, ownerId, targetIds)?
+  let (sqlText, args) = syncDeleteSql(desc, ownerId, targetIds)
+  db.exec(sqlText, args)?
+}
+
+fn syncDeleteSql(desc: ManyToManyDesc, ownerId: i64, targetIds: []i64): (string, []Value) {
+  if (len(targetIds) == 0) {
+    return ("delete from ${desc.joinTable} where ${desc.ownerColumn} = $1", [Value.Int(ownerId)])
+  }
+  let args = [Value.Int(ownerId)]
+  let marks = []string(0)
+  for id of targetIds {
+    args = append(args, Value.Int(id))
+    marks = append(marks, "$${len(args)}")
+  }
+  let list = join(marks, ", ")
+  let sqlText = "delete from ${desc.joinTable} where ${desc.ownerColumn} = $1 and ${desc.targetColumn} not in (${list})"
+  return (sqlText, args)
+}
