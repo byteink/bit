@@ -21,10 +21,13 @@ $n` instead of a growing `OFFSET`, so a deep page costs what page 1 does,
 `@timestamps`, filling `createdAt` on INSERT and `updatedAt` on every
 write, single or bulk, `hasMany`/`hasOne`/`belongsTo` relations with eager
 loading via `with()`, batched so loading N parent rows never issues more
-than one extra query per relation, never one per row, and `@softDelete`,
+than one extra query per relation, never one per row, `@softDelete`,
 which makes `delete` mark a row instead of removing it and excludes a
 marked row from every ordinary read until
-`withTrashed`/`onlyTrashed`/`restore`/`forceDelete` says otherwise.
+`withTrashed`/`onlyTrashed`/`restore`/`forceDelete` says otherwise, and
+`@version`, optimistic locking: `save` on a table carrying it adds the old
+version to its UPDATE's WHERE and raises `StaleWriteError`, distinct from a
+row-not-found, when another write landed first.
 
 ## Install
 
@@ -68,7 +71,8 @@ driver's constraint-violation error into a typed, catchable cause is
 cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
 `hasMany`/`hasOne`/`belongsTo` and eager loading with `with()` is
 [`docs/relation.md`](docs/relation.md). Marking a row deleted instead of
-removing it is [`docs/softdelete.md`](docs/softdelete.md).
+removing it is [`docs/softdelete.md`](docs/softdelete.md). Optimistic
+locking against a lost update is [`docs/version.md`](docs/version.md).
 
 ## `Dialect` vs `UpsertDialect`
 

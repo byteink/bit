@@ -15,3 +15,4 @@
 | [Keyset pagination](keyset.md) | `after`: `WHERE id > $n` instead of `OFFSET`, so a deep page costs what page 1 costs |
 | [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |
 | [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` opt in |
+| [Optimistic locking](version.md) | `@version`: `save`'s UPDATE checks the old version and raises it by one, `StaleWriteError` when another write landed first, distinct from a row-not-found |
