@@ -1,0 +1,232 @@
+// pkg/orm/lock.bit — pessimistic locking on the find chain (#5083, owner
+// decision 2026-09-12): `FOR UPDATE`, `FOR UPDATE SKIP LOCKED` and
+// `FOR UPDATE NOWAIT`, legal only inside a transaction.
+//
+//     db.tx((db) => {
+//       let q = find<Account>(db, "accounts", fields, mapper).where("id", 1)
+//       let a = forUpdate<Account>(q, LockOpts{}).oneOrFail()?
+//       a.balance = a.balance - amt
+//       db.save(a)?
+//     })?
+//
+//     db.tx((db) => {
+//       let q = find<Job>(db, "jobs", fields, mapper).where("state", "pending").limit(1)
+//       let job = forUpdate<Job>(q, LockOpts{ skipLocked: true }).one()?
+//     })?
+//
+// WHY `forUpdate` IS A WRAPPER AROUND `Query<T>`, NOT A METHOD WRITTEN HERE.
+// `pkg/orm/keyset.bit`'s own header already states the rule: "a class's
+// method set is the set of methods declared in its body (SPEC §14)" — a real
+// `.forUpdate()` on the chain itself belongs inside `Query<T>` in
+// `pkg/orm/query.bit`, the same way `after()` (declared in query.bit) calls
+// into `keysetPredicate` (keyset.bit) for its logic. This ticket's own file
+// list is `lock.bit`/`lock.test.bit` only — query.bit is another agent's file
+// this run, so the wiring `Query<T>.forUpdate()`/`.forUpdateSkipLocked()`
+// delegating one line each into `forUpdate<T>` below is flagged as follow-up
+// work rather than made here (see the delivery report on #5083). Everything
+// below is complete and independently correct today: `LockedQuery<T>` reads
+// `Query<T>`'s own fields and private `selectSql`/`boundedSql` builders
+// directly — legal because a Bit module is a whole directory sharing one
+// declaration namespace (SPEC §17.1), the identical access `softdelete.bit`'s
+// `SoftQuery<T>` already uses on `this.inner.wheres`.
+//
+// NAMED FIELDS, NOT `forUpdate(skipLocked = true)` — SPEC §12.11 forbids a
+// named argument on a generic receiver or callee outright ("a named argument
+// is a compile error when the callee is a generic function, when the
+// receiver is a generic class"), and `Query<T>`/`forUpdate<T>` are both
+// generic. `LockOpts{ skipLocked: true }` is an ordinary composite literal —
+// always legal, generic receiver or not — and doubles as the "make the
+// difference visible" naming the ticket asks for: `skipLocked`/`nowait` are
+// two independent fields, not one flag a caller has to remember the meaning
+// of positionally.
+//
+// THE GUARD IS THE POINT. `SELECT ... FOR UPDATE` issued on a `Pool` (no
+// open transaction) takes its row lock and releases it at the end of that
+// one statement — the query still returns the right rows, so it LOOKS like
+// it worked. Two workers racing the same queue row both "win". `requireTx`
+// below is what every terminal (`all`/`one`/`oneOrFail`) runs before issuing
+// any SQL, by asking Data's own runtime type the same way
+// `stdlib/sql/tx.bit`'s `enter()` already does (`db.(Pool)`) — `Data` (this
+// module's `data.bit`) is `Pool` or a live transaction handle, and the
+// concrete type is the only thing this file has to ask, since `Executor`
+// itself carries no "am I inside a transaction" flag (data.bit's own header:
+// there is deliberately no ambient one).
+//
+// `count()`/`exists()` REFUSE RATHER THAN BEING LEFT UNDEFINED. A row lock on
+// a `count(*)` or an existence probe is meaningless (the ticket's own
+// constraint) — refusing with a typed, catchable error is the same choice
+// `keyset.bit`'s `after()` makes for its own invalid states, not a panic,
+// since a caller building a query dynamically can reasonably reach this path
+// and needs to recover from it.
+//
+// MYSQL'S VERSION GATE IS A SEPARATE, EXPLICIT-PARAMETER FUNCTION, THE SAME
+// SHAPE `write.bit`'s OWN `upsert` USES. Postgres and MySQL 8 render the
+// identical clause text (`lockClause` below is the whole story for both) —
+// only MySQL below 8.0 cannot run `SKIP LOCKED`/`NOWAIT` at all (mysql.bit's
+// own header names this exact trap: a spelling legal on one engine, a syntax
+// error on the other). Nothing in `Data`/`Executor` carries a server version
+// today — `write.bit`'s header gives the identical reason `upsert` takes
+// `dialect: UpsertDialect` explicitly instead of reading it off `db` — so
+// `mysqlLockClause` below takes the version explicitly too, exactly the gap
+// `mysql.bit`'s own header flags rather than guesses around (its `time_zone`
+// note). A caller who knows it is targeting MySQL calls this instead of
+// `lockClause`, supplying what it already knows about its own server.
+
+// `Query<T>`/`find<T>`/`Rows`/`Value` (query.bit), `sqlFindMany`/
+// `sqlFindOne`/`sqlFindOneOrFail` (imported by query.bit from "std/sql") and
+// `Pool` (imported by data.test.bit from "std/sql") need no import here — a
+// second import of any of them would be E0042; see this file's header and
+// SPEC §17.1.
+
+// Why `forUpdate<T>` on the class mapped to a table was refused — see this
+// file's header for each.
+export enum LockCause {
+  NotInTransaction,
+  ConflictingOptions,
+  TerminalNotLockable,
+  UnsupportedByDialect,
+}
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `pkg/orm/keyset.bit`'s `KeysetError` is. `detail` carries the one
+// piece each cause needs beyond its own fixed wording — empty where a cause
+// needs nothing more.
+export class LockError {
+  export cause: LockCause
+  export detail: string
+
+  message(): string {
+    match (this.cause) {
+      NotInTransaction => return "pkg/orm: forUpdate requires a live transaction (Tx), not a Pool - SELECT ... FOR UPDATE issued on a Pool takes the lock and releases it at the end of that one statement, protecting nothing; wrap the call in db.tx((db) => { ... })"
+      ConflictingOptions => return "pkg/orm: forUpdate cannot take skipLocked and nowait together - SKIP LOCKED returns fewer rows without blocking, NOWAIT fails immediately instead of blocking; they answer different questions"
+      TerminalNotLockable => return "pkg/orm: forUpdate cannot be combined with '${this.detail}' - a row lock is meaningless without a row to lock"
+      UnsupportedByDialect => return "pkg/orm: ${this.detail}"
+    }
+  }
+}
+
+// `skipLocked`/`nowait` as two independent fields — see this file's header
+// for why a composite literal replaces the named-argument spelling SPEC
+// §12.11 forbids here. Both default `false`: plain `LockOpts{}` is `FOR
+// UPDATE`.
+export class LockOpts {
+  export skipLocked: bool = false,
+  export nowait: bool = false,
+}
+
+// A MySQL server's reported version, as a caller targeting MySQL already
+// knows it (see this file's header for why this file cannot look it up
+// itself).
+export class MysqlVersion {
+  export major: int,
+  export minor: int,
+}
+
+// Fails unless `db` is a live transaction handle. `Pool` is the one concrete
+// type this file has to rule out — every other value reaching `Data` is
+// already inside a transaction (the handle `db.tx`'s own block receives, or
+// a savepoint nested under it), the same distinction `stdlib/sql/tx.bit`'s
+// `enter()` draws with the identical assertion.
+fn requireTx(db: Data): ()! {
+  let (_, isPool) = db.(Pool)
+  if (isPool) {
+    fail LockError{ cause: LockCause.NotInTransaction, detail: "" }
+  }
+}
+
+// The `FOR UPDATE` clause text for `opts`, or the refusal for an
+// unsatisfiable combination. Dialect-neutral: Postgres and MySQL 8 both
+// accept this exact spelling (see this file's header) — `mysqlLockClause`
+// below is the one place a server version narrows it further.
+fn lockClause(opts: LockOpts): string! {
+  if (opts.skipLocked && opts.nowait) {
+    fail LockError{ cause: LockCause.ConflictingOptions, detail: "" }
+  }
+  if (opts.skipLocked) {
+    return " for update skip locked"
+  }
+  if (opts.nowait) {
+    return " for update nowait"
+  }
+  return " for update"
+}
+
+// `lockClause`, refusing `skipLocked`/`nowait` when `version` is older than
+// MySQL 8.0 — the one engine-specific gate this file needs (this file's
+// header). Postgres never calls this: `lockClause` alone is already correct
+// for it.
+export fn mysqlLockClause(opts: LockOpts, version: MysqlVersion): string! {
+  if (opts.skipLocked && version.major < 8) {
+    fail LockError{
+      cause: LockCause.UnsupportedByDialect,
+      detail: "MySQL ${version.major}.${version.minor} does not support FOR UPDATE SKIP LOCKED (added in MySQL 8.0); omit skipLocked or upgrade the server",
+    }
+  }
+  if (opts.nowait && version.major < 8) {
+    fail LockError{
+      cause: LockCause.UnsupportedByDialect,
+      detail: "MySQL ${version.major}.${version.minor} does not support FOR UPDATE NOWAIT (added in MySQL 8.0); omit nowait or upgrade the server",
+    }
+  }
+  return lockClause(opts)?
+}
+
+// Wraps an already-built `Query<T>` with a lock clause, applied by every
+// terminal (`all`/`one`/`oneOrFail`) after `requireTx` passes — see this
+// file's header for why this is a wrapper rather than a method on `Query<T>`
+// itself, and why `count`/`exists` refuse instead of running.
+export class LockedQuery<T> {
+  inner: Query<T>
+  opts: LockOpts
+  export all(): []T! { // Every matching row, locked — the unbounded terminal, same as
+    // `Query<T>.all()`.
+    let clause = this.guard()?
+    return sqlFindMany(
+      this.inner.db,
+      this.inner.selectSql() + clause,
+      this.inner.args,
+      this.inner.mapper,
+    )?
+  }
+  export one(): Option<T>! { // At most one row, locked — `Query<T>.boundedSql()` still forces the
+    // LIMIT 2 that catches an unexpectedly wide match (query.bit's own header).
+    let clause = this.guard()?
+    return sqlFindOne(
+      this.inner.db,
+      this.inner.boundedSql() + clause,
+      this.inner.args,
+      this.inner.mapper,
+    )?
+  }
+  export oneOrFail(): T! { // Exactly one row, locked, or the same `SqlRowError` `Query<T>.oneOrFail()`
+    // raises for zero or several.
+    let clause = this.guard()?
+    return sqlFindOneOrFail(
+      this.inner.db,
+      this.inner.boundedSql() + clause,
+      this.inner.args,
+      this.inner.mapper,
+    )?
+  }
+  export count(): i64! { // Refused - see this file's header.
+    fail LockError{ cause: LockCause.TerminalNotLockable, detail: "count()" }
+  }
+  export exists(): bool! { // Refused - see this file's header.
+    fail LockError{ cause: LockCause.TerminalNotLockable, detail: "exists()" }
+  }
+  guard(): string! { // `requireTx` then `lockClause`, in that order, so a caller on a `Pool`
+    // never reaches SQL assembly at all - the "zero statements issued" the
+    // ticket's own acceptance names.
+    requireTx(this.inner.db)?
+    return lockClause(this.opts)?
+  }
+}
+
+// The one entry point: wraps `q` with `opts`, never failing itself - every
+// refusal in this file is deferred to the terminal that already carries a
+// `?` in every one of this file's own examples, the same convention every
+// other fallible `Query<T>` terminal (`count`/`exists`/`one`/`oneOrFail`)
+// already follows.
+export fn forUpdate<T>(q: Query<T>, opts: LockOpts): LockedQuery<T> {
+  return LockedQuery<T>{ inner: q, opts: opts }
+}
