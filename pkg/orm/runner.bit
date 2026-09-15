@@ -1,0 +1,355 @@
+// pkg/orm/runner.bit — the migration runner (#5068): applies the checked-in
+// registry against a live database. `up`/`status`/`sql`/`down` for local
+// iteration; `up` is the production path.
+//
+//   bit run cmd/migrate/main.bit up
+//   bit run cmd/migrate/main.bit status
+//   bit run cmd/migrate/main.bit sql 7      // prints DDL, runs nothing
+//   bit run cmd/migrate/main.bit down       // local only
+//
+// THE REGISTRY IS AN EXPLICIT LIST, NEVER A DIRECTORY SCAN. Bit has no
+// reflection, so this file cannot find migration files itself. A caller
+// (a checked-in `migrations/all.bit`, regenerated whenever a migration is
+// added) builds `[]Migration` and hands it to `up`/`status`/`sql`/`down` —
+// this file never calls `readDir` or opens a `.bit` file.
+//
+// GAP FLAGGED, NOT GUESSED AROUND: #5067's `generate` (`generate.bit`)
+// writes a numbered `.bit` file whose only export is `fn up()`, and does not
+// yet write or update `migrations/all.bit` — so today there is no producer
+// for the registry this file reads. This file defines the registry's SHAPE
+// (`Migration` below: a version, name, checksum and two closures returning
+// `[]SchemaOp`) since it is the shape a caller can hand-write today; wiring
+// `generate` to also emit a matching `migrations/all.bit` entry, and
+// reconciling its bodiless `up()` with `Migration.apply`'s `() => []SchemaOp`
+// signature, is follow-up work, not silently guessed at here.
+//
+// FIVE PIECES, EACH GUARDING ONE FAILURE:
+//
+// 1. `schema_history` (history.bit) RECORDS A CHECKSUM PER MIGRATION.
+//    `verifyChecksums` below compares every already-applied migration's
+//    registry checksum against what was recorded when it ran, for every
+//    entry in the ledger, BEFORE anything is applied — one edited file
+//    stops the whole run, not just its own version, because a diverged
+//    ledger means the reviewer no longer knows what state the database is
+//    actually in.
+//
+// 2. AN ADVISORY LOCK AROUND THE WHOLE RUN. `acquireLock` is the first
+//    statement `up`/`down` issue; `releaseLockBestEffort` is `defer`red
+//    immediately after, so it runs whether the run below succeeds or fails
+//    via `fail`/`?` — see SPEC §18.5: a `defer` runs on an ordinary early
+//    return, and only a `panic` skips it, the same distinction `std/sql`'s
+//    own `txValueAt` (`stdlib/sql/tx.bit`) draws for its rollback.
+//    HARDCODED TO POSTGRES' `pg_advisory_lock`/`pg_advisory_unlock` — the
+//    only `Dialect` this repo has (`postgres.bit`); `Dialect` itself has no
+//    lock/unlock method today, so a MySQL runner needs that interface
+//    widened first. Flagged here rather than guessed at.
+//
+// 3. ONE TRANSACTION PER MIGRATION. `applyMigration` renders a migration's
+//    ops, splits the result into the statements the dialect flagged
+//    transactional and the ones it did not (`dialect.bit`'s own
+//    `Statement.transactional`), then issues, in order: `BEGIN`, every
+//    transactional statement, the `schema_history` row for THIS migration
+//    (so the ledger write is part of the same atomic unit as the DDL it
+//    describes), `COMMIT` — and only after that commits, each
+//    non-transactional statement individually, with no wrapping
+//    transaction (Postgres refuses `CREATE INDEX CONCURRENTLY` inside one).
+//    A failure before `COMMIT` issues `ROLLBACK` and leaves the migration
+//    unapplied. A non-transactional statement failing AFTER `COMMIT` cannot
+//    be rolled back either — inherent to what "non-transactional" means —
+//    and is reported as what it is: the migration's ledger row is already
+//    committed, but its trailing statement did not run.
+//
+// 4. `sql` PRINTS AND RUNS NOTHING. It renders one migration's DDL and
+//    returns it as a string — there is no `db` parameter on this function
+//    at all, so it structurally cannot issue a statement to any driver.
+//
+// 5. FORWARD-ONLY IN PRODUCTION. `down` reverts only the most recently
+//    applied migration, and only when `schema_history`'s own `appliedAt`
+//    for it is within `maxAgeNs` of `at` — see this file's own `down` for
+//    why a production rollback is a new migration, never this.
+
+import { Millisecond, Mono, monotonic, since } from "std/time"
+import { sorted } from "std/sort"
+
+// One migration in the checked-in registry: `apply`/`revert` each build the
+// full set of #5065 `SchemaOp`s for their direction, rendered against
+// whichever `Dialect` the caller passes to `up`/`down`/`sql` — the same
+// tree-not-text split `schema.bit`'s own header establishes, so one
+// `Migration` targets every dialect this package ever gets a renderer for.
+export class Migration {
+  export version: int,
+  export name: string,
+  export checksum: string,
+  export apply: () => []SchemaOp,
+  export revert: () => []SchemaOp,
+}
+
+// One migration `up` actually ran, for the caller's own report.
+export class AppliedMigration {
+  export version: int,
+  export name: string,
+  export checksum: string,
+  export appliedAt: i64,
+  export durationMs: i64,
+}
+
+export class UpReport {
+  export applied: []AppliedMigration,
+}
+
+// Whether `migrations` entry is applied, for `status`'s report.
+export class MigrationStatus {
+  export version: int,
+  export name: string,
+  export applied: bool,
+}
+
+export class RevertedMigration {
+  export version: int,
+  export name: string,
+}
+
+// This package's own advisory-lock namespace key (`pg_advisory_lock` takes a
+// bigint). Arbitrary, but must never change once shipped: two runner builds
+// that disagree on it would never see each other's lock, and a rolling
+// deploy's concurrent DDL would interleave again — exactly what this lock
+// exists to prevent.
+const advisoryLockKey: int = 584176068
+
+// Applies every migration in `migrations` not yet recorded in
+// `schema_history`, in ascending version order. See this file's header for
+// the checksum check and the transaction shape.
+export fn up(db: Data, dialect: Dialect, migrations: []Migration, at: Timestamp): UpReport! {
+  acquireLock(db)?
+  defer releaseLockBestEffort(db)
+  ensureHistoryTable(db)?
+  let history = loadHistory(db)?
+  verifyChecksums(migrations, history)?
+  let pending = pendingInOrder(migrations, history)
+  let applied = []AppliedMigration(0)
+  for m of pending {
+    applied = append(applied, applyMigration(db, dialect, m, at)?)
+  }
+  return UpReport{ applied: applied }
+}
+
+// Every registry entry against `schema_history`: applied or still pending.
+export fn status(db: Data, migrations: []Migration): []MigrationStatus! {
+  let history = loadHistory(db)?
+  let out = []MigrationStatus(0)
+  for m of migrations {
+    out = append(
+      out,
+      MigrationStatus{
+        version: m.version,
+        name: m.name,
+        applied: hasVersion(history, m.version),
+      },
+    )
+  }
+  return out
+}
+
+// The DDL `version` would run, as text — nothing here touches a database;
+// see this file's header, piece 4.
+export fn sql(dialect: Dialect, migrations: []Migration, version: int): string! {
+  let m = findMigration(migrations, version)?
+  let stmts = renderOps(dialect, m.apply())
+  let lines = []string(0)
+  for s of stmts {
+    lines = append(lines, s.sql)
+  }
+  return join(lines, "\n")
+}
+
+// Reverts the most recently applied migration — never a specific version,
+// never more than one call's worth of history — refusing when it is older
+// than `maxAgeNs`. Local iteration only: a production rollback of data that
+// has already taken writes is a new numbered migration, because `down`
+// cannot un-drop a column that held data.
+export fn down(
+  db: Data, dialect: Dialect, migrations: []Migration, at: Timestamp, maxAgeNs: int,
+): RevertedMigration! {
+  acquireLock(db)?
+  defer releaseLockBestEffort(db)
+  let history = loadHistory(db)?
+  let (last, found) = latestEntry(history)
+  if (!found) {
+    fail newError("pkg/orm: migrate: down: no applied migrations to roll back")
+  }
+  let age = at.ns - last.appliedAt
+  if (age > maxAgeNs) {
+    fail newError(
+        "pkg/orm: migrate: down: ${migrationFileNameFor(last.version, last.name)} was " +
+        "applied ${age / Millisecond}ms ago, older than the configured window of " +
+        "${maxAgeNs / Millisecond}ms; a production rollback is a new migration, not down",
+    )
+  }
+  let m = findMigration(migrations, last.version)?
+  let stmts = renderOps(dialect, m.revert())
+  let (transactional, nonTransactional) = splitByTransactional(stmts)
+  runTransactionalBlock(db, transactional, (d) => {
+    deleteHistory(d, m.version)?
+  })?
+  runNonTransactional(db, nonTransactional)?
+  return RevertedMigration{ version: m.version, name: m.name }
+}
+
+// Renders `m`, applies it in its own transaction (see this file's header,
+// piece 3), and returns what got recorded.
+fn applyMigration(db: Data, dialect: Dialect, m: Migration, at: Timestamp): AppliedMigration! {
+  let start = monotonic()
+  let stmts = renderOps(dialect, m.apply())
+  let (transactional, nonTransactional) = splitByTransactional(stmts)
+  runTransactionalBlock(db, transactional, (d) => {
+    recordApplied(
+      d,
+      HistoryEntry{
+        version: m.version,
+        name: m.name,
+        checksum: m.checksum,
+        appliedAt: at.ns,
+        durationMs: elapsedMs(start),
+      },
+    )?
+  })?
+  runNonTransactional(db, nonTransactional)?
+  return AppliedMigration{
+    version: m.version,
+    name: m.name,
+    checksum: m.checksum,
+    appliedAt: at.ns,
+    durationMs: elapsedMs(start),
+  }
+}
+
+fn elapsedMs(start: Mono): i64 {
+  return since(start) / Millisecond
+}
+
+// `BEGIN`, every statement in `transactional`, then `ledger(db)` (the
+// caller's own `schema_history` write — `recordApplied` for `up`,
+// `deleteHistory` for `down`), then `COMMIT`. Any failure along the way
+// issues `ROLLBACK` (best effort — the failure already on its way out is
+// the one worth reporting) before propagating the original error, so the
+// migration this transaction describes is left unapplied.
+fn runTransactionalBlock(db: Data, transactional: []Statement, ledger: (Data) => ()!): ()! {
+  db.exec("BEGIN", []Value(0))?
+  runTransactionalBody(db, transactional, ledger) catch e {
+    execIgnoringError(db, "ROLLBACK")
+    fail e
+  }
+  db.exec("COMMIT", []Value(0))?
+}
+
+fn runTransactionalBody(db: Data, transactional: []Statement, ledger: (Data) => ()!): ()! {
+  for s of transactional {
+    db.exec(s.sql, []Value(0))?
+  }
+  ledger(db)?
+}
+
+// The statements a dialect flagged non-transactional, run individually,
+// outside any transaction, after the migration's own transactional block —
+// and therefore its `schema_history` row — has already committed.
+fn runNonTransactional(db: Data, nonTransactional: []Statement): ()! {
+  for s of nonTransactional {
+    db.exec(s.sql, []Value(0))?
+  }
+}
+
+fn execIgnoringError(db: Data, sqlText: string) {
+  db.exec(sqlText, []Value(0)) catch _ {
+    return
+  }
+}
+
+// `pg_advisory_lock` — the first statement `up`/`down` issue. See this
+// file's header, piece 2, for why this is Postgres-specific today.
+fn acquireLock(db: Data): ()! {
+  db.exec("select pg_advisory_lock($1)", [Value.Int(advisoryLockKey)])?
+}
+
+// `pg_advisory_unlock`, `defer`red right after `acquireLock` succeeds so it
+// runs on every path out of `up`/`down` but a panic. Swallows its own
+// failure — the same `abandon` reasoning `stdlib/sql/tx.bit` already uses
+// for a rollback that fails while a more useful error is already on its way
+// to the caller.
+fn releaseLockBestEffort(db: Data) {
+  db.exec("select pg_advisory_unlock($1)", [Value.Int(advisoryLockKey)]) catch _ {
+    return
+  }
+}
+
+// Every already-applied migration's registry checksum against what
+// `schema_history` recorded when it ran. Stops the WHOLE run — nothing in
+// `migrations` is applied — the moment one disagrees; see this file's
+// header, piece 1. A history row whose version no longer has a matching
+// registry entry is not this ticket's concern (the migration file was
+// removed from the registry, a separate failure mode) and is skipped.
+fn verifyChecksums(migrations: []Migration, history: []HistoryEntry): ()! {
+  for h of history {
+    let m = findMigration(migrations, h.version) catch _ {
+      continue
+    }
+    if (m.checksum != h.checksum) {
+      fail newError(
+          "pkg/orm: migrate: ${migrationFileName(m)} has changed since it was applied " +
+          "— recorded checksum '${h.checksum}', file now checksums to '${m.checksum}'; " +
+          "nothing has been applied",
+      )
+    }
+  }
+}
+
+// `migrations` filtered to versions absent from `history`, sorted ascending
+// — `up`'s own apply order.
+fn pendingInOrder(migrations: []Migration, history: []HistoryEntry): []Migration {
+  let pending = []Migration(0)
+  for m of migrations {
+    if (!hasVersion(history, m.version)) {
+      pending = append(pending, m)
+    }
+  }
+  return sorted(pending, (a, b) => a.version < b.version)
+}
+
+fn findMigration(migrations: []Migration, version: int): Migration! {
+  for m of migrations {
+    if (m.version == version) {
+      return m
+    }
+  }
+  fail newError("pkg/orm: migrate: no migration ${version} in the registry")
+}
+
+fn renderOps(dialect: Dialect, ops: []SchemaOp): []Statement {
+  let out = []Statement(0)
+  for op of ops {
+    for s of dialect.render(op) {
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+fn splitByTransactional(stmts: []Statement): ([]Statement, []Statement) {
+  let transactional = []Statement(0)
+  let nonTransactional = []Statement(0)
+  for s of stmts {
+    if (s.transactional) {
+      transactional = append(transactional, s)
+    } else {
+      nonTransactional = append(nonTransactional, s)
+    }
+  }
+  return (transactional, nonTransactional)
+}
+
+fn migrationFileName(m: Migration): string {
+  return migrationFileNameFor(m.version, m.name)
+}
+
+fn migrationFileNameFor(version: int, name: string): string {
+  return "${padStart("${version}", 4, "0")}_${name}.bit"
+}
