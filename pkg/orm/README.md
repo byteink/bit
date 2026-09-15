@@ -27,7 +27,11 @@ marked row from every ordinary read until
 `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` says otherwise, and
 `@version`, optimistic locking: `save` on a table carrying it adds the old
 version to its UPDATE's WHERE and raises `StaleWriteError`, distinct from a
-row-not-found, when another write landed first.
+row-not-found, when another write landed first, and `Query<T>.whereRaw`/
+`orderByField`, the one escape hatch for SQL text or a dynamic column
+name the rest of the builder cannot express - values still bind through
+placeholders and a dynamic column is checked against an allowlist, never
+escaped or quoted.
 
 ## Install
 
