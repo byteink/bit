@@ -172,13 +172,16 @@ structurally incomplete node on purpose (see schema.md's own "Sharp
 edges"); the dialect is where a migration that forgot `.references(...)`
 is finally caught.
 
-**Postgres only renders the six column types schema.bit's `ColumnType`
+**Postgres only renders the seven column types schema.bit's `ColumnType`
 carries** - `Id`, `Int` (always `bigint`, since Bit's `int` is Bit's only
 ordinary integer size), `String(length)` (`varchar(length)`), `Text`,
-`Bool` and `Timestamp` (always `timestamptz`, never a bare `timestamp` -
-an instant read from a zoneless column is invented). There is no `f64`,
-`decimal`, `[]byte` or `Option<T>` column yet, because the intent tree
-does not carry one; that is schema.bit's surface to grow, not this file's.
+`Bool`, `Timestamp` (always `timestamptz`, never a bare `timestamp` - an
+instant read from a zoneless column is invented) and `Decimal` (bare
+`numeric`, no precision or scale - see [Schema](schema.md)'s own "Money
+columns" section for why an unconstrained `numeric` is the only mapping
+that cannot silently round a `decimal` value). There is no `f64`,
+`[]byte` or `Option<T>` column yet, because the intent tree does not
+carry one; that is schema.bit's surface to grow, not this file's.
 
 ## When not to use this
 
