@@ -1,0 +1,368 @@
+// pkg/orm/generate.bit — migrate generate (#5067, owner decision
+// 2026-09-12): "you never hand-write a migration." Reads the live schema
+// from information_schema, reads each entity's #5051 descriptor, diffs
+// them, and writes a NUMBERED FILE of schema-builder (#5065) calls for a
+// human to review and commit. `generate` never applies anything — running
+// a migration is #5069's job, unstarted.
+//
+//   orm.generate(db, [User{}, Order{}], "add_user_phone")?
+//     -> writes migrations/0007_add_user_phone.bit
+//
+// FIVE RULES THIS FILE ENFORCES, EVERY ONE OF THEM "DO NOT GUESS":
+//
+// 1. A RENAME IS NEVER INFERRED. There is no code path here that detects a
+//    rename at all — a column the entity has and the database does not,
+//    and a column the database has and the entity does not, are always two
+//    independent findings: an addColumn and a dropColumn. A diff cannot
+//    tell a rename from a delete-and-create, and guessing destroys the
+//    dropped column's data (schema.bit's own header cites TypeORM getting
+//    exactly this wrong). When both land on the same table in one pass,
+//    the drop's comment names the columns the same pass added, so the
+//    reviewer can edit the two calls into one `renameColumn(...)` — see
+//    `destructiveComment` below — but this file itself never does.
+//
+// 2. THIS NEVER APPLIES ANYTHING. `generate`/`generateInto` write a `.bit`
+//    file and return a message; nothing here opens a transaction or runs
+//    a statement against `db` beyond the read-only `information_schema`
+//    query that builds the diff.
+//
+// 3. ENTITIES ARE AN EXPLICIT ARGUMENT. Bit has no reflection, so nothing
+//    here enumerates "every @table class" — the caller's own list is the
+//    source of truth, the same shape #5061's `with()` relation map uses.
+//
+// 4. AN EMPTY DIFF WRITES NOTHING. `generateInto` returns a message
+//    instead of writing a file when every entity already matches; a
+//    migrations directory full of empty files is how people stop reading
+//    them.
+//
+// 5. A DESTRUCTIVE CHANGE IS EMITTED, NEVER OMITTED, with a comment
+//    naming it destructive. `dropColumn` is the only destructive op this
+//    file emits — there is no dropTable path here; a table's own removal
+//    is a hand-written decision, never a diff's.
+//
+// THE TABLE-NAME GAP, FLAGGED RATHER THAN GUESSED. `naming.bit`'s
+// `tableName` falls back to pluralizing the CLASS NAME when `@table`
+// carries no override, and a class name is exactly what no `@table` class
+// exposes without reflection: `tableDescriptor()`/`tableAttrs()` (#5051,
+// #5189) are the only two members `@table` synthesizes, and neither
+// carries the class's own name as data. So every entity passed to
+// `generate` MUST carry an explicit `@table("name")`; one that does not
+// fails loudly (`tableNameOf` below), rather than this file guessing a
+// pluralized name it has no way to check against the class it came from.
+//
+// WHY A NAME READ FROM information_schema NEVER BREAKS OUT OF THE
+// GENERATED SOURCE. This file writes Bit SOURCE, not DDL — every table or
+// column name it read from the live database or a descriptor becomes a
+// Bit STRING LITERAL inside a `.bit` file, never SQL text a driver runs
+// (#5066's identifier-escaping rule is about rendering a SchemaOp to DDL,
+// a step this file never takes). A name still has to reach that string
+// literal safely: Bit's double-quoted string interpolates `${...}`
+// unconditionally (SPEC §5.7), so a column literally named `${panic()}`
+// would need only `\` and `"` escaped to become a live expression inside
+// the file this generator writes. `bitStringLiteral` below additionally
+// escapes every literal `$`, and a `//` comment naming a hostile column
+// gets its own narrower guard (`commentSafe`) against a newline splitting
+// one comment into a comment line plus a line of live Bit source.
+import { asText } from "std/sql"
+import { isDir, mkdir, readDir, writeFile } from "std/fs"
+import { join as pathJoin } from "std/path"
+import { padStart, parseInt, split } from "std/strings"
+
+// Anything `generate` can read a descriptor off: exactly the two members
+// `@table` synthesizes (#5051, #5189). A concrete `@table` class satisfies
+// this structurally (SPEC §14.3) with no declared `implements` — the same
+// way `Executor` (`data.bit`) is satisfied by a `Pool` or a transaction
+// handle — which is what lets `[User{}, Order{}]` convert to `[]TableEntity`
+// element-by-element at the call site (SPEC §12.3's bare-literal rule).
+export interface TableEntity {
+  tableDescriptor(): []FieldDesc,
+  tableAttrs(): []AttrDesc,
+}
+
+// Where `generate` writes, relative to the caller's own cwd — a real
+// project's migration directory. `generateInto` takes the directory
+// explicitly instead, so this file's own tests can point it at a scratch
+// directory without touching a real one.
+const migrationsDir: string = "migrations"
+
+// Diffs `entities` against the live schema and writes a numbered file
+// under "migrations", or returns without writing one if nothing differs.
+// See this file's header for the five rules this enforces.
+export fn generate(db: Data, entities: []TableEntity, name: string): string! {
+  return generateInto(db, entities, name, migrationsDir)?
+}
+
+// `generate`, writing under `dir` instead of the hardcoded "migrations".
+export fn generateInto(db: Data, entities: []TableEntity, name: string, dir: string): string! {
+  let ops = []string(0)
+  for e of entities {
+    let table = tableNameOf(e)?
+    let fields = e.tableDescriptor()
+    let liveCols = liveColumns(db, table)?
+    let added = fieldsNotIn(fields, liveCols)
+    let addedCols = columnNamesOf(added)
+    let removed = colsNotInFields(liveCols, fields)
+    if (len(added) == 0 && len(removed) == 0) {
+      continue
+    }
+    ops = append(ops, renderAlterBlock(table, added, addedCols, removed)?)
+  }
+  if (len(ops) == 0) {
+    return "pkg/orm: generate: schema already matches every entity given; nothing written"
+  }
+  if (!isDir(dir)) {
+    mkdir(dir)?
+  }
+  let num = nextMigrationNumber(dir)?
+  let fileName = "${padStart("${num}", 4, "0")}_${name}.bit"
+  let path = pathJoin(dir, fileName)
+  writeFile(path, renderFile(name, ops))?
+  return "pkg/orm: generate: wrote ${path}"
+}
+
+// The table name `e` was declared with — its own `@table("name")`
+// override, and only that; see this file's header for why a default
+// pluralized name is never guessed here.
+fn tableNameOf(e: TableEntity): string! {
+  let (v, found) = attrArg(e.tableAttrs(), "table")
+  if (!found) {
+    fail newError(
+        "pkg/orm: generate: this entity has no explicit @table(\"name\") — " +
+        "generate cannot derive a default table name without the class's " +
+        "own name, which @table's synthesized members do not carry (Bit " +
+        "has no reflection); add an explicit @table(\"...\") to the entity",
+    )
+  }
+  return v
+}
+
+// The live column names of `table`, in ordinal order, read from
+// information_schema.columns — LIVE, never cached (rule 4 above), because
+// a migration diffed against a stale snapshot could re-drop a column
+// another migration already added.
+fn liveColumns(db: Data, table: string): []string! {
+  let rows = db.query(
+    "select column_name from information_schema.columns where table_name = $1 order by ordinal_position",
+    [Value.Text(table)],
+  )?
+  defer rows.close()
+  let out = []string(0)
+  while (rows.next()?) {
+    out = append(out, asText(rows.value(0))?)
+  }
+  return out
+}
+
+// The fields of `fields` whose own column name (naming.bit's `columnName`
+// — `@column("...")` if given, else snake_case) is absent from `liveCols`.
+fn fieldsNotIn(fields: []FieldDesc, liveCols: []string): []FieldDesc {
+  let out = []FieldDesc(0)
+  for f of fields {
+    if (!hasColumn(liveCols, columnName(f))) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// Plain membership on a column-name list. Not `std/strings`' `contains`
+// (substring on one `string`, already imported module-wide by
+// `query.test.bit` and the wrong shape for a `[]string`) or `std/seq`'s
+// `contains<T>` (a second import of the same name, E0042) — a five-line
+// loop is cheaper than aliasing either import.
+fn hasColumn(cols: []string, name: string): bool {
+  for c of cols {
+    if (c == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// The live columns with no field in `fields` mapping to them —
+// `naming.bit`'s own `fieldForColumn`, read the other direction.
+fn colsNotInFields(liveCols: []string, fields: []FieldDesc): []string {
+  let out = []string(0)
+  for c of liveCols {
+    if (fieldForColumn(fields, c) == "") {
+      out = append(out, c)
+    }
+  }
+  return out
+}
+
+fn columnNamesOf(fields: []FieldDesc): []string {
+  let out = []string(0)
+  for f of fields {
+    out = append(out, columnName(f))
+  }
+  return out
+}
+
+// The default length `generate` gives a new `string` column — there is
+// nowhere else to read one from: `@maxLen(...)` resolves to a callable
+// validator (#5051) and is never recorded in the descriptor, so no length
+// reaches this file at all. Documented here rather than hidden, the same
+// way `schema.bit`'s own header flags its `t.string` gap.
+const defaultStringLength: int = 255
+
+// The Bit type name a field's descriptor carries -> the `AlterTable` "add"
+// call to emit for it. A CLOSED mapping: an unmapped type fails loudly,
+// naming the field, rather than guessing a schema column type it might be
+// wrong about. `i64` additionally checks `@id` (`write.bit`'s own
+// `hasIdAttr`, reused here) — an i64 field marked `@id` becomes an
+// auto-increment `Id` column; every other i64 is `Int`.
+fn addColumnCall(f: FieldDesc): string! {
+  let col = bitStringLiteral(columnName(f))
+  if (f.typeName == "i64") {
+    if (hasIdAttr(f)) {
+      return "t.addId(${col})"
+    }
+    return "t.addInt(${col})"
+  }
+  if (f.typeName == "string") {
+    return "t.addString(${col}, ${defaultStringLength})"
+  }
+  if (f.typeName == "bool") {
+    return "t.addBool(${col})"
+  }
+  if (f.typeName == "decimal") {
+    return "t.addDecimal(${col})"
+  }
+  fail newError(
+      "pkg/orm: generate: field '${f.name}' has Bit type '${f.typeName}', " +
+      "which this generator has no schema column mapping for — add it to " +
+      "the migration file by hand instead of guessing one",
+  )
+}
+
+// One table's `alter()` block as Bit source. `added`/`removed` are never
+// both empty — the caller only reaches this when there is a diff.
+// `addedCols` is `added`'s own column names, already computed by the
+// caller, so `destructiveComment` does not recompute them per drop.
+fn renderAlterBlock(
+  table: string,
+  added: []FieldDesc,
+  addedCols: []string,
+  removed: []string,
+): string! {
+  let b = newBuilder()
+  b.write("alter(${bitStringLiteral(table)}, (t) => {\n")
+  for f of added {
+    let call = addColumnCall(f)?
+    b.write("  ${call}\n")
+  }
+  for col of removed {
+    b.write("  ${destructiveComment(col, addedCols)}\n")
+    b.write("  t.dropColumn(${bitStringLiteral(col)})\n")
+  }
+  b.write("})")
+  return b.toString()
+}
+
+// The comment above a `dropColumn` call: marks it destructive (rule 5),
+// and — when this same table's diff also added a column in this pass —
+// names both instead of guessing a rename (rule 1). The reviewer is the
+// one who turns these two calls into a `renameColumn(...)` if that is
+// what actually happened.
+fn destructiveComment(col: string, addedCols: []string): string {
+  let base = "// destructive: '${commentSafe(col)}' exists in the " +
+    "database but not in the entity; dropping it deletes data"
+  if (len(addedCols) == 0) {
+    return base
+  }
+  return "${base} — this same diff adds ${joinedNames(addedCols)} to " +
+    "this table; if this is a rename, edit these two calls into one " +
+    "renameColumn(...) call instead"
+}
+
+fn joinedNames(names: []string): string {
+  let out = []string(0)
+  for n of names {
+    out = append(out, "'${commentSafe(n)}'")
+  }
+  return join(out, ", ")
+}
+
+// Strips a newline/carriage return from `s` before it goes into a `//`
+// comment this file writes. A column name is data, not something trusted
+// to stay on one line — a literal newline inside a generated comment
+// would let it inject a second line of live Bit source into the file
+// instead of staying inert text.
+fn commentSafe(s: string): string {
+  return replace(replace(s, "\n", " "), "\r", " ")
+}
+
+// `s` as a Bit double-quoted string literal, safe against every one of
+// its own escape mechanisms (SPEC §5.7): `\` and `"` first (the ordinary
+// escapes), then every literal `$` (`\$` is what SPEC §5.7 names as the
+// way to emit one) so a name like `${panic()}` cannot become a live
+// interpolation in the file this function writes, then a literal newline
+// — interpreted strings are single-line — as `\n`.
+fn bitStringLiteral(s: string): string {
+  let out = replace(s, "\\", "\\\\")
+  out = replace(out, "\"", "\\\"")
+  out = replace(out, "$", "\\$")
+  out = replace(out, "\n", "\\n")
+  return "\"${out}\""
+}
+
+// The migration file's whole source: a header naming what generated it,
+// an `import` for the schema builder, and one `up()` gathering every
+// table's alter block in the order `entities` gave them.
+fn renderFile(name: string, ops: []string): string {
+  let b = newBuilder()
+  b.write("// Generated by orm.generate(\"${commentSafe(name)}\") — review before committing.\n")
+  b.write("// A dropColumn next to an addColumn in the same block may be a\n")
+  b.write("// rename; this generator never guesses one — edit it into a\n")
+  b.write("// renameColumn(...) call if that is what you meant (#5067).\n\n")
+  b.write("import { alter } from \"orm\"\n\n")
+  b.write("export fn up() {\n")
+  for op of ops {
+    b.write(indentBlock(op))
+    b.write("\n")
+  }
+  b.write("}\n")
+  return b.toString()
+}
+
+fn indentBlock(s: string): string {
+  let lines = split(s, "\n")
+  let out = []string(0)
+  for ln of lines {
+    out = append(out, "  ${ln}")
+  }
+  return join(out, "\n")
+}
+
+// One higher than the highest `NNNN_...` prefix already in `dir` (0 when
+// `dir` has no numbered file yet), so a fresh migration never collides
+// with or reorders an existing one.
+fn nextMigrationNumber(dir: string): int! {
+  let names = readDir(dir)?
+  let highest = 0
+  for n of names {
+    let num = leadingNumber(n)
+    if (num > highest) {
+      highest = num
+    }
+  }
+  return highest + 1
+}
+
+// The leading run of ASCII digits in `name`, or 0 if it has none — a
+// non-numbered file already in the directory (a README, say) is simply
+// never the highest.
+fn leadingNumber(name: string): int {
+  let i = 0
+  let n = len(name)
+  while (i < n && isDigitByte(name[i])) {
+    i = i + 1
+  }
+  if (i == 0) {
+    return 0
+  }
+  return parseInt(name[0:i]) catch _ {
+    0
+  }
+}
