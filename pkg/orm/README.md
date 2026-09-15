@@ -46,6 +46,8 @@ mapped from a `@table` class's field names - see
 `SchemaDialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first.
 Querying rows through the find chain is [`docs/query.md`](docs/query.md).
 Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
+Turning a driver's constraint-violation error into a typed, catchable cause
+is [`docs/errors.md`](docs/errors.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
