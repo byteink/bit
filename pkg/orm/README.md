@@ -8,10 +8,13 @@ field to its SQL table and column, the schema builder that declares tables,
 columns, indexes and foreign keys as an intent tree for a dialect to
 render, `Query<T>`, the find chain (`where`/`whereIn`/`whereNull`/
 `whereLike`/`orderBy`/`limit`/`offset`) whose string-literal column names
-are checked against `T`'s fields at compile time, and `save`/`delete`/
+are checked against `T`'s fields at compile time, `save`/`delete`/
 `upsert`, the three write verbs: one `save` for a new or already-persisted
 entity, decided by a hidden flag rather than the primary key, and 0 rows
-matched by an UPDATE is an error rather than a silent no-op.
+matched by an UPDATE is an error rather than a silent no-op, and
+`update`/`deleteMany`, the patch builder for writing or removing rows by a
+`where` clause with no instance loaded - a bare call touching every row is
+refused unless `.all()` says so on purpose.
 
 ## Install
 
@@ -44,7 +47,8 @@ mapped from a `@table` class's field names - see
 [`docs/naming.md`](docs/naming.md). Declaring and altering tables is
 [`docs/schema.md`](docs/schema.md). Querying rows through the find chain is
 [`docs/query.md`](docs/query.md). Saving, deleting and upserting a row is
-[`docs/write.md`](docs/write.md).
+[`docs/write.md`](docs/write.md). Writing or removing rows with no instance
+loaded is [`docs/patch.md`](docs/patch.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

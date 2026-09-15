@@ -1,0 +1,238 @@
+// pkg/orm/patch.bit — the update/delete patch builder (#5060, owner decision
+// 2026-09-12): "do you already have the instance? Yes -> save. No -> this."
+// It exists for exactly two cases: one column where loading the row first
+// would be a wasted round-trip (`lastSeenAt` on every login), and many rows
+// at once where there is no single instance to hold.
+//
+//     update<Person>(db, "people", fields).where("id", Value.Int(1)).set("phone", p).run()?
+//     update<Person>(db, "people", fields).where("active", Value.Bool(false)).set("archived", Value.Bool(true)).run()?
+//     deleteMany<Person>(db, "people", fields).where("createdAt", Value.Int(cutoff)).run()?
+//
+// WHY `update<T>`/`deleteMany<T>` TAKE `table`/`fields` EXPLICITLY, NOT
+// `db.update<T>()`. Same limitation `pkg/orm/query.bit`'s own header
+// documents for `find<T>`: `Patch<T>`/`DeletePatch<T>`'s methods run after
+// `T` has already collapsed to the type parameter of an already-built
+// value, never a literal a pre-checker pass can resolve — only the ROOT
+// call, written `update<Person>(...)` with `<T>` spelled out at the call
+// site itself, is something `compiler/checkormquery.bit` can see. Until a
+// second compiler pass exists (that file's own header names the reuse
+// surface), the caller supplies `table`/`fields` once per entity, the same
+// `personDesc()`-shaped wrapper `docs/write.md` already established.
+//
+// WHY `deleteMany<T>`, NOT `delete<T>`. `pkg/orm/write.bit` already exports
+// a non-generic `delete(db, desc, values)` for the single-instance case —
+// two top-level functions named `delete` in the same module do not
+// overload, they collide. `deleteMany` also says out loud what this one
+// does that `write.bit`'s `delete` cannot: touch more than one row without
+// an instance for any of them.
+//
+// THE OWNER'S OWN EXAMPLE USED AN OPERATOR (`Op.Lt`) THIS PACKAGE DOES NOT
+// HAVE YET. No `Op` vocabulary exists anywhere in `pkg/orm` or `std/sql` —
+// `Query<T>.where` (#5057) is equality-only, and this ticket's own
+// instruction is to match that shape exactly, not invent a parallel one.
+// `where` below is equality-only for the same reason; a comparison
+// operator is real, separate work this file does not attempt.
+//
+// SECURITY IS THE SAME STANDARD `compiler/checkormquery.bit` SET FOR
+// `find<T>` (#5057). `where`/`set` take a Bit FIELD name, never SQL text;
+// `columnForPatchField` below panics naming the field and the table at
+// RUNTIME the same way `Query.columnFor` does, and — as of this ticket —
+// `compiler/checkormquery.bit`'s chain-root walk now recognises `update<T>`
+// and `deleteMany<T>` as roots exactly like `find<T>`, so a string-literal
+// column misspelled at either is E0163 at compile time too. Every VALUE is
+// a `Value`, carried as a `$n` placeholder; nothing in this file ever
+// pastes a value into SQL text.
+//
+// SAFETY: A BARE `run()` MUST NOT BE SILENT. `where`/`set` never DELETE or
+// mass-UPDATE by construction — the caller must say `.all()` first, the
+// same shape `write.bit`'s own header names for `deleteAll`. `refuseIfBare`
+// below is the one gate both `Patch<T>.run()` and `DeletePatch<T>.run()`
+// pass through before a single byte reaches the driver.
+//
+// @VERSION IS AN UPDATE-ONLY REFUSAL, NOT AN UPDATE-ONLY IMPLEMENTATION OF
+// #5059. This file never loads the row, so it has no old version to
+// compare against — it can only refuse to run blind. `refuseIfVersionMissing`
+// treats "the caller named the `@version` field in a `where(...)` call" as
+// "supplied explicitly"; it does not increment a version or add an
+// implicit `WHERE version = ...` the way #5059's `save()` will. `deleteMany`
+// carries no such refusal: removing a row by key is not the lost-update
+// case `@version` exists for.
+//
+// UPDATE WRITES ONLY THE COLUMNS `set()` NAMED, UNLIKE `save`. `sets`
+// starts empty and `run()` refuses to execute an UPDATE with nothing in
+// it — there is no "every column" default here, because this builder never
+// held a whole entity to begin with.
+
+// Why an UPDATE or DELETE would otherwise run unbounded, or an UPDATE on a
+// `@version` table would otherwise run blind — see this file's header.
+export enum PatchCause { NoWhereClause, VersionRequired }
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `pkg/orm/write.bit`'s `WriteError` is. `table` stands in for "the
+// class" the same way `WriteError.message()` already does — this package's
+// error messages have never carried a class name separately from the table
+// it maps to.
+export class PatchError {
+  export cause: PatchCause
+  export table: string
+
+  message(): string {
+    match (this.cause) {
+      NoWhereClause => return "pkg/orm: update/delete on the class mapped to '${this.table}' has no where() and no .all() - refusing to touch every row; call .all() before run() if a bulk write is intended"
+      VersionRequired => return "pkg/orm: update on the class mapped to '${this.table}' carries a @version field - supply it explicitly with where(\"<field>\", ...) before run(), or use save() (#5059) for automatic optimistic locking"
+    }
+  }
+}
+
+// The UPDATE half: `where`/`set` accumulate predicates and assignments,
+// `run()` executes and returns the affected row count. Every method but
+// `run` returns `this`, already mutated, so a caller may chain fluently.
+export class Patch<T> {
+  db: Data
+  table: string
+  fields: []FieldDesc
+  wheres: []string
+  whereFields: []string
+  args: []Value
+  sets: []string
+  allFlag: bool
+  export where(column: string, val: Value): Patch<T> {
+    let col = columnForPatchField(this.fields, this.table, column)
+    this.args = append(this.args, val)
+    this.wheres = append(this.wheres, "${col} = $${len(this.args)}")
+    this.whereFields = append(this.whereFields, column)
+    return this
+  }
+  export set(column: string, val: Value): Patch<T> {
+    let col = columnForPatchField(this.fields, this.table, column)
+    this.args = append(this.args, val)
+    this.sets = append(this.sets, "${col} = $${len(this.args)}")
+    return this
+  }
+  export all(): Patch< // The explicit "I meant every row" escape hatch — see this file's header.
+    T,
+  > {
+    this.allFlag = true
+    return this
+  }
+  export run(): int! { // Runs `UPDATE <table> SET <sets> [WHERE <wheres>]` and returns the
+    // affected row count. 0 is an ordinary result here, never an error — a
+    // bulk update matching nothing is not a mistake the way `save`'s single
+    // instance not matching is (`pkg/orm/write.bit`'s own header).
+    refuseIfBare(this.table, this.whereFields, this.allFlag)?
+    refuseIfVersionMissing(this.table, this.fields, this.whereFields)?
+    if (len(this.sets) == 0) {
+      fail newError("pkg/orm: update on the class mapped to '${this.table}' called run() with no set() - nothing to write")
+    }
+    let sqlText = "update ${this.table} set ${join(this.sets, ", ")}" + patchWhereSql(this.wheres)
+    return this.db.exec(sqlText, this.args)?
+  }
+}
+
+// The DELETE half: `where` accumulates predicates, `run()` executes and
+// returns the affected row count. No `set` — there is nothing to assign.
+export class DeletePatch<T> {
+  db: Data
+  table: string
+  fields: []FieldDesc
+  wheres: []string
+  whereFields: []string
+  args: []Value
+  allFlag: bool
+  export where(column: string, val: Value): DeletePatch<T> {
+    let col = columnForPatchField(this.fields, this.table, column)
+    this.args = append(this.args, val)
+    this.wheres = append(this.wheres, "${col} = $${len(this.args)}")
+    this.whereFields = append(this.whereFields, column)
+    return this
+  }
+  export all(): DeletePatch<T> {
+    this.allFlag = true
+    return this
+  }
+  export run(): int! { // Runs `DELETE FROM <table> [WHERE <wheres>]` and returns the affected
+    // row count. No `@version` refusal — see this file's header.
+    refuseIfBare(this.table, this.whereFields, this.allFlag)?
+    let sqlText = "delete from ${this.table}" + patchWhereSql(this.wheres)
+    return this.db.exec(sqlText, this.args)?
+  }
+}
+
+// The one entry point for an UPDATE chain (`compiler/checkormquery.bit`
+// recognises `<T>` written explicitly here, the same way it recognises
+// `find<T>`). See this file's header for why `table`/`fields` are explicit.
+export fn update<T>(db: Data, table: string, fields: []FieldDesc): Patch<T> {
+  return Patch<T>{
+    db: db, table: table, fields: fields, wheres: []string(0), whereFields: []string(0),
+    args: []Value(0), sets: []string(0), allFlag: false,
+  }
+}
+
+// The one entry point for a DELETE chain — see this file's header for why
+// this is `deleteMany`, not `delete`.
+export fn deleteMany<T>(db: Data, table: string, fields: []FieldDesc): DeletePatch<T> {
+  return DeletePatch<T>{
+    db: db, table: table, fields: fields, wheres: []string(0), whereFields: []string(0),
+    args: []Value(0), allFlag: false,
+  }
+}
+
+// `field`'s SQL column, validated against `fields` at RUNTIME — the same
+// fallback `pkg/orm/query.bit`'s `Query.columnFor` is for a column the
+// compiler could not check because it was not a string literal at the call.
+// A field that does not exist is a caller bug, not a recoverable condition,
+// so this panics naming both.
+fn columnForPatchField(fields: []FieldDesc, table: string, field: string): string {
+  for f of fields {
+    if (f.name == field) {
+      return columnName(f)
+    }
+  }
+  panic("pkg/orm: '${field}' is not a field of the class mapped to '${table}'")
+}
+
+// No `where()` and no `.all()` — see this file's header for why this
+// refuses rather than running unbounded.
+fn refuseIfBare(table: string, whereFields: []string, allFlag: bool): ()! {
+  if (len(whereFields) == 0 && !allFlag) {
+    fail PatchError{ cause: PatchCause.NoWhereClause, table: table }
+  }
+}
+
+// `fields` carries a `@version` field and `whereFields` never named it —
+// see this file's header for what "supplied explicitly" means here.
+fn refuseIfVersionMissing(table: string, fields: []FieldDesc, whereFields: []string): ()! {
+  let (versionField, hasVersion) = versionFieldOf(fields)
+  if (hasVersion && !patchFieldNameIn(versionField, whereFields)) {
+    fail PatchError{ cause: PatchCause.VersionRequired, table: table }
+  }
+}
+
+// The one field carrying `@version`, or ("", false) when none does —
+// existence only, the same shape `write.bit`'s own `hasIdAttr` checks.
+fn versionFieldOf(fields: []FieldDesc): (string, bool) {
+  for f of fields {
+    for a of f.attrs {
+      if (a.name == "version") {
+        return (f.name, true)
+      }
+    }
+  }
+  return ("", false)
+}
+
+fn patchFieldNameIn(name: string, names: []string): bool {
+  for n of names {
+    if (n == name) {
+      return true
+    }
+  }
+  return false
+}
+
+fn patchWhereSql(wheres: []string): string {
+  if (len(wheres) == 0) {
+    return ""
+  }
+  return " where " + join(wheres, " and ")
+}
