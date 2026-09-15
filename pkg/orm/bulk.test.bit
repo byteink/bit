@@ -1,0 +1,234 @@
+// pkg/orm/bulk.test.bit — #5072's acceptance for `insertAll`, against a fake
+// driver.
+//
+// `bkAdapter` is the "database": every `query()` call is recorded
+// (`calls`, so a test can assert the STATEMENT COUNT), and the row set it
+// hands back is not canned — it is computed from the arguments the
+// statement actually carried, `len(params) / len(cols)` groups, each
+// answering with a fresh, monotonically increasing `id` (modelling a
+// database auto-increment column) alongside every other column's value the
+// caller sent, unchanged. That is what lets the chunk-boundary test below
+// prove every row arrived exactly once: `seq` is the one value this file
+// controls end to end, so a dropped, duplicated or reordered row shows up
+// as a `seq` that is missing, or seen twice, out of `0..n-1`.
+//
+// `pool`/`Pool`/`Datasource`/`Conn`/`Rows`/`Stmt`/`Tx`/`Value`/`Isolation`
+// are imported by ./data.test.bit, this file's sibling in the same module
+// (SPEC §17.1) — a second import here would be E0042. `FieldDesc`/`AttrDesc`
+// by ./naming.bit. `Account`/`accountDesc`/`accountValues`/`fieldWithId`
+// are declared in ./write.test.bit and reused here rather than redeclared,
+// the same way that file reuses `field` from ./naming.test.bit.
+
+class bkCall { sql: string, args: []Value }
+
+// One canned RETURNING row per group, replayed byte-for-byte from what the
+// statement itself carried — see this file's header.
+class bkRows {
+  cols: []string
+  data: [][]Value
+  i: int
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.data)
+  }
+
+  columns(): []string {
+    return this.cols
+  }
+
+  value(col: int): Value {
+    return this.data[this.i][col]
+  }
+
+  close() {}
+}
+
+// The fake database: every `query()` call, in order, and a monotonically
+// increasing generated-key counter shared across every call — modelling one
+// auto-increment sequence across every chunk `insertAll` issues.
+class bkAdapter {
+  calls: []bkCall
+  nextId: i64
+  // The columns each `RETURNING *` row carries, `id` always first — the
+  // width `query()` below steps `params` by, since a test's entity has a
+  // fixed number of columns per row.
+  cols: []string
+
+  connect(cfg: Datasource): Conn! {
+    return bkConn{ a: this }
+  }
+}
+
+class bkConn {
+  a: bkAdapter
+
+  // Computes its RETURNING rows from `params` itself: `len(params) /
+  // len(this.a.cols)` groups, each answering with a fresh generated `id`
+  // (column 0) and every other column echoed back exactly as sent.
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.calls = append(this.a.calls, bkCall{ sql: sqlText, args: params })
+    let ncols = len(this.a.cols)
+    let data = [][]Value(0)
+    let i = 0
+    while (i < len(params)) {
+      this.a.nextId = this.a.nextId + 1
+      let row = []Value(0)
+      row = append(row, Value.Int(this.a.nextId))
+      let j = 1
+      while (j < ncols) {
+        row = append(row, params[i + j])
+        j = j + 1
+      }
+      data = append(data, row)
+      i = i + ncols
+    }
+    return bkRows{ cols: this.a.cols, data: data, i: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec not supported")
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    fail newError("fake: begin not supported")
+  }
+
+  close() {}
+}
+
+fn newBkPool(a: bkAdapter): Pool {
+  let p = pool(a, Datasource{ host: "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+// A 4-column entity — `id` (`@id`, generated), `seq`, `note`, `extra` —
+// exactly the width `65535 / 4` in `maxRowsPerChunk` (bulk.bit) divides by.
+fn bulkItemDesc(): TableDesc {
+  return TableDesc{
+    table: "bulk_items", fields: [fieldWithId("id"), field("seq"), field("note"), field("extra")],
+  }
+}
+
+fn bulkItemValues(seq: int): map<string, Value> {
+  return map<string, Value>{
+    "id": Value.Int(0), "seq": Value.Int(seq), "note": Value.Text("n"), "extra": Value.Text("e"),
+  }
+}
+
+test "insertAll with 3 rows issues exactly 1 statement carrying 3 value groups" {
+  let a = bkAdapter{ calls: []bkCall(0), nextId: 0, cols: ["id", "name", "email"] }
+  let p = newBkPool(a)
+  let u0 = Account{ id: 0, name: "Ada", email: "a@x.com" }
+  let u1 = Account{ id: 0, name: "Bea", email: "b@x.com" }
+  let u2 = Account{ id: 0, name: "Cid", email: "c@x.com" }
+  let rows = [accountValues(u0), accountValues(u1), accountValues(u2)]
+
+  let generated = insertAll(p, accountDesc(), rows) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  assert(len(a.calls) == 1, "must issue exactly 1 statement, got ${len(a.calls)}")
+  let want = "insert into accounts (id, name, email) values ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) returning *"
+  assert(a.calls[0].sql == want, "got: ${a.calls[0].sql}")
+  assert(len(generated) == 3, "must return one row per input row, got ${len(generated)}")
+}
+
+test "an INSERT with database-generated keys fills every entity's key and marks it persisted" {
+  let a = bkAdapter{ calls: []bkCall(0), nextId: 100, cols: ["id", "name", "email"] }
+  let p = newBkPool(a)
+  let u0 = Account{ id: 0, name: "Ada", email: "a@x.com" }
+  let u1 = Account{ id: 0, name: "Bea", email: "b@x.com" }
+  let users = [u0, u1]
+  let rows = [accountValues(u0), accountValues(u1)]
+
+  let generated = insertAll(p, accountDesc(), rows) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let i = 0
+  while (i < len(users)) {
+    let (idVal, ok) = generated[i]["id"]
+    assert(ok, "generated[${i}] must carry a filled 'id'")
+    match (idVal) {
+      Int(n) => users[i].id = n
+      _ => assert(false, "generated id must be an Int")
+    }
+    users[i].markPersisted(true)
+    i = i + 1
+  }
+  assert(users[0].id == 101, "got ${users[0].id}")
+  assert(users[1].id == 102, "got ${users[1].id}")
+  assert(users[0].isPersisted(), "each returned entity must read isPersisted() true")
+  assert(users[1].isPersisted(), "each returned entity must read isPersisted() true")
+}
+
+// The chunk boundary is where a dropped or duplicated row would hide: 30000
+// is deliberately NOT a multiple of `65535 / 4`, so the last chunk is
+// short, and the test proves the boundary neither drops nor repeats a row.
+test "30000 rows of a 4-column entity chunk at 65535/4 placeholders, every row exactly once" {
+  let a = bkAdapter{ calls: []bkCall(0), nextId: 0, cols: ["id", "seq", "note", "extra"] }
+  let p = newBkPool(a)
+  let total = 30000
+  let rows = []map<string, Value>(0)
+  let i = 0
+  while (i < total) {
+    rows = append(rows, bulkItemValues(i))
+    i = i + 1
+  }
+
+  let generated = insertAll(p, bulkItemDesc(), rows) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let chunkSize = 65535 / 4
+  let expectedChunks = (total + chunkSize - 1) / chunkSize
+  assert(
+    len(a.calls) == expectedChunks,
+    "must issue ${expectedChunks} statements for ${total} rows at ${chunkSize} rows/chunk, got ${len(a.calls)}",
+  )
+  assert(len(generated) == total, "must return exactly ${total} rows, got ${len(generated)}")
+
+  let seen = []bool(total)
+  let dupes = 0
+  let outOfRange = 0
+  for g of generated {
+    let (seqVal, ok) = g["seq"]
+    assert(ok, "every returned row must carry 'seq'")
+    match (seqVal) {
+      Int(n) => {
+        if (n < 0 || n >= i64(total)) {
+          outOfRange = outOfRange + 1
+        } else if (seen[n]) {
+          dupes = dupes + 1
+        } else {
+          seen[n] = true
+        }
+      }
+      _ => assert(false, "'seq' must be an Int")
+    }
+  }
+  assert(
+    outOfRange == 0,
+    "no returned row's seq may fall outside 0..${total - 1}, got ${outOfRange} out of range",
+  )
+  assert(dupes == 0, "no seq may repeat across chunks, got ${dupes} duplicate(s)")
+  let missing = 0
+  let j = 0
+  while (j < total) {
+    if (!seen[j]) {
+      missing = missing + 1
+    }
+    j = j + 1
+  }
+  assert(missing == 0, "every seq 0..${total - 1} must be present, got ${missing} missing")
+}

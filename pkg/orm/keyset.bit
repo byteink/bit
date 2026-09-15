@@ -1,0 +1,127 @@
+// pkg/orm/keyset.bit — after(), the keyset-pagination cursor (#5072).
+//
+//     let q = people(db).orderBy("id", Dir.Asc)
+//     let page1 = q.limit(50).all()?
+//     let last = page1[len(page1) - 1]
+//     let page2 = q.after(Value.Int(last.id))?.limit(50).all()?   // WHERE id > $1 ORDER BY id LIMIT 50
+//
+// WHY THIS FILE HAS NO SQL OF ITS OWN AND NO NEW METHOD ON `Query<T>`
+// WRITTEN HERE. A class's method set is the set of methods declared in its
+// body (SPEC §14) — `after()` itself, plus the `orderByFields`/
+// `orderByDirs` fields it reads, is added directly to `Query<T>` in
+// `query.bit`, right next to `orderBy` and `wheres`/`args`, the exact state
+// it composes with. This file supplies the pure logic `after()` calls into
+// (`keysetPredicate` below) and the typed refusal, kept separate the same
+// way `pkg/orm/errors.bit`'s classification logic is kept out of
+// `write.bit` even though `save`'s callers are its only caller.
+//
+// `LIMIT 50 OFFSET 100000` MAKES THE DATABASE COUNT AND DISCARD 100000
+// ROWS FIRST — `offset()` (query.bit) stays available for a page-number UI,
+// but its cost grows with depth. `after()` never adds an OFFSET: it carries
+// the last row's own sort key and asks for everything past it, which uses
+// the ORDER BY column's index instead of a table scan, so page 10000 costs
+// what page 1 costs. See `docs/keyset.md` for what this does and does not
+// prove without a real database — an index-friendly WHERE clause is not
+// the same claim as a measured query plan.
+//
+// AFTER() READS THE FIRST orderBy() COLUMN, AND REQUIRES ONE TO ALREADY BE
+// SET. `Query<T>.orderBy()` records the Bit field name and direction of
+// every call, in order (`orderByFields`/`orderByDirs`, query.bit) — the
+// same way `Patch<T>.where()` records `whereFields` for `refuseIfBare`
+// (patch.bit). `after()` composes with the FIRST one: for a single-column
+// order, the common case this file's whole header example uses, that is
+// the only column there is; a composite (multi-column) keyset cursor,
+// comparing a tuple rather than one column, is real, separate work not
+// attempted here, the same way this package flags every other real gap
+// (`pkg/orm/schema.bit`'s own header lists three). Calling `after()` before
+// any `orderBy()` — the order is chain-position-independent for every
+// other method here, but `after()` needs the order already recorded to
+// read it — refuses with `KeysetCause.NoOrderBy`, and ordering by a column
+// that carries neither `@id` nor `@unique` refuses naming it
+// (`KeysetCause.NotUnique`): a non-unique sort key means two rows can share
+// the boundary value, so "everything after it" silently skips or repeats
+// rows.
+//
+// WHY `after()` RETURNS `Query<T>!`, UNLIKE EVERY OTHER CHAIN METHOD. Every
+// other builder method here (`where`, `orderBy`, `limit`, ...) can never
+// fail — a bad column name is a compile-time `E0163` or a runtime `panic`
+// naming a caller bug, never a recoverable condition. `after()` is
+// different: calling it with no `orderBy()` yet, or ordering by a
+// non-unique column, is a legitimate mistake a caller can catch and act on
+// (fall back to `offset()`, or add `@unique`), so it is `fail`-based like
+// `Patch<T>.run()`'s own refusal, propagated with `?` before the next
+// chain call: `q.after(cursor)?.limit(50).all()?`.
+
+// `FieldDesc` (naming.bit/data.test.bit) and `Dir` (query.bit, this file's
+// own sibling in the same module, SPEC §17.1) need no import here — a
+// second import would be E0042.
+
+// Why `after()` on the class mapped to `table` was refused: no `orderBy()`
+// was set yet, or the column it orders by is not `@id`/`@unique` — see
+// this file's header.
+export enum KeysetCause { NoOrderBy, NotUnique }
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `pkg/orm/patch.bit`'s `PatchError` is.
+export class KeysetError {
+  export cause: KeysetCause
+  export table: string
+  export column: string
+
+  export message(): string {
+    match (this.cause) {
+      NoOrderBy => return "pkg/orm: after() on the class mapped to '${this.table}' has no orderBy() set - keyset pagination needs a deterministic order to compare the cursor against"
+      NotUnique => return "pkg/orm: after() on the class mapped to '${this.table}' orders by '${this.column}', which is neither @id nor @unique - the page boundary would be ambiguous, silently skipping or repeating rows"
+    }
+  }
+}
+
+// The column and comparison operator `Query<T>.after()` (query.bit) binds
+// its cursor value against, read off the FIRST `orderBy()` call — see this
+// file's header for why the first, and why refusal is a `fail`, not a
+// panic. `>` for an ascending order, `<` for a descending one, so "after"
+// always means "further along the order actually requested."
+fn keysetPredicate(
+  table: string,
+  fields: []FieldDesc,
+  orderByFields: []string,
+  orderByDirs: []Dir,
+): (string, string)! {
+  if (len(orderByFields) == 0) {
+    fail KeysetError{ cause: KeysetCause.NoOrderBy, table: table, column: "" }
+  }
+  let field = orderByFields[0]
+  let f = keysetFieldNamed(fields, field, table)
+  if (!keysetIsUnique(f)) {
+    fail KeysetError{ cause: KeysetCause.NotUnique, table: table, column: field }
+  }
+  let op = ">"
+  if (orderByDirs[0] == Dir.Desc) {
+    op = "<"
+  }
+  return (columnName(f), op)
+}
+
+// `name`'s `FieldDesc`, or a panic naming both — unreachable in practice,
+// since `Query<T>.orderBy()` already validated `name` through its own
+// `columnFor` before recording it into `orderByFields`; kept defensive the
+// same way `pkg/orm/write.bit`'s several lookups are.
+fn keysetFieldNamed(fields: []FieldDesc, name: string, table: string): FieldDesc {
+  for f of fields {
+    if (f.name == name) {
+      return f
+    }
+  }
+  panic("pkg/orm: '${name}' is not a field of the class mapped to '${table}'")
+}
+
+// Whether `f` carries `@id` or `@unique` — the one property that makes
+// "greater than this row's key" an unambiguous page boundary.
+fn keysetIsUnique(f: FieldDesc): bool {
+  for a of f.attrs {
+    if (a.name == "id" || a.name == "unique") {
+      return true
+    }
+  }
+  return false
+}
