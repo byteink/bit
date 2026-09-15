@@ -85,6 +85,28 @@ fn lowerAppendElems(fc: FnCtx, accIn: int, ctx: AppendPackedCtx, args: []int): i
   let i = 1
   while (i < len(args) && !fc.failed) {
     let a = args[i]
+    // #5328: `append(dst, ...src)`. SPEC §12.4: "Exactly one `...spread`
+    // argument is permitted... Mixing individual args and a spread in the
+    // same call is a compile error" — `lowerVariadicTail` (lowerprim.bit)
+    // enforces exactly this for a real variadic function's tail (a lone
+    // spread only, `len(items) == 1`), but `vAppendCall`
+    // (validateappend.bit) dispatches past the general check that raises
+    // E0063 for everyone else, so append never got the rule at all. Mirrored
+    // here: a spread is legal only as append's SOLE trailing argument
+    // (`len(args) == 2` — `dst` plus the one spread).
+    if (getNode(fc.c.tree, a).tag == Tag.ArgSpread) {
+      if (len(args) != 2) {
+        fcFail(
+          fc,
+          getNode(fc.c.tree, a).span,
+          "a `...` spread mixed with another append argument",
+        )
+        return 0
+      }
+      acc = lowerAppendSpreadInto(fc, acc, ctx, kidsOf(fc.c.tree, a)[0])
+      i = i + 1
+      continue
+    }
     if (getNode(fc.c.tree, a).tag == Tag.Arg) {
       a = kidsOf(fc.c.tree, a)[0]
     }
@@ -104,6 +126,106 @@ fn lowerAppendElems(fc: FnCtx, accIn: int, ctx: AppendPackedCtx, args: []int): i
     i = i + 1
   }
   return acc
+}
+
+// `append(dst, ...src)` (#5328): folds every element of `src` into `acc` with
+// a genuine runtime loop — the same shape `for x of src { acc = append(acc,
+// x) }` lowers to, and the same shape #5072's hand-written workaround used
+// at every call site before this existed. `lowerAppend` never had this case
+// at all: every trailing argument was lowered as one AST-level expression
+// per source token, so a single spread token — one node standing for a
+// runtime-many-element value — reached `lowerExprH` and hit E0092 ("cannot
+// lower an expression form the lowerer does not yet handle"), for every
+// element type alike; there was no element-type boundary to find.
+//
+// Reuses `for … of`'s own element-read shape (`lowerForOfSliceElem`,
+// lowerctrl.bit): the header computes `icmp_slt(idx, slice_len(src))` and
+// branches to a ZERO-PARAM body whose first instruction is the element load
+// — the exact invariant that function's bounds-check elision depends on
+// (see its own comment: no call, no allocation, no safepoint between the
+// header's compare and the load).
+//
+// EVERY value the loop reads — `src`, `ctx.refV`, `ctx.esV`, besides `acc`
+// and `idx` which genuinely change — is threaded through the env exactly
+// like `for … of`'s own `$iter`. The IR verifier requires this even for a
+// value nothing inside the loop reassigns: `ircheck.bit` refuses any read,
+// anywhere in a loop closed by a back edge, of a value defined outside
+// it — the first version of this function skipped that for the three
+// invariants and every fixture failed verification (#5328) rather than
+// producing a wrong answer.
+//
+// A packed (`stride > 8`) `elemTy` never reaches here: `scanAppendArgs`
+// (lowersliceinline.bit) already disqualifies packing, module-wide, for any
+// elemTy a spread ever appends into — a spread argument is never a fresh
+// `CompositeLit` — so `ctx.stride` is always <= 8 by the time
+// `lowerAppendElems` calls this, and `lowerForOfSliceElem` takes its
+// ordinary (non-packed) arm.
+fn lowerAppendSpreadInto(fc: FnCtx, accIn: int, ctx: AppendPackedCtx, spreadOperand: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let srcTy = mkSlice(fc.c.ctx, ctx.elemTy)
+  let srcV = lowerExprH(fc, spreadOperand, srcTy)
+  if (fc.failed) {
+    return 0
+  }
+  declareLocal(fc, "$appendAcc", accIn, ctx.sliceTy)
+  declareLocal(fc, "$appendSrc", srcV, srcTy)
+  declareLocal(fc, "$appendRef", ctx.refV, i64ty)
+  declareLocal(fc, "$appendEs", ctx.esV, i64ty)
+  let zeroI = mkInstr(Op.ConstInt, i64ty)
+  zeroI.ival = 0
+  declareLocal(fc, "$appendIdx", builderEmit(fc.b, zeroI), i64ty)
+  let preLen = len(fc.env)
+  let idxSlot = preLen - 1
+  let esSlot = preLen - 2
+  let refSlot = preLen - 3
+  let srcSlot = preLen - 4
+  let accSlot = preLen - 5
+
+  let header = builderNewBlock(fc.b)
+  let bodyBlk = builderNewBlock(fc.b)
+  let exitBlk = builderNewBlock(fc.b)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, header)
+  addJoinParams(fc, preLen)
+  let idxVal = fc.env[idxSlot].value
+  let srcCur = fc.env[srcSlot].value
+  let lenIns = mkInstr(Op.SliceLen, i64ty)
+  lenIns.lhs = srcCur
+  let cmp = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
+  cmp.lhs = idxVal
+  cmp.rhs = builderEmit(fc.b, lenIns)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, cmp)
+  br.ival = bodyBlk
+  br.thenArgs = []int(0)
+  br.ival2 = exitBlk
+  br.elseArgs = snapshotValues(fc, preLen)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, bodyBlk)
+  let elem = lowerForOfSliceElem(fc, srcCur, idxVal, ctx.elemTy)
+  let loopCtx = AppendPackedCtx{
+    sliceTy: ctx.sliceTy, elemTy: ctx.elemTy, stride: ctx.stride,
+    refV: fc.env[refSlot].value, esV: fc.env[esSlot].value,
+  }
+  fc.env[accSlot].value = emitAppendCall(fc, fc.env[accSlot].value, elem.value, loopCtx)
+  let oneI = mkInstr(Op.ConstInt, i64ty)
+  oneI.ival = 1
+  let addI = mkInstr(Op.Add, i64ty)
+  addI.lhs = idxVal
+  addI.rhs = builderEmit(fc.b, oneI)
+  fc.env[idxSlot].value = builderEmit(fc.b, addI)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, exitBlk)
+  addJoinParams(fc, preLen)
+  let result = fc.env[accSlot].value
+  truncateEnv(fc, preLen - 5)
+  return result
 }
 
 // The inputs a packed `append` shares across every trailing value it writes
