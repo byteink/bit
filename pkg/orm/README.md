@@ -31,7 +31,12 @@ row-not-found, when another write landed first, and `Query<T>.whereRaw`/
 `orderByField`, the one escape hatch for SQL text or a dynamic column
 name the rest of the builder cannot express - values still bind through
 placeholders and a dynamic column is checked against an allowlist, never
-escaped or quoted.
+escaped or quoted, `generate`, which diffs your `@table` entities against
+the live schema and writes a reviewed migration file - never applying
+anything and never inferring a rename from a drop next to an add, and
+`up`/`status`/`sql`/`down`, applying a checked-in migration registry
+against a live database with an advisory lock around the run and one
+transaction per migration, the ledger row inside it.
 
 ## Install
 
@@ -77,6 +82,9 @@ cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
 [`docs/relation.md`](docs/relation.md). Marking a row deleted instead of
 removing it is [`docs/softdelete.md`](docs/softdelete.md). Optimistic
 locking against a lost update is [`docs/version.md`](docs/version.md).
+Writing a reviewed migration file from your entities is
+[`docs/generate.md`](docs/generate.md). Applying that file against a live
+database is [`docs/migrate.md`](docs/migrate.md).
 
 ## `Dialect` vs `UpsertDialect`
 

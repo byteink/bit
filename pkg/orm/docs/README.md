@@ -17,3 +17,5 @@
 | [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |
 | [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` opt in |
 | [Optimistic locking](version.md) | `@version`: `save`'s UPDATE checks the old version and raises it by one, `StaleWriteError` when another write landed first, distinct from a row-not-found |
+| [Generate migrations](generate.md) | `generate`: diffs your `@table` entities against the live schema and writes a reviewed migration file, never applying anything and never inferring a rename |
+| [Apply migrations](migrate.md) | `up`/`status`/`sql`/`down`: applies a checked-in migration registry against a live database, one transaction per migration with the ledger row inside it, an advisory lock around the whole run |
