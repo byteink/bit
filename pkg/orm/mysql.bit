@@ -1,0 +1,290 @@
+// pkg/orm/mysql.bit — MySQL, the second `Dialect` (#5070), built after
+// Postgres (#5066) deliberately — the same discipline #3986 used for the
+// drivers: one dialect alone gets shaped around one database, the second is
+// what proves `Dialect` is a real interface and not just `Postgres` with an
+// extra name. This file changes nothing in `postgres.bit`'s own output —
+// every helper below is named `mysql*`/`Mysql*` specifically so it cannot
+// collide with (or accidentally call into) a Postgres-shaped one; Bit
+// declarations bind package-wide, so a same-named `fn` in this file would be
+// `E0042 already declared`, not a private override. `onDeleteClause` and
+// `indexName` (`postgres.bit`) ARE called directly, unmodified: both are
+// pure string shaping with no dialect-specific quoting or keyword inside
+// them (`on delete cascade`/`_idx`), so duplicating them here would be the
+// special case this codebase's own taste rule forbids, not a safety margin.
+//
+// TYPE MAPPING COVERS EXACTLY THE SEVEN `ColumnType` VARIANTS SCHEMA.BIT
+// CARRIES TODAY — `Id`, `Int`, `String(length)`, `Text`, `Bool`, `Timestamp`,
+// `Decimal` — NOT the wider `i32`/`f64`/`[]byte`/bare-`Date` vocabulary
+// #5070's own acceptance text names. `docs/schema.md`'s "Money columns, and
+// what is still missing" section, written for the owner decision #5326
+// (2026-09-15, three days after #5070 was filed), weighs each of those three
+// and leaves them out on purpose: "no table in this package ... has needed
+// one yet ... declaring it earlier would be a column nothing exercises."
+// Adding them to `ColumnType` to satisfy this ticket's literal wording would
+// reopen a decision made after the ticket was written, and reach outside
+// this ticket's own file list (`mysql.bit`/`mysql.test.bit`/`dialect.bit`)
+// into `schema.bit`, which is explicitly out of scope. Flagged on the ticket
+// rather than guessed around; every variant `ColumnType` actually has gets
+// full coverage instead.
+//
+// THE NAMING TRAP: MYSQL'S ZONE-AWARE TYPE IS THE OPPOSITE NAME FROM
+// POSTGRES'. Postgres `timestamp` is zone-naive and `timestamptz` is
+// zone-aware (`postgres.bit`'s own header); MySQL is the other way around —
+// `DATETIME` is zone-naive, `TIMESTAMP` is the zone-aware one, stored as UTC
+// internally and converted on read/write using the session `time_zone`. The
+// same reasoning `postgres.bit` gives for never rendering a bare
+// `timestamp` — "an instant read from a zoneless column is invented"
+// (#3986) — applies again here, so `ColumnType.Timestamp` renders MySQL's
+// `timestamp`, never `datetime`, even though porting the Postgres mapping
+// by NAME would land on the wrong one. This is the same trap already
+// recorded on #3986 for the driver codecs.
+//
+// A MYSQL CONNECTION MUST SET SESSION `time_zone` EXPLICITLY, AND THIS FILE
+// CANNOT DO IT. `TIMESTAMP`'s UTC-internal/session-converted behaviour above
+// means a value read back through a connection with a different session
+// `time_zone` than the one that wrote it is a different wall-clock value —
+// not a DDL concern `Dialect.render(op: SchemaOp)` has any hook for (it
+// renders one schema change, not a connection). This is the same shape as
+// `runner.bit`'s own advisory lock being "hardcoded to Postgres' ...
+// Dialect itself has no lock/unlock method today" (`runner.bit`'s header,
+// piece 2): a real gap, but one that needs whatever opens a MySQL
+// connection (this package's driver layer, not this file) to issue `SET
+// time_zone = '+00:00'` once per connection — flagged here, not guessed at,
+// and not a reason to widen `Dialect` as a side quest of this ticket.
+//
+// EVERY STATEMENT RENDERS `transactional: false`. MYSQL DDL IS NOT
+// TRANSACTIONAL — InnoDB commits any open transaction implicitly at (or
+// around) almost every DDL statement, `CREATE`/`ALTER`/`DROP TABLE` and
+// `CREATE INDEX` included, no matter what a surrounding `BEGIN`/`COMMIT`
+// says. Flagging these `true` the way `postgres.bit` does for its own
+// `CREATE TABLE` would be a lie: the runner (`runner.bit`) would wrap them
+// in `BEGIN` ... `COMMIT`, but MySQL has already committed each statement on
+// its own by the time `COMMIT` runs, so the wrapping buys no atomicity and
+// no rollback. `false` is the honest statement-by-statement signal that
+// matches `dialect.bit`'s own contract for the flag: a statement this
+// dialect cannot run inside a transaction — on MySQL that is every
+// statement, not only a `CONCURRENTLY`-shaped one, because MySQL has no
+// `CONCURRENTLY` and no non-blocking-index keyword to detect in `raw()`
+// text at all (MySQL 8's online DDL is a storage-engine default, not
+// something a migration author writes into the SQL text the way Postgres'
+// `CONCURRENTLY` is).
+//
+// THE RUNNER CANNOT FIX WHAT THIS CHANGES ABOUT A FAILED MIGRATION.
+// `runner.bit`'s `applyMigration` runs every `transactional` statement
+// inside `BEGIN` ... ledger write ... `COMMIT`, THEN every non-transactional
+// statement afterward. Because this file renders every statement
+// non-transactional, that ledger write commits BEFORE any of this
+// migration's actual DDL has run at all, and each DDL statement then either
+// succeeds and stays applied (MySQL's own implicit commit, unrecoverable
+// even by a later failure) or fails, leaving every prior statement in the
+// same migration applied and every later one missing — with
+// `schema_history` already recording the migration as done. On Postgres a
+// failed migration means nothing was applied; on MySQL a failed migration
+// can mean PART of it was applied AND the ledger already says it succeeded.
+// This is a real gap in `runner.bit`, not something a `Dialect` can correct
+// from inside `render()` — flagged here, plainly, rather than silently
+// rendered around; `pkg/orm/README.md` needs the same note, filed as
+// follow-up since another agent holds that file while this ticket is in
+// flight.
+//
+// `replace` is not imported here — `postgres.bit` already imports it from
+// `std/strings` and a Bit import binds package-wide (postgres.bit's own
+// header on this exact pair).
+
+// MySQL, the second `Dialect` implementation.
+export class Mysql {
+  export render(op: SchemaOp): []Statement {
+    match (op) {
+      CreateTable(t) => return mysqlRenderCreateTable(t)
+      AlterTable(t) => return mysqlRenderAlterTable(t)
+      DropTable(name) => return [mysqlDropTableStatement(name)]
+    }
+  }
+}
+
+// `CREATE TABLE`, then one `CREATE INDEX` per `t.index()`, then each
+// `raw()` passthrough, in declaration order — same statement split as
+// `postgres.bit`'s `renderCreateTable`, see `dialect.bit`'s header for why.
+fn mysqlRenderCreateTable(t: Table): []Statement {
+  let defs = []string(0)
+  for c of t.columns {
+    defs = append(defs, mysqlColumnDef(c))
+  }
+  for fk of t.foreignKeys {
+    defs = append(defs, mysqlForeignKeyDef(t.name, fk))
+  }
+  let body = join(defs, ",\n  ")
+  let sql = "create table ${mysqlQuoteIdent(t.name)} (\n  ${body}\n);"
+  let stmts = [Statement{ sql: sql, transactional: false }]
+  for ix of t.indexes {
+    stmts = append(stmts, mysqlIndexStatement(t, ix))
+  }
+  for r of t.raws {
+    stmts = append(stmts, mysqlRawStatement(r))
+  }
+  return stmts
+}
+
+// One `ALTER TABLE` statement per `AlterOp`, then each `raw()` passthrough —
+// see `postgres.bit`'s `renderAlterTable` for why never batched.
+fn mysqlRenderAlterTable(t: AlterTable): []Statement {
+  let stmts = []Statement(0)
+  for op of t.ops {
+    stmts = append(stmts, mysqlAlterOpStatement(t.name, op))
+  }
+  for r of t.raws {
+    stmts = append(stmts, mysqlRawStatement(r))
+  }
+  return stmts
+}
+
+fn mysqlAlterOpStatement(table: string, op: AlterOp): Statement {
+  match (op) {
+    AddColumn(c) => return Statement{
+      sql: "alter table ${mysqlQuoteIdent(table)} add column ${mysqlColumnDef(c)};",
+      transactional: false,
+    }
+    DropColumn(name) => return Statement{
+      sql: "alter table ${mysqlQuoteIdent(table)} drop column ${mysqlQuoteIdent(name)};",
+      transactional: false,
+    }
+    RenameColumn(oldName, newName) => return Statement{
+      sql: "alter table ${mysqlQuoteIdent(table)} rename column ${mysqlQuoteIdent(oldName)} to ${mysqlQuoteIdent(newName)};",
+      transactional: false,
+    }
+  }
+}
+
+fn mysqlDropTableStatement(name: string): Statement {
+  return Statement{ sql: "drop table ${mysqlQuoteIdent(name)};", transactional: false }
+}
+
+// One column's definition inside a `CREATE TABLE`/`ADD COLUMN`. `Id` is
+// `bigint auto_increment primary key` — `generated always as identity` is
+// Postgres/SQL-standard syntax MySQL does not have (this ticket's own
+// constraint: "`generated always as identity` is `auto_increment`") — and
+// returns early for the same reason `postgres.bit`'s `columnDef` does: an
+// auto-increment primary key needs no `not null`/`unique` suffix regardless
+// of what the `Column` node's own flags happen to hold.
+fn mysqlColumnDef(c: Column): string {
+  if (c.colType == ColumnType.Id) {
+    return "${mysqlQuoteIdent(c.name)} bigint auto_increment primary key"
+  }
+  let parts = [mysqlQuoteIdent(c.name), mysqlType(c.colType)]
+  if (!c.isNullable) {
+    parts = append(parts, "not null")
+  }
+  if (c.isUnique) {
+    parts = append(parts, "unique")
+  }
+  return join(parts, " ")
+}
+
+// `ColumnType` -> MySQL type keyword. `Bool` renders `tinyint(1)` — MySQL
+// has no native boolean storage type; `tinyint(1)` is the documented
+// convention its own client libraries treat as boolean. `Decimal` renders
+// `decimal(38,9)`, NOT bare `decimal`/`numeric` the way `postgres.bit`
+// renders an unconstrained `numeric` — MySQL has no arbitrary-precision
+// decimal type at all, so a bound is unavoidable here; unlike Postgres,
+// this mapping CAN silently round a Bit `decimal` value carrying more than
+// 9 fractional digits or more than 29 integer digits (#3980's own ~28
+// significant digits). `decimal(38,9)` is this ticket's own required
+// spelling, and the loss of Postgres' truncation-proof guarantee is the
+// divergence to know about, not something this file can close from a type
+// mapping alone.
+fn mysqlType(colType: ColumnType): string {
+  match (colType) {
+    Id => return "bigint"
+    Int => return "bigint"
+    String(length) => return "varchar(${length})"
+    Text => return "text"
+    Bool => return "tinyint(1)"
+    Timestamp => return "timestamp"
+    Decimal => return "decimal(38,9)"
+  }
+}
+
+// `CONSTRAINT ... FOREIGN KEY ... REFERENCES ...` — MySQL/InnoDB accepts the
+// identical clause shape Postgres does, just backtick-quoted; panics the
+// same way `postgres.bit`'s `foreignKeyDef` does when `references(...)` was
+// never called (this file's header on why a missing target is a caller
+// bug, not a builder-time failure). `onDeleteClause` (`postgres.bit`) is
+// called directly, unmodified — see this file's header.
+fn mysqlForeignKeyDef(table: string, fk: ForeignKey): string {
+  if (fk.refTable == "" || fk.refColumn == "") {
+    panic("pkg/orm: foreign key on '${fk.column}' of '${table}' has no references(...) target")
+  }
+  let name = mysqlQuoteIdent("${table}_${fk.column}_fkey")
+  let clause = "constraint ${name} foreign key (${mysqlQuoteIdent(fk.column)}) references ${mysqlQuoteIdent(fk.refTable)} (${mysqlQuoteIdent(fk.refColumn)})"
+  let action = onDeleteClause(fk.onDeleteAction)
+  if (action != "") {
+    return clause + " " + action
+  }
+  return clause
+}
+
+// `CREATE INDEX <table>_<cols>_idx ON <table> (<cols>)` — same generated
+// name `indexName` (`postgres.bit`) already builds, called directly (this
+// file's header). Always `transactional: false` (this file's header); there
+// is no `CONCURRENTLY` equivalent to detect in a `raw()` passthrough on
+// MySQL, so unlike `postgres.bit`'s `rawStatement` this never scans the SQL
+// text at all.
+fn mysqlIndexStatement(t: Table, ix: Index): Statement {
+  let cols = []string(0)
+  for c of ix.columns {
+    cols = append(cols, mysqlIndexColumnRef(t, c))
+  }
+  let name = mysqlQuoteIdent(indexName(t.name, ix.columns))
+  let colList = join(cols, ", ")
+  let sql = "create index ${name} on ${mysqlQuoteIdent(t.name)} (${colList});"
+  return Statement{ sql: sql, transactional: false }
+}
+
+// A `text` column has no implicit key length, unlike every other type this
+// file renders — MySQL refuses to index one at all without an explicit
+// prefix length ("BLOB/TEXT column ... used in key specification without a
+// key length"), a limit Postgres never has (this ticket's own divergence
+// list). 255 is a fixed, conservative prefix that stays under InnoDB's
+// index key-length ceiling even at 4 bytes/char (`utf8mb4`); a per-column
+// prefix length would need `schema.bit`'s `Index` to carry one, which it
+// does not today, so every indexed `text` column gets the same 255-byte
+// prefix until that exists.
+fn mysqlIndexColumnRef(t: Table, name: string): string {
+  let (colType, found) = mysqlColumnType(t, name)
+  if (found && colType == ColumnType.Text) {
+    return "${mysqlQuoteIdent(name)}(255)"
+  }
+  return mysqlQuoteIdent(name)
+}
+
+// `name`'s `ColumnType` among `t.columns`, and whether it was found at all
+// — an index naming a column absent from `t.columns` is a structurally
+// incomplete node the same way a foreign key with no `references(...)` is
+// (`mysqlForeignKeyDef`'s own comment), so this reports "not found" rather
+// than guessing a type, and `mysqlIndexColumnRef` treats that the same as
+// any non-`Text` column: no prefix.
+fn mysqlColumnType(t: Table, name: string): (ColumnType, bool) {
+  for c of t.columns {
+    if (c.name == name) {
+      return (c.colType, true)
+    }
+  }
+  return (ColumnType.Int, false)
+}
+
+// A `raw()` passthrough, unquoted and unescaped by design (`postgres.bit`'s
+// header on why `raw()` is the one exception to this file's quoting
+// guarantee) — always `transactional: false` (this file's header).
+fn mysqlRawStatement(text: string): Statement {
+  return Statement{ sql: text, transactional: false }
+}
+
+// A SQL identifier, backtick-quoted with any embedded backtick doubled —
+// MySQL's own standard escape for a quoted identifier, the backtick
+// equivalent of `postgres.bit`'s `quoteIdent` double-quoting. This is the
+// only quoting this file performs; see `postgres.bit`'s header for why
+// every identifier goes through it and why `raw()` alone does not.
+fn mysqlQuoteIdent(name: string): string {
+  let escaped = replace(name, "`", "``")
+  return "`${escaped}`"
+}
