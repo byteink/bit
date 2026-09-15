@@ -1,0 +1,572 @@
+// _tests_/bit/jsxconformance.bit — the SPEC §12.12 JSX conformance gate
+// (#5339), built after three defects shipped behind fully green gates, all
+// the same shape:
+//
+//   #3944 — jsx_desugar_page.bit DEFINED its own elem/attr/frag, so the
+//   acceptance could not fail the way the product failed.
+//   #5155 — the verification program used `<div id="x">`, stepping around
+//   `class`, the most-used attribute in JSX.
+//   #5333 — jsx_grammar_conformance.bit covers six of SPEC 12.12's seven
+//   productions; the seventh, jsx_text, appears only as an attribute VALUE,
+//   so no case ever touched prose, and five (in fact six — see below)
+//   characters the grammar admits were rejected by the lexer.
+//
+// Every one of those fixtures was correct, rendered, and would ship. #5169's
+// own body wrote the rule that would have caught #3944/#5155 ("acceptance
+// RENDERS, it does not typecheck") and applied it to the six productions
+// someone happened to think of. A rule about HOW to test does not decide
+// WHAT to test — so this gate does not accept a hand-picked case list. It
+// reads SPEC.md's own §12.12 grammar block at run time, extracts every
+// production's name (the CENSUS), and fails, naming the production, when
+// none of the cases below claims it. That is the load-bearing part: it is
+// what turns "nobody wrote a case" from silence into red, the same way
+// `test-spec` (_tests_/bit/spec/) fails on a dangling nonterminal.
+//
+// A production whose right-hand side is a CHARACTER CLASS is not satisfied
+// by one representative: jsx_text (`{ JSX_CHAR }`, any source byte but `<`
+// or `{`) gets one case per ASCII punctuation byte the class admits minus
+// the two terminators, each asserted individually, plus two cases proving
+// `<` and `{` actually terminate a text run rather than joining it. A
+// partial fix — one that special-cases the handful of characters a report
+// happened to name, exactly the failure mode #5333's own investigation
+// documented — cannot pass this: enumerating the full class found `\`
+// (backslash) rejected with error[E0001] on this tree too, a SIXTH broken
+// character #5333's own acceptance never named (it tested 15 of the 30).
+//
+// SIX OF THE SEVEN PRODUCTIONS (jsx_elem, jsx_attr, jsx_child, jsx_name,
+// jsx_tag_name — jsx_fragment is not exercised there) are already proven,
+// correctly, by `_tests_/cases/jsx_grammar_conformance.bit` — a reserved
+// keyword attribute, a hyphenated attribute, a namespaced attribute and tag
+// name, a member-expression tag, a spread attribute and an empty expression
+// child, rendered through the real `pkg/web`. That fixture is NOT rewritten
+// here (constraint): this gate runs it unchanged, in place, and folds its
+// productions into the census: correct work does not get re-litigated, it
+// gets counted.
+//
+// EVERY CASE RENDERS THROUGH THE REAL `pkg/web`, never a local stand-in —
+// exactly what #3944's fixture got wrong. A case that is not the reused
+// fixture above builds its own scratch project: `bit.json`/`bit.lock`
+// declaring `web` as a local-path dependency on this tree's own `pkg/web`
+// (the same shape `_tests_/bit/pkgdocsgate.bit` already uses and verified
+// against a real `bit add <abs-path>` run there), so nothing borrows an
+// import a case did not declare.
+//
+// ON A TREE WHERE #5333 IS NOT YET FIXED (this gate's own base), the
+// jsx_text character cases for the currently-rejected bytes are EXPECTED TO
+// FAIL, naming the exact compiler diagnostic — that red is the proof this
+// gate tests BEHAVIOUR, not "did it parse": a gate that could not fail
+// before the fix landed would prove nothing once it did.
+//
+// Registered beside the other scoped gates (tools/build/gatestable2.bit),
+// never in `./make test`'s mandatory suite — same reason `test-spec` and
+// `test-package-docs` are excluded (tools/build/defs.bit's own Step{}
+// comments).
+//
+// Configure by environment, since `bit run` forwards no argv:
+//   BIT_REPO             repo root                          (required)
+//   BIT_BIN               compiler under test (default bit-out/bin/bit)
+//   BIT_STDLIB             stdlib root         (default ${BIT_REPO}/stdlib)
+//   BIT_TEST_TIMEOUT_S     per-job deadline, seconds (default 60, max 3600)
+
+import { exists, isDir, mkdir, readFile, remove, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { join } from "std/path"
+import { hasPrefix, indexOf, parseInt, trimSpace } from "std/strings"
+import { now } from "std/time"
+import { repoRoot } from "./docsrunner"
+
+const defaultTimeoutS: int = 60
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+// The exact heading `spec/SPEC.md` gives §12.12, and the grammar block's
+// fence — a bare fence, per #5197's own fix (see spec.bit's CHECK 4).
+const specMarker: string = "### 12.12 JSX Elements and Fragments"
+const fence: string = "```"
+const maxSpecBytes: int = 2097152
+const maxBlockLines: int = 64
+const maxProductions: int = 32
+
+// The compiler under test, `pkg/web`'s absolute path (every dynamic case's
+// scratch `bit.json` local-path dependency), the existing fixture's own
+// directory (the reused case runs there, unmodified), and the per-job
+// deadline.
+class Cfg { bin: string, pkgWebPath: string, casesDir: string, deadlineMs: int }
+
+// One case. `useCasesDir` selects the run mechanism: true runs the existing,
+// unmodified `_tests_/cases/<name>` fixture in place (`name` is its bare
+// filename, `wantOut` is its own `.expected` content read once at table
+// build time); false builds a fresh scratch project from `src` and compares
+// stdout to `wantOut` with exactly one trailing newline allowed.
+class JsxCase {
+  name: string,
+  productions: []string,
+  useCasesDir: bool,
+  src: string,
+  wantOut: string,
+}
+
+class RunOut { code: int, out: string, err: string }
+
+class Stats { cases: int, checks: int, failures: int }
+
+fn fatal(msg: string) {
+  eprint("jsxconformance: SETUP FAILED: ${msg}\n")
+  exit(1)
+}
+
+fn failCase(st: Stats, c: JsxCase, why: string) {
+  st.failures = st.failures + 1
+  eprint("jsxconformance: FAIL ${c.name} [${joinProds(c.productions)}]: ${why}\n")
+}
+
+fn joinProds(ps: []string): string {
+  let out = ""
+  let i = 0
+  while (i < len(ps)) {
+    if (i > 0) {
+      out = out + ","
+    }
+    out = out + ps[i]
+    i = i + 1
+  }
+  return out
+}
+
+fn timeoutMs(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) {
+    return defaultTimeoutS * 1000
+  }
+  let n = parseInt(raw) catch _ {
+    eprint("jsxconformance: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS * 1000
+  }
+  if (n < 1) {
+    return 1000
+  }
+  if (n > maxTimeoutS) {
+    return maxTimeoutS * 1000
+  }
+  return n * 1000
+}
+
+// --- SPEC.md census ---------------------------------------------------
+
+// Every production name §12.12's own grammar block defines: the bare
+// identifier starting each non-indented line up to its first whitespace,
+// before the `=`. A continuation line (`jsx_attr`'s second alternative, for
+// instance) is indented and contributes nothing here — it is still part of
+// the SAME production's RHS, which this gate does not need to parse, only
+// to know the production exists.
+fn productionNamesInBlock(block: string): []string {
+  let out = []string(0)
+  let lines = splitLines(block)
+  let i = 0
+  while (i < len(lines) && len(out) < maxProductions) {
+    let line = lines[i]
+    i = i + 1
+    if (len(line) == 0 || line[0] == ' ' || line[0] == '\t') {
+      continue
+    }
+    let eq = indexOf(line, "=")
+    if (eq <= 0) {
+      continue
+    }
+    out = append(out, trimSpace(line[0:eq]))
+  }
+  return out
+}
+
+fn splitLines(s: string): []string {
+  let out = []string(0)
+  let start = 0
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '\n') {
+      out = append(out, s[start:i])
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out = append(out, s[start:len(s)])
+  return out
+}
+
+// The §12.12 grammar block's own text: from `specMarker`, to the next bare
+// ``` fence, to the ``` closing it.
+fn extractGrammarBlock(spec: string): string {
+  let at = indexOf(spec, specMarker)
+  if (at < 0) {
+    fatal("spec/SPEC.md: marker not found: ${specMarker}")
+  }
+  let rest = spec[at:len(spec)]
+  let open = indexOf(rest, fence)
+  if (open < 0) {
+    fatal("spec/SPEC.md: no fenced block after ${specMarker}")
+  }
+  let afterOpen = rest[open + len(fence):len(rest)]
+  let nl = indexOf(afterOpen, "\n")
+  if (nl < 0) {
+    fatal("spec/SPEC.md: fenced block after ${specMarker} has no content")
+  }
+  let body = afterOpen[nl + 1:len(afterOpen)]
+  let closeAt = indexOf(body, fence)
+  if (closeAt < 0) {
+    fatal("spec/SPEC.md: fenced block after ${specMarker} never closes")
+  }
+  return body[0:closeAt]
+}
+
+fn censusProductions(root: string): []string {
+  let path = join(root, "spec/SPEC.md")
+  let spec = readFile(path) catch e {
+    fatal("cannot read ${path}: ${e.message()}")
+    ""
+  }
+  if (len(spec) > maxSpecBytes) {
+    fatal("${path} exceeds ${maxSpecBytes} bytes")
+  }
+  let block = extractGrammarBlock(spec)
+  if (len(splitLines(block)) > maxBlockLines) {
+    fatal("§12.12's grammar block exceeds ${maxBlockLines} lines")
+  }
+  let names = productionNamesInBlock(block)
+  if (len(names) == 0) {
+    fatal("§12.12's grammar block yielded zero production names — the marker or fence moved")
+  }
+  return names
+}
+
+// FAILS, naming it, for every census production no case in `cases` claims —
+// this is the whole point of the gate: a production with no case is red,
+// never silent.
+fn checkCensus(names: []string, cases: []JsxCase): int {
+  let missing = 0
+  for name of names {
+    let covered = false
+    for c of cases {
+      for p of c.productions {
+        if (p == name) {
+          covered = true
+        }
+      }
+    }
+    if (!covered) {
+      missing = missing + 1
+      eprint("jsxconformance: FAIL census: SPEC 12.12 production '${name}' has zero cases\n")
+    }
+  }
+  return missing
+}
+
+// --- the case table -----------------------------------------------------
+
+// SPEC 12.12's jsx_text is `{ JSX_CHAR }` — any source byte but `<` and
+// `{` — so the RHS is a character class and a representative is not enough
+// (constraint). This is every ASCII punctuation byte EXCEPT the two
+// terminators, `<` and `{`, which get their own termination-behaviour cases
+// below instead of a "renders unchanged" one (they cannot render unchanged
+// — they end the text run by definition).
+fn jsxTextPunctuation(): []string {
+  return [
+    "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".",
+    "/", ":", ";", "=", ">", "?", "@", "[", "\\", "]", "^", "_", "`", "|",
+    "}", "~",
+  ]
+}
+
+// The five bytes rendered `render`/`text` (pkg/web/escape.bit's
+// `appendHtmlEscaped`) HTML-escapes; every other punctuation byte, and the
+// jsx_text case for it, passes through unchanged. `<` and `{` never reach
+// here — they terminate the text run before `text()` ever sees them.
+fn escapeForOutput(c: string): string {
+  if (c == "&") {
+    return "&amp;"
+  }
+  if (c == ">") {
+    return "&gt;"
+  }
+  if (c == "\"") {
+    return "&quot;"
+  }
+  if (c == "'") {
+    return "&#39;"
+  }
+  return c
+}
+
+const webImport: string = "import { render, elem, attr, frag, text } from \"web\"\n"
+
+fn textCharCase(c: string): JsxCase {
+  let src = webImport + "fn main() {\n  println(render(<p>a" + c + "b</p>))\n}\n"
+  let want = "<p>a" + escapeForOutput(c) + "b</p>"
+  return JsxCase{
+    name: "jsx_text char '${c}'", productions: ["jsx_text"],
+    useCasesDir: false, src: src, wantOut: want,
+  }
+}
+
+// Proves `<` and `{` actually TERMINATE a jsx_text run rather than joining
+// it — the two terminators the character-class enumeration above does not
+// (and cannot) cover as ordinary text bytes. If the text scanner ever
+// swallowed either past its terminator, the surrounding element would not
+// parse into the tree these two programs assert.
+fn textTerminatorCases(): []JsxCase {
+  let ltSrc = webImport + "fn main() {\n  println(render(<div>a<span>b</span></div>))\n}\n"
+  let braceSrc = webImport + "fn main() {\n  println(render(<p>a{text(\"x\")}b</p>))\n}\n"
+  return [
+    JsxCase{
+      name: "jsx_text terminator '<'", productions: ["jsx_text"], useCasesDir: false,
+      src: ltSrc, wantOut: "<div>a<span>b</span></div>",
+    },
+    JsxCase{
+      name: "jsx_text terminator '{'", productions: ["jsx_text"], useCasesDir: false,
+      src: braceSrc, wantOut: "<p>axb</p>",
+    },
+  ]
+}
+
+fn fragmentCase(): JsxCase {
+  let src = webImport + "fn main() {\n  println(render(<>a<b>b</b></>))\n}\n"
+  return JsxCase{
+    name: "jsx_fragment nested element", productions: ["jsx_fragment"],
+    useCasesDir: false, src: src, wantOut: "a<b>b</b>",
+  }
+}
+
+// The one case this gate does not compose: `_tests_/cases/
+// jsx_grammar_conformance.bit`, unmodified, run in place against its own
+// `.expected` (constraint: that fixture is not rewritten). Its own header
+// names what it proves: a reserved-word attribute, a hyphenated attribute,
+// a namespaced attribute and tag name, a member-expression tag, a spread
+// attribute and an empty expression child — jsx_elem, jsx_attr, jsx_child,
+// jsx_name and jsx_tag_name, five of the six it was credited with (it has
+// no fragment).
+fn reusedGrammarConformanceCase(casesDir: string): JsxCase {
+  let name = "jsx_grammar_conformance.bit"
+  let expectedPath = join(casesDir, "jsx_grammar_conformance.expected")
+  let want = readFile(expectedPath) catch e {
+    fatal("cannot read ${expectedPath}: ${e.message()}")
+    ""
+  }
+  return JsxCase{
+    name: name, productions: ["jsx_elem", "jsx_attr", "jsx_child", "jsx_name", "jsx_tag_name"],
+    useCasesDir: true, src: "", wantOut: stripOneTrailingNewline(want),
+  }
+}
+
+fn buildCases(casesDir: string): []JsxCase {
+  let out = []JsxCase(0)
+  out = append(out, reusedGrammarConformanceCase(casesDir))
+  out = append(out, fragmentCase())
+  for c of jsxTextPunctuation() {
+    out = append(out, textCharCase(c))
+  }
+  for c of textTerminatorCases() {
+    out = append(out, c)
+  }
+  return out
+}
+
+// --- running one case ----------------------------------------------------
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word — same shape
+// `_tests_/bit/checkerdiag/checkerdiagrun.bit`'s `shQuote` uses, reproduced
+// here rather than imported (an independent, self-contained gate module,
+// same convention `_tests_/bit/pkgdocsgate.bit` already follows for its own
+// wrapper machinery).
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// A fresh scratch project for one dynamic case: `bit.json`/`bit.lock`
+// declaring `web` as a local-path dependency on this tree's own `pkg/web`
+// (verified shape — pkgdocsgate.bit's own header), plus the case's
+// generated `main.bit`.
+fn writeScratchProject(dir: string, pkgWebPath: string, src: string) {
+  mkdir(dir) catch e {
+    fatal("cannot create ${dir}: ${e.message()}")
+  }
+  let bitJson = "{\"name\": \"jsxconformance-check\", \"dependencies\": {\"web\": \"${pkgWebPath}\"}}\n"
+  let bitLock = "{\"web\": {\"path\": \"${pkgWebPath}\", \"requires\": {}}}\n"
+  writeFile(join(dir, "bit.json"), bitJson) catch e {
+    fatal("cannot write ${dir}/bit.json: ${e.message()}")
+  }
+  writeFile(join(dir, "bit.lock"), bitLock) catch e {
+    fatal("cannot write ${dir}/bit.lock: ${e.message()}")
+  }
+  writeFile(join(dir, "main.bit"), src) catch e {
+    fatal("cannot write ${dir}/main.bit: ${e.message()}")
+  }
+}
+
+fn removeQuiet(path: string) {
+  remove(path) catch e {
+    return
+  }
+}
+
+// `remove` only takes a file or an EMPTY directory (stdlib/fs's own
+// contract), so a scratch project's three files come off before the
+// directory that held them.
+fn dropScratchProject(dir: string) {
+  for f of ["bit.json", "bit.lock", "main.bit"] {
+    removeQuiet(join(dir, f))
+  }
+  removeQuiet(dir)
+}
+
+// Builds and runs one `/bin/sh` wrapper (checkerdiagrun.bit's own
+// `runWrapped` shape): `cmd` is already a full shell command line; stdout
+// and stderr land in separate files this process reads back, so a case can
+// assert exact rendered HTML on one and an exact diagnostic substring on
+// the other without either clobbering the other.
+fn runWrapped(scratch: string, idx: int, cmd: string, deadlineMs: int): RunOut {
+  let base = "${scratch}/job-${now().ns}-${idx}"
+  let outPath = "${base}.out"
+  let errPath = "${base}.err"
+  let scriptPath = "${base}.sh"
+  removeQuiet(outPath)
+  removeQuiet(errPath)
+
+  // Redirects for the REST of the script, so `cmd` itself may be a `cd X &&
+  // exec Y` chain (the useCasesDir branch) without a second, colliding
+  // `exec` wrapped around the whole chain — `exec Y` inside the chain is
+  // `cmd`'s own, the only one.
+  let script = "#!/bin/sh\nexec 1>${shQuote(outPath)} 2>${shQuote(errPath)}\n${cmd}\n"
+  writeFile(scriptPath, script) catch e {
+    fatal("cannot write ${scriptPath}: ${e.message()}")
+  }
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fatal("cannot chmod ${scriptPath}")
+  }
+
+  let code = osRunBounded(scriptPath, deadlineMs)
+  removeQuiet(scriptPath)
+
+  if (!exists(outPath) || !exists(errPath)) {
+    return RunOut{code: code, out: "", err: "(wrapper never produced redirect files)"}
+  }
+  let so = readFile(outPath) catch e { "" }
+  let se = readFile(errPath) catch e { "" }
+  removeQuiet(outPath)
+  removeQuiet(errPath)
+  return RunOut{code: code, out: so, err: se}
+}
+
+fn describeSentinel(code: int): string {
+  if (code == rcTimedOut) {
+    return "TIMED OUT"
+  }
+  if (code == rcSpawnFailed) {
+    return "could not spawn wrapper"
+  }
+  if (code <= rcSignalBase) {
+    return "CRASHED — signal ${0 - code + rcSignalBase}"
+  }
+  return "exited ${code}"
+}
+
+// Strips exactly one trailing newline — `println`'s own terminator — so a
+// case's `wantOut` never has to spell it out.
+fn stripOneTrailingNewline(s: string): string {
+  if (len(s) > 0 && s[len(s) - 1] == '\n') {
+    return s[0:len(s) - 1]
+  }
+  return s
+}
+
+fn runCase(cfg: Cfg, scratch: string, c: JsxCase, idx: int, st: Stats): int {
+  st.cases = st.cases + 1
+  let dir = "${scratch}/proj-${now().ns}-${idx}"
+  let cmd = ""
+  if (c.useCasesDir) {
+    cmd = "cd ${shQuote(cfg.casesDir)} && exec ${shQuote(cfg.bin)} run ${shQuote(c.name)}"
+  } else {
+    writeScratchProject(dir, cfg.pkgWebPath, c.src)
+    cmd = "exec ${shQuote(cfg.bin)} run ${shQuote(dir)}"
+  }
+
+  let r = runWrapped(scratch, idx, cmd, cfg.deadlineMs)
+  if (!c.useCasesDir) {
+    dropScratchProject(dir)
+  }
+  st.checks = st.checks + 1
+  if (r.code != 0) {
+    failCase(st, c, "expected exit 0 with '${c.wantOut}', got ${describeSentinel(r.code)}: ${trimSpace(r.err)}")
+    return r.code
+  }
+  let got = stripOneTrailingNewline(r.out)
+  if (got != c.wantOut) {
+    failCase(st, c, "stdout mismatch: expected '${c.wantOut}', got '${got}'")
+  }
+  return r.code
+}
+
+// --- entry point -----------------------------------------------------
+
+fn requiredBin(root: string): string {
+  let bin = envOr("BIT_BIN", "${root}/bit-out/bin/bit")
+  if (!exists(bin)) {
+    fatal("compiler not found: ${bin} (set BIT_BIN)")
+  }
+  return bin
+}
+
+fn main() {
+  let root = repoRoot()
+  let bin = requiredBin(root)
+  let casesDir = join(root, "_tests_/cases")
+  if (!isDir(casesDir)) {
+    fatal("not a directory: ${casesDir}")
+  }
+  let pkgWebPath = join(root, "pkg/web")
+  if (!isDir(pkgWebPath)) {
+    fatal("not a directory: ${pkgWebPath}")
+  }
+
+  let names = censusProductions(root)
+  let cases = buildCases(casesDir)
+  let missing = checkCensus(names, cases)
+
+  let scratch = "/tmp/bit-jsxconformance-${now().ns}"
+  mkdir(scratch) catch e {
+    fatal("cannot create ${scratch}: ${e.message()}")
+  }
+
+  let cfg = Cfg{bin: bin, pkgWebPath: pkgWebPath, casesDir: casesDir, deadlineMs: timeoutMs()}
+  let st = Stats{cases: 0, checks: 0, failures: 0}
+  let i = 0
+  for c of cases {
+    runCase(cfg, scratch, c, i, st)
+    i = i + 1
+  }
+  remove(scratch) catch e {
+    eprint("jsxconformance: warning: cannot remove ${scratch}: ${e.message()}\n")
+  }
+
+  if (st.checks == 0) {
+    fatal("0 checks ran across ${st.cases} case(s) — the runner broke, not a legitimately empty corpus")
+  }
+
+  if (missing != 0 || st.failures != 0) {
+    eprint("jsxconformance: FAILED — ${missing} SPEC 12.12 production(s) with zero cases, ${st.failures} case failure(s) of ${st.checks} check(s) over ${st.cases} case(s) over ${len(names)} production(s)\n")
+    exit(1)
+  }
+  print("jsxconformance: ok — ${len(names)} SPEC 12.12 production(s), ${st.cases} case(s), ${st.checks} check(s)\n")
+}
