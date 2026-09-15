@@ -176,9 +176,9 @@ the length: `t.addString("phone", 20)`.
 
 **A foreign key with no `.references(...)` is silent, not rejected.**
 `t.foreign("team_id")` alone produces a `ForeignKey` node whose `refTable`
-and `refColumn` are both `""`. This package checks structure, never SQL
-semantics - the dialect that eventually renders the tree is where a
-missing target would surface, not here.
+is `""` and whose `refColumns` is empty. This package checks structure,
+never SQL semantics - the dialect that eventually renders the tree is where
+a missing target would surface, not here.
 
 ## What this package does not do yet
 

@@ -104,12 +104,18 @@ export class Mysql {
 // `raw()` passthrough, in declaration order — same statement split as
 // `postgres.bit`'s `renderCreateTable`, see `dialect.bit`'s header for why.
 fn mysqlRenderCreateTable(t: Table): []Statement {
+  validateCompositeKey(t) catch e {
+    panic(e.message())
+  }
   let defs = []string(0)
   for c of t.columns {
-    defs = append(defs, mysqlColumnDef(c))
+    defs = append(defs, mysqlColumnDef(c, mysqlInPrimaryKey(t, c.name)))
   }
   for fk of t.foreignKeys {
     defs = append(defs, mysqlForeignKeyDef(t.name, fk))
+  }
+  if (len(t.primaryKeyColumns) > 0) {
+    defs = append(defs, mysqlPrimaryKeyDef(t.primaryKeyColumns))
   }
   let body = join(defs, ",\n  ")
   let sql = "create table ${mysqlQuoteIdent(t.name)} (\n  ${body}\n);"
@@ -139,7 +145,7 @@ fn mysqlRenderAlterTable(t: AlterTable): []Statement {
 fn mysqlAlterOpStatement(table: string, op: AlterOp): Statement {
   match (op) {
     AddColumn(c) => return Statement{
-      sql: "alter table ${mysqlQuoteIdent(table)} add column ${mysqlColumnDef(c)};",
+      sql: "alter table ${mysqlQuoteIdent(table)} add column ${mysqlColumnDef(c, false)};",
       transactional: false,
     }
     DropColumn(name) => return Statement{
@@ -163,9 +169,23 @@ fn mysqlDropTableStatement(name: string): Statement {
 // constraint: "`generated always as identity` is `auto_increment`") — and
 // returns early for the same reason `postgres.bit`'s `columnDef` does: an
 // auto-increment primary key needs no `not null`/`unique` suffix regardless
-// of what the `Column` node's own flags happen to hold.
-fn mysqlColumnDef(c: Column): string {
+// of what the `Column` node's own flags happen to hold. `inCompositeKey` is
+// `postgres.bit`'s own flag (#5084): when true, this column's own `primary
+// key` moves to the table-level clause `mysqlRenderCreateTable` appends
+// instead, so the two never both declare one.
+//
+// AN AUTO_INCREMENT COLUMN'S POSITION WITHIN A COMPOSITE KEY IS NOT
+// VALIDATED HERE. MySQL/InnoDB requires an `AUTO_INCREMENT` column to be
+// the leading column of SOME index on the table; whether `columns`'s given
+// order satisfies that for the specific key this file rendered is a
+// question about column ORDER this function has no way to answer from one
+// column at a time — flagged here rather than guessed at, the same way this
+// file's own header already flags MySQL's per-connection `time_zone` gap.
+fn mysqlColumnDef(c: Column, inCompositeKey: bool): string {
   if (c.colType == ColumnType.Id) {
+    if (inCompositeKey) {
+      return "${mysqlQuoteIdent(c.name)} bigint auto_increment"
+    }
     return "${mysqlQuoteIdent(c.name)} bigint auto_increment primary key"
   }
   let parts = [mysqlQuoteIdent(c.name), mysqlType(c.colType)]
@@ -176,6 +196,27 @@ fn mysqlColumnDef(c: Column): string {
     parts = append(parts, "unique")
   }
   return join(parts, " ")
+}
+
+// `postgres.bit`'s own `inPrimaryKey`, MySQL-spelled: whether `name` is one
+// of `t.primaryKeyColumns`.
+fn mysqlInPrimaryKey(t: Table, name: string): bool {
+  for c of t.primaryKeyColumns {
+    if (c == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// `primary key (col1, col2, ...)`, backtick-quoted — `postgres.bit`'s own
+// `primaryKeyDef`, MySQL-spelled.
+fn mysqlPrimaryKeyDef(columns: []string): string {
+  let quoted = []string(0)
+  for c of columns {
+    quoted = append(quoted, mysqlQuoteIdent(c))
+  }
+  return "primary key (${join(quoted, ", ")})"
 }
 
 // `ColumnType` -> MySQL type keyword. `Bool` renders `tinyint(1)` — MySQL
@@ -202,18 +243,34 @@ fn mysqlType(colType: ColumnType): string {
   }
 }
 
-// `CONSTRAINT ... FOREIGN KEY ... REFERENCES ...` — MySQL/InnoDB accepts the
-// identical clause shape Postgres does, just backtick-quoted; panics the
-// same way `postgres.bit`'s `foreignKeyDef` does when `references(...)` was
-// never called (this file's header on why a missing target is a caller
-// bug, not a builder-time failure). `onDeleteClause` (`postgres.bit`) is
-// called directly, unmodified — see this file's header.
+// `CONSTRAINT ... FOREIGN KEY (...) REFERENCES ...(...)` — MySQL/InnoDB
+// accepts the identical clause shape Postgres does, just backtick-quoted;
+// panics the same way `postgres.bit`'s `foreignKeyDef` does when
+// `references(...)` was never called, or named a different number of
+// columns than `foreign(...)` did (#5084, this file's header on why a
+// mismatched target is a caller bug, not a builder-time failure).
+// `onDeleteClause` (`postgres.bit`) is called directly, unmodified — see
+// this file's header.
 fn mysqlForeignKeyDef(table: string, fk: ForeignKey): string {
-  if (fk.refTable == "" || fk.refColumn == "") {
-    panic("pkg/orm: foreign key on '${fk.column}' of '${table}' has no references(...) target")
+  if (fk.refTable == "" || len(fk.refColumns) == 0) {
+    panic("pkg/orm: foreign key on '${join(fk.columns, ", ")}' of '${table}' has no references(...) target")
   }
-  let name = mysqlQuoteIdent("${table}_${fk.column}_fkey")
-  let clause = "constraint ${name} foreign key (${mysqlQuoteIdent(fk.column)}) references ${mysqlQuoteIdent(fk.refTable)} (${mysqlQuoteIdent(fk.refColumn)})"
+  if (len(fk.columns) != len(fk.refColumns)) {
+    panic("pkg/orm: foreign key on '${join(fk.columns, ", ")}' of '${table}' names ${len(fk.columns)} column(s) but references(...) named ${len(fk.refColumns)}")
+  }
+  let name = mysqlQuoteIdent("${table}_${join(fk.columns, "_")}_fkey")
+  let cols = []string(0)
+  for c of fk.columns {
+    cols = append(cols, mysqlQuoteIdent(c))
+  }
+  let refCols = []string(0)
+  for c of fk.refColumns {
+    refCols = append(refCols, mysqlQuoteIdent(c))
+  }
+  let clause = "constraint ${name} foreign key (${join(cols, ", ")}) references ${mysqlQuoteIdent(fk.refTable)} (${join(
+    refCols,
+    ", ",
+  )})"
   let action = onDeleteClause(fk.onDeleteAction)
   if (action != "") {
     return clause + " " + action
@@ -248,26 +305,11 @@ fn mysqlIndexStatement(t: Table, ix: Index): Statement {
 // does not today, so every indexed `text` column gets the same 255-byte
 // prefix until that exists.
 fn mysqlIndexColumnRef(t: Table, name: string): string {
-  let (colType, found) = mysqlColumnType(t, name)
+  let (colType, found) = columnTypeOf(t, name)
   if (found && colType == ColumnType.Text) {
     return "${mysqlQuoteIdent(name)}(255)"
   }
   return mysqlQuoteIdent(name)
-}
-
-// `name`'s `ColumnType` among `t.columns`, and whether it was found at all
-// — an index naming a column absent from `t.columns` is a structurally
-// incomplete node the same way a foreign key with no `references(...)` is
-// (`mysqlForeignKeyDef`'s own comment), so this reports "not found" rather
-// than guessing a type, and `mysqlIndexColumnRef` treats that the same as
-// any non-`Text` column: no prefix.
-fn mysqlColumnType(t: Table, name: string): (ColumnType, bool) {
-  for c of t.columns {
-    if (c.name == name) {
-      return (c.colType, true)
-    }
-  }
-  return (ColumnType.Int, false)
 }
 
 // A `raw()` passthrough, unquoted and unescaped by design (`postgres.bit`'s
