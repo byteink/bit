@@ -1,0 +1,329 @@
+// pkg/orm/runner.test.bit — #5068's acceptance, against a FAKE driver
+// (`rnExecutor` below) that keeps its own in-memory `schema_history` and
+// records every statement it is asked to run, in order — the same shape
+// `generate.test.bit`'s `gnExecutor` uses for `information_schema`, applied
+// here to `schema_history` instead. `Postgres{}` (`postgres.bit`, already
+// covered by `postgres.test.bit`) renders every migration's DDL; nothing
+// here fakes a `Dialect`, since this file's own acceptance is about the
+// RUNNER's statement sequencing, not about DDL correctness.
+
+class rnExecutor {
+  history: []HistoryEntry
+  log: []string
+  // The exact statement text to fail on, once — "" means never fail. Lets a
+  // test force the failure path without a driver that understands SQL.
+  failOn: string
+
+  query(sqlText: string, params: []Value): Rows! {
+    this.log = append(this.log, sqlText)
+    this.failIfMatched(sqlText)?
+    if (hasPrefix(sqlText, "select version, name, checksum")) {
+      return rnRows{ entries: this.history, i: -1 }
+    }
+    fail newError("rnExecutor: query not supported: ${sqlText}")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.log = append(this.log, sqlText)
+    this.failIfMatched(sqlText)?
+    if (hasPrefix(sqlText, "insert into schema_history")) {
+      this.history = append(
+        this.history,
+        HistoryEntry{
+          version: asInt(params[0])?,
+          name: asText(params[1])?,
+          checksum: asText(params[2])?,
+          appliedAt: asInt(params[3])?,
+          durationMs: asInt(params[4])?,
+        },
+      )
+      return 1
+    }
+    if (hasPrefix(sqlText, "delete from schema_history")) {
+      this.history = withoutVersion(this.history, asInt(params[0])?)
+      return 1
+    }
+    return 0
+  }
+
+  failIfMatched(sqlText: string): ()! {
+    if (this.failOn != "" && sqlText == this.failOn) {
+      fail newError("rnExecutor: forced failure on: ${sqlText}")
+    }
+  }
+}
+
+class rnRows {
+  entries: []HistoryEntry
+  i: i64
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.entries)
+  }
+
+  columns(): []string {
+    return ["version", "name", "checksum", "applied_at", "duration_ms"]
+  }
+
+  value(col: int): Value {
+    let e = this.entries[this.i]
+    if (col == 0) {
+      return Value.Int(e.version)
+    }
+    if (col == 1) {
+      return Value.Text(e.name)
+    }
+    if (col == 2) {
+      return Value.Text(e.checksum)
+    }
+    if (col == 3) {
+      return Value.Int(e.appliedAt)
+    }
+    return Value.Int(e.durationMs)
+  }
+
+  close() {}
+}
+
+fn withoutVersion(history: []HistoryEntry, version: int): []HistoryEntry {
+  let out = []HistoryEntry(0)
+  for h of history {
+    if (h.version != version) {
+      out = append(out, h)
+    }
+  }
+  return out
+}
+
+// A migration that adds one nullable-free string column on `table` — one
+// transactional `Statement`, nothing else.
+fn migPlain(version: int, name: string, table: string, checksum: string): Migration {
+  return Migration{
+    version: version,
+    name: name,
+    checksum: checksum,
+    apply: () => [
+      alter(table, (t) => {
+        t.addString("note", 50)
+      }),
+    ],
+    revert: () => [
+      alter(table, (t) => {
+        t.dropColumn("note")
+      }),
+    ],
+  }
+}
+
+// A migration carrying both a transactional add and a non-transactional
+// `CREATE INDEX CONCURRENTLY` raw — see `postgres.bit`'s own
+// `rawStatement`, which is what flags the second op non-transactional.
+fn migMixed(version: int, name: string, table: string, checksum: string): Migration {
+  return Migration{
+    version: version,
+    name: name,
+    checksum: checksum,
+    apply: () => [
+      alter(table, (t) => {
+        t.addString("note", 50)
+      }),
+      alter(table, (t) => {
+        t.raw("CREATE INDEX CONCURRENTLY idx_${table}_note ON ${table} (note)")
+      }),
+    ],
+    revert: () => [
+      alter(table, (t) => {
+        t.dropColumn("note")
+      }),
+    ],
+  }
+}
+
+fn indexOf(log: []string, needle: string): int {
+  let i = 0
+  while (i < len(log)) {
+    if (log[i] == needle) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn countPrefixed(log: []string, prefix: string): int {
+  let n = 0
+  for s of log {
+    if (hasPrefix(s, prefix)) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+test "up applies pending migrations in ascending numeric order and records one schema_history row each" {
+  let db = rnExecutor{ history: []HistoryEntry(0), log: []string(0), failOn: "" }
+  let migrations = [
+    migPlain(3, "third", "widgets", "chk3"),
+    migPlain(1, "first", "widgets", "chk1"),
+    migPlain(2, "second", "widgets", "chk2"),
+  ]
+  let report = up(db, Postgres{}, migrations, Timestamp{ ns: 5000 }) catch e {
+    panic("up: ${e.message()}")
+  }
+  assert(len(report.applied) == 3, "expected 3 applied migrations, got ${len(report.applied)}")
+  assert(
+    report.applied[0].version == 1,
+    "expected version 1 first, got ${report.applied[0].version}",
+  )
+  assert(
+    report.applied[1].version == 2,
+    "expected version 2 second, got ${report.applied[1].version}",
+  )
+  assert(
+    report.applied[2].version == 3,
+    "expected version 3 third, got ${report.applied[2].version}",
+  )
+  for a of report.applied {
+    assert(a.appliedAt == 5000, "expected appliedAt 5000, got ${a.appliedAt}")
+    assert(a.durationMs >= 0, "expected a non-negative duration, got ${a.durationMs}")
+  }
+  assert(len(db.history) == 3, "expected 3 schema_history rows, got ${len(db.history)}")
+  assert(
+    db.history[0].version == 1 && db.history[0].checksum == "chk1",
+    "row 0 wrong: ${db.history[0].version}/${db.history[0].checksum}",
+  )
+  assert(
+    db.history[2].version == 3 && db.history[2].checksum == "chk3",
+    "row 2 wrong: ${db.history[2].version}/${db.history[2].checksum}",
+  )
+}
+
+test "an already-applied migration whose file changed errors naming the file and both checksums, and applies nothing" {
+  let db = rnExecutor{
+    history: [
+      HistoryEntry{ version: 1, name: "init", checksum: "OLD_SUM", appliedAt: 100, durationMs: 3 },
+    ],
+    log: []string(0),
+    failOn: "",
+  }
+  let migrations = [migPlain(1, "init", "widgets", "NEW_SUM")]
+  up(db, Postgres{}, migrations, Timestamp{ ns: 5000 }) catch e {
+    assert(contains(e.message(), "0001_init.bit"), "error does not name the file: ${e.message()}")
+    assert(
+      contains(e.message(), "OLD_SUM"),
+      "error does not carry the recorded checksum: ${e.message()}",
+    )
+    assert(
+      contains(e.message(), "NEW_SUM"),
+      "error does not carry the current checksum: ${e.message()}",
+    )
+    assert(indexOf(db.log, "BEGIN") == -1, "a BEGIN was issued; nothing should have been applied")
+    assert(len(db.history) == 1, "schema_history changed; nothing should have been applied")
+    return
+  }
+  panic("up: expected a checksum-mismatch error, got success")
+}
+
+test "the advisory lock is the first statement issued and is released at the end, including on the failure path" {
+  let failingSql = "alter table \"widgets\" add column \"note\" varchar(50) not null;"
+  let db = rnExecutor{ history: []HistoryEntry(0), log: []string(0), failOn: failingSql }
+  let migrations = [migPlain(1, "init", "widgets", "chk1")]
+  up(db, Postgres{}, migrations, Timestamp{ ns: 5000 }) catch _ {
+    assert(len(db.log) >= 2, "expected at least a lock and an unlock, got ${len(db.log)}")
+    assert(
+      db.log[0] == "select pg_advisory_lock($1)",
+      "lock was not the first statement: ${db.log[0]}",
+    )
+    assert(
+      db.log[len(db.log) - 1] == "select pg_advisory_unlock($1)",
+      "lock was not released as the last statement: ${db.log[len(db.log) - 1]}",
+    )
+    return
+  }
+  panic("up: expected the forced statement failure to propagate")
+}
+
+test "each migration's statements are bracketed by BEGIN and COMMIT while a non-transactional statement runs outside" {
+  let db = rnExecutor{ history: []HistoryEntry(0), log: []string(0), failOn: "" }
+  let migrations = [migMixed(1, "add_note_and_index", "widgets", "chk1")]
+  up(db, Postgres{}, migrations, Timestamp{ ns: 5000 }) catch e {
+    panic("up: ${e.message()}")
+  }
+  let beginAt = indexOf(db.log, "BEGIN")
+  let commitAt = indexOf(db.log, "COMMIT")
+  let insertAt = indexOf(
+    db.log,
+    "insert into schema_history (version, name, checksum, applied_at, duration_ms) values ($1, $2, $3, $4, $5)",
+  )
+  let concurrentAt = -1
+  let i = 0
+  while (i < len(db.log)) {
+    if (hasPrefix(db.log[i], "CREATE INDEX CONCURRENTLY")) {
+      concurrentAt = i
+    }
+    i = i + 1
+  }
+  let logDump = join(db.log, " | ")
+  assert(
+    beginAt >= 0 && commitAt >= 0 && insertAt >= 0 && concurrentAt >= 0,
+    "missing an expected statement: ${logDump}",
+  )
+  assert(
+    beginAt < insertAt && insertAt < commitAt,
+    "schema_history was not written inside the transaction",
+  )
+  assert(commitAt < concurrentAt, "the non-transactional statement ran before COMMIT")
+  assert(
+    countPrefixed(db.log, "CREATE INDEX CONCURRENTLY") == 1,
+    "expected exactly one CONCURRENTLY statement",
+  )
+}
+
+test "sql n prints the DDL and issues zero statements to the driver" {
+  // `sql` takes no `db` parameter at all — this is a compile-time guarantee,
+  // not a runtime check, that it cannot issue anything to any driver.
+  let migrations = [migPlain(7, "seventh", "widgets", "chk7")]
+  let text = sql(Postgres{}, migrations, 7) catch e {
+    panic("sql: ${e.message()}")
+  }
+  assert(contains(text, "add column"), "expected DDL text, got: ${text}")
+  assert(contains(text, "\"note\""), "expected the column name in the DDL: ${text}")
+}
+
+test "down refuses a migration whose recorded applied_at is older than the configured window" {
+  let db = rnExecutor{
+    history: [
+      HistoryEntry{ version: 1, name: "init", checksum: "chk1", appliedAt: 1000, durationMs: 2 },
+    ],
+    log: []string(0),
+    failOn: "",
+  }
+  let migrations = [migPlain(1, "init", "widgets", "chk1")]
+  let tenSeconds = 10000000000
+  let oneSecond = 1000000000
+  down(db, Postgres{}, migrations, Timestamp{ ns: 1000 + tenSeconds }, oneSecond) catch e {
+    assert(contains(e.message(), "older than"), "unexpected error: ${e.message()}")
+    assert(len(db.history) == 1, "down must not have reverted anything")
+    return
+  }
+  panic("down: expected the age-window refusal, got success")
+}
+
+test "down reverts the last migration when within the configured window" {
+  let db = rnExecutor{
+    history: [
+      HistoryEntry{ version: 1, name: "init", checksum: "chk1", appliedAt: 1000, durationMs: 2 },
+    ],
+    log: []string(0),
+    failOn: "",
+  }
+  let migrations = [migPlain(1, "init", "widgets", "chk1")]
+  let oneSecond = 1000000000
+  let tenSeconds = 10000000000
+  let reverted = down(db, Postgres{}, migrations, Timestamp{ ns: 1000 + oneSecond }, tenSeconds) catch e {
+    panic("down: ${e.message()}")
+  }
+  assert(reverted.version == 1, "expected version 1 reverted, got ${reverted.version}")
+  assert(len(db.history) == 0, "expected schema_history emptied, got ${len(db.history)} rows")
+}
