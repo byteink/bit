@@ -42,9 +42,10 @@ See [`docs/data.md`](docs/data.md) for `Data` and the call sites (`pool`
 alone, `pool.tx(...)`, `pool.txValue<T>(...)`). Table and column names are
 mapped from a `@table` class's field names - see
 [`docs/naming.md`](docs/naming.md). Declaring and altering tables is
-[`docs/schema.md`](docs/schema.md). Querying rows through the find chain is
-[`docs/query.md`](docs/query.md). Saving, deleting and upserting a row is
-[`docs/write.md`](docs/write.md).
+[`docs/schema.md`](docs/schema.md), rendered to real DDL by a
+`SchemaDialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first.
+Querying rows through the find chain is [`docs/query.md`](docs/query.md).
+Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
