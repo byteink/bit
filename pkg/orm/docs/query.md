@@ -171,18 +171,11 @@ it would reuse. Until then, `people(db)` above is the pattern: write the
 `table`/`fields`/`mapper` once per entity, and every other function in
 your program calls that one function instead of `find` directly.
 
-## What this package does not do yet
-
-There is no `whereRaw` or any other way to write a dynamic SQL fragment -
-on purpose, and tracked as its own, separate piece of work. The moment a
-column name can come from outside your own source, checking it against a
-class's fields the way this file does is not enough; that needs an
-explicit, auditable escape hatch, the way [Schema](schema.md)'s `raw()` is
-for DDL, not a quiet gap in the builder.
-
 ## Where to go next
 
 [Naming](naming.md) covers `tableDescriptor()` and how a field name becomes
 the column text `where`/`orderBy` bind against. [Data](data.md) covers the
 `Data` interface every function on this page takes, and why it is not
-`Pool` directly.
+`Pool` directly. [Raw SQL and dynamic columns](raw.md) covers `whereRaw`
+and `orderByField` - a SQL fragment this file's builder has no shape for,
+and a column name from outside your own source.

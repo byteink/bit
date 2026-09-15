@@ -1,0 +1,172 @@
+// pkg/orm/raw.bit — #5073: the one escape hatch through the find chain
+// (#5057) that accepts SQL text a caller writes, and the one place a
+// column name may come from outside the program. THE injection surface in
+// the ORM (owner decision 2026-09-12) — everything else in pkg/orm is safe
+// by construction.
+//
+//     db.find<User>().whereRaw("lower(email) = lower($1)", e).all()?
+//     db.find<User>().orderByField(sortColumn, Dir.Asc)?
+//
+// `whereRaw` and `orderByField` themselves are declared directly on
+// `Query<T>` in `pkg/orm/query.bit` (SPEC §14 — a class's method set is the
+// set of methods declared in its own body), the same split `keyset.bit`'s
+// own header documents for `after()`: this file supplies the pure logic
+// and the typed refusal, `query.bit` supplies the method and the state it
+// touches (`wheres`/`args`/`orderBys`).
+//
+// TWO RULES MAKE THIS SAFE.
+//
+//   1. VALUES STILL GO THROUGH PLACEHOLDERS. `whereRaw` takes a fragment
+//      plus its own bound arguments, never a pre-interpolated string.
+//      `fragment`'s `$n` placeholders are numbered LOCALLY to the call (so
+//      `whereRaw("lower(email) = lower($1)", e)` reads exactly as
+//      written) and `renumberPlaceholders` below shifts them to their true
+//      position once `query.bit`'s `whereRaw` knows how many arguments
+//      earlier `where`/`whereIn`/`whereRaw` calls in the same chain already
+//      bound — the offset is 0 for a fragment that is the chain's first
+//      bound clause, which is what makes the fragment come out
+//      byte-for-byte unchanged in that, the common, case. A fragment whose
+//      placeholder count disagrees with the arguments supplied is a
+//      DEVELOPER bug — the fragment is source code, not user input — so
+//      `checkRawArgCount` panics, the same category `Query.columnFor`
+//      (query.bit) already panics for a literal column that is not one of
+//      `T`'s fields.
+//
+//   2. A DYNAMIC COLUMN NAME IS AN ALLOWLIST CHECK, NEVER A SANITISER. SQL
+//      has no parameter form for an identifier, so `orderByField` resolves
+//      its `field` argument against `T`'s own descriptor (`tableDescriptor()`,
+//      #5051) via `allowedColumn` below and FAILS — a catchable
+//      `UnknownColumnError`, never a panic — when it is not one of `T`'s
+//      declared fields. That distinction from rule 1 is deliberate:
+//      `field` here is routinely END-USER input (a sortable table header),
+//      and a malicious value must turn into an error the caller's own
+//      handler can report as a 400, never crash the process the way a
+//      panic would.
+//
+// NO ESCAPING, NO QUOTING, ANYWHERE IN THIS FILE. The only identifier
+// safety mechanism here is the allowlist scan in `allowedColumn` — never a
+// function that quotes or escapes a caller-supplied identifier, and never
+// will be: every sanitiser of that shape has been bypassed by someone,
+// somewhere. `raw.test.bit` proves this with a source-level scan of this
+// file, not just the two tests above it.
+//
+// CONTRAST WITH `pkg/orm/schema.bit`'s `table()`/`alter()` (#5066), WHICH
+// DO QUOTE EVERY IDENTIFIER UNCONDITIONALLY — a different threat model, not
+// something to "unify" with this file. Those take raw strings a developer
+// writes once, in a migration, that never pass through this package's own
+// naming (`naming.bit`) at all; quoting there guards against a Bit
+// keyword or a mixed-case name colliding with an engine's own reserved
+// word, authored by the same person who wrote the migration. Here the
+// identifier can arrive with an HTTP request; the answer is refusing
+// anything not already declared on the entity, not making the request
+// text safer to embed.
+//
+// `raw` STAYS IN THE NAME OF EVERY METHOD THAT ACCEPTS UNPARSED SQL TEXT —
+// `whereRaw`, here — so a security review can grep for it, the same
+// reasoning `pkg/web`'s `raw(s)` documents for unescaped HTML.
+// `orderByField` carries no such marker on purpose: it is the SAFE
+// alternative to writing SQL, not a second unsafe escape hatch, and naming
+// it as though it were raw would bury the one name worth grepping for.
+
+// `newBuilder` (std/strings) and `FieldDesc` (std/sql) are imported by
+// ./naming.bit, this file's sibling in the same module (SPEC §17.1) — a
+// second import here would be E0042. `isDigitByte`, `columnName` are
+// declared there too and reused below unqualified, same reason.
+
+// Why `whereRaw`'s fragment and its bound arguments disagreed — always a
+// mistake in code someone wrote, never something end-user input can
+// trigger, so this panics rather than returning a value a `catch` could
+// swallow. `want` is the highest `$n` the fragment itself references;
+// `got` is `len(args)` at the call site.
+fn checkRawArgCount(fragment: string, got: int) {
+  let want = maxPlaceholder(fragment)
+  if (want != got) {
+    panic("pkg/orm: whereRaw fragment '${fragment}' references ${want} placeholder(s) but got ${got} argument(s)")
+  }
+}
+
+// The highest `$n` referenced in `fragment`, or 0 when it references none.
+// Byte-scanned the same way `naming.bit`'s own `toSnake` is — the only
+// alphabet a placeholder digit needs is ASCII `0`-`9`.
+fn maxPlaceholder(fragment: string): int {
+  let n = len(fragment)
+  let i = 0
+  let want = 0
+  while (i < n) {
+    if (fragment[i] == '$' && i + 1 < n && isDigitByte(fragment[i + 1])) {
+      let (num, next) = readDigits(fragment, i + 1, n)
+      if (num > want) {
+        want = num
+      }
+      i = next
+    } else {
+      i = i + 1
+    }
+  }
+  return want
+}
+
+// `fragment` with every `$n` shifted to `$(n + offset)` — see this file's
+// header for why `offset` is `len(this.args)` at the moment `whereRaw` is
+// called, and why that makes a fragment that is the chain's first bound
+// clause come back unchanged.
+fn renumberPlaceholders(fragment: string, offset: int): string {
+  if (offset == 0) {
+    return fragment
+  }
+  let b = newBuilder()
+  let n = len(fragment)
+  let i = 0
+  while (i < n) {
+    if (fragment[i] == '$' && i + 1 < n && isDigitByte(fragment[i + 1])) {
+      let (num, next) = readDigits(fragment, i + 1, n)
+      b.write("$${num + offset}")
+      i = next
+    } else {
+      b.writeByte(fragment[i])
+      i = i + 1
+    }
+  }
+  return b.toString()
+}
+
+// The decimal digits starting at `fragment[at]`, and the index just past
+// them — `at` is always the byte right after a `$` this file's own callers
+// already confirmed is followed by a digit, so this never sees an empty
+// run.
+fn readDigits(fragment: string, at: int, n: int): (int, int) {
+  let j = at
+  let num = 0
+  while (j < n && isDigitByte(fragment[j])) {
+    num = num * 10 + int(fragment[j] - '0')
+    j = j + 1
+  }
+  return (num, j)
+}
+
+// Why `orderByField` rejected a column name — catchable, since `field` is
+// routinely end-user input (this file's header) and a caller's handler
+// must be able to turn it into a 400, never crash.
+export class UnknownColumnError {
+  export table: string
+  export field: string
+
+  message(): string {
+    return "pkg/orm: '${this.field}' is not a field of the class mapped to '${this.table}'"
+  }
+}
+
+// The allowlist check behind `Query<T>.orderByField` (query.bit): `field`
+// resolved against `fields` (`T`'s own descriptor, #5051) and mapped to
+// its SQL column, or `UnknownColumnError` naming both — never a fallback
+// that lets an unresolved `field` reach SQL text. See this file's header
+// for why this is the one identifier path with no escaping or quoting
+// anywhere in it.
+fn allowedColumn(fields: []FieldDesc, table: string, field: string): string! {
+  for f of fields {
+    if (f.name == field) {
+      return columnName(f)
+    }
+  }
+  fail UnknownColumnError{ table: table, field: field }
+}
