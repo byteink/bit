@@ -1,0 +1,94 @@
+// _tests_/stress/parallel/chanracemake.bit — N tasks concurrently construct
+// their OWN chan<int>(1) and round-trip a distinct value through it; every
+// value must come back exactly what was sent (#5228).
+//
+// THE REGRESSION THIS CATCHES, DETERMINISTICALLY AND WITHOUT THE COLLECTOR.
+// `rtChanMake` (runtime/chan/chanwrap.bit) used to carve each channel's
+// 13-word handle and ring out of the process-wide reserve with `reserveGrow`
+// called under NO lock. `reserveTake`'s bump cursor (runtime/gc/mem.bit's
+// `resBump`) is a plain, non-atomic load-modify-store — the other two
+// `reserveTake` call sites (`gcHeapAlloc` via `heapLock`, `idxInsertSpan` via
+// `lockPtr`) already hold a lock across it, this one did not. Two OS threads
+// racing `chan<T>(n)` at the same instant could therefore be handed the SAME
+// handle address; the second `chanInit` on that shared address overwrites
+// the first channel's `chSend`/`chRecv`/ring fields mid-flight, so one task's
+// round trip returns the OTHER task's value (or a torn mix of both) instead
+// of its own. That is what `worker` below asserts against directly — no
+// buffered channel is ever shared between tasks, so a mismatch can only come
+// from two `chan_make` calls colliding on one reserve slot.
+//
+// #5228's own hang additionally needed a GC cycle on top of this (the
+// aliased handle's `next` pointer becomes a self-loop that
+// `chanScanRegistryRoots` walks forever) — this program never triggers a
+// collection and does not need to; the aliasing itself is the bug, and a
+// value mismatch here is proof of it independent of anything the collector
+// does.
+//
+// ROUNDS x taskCount, not one giant batch: `reserveTake`'s racy window is a
+// handful of instructions, so a single pass of `taskCount` concurrent
+// `chan_make`s is not guaranteed to land two of them on the exact same
+// cycle. Repeating gives many independent chances at the same collision
+// within one run, which is what makes this reproduce reliably instead of
+// occasionally — measured to go red within the first few rounds against the
+// pre-fix runtime at BIT_WORKERS=8 (see #5228's ticket comments for numbers).
+
+const taskCount: int = 64
+const rounds: int = 100
+
+class Round {
+  id: int,
+  got: int,
+}
+
+// Each task owns its `chan<int>(1)` outright: nothing else ever touches it,
+// so `got != id` can only mean this handle was not really this task's own.
+fn worker(id: int, results: chan<Round>) {
+  let c = chan<int>(1)
+  c <- id
+  let got = <- c
+  results <- Round{ id: id, got: got }
+}
+
+// One batch of `taskCount` concurrent `chan_make`s. Returns the number of
+// tasks whose value did NOT round-trip.
+fn oneRound(): int {
+  let results = chan<Round>(taskCount)
+  let i = 0
+  while (i < taskCount) {
+    spawn worker(i, results)
+    i = i + 1
+  }
+  let mismatches = 0
+  let k = 0
+  while (k < taskCount) {
+    let r = <- results
+    if (r.got != r.id) {
+      mismatches = mismatches + 1
+    }
+    k = k + 1
+  }
+  return mismatches
+}
+
+fn main(): int {
+  let badRounds = 0
+  let totalMismatches = 0
+  let round = 0
+  while (round < rounds) {
+    let m = oneRound()
+    if (m > 0) {
+      badRounds = badRounds + 1
+      totalMismatches = totalMismatches + m
+    }
+    round = round + 1
+  }
+  if (badRounds > 0) {
+    print(
+        "chanracemake FAIL rounds_with_mismatch=${badRounds}/${rounds} " +
+        "total_mismatches=${totalMismatches}\n",
+    )
+    return 1
+  }
+  print("chanracemake OK\n")
+  return 0
+}
