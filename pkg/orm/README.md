@@ -36,7 +36,12 @@ the live schema and writes a reviewed migration file - never applying
 anything and never inferring a rename from a drop next to an add, and
 `up`/`status`/`sql`/`down`, applying a checked-in migration registry
 against a live database with an advisory lock around the run and one
-transaction per migration, the ledger row inside it.
+transaction per migration, the ledger row inside it, `Mysql`, the second
+`Dialect` implementation - the same intent tree rendered to MySQL's own DDL,
+with every place it diverges from Postgres named on one page, and
+`withRollback`/`make`/`create`/`Seq`, running your own test suite inside a
+transaction that always rolls back, even on success, so nothing a test
+writes is ever there to clean up.
 
 ## Install
 
@@ -68,7 +73,8 @@ alone, `pool.tx(...)`, `pool.txValue<T>(...)`). Table and column names are
 mapped from a `@table` class's field names - see
 [`docs/naming.md`](docs/naming.md). Declaring and altering tables is
 [`docs/schema.md`](docs/schema.md), rendered to real DDL by a
-`Dialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first.
+`Dialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first,
+[`docs/mysql.md`](docs/mysql.md) for `Mysql` and where its DDL diverges.
 Querying rows through the find chain is [`docs/query.md`](docs/query.md).
 Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is
@@ -84,22 +90,24 @@ removing it is [`docs/softdelete.md`](docs/softdelete.md). Optimistic
 locking against a lost update is [`docs/version.md`](docs/version.md).
 Writing a reviewed migration file from your entities is
 [`docs/generate.md`](docs/generate.md). Applying that file against a live
-database is [`docs/migrate.md`](docs/migrate.md).
+database is [`docs/migrate.md`](docs/migrate.md). Running your own test
+suite inside a transaction that always rolls back is
+[`docs/testing.md`](docs/testing.md).
 
 ## `Dialect` vs `UpsertDialect`
 
 Two different types answer "which database": [`Dialect`](docs/dialect.md)
 is an interface with one method, `render(op: SchemaOp): []Statement` - it
 turns a whole schema migration into the DDL one engine understands, and
-gains a new implementation per engine (`Postgres` today, MySQL later).
-`UpsertDialect` (`docs/write.md`) is a plain two-value enum `upsert` reads
-to pick `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` syntax for one
-statement - it renders nothing and has no implementations to add. They
-stay separate types (#5325) because folding the enum into the interface
-would make every `upsert` caller hand it a full `Dialect` implementation
-just to express a two-value syntax choice, and would block a MySQL
-`upsert` on MySQL's still-unstarted `Dialect` (#5067) rather than letting
-it ship independently, the way it does today.
+gains a new implementation per engine (`Postgres`, then `Mysql` - see
+[`docs/mysql.md`](docs/mysql.md)). `UpsertDialect` (`docs/write.md`) is a
+plain two-value enum `upsert` reads to pick `ON CONFLICT` vs `ON DUPLICATE
+KEY UPDATE` syntax for one statement - it renders nothing and has no
+implementations to add. They stay separate types (#5325) because folding
+the enum into the interface would make every `upsert` caller hand it a full
+`Dialect` implementation just to express a two-value syntax choice, which
+`upsert` never needed even once `Dialect` itself grew a second
+implementation.
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
