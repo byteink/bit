@@ -62,6 +62,34 @@ BIT2="${ROOT}/bit-out/bin/bit"
 # scores MATCH — a full green board from no compiler.
 diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 
+# BOTH SIDES must reach the working tree's stdlib THROUGH THE SAME PATH STRING,
+# the #1920 pin selfhost-diffcheck.sh already carries -- read its copy for the
+# full account. It was a check-row-only concern until #5177 routed
+# `--dump-types`/`--dump-ir`/`--dump-ir-pre` through `loadProject` for prelude
+# injection (compiler/main.bit's `checkedSourceFile`, replacing a scratch module
+# with `prelude: -1` that never touched stdRoot), and the pin was not carried
+# over here with it.
+#
+# Unpinned, stage0.sh's wrapper hands the ORACLE an absolute BIT_STDLIB while
+# BIT2 runs bare and `stdRootPath` (compiler/mainpaths.bit) falls through
+# `resolveNearExe` -- there is no `bit-out/stdlib` -- to the cwd-relative
+# literal `"stdlib"`. `loadModuleAt` (compiler/project.bit) memoises on
+# `pathResolve(dir)`, which is LEXICAL and never absolutises, so for a corpus
+# file under `stdlib/core/` the relative spelling makes the prelude's key and
+# the root's key the SAME STRING: the root load hits the prelude's cached
+# module and its `rootOnly` filter is dropped, dumping the whole two-file
+# module against its concatenated source. That is one compiler disagreeing with
+# ITSELF about an environment, scored as a divergence between two compilers
+# (#5356: stdlib/core/core.bit and stdlib/core/option.bit, MISMATCH=2 from a
+# bare shell while `./make test-differentials` -- which exports BIT_STDLIB per
+# tools/build/gatestable2.bit -- read green).
+#
+# `$(pwd)` not `${ROOT}`: it must name the tree the CORPUS below is found in,
+# since `find $CORPUS` is cwd-relative. The wrapper's `${BIT_STDLIB:-...}` takes
+# this value instead of substituting its own.
+BIT_STDLIB="$(pwd)/stdlib"
+export BIT_STDLIB
+
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.
 whydied() {
