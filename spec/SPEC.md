@@ -3818,13 +3818,52 @@ enum Ticket {
   `Result<T, E>` this way.
 
 Representation (non-normative): an enum with no payload-carrying variant is a
-bare tag word. An enum with any payload-carrying variant is boxed: every
-construction of it - including a no-payload variant of that same enum - is one
-heap-allocated `{ tag: i64 @0, ... }` object, with payload argument words
-stored inline starting at offset 8 (`8 + 8*argc` bytes total); there is no
-intermediate payload pointer or second allocation. A no-payload construction is
-the same 16-byte shape with the payload word zeroed. See `runtime/ABI.md`
-§1.2 for the byte layout.
+bare tag word. An enum with any payload-carrying variant has two forms. Which
+one it takes is a property of the TYPE, fixed at its declaration (for a generic
+enum, at each instantiation), never of an individual construction, so every
+module that names the type agrees on its shape without analysing anything.
+
+The **boxed** form is one heap-allocated `{ tag: i64 @0, ... }` object per
+construction - including a no-payload variant of that same enum - with payload
+argument words stored inline starting at offset 8 (`8 + 8*argc` bytes total);
+there is no intermediate payload pointer or second allocation. A no-payload
+construction is the same 16-byte shape with the payload word zeroed.
+
+The **value** form is two machine words - the tag, then the one payload word -
+with no heap object, no header and no allocation at all. A type takes it when
+every one of its variants carries at most one payload word AND every
+payload-carrying variant carries the same type, and the type is a fully
+monomorphized instantiation. `Option<i64>`, `Option<string>` and `Option<Json>`
+qualify; `Result<i64, string>` does not, because its two payload types disagree,
+and neither does a variant with two or more payload arguments:
+
+```bit
+enum Slot { Empty, Filled(i64) }
+
+enum Mixed { Count(i64), Name(string) }
+
+fn bump(s: Slot): Slot {
+  let n = 0
+  match (s) {
+    Filled(v) => { n = v + 1 }
+    Empty => { n = 1 }
+  }
+  return Slot.Filled(n)
+}
+```
+
+`Slot` is value-form, so the `Slot` that crosses `bump`'s parameter and its
+return costs no allocation; `Mixed` is boxed. Both are the same language: the
+form is unobservable to a program, which can neither ask for it nor detect it.
+A value-form enum is materialized back into the identical boxed object at any
+use that needs one shared memory location - stored into a class field, a slice
+or array element, a map key or value, sent on a channel, captured by a closure,
+or converted to an interface - so containers hold what they always held.
+
+The value form is used for returns only on targets whose ABI returns a
+two-word aggregate in registers (the aarch64 targets today); elsewhere a
+returned enum takes the boxed form. See `runtime/ABI.md` §1.2 for the byte
+layout, the exact eligibility predicate and the target gate.
 
 ### 14.8 Diagnostic Order
 

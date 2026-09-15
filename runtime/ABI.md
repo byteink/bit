@@ -165,6 +165,97 @@ take the offset from `enumPayloadBase` in `compiler/lowerlayout.bit`, because a
 writer and a reader that disagree here produce a wrong answer with no
 diagnostic, not a crash.
 
+### 1.2.1 The value form: an eligible enum as two words (#5312, #5313, #5340)
+
+Everything above describes the **boxed** form. An enum TYPE that satisfies the
+predicate below is not boxed at all while it is passed, returned or matched: it
+is **two independent single-word SSA values** — the i64 tag, then the one payload
+word — exploded in the lowerer exactly as a two-member tuple or a `decimal`
+already is (`explodedWordTypes`, `compiler/lowerexplode.bit`), so no
+multi-location value ever reaches the register allocator. No header, no
+`gc_alloc`, no `TypeInfo`, and nothing for the collector to trace beyond the one
+word's own `isRef`.
+
+**Eligibility is a property of the monomorphized TYPE, never of a construction
+site** — `match`, a parameter and a return must agree on the shape with no
+analysis, and a per-site rule would give two values of one static type two
+different register footprints. `enumExplosionEligible`
+(`compiler/lowerlayout.bit`) is the whole predicate; each clause is a refusal the
+boxed form absorbs unchanged:
+
+| clause | a type it refuses | why |
+|---|---|---|
+| `enumBoxed`: at least one payload-carrying variant | `enum Color { Red, Green, Blue }` | already lowers to a bare tag word — there is no allocation to remove |
+| every variant's payload is 0 or 1 words | `Frame` (`stdlib/quic/frames.bit`): `NewConnectionId(u64, u64, []byte, []byte)` is four | N = 2 (tag + one payload word); a wider payload has no word to live in |
+| every recorded payload type is fully substituted | the generic DECLARATION `Option<T>`, whose own `ctx.variantPayloads` entry holds a bare `TypeParam` | only an INSTANTIATION (`fillInstVariants`) has a word anything has sized |
+| every payload-carrying variant carries the SAME type (`enumCommonPayloadType` returns a type, not `-1`) | `Result<i64, string>` | the arm must read back the type the constructor wrote — see below |
+
+The last clause is #5340's, and it is the one that is not merely conservative.
+#5312 typed the shared word as a declaration-wide union (`ctx.errorId` whenever
+ANY variant's payload word was a pointer), which is the only SAFE answer for a
+mixed declaration but a WRONG one for the shape real code is made of:
+`forwardOneLoad` (`compiler/optstore.bit`) forwards a store into a load only when
+the two IR types are EQUAL, and `explodedArgWords` (`compiler/lowerexplode.bit`)
+gates a call site's argument explosion on the argument VALUE's IR type. A word
+typed `error` can therefore never answer an arm that binds a `Json`: the rebuild
+survives every pass, and a call-result subject rebuilds a box per match. So a
+declaration with one payload type explodes with that type EXACTLY, and a mixed
+one goes back on the boxed path it was on before #5313 — never a lost root, and
+no shape can regress.
+
+**GC references.** The payload word carries its own static `isRef`, which
+`regalloc` records into a safepoint's registers or slots with no stack-map format
+change (#4236). `enumPayloadWordIsRef` (`compiler/lowerlayout.bit`) remains the
+conservative union — the word is traced if ANY variant's payload there is a
+pointer, never only if every variant's is. Over-tracing a plain integer costs a
+scan; under-tracing loses a root and frees a live object, so the union errs in
+the one direction that cannot be wrong.
+
+**The target gate is on the RETURN side only.** `explodedRetWords`
+(`compiler/lowerexplode.bit`) returns the empty list unless `Lowerer.multiWordRet`
+— that is `targetReturnsInRegisters` (`compiler/build.bit`), true for
+`aarch64-macos` and `aarch64-linux` and false for both x86_64 targets — so an
+x86_64 build hands a returned enum back as one handle and keeps the boxed object
+at every `ret`. The PARAMETER side has no target gate: it rides `explodesParams`
+on every target, exactly as a tuple or a `decimal` parameter already does.
+
+**Materialization back to the box.** A use that needs one shared memory location
+— a class field, a slice or array element, a map key or value, a channel send, a
+closure capture, a conversion to an interface — rebuilds the identical
+`{ tag @0, arg0 @8 }` object through `materializeExplodedEnum`
+(`compiler/lowerlayout.bit`), from the same `enumPayloadBase` the boxed path
+uses. Containers, `TypeInfo` (§2) and the collector are unchanged; only the
+transient form is new.
+
+**`match` over an exploded subject.** `matchSubjectWords` / `lowerMatchSubject`
+(`compiler/lowerbranch.bit`) read the subject's raw `[tag, payload]` words when
+the subject is a local bound to an exploded value, or a call result whose fresh
+box's own `field_set` operands are still recoverable (`freshEnumBoxWords`), and
+`bindArmPayloadDirect` binds a one-word payload straight from the word — no box,
+no `field_get`, nothing for a later pass to have to cancel. An arm that binds no
+payload reads the tag word alone.
+
+**Measured, aarch64-macos, `bench/cases/json`** — `swept+live` and `allocbytes`
+from one `BIT_GC_STATS=1` run of the built benchmark (object counts are
+deterministic; stdout was byte-identical at all three points), cycles the median
+of 7 interleaved runs against a byte-identical null control that read 0.56%
+apart:
+
+| compiler | objects | allocbytes | cycles |
+|---|---|---|---|
+| `d0b16a06`, before #5312 | 5,400,061 | 273,929,536 | 1,377,592,364 |
+| `608a4ab3`, #5313 with the union-typed word | 9,300,064 | 398,729,632 | 3,989,032,924 |
+| `1d92321c`, after #5340 | 4,350,060 | 240,329,504 | 1,297,601,527 |
+
+Against the pre-mechanism compiler that is **-1,050,001 objects (-19.4%) and
+-33,600,032 bytes (-12.3%)**, which is 32.0 bytes per removed object exactly: the
+16-byte header plus the two words of an argc=1 box. `bench/cases/allocflat`,
+which declares no enum, read 4,006 objects and 246,416,704 bytes at all three
+commits and its cycles moved 0.33% across all four binaries — the control that
+says this is an enum-representation change and not a build difference. The middle
+row is why the exact-typing clause exists: the value form without it cost json
++3,900,003 objects and 2.9x its cycles.
+
 ---
 
 ## 2. Per-type pointer maps (`TypeInfo`)
