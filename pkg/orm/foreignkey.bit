@@ -1,0 +1,210 @@
+// pkg/orm/foreignkey.bit — `onDelete` on a `@belongsTo` relation (#5061),
+// rendered into the foreign-key constraint `pkg/orm/schema.bit`'s builder
+// and `postgres.bit`'s `Dialect` already know how to emit (#5065/#5066).
+// Owner decision 2026-09-12.
+//
+//   @table
+//   class Order {
+//     @id id: i64
+//     @belongsTo("userId", onDelete = Cascade)  user: User
+//     userId: i64
+//   }
+//
+//   addForeignKeys(t, Order{ id: 0, user: User{ id: 0 }, userId: 0 }.tableDescriptor(),
+//     map<string, RelationTarget>{ "user": RelationTarget{ isTable: true, table: "users", idColumn: "id" } })?
+//
+// THE ATTRIBUTE'S RECORDED SHAPE. `compiler/classtabledesc.bit` renders
+// `@belongsTo("userId", onDelete = Cascade)` to `AttrDesc{ name: "belongsTo",
+// args: ["userId", "onDelete", "Cascade"] }` - a named argument renders as
+// TWO consecutive words, the keyword then its value
+// (`compiler/classtabledescwords.bit`'s `tableAttrArgWords`, #5064's own
+// compiler change: attribute argument lists did not accept `name = expr` at
+// all before this ticket, confirmed by parse error on this exact example).
+// This file reads that flat list; it never re-derives it.
+//
+// THE DATABASE ENFORCES onDelete, NOT THIS PACKAGE. `addForeignKeys` builds
+// the DDL constraint only - it never walks a relation issuing a child
+// DELETE. That would be N statements, not atomic without a transaction the
+// caller may not have opened, and it would silently diverge from what the
+// schema says once someone edits the constraint by hand. A parent delete
+// (`pkg/orm/write.bit`'s ordinary `delete<T>`) stays exactly one statement
+// to the driver; Postgres/MySQL enforce the constraint atomically from
+// there.
+//
+// DEFAULT IS Restrict, NOT Cascade. An omitted `onDelete` (no "onDelete"
+// keyword in `args` at all) is `ReferentialAction.Restrict` - deleting a
+// referenced row with a child still pointing at it then fails loudly
+// instead of silently destroying the child. Cascade is written down
+// deliberately, because a mistaken cascade on a widely-referenced table
+// deletes half the database from one statement.
+//
+// SetNull NEEDS A NULLABLE COLUMN. `onDelete = SetNull` whose foreign-key
+// column field is not `Option<...>` is `ForeignKeyError` naming both the
+// field and the option - the database would otherwise be asked to write
+// NULL into a NOT NULL column and fail at DELETE time, in production, on a
+// statement that looked fine in review.
+//
+// THE TARGET MUST BE A @table CLASS, AND THIS FILE CANNOT SEE ITS
+// ATTRIBUTES ITSELF. Bit has no reflection to read a type parameter's own
+// attributes - `pkg/orm/relation.bit`'s own header states the identical
+// limitation for eager loading. `RelationTarget` is the same explicit
+// per-entity-wrapper shape `relation.bit`'s `hasMany`/`hasOne`/`belongsTo`
+// and `softdelete.bit`'s scoped entry points already use: the caller (who
+// wrote `@table class User` and knows it) supplies `isTable`/`table`/
+// `idColumn` once per relation; a relation missing from `targets`, or
+// carrying `isTable: false`, is rejected rather than silently emitting a
+// dangling reference to a table that may never exist.
+//
+// NO FOREIGN-KEY COLUMN IS EVER LEFT UNINDEXED. Postgres does not index a
+// referencing column automatically (only the REFERENCED side, always this
+// package's `@id` primary key, is). `addForeignKeys` always calls
+// `t.index(column)` alongside `t.foreign(column)...` for the identical
+// column - never silently skipping the index because the constraint alone
+// "looks" complete.
+
+import { hasPrefix } from "std/strings"
+
+// Why `addForeignKeys` rejected one `@belongsTo` field.
+export enum ForeignKeyCause {
+  // `onDelete = SetNull` but the foreign-key column field is not
+  // `Option<...>`.
+  SetNullRequiresOption,
+  // The relation's target is missing from `targets`, or was supplied with
+  // `isTable: false` - not a `@table` class.
+  TargetNotTable,
+  // `onDelete`'s own value is none of `Cascade`/`Restrict`/`SetNull`/
+  // `NoAction`.
+  UnknownOnDelete,
+}
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `pkg/orm/softdelete.bit`'s `SoftDeleteError` is.
+export class ForeignKeyError {
+  export cause: ForeignKeyCause
+  export field: string
+  export detail: string
+
+  message(): string {
+    match (this.cause) {
+      SetNullRequiresOption => return "pkg/orm: '${this.field}' declares onDelete = SetNull but its foreign-key field ${this.detail} is not Option<...>"
+      TargetNotTable => return "pkg/orm: '${this.field}' relates to '${this.detail}', which does not carry '@table'"
+      UnknownOnDelete => return "pkg/orm: '@belongsTo' onDelete value '${this.detail}' is not Cascade, Restrict, SetNull or NoAction"
+    }
+  }
+}
+
+// What the caller already knows about a `@belongsTo` field's target class -
+// see this file's header for why it cannot be read off the descriptor
+// itself.
+export class RelationTarget {
+  export isTable: bool,
+  export table: string,
+  export idColumn: string,
+}
+
+// Adds one `ForeignKey` (plus its index) to `t` for every `@belongsTo`
+// field in `fields`, reading each one's own recorded `onDelete` and
+// validating it against `targets`. Fields carrying no `@belongsTo` are
+// skipped - `@hasMany`/`@hasOne` own no column on this side (relation.bit's
+// header) and never reach this file.
+export fn addForeignKeys(
+  t: Table, fields: []FieldDesc, targets: map<string, RelationTarget>,
+): ()! {
+  for f of fields {
+    let (bitFieldName, has) = belongsToColumn(f.attrs)
+    if (!has) {
+      continue
+    }
+    let (target, found) = targets[f.name]
+    if (!found || !target.isTable) {
+      fail ForeignKeyError{
+        cause: ForeignKeyCause.TargetNotTable, field: f.name, detail: f.typeName,
+      }
+    }
+    let fkField = requireField(fields, bitFieldName, f.name)
+    let action = onDeleteFor(f.attrs)?
+    if (action == ReferentialAction.SetNull && !hasPrefix(fkField.typeName, "Option<")) {
+      fail ForeignKeyError{
+        cause: ForeignKeyCause.SetNullRequiresOption, field: f.name,
+        detail: "'${bitFieldName}: ${fkField.typeName}'",
+      }
+    }
+    let column = columnName(fkField)
+    t.foreign(column).references(target.table, target.idColumn).onDelete(action)
+    t.index(column)
+  }
+}
+
+// The `@belongsTo` field named in `fields` for its own foreign-key column
+// is a program-shape bug the same category `pkg/orm/write.bit`'s own
+// `primaryKeyField` panics for - the attribute's own argument named a field
+// that does not exist on the class, not data a caller can recover from.
+fn requireField(fields: []FieldDesc, name: string, relationField: string): FieldDesc {
+  for f of fields {
+    if (f.name == name) {
+      return f
+    }
+  }
+  panic("pkg/orm: '@belongsTo' on '${relationField}' names foreign-key field '${name}', which '${relationField}'s class does not declare")
+}
+
+// `@belongsTo`'s own first (positional) argument, the foreign-key column's
+// Bit field name - #5061's "the attribute argument names the FOREIGN KEY
+// COLUMN ON THE OWNING SIDE" (relation.bit's header).
+fn belongsToColumn(attrs: []AttrDesc): (string, bool) {
+  for a of attrs {
+    if (a.name == "belongsTo" && len(a.args) > 0) {
+      return (a.args[0], true)
+    }
+  }
+  return ("", false)
+}
+
+// `onDelete`'s own value among a `@belongsTo`'s recorded args, or
+// `Restrict` when the keyword is absent - this ticket's own default.
+fn onDeleteFor(attrs: []AttrDesc): ReferentialAction! {
+  for a of attrs {
+    if (a.name != "belongsTo") {
+      continue
+    }
+    let (spelling, found) = namedArg(a.args, "onDelete")
+    if (!found) {
+      return ReferentialAction.Restrict
+    }
+    return parseOnDelete(spelling)?
+  }
+  return ReferentialAction.Restrict
+}
+
+// The value following `key` in a recorded attribute's flat `args` - see
+// this file's header for why a named argument renders as two consecutive
+// words. Starts at 1: `args[0]` is always `@belongsTo`'s own positional
+// column argument, never a keyword.
+fn namedArg(args: []string, key: string): (string, bool) {
+  let i = 1
+  while (i < len(args) - 1) {
+    if (args[i] == key) {
+      return (args[i + 1], true)
+    }
+    i = i + 1
+  }
+  return ("", false)
+}
+
+fn parseOnDelete(spelling: string): ReferentialAction! {
+  if (spelling == "Cascade") {
+    return ReferentialAction.Cascade
+  }
+  if (spelling == "Restrict") {
+    return ReferentialAction.Restrict
+  }
+  if (spelling == "SetNull") {
+    return ReferentialAction.SetNull
+  }
+  if (spelling == "NoAction") {
+    return ReferentialAction.NoAction
+  }
+  fail ForeignKeyError{
+    cause: ForeignKeyCause.UnknownOnDelete, field: "", detail: spelling,
+  }
+}
