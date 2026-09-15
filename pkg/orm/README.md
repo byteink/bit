@@ -56,7 +56,7 @@ alone, `pool.tx(...)`, `pool.txValue<T>(...)`). Table and column names are
 mapped from a `@table` class's field names - see
 [`docs/naming.md`](docs/naming.md). Declaring and altering tables is
 [`docs/schema.md`](docs/schema.md), rendered to real DDL by a
-`SchemaDialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first.
+`Dialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first.
 Querying rows through the find chain is [`docs/query.md`](docs/query.md).
 Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is
@@ -69,6 +69,21 @@ cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
 `hasMany`/`hasOne`/`belongsTo` and eager loading with `with()` is
 [`docs/relation.md`](docs/relation.md). Marking a row deleted instead of
 removing it is [`docs/softdelete.md`](docs/softdelete.md).
+
+## `Dialect` vs `UpsertDialect`
+
+Two different types answer "which database": [`Dialect`](docs/dialect.md)
+is an interface with one method, `render(op: SchemaOp): []Statement` - it
+turns a whole schema migration into the DDL one engine understands, and
+gains a new implementation per engine (`Postgres` today, MySQL later).
+`UpsertDialect` (`docs/write.md`) is a plain two-value enum `upsert` reads
+to pick `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` syntax for one
+statement - it renders nothing and has no implementations to add. They
+stay separate types (#5325) because folding the enum into the interface
+would make every `upsert` caller hand it a full `Dialect` implementation
+just to express a two-value syntax choice, and would block a MySQL
+`upsert` on MySQL's still-unstarted `Dialect` (#5067) rather than letting
+it ship independently, the way it does today.
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

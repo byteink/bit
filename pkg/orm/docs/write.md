@@ -139,20 +139,25 @@ catches, avoided here on purpose.
 ## upsert - insert or update in one statement, with two real limits
 
 ```bit
-import { Dialect, upsert } from "orm"
+import { UpsertDialect, upsert } from "orm"
 
 fn upsertPersonByEmail(db: Data, p: Person): ()! {
-  upsert(db, personDesc(), personValues(p), Dialect.Postgres, on = "email")?
+  upsert(db, personDesc(), personValues(p), UpsertDialect.Postgres, on = "email")?
 }
 ```
 
 This is `INSERT INTO people (...) VALUES (...) ON CONFLICT (email) DO
 UPDATE SET ...` on Postgres, `ON DUPLICATE KEY UPDATE` on MySQL
-(`Dialect.Mysql`) - the statement CSV imports and sync jobs actually want:
+(`UpsertDialect.Mysql`) - the statement CSV imports and sync jobs actually want:
 one round trip, no "does this email already exist" query first. `on`
 names a unique or primary-key column; the Bit field name, translated the
 same way `where`'s column names are, never a raw SQL identifier. Omit it
 and `upsert` uses the primary key.
+
+`UpsertDialect` is not [`Dialect`](dialect.md), the schema-rendering
+interface - it is a plain tag scoped to `upsert` alone. See
+[`pkg/orm/README.md`](../README.md#dialect-vs-upsertdialect) for why the
+two stay separate types.
 
 **`upsert` is never what `save` does by default, for two reasons that
 matter in production:**
