@@ -400,10 +400,45 @@ fn jsxMaybeGap(p: Parser, afterText: bool): int {
   return jsxGapText(p)
 }
 
+// The byte position everything before which this element's children have
+// already consumed. NOT derivable from `p.toks[p.pos - 1].end`: after a text
+// run, `jsxResync` rebuilds the token tail and leaves `p.pos - 1` holding the
+// token that preceded the WHOLE run, so that expression reads back a position
+// the parser is already past — which is what made two consecutive text runs
+// rescan the same bytes forever (#5348). Only the first turn, before any
+// resync has happened, can take it from the tokens.
+fn jsxConsumedEnd(p: Parser): int {
+  if (p.pos == 0) {
+    return 0
+  }
+  return p.toks[p.pos - 1].end
+}
+
+// Out of children, by BYTES as well as by tokens. The token test alone is not
+// enough: what is left at `len(p.src)` can be the lexer's zero-width
+// synthesized semicolon (`semiToken`, lexer.bit) rather than `Eof`, and that
+// token is not text — there is nothing left for a text run to consume, so
+// `jsxRawTextEnd` would hand back `cursor` unchanged and the caller's loop
+// would stop advancing. The caller reports the missing closing tag.
+fn jsxAtChildrenEnd(p: Parser, cursor: int): bool {
+  return peekKind(p) == Kind.Eof || cursor >= len(p.src)
+}
+
 // `{ jsx_child }` up to the closing tag (or EOF, which the caller reports).
-// Terminating: every branch strictly advances the SOURCE byte position —
-// `parseJsxText` by at least one byte (`jsxRawTextEnd`), `parseJsx` its `<`,
-// `parseJsxBraced` its `{` — so the loop is bounded by the file length.
+//
+// Terminating, on `cursor` — the source byte position below. Every turn either
+// sets `done` or strictly increases it: `parseJsx` consumes at least its `<`
+// and `parseJsxChildBraced` at least its `{`, each one byte wide and each at or
+// after `cursor`, so `jsxConsumedEnd` comes back strictly greater; and the text
+// branch runs to `jsxRawTextEnd(p.src, cursor)`, which is `> cursor` for every
+// `cursor < len(p.src)` (it takes a delimiter byte AT `cursor` before scanning,
+// and takes a non-delimiter one in the scan itself). The loop's first branch
+// makes `cursor < len(p.src)` hold everywhere below it. `cursor` never exceeds
+// `len(p.src)`, so the loop is bounded by the file length.
+//
+// The token cursor `p.pos` is deliberately NOT the measure: `jsxResync` can
+// leave it exactly where it was and still have advanced the parse, because the
+// tokens it points AT were replaced by a re-lex from further along.
 fn parseJsxChildren(p: Parser): int {
   let items = []int(0)
   let done = false
@@ -418,13 +453,14 @@ fn parseJsxChildren(p: Parser): int {
   // for the turn right after one is always exactly 0 — this flag says so
   // without asking the token that can no longer answer.
   let afterText = false
+  let cursor = jsxConsumedEnd(p)
   while (!done) {
     // Each turn produces at most a separator and one child, appended here
     // rather than in the branches: `append` on a slice PARAMETER aliases the
     // caller's array (E0214), so the accumulator never leaves this function.
     let gap = 0
     let child = 0
-    if (peekKind(p) == Kind.Eof) {
+    if (jsxAtChildrenEnd(p, cursor)) {
       done = true
     } else if (peekKind(p) == Kind.Lt && peekKindAt(p, 1) == Kind.Slash) {
       gap = jsxMaybeGap(p, afterText)
@@ -432,13 +468,17 @@ fn parseJsxChildren(p: Parser): int {
     } else if (atJsxStart(p)) {
       gap = jsxMaybeGap(p, afterText)
       child = parseJsx(p)
+      cursor = jsxConsumedEnd(p)
       afterText = false
     } else if (peekKind(p) == Kind.LBrace) {
       gap = jsxMaybeGap(p, afterText)
       child = parseJsxChildBraced(p)
+      cursor = jsxConsumedEnd(p)
       afterText = false
     } else {
-      child = parseJsxText(p)
+      let boundary = jsxRawTextEnd(p.src, cursor)
+      child = parseJsxText(p, cursor, boundary)
+      cursor = boundary
       afterText = true
     }
     if (gap != 0) {
@@ -482,12 +522,13 @@ fn jsxGapText(p: Parser): int {
 // directly in the bytes, with no lexer involved at all. `jsx_text`'s own
 // termination rule needs none: it is "the next '<' or '{' byte", full stop.
 //
-// Progress when `start0` itself IS a delimiter byte (`<` that failed
-// `atJsxStart`, e.g. `<3` — not a tag, not `</`, so `parseJsxChildren`'s
-// dispatch falls through to text): one byte is taken as literal text before
-// scanning resumes, so the run is never zero-width and the caller's loop
-// cannot spin. `{` cannot reach here zero-width — `parseJsxChildren` always
-// routes a `{` to `parseJsxChildBraced` first.
+// STRICTLY greater than `start0` for every `start0 < len(src)`, which is what
+// `parseJsxChildren`'s termination rests on. Both arms give that: a delimiter
+// byte AT `start0` (a `<` that failed `atJsxStart`, e.g. `<3` — not a tag, not
+// `</`, so the dispatch falls through to text) is taken as one byte of literal
+// text before scanning resumes, and a non-delimiter one is taken by the scan.
+// The caller guarantees `start0 < len(src)`; at `len(src)` there is no text
+// left and this would return `start0` unchanged.
 fn jsxRawTextEnd(src: string, start0: int): int {
   let i = start0
   if (i < len(src) && (src[i] == '<' || src[i] == '{')) {
@@ -582,20 +623,19 @@ fn jsxResync(p: Parser, discardFrom: int, boundary: int) {
   p.pos = keep
 }
 
-// One run of text between two delimiters, as a `jsx_text` leaf — or 0 when the
-// run is whitespace the §12.12 rule discards.
+// The run `[runStart, boundary)` as a `jsx_text` leaf — or 0 when the run is
+// whitespace the §12.12 rule discards.
 //
-// The run's END is found in the SOURCE (`jsxRawTextEnd`), not in the tokens —
-// see `jsxResync` for why the tokens cannot be trusted here. That keeps
-// interior spacing exactly as written (tokens have no spacing between them)
-// and makes the lexer's synthesized semicolons, which are zero-width,
-// invisible here.
-fn parseJsxText(p: Parser): int {
-  let runStart = 0
-  if (p.pos > 0) {
-    runStart = p.toks[p.pos - 1].end
-  }
-  let boundary = jsxRawTextEnd(p.src, runStart)
+// Both ends come from the caller, which owns them: the run's END is found in
+// the SOURCE (`jsxRawTextEnd`), not in the tokens — see `jsxResync` for why the
+// tokens cannot be trusted here — and its START is the caller's `cursor`, for
+// the same reason. Deriving `runStart` here from `p.toks[p.pos - 1].end`, as
+// this function used to, reads a position from BEFORE the previous run
+// whenever that run resynced, so two text runs in a row rescanned the same
+// bytes for ever (#5348). Taking the end from the source keeps interior spacing
+// exactly as written (tokens have no spacing between them) and makes the
+// lexer's synthesized semicolons, which are zero-width, invisible here.
+fn parseJsxText(p: Parser, runStart: int, boundary: int): int {
   jsxResync(p, runStart, boundary)
   let (lo, hi) = jsxTrimText(p.src, runStart, boundary)
   if (lo >= hi) {
