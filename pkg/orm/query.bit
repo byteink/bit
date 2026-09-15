@@ -1,0 +1,277 @@
+// pkg/orm/query.bit — the find chain (#5057, owner decision 2026-09-12):
+// where/whereIn/whereNull/whereLike/orderBy/limit/offset, with a
+// string-literal column name checked at compile time.
+//
+//     let fields = User{}.tableDescriptor()
+//     let q = find<User>(db, tableName("User", User{}.tableAttrs()), fields, __rowToUser)
+//     let rows = q.where("email", Value.Text(e)).orderBy("createdAt", Dir.Desc).limit(20).all()?
+//
+// WHY `find<T>` TAKES `table`/`fields`/`mapper` EXPLICITLY, NOT
+// `db.find<User>()`. #5054's own `find<T>`/`findOne<T>`/`findOneOrFail<T>`
+// (stdlib/sql/row.bit) get their per-class mapper by a COMPILER REWRITE at
+// the exact call site that writes `<T>` literally (compiler/checksqlrow.bit)
+// — the template body never runs. `Query<T>.all()`/`.one()`/`.oneOrFail()`
+// below are ordinary METHODS on a generic class: by the time they run, `T`
+// is Query's own type parameter, not a literal class name any pre-checker
+// pass can resolve to a declaration — the exact same call, written inside a
+// generic body instead of at a literal call site, cannot be rewritten the
+// way #5054's own call sites are. Auto-deriving the mapper the way
+// `db.find<User>()` implies would need a SECOND compiler pass shaped like
+// checksqlrow.bit/checksqlrowbuild.bit's, reusing `sqlClassSiteOf`,
+// `buildSqlRowClass`, `synthSqlRowMapper` and `injectSqlRowMapperDecls`
+// (compiler/checksqlrow.bit, compiler/checksqlrowbuild.bit — all already
+// shaped to accept an arbitrary call site, not tied to std/sql's own three
+// names) retargeted at `find<T>`'s call shape and wired into
+// `injectSynthMembers` (compiler/synthtext.bit). That is real, buildable
+// work — flagged here rather than filed, same as #5056's `@table("...")`
+// gap and #5065's `E0050` gap — and NOT attempted in this delivery: it
+// touches the same shared, heavily-relied-on synthesis pipeline every other
+// landed ORM feature runs through, and getting it wrong there is a
+// regression risk this ticket's own scope does not need to take. Until it
+// lands, the caller supplies `table`, `fields` (`T{}.tableDescriptor()`,
+// #5051) and `mapper` once per entity, at the one call site where `T` truly
+// is a literal. A SECOND, independent limitation follows from this shape —
+// `Query<T>` constructed via a generic function (`find<T>`) rather than a
+// literal `Query<Widget>{...}`: calling a SEPARATE generic function with `T`
+// as an explicit type argument from inside such a class's own method does
+// not lower (`error[E0092]`, isolated outside this package). `all`/`one`/
+// `oneOrFail` below therefore run their fetch loop inline against
+// `this.mapper` (a closure FIELD call, unaffected) instead of calling
+// stdlib/sql/row.bit's `sqlFindMany`/`sqlFindOne`/`sqlFindOneOrFail`.
+//
+// SECURITY IS THE POINT (#5057's own label). A column name reaching SQL
+// unchecked is an injection vector. `where`/`whereIn`/`whereNull`/
+// `whereLike`/`orderBy` take a Bit FIELD name, never raw SQL text:
+// `compiler/checkormquery.bit` rejects a STRING-LITERAL column that is not
+// one of `T`'s declared fields, naming the field and the class, at the
+// exact call chain rooted at `find<T>(...)`. A column reached any other way
+// (a variable, a chain that does not start at `find<T>`) falls back to the
+// RUNTIME check `columnFor` below always performs — never silently
+// concatenated into SQL text either way. Every VALUE is a `Value`, carried
+// to `Executor.query`/`exec` as a separate, numbered `$n` argument
+// (stdlib/sql/sql.bit's own header) — nothing in this file ever builds SQL
+// text by pasting a caller's value into it.
+//
+// ONE() AND ONEORFAIL() ALWAYS CARRY A LIMIT. `boundedSql` never emits a
+// bare, unbounded SELECT for either: it raises the query's own LIMIT to (at
+// least) 2 when none smaller is already set, exactly wide enough for
+// `sqlFindOne`/`sqlFindOneOrFail` (stdlib/sql/row.bit) to see a second
+// matching row and refuse it, rather than silently returning the first
+// (constraint on #5057).
+
+import { SqlRowCause, SqlRowError, sqlReqInt } from "std/sql"
+import { join } from "std/strings"
+
+// Sort direction for `orderBy`.
+export enum Dir { Asc, Desc }
+
+// A chain builder over `T`'s table. Every method but the six terminals
+// (`all`/`one`/`oneOrFail`/`count`/`exists`) returns `this`, already
+// mutated, so a caller may chain fluently or hold the builder in a
+// variable and add to it later — see this file's header for what each
+// terminal executes.
+export class Query<T> {
+  db: Data
+  table: string
+  fields: []FieldDesc
+  mapper: (Rows) => T!
+  wheres: []string
+  args: []Value
+  orderBys: []string
+  limitN: int
+  hasLimit: bool
+  offsetN: int
+  hasOffset: bool
+  export where(
+    column: string,
+    val: Value,
+  ): Query< // `column = $n`, `val` bound as the n-th positional argument.
+    T,
+  > {
+    let col = this.columnFor(column)
+    this.args = append(this.args, val)
+    this.wheres = append(this.wheres, "${col} = $${len(this.args)}")
+    return this
+  }
+  export whereLike(
+    column: string,
+    pattern: Value,
+  ): Query< // `column like $n`. Still a bound argument — the pattern's `%`/`_`
+    // wildcards are the caller's own text, never SQL syntax this file writes.
+    T,
+  > {
+    let col = this.columnFor(column)
+    this.args = append(this.args, pattern)
+    this.wheres = append(this.wheres, "${col} like $${len(this.args)}")
+    return this
+  }
+  export whereIn(
+    column: string,
+    vals: []Value,
+  ): Query< // `column in ($n, $n+1, ...)`, one bound argument per value. An empty
+    // `vals` emits `1 = 0` rather than `in ()`, which several dialects reject
+    // outright — "matches nothing" is what an empty set of choices means.
+    T,
+  > {
+    let col = this.columnFor(column)
+    if (len(vals) == 0) {
+      this.wheres = append(this.wheres, "1 = 0")
+      return this
+    }
+    let marks = []string(0)
+    for v of vals {
+      this.args = append(this.args, v)
+      marks = append(marks, "$${len(this.args)}")
+    }
+    let list = join(marks, ", ")
+    this.wheres = append(this.wheres, "${col} in (${list})")
+    return this
+  }
+  export whereNull(column: string): Query< // `column is null`. Takes no value — NULL is never a bound parameter.
+    T,
+  > {
+    let col = this.columnFor(column)
+    this.wheres = append(this.wheres, "${col} is null")
+    return this
+  }
+  export orderBy(column: string, dir: Dir): Query<T> {
+    let col = this.columnFor(column)
+    let word = "asc"
+    if (dir == Dir.Desc) {
+      word = "desc"
+    }
+    this.orderBys = append(this.orderBys, "${col} ${word}")
+    return this
+  }
+  export limit(n: int): Query<T> {
+    this.limitN = n
+    this.hasLimit = true
+    return this
+  }
+  export offset(n: int): Query<T> {
+    this.offsetN = n
+    this.hasOffset = true
+    return this
+  }
+  export all(): []T! { // Every matching row, mapped into `T`. Runs the fetch loop inline rather
+    // than calling stdlib/sql/row.bit's own generic `sqlFindMany<T>` — a
+    // compiler limitation this file's header documents: a generic function
+    // called with its OWN class's type parameter, from a method of a class
+    // that was itself constructed through a generic function (`find<T>`
+    // below) rather than a literal composite (`Query<Widget>{...}`), does not
+    // lower (`error[E0092]: cannot lower a call whose target could not be
+    // resolved` — isolated in a two-file, no-pkg/orm repro; `this.mapper(...)`,
+    // an ordinary closure-field call, is unaffected).
+    let rows = this.db.query(this.selectSql(), this.args)?
+    defer rows.close()
+    let out = []T(0)
+    while (rows.next()?) {
+      out = append(out, this.mapper(rows)?)
+    }
+    return out
+  }
+  export one(): Option< // At most one row — `None` for zero, `SqlRowCause.TooManyRows` for more
+    // than one, never the first of several silently. See this file's header
+    // for `boundedSql`, and `all`'s own comment for why this is inlined
+    // rather than calling `sqlFindOne<T>`.
+    T,
+  >! {
+    let rows = this.db.query(this.boundedSql(), this.args)?
+    defer rows.close()
+    if (!rows.next()?) {
+      return Option<T>.None
+    }
+    let v = this.mapper(rows)?
+    if (rows.next()?) {
+      fail SqlRowError{ cause: SqlRowCause.TooManyRows, column: "", expected: "", found: "" }
+    }
+    return Option<T>.Some(v)
+  }
+  export oneOrFail(): T! { // Exactly one row, or an error distinguishing `SqlRowCause.NoRows` from
+    // `TooManyRows`. Inlined for the same reason `all`/`one` are.
+    let rows = this.db.query(this.boundedSql(), this.args)?
+    defer rows.close()
+    if (!rows.next()?) {
+      fail SqlRowError{ cause: SqlRowCause.NoRows, column: "", expected: "", found: "" }
+    }
+    let v = this.mapper(rows)?
+    if (rows.next()?) {
+      fail SqlRowError{ cause: SqlRowCause.TooManyRows, column: "", expected: "", found: "" }
+    }
+    return v
+  }
+  export count(): i64! { // The row count matching every `where`/`whereIn`/`whereNull`/`whereLike`
+    // clause so far — `orderBy`/`limit`/`offset` do not affect a count and are
+    // not applied.
+    let rows = this.db.query("select count(*) as n from ${this.table}${this.whereSql()}", this.args)?
+    defer rows.close()
+    rows.next()?
+    return sqlReqInt(rows, rows.columns(), "n")?
+  }
+  export exists(): bool! { // Whether any row matches — `select 1 ... limit 1`, the cheapest query
+    // that answers yes/no without counting or mapping a row.
+    let sql = "select 1 from ${this.table}${this.whereSql()} limit 1"
+    let rows = this.db.query(sql, this.args)?
+    defer rows.close()
+    return rows.next()?
+  }
+  columnFor( // `field`'s SQL column, validated against `T`'s own descriptor at RUNTIME
+    // — the fallback for a column name the compiler could not check because it
+    // was not a string literal at the call (this file's header, and
+    // compiler/checkormquery.bit's own header). A field that does not exist is
+    // a caller bug, not a recoverable condition, so this panics naming both —
+    // the same category #5053's unloaded-relation panic takes.
+    field: string,
+  ): string {
+    for f of this.fields {
+      if (f.name == field) {
+        return columnName(f)
+      }
+    }
+    panic("pkg/orm: '${field}' is not a field of the class mapped to '${this.table}'")
+  }
+  whereSql(): string {
+    if (len(this.wheres) == 0) {
+      return ""
+    }
+    return " where " + join(this.wheres, " and ")
+  }
+  selectSql(): string { // The SQL every terminal but `one`/`oneOrFail` runs: `select * from
+    // <table>`, `where`, `order by`, `limit`, `offset`, in that order, each
+    // omitted when unset.
+    return this.buildSql(this.hasLimit, this.limitN)
+  }
+  boundedSql(): string { // `selectSql`, but with `hasLimit`/`limitN` forced to at least (LIMIT 2,
+    // has-limit) when the caller set none smaller — see this file's header.
+    if (this.hasLimit && this.limitN <= 2) {
+      return this.buildSql(this.hasLimit, this.limitN)
+    }
+    return this.buildSql(true, 2)
+  }
+  buildSql(hasLimit: bool, limitN: int): string {
+    let sql = "select * from ${this.table}" + this.whereSql()
+    if (len(this.orderBys) != 0) {
+      sql = sql + " order by " + join(this.orderBys, ", ")
+    }
+    if (hasLimit) {
+      sql = sql + " limit ${limitN}"
+    }
+    if (this.hasOffset) {
+      sql = sql + " offset ${this.offsetN}"
+    }
+    return sql
+  }
+}
+
+// The one entry point (`compiler/checkormquery.bit` recognises `<T>` written
+// explicitly here, exactly as `find<T>`/`findOne<T>`/`findOneOrFail<T>`
+// (stdlib/sql/row.bit) are recognised by `compiler/checksqlrow.bit`): starts
+// an empty `Query<T>` against `table`, validating a later literal column
+// against `fields` and mapping every row through `mapper`. See this file's
+// header for why these three are explicit rather than derived.
+export fn find<T>(db: Data, table: string, fields: []FieldDesc, mapper: (Rows) => T!): Query<T> {
+  return Query<T>{
+    db: db, table: table, fields: fields, mapper: mapper, wheres: []string(0), args: []Value(0),
+    orderBys: []string(0), limitN: 0, hasLimit: false, offsetN: 0, hasOffset: false,
+  }
+}
