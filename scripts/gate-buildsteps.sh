@@ -18,6 +18,30 @@
 # own existing style (bucket_scripts() already did this for
 # BUCKET_PRE/BUCKET_POST before this file existed).
 #
+# CAN A GATE DECLARE ITS OWN BUCKET, RATHER THAN HAVE ONE INFERRED? #5396
+# asked this squarely after the fourth hand-addition to the `selfhost` arm
+# below (test-abimembers, test-string-explode/test-string-keepalive,
+# test-gc-retention, test-fieldattrcollision) and a fifth (test-checker-diag,
+# test-classkeyword) landed in the identical shape. DECIDED: NO — and not on
+# cost, on mechanism. Every gate scripts/gate-envscope.sh already discovers
+# (an env-declared BIT_*_TREES=, a harness-source tree scan, a bare argv
+# path) is discoverable BECAUSE it reads a tree, and each discovery is a live
+# PROBE of build_steps_for_bucket() itself, so a stale wiring fails loudly —
+# that is the whole reason those three mechanisms exist and this hand list
+# does not get to skip them. The gates that keep landing here are a
+# different class BY DESIGN: they drive `bit check`/`bit run` directly
+# against one small fixture, deliberately independent of any tree's content,
+# so there is no scan pattern for a mechanical assertion to find — adding a
+# `bucket:` field to their Gate{} literal would not be a discoverable
+# declaration, it would be a second hand-maintained list wearing a different
+# hat, with nothing probing it against BUILD_STEPS the way
+# assert_argvscoped_gates_current() does today. That list would go stale
+# exactly the way this one already has, four times, before anyone noticed.
+# The fix that actually holds is the one this file already applies: hand-add
+# the gate to the bucket that exercises the tree it proves something about,
+# with the reasoning written inline — so the next hand-addition is a decision
+# made in the open, not a habit.
+#
 # Call order, exactly as gate.sh runs this code:
 #   build_steps_for_bucket   # sets BUILD_STEPS from BUCKET
 #   union_testsbit_steps     # folds testsbit_steps into BUILD_STEPS + REASON
@@ -220,7 +244,23 @@ case "${BUCKET}" in
     # `@table` field attribute resolves to one in a sibling file of the same
     # module, and that lives entirely in that file, not in anything this
     # bucket's argv/env scan can see.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-retention test-fieldattrcollision)
+    #
+    # test-checker-diag and test-classkeyword (#5396) are a FOURTH route to
+    # the same gap, and the class-defining one: both drive `bit check`/`bit
+    # run` against BIT_BIN directly rather than scanning a tree at all — argv
+    # names only their own fixture (`_tests_/bit/checkerdiag`,
+    # `_tests_/bit/classkeyword.bit`), and env carries nothing but
+    # std/BIT_BIN/BIT_CHECKER_CASES_DIR. Neither reads compiler/** content the
+    # way test-abimembers' bitSources() walk does, so none of the three
+    # env/argv-declared-scope assertions in scripts/gate-envscope.sh has
+    # anything to discover — see this file's own header for why a bucket
+    # DECLARATION would not fix that either. test-checker-diag proves 191
+    # cases / 766 checks of the checker's rendered diagnostic TEXT against a
+    # `.expected` — exactly what a compiler change perturbs without touching
+    # behaviour — and test-classkeyword proves the retired `class` keyword
+    # spelling still gets rejected; both were dark for every
+    # compiler/**-only diff before this line.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -470,7 +510,17 @@ case "${BUCKET}" in
     # introduced by #5127's own fix, were fixed — adding it here first would
     # have failed this bucket on every pkg/**-only diff for defects the diff
     # never touched. #5151 fixed all 11 and added it here in the same commit.
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs)
+    #
+    # test-fmt-citations (#5396) is the sixth, found by
+    # assert_argvscoped_gates_current() itself, not by inspection like the
+    # five above: _tests_/bit/fmtcitations/fmtcitationsmdsection.bit's
+    # mdSearchRoots() returns `["spec", "runtime", "docs", "pkg"]`, a bare
+    # array-element literal naming pkg/ as a resolution root for bare
+    # `<file>.md §N` section citations (docs/**, pkg/**'s own docs cite each
+    # other), so a pkg/**-only diff that moves or renames a cited doc page
+    # reddened only the pre-push suite. It was already wired into `runtime`
+    # and `stdlib` for the identical `${repo}/<tree>` reason.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations)
     ;;
   spec)
     BUILD_STEPS=(test-spec)
