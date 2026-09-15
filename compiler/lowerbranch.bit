@@ -455,6 +455,59 @@ fn matchSubjectWords(fc: FnCtx, subjectNode: int): []int {
   return bindWordValues(fc.env[slot])
 }
 
+// The two word values a `materializeExplodedEnum` box (lowerlayout.bit) was
+// just built from, or an EMPTY list when `v` is not that shape.
+//
+// WHY THIS EXISTS (#5340). `matchSubjectWords` above answers only for a bare
+// identifier bound to an exploded local. `match (jsonGet(item, "id"))` — the
+// subject is the CALL — never reaches it, and that is the shape
+// `bench/cases/json` is built from. For it, `lowerExprH` goes through
+// `emitResolvedCall` (lowerprim.bit), which rebuilds the callee's two return
+// registers into a box in the CALLER'S CURRENT BLOCK, i.e. the match's own
+// entry block. Taking that box as `ms.handle` puts the payload binder's
+// `field_get` back in the ARM's block, one block away, which is exactly the
+// arrangement block-local store-to-load forwarding can never answer — so the
+// rebuild survived optimization on every such match. Measured: 10 `gc_alloc
+// size=16 ... Option` surviving in json's `main` post-opt, and json's
+// `swept+live` at 9,300,064 against a 5,400,061 baseline.
+//
+// Recovering the words means the match reads what the call already returned
+// in registers and the intermediate box is named by nothing, so ordinary
+// dead-allocation elimination takes it — the box is not rewritten or elided
+// here, nothing downstream depends on store-to-load forwarding having run,
+// and an unrecognised shape keeps today's IR exactly. Same structural,
+// bounds-guarded, can-only-under-report test as `freshStringBoxWords`
+// (lowerexplodestr.bit), which does this for a three-word `string` box, and
+// read off the box's own `field_set`s for the same reason.
+//
+// THE ELIGIBILITY TEST IS LOAD-BEARING, not a precaution: `bindArmPayload`
+// rebuilds through `materializeExplodedEnum`, which indexes
+// `explodedEnumWordTypes(ctx, ty)[1]`. That list is EMPTY for an enum the
+// #5312 predicate refuses, so admitting an ineligible enum here would panic
+// `index out of range` in the rebuild rather than produce wrong code.
+fn freshEnumBoxWords(fc: FnCtx, v: int, subjectTy: int): []int {
+  if (len(explodedEnumWordTypes(fc.c.ctx, subjectTy)) != 2) {
+    return []int(0)
+  }
+  let b = fc.b
+  if (v < 0 || v + 2 >= len(b.instrs)) {
+    return []int(0)
+  }
+  let ga = b.instrs[v]
+  if (ga.op != Op.GcAlloc || ga.ty != subjectTy || ga.ival != enumPayloadBase + 8) {
+    return []int(0)
+  }
+  let fs0 = b.instrs[v + 1]
+  let fs1 = b.instrs[v + 2]
+  if (fs0.op != Op.FieldSet || fs0.lhs != v || fs0.ival != 0) {
+    return []int(0)
+  }
+  if (fs1.op != Op.FieldSet || fs1.lhs != v || fs1.ival != enumPayloadBase) {
+    return []int(0)
+  }
+  return [fs0.rhs, fs1.rhs]
+}
+
 // The match subject resolved exactly once, shared by `lowerMatch` and
 // `lowerMatchExpr` (lowerflow.bit): `tag` is always ready to compare,
 // `handle`/`words` carry whichever of the box or the raw words
@@ -474,6 +527,16 @@ fn lowerMatchSubject(fc: FnCtx, subjectNode: int, subjectTy: int, boxed: bool): 
   let subject = lowerExprH(fc, subjectNode, subjectTy)
   if (fc.failed) {
     return MatchSubject{ tag: 0, handle: 0, words: []int(0) }
+  }
+  // #5340: the subject expression just BUILT its box here (a call result
+  // rebuilt by `emitResolvedCall`, a variant construction matched in place).
+  // Take the words it was built from instead of the box, so the same
+  // same-block cancellation the identifier path above gets applies.
+  if (boxed) {
+    let fresh = freshEnumBoxWords(fc, subject, subjectTy)
+    if (len(fresh) != 0) {
+      return MatchSubject{ tag: fresh[0], handle: 0, words: fresh }
+    }
   }
   return MatchSubject{
     tag: matchTag(fc, subject, subjectTy, boxed),
@@ -506,6 +569,70 @@ fn lowerMatchSubject(fc: FnCtx, subjectNode: int, subjectTy: int, boxed: bool): 
 // same same-block cancellation `ir_tuple_layout.bit` pins for a
 // straight-line tuple access, not a new mechanism. Each arm rebuilds its
 // own; nothing carries across arms.
+// The type binder `i` of a variant arm takes.
+//
+// Still a bare param means the table had no instantiation to read — typically
+// a generic FUNCTION body, whose node types lowering re-derives per
+// instantiation. The checker's binder type is the stronger answer there
+// (#1558). Guarded on TypeParam so it never overrides a concrete answer.
+fn armBinderType(fc: FnCtx, ptypes: []int, binders: []int, i: int): int {
+  let bty = primType(fc.c.ctx, 3)
+  if (i < len(ptypes)) {
+    bty = ptypes[i]
+  }
+  if (fc.c.ctx.types[bty].kind == TypeKind.TypeParam) {
+    let checked = fc.c.declTypes[binders[i]]
+    if (checked != 0 && fc.c.ctx.types[checked].kind != TypeKind.TypeParam) {
+      bty = checked
+    }
+  }
+  return bty
+}
+
+// Binds a one-word payload STRAIGHT FROM the subject's own payload word — no
+// box, no load, nothing for any optimizer pass to cancel. Returns whether it
+// did; `false` leaves the rebuild path below exactly as it was.
+//
+// WHY THE REBUILD IS NOT ENOUGH ON ITS OWN (#5340). #5313 put the `gc_alloc`
+// and its `field_get` in the same block so that store-to-load forwarding
+// plus dead-allocation elimination would cancel them, and measured that
+// working — on `Option<i64>`, where the payload word's type and the binder's
+// type are BOTH `i64`. `forwardOneLoad` (compiler/optstore.bit) forwards only
+// when the stored value's type EQUALS the load's, and for every other shape
+// those two types differ by construction: #5312's word type is the
+// DECLARATION-WIDE conservative union (`error` when any variant's payload
+// word is a pointer, else `i64`), while the arm loads the VARIANT's own
+// payload type. `Option<Json>` stores `error` and loads `Json`; the forward
+// is refused and the box survives. Measured on bench/cases/json: 8 of 10
+// rebuilds in `main` survived optimization for exactly this reason, 3,300,003
+// objects.
+//
+// IDENTICAL TYPES ONLY, and that is not a conservative choice — it is the
+// only sound one. An SSA value's own IR type is read downstream:
+// `explodedArgWords` (lowerexplode.bit) gates a call site's argument
+// explosion on it, so binding a word typed `error` to a binder typed `Json`
+// passes ONE argument where the callee declares two, which
+// `callArityEscapesInFunc` (verify.bit) refuses — observed, not predicted,
+// while writing this. Since #5340 typed the payload word as
+// `enumCommonPayloadType` (lowerlayout.bit) rather than a union stand-in,
+// the two types are equal for every enum the predicate now admits, so this
+// arm fires on all of them and the box is never built at all — no dependence
+// on any optimizer pass, which is what the previous arrangement had.
+fn bindArmPayloadDirect(fc: FnCtx, ms: MatchSubject, enumTy: int, binders: []int, ptypes: []int): bool {
+  if (len(ms.words) != 2 || len(binders) != 1) {
+    return false
+  }
+  let words = explodedEnumWordTypes(fc.c.ctx, enumTy)
+  if (len(words) != 2 || words[1] != armBinderType(fc, ptypes, binders, 0)) {
+    return false
+  }
+  let bty = words[1]
+  let bn = getNode(fc.c.tree, binders[0])
+  declareLocal(fc, fc.c.source[bn.span.start:bn.span.end], ms.words[1], bty)
+  rebindCheckerName(fc, binders[0], bty)
+  return true
+}
+
 fn bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, ms: MatchSubject) {
   if (!boxed) {
     return
@@ -514,29 +641,19 @@ fn bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, ms: MatchSubjec
   if (vp[1] == 0) {
     return
   }
+  let vn = getNode(fc.c.tree, vp[0])
+  let ptypes = variantPayloadTypes(fc.c, enumTy, fc.c.source[vn.span.start:vn.span.end])
+  let binders = kidsOf(fc.c.tree, vp[1])
+  if (bindArmPayloadDirect(fc, ms, enumTy, binders, ptypes)) {
+    return
+  }
   let obj = ms.handle
   if (len(ms.words) != 0) {
     obj = materializeExplodedEnum(fc.c.ctx, fc.b, enumTy, ms.words)
   }
-  let vn = getNode(fc.c.tree, vp[0])
-  let ptypes = variantPayloadTypes(fc.c, enumTy, fc.c.source[vn.span.start:vn.span.end])
-  let binders = kidsOf(fc.c.tree, vp[1])
   let i = 0
   while (i < len(binders)) {
-    let bty = primType(fc.c.ctx, 3)
-    if (i < len(ptypes)) {
-      bty = ptypes[i]
-    }
-    // Still a bare param means the table had no instantiation to read —
-    // typically a generic FUNCTION body, whose node types lowering re-derives
-    // per instantiation. The checker's binder type is the stronger answer there
-    // (#1558). Guarded on TypeParam so it never overrides a concrete answer.
-    if (fc.c.ctx.types[bty].kind == TypeKind.TypeParam) {
-      let checked = fc.c.declTypes[binders[i]]
-      if (checked != 0 && fc.c.ctx.types[checked].kind != TypeKind.TypeParam) {
-        bty = checked
-      }
-    }
+    let bty = armBinderType(fc, ptypes, binders, i)
     let fg = mkInstr(Op.FieldGet, bty)
     fg.lhs = obj
     fg.ival = enumPayloadBase + 8 * i
