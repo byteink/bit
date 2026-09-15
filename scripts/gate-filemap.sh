@@ -283,6 +283,10 @@ gates_for_file() {
     # under the 800-line limit), same shape as _tests_/bit/fmtcitations/*
     # and _tests_/bit/golden/* below.
     _tests_/bit/externarchive/*) printf 'test-extern-archive\n'; return 0 ;;
+    # #5393: a directory module from the start (a fixture/ sibling holding
+    # the two-file same-module repro the harness drives `bit check` against
+    # directly), same shape as _tests_/bit/externarchive/* above.
+    _tests_/bit/fieldattrcollision/*) printf 'test-fieldattrcollision\n'; return 0 ;;
     # #3458 moved this from a single file (_tests_/bit/fmtcitations.bit) to a
     # directory module — its self-tests split into a sibling to stay under the
     # 800-line limit, the same shape as _tests_/bit/benchgate/* above.

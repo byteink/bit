@@ -211,7 +211,16 @@ case "${BUCKET}" in
     # `[sp, top)` scan reading its spilled frame as 941,761 false roots — one
     # commit in each tree could have caused it and no bucket ran anything that
     # reads the counters.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-retention)
+    #
+    # test-fieldattrcollision (#5393) is the same gap by the same third route
+    # as test-abimembers above: its scope is in neither argv (names only its
+    # own fixture, `_tests_/bit/fieldattrcollision`) nor an env entry — what
+    # it proves is that compiler/classfieldattr.bit's field-attribute
+    # diagnostics name the colliding free function's OWN declaration when a
+    # `@table` field attribute resolves to one in a sibling file of the same
+    # module, and that lives entirely in that file, not in anything this
+    # bucket's argv/env scan can see.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-retention test-fieldattrcollision)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
