@@ -2991,10 +2991,12 @@ are not built in and the compiler never implicitly imports them or
 special-cases the module that defines them (`pkg/web`, or any other module
 exporting the same four names) - a file that writes a lowercase tag with
 none of the four in scope gets the ordinary unresolved-name diagnostic,
-exactly as a bare call to an unimported function would. Only the names a
-given file's JSX actually needs are required in scope: a file with no text
-children never needs `text`, exactly as one with no fragments never needs
-`frag`.
+exactly as a bare call to an unimported function would. **The desugaring's
+target names must be in scope at the JSX use site**, the same requirement
+an ordinary call has on its callee - importing them anywhere else in the
+program does not help. Only the names a given file's JSX actually needs are
+required in scope: a file with no text children never needs `text`, exactly
+as one with no fragments never needs `frag`.
 
 A JSX expression's own type is whatever its desugared call returns; there is
 no built-in `Node` type.
