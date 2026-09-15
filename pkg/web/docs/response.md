@@ -12,15 +12,23 @@ import { Ctx, Res } from "web"
 fn showUser(c: Ctx): Res! {
   return c.text("ok").status(200).header("X-Request-Id", "abc-123")
 }
+
+fn showStyles(c: Ctx): Res! {
+  return c.bytes(".btn{color:red}", "text/css; charset=utf-8")
+}
 ```
 
 The common constructors on `Ctx`: `c.json(v)` for anything satisfying
 `Jsonable` (a class carrying `toJson()`, synthesized by `@json`), `c.text(s)`,
-`c.html(n)` for a `Node` tree, `c.status(n)` for an empty body, `c.created(id)`
-and `c.createdUrl(target)` for a `201` with `Location`, `c.noContent()` for a
-`204`, and `c.redirect(target)`. `Res` itself carries `.status(n)`,
-`.header(name, value)`, `.wrap(key)` and `.mapValue(f)` for a middleware that
-wants to reshape a value response on the way out.
+`c.html(n)` for a `Node` tree, `c.bytes(body, contentType)` for a body whose
+type is none of the above - CSS, SVG, a script - taking `contentType`
+verbatim rather than appending a charset the way `text`/`html`/`json` each
+append their own single one, and refusing an empty one (a response with no
+Content-Type is a MIME-sniffing vector), `c.status(n)` for an empty body,
+`c.created(id)` and `c.createdUrl(target)` for a `201` with `Location`,
+`c.noContent()` for a `204`, and `c.redirect(target)`. `Res` itself carries
+`.status(n)`, `.header(name, value)`, `.wrap(key)` and `.mapValue(f)` for a
+middleware that wants to reshape a value response on the way out.
 
 ## The Node tree
 
