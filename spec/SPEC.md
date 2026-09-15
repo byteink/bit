@@ -2847,6 +2847,15 @@ names' full text exactly as a plain tag's closer already is.
 An attribute written without `=` has the value `true`, so `<input disabled />`
 and `<input disabled={true} />` mean the same thing.
 
+**A `{ expression }` attribute value has no JSX-specific type rule** (#5324):
+the desugaring below turns it into an ordinary call argument - `attr`'s own
+`(string, string)` signature on a lowercase tag, the named parameter's own
+declared type on an uppercase (component) tag - typed exactly as any other
+call argument (§12.4), with no coercion. `data-id={n}` for `n: i64` is
+E0041, `expected 'string', found 'i64'`, the same diagnostic a hand-written
+`attr("data-id", n)` call gets; write `data-id="${n}"` (§5.7's
+interpolation) to convert it explicitly.
+
 **A spread attribute** (`<div {...props} />`, #5172) inserts every attribute
 `props` (a `pkg/web` `[]Node`) carries at the position it is written, mixed
 freely with ordinary attributes and children in the same tag: `<div
