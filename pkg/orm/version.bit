@@ -1,0 +1,160 @@
+// pkg/orm/version.bit — @version optimistic locking (#5059, owner decision
+// 2026-09-12): the lost-update case a bare UPDATE can't see.
+//
+//     @table
+//     class Account {
+//       @id id: i64
+//       @version version: i64
+//       balance: decimal
+//     }
+//
+// Alice and Bob both load account 1 at version 5. Alice saves, it becomes
+// 6. Bob saves 80 against the version he read: `WHERE version = 5` matches
+// nothing, Bob is told, reloads, sees Alice's 90. Without this, Bob's write
+// lands and Alice's is gone with nothing logged - on a money table that is
+// how an audit goes missing.
+//
+// `write.bit`'s `updateRow` is the only caller: a `@version` field on
+// `desc.fields` makes it emit
+//
+//     UPDATE accounts SET balance = $1, version = $2
+//      WHERE id = $3 AND version = $4      -- $2 = old + 1, $4 = old
+//
+// (every column, including the version column itself and the primary key -
+// `write.bit`'s own header already establishes "every column" as this
+// package's UPDATE convention; this file does not carve out an exception
+// for the columns the above sketch left out for brevity). 0 rows matched
+// means someone else wrote first.
+//
+// A SEPARATE ERROR TYPE FROM `WriteError` (`write.bit`, #5058), ON PURPOSE.
+// `WriteError{ cause: NoRowsAffected }` means the row is simply gone - the
+// caller's correct response is 404. `StaleWriteError` means the row is
+// still there but someone else changed it since this caller last read it -
+// the correct response is reload and retry. Collapsing the two into one
+// type makes that branch unwritable: a `catch` cannot tell "gone" from
+// "changed" without re-parsing a message string, the same reasoning
+// `errors.bit`'s own header gives for keeping constraint violations out of
+// `WriteCause` too.
+//
+// THE INCREMENT HAPPENS INSIDE THE SAME UPDATE, NEVER A SEPARATE
+// READ-MODIFY-WRITE. `updateRowVersioned` (write.bit) computes `old + 1` in
+// Bit from the version the CALLER already holds (the same `values` map
+// every other column comes from, no extra `SELECT`) and binds it as the
+// `SET version = $n` argument of the very statement whose `WHERE version =
+// $m` checks the old value - one round trip, one statement. The atomicity
+// this closes the race with is the `WHERE`, not a lock: two concurrent
+// UPDATEs racing for the same row can both compute "old + 1" from the same
+// stale old value, but only one's `WHERE version = old` still matches by
+// the time it commits - the loser affects 0 rows and gets `StaleWriteError`
+// instead of silently overwriting the winner.
+//
+// ON SUCCESS THE NEW VERSION COMES BACK THE SAME WAY A GENERATED KEY DOES.
+// `write.bit`'s own `SaveResult.generated` is how an INSERT hands a
+// database-generated id back to the caller's wrapper for it to apply onto
+// the concrete entity (`docs/write.md`'s `savePerson`-shaped pattern, and
+// `write.test.bit`'s own "caller applies RETURNING's id onto the concrete
+// entity" test). A versioned UPDATE reuses the identical channel:
+// `generated[versionField] = Value.Int(old + 1)`, no RETURNING round trip
+// needed since this file already computed the new value itself. The
+// caller's wrapper writes it back exactly like it already writes back a
+// generated id, and a second `save` in the same request reads the right
+// old version.
+//
+// TWO ASYMMETRIES THIS FILE DOES NOT CLOSE, BOTH DOCUMENTED WHERE THEY
+// LIVE, NEITHER FIXED HERE.
+//
+//   - The patch builder (`pkg/orm/patch.bit`, #5060) never loads a row, so
+//     it has no old version to compare against. It refuses to run against a
+//     `@version` table unless the caller names the version field in a
+//     `where(...)` call first (`PatchCause.VersionRequired`,
+//     `refuseIfVersionMissing` in that file) - a silent skip on a money
+//     table is the exact failure this ticket exists to close, so a refusal
+//     is correct there, not a bug to fix here.
+//   - `upsert` (`write.bit`, #5058) cannot version-check by construction:
+//     there is no "which statement ran, INSERT or UPDATE" to gate a compare
+//     on before the database has already decided. Recorded on #5058, not
+//     solved by this file.
+//
+// A THIRD ASYMMETRY, FOUND WHILE BUILDING THIS, FLAGGED NOT FIXED: the
+// patch builder's own `versionFieldOf` (`patch.bit`) picks the FIRST field
+// named `@version` and never checks for a second one, so a class shaped
+// wrong (two `@version` fields) is rejected by `save` (this file) but not
+// by `update<T>(...)`. Both entry points reading a class that should never
+// exist is a smaller gap than the two above; left for a follow-up ticket
+// rather than reworking `patch.bit`'s own landed, tested behaviour here.
+
+// Why a class was rejected as `@version`-shaped wrong - see this file's
+// header.
+export enum VersionCause { MultipleVersionFields }
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `pkg/orm/softdelete.bit`'s `SoftDeleteError` is: a class shaped
+// wrong is a program the caller can still catch and report, not a
+// panic-worthy corrupted invariant.
+export class VersionError {
+  export cause: VersionCause
+  export table: string
+
+  message(): string {
+    return "pkg/orm: the class mapped to '${this.table}' carries more than one '@version' field - exactly one is allowed"
+  }
+}
+
+// Someone else's write landed between this caller's read and this write -
+// see this file's header for why this is never `WriteError`. `oldVersion`
+// is the version this caller read; `newVersion` is the value it tried to
+// write (`oldVersion + 1`) - not necessarily the row's current version,
+// which this caller never re-read.
+export class StaleWriteError {
+  export table: string
+  export key: Value
+  export oldVersion: int
+  export newVersion: int
+
+  message(): string {
+    return "pkg/orm: stale write on the class mapped to '${this.table}' with key ${valueText(this.key)} - tried to write version ${this.newVersion} over ${this.oldVersion}, but another write already changed it; reload and retry"
+  }
+}
+
+// The one field carrying `@version`, or `("", false)` when none does -
+// existence only, the same shape `write.bit`'s own `hasIdAttr` checks and
+// `patch.bit`'s own `versionFieldOf` returns. Fails naming the table when
+// MORE than one field carries it - see this file's header for why that is
+// caught here rather than picking the first and moving on.
+fn versionField(fields: []FieldDesc, table: string): (FieldDesc, bool)! {
+  let found = false
+  let out = FieldDesc{ name: "", typeName: "", attrs: []AttrDesc(0) }
+  for f of fields {
+    if (hasVersionAttr(f)) {
+      if (found) {
+        fail VersionError{ cause: VersionCause.MultipleVersionFields, table: table }
+      }
+      found = true
+      out = f
+    }
+  }
+  return (out, found)
+}
+
+fn hasVersionAttr(f: FieldDesc): bool {
+  for a of f.attrs {
+    if (a.name == "version") {
+      return true
+    }
+  }
+  return false
+}
+
+// `field`'s current value out of `values`, as the plain int `@version`
+// requires - reuses `write.bit`'s own `valueFor` for the missing-entry
+// case, then panics naming the field and what it actually held if it is
+// not `Value.Int`: a `@version` column holding anything else is the
+// caller's own wrapper building the wrong `Value` variant, the same
+// category of caller bug `valueFor`'s own panic already is.
+fn versionValue(values: map<string, Value>, field: FieldDesc, table: string): int {
+  let v = valueFor(values, field, table)
+  match (v) {
+    Int(n) => return n
+    _ => panic("pkg/orm: '@version' field '${field.name}' of the class mapped to '${table}' must be Value.Int, got ${valueText(v)}")
+  }
+}

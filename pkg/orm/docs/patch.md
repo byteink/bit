@@ -106,9 +106,10 @@ for the same reason a bare `update` is.
 ## The sharper edge: a `@version` table with no version supplied
 
 `update` never loads the row it is changing, so it has nothing to compare a
-version against - unlike `save` (see [`#5059`](write.md) for the automatic
-optimistic lock `save` will carry on a `@version` table). On a class that
-carries `@version`, `update` refuses to run unless the `where` chain named
+version against - unlike `save` (see [Optimistic locking](version.md) for
+the automatic optimistic lock `save` carries on a `@version` table). On a
+class that carries `@version`, `update` refuses to run unless the `where`
+chain named
 that field explicitly:
 
 ```bit
