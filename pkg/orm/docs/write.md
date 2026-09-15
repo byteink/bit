@@ -26,6 +26,7 @@ fn personDesc(): TableDesc {
   return TableDesc{
     table: "people",
     fields: Person{ id: 0, name: "", email: "" }.tableDescriptor(),
+    classAttrs: []AttrDesc(0),
   }
 }
 

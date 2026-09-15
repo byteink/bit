@@ -14,3 +14,4 @@
 | [Bulk insert](bulk.md) | `insertAll`: many rows in one statement, chunked at a computed placeholder limit, never one statement per row |
 | [Keyset pagination](keyset.md) | `after`: `WHERE id > $n` instead of `OFFSET`, so a deep page costs what page 1 costs |
 | [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |
+| [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` opt in |
