@@ -1,0 +1,404 @@
+// pkg/orm/write.bit — save, delete and upsert (#5058, owner decision
+// 2026-09-12): "if I have a user instance whether I just create it or it
+// was from a db query, saving it should work" - one `save`, never a
+// `create`/`update` pair, decided by the hidden persisted flag (#5052)
+// rather than the primary key, because a UUID or application-assigned key
+// already has a non-zero value on a brand-new row.
+//
+// WHY THESE THREE ARE NOT GENERIC OVER `T`, UNLIKE `find<T>`. `isPersisted`/
+// `markPersisted`/`tableDescriptor` are ordinary calls on a *concrete*
+// `@table` class - the checker's `isPersistedAccessorOn`
+// (compiler/classtabledesc.bit) only recognises them once the receiver has
+// resolved to an actual struct declaration, so `u.isPersisted()` inside a
+// function generic over an unconstrained `T` is a plain unknown-member
+// `E0057` (confirmed with a throwaway probe against this repo's compiler,
+// same finding `pkg/orm/query.bit`'s own header already documents for a
+// different call shape). `on = "..."` (SPEC §12.11) also needs a named,
+// non-generic callee. So, like `find<T>(db, table, fields, mapper)`, these
+// three take the entity's current column values explicitly rather than
+// reading them off `T` themselves - write a small per-entity wrapper once,
+// the way `people(db)` wraps `find<T>` (`docs/write.md`):
+//
+//     fn saveUser(db: Data, u: User): User! {
+//       let desc = TableDesc{ table: "users", fields: u.tableDescriptor() }
+//       let values = map<string, Value>{ "id": Value.Int(u.id), "email": Value.Text(u.email) }
+//       let result = save(db, desc, values, u.isPersisted())?
+//       u.markPersisted(true)
+//       return u
+//     }
+//
+// `values` IS KEYED BY BIT FIELD NAME, NEVER POSITIONAL. A `[]Value` aligned
+// to `fields` by index would silently corrupt a row the moment the two
+// lists drift out of order, with no error to catch it. `values[f.name]` is
+// checked against `fields` for every column this file touches (`valueFor`
+// below) and panics naming the field and the table if one is missing -
+// the same category `pkg/orm/query.bit`'s own `columnFor` panic is, for the
+// identical reason: a caller bug, not a recoverable condition.
+//
+// SECURITY IS THE SAME STANDARD `compiler/checkormquery.bit` set for
+// `find<T>` (#5057). Every column name this file emits - insert/update
+// targets, the primary key in a `where`, `on`'s conflict target - comes from
+// `columnName(f)` against a `FieldDesc` this module's own caller supplied
+// from `tableDescriptor()`, never a raw string pasted into SQL text. `on`
+// is a Bit FIELD name like every other column-naming parameter in this
+// package (`where`, `orderBy`, ...), translated the same way, and an
+// unknown one panics rather than being silently ignored. Every VALUE is a
+// bound `$n` argument, never concatenated - `insertColumnsAndArgs` and its
+// siblings below build `args` and the SQL text together, one `append` each,
+// so the two can never drift.
+//
+// `@id` MARKS THE PRIMARY KEY - `docs/stdlib/sql.md`'s own words: "`pkg/orm`
+// treats `@id` as a primary key". Composite keys are consciously out of
+// scope here (epic #5050's #5084): `primaryKeyField` below panics naming
+// the table if a class carries more than one `@id` field, rather than
+// picking one and updating or deleting by half a key.
+//
+// UPDATE AND DELETE USE `db.exec`, NEVER `db.query` - `stdlib/sql/sql.bit`'s
+// own header: "`exec` REPORTS AFFECTED ROWS, NEVER A ROW SET", the exact
+// count `save`'s 0-rows check reads. INSERT and Postgres's `upsert` use
+// `db.query(... RETURNING *)` instead, because filling a database-generated
+// key needs the row the database actually wrote back, not just a count.
+//
+// UPDATE WRITES EVERY COLUMN, INCLUDING THE PRIMARY KEY ITSELF (a harmless
+// `id = $1 ... where id = $1`) - the ticket's own wording, and simpler than
+// carving one column out of every `SET` list for no behavioural gain.
+//
+// MYSQL HAS NO `RETURNING`. `upsertMysql`'s branch runs `db.exec` and
+// always answers with an empty `generated` map - documented here rather
+// than hidden, the same way this package flags every other real gap
+// (`pkg/orm/schema.bit`'s own header lists three). Filling a MySQL
+// auto-increment key from `LAST_INSERT_ID()` is unstarted, separate work.
+//
+// TABLE AND FIELDS TRAVEL TOGETHER AS `TableDesc`, NEVER TWO PARAMETERS -
+// every function below needs both or neither, and `bit lint`'s own
+// max-params finding on an earlier draft of `upsert` (six positional
+// parameters) is exactly the "group them into a class" case
+// `spec/LINT.md` names.
+
+// A `@table` class's own name and field list, together - what every
+// function in this file needs to build SQL, and never wants split, so a
+// caller builds it once: `TableDesc{ table: "users", fields:
+// u.tableDescriptor() }`.
+export class TableDesc {
+  export table: string,
+  export fields: []FieldDesc,
+}
+
+// What a successful `save` did, and the row the database wrote back -
+// `generated` is empty for an UPDATE (no `RETURNING` is run) and for a
+// column the driver's response did not carry.
+export class SaveResult {
+  export inserted: bool,
+  export generated: map<string, Value>,
+}
+
+// Which upsert syntax to emit - see this file's header for why `upsert`
+// takes this explicitly rather than reading it off `db`: no dialect
+// abstraction exists yet (`pkg/orm/schema.bit`'s own header names
+// `Dialect` as #5066/#5070, still open). This enum is scoped to write.bit
+// on purpose and should fold into that one once it lands.
+export enum Dialect { Postgres, Mysql }
+
+// Why an UPDATE matched no row: a caller held a stale entity - another
+// request already deleted or never inserted it. Distinct from any error a
+// `Value`/driver problem would raise, so a caller can `catch` this one
+// specifically.
+export enum WriteCause { NoRowsAffected }
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `stdlib/sql/row.bit`'s `SqlRowError` is.
+export class WriteError {
+  export cause: WriteCause
+  export table: string
+  export key: Value
+
+  message(): string {
+    return "pkg/orm: update matched 0 rows in the class mapped to '${this.table}' with key ${valueText(this.key)}"
+  }
+}
+
+// INSERT for a new entity, UPDATE for one already persisted - `persisted`
+// decides, never a value in `values`. See this file's header for why the
+// caller supplies `desc`/`values` rather than this function reading them
+// off an entity.
+export fn save(
+  db: Data,
+  desc: TableDesc,
+  values: map<string, Value>,
+  persisted: bool,
+): SaveResult! {
+  if (!persisted) {
+    return insertRow(db, desc, values)?
+  }
+  return updateRow(db, desc, values)?
+}
+
+// DELETE by primary key. Leaves nothing for the caller to re-check: this
+// file never calls `markPersisted` itself (it cannot - see this file's
+// header), so the caller's own wrapper clears the flag after a successful
+// call, the way `saveUser` above sets it after a successful `save`.
+export fn delete(db: Data, desc: TableDesc, values: map<string, Value>): ()! {
+  let pk = primaryKeyField(desc)
+  let (sqlText, args) = deleteSql(desc, pk, values)
+  db.exec(sqlText, args)?
+}
+
+// `INSERT ... ON CONFLICT (on) DO UPDATE` on Postgres, `INSERT ... ON
+// DUPLICATE KEY UPDATE` on MySQL. Never `save`'s default: it cannot
+// version-check (there is no "which statement ran" to gate a `@version`
+// compare on) and it CAN resurrect a row `delete` cleared, because
+// insert-or-update is exactly what those mean. `on` names a unique or
+// primary-key column; empty (the default) uses the primary key. Returns
+// the row the database wrote back on Postgres; always empty on MySQL, see
+// this file's header.
+export fn upsert(
+  db: Data,
+  desc: TableDesc,
+  values: map<string, Value>,
+  dialect: Dialect,
+  on: string = "",
+): map<string, Value>! {
+  let onField = onFieldOrPrimary(desc, on)
+  if (dialect == Dialect.Postgres) {
+    return upsertPostgres(db, desc, values, onField)?
+  }
+  return upsertMysql(db, desc, values, onField)?
+}
+
+// ---- save's two branches ---------------------------------------------------
+
+fn insertRow(db: Data, desc: TableDesc, values: map<string, Value>): SaveResult! {
+  let (sqlText, args) = insertSql(desc, values)
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  if (!rows.next()?) {
+    fail newError("pkg/orm: insert into '${desc.table}' returned no row from RETURNING")
+  }
+  return SaveResult{ inserted: true, generated: rowByFields(rows, desc.fields) }
+}
+
+fn updateRow(db: Data, desc: TableDesc, values: map<string, Value>): SaveResult! {
+  let pk = primaryKeyField(desc)
+  let (sqlText, args) = updateSql(desc, values, pk)
+  let n = db.exec(sqlText, args)?
+  if (n == 0) {
+    fail WriteError{
+      cause: WriteCause.NoRowsAffected,
+      table: desc.table,
+      key: valueFor(values, pk, desc.table),
+    }
+  }
+  return SaveResult{ inserted: false, generated: map<string, Value>(0) }
+}
+
+// ---- upsert's two dialects --------------------------------------------------
+
+fn upsertPostgres(
+  db: Data,
+  desc: TableDesc,
+  values: map<string, Value>,
+  onField: FieldDesc,
+): map<string, Value>! {
+  let (sqlText, args) = upsertPostgresSql(desc, values, onField)
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  if (!rows.next()?) {
+    fail newError("pkg/orm: upsert into '${desc.table}' returned no row from RETURNING")
+  }
+  return rowByFields(rows, desc.fields)
+}
+
+fn upsertMysql(
+  db: Data,
+  desc: TableDesc,
+  values: map<string, Value>,
+  onField: FieldDesc,
+): map<string, Value>! {
+  let (sqlText, args) = upsertMysqlSql(desc, values, onField)
+  db.exec(sqlText, args)?
+  return map<string, Value>(0)
+}
+
+// ---- SQL text -----------------------------------------------------------
+
+// Every column, its placeholder and its bound argument, in `desc.fields`
+// order - shared by `insertSql` and both upsert dialects, which all start
+// an INSERT the identical way.
+fn insertColumnsAndArgs(
+  desc: TableDesc,
+  values: map<string, Value>,
+): ([]string, []string, []Value) {
+  let cols = []string(0)
+  let marks = []string(0)
+  let args = []Value(0)
+  for f of desc.fields {
+    cols = append(cols, columnName(f))
+    args = append(args, valueFor(values, f, desc.table))
+    marks = append(marks, "$${len(args)}")
+  }
+  return (cols, marks, args)
+}
+
+fn insertSql(desc: TableDesc, values: map<string, Value>): (string, []Value) {
+  let (cols, marks, args) = insertColumnsAndArgs(desc, values)
+  let sqlText = "insert into ${desc.table} (${join(cols, ", ")}) values (${join(marks, ", ")}) returning *"
+  return (sqlText, args)
+}
+
+fn updateSql(desc: TableDesc, values: map<string, Value>, pk: FieldDesc): (string, []Value) {
+  let sets = []string(0)
+  let args = []Value(0)
+  for f of desc.fields {
+    args = append(args, valueFor(values, f, desc.table))
+    sets = append(sets, "${columnName(f)} = $${len(args)}")
+  }
+  args = append(args, valueFor(values, pk, desc.table))
+  let sqlText = "update ${desc.table} set ${join(sets, ", ")} where ${columnName(pk)} = $${len(args)}"
+  return (sqlText, args)
+}
+
+fn deleteSql(desc: TableDesc, pk: FieldDesc, values: map<string, Value>): (string, []Value) {
+  let sqlText = "delete from ${desc.table} where ${columnName(pk)} = $1"
+  return (sqlText, [valueFor(values, pk, desc.table)])
+}
+
+// `col = excluded.col` for every column but the conflict target, which
+// needs no assignment against itself.
+fn upsertPostgresSql(
+  desc: TableDesc,
+  values: map<string, Value>,
+  onField: FieldDesc,
+): (string, []Value) {
+  let (cols, marks, args) = insertColumnsAndArgs(desc, values)
+  let sets = []string(0)
+  for f of desc.fields {
+    if (f.name != onField.name) {
+      let c = columnName(f)
+      sets = append(sets, "${c} = excluded.${c}")
+    }
+  }
+  let sqlText = "insert into ${desc.table} (${join(cols, ", ")}) values (${join(marks, ", ")}) on conflict (${columnName(onField)}) do update set ${join(
+    sets,
+    ", ",
+  )} returning *"
+  return (sqlText, args)
+}
+
+// `col = values(col)` - MySQL's own reference to the row that failed to
+// insert, the same idea `excluded.col` is on Postgres.
+fn upsertMysqlSql(
+  desc: TableDesc,
+  values: map<string, Value>,
+  onField: FieldDesc,
+): (string, []Value) {
+  let (cols, marks, args) = insertColumnsAndArgs(desc, values)
+  let sets = []string(0)
+  for f of desc.fields {
+    if (f.name != onField.name) {
+      let c = columnName(f)
+      sets = append(sets, "${c} = values(${c})")
+    }
+  }
+  let sqlText = "insert into ${desc.table} (${join(cols, ", ")}) values (${join(marks, ", ")}) on duplicate key update ${join(
+    sets,
+    ", ",
+  )}"
+  return (sqlText, args)
+}
+
+// ---- shared lookups -------------------------------------------------------
+
+// `field`'s current value out of the caller-supplied map, or a panic naming
+// the field and the table - see this file's header for why this is a
+// lookup by name rather than a positional list.
+fn valueFor(values: map<string, Value>, field: FieldDesc, table: string): Value {
+  let (v, ok) = values[field.name]
+  if (!ok) {
+    panic("pkg/orm: no value supplied for field '${field.name}' of the class mapped to '${table}'")
+  }
+  return v
+}
+
+// The one field carrying `@id`, or a panic naming the table - for no
+// `@id` at all, or for more than one (a composite key, out of scope here;
+// see this file's header).
+fn primaryKeyField(desc: TableDesc): FieldDesc {
+  let idx = -1
+  let count = 0
+  for (i, f) in desc.fields {
+    if (hasIdAttr(f)) {
+      count = count + 1
+      if (idx < 0) {
+        idx = i
+      }
+    }
+  }
+  if (count == 0) {
+    panic("pkg/orm: no field of the class mapped to '${desc.table}' carries '@id'")
+  }
+  if (count > 1) {
+    panic("pkg/orm: the class mapped to '${desc.table}' carries more than one '@id' field - composite primary keys are not supported yet (#5084)")
+  }
+  return desc.fields[idx]
+}
+
+fn hasIdAttr(f: FieldDesc): bool {
+  for a of f.attrs {
+    if (a.name == "id") {
+      return true
+    }
+  }
+  return false
+}
+
+// `on`'s field, or the primary key when `on` is empty (`upsert`'s own
+// default) - a panic naming both when `on` names no field of `desc.fields`,
+// the same category `columnFor` (pkg/orm/query.bit) panics for.
+fn onFieldOrPrimary(desc: TableDesc, on: string): FieldDesc {
+  if (on == "") {
+    return primaryKeyField(desc)
+  }
+  for f of desc.fields {
+    if (f.name == on) {
+      return f
+    }
+  }
+  panic("pkg/orm: '${on}' is not a field of the class mapped to '${desc.table}'")
+}
+
+// One returned row, read into a map keyed by BIT field name via
+// `columnName`, the same translation every write in this file uses - a
+// column the response did not carry is left out rather than defaulted to
+// `Value.Null`, so a caller can tell "not returned" from "returned NULL".
+fn rowByFields(rows: Rows, fields: []FieldDesc): map<string, Value> {
+  let cols = rows.columns()
+  let out = map<string, Value>(len(fields))
+  for f of fields {
+    let idx = indexOfColumn(cols, columnName(f))
+    if (idx >= 0) {
+      out[f.name] = rows.value(idx)
+    }
+  }
+  return out
+}
+
+fn indexOfColumn(cols: []string, name: string): int {
+  for (i, c) in cols {
+    if (c == name) {
+      return i
+    }
+  }
+  return -1
+}
+
+// A `Value` rendered for an error message - `WriteError.message()`'s own
+// need, kept local since no other file in this package renders one to text.
+fn valueText(v: Value): string {
+  match (v) {
+    Null => return "null"
+    Int(n) => return "${n}"
+    Float(f) => return "${f}"
+    Text(s) => return "'${s}'"
+    Blob(b) => return "<${len(b)} bytes>"
+  }
+}
