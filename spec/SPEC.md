@@ -1258,6 +1258,30 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   missing row. `findOneOrFail<T>` is, distinguishably from every mapping
   failure.
 
+**`pkg/orm`'s find chain - a compile-time check on a literal column name.**
+
+- `pkg/orm/query.bit` declares `find<T>(db, table, fields, mapper):
+  Query<T>`, a chain builder over `where`/`whereIn`/`whereNull`/
+  `whereLike`/`orderBy`/`limit`/`offset`, terminated by `all`/`one`/
+  `oneOrFail`/`count`/`exists`. `where`/`whereIn`/`whereNull`/`whereLike`/
+  `orderBy` take a Bit **field** name, never a SQL column - the same
+  three-namings split §10.5's `@column` already draws.
+- When a `where`/`whereIn`/`whereNull`/`whereLike`/`orderBy` call
+  syntactically chained off a `find<T>(...)` call names a **string
+  literal** column that is not one of `T`'s declared fields, that is
+  **E0163**, naming the field and the class - the check the ticket that
+  added this (#5057) calls "the whole point": a misspelled column caught
+  before the program runs, at no runtime cost. A column reached any other
+  way (held in a variable, chained off a `Query<T>` this syntactic walk
+  cannot trace back to its own `find<T>(...)` root) is not flagged here; it
+  is never silently accepted either - `Query.columnFor` performs the
+  identical existence check at runtime, panicking naming the field and the
+  class.
+- Every value passed to `where`/`whereIn`/`whereLike` is `std/sql`'s own
+  `Value`, bound as a numbered `$n` argument exactly as `Executor.query`
+  takes it (§17's `std/sql` contract) - no value is ever concatenated into
+  the SQL text this package builds.
+
 ### 10.6 Interface Declarations
 
 ```
