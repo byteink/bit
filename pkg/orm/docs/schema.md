@@ -26,8 +26,6 @@ fn peopleTable() {
 this package's. `op` is a `SchemaOp` - read it back with `match`:
 
 ```bit
-import { table } from "orm"
-
 fn describe() {
   let op = table("people", (t) => {
     t.id("id")
@@ -51,7 +49,7 @@ chained onto it - `.unique()`, `.nullable()` - mutates that same column,
 not a copy:
 
 ```bit
-import { ReferentialAction, table } from "orm"
+import { ReferentialAction } from "orm"
 
 fn peopleWithConstraints() {
   table("people", (t) => {
@@ -102,8 +100,6 @@ constraint, or `CREATE INDEX CONCURRENTLY`. `t.raw(...)` - on both `table`'s
 and `alter`'s builder - passes a statement through untouched, per dialect:
 
 ```bit
-import { alter } from "orm"
-
 fn addPartialIndex() {
   alter("people", (t) => {
     t.raw("CREATE INDEX CONCURRENTLY people_active_idx ON people (id) WHERE deleted_at IS NULL")
