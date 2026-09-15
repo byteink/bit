@@ -1,0 +1,243 @@
+// pkg/orm/lock.test.bit — #5083's acceptance, against a fake driver.
+//
+// `lockAdapter` is the "database": `calls` records every statement issued,
+// through either `lockConn` (no open transaction - a `Pool`) or `lockTx`
+// (inside one) - so a test can assert `len(a.calls) == 0` to prove a
+// refusal issued nothing, the same shape `pkg/orm/query.test.bit`'s own
+// `qryAdapter` is for a plain read.
+//
+// `pool`/`Pool`/`Datasource`/`Conn`/`Rows`/`Stmt`/`Tx`/`Value` are imported
+// by ./data.test.bit, this file's sibling in the same module (SPEC §17.1) -
+// a second import here would be E0042. `field` (a plain, non-`@id`
+// `FieldDesc`) is declared in ./naming.test.bit and reused here rather than
+// redeclared, the same way ./write.test.bit's own header explains reusing
+// it. `Widget`/`qryAdapter`/`Account`/`fkAdapter` are already module-level
+// names (./query.test.bit, ./write.test.bit, ./data.test.bit) - this file's
+// own fake and mapped class are named `lock*`/`Job` so neither collides
+// (E0042). `contains` is imported by ./query.test.bit and reused here.
+
+import { hasSuffix } from "std/strings"
+
+class Job { id: i64 }
+
+fn jobMapper(rows: Rows): Job! {
+  let cols = rows.columns()
+  return Job{ id: sqlReqInt(rows, cols, "id")? }
+}
+
+class lockCall { sql: string, args: []Value }
+
+class lockRows {
+  cols: []string
+  data: [][]Value
+  i: int
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.data)
+  }
+  columns(): []string {
+    return this.cols
+  }
+  value(col: int): Value {
+    return this.data[this.i][col]
+  }
+  close() {}
+}
+
+// The fake database: every `query()` call, through either handle.
+class lockAdapter {
+  calls: []lockCall
+  cols: []string
+  rows: [][]Value
+  connect(cfg: Datasource): Conn! {
+    return lockConn{ a: this }
+  }
+}
+
+// One physical connection - no transaction open, so `Pool.begin()` (below)
+// is the only way to reach `lockTx`; a `query()` issued straight through
+// here is exactly the "on a Pool" case `requireTx` refuses.
+class lockConn {
+  a: lockAdapter
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.calls = append(this.a.calls, lockCall{ sql: sqlText, args: params })
+    return lockRows{ cols: this.a.cols, data: this.a.rows, i: -1 }
+  }
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec not supported")
+  }
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+  begin(): Tx! {
+    return lockTx{ a: this.a }
+  }
+  close() {}
+}
+
+// One open transaction. `query()` behaves exactly like `lockConn`'s -
+// `p.tx()` is what the caller's `db` becomes a `Tx` under, never this fake's
+// own bookkeeping - so `requireTx` sees this as "not a Pool" purely from its
+// runtime type, the same assertion `stdlib/sql/tx.bit`'s `enter()` makes.
+class lockTx {
+  a: lockAdapter
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.calls = append(this.a.calls, lockCall{ sql: sqlText, args: params })
+    return lockRows{ cols: this.a.cols, data: this.a.rows, i: -1 }
+  }
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec not supported")
+  }
+  commit(): ()! {}
+  rollback(): ()! {}
+}
+
+fn newLockPool(a: lockAdapter): Pool {
+  let p = pool(a, Datasource{ host: "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+fn lastLockCall(a: lockAdapter): lockCall {
+  return a.calls[len(a.calls) - 1]
+}
+
+fn jobQuery(db: Data): Query<Job> {
+  return find<Job>(db, "jobs", [field("id"), field("state")], jobMapper).where(
+    "state",
+    Value.Text("pending"),
+  )
+}
+
+test "forUpdate() inside a transaction emits a statement ending FOR UPDATE" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  p.tx((db) => {
+    forUpdate<Job>(jobQuery(db), LockOpts{}).oneOrFail()?
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let sql = lastLockCall(a).sql
+  assert(hasSuffix(sql, " for update"), "got: ${sql}")
+}
+
+test "forUpdate(skipLocked = true) emits FOR UPDATE SKIP LOCKED" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  p.tx((db) => {
+    forUpdate<Job>(jobQuery(db), LockOpts{ skipLocked: true }).oneOrFail()?
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let sql = lastLockCall(a).sql
+  assert(hasSuffix(sql, " for update skip locked"), "got: ${sql}")
+}
+
+test "forUpdate(nowait = true) emits FOR UPDATE NOWAIT" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  p.tx((db) => {
+    forUpdate<Job>(jobQuery(db), LockOpts{ nowait: true }).oneOrFail()?
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let sql = lastLockCall(a).sql
+  assert(hasSuffix(sql, " for update nowait"), "got: ${sql}")
+}
+
+// This is the mutation proof: comment out `requireTx(this.inner.db)?`
+// inside `LockedQuery.guard()` (lock.bit) and this test goes red - the
+// query on a bare Pool would then run and return the canned row instead of
+// failing, and `a.calls` would be non-empty.
+test "forUpdate called on a Pool rather than a Tx is refused naming both, with zero statements issued" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  forUpdate<Job>(jobQuery(p), LockOpts{}).oneOrFail() catch e {
+    let (le, ok) = e.(LockError)
+    assert(ok, "a LockError, got '${e.message()}'")
+    assert(le.cause == LockCause.NotInTransaction, "cause must be NotInTransaction")
+    assert(contains(e.message(), "Pool"), "message must name Pool: ${e.message()}")
+    assert(contains(e.message(), "Tx"), "message must name Tx: ${e.message()}")
+    assert(len(a.calls) == 0, "a statement was issued despite the refusal")
+    return
+  }
+  assert(false, "must refuse forUpdate on a Pool")
+}
+
+test "skipLocked and nowait passed together are refused" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  p.tx((db) => {
+    forUpdate<Job>(jobQuery(db), LockOpts{ skipLocked: true, nowait: true }).oneOrFail() catch e {
+      let (le, ok) = e.(LockError)
+      assert(ok, "a LockError, got '${e.message()}'")
+      assert(le.cause == LockCause.ConflictingOptions, "cause must be ConflictingOptions")
+      return
+    }
+    assert(false, "must refuse skipLocked and nowait together")
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+  }
+}
+
+test "the MySQL renderer refuses SKIP LOCKED at 5.7 and accepts it at 8.0" {
+  mysqlLockClause(LockOpts{ skipLocked: true }, MysqlVersion{ major: 5, minor: 7 }) catch e {
+    let (le, ok) = e.(LockError)
+    assert(ok, "a LockError, got '${e.message()}'")
+    assert(le.cause == LockCause.UnsupportedByDialect, "cause must be UnsupportedByDialect")
+    assert(contains(e.message(), "5.7"), "message must name the version: ${e.message()}")
+    let clause = mysqlLockClause(LockOpts{ skipLocked: true }, MysqlVersion{ major: 8, minor: 0 }) catch e2 {
+      assert(false, "must accept at 8.0: ${e2.message()}")
+      return
+    }
+    assert(hasSuffix(clause, "skip locked"), "got: ${clause}")
+    return
+  }
+  assert(false, "must refuse SKIP LOCKED at MySQL 5.7")
+}
+
+test "forUpdate on count() is refused" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  p.tx((db) => {
+    forUpdate<Job>(jobQuery(db), LockOpts{}).count() catch e {
+      let (le, ok) = e.(LockError)
+      assert(ok, "a LockError, got '${e.message()}'")
+      assert(le.cause == LockCause.TerminalNotLockable, "cause must be TerminalNotLockable")
+      return
+    }
+    assert(false, "must refuse forUpdate on count()")
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+  }
+}
+
+test "forUpdate on exists() is refused" {
+  let a = lockAdapter{ cols: ["id"], rows: [[Value.Int(1)]] }
+  let p = newLockPool(a)
+
+  p.tx((db) => {
+    forUpdate<Job>(jobQuery(db), LockOpts{}).exists() catch e {
+      let (le, ok) = e.(LockError)
+      assert(ok, "a LockError, got '${e.message()}'")
+      assert(le.cause == LockCause.TerminalNotLockable, "cause must be TerminalNotLockable")
+      return
+    }
+    assert(false, "must refuse forUpdate on exists()")
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+  }
+}
