@@ -82,6 +82,19 @@ fn explodedWordTypes(ctx: TypeContext, ty: int, explodeStr: bool): []int {
   if (isDecimalPrim(ctx, ty)) {
     return decimalWordTypes(ctx)
   }
+  // #5313: an enum is admitted by KIND — `explodedEnumWordTypes` (lowerlayout.bit) is #5312's own eligibility gate.
+  if (ty != 0 && ctx.types[ty].kind == TypeKind.Enum) {
+    return explodedEnumWordTypes(ctx, ty)
+  }
+  return tupleWordTypes(ctx, ty)
+}
+
+// The `Tuple` case `explodedWordTypes` falls through to once `string`/
+// `decimal`/`Enum` are ruled out: every member must be exactly one 8-byte
+// field, or an empty list keeps the one-word convention. Split out to hold
+// `explodedWordTypes` itself at spec/LINT.md's complexity ceiling — a fourth
+// admitted-by-name/kind arm above already reaches it.
+fn tupleWordTypes(ctx: TypeContext, ty: int): []int {
   if (ty == 0 || ctx.types[ty].kind != TypeKind.Tuple) {
     return []int(0)
   }
@@ -649,150 +662,4 @@ fn emitCallResultWords(ctx: TypeContext, b: IrBuilder, call: int, words: []int):
   // forwarding, and after that nothing but these edges couples the words.
   recordWordKeepAlive(ctx, b, words, out)
   return out
-}
-
-// ===========================================================================
-// Keepalive edges (#4406)
-//
-// THE HAZARD THIS CLOSES, reproduced on `df423d13` before any of it was
-// written. `explodedWordTypes` admits a tuple whose members are each one word,
-// and `*T` (SPEC §11.4) is one word the GC must never follow (`isRefType`,
-// codegen.bit). So `(ptrOf(s) + 1, s)` is an exploded aggregate whose word 0 is
-// an INTERIOR address into `s`'s buffer and whose word 1 is the only thing that
-// roots it. Explosion makes the two independent SSA values with nothing between
-// them, so word 1's live interval ends at its last use — which is nowhere, when
-// the consumer reads only word 0:
-//
-//   %1 = call @mkPair(%0) *i64        word 0, the interior pointer
-//   %2 = call_word %1[1] []i64        word 1, the base, never read again
-//   %3 = call @churn() i64            SAFEPOINT, stack map regs=[]
-//   %4 = field_get %1[0] i64          dereferences the interior pointer
-//
-// Conservative scanning does not save it: `gcOwns` (runtime/gc/gcalloc.bit) is
-// exact base equality, so the interior word roots nothing. Measured: 1234 under
-// the default collector, `0` under `BIT_GC=stress`, exit 0 both times. With the
-// same program built from `ptrOf(s) + 0` — a BASE pointer, everything else
-// identical — stress prints 1234, which is what isolates interior-ness rather
-// than the missing root as the cause.
-//
-// WHERE THE EDGES ARE RECORDED: exactly where the aggregate is taken apart into
-// words, so there is one rule rather than a list of shapes. Every non-traced
-// word is paired with every traced word of the same aggregate. Pairing `len`
-// with `base` as well as `ptr` is deliberate and is the reason there is no
-// "which word is the pointer" test here: the lowerer does not know, and a word
-// that is merely an integer costs the base a slightly longer interval rather
-// than a wrong answer.
-//
-// A `return`'s words are NOT recorded. `explodedRetValues` emits them adjacent
-// to the `ret` that consumes them, so there is no safepoint left in this
-// function for the base to be dead across; the caller's own edges (recorded by
-// `recordCallResultKeepAlive` on the receiving side) carry it from there.
-// ===========================================================================
-
-// Records "value `derived` must not outlive value `base`".
-fn builderKeepAlive(b: IrBuilder, derived: int, base: int) {
-  if (derived == base) {
-    return
-  }
-  b.keepAlive = append(b.keepAlive, derived)
-  b.keepAlive = append(b.keepAlive, base)
-}
-
-// Pairs every non-traced word of one aggregate with every traced word of it.
-// `words` are the per-word TYPES and `ids` the value ids, positionally.
-fn recordWordKeepAlive(ctx: TypeContext, b: IrBuilder, words: []int, ids: []int) {
-  let k = 0
-  while (k < len(words) && k < len(ids)) {
-    if (!isRefType(ctx, words[k])) {
-      let t = 0
-      while (t < len(words) && t < len(ids)) {
-        if (isRefType(ctx, words[t])) {
-          builderKeepAlive(b, ids[k], ids[t])
-        }
-        t = t + 1
-      }
-    }
-    k = k + 1
-  }
-}
-
-// The parameter side: `paramIds` is the FLAT block-0 parameter list
-// `explodeParamTypes` produced, so this walks `paramTypes` with the same cursor
-// that built it and hands each exploded parameter's own run to
-// `recordWordKeepAlive`. `gates.tuples` is `explodesParams`, so an ineligible
-// declaration records nothing — its single handle is its own root.
-//
-// #4423 makes this load-bearing where it was free. A tuple's words are all base
-// pointers, so the edges cost nothing; an exploded `string` PARAMETER arrives
-// as `{ptr, len, base}` where `ptr` is an INTERIOR address into the bytes
-// `base` roots, and `gcOwns` (runtime/gc/gcalloc.bit) is exact base equality.
-// Without an edge from `ptr` to `base`, a callee that reads only `ptr` lets
-// `base`'s interval end at block 0 and the next collection sweeps the bytes
-// under it — a wrong answer at exit 0, which is the shape #4406 measured.
-fn recordParamKeepAlive(
-  ctx: TypeContext, b: IrBuilder, paramTypes: []int, paramIds: []int, gates: ArgExplodeGates,
-) {
-  if (!gates.tuples || !anyExplodedParam(ctx, paramTypes, gates.strings)) {
-    return
-  }
-  let at = 0
-  let i = 0
-  while (i < len(paramTypes)) {
-    let words = explodedWordTypes(ctx, paramTypes[i], gates.strings)
-    if (len(words) == 0) {
-      at = at + 1
-    } else {
-      let ids = []int(0)
-      let k = 0
-      while (k < len(words)) {
-        if (at + k < len(paramIds)) {
-          ids = append(ids, paramIds[at + k])
-        }
-        k = k + 1
-      }
-      recordWordKeepAlive(ctx, b, words, ids)
-      at = at + len(words)
-    }
-    i = i + 1
-  }
-}
-
-// The words of `val`, an aggregate whose per-word types are `words`: one
-// `field_get` at `k * 8` typed as that word. No keepalive edges — see
-// `explodeValueWords` for the form that records them, which is what every
-// caller but the `return` path wants.
-//
-// The offset is `k * 8` rather than a `layoutFields` lookup, and that is exact
-// rather than an assumption for both shapes that reach here: a type
-// `explodedWordTypes` admits has every member an 8-byte field, and a boxed
-// `string` has its `{ptr, len, base}` fixed at 0/8/16 by `runtime/ABI.md` §2.3.
-//
-// ONE decomposer for the tuple and the string sides, for the argument, return
-// and local positions alike. There used to be two identical loops —
-// `explodedWordGet` called in a loop, and `unboxStringWords` — differing only
-// in where the word type came from, and this file carries the receipt for what
-// a second copy costs: #4412 widened one consumer of a shared predicate and not
-// the other, and `take4((1,2,3,4))` printed 1200 at exit 0. The word TYPE now
-// has exactly one source, the `words` list the caller was given.
-fn emitWordReads(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []int {
-  let ids = []int(0)
-  let k = 0
-  while (k < len(words)) {
-    let fg = mkInstr(Op.FieldGet, words[k])
-    fg.lhs = val
-    fg.ival = k * 8
-    ids = append(ids, builderEmit(b, fg))
-    k = k + 1
-  }
-  return ids
-}
-
-// `emitWordReads` plus the keepalive edges pairing every untraced word with
-// every traced one (#4406) — the form every position takes except a `return`,
-// whose words are consumed by the `ret` in the same block (see the banner
-// above).
-fn explodeValueWords(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []int {
-  let ids = emitWordReads(ctx, b, val, words)
-  recordWordKeepAlive(ctx, b, words, ids)
-  return ids
 }
