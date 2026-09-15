@@ -176,6 +176,6 @@ your program calls that one function instead of `find` directly.
 [Naming](naming.md) covers `tableDescriptor()` and how a field name becomes
 the column text `where`/`orderBy` bind against. [Data](data.md) covers the
 `Data` interface every function on this page takes, and why it is not
-`Pool` directly. [Raw SQL and dynamic columns](raw.md) covers `whereRaw`
-and `orderByField` - a SQL fragment this file's builder has no shape for,
-and a column name from outside your own source.
+`Pool` directly. [Raw SQL and dynamic columns](raw.md) covers `whereRaw`,
+`orderByRaw` and `orderByField` - a SQL fragment this file's builder has
+no shape for, and a column name from outside your own source.
