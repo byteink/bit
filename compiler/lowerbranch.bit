@@ -425,6 +425,63 @@ fn tagType(fc: FnCtx, subjectTy: int, boxed: bool): int {
   return subjectTy
 }
 
+// The subject's own [tag, payload] word values (#5312/#5313) when
+// `subjectNode` is a bare identifier bound to an EXPLODED enum local, or an
+// EMPTY list for anything else (a call result, a field access, a C-like
+// enum, an un-exploded boxed enum) — which keeps the box-based path below
+// exactly as it was.
+//
+// WHY THIS MATTERS FOR THE ZERO-ALLOC CLAIM, not just correctness: without
+// it, the match's subject was always materialized once, as a whole box, at
+// the match's own entry block — but a payload binder's `field_get` runs
+// inside the ARM's block, a different one on every arm but one reached with
+// no branch, so the block-local store-to-load forwarding
+// `ir_tuple_layout.bit` relies on can never answer it and dead-allocation
+// elimination can never prove the box dead: it survived optimization on
+// every exploded-enum match. Reading the tag off word 0 directly (no object
+// needed at all for arms binding no payload) and rebuilding a box from the
+// words ONLY inside the one arm that binds one (`bindArmPayload`) puts the
+// `gc_alloc` and its lone `field_get` back in the same block, where the same
+// two passes already cancel it.
+fn matchSubjectWords(fc: FnCtx, subjectNode: int): []int {
+  if (getNode(fc.c.tree, subjectNode).tag != Tag.Ident) {
+    return []int(0)
+  }
+  let n = getNode(fc.c.tree, subjectNode)
+  let slot = envIndex(fc, fc.c.source[n.span.start:n.span.end])
+  if (slot == -1 || !bindIsExploded(fc.env[slot])) {
+    return []int(0)
+  }
+  return bindWordValues(fc.env[slot])
+}
+
+// The match subject resolved exactly once, shared by `lowerMatch` and
+// `lowerMatchExpr` (lowerflow.bit): `tag` is always ready to compare,
+// `handle`/`words` carry whichever of the box or the raw words
+// `matchSubjectWords` picked, so `bindArmPayload` (called once per arm, not
+// here) knows which one to read.
+class MatchSubject {
+  tag: int,
+  handle: int,
+  words: []int,
+}
+
+fn lowerMatchSubject(fc: FnCtx, subjectNode: int, subjectTy: int, boxed: bool): MatchSubject {
+  let words = matchSubjectWords(fc, subjectNode)
+  if (len(words) != 0) {
+    return MatchSubject{ tag: words[0], handle: 0, words: words }
+  }
+  let subject = lowerExprH(fc, subjectNode, subjectTy)
+  if (fc.failed) {
+    return MatchSubject{ tag: 0, handle: 0, words: []int(0) }
+  }
+  return MatchSubject{
+    tag: matchTag(fc, subject, subjectTy, boxed),
+    handle: subject,
+    words: []int(0),
+  }
+}
+
 // Binds a boxed variant arm's payload `V(a, b) =>`: word i of the merged
 // discriminant/payload object (offset `enumPayloadBase + 8*i`, #4018; the base
 // is 8 since #4026) into binder i. No-op for a C-like enum or a no-binder arm.
@@ -439,13 +496,27 @@ fn tagType(fc: FnCtx, subjectTy: int, boxed: bool): int {
 // substituted — local, imported, or a bare inferred variant construction all
 // instantiate through `instantiateNamed` now (#1573), so `ptypes[i]` is
 // concrete here whenever `enumTy` resolved to a real instantiation.
-fn bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: int) {
+// `ms.words` is `lowerMatchSubject`'s [tag, payload], non-empty exactly when
+// the subject arrived as raw words rather than a box (#5313). Then
+// `ms.handle` is 0 (unused) and the box is rebuilt HERE, from the words,
+// instead of reading the one `lowerMatch`/`lowerMatchExpr` would otherwise
+// have built once at the match's own entry block: that `gc_alloc` and this
+// function's own `field_get` are now in the SAME block, so block-local
+// store-to-load forwarding and dead-allocation elimination cancel both — the
+// same same-block cancellation `ir_tuple_layout.bit` pins for a
+// straight-line tuple access, not a new mechanism. Each arm rebuilds its
+// own; nothing carries across arms.
+fn bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, ms: MatchSubject) {
   if (!boxed) {
     return
   }
   let vp = kidsOf(fc.c.tree, kidsOf(fc.c.tree, arm)[0])
   if (vp[1] == 0) {
     return
+  }
+  let obj = ms.handle
+  if (len(ms.words) != 0) {
+    obj = materializeExplodedEnum(fc.c.ctx, fc.b, enumTy, ms.words)
   }
   let vn = getNode(fc.c.tree, vp[0])
   let ptypes = variantPayloadTypes(fc.c, enumTy, fc.c.source[vn.span.start:vn.span.end])
@@ -467,7 +538,7 @@ fn bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: int) {
       }
     }
     let fg = mkInstr(Op.FieldGet, bty)
-    fg.lhs = subject
+    fg.lhs = obj
     fg.ival = enumPayloadBase + 8 * i
     let bn = getNode(fc.c.tree, binders[i])
     let bname = fc.c.source[bn.span.start:bn.span.end]
