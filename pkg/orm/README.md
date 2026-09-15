@@ -27,7 +27,11 @@ marked row from every ordinary read until
 `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` says otherwise, and
 `@version`, optimistic locking: `save` on a table carrying it adds the old
 version to its UPDATE's WHERE and raises `StaleWriteError`, distinct from a
-row-not-found, when another write landed first, and `Query<T>.whereRaw`/
+row-not-found, when another write landed first, `forUpdate`, pessimistic
+row locking on the find chain - `FOR UPDATE` blocks until a row is free,
+`FOR UPDATE SKIP LOCKED` never blocks and returns fewer rows than the query
+matched, and both are refused outside a transaction and on `count()`/
+`exists()`, and `Query<T>.whereRaw`/
 `orderByField`, the one escape hatch for SQL text or a dynamic column
 name the rest of the builder cannot express - values still bind through
 placeholders and a dynamic column is checked against an allowlist, never
@@ -88,6 +92,8 @@ cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
 [`docs/relation.md`](docs/relation.md). Marking a row deleted instead of
 removing it is [`docs/softdelete.md`](docs/softdelete.md). Optimistic
 locking against a lost update is [`docs/version.md`](docs/version.md).
+Locking a row against a concurrent writer with `forUpdate` is
+[`docs/locking.md`](docs/locking.md).
 Writing a reviewed migration file from your entities is
 [`docs/generate.md`](docs/generate.md). Applying that file against a live
 database is [`docs/migrate.md`](docs/migrate.md). Running your own test
