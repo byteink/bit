@@ -1,0 +1,432 @@
+// pkg/orm/softdelete.bit — @softDelete (#5063, owner decision 2026-09-12,
+// "the most dangerous ticket in the wave"): `delete` marks a row instead of
+// removing it, and every read path excludes a marked row unless the caller
+// says otherwise on purpose.
+//
+//     @table @softDelete class User {
+//       @id id: i64
+//       email: string
+//       deletedAt: Option<DateTime>
+//     }
+//
+//     delete(db, userDesc(u), userValues(u))?               // UPDATE ... SET deleted_at = now()
+//     findScoped<User>(db, "users", fields, attrs, mapper)?.all()?        // WHERE deleted_at IS NULL, added silently
+//     findScoped<User>(...)?.withTrashed().all()?            // no filter
+//     findScoped<User>(...)?.onlyTrashed().all()?             // WHERE deleted_at IS NOT NULL
+//     restore(db, userDesc(u), userValues(u))?                // SET deleted_at = NULL
+//     forceDelete(db, userDesc(u), userValues(u))?             // a real DELETE
+//
+// THE DEFAULT FILTER IS THE DANGEROUS DIRECTION, SO IT NEVER LIVES IN
+// `pkg/orm/query.bit`/`patch.bit` THEMSELVES. Those two files' `find<T>`/
+// `update<T>`/`deleteMany<T>` stay exactly what #5057/#5060 shipped —
+// unaware of `@softDelete`, so a table with no such mark is never touched
+// by a stray filter (the OTHER direction this ticket calls out as equally
+// silent and equally wrong). `findScoped<T>`/`updateScoped<T>`/
+// `deleteManyScoped<T>` below are the ONLY entry points that add the
+// filter, driven by `softDeleteColumn` reading the class's own synthesized
+// `tableAttrs()` — the identical descriptor `pkg/orm/naming.bit`'s
+// `tableName` already reads for `@table("...")`. A caller who marks a class
+// `@softDelete` writes the one per-entity wrapper this package already
+// asks for everywhere (`pkg/orm/query.bit`'s own header: "the caller
+// supplies table, fields and mapper once per entity") calling the
+// `*Scoped` entry point instead of the plain one — exactly the choice that
+// wrapper already makes for `table`/`fields`/`mapper`, now also for
+// whether the class is soft-delete.
+//
+// WHY THIS FILE NEVER CHANGES `find<T>`/`update<T>`/`deleteMany<T>`'S OWN
+// SIGNATURE. `compiler/checkormquery.bit` recognises those three calls BY
+// THEIR EXACT SHAPE (`ormFindFuncName`/`ormUpdateFuncName`/
+// `ormDeleteFuncName`, that file's own header) to check a chained
+// string-literal column at compile time (E0163). Adding a parameter to any
+// of them risks breaking that pattern match for every caller in the
+// package, a compiler change this ticket's own files do not touch and does
+// not need to. `findScoped`/`updateScoped`/`deleteManyScoped` are new,
+// separate root calls instead — `compiler/checkormquery.bit` does not walk
+// chains rooted at them, so a literal column mistake through this file
+// falls back to the RUNTIME check `Query.columnFor`/`columnForPatchField`
+// already perform on every call, chained here or not (`pkg/orm/query.bit`'s
+// own header: "never silently concatenated into SQL text either way").
+//
+// COMPOSING WITH A CALLER'S OWN `where` NEVER STRING-CONCATENATES. The
+// automatic predicate is one more entry APPENDED to the same `wheres` LIST
+// `Query<T>`/`Patch<T>`/`DeletePatch<T>` already AND together
+// (`join(wheres, " and ")` — those files' own `whereSql`/`patchWhereSql`),
+// never pasted onto the END of an already-assembled SQL string. Every
+// predicate in that list — a caller's own `where`/`whereIn`/`whereLike` or
+// this file's own `deleted_at is null` — is already a complete, correctly
+// parenthesized clause on its own (`col = $n`, `col in (...)`, `col like
+// $n`), so joining any number of them with `and` can never let one bind to
+// only part of another the way appending text after a caller-built `OR`
+// would (this ticket's own warning). Today neither `Query<T>` nor
+// `Patch<T>`/`DeletePatch<T>` expose an `OR` at all — see `pkg/orm/query.bit`
+// and `pkg/orm/patch.bit`'s own headers — so every existing predicate is
+// already exactly this shape; the list-append design stays correct without
+// change the day one of those files adds an `OR`-capable clause, as long as
+// that clause is added the same way: one self-contained string per entry.
+//
+// FIELD ACCESS ACROSS FILES IN THIS PACKAGE IS ORDINARY, NOT A LOOPHOLE.
+// `pkg/orm` is one MODULE (SPEC §17.1: "a directory of .bit files sharing
+// one declaration namespace"), the same reason `pkg/orm/write.bit` already
+// calls `pkg/orm/naming.bit`'s `columnName` and `pkg/orm/query.test.bit`
+// already calls `pkg/orm/naming.test.bit`'s unexported `field(...)` with no
+// `import` anywhere in either file. This file reads and appends to
+// `Query<T>.wheres`/`Patch<T>.wheres`/`DeletePatch<T>.wheres` (and their
+// sibling fields) the identical way — unexported, module-private, and
+// exactly as visible here as within their own declaring file (SPEC §17.3).
+//
+// `now()`/`null` ARE RAW SQL TEXT, NEVER A BOUND `Value`. `std/sql`'s
+// `Value` enum (`Null`/`Int`/`Float`/`Text`/`Blob`) has no timestamp
+// variant yet, so `deletedAt = now()`/`= null` are written as fixed
+// program text, the same category as this package's own `excluded.col`/
+// `values(col)` upsert syntax (`pkg/orm/write.bit`) — never a caller value,
+// so nothing here is a place external input can reach SQL text unchecked.
+//
+// `with()`'S CHILD QUERY (#5061, landed after this ticket's own first
+// delivery, wired here on rebase) COMPOSES THROUGH THE CALLER'S OWN LOADER
+// WRAPPER, NOT A CHANGE TO `pkg/orm/relation.bit`. `hasMany`/`hasOne`/
+// `belongsTo` (that file) take `childQuery: (Data) => Query<TChild>` as an
+// ordinary closure the caller supplies once per entity, the same
+// `postsLoader()`-shaped wrapper `relation.bit`'s own header already
+// establishes for every relation — so a `@softDelete` child table is the
+// caller's own choice of which function to put in that closure:
+// `findScopedQuery<TChild>` below, instead of `find<TChild>`. Nothing in
+// `relation.bit`'s own `fetchByForeignKey`/`hasMany`/`hasOne`/`belongsTo`
+// needed to change: the loader's own `whereIn(...)` (relation.bit) is one
+// more entry appended to the SAME `wheres` list `findScopedQuery` already
+// pre-filled — this file's own composition guarantee, never a special case
+// for relations.
+
+// The soft-delete column for a class's own `classAttrs`
+// (`tableAttrs()`)/`fields` (`tableDescriptor()`), or `""` when the class
+// carries no `@softDelete` at all — every entry point below treats `""` as
+// "not a soft-delete table, behave exactly as `pkg/orm/query.bit`/
+// `write.bit`/`patch.bit` already do." `@softDelete` present without a
+// declared `deletedAt` field fails naming it — the ticket's own words,
+// "the mark without it is an error naming the field" — never a silent
+// no-op and never a panic: a class shaped wrong is a program the caller
+// can still catch and report, not a corrupted invariant.
+fn softDeleteColumn(classAttrs: []AttrDesc, fields: []FieldDesc, table: string): string! {
+  if (!hasSoftDeleteAttr(classAttrs)) {
+    return ""
+  }
+  for f of fields {
+    if (f.name == "deletedAt") {
+      return columnName(f)
+    }
+  }
+  fail SoftDeleteError{ cause: SoftDeleteCause.MissingDeletedAtField, table: table }
+}
+
+fn hasSoftDeleteAttr(classAttrs: []AttrDesc): bool {
+  for a of classAttrs {
+    if (a.name == "softDelete") {
+      return true
+    }
+  }
+  return false
+}
+
+// Why `@softDelete` was declared without the field it requires.
+export enum SoftDeleteCause { MissingDeletedAtField }
+
+// Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), the same
+// shape `pkg/orm/write.bit`'s `WriteError` and `pkg/orm/patch.bit`'s
+// `PatchError` are.
+export class SoftDeleteError {
+  export cause: SoftDeleteCause
+  export table: string
+
+  message(): string {
+    return "pkg/orm: '@softDelete' on the class mapped to '${this.table}' requires a declared 'deletedAt' field"
+  }
+}
+
+// `update ${table} set ${col} = now() where ${pkCol} = $1` — the one
+// statement both `write.bit`'s `delete` and this file's `SoftDeletePatch`
+// run for a soft-delete table, kept in one place so the two never drift.
+fn softDeleteUpdateSql(table: string, col: string, pkCol: string): string {
+  return "update ${table} set ${col} = now() where ${pkCol} = $1"
+}
+
+// `SET deleted_at = NULL`, undoing a soft delete — the ticket's own
+// `db.restore(u)?`. Same primary-key-only `WHERE` `write.bit`'s own
+// `delete`/`save`'s `UPDATE` use. Calling this on a class that carries no
+// `@softDelete` at all is a caller bug (there is no `deletedAt` to clear),
+// so that case panics naming the table, the same category
+// `pkg/orm/write.bit`'s own `primaryKeyField` panics for a missing `@id`.
+export fn restore(db: Data, desc: TableDesc, values: map<string, Value>): ()! {
+  let pk = primaryKeyField(desc)
+  let col = softDeleteColumn(desc.classAttrs, desc.fields, desc.table)?
+  if (col == "") {
+    panic("pkg/orm: 'restore' called on the class mapped to '${desc.table}', which does not carry '@softDelete'")
+  }
+  let sqlText = "update ${desc.table} set ${col} = null where ${columnName(pk)} = $1"
+  db.exec(sqlText, [valueFor(values, pk, desc.table)])?
+}
+
+// A real `DELETE`, the escape hatch every soft-delete table still needs
+// (this file's header) — the ticket's own greppable `forceDelete`. Reuses
+// `write.bit`'s own `deleteSql` unchanged: the identical statement a
+// non-soft-delete `delete()` already emits, so it works on any table,
+// soft-delete or not.
+export fn forceDelete(db: Data, desc: TableDesc, values: map<string, Value>): ()! {
+  let pk = primaryKeyField(desc)
+  let (sqlText, args) = deleteSql(desc, pk, values)
+  db.exec(sqlText, args)?
+}
+
+// Which rows a `SoftQuery<T>`'s terminal sees: every row but a trashed one
+// (the automatic default), every row regardless (`withTrashed`), or only a
+// trashed one (`onlyTrashed`).
+enum TrashMode { Default, WithTrashed, OnlyTrashed }
+
+// The soft-delete-aware find chain: wraps `pkg/orm/query.bit`'s own
+// `Query<T>` and adds the trash-mode predicate to every one of its five
+// terminals (`all`/`one`/`oneOrFail`/`count`/`exists`) — see this file's
+// header for why the filter lives here and never in `Query<T>` itself.
+// Every builder method below delegates straight to `Query<T>`'s own,
+// unchanged — `Query.columnFor`'s runtime column check still runs on
+// every one of them.
+export class SoftQuery<T> {
+  inner: Query<T>
+  deletedAtCol: string
+  trashMode: TrashMode
+  scopedOnce: bool
+  export where(column: string, val: Value): SoftQuery<T> {
+    this.inner = this.inner.where(column, val)
+    return this
+  }
+  export whereLike(column: string, pattern: Value): SoftQuery<T> {
+    this.inner = this.inner.whereLike(column, pattern)
+    return this
+  }
+  export whereIn(column: string, vals: []Value): SoftQuery<T> {
+    this.inner = this.inner.whereIn(column, vals)
+    return this
+  }
+  export whereNull(column: string): SoftQuery<T> {
+    this.inner = this.inner.whereNull(column)
+    return this
+  }
+  export orderBy(column: string, dir: Dir): SoftQuery<T> {
+    this.inner = this.inner.orderBy(column, dir)
+    return this
+  }
+  export limit(n: int): SoftQuery<T> {
+    this.inner = this.inner.limit(n)
+    return this
+  }
+  export offset(n: int): SoftQuery<T> {
+    this.inner = this.inner.offset(n)
+    return this
+  }
+  export after(val: Value): SoftQuery<T>! { // Keyset pagination (#5072, `pkg/orm/keyset.bit`) composes exactly the
+    // way a caller's own `where` does (this file's header): `after()` appends
+    // ONE MORE self-contained predicate to `inner.wheres`, and the automatic
+    // exclusion is appended after it (or before, if `withTrashed()`/
+    // `onlyTrashed()`/no soft-delete mark leaves nothing to append) at the
+    // terminal - order between the two never matters, both are ANDed.
+    this.inner = this.inner.after(val)?
+    return this
+  }
+  export with(name: string): SoftQuery<T> { // Requests eager loading of a relation registered on the wrapped
+    // `Query<T>` (`pkg/orm/relation.bit`'s `withRelations`) - delegates
+    // straight through, unchanged; a soft-delete PARENT's own `with(...)`
+    // works exactly like a plain `Query<T>`'s. See this file's header for
+    // how a soft-delete CHILD relation composes (`findScopedQuery`).
+    this.inner = this.inner.with(name)
+    return this
+  }
+  export withTrashed(): SoftQuery<T> {
+    this.trashMode = TrashMode.WithTrashed
+    return this
+  }
+  export onlyTrashed(): SoftQuery<T> {
+    this.trashMode = TrashMode.OnlyTrashed
+    return this
+  }
+  export all(): []T! { // Every terminal below calls `this.inner`'s own METHOD DIRECTLY, never
+    // through a value returned by another method on `this` — a generic
+    // instantiation of `Query<T>.all`/`.one`/etc. reached that way (rather
+    // than off the `inner` field itself) fails to reach the linker
+    // (confirmed with a throwaway probe against this repo's compiler: the
+    // identical chain through a field works, the identical chain through an
+    // intermediate method returns "undefined symbol" at link time). Each
+    // terminal therefore calls `this.applyTrashFilter()` — a `()`-returning
+    // method with no `Query<T>` in its own signature — first, then reads
+    // straight off `this.inner`.
+    this.applyTrashFilter()
+    return this.inner.all()?
+  }
+  export one(): Option<T>! {
+    this.applyTrashFilter()
+    return this.inner.one()?
+  }
+  export oneOrFail(): T! {
+    this.applyTrashFilter()
+    return this.inner.oneOrFail()?
+  }
+  export count(): i64! {
+    this.applyTrashFilter()
+    return this.inner.count()?
+  }
+  export exists(): bool! {
+    this.applyTrashFilter()
+    return this.inner.exists()?
+  }
+  applyTrashFilter() { // Appends the trash-mode predicate to `inner.wheres` exactly once — every
+    // terminal above calls this first, so whichever one runs first bakes it
+    // in and a second terminal on the same chain never doubles it.
+    if (!this.scopedOnce) {
+      let pred = this.trashPredicate()
+      if (pred != "") {
+        this.inner.wheres = append(this.inner.wheres, pred)
+      }
+      this.scopedOnce = true
+    }
+  }
+  trashPredicate(): string {
+    if (this.deletedAtCol == "") {
+      return ""
+    }
+    match (this.trashMode) {
+      Default => return "${this.deletedAtCol} is null"
+      OnlyTrashed => return "${this.deletedAtCol} is not null"
+      WithTrashed => return ""
+    }
+  }
+}
+
+// The one entry point for a soft-delete-aware find chain — mirrors
+// `pkg/orm/query.bit`'s own `find<T>` exactly (`db`, `table`, `fields`,
+// `mapper`), plus `classAttrs` (`T{}.tableAttrs()`) to decide whether the
+// class is soft-delete at all. Fails per `softDeleteColumn`'s own
+// contract when `@softDelete` is declared without `deletedAt`.
+export fn findScoped<T>(
+  db: Data,
+  table: string,
+  fields: []FieldDesc,
+  classAttrs: []AttrDesc,
+  mapper: (Rows) => T!,
+): SoftQuery<T>! {
+  let col = softDeleteColumn(classAttrs, fields, table)?
+  return SoftQuery<T>{
+    inner: find<T>(db, table, fields, mapper), deletedAtCol: col, trashMode: TrashMode.Default,
+    scopedOnce: false,
+  }
+}
+
+// The plain `Query<T>` `findScoped<T>` wraps, with the default exclusion
+// already applied and NO `SoftQuery<T>` around it - what a `with()`
+// relation's own `childQuery` closure needs. `pkg/orm/relation.bit`'s
+// `hasMany`/`hasOne`/`belongsTo` all take `childQuery: (Data) =>
+// Query<TChild>`, never `(Data) => SoftQuery<TChild>`, so a relation's
+// child load can only see this shape - the caller's own per-entity loader
+// wrapper (the same `postsLoader()`-shaped function `relation.bit`'s own
+// header documents) calls this instead of `find<T>` when the CHILD table
+// is `@softDelete`, and the exclusion composes with the `whereIn` the
+// relation loader adds afterward the identical way a caller's own `where`
+// does (this file's header) - one more self-contained entry in the same
+// `wheres` list, never string-concatenated.
+//
+// `withTrashed`/`onlyTrashed` have no meaning for a relation's own child
+// query - an eager load always respects the child table's own default
+// scope, the same way `findScoped<T>`'s `Default` trash mode does - so this
+// always applies exactly that one filter, never a wrapper carrying
+// trash-mode state.
+//
+// PANICS, NEVER `!`, ON A `@softDelete` CLASS MISSING `deletedAt`.
+// `childQuery`'s own signature (`pkg/orm/relation.bit`) is not fallible, so
+// there is no `?`/`catch` a `Query<T>!` here could propagate through - the
+// same category `restore`'s own panic (this file, above) already is for a
+// class shaped wrong that a fixed, non-fallible caller signature cannot
+// route an error through.
+export fn findScopedQuery<T>(
+  db: Data,
+  table: string,
+  fields: []FieldDesc,
+  classAttrs: []AttrDesc,
+  mapper: (Rows) => T!,
+): Query<T> {
+  let col = softDeleteColumn(classAttrs, fields, table) catch e {
+    panic("pkg/orm: ${e.message()}")
+  }
+  let q = find<T>(db, table, fields, mapper)
+  if (col != "") {
+    q.wheres = append(q.wheres, "${col} is null")
+  }
+  return q
+}
+
+// The soft-delete-aware bulk UPDATE entry point — mirrors
+// `pkg/orm/patch.bit`'s own `update<T>` plus `classAttrs`. On a
+// soft-delete table the returned `Patch<T>` already excludes a trashed row
+// from its own default `WHERE` ("The patch builder ... also filters, so a
+// bulk update does not silently touch deleted rows" — the ticket's own
+// words); on any other table it is `update<T>`'s own, unchanged. Returns
+// the real `Patch<T>` type — every one of its own methods
+// (`where`/`set`/`run`) works exactly as `pkg/orm/patch.bit` already
+// documents.
+export fn updateScoped<T>(
+  db: Data,
+  table: string,
+  fields: []FieldDesc,
+  classAttrs: []AttrDesc,
+): Patch<T>! {
+  let col = softDeleteColumn(classAttrs, fields, table)?
+  let p = update<T>(db, table, fields)
+  if (col != "") {
+    p.wheres = append(p.wheres, "${col} is null")
+    p.whereFields = append(p.whereFields, "deletedAt")
+  }
+  return p
+}
+
+// Wraps `pkg/orm/patch.bit`'s own `DeletePatch<T>` only to change what
+// `run()` executes on a soft-delete table: `UPDATE ... SET deleted_at =
+// now()`, never a real `DELETE` — the same branch `write.bit`'s own
+// `delete` takes, so a bulk removal through `deleteMany` can never
+// silently hard-delete what the single-row path protects. Every other
+// method delegates straight through to `DeletePatch<T>`, unchanged.
+export class SoftDeletePatch<T> {
+  inner: DeletePatch<T>
+  deletedAtCol: string
+  export where(column: string, val: Value): SoftDeletePatch<T> {
+    this.inner = this.inner.where(column, val)
+    return this
+  }
+  export all(): SoftDeletePatch<T> {
+    this.inner = this.inner.all()
+    return this
+  }
+  export run(): int! {
+    if (this.deletedAtCol == "") {
+      return this.inner.run()?
+    }
+    refuseIfBare(this.inner.table, this.inner.whereFields, this.inner.allFlag)?
+    let sqlText = "update ${this.inner.table} set ${this.deletedAtCol} = now()" +
+      patchWhereSql(this.inner.wheres)
+    return this.inner.db.exec(sqlText, this.inner.args)?
+  }
+}
+
+// The one entry point for a soft-delete-aware bulk DELETE — mirrors
+// `pkg/orm/patch.bit`'s own `deleteMany<T>` plus `classAttrs`. On a
+// soft-delete table this both excludes an already-trashed row from the
+// default `WHERE` and turns `run()` into the same `UPDATE`
+// `write.bit`'s own `delete` emits; on any other table `run()` is
+// `deleteMany<T>`'s own, unchanged real `DELETE`.
+export fn deleteManyScoped<T>(
+  db: Data,
+  table: string,
+  fields: []FieldDesc,
+  classAttrs: []AttrDesc,
+): SoftDeletePatch<T>! {
+  let col = softDeleteColumn(classAttrs, fields, table)?
+  let p = deleteMany<T>(db, table, fields)
+  if (col != "") {
+    p.wheres = append(p.wheres, "${col} is null")
+    p.whereFields = append(p.whereFields, "deletedAt")
+  }
+  return SoftDeletePatch<T>{ inner: p, deletedAtCol: col }
+}
