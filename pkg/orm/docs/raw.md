@@ -1,15 +1,15 @@
 # Raw SQL and dynamic columns
 
 [Query](query.md)'s chain covers `where`/`whereIn`/`whereNull`/
-`whereLike`/`orderBy`, but nothing expresses a window function, a lateral
-join, a CTE, or a Postgres `tsvector` match - SQL your database can run
-that this package's builder has no shape for. And a sortable table
-header handing you a column name at request time has no safe place in the
-chain at all: every method on [Query](query.md) takes a Bit field name,
-checked against the class you mapped, never a string an HTTP request
-picked. `whereRaw` and `orderByField` are the two escape hatches - the
-only place in this package SQL text or a dynamic identifier is allowed to
-reach a query.
+`whereLike`/`orderBy`, but nothing expresses a `case` expression, `NULLS
+LAST`, a window function, a lateral join, a CTE, or a Postgres `tsvector`
+match - SQL your database can run that this package's builder has no
+shape for. And a sortable table header handing you a column name at
+request time has no safe place in the chain at all: every method on
+[Query](query.md) takes a Bit field name, checked against the class you
+mapped, never a string an HTTP request picked. `whereRaw`, `orderByRaw`
+and `orderByField` are the three escape hatches - the only place in this
+package SQL text or a dynamic identifier is allowed to reach a query.
 
 ## whereRaw: a fragment plus its own bound arguments
 
@@ -73,6 +73,29 @@ panics rather than silently running a mismatched query - the fragment is
 code you wrote, so a mismatch is a bug in that code, caught the moment it
 runs rather than producing a query with the wrong argument count.
 
+## orderByRaw: a sort expression with no bound values
+
+```bit
+fn exampleAddressesFirst(db: Data): []Person! {
+  let q = people(db).orderByRaw("case when email like '%@example.com' then 0 else 1 end")
+  return q.orderBy("name", Dir.Asc).all()?
+}
+```
+
+`orderByRaw` is `whereRaw`'s counterpart for the ORDER BY clause - the
+escape hatch for a `case` expression, `NULLS LAST`, an ordinal, or a
+window function's output, none of which `orderBy`/`orderByField` can
+express. `exampleAddressesFirst` sorts `@example.com` addresses first,
+then every row alphabetically by name - `orderByRaw` and `orderBy`
+compose in the order you call them, the same way two `where` calls do.
+
+Unlike `whereRaw`, `orderByRaw` takes **no argument list at all**. ORDER
+BY has no bound-value form - nothing in a query ever supplies a parameter
+for a sort expression - so a fragment containing a placeholder (`$1`,
+`$2`, ...) is refused with a panic rather than silently accepted: the
+placeholder could never be filled, so writing one is always a mistake in
+the fragment itself, not something a caller can trigger with input.
+
 ## orderByField: a column name from outside your program
 
 ```bit
@@ -101,17 +124,17 @@ that tries to sanitise the text instead has been bypassed before.
 
 ## Why raw stays in the name, and orderByField does not
 
-`whereRaw` is the one method in this package that runs SQL text you
-wrote - `raw` stays in its name on purpose, so a security review can find
-every call to it with one grep, the same reason `pkg/web`'s `raw(s)`
-carries the word for unescaped HTML. `orderByField` is not a second raw
-escape hatch: it is the safe alternative to writing one, and naming it as
-though it were unsafe would bury the one name actually worth grepping
-for.
+`whereRaw` and `orderByRaw` are the two methods in this package that run
+SQL text you wrote - `raw` stays in both names on purpose, so a security
+review can find every call to either with one grep, the same reason
+`pkg/web`'s `raw(s)` carries the word for unescaped HTML. `orderByField`
+is not a third raw escape hatch: it is the safe alternative to writing
+one, and naming it as though it were unsafe would bury the two names
+actually worth grepping for.
 
 ## Where to go next
 
-[Query](query.md) covers the rest of the find chain these two extend.
+[Query](query.md) covers the rest of the find chain these three extend.
 [Schema](schema.md)'s own `raw()` is the equivalent escape hatch for DDL -
 a different threat model, since a migration is text a developer authors
 once rather than text a request can shape.
