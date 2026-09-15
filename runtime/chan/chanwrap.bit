@@ -362,13 +362,45 @@ export @symbol("bit_rt_select_alloc") fn rtSelectAlloc(n: int): int {
 // `chanBootBind` yet, which no live path reaches.
 extern fn bit_rt_oom(): i64
 
+// THE RESERVE LOCK (#5228). `reserveTake` (`../gc/mem.bit`) bumps `resBump`
+// with a plain, non-atomic load-modify-store — every other caller (`gcHeapAlloc`
+// via `heapLock`, `idxInsertSpan` via `lockPtr`) already holds a lock across
+// its `reserveGrow` call for exactly that reason. This wrapper did not: two
+// workers calling `chan<T>(n)` at the same instant could both read the same
+// `resBump` and be handed the SAME handle address, and the second
+// `chanRegister` on that shared address made `ch.next == ch` — a cycle
+// `chanScanRegistryRoots` (`./chanreg.bit`) then walked forever with the world
+// stopped. `crLock` (`./chanreg.bit`) is NOT the right lock for this: it
+// guards the registry's head pointer and per-channel buffered-word reads, not
+// the reserve's bump cursor, and taking it here would leave the actual race —
+// two `reserveGrow` calls on the same reserve — completely unserialised.
+//
+// `chanReserveLock` is its own word (SPEC §11.5's `let lockWord: i32 = 0`
+// shape) rather than a slot in the boot-owned `chanReserveDesc` block: this
+// function is NOT `@nosplit` (this file's header), so it can `ptrOf` its own
+// module state directly and does not need the caller-owned-block pattern
+// `chanBootBind` uses for state `@nosplit` code must reach.
+//
+// Held only across the two `reserveGrow` calls, never across `chanInit`/
+// `chanRegister`: once both bumps have happened under the lock, this call's
+// handle and ring addresses are exclusively its own, so nothing past that
+// point needs exclusion. Neither `reserveGrow` nor `bit_rt_map_pages` (the
+// syscall it may take) parks or reaches a safepoint, so this lock cannot be
+// held across one — the same property the transitive scan behind #3761
+// verified for every other lock-taker in the runtime; this call site adds one
+// more that holds no lock across a park, not one that breaks the invariant.
+let chanReserveLock: i32 = 0
+
 export @symbol("bit_rt_chan_make") fn rtChanMake(capacity: int, isRef: bool): int {
   if (chanReserveAddr == 0) {
     return 0
   }
   let res = wordAt(chanReserveAddr)
+  let lock = ptrOf(chanReserveLock)
+  spinAcquire(lock)
   let handle = reserveGrow(res, chanWords * 8)
   if (handle == 0) {
+    spinRelease(lock)
     let _ = bit_rt_oom()
     return 0
   }
@@ -376,10 +408,12 @@ export @symbol("bit_rt_chan_make") fn rtChanMake(capacity: int, isRef: bool): in
   if (capacity > 0) {
     bufAddr = reserveGrow(res, capacity * 8)
     if (bufAddr == 0) {
+      spinRelease(lock)
       let _ = bit_rt_oom()
       return 0
     }
   }
+  spinRelease(lock)
   chanInit(wordAt(handle), bufAddr, capacity, isRef, wordAt(chanSchedAddr))
   if (isRef) {
     chanRegister(wordAt(chanRegAddr), wordAt(handle))
