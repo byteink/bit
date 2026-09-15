@@ -10,3 +10,4 @@
 | [Write](write.md) | `save`, `delete` and `upsert`: INSERT vs UPDATE decided by the persisted flag, never the primary key, and why 0 rows matched is an error |
 | [Patch](patch.md) | `update`/`deleteMany`: writing or removing rows by a `where` clause with no instance loaded, for a single column or a bulk write |
 | [Errors](errors.md) | Turning a driver's constraint-violation error into a typed, catchable cause via `classify`, decided from SQLSTATE, never message text |
+| [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |

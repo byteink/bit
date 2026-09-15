@@ -14,7 +14,10 @@ entity, decided by a hidden flag rather than the primary key, and 0 rows
 matched by an UPDATE is an error rather than a silent no-op, and
 `update`/`deleteMany`, the patch builder for writing or removing rows by a
 `where` clause with no instance loaded - a bare call touching every row is
-refused unless `.all()` says so on purpose.
+refused unless `.all()` says so on purpose, and `hasMany`/`hasOne`/
+`belongsTo` relations with eager loading via `with()`, batched so loading N
+parent rows never issues more than one extra query per relation, never one
+per row.
 
 ## Install
 
@@ -52,6 +55,8 @@ Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is
 [`docs/patch.md`](docs/patch.md). Turning a driver's constraint-violation
 error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
+`hasMany`/`hasOne`/`belongsTo` and eager loading with `with()` is
+[`docs/relation.md`](docs/relation.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
