@@ -201,6 +201,22 @@ whether it succeeds or fails) is hardcoded to Postgres today - `Dialect`
 has no lock/unlock method yet, so a MySQL runner needs that interface
 widened first.
 
+### On MySQL, none of the paragraph above holds yet
+
+Everything above describes the Postgres path. MySQL DDL auto-commits, so
+`Mysql` honestly flags every statement it renders non-transactional - and
+that empties the `BEGIN`/`COMMIT` block, leaving only the `schema_history`
+row inside it. The ledger row therefore commits *before* the first line of
+DDL runs, which is the opposite of the guarantee this section describes: a
+migration that fails partway leaves the ledger claiming it applied
+cleanly, and the next `up` skips it. `up` on MySQL also takes no lock at
+all, because the lock is the Postgres statement above.
+
+This is tracked as #5378 and it is a bug in the seam between the runner
+and the renderer, not in either one alone. Until it is fixed, treat the
+runner as Postgres-only and use `sql <n>` to review and apply MySQL
+migrations by hand.
+
 ## When not to use `down`
 
 Never for a production rollback. See "Local iteration" above - `down`
