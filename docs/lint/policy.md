@@ -396,18 +396,31 @@ code is what a CI gate reads, never `bit build`'s.
 > preceding '.with("${field}")' in this function`
 
 New with #5247 (epic #5050, compiler/lintrelation.bit), the compile-time half
-of #5053's runtime panic on the same misuse - the two are meant to be
+of #5271's runtime panic on the same misuse - the two are meant to be
 recognisable as the same mistake, so their wording agrees on naming the
 class, the field, and the exact `.with("field")` call that is missing.
 Scoped narrowly, on purpose: it only sees a local bound straight from
-`findOneOrFail<T>(...)` (`T` written as an explicit type argument, needing no
-type inference the resolver cannot give it - see the file's own header) and
-only flags a read of that local's relation field, per
-`compiler/classrelationattr.bit`'s compiler-known predicate, later in the
-SAME function and not among the fields a `.with("field")` link already
-chained onto that same binding. Like E0217, there is no legacy debt to
-disposition: `grep -c '^warning\[E0218\]' "$LOG"` against `compiler` and
-`stdlib` is 0 at landing and is expected to stay 0.
+`find<T>(db, table, fields, mapper)` (pkg/orm's real chain builder, #5061 -
+`T` written as an explicit type argument, needing no type inference the
+resolver cannot give it - see the file's own header), optionally chained
+through `Query<T>`'s other non-failable builder methods and `.with("field")`
+links, terminated by `.oneOrFail()`. It flags a read of that local's
+relation field, per `compiler/classrelationattr.bit`'s compiler-known
+predicate, later in the SAME function and not among the fields a
+`.with("field")` link already chained onto that same binding.
+
+**Covers `@hasMany`, `@hasOne` and `@belongsTo` alike.** The predicate this
+rule asks is the field's compiler-known relation attribute, never the
+field's own `[]T`/class-typed shape. This matters most for `@hasOne`/
+`@belongsTo`: #5271's runtime sentinel only encodes "unloaded" for a `[]T`
+(`@hasMany`) field's zero value - a `@hasOne`/`@belongsTo` target is
+class-typed with no zero value that can carry it, so the runtime panic never
+fires for those two kinds (pkg/orm/relation.bit's own header). E0218 is
+their only protection, compile-time or run-time.
+
+Like E0217, there is no legacy debt to disposition:
+`grep -c '^warning\[E0218\]' "$LOG"` against `compiler` and `stdlib` is 0 at
+landing and is expected to stay 0.
 
 **Not added to any default-error escalation.** Severity=1 (warning) through
 `warn`, same as every other rule in this file.
