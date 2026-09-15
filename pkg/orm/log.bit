@@ -1,0 +1,241 @@
+// pkg/orm/log.bit — query logging (#5075): every statement the ORM runs,
+// with bound values redacted by default, a slow-query warning, and a
+// statement counter #5061's N+1 guarantee is checkable against.
+//
+//   let logger = newLogger(sink)     // redacted, 200ms slow threshold
+//   let db = logger.wrap(pool)       // db: Data — a drop-in for the Pool or Tx it wraps
+//   db.query(sqlText, args)?         // logged as "[sql] <ms>ms <sqlText> args=[redacted]"
+//
+// THE ZERO VALUE OF LogValues IS Redacted (this workspace's rule: order an
+// enum so its zero value is what a caller gets when every default mechanism
+// fails at once — `Isolation.Default` in stdlib/sql/tx.bit is the same
+// pattern). `LogOptions{}` — every field left at its Bit zero value, never
+// explicitly touched — therefore redacts. `LogValues.Shown` is the one
+// field a caller sets BY NAME to see a bound value; its own doc comment
+// below states what that costs, so turning it on cannot be an accident of
+// an unset field.
+//
+// A THRESHOLD OF ZERO OR NEGATIVE DISABLES THE SLOW-QUERY WARNING RATHER
+// THAN FIRING ON EVERY QUERY. "warn when elapsed >= threshold" would make 0
+// mean "every statement is slow" the moment a caller left the field
+// unset — exactly what `LogOptions{}` is. Silently turning every query into
+// a warning is a worse surprise than logging none, so <= 0 means off.
+// `defaultOptions()` is the one place 200ms (#5075) is spelled out; a
+// caller who wants the warning opts in by threshold, the same way
+// `LogValues` opts in by variant.
+//
+// THE ROW COUNT NAMES WHAT DURATION ALONE CANNOT. A query slow because it
+// returned 400000 rows and a query slow because it scanned a table for one
+// matching row are different bugs with the same duration — `Logger.wrap`'s
+// `Rows` decorator (`countingRows` below) counts every row the CALLER
+// actually reads and logs it beside the duration once the cursor closes.
+//
+// THE LOGGER CANNOT TURN A WORKING QUERY INTO A FAILED ONE. `LogSink.log`
+// takes no `!` — the same non-fallible one-method shape pkg/web's own
+// `LogSink` (pkg/web/adapter.bit) already uses — so there is no failure
+// path out of a log write for this file to swallow, the same way
+// `pkg/orm/runner.bit`'s `releaseLockBestEffort` swallows ITS best-effort
+// failure by `catch`ing one; here the guarantee is structural instead of a
+// `catch`. Nothing in this file changes a statement's SQL text or
+// arguments, retries it, or turns a driver failure into a success — every
+// wrapper below forwards to `inner` and only observes.
+//
+// A FAILED STATEMENT'S TEXT AND THE DRIVER'S MESSAGE ARE LOGGED SEPARATELY.
+// `logFailure` writes the statement text and the driver's own message as
+// two distinct `sink.log` calls, never one interpolated line joining them —
+// a driver message that echoes a bound value back (a constraint violation
+// naming the offending value, say) must not be reassembled against this
+// statement's own text into the pair a caller never asked to have logged
+// together.
+//
+// NOT IMPORTED FROM pkg/web. Packages are released independently
+// (pkg/README.md); pkg/orm declares its own one-method `LogSink` rather
+// than depending on pkg/web just to log a query — "the same shape" is a
+// contract, not a shared import.
+
+const defaultSlowThresholdMs: int = 200
+const redactedPlaceholder: string = "[redacted]"
+
+// Where a logged line goes. A test sets its own sink and reads the lines
+// back, the same way pkg/web's own `RecordingSink` does — see this file's
+// header for why `log` takes no `!`.
+export interface LogSink {
+  log(line: string),
+}
+
+// Whether a bound value is written to the log line. `Redacted` is variant
+// 0 and must stay variant 0 — see this file's header.
+export enum LogValues {
+  Redacted,
+  // Every bound value, in cleartext, in whatever `LogSink.log` does with a
+  // line — a caller sets this because they have decided that is
+  // acceptable for wherever this sink writes. Costs exactly what its name
+  // says.
+  Shown,
+}
+
+// A logger's configuration. The zero value (`LogOptions{}`) redacts values
+// and disables the slow-query warning — see this file's header for why a
+// zero (or negative) threshold means "off", never "warn on everything".
+// `defaultOptions()` below is the constructor that turns the warning on at
+// #5075's own 200ms.
+export class LogOptions {
+  export values: LogValues,
+  // Milliseconds. <= 0 disables the slow-query warning entirely — there is
+  // no "unconfigured" distinct from "disabled"; a caller who wants the
+  // default calls `defaultOptions()`.
+  export slowThresholdMs: int,
+}
+
+// `LogOptions` with the slow-query warning on at 200ms (#5075's own
+// default). Values still redacted — this does not touch `values`, so it
+// stays at `LogValues`'s zero variant.
+export fn defaultOptions(): LogOptions {
+  return LogOptions{ values: LogValues.Redacted, slowThresholdMs: defaultSlowThresholdMs }
+}
+
+// Every statement issued through a `Logger.wrap`ped `Data`: the sink line
+// and the #5061 statement counter a caller — this package's own tests, or
+// an application checking its own handler — can assert against.
+export class Logger {
+  sink: LogSink
+  options: LogOptions
+  export statementCount: int
+
+  // Wraps `db` so every `query`/`exec` it runs is logged and counted. The
+  // result is itself `Data` — a drop-in anywhere the `Pool` or transaction
+  // handle it wraps is accepted, per pkg/orm/data.bit's own header.
+  export wrap(db: Data): Data {
+    return loggingExecutor{ inner: db, logger: this }
+  }
+}
+
+// `sink`, `defaultOptions()` — the safe, spelled-out-in-the-ticket default:
+// redacted values, a 200ms slow-query warning.
+export fn newLogger(sink: LogSink): Logger {
+  return newLoggerWithOptions(sink, defaultOptions())
+}
+
+// `newLogger`, with `options` given explicitly — the one place a caller
+// reaches for `LogValues.Shown` or a different threshold.
+export fn newLoggerWithOptions(sink: LogSink, options: LogOptions): Logger {
+  return Logger{ sink: sink, options: options, statementCount: 0 }
+}
+
+// The `Data` `Logger.wrap` returns. Forwards every call to `inner`
+// unchanged — see this file's header for why nothing here can turn a
+// working query into a failed one, or a failed one into a working one.
+class loggingExecutor {
+  inner: Data
+  logger: Logger
+
+  query(sqlText: string, params: []Value): Rows! {
+    this.logger.statementCount = this.logger.statementCount + 1
+    let start = monotonic()
+    let rows = this.inner.query(sqlText, params) catch e {
+      logFailure(this.logger, sqlText, e)
+      fail e
+    }
+    return countingRows{ inner: rows, sqlText: sqlText, logger: this.logger, start: start, n: 0 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.logger.statementCount = this.logger.statementCount + 1
+    let start = monotonic()
+    let n = this.inner.exec(sqlText, params) catch e {
+      logFailure(this.logger, sqlText, e)
+      fail e
+    }
+    logStatement(this.logger, sqlText, params, elapsedMs(start), n)
+    return n
+  }
+}
+
+// Wraps the `Rows` a logged `query` returned so the row count a slow-query
+// entry names (this file's header) reflects what the CALLER actually read.
+// Logging happens at `close()`, once iteration is over — never by this
+// file consuming the cursor itself ahead of the caller.
+class countingRows {
+  inner: Rows
+  sqlText: string
+  logger: Logger
+  start: Mono
+  n: int
+
+  next(): bool! {
+    let more = this.inner.next()?
+    if (more) {
+      this.n = this.n + 1
+    }
+    return more
+  }
+
+  columns(): []string {
+    return this.inner.columns()
+  }
+
+  value(col: int): Value {
+    return this.inner.value(col)
+  }
+
+  close() {
+    logStatement(this.logger, this.sqlText, []Value(0), elapsedMs(this.start), this.n)
+    this.inner.close()
+  }
+}
+
+// The one place a statement line is written: the `[sql]` line always, then
+// a separate `[warn]` line when `durationMs` clears the configured
+// threshold (this file's header — <= 0 never fires). `rows` is the
+// returned-row count for a `query`, the affected-row count for an `exec`.
+fn logStatement(logger: Logger, sqlText: string, params: []Value, durationMs: i64, rows: int) {
+  writeLine(
+    logger.sink,
+    "[sql] ${durationMs}ms  ${sqlText}  args=${argsText(logger.options.values, params)}",
+  )
+  if (logger.options.slowThresholdMs > 0 && durationMs >= logger.options.slowThresholdMs) {
+    writeLine(logger.sink, "[warn] slow query ${durationMs}ms rows=${rows}  ${sqlText}")
+  }
+}
+
+// A statement the driver rejected: the SQL text (never a value — SQL text
+// alone is already safe, `pkg/orm/query.bit`'s own header) and the driver's
+// own message, on two lines — see this file's header for why never one.
+fn logFailure(logger: Logger, sqlText: string, e: error) {
+  writeLine(logger.sink, "[sql] error  ${sqlText}")
+  writeLine(logger.sink, "[sql] error detail: ${e.message()}")
+}
+
+fn argsText(values: LogValues, params: []Value): string {
+  if (values == LogValues.Redacted) {
+    return redactedPlaceholder
+  }
+  return valuesText(params)
+}
+
+// `valueText` (a `Value` rendered for a message) is already declared by
+// pkg/orm/write.bit, this module's own sibling — reused, not redeclared
+// (E0042).
+fn valuesText(params: []Value): string {
+  let parts = []string(0)
+  for v of params {
+    parts = append(parts, valueText(v))
+  }
+  return "[" + join(parts, ", ") + "]"
+}
+
+// `line` to `sink`, or to stderr when none is configured — the same
+// nil-sink fallback pkg/web/adapter.bit's own `logLine` uses, and never
+// stdout (this file's header). `log` takes no `!` (this file's header), so
+// there is nothing here to catch.
+fn writeLine(sink: LogSink, line: string) {
+  if (sink == nil) {
+    eprint(line + "\n")
+    return
+  }
+  sink.log(line)
+}
+
+// `elapsedMs` (Mono -> i64 milliseconds since `start`) is already declared
+// by pkg/orm/runner.bit, this module's own sibling — a second declaration
+// here would be E0042; reused as-is.
