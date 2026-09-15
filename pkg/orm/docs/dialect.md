@@ -8,7 +8,7 @@ identity`, a quoted column name, `CREATE INDEX CONCURRENTLY` outside a
 transaction) is the kind of detail that is easy to get right once and wrong
 the second time you write it by hand.
 
-A `SchemaDialect` renders the tree for you, once per engine. `Postgres` is
+A `Dialect` renders the tree for you, once per engine. `Postgres` is
 the first one.
 
 ## The simplest thing that works
@@ -110,14 +110,14 @@ package renders - `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, a plain
 ## Writing dialect-agnostic code
 
 Nothing above needed to know it was talking to `Postgres` specifically -
-every call went through `render`, the one method `SchemaDialect` declares.
-Code that applies a migration can take the interface instead of a concrete
+every call went through `render`, the one method `Dialect` declares. Code
+that applies a migration can take the interface instead of a concrete
 dialect, so it keeps working once a second one (MySQL) exists:
 
 ```bit
-import { SchemaDialect, Statement } from "orm"
+import { Dialect, Statement } from "orm"
 
-fn renderAll(dialect: SchemaDialect, ops: []SchemaOp): []Statement {
+fn renderAll(dialect: Dialect, ops: []SchemaOp): []Statement {
   let all = []Statement(0)
   for op of ops {
     for s of dialect.render(op) {
@@ -130,7 +130,13 @@ fn renderAll(dialect: SchemaDialect, ops: []SchemaOp): []Statement {
 
 Calling `renderAll(Postgres{}, [peopleWithConstraintsOp()])` renders the
 same two statements the earlier example did; nothing here changes when a
-second `SchemaDialect` is added.
+second `Dialect` is added.
+
+`pkg/orm/write.bit`'s `upsert` also takes a "which database" parameter,
+`UpsertDialect` - a plain two-value tag for `ON CONFLICT` vs `ON DUPLICATE
+KEY UPDATE` syntax, not this interface. See [Write](write.md) and
+[`pkg/orm/README.md`](../README.md#dialect-vs-upsertdialect) for why the
+two stay separate types.
 
 ## Sharp edges
 
