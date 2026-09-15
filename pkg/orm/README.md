@@ -14,7 +14,8 @@ entity, decided by a hidden flag rather than the primary key, and 0 rows
 matched by an UPDATE is an error rather than a silent no-op, and
 `update`/`deleteMany`, the patch builder for writing or removing rows by a
 `where` clause with no instance loaded - a bare call touching every row is
-refused unless `.all()` says so on purpose.
+refused unless `.all()` says so on purpose, and `@timestamps`, filling
+`createdAt` on INSERT and `updatedAt` on every write, single or bulk.
 
 ## Install
 
@@ -50,8 +51,10 @@ mapped from a `@table` class's field names - see
 Querying rows through the find chain is [`docs/query.md`](docs/query.md).
 Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is
-[`docs/patch.md`](docs/patch.md). Turning a driver's constraint-violation
-error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
+[`docs/patch.md`](docs/patch.md). Filling `createdAt`/`updatedAt`
+automatically is [`docs/timestamps.md`](docs/timestamps.md). Turning a
+driver's constraint-violation error into a typed, catchable cause is
+[`docs/errors.md`](docs/errors.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
