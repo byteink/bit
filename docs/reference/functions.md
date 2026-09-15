@@ -239,6 +239,65 @@ fn dayKind(day: int): string {
 }
 ```
 
+## Optional parameters
+
+`shortCode` above always draws from the same 36-character alphabet. A test
+that wants to force collisions on a tiny alphabet has to copy the whole
+function just to change one argument every other caller was happy with.
+
+Give the trailing parameter a default instead, so most calls can leave it out.
+The default has to be a literal, written right where the parameter is
+declared - not a reference to some other constant:
+
+```bit
+fn code(n: int, chars: string = "abcdefghijklmnopqrstuvwxyz0123456789"): string {
+  let out = []byte(0)
+  let x = n
+  while (x > 0 || len(out) == 0) {
+    out = append(out, chars[x % len(chars)])
+    x = x / len(chars)
+  }
+  return string(out)
+}
+
+fn main() {
+  println(code(12345))       // default alphabet
+  println(code(12345, "01")) // caller opts into a smaller one
+}
+// 7sj
+// 10011100000011
+```
+
+A method's trailing parameter takes a default exactly the same way - a call
+through `l.describe()` omits it just as `code(12345)` does above:
+
+```bit
+class LinkStats {
+  export url: string
+  export created: i64
+  export hits: int
+
+  export describe(label: string = "link"): string {
+    return "${label}: ${this.url} (hits=${this.hits})"
+  }
+}
+
+fn main() {
+  let l = LinkStats{ url: "https://example.com", created: 0, hits: 3 }
+  println(l.describe())
+  println(l.describe("short URL"))
+}
+// link: https://example.com (hits=3)
+// short URL: https://example.com (hits=3)
+```
+
+A non-literal default is rejected outright, never evaluated once at the call
+site - `chars: string = someFunc()` does not compile. Once one parameter
+carries a default, every parameter after it needs one too: a call short of
+its positional prefix could never reach a required parameter past an optional
+one, so `fn f(a: int = 1, b: int)` is rejected on the declaration itself, not
+on some future call.
+
 ## Sharp edges
 
 A bare expression is only a valid statement when it can have an effect on
