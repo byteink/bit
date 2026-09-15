@@ -1,0 +1,277 @@
+// pkg/orm/testing.test.bit — #5074's acceptance, against a fake driver.
+//
+// `rbkAdapter` is the "database": `committed` holds every row that has
+// durably landed (mirrors `data.test.bit`'s own `fkAdapter`), and `ops`
+// records every `COMMIT`/`ROLLBACK` the fake driver's `Tx` actually saw —
+// what "withRollback issues ROLLBACK and never COMMIT" is read from,
+// exactly as the acceptance asks. `rbkTx` additionally supports `query`
+// (`data.test.bit`'s own fake does not need to), because this file's own
+// acceptance needs to prove a row written earlier in a transaction is
+// visible to a read inside that same transaction.
+//
+// `pool`/`Pool`/`Datasource`/`Conn`/`Rows`/`Stmt`/`Tx`/`Value` are imported
+// by ./data.test.bit, this file's sibling in the same module (SPEC §17.1) —
+// a second import here would be E0042. `hasEntry`/`joined` (membership and
+// a printable form of a `[]string`, for assertion messages) are declared
+// there too and reused here rather than redeclared.
+
+// One row in the fake "test_rows" table: just the email, which is all
+// these tests ever need to tell rows apart.
+class rbkRows {
+  emails: []string
+  i: int
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.emails)
+  }
+
+  columns(): []string {
+    return ["email"]
+  }
+
+  value(col: int): Value {
+    return Value.Text(this.emails[this.i])
+  }
+
+  close() {}
+}
+
+// The fake database: every row that has durably committed, and every
+// COMMIT/ROLLBACK its one transaction handle actually issued, in order.
+class rbkAdapter {
+  committed: []string
+  ops: []string
+
+  connect(cfg: Datasource): Conn! {
+    return rbkConn{ a: this }
+  }
+}
+
+// One physical connection. This file's tests only ever run inside a
+// transaction (`withRollback`'s whole point), so `query`/`exec` outside one
+// are never exercised and simply fail loudly if they ever are.
+class rbkConn {
+  a: rbkAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    fail newError("fake: query outside a transaction not supported")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec outside a transaction not supported")
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    return rbkTx{ a: this.a, pending: []string(0) }
+  }
+
+  close() {}
+}
+
+// One transaction: writes stage into `pending` and only reach
+// `a.committed` on `commit` — discarding `pending` on `rollback` is the
+// rollback, the same shape `data.test.bit`'s `fkTx` already uses. `query`
+// reads both `pending` and `a.committed`, so a row written earlier in this
+// same transaction is visible to a query in it before the transaction ends.
+class rbkTx {
+  a: rbkAdapter
+  pending: []string
+
+  query(sqlText: string, params: []Value): Rows! {
+    let want = textOf(params[0])
+    let matches = []string(0)
+    for e of this.pending {
+      if (e == want) {
+        matches = append(matches, e)
+      }
+    }
+    for e of this.a.committed {
+      if (e == want) {
+        matches = append(matches, e)
+      }
+    }
+    return rbkRows{ emails: matches, i: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.pending = append(this.pending, textOf(params[0]))
+    return 1
+  }
+
+  commit(): ()! {
+    this.a.ops = append(this.a.ops, "COMMIT")
+    for e of this.pending {
+      this.a.committed = append(this.a.committed, e)
+    }
+  }
+
+  rollback(): ()! {
+    this.a.ops = append(this.a.ops, "ROLLBACK")
+    // Discarding `pending` (by never copying it into `a.committed`) IS the
+    // rollback; there is nothing else to undo in this fake.
+  }
+}
+
+fn textOf(v: Value): string {
+  match (v) {
+    Text(s) => return s
+    _ => panic("rbk: fake only carries Value.Text params")
+  }
+}
+
+fn newRbkPool(a: rbkAdapter): Pool {
+  let p = pool(a, Datasource{ host: "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+// How many rows named `email` this transaction can currently see — staged
+// or already committed.
+fn countEmail(db: Data, email: string): int! {
+  let rows = db.query("select email from test_rows where email = $1", [Value.Text(email)])?
+  let n = 0
+  while (rows.next()?) {
+    n = n + 1
+  }
+  rows.close()
+  return n
+}
+
+test "withRollback issues ROLLBACK and never COMMIT when the body succeeds" {
+  let a = rbkAdapter{}
+  let p = newRbkPool(a)
+
+  withRollback(p, (db) => {
+    db.exec("insert into test_rows (email) values ($1)", [Value.Text("ok@example.test")])?
+  }) catch e {
+    assert(false, "a successful body must not fail withRollback: ${e.message()}")
+    return
+  }
+
+  assert(hasEntry(a.ops, "ROLLBACK"), "withRollback never rolled back: ${joined(a.ops)}")
+  assert(
+    !hasEntry(a.ops, "COMMIT"),
+    "withRollback committed on a successful body: ${joined(a.ops)}",
+  )
+}
+
+test "withRollback rolls back and propagates the body's error when the body fails" {
+  let a = rbkAdapter{}
+  let p = newRbkPool(a)
+
+  withRollback(p, (db) => {
+    db.exec("insert into test_rows (email) values ($1)", [Value.Text("fails@example.test")])?
+    fail newError("pkg/orm: testing: deliberate body failure")
+  }) catch e {
+    assert(
+      contains(e.message(), "deliberate body failure"),
+      "withRollback must propagate the body's own error unchanged, got: ${e.message()}",
+    )
+    assert(hasEntry(a.ops, "ROLLBACK"), "a failing body must still roll back: ${joined(a.ops)}")
+    assert(!hasEntry(a.ops, "COMMIT"), "a failing body must never commit: ${joined(a.ops)}")
+    return
+  }
+  assert(false, "withRollback must propagate the body's error, but reported success")
+}
+
+test "a row written inside the closure is visible to a query inside the same closure" {
+  let a = rbkAdapter{}
+  let p = newRbkPool(a)
+
+  withRollback(p, (db) => {
+    db.exec("insert into test_rows (email) values ($1)", [Value.Text("visible@example.test")])?
+    let n = countEmail(db, "visible@example.test")?
+    assert(
+      n == 1,
+      "a row written earlier in the same closure must be visible to a query in it, got ${n}",
+    )
+  }) catch e {
+    assert(false, "withRollback must not fail: ${e.message()}")
+    return
+  }
+}
+
+// The positive control: this is the one test that fails if `withRollback`
+// stops rolling back (this file's mutation proof flips the body/marker
+// order so the transaction commits instead — see the ticket comment).
+test "two successive withRollback calls each start with zero rows" {
+  let a = rbkAdapter{}
+  let p = newRbkPool(a)
+
+  withRollback(p, (db) => {
+    let n = countEmail(db, "leaks@example.test")?
+    assert(n == 0, "the first withRollback call must start with zero rows, got ${n}")
+    db.exec("insert into test_rows (email) values ($1)", [Value.Text("leaks@example.test")])?
+  }) catch e {
+    assert(false, "withRollback must not fail: ${e.message()}")
+    return
+  }
+
+  withRollback(p, (db) => {
+    let n = countEmail(db, "leaks@example.test")?
+    assert(
+      n == 0,
+      "a second withRollback call must start with zero rows too - nothing may leak from the first, got ${n}",
+    )
+  }) catch e {
+    assert(false, "withRollback must not fail: ${e.message()}")
+    return
+  }
+}
+
+// The entity `make`/`create` build in the tests below. Not `@table` - these
+// tests never touch SQL generation, only this file's own counter and
+// insert-vs-no-insert behaviour.
+class User {
+  email: string,
+  name: string,
+}
+
+fn userSeed(n: i64): User {
+  return User{ email: "user${n}@example.test", name: "User ${n}" }
+}
+
+test "make<User>() called twice produces two distinct deterministic emails, reproducible on a re-run" {
+  let seq = Seq{}
+  let u1 = make<User>(seq, userSeed)
+  let u2 = make<User>(seq, userSeed)
+  assert(u1.email != u2.email, "two make<User>() calls in one test must not share an email")
+  assert(u1.email == "user1@example.test", "the first call must be deterministic, got ${u1.email}")
+  assert(u2.email == "user2@example.test", "the second call must be deterministic, got ${u2.email}")
+
+  // A fresh `Seq{}` is what a re-run of this test starts from (this file's
+  // header) - reproducing it here is the re-run.
+  let rerun = Seq{}
+  let r1 = make<User>(rerun, userSeed)
+  let r2 = make<User>(rerun, userSeed)
+  assert(r1.email == u1.email, "a re-run must reproduce the first email, got ${r1.email}")
+  assert(r2.email == u2.email, "a re-run must reproduce the second email, got ${r2.email}")
+}
+
+test "make does not issue an INSERT while create does" {
+  let seq = Seq{}
+  let saved: []string = []string(0)
+
+  let m = make<User>(seq, userSeed)
+  assert(len(saved) == 0, "make must never save, got ${len(saved)} row(s)")
+
+  let c = create<User>(seq, userSeed, (u) => {
+    saved = append(saved, u.email)
+    return u
+  }) catch e {
+    assert(false, "create must not fail: ${e.message()}")
+    return
+  }
+  assert(len(saved) == 1, "create must save exactly once, got ${len(saved)}")
+  assert(saved[0] == c.email, "create must save the row it built, got ${saved[0]} vs ${c.email}")
+  assert(
+    m.email != c.email,
+    "make's and create's rows must come from the same counter, never colliding",
+  )
+}
