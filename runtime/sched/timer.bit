@@ -183,6 +183,56 @@ export @nosplit @symbol("bit_rt_port_sched_timer_push") fn schedTimerPush(s: *i6
   spinRelease(lockOf(s, scTimerLock))
 }
 
+// Retract `task` from the sleeping list before its deadline (#5433). This is
+// the timer-queue half of the retraction pair `pollUnregister` (#5430) is the
+// poll-side half of: a caller that armed BOTH a readiness registration and a
+// timer for the SAME task, and whose readiness side just won the race, must
+// remove the still-linked timer entry before the task can go on to finish and
+// be freed — otherwise a later `schedTimerExpire` walks into a `Task` this
+// call no longer owns. See `../../net/darwin/tcp.bit`'s deadline-bounded
+// section for the consumer.
+//
+// Returns true when `task` was still linked and is now unlinked. False means
+// it was not found — either `schedTimerExpire`'s own `timerPartition` already
+// pulled it off (the timer won the race instead), or it was never pushed.
+// Either reading is safe for the caller: "not found" means there is nothing
+// left on this list for this task, which is exactly the postcondition a
+// caller that found `true` establishes here directly.
+//
+// Bounded by `schedMaxRegistered` (Power of 10), the same walk bound
+// `timerPartition`/`schedTimerCount` use, under the same lock those take —
+// mutual exclusion with `timerPartition` is what makes "found here" and
+// "already pulled by a concurrent expire pass" the only two outcomes; there
+// is no window in which both are examining the list at once.
+export @nosplit @symbol("bit_rt_port_sched_timer_cancel") fn schedTimerCancel(
+  s: *i64,
+  task: int,
+): bool {
+  spinAcquire(lockOf(s, scTimerLock))
+  let prev = 0
+  let it = *(s + scTimerHead)
+  let n = 0
+  let found = false
+  while (it != 0 && n < schedMaxRegistered) {
+    n = n + 1
+    if (it == task) {
+      let next = *(taskAt(it) + taskTimerNext)
+      if (prev == 0) {
+        *(s + scTimerHead) = next
+      } else {
+        *(taskAt(prev) + taskTimerNext) = next
+      }
+      found = true
+      it = 0
+    } else {
+      prev = it
+      it = *(taskAt(it) + taskTimerNext)
+    }
+  }
+  spinRelease(lockOf(s, scTimerLock))
+  return found
+}
+
 // ---------------------------------------------------------------------------
 // The next known deadline, and what it is for (#3911)
 // ---------------------------------------------------------------------------
@@ -317,6 +367,31 @@ export @nosplit @symbol("bit_rt_port_sched_park_bound_ns") fn schedParkBoundNs(
   return due
 }
 
+// Whether a task `schedUnpark` just failed to wake is still owed a wake from
+// THIS list, as opposed to resolved by something else entirely (#5433) — see
+// `schedTimerExpire`'s own comment for the full state-machine argument.
+// `taskParked` is included and is the case that matters most: `schedUnpark`'s
+// CAS reads `taskParking` and fails, then the worker publishes `taskParked`
+// (`workerrun.bit`'s `schedWorkerStep`, case 1) before this load runs — two
+// reads of the same word at different moments, no lock held across them. A
+// parked task is always safe to re-push (the next pass CASes it awake, the
+// pre-existing behaviour `schedTimerPush`'s own header describes), so
+// widening the window this far costs nothing. `taskWakePending` is EXCLUDED
+// deliberately, not by omission: once a waker sets it (case 2, same switch)
+// the task's only next transition is `taskWakePending -> taskRunnable`
+// (requeued, never back to `taskParked`), so it is exactly as resolved as
+// `taskRunnable`/`taskDone` and re-pushing it would be the same
+// use-after-free `schedTimerCancel` above exists to prevent.
+//
+// Split out so `schedTimerExpire` stays under E0204's complexity ceiling, the
+// same reason `pollDrainSkippable` (`./darwin/poll.bit`) is its own function.
+export @nosplit @symbol("bit_rt_port_sched_timer_still_pending") fn schedTimerStillPending(
+  t: *i64,
+): bool {
+  let state = atomicLoad(t + taskState)
+  return state == taskRunning || state == taskParking || state == taskParked
+}
+
 // Wake every sleeper whose deadline has passed. Returns how many actually woke.
 //
 // `runtime/sched/`'s `expire`, including its two-list partition and its rule that the
@@ -333,6 +408,25 @@ export @nosplit @symbol("bit_rt_port_sched_park_bound_ns") fn schedParkBoundNs(
 // Both walks are bounded by `schedMaxRegistered` (Power of 10) — the same
 // runaway backstop the registry walk uses, for the same reason: a corrupted link
 // must terminate the loop rather than hang the worker.
+//
+// THE RE-PUSH IS GUARDED BY `schedTimerStillPending`, NOT UNCONDITIONAL
+// (#5433). Before a caller could race a readiness registration against this
+// same timer entry, `taskRunning` (plain `schedSleepUntil`, unarmed),
+// `taskParking` (armed via `schedParkArm`) and `taskParked` itself (the CAS
+// above can fail against a genuinely parked task too — see
+// `schedTimerStillPending`'s own comment for the exact interleaving) were the
+// ONLY states this task could ever be in here — nothing else was able to
+// touch it between `timerPartition` pulling it into `due` and this loop
+// reaching it, so "CAS failed" and "still owed a wake from this list" were
+// the same fact. That stopped being true the moment a poll registration can
+// ALSO resolve this task (`schedPollUnpark`, `../net/*/sock.bit`'s
+// readiness-vs-timer race): if poll already won, the state here is
+// `taskRunnable`, `taskWakePending` or `taskDone` — none of which this task
+// ever returns to `taskParked` from — and blindly re-pushing would hand this
+// list a `task` address the winner's worker may already be running to
+// completion and freeing — exactly the use-after-free `schedTimerCancel`
+// above exists to prevent on the other side of the same race.
+// `schedTimerStillPending` is what tells the two cases apart.
 export @nosplit @symbol("bit_rt_port_sched_timer_expire") fn schedTimerExpire(
   s: *i64,
   now: int,
@@ -347,7 +441,7 @@ export @nosplit @symbol("bit_rt_port_sched_timer_expire") fn schedTimerExpire(
     *(t + taskTimerNext) = 0
     if (schedUnpark(s, due)) {
       woken = woken + 1
-    } else {
+    } else if (schedTimerStillPending(t)) {
       // Due, but its context is not saved yet. Put it back and retry next pass.
       schedTimerPush(s, due)
     }

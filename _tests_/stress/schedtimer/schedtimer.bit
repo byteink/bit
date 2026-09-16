@@ -16,9 +16,11 @@
 
 import { schedInit, schedWorkerAt, schedWorkerRun } from "../../../runtime/sched"
 import { schedTimerPush, schedTimerExpire, schedTimerCount, schedSleepUntil } from "../../../runtime/sched"
+import { schedTimerCancel, schedTimerStillPending } from "../../../runtime/sched"
 import { schedTaskInit, schedRegister, schedSpawn, schedShutdown, schedTaskExit, taskWords } from "../../../runtime/sched"
 import { schedStackAligned, schedStackBytes, taskAt, gqPop } from "../../../runtime/sched"
-import { taskState, taskDeadline, taskParked, taskRunning, scGlobal, workerWords } from "../../../runtime/sched"
+import { taskState, taskDeadline, taskParked, taskParking, taskRunnable, taskRunning } from "../../../runtime/sched"
+import { taskWakePending, taskDone, scGlobal } from "../../../runtime/sched"
 
 // One worker: the timer queue is scheduler-wide, not per-worker, so a second
 // worker would add an OS thread without adding a property.
@@ -37,6 +39,16 @@ let tC: [taskWords]i64
 // A fourth for the not-yet-parked retention property, which needs a task that
 // is on the timer list while still `taskRunning`.
 let tD: [taskWords]i64
+
+// A fifth and sixth for the retraction properties below (#5433): a task
+// cancelled from the list before it is due, and a task the OTHER side of a
+// race already resolved before `expire` ever saw it due.
+let tE: [taskWords]i64
+let tF: [taskWords]i64
+
+// A seventh, bare and never linked onto any list, for `schedTimerStillPending`'s
+// own state-by-state contract below — it only ever reads `taskState`.
+let tG: [taskWords]i64
 
 // The end-to-end task: this one really runs, so it really needs a stack.
 // 256KiB usable inside a 512KiB region, so a 256KiB-aligned base exists whatever
@@ -165,6 +177,64 @@ fn runLoopProps(): (bool, bool, bool) {
   return (aligned, woke, clockPassed)
 }
 
+// The retraction properties (#5433), split out of `main()` for the
+// max-fn-lines limit exactly as `runLoopProps` is above. `schedTimerCancel`
+// is the timer-queue half of the retraction pair `pollUnregister` (#5430,
+// `../../../runtime/sched/{darwin,linux}/poll.bit`) is the kernel-side half
+// of — see `schedTimerCancel`'s own comment in `../../../runtime/sched/
+// timer.bit` for the race this closes: a task racing a readiness
+// registration against a timer for the same task must retract whichever side
+// did not fire, or the loser is left holding a `Task` address the winner's
+// worker may already have run to completion and freed.
+fn retractionProps(): (bool, bool, int, int, int, bool, bool, bool, bool) {
+  let s = taskAt(schedAddr())
+
+  // A task armed and then cancelled before its deadline: found once (the
+  // list actually held it), gone the second time (cancelling twice must not
+  // report a phantom second removal).
+  armTimer(int(ptrOf(tE)), 500, taskParking)
+  let cancelled = schedTimerCancel(s, int(ptrOf(tE)))
+  let cancelledAgain = schedTimerCancel(s, int(ptrOf(tE)))
+  let leftAfterCancel = schedTimerCount(s)
+
+  // A task the OTHER side of a race already resolved before `expire` ever
+  // saw it due: state is `taskRunnable`, not `taskParking`, exactly as it
+  // would be had a readiness registration won first (../../../runtime/net's
+  // consumer). The mutation this guards: reverting `schedTimerExpire`'s
+  // `else if (schedTimerStillPending(t))` to an unconditional re-push makes
+  // `resolvedLeft` read back 1 instead of 0 — the stale entry survives
+  // pointing at a task this list no longer owns.
+  armTimer(int(ptrOf(tF)), 100, taskRunnable)
+  let resolvedWoke = schedTimerExpire(s, 150)
+  let resolvedLeft = schedTimerCount(s)
+
+  // `schedTimerStillPending`'s own contract, proven directly rather than
+  // driven end to end. The real hazard it closes — `schedUnpark`'s CAS
+  // reading `taskParking` and failing, then the WORKER publishing
+  // `taskParking -> taskParked` (`workerrun.bit`'s `schedWorkerStep`, case 1)
+  // before this predicate's own load runs — is two reads of one word from
+  // two different cores with no lock across them; this program is
+  // single-threaded and cannot force that interleaving. What it can prove
+  // synchronously is the predicate's table: `taskParked` reads as still
+  // pending (safe to re-push — the next pass CASes it awake, the
+  // pre-existing behaviour), and `taskRunnable`/`taskWakePending`/`taskDone`
+  // do not (a different winner already resolved the task, and none of the
+  // three ever leads back to `taskParked`).
+  atomicStore(taskAt(int(ptrOf(tG))) + taskState, taskParked)
+  let stillParked = schedTimerStillPending(taskAt(int(ptrOf(tG))))
+  atomicStore(taskAt(int(ptrOf(tG))) + taskState, taskRunnable)
+  let droppedRunnable = !schedTimerStillPending(taskAt(int(ptrOf(tG))))
+  atomicStore(taskAt(int(ptrOf(tG))) + taskState, taskWakePending)
+  let droppedWakePending = !schedTimerStillPending(taskAt(int(ptrOf(tG))))
+  atomicStore(taskAt(int(ptrOf(tG))) + taskState, taskDone)
+  let droppedDone = !schedTimerStillPending(taskAt(int(ptrOf(tG))))
+
+  return (
+    cancelled, cancelledAgain, leftAfterCancel, resolvedWoke, resolvedLeft,
+    stillParked, droppedRunnable, droppedWakePending, droppedDone,
+  )
+}
+
 fn main() {
   let s = taskAt(schedAddr())
   schedInit(s, int(ptrOf(workerBlocks)), timerWorkers)
@@ -223,6 +293,10 @@ fn main() {
   let gotD = tookFromGlobal() == int(ptrOf(tD))
 
   let (aligned, woke, clockPassed) = runLoopProps()
+  let (
+    cancelled, cancelledAgain, leftAfterCancel, resolvedWoke, resolvedLeft,
+    stillParked, droppedRunnable, droppedWakePending, droppedDone,
+  ) = retractionProps()
 
   println("armed ${armed} early ${earlyWoke}")
   println("A ${wokeA} ${gotA} left ${leftAfterA}")
@@ -231,4 +305,10 @@ fn main() {
   println("retain ${notYetWoke} ${stillArmed} ${nothingQueued}")
   println("late ${lateWoke} ${gotD}")
   println("live ${aligned} ${woke} ${clockPassed}")
+  println("cancel ${cancelled} ${cancelledAgain} left ${leftAfterCancel}")
+  println("resolved ${resolvedWoke} left ${resolvedLeft}")
+  println(
+      "pending parked ${stillParked} dropped ${droppedRunnable} " +
+      "${droppedWakePending} ${droppedDone}",
+  )
 }
