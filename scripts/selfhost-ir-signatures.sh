@@ -452,6 +452,81 @@ explainMismatch() {
         exit 0
       }
 
+      # --- #5429: decimal boxed-slot explode (field_set/field_get width-16 fix) ---
+      #
+      # `buildTupleIn`/`tupleElem` (compiler/lowerexpr.bit) and the closure-env
+      # pack/unpack plus mutated-capture cell write (compiler/lowerclosure.bit,
+      # compiler/lowerfuncval.bit) used to move a `decimal` VALUE with a single
+      # field access typed `decimal` -- the oracle `gpSizeOpc: width 16` panic,
+      # because a decimal VALUE is an 8-byte POINTER to a two-word box, not a
+      # 16-byte inline value. #5429 fixes every one of those sites to move the
+      # two i64 WORDS separately instead of the whole 16 bytes at once.
+      #
+      # A WRITE site (building a tuple/env slot from a decimal source) used to
+      # be one `field_set dst[k] = %ptr`; now it reads the two source words
+      # and writes them separately -- TWO more `field_get`s. `field_set` itself
+      # is unscored by opcode() (see the comment on that function), so only the
+      # `field_get` pair is visible here, not the doubled `field_set` count.
+      #
+      # A READ site (pulling a decimal member back out, to use as a
+      # `decimal`-typed value) used to be one `field_get src[k] decimal` (a
+      # pointer) plus the two-word unbox off that pointer -- 3 `field_get`s
+      # total, no allocation, since the pointer already pointed at a live box.
+      # Now the two words are read directly off `src` (2 `field_get`s, no
+      # allocation), then RE-BOXED into a fresh 16-byte `(i64, i64)` object so
+      # the value can still be passed around as a pointer (`gc_alloc` + 2 more
+      # `field_set`s, unscored), then unboxed again at the point of use (2 more
+      # `field_get`s) -- 4 `field_get`s and 1 `gc_alloc`, net +1 `field_get` and
+      # +1 `gc_alloc` over the oracle per read site.
+      #
+      # So per write site (Nw) and read site (Nr), independently:
+      #   delta(field_get) = 2*Nw + Nr        delta(gc_alloc) = Nr
+      # Nr is read straight off delta(gc_alloc); Nw is solved from what is left
+      # of delta(field_get) after removing the Nr share, and that remainder
+      # must be a non-negative EVEN number -- an odd remainder is not this shape.
+      #
+      # Derived empirically from both #5429 fixtures at pre-opt (`--dump-ir-pre`,
+      # oracle e960043d vs this tree, measured at 43627746):
+      #   _tests_/cases/decimal_tuple_member.bit:    field_get +3, gc_alloc +1
+      #     -> Nr=1, Nw=1 (one tuple-build write, one destructure-and-print read)
+      #   _tests_/cases/decimal_closure_capture.bit: field_get +9, gc_alloc +3
+      #     -> Nr=3, Nw=3 (env-pack write, two cell writes; read-capture use,
+      #        two mutated-capture reads)
+      # No other opcode moves on either file at pre-opt.
+      Nr5429 = delta["gc_alloc"]
+      Nrest5429 = delta["field_get"] - Nr5429
+      ok5429 = (Nr5429 >= 0 && Nrest5429 >= 0 && Nrest5429 % 2 == 0)
+      Nw5429 = Nrest5429 / 2
+      if (Nw5429 + Nr5429 <= 0) ok5429 = 0
+
+      # POST-OPT: the opt.bit CSE/DCE pass can fold a read site box-then-unbox
+      # roundtrip away entirely once nothing else observes the intermediate
+      # pointer (the same class of redistribution the #3107 post-opt arm
+      # documents), so the exact Nw/Nr split above does not survive. What DOES
+      # hold on both #5429 fixtures: `field_get` and `gc_alloc` move by the
+      # SAME amount, always downward -- each eliminated box takes its own
+      # reads with it, in lockstep, never a partial fold:
+      #   decimal_tuple_member.bit:    field_get -3, gc_alloc -3
+      #   decimal_closure_capture.bit: field_get -2, gc_alloc -2
+      if (kind != "ir") {
+        ok5429 = (delta["field_get"] == delta["gc_alloc"] && delta["gc_alloc"] < 0)
+      }
+      # Both kinds: nothing outside {field_get, gc_alloc} may move at all --
+      # no unconstrained-magnitude allowance, unlike the #3107/#3862 post-opt
+      # arms, because nothing else moved on either measured fixture. `moved`,
+      # not `delta` -- see the block comment above this function for why
+      # `delta` is polluted with every zero-valued key the earlier signature
+      # blocks above have already probed by the time this one runs.
+      for (op in moved) {
+        opname = op
+        sub(/^rt_call:/, "", opname)
+        if (opname != "field_get" && opname != "gc_alloc") ok5429 = 0
+      }
+      if (ok5429) {
+        print "5429-decimal-boxed-slot-explode"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
