@@ -21,7 +21,11 @@ $n` instead of a growing `OFFSET`, so a deep page costs what page 1 does,
 `@timestamps`, filling `createdAt` on INSERT and `updatedAt` on every
 write, single or bulk, `hasMany`/`hasOne`/`belongsTo` relations with eager
 loading via `with()`, batched so loading N parent rows never issues more
-than one extra query per relation, never one per row, `@softDelete`,
+than one extra query per relation, never one per row, `manyToManyTable`,
+`manyToManyLoader` and `attach`/`detach`/`sync`, the join-table primitives
+behind `@manyToMany` - the join table is always named explicitly, never
+inferred, `attach`/`sync` are idempotent on both Postgres and MySQL, and
+`detach` refuses to become an unfiltered `DELETE`, `@softDelete`,
 which makes `delete` mark a row instead of removing it and excludes a
 marked row from every ordinary read until
 `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` says otherwise, and
@@ -89,7 +93,9 @@ driver's constraint-violation error into a typed, catchable cause is
 [`docs/bulk.md`](docs/bulk.md). Paginating a large table without `OFFSET`'s
 cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
 `hasMany`/`hasOne`/`belongsTo` and eager loading with `with()` is
-[`docs/relation.md`](docs/relation.md). Marking a row deleted instead of
+[`docs/relation.md`](docs/relation.md). Many-to-many relations - the join
+table's DDL, eager loading and `attach`/`detach`/`sync` - is
+[`docs/manytomany.md`](docs/manytomany.md). Marking a row deleted instead of
 removing it is [`docs/softdelete.md`](docs/softdelete.md). Optimistic
 locking against a lost update is [`docs/version.md`](docs/version.md).
 Locking a row against a concurrent writer with `forUpdate` is
