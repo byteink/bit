@@ -11,7 +11,10 @@
 // asked as well and must fail.
 //
 // `listen`, `dial` and `Conn` are siblings in this same module (net.bit), so
-// nothing is imported.
+// they are not imported. `std/time` is the one import, for the last test
+// below (#5428): it times a read path, and `monotonic` is the same clock the
+// deadlines that read arms are measured against.
+import { monotonic, since } from "std/time"
 
 test "peerIp reads 127.0.0.1 on both ends of a loopback connection" {
   let l = listen("127.0.0.1", 0) catch e {
@@ -90,6 +93,83 @@ test "peerIp on a closed conn fails with an error rather than panicking" {
     return
   }
   assert(false, "a closed conn has no peer, but peerIp returned '${leaked}'")
+  a.close()
+  l.close()
+}
+
+// #5428 — A DEADLINE-ARMED READ MUST NOT COST A POLL INTERVAL PER EXCHANGE.
+//
+// `readDeadline` reaches `netReadSockDeadline`, which cannot park on readiness
+// (see runtime/net/darwin/tcp.bit's "Deadline-bounded connect/read/write") and
+// retries on a timer instead. It used to wait a flat `netDeadlinePollNs` (2ms)
+// on EVERY miss, so a request/response protocol on one reused connection was
+// capped at 500 exchanges per second no matter how near its peer was — the
+// 78x regression #5419's keep-alive server measured. The slice now starts at
+// `netDeadlineFastPollNs` (1us) and doubles toward the same 2ms ceiling.
+//
+// THE BOUND IS DELIBERATELY FAR FROM BOTH ANSWERS, because a wall-clock
+// assertion on a machine running a build fleet has to fail only for the
+// defect. 500 exchanges cost about 18ms here and at least 500 * 2ms = 1000ms
+// with the flat slice back: 250ms is a 14x headroom on the healthy path and a
+// 4x margin on the broken one.
+//
+// The deadline is re-armed per exchange, as an idle timeout is, so the read
+// that answers each wait is a fresh one rather than one long deadline set
+// once — which is the case that pays the slice.
+fn deadlineEchoServer(c: Conn, n: int) {
+  let i = 0
+  while (i < n) {
+    i = i + 1
+    c.setDeadline(monotonic().ns + 60000000000)
+    let req = c.readDeadline(64) catch _ {
+      return
+    }
+    if (len(req) == 0) {
+      return
+    }
+    c.setDeadline(0)
+    c.write("R") catch _ {
+      return
+    }
+  }
+}
+
+test "a deadline-armed read answers a near peer without waiting a poll interval" {
+  let exchanges = 500
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let port = l.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let a = l.accept() catch e {
+    assert(false, "accept: ${e.message()}")
+    return
+  }
+  spawn deadlineEchoServer(a, exchanges)
+  let start = monotonic()
+  let done = 0
+  let i = 0
+  while (i < exchanges) {
+    i = i + 1
+    c.write("Q") catch _ {
+      break
+    }
+    if (len(c.read(64)) == 0) {
+      break
+    }
+    done = done + 1
+  }
+  let elapsedMs = since(start) / 1000000
+  assert(done == exchanges, "completed ${done} of ${exchanges} exchanges")
+  assert(elapsedMs < 250, "${exchanges} deadline-armed exchanges took ${elapsedMs}ms")
+  c.close()
   a.close()
   l.close()
 }
