@@ -168,6 +168,7 @@ fix this.
 | Indexing an unbounded `text` column | no prefix needed | an explicit key-length prefix is required; this package always renders `(255)` |
 | `CREATE INDEX CONCURRENTLY` via `raw()` | detected in the raw text, flagged non-transactional | no equivalent exists; a `raw()` statement is never scanned for it |
 | Every statement's `transactional` flag | `true`, except a `raw()` naming `CONCURRENTLY` | always `false` - MySQL DDL auto-commits (see above) |
+| `alter()`'s composite primary-key change | one `drop constraint if exists ... add constraint ...` statement, either case | two ops instead of one: `t.primaryKey(...)` (no key exists yet) renders a bare `add primary key`; `t.replacePrimaryKey(...)` (one already does) renders `drop primary key, add primary key` in one statement - MySQL's `drop primary key` has no `IF EXISTS`, so the caller asserts which case applies (`generate`'s own `hasLivePrimaryKey` picks for a generated migration) |
 | The migration runner's advisory lock | `pg_advisory_lock`, taken by `up` | none - `Dialect` has no lock method, so `up` takes no lock at all (see above) |
 
 ## When not to use this
