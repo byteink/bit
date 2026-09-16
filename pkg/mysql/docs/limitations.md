@@ -2,14 +2,6 @@
 
 What this driver does not do yet, and where each gap is tracked.
 
-- **`VARBINARY`/`BINARY` are not recognized as blobs.** The binary protocol
-  reports each column's real MySQL type, and most of the type table is fully
-  decoded - native integer and float widths, `DECIMAL` proven against its text
-  form (#3995, see [Types](types.md)), MariaDB's `UUID`/`INET4`/`INET6`. But a
-  fixed-length or variable-length binary-charset column reported as its
-  generic string type rather than the dedicated `BLOB` family still comes back
-  as `Value.Text` instead of `Value.Blob`, since only the `BLOB` family's own
-  type codes are checked against the column's charset today.
 - **Transactions are not implemented.** `Conn.begin` fails, naming epic #3986.
   `query`, `exec` and `prepare` all take parameters today; only starting and
   ending a transaction does not exist yet.
