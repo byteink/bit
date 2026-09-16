@@ -1,0 +1,201 @@
+// `pollUnregister` (#5430) against a REAL kernel, Darwin/kqueue.
+//
+// ../schedpolldarwin proves a registered task wakes when its fd becomes
+// ready. This program proves the opposite half exists: a task can be
+// RETRACTED before that happens, and once retracted, making the fd ready
+// afterward wakes nothing. That is the primitive #5430 closes the race with —
+// a task linked on both the poller and `scTimerHead` (../../timer.bit's
+// netpoller section) leaves the loser of that race holding a freed `Task`,
+// and retraction is how the loser stops being a loser.
+//
+// ONE POLLER, TWO TASKS, AND THAT IS LOAD-BEARING, NOT A STYLE CHOICE. Task A
+// is registered and then immediately retracted; task B is registered and left
+// alone — the positive control the acceptance bar asks for, run through the
+// SAME drain call rather than a separate one. That matters because
+// `pollDrainSkippable` (this module) skips the kernel call entirely whenever
+// `schedPollPendingCount()` reads 0, and a `pollUnregister` that decremented
+// the count WITHOUT actually removing the kqueue knote would still make that
+// count hit 0 for a single-task version of this test — the drain would be
+// skipped, the leftover kernel registration would never be asked about, and
+// the test would read green by construction. Task B's own outstanding
+// registration keeps the count above 0 for as long as task A's retraction
+// might still be wrong, which is what forces `pollDrain` to actually call
+// `kevent` and, if the retraction failed, actually see task A's stale event.
+//
+// Darwin-only by construction, hence the sibling `darwin-only` marker: it
+// binds runtime/sched/darwin, which reaches libSystem through `extern
+// function` (SPEC §11.7) — rejected on Linux even for an uncalled
+// declaration. ../schedpollunregisterlinux is the epoll twin, compile-checked
+// only (cross-compiled, never run — this machine has no Linux kernel).
+
+import { schedInit, schedWorkerAt, schedWorkerRun } from "../../../runtime/sched"
+import { schedSetPollFd, pollRead, schedTaskInit, schedRegister, taskWords } from "../../../runtime/sched"
+import { schedSpawn, schedShutdown, schedTaskExit, schedPark } from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt } from "../../../runtime/sched"
+import { pollCreate, pollClose, pollRegister, pollUnregister, pollDrain } from "../../../runtime/sched/darwin"
+
+// int pipe(int fds[2]); ssize_t write(int, const void *, size_t);
+// Only C-representable types cross the boundary (§11.7).
+extern fn pipe(fds: *u8): i32
+extern fn write(fd: i32, buf: *u8, n: i64): i64
+
+const pollWorkers: int = 1
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+// Two 256KiB stacks inside a 768KiB region, so two 256KiB-aligned bases exist
+// whatever address the linker gives the array. Same layout
+// ../schedpolldarwin uses.
+let stackArea: [98304]i64
+let waiterTaskA: [taskWords]i64
+let waiterTaskB: [taskWords]i64
+
+// `int fds[2]` — TWO PACKED 32-BIT FIELDS IN ONE 8-BYTE WORD. Same bridge
+// ../schedpolldarwin documents at length.
+let pipeFdsA: [1]i64
+let pipeFdsB: [1]i64
+let writeBuf: [1]i64
+
+// Observations. Untraced module state (§11.11): written from a green thread,
+// read by the driver, and never walked by the collector.
+let obsWokeA: i64 = 0
+let obsWokeB: i64 = 0
+let addrWokeA: i64 = 0
+let addrWokeB: i64 = 0
+let addrSched: i64 = 0
+
+// The largest number of events any single `pollDrain` call returned — the
+// literal `pollDrain` return the acceptance bar asks for. A retraction that
+// actually works leaves exactly ONE live registration (task B's) once both
+// pipes are ready, so this must top out at 1, never 2.
+let maxDrain: i64 = 0
+
+// Safety net only, not the property under test: both pipes are made ready
+// before the run starts and task B always wakes on the first idle drain, so
+// this never fires in either the correct or the "leftover kqueue
+// registration" mutant — it exists so a genuinely different bug (the
+// scheduler wedging) fails with a verdict instead of a hang, same as
+// ../schedpolldarwin's own `idleGiveUp`.
+const idleGiveUp: int = 200000
+let idlePasses: i64 = 0
+let gaveUp: i64 = 0
+
+fn guardClock(): int {
+  idlePasses = idlePasses + 1
+  if (int(idlePasses) > idleGiveUp) {
+    gaveUp = 1
+    schedShutdown(taskAt(addrSched))
+  }
+  return int(idlePasses)
+}
+
+fn schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+// Wraps `pollDrain` to record the largest batch any one call returned. See
+// `maxDrain`.
+fn pollTap(schedAddr: int, timeoutMs: int): int {
+  let n = pollDrain(schedAddr, timeoutMs)
+  if (i64(n) > maxDrain) {
+    maxDrain = i64(n)
+  }
+  return n
+}
+
+// Task A: retracted before its pipe is ever made ready. It must never reach
+// the store below — reaching it is the failure this program exists to catch.
+@nosplit fn waiterBodyA() {
+  schedPark()
+  atomicStore(taskAt(addrWokeA), 1)
+  schedTaskExit()
+}
+
+// Task B: the positive control, registered and left alone. Its wake is what
+// ends the run — see the header for why its registration staying live is
+// what makes task A's retraction observable at all.
+@nosplit fn waiterBodyB() {
+  schedPark()
+  atomicStore(taskAt(addrWokeB), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+fn main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), pollWorkers)
+  addrWokeA = int(ptrOf(obsWokeA))
+  addrWokeB = int(ptrOf(obsWokeB))
+  addrSched = schedAddr()
+
+  let pfd = pollCreate()
+  let created = pfd >= 0
+  schedSetPollFd(s, pfd)
+
+  pipeFdsA[0] = 0
+  pipeFdsB[0] = 0
+  let zb: *u8 = nil
+  let pipedA = int(pipe(zb + int(ptrOf(pipeFdsA)))) == 0
+  let pipedB = int(pipe(zb + int(ptrOf(pipeFdsB)))) == 0
+  let fdWordA = int(pipeFdsA[0])
+  let readFdA = fdWordA % 4294967296
+  let writeFdA = fdWordA / 4294967296
+  let fdWordB = int(pipeFdsB[0])
+  let readFdB = fdWordB % 4294967296
+  let writeFdB = fdWordB / 4294967296
+
+  let base = int(ptrOf(stackArea))
+  let bumped = base + schedStackBytes - 1
+  let stackBaseA = bumped - bumped % schedStackBytes
+  let stackBaseB = stackBaseA + schedStackBytes
+  let aligned = schedStackAligned(stackBaseA) && schedStackAligned(stackBaseB)
+
+  let taskAddrA = int(ptrOf(waiterTaskA))
+  schedTaskInit(taskAt(taskAddrA), stackBaseA, schedStackBytes, entryOf(waiterBodyA), 0)
+  schedRegister(s, taskAddrA)
+
+  let taskAddrB = int(ptrOf(waiterTaskB))
+  schedTaskInit(taskAt(taskAddrB), stackBaseB, schedStackBytes, entryOf(waiterBodyB), 0)
+  schedRegister(s, taskAddrB)
+
+  // Register BEFORE the tasks run, exactly as ../schedpolldarwin does and for
+  // the same reason: a task body registering itself would need to reach the
+  // provider from `@nosplit` code, which E0075 rejects.
+  let registeredA = pollRegister(pfd, readFdA, pollRead, taskAddrA)
+  let registeredB = pollRegister(pfd, readFdB, pollRead, taskAddrB)
+
+  // The retraction under test. Called before either task has been spawned —
+  // `pollUnregister` is a kernel-side operation on `(pollFd, fd)` and does
+  // not depend on the task's scheduling state, only `schedPollUnpark`'s CAS
+  // does (../../sched.bit's "arming a park" section).
+  let retracted = pollUnregister(pfd, readFdA, pollRead)
+
+  schedSpawn(s, taskAddrA)
+  schedSpawn(s, taskAddrB)
+
+  // Nothing is ready yet, and task A's retraction must not have disturbed
+  // task B's own live registration.
+  let spurious = pollDrain(schedAddr(), 0)
+
+  // Make BOTH pipes readable before any worker runs, exactly as
+  // ../schedpolldarwin does: this single worker runs both tasks to their
+  // park point before its first idle pass ever calls `pollTap`, so the
+  // writes below cannot race either task's CAS.
+  writeBuf[0] = 0
+  let z: *u8 = nil
+  let wbuf = z + int(ptrOf(writeBuf))
+  let wroteA = int(write(i32(writeFdA), wbuf, i64(1))) == 1
+  let wroteB = int(write(i32(writeFdB), wbuf, i64(1))) == 1
+
+  schedWorkerRun(schedWorkerAt(s, 0), guardClock, pollTap)
+
+  let wokeA = int(obsWokeA) != 0
+  let wokeB = int(obsWokeB) != 0
+
+  pollClose(pfd)
+
+  println("poller ${created} ${pipedA} ${pipedB} ${aligned}")
+  println("armed ${registeredA} ${registeredB} retracted ${retracted} spurious ${spurious}")
+  println("wrote ${wroteA} ${wroteB} wokeA ${wokeA} wokeB ${wokeB}")
+  println("maxDrain ${maxDrain} gaveUp ${int(gaveUp) != 0}")
+}

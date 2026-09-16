@@ -1,0 +1,201 @@
+// `pollUnregister` (#5430) against a REAL kernel, Linux/epoll.
+//
+// ../schedpollunregisterdarwin is the kqueue twin and carries the full
+// argument for this program's shape; kept identical here so a divergence
+// between the two means a real platform difference rather than a spelling
+// one. Short version: task A is registered and immediately retracted, task B
+// is registered and left alone, both pipes are made ready, and ONE poller
+// drains both. Task B's registration staying live for the whole run is what
+// keeps `pollDrainSkippable`'s pending-count fast path from skipping the
+// kernel call altogether — see the Darwin twin's header for why a
+// single-task version of this test cannot catch a `pollUnregister` that
+// decrements the count without actually removing the epoll registration.
+//
+// CROSS-COMPILED ONLY ON THIS WORKSPACE'S MACHINE (macOS/arm64) — there is no
+// Linux kernel here to run it against, so `_tests_/stress/schedpollunregisterdarwin`
+// is the one actually executed for #5430. This file is proven to build AND
+// link for `x86_64-linux` (`bit build --target x86_64-linux`), which is the
+// bar that catches a new `extern fn`/`syscall` that only fails at program
+// link (this workspace's own known blind spot for an unexercised provider).
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/sched/linux, which reaches the kernel through `syscall` (SPEC
+// §11.8) — rejected on Darwin even for an uncalled declaration.
+
+import { schedInit, schedWorkerAt, schedWorkerRun } from "../../../runtime/sched"
+import { schedSetPollFd, pollRead, schedTaskInit, schedRegister, taskWords } from "../../../runtime/sched"
+import { schedSpawn, schedShutdown, schedTaskExit, schedPark } from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt } from "../../../runtime/sched"
+import { pollCreate, pollClose, pollRegister, pollUnregister, pollDrain } from "../../../runtime/sched/linux"
+
+// pipe2(2) and write(2) as raw syscalls (§11.8) — the ELF output is fully
+// static with no libc. Numbers read out of the pinned reference toolchain's
+// std/os/linux/syscalls (`X64`/`Arm64` enums), never from memory. Same shape
+// ../schedpolllinux uses.
+//
+// `hostTarget()` is 0 for x86_64-linux and 1 for aarch64-linux; this program
+// is only ever built for a Linux target, so the two cases are exhaustive.
+fn nr(x64: int, arm64: int): int {
+  if (hostTarget() == 0) {
+    return x64
+  }
+  return arm64
+}
+
+// pipe2 rather than pipe: aarch64 has NO `pipe` syscall at all, only `pipe2`.
+fn nrPipe2(): int { return nr(293, 59) }
+fn nrWrite(): int { return nr(1, 64) }
+
+const pollWorkers: int = 1
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+// Two 256KiB stacks inside a 768KiB region, so two 256KiB-aligned bases exist
+// whatever address the linker gives the array. Same layout
+// ../schedpolllinux uses.
+let stackArea: [98304]i64
+let waiterTaskA: [taskWords]i64
+let waiterTaskB: [taskWords]i64
+
+// `int fds[2]` — TWO PACKED 32-BIT FIELDS IN ONE 8-BYTE WORD. Same bridge
+// ../schedpolllinux documents at length.
+let pipeFdsA: [1]i64
+let pipeFdsB: [1]i64
+let writeBuf: [1]i64
+
+// Observations. Untraced module state (§11.11): written from a green thread,
+// read by the driver, and never walked by the collector.
+let obsWokeA: i64 = 0
+let obsWokeB: i64 = 0
+let addrWokeA: i64 = 0
+let addrWokeB: i64 = 0
+let addrSched: i64 = 0
+
+// The largest number of events any single `pollDrain` call returned — the
+// literal `pollDrain` return the acceptance bar asks for. A retraction that
+// actually works leaves exactly ONE live registration (task B's) once both
+// pipes are ready, so this must top out at 1, never 2.
+let maxDrain: i64 = 0
+
+// Safety net only, not the property under test — see the Darwin twin's own
+// `idleGiveUp` for the full argument.
+const idleGiveUp: int = 200000
+let idlePasses: i64 = 0
+let gaveUp: i64 = 0
+
+fn guardClock(): int {
+  idlePasses = idlePasses + 1
+  if (int(idlePasses) > idleGiveUp) {
+    gaveUp = 1
+    schedShutdown(taskAt(addrSched))
+  }
+  return int(idlePasses)
+}
+
+fn schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+// Wraps `pollDrain` to record the largest batch any one call returned. See
+// `maxDrain`.
+fn pollTap(schedAddr: int, timeoutMs: int): int {
+  let n = pollDrain(schedAddr, timeoutMs)
+  if (i64(n) > maxDrain) {
+    maxDrain = i64(n)
+  }
+  return n
+}
+
+// Task A: retracted before its pipe is ever made ready. It must never reach
+// the store below — reaching it is the failure this program exists to catch.
+@nosplit fn waiterBodyA() {
+  schedPark()
+  atomicStore(taskAt(addrWokeA), 1)
+  schedTaskExit()
+}
+
+// Task B: the positive control, registered and left alone. Its wake is what
+// ends the run.
+@nosplit fn waiterBodyB() {
+  schedPark()
+  atomicStore(taskAt(addrWokeB), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+fn main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), pollWorkers)
+  addrWokeA = int(ptrOf(obsWokeA))
+  addrWokeB = int(ptrOf(obsWokeB))
+  addrSched = schedAddr()
+
+  let pfd = pollCreate()
+  let created = pfd >= 0
+  schedSetPollFd(s, pfd)
+
+  pipeFdsA[0] = 0
+  pipeFdsB[0] = 0
+  let pipedA = int(syscall(nrPipe2(), i64(int(ptrOf(pipeFdsA))), 0)) == 0
+  let pipedB = int(syscall(nrPipe2(), i64(int(ptrOf(pipeFdsB))), 0)) == 0
+  // Split each packed pair: fds[0] is the low 32 bits, fds[1] the high 32.
+  let fdWordA = int(pipeFdsA[0])
+  let readFdA = fdWordA % 4294967296
+  let writeFdA = fdWordA / 4294967296
+  let fdWordB = int(pipeFdsB[0])
+  let readFdB = fdWordB % 4294967296
+  let writeFdB = fdWordB / 4294967296
+
+  let base = int(ptrOf(stackArea))
+  let bumped = base + schedStackBytes - 1
+  let stackBaseA = bumped - bumped % schedStackBytes
+  let stackBaseB = stackBaseA + schedStackBytes
+  let aligned = schedStackAligned(stackBaseA) && schedStackAligned(stackBaseB)
+
+  let taskAddrA = int(ptrOf(waiterTaskA))
+  schedTaskInit(taskAt(taskAddrA), stackBaseA, schedStackBytes, entryOf(waiterBodyA), 0)
+  schedRegister(s, taskAddrA)
+
+  let taskAddrB = int(ptrOf(waiterTaskB))
+  schedTaskInit(taskAt(taskAddrB), stackBaseB, schedStackBytes, entryOf(waiterBodyB), 0)
+  schedRegister(s, taskAddrB)
+
+  // Register BEFORE the tasks run, exactly as ../schedpolllinux does and for
+  // the same reason: a task body registering itself would need to reach the
+  // provider from `@nosplit` code, which E0075 rejects.
+  let registeredA = pollRegister(pfd, readFdA, pollRead, taskAddrA)
+  let registeredB = pollRegister(pfd, readFdB, pollRead, taskAddrB)
+
+  // The retraction under test. Called before either task has been spawned —
+  // `pollUnregister` is a kernel-side operation on `(pollFd, fd)` and does
+  // not depend on the task's scheduling state, only `schedPollUnpark`'s CAS
+  // does (../../sched.bit's "arming a park" section).
+  let retracted = pollUnregister(pfd, readFdA, pollRead)
+
+  schedSpawn(s, taskAddrA)
+  schedSpawn(s, taskAddrB)
+
+  // Nothing is ready yet, and task A's retraction must not have disturbed
+  // task B's own live registration.
+  let spurious = pollDrain(schedAddr(), 0)
+
+  // Make BOTH pipes readable before any worker runs, exactly as
+  // ../schedpolllinux does: this single worker runs both tasks to their park
+  // point before its first idle pass ever calls `pollTap`, so the writes
+  // below cannot race either task's CAS.
+  writeBuf[0] = 0
+  let wroteA = int(syscall(nrWrite(), i64(writeFdA), i64(int(ptrOf(writeBuf))), i64(1))) == 1
+  let wroteB = int(syscall(nrWrite(), i64(writeFdB), i64(int(ptrOf(writeBuf))), i64(1))) == 1
+
+  schedWorkerRun(schedWorkerAt(s, 0), guardClock, pollTap)
+
+  let wokeA = int(obsWokeA) != 0
+  let wokeB = int(obsWokeB) != 0
+
+  pollClose(pfd)
+
+  println("poller ${created} ${pipedA} ${pipedB} ${aligned}")
+  println("armed ${registeredA} ${registeredB} retracted ${retracted} spurious ${spurious}")
+  println("wrote ${wroteA} ${wroteB} wokeA ${wokeA} wokeB ${wokeB}")
+  println("maxDrain ${maxDrain} gaveUp ${int(gaveUp) != 0}")
+}
