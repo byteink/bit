@@ -13,7 +13,12 @@
 #
 #   ./pkg/web/bench/run.sh              ship, build, measure, publish
 #   ./pkg/web/bench/run.sh --reuse      measure against the tree already there
-#   ./pkg/web/bench/run.sh --report     re-render from the last results.csv only
+#   ./pkg/web/bench/run.sh --fetch      pull the box's last results, then publish
+#   ./pkg/web/bench/run.sh --report     re-render from out/ as it stands here
+#
+# --report renders whatever is in out/ WITHOUT going to the box, so it will
+# happily republish a stale or partial results.csv. Use --fetch after a run
+# that was started by hand over there.
 #
 # Environment: BIT_X64_HOST and friends, resolved by scripts/x64host.sh.
 set -euo pipefail
@@ -82,12 +87,24 @@ head, rest = text.split(begin, 1)
 _, tail = rest.split(end, 1)
 open(readme, "w").write("%s%s\n%s\n%s%s" % (head, begin, body, end, tail))
 PY
-  cp "$md" "$HERE/RESULTS.md"
+  # RESULTS.md carries the block AND the transcript of the proof that ran
+  # before it, because out/ is generated and gitignored: without this the
+  # committed artefact would assert identical responses with nothing behind it.
+  {
+    cat "$md"
+    echo
+    echo "## Verification, exactly as it ran"
+    echo
+    echo '```'
+    cat "$HERE/out/verify.txt"
+    echo '```'
+  } > "$HERE/RESULTS.md"
   echo "wrote pkg/web/README.md and pkg/web/bench/RESULTS.md"
 }
 
 case $MODE in
   --report) ;;
+  --fetch)  fetch ;;
   --reuse)  measure; fetch ;;
   *)        ship; measure; fetch ;;
 esac

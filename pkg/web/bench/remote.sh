@@ -352,15 +352,15 @@ record_env() {
 
 versions() {
   {
-    say "bit $(docker run --rm "$BIT_IMAGE" --version 2>&1 | head -1)"
-    say "gin $(grep -m1 'gin-gonic/gin' "$ROOT/apps/gin/go.mod" | awk '{print $2}')"
+    say "bit $(docker run --rm "$BIT_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}')"
+    say "gin $(grep -m1 'gin-gonic/gin' "$ROOT/apps/gin/go.mod" | awk '{print $NF}')"
     say "go $(docker run --rm golang:1-alpine go version | awk '{print $3}')"
     say "express $(docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
       node -p 'require("express/package.json").version' 2>&1 | tail -1)"
     say "node $(docker run --rm node:22-alpine node --version)"
     say "bun $(docker run --rm oven/bun:1 bun --version)"
     say "springboot $(grep -m1 -A2 spring-boot-starter-parent "$ROOT/apps/spring/pom.xml" | grep version | sed 's/.*<version>\(.*\)<\/version>.*/\1/')"
-    say "jvm $(docker run --rm eclipse-temurin:21-jdk-alpine java -version 2>&1 | head -1)"
+    say "jvm $(docker run --rm eclipse-temurin:21-jdk-alpine java -version 2>&1 | head -1 | cut -d'"' -f2)"
     say "dotnet $(docker run --rm mcr.microsoft.com/dotnet/sdk:9.0 dotnet --version)"
   } > "$OUT/versions.txt" 2>&1
 }
@@ -368,13 +368,18 @@ versions() {
 # ---------------------------------------------------------------- main
 
 # Stages, so a slow build is not repeated to re-run a fast measurement:
-#   build   compile the six servers, nothing else
-#   run     prove + measure against an already built tree (the default is both)
+#   build     compile the six servers, nothing else
+#   versions  re-record what each framework resolved to, nothing else
+#   run       prove + measure against an already built tree (default: both)
 main() {
   local stage=${1:-all}
   mkdir -p "$OUT" "$LOG"
   if [ "$stage" = build ]; then
     build_all
+    versions
+    return 0
+  fi
+  if [ "$stage" = versions ]; then
     versions
     return 0
   fi

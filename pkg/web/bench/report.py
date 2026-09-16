@@ -10,6 +10,7 @@ beside it is not a result a reader can judge.
 """
 import csv
 import os
+import re
 import statistics
 import sys
 
@@ -41,13 +42,20 @@ def series(rows, fw, test, conn, field):
             if r["framework"] == fw and r["test"] == test and r["conn"] == conn]
 
 
+def noise(vals):
+    """Half the min..max range as a fraction of the median."""
+    if len(vals) < 2:
+        return 0.0
+    med = statistics.median(vals)
+    return (max(vals) - min(vals)) / 2.0 / med if med else 0.0
+
+
 def spread(vals):
     """Half the min..max range as a percent of the median, the reader's noise
     bar. Reported rather than a stddev because 5 reps do not support one."""
     if len(vals) < 2:
         return "n/a"
-    med = statistics.median(vals)
-    return "%.1f%%" % (100.0 * (max(vals) - min(vals)) / 2.0 / med) if med else "n/a"
+    return "%.1f%%" % (100.0 * noise(vals))
 
 
 def rps(n):
@@ -86,9 +94,9 @@ def pinning(out_dir):
     derives the two sets at run time and this is where they are read back."""
     path = os.path.join(out_dir, "verify.txt")
     for line in open(path) if os.path.exists(path) else []:
-        if line.startswith("=== servers pinned "):
-            f = line.split()
-            return f[4].rstrip(","), f[8].rstrip(",")
+        m = re.match(r"=== servers pinned (\S+?), load generator (\S+?), disjoint", line)
+        if m:
+            return m.group(1), m.group(2)
     return "?", "?"
 
 
@@ -97,12 +105,41 @@ def bad_reps(rows):
 
 
 def versions_line(v):
-    parts = [("pkg/web", v.get("bit", "?")), ("gin", v.get("gin", "?")),
+    parts = [("Bit toolchain", v.get("bit", "?")), ("gin", v.get("gin", "?")),
              ("Go", v.get("go", "?")), ("express", v.get("express", "?")),
              ("Node", v.get("node", "?")), ("bun", v.get("bun", "?")),
              ("Spring Boot", v.get("springboot", "?")), ("JVM", v.get("jvm", "?")),
              ("ASP.NET", v.get("dotnet", "?"))]
     return ", ".join("%s %s" % (a, b) for a, b in parts)
+
+
+def scaling_note(rows, conns):
+    """Name every framework whose throughput FALLS as concurrency rises. A
+    table where one row's c=64 figure is a fifth of its c=1 figure reads like
+    a transcription error unless the block says outright that it is not."""
+    if len(conns) < 2:
+        return ""
+    lo, hi, hits = conns[0], conns[-1], []
+    for fw in ORDER:
+        for test, _ in TESTS:
+            a = series(rows, fw, test, lo, "rps")
+            b = series(rows, fw, test, hi, "rps")
+            if not a or not b:
+                continue
+            # Only a fall LARGER than the two noise bars combined. Without
+            # that test a 1% dip inside its own spread gets named here as a
+            # scaling defect, which is the opposite of what this note is for.
+            fall = (statistics.median(a) - statistics.median(b)) / statistics.median(a)
+            if fall > noise(a) + noise(b):
+                hits.append("%s on %s (%s at c=%s, %s at c=%s)" % (
+                    LABEL[fw], test, rps(statistics.median(a)), lo,
+                    rps(statistics.median(b)), hi))
+    if not hits:
+        return ""
+    return ("> Throughput FALLS with concurrency, which is a measurement and not"
+            " a transcription error, for: %s. Every one of those reps answered"
+            " 200 on every request; what changes is how long each took."
+            % "; ".join(hits))
 
 
 def io_line(env_text):
@@ -118,9 +155,9 @@ def io_line(env_text):
             seen = True
     if not rows:
         return "not captured"
-    return "blocked %d-%d, reads %d-%d KB/s, iowait %d-%d%%" % (
+    return "%d-%d process(es) blocked on disk, %.1f-%.1f MB/s read, %d-%d%% iowait" % (
         min(r[0] for r in rows), max(r[0] for r in rows),
-        min(r[1] for r in rows), max(r[1] for r in rows),
+        min(r[1] for r in rows) / 1024.0, max(r[1] for r in rows) / 1024.0,
         min(r[2] for r in rows), max(r[2] for r in rows))
 
 
@@ -157,7 +194,11 @@ def main():
     p("> Every figure is the median of %d reps of 5 seconds each, and `spread` is"
       " half the min-to-max range as a percent of that median. `c` is the number"
       " of concurrent keep-alive connections the load generator held open."
-      % reps)
+      " `vs pkg/web` divides that framework's c=%s median by pkg/web's, so"
+      " 2.00x is twice the requests per second." % (reps, conns[-1]))
+    note = scaling_note(rows, conns)
+    if note:
+        p(note)
     p("> The two concurrency columns are published together because they do not"
       " move together. c=1 is what one request costs with no queue in front of"
       " it; c=64 is the server under load. A framework can lead on one and trail"
