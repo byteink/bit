@@ -249,6 +249,15 @@ fn prepared(c: myConn, text: string): preparedStmt! {
 
 // COM_STMT_PREPARE and its reply: the statement id, how many parameters it
 // takes, and the columns it will return.
+//
+// A FAILURE INSIDE readDefs/skipDefs BELOW IS MARKED FATAL RATHER THAN
+// DRAINED (#5422's enumeration). COM_STMT_PREPARE's reply is TWO independent
+// definition blocks back to back (params, then columns) with no row stage —
+// unlike a result set, there is no single "read until EOF" recovery that
+// covers both a mid-block failure AND the still-untouched second block, and
+// building one for a stage this rare is not worth the risk of draining the
+// wrong number of packets. `transportError` is exactly the marker the pool
+// already honors (stdlib/sql/config.bit) for "the offset is now unknown".
 fn prepareStmt(c: myConn, text: string): preparedStmt! {
   c.w.startCommand()
   c.w.send(writeLe(comStmtPrepare, 1) + text) catch e {
@@ -265,8 +274,13 @@ fn prepareStmt(c: myConn, text: string): preparedStmt! {
   let id = cur.int(4)?
   let cols = cur.int(2)?
   let params = cur.int(2)?
-  skipDefs(c, params)?
-  return preparedStmt{ id: id, params: params, cols: readDefs(c, cols)? }
+  skipDefs(c, params) catch e {
+    fail transportError(e.message())
+  }
+  let defs = readDefs(c, cols) catch e {
+    fail transportError(e.message())
+  }
+  return preparedStmt{ id: id, params: params, cols: defs }
 }
 
 // `n` column definition packets and the EOF that closes them, kept.
@@ -290,6 +304,34 @@ fn readDefs(c: myConn, n: int): []column! {
 // them wrongly would desync every following packet.
 fn skipDefs(c: myConn, n: int): ()! {
   readDefs(c, n)?
+}
+
+// `n` result-column definition packets and their closing EOF, for a result
+// set that HAS a row stage after them (`collectStmt`, unlike a prepare's own
+// definition blocks). A failure partway through drains the rest of this
+// block plus every row up to the terminating EOF/ERR, so the failure this
+// call reports is the only thing wrong with the connection (#5422).
+//
+// Bounded by `n + queryPacketBudget` (`myConn.drainResponse`).
+fn readResultDefs(c: myConn, n: int): []column! {
+  let out = []column(0)
+  let i = 0
+  while (i < n) {
+    let col = parseColumn(c.recv()?) catch e {
+      c.drainResponse(n - i - 1)
+      fail e
+    }
+    out = append(out, col)
+    i = i + 1
+  }
+  if (n > 0) {
+    let eof = c.recv()?
+    if (!isEof(eof)) {
+      c.drainResponse(0)
+      fail transportError("the server sent no EOF after ${n} column definitions")
+    }
+  }
+  return out
 }
 
 // COM_STMT_CLOSE. The server never answers it, so there is nothing to read and
@@ -334,8 +376,13 @@ fn collectStmt(c: myConn, st: preparedStmt): stmtResult! {
   if (packetKind(head) == 0) {
     return stmtResult{ rows: emptyRows(), affected: affectedRows(head)? }
   }
-  let count = readLenEnc(cursor{ s: head, at: 0 })?
-  let cols = readDefs(c, count)?
+  // A malformed count means the number of column-definition packets still
+  // owed cannot be known, so there is nothing safe to drain (#5422, as
+  // `collect`'s own count parse in conn.bit).
+  let count = readLenEnc(cursor{ s: head, at: 0 }) catch e {
+    fail transportError(e.message())
+  }
+  let cols = readResultDefs(c, count)?
   let out = myRows{ cols: columnNames(cols), rows: [][]Value(0), at: 0 - 1 }
   binaryRows(c, out, cols)?
   return stmtResult{ rows: out, affected: 0 }
@@ -368,6 +415,12 @@ fn columnNames(cols: []column): []string {
 
 // Binary row packets until the closing EOF or OK.
 //
+// A DECODE FAILURE (a refused DATETIME column, binary.bit's `binaryValue`)
+// drains the rest of this result set before propagating, so the connection
+// answers the NEXT command with its own reply rather than these leftover
+// row/EOF bytes (#5422) — the packet that failed is already off the wire;
+// what is left is whatever rows and the closing EOF the server still owes.
+//
 // Bounded by `queryPacketBudget`.
 fn binaryRows(c: myConn, out: myRows, cols: []column): ()! {
   let seen = 0
@@ -380,7 +433,11 @@ fn binaryRows(c: myConn, out: myRows, cols: []column): ()! {
     if (isEof(p)) {
       return
     }
-    out.rows = append(out.rows, binaryRow(p, cols)?)
+    let row = binaryRow(p, cols) catch e {
+      c.drainResponse(0)
+      fail e
+    }
+    out.rows = append(out.rows, row)
   }
   fail transportError("the server sent ${queryPacketBudget} packets without " + "ending the result set")
 }
