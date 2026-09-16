@@ -1,0 +1,131 @@
+// pkg/orm/jsoncol.bit — binding a `Json` tree or a `@json` class value into
+// a `jsonb`/`JSON` column, and reading one back (#5086).
+//
+//     t.json("payload")            // schema.bit: the one builder for BOTH
+//                                   // a raw Json tree field and a @json
+//                                   // class field — postgres.bit/mysql.bit
+//                                   // render `jsonb`/`json` either way, so
+//                                   // only the VALUE going in and out
+//                                   // differs, which is what this file is
+//                                   // for.
+//
+//     let v = jsonColumnValue(payload)              // write
+//     let tree = jsonColumnRead(row.value(0), "payload")?           // read
+//     let cfg = jsonColumnDecode<Settings>(row.value(1), "config")? // read
+//
+// SQL NULL VERSUS A JSON NULL (owner decision, this ticket). A SQL NULL
+// (`Value.Null`) and the JSON literal `null` (`Json.JsonNull`) are
+// different values, and this file keeps them different rather than
+// collapsing one into the other:
+//
+//   - `jsonColumnValue` NEVER produces `Value.Null`. A `Json` tree is
+//     always a PRESENT value on this file's side of the boundary —
+//     `Json.JsonNull` (an explicit JSON null document) encodes to the text
+//     "null" and is bound as `Value.Text("null")`, a stored value, not an
+//     absent column.
+//   - A column that may hold no value at all is `Option<Json>`'s job
+//     (schema.bit's own `.nullable()`, `pkg/orm/foreignkey.bit`'s header on
+//     the same `Option<...>` shape for a nullable field): a caller with one
+//     converts `None` to `Value.Null` itself, once, before ever reaching
+//     this file, and converts a decoded value back into `Some(...)` on the
+//     way out.
+//   - `jsonColumnRead`/`jsonColumnDecode<T>` below both FAIL, naming the
+//     column, when handed a `Value.Null` — never silently reading it back
+//     as `Json.JsonNull`. Coercing "no value" into "the value `null`" would
+//     make the two indistinguishable on the read side too.
+//
+// INVALID JSON IS AN ERROR NAMING THE COLUMN, NEVER AN EMPTY VALUE. A row
+// whose stored bytes are not valid JSON — truncated, hand-edited, written by
+// something outside this package — is a corrupted row, not a document that
+// happens to be empty. `JsonColumnError` below names the column and carries
+// the underlying parse/decode failure's own message, for both read paths.
+//
+// A `@json` CLASS FIELD DECODES THROUGH `jsonDecode<T>`, NEVER A SECOND
+// EXTRACTOR (#3977, this ticket's own constraint). `jsonColumnDecode<T>`
+// parses the column's text into a `Json` tree with `jsonParse` and hands it
+// straight to `jsonDecode<T>` — the same field-naming, dotted-path failures
+// a direct call already produces, not reimplemented here.
+//
+// WHY `jsonParse` + `jsonDecode<T>`, NOT `jsonDecodeText<T>`.
+// `jsonDecodeText<T>` is specialised by REWRITING ITS OWN CALL SITE to the
+// concrete class named in the turbofish
+// (compiler/classjsondecodetextcall.bit) and explicitly refuses a type
+// PARAMETER: "the text entry point is specialised by rewriting the call
+// rather than through the instantiation ledger" — so it cannot be called
+// from inside a function, like this one, that is itself generic over `T`.
+// `jsonDecode<T>`, taking an already-parsed `Json`, IS composable from a
+// generic (#4563, compiler/classjsondecodegenericretarget.bit) — that is
+// what lets `jsonColumnDecode<T>` exist as one function instead of a
+// per-entity copy-paste, and is why the parse step is written out here
+// rather than folded into a single call.
+//
+// QUERYING INSIDE THE DOCUMENT IS NOT THIS FILE'S JOB. `payload->>'event' =
+// 'x'` is dialect-specific SQL no builder in this package expresses;
+// `whereRaw` (#5073, raw.bit) is the escape hatch for exactly that, the same
+// as any other expression this package's builders do not cover. Nothing
+// here adds a path operator, on purpose.
+//
+// `Json`/`JsonEntry` are imported here so a `@json` class anywhere in this
+// module (pkg/orm's own tests among them) has the two names E0142
+// (compiler/classjson.bit) requires — see naming.bit's header for the
+// identical package-wide-import reasoning applied to `FieldDesc`/
+// `AttrDesc`. `asText` is imported by generate.bit, this file's sibling in
+// the same module (SPEC §17.1) — a second import here would be E0042.
+
+import { Json, JsonEntry, jsonDecode, jsonEncode, jsonParse } from "std/json"
+
+// Why a column's stored bytes could not become the value asked of them —
+// naming the column so the caller's error says which row/table this is
+// about, not just "invalid JSON". `cause` is the underlying parse/decode
+// failure's own message, carried rather than re-derived.
+export class JsonColumnError {
+  export column: string
+  export cause: string
+
+  message(): string {
+    return "pkg/orm: column '${this.column}' is not usable as JSON: ${this.cause}"
+  }
+}
+
+// `j` as the bound `Value` a driver places into a `jsonb`/`JSON` column —
+// always `Value.Text`, never a SQL NULL (this file's header on NULL versus
+// a JSON null) and never interpolated into SQL text: `save`/`insert`
+// (write.bit) bind every value as a `$n` parameter, the same rule
+// `raw.bit`'s own header states for the one place this package accepts
+// unparsed SQL — and this is not that place.
+export fn jsonColumnValue(j: Json): Value {
+  return Value.Text(jsonEncode(j))
+}
+
+// `v`'s text, or `JsonColumnError` naming `column` when `v` is not
+// `Value.Text` — a `Value.Null` here is a caller/schema mismatch (this
+// file's header on NULL versus a JSON null), not something either read
+// path below silently coerces into a JSON value.
+fn jsonColumnText(v: Value, column: string): string! {
+  return asText(v) catch e {
+    fail JsonColumnError{ column: column, cause: e.message() }
+  }
+}
+
+// Parses column `column`'s stored bytes into a `Json` tree — the read half
+// of a plain `Json`-typed field.
+export fn jsonColumnRead(v: Value, column: string): Json! {
+  let text = jsonColumnText(v, column)?
+  return jsonParse(text) catch e {
+    fail JsonColumnError{ column: column, cause: e.message() }
+  }
+}
+
+// Parses and decodes column `column`'s stored bytes into `T`, a class
+// carrying `@json` — the read half of a `@json` class field. See this
+// file's header for why this goes through `jsonParse` + `jsonDecode<T>`
+// rather than `jsonDecodeText<T>`.
+export fn jsonColumnDecode<T>(v: Value, column: string): T! {
+  let text = jsonColumnText(v, column)?
+  let tree = jsonParse(text) catch e {
+    fail JsonColumnError{ column: column, cause: e.message() }
+  }
+  return jsonDecode<T>(tree) catch e {
+    fail JsonColumnError{ column: column, cause: e.message() }
+  }
+}
