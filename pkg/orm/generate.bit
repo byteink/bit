@@ -37,8 +37,11 @@
 //
 // 5. A DESTRUCTIVE CHANGE IS EMITTED, NEVER OMITTED, with a comment
 //    naming it destructive. `dropColumn` is the only destructive op this
-//    file emits — there is no dropTable path here; a table's own removal
-//    is a hand-written decision, never a diff's.
+//    file emits against an ENTITY table — there is no dropTable path for
+//    one; an entity table's own removal is a hand-written decision, never a
+//    diff's. The one exception is a `@manyToMany` join table (#5390): its
+//    `down()` companion function drops it, because #5081's own decision
+//    makes the ORM its owner, not a human — see `manyToManyDescsFor` below.
 //
 // A COMPOSITE-KEY ENTITY (#5084, more than one `@id` field) NEVER GETS TWO
 // AUTO-INCREMENT COLUMNS (#5395, #5397). `AlterTable.primaryKey` (schema.bit,
@@ -75,13 +78,21 @@
 // once a composite key already exists live, leaves the key untouched, the
 // same as before #5397.
 //
-// MYSQL MAY STILL REFUSE THIS MIGRATION, AT APPLY TIME, NOT HERE.
-// `generate` writes dialect-agnostic schema-builder source (this file's own
-// header, "WHY A NAME READ FROM information_schema..." paragraph) - it
-// never picks a `Dialect` and never renders DDL. `mysql.bit`'s own
-// `mysqlAlterOpStatement` is where a `SetPrimaryKey` op it cannot express
-// safely (its own header, #5397) fails naming MySQL specifically, when
-// whatever runs this generated file against a MySQL connection gets there.
+// MYSQL RENDERS THIS MIGRATION TOO, BECAUSE `generate` ASSERTS WHICH CASE
+// APPLIES (#5400). `generate` writes dialect-agnostic schema-builder source
+// (this file's own header, "WHY A NAME READ FROM information_schema..."
+// paragraph) - it never picks a `Dialect` and never renders DDL. But
+// `mysql.bit`'s own `mysqlAlterOpStatement` cannot safely express "set the
+// primary key" from one op alone (MySQL's `DROP PRIMARY KEY` has no `IF
+// EXISTS` - mysql.bit's own header). `hasLivePrimaryKey` below reads the
+// live `information_schema.table_constraints` - the one live-schema
+// question `SchemaOp` itself deliberately never carries (schema.bit's own
+// header) - and `primaryKeyCallLine` below emits `t.primaryKey(...)`
+// (`AlterOp.SetPrimaryKey`, asserting no key exists yet) or
+// `t.replacePrimaryKey(...)` (`AlterOp.ReplacePrimaryKey`, asserting one
+// already does) accordingly. Postgres renders both ops identically
+// (`postgres.bit`'s own `setPrimaryKeyStatement`), so this assertion only
+// changes MySQL's own output.
 //
 // THE TABLE-NAME GAP, FLAGGED RATHER THAN GUESSED. `naming.bit`'s
 // `tableName` falls back to pluralizing the CLASS NAME when `@table`
@@ -140,7 +151,7 @@ export fn generateInto(db: Data, entities: []TableEntity, name: string, dir: str
   let ops = []string(0)
   for e of entities {
     let table = tableNameOf(e)?
-    let fields = e.tableDescriptor()
+    let fields = withoutManyToMany(e.tableDescriptor())
     let liveCols = liveColumns(db, table)?
     let added = fieldsNotIn(fields, liveCols)
     let removed = colsNotInFields(liveCols, fields)
@@ -148,11 +159,21 @@ export fn generateInto(db: Data, entities: []TableEntity, name: string, dir: str
       continue
     }
     let composite = hasCompositeKey(fields)
-    let primaryKeyCols = []string(0)
+    let primaryKeyCall = ""
     if (composite && hasIdField(added)) {
-      primaryKeyCols = idColumnNames(fields)
+      let replacing = hasLivePrimaryKey(db, table)?
+      primaryKeyCall = primaryKeyCallLine(fields, replacing)
     }
-    ops = append(ops, renderAlterBlock(table, added, removed, composite, primaryKeyCols)?)
+    ops = append(ops, renderAlterBlock(table, added, removed, composite, primaryKeyCall)?)
+  }
+  let downOps = []string(0)
+  for desc of manyToManyDescsFor(entities)? {
+    let liveJoinCols = liveColumns(db, desc.joinTable)?
+    if (len(liveJoinCols) > 0) {
+      continue
+    }
+    ops = append(ops, renderJoinTableCreate(desc))
+    downOps = append(downOps, renderJoinTableDrop(desc.joinTable))
   }
   if (len(ops) == 0) {
     return "pkg/orm: generate: schema already matches every entity given; nothing written"
@@ -163,7 +184,7 @@ export fn generateInto(db: Data, entities: []TableEntity, name: string, dir: str
   let num = nextMigrationNumber(dir)?
   let fileName = "${padStart("${num}", 4, "0")}_${name}.bit"
   let path = pathJoin(dir, fileName)
-  writeFile(path, renderFile(name, ops))?
+  writeFile(path, renderFile(name, ops, downOps))?
   return "pkg/orm: generate: wrote ${path}"
 }
 
@@ -196,6 +217,38 @@ fn liveColumns(db: Data, table: string): []string! {
   let out = []string(0)
   while (rows.next()?) {
     out = append(out, asText(rows.value(0))?)
+  }
+  return out
+}
+
+// Whether `table` already carries a primary key live, read once — the
+// caller's own assertion `mysql.bit`'s renderer needs to pick a safe
+// spelling (#5400, this file's header), because `SchemaOp` itself carries no
+// live-schema state (schema.bit's own header). Read through the ANSI-
+// standard `information_schema.table_constraints` view, same portability as
+// `liveColumns`' own `information_schema.columns` — no dialect-specific
+// query, since `generate` never picks a `Dialect` (this file's header).
+fn hasLivePrimaryKey(db: Data, table: string): bool! {
+  let rows = db.query(
+    "select constraint_name from information_schema.table_constraints where table_name = $1 and constraint_type = 'PRIMARY KEY'",
+    [Value.Text(table)],
+  )?
+  defer rows.close()
+  return rows.next()?
+}
+
+// `fields`, excluding any carrying `@manyToMany` (#5390) — that field names
+// a relation through a join table, never a column of THIS table, and
+// `addColumnCall` below has no mapping for a `[]T` typeName (nor should it
+// gain one): `manyToManyDescsFor`'s own pass, not this ordinary column
+// diff, is what reads a `@manyToMany` field.
+fn withoutManyToMany(fields: []FieldDesc): []FieldDesc {
+  let out = []FieldDesc(0)
+  for f of fields {
+    let (_, found) = attrArg(f.attrs, "manyToMany")
+    if (!found) {
+      out = append(out, f)
+    }
   }
   return out
 }
@@ -336,16 +389,16 @@ fn addColumnCall(f: FieldDesc, composite: bool): string! {
 // cheap and pure) for `destructiveComment`, instead of a sixth parameter -
 // `bit lint`'s own parameter-count ceiling (`spec/LINT.md`) applies to this
 // function too. `composite` picks `addColumnCall`'s `t.addId(...)`/
-// `t.addInt(...)` split; `primaryKeyCols`, non-empty only for a
-// composite-key entity whose diff adds an `@id` column (this file's
-// header), becomes one `t.primaryKey(...)` call, written after every add
-// and before any drop.
+// `t.addInt(...)` split; `primaryKeyCall`, "" unless this diff adds an
+// `@id` column of a composite-key entity (this file's header), is the whole
+// `t.primaryKey(...)`/`t.replacePrimaryKey(...)` call text
+// (`primaryKeyCallLine` below), written after every add and before any drop.
 fn renderAlterBlock(
   table: string,
   added: []FieldDesc,
   removed: []string,
   composite: bool,
-  primaryKeyCols: []string,
+  primaryKeyCall: string,
 ): string! {
   let addedCols = columnNamesOf(added)
   let b = newBuilder()
@@ -354,8 +407,8 @@ fn renderAlterBlock(
     let call = addColumnCall(f, composite)?
     b.write("  ${call}\n")
   }
-  if (len(primaryKeyCols) > 0) {
-    b.write("  t.primaryKey(${primaryKeyCallArgs(primaryKeyCols)})\n")
+  if (primaryKeyCall != "") {
+    b.write("  ${primaryKeyCall}\n")
   }
   for col of removed {
     b.write("  ${destructiveComment(col, addedCols)}\n")
@@ -365,8 +418,25 @@ fn renderAlterBlock(
   return b.toString()
 }
 
-// `primaryKeyCols`, each rendered as a Bit string literal and comma-joined —
-// `t.primaryKey(...)`'s own argument list (`renderAlterBlock` above).
+// The `t.primaryKey(...)`/`t.replacePrimaryKey(...)` call to append to a
+// migration's alter block (#5400) — `replacing` is `generate`'s own
+// assertion, read live off `information_schema` (`hasLivePrimaryKey`
+// above), that `mysql.bit`'s renderer needs to pick a safe MySQL spelling:
+// `t.primaryKey` when the table's key does not exist yet (`AlterOp.
+// SetPrimaryKey`), `t.replacePrimaryKey` when it already does (`AlterOp.
+// ReplacePrimaryKey`). The caller only reaches this when the diff already
+// established a primary-key call is needed (this file's header).
+fn primaryKeyCallLine(fields: []FieldDesc, replacing: bool): string {
+  let callName = "primaryKey"
+  if (replacing) {
+    callName = "replacePrimaryKey"
+  }
+  return "t.${callName}(${primaryKeyCallArgs(idColumnNames(fields))})"
+}
+
+// `cols`, each rendered as a Bit string literal and comma-joined —
+// `t.primaryKey(...)`/`t.replacePrimaryKey(...)`'s own argument list
+// (`primaryKeyCallLine` above).
 fn primaryKeyCallArgs(cols: []string): string {
   let out = []string(0)
   for c of cols {
@@ -422,23 +492,209 @@ fn bitStringLiteral(s: string): string {
   return "\"${out}\""
 }
 
+// One `@manyToMany` field found while walking `entities` (#5390): the
+// entity that declared it, the join table its own attribute names, and the
+// class name it points at — read off the field's own recorded `typeName`
+// (e.g. `"[]Role"`), never off a type parameter's own attributes, which
+// `generate` cannot see (this file's header, same "no reflection" gap
+// `pkg/orm/foreignkey.bit`'s `RelationTarget` exists for). `entity` is kept
+// so `manyToManyDescFrom` can read ITS OWN `tableDescriptor()`/
+// `tableAttrs()` once the other side of the pair is found — both sides
+// must already be in `entities` for `generate` to build the relation at
+// all (rule 3, this file's header: entities are an explicit argument).
+class mtmSide {
+  entity: TableEntity,
+  joinTable: string,
+  pointsAtClass: string,
+}
+
+// The class name a `[]ClassName` field's own recorded `typeName` names, and
+// whether `typeName` was slice-shaped at all — every `@manyToMany` field is
+// declared `[]T` (#5081's own example).
+fn sliceElementClassName(typeName: string): (string, bool) {
+  if (len(typeName) < 3 || typeName[0:2] != "[]") {
+    return ("", false)
+  }
+  return (typeName[2:len(typeName)], true)
+}
+
+// Every `@manyToMany` field across ALL `entities`, one `mtmSide` per field —
+// gathered before any join table is built so a table named by two
+// different entities' fields is recognised as ONE relation, never two
+// independent findings (this file's own rule 1: a diff never guesses a
+// relationship the compiler did not record explicitly on both sides).
+fn manyToManySides(entities: []TableEntity): []mtmSide {
+  let out = []mtmSide(0)
+  for e of entities {
+    for f of e.tableDescriptor() {
+      let (joinTable, found) = attrArg(f.attrs, "manyToMany")
+      if (!found) {
+        continue
+      }
+      let (className, isSlice) = sliceElementClassName(f.typeName)
+      if (!isSlice) {
+        panic("pkg/orm: generate: '@manyToMany(\"${joinTable}\")' on field '${f.name}' is not a '[]T' field ('${f.typeName}')")
+      }
+      out = append(out, mtmSide{ entity: e, joinTable: joinTable, pointsAtClass: className })
+    }
+  }
+  return out
+}
+
+// The `mtmSide`s of `sides` naming `joinTable` — `manyToManyDescsFor`'s own
+// grouping step.
+fn sidesNaming(sides: []mtmSide, joinTable: string): []mtmSide {
+  let out = []mtmSide(0)
+  for s of sides {
+    if (s.joinTable == joinTable) {
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+// `fields`'s own single `@id` column name, or a failure naming `table` —
+// `manyToManyDescFrom`'s own guard: `manyToManyTable`'s foreign keys are
+// single-column, so a side with no `@id` field at all cannot build one.
+fn singleIdColumn(fields: []FieldDesc, table: string): string! {
+  let ids = idColumnNames(fields)
+  if (len(ids) == 0) {
+    fail newError("pkg/orm: generate: '${table}' has no '@id' field; a many-to-many join table needs one to reference")
+  }
+  return ids[0]
+}
+
+// One `ManyToManyDesc` per DISTINCT join table name declared by exactly two
+// `@manyToMany` sides across `entities` (#5390) — refuses (this file's own
+// "never guess" rule) when a join table name is declared by any other
+// count: one means the relation's other half is not in `entities` at all
+// (rule 3: entities are an explicit argument, so `generate` cannot see a
+// class the caller never passed), three or more names an ambiguous join
+// table `manyToManyTable` was never designed to build from more than a
+// pair. `ownerColumn`/`targetColumn` are each read off the OTHER side's own
+// `pointsAtClass` (already known, no reflection needed — this file's own
+// `mtmSide` header), snake_cased plus "_id", #5081's own header convention
+// ("<singular snake_case target>_id"): `a`'s field names the class `b`'s
+// own table is, so `b`'s `pointsAtClass` (naming `a`'s class) is `a`'s own
+// join-table column.
+fn manyToManyDescsFor(entities: []TableEntity): []ManyToManyDesc! {
+  let sides = manyToManySides(entities)
+  let seen = map<string, bool>(0)
+  let out = []ManyToManyDesc(0)
+  for s of sides {
+    if (seen[s.joinTable]) {
+      continue
+    }
+    seen[s.joinTable] = true
+    let matches = sidesNaming(sides, s.joinTable)
+    if (len(matches) != 2) {
+      fail newError(
+          "pkg/orm: generate: '@manyToMany(\"${s.joinTable}\")' is declared " +
+          "by ${len(matches)} field(s) across the given entities, not the " +
+          "two sides a join table needs — both classes on this relation " +
+          "must be in the entities list passed to generate",
+      )
+    }
+    out = append(out, manyToManyDescFrom(matches[0], matches[1])?)
+  }
+  return out
+}
+
+fn manyToManyDescFrom(a: mtmSide, b: mtmSide): ManyToManyDesc! {
+  let aFields = a.entity.tableDescriptor()
+  let bFields = b.entity.tableDescriptor()
+  if (hasCompositeKey(aFields) || hasCompositeKey(bFields)) {
+    fail newError(
+        "pkg/orm: generate: '@manyToMany(\"${a.joinTable}\")' cannot build a " +
+        "join table — one of its two classes has a composite key, and a " +
+        "join table's foreign key is single-column",
+    )
+  }
+  let ownerTable = tableNameOf(a.entity)?
+  let targetTable = tableNameOf(b.entity)?
+  return ManyToManyDesc{
+    joinTable: a.joinTable,
+    ownerTable: ownerTable,
+    ownerIdColumn: singleIdColumn(aFields, ownerTable)?,
+    ownerColumn: "${toSnake(b.pointsAtClass)}_id",
+    targetTable: targetTable,
+    targetIdColumn: singleIdColumn(bFields, targetTable)?,
+    targetColumn: "${toSnake(a.pointsAtClass)}_id",
+  }
+}
+
+// `manyToManyTable(desc)`'s own call, rendered as Bit source — this file
+// never invokes it directly and reserializes the result (rule 2, this
+// file's header: `generate` never applies anything); it writes the SAME
+// call text a hand-written migration would (#5081's own `manytomany.bit`
+// example), into the SAME `up()` block a column diff's `alter(...)` calls
+// already go into.
+fn renderJoinTableCreate(desc: ManyToManyDesc): string {
+  return "manyToManyTable(${manyToManyDescLiteral(desc)})"
+}
+
+fn manyToManyDescLiteral(desc: ManyToManyDesc): string {
+  return "ManyToManyDesc{\n" +
+    "    joinTable: ${bitStringLiteral(desc.joinTable)}, ownerColumn: ${bitStringLiteral(desc.ownerColumn)},\n" +
+    "    ownerTable: ${bitStringLiteral(desc.ownerTable)}, ownerIdColumn: ${bitStringLiteral(desc.ownerIdColumn)},\n" +
+    "    targetColumn: ${bitStringLiteral(desc.targetColumn)}, targetTable: ${bitStringLiteral(desc.targetTable)},\n" +
+    "    targetIdColumn: ${bitStringLiteral(desc.targetIdColumn)},\n" +
+    "  }"
+}
+
+// `drop(joinTable)`'s own call, rendered as Bit source — the rollback half
+// of a join table this migration's `up()` created (#5390); never for an
+// ordinary entity table (this file's own rule 5), only for the one table a
+// `@manyToMany` attribute makes the ORM's to own, not a human's (#5081's
+// own decision).
+fn renderJoinTableDrop(joinTable: string): string {
+  return "drop(${bitStringLiteral(joinTable)})"
+}
+
 // The migration file's whole source: a header naming what generated it,
 // an `import` for the schema builder, and one `up()` gathering every
-// table's alter block in the order `entities` gave them.
-fn renderFile(name: string, ops: []string): string {
+// table's alter block in the order `entities` gave them, plus one `down()`
+// dropping any join table `up()` created (#5390), when there is one.
+fn renderFile(name: string, ops: []string, downOps: []string): string {
   let b = newBuilder()
   b.write("// Generated by orm.generate(\"${commentSafe(name)}\") — review before committing.\n")
   b.write("// A dropColumn next to an addColumn in the same block may be a\n")
   b.write("// rename; this generator never guesses one — edit it into a\n")
   b.write("// renameColumn(...) call if that is what you meant (#5067).\n\n")
-  b.write("import { alter } from \"orm\"\n\n")
+  b.write(renderFileImportLine(downOps))
   b.write("export fn up() {\n")
   for op of ops {
     b.write(indentBlock(op))
     b.write("\n")
   }
   b.write("}\n")
+  if (len(downOps) > 0) {
+    b.write("\n// The rollback half of the join table(s) this migration's up()\n")
+    b.write("// created (#5390) — never for an ordinary entity table (this file's\n")
+    b.write("// own rule 5): a @manyToMany join table is the one table this\n")
+    b.write("// generator ever creates or drops on its own, since #5081's own\n")
+    b.write("// decision makes the ORM its owner, not a human.\n")
+    b.write("export fn down() {\n")
+    for op of downOps {
+      b.write(indentBlock(op))
+      b.write("\n")
+    }
+    b.write("}\n")
+  }
   return b.toString()
+}
+
+// `import { alter } from "orm"`, widened to also bring in `drop`,
+// `manyToManyTable` and `ManyToManyDesc` when the file has a `down()` block
+// to compile — those three are used ONLY there and in the matching `up()`
+// join-table calls (`renderJoinTableCreate`/`renderJoinTableDrop` above),
+// which are always added together (`generateInto`'s own loop), so `downOps`
+// being non-empty is exactly the condition that needs them.
+fn renderFileImportLine(downOps: []string): string {
+  if (len(downOps) > 0) {
+    return "import { alter, drop, manyToManyTable, ManyToManyDesc } from \"orm\"\n\n"
+  }
+  return "import { alter } from \"orm\"\n\n"
 }
 
 fn indentBlock(s: string): string {
