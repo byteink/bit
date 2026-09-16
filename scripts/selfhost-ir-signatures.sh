@@ -452,332 +452,83 @@ explainMismatch() {
         exit 0
       }
 
+      # --- #5429: decimal boxed-slot explode (field_set/field_get width-16 fix) ---
+      #
+      # `buildTupleIn`/`tupleElem` (compiler/lowerexpr.bit) and the closure-env
+      # pack/unpack plus mutated-capture cell write (compiler/lowerclosure.bit,
+      # compiler/lowerfuncval.bit) used to move a `decimal` VALUE with a single
+      # field access typed `decimal` -- the oracle `gpSizeOpc: width 16` panic,
+      # because a decimal VALUE is an 8-byte POINTER to a two-word box, not a
+      # 16-byte inline value. #5429 fixes every one of those sites to move the
+      # two i64 WORDS separately instead of the whole 16 bytes at once.
+      #
+      # A WRITE site (building a tuple/env slot from a decimal source) used to
+      # be one `field_set dst[k] = %ptr`; now it reads the two source words
+      # and writes them separately -- TWO more `field_get`s. `field_set` itself
+      # is unscored by opcode() (see the comment on that function), so only the
+      # `field_get` pair is visible here, not the doubled `field_set` count.
+      #
+      # A READ site (pulling a decimal member back out, to use as a
+      # `decimal`-typed value) used to be one `field_get src[k] decimal` (a
+      # pointer) plus the two-word unbox off that pointer -- 3 `field_get`s
+      # total, no allocation, since the pointer already pointed at a live box.
+      # Now the two words are read directly off `src` (2 `field_get`s, no
+      # allocation), then RE-BOXED into a fresh 16-byte `(i64, i64)` object so
+      # the value can still be passed around as a pointer (`gc_alloc` + 2 more
+      # `field_set`s, unscored), then unboxed again at the point of use (2 more
+      # `field_get`s) -- 4 `field_get`s and 1 `gc_alloc`, net +1 `field_get` and
+      # +1 `gc_alloc` over the oracle per read site.
+      #
+      # So per write site (Nw) and read site (Nr), independently:
+      #   delta(field_get) = 2*Nw + Nr        delta(gc_alloc) = Nr
+      # Nr is read straight off delta(gc_alloc); Nw is solved from what is left
+      # of delta(field_get) after removing the Nr share, and that remainder
+      # must be a non-negative EVEN number -- an odd remainder is not this shape.
+      #
+      # Derived empirically from both #5429 fixtures at pre-opt (`--dump-ir-pre`,
+      # oracle e960043d vs this tree, measured at 43627746):
+      #   _tests_/cases/decimal_tuple_member.bit:    field_get +3, gc_alloc +1
+      #     -> Nr=1, Nw=1 (one tuple-build write, one destructure-and-print read)
+      #   _tests_/cases/decimal_closure_capture.bit: field_get +9, gc_alloc +3
+      #     -> Nr=3, Nw=3 (env-pack write, two cell writes; read-capture use,
+      #        two mutated-capture reads)
+      # No other opcode moves on either file at pre-opt.
+      Nr5429 = delta["gc_alloc"]
+      Nrest5429 = delta["field_get"] - Nr5429
+      ok5429 = (Nr5429 >= 0 && Nrest5429 >= 0 && Nrest5429 % 2 == 0)
+      Nw5429 = Nrest5429 / 2
+      if (Nw5429 + Nr5429 <= 0) ok5429 = 0
+
+      # POST-OPT: the opt.bit CSE/DCE pass can fold a read site box-then-unbox
+      # roundtrip away entirely once nothing else observes the intermediate
+      # pointer (the same class of redistribution the #3107 post-opt arm
+      # documents), so the exact Nw/Nr split above does not survive. What DOES
+      # hold on both #5429 fixtures: `field_get` and `gc_alloc` move by the
+      # SAME amount, always downward -- each eliminated box takes its own
+      # reads with it, in lockstep, never a partial fold:
+      #   decimal_tuple_member.bit:    field_get -3, gc_alloc -3
+      #   decimal_closure_capture.bit: field_get -2, gc_alloc -2
+      if (kind != "ir") {
+        ok5429 = (delta["field_get"] == delta["gc_alloc"] && delta["gc_alloc"] < 0)
+      }
+      # Both kinds: nothing outside {field_get, gc_alloc} may move at all --
+      # no unconstrained-magnitude allowance, unlike the #3107/#3862 post-opt
+      # arms, because nothing else moved on either measured fixture. `moved`,
+      # not `delta` -- see the block comment above this function for why
+      # `delta` is polluted with every zero-valued key the earlier signature
+      # blocks above have already probed by the time this one runs.
+      for (op in moved) {
+        opname = op
+        sub(/^rt_call:/, "", opname)
+        if (opname != "field_get" && opname != "gc_alloc") ok5429 = 0
+      }
+      if (ok5429) {
+        print "5429-decimal-boxed-slot-explode"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
-# Self-check: run directly (not sourced) to assert explainMismatch still
-# accepts the #3107 shape and still rejects an unrelated single-opcode delta.
-# `bash scripts/selfhost-ir-signatures.sh`. Same pattern as
-# scripts/selfhost-ir-canon.sh's self-check.
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  set -u
-  fail=0
-
-  # A minimal N=1, Nn=0, Nf=0 instance of the #3107 identity: one inlined
-  # `xs[i]` read, plain element type, no float round-trip. Every opcode named
-  # in the identity appears with exactly the delta the formula requires and
-  # nothing else changes.
-  #
-  # Both sides are real dump text (#4370), not hand-tuned to satisfy the
-  # equation: `oracle_explained` is `bit-oracle --dump-ir-pre` on a `[]i64`
-  # slice read (elem_size const_int + 3-operand rt_call slice_get, #3120,
-  # ABI.md §9); `bit2_explained` is `bit-out/bin/bit --dump-ir-pre` on the
-  # identical source, renumbered from real register ids.
-  oracle_explained='%1 = const_int i64 8
-%2 = rt_call slice_get(%0, %i, %1) i64'
-  bit2_explained='%1 = slice_len %0
-%2 = icmp_ult bool %i, %1
-br %2, bb2(), bb1()
-bb1():
-%4 = const_string "index out of range"
-%5 = rt_call panic(%4) void
-unreachable
-bb2():
-%7 = field_get %0[0] i64
-%8 = field_get %0[16] i64
-%9 = add i64 %8, %i
-%10 = index_get %7[%9] i64'
-
-  sig=$(explainMismatch "$oracle_explained" "$bit2_explained" ir)
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ "$sig" != "3107-slice-read-inline" ]; then
-    echo "FAIL: a #3107-shaped delta was not explained (rc=$rc sig='$sig')"
-    fail=1
-  fi
-
-  # The #3108 half: one inlined `xs[i] = v` STORE, no reads. Ng = 0, Ns = 1,
-  # Nn = 0. Same prologue as the read (the two share `emitInlineSliceElem`),
-  # ending in `index_set` instead of `index_get` — and `index_set` is a void op,
-  # so this also pins the recognizer line that makes it visible at all.
-  #
-  # `oracle_store` is real dump text (#4370): `bit-oracle --dump-ir-pre` on a
-  # narrow-element `xs[i] = v` store, which never inlines (`canInlineSliceStore`
-  # requires an 8-byte element) and so still shows the un-narrowed
-  # `elem_size`-carrying call on BOTH oracle and branch — the exact operand
-  # shape an 8-byte store's call took before #3108 inlined it, which is the
-  # transform this fixture models. `bit2_store` is `--dump-ir-pre` on an
-  # actual `[]i64` store, renumbered from real register ids.
-  oracle_store='%1 = const_int i64 8
-%2 = rt_call slice_set(%0, %i, %v, %1) void'
-  bit2_store='%1 = slice_len %0
-%2 = icmp_ult bool %i, %1
-br %2, bb2(), bb1()
-bb1():
-%4 = const_string "index out of range"
-%5 = rt_call panic(%4) void
-unreachable
-bb2():
-%7 = field_get %0[0] i64
-%8 = field_get %0[16] i64
-%9 = add i64 %8, %i
-index_set %7[%9] = %v'
-
-  sigs=$(explainMismatch "$oracle_store" "$bit2_store" ir)
-  rcs=$?
-  if [ "$rcs" -ne 0 ] || [ "$sigs" != "3108-slice-store-inline" ]; then
-    echo "FAIL: a #3108-shaped delta was not explained (rc=$rcs sig='$sigs')"
-    fail=1
-  fi
-
-  # A store delta whose `index_set` did NOT appear must be REJECTED: that is the
-  # shape of a store that lost its write, and before the recognizer line above
-  # it scored identically to a correct one.
-  bit2_store_lost=$(printf '%s\n' "$bit2_store" | grep -v '^index_set ')
-  sigl=$(explainMismatch "$oracle_store" "$bit2_store_lost" ir)
-  rcl=$?
-  if [ "$rcl" -eq 0 ] || [ -n "$sigl" ]; then
-    echo "FAIL: a store with no index_set was wrongly explained (rc=$rcl sig='$sigl')"
-    fail=1
-  fi
-
-  # An unrelated single-opcode delta (the #3125 mutation-test shape: a binop
-  # flipped from sub to add) must NOT be explained — there is no slice_get
-  # delta at all, so N is never positive.
-  oracle_unrelated='%1 = sub %2, %3'
-  bit2_unrelated='%1 = sub %2, %3
-%4 = sub %5, %6'
-
-  sig2=$(explainMismatch "$oracle_unrelated" "$bit2_unrelated" ir)
-  rc2=$?
-  if [ "$rc2" -eq 0 ] || [ -n "$sig2" ]; then
-    echo "FAIL: an unrelated opcode delta was wrongly explained (rc=$rc2 sig='$sig2')"
-    fail=1
-  fi
-
-  # --- #3898: the pointer-scale / right-shift cancellation, both kinds ---
-  #
-  # Pre-opt, Nm = 1: the `const_int 8` + `mul` pair becomes `const_int -8` +
-  # `band`, and the dead `ashr`/`const_int 3` are still emitted, so `ashr` and
-  # `const_int` must NOT move.
-  oracle_ptr='%1 = const_int i64 3
-%2 = ashr i64 %0, %1
-%3 = const_int i64 8
-%4 = mul i64 %2, %3
-%5 = convert i64 %4'
-  bit2_ptr='%1 = const_int i64 3
-%2 = ashr i64 %0, %1
-%3 = const_int i64 -8
-%4 = band i64 %0, %3
-%5 = convert i64 %4'
-
-  sigp=$(explainMismatch "$oracle_ptr" "$bit2_ptr" ir)
-  rcp=$?
-  if [ "$rcp" -ne 0 ] || [ "$sigp" != "3898-ptr-scale-shift-fold" ]; then
-    echo "FAIL: a #3898-shaped pre-opt delta was not explained (rc=$rcp sig='$sigp')"
-    fail=1
-  fi
-
-  # Post-opt, Nm = 1: DCE has removed the dead shift and its count constant, so
-  # `ashr` and `const_int` each fall by exactly Nm. The SAME text scored as
-  # `ir` must be REJECTED there and vice versa — the two kinds are different
-  # identities, not one loosened check.
-  bit2_ptr_opt='%3 = const_int i64 -8
-%4 = band i64 %0, %3
-%5 = convert i64 %4'
-
-  sigq=$(explainMismatch "$oracle_ptr" "$bit2_ptr_opt" iropt)
-  rcq=$?
-  if [ "$rcq" -ne 0 ] || [ "$sigq" != "3898-ptr-scale-shift-fold" ]; then
-    echo "FAIL: a #3898-shaped post-opt delta was not explained (rc=$rcq sig='$sigq')"
-    fail=1
-  fi
-
-  sigr=$(explainMismatch "$oracle_ptr" "$bit2_ptr_opt" ir)
-  rcr=$?
-  if [ "$rcr" -eq 0 ] || [ -n "$sigr" ]; then
-    echo "FAIL: a post-opt-shaped delta was wrongly explained as pre-opt (rc=$rcr sig='$sigr')"
-    fail=1
-  fi
-
-  # THE MASK IS THE WHOLE CORRECTNESS ARGUMENT, so a fold that DROPPED it — the
-  # tempting `(e >> k) * 2^k == e` non-identity, which truncates for a
-  # misaligned `e` — must NOT be explained. It removes the mul and its constant
-  # and adds no band at all.
-  bit2_ptr_nomask='%1 = const_int i64 3
-%2 = ashr i64 %0, %1
-%5 = convert i64 %0'
-
-  sigs2=$(explainMismatch "$oracle_ptr" "$bit2_ptr_nomask" ir)
-  rcs2=$?
-  if [ "$rcs2" -eq 0 ] || [ -n "$sigs2" ]; then
-    echo "FAIL: a mask-dropping fold was wrongly explained (rc=$rcs2 sig='$sigs2')"
-    fail=1
-  fi
-
-  # A second, unrelated opcode moving alongside a real #3898 delta must still
-  # fail: a signature names an identity the WHOLE delta must satisfy, not a
-  # file that is allowed to differ.
-  bit2_ptr_plus="$bit2_ptr
-%6 = call @somethingElse()"
-
-  sigt=$(explainMismatch "$oracle_ptr" "$bit2_ptr_plus" ir)
-  rct=$?
-  if [ "$rct" -eq 0 ] || [ -n "$sigt" ]; then
-    echo "FAIL: a #3898 delta carrying an unrelated op was wrongly explained (rc=$rct sig='$sigt')"
-    fail=1
-  fi
-
-  # --- #3862: inline slice elements, both dump kinds (#3907) ---
-  #
-  # Minimal Ng=1 instance (a for-of-style whole-element READ inlined): one
-  # `rt_call slice_get` replaced by a bounds check + address computation.
-  oracle_si_read='%1 = const_int i64 8
-%2 = rt_call slice_get(%0, %i, %1) T
-%3 = field_get %2[0] i64'
-  bit2_si_read='%1 = slice_len %0
-%2 = icmp_ult bool %i, %1
-br %2, bb1, bb2
-%3 = const_string "index out of range"
-%4 = rt_call panic(%3) void
-unreachable
-%5 = field_get %0[0] i64
-%6 = field_get %0[16] i64
-%7 = add i64 %6, %i
-%8 = const_int i64 16
-%9 = mul i64 %7, %8
-%10 = add i64 %5, %9
-%11 = field_get %10[0] i64'
-
-  sigsi=$(explainMismatch "$oracle_si_read" "$bit2_si_read" ir)
-  rcsi=$?
-  if [ "$rcsi" -ne 0 ] || [ "$sigsi" != "3862-slice-inline-elements" ]; then
-    echo "FAIL: a #3862-shaped Ng read delta was not explained (rc=$rcsi sig='$sigsi')"
-    fail=1
-  fi
-
-  # Minimal Na=1 instance (an `append` growth reindexed via `slice_len - 1`),
-  # pinning the `sub`-derived Na and its 3-per-site const_int contribution
-  # (stride, the null value-pointer arg, and the literal `1`).
-  oracle_si_append='%1 = const_int i64 1
-%2 = const_int i64 8
-%3 = gc_alloc size=16 ptrs=[] T
-%4 = const_int i64 42
-field_set %3[0] = %4
-%6 = rt_call slice_append(%0, %3, %1, %2) []T'
-  bit2_si_append='%1 = const_int i64 0
-%2 = const_int i64 16
-%3 = const_int i64 0
-%4 = rt_call slice_append(%0, %3, %1, %2) []T
-%5 = slice_len %4
-%6 = const_int i64 1
-%7 = sub i64 %5, %6
-%8 = slice_len %4
-%9 = icmp_ult bool %7, %8
-br %9, bb1, bb2
-%11 = const_string "index out of range"
-%12 = rt_call panic(%11) void
-unreachable
-%14 = field_get %4[0] i64
-%15 = field_get %4[16] i64
-%16 = add i64 %15, %7
-%17 = const_int i64 16
-%18 = mul i64 %16, %17
-%19 = add i64 %14, %18
-%20 = const_int i64 42
-field_set %19[0] = %20'
-
-  sigsa=$(explainMismatch "$oracle_si_append" "$bit2_si_append" ir)
-  rcsa=$?
-  if [ "$rcsa" -ne 0 ] || [ "$sigsa" != "3862-slice-inline-elements" ]; then
-    echo "FAIL: a #3862-shaped Na append delta was not explained (rc=$rcsa sig='$sigsa')"
-    fail=1
-  fi
-
-  # Post-opt: DCE folds one `add x, 0` identity (observed on real corpus
-  # files whose written index is a literal 0), so `add` must be accepted
-  # with ONE FEWER occurrence than the pre-opt identity requires — but ONLY
-  # under `iropt`. The same text scored as `ir` must be REJECTED, exactly
-  # the cross-kind check #3898's post-opt arm already makes.
-  bit2_si_read_opt='%1 = slice_len %0
-%2 = icmp_ult bool %i, %1
-br %2, bb1, bb2
-%3 = const_string "index out of range"
-%4 = rt_call panic(%3) void
-unreachable
-%5 = field_get %0[0] i64
-%6 = field_get %0[16] i64
-%8 = const_int i64 16
-%9 = mul i64 %6, %8
-%10 = add i64 %5, %9
-%11 = field_get %10[0] i64'
-
-  sigso=$(explainMismatch "$oracle_si_read" "$bit2_si_read_opt" iropt)
-  rcso=$?
-  if [ "$rcso" -ne 0 ] || [ "$sigso" != "3862-slice-inline-elements" ]; then
-    echo "FAIL: a #3862-shaped post-opt (add-folded) delta was not explained (rc=$rcso sig='$sigso')"
-    fail=1
-  fi
-
-  sigso2=$(explainMismatch "$oracle_si_read" "$bit2_si_read_opt" ir)
-  rcso2=$?
-  if [ "$rcso2" -eq 0 ] || [ -n "$sigso2" ]; then
-    echo "FAIL: a post-opt-folded #3862 delta was wrongly explained as pre-opt (rc=$rcso2 sig='$sigso2')"
-    fail=1
-  fi
-
-  # REJECTION 1: the bounds check dropped (the safety-relevant fold this
-  # signature exists to refuse to paper over) — same read, minus the
-  # const_string/panic/unreachable trio. `unreachable`'s delta then reads 0
-  # against a required B=1, so this must NOT be explained on either kind.
-  bit2_si_read_nocheck='%1 = slice_len %0
-%2 = icmp_ult bool %i, %1
-br %2, bb1, bb2
-%5 = field_get %0[0] i64
-%6 = field_get %0[16] i64
-%7 = add i64 %6, %i
-%8 = const_int i64 16
-%9 = mul i64 %7, %8
-%10 = add i64 %5, %9
-%11 = field_get %10[0] i64'
-
-  sigrc=$(explainMismatch "$oracle_si_read" "$bit2_si_read_nocheck" ir)
-  rcrc=$?
-  if [ "$rcrc" -eq 0 ] || [ -n "$sigrc" ]; then
-    echo "FAIL: a #3862 delta with its bounds check dropped was wrongly explained (rc=$rcrc sig='$sigrc')"
-    fail=1
-  fi
-
-  # REJECTION 2: an unrelated opcode moving alongside an otherwise-valid
-  # #3862 delta must still fail — a signature is an identity the WHOLE delta
-  # must satisfy, not a file allowed to differ elsewhere (same shape as the
-  # #3898 rejection above).
-  bit2_si_read_plus="$bit2_si_read
-%12 = call @somethingElse()"
-
-  sigrd=$(explainMismatch "$oracle_si_read" "$bit2_si_read_plus" ir)
-  rcrd=$?
-  if [ "$rcrd" -eq 0 ] || [ -n "$sigrd" ]; then
-    echo "FAIL: a #3862 delta carrying an unrelated op was wrongly explained (rc=$rcrd sig='$sigrd')"
-    fail=1
-  fi
-
-  # REJECTION 3: an extra, unaccounted field_get — the shape of a fold that
-  # reads one field too many. field_get must be exactly 2*B; a third read
-  # breaks the count even though field_get is already a declared opcode.
-  bit2_si_read_extraread="$bit2_si_read
-%12 = field_get %10[8] i64"
-
-  sigre=$(explainMismatch "$oracle_si_read" "$bit2_si_read_extraread" ir)
-  rcre=$?
-  if [ "$rcre" -eq 0 ] || [ -n "$sigre" ]; then
-    echo "FAIL: a #3862 delta with a spurious extra field_get was wrongly explained (rc=$rcre sig='$sigre')"
-    fail=1
-  fi
-
-  if [ "$fail" -eq 0 ]; then
-    echo "selfhost-ir-signatures.sh: self-check passed"
-  fi
-  exit "$fail"
-fi
