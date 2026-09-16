@@ -63,6 +63,20 @@
 // red-before/green-after; a wider audit is separate follow-up work, filed as
 // its own ticket rather than silently exempting any file from this gate.
 //
+// PROSE LINKS (#5401). Compiling ```bit blocks says nothing about the prose
+// around them: `docs/dialect.md` linked `../README.md#dialect-vs-
+// upsertdialect` and that anchor stopped existing the moment #5384 renamed
+// the heading it pointed at — a person caught it, no gate did. So every page
+// this file already reads is also scanned (fenced blocks stripped first, so
+// an example's own brackets/parens are never mistaken for prose) for
+// `[text](target)` markdown links: a relative `target` must resolve to a
+// real file (checked against the page's own directory), and a `#anchor` on
+// either a same-page or cross-page link must match a real heading's GitHub-
+// style slug in the resolved file. No allowlist — a broken link or a broken
+// anchor genuinely broke; this cannot cry wolf on a legitimate prose word
+// the way a symbol-name check would (a backticked-identifier check was
+// considered and rejected here for exactly that reason; see the ticket).
+//
 // Registered in `coreSteps()` (tools/build/defs.bit) beside `test-packages`,
 // deliberately NOT `gateSteps()` — same reason as every other package gate:
 // this must never grow the mandatory `./make test` suite. Added to the `pkg`
@@ -78,8 +92,8 @@
 
 import { exists, isDir, mkdir, readDir, readFile, remove, writeFile } from "std/fs"
 import { envOr, exit } from "std/os"
-import { join } from "std/path"
-import { contains, hasSuffix, indexOf, parseInt } from "std/strings"
+import { clean, dir as pageDir, join } from "std/path"
+import { contains, hasPrefix, hasSuffix, indexOf, parseInt, split, toLower, trimSpace } from "std/strings"
 import { now } from "std/time"
 import { repoRoot, trimInfo } from "./docsrunner"
 
@@ -94,6 +108,10 @@ const perBlockMarker: string = "<!-- doctest: per-block -->"
 // close to it, and a page that somehow hit it would rather be truncated
 // loudly here than let the extractor run unbounded.
 const maxBlocksPerPage: int = 64
+
+// Same bound, for markdown links per page — the densest page in this corpus
+// today (`pkg/orm/docs/README.md`) carries about two dozen.
+const maxLinksPerPage: int = 256
 
 // `osRunBounded`'s result encoding (ABI.md §19), same constants
 // `_tests_/bit/packagesgate.bit` already names.
@@ -125,12 +143,15 @@ class Stats {
   jobs: int,
   failures: int,
   fmtFailures: int,
+  linksChecked: int,
+  linkFailures: int,
   nextIdx: int, // the next scratch-dir index to hand out, so it survives across pages
 }
 
 fn zeroStats(): Stats {
   return Stats{
-    pages: 0, pagesWithBlocks: 0, totalBlocks: 0, jobs: 0, failures: 0, fmtFailures: 0, nextIdx: 0,
+    pages: 0, pagesWithBlocks: 0, totalBlocks: 0, jobs: 0, failures: 0, fmtFailures: 0,
+    linksChecked: 0, linkFailures: 0, nextIdx: 0,
   }
 }
 
@@ -235,6 +256,202 @@ fn normalizeTrailingNewline(src: string): string {
     trimmed = trimmed[:len(trimmed) - 1]
   }
   return trimmed + "\n"
+}
+
+// `md` with every fenced block's body removed — a line-oriented toggle on a
+// `` ``` `` line, same "any info string, whole block" scope `extractBlocks`
+// uses for the tag itself, so an example's own `[`/`]`/`(`/`)` bytes can
+// never be mistaken for a markdown link in the prose scan below.
+fn stripFences(md: string): string {
+  let out = ""
+  let inFence = false
+  for line of split(md, "\n") {
+    if (hasPrefix(trimSpace(line), "```")) {
+      inFence = !inFence
+      continue
+    }
+    if (!inFence) {
+      out = out + line + "\n"
+    }
+  }
+  return out
+}
+
+// A GitHub-style heading anchor: lowercase, letters/digits/`_`/`-` kept
+// as-is, a space becomes `-`, everything else (backticks, punctuation)
+// dropped. Verified against this repo's own headings: "`Dialect` vs
+// `ServerDialect`" -> `dialect-vs-serverdialect` (`pkg/orm/README.md`,
+// linked from `pkg/orm/docs/dialect.md`), and "upsert - insert or update in
+// one statement, with two real limits" -> `upsert---insert-or-update-in-
+// one-statement-with-two-real-limits` (`pkg/orm/docs/write.md`, linked from
+// `pkg/orm/docs/version.md`) — the run of hyphens there is a literal `-`
+// beside two collapsed spaces, not a bug.
+fn slugify(text: string): string {
+  let lower = toLower(text)
+  let out = ""
+  let i = 0
+  let n = len(lower)
+  while (i < n) {
+    let ch = lower[i]
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+      out = out + string([ch])
+    } else if (ch == ' ') {
+      out = out + "-"
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Every ATX heading's (`#` through `######`, a space, then text) slug, in
+// document order — duplicates included, since a set membership check is all
+// a link target needs. `prose` is expected already fence-stripped, so a
+// fenced example that happens to show markdown syntax never contributes a
+// fake heading.
+fn headingSlugs(prose: string): []string {
+  let out = []string(0)
+  for line of split(prose, "\n") {
+    let t = trimSpace(line)
+    if (!hasPrefix(t, "#")) {
+      continue
+    }
+    let i = 0
+    while (i < len(t) && t[i] == '#') {
+      i = i + 1
+    }
+    if (i == 0 || i > 6 || i >= len(t) || t[i] != ' ') {
+      continue
+    }
+    out = append(out, slugify(trimSpace(t[i:])))
+  }
+  return out
+}
+
+fn containsStr(items: []string, target: string): bool {
+  for it of items {
+    if (it == target) {
+      return true
+    }
+  }
+  return false
+}
+
+// Every `[text](target)` link's raw `target` in `prose`, document order, an
+// image (`![...]`) excluded since its target is an asset, not a doc page. A
+// forward scan: this corpus has no link text containing its own `[`/`]`, so
+// the first `]` after an unmatched `[` is always the real close.
+fn extractLinkTargets(prose: string): []string {
+  let out = []string(0)
+  let rest = prose
+  let bound = 0
+  while (bound < maxLinksPerPage) {
+    bound = bound + 1
+    let openRel = indexOf(rest, "[")
+    if (openRel < 0) {
+      break
+    }
+    let o = int(openRel)
+    let isImage = o > 0 && rest[o - 1] == '!'
+    let afterOpen = rest[o + 1:]
+    let closeRel = indexOf(afterOpen, "]")
+    if (closeRel < 0) {
+      break
+    }
+    let cb = int(closeRel)
+    let afterClose = afterOpen[cb + 1:]
+    if (len(afterClose) == 0 || afterClose[0] != '(') {
+      rest = afterOpen
+      continue
+    }
+    let afterParen = afterClose[1:]
+    let closeParenRel = indexOf(afterParen, ")")
+    if (closeParenRel < 0) {
+      break
+    }
+    let cp = int(closeParenRel)
+    if (!isImage) {
+      out = append(out, afterParen[:cp])
+    }
+    rest = afterParen[cp + 1:]
+  }
+  return out
+}
+
+// Whether `target` is one this gate can resolve on disk at all — an external
+// URL or a `mailto:` has nothing here to check against.
+fn isCheckableLink(target: string): bool {
+  if (len(target) == 0) {
+    return false
+  }
+  if (contains(target, "://")) {
+    return false
+  }
+  if (hasPrefix(target, "mailto:")) {
+    return false
+  }
+  return true
+}
+
+// `target` split on its first `#`: the file part (possibly empty, for a
+// same-page anchor) and the anchor part (possibly empty, for a plain link).
+fn splitTarget(target: string): (string, string) {
+  let hashRel = indexOf(target, "#")
+  if (hashRel < 0) {
+    return (target, "")
+  }
+  let h = int(hashRel)
+  return (target[:h], target[h + 1:])
+}
+
+// One link: its file part (if any) must exist relative to `page`'s own
+// directory, and its anchor part (if any) must match a real heading slug in
+// whichever file the link actually points at — the resolved file when there
+// is one, `page` itself (via `selfHeadings`) otherwise.
+fn checkOneLink(page: string, target: string, selfHeadings: []string, st: Stats): Stats {
+  let out = st
+  let (filePart, anchorPart) = splitTarget(target)
+  let targetPage = page
+  if (len(filePart) > 0) {
+    targetPage = clean(join(pageDir(page), filePart))
+    if (!exists(targetPage)) {
+      out.linkFailures = out.linkFailures + 1
+      eprint("\npkgdocsgate: FAIL ${page} links '${target}' — no such file: ${targetPage}\n")
+      return out
+    }
+  }
+  if (len(anchorPart) == 0) {
+    return out
+  }
+  let headings = selfHeadings
+  if (len(filePart) > 0) {
+    let targetMd = readFile(targetPage) catch e {
+      fatal("cannot read ${targetPage}: ${e.message()}")
+      ""
+    }
+    headings = headingSlugs(stripFences(targetMd))
+  }
+  if (!containsStr(headings, anchorPart)) {
+    out.linkFailures = out.linkFailures + 1
+    eprint("\npkgdocsgate: FAIL ${page} links '${target}' — no heading '#${anchorPart}' in ${targetPage}\n")
+  }
+  return out
+}
+
+// One page's prose: every checkable link target must resolve, anchor
+// included. Runs on every page this file reads, regardless of whether it
+// carries any ```bit block at all.
+fn checkPageLinks(page: string, md: string, st: Stats): Stats {
+  let out = st
+  let prose = stripFences(md)
+  let selfHeadings = headingSlugs(prose)
+  for target of extractLinkTargets(prose) {
+    if (!isCheckableLink(target)) {
+      continue
+    }
+    out.linksChecked = out.linksChecked + 1
+    out = checkOneLink(page, target, selfHeadings, out)
+  }
+  return out
 }
 
 fn jobsForPage(
@@ -419,6 +636,7 @@ fn processPage(cfg: Cfg, pkgName: string, pkgAbsPath: string, page: string, st: 
     fatal("cannot read ${page}: ${e.message()}")
     ""
   }
+  out = checkPageLinks(page, md, out)
   let blocks = extractBlocks(md)
   if (len(blocks) == 0) {
     return out
@@ -446,11 +664,11 @@ fn reportResult(st: Stats, names: []string, pkgDir: string) {
   if (st.jobs == 0) {
     fatal("0 checkable block(s) across ${len(names)} package(s) under ${pkgDir} — the fence match broke, or every page lost its blocks")
   }
-  if (st.failures != 0 || st.fmtFailures != 0) {
-    eprint("pkgdocsgate: FAILED — ${st.failures} typecheck failure(s), ${st.fmtFailures} fmt failure(s) of ${st.jobs} job(s) over ${st.pagesWithBlocks} page(s) in ${len(names)} package(s)\n")
+  if (st.failures != 0 || st.fmtFailures != 0 || st.linkFailures != 0) {
+    eprint("pkgdocsgate: FAILED — ${st.failures} typecheck failure(s), ${st.fmtFailures} fmt failure(s), ${st.linkFailures} broken link(s) of ${st.jobs} job(s) and ${st.linksChecked} link(s) over ${st.pagesWithBlocks} page(s) in ${len(names)} package(s)\n")
     exit(1)
   }
-  print("pkgdocsgate: ok — ${st.totalBlocks} block(s) over ${st.pagesWithBlocks} page(s), ${st.jobs} job(s) checked across ${len(names)} package(s) under ${pkgDir}\n")
+  print("pkgdocsgate: ok — ${st.totalBlocks} block(s) over ${st.pagesWithBlocks} page(s), ${st.jobs} job(s) and ${st.linksChecked} link(s) checked across ${len(names)} package(s) under ${pkgDir}\n")
 }
 
 fn main() {
