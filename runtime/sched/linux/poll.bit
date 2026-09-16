@@ -15,6 +15,7 @@
 import { taskAt, schedPollUnpark, scPollFd, scPollFdWrite, pollRead } from "../../sched"
 import { schedPollTryEnter, schedPollLeave } from "../../sched"
 import { schedPollPendingInc, schedPollPendingDec, schedPollPendingCount } from "../../sched"
+import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
 import { sysClose, sysEpollCreate1, sysEpollCtl, sysEpollPwait } from "../../syscalls"
 
 // Syscall numbers are per-architecture and Bit has no arch-conditional
@@ -34,17 +35,21 @@ import { sysClose, sysEpollCreate1, sysEpollCtl, sysEpollPwait } from "../../sys
 
 // EPOLL_CTL_ADD / EPOLL_CTL_MOD / EPOLL_CTL_DEL, from
 // include/uapi/linux/eventpoll.h.
-fn ctlAdd(): int { return 1 }
-fn ctlDel(): int { return 2 }
-fn ctlMod(): int { return 3 }
+//
+// `@nosplit` (#5438): `pollRegister`/`pollUnregister` must be, so every
+// function they call must be too (E0075 is transitive over user-function
+// calls, not just over what a function itself does).
+@nosplit fn ctlAdd(): int { return 1 }
+@nosplit fn ctlDel(): int { return 2 }
+@nosplit fn ctlMod(): int { return 3 }
 
 // EPOLLIN / EPOLLOUT / EPOLLONESHOT (1 << 30). Same source.
-fn epollIn(): int { return 1 }
-fn epollOut(): int { return 4 }
-fn epollOneshot(): int { return 1073741824 }
+@nosplit fn epollIn(): int { return 1 }
+@nosplit fn epollOut(): int { return 4 }
+@nosplit fn epollOneshot(): int { return 1073741824 }
 
 // -EEXIST, the one errno with contract meaning here (see `pollRegister`).
-fn eExist(): int { return 17 }
+@nosplit fn eExist(): int { return 17 }
 
 // `class epoll_event` IS NOT THE SAME SIZE ON THE TWO ARCHITECTURES, and
 // nothing about the source spelling reveals that. The UAPI header declares it
@@ -74,6 +79,36 @@ fn eventDataOff(): int {
     return 4
   }
   return 8
+}
+
+// `eventDataOff`'s answer, cached once a poll descriptor exists so
+// `pollRegister` (#5438, `@nosplit`) can read it without calling
+// `hostTarget()` — a real `bit_rt_host_target` runtime call, not (unlike
+// `syscall`, an inline trap) on the compiler's `@nosplit` allowlist, so
+// calling it from a `@nosplit` body is E0075. `eventDataOff` above stays the
+// source of truth for `pollDrainOne`, which is not `@nosplit`; this is a
+// one-word cache of its answer for the one caller that needs it nosplit-safe.
+//
+// SAFE TO CACHE, BECAUSE THE ARCHITECTURE CANNOT CHANGE MID-PROCESS: every
+// `pollFd` a caller can ever pass to `pollRegister` was handed out by
+// `pollCreate`, which fills this cache before returning it, so no nosplit
+// caller can reach `pollRegister` with a valid descriptor before the cache is
+// filled. `pollCreate` may run more than once (one poll descriptor per
+// worker); re-deriving the identical value each time is redundant, never
+// wrong.
+let eventDataOffCache: [1]i64
+
+@nosplit fn layoutBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(eventDataOffCache))
+}
+
+fn cacheEventDataOff() {
+  writeU64(layoutBytes(), 0, eventDataOff())
+}
+
+@nosplit fn eventDataOffNosplit(): int {
+  return readU64(layoutBytes(), 0)
 }
 
 // Ready events drained per call. `runtime/sched/`'s `max_batch`; more ready events
@@ -108,7 +143,10 @@ fn bytesOf(): *u8 {
 //
 // The top byte is included for completeness; a user-space task address never
 // sets bit 63 on either target, so the reassembly cannot overflow `int`.
-fn readU64(base: *u8, off: int): int {
+// `@nosplit` (#5438): all three are called from `pollRegister`/
+// `eventDataOffNosplit` (`readU64`) or `pollRegister` directly (`writeU64`,
+// `writeU32`).
+@nosplit fn readU64(base: *u8, off: int): int {
   let v = 0
   let k = 7
   while (k >= 0) {
@@ -119,7 +157,7 @@ fn readU64(base: *u8, off: int): int {
   return v
 }
 
-fn writeU32(base: *u8, off: int, v: int) {
+@nosplit fn writeU32(base: *u8, off: int, v: int) {
   let k = 0
   while (k < 4) {
     let p = base + off + k
@@ -128,7 +166,7 @@ fn writeU32(base: *u8, off: int, v: int) {
   }
 }
 
-fn writeU64(base: *u8, off: int, v: int) {
+@nosplit fn writeU64(base: *u8, off: int, v: int) {
   let k = 0
   while (k < 8) {
     let p = base + off + k
@@ -161,6 +199,9 @@ export @symbol("bit_rt_port_sched_poll_create") fn pollCreate(): int {
   if (rc <= 0) {
     return 0 - 1
   }
+  // Fills `eventDataOffCache` before handing out a descriptor any caller
+  // could pass to `pollRegister` — see that cache's own comment.
+  cacheEventDataOff()
   return rc
 }
 
@@ -172,6 +213,46 @@ export @symbol("bit_rt_port_sched_poll_close") fn pollClose(pollFd: int) {
     return
   }
   let _ = int(syscall(sysClose(), i64(pollFd)))
+}
+
+// Per-worker scratch for the `epoll_event` struct `pollRegister`/
+// `pollUnregister` build (#5438). NOT `evBuf` above: that buffer is sound
+// shared state only because `schedPollTryEnter`'s try-lock admits one worker
+// at a time, and register/unregister are not behind that lock — several
+// green tasks on several workers call either concurrently, so one shared
+// buffer would let two of them stomp each other's struct mid-build.
+//
+// One slot per worker (not per task) is enough: only one task runs per
+// worker at a time (cooperative M:N), and neither function yields or reaches
+// a safepoint mid-body, so within a single worker a register and an
+// unregister can never be mid-flight together. Same shape as
+// `runtime/net/sock.bit`'s `sockScratchSlot()`/`saBuf` and the Darwin twin's
+// identical buffer — (schedMaxWorkers + 1) slots, the extra one a fallback
+// for a caller off a green stack, sized with its own literal because a
+// fixed-array length must be one (E0021, the same constraint `preempt.bit`
+// documents for `preemptSlots`).
+const pollScratchSlots: int = 32
+
+@nosplit fn pollScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return pollScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= pollScratchSlots) {
+    return pollScratchSlots
+  }
+  return id
+}
+
+// (pollScratchSlots + 1) slots of 2 words (16 bytes) each = 66 words — sized
+// for the LARGER `epoll_event` (aarch64, 16 bytes; x86-64 packs to 12 and
+// uses only the first 12 of each 16-byte slot).
+let pollRegScratch: [66]i64
+
+@nosplit fn pollScratchBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(pollRegScratch)) + pollScratchSlot() * 16
 }
 
 // Register `task` to be woken when `fd` is ready for `interest`.
@@ -189,26 +270,22 @@ export @symbol("bit_rt_port_sched_poll_close") fn pollClose(pollFd: int) {
 // not an edge case: a socket typically waits for `write` on connect and then
 // `read` on first use, which re-registers within one fd's lifetime. `runtime/sched/`
 // records this as a regression fix for a real epoll hang.
-export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(
+export @symbol("bit_rt_port_sched_poll_register") @nosplit fn pollRegister(
   pollFd: int,
   fd: int,
   interest: int,
   task: int,
 ): bool {
-  let ev = []i64(2)
-  ev[0] = 0
-  ev[1] = 0
-  let z: *u8 = nil
-  let base = z + int(ptrOf(ev))
+  let base = pollScratchBytes()
 
   let io = epollOut()
   if (interest == pollRead) {
     io = epollIn()
   }
   writeU32(base, 0, io + epollOneshot())
-  writeU64(base, eventDataOff(), task)
+  writeU64(base, eventDataOffNosplit(), task)
 
-  let evAddr = i64(int(ptrOf(ev)))
+  let evAddr = i64(int(base))
   let add = int(syscall(sysEpollCtl(), i64(pollFd), i64(ctlAdd()), i64(fd), evAddr))
   if (add == 0) {
     // Counted only once armed with the kernel — see `schedPollPendingInc`'s
@@ -251,7 +328,7 @@ export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(
 // that needs to know which side won a race needs an ordering argument beyond
 // this return value, which is exactly why the net-side race itself is a
 // separate ticket from this retraction primitive.
-export @symbol("bit_rt_port_sched_poll_unregister") fn pollUnregister(
+export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
   pollFd: int,
   fd: int,
   interest: int,
@@ -259,10 +336,11 @@ export @symbol("bit_rt_port_sched_poll_unregister") fn pollUnregister(
   if (pollFd <= 0 || fd < 0) {
     return false
   }
-  let ev = []i64(2)
-  ev[0] = 0
-  ev[1] = 0
-  let evAddr = i64(int(ptrOf(ev)))
+  // The kernel does not read this struct for `EPOLL_CTL_DEL` (it only needs a
+  // non-null pointer, a pre-2.6.9 kernel bug workaround libc callers still
+  // carry) — the scratch slot's leftover bytes from whatever last wrote it
+  // are never inspected, so nothing needs zeroing here.
+  let evAddr = i64(int(pollScratchBytes()))
 
   let del = int(syscall(sysEpollCtl(), i64(pollFd), i64(ctlDel()), i64(fd), evAddr))
   if (del != 0) {

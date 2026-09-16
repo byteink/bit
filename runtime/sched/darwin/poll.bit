@@ -15,6 +15,7 @@
 import { taskAt, schedPollUnpark, scPollFd, pollRead } from "../../sched"
 import { schedPollTryEnter, schedPollLeave } from "../../sched"
 import { schedPollPendingInc, schedPollPendingDec, schedPollPendingCount } from "../../sched"
+import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
 
 // int kqueue(void);
 // int kevent(int kq, const kevent *changelist, int nchanges,
@@ -58,8 +59,12 @@ extern fn bit_rt_fs_close(fd: i64): i64
 // EVFILT_READ / EVFILT_WRITE, from <sys/event.h>. NEGATIVE, and
 // they are stored into an i16 field, so they are written as two's-complement
 // 16-bit patterns by `writeI16` below rather than as bare integers.
-fn evfiltRead(): int { return 0 - 1 }
-fn evfiltWrite(): int { return 0 - 2 }
+//
+// `@nosplit` (#5438): `pollRegister`/`pollUnregister` must be, so every
+// function they call must be too (E0075 is transitive over user-function
+// calls, not just over what a function itself does).
+@nosplit fn evfiltRead(): int { return 0 - 1 }
+@nosplit fn evfiltWrite(): int { return 0 - 2 }
 
 // EV_ADD (0x0001) | EV_ONESHOT (0x0010), from <sys/event.h>.
 //
@@ -67,12 +72,12 @@ fn evfiltWrite(): int { return 0 - 2 }
 // registration in place, so re-registering the same fd is the same call. The
 // Linux twin's EEXIST path has no counterpart here, and that asymmetry is real
 // rather than an oversight in one of the two.
-fn evAddOneshot(): int { return 17 }
+@nosplit fn evAddOneshot(): int { return 17 }
 
 // EV_DELETE (0x0002), from <sys/event.h>. Removes a knote outright rather than
 // re-arming it, which is what `pollUnregister` needs: EV_ADD cannot express
 // "stop watching this fd".
-fn evDelete(): int { return 2 }
+@nosplit fn evDelete(): int { return 2 }
 
 // `kevent` (a C structure) on macOS, from <sys/event.h> — which pins every one of these with
 // a comptime `@offsetOf` assertion because `sys/types.h` applies `#pragma
@@ -139,7 +144,9 @@ fn readU64(base: *u8, off: int): int {
   return v
 }
 
-fn writeU64(base: *u8, off: int, v: int) {
+// `@nosplit` (#5438): both writers below are called from `pollRegister`/
+// `pollUnregister`.
+@nosplit fn writeU64(base: *u8, off: int, v: int) {
   let k = 0
   while (k < 8) {
     let p = base + off + k
@@ -148,7 +155,7 @@ fn writeU64(base: *u8, off: int, v: int) {
   }
 }
 
-fn writeU32(base: *u8, off: int, v: int) {
+@nosplit fn writeU32(base: *u8, off: int, v: int) {
   let k = 0
   while (k < 4) {
     let p = base + off + k
@@ -161,7 +168,7 @@ fn writeU32(base: *u8, off: int, v: int) {
 // is reduced mod 2^16 first — writing a negative number's low bytes directly
 // would depend on how the division below rounds, which is exactly the kind of
 // detail that silently registers the wrong filter.
-fn writeI16(base: *u8, off: int, v: int) {
+@nosplit fn writeI16(base: *u8, off: int, v: int) {
   let u = v % 65536
   if (u < 0) {
     u = u + 65536
@@ -205,24 +212,55 @@ export @symbol("bit_rt_port_sched_poll_close") fn pollClose(pollFd: int) {
   let _ = int(bit_rt_fs_close(i64(pollFd)))
 }
 
+// Per-worker scratch for the 32-byte `kevent` change struct `pollRegister`/
+// `pollUnregister` build (#5438). NOT `evBuf` above: that buffer is sound
+// shared state only because `schedPollTryEnter`'s try-lock admits one worker
+// at a time, and register/unregister are not behind that lock — several
+// green tasks on several workers call either concurrently, so one shared
+// buffer would let two of them stomp each other's change struct mid-build.
+//
+// One slot per worker (not per task) is enough: only one task runs per
+// worker at a time (cooperative M:N), and neither function yields or reaches
+// a safepoint mid-body, so within a single worker a register and an
+// unregister can never be mid-flight together. Same shape as
+// `runtime/net/sock.bit`'s `sockScratchSlot()`/`saBuf` — (schedMaxWorkers +
+// 1) slots, the extra one a fallback for a caller off a green stack, sized
+// with its own literal because a fixed-array length must be one (E0021, the
+// same constraint `preempt.bit` documents for `preemptSlots`).
+const pollScratchSlots: int = 32
+
+@nosplit fn pollScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return pollScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= pollScratchSlots) {
+    return pollScratchSlots
+  }
+  return id
+}
+
+// (pollScratchSlots + 1) slots of 4 words (32 bytes) each = 132 words.
+let pollRegScratch: [132]i64
+
+@nosplit fn pollScratchBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(pollRegScratch)) + pollScratchSlot() * 32
+}
+
 // Register `task` to be woken when `fd` is ready for `interest`.
 //
 // ONESHOT, matching the Linux twin: the registration fires once and
 // disarms, so a woken task must re-register before parking on the same fd
 // again. That is what makes the wake edge unambiguous.
-export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(
+export @symbol("bit_rt_port_sched_poll_register") @nosplit fn pollRegister(
   pollFd: int,
   fd: int,
   interest: int,
   task: int,
 ): bool {
-  let ev = []i64(4)
-  ev[0] = 0
-  ev[1] = 0
-  ev[2] = 0
-  ev[3] = 0
-  let z: *u8 = nil
-  let base = z + int(ptrOf(ev))
+  let base = pollScratchBytes()
 
   let filter = evfiltWrite()
   if (interest == pollRead) {
@@ -265,7 +303,7 @@ export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(
 // `interest` selects the same `EVFILT_READ`/`EVFILT_WRITE` split `pollRegister`
 // arms — kqueue tracks the two directions on one fd as separate knotes, so
 // deleting the wrong filter would silently leave the real registration armed.
-export @symbol("bit_rt_port_sched_poll_unregister") fn pollUnregister(
+export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
   pollFd: int,
   fd: int,
   interest: int,
@@ -273,13 +311,7 @@ export @symbol("bit_rt_port_sched_poll_unregister") fn pollUnregister(
   if (pollFd <= 0 || fd < 0) {
     return false
   }
-  let ev = []i64(4)
-  ev[0] = 0
-  ev[1] = 0
-  ev[2] = 0
-  ev[3] = 0
-  let z: *u8 = nil
-  let base = z + int(ptrOf(ev))
+  let base = pollScratchBytes()
 
   let filter = evfiltWrite()
   if (interest == pollRead) {
