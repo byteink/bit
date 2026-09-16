@@ -55,22 +55,15 @@ layer, not in a numeric type. See "When not to use it" below.
 
 ## Parsing text into a decimal
 
-### `parseDecimal(s: string): ParseDecimalResult`
+### `parseDecimal(s: string): decimal!`
 
 The `decimal` that text `s` denotes: an optional sign, digits, an optional
 `.` and more digits, and an optional exponent - nothing else. No leading or
 trailing whitespace, no thousands separator, no currency symbol: a parser
 that tolerates `"1,234"` is how an invoice becomes wrong by three orders of
-magnitude, so this one refuses instead of guessing.
-
-### `ParseDecimalResult`
-
-`parseDecimal`'s outcome: `ok` is `true` and `value` holds the parsed
-`decimal` on success; otherwise `ok` is `false` and `err` names the problem.
-(Not the fallible `decimal!` you would expect from `std/strings.parseInt` -
-`decimal` cannot yet cross a fallible return in this compiler, tracked as
-[#5410](https://github.com/byteink/bit/issues/5410); this class is the
-workaround, and it goes away once that lands.)
+magnitude, so this one refuses instead of guessing - the same fallible
+`T!` idiom `std/strings.parseInt` uses, handled with `?`/`catch` (SPEC
+§12.11).
 
 Now the cart total can come from text - the shape a web form or a
 database's `numeric` column actually hands you, which is `parseDecimal`'s own
@@ -83,11 +76,10 @@ fn total(prices: []string): string! {
   let sum: decimal = 0
   let i = 0
   while (i < len(prices)) {
-    let r = parseDecimal(prices[i])
-    if (!r.ok) {
-      fail newError("bad price '${prices[i]}': ${r.err}")
+    let price = parseDecimal(prices[i]) catch err {
+      fail newError("bad price '${prices[i]}': ${err.message()}")
     }
-    sum = sum + r.value
+    sum = sum + price
     i = i + 1
   }
   return toString(sum)
@@ -129,11 +121,10 @@ fn invoiceTotal(prices: []string, taxRate: decimal): string! {
   let subtotal: decimal = 0
   let i = 0
   while (i < len(prices)) {
-    let r = parseDecimal(prices[i])
-    if (!r.ok) {
-      fail newError("bad price '${prices[i]}': ${r.err}")
+    let price = parseDecimal(prices[i]) catch err {
+      fail newError("bad price '${prices[i]}': ${err.message()}")
     }
-    subtotal = subtotal + r.value
+    subtotal = subtotal + price
     i = i + 1
   }
   let tax = round(subtotal * taxRate, 2, RoundMode.HalfEven)
@@ -180,19 +171,30 @@ hand you - test this before trusting user input:
 ```bit
 import { parseDecimal } from "std/decimal"
 
+fn parses(s: string): bool {
+  let zero: decimal = 0
+  let ok = true
+  parseDecimal(s) catch _ {
+    ok = false
+    zero
+  }
+  return ok
+}
+
 fn rejectsMessyInput(): bool {
-  let a = parseDecimal(" 19.99") // leading whitespace
-  let b = parseDecimal("$19.99") // currency symbol
-  let c = parseDecimal("19,99")  // thousands/decimal-comma separator
-  return !a.ok && !b.ok && !c.ok
+  let leadingSpace = !parses(" 19.99") // leading whitespace
+  let currency = !parses("$19.99")     // currency symbol
+  let thousands = !parses("19,99")     // thousands/decimal-comma separator
+  return leadingSpace && currency && thousands
 }
 ```
 
-`round`'s own signature cannot fail - `decimal` cannot cross a fallible
-return yet (see `ParseDecimalResult` above) - so a `scale` so extreme that
+`round`'s own signature is not fallible - it panics rather than returning an
+error, the same "panics rather than wrapping" contract every other decimal
+overflow already has (SPEC §11.1) - so a `scale` so extreme that
 reconstructing the rounded value would exceed 96-bit precision panics
-instead of returning an error. In practice this only happens at scales far
-outside anything a real currency or unit uses.
+instead. In practice this only happens at scales far outside anything a real
+currency or unit uses.
 
 ## When not to use it
 
