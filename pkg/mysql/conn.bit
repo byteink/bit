@@ -86,7 +86,12 @@ class myConn {
           "(LOAD DATA LOCAL); this driver never does",
       )
     }
-    let count = readLenEnc(cursor{ s: head, at: 0 })?
+    // A malformed count means the number of column-definition packets still
+    // owed cannot be known, so there is nothing safe to drain — marked fatal
+    // so the pool never hands this connection out again (#5422).
+    let count = readLenEnc(cursor{ s: head, at: 0 }) catch e {
+      fail transportError(e.message())
+    }
     let out = myRows{ cols: this.columns(count)?, rows: [][]Value(0), at: 0 - 1 }
     this.rows(out)?
     return out
@@ -99,6 +104,44 @@ class myConn {
     }
   }
 
+  // Best-effort recovery for a response that broke partway through decoding,
+  // so the NEXT command on this connection reads its own reply rather than
+  // this one's leftover bytes (#5422). `defsRemaining` is how many more
+  // column-definition packets the server still owes before their closing
+  // EOF — 0 when the failure was already in the row stream, where the
+  // definitions and their EOF are behind us. Every read here is dropped on
+  // failure: a broken socket has nothing left to drain, and the caller's own
+  // error is what gets reported either way.
+  //
+  // Bounded by `defsRemaining + queryPacketBudget`.
+  drainResponse(defsRemaining: int) {
+    let i = 0
+    while (i < defsRemaining) {
+      i = i + 1
+      this.w.recv() catch _ {
+        return
+      }
+    }
+    if (defsRemaining > 0) {
+      let closer = this.w.recv() catch _ {
+        return
+      }
+      if (packetKind(closer) == 255) {
+        return
+      }
+    }
+    let seen = 0
+    while (seen < queryPacketBudget) {
+      seen = seen + 1
+      let p = this.w.recv() catch _ {
+        return
+      }
+      if (packetKind(p) == 255 || isEof(p)) {
+        return
+      }
+    }
+  }
+
   // `count` column definition packets, then the EOF that closes them. Only the
   // column NAME is read; the type, length and flags belong to the typed-decoding
   // ticket.
@@ -108,11 +151,16 @@ class myConn {
     let out = []string(0)
     let i = 0
     while (i < count) {
-      out = append(out, columnName(this.recv()?)?)
+      let name = columnName(this.recv()?) catch e {
+        this.drainResponse(count - i - 1)
+        fail e
+      }
+      out = append(out, name)
       i = i + 1
     }
     let eof = this.recv()?
     if (!isEof(eof)) {
+      this.drainResponse(0)
       fail transportError("the server sent no EOF after ${count} column " + "definitions")
     }
     return out
@@ -132,7 +180,11 @@ class myConn {
       if (isEof(p)) {
         return
       }
-      out.rows = append(out.rows, decodeRow(p)?)
+      let row = decodeRow(p) catch e {
+        this.drainResponse(0)
+        fail e
+      }
+      out.rows = append(out.rows, row)
     }
     fail transportError("the server sent ${queryPacketBudget} packets without " + "ending the result set")
   }
