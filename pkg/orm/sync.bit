@@ -1,0 +1,283 @@
+// pkg/orm/sync.bit — #5069, owner decision 2026-09-12: the TypeORM
+// `synchronize: true` experience, for development only.
+//
+//   syncSchema(db, [User{}, Order{}], RunnerDialect{ render: Postgres{}, server: ServerDialect.Postgres })?
+//
+// NAMED `syncSchema`, NOT THE TICKET'S OWN `sync`. #5081 (`manytomany.bit`)
+// already exports `sync(db, desc, ownerId, targetIds, dialect)` — the
+// many-to-many join table's own idempotent attach-then-prune, landed before
+// this ticket was filed. `pkg/orm` is one flat module (SPEC §17.1): a
+// second top-level `sync` would be `E0042 already declared`, confirmed
+// against this exact pair while building this file (`bit check` first
+// reported the WRONG arity, 5 instead of 3, resolving every call in this
+// package's own module against whichever declaration the checker bound —
+// `dialect.bit`'s own header on the `Dialect`/`UpsertDialect` split, #5325,
+// is the identical class of collision, resolved the same way: keep the
+// pair's own established name and give the new export a distinct one).
+//
+// Diffs entity descriptors against the live schema — #5067's own diff
+// (`generate.bit`) and #5435's own enum-CHECK comparison (`generateenum.bit`),
+// reused verbatim, never rebuilt — and APPLIES the result immediately: no
+// file, no review, no prompt. `RunnerDialect` (`runner.bit`, #5384) is the
+// identical bundle `up`/`down` already take, reused rather than adding a
+// fourth shape: `render` picks the DDL renderer, `server` picks the enum-
+// CHECK keyword and stays unread by anything else here.
+//
+// THE REFUSAL IS THE FEATURE, NOT A GUARD CLAUSE (owner decision, this
+// ticket). `refuseIfMigrated` below is the FIRST thing `sync` does, before
+// it reads a single entity: any database whose `schema_history` table
+// carries one or more rows is under migration control — an ordered,
+// reviewed history applying a computed diff on top of would make a lie —
+// and `sync` refuses outright, naming `schema_history` and pointing at
+// `generate`/`up` (#5067/#5068). A database with NO `schema_history` table
+// at all, or one with zero rows, is a scratch database and is synced. This
+// is a STRUCTURAL fact (a row count), never a heuristic: nothing in this
+// file reads an environment variable, a hostname or a connection string —
+// see `refuseIfMigrated`'s own header for why a fact beats a convention
+// someone has to remember.
+//
+// DROPS ARE INCLUDED, ON PURPOSE (this ticket's own text: "it is a scratch
+// database"). A column live but absent from the entity is dropped directly,
+// the same as an added column is added directly — `generate.bit`'s own
+// `destructiveComment` exists because THAT file writes a review artifact a
+// human reads before running; `sync` has no such artifact, so there is
+// nothing for a comment to attach to. The fence that makes this safe is the
+// refusal above, not a second guard here.
+//
+// NEVER A WHOLE-TABLE DROP, THE SAME RULE `generate.bit`'S OWN RULE 5
+// ALREADY STATES: an entity table's own removal is a hand-written decision,
+// never a diff's — an entity simply absent from the caller's own list is
+// never inspected by this file at all (rule 3, `generate.bit`'s own header:
+// entities are an explicit argument).
+//
+// A MANYTOMANY JOIN TABLE IS OUT OF SCOPE, THE SAME SCOPE #5076'S OWN
+// `check.bit` DECLARED for the identical reason: `generate.bit`'s
+// `manyToManyDescsFor`/`renderJoinTableCreate` are this package's one path
+// that creates one, and are not called here — extending `sync` to cover a
+// join table is real, separate work, not a silent gap.
+//
+// A BRAND-NEW TABLE'S OWN ENUM COLUMN GETS NO CHECK CONSTRAINT YET, THE
+// SAME DOCUMENTED GAP `generateenum.bit`'s `enumCheckDiffs` ALREADY HAS FOR
+// A COLUMN THIS SAME DIFF IS ADDING (that file's own header: "outside this
+// function's job, which is drift on a column ... a prior migration already
+// created"). `addColumnToCreateTable`/`addColumnToAlterTable` below map a
+// field's Bit type the identical closed way `generate.bit`'s own
+// `addColumnCall` does — this is not a new limitation `sync` introduces.
+//
+// NEVER WRITES `schema_history` (this ticket's own constraint) — a synced
+// database has no migration history, which is both true and what keeps
+// `refuseIfMigrated` correct on the NEXT run. `applyTableOp` below reuses
+// `runner.bit`'s own `renderOps`/`splitByTransactional`/
+// `runTransactionalBlock`/`runNonTransactional` — the identical statement-
+// sequencing primitives `up`/`down` already use — passing a NO-OP ledger
+// closure, so the BEGIN/COMMIT/ROLLBACK shape is shared, not reimplemented,
+// while the one write those functions make on `up`'s behalf (`recordApplied`)
+// never happens here.
+
+// Whether `table` exists live at all — `information_schema.tables` is the
+// ANSI-standard view both engines expose (portable, no dialect branch, the
+// same reasoning `generate.bit`'s own `hasLivePrimaryKey` already gives for
+// `information_schema.table_constraints`) — read once per entity, since
+// `liveColumns` alone cannot tell "the table has zero columns" (impossible)
+// from "the table does not exist" (this file's own reason to create one).
+fn liveTableExists(db: Data, table: string): bool! {
+  let rows = db.query(
+    "select table_name from information_schema.tables where table_name = $1",
+    [Value.Text(table)],
+  )?
+  defer rows.close()
+  return rows.next()?
+}
+
+// Refuses when `schema_history` carries one or more rows — see this file's
+// header for why this is a fact, never a heuristic. A database with no
+// `schema_history` table at all is a scratch database (never queried for a
+// row count at all, since there is nothing to count); one with the table
+// but zero rows is too.
+fn refuseIfMigrated(db: Data): ()! {
+  let hasHistoryTable = liveTableExists(db, "schema_history")?
+  if (!hasHistoryTable) {
+    return
+  }
+  let rows = db.query("select count(*) from schema_history", []Value(0))?
+  defer rows.close()
+  rows.next()?
+  let n = asInt(rows.value(0))?
+  if (n == 0) {
+    return
+  }
+  fail newError(
+      "pkg/orm: sync: refusing - schema_history has ${n} row(s); this " +
+      "database is under migration control and applying a computed diff " +
+      "on top of a reviewed history would make it a lie. Use 'generate' " +
+      "(#5067) to write a migration and 'up' (#5068) to apply it instead",
+  )
+}
+
+// A field's Bit type -> the `Table` column it becomes, for a brand-new
+// table — `generate.bit`'s own `addColumnCall` mapping (this file's
+// header), built as a real `Column` instead of rendered source text, since
+// `sync` applies immediately rather than writing a file.
+fn addColumnToCreateTable(t: Table, f: FieldDesc, composite: bool): ()! {
+  let col = columnName(f)
+  if (f.typeName == "i64") {
+    if (hasIdAttr(f) && !composite) {
+      t.id(col)
+    } else {
+      t.int(col)
+    }
+    return
+  }
+  if (f.typeName == "string") {
+    t.string(col, defaultStringLength)
+    return
+  }
+  if (f.typeName == "bool") {
+    t.bool(col)
+    return
+  }
+  if (f.typeName == "decimal") {
+    t.decimal(col)
+    return
+  }
+  fail newError(
+      "pkg/orm: sync: field '${f.name}' has Bit type '${f.typeName}', " +
+      "which this package has no schema column mapping for",
+  )
+}
+
+// `addColumnToCreateTable`'s own sibling for an EXISTING table's `alter()`
+// block — `AlterTable`'s add methods are separately named
+// (`addId`/`addInt`/...) from `Table`'s (`id`/`int`/...), the same split
+// schema.bit's own header explains for the builder pair itself.
+fn addColumnToAlterTable(t: AlterTable, f: FieldDesc, composite: bool): ()! {
+  let col = columnName(f)
+  if (f.typeName == "i64") {
+    if (hasIdAttr(f) && !composite) {
+      t.addId(col)
+    } else {
+      t.addInt(col)
+    }
+    return
+  }
+  if (f.typeName == "string") {
+    t.addString(col, defaultStringLength)
+    return
+  }
+  if (f.typeName == "bool") {
+    t.addBool(col)
+    return
+  }
+  if (f.typeName == "decimal") {
+    t.addDecimal(col)
+    return
+  }
+  fail newError(
+      "pkg/orm: sync: field '${f.name}' has Bit type '${f.typeName}', " +
+      "which this package has no schema column mapping for",
+  )
+}
+
+// `table`'s own `CREATE TABLE`, every field mapped through
+// `addColumnToCreateTable`, with a `t.primaryKey(...)` call only for a
+// composite key (#5084) — the identical condition `generate.bit`'s own
+// header states for why a single `@id` field needs no separate call
+// (`t.id(...)` already carries its own inline primary key).
+fn buildCreateTable(table: string, fields: []FieldDesc, composite: bool): Table! {
+  let t = Table{
+    name: table, columns: []Column(0), indexes: []Index(0),
+    foreignKeys: []ForeignKey(0), raws: []string(0), primaryKeyColumns: []string(0),
+  }
+  for f of fields {
+    addColumnToCreateTable(t, f, composite)?
+  }
+  if (composite) {
+    t.primaryKey(...idColumnNames(fields))
+  }
+  return t
+}
+
+// `table`'s own `alter()` block against its live columns — `generate.bit`'s
+// `tableAlterOp` (this file's header), rebuilt as a real `AlterTable`
+// instead of rendered source text. `hasWork` is read off the built node
+// itself (`len(t.ops) > 0 || len(t.raws) > 0`) rather than a separate
+// upfront gate, since building it is cheap and this avoids a second count
+// of the same three findings `generate.bit`'s own gate re-derives.
+fn alterTableOp(
+  db: Data,
+  table: string,
+  fields: []FieldDesc,
+  dialect: RunnerDialect,
+): (AlterTable, bool)! {
+  let liveCols = liveColumns(db, table)?
+  let added = fieldsNotIn(fields, liveCols)
+  let removed = colsNotInFields(liveCols, fields)
+  let composite = hasCompositeKey(fields)
+  let t = AlterTable{ name: table, ops: []AlterOp(0), raws: []string(0) }
+  for f of added {
+    addColumnToAlterTable(t, f, composite)?
+  }
+  if (composite && hasIdField(added)) {
+    let replacing = hasLivePrimaryKey(db, table)?
+    if (replacing) {
+      t.replacePrimaryKey(...idColumnNames(fields))
+    } else {
+      t.primaryKey(...idColumnNames(fields))
+    }
+  }
+  for c of removed {
+    t.dropColumn(c)
+  }
+  for sql of enumCheckDiffs(db, table, fields, columnNamesOf(added), dialect.server)? {
+    t.raw(sql)
+  }
+  return (t, len(t.ops) > 0 || len(t.raws) > 0)
+}
+
+// One entity's own `SchemaOp` and whether it carries any work at all — a
+// brand-new table (`liveTableExists` false) always does; an existing one
+// only when `alterTableOp` found a difference.
+fn tableOp(db: Data, e: TableEntity, dialect: RunnerDialect): (SchemaOp, bool)! {
+  let table = tableNameOf(e)?
+  let fields = withoutManyToMany(e.tableDescriptor())
+  let exists = liveTableExists(db, table)?
+  if (!exists) {
+    return (SchemaOp.CreateTable(buildCreateTable(table, fields, hasCompositeKey(fields))?), true)
+  }
+  let (t, hasWork) = alterTableOp(db, table, fields, dialect)?
+  return (SchemaOp.AlterTable(t), hasWork)
+}
+
+// Renders `op` and applies every statement — `runner.bit`'s own
+// `renderOps`/`splitByTransactional`/`runTransactionalBlock`/
+// `runNonTransactional`, reused unchanged (this file's header): a
+// transactional block wrapped in `BEGIN`/`COMMIT` (with `ROLLBACK` on
+// failure) when the dialect leaves one to use, every non-transactional
+// statement run individually otherwise — the identical shape `up` applies a
+// migration with, minus the one write `up` makes that `sync` never does
+// (`schema_history`, this file's header): the ledger closure passed here
+// does nothing.
+fn applyTableOp(db: Data, render: Dialect, op: SchemaOp): ()! {
+  let stmts = renderOps(render, [op])
+  let (transactional, nonTransactional) = splitByTransactional(stmts)
+  if (len(transactional) > 0) {
+    runTransactionalBlock(db, transactional, (d) => {})?
+  }
+  runNonTransactional(db, nonTransactional)?
+}
+
+// Diffs `entities` against the live schema and applies the difference
+// immediately — added columns, dropped columns, a brand-new table, and an
+// enum column's drifted CHECK constraint (#5435) alike — refusing outright
+// when `schema_history` carries any row (this file's header). No file, no
+// review, no prompt: the refusal above is what makes that safe.
+export fn syncSchema(db: Data, entities: []TableEntity, dialect: RunnerDialect): ()! {
+  refuseIfMigrated(db)?
+  for e of entities {
+    let (op, hasWork) = tableOp(db, e, dialect)?
+    if (!hasWork) {
+      continue
+    }
+    applyTableOp(db, dialect.render, op)?
+  }
+}

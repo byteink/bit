@@ -1,0 +1,367 @@
+// pkg/orm/sync.test.bit — #5069's acceptance, against a FAKE driver
+// (`syExecutor` below) that records every statement `sync` issues, in
+// order — the same logging shape `runner.test.bit`'s own `rnExecutor` uses
+// for `schema_history`, applied here to the DDL `sync` itself applies —
+// plus one live-server test proving all five behaviours against a real
+// Postgres (#5431/#5435/#5076: a test that skips when no server is
+// configured has never run).
+//
+// `syExecutor.tables`/`columnsByTable`/`checkClauses` ARE the fake live
+// schema, the identical `information_schema` shape `generate.test.bit`'s
+// `gnExecutor`/`check.test.bit`'s `ckExecutor` already use;
+// `historyTableExists`/`historyRows` are the one new fact this ticket
+// needs, answering `information_schema.tables`/`schema_history`'s own row
+// count the same portable way `liveTableExists` (`sync.bit`) queries both.
+//
+// `pgDialect()` is `runner.test.bit`'s own — this file reuses it rather
+// than redeclaring (same module, E0042), the same reuse
+// `check.test.bit`'s own header already does for `scratchDir`/`resetDir`/
+// `findRepoRoot`.
+class syExecutor {
+  tables: []string
+  columnsByTable: map<string, []string>
+  checkClauses: map<string, string>
+  historyTableExists: bool
+  historyRows: int
+  execLog: []string
+
+  query(sqlText: string, params: []Value): Rows! {
+    let key = ""
+    if (len(params) > 0) {
+      key = asText(params[0]) catch _ {
+        ""
+      }
+    }
+    if (contains(sqlText, "check_constraints")) {
+      return syCheckRows{ clause: this.checkClauses[key], i: -1 }
+    }
+    if (contains(sqlText, "information_schema.columns")) {
+      return syColRows{ cols: this.columnsByTable[key], i: -1 }
+    }
+    if (contains(sqlText, "information_schema.tables")) {
+      let found = this.historyTableExists
+      if (key != "schema_history") {
+        found = hasColumn(this.tables, key)
+      }
+      return syExistsRows{ found: found, i: -1 }
+    }
+    if (contains(sqlText, "count(*) from schema_history")) {
+      return syCountRows{ n: this.historyRows }
+    }
+    fail newError("syExecutor: query not supported: ${sqlText}")
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.execLog = append(this.execLog, sqlText)
+    return 0
+  }
+}
+
+class syCheckRows {
+  clause: string
+  i: i64
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i == 0 && this.clause != ""
+  }
+
+  columns(): []string {
+    return ["check_clause"]
+  }
+
+  value(col: int): Value {
+    return Value.Text(this.clause)
+  }
+
+  close() {}
+}
+
+class syColRows {
+  cols: []string
+  i: i64
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.cols)
+  }
+
+  columns(): []string {
+    return ["column_name"]
+  }
+
+  value(col: int): Value {
+    return Value.Text(this.cols[this.i])
+  }
+
+  close() {}
+}
+
+class syExistsRows {
+  found: bool
+  i: i64
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i == 0 && this.found
+  }
+
+  columns(): []string {
+    return ["table_name"]
+  }
+
+  value(col: int): Value {
+    return Value.Text("x")
+  }
+
+  close() {}
+}
+
+class syCountRows {
+  n: int
+  i: i64
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i == 0
+  }
+
+  columns(): []string {
+    return ["count"]
+  }
+
+  value(col: int): Value {
+    return Value.Int(this.n)
+  }
+
+  close() {}
+}
+
+@table("sy_widgets") class syWidget {
+  @id
+  id: i64
+  name: string
+}
+
+@table("sy_widgets") class syWidgetAdd {
+  @id
+  id: i64
+  name: string
+  phone: string
+}
+
+@table("sy_new_table") class syNewTable {
+  @id
+  id: i64
+  name: string
+}
+
+@table("sy_status") class syStatus {
+  @id
+  id: i64
+  @enumVariants("Draft", "Active", "Archived", "Retired")
+  status: string
+}
+
+test "a schema that already agrees is a no-op — sync issues no statement at all" {
+  let db = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name"] },
+  }
+  syncSchema(db, [syWidget{}], pgDialect()) catch e {
+    panic("sync: an agreeing schema must not fail: ${e.message()}")
+  }
+  assert(len(db.execLog) == 0, "an agreeing schema issued a statement: ${join(db.execLog, ", ")}")
+}
+
+test "an added column in the entity is applied directly, not just reported" {
+  let db = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name"] },
+  }
+  syncSchema(db, [syWidgetAdd{}], pgDialect()) catch e {
+    panic("sync: ${e.message()}")
+  }
+  let applied = false
+  for stmt of db.execLog {
+    if (contains(stmt, "add column") && contains(stmt, "\"phone\"")) {
+      applied = true
+    }
+  }
+  assert(applied, "sync did not apply the added column: ${join(db.execLog, ", ")}")
+  assert(
+    contains(join(db.execLog, "\n"), "BEGIN"),
+    "sync did not wrap the change in a transaction: ${join(db.execLog, ", ")}",
+  )
+}
+
+test "a column present live but absent from the entity is dropped directly, not commented" {
+  let db = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name", "legacy_flag"] },
+  }
+  syncSchema(db, [syWidget{}], pgDialect()) catch e {
+    panic("sync: ${e.message()}")
+  }
+  let dropped = false
+  for stmt of db.execLog {
+    if (contains(stmt, "drop column") && contains(stmt, "\"legacy_flag\"")) {
+      dropped = true
+    }
+  }
+  assert(dropped, "sync did not drop the removed column: ${join(db.execLog, ", ")}")
+}
+
+test "an entity whose table does not exist yet is created outright" {
+  let db = syExecutor{ tables: []string(0), columnsByTable: map<string, []string>(0) }
+  syncSchema(db, [syNewTable{}], pgDialect()) catch e {
+    panic("sync: ${e.message()}")
+  }
+  let created = false
+  for stmt of db.execLog {
+    if (contains(stmt, "create table \"sy_new_table\"")) {
+      created = true
+    }
+  }
+  assert(created, "sync did not create the missing table: ${join(db.execLog, ", ")}")
+}
+
+// #5435's own path: an enum variant added in Bit is invisible to
+// presence/absence alone, so this is the finding `enumCheckDiffs`
+// (`generateenum.bit`) makes and `sync` must APPLY, not just report.
+test "an enum variant change is applied through #5435's own rendering path" {
+  let db = syExecutor{
+    tables: ["sy_status"],
+    columnsByTable: map<string, []string>{ "sy_status": ["id", "status"] },
+    checkClauses: map<string, string>{
+      "sy_status_status_check": "(status = ANY (ARRAY['Draft'::text, 'Active'::text, 'Archived'::text]))",
+    },
+  }
+  syncSchema(db, [syStatus{}], pgDialect()) catch e {
+    panic("sync: ${e.message()}")
+  }
+  let joined = join(db.execLog, "\n")
+  assert(
+    contains(joined, "drop constraint \"sy_status_status_check\""),
+    "sync did not apply the enum-CHECK drop-and-recreate: ${join(db.execLog, ", ")}",
+  )
+  assert(
+    contains(joined, "'Retired'"),
+    "sync's applied CHECK is missing the new variant: ${join(db.execLog, ", ")}",
+  )
+}
+
+test "a database whose schema_history carries at least one row is refused, issuing zero DDL statements, naming schema_history" {
+  let db = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name"] },
+    historyTableExists: true,
+    historyRows: 3,
+  }
+  let failed = false
+  syncSchema(db, [syWidgetAdd{}], pgDialect()) catch e {
+    failed = true
+    assert(
+      contains(e.message(), "schema_history"),
+      "refusal did not name schema_history: ${e.message()}",
+    )
+  }
+  assert(failed, "sync must refuse a database whose schema_history carries rows")
+  assert(len(db.execLog) == 0, "a refused sync issued DDL: ${join(db.execLog, ", ")}")
+}
+
+// The mechanism proof the acceptance names explicitly: no code path reads
+// an environment variable, a hostname or a connection string — an
+// IDENTICAL driver, differing only in the history row count, flips the
+// outcome.
+test "the refusal is decided by the history row count alone — an identical driver with 0 rows syncs" {
+  let historyTable = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name"] },
+    historyTableExists: true,
+    historyRows: 0,
+  }
+  syncSchema(historyTable, [syWidgetAdd{}], pgDialect()) catch e {
+    panic("sync: a schema_history table with zero rows must be treated as scratch: ${e.message()}")
+  }
+  assert(
+    len(historyTable.execLog) > 0,
+    "a scratch database with an empty schema_history table applied nothing",
+  )
+}
+
+test "a database with no schema_history table at all is treated as a scratch database and synced" {
+  let db = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name"] },
+  }
+  syncSchema(db, [syWidgetAdd{}], pgDialect()) catch e {
+    panic("sync: a database with no schema_history table must be synced: ${e.message()}")
+  }
+  assert(len(db.execLog) > 0, "a scratch database with no schema_history table applied nothing")
+}
+
+test "sync writes no row to schema_history in the succeeding case" {
+  let db = syExecutor{
+    tables: ["sy_widgets"],
+    columnsByTable: map<string, []string>{ "sy_widgets": ["id", "name"] },
+  }
+  syncSchema(db, [syWidgetAdd{}], pgDialect()) catch e {
+    panic("sync: ${e.message()}")
+  }
+  for stmt of db.execLog {
+    assert(!contains(stmt, "schema_history"), "sync wrote to schema_history: ${stmt}")
+  }
+}
+
+// #5431/#5435/#5076: a test that skips when no server is configured has
+// never run. `ORM_TEST_LIVE_PG_URI` supplies a Postgres connection string;
+// this test skips only when it is unset, and says so. Proves all five
+// behaviours against a real server in one program: an agreeing schema is a
+// no-op, an added column and a dropped column are applied together, a
+// brand-new table is created, an enum variant change is applied through
+// #5435's own rewrite-tolerant path, and a database whose `schema_history`
+// carries a row is refused.
+const liveSyncProofSource: string = "import { args } from \"std/os\"\nimport { pool, Datasource, Value, FieldDesc, AttrDesc, Executor, asText } from \"std/sql\"\nimport { contains } from \"std/strings\"\nimport { adapter } from \"postgres\"\nimport { syncSchema, RunnerDialect, ServerDialect, ensureHistoryTable, recordApplied, HistoryEntry } from \"orm\"\nimport { Postgres } from \"orm\"\n\n@table(\"sy5069_a\") class WidgetOk {\n  @id\n  id: i64\n  name: string\n}\n\n@table(\"sy5069_b\") class WidgetAddDrop {\n  @id\n  id: i64\n  name: string\n  phone: string\n}\n\n@table(\"sy5069_new\") class WidgetNew {\n  @id\n  id: i64\n  name: string\n}\n\n@table(\"sy5069_status\") class WidgetStatus {\n  @id\n  id: i64\n  @enumVariants(\"Draft\", \"Active\", \"Archived\", \"Retired\")\n  status: string\n}\n\nfn dialect(): RunnerDialect {\n  return RunnerDialect{ render: Postgres{}, server: ServerDialect.Postgres }\n}\n\nfn columnNames(db: Executor, table: string): []string! {\n  let rows = db.query(\"select column_name from information_schema.columns where table_name = $1 order by ordinal_position\", [Value.Text(table)])?\n  defer rows.close()\n  let out = []string(0)\n  while (rows.next()?) {\n    out = append(out, asText(rows.value(0))?)\n  }\n  return out\n}\n\nfn hasName(names: []string, name: string): bool {\n  for n of names {\n    if (n == name) {\n      return true\n    }\n  }\n  return false\n}\n\nfn namesJoined(names: []string): string {\n  let out = \"\"\n  for n of names {\n    out = \"\${out}\${n}, \"\n  }\n  return out\n}\n\nfn main(): ()! {\n  let uri = args()[1]\n  let db = pool(adapter(), Datasource{ uri: uri }) catch e {\n    panic(\"pool: \${e.message()}\")\n  }\n\n  db.exec(\"drop table if exists sy5069_a\", []Value(0)) catch e { panic(\"drop a: \${e.message()}\") }\n  db.exec(\"drop table if exists sy5069_b\", []Value(0)) catch e { panic(\"drop b: \${e.message()}\") }\n  db.exec(\"drop table if exists sy5069_new\", []Value(0)) catch e { panic(\"drop new: \${e.message()}\") }\n  db.exec(\"drop table if exists sy5069_status\", []Value(0)) catch e { panic(\"drop status: \${e.message()}\") }\n  db.exec(\"drop table if exists schema_history\", []Value(0)) catch e { panic(\"drop history: \${e.message()}\") }\n\n  db.exec(\"create table sy5069_a (id bigint generated always as identity primary key, name character varying(255) not null)\", []Value(0)) catch e { panic(\"create a: \${e.message()}\") }\n  db.exec(\"create table sy5069_b (id bigint generated always as identity primary key, name character varying(255) not null, legacy boolean not null)\", []Value(0)) catch e { panic(\"create b: \${e.message()}\") }\n  db.exec(\"create table sy5069_status (id bigint generated always as identity primary key, status text not null check (status in ('Draft','Active','Archived')))\", []Value(0)) catch e { panic(\"create status: \${e.message()}\") }\n\n  syncSchema(db, [WidgetOk{}], dialect()) catch e {\n    panic(\"LIVE PROOF FAILED: an agreeing schema reported a disagreement: \${e.message()}\")\n  }\n\n  syncSchema(db, [WidgetAddDrop{}], dialect()) catch e {\n    panic(\"LIVE PROOF FAILED: add+drop sync failed: \${e.message()}\")\n  }\n  let bCols = columnNames(db, \"sy5069_b\")?\n  if (!hasName(bCols, \"phone\")) {\n    panic(\"LIVE PROOF FAILED: sync did not add 'phone' live: \${namesJoined(bCols)}\")\n  }\n  if (hasName(bCols, \"legacy\")) {\n    panic(\"LIVE PROOF FAILED: sync did not drop 'legacy' live: \${namesJoined(bCols)}\")\n  }\n\n  syncSchema(db, [WidgetNew{}], dialect()) catch e {\n    panic(\"LIVE PROOF FAILED: sync did not create the new table: \${e.message()}\")\n  }\n  let newCols = columnNames(db, \"sy5069_new\")?\n  if (!hasName(newCols, \"id\") || !hasName(newCols, \"name\")) {\n    panic(\"LIVE PROOF FAILED: the newly created table is missing columns: \${namesJoined(newCols)}\")\n  }\n\n  syncSchema(db, [WidgetStatus{}], dialect()) catch e {\n    panic(\"LIVE PROOF FAILED: enum sync failed: \${e.message()}\")\n  }\n  let checkRows = db.query(\"select check_clause from information_schema.check_constraints where constraint_name = $1\", [Value.Text(\"sy5069_status_status_check\")]) catch e { panic(\"check query: \${e.message()}\") }\n  if (!checkRows.next() catch e { panic(\"check next: \${e.message()}\") }) {\n    panic(\"LIVE PROOF FAILED: no live CHECK found after sync\")\n  }\n  let clause = asText(checkRows.value(0)) catch e { panic(\"check value: \${e.message()}\") }\n  checkRows.close()\n  if (!contains(clause, \"Retired\")) {\n    panic(\"LIVE PROOF FAILED: applied CHECK is missing the new variant: \${clause}\")\n  }\n\n  ensureHistoryTable(db) catch e { panic(\"ensureHistoryTable: \${e.message()}\") }\n  recordApplied(db, HistoryEntry{ version: 1, name: \"seed\", checksum: \"x\", appliedAt: 0, durationMs: 0 }) catch e { panic(\"recordApplied: \${e.message()}\") }\n  let refused = false\n  syncSchema(db, [WidgetOk{}], dialect()) catch e {\n    refused = true\n    if (!contains(e.message(), \"schema_history\")) {\n      panic(\"LIVE PROOF FAILED: refusal did not name schema_history: \${e.message()}\")\n    }\n  }\n  if (!refused) {\n    panic(\"LIVE PROOF FAILED: sync did not refuse a migrated database\")\n  }\n\n  db.exec(\"drop table sy5069_a\", []Value(0)) catch e { panic(\"cleanup a: \${e.message()}\") }\n  db.exec(\"drop table sy5069_b\", []Value(0)) catch e { panic(\"cleanup b: \${e.message()}\") }\n  db.exec(\"drop table sy5069_new\", []Value(0)) catch e { panic(\"cleanup new: \${e.message()}\") }\n  db.exec(\"drop table sy5069_status\", []Value(0)) catch e { panic(\"cleanup status: \${e.message()}\") }\n  db.exec(\"drop table schema_history\", []Value(0)) catch e { panic(\"cleanup history: \${e.message()}\") }\n  db.close()\n  print(\"LIVE_PROOF_OK\")\n}\n"
+
+test "live: an agreeing schema is a no-op, added/dropped columns and a new table are applied, an enum change is applied, and a migrated database is refused" {
+  let uri = env("ORM_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_PG_URI is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let proj = scratchDir("syncliveproof")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof5069\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", liveSyncProofSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(
+    rc == 0,
+    "live proof against a real Postgres server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}'",
+  )
+  resetDir(proj)
+}
