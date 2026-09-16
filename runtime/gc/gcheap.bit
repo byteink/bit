@@ -38,6 +38,339 @@
   return n + (addr >> 2)
 }
 
+// ---------------------------------------------------------------------------
+// The per-OS-thread small-slot cache (#5436)
+// ---------------------------------------------------------------------------
+//
+// ONE PROCESS-WIDE SPIN LOCK PER ALLOCATION IS WHAT THIS EXISTS TO REMOVE.
+// `heapLock(g)` is one address in the GC block, so before this every green
+// thread on every OS worker serialized every allocation on it. Measured on
+// `pkg/web/bench/apps/bit` at 16 keep-alive connections with only the worker
+// count varying: 62,964 req/s at `BIT_WORKERS=1`, 27,303 at 2, 14,833 at 4,
+// 7,218 at 8, 4,557 at 18 — every worker ADDED subtracted throughput, and
+// `bit_rt_spin_acquire` was 87% of on-CPU samples with `gcHeapAlloc` 33,564 of
+// its 33,962 callers. The spin is already the tuned form (#2321, see
+// `runtime/spinlock.bit`), so the fix is to stop reaching the lock rather than
+// to spin better.
+//
+// A thread takes a BATCH of slots out of a class's free list under the lock and
+// hands them out one at a time with no lock at all, so the lock is taken once
+// per `acMaxBytes / size` allocations instead of once per allocation.
+//
+// WHAT THE COLLECTOR SEES IS UNCHANGED, and that is the whole correctness
+// argument. A cached slot is in exactly the state a free-list slot is in: it is
+// off the free list, its span's `spanLive`/`spanFree`/`spanEmpty` moved when it
+// was taken (so `heapCheckSpansLocked`'s `sum(total - free) == spanLive` still
+// balances, stress-mode check included), no `setSlotBit` bit is set for it, it
+// is on no object list, and `gcOwns` therefore answers false for its address.
+// Nothing marks it, nothing sweeps it, and nothing can hand it out twice — it
+// is on exactly one list, and that list is one thread's.
+//
+// LIVE BYTES ARE CHARGED AT HAND-OUT, NOT AT REFILL, and that is load-bearing
+// rather than cosmetic. `heapLiveWord` is a sum of REQUEST sizes and a free
+// subtracts the request size it was given (`heapGiveSmallLocked`), so charging
+// a batch at the size of the request that happened to trigger it would drift
+// the live total every time a DIFFERENT request size in the same class popped a
+// slot out of it — the classes are size buckets, not exact sizes. The refill
+// therefore takes its slots at `size` 0 and the pop adds the caller's own
+// `size`, which leaves `gcLiveBytes` exactly the number it was before this
+// cache existed at every point a caller can observe it: `gcShouldCollect`'s
+// trigger, `_tests_/stress/gcbit`'s `sizeRoundTrip` (which compares it across
+// collections) and `_tests_/stress/gcslotbitmap`'s post-`gcDeinit` leak read.
+//
+// `heapAllocBytes` — the cumulative, never-decremented `allocbytes=` stat whose
+// only reader is `runtime/stw/stwstats.bit`'s `statsReport` — DOES move: it is
+// charged where the slot leaves the free list, so it now runs ahead of the
+// bytes actually handed out by whatever is sitting in caches, bounded by
+// `acMaxBytes` per class per thread.
+//
+// THE ENTRY IS KEYED BY THE OS THREAD, so the pop needs no atomic: no other
+// thread can reach it. `gcHeapAlloc` is `@nosplit` and contains no safepoint
+// poll, so a green task cannot be descheduled between the load of the head and
+// the store of its successor, and so cannot resume on another worker inside
+// that window. STANDING OBLIGATION: that rests on this path staying free of
+// yields — a safepoint added between `allocCachePop`'s two lines would hand one
+// slot to two threads.
+//
+// A COLLECTION NEEDS NO FLUSH, for the same reason the sweep never sees these
+// slots: they are not objects and they are charged no live bytes. What a
+// cached slot does cost is that its span cannot go entirely free, so a reclaim
+// pass will not release it — bounded by the cap below and given back by
+// `allocCacheDrainInto` as soon as the entry is reused for another heap.
+
+// Entries in the table. A power of two, and comfortably above any worker count
+// this runtime creates (`maxMutators` is 256, but the pool is core-count-sized);
+// a thread that finds every probed entry taken simply allocates through the
+// lock, which is exactly today's behaviour.
+const acEntries = 64
+
+// Words per entry, and the same figure in bytes. 64 words = 512 bytes = eight
+// whole cache lines, so no two threads' entries share one. The entry uses 40 of
+// them (3 header words + one head per class), so even a table base that is only
+// 8-byte aligned leaves 24 dead words between one entry's last live word and
+// the next entry's first — false sharing is impossible without depending on the
+// block's alignment.
+const acEntryWords = 64
+const acEntryBytes = 512
+
+const acOwner = 0 // `gcThreadToken()` of the owning OS thread, 0 when free
+const acHeap = 1  // `*(g + gcHeapAddr)` these slots were taken from, 0 when none
+const acLock = 2  // `*(g + gcHeapLockAddr)` for that heap, so a drain can lock it
+const acHeads = 3 // `acHeads + idx`: head of class `idx`'s cached chain
+
+// Most bytes of ONE class ONE thread may hold, and the hard ceiling on the
+// batch. A cap in BYTES rather than in slots is what keeps the idle footprint
+// flat across the 37 classes: the same rule gives 512 slots' worth of an 8-byte
+// class (clamped to `acMaxBatch`) and none at all above 4 KiB, where an
+// allocation is rare enough that the lock it takes is not measurable and the
+// memory a cache would hold is not.
+const acMaxBytes = 4096
+const acMaxBatch = 64
+
+// Probes before giving up and using the lock. Linear, so a collision costs the
+// colliding thread one extra load per allocation and nothing else.
+const acProbes = 4
+
+// The table itself. `acEntries * acEntryWords`; an array length must be a
+// literal, so the two cannot be written as one.
+let allocCacheBlock: [4096]i64
+
+// Nonzero once the heap lock has been found HELD by another thread, which is
+// the only condition this cache exists for and the only one in which it pays.
+//
+// A CACHE THAT IS ALWAYS ON IS A LOSS ON EVERY SINGLE-THREADED PROGRAM, and
+// that is measured rather than feared. The per-allocation cost of reaching an
+// entry is `gcThreadToken`, a cross-object call on every target since the
+// #3420 platform split (`./gcthread.bit` states that cost in full), plus the
+// hash and the probe; against an UNCONTENDED `spinAcquire`, which is one
+// successful compare-and-exchange, that trade is negative. Medians of 5
+// interleaved reps on this host, cache always on vs this tree:
+// `bench/cases/alloc` 0.227s -> 0.266s (+17%), `bench/cases/strings` 0.222 ->
+// 0.243 (+9%), `bench/cases/json` 0.301 -> 0.319 (+6%). Every one of those
+// programs is single-threaded, so every one of them was paying for a lock
+// nobody else wanted.
+//
+// ARMED BY THE EVIDENCE, NOT BY A COUNT OF THREADS. The first gate tried was
+// "more than one registered mutator", and it never fired: the runtime's
+// default worker pool registers several OS threads before `main` runs, so
+// every program in the list above still paid. A failed `spinTryAcquire` is the
+// exact event the cache removes, so it is what turns it on.
+//
+// MONOTONIC AND PROCESS-WIDE: it is never cleared, so a program that contends
+// once keeps the cache for the rest of its life. A plain word written with the
+// same value by any number of threads — the races are all benign, and a reader
+// that is late by a few allocations simply takes the lock a few more times.
+let allocCacheArmed: i64 = 0
+
+// Arm the cache without waiting for contention to do it (#5441). ADDITIVE: the
+// failed-`spinTryAcquire` arming above is untouched, and this sets the same
+// monotonic word to the same value.
+//
+// IT EXISTS BECAUSE CONTENTION-ONLY ARMING IS ALSO COVERAGE-ONLY-ON-CONTENTION.
+// Every GC oracle in `_tests_/` but `_tests_/stress/parallel/` is a single
+// mutator, so without a forced arm the gates prove the fallback path and not
+// this one. Two callers turn it on: `BIT_GC_ALLOCCACHE=1`
+// (`../root/rootconfig.bit`) for a one-off run under any policy, and
+// `gcConfigure` whenever its `stress` parameter is true (`./gc.bit`), which
+// puts the cache under `BIT_GC=stress` — half of every stress-corpus program
+// run — permanently and with no harness change.
+//
+// `@symbol`-pinned for the #1627 reason the `gcEnv*` readers carry: its
+// `rootConfigureFromEnv` caller is small enough to be spliced into `boot`,
+// whose module emits `--freestanding` and may not name a mangled callee.
+export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
+  allocCacheArmed = 1
+}
+
+// This OS thread's entry address, or 0 when it can have none — before boot, on
+// a thread with no thread pointer, or when every probed entry belongs to
+// another live thread.
+//
+// THE READINESS GATE IS NOT OPTIONAL AND ITS ORDER IS NOT EITHER. On x86-64 the
+// token is a load through `%fs:0`, which FAULTS on a thread whose FS base has
+// not been installed yet; `worldBlockAddr()` answers 0 until `rootInit` has
+// done that, exactly as `../gc/gcworldsync.bit`'s `currentMutator` documents
+// for the same pair of calls in the same order.
+@nosplit fn allocCacheEntry(g: *i64): int {
+  if (worldBlockAddr() == 0) {
+    return 0
+  }
+  let token = gcThreadToken()
+  if (token == 0) {
+    return 0
+  }
+  let base = int(ptrOf(allocCacheBlock))
+  // Thread pointers differ in their middle bits (per-thread TLS blocks are page
+  // multiples apart), so the low bits alone would pile every thread into a
+  // handful of entries. XOR-folding three shifted copies mixes bits 4..21 down
+  // into the index; a multiplicative mix is not available here because an i64
+  // multiply of an address overflows, which traps in a debug build (§11.1).
+  let home = ((token >> 4) ^ (token >> 10) ^ (token >> 16)) & (acEntries - 1)
+  let i = 0
+  // Bounded: exactly `acProbes` iterations.
+  while (i < acProbes) {
+    let addr = base + ((home + i) & (acEntries - 1)) * acEntryBytes
+    let e = wordAt(addr)
+    let own = atomicLoad(e + acOwner)
+    if (own == token) {
+      return allocCacheFor(e, g, addr)
+    }
+    // Claim a free entry. The exchange is what takes it; a thread that loses
+    // the race falls through to the next probe.
+    if (own == 0 && atomicCmpxchg(e + acOwner, 0, token)) {
+      return allocCacheFor(e, g, addr)
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Bind entry `e` to `g`'s heap, returning `addr` unchanged so the caller reads
+// as one expression. A no-op in the steady state (one load and one compare);
+// the drain runs only when a thread that cached slots out of one heap allocates
+// out of a DIFFERENT one, which is what `_tests_/stress` programs do when they
+// tear one heap down and stand the next one up on the same thread.
+@nosplit fn allocCacheFor(e: *i64, g: *i64, addr: int): int {
+  let heapAddr = *(g + gcHeapAddr)
+  if (*(e + acHeap) != heapAddr) {
+    allocCacheDrainInto(e, *(e + acHeap), *(e + acLock))
+    *(e + acHeap) = heapAddr
+    *(e + acLock) = *(g + gcHeapLockAddr)
+  }
+  return addr
+}
+
+// Give every cached slot back to the heap it was taken from, under that heap's
+// own lock. `heapAddr` 0 means the entry holds nothing.
+//
+// NO RECLAIM PASS IS RUN and none is owed: `heapGiveSmallLocked`'s return says
+// only that one would now be warranted, and the next free of that class asks
+// the same question again (`gcHeapFreeLocked`). Skipping it here is what lets
+// this run without a `g`, which the entry does not keep.
+@nosplit fn allocCacheDrainInto(e: *i64, heapAddr: int, lockAddr: int) {
+  if (heapAddr == 0) {
+    return
+  }
+  // `>> 2`, not `/ 4` — `heapLock`'s argument above, for the same word.
+  let n: *i32 = nil
+  let lk = n + (lockAddr >> 2)
+  spinAcquire(lk)
+  let h = wordAt(heapAddr)
+  let idx = 0
+  // Bounded: `allocNumClasses` iterations outside, `acMaxBatch` inside — a
+  // chain is only ever built by `allocCacheFillLocked`, which stops there.
+  while (idx < allocNumClasses) {
+    let a = *(e + acHeads + idx)
+    let k = 0
+    while (a != 0 && k < acMaxBatch) {
+      let nxt = *wordAt(a)
+      // `size` 0: this slot was never handed out, so it was never charged any
+      // live bytes — see this section's header.
+      let _ = heapGiveSmallLocked(h, a, idx, 0)
+      a = nxt
+      k = k + 1
+    }
+    *(e + acHeads + idx) = 0
+    idx = idx + 1
+  }
+  *(e + acHeap) = 0
+  *(e + acLock) = 0
+  spinRelease(lk)
+}
+
+// Drop — without giving back — every slot cached out of the heap at `heapAddr`.
+// `gcDeinit`'s, and only ever correct there: the spans those slots live in are
+// about to be unmapped, so handing them to a free list that is itself going
+// away would be the one way to make a cached slot outlive its heap.
+@nosplit fn allocCacheForget(heapAddr: int) {
+  let base = int(ptrOf(allocCacheBlock))
+  let i = 0
+  // Bounded: `acEntries` iterations, `allocNumClasses` inside.
+  while (i < acEntries) {
+    let e = wordAt(base + i * acEntryBytes)
+    if (*(e + acHeap) == heapAddr) {
+      let idx = 0
+      while (idx < allocNumClasses) {
+        *(e + acHeads + idx) = 0
+        idx = idx + 1
+      }
+      *(e + acHeap) = 0
+      *(e + acLock) = 0
+    }
+    i = i + 1
+  }
+}
+
+// Put this thread's cached slots back on `g`'s free lists, leaving the heap in
+// the state it would have been in had this cache never existed.
+//
+// THIS IS WHAT KEEPS THE BITMAP ORACLE EXACT, and it is the only reason it is
+// exported. `_tests_/stress/gcslotbitmap`'s `checkSpanBitmap` asserts
+// `popcount(#3176 bitmap) == spanTotal - spanFree`, i.e. that every slot off
+// the free list is a live object — an identity a slot cache breaks by
+// construction, because a cached slot is a third state: off the list and not an
+// object. Draining first restores the two-state world the assertion is written
+// for, so the assertion stays `==` rather than being widened to `<=`, which
+// would have stopped catching the stale bits (#3925, #4058) it exists for.
+//
+// The drain is not a collection and does not need the world stopped: it touches
+// this thread's own entry and the heap lock, both of which an ordinary
+// allocation on this thread touches anyway.
+export @nosplit fn gcDrainAllocCache(g: *i64) {
+  let addr = allocCacheEntry(g)
+  if (addr == 0) {
+    return
+  }
+  let e = wordAt(addr)
+  allocCacheDrainInto(e, *(e + acHeap), *(e + acLock))
+}
+
+// Hand out one cached slot of class `idx`, or 0 when the cache is empty. NO
+// LOCK — see this section's header for why the entry needs none, and for why
+// the caller's `size` is charged here rather than at the refill.
+@nosplit fn allocCachePop(e: *i64, h: *i64, idx: int, size: int): int {
+  let head = e + acHeads + idx
+  let addr = *head
+  if (addr == 0) {
+    return 0
+  }
+  *head = *wordAt(addr)
+  let _ = atomicAdd(h + heapLiveWord, size)
+  return addr
+}
+
+// Top up class `idx`'s chain. CALLER MUST HOLD `heapLock(g)`, and must already
+// have taken the slot it is about to return to its own caller — this only fills
+// the cache, so a class that cannot yield a single extra slot simply leaves it
+// empty and the next allocation refills through the lock again.
+//
+// `heapTakeSmallLocked` AND NOTHING ELSE. The refill never grows the heap: it
+// takes only what the class's free list already holds, so it cannot map a span,
+// cannot fail, and adds no work to the critical section beyond the pops it
+// makes. That is also what keeps the span bookkeeping exact — every slot here
+// moved through the same primitive that every uncached allocation moves
+// through.
+@nosplit fn allocCacheFillLocked(g: *i64, e: *i64, idx: int, size: int) {
+  let h = heapBlock(g)
+  let head = e + acHeads + idx
+  let want = acMaxBytes / size
+  if (want > acMaxBatch) {
+    want = acMaxBatch
+  }
+  let n = 1
+  // Bounded: `acMaxBatch` iterations at most, and the class runs dry before
+  // that whenever it is nearly empty.
+  while (n < want) {
+    let addr = heapTakeSmallLocked(h, idx, 0)
+    if (addr == 0) {
+      break
+    }
+    *wordAt(addr) = *head
+    *head = addr
+    n = n + 1
+  }
+}
+
 // `Heap.alloc(size, alignment)`: the address, or 0 when memory is exhausted.
 //
 // UNDER STRESS THE REFILL PATH ALSO VERIFIES THE SPAN BOOKKEEPING (#2374) —
@@ -74,72 +407,114 @@
 // 56. Computing it BEFORE the lock rather than after also shortens the critical
 // section — sound because `allocClassify` is pure: it reads no heap word, takes
 // no lock and mutates nothing (`runtime/alloc/classify.bit`).
+//
+// EVERY FRAME ON THE UNARMED PATH IS THE SAME ONE IT ALWAYS WAS, and that is
+// why the #5436 cache is written into this function rather than in front of it.
+// A first draft put the small path in its own `gcHeapAllocSmall` and the span
+// refill in a third function; the two extra call frames cost `bench/cases/alloc`
+// 0.224s -> 0.241s (+7.6%) and `bench/cases/strings` +6.7% on a workload that
+// never takes the cache at all. The take below is therefore INLINE here, as it
+// was before, and only the cold span-refill path is a call.
 @nosplit fn gcHeapAlloc(g: *i64, size: int, alignment: int, idx: int): int {
-  spinAcquire(heapLock(g))
-  if (idx >= 0) {
-    let addr = heapTakeSmallLocked(heapBlock(g), idx, size)
-    if (addr != 0) {
-      spinRelease(heapLock(g))
-      return addr
-    }
-    // Class empty: try the #3045 span cache before the reserve. A reclaimed
-    // span sitting there is address space that is already ours — resident,
-    // owned, and unlinked from every class — so reusing it costs nothing the
-    // reserve would otherwise have to map fresh.
-    let span = heapSpanCacheTakeLocked(heapBlock(g))
-    let owned = true
-    if (span == 0) {
-      // Cache empty: try the span reserve's own free list next (#3868) —
-      // an address `gcHeapFree`'s overflow arm recovered rather than
-      // abandoned when the #3045 cache was already full for it. Cheaper
-      // than `reserveGrow` even though both eventually return mapped
-      // memory: this skips a syscall entirely, `bit_rt_remap_pages` having
-      // already paid it when the span was pushed.
-      span = spanFreeListTake(g + gcSpanFree)
-      if (span == 0) {
-        // Free list empty too: carve a fresh span out of the reserve and
-        // retry, which is `allocSmall`'s `refill` path. `reserveGrow` maps a
-        // fresh chunk when the reserve is spent, so this fails only when the
-        // OS is out — `refill`'s `mapPages(span_bytes) orelse return false`
-        // exactly (#1638).
-        span = reserveGrow(g + gcSpanRes, allocSpanBytes)
-        if (span == 0) {
-          spinRelease(heapLock(g))
-          return 0
-        }
-        // Whether this span may ever be given back to the OS is decided HERE
-        // and recorded on the span, because this is the only place that
-        // knows: a span out of a chunk the reserve mapped is releasable, one
-        // out of the arena the CALLER bound is not (#2375, see
-        // `reserveHeadOwns`).
-        owned = reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes)
-      }
-      // A free-list span is always releasable too, same reasoning as the
-      // cache below: it can only have arrived here via `gcHeapFree`'s
-      // overflow arm, which only ever reaches a span already established as
-      // owned. `owned` stays at its default (true) for it.
-    }
-    // A cached span is always releasable: `heapSpanCachePushLocked` only ever
-    // receives spans `heapReclaimSpansLocked` marked doomed, and that pass
-    // only takes spans with `spanOwned != 0` to begin with.
-    heapRefillLocked(heapBlock(g), idx, span, owned)
-    // #3177: register the span as span-backed BEFORE any slot in it is
-    // handed out, so `gcOwns` can answer every object carved from it via the
-    // #3176 bitmap instead of `idxContains`/`gcOwnsLinear`. Still inside the
-    // heap lock — safe to nest the list lock this takes underneath it, never
-    // the other way (`./gcindex.bit`'s span-presence note: nothing reachable
-    // under the list lock ever acquires the heap lock).
-    idxInsertSpan(g, span)
-    if (*(g + gcCfgStress) != 0) {
-      let _ = heapCheckSpansLocked(heapBlock(g))
-    }
-    let got = heapTakeSmallLocked(heapBlock(g), idx, size)
+  if (idx < 0) {
+    spinAcquire(heapLock(g))
+    let big = gcHeapAllocLargeLocked(g, size)
     spinRelease(heapLock(g))
-    return got
+    return big
   }
-  let got = gcHeapAllocLargeLocked(g, size)
-  spinRelease(heapLock(g))
+  // The cache is skipped outright for a request that could not hold two slots
+  // under the cap: a class that large is allocated rarely enough that its lock
+  // traffic does not appear in a profile, and caching it would spend the whole
+  // per-thread budget on one slot. `entry` is resolved BEFORE the lock —
+  // nothing it reads is under the heap lock, and resolving it inside would put
+  // a cross-object call in the critical section this exists to shorten.
+  let entry = 0
+  if (allocCacheArmed != 0 && size * 2 <= acMaxBytes) {
+    entry = allocCacheEntry(g)
+    if (entry != 0) {
+      let hit = allocCachePop(wordAt(entry), heapBlock(g), idx, size)
+      if (hit != 0) {
+        return hit
+      }
+    }
+  }
+  // `spinAcquire`'s own first step, open-coded so a failed exchange — the exact
+  // event this cache removes — is what arms it. An uncontended acquire costs
+  // what it costs today: one successful compare-and-exchange.
+  let lk = heapLock(g)
+  if (!spinTryAcquire(lk)) {
+    allocCacheArmed = 1
+    spinAcquire(lk)
+  }
+  let got = heapTakeSmallLocked(heapBlock(g), idx, size)
+  if (got == 0) {
+    got = gcHeapRefillSmallLocked(g, size, idx)
+  }
+  if (got != 0 && entry != 0) {
+    allocCacheFillLocked(g, wordAt(entry), idx, size)
+  }
+  spinRelease(lk)
   return got
+}
+
+// The class is empty: refill it from the span cache, the span free list or the
+// reserve, and take one slot out of the refilled class. CALLER MUST HOLD
+// `heapLock(g)`, and still holds it on return. Split out of `gcHeapAlloc` so
+// the take above stays inline in the caller (see its header) and so both stay
+// under E0201's 80-line limit; every comment below is the one it carried when
+// this was the tail of that one function.
+@nosplit fn gcHeapRefillSmallLocked(g: *i64, size: int, idx: int): int {
+  // Class empty: try the #3045 span cache before the reserve. A reclaimed
+  // span sitting there is address space that is already ours — resident,
+  // owned, and unlinked from every class — so reusing it costs nothing the
+  // reserve would otherwise have to map fresh.
+  let span = heapSpanCacheTakeLocked(heapBlock(g))
+  let owned = true
+  if (span == 0) {
+    // Cache empty: try the span reserve's own free list next (#3868) —
+    // an address `gcHeapFree`'s overflow arm recovered rather than
+    // abandoned when the #3045 cache was already full for it. Cheaper
+    // than `reserveGrow` even though both eventually return mapped
+    // memory: this skips a syscall entirely, `bit_rt_remap_pages` having
+    // already paid it when the span was pushed.
+    span = spanFreeListTake(g + gcSpanFree)
+    if (span == 0) {
+      // Free list empty too: carve a fresh span out of the reserve and
+      // retry, which is `allocSmall`'s `refill` path. `reserveGrow` maps a
+      // fresh chunk when the reserve is spent, so this fails only when the
+      // OS is out — `refill`'s `mapPages(span_bytes) orelse return false`
+      // exactly (#1638).
+      span = reserveGrow(g + gcSpanRes, allocSpanBytes)
+      if (span == 0) {
+        return 0
+      }
+      // Whether this span may ever be given back to the OS is decided HERE
+      // and recorded on the span, because this is the only place that
+      // knows: a span out of a chunk the reserve mapped is releasable, one
+      // out of the arena the CALLER bound is not (#2375, see
+      // `reserveHeadOwns`).
+      owned = reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes)
+    }
+    // A free-list span is always releasable too, same reasoning as the
+    // cache below: it can only have arrived here via `gcHeapFree`'s
+    // overflow arm, which only ever reaches a span already established as
+    // owned. `owned` stays at its default (true) for it.
+  }
+  // A cached span is always releasable: `heapSpanCachePushLocked` only ever
+  // receives spans `heapReclaimSpansLocked` marked doomed, and that pass
+  // only takes spans with `spanOwned != 0` to begin with.
+  heapRefillLocked(heapBlock(g), idx, span, owned)
+  // #3177: register the span as span-backed BEFORE any slot in it is
+  // handed out, so `gcOwns` can answer every object carved from it via the
+  // #3176 bitmap instead of `idxContains`/`gcOwnsLinear`. Still inside the
+  // heap lock — safe to nest the list lock this takes underneath it, never
+  // the other way (`./gcindex.bit`'s span-presence note: nothing reachable
+  // under the list lock ever acquires the heap lock).
+  idxInsertSpan(g, span)
+  if (*(g + gcCfgStress) != 0) {
+    let _ = heapCheckSpansLocked(heapBlock(g))
+  }
+  return heapTakeSmallLocked(heapBlock(g), idx, size)
 }
 
 // The direct-mapped (large) path — `allocLarge` verbatim: round to whole pages

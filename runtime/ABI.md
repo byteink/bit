@@ -1772,6 +1772,13 @@ Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 | `BIT_GC_GROWTH_PCT` | 200     | Heap growth percent between collections (>= 100)   |
 | `BIT_GC_MARKSTACK`  | 8192    | Mark worklist capacity in entries (> 0)            |
 | `BIT_GC_STATS`      | off     | `1`/`on` prints one summary line to stderr at exit  |
+| `BIT_GC_ALLOCCACHE` | off     | `1`/`on` arms the per-OS-thread slot cache at boot instead of on first lock contention (#5441) |
+
+`BIT_GC_ALLOCCACHE` is the one row that is NOT `configFromEnv`'s: it names this
+port's own allocator (`runtime/gc/gcheap.bit`), it selects which of two paths a
+run takes rather than any policy, and `BIT_GC=stress` arms the same cache on its
+own — so every stress run already exercises it and the variable exists to reach
+the default policy too.
 
 POSIX only in v1; Windows keeps the compiled defaults until the runtime adds
 `GetEnvironmentVariableW`.
