@@ -1,0 +1,165 @@
+// pkg/postgres/numeric.bit — the binary `numeric` wire format decoded to
+// `decimal` (#3989), proven against Postgres's own `::text` form rather than
+// trusted (numeric.test.bit's live corpus).
+//
+// WIRE SHAPE (NumericSend/NumericRecv, src/backend/utils/adt/numeric.c): a
+// 2-byte `ndigits`, a 2-byte signed `weight`, a 2-byte `sign` (0x0000
+// positive, 0x4000 negative, 0xC000 NaN, 0xD000 +Infinity, 0xF000 -Infinity
+// — the last two PG14+), a 2-byte `dscale`, then `ndigits` 2-byte base-10000
+// digit groups. Digit group `i` carries the 4 decimal digits at position
+// `(weight - i)`, counted in units of 4 digits from the decimal point.
+// Postgres drops leading AND trailing all-zero groups from the wire and
+// shifts `weight` to compensate — an INTERNAL zero group (`10000.0001`, the
+// group between the two nonzero ones) is still sent, only the edges are
+// trimmed — so the digit array does not cover every position on its own;
+// `digitAt` below fills the gap with implied zero groups.
+//
+// THE TEXT IS REBUILT, NOT THE NUMBER ITSELF. Concatenating each group as an
+// exact 4-digit field and handing the result to `parseDecimal` gets
+// decimal's own overflow and scale checks for free (SPEC §11.1: 96-bit
+// magnitude, scale 0..28) instead of a second copy of them here, and it is
+// the only way `1.50` keeps its trailing zero: `dscale` becomes exactly the
+// count of fractional digits in the text `parseDecimal` sees.
+
+import { parseDecimal, toString } from "std/decimal"
+
+// numeric's own OID (`pg_type.typname = 'numeric'`).
+export const oidNumeric: int = 1700
+
+// Sign field values (NumericSend).
+const numericPos: int = 0
+const numericNeg: int = 16384    // 0x4000
+const numericNaN: int = 49152    // 0xC000
+const numericPosInf: int = 53248 // 0xD000, PG14+
+const numericNegInf: int = 61440 // 0xF000, PG14+
+
+// A signed 2-byte big-endian field at `off`.
+fn be16s(b: []byte, off: int): int! {
+  let u = be16u(b, off)?
+  if (u >= 32768) {
+    return u - 65536
+  }
+  return u
+}
+
+// An unsigned 2-byte big-endian field at `off`.
+fn be16u(b: []byte, off: int): int! {
+  if (off + 2 > len(b)) {
+    fail newError("postgres: truncated numeric value")
+  }
+  return int(b[off]) * 256 + int(b[off + 1])
+}
+
+// The base-10000 digit group at position `pos` (units of 4 decimal digits
+// from the point), or 0 when `pos` falls outside the stored range — the
+// leading/trailing all-zero groups Postgres trims off the wire.
+fn digitAt(digits: []int, weight: int, pos: int): int {
+  let idx = weight - pos
+  if (idx < 0 || idx >= len(digits)) {
+    return 0
+  }
+  return digits[idx]
+}
+
+// `n` (0..9999) as exactly 4 decimal digits, zero-padded.
+fn pad4(n: int): string {
+  let s = "${n}"
+  while (len(s) < 4) {
+    s = "0" + s
+  }
+  return s
+}
+
+// The integer part: groups from `weight` down to 0, zero-padded and
+// concatenated, then stripped of leading zeros (keeping at least one digit).
+// Just "0" when `weight < 0` — the value has no integer digit groups at all.
+//
+// Bounded by `weight + 1`, which the wire caps at 32768 (a signed 16-bit
+// field).
+fn intDigits(digits: []int, weight: int): string {
+  if (weight < 0) {
+    return "0"
+  }
+  let s = ""
+  let pos = weight
+  while (pos >= 0) {
+    s = s + pad4(digitAt(digits, weight, pos))
+    pos = pos - 1
+  }
+  let i = 0
+  while (i < len(s) - 1 && s[i] == '0') {
+    i = i + 1
+  }
+  return s[i:len(s)]
+}
+
+// The first `dscale` fractional digits: groups from -1 down to
+// `-ceil(dscale/4)`, concatenated and cut to exactly `dscale` characters —
+// the digits of the last group past `dscale` are always zero, a numeric
+// storage invariant this relies on rather than reverifies.
+//
+// Bounded by `ceil(dscale/4)`, which the wire caps at 8192 (a 16-bit field).
+fn fracDigits(digits: []int, weight: int, dscale: int): string {
+  let groups = (dscale + 3) / 4
+  let s = ""
+  let pos = 0 - 1
+  while (pos >= 0 - groups) {
+    s = s + pad4(digitAt(digits, weight, pos))
+    pos = pos - 1
+  }
+  return s[0:dscale]
+}
+
+// The canonical decimal text `digits`/`weight`/`dscale`/`negative` denote —
+// exactly what `parseDecimal` (and `decimal`'s own `toString`) would read
+// back, trailing zeros included.
+fn numericText(digits: []int, weight: int, dscale: int, negative: bool): string {
+  let text = intDigits(digits, weight)
+  if (dscale > 0) {
+    text = text + "." + fracDigits(digits, weight, dscale)
+  }
+  if (negative) {
+    return "-" + text
+  }
+  return text
+}
+
+// The `decimal` a `numeric` column's binary body decodes to, `column` naming
+// it in every failure. `NaN`/`Infinity`/`-Infinity` and a magnitude or scale
+// decimal cannot hold are errors, never a silent round or a dropped digit —
+// #3989's constraint.
+export fn decodeNumeric(body: string, column: string): decimal! {
+  let b = []byte(body)
+  if (len(b) < 8) {
+    fail newError("postgres: column ${column}: truncated numeric value")
+  }
+  let ndigits = be16u(b, 0)?
+  let weight = be16s(b, 2)?
+  let sign = be16u(b, 4)?
+  let dscale = be16u(b, 6)?
+  if (sign == numericNaN) {
+    fail newError("postgres: column ${column}: numeric value is NaN, which decimal cannot represent")
+  }
+  if (sign == numericPosInf) {
+    fail newError("postgres: column ${column}: numeric value is Infinity, which decimal cannot represent")
+  }
+  if (sign == numericNegInf) {
+    fail newError("postgres: column ${column}: numeric value is -Infinity, which decimal cannot represent")
+  }
+  if (sign != numericPos && sign != numericNeg) {
+    fail newError("postgres: column ${column}: numeric value carries unknown sign field ${sign}")
+  }
+  if (8 + ndigits * 2 > len(b)) {
+    fail newError("postgres: column ${column}: numeric value declares ${ndigits} digits past the message")
+  }
+  let digits = []int(ndigits)
+  let i = 0
+  while (i < ndigits) {
+    digits[i] = be16u(b, 8 + i * 2)?
+    i = i + 1
+  }
+  let text = numericText(digits, weight, dscale, sign == numericNeg)
+  return parseDecimal(text) catch e {
+    fail newError("postgres: column ${column}: ${e.message()}")
+  }
+}
