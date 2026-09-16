@@ -1,103 +1,293 @@
-// pkg/postgres/temporal.bit — binary wire decoders for `date`, `time`,
-// `timestamp` and `timestamptz` (#5450, epic #5449), sibling of codec.bit's
-// scalar decoders and split into its own file for the same reason
-// numeric.bit is: one concern per file, none of them near the 800-line
-// ceiling.
+// pkg/postgres/temporal.bit — `date`, `time`, `timestamp` and `timestamptz`
+// (#5450, epic #5449), sibling of `pkg/mysql`'s `decimal.bit`/`codec.bit`:
+// same shape, same driver.
 //
-// THE WIRE EPOCH IS 2000-01-01, NOT THE UNIX EPOCH. `date` is a signed
-// int4 count of DAYS since 2000-01-01 (`DateADTGetDatum`); `time` is a
-// signed int8 of microseconds since midnight, no date, no zone
-// (`TimeADTGetDatum`); `timestamp` and `timestamptz` are both a signed int8
-// of MICROSECONDS since 2000-01-01 (`TimestampGetDatum`). Every decoder
-// below is built on `pgEpoch`, a single `DateTime` at 2000-01-01T00:00:00Z,
-// rather than a bare `946684800`-second literal added by hand: the offset
-// falls out of `std/time`'s own calendar arithmetic instead of being
-// restated, and mutating `pgEpochYear` alone is enough to break every
-// decoder here at once (temporal.test.bit's proof).
+// TEXT, NOT BINARY. `query.bit`'s `bindFrame` asks for `fmtText` on every
+// result column — Postgres's Bind message carries one result-format code
+// for the whole row, sent before Describe has said what the columns even
+// are, so there is no per-column binary choice on the ordinary path
+// (`codec.bit`'s own header). Every value this file's callers see is
+// already `Value.Text`, the same server-rendered bytes `asText` would
+// return, which is also why this file, unlike `codec.bit`/`numeric.bit`,
+// parses SERVER TEXT rather than wire bytes and needs no `queryBinary`.
 //
-// `timestamp` AND `timestamptz` DECODE FROM IDENTICAL BYTES. Postgres puts
-// no zone on the wire for either — a `timestamptz` column's session
-// `TimeZone` affects only how the server renders it as TEXT, never what is
-// sent in binary. What differs between the two is MEANING, not bytes: a
-// `timestamptz` value is a true instant, always UTC, and the `Timestamp`
-// `decodeTimestamptz` returns is exactly that instant. A `timestamp` value
-// is a wall-clock reading Postgres stored with no zone attached at all —
-// `decodeTimestamp` returns the same kind of `Timestamp`, but it is only
-// that wall-clock reading labeled UTC, correct as an instant only when the
-// caller already knows (or does not care) what zone the writer meant by it.
+// THIS DRIVER ASSUMES ISO `DateStyle` (Postgres's own default:
+// `YYYY-MM-DD HH:MM:SS[.ffffff]`, optionally `+HH[:MM[:SS]]`) and does not
+// read or set the session's `DateStyle` — nothing here pins it, the same
+// way nothing pins `TimeZone` either. A session running German, SQL or
+// Postgres `DateStyle` sends a different field order (`DD.MM.YYYY`,
+// `MM/DD/YYYY`, ...) and every decoder below fails loudly on it rather
+// than silently reading a swapped day and month: `pgParseDate` checks the
+// two `-` separators land at the ISO positions before trusting any digit.
+// `infinity`/`-infinity` and BC dates are valid Postgres text this format
+// does not parse either — `std/time.Date`'s range is 1..9999 AD with no
+// "unbounded" value to return, so both are refused by name rather than
+// misread as a nonsense date.
 //
-// RETURNS `std/time`'s OWN TYPES, never a package-local one: `Date` for
-// `date`, `Time` for `time`, `Timestamp` for both temporal columns —
-// exactly what `pkg/mysql`'s `mysqlInstant`/`mysqlOptInstant` (codec.bit)
-// already return, so this driver and that one share one temporal
-// vocabulary rather than two. `beSigned`, from codec.bit, same module, is
-// reused unqualified for the signed big-endian fields, same as
-// `decodeInt2`/`decodeInt4`/`decodeInt8` already do.
+// FRACTIONAL SECONDS ARE VARIABLE-WIDTH. Postgres strips trailing zero
+// digits from a `time`/`timestamp`/`timestamptz`'s fraction — `10:30:00`,
+// `10:30:00.1`, `10:30:00.123456` are all real output for the same column,
+// unlike `pkg/mysql`'s fixed 6-digit form (codec.bit's own header). Every
+// decoder here reads 1..6 fractional digits and scales up to nanoseconds,
+// never assumes a fixed width.
+//
+// RETURNS `std/time`'s OWN TYPES, never a package-local one — `Date` for
+// `date`, `Time` for `time`, `Timestamp` for both temporal columns, the
+// same return type `pkg/mysql`'s `mysqlInstant` already uses, so the two
+// drivers share one temporal vocabulary. `pgTimestamptz`'s `Timestamp` is
+// a true instant, always correct: `timestamptz` text always carries an
+// explicit UTC offset, applied below. `pgTimestamp`'s `Timestamp` is only
+// as good as the session's assumption that the wall-clock reading IS UTC
+// — Postgres sends a `timestamp` column with no zone at all, so this is
+// that reading relabelled, not a fact the wire told us.
 
-import { Date, DateTime, Time, Timestamp, date, timeNs, utc, Microsecond } from "std/time"
+import { Date, NaiveDateTime, Time, Timestamp, date, timeNs, utc, Second } from "std/time"
 
-// 2000-01-01, Postgres's own zero point for `date`/`timestamp`/`timestamptz`
-// (`POSTGRES_EPOCH_JDATE`), named as three fields rather than folded into
-// one constant so each is independently visible — and independently
-// breakable, for the mutation proof in temporal.test.bit.
-const pgEpochYear: int = 2000
-const pgEpochMonth: int = 1
-const pgEpochDay: int = 1
-
-// Midnight UTC on the wire epoch. `date(pgEpochYear, ...)` cannot actually
-// fail — the literals are a valid calendar date — so a failure here is a
-// broken invariant, not a runtime condition callers should handle.
-fn pgEpoch(): DateTime {
-  let d = date(pgEpochYear, pgEpochMonth, pgEpochDay) catch e {
-    panic("postgres: pgEpoch: ${e.message()}")
-  }
-  return d.atStartOfDay(utc())
-}
-
-// `date`: a signed int4 count of days since `pgEpoch`.
-export fn decodeDate(body: string, column: string): Date! {
-  let days = beSigned(body, 0, 4, column)?
-  return pgEpoch().date().addDays(days)
-}
-
-// `time`: a signed int8 of microseconds since midnight, no date, no zone.
-// Postgres never sends one outside `0..86399999999` (`24:00:00` is not a
-// valid `time`), so anything past that range is a malformed column rather
-// than a value this decoder should try to interpret.
-export fn decodeTime(body: string, column: string): Time! {
-  let micros = beSigned(body, 0, 8, column)?
-  if (micros < 0 || micros >= 86400000000) {
-    fail newError("postgres: column ${column}: time value ${micros}us is out of range for one day")
-  }
-  let hour = micros / 3600000000
-  let minute = micros / 60000000 % 60
-  let second = micros / 1000000 % 60
-  let nanosecond = micros % 1000000 * 1000
-  return timeNs(hour, minute, second, nanosecond) catch e {
-    fail newError("postgres: column ${column}: ${e.message()}")
+// `v` as text, naming `col` and `kind` (`"date"`, `"time"`, ...) in the
+// failure — mirrors `std/sql`'s own `asText`, reimplemented locally rather
+// than imported: `asText`/`isNull` are already imported once elsewhere in
+// this module (`live.test.bit`) and a second `import { asText } from
+// "std/sql"` here would be a duplicate declaration (SPEC §17.1, per-module
+// imports).
+fn pgText(v: Value, col: string, kind: string): string! {
+  match (v) {
+    Text(s) => return s
+    _ => fail newError("postgres: column ${col}: not a ${kind} value")
   }
 }
 
-// Shared by `decodeTimestamp` and `decodeTimestamptz`: `micros` since
-// `pgEpoch`, as the `Timestamp` that instant names. `addNanoseconds` on a
-// `DateTime` (stdlib/time/calarith.bit) carries across day boundaries
-// through Hinnant's civil-from-days conversion, so this is exact for a
-// value on either side of `pgEpoch`, not just after it.
-fn pgInstant(micros: int, column: string): Timestamp! {
-  return pgEpoch().addNanoseconds(micros * Microsecond).toTimestamp() catch e {
-    fail newError("postgres: column ${column}: ${e.message()}")
+// `v` is SQL NULL. Same reimplementation reason as `pgText`.
+fn pgIsNull(v: Value): bool {
+  match (v) {
+    Null => return true
+    _ => return false
   }
 }
 
-// `timestamp` (`timestamp without time zone`): see the file header for what
-// the returned `Timestamp` does and does not mean.
-export fn decodeTimestamp(body: string, column: string): Timestamp! {
-  let micros = beSigned(body, 0, 8, column)?
-  return pgInstant(micros, column)?
+// Postgres's `infinity`/`-infinity`, which `std/time.Date`/`Timestamp` have
+// no value to represent (SPEC's bounded types, no "unbounded" sentinel).
+fn pgIsInfinity(s: string): bool {
+  return s == "infinity" || s == "-infinity"
 }
 
-// `timestamptz`: a true UTC instant.
-export fn decodeTimestamptz(body: string, column: string): Timestamp! {
-  let micros = beSigned(body, 0, 8, column)?
-  return pgInstant(micros, column)?
+// The `count` ASCII digits at `s[start:start + count]`, as an int. Fails on
+// a non-digit or a string too short to hold them — never reads past `s`.
+fn pgDigits(s: string, start: int, count: int, col: string): int! {
+  if (start + count > len(s)) {
+    fail newError("postgres: column ${col}: '${s}' is too short")
+  }
+  let n = 0
+  let i = 0
+  while (i < count) {
+    let c = s[start + i]
+    if (c < '0' || c > '9') {
+      fail newError("postgres: column ${col}: '${s}' has a non-digit where a digit was expected")
+    }
+    n = n * 10 + (int(c) - 48)
+    i = i + 1
+  }
+  return n
+}
+
+// `s`'s leading `YYYY-MM-DD` (ISO `DateStyle`), as (year, month, day, the
+// length consumed). Postgres always zero-pads the year to 4 digits for
+// every year `Date` can hold (1..9999), so a fixed 4-digit field is exact
+// here, not an assumption that silently drops a 5th digit.
+fn pgParseDate(s: string, col: string): (int, int, int, int)! {
+  if (len(s) < 10 || s[4] != '-' || s[7] != '-') {
+    fail newError("postgres: column ${col}: '${s}' is not an ISO date (want YYYY-MM-DD)")
+  }
+  let year = pgDigits(s, 0, 4, col)?
+  let month = pgDigits(s, 5, 2, col)?
+  let day = pgDigits(s, 8, 2, col)?
+  return (year, month, day, 10)
+}
+
+// An optional `.` and 1..6 fractional-second digits at `s[pos:]`, as
+// (nanoseconds, the offset just past what was consumed) — `pos` itself
+// when there is no `.` there at all. Split out of `pgParseTime` to keep
+// that function under the complexity ceiling (`spec/LINT.md`).
+fn pgParseFraction(s: string, pos: int, col: string): (int, int)! {
+  if (pos >= len(s) || s[pos] != '.') {
+    return (0, pos)
+  }
+  let fracStart = pos + 1
+  let end = fracStart
+  while (end < len(s) && s[end] >= '0' && s[end] <= '9') {
+    end = end + 1
+  }
+  let digits = end - fracStart
+  if (digits == 0 || digits > 6) {
+    fail newError("postgres: column ${col}: '${s}' has a malformed fractional second")
+  }
+  let frac = pgDigits(s, fracStart, digits, col)?
+  let scale = 1
+  let pad = 6 - digits
+  let k = 0
+  while (k < pad) {
+    scale = scale * 10
+    k = k + 1
+  }
+  return (frac * scale * 1000, end)
+}
+
+// `s[start:]`'s leading `HH:MM:SS`, then an optional fractional second
+// (`pgParseFraction`), as (hour, minute, second, nanosecond, the offset
+// just past what was consumed) — that offset is where a `timestamptz`'s
+// zone suffix starts, if there is one.
+fn pgParseTime(s: string, start: int, col: string): (int, int, int, int, int)! {
+  if (start + 8 > len(s) || s[start + 2] != ':' || s[start + 5] != ':') {
+    fail newError("postgres: column ${col}: '${s}' is not an ISO time (want HH:MM:SS)")
+  }
+  let hour = pgDigits(s, start, 2, col)?
+  let minute = pgDigits(s, start + 3, 2, col)?
+  let second = pgDigits(s, start + 6, 2, col)?
+  let (nanos, pos) = pgParseFraction(s, start + 8, col)?
+  return (hour, minute, second, nanos, pos)
+}
+
+// `rest`, the digits after a timestamptz's `+`/`-`, as (hours, minutes,
+// seconds) — `HH`, `HH:MM` or `HH:MM:SS`, `rest`'s own length already
+// having picked which. Split out of `pgParseOffset` to keep that function
+// under the complexity ceiling (`spec/LINT.md`).
+fn pgParseOffsetClock(rest: string, original: string, col: string): (int, int, int)! {
+  let hh = pgDigits(rest, 0, 2, col)?
+  if (len(rest) == 2) {
+    return (hh, 0, 0)
+  }
+  if (rest[2] != ':') {
+    fail newError("postgres: column ${col}: '${original}' has a malformed UTC offset")
+  }
+  let mm = pgDigits(rest, 3, 2, col)?
+  if (len(rest) == 5) {
+    return (hh, mm, 0)
+  }
+  if (rest[5] != ':') {
+    fail newError("postgres: column ${col}: '${original}' has a malformed UTC offset")
+  }
+  let ss = pgDigits(rest, 6, 2, col)?
+  return (hh, mm, ss)
+}
+
+// A `timestamptz` zone suffix at `s[pos:]` — `+HH`, `+HH:MM` or
+// `+HH:MM:SS` (Postgres emits the seconds form for a handful of pre-1883
+// zones whose standard offset is not a round number of minutes) — as
+// signed seconds east of UTC.
+fn pgParseOffset(s: string, pos: int, col: string): int! {
+  if (pos >= len(s) || (s[pos] != '+' && s[pos] != '-')) {
+    fail newError("postgres: column ${col}: '${s}' has no UTC offset for a timestamptz value")
+  }
+  let sign = 1
+  if (s[pos] == '-') {
+    sign = 0 - 1
+  }
+  let rest = s[pos + 1:len(s)]
+  if (len(rest) != 2 && len(rest) != 5 && len(rest) != 8) {
+    fail newError("postgres: column ${col}: '${s}' has a malformed UTC offset")
+  }
+  let (hh, mm, ss) = pgParseOffsetClock(rest, s, col)?
+  return sign * (hh * 3600 + mm * 60 + ss)
+}
+
+// `s`'s leading `YYYY-MM-DD HH:MM:SS[.ffffff]` (the `timestamp`/
+// `timestamptz` shape, no zone), as the `NaiveDateTime` it names, plus the
+// offset just past what was consumed. Shared by `pgTimestamp` (stops here)
+// and `pgInstant` (reads a zone suffix from that offset).
+fn pgParseNaive(s: string, col: string): (NaiveDateTime, int)! {
+  if (pgIsInfinity(s)) {
+    fail newError("postgres: column ${col}: '${s}' has no finite value to represent")
+  }
+  let (year, month, day, dateLen) = pgParseDate(s, col)?
+  if (dateLen >= len(s) || s[dateLen] != ' ') {
+    fail newError("postgres: column ${col}: '${s}' is missing its time of day")
+  }
+  let (hour, minute, second, nanos, timeEnd) = pgParseTime(s, dateLen + 1, col)?
+  let d = date(year, month, day) catch e {
+    fail newError("postgres: column ${col}: ${e.message()}")
+  }
+  let naive = d.atTime(hour, minute, second) catch e {
+    fail newError("postgres: column ${col}: ${e.message()}")
+  }
+  return (naive.addNanoseconds(nanos), timeEnd)
+}
+
+// `date`.
+export fn pgDate(col: string, v: Value): Date! {
+  let s = pgText(v, col, "date")?
+  if (pgIsInfinity(s)) {
+    fail newError("postgres: column ${col}: '${s}' has no finite value to represent")
+  }
+  let (year, month, day, _) = pgParseDate(s, col)?
+  return date(year, month, day) catch e {
+    fail newError("postgres: column ${col}: ${e.message()}")
+  }
+}
+
+// As `pgDate`, but a SQL NULL decodes to `None` rather than failing — the
+// shape every nullable-column accessor in this package follows
+// (`pkg/mysql/decimal.bit`'s `mysqlOptDecimal`).
+export fn pgOptDate(col: string, v: Value): Option<Date>! {
+  if (pgIsNull(v)) {
+    return Option<Date>.None
+  }
+  return Option<Date>.Some(pgDate(col, v)?)
+}
+
+// `time`, no date, no zone.
+export fn pgTime(col: string, v: Value): Time! {
+  let s = pgText(v, col, "time")?
+  let (hour, minute, second, nanos, _) = pgParseTime(s, 0, col)?
+  return timeNs(hour, minute, second, nanos) catch e {
+    fail newError("postgres: column ${col}: ${e.message()}")
+  }
+}
+
+export fn pgOptTime(col: string, v: Value): Option<Time>! {
+  if (pgIsNull(v)) {
+    return Option<Time>.None
+  }
+  return Option<Time>.Some(pgTime(col, v)?)
+}
+
+// `timestamp` (`timestamp without time zone`): see the file header for
+// what the returned `Timestamp` does and does not mean — it is the
+// wall-clock reading Postgres stored, relabelled UTC, never a fact the
+// wire told us.
+export fn pgTimestamp(col: string, v: Value): Timestamp! {
+  let s = pgText(v, col, "timestamp")?
+  let (naive, _) = pgParseNaive(s, col)?
+  return naive.inZone(utc()).toTimestamp() catch e {
+    fail newError("postgres: column ${col}: ${e.message()}")
+  }
+}
+
+export fn pgOptTimestamp(col: string, v: Value): Option<Timestamp>! {
+  if (pgIsNull(v)) {
+    return Option<Timestamp>.None
+  }
+  return Option<Timestamp>.Some(pgTimestamp(col, v)?)
+}
+
+// `timestamptz`: a true UTC instant, named `pgInstant` — not `pgTimestamptz`
+// — to match `pkg/mysql`'s `mysqlInstant`: the same semantic type
+// (`std/time.Timestamp`, a real instant), the same reason it is not called
+// after its SQL type name there either.
+export fn pgInstant(col: string, v: Value): Timestamp! {
+  let s = pgText(v, col, "timestamptz")?
+  let (naive, pos) = pgParseNaive(s, col)?
+  let offsetSeconds = pgParseOffset(s, pos, col)?
+  let asIfUtc = naive.inZone(utc()).toTimestamp() catch e {
+    fail newError("postgres: column ${col}: ${e.message()}")
+  }
+  // The wall clock just parsed IS the reading at `offsetSeconds` east of
+  // UTC, not at UTC itself — `asIfUtc` is that same reading treated as UTC,
+  // so the real instant is `offsetSeconds` earlier (later, when negative).
+  return asIfUtc.add(0 - offsetSeconds * Second)
+}
+
+export fn pgOptInstant(col: string, v: Value): Option<Timestamp>! {
+  if (pgIsNull(v)) {
+    return Option<Timestamp>.None
+  }
+  return Option<Timestamp>.Some(pgInstant(col, v)?)
 }
