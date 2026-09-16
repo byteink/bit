@@ -6,7 +6,11 @@ and the descriptor it synthesizes. This package is under active development
 written against instead of a concrete `Pool`, the name mapping from a Bit
 field to its SQL table and column, the schema builder that declares tables,
 columns, indexes and foreign keys as an intent tree for a dialect to
-render, `Query<T>`, the find chain (`where`/`whereIn`/`whereNull`/
+render, `t.json`/`AlterTable.addJson`, a `jsonb`/`json` column for a raw
+`Json` tree or a `@json` class field, with `jsonColumnValue`/
+`jsonColumnRead`/`jsonColumnDecode<T>` as its write and read halves and a
+SQL NULL always kept distinct from a stored JSON `null`, `Query<T>`, the
+find chain (`where`/`whereIn`/`whereNull`/
 `whereLike`/`orderBy`/`limit`/`offset`) whose string-literal column names
 are checked against `T`'s fields at compile time, `save`/`delete`/
 `upsert`, the three write verbs: one `save` for a new or already-persisted
@@ -83,6 +87,9 @@ mapped from a `@table` class's field names - see
 [`docs/schema.md`](docs/schema.md), rendered to real DDL by a
 `Dialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first,
 [`docs/mysql.md`](docs/mysql.md) for `Mysql` and where its DDL diverges.
+A `jsonb`/`json` column for a `Json` tree or a `@json` class field, and
+why a SQL NULL is never the same value as a stored JSON `null`, is
+[`docs/json.md`](docs/json.md).
 Querying rows through the find chain is [`docs/query.md`](docs/query.md).
 Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is

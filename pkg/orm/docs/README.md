@@ -7,6 +7,7 @@
 | [Schema](schema.md) | Declaring and altering tables, columns, indexes and foreign keys as an intent tree, never SQL text |
 | [Dialect](dialect.md) | Rendering that intent tree to real DDL behind a `Dialect` interface, `Postgres` first |
 | [MySQL](mysql.md) | The second `Dialect`: every place its DDL diverges from Postgres in one table, why every statement it renders is non-transactional, and why the migration runner has no lock on it |
+| [JSON columns](json.md) | `t.json`/`t.addJson`: a `jsonb`/`json` column that normalises on write, `jsonColumnValue`/`jsonColumnRead`/`jsonColumnDecode<T>` for a `Json` tree or a `@json` class field, and why a SQL NULL and a JSON `null` stay distinct |
 | [Query](query.md) | The find chain: where/whereIn/whereNull/whereLike/orderBy/limit/offset, with a compile-time check on a string-literal column name |
 | [Raw SQL and dynamic columns](raw.md) | `whereRaw`: a SQL fragment plus its own bound arguments. `orderByField`: a column name from outside your program, checked against an allowlist, never escaped |
 | [Write](write.md) | `save`, `delete` and `upsert`: INSERT vs UPDATE decided by the persisted flag, never the primary key, and why 0 rows matched is an error |
