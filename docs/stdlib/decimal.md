@@ -35,6 +35,24 @@ fn subtotal(): decimal {
 `subtotal()` returns exactly `20.00`. String interpolation (`"${subtotal()}"`)
 already renders it as text with no extra step.
 
+## Rendering a decimal as text
+
+### `toString(d: decimal): string`
+
+The exact value of `d`, at `d`'s own scale: `.` as the decimal point, no
+thousands separator, no currency symbol, no padding. `20.00` renders as
+`"20.00"` and not `"20"`, because the scale is part of the value - a price
+that arrived with two fractional digits still has two after a round trip.
+
+This is what `"${d}"` calls, so the two are interchangeable and you rarely
+need to name it directly. Reach for it where you need the string itself
+rather than a string containing it - a `[]string` of rendered rows, a
+comparison against text, a value handed to a writer.
+
+Money for a human reader is a separate job: a thousands separator, a
+currency symbol and a locale's own decimal point belong at the display
+layer, not in a numeric type. See "When not to use it" below.
+
 ## Parsing text into a decimal
 
 ### `parseDecimal(s: string): ParseDecimalResult`
@@ -134,10 +152,10 @@ fn allModes(): []string {
   let x: decimal = 2.345
   return []string{
     toString(round(x, 2, RoundMode.HalfEven)), // "2.34" - 4 is even
-    toString(round(x, 2, RoundMode.HalfUp)), // "2.35" - away from zero
+    toString(round(x, 2, RoundMode.HalfUp)),   // "2.35" - away from zero
     toString(round(x, 2, RoundMode.HalfDown)), // "2.34" - toward zero
-    toString(round(x, 2, RoundMode.Floor)), // "2.34"
-    toString(round(x, 2, RoundMode.Ceiling)), // "2.35"
+    toString(round(x, 2, RoundMode.Floor)),    // "2.34"
+    toString(round(x, 2, RoundMode.Ceiling)),  // "2.35"
     toString(round(x, 2, RoundMode.Truncate)), // "2.34"
   }
 }
@@ -165,7 +183,7 @@ import { parseDecimal } from "std/decimal"
 fn rejectsMessyInput(): bool {
   let a = parseDecimal(" 19.99") // leading whitespace
   let b = parseDecimal("$19.99") // currency symbol
-  let c = parseDecimal("19,99") // thousands/decimal-comma separator
+  let c = parseDecimal("19,99")  // thousands/decimal-comma separator
   return !a.ok && !b.ok && !c.ok
 }
 ```
