@@ -90,6 +90,9 @@ mapped from a `@table` class's field names - see
 A `jsonb`/`json` column for a `Json` tree or a `@json` class field, and
 why a SQL NULL is never the same value as a stored JSON `null`, is
 [`docs/json.md`](docs/json.md).
+An enum field mapped to a `text` column with a CHECK constraint listing
+its variants by name, never a native database enum type, is
+[`docs/enum.md`](docs/enum.md).
 Querying rows through the find chain is [`docs/query.md`](docs/query.md).
 Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
 Writing or removing rows with no instance loaded is
