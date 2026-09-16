@@ -164,16 +164,40 @@ fn main() {
 }
 BITEOF
 
-# --- run one program under `/usr/bin/time -l`, parse its report -------------
+# --- build a probe once, outside any timing window, then pay the per-fresh-
+# inode first-execve charge with one discarded run --------------------------
+# `bit run` compiles in-process to a fresh nonce path and execs it, so the
+# old `run_timed` measured a compile plus that exec charge (0.45-0.81s at
+# 0.00s user/sys) instead of the probe's own work (#5316, #5411). Building
+# once and warming the binary here moves both costs outside every timed
+# window. Repo root as cwd, same as `bit run` used implicitly, or std/sync
+# and std/time fail to resolve (E0045).
+
+build_probe() {
+  local prog=$1 bin=$2 buildlog
+  buildlog="$(mktemp "$workdir/build.XXXXXX")"
+  if ! ( cd "$REPO_ROOT" && "$BIT" build "$prog" -o "$bin" >"$buildlog" 2>&1 ); then
+    echo "workerbench: program failed (${prog})" >&2
+    cat "$buildlog" >&2
+    exit 1
+  fi
+  rm -f "$buildlog"
+  ( cd "$REPO_ROOT" && "$bin" >/dev/null 2>&1 || true )
+}
+
+build_probe "$workdir/idle.bit" "$workdir/idle.bin"
+build_probe "$workdir/spawn.bit" "$workdir/spawn.bin"
+
+# --- run one built binary under `/usr/bin/time -l`, parse its report --------
 # Sets TIME_REAL/TIME_USER/TIME_SYS (seconds, as printed) on success; exits
 # non-zero itself if the measured program failed, since a number derived from
 # a failed run is not a number.
 
 run_timed() {
-  local workers=$1 prog=$2 timefile
+  local workers=$1 bin=$2 timefile
   timefile="$(mktemp "$workdir/time.XXXXXX")"
-  if ! BIT_WORKERS="$workers" /usr/bin/time -l "$BIT" run "$prog" >/dev/null 2>"$timefile"; then
-    echo "workerbench: program failed (BIT_WORKERS=${workers} ${prog})" >&2
+  if ! ( cd "$REPO_ROOT" && BIT_WORKERS="$workers" /usr/bin/time -l "$bin" >/dev/null 2>"$timefile" ); then
+    echo "workerbench: program failed (BIT_WORKERS=${workers} ${bin})" >&2
     cat "$timefile" >&2
     exit 1
   fi
@@ -186,14 +210,14 @@ run_timed() {
 # --- measurement A: idle cost at each of the fixed worker counts ------------
 
 for n in 1 2 4 8 18; do
-  run_timed "$n" "$workdir/idle.bit"
+  run_timed "$n" "$workdir/idle.bin"
   cpu="$(awk -v u="$TIME_USER" -v s="$TIME_SYS" 'BEGIN{printf "%.2f", u+s}')"
   echo "idle BIT_WORKERS=${n} cpu=${cpu}s"
 done
 
 # --- measurement B: spawn parallelism at the given worker count ------------
 
-run_timed "$SPAWN_WORKERS" "$workdir/spawn.bit"
+run_timed "$SPAWN_WORKERS" "$workdir/spawn.bin"
 pct="$(awk -v u="$TIME_USER" -v s="$TIME_SYS" -v r="$TIME_REAL" \
   'BEGIN{ if (r+0>0) printf "%.0f", (u+s)/r*100; else printf "0" }')"
 echo "spawn BIT_WORKERS=${SPAWN_WORKERS} cpu_percent=${pct}%"
