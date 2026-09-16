@@ -15,6 +15,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [seq](seq.md) | `"std/seq"` | `mapped`, `filter`, `reduce` over slices |
 | [sort](sort.md) | `"std/sort"` | Stable comparator-based sorting over slices |
 | [math](math.md) | `"std/math"` | `f64` maths and integer helpers |
+| [decimal](decimal.md) | `"std/decimal"` | Exact base-10 text and rounding for the `decimal` type - money |
 | [time](time.md) | `"std/time"` | Clocks, durations, sleeping |
 | [os](os.md) | `"std/os"` | Arguments, environment, exit |
 | [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
