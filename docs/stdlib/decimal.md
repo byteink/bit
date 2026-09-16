@@ -174,7 +174,7 @@ import { parseDecimal } from "std/decimal"
 fn parses(s: string): bool {
   let zero: decimal = 0
   let ok = true
-  parseDecimal(s) catch err {
+  parseDecimal(s) catch _ {
     ok = false
     zero
   }
@@ -182,9 +182,10 @@ fn parses(s: string): bool {
 }
 
 fn rejectsMessyInput(): bool {
-  return !parses(" 19.99") // leading whitespace
-    && !parses("$19.99") // currency symbol
-    && !parses("19,99") // thousands/decimal-comma separator
+  let leadingSpace = !parses(" 19.99") // leading whitespace
+  let currency = !parses("$19.99")     // currency symbol
+  let thousands = !parses("19,99")     // thousands/decimal-comma separator
+  return leadingSpace && currency && thousands
 }
 ```
 
