@@ -1,0 +1,584 @@
+// Bit standard library — decimal module (#3983).
+//
+// `decimal` (SPEC §11.1) is its own numeric family, not an integer or a float,
+// with dedicated compiler/runtime support (#3982: locals, fields, unary
+// -/+, binary +/-/*// and the six comparisons) but no stdlib home of its
+// own yet. This module is that home — the text and rounding surface a
+// program actually calls, following the one-module-per-concept precedent
+// `std/uuid`/`std/tz` already set, rather than folding an enum and three
+// functions into `std/strings` (whose parseInt/parseFloat are ASCII-only
+// numeric parsing, not decimal's rounding semantics).
+//
+// TWO COMPILER GAPS THIS MODULE WORKS AROUND, both outside this ticket's
+// `stdlib/` scope (filed as follow-ups):
+//
+//  1. `decimal(n)` and `i64(d)` (SPEC §12.9's other two decimal conversions)
+//     are accepted by the checker but have no codegen — `decimal(n)`
+//     segfaults the compiler, `i64(d)` returns garbage. Every decimal value
+//     below is built from decimal literals (§5.4, <=18 digits) and
+//     `+`/`-`/`*` chains instead, the technique
+//     `_tests_/cases/decimal_corpus.bit` already uses past 18 digits.
+//
+//  2. A `decimal` cannot cross a fallible (`T!`) return or sit in a generic
+//     payload-carrying enum: `fn f(): decimal!` crashes at every call site
+//     that unwraps it (`?` or `catch`), and `Result<decimal, E>.Ok(v)`
+//     segfaults the compiler outright — confirmed by direct probes, not
+//     inferred. `parseDecimal` therefore returns `ParseDecimalResult`, a
+//     plain class (decimal class FIELDS are #3982's own proven path), not
+//     `decimal!` — the shape the ticket describes, blocked by a compiler
+//     defect wider than this ticket, reported rather than routed around
+//     silently.
+
+import { Builder, newBuilder } from "std/strings"
+
+// How a value rounds when the digit(s) being dropped sit exactly halfway.
+// `HalfEven` is the type's own default for division (§11.1); this API is for
+// money, where the scale is fixed by the currency and the mode by the
+// jurisdiction, so `round` takes both explicitly and defaults neither.
+export enum RoundMode { HalfEven, HalfUp, HalfDown, Floor, Ceiling, Truncate }
+
+// The exact decimal text of `d`: its own scale, `.` as the point, no
+// thousands separator, no currency symbol. Locale-aware money formatting is
+// an `i18n` concern and does not belong in a numeric type (§11.1).
+// `"${d}"` already calls the same runtime renderer this returns.
+export fn toString(d: decimal): string {
+  return "${d}"
+}
+
+// `parseDecimal`'s outcome: `ok` and `value` on success, `ok` false and
+// `err` naming the problem otherwise. Not `decimal!` — see the file banner.
+export class ParseDecimalResult {
+  export ok: bool,
+  export value: decimal,
+  export err: string,
+}
+
+// The 96-bit mantissa's maximum value, 79228162514264337593543950335 =
+// 2^96 - 1, built the way `decimal_corpus.bit`'s
+// `printSignMagnitudeRegression` builds values past 18 digits — chained
+// `*`/`+` on <=18-digit literals, since a decimal literal cannot spell more
+// than 18 digits (§5.4) and `decimal(n)` cannot be used (file banner).
+fn maxDecimalMagnitude(): decimal {
+  let p9: decimal = 1000000000
+  let p18 = p9 * p9
+  let hi: decimal = 79228162514
+  let lo: decimal = 264337593543950335
+  return hi * p18 + lo
+}
+
+// `floor(maxDecimalMagnitude() / 10)`, built the same way, never by
+// dividing (decimal division trims trailing zeros to the shortest exact
+// representation — SPEC §11.1 — so it cannot be trusted to hand back an
+// integer here). Used by `accumulateDigit`'s overflow guard.
+fn maxDecimalMagnitudeDiv10(): decimal {
+  let p9: decimal = 1000000000
+  let p18 = p9 * p9
+  let hi: decimal = 7922816251
+  let lo: decimal = 426433759354395033
+  return hi * p18 + lo
+}
+
+// The decimal value of one digit `d` (0..9), built by adding the literal `1`
+// `d` times — bounded (`d` is always a scanned digit) and needs no
+// `decimal(int)` conversion (file banner).
+fn decimalOfDigit(d: i64): decimal {
+  let one: decimal = 1
+  let v: decimal = 0
+  let i: i64 = 0
+  while (i < d) {
+    v = v + one
+    i = i + 1
+  }
+  return v
+}
+
+// `0.1^n` (mantissa 1, scale `n`), 0 <= n <= 28 — multiplication never trims
+// (SPEC §11.1), so this is the exact scale-`n` unit, built without division.
+fn tenthPow(n: int): decimal {
+  let p: decimal = 1
+  let tenth: decimal = 0.1
+  let i = 0
+  while (i < n) {
+    p = p * tenth
+    i = i + 1
+  }
+  return p
+}
+
+// The running state of a digit scan: `mant` mutated in place rather than
+// threaded through a `decimal!` return (file banner) — a class is a
+// reference type (§13.3), so `accumulateDigit(st, ...)` mutating `st.mant`
+// is visible to the caller without `decimal` ever crossing a fallible
+// boundary.
+class DigitScanState {
+  mant: decimal,
+  fracDigits: int,
+  sawDigit: bool,
+  next: int,
+  failed: bool,
+  failMsg: string,
+}
+
+fn newDigitScanState(): DigitScanState {
+  let zero: decimal = 0
+  return DigitScanState{
+    mant: zero,
+    fracDigits: 0,
+    sawDigit: false,
+    next: 0,
+    failed: false,
+    failMsg: "",
+  }
+}
+
+// Folds digit `d` into `st.mant`, or marks `st` failed once
+// `st.mant * 10 + d` would exceed `maxDecimalMagnitude()`. `limit` is
+// `maxDecimalMagnitudeDiv10()`, passed in so a multi-digit scan computes it
+// once.
+//
+// Correct at the exact boundary, not just conservatively under it: for any
+// `mant <= limit`, `mant*10+d <= maxDecimalMagnitude()` iff `mant < limit`
+// (any digit is safe) or `mant == limit` and `d <= 5` (`limit`'s own last
+// digit, since `maxDecimalMagnitude() == limit*10 + 5`). `mant > limit`
+// always overflows regardless of `d`.
+fn accumulateDigit(st: DigitScanState, d: i64, limit: decimal) {
+  if (st.mant > limit || (st.mant == limit && d > 5)) {
+    st.failed = true
+    st.failMsg = "parseDecimal: too many significant digits for decimal's 96-bit precision"
+    return
+  }
+  let ten: decimal = 10
+  st.mant = st.mant * ten + decimalOfDigit(d)
+}
+
+// Scans `s[i:]`'s digits and at most one `.`, stopping at `e`/`E` or the
+// string's end. Fails on any other byte (SPEC §11.1: no whitespace, no
+// thousands separator, no currency symbol — anything not a digit or `.` is
+// invalid syntax here) or on more digits than `decimal` holds.
+fn scanDigits(s: string, i: int, limit: decimal): DigitScanState {
+  let st = newDigitScanState()
+  let n = len(s)
+  let sawPoint = false
+  let at = i
+  while (at < n) {
+    let c = s[at]
+    if (c == 'e' || c == 'E') {
+      break
+    }
+    if (c == '.') {
+      if (sawPoint) {
+        st.failed = true
+        st.failMsg = "parseDecimal: more than one '.' in ${s}"
+        break
+      }
+      sawPoint = true
+      at = at + 1
+      continue
+    }
+    if (c < '0' || c > '9') {
+      st.failed = true
+      st.failMsg = "parseDecimal: invalid character in ${s}"
+      break
+    }
+    accumulateDigit(st, i64(c - '0'), limit)
+    if (st.failed) {
+      break
+    }
+    st.sawDigit = true
+    if (sawPoint) {
+      st.fracDigits = st.fracDigits + 1
+    }
+    at = at + 1
+  }
+  st.next = at
+  return st
+}
+
+// The signed integer exponent starting at `s[i]` (just past the `e`/`E`),
+// requiring at least one digit and rejecting anything else. Plain `int!`
+// (not `decimal!`) is unaffected by the file banner's gap.
+fn scanExponent(s: string, i: int): int! {
+  let n = len(s)
+  if (i >= n) {
+    fail newError("parseDecimal: exponent with no digits in ${s}")
+  }
+  let at = i
+  let neg = false
+  if (s[at] == '+' || s[at] == '-') {
+    neg = s[at] == '-'
+    at = at + 1
+  }
+  if (at >= n) {
+    fail newError("parseDecimal: exponent with no digits in ${s}")
+  }
+  let v = 0
+  let digits = 0
+  while (at < n) {
+    let c = s[at]
+    if (c < '0' || c > '9') {
+      fail newError("parseDecimal: invalid exponent in ${s}")
+    }
+    if (digits >= 6) {
+      fail newError("parseDecimal: exponent out of range in ${s}")
+    }
+    v = v * 10 + int(c - '0')
+    digits = digits + 1
+    at = at + 1
+  }
+  if (neg) {
+    return 0 - v
+  }
+  return v
+}
+
+// `mant` with `pad` more `0` digits folded in — the negative-effective-scale
+// case (an exponent past the fractional digit count, e.g. `"1.5e3"`):
+// bringing the internal scale up to 0 by appending zeros to the magnitude,
+// through the same overflow-guarded accumulation `scanDigits` uses.
+fn padZeros(mant: decimal, pad: int, limit: decimal): DigitScanState {
+  let st = newDigitScanState()
+  st.mant = mant
+  let k = 0
+  while (k < pad) {
+    accumulateDigit(st, 0, limit)
+    if (st.failed) {
+      st.failMsg = "parseDecimal: scale exceeds decimal's 96-bit precision"
+      return st
+    }
+    k = k + 1
+  }
+  return st
+}
+
+fn parseFail(err: string): ParseDecimalResult {
+  let zero: decimal = 0
+  return ParseDecimalResult{ ok: false, value: zero, err: err }
+}
+
+// The magnitude and internal scale (§11.1: always 0..28, never negative)
+// `parseDecimal` stores, after folding in the text's exponent. Split out of
+// `parseDecimal` to keep it under the complexity ceiling.
+class ScaleResolution {
+  ok: bool,
+  mant: decimal,
+  scale: int,
+  err: string,
+}
+
+// `fracDigits - exponent` is the text's effective scale. A negative one
+// (an exponent past the fractional digit count, e.g. `"1.5e3"`) is folded
+// into `mant` as trailing zeros instead — the internal scale field can only
+// hold 0..28 (§11.1) — through the same overflow-guarded accumulation
+// `scanDigits` uses; one past 28 in the other direction is an error, never
+// a silent round.
+fn resolveScale(
+  mant: decimal,
+  fracDigits: int,
+  exponent: int,
+  limit: decimal,
+  s: string,
+): ScaleResolution {
+  let scale = fracDigits - exponent
+  if (scale < 0) {
+    let padded = padZeros(mant, 0 - scale, limit)
+    if (padded.failed) {
+      return ScaleResolution{ ok: false, mant: mant, scale: 0, err: padded.failMsg }
+    }
+    return ScaleResolution{ ok: true, mant: padded.mant, scale: 0, err: "" }
+  }
+  if (scale > 28) {
+    let msg = "parseDecimal: scale ${scale} exceeds decimal's maximum of 28 in ${s}"
+    return ScaleResolution{ ok: false, mant: mant, scale: scale, err: msg }
+  }
+  return ScaleResolution{ ok: true, mant: mant, scale: scale, err: "" }
+}
+
+// The `decimal` that text `s` denotes: an optional sign, digits, an
+// optional `.` and digits, and an optional exponent — nothing else (SPEC
+// §11.1). `ok` is false on empty input, a bare sign, any disallowed byte (no
+// leading/trailing whitespace, no thousands separator, no currency symbol),
+// a magnitude past the type's 96-bit precision, or an effective scale
+// outside 0..28. Never silently rounds: a value that cannot be represented
+// exactly is `!ok`, not a truncation.
+export fn parseDecimal(s: string): ParseDecimalResult {
+  if (len(s) == 0) {
+    return parseFail("parseDecimal: empty string")
+  }
+  let neg = false
+  let i = 0
+  if (s[0] == '+' || s[0] == '-') {
+    neg = s[0] == '-'
+    i = 1
+  }
+  let limit = maxDecimalMagnitudeDiv10()
+  let scan = scanDigits(s, i, limit)
+  if (scan.failed) {
+    return parseFail(scan.failMsg)
+  }
+  if (!scan.sawDigit) {
+    return parseFail("parseDecimal: no digits in ${s}")
+  }
+  let exponent = 0
+  if (scan.next < len(s)) {
+    let e = scanExponent(s, scan.next + 1) catch err {
+      return parseFail(err.message())
+    }
+    exponent = e
+  }
+  let resolved = resolveScale(scan.mant, scan.fracDigits, exponent, limit, s)
+  if (!resolved.ok) {
+    return parseFail(resolved.err)
+  }
+  let result = resolved.mant * tenthPow(resolved.scale)
+  if (neg) {
+    return ParseDecimalResult{ ok: true, value: 0 - result, err: "" }
+  }
+  return ParseDecimalResult{ ok: true, value: result, err: "" }
+}
+
+// `d`'s sign, its digits with the `.` removed, and how many of those digits
+// sit before the point — `round`'s own view of `toString(d)`, scanned once.
+class DecimalDigits {
+  neg: bool,
+  digits: []byte,
+  pointPos: int,
+}
+
+fn digitsOfDecimalText(text: string): DecimalDigits {
+  let n = len(text)
+  let neg = false
+  let i = 0
+  if (text[0] == '-') {
+    neg = true
+    i = 1
+  }
+  let digits = []byte(0, n)
+  let pointPos = 0
+  let sawPoint = false
+  while (i < n) {
+    let c = text[i]
+    if (c == '.') {
+      sawPoint = true
+    } else {
+      digits = append(digits, c)
+      if (!sawPoint) {
+        pointPos = pointPos + 1
+      }
+    }
+    i = i + 1
+  }
+  return DecimalDigits{ neg: neg, digits: digits, pointPos: pointPos }
+}
+
+// `digits` left-padded with `pad` `'0'` bytes.
+fn padLeftZeros(digits: []byte, pad: int): []byte {
+  let n = len(digits)
+  let out = []byte(n + pad)
+  let i = 0
+  while (i < pad) {
+    out[i] = '0'
+    i = i + 1
+  }
+  let j = 0
+  while (j < n) {
+    out[pad + j] = digits[j]
+    j = j + 1
+  }
+  return out
+}
+
+// `digits` interpreted as a big-endian decimal magnitude, plus one — `"099"`
+// becomes `"100"`, growing by one byte on a full carry. Never mutates
+// `digits`: the sub-slice `round` passes in is a view over its own scratch
+// array and this always returns a fresh one.
+fn carryIncrement(digits: []byte): []byte {
+  let n = len(digits)
+  let work = []byte(n)
+  let k = 0
+  while (k < n) {
+    work[k] = digits[k]
+    k = k + 1
+  }
+  let i = n - 1
+  let carry = true
+  while (i >= 0 && carry) {
+    if (work[i] == '9') {
+      work[i] = '0'
+    } else {
+      work[i] = work[i] + 1
+      carry = false
+    }
+    i = i - 1
+  }
+  if (!carry) {
+    return work
+  }
+  let out = []byte(n + 1)
+  out[0] = '1'
+  let j = 0
+  while (j < n) {
+    out[j + 1] = work[j]
+    j = j + 1
+  }
+  return out
+}
+
+// Whether the digits `digits[keepCount:]` being dropped are all zero, sit
+// exactly halfway (a leading `5` with nothing but zeros after), or exceed
+// halfway — the three facts every `RoundMode` decides on.
+class DropSignals {
+  anyNonzero: bool,
+  isHalf: bool,
+  isMoreThanHalf: bool,
+}
+
+fn dropSignals(digits: []byte, keepCount: int): DropSignals {
+  let first = digits[keepCount]
+  let restZero = true
+  let k = keepCount + 1
+  while (k < len(digits)) {
+    if (digits[k] != '0') {
+      restZero = false
+    }
+    k = k + 1
+  }
+  let isHalf = first == '5' && restZero
+  let isMoreThanHalf = first > '5' || (first == '5' && !restZero)
+  let anyNonzero = first != '0' || !restZero
+  return DropSignals{ anyNonzero: anyNonzero, isHalf: isHalf, isMoreThanHalf: isMoreThanHalf }
+}
+
+// Whether rounding `digits` to `keepCount` digits under `mode` carries the
+// last kept digit up by one. `Floor`/`Ceiling` round away from zero exactly
+// when any dropped digit is nonzero, on the side that grows the magnitude
+// (negative for `Floor`, positive for `Ceiling`); `HalfUp` breaks an exact
+// tie away from zero, `HalfDown` toward zero, `HalfEven` toward whichever
+// neighbor is even.
+// `Truncate`/`Floor`/`Ceiling`'s own share of `roundModeWantsUp`, split out
+// to stay under the complexity ceiling: `Floor`/`Ceiling` round away from
+// zero exactly when any dropped digit is nonzero, on the side that grows
+// the magnitude (negative for `Floor`, positive for `Ceiling`); `Truncate`
+// never rounds up.
+fn truncateFamilyUp(mode: RoundMode, neg: bool, anyNonzero: bool): bool {
+  if (mode == RoundMode.Floor) {
+    return neg && anyNonzero
+  }
+  if (mode == RoundMode.Ceiling) {
+    return !neg && anyNonzero
+  }
+  return false
+}
+
+// `HalfUp`/`HalfDown`/`HalfEven`'s own share: an exact tie breaks away from
+// zero for `HalfUp`, toward zero for `HalfDown`, and toward whichever
+// neighbor is even for `HalfEven`; anything past the tie always rounds up.
+fn halfFamilyUp(mode: RoundMode, isHalf: bool, isMoreThanHalf: bool, lastKeptEven: bool): bool {
+  if (mode == RoundMode.HalfDown) {
+    return isMoreThanHalf
+  }
+  if (mode == RoundMode.HalfEven) {
+    return isMoreThanHalf || (isHalf && !lastKeptEven)
+  }
+  return isMoreThanHalf || isHalf
+}
+
+fn roundModeWantsUp(mode: RoundMode, neg: bool, sig: DropSignals, lastKeptEven: bool): bool {
+  if (mode == RoundMode.Truncate || mode == RoundMode.Floor || mode == RoundMode.Ceiling) {
+    return truncateFamilyUp(mode, neg, sig.anyNonzero)
+  }
+  return halfFamilyUp(mode, sig.isHalf, sig.isMoreThanHalf, lastKeptEven)
+}
+
+fn decimalRoundUp(mode: RoundMode, neg: bool, digits: []byte, keepCount: int): bool {
+  let sig = dropSignals(digits, keepCount)
+  let lastKeptEven = true
+  if (keepCount > 0) {
+    lastKeptEven = (digits[keepCount - 1] - '0') % 2 == 0
+  }
+  return roundModeWantsUp(mode, neg, sig, lastKeptEven)
+}
+
+// Appends `kept`'s digits to `b`, then pads with `'0'` up to `targetLen` —
+// the negative-`scale` reconstruction (round to tens, hundreds, ...): no
+// fractional part, the dropped magnitude becomes trailing zeros.
+fn writeIntegerRounded(b: Builder, kept: []byte, targetLen: int) {
+  let i = 0
+  while (i < len(kept)) {
+    b.writeByte(kept[i])
+    i = i + 1
+  }
+  while (i < targetLen) {
+    b.writeByte('0')
+    i = i + 1
+  }
+}
+
+// Appends `kept`'s first `pointPos` digits, then (if `scale > 0`) a `.` and
+// the rest — the `scale >= 0` reconstruction.
+fn writeScaledRounded(b: Builder, kept: []byte, pointPos: int, scale: int) {
+  let i = 0
+  while (i < pointPos) {
+    b.writeByte(kept[i])
+    i = i + 1
+  }
+  if (scale > 0) {
+    b.writeByte('.')
+    while (i < len(kept)) {
+      b.writeByte(kept[i])
+      i = i + 1
+    }
+  }
+}
+
+// `d` rounded to `scale` fractional digits under `mode`. `scale` is the
+// caller's to state, always — money's scale is fixed by the currency and
+// its mode by the jurisdiction, so neither gets a default (SPEC §11.1). A
+// negative `scale` rounds to tens, hundreds, and so on: `round(x, -2,
+// mode)` rounds to the nearest hundred.
+//
+// Works on `toString(d)`'s digit text (SPEC §11.1's own exact rendering),
+// not `decimal(int)`/`i64(d)` (file banner) — round the digit array at the
+// target position, carry, then re-parse through `parseDecimal`. A `scale`
+// so extreme the reconstruction would exceed decimal's 96-bit precision
+// panics — the same "panics rather than wrapping" contract every other
+// decimal overflow already has (SPEC §11.1); `parseDecimal` cannot return
+// an error here since `round`'s own signature is not fallible.
+export fn round(d: decimal, scale: int, mode: RoundMode): decimal {
+  if (scale >= 28) {
+    return d
+  }
+  let dd = digitsOfDecimalText(toString(d))
+  let pointPos = dd.pointPos
+  let digits = dd.digits
+  let keepCount = pointPos + scale
+  if (keepCount < 0) {
+    let pad = 0 - keepCount
+    digits = padLeftZeros(digits, pad)
+    pointPos = pointPos + pad
+    keepCount = 0
+  }
+  if (keepCount >= len(digits)) {
+    return d
+  }
+
+  let kept = digits[0:keepCount]
+  if (decimalRoundUp(mode, dd.neg, digits, keepCount)) {
+    kept = carryIncrement(kept)
+  }
+  let finalPointPos = pointPos + (len(kept) - keepCount)
+
+  let b = newBuilder()
+  if (dd.neg) {
+    b.writeByte('-')
+  }
+  if (scale < 0) {
+    writeIntegerRounded(b, kept, finalPointPos)
+  } else {
+    writeScaledRounded(b, kept, finalPointPos, scale)
+  }
+  let pr = parseDecimal(b.toString())
+  if (!pr.ok) {
+    panic("round: internal reconstruction produced unparseable text: ${pr.err}")
+  }
+  return pr.value
+}
