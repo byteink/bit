@@ -399,14 +399,39 @@ let netClockScratch: [66]i64
 
 // Poll interval while waiting for readiness or the deadline, whichever comes
 // first: 2ms, the same value `runtime/root/*/os.bit`'s `osPollNs` uses for an
-// analogous bounded wait.
+// analogous bounded wait. The STEADY-STATE slice, not the first one.
 const netDeadlinePollNs: int = 2000000
 
-// Worst-case iterations of the retry loops below: the wait ceiling divided by
-// the poll interval, plus slack (Power of 10 rule 2, no `while (true)`) — the
-// monotonic-deadline check inside each loop is what actually ends every real
-// call, well before this bound is reached.
-const netDeadlineMaxPolls: int = netDeadlineMaxWaitNs / netDeadlinePollNs + 16
+// The slice a wait STARTS at (#5428), doubling toward `netDeadlinePollNs` from
+// there, so a peer that answers in microseconds is not made to wait 2ms per
+// exchange — which capped a keep-alive connection at 500 exchanges per second.
+// Byte-for-byte mirror of ../darwin/tcp.bit's constants and helper of the same
+// names; see there for why the fix is a ramp rather than a smaller
+// `netDeadlinePollNs`, why it is not a readiness race, why the first slice
+// still parks instead of yielding, and the measurements behind each.
+const netDeadlineFastPollNs: int = 1000
+
+// The slice after `cur`: double it, never past the steady-state interval.
+@nosplit fn netDeadlineNextSliceNs(cur: int): int {
+  let next = cur * 2
+  if (next > netDeadlinePollNs) {
+    return netDeadlinePollNs
+  }
+  return next
+}
+
+// Doublings from `netDeadlineFastPollNs` to `netDeadlinePollNs` (1us to 2ms
+// is 11), rounded up with slack: the extra iterations the ramp costs the
+// bound below over a loop that waited the full interval every time.
+const netDeadlineRampPolls: int = 16
+
+// Worst-case iterations of the retry loops below: the ramp in full, plus the
+// wait ceiling divided by the steady-state interval, plus slack (Power of 10
+// rule 2, no `while (true)`) — the monotonic-deadline check inside each loop
+// is what actually ends every real call, well before this bound is reached.
+const netDeadlineMaxPolls: int = netDeadlineRampPolls +
+  netDeadlineMaxWaitNs / netDeadlinePollNs +
+  16
 
 // The deadline elapsed before the operation completed — `osForkExecWaitBounded`'s
 // `-2` "timed out" sentinel, reused here for the same reason: one convention
@@ -433,13 +458,13 @@ export @nosplit fn netClockNowNs(): int {
 // without a scheduler to drive `schedTimerExpire`; retrying tightly is thus
 // the correct fallback, and it can never run past `deadlineNs` because the
 // caller checks the clock again on every iteration.
-@nosplit fn netAwaitDeadlineTick(deadlineNs: int): bool {
+@nosplit fn netAwaitDeadlineTick(deadlineNs: int, sliceNs: int): bool {
   let taskAddr = schedCurrentTask()
   if (taskAddr == 0) {
     return false
   }
   let now = netClockNowNs()
-  let wake = now + netDeadlinePollNs
+  let wake = now + sliceNs
   if (wake > deadlineNs) {
     wake = deadlineNs
   }
@@ -460,6 +485,7 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
 ): int {
   let deadline = netClampDeadline(deadlineNs, netClockNowNs())
   let polls = 0
+  let slice = netDeadlineFastPollNs
   while (polls < netDeadlineMaxPolls) {
     polls = polls + 1
     let n = sysRc(int(syscall(sysRead(), i64(fd), i64(int(buf)), i64(bufCap))))
@@ -471,7 +497,8 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
       if (netClockNowNs() >= deadline) {
         return netDeadlineTimedOut
       }
-      let _ = netAwaitDeadlineTick(deadline)
+      let _ = netAwaitDeadlineTick(deadline, slice)
+      slice = netDeadlineNextSliceNs(slice)
     } else if (e == eIntr()) {
       // Interrupted; retry immediately, same as `netReadSock`.
     } else if (e == eConnReset()) {
@@ -499,6 +526,7 @@ export @symbol("bit_rt_port_net_write_sock_deadline") @nosplit fn netWriteSockDe
   let deadline = netClampDeadline(deadlineNs, netClockNowNs())
   let off = 0
   let polls = 0
+  let slice = netDeadlineFastPollNs
   while (off < n && polls < netDeadlineMaxPolls) {
     polls = polls + 1
     let wrote = sysRc(int(syscall(sysWrite(), i64(fd), i64(int(buf + off)), i64(n - off))))
@@ -512,7 +540,8 @@ export @symbol("bit_rt_port_net_write_sock_deadline") @nosplit fn netWriteSockDe
         if (netClockNowNs() >= deadline) {
           return netDeadlineTimedOut
         }
-        let _ = netAwaitDeadlineTick(deadline)
+        let _ = netAwaitDeadlineTick(deadline, slice)
+        slice = netDeadlineNextSliceNs(slice)
       } else if (e != eIntr()) {
         return 0 - 1
       }
@@ -557,13 +586,15 @@ export @symbol("bit_rt_port_net_dial_tcp_deadline") @nosplit fn netDialTcpDeadli
     return 0 - 1
   }
   let polls = 0
+  let slice = netDeadlineFastPollNs
   while (polls < netDeadlineMaxPolls) {
     polls = polls + 1
     if (netClockNowNs() >= deadline) {
       netClose(fd)
       return netDeadlineTimedOut
     }
-    let _ = netAwaitDeadlineTick(deadline)
+    let _ = netAwaitDeadlineTick(deadline, slice)
+    slice = netDeadlineNextSliceNs(slice)
     // THE ADDRESS IS REBUILT EVERY ATTEMPT — see `netDialTcp`'s identical
     // comment; `netAwaitDeadlineTick` parks, so another task can leave its own
     // address in this worker's `saBytes()`/`ipBytes()` slot, or this task can
