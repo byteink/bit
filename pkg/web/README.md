@@ -64,3 +64,10 @@ request and response, middleware and its scope, sessions/CSRF/CORS/security
 headers, the operational middleware (rate limiting, static files, compress,
 logging, tracing, recovery), errors, the `envelope()`/`page()` response
 shape, and every `Config` field.
+
+<!-- BENCH:START -->
+<!-- BENCH:END -->
+
+Regenerate with `./pkg/web/bench/run.sh`, which needs an x86-64 Linux host
+(`scripts/x64host.sh`) with docker. The six servers it compares are under
+[`bench/apps/`](bench/apps); `bench/RESULTS.md` is the same block standalone.
