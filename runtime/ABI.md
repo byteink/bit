@@ -1473,13 +1473,24 @@ At a safepoint poll each mutator does exactly one of:
    fails to take the lock parks instead of spinning, so it can never hold the
    lock's winner hostage.
 
-**A collection that cannot achieve a full stop is abandoned, never forced.** The
-rendezvous wait is bounded (Power-of-10: every loop is); on expiry the collector
-clears the stop request, releases every parked thread, and returns *without*
-collecting. Skipping a collection is always safe — the heap simply grows to the
-next trigger — so correctness never depends on the rendezvous succeeding, and no
-blocking mutator can deadlock the collector. Abandonments are counted and
-reported by `BIT_GC_STATS=1`.
+**A collection that cannot achieve a full stop is retried, then abandoned —
+never forced.** The rendezvous wait is bounded (Power-of-10: every loop is); on
+an individual expiry the collector retries it — *without* clearing the stop
+request or releasing any parked thread — reusing the same epoch, so an
+acknowledgement a prior round already collected stays valid and a round only
+has to gather whatever mutator has not yet reached `parked`. Only once
+`stwRendezvousRetryBound` (`runtime/stw/stwpoll.bit`) rounds have all expired
+does the collector clear the stop request, release every parked thread, and
+return *without* collecting. (#5322: clearing the stop on every individual
+expiry used to release the whole parked herd into a race for the collector
+lock, whose winner bumped the epoch again and discarded every acknowledgement
+the previous round had banked — a self-sustaining livelock under CPU
+oversubscription, epoch climbing while `collections` stayed frozen.) Skipping a
+collection is always safe — the heap simply grows to the next trigger — so
+correctness never depends on the rendezvous succeeding, and no blocking mutator
+can deadlock the collector. Abandonments (a full exhaustion of the retry
+rounds, not an individual round's expiry) are counted and reported by
+`BIT_GC_STATS=1`.
 
 **Roots under the handshake.** The collecting thread walks its own stack
 precisely from its own snapshot (§4); every *other* `parked` mutator is walked
