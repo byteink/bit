@@ -181,6 +181,60 @@ fn fixtureSource(row: Row, n: int): string {
     "}\n"
 }
 
+// #3982 (decimal codegen). A decimal binary operator plus its declared
+// zero-allocation slope. `callExpr` is a bare expression on loop-invariant
+// locals `a`/`b` (`a - b`), never a fallible `T!` call, so it does not fit
+// `Row` above (whose `fixtureSource` always wraps `callExpr` in
+// `catch _ { panic(...) }` and checks a `perCallValue: int` sum, neither of
+// which a plain decimal operator returns). `#5402` was the one non-zero
+// case (binary `-` allocated one heap object per call, fixed by exploding
+// its left operand before the negate it lowers through) — DecRow exists to
+// keep it from regressing silently.
+class DecRow {
+  name: string,
+  callExpr: string,
+  slope: int,
+}
+
+fn decimalRows(): []DecRow {
+  return [
+    DecRow{ name: "decimal_add", callExpr: "a + b", slope: 0 },
+    DecRow{ name: "decimal_sub", callExpr: "a - b", slope: 0 },
+    DecRow{ name: "decimal_mul", callExpr: "a * b", slope: 0 },
+    DecRow{ name: "decimal_div", callExpr: "a / b", slope: 0 },
+  ]
+}
+
+// `want` is computed by the SAME expression, once, outside the loop: `a`
+// and `b` are loop-invariant, decimal arithmetic is pure, so the two
+// evaluations are byte-identical and no operator-specific literal is
+// needed (division's exact result is a 28-digit half-even repeating
+// decimal that would be unreadable to hand-write). Comparing `c` to `want`
+// every iteration — rather than summing `c`, as `fixtureSource` above
+// does — forces the compiler to treat every `callExpr` result as used by a
+// data-dependent branch without accumulating a value that could overflow
+// decimal's 96-bit mantissa (division's result is close to the type's full
+// precision; `callsN` copies of it summed would panic).
+fn decimalFixtureSource(row: DecRow, n: int): string {
+  return "fn main() {\n" +
+    "  let a: decimal = 1.5\n" +
+    "  let b: decimal = 2.25\n" +
+    "  let want: decimal = ${row.callExpr}\n" +
+    "  let matches = 0\n" +
+    "  let i = 0\n" +
+    "  while (i < ${n}) {\n" +
+    "    let c: decimal = ${row.callExpr}\n" +
+    "    if (c == want) {\n" +
+    "      matches = matches + 1\n" +
+    "    }\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "  if (matches != ${n}) {\n" +
+    "    panic(\"allocslope: ${row.name} correctness check failed\")\n" +
+    "  }\n" +
+    "}\n"
+}
+
 class Measured { ok: bool, exitCode: int, objects: int }
 
 // Everything a build/run/measure step needs that does NOT vary per (row, N)
@@ -214,39 +268,45 @@ fn runFixture(ctx: Ctx, prog: string, tag: string): Measured! {
 // Builds and runs `row`'s fixture at exactly `n` calls, returning the
 // `swept+live` object count, or -1 (having already recorded the failing
 // checks under `ctx.t`) when either step could not be measured.
-fn measureAt(ctx: Ctx, row: Row, n: int): int {
-  let tag = "${row.name}_${n}"
+// `name` and `source` are already the (row, n)-specific values — this
+// function no longer knows about `Row` at all, so it measures a `Row`'s
+// stdlib fixture and a `DecRow`'s bare-expression fixture identically
+// (#3982 comment 21: the decimal rows below cannot fit `Row`'s
+// catch-and-panic wrapper, so the shared plumbing takes plain strings
+// instead of owning the fixture shape).
+fn measureAt(ctx: Ctx, name: string, source: string, n: int): int {
+  let tag = "${name}_${n}"
   let src = "${ctx.scratch}/${tag}.bit"
-  writeFile(src, fixtureSource(row, n)) catch e {
-    check(ctx.t, false, "${row.name}: cannot write fixture: ${e.message()}")
+  writeFile(src, source) catch e {
+    check(ctx.t, false, "${name}: cannot write fixture: ${e.message()}")
     return 0 - 1
   }
   let prog = "${ctx.scratch}/${tag}"
   let build = buildFixture(ctx, src, prog, tag) catch e {
-    check(ctx.t, false, "${row.name}: ${e.message()}")
+    check(ctx.t, false, "${name}: ${e.message()}")
     return 0 - 1
   }
   check(
     ctx.t,
     build == 0 && exists(prog),
-    "${row.name}: fixture at N=${n} must compile (bit build exited ${build})",
+    "${name}: fixture at N=${n} must compile (bit build exited ${build})",
   )
   if (build != 0 || !exists(prog)) {
     return 0 - 1
   }
   let run = runFixture(ctx, prog, tag) catch e {
-    check(ctx.t, false, "${row.name}: ${e.message()}")
+    check(ctx.t, false, "${name}: ${e.message()}")
     return 0 - 1
   }
   check(
     ctx.t,
     run.exitCode == 0,
-    "${row.name}: fixture at N=${n} must exit 0 (exited ${run.exitCode})",
+    "${name}: fixture at N=${n} must exit 0 (exited ${run.exitCode})",
   )
   check(
     ctx.t,
     run.ok,
-    "${row.name}: no `[bit-gc] ... swept=N live=N` summary at N=${n} — the run was not measured",
+    "${name}: no `[bit-gc] ... swept=N live=N` summary at N=${n} — the run was not measured",
   )
   if (run.exitCode != 0 || !run.ok) {
     return 0 - 1
@@ -254,21 +314,21 @@ fn measureAt(ctx: Ctx, row: Row, n: int): int {
   return run.objects
 }
 
-// Measures `row` at `callsN` and `2*callsN`, derives the marginal slope, and
-// checks it against the row's declared value. Prints the two counts and the
-// derived slope unconditionally, pass or fail, so a failure names the exact
-// numbers it was computed from.
-fn evalRow(ctx: Ctx, row: Row) {
-  let objN = measureAt(ctx, row, callsN)
-  let obj2N = measureAt(ctx, row, callsN * 2)
+// Measures `name` at `callsN` and `2*callsN` from the two already-rendered
+// fixture sources, derives the marginal slope, and checks it against
+// `wantSlope`. Prints the two counts and the derived slope unconditionally,
+// pass or fail, so a failure names the exact numbers it was computed from.
+fn evalRow(ctx: Ctx, name: string, wantSlope: int, srcN: string, src2N: string) {
+  let objN = measureAt(ctx, name, srcN, callsN)
+  let obj2N = measureAt(ctx, name, src2N, callsN * 2)
   if (objN < 0 || obj2N < 0) {
     return
   }
   let slope = (obj2N - objN) / callsN
-  print("allocslope: ${row.name}: N=${callsN} objects=${objN}, 2N=${callsN * 2} objects=${obj2N}, slope=${slope}\n")
+  print("allocslope: ${name}: N=${callsN} objects=${objN}, 2N=${callsN * 2} objects=${obj2N}, slope=${slope}\n")
   check(
-    ctx.t, slope == row.slope,
-      "${row.name}: slope ${slope} objects/call, want ${row.slope} " +
+    ctx.t, slope == wantSlope,
+      "${name}: slope ${slope} objects/call, want ${wantSlope} " +
       "(N=${callsN} objects=${objN}, 2N=${callsN * 2} objects=${obj2N})",
   )
 }
@@ -284,7 +344,13 @@ fn runAll(t: Tally, scratch: string, ms: int) {
   }
   let ctx = Ctx{ t: t, bit: bit, stdlib: stdlib, scratch: scratch, ms: ms }
   for row of rows() {
-    evalRow(ctx, row)
+    evalRow(ctx, row.name, row.slope, fixtureSource(row, callsN), fixtureSource(row, callsN * 2))
+  }
+  for row of decimalRows() {
+    evalRow(
+      ctx, row.name, row.slope,
+      decimalFixtureSource(row, callsN), decimalFixtureSource(row, callsN * 2),
+    )
   }
 }
 
