@@ -372,6 +372,71 @@ export @nosplit @symbol("bit_rt_heap_take_small_locked") fn heapTakeSmallLocked(
   return addr
 }
 
+// Splice up to `want` slots off the FRONT of class `idx`'s free list in one
+// pass and return the head of the spliced chain, or 0 when the class is empty.
+// The last slot's intrusive next word is set to `tail`, so the caller gets a
+// ready-made chain with its own list already hung off the end. CALLER MUST
+// HOLD THE LOCK.
+//
+// WHY THIS EXISTS, AND WHY BATCHING ALONE DID NOT (#5448). #5436's per-thread
+// slot cache took `heapLock` once per 64 allocations rather than once per
+// allocation, by calling `heapTakeSmallLocked` 64 times in a row under that one
+// lock. That cut the ACQUISITION RATE 64x and left the lock OCCUPANCY where it
+// was: the same per-slot work, still serialized, just in bursts. Measured, not
+// argued — a 4x larger batch (64 -> 256 slots, eligibility held constant) moved
+// `pkg/web/bench/apps/bit` /plaintext c=16 by nothing at any worker count
+// (W=4 47,118 -> 48,814, W=8 33,868 -> 34,414, W=18 26,642 -> 25,544, all
+// inside the spread), while `sample` put the waiters-to-holder ratio at 4.8:1
+// on 8 workers, a saturated lock. The critical section has to get SHORTER.
+//
+// WHAT COMES OUT PER SLOT, AGAINST `heapTakeSmallLocked` ABOVE:
+//   - `atomicAdd(h + heapLiveWord, size)`. A refill passes `size` 0, so each was
+//     a full read-modify-write that added NOTHING to the hottest line in the
+//     process — the one every other thread's `allocCachePop` hammers at the same
+//     time. 63 of 64 exclusive-ownership transfers of it, inside the lock, gone.
+//   - `allocClassSize(idx)`, a real `bl` (see above), now called once.
+//   - the anchor's `spanLive` read-modify-write, now one add of `n`.
+// What stays per slot is what is per slot: the next-pointer load and that slot's
+// own span's `spanFree`, with `spanEmpty` on the same transition and rule.
+//
+// ADDRESS ORDER IS THE ALLOCATOR'S OWN AGAIN. This hands back the free list's
+// prefix in free-list order, so a cache filled from it hands out exactly the
+// addresses an uncached allocator would, in the same sequence. The per-slot loop
+// it replaces prepended each slot as it popped, and so reversed them.
+export @nosplit @symbol("bit_rt_heap_take_batch_locked") fn heapTakeBatchLocked(h: *i64, idx: int, want: int, tail: int): int {
+  if (want < 1) { return 0 }
+  let head = h + heapListsWord + idx
+  let anchor = *head
+  if (anchor == 0) { return 0 }          // no span yet: nothing to splice
+  let a = allocWordAt(anchor)
+  let first = *(a + spanList)
+  if (first == 0) { return 0 }           // every slot handed out
+  let addr = first
+  let last = first
+  let n = 0
+  // Bounded: `want` iterations, and the class runs dry before that whenever it
+  // holds fewer than `want` slots.
+  while (n < want && addr != 0) {
+    let sp = allocWordAt(allocSpanOf(addr))
+    let f = *(sp + spanFree)
+    *(sp + spanFree) = f - 1
+    // Same transition and the same owned-only rule as `heapTakeSmallLocked`:
+    // the first slot out of an entirely-free span makes it unreleasable.
+    if (f == *(sp + spanTotal) && *(sp + spanOwned) != 0) {
+      *(a + spanEmpty) = *(a + spanEmpty) - 1
+    }
+    last = addr
+    addr = *allocWordAt(addr)
+    n = n + 1
+  }
+  *(a + spanList) = addr                 // list = the slot after the last taken
+  *allocWordAt(last) = tail              // and the chain ends where the caller says
+  *(a + spanLive) = *(a + spanLive) + n
+  let ab = h + heapAllocBytesWord
+  *ab = *ab + n * allocClassSize(idx)
+  return first
+}
+
 // Push a slot back onto class `idx`. CALLER MUST HOLD THE LOCK.
 //
 // The intrusive next-pointer is written into the freed slot itself, which is
