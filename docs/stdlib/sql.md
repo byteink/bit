@@ -913,6 +913,179 @@ or if the column overflows `decimal`'s 96-bit magnitude / scale-28 range
 
 The decimal literal claimed by column `col`, or `None` on `NULL`.
 
+### Temporal, uuid, json and array columns
+
+A date, a time, a timestamp, a uuid, a JSON document and an array are the
+rest of the standard SQL type surface, and until now `find<T>` and a
+hand-written mapper both had no way to read one: `Value` stops at
+`Null`/`Int`/`Float`/`Text`/`Blob`, so a `timestamptz` or a `uuid` column
+arrived as a `Text` a caller had to parse by hand, per driver. These
+accessors are that parse, written once here rather than in every caller -
+and, like `decimal` above, every one of these types stays `Value.Text` on
+the wire on both drivers, because a database renders a date or a uuid as
+text even when it renders an integer as one.
+
+One accessor covers `timestamp` and `timestamptz` together:
+`sqlReqTimestamp` reads a trailing UTC offset when the text carries one
+(`timestamptz`) and treats an offset-less reading as already UTC
+(`timestamp`), returning a true instant either way - a `Value` carries no
+record of which SQL type produced it, so there is nothing to switch on.
+
+Arrays are **one generic accessor over an element decoder**, the same
+generic-plus-closure shape `sqlFindMany<T>` already uses for a whole row:
+`sqlReqArray<T>(rows, cols, col, elem)` splits a Postgres `{...}` array
+literal into its elements and applies `elem: (Value) => T!` to each.
+`sqlElemInt`/`sqlElemFloat`/`sqlElemBool`/`sqlElemText`/`sqlElemBlob`/
+`sqlElemDecimal` are the six built-in decoders, one per scalar type,
+mirroring `sqlReqInt`/`sqlReqFloat`/... above; pass the matching one, or
+write a closure for anything else.
+
+A shipment row exercises every one of them - required and optional forms,
+a `Json` tree, a `Json`-backed class, and an array of each scalar:
+
+```bit
+import {
+  Rows, sqlReqInt, sqlReqTimestamp, sqlOptTimestamp, sqlReqDate, sqlOptDate,
+  sqlReqTime, sqlOptTime, sqlReqUuid, sqlOptUuid, sqlReqJson, sqlOptJson,
+  sqlReqJsonAs, sqlOptJsonAs, sqlReqArray, sqlOptArray,
+  sqlElemInt, sqlElemFloat, sqlElemBool, sqlElemText, sqlElemBlob, sqlElemDecimal,
+} from "std/sql"
+import { Timestamp, Date, Time } from "std/time"
+import { UUID } from "std/uuid"
+import { Json, JsonEntry } from "std/json"
+
+@json class ShipmentSettings {
+  carrier: string,
+  insured: bool,
+}
+
+class Shipment {
+  id: i64,
+  trackingId: UUID,
+  externalId: Option<UUID>,
+  placedAt: Timestamp,
+  cancelledAt: Option<Timestamp>,
+  shipDate: Date,
+  deliveredDate: Option<Date>,
+  cutoff: Time,
+  pickupTime: Option<Time>,
+  manifest: Json,
+  extra: Option<Json>,
+  settings: ShipmentSettings,
+  backorderSettings: Option<ShipmentSettings>,
+  itemIds: []i64,
+  weights: []f64,
+  flags: []bool,
+  notes: []string,
+  photos: [][]byte,
+  totals: []decimal,
+  backorderIds: Option<[]i64>,
+}
+
+fn shipmentMapper(rows: Rows): Shipment! {
+  let cols = rows.columns()
+  return Shipment{
+    id: sqlReqInt(rows, cols, "id")?,
+    trackingId: sqlReqUuid(rows, cols, "tracking_id")?,
+    externalId: sqlOptUuid(rows, cols, "external_id")?,
+    placedAt: sqlReqTimestamp(rows, cols, "placed_at")?,
+    cancelledAt: sqlOptTimestamp(rows, cols, "cancelled_at")?,
+    shipDate: sqlReqDate(rows, cols, "ship_date")?,
+    deliveredDate: sqlOptDate(rows, cols, "delivered_date")?,
+    cutoff: sqlReqTime(rows, cols, "cutoff")?,
+    pickupTime: sqlOptTime(rows, cols, "pickup_time")?,
+    manifest: sqlReqJson(rows, cols, "manifest")?,
+    extra: sqlOptJson(rows, cols, "extra")?,
+    settings: sqlReqJsonAs<ShipmentSettings>(rows, cols, "settings")?,
+    backorderSettings: sqlOptJsonAs<ShipmentSettings>(rows, cols, "backorder_settings")?,
+    itemIds: sqlReqArray<i64>(rows, cols, "item_ids", sqlElemInt)?,
+    weights: sqlReqArray<f64>(rows, cols, "weights", sqlElemFloat)?,
+    flags: sqlReqArray<bool>(rows, cols, "flags", sqlElemBool)?,
+    notes: sqlReqArray<string>(rows, cols, "notes", sqlElemText)?,
+    photos: sqlReqArray<[]byte>(rows, cols, "photos", sqlElemBlob)?,
+    totals: sqlReqArray<decimal>(rows, cols, "totals", sqlElemDecimal)?,
+    backorderIds: sqlOptArray<i64>(rows, cols, "backorder_ids", sqlElemInt)?,
+  }
+}
+```
+
+`sqlReqJson`/`sqlOptJson` return a `Json` tree for a caller that does not
+know the column's shape ahead of time - `manifest` above. `sqlReqJsonAs<T>`/
+`sqlOptJsonAs<T>` decode straight into a class instead, the shape most
+callers actually want - `settings` above. Both pairs keep a SQL NULL and a
+stored JSON `null` distinct, matching `pkg/orm/docs/json.md`: a SQL NULL
+fails `NullField` (`Req`) or decodes to `None` (`Opt`); a stored JSON `null`
+document decodes successfully, to `Json.JsonNull` or a class's own
+`null`-shaped field, because it is data the row actually holds.
+
+### `sqlReqTimestamp(rows: Rows, cols: []string, col: string): Timestamp!`
+
+### `sqlOptTimestamp(rows: Rows, cols: []string, col: string): Option<Timestamp>!`
+
+The instant claimed by column `col`, reading `timestamp` or `timestamptz`
+text alike.
+
+### `sqlReqDate(rows: Rows, cols: []string, col: string): Date!`
+
+### `sqlOptDate(rows: Rows, cols: []string, col: string): Option<Date>!`
+
+The calendar date claimed by column `col`.
+
+### `sqlReqTime(rows: Rows, cols: []string, col: string): Time!`
+
+### `sqlOptTime(rows: Rows, cols: []string, col: string): Option<Time>!`
+
+The time-of-day claimed by column `col`, with 0..6 fractional-second digits.
+
+### `sqlReqUuid(rows: Rows, cols: []string, col: string): UUID!`
+
+### `sqlOptUuid(rows: Rows, cols: []string, col: string): Option<UUID>!`
+
+The uuid claimed by column `col`, parsed with `std/uuid`'s `parse`.
+
+### `sqlReqJson(rows: Rows, cols: []string, col: string): Json!`
+
+### `sqlOptJson(rows: Rows, cols: []string, col: string): Option<Json>!`
+
+The `Json` tree claimed by column `col`, parsed with `std/json`'s
+`jsonParse`.
+
+### `sqlReqJsonAs<T>(rows: Rows, cols: []string, col: string): T!`
+
+### `sqlOptJsonAs<T>(rows: Rows, cols: []string, col: string): Option<T>!`
+
+Column `col`'s JSON, decoded straight into `T` with `std/json`'s
+`jsonDecode<T>` - `T` must carry `@json`, the same mark `jsonDecode<T>`
+itself requires.
+
+### `sqlReqArray<T>(rows: Rows, cols: []string, col: string, elem: (Value) => T!): []T!`
+
+### `sqlOptArray<T>(rows: Rows, cols: []string, col: string, elem: (Value) => T!): Option<[]T>!`
+
+Column `col`'s Postgres `{...}` array literal, decoded to `[]T` by applying
+`elem` to each element. `{}` is an empty slice; a nested `{{1,2},{3,4}}`
+fails by name rather than silently flattening - Postgres arrays may be
+multi-dimensional, this accessor is one dimension only. An embedded `NULL`
+element fails naming the column, unless `elem` itself tolerates
+`Value.Null`.
+
+### `sqlElemInt(v: Value): i64!`
+
+### `sqlElemFloat(v: Value): f64!`
+
+### `sqlElemBool(v: Value): bool!`
+
+### `sqlElemText(v: Value): string!`
+
+### `sqlElemBlob(v: Value): []byte!`
+
+### `sqlElemDecimal(v: Value): decimal!`
+
+The six built-in element decoders for `sqlReqArray<T>`/`sqlOptArray<T>`,
+one per scalar type above. Each matches `Value.Text` - an array element is
+its own substring on the wire, never a typed sub-`Value` - and fails on a
+`NULL` element or text that does not parse as its type.
+
 Five more functions serve `find<T>`/`findOne<T>`/`findOneOrFail<T>` for a
 **plain scalar `T`** (no class declared): each requires the result to carry
 **exactly one** column, failing with `ColumnCount` otherwise, then applies
