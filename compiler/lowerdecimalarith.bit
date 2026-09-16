@@ -609,3 +609,115 @@ fn lowerDecimalMultiply(fc: FnCtx, a: int, b: int): int {
   let resultHi = decComposeHi(fc, magM, scaleSum, finalSignMasked)
   return buildTuple(fc, decimalTupleType(ctx), [magLo, resultHi])
 }
+
+// ---- §12.9 conversions to/from a plain integer -----------------------------
+
+// Panics "decimal to integer conversion overflowed" unless `ok` — the
+// conversion-specific sibling of `emitDecimalOverflowPanic` above and
+// `emitDecimalDivZeroPanic` (lowerdecimaldiv.bit): SPEC §13.5 gives each
+// distinct decimal fault its own message, and this one is neither an
+// arithmetic overflow nor a divide-by-zero, it is `i64(d)`'s truncated
+// integer part not fitting the destination's 64-bit range.
+fn emitDecimalToIntOverflowPanic(fc: FnCtx, ok: int) {
+  let good = builderNewBlock(fc.b)
+  let bad = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = ok
+  br.ival = good
+  br.ival2 = bad
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, bad)
+  let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  msg.sval = "decimal to integer conversion overflowed"
+  msg.ival = internPoolString(fc, msg.sval)
+  let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  pn.name = "panic"
+  pn.args = [builderEmit(fc.b, msg)]
+  emitRtCall(fc, pn)
+  builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, good)
+}
+
+// An ordinary (non-decimal) numeric `Convert`, exactly `lowerConvert`'s own
+// generic fallback (lowerprim.bit) — both operands are one register here, so
+// this is the well-tested plain sign-/zero-extend-or-truncate path, never the
+// 16-byte decimal case that path cannot handle.
+fn emitScalarConvert(fc: FnCtx, v: int, dstTy: int): int {
+  let ins = mkInstr(Op.Convert, dstTy)
+  ins.lhs = v
+  return builderEmit(fc.b, ins)
+}
+
+// `decimal(n)` (§12.9) for any integer `n`: exact, scale 0. An unsigned
+// source is already its own magnitude — sign is always positive. A signed
+// source's magnitude is computed sign-agnostically (`0 - n`, wrapping i64
+// arithmetic, this file's own idiom throughout — see `emitDecAddPair`'s
+// banner) rather than `Op.Neg`, which is exactly the `-i64::MIN`
+// representability trap `lowerDecimalNegate` (lowerdecimal.bit) already
+// avoids for the sign-bit constant; here the trap is on the VALUE itself, one
+// magnitude (`i64::MIN`'s, `2^63`) past what a signed i64 can hold, and `0 -
+// n` computed at 64 bits wraps to exactly that magnitude's correct bit
+// pattern instead of overflowing a signed representation of it.
+fn lowerIntToDecimalConvert(fc: FnCtx, srcVal: int, srcTy: int): int {
+  let ctx = fc.c.ctx
+  let i64ty = primType(ctx, 3)
+  let boolTy = primType(ctx, 10)
+  let srcI64 = srcVal
+  if (srcTy != i64ty) {
+    srcI64 = emitScalarConvert(fc, srcVal, i64ty)
+  }
+  if (!widthOf(ctx, srcTy).signed) {
+    return buildTuple(fc, decimalTupleType(ctx), [srcI64, emitI64Const(fc, 0)])
+  }
+  let isNeg = emitBin(fc, Op.ICmpSlt, boolTy, srcI64, emitI64Const(fc, 0))
+  let magNeg = emitBin(fc, Op.Sub, i64ty, emitI64Const(fc, 0), srcI64)
+  let mag = emitCondVal(fc, isNeg, i64ty, magNeg, srcI64)
+  let signMasked = emitCondVal(fc, isNeg, i64ty, emitSignBitConst(fc), emitI64Const(fc, 0))
+  let hi = decComposeHi(fc, emitI64Const(fc, 0), emitI64Const(fc, 0), signMasked)
+  return buildTuple(fc, decimalTupleType(ctx), [mag, hi])
+}
+
+// `i64(d)` (§12.9): truncates the fractional part toward zero, matching the
+// `float -> int truncates toward zero` rule the same section already states
+// for every other numeric conversion. Divides the mantissa down by its own
+// scale (`emitDecimalDivPow10`, lowerdecimaldiv.bit — dropping the remainder
+// each round IS the truncation), panics if the truncated magnitude does not
+// fit a 64-bit integer, reapplies the sign the same wrapping way
+// `lowerIntToDecimalConvert` builds it, then hands off to the ordinary
+// int-to-int path for any destination narrower or wider than `i64` — exactly
+// the truncate/extend §12.9 already defines for two plain integer types.
+fn lowerDecimalToIntConvert(fc: FnCtx, srcVal: int, dstTy: int): int {
+  let ctx = fc.c.ctx
+  let i64ty = primType(ctx, 3)
+  let boolTy = primType(ctx, 10)
+  let words = explodeValueWords(ctx, fc.b, srcVal, decimalWordTypes(ctx))
+  let lo = words[0]
+  let hi = words[1]
+  let neg = decIsNeg(fc, hi)
+  let (tlo, tm) = emitDecimalDivPow10(fc, lo, decMantHi32(fc, hi), decScale(fc, hi))
+
+  let bound = emitCondVal(
+    fc,
+    neg,
+    i64ty,
+    emitSignBitConst(fc),
+    emitI64Const(fc, 9223372036854775807),
+  )
+  let noHiBits = emitBin(fc, Op.ICmpEq, boolTy, tm, emitI64Const(fc, 0))
+  let inRange = emitBin(fc, Op.ICmpUle, boolTy, tlo, bound)
+  // `emitDecMulPair`'s own `ok12`/`ok` shape above: this file's idiom for
+  // ANDing two runtime bools is a nested `emitCondVal`, not a bitwise op.
+  let fits = emitCondVal(fc, noHiBits, boolTy, inRange, emitBoolConst(fc, false))
+  emitDecimalToIntOverflowPanic(fc, fits)
+
+  let magNeg = emitBin(fc, Op.Sub, i64ty, emitI64Const(fc, 0), tlo)
+  let result64 = emitCondVal(fc, neg, i64ty, magNeg, tlo)
+  if (dstTy == i64ty) {
+    return result64
+  }
+  return emitScalarConvert(fc, result64, dstTy)
+}

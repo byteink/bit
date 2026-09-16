@@ -1537,10 +1537,17 @@ interface is a separate extension this section does not make.
   result is safe precisely because equality already ignores scale (above) -
   no trim can change what a later `==` sees. A result whose mantissa would
   not fit 96 bits, or (for `*`) whose scale would exceed 28, **panics**
-  (§13.5) rather than wrapping; dividing by a zero decimal panics too. *(v1
-  status: the type, its literals, its conversions,
-  locals/parameters/fields/returns, interpolation, unary `-`/`+`, binary
-  `+`/`-`/`*`/`/`, and the six comparisons are implemented.)*
+  (§13.5) rather than wrapping; dividing by a zero decimal panics too.
+  Converting `decimal` to an integer type (`i64(d)`, §12.9) **truncates
+  toward zero**, discarding any digits past the decimal point rather than
+  rounding them - the same rule §12.9 already states for `float -> int`, so
+  every numeric-to-integer conversion truncates the identical way regardless
+  of which non-integer family it starts from. A truncated value that does not
+  fit the destination's 64-bit range **panics** ("decimal to integer
+  conversion overflowed"), the same posture as the mantissa/scale panics
+  above rather than a silent wrap. *(v1 status: the type, its literals, its
+  conversions, locals/parameters/fields/returns, interpolation, unary
+  `-`/`+`, binary `+`/`-`/`*`/`/`, and the six comparisons are implemented.)*
 - `bool` (`true` / `false`).
 - `string`: immutable, UTF-8 byte sequence; indexing yields a `byte`; `len(s)` is
   the byte length. Strings are reference types but deeply immutable.
@@ -3374,6 +3381,8 @@ rejected outright, `E0047`). `Result<T, E>` has no such rescue - both `Ok` and
   mode: unlike signed integer overflow above, there is no wrapping
   representation for it to fall back to. `decimal` division by a zero
   `decimal` **panics**, the same posture as integer division by zero above.
+  Converting a `decimal` to an integer type whose truncated (§11.1) value does
+  not fit the destination's 64-bit range **panics** too.
 
 ### 13.6 Memory Model (GC)
 
