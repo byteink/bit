@@ -319,6 +319,34 @@ read it back with `port()`.
 
 The port the server is bound to.
 
+### `Server.setIdleTimeoutMs(ms: int)`
+
+A persistent connection that goes quiet still holds a socket and a green
+thread. Left alone it holds them forever, so a handful of idle clients can
+exhaust a server that is doing no work at all. This sets how long
+`listenAndServeOn` waits for the next request on an already-answered
+connection before closing it. The default is 60 seconds, matching nginx's
+`keepalive_timeout`. Set it before serving starts.
+
+```bit
+import { serve } from "std/http"
+
+fn main(): ()! {
+  let srv = serve("127.0.0.1", 8080)?
+  srv.setIdleTimeoutMs(15000)
+  srv.setMaxRequestsPerConn(200)
+}
+```
+
+### `Server.setMaxRequestsPerConn(n: int)`
+
+A timeout alone does not bound a connection that stays *busy*. An upstream
+load balancer, or a handler leaking a little state per request, can pin one
+connection open indefinitely while never being idle long enough to time out.
+This caps how many requests a single connection may answer before the server
+closes it regardless of `Connection: keep-alive` - the bound nginx spells
+`keepalive_requests`. The default is 1000, and the example above sets both.
+
 ### `Server.accept(): Exchange!`
 
 Accepts the next connection, parking until a client arrives. Returns
