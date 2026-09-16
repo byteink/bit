@@ -872,6 +872,47 @@ The string claimed by column `col`, or `None` on `NULL`.
 
 The bytes claimed by column `col`, or `None` on `NULL`.
 
+### `decimal` columns: `sqlReqDecimal`/`sqlOptDecimal`
+
+`decimal` is not a `Value` variant - `Value` stays the five wire types above,
+and every driver sends a `DECIMAL`/`NUMERIC` column as `Value.Text` (the
+literal a database renders it as, `"1234.5678"`). `sqlReqDecimal` and
+`sqlOptDecimal` are the accessor: the same conversion every driver's own
+codec already does (`pkg/mysql`'s `mysqlDecimal` is `asText` then
+`parseDecimal`), so one accessor serves every driver with no per-driver
+mechanism. `find<T>` cannot map a `decimal` field itself - it is not one of
+the five scalar types - so a class with one is mapped by hand:
+
+```bit
+import { Rows, sqlReqInt, sqlReqDecimal, sqlOptDecimal } from "std/sql"
+
+class Order {
+  id: i64,
+  price: decimal,
+  refunded: Option<decimal>,
+}
+
+fn orderMapper(rows: Rows): Order! {
+  let cols = rows.columns()
+  return Order{
+    id: sqlReqInt(rows, cols, "id")?,
+    price: sqlReqDecimal(rows, cols, "price")?,
+    refunded: sqlOptDecimal(rows, cols, "refunded")?,
+  }
+}
+```
+
+### `sqlReqDecimal(rows: Rows, cols: []string, col: string): decimal!`
+
+The decimal literal claimed by column `col`, parsed with `std/decimal`'s
+`parseDecimal`. Fails naming the column if the text is not a valid decimal,
+or if the column overflows `decimal`'s 96-bit magnitude / scale-28 range
+(`std/decimal`'s own limit, never a silent round).
+
+### `sqlOptDecimal(rows: Rows, cols: []string, col: string): Option<decimal>!`
+
+The decimal literal claimed by column `col`, or `None` on `NULL`.
+
 Five more functions serve `find<T>`/`findOne<T>`/`findOneOrFail<T>` for a
 **plain scalar `T`** (no class declared): each requires the result to carry
 **exactly one** column, failing with `ColumnCount` otherwise, then applies
