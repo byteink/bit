@@ -114,7 +114,12 @@ cat >"$workdir/spawn.bit" <<'BITEOF'
 import { WaitGroup, newWaitGroup } from "std/sync"
 
 const tasks = 4
-const primeCeiling = 50000
+// Sized from a measured single-task wall-clock, not a round multiplier
+// (#5412): one burn() at this ceiling, built+warmed+timed the same way as
+// run_timed() below, measured 0.48-0.53s real on this Mac. At the shipped
+// 50000 a task finished under /usr/bin/time's 10ms resolution, making
+// cpu_percent read 0% regardless of actual parallelism.
+const primeCeiling = 6000000
 
 fn isPrime(n: int): bool {
   if (n < 2) {
