@@ -1,0 +1,211 @@
+// pkg/orm/enumcol.bit — mapping a Bit enum field to a `text` column with a
+// CHECK constraint listing its variants (#5082, owner decision 2026-09-12).
+//
+//   enum Status {
+//     Draft, Active, Archived,
+//     export name(): string {
+//       match (this) { Draft => return "Draft" Active => return "Active" Archived => return "Archived" }
+//     }
+//   }
+//
+//   let ddl = enumColumnDef("status", ["Draft", "Active", "Archived"])
+//     // "status text not null check (status in ('Draft','Active','Archived'))"
+//
+//   let v = enumColumnValue<Status>(post.status, (s) => s.name())        // write
+//   post.status = enumColumnRead<Status>(row.value(0), "status", "Status", parseStatus)?  // read
+//
+// THE VARIANT NAME IS STORED, NEVER THE ORDINAL. Reordering the enum's
+// declaration is then a no-op for every existing row — `enumVariantsChanged`
+// below is what proves a reorder emits nothing, by comparing the two
+// variant lists as SETS, never as sequences.
+//
+// WHY THE VARIANT LIST AND THE NAME/PARSE FUNCTIONS ARE ALL EXPLICIT
+// ARGUMENTS, NEVER READ OFF THE ENUM TYPE. Bit has no reflection
+// (`pkg/orm/generate.bit`'s own header states this throughout the package)
+// — nothing here can enumerate `Status`'s own variants, or convert a
+// `Status` value to its variant's name, from the type alone. The caller
+// supplies both, the same "the list is an argument" shape
+// `pkg/orm/generate.bit`'s own header already established for entities —
+// `name`/`parse` are ordinary enum methods and a free function the caller
+// writes once per enum with a `match` (SPEC §14.7's own `Ticket.summary()`
+// shows the identical shape).
+//
+// NO NEW COLUMNTYPE VARIANT. `schema.bit`'s `ColumnType` stays untouched —
+// an enum column is `ColumnType.Text` plus a CHECK, not a ninth variant a
+// dialect would need its own keyword for; this keeps every dialect's type
+// mapping (`postgres.bit`'s `pgType`, `mysql.bit`'s `mysqlType`) exhaustive
+// over the same eight variants it already is. This also directly satisfies
+// this ticket's own constraint: never a native database ENUM type on either
+// engine.
+//
+// THE COLUMN IDENTIFIER IS NOT QUOTED HERE, UNLIKE `postgres.bit`'s
+// `quoteIdent`/`mysql.bit`'s `mysqlQuoteIdent`. Every identifier those two
+// quote comes from a caller-supplied string that could be anything
+// (`table(...)`/`alter(...)`, schema.bit's own header) or a hostile test
+// fixture built to prove it. An enum field's column name, in contrast, is
+// always a Bit identifier — a `@table` class's own field name, or
+// `naming.bit`'s snake_case of it — lexically restricted to letters,
+// digits and `_` (SPEC's lexical grammar), so it can never carry a quote,
+// space or any other SQL metacharacter. Quoting it would change the
+// spelling without changing the safety, and this ticket's own acceptance
+// pins the unquoted spelling exactly (`status text not null check (status
+// in (...))`).
+//
+// EVERY VARIANT NAME, IN CONTRAST, IS QUOTED AND ESCAPED. A variant's
+// stored name (what `enumColumnValue` below writes) is whatever string the
+// caller's own `name(v)` returns — not a Bit identifier this file can
+// trust the same way. `quoteEnumLiteral` doubles any embedded `'`, the
+// standard SQL escape for a single-quoted string literal, valid on both
+// engines regardless of MySQL's `ANSI_QUOTES` mode (that setting changes
+// how a DOUBLE quote is read, never how a single quote inside a literal is
+// escaped) — `enumcol.test.bit` proves a variant literally named
+// `B'; drop table users; --` stays inertly inside its own literal.
+//
+// THIS COLUMN DEFINITION IS DIALECT-NEUTRAL, ON PURPOSE — SEE
+// `postgres.bit`'s AND `mysql.bit`'s OWN HEADERS. `text`, `not null` and
+// `check (col in (...))` are identical syntax on both engines for this
+// shape (MySQL has supported `CHECK` since 8.0.16), so `enumColumnDef`
+// lives here once instead of once per dialect; `postgres.test.bit`'s and
+// `mysql.test.bit`'s own enum tests both call it and assert the identical
+// string, which is itself the proof there is no divergence to render.
+//
+// THE ALTER STATEMENTS DIVERGE, AND LIVE IN EACH DIALECT FILE INSTEAD.
+// Dropping a named CHECK constraint is `drop constraint <name>` on
+// Postgres and `drop check <name>` on MySQL — a real keyword difference,
+// unlike the column definition above — so `postgres.bit`'s `enumCheckAlter`
+// and `mysql.bit`'s `mysqlEnumCheckAlter` each render their own engine's
+// spelling of "drop the old CHECK, add the new one, in one statement",
+// sharing only `enumCheckName`/`enumVariantList` from this file. Adding a
+// variant and removing one render through the identical function — the
+// SAME new list either way — which is also what makes a removal fail
+// loudly: the engine validates `add constraint ... check (...)` against
+// every existing row, and a row still holding a removed value is rejected
+// by the SERVER (`errors.bit`'s own `CheckViolation`, SQLSTATE 23514),
+// never silently accepted. Neither statement rewrites the table — both are
+// a metadata-only constraint swap, not a `CREATE TABLE`/column rewrite.
+//
+// NOT WIRED INTO `generate.bit`'s LIVE DIFF. `generate.bit` diffs
+// `information_schema.columns` for added/removed COLUMNS; it reads no
+// CHECK-constraint metadata today, and teaching it to is a wider, separate
+// integration (a live query, per-table, per-constraint) than this file's
+// own scope. `enumVariantsChanged` below is the decision a future
+// `generate.bit` change would call before deciding to emit anything —
+// flagged here rather than guessed at, the same way this package flags
+// every other reflection gap it finds.
+//
+// READING BACK NEVER FALLS BACK TO THE FIRST VARIANT. An unknown stored
+// value — written by another service, or predating a removed variant — is
+// `EnumColumnError`, naming the column, the raw value and the enum, the
+// same column-naming shape `pkg/orm/jsoncol.bit`'s `JsonColumnError`
+// already uses for an unusable stored value.
+//
+// `join`/`replace` are not imported here — `query.bit`/`postgres.bit`
+// already import them and a Bit import binds package-wide (`postgres.bit`'s
+// own header on this exact pair).
+
+// Why a column's stored text is not a variant of the enum it is declared
+// to hold — naming the column, the raw stored value and the enum, so the
+// caller's error says exactly what is wrong rather than guessing at the
+// first variant (this file's header; the ticket's own constraint: never a
+// silent fallback).
+export class EnumColumnError {
+  export column: string
+  export value: string
+  export enumName: string
+
+  message(): string {
+    return "pkg/orm: column '${this.column}' holds '${this.value}', not a variant of ${this.enumName}"
+  }
+}
+
+// `v`'s variant name, bound as a `Value` a driver places into a `text`
+// column — always `Value.Text`, never a SQL NULL (an `Option<T>`-wrapped
+// enum field converts `None` to `Value.Null` itself before ever reaching
+// this file, the same rule `pkg/orm/jsoncol.bit`'s header states for
+// `Option<Json>`). `name` is the caller's own conversion from `v` to its
+// declared variant's name (this file's header on why it cannot be derived
+// here).
+export fn enumColumnValue<T>(v: T, name: (T) => string): Value {
+  return Value.Text(name(v))
+}
+
+// Reads `column`'s stored text back into `T` via the caller's own `parse`,
+// or `EnumColumnError` naming `column`, the raw value and `enumName` when
+// the stored text is not one of `T`'s declared variants — never a silent
+// fallback to the first variant (this file's header). `v` must be
+// `Value.Text`; anything else is a caller/schema mismatch, reported the
+// same way.
+export fn enumColumnRead<T>(
+  v: Value,
+  column: string,
+  enumName: string,
+  parse: (string) => Option<T>,
+): T! {
+  let text = asText(v) catch _ {
+    fail EnumColumnError{ column: column, value: "", enumName: enumName }
+  }
+  match (parse(text)) {
+    Some(x) => return x
+    None => fail EnumColumnError{ column: column, value: text, enumName: enumName }
+  }
+}
+
+// Whether `oldVariants` and `newVariants` differ AS SETS — order never
+// counts, which is the entire enforcement of "reordering emits nothing"
+// (this file's header): a caller comparing an enum's old declaration
+// against its new one calls this before deciding to emit an ALTER at all.
+export fn enumVariantsChanged(oldVariants: []string, newVariants: []string): bool {
+  if (len(oldVariants) != len(newVariants)) {
+    return true
+  }
+  for v of newVariants {
+    if (!containsVariant(oldVariants, v)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn containsVariant(variants: []string, v: string): bool {
+  for x of variants {
+    if (x == v) {
+      return true
+    }
+  }
+  return false
+}
+
+// The deterministic CHECK constraint name for `column` on `table` —
+// `<table>_<column>_check`, the same `<table>_pkey`/`<table>_<col>_fkey`
+// shape `postgres.bit`'s `setPrimaryKeyStatement`/`foreignKeyDef` already
+// use, so a caller reading a generated migration recognises the
+// convention on sight.
+export fn enumCheckName(table: string, column: string): string {
+  return "${table}_${column}_check"
+}
+
+// `variants`, each a single-quoted, escaped SQL string literal, comma
+// joined with no space — `('Draft','Active','Archived')`'s own interior —
+// shared by `enumColumnDef` below and each dialect's `enumCheckAlter`.
+export fn enumVariantList(variants: []string): string {
+  let quoted = []string(0)
+  for v of variants {
+    quoted = append(quoted, quoteEnumLiteral(v))
+  }
+  return join(quoted, ",")
+}
+
+// One variant name as a SQL string literal — see this file's header for
+// why every variant, unlike the column identifier, is quoted and escaped.
+fn quoteEnumLiteral(v: string): string {
+  let escaped = replace(v, "'", "''")
+  return "'${escaped}'"
+}
+
+// `name text not null check (name in (variant1,variant2,...))` — the
+// column definition for an enum field, identical on both dialects (this
+// file's header). `variants` stays in the caller's own declaration order;
+// nothing here sorts or deduplicates it.
+export fn enumColumnDef(name: string, variants: []string): string {
+  return "${name} text not null check (${name} in (${enumVariantList(variants)}))"
+}
