@@ -1,0 +1,377 @@
+// stdlib/http/keepalive.test.bit — persistent HTTP/1.1 connections (#5419).
+//
+// Same module as http.bit (SPEC §19): `Conn`, `dial`, `header`, `atoi`,
+// `indexOf`, `Server`, `serve`, `listenAndServeOn`, `ok`, `ok` and the rest
+// are already bound module-wide, so nothing from std/net, std/strings or this
+// module is imported here, except `sleep` (std/time), new to this module —
+// `Millisecond` is already imported by shutdown.bit (same module); a second
+// import of it here would be E0042.
+import { sleep } from "std/time"
+
+// A response-at-a-time reader over a persistent connection's socket: `pending`
+// carries whatever a `next()` call over-read (the start of the FOLLOWING
+// response, already delivered in the same `conn.read`) forward to the next
+// call, the client-side mirror of `netStream.pending` (http.bit, #5419) —
+// without it, a test that pipelines its requests (so every response is
+// already sitting in the socket buffer by the time it starts reading) loses
+// every response after the first to the same discarded-tail bug #5419 fixed
+// server-side.
+class respReader {
+  conn: Conn
+  pending: string
+
+  // Exactly one HTTP/1.1 response: the header block plus its declared
+  // `Content-Length` bytes. Bounded by `maxReads`: every iteration is either
+  // a header-terminator search or a body fill, and a real server answers
+  // within a handful of reads, so a peer that never completes a response
+  // fails the test instead of hanging the suite.
+  next(): string! {
+    let maxReads = 1000
+    let buf = this.pending
+    let n = 0
+    while (indexOf(buf, "\r\n\r\n") < 0) {
+      n = n + 1
+      if (n > maxReads) {
+        fail newError("respReader.next: no header terminator within ${maxReads} reads")
+      }
+      let chunk = this.conn.read(4096)
+      if (len(chunk) == 0) {
+        fail newError("respReader.next: connection closed before headers completed")
+      }
+      buf = buf + chunk
+    }
+    let sep = indexOf(buf, "\r\n\r\n")
+    let head = buf[0:sep]
+    let already = buf[sep + 4:len(buf)]
+    let cl = 0
+    let clText = header(head, "Content-Length")
+    if (len(clText) > 0) {
+      cl = atoi(clText)
+    }
+    while (len(already) < cl) {
+      n = n + 1
+      if (n > maxReads) {
+        fail newError("respReader.next: body never completed")
+      }
+      let chunk = this.conn.read(4096)
+      if (len(chunk) == 0) {
+        fail newError("respReader.next: connection closed mid-body")
+      }
+      already = already + chunk
+    }
+    this.pending = already[cl:len(already)]
+    return head + "\r\n\r\n" + already[0:cl]
+  }
+}
+
+fn newRespReader(conn: Conn): respReader {
+  return respReader{ conn: conn, pending: "" }
+}
+
+// `listenAndServeOn` returns only on an accept error, which is what closing
+// the listener at the end of a test produces; swallowing it is the intended
+// end of this green thread, not an ignored failure — the same pattern every
+// other wire test in this module uses.
+fn keepAliveServe(s: Server) {
+  listenAndServeOn(s, (req) => ok("hi")) catch _ {
+    return
+  }
+}
+
+fn startServer(): (Server, int)! {
+  let s = serve("127.0.0.1", 0)?
+  let port = s.port()?
+  spawn keepAliveServe(s)
+  return s, port
+}
+
+test "two sequential HTTP/1.1 requests answer on one TCP connection, no Connection: close" {
+  let (s, port) = startServer() catch e {
+    assert(false, "startServer: ${e.message()}")
+    return
+  }
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let reader = newRespReader(conn)
+
+  conn.write("GET /a HTTP/1.1\r\nHost: x\r\n\r\n") catch e {
+    s.close()
+    assert(false, "write 1: ${e.message()}")
+    return
+  }
+  let first = reader.next() catch e {
+    s.close()
+    assert(false, "response 1: ${e.message()}")
+    return
+  }
+  assert(indexOf(first, "connection: close") < 0, "response 1 carried Connection: close:\n${first}")
+
+  // The SAME socket, a second request — if the server had closed after the
+  // first response (the pre-#5419 behavior), this write would fail against a
+  // torn-down connection instead of the peer ever reading it.
+  conn.write("GET /b HTTP/1.1\r\nHost: x\r\n\r\n") catch e {
+    s.close()
+    assert(false, "write 2: ${e.message()}")
+    return
+  }
+  let second = reader.next() catch e {
+    s.close()
+    assert(false, "response 2: ${e.message()}")
+    return
+  }
+  assert(
+    indexOf(second, "connection: close") < 0,
+    "response 2 carried Connection: close:\n${second}",
+  )
+  assert(indexOf(second, "200") >= 0, "response 2 was not a 200:\n${second}")
+
+  conn.close()
+  s.close()
+}
+
+test "a client-sent Connection: close is honoured and the server closes after" {
+  let (s, port) = startServer() catch e {
+    assert(false, "startServer: ${e.message()}")
+    return
+  }
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let reader = newRespReader(conn)
+  conn.write("GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") catch e {
+    s.close()
+    assert(false, "write: ${e.message()}")
+    return
+  }
+  let res = reader.next() catch e {
+    s.close()
+    assert(false, "response: ${e.message()}")
+    return
+  }
+  assert(
+    indexOf(toLowerLocal(res), "connection: close") >= 0,
+    "want Connection: close, got:\n${res}",
+  )
+
+  // The server closed: a further read is an orderly end of stream, not a
+  // hang — bounded to a handful of reads rather than one, since `close()` on
+  // the server side can take a read or two to surface as an empty result.
+  let n = 0
+  let trailing = "x"
+  while (len(trailing) > 0 && n < 100) {
+    n = n + 1
+    trailing = conn.read(4096)
+  }
+  assert(len(trailing) == 0, "connection stayed open after Connection: close")
+  conn.close()
+  s.close()
+}
+
+// `toLower` (std/strings) is already a module-wide sibling via http.bit's
+// import, but this file never calls it directly except here — spelled as a
+// tiny wrapper only so the one call site above reads as a boolean check
+// rather than repeating `toLower(res)` at both possible failure messages.
+fn toLowerLocal(s: string): string { return toLower(s) }
+
+test "an HTTP/1.0 request gets close-delimited behavior by default" {
+  let (s, port) = startServer() catch e {
+    assert(false, "startServer: ${e.message()}")
+    return
+  }
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let reader = newRespReader(conn)
+  conn.write("GET /a HTTP/1.0\r\nHost: x\r\n\r\n") catch e {
+    s.close()
+    assert(false, "write: ${e.message()}")
+    return
+  }
+  let res = reader.next() catch e {
+    s.close()
+    assert(false, "response: ${e.message()}")
+    return
+  }
+  assert(
+    indexOf(toLowerLocal(res), "connection: close") >= 0,
+    "want Connection: close for HTTP/1.0, got:\n${res}",
+  )
+  conn.close()
+  s.close()
+}
+
+test "Server.setMaxRequestsPerConn caps a connection at N requests" {
+  let s = serve("127.0.0.1", 0) catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  s.setMaxRequestsPerConn(2)
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn keepAliveServe(s)
+
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let reader = newRespReader(conn)
+  conn.write("GET /a HTTP/1.1\r\nHost: x\r\n\r\n") catch e {
+    s.close()
+    assert(false, "write 1: ${e.message()}")
+    return
+  }
+  let first = reader.next() catch e {
+    s.close()
+    assert(false, "response 1: ${e.message()}")
+    return
+  }
+  assert(
+    indexOf(toLowerLocal(first), "connection: close") < 0,
+    "response 1 (of 2) closed early:\n${first}",
+  )
+
+  conn.write("GET /b HTTP/1.1\r\nHost: x\r\n\r\n") catch e {
+    s.close()
+    assert(false, "write 2: ${e.message()}")
+    return
+  }
+  let second = reader.next() catch e {
+    s.close()
+    assert(false, "response 2: ${e.message()}")
+    return
+  }
+  // The 2nd of a 2-request cap: the server must close after it, whatever the
+  // client asked for.
+  assert(
+    indexOf(toLowerLocal(second), "connection: close") >= 0,
+    "response 2 (the cap) kept the connection open:\n${second}",
+  )
+
+  let n = 0
+  let trailing = "x"
+  while (len(trailing) > 0 && n < 100) {
+    n = n + 1
+    trailing = conn.read(4096)
+  }
+  assert(len(trailing) == 0, "connection stayed open past setMaxRequestsPerConn(2)")
+  conn.close()
+  s.close()
+}
+
+test "Server.setIdleTimeoutMs closes a connection that sends no request in time" {
+  let s = serve("127.0.0.1", 0) catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  s.setIdleTimeoutMs(50)
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn keepAliveServe(s)
+
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  // Send nothing; wait past the 50ms idle deadline, then read.
+  sleep(300 * Millisecond)
+  let n = 0
+  let trailing = "x"
+  while (len(trailing) > 0 && n < 100) {
+    n = n + 1
+    trailing = conn.read(4096)
+  }
+  assert(len(trailing) == 0, "an idle connection past setIdleTimeoutMs(50) was not closed")
+  conn.close()
+  s.close()
+}
+
+test "a Content-Length body and a chunked body are both read to their declared end on a persistent connection, pipelined" {
+  let s = serve("127.0.0.1", 0) catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn wireServe(s, echoBody)
+
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let reader = newRespReader(conn)
+  // Three requests, ALL written before any response is read: a
+  // Content-Length body, a chunked body, and a bodyless GET — the exact
+  // shape a pipelining client sends, and the shape that used to lose bytes
+  // to the discarded tail of `readRequestContentLengthBody`/
+  // `decodeChunkedBody` (#5419).
+  let req1 = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+  let req2 = "POST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbit\r\n0\r\n\r\n"
+  let req3 = "GET /c HTTP/1.1\r\nHost: x\r\n\r\n"
+  conn.write(req1 + req2 + req3) catch e {
+    s.close()
+    assert(false, "write: ${e.message()}")
+    return
+  }
+
+  let r1 = reader.next() catch e {
+    s.close()
+    assert(false, "response 1: ${e.message()}")
+    return
+  }
+  assert(
+    indexOf(r1, "\r\n\r\nhello") >= 0,
+    "response 1 body was not the Content-Length body:\n${r1}",
+  )
+
+  let r2 = reader.next() catch e {
+    s.close()
+    assert(false, "response 2: ${e.message()}")
+    return
+  }
+  assert(
+    indexOf(r2, "\r\n\r\nbit") >= 0,
+    "response 2 body was not the decoded chunked body:\n${r2}",
+  )
+
+  let r3 = reader.next() catch e {
+    s.close()
+    assert(false, "response 3: ${e.message()}")
+    return
+  }
+  assert(indexOf(r3, "\r\n\r\n") >= 0, "response 3 (bodyless) had no head/body split:\n${r3}")
+
+  conn.close()
+  s.close()
+}
+
+// Echoes the request body back, so the wire test above can tell which
+// request's body a response answers without the handler needing to be told
+// which path is which.
+fn echoBody(req: Request): Response {
+  return ok(req.body)
+}
+
+// The three-request pipelining test needs raw `listenAndServeOn`, same as
+// `keepAliveServe`, but over a caller-supplied handler (`echoBody`) rather
+// than the fixed one `keepAliveServe` closes over.
+fn wireServe(s: Server, handler: (Request) => Response) {
+  listenAndServeOn(s, handler) catch _ {
+    return
+  }
+}
