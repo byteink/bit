@@ -6,11 +6,17 @@
 // text around that value; running it for the parameterless case too would be a
 // second code path whose only merit is saving a message on `select 1`.
 //
-// VALUES COME BACK IN THE PROTOCOL'S TEXT FORMAT, so every non-NULL column is
-// `Value.Text` whatever its column type, and `pgRows` carries the columns' type
-// OIDs beside them. Turning those bytes into `Value.Int`/`Value.Float`/... is
-// the codec ticket (#3989); this file delivers the bytes and the OID that says
-// what they are.
+// VALUES COME BACK IN THE PROTOCOL'S TEXT FORMAT, so every non-NULL column
+// arrives as server-rendered text. `decodeRow` (#5456) types it from the
+// column's OID — `Value.Int` for int2/int4/int8, `Value.Float` for
+// float4/float8, `Value.Int(0/1)` for bool (`stdlib/sql/row.bit` has no
+// separate boolean wire type), `Value.Blob` for bytea, reusing the same text
+// parsers `scalar.bit`'s `pgFloat4`/`pgFloat8`/`pgBytea` are built on rather
+// than a second copy of them. AN OID NOT ON THAT LIST — including
+// timestamp/date/time/uuid/numeric, which keep their own dedicated
+// text-expecting converters — FALLS BACK TO `Value.Text`, unconditionally:
+// `decodeRow` cannot fail on a column type it does not recognize, only on a
+// malformed wire response for one it does.
 //
 // `begin` STILL FAILS. Transactions are the rest of epic #3986: `std/sql` runs
 // them through a closure (stdlib/sql/tx.bit) and a half-working `begin` would
@@ -107,7 +113,13 @@ fn describeColumns(body: string): []pgColumn! {
 // that many bytes. A length of -1 is SQL NULL and carries no bytes at all —
 // the distinction `Value.Null` exists to keep, and the one an empty string
 // would erase.
-fn decodeRow(body: string): []Value! {
+//
+// `cols` is the `RowDescription` `Describe` already returned for this
+// statement — the extended protocol's own order (Parse/Bind/Describe/
+// Execute/Sync) puts it before any `DataRow`, so it is populated by the time
+// this runs. An index past `cols` (a response shorter than expected) types
+// that column as if its OID were unknown: `Value.Text`, never a failure.
+fn decodeRow(body: string, cols: []pgColumn): []Value! {
   let count = readBe16(body, 0)?
   let out = []Value(0)
   let off = 2
@@ -123,11 +135,60 @@ fn decodeRow(body: string): []Value! {
     if (off + size > len(body)) {
       fail newError("postgres: DataRow column ${i} runs past the message")
     }
-    out = append(out, Value.Text(body[off:off + size]))
+    let col = columnAt(cols, i)
+    out = append(out, valueForColumn(col.oid, col.name, body[off:off + size])?)
     off = off + size
     i = i + 1
   }
   return out
+}
+
+// `cols[i]`, or a name-less, OID-less column when `i` is out of range —
+// `valueForColumn` reads an unmapped OID as `Value.Text`, so this is where
+// "the RowDescription was short" and "the OID is genuinely unmapped" fall
+// back to the same, always-safe behaviour.
+fn columnAt(cols: []pgColumn, i: int): pgColumn {
+  if (i < len(cols)) {
+    return cols[i]
+  }
+  return pgColumn{ name: "", oid: -1 }
+}
+
+// `text`, the server's rendering of column `col` typed `oid`, as the `Value`
+// its SQL type denotes. See the header comment for the mapped OIDs and the
+// fallback guarantee. `pgParseFloatText`/`pgParseBytea` (scalar.bit) are
+// reused rather than redeclared (SPEC §17.1, per-module declarations) — the
+// same text parse `pgFloat4`/`pgFloat8`/`pgBytea` already prove.
+fn valueForColumn(oid: int, col: string, text: string): Value! {
+  if (oid == oidInt2 || oid == oidInt4 || oid == oidInt8) {
+    let n = parseInt(text) catch e {
+      fail newError("postgres: column ${col}: ${e.message()}")
+    }
+    return Value.Int(n)
+  }
+  if (oid == oidFloat4 || oid == oidFloat8) {
+    return Value.Float(pgParseFloatText(text, col, "float")?)
+  }
+  if (oid == oidBool) {
+    return Value.Int(pgParseBoolText(text, col)?)
+  }
+  if (oid == oidBytea) {
+    return Value.Blob(pgParseBytea(text, col)?)
+  }
+  return Value.Text(text)
+}
+
+// Postgres's text rendering of `bool`: exactly `t` or `f`. `stdlib/sql/row.bit`
+// has no `Value.Bool` variant (SQL itself has no universal one), so this
+// returns 0/1 the way `sqlReqBool`/`sqlOptBool` already read an `Int` column.
+fn pgParseBoolText(text: string, col: string): int! {
+  if (text == "t") {
+    return 1
+  }
+  if (text == "f") {
+    return 0
+  }
+  fail newError("postgres: column ${col}: bool value '${text}' is neither 't' nor 'f'")
 }
 
 // A two-byte big-endian integer. Only unsigned counts are read with it.
