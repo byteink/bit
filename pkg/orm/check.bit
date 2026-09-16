@@ -1,0 +1,279 @@
+// pkg/orm/check.bit — #5076: fail when the entities and the live schema
+// disagree. The guard that makes "the entity is the source of truth" true
+// rather than aspirational — the same pair #5067's own header names, read
+// the other way: `generate` turns a diff into a file to review; `check`
+// turns the identical diff into a pass/fail with nothing written.
+//
+//   check(db, [User{}, Order{}], ServerDialect.Postgres)?  // exit 0 if they agree
+//
+// NEVER WRITES A FILE OR APPLIES ANYTHING. This file issues exactly the
+// read-only queries `generate.bit`'s own diff already issues
+// (`liveColumnDetails` below is `liveColumns`' own query widened by one
+// column, `data_type`) plus the identical enum-CHECK comparison
+// `generateenum.bit` uses (`enumVariantsAttr`, `liveEnumCheckClause`,
+// `quotedLiteralsIn`, `enumVariantsChanged` — reused verbatim, never
+// reimplemented) — nothing here calls `db.exec` at all.
+//
+// REUSES #5067's OWN PRESENCE DIFF, NEVER REBUILDS IT. `tableNameOf`,
+// `withoutManyToMany`, `fieldsNotIn`, `colsNotInFields`, `columnNamesOf` and
+// `hasColumn` (`generate.bit`) are this file's one caller of each — the
+// added/removed finding is identical to what a migration file would emit,
+// just reported instead of rendered.
+//
+// A COLUMN PRESENT IN BOTH GETS ONE MORE COMPARISON `generate.bit`'s OWN
+// DIFF NEVER MAKES: ITS TYPE. `entityTypeFamily`/`liveTypeFamily` below
+// answer "integer/string/boolean/decimal", never a dialect's exact DDL
+// keyword — deliberately coarser than `postgres.bit`'s `pgType`/
+// `mysql.bit`'s `mysqlType`, which pick a byte-for-byte column definition
+// for something this file only ever READS back through
+// `information_schema.columns.data_type`, never renders. The four families
+// are exactly `generate.bit`'s own `addColumnCall`'s closed mapping
+// (`i64`/`string`/`bool`/`decimal`) — a field whose Bit type maps to none
+// of them is skipped here too, the same "no guessing" rule, rather than
+// reported as a mismatch this file cannot back up. An enum column (`text`
+// live, `string` declared) is not a special case: `text`/`character
+// varying`/`varchar` all normalise to the "string" family, so #5082's own
+// column shape never false-positives here — its own finding is
+// `enumCheckDiffLines` below, not this one.
+//
+// A MANYTOMANY JOIN TABLE IS OUT OF SCOPE, STATED RATHER THAN GUESSED
+// AROUND. `generate.bit`'s `manyToManyDescsFor` diffs whether a
+// `@manyToMany` join table exists at all; #5076's own acceptance names
+// column presence, absence and type, and the enum-CHECK case #5435 added —
+// never a join table. Extending this file to cover one is real, separate
+// work, not a silent gap.
+import { toLower } from "std/strings"
+
+// One live column's name and reported `information_schema.columns.
+// data_type` — `liveColumns`' own shape (`generate.bit`), widened by the
+// one field this file's own type comparison needs; `liveColumns` itself
+// stays untouched since `tableAlterOp` never needed a type.
+class liveColumnInfo {
+  name: string,
+  dataType: string,
+}
+
+// `table`'s live columns, name and type together, in ordinal order —
+// `generate.bit`'s own `liveColumns` query, widened by `data_type`; kept as
+// its own query rather than adding a second round trip on top of
+// `liveColumns` itself.
+fn liveColumnDetails(db: Data, table: string): []liveColumnInfo! {
+  let rows = db.query(
+    "select column_name, data_type from information_schema.columns where table_name = $1 order by ordinal_position",
+    [Value.Text(table)],
+  )?
+  defer rows.close()
+  let out = []liveColumnInfo(0)
+  while (rows.next()?) {
+    out = append(
+      out,
+      liveColumnInfo{ name: asText(rows.value(0))?, dataType: asText(rows.value(1))? },
+    )
+  }
+  return out
+}
+
+fn liveColumnNames(cols: []liveColumnInfo): []string {
+  let out = []string(0)
+  for c of cols {
+    out = append(out, c.name)
+  }
+  return out
+}
+
+// `name`'s own live `data_type`, and whether `cols` carries one at all —
+// the caller only reaches for this on a column already known present
+// (`hasColumn(liveColumnNames(cols), name)` already checked), so "not
+// found" only happens for a column this same diff is about to report added.
+fn liveDataTypeFor(cols: []liveColumnInfo, name: string): (string, bool) {
+  for c of cols {
+    if (c.name == name) {
+      return (c.dataType, true)
+    }
+  }
+  return ("", false)
+}
+
+// A field's Bit type -> the family its live column must belong to, and
+// whether this file has one at all for `f.typeName` — the closed set
+// `generate.bit`'s own `addColumnCall` maps, read the other direction; a
+// type outside it (a `Timestamp` field, say) is left uncompared rather than
+// guessed at, the identical "closed mapping, never guess" rule.
+fn entityTypeFamily(f: FieldDesc): (string, bool) {
+  if (f.typeName == "i64") {
+    return ("integer", true)
+  }
+  if (f.typeName == "string") {
+    return ("string", true)
+  }
+  if (f.typeName == "bool") {
+    return ("boolean", true)
+  }
+  if (f.typeName == "decimal") {
+    return ("decimal", true)
+  }
+  return ("", false)
+}
+
+// `information_schema.columns.data_type` (already lower-cased by both
+// engines) -> the same four families `entityTypeFamily` names, per dialect
+// — the two engines report a different spelling for the identical column
+// this package would itself generate (`postgres.bit`'s `pgType`/
+// `mysql.bit`'s `mysqlType`), so the mapping back is per dialect too. A
+// `data_type` this file does not recognise is returned verbatim, which
+// never equals one of the four family names above and so always reports as
+// a mismatch — correct for a live column of a type this package has no
+// mapping for at all, since `entityTypeFamily` already refused to compare
+// against it.
+fn liveTypeFamily(dataType: string, dialect: ServerDialect): string {
+  match (dialect) {
+    Postgres => return postgresTypeFamily(dataType)
+    Mysql(_) => return mysqlTypeFamily(dataType)
+  }
+}
+
+fn postgresTypeFamily(dataType: string): string {
+  if (dataType == "bigint" || dataType == "integer" || dataType == "smallint") {
+    return "integer"
+  }
+  if (dataType == "character varying" || dataType == "text" || dataType == "character") {
+    return "string"
+  }
+  if (dataType == "boolean") {
+    return "boolean"
+  }
+  if (dataType == "numeric") {
+    return "decimal"
+  }
+  return dataType
+}
+
+// `tinyint` is this package's own `mysqlType` spelling for `Bool`
+// (`mysql.bit`'s own header on `mysqlType`) — never a genuine small integer
+// column here, since `entityTypeFamily` only ever compares a live column
+// against a field this package itself would have generated.
+fn mysqlTypeFamily(dataType: string): string {
+  if (dataType == "bigint" || dataType == "int") {
+    return "integer"
+  }
+  if (dataType == "varchar" || dataType == "text") {
+    return "string"
+  }
+  if (dataType == "tinyint") {
+    return "boolean"
+  }
+  if (dataType == "decimal" || dataType == "numeric") {
+    return "decimal"
+  }
+  return dataType
+}
+
+// One line naming `table`, the column and the direction when `f`'s live
+// type disagrees with its declared one, or "" when it doesn't (or when
+// `f.typeName` carries no family this file compares at all — see this
+// file's header).
+fn typeMismatchLine(
+  table: string,
+  f: FieldDesc,
+  liveDataType: string,
+  dialect: ServerDialect,
+): string {
+  let (family, mapped) = entityTypeFamily(f)
+  if (!mapped) {
+    return ""
+  }
+  if (liveTypeFamily(toLower(liveDataType), dialect) == family) {
+    return ""
+  }
+  return "${table}.${columnName(f)}: type mismatch, entity declares '${f.typeName}', database has '${liveDataType}'"
+}
+
+// One line per enum column (`@enumVariants(...)`, #5435) whose live CHECK
+// disagrees with what the entity declares — `enumVariantsAttr`,
+// `liveEnumCheckClause`, `quotedLiteralsIn` and `enumVariantsChanged`
+// (`generateenum.bit`) are the identical functions #5435's own diff uses;
+// this file never renders the drop-and-recreate `enumCheckAlterSql` builds,
+// since a report needs no dialect at all — only `generateenum.bit`'s own
+// SQL rendering does.
+fn enumCheckDiffLines(db: Data, table: string, fields: []FieldDesc): []string! {
+  let out = []string(0)
+  for f of fields {
+    let (declared, isEnum) = enumVariantsAttr(f.attrs)
+    if (!isEnum) {
+      continue
+    }
+    let column = columnName(f)
+    let liveClause = liveEnumCheckClause(db, table, column)?
+    if (liveClause == "") {
+      continue
+    }
+    let liveVariants = quotedLiteralsIn(liveClause)
+    if (!enumVariantsChanged(liveVariants, declared)) {
+      continue
+    }
+    out = append(
+      out,
+      "${table}.${column}: enum variants differ, entity declares [${join(declared, ", ")}], database has [${join(
+        liveVariants,
+        ", ",
+      )}]",
+    )
+  }
+  return out
+}
+
+// One entity's own disagreement lines: added, removed, type-mismatched and
+// enum-drifted, in that order — see this file's header for why each reuses
+// `generate.bit`'s/`generateenum.bit`'s own functions instead of rebuilding
+// the comparison.
+fn tableCheckLines(db: Data, e: TableEntity, dialect: ServerDialect): []string! {
+  let table = tableNameOf(e)?
+  let fields = withoutManyToMany(e.tableDescriptor())
+  let liveCols = liveColumnDetails(db, table)?
+  let liveNames = liveColumnNames(liveCols)
+  let added = fieldsNotIn(fields, liveNames)
+  let removed = colsNotInFields(liveNames, fields)
+  let lines = []string(0)
+  for f of added {
+    lines = append(lines, "${table}.${columnName(f)}: in entity, not in database")
+  }
+  for c of removed {
+    lines = append(lines, "${table}.${c}: in database, not in entity")
+  }
+  let addedNames = columnNamesOf(added)
+  for f of fields {
+    let column = columnName(f)
+    if (hasColumn(addedNames, column)) {
+      continue
+    }
+    let (dataType, found) = liveDataTypeFor(liveCols, column)
+    if (!found) {
+      continue
+    }
+    let line = typeMismatchLine(table, f, dataType, dialect)
+    if (line != "") {
+      lines = append(lines, line)
+    }
+  }
+  lines = append(lines, ...enumCheckDiffLines(db, table, fields)?)
+  return lines
+}
+
+// Diffs `entities` against the live schema (#5067's own diff, widened by a
+// type and an enum-CHECK comparison — this file's header) and fails naming
+// every disagreement, one line per line, when there is at least one. Never
+// writes a file, never issues a statement beyond the read-only queries
+// above — `orm.generate` is what turns the identical diff into a reviewed
+// migration; this is the CI/boot-time gate that only ever reports it.
+export fn check(db: Data, entities: []TableEntity, dialect: ServerDialect): ()! {
+  let diffs = []string(0)
+  for e of entities {
+    diffs = append(diffs, ...tableCheckLines(db, e, dialect)?)
+  }
+  if (len(diffs) == 0) {
+    return
+  }
+  fail newError(
+    "pkg/orm: check: entities and the live schema disagree:\n" + join(diffs, "\n"),
+  )
+}

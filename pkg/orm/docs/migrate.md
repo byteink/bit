@@ -268,5 +268,7 @@ undone with a new migration, not by reverting the old one.
 ## Where to go next
 
 [Generate](generate.md) covers writing the migration file this page
-applies. [Schema](schema.md) and [Dialect](dialect.md) cover the
+applies. [Check the schema in CI](check.md) covers failing the build
+before a deploy ever reaches this page, when an entity and the live schema
+disagree. [Schema](schema.md) and [Dialect](dialect.md) cover the
 `alter()`/`SchemaOp` vocabulary and the DDL it renders to.
