@@ -611,11 +611,12 @@ produces (`jsx_elem`, `jsx_frag`, `jsx_attrs`, `jsx_attr`, `jsx_children`,
 flat-then-fits-or-wrap shape as every other list in this document (§1, §5,
 §10):
 
-- **Attributes.** Zero attributes stays flat. One tries to stay flat -
-  ` name` or ` name={expr}` joined onto the opening tag - and only falls
-  back on overflow or an embedded newline. Two or more *always* take the
-  stacked form: one attribute per line, one deeper indent, with the closer
-  (`>` or `/>`) alone on its own line at the outer indent.
+- **Attributes.** Zero attributes stays flat. Any other count tries to stay
+  flat first - each attribute joined onto the opening tag as ` name` or
+  ` name={expr}` - and only falls back on overflow, an embedded newline, or
+  a comment anywhere in the attribute list. The fallback is the stacked
+  form: one attribute per line, one deeper indent, with the closer (`>` or
+  `/>`) alone on its own line at the outer indent.
 - **Children.** A single child tries to stay flat, joined onto the same line
   as the tags: `<Name>child</Name>`. Two or more children, a child that does
   not fit, or a child holding a comment take the stacked form: one child per
@@ -640,7 +641,8 @@ place, so a real significant gap is never touched.
 ```text
 <Button
   onClick={handleClick}
-  disabled
+  disabled={isDisabled}
+  title="Save the current document to disk permanently"
 >
   <Icon name="close" />
   Close
