@@ -113,20 +113,30 @@ database is [`docs/migrate.md`](docs/migrate.md). Running your own test
 suite inside a transaction that always rolls back is
 [`docs/testing.md`](docs/testing.md).
 
-## `Dialect` vs `UpsertDialect`
+## `Dialect` vs `ServerDialect`
 
-Two different types answer "which database": [`Dialect`](docs/dialect.md)
-is an interface with one method, `render(op: SchemaOp): []Statement` - it
-turns a whole schema migration into the DDL one engine understands, and
-gains a new implementation per engine (`Postgres`, then `Mysql` - see
-[`docs/mysql.md`](docs/mysql.md)). `UpsertDialect` (`docs/write.md`) is a
-plain two-value enum `upsert` reads to pick `ON CONFLICT` vs `ON DUPLICATE
-KEY UPDATE` syntax for one statement - it renders nothing and has no
-implementations to add. They stay separate types (#5325) because folding
-the enum into the interface would make every `upsert` caller hand it a full
-`Dialect` implementation just to express a two-value syntax choice, which
-`upsert` never needed even once `Dialect` itself grew a second
-implementation.
+Two different types answer "which database", and they answer different
+questions. [`Dialect`](docs/dialect.md) is an interface with one method,
+`render(op: SchemaOp): []Statement` - it turns a schema migration into the
+DDL one engine understands, and gains a new implementation per engine
+(`Postgres`, then `Mysql` - see [`docs/mysql.md`](docs/mysql.md)).
+`ServerDialect` (`pkg/orm/data.bit`) is a value - `Postgres` or
+`Mysql(MysqlVersion)` - that every dialect-sensitive function takes to
+decide a syntax or a capability: `upsert`'s `ON CONFLICT` vs `ON DUPLICATE
+KEY UPDATE`, `attach`/`sync`'s idempotent insert, `forUpdate`'s
+`SKIP LOCKED` (which needs the real MySQL version, not just the engine),
+and the migration runner's advisory lock.
+
+They stay separate types (#5325, #5384) because folding the value into the
+interface would make every `upsert` caller hand it a full `Dialect`
+implementation to express a syntax choice, and because a `Dialect` renders
+DDL while a `ServerDialect` renders nothing at all.
+
+`ServerDialect` replaced two narrower types in #5384: `UpsertDialect`, a
+bare engine tag, and `LockDialect`, which carried a version. The richer
+shape won because a tag cannot answer a version question - and with it went
+`LockDialect.Neutral`, whose meaning was "trust me, this MySQL is 8.0 or
+later". A MySQL caller now supplies a real version.
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

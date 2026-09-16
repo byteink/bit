@@ -133,9 +133,11 @@ same two statements the earlier example did; nothing here changes when a
 second `Dialect` is added.
 
 `pkg/orm/write.bit`'s `upsert` also takes a "which database" parameter,
-`UpsertDialect` - a plain two-value tag for `ON CONFLICT` vs `ON DUPLICATE
-KEY UPDATE` syntax, not this interface. See [Write](write.md) and
-[`pkg/orm/README.md`](../README.md#dialect-vs-upsertdialect) for why the
+`ServerDialect` - a value (`Postgres` or `Mysql(MysqlVersion)`) that picks
+`ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` syntax, not this interface. It
+renders nothing; every dialect-sensitive function in the package takes it.
+See [Write](write.md) and
+[`pkg/orm/README.md`](../README.md#dialect-vs-serverdialect) for why the
 two stay separate types.
 
 ## Sharp edges
