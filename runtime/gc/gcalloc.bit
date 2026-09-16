@@ -11,15 +11,78 @@ import { pollRequest } from "../sched"
 // Allocation
 // ---------------------------------------------------------------------------
 
+// How many exchanges a bound may lose before it is widened to its extreme
+// instead. #5440: the give-up arm is NOT "leave the bound alone" — a bound
+// narrower than the live set makes `gcMarkRoot` reject a live root and the
+// collector free a reachable object, so the only safe surrender is the widest
+// possible value. `0` for the low bound and `gcAddrMax` for the high one cost
+// the O(1) reject its precision (every candidate then goes to the exact
+// `gcOwns` test) and cost correctness nothing. They are also self-stable: a
+// later `noteBody` reading an extreme bound takes its early return and never
+// exchanges it back to something narrower.
+const gcBoundTries = 64
+
+// Lower `*p` to `want`, or to 0 if the exchange keeps losing. Cold half of
+// `noteBody` below; see `worldRaiseHighWater` (`./gcworld.bit`) for the same
+// shape on a monotonic counter.
+@nosplit fn lowerBound(p: *i64, want: int) {
+  let i = 0
+  // Bounded: `gcBoundTries` exchanges, then the extreme. Each failed exchange
+  // means another allocator moved the bound, and it only ever moves DOWN.
+  while (i < gcBoundTries) {
+    let cur = atomicLoad(p)
+    if (cur <= want) {
+      return
+    }
+    if (atomicCmpxchg(p, cur, want)) {
+      return
+    }
+    i = i + 1
+  }
+  atomicStore(p, 0)
+}
+
+// Raise `*p` to `want`, or to `gcAddrMax` if the exchange keeps losing.
+@nosplit fn raiseBound(p: *i64, want: int) {
+  let i = 0
+  // Bounded, and monotonic upward, for the same reason as `lowerBound`.
+  while (i < gcBoundTries) {
+    let cur = atomicLoad(p)
+    if (cur >= want) {
+      return
+    }
+    if (atomicCmpxchg(p, cur, want)) {
+      return
+    }
+    i = i + 1
+  }
+  atomicStore(p, gcAddrMax)
+}
+
 // Widen the monotonic address window used by `gcMarkRoot`'s O(1) reject.
 // Never shrinks on sweep: shrinking only widens the reject
 // window slightly and costs nothing in correctness.
+//
+// #5440: COMPARE-AND-EXCHANGE, NOT A PLAIN READ-MODIFY-WRITE. This ran under
+// `linkObject`'s object-list lock, which serialised it; that lock is off the
+// small-object path now. Two allocators racing a plain load-compare-store LOSE
+// the wider of two widenings — A reads lo=100 and stores 50, B reads the same
+// 100 and stores 80, and the object at 50 is now outside the window the mark
+// phase trusts. That is a collected live object, not a slow one, which is why
+// the exchange loops above surrender to the extreme rather than to no-op.
+//
+// THE UNCONTENDED PATH IS STILL TWO LOADS AND TWO COMPARES. A bound moves only
+// while the heap's address range is growing — a handful of times per program,
+// not once per allocation — so the exchange is in a cold callee and the hot
+// path pays no atomic at all.
 @nosplit fn noteBody(g: *i64, addr: int) {
-  if (addr < *(g + gcLoAddr)) {
-    *(g + gcLoAddr) = addr
+  let lo = g + gcLoAddr
+  if (addr < *lo) {
+    lowerBound(lo, addr)
   }
-  if (addr + 1 > *(g + gcHiAddr)) {
-    *(g + gcHiAddr) = addr + 1
+  let hi = g + gcHiAddr
+  if (addr + 1 > *hi) {
+    raiseBound(hi, addr + 1)
   }
 }
 
@@ -37,45 +100,43 @@ import { pollRequest } from "../sched"
 // `idx` is recomputed from `size`/`alignment` with the SAME pure
 // `allocClassify` call `gcHeapAlloc`/`gcHeapFree` already made internally
 // (alignment is always 8 for a GC object), so this needs no read of the
-// allocator's own span state and no extra lock beyond the one already held
-// here. `idx < 0` is the large/direct-mapped path — not span-backed, so the
-// bitmap does not apply and both helpers below no-op.
+// allocator's own span state and no lock at all. `idx < 0` is the
+// large/direct-mapped path — not span-backed, so the bitmap does not apply and
+// both helpers below no-op.
 //
-// PLAIN READ-MODIFY-WRITE, NOT AN ATOMIC ONE (#4320). This comment used to
-// assert the opposite — that "two mutator threads can concurrently link or free
-// two different slots that land in the SAME 64-bit bitmap word" because
-// `linkObject`/`freeObject` "hold only the object-list lock". That was a claim,
-// not a proof, and it named the wrong lock as the one that fails to help: the
-// object-list lock is a SINGLE global lock and is exactly what serialises the
-// set side. There are two bit-writing call sites in the whole tree and they are
-// mutually exclusive of each other:
+// ATOMIC READ-MODIFY-WRITE, AND #4320's STANDING OBLIGATION IS WHY (#5440).
+// #4320 made this a plain `*w = *w | mask` on an argument that was explicit
+// about what it rested on: "`linkObject` -> `setSlotBit` runs between
+// `spinAcquire(lockPtr(g))` and `spinRelease(lockPtr(g))`, so two sets can
+// never overlap", with the obligation that "if that lock is ever removed, the
+// atomicity must come back here". #5440 removed that lock from the small-object
+// path, so the atomicity is back, exactly as promised. The premise it rested on
+// is now false and two mutators DO concurrently set two bits in one 64-bit
+// bitmap word: a span's slots are handed out to whichever threads ask, and
+// #5436's per-thread slot cache refills 64 at a time from a shared free list.
+// A lost `|` is a live object with no bit, which `./gcwalk.bit` never
+// enumerates and `sweep` never frees — a leak — and worse, `gcOwns` answers
+// false for it, so a reference to it is not traced.
 //
-//   `linkObject` -> `setSlotBit` (below) runs between `spinAcquire(lockPtr(g))`
-//   and `spinRelease(lockPtr(g))`, so two sets can never overlap.
+// THE OTHER BIT-WRITING CALL SITE STILL NEEDS NOTHING, and its argument never
+// rested on the lock. `gcVisitWord`'s batched clear (`./gcwalk.bit`) is reached
+// only through `sweep`/`gcDeinit`, which have exactly two callers: `sweep`,
+// reached only from `gcCollectFinish` inside `stwCollect` (`../stw/stw.bit`)
+// AFTER `worldRendezvous` returned true — every other mutator parked and
+// acknowledged this epoch, and `linkObject` is `@nosplit` with no poll in it,
+// so no thread can be inside it — and `gcDeinit` (`./gc.bit`), at shutdown. An
+// expired rendezvous ABANDONS rather than collecting (`../stw/stwpoll.bit`), so
+// there is no forced-collection arm. `../alloc/spancache.bit`'s
+// `heapSpanCacheTakeLocked` writes these same words with plain full-word stores
+// under the HEAP lock, and may: the span it is zeroing came off the span cache
+// with every slot free, so no slot of it is in any thread's hand yet.
 //
-//   `gcVisitWord`'s batched clear (`./gcwalk.bit`) is reached only through
-//   `sweep`/`gcDeinit`, which have exactly two callers:
-//   `sweep`, reached only from `gcCollectFinish` inside `stwCollect`
-//   (`../stw/stw.bit`) AFTER `worldRendezvous` returned true — every other
-//   mutator parked and acknowledged this epoch, and `linkObject` is `@nosplit`
-//   with no poll in it, so no thread can be inside it — and `gcDeinit`
-//   (`./gc.bit`), at shutdown. An expired rendezvous ABANDONS rather than
-//   collecting (`../stw/stwpoll.bit`), so there is no forced-collection arm.
-//
-// So the RMW has one writer at a time and cannot lose a bit. What the atomic
-// additionally bought was the `stlxr`'s release, and that edge was UNPAIRED:
-// the only off-stop-the-world reader, `gcOwns` below via `dynTypeOf`
+// WHAT THE ATOMIC DOES NOT BUY IS ORDERING, and #4320 was right about that.
+// The only off-stop-the-world reader, `gcOwns` below via `dynTypeOf`
 // (`../root/iface.bit`), reads through `allocSpanBitmapWord`
-// (`../alloc/bitmap.bit`), which is a plain load with no acquire. A release
-// with no matching acquire establishes no happens-before, so deleting it
-// removes an ordering guarantee no reader ever had. `../alloc/spancache.bit`'s
-// `heapSpanCacheTakeLocked` already writes these same words with a plain
-// full-word store for the same reason.
-//
-// STANDING OBLIGATION: this rests on `linkObject` holding the object-list lock.
-// If that lock is ever removed (#4162 ranks it at 12.53 cycles/object), the
-// atomicity must come back here, or the per-worker arena must own its own
-// bitmap words so that the writers stay disjoint by construction.
+// (`../alloc/bitmap.bit`), which is a plain load with no acquire — a release
+// here would pair with nothing. This is wanted for the single-word atomicity of
+// the `|` and for nothing else.
 @nosplit fn setSlotBit(addr: int, idx: int) {
   if (idx < 0) {
     return
@@ -88,13 +149,44 @@ import { pollRequest } from "../sched"
   // `n % 64` are `n >> 6` and `n & 63` — #4317, the #3898 lesson applied here.
   let w = wordAt(allocSpanOf(addr) + allocSpanHdrWords * 8 + (n >> 6) * 8)
   let mask = 1 << (n & 63)
-  *w = *w | mask
+  let _ = atomicOr(w, mask)
 }
 
-// Thread a freshly-allocated header onto the all-objects list and bump the
-// counters and address bounds under the list lock, so concurrent allocators on
-// different workers cannot corrupt the list. Prepends, so the list is
+// Publish a freshly-allocated header to the collector: write its own header
+// words, bump the two shared counters, widen the address window, set its
+// occupied-slot bit, and — for a large object only — thread it onto the large
+// list and the hash index under the list lock. Prepends, so that list is
 // newest-first — which is what fixes the SWEEP ORDER, and this port keeps it.
+//
+// #5440: THE SMALL PATH TAKES NO LOCK. It opened with `spinAcquire(lockPtr(g))`
+// and held it to the end, which made ONE address in the process-wide GC block a
+// serialization point for every allocation by every thread. Once #5436 batched
+// `heapLock` off this path that was the whole remaining convoy: `sample` of
+// `pkg/web/bench/apps/bit` at 8 workers, c=16, ranked `bit_rt_spin_acquire` the
+// top leaf at 29,560 samples, 27,567 of them under this function against 1,987
+// under `gcHeapAlloc`. The four things it protected are now protected
+// individually, and the lock is kept for exactly the one that needs it:
+//
+//   the two header stores — the object is reachable by no other thread yet, so
+//   they need nothing and never did;
+//   `gcNumObjectsIdx` and `gcStTotalAllocated` — `atomicAdd`. Both are only
+//   ever decremented or reset from stop-the-world code (`gcVisitSlot` in
+//   `./gcwalk.bit`, `gcInit`), and every reader is a plain aligned 64-bit load,
+//   which does not tear;
+//   `noteBody` — a compare-and-exchange per bound, see its own header;
+//   `setSlotBit` — `atomicOr`, which is #4320's standing obligation coming due;
+//   the `idx < 0` arm — KEEPS THE LOCK. The large list head and `idxInsert`'s
+//   open-addressed table are genuinely shared mutable structure with no atomic
+//   form, and large allocations are rare enough that serializing them costs
+//   nothing measurable. `idxInsert`/`idxRemove` (`./gcindex.bit`) are the only
+//   other holders of this lock and both are on that same large path, so its
+//   mutual exclusion is unbroken — it simply no longer covers the small path.
+//
+// NOTHING HERE IS ORDERED AGAINST A CONCURRENT COLLECTOR, and nothing needs to
+// be: this function is `@nosplit` with no poll in it, so a thread inside it
+// cannot acknowledge a stop-the-world epoch, and `worldRendezvous` therefore
+// cannot return true until every allocator has left. Mark and sweep see whole
+// `linkObject`s or none, exactly as they did under the lock.
 //
 // #3178: THE HASH INDEX ONLY TRACKS LARGE (NOT SPAN-BACKED) OBJECTS NOW.
 // `gcOwns` (`gcOwns` below) has answered every span-backed address from
@@ -120,13 +212,12 @@ import { pollRequest } from "../sched"
 // and E0202's five-param limit had to be widened for.
 @nosplit fn linkObject(g: *i64, h: int, infoAddr: int, total: int, idx: int) {
   let bodyAddr = bodyFromHeader(h)
-  spinAcquire(lockPtr(g))
   storeWord(h + gcHdrInfo, infoAddr)
   // `total` is positive, so this one store writes the size AND leaves the mark
   // clear (#4083). The separate mark store is gone, not moved.
   storeWord(h + gcHdrSize, total)
-  *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) + 1
-  *(g + gcStTotalAllocated) = *(g + gcStTotalAllocated) + 1
+  let _ = atomicAdd(g + gcNumObjectsIdx, 1)
+  let _ = atomicAdd(g + gcStTotalAllocated, 1)
   noteBody(g, bodyAddr)
   // #4059: A SMALL OBJECT IS RECORDED ONLY BY `setSlotBit` BELOW. The global
   // all-objects list is gone; `./gcwalk.bit` enumerates the small population
@@ -139,12 +230,13 @@ import { pollRequest } from "../sched"
   // insert below already uses, so the two records cannot disagree about which
   // population an object is in.
   if (idx < 0) {
+    spinAcquire(lockPtr(g))
     storeWord(h - gcLargePrologue, *(g + gcLargeAll))
     *(g + gcLargeAll) = h
     idxInsert(g, bodyAddr)
+    spinRelease(lockPtr(g))
   }
   setSlotBit(h, idx)
-  spinRelease(lockPtr(g))
 }
 
 // Zero `n` bytes at `addr`. `n` is always a multiple of 8 here (bodies are
