@@ -1,0 +1,722 @@
+// Bit standard library — sql module, the temporal/uuid/json/array typed
+// accessors (#5457, epic #5449). Split from row.bit (SPEC §17.1, one module
+// across files, shares row.bit's namespace) to keep row.bit under the
+// 800-line ceiling.
+//
+// TEXT, ALWAYS. `std/sql`'s scalar accessors (row.bit) read Int/Float/Blob
+// straight off `Value` since #5456 typed those from OID/wire width, but
+// date/time/timestamp/uuid/json/array columns are deliberately still
+// `Value.Text` on both drivers — they have dedicated converters expecting
+// text (`pkg/postgres/conn.bit`'s `valueForColumn`, `pkg/mysql/binary.bit`'s
+// `temporalText`) — so every accessor below matches `Text` and parses it,
+// the same shape `sqlReqDecimal` (row.bit) already established.
+//
+// THIS FILE CANNOT CALL `pkg/postgres`/`pkg/mysql` — a package depends on
+// stdlib, never the reverse (`pkg/README.md`'s Layout) — so the ISO-ish text
+// parse below is written once, here, rather than delegated to
+// `pgTimestamp`/`pgDate`/`pgTime`/`pgUuid`/`mysqlInstant`/`mysqlUuid`, which
+// those packages already have. That makes every one of them redundant for
+// the ordinary `Rows` path this file now covers directly; retiring them is a
+// follow-up (#5457's own instruction), not part of this change.
+//
+// ONE TIMESTAMP ACCESSOR FOR BOTH `timestamp` AND `timestamptz`: a `Value`
+// carries no record of which SQL type produced it, so `sqlReqTimestamp`
+// reads an optional trailing UTC offset — present for `timestamptz` text,
+// absent for plain `timestamp` — and returns a true instant either way,
+// treating an offset-less reading as already UTC (the same relabelling
+// `pkg/postgres/temporal.bit`'s `pgTimestamp` documents, not a fact the text
+// told us).
+//
+// FRACTIONAL SECONDS ARE 1..6 DIGITS, never assumed fixed-width: Postgres
+// strips trailing zeros, MySQL's wire-to-text pad is fixed at 6 when
+// present — both are read the same variable-width way here.
+//
+// ARRAYS ARE POSTGRES'S OWN TEXT LITERAL (`{1,2,3}`, `{}`, a quoted element
+// for one containing a comma/brace/quote/backslash, a bare `NULL` token for
+// a null element), ONE DIMENSION ONLY — a nested `{{1,2},{3,4}}` fails by
+// name rather than silently flattening. MySQL has no server-side array type
+// today, so this is presently exercised by one driver, not an omission on
+// the other's part.
+
+import { Date, Time, Timestamp, date, timeNs, utc, Second } from "std/time"
+import { UUID, parse as parseUuid } from "std/uuid"
+import { Json, jsonDecode, jsonParse } from "std/json"
+import { parseInt, newBuilder } from "std/strings"
+
+// ---- date / time / timestamp ----------------------------------------------
+
+// The `count` ASCII digits at `s[start:start + count]`, as an int. Fails on
+// a non-digit or a string too short to hold them.
+fn sqlDigits(s: string, start: int, count: int, col: string, kind: string): int! {
+  if (start + count > len(s)) {
+    fail SqlRowError{ cause: SqlRowCause.TypeMismatch, column: col, expected: kind, found: s }
+  }
+  let n = 0
+  let i = 0
+  while (i < count) {
+    let c = s[start + i]
+    if (c < '0' || c > '9') {
+      fail SqlRowError{ cause: SqlRowCause.TypeMismatch, column: col, expected: kind, found: s }
+    }
+    n = n * 10 + (int(c) - 48)
+    i = i + 1
+  }
+  return n
+}
+
+// `s`'s leading `YYYY-MM-DD`, as (year, month, day).
+fn sqlParseDate(s: string, col: string): (int, int, int)! {
+  if (len(s) < 10 || s[4] != '-' || s[7] != '-') {
+    fail SqlRowError{ cause: SqlRowCause.TypeMismatch, column: col, expected: "Date", found: s }
+  }
+  let year = sqlDigits(s, 0, 4, col, "Date")?
+  let month = sqlDigits(s, 5, 2, col, "Date")?
+  let day = sqlDigits(s, 8, 2, col, "Date")?
+  return (year, month, day)
+}
+
+// An optional `.` and 1..6 fractional-second digits at `s[pos:]`, as
+// (nanoseconds, the offset just past what was consumed) — `pos` itself when
+// there is no `.` there at all.
+fn sqlParseFraction(s: string, pos: int, col: string): (int, int)! {
+  if (pos >= len(s) || s[pos] != '.') {
+    return (0, pos)
+  }
+  let start = pos + 1
+  let end = start
+  while (end < len(s) && s[end] >= '0' && s[end] <= '9') {
+    end = end + 1
+  }
+  let digits = end - start
+  if (digits == 0 || digits > 6) {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "fractional seconds",
+      found: s,
+    }
+  }
+  let frac = sqlDigits(s, start, digits, col, "fractional seconds")?
+  let scale = 1
+  let pad = 6 - digits
+  let k = 0
+  while (k < pad) {
+    scale = scale * 10
+    k = k + 1
+  }
+  return (frac * scale * 1000, end)
+}
+
+// `s[start:]`'s leading `HH:MM:SS`, then an optional fractional second, as
+// (hour, minute, second, nanosecond, the offset just past what was
+// consumed) — that offset is where a timestamptz's zone suffix starts, if
+// there is one.
+fn sqlParseTime(s: string, start: int, col: string): (int, int, int, int, int)! {
+  if (start + 8 > len(s) || s[start + 2] != ':' || s[start + 5] != ':') {
+    fail SqlRowError{ cause: SqlRowCause.TypeMismatch, column: col, expected: "Time", found: s }
+  }
+  let hour = sqlDigits(s, start, 2, col, "Time")?
+  let minute = sqlDigits(s, start + 3, 2, col, "Time")?
+  let second = sqlDigits(s, start + 6, 2, col, "Time")?
+  let (nanos, pos) = sqlParseFraction(s, start + 8, col)?
+  return (hour, minute, second, nanos, pos)
+}
+
+// `s[pos:]` is present and starts a UTC offset (`+`/`-`).
+fn sqlHasOffset(s: string, pos: int): bool {
+  return pos < len(s) && (s[pos] == '+' || s[pos] == '-')
+}
+
+// `rest`, the digits after a `+`/`-`, as (hours, minutes, seconds) — `HH`,
+// `HH:MM` or `HH:MM:SS`, `rest`'s own length picking which.
+fn sqlParseOffsetClock(rest: string, s: string, col: string): (int, int, int)! {
+  let hh = sqlDigits(rest, 0, 2, col, "UTC offset")?
+  if (len(rest) == 2) {
+    return (hh, 0, 0)
+  }
+  if (rest[2] != ':') {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "UTC offset",
+      found: s,
+    }
+  }
+  let mm = sqlDigits(rest, 3, 2, col, "UTC offset")?
+  if (len(rest) == 5) {
+    return (hh, mm, 0)
+  }
+  if (rest[5] != ':') {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "UTC offset",
+      found: s,
+    }
+  }
+  let ss = sqlDigits(rest, 6, 2, col, "UTC offset")?
+  return (hh, mm, ss)
+}
+
+// A `+HH`, `+HH:MM` or `+HH:MM:SS` zone suffix at `s[pos:]`, as signed
+// seconds east of UTC. Caller has already checked `sqlHasOffset`.
+fn sqlParseOffset(s: string, pos: int, col: string): int! {
+  let sign = 1
+  if (s[pos] == '-') {
+    sign = 0 - 1
+  }
+  let rest = s[pos + 1:len(s)]
+  if (len(rest) != 2 && len(rest) != 5 && len(rest) != 8) {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "UTC offset",
+      found: s,
+    }
+  }
+  let (hh, mm, ss) = sqlParseOffsetClock(rest, s, col)?
+  return sign * (hh * 3600 + mm * 60 + ss)
+}
+
+// `s` (a `timestamp` or `timestamptz` column's text) as the instant it
+// names, applying a trailing UTC offset when there is one.
+fn sqlParseTimestampText(s: string, col: string): Timestamp! {
+  let (year, month, day) = sqlParseDate(s, col)?
+  if (len(s) < 11 || s[10] != ' ') {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "Timestamp",
+      found: s,
+    }
+  }
+  let (hour, minute, second, nanos, pos) = sqlParseTime(s, 11, col)?
+  let d = date(year, month, day) catch e {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "Timestamp",
+      found: e.message(),
+    }
+  }
+  let naive = d.atTime(hour, minute, second) catch e {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "Timestamp",
+      found: e.message(),
+    }
+  }
+  let asUtc = naive.addNanoseconds(nanos).inZone(utc()).toTimestamp() catch e {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "Timestamp",
+      found: e.message(),
+    }
+  }
+  if (!sqlHasOffset(s, pos)) {
+    return asUtc
+  }
+  let offsetSeconds = sqlParseOffset(s, pos, col)?
+  return asUtc.add(0 - offsetSeconds * Second)
+}
+
+export fn sqlReqTimestamp(rows: Rows, cols: []string, col: string): Timestamp! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => return sqlParseTimestampText(s, col)?
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Timestamp", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptTimestamp(rows: Rows, cols: []string, col: string): Option<Timestamp>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<Timestamp>.None
+    Text(s) => return Option<Timestamp>.Some(sqlParseTimestampText(s, col)?)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Timestamp", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlReqDate(rows: Rows, cols: []string, col: string): Date! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => {
+      let (year, month, day) = sqlParseDate(s, col)?
+      return date(year, month, day) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Date",
+          found: e.message(),
+        }
+      }
+    }
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Date", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptDate(rows: Rows, cols: []string, col: string): Option<Date>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<Date>.None
+    Text(s) => {
+      let (year, month, day) = sqlParseDate(s, col)?
+      let d = date(year, month, day) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Date",
+          found: e.message(),
+        }
+      }
+      return Option<Date>.Some(d)
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Date", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlReqTime(rows: Rows, cols: []string, col: string): Time! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => {
+      let (hour, minute, second, nanos, _) = sqlParseTime(s, 0, col)?
+      return timeNs(hour, minute, second, nanos) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Time",
+          found: e.message(),
+        }
+      }
+    }
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Time", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptTime(rows: Rows, cols: []string, col: string): Option<Time>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<Time>.None
+    Text(s) => {
+      let (hour, minute, second, nanos, _) = sqlParseTime(s, 0, col)?
+      let t = timeNs(hour, minute, second, nanos) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Time",
+          found: e.message(),
+        }
+      }
+      return Option<Time>.Some(t)
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Time", found: sqlValueKind(v),
+    }
+  }
+}
+
+// ---- uuid -------------------------------------------------------------
+
+export fn sqlReqUuid(rows: Rows, cols: []string, col: string): UUID! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => return parseUuid(s) catch e {
+      fail SqlRowError{
+        cause: SqlRowCause.TypeMismatch,
+        column: col,
+        expected: "Uuid",
+        found: e.message(),
+      }
+    }
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Uuid", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptUuid(rows: Rows, cols: []string, col: string): Option<UUID>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<UUID>.None
+    Text(s) => {
+      let u = parseUuid(s) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Uuid",
+          found: e.message(),
+        }
+      }
+      return Option<UUID>.Some(u)
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Uuid", found: sqlValueKind(v),
+    }
+  }
+}
+
+// ---- json ---------------------------------------------------------------
+//
+// A SQL NULL and a JSON `null` stay different, matching `pkg/orm/jsoncol.bit`
+// (`pkg/orm/docs/json.md`): the `Req` pair fails `NullField`/returns `None`
+// on a SQL NULL, exactly like every other `Opt` accessor in this module —
+// `jsonParse`/`jsonDecode<T>` only ever see a column that really is JSON
+// text, so a stored JSON `null` document still decodes to `Json.JsonNull`,
+// never conflated with an absent column.
+
+export fn sqlReqJson(rows: Rows, cols: []string, col: string): Json! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => return jsonParse(s) catch e {
+      fail SqlRowError{
+        cause: SqlRowCause.TypeMismatch,
+        column: col,
+        expected: "Json",
+        found: e.message(),
+      }
+    }
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Json", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptJson(rows: Rows, cols: []string, col: string): Option<Json>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<Json>.None
+    Text(s) => {
+      let j = jsonParse(s) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Json",
+          found: e.message(),
+        }
+      }
+      return Option<Json>.Some(j)
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Json", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlReqJsonAs<T>(rows: Rows, cols: []string, col: string): T! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => {
+      let tree = jsonParse(s) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Json",
+          found: e.message(),
+        }
+      }
+      return jsonDecode<T>(tree) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Json",
+          found: e.message(),
+        }
+      }
+    }
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Json", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptJsonAs<T>(rows: Rows, cols: []string, col: string): Option<T>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<T>.None
+    Text(s) => {
+      let tree = jsonParse(s) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Json",
+          found: e.message(),
+        }
+      }
+      let decoded = jsonDecode<T>(tree) catch e {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Json",
+          found: e.message(),
+        }
+      }
+      return Option<T>.Some(decoded)
+    }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Json", found: sqlValueKind(v),
+    }
+  }
+}
+
+// ---- array element decoders (sqlElem*) ------------------------------------
+//
+// THE CONTRACT `sqlReqArray<T>`/`sqlOptArray<T>` CONSUME: `(v: Value) => T!`
+// — one per scalar type, mirroring row.bit's six `sqlReq*` pairs. An array's
+// text form carries each element as its own substring, never a typed
+// sub-`Value` (Postgres has no per-element OID on the wire, only the
+// array's own), so every `sqlElem*` here matches `Value.Text` and parses
+// it, the same shape `sqlReqDecimal` (row.bit) already established for a
+// scalar column.
+
+export fn sqlElemInt(v: Value): i64! {
+  match (v) {
+    Text(s) => return parseInt(s) catch e {
+      fail newError("sql: array element '${s}' is not Int: ${e.message()}")
+    }
+    Null => fail newError("sql: array element is NULL")
+    _ => fail newError("sql: array element is not Int text")
+  }
+}
+
+export fn sqlElemFloat(v: Value): f64! {
+  match (v) {
+    Text(s) => return sqlElemFloatText(s)?
+    Null => fail newError("sql: array element is NULL")
+    _ => fail newError("sql: array element is not Float text")
+  }
+}
+
+fn sqlElemFloatText(s: string): f64! {
+  if (s == "Infinity") {
+    return 1.0 / 0.0
+  }
+  if (s == "-Infinity") {
+    return 0.0 - 1.0 / 0.0
+  }
+  if (s == "NaN") {
+    return 0.0 / 0.0
+  }
+  let f = parseFloat(s)
+  if (f != f) {
+    fail newError("sql: array element '${s}' is not Float")
+  }
+  return f
+}
+
+export fn sqlElemBool(v: Value): bool! {
+  match (v) {
+    Text(s) => {
+      if (s == "t") {
+        return true
+      }
+      if (s == "f") {
+        return false
+      }
+      fail newError("sql: array element '${s}' is not Bool")
+    }
+    Null => fail newError("sql: array element is NULL")
+    _ => fail newError("sql: array element is not Bool text")
+  }
+}
+
+export fn sqlElemText(v: Value): string! {
+  match (v) {
+    Text(s) => return s
+    Null => fail newError("sql: array element is NULL")
+    _ => fail newError("sql: array element is not Text")
+  }
+}
+
+export fn sqlElemBlob(v: Value): []byte! {
+  match (v) {
+    Text(s) => return sqlParseBytea(s)?
+    Null => fail newError("sql: array element is NULL")
+    _ => fail newError("sql: array element is not Blob text")
+  }
+}
+
+// `\x`-prefixed lowercase or uppercase hex, Postgres's default
+// `bytea_output`. The legacy `escape` format is refused by name, matching
+// `pkg/postgres/scalar.bit`'s `pgParseBytea`.
+fn sqlParseBytea(s: string): []byte! {
+  if (len(s) < 2 || s[0] != 0x5c || s[1] != 0x78) {
+    fail newError("sql: bytea array element '${s}' is not in \\x hex form")
+  }
+  let hex = s[2:len(s)]
+  if (len(hex) % 2 != 0) {
+    fail newError("sql: bytea array element has an odd digit count")
+  }
+  let out = []byte(len(hex) / 2)
+  let i = 0
+  while (i < len(hex)) {
+    let hi = sqlHexNibble(hex[i])?
+    let lo = sqlHexNibble(hex[i + 1])?
+    out[i / 2] = hi * 16 + lo
+    i = i + 2
+  }
+  return out
+}
+
+fn sqlHexNibble(c: u8): u8! {
+  if (c >= 48 && c <= 57) {
+    return c - 48
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 97 + 10
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 65 + 10
+  }
+  fail newError("sql: invalid bytea hex digit")
+}
+
+export fn sqlElemDecimal(v: Value): decimal! {
+  match (v) {
+    Text(s) => return parseDecimal(s) catch e {
+      fail newError("sql: array element '${s}' is not Decimal: ${e.message()}")
+    }
+    Null => fail newError("sql: array element is NULL")
+    _ => fail newError("sql: array element is not Decimal text")
+  }
+}
+
+// ---- the generic array accessor -------------------------------------------
+
+export fn sqlReqArray<T>(rows: Rows, cols: []string, col: string, elem: (Value) => T!): []T! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Text(s) => return sqlDecodeArray<T>(s, col, elem)?
+    Null => fail SqlRowError{ cause: SqlRowCause.NullField, column: col, expected: "", found: "" }
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Array", found: sqlValueKind(v),
+    }
+  }
+}
+
+export fn sqlOptArray<T>(
+  rows: Rows,
+  cols: []string,
+  col: string,
+  elem: (Value) => T!,
+): Option<[]T>! {
+  let v = sqlColumnValue(rows, cols, col)?
+  match (v) {
+    Null => return Option<[]T>.None
+    Text(s) => return Option<[]T>.Some(sqlDecodeArray<T>(s, col, elem)?)
+    _ => fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch, column: col, expected: "Array", found: sqlValueKind(v),
+    }
+  }
+}
+
+fn sqlDecodeArray<T>(s: string, col: string, elem: (Value) => T!): []T! {
+  let elems = sqlArraySplit(s, col)?
+  let out = []T(0)
+  let i = 0
+  while (i < len(elems)) {
+    let v = elem(elems[i]) catch e {
+      fail SqlRowError{
+        cause: SqlRowCause.TypeMismatch,
+        column: col,
+        expected: "array element",
+        found: e.message(),
+      }
+    }
+    out = append(out, v)
+    i = i + 1
+  }
+  return out
+}
+
+// Postgres's `{...}` array literal as its top-level elements, one dimension
+// only: `{}` is zero elements, a bare `NULL` token is `Value.Null`, a
+// quoted element unescapes `\"`/`\\`, and anything else is read verbatim up
+// to the next `,` or the closing `}`.
+fn sqlArraySplit(s: string, col: string): []Value! {
+  if (len(s) < 2 || s[0] != '{' || s[len(s) - 1] != '}') {
+    fail SqlRowError{
+      cause: SqlRowCause.TypeMismatch,
+      column: col,
+      expected: "Array ({...})",
+      found: s,
+    }
+  }
+  let inner = s[1:len(s) - 1]
+  if (len(inner) == 0) {
+    return []Value(0)
+  }
+  let out = []Value(0)
+  let i = 0
+  while (i < len(inner)) {
+    let (elem, next) = sqlArrayElement(inner, i, col)?
+    out = append(out, elem)
+    i = next
+    if (i < len(inner)) {
+      if (inner[i] != ',') {
+        fail SqlRowError{
+          cause: SqlRowCause.TypeMismatch,
+          column: col,
+          expected: "Array",
+          found: s,
+        }
+      }
+      i = i + 1
+    }
+  }
+  return out
+}
+
+// One array element starting at `s[start]`, as (the decoded `Value`, the
+// offset just past it).
+fn sqlArrayElement(s: string, start: int, col: string): (Value, int)! {
+  if (start < len(s) && s[start] == '"') {
+    return sqlArrayQuoted(s, start, col)?
+  }
+  let end = start
+  while (end < len(s) && s[end] != ',') {
+    end = end + 1
+  }
+  let text = s[start:end]
+  if (text == "NULL") {
+    return (Value.Null, end)
+  }
+  return (Value.Text(text), end)
+}
+
+// A `"..."` element, unescaping `\"` and `\\`, as (its text `Value`, the
+// offset just past the closing quote).
+fn sqlArrayQuoted(s: string, start: int, col: string): (Value, int)! {
+  let b = newBuilder()
+  let i = start + 1
+  while (i < len(s) && s[i] != '"') {
+    if (s[i] == 0x5c && i + 1 < len(s)) {
+      b.writeByte(s[i + 1])
+      i = i + 2
+    } else {
+      b.writeByte(s[i])
+      i = i + 1
+    }
+  }
+  if (i >= len(s)) {
+    fail SqlRowError{ cause: SqlRowCause.TypeMismatch, column: col, expected: "Array", found: s }
+  }
+  return (Value.Text(b.toString()), i + 1)
+}
