@@ -38,5 +38,7 @@ Read the [docs](docs/README.md) in order:
 4. [Authentication](docs/authentication.md) - the four plugins and which two warn
 5. [Queries](docs/queries.md) - placeholder rewriting, prepared statements, the
    single-packet limit
-6. [Errors](docs/errors.md) - matching a server error by code and SQLSTATE
-7. [Limitations](docs/limitations.md) - what this driver does not do yet
+6. [Types](docs/types.md) - DECIMAL, TIMESTAMP vs. the refused DATETIME, and
+   MariaDB's UUID/INET4/INET6
+7. [Errors](docs/errors.md) - matching a server error by code and SQLSTATE
+8. [Limitations](docs/limitations.md) - what this driver does not do yet
