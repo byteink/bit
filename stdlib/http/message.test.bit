@@ -6,6 +6,14 @@
 // into this module through `multipart.test.bit`, and importing it twice is
 // E0042.
 //
+// The last four tests are `header()`'s matching rule (#5437), which the body
+// budget above depends on: `readRequestBody` frames a body from whatever
+// `header()` says `Content-Length` and `Transfer-Encoding` are. They pin where
+// a field line may begin, what must follow the name, and which occurrence
+// wins, because `header()` scans the block in place with an ASCII case fold
+// and an in-place scanner can get those wrong in ways lowercasing a copy of
+// the whole block could not.
+//
 // The first three tests drive `readMessage` directly through a scripted
 // `byteStream`, with no socket: that is what makes "refused BEFORE the bytes
 // are read" mechanically checkable rather than a claim. The double counts its
@@ -193,4 +201,132 @@ test "Server.setMaxBodyBytes reaches the read path over a real connection" {
   // server was configured to refuse.
   assert(over.status == 400, "over the limit: status ${itoa(over.status)}")
   s.close()
+}
+
+// ---------------------------------------------------------------------------
+// header() field-name matching (#5437)
+// ---------------------------------------------------------------------------
+
+// One block covering all three positions a match may be found in or confused
+// by: a field at the very start, a field after a CRLF, and a VALUE that spells
+// a field name of its own.
+const matchBlock = "Content-Type: text/plain\r\nX-Note: content-length: 9\r\nContent-Length: 4\r\n"
+
+test "header() matches a field name in any case, at the block start and after a CRLF" {
+  // At byte 0.
+  assert(
+    header(matchBlock, "Content-Type") == "text/plain",
+    "as written: '${header(matchBlock, "Content-Type")}'",
+  )
+  assert(
+    header(matchBlock, "content-type") == "text/plain",
+    "lower: '${header(matchBlock, "content-type")}'",
+  )
+  assert(
+    header(matchBlock, "CONTENT-TYPE") == "text/plain",
+    "upper: '${header(matchBlock, "CONTENT-TYPE")}'",
+  )
+  assert(
+    header(matchBlock, "cOnTeNt-TyPe") == "text/plain",
+    "mixed: '${header(matchBlock, "cOnTeNt-TyPe")}'",
+  )
+  // After a CRLF. The field itself is written in one case and asked for in
+  // four, so neither side of the comparison can be the one being folded.
+  assert(
+    header(matchBlock, "Content-Length") == "4",
+    "as written: '${header(matchBlock, "Content-Length")}'",
+  )
+  assert(
+    header(matchBlock, "content-length") == "4",
+    "lower: '${header(matchBlock, "content-length")}'",
+  )
+  assert(
+    header(matchBlock, "CONTENT-LENGTH") == "4",
+    "upper: '${header(matchBlock, "CONTENT-LENGTH")}'",
+  )
+  // A field written in lower case, asked for in upper.
+  let lowerWritten = "x-trace: abc\r\n"
+  assert(
+    header(lowerWritten, "X-Trace") == "abc",
+    "upper ask: '${header(lowerWritten, "X-Trace")}'",
+  )
+}
+
+test "header() matches a whole field name at a line start, never a prefix or a value" {
+  // "content-length: 9" appears in the X-Note VALUE, before the real field.
+  // A search that does not insist on a line start reads 9.
+  assert(
+    header(matchBlock, "content-length") == "4",
+    "value match won: '${header(matchBlock, "content-length")}'",
+  )
+  // A prefix of a field name is not that field: the ':' must follow the name.
+  assert(header(matchBlock, "Content") == "", "prefix matched: '${header(matchBlock, "Content")}'")
+  assert(
+    header(matchBlock, "Content-") == "",
+    "prefix matched: '${header(matchBlock, "Content-")}'",
+  )
+  // Nor is a field name that merely starts with the one asked for.
+  let longer = "X-A: 1\r\nContent-Type-Options: nosniff\r\n"
+  assert(
+    header(longer, "Content-Type") == "",
+    "longer field matched: '${header(longer, "Content-Type")}'",
+  )
+  // RFC 9112 §5: no whitespace between the field name and the colon.
+  assert(header("X-Sp : 1\r\n", "X-Sp") == "", "space before colon matched")
+  // Absent, and absent from an empty block.
+  assert(header(matchBlock, "X-Missing") == "", "absent: '${header(matchBlock, "X-Missing")}'")
+  assert(header("", "Content-Type") == "", "empty block matched something")
+}
+
+test "header() returns the first occurrence of a repeated field" {
+  let repeated = "Set-Cookie: a=1\r\nSET-COOKIE: b=2\r\nset-cookie: c=3\r\n"
+  assert(
+    header(repeated, "Set-Cookie") == "a=1",
+    "first of three: '${header(repeated, "Set-Cookie")}'",
+  )
+  assert(
+    header(repeated, "set-cookie") == "a=1",
+    "first of three: '${header(repeated, "set-cookie")}'",
+  )
+  // A repeat whose first occurrence is the one at byte 0.
+  let firstAtStart = "X-Dup: one\r\nX-Dup: two\r\n"
+  assert(
+    header(firstAtStart, "x-dup") == "one",
+    "first at byte 0: '${header(firstAtStart, "x-dup")}'",
+  )
+}
+
+test "header() trims the value and reads a final line with no trailing CRLF" {
+  assert(
+    header("X-Pad:\tspaced  \r\n", "X-Pad") == "spaced",
+    "trim: '${header("X-Pad:\tspaced  \r\n", "X-Pad")}'",
+  )
+  assert(
+    header("X-Empty:\r\n", "X-Empty") == "",
+    "empty value: '${header("X-Empty:\r\n", "X-Empty")}'",
+  )
+  assert(
+    header("X-Empty:   \r\n", "X-Empty") == "",
+    "blank value: '${header("X-Empty:   \r\n", "X-Empty")}'",
+  )
+  // No trailing CRLF on the last line: the value runs to the end of the block.
+  assert(header("A: 1\r\nX-Last: tail", "X-Last") == "tail", "unterminated last line")
+  assert(header("X-Only: solo", "X-Only") == "solo", "unterminated only line")
+}
+
+test "Response.setHeader replaces a field written in another case" {
+  // `setHeader` finds the line to replace through `headerLineRange`, which
+  // shares `header()`'s scanner: a case-insensitive find is what keeps two
+  // spellings of one field from both reaching the wire.
+  let r = ok("body")
+  r.setHeader("X-Thing", "1") catch e {
+    assert(false, "setHeader: ${e.message()}")
+    return
+  }
+  r.setHeader("x-thing", "2") catch e {
+    assert(false, "setHeader again: ${e.message()}")
+    return
+  }
+  assert(r.headers == "x-thing: 2\r\n", "headers = '${r.headers}'")
+  assert(r.getHeader("X-THING") == "2", "getHeader = '${r.getHeader("X-THING")}'")
 }
