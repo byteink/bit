@@ -1,0 +1,156 @@
+// pkg/orm/generateenum.bit — an enum column's CHECK-constraint drift, split
+// out of `generate.bit` once this finding pushed that file over `bit
+// lint`'s own `max-file-lines=800` ceiling (`spec/LINT.md`, #5435). Pure
+// move: every function below used to live in `generate.bit` verbatim, and
+// stays part of the SAME module (`pkg/orm` is one flat namespace, this
+// file's own header on why no import is needed for `hasColumn`,
+// `columnName`, `enumCheckName`, `enumVariantsChanged`, `enumCheckAlter`,
+// `mysqlEnumCheckAlter`, `newBuilder` or `asText` — every one of them is
+// either declared elsewhere in this package or imported once, module-wide,
+// by a sibling file). `generate.bit`'s own header, "AN ENUM COLUMN'S CHECK
+// CONSTRAINT..." paragraph, is the design note; `tableAlterOp`
+// (`generate.bit`) is this file's one caller.
+
+// A field's own declared enum variant list, and whether it carries one —
+// `@enumVariants("Draft", "Active", "Archived")` (#5435), recorded on
+// `FieldDesc.attrs` the identical way `@column`/`@manyToMany` already are
+// (`generate.bit`'s own header). Never `@enum(...)`: `enum` is a reserved
+// word (SPEC's lexical grammar), so that spelling cannot parse as an
+// attribute name at all.
+fn enumVariantsAttr(attrs: []AttrDesc): ([]string, bool) {
+  for a of attrs {
+    if (a.name == "enumVariants") {
+      return (a.args, true)
+    }
+  }
+  return ([]string(0), false)
+}
+
+// Every raw ALTER statement `table`'s own enum-typed columns owe a drifted
+// CHECK constraint (#5435, `generate.bit`'s own header) — one per field
+// carrying `@enumVariants(...)` whose declared list no longer matches what
+// is live, in `fields`' own declaration order. `addedCols` excludes a
+// field this same diff is already adding: a brand-new column has no live
+// CHECK to compare against, and mapping an enum's own Bit type through
+// `addColumnCall` at all is `enumcol.bit`'s own documented gap (no
+// `ColumnType` for one, that file's header) — outside this function's job,
+// which is drift on a column #5082's own `enumColumnDef`/a prior migration
+// already created. A field with no live CHECK found at all (`liveClause ==
+// ""`) is left alone for the same reason: this function only ever DROPS
+// AND RECREATES a constraint that already exists, never creates one from
+// nothing.
+fn enumCheckDiffs(
+  db: Data, table: string, fields: []FieldDesc, addedCols: []string, dialect: ServerDialect,
+): []string! {
+  let out = []string(0)
+  for f of fields {
+    let (declared, isEnum) = enumVariantsAttr(f.attrs)
+    if (!isEnum) {
+      continue
+    }
+    let column = columnName(f)
+    if (hasColumn(addedCols, column)) {
+      continue
+    }
+    let liveClause = liveEnumCheckClause(db, table, column)?
+    if (liveClause == "") {
+      continue
+    }
+    if (!enumVariantsChanged(quotedLiteralsIn(liveClause), declared)) {
+      continue
+    }
+    out = append(out, enumCheckAlterSql(table, column, declared, dialect))
+  }
+  return out
+}
+
+// `table`'s live CHECK predicate for `column`'s own enum constraint, or ""
+// when none exists — read by `enumcol.bit`'s own deterministic
+// `enumCheckName`, not by joining through a per-engine metadata view: both
+// Postgres' and MySQL 8.0.16+/MariaDB 10.2+'s `information_schema.
+// check_constraints` carry the identical `(constraint_name, check_clause)`
+// shape (#5435's own ticket text names both), so looking a constraint up
+// by the one name this package itself always gives it needs no dialect
+// branch at all — the same "no dialect-specific query" rule
+// `generate.bit`'s own `hasLivePrimaryKey` already follows for the
+// identical reason.
+fn liveEnumCheckClause(db: Data, table: string, column: string): string! {
+  let rows = db.query(
+    "select check_clause from information_schema.check_constraints where constraint_name = $1",
+    [Value.Text(enumCheckName(table, column))],
+  )?
+  defer rows.close()
+  if (!rows.next()?) {
+    return ""
+  }
+  return asText(rows.value(0))?
+}
+
+// Every single-quoted SQL string literal inside `clause`, each un-escaped
+// (`''` collapses to one `'`, the standard SQL escape `enumcol.bit`'s own
+// `quoteEnumLiteral` writes). Not a SQL parser, deliberately: Postgres
+// rewrites `col in ('a','b')` into `col = any (array['a','b'])` by the
+// time `check_clause` reports it back (`pg_get_expr`'s own
+// canonicalization), and MySQL prefixes each literal with a charset
+// introducer (`_utf8mb4'a'`) — two renderings this function has no reason
+// to special-case, because the SET of quoted literals in either is exactly
+// the variant list `enumCheckAlter`/`mysqlEnumCheckAlter` wrote, the only
+// string literals either engine's own CHECK predicate ever contains for a
+// column this package generated.
+fn quotedLiteralsIn(clause: string): []string {
+  let out = []string(0)
+  let i = 0
+  let n = len(clause)
+  while (i < n) {
+    if (clause[i] == '\'') {
+      let (lit, next) = readQuotedLiteral(clause, i + 1, n)
+      out = append(out, lit)
+      i = next
+    } else {
+      i = i + 1
+    }
+  }
+  return out
+}
+
+// One single-quoted literal's CONTENT, starting right after its opening
+// `'` at `start` — returns the un-escaped text and the index right after
+// the closing `'`.
+fn readQuotedLiteral(clause: string, start: int, n: int): (string, int) {
+  let b = newBuilder()
+  let i = start
+  while (i < n) {
+    let c = clause[i]
+    if (c == '\'') {
+      if (i + 1 < n && clause[i + 1] == '\'') {
+        b.writeByte('\'')
+        i = i + 2
+      } else {
+        return (b.toString(), i + 1)
+      }
+    } else {
+      b.writeByte(c)
+      i = i + 1
+    }
+  }
+  return (b.toString(), i)
+}
+
+// The rendered drop-and-recreate for one drifted enum column, picking
+// Postgres' `enumCheckAlter` or MySQL's `mysqlEnumCheckAlter` (both
+// #5082) by the caller's own explicit `dialect` — never inferred from
+// `db`, the live connection (`generate.bit`'s own header on why:
+// `pkg/orm/data.bit`, #5384). `.sql` only: `.transactional` governs how a
+// runner (#5069, unstarted) sequences statements, not something a
+// `t.raw(...)` call in generated Bit SOURCE carries.
+fn enumCheckAlterSql(
+  table: string,
+  column: string,
+  variants: []string,
+  dialect: ServerDialect,
+): string {
+  match (dialect) {
+    Postgres => return enumCheckAlter(table, column, variants).sql
+    Mysql(_) => return mysqlEnumCheckAlter(table, column, variants).sql
+  }
+}
