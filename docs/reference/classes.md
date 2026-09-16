@@ -167,7 +167,9 @@ fn defaults(): int {
 }
 ```
 
-The default has to be a compile-time constant.
+A non-class field's default has to be a compile-time constant. A field
+whose own type is a class can also declare a default; it works differently,
+and is covered below in "Fields that are themselves a class".
 
 ### Composite literal field shorthand
 
@@ -215,6 +217,36 @@ class Outer { a: int, b: Inner }
 let bad = Outer{ a: 1 }              // error[E0083]: 'b' omitted
 let good = Outer{ a: 1, b: Inner{} } // fine
 ```
+
+A class-typed field can still be omitted if it declares its own default,
+written as a composite literal of its own type instead of a constant. Unlike
+a non-class default, a class-typed one is **rebuilt fresh at every
+construction site** that omits it, exactly as if the literal had been
+spelled there - two values that both omit `b` get their own `Inner`, never
+the same one:
+
+```bit
+class Inner {
+  n: int = 1,
+}
+
+class Configured {
+  export a: int,
+  export b: Inner = Inner{ n: 1 },
+}
+
+fn separateDefaults(): int {
+  let x = Configured{ a: 1 }
+  let y = Configured{ a: 2 }
+  x.b.n = 99
+  return y.b.n // 1, not 99: x and y never shared the default
+}
+```
+
+A shared default object was considered and rejected: it would make
+`Configured{ a: 1 }.b` an alias of every other omission's `b`, with nothing
+in `Configured{ a: 1 }` to suggest that. Mutating one caller's copy would
+silently reach every other caller's.
 
 ### Comparability
 

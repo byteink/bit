@@ -911,21 +911,34 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   its body runs - so `init` may leave a defaulted field alone. Defaults are
   therefore part of the type's zero value (§13.4), not a composite-literal
   convenience, and every construction of the type agrees on them.
-- The initializer is a **constant expression** (§15.4), folded at compile
-  time. It may name a module-level `const`, including an imported one, and is
-  evaluated in the module that declares the field - never in the module that
-  constructs the value. A non-constant initializer is `E0064`; one that folds
-  but does not fit `i64` is `E0084`; one that folds to the wrong type is
-  `E0041`. Because it is a constant there is no allocation, no safepoint and
-  no ordering between fields: each default is independent, and a defaulted
-  field costs the same at the construction site as a spelled one.
-- A **consequence of the constant rule**: a field whose own type is a class
-  or a payload-carrying enum cannot have a default today, because no value of
-  either type is a constant expression. Such a field therefore still has no
-  zero value and still raises `E0083` when omitted (§13.4) - the rule and its
-  message are unchanged by this feature. Should constant expressions ever
-  widen to cover such a value, a default on the field would supply exactly
-  what `E0083` says is missing, and the omission would become legal.
+- For a field whose own type is not a class, the initializer is a
+  **constant expression** (§15.4), folded at compile time. It may name a
+  module-level `const`, including an imported one, and is evaluated in the
+  module that declares the field - never in the module that constructs the
+  value. A non-constant initializer is `E0064`; one that folds but does not
+  fit `i64` is `E0084`; one that folds to the wrong type is `E0041`. Because
+  it is a constant there is no allocation, no safepoint and no ordering
+  between fields: each default is independent, and a defaulted field costs
+  the same at the construction site as a spelled one.
+- A field whose own type **is** a class may also carry a default, written as
+  a composite literal of that class type (§12.2) - not a constant
+  expression, and folded to no value. Each of its own field values must in
+  turn be a nested composite literal, or a compile-time constant of a
+  non-class field's type; a function call or any other run-time expression
+  there is the same `E0064` as elsewhere. Unlike the constant case above, a
+  class-typed default is **rebuilt fresh at every construction site** the
+  field is omitted from - exactly as if the literal had been spelled there.
+  Two values that both omit the field never share the same object: mutating
+  one never affects the other. This is per-construction fill, chosen over
+  handing every caller a single shared object, which would make a class
+  default a hidden aliasing hazard with nothing at either construction site
+  to suggest it. It costs the same as writing the literal at the site: one
+  allocation, no different from a spelled class-typed field - the "no
+  allocation" guarantee above is scoped to non-class defaults specifically,
+  since a spelled class-typed field already allocates today. A
+  payload-carrying enum field still cannot have a default: no value of that
+  type is a constant expression or a composite literal, so it still has no
+  zero value and still raises `E0083` when omitted (§13.4).
 - Defaults are class-only. `trait_field` (§10.7) carries none.
 - A field may carry **attributes**, written above it, one per line, before any
   `export` or `readonly`. **An attribute is sugar for a call to an ordinary
@@ -3286,12 +3299,15 @@ default-constructed.** Both forms that would ask for one are **E0083**:
 ```
 class Inner { xs: []u32 }
 class Outer { a: int, b: Inner }
+class Config { a: int, b: Inner = Inner{ xs: []u32(0) } }
 
 let o = Outer{ a: 1 }          // E0083 - omits the class-typed `b`
 let p: Outer                   // E0083 - no initializer at all
 let s = []Outer(2)             // E0083 - `[]T(n)` means n zero values (§12.9)
 let q = Outer{ a: 1, b: Inner{} }   // ok; `Inner` has no class-typed field
 let e = []Outer(0)             // ok; asks for no zero values at all
+let c = Config{ a: 1 }         // ok; `b`'s declared default (§10.5) supplies
+                                // a fresh `Inner`, rebuilt at this site
 ```
 
 `[]T(n)` is reported only when `n` is a constant above zero. A run-time `n` is
