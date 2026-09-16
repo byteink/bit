@@ -80,14 +80,18 @@
 //
 // MYSQL RENDERS THIS MIGRATION TOO, BECAUSE `generate` ASSERTS WHICH CASE
 // APPLIES (#5400). `generate` writes dialect-agnostic schema-builder source
-// (this file's own header, "WHY A NAME READ FROM information_schema..."
-// paragraph) - it never picks a `Dialect` and never renders DDL. But
-// `mysql.bit`'s own `mysqlAlterOpStatement` cannot safely express "set the
-// primary key" from one op alone (MySQL's `DROP PRIMARY KEY` has no `IF
-// EXISTS` - mysql.bit's own header). `hasLivePrimaryKey` below reads the
-// live `information_schema.table_constraints` - the one live-schema
-// question `SchemaOp` itself deliberately never carries (schema.bit's own
-// header) - and `primaryKeyCallLine` below emits `t.primaryKey(...)`
+// for every add/drop/rename/primary-key finding (this file's own header,
+// "WHY A NAME READ FROM information_schema..." paragraph) - those never
+// pick a `Dialect` or render DDL. The one exception is the enum-CHECK
+// finding (#5435, "AN ENUM COLUMN'S CHECK CONSTRAINT..." above), which
+// does, because a `t.raw(...)` payload has to be literal SQL text by the
+// time it is written. But `mysql.bit`'s own `mysqlAlterOpStatement` cannot
+// safely express "set the primary key" from one op alone (MySQL's `DROP
+// PRIMARY KEY` has no `IF EXISTS` - mysql.bit's own header).
+// `hasLivePrimaryKey` below reads the live
+// `information_schema.table_constraints` - the one live-schema question
+// `SchemaOp` itself deliberately never carries (schema.bit's own header) -
+// and `primaryKeyCallLine` below emits `t.primaryKey(...)`
 // (`AlterOp.SetPrimaryKey`, asserting no key exists yet) or
 // `t.replacePrimaryKey(...)` (`AlterOp.ReplacePrimaryKey`, asserting one
 // already does) accordingly. Postgres renders both ops identically
@@ -117,6 +121,25 @@
 // escapes every literal `$`, and a `//` comment naming a hostile column
 // gets its own narrower guard (`commentSafe`) against a newline splitting
 // one comment into a comment line plus a line of live Bit source.
+//
+// AN ENUM COLUMN'S CHECK CONSTRAINT IS A SIXTH FINDING, INDEPENDENT OF
+// ADD/DROP (#5435, logic in the sibling `generateenum.bit`).
+// `@enumVariants("Draft", "Active", "Archived")` on a field records that
+// field's declared variant list on `FieldDesc.attrs`, the same "caller
+// supplies the list" shape `enumcol.bit`'s header uses, exactly the way
+// `@column` already does. A column present in both entity and live schema
+// is invisible to `fieldsNotIn`/`colsNotInFields`, so `generateenum.bit`'s
+// `enumCheckDiffs` reads the live CHECK back through `enumcol.bit`'s own
+// deterministic `enumCheckName` and compares it with `enumVariantsChanged`'s
+// SET semantics, so a reorder stays a no-op. THIS IS THE ONE PLACE
+// `generate` PICKS A DIALECT: the drop-and-recreate needs `postgres.bit`'s
+// `enumCheckAlter` or `mysql.bit`'s `mysqlEnumCheckAlter`, which diverge on
+// one keyword, never read off the live connection (`pkg/orm/data.bit`'s
+// own header, #5384) — so `generate`/`generateInto` take
+// `dialect: ServerDialect` explicitly, matching `write.bit`'s `upsert` and
+// `lock.bit`'s `forUpdate`. The rendered SQL reaches the migration file
+// only as a `t.raw(...)` call — a STRING this file writes, never run
+// (rule 2 above still holds).
 import { asText } from "std/sql"
 import { isDir, mkdir, readDir, writeFile } from "std/fs"
 import { join as pathJoin } from "std/path"
@@ -141,30 +164,53 @@ const migrationsDir: string = "migrations"
 
 // Diffs `entities` against the live schema and writes a numbered file
 // under "migrations", or returns without writing one if nothing differs.
-// See this file's header for the five rules this enforces.
-export fn generate(db: Data, entities: []TableEntity, name: string): string! {
-  return generateInto(db, entities, name, migrationsDir)?
+// See this file's header for the six findings this enforces — `dialect`
+// is read by exactly one of them, an enum column's CHECK constraint
+// (#5435, this file's header).
+export fn generate(
+  db: Data, entities: []TableEntity, name: string, dialect: ServerDialect,
+): string! {
+  return generateInto(db, entities, name, migrationsDir, dialect)?
+}
+
+// One entity's own `alter()` block, or "" when its table's diff is empty —
+// split out of `generateInto`'s loop once `enumChecks` (#5435) pushed its
+// branch count over `bit lint`'s `max-complexity=10` ceiling
+// (`spec/LINT.md`); the same findings `generateInto` always diffed.
+fn tableAlterOp(db: Data, e: TableEntity, dialect: ServerDialect): string! {
+  let table = tableNameOf(e)?
+  let fields = withoutManyToMany(e.tableDescriptor())
+  let liveCols = liveColumns(db, table)?
+  let added = fieldsNotIn(fields, liveCols)
+  let removed = colsNotInFields(liveCols, fields)
+  let enumChecks = enumCheckDiffs(db, table, fields, columnNamesOf(added), dialect)?
+  if (len(added) == 0 && len(removed) == 0 && len(enumChecks) == 0) {
+    return ""
+  }
+  let composite = hasCompositeKey(fields)
+  let primaryKeyCall = ""
+  if (composite && hasIdField(added)) {
+    let replacing = hasLivePrimaryKey(db, table)?
+    primaryKeyCall = primaryKeyCallLine(fields, replacing)
+  }
+  return renderAlterBlock(
+    alterBlockSpec{
+      table: table, added: added, removed: removed, composite: composite,
+      primaryKeyCall: primaryKeyCall, enumChecks: enumChecks,
+    },
+  )?
 }
 
 // `generate`, writing under `dir` instead of the hardcoded "migrations".
-export fn generateInto(db: Data, entities: []TableEntity, name: string, dir: string): string! {
+export fn generateInto(
+  db: Data, entities: []TableEntity, name: string, dir: string, dialect: ServerDialect,
+): string! {
   let ops = []string(0)
   for e of entities {
-    let table = tableNameOf(e)?
-    let fields = withoutManyToMany(e.tableDescriptor())
-    let liveCols = liveColumns(db, table)?
-    let added = fieldsNotIn(fields, liveCols)
-    let removed = colsNotInFields(liveCols, fields)
-    if (len(added) == 0 && len(removed) == 0) {
-      continue
+    let op = tableAlterOp(db, e, dialect)?
+    if (op != "") {
+      ops = append(ops, op)
     }
-    let composite = hasCompositeKey(fields)
-    let primaryKeyCall = ""
-    if (composite && hasIdField(added)) {
-      let replacing = hasLivePrimaryKey(db, table)?
-      primaryKeyCall = primaryKeyCallLine(fields, replacing)
-    }
-    ops = append(ops, renderAlterBlock(table, added, removed, composite, primaryKeyCall)?)
   }
   let downOps = []string(0)
   for desc of manyToManyDescsFor(entities)? {
@@ -383,36 +429,49 @@ fn addColumnCall(f: FieldDesc, composite: bool): string! {
   )
 }
 
-// One table's `alter()` block as Bit source. `added`/`removed` are never
-// both empty — the caller only reaches this when there is a diff.
-// `added`'s own column names are recomputed once here (`columnNamesOf`,
-// cheap and pure) for `destructiveComment`, instead of a sixth parameter -
-// `bit lint`'s own parameter-count ceiling (`spec/LINT.md`) applies to this
-// function too. `composite` picks `addColumnCall`'s `t.addId(...)`/
-// `t.addInt(...)` split; `primaryKeyCall`, "" unless this diff adds an
-// `@id` column of a composite-key entity (this file's header), is the whole
-// `t.primaryKey(...)`/`t.replacePrimaryKey(...)` call text
-// (`primaryKeyCallLine` below), written after every add and before any drop.
-fn renderAlterBlock(
+// One table's `alter()` block, bundled into a single parameter — `bit
+// lint`'s `max-params=5` ceiling (`spec/LINT.md`) already sat at exactly
+// five before `enumChecks` (#5435) needed a sixth. `enumChecks` is every
+// raw ALTER an enum column's drifted CHECK constraint owes this table
+// (`generateenum.bit`'s `enumCheckDiffs`), in field-declaration order.
+class alterBlockSpec {
   table: string,
   added: []FieldDesc,
   removed: []string,
   composite: bool,
   primaryKeyCall: string,
-): string! {
-  let addedCols = columnNamesOf(added)
+  enumChecks: []string,
+}
+
+// One table's `alter()` block as Bit source. `spec.added`/`spec.removed`/
+// `spec.enumChecks` are never all empty — the caller only reaches this when
+// there is a diff. `spec.composite` picks `addColumnCall`'s
+// `t.addId(...)`/`t.addInt(...)` split; `spec.primaryKeyCall`, "" unless
+// this diff adds an `@id` column of a composite-key entity (this file's
+// header), is the whole `t.primaryKey(...)`/`t.replacePrimaryKey(...)`
+// call text (`primaryKeyCallLine` below), written after every add and
+// before any drop. `spec.enumChecks` renders last, as one `t.raw(...)` per
+// drifted enum column — `AlterTable` has no structured op for "change a
+// CHECK" (`schema.bit`'s own `AlterOp` vocabulary), so the escape hatch
+// `Table.raw`'s own header already names is what carries the dialect-
+// rendered statement `enumCheckAlterSql` built.
+fn renderAlterBlock(spec: alterBlockSpec): string! {
+  let addedCols = columnNamesOf(spec.added)
   let b = newBuilder()
-  b.write("alter(${bitStringLiteral(table)}, (t) => {\n")
-  for f of added {
-    let call = addColumnCall(f, composite)?
+  b.write("alter(${bitStringLiteral(spec.table)}, (t) => {\n")
+  for f of spec.added {
+    let call = addColumnCall(f, spec.composite)?
     b.write("  ${call}\n")
   }
-  if (primaryKeyCall != "") {
-    b.write("  ${primaryKeyCall}\n")
+  if (spec.primaryKeyCall != "") {
+    b.write("  ${spec.primaryKeyCall}\n")
   }
-  for col of removed {
+  for col of spec.removed {
     b.write("  ${destructiveComment(col, addedCols)}\n")
     b.write("  t.dropColumn(${bitStringLiteral(col)})\n")
+  }
+  for sql of spec.enumChecks {
+    b.write("  t.raw(${bitStringLiteral(sql)})\n")
   }
   b.write("})")
   return b.toString()

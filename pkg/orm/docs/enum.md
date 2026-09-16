@@ -200,6 +200,14 @@ declaration for readability changes nothing about what a migration should
 emit, because the variant's **name** is what a row carries, never its
 declaration position.
 
+**You don't have to call `enumCheckAlter` yourself.** Declare the field's
+variant list on the entity with `@enumVariants("Draft", "Active",
+"Archived", "Retired")` instead of a free-floating list, and
+[Generate](generate.md) reads the live CHECK back and renders this exact
+drop-and-recreate for you the next time you run it - the same SET
+comparison shown above, wired into the live diff rather than something
+you call by hand.
+
 ## Sharp edges
 
 **Renaming what `name()` returns for a variant is not free.** Reordering
@@ -226,3 +234,5 @@ can carry. [Dialect](dialect.md) and [MySQL](mysql.md) cover the
 [Errors](errors.md) covers `classify` and every typed constraint-violation
 cause, `CheckViolation` among them. [Write](write.md) covers `save`, where
 a `map<string, Value>` built with `enumColumnValue` usually ends up.
+[Generate](generate.md) covers `@enumVariants` and the live CHECK diff in
+full.
