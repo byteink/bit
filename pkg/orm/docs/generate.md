@@ -208,9 +208,12 @@ Running the file it wrote against a real database is
 ## Where to go next
 
 [Migrate](migrate.md) covers applying the file this page writes.
-[Schema](schema.md) covers `alter`'s own vocabulary - `addString`,
-`dropColumn`, and the rest of `AlterTable` - in full. [Naming](naming.md)
-covers how a table or column name is normally derived when you don't
-override it. [Enum columns](enum.md) covers `@enumVariants`'s own column
-shape - the CHECK constraint text, the round trip, and why reordering is
-always free - in full.
+[Check the schema in CI](check.md) covers running the identical diff as a
+pass/fail gate instead, so a deploy that skipped `generate` entirely fails
+the build rather than shipping a mismatch. [Schema](schema.md) covers
+`alter`'s own vocabulary - `addString`, `dropColumn`, and the rest of
+`AlterTable` - in full. [Naming](naming.md) covers how a table or column
+name is normally derived when you don't override it. [Enum
+columns](enum.md) covers `@enumVariants`'s own column shape - the CHECK
+constraint text, the round trip, and why reordering is always free - in
+full.
