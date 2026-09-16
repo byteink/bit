@@ -12,8 +12,9 @@
 // WHY OBJECT COUNT IS TWO-SIDED, etc.) and its SUBPROCESS MECHANICS
 // paragraph for what these functions do: build the benchmark once, then run
 // it `reps` times through a generated `/bin/sh` wrapper that reports exit
-// code, user CPU centiseconds, peak RSS bytes and allocated object count as
-// one space-separated result line.
+// code, user CPU centiseconds, peak RSS bytes, allocated object count and a
+// same-run descheduled-time reading (see DESCHEDULE DETECTION below) as one
+// space-separated result line.
 
 // --- shell plumbing ----------------------------------------------------
 
@@ -67,102 +68,38 @@ fn runMsg(code: int): string {
   return "exited ${code}"
 }
 
-// --- load probe (#5095) -------------------------------------------------
+// --- descheduled-time detection (#5196) ---------------------------------
 
-// #5095: CPU is the one metric benchgate reads that host contention can
-// inflate (see benchgate.bit's WHY USER CPU IS NOT IMMUNE TO CONTENTION
-// header note, #3017) — RSS and object count are unaffected and stay hard
-// failures no matter what this probe reads. Same uptime/getconf/awk idiom
-// and the same idle-relative scale _tests_/bit/stress/verify.bit's
-// loadProbe() already uses (scale 1 at or under the core count is "quiet"),
-// so a contention verdict here means the same thing it means in the stress
-// gate. Sampled fresh immediately before EVERY rep's own bounded subprocess
-// (runCase's reps loop) rather than once at gate launch: #5124 found a
-// launch-time-only sample is idle-relative by construction no matter how
-// loaded the box gets once its own subprocesses start, and this gate's own
-// cases run for tens of seconds after launch.
-const loadScaleCap: int = 8
-const loadProbeTimeoutMs: int = 5000
-
-class LoadProbe { scale: int, text: string }
-
-// #5095's acceptance requires exercising the INCONCLUSIVE path without
-// physically loading the box — a real load is not reproducible, and it would
-// also corrupt the very CPU reading the test is trying to check. Set to an
-// integer >= 2 to make every probe in this run report that scale
-// unconditionally; unset, empty, or < 2 uses the real probe below.
-fn forcedLoadScale(): int {
-  let v = trimSpace(envOr("BIT_BENCHGATE_FORCE_LOAD_SCALE", ""))
-  if (v == "") {
-    return -1
-  }
-  let n = parseInt(v) catch _ {
-    return -1
-  }
-  if (n < 2) {
-    return -1
-  }
-  return n
-}
-
-// One load sample, taken via the same trampoline every other subprocess in
-// this gate uses (benchgate.bit imports `runScript` from `../trampoline`) so
-// a probe run once per rep does not reintroduce the fresh-inode exec tax
-// that module exists to avoid. Never fatal to obtain: any failure of the
-// probe (missing uptime/getconf, malformed output, the probe itself timing
-// out) falls back to scale 1, exactly "quiet" — a broken probe can only ever
-// fail closed to the pre-#5095 behaviour (always FAIL), never open into
-// swallowing a real regression as INCONCLUSIVE.
-fn loadProbe(scratch: string): LoadProbe {
-  let forced = forcedLoadScale()
-  if (forced >= 2) {
-    return LoadProbe{ scale: forced, text: "forced ${forced}x for test" }
-  }
-  let fallback = LoadProbe{ scale: 1, text: "unknown" }
-  let outPath = scratch + "/loadprobe.out"
-  let scriptPath = scratch + "/loadprobe.sh"
-  let body = "#!/bin/sh\n" +
-    "cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null)\n" +
-    "case \"$cores\" in ''|*[!0-9]*) cores=1 ;; esac\n" +
-    "load=$(uptime 2>/dev/null | sed -n 's/.*load averages*: *//p' | awk -F'[ ,]+' '{print $1}')\n" +
-    "case \"$load\" in ''|*[!0-9.]*) load=0 ;; esac\n" +
-    "awk -v l=\"$load\" -v c=\"$cores\" -v cap=${loadScaleCap} " +
-    "'BEGIN{r=l/c; s=int(r); if(r>s)s++; if(s<1)s=1; if(s>cap)s=cap; printf \"%d %s\\n\", s, l}' > " +
-    shQuote(outPath) +
-    "\n"
-  let code = runScript(scriptPath, body, loadProbeTimeoutMs) catch _ {
-    return fallback
-  }
-  if (code != 0) {
-    return fallback
-  }
-  let raw = readFile(outPath) catch _ {
-    return fallback
-  }
-  let parts = split(trimSpace(trimTrailingNl(raw)), " ")
-  if (len(parts) != 2) {
-    return fallback
-  }
-  let scale = parseInt(parts[0]) catch _ {
-    return fallback
-  }
-  if (scale < 1) {
-    return fallback
-  }
-  let text = parts[1]
-  if (text == "") {
-    text = "unknown"
-  }
-  return LoadProbe{ scale: scale, text: text }
-}
-
-// #5095: idle-relative is the same threshold _tests_/bit/stress/verify.bit's
-// loadProbe already established (scale 1 at or under the core count) —
-// reusing it means "loaded" here means the same thing it means in the
-// stress gate, not a second, independently-calibrated number.
-fn isLoaded(p: LoadProbe): bool {
-  return p.scale > 1
-}
+// #5095 tried to gate the CPU-ceiling check behind a host-wide load probe
+// (`load average / core count > 1`), the same idiom
+// _tests_/bit/stress/verify.bit uses for scaling a WATCHDOG timeout. #5196
+// found the reuse was the bug: that threshold only opens once load exceeds
+// the box's total core count, so on an 18-core box it never opened anywhere
+// in the realistic 1x-18x contention range this shared, multi-agent
+// workspace actually produces — including the exact run that measured
+// strmap at 53cs against a 28cs baseline (165%) under host load 17.55,
+// which nearly blocked the v0.17.0 release. A gate judging on a constant,
+// guarded by a valve that cannot open, is still judging on a constant.
+//
+// This replaces the external load probe with a same-run control: each rep's
+// own measurement already reports wall-clock (`real`) and total CPU
+// (`user`+`sys`) from the same instrument (`/usr/bin/time -l` on Darwin, one
+// wall-clock pair plus `/proc/<pid>/stat`'s utime+stime on Linux — see
+// darwinMeasureBranch()/linuxMeasureBranch() below). For a single-threaded,
+// non-blocking, CPU-bound benchmark those two should be equal to within
+// rounding: `real` cannot be LESS than total CPU (a process cannot execute
+// more than one core-second per wall-second), and on a quiet box it is not
+// MORE either, because there is nothing to wait for. Any positive gap
+// (`gapCentis` below) is time this specific process spent off a core during
+// this specific measurement — descheduled, i.e. the box was busy right then.
+//
+// No external probe, no load-average/core-count division, and no percentage
+// or absolute-centisecond constant to calibrate: `wasDescheduled()` in
+// benchgate.bit compares the gap to that SAME rep's own CPU reading (gap >
+// cpu means the process waited longer than it ran), which is dimensionless
+// and needs no per-host or per-case tuning — a short case (baseline as low
+// as 4cs) and a long one are judged by the same relation, not an absolute
+// noise floor sized for one of them.
 
 // --- build ---------------------------------------------------------------
 
@@ -245,10 +182,15 @@ fn buildScript(
 // child exits and is reaped before `time` appends its own report), so no
 // second capture file is needed here. `/usr/bin/time -l`'s first line is
 // fixed-format: "<real> real <user> user <sys> sys", so the user-seconds
-// value is always field 3 of the line matching " user". `(u*100)+0.5`
-// rounds to the nearest centisecond. The same pass folds in the
-// `swept=`/`live=` scan (`gcAwkBody`, built once in measureScript and
-// shared by both branches) so ONE awk call produces all four fields.
+// value is always field 3 of the line matching " user" -- and that SAME line
+// carries `real` (field 1) and `sys` (field 5), read here too so gapCentis
+// (#5196, see DESCHEDULE DETECTION above) needs no second instrument: `g =
+// real - user - sys` is the time this process was off a core during this
+// rep, clamped to >=0 (rounding on three independently-rounded fields can
+// otherwise put it a hair negative). `(x*100)+0.5` rounds to the nearest
+// centisecond. The same pass folds in the `swept=`/`live=` scan (`gcAwkBody`,
+// built once in measureScript and shared by both branches) so ONE awk call
+// produces all five fields.
 fn darwinMeasureBranch(
   bin: string,
   outPath: string,
@@ -267,11 +209,12 @@ fn darwinMeasureBranch(
     "\n"
   s = s + "    ec=$?\n"
   s = s +
-    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" +
+    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;rl=0;sy=0;" +
     gcAwkBody +
-    "/ user/{u=$3} /maximum resident set size/{r=$1} " +
+    "/ user/{u=$3;rl=$1;sy=$5} /maximum resident set size/{r=$1} " +
     "END{obj=-1; if (sw>=0 && lv>=0) obj=sw+lv; " +
-    "printf \"%d %d %d %d\\n\", ec, (u*100)+0.5, r, obj}' " +
+    "g=-1; if (u>=0) {g=rl-u-sy; if(g<0)g=0; g=(g*100)+0.5}; " +
+    "printf \"%d %d %d %d %d\\n\", ec, (u*100)+0.5, r, obj, g}' " +
     shQuote(rawPath) +
     " > " +
     shQuote(resPath) +
@@ -289,7 +232,11 @@ fn darwinMeasureBranch(
 // mutation-tested for #2207. `gcPath` is the child's OWN stderr, captured
 // separately (Linux has no `/usr/bin/time -l` merging it in for us the way
 // the Darwin branch gets for free) — same `swept=`/`live=` scan, different
-// source file.
+// source file. `start`/`end` (#5196, GNU `date +%s%N`, nanoseconds since
+// epoch) bracket the same child this loop already polls, giving a wall-clock
+// reading with no second instrument — see DESCHEDULE DETECTION above; unlike
+// Darwin's single `/usr/bin/time -l` line, Linux has no built-in real-vs-cpu
+// pairing, so the timestamps are the only addition this platform needs.
 fn linuxMeasureBranch(
   bin: string,
   outPath: string,
@@ -298,6 +245,7 @@ fn linuxMeasureBranch(
   gcAwkBody: string,
 ): string {
   let s = "  *)\n"
+  s = s + "    start=$(date +%s%N)\n"
   s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " 2>" + shQuote(gcPath) + " &\n"
   s = s + "    pid=$!\n"
   s = s + "    cpu=-1\n"
@@ -321,18 +269,32 @@ fn linuxMeasureBranch(
   s = s + "    done\n"
   s = s + "    wait $pid\n"
   s = s + "    ec=$?\n"
+  s = s + "    end=$(date +%s%N)\n"
   s = s + "    CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)\n"
   s = s + "    cpuCs=-1\n"
   s = s + "    rssB=-1\n"
   s = s + "    if [ $cpu -ge 0 ]; then cpuCs=$((cpu * 100 / CLK)); fi\n"
   s = s + "    if [ $hwm -ge 0 ]; then rssB=$((hwm * 1024)); fi\n"
+  // realCs/gapCs are computed only once cpuCs is known valid: an invalid
+  // cpuCs (-1) already fails validateRep()'s cpu<0 check downstream, so the
+  // gap is meaningless in that case and left at -1 rather than racing a
+  // divide against a sentinel.
+  s = s + "    gapCs=-1\n"
+  s = s + "    if [ $cpuCs -ge 0 ]; then\n"
+  s = s + "      realCs=$(( (end - start) / 10000000 ))\n"
+  s = s + "      gapCs=$(( realCs - cpuCs ))\n"
+  s = s + "      if [ $gapCs -lt 0 ]; then gapCs=0; fi\n"
+  s = s + "    fi\n"
   s = s +
     "    obj=$(awk 'BEGIN{" +
     gcAwkBody +
     "END{if (sw>=0 && lv>=0) print sw+lv; else print -1}' " +
     shQuote(gcPath) +
     ")\n"
-  s = s + "    printf \"%d %d %d %d\\n\" $ec $cpuCs $rssB $obj > " + shQuote(resPath) + "\n"
+  s = s +
+    "    printf \"%d %d %d %d %d\\n\" $ec $cpuCs $rssB $obj $gapCs > " +
+    shQuote(resPath) +
+    "\n"
   s = s + "    exit $ec\n"
   return s + "    ;;\n"
 }
@@ -372,6 +334,11 @@ class Measured {
   cpuCentis: int,
   rssBytes: int,
   objects: int,
+  // #5196: real-minus-CPU centiseconds from the SAME measurement (see
+  // DESCHEDULE DETECTION above), -1 when unavailable (cpuCentis itself was
+  // invalid, so the gap could not be computed) — same "-1 means not
+  // measured, never a silent 0" convention as the other fields.
+  gapCentis: int,
   out: string,
 }
 
@@ -389,20 +356,35 @@ fn trimTrailingNl(s: string): string {
 
 fn parseMeasured(resText: string, outText: string): Measured {
   let parts = split(trimSpace(trimTrailingNl(resText)), " ")
-  if (len(parts) != 4) {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  if (len(parts) != 5) {
+    return Measured{
+      ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, gapCentis: 0, out: outText,
+    }
   }
   let ec = parseInt(parts[0]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+    return Measured{
+      ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, gapCentis: 0, out: outText,
+    }
   }
   let cpu = parseInt(parts[1]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+    return Measured{
+      ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, gapCentis: 0, out: outText,
+    }
   }
   let rss = parseInt(parts[2]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+    return Measured{
+      ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, gapCentis: 0, out: outText,
+    }
   }
   let obj = parseInt(parts[3]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+    return Measured{
+      ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, gapCentis: 0, out: outText,
+    }
+  }
+  let gap = parseInt(parts[4]) catch _ {
+    return Measured{
+      ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, gapCentis: 0, out: outText,
+    }
   }
   return Measured{
     ok: true,
@@ -410,6 +392,7 @@ fn parseMeasured(resText: string, outText: string): Measured {
     cpuCentis: cpu,
     rssBytes: rss,
     objects: obj,
+    gapCentis: gap,
     out: outText,
   }
 }
