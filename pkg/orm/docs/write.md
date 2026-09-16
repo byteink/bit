@@ -139,25 +139,31 @@ catches, avoided here on purpose.
 ## upsert - insert or update in one statement, with two real limits
 
 ```bit
-import { UpsertDialect, upsert } from "orm"
+import { ServerDialect, upsert } from "orm"
 
 fn upsertPersonByEmail(db: Data, p: Person): ()! {
-  upsert(db, personDesc(), personValues(p), UpsertDialect.Postgres, on = "email")?
+  upsert(db, personDesc(), personValues(p), ServerDialect.Postgres, on = "email")?
 }
 ```
 
 This is `INSERT INTO people (...) VALUES (...) ON CONFLICT (email) DO
 UPDATE SET ...` on Postgres, `ON DUPLICATE KEY UPDATE` on MySQL
-(`UpsertDialect.Mysql`) - the statement CSV imports and sync jobs actually want:
-one round trip, no "does this email already exist" query first. `on`
-names a unique or primary-key column; the Bit field name, translated the
-same way `where`'s column names are, never a raw SQL identifier. Omit it
-and `upsert` uses the primary key.
+(`ServerDialect.Mysql(version)`) - the statement CSV imports and sync jobs
+actually want: one round trip, no "does this email already exist" query
+first. `on` names a unique or primary-key column; the Bit field name,
+translated the same way `where`'s column names are, never a raw SQL
+identifier. Omit it and `upsert` uses the primary key.
 
-`UpsertDialect` is not [`Dialect`](dialect.md), the schema-rendering
-interface - it is a plain tag scoped to `upsert` alone. See
-[`pkg/orm/README.md`](../README.md#dialect-vs-upsertdialect) for why the
-two stay separate types.
+A MySQL call here has to supply a `MysqlVersion` on `ServerDialect.Mysql`
+that `upsert` never reads - `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` is a
+syntax choice, not a version-gated one. `ServerDialect` (#5384) is the one
+type every dialect-sensitive function in this package takes now, replacing
+an earlier, narrower `UpsertDialect` that existed only for `upsert`; the
+version-carrying shape came from [Locking](locking.md)'s `forUpdate`, which
+does need a real MySQL version to gate `SKIP LOCKED`/`NOWAIT`. `Dialect`
+(the schema-rendering interface, [Dialect](dialect.md)) is a different type
+for a different question - "how do I render a migration's DDL," not "which
+server am I talking to."
 
 **`upsert` is never what `save` does by default, for two reasons that
 matter in production:**

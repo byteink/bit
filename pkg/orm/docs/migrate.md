@@ -33,6 +33,8 @@ import {
   MigrationStatus,
   Postgres,
   RevertedMigration,
+  RunnerDialect,
+  ServerDialect,
   UpReport,
   alter,
   deleteHistory,
@@ -69,6 +71,10 @@ fn migrations(): []Migration {
     },
   ]
 }
+
+fn postgresDialect(): RunnerDialect {
+  return RunnerDialect{ render: Postgres{}, server: ServerDialect.Postgres }
+}
 ```
 
 This entry mirrors [Generate](generate.md)'s `0007_add_widget_phone.bit`
@@ -76,11 +82,21 @@ by hand: `apply` is what that file's `up()` would build if its signature
 matched `Migration`'s, and `revert` is its own reverse, which you write
 yourself - nothing derives one from the other.
 
+`postgresDialect()` builds the second argument every `up`/`down` call below
+needs: a `RunnerDialect`, two facts about the target server bundled into one
+parameter - `render`, the [Dialect](dialect.md) that turns a migration's
+`SchemaOp`s into real DDL (`Postgres{}` here), and `server: ServerDialect`,
+which server `up`/`down` take their advisory lock against. The two are
+never derived from each other (#5384): "how do I render this migration's
+SQL" and "which server locks the run" are different questions, and a real
+MySQL deployment answers both the same way, but nothing here assumes it -
+see "The sharp edge" below for what `server` actually controls.
+
 ## The simplest thing that works: apply everything pending
 
 ```bit
 fn deploy(db: Data): UpReport! {
-  return up(db, Postgres{}, migrations(), now())?
+  return up(db, postgresDialect(), migrations(), now())?
 }
 ```
 
@@ -126,7 +142,7 @@ will run before anyone runs it.
 ```bit
 fn undo(db: Data): RevertedMigration! {
   let oneHour = 3600000000000
-  return down(db, Postgres{}, migrations(), now(), oneHour)?
+  return down(db, postgresDialect(), migrations(), now(), oneHour)?
 }
 ```
 
@@ -197,11 +213,28 @@ roll it back. That failure is reported as what it is; treat it as a
 partially-applied migration to finish by hand, not a rejected one.
 
 The advisory lock (`pg_advisory_lock`, released at the end of the run
-whether it succeeds or fails) is hardcoded to Postgres today - `Dialect`
-has no lock/unlock method yet, so a MySQL runner needs that interface
-widened first.
+whether it succeeds or fails) is taken when `server: ServerDialect.Postgres`.
+Pass `ServerDialect.Mysql(version)` instead and `up`/`down` refuse
+immediately, before issuing any statement (#5384) - there is no MySQL
+advisory lock implemented yet, and running a MySQL migration unlocked would
+mean two instances deploying at the same moment could interleave their DDL
+with nothing stopping them, exactly what this lock exists to prevent. That
+is a behavior change from an earlier version of this package, which ran
+every MySQL migration through the Postgres-only `pg_advisory_lock` SQL
+text unconditionally: against a fake driver in a test that "worked" (the
+fake didn't check the SQL), but against a real MySQL server it would have
+failed anyway, with an opaque driver error instead of this typed,
+catchable one. **MySQL migrations cannot run through `up`/`down` today** -
+see the next section for the statement sequencing they will use once a
+MySQL lock exists.
 
 ### On MySQL, the ledger row moves to the end (#5378)
+
+The sequencing below is real, tested code (`applyMigration` in
+`pkg/orm/runner.bit`) - it is what `up` will do for a MySQL migration once
+a MySQL advisory lock exists to get past the refusal above. It documents
+the shape now so the lock implementation has nothing left to design when
+it lands, not a path you can reach by calling `up`/`down` today.
 
 MySQL DDL auto-commits, so `Mysql` honestly flags every statement it
 renders non-transactional - and that leaves no `BEGIN`/`COMMIT` block for
@@ -221,9 +254,9 @@ back either way) - write migrations whose statements are safe to repeat
 (`create table if not exists`, `add column if not exists` where your MySQL
 version supports it) if that matters to you.
 
-`up` on MySQL still takes no advisory lock, because the lock
-(`pg_advisory_lock`) is the Postgres statement above and `Dialect` has no
-lock/unlock method yet - a separate gap, not this one.
+This section describes sequencing, not something you can trigger from
+`up`/`down` today - see "The sharp edge" above for the explicit refusal
+that stops a MySQL run before it gets here.
 
 ## When not to use `down`
 
