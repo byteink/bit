@@ -249,10 +249,13 @@ not give it a placeholder your program would ever read by mistake.
 
 ## When not to use this
 
-There is no `manyToMany` here - a join table needs its own schema
-declaration and its own diffing in [Schema](schema.md)'s sync, tracked as
-separate work. Model a many-to-many relationship as two `hasMany`s through
-an explicit join-table entity until it lands.
+For a many-to-many relationship, see [Many-to-many](manytomany.md):
+`manyToManyTable`, `manyToManyLoader` and `attach`/`detach`/`sync` cover the
+join table's DDL, eager loading and changing the set. There is no automatic
+`with()` wiring from a bare `@manyToMany` field yet - unlike `@hasMany`/
+`@hasOne`/`@belongsTo` above, nothing reads the attribute's own join-table
+argument into a loader for you, so [Many-to-many](manytomany.md)'s
+`ManyToManyDesc` is still hand-written today.
 
 ## Where to go next
 

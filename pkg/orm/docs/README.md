@@ -16,6 +16,7 @@
 | [Bulk insert](bulk.md) | `insertAll`: many rows in one statement, chunked at a computed placeholder limit, never one statement per row |
 | [Keyset pagination](keyset.md) | `after`: `WHERE id > $n` instead of `OFFSET`, so a deep page costs what page 1 costs |
 | [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |
+| [Many-to-many](manytomany.md) | `@manyToMany`, `manyToManyTable`, `manyToManyLoader` and `attach`/`detach`/`sync` on the join table, with the join table name always an explicit argument, never inferred |
 | [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withTrashed`/`onlyTrashed`/`restore`/`forceDelete` opt in |
 | [Optimistic locking](version.md) | `@version`: `save`'s UPDATE checks the old version and raises it by one, `StaleWriteError` when another write landed first, distinct from a row-not-found |
 | [Row locking](locking.md) | `forUpdate`: `FOR UPDATE` blocks until a row is free, `SKIP LOCKED` never blocks and returns fewer rows than matched, refused outside a transaction and on `count()`/`exists()` |

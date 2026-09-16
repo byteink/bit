@@ -43,7 +43,7 @@ fn pendingJobs(db: Data): Query<Job> {
 }
 
 fn claimOneJob(db: Data): Option<Job>! {
-  let job = forUpdate<Job>(pendingJobs(db).limit(1), LockOpts{}, LockDialect.Neutral).one()?
+  let job = pendingJobs(db).limit(1).forUpdate(LockOpts{}, LockDialect.Neutral).one()?
   match (job) {
     Some(j) => {
       db.exec(
@@ -63,15 +63,24 @@ fn runClaimOneJob(p: Pool): Option<Job>! {
 }
 ```
 
-`forUpdate<T>(q, opts, dialect)` wraps a `Query<T>` chain you already built
-with `find` - `pendingJobs(db).limit(1)` above - and returns a
-`LockedQuery<T>` whose terminals (`all`/`one`/`oneOrFail`) run the same SQL
-with a lock clause appended. `dialect` is required and explicit - see
-"SKIP LOCKED and NOWAIT need MySQL 8.0" below for what it is for.
-`LockOpts{}` is plain `FOR UPDATE`: it **blocks** until
-whichever transaction currently holds the row commits or rolls back. Two
-workers both calling `claimOneJob` at once do not both get job 42 - the
-second one's `forUpdate(...).one()` simply waits its turn.
+`Query<T>.forUpdate(opts, dialect)` continues the chain you're already
+building with `find`/`where`/`limit` - `pendingJobs(db).limit(1)` above -
+and returns a `LockedQuery<T>` whose terminals (`all`/`one`/`oneOrFail`)
+run the same SQL with a lock clause appended. `dialect` is required and
+explicit - see "SKIP LOCKED and NOWAIT need MySQL 8.0" below for what it is
+for. `LockOpts{}` is plain `FOR UPDATE`: it **blocks** until whichever
+transaction currently holds the row commits or rolls back. Two workers both
+calling `claimOneJob` at once do not both get job 42 - the second one's
+`forUpdate(...).one()` simply waits its turn.
+
+The free function `forUpdate<T>(q, opts, dialect)` (`pkg/orm/lock.bit`)
+does the identical work - `.forUpdate(opts, dialect)` is one line
+delegating straight into it, the same way `Pool.txValue<T>` delegates into
+its own free-function twin. Reach for the free function when you already
+hold a built `Query<T>` value - passed in as a parameter, or returned by
+another function - rather than writing the chain inline: `claimUpTo` below
+wraps `pendingJobs(db).limit(n)` with the free function for exactly that
+reason.
 
 Holding the lock is not the same as claiming the job. `claimOneJob` also
 writes `state = 'processing'` before it commits, inside the same
