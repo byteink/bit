@@ -114,7 +114,6 @@ which a time-of-day type can hold. The `int` is nanoseconds, the same
 duration idiom `std/time.Second`/`Hour` already use:
 
 ```bit
-import { mysqlTime } from "mysql"
 import { Second } from "std/time"
 
 fn prepTimeOf(db: Pool, id: string): int! {
