@@ -7,18 +7,26 @@
 // identical on either transport; only the socket swaps, behind a small
 // `byteStream` interface (`netStream` for cleartext, `tlsStream` for TLS).
 //
-// Scope for v1: HTTP/1.1 over cleartext or TLS, one request per connection
-// (`Connection: close`), no redirects. Headers are carried as a raw block and
-// read with `header()` — case-insensitively, by name. Request framing follows
-// RFC 9112 §6: a body is read only when `Content-Length` or
+// Scope for v1: HTTP/1.1 over cleartext or TLS, no redirects. The
+// `listenAndServe`/`serve` server keeps a connection open for more than one
+// request by default (RFC 9112 §9.3, #5419): `Connection: close` is honoured
+// when the client sends it, sent by the server when it must close after a
+// response (an HTTP/1.0 peer, an idle or request-count-capped connection),
+// and otherwise the connection persists. Headers are carried as a raw block
+// and read with `header()` — case-insensitively, by name. Request framing
+// follows RFC 9112 §6: a body is read only when `Content-Length` or
 // `Transfer-Encoding: chunked` says so — chunked is decoded, never passed
 // through as raw framing bytes — and a request declaring both, an unparsable
 // Content-Length, or a malformed chunk stream is rejected with 400 rather than
 // guessed at. Responses are always sent with an exact Content-Length; the
-// server itself never emits chunked.
+// server itself never emits chunked. The direct `Server.accept()`/`Exchange`
+// API stays one request per connection (`Exchange.respond`'s own comment).
 
 import { listen, dial, dialDeadline, udpBind, Listener, Conn, UdpSocket } from "std/net"
 import { indexOf, hasPrefix, toLower, newBuilder } from "std/strings"
+// `monotonic` is client.bit's import (same module, SPEC §19) — used here too
+// (`serveOne`, server.bit, #5419) without a second import, which would be
+// E0042.
 import {
   dial as tlsDial, dialDeadline as tlsDialDeadline, listen as tlsListen, TlsConn, TlsConfig,
   TlsListener, newTlsConfig, emptyTrustStore, TrustStore as TlsTrustStore,
@@ -175,9 +183,14 @@ export fn header(block: string, name: string): string {
 // before the address could be read. `""` is the zero value of `string` (SPEC §12.2,
 // §13.4), so every existing construction site that omits the field keeps
 // compiling and keeps meaning "no peer known".
+// `version` is the request line's third token verbatim ("HTTP/1.1",
+// "HTTP/1.0"), or "" when the request line had none — matched exactly
+// against "HTTP/1.1" (RFC 9110 §9.1's case sensitivity) by `wantsClose`
+// (server.bit, #5419) to decide whether this connection persists by default.
 export class Request {
   export method: string,
   export path: string,
+  export version: string,
   export headers: string,
   export body: string,
   export peer: string,
@@ -490,11 +503,22 @@ fn reason(status: int): string {
 // being written; only for a HEAD whose body is already empty, which leaves
 // nothing to count, is a single well-formed declared field honoured instead
 // (`framingLength`, #4635, #4640).
-fn serializeResponse(res: Response, method: string): string {
+// `mustClose` is the framing decision `wantsClose` (server.bit) already
+// made — whether the connection closes after this response, per RFC 9112
+// §9.3's negotiation between the request's own `Connection` header and the
+// server's own limits (idle timeout, max requests, an HTTP/1.0 peer). This
+// function only renders that decision onto the wire; it never re-derives it.
+// Named `mustClose`, not `close`: `close` is a predeclared identifier
+// (E0048).
+fn serializeResponse(res: Response, method: string, mustClose: bool): string {
   let head = "HTTP/1.1 ${res.status} ${reason(res.status)}\r\n"
   head = head + "Content-Length: ${framingLength(res, method)}\r\n"
   head = head + "Content-Type: ${res.contentType}\r\n"
-  head = head + "Connection: close\r\n"
+  if (mustClose) {
+    head = head + "Connection: close\r\n"
+  } else {
+    head = head + "Connection: keep-alive\r\n"
+  }
   head = head + withoutHeaderLines(res.headers, contentLengthField)
   head = head + "\r\n"
   if (method == methodHead) {
@@ -523,12 +547,24 @@ fn serializeResponse(res: Response, method: string): string {
 // a peer address is metadata, and a socket that cannot name its peer — the
 // connection died, or it is a test double with no fd — must not turn into a
 // failed request. Every implementation answers `""` in that case.
+// `unread` puts `extra` back in front of whatever this stream returns next —
+// the mechanism that keeps a persistent connection's pipelined bytes (the
+// start of the NEXT request, already delivered in the same read as the
+// current message's end) from being discarded by a framing function that
+// only wanted a prefix of what it read (#5419: `readRequestContentLengthBody`,
+// `decodeChunkedBody`, `readRequestBody`, message.bit). `setIdleDeadline`
+// bounds the NEXT `readUp` (and everything read to complete the message it
+// starts) by an absolute `std/time.monotonic().ns` deadline, 0 clearing it —
+// the mechanism `serveOne` (server.bit) uses to close a connection that goes
+// idle between requests.
 interface byteStream {
   readUp(n: int): string!,
   writeStr(s: string): ()!,
   shut(),
   forceClose(),
   peer(): string,
+  unread(extra: string),
+  setIdleDeadline(deadlineNs: int),
 }
 
 // A cleartext transport over a std/net TCP connection. `conn.deadline() != 0`
@@ -537,7 +573,21 @@ interface byteStream {
 // the exact call it always has, so a caller with no timeout sees no change.
 class netStream {
   conn: Conn
+  // Bytes `unread` pushed back, served before the next real socket read
+  // (#5419). "" the whole life of a one-shot connection — only a keep-alive
+  // loop that pipelines ever sets it.
+  pending: string
   readUp(n: int): string! {
+    if (len(this.pending) > 0) {
+      if (len(this.pending) <= n) {
+        let out = this.pending
+        this.pending = ""
+        return out
+      }
+      let out = this.pending[0:n]
+      this.pending = this.pending[n:len(this.pending)]
+      return out
+    }
     if (this.conn.deadline() != 0) {
       return this.conn.readDeadline(n)?
     }
@@ -557,12 +607,30 @@ class netStream {
   forceClose() { this.conn.shutdown() }
 
   peer(): string { return this.conn.peerIp() catch "" }
+
+  unread(extra: string) { this.pending = extra + this.pending }
+
+  setIdleDeadline(deadlineNs: int) { this.conn.setDeadline(deadlineNs) }
 }
 // A TLS transport over a std/tls connection; strings cross the byte-oriented
 // record API as raw bytes, no reinterpretation.
 class tlsStream {
   conn: TlsConn
-  readUp(n: int): string! { return string(this.conn.read(n)?) }
+  // See `netStream.pending`.
+  pending: string
+  readUp(n: int): string! {
+    if (len(this.pending) > 0) {
+      if (len(this.pending) <= n) {
+        let out = this.pending
+        this.pending = ""
+        return out
+      }
+      let out = this.pending[0:n]
+      this.pending = this.pending[n:len(this.pending)]
+      return out
+    }
+    return string(this.conn.read(n)?)
+  }
 
   writeStr(data: string): ()! { this.conn.write([]byte(data))? }
 
@@ -571,6 +639,17 @@ class tlsStream {
   forceClose() { this.conn.shutdown() }
 
   peer(): string { return this.conn.peerIp() catch "" }
+
+  unread(extra: string) { this.pending = extra + this.pending }
+
+  // No-op: `TlsConn` (std/tls) exposes no setter for the deadline an
+  // accept()-side connection reads under — only `dialDeadline` sets one, on
+  // the client side. A TLS server connection therefore persists across
+  // requests (`maxRequests` still caps it) with no idle timeout; closing that
+  // gap needs a `TlsConn.setDeadline` in std/tls, out of this file's scope
+  // (#5419's ticket names stdlib/http/http.bit, stdlib/http/server.bit,
+  // pkg/web/adapter.bit only).
+  setIdleDeadline(deadlineNs: int) {}
 }
 // Read `s` to end of stream (an empty read) onto `buffered` — the body-position
 // bytes that already arrived with the headers — and no further than

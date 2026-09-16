@@ -4,6 +4,13 @@
 // Server
 // ---------------------------------------------------------------------------
 
+// A `listenAndServe`/`serve` connection persists past its first request by
+// default (#5419); these two bound what that costs. `setIdleTimeoutMs`/
+// `setMaxRequestsPerConn` override either. 60s matches nginx's
+// `keepalive_timeout` default; 1000 matches its `keepalive_requests` default.
+const defaultIdleTimeoutNs = 60000000000
+const defaultMaxRequestsPerConn = 1000
+
 // A listening HTTP server. Drive it with an `accept()` loop: `accept()` only
 // accepts, so it returns as soon as a connection exists, before anything is
 // read off it. Spawn a green thread per exchange and call `Exchange.read()`
@@ -14,6 +21,8 @@ export class Server {
   listener: Listener
   drain: drainState
   maxBody: int
+  idleTimeoutNs: int
+  maxRequests: int
   // The port the server is bound to.
   export port(): int! {
     return this.listener.port()?
@@ -48,6 +57,26 @@ export class Server {
   // genuinely accepts large uploads names the size it accepts.
   export setMaxBodyBytes(n: int) {
     this.maxBody = n
+  }
+
+  // How long (#5419) a connection served through `listenAndServeOn` may sit
+  // idle between requests before the server closes it — reset at the start
+  // of every wait for a new request, so activity keeps postponing it, not a
+  // per-connection lifetime cap. Set before serving starts; connections
+  // already accepted keep the value they were accepted with, same as
+  // `setMaxBodyBytes`.
+  export setIdleTimeoutMs(ms: int) {
+    this.idleTimeoutNs = ms * 1000000
+  }
+
+  // How many requests (#5419) a single connection served through
+  // `listenAndServeOn` may answer before the server closes it regardless of
+  // `Connection: keep-alive` — the same bound `keepalive_requests` gives an
+  // operator: an upstream load balancer or a slowly leaking handler cannot
+  // pin one connection open forever. Set before serving starts, same caveat
+  // as `setIdleTimeoutMs`.
+  export setMaxRequestsPerConn(n: int) {
+    this.maxRequests = n
   }
 
   export close() {
@@ -104,7 +133,10 @@ export class Exchange {
   // fd for the life of the process (#4175).
   export respond(res: Response): ()! {
     defer this.conn.close()
-    this.conn.write(serializeResponse(res, this.method))?
+    // Always `close: true`: this API is one request per connection (this
+    // class's own doc comment), unlike `listenAndServeOn`'s persistent
+    // connections (#5419).
+    this.conn.write(serializeResponse(res, this.method, true))?
   }
 
   // Take ownership of the exchange's underlying connection for a protocol
@@ -123,29 +155,55 @@ export class Exchange {
 // choose one; read it back with `port()`.
 export fn serve(host: string, port: int): Server! {
   let l = listen(host, port)?
-  return Server{ listener: l, drain: newDrainState(), maxBody: defaultMaxBodyBytes }
+  return Server{
+    listener: l, drain: newDrainState(), maxBody: defaultMaxBodyBytes,
+    idleTimeoutNs: defaultIdleTimeoutNs, maxRequests: defaultMaxRequestsPerConn,
+  }
 }
 
 // The per-server policy every accepted connection is served under: the HTTP/3
-// port to advertise in `Alt-Svc` (0 to advertise nothing) and the byte budget
-// `readMessage` reads a request body under. One value built once per serve
-// loop and shared by every connection it accepts — a class rather than two
-// more parameters because `answer` already carries five, which is E0202's
+// port to advertise in `Alt-Svc` (0 to advertise nothing), the byte budget
+// `readMessage` reads a request body under, and the idle-timeout/max-requests
+// pair that bounds a persistent connection (#5419). One value built once per
+// serve loop and shared by every connection it accepts — a class rather than
+// more parameters because `answerOne` already carries six, which is E0202's
 // ceiling.
 class connOpts {
   altPort: int,
   maxBody: int,
+  idleTimeoutNs: int,
+  maxRequests: int,
 }
 
 // Answers a malformed request with `400 Bad Request` and closes the
 // connection. Best-effort: the peer may already be gone, in which case the
 // write fails and is swallowed — there is no one left to tell.
 fn answerBadRequest(s: byteStream) {
-  s.writeStr(serializeResponse(respond(400, ""), "")) catch _ {
+  s.writeStr(serializeResponse(respond(400, ""), "", true)) catch _ {
     s.shut()
     return
   }
   s.shut()
+}
+
+// Whether the connection closes after answering a request framed by
+// `reqHeaders`/`version` (RFC 9112 §9.3, #5419). The client's own explicit
+// `close` always wins; short of that, an HTTP/1.1 request (`version` is
+// exactly "HTTP/1.1" — RFC 9110 §9.1's case-sensitive token) persists by
+// default, and anything else (HTTP/1.0, or a request line with no version at
+// all) closes unless the client opted into `keep-alive`. `Connection` may
+// carry more than one token ("keep-alive, Upgrade"), so both checks are a
+// substring search of the lowercased field, the same matching `header()`
+// already gives every other caller of it.
+fn wantsClose(reqHeaders: string, version: string): bool {
+  let conn = toLower(header(reqHeaders, "connection"))
+  if (indexOf(conn, "close") >= 0) {
+    return true
+  }
+  if (version == "HTTP/1.1") {
+    return false
+  }
+  return indexOf(conn, "keep-alive") < 0
 }
 
 // Serve HTTP forever on an already-bound `s`, dispatching every request to
@@ -172,7 +230,10 @@ fn answerBadRequest(s: byteStream) {
 // read stalls on its own thread; every other accept and every other read
 // proceeds.
 export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
-  let opts = connOpts{ altPort: 0, maxBody: s.maxBody }
+  let opts = connOpts{
+    altPort: 0, maxBody: s.maxBody,
+    idleTimeoutNs: s.idleTimeoutNs, maxRequests: s.maxRequests,
+  }
   while (true) {
     let c = s.listener.accept()?
     spawn serveOne(netStream{ conn: c }, handler, opts, s.drain)
@@ -191,13 +252,42 @@ export fn listenAndServe(host: string, port: int, handler: (Request) => Response
   listenAndServeOn(s, handler)?
 }
 
-// Read one request off `s`, answer it with `handler`, and close. On the calling
-// green thread; a read or write failure just drops the connection. `altPort` is
-// advertised in the response's Alt-Svc header (0 to advertise nothing). `d` is
-// the owning `Server`'s drain tracker (`shutdown.bit`, #3963): this connection
-// is registered idle for as long as it waits for its request, then marked
-// active for the rest of its life, so a graceful shutdown knows whether it is
-// safe to force-close right away or must be given a chance to finish.
+// Read and answer requests off `s` until the connection closes: the client
+// asked to (`wantsClose`), it hit `opts.maxRequests`, it went idle past
+// `opts.idleTimeoutNs`, or a read/write failed. On the calling green thread —
+// spawned per connection, so one slow or malicious peer only ever blocks its
+// own thread, never another connection's accept or read (#2170). `d` is the
+// owning `Server`'s drain tracker (`shutdown.bit`, #3963): this connection is
+// registered idle for as long as it waits for A request, then marked active
+// for the rest of that request's life, every request in turn — so a graceful
+// shutdown can tell a connection between requests (safe to force-close) from
+// one mid-exchange (give it a chance to finish).
+// This connection's drain registration (`shutdown.bit`, #3963): `d` is the
+// owning `Server`'s tracker, `id` the handle this one connection registered
+// under. Bundled into one value so `answerOne` (#5419, a persistent
+// connection's per-request step) stays at 5 parameters, E0202's ceiling.
+class drainSlot {
+  d: drainState,
+  id: int,
+}
+
+// Which request, of how many, this `answerOne` call is answering (#5419).
+// `first` is true only for a connection's very first request: a malformed
+// request there gets `answerBadRequest`'s 400, exactly the single-request
+// behavior this replaces; on every later request the same read failure means
+// the peer went idle past the deadline just armed, or the connection simply
+// died between exchanges — closing without a response is the ordinary end of
+// a persistent connection (RFC 9112 §9.3), not a fresh error to report.
+// `atLimit` is `n == maxRequests` from the caller's loop counter: the last
+// request this connection may answer, framed with `Connection: close`
+// regardless of what the client asked for, same as an idle-timeout or
+// `wantsClose` closure. Bundled with `first` for the same E0202 reason as
+// `drainSlot`.
+class answerTurn {
+  first: bool,
+  atLimit: bool,
+}
+
 fn serveOne(s: byteStream, handler: (Request) => Response, opts: connOpts, d: drainState) {
   let id = drainRegister(
     d,
@@ -207,35 +297,66 @@ fn serveOne(s: byteStream, handler: (Request) => Response, opts: connOpts, d: dr
     () => {},
   )
   defer drainDeregister(d, id)
-  answer(s, handler, opts, d, id) catch _ {
-    return
+  let slot = drainSlot{ d: d, id: id }
+  let n = 0
+  while (n < opts.maxRequests) {
+    n = n + 1
+    s.setIdleDeadline(monotonic().ns + opts.idleTimeoutNs)
+    let turn = answerTurn{ first: n == 1, atLimit: n == opts.maxRequests }
+    let more = answerOne(s, handler, opts, slot, turn)
+    if (!more) {
+      return
+    }
   }
 }
 
-fn answer(
+// Reads and answers one request off `s`, returning whether the connection
+// stays open for another (#5419). See `answerTurn` for `turn.first`/
+// `turn.atLimit`'s exact meaning.
+fn answerOne(
   s: byteStream,
   handler: (Request) => Response,
   opts: connOpts,
-  d: drainState,
-  id: int,
-): ()! {
+  slot: drainSlot,
+  turn: answerTurn,
+): bool {
   let req = readMessage(s, opts.maxBody) catch _ {
-    answerBadRequest(s)
-    return
+    if (turn.first) {
+      answerBadRequest(s)
+    } else {
+      s.shut()
+    }
+    return false
   }
-  drainMarkActive(d, id)
-  // `defer` (SPEC §18.5) runs on `?` propagation the same as a normal
-  // return, so a peer that hangs up before the response write completes
-  // still shuts `s` down — without this the bare `s.shut()` below the `?`
-  // never ran, leaking the fd for the life of the process (#4175).
-  // `answerBadRequest` above already shuts on both of its own paths, so this
-  // is placed after that branch rather than at the top of the function.
-  defer s.shut()
+  if (len(req.method) == 0) {
+    // The peer closed before sending a(nother) request — the ordinary end of
+    // a persistent connection, not a failure.
+    s.shut()
+    return false
+  }
+  drainMarkActive(slot.d, slot.id)
   let res = handler(req)
   if (opts.altPort > 0) {
     res.headers = res.headers + altSvcHeader(opts.altPort)
   }
-  s.writeStr(serializeResponse(res, req.method))?
+  // Named `mustClose`, not `close`: `close` is a predeclared identifier
+  // (E0048).
+  let mustClose = turn.atLimit || wantsClose(req.headers, req.version)
+  // No bare `defer s.shut()` (unlike the old one-shot `answer`): a connection
+  // that stays open (`mustClose` false, write succeeded) must NOT be shut
+  // before its next request, so every exit path shuts explicitly instead — a
+  // write failure ends the connection exactly as it always has (#4175), just
+  // via `catch` rather than `?`-propagation now that this function no longer
+  // fails.
+  s.writeStr(serializeResponse(res, req.method, mustClose)) catch _ {
+    s.shut()
+    return false
+  }
+  if (mustClose) {
+    s.shut()
+    return false
+  }
+  return true
 }
 
 // Serve HTTPS forever on an already-bound `l`, dispatching every request to
@@ -262,7 +383,14 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
   // `serveTlsOn` takes a bare `TlsListener`, not a server object, so there is
   // nothing to configure a body budget on: it serves under the default. Use
   // `tlsServe`/`serveTlsServerOn` (below) to raise or lower it.
-  let opts = connOpts{ altPort: altPort, maxBody: defaultMaxBodyBytes }
+  // `tlsStream.setIdleDeadline` is a no-op (see its own comment — `TlsConn`
+  // has no accept-side deadline setter), so `idleTimeoutNs` here bounds
+  // nothing yet; `maxRequests` still caps a persistent HTTP/1.1-over-TLS
+  // connection.
+  let opts = connOpts{
+    altPort: altPort, maxBody: defaultMaxBodyBytes,
+    idleTimeoutNs: defaultIdleTimeoutNs, maxRequests: defaultMaxRequestsPerConn,
+  }
   while (true) {
     // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
     // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
@@ -387,7 +515,11 @@ export fn tlsServe(host: string, port: int, certPem: string, keyPem: string): Tl
 // there for why an ordinary failure must NOT stop the loop.
 export fn serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()! {
   let altPort = ts.listener.port()?
-  let opts = connOpts{ altPort: altPort, maxBody: ts.maxBody }
+  // See `serveTlsOn`'s comment on `idleTimeoutNs`: not yet enforced over TLS.
+  let opts = connOpts{
+    altPort: altPort, maxBody: ts.maxBody,
+    idleTimeoutNs: defaultIdleTimeoutNs, maxRequests: defaultMaxRequestsPerConn,
+  }
   while (true) {
     let conn = ts.listener.accept() catch _ {
       if (drainStarted(ts.drain)) {
