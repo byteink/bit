@@ -260,7 +260,15 @@ case "${BUCKET}" in
     # behaviour — and test-classkeyword proves the retired `class` keyword
     # spelling still gets rejected; both were dark for every
     # compiler/**-only diff before this line.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword)
+    #
+    # test-gc-decimalstress (#5426) is the #4578 shape again, right beside
+    # test-string-keepalive: it COMPILES AND RUNS a fixture under
+    # BIT_GC=stress and the code under test — `enumPayloadSlotIsPtr`,
+    # compiler/lowerdecimal.bit, used at its two call sites in
+    # compiler/lowerlayout.bit — is compiler-only, so `gates_for_file
+    # compiler/lowerdecimal.bit` resolving to this bucket (not to one gate)
+    # left every compiler/**-only diff blind to it before this line.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -314,6 +322,13 @@ case "${BUCKET}" in
     # commit in each tree could have caused it and no bucket ran anything that
     # reads the counters.
     #
+    # test-gc-decimalstress (#5426) is the same #4578 shape as test-gc-retention
+    # just above: it proves the collector actually TRACES a pointer-map offset
+    # the compiler emits, so a runtime-only defect in the mark/trace walk
+    # (runtime/gc/gcalloc.bit) is exactly as reachable here as a compiler-only
+    # one in `enumPayloadSlotIsPtr` — neither argv nor an env entry names
+    # runtime/ content, so a runtime-only diff was blind to it before this line.
+    #
     # test-fmt-citations (#4466) is the #4465 shape — scope in neither argv
     # (which names only `_tests_/bit/fmtcitations`) nor an env entry, but in
     # the harness's own DocRow table: `docPath: "runtime/ABI.md",
@@ -335,7 +350,7 @@ case "${BUCKET}" in
     # is wired here by hand, and scripts/gate-envscope.sh's
     # assert_taskwordssizing_scope_current() re-checks this membership on
     # every run rather than leaving it unaudited.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-fmt-citations test-taskwords-sizing)
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
