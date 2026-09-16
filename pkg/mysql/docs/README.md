@@ -10,7 +10,7 @@ bitlang.org's sidebar reads it in.
 | [TLS](tls.md) | `ssl-mode`, the no-mode ladder, exactly what `VERIFY_CA` checks and does not, the once-per-pool warnings |
 | [Authentication](authentication.md) | the four plugins, which two warn, why `caching_sha2_password`'s full path needs TLS |
 | [Queries](queries.md) | `query`, `exec`, `prepare`, `$N` placeholder rewriting, the statement cache, the single-packet limit |
-| [Types](types.md) | `mysqlDecimal`/`mysqlInstant`/`mysqlUuid` and their `Opt` twins, why `DATETIME` is refused, the `time_zone` pin, MariaDB's `UUID`/`INET4`/`INET6` |
+| [Types](types.md) | `mysqlDecimal`/`mysqlInstant`/`mysqlDate`/`mysqlTime`/`mysqlJson`/`mysqlUuid` and their `Opt` twins, why `DATETIME` is refused, the `time_zone` pin, MySQL vs MariaDB JSON, MariaDB's `UUID`/`INET4`/`INET6` |
 | [Errors](errors.md) | matching a server error by code and SQLSTATE, `FatalError` and what the connection pool does with one |
 | [Limitations](limitations.md) | what this driver does not do yet, named against the ticket that closes each gap |
 

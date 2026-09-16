@@ -87,6 +87,52 @@ reads UTC regardless of what the server administrator has set as the
 default - you never call `set time_zone` yourself, and a server-side default
 changing under you cannot silently change what your program reads.
 
+## Dates and times: `mysqlDate`, `mysqlTime`
+
+```bit
+import { mysqlDate, mysqlTime } from "mysql"
+import { Date } from "std/time"
+
+fn shippedOn(db: Pool, id: string): Date! {
+  let rows = db.query("select ship_date from payments where id = $1", [Value.Text(id)])?
+  defer rows.close()
+  rows.next()?
+  return mysqlDate("ship_date", rows.value(0))?
+}
+```
+
+`mysqlDate` reads a `DATE` column as `std/time.Date`. MySQL will also store
+`0000-00-00` - a real value outside strict mode - which `mysqlDate` refuses
+rather than guesses at: `Date` has no year-0 to represent it as, and `None`
+already means SQL `NULL`, so returning it there would conflate a stored
+zero date with an absent one.
+
+`mysqlTime` reads a `TIME` column, and its return type is deliberately
+`int`, not `std/time.Time`: MySQL's `TIME` is a **duration**, spanning
+`-838:59:59` to `838:59:59` - negative, and past 24 hours - neither of
+which a time-of-day type can hold. The `int` is nanoseconds, the same
+duration idiom `std/time.Second`/`Hour` already use:
+
+```bit
+import { mysqlTime } from "mysql"
+import { Second } from "std/time"
+
+fn prepTimeOf(db: Pool, id: string): int! {
+  let rows = db.query("select prep_time from recipes where id = $1", [Value.Text(id)])?
+  defer rows.close()
+  rows.next()?
+  let ns = mysqlTime("prep_time", rows.value(0))?
+  return ns / Second // whole seconds, if that's what the caller wants
+}
+```
+
+Both wire encodings are length-prefixed and variable-width - a `DATE` is
+0, 4, 7 or 11 bytes depending on how much precision is present, and `TIME`
+carries its own sign byte and day count - but that decoding already happens
+in this package's wire layer; `mysqlDate`/`mysqlTime` parse the
+server-rendered text it produces, the same text either protocol (`query`
+vs a bound statement) hands back.
+
 ## Nullable columns
 
 Every accessor above has an `Opt` twin that reads a SQL `NULL` as `None`
@@ -113,6 +159,36 @@ fn refundOf(db: Pool, id: string): (Option<decimal>, Option<Timestamp>)! {
 A refund that has not happened yet reads as `None`, not as a zero amount or
 an error - the column really is `NULL`, and a zero would be a lie about a
 refund that was issued for nothing.
+
+## JSON: `mysqlJson`
+
+MySQL 5.7+ and MariaDB disagree about what a `JSON` column even is, and it
+is not cosmetic. MySQL has a native `JSON` type with its own binary wire
+representation; MariaDB has none - `JSON` there is `LONGTEXT` under a
+`CHECK` constraint, so it always arrives as ordinary text. Decoding
+MariaDB's text as though it were MySQL's binary format produces garbage
+that looks like a parse bug rather than a wrong assumption.
+
+```bit
+import { mysqlJson } from "mysql"
+import { Json } from "std/json"
+
+fn metadataOf(db: Pool, id: string): Json! {
+  let rows = db.query("select metadata from payments where id = $1", [Value.Text(id)])?
+  defer rows.close()
+  rows.next()?
+  return mysqlJson("metadata", rows.value(0))?
+}
+```
+
+`mysqlJson` detects which shape it was handed by the bytes themselves,
+not by which server the connection is talking to: a parameterless query
+stays on the text protocol even against a real MySQL `JSON` column (see
+[Queries](queries.md)), so "the server is MySQL" is not the same claim as
+"these bytes are MySQL's binary format" - reading the leading byte is.
+Text - MariaDB always, MySQL whenever the query used the text protocol -
+goes through `std/json.jsonParse`; MySQL's binary tag format is decoded
+by this package's own reader, in one pass over the wire bytes.
 
 ## MariaDB's own types: UUID and INET4/INET6
 
@@ -159,13 +235,10 @@ a UUID.
 `TINYINT(1)`, MySQL's conventional bool column, already decodes to
 `Value.Int` - read it with `std/sql`'s `sqlReqBool` when the field is a
 `bool`, or `sqlReqInt` when it is an `i64`; the field you are reading into
-decides, the same rule `JSON` follows. `JSON` itself decodes to the field's
-own type through the same ordinary `Value` accessors - there is no
-MySQL-specific JSON codec to reach for. See [Queries](queries.md) for how a
-column's real type only comes back at all once a query goes through the
-binary protocol - a parameterless query stays on `COM_QUERY` and every
-column of it comes back as `Value.Text`, `1` and all, regardless of its
-declared type.
+decides. See [Queries](queries.md) for how a column's real type only comes
+back at all once a query goes through the binary protocol - a
+parameterless query stays on `COM_QUERY` and every column of it comes back
+as `Value.Text`, `1` and all, regardless of its declared type.
 
 ## Where to go next
 
