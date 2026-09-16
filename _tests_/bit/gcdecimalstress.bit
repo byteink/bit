@@ -1,0 +1,257 @@
+// _tests_/bit/gcdecimalstress.bit — #5426. The permanent regression test for
+// #5424's GC pointer-map fix: `enumPayloadSlotIsPtr` (compiler/lowerdecimal.bit)
+// now answers `true` for a `decimal` sitting in an ENUM PAYLOAD SLOT, so the
+// slot's offset lands in the enum object's `ptr_offsets` and the collector
+// traces the pointer to the boxed `decimalTupleType` object it holds.
+//
+// WHY A PLAIN `_tests_/cases` `// run` FIXTURE CANNOT COVER THIS. It is
+// compiled and run under the DEFAULT collector, which never collects a
+// small program — #5424's own investigation confirmed the bug is invisible
+// there at any size tried. The kill needs `BIT_GC=stress` (a collection at
+// every safepoint), so this is a harness that drives the built binary twice,
+// not a fixture. Same shape as _tests_/bit/stringkeepalive.bit (#4406/#4425)
+// for the interior-pointer hazard — copied here rather than reinvented.
+//
+// THE FIXTURE. `produce()` returns `Box.Ok(12.50)`: a two-word enum object
+// {tag, payload} whose payload word is a POINTER to a boxed decimal tuple
+// (two i64 words — the exact 16-byte size class `churn` allocates 200,000
+// more of). `v`'s Box wrapper is trivially rooted by the stack/stackmap scan
+// — that was never in question. What is in question is whether tracing FROM
+// that rooted Box object follows its payload word to keep the boxed decimal
+// alive: with the #5424 bug, it does not, so the decimal box is swept and its
+// slot is handed to one of churn's own same-size-class boxes, which zeroes
+// then overwrites it with 3.33's bit pattern. Reading `v`'s decimal back then
+// returns garbage indistinguishable from 3.33/9.99/whatever churn last wrote,
+// never a crash — exit 0 both ways.
+//
+// ITERATION COUNT: 200,000. This is not a guess — it is the count #5424's own
+// kill used, and re-measured here on the REVERTED predicate (see the ticket
+// comment/report): 200,000 iterations under BIT_GC=stress failed the
+// differential every one of 5 repeated runs on the mutant that makes
+// `enumPayloadSlotIsPtr` ignore `decimal` (i.e. always agree with
+// `fieldLayoutFor`), and 5/5 passed on the fixed compiler. A collection must
+// actually happen for the bug to be reachable at all (`BIT_GC=stress`
+// collects at every safepoint, so the `churn` loop's back edge is enough),
+// and the assert on `collections > 0` below makes that a hard requirement
+// rather than an assumption.
+//
+// THE ONLY GATE THAT RUNS `_tests_/bit/gcdecimalstress.bit`, wired into
+// `./make test` as `test-gc-decimalstress`.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace, indexOf } from "std/strings"
+
+const defaultTimeoutS: int = 120
+const maxTimeoutMs: int = 6000000
+const churnIters: int = 200000
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("gcdecimalstress: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0 || s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// `${` cannot appear inside the fixture's own source literal — this
+// harness's lexer would read it as an interpolation of the harness itself.
+// Same device as stringkeepalive.bit.
+const IS: string = "$" + "{"
+
+// The killer program. `churn` allocates `churnIters` more `Box.Ok` values —
+// same enum, same boxed-decimal size class as `v`'s — so a collector that
+// fails to trace `v`'s payload pointer frees its box into churn's own churn.
+fn fixtureSrc(): string {
+  return "enum Box { Ok(decimal), Err(string) }\n" +
+    "fn produce(): Box {\n" +
+    "  let d: decimal = 12.50\n" +
+    "  return Box.Ok(d)\n" +
+    "}\n" +
+    "fn churn(n: int): int {\n" +
+    "  let t = 0\n  let i = 0\n" +
+    "  while (i < n) {\n" +
+    "    let c: decimal = 3.33\n" +
+    "    let b = Box.Ok(c)\n" +
+    "    match (b) {\n" +
+    "      Ok(x) => t = t + 1\n" +
+    "      Err(_) => t = t\n" +
+    "    }\n" +
+    "    i = i + 1\n" +
+    "  }\n  return t\n}\n" +
+    "fn main() {\n" +
+    "  let v = produce()\n" +
+    "  let junk = churn(" +
+    "${churnIters}" +
+    ")\n" +
+    "  match (v) {\n" +
+    "    Ok(d) => println(\"" +
+    IS +
+    "d} " +
+    IS +
+    "junk}\")\n" +
+    "    Err(_) => println(\"err " +
+    IS +
+    "junk}\")\n" +
+    "  }\n" +
+    "}\n"
+}
+
+class Env {
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  dir: string,
+}
+
+class Run {
+  code: int,
+  out: string,
+  err: string,
+}
+
+fn baseEnv(e: Env): string {
+  return "BIT_STDLIB=" +
+    shQuote(e.stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" +
+    shQuote(e.libbitrt) +
+    "\nexport BIT_LIBBITRT\n"
+}
+
+fn runOne(dir: string, tag: string, cmd: string, extraEnv: string): Run {
+  let shPath = "${dir}/${tag}.sh"
+  let outPath = "${dir}/${tag}.out"
+  let errPath = "${dir}/${tag}.err"
+  let script = "#!/bin/sh\n" +
+    extraEnv +
+    cmd +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch er {
+    eprint("gcdecimalstress: cannot write ${shPath}: ${er.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("gcdecimalstress: cannot chmod ${shPath}\n")
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  let err = readFile(errPath) catch _ {
+    ""
+  }
+  return Run{ code: code, out: out, err: err }
+}
+
+fn buildFixture(e: Env, srcPath: string): string {
+  let exe = "${e.dir}/fixture.bin"
+  let r = runOne(
+    e.dir, "build", shQuote(e.bin) + " build " + shQuote(srcPath) + " -o " + shQuote(exe),
+    baseEnv(e),
+  )
+  if (r.code != 0) {
+    eprint("gcdecimalstress: FAIL build — exited ${r.code}\n${r.err}\n")
+    return ""
+  }
+  return exe
+}
+
+// swept+live out of a `[bit-gc]` stderr line, same convention as
+// stringkeepalive.bit's statField/gcObjects.
+fn statField(err: string, key: string): int {
+  let at = indexOf(err, key)
+  if (at < 0) {
+    return -1
+  }
+  let start = at + len(key)
+  let i = start
+  while (i < len(err) && err[i] != 32 && err[i] != 10) {
+    i = i + 1
+  }
+  return parseInt(err[start:i]) catch _ {
+    -1
+  }
+}
+
+fn main() {
+  let e = Env{
+    bin: requiredEnv("BIT_BIN"),
+    stdlib: requiredEnv("BIT_STDLIB"),
+    libbitrt: requiredEnv("BIT_LIBBITRT"),
+    dir: envOr("TMPDIR", "/tmp") + "/bit-gcdecimalstress-${timeUnixNs()}",
+  }
+  mkdir(e.dir) catch err {
+    eprint("gcdecimalstress: cannot create ${e.dir}: ${err.message()}\n")
+    exit(2)
+  }
+  let srcPath = "${e.dir}/fixture.bit"
+  writeFile(srcPath, fixtureSrc()) catch er {
+    eprint("gcdecimalstress: cannot write ${srcPath}: ${er.message()}\n")
+    exit(2)
+  }
+  let exe = buildFixture(e, srcPath)
+  if (exe == "") {
+    exit(1)
+  }
+  // The default-collector run is the oracle: a small program never collects,
+  // so this cannot see the bug either — it only proves the fixture itself is
+  // correct before BIT_GC=stress is asked to agree with it.
+  let want = runOne(e.dir, "default", shQuote(exe), "")
+  if (want.code != 0 || indexOf(want.out, "12.5") < 0) {
+    eprint("gcdecimalstress: FAIL default run — exit ${want.code}, stdout '${want.out}'\n${want.err}\n")
+    exit(1)
+  }
+  let str = runOne(
+    e.dir, "stress", shQuote(exe),
+    "BIT_GC=stress\nexport BIT_GC\nBIT_GC_STATS=1\nexport BIT_GC_STATS\n",
+  )
+  let collections = statField(str.err, "collections=")
+  if (collections < 0) {
+    eprint("gcdecimalstress: FAIL — no [bit-gc] line; BIT_GC_STATS=1 did not take\n")
+    exit(1)
+  }
+  if (collections == 0) {
+    eprint("gcdecimalstress: FAIL — BIT_GC=stress collected 0 times over ${churnIters} allocations; the oracle never ran\n")
+    exit(1)
+  }
+  if (str.code != 0 || str.out != want.out) {
+    eprint("gcdecimalstress: FAIL [BIT_GC=stress] — exit ${str.code} (want 0), stdout '${str.out}' (want '${want.out}') over ${collections} collection(s)\n${str.err}\n")
+    exit(1)
+  }
+  println("gcdecimalstress: PASS — Box.Ok(12.50) survives default GC and BIT_GC=stress (${collections} collections, ${churnIters} churn allocations)")
+}
