@@ -327,7 +327,92 @@ fn xFnCtx(types: []int, blocks: []IrBlock): XCtx {
   return cx
 }
 
+// #5425: no in-process way to observe a compiler-internal `panic()` firing —
+// it is unconditionally fatal with no `recover` (SPEC.md S18.4), so calling
+// a panicking path from inside a check `selfcheck()` runs below crashes the
+// WHOLE `bit selfcheck` battery, not just that one check. The only way to
+// isolate the crash is a separate process; `std/os` has no `setEnv` and its
+// `run`/`osRun` capture nothing but the exit code (stdlib/os/os.bit's own
+// doc comment), and `osRunBounded` — the one builtin with a deadline — takes
+// no argv to route around either gap. So this goes through `/bin/sh`,
+// exactly as `compiler/pmfetchtail.bit`'s `runGit` already does for the same
+// two reasons: a written script sets the ONE env var this child needs and
+// redirects its combined output to a file, bounded by the same
+// background-plus-watcher shape `runGit` uses since `osRun` itself has no
+// timeout, and it is run as `/bin/sh <scriptPath>` — never `exec`'d as the
+// script file itself — since a freshly written executable's first `exec`
+// costs ~15-26s on macOS (`runGit`'s header) while `/bin/sh` merely reading
+// the file pays nothing.
+//
+// `BIT_SELFCHECK_ONLY=<name>`, read at the top of `selfcheck()` below, runs
+// exactly the one check `selfcheckOnly` maps `name` to and returns, instead
+// of the whole battery. Unset — every ordinary `bit selfcheck` invocation —
+// `selfcheck()` is unchanged from today: same checks, same order, same
+// timing.
+//
+// Only checks that PANIC belong in `selfcheckOnly`'s table: anything that
+// merely asserts a pass/fail predicate is already proven in-process by the
+// battery itself, and isolating it here would duplicate that coverage for
+// no reason. Add a new isolated check with one more `name == "..."` arm —
+// this does not, and must not, grow to cover the other ~400 checks
+// `selfcheck()` runs directly.
+fn selfcheckOnly(name: string) {
+  if (name == "checkGpEncodableWidthPanicsOnWidth16") {
+    checkGpEncodableWidthPanicsOnWidth16()
+    return
+  }
+  panic("selfcheckOnly: no isolated check named ${name}")
+}
+
+// Spawns `selfExe() selfcheck` as a child with `BIT_SELFCHECK_ONLY=name` set,
+// so `name` runs alone through `selfcheckOnly` above instead of the whole
+// battery, and returns its exit code plus its captured combined
+// stdout+stderr — a panic exits 2 and writes "panic: <message>\n" to stderr
+// (runtime/root/*/io.bit's `rootPanic`), so a caller checks both: the code
+// alone cannot tell "the check we meant panicked" apart from any other way
+// the child could have stopped.
+fn runSelfcheckOnlyPanics(name: string): (int, string) {
+  let base = scratchBase()
+  let scriptPath = base + ".sh"
+  let outPath = base + ".out"
+  defer removeQuiet(scriptPath)
+  defer removeQuiet(outPath)
+  let script = "#!/bin/sh\n" +
+    "BIT_SELFCHECK_ONLY=" +
+    shQuote(name) +
+    " " +
+    shQuote(selfExe()) +
+    " selfcheck > " +
+    shQuote(outPath) +
+    " 2>&1 &\n" +
+    "child=$!\n" +
+    "( sleep 10; kill -9 \"$child\" 2>/dev/null ) &\n" +
+    "watcher=$!\n" +
+    "wait \"$child\" 2>/dev/null\n" +
+    "status=$?\n" +
+    "if kill -0 \"$watcher\" 2>/dev/null; then\n" +
+    "  kill \"$watcher\" 2>/dev/null\n" +
+    "  wait \"$watcher\" 2>/dev/null\n" +
+    "  exit \"$status\"\n" +
+    "fi\n" +
+    "wait \"$watcher\" 2>/dev/null\n" +
+    "exit 124\n"
+  writeFile(scriptPath, script) catch e {
+    panic("runSelfcheckOnlyPanics: cannot write wrapper script: ${e.message()}")
+  }
+  let code = osRun("/bin/sh", [scriptPath])
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  return code, out
+}
+
 fn selfcheck() {
+  let only = osEnv("BIT_SELFCHECK_ONLY")
+  if (len(only) > 0) {
+    selfcheckOnly(only)
+    return
+  }
   checkStoreForwardManyAllocations()
   checkConvertWidenAlias()
   checkLicmConstOperand()
@@ -461,6 +546,9 @@ fn selfcheck() {
   checkArm64Encoder()
   checkGpSizeOpcTable()
   checkGpSizeOpcReachedThroughDispatch()
+  // #5425: proves the panic itself fires, in an isolated child — neither
+  // check above does (arm64encodecheck.bit).
+  checkGpEncodableWidthPanics()
   checkRedundantBoundsBranchFalseEdge()
   checkDeadBoundsBlockNeedsSinglePred()
   checkBlockLayoutMovesTerminalBlocks()
