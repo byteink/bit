@@ -14,26 +14,41 @@
 //
 // THE FIXTURE. `produce()` returns `Box.Ok(12.50)`: a two-word enum object
 // {tag, payload} whose payload word is a POINTER to a boxed decimal tuple
-// (two i64 words — the exact 16-byte size class `churn` allocates 200,000
-// more of). `v`'s Box wrapper is trivially rooted by the stack/stackmap scan
-// — that was never in question. What is in question is whether tracing FROM
-// that rooted Box object follows its payload word to keep the boxed decimal
-// alive: with the #5424 bug, it does not, so the decimal box is swept and its
-// slot is handed to one of churn's own same-size-class boxes, which zeroes
-// then overwrites it with 3.33's bit pattern. Reading `v`'s decimal back then
-// returns garbage indistinguishable from 3.33/9.99/whatever churn last wrote,
-// never a crash — exit 0 both ways.
+// (two i64 words — the exact 16-byte size class `churn` allocates more of).
+// `v`'s Box wrapper is trivially rooted by the stack/stackmap scan — that was
+// never in question. What is in question is whether tracing FROM that rooted
+// Box object follows its payload word to keep the boxed decimal alive: with
+// the #5424 bug, it does not, so the decimal box is swept and its slot is
+// handed to one of churn's own same-size-class boxes, which zeroes then
+// overwrites it. Reading `v`'s decimal back then returns garbage
+// indistinguishable from whatever churn last wrote there, never a crash —
+// exit 0 both ways.
 //
-// ITERATION COUNT: 200,000. This is not a guess — it is the count #5424's own
-// kill used, and re-measured here on the REVERTED predicate (see the ticket
-// comment/report): 200,000 iterations under BIT_GC=stress failed the
-// differential every one of 5 repeated runs on the mutant that makes
-// `enumPayloadSlotIsPtr` ignore `decimal` (i.e. always agree with
-// `fieldLayoutFor`), and 5/5 passed on the fixed compiler. A collection must
-// actually happen for the bug to be reachable at all (`BIT_GC=stress`
-// collects at every safepoint, so the `churn` loop's back edge is enough),
-// and the assert on `collections > 0` below makes that a hard requirement
-// rather than an assumption.
+// WHY `produce()` IS CALLED THROUGH `indirect(f: () => Box)` RATHER THAN
+// DIRECTLY. A direct `produce()` call gets INLINED into `main` (confirmed on
+// `--dump-ir`: no `call @produce` appears, the allocation happens straight in
+// `main`'s own block) — the same masking `stringkeepalive.bit`'s header
+// describes for `paramview`: the dead SSA value still occupies a physical
+// register/stack slot in `main`'s own frame, which conservative stack
+// scanning can find by accident even after `enumPayloadSlotIsPtr` drops it
+// from the object's own pointer map. Routing the call through a function
+// VALUE (`call_value`, never devirtualized) forces a real call boundary whose
+// frame is genuinely popped, matching stringkeepalive's own fix for the
+// identical hazard ("the killer had to POP the producing frame").
+//
+// ITERATION COUNT: 40 independent `trial()`s of 5,000 churn allocations each
+// (200,000 total, not a round-number guess) — NOT ONE trial of 200,000. This
+// was measured, not assumed: on the mutant that makes `enumPayloadSlotIsPtr`
+// ignore `decimal` (i.e. always agree with `fieldLayoutFor`), ONE trial of
+// 200,000 killed only 1 of 13 repeated process runs (~8%, some batches 0/10)
+// — slot reuse under this allocator is timing-sensitive enough that a single
+// giant churn is an unreliable oracle, and 1,000,000 in one trial killed 0/5.
+// 40 SMALLER trials in one process, by contrast, killed 40/40 process runs
+// (3/3 repeated) and 0/40 on the fixed compiler (3/3 repeated) — many
+// independent allocate/collect windows are what actually catches the timing,
+// not one large one. `collections > 0` below still asserts a collection
+// happened at all, so an oracle that silently stopped collecting cannot
+// read as a pass by having nothing to catch.
 //
 // THE ONLY GATE THAT RUNS `_tests_/bit/gcdecimalstress.bit`, wired into
 // `./make test` as `test-gc-decimalstress`.
@@ -44,7 +59,8 @@ import { parseInt, trimSpace, indexOf } from "std/strings"
 
 const defaultTimeoutS: int = 120
 const maxTimeoutMs: int = 6000000
-const churnIters: int = 200000
+const trialCount: int = 40
+const churnPerTrial: int = 5000
 
 fn requiredEnv(name: string): string {
   let v = env(name)
@@ -88,14 +104,19 @@ fn shQuote(s: string): string {
 // Same device as stringkeepalive.bit.
 const IS: string = "$" + "{"
 
-// The killer program. `churn` allocates `churnIters` more `Box.Ok` values —
-// same enum, same boxed-decimal size class as `v`'s — so a collector that
-// fails to trace `v`'s payload pointer frees its box into churn's own churn.
+// The killer program. `churn` allocates `churnPerTrial` more `Box.Ok` values
+// each trial — same enum, same boxed-decimal size class as `v`'s — so a
+// collector that fails to trace `v`'s payload pointer frees its box into
+// churn's own churn. `indirect` is the real call boundary `produce()` needs
+// (see the header for why a direct call is inlined and masks the bug).
 fn fixtureSrc(): string {
   return "enum Box { Ok(decimal), Err(string) }\n" +
     "fn produce(): Box {\n" +
     "  let d: decimal = 12.50\n" +
     "  return Box.Ok(d)\n" +
+    "}\n" +
+    "fn indirect(f: () => Box): Box {\n" +
+    "  return f()\n" +
     "}\n" +
     "fn churn(n: int): int {\n" +
     "  let t = 0\n  let i = 0\n" +
@@ -108,21 +129,28 @@ fn fixtureSrc(): string {
     "    }\n" +
     "    i = i + 1\n" +
     "  }\n  return t\n}\n" +
-    "fn main() {\n" +
-    "  let v = produce()\n" +
-    "  let junk = churn(" +
-    "${churnIters}" +
-    ")\n" +
+    "fn trial(n: int): bool {\n" +
+    "  let v = indirect(produce)\n" +
+    "  let junk = churn(n)\n" +
     "  match (v) {\n" +
-    "    Ok(d) => println(\"" +
-    IS +
-    "d} " +
-    IS +
-    "junk}\")\n" +
-    "    Err(_) => println(\"err " +
-    IS +
-    "junk}\")\n" +
+    "    Ok(d) => { return d == 12.50 }\n" +
+    "    Err(_) => { return false }\n" +
     "  }\n" +
+    "}\n" +
+    "fn main() {\n" +
+    "  let trials = " +
+    "${trialCount}" +
+    "\n  let bad = 0\n  let k = 0\n" +
+    "  while (k < trials) {\n" +
+    "    if (!trial(" +
+    "${churnPerTrial}" +
+    ")) {\n      bad = bad + 1\n    }\n" +
+    "    k = k + 1\n  }\n" +
+    "  println(\"bad=" +
+    IS +
+    "bad}/" +
+    IS +
+    "trials}\")\n" +
     "}\n"
 }
 
@@ -228,12 +256,13 @@ fn main() {
   if (exe == "") {
     exit(1)
   }
+  let wantOut = "bad=0/${trialCount}\n"
   // The default-collector run is the oracle: a small program never collects,
   // so this cannot see the bug either — it only proves the fixture itself is
   // correct before BIT_GC=stress is asked to agree with it.
   let want = runOne(e.dir, "default", shQuote(exe), "")
-  if (want.code != 0 || indexOf(want.out, "12.5") < 0) {
-    eprint("gcdecimalstress: FAIL default run — exit ${want.code}, stdout '${want.out}'\n${want.err}\n")
+  if (want.code != 0 || want.out != wantOut) {
+    eprint("gcdecimalstress: FAIL default run — exit ${want.code}, stdout '${want.out}' (want '${wantOut}')\n${want.err}\n")
     exit(1)
   }
   let str = runOne(
@@ -246,12 +275,12 @@ fn main() {
     exit(1)
   }
   if (collections == 0) {
-    eprint("gcdecimalstress: FAIL — BIT_GC=stress collected 0 times over ${churnIters} allocations; the oracle never ran\n")
+    eprint("gcdecimalstress: FAIL — BIT_GC=stress collected 0 times over ${trialCount * churnPerTrial} allocations; the oracle never ran\n")
     exit(1)
   }
-  if (str.code != 0 || str.out != want.out) {
-    eprint("gcdecimalstress: FAIL [BIT_GC=stress] — exit ${str.code} (want 0), stdout '${str.out}' (want '${want.out}') over ${collections} collection(s)\n${str.err}\n")
+  if (str.code != 0 || str.out != wantOut) {
+    eprint("gcdecimalstress: FAIL [BIT_GC=stress] — exit ${str.code} (want 0), stdout '${str.out}' (want '${wantOut}') over ${collections} collection(s)\n${str.err}\n")
     exit(1)
   }
-  println("gcdecimalstress: PASS — Box.Ok(12.50) survives default GC and BIT_GC=stress (${collections} collections, ${churnIters} churn allocations)")
+  println("gcdecimalstress: PASS — ${trialCount}/${trialCount} trials of Box.Ok(12.50) survived BIT_GC=stress (${collections} collections)")
 }
