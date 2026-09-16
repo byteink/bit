@@ -135,6 +135,33 @@ const acProbes = 4
 // literal, so the two cannot be written as one.
 let allocCacheBlock: [4096]i64
 
+// Nonzero once the heap lock has been found HELD by another thread, which is
+// the only condition this cache exists for and the only one in which it pays.
+//
+// A CACHE THAT IS ALWAYS ON IS A LOSS ON EVERY SINGLE-THREADED PROGRAM, and
+// that is measured rather than feared. The per-allocation cost of reaching an
+// entry is `gcThreadToken`, a cross-object call on every target since the
+// #3420 platform split (`./gcthread.bit` states that cost in full), plus the
+// hash and the probe; against an UNCONTENDED `spinAcquire`, which is one
+// successful compare-and-exchange, that trade is negative. Medians of 5
+// interleaved reps on this host, cache always on vs this tree:
+// `bench/cases/alloc` 0.227s -> 0.266s (+17%), `bench/cases/strings` 0.222 ->
+// 0.243 (+9%), `bench/cases/json` 0.301 -> 0.319 (+6%). Every one of those
+// programs is single-threaded, so every one of them was paying for a lock
+// nobody else wanted.
+//
+// ARMED BY THE EVIDENCE, NOT BY A COUNT OF THREADS. The first gate tried was
+// "more than one registered mutator", and it never fired: the runtime's
+// default worker pool registers several OS threads before `main` runs, so
+// every program in the list above still paid. A failed `spinTryAcquire` is the
+// exact event the cache removes, so it is what turns it on.
+//
+// MONOTONIC AND PROCESS-WIDE: it is never cleared, so a program that contends
+// once keeps the cache for the rest of its life. A plain word written with the
+// same value by any number of threads — the races are all benign, and a reader
+// that is late by a few allocations simply takes the lock a few more times.
+let allocCacheArmed: i64 = 0
+
 // This OS thread's entry address, or 0 when it can have none — before boot, on
 // a thread with no thread pointer, or when every probed entry belongs to
 // another live thread.
@@ -360,35 +387,29 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
 // 56. Computing it BEFORE the lock rather than after also shortens the critical
 // section — sound because `allocClassify` is pure: it reads no heap word, takes
 // no lock and mutates nothing (`runtime/alloc/classify.bit`).
+//
+// EVERY FRAME ON THE UNARMED PATH IS THE SAME ONE IT ALWAYS WAS, and that is
+// why the #5436 cache is written into this function rather than in front of it.
+// A first draft put the small path in its own `gcHeapAllocSmall` and the span
+// refill in a third function; the two extra call frames cost `bench/cases/alloc`
+// 0.224s -> 0.241s (+7.6%) and `bench/cases/strings` +6.7% on a workload that
+// never takes the cache at all. The take below is therefore INLINE here, as it
+// was before, and only the cold span-refill path is a call.
 @nosplit fn gcHeapAlloc(g: *i64, size: int, alignment: int, idx: int): int {
-  if (idx >= 0) {
-    return gcHeapAllocSmall(g, size, idx)
+  if (idx < 0) {
+    spinAcquire(heapLock(g))
+    let big = gcHeapAllocLargeLocked(g, size)
+    spinRelease(heapLock(g))
+    return big
   }
-  spinAcquire(heapLock(g))
-  let got = gcHeapAllocLargeLocked(g, size)
-  spinRelease(heapLock(g))
-  return got
-}
-
-// The small path, with the #5436 per-thread cache in front of the lock. The
-// lock-free arm is the whole of the fast path: a hit returns without touching
-// any word another thread can see except `heapLiveWord`, which is one atomic
-// add rather than an acquire, a critical section and a release.
-//
-// A MISS COSTS ONE REFILL, NOT ONE ALLOCATION. The same critical section that
-// serves this request also fills the cache, so a class in steady use reaches
-// the lock once per `acMaxBytes / size` allocations. `entry` is resolved BEFORE
-// the lock — `allocCacheEntry` reads the thread token and the table, neither of
-// which the heap lock protects, and doing it inside would put a cross-object
-// call in the critical section this function exists to shorten.
-//
-// The cache is skipped outright for a request that could not hold two slots
-// under the cap: a class that large is allocated rarely enough that its lock
-// traffic does not appear in a profile, and caching it would spend the whole
-// per-thread budget on one slot.
-@nosplit fn gcHeapAllocSmall(g: *i64, size: int, idx: int): int {
+  // The cache is skipped outright for a request that could not hold two slots
+  // under the cap: a class that large is allocated rarely enough that its lock
+  // traffic does not appear in a profile, and caching it would spend the whole
+  // per-thread budget on one slot. `entry` is resolved BEFORE the lock —
+  // nothing it reads is under the heap lock, and resolving it inside would put
+  // a cross-object call in the critical section this exists to shorten.
   let entry = 0
-  if (size * 2 <= acMaxBytes) {
+  if (allocCacheArmed != 0 && size * 2 <= acMaxBytes) {
     entry = allocCacheEntry(g)
     if (entry != 0) {
       let hit = allocCachePop(wordAt(entry), heapBlock(g), idx, size)
@@ -397,25 +418,32 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
       }
     }
   }
-  spinAcquire(heapLock(g))
-  let got = gcHeapAllocSmallLocked(g, size, idx)
+  // `spinAcquire`'s own first step, open-coded so a failed exchange — the exact
+  // event this cache removes — is what arms it. An uncontended acquire costs
+  // what it costs today: one successful compare-and-exchange.
+  let lk = heapLock(g)
+  if (!spinTryAcquire(lk)) {
+    allocCacheArmed = 1
+    spinAcquire(lk)
+  }
+  let got = heapTakeSmallLocked(heapBlock(g), idx, size)
+  if (got == 0) {
+    got = gcHeapRefillSmallLocked(g, size, idx)
+  }
   if (got != 0 && entry != 0) {
     allocCacheFillLocked(g, wordAt(entry), idx, size)
   }
-  spinRelease(heapLock(g))
+  spinRelease(lk)
   return got
 }
 
-// One small slot of class `idx`, refilling the class from the span cache, the
-// span free list or the reserve when it is empty. CALLER MUST HOLD
-// `heapLock(g)`, and still holds it on return — split out of `gcHeapAlloc`
-// unchanged when the cache above went in front of it, so that every comment
-// below still describes the one critical section it was written for.
-@nosplit fn gcHeapAllocSmallLocked(g: *i64, size: int, idx: int): int {
-  let addr = heapTakeSmallLocked(heapBlock(g), idx, size)
-  if (addr != 0) {
-    return addr
-  }
+// The class is empty: refill it from the span cache, the span free list or the
+// reserve, and take one slot out of the refilled class. CALLER MUST HOLD
+// `heapLock(g)`, and still holds it on return. Split out of `gcHeapAlloc` so
+// the take above stays inline in the caller (see its header) and so both stay
+// under E0201's 80-line limit; every comment below is the one it carried when
+// this was the tail of that one function.
+@nosplit fn gcHeapRefillSmallLocked(g: *i64, size: int, idx: int): int {
   // Class empty: try the #3045 span cache before the reserve. A reclaimed
   // span sitting there is address space that is already ours — resident,
   // owned, and unlinked from every class — so reusing it costs nothing the
