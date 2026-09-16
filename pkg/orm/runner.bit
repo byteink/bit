@@ -35,14 +35,28 @@
 //
 // 2. AN ADVISORY LOCK AROUND THE WHOLE RUN. `acquireLock` is the first
 //    statement `up`/`down` issue; `releaseLockBestEffort` is `defer`red
-//    immediately after, so it runs whether the run below succeeds or fails
-//    via `fail`/`?` — see SPEC §18.5: a `defer` runs on an ordinary early
-//    return, and only a `panic` skips it, the same distinction `std/sql`'s
-//    own `txValueAt` (`stdlib/sql/tx.bit`) draws for its rollback.
-//    HARDCODED TO POSTGRES' `pg_advisory_lock`/`pg_advisory_unlock` — the
-//    only `Dialect` this repo has (`postgres.bit`); `Dialect` itself has no
-//    lock/unlock method today, so a MySQL runner needs that interface
-//    widened first. Flagged here rather than guessed at.
+//    immediately after it succeeds, so it runs whether the run below
+//    succeeds or fails via `fail`/`?` — see SPEC §18.5: a `defer` runs on
+//    an ordinary early return, and only a `panic` skips it, the same
+//    distinction `std/sql`'s own `txValueAt` (`stdlib/sql/tx.bit`) draws
+//    for its rollback. `up`/`down` take `dialect: RunnerDialect` (below)
+//    instead of a bare `Dialect` now - `render` is the existing DDL
+//    renderer, unchanged; `server: ServerDialect` (`pkg/orm/data.bit`,
+//    #5384) is the fourth site the ticket named, previously hardcoded with
+//    no parameter at all. `acquireLock` MATCHES ON `dialect.server`:
+//    `Postgres` issues the real `pg_advisory_lock`; `Mysql(_)` REFUSES
+//    before any statement is sent, naming the gap, rather than sending
+//    `pg_advisory_lock` - a Postgres function name - to a server that has
+//    none. The two fields are NOT collapsed into one (reading the lock
+//    choice off `render`'s own concrete type): they answer different
+//    questions - "how do I render this migration's SQL" vs "which server
+//    locks it" - bundled into one class only because `bit lint`'s
+//    max-params finding refuses a sixth positional parameter on
+//    `up`/`down`, the identical "group them into a class" call
+//    `write.bit`'s own header already makes for `TableDesc`; a caller
+//    still states both facts explicitly, never one derived from the
+//    other. A working MySQL advisory lock (`GET_LOCK`) is unstarted,
+//    separate work.
 //
 // 3. ONE TRANSACTION PER MIGRATION, WHEN THE DIALECT LEAVES ONE TO USE.
 //    `applyMigration` renders a migration's ops, splits the result into the
@@ -127,6 +141,18 @@ export class RevertedMigration {
   export name: string,
 }
 
+// The two facts `up`/`down` need about the target server, bundled into one
+// parameter — see this file's header, piece 2, for why they are separate
+// fields rather than one derived from the other, and why they are bundled
+// at all (`bit lint`'s max-params finding, the same reasoning
+// `pkg/orm/write.bit`'s header gives for `TableDesc`). `render` is
+// unchanged from `up`/`down`'s prior bare `Dialect` parameter; `server`
+// (`pkg/orm/data.bit`'s `ServerDialect`, #5384) is new.
+export class RunnerDialect {
+  export render: Dialect,
+  export server: ServerDialect,
+}
+
 // This package's own advisory-lock namespace key (`pg_advisory_lock` takes a
 // bigint). Arbitrary, but must never change once shipped: two runner builds
 // that disagree on it would never see each other's lock, and a rolling
@@ -137,8 +163,8 @@ const advisoryLockKey: int = 584176068
 // Applies every migration in `migrations` not yet recorded in
 // `schema_history`, in ascending version order. See this file's header for
 // the checksum check and the transaction shape.
-export fn up(db: Data, dialect: Dialect, migrations: []Migration, at: Timestamp): UpReport! {
-  acquireLock(db)?
+export fn up(db: Data, dialect: RunnerDialect, migrations: []Migration, at: Timestamp): UpReport! {
+  acquireLock(db, dialect.server)?
   defer releaseLockBestEffort(db)
   ensureHistoryTable(db)?
   let history = loadHistory(db)?
@@ -146,7 +172,7 @@ export fn up(db: Data, dialect: Dialect, migrations: []Migration, at: Timestamp)
   let pending = pendingInOrder(migrations, history)
   let applied = []AppliedMigration(0)
   for m of pending {
-    applied = append(applied, applyMigration(db, dialect, m, at)?)
+    applied = append(applied, applyMigration(db, dialect.render, m, at)?)
   }
   return UpReport{ applied: applied }
 }
@@ -186,9 +212,9 @@ export fn sql(dialect: Dialect, migrations: []Migration, version: int): string! 
 // has already taken writes is a new numbered migration, because `down`
 // cannot un-drop a column that held data.
 export fn down(
-  db: Data, dialect: Dialect, migrations: []Migration, at: Timestamp, maxAgeNs: int,
+  db: Data, dialect: RunnerDialect, migrations: []Migration, at: Timestamp, maxAgeNs: int,
 ): RevertedMigration! {
-  acquireLock(db)?
+  acquireLock(db, dialect.server)?
   defer releaseLockBestEffort(db)
   let history = loadHistory(db)?
   let (last, found) = latestEntry(history)
@@ -204,7 +230,7 @@ export fn down(
     )
   }
   let m = findMigration(migrations, last.version)?
-  let stmts = renderOps(dialect, m.revert())
+  let stmts = renderOps(dialect.render, m.revert())
   let (transactional, nonTransactional) = splitByTransactional(stmts)
   runTransactionalBlock(db, transactional, (d) => {
     deleteHistory(d, m.version)?
@@ -307,10 +333,18 @@ fn execIgnoringError(db: Data, sqlText: string) {
   }
 }
 
-// `pg_advisory_lock` — the first statement `up`/`down` issue. See this
-// file's header, piece 2, for why this is Postgres-specific today.
-fn acquireLock(db: Data): ()! {
-  db.exec("select pg_advisory_lock($1)", [Value.Int(advisoryLockKey)])?
+// `pg_advisory_lock` on Postgres — the first statement `up`/`down` issue.
+// Refuses on MySQL, issuing nothing, rather than sending a Postgres-only
+// function name to a server that has none. See this file's header, piece 2.
+fn acquireLock(db: Data, dialect: ServerDialect): ()! {
+  match (dialect) {
+    Postgres => db.exec("select pg_advisory_lock($1)", [Value.Int(advisoryLockKey)])?
+    Mysql(_) => fail newError(
+        "pkg/orm: migrate: no MySQL advisory lock implementation yet (#5384) - " +
+        "up/down refuse rather than running unlocked or sending Postgres-only SQL " +
+        "to a MySQL server",
+    )
+  }
 }
 
 // `pg_advisory_unlock`, `defer`red right after `acquireLock` succeeds so it
