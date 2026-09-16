@@ -1,0 +1,207 @@
+// pkg/postgres/codec.bit — binary wire decoders for the scalar type table
+// (#3989), and `queryBinary`, the raw-bytes fetch every codec is proven
+// against (numeric.test.bit, codec.test.bit).
+//
+// BINARY WHERE A CODEC EXISTS, TEXT OTHERWISE (epic #3986). The normal query
+// path (query.bit/conn.bit) always asks Postgres for text, because Bind's
+// result-format codes are sent before Describe answers with the columns'
+// OIDs — there is no way to pick per-column binary/text without a second
+// round trip Postgres's own protocol does not avoid. `queryBinary` sidesteps
+// that by asking for binary on every result column, which only a caller who
+// already knows what it is decoding — a codec's own proof — can safely do:
+// a query whose column types are not all covered by a binary decoder below
+// would come back as bytes nothing here can read as text.
+//
+// EVERY SCALAR DECODER TAKES A COLUMN NAME so a caller — `codec.test.bit`,
+// or a future typed `Rows` accessor — can put it in an error, the same
+// contract `decodeNumeric` (numeric.bit) already keeps.
+
+// int2, int4, int8, float4, float8, bool, uuid, timestamptz OIDs
+// (`pg_type.typname`). `oidBytea` already exists in query.bit; not repeated
+// here.
+export const oidInt2: int = 21
+export const oidInt4: int = 23
+export const oidInt8: int = 20
+export const oidFloat4: int = 700
+export const oidFloat8: int = 701
+export const oidBool: int = 16
+export const oidText: int = 25
+export const oidVarchar: int = 1043
+export const oidBpchar: int = 1042
+export const oidTimestamp: int = 1114
+export const oidTimestamptz: int = 1184
+export const oidInet: int = 869
+
+// A signed N-byte big-endian integer at `off`, `width` bytes wide (2, 4 or
+// 8). Shared by every fixed-width scalar decoder below instead of one
+// hand-rolled loop per width.
+fn beSigned(body: string, off: int, width: int, column: string): int! {
+  let b = []byte(body)
+  if (off + width > len(b)) {
+    fail newError("postgres: column ${column}: truncated ${width}-byte value")
+  }
+  let u = 0
+  let i = 0
+  while (i < width) {
+    u = u * 256 + int(b[off + i])
+    i = i + 1
+  }
+  let signBit = 1
+  let j = 0
+  while (j < width - 1) {
+    signBit = signBit * 256
+    j = j + 1
+  }
+  signBit = signBit * 128
+  if (u >= signBit) {
+    return u - signBit * 2
+  }
+  return u
+}
+
+// `int2` (2 bytes), `int4` (4 bytes) and `int8` (8 bytes) all decode the
+// same way: a plain signed big-endian integer, no length prefix beyond the
+// DataRow column length already stripped by `decodeRowRaw`.
+export fn decodeInt2(body: string, column: string): int! {
+  return beSigned(body, 0, 2, column)?
+}
+
+export fn decodeInt4(body: string, column: string): int! {
+  return beSigned(body, 0, 4, column)?
+}
+
+export fn decodeInt8(body: string, column: string): int! {
+  return beSigned(body, 0, 8, column)?
+}
+
+// `bool`: exactly one byte, 0 or 1.
+export fn decodeBool(body: string, column: string): bool! {
+  if (len(body) != 1) {
+    fail newError("postgres: column ${column}: bool value is ${len(body)} bytes, want 1")
+  }
+  let b = []byte(body)
+  if (b[0] == 0) {
+    return false
+  }
+  if (b[0] == 1) {
+    return true
+  }
+  fail newError("postgres: column ${column}: bool value has byte ${int(b[0])}, want 0 or 1")
+}
+
+// `text`/`varchar`/`char`/`inet` (and every other type this driver has no
+// binary decoder for, per #3986's "text otherwise"): the bytes as sent,
+// unchanged. Postgres's binary format for these IS its text format, so the
+// same function reads a value requested either way — including `inet`,
+// which the type table maps to `string` rather than a decoded type.
+export fn decodeText(body: string, column: string): string! {
+  return body
+}
+
+// A `timestamp without time zone` column, refused: it stores a wall-clock
+// reading with no zone, so any `Instant` this returned would be invented.
+// Named after `column` and pointing at the fix, per #3989's constraint.
+export fn refuseTimestamp(column: string): ()! {
+  fail newError(
+      "postgres: column ${column} is timestamp without time zone, which has " +
+      "no zone to build an Instant from — use timestamptz, or read it as text",
+  )
+}
+
+// One `DataRow` column's raw bytes, format preserved (never re-wrapped in
+// `Value.Text` the way `decodeRow`, conn.bit, always does).
+class rawColumn {
+  bytes: string,
+  isNull: bool,
+}
+
+// `DataRow`'s columns as raw bytes. Same framing as `decodeRow` (conn.bit);
+// kept separate so the normal all-text query path is untouched by this file.
+fn decodeRowRaw(body: string): []rawColumn! {
+  let count = readBe16(body, 0)?
+  let out = []rawColumn(0)
+  let off = 2
+  let i = 0
+  while (i < count) {
+    let size = readBe32(body, off)?
+    off = off + 4
+    if (size == nullColumn) {
+      out = append(out, rawColumn{ bytes: "", isNull: true })
+      i = i + 1
+      continue
+    }
+    if (off + size > len(body)) {
+      fail newError("postgres: DataRow column ${i} runs past the message")
+    }
+    out = append(out, rawColumn{ bytes: body[off:off + size], isNull: false })
+    off = off + size
+    i = i + 1
+  }
+  return out
+}
+
+// A Bind frame requesting `resultFormat` for EVERY result column — the
+// protocol's own shorthand, "a count of 1 applies to all columns", and the
+// only way to ask for binary before Describe has said how many columns
+// there are. `query.bit`'s `bindFrame` always asks for text; this is a
+// sibling, not a replacement.
+fn bindFrameFormat(bound: []boundParam, resultFormat: int): string {
+  let body = cstr("") + cstr("") + be16(len(bound))
+  for p of bound {
+    body = body + be16(p.format)
+  }
+  body = body + be16(len(bound))
+  for p of bound {
+    body = body + paramField(p)
+  }
+  return frame("B", body + be16(1) + be16(resultFormat))
+}
+
+// Run one unnamed, unparameterized-or-not statement with every result
+// column requested in binary, and return its rows as raw bytes. This is
+// how every codec in this file and in `numeric.bit` is proven: real bytes
+// Postgres itself produced, decoded, and compared to that same server's
+// `::text` rendering of the same value (`numeric.test.bit`) — never bytes
+// this package encoded itself.
+export fn queryBinary(c: pgConn, sqlText: string, params: []Value): [][]rawColumn! {
+  let bound = bindAll(params)
+  let types = declaredTypes(bound)
+  let batch = parseFrame("", sqlText, types) +
+    bindFrameFormat(bound, fmtBinary) +
+    describeFrame() +
+    executeFrame() +
+    syncFrame()
+  c.s.writeAll(batch) catch e {
+    fail transportError(e.message())
+  }
+  return collectBinaryRows(c)?
+}
+
+// Read `DataRow`s to `ReadyForQuery`, raw. Split out of `queryBinary` so
+// that function stays one job (`bit lint`'s complexity ceiling).
+fn collectBinaryRows(c: pgConn): [][]rawColumn! {
+  let out = [][]rawColumn(0)
+  let failure: error = pgError{ severity: "", state: "", text: "" }
+  let failed = false
+  let seen = 0
+  while (seen < queryMessageBudget) {
+    seen = seen + 1
+    let m = c.r.next() catch e {
+      fail transportError(e.message())
+    }
+    if (m.tag == "Z") {
+      if (failed) {
+        fail failure
+      }
+      return out
+    }
+    if (m.tag == "D") {
+      out = append(out, decodeRowRaw(m.body)?)
+    }
+    if (m.tag == "E" && !failed) {
+      failed = true
+      failure = serverError(m.body)
+    }
+  }
+  fail transportError("the server sent ${queryMessageBudget} messages without reaching ReadyForQuery")
+}
