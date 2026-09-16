@@ -1,0 +1,176 @@
+// pkg/mysql/temporal.bit — DATE and TIME (#5453, epic #5449), sibling of
+// `codec.bit`'s `mysqlInstant`/`mysqlUuid` and `decimal.bit`'s
+// `mysqlDecimal`: same shape, same driver, new file because `binary.bit`'s
+// header already reserves `codec.bit` for the rest of the type table and
+// this ticket adds two more rows to it.
+//
+// BOTH PROTOCOLS PRODUCE THE SAME TEXT. A parameterless query stays on
+// COM_QUERY and the server renders every column as text of its own accord;
+// a bound query goes through COM_STMT_EXECUTE and comes back binary, but
+// `binary.bit`'s `temporalText`/`dateText`/`timeText` already turn DATE and
+// TIME's length-prefixed wire encoding (0/4/7/11 bytes for DATE, a sign
+// byte plus a day count for TIME) into the identical server-rendered text
+// MySQL's own `SELECT` would print — `"2026-09-11"`,
+// `"838:59:59.123456"`. So, exactly like `mysqlInstant` before it, this file
+// never touches wire bytes: it parses `Value.Text`, the same string either
+// protocol hands back.
+//
+// TIME IS A DURATION, NOT A CLOCK READING. MySQL's TIME spans -838:59:59 to
+// 838:59:59 — negative, and past 24 hours — neither of which `std/time.Time`
+// (hour 0..23, no sign) can hold. `mysqlTime` returns a plain `int` of
+// nanoseconds instead, the same duration idiom `std/time.Second`/`Hour`
+// already use (duration.bit, `pgInstant`'s own `offsetSeconds * Second`) —
+// not a package-local type, and not a second temporal vocabulary.
+//
+// THE ZERO DATE IS REFUSED, NOT GUESSED. `0000-00-00` is a real value MySQL
+// will store (outside strict mode, or with NO_ZERO_DATE off) and
+// `binary.bit`'s zero-length DATE decodes to exactly that text — but
+// `std/time.Date` has no year-0 value to represent it as (1..9999 AD only,
+// the same range `pkg/postgres/temporal.bit` already refuses `infinity`
+// against). Reading it as `None` would be worse: `None` already means SQL
+// NULL, and `0000-00-00` is a stored value, not the column's absence.
+import { Date } from "std/time"
+
+// `v` as text, naming `col` and `kind` in the failure. Reimplemented rather
+// than imported: `asText` is already imported once elsewhere in this module
+// (`codec.bit`), and a second `import { asText } from "std/sql"` here would
+// be a duplicate declaration (SPEC §17.1, per-module imports) — the same
+// reason `pkg/postgres/temporal.bit` reimplements its own `pgText`.
+fn myText(v: Value, col: string, kind: string): string! {
+  match (v) {
+    Text(s) => return s
+    _ => fail newError("mysql: column '${col}' is not a ${kind} value")
+  }
+}
+
+// The `count` ASCII digits at `s[start:start+count]`, as an int. Fails on a
+// non-digit or a string too short to hold them.
+fn myDigits(s: string, start: int, count: int, col: string): int! {
+  if (start + count > len(s)) {
+    fail newError("mysql: column '${col}': '${s}' is too short")
+  }
+  let n = 0
+  let i = 0
+  while (i < count) {
+    let c = s[start + i]
+    if (c < '0' || c > '9') {
+      fail newError("mysql: column '${col}': '${s}' has a non-digit where a digit was expected")
+    }
+    n = n * 10 + (int(c) - 48)
+    i = i + 1
+  }
+  return n
+}
+
+// `s`'s leading `YYYY-MM-DD`, as (year, month, day). Fixed-width: every DATE
+// this driver decodes, binary or text, zero-pads the year to 4 digits and
+// the month/day to 2 (`binary.bit`'s `pad`, MySQL's own text rendering).
+fn myParseDate(s: string, col: string): (int, int, int)! {
+  if (len(s) < 10 || s[4] != '-' || s[7] != '-') {
+    fail newError("mysql: column '${col}': '${s}' is not a DATE (want YYYY-MM-DD)")
+  }
+  let year = myDigits(s, 0, 4, col)?
+  let month = myDigits(s, 5, 2, col)?
+  let day = myDigits(s, 8, 2, col)?
+  return (year, month, day)
+}
+
+// `date`, from a DATE column named `col`.
+export fn mysqlDate(col: string, v: Value): Date! {
+  let s = myText(v, col, "DATE")?
+  if (s == "0000-00-00") {
+    fail newError("mysql: column '${col}': '0000-00-00' has no date to represent")
+  }
+  let (year, month, day) = myParseDate(s, col)?
+  return date(year, month, day) catch e {
+    fail newError("mysql: column '${col}': ${e.message()}")
+  }
+}
+
+// As `mysqlDate`, but a SQL NULL decodes to `None` rather than failing — the
+// shape every nullable-column accessor in this package follows. A
+// `0000-00-00` value still fails: it is a stored value, not an absent one.
+export fn mysqlOptDate(col: string, v: Value): Option<Date>! {
+  if (isNull(v)) {
+    return Option<Date>.None
+  }
+  return Option<Date>.Some(mysqlDate(col, v)?)
+}
+
+// `s[start:]`'s leading digits up to (not including) the next `:`, as
+// (value, the offset of the `:`). TIME's hour field is 2 or 3 digits — up to
+// 838 — so, unlike `YYYY-MM-DD`'s fixed width, this scans rather than
+// assumes a length.
+fn myHourField(s: string, start: int, col: string): (int, int)! {
+  let i = start
+  while (i < len(s) && s[i] != ':') {
+    i = i + 1
+  }
+  if (i == start || i >= len(s)) {
+    fail newError("mysql: column '${col}': '${s}' is not a TIME (want [-]H+:MM:SS)")
+  }
+  let hours = myDigits(s, start, i - start, col)?
+  return (hours, i)
+}
+
+// An optional `.` and 1..6 fractional-second digits at `s[pos:]`, as
+// nanoseconds — `binary.bit`'s `microText` always sends exactly 6 when
+// present, but this reads a variable count so server-rendered text (which
+// this file also parses) is never assumed to match it exactly.
+fn myFraction(s: string, pos: int, col: string): int! {
+  if (pos >= len(s)) {
+    return 0
+  }
+  if (s[pos] != '.') {
+    fail newError("mysql: column '${col}': '${s}' has trailing characters after the seconds field")
+  }
+  let start = pos + 1
+  let end = start
+  while (end < len(s) && s[end] >= '0' && s[end] <= '9') {
+    end = end + 1
+  }
+  let digits = end - start
+  if (digits == 0 || digits > 6 || end != len(s)) {
+    fail newError("mysql: column '${col}': '${s}' has a malformed fractional second")
+  }
+  let frac = myDigits(s, start, digits, col)?
+  let scale = 1
+  let pad = 6 - digits
+  let k = 0
+  while (k < pad) {
+    scale = scale * 10
+    k = k + 1
+  }
+  return frac * scale * 1000
+}
+
+// TIME, as the signed duration in nanoseconds it names — `mysqlTime`'s own
+// header explains why this is `int`, never `std/time.Time`.
+export fn mysqlTime(col: string, v: Value): int! {
+  let s = myText(v, col, "TIME")?
+  let neg = len(s) > 0 && s[0] == '-'
+  let start = 0
+  if (neg) {
+    start = 1
+  }
+  let (hours, colonAt) = myHourField(s, start, col)?
+  if (colonAt + 6 > len(s) || s[colonAt + 3] != ':') {
+    fail newError("mysql: column '${col}': '${s}' is not a TIME (want [-]H+:MM:SS)")
+  }
+  let minutes = myDigits(s, colonAt + 1, 2, col)?
+  let seconds = myDigits(s, colonAt + 4, 2, col)?
+  let nanos = myFraction(s, colonAt + 6, col)?
+  let total = (hours * 3600 + minutes * 60 + seconds) * 1000000000 + nanos
+  if (neg) {
+    return 0 - total
+  }
+  return total
+}
+
+// As `mysqlTime`, but a SQL NULL decodes to `None` rather than failing.
+export fn mysqlOptTime(col: string, v: Value): Option<int>! {
+  if (isNull(v)) {
+    return Option<int>.None
+  }
+  return Option<int>.Some(mysqlTime(col, v)?)
+}

@@ -1,0 +1,348 @@
+// pkg/mysql/json.bit — JSON (#5453, epic #5449), sibling of `temporal.bit`
+// and `codec.bit`'s `mysqlInstant`: same shape, same driver.
+//
+// TWO SERVERS, TWO WIRE SHAPES, ONE VALUE. MySQL 5.7+ has a native `JSON`
+// type with its own binary representation; MariaDB has none — `JSON` there
+// is `LONGTEXT` with a CHECK constraint (`servers.md`'s own words), so it
+// crosses the wire as ordinary text through `binary.bit`'s ordinary
+// length-encoded-string fallthrough, exactly like a VARCHAR. Decoding
+// MariaDB's text as MySQL's binary tag format would produce garbage that
+// looks like a parse bug — the trap this file exists to avoid.
+//
+// DETECTION IS BY CONTENT, NOT `serverInfo.family`, AND THAT IS THE
+// STRONGER TEST. Family alone is not enough: `conn.bit`'s `query` only
+// reaches the binary protocol when the statement has bound parameters
+// (COM_STMT_PREPARE/EXECUTE) — a parameterless query stays on COM_QUERY,
+// and COM_QUERY renders every column as the server's own TEXT, MySQL
+// included. So a genuine MySQL `JSON` column is binary-tagged bytes on one
+// query shape and plain rendered text on the other, and `family ==
+// "MySQL"` cannot tell those apart. What CAN: MySQL's binary tag format's
+// first byte is always one of a small fixed set (0x00-0x0C, 0x0F) — small
+// object, large object, small array, large array, literal, the six numeric
+// widths, string, or opaque — and every one of those is below the lowest
+// byte any JSON text can legally start with (`{`, `[`, `"`, a digit, `-`,
+// `t`, `f`, `n`, all >= 0x22). Reading the bytes in front of you is a
+// stronger signal than which server they came from.
+//
+// THE BINARY FORMAT ITSELF (undocumented publicly, stable since 5.7,
+// reverse-engineered independently by every binlog-reading client this
+// driver's author has read the source of): a container (object or array)
+// opens with its own type byte, an element count and a total byte size (2
+// bytes each for "small", 4 bytes each for "large" — MySQL picks large only
+// once a small container's offsets would not fit in 16 bits), then, for an
+// object, one (key-offset, key-length) pair per key, then one
+// (value-type, value) entry per element. A value that fits in the offset
+// field's own width (a literal, or an integer narrow enough) is stored
+// INLINE, right there in the entry; anything wider is a byte OFFSET, always
+// counted from the start of the immediately enclosing container, to where
+// the full value lives in that container's trailing data. Recursing on an
+// offset is exactly the same decode this file starts a document with.
+import { Json, JsonEntry, jsonParse } from "std/json"
+
+// The binary tag format's type bytes (MySQL's own `enum_json_types`,
+// undocumented but stable since 5.7.8).
+const jbSmallObject: int = 0
+const jbLargeObject: int = 1
+const jbSmallArray: int = 2
+const jbLargeArray: int = 3
+const jbLiteral: int = 4
+const jbInt16: int = 5
+const jbUint16: int = 6
+const jbInt32: int = 7
+const jbUint32: int = 8
+const jbInt64: int = 9
+const jbUint64: int = 10
+const jbDouble: int = 11
+const jbStringType: int = 12
+const jbOpaque: int = 15
+
+// A LITERAL's inline byte: JSON null, true or false.
+const jbLiteralNull: int = 0
+const jbLiteralTrue: int = 1
+const jbLiteralFalse: int = 2
+
+// How many containers deep this file will recurse before refusing rather
+// than exhausting the stack on a corrupt or adversarial document — the same
+// bound `std/json`'s own decoder holds itself to (`jsonMaxDecodeDepth`,
+// decode.bit), independently declared here because this file decodes
+// containers of its OWN format, not `std/json`'s CST.
+const jbMaxDepth: int = 128
+
+// `v` as text, naming `col` in the failure. `myText` (temporal.bit, same
+// module) already does exactly this; reused rather than duplicated.
+fn myJsonText(v: Value, col: string): string! {
+  return myText(v, col, "JSON")?
+}
+
+// `data[lo:to]`, bounds-checked. Every raw slice in this file goes
+// through this rather than Bit's own `[a:b]`, so a truncated or corrupt
+// document fails naming the column instead of panicking mid-decode.
+fn jbSlice(data: string, lo: int, to: int, col: string): string! {
+  if (lo < 0 || to < lo || to > len(data)) {
+    fail newError("mysql: column '${col}': a JSON value's binary encoding reads past its own bytes")
+  }
+  return data[lo:to]
+}
+
+// The value of a JSON column named `col`. Detects MySQL's binary tag format
+// by its leading byte (this file's header) and falls back to
+// `std/json.jsonParse` on ordinary text — MariaDB always, and MySQL itself
+// whenever the query stayed on the text protocol.
+export fn mysqlJson(col: string, v: Value): Json! {
+  let s = myJsonText(v, col)?
+  if (looksBinary(s)) {
+    return jbTopLevel(s, col)?
+  }
+  return jsonParse(s) catch e {
+    fail newError("mysql: column '${col}': ${e.message()}")
+  }
+}
+
+// As `mysqlJson`, but a SQL NULL decodes to `None` rather than failing.
+export fn mysqlOptJson(col: string, v: Value): Option<Json>! {
+  if (isNull(v)) {
+    return Option<Json>.None
+  }
+  return Option<Json>.Some(mysqlJson(col, v)?)
+}
+
+// Whether `s` opens with one of MySQL's binary tag bytes rather than a
+// character any JSON text could start with (this file's header explains
+// why this, not `serverInfo.family`, is the test).
+fn looksBinary(s: string): bool {
+  if (len(s) == 0) {
+    return false
+  }
+  let b = int(s[0])
+  return (b >= jbSmallObject && b <= jbStringType) || b == jbOpaque
+}
+
+// The whole document: a container at the top, or — MySQL 5.7.22+ — a bare
+// scalar, stored as its type byte followed directly by that type's own
+// full-width encoding (never inlined; there is no entry to inline it into).
+fn jbTopLevel(s: string, col: string): Json! {
+  let tag = int(s[0])
+  if (isContainerType(tag)) {
+    return jbContainer(s, col, 0)?
+  }
+  return jbValueAt(s, 1, tag, col, 0)?
+}
+
+fn isContainerType(tag: int): bool {
+  return tag == jbSmallObject || tag == jbLargeObject || tag == jbSmallArray || tag == jbLargeArray
+}
+
+// One object or array: `data[0]` is its own type byte. `depth` is this
+// container's nesting depth, checked once on entry so a pathological
+// document fails rather than recursing without bound.
+fn jbContainer(data: string, col: string, depth: int): Json! {
+  if (depth >= jbMaxDepth) {
+    fail newError("mysql: column '${col}': JSON nests more than ${jbMaxDepth} containers deep")
+  }
+  if (len(data) < 1) {
+    fail newError("mysql: column '${col}': an empty JSON container")
+  }
+  let tag = int(data[0])
+  let isObject = tag == jbSmallObject || tag == jbLargeObject
+  let small = tag == jbSmallObject || tag == jbSmallArray
+  let offW = 4
+  if (small) {
+    offW = 2
+  }
+  let c = cursor{ s: data, at: 1 }
+  let count = c.int(offW)?
+  c.int(offW)? // total size in bytes; not needed for decode, offsets are self-sufficient
+  let keys = jbReadKeys(c, isObject, count, col)?
+  let entries = jbReadValueEntries(c, count, offW, col)?
+  let ctx = jbCtx{ data: data, small: small, col: col, depth: depth }
+  return jbAssemble(ctx, isObject, keys, entries)?
+}
+
+// The four values every value-entry decode needs, bundled so
+// `jbAssemble`/`jbEntryValue` stay under the 5-parameter lint ceiling
+// (`spec/LINT.md`) instead of threading `data`/`small`/`col`/`depth`
+// through each call individually.
+class jbCtx { data: string, small: bool, col: string, depth: int }
+
+// One (key-offset, key-length) pair per member, object only; `[]jbKeyRef(0)`
+// for an array, since arrays have no keys to read.
+class jbKeyRef { off: int, klen: int }
+
+fn jbReadKeys(c: cursor, isObject: bool, count: int, col: string): []jbKeyRef! {
+  let out = []jbKeyRef(0)
+  if (!isObject) {
+    return out
+  }
+  let i = 0
+  while (i < count) {
+    let off = c.int(4)?
+    let klen = c.int(2)?
+    out = append(out, jbKeyRef{ off: off, klen: klen })
+    i = i + 1
+  }
+  return out
+}
+
+// One (type, inline-or-offset) entry per element. The entry's own field
+// width is `offW`; whether it holds the value inline or a pointer to it
+// depends on the type and is decided at assembly time, once the container's
+// own byte range (needed to resolve a pointer) is in hand.
+class jbValueEntry { kind: int, raw: string }
+
+fn jbReadValueEntries(c: cursor, count: int, offW: int, col: string): []jbValueEntry! {
+  let out = []jbValueEntry(0)
+  let i = 0
+  while (i < count) {
+    let kind = c.int(1)?
+    let raw = c.take(offW)?
+    out = append(out, jbValueEntry{ kind: kind, raw: raw })
+    i = i + 1
+  }
+  return out
+}
+
+// KEY-OFFSET IS 4 BYTES EVEN IN A "SMALL" OBJECT. Only the count/size
+// header fields and the value entries' own offset field shrink to 2 bytes
+// under the small format — a key's offset is always stored as uint32,
+// which is why `jbReadKeys` above reads `c.int(4)` unconditionally while
+// `jbReadValueEntries` takes `offW` from its caller.
+fn jbAssemble(ctx: jbCtx, isObject: bool, keys: []jbKeyRef, entries: []jbValueEntry): Json! {
+  if (isObject) {
+    let out = []JsonEntry(0)
+    let i = 0
+    while (i < len(entries)) {
+      let k = keys[i]
+      let key = jbSlice(ctx.data, k.off, k.off + k.klen, ctx.col)?
+      let value = jbEntryValue(ctx, entries[i])?
+      out = append(out, JsonEntry{ key: key, value: value })
+      i = i + 1
+    }
+    return Json.JsonObject(out)
+  }
+  let out = []Json(0)
+  let i = 0
+  while (i < len(entries)) {
+    out = append(out, jbEntryValue(ctx, entries[i])?)
+    i = i + 1
+  }
+  return Json.JsonArray(out)
+}
+
+// One value entry's `Json`: decoded straight from its inline bytes when the
+// type fits the entry's own width, otherwise read from the offset those
+// bytes name, counted from `ctx.data`'s own start.
+fn jbEntryValue(ctx: jbCtx, e: jbValueEntry): Json! {
+  if (jbInlineable(e.kind, ctx.small)) {
+    return jbInlineValue(e.raw, e.kind, ctx.col)?
+  }
+  let offset = intOfWidth(e.raw, true)?
+  return jbValueAt(ctx.data, offset, e.kind, ctx.col, ctx.depth)?
+}
+
+// A literal is always inline (one byte fits any entry width); INT16/UINT16
+// fit a "small" (2-byte) entry exactly and a "large" (4-byte) one with room
+// to spare; INT32/UINT32 need the full 4 bytes a "large" entry has and a
+// "small" one does not.
+fn jbInlineable(kind: int, small: bool): bool {
+  if (kind == jbLiteral || kind == jbInt16 || kind == jbUint16) {
+    return true
+  }
+  return !small && (kind == jbInt32 || kind == jbUint32)
+}
+
+// An inline entry's own `offW` raw bytes, narrowed to the type's true width
+// before decoding — the trailing bytes of a "large" entry inlining an
+// INT16 are padding, not part of the value.
+fn jbInlineValue(raw: string, kind: int, col: string): Json! {
+  if (kind == jbLiteral) {
+    return jbLiteralValue(int(raw[0]), col)?
+  }
+  if (kind == jbInt16) {
+    return Json.JsonInt(intOfWidth(raw[0:2], false)?)
+  }
+  if (kind == jbUint16) {
+    return Json.JsonInt(intOfWidth(raw[0:2], true)?)
+  }
+  if (kind == jbInt32) {
+    return Json.JsonInt(intOfWidth(raw[0:4], false)?)
+  }
+  return Json.JsonInt(intOfWidth(raw[0:4], true)?)
+}
+
+fn jbLiteralValue(b: int, col: string): Json! {
+  if (b == jbLiteralNull) {
+    return Json.JsonNull
+  }
+  if (b == jbLiteralTrue) {
+    return Json.JsonBool(true)
+  }
+  if (b == jbLiteralFalse) {
+    return Json.JsonBool(false)
+  }
+  fail newError("mysql: column '${col}': an unrecognized JSON literal byte ${b}")
+}
+
+// A value stored at `pos` in its own full-width encoding — never inlined,
+// since only `jbEntryValue` inlines anything, and it already returned
+// before reaching here.
+fn jbValueAt(data: string, pos: int, kind: int, col: string, depth: int): Json! {
+  if (isContainerType(kind)) {
+    return jbContainer(jbSlice(data, pos, len(data), col)?, col, depth + 1)?
+  }
+  if (kind == jbLiteral) {
+    return jbLiteralValue(int(jbSlice(data, pos, pos + 1, col)?[0]), col)?
+  }
+  if (kind == jbInt16 || kind == jbUint16) {
+    return Json.JsonInt(intOfWidth(jbSlice(data, pos, pos + 2, col)?, kind == jbUint16)?)
+  }
+  if (kind == jbInt32 || kind == jbUint32) {
+    return Json.JsonInt(intOfWidth(jbSlice(data, pos, pos + 4, col)?, kind == jbUint32)?)
+  }
+  return jbValueAtWide(data, pos, kind, col)?
+}
+
+// The four widest scalar types, split out of `jbValueAt` to keep it under
+// the complexity ceiling (`spec/LINT.md`).
+fn jbValueAtWide(data: string, pos: int, kind: int, col: string): Json! {
+  if (kind == jbInt64 || kind == jbUint64) {
+    return Json.JsonInt(intOfWidth(jbSlice(data, pos, pos + 8, col)?, kind == jbUint64)?)
+  }
+  if (kind == jbDouble) {
+    return Json.JsonFloat(bitsToFloat(u64FromLe(jbSlice(data, pos, pos + 8, col)?)))
+  }
+  if (kind == jbStringType) {
+    return jbStringAt(data, pos, col)?
+  }
+  fail newError("mysql: column '${col}': JSON contains an OPAQUE sub-value (type ${kind}), which this driver does not decode yet")
+}
+
+// A STRING value: MySQL's own variable-length count (base-128, 7 bits per
+// byte, continuation in the high bit — the format's own length prefix, NOT
+// the wire protocol's length-encoded integer from `wire.bit`), then that
+// many raw bytes. No escaping to undo: an embedded `"` is a plain byte
+// here, unlike in JSON TEXT.
+fn jbStringAt(data: string, pos: int, col: string): Json! {
+  let c = cursor{ s: data, at: pos }
+  let n = jbVarLen(c, col)?
+  return Json.JsonString(c.take(n)?)
+}
+
+// The format's own variable-length integer: up to 5 bytes of 7 bits each,
+// least-significant group first, continuation flagged by the top bit.
+//
+// Bounded by 5 iterations — the most a 32-bit length ever needs.
+fn jbVarLen(c: cursor, col: string): int! {
+  let result = 0
+  let shift = 0
+  let i = 0
+  while (i < 5) {
+    let b = c.int(1)?
+    result = result + (b & 127) * twoPow(shift)
+    if ((b & 128) == 0) {
+      return result
+    }
+    shift = shift + 7
+    i = i + 1
+  }
+  fail newError("mysql: column '${col}': a JSON string's length prefix exceeds 5 bytes")
+}
