@@ -19,7 +19,7 @@ import {
   Postgres,
   Query,
   RelationLoader,
-  UpsertDialect,
+  ServerDialect,
   attach,
   detach,
   find,
@@ -151,7 +151,7 @@ one:
 
 ```bit
 fn addTags(db: Data, postId: i64, tagIds: []i64): ()! {
-  attach(db, postTagsDesc(), postId, tagIds, UpsertDialect.Postgres)?
+  attach(db, postTagsDesc(), postId, tagIds, ServerDialect.Postgres)?
 }
 
 fn removeTags(db: Data, postId: i64, tagIds: []i64): ()! {
@@ -159,7 +159,7 @@ fn removeTags(db: Data, postId: i64, tagIds: []i64): ()! {
 }
 
 fn setTags(db: Data, postId: i64, tagIds: []i64): ()! {
-  sync(db, postTagsDesc(), postId, tagIds, UpsertDialect.Postgres)?
+  sync(db, postTagsDesc(), postId, tagIds, ServerDialect.Postgres)?
 }
 ```
 
@@ -170,9 +170,14 @@ join table's composite primary key doing the work: on Postgres, `attach`
 renders `on conflict (post_id, tag_id) do nothing`; on MySQL it renders `on
 duplicate key update post_id = post_id`, a self-assignment that changes no
 column and only ever fires on the pair's own key conflict. Both take
-`dialect: UpsertDialect` explicitly because nothing reaching `Data` carries
-a server dialect today (#5384) - the same reason `write.bit`'s `upsert`
-takes one. `attach` never uses `INSERT IGNORE`: that clause suppresses
+`dialect: ServerDialect` explicitly because nothing reaching `Data` carries
+a server dialect (#5384 settled this: it never will) - the same package-wide
+type `write.bit`'s `upsert` and `lock.bit`'s `forUpdate` also take. Neither
+`attach` nor `sync` reads the `MysqlVersion` that `ServerDialect.Mysql`
+carries - `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` is a syntax choice, not
+a version-gated one, so a MySQL call here supplies a version this file never
+looks at, cheaper than a separate version-less type just for these two
+functions. `attach` never uses `INSERT IGNORE`: that clause suppresses
 every insert error on the statement, not just a duplicate key, so a
 genuine foreign-key or `NOT NULL` violation would be silently dropped along
 with the duplicate it was meant to catch, turning a real bug into a pair
@@ -189,7 +194,7 @@ remove at a time - wants `sync`: it runs `attach`'s idempotent insert for
 the given set, then one `delete ... where post_id = $1 and tag_id not in
 (...)` removing anything else already attached. That's one insert and one
 delete, never a statement per tag and never a prior `SELECT` to compute the
-difference. `sync(db, postTagsDesc(), postId, []i64(0), UpsertDialect.Postgres)`
+difference. `sync(db, postTagsDesc(), postId, []i64(0), ServerDialect.Postgres)`
 is the one path in this file that clears a post's tags entirely - reached
 only by calling `sync` with an empty set, never through `detach`.
 
@@ -216,4 +221,4 @@ carries its own data - see "The honest boundary" above.
 `with()`/eager-loading vocabulary this page builds on. [Schema](schema.md)
 and [Dialect](dialect.md) cover the `SchemaOp`/`Table.primaryKey`
 vocabulary `manyToManyTable` uses and the DDL it renders to. [Write](write.md)
-covers `UpsertDialect` and why it stays a separate type from `Dialect`.
+covers `ServerDialect` and why it stays a separate type from `Dialect`.

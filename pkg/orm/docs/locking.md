@@ -16,12 +16,12 @@ what happens to it."
 import {
   Data,
   LockCause,
-  LockDialect,
   LockError,
   LockOpts,
   LockedQuery,
   MysqlVersion,
   Query,
+  ServerDialect,
   find,
   forUpdate,
 } from "orm"
@@ -43,7 +43,7 @@ fn pendingJobs(db: Data): Query<Job> {
 }
 
 fn claimOneJob(db: Data): Option<Job>! {
-  let job = pendingJobs(db).limit(1).forUpdate(LockOpts{}, LockDialect.Neutral).one()?
+  let job = pendingJobs(db).limit(1).forUpdate(LockOpts{}, ServerDialect.Postgres).one()?
   match (job) {
     Some(j) => {
       db.exec(
@@ -98,7 +98,9 @@ free, right now:
 
 ```bit
 fn claimUpTo(db: Data, n: int): LockedQuery<Job> {
-  return forUpdate<Job>(pendingJobs(db).limit(n), LockOpts{ skipLocked: true }, LockDialect.Neutral)
+  return forUpdate<Job>(
+    pendingJobs(db).limit(n), LockOpts{ skipLocked: true }, ServerDialect.Postgres,
+  )
 }
 
 fn claimBatch(db: Data, n: int): []Job! {
@@ -173,7 +175,7 @@ statements are sent to the database, so there is nothing to undo.
 
 ```bit
 fn pendingCountLocked(db: Data): i64! {
-  return forUpdate<Job>(pendingJobs(db), LockOpts{}, LockDialect.Neutral).count()?
+  return forUpdate<Job>(pendingJobs(db), LockOpts{}, ServerDialect.Postgres).count()?
 }
 
 fn pendingCount(db: Data): i64! {
@@ -201,20 +203,25 @@ pick one answer to "what happens when the row is already locked," not both.
 
 ### SKIP LOCKED and NOWAIT need MySQL 8.0
 
-Nothing reaching `Data` carries a server version today (#5384), so
-`forUpdate`'s third argument, `dialect: LockDialect`, is how you supply it -
-`LockDialect.Neutral` for Postgres or MySQL 8+ (every example above uses
-this; `lockClause` alone is already correct for both), `LockDialect.
-Mysql(version)` for anything targeting MySQL. `LockedQuery`'s own `guard()`
-checks `version` before building any SQL, the same "zero statements issued
-on a refusal" guarantee the transaction check above gives:
+Nothing reaching `Data` carries a server version (#5384 settled this: `Data`
+stays a bare alias to `Executor`, never a wrapper this package would have to
+populate), so `forUpdate`'s third argument, `dialect: ServerDialect`, is how
+you supply it - `ServerDialect.Postgres` (every example above uses this;
+`lockClause` alone is already correct for Postgres), `ServerDialect.
+Mysql(version)` for anything targeting MySQL. There is no third option that
+skips stating a MySQL version: an earlier shape had a `Neutral` tag that also
+covered MySQL 8.0+ with no version check, and it is gone, not renamed - a
+caller targeting MySQL states its real version on every call, every time,
+and `LockedQuery`'s own `guard()` checks `version` before building any SQL,
+the same "zero statements issued on a refusal" guarantee the transaction
+check above gives:
 
 ```bit
 fn claimBatchOnMysql(db: Data, n: int, version: MysqlVersion): []Job! {
   let jobs = forUpdate<Job>(
     pendingJobs(db).limit(n),
     LockOpts{ skipLocked: true },
-    LockDialect.Mysql(version),
+    ServerDialect.Mysql(version),
   ).all()?
   for j of jobs {
     db.exec(
@@ -233,11 +240,17 @@ reaches the driver:
 pkg/orm: MySQL 5.7 does not support FOR UPDATE SKIP LOCKED (added in MySQL 8.0); omit skipLocked or upgrade the server
 ```
 
-Pass `LockDialect.Neutral` against a MySQL server older than 8.0 instead of
-`Mysql(version)`, and the failure comes back from the driver - a SQL syntax
-error, not this typed `LockError`: `Neutral` means "render the
-dialect-neutral clause unconditionally," never "this is Postgres." Postgres
-should always pass `Neutral` - it has no version gate to check.
+This is a behavior change from an earlier version of `forUpdate` (#5384):
+that version let a MySQL caller pass a dialect tag that meant "trust me,
+this server is 8.0 or newer" and skipped the check entirely - asserting a
+fact about the server with no evidence behind it. That tag is gone.
+Every MySQL call states its real version now, checked on every `forUpdate`,
+not just remembered once and trusted forever - a caller who was relying on
+the old bypass now supplies a `MysqlVersion` (typically read from the
+driver's own connection info at startup, not hand-typed per call) instead
+of asserting one. Postgres has no version gate to check either way, so it
+always passes the plain `ServerDialect.Postgres` tag, with nothing to get
+wrong.
 
 ## When not to use this
 
@@ -261,4 +274,4 @@ statement that would look like it worked while protecting nothing - see
 [Data](data.md) covers `Pool.tx`/`Pool.txValue<T>` and why the closure
 parameter should shadow the outer handle. [MySQL](mysql.md) covers the
 other places Postgres and MySQL diverge, including the version gate
-`LockDialect.Mysql(version)` closes here.
+`ServerDialect.Mysql(version)` closes here.
