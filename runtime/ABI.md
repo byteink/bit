@@ -4275,16 +4275,19 @@ access on most targets permits the reordering the edge exists to forbid:
 
 **Why the GC-safety exception in SPEC.md §13.7 is precise, not hand-waved.**
 §5's root scan trusts a stack slot's or register's declared shape at a
-safepoint — it does not re-validate that a slice's `ptr` and `len` (or an
-interface's `type` and `data`) were written together. A racing, non-atomic
-write to a GC-traced multiword field can leave exactly such a torn value
-sitting in a live slot; if a safepoint (§5) lands while it is there, the
-collector scans it as if it were well-formed. This is the concrete mechanism
-behind SPEC.md §13.7's claim that a composite-value race — never a
-single-word one — is the one way otherwise-safe Bit code can reach real
-memory-unsafety, and it is exactly why the audit in §22 above only needed to
-reason about *runtime*-internal state: user Bit code gets no such audit for
-free, which is the whole reason §13.7 and this section exist.
+safepoint — it does not re-validate that a slice's `ptr` and `len` (or a
+reference-holding class's own fields) were written together. A racing,
+non-atomic write to a GC-traced multiword field can leave exactly such a
+torn value sitting in a live slot; if a safepoint (§5) lands while it is
+there, the collector scans it as if it were well-formed. An interface value
+is not an example of this today — it is one word, the receiver's object
+pointer (§2.1, SPEC §14.3), so it carries no `type`/`data` pair to tear.
+This is the concrete mechanism behind SPEC.md §13.7's claim that a
+composite-value race — never a single-word one — is the one way
+otherwise-safe Bit code can reach real memory-unsafety, and it is exactly
+why the audit in §22 above only needed to reason about *runtime*-internal
+state: user Bit code gets no such audit for free, which is the whole reason
+§13.7 and this section exist.
 
 ## 24. CPU sampling profiler (`runtime/root/darwin/prof.bit`, #1906)
 

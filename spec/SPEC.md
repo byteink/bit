@@ -3452,23 +3452,25 @@ buggy:
   value a racing reader sees is unspecified - that is the race itself, and the
   fix is always one of the edges above, not this guarantee.
 - A racing access to a value **wider than one word** - a class assigned as a
-  whole, a slice header `{ptr, len, cap}`, a `string` header `{ptr, len}`, an
-  interface value `{type, data}`, or a multi-return tuple - **can tear**: a
-  reader can observe a mix of words from different writes (e.g. one write's
-  `ptr` paired with another write's `len`). A torn ordinary value is a **logic
-  bug** (wrong length, wrong bounds-check outcome, a stale-but-well-typed
-  field) - Bit's usual safety nets (bounds checks, `nil` checks) still run
-  against whatever was actually read, so this alone does not corrupt memory.
+  whole, a slice header `{ptr, len, cap}`, a `string` header `{ptr, len}`, or a
+  multi-return tuple - **can tear**: a reader can observe a mix of words from
+  different writes (e.g. one write's `ptr` paired with another write's `len`).
+  A torn ordinary value is a **logic bug** (wrong length, wrong bounds-check
+  outcome, a stale-but-well-typed field) - Bit's usual safety nets (bounds
+  checks, `nil` checks) still run against whatever was actually read, so this
+  alone does not corrupt memory. An interface value is one word today - the
+  receiver's object pointer, its type reached through the header rather than
+  carried in the value (§14.3) - so it falls under the guarantee above, not
+  this one; it would join this list only if interface values become a fat
+  `{type, data}` pair, which they are not today (`runtime/ABI.md` §2.1).
 - The one exception: if a torn **GC-traced** multiword value (a slice, string,
-  interface, or reference-holding class) is what a root scan observes live in
-  a stack slot or register at a safepoint (ABI.md §5), the collector trusts
-  that slot's declared shape - a `data` pointer paired with a mismatched
-  `type` tag from a torn interface, or a `ptr` paired with a mismatched `len`,
-  can violate the collector's precision. This is the one way a race in
-  otherwise-safe Bit code can reach real memory-unsafety. It is rare (a
-  safepoint must land inside the torn window) but real, exactly as in Go, and
-  it is why a race on a shared composite value is never "just a data bug to
-  shrug off."
+  or reference-holding class) is what a root scan observes live in a stack slot
+  or register at a safepoint (ABI.md §5), the collector trusts that slot's
+  declared shape - a `ptr` paired with a mismatched `len` can violate the
+  collector's precision. This is the one way a race in otherwise-safe Bit code
+  can reach real memory-unsafety. It is rare (a safepoint must land inside the
+  torn window) but real, exactly as in Go, and it is why a race on a shared
+  composite value is never "just a data bug to shrug off."
 
 Channels and `std/sync` (`Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics) are
 the race-free coordination tools; the raw `*T` pointer and its atomic builtins
