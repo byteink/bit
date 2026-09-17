@@ -350,6 +350,62 @@ fn main() {
     fail=1
   fi
 
+  # --- #5521: void-ok return drops its dead operand ---
+  #
+  # Real dump text (`bit --dump-ir-pre` on both the pinned stage0 and this
+  # tree), not hand-tuned: `func writeNode()` off the actual
+  # _tests_/cases/run_return_unit_fallible.bit fixture #5521 added. The
+  # oracle still carries the un-fixed `return other()?` shape (`ret %0`);
+  # this tree drops the operand (`ret`) and nothing else in the function
+  # differs.
+  oracle_5521_pre='func writeNode() void {
+bb0():
+  %0 = call @other() void
+  %1 = rt_call err_get() error
+  %2 = const_nil
+  %3 = icmp_ne bool %1, %2
+  br %3, bb1(), bb2()
+bb1():
+  %5 = rt_call err_set(%1) void
+  ret
+bb2():
+  %7 = const_nil
+  %8 = rt_call err_set(%7) void
+  ret %0
+}'
+  bit2_5521_pre='func writeNode() void {
+bb0():
+  %0 = call @other() void
+  %1 = rt_call err_get() error
+  %2 = const_nil
+  %3 = icmp_ne bool %1, %2
+  br %3, bb1(), bb2()
+bb1():
+  %5 = rt_call err_set(%1) void
+  ret
+bb2():
+  %7 = const_nil
+  %8 = rt_call err_set(%7) void
+  ret
+}'
+  sig5521=$(explainMismatch "$oracle_5521_pre" "$bit2_5521_pre" ir)
+  rc5521=$?
+  if [ "$rc5521" -ne 0 ] || [ "$sig5521" != "5521-void-return-bare-ret" ]; then
+    echo "FAIL: the real #5521 void-return delta was not explained (rc=$rc5521 sig='$sig5521')"
+    fail=1
+  fi
+
+  # REJECTION: a SECOND, unrelated line change alongside the same `ret %0` ->
+  # `ret` drop must not be explained -- the identity requires exactly one
+  # differing line, never "this shape plus anything else".
+  bit2_5521_plus="${bit2_5521_pre/rt_call err_set(%7) void/rt_call err_set(%9) void}"
+  sig5521p=$(explainMismatch "$oracle_5521_pre" "$bit2_5521_plus" ir)
+  rc5521p=$?
+  if [ "$rc5521p" -eq 0 ] || [ -n "$sig5521p" ]; then
+    echo "FAIL: a #5521 delta carrying a second, unrelated line change was wrongly explained (rc=$rc5521p sig='$sig5521p')"
+    fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
