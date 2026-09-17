@@ -622,6 +622,92 @@ explainMismatch() {
         exit 0
       }
 
+      # --- #5506: the NIL PAYLOAD WORD of a no-payload variant, retyped from
+      # `i64` to the type the exploded read-back reads it at
+      # (`buildEnumObj`/`enumNilPayloadType`, compiler/lowerlayout.bit +
+      # compiler/lowerexplode.bit) ---
+      #
+      # Runs LAST, immediately before the regression verdict, so it can never
+      # claim a file one of the signatures above already explains.
+      #
+      # Like the #5486 reorder block it works on the CANONICALIZED LINE
+      # MULTISET rather than an opcode histogram, because these files also
+      # carry the #5486 reorder and a histogram cannot tell the two apart. Here
+      # the multisets are NOT equal: what is checked is that their symmetric
+      # difference contains nothing but the lines this one transform moves.
+      #
+      # PRE-OPT (`kind == "ir"`), the strict arm: every line the oracle has and
+      # this tree does not must be `const_int i64 0` — the hardcoded nil word —
+      # and every line this tree has and the oracle does not must be that same
+      # ZERO in another type: `const_nil` for a reference slot, `const_float
+      # <t> 0`, `const_bool false`, or `const_int <t> 0` for a narrower int.
+      # `const_int i64 0` is deliberately NOT accepted on the added side: an
+      # i64 payload word retypes to the identical line and so never appears in
+      # the difference at all, which leaves the pattern free to refuse a gained
+      # i64 zero as the regression it would be. The two counts must BALANCE
+      # exactly — measured on all 21 pre-opt diverging files of this tree
+      # (`bash scripts/selfhost-diffir.sh` before this signature existed), from
+      # 1 site up to the 42 in stdlib/json/value.bit (25 const_nil, 11 const_float,
+      # 6 const_bool) against 42 const_int i64 0.
+      #
+      # POST-OPT, the weaker arm, and its weakness stated rather than implied:
+      # once the store and the load agree, `forwardOneLoad` answers the load
+      # and the box DIES, so the difference also carries that footprint: one
+      # `gc_alloc size=16 ptrs=[%] <enum>`, its two
+      # `field_set`s at [0] and [8], and up to one read back of each of those
+      # two words. The counts are tied to the allocation count (two stores per
+      # dead box, never more reads than boxes), which is what refuses a
+      # half-deleted box, but the SHAPE is not unique to `buildEnumObj`: a bug
+      # that deleted a LIVE payload-carrying box of the same 16-byte
+      # one-pointer layout would present the same way and be explained. That
+      # gap is real. It is bounded by the pre-opt arm above, which admits
+      # nothing but the constant, and by `test-golden`/`test-selfcheck`, which
+      # run the deleted-box programs; this signature is evidence about the
+      # TRANSFORM, never about the box being dead.
+      #
+      # The mutation control (flip `Op.Sub` to `Op.Add` in compiler/lower.bit
+      # `binOpFor`) changes a `sub` line into an `add` line: neither is in
+      # either pattern set, so the symmetric difference is non-empty in a shape
+      # no arm accepts and every such file still fails. Recorded on #5506.
+      ok5506 = 1
+      Nci5506 = 0; Nadd5506 = 0; Ng5506 = 0
+      Nfs0_5506 = 0; Nfs8_5506 = 0; Nfg5506 = 0
+      for (k5506 in cntA5486) {
+        d5506 = cntA5486[k5506] - cntB5486[k5506]
+        if (d5506 <= 0) { continue }
+        if (k5506 ~ /^[[:space:]]*% = const_int i64 0$/) { Nci5506 += d5506; continue }
+        if (kind == "ir") { ok5506 = 0; continue }
+        if (k5506 ~ /^[[:space:]]*% = gc_alloc size=16 ptrs=\[%\] /) { Ng5506 += d5506; continue }
+        if (k5506 ~ /^[[:space:]]*field_set %\[0\] = %$/) { Nfs0_5506 += d5506; continue }
+        if (k5506 ~ /^[[:space:]]*field_set %\[8\] = %$/) { Nfs8_5506 += d5506; continue }
+        if (k5506 ~ /^[[:space:]]*% = field_get %\[[08]\] /) { Nfg5506 += d5506; continue }
+        ok5506 = 0
+      }
+      for (k5506 in cntB5486) {
+        d5506 = cntB5486[k5506] - cntA5486[k5506]
+        if (d5506 <= 0) { continue }
+        if (k5506 ~ /^[[:space:]]*% = const_nil$/ ||
+            k5506 ~ /^[[:space:]]*% = const_bool false$/ ||
+            k5506 ~ /^[[:space:]]*% = const_float [^ ]+ 0$/ ||
+            (k5506 ~ /^[[:space:]]*% = const_int [^ ]+ 0$/ &&
+             k5506 !~ /^[[:space:]]*% = const_int i64 0$/)) {
+          Nadd5506 += d5506
+          continue
+        }
+        ok5506 = 0
+      }
+      if (kind == "ir") {
+        ok5506 = (ok5506 && Nadd5506 > 0 && Nci5506 == Nadd5506)
+      } else {
+        ok5506 = (ok5506 && Nfs0_5506 == Ng5506 && Nfs8_5506 == Ng5506 &&
+                  Nfg5506 <= Ng5506 && Nci5506 <= Ng5506 &&
+                  Ng5506 + Nadd5506 > 0)
+      }
+      if (ok5506) {
+        print "5506-enum-nil-payload-retype"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
