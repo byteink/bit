@@ -1,0 +1,206 @@
+// pkg/yaml/anchor.bit — yaml module, anchor/alias resolution under the
+// package's expansion budget (#5497, epic #1482). `value.bit` and
+// `scan.bit` are siblings in this same flat module (pkg/README.md).
+//
+// THE ATTACK. YAML lets a node be named (`&a`) and referenced (`*a`).
+// Because an alias may point at an anchor that itself contains aliases,
+// expansion is MULTIPLICATIVE: nine anchors each referencing the previous
+// one nine times is 9 levels of 9-ary nesting, and the node count the last
+// level stands for is 9^9 — 387,420,489 — from well under a kilobyte of
+// source (`value.bit`'s own `maxAliasExpansions` comment does the exact
+// arithmetic). This file is the only place in the package that resolves an
+// alias, so it is the only place that can stop that multiplication.
+//
+// A DOCUMENT-WIDE RUNNING BUDGET, NOT A PER-NODE ONE. `AnchorTable` carries
+// `aliasExpansions`/`totalNodes` as mutable state that accumulates across
+// every `yamlAnchorResolve` call for the whole document — never reset per
+// anchor, per call, or per node — because a cap that resets cannot bound a
+// multiplicative total. Both counters are checked against `YamlLimits`
+// (`value.bit`, #5491): this file reads that budget, it never invents its
+// own number.
+//
+// COUNTING NODES, NOT JUST RESOLUTIONS, AND WHY BOTH ARE BOUNDED WORK.
+// `yamlAnchorResolve` never deep-copies the value stored under an anchor —
+// it hands back the same object, so resolving an alias costs this table
+// only a shared reference, not new memory. What it DOES cost, and what a
+// caller that goes on to walk or re-serialize the substituted tree WOULD
+// pay in full, is however many nodes that subtree logically stands for —
+// which for a chained alias is the very count the attack multiplies. This
+// file charges that cost up front, at resolve time, via `countMaterialized`
+// below: a walk that aborts the instant the running total would exceed the
+// budget remaining, rather than ever completing a full walk of a subtree
+// the multiplication has made enormous. That early abort is what keeps
+// resolving deep into a bomb bounded, exactly as cheap as the budget it is
+// bounded by, however many levels the document still has left to offer —
+// `anchor.test.bit`'s bomb proves this by timing it.
+//
+// UNDEFINED AND RECURSIVE ANCHORS ARE THE SAME CHECK, ON PURPOSE. `Yaml`
+// (value.bit) has no alias arm: an alias is resolved and substituted before
+// the value containing it is ever built, so a caller can only reach
+// `yamlAnchorDefine(t, name, ...)` for `name` once every alias inside that
+// value has already resolved successfully. An anchor that references
+// itself (`&a [*a]`) therefore always tries to resolve `a` before `a`'s own
+// `yamlAnchorDefine` call has happened — indistinguishable, at this table,
+// from `a` never having been defined at all. No separate recursion check is
+// needed or added; the ordering this table requires makes one impossible to
+// reach without the other already having failed.
+//
+// NO TYPE-DRIVEN CONSTRUCTION. This file resolves names to already-built
+// `Yaml` values; it has no notion of a YAML type indicator at all, so there
+// is no path here from untrusted input to selecting or constructing a type.
+
+// One document's anchor table: the most recent `Yaml` recorded under each
+// anchor name, plus the two running budgets `yamlAnchorResolve` charges
+// against for the whole document (see this file's header).
+export class AnchorTable {
+  entries: map<string, Yaml>,
+  aliasExpansions: i64,
+  totalNodes: i64,
+}
+
+// A fresh table for one document: no anchors defined yet, both running
+// budgets at zero.
+export fn newAnchorTable(): AnchorTable {
+  return AnchorTable{ entries: map<string, Yaml>(), aliasExpansions: 0, totalNodes: 0 }
+}
+
+// Records `node` — already fully resolved, with no unresolved alias inside
+// it (see this file's header) — under `name`. YAML permits an anchor name
+// to be redefined later in a document; a later alias always takes the most
+// recent definition, so this simply overwrites any earlier entry.
+export fn yamlAnchorDefine(t: AnchorTable, name: string, node: Yaml): ()! {
+  if (len(name) == 0) {
+    fail newError("yaml: anchor name must not be empty")
+  }
+  t.entries[name] = node
+}
+
+// The outcome of walking a `Yaml` subtree to price a `yamlAnchorResolve`
+// call: `count` nodes visited, `ok` when the whole subtree fit inside the
+// budget it was walked with, and `depthExceeded` distinguishing a nesting
+// failure from a node-count failure so the caller can name the right limit.
+// Unexported: internal to this file's counting, never returned to a caller.
+class CountResult { count: i64, ok: bool, depthExceeded: bool }
+
+fn countFail(): CountResult {
+  return CountResult{ count: 0, ok: false, depthExceeded: false }
+}
+
+fn countDepthFail(): CountResult {
+  return CountResult{ count: 0, ok: false, depthExceeded: true }
+}
+
+// Exactly one node: the scalar arms of `Yaml` (`YamlNull`/`YamlBool`/
+// `YamlInt`/`YamlFloat`/`YamlString`) have no children to recurse into.
+fn countLeaf(budget: i64): CountResult {
+  if (budget < 1) {
+    return countFail()
+  }
+  return CountResult{ count: 1, ok: true, depthExceeded: false }
+}
+
+// `items`'s own sequence node, plus every element, each charged against
+// whatever budget remains after its predecessors — so a violation partway
+// through stops the walk immediately rather than finishing it.
+fn countChildren(items: []Yaml, budget: i64, depth: i64, maxDepth: i64): CountResult {
+  let total: i64 = 1
+  if (total > budget) {
+    return countFail()
+  }
+  let i = 0
+  while (i < len(items)) {
+    let r = countMaterialized(items[i], budget - total, depth + 1, maxDepth)
+    if (!r.ok) {
+      return r
+    }
+    total = total + r.count
+    if (total > budget) {
+      return countFail()
+    }
+    i = i + 1
+  }
+  return CountResult{ count: total, ok: true, depthExceeded: false }
+}
+
+// One mapping entry: its key, then its value, each charged in turn against
+// whatever budget the previous one left.
+fn countPair(e: YamlEntry, budget: i64, depth: i64, maxDepth: i64): CountResult {
+  let kr = countMaterialized(e.key, budget, depth, maxDepth)
+  if (!kr.ok) {
+    return kr
+  }
+  let vr = countMaterialized(e.value, budget - kr.count, depth, maxDepth)
+  if (!vr.ok) {
+    return vr
+  }
+  return CountResult{ count: kr.count + vr.count, ok: true, depthExceeded: false }
+}
+
+// `entries`'s own mapping node, plus every key/value pair.
+fn countEntries(entries: []YamlEntry, budget: i64, depth: i64, maxDepth: i64): CountResult {
+  let total: i64 = 1
+  if (total > budget) {
+    return countFail()
+  }
+  let i = 0
+  while (i < len(entries)) {
+    let r = countPair(entries[i], budget - total, depth, maxDepth)
+    if (!r.ok) {
+      return r
+    }
+    total = total + r.count
+    if (total > budget) {
+      return countFail()
+    }
+    i = i + 1
+  }
+  return CountResult{ count: total, ok: true, depthExceeded: false }
+}
+
+// Walks `y`, pricing every node it and its descendants stand for against
+// `budget`, bounded to `maxDepth` nesting levels — `depth` is the level `y`
+// itself sits at, 1 for whatever `yamlAnchorResolve` is charging. An alias
+// chain is depth too (this file's ticket): a value stored under one anchor
+// and then aliased into another may already carry nesting from an earlier
+// expansion, so this checks `y`'s own depth on every call, not only at the
+// document's top level. Recursion here is bounded by `maxDepth` itself (at
+// most `YamlLimits.maxDepth`, 128 by default) — never by `y`'s size, which
+// is exactly the quantity this function exists to bound instead of trust.
+fn countMaterialized(y: Yaml, budget: i64, depth: i64, maxDepth: i64): CountResult {
+  if (depth > maxDepth) {
+    return countDepthFail()
+  }
+  match (y) {
+    YamlSequence(items) => return countChildren(items, budget, depth, maxDepth)
+    YamlMapping(entries) => return countEntries(entries, budget, depth, maxDepth)
+    _ => return countLeaf(budget)
+  }
+}
+
+// Resolves `name` to the `Yaml` most recently defined under it, charging
+// the whole-document running budgets in `t` against `limits` (see this
+// file's header for why both are checked and why neither resets). Fails
+// naming whichever single limit was hit: `maxAliasExpansions` before doing
+// any walk (so a call that was always going to be refused for its own sake
+// never pays for counting), then `maxDepth` or `maxTotalNodes`, whichever
+// `countMaterialized` reports first.
+export fn yamlAnchorResolve(t: AnchorTable, name: string, limits: YamlLimits): Yaml! {
+  let (node, found) = t.entries[name]
+  if (!found) {
+    fail newError("yaml: alias references undefined anchor '${name}'")
+  }
+  if (t.aliasExpansions + 1 > limits.maxAliasExpansions) {
+    fail newError("yaml: alias '${name}' exceeds maxAliasExpansions limit of ${limits.maxAliasExpansions}")
+  }
+  let remaining = limits.maxTotalNodes - t.totalNodes
+  let r = countMaterialized(node, remaining, 1, limits.maxDepth)
+  if (!r.ok) {
+    if (r.depthExceeded) {
+      fail newError("yaml: alias '${name}' exceeds maxDepth limit of ${limits.maxDepth}")
+    }
+    fail newError("yaml: alias '${name}' materializes past maxTotalNodes limit of ${limits.maxTotalNodes}")
+  }
+  t.aliasExpansions = t.aliasExpansions + 1
+  t.totalNodes = t.totalNodes + r.count
+  return node
+}
