@@ -1,0 +1,494 @@
+// Bit toml package — lex.bit, the flat streaming lexer over TOML text
+// (TOML 1.0.0, #5480, epic #1481).
+//
+// Same four rules stdlib/json/lex.bit's header states and paid for, carried
+// over unchanged:
+// 1. FLAT, NOT RECURSIVE — nesting is a push/pop depth counter, never
+//    recursion, so a maliciously deep input yields an `Invalid` token
+//    instead of a stack overflow.
+// 2. RAW SPANS, NOT DECODED VALUES — a token carries `start`/`end` byte
+//    offsets into the source. Escapes are not decoded and numeric/date-time
+//    grammar is not enforced here; later files own that.
+// 3. TWO ENTRY POINTS, ONE GRAMMAR — `lex(src)` materializes `[]Token` for
+//    callers wanting random access (the tests). `lexNext(l)` advances an
+//    in-place `Lexer` whose current token is read off its own
+//    `kind`/`start`/`end` fields, for a caller (the parser, a later ticket)
+//    that never looks backwards and so never pays a `gc_alloc` per token —
+//    see stdlib/json/lex.bit:26-34 for the measured cost this avoids. A
+//    class is a heap object in Bit, so materializing one `Token` per token
+//    is one allocation per token held live for the whole parse.
+//    `scanToken` is the only function that builds a `Token`, so the two
+//    entry points cannot drift apart. Neither `Lexer` nor `lexNext` is
+//    exported: `pkg/toml/` is one flat module (pkg/README.md), so a sibling
+//    file in this same package — the parser — reaches them without an
+//    import, the same way `stdlib/json/lex.bit`'s `Lexer`/`lexNext` are
+//    unexported and used in-module by `parse.bit`.
+// 4. NO REGEX, NO GENERATED TABLES — a lexer is a loop.
+//
+// TOML-specific facts this scanner differs from JSON's on: newlines are
+// SIGNIFICANT and are emitted as `Newline`, not skipped as whitespace; `#`
+// runs to end of line and is emitted as `Comment`, never swallowed; `[[` is
+// two `LBracket` tokens, the parser decides what they mean; a bare key is
+// `A-Za-z0-9_-`; a multi-line string's leading newline (if any) is part of
+// its span — stripping it is the string decoder's job, not this scanner's;
+// an unquoted value starting with four digits then `-`, or two digits then
+// `:`, scans as one `DateTime` span, unvalidated; a raw control character
+// other than tab inside a string is `Invalid`.
+
+// The lexical categories a TOML token can be.
+export enum TokenKind {
+  BareKey,
+  BasicString,
+  LiteralString,
+  MlBasicString,
+  MlLiteralString,
+  Number,
+  Bool,
+  DateTime,
+  Dot,
+  Equals,
+  Comma,
+  LBracket,
+  RBracket,
+  LBrace,
+  RBrace,
+  Newline,
+  Comment,
+  Eof,
+  Invalid,
+}
+
+// One lexical token: its kind and its `[start, end)` byte span in the
+// source, raw and unnormalized — quotes, backslashes and opener/closer
+// characters are all included exactly as written.
+export class Token { export kind: TokenKind, export start: int, export end: int }
+
+// Combined `[`/`{` nesting limit, mirrored from stdlib/json/lex.bit's
+// `jsonMaxDepth`: the open that would create the next level past this is
+// rejected as `Invalid` instead of tracked, so the lexer's own counter never
+// grows past this fixed bound. TOML's parser (a later ticket) has not been
+// measured yet, so this is carried over unchanged rather than re-derived —
+// re-measure inside a `spawn` (stdlib/json/lex.bit's own comment explains
+// why) before relying on the exact number.
+export const tomlMaxDepth = 128
+
+// The scanner's state, plus the token it most recently produced
+// (`kind`/`start`/`end`). Carrying the current token in the state is what
+// lets a caller drive `lexNext` without allocating — see this file's header.
+class Lexer { src: string, i: int, depth: int, kind: TokenKind, start: int, end: int }
+
+// A scanner positioned before `source`'s first token. `kind` is `Eof` until
+// the first `lexNext`, matching what an empty source yields, so a caller
+// reading the cursor before scanning sees "no token", never garbage.
+fn newLexer(source: string): Lexer {
+  return Lexer{ src: source, i: 0, depth: 0, kind: TokenKind.Eof, start: 0, end: 0 }
+}
+
+fn isDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+fn isAlpha(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn isBareKeyChar(c: u8): bool {
+  return isAlpha(c) || isDigit(c) || c == '_' || c == '-'
+}
+
+fn isBareKeyStart(c: u8): bool {
+  return isAlpha(c) || c == '_'
+}
+
+fn isNumberStart(c: u8): bool {
+  return isDigit(c) || c == '+' || c == '-'
+}
+
+// TOML's control-character rule: any raw byte below 0x20 other than tab, or
+// DEL (0x7F), is invalid inside a string.
+fn isTomlControlChar(c: u8): bool {
+  return (c < 0x20 && c != '\t') || c == 0x7F
+}
+
+// The multi-line variant of `isTomlControlChar`: the newlines a multi-line
+// string is explicitly allowed to embed (`\n`, `\r`) are not violations here.
+fn isMlControlChar(c: u8): bool {
+  return isTomlControlChar(c) && c != '\n' && c != '\r'
+}
+
+// Whether `lx.i` sits on three consecutive `q` bytes — used both to detect a
+// multi-line string's triple-quote opener and to find its closer.
+fn atTripleQuote(lx: Lexer, q: u8): bool {
+  return lx.i + 2 < len(lx.src) &&
+    lx.src[lx.i] == q &&
+    lx.src[lx.i + 1] == q &&
+    lx.src[lx.i + 2] == q
+}
+
+// Records `[start, end)` as the current token without touching the cursor.
+fn setTok(lx: Lexer, k: TokenKind, start: int, end: int) {
+  lx.kind = k
+  lx.start = start
+  lx.end = end
+}
+
+// Advances the cursor by `n` and records the token `[start, start+n)`.
+fn emit(lx: Lexer, start: int, n: int, k: TokenKind) {
+  lx.i = start + n
+  setTok(lx, k, start, start + n)
+}
+
+// `[`/`{`: enforces `tomlMaxDepth`, recording `Invalid` (without opening a
+// new level) once the counter already sits at the cap.
+fn scanOpen(lx: Lexer, k: TokenKind) {
+  let start = lx.i
+  if (lx.depth >= tomlMaxDepth) {
+    emit(lx, start, 1, TokenKind.Invalid)
+    return
+  }
+  lx.depth = lx.depth + 1
+  emit(lx, start, 1, k)
+}
+
+// `]`/`}`: pops one level; never goes negative on an unmatched closer.
+fn scanClose(lx: Lexer, k: TokenKind) {
+  let start = lx.i
+  if (lx.depth > 0) {
+    lx.depth = lx.depth - 1
+  }
+  emit(lx, start, 1, k)
+}
+
+// A `\n` or `\r\n` line ending, emitted as its own token: TOML newlines
+// terminate a key/value pair, so they are significant rather than skippable
+// whitespace.
+fn scanNewline(lx: Lexer) {
+  let start = lx.i
+  if (lx.src[lx.i] == '\r' && lx.i + 1 < len(lx.src) && lx.src[lx.i + 1] == '\n') {
+    emit(lx, start, 2, TokenKind.Newline)
+    return
+  }
+  emit(lx, start, 1, TokenKind.Newline)
+}
+
+// `#` to end of line, the line ending itself excluded, emitted as `Comment`
+// rather than swallowed so a later comment-preserving layer needs no forked
+// scanner.
+fn scanComment(lx: Lexer) {
+  let start = lx.i
+  lx.i = lx.i + 1
+  while (lx.i < len(lx.src) && lx.src[lx.i] != '\n' && lx.src[lx.i] != '\r') {
+    lx.i = lx.i + 1
+  }
+  setTok(lx, TokenKind.Comment, start, lx.i)
+}
+
+// A `"`-delimited single-line string span, quotes included, escapes left
+// raw and un-decoded. A `\` always protects the byte after it from ending
+// the string, mirroring stdlib/json/lex.bit's `scanString`. A raw control
+// character (other than tab) or an unterminated string reports `Invalid`,
+// consuming through the offending byte so the next call always makes
+// forward progress.
+fn scanBasicString(lx: Lexer) {
+  let start = lx.i
+  lx.i = lx.i + 1
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    if (c == '"') {
+      lx.i = lx.i + 1
+      setTok(lx, TokenKind.BasicString, start, lx.i)
+      return
+    }
+    if (isTomlControlChar(c)) {
+      lx.i = lx.i + 1
+      setTok(lx, TokenKind.Invalid, start, lx.i)
+      return
+    }
+    if (c == '\\' && lx.i + 1 < len(lx.src)) {
+      lx.i = lx.i + 2
+    } else {
+      lx.i = lx.i + 1
+    }
+  }
+  setTok(lx, TokenKind.Invalid, start, lx.i)
+}
+
+// A `'`-delimited single-line string span, quotes included. Literal strings
+// have no escape mechanism (TOML 1.0.0 §Strings), so unlike
+// `scanBasicString` a `\` is just an ordinary content byte. Control
+// characters and an unterminated string are handled the same way.
+fn scanLiteralString(lx: Lexer) {
+  let start = lx.i
+  lx.i = lx.i + 1
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    if (c == '\'') {
+      lx.i = lx.i + 1
+      setTok(lx, TokenKind.LiteralString, start, lx.i)
+      return
+    }
+    if (isTomlControlChar(c)) {
+      lx.i = lx.i + 1
+      setTok(lx, TokenKind.Invalid, start, lx.i)
+      return
+    }
+    lx.i = lx.i + 1
+  }
+  setTok(lx, TokenKind.Invalid, start, lx.i)
+}
+
+// A `"""`-delimited multi-line string span, opener and closer included. A
+// newline immediately after the opener is part of this span; stripping it
+// is the string decoder's job, not this scanner's (TOML 1.0.0 §Strings). A
+// `\` always protects the byte after it, same as `scanBasicString`, so an
+// escaped `"""` inside the body cannot close it early.
+fn scanMlBasicString(lx: Lexer) {
+  let start = lx.i
+  lx.i = lx.i + 3
+  while (lx.i < len(lx.src)) {
+    if (atTripleQuote(lx, '"')) {
+      lx.i = lx.i + 3
+      setTok(lx, TokenKind.MlBasicString, start, lx.i)
+      return
+    }
+    let c = lx.src[lx.i]
+    if (c == '\\' && lx.i + 1 < len(lx.src)) {
+      lx.i = lx.i + 2
+      continue
+    }
+    if (isMlControlChar(c)) {
+      lx.i = lx.i + 1
+      setTok(lx, TokenKind.Invalid, start, lx.i)
+      return
+    }
+    lx.i = lx.i + 1
+  }
+  setTok(lx, TokenKind.Invalid, start, lx.i)
+}
+
+// A `'''`-delimited multi-line string span, opener and closer included. No
+// escape mechanism, same as `scanLiteralString`.
+fn scanMlLiteralString(lx: Lexer) {
+  let start = lx.i
+  lx.i = lx.i + 3
+  while (lx.i < len(lx.src)) {
+    if (atTripleQuote(lx, '\'')) {
+      lx.i = lx.i + 3
+      setTok(lx, TokenKind.MlLiteralString, start, lx.i)
+      return
+    }
+    let c = lx.src[lx.i]
+    if (isMlControlChar(c)) {
+      lx.i = lx.i + 1
+      setTok(lx, TokenKind.Invalid, start, lx.i)
+      return
+    }
+    lx.i = lx.i + 1
+  }
+  setTok(lx, TokenKind.Invalid, start, lx.i)
+}
+
+// Whether an unquoted value starting at `lx.i` opens with four digits then
+// `-` — a full date, TOML 1.0.0's date-time grammar (RFC 3339).
+fn isDateStart(lx: Lexer): bool {
+  let n = len(lx.src)
+  return lx.i + 4 < n &&
+    isDigit(lx.src[lx.i]) &&
+    isDigit(lx.src[lx.i + 1]) &&
+    isDigit(lx.src[lx.i + 2]) &&
+    isDigit(lx.src[lx.i + 3]) &&
+    lx.src[lx.i + 4] == '-'
+}
+
+// Whether an unquoted value starting at `lx.i` opens with two digits then
+// `:` — a bare local time, TOML 1.0.0's date-time grammar (RFC 3339).
+fn isTimeStart(lx: Lexer): bool {
+  let n = len(lx.src)
+  return lx.i + 2 < n &&
+    isDigit(lx.src[lx.i]) &&
+    isDigit(lx.src[lx.i + 1]) &&
+    lx.src[lx.i + 2] == ':'
+}
+
+// Whether an unquoted value at `lx.i` is the start of a TOML date-time
+// literal — scanned as one span below, never validated here.
+fn looksLikeDateTime(lx: Lexer): bool {
+  return isDateStart(lx) || isTimeStart(lx)
+}
+
+fn isDateTimeChar(c: u8): bool {
+  return isDigit(c) ||
+    c == '-' ||
+    c == ':' ||
+    c == '.' ||
+    c == 'T' ||
+    c == 't' ||
+    c == 'Z' ||
+    c == 'z' ||
+    c == '+'
+}
+
+// A date-time literal span (offset date-time, local date-time, local date,
+// or local time — the four temporal `Toml` arms all share this one token
+// kind; telling them apart is the parser's job).
+fn scanDateTime(lx: Lexer) {
+  let start = lx.i
+  while (lx.i < len(lx.src) && isDateTimeChar(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  setTok(lx, TokenKind.DateTime, start, lx.i)
+}
+
+fn isNumberChar(c: u8): bool {
+  return isAlpha(c) || isDigit(c) || c == '.' || c == '_' || c == '+' || c == '-'
+}
+
+// A number literal span (int or float, any TOML 1.0.0 radix/underscore/
+// exponent form), captured verbatim — this layer scans the shape, it does
+// not enforce the grammar.
+fn scanNumber(lx: Lexer) {
+  let start = lx.i
+  while (lx.i < len(lx.src) && isNumberChar(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  setTok(lx, TokenKind.Number, start, lx.i)
+}
+
+// Dispatches an unquoted value starting with a digit or a sign: a date-time
+// span if it opens with a date-time's own shape, else a number span.
+fn scanNumberOrDateTime(lx: Lexer) {
+  if (looksLikeDateTime(lx)) {
+    scanDateTime(lx)
+    return
+  }
+  scanNumber(lx)
+}
+
+// Whether `lx.src[start:end]` byte-compares equal to `word`. Span-compared
+// rather than materialized, same reasoning as stdlib/json/lex.bit's
+// `spanIs`: one heap allocation to learn something a handful of byte
+// compares already know.
+fn spanIs(lx: Lexer, start: int, end: int, word: string): bool {
+  if (end - start != len(word)) {
+    return false
+  }
+  let k = 0
+  while (k < len(word)) {
+    if (lx.src[start + k] != word[k]) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// A bare key, `true`/`false`, or the unquoted numeric words `inf`/`nan` —
+// TOML's only unquoted literals that start with a letter or `_` rather than
+// a digit or sign.
+fn scanWordOrBareKey(lx: Lexer) {
+  let start = lx.i
+  while (lx.i < len(lx.src) && isBareKeyChar(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  if (spanIs(lx, start, lx.i, "true") || spanIs(lx, start, lx.i, "false")) {
+    setTok(lx, TokenKind.Bool, start, lx.i)
+    return
+  }
+  if (spanIs(lx, start, lx.i, "inf") || spanIs(lx, start, lx.i, "nan")) {
+    setTok(lx, TokenKind.Number, start, lx.i)
+    return
+  }
+  setTok(lx, TokenKind.BareKey, start, lx.i)
+}
+
+// Dispatches one token from `lx.i`, or `Eof` once the source is exhausted.
+// Space and tab are skipped; everything else TOML assigns meaning to,
+// including the newline, is emitted as a token — see this file's header for
+// why. `[[` is deliberately two `LBracket` tokens: this scanner never looks
+// past the current byte to merge them, leaving that decision to the parser.
+fn lexNext(lx: Lexer) {
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    switch {
+      case c == ' ' || c == '\t':
+        lx.i = lx.i + 1
+      case c == '\n' || c == '\r':
+        scanNewline(lx)
+        return
+      case c == '#':
+        scanComment(lx)
+        return
+      case c == '.':
+        emit(lx, lx.i, 1, TokenKind.Dot)
+        return
+      case c == '=':
+        emit(lx, lx.i, 1, TokenKind.Equals)
+        return
+      case c == ',':
+        emit(lx, lx.i, 1, TokenKind.Comma)
+        return
+      case c == '[':
+        scanOpen(lx, TokenKind.LBracket)
+        return
+      case c == ']':
+        scanClose(lx, TokenKind.RBracket)
+        return
+      case c == '{':
+        scanOpen(lx, TokenKind.LBrace)
+        return
+      case c == '}':
+        scanClose(lx, TokenKind.RBrace)
+        return
+      case c == '"' && atTripleQuote(lx, '"'):
+        scanMlBasicString(lx)
+        return
+      case c == '"':
+        scanBasicString(lx)
+        return
+      case c == '\'' && atTripleQuote(lx, '\''):
+        scanMlLiteralString(lx)
+        return
+      case c == '\'':
+        scanLiteralString(lx)
+        return
+      case isNumberStart(c):
+        scanNumberOrDateTime(lx)
+        return
+      case isBareKeyStart(c):
+        scanWordOrBareKey(lx)
+        return
+      default:
+        emit(lx, lx.i, 1, TokenKind.Invalid)
+        return
+    }
+  }
+  setTok(lx, TokenKind.Eof, lx.i, lx.i)
+}
+
+// The only place a `Token` is materialized. The `[]Token` API (`lex`) needs
+// one per token; a caller driving `lexNext` directly never calls this.
+fn scanToken(lx: Lexer): Token {
+  lexNext(lx)
+  return Token{ kind: lx.kind, start: lx.start, end: lx.end }
+}
+
+// The full token stream for `source`, ending with one `Eof`. Bounded by
+// twice the byte length plus a guard slot, mirroring
+// stdlib/json/lex.bit's `lexImpl`: every emitted token consumes at least
+// one source byte, so the loop cannot outrun the input — a statically
+// provable bound, not open-ended recursion.
+export fn lex(source: string): []Token {
+  let lx = newLexer(source)
+  let toks = []Token(0)
+  let guard = 0
+  let bound = len(source) * 2 + 2
+  while (guard <= bound) {
+    let t = scanToken(lx)
+    toks = append(toks, t)
+    if (t.kind == TokenKind.Eof) {
+      break
+    }
+    guard = guard + 1
+  }
+  return toks
+}
