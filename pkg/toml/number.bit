@@ -1,0 +1,412 @@
+// Bit toml package — number.bit, decoding TOML integers and floats
+// (TOML 1.0.0, #5482, epic #1481).
+//
+// `pkg/toml/lex.bit`'s `Number` token is a raw span: it does not enforce
+// numeric grammar, so this file owns the whole of TOML 1.0.0 sections
+// "Integer" and "Float". Errors use `TomlError` (`pkg/toml/strings.bit`,
+// #5481) — `pkg/toml/` is one flat module (pkg/README.md) sharing one
+// namespace, so `TomlError` is reached the same way `Toml`/`TokenKind` are:
+// no import. This file was written concurrently with #5481 against main
+// before it landed; `tomlNumberError` below constructs `TomlError` directly
+// and this file does not compile standalone until #5481's commit is also
+// present — expected, per the integrator's merge-batch note on this ticket.
+//
+// PERFORMANCE. No copy of the span is ever built. Every digit run is walked
+// once, skipping `_` inline while accumulating — the same shape
+// `stdlib/strings/strings.bit`'s `parseIntAccumulate` uses for exact i64
+// accumulation (including i64 MIN, via a negative running magnitude), which
+// this file's `accumulateRadix` also borrows for the non-decimal bases.
+// Floats are never routed through the general-purpose `parseFloat` builtin,
+// which would need the underscore-stripped copy this file is required not
+// to build (#5482's ticket): `accumulateDigitsF64` accumulates decimal
+// digits into an f64 via Horner's method instead, so the exact ULP the
+// hardware `parseFloat` builtin would return is not guaranteed — acceptable
+// because TOML's Float grammar has no correctly-rounded requirement, only a
+// grammar one.
+
+import { pow } from "std/math"
+
+// An offset-carrying decode failure, satisfying the predeclared `error`
+// interface via `message()`. Constructs `strings.bit`'s exported
+// `TomlError` rather than declaring a second error type in this shared
+// module namespace.
+fn tomlNumberError(msg: string, offset: int): error {
+  return TomlError{ offset: offset, msg: msg }
+}
+
+// The full unsigned 64-bit range, the accumulation ceiling for the
+// prefixed integer forms (0x/0o/0b), which TOML defines as non-negative
+// magnitudes — see `finalizeInt`, which then re-checks the TOML-level i64
+// range on top of this.
+const tomlU64Max: u64 = 18446744073709551615
+
+// i64::MAX, widened to u64 so `finalizeInt` can compare it against a u64
+// magnitude without a signed/unsigned mismatch.
+const tomlI64MaxAsU64: u64 = 9223372036854775807
+
+// `c`'s value as a hex digit (0-15), or -1 if `c` is not `0-9`, `a-f`, or
+// `A-F`. The one table every base's digit check narrows from — `digitValue`
+// below rejects anything `>= base`, so base 10 excluding `a-f`'s 10-15 falls
+// out for free instead of needing its own digit classifier.
+fn digitMagnitude(c: u8): i64 {
+  if (c >= '0' && c <= '9') {
+    return i64(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return i64(c - 'a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return i64(c - 'A') + 10
+  }
+  return -1
+}
+
+// `c`'s value in `base` (2, 8, 10, or 16), or -1 if `c` is not a digit of
+// that base.
+fn digitValue(c: u8, base: i64): i64 {
+  let v = digitMagnitude(c)
+  if (v < 0 || v >= base) {
+    return -1
+  }
+  return v
+}
+
+// Whether a `_` encountered here is misplaced: TOML permits an underscore
+// only between two digits, so one before any digit has been seen, or right
+// after another underscore, is invalid.
+fn badUnderscore(sawDigit: bool, prevUnderscore: bool): bool {
+  return !sawDigit || prevUnderscore
+}
+
+// Whether accumulating digit `d` onto `v` (already known `<= maxDiv`, or
+// `== maxDiv` with `d <= maxMod`) would exceed `tomlU64Max` — the standard
+// pre-check that avoids ever forming the overflowed value, computed against
+// thresholds the caller derives once per call rather than every digit.
+fn radixOverflows(v: u64, d: i64, maxDiv: u64, maxMod: u64): bool {
+  if (v > maxDiv) {
+    return true
+  }
+  return v == maxDiv && u64(d) > maxMod
+}
+
+// Accumulates the unsigned magnitude of digit run `src[start:end]` in
+// `base`, honoring the between-digits underscore rule, into a u64 — used
+// for decimal, hex, octal and binary alike (the sign, prefix, and TOML-level
+// signed range are all the caller's job; see `finalizeInt`). Fails on an
+// empty run, a misplaced underscore, a non-digit-of-`base` byte, or a
+// magnitude past `tomlU64Max`, naming the exact byte offset each time.
+fn accumulateRadix(src: string, start: int, end: int, base: i64): u64! {
+  let maxDiv = tomlU64Max / u64(base)
+  let maxMod = tomlU64Max % u64(base)
+  let v = u64(0)
+  let i = start
+  let sawDigit = false
+  let prevUnderscore = false
+  while (i < end) {
+    let c = src[i]
+    if (c == '_') {
+      if (badUnderscore(sawDigit, prevUnderscore)) {
+        fail tomlNumberError("underscore must be between digits", i)
+      }
+      prevUnderscore = true
+      i = i + 1
+      continue
+    }
+    let d = digitValue(c, base)
+    if (d < 0) {
+      fail tomlNumberError("invalid digit in number", i)
+    }
+    if (radixOverflows(v, d, maxDiv, maxMod)) {
+      fail tomlNumberError("integer literal out of range", i)
+    }
+    v = v * u64(base) + u64(d)
+    sawDigit = true
+    prevUnderscore = false
+    i = i + 1
+  }
+  if (!sawDigit) {
+    fail tomlNumberError("number has no digits", start)
+  }
+  if (prevUnderscore) {
+    fail tomlNumberError("underscore must be between digits", end - 1)
+  }
+  return v
+}
+
+// The float counterpart of `accumulateRadix`: accumulates decimal digit run
+// `src[start:end]` into an f64 via Horner's method, continuing from `init`
+// so a caller can chain an integer-part call into a fraction-part call
+// without restarting at zero. Same underscore rule, same empty-run error;
+// never fails on magnitude — an extreme float correctly rounds to +-Inf/0
+// under IEEE-754 (`stdlib/strings/strings.bit`'s `parseFloat` doc makes the
+// same call), which is not a grammar error.
+fn accumulateDigitsF64(src: string, start: int, end: int, init: f64): f64! {
+  let v = init
+  let i = start
+  let sawDigit = false
+  let prevUnderscore = false
+  while (i < end) {
+    let c = src[i]
+    if (c == '_') {
+      if (badUnderscore(sawDigit, prevUnderscore)) {
+        fail tomlNumberError("underscore must be between digits", i)
+      }
+      prevUnderscore = true
+      i = i + 1
+      continue
+    }
+    let d = digitValue(c, 10)
+    if (d < 0) {
+      fail tomlNumberError("invalid digit in number", i)
+    }
+    v = v * 10.0 + f64(d)
+    sawDigit = true
+    prevUnderscore = false
+    i = i + 1
+  }
+  if (!sawDigit) {
+    fail tomlNumberError("number has no digits", start)
+  }
+  if (prevUnderscore) {
+    fail tomlNumberError("underscore must be between digits", end - 1)
+  }
+  return v
+}
+
+// Whether `src[start:end]` is exactly one of the six special float
+// spellings TOML defines — lowercase only, `inf`/`nan` optionally signed.
+fn spanEq(src: string, start: int, end: int, word: string): bool {
+  if (end - start != len(word)) {
+    return false
+  }
+  let i = 0
+  while (i < len(word)) {
+    if (src[start + i] != word[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn specialFloat(src: string, start: int, end: int): Option<f64> {
+  if (spanEq(src, start, end, "inf") || spanEq(src, start, end, "+inf")) {
+    return Option<f64>.Some(1.0 / 0.0)
+  }
+  if (spanEq(src, start, end, "-inf")) {
+    return Option<f64>.Some(0.0 - 1.0 / 0.0)
+  }
+  if (spanEq(src, start, end, "nan") ||
+    spanEq(src, start, end, "+nan") ||
+    spanEq(src, start, end, "-nan")) {
+    return Option<f64>.Some(0.0 / 0.0)
+  }
+  return Option<f64>.None
+}
+
+// Whether `src[start:end]` opens with one of the three base prefixes, which
+// take no sign — checked against the raw, unsigned start, so a signed
+// `+0x1`/`-0x1` never matches here and falls through to the decimal path,
+// where it is rejected on other grounds (its digit run is not valid
+// decimal).
+fn isPrefixedBase(src: string, start: int, end: int): bool {
+  return end - start >= 3 &&
+    src[start] == '0' &&
+    (src[start + 1] == 'x' || src[start + 1] == 'o' || src[start + 1] == 'b')
+}
+
+// Applies TOML's signed-64-bit range to unsigned magnitude `mag`, returning
+// the `TomlInt`. i64::MIN's magnitude (2^63) is one past i64::MAX but is
+// the one magnitude a negative literal may reach; every other case's ceiling
+// is i64::MAX itself. `i64(u64(0) - mag)` recovers the correct two's
+// complement negative value for i64::MIN without ever forming
+// +9223372036854775808 as a (non-representable) positive i64, the same
+// negative-accumulation trick `parseIntAccumulate` uses.
+fn finalizeInt(mag: u64, negative: bool, offset: int): Toml! {
+  if (negative) {
+    if (mag > tomlI64MaxAsU64 + u64(1)) {
+      fail tomlNumberError("integer literal out of range", offset)
+    }
+    return Toml.TomlInt(i64(u64(0) - mag))
+  }
+  if (mag > tomlI64MaxAsU64) {
+    fail tomlNumberError("integer literal out of range", offset)
+  }
+  return Toml.TomlInt(i64(mag))
+}
+
+fn decodePrefixed(src: string, start: int, end: int): Toml! {
+  let c = src[start + 1]
+  if (c == 'x') {
+    let mag = accumulateRadix(src, start + 2, end, 16)?
+    return finalizeInt(mag, false, start)?
+  }
+  if (c == 'o') {
+    let mag = accumulateRadix(src, start + 2, end, 8)?
+    return finalizeInt(mag, false, start)?
+  }
+  let mag = accumulateRadix(src, start + 2, end, 2)?
+  return finalizeInt(mag, false, start)?
+}
+
+// The position just past a decimal number's integer-part digit run: the
+// first `.`, `e`, or `E`, or `end` if there is none. Whatever byte is
+// skipped over here (a stray non-digit, say) is not validated by this scan
+// — `accumulateRadix`/`accumulateDigitsF64` validate the run they are each
+// handed, so a malformed byte inside it is still rejected, just by the
+// accumulator rather than by this boundary finder.
+fn findIntPartEnd(src: string, start: int, end: int): int {
+  let i = start
+  while (i < end && src[i] != '.' && src[i] != 'e' && src[i] != 'E') {
+    i = i + 1
+  }
+  return i
+}
+
+// The position just past a fraction's digit run: the first `e`/`E`, or
+// `end`. Only ever called once a `.` has already been confirmed.
+fn findExpStart(src: string, start: int, end: int): int {
+  let i = start
+  while (i < end && src[i] != 'e' && src[i] != 'E') {
+    i = i + 1
+  }
+  return i
+}
+
+// TOML disallows a leading zero in a decimal integer, and a float's integer
+// part follows the same rule (TOML 1.0.0 "Float": it "follows the same
+// rules as decimal integer values") — `0` alone is fine, `01` and `0_1` are
+// not. `intEnd` is the position just past the integer-part run.
+fn hasLeadingZero(src: string, digitsStart: int, intEnd: int): bool {
+  return src[digitsStart] == '0' && digitsStart + 1 < intEnd
+}
+
+// The structural shape of a decimal number's digit run: where the integer
+// part ends, and whether a fraction and/or exponent follow. One linear scan
+// of `src[start:end]`, done once and consumed by `decodeDecimal` and
+// `decodeDecimalFloat` rather than re-derived.
+class DecimalShape { intEnd: int, hasFrac: bool, fracEnd: int, hasExp: bool }
+
+fn classifyDecimalShape(src: string, start: int, end: int): DecimalShape {
+  let intEnd = findIntPartEnd(src, start, end)
+  let hasFrac = intEnd < end && src[intEnd] == '.'
+  let fracEnd = intEnd
+  if (hasFrac) {
+    fracEnd = findExpStart(src, intEnd + 1, end)
+  }
+  let hasExp = fracEnd < end && (src[fracEnd] == 'e' || src[fracEnd] == 'E')
+  return DecimalShape{ intEnd: intEnd, hasFrac: hasFrac, fracEnd: fracEnd, hasExp: hasExp }
+}
+
+// The count of non-`_` bytes in `src[start:end]` — the actual digit count
+// of a fraction-part run, as opposed to its raw span length, which an
+// underscore would otherwise inflate. Used only to place the decimal point
+// back in `decodeDecimalFloat`: `9_224.445_991`'s fraction span is 7 bytes
+// but 6 digits, and the point belongs 6 places in, not 7.
+fn countDigits(src: string, start: int, end: int): int {
+  let i = start
+  let n = 0
+  while (i < end) {
+    if (src[i] != '_') {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// The `[+-]?digit+` exponent clause starting right after the `e`/`E` at
+// `start`, as a signed f64 magnitude (an f64 because it only ever feeds
+// `pow(10.0, ...)` below — an absurdly long exponent digit run saturates
+// smoothly to +-Inf through that call rather than wrapping the way an
+// integer accumulator would).
+fn decodeExponent(src: string, start: int, end: int): f64! {
+  let i = start
+  let sign = 1.0
+  if (i < end && src[i] == '+') {
+    i = i + 1
+  } else if (i < end && src[i] == '-') {
+    sign = -1.0
+    i = i + 1
+  }
+  let mag = accumulateDigitsF64(src, i, end, 0.0)?
+  return sign * mag
+}
+
+// The float value of decimal digit run `src[start:end]`, given its already
+// classified `shape`. The integer-part and fraction-part digits accumulate
+// into one running mantissa (`accumulateDigitsF64` chains the second call
+// off the first's result), then `fracDigits` places the decimal point back
+// and `exp` applies the `e`/`E` clause, both via one `pow(10.0, ...)` — a
+// trailing `.` or a bare `.digit` both fail here too: an empty fraction-part
+// span reaches `accumulateDigitsF64` with `start == end`, which is exactly
+// its own "no digits" error.
+fn decodeDecimalFloat(
+  src: string,
+  start: int,
+  end: int,
+  shape: DecimalShape,
+  negative: bool,
+): f64! {
+  let mant = accumulateDigitsF64(src, start, shape.intEnd, 0.0)?
+  let fracDigits = 0
+  if (shape.hasFrac) {
+    fracDigits = countDigits(src, shape.intEnd + 1, shape.fracEnd)
+    mant = accumulateDigitsF64(src, shape.intEnd + 1, shape.fracEnd, mant)?
+  }
+  let exp = 0.0
+  if (shape.hasExp) {
+    exp = decodeExponent(src, shape.fracEnd + 1, end)?
+  }
+  let value = mant * pow(10.0, exp - f64(fracDigits))
+  if (negative) {
+    return 0.0 - value
+  }
+  return value
+}
+
+// The decimal path: optional `+`/`-` sign, then a plain integer or a float
+// (fraction and/or exponent) — never the prefixed bases, which
+// `isPrefixedBase` routes around this function entirely.
+fn decodeDecimal(src: string, start: int, end: int): Toml! {
+  let negative = false
+  let i = start
+  if (src[i] == '+') {
+    i = i + 1
+  } else if (src[i] == '-') {
+    negative = true
+    i = i + 1
+  }
+  if (i >= end) {
+    fail tomlNumberError("number has no digits", start)
+  }
+  let shape = classifyDecimalShape(src, i, end)
+  if (hasLeadingZero(src, i, shape.intEnd)) {
+    fail tomlNumberError("leading zero in integer literal", i)
+  }
+  if (!shape.hasFrac && !shape.hasExp) {
+    let mag = accumulateRadix(src, i, end, 10)?
+    return finalizeInt(mag, negative, start)?
+  }
+  let value = decodeDecimalFloat(src, i, end, shape, negative)?
+  return Toml.TomlFloat(value)
+}
+
+// Decodes `pkg/toml/lex.bit`'s `Number` span `src[start:end]` into a
+// `TomlInt` or `TomlFloat`. The float/int discriminator: `.`, `e`/`E`
+// outside a hex prefix, or one of the six special spellings makes it a
+// float — `1e2` is a `TomlFloat`, never a `TomlInt` (TOML 1.0.0 "Float").
+export fn tomlDecodeNumber(src: string, start: int, end: int): Toml! {
+  if (end <= start) {
+    fail tomlNumberError("empty number", start)
+  }
+  let special = specialFloat(src, start, end)
+  match (special) {
+    Some(v) => { return Toml.TomlFloat(v) }
+    None => {}
+  }
+  if (isPrefixedBase(src, start, end)) {
+    return decodePrefixed(src, start, end)?
+  }
+  return decodeDecimal(src, start, end)?
+}
