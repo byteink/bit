@@ -1,0 +1,515 @@
+// pkg/yaml/encode.bit — yaml module, the encoder: the inverse of
+// `pkg/yaml/parse.bit` (#5499, epic #1482). `value.bit`, `scan.bit`,
+// `schema.bit` and `flow.bit` are siblings in this same flat module
+// (pkg/README.md); this file calls into `schema.bit`'s real resolver for
+// every quoting decision and never re-implements typing, scalar decoding or
+// anchors of its own.
+//
+// THE ONE REQUIREMENT: `yamlParse(yamlEncode(v))` must equal `v`, structurally
+// and by TYPE. YAML 1.2's core schema (`schema.bit`) implicitly types a bare
+// PLAIN scalar; a `YamlString` whose text would resolve to something else on
+// re-read is silently corrupted unless it is quoted. `needsQuote` below is
+// the one place that decision is made, and it is made by calling
+// `yamlResolveScalar` itself — never a hand-copied spelling table, which
+// would drift the moment `schema.bit` grows or narrows its own tables.
+//
+// THE INVERSE NORWAY TRAP, BOTH DIRECTIONS. `schema.bit`'s core schema does
+// NOT resolve `no`/`off`/`y`/`n`/`010` (1.1 spellings, deliberately excluded
+// — that file's own header). Calling the same resolver here means this file
+// inherits that exclusion for free: those strings round-trip bare, with no
+// second table to keep in sync and no risk of quoting them "just in case"
+// (noise the ticket calls out by name).
+//
+// STRUCTURAL SAFETY IS A SEPARATE AXIS FROM TYPING. Even a string the schema
+// would still call a string can break re-parsing as a PLAIN scalar for
+// reasons that have nothing to do with typing: `scan.bit`'s `scanPlainScalar`
+// stops at a bare `\n`/`\r`, at `: ` or a trailing `:` anywhere in the token
+// (`isColonBoundary`, checked on every byte, not just the first), and at a
+// space immediately before `#` (`isCommentAhead`) — silently truncating the
+// scalar rather than erroring. `scan.bit`'s top-level dispatch also hands a
+// LEADING `-`,`?`,`:`,`,`,`[`,`]`,`{`,`}`,`&`,`*`,`!`,`#`,`|`,`>`,`'`,`"`,`%`
+// straight to a different token kind before a plain scalar is ever
+// considered; `@` and backtick carry the same reservation in the wider YAML
+// 1.2 indicator set even though this scanner does not yet special-case them.
+// `needsQuoteStructural` below covers exactly these cases, derived by
+// reading `scan.bit`'s dispatch and `scanPlainScalar`'s own loop, not
+// guessed at.
+//
+// BLOCK STYLE ONLY, TWO SPACES PER LEVEL, NO COMPACT FORMS. Every non-scalar
+// value gets its own fresh line(s) rather than a same-line compact form
+// (`- key: value`, `key: - item`): `parse.bit`'s `parseAfterIndicator` and
+// `parseSeqItemValue` both recognize a strictly-deeper `Indent` unconditionally,
+// so always emitting one non-scalar child that way is always correct, at the
+// cost of being less compact than a hand-written file. The one exception is
+// the ticket's own explicit rule — a SEQUENCE value reached via `?`/`:`
+// (a mapping value, or an explicit key/value) may sit at the SAME column as
+// its indicator with no `Indent` at all: `parse.bit`'s own header calls this
+// "the same-indentation sequence", and `parseBlockSequence`'s continuation
+// check (`p.s.kind != TokenKind.SeqEntry`) confirms a `?`/`:` line at that
+// same column correctly ends the sequence rather than extending it. A
+// sequence ITEM's own nested value has no such concession
+// (`parseSeqItemValue` only recognizes `Indent`), so it is always indented
+// deeper, exactly like a nested mapping in either context.
+//
+// EMPTY COLLECTIONS ARE FLOW, INLINE. Block style has no way to spell an
+// empty sequence or mapping at all; `[]`/`{}` is what every YAML tool falls
+// back to, and `scan.bit` opens/closes flow brackets unconditionally
+// (`dispatchFlowBrackets`, not gated on `flowDepth`), so this never recurses
+// into `flow.bit`'s own grammar — the value has no elements to place inside.
+//
+// FLOATS ROUND-TRIP VIA SHORTEST-DECIMAL INTERPOLATION, NOT `formatFloat`.
+// `"${x}"` (string interpolation) is `runtime/root/floatfmt.bit`'s
+// shortest-round-trip Dragon4 rendering (`std/strings/format.bit`'s own
+// header states this explicitly, and why `formatFloat`'s fixed-decimal
+// rounding is the wrong tool: it can lose digits `"${x}"` never drops). Its
+// only gap for this file's purpose is that an integer-valued float
+// (`"${10.0}"` is `"10"`) reads back as `YamlInt`, not `YamlFloat` — this
+// file appends `.0` whenever the interpolated text carries no `.`, which
+// is the only case `schema.bit`'s float grammar requires a `.` or exponent
+// for. `.inf`/`-.inf`/`.nan` are checked directly against the value (mirroring
+// `format.bit`'s own `maxFinite` technique) rather than string-matching
+// interpolation's own lowercase `"inf"`/`"nan"` spellings, since neither
+// matches the YAML 1.2 spelling anyway.
+//
+// DEPTH IS THE CYCLE GUARD, NOT IDENTITY. This file never checks whether a
+// `[]Yaml`/`[]YamlEntry` slice is the same object as an ancestor's — it
+// bounds recursion by `YamlLimits.maxDepth` instead, exactly like
+// `anchor.bit`'s own `countMaterialized` bounds alias expansion by the same
+// field. A genuinely cyclic value (a slice holding itself, constructible in
+// Bit since arrays are reference types) then fails fast at the depth
+// ceiling rather than recursing forever — bounded, not merely probable.
+//
+// NO ANCHORS OR ALIASES ARE EVER EMITTED. Every shared subtree is written
+// out in full; this file has no aliasing policy and does not need one.
+//
+// WHAT THIS FILE DOES NOT EMIT: multi-line literal/folded block scalars
+// (`|`/`>`) for a string containing a line break — such a string is instead
+// double-quoted with a `\n` escape, which round-trips correctly but is not
+// full YAML 1.2 block-scalar style; see `pkg/yaml/docs/` for the named gap.
+
+import { hasSuffix } from "std/strings"
+
+fn encodeError(msg: string): error {
+  return newError(msg)
+}
+
+// --- depth bound (this file's cycle guard; see header) --------------------
+
+// Bundles the depth counter with the budget it is checked against: every
+// writer below that recurses into a nested collection needs both, and
+// `limits` never changes within one `yamlEncode`/`yamlEncodeAll` call —
+// carrying them together keeps `writeNonScalarAfterIndicator` at 5
+// parameters instead of 6 (`max-params`, spec/LINT.md), not a special case
+// for that one function.
+class EncCtx { depth: i64, limits: YamlLimits }
+
+fn deeper(ctx: EncCtx): EncCtx {
+  return EncCtx{ depth: ctx.depth + 1, limits: ctx.limits }
+}
+
+fn checkEncodeDepth(ctx: EncCtx): ()! {
+  if (ctx.depth > ctx.limits.maxDepth) {
+    fail encodeError("yaml: encode nesting exceeds maxDepth limit of ${ctx.limits.maxDepth} (cyclic value?)")
+  }
+}
+
+// --- indentation -----------------------------------------------------------
+
+fn writeSpaces(b: Builder, n: i64) {
+  let i: i64 = 0
+  while (i < n) {
+    b.writeByte(' ')
+    i = i + 1
+  }
+}
+
+// --- scalar quoting decision (this file's header explains both axes) ------
+
+// The first byte of every plain scalar that `scan.bit`'s dispatch (or the
+// wider YAML 1.2 indicator set) hands to something other than a plain
+// scalar. `@` and backtick are reserved by the spec even though this
+// scanner does not yet special-case them (this file's header).
+const reservedLeadBytes: string = "-?:,[]{}#&*!|>'\"%@`"
+
+fn indexOfLeadByte(s: string, c: u8): i64 {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn isReservedLead(c: u8): bool {
+  return indexOfLeadByte(reservedLeadBytes, c) >= 0
+}
+
+// Control bytes and the two line-break bytes: `scan.bit` never forbids a
+// raw control byte in a plain scalar, but a real line break folds
+// (`scalar.bit`'s `foldContent`) and a `\t`/other control byte is safer read
+// back as an explicit escape than as a raw byte some downstream tool chokes
+// on — the ticket's own "or a control character" rule.
+fn isControlOrBreakByte(c: u8): bool {
+  if (c == '\n' || c == '\r') {
+    return true
+  }
+  return c < 0x20 || c == 0x7F
+}
+
+fn hasControlOrBreak(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (isControlOrBreakByte(s[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `: `/trailing `:` (`isColonBoundary`) and ` #` (`isCommentAhead`) both
+// truncate a plain scalar mid-token, anywhere in the source, not only at
+// its start — `scan.bit`'s header explains why (this file's header).
+fn hasDangerousColon(s: string): bool {
+  if (contains(s, ": ")) {
+    return true
+  }
+  return hasSuffix(s, ":")
+}
+
+fn hasSpaceHash(s: string): bool {
+  return contains(s, " #")
+}
+
+// A bare document marker at column 0 of its own line (`scan.bit`'s
+// `isDocMarker`) only matters for a lone top-level scalar document: any
+// other position is never both `fresh` and column 0 (this file's header
+// analysis). Quoting the two exact spellings unconditionally is cheap and
+// avoids a real, if narrow, corruption case.
+fn isDocMarkerText(s: string): bool {
+  return s == "---" || s == "..."
+}
+
+fn needsQuoteStructural(s: string): bool {
+  if (len(s) == 0) {
+    return true
+  }
+  if (s[0] == ' ' || s[len(s) - 1] == ' ') {
+    return true
+  }
+  if (hasControlOrBreak(s)) {
+    return true
+  }
+  if (isReservedLead(s[0])) {
+    return true
+  }
+  if (hasDangerousColon(s)) {
+    return true
+  }
+  if (hasSpaceHash(s)) {
+    return true
+  }
+  return isDocMarkerText(s)
+}
+
+// The typing axis: call the REAL resolver (this file's header — never a
+// hand-copied table) and quote whenever the result is not the same
+// `YamlString` unchanged. `resolvePlain`'s string-producing arm always
+// returns the input text verbatim, so `t != s` is a defensive belt, not a
+// case expected to fire.
+fn typingWouldChange(s: string): bool {
+  let resolved = yamlResolveScalar(s, ScalarStyle.Plain)
+  match (yamlAsString(resolved)) {
+    Some(t) => return t != s
+    None => return true
+  }
+}
+
+fn needsQuote(s: string): bool {
+  if (typingWouldChange(s)) {
+    return true
+  }
+  return needsQuoteStructural(s)
+}
+
+// --- double-quoted escaping -------------------------------------------------
+
+// The single-byte escapes this file emits, aligned index-for-index —
+// mirrors `scalar.bit`'s `simpleEscapeByte` table in shape (that file's own
+// comment explains the technique) but runs the opposite direction: byte to
+// letter, for encoding, not letter to byte, for decoding. 0 is a safe
+// sentinel ("no match"): no accepted letter is byte 0.
+fn simpleEscapeLetter(c: u8): u8 {
+  let bytes = [0, 7, 8, 9, 10, 11, 12, 13, 27, 34, 92]
+  let letters = "0abtnvfre\"\\"
+  let i = 0
+  while (i < len(bytes)) {
+    if (u8(bytes[i]) == c) {
+      return letters[i]
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn hexDigit(v: u8): u8 {
+  if (v < 10) {
+    return '0' + v
+  }
+  return 'a' + (v - 10)
+}
+
+fn writeHexEscape(b: Builder, c: u8) {
+  b.writeByte('\\')
+  b.writeByte('x')
+  b.writeByte(hexDigit(c / 16))
+  b.writeByte(hexDigit(c % 16))
+}
+
+fn writeEscapedByte(b: Builder, c: u8) {
+  let letter = simpleEscapeLetter(c)
+  if (letter != 0) {
+    b.writeByte('\\')
+    b.writeByte(letter)
+    return
+  }
+  if (isControlOrBreakByte(c)) {
+    writeHexEscape(b, c)
+    return
+  }
+  b.writeByte(c)
+}
+
+// Raw, already-valid UTF-8 bytes that are neither an escape target nor a
+// control/break byte are copied verbatim — `scalar.bit`'s own decoder copies
+// every non-special byte the same way, including every continuation byte of
+// a multi-byte rune, so no UTF-8-aware handling is needed on either side.
+fn writeDoubleQuoted(b: Builder, s: string) {
+  b.writeByte('"')
+  let i = 0
+  while (i < len(s)) {
+    writeEscapedByte(b, s[i])
+    i = i + 1
+  }
+  b.writeByte('"')
+}
+
+fn writeStringScalar(b: Builder, s: string): ()! {
+  if (needsQuote(s)) {
+    writeDoubleQuoted(b, s)
+    return
+  }
+  b.write(s)
+}
+
+// --- floats (this file's header explains the shortest-decimal choice) -----
+
+const maxFiniteFloat: f64 = 1.7976931348623157e308
+
+fn finiteFloatText(x: f64): string {
+  let raw = "${x}"
+  if (contains(raw, ".")) {
+    return raw
+  }
+  return raw + ".0"
+}
+
+fn encodeFloatText(x: f64): string {
+  if (x != x) {
+    return ".nan"
+  }
+  if (x > maxFiniteFloat) {
+    return ".inf"
+  }
+  if (x < 0.0 - maxFiniteFloat) {
+    return "-.inf"
+  }
+  return finiteFloatText(x)
+}
+
+// --- one scalar, inline -----------------------------------------------------
+
+fn writeScalarInline(b: Builder, y: Yaml): ()! {
+  match (y) {
+    YamlNull => {
+      b.write("null")
+      return
+    }
+    YamlBool(v) => {
+      if (v) {
+        b.write("true")
+      } else {
+        b.write("false")
+      }
+      return
+    }
+    YamlInt(v) => {
+      b.write("${v}")
+      return
+    }
+    YamlFloat(v) => {
+      b.write(encodeFloatText(v))
+      return
+    }
+    YamlString(s) => return writeStringScalar(b, s)?
+    _ => fail encodeError("yaml: internal: writeScalarInline called on a collection")
+  }
+}
+
+// --- the value after `-`, `:` or `?` (this file's header: two contexts) ---
+
+// `seqIndent`/`mapIndent` are the two contexts this file's header derives
+// from `parse.bit`: after a mapping indicator, a nested sequence may sit at
+// the SAME column as the indicator (`seqIndent`) while a nested mapping
+// must sit deeper; after a sequence dash, both must sit deeper, so callers
+// in that context simply pass the same deeper value for both.
+fn writeNonScalarAfterIndicator(
+  b: Builder,
+  value: Yaml,
+  seqIndent: i64,
+  mapIndent: i64,
+  ctx: EncCtx,
+): ()! {
+  match (value) {
+    YamlSequence(items) => {
+      if (len(items) == 0) {
+        b.write("[]\n")
+        return
+      }
+      b.write("\n")
+      return writeSequenceLines(b, items, seqIndent, ctx)?
+    }
+    YamlMapping(entries) => {
+      if (len(entries) == 0) {
+        b.write("{}\n")
+        return
+      }
+      b.write("\n")
+      return writeMappingLines(b, entries, mapIndent, ctx)?
+    }
+    _ => {
+      writeScalarInline(b, value)?
+      b.write("\n")
+      return
+    }
+  }
+}
+
+// --- block sequence ----------------------------------------------------
+
+fn writeSequenceLines(b: Builder, items: []Yaml, indent: i64, ctx: EncCtx): ()! {
+  checkEncodeDepth(ctx)?
+  let i = 0
+  while (i < len(items)) {
+    writeSpaces(b, indent)
+    b.write("- ")
+    writeNonScalarAfterIndicator(b, items[i], indent + 2, indent + 2, deeper(ctx))?
+    i = i + 1
+  }
+}
+
+// --- block mapping -------------------------------------------------------
+
+fn isScalarKey(k: Yaml): bool {
+  return !yamlIsSequence(k) && !yamlIsMapping(k)
+}
+
+// A scalar key always has a plain-or-quoted inline spelling, so it uses the
+// implicit `key: value` form; a non-scalar key has none (the ticket's own
+// wording) and uses the explicit `? key` / `: value` form instead — both
+// the key and the value go through `writeNonScalarAfterIndicator` with the
+// SAME `indent`, since `parse.bit`'s `readExplicitEntry` requires the `:`
+// back at exactly the mapping's own column. Split into two single-purpose
+// functions, each a plain tail call with no branch of its own: a single
+// function returning both forms via `return <call>?` in one arm and a
+// fallthrough in the other hits `bit`'s compiler assertion
+// `assertSavedCoversWrites` (#5521) — filed there with a 9-line minimal
+// repro; no recursion cycle or branching turned out to be required, only a
+// named function whose body is `return <call returning ()!>()?`. Worked
+// around here rather than chased into `compiler/` from this `pkg/` ticket.
+fn writeImplicitEntry(b: Builder, entry: YamlEntry, indent: i64, ctx: EncCtx): ()! {
+  writeSpaces(b, indent)
+  writeScalarInline(b, entry.key)?
+  b.write(": ")
+  return writeNonScalarAfterIndicator(b, entry.value, indent, indent + 2, deeper(ctx))?
+}
+
+fn writeExplicitEntry(b: Builder, entry: YamlEntry, indent: i64, ctx: EncCtx): ()! {
+  writeSpaces(b, indent)
+  b.write("? ")
+  writeNonScalarAfterIndicator(b, entry.key, indent, indent + 2, deeper(ctx))?
+  writeSpaces(b, indent)
+  b.write(": ")
+  return writeNonScalarAfterIndicator(b, entry.value, indent, indent + 2, deeper(ctx))?
+}
+
+fn writeMappingEntry(b: Builder, entry: YamlEntry, indent: i64, ctx: EncCtx): ()! {
+  if (isScalarKey(entry.key)) {
+    return writeImplicitEntry(b, entry, indent, ctx)?
+  }
+  return writeExplicitEntry(b, entry, indent, ctx)?
+}
+
+fn writeMappingLines(b: Builder, entries: []YamlEntry, indent: i64, ctx: EncCtx): ()! {
+  checkEncodeDepth(ctx)?
+  let i = 0
+  while (i < len(entries)) {
+    writeMappingEntry(b, entries[i], indent, ctx)?
+    i = i + 1
+  }
+}
+
+// --- one whole document ---------------------------------------------------
+
+fn writeDocument(b: Builder, y: Yaml, limits: YamlLimits): ()! {
+  let ctx = EncCtx{ depth: 1, limits: limits }
+  match (y) {
+    YamlSequence(items) => {
+      if (len(items) == 0) {
+        b.write("[]\n")
+        return
+      }
+      return writeSequenceLines(b, items, 0, ctx)?
+    }
+    YamlMapping(entries) => {
+      if (len(entries) == 0) {
+        b.write("{}\n")
+        return
+      }
+      return writeMappingLines(b, entries, 0, ctx)?
+    }
+    _ => {
+      writeScalarInline(b, y)?
+      b.write("\n")
+      return
+    }
+  }
+}
+
+// --- entry points ------------------------------------------------------
+
+// One `Yaml` value as a single YAML document: no leading `---`, matching
+// `yamlParse`'s own single-document contract.
+export fn yamlEncode(y: Yaml): string! {
+  let b = newBuilder()
+  writeDocument(b, y, yamlDefaultLimits())?
+  return b.toString()
+}
+
+// Every document in `docs`, each preceded by its own `---` — `parse.bit`'s
+// own test corpus confirms a leading `---` on the very first document
+// parses identically to one with none, so this never special-cases the
+// first entry.
+export fn yamlEncodeAll(docs: []Yaml): string! {
+  let b = newBuilder()
+  let limits = yamlDefaultLimits()
+  let i = 0
+  while (i < len(docs)) {
+    b.write("---\n")
+    writeDocument(b, docs[i], limits)?
+    i = i + 1
+  }
+  return b.toString()
+}
