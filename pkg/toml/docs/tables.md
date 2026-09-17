@@ -1,7 +1,7 @@
 # Tables
 
-TOML gives you four ways to write nested structure — `[table]`, dotted keys,
-`[[array of tables]]`, and inline `{ }` — and all four decode onto the same
+TOML gives you four ways to write nested structure - `[table]`, dotted keys,
+`[[array of tables]]`, and inline `{ }` - and all four decode onto the same
 two `Toml` variants, `TomlTable` and `TomlArray`. This chapter is about
 reading whichever one a file actually used.
 
@@ -35,7 +35,7 @@ contact.email = "ops@waypoint.dev"
 
 `[server.limits]` and a dotted key like `contact.name` both build the same
 shape: a table nested inside another table. Reading either one is
-`tomlAsTable` twice, once per level — there is nothing special about the
+`tomlAsTable` twice, once per level - there is nothing special about the
 dotted spelling once the document is parsed:
 
 ```bit
@@ -71,7 +71,7 @@ fn contactEmail(root: []TomlEntry): string! {
 ```
 
 `contact.name = "..."` and `contact.email = "..."` in the source produce one
-`metadata.contact` table with two entries — the same `[]TomlEntry` you would
+`metadata.contact` table with two entries - the same `[]TomlEntry` you would
 get from writing `[metadata.contact]` as its own header instead. Pick
 whichever spelling reads better in the file; the parsed value cannot tell
 them apart.
@@ -79,7 +79,7 @@ them apart.
 ## `[[array of tables]]`
 
 `server.routes` is a `TomlArray` whose every element is itself a
-`TomlTable` — `tomlAsArray` once, then `tomlAsTable` per element, the same
+`TomlTable` - `tomlAsArray` once, then `tomlAsTable` per element, the same
 two accessors as anything else:
 
 ```bit
@@ -101,7 +101,7 @@ fn routes(server: []TomlEntry): []Route! {
 ```
 
 A single `[[server.routes]]` block with no entries at all would still parse
-as a one-element array — TOML has no way to write a zero-length array of
+as a one-element array - TOML has no way to write a zero-length array of
 tables with the header form. An empty list in the source is always the
 inline `routes = []` spelling instead, which decodes the same way any other
 empty `TomlArray` does.
@@ -109,7 +109,7 @@ empty `TomlArray` does.
 ## Inline tables
 
 `healthcheck = { path = "/health", interval_s = 5 }` decodes to a
-`TomlTable` exactly like `[server.healthcheck]` would — `tomlAsTable` does
+`TomlTable` exactly like `[server.healthcheck]` would - `tomlAsTable` does
 not know or care which syntax produced the value:
 
 ```bit
@@ -121,7 +121,7 @@ fn healthcheckPath(server: []TomlEntry): string! {
 
 The one real difference is source-only: an inline table closes the moment
 its `}` is read, so nothing later in the document can add another key to
-it — `[server.healthcheck]` appearing further down the file would be a
+it - `[server.healthcheck]` appearing further down the file would be a
 redefinition error, not an extension. [Errors](errors.md) covers that
 rejection and the ones next to it.
 
