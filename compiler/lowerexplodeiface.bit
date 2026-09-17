@@ -1,0 +1,287 @@
+// compiler/lowerexplodeiface.bit — #5446: the VTABLE half of the return-word
+// convention. Sibling of lowerexplodemethod.bit (#5445, the direct-call half),
+// lowerexplode.bit (the width rule and both ABI directions) and
+// lowerexplodestr.bit (the `string` half); same module, so this needs no
+// imports.
+//
+// WHAT #5445 LEFT OUT, and why it is not "the same change with one test
+// removed". A direct `call` resolves to ONE callee, so #5445 could answer the
+// question from that callee's declaration alone: `methodRetExplodes` admits a
+// method only when nothing in the project can reach its symbol except a direct
+// call, and an interface declaring the NAME is one of the three things that
+// disqualifies it. An `Op.CallIface` has a second party. The call site knows
+// the INTERFACE, `methodId` (lower.bit) turns the method NAME into a dispatch
+// id, and `bit_rt_iface_lookup` (runtime/root/iface.bit) resolves that id
+// against whatever receiver arrives — so the convention is a contract between
+// one call site and every class the id can land on, none of which the call
+// site names.
+//
+// THE DECISION, stated once (`runtime/ABI.md` §1.2.2 carries it too).
+// Eligibility is keyed on the method NAME, project-wide, and it is UNANIMOUS
+// or nothing: a name returns its result in words only when EVERY declaration
+// of that name in the project — every interface signature and every concrete
+// method — yields the SAME non-empty word list. One disagreeing declaration
+// puts the name back on the one-handle convention for all of them.
+//
+// WHY THE NAME AND NOT THE INTERFACE. An interface-keyed rule reads more
+// natural and is wrong: two interfaces may each declare `step`, with different
+// result types, and `methodId` gives both call sites the SAME id. The unit of
+// dispatch identity is the name, so the unit of agreement has to be the name.
+// Keying on the name also answers the ticket's second question without a
+// second rule — a class whose own result type would refuse simply poisons the
+// name, and its interface's call sites keep one handle with it.
+//
+// WHY UNANIMITY AND NOT "the interface's declared type wins". The callee's
+// `ret` is lowered from the CLASS's declaration; if a class's own result were
+// allowed to differ from the interface's, the class would have to marshal a
+// type it does not return. Refusing the name is the only answer that needs no
+// coercion anywhere and leaves every refused shape exactly as it is today.
+//
+// WHAT UNANIMITY DOES NOT COVER, and why those names stay excluded whatever
+// they agree on: a method taken as a VALUE is lowered to a closure called
+// through `Op.CallValue` (`lowerStructMethodValue`, lowerfuncval.bit) and an
+// INTERFACE method taken as a value gets a trampoline whose own `ret` is
+// single-word (`lowerIfaceMethodValue`, lowerglobal.bit) — neither call site
+// can know the callee returned words. Nor do the three names lowering
+// synthesizes calls to (`show`, `message`, `init`). `collectDynamicMethodNames`
+// (lowerexplodemethod.bit) builds exactly that set FIRST and hands it here as
+// `hard`, so agreement can never rescue a name from it.
+//
+// A DEFERRED interface call needs nothing here: `resolveDeferMethodTarget`
+// (lowerdefer.bit) types its `Op.CallIface` `void` and emits no `Op.CallWord`
+// run, so the extra return registers are ignored — the same case
+// `deferredResultTy` already documents for a direct call.
+
+// The per-word types an `Op.CallIface` on `name` carries, or an EMPTY list for
+// the one-handle convention. `ctx.wordRetMethods` is filled by
+// `ifaceWordRetMethods` below before any body is lowered, so an unfilled map
+// answers "one handle" for every name — an unfilled gate must be the
+// restrictive one, the same way `methodNameIsDynamic` is.
+fn ifaceRetWords(ctx: TypeContext, name: string): []int {
+  let (w, ok) = ctx.wordRetMethods[name]
+  if (!ok) {
+    return []int(0)
+  }
+  return w
+}
+
+// Whether `name` hands its result back in words — the one relaxation
+// `methodRetExplodes` (lowerexplodemethod.bit) makes to #5445's gate, and the
+// reason that gate's guarantee is unchanged: a name reaches here only after
+// every declaration of it agreed, so a method admitted this way still has
+// exactly one convention across every caller it can have.
+fn methodNameReturnsWords(ctx: TypeContext, name: string): bool {
+  return len(ifaceRetWords(ctx, name)) != 0
+}
+
+// The `Op.CallIface` for `name`, with the `Op.CallWord` run its callees' `ret`s
+// need when the name returns words. The vtable twin of `emitStaticMethodCall`
+// (lowerexplodemethod.bit) and the ONLY producer of a user-source interface
+// call — `lowerMemberMethodCall` (lowercall.bit) calls nothing else, so the
+// call site and the word list cannot drift apart.
+//
+// `result` is what the call evaluates to in Bit terms (the unwrapped method
+// result); a name the map refuses reads `words` empty and emits exactly the
+// single-result `call_iface` this site emitted before.
+fn emitIfaceMethodCall(fc: FnCtx, mname: string, recvV: int, args: []int, result: int): int {
+  let words = ifaceRetWords(fc.c.ctx, mname)
+  let ins = mkInstr(Op.CallIface, result)
+  if (len(words) != 0) {
+    ins = mkInstr(Op.CallIface, words[0])
+  }
+  ins.lhs = recvV
+  ins.ival = methodId(fc.lowerer, mname)
+  ins.args = args
+  let call = builderEmit(fc.b, ins)
+  if (len(words) == 0) {
+    return call
+  }
+  // The aggregate is rebuilt here and the optimizer removes the box exactly as
+  // it does on the direct side (`emitStaticMethodCall`): the consumer's
+  // `field_get`s forward from these `field_set`s in the same block. Where the
+  // value genuinely escapes the box stays, which is today's behaviour, so this
+  // is never worse than what it replaces and correctness never depends on the
+  // optimizer running.
+  return materializeExplodedIn(
+    fc, fc.b, result, emitCallResultWords(fc.c.ctx, fc.b, call, words),
+  )
+}
+
+// The per-name fold `ifaceWordRetMethods` walks the whole type table into.
+// `words` is the list the name has agreed on so far, `bad` a name some
+// declaration has already disagreed with (or refused outright), and `iface`
+// every name an interface declares — only those are candidates, because a name
+// no interface declares is #5445's question and is answered per declaration.
+class RetWordFold {
+  words: map<string, []int>,
+  bad: map<string, bool>,
+  iface: []string,
+}
+
+// `TypeContext.wordRetMethods` for the whole project: name -> the word list
+// every declaration of that name agreed on. PROJECT-wide and computed once,
+// because that is the scope the question has — an implementing class is
+// lowered in its own module and the call site in another, from one
+// `lowerProject`.
+//
+// `lo.multiWordRet` short-circuits the whole pass, so x86_64 (which boxes by
+// design, `targetReturnsInRegisters` in build.bit) gets an empty map and every
+// site below reads "one handle" exactly as it does today.
+fn ifaceWordRetMethods(
+  mods: []Checker,
+  root: int,
+  lo: Lowerer,
+  hard: map<string, bool>,
+): map<string, []int> {
+  let out = map<string, []int>{}
+  if (!lo.multiWordRet) {
+    return out
+  }
+  let ctx = mods[root].ctx
+  let fold = RetWordFold{
+    words: map<string, []int>{},
+    bad: map<string, bool>{},
+    iface: []string(0),
+  }
+  let t = 0
+  while (t < len(ctx.types)) {
+    foldTypeRetWords(mods, root, lo, fold, t)
+    t = t + 1
+  }
+  let i = 0
+  while (i < len(fold.iface)) {
+    admitAgreedName(out, fold, hard, fold.iface[i])
+    i = i + 1
+  }
+  return out
+}
+
+// One candidate name into `out`, if every declaration of it agreed on a
+// non-empty word list AND it is not in `hard` (a name no agreement can rescue —
+// see this file's banner).
+fn admitAgreedName(
+  out: map<string, []int>,
+  fold: RetWordFold,
+  hard: map<string, bool>,
+  name: string,
+) {
+  let (isHard, hardSeen) = hard[name]
+  if (hardSeen && isHard) {
+    return
+  }
+  let (isBad, badSeen) = fold.bad[name]
+  if (badSeen && isBad) {
+    return
+  }
+  let (w, ok) = fold.words[name]
+  if (ok && len(w) != 0) {
+    out[name] = w
+  }
+}
+
+// Folds every method type `t` declares into the per-name agreement.
+// `typeMethodNames` (types.bit) is the only way to ask a type which members it
+// has — `methodResults`/`methodDecls` are keyed "<typeId>.<member>" and a map
+// cannot be enumerated by prefix.
+fn foldTypeRetWords(mods: []Checker, root: int, lo: Lowerer, fold: RetWordFold, t: int) {
+  let ctx = mods[root].ctx
+  let (ms, ok) = ctx.typeMethodNames["${t}"]
+  if (!ok) {
+    return
+  }
+  let isIface = ctx.types[t].kind == TypeKind.Interface
+  let i = 0
+  while (i < len(ms)) {
+    if (isIface) {
+      fold.iface = append(fold.iface, ms[i])
+    }
+    noteRetWords(fold, ms[i], declRetWordsAt(mods, root, lo, t, ms[i]))
+    i = i + 1
+  }
+}
+
+// `name` on type `t` contributes `words` to the fold. An EMPTY list is a
+// refusal and poisons the name — that is the whole unanimity rule, and it is
+// why every caller of this hands back an empty list rather than skipping a
+// declaration it could not classify.
+fn noteRetWords(fold: RetWordFold, name: string, words: []int) {
+  if (len(words) == 0) {
+    fold.bad[name] = true
+    return
+  }
+  let (prev, ok) = fold.words[name]
+  if (!ok) {
+    fold.words[name] = words
+    return
+  }
+  if (!intListsEqual(prev, words)) {
+    fold.bad[name] = true
+  }
+}
+
+fn intListsEqual(a: []int, b: []int): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The word list `t.name` would return, or empty when it must not.
+//
+// An INTERFACE has no `FuncDecl` (`methodDecls`' own comment says so), so its
+// contribution is read off the signature the checker recorded. A CONCRETE
+// method's is read off the very declaration its `ret` will be lowered from,
+// through `methodDeclRetEligible` (lowerexplodemethod.bit) — the same
+// per-declaration gate #5445 applies, so a generic, variadic, `extern` or
+// `@symbol` implementation refuses and takes the whole name with it rather
+// than leaving one class on a convention its interface's call sites do not
+// use. A concrete method whose declaration this cannot find refuses for the
+// same reason.
+fn declRetWordsAt(mods: []Checker, root: int, lo: Lowerer, t: int, name: string): []int {
+  let ctx = mods[root].ctx
+  let key = "${t}.${name}"
+  if (ctx.types[t].kind == TypeKind.Interface) {
+    let (res, ok) = ctx.methodResults[key]
+    if (!ok) {
+      return []int(0)
+    }
+    return plainRetWords(ctx, lo, res)
+  }
+  let (decl, dok) = ctx.methodDecls[key]
+  let (mod, mok) = ctx.methodDeclMods[key]
+  if (!dok || !mok || mod < 0 || mod >= len(mods)) {
+    return []int(0)
+  }
+  let owner = mods[mod]
+  if (!methodDeclRetEligible(owner, decl)) {
+    return []int(0)
+  }
+  return plainRetWords(ctx, lo, declPlainResultType(owner, decl))
+}
+
+// `ty`'s return words under this build's gates, or empty. The same two steps
+// `explodedRetWords` (lowerexplode.bit) takes after its own eligibility test —
+// the width rule and the RETURN side's register budget (#4238: a return word
+// past the eighth has no path at all) — so a name admitted here and a callee
+// lowered by `explodedRetWords` derive the identical list.
+//
+// A `Fallible` result is refused here as well as by `declPlainResultType`,
+// because the interface arm above reads `methodResults` raw and a method
+// declared `(): Step!` records the Fallible type there.
+fn plainRetWords(ctx: TypeContext, lo: Lowerer, ty: int): []int {
+  if (ty == 0 || ctx.types[ty].kind == TypeKind.Fallible) {
+    return []int(0)
+  }
+  let words = explodedWordTypes(ctx, ty, lo.explodeStrings)
+  if (!retWordsFitRegisters(ctx, words)) {
+    return []int(0)
+  }
+  return words
+}
