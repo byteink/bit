@@ -1,0 +1,457 @@
+// pkg/yaml/block.bit — literal (`|`) and folded (`>`) block scalars: header
+// parsing, indentation resolution, chomping and folding (#5494, epic #1482).
+// `value.bit` and `scan.bit` are siblings in this same flat module
+// (pkg/README.md); `scan.bit`'s `scanBlockScalarHeader` stops at the header
+// (see that function's own comment) — this file reads forward from there and
+// owns the block body end to end, since the body's extent is not knowable
+// until the indentation is resolved (this file's one exported signature
+// reflects that: it takes a header span and a parent indent, not a
+// pre-sliced body).
+//
+// THE HEADER. `|`/`>` plus, in either order, an explicit indentation digit
+// (`1`-`9`; `0` is invalid — it never resolves an ambiguity) and a chomping
+// indicator (`-` strip, `+` keep; no indicator is clip, the default).
+// `parseBlockHeader` walks the header span one byte at a time
+// (`applyIndicator`) rather than as one flat function, since the six-way
+// combination of "which field, which duplicate check, which digit range"
+// pushes a single function's branch count past E0204's limit.
+//
+// INDENTATION. Explicit: `parentIndent + indicator`, taken literally, so
+// whitespace beyond it inside a content line is not indentation — it is
+// content (`resolveBlockIndent`). Implicit: the leading spaces of the first
+// non-blank line among the block's candidate lines (`detectImplicitIndent`);
+// a candidate line is any blank line or any non-blank line more indented
+// than `parentIndent` — a non-blank line at or below `parentIndent` can
+// never belong to this block regardless of style or chomping, so that
+// alone bounds how far detection has to look. Blank lines seen before that
+// first non-blank line do not fix the indent themselves, but once it is
+// fixed, any of their bytes past that column are content, never discarded —
+// `blockLineContent` strips exactly `blockIndent` columns from EVERY line,
+// blank or not, so a blank line indented deeper than the block keeps its
+// extra whitespace exactly the same way a content line would. That is what
+// keeps a leading blank line that happens to be more indented than the
+// block from being silently swallowed as padding.
+//
+// A tab is never counted as indentation: `countLeadingSpaces` counts only
+// `' '` bytes, so a tab immediately short-circuits it. A non-blank line
+// whose space-count then falls short of `blockIndent` simply ends the block
+// (`collectBlockLines`) — the same path an ordinary dedent takes — rather
+// than a separate tab-specific error; the tab is never mistaken for
+// indentation either way, which is the constraint this file has to meet.
+//
+// CHOMPING. Every style/mode combination is built the same way: assemble
+// the full "keep" text first (every line break the source actually had,
+// literal or folded per style), then `applyChomping` trims or keeps its
+// trailing newline run. Clip special-cases empty content (no newline to
+// keep) and a source with no final line break at all (nothing to clip to
+// one of) — it never invents a break the source never had.
+//
+// FOLDING. `buildFoldedKeep` mirrors `scalar.bit`'s `foldLines`/
+// `foldSeparator` shape (reused directly — same module, pkg/README.md's flat
+// namespace) but the critical difference from a plain scalar's fold is
+// this: a more-indented line suspends folding on BOTH sides, not just the
+// separator immediately before it. `literalBreak` is
+// `prevMoreIndented || moreIndented`, checked at every separator, so the
+// break from a more-indented line back down to a normal one stays a literal
+// newline instead of being folded to a space — the exact case the ticket
+// names as the most commonly wrong part of a folded scalar.
+
+// Which trailing-newline rule `applyChomping` applies. `ChompClip` is also
+// the "no indicator seen yet" sentinel `applyIndicator` starts from: clip
+// has no character of its own in the header grammar, so a real header can
+// never legitimately set it a second time.
+enum ChompMode {
+  ChompClip,
+  ChompStrip,
+  ChompKeep,
+}
+
+enum BlockStyle {
+  Literal,
+  Folded,
+}
+
+// `indent < 0` means no explicit indentation indicator was present.
+class BlockHeader { style: BlockStyle, indent: i64, chomp: ChompMode }
+
+// One physical line of the block body, already measured. `textEnd` is the
+// offset of the line's terminator (or `len(src)` at a final, unterminated
+// line); `nextStart` is where the following line begins.
+class BlockLine {
+  spaces: i64,
+  isBlank: bool,
+  lineStart: i64,
+  textEnd: i64,
+  hadBreak: bool,
+  nextStart: i64,
+}
+
+// This package's own error convention, matching `scalar.bit`'s
+// `scalarError`: a message plus the byte offset it happened at.
+fn blockError(msg: string, offset: i64): error {
+  return newError("${msg} at byte ${offset}")
+}
+
+// --- header ---------------------------------------------------------------
+
+fn parseBlockStyle(src: string, headerStart: i64, headerEnd: i64): BlockStyle! {
+  if (headerEnd - headerStart < 1) {
+    fail blockError("yaml: empty block scalar header", headerStart)
+  }
+  let c = src[headerStart]
+  if (c == '|') {
+    return BlockStyle.Literal
+  }
+  if (c == '>') {
+    return BlockStyle.Folded
+  }
+  fail blockError("yaml: block scalar header must start with | or >", headerStart)
+}
+
+// One header byte past the style marker, applied to `h`. Digit and chomp
+// character are independent fields so `|2-` and `|-2` reach the same
+// `BlockHeader` regardless of order — this function does not care which it
+// sees first, only that neither repeats.
+fn applyIndicator(h: BlockHeader, c: u8, offset: i64): BlockHeader! {
+  if (isDigit(c)) {
+    if (h.indent >= 0) {
+      fail blockError("yaml: duplicate indentation indicator", offset)
+    }
+    if (c == '0') {
+      fail blockError("yaml: indentation indicator must be 1-9", offset)
+    }
+    return BlockHeader{ style: h.style, indent: i64(c - '0'), chomp: h.chomp }
+  }
+  if (c == '-' || c == '+') {
+    if (h.chomp == ChompMode.ChompStrip || h.chomp == ChompMode.ChompKeep) {
+      fail blockError("yaml: duplicate chomping indicator", offset)
+    }
+    if (c == '-') {
+      return BlockHeader{ style: h.style, indent: h.indent, chomp: ChompMode.ChompStrip }
+    }
+    return BlockHeader{ style: h.style, indent: h.indent, chomp: ChompMode.ChompKeep }
+  }
+  fail blockError("yaml: invalid character in block scalar header", offset)
+}
+
+// `src[headerStart:headerEnd)` is exactly the `BlockScalarHeader` token
+// `scan.bit` emits: the style byte plus at most one digit and one chomp
+// character, in either order (`scanBlockScalarHeader`'s own `isBlockHeaderChar`
+// already restricts the byte set; this function only checks arity and range).
+fn parseBlockHeader(src: string, headerStart: i64, headerEnd: i64): BlockHeader! {
+  let style = parseBlockStyle(src, headerStart, headerEnd)?
+  let header = BlockHeader{ style: style, indent: -1, chomp: ChompMode.ChompClip }
+  let i = headerStart + 1
+  while (i < headerEnd) {
+    header = applyIndicator(header, src[i], i)?
+    i = i + 1
+  }
+  return header
+}
+
+// The spaces/tabs and optional `#...` comment that may trail the header on
+// its own line, stopped at the first byte that is neither — the newline (or
+// EOF) `consumeHeaderNewline` expects next.
+fn skipHeaderWhitespaceAndComment(src: string, pos: i64, n: i64): i64 {
+  let i = pos
+  while (i < n && (src[i] == ' ' || src[i] == '\t')) {
+    i = i + 1
+  }
+  if (i >= n || src[i] != '#') {
+    return i
+  }
+  while (i < n && src[i] != '\n' && src[i] != '\r') {
+    i = i + 1
+  }
+  return i
+}
+
+// The offset right after the header line's own break, or `i` unchanged at
+// EOF (a header with no body at all). Anything else at `i` — the comment
+// scan already consumed a real comment, so this only fires on stray
+// non-whitespace — is malformed input, never silently accepted.
+fn consumeHeaderNewline(src: string, i: i64, n: i64): i64! {
+  if (i >= n) {
+    return i
+  }
+  if (src[i] == '\r' && i + 1 < n && src[i + 1] == '\n') {
+    return i + 2
+  }
+  if (src[i] == '\n') {
+    return i + 1
+  }
+  fail blockError("yaml: unexpected content after block scalar header", i)
+}
+
+// The byte offset the block body starts at, just past the header line.
+fn skipHeaderTail(src: string, headerEnd: i64, n: i64): i64! {
+  let i = skipHeaderWhitespaceAndComment(src, headerEnd, n)
+  return consumeHeaderNewline(src, i, n)?
+}
+
+// --- line measurement -------------------------------------------------------
+
+// The count of leading `' '` bytes from `lineStart` — this file's only
+// notion of indentation. A `'\t'` (or any other byte) stops the count
+// immediately, so a tab can never be counted as indentation (constraint).
+fn countLeadingSpaces(src: string, lineStart: i64, n: i64): i64 {
+  let i = lineStart
+  while (i < n && src[i] == ' ') {
+    i = i + 1
+  }
+  return i - lineStart
+}
+
+// `(textEnd, isBlank)` for the line body starting at `start` (right after
+// its leading spaces): `textEnd` is the offset of its terminator or EOF;
+// `isBlank` is whether every byte in between is a space or tab.
+fn scanLineBody(src: string, start: i64, n: i64): (i64, bool) {
+  let j = start
+  let blank = true
+  while (j < n && src[j] != '\n' && src[j] != '\r') {
+    if (src[j] != ' ' && src[j] != '\t') {
+      blank = false
+    }
+    j = j + 1
+  }
+  return (j, blank)
+}
+
+// `(hadBreak, nextStart)` for the terminator starting at `j`: `false` only
+// at true EOF with no trailing newline, the one case a block's last line
+// carries no break to chomp.
+fn lineTerminator(src: string, j: i64, n: i64): (bool, i64) {
+  if (j >= n) {
+    return (false, j)
+  }
+  if (src[j] == '\r' && j + 1 < n && src[j + 1] == '\n') {
+    return (true, j + 2)
+  }
+  return (true, j + 1)
+}
+
+// One physical line's full record, from raw source bytes only — the scanner
+// never tokenizes a block body (`scan.bit`'s own header comment), so every
+// line inside one is measured here.
+fn scanBlockLine(src: string, lineStart: i64, n: i64): BlockLine {
+  let spaces = countLeadingSpaces(src, lineStart, n)
+  let (textEnd, blank) = scanLineBody(src, lineStart + spaces, n)
+  let (hadBreak, nextStart) = lineTerminator(src, textEnd, n)
+  return BlockLine{
+    spaces: spaces,
+    isBlank: blank,
+    lineStart: lineStart,
+    textEnd: textEnd,
+    hadBreak: hadBreak,
+    nextStart: nextStart,
+  }
+}
+
+// --- indentation resolution -------------------------------------------------
+
+// Implicit indentation: the leading-space count of the first non-blank
+// candidate line (a candidate is blank, or non-blank and more indented than
+// `parentIndent` — see this file's header). No candidate at all (the block
+// is empty or entirely blank) falls back to the deepest blank line seen, 0
+// if there were none either.
+fn detectImplicitIndent(src: string, bodyStart: i64, n: i64, parentIndent: i64): i64 {
+  let pos = bodyStart
+  let maxBlank = 0
+  let guard = 0
+  let bound = n - bodyStart + 8
+  while (pos < n && guard <= bound) {
+    guard = guard + 1
+    let line = scanBlockLine(src, pos, n)
+    if (!line.isBlank) {
+      if (line.spaces > parentIndent) {
+        return line.spaces
+      }
+      return maxBlank
+    }
+    if (line.spaces > maxBlank) {
+      maxBlank = line.spaces
+    }
+    pos = line.nextStart
+    if (!line.hadBreak) {
+      return maxBlank
+    }
+  }
+  return maxBlank
+}
+
+// The resolved block indentation: the header's own digit, offset from the
+// parent, or detected from the body when the header carried none.
+fn resolveBlockIndent(
+  header: BlockHeader,
+  src: string,
+  bodyStart: i64,
+  n: i64,
+  parentIndent: i64,
+): i64 {
+  if (header.indent >= 0) {
+    return parentIndent + header.indent
+  }
+  return detectImplicitIndent(src, bodyStart, n, parentIndent)
+}
+
+// --- body collection ---------------------------------------------------------
+
+// Every line belonging to the block, in order, plus the offset the scanner
+// resumes at. Blank lines always belong (chomping decides how many trailing
+// ones survive); a non-blank line short of `blockIndent` — whether a real
+// dedent or a tab that kept `spaces` from reaching it — ends the block
+// without being consumed, never an error (this file's header explains why a
+// tab needs no separate error path).
+fn collectBlockLines(src: string, bodyStart: i64, n: i64, blockIndent: i64): ([]BlockLine, i64)! {
+  let lines = []BlockLine(0)
+  let pos = bodyStart
+  let guard = 0
+  let bound = n - bodyStart + 8
+  while (pos < n && guard <= bound) {
+    guard = guard + 1
+    let line = scanBlockLine(src, pos, n)
+    if (!line.isBlank && line.spaces < blockIndent) {
+      return (lines, pos)
+    }
+    lines = append(lines, line)
+    pos = line.nextStart
+    if (!line.hadBreak) {
+      return (lines, pos)
+    }
+  }
+  if (guard > bound) {
+    fail blockError("yaml: block scalar body scan did not terminate", pos)
+  }
+  return (lines, pos)
+}
+
+// --- content assembly -------------------------------------------------------
+
+// `line`'s content: everything past the first `blockIndent` columns, or ""
+// when the line does not reach that far (a shorter blank line). Applied to
+// every line alike, blank or not — the mechanism behind this file's
+// leading-more-indented-blank-line rule (see this file's header).
+fn blockLineContent(src: string, line: BlockLine, blockIndent: i64): string {
+  let cut = line.lineStart + blockIndent
+  if (cut >= line.textEnd) {
+    return ""
+  }
+  return src[cut:line.textEnd]
+}
+
+fn blockLineMoreIndented(line: BlockLine, blockIndent: i64): bool {
+  return line.spaces > blockIndent
+}
+
+// Literal (`|`): every line break kept exactly, never folded.
+fn buildLiteralKeep(src: string, lines: []BlockLine, blockIndent: i64): string {
+  let b = newBuilder()
+  let i = 0
+  while (i < len(lines)) {
+    b = b.write(blockLineContent(src, lines[i], blockIndent))
+    if (lines[i].hadBreak) {
+      b = b.writeByte('\n')
+    }
+    i = i + 1
+  }
+  return b.toString()
+}
+
+// Folded (`>`): a line is a "chunk" (gets its own separator-then-content
+// treatment) when it has real content or is more indented than the block —
+// a more-indented blank line's extra whitespace is content too, per this
+// file's header. Every other blank line only advances `breakCount`, feeding
+// `foldSeparator` (reused from `scalar.bit`, same module) once the next
+// chunk is reached. `literalBreak` is true when EITHER side of the
+// separator is more indented, not just the one right before it — the break
+// after a more-indented line stays literal too, which is the trap this
+// file's header names.
+fn buildFoldedKeep(src: string, lines: []BlockLine, blockIndent: i64): string {
+  let b = newBuilder()
+  let breakCount = 0
+  let haveChunk = false
+  let prevMoreIndented = false
+  let i = 0
+  while (i < len(lines)) {
+    let line = lines[i]
+    let moreIndented = blockLineMoreIndented(line, blockIndent)
+    let isChunk = !line.isBlank || moreIndented
+    if (!isChunk) {
+      breakCount = breakCount + 1
+      i = i + 1
+      continue
+    }
+    if (haveChunk) {
+      let literalBreak = prevMoreIndented || moreIndented
+      b = b.write(foldSeparator(breakCount, literalBreak))
+    }
+    b = b.write(blockLineContent(src, line, blockIndent))
+    haveChunk = true
+    prevMoreIndented = moreIndented
+    breakCount = 0
+    if (line.hadBreak) {
+      breakCount = 1
+    }
+    i = i + 1
+  }
+  b = b.write(repeat("\n", breakCount))
+  return b.toString()
+}
+
+fn buildKeepText(src: string, style: BlockStyle, lines: []BlockLine, blockIndent: i64): string {
+  match (style) {
+    Literal => return buildLiteralKeep(src, lines, blockIndent)
+    Folded => return buildFoldedKeep(src, lines, blockIndent)
+  }
+}
+
+// --- chomping ----------------------------------------------------------------
+
+// `keepText` with every line break the source had, literal or folded.
+// Chomping only ever trims or keeps its trailing run of `'\n'` bytes — it
+// never touches anything before that run.
+fn applyChomping(keepText: string, chomp: ChompMode): string {
+  let n = len(keepText)
+  let trailingNL = 0
+  while (trailingNL < n && keepText[n - 1 - trailingNL] == '\n') {
+    trailingNL = trailingNL + 1
+  }
+  let core = keepText[0:n - trailingNL]
+  match (chomp) {
+    ChompStrip => return core
+    ChompKeep => return keepText
+    ChompClip => {
+      if (core == "") {
+        return core
+      }
+      if (trailingNL >= 1) {
+        return core + "\n"
+      }
+      return core
+    }
+  }
+}
+
+// --- entry point ---------------------------------------------------------
+
+// Decodes the block scalar whose header token is `src[headerStart:headerEnd)`
+// (exactly what `scan.bit`'s `BlockScalarHeader` token spans), reading
+// forward into the body it owns. `parentIndent` is the indentation of the
+// node this block scalar is a value of. Returns the decoded string and the
+// byte offset just past the block, so a caller (a future parser) can resume
+// scanning there without re-scanning anything this function already read.
+export fn yamlDecodeBlockScalar(
+  src: string,
+  headerStart: i64,
+  headerEnd: i64,
+  parentIndent: i64,
+): (string, i64)! {
+  let n = len(src)
+  let header = parseBlockHeader(src, headerStart, headerEnd)?
+  let bodyStart = skipHeaderTail(src, headerEnd, n)?
+  let blockIndent = resolveBlockIndent(header, src, bodyStart, n, parentIndent)
+  let (lines, resumeAt) = collectBlockLines(src, bodyStart, n, blockIndent)?
+  let keepText = buildKeepText(src, header.style, lines, blockIndent)
+  let text = applyChomping(keepText, header.chomp)
+  return (text, resumeAt)
+}
