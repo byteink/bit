@@ -1,0 +1,706 @@
+// Bit toml package — parse.bit, the document parser and the package's main
+// entry point: `tomlParse` (TOML 1.0.0, #5484, epic #1481).
+//
+// This file owns the STRUCTURAL half of TOML: key/value lines, dotted keys,
+// `[table]` and `[[array of tables]]` headers, inline tables and arrays, and
+// every redefinition rule. It drives `pkg/toml/lex.bit`'s streaming
+// `lexNext` (never `lex`, which materializes `[]Token`) and calls
+// `tomlDecodeString`/`tomlDecodeNumber`/`tomlDecodeDateTime` for every
+// scalar — no string, number or date-time grammar is re-implemented here.
+//
+// THE WORKING DOCUMENT TREE. `Toml.TomlTable` is immutable ([]TomlEntry), but
+// a table under construction needs to be extended key by key, sometimes long
+// after it was first created. `WTable` is the mutable counterpart this file
+// builds against and converts to `Toml` only once, in `finalizeTable`:
+//
+//   enum WNode { WLeaf(Toml), WSub(WTable), WArr([]WTable) }
+//
+// A `WLeaf` is a value that can never be extended: every ordinary scalar,
+// every `TomlArray`, and — critically — a closed inline table, which becomes
+// a `WLeaf(TomlTable(...))` the instant its `}` is seen. Reaching a `WLeaf`
+// while resolving any later path (a header, a dotted key) is always an
+// error, and that ONE check is what implements three of the spec's separate
+// rules at once: colliding with a plain value, redefining an intermediate as
+// a non-table, and extending an inline table — they are the same case here.
+//
+// EXPLICIT VS IMPLICIT. `WTable.explicit` is true exactly when a `[header]`
+// (not `[[...]]`) has claimed this exact table. A dotted key's intermediate
+// segments only ever create `explicit: false` tables (TOML's grammar never
+// lets a dotted key's non-terminal segment be anything else), and
+// descending an EXISTING table — by dotted key or as a header's own
+// intermediate segment — never checks or sets this flag: TOML allows
+// `[a]` followed by `b.c = 1` to extend `a` with a new implicit `b` freely.
+// The flag matters at exactly one place, `reopenTableHeader`: a `[header]`
+// whose full path already resolves to a table that is already `explicit`
+// is the spec's "you cannot define a table more than once". `[[array]]`
+// headers never redefine — a repeated `[[x]]` always appends — so array
+// elements carry no such flag at all.
+//
+// NO RECURSION FOR VALUE NESTING. `parseCompoundValue` drives an explicit
+// `[]Ctx` stack for arrays and inline tables, never a function calling
+// itself, so a maliciously deep run of `[`/`{` cannot grow the Bit call
+// stack — `pushContainer` refuses once `len(stack) >= tomlMaxDepth`
+// (`lex.bit`'s own bracket-depth cap, reused here as this parser's own flat
+// counter). `finalizeTable`, by contrast, IS mutual recursion — but it runs
+// only after the whole document is already built, and `newChildTable`
+// refused every table past that same `tomlMaxDepth` on the way in, so its
+// worst case is a compile-time-bounded 128 frames, not input-driven.
+//
+// INLINE TABLES: SIMPLE KEYS ONLY. TOML 1.0.0 permits dotted keys inside
+// `{ }` (`{ a.b = 1 }`); this file does not split them — an inline table's
+// entries are read as flat `[]TomlEntry`, one `key = value` per comma, and a
+// dotted segment there is rejected the same as any other malformed key
+// (comes back as "expected '='"). Left for the compliance ticket (#5487) to
+// surface and follow up on; not a case the acceptance list below requires.
+//
+// KEY TOKENS THAT AREN'T `BareKey`. `lex.bit`'s scanner reclassifies the
+// bare words `true`/`false`/`inf`/`nan` and any all-digit run as
+// `Bool`/`Number` even in key position (its own header: a key-position digit
+// run has no way to tell itself apart from a value at the scanner level).
+// `parseKeySegment` accepts those tokens back as bare-key text too. A
+// `Number` span with a `.`/sign/exponent (TOML's "numeric dotted key",
+// `1.2 = 3` meaning table `1` key `2`) would need re-splitting at the lexer
+// boundary this file does not own; that gap is also left for #5487.
+
+// --- the mutable working tree -----------------------------------------
+
+enum WNode {
+  WLeaf(Toml),
+  WSub(WTable),
+  WArr([]WTable),
+}
+
+class WEntry { key: string, node: WNode }
+
+// `depth` is this table's distance from the root, checked by `newChildTable`
+// against `tomlMaxDepth` so `finalizeTable`'s recursion is bounded by a
+// constant rather than by how many dots a header or key chain contains.
+class WTable { entries: []WEntry, explicit: bool, depth: int }
+
+fn newRootTable(): WTable {
+  return WTable{ entries: []WEntry(0), explicit: true, depth: 0 }
+}
+
+// A new child of `parent`, refusing once nesting would exceed
+// `tomlMaxDepth` — the one place table depth is bounded, shared by dotted
+// keys, `[header]`, and `[[header]]` alike.
+fn newChildTable(parent: WTable, explicit: bool, offset: int): WTable! {
+  if (parent.depth + 1 > tomlMaxDepth) {
+    fail tomlParseError("table nesting exceeds maximum depth", offset)
+  }
+  return WTable{ entries: []WEntry(0), explicit: explicit, depth: parent.depth + 1 }
+}
+
+// Finds `key` among `t`'s own entries (not recursive), or none.
+fn findEntry(t: WTable, key: string): Option<WEntry> {
+  let i = 0
+  while (i < len(t.entries)) {
+    if (t.entries[i].key == key) {
+      return Option<WEntry>.Some(t.entries[i])
+    }
+    i = i + 1
+  }
+  return Option<WEntry>.None
+}
+
+// One key path segment, paired with the byte offset of its own token —
+// `TomlError.offset` names the failing construct, not the whole line.
+class KeySeg { name: string, offset: int }
+
+// Descends one INTERMEDIATE path segment (never the terminal one) from `t`:
+// creates an implicit `WSub` the first time `seg.name` is seen, otherwise
+// descends into an existing table — or, per TOML's array-of-tables
+// extension rule, the LAST element of an existing array of tables. A
+// `WLeaf` here is always an error: the segment already names a value, not a
+// table.
+fn descendIntermediate(t: WTable, seg: KeySeg): WTable! {
+  let found = findEntry(t, seg.name)
+  match (found) {
+    None => {
+      let sub = newChildTable(t, false, seg.offset)?
+      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WSub(sub) })
+      return sub
+    }
+    Some(e) => { return descendIntoExisting(e, seg)? }
+  }
+}
+
+fn descendIntoExisting(e: WEntry, seg: KeySeg): WTable! {
+  match (e.node) {
+    WSub(sub) => { return sub }
+    WArr(tables) => { return tables[len(tables) - 1] }
+    WLeaf(_) => {
+      fail tomlParseError("'${seg.name}' is already defined and is not a table", seg.offset)
+    }
+  }
+}
+
+// The terminal segment of a `[header]` (never `[[...]]`): creates a new
+// explicit table, or claims an existing implicit one, or fails — a table
+// already explicit, an array of tables, or a plain value are all
+// redefinitions.
+fn openTableHeader(t: WTable, seg: KeySeg): WTable! {
+  let found = findEntry(t, seg.name)
+  match (found) {
+    None => {
+      let sub = newChildTable(t, true, seg.offset)?
+      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WSub(sub) })
+      return sub
+    }
+    Some(e) => { return reopenTableHeader(e, seg)? }
+  }
+}
+
+fn reopenTableHeader(e: WEntry, seg: KeySeg): WTable! {
+  match (e.node) {
+    WSub(sub) => {
+      if (sub.explicit) {
+        fail tomlParseError("table '${seg.name}' redefined", seg.offset)
+      }
+      sub.explicit = true
+      return sub
+    }
+    WArr(_) => { fail tomlParseError("'${seg.name}' is already an array of tables", seg.offset) }
+    WLeaf(_) => { fail tomlParseError("'${seg.name}' is already defined", seg.offset) }
+  }
+}
+
+// The terminal segment of a `[[header]]`: always appends a fresh table to
+// the array (or creates a one-element array the first time), unless `key`
+// already names a plain table or a value.
+fn openArrayTableHeader(t: WTable, seg: KeySeg): WTable! {
+  let found = findEntry(t, seg.name)
+  match (found) {
+    None => {
+      let fresh = newChildTable(t, true, seg.offset)?
+      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WArr([fresh]) })
+      return fresh
+    }
+    Some(e) => { return appendArrayTable(t, e, seg)? }
+  }
+}
+
+fn appendArrayTable(t: WTable, e: WEntry, seg: KeySeg): WTable! {
+  match (e.node) {
+    WArr(tables) => {
+      let fresh = newChildTable(t, true, seg.offset)?
+      e.node = WNode.WArr(append(tables, fresh))
+      return fresh
+    }
+    WSub(_) => { fail tomlParseError("'${seg.name}' is already a table", seg.offset) }
+    WLeaf(_) => { fail tomlParseError("'${seg.name}' is already defined", seg.offset) }
+  }
+}
+
+// Sets a terminal key/value pair on `t`: any existing entry under this
+// exact name — leaf, table, or array of tables — is a duplicate key.
+fn setLeaf(t: WTable, seg: KeySeg, value: Toml): ()! {
+  let found = findEntry(t, seg.name)
+  match (found) {
+    None => {
+      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WLeaf(value) })
+      return
+    }
+    Some(_) => { fail tomlParseError("duplicate key '${seg.name}'", seg.offset) }
+  }
+}
+
+// --- converting the working tree to `Toml` -----------------------------
+//
+// Safe as ordinary (mutual) recursion: `newChildTable` already refused any
+// table past `tomlMaxDepth` on the way in, so this walk is bounded by that
+// same compile-time constant, not by anything still under an attacker's
+// control (see this file's header).
+
+fn finalizeTable(t: WTable): Toml {
+  let entries = []TomlEntry(0, len(t.entries))
+  let i = 0
+  while (i < len(t.entries)) {
+    entries = append(entries, finalizeEntry(t.entries[i]))
+    i = i + 1
+  }
+  return Toml.TomlTable(entries)
+}
+
+fn finalizeEntry(e: WEntry): TomlEntry {
+  match (e.node) {
+    WLeaf(v) => { return TomlEntry{ key: e.key, value: v } }
+    WSub(sub) => { return TomlEntry{ key: e.key, value: finalizeTable(sub) } }
+    WArr(tables) => { return TomlEntry{ key: e.key, value: Toml.TomlArray(finalizeArray(tables)) } }
+  }
+}
+
+fn finalizeArray(tables: []WTable): []Toml {
+  let out = []Toml(0, len(tables))
+  let i = 0
+  while (i < len(tables)) {
+    out = append(out, finalizeTable(tables[i]))
+    i = i + 1
+  }
+  return out
+}
+
+// --- the parser ----------------------------------------------------------
+
+class Parser { src: string, lx: Lexer, root: WTable, current: WTable }
+
+fn newTomlParser(src: string): Parser {
+  let root = newRootTable()
+  let p = Parser{ src: src, lx: newLexer(src), root: root, current: root }
+  lexNext(p.lx)
+  return p
+}
+
+// Moves past the token under the cursor. At `Eof` it stays put, mirroring
+// `stdlib/json/parse.bit`'s own `advance`.
+fn advance(p: Parser) {
+  if (p.lx.kind != TokenKind.Eof) {
+    lexNext(p.lx)
+  }
+}
+
+// An upper bound on the tokens `p.src` can still yield: every token
+// consumes at least one source byte, plus a guard slot.
+fn tokenBound(p: Parser): int {
+  return len(p.src) + 2
+}
+
+fn tomlParseError(msg: string, offset: int): error {
+  return TomlError{ offset: offset, msg: msg }
+}
+
+export fn tomlParse(src: string): Toml! {
+  let p = newTomlParser(src)
+  parseDocument(p)?
+  return finalizeTable(p.root)
+}
+
+// Consumes a run of `Newline`/`Comment` tokens. Bounded implicitly: every
+// token consumed strictly advances `p.lx`'s cursor over a finite source,
+// the same argument `lex.bit`'s own scanners rely on for their unguarded
+// `while (lx.i < len(lx.src))` loops.
+fn skipBlankLines(p: Parser) {
+  while (p.lx.kind == TokenKind.Newline || p.lx.kind == TokenKind.Comment) {
+    advance(p)
+  }
+}
+
+fn parseDocument(p: Parser): ()! {
+  let guard = 0
+  let bound = tokenBound(p)
+  while (guard <= bound) {
+    skipBlankLines(p)
+    if (p.lx.kind == TokenKind.Eof) {
+      return
+    }
+    if (p.lx.kind == TokenKind.LBracket) {
+      parseHeaderLine(p)?
+    } else {
+      parseKeyValueLine(p)?
+    }
+    guard = guard + 1
+  }
+  fail tomlParseError("document exceeds token bound", p.lx.start)
+}
+
+fn expectRBracket(p: Parser): ()! {
+  if (p.lx.kind != TokenKind.RBracket) {
+    fail tomlParseError("expected ']'", p.lx.start)
+  }
+  advance(p)
+  return
+}
+
+// A line's own end: an optional trailing comment, then a newline or EOF.
+// Anything else — a second value, a stray token — is TOML 1.0.0's "each
+// key/value pair (and each header) is its own line" rule.
+fn expectLineEnd(p: Parser): ()! {
+  if (p.lx.kind == TokenKind.Comment) {
+    advance(p)
+  }
+  if (p.lx.kind == TokenKind.Newline) {
+    advance(p)
+    return
+  }
+  if (p.lx.kind == TokenKind.Eof) {
+    return
+  }
+  fail tomlParseError("expected newline after value", p.lx.start)
+}
+
+// `[a.b.c]` / `[[a.b.c]]`: one `[` already confirmed by the caller.
+fn parseHeaderLine(p: Parser): ()! {
+  let start = p.lx.start
+  advance(p)
+  let isArray = p.lx.kind == TokenKind.LBracket
+  if (isArray) {
+    advance(p)
+  }
+  let path = parseKeyPath(p)?
+  expectRBracket(p)?
+  if (isArray) {
+    expectRBracket(p)?
+  }
+  expectLineEnd(p)?
+  p.current = resolveHeader(p, path, isArray, start)?
+  return
+}
+
+fn resolveHeader(p: Parser, path: []KeySeg, isArray: bool, start: int): WTable! {
+  if (len(path) == 0) {
+    fail tomlParseError("empty table header", start)
+  }
+  let t = p.root
+  let i = 0
+  while (i < len(path) - 1) {
+    t = descendIntermediate(t, path[i])?
+    i = i + 1
+  }
+  let last = path[len(path) - 1]
+  if (isArray) {
+    return openArrayTableHeader(t, last)?
+  }
+  return openTableHeader(t, last)?
+}
+
+fn parseKeyValueLine(p: Parser): ()! {
+  let path = parseKeyPath(p)?
+  if (p.lx.kind != TokenKind.Equals) {
+    fail tomlParseError("expected '=' after key", p.lx.start)
+  }
+  advance(p)
+  let value = parseValue(p)?
+  expectLineEnd(p)?
+  applyKeyValue(p.current, path, value)?
+  return
+}
+
+fn applyKeyValue(t: WTable, path: []KeySeg, value: Toml): ()! {
+  let cur = t
+  let i = 0
+  while (i < len(path) - 1) {
+    cur = descendIntermediate(cur, path[i])?
+    i = i + 1
+  }
+  setLeaf(cur, path[len(path) - 1], value)?
+  return
+}
+
+// One or more `.`-separated key segments. Bounded by `tokenBound`: each
+// extra segment consumes at least a `.` and a key token.
+fn parseKeyPath(p: Parser): []KeySeg! {
+  let segs = []KeySeg(0)
+  segs = append(segs, parseKeySegment(p)?)
+  let guard = 0
+  let bound = tokenBound(p)
+  while (p.lx.kind == TokenKind.Dot && guard <= bound) {
+    advance(p)
+    segs = append(segs, parseKeySegment(p)?)
+    guard = guard + 1
+  }
+  return segs
+}
+
+// A bare key, `true`/`false` (lexed as `Bool` even in key position), a
+// quoted key, or an all-digit/`inf`/`nan` `Number` span — see this file's
+// header for what `Number` in key position does and does not cover.
+fn parseKeySegment(p: Parser): KeySeg! {
+  let kind = p.lx.kind
+  let start = p.lx.start
+  let end = p.lx.end
+  switch (kind) {
+    case TokenKind.BareKey, TokenKind.Bool:
+      advance(p)
+      return KeySeg{ name: p.src[start:end], offset: start }
+    case TokenKind.BasicString, TokenKind.LiteralString:
+      advance(p)
+      return KeySeg{ name: tomlDecodeString(p.src, kind, start, end)?, offset: start }
+    case TokenKind.Number:
+      return parseNumericKeySegment(p, start, end)?
+    default:
+      fail tomlParseError("expected a key", start)
+  }
+}
+
+fn parseNumericKeySegment(p: Parser, start: int, end: int): KeySeg! {
+  let text = p.src[start:end]
+  if (text == "inf" || text == "nan" || isAllDigits(p.src, start, end)) {
+    advance(p)
+    return KeySeg{ name: text, offset: start }
+  }
+  fail tomlParseError("unsupported numeric key form", start)
+}
+
+fn isAllDigits(src: string, start: int, end: int): bool {
+  let i = start
+  while (i < end) {
+    if (!isDigit(src[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// --- values: scalars, plus the iterative array/inline-table machine -----
+
+fn parseValue(p: Parser): Toml! {
+  let scalar = tryReadScalar(p)?
+  match (scalar) {
+    Some(v) => { return v }
+    None => { return parseCompoundValue(p)? }
+  }
+}
+
+// A scalar token consumed and decoded, or none (without consuming) when the
+// cursor sits on `[`/`{` — the caller's cue to open a container instead.
+// Anything else in value position is a hard error.
+fn tryReadScalar(p: Parser): Option<Toml>! {
+  let kind = p.lx.kind
+  let start = p.lx.start
+  let end = p.lx.end
+  switch (kind) {
+    case TokenKind.BasicString,
+      TokenKind.LiteralString,
+      TokenKind.MlBasicString,
+      TokenKind.MlLiteralString:
+      advance(p)
+      return Option<Toml>.Some(Toml.TomlString(tomlDecodeString(p.src, kind, start, end)?))
+    case TokenKind.Number:
+      advance(p)
+      return Option<Toml>.Some(tomlDecodeNumber(p.src, start, end)?)
+    case TokenKind.Bool:
+      advance(p)
+      return Option<Toml>.Some(Toml.TomlBool(p.src[start] == 't'))
+    case TokenKind.DateTime:
+      advance(p)
+      return Option<Toml>.Some(tomlDecodeDateTime(p.src, start, end)?)
+    case TokenKind.LBracket, TokenKind.LBrace:
+      return Option<Toml>.None
+    default:
+      fail tomlParseError("expected a value", start)
+  }
+}
+
+// One open array or inline table, in progress.
+enum CKind { CArr, CObj }
+
+class Ctx {
+  kind: CKind,
+  items: []Toml,
+  entries: []TomlEntry,
+  pendingKey: string,
+  pendingKeyOffset: int,
+  hasPendingKey: bool,
+  expectSeparator: bool,
+}
+
+fn newCtx(kind: CKind): Ctx {
+  return Ctx{
+    kind: kind,
+    items: []Toml(0),
+    entries: []TomlEntry(0),
+    pendingKey: "",
+    pendingKeyOffset: 0,
+    hasPendingKey: false,
+    expectSeparator: false,
+  }
+}
+
+// What one token-driven step of the innermost open container did.
+enum StepOutcome {
+  Continue,
+  Push(Ctx),
+  Close(Toml),
+}
+
+// Reads one whole array or inline table (`p.lx` already confirmed to sit on
+// `[`/`{`) without ever calling itself: nesting is an explicit `[]Ctx`
+// stack, so an arbitrarily deep run of open brackets grows Bit heap memory,
+// never the call stack (see this file's header).
+fn parseCompoundValue(p: Parser): Toml! {
+  let firstKind = CKind.CArr
+  if (p.lx.kind == TokenKind.LBrace) {
+    firstKind = CKind.CObj
+  }
+  advance(p)
+  let stack = []Ctx(0)
+  stack = append(stack, newCtx(firstKind))
+  let guard = 0
+  let bound = tokenBound(p)
+  while (guard <= bound) {
+    let stackLen = len(stack)
+    let outcome = stepFrame(p, stack[stackLen - 1], stackLen)?
+    let applied = applyOutcome(outcome, stack)
+    stack = applied.stack
+    match (applied.value) {
+      Some(v) => { return v }
+      None => {}
+    }
+    guard = guard + 1
+  }
+  fail tomlParseError("value nesting exceeds token bound", p.lx.start)
+}
+
+fn stepFrame(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+  if (top.kind == CKind.CArr) {
+    return stepArray(p, top, stackLen)?
+  }
+  return stepObject(p, top, stackLen)?
+}
+
+class ApplyResult { stack: []Ctx, value: Option<Toml> }
+
+// Applies one `StepOutcome` to `stack`: `Push` grows it, `Close` pops it and
+// either hands the finished value to the new top (still nested) or reports
+// it as the whole compound value's result (stack now empty).
+fn applyOutcome(outcome: StepOutcome, stack: []Ctx): ApplyResult {
+  match (outcome) {
+    Continue => { return ApplyResult{ stack: stack, value: Option<Toml>.None } }
+    Push(ctx) => {
+      stack = append(stack, ctx)
+      return ApplyResult{ stack: stack, value: Option<Toml>.None }
+    }
+    Close(v) => {
+      let popped = stack[0:len(stack) - 1]
+      if (len(popped) == 0) {
+        return ApplyResult{ stack: popped, value: Option<Toml>.Some(v) }
+      }
+      attachValue(popped[len(popped) - 1], v)
+      return ApplyResult{ stack: popped, value: Option<Toml>.None }
+    }
+  }
+}
+
+// Attaches a just-closed nested value to its parent frame — the array-
+// append or the pending-key case, matching `readArrayElement`/
+// `readInlineValue`'s own scalar handling exactly.
+fn attachValue(parent: Ctx, v: Toml) {
+  if (parent.kind == CKind.CArr) {
+    parent.items = append(parent.items, v)
+    parent.expectSeparator = true
+    return
+  }
+  parent.entries = append(parent.entries, TomlEntry{ key: parent.pendingKey, value: v })
+  parent.hasPendingKey = false
+  parent.expectSeparator = true
+}
+
+// Refuses to open a new container once `stackLen` already sits at
+// `tomlMaxDepth` — this parser's own flat depth counter (`len(stack)`),
+// independent of `lex.bit`'s own bracket-depth cap.
+fn pushContainer(p: Parser, stackLen: int): StepOutcome! {
+  if (stackLen >= tomlMaxDepth) {
+    fail tomlParseError("value nesting exceeds maximum depth", p.lx.start)
+  }
+  let kind = CKind.CArr
+  if (p.lx.kind == TokenKind.LBrace) {
+    kind = CKind.CObj
+  }
+  advance(p)
+  return StepOutcome.Push(newCtx(kind))
+}
+
+// Newlines and comments are insignificant inside `[ ]` (TOML 1.0.0
+// "Array") — never inside `{ }`, so `stepObject` never calls this.
+fn skipArrayFiller(p: Parser) {
+  skipBlankLines(p)
+}
+
+fn stepArray(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+  skipArrayFiller(p)
+  if (top.expectSeparator) {
+    if (p.lx.kind == TokenKind.RBracket) {
+      advance(p)
+      return StepOutcome.Close(Toml.TomlArray(top.items))
+    }
+    if (p.lx.kind != TokenKind.Comma) {
+      fail tomlParseError("expected ',' or ']' in array", p.lx.start)
+    }
+    advance(p)
+    top.expectSeparator = false
+    skipArrayFiller(p)
+  }
+  if (p.lx.kind == TokenKind.RBracket) {
+    advance(p)
+    return StepOutcome.Close(Toml.TomlArray(top.items))
+  }
+  return readArrayElement(p, top, stackLen)?
+}
+
+fn readArrayElement(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+  let scalar = tryReadScalar(p)?
+  match (scalar) {
+    Some(v) => {
+      top.items = append(top.items, v)
+      top.expectSeparator = true
+      return StepOutcome.Continue
+    }
+    None => { return pushContainer(p, stackLen)? }
+  }
+}
+
+// No trailing comma, no newline (TOML 1.0.0 "Inline Table": both illegal).
+fn stepObject(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+  if (p.lx.kind == TokenKind.Newline) {
+    fail tomlParseError("newline not allowed in inline table", p.lx.start)
+  }
+  if (top.hasPendingKey) {
+    return readInlineValue(p, top, stackLen)?
+  }
+  if (top.expectSeparator) {
+    if (p.lx.kind == TokenKind.RBrace) {
+      advance(p)
+      return StepOutcome.Close(Toml.TomlTable(top.entries))
+    }
+    if (p.lx.kind != TokenKind.Comma) {
+      fail tomlParseError("expected ',' or '}' in inline table", p.lx.start)
+    }
+    advance(p)
+    top.expectSeparator = false
+  }
+  return readInlineKey(p, top)?
+}
+
+fn readInlineKey(p: Parser, top: Ctx): StepOutcome! {
+  if (p.lx.kind == TokenKind.RBrace && len(top.entries) == 0) {
+    advance(p)
+    return StepOutcome.Close(Toml.TomlTable(top.entries))
+  }
+  let seg = parseKeySegment(p)?
+  if (inlineHasKey(top.entries, seg.name)) {
+    fail tomlParseError("duplicate key '${seg.name}'", seg.offset)
+  }
+  if (p.lx.kind != TokenKind.Equals) {
+    fail tomlParseError("expected '=' after key", p.lx.start)
+  }
+  advance(p)
+  top.pendingKey = seg.name
+  top.pendingKeyOffset = seg.offset
+  top.hasPendingKey = true
+  return StepOutcome.Continue
+}
+
+fn inlineHasKey(entries: []TomlEntry, key: string): bool {
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].key == key) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn readInlineValue(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+  let scalar = tryReadScalar(p)?
+  match (scalar) {
+    Some(v) => {
+      top.entries = append(top.entries, TomlEntry{ key: top.pendingKey, value: v })
+      top.hasPendingKey = false
+      top.expectSeparator = true
+      return StepOutcome.Continue
+    }
+    None => { return pushContainer(p, stackLen)? }
+  }
+}
