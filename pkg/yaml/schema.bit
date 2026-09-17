@@ -1,0 +1,489 @@
+// pkg/yaml/schema.bit — yaml module, implicit typing for plain scalars
+// (#5496, epic #1482), plus the explicit escape hatch the epic requires.
+//
+// PINS THE YAML 1.2 CORE SCHEMA, NOT 1.1. This is the whole point of the
+// file. YAML 1.1 resolved `yes`/`no`/`on`/`off`/`y`/`n` as booleans, so a
+// column of country codes containing `NO` silently became `false` — the
+// "Norway problem" that made a generation of tooling distrust YAML. The 1.2
+// core schema (spec.yaml.org, 10.3.2) closed that: only `true`/`True`/`TRUE`
+// and `false`/`False`/`FALSE` are booleans. `resolveBool` below does not
+// have a `yes`/`no`/`on`/`off`/`y`/`n` table, and it must never grow one.
+//
+// ONLY PLAIN SCALARS ARE TYPED. `ScalarStyle` is this file's own type,
+// deliberately not `scan.bit`'s `TokenKind`: a caller cannot hand a token
+// kind through by accident and get implicit typing applied to a quoted
+// string, because the two types are structurally unrelated. A quoted scalar
+// (`ScalarStyle.Quoted`) or a block scalar (`ScalarStyle.Block`, literal `|`
+// or folded `>`) is ALWAYS `YamlString` regardless of its text — that is how
+// a document author writes `"no"` or `"1.20"` and keeps it a string. Neither
+// `pkg/yaml/scalar.bit` nor `pkg/yaml/block.bit`/`flow.bit` currently record
+// which style produced a given decoded string (both scalar.bit's and
+// flow.bit's own headers say typing is deferred, not how); wiring a real
+// parser's call sites to pass the right `ScalarStyle` is that parser's job,
+// not this file's — this is a structural gap worth stating plainly rather
+// than guessing at, per the ticket.
+//
+// THE CORE SCHEMA'S FOUR TAGS, each a closed set (spec.yaml.org 10.3.2):
+//   null  — `null`, `Null`, `NULL`, `~`, and the empty scalar.
+//   bool  — `true`/`True`/`TRUE`, `false`/`False`/`FALSE`. Nothing else.
+//   int   — decimal `[-+]?[0-9]+`, hex `0x[0-9a-fA-F]+`, octal `0o[0-7]+`.
+//           A bare leading zero (`010`) is deliberately excluded from the
+//           decimal form here even though it is not part of either prefixed
+//           form: the ticket requires `010` to resolve as a STRING, not as
+//           decimal 10 or legacy octal 8, so it can never again be
+//           ambiguous with the 1.1 octal spelling. `0o10` is how octal 8 is
+//           written; `resolveInt` never falls back to treating a leading
+//           zero as anything numeric.
+//   float — `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?`, plus
+//           `[-+]?\.(inf|Inf|INF)` and `\.(nan|NaN|NAN)` (nan takes no
+//           sign). A bare digit run with neither a `.` nor an exponent is
+//           exclusively `resolveInt`'s territory — `resolveFloat` requires
+//           one of the two, so a value `resolveInt` rejected for having a
+//           leading zero (`010`) is never silently promoted to a float
+//           either; it falls all the way through to `YamlString`.
+// Anything not matching one of the four is a string — the default outcome,
+// not an error; `resolvePlain`'s final line is `YamlString(text)`.
+//
+// INTEGER OVERFLOW IS A STRING, NOT A WRAP. A decimal literal past `i64`
+// range fails `std/strings`' `parseInt` and is caught; a hex/octal literal
+// past `i64` range is caught by `magnitudeToInt`'s explicit range check.
+// Both paths return `Option<i64>.None`, which `resolvePlain` treats exactly
+// like "no int spelling matched" — falling through to float, then string.
+//
+// PERFORMANCE: DISPATCH ON THE FIRST BYTE, NO REGEX, NO LOWERCASED COPY.
+// The overwhelmingly common plain scalar matches none of the four tags, so
+// `resolvePlain` rejects it in one table lookup (`hasTypedFirstByte`) before
+// comparing a single byte further — no allocation, no per-spelling regex.
+// Every spelling table below (null, bool, inf, nan) is matched by
+// `matchesSpelling`'s single bounded scan rather than a chain of `==`/`||`
+// comparisons: `max-complexity` (spec/LINT.md) counts `&&`/`||` the same as
+// a `switch` case, so an N-way `||` chain costs the same as an N-case
+// `switch` — `scalar.bit`'s `simpleEscapeByte`/`namedEscapeCodepoint` use
+// the identical trick to stay under the ceiling with a 12- and 4-entry
+// table; this file reuses it for tables up to 6 entries.
+
+import { parseInt } from "std/strings"
+
+// Which of YAML's three scalar shapes produced `text` — the one input
+// `yamlResolveScalar` needs to decide whether typing is even attempted.
+// `Quoted` covers both single- and double-quoted; the core schema treats
+// them identically (always a string), so this file has no reason to keep
+// them apart the way `scan.bit`'s `TokenKind` does.
+export enum ScalarStyle {
+  Plain,
+  Quoted,
+  Block,
+}
+
+// Resolves `text` (already decoded by `pkg/yaml/scalar.bit` or folded by
+// `pkg/yaml/block.bit`) to a typed `Yaml` value per the YAML 1.2 core
+// schema — see this file's header for exactly what that does and does not
+// accept. `style != Plain` always returns `YamlString(text)` unresolved:
+// quoting or block-scalar style is how a document author opts a value out
+// of typing, and this is the one place that contract is enforced.
+export fn yamlResolveScalar(text: string, style: ScalarStyle): Yaml {
+  if (style != ScalarStyle.Plain) {
+    return Yaml.YamlString(text)
+  }
+  return resolvePlain(text)
+}
+
+// The explicit escape hatch the epic requires: always `YamlString(text)`,
+// regardless of style or content. A caller reading a column of country
+// codes or a `version: 1.20` field that must keep its trailing zero calls
+// this instead of `yamlResolveScalar` — a parser setting picks one of the
+// two resolvers by name, never a flag threaded through the typed one, so
+// the two paths can never be confused with each other. `style` is accepted
+// only for signature parity with `yamlResolveScalar`; every style is
+// already a string once typing is off, so this function does not branch on
+// it.
+export fn yamlResolveRaw(text: string, style: ScalarStyle): Yaml {
+  return Yaml.YamlString(text)
+}
+
+// --- dispatch -------------------------------------------------------------
+
+// The first byte of every accepted null/bool/int/float spelling. Anything
+// else can never resolve to a non-string tag, so `resolvePlain` checks this
+// before any per-tag comparison and returns immediately on a miss — the
+// common-case fast path this file's header calls out.
+const typedFirstBytes: string = "~nNtTfF+-.0123456789"
+
+fn indexOfByte(s: string, c: u8): i64 {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn hasTypedFirstByte(c0: u8): bool {
+  return indexOfByte(typedFirstBytes, c0) >= 0
+}
+
+// The empty scalar is null (core schema); every other tag needs at least
+// one byte, so the length check doubles as the entry point's own fast path.
+fn resolvePlain(text: string): Yaml {
+  if (len(text) == 0) {
+    return Yaml.YamlNull
+  }
+  if (!hasTypedFirstByte(text[0])) {
+    return Yaml.YamlString(text)
+  }
+  if (resolveNull(text)) {
+    return Yaml.YamlNull
+  }
+  let b = resolveBool(text)
+  if (isSome(b)) {
+    return Yaml.YamlBool(unwrap(b))
+  }
+  let i = resolveInt(text)
+  if (isSome(i)) {
+    return Yaml.YamlInt(unwrap(i))
+  }
+  let f = resolveFloat(text)
+  if (isSome(f)) {
+    return Yaml.YamlFloat(unwrap(f))
+  }
+  return Yaml.YamlString(text)
+}
+
+// Whether `text` equals any spelling in `table` — one bounded scan, not a
+// chain of `==`/`||` comparisons (this file's header explains why).
+fn matchesSpelling(text: string, table: []string): bool {
+  let i = 0
+  while (i < len(table)) {
+    if (text == table[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// --- null / bool ------------------------------------------------------
+
+fn resolveNull(text: string): bool {
+  return matchesSpelling(text, ["null", "Null", "NULL", "~"])
+}
+
+// 1.2 core schema ONLY: `true`/`True`/`TRUE` and `false`/`False`/`FALSE`.
+// `yes`/`no`/`on`/`off`/`y`/`n` are 1.1 spellings and MUST stay strings —
+// see this file's header. Never add them here.
+fn resolveBool(text: string): Option<bool> {
+  if (matchesSpelling(text, ["true", "True", "TRUE"])) {
+    return Option<bool>.Some(true)
+  }
+  if (matchesSpelling(text, ["false", "False", "FALSE"])) {
+    return Option<bool>.Some(false)
+  }
+  return Option<bool>.None
+}
+
+// --- shared digit scanning ----------------------------------------------
+
+fn isDigitByte(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+// The cursor just past the maximal run of decimal digits starting at
+// `start`, bounded by `end` — never past it, so a caller can chain this
+// straight into a following literal (`.`, `e`) without an extra bounds
+// check of its own.
+fn scanDigits(text: string, start: i64, end: i64): i64 {
+  let i = start
+  while (i < end && isDigitByte(text[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+// `1` past a leading `+`/`-`, otherwise `0`. Shared by the decimal-int and
+// general-float resolvers — both grammars take the same optional sign.
+fn signOffset(text: string): i64 {
+  if (len(text) > 0 && (text[0] == '+' || text[0] == '-')) {
+    return 1
+  }
+  return 0
+}
+
+// --- int: decimal ---------------------------------------------------------
+
+// `text[start:end)` is a valid decimal-int digit span: exactly "0", or a
+// nonzero digit followed by zero or more digits. A leading zero followed by
+// more digits (`010`) is neither — see this file's header for why that
+// exclusion exists.
+fn isDecimalDigitSpan(text: string, start: i64, end: i64): bool {
+  if (start >= end) {
+    return false
+  }
+  if (text[start] == '0') {
+    return end - start == 1
+  }
+  return scanDigits(text, start, end) == end
+}
+
+fn isDecimalIntSpelling(text: string): bool {
+  return isDecimalDigitSpan(text, signOffset(text), len(text))
+}
+
+// `parseInt` (`std/strings`) already accumulates the exact `i64` range,
+// including `i64::MIN`, and fails on overflow rather than wrapping —
+// exactly the overflow-is-a-string contract this file needs, so decimal
+// int resolution reuses it instead of a second accumulator.
+fn parseDecimalInt(text: string): Option<i64> {
+  let v = parseInt(text) catch _ {
+    return Option<i64>.None
+  }
+  return Option<i64>.Some(v)
+}
+
+// --- int: hex / octal -----------------------------------------------------
+
+fn isHexDigitByte(c: u8): bool {
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  if (c >= 'a' && c <= 'f') {
+    return true
+  }
+  return c >= 'A' && c <= 'F'
+}
+
+fn isOctalDigitByte(c: u8): bool {
+  return c >= '0' && c <= '7'
+}
+
+fn scanHexDigits(text: string, start: i64, end: i64): i64 {
+  let i = start
+  while (i < end && isHexDigitByte(text[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+fn scanOctalDigits(text: string, start: i64, end: i64): i64 {
+  let i = start
+  while (i < end && isOctalDigitByte(text[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+// `0x` (lowercase `x` only — the 1.2 spelling) followed by one or more hex
+// digits, no sign: the core schema's hex/octal forms carry no sign token.
+fn isHexIntSpelling(text: string): bool {
+  let n = len(text)
+  if (n < 3 || text[0] != '0' || text[1] != 'x') {
+    return false
+  }
+  return scanHexDigits(text, 2, n) == n
+}
+
+// `0o` (lowercase `o` only) followed by one or more octal digits.
+fn isOctalIntSpelling(text: string): bool {
+  let n = len(text)
+  if (n < 3 || text[0] != '0' || text[1] != 'o') {
+    return false
+  }
+  return scanOctalDigits(text, 2, n) == n
+}
+
+// `u64::MAX`, the accumulation ceiling before `magnitudeToInt` re-checks
+// the narrower `i64` range the core schema's unsigned hex/octal forms are
+// still bound by (they carry no sign, but the *value* must still fit an
+// `i64` — `Yaml.YamlInt` holds nothing wider).
+const schemaU64Max: u64 = 18446744073709551615
+const schemaI64MaxAsU64: u64 = 9223372036854775807
+
+// `0`-`9`, `a`-`f`, or `A`-`F` as a magnitude 0-15. Octal digits (`0`-`7`)
+// fall out of the first branch for free — `accumulateUnsigned`'s caller has
+// already validated every byte is a digit of the base in use, so this never
+// needs to reject anything itself.
+fn digitMagnitudeGeneric(c: u8): i64 {
+  if (c >= '0' && c <= '9') {
+    return i64(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return i64(c - 'a') + 10
+  }
+  return i64(c - 'A') + 10
+}
+
+// Accumulates the unsigned magnitude of a pre-validated digit run into a
+// `u64`, failing (returning `None`) the instant one more digit would exceed
+// `schemaU64Max` — the standard pre-check that never forms the overflowed
+// value, mirroring `pkg/toml/number.bit`'s `radixOverflows`/`accumulateRadix`
+// (that file's own comment explains the technique; this file does not share
+// code with it across packages, only the shape).
+fn accumulateUnsigned(text: string, start: i64, end: i64, base: i64): Option<u64> {
+  let maxDiv = schemaU64Max / u64(base)
+  let maxMod = schemaU64Max % u64(base)
+  let v = u64(0)
+  let i = start
+  while (i < end) {
+    let d = digitMagnitudeGeneric(text[i])
+    if (v > maxDiv || (v == maxDiv && u64(d) > maxMod)) {
+      return Option<u64>.None
+    }
+    v = v * u64(base) + u64(d)
+    i = i + 1
+  }
+  return Option<u64>.Some(v)
+}
+
+// `mag`, narrowed to `i64`, or `None` when it is absent (accumulation
+// already overflowed `u64`) or exceeds `i64::MAX` (fits `u64` but not the
+// signed range `Yaml.YamlInt` holds) — either way, overflow is a string,
+// never a wrap.
+fn magnitudeToInt(mag: Option<u64>): Option<i64> {
+  if (isNone(mag)) {
+    return Option<i64>.None
+  }
+  let v = unwrap(mag)
+  if (v > schemaI64MaxAsU64) {
+    return Option<i64>.None
+  }
+  return Option<i64>.Some(i64(v))
+}
+
+fn parseHexInt(text: string): Option<i64> {
+  return magnitudeToInt(accumulateUnsigned(text, 2, len(text), 16))
+}
+
+fn parseOctalInt(text: string): Option<i64> {
+  return magnitudeToInt(accumulateUnsigned(text, 2, len(text), 8))
+}
+
+// --- int: entry point -----------------------------------------------------
+
+fn resolveInt(text: string): Option<i64> {
+  if (isHexIntSpelling(text)) {
+    return parseHexInt(text)
+  }
+  if (isOctalIntSpelling(text)) {
+    return parseOctalInt(text)
+  }
+  if (!isDecimalIntSpelling(text)) {
+    return Option<i64>.None
+  }
+  return parseDecimalInt(text)
+}
+
+// --- float: .inf / .nan ----------------------------------------------------
+
+// `[-+]?\.(inf|Inf|INF)` and `\.(nan|NaN|NAN)` — inf takes an optional
+// sign, nan never does (core schema grammar, this file's header). `0.0/0.0`
+// and `1.0/0.0` are IEEE-754 division-by-zero, which the spec guarantees
+// yields NaN/+Inf rather than panicking (SPEC §13); `pkg/toml/number.bit`'s
+// `specialFloat` constructs its own inf/nan the same way.
+fn resolveFloatSpecial(text: string): Option<f64> {
+  if (matchesSpelling(text, ["-.inf", "-.Inf", "-.INF"])) {
+    return Option<f64>.Some(0.0 - 1.0 / 0.0)
+  }
+  if (matchesSpelling(text, [".inf", "+.inf", ".Inf", "+.Inf", ".INF", "+.INF"])) {
+    return Option<f64>.Some(1.0 / 0.0)
+  }
+  if (matchesSpelling(text, [".nan", ".NaN", ".NAN"])) {
+    return Option<f64>.Some(0.0 / 0.0)
+  }
+  return Option<f64>.None
+}
+
+// --- float: general grammar -------------------------------------------
+
+fn isExponentByte(c: u8): bool {
+  return c == 'e' || c == 'E'
+}
+
+// `[eE][-+]?[0-9]+` starting at `text[start]` (already confirmed to be
+// `e`/`E` by the caller) — the cursor just past it, or -1 when no exponent
+// digit follows the marker (and optional sign).
+fn scanExponent(text: string, start: i64, end: i64): i64 {
+  let i = start + 1
+  if (i < end && (text[i] == '+' || text[i] == '-')) {
+    i = i + 1
+  }
+  let afterDigits = scanDigits(text, i, end)
+  if (afterDigits == i) {
+    return -1
+  }
+  return afterDigits
+}
+
+// `\.[0-9]+ | [0-9]+(\.[0-9]*)?` starting at `start` — the mantissa, sign
+// already stripped by the caller. Returns the cursor just past it, or -1
+// when neither branch matches (e.g. a bare "." with digits on neither
+// side).
+fn scanMantissaEnd(text: string, start: i64, end: i64): i64 {
+  let afterInt = scanDigits(text, start, end)
+  let intLen = afterInt - start
+  if (!hasDotAt(text, afterInt)) {
+    if (intLen == 0) {
+      return -1
+    }
+    return afterInt
+  }
+  let afterFrac = scanDigits(text, afterInt + 1, end)
+  let fracLen = afterFrac - (afterInt + 1)
+  if (intLen == 0 && fracLen == 0) {
+    return -1
+  }
+  return afterFrac
+}
+
+fn hasDotAt(text: string, i: i64): bool {
+  return i < len(text) && text[i] == '.'
+}
+
+// The general (non-special) float shape, restricted to require a `.` or an
+// exponent: a bare digit run with neither is exclusively `resolveInt`'s
+// territory (already tried and failed by the time this runs), never
+// silently promoted to a float — this file's header explains why that
+// matters for `010`.
+fn isGeneralFloatSpelling(text: string): bool {
+  let n = len(text)
+  let start = signOffset(text)
+  let afterMantissa = scanMantissaEnd(text, start, n)
+  if (afterMantissa < 0) {
+    return false
+  }
+  let afterInt = scanDigits(text, start, n)
+  let hadDot = hasDotAt(text, afterInt)
+  let cursor = afterMantissa
+  let hadExp = cursor < n && isExponentByte(text[cursor])
+  if (hadExp) {
+    cursor = scanExponent(text, cursor, n)
+    if (cursor < 0) {
+      return false
+    }
+  }
+  if (!hadDot && !hadExp) {
+    return false
+  }
+  return cursor == n
+}
+
+// --- float: entry point ---------------------------------------------------
+
+fn resolveFloat(text: string): Option<f64> {
+  let special = resolveFloatSpecial(text)
+  if (isSome(special)) {
+    return special
+  }
+  if (!isGeneralFloatSpelling(text)) {
+    return Option<f64>.None
+  }
+  // `isGeneralFloatSpelling` already proved `text` matches the core
+  // schema's own float grammar, a subset of the predeclared `parseFloat`
+  // builtin's (SPEC §5.3) — the NaN check is a defensive belt, not a case
+  // expected to fire.
+  let v = parseFloat(text)
+  if (v != v) {
+    return Option<f64>.None
+  }
+  return Option<f64>.Some(v)
+}
