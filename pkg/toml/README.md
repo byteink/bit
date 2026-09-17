@@ -33,9 +33,9 @@ fn main(): ()! {
 }
 ```
 
-Everything else — walking nested tables and arrays of tables, the four
+Everything else - walking nested tables and arrays of tables, the four
 date-time forms, encoding a value back to text, and the errors this package
-raises — is in [`docs/`](docs/README.md).
+raises - is in [`docs/`](docs/README.md).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

@@ -3,14 +3,14 @@
 Every TOML scalar and the four date-time forms, and how each one comes back
 as a typed Bit value instead of a bare string you have to reparse yourself.
 
-`Toml` is a ten-variant enum — one arm per TOML scalar type, plus arrays and
+`Toml` is a ten-variant enum - one arm per TOML scalar type, plus arrays and
 tables. A caller never matches on it directly: an exhaustive match with one
 arm per variant runs past this package's own function complexity ceiling
 once you get to ten. Instead, every variant has a `tomlIsX`/`tomlAsX` pair:
 `tomlIsX` answers "is this one of those", and `tomlAsX` gives you the
 payload as an `Option`, `None` when it is not.
 
-The four temporal arms are not new types — they reuse `std/time`'s own
+The four temporal arms are not new types - they reuse `std/time`'s own
 `DateTime`, `NaiveDateTime`, `Date` and `Time`, the same ones you would
 already use anywhere else in a Bit program:
 
@@ -153,7 +153,7 @@ fn localTimeField(entries: []TomlEntry, key: string): Time! {
 ## Reading `deploy.toml`'s own scalars
 
 [Parsing](parsing.md) introduced `deploy.toml`. Its `metadata` table alone
-carries all four date-time forms — when the release was cut (a bare date),
+carries all four date-time forms - when the release was cut (a bare date),
 when the build started (a bare time), when the build finished (no zone, so
 it's read wherever the build ran) and when it actually went live (a zone
 attached, so it means the same instant no matter who reads it later):
@@ -188,7 +188,7 @@ fn describeDeploy(path: string): string! {
 ```
 
 `DateTime.toString()`, `NaiveDateTime.toString()`, `Date.toString()` and
-`Time.toString()` all round-trip through RFC 3339 — the same text
+`Time.toString()` all round-trip through RFC 3339 - the same text
 [Encoding](encoding.md) writes back out.
 
 ## Under the hood: decoding one literal
@@ -196,7 +196,7 @@ fn describeDeploy(path: string): string! {
 `tomlParse` calls `tomlDecodeString`, `tomlDecodeNumber` and
 `tomlDecodeDateTime` once per scalar token it reads. They are exported for
 the same reason `lex` is (see [Parsing](parsing.md)): a caller who already
-has a raw `Token` — from `lex`, not from `tomlParse` — can decode just that
+has a raw `Token` - from `lex`, not from `tomlParse` - can decode just that
 one span without building a whole document around it.
 
 ```bit

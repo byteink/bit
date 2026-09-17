@@ -2,12 +2,12 @@
 
 `tomlEncode` is `tomlParse` run backward: a `Toml` value in, TOML 1.0.0 text
 out. You reach for it when your program builds or edits configuration
-rather than only reading it — writing a fresh `deploy.toml`, or reading one,
+rather than only reading it - writing a fresh `deploy.toml`, or reading one,
 changing a field, and saving it back.
 
 ## The simplest round trip
 
-`tomlEncode(t: Toml): string!` fails when `t` has no TOML spelling at all —
+`tomlEncode(t: Toml): string!` fails when `t` has no TOML spelling at all -
 the only case is a non-table at the root, since a document's root is always
 an implicit table with no header of its own:
 
@@ -37,7 +37,7 @@ version = "1.4.2"
 
 The more common shape: parse a file, change one field, write it back. A
 `Toml` value is immutable, so "changing a field" means building a new
-`TomlTable` with that one entry replaced — the rest of the entries, and
+`TomlTable` with that one entry replaced - the rest of the entries, and
 their order, carried over unchanged:
 
 ```bit
@@ -65,7 +65,7 @@ fn bumpVersion(path: string, next: string): ()! {
 ```
 
 `tomlParse(tomlEncode(v)?)?` gets you back a value equal to `v` for anything
-`tomlEncode` accepted — every scalar, every date-time form, nested tables
+`tomlEncode` accepted - every scalar, every date-time form, nested tables
 and arrays of tables all included. The text itself is not guaranteed to
 match byte for byte: a table whose source interleaved scalar keys with
 sub-tables re-emits with its scalars first, because once a `[sub]` header
@@ -77,7 +77,7 @@ opened it. The parsed value is what round-trips, not the formatting.
 Two shapes `tomlEncode` refuses outright, both because TOML's text format
 has no way to write them:
 
-* A non-table at the root — `tomlEncode(Toml.TomlInt(1))` fails, since
+* A non-table at the root - `tomlEncode(Toml.TomlInt(1))` fails, since
   there is no `[header]` for a bare value to attach to.
 * `nan`, `inf` or `-inf` in a **key** position is unreachable through this
   package's own constructors (a `TomlEntry.key` is always a `string`), so it

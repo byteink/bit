@@ -1,6 +1,6 @@
 # Parsing
 
-Turns TOML text into one `Toml` value you can walk with ordinary Bit code —
+Turns TOML text into one `Toml` value you can walk with ordinary Bit code -
 no reflection, no schema, no code generation step.
 
 Say your service, `waypoint`, is deployed from a file an operator hand-edits:
@@ -30,7 +30,7 @@ fn main(): ()! {
 ```
 
 `tomlParse(src): Toml!` fails on malformed input (see
-[Errors](errors.md)) and otherwise returns one `Toml` — always a
+[Errors](errors.md)) and otherwise returns one `Toml` - always a
 `TomlTable` at the root, since a bare TOML document has no outer syntax of
 its own. `tomlAsTable` gives you its entries back as `[]TomlEntry`, in the
 order they appeared in the file: `TomlTable` is a slice, not a map, because
@@ -39,7 +39,7 @@ TOML tables have a defined source order and a map would throw it away.
 ## The real file
 
 A real deploy config nests: a `[server]` section, a list of routes, a
-database URL. Here is `deploy.toml` in full — the rest of this section
+database URL. Here is `deploy.toml` in full - the rest of this section
 reads fields out of it:
 
 ```toml
@@ -79,7 +79,7 @@ contact.name = "Ops Team"
 contact.email = "ops@waypoint.dev"
 ```
 
-`TomlEntry` has no map lookup built in — walking to `server.host` means
+`TomlEntry` has no map lookup built in - walking to `server.host` means
 finding `"server"` among the root's entries, then `"host"` among that
 table's own entries. A small helper does it once:
 
@@ -105,13 +105,13 @@ fn loadServerHost(path: string): string! {
 ```
 
 [Values](values.md) covers every scalar `field` can return, and
-[Tables](tables.md) covers the nested and repeated shapes — `[server]`,
+[Tables](tables.md) covers the nested and repeated shapes - `[server]`,
 `[[server.routes]]`, the inline `healthcheck`, and `contact`'s dotted keys.
 
 ## Under the hood: the token stream
 
 `tomlParse` is built on `lex`, this package's own tokenizer, which you can
-call directly if you need the raw lexical structure — a syntax highlighter,
+call directly if you need the raw lexical structure - a syntax highlighter,
 say, that wants every meaningful span without building a `Toml` tree at all:
 
 ```bit
@@ -129,7 +129,7 @@ fn significantSpans(src: string): []string {
 }
 ```
 
-`Token` carries its `kind` and its `[start, end)` byte span, unnormalized —
+`Token` carries its `kind` and its `[start, end)` byte span, unnormalized -
 quotes and brackets included exactly as written. `lex` never fails: an
 unrecognized byte becomes one `Invalid` token rather than stopping the scan,
 so a caller walking the stream directly decides for itself whether an
