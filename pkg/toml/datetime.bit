@@ -1,0 +1,214 @@
+// pkg/toml/datetime.bit — decoding the four TOML date-time forms onto
+// std/time's existing types (#5483, epic #1481).
+//
+// `pkg/toml/value.bit` (#5479) already names the mapping and already
+// imports the four std/time types this file returns; `pkg/toml/lex.bit`
+// (#5480) already scans one `DateTime` span per literal without validating
+// it (TOML 1.0.0, "Offset Date-Time" / "Local Date-Time" / "Local Date" /
+// "Local Time"). This file is what turns that raw span into one of
+// `Toml`'s four temporal arms — the whole of those four grammar sections,
+// nothing else. `pkg/toml/` is one flat module (pkg/README.md): `Toml`,
+// `Lexer`, `newLexer`, `isDateStart`, `isTimeStart` and `isDigit` are this
+// file's siblings' own declarations, used here unqualified, no import, no
+// redeclaration.
+//
+// DISCRIMINATE BY SHAPE, NOT BY TRYING EACH PARSER IN TURN. A span opening
+// with a full date is a date-time once anything follows the date, and
+// which of the two temporal-with-time arms it is gets decided by a
+// trailing zone — never by attempting `parseDateTime` and falling back to
+// something else on failure, which cannot be proven exhaustive.
+// `isDateStart`/`isTimeStart` (lex.bit) already answer "does this look
+// like a date" / "a time" off a `Lexer`'s cursor, so this file builds one
+// with `newLexer` over the isolated span and asks the same two questions
+// the lexer itself already answered once when it decided to emit one
+// `DateTime` token, rather than re-deriving digit-run logic a second time.
+//
+// CALENDAR VALIDATION IS std/time's, NOT RE-IMPLEMENTED HERE. `date()`
+// (stdlib/time/date.bit) rejects an out-of-range year, month, or
+// day-in-month; `timeNs()` (stdlib/time/timeofday.bit) rejects an
+// out-of-range hour, minute or second — both verified by reading their
+// source, not assumed. `parseDate`/`parseTime`/`parseNaiveDateTime`/
+// `parseDateTime` (stdlib/time/ldmlparse.bit) call through to both, so
+// this file leans on them entirely rather than re-checking ranges.
+//
+// WHERE std/time IS STRICTER THAN TOML, THIS FILE ADAPTS AROUND IT —
+// std/time is frozen-surface and is never touched for this:
+//   - std/time's separator is an uppercase `T` only; TOML also permits
+//     lowercase `t` and a space. `tomlDtNormalizeSep` rewrites either to
+//     `T` before parsing.
+//   - std/time's UTC marker is an uppercase `Z` only; TOML also permits
+//     lowercase `z`. `tomlDtNormalizeZone` rewrites it before parsing.
+//   - std/time's offset parser already treats `-00:00` as zero seconds
+//     east of UTC, the same as `+00:00` (`sign * 0 == 0`,
+//     stdlib/time/ldmlparse.bit's `ldmlpOffset`), so TOML's "-00:00 means
+//     the same as +00:00" needs no special case here.
+//   - std/time accepts a fractional second of 1 to 9 digits and FAILS past
+//     nine rather than truncating (ldmlparse.bit's own comment). TOML
+//     1.0.0 permits arbitrary precision and requires an implementation
+//     that cannot keep it all to truncate, not round, not reject — so
+//     `tomlDtTruncateFraction` drops any digits past the ninth
+//     (nanosecond) place before handing the span to std/time.
+//
+// Errors carry the ORIGINAL byte offset (`start`, the caller's absolute
+// offset into the source), never an offset into the isolated span —
+// `tomlDtError` is the only place a std/time error is rethrown, and it is
+// always rethrown with that offset.
+
+import { parseDate, parseTime, parseNaiveDateTime, parseDateTime } from "std/time"
+
+// "YYYY-MM-DD", the length of a bare local date and the index a date-time's
+// separator sits at.
+const tomlDtDateLen: int = 10
+
+// "+HH:MM" / "-HH:MM", the fixed width of a numeric zone offset — always
+// the last six bytes of an offset date-time once the separator is
+// normalized, regardless of the fractional second's own width.
+const tomlDtOffsetLen: int = 6
+
+// The nanosecond place std/time's own fractional-second field caps at.
+const tomlDtNanoDigits: int = 9
+
+// Decodes the TOML date-time literal at `src[start:end]` — a span
+// `pkg/toml/lex.bit`'s `DateTime` token already isolated but never
+// validated — onto whichever of `Toml`'s four temporal arms its shape
+// names. Fails with `start` as the reported byte offset on anything the
+// TOML grammar or the calendar itself rejects.
+export fn tomlDecodeDateTime(src: string, start: int, end: int): Toml! {
+  let s = src[start:end]
+  let lx = newLexer(s)
+  if (isDateStart(lx)) {
+    if (len(s) == tomlDtDateLen) {
+      return tomlDtDecodeDate(s, start)?
+    }
+    return tomlDtDecodeDateTime(s, start)?
+  }
+  if (isTimeStart(lx)) {
+    return tomlDtDecodeTime(s, start)?
+  }
+  fail newError("toml: not a date-time literal at byte ${start}")
+}
+
+// A bare `YYYY-MM-DD`, TOML's "Local Date" — the whole span, unmodified.
+fn tomlDtDecodeDate(s: string, offset: int): Toml! {
+  let d = parseDate(s) catch e {
+    fail tomlDtError(e, offset)
+  }
+  return Toml.TomlLocalDate(d)
+}
+
+// A bare `HH:MM:SS[.fraction]`, TOML's "Local Time" — no separator or zone
+// to normalize, only the fraction can need truncating.
+fn tomlDtDecodeTime(s: string, offset: int): Toml! {
+  let n = tomlDtTruncateFraction(s)
+  let t = parseTime(n) catch e {
+    fail tomlDtError(e, offset)
+  }
+  return Toml.TomlLocalTime(t)
+}
+
+// A date plus a time, TOML's "Offset Date-Time" or "Local Date-Time" —
+// which one is decided by a trailing zone, after normalizing the
+// separator, the zone letter and the fraction.
+fn tomlDtDecodeDateTime(s: string, offset: int): Toml! {
+  let n = tomlDtTruncateFraction(tomlDtNormalizeZone(tomlDtNormalizeSep(s)))
+  if (tomlDtHasOffsetSuffix(n)) {
+    let dt = parseDateTime(n) catch e {
+      fail tomlDtError(e, offset)
+    }
+    return Toml.TomlOffsetDateTime(dt)
+  }
+  let ndt = parseNaiveDateTime(n) catch e {
+    fail tomlDtError(e, offset)
+  }
+  return Toml.TomlLocalDateTime(ndt)
+}
+
+// Rewrites a `t` or ` ` date-time separator at index `tomlDtDateLen` to the
+// uppercase `T` std/time's own parsers require (TOML 1.0.0 permits all
+// three). A span too short to carry a separator, or already carrying `T`,
+// is returned unchanged.
+fn tomlDtNormalizeSep(s: string): string {
+  if (len(s) <= tomlDtDateLen) {
+    return s
+  }
+  let c = s[tomlDtDateLen]
+  if (c == 't' || c == ' ') {
+    return s[0:tomlDtDateLen] + "T" + s[tomlDtDateLen + 1:len(s)]
+  }
+  return s
+}
+
+// Rewrites a trailing lowercase `z` UTC marker to the uppercase `Z`
+// std/time's own zone parser requires (TOML 1.0.0 permits both).
+fn tomlDtNormalizeZone(s: string): string {
+  let n = len(s)
+  if (n > 0 && s[n - 1] == 'z') {
+    return s[0:n - 1] + "Z"
+  }
+  return s
+}
+
+// Drops any fractional-second digit past the ninth (nanosecond) place —
+// TOML 1.0.0 permits arbitrary precision and requires truncation, never
+// rounding or rejection, when an implementation cannot keep it all. A span
+// with no `.` — a date, a whole-second time, or a whole-second date-time —
+// is returned unchanged.
+fn tomlDtTruncateFraction(s: string): string {
+  let dot = tomlDtFindDot(s)
+  if (dot < 0) {
+    return s
+  }
+  let digitsStart = dot + 1
+  let runLen = tomlDtDigitRunLen(s, digitsStart)
+  if (runLen <= tomlDtNanoDigits) {
+    return s
+  }
+  return s[0:digitsStart + tomlDtNanoDigits] + s[digitsStart + runLen:len(s)]
+}
+
+// The index of `s`'s only `.` (TOML's date-time grammar has no other use
+// for one), or -1 when there is none.
+fn tomlDtFindDot(s: string): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '.') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The length of the run of ASCII digits starting at `s[start]`.
+fn tomlDtDigitRunLen(s: string, start: int): int {
+  let i = start
+  while (i < len(s) && isDigit(s[i])) {
+    i = i + 1
+  }
+  return i - start
+}
+
+// Whether `s` ends in a zone: a trailing `Z` (already normalized from `z`
+// by the time this runs), or a `+`/`-` exactly `tomlDtOffsetLen` bytes from
+// the end — the fixed-width numeric form, independent of the fraction's
+// own width since the zone is always the suffix. Grammar past that single
+// sign byte (the digits and the colon) is std/time's `parseDateTime` to
+// enforce, not this file's to pre-check.
+fn tomlDtHasOffsetSuffix(s: string): bool {
+  let n = len(s)
+  if (n > 0 && s[n - 1] == 'Z') {
+    return true
+  }
+  if (n < tomlDtOffsetLen) {
+    return false
+  }
+  let c = s[n - tomlDtOffsetLen]
+  return c == '+' || c == '-'
+}
+
+// Rethrows a std/time failure with the ORIGINAL source byte offset —
+// std/time's own message names a position inside the isolated span, which
+// is never what a caller of this file wants.
+fn tomlDtError(e: error, offset: int): error {
+  return newError("toml: " + e.message() + " at byte ${offset}")
+}
