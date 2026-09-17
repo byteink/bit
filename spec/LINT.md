@@ -202,7 +202,7 @@ Counting rules, so the numbers are reproducible:
 - `max-complexity` is cyclomatic complexity: start at 1, add one for each `if`,
   `while`, `for`, `match` arm, `switch` case, `catch`, `&&`, and `||`. A
   `switch`'s `default` clause does not add a point, the same as a plain `if`'s
-  `else` — the catch-all arm is not an independent path, only what runs when
+  `else` -- the catch-all arm is not an independent path, only what runs when
   none of the counted cases match. Unlike `max-nesting` it is flat-sensitive -
   a 300-line `match` with 60 one-line arms scores 61 while nesting stays at 1,
   and the same 300 lines as a `switch` with 60 cases scores the same.
