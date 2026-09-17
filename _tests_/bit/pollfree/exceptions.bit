@@ -76,6 +76,9 @@ fn pollFreeExceptions(): []string {
   out = extendStrings(out, exceptionsNetTcpEngine())
   out = extendStrings(out, exceptionsNetUdpEngine())
   out = extendStrings(out, exceptionsAuxv())
+  out = extendStrings(out, exceptionsSchedPollLinux())
+  out = extendStrings(out, exceptionsSchedPollWindows())
+  out = extendStrings(out, exceptionsSchedMachinery())
   return out
 }
 
@@ -90,6 +93,156 @@ fn exceptionsAuxv(): []string {
   return [
     "auxv:wordAt",
     "auxv:getauxval",
+  ]
+}
+
+// (i) `runtime/sched/linux/poll.bit` (#5467, epic #5458's linux sched
+// sub-ticket). The darwin twin (#5466) needed no exceptions at all: every one
+// of its six flagged declarations (`bufBytes`, `tsBytes`, `readU64`,
+// `pollCreate`, `pollClose`, `pollDrain`) is `@nosplit` now, confirmed by
+// `bit check runtime/sched/darwin` (exit 0) with a negative control (stripping
+// `@nosplit` from `readU64` reproduces E0075 naming `pollDrain`). Linux's
+// `bytesOf` and `pollClose` are the identical shape and are `@nosplit` too,
+// same proof. The six entries below are blocked from `@nosplit` for a single,
+// mechanically-confirmed reason this file's own header already documents at
+// `eventDataOff`: `hostTarget()` is a real `bit_rt_host_target` runtime call,
+// not on the compiler's `@nosplit` allowlist (unlike `syscall`, an inline
+// trap), so any caller reaching it is refused E0075 regardless of whether it
+// allocates. Forcing `@nosplit` onto `eventStride`/`eventDataOff` and
+// re-running `bit check` reproduces exactly that: "nosplit function
+// 'eventStride' calls 'hostTarget', which is not marked nosplit".
+//
+// THE PROPERTY HOLDS ANYWAY, which is what each entry claims:
+//   - `eventStride`/`eventDataOff`: straight-line `if hostTarget()==0`
+//     branches returning one of two int literals (12/16 or 4/8). No loop, no
+//     allocation, no pointer ever formed — the only "state" is the return
+//     value.
+//   - `cacheEventDataOff`: writes `eventDataOff()`'s scalar answer into the
+//     module-static `eventDataOffCache` (a `[1]i64`, not a GC object) through
+//     the already-`@nosplit` `layoutBytes`/`writeU64`. Blocked only by its one
+//     call to `eventDataOff`.
+//   - `pollCreate`: `rc` is the scalar epoll fd `syscall` (an inline trap)
+//     returns; the only other call is `cacheEventDataOff()`, priming the
+//     cache before the descriptor is handed to any caller. No GC object at
+//     any point.
+//   - `pollDrainOne`: this file's own header at `eventDataOffNosplit`
+//     documents the design already — `eventDataOff` stays the source of truth
+//     here specifically because this is "the one caller that needs it
+//     nosplit-safe" was never this function. `pollFd`/`timeoutMs` are raw
+//     ints, `evBuf` is the module-static drain buffer, and `task` is a raw
+//     scheduler address read out of the kernel's answer and handed straight
+//     to the already-`@nosplit` `schedPollUnpark` — the same "raw scheduler
+//     address, never a GC reference" shape `net/*:netAwaitReady` and its
+//     siblings rest on. Blocked only by its calls to `eventStride`/
+//     `eventDataOff`.
+//   - `pollDrain`: calls `pollDrainOne` twice (read then write descriptor);
+//     everything else it touches (`taskAt`, `schedPollTryEnter`,
+//     `schedPollLeave`) is already `@nosplit`. `scPollFd`/`scPollFdWrite` are
+//     raw ints and `s` is the raw scheduler address `taskAt` returns — no GC
+//     object. Blocked transitively through `pollDrainOne`.
+//
+// None of these six ever suspends the calling task (unlike a genuine park):
+// `pollDrain`'s own doc comment states the run loop always calls it with
+// `timeoutMs` 0, non-blocking, specifically so a worker is never sitting in a
+// syscall mid-collection. The hazard this gate polices — a raw GC address
+// surviving a back-edge poll — does not arise here at all; only the
+// annotation is unavailable, for the one documented, mechanically-confirmed
+// reason above.
+fn exceptionsSchedPollLinux(): []string {
+  return [
+    "sched/linux:eventStride",
+    "sched/linux:eventDataOff",
+    "sched/linux:cacheEventDataOff",
+    "sched/linux:pollCreate",
+    "sched/linux:pollDrain",
+    "sched/linux:pollDrainOne",
+  ]
+}
+
+// (j) `runtime/sched/windows/poll.bit` (#5468, epic #5458's windows sched
+// sub-ticket — the IOCP poll engine, the largest single file in the epic).
+// 22 of its 28 declarations are `@nosplit` above. These six share ONE
+// mechanical blocker, distinct from linux's `hostTarget()` case: each reads
+// or writes a fixed `[]i64` array (`ovWords`/`wsabufWords`/`taskOf`/
+// `flagsScratch`/`bytesXfer`/`opKind`/`slotStatus`/`evBuf`) through a
+// RUNTIME index — `slot`, from `scratchClaim()` or recovered from a
+// completion packet's `lpOverlapped` address, or `i`, a bounded loop
+// counter — never a literal or a masked literal, so
+// `vNosplitArrayIndexInBounds` (compiler/validateattr.bit) cannot prove the
+// access in range and E0075 refuses it, the same rule a slice base is
+// refused by (#3107/#4270). Confirmed by a negative control: forcing
+// `@nosplit` onto all six and re-running `bit check runtime/sched/windows`
+// reproduces E0075 at all 31 indexing sites across these six functions, each
+// pointing straight at the array element, e.g. "nosplit function
+// 'pollRegister' may not allocate or reach a safepoint here" at
+// `ovWords[slot * 4 + 0] = i64(0)`. The file's own pointer-arithmetic
+// helpers (`ovPtr`/`wsabufPtr`/`flagsPtr`/`bytesXferPtr`/`ovBase`, all
+// `@nosplit` above) exist for exactly this reason; this group is only the
+// call sites that index the backing arrays directly instead.
+//
+// THE PROPERTY HOLDS ANYWAY, which is what each entry claims: every word
+// these arrays hold is a plain `int`/`i64` — a slot index, a task's raw
+// scheduler address (`taskOf`), a byte count, an NTSTATUS-shaped status
+// word, or a zeroed OVERLAPPED/WSABUF field — never a GC object or a
+// pointer into the GC heap. `taskOf[slot]` is the identical "raw scheduler
+// address, never a GC reference" shape `net/*:netAwaitReady` (g1) and
+// linux's `pollDrainOne` (i) already rest on; `pollRegister`/`pollClaimOp`/
+// `pollFinishSlot`/`pollDrain` hold nothing else across the
+// WSARecv/WSASend/GetQueuedCompletionStatusEx calls that could poll.
+// `pollOpBytes`/`pollOpStatus` are pure scalar reads out of the same pool,
+// called by `../../net/windows` (#3340) only AFTER the task is woken, never
+// across a poll themselves.
+fn exceptionsSchedPollWindows(): []string {
+  return [
+    "sched/windows:pollRegister",
+    "sched/windows:pollClaimOp",
+    "sched/windows:pollOpBytes",
+    "sched/windows:pollOpStatus",
+    "sched/windows:pollFinishSlot",
+    "sched/windows:pollDrain",
+  ]
+}
+
+// (k) `runtime/sched/` worker/grow/task machinery, platform-independent
+// (#5469, epic #5458's completion ticket — the one that also adds the
+// `sched` `Root{}` entry below). Four declarations, each blocked from
+// `@nosplit` for the SAME reason, confirmed by reading the transitive callee
+// each one reaches and, for `schedStartWorker`, by this file's own header
+// comment at `./grow.bit`'s `schedMaybeGrow` naming it explicitly: a call
+// THROUGH A VALUE. `schedStartWorker` (`./worker.bit`) invokes
+// `launch.startFn(...)`, the caller-supplied platform `threadStart` function
+// value; `schedMaybeGrow` (`./grow.bit`) calls `schedStartWorker` itself;
+// `schedWorkerRun` (`./workerrun.bit`) calls `schedFindWorkIdle`, which takes
+// `nowFn`/`pollFn` as function values and calls them directly; and
+// `schedFindWorkIdle` (`./workerfind.bit`) is that callee. SPEC §10.3.1 rules
+// out a call through a value unconditionally (`vNosplitCall`,
+// compiler/validateattr.bit: "callee must be a bare Ident") — restructuring
+// cannot change this, since accepting a platform thread-start recipe or a
+// clock/poller seam AS a function value is the whole point of each (see
+// `./grow.bit`'s own header: "starting a thread is irreducibly not
+// `@nosplit`", and `./workerfind.bit`'s: "a call through a value is E0075 in
+// a `@nosplit` body").
+//
+// THE PROPERTY HOLDS ANYWAY. `schedStartWorker` holds only `s`/`launch`'s
+// fields (`entry`/`argArea`/`doneArea`/`handleArea`, four raw pointers into
+// caller-owned arrays) and `i`/`block`/`done`/`h`, all plain `int`s derived
+// from them — `launch: WorkerLaunch` is a plain field bundle crossing a
+// module edge (`./grow.bit`'s own header), never constructed with a managed
+// payload. `schedMaybeGrow` adds nothing beyond forwarding the same `launch`
+// unchanged. `schedFindWorkIdle` holds `w`/`s`, the worker/scheduler raw
+// block addresses every already-`@nosplit` sibling in this module holds the
+// same way (`schedFindWork`, `schedWorkPending`), plus `now`/`addr`/
+// `chanWoken`/`t`, all `int`. `schedWorkerRun` holds `w`/`s`/`backoff`/`n`,
+// identically raw, across its call into `schedWorkerStep` (`@nosplit` above)
+// and `schedFindWorkIdle`. None of the four ever allocates or holds a GC
+// object — the only thing E0075 refuses is the shape of the call, not
+// anything about what crosses it.
+fn exceptionsSchedMachinery(): []string {
+  return [
+    "sched:schedStartWorker",
+    "sched:schedMaybeGrow",
+    "sched:schedFindWorkIdle",
+    "sched:schedWorkerRun",
   ]
 }
 
