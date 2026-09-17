@@ -1,0 +1,220 @@
+// compiler/lowerexplodemethod.bit — #5445: the METHOD half of the return-word
+// convention. Sibling of lowerexplode.bit (the width rule and both ABI
+// directions) and lowerexplodestr.bit (the `string` half); same module, so
+// this needs no imports.
+//
+// WHAT WAS EXCLUDED AND WHY. `explodedRetWords` (lowerexplode.bit) gates the
+// return side on `explodesParams`, whose second exclusion is a RECEIVER: a
+// method reaches its callers through `Op.CallIface` as well as by name, and
+// there the INTERFACE's signature is the contract, not the class's. The
+// RETURN side inherited that exclusion whole even though only the result type
+// is at stake, so `Counter.next(): Opt` boxed one `{tag, payload}` object per
+// call while the byte-identical free function did not — measured at
+// `0c035ef0`, 1,000,000 crossings, `obj (swept+live)` 1,000,007 against 7 and
+// 32.0 B/object of `allocbytes` difference.
+//
+// WHY THE ONE-LINE RELAXATION IS A MISCOMPILE, not a smaller version of this.
+// Dropping the receiver test from the return side's gate self-hosts clean and
+// compiles the shape with rc=0 and no diagnostic: the callee's `ret` grows its
+// second word while the direct call site stays a single-result `call` with no
+// `call_word` run after it, so the caller reads the tag register as a boxed
+// handle and dereferences an integer. `_tests_/cases/run_enum_explode_method.bit`
+// pins that shape by name. The fix is two halves that must land together —
+// this file's gate, and `emitStaticMethodCall` below at the call site.
+//
+// THE GATE, and why it is a NAME rather than a call-site test. The callee's
+// `ret` is lowered once, from the declaration; every caller must agree with it
+// without seeing any other caller. So the question has to be answerable from
+// the declaration alone, and it is: a method may hand its result back in words
+// only when NOTHING in the project can reach its symbol except a direct
+// `call` — no interface declares its name (`Op.CallIface` keeps the one-handle
+// convention until #5446, so the interface's contract can never disagree with
+// a class's), it is never taken as a method VALUE, and lowering synthesizes no
+// call to that name of its own. That set is `ctx.dynamicMethodNames`
+// (types.bit), collected once by `collectDynamicMethodNames` below.
+//
+// A deferred method call needs nothing here and is not in the set:
+// `resolveDeferMethodTarget` (lowerdefer.bit) types its `Op.Call` `void` and
+// discards the result, so the extra return registers are simply ignored —
+// the same "no `Op.CallWord` run, the caller ignores the rest" case
+// `deferredResultTy` and `synthSpawnTrampoline` (lowerfuncval.bit) already
+// document for free functions, and `callResultEscapesInFunc` (verify.bit)
+// refuses a short run only where the result is actually read.
+
+// Whether `decl` — a METHOD — returns its result in words instead of one
+// handle. Read by `explodedRetWords` (lowerexplode.bit) beside
+// `explodesParams`, which stays exactly as it was: this widens the RETURN side
+// only, and the argument side of a method is untouched.
+//
+// Every exclusion `explodesParams` makes for a free function is made here for
+// the same reason — an `extern` has no body to lower, a declaration with type
+// params (the parser merges a generic RECEIVER's list in front of the
+// method's own, `methodOwnGenericCount` in checklookup.bit, so this excludes
+// a generic class's methods too) is monomorphized under another symbol, a
+// variadic parameter list does not describe what arrives, and an `@symbol`
+// name is an ABI someone else owns.
+fn methodRetExplodes(c: Checker, decl: int): bool {
+  if (decl == 0 || isExternDecl(c.tree, decl)) {
+    return false
+  }
+  let kids = kidsOf(c.tree, decl)
+  if (kids[0] == 0 || kids[2] != 0 || paramsAreVariadic(c, kids[3])) {
+    return false
+  }
+  if (funcAttrArg(c, decl, "symbol") != "") {
+    return false
+  }
+  let mn = getNode(c.tree, kids[1])
+  let name = c.source[mn.span.start:mn.span.end]
+  if (methodNameIsDynamic(c.ctx, name)) {
+    return false
+  }
+  return methodDeclIsResolvable(c, decl, kids, name)
+}
+
+// Whether `name` is reachable other than by a direct call — see
+// `TypeContext.dynamicMethodNames` (types.bit). An empty map (nothing
+// collected) answers false for every name, which is why
+// `collectDynamicMethodNames` runs before the first body is lowered rather
+// than lazily: an unfilled gate is a permissive one.
+fn methodNameIsDynamic(ctx: TypeContext, name: string): bool {
+  let (dyn, ok) = ctx.dynamicMethodNames[name]
+  return ok && dyn
+}
+
+// Whether `methodRefAt` (checklookup.bit) — the lookup EVERY call site
+// resolves a method through — hands back this very declaration for this
+// receiver.
+//
+// The round trip is the agreement itself, not a precaution. The callee's `ret`
+// is built from `decl`; a call site that resolved to a different declaration,
+// or to none, would read `explodedRetWords` for something else and emit the
+// one-handle shape against a callee returning words. Answering false here
+// keeps both sides on today's convention instead.
+fn methodDeclIsResolvable(c: Checker, decl: int, kids: []int, name: string): bool {
+  let recvTy = userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, kids[0])[1]))
+  if (recvTy <= 0) {
+    return false
+  }
+  let (d, ok) = c.ctx.methodDecls["${recvTy}.${name}"]
+  return ok && d == decl
+}
+
+// Fills `ctx.dynamicMethodNames` (types.bit) for the whole project, before any
+// body is lowered. Called from `lowerProject` (lowerglobal.bit), which is the
+// one place that holds every module at once — the scope the question has.
+//
+// The three synthesized names have no member node in the source to find them
+// by: `lowerToString` (lowerinterp.bit) calls `show` on a class value,
+// `emitErrorLine` (lowerentry.bit) calls `message` through the error
+// interface, and `lowerClassConstruct` (classinit.bit) calls `init`. Listed rather
+// than derived, so a fourth such site adds its name here and nothing else.
+fn collectDynamicMethodNames(mods: []Checker, root: int) {
+  let ctx = mods[root].ctx
+  let names = map<string, bool>{}
+  names["show"] = true
+  names["message"] = true
+  names["init"] = true
+  ifaceMethodNamesInto(ctx, names)
+  let mi = 0
+  while (mi < len(mods)) {
+    memberValueNamesInto(mods[mi], names)
+    mi = mi + 1
+  }
+  ctx.dynamicMethodNames = names
+}
+
+// Every method name an interface in this project declares. `Op.CallIface`
+// carries a dispatch id derived from the NAME (`methodId`, lower.bit) and
+// `bit_rt_iface_lookup` (runtime/root/iface.bit) resolves it against the
+// receiver's own table, so a name any interface declares can land on any
+// class that has it — which is why the exclusion is by name and not by which
+// class implements what.
+fn ifaceMethodNamesInto(ctx: TypeContext, names: map<string, bool>) {
+  let t = 0
+  while (t < len(ctx.types)) {
+    if (ctx.types[t].kind == TypeKind.Interface) {
+      let (ms, ok) = ctx.typeMethodNames["${t}"]
+      if (ok) {
+        markNames(names, ms)
+      }
+    }
+    t = t + 1
+  }
+}
+
+fn markNames(names: map<string, bool>, ms: []string) {
+  let i = 0
+  while (i < len(ms)) {
+    names[ms[i]] = true
+    i = i + 1
+  }
+}
+
+// Every member name in `c`'s tree that is NOT the callee of a call — `v.m`
+// taken as a value, which `lowerStructMethodValue` (lowerfuncval.bit) lowers
+// to a closure over the method's own symbol, called back through
+// `Op.CallValue`'s one-handle convention with nothing at the call site that
+// could know the callee returns words.
+//
+// FIELD reads land in this set too (`p.x` is a `Tag.Member` nobody calls) and
+// that is deliberate: the set only ever refuses an optimization, never admits
+// one, so an over-approximation costs a method that shares a field's name its
+// words and costs correctness nothing.
+fn memberValueNamesInto(c: Checker, names: map<string, bool>) {
+  let n = len(c.tree.nodes)
+  let called = []bool(n)
+  let i = 1
+  while (i < n) {
+    if (getNode(c.tree, i).tag == Tag.Call) {
+      let ck = kidsOf(c.tree, i)
+      if (len(ck) != 0 && ck[0] > 0 && ck[0] < n) {
+        called[ck[0]] = true
+      }
+    }
+    i = i + 1
+  }
+  i = 1
+  while (i < n) {
+    if (getNode(c.tree, i).tag == Tag.Member && !called[i]) {
+      let mn = getNode(c.tree, kidsOf(c.tree, i)[1])
+      names[c.source[mn.span.start:mn.span.end]] = true
+    }
+    i = i + 1
+  }
+}
+
+// The `Op.Call` for a statically dispatched method, with the `Op.CallWord` run
+// its callee's `ret` needs when that callee returns words. The tail every
+// by-name method call site shares (`lowerClassMethodCall` and
+// `lowerMemberPrimMethodCall`, lowercall.bit), for the same reason
+// `emitResolvedCall` (lowerprim.bit) is the free call's: two copies of this
+// would be two chances to disagree with one callee.
+//
+// `fr` is what `methodRefAt` (checklookup.bit) answered for this receiver and
+// name, so the declaration read here is the declaration the callee was lowered
+// from — `methodDeclIsResolvable` above is that agreement stated as a gate.
+// A method the gate refuses reads `retWords` empty and emits exactly the
+// single-result `call` this site emitted before.
+fn emitStaticMethodCall(fc: FnCtx, fr: FuncRef, symbol: string, result: int, args: []int): int {
+  let retWords = explodedRetWords(fr.owner, fr.decl, fc.lowerer)
+  let ins = mkInstr(Op.Call, result)
+  if (len(retWords) != 0) {
+    ins = mkInstr(Op.Call, retWords[0])
+  }
+  ins.name = symbol
+  ins.args = args
+  let call = builderEmit(fc.b, ins)
+  if (len(retWords) == 0) {
+    return call
+  }
+  // The aggregate is rebuilt here and the optimizer removes the box: the
+  // consumer's `field_get`s forward from these `field_set`s in the same block
+  // and the allocation nothing reads is deleted. Where it genuinely escapes
+  // the box stays, which is today's behaviour exactly — so this is never
+  // worse than what it replaces, and correctness never depends on the
+  // optimizer running (`emitResolvedCall`, lowerprim.bit, on the free side).
+  return materializeExplodedIn(
+    fc, fc.b, result, emitCallResultWords(fc.c.ctx, fc.b, call, retWords),
+  )
+}
