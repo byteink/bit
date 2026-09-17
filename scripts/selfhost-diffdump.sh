@@ -181,7 +181,8 @@ run_basic() {
   oerr="$work/oracle.err"
   bout="$work/bit2.out"
   berr="$work/bit2.err"
-  match=0 mismatch=0 skip=0 timeout=0 oraclecrash=0 oraclepanic=0 exitdiff=0 firstbad="" firstexitdiff=""
+  match=0 mismatch=0 explained=0 skip=0 timeout=0 oraclecrash=0 oraclepanic=0 exitdiff=0 firstbad="" firstexitdiff=""
+  : >"$work/explained"
   for f in $(find $CORPUS -name '*.bit' | sort); do
     # Verdict-deciding (#3422): retry-once-on-stall, same as before. Stdout
     # and stderr are captured SEPARATELY (#5037, alarmrun_cap2): a merged
@@ -252,15 +253,39 @@ run_basic() {
     if [ "$seed" = "$b2" ]; then
       match=$((match + 1))
     else
-      mismatch=$((mismatch + 1))
-      [ -z "$firstbad" ] && firstbad="$f"
+      # #5510: only the `ast` row ever has a declared signature to check --
+      # `tokens`/`diags` never call explainMismatch at all, so a divergence
+      # there is scored exactly as before. Checked only once seed/b2 are
+      # already known to differ: the overwhelming majority of files match,
+      # so this never forks awk for them.
+      sig=""
+      if [ "$NAME" = ast ]; then
+        sig=$(explainMismatch "$seed" "$b2" ast)
+      fi
+      if [ -n "$sig" ]; then
+        explained=$((explained + 1))
+        echo "$f -> explained by declared signature '$sig'" >>"$work/explained"
+      else
+        mismatch=$((mismatch + 1))
+        [ -z "$firstbad" ] && firstbad="$f"
+      fi
     fi
   done
 
   if [ -n "$SKIPLABEL" ]; then
-    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXITDIFF=$exitdiff SKIP($SKIPLABEL)=$skip TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained EXITDIFF=$exitdiff SKIP($SKIPLABEL)=$skip TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
   else
-    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXITDIFF=$exitdiff TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained EXITDIFF=$exitdiff TIMEOUT=$timeout ORACLE-CRASH=$oraclecrash ORACLE-PANIC=$oraclepanic"
+  fi
+
+  # Informational only, never fails the gate: each of these matched a
+  # declared transform signature's identity exactly (explainMismatch, #5510)
+  # -- see selfhost-ir-signatures.sh's header for why that is a stronger
+  # claim than "this file is allowed to differ".
+  if [ -s "$work/explained" ]; then
+    echo
+    echo "EXPLAINED: $explained file(s) diverge from the pinned stage0 but match a declared signature (not a regression):"
+    sed 's/^/  /' "$work/explained"
   fi
 
   # Informational only, never fails the gate (unaffected by diffexit below):

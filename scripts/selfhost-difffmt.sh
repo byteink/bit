@@ -57,6 +57,8 @@ set -uo pipefail
 . "$(dirname -- "$0")/alarmrun.sh"
 # shellcheck source=scripts/diffexit.sh
 . "$(dirname -- "$0")/diffexit.sh"
+# shellcheck source=scripts/selfhost-ir-signatures.sh
+. "$(dirname -- "$0")/selfhost-ir-signatures.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -139,9 +141,10 @@ if [ -n "$absent" ]; then
 fi
 
 : >"$work/mismatch"
+: >"$work/explained"
 : >"$work/timeout"
 : >"$work/oracletimeout"
-match=0 skip=0
+match=0 explained=0 skip=0
 
 # fmt_retry <side> <target> <pristine> <bin> -- alarmrun_retry's own contract
 # (one retry on SIGALRM, 142 iff both attempts stall, stall note on fd 9) but
@@ -214,15 +217,37 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
   if cmp -s "$a/s.bit" "$b/s.bit"; then
     match=$((match + 1))
   else
-    echo "$f" >>"$work/mismatch"
+    # #5510: the fmt arm had no declared-signature mechanism at all before
+    # this -- every divergence failed the gate outright, which is what made
+    # #5474 (a correct parser fix) unlandable: its own new fixture formats
+    # differently pre/post fix by construction. Checked only once cmp has
+    # already found a byte difference, same as the ast arm in
+    # selfhost-diffdump.sh's run_basic().
+    sig=$(explainMismatch "$(cat "$a/s.bit")" "$(cat "$b/s.bit")" fmt)
+    if [ -n "$sig" ]; then
+      explained=$((explained + 1))
+      echo "$f -> explained by declared signature '$sig'" >>"$work/explained"
+    else
+      echo "$f" >>"$work/mismatch"
+    fi
   fi
 done
 
-compared=$((match + $(wc -l <"$work/mismatch" | tr -d ' ')))
+compared=$((match + explained + $(wc -l <"$work/mismatch" | tr -d ' ')))
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
 oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
-echo "fmt differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts SKIP(unformattable)=$skip"
+echo "fmt differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts SKIP(unformattable)=$skip"
+
+# Informational only, never fails the gate: each of these matched a declared
+# signature's identity exactly (explainMismatch, scripts/selfhost-ir-
+# signatures.sh) -- see that file's header for why that is a stronger claim
+# than "this file is allowed to differ".
+if [ -s "$work/explained" ]; then
+  echo
+  echo "EXPLAINED: $explained file(s) the two formatters render differently but match a declared signature (not a regression):"
+  sed 's/^/  /' "$work/explained"
+fi
 
 # Corpus floor (#1516): comparing nothing is not agreement. If every file was
 # skipped or timed out there is no evidence either way, and a green here would
