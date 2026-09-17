@@ -49,6 +49,15 @@ does, is how a caller finds out which it got instead of assuming.
 non-scalar mapping key (a sequence or a mapping used as a key), so typing
 `key` as a plain `string` would make that unrepresentable.
 
+`yamlAsMapping` hands back `[]YamlEntry` in the exact order the document
+wrote it, so a caller that cares about that order - re-emitting the file
+with [Encoding](encoding.md), say - never loses it. That is preserving
+fidelity to what was written, not a claim about equality: two YAML
+mappings with the same keys and values in a different order are the same
+value, the way two JSON objects are. [Conformance](conformance.md) has a
+concrete case where the corpus's own reference data disagrees with itself
+on order for exactly this reason.
+
 ## The real file
 
 A real deploy config nests further: server settings, a list of regions, a
