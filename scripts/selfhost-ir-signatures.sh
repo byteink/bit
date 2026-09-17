@@ -282,6 +282,51 @@ explainMismatch() {
         if (catchDisambigFmt(nA, linesA, nB, linesB)) { print "5474-catch-composite-default-fmt"; exit 0 }
         exit 1
       }
+      # --- #5521: a void-ok return drops its now-dead operand
+      # (`emitReturnValue`, compiler/lowerfunc.bit) ---
+      #
+      # #5521 fixed `emitReturnValue` putting a void expression instruction id
+      # into `Op.Ret.args` whenever the function declared ok type is void --
+      # the same invariant #4571 already enforced one level over, for an
+      # expression-bodied arrow closure (`closureExprReturn`). The pinned
+      # stage0 still carries the un-fixed statement-form path, so it still
+      # lowers a NAMED function own `return <expr>` (or a `@naked` body
+      # `return asm {...}`) with the dead operand attached; this tree drops
+      # it. Nothing else in the function moves: the value the operand used to
+      # name is still DEFINED earlier exactly as before (dead now, not
+      # renumbered, not removed by this lowering change), so every other line
+      # is byte-identical.
+      #
+      # The identity is deliberately narrower than a delta count: EVERY line
+      # must match except exactly one, and that one line must go from a
+      # single-operand `ret %<id>` (oracle) to the same line with the operand
+      # removed (bit2) -- two or more differing lines, or a differing line of
+      # any other shape, both fail this and fall through to the checks below.
+      # Derived from both real divergences #5521 produces against the pinned
+      # stage0 (`bit --dump-ir-pre`, byte for byte):
+      # _tests_/cases/run_naked_not_inlined.bit (`4c4`) and
+      # _tests_/cases/run_return_unit_fallible.bit (`21c21`) -- both are
+      # exactly this one-line shape, confirmed in
+      # selfhost-ir-signatures-selfcheck.sh with the real `writeNode()` dump
+      # off the latter fixture, not a hand-written stand-in.
+      if (nA == nB) {
+        diffLine5521 = 0
+        onlyOneDiff5521 = 1
+        for (k5521 = 1; k5521 <= nA; k5521++) {
+          if (linesA[k5521] == linesB[k5521]) { continue }
+          if (diffLine5521 != 0) { onlyOneDiff5521 = 0; break }
+          diffLine5521 = k5521
+        }
+        if (onlyOneDiff5521 && diffLine5521 != 0 &&
+            linesA[diffLine5521] ~ /^[[:space:]]*ret %[0-9]+$/) {
+          wantB5521 = linesA[diffLine5521]
+          sub(/ %[0-9]+$/, "", wantB5521)
+          if (linesB[diffLine5521] == wantB5521) {
+            print "5521-void-return-bare-ret"
+            exit 0
+          }
+        }
+      }
       # --- #5486: pure instruction-reorder (payload lowered before its
       # `gc_alloc`, compiler/lowercall.bit variantPayloadValues via
       # lowerVariantConstruction, compiler/lowerlayout.bit) ---
@@ -739,7 +784,8 @@ declaredSignatureNames() {
     "5486-variant-payload-reorder" \
     "5429-decimal-boxed-slot-explode" \
     "5506-enum-nil-payload-retype" \
-    "5445-method-return-explode-direct-call"
+    "5445-method-return-explode-direct-call" \
+    "5521-void-return-bare-ret"
   [ "$kind" = ir ] || printf '%s\n' "5486-variant-payload-redundant-read-elim"
   [ -n "$kind" ] || printf '%s\n' "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt"
 }
