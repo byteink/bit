@@ -1,0 +1,512 @@
+// pkg/yaml/scalar.bit — yaml module, plain/single-quoted/double-quoted
+// scalar decoding (#5493, epic #1482). Turns the raw `[start, end)` spans
+// `pkg/yaml/scan.bit` produces into decoded `string` values; `value.bit` and
+// `scan.bit` are siblings in this same flat module (pkg/README.md).
+//
+// THREE STYLES, three rule sets — see `yamlDecodeScalar` for the dispatch:
+//
+//   - PLAIN has no delimiters and no escapes: a single-line span decodes to
+//     exactly itself. A multi-line span (this file's caller may hand one in
+//     directly — the scanner itself never emits a `PlainScalar` token
+//     crossing a line, `scanPlainScalar` stops at every `\n`/`\r`, but this
+//     function's contract is "decode whatever span you are given") folds
+//     per `foldContent` below.
+//   - SINGLE-QUOTED has exactly one escape, `''` for a literal `'`; no
+//     backslash escapes at all (`decodeEscaped`'s table does not apply
+//     here). Line folding is NOT applied to this style in this file: the
+//     ticket's own three-style breakdown states folding for "double-quoted
+//     and plain" only, so a multi-quoted span's embedded line breaks (the
+//     scanner does allow `SingleQuoted` to cross lines, `scanSingleQuoted`
+//     does not stop at `\n`) are returned literally. If a caller needs
+//     folded single-quoted scalars, that is a follow-up ticket, not a
+//     silent addition here.
+//   - DOUBLE-QUOTED is the only style with backslash escapes, and the only
+//     one that mixes escapes with line folding: an escaped line break
+//     (`\` immediately before `\n`/`\r\n`) is a continuation that removes
+//     the break entirely (no space, no fold), while every OTHER embedded
+//     break is subject to the same `foldContent` plain scalars use.
+//
+// LINE FOLDING (`foldContent`, shared by plain and double-quoted): given
+// content already free of escapes, split it into physical lines. A single
+// break between two content lines becomes one space. A run of N consecutive
+// breaks (extra breaks come from blank lines in between) becomes N-1
+// literal newlines. The first continuation line (`lines[1]`) sets the
+// scalar's baseline indentation — a raw byte span carries no external
+// column context the way a real block-context parser would supply, so this
+// file establishes the baseline from the content itself. A later line
+// indented past that baseline is "more indented": its break is NOT folded
+// (kept as a literal, unreduced run of newlines) and its extra indentation
+// beyond the baseline is preserved as content, mirroring how YAML never
+// folds around more-indented material (spec 6.5).
+//
+// TYPES ARE NOT RESOLVED HERE. Every style decodes to a `string`; whether
+// `no` is a boolean or `123` is an int is `pkg/yaml/schema.bit`'s decision.
+//
+// PERFORMANCE. The common case is a scalar needing no work: `yamlDecodeScalar`
+// and each style's decoder scan once for the first byte that needs handling
+// (an escape, a doubled quote, a line break) and return the slice directly
+// when there is none — no `Builder`, no allocation — mirroring
+// `stdlib/json/escape.bit`'s `decodeStringLiteral` fast path.
+
+// `repeat` is already imported into this module by scan.test.bit (same
+// module, importing it again here would be E0042 — pkg/README.md's flat
+// namespace).
+import { Builder, newBuilder, trim, trimRight } from "std/strings"
+
+// This package's own error convention for this file: a message plus the
+// byte offset it happened at, mirroring `stdlib/json/parse.bit`'s
+// `posError` without that file's line:column pass — this package's callers
+// slice by byte offset, so that alone is the load-bearing part.
+fn scalarError(msg: string, offset: i64): error {
+  return newError("${msg} at byte ${offset}")
+}
+
+// --- small byte-scanning helpers, shared by every style's fast path -------
+
+// The offset of `c` in `s[start:end)`, or -1 when absent.
+fn indexOfChar(s: string, start: i64, end: i64, c: u8): i64 {
+  let i = start
+  while (i < end) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// `s[i]` is `\r` immediately followed by `\n`, within `[i, end)` — the one
+// shape a `\r\n` break takes, shared by `splitRawLines`, the double-quoted
+// escape loop and its line-continuation check so none of the three drift
+// apart on how a Windows line ending is recognized.
+fn isCRLFAt(s: string, i: i64, end: i64): bool {
+  return s[i] == '\r' && i + 1 < end && s[i + 1] == '\n'
+}
+
+// The offset of the first `\n` or `\r` in `s[start:end)`, or -1.
+fn indexOfBreak(s: string, start: i64, end: i64): i64 {
+  let i = start
+  while (i < end) {
+    let c = s[i]
+    if (c == '\n' || c == '\r') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The offset of the first `\`, `\n` or `\r` in `s[start:end)`, or -1 — the
+// double-quoted fast-path test: either one means this span needs the escape
+// loop, neither means the slice is the answer.
+fn indexOfEscapeOrBreak(s: string, start: i64, end: i64): i64 {
+  let i = start
+  while (i < end) {
+    let c = s[i]
+    if (c == '\\' || c == '\n' || c == '\r') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// --- line folding (plain and double-quoted, see this file's header) ------
+
+// `content` split into physical lines on `\n`/`\r\n`, terminators removed.
+// A blank line (including a trailing one, when `content` ends on a break)
+// becomes an empty string, never dropped — `foldContent` needs every blank
+// line to count consecutive breaks correctly.
+fn splitRawLines(content: string): []string {
+  let n = len(content)
+  let lines = []string(0)
+  let lineStart = 0
+  let i = 0
+  while (i < n) {
+    let c = content[i]
+    if (c == '\n') {
+      lines = append(lines, content[lineStart:i])
+      i = i + 1
+      lineStart = i
+      continue
+    }
+    if (isCRLFAt(content, i, n)) {
+      lines = append(lines, content[lineStart:i])
+      i = i + 2
+      lineStart = i
+      continue
+    }
+    i = i + 1
+  }
+  lines = append(lines, content[lineStart:n])
+  return lines
+}
+
+// A line with nothing but spaces/tabs (or nothing at all) — carries no
+// content of its own, only an extra break for the N/N-1 fold count.
+fn isBlankLine(line: string): bool {
+  return trim(line, " \t") == ""
+}
+
+// The count of leading space/tab bytes — this file's only notion of
+// "indentation" for a raw span with no external column context.
+fn lineIndent(line: string): i64 {
+  let n = len(line)
+  let i = 0
+  while (i < n && (line[i] == ' ' || line[i] == '\t')) {
+    i = i + 1
+  }
+  return i
+}
+
+// `line` with its leading and trailing space/tab stripped — every folded
+// line's content, per this file's header.
+fn trimEdges(line: string): string {
+  return trim(line, " \t")
+}
+
+// The baseline indentation this content's fold decisions are measured
+// against: the first non-blank continuation line's own indentation (see
+// this file's header — `lines[0]` is the scalar's own first line and never
+// sets it). Content with no non-blank continuation line at all falls back
+// to 0, so any indented continuation would count as more-indented.
+fn foldBaseline(lines: []string): i64 {
+  let i = 1
+  while (i < len(lines)) {
+    if (!isBlankLine(lines[i])) {
+      return lineIndent(lines[i])
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The separator folding emits before a content line: a more-indented line
+// gets its break run preserved literally (folding is suspended, not
+// reduced); otherwise one break folds to a space and N breaks fold to N-1
+// newlines.
+fn foldSeparator(breakCount: i64, moreIndented: bool): string {
+  if (moreIndented) {
+    return repeat("\n", breakCount)
+  }
+  if (breakCount <= 1) {
+    return " "
+  }
+  return repeat("\n", breakCount - 1)
+}
+
+// A content line's own folded text: a more-indented line keeps everything
+// past the baseline's column (its extra indentation is content), trimmed
+// only on the trailing side; any other line is trimmed on both sides.
+fn foldLineText(line: string, baseline: i64, moreIndented: bool): string {
+  if (moreIndented) {
+    return trimRight(line[baseline:len(line)], " \t")
+  }
+  return trimEdges(line)
+}
+
+// Folds already-split `lines` per this file's header. Shared by plain
+// (`foldContent`, `lines` split on every raw byte in the span) and
+// double-quoted (`decodeDoubleQuoted`, `lines` are already-escape-decoded
+// segments split only at a raw, un-escaped source break) — the two need
+// different splitters, since a double-quoted segment's decoded bytes can
+// legitimately contain a `\n` BYTE from a `\n` escape that is not a line
+// break to fold at all, but once split, both fold the same way.
+fn foldLines(lines: []string): string {
+  let baseline = foldBaseline(lines)
+  let b = newBuilder().write(trimEdges(lines[0]))
+  let breakCount = 1
+  let i = 1
+  while (i < len(lines)) {
+    if (isBlankLine(lines[i])) {
+      breakCount = breakCount + 1
+      i = i + 1
+      continue
+    }
+    let moreIndented = lineIndent(lines[i]) > baseline
+    b = b.write(foldSeparator(breakCount, moreIndented))
+    b = b.write(foldLineText(lines[i], baseline, moreIndented))
+    breakCount = 1
+    i = i + 1
+  }
+  return b.toString()
+}
+
+// Folds `content`'s embedded line breaks per this file's header. Callers
+// only reach this once they have already confirmed `content` contains at
+// least one break (each style's own fast path) — a single-line `content`
+// still folds correctly (the loop below never runs), but skipping the call
+// entirely is what keeps the no-op case allocation-free. Plain-only: plain
+// has no escapes, so every `\n`/`\r\n` byte in its span is a real source
+// break, unlike double-quoted (see `foldLines`).
+fn foldContent(content: string): string {
+  return foldLines(splitRawLines(content))
+}
+
+// --- single-quoted -----------------------------------------------------
+
+// `content[firstQuote:]` with every `''` collapsed to one literal `'`.
+// `content[0:firstQuote]` needs no copy of its own quotes (there are none
+// before `firstQuote` by construction) so it is written once, whole.
+fn collapseDoubledQuotes(content: string, firstQuote: i64): string {
+  let n = len(content)
+  let b = newBuilder().write(content[0:firstQuote])
+  let i = firstQuote
+  while (i < n) {
+    if (content[i] == '\'') {
+      b = b.writeByte('\'')
+      i = i + 2
+      continue
+    }
+    b = b.writeByte(content[i])
+    i = i + 1
+  }
+  return b.toString()
+}
+
+// `'...'`: strips the surrounding quotes and collapses `''` to `'`. No line
+// folding — see this file's header.
+fn decodeSingleQuoted(src: string, start: i64, end: i64): string! {
+  let inner0 = start + 1
+  let inner1 = end - 1
+  if (indexOfChar(src, inner0, inner1, '\'') < 0) {
+    return src[inner0:inner1]
+  }
+  let content = src[inner0:inner1]
+  let firstQuote = indexOfChar(content, 0, len(content), '\'')
+  return collapseDoubledQuotes(content, firstQuote)
+}
+
+// --- double-quoted -------------------------------------------------------
+
+fn hexDigitVal(src: string, at: i64, escStart: i64): i64! {
+  let c = src[at]
+  if (c >= '0' && c <= '9') {
+    return i64(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return i64(c - 'a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return i64(c - 'A') + 10
+  }
+  fail scalarError("yaml: invalid hex escape digit", escStart)
+}
+
+// The `width`-hex-digit codepoint starting at `src[at]`.
+fn accumulateHex(src: string, at: i64, width: i64, escStart: i64): i64! {
+  let v = i64(0)
+  let k = 0
+  while (k < width) {
+    let d = hexDigitVal(src, at + k, escStart)?
+    v = v * 16 + d
+    k = k + 1
+  }
+  return v
+}
+
+// Encodes Unicode scalar value `cp` as UTF-8 into `b`. Hand-rolled because
+// `string(rune)` is not implemented yet (SPEC §12.9) — `stdlib/json/escape.bit`
+// and `stdlib/regex/litscan.bit` each carry the identical small local copy
+// for the same reason (litscan.bit's own comment explains why a shared
+// export is not worth it for a function this size).
+fn writeUtf8Rune(b: Builder, cp: i64) {
+  if (cp < 0x80) {
+    b.writeByte(u8(cp))
+    return
+  }
+  if (cp < 0x800) {
+    b.writeByte(u8(0xC0 | (cp >> 6)))
+    b.writeByte(u8(0x80 | (cp & 0x3F)))
+    return
+  }
+  if (cp < 0x10000) {
+    b.writeByte(u8(0xE0 | (cp >> 12)))
+    b.writeByte(u8(0x80 | ((cp >> 6) & 0x3F)))
+    b.writeByte(u8(0x80 | (cp & 0x3F)))
+    return
+  }
+  b.writeByte(u8(0xF0 | (cp >> 18)))
+  b.writeByte(u8(0x80 | ((cp >> 12) & 0x3F)))
+  b.writeByte(u8(0x80 | ((cp >> 6) & 0x3F)))
+  b.writeByte(u8(0x80 | (cp & 0x3F)))
+}
+
+// `\xXX`/`\uXXXX`/`\UXXXXXXXX`: `width` hex digits starting right after the
+// escape letter at `src[i]`, rejecting a surrogate (U+D800..U+DFFF) or
+// anything past U+10FFFF rather than substituting a replacement character
+// (ticket constraint). Returns the position just past the escape.
+// `escStart` (the backslash's own offset, for error messages) is `i - 1`
+// rather than a sixth parameter — max-params' limit is 5 (E0202) — every
+// caller reaches this function with `i` pointing right after that backslash.
+fn decodeFixedHexEscape(src: string, i: i64, end: i64, b: Builder, width: i64): i64! {
+  let escStart = i - 1
+  if (i + 1 + width > end) {
+    fail scalarError("yaml: invalid escape", escStart)
+  }
+  let cp = accumulateHex(src, i + 1, width, escStart)?
+  if (cp >= 0xD800 && cp <= 0xDFFF) {
+    fail scalarError("yaml: surrogate codepoint in escape", escStart)
+  }
+  if (cp > 0x10FFFF) {
+    fail scalarError("yaml: codepoint above U+10FFFF in escape", escStart)
+  }
+  writeUtf8Rune(b, cp)
+  return i + 1 + width
+}
+
+// The single-byte escapes: `\0 \a \b \t \n \v \f \r \e \" \/ \\`, aligned
+// index-for-index between the two strings/array below. -1 means `e` is not
+// one of these (the caller checks the multi-byte table next).
+fn simpleEscapeByte(e: u8): i64 {
+  let letters = "0abtnvfre\"/\\"
+  let bytes = [0, 7, 8, 9, 10, 11, 12, 13, 27, 34, 47, 92]
+  let i = 0
+  while (i < len(letters)) {
+    if (letters[i] == e) {
+      return bytes[i]
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The fixed-codepoint escapes: `\N` (U+0085), `\_` (U+00A0), `\L` (U+2028),
+// `\P` (U+2029) — each multi-byte in UTF-8, so `writeUtf8Rune` encodes them
+// rather than a single `writeByte`. -1 means `e` is not one of these.
+fn namedEscapeCodepoint(e: u8): i64 {
+  let letters = "N_LP"
+  let points = [0x85, 0xA0, 0x2028, 0x2029]
+  let i = 0
+  while (i < len(letters)) {
+    if (letters[i] == e) {
+      return points[i]
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// `src[i]` is the byte right after a `\` (the escape letter itself). Decodes
+// exactly one escape into `b` and returns the position just past it. An
+// escape letter matching none of the four tables above is an error — never
+// a silently-ignored or replacement-charactered byte (ticket constraint).
+fn decodeOneEscape(src: string, i: i64, end: i64, escStart: i64, b: Builder): i64! {
+  let e = src[i]
+  if (e == '\n') {
+    return i + 1
+  }
+  if (isCRLFAt(src, i, end)) {
+    return i + 2
+  }
+  if (e == 'x') {
+    return decodeFixedHexEscape(src, i, end, b, 2)?
+  }
+  if (e == 'u') {
+    return decodeFixedHexEscape(src, i, end, b, 4)?
+  }
+  if (e == 'U') {
+    return decodeFixedHexEscape(src, i, end, b, 8)?
+  }
+  let simple = simpleEscapeByte(e)
+  if (simple >= 0) {
+    b.writeByte(u8(simple))
+    return i + 1
+  }
+  let cp = namedEscapeCodepoint(e)
+  if (cp >= 0) {
+    writeUtf8Rune(b, cp)
+    return i + 1
+  }
+  fail scalarError("yaml: unknown escape character", escStart)
+}
+
+// `src[start:end)` (the double-quoted span's inside, no quotes) split into
+// escape-decoded segments, one per RAW (un-escaped) source line — never one
+// string with the breaks left in it. A decoded `\n` escape is a literal LF
+// BYTE indistinguishable from a real line break once it is sitting in a
+// string, so segmenting has to happen here, against the source bytes,
+// before that ambiguity exists; an escaped break (`\` immediately before
+// `\n`/`\r\n`) never reaches the two break checks below at all —
+// `decodeOneEscape` already consumed it and wrote nothing, so it starts no
+// new segment. `firstSpecial` is where `indexOfEscapeOrBreak` found the
+// first byte needing handling.
+fn decodeDoubleQuotedSegments(src: string, start: i64, end: i64, firstSpecial: i64): []string! {
+  let segs = []string(0)
+  let b = newBuilder().write(src[start:firstSpecial])
+  let i = firstSpecial
+  while (i < end) {
+    let c = src[i]
+    if (c == '\\') {
+      if (i + 1 >= end) {
+        fail scalarError("yaml: unterminated escape", i)
+      }
+      i = decodeOneEscape(src, i + 1, end, i, b)?
+      continue
+    }
+    if (c == '\n' || isCRLFAt(src, i, end)) {
+      segs = append(segs, b.toString())
+      b = newBuilder()
+      if (c == '\n') {
+        i = i + 1
+      } else {
+        i = i + 2
+      }
+      continue
+    }
+    b.writeByte(c)
+    i = i + 1
+  }
+  segs = append(segs, b.toString())
+  return segs
+}
+
+// `"..."`: strips the surrounding quotes, decodes every escape, and folds
+// any real (un-escaped) line break across the resulting segments.
+fn decodeDoubleQuoted(src: string, start: i64, end: i64): string! {
+  let inner0 = start + 1
+  let inner1 = end - 1
+  let firstSpecial = indexOfEscapeOrBreak(src, inner0, inner1)
+  if (firstSpecial < 0) {
+    return src[inner0:inner1]
+  }
+  let segs = decodeDoubleQuotedSegments(src, inner0, inner1, firstSpecial)?
+  if (len(segs) == 1) {
+    return segs[0]
+  }
+  return foldLines(segs)
+}
+
+// --- plain -----------------------------------------------------------
+
+// No delimiters, no escapes: a single-line span is exactly itself; a
+// multi-line span folds (see this file's header — the scanner's own
+// `PlainScalar` tokens never cross a line, so this path only fires when a
+// caller hands in a wider span deliberately, e.g. a parser joining several
+// tokens' spans, or a test).
+fn decodePlain(src: string, start: i64, end: i64): string {
+  if (indexOfBreak(src, start, end) < 0) {
+    return src[start:end]
+  }
+  return foldContent(src[start:end])
+}
+
+// --- entry point -----------------------------------------------------
+
+// Decodes the scalar `[start, end)` names in `src`, dispatching on `kind`.
+// `switch` (not `match`) deliberately: only three of `TokenKind`'s twenty-two
+// variants are scalar styles, and `switch`'s `default` — unlike `match`,
+// which has none (SPEC §10.1) — lets this function reject every other kind
+// without naming all nineteen.
+export fn yamlDecodeScalar(src: string, kind: TokenKind, start: i64, end: i64): string! {
+  switch (kind) {
+    case TokenKind.PlainScalar:
+      return decodePlain(src, start, end)
+    case TokenKind.SingleQuoted:
+      return decodeSingleQuoted(src, start, end)?
+    case TokenKind.DoubleQuoted:
+      return decodeDoubleQuoted(src, start, end)?
+    default:
+      fail scalarError("yaml: not a scalar token", start)
+  }
+}
