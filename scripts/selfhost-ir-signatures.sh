@@ -559,6 +559,23 @@ explainMismatch() {
       # transform changed -- so the coexistence loop below tolerates exactly
       # that #5506 line shape and nothing wider.
       #
+      # #5446 EXTENDED WHAT THIS EXPLAINS, WITHOUT CHANGING ONE LINE OF THE
+      # ARITHMETIC BELOW -- verified on this corpus, not assumed. The vtable
+      # half of the same ABI change makes an `Op.CallIface` carry the identical
+      # run, so a vtable call site produces the CALL SITE sub-shape below
+      # verbatim: `call_iface ... <Enum>` + two `field_get`s becomes
+      # `call_iface ... <word0 type>` + `call_word` + the same compat re-box.
+      # Nothing here reads the call OPCODE -- the counts are delta(gc_alloc),
+      # delta(call_word), delta(field_get) and the `ret` line multiset, and the
+      # count of `call_iface` lines does not move (only the TYPE on that line
+      # does, and the line multiset below is consulted for `ret` and `const_*`
+      # shapes only). So the constraint is exactly as tight on a vtable site as
+      # on a direct one, and the NAME is historical: this signature explains
+      # both dispatch forms. _tests_/cases/run_enum_explode_method.bit is the
+      # file that proves it -- the only corpus file whose divergence includes a
+      # `call_iface`-owned `call_word`, explained here with no pattern loosened
+      # and no arm relaxed.
+      #
       # TWO sub-shapes of the one ABI change, measured across the 11 files:
       #
       # CALL SITE (a caller unpacking a method payload-enum return): the

@@ -258,6 +258,82 @@ row is why the exact-typing clause exists: the value form without it cost json
 
 ---
 
+### 1.2.2 Which functions return an eligible enum in words (#4405, #5445, #5446)
+
+§1.1's "a `ret` carries at most one value" is the BOXED form and still describes
+every position not named here. The return-word convention is the exception, and
+who may use it is decided from declarations alone — never from a call site,
+because the callee's `ret` is lowered once and every caller must agree with it
+without seeing any other caller.
+
+**A free function** returns its result in words when `explodesParams`
+(`compiler/lowerexplode.bit`) admits its declaration: not `extern`, no type
+parameters, no variadic parameter list, no `@symbol`. Its result type must
+explode (§1.2.1's eligibility, `explodedWordTypes`) and the word list must fit
+the return-register budget (`retWordsFitRegisters`; a return word past the
+eighth has no path, #4238).
+
+**A method reached only by a direct `call`** returns its result in words when
+`methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
+per-declaration exclusions, plus the whole-project requirement that nothing can
+reach its symbol except a direct call — it is never taken as a method VALUE, and
+it is none of the three names lowering synthesizes calls to (`show`, `message`,
+`init`).
+
+**A method reached through the vtable** — `Op.CallIface` — is decided on the
+method NAME, project-wide, and it is unanimous or nothing:
+
+> A method name returns its result in words only when EVERY declaration of that
+> name in the project — every interface signature and every concrete method —
+> yields the SAME non-empty word list. One disagreeing declaration puts the name
+> back on the one-handle convention for all of them.
+
+`ifaceWordRetMethods` (`compiler/lowerexplodeiface.bit`) computes that set once,
+before the first body is lowered, into `TypeContext.wordRetMethods`.
+
+**Why the name and not the interface.** `methodId` (`compiler/lower.bit`) derives
+the dispatch id from the method NAME and `bit_rt_iface_lookup`
+(`runtime/root/iface.bit`, §2.1) resolves that id against whatever receiver
+arrives. Two interfaces may each declare `step` with different result types and
+share one id, so the unit of agreement has to be the unit of dispatch identity.
+
+**Why unanimity and not "the interface's declared type wins".** The callee's
+`ret` is lowered from the CLASS's declaration. A rule that let the interface
+decide would oblige an implementation the per-declaration gate refuses — a
+generic class's method, a variadic or `@symbol` one — to marshal words its own
+lowering never emits, and the call site would read a return register the callee
+never wrote. Refusing the whole name is the only answer that needs no coercion
+anywhere and leaves every refused shape exactly as it was.
+
+**What no agreement can rescue.** A method taken as a VALUE is called back
+through `Op.CallValue`'s one-handle convention (`lowerStructMethodValue`,
+`compiler/lowerfuncval.bit`), and an interface method taken as a value gets a
+trampoline whose own `ret` is single-word (`compiler/lowerglobal.bit`); neither
+call site can know the callee returned words. Those names, and the three
+synthesized ones, are excluded before agreement is computed.
+
+**Target gate.** All three forms are additionally gated on
+`Lowerer.multiWordRet`, seeded from `targetReturnsInRegisters`
+(`compiler/build.bit`). x86_64 boxes and every rule above reads "one handle"
+there.
+
+**Measured, aarch64-macos**, a 1,000,000-crossing driver built at
+`03ed887b` + this change, `BIT_GC_STATS=1`, stdout byte-identical between the
+two programs:
+
+| driver | `swept+live` | `allocbytes` |
+|---|---|---|
+| vtable-dispatched `Source.step(): Step` | 9 | 528,864 |
+| the same loop against a free `stepOf(): Step` | 9 | 528,864 |
+
+At `03ed887b` the same vtable driver read 1,000,010 objects and 32,528,896
+bytes — one `{tag, payload}` box per element. The difference is 1,000,001
+objects and 32,000,032 bytes, 32.0 bytes each exactly: the 16-byte header plus
+the two words of an argc=1 box, the same figure §1.2.1's table reports per
+removed object.
+
+---
+
 ## 2. Per-type pointer maps (`TypeInfo`)
 
 The compiler emits one static `TypeInfo` per distinct (monomorphized) type and
