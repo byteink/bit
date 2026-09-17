@@ -1,0 +1,592 @@
+// pkg/yaml/parse.bit — yaml module, the block-context document parser and
+// the package's entry point (#5498, epic #1482). `value.bit`, `scan.bit`,
+// `scalar.bit`, `block.bit`, `flow.bit`, `schema.bit` and `anchor.bit` are
+// siblings in this same flat module (pkg/README.md); this file drives
+// `scan.bit`'s streaming `scanNext` (never `scan`, which materializes
+// `[]Token` — that file's own header explains the allocation this avoids)
+// and calls every sibling for the grammar it owns; it never re-implements
+// scalar, block-scalar, flow, typing or anchor handling.
+//
+// COLUMNS, NOT A SEPARATE DEPTH COUNTER. Block nesting is entirely
+// indentation-driven: `scan.bit`'s `Scanner.indentStack` already refuses to
+// grow past `limits.maxDepth` (emitting `Invalid` instead), and
+// `Scanner.col` already carries each line's measured column. This file reads
+// both directly (module-private fields are visible within the flat module —
+// `flow.bit` already relies on the same fact for `Scanner.src`/`kind`) rather
+// than tracking a second, parallel notion of depth or column.
+//
+// A BLOCK COLLECTION'S MEMBERS SHARE ONE COLUMN. A mapping's keys, and a
+// sequence's `-` markers, must all sit at the exact column the first one
+// did — never merely "more indented than the parent". After each member's
+// value is parsed (recursively, via the same `parseBlockNode` a document's
+// root uses), the scanner has already measured the following line's column
+// (`Scanner.col`, set once per physical line before any `Indent`/`Dedent` is
+// even decided), so this file compares `col` directly, draining any pending
+// `Dedent` tokens only once that comparison confirms this collection
+// continues.
+//
+// THE SAME-INDENTATION SEQUENCE. `key:` followed by `- a` at the SAME column
+// as `key` produces no `Indent` token at all (the scanner's indent stack
+// already sits at that column), so `parseAfterIndicator` never special-cases
+// it: it falls straight through to `parseBlockNode`, which finds `SeqEntry`
+// exactly like it would after a real `Indent`.
+//
+// COMPACT SEQUENCE-OF-MAPPING (`- key: value`). A mapping starting right
+// after `- ` on the same physical line establishes its own column from a
+// byte-offset computation relative to the `-` (`parseSeqItemValue`'s
+// `inlineCol`), since no fresh line measured it — every CONTINUATION line of
+// that mapping is then measured normally by the scanner.
+//
+// SCALAR STYLE WIRING (the #5496 blocker recorded on this ticket).
+// `schema.bit`'s `yamlResolveScalar`/`yamlResolveRaw` need the producing
+// style, which only exists at the moment a token is decoded — `resolveByKind`
+// is the one place that maps a `TokenKind` to the right `ScalarStyle`: Plain
+// for `PlainScalar`, Quoted for `SingleQuoted`/`DoubleQuoted`. A `|`/`>` block
+// scalar always resolves through `ScalarStyle.Block`. Both mapping KEYS and
+// VALUES go through the same resolver — `value.bit`'s own header explains why
+// `YamlEntry.key` is `Yaml`, not `string`: a plain key must be typed exactly
+// like a plain value. `flow.bit`'s own plain-scalar call site
+// (`parseFlowScalar`) does not yet call a resolver at all — it always
+// returns `YamlString` — so a flow collection's scalars stay untyped
+// regardless of what this file does; `flow.bit` is not among this file's
+// own files, so that gap is filed as a follow-up rather than edited here
+// (see #5498's comment thread).
+//
+// SCOPE. Merge keys (`<<`, YAML 1.1) are rejected by name
+// (`checkNotMergeKey`), never silently treated as a mapping key. A bare
+// multi-line bare document at the top level with no `---` separators —
+// `hello\nworld` — is YAML's multi-line plain scalar folding, which this
+// file does not implement; rather than silently split it into two
+// documents, `parseStream` reports it as unexpected trailing content.
+
+// The caller's own choice of resource budget and scalar resolver
+// (`yamlResolveScalar` by default; `yamlResolveRaw` opts a whole parse out of
+// implicit typing — `schema.bit`'s own header names this exact pair).
+export class YamlOptions {
+  export limits: YamlLimits,
+  export resolver: (string, ScalarStyle) => Yaml,
+}
+
+export fn yamlDefaultOptions(): YamlOptions {
+  return YamlOptions{ limits: yamlDefaultLimits(), resolver: yamlResolveScalar }
+}
+
+// This file's own error convention, matching every sibling's (`scalarError`,
+// `blockError`, `flowError`): a message plus the byte offset it happened at.
+fn parseError(msg: string, offset: i64): error {
+  return newError("${msg} at byte ${offset}")
+}
+
+// Parser state for one call to `yamlParseWith`: the scanner cursor, the
+// budget and resolver from `YamlOptions`, the current document's anchor
+// table (reset per document — anchors never cross a `---` boundary), and
+// this file's own running node count charged against `limits.maxTotalNodes`
+// for everything built directly in block context (mirrors `flow.bit`'s own
+// `FlowCtx.nodes`; a value returned by `yamlParseFlow` is charged once here
+// as a single unit, on top of whatever `yamlParseFlow` already bounded
+// internally — the two counters are independent, matching how `flow.bit`
+// and `anchor.bit` already each keep their own against the same shared
+// `YamlLimits`, never a new limit value).
+class Parser {
+  s: Scanner,
+  src: string,
+  limits: YamlLimits,
+  resolver: (string, ScalarStyle) => Yaml,
+  anchors: AnchorTable,
+  totalNodes: i64,
+}
+
+fn newParser(s: Scanner, src: string, opts: YamlOptions): Parser {
+  return Parser{
+    s: s,
+    src: src,
+    limits: opts.limits,
+    resolver: opts.resolver,
+    anchors: newAnchorTable(),
+    totalNodes: 0,
+  }
+}
+
+fn advance(p: Parser) {
+  scanNext(p.s)
+}
+
+// Charges one more built `Yaml` node against `limits.maxTotalNodes`,
+// matching `flow.bit`'s own `chargeNode` shape exactly.
+fn chargeBlockNode(p: Parser, offset: i64): ()! {
+  p.totalNodes = p.totalNodes + 1
+  if (p.totalNodes > p.limits.maxTotalNodes) {
+    fail parseError("yaml: too many nodes: maxTotalNodes exceeded", offset)
+  }
+}
+
+// `scan.bit`'s own outer door (`scan`) checks `maxDocumentBytes` before
+// scanning a single byte; this file drives `scanNext` directly instead, so
+// it is this file's job to run that same check at its own outer door.
+fn checkDocumentSize(src: string, limits: YamlLimits): ()! {
+  let n = len(src)
+  if (n > limits.maxDocumentBytes) {
+    fail parseError(
+      "yaml: document too large: ${n} bytes exceeds maxDocumentBytes limit of ${limits.maxDocumentBytes} bytes",
+      0,
+    )
+  }
+}
+
+// Repositions `s` to resume scanning right after a block scalar body
+// (`block.bit`'s own `resumeAt`, always a true line-start offset) — the one
+// place this file drives the scanner's cursor directly rather than through
+// `scanNext`, since the scanner itself never tokenizes a block body.
+fn repositionScanner(s: Scanner, at: i64) {
+  s.i = at
+  s.atLineStart = true
+  s.freshLine = true
+}
+
+// `Eof`, `DocStart` and `DocEnd` all end a node's search for more content,
+// at any nesting level: an empty value, an empty document, or the end of
+// the stream are the same "nothing more here" signal to every caller below.
+fn isDocBoundary(k: TokenKind): bool {
+  return k == TokenKind.Eof || k == TokenKind.DocStart || k == TokenKind.DocEnd
+}
+
+fn isScalarStart(k: TokenKind): bool {
+  return k == TokenKind.PlainScalar || k == TokenKind.SingleQuoted || k == TokenKind.DoubleQuoted
+}
+
+// Consumes a run of `Comment` tokens — the only "noise" token block context
+// ever produces (a blank or comment-only line otherwise leaves no token at
+// all, `scan.bit`'s own header). Bounded by source length: every iteration
+// strictly advances the scanner over at least the `#` byte.
+fn skipComments(p: Parser) {
+  let guard = 0
+  let bound = p.s.srcLen + 4
+  while (p.s.kind == TokenKind.Comment && guard <= bound) {
+    advance(p)
+    guard = guard + 1
+  }
+}
+
+// Comments and `%YAML`/`%TAG` directives, both stream-level noise between
+// documents.
+fn skipStreamNoise(p: Parser) {
+  let guard = 0
+  let bound = p.s.srcLen + 8
+  while (guard <= bound) {
+    if (p.s.kind == TokenKind.Directive || p.s.kind == TokenKind.Comment) {
+      advance(p)
+      guard = guard + 1
+      continue
+    }
+    return
+  }
+}
+
+// The `ScalarStyle` a decoded scalar's own `TokenKind` maps to (the #5496
+// blocker this file's header explains) — Plain for `PlainScalar`, Quoted for
+// either quote form; block scalars never reach this function; they go
+// through `ScalarStyle.Block` directly in `dispatchBlockNode`.
+fn resolveByKind(text: string, kind: TokenKind, resolver: (string, ScalarStyle) => Yaml): Yaml {
+  if (kind == TokenKind.PlainScalar) {
+    return resolver(text, ScalarStyle.Plain)
+  }
+  return resolver(text, ScalarStyle.Quoted)
+}
+
+// Merge keys (`<<`) are YAML 1.1 and explicitly out of scope (epic
+// constraint) — named as an unsupported construct, never silently accepted
+// as an ordinary string key.
+fn checkNotMergeKey(key: Yaml, offset: i64): ()! {
+  match (yamlAsString(key)) {
+    Some(s) => {
+      if (s == "<<") {
+        fail parseError("yaml: merge keys ('<<') are YAML 1.1 and not supported", offset)
+      }
+    }
+    None => {}
+  }
+}
+
+// --- node properties: anchor and tag prefixes -----------------------------
+
+// `&name` and/or `!tag`, in either order, before a node. Tags are consumed
+// and otherwise ignored — the epic forbids type-tag-driven construction, so
+// this file has no notion of tag-driven typing to wire up. Bounded to two
+// iterations: YAML permits at most one anchor and one tag per node.
+fn consumeNodeProperties(p: Parser): Option<string> {
+  let anchorName = Option<string>.None
+  let i = 0
+  while (i < 2) {
+    if (p.s.kind == TokenKind.Anchor) {
+      anchorName = Option<string>.Some(p.src[p.s.start + 1:p.s.end])
+      advance(p)
+    } else if (p.s.kind == TokenKind.Tag) {
+      advance(p)
+    } else {
+      return anchorName
+    }
+    i = i + 1
+  }
+  return anchorName
+}
+
+// --- one node, of any kind ------------------------------------------------
+
+// Parses one block node at or past `indent`. `colHint < 0` means "derive
+// this node's own column from `Scanner.col`" (the normal case — the node
+// starts at a just-measured line start); a non-negative `colHint` overrides
+// it, used only by `parseSeqItemValue` for a compact `- key: value` whose
+// key did not start a fresh line of its own.
+fn parseBlockNode(p: Parser, indent: i64, colHint: i64): Yaml! {
+  let anchorName = consumeNodeProperties(p)
+  let value = dispatchBlockNode(p, indent, colHint)?
+  match (anchorName) {
+    Some(name) => {
+      chargeBlockNode(p, p.s.start)?
+      yamlAnchorDefine(p.anchors, name, value)?
+    }
+    None => {}
+  }
+  return value
+}
+
+fn dispatchBlockNode(p: Parser, indent: i64, colHint: i64): Yaml! {
+  let col = colHint
+  if (col < 0) {
+    col = p.s.col
+  }
+  switch (p.s.kind) {
+    case TokenKind.Alias:
+      return parseAlias(p)?
+    case TokenKind.SeqEntry:
+      return parseBlockSequence(p, col)?
+    case TokenKind.KeyIndicator:
+      return parseBlockMapping(p, col, Option<Yaml>.None, 0)?
+    case TokenKind.FlowSeqStart, TokenKind.FlowMapStart:
+      return parseBlockFlow(p)?
+    case TokenKind.BlockScalarHeader:
+      return parseBlockScalarValue(p, indent)?
+    case TokenKind.PlainScalar, TokenKind.SingleQuoted, TokenKind.DoubleQuoted:
+      return parseScalarOrMapping(p, col)?
+    default:
+      fail parseError("yaml: unexpected token in block context", p.s.start)
+  }
+}
+
+fn parseAlias(p: Parser): Yaml! {
+  let name = p.src[p.s.start + 1:p.s.end]
+  let offset = p.s.start
+  advance(p)
+  let value = yamlAnchorResolve(p.anchors, name, p.limits)?
+  chargeBlockNode(p, offset)?
+  return value
+}
+
+// A flow collection nested inside block content is bounded against the SAME
+// `maxDepth` ceiling block nesting already is — `flow.bit`'s own header
+// explains why `depth` is `Scanner.indentStack`'s current height, not a
+// fresh zero.
+fn parseBlockFlow(p: Parser): Yaml! {
+  let start = p.s.start
+  let depth = len(p.s.indentStack) - 1
+  let value = yamlParseFlow(p.s, p.limits, depth)?
+  chargeBlockNode(p, start)?
+  return value
+}
+
+fn parseBlockScalarValue(p: Parser, indent: i64): Yaml! {
+  let headerStart = p.s.start
+  let headerEnd = p.s.end
+  let (text, resumeAt) = yamlDecodeBlockScalar(p.src, headerStart, headerEnd, indent)?
+  repositionScanner(p.s, resumeAt)
+  advance(p)
+  chargeBlockNode(p, headerStart)?
+  return p.resolver(text, ScalarStyle.Block)
+}
+
+// A plain/quoted scalar that might turn out to be a mapping's first key —
+// the one place this file must consume a token before it can tell which. A
+// `ValueIndicator` only makes this scalar a key when it sits on the SAME
+// line: a `?`/`: value` pair whose key is a bare scalar (`? a\n: 1`) would
+// otherwise misread the NEXT line's unrelated `:` as belonging to `a`,
+// since a same-column new line leaves `Scanner.col` reading exactly like a
+// same-line continuation (`hasLineBreak`, same ambiguity as
+// `parseAfterIndicator`).
+fn parseScalarOrMapping(p: Parser, col: i64): Yaml! {
+  let kind = p.s.kind
+  let start = p.s.start
+  let end = p.s.end
+  let text = yamlDecodeScalar(p.src, kind, p.s.start, p.s.end)?
+  advance(p)
+  if (p.s.kind == TokenKind.ValueIndicator && !hasLineBreak(p.src, end, p.s.start)) {
+    let key = resolveByKind(text, kind, p.resolver)
+    checkNotMergeKey(key, start)?
+    return parseBlockMapping(p, col, Option<Yaml>.Some(key), start)?
+  }
+  chargeBlockNode(p, start)?
+  return resolveByKind(text, kind, p.resolver)
+}
+
+// --- the value after `:` or the key after `?` -----------------------------
+
+// A byte in `[start, end)` is a line break — used only to tell "still on the
+// indicator's own line" from "a new line that happens to measure the same
+// column", since the scanner leaves `Scanner.col` unchanged (stale, not
+// re-measured) for the first case and freshly measured for the second; the
+// two are otherwise indistinguishable from `Scanner.col` alone.
+fn hasLineBreak(src: string, start: i64, end: i64): bool {
+  let i = start
+  while (i < end) {
+    if (src[i] == '\n' || src[i] == '\r') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Shared by an implicit `key: value`'s value, an explicit `? key`'s key, and
+// `: value`'s value: an inline continuation on the same line, a nested node
+// on a strictly deeper line (`Indent`), or nothing at all (`YamlNull`).
+// `afterOffset` is the byte offset right past the `:`/`?` token that led
+// here, needed only to resolve the same-line-vs-new-line ambiguity above.
+// The same-column sequence case (this file's header) is the one shape a new
+// line at this exact column is NOT empty: `SeqEntry` falls straight through
+// to `parseBlockNode`, which finds it waiting at `indent`.
+fn parseAfterIndicator(p: Parser, indent: i64, afterOffset: i64): Yaml! {
+  skipComments(p)
+  if (p.s.kind == TokenKind.Indent) {
+    advance(p)
+    let childCol = p.s.col
+    return parseBlockNode(p, childCol, -1)?
+  }
+  if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
+    return Yaml.YamlNull
+  }
+  let sameLine = !hasLineBreak(p.src, afterOffset, p.s.start)
+  if (!sameLine && p.s.kind != TokenKind.SeqEntry) {
+    return Yaml.YamlNull
+  }
+  return parseBlockNode(p, indent, -1)?
+}
+
+// --- block mapping ---------------------------------------------------------
+
+class MapEntryOut { key: Yaml, keyStart: i64, value: Yaml }
+
+fn readMappingEntry(p: Parser, col: i64, pending: Option<Yaml>, pendingStart: i64): MapEntryOut! {
+  if (isSome(pending)) {
+    let afterColon = p.s.end
+    advance(p)
+    let value = parseAfterIndicator(p, col, afterColon)?
+    return MapEntryOut{ key: unwrap(pending), keyStart: pendingStart, value: value }
+  }
+  if (p.s.kind == TokenKind.KeyIndicator) {
+    return readExplicitEntry(p, col)?
+  }
+  return readImplicitEntry(p, col)?
+}
+
+// `? key` with an optional `: value` — the value indicator, if present,
+// must sit back at this mapping's own column (a nested key that itself
+// contains a colon-bearing scalar must not be mistaken for one).
+fn readExplicitEntry(p: Parser, col: i64): MapEntryOut! {
+  let keyStart = p.s.start
+  let afterQ = p.s.end
+  advance(p)
+  let key = parseAfterIndicator(p, col, afterQ)?
+  checkNotMergeKey(key, keyStart)?
+  skipComments(p)
+  if (p.s.col == col && p.s.kind == TokenKind.ValueIndicator) {
+    let afterColon = p.s.end
+    advance(p)
+    let value = parseAfterIndicator(p, col, afterColon)?
+    return MapEntryOut{ key: key, keyStart: keyStart, value: value }
+  }
+  return MapEntryOut{ key: key, keyStart: keyStart, value: Yaml.YamlNull }
+}
+
+fn readImplicitEntry(p: Parser, col: i64): MapEntryOut! {
+  let keyStart = p.s.start
+  let kind = p.s.kind
+  let text = yamlDecodeScalar(p.src, kind, p.s.start, p.s.end)?
+  advance(p)
+  if (p.s.kind != TokenKind.ValueIndicator) {
+    fail parseError("yaml: expected ':' after mapping key", p.s.start)
+  }
+  let key = resolveByKind(text, kind, p.resolver)
+  checkNotMergeKey(key, keyStart)?
+  let afterColon = p.s.end
+  advance(p)
+  let value = parseAfterIndicator(p, col, afterColon)?
+  return MapEntryOut{ key: key, keyStart: keyStart, value: value }
+}
+
+fn finishMapping(p: Parser, entries: []YamlEntry): Yaml! {
+  chargeBlockNode(p, p.s.start)?
+  return Yaml.YamlMapping(entries)
+}
+
+// One block mapping, all entries at exactly `col`. `firstKey`, when present,
+// is a scalar key `dispatchBlockNode` already consumed while checking for a
+// `:` — `readMappingEntry` folds it into the very first loop iteration so
+// every entry after it goes through the identical path.
+fn parseBlockMapping(p: Parser, col: i64, firstKey: Option<Yaml>, firstKeyStart: i64): Yaml! {
+  let entries = []YamlEntry(0)
+  let pending = firstKey
+  let pendingStart = firstKeyStart
+  let guard = 0
+  let bound = p.s.srcLen + 8
+  while (guard <= bound) {
+    guard = guard + 1
+    let out = readMappingEntry(p, col, pending, pendingStart)?
+    pending = Option<Yaml>.None
+    if (flowKeyPresent(entries, out.key)) {
+      fail parseError("yaml: duplicate key in block mapping", out.keyStart)
+    }
+    entries = append(entries, YamlEntry{ key: out.key, value: out.value })
+    skipComments(p)
+    if (p.s.col != col) {
+      return finishMapping(p, entries)?
+    }
+    while (p.s.kind == TokenKind.Dedent) {
+      advance(p)
+    }
+    if (p.s.kind != TokenKind.KeyIndicator && !isScalarStart(p.s.kind)) {
+      return finishMapping(p, entries)?
+    }
+  }
+  fail parseError("yaml: block mapping scan did not terminate", p.s.start)
+}
+
+// --- block sequence ---------------------------------------------------------
+
+fn finishSequence(p: Parser, items: []Yaml): Yaml! {
+  chargeBlockNode(p, p.s.start)?
+  return Yaml.YamlSequence(items)
+}
+
+// The value of one `- ` entry: nested on a deeper line (`Indent`), nothing
+// at all, or an inline continuation on the same line as the `-`. A new line
+// that is not `Indent`/`Dedent` (a sibling `-` sharing the outer sequence's
+// own column, unlike a mapping key, gets no special same-indentation
+// allowance here — see this file's header) is always empty, resolved via
+// `hasLineBreak` exactly like `parseAfterIndicator`. `inlineCol` is a true
+// same-line continuation's real source column, computed from its byte
+// offset relative to the `-` — the one place a node's column cannot simply
+// be read off `Scanner.col`, since no fresh line measured it.
+fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dashCol: i64): Yaml! {
+  skipComments(p)
+  if (p.s.kind == TokenKind.Indent) {
+    advance(p)
+    let childCol = p.s.col
+    return parseBlockNode(p, childCol, -1)?
+  }
+  if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
+    return Yaml.YamlNull
+  }
+  if (hasLineBreak(p.src, dashEnd, p.s.start)) {
+    return Yaml.YamlNull
+  }
+  let inlineCol = dashCol + (p.s.start - dashStart)
+  return parseBlockNode(p, itemCol, inlineCol)?
+}
+
+// One block sequence, all `-` markers at exactly `col`.
+fn parseBlockSequence(p: Parser, col: i64): Yaml! {
+  let items = []Yaml(0)
+  let guard = 0
+  let bound = p.s.srcLen + 8
+  while (guard <= bound) {
+    guard = guard + 1
+    let dashStart = p.s.start
+    let dashCol = p.s.col
+    let dashEnd = p.s.end
+    advance(p)
+    let value = parseSeqItemValue(p, col, dashStart, dashEnd, dashCol)?
+    items = append(items, value)
+    skipComments(p)
+    if (p.s.col != col) {
+      return finishSequence(p, items)?
+    }
+    while (p.s.kind == TokenKind.Dedent) {
+      advance(p)
+    }
+    if (p.s.kind != TokenKind.SeqEntry) {
+      return finishSequence(p, items)?
+    }
+  }
+  fail parseError("yaml: block sequence scan did not terminate", p.s.start)
+}
+
+// --- the stream: directives, `---`/`...`, one or more documents ----------
+
+// One document's content, already known not to be an empty boundary —
+// `parseStream` charges the anchor table reset and the boundary check.
+fn parseDocumentContent(p: Parser): Yaml! {
+  let doc = parseBlockNode(p, 0, -1)?
+  skipStreamNoise(p)
+  if (!isDocBoundary(p.s.kind)) {
+    fail parseError("yaml: unexpected content after document (missing '---'?)", p.s.start)
+  }
+  return doc
+}
+
+fn parseStream(p: Parser): []Yaml! {
+  let docs = []Yaml(0)
+  let guard = 0
+  let bound = p.s.srcLen + 8
+  while (guard <= bound) {
+    guard = guard + 1
+    skipStreamNoise(p)
+    if (p.s.kind == TokenKind.Eof) {
+      return docs
+    }
+    if (p.s.kind == TokenKind.DocEnd) {
+      advance(p)
+      continue
+    }
+    if (p.s.kind == TokenKind.DocStart) {
+      advance(p)
+    }
+    skipStreamNoise(p)
+    p.anchors = newAnchorTable()
+    let doc = Yaml.YamlNull
+    if (!isDocBoundary(p.s.kind)) {
+      doc = parseDocumentContent(p)?
+    }
+    docs = append(docs, doc)
+    if (p.s.kind == TokenKind.DocEnd) {
+      advance(p)
+    }
+  }
+  fail parseError("yaml: stream scan did not terminate", p.s.start)
+}
+
+// --- entry point -----------------------------------------------------------
+
+// Every document in `src`, decoded per `opts`. A stream may hold zero
+// documents (an empty or all-comments/directives input) — that is an empty
+// result, not an error (epic requirement).
+export fn yamlParseWith(src: string, opts: YamlOptions): []Yaml! {
+  checkDocumentSize(src, opts.limits)?
+  let s = newScanner(src, opts.limits)
+  scanNext(s)
+  let p = newParser(s, src, opts)
+  return parseStream(p)?
+}
+
+export fn yamlParseAll(src: string): []Yaml! {
+  return yamlParseWith(src, yamlDefaultOptions())?
+}
+
+// The single document in `src`. Errors naming the count for anything other
+// than exactly one — silently returning the first of several is how a
+// caller loses data without noticing (ticket constraint).
+export fn yamlParse(src: string): Yaml! {
+  let docs = yamlParseAll(src)?
+  if (len(docs) != 1) {
+    fail parseError("yaml: expected exactly one document, found ${len(docs)}", 0)
+  }
+  return docs[0]
+}
