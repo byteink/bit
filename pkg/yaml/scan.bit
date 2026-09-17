@@ -1,0 +1,679 @@
+// pkg/yaml/scan.bit — yaml module, indentation-aware flat scanner (#5492,
+// epic #1482). Turns YAML 1.2 source bytes into a flat token stream: no
+// recursion, no regex, no generated tables, modeled directly on
+// stdlib/json/lex.bit's `Lexer`/`lexNext` shape (that file's own 40-line
+// header explains why each rule below costs what it costs; this header only
+// states the YAML-specific deltas).
+//
+// TWO ENTRY POINTS, ONE GRAMMAR. `scan(source, limits)` materializes the
+// whole stream as `[]Token`, for tests and any caller wanting random access.
+// A future parser (same module, no import needed — pkg/README.md's flat
+// namespace) drives `scanNext(s)` directly instead, reading the current
+// token off `Scanner`'s own `kind`/`start`/`end` fields: a class is a heap
+// object in Bit, so materializing a `Token` per token is a `gc_alloc` each,
+// and JSON's own lexer paid exactly that cost before `lexNext` existed
+// (stdlib/json/lex.bit:26-34). `scanTok` below is the only function that
+// builds a `Token`, so the two entry points cannot drift apart.
+//
+// RAW SPANS ONLY. Every token carries `[start, end)` byte offsets into
+// `source`. Escapes inside quoted scalars are not decoded, block scalar
+// bodies are not read, and no value is constructed — later files in this
+// package own all of that. This layer slices, it never normalizes.
+//
+// INDENTATION. Nesting lives on `Scanner.indentStack`, an explicit `[]int`
+// of column numbers, bounded by `YamlLimits.maxDepth` (read from the caller,
+// never a second constant — pkg/yaml/value.bit is this package's one budget).
+// A document nested past that depth yields an `Invalid` token, never a stack
+// overflow; `Scanner.flowDepth` gets the same cap for the same reason, since
+// a pathological run of `[[[[...` is the same shape of attack. Flow context
+// (`flowDepth > 0`) suppresses indentation entirely, per YAML: a blank line
+// or a comment-only line carries no indentation signal either way, checked
+// before the column comparison so neither can emit a stray `Dedent`.
+//
+// THE COLON RULE. `:` only closes a key when followed by a space, a newline,
+// or end of input (`isColonBoundary`) — this is what keeps `http://x` one
+// `PlainScalar` instead of splitting on its first colon, and it is checked
+// inside `scanPlainScalar`'s own loop, not just at the token's start, so a
+// colon buried mid-scalar is caught too. `-` and `?` get the same
+// followed-by-blank test (`followedByBlank`): `-3` is a scalar, `- ` is a
+// `SeqEntry`. `#` only starts a `Comment` when it is reached as the first
+// byte of a token — which, structurally, only happens at the start of a
+// line or right after whitespace was skipped — so `scanPlainScalar` need
+// only check for a *space* immediately before a `#` to stop early; `a#b`
+// never hits that check and stays one scalar.
+
+// The lexical categories a YAML scan can produce.
+export enum TokenKind {
+  Indent,
+  Dedent,
+  KeyIndicator,
+  ValueIndicator,
+  SeqEntry,
+  Anchor,
+  Alias,
+  Tag,
+  Comment,
+  DocStart,
+  DocEnd,
+  Directive,
+  PlainScalar,
+  SingleQuoted,
+  DoubleQuoted,
+  BlockScalarHeader,
+  FlowSeqStart,
+  FlowSeqEnd,
+  FlowMapStart,
+  FlowMapEnd,
+  FlowEntry,
+  Eof,
+  Invalid,
+}
+
+// One lexical token: its kind and its `[start, end)` byte span in the
+// source. `Indent`/`Dedent` are zero-width (`start == end`), positioned at
+// the first byte of the line's content, since no bytes belong to them.
+export class Token { export kind: TokenKind, export start: int, export end: int }
+
+// The scanner's state, plus the token it most recently produced
+// (`kind`/`start`/`end`). Not exported: only this file's `scan` and a
+// future same-module parser drive it (mirrors `stdlib/json/lex.bit`'s
+// unexported `Lexer`).
+class Scanner {
+  src: string,
+  srcLen: int,
+  i: int,
+  limits: YamlLimits,
+  indentStack: []int,
+  flowDepth: int,
+  atLineStart: bool,
+  pendingDedents: int,
+  freshLine: bool,
+  col: int,
+  kind: TokenKind,
+  start: int,
+  end: int,
+}
+
+// A scanner positioned before `source`'s first byte, top-level indentation
+// at column 0. `kind` is `Eof` until the first `scanNext`, same as an empty
+// source would yield, so a caller reading the cursor unscanned sees "no
+// token" rather than garbage.
+fn newScanner(source: string, limits: YamlLimits): Scanner {
+  return Scanner{
+    src: source,
+    srcLen: len(source),
+    i: 0,
+    limits: limits,
+    indentStack: [0],
+    flowDepth: 0,
+    atLineStart: true,
+    pendingDedents: 0,
+    freshLine: true,
+    col: 0,
+    kind: TokenKind.Eof,
+    start: 0,
+    end: 0,
+  }
+}
+
+fn isDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+fn isSpaceOrNewline(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// Records `[start, end)` as the current token without touching the cursor.
+fn setTok(s: Scanner, k: TokenKind, start: int, end: int) {
+  s.kind = k
+  s.start = start
+  s.end = end
+}
+
+// Advances the cursor by `n` and records the token `[start, start+n)`.
+// `n == 0` for `Indent`/`Dedent`: nothing to consume, the position is the
+// marker.
+fn emit(s: Scanner, start: int, n: int, k: TokenKind) {
+  s.i = start + n
+  setTok(s, k, start, start + n)
+}
+
+// True when the next byte closes a `:`/`-`/`?` indicator: a space, a
+// newline, or end of input. Shared by `scanColon`, `scanDash` and
+// `scanQuestion` so the three follow the identical rule.
+fn followedByBlank(s: Scanner): bool {
+  if (s.i + 1 >= s.srcLen) {
+    return true
+  }
+  let n = s.src[s.i + 1]
+  return n == ' ' || n == '\n' || n == '\r'
+}
+
+// --- indentation -----------------------------------------------------
+
+// Advances over the spaces at the start of the current line, returning the
+// column reached. Stops (without consuming it) at the first non-space byte,
+// including a tab: tab-as-indentation is rejected by the caller, not here.
+fn skipLineIndentSpaces(s: Scanner): int {
+  let col = 0
+  while (s.i < s.srcLen && s.src[s.i] == ' ') {
+    s.i = s.i + 1
+    col = col + 1
+  }
+  return col
+}
+
+// The open that would create the `limits.maxDepth + 1`th level is rejected
+// as `Invalid` (without growing the stack) instead of tracked, so
+// `indentStack` never grows past the caller's own bound.
+fn pushIndent(s: Scanner, col: int): bool {
+  if (len(s.indentStack) - 1 >= s.limits.maxDepth) {
+    emit(s, s.i, 0, TokenKind.Invalid)
+    return true
+  }
+  s.indentStack = append(s.indentStack, col)
+  emit(s, s.i, 0, TokenKind.Indent)
+  return true
+}
+
+// Pops every level deeper than `col`, queuing the rest as `pendingDedents`
+// so `scanNext` can emit exactly one `Dedent` per call. `pops == 0` means
+// `col` did not dedent past the top after all (equal case already handled
+// by `applyIndent`), so nothing is emitted.
+fn startDedent(s: Scanner, col: int): bool {
+  let pops = 0
+  while (len(s.indentStack) > 1 && s.indentStack[len(s.indentStack) - 1] > col) {
+    s.indentStack = s.indentStack[0:len(s.indentStack) - 1]
+    pops = pops + 1
+  }
+  if (pops == 0) {
+    return false
+  }
+  s.pendingDedents = pops - 1
+  emit(s, s.i, 0, TokenKind.Dedent)
+  return true
+}
+
+// Compares this line's column against the indent stack's top, once a line
+// has been confirmed to carry a real indentation signal (never called for a
+// blank or comment-only line — see `lineStartStep`).
+fn applyIndent(s: Scanner, col: int): bool {
+  let top = s.indentStack[len(s.indentStack) - 1]
+  if (col > top) {
+    return pushIndent(s, col)
+  }
+  if (col < top) {
+    return startDedent(s, col)
+  }
+  return false
+}
+
+// One line-start step. Measures this line's indentation and decides whether
+// an `Indent`/`Dedent`/`Invalid` token is due right now. Returns `true` when
+// it emitted one (caller returns immediately); `false` means either a blank
+// line was consumed with no signal (caller loops to the next line) or this
+// line's content starts here with no indentation change (caller falls
+// through to content dispatch). A comment-only line and a blank line both
+// take the `false` paths without ever reaching `applyIndent`, so neither
+// can emit a `Dedent`.
+fn lineStartStep(s: Scanner): bool {
+  let col = skipLineIndentSpaces(s)
+  s.col = col
+  if (s.i < s.srcLen && s.src[s.i] == '\t') {
+    emit(s, s.i, 1, TokenKind.Invalid)
+    s.atLineStart = false
+    return true
+  }
+  if (s.i >= s.srcLen) {
+    s.atLineStart = false
+    return false
+  }
+  let c = s.src[s.i]
+  if (c == '\n') {
+    s.i = s.i + 1
+    return false
+  }
+  if (c == '\r' && s.i + 1 < s.srcLen && s.src[s.i + 1] == '\n') {
+    s.i = s.i + 2
+    return false
+  }
+  if (c == '#') {
+    s.atLineStart = false
+    s.freshLine = true
+    return false
+  }
+  s.atLineStart = false
+  s.freshLine = true
+  return applyIndent(s, col)
+}
+
+// --- flow brackets -----------------------------------------------------
+
+// `[`/`{`: enforces `limits.maxDepth` on flow nesting too (the billion-laughs
+// shape is not limited to block indentation), recording `Invalid` once the
+// counter already sits at the cap rather than opening another level.
+fn openFlow(s: Scanner, k: TokenKind) {
+  let start = s.i
+  if (s.flowDepth >= s.limits.maxDepth) {
+    emit(s, start, 1, TokenKind.Invalid)
+    return
+  }
+  s.flowDepth = s.flowDepth + 1
+  emit(s, start, 1, k)
+}
+
+// `]`/`}`: pops one level; never goes negative on an unmatched closer.
+fn closeFlow(s: Scanner, k: TokenKind) {
+  let start = s.i
+  if (s.flowDepth > 0) {
+    s.flowDepth = s.flowDepth - 1
+  }
+  emit(s, start, 1, k)
+}
+
+fn dispatchFlowBrackets(s: Scanner, c: u8): bool {
+  if (c == '[') {
+    openFlow(s, TokenKind.FlowSeqStart)
+    return true
+  }
+  if (c == ']') {
+    closeFlow(s, TokenKind.FlowSeqEnd)
+    return true
+  }
+  if (c == '{') {
+    openFlow(s, TokenKind.FlowMapStart)
+    return true
+  }
+  if (c == '}') {
+    closeFlow(s, TokenKind.FlowMapEnd)
+    return true
+  }
+  if (c == ',') {
+    emit(s, s.i, 1, TokenKind.FlowEntry)
+    return true
+  }
+  return false
+}
+
+// --- plain scalars -----------------------------------------------------
+
+// `:` only closes a key when followed by a space, a newline or end of
+// input (checked at the scanner's *current* position, so this doubles as
+// both the dispatch test on `scanColon` and the mid-scalar stop test on
+// `scanPlainScalar`).
+fn isColonBoundary(s: Scanner): bool {
+  if (s.src[s.i] != ':') {
+    return false
+  }
+  if (s.i + 1 >= s.srcLen) {
+    return true
+  }
+  let n = s.src[s.i + 1]
+  return n == ' ' || n == '\n' || n == '\r'
+}
+
+fn isFlowStopperChar(c: u8): bool {
+  return c == ',' || c == ']' || c == '}' || c == '[' || c == '{'
+}
+
+// A space immediately followed by `#` stops a plain scalar and hands the
+// `#` to the comment dispatch; `a#b` never sees this (no space before it),
+// so it never breaks the scalar.
+fn isCommentAhead(s: Scanner): bool {
+  return s.i + 1 < s.srcLen && s.src[s.i + 1] == '#'
+}
+
+// A greedy single-line raw span: everything up to a newline, a
+// `:`/space+`#` boundary, or (inside flow) a flow indicator. No escape
+// handling, no line folding — later files own the grammar above this span.
+fn scanPlainScalar(s: Scanner) {
+  let start = s.i
+  while (s.i < s.srcLen) {
+    let c = s.src[s.i]
+    if (c == '\n' || c == '\r') {
+      break
+    }
+    if (isColonBoundary(s)) {
+      break
+    }
+    if (s.flowDepth > 0 && isFlowStopperChar(c)) {
+      break
+    }
+    if (c == ' ' && isCommentAhead(s)) {
+      break
+    }
+    s.i = s.i + 1
+  }
+  setTok(s, TokenKind.PlainScalar, start, s.i)
+}
+
+// --- single-char indicators with a lookahead ---------------------------
+
+fn scanQuestion(s: Scanner) {
+  if (followedByBlank(s)) {
+    emit(s, s.i, 1, TokenKind.KeyIndicator)
+    return
+  }
+  scanPlainScalar(s)
+}
+
+fn scanColon(s: Scanner) {
+  if (followedByBlank(s)) {
+    emit(s, s.i, 1, TokenKind.ValueIndicator)
+    return
+  }
+  scanPlainScalar(s)
+}
+
+// `marker` is `"---"` or `"..."`, tested at `s.i` and required to be
+// followed by whitespace or end of input (a bare `----` is content, not a
+// document marker).
+fn isDocMarker(s: Scanner, marker: string): bool {
+  if (s.i + 3 > s.srcLen) {
+    return false
+  }
+  if (s.src[s.i] != marker[0] || s.src[s.i + 1] != marker[1] || s.src[s.i + 2] != marker[2]) {
+    return false
+  }
+  return s.i + 3 >= s.srcLen || isSpaceOrNewline(s.src[s.i + 3])
+}
+
+// `---` is only a `DocStart` at column 0 of a fresh line; anywhere else
+// (including `-3` — see `followedByBlank`) it falls through to `SeqEntry`
+// or a plain scalar, exactly like a lone `-`.
+fn scanDash(s: Scanner, fresh: bool) {
+  if (fresh && s.col == 0 && isDocMarker(s, "---")) {
+    emit(s, s.i, 3, TokenKind.DocStart)
+    return
+  }
+  if (followedByBlank(s)) {
+    emit(s, s.i, 1, TokenKind.SeqEntry)
+    return
+  }
+  scanPlainScalar(s)
+}
+
+// `...` is only a `DocEnd` at column 0 of a fresh line; `false` means "not
+// handled", so the caller falls through to a plain scalar.
+fn scanDot(s: Scanner, fresh: bool): bool {
+  if (fresh && s.col == 0 && isDocMarker(s, "...")) {
+    emit(s, s.i, 3, TokenKind.DocEnd)
+    return true
+  }
+  return false
+}
+
+// --- indicator spans (anchor / alias / tag) and block scalar headers ---
+
+// Any byte that cannot continue an anchor, alias or tag name: whitespace,
+// or a flow/comment indicator that must end the token instead.
+fn isIndicatorNameChar(c: u8): bool {
+  if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+    return false
+  }
+  return c != ',' && c != '[' && c != ']' && c != '{' && c != '}' && c != '#'
+}
+
+// `&name` / `*name` / `!...`: one indicator byte plus a run of name bytes,
+// raw span only — resolving/expanding an alias or looking up a tag is a
+// later file's job.
+fn scanIndicatorSpan(s: Scanner, k: TokenKind) {
+  let start = s.i
+  s.i = s.i + 1
+  while (s.i < s.srcLen && isIndicatorNameChar(s.src[s.i])) {
+    s.i = s.i + 1
+  }
+  setTok(s, k, start, s.i)
+}
+
+fn isBlockHeaderChar(c: u8): bool {
+  return c == '-' || c == '+' || isDigit(c)
+}
+
+// `|`/`>` plus their chomping (`-`/`+`) and explicit indent (digit)
+// indicators. The block body itself is never read here — the header's raw
+// span is all this layer emits.
+fn scanBlockScalarHeader(s: Scanner) {
+  let start = s.i
+  s.i = s.i + 1
+  while (s.i < s.srcLen && isBlockHeaderChar(s.src[s.i])) {
+    s.i = s.i + 1
+  }
+  setTok(s, TokenKind.BlockScalarHeader, start, s.i)
+}
+
+// `#` to end of line, or `%YAML` / `%TAG` to end of line: same shape, kept
+// as two functions so each token kind stays independently named at its call
+// site.
+fn scanToEol(s: Scanner, k: TokenKind) {
+  let start = s.i
+  while (s.i < s.srcLen && s.src[s.i] != '\n' && s.src[s.i] != '\r') {
+    s.i = s.i + 1
+  }
+  setTok(s, k, start, s.i)
+}
+
+// --- quoted scalars ------------------------------------------------------
+
+// `'...'`, quotes included, raw. The only escape a single-quoted scalar has
+// is a doubled quote (`''`) for a literal `'`; an unterminated scalar
+// consumes to EOF and reports `Invalid` rather than looping past the source.
+fn scanSingleQuoted(s: Scanner) {
+  let start = s.i
+  s.i = s.i + 1
+  while (s.i < s.srcLen) {
+    if (s.src[s.i] == '\'') {
+      if (s.i + 1 < s.srcLen && s.src[s.i + 1] == '\'') {
+        s.i = s.i + 2
+      } else {
+        s.i = s.i + 1
+        setTok(s, TokenKind.SingleQuoted, start, s.i)
+        return
+      }
+    } else {
+      s.i = s.i + 1
+    }
+  }
+  setTok(s, TokenKind.Invalid, start, s.i)
+}
+
+// `"..."`, quotes included, raw — a `\` always protects the byte after it
+// (so an escaped quote does not close the scalar), mirroring
+// `stdlib/json/lex.bit`'s `scanString`. Escapes are not decoded here.
+fn scanDoubleQuoted(s: Scanner) {
+  let start = s.i
+  s.i = s.i + 1
+  while (s.i < s.srcLen) {
+    let c = s.src[s.i]
+    if (c == '"') {
+      s.i = s.i + 1
+      setTok(s, TokenKind.DoubleQuoted, start, s.i)
+      return
+    }
+    if (c == '\\' && s.i + 1 < s.srcLen) {
+      s.i = s.i + 2
+    } else {
+      s.i = s.i + 1
+    }
+  }
+  setTok(s, TokenKind.Invalid, start, s.i)
+}
+
+fn dispatchQuoted(s: Scanner, c: u8): bool {
+  if (c == '\'') {
+    scanSingleQuoted(s)
+    return true
+  }
+  if (c == '"') {
+    scanDoubleQuoted(s)
+    return true
+  }
+  return false
+}
+
+// --- top-level content dispatch ------------------------------------------
+
+// `-`, `.`, `?`, `:` all need lookahead beyond a single byte compare, so
+// they get their own group, split from the plain marked-indicator group
+// below to keep each function's branch count small (E0204).
+fn dispatchIndicatorsStructural(s: Scanner, c: u8, fresh: bool): bool {
+  if (c == '-') {
+    scanDash(s, fresh)
+    return true
+  }
+  if (c == '.') {
+    return scanDot(s, fresh)
+  }
+  if (c == '?') {
+    scanQuestion(s)
+    return true
+  }
+  if (c == ':') {
+    scanColon(s)
+    return true
+  }
+  return false
+}
+
+fn dispatchIndicatorsMarked(s: Scanner, c: u8): bool {
+  if (c == '&') {
+    scanIndicatorSpan(s, TokenKind.Anchor)
+    return true
+  }
+  if (c == '*') {
+    scanIndicatorSpan(s, TokenKind.Alias)
+    return true
+  }
+  if (c == '!') {
+    scanIndicatorSpan(s, TokenKind.Tag)
+    return true
+  }
+  if (c == '#') {
+    scanToEol(s, TokenKind.Comment)
+    return true
+  }
+  if (c == '|' || c == '>') {
+    scanBlockScalarHeader(s)
+    return true
+  }
+  if (c == '%') {
+    scanToEol(s, TokenKind.Directive)
+    return true
+  }
+  return false
+}
+
+fn dispatchIndicators(s: Scanner, c: u8, fresh: bool): bool {
+  if (dispatchIndicatorsStructural(s, c, fresh)) {
+    return true
+  }
+  return dispatchIndicatorsMarked(s, c)
+}
+
+// The only place a real (non-indent/dedent) content token is dispatched.
+// `fresh` — this line's very first content token — is read once here and
+// cleared, so a later token on the same line never re-triggers a document
+// marker check.
+fn dispatchToken(s: Scanner, c: u8) {
+  let fresh = s.freshLine
+  s.freshLine = false
+  if (dispatchFlowBrackets(s, c)) {
+    return
+  }
+  if (dispatchIndicators(s, c, fresh)) {
+    return
+  }
+  if (dispatchQuoted(s, c)) {
+    return
+  }
+  scanPlainScalar(s)
+}
+
+// --- the shared grammar (rule 3 of this file's header) -------------------
+
+// `\n` or `\r\n`, outside flow context resets `atLineStart` so the next
+// `scanNext` call measures the following line's indentation; inside flow
+// context a newline is plain whitespace. Returns whether it consumed one,
+// so `scanNext` knows to loop rather than dispatch.
+fn consumeNewline(s: Scanner, c: u8): bool {
+  if (c == '\n') {
+    s.i = s.i + 1
+    s.atLineStart = s.flowDepth == 0
+    return true
+  }
+  if (c == '\r' && s.i + 1 < s.srcLen && s.src[s.i + 1] == '\n') {
+    s.i = s.i + 2
+    s.atLineStart = s.flowDepth == 0
+    return true
+  }
+  return false
+}
+
+// Advances `s` past exactly one token, recorded on `kind`/`start`/`end`.
+// The `guard`/`bound` pair is a hard ceiling on this call's own work, not a
+// performance budget: every branch that loops back either strictly consumes
+// a source byte or strictly drains `pendingDedents` (itself bounded by
+// `limits.maxDepth`, since `indentStack` can never hold more), so a call
+// that manages neither in `bound` iterations is a logic bug, not slow
+// input, and reports `Invalid` instead of spinning forever.
+fn scanNext(s: Scanner) {
+  let guard = 0
+  let bound = (s.srcLen - s.i + 8) * (s.limits.maxDepth + 2)
+  while (guard <= bound) {
+    guard = guard + 1
+    if (s.pendingDedents > 0) {
+      s.pendingDedents = s.pendingDedents - 1
+      emit(s, s.i, 0, TokenKind.Dedent)
+      return
+    }
+    if (s.atLineStart && s.flowDepth == 0) {
+      if (lineStartStep(s)) {
+        return
+      }
+      continue
+    }
+    if (s.i >= s.srcLen) {
+      setTok(s, TokenKind.Eof, s.i, s.i)
+      return
+    }
+    let c = s.src[s.i]
+    if (consumeNewline(s, c)) {
+      continue
+    }
+    if (c == ' ' || c == '\t') {
+      s.i = s.i + 1
+      continue
+    }
+    dispatchToken(s, c)
+    return
+  }
+  setTok(s, TokenKind.Invalid, s.i, s.i)
+}
+
+// The only place a `Token` is materialized — see this file's header.
+fn scanTok(s: Scanner): Token {
+  scanNext(s)
+  return Token{ kind: s.kind, start: s.start, end: s.end }
+}
+
+// The full token stream for `source`, ending with one `Eof`. Bounded the
+// same way `stdlib/json/lex.bit:lexImpl` is: every iteration either records
+// a token that strictly advances `s.i`, or an `Indent`/`Dedent` bounded by
+// `limits.maxDepth` per line — so `(srcLen + 8) * (maxDepth + 2)` is a
+// generous but provable ceiling on total tokens, not an open-ended loop.
+export fn scan(source: string, limits: YamlLimits): []Token {
+  let s = newScanner(source, limits)
+  let toks = []Token(0)
+  let guard = 0
+  let bound = (len(source) + 8) * (limits.maxDepth + 2)
+  while (guard <= bound) {
+    let t = scanTok(s)
+    toks = append(toks, t)
+    if (t.kind == TokenKind.Eof) {
+      break
+    }
+    guard = guard + 1
+  }
+  return toks
+}
