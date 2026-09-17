@@ -227,14 +227,14 @@ Two consequences to plan for rather than discover:
   "accepted, reviewed difference" mechanism, added after this doc's first
   draft). Because the oracle re-bases to N-1 at every repin, a transform
   that landed before release N is back IN the oracle by N+1: the signature
-  then explains zero files, and nothing removes it automatically — a stale
+  then explains zero files, and nothing removes it automatically -- a stale
   signature stays declared, evaluated against every future mismatch, ready
   to swallow an unrelated real regression whose delta happens to satisfy
   its identity by coincidence. `selfhost-diffir.sh`/`selfhost-diffiropt.sh`
   fail and name a signature that explains zero files as RETIRED, so this
   is not silent; **the repin step still means someone has to act on it**:
   after moving the stage0 pin, run both scripts and remove every signature
-  they report retired (checked on every host this repo builds for — a
+  they report retired (checked on every host this repo builds for -- a
   signature can explain zero files on one host and still be needed on
   another, per §4's per-file rather than per-host claim), before
   considering the repin done.
