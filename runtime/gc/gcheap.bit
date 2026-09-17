@@ -118,6 +118,13 @@ const acHeap = 1  // `*(g + gcHeapAddr)` these slots were taken from, 0 when non
 const acLock = 2  // `*(g + gcHeapLockAddr)` for that heap, so a drain can lock it
 const acHeads = 3 // `acHeads + idx`: head of class `idx`'s cached chain
 
+// #5472: bytes this thread may still allocate before it must read the SHARED
+// collection trigger again. `acHeads + allocNumClasses` = 3 + 37 = 40, the
+// first word past the class heads and still inside the same 512-byte entry, so
+// it is private to the owning OS thread by exactly the argument the heads are
+// (see `acOwner`) and shares no line with another thread's.
+const acBudget = 40
+
 // Most bytes of ONE class ONE thread may hold, and the hard ceiling on the
 // batch. A cap in BYTES rather than in slots is what keeps the idle footprint
 // flat across the 37 classes: the same rule gives 512 slots' worth of an 8-byte
@@ -238,6 +245,81 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
     *(e + acLock) = *(g + gcHeapLockAddr)
   }
   return addr
+}
+
+// This OS thread's entry when the per-thread paths are armed, 0 otherwise.
+//
+// ONE RESOLUTION PER ALLOCATION, and that is why it is here rather than inside
+// `gcHeapAlloc` where the arming gate used to live: #5472 gave the entry a
+// second consumer — the trigger budget below, charged AFTER the object is
+// linked — and resolving it twice would pay `gcThreadToken` and the probe
+// twice for one allocation.
+//
+// It is resolved for EVERY size now, where the cache gate skipped anything
+// above `acMaxBytes / 2`. That is deliberate: the budget must be charged for
+// every allocation or a stream of large objects would raise the shared live
+// total without ever spending the budget that guards the read of it. The only
+// consequence is that a thread allocating nothing but large objects claims a
+// table entry it holds no slots in, which costs one of 64 entries and nothing
+// else (a thread that finds none free allocates through the lock, as today).
+@nosplit fn allocCacheArm(g: *i64): int {
+  if (allocCacheArmed == 0) {
+    return 0
+  }
+  return allocCacheEntry(g)
+}
+
+// Charge `total` bytes to this thread's private allocation budget and answer
+// whether an allocation-door poll request is due (#5472).
+//
+// THE POINT IS THE READ IT REMOVES. `gcShouldCollect` opens with
+// `heapLiveBytes`, an `ldar` on `heapLiveWord` — the one word EVERY allocating
+// thread also `atomicAdd`s — so asking it on every allocation puts an acquire
+// load of a permanently-dirty line on the allocation path of every mutator.
+// This charges a word no other thread can touch with a plain load, subtract and
+// store, and reaches the shared trigger only when the budget runs out.
+//
+// NOT A SAMPLING SCHEME: the budget is the distance to the byte trigger
+// (`gcTriggerBudget`, ../gc/gccollect.bit), so it expires BEFORE the trigger it
+// guards can fire, and it is 0 — consult on every allocation, exactly today's
+// behaviour — whenever the trigger is crossed, the collector is off, or stress
+// is on. `gcCollectFinish` clears it on every collection so a budget taken
+// against an old `gcNextBytes` cannot outlive it.
+@nosplit fn gcAllocBudgetSpend(g: *i64, entry: int, total: int): bool {
+  let e = wordAt(entry)
+  let left = *(e + acBudget) - total
+  if (left > 0) {
+    *(e + acBudget) = left
+    return false
+  }
+  let budget = gcTriggerBudget(g)
+  *(e + acBudget) = budget
+  if (budget > 0) {
+    return false
+  }
+  return gcShouldCollect(g)
+}
+
+// Drop every thread's budget, so the next allocation on each re-reads the
+// trigger. CALLED FROM `gcCollectFinish` (../gc/gccollect.bit) and nowhere
+// else: a collection is the one event that moves `gcNextBytes`, and a budget
+// measured against the trigger of the cycle that just ended is exactly the
+// stale figure that would let a mutator run past the new one.
+//
+// A PLAIN STORE INTO ANOTHER THREAD'S WORD IS SOUND HERE. Its caller runs with
+// the world stopped (`stwCollect`), so every owner is parked; on the
+// single-mutator `gcCollectRoots` path there is no other owner to race. Even
+// were one to race, the two outcomes are a lost reset and a lost charge, and
+// both cost one extra consult rather than a missed one.
+@nosplit fn gcAllocBudgetClear() {
+  let base = int(ptrOf(allocCacheBlock))
+  let i = 0
+  // Bounded: exactly `acEntries` iterations.
+  while (i < acEntries) {
+    let e = wordAt(base + i * acEntryBytes)
+    *(e + acBudget) = 0
+    i = i + 1
+  }
 }
 
 // Give every cached slot back to the heap it was taken from, under that heap's
@@ -416,7 +498,12 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
 // 0.224s -> 0.241s (+7.6%) and `bench/cases/strings` +6.7% on a workload that
 // never takes the cache at all. The take below is therefore INLINE here, as it
 // was before, and only the cold span-refill path is a call.
-@nosplit fn gcHeapAlloc(g: *i64, size: int, alignment: int, idx: int): int {
+//
+// `entry` is THIS THREAD's cache entry, or 0 when it has none — resolved by the
+// caller (`allocCacheArm`, #5472) rather than here, because `allocObject` needs
+// the same entry after the allocation for its trigger budget and one thread
+// token plus one probe per allocation is the whole point.
+@nosplit fn gcHeapAlloc(g: *i64, size: int, alignment: int, idx: int, entry: int): int {
   if (idx < 0) {
     spinAcquire(heapLock(g))
     let big = gcHeapAllocLargeLocked(g, size)
@@ -426,17 +513,15 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
   // The cache is skipped outright for a request that could not hold two slots
   // under the cap: a class that large is allocated rarely enough that its lock
   // traffic does not appear in a profile, and caching it would spend the whole
-  // per-thread budget on one slot. `entry` is resolved BEFORE the lock —
+  // per-thread budget on one slot. The entry is resolved BEFORE the lock —
   // nothing it reads is under the heap lock, and resolving it inside would put
   // a cross-object call in the critical section this exists to shorten.
-  let entry = 0
-  if (allocCacheArmed != 0 && size * 2 <= acMaxBytes) {
-    entry = allocCacheEntry(g)
-    if (entry != 0) {
-      let hit = allocCachePop(wordAt(entry), heapBlock(g), idx, size)
-      if (hit != 0) {
-        return hit
-      }
+  let cache = 0
+  if (entry != 0 && size * 2 <= acMaxBytes) {
+    cache = entry
+    let hit = allocCachePop(wordAt(cache), heapBlock(g), idx, size)
+    if (hit != 0) {
+      return hit
     }
   }
   // `spinAcquire`'s own first step, open-coded so a failed exchange — the exact
@@ -451,8 +536,8 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
   if (got == 0) {
     got = gcHeapRefillSmallLocked(g, size, idx)
   }
-  if (got != 0 && entry != 0) {
-    allocCacheFillLocked(g, wordAt(entry), idx, size)
+  if (got != 0 && cache != 0) {
+    allocCacheFillLocked(g, wordAt(cache), idx, size)
   }
   spinRelease(lk)
   return got
