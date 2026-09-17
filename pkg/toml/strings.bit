@@ -1,0 +1,395 @@
+// Bit toml package — strings.bit, decoding the four TOML string forms from
+// `pkg/toml/lex.bit`'s raw spans (TOML 1.0.0 "String", #5481, epic #1481).
+//
+// The lexer only slices — it never decodes an escape and never strips a
+// multi-line opener's leading newline (lex.bit's own header). This file owns
+// all of that: `tomlDecodeString` is the one entry point, dispatching on the
+// token's `TokenKind` to one decoder per string form.
+//
+// FAST PATH FIRST (stdlib/json/escape.bit is the precedent this mirrors).
+// Most TOML strings carry no escape at all. Every decoder here pre-scans for
+// the first byte needing work and returns a direct sub-slice of `src` when
+// there is none, never building a `Builder` for a string that does not need
+// one — `decodeStringLiteral` (stdlib/json/parse.bit) explains why: without
+// the pre-scan, decoding an escape-free L-byte string costs O(L^2), because
+// `Builder.writeByte` copies its whole accumulated buffer on every call.
+//
+// ONE ESCAPE SET, TWO CALLERS. `decodeBasicEscape` decodes one `\X` escape
+// and is shared verbatim between `decodeBasicString` and
+// `decodeMlBasicEscaped` — TOML 1.0.0 gives multi-line basic strings the
+// same escapes as single-line basic strings, plus two rules of its own (the
+// opener's leading newline, the line-ending backslash), so only the byte
+// that reaches the escape decoder differs, never the escape grammar.
+//
+// LEXER-ENFORCED RULES ARE RE-CHECKED HERE TOO. `lex.bit`'s scanners already
+// reject a raw control character with `Invalid`, so a token that reaches
+// this file as `BasicString`/etc. never carries one — but this file is the
+// one that owns TOML 1.0.0's whole "String" section (this file's own
+// header), so every decoder still walks its control-character rule itself
+// rather than trusting an upstream guarantee it does not otherwise depend
+// on. It costs nothing extra: the same byte-by-byte scan that finds the
+// first escape is the one checking it.
+
+import { Builder, newBuilder } from "std/strings"
+
+// The package's own error type: every decode failure names the byte offset
+// of the offending character (`offset`), so a caller can turn it into a
+// source position the same way `stdlib/json/parse.bit`'s `posError` lets its
+// own callers do, without a second pass over `src` to find it again.
+export class TomlError {
+  export offset: int
+  msg: string
+
+  message(): string {
+    return "toml: ${this.msg} (byte ${this.offset})"
+  }
+}
+
+fn tomlStringError(msg: string, offset: int): error {
+  return TomlError{ offset: offset, msg: msg }
+}
+
+// TOML 1.0.0's closed unicode-scalar-value range: a UTF-16 surrogate half
+// and anything past the last Unicode plane are both errors, never a
+// replacement character (this file's ticket, and RFC 3629 §3's own scalar
+// value definition, which TOML's `\uXXXX`/`\UXXXXXXXX` inherit).
+const tomlSurrogateLo = 0xD800
+const tomlSurrogateHi = 0xDFFF
+const tomlMaxScalarValue = 0x10FFFF
+
+// `src[start:end)` decoded as `kind`'s string form. `start`/`end` are the
+// token's own span, delimiters included — exactly what `lex.bit` hands back
+// — so every branch below trims its own opener/closer before decoding the
+// body.
+export fn tomlDecodeString(src: string, kind: TokenKind, start: int, end: int): string! {
+  switch (kind) {
+    case TokenKind.BasicString:
+      return decodeBasicString(src, start + 1, end - 1)?
+    case TokenKind.LiteralString:
+      return decodeLiteralString(src, start + 1, end - 1)?
+    case TokenKind.MlBasicString:
+      return decodeMlBasicString(src, start + 3, end - 3)?
+    case TokenKind.MlLiteralString:
+      return decodeMlLiteralString(src, start + 3, end - 3)?
+    default:
+      fail tomlStringError("not a string token", start)
+  }
+}
+
+// --- basic strings ("...") -------------------------------------------------
+
+// The offset of the first `\` in `src[start:end)`, or -1 when the span needs
+// no decoding at all. Fails immediately on a raw control character other
+// than tab (TOML 1.0.0 "String"), the same shape `stdlib/json/escape.bit`'s
+// `scanEscape` uses for JSON's own control-character rule.
+fn scanBasicEscape(src: string, start: int, end: int): int! {
+  let j = start
+  while (j < end) {
+    let c = src[j]
+    if (isTomlControlChar(c)) {
+      fail tomlStringError("control character in string", j)
+    }
+    if (c == '\\') {
+      return j
+    }
+    j = j + 1
+  }
+  return -1
+}
+
+fn decodeBasicString(src: string, start: int, end: int): string! {
+  let firstEscape = scanBasicEscape(src, start, end)?
+  if (firstEscape < 0) {
+    return src[start:end]
+  }
+  return decodeBasicEscaped(src, start, end, firstEscape)?
+}
+
+// `src[start:end)` with its escapes resolved, `firstEscape` being the offset
+// `scanBasicEscape` returned. Everything before it is copied in one write.
+fn decodeBasicEscaped(src: string, start: int, end: int, firstEscape: int): string! {
+  let i = firstEscape
+  let b = newBuilder().write(src[start:firstEscape])
+  while (i < end) {
+    let c = src[i]
+    if (isTomlControlChar(c)) {
+      fail tomlStringError("control character in string", i)
+    }
+    if (c != '\\') {
+      b = b.writeByte(c)
+      i = i + 1
+      continue
+    }
+    i = decodeBasicEscape(src, i, end, b)?
+  }
+  return b.toString()
+}
+
+// The byte a simple (non-`\u`/`\U`) TOML escape decodes to, or -1 when `e`
+// is not one of them — TOML 1.0.0's closed set is `\b \t \n \f \r \" \\`,
+// deliberately narrower than JSON's (no `\/`).
+fn simpleEscapeByte(e: u8): int {
+  switch (e) {
+    case '"':
+      return int('"')
+    case '\\':
+      return int('\\')
+    case 'b':
+      return 8
+    case 't':
+      return int('\t')
+    case 'n':
+      return int('\n')
+    case 'f':
+      return 12
+    case 'r':
+      return int('\r')
+    default:
+      return -1
+  }
+}
+
+// One `\X` escape starting at `i` (the `\`), appended to `b`, returning the
+// position just past it. Shared verbatim by `decodeBasicEscaped` and
+// `decodeMlBasicEscaped` (this file's header) — the escape grammar is
+// identical for both string forms.
+fn decodeBasicEscape(src: string, i: int, end: int, b: Builder): int! {
+  let escStart = i
+  if (i + 1 >= end) {
+    fail tomlStringError("unterminated escape", escStart)
+  }
+  let e = src[i + 1]
+  let simple = simpleEscapeByte(e)
+  if (simple >= 0) {
+    b = b.writeByte(u8(simple))
+    return i + 2
+  }
+  if (e == 'u') {
+    return decodeShortUnicodeEscape(src, i, end, escStart, b)?
+  }
+  if (e == 'U') {
+    return decodeLongUnicodeEscape(src, i, end, escStart, b)?
+  }
+  fail tomlStringError("invalid escape character", escStart)
+}
+
+// --- \uXXXX / \UXXXXXXXX ----------------------------------------------------
+
+fn hexDigitVal(src: string, at: int): int! {
+  let c = src[at]
+  if (c >= '0' && c <= '9') {
+    return int(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return int(c - 'a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return int(c - 'A') + 10
+  }
+  fail tomlStringError("invalid hex digit in unicode escape", at)
+}
+
+// The `n`-hex-digit codepoint starting at `src[i]`.
+fn decodeHexDigits(src: string, i: int, n: int, end: int): int! {
+  if (i + n > end) {
+    fail tomlStringError("truncated unicode escape", i)
+  }
+  let v = 0
+  let k = 0
+  while (k < n) {
+    let d = hexDigitVal(src, i + k)?
+    v = v * 16 + d
+    k = k + 1
+  }
+  return v
+}
+
+// TOML 1.0.0 requires a Unicode SCALAR VALUE, not merely a codepoint: a
+// surrogate half and anything past U+10FFFF are both rejected outright,
+// never replaced (this file's ticket).
+fn validateScalarValue(cp: int, at: int): int! {
+  if (cp >= tomlSurrogateLo && cp <= tomlSurrogateHi) {
+    fail tomlStringError("surrogate code point in unicode escape", at)
+  }
+  if (cp > tomlMaxScalarValue) {
+    fail tomlStringError("code point above U+10FFFF in unicode escape", at)
+  }
+  return cp
+}
+
+// Encodes Unicode scalar value `cp` as UTF-8 into `b`. Hand-rolled for the
+// same reason `stdlib/json/escape.bit`'s own `writeUtf8` is: `string(rune)`
+// is not implemented yet (that file's header), and this is a different
+// module, so its unexported `writeUtf8` is not reachable from here.
+fn writeUtf8(b: Builder, cp: int): Builder {
+  if (cp < 0x80) {
+    return b.writeByte(u8(cp))
+  }
+  if (cp < 0x800) {
+    return b.writeByte(u8(0xC0 | (cp >> 6))).writeByte(u8(0x80 | (cp & 0x3F)))
+  }
+  if (cp < 0x10000) {
+    return b.writeByte(u8(0xE0 | (cp >> 12))).writeByte(u8(0x80 | ((cp >> 6) & 0x3F))).writeByte(
+      u8(0x80 | (cp & 0x3F)),
+    )
+  }
+  return b.writeByte(u8(0xF0 | (cp >> 18))).writeByte(u8(0x80 | ((cp >> 12) & 0x3F))).writeByte(
+    u8(0x80 | ((cp >> 6) & 0x3F)),
+  ).writeByte(u8(0x80 | (cp & 0x3F)))
+}
+
+// `\uXXXX`: 4 hex digits, total escape length 6.
+fn decodeShortUnicodeEscape(src: string, i: int, end: int, escStart: int, b: Builder): int! {
+  let cp = decodeHexDigits(src, i + 2, 4, end)?
+  let scalar = validateScalarValue(cp, escStart)?
+  b = writeUtf8(b, scalar)
+  return i + 6
+}
+
+// `\UXXXXXXXX`: 8 hex digits, total escape length 10.
+fn decodeLongUnicodeEscape(src: string, i: int, end: int, escStart: int, b: Builder): int! {
+  let cp = decodeHexDigits(src, i + 2, 8, end)?
+  let scalar = validateScalarValue(cp, escStart)?
+  b = writeUtf8(b, scalar)
+  return i + 10
+}
+
+// --- literal strings ('...') ------------------------------------------------
+
+// No escape mechanism at all (TOML 1.0.0 "String"): a `\` is ordinary
+// content, so the only work is the control-character rule, and the result is
+// always a direct sub-slice.
+fn decodeLiteralString(src: string, start: int, end: int): string! {
+  let j = start
+  while (j < end) {
+    if (isTomlControlChar(src[j])) {
+      fail tomlStringError("control character in string", j)
+    }
+    j = j + 1
+  }
+  return src[start:end]
+}
+
+// --- shared multi-line rule: the opener's leading newline -----------------
+
+// `body`'s start, past one leading `\n` or `\r\n` immediately after the
+// opening delimiter — TOML 1.0.0 "String": "A newline immediately following
+// the opening delimiter will be trimmed." Shared by both multi-line forms.
+fn stripLeadingNewline(src: string, start: int, end: int): int {
+  if (start >= end) {
+    return start
+  }
+  if (src[start] == '\r' && start + 1 < end && src[start + 1] == '\n') {
+    return start + 2
+  }
+  if (src[start] == '\n') {
+    return start + 1
+  }
+  return start
+}
+
+// --- multi-line literal strings ('''...''') ---------------------------------
+
+// No escape mechanism, same as `decodeLiteralString`; the only multi-line
+// rule that applies is the opener's leading newline. Up to two unescaped
+// `'` before the real closer need no special handling here — the lexer's
+// span already ends at the real triple-quote closer (lex.bit's
+// `scanMlLiteralString`), so any stray `'`/`''` inside is ordinary content
+// this loop copies like any other byte.
+fn decodeMlLiteralString(src: string, rawStart: int, end: int): string! {
+  let start = stripLeadingNewline(src, rawStart, end)
+  let j = start
+  while (j < end) {
+    if (isMlControlChar(src[j])) {
+      fail tomlStringError("control character in string", j)
+    }
+    j = j + 1
+  }
+  return src[start:end]
+}
+
+// --- multi-line basic strings ("""...""") -----------------------------------
+
+// Whitespace insignificant inside a line-ending backslash's trim (TOML
+// 1.0.0 "String") — the newline itself is checked separately, since finding
+// one is what confirms the rule fired at all.
+fn isMlInlineSpace(c: u8): bool {
+  return c == ' ' || c == '\t'
+}
+
+// The offset just past the run of whitespace-and-newlines a line-ending
+// backslash at `i` trims, or -1 when `i` is an ordinary escape instead: TOML
+// 1.0.0 "String" fires the rule only when `\` is the LAST non-whitespace
+// character on its line, so scanning forward from `i+1` must cross at least
+// one newline before any other non-whitespace byte.
+fn lineEndingBackslashEnd(src: string, i: int, end: int): int {
+  let j = i + 1
+  let sawNewline = false
+  while (j < end && (isMlInlineSpace(src[j]) || src[j] == '\n' || src[j] == '\r')) {
+    if (src[j] == '\n' || src[j] == '\r') {
+      sawNewline = true
+    }
+    j = j + 1
+  }
+  if (sawNewline) {
+    return j
+  }
+  return -1
+}
+
+// The offset of the first byte a multi-line basic string's body needs
+// decoding for: a `\` (either an ordinary escape or a line-ending
+// backslash) or an invalid control character. -1 when the whole body is
+// plain content.
+fn scanMlBasicSpecial(src: string, start: int, end: int): int! {
+  let j = start
+  while (j < end) {
+    let c = src[j]
+    if (isMlControlChar(c)) {
+      fail tomlStringError("control character in string", j)
+    }
+    if (c == '\\') {
+      return j
+    }
+    j = j + 1
+  }
+  return -1
+}
+
+fn decodeMlBasicString(src: string, rawStart: int, end: int): string! {
+  let start = stripLeadingNewline(src, rawStart, end)
+  let firstSpecial = scanMlBasicSpecial(src, start, end)?
+  if (firstSpecial < 0) {
+    return src[start:end]
+  }
+  return decodeMlBasicEscaped(src, start, end, firstSpecial)?
+}
+
+// `src[start:end)` with its escapes resolved and every line-ending backslash
+// trimmed, `firstSpecial` being the offset `scanMlBasicSpecial` returned.
+// Reuses `decodeBasicEscape` for an ordinary escape — TOML 1.0.0 gives
+// multi-line basic strings the same escape grammar as single-line ones, so
+// only the two extra rules (the opener's newline, handled by the caller, and
+// the line-ending backslash, handled here) are this function's own.
+fn decodeMlBasicEscaped(src: string, start: int, end: int, firstSpecial: int): string! {
+  let i = firstSpecial
+  let b = newBuilder().write(src[start:firstSpecial])
+  while (i < end) {
+    let c = src[i]
+    if (isMlControlChar(c)) {
+      fail tomlStringError("control character in string", i)
+    }
+    if (c != '\\') {
+      b = b.writeByte(c)
+      i = i + 1
+      continue
+    }
+    let contAt = lineEndingBackslashEnd(src, i, end)
+    if (contAt >= 0) {
+      i = contAt
+      continue
+    }
+    i = decodeBasicEscape(src, i, end, b)?
+  }
+  return b.toString()
+}
