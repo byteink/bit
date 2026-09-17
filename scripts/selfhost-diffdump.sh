@@ -563,6 +563,29 @@ run_ir() {
   oraclecrashes=$(wc -l <"$work/oraclecrash" | tr -d ' ')
   oraclepanics=$(wc -l <"$work/oraclepanic" | tr -d ' ')
 
+  # A declared signature that never fires on this run is not guarding
+  # anything (#5509): the oracle is the pinned stage0, release N-1
+  # (docs/release/bootstrap.md), and it moves every release, so a transform
+  # that landed before release N is back IN the oracle by N+1 -- the two
+  # compilers agree again on every site it used to explain, and the
+  # signature has nothing left to do except silently swallow a FUTURE,
+  # unrelated mismatch that happens to satisfy its identity by coincidence.
+  # This run's own corpus decides retirement, which makes the check
+  # per-host by construction (declaredSignatureNames, sourced from
+  # selfhost-ir-signatures.sh, is the single source of truth for what
+  # "declared" means) -- see that file's WHICH HOSTS note for why every
+  # signature declared there today is expected to fire identically on
+  # every target this repo builds for, so a zero here is a real retirement
+  # candidate, not an arch difference this check would misreport.
+  retired="" retiredcount=0
+  while IFS= read -r signame; do
+    [ -n "$signame" ] || continue
+    if ! grep -q "declared signature '${signame}'" "$work/explained" 2>/dev/null; then
+      retired="$retired $signame"
+      retiredcount=$((retiredcount + 1))
+    fi
+  done < <(declaredSignatureNames "$NAME")
+
   echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained NO-VERDICT=$timeouts ORACLE-TIMEOUT=$oracletimeouts ORACLE-CRASH=$oraclecrashes ORACLE-PANIC=$oraclepanics SKIP($SKIPLABEL)=$skip"
 
   # A RUN THAT COMPARED NOTHING IS NOT A PASS (#1881). Two ways to get here having
@@ -659,7 +682,20 @@ run_ir() {
   # legitimate decline -- #3755 and #3756 sat unseen inside SKIP as a result.
   print_bucket "NOTE: the pinned stage0 PANICKED on $oraclepanics file(s) — no verdict available, tracked as #3757:" "$work/oraclepanic"
 
-  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ]; then
+  # RETIRED signatures fail the run, same as a REGRESSION, and are reported
+  # by name (#5509) -- a signature this run never needed is not evidence of
+  # nothing; it is evidence the signature itself is stale. `-f` in the
+  # diffexit call below is what actually turns this into exit 1: printing
+  # the list here without adding retiredcount there would read as a warning
+  # that never fails the gate, which is the exact "known-and-ignored red"
+  # shape #1895/#1883 already burned this family for once.
+  if [ "$retiredcount" -gt 0 ]; then
+    echo
+    echo "RETIRED: $retiredcount declared signature(s) explained zero files in this run's corpus and must be removed from scripts/selfhost-ir-signatures.sh (or, if this host legitimately cannot exercise them, confirmed dead on every other host this repo builds for first):"
+    for s in $retired; do echo "  retired: $s"; done
+  fi
+
+  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ] && [ "$retiredcount" -eq 0 ]; then
     echo
     if [ "$explained" -gt 0 ]; then
       echo "$PREFIX: every file's $VERB IR matches the pinned stage0's, or is explained by a declared transform signature ($explained explained)."
@@ -667,7 +703,7 @@ run_ir() {
       echo "$PREFIX: every file's $VERB IR is identical to the pinned stage0's."
     fi
   fi
-  diffexit "$LABEL" -f "$mismatch" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
+  diffexit "$LABEL" -f "$mismatch" "$retiredcount" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
 }
 
 case "$KIND" in

@@ -220,6 +220,24 @@ Two consequences to plan for rather than discover:
   differences between the seed and the self-hosted output; those waivers became
   meaningless once the seed was gone, and #1883 deleted the list along with its
   reader. No mismatch is permitted now.
+- **A repin can retire a declared transform signature without telling
+  anyone (#5509).** `scripts/selfhost-ir-signatures.sh`'s `explainMismatch`
+  downgrades a divergence from the pinned oracle to EXPLAINED when it
+  matches a signature filed for an intentional lowering change (§4's
+  "accepted, reviewed difference" mechanism, added after this doc's first
+  draft). Because the oracle re-bases to N-1 at every repin, a transform
+  that landed before release N is back IN the oracle by N+1: the signature
+  then explains zero files, and nothing removes it automatically — a stale
+  signature stays declared, evaluated against every future mismatch, ready
+  to swallow an unrelated real regression whose delta happens to satisfy
+  its identity by coincidence. `selfhost-diffir.sh`/`selfhost-diffiropt.sh`
+  fail and name a signature that explains zero files as RETIRED, so this
+  is not silent; **the repin step still means someone has to act on it**:
+  after moving the stage0 pin, run both scripts and remove every signature
+  they report retired (checked on every host this repo builds for — a
+  signature can explain zero files on one host and still be needed on
+  another, per §4's per-file rather than per-host claim), before
+  considering the repin done.
 
 ## 5. What checks the compiler that compiles the compiler
 
