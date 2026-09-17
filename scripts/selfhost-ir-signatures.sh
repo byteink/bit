@@ -547,6 +547,137 @@ explainMismatch() {
         exit 0
       }
 
+      # --- #5445: a METHOD RETURN EXPLODES ACROSS A DIRECT (non-interface)
+      # CALL (compiler/lowercall.bit direct-call path; the callee own
+      # return, compiler/lowerlayout.bit) ---
+      #
+      # Runs LAST, after #5506, so it can never claim a file #5506 already
+      # explains on its own. Several of the 11 files this ticket (#5517)
+      # covers ALSO carry the independently-landed #5506 nil-payload retype
+      # in the SAME function -- stdlib/io/io.bit readLine builds an
+      # Option<string> "None" the ordinary way, unrelated to what THIS
+      # transform changed -- so the coexistence loop below tolerates exactly
+      # that #5506 line shape and nothing wider.
+      #
+      # TWO sub-shapes of the one ABI change, measured across the 11 files:
+      #
+      # CALL SITE (a caller unpacking a method payload-enum return): the
+      # oracle `call ... <Enum>` plus the two `field_get`s that unpack it
+      # become `call ... <word0 type>` + `call_word` (the second word) + a
+      # compat re-box (`gc_alloc` + two `field_set`s, unscored by opcode() so
+      # invisible to the counts below). Downstream use sites either re-derive
+      # through the box (both original `field_get`s survive, net 0) or use
+      # the call/call_word results directly (both vanish, net -2) -- measured
+      # from 0 of 5 sites re-deriving (examples/regex/regex.bit) to all sites
+      # re-deriving (regex_star_nullable_body.bit). Every call site adds
+      # exactly one `gc_alloc` and one `call_word`: the call count IS
+      # delta(gc_alloc) at pre-opt, which must equal delta(call_word)
+      # exactly -- the return-site sub-shape below never touches the
+      # gc_alloc count, since it reuses the box the oracle already built.
+      #
+      # RETURN SITE (the callee building the same box, then unpacking it
+      # again to return the two words instead of the pointer): the box is
+      # built EXACTLY as before -- same `gc_alloc`, same two `field_set`s --
+      # then two new `field_get`s unpack it and a single-value `ret` becomes
+      # a two-value `ret`. Measured on every return site in
+      # _tests_/cases/run_enum_explode_method_direct.bit and stdlib/io/io.bit
+      # (the only two files of the 11 whose own method definition, rather
+      # than only a caller of one defined elsewhere, is dumped): always
+      # exactly +2 `field_get`, +0 `gc_alloc`, one canonicalized `ret %` line
+      # traded for one `ret %, %` line.
+      #
+      # PRE-OPT is the strict arm: Ncall (=delta(gc_alloc)=delta(call_word))
+      # and Nret (the ret-arity swap count, read off the canonicalized line
+      # multiset the same way #5486/#5506 do) must both be non-negative, sum
+      # positive, and delta(field_get) minus the return sites fixed +2*Nret
+      # must be an even number in [-2*Ncall, 0] -- the call sites own
+      # contribution, one of {0,-2} each, never a free allowance.
+      #
+      # POST-OPT is weaker, stated plainly: opt.bit CSE/DCE can eliminate
+      # MORE than the pre-opt arm fixed accounting once it can inline a
+      # small direct callee (run_enum_explode_method_direct.bit is small
+      # enough to inline whole, which erases its call site call_word/
+      # gc_alloc entirely rather than merely dead-boxing them), so only a
+      # FLOOR is enforced here (gc_alloc at least as negative as -Nret,
+      # field_get at least as negative as -2*Ncall_post), never a ceiling on
+      # how much MORE the optimizer folded away. That gap is real: a
+      # regression that deleted extra, unrelated boxes in the same function
+      # would read the same way. It is bounded by the strict pre-opt arm
+      # above, which this arm cannot override on its own, and by
+      # test-golden/test-selfcheck running the deleted-box programs.
+      #
+      # The mutation control (flip `Op.Sub` to `Op.Add` in `binOpFor`) adds
+      # an `add` and removes a `sub` on every file that lowers a subtraction,
+      # including some of these 11 (stdlib/io/io.bit,
+      # _tests_/imports/regexconform/main.bit): neither opcode is ever
+      # tolerated moving below, so the file still fails as a regression.
+      ok5445 = 1
+      if (kind == "ir") {
+        Ncall5445 = delta["gc_alloc"]
+        if (Ncall5445 != delta["call_word"]) ok5445 = 0
+      } else {
+        Ncall5445 = delta["call_word"]
+      }
+      if (Ncall5445 < 0) ok5445 = 0
+
+      retSingleDelta5445 = cntA5486["  ret %"] - cntB5486["  ret %"]
+      retMultiDelta5445  = cntB5486["  ret %, %"] - cntA5486["  ret %, %"]
+      if (retSingleDelta5445 != retMultiDelta5445 || retSingleDelta5445 < 0) ok5445 = 0
+      Nret5445 = retSingleDelta5445
+
+      if (Ncall5445 + Nret5445 <= 0) ok5445 = 0
+
+      if (kind == "ir") {
+        Nfg5445 = delta["field_get"] - 2 * Nret5445
+        if (Nfg5445 > 0 || Nfg5445 % 2 != 0 || Nfg5445 < -2 * Ncall5445) ok5445 = 0
+      } else {
+        if (delta["gc_alloc"] > -Nret5445) ok5445 = 0
+        if (delta["field_get"] > -2 * Ncall5445) ok5445 = 0
+      }
+
+      # Nothing outside {field_get, gc_alloc, call_word} may move, EXCEPT
+      # the #5506 nil-payload-retype shape when it coexists in the same
+      # function -- checked by its exact line shapes (the same regexes
+      # #5506 uses), not merely the opcode name, so an unrelated const_int
+      # change (the shape a real bug would take) still fails this. The
+      # removed/added counts are required to balance at pre-opt exactly as
+      # #5506 requires; post-opt CSE can dedupe an unrelated,
+      # coincidentally-identical `const_int i64 0` elsewhere in the same
+      # function without touching this transform at all, so post-opt only
+      # checks each side shape, not the pairing (the same asymmetry the two
+      # #5506 arms already have).
+      coexistOk5445 = 1
+      NciCoexist5445 = 0; NaddCoexist5445 = 0
+      for (op5445 in moved) {
+        opname5445 = op5445
+        sub(/^rt_call:/, "", opname5445)
+        if (opname5445 == "field_get" || opname5445 == "gc_alloc" || opname5445 == "call_word") continue
+        if (opname5445 != "const_nil" && opname5445 != "const_bool" && opname5445 != "const_float" && opname5445 != "const_int") ok5445 = 0
+      }
+      for (k5445 in cntA5486) {
+        d5445 = cntA5486[k5445] - cntB5486[k5445]
+        if (d5445 <= 0) { continue }
+        if (k5445 ~ /^[[:space:]]*% = const_int i64 0$/) { NciCoexist5445 += d5445; continue }
+        if (k5445 ~ /^[[:space:]]*% = const_(nil|bool|float|int)/) coexistOk5445 = 0
+      }
+      for (k5445 in cntB5486) {
+        d5445 = cntB5486[k5445] - cntA5486[k5445]
+        if (d5445 <= 0) { continue }
+        if (k5445 ~ /^[[:space:]]*% = const_nil$/ ||
+            k5445 ~ /^[[:space:]]*% = const_bool false$/ ||
+            k5445 ~ /^[[:space:]]*% = const_float [^ ]+ 0$/ ||
+            (k5445 ~ /^[[:space:]]*% = const_int [^ ]+ 0$/ &&
+             k5445 !~ /^[[:space:]]*% = const_int i64 0$/)) { NaddCoexist5445 += d5445; continue }
+        if (k5445 ~ /^[[:space:]]*% = const_(nil|bool|float|int)/) coexistOk5445 = 0
+      }
+      if (kind == "ir" && NciCoexist5445 != NaddCoexist5445) coexistOk5445 = 0
+      if (!coexistOk5445) ok5445 = 0
+
+      if (ok5445) {
+        print "5445-method-return-explode-direct-call"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -590,7 +721,8 @@ declaredSignatureNames() {
   printf '%s\n' \
     "5486-variant-payload-reorder" \
     "5429-decimal-boxed-slot-explode" \
-    "5506-enum-nil-payload-retype"
+    "5506-enum-nil-payload-retype" \
+    "5445-method-return-explode-direct-call"
   [ "$kind" = ir ] || printf '%s\n' "5486-variant-payload-redundant-read-elim"
   [ -n "$kind" ] || printf '%s\n' "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt"
 }
