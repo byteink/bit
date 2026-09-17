@@ -210,10 +210,67 @@ explainMismatch() {
       if (line ~ /^[[:space:]]*index_set /) { return "index_set" }
       return ""
     }
+    # canon5486 erases every `%<id>` token (definition AND use sites alike,
+    # same as the ticket-proposed `sed -E "s/%[0-9]+/%/g"`) so a line SHAPE
+    # can be compared across two dumps whose value numbering shifted because
+    # instructions were reordered, not because anything structural changed.
+    # $t<id> type-id tokens are NOT touched here -- explainMismatch only ever
+    # runs on text the caller already ran through canon_ir_ids (selfhost-ir-
+    # canon.sh) and found STILL mismatching, so any residual difference is
+    # not a $t-interning-order artifact by construction.
+    function canon5486(line,    c) {
+      c = line
+      gsub(/%[0-9]+/, "%", c)
+      return c
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
-    side == 0 { op = opcode($0); if (op != "") a[op]++; next }
-    { op = opcode($0); if (op != "") b[op]++ }
+    side == 0 { cntA5486[canon5486($0)]++; op = opcode($0); if (op != "") a[op]++; next }
+    { cntB5486[canon5486($0)]++; op = opcode($0); if (op != "") b[op]++ }
     END {
+      # --- #5486: pure instruction-reorder (payload lowered before its
+      # `gc_alloc`, compiler/lowercall.bit variantPayloadValues via
+      # lowerVariantConstruction, compiler/lowerlayout.bit) ---
+      #
+      # Every opcode-COUNT delta is zero for a reorder — nothing is added,
+      # removed or retyped, so the #3107-style identities below (each keyed on
+      # some N > 0) correctly do not explain it and would need their own,
+      # weaker, all-zero special case if this were folded into one of them.
+      # The identity actually checked here is STRONGER than an opcode
+      # histogram: the CANONICALIZED LINE MULTISET (every `%<id>` erased, both
+      # definition and use sites, then compared as a bag of lines rather than
+      # ordered text) must be identical between the two sides. Measured
+      # against every file #5486 (a928fd01) reorders relative to the pinned
+      # oracle (bd466499) — 57 of them at pre-opt, `bash
+      # scripts/selfhost-diffir.sh` before this signature existed — the
+      # multiset holds on all 57; the io.bit hunk quoted in the ticket is the
+      # worked example. This also explains 49 of those same 57 files at
+      # POST-opt, where `opt.bit` does not additionally touch anything: the
+      # other 8 post-opt files need the separate identity below, because
+      # there the optimizer does not just reorder.
+      #
+      # WHAT THIS DOES NOT CATCH, stated plainly rather than implied: two
+      # side-effecting expressions (two `rt_call`s, say) swapped in
+      # EVALUATION ORDER produce the exact same bag of lines and pass this
+      # check, even though the order genuinely matters for a caller-visible
+      # effect. A per-file line multiset cannot distinguish "moved" from
+      # "reordered past something it must not cross" — that is a real gap,
+      # not a rounding error, and the reason this signature is scoped to one
+      # named transform call site rather than offered as a general-purpose
+      # reorder detector. The mutation control (flip `Op.Sub` to `Op.Add` in
+      # compiler/lower.bit binOpFor) changes a line OPCODE, not its position,
+      # so it changes the multiset CONTENTS and still fails this check and
+      # every other one below (recorded on the ticket).
+      reorder5486 = 1
+      for (k5486 in cntA5486) { if (cntB5486[k5486] != cntA5486[k5486]) reorder5486 = 0 }
+      if (reorder5486) {
+        for (k5486 in cntB5486) { if (cntA5486[k5486] != cntB5486[k5486]) reorder5486 = 0 }
+      }
+      if (reorder5486) {
+        print "5486-variant-payload-reorder"
+        exit 0
+      }
+
+
       for (op in a) allop[op] = 1
       for (op in b) allop[op] = 1
       # `moved` is the set of opcodes that ACTUALLY changed, recorded here and
@@ -524,6 +581,44 @@ explainMismatch() {
       }
       if (ok5429) {
         print "5429-decimal-boxed-slot-explode"
+        exit 0
+      }
+
+      # --- #5486, POST-OPT ONLY: redundant post-box payload read eliminated
+      # WITHOUT the box itself dying --- the reorder block far above this one
+      # explains a pure move; this covers the one shape in the corpus where
+      # `opt.bit` goes further than a reorder but the box still survives.
+      #
+      # Once the payload is lowered before its `gc_alloc` (see the reorder
+      # block), a `field_get box[k]` that used to re-derive the payload from
+      # the freshly built box is sometimes redundant -- the payload SSA value
+      # is already live -- and CSE forwards it directly, dropping the
+      # `field_get`, even when the box itself is still returned/used
+      # elsewhere and so is NOT eliminated. Measured on
+      # _tests_/cases/run_enum_explode_method.bit (bd466499 oracle vs
+      # a928fd01): delta(field_get) = -2, every other opcode delta = 0,
+      # INCLUDING gc_alloc (=0 -- the box survives, unlike the 7 other
+      # post-opt-diverging corpus files where the box also dies).
+      #
+      # THAT gc_alloc=0 case is exactly what keeps this block from ever firing
+      # on a file the #5429 block above already claims: #5429s post-opt arm
+      # requires delta(gc_alloc) == delta(field_get) AND delta(gc_alloc) < 0
+      # (a box that DOES die), so it runs first and correctly claims the
+      # other 7 #5486 post-opt files whose box also dies -- that identity is
+      # not decimal-specific despite its name; it is opt.bit box-elimination
+      # DCE in general, independently reachable from two different call
+      # sites. This block is deliberately narrower and ONLY covers the
+      # gc_alloc-untouched case #5429s block cannot: it is not a generalised
+      # "field_get moved" check, since widening it further would risk
+      # explaining an unrelated field-read miscount.
+      Ng5486b = -delta["gc_alloc"]
+      Nf5486b = -delta["field_get"]
+      ok5486b = (kind != "ir" && Ng5486b == 0 && Nf5486b > 0)
+      for (op in moved) {
+        if (op != "field_get") ok5486b = 0
+      }
+      if (ok5486b) {
+        print "5486-variant-payload-redundant-read-elim"
         exit 0
       }
 
