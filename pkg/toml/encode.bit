@@ -1,0 +1,467 @@
+// Bit toml package — encode.bit, encoding a `Toml` value back to TOML 1.0.0
+// text (#5485, epic #1481).
+//
+// The inverse of `pkg/toml/parse.bit`'s `tomlParse`: `tomlEncode` is the one
+// entry point. Fallible because not every `Toml` value has a TOML spelling —
+// a bare non-table at the root has no `[header]` to attach to, since the
+// root table is written with no header at all. `pkg/toml/` is one flat
+// module (pkg/README.md): `Toml`, `TomlEntry`, `TomlError` and every
+// `tomlIs*`/`tomlAs*` accessor (`value.bit`) are used here unqualified, no
+// import, no redeclaration — errors reuse `TomlError` (`strings.bit`)
+// rather than declaring a second error type in this shared namespace, with
+// `offset: -1` standing in for "no source position": an encode failure has
+// no byte offset into anything, unlike every decode failure in this module.
+//
+// THREE DECISIONS THIS FILE OWNS, EACH A REAL ROUND-TRIP BUG IF GOT WRONG:
+//
+//   KEY QUOTING MATCHES WHAT THIS PACKAGE'S OWN PARSER ACCEPTS BARE, NOT
+//   JUST TOML 1.0.0'S ABSTRACT GRAMMAR. `pkg/toml/lex.bit`'s `isBareKeyStart`
+//   only starts a bare-key scan on a letter or `_`; a key beginning with a
+//   digit or `-` instead lexes as `Number`/`DateTime` and only round-trips
+//   through `parseKeySegment` when it is ALL ASCII digits (parse.bit's own
+//   header names this gap and leaves it for #5487). `tomlEncIsBareKey`
+//   mirrors that narrower rule exactly: every byte in `A-Za-z0-9_-`, AND
+//   (starts with a letter or `_`, OR is entirely digits). A digit-led key
+//   with any dash or underscore (`12_3`, `12-3`) is quoted, never emitted
+//   bare — emitting it bare would silently reparse as a different token (a
+//   malformed number, or nothing at all) rather than the same key.
+//
+//   STRING FORM IS ALWAYS BASIC, SINGLE-LINE, NEVER LITERAL OR MULTI-LINE.
+//   TOML gives four string forms only to make hand-written source pleasant;
+//   nothing here is hand-written, and a basic string can hold every `string`
+//   value this package's `Toml` can carry (`strings.bit`'s decoder already
+//   proves the same escape set decodes any byte sequence back, control
+//   characters included via `\u00XX`). One form means one deterministic
+//   answer for every string, never a choice that could vary output for the
+//   same input.
+//
+//   A TABLE IS ALWAYS A `[header]` SECTION AT THE TOP OF ITS PARENT, NEVER
+//   AN INLINE `{ }` — except when it sits inside an array or another inline
+//   value, where a `[header]` has no textual place to go and the whole
+//   subtree is written inline instead, recursively. This is the standard
+//   split every mainstream TOML encoder makes and it removes the ambiguity
+//   entirely: a `TomlTable` value's encoding depends only on whether an
+//   ancestor is already inline, never on a heuristic like size or depth.
+//
+// TABLE LAYOUT, THE ROUND-TRIP BUG MOST LIKELY TO BITE AFTER KEY QUOTING.
+// Once a `[sub]` header is written, every following `key = value` line
+// belongs to `sub`, not to the table that opened it — so `encodeTableBody`
+// always writes a table's own scalar-shaped entries FIRST, then its
+// sub-table/array-of-table entries as their own header sections, regardless
+// of their relative order in `[]TomlEntry`. Within each of those two groups,
+// `[]TomlEntry` order is preserved exactly — never sorted. A table whose
+// original order interleaves scalars and sub-tables (a real shape: TOML
+// permits `[t]` / `a = 1` / `b.c = 2` / `d = 3`, giving `t` the entries
+// `a, b, d` with `b` a table between two scalars) re-emits as `a, d` then
+// `b`: the same key/value pairs, just partitioned, because TOML's own text
+// format has no way to interleave them validly. That is unavoidable, not a
+// bug — see this file's own round-trip tests for the shapes that DO stay in
+// exact order (nothing interleaves scalars and sub-tables within one table).
+//
+// EMPTY ARRAY-OF-TABLES HAS NO TEXTUAL FORM. `[[name]]` repeated zero times
+// writes nothing at all, silently dropping the key. So the array-of-tables
+// path (repeated `[[header]]`) is only taken for a NON-EMPTY `TomlArray`
+// whose every element is a `TomlTable`; an empty array, table-shaped or not,
+// is always the inline literal `[]` instead (`isArrayOfTables` below).
+//
+// FLOATS: "${f}" (the runtime's shortest-round-trip formatter, the same one
+// `stdlib/json/encode.bit`'s `formatJsonFloat` builds on) IS the source of
+// truth for which digits denote `f` — this file only reshapes that text into
+// TOML's float grammar (digits required on both sides of `.`), never
+// recomputes a decimal conversion. Unlike JSON, TOML has no requirement to
+// reformat an extreme magnitude into scientific notation: `decodeDecimalFloat`
+// (number.bit) accepts an arbitrarily long positional digit run, so the
+// runtime's own text is reshaped, never re-derived.
+
+// `Builder`/`newBuilder` (std/strings) are already imported once for this
+// module by `strings.bit`; imports are per module, not per file (a second
+// `import` of the same name is E0042), so this file reaches them the same
+// way it reaches `Toml`/`TomlEntry`/`TomlError` — unqualified, no import.
+
+// Encodes `t` as TOML 1.0.0 text. Fails when `t` is not a `TomlTable` — the
+// root of a TOML document is always an implicit table with no header of its
+// own, so nothing else has a root-level spelling.
+export fn tomlEncode(t: Toml): string! {
+  if (!tomlIsTable(t)) {
+    fail tomlEncodeError("root value must be a table")
+  }
+  let entries = unwrap(tomlAsTable(t))
+  let b = newBuilder()
+  b = encodeTableBody(b, entries)?
+  return b.toString()
+}
+
+fn tomlEncodeError(msg: string): error {
+  return TomlError{ offset: -1, msg: msg }
+}
+
+// --- table sections --------------------------------------------------------
+
+// A table's own scalar-shaped entries, then its sub-table/array-of-table
+// entries as nested `[header]`/`[[header]]` sections — see this file's
+// header for why that split, not `[]TomlEntry` order, decides which comes
+// first at the top of any one table.
+fn encodeTableBody(b: Builder, entries: []TomlEntry): Builder! {
+  b = encodeScalarEntries(b, entries)?
+  b = encodeSectionEntries(b, entries, []string(0))?
+  return b
+}
+
+// `key = value` for every entry whose value is NOT itself written as a
+// `[header]` section, in `[]TomlEntry` order.
+fn encodeScalarEntries(b: Builder, entries: []TomlEntry): Builder! {
+  let i = 0
+  while (i < len(entries)) {
+    if (!isSectionValue(entries[i].value)) {
+      b = encodeKey(b, entries[i].key)
+      b = b.write(" = ")
+      b = encodeInlineValue(b, entries[i].value)?
+      b = b.write("\n")
+    }
+    i = i + 1
+  }
+  return b
+}
+
+// A `[header]` or `[[header]]` section for every entry whose value IS
+// section-shaped, in `[]TomlEntry` order, with `path` the dotted key chain
+// from the root down to (not including) this table.
+fn encodeSectionEntries(b: Builder, entries: []TomlEntry, path: []string): Builder! {
+  let i = 0
+  while (i < len(entries)) {
+    if (isSectionValue(entries[i].value)) {
+      b = encodeSection(b, entries[i].key, entries[i].value, path)?
+    }
+    i = i + 1
+  }
+  return b
+}
+
+// `path` plus one more segment, always into a FRESH backing array — never
+// `append(path, key)`, which E0214 flags because `path` is a parameter
+// whose backing array a sibling call in the same loop may still reuse
+// (`encodeSectionEntries` calls `encodeSection` once per section entry,
+// all sharing the same `path`).
+fn tomlEncChildPath(path: []string, key: string): []string {
+  let n = len(path)
+  let out = []string(n + 1)
+  let i = 0
+  while (i < n) {
+    out[i] = path[i]
+    i = i + 1
+  }
+  out[n] = key
+  return out
+}
+
+fn encodeSection(b: Builder, key: string, v: Toml, path: []string): Builder! {
+  let childPath = tomlEncChildPath(path, key)
+  if (tomlIsTable(v)) {
+    return encodeSubTable(b, unwrap(tomlAsTable(v)), childPath)?
+  }
+  return encodeArrayOfTables(b, unwrap(tomlAsArray(v)), childPath)?
+}
+
+fn encodeSubTable(b: Builder, entries: []TomlEntry, path: []string): Builder! {
+  b = b.write("\n[")
+  b = encodeKeyPath(b, path)
+  b = b.write("]\n")
+  b = encodeScalarEntries(b, entries)?
+  b = encodeSectionEntries(b, entries, path)?
+  return b
+}
+
+// Repeats `[[path]]` once per element (`isSectionValue`/`isArrayOfTables`
+// below already refused an empty array, which has no way to spell "an
+// array-of-tables with zero elements" in this header form). Each element's
+// own sections use `path` unchanged: a later `[[path.sub]]` attaches to
+// whichever `[[path]]` was written most recently, exactly matching
+// `parse.bit`'s `descendIntoExisting`, which always descends into the LAST
+// element of an existing array of tables.
+fn encodeArrayOfTables(b: Builder, items: []Toml, path: []string): Builder! {
+  let i = 0
+  while (i < len(items)) {
+    let entries = unwrap(tomlAsTable(items[i]))
+    b = b.write("\n[[")
+    b = encodeKeyPath(b, path)
+    b = b.write("]]\n")
+    b = encodeScalarEntries(b, entries)?
+    b = encodeSectionEntries(b, entries, path)?
+    i = i + 1
+  }
+  return b
+}
+
+// Whether `v` is written as its own `[header]`/`[[header]]` section rather
+// than a `key = value` line: any table, or a non-empty array whose every
+// element is a table (see this file's header on why empty is excluded).
+fn isSectionValue(v: Toml): bool {
+  if (tomlIsTable(v)) {
+    return true
+  }
+  if (!tomlIsArray(v)) {
+    return false
+  }
+  return isArrayOfTables(unwrap(tomlAsArray(v)))
+}
+
+fn isArrayOfTables(items: []Toml): bool {
+  if (len(items) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(items)) {
+    if (!tomlIsTable(items[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// --- keys --------------------------------------------------------------
+
+// `key` bare when legal, else a quoted basic-string key — see this file's
+// header for why the bare set is narrower than TOML 1.0.0's own grammar.
+fn encodeKey(b: Builder, key: string): Builder {
+  if (tomlEncIsBareKey(key)) {
+    return b.write(key)
+  }
+  return b.write(encodeBasicString(key))
+}
+
+// `path`'s segments, each independently bare-or-quoted, joined by `.` —
+// used for a `[header]`/`[[header]]` line, never for a single key.
+fn encodeKeyPath(b: Builder, path: []string): Builder {
+  let i = 0
+  while (i < len(path)) {
+    if (i > 0) {
+      b = b.write(".")
+    }
+    b = encodeKey(b, path[i])
+    i = i + 1
+  }
+  return b
+}
+
+// See this file's header: every byte in `A-Za-z0-9_-`, and either the first
+// byte is a letter/`_`, or the whole key is ASCII digits.
+fn tomlEncIsBareKey(key: string): bool {
+  let n = len(key)
+  if (n == 0) {
+    return false
+  }
+  let i = 0
+  while (i < n) {
+    if (!isBareKeyChar(key[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  if (isBareKeyStart(key[0])) {
+    return true
+  }
+  return tomlEncIsAllDigits(key)
+}
+
+fn tomlEncIsAllDigits(key: string): bool {
+  let i = 0
+  while (i < len(key)) {
+    if (!isDigit(key[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// --- inline values -------------------------------------------------------
+//
+// Every value reachable from an array element or an inline-table entry:
+// scalars write directly, containers recurse fully inline (this file's
+// header — a `[header]` has no textual place once already inside `[ ]`/`{ }`).
+
+fn encodeInlineValue(b: Builder, v: Toml): Builder! {
+  if (tomlIsArray(v)) {
+    return encodeInlineArray(b, unwrap(tomlAsArray(v)))?
+  }
+  if (tomlIsTable(v)) {
+    return encodeInlineTable(b, unwrap(tomlAsTable(v)))?
+  }
+  return encodeScalar(b, v)?
+}
+
+fn encodeInlineArray(b: Builder, items: []Toml): Builder! {
+  b = b.write("[")
+  let i = 0
+  while (i < len(items)) {
+    if (i > 0) {
+      b = b.write(", ")
+    }
+    b = encodeInlineValue(b, items[i])?
+    i = i + 1
+  }
+  b = b.write("]")
+  return b
+}
+
+fn encodeInlineTable(b: Builder, entries: []TomlEntry): Builder! {
+  b = b.write("{")
+  let i = 0
+  while (i < len(entries)) {
+    if (i > 0) {
+      b = b.write(", ")
+    }
+    b = encodeKey(b, entries[i].key)
+    b = b.write(" = ")
+    b = encodeInlineValue(b, entries[i].value)?
+    i = i + 1
+  }
+  b = b.write("}")
+  return b
+}
+
+// --- scalars -------------------------------------------------------------
+
+fn encodeScalar(b: Builder, v: Toml): Builder! {
+  if (tomlIsString(v)) {
+    return b.write(encodeBasicString(unwrap(tomlAsString(v))))
+  }
+  if (tomlIsInt(v)) {
+    return b.write("${unwrap(tomlAsInt(v))}")
+  }
+  if (tomlIsFloat(v)) {
+    return b.write(encodeFloat(unwrap(tomlAsFloat(v))))
+  }
+  if (tomlIsBool(v)) {
+    return b.write(encodeBoolText(unwrap(tomlAsBool(v))))
+  }
+  return encodeTemporal(b, v)?
+}
+
+// The four date-time arms: each type's own `toString()` (std/time) already
+// IS the RFC 3339 form `pkg/toml/datetime.bit`'s decoders accept back
+// (`parseDate`/`parseTime`/`parseNaiveDateTime`/`parseDateTime`'s own
+// comments name their input as exactly this format), so this file re-derives
+// nothing. Split from `encodeScalar` to keep both under E0204's complexity
+// ceiling (`Toml` has ten arms; `value.bit`'s own header hit the same limit
+// splitting its accessors, and #5507 landed today counting `switch`/`case`
+// the same way). The trailing `fail` is unreachable in practice — every one
+// of `Toml`'s ten arms is handled between `encodeScalar`,
+// `encodeInlineValue`'s two container checks and this function — but the
+// four `if`s here are not visible to the checker as exhaustive, so it stays
+// as a defended fallback rather than a silently wrong encoding.
+fn encodeTemporal(b: Builder, v: Toml): Builder! {
+  if (tomlIsOffsetDateTime(v)) {
+    return b.write(unwrap(tomlAsOffsetDateTime(v)).toString())
+  }
+  if (tomlIsLocalDateTime(v)) {
+    return b.write(unwrap(tomlAsLocalDateTime(v)).toString())
+  }
+  if (tomlIsLocalDate(v)) {
+    return b.write(unwrap(tomlAsLocalDate(v)).toString())
+  }
+  if (tomlIsLocalTime(v)) {
+    return b.write(unwrap(tomlAsLocalTime(v)).toString())
+  }
+  fail tomlEncodeError("not an encodable scalar value")
+}
+
+fn encodeBoolText(v: bool): string {
+  if (v) {
+    return "true"
+  }
+  return "false"
+}
+
+// `f` as a TOML float literal. `inf`/`-inf`/`nan` are already TOML 1.0.0's
+// own lowercase spellings (TOML 1.0.0 "Float"), passed through unchanged;
+// a finite value's runtime text never carries an exponent (this file's
+// header), so the only reshaping a finite value ever needs is appending
+// `.0` when there is no `.` at all (an integral float like `100.0`, whose
+// runtime text is `"100"`) — TOML's float grammar requires a digit on both
+// sides of the point.
+fn encodeFloat(f: f64): string {
+  let text = "${f}"
+  if (isNonFiniteFloatText(text)) {
+    return text
+  }
+  if (tomlHasDotByte(text)) {
+    return text
+  }
+  return text + ".0"
+}
+
+fn isNonFiniteFloatText(text: string): bool {
+  return text == "nan" || text == "inf" || text == "-inf"
+}
+
+fn tomlHasDotByte(text: string): bool {
+  let i = 0
+  while (i < len(text)) {
+    if (text[i] == '.') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// --- strings ---------------------------------------------------------------
+//
+// Always a basic string (this file's header). The escape set mirrors
+// `strings.bit`'s `simpleEscapeByte` exactly, in reverse, so every basic
+// string this file writes decodes back through that same closed set: `"`,
+// `\`, `\n`, `\t`, `\r`, backspace and form feed get their named escape;
+// any other byte `isTomlControlChar` (`lex.bit`) rejects raw becomes
+// `\u00XX`; everything else — every printable ASCII byte and every UTF-8
+// continuation byte of a multi-byte character — passes through unescaped,
+// since TOML basic strings are UTF-8 content, not `\uXXXX`-only like JSON.
+
+const tomlEncHexDigits: string = "0123456789abcdef"
+
+fn tomlEncUnicodeEscape(c: u8): string {
+  let out = []byte(2)
+  out[0] = tomlEncHexDigits[int(c >> 4)]
+  out[1] = tomlEncHexDigits[int(c & 0x0f)]
+  return "\\u00" + string(out)
+}
+
+fn encodeBasicString(s: string): string {
+  let b = newBuilder().write("\"")
+  let i = 0
+  while (i < len(s)) {
+    b = encodeBasicStringByte(b, s[i])
+    i = i + 1
+  }
+  b = b.write("\"")
+  return b.toString()
+}
+
+fn encodeBasicStringByte(b: Builder, c: u8): Builder {
+  if (c == '"') {
+    return b.write("\\\"")
+  }
+  if (c == '\\') {
+    return b.write("\\\\")
+  }
+  if (c == '\n') {
+    return b.write("\\n")
+  }
+  if (c == '\t') {
+    return b.write("\\t")
+  }
+  if (c == '\r') {
+    return b.write("\\r")
+  }
+  if (c == 8) { // backspace
+    return b.write("\\b")
+  }
+  if (c == 12) { // form feed
+    return b.write("\\f")
+  }
+  if (isTomlControlChar(c)) {
+    return b.write(tomlEncUnicodeEscape(c))
+  }
+  return b.writeByte(c)
+}
