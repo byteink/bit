@@ -1,0 +1,401 @@
+// pkg/yaml/flow.bit — yaml module, flow sequences and flow mappings, where
+// indentation stops mattering (#5495, epic #1482). `value.bit`, `scan.bit`
+// and `scalar.bit` are siblings in this same flat module (pkg/README.md);
+// `yamlParseFlow` is the one door a block-context parser (#5498, #5494)
+// drives once it sees a `FlowSeqStart`/`FlowMapStart` token — everything in
+// this file is unreachable from outside a `[`/`{`.
+//
+// A TRAILING COMMA IS PERMITTED (YAML 1.2.2 §7.4/§7.5: flow entries are
+// comma-separated, and the grammar's own `s-l+flow-in-block` production
+// allows the last entry's `,` before the closer). What is forbidden is an
+// EMPTY NODE ENTRY — a doubled comma (`[a,, b]`) or a leading one
+// (`[, a]`) — never a JSON/JSON5 rule to borrow from by analogy.
+// `flowAfterEntry` is the one place this is decided: a `,` immediately
+// followed by the closer is consumed as a legal trailing comma and closes
+// the collection right there; a `,` followed by anything else (including
+// another `,`) falls through to the ordinary `parseFlowNode` value check,
+// which is what actually rejects a doubled or leading comma (neither is a
+// valid flow value) — see `parseFlowNode`'s own comment.
+//
+// TYPES ARE NOT RESOLVED HERE, same boundary `scalar.bit` draws: every
+// scalar this file parses becomes a `Yaml.YamlString`, never `YamlBool`/
+// `YamlInt`/`YamlFloat` — that resolution is `pkg/yaml/schema.bit`'s job
+// (not yet written), not this file's.
+//
+// PLAIN SCALAR TERMINATION IS THE SCANNER'S JOB, NOT RE-CHECKED HERE.
+// `scan.bit`'s `scanPlainScalar` already stops a `PlainScalar` token at `,`,
+// `[`, `]`, `{`, `}` whenever `flowDepth > 0` (`isFlowStopperChar`), and at
+// the identical `:` boundary rule block context uses (`isColonBoundary`) —
+// so a `PlainScalar` token this file receives can never itself contain a raw
+// flow indicator; `yamlDecodeScalar` (scalar.bit) decodes whatever span it
+// is handed with no flow-awareness of its own, and needs none. An unquoted
+// attempt to write a flow indicator into what looks like a single scalar —
+// `[x[y]]`, intending the plain scalar `x[y]` — is what the scanner's rule
+// turns into a syntax error instead: `x` closes as its own token the moment
+// `[` is reached, leaving the parser looking at an unexpected `[` where a
+// `,` or the closer was required. See flow.test.bit's rejection test.
+//
+// NESTING DEPTH is `depth`, an explicit counter threaded through every
+// recursive call — never Bit's own call stack, which would turn a
+// pathologically deep `[[[[...` into a crash instead of a rejection
+// (`checkDepth`). `depth` starts wherever the caller's own block nesting
+// already stands (0 for a document that opens directly with `[`/`{`), so a
+// flow collection nested inside deep block content is bounded against the
+// SAME `limits.maxDepth` ceiling, combined — not a second, flow-only budget.
+// The scanner's own `flowDepth` (scan.bit) is a separate, narrower guard
+// (bracket count alone, no block depth) that already protects `scanNext`
+// itself; this file's counter is the one that sees the whole picture.
+//
+// TOTAL NODE COUNT is `FlowCtx.nodes`, incremented by `chargeNode` for every
+// `Yaml` value this file builds — leaf scalars, `YamlNull`, and each
+// sequence/mapping itself — and checked against `limits.maxTotalNodes` on
+// every charge, so a wide flow collection (many siblings, no extra depth) is
+// bounded exactly like a deep one.
+//
+// PERFORMANCE. This file drives `scanNext` exclusively, never `scan` — a
+// parse never materializes `[]Token`, matching scan.bit's own two-entry-point
+// design (that file's header explains the allocation this avoids).
+
+// Bundles the scanner cursor, the budget, and the running node count that
+// `chargeNode` mutates across every recursive call inside one top-level
+// `yamlParseFlow` invocation. Not exported: only this file's functions drive
+// it.
+class FlowCtx { s: Scanner, limits: YamlLimits, nodes: i64 }
+
+fn newFlowCtx(s: Scanner, limits: YamlLimits): FlowCtx {
+  return FlowCtx{ s: s, limits: limits, nodes: 0 }
+}
+
+// This file's own error convention, matching scalar.bit's `scalarError`: a
+// message plus the byte offset it happened at.
+fn flowError(msg: string, offset: int): error {
+  return newError("${msg} at byte ${offset}")
+}
+
+// Charges one more built `Yaml` node against `limits.maxTotalNodes`, failing
+// once the running count exceeds it — checked on every call, so a wide
+// collection is rejected as soon as its width crosses the budget rather than
+// after every element has already been materialized.
+fn chargeNode(ctx: FlowCtx, offset: int): ()! {
+  ctx.nodes = ctx.nodes + 1
+  if (ctx.nodes > ctx.limits.maxTotalNodes) {
+    fail flowError("yaml: too many nodes: maxTotalNodes exceeded", offset)
+  }
+}
+
+// Rejects the collection about to open at `depth` (its own nesting level,
+// zero-based) once it would reach `limits.maxDepth` — an explicit counter,
+// not Bit's call stack (this file's header).
+fn checkDepth(ctx: FlowCtx, depth: i64, offset: int): ()! {
+  if (depth >= ctx.limits.maxDepth) {
+    fail flowError("yaml: nesting exceeds maxDepth", offset)
+  }
+}
+
+// --- key equality, for duplicate-key detection --------------------------
+
+// Structural equality between two `Yaml` values, used only to detect a
+// repeated flow-mapping key (`YamlEntry.key` is a full `Yaml`, not a
+// `string` — value.bit's own header — so a non-scalar key like `[a,b]`
+// needs real comparison, not a string match). Split one arm per function to
+// keep `yamlEqual` itself under the complexity ceiling (E0204); mapping
+// equality is by source-order entries, not as an unordered set — the
+// simplest structural rule that still catches the duplicate shapes this
+// file's own callers can produce.
+fn yamlEqual(a: Yaml, b: Yaml): bool {
+  match (a) {
+    YamlNull => return yamlIsNull(b)
+    YamlBool(x) => return yamlEqualBool(x, b)
+    YamlInt(x) => return yamlEqualInt(x, b)
+    YamlFloat(x) => return yamlEqualFloat(x, b)
+    YamlString(x) => return yamlEqualString(x, b)
+    YamlSequence(x) => return yamlEqualSequence(x, b)
+    YamlMapping(x) => return yamlEqualMapping(x, b)
+  }
+}
+
+fn yamlEqualBool(x: bool, b: Yaml): bool {
+  match (yamlAsBool(b)) {
+    Some(y) => return x == y
+    None => return false
+  }
+}
+
+fn yamlEqualInt(x: i64, b: Yaml): bool {
+  match (yamlAsInt(b)) {
+    Some(y) => return x == y
+    None => return false
+  }
+}
+
+fn yamlEqualFloat(x: f64, b: Yaml): bool {
+  match (yamlAsFloat(b)) {
+    Some(y) => return x == y
+    None => return false
+  }
+}
+
+fn yamlEqualString(x: string, b: Yaml): bool {
+  match (yamlAsString(b)) {
+    Some(y) => return x == y
+    None => return false
+  }
+}
+
+fn yamlEqualItems(x: []Yaml, y: []Yaml): bool {
+  if (len(x) != len(y)) {
+    return false
+  }
+  let i = 0
+  while (i < len(x)) {
+    if (!yamlEqual(x[i], y[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn yamlEqualSequence(x: []Yaml, b: Yaml): bool {
+  match (yamlAsSequence(b)) {
+    None => return false
+    Some(y) => return yamlEqualItems(x, y)
+  }
+}
+
+fn yamlEqualEntries(x: []YamlEntry, y: []YamlEntry): bool {
+  if (len(x) != len(y)) {
+    return false
+  }
+  let i = 0
+  while (i < len(x)) {
+    if (!yamlEqual(x[i].key, y[i].key) || !yamlEqual(x[i].value, y[i].value)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn yamlEqualMapping(x: []YamlEntry, b: Yaml): bool {
+  match (yamlAsMapping(b)) {
+    None => return false
+    Some(y) => return yamlEqualEntries(x, y)
+  }
+}
+
+fn flowKeyPresent(entries: []YamlEntry, key: Yaml): bool {
+  let i = 0
+  while (i < len(entries)) {
+    if (yamlEqual(entries[i].key, key)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// --- one flow value, scalar or nested collection -------------------------
+
+fn parseFlowScalar(ctx: FlowCtx): Yaml! {
+  let start = ctx.s.start
+  let text = yamlDecodeScalar(ctx.s.src, ctx.s.kind, ctx.s.start, ctx.s.end)?
+  scanNext(ctx.s)
+  chargeNode(ctx, start)?
+  return Yaml.YamlString(text)
+}
+
+// Any single flow value at the current token: a nested `[`/`{` collection
+// (recursing at `depth + 1`) or a scalar. Anything else — the collection's
+// own closer, a stray `,`, an `Invalid` token, `Eof` — is not a value; this
+// is the one place that rejection fires, which is what actually rejects a
+// doubled or leading comma (`flowAfterEntry` already accepted a true
+// trailing comma before this function is ever reached again — this file's
+// header).
+fn parseFlowNode(ctx: FlowCtx, depth: i64): Yaml! {
+  if (ctx.s.kind == TokenKind.FlowSeqStart || ctx.s.kind == TokenKind.FlowMapStart) {
+    return parseFlowCollection(ctx, depth + 1)?
+  }
+  let k = ctx.s.kind
+  if (k == TokenKind.PlainScalar || k == TokenKind.SingleQuoted || k == TokenKind.DoubleQuoted) {
+    return parseFlowScalar(ctx)?
+  }
+  fail flowError("yaml: expected a flow value", ctx.s.start)
+}
+
+// The value half of a `key: value` entry, where the value may be omitted —
+// `{a: }` is `{a: null}` exactly like `{a}` (ticket): a terminator token
+// right after the `:` means "no value", not "parse whatever comes next".
+fn parseFlowValueOrNull(ctx: FlowCtx, depth: i64): Yaml! {
+  let k = ctx.s.kind
+  if (k == TokenKind.FlowEntry || k == TokenKind.FlowSeqEnd || k == TokenKind.FlowMapEnd) {
+    chargeNode(ctx, ctx.s.start)?
+    return Yaml.YamlNull
+  }
+  return parseFlowNode(ctx, depth)?
+}
+
+// --- shared close/comma handling ------------------------------------------
+
+// After one entry: `closeKind` alone closes the collection. A `,` is
+// consumed either way; if `closeKind` immediately follows, that `,` was a
+// legal trailing comma and the collection closes right here — otherwise the
+// loop continues to the next entry, and `parseFlowNode` is what rejects a
+// `,` followed by another `,` (or by nothing parseable at all) as an empty
+// node entry (this file's header). Anything else after an entry, with no
+// `,` at all, is a syntax error.
+fn flowAfterEntry(ctx: FlowCtx, closeKind: TokenKind): bool! {
+  if (ctx.s.kind == closeKind) {
+    scanNext(ctx.s)
+    return true
+  }
+  if (ctx.s.kind == TokenKind.FlowEntry) {
+    scanNext(ctx.s)
+    if (ctx.s.kind == closeKind) {
+      scanNext(ctx.s)
+      return true
+    }
+    return false
+  }
+  fail flowError("yaml: expected ',' or closing bracket in flow collection", ctx.s.start)
+}
+
+// A loop bound on entry count: every iteration of a flow sequence/mapping
+// loop consumes at least one source byte (flow context never emits a
+// zero-width token — Indent/Dedent are suppressed whenever flowDepth > 0,
+// scan.bit's own header), so remaining source bytes is a generous, provable
+// ceiling on remaining iterations.
+fn flowLoopBound(ctx: FlowCtx): int {
+  return ctx.s.srcLen + 4
+}
+
+// --- flow sequence ---------------------------------------------------------
+
+// One `[...]` entry: a bare flow value, or a `key: value` / `? key [: value]`
+// pair, which becomes a single-entry `YamlMapping` (`[a: 1]` is a sequence
+// holding one mapping — ticket). `?` is legal here exactly as in a flow
+// mapping entry; sharing the same shape is why `parseFlowMapEntry` (below)
+// and this function both start with the same explicit-key check.
+fn parseFlowSeqEntry(ctx: FlowCtx, depth: i64): Yaml! {
+  let entryStart = ctx.s.start
+  let explicit = ctx.s.kind == TokenKind.KeyIndicator
+  if (explicit) {
+    scanNext(ctx.s)
+  }
+  let first = parseFlowNode(ctx, depth)?
+  if (ctx.s.kind == TokenKind.ValueIndicator) {
+    scanNext(ctx.s)
+    let value = parseFlowValueOrNull(ctx, depth)?
+    chargeNode(ctx, entryStart)?
+    return Yaml.YamlMapping([YamlEntry{ key: first, value: value }])
+  }
+  if (explicit) {
+    chargeNode(ctx, entryStart)?
+    return Yaml.YamlMapping([YamlEntry{ key: first, value: Yaml.YamlNull }])
+  }
+  return first
+}
+
+fn parseFlowSeq(ctx: FlowCtx, depth: i64): Yaml! {
+  let start = ctx.s.start
+  scanNext(ctx.s)
+  if (ctx.s.kind == TokenKind.FlowSeqEnd) {
+    scanNext(ctx.s)
+    chargeNode(ctx, start)?
+    return Yaml.YamlSequence([]Yaml(0))
+  }
+  let items = []Yaml(0)
+  let guard = 0
+  let bound = flowLoopBound(ctx)
+  while (guard <= bound) {
+    guard = guard + 1
+    let item = parseFlowSeqEntry(ctx, depth)?
+    items = append(items, item)
+    let closed = flowAfterEntry(ctx, TokenKind.FlowSeqEnd)?
+    if (closed) {
+      chargeNode(ctx, start)?
+      return Yaml.YamlSequence(items)
+    }
+  }
+  fail flowError("yaml: unterminated flow sequence", start)
+}
+
+// --- flow mapping ------------------------------------------------------
+
+// The result of parsing one `{...}` entry: the entry itself, plus the byte
+// offset its key started at — needed for the duplicate-key error, which
+// must name the REPEATED key's own position, not the mapping's.
+class FlowMapEntryOut { entry: YamlEntry, keyStart: int }
+
+// One `{...}` entry: `? key [: value]` or `key [: value]`, where a missing
+// `:` means an implicit null value (`{a}` is `{a: null}` — ticket) rather
+// than the bare-node-only shape a flow sequence entry allows.
+fn parseFlowMapEntry(ctx: FlowCtx, depth: i64): FlowMapEntryOut! {
+  let keyStart = ctx.s.start
+  let explicit = ctx.s.kind == TokenKind.KeyIndicator
+  if (explicit) {
+    scanNext(ctx.s)
+  }
+  let key = parseFlowNode(ctx, depth)?
+  let value = Yaml.YamlNull
+  if (ctx.s.kind == TokenKind.ValueIndicator) {
+    scanNext(ctx.s)
+    value = parseFlowValueOrNull(ctx, depth)?
+  } else {
+    chargeNode(ctx, keyStart)?
+  }
+  return FlowMapEntryOut{ entry: YamlEntry{ key: key, value: value }, keyStart: keyStart }
+}
+
+fn parseFlowMap(ctx: FlowCtx, depth: i64): Yaml! {
+  let start = ctx.s.start
+  scanNext(ctx.s)
+  if (ctx.s.kind == TokenKind.FlowMapEnd) {
+    scanNext(ctx.s)
+    chargeNode(ctx, start)?
+    return Yaml.YamlMapping([]YamlEntry(0))
+  }
+  let entries = []YamlEntry(0)
+  let guard = 0
+  let bound = flowLoopBound(ctx)
+  while (guard <= bound) {
+    guard = guard + 1
+    let out = parseFlowMapEntry(ctx, depth)?
+    if (flowKeyPresent(entries, out.entry.key)) {
+      fail flowError("yaml: duplicate key in flow mapping", out.keyStart)
+    }
+    entries = append(entries, out.entry)
+    let closed = flowAfterEntry(ctx, TokenKind.FlowMapEnd)?
+    if (closed) {
+      chargeNode(ctx, start)?
+      return Yaml.YamlMapping(entries)
+    }
+  }
+  fail flowError("yaml: unterminated flow mapping", start)
+}
+
+// --- entry point -----------------------------------------------------
+
+fn parseFlowCollection(ctx: FlowCtx, depth: i64): Yaml! {
+  checkDepth(ctx, depth, ctx.s.start)?
+  if (ctx.s.kind == TokenKind.FlowSeqStart) {
+    return parseFlowSeq(ctx, depth)?
+  }
+  if (ctx.s.kind == TokenKind.FlowMapStart) {
+    return parseFlowMap(ctx, depth)?
+  }
+  fail flowError("yaml: not a flow collection", ctx.s.start)
+}
+
+// Parses one flow sequence or flow mapping starting at `s`'s CURRENT token
+// (`FlowSeqStart` or `FlowMapStart`, already produced by the caller's own
+// `scanNext` — the same "peeked, not yet consumed" convention
+// `stdlib/json/parse.bit`'s `parseObject`/`parseArray` use), leaving `s`
+// positioned on the token right after the collection's closing bracket.
+// `depth` is the nesting level this collection itself opens at (0 for a
+// flow collection reached directly from a document's top level); `limits`
+// is read for both `maxDepth` and `maxTotalNodes`, never a second budget.
+export fn yamlParseFlow(s: Scanner, limits: YamlLimits, depth: i64): Yaml! {
+  let ctx = newFlowCtx(s, limits)
+  return parseFlowCollection(ctx, depth)?
+}
