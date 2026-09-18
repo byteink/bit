@@ -25,7 +25,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)      # pkg/toml/bench
 PKG=$(cd "$HERE/.." && pwd)              # pkg/toml
 REPO=$(cd "$HERE/../../.." && pwd)       # repo root
 BIT=${BIT:-$REPO/bit-out/bin/bit}
-GO_IMAGE=${GO_IMAGE:-golang:1.25}
+# Same env var name and same default tag as pkg/yaml/bench/run.sh (#5559):
+# two sibling harnesses publishing Go-comparison numbers on two different Go
+# toolchains cannot be read against each other.
+GO_IMAGE=${BENCH_GO_IMAGE:-golang:1.25}
 FIXTURE=$HERE/data/fixture.toml
 RUNS=15                                  # timed runs per side; see trimmean() below
 MODE=${1:-full}
@@ -39,7 +42,13 @@ HOST_GOARCH=arm64
 case "$(uname -s)" in Linux) HOST_GOOS=linux ;; esac
 case "$(uname -m)" in x86_64) HOST_GOARCH=amd64 ;; esac
 
-mkdir -p "$HERE/out/bin" "$HERE/out/cache/go" "$HERE/out/cache/gomod"
+# Outside the repo tree on purpose (#5559): Go writes module-cache files
+# mode 0444, and a cache under $HERE survives into `git worktree remove`
+# which then fails with Permission denied. BENCH_CACHE_DIR overrides it;
+# the default lives under $TMPDIR, per-package so pkg/yaml/bench's own
+# cache (same default base) never collides with this one.
+CACHE_DIR=${BENCH_CACHE_DIR:-${TMPDIR:-/tmp}/bit-bench-gomod/toml}
+mkdir -p "$HERE/out/bin" "$CACHE_DIR/go" "$CACHE_DIR/gomod"
 
 say() { printf '%s\n' "$*"; }
 
@@ -54,26 +63,30 @@ build_bit() {
   BIT_REPO="$REPO" "$BIT" build "$HERE/apps/bit/main.bit" -o "$HERE/out/bin/bitbench"
 }
 
-# build_go <dir> <module> <out-name>. GOFLAGS=-mod=mod because go.mod ships
-# bare (no require lines, matching pkg/web/bench/apps/gin/go.mod's own
-# precedent) and `go get ... @latest` fills them in fresh every run, rather
-# than pinning a competitor's version this package does not control.
+# build_go <dir> <out-name>. Pinned, not `go get ... @latest` (#5559):
+# pkg/web/bench/apps/gin/go.mod's bare-go.mod precedent was considered and
+# rejected here, in favour of matching pkg/yaml/bench (#5501), which already
+# committed go.mod + go.sum pinning its two competitors - two sibling
+# harnesses need one policy, and a published figure that cannot be
+# reproduced next month is worse than no figure. GOFLAGS=-mod=readonly so a
+# `go.{mod,sum}` drifted from its committed pin fails loudly instead of
+# silently rewriting itself.
 build_go() {
-  local dir=$1 module=$2 out=$3
+  local dir=$1 out=$2
   docker run --rm \
     -v "$HERE/apps/$dir:/src" \
-    -v "$HERE/out/cache/go:/gocache" -v "$HERE/out/cache/gomod:/gomod" \
-    -w /src -e GOCACHE=/gocache -e GOMODCACHE=/gomod -e GOFLAGS=-mod=mod \
+    -v "$CACHE_DIR/go:/gocache" -v "$CACHE_DIR/gomod:/gomod" \
+    -w /src -e GOCACHE=/gocache -e GOMODCACHE=/gomod -e GOFLAGS=-mod=readonly \
     -e GOOS="$HOST_GOOS" -e GOARCH="$HOST_GOARCH" -e CGO_ENABLED=0 \
-    "$GO_IMAGE" sh -c "go get $module@latest && go mod tidy && go build -o /src/$out ."
+    "$GO_IMAGE" go build -o "/src/$out" .
   cp "$HERE/apps/$dir/$out" "$HERE/out/bin/$out"
-  # `go mod tidy` just wrote a resolved `require` line into the committed,
-  # deliberately bare go.mod (matching pkg/web/bench/apps/gin/go.mod's own
-  # precedent: never pin a competitor's version this package does not
-  # control). Restored from HEAD so a `run.sh` invocation never leaves the
-  # tree dirty; go.sum is untracked (bench/.gitignore) so it needs no such
-  # restore.
-  git -C "$REPO" checkout -- "pkg/toml/bench/apps/$dir/go.mod" 2>/dev/null || true
+}
+
+# Reads the pinned version straight out of the committed go.mod - the same
+# value `go build` just built against, not a value resolved separately that
+# could drift from it.
+pinned_version() {
+  awk '/^require /{print $3}' "$HERE/apps/$1/go.mod"
 }
 
 # ---------------------------------------------------------------- verify
@@ -147,14 +160,16 @@ measure() {
 # ---------------------------------------------------------------- render
 
 publish() {
-  local commit stamp bitver goversion host
+  local commit stamp bitver goversion host bsver gtver
   commit=$(git -C "$REPO" rev-parse --short=8 HEAD 2>/dev/null || echo "?")
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   bitver=$("$BIT" --version 2>&1)
   goversion=$(docker run --rm "$GO_IMAGE" go version 2>&1)
   host=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
+  bsver=$(pinned_version burntsushi)
+  gtver=$(pinned_version gotoml)
   local md=$HERE/out/block.md
-  python3 "$HERE/report.py" "$HERE/out" "$FIXTURE" "$commit" "$stamp" "$bitver" "$goversion" "$host" "$RUNS" > "$md"
+  python3 "$HERE/report.py" "$HERE/out" "$FIXTURE" "$commit" "$stamp" "$bitver" "$goversion" "$host" "$RUNS" "$bsver" "$gtver" > "$md"
   python3 - "$PKG/README.md" "$md" <<'PY'
 import sys
 readme, block = sys.argv[1], sys.argv[2]
@@ -179,15 +194,15 @@ case $MODE in
     ;;
   --verify-only)
     build_bit
-    build_go burntsushi github.com/BurntSushi/toml burntsushibench
-    build_go gotoml github.com/pelletier/go-toml/v2 gotomlbench
+    build_go burntsushi burntsushibench
+    build_go gotoml gotomlbench
     verify
     say "verify-only: stopping before the timed measurement"
     ;;
   full|"")
     build_bit
-    build_go burntsushi github.com/BurntSushi/toml burntsushibench
-    build_go gotoml github.com/pelletier/go-toml/v2 gotomlbench
+    build_go burntsushi burntsushibench
+    build_go gotoml gotomlbench
     verify
     measure
     publish

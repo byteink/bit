@@ -12,10 +12,28 @@ between the `BENCH` markers: pkg/yaml against `github.com/goccy/go-yaml` and
 
 Runs entirely on the developer machine, no remote host: `bit` is built once
 by `./make selfhost` and run natively; the two Go competitors are
-cross-compiled for this host's OS/arch inside a throwaway `golang` docker
-container (`CGO_ENABLED=0`, both are pure Go, so no cgo toolchain is needed)
-and then also run natively - Go is never installed on the machine itself.
-`BENCH_RUNS` overrides the run count (default 15).
+cross-compiled for this host's OS/arch inside a throwaway
+`${BENCH_GO_IMAGE:-golang:1.25}` docker container (`CGO_ENABLED=0`, both are
+pure Go, so no cgo toolchain is needed) and then also run natively - Go is
+never installed on the machine itself. `BENCH_RUNS` overrides the run count
+(default 15).
+
+## Versioning policy
+
+Both competitors are pinned: `apps/yamlv3/go.{mod,sum}` and
+`apps/goccy/go.{mod,sum}` are committed, and `build_go` never runs `go get`
+at build time. This matches the policy `pkg/toml/bench` (#5488) was
+converted to, not `pkg/web/bench/apps/gin`'s bare `go.mod`: a published
+figure that cannot be reproduced next month, against whatever goccy/go-yaml
+or yaml.v3 happened to resolve to on the day it ran, is worse than no figure
+(#5559). The pinned version is read back out of `go.mod` and published in
+the block's `Versions:` line, never resolved separately from what was
+actually built. Bumping either pin is a deliberate, reviewed change to this
+repo, the same as any other dependency version bump.
+
+The Go image is `${BENCH_GO_IMAGE:-golang:1.25}` - same env var name and
+same default tag as `pkg/toml/bench/run.sh`, so the two sibling harnesses'
+Go-comparison numbers are read against the same toolchain (#5559).
 
 ## What is compared, and what is not
 
@@ -61,3 +79,9 @@ resident set size. The checksum computation runs inside the timed region on
 every side (not just the untimed `--verify` proof), so all three are timed on
 comparable work rather than the Go sides being penalized for an extra pass
 Bit's own driver does not pay.
+
+`out/` is generated and gitignored. The Go build/module caches live outside
+the repo tree entirely - `${BENCH_CACHE_DIR:-$TMPDIR/bit-bench-gomod/yaml}` -
+because Go writes module-cache files mode 0444, and a cache under `out/`
+survives into `git worktree remove`, which then fails with Permission
+denied (#5559).
