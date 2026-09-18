@@ -64,3 +64,33 @@ The cache is per connection, never shared, evicts least-recently-used,
 closes what it evicts, and dies with the connection. A statement is
 remembered only after the server has actually parsed it: a Parse in a batch
 that then failed was rolled back with its implicit transaction.
+
+## Transactions
+
+Moving money between two rows needs both updates to land or neither. `tx`
+runs a block on one pooled connection and ends it for you - `COMMIT` when
+the block returns, `ROLLBACK` on any failure or panic - with the connection
+back in the pool either way:
+
+```bit
+fn transferCents(db: Pool, fromId: string, toId: string, cents: int): ()! {
+  db.tx((t) => {
+    t.exec(
+      "update accounts set balance = balance - $1 where id = $2",
+      []Value{
+        Value.Int(cents), Value.Text(fromId),
+      },
+    )?
+    t.exec(
+      "update accounts set balance = balance + $1 where id = $2",
+      []Value{
+        Value.Int(cents), Value.Text(toId),
+      },
+    )?
+  })?
+}
+```
+
+`Conn.begin` sends plain `BEGIN`; `commit`/`rollback` send `COMMIT`/
+`ROLLBACK` on that same connection. Isolation levels are `std/sql`'s own
+job (`db.txAt`), not a statement this driver builds itself.
