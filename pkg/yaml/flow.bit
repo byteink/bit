@@ -73,10 +73,16 @@ class FlowCtx {
   limits: YamlLimits,
   nodes: i64,
   resolver: (string, ScalarStyle) => Yaml,
+  anchors: AnchorTable,
 }
 
-fn newFlowCtx(s: Scanner, limits: YamlLimits, resolver: (string, ScalarStyle) => Yaml): FlowCtx {
-  return FlowCtx{ s: s, limits: limits, nodes: 0, resolver: resolver }
+fn newFlowCtx(
+  s: Scanner,
+  limits: YamlLimits,
+  resolver: (string, ScalarStyle) => Yaml,
+  anchors: AnchorTable,
+): FlowCtx {
+  return FlowCtx{ s: s, limits: limits, nodes: 0, resolver: resolver, anchors: anchors }
 }
 
 // This file's own error convention, matching scalar.bit's `scalarError`: a
@@ -166,7 +172,7 @@ fn advanceFlow(ctx: FlowCtx) {
 // simplest structural rule that still catches the duplicate shapes this
 // file's own callers can produce.
 fn yamlEqual(a: Yaml, b: Yaml): bool {
-  match (a) {
+  match (yamlUndecorated(a)) {
     YamlNull => return yamlIsNull(b)
     YamlBool(x) => return yamlEqualBool(x, b)
     YamlInt(x) => return yamlEqualInt(x, b)
@@ -174,6 +180,7 @@ fn yamlEqual(a: Yaml, b: Yaml): bool {
     YamlString(x) => return yamlEqualString(x, b)
     YamlSequence(x) => return yamlEqualSequence(x, b)
     YamlMapping(x) => return yamlEqualMapping(x, b)
+    YamlDecorated(_, _) => panic("yaml: internal: yamlUndecorated leaked a YamlDecorated")
   }
 }
 
@@ -321,36 +328,6 @@ fn parseFlowScalar(ctx: FlowCtx): Yaml! {
   return finishFlowScalar(ctx, kind, start, end)?
 }
 
-// Optional `&anchor`/`!tag` properties directly prefixing a flow value,
-// either order (the core grammar allows both — YAML 1.2.2 §8.2). Consumed,
-// never registered: `FlowCtx` carries no `AnchorTable` (this file's own
-// header names exactly what it does carry — the scan cursor, the budget,
-// the resolver — an anchor table is none of those), so a nested flow
-// anchor is dropped exactly like this package's own tag policy already
-// drops a tag elsewhere (`corpusExclusionsExplicitTagType`'s own comment,
-// pkg/yaml/corpus.test.bit: "this file's tag handling treats every tag
-// identically — consumed and ignored"). No fixture in this file's own scope
-// aliases a flow-defined anchor, so no resolution is lost by dropping it.
-// Returns whether a tag was seen: an explicitly tagged node with no scalar
-// or collection following it (`{ foo: !!str }`, tag directly against a
-// terminator) resolves to an empty STRING, never `YamlNull` — the same
-// "explicit form is never plain-typed" rule `schema.bit`'s own
-// `yamlResolveScalar` already applies to an explicitly quoted empty scalar,
-// generalized to any explicit tag rather than one specific tag name.
-fn consumeFlowNodeProperties(ctx: FlowCtx): bool {
-  let sawTag = false
-  let guard = 0
-  let bound = flowLoopBound(ctx)
-  while ((ctx.s.kind == TokenKind.Anchor || ctx.s.kind == TokenKind.Tag) && guard <= bound) {
-    if (ctx.s.kind == TokenKind.Tag) {
-      sawTag = true
-    }
-    advanceFlow(ctx)
-    guard = guard + 1
-  }
-  return sawTag
-}
-
 // A flow scalar's first byte reserves `-`/`?`/`:` for ambiguity with a
 // block construct (YAML 1.2.2 §7.3.3's `ns-plain-first` exception list):
 // each is a legal plain-scalar start only when NOT immediately followed by
@@ -372,26 +349,43 @@ fn isBareDashIndicator(ctx: FlowCtx): bool {
 // doubled or leading comma (`flowAfterEntry` already accepted a true
 // trailing comma before this function is ever reached again — this file's
 // header).
+// A scalar value at the current token — plain, single- or double-quoted —
+// decorated with whatever properties `parseFlowNode` already consumed.
+// Split out purely to keep that function's cyclomatic complexity under
+// spec/LINT.md's ceiling.
+fn parseFlowScalarValue(ctx: FlowCtx, props: PendingProps): Yaml! {
+  if (isBareDashIndicator(ctx)) {
+    fail flowError(
+      "yaml: a bare '-' is reserved for the block sequence indicator, not a plain scalar",
+      ctx.s.start,
+    )
+  }
+  let scalar = parseFlowScalar(ctx)?
+  return applyFlowAnchor(ctx, props, scalar)?
+}
+
 fn parseFlowNode(ctx: FlowCtx, depth: i64): Yaml! {
-  let sawTag = consumeFlowNodeProperties(ctx)
+  let props = consumeFlowNodeProperties(ctx)
+  if (ctx.s.kind == TokenKind.Alias) {
+    if (isSome(props.anchor) || isSome(props.tag)) {
+      fail flowError("yaml: an alias node cannot carry an anchor or tag property", ctx.s.start)
+    }
+    return parseFlowAlias(ctx)?
+  }
   if (ctx.s.kind == TokenKind.FlowSeqStart || ctx.s.kind == TokenKind.FlowMapStart) {
-    return parseFlowCollection(ctx, depth + 1)?
+    let collection = parseFlowCollection(ctx, depth + 1)?
+    return applyFlowAnchor(ctx, props, collection)?
   }
   if (ctx.s.kind == TokenKind.PlainScalar) {
-    if (isBareDashIndicator(ctx)) {
-      fail flowError(
-        "yaml: a bare '-' is reserved for the block sequence indicator, not a plain scalar",
-        ctx.s.start,
-      )
-    }
-    return parseFlowScalar(ctx)?
+    return parseFlowScalarValue(ctx, props)?
   }
   if (ctx.s.kind == TokenKind.SingleQuoted || ctx.s.kind == TokenKind.DoubleQuoted) {
-    return parseFlowScalar(ctx)?
+    let quoted = parseFlowScalar(ctx)?
+    return applyFlowAnchor(ctx, props, quoted)?
   }
-  if (sawTag) {
+  if (isSome(props.tag)) {
     chargeNode(ctx, ctx.s.start)?
-    return ctx.resolver("", ScalarStyle.Quoted)
+    return applyFlowAnchor(ctx, props, ctx.resolver("", ScalarStyle.Quoted))?
   }
   fail flowError("yaml: expected a flow value", ctx.s.start)
 }
@@ -763,7 +757,8 @@ fn yamlParseFlow(
   limits: YamlLimits,
   depth: i64,
   resolver: (string, ScalarStyle) => Yaml,
+  anchors: AnchorTable,
 ): Yaml! {
-  let ctx = newFlowCtx(s, limits, resolver)
+  let ctx = newFlowCtx(s, limits, resolver, anchors)
   return parseFlowCollection(ctx, depth)?
 }

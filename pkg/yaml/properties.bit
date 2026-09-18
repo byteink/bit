@@ -8,10 +8,33 @@
 
 // --- node properties: anchor and tag prefixes -----------------------------
 
-// `&name` and/or `!tag`, in either order, before a node. Tags are consumed
-// and otherwise ignored — the epic forbids type-tag-driven construction, so
-// this file has no notion of tag-driven typing to wire up. Bounded to two
-// iterations: YAML permits at most one anchor and one tag per node.
+// A raw `!...` tag token span resolved to the text `test.event`/every other
+// implementation displays it with (#5555): `!` alone (the non-specific tag,
+// YAML 1.2.2 §6.9.1.1) stays `!`; `!!name` (the secondary `!!` handle,
+// §6.8.2.2 — the only handle this package pre-declares, since it declares no
+// `%TAG` directive handling of its own, #5498's own scope) expands to the
+// `tag:yaml.org,2002:` prefix; any other `!name` (the primary handle) or
+// `!<...>` (already a full URI, `scanVerbatimTag`, scan.bit) is carried
+// through exactly as scanned — there is no declared handle to expand it
+// against. Never used to choose a type (this file's header, epic #1482):
+// purely a display/round-trip transform on text a caller may read.
+fn resolveTagText(raw: string): string {
+  if (raw == "!") {
+    return "!"
+  }
+  if (len(raw) >= 2 && raw[0] == '!' && raw[1] == '!') {
+    return "tag:yaml.org,2002:${raw[2:len(raw)]}"
+  }
+  return raw
+}
+
+// `&name` and/or `!tag`, in either order, before a node. Tag text is
+// captured (`resolveTagText`) as DATA a caller may read via
+// `yamlDecorationOf` (value.bit) — never as a dispatch key: `yamlResolve`/
+// `yamlResolveScalar` (schema.bit) still decide a scalar's type from its own
+// spelling under the YAML 1.2 core schema alone, epic #1482's own
+// constraint, untouched by this. Bounded to two iterations: YAML permits at
+// most one anchor and one tag per node.
 //
 // `indent` is the column a SECOND property (the tag after an anchor, or
 // vice versa) must clear once it starts a fresh line — the first property
@@ -28,8 +51,13 @@
 // Also returns `prevEnd`, the last property's end — no token alone tells
 // "same line" from "merely precedes" (3R3P: `&sequence\n- a`, same column,
 // no `Indent`, yet two lines; only raw `hasLineBreak` knows).
-fn consumeNodeProperties(p: Parser, indent: i64, descended: bool): (Option<string>, i64)! {
+fn consumeNodeProperties(
+  p: Parser,
+  indent: i64,
+  descended: bool,
+): (Option<string>, Option<string>, i64)! {
   let anchorName = Option<string>.None
+  let tagText = Option<string>.None
   let i = 0
   let prevEnd = p.s.start
   while (i < 2) {
@@ -45,30 +73,47 @@ fn consumeNodeProperties(p: Parser, indent: i64, descended: bool): (Option<strin
       }
       if (p.s.kind == TokenKind.Anchor) {
         anchorName = Option<string>.Some(p.src[p.s.start + 1:p.s.end])
+      } else {
+        tagText = Option<string>.Some(resolveTagText(p.src[p.s.start:p.s.end]))
       }
       prevEnd = p.s.end
       advance(p)
     } else {
-      return (anchorName, prevEnd)
+      return (anchorName, tagText, prevEnd)
     }
     i = i + 1
   }
-  return (anchorName, prevEnd)
+  return (anchorName, tagText, prevEnd)
 }
 
-// Defines `name` (when present) against `value` and returns `value`
-// unchanged — the tail every `parseBlockNode` exit path shares, whether the
-// node's own properties were consumed right here or one recursive level
-// down (`parseBlockNode`'s own `Indent` branch).
-fn applyAnchor(p: Parser, name: Option<string>, value: Yaml): Yaml! {
-  match (name) {
+// An anchor name and/or tag text pending application to whatever node is
+// dispatched next — bundled into one value so `DispatchCtx`/
+// `parseScalarOrMapping`/`parseFlowOrMapping` each carry one field instead
+// of two, keeping every one of them under spec/LINT.md's max-param ceiling.
+class PendingProps { anchor: Option<string>, tag: Option<string> }
+
+fn noPendingProps(): PendingProps {
+  return PendingProps{ anchor: Option<string>.None, tag: Option<string>.None }
+}
+
+// Defines `name` (when present) against the PLAIN, undecorated `value` and
+// returns `value` decorated with `name`/`tag` (value.bit's `yamlDecorate`,
+// a no-op when both are `None`) — the tail every `parseBlockNode` exit path
+// shares, whether the node's own properties were consumed right here or one
+// recursive level down (`parseBlockNode`'s own `Indent` branch). The anchor
+// TABLE always stores the plain value, never a decorated one: a later alias
+// must be free to wrap it as its OWN `alias` decoration
+// (`resolveAliasToken` below) rather than inheriting this node's `anchor`/
+// `tag` (value.bit's header: the two are mutually exclusive per node).
+fn applyAnchor(p: Parser, props: PendingProps, value: Yaml): Yaml! {
+  match (props.anchor) {
     Some(n) => {
       chargeBlockNode(p, p.s.start)?
       yamlAnchorDefine(p.anchors, n, value)?
     }
     None => {}
   }
-  return value
+  return yamlDecorate(value, props.anchor, props.tag, Option<string>.None)
 }
 
 // §8.2.3: a sequence needs a comment-only rest of line after properties —
@@ -106,7 +151,20 @@ fn rejectAnchorMisplaced(p: Parser, far: Option<string>, here: Option<string>, e
 // own `prevEnd`), the FINAL line's own column, and whether the chain ever
 // found a SECOND line's worth of properties at all (`parseBlockNode`
 // dispatches differently either way, same as before this function existed).
-class PropertyChain { names: []string, lastEnd: i64, col: i64, descended: bool }
+// `tag` is the LAST tag text seen across the chain (`None` when none was):
+// valid YAML carries at most one tag per node, and this file's own scope
+// (#5555) is the single-line, single-node case those anchor/tag ids need —
+// a tag on an OUTER chain level, several property-only lines up from the
+// node it actually decorates, is left uncaptured here exactly as before
+// this ticket (`applyAnchor`'s own tag-consuming call sites below are all
+// same-line).
+class PropertyChain {
+  names: []string,
+  tag: Option<string>,
+  lastEnd: i64,
+  col: i64,
+  descended: bool,
+}
 
 // Chases a node's own `&anchor`/`!tag` prefix across every property-only
 // LINE it spans, not just one: `consumeNodeProperties` reads at most one
@@ -132,13 +190,14 @@ class PropertyChain { names: []string, lastEnd: i64, col: i64, descended: bool }
 // `maxDepth` ceiling, the same bound this file's `parseBlockNode` caller
 // already claims for the recursion this replaces.
 fn consumePropertyChain(p: Parser, indent: i64, descended: bool): PropertyChain! {
-  let (first, firstEnd) = consumeNodeProperties(p, indent, descended)?
+  let (first, firstTag, firstEnd) = consumeNodeProperties(p, indent, descended)?
   skipComments(p)?
   let names = []string(0)
   match (first) {
     Some(n) => { names = append(names, n) }
     None => {}
   }
+  let tag = firstTag
   let lastEnd = firstEnd
   let col = indent
   let sawMore = false
@@ -154,18 +213,30 @@ fn consumePropertyChain(p: Parser, indent: i64, descended: bool): PropertyChain!
       advance(p)
     }
     col = p.s.col
-    let (next, nextEnd) = consumeNodeProperties(p, col, true)?
+    let (next, nextTag, nextEnd) = consumeNodeProperties(p, col, true)?
     rejectSeqOnAnchorLine(p, next, nextEnd)?
     match (next) {
       Some(n) => { names = append(names, n) }
       None => {}
     }
+    tag = mergeChainTag(tag, nextTag)
     lastEnd = nextEnd
     while (p.s.kind == TokenKind.Dedent) {
       advance(p)
     }
   }
-  return PropertyChain{ names: names, lastEnd: lastEnd, col: col, descended: sawMore }
+  return PropertyChain{ names: names, tag: tag, lastEnd: lastEnd, col: col, descended: sawMore }
+}
+
+// The chain's running tag after a further line's own `consumeNodeProperties`
+// call: `next` when it saw one, else whatever the chain already had. Split
+// out of `consumePropertyChain` purely to keep that function's cyclomatic
+// complexity under spec/LINT.md's ceiling.
+fn mergeChainTag(tag: Option<string>, next: Option<string>): Option<string> {
+  if (isSome(next)) {
+    return next
+  }
+  return tag
 }
 
 // A further property-only line, reached either by a genuine `Indent`
@@ -175,19 +246,35 @@ fn isChainContinuation(k: TokenKind): bool {
   return k == TokenKind.Indent || k == TokenKind.Anchor || k == TokenKind.Tag
 }
 
-// Applies every anchor name the chain collected, outermost last (matching
-// `applyAnchor`'s own nesting order when there were exactly two: the
-// caller passed the OUTER name last so it wraps the inner one) — order
-// only matters if `yamlAnchorDefine` rejected a re-bind, which it does
-// not (last write wins is already this table's own contract, anchor.bit).
-fn applyAnchorChain(p: Parser, names: []string, value: Yaml): Yaml! {
-  let result = value
+// Defines every anchor name the chain collected against the PLAIN `value` —
+// `consumePropertyChain`'s own header: more than one name means several
+// property-only LINES collapsed onto the same dispatched node (U3XV's
+// `top1: &node1\n  &k1 key1: one` collapses `&node1`, the outer mapping's
+// own anchor, and `&k1`, its first KEY's, into one chain, since nothing
+// between them starts a fresh node until the key's own scalar). Registering
+// every name keeps every one of them resolvable by a later alias to this
+// SAME value — `yamlAnchorDefine`'s own "last write wins" contract makes
+// which one "wins" a non-issue when they are never redefined elsewhere.
+// DECORATES ONCE, with only the LAST (outermost) name and `tag` — a node
+// wraps at most once (value.bit's header); a chain that collapsed several
+// names onto one dispatched value cannot un-collapse them into the several
+// distinct tree positions they really belong to without `readImplicitKey`'s
+// own machinery, which is a real, currently-open imprecision this file
+// accepts rather than silently pretends does not exist: an alias to any
+// non-last name in such a chain still resolves to the right VALUE (the
+// table entry), just without that name's own anchor showing in a
+// `yamlDecorationOf` read at the position it was declared.
+fn applyAnchorChain(p: Parser, names: []string, tag: Option<string>, value: Yaml): Yaml! {
   let i = 0
   while (i < len(names)) {
-    result = applyAnchor(p, Option<string>.Some(names[i]), result)?
+    chargeBlockNode(p, p.s.start)?
+    yamlAnchorDefine(p.anchors, names[i], value)?
     i = i + 1
   }
-  return result
+  if (len(names) == 0) {
+    return yamlDecorate(value, Option<string>.None, tag, Option<string>.None)
+  }
+  return yamlDecorate(value, Option<string>.Some(names[len(names) - 1]), tag, Option<string>.None)
 }
 
 // --- a mapping key wrapped in properties, or an alias --------------------
@@ -204,7 +291,13 @@ fn resolveAliasToken(p: Parser): (Yaml, i64, i64)! {
   let name = p.src[start + 1:end]
   advance(p)
   let value = yamlAnchorResolve(p.anchors, name, p.limits)?
-  return (value, start, end)
+  let decorated = yamlDecorate(
+    value,
+    Option<string>.None,
+    Option<string>.None,
+    Option<string>.Some(name),
+  )
+  return (decorated, start, end)
 }
 
 // A mapping key's own primary token: a bare scalar (as `readImplicitEntry`
@@ -241,9 +334,9 @@ fn readKeyPrimary(p: Parser): Yaml! {
 // a KEY's own properties across more than one line.
 fn readImplicitKey(p: Parser, col: i64): (Yaml, i64)! {
   let keyStart = p.s.start
-  let (anchorName, anchorEnd) = consumeNodeProperties(p, col, false)?
+  let (anchorName, tagText, anchorEnd) = consumeNodeProperties(p, col, false)?
   rejectAnchorMisplaced(p, Option<string>.None, anchorName, anchorEnd)?
   let key = readKeyPrimary(p)?
-  let named = applyAnchor(p, anchorName, key)?
+  let named = applyAnchor(p, PendingProps{ anchor: anchorName, tag: tagText }, key)?
   return (named, keyStart)
 }
