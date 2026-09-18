@@ -249,34 +249,71 @@ fn scanBlockLine(src: string, lineStart: i64, n: i64): BlockLine {
 
 // --- indentation resolution -------------------------------------------------
 
+// The no-real-content fallback for `detectImplicitIndent`: at least
+// `parentIndent + 1`, never less — using `parentIndent` itself would let a
+// genuinely empty block scalar swallow the very next sibling line sitting
+// at or below `parentIndent` (#5527 K858, an empty `>-` before a dedented
+// mapping key). The deepest blank line seen still wins when it already
+// clears that floor, preserving this file's own leading-more-indented-
+// blank-line rule (see this file's header).
+fn blankFallbackIndent(maxBlank: i64, parentIndent: i64): i64 {
+  let floor = parentIndent + 1
+  if (maxBlank > floor) {
+    return maxBlank
+  }
+  return floor
+}
+
 // Implicit indentation: the leading-space count of the first non-blank
 // candidate line (a candidate is blank, or non-blank and more indented than
-// `parentIndent` — see this file's header). No candidate at all (the block
-// is empty or entirely blank) falls back to the deepest blank line seen, 0
-// if there were none either.
-fn detectImplicitIndent(src: string, bodyStart: i64, n: i64, parentIndent: i64): i64 {
+// `parentIndent` — see this file's header). A leading blank line indented
+// MORE than that first non-blank line is a spec violation (the block's own
+// indentation would be ambiguous) and fails outright rather than silently
+// accepting it (#5527 S98Z/W9L4/5LLU).
+//
+// No candidate at all falls back to `blankFallbackIndent` — BUT only once a
+// blank line was actually seen first (`sawBlank`): a block scalar's body
+// can legitimately start with real, non-blank content at exactly
+// `parentIndent` and no deeper (a document-root scalar right after `---`,
+// #5527's own DK3J/FP8R — the root has no enclosing construct for
+// `parentIndent` to protect). It is only once a leading blank line has
+// already been read that a same-or-shallower non-blank line signals a
+// genuinely empty block scalar swallowing the next sibling (#5527 K858, an
+// empty `>-` before a dedented mapping key) rather than root-level content.
+fn detectImplicitIndent(src: string, bodyStart: i64, n: i64, parentIndent: i64): i64! {
   let pos = bodyStart
   let maxBlank = 0
+  let sawBlank = false
   let guard = 0
   let bound = n - bodyStart + 8
   while (pos < n && guard <= bound) {
     guard = guard + 1
     let line = scanBlockLine(src, pos, n)
     if (!line.isBlank) {
-      if (line.spaces > parentIndent) {
-        return line.spaces
+      if (line.spaces <= parentIndent) {
+        if (sawBlank) {
+          return blankFallbackIndent(maxBlank, parentIndent)
+        }
+        return maxBlank
       }
-      return maxBlank
+      if (maxBlank > line.spaces) {
+        fail blockError(
+          "yaml: block scalar leading empty line more indented than its first content line",
+          line.lineStart,
+        )
+      }
+      return line.spaces
     }
+    sawBlank = true
     if (line.spaces > maxBlank) {
       maxBlank = line.spaces
     }
     pos = line.nextStart
     if (!line.hadBreak) {
-      return maxBlank
+      return blankFallbackIndent(maxBlank, parentIndent)
     }
   }
-  return maxBlank
+  return blankFallbackIndent(maxBlank, parentIndent)
 }
 
 // The resolved block indentation: the header's own digit, offset from the
@@ -287,11 +324,11 @@ fn resolveBlockIndent(
   bodyStart: i64,
   n: i64,
   parentIndent: i64,
-): i64 {
+): i64! {
   if (header.indent >= 0) {
     return parentIndent + header.indent
   }
-  return detectImplicitIndent(src, bodyStart, n, parentIndent)
+  return detectImplicitIndent(src, bodyStart, n, parentIndent)?
 }
 
 // --- body collection ---------------------------------------------------------
@@ -302,6 +339,23 @@ fn resolveBlockIndent(
 // dedent or a tab that kept `spaces` from reaching it — ends the block
 // without being consumed, never an error (this file's header explains why a
 // tab needs no separate error path).
+// A stream's final line, even lacking its own terminator, still ends one —
+// the "trailing whitespace in streams" rule (#5527 JEF9/02, L24T/01): a
+// wholly blank final line at true EOF counts as terminated for chomping,
+// exactly as if the source had one more `\n` byte. Only a blank line gets
+// this; ordinary content at true EOF keeps `hadBreak` false, per this
+// file's own documented contract (see this file's header).
+fn blockLineWithBreak(line: BlockLine): BlockLine {
+  return BlockLine{
+    spaces: line.spaces,
+    isBlank: line.isBlank,
+    lineStart: line.lineStart,
+    textEnd: line.textEnd,
+    hadBreak: true,
+    nextStart: line.nextStart,
+  }
+}
+
 fn collectBlockLines(src: string, bodyStart: i64, n: i64, blockIndent: i64): ([]BlockLine, i64)! {
   let lines = []BlockLine(0)
   let pos = bodyStart
@@ -316,6 +370,9 @@ fn collectBlockLines(src: string, bodyStart: i64, n: i64, blockIndent: i64): ([]
     lines = append(lines, line)
     pos = line.nextStart
     if (!line.hadBreak) {
+      if (line.isBlank) {
+        lines[len(lines) - 1] = blockLineWithBreak(line)
+      }
       return (lines, pos)
     }
   }
@@ -357,37 +414,51 @@ fn buildLiteralKeep(src: string, lines: []BlockLine, blockIndent: i64): string {
   return b.toString()
 }
 
+// A blank line whose own trimmed content (e.g. a lone tab past
+// `blockIndent`, #5527 R4YG) is non-empty folds exactly like a
+// more-indented line: literally, never to a space — there is no plain text
+// on that side to fold with.
+fn blockLineLiteral(line: BlockLine, moreIndented: bool, content: string): bool {
+  return moreIndented || (line.isBlank && content != "")
+}
+
 // Folded (`>`): a line is a "chunk" (gets its own separator-then-content
-// treatment) when it has real content or is more indented than the block —
-// a more-indented blank line's extra whitespace is content too, per this
-// file's header. Every other blank line only advances `breakCount`, feeding
-// `foldSeparator` (reused from `scalar.bit`, same module) once the next
-// chunk is reached. `literalBreak` is true when EITHER side of the
-// separator is more indented, not just the one right before it — the break
-// after a more-indented line stays literal too, which is the trap this
-// file's header names.
+// treatment) when it has real content, is more indented than the block, or
+// — blank though it is — still has bytes past `blockIndent` (content is
+// never discarded, per this file's header). Every other blank line only
+// advances `breakCount`, feeding `foldSeparator` (reused from `scalar.bit`,
+// same module) once the next chunk is reached. A run of blank lines before
+// the FIRST chunk gets no separator to fold through (nothing precedes it)
+// so it is written out literally instead (#5527 4QFQ/7T8X/F6MC). Once a
+// chunk exists, `literalBreak` is true when either side of the separator is
+// literal (more-indented or blank-with-content), not just the one right
+// before it — the break after such a line stays literal too, which is the
+// trap this file's header names.
 fn buildFoldedKeep(src: string, lines: []BlockLine, blockIndent: i64): string {
   let b = newBuilder()
   let breakCount = 0
   let haveChunk = false
-  let prevMoreIndented = false
+  let prevLiteral = false
   let i = 0
   while (i < len(lines)) {
     let line = lines[i]
     let moreIndented = blockLineMoreIndented(line, blockIndent)
-    let isChunk = !line.isBlank || moreIndented
+    let content = blockLineContent(src, line, blockIndent)
+    let isChunk = !line.isBlank || moreIndented || content != ""
     if (!isChunk) {
       breakCount = breakCount + 1
       i = i + 1
       continue
     }
+    let literal = blockLineLiteral(line, moreIndented, content)
     if (haveChunk) {
-      let literalBreak = prevMoreIndented || moreIndented
-      b = b.write(foldSeparator(breakCount, literalBreak))
+      b = b.write(foldSeparator(breakCount, prevLiteral || literal))
+    } else if (breakCount > 0) {
+      b = b.write(repeat("\n", breakCount))
     }
-    b = b.write(blockLineContent(src, line, blockIndent))
+    b = b.write(content)
     haveChunk = true
-    prevMoreIndented = moreIndented
+    prevLiteral = literal
     breakCount = 0
     if (line.hadBreak) {
       breakCount = 1
@@ -449,7 +520,7 @@ export fn yamlDecodeBlockScalar(
   let n = len(src)
   let header = parseBlockHeader(src, headerStart, headerEnd)?
   let bodyStart = skipHeaderTail(src, headerEnd, n)?
-  let blockIndent = resolveBlockIndent(header, src, bodyStart, n, parentIndent)
+  let blockIndent = resolveBlockIndent(header, src, bodyStart, n, parentIndent)?
   let (lines, resumeAt) = collectBlockLines(src, bodyStart, n, blockIndent)?
   let keepText = buildKeepText(src, header.style, lines, blockIndent)
   let text = applyChomping(keepText, header.chomp)
