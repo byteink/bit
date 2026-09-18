@@ -7,7 +7,7 @@ bench/run.sh in this repo holds: the block says so itself, and the next run
 overwrites whatever is between the markers.
 
 Trimmed mean (drop the slowest fifth of RUNS samples, mean what is left) is
-the same estimator run.sh's own trimmean() uses to build these files —
+the same estimator run.sh's own trimmean() uses to build these files -
 bench/run.sh:34-59 (repo root, #4040) settled on it after comparing four.
 """
 import os
@@ -55,7 +55,7 @@ def main():
         f"parsed it to a byte-identical checksum before anything was timed "
         f"(entry count + a CRC-32C fold over every key and scalar value, "
         f"sorted by key so an unordered Go map iterates the same as pkg/toml's "
-        f"source-ordered table) — see `RESULTS.md`'s own verification "
+        f"source-ordered table) - see `RESULTS.md`'s own verification "
         f"transcript below."
     )
     print()
@@ -68,7 +68,7 @@ def main():
     print(
         f"> Each figure is the trimmed mean (slowest fifth of {runs} runs "
         f"dropped, mean of the rest) of one process invocation: read the "
-        f"fixture, parse it once, print an entry count, exit — never the "
+        f"fixture, parse it once, print an entry count, exit - never the "
         f"checksum walk above, which is a separate, untimed mode of the same "
         f"binary (folding and sorting the whole tree on every timed run would "
         f"measure parse+hash throughput, not parse throughput). `vs pkg/toml` "
@@ -81,7 +81,7 @@ def main():
     print(
         f"> Both Go competitors are cross-compiled for this host's own "
         f"OS/arch inside a throwaway `docker run` (never installed on the "
-        f"host) and then run natively, exactly like pkg/toml's own binary — "
+        f"host) and then run natively, exactly like pkg/toml's own binary - "
         f"never timed from inside the container, which would fold Docker "
         f"Desktop's VM overhead into one side of the comparison and not the "
         f"other."

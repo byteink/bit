@@ -1,8 +1,8 @@
-# pkg/yaml/bench results — pending
+# pkg/yaml/bench results - pending
 
 The measured table (#5501) is not published yet: `run.sh`'s own exclusivity
 requirement (an idle box, 15+ runs) has not been met in this worktree. Run
-`./run.sh` on a drained machine to fill this in — it overwrites this whole
+`./run.sh` on a drained machine to fill this in - it overwrites this whole
 file and the `BENCH` block in `../README.md` together, every time.
 
 What HAS been proven, on Bit `9221db25`: all three implementations parse

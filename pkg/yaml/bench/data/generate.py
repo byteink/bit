@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# pkg/yaml/bench/data/generate.py — deterministic generator for k8s-manifests.yaml (#5501).
+# pkg/yaml/bench/data/generate.py - deterministic generator for k8s-manifests.yaml (#5501).
 #
 # Run once, by hand, to produce the checked-in fixture; run.sh never calls this
-# — a benchmark whose input changes per run cannot be compared across commits
+# - a benchmark whose input changes per run cannot be compared across commits
 # (#5501's own ticket). Re-run only to intentionally regenerate the fixture,
 # and commit the new output in the same change as whatever motivated it.
 #
