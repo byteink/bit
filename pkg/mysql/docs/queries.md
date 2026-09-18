@@ -48,8 +48,35 @@ on the same connection, evicted FIFO once the cache is full; it is off by
 default because every cached statement holds server-side memory and a table
 lock reference for the connection's whole life.
 
-**Transactions are not yet implemented.** `Conn.begin` fails, naming the
-tracking epic; see [Limitations](limitations.md).
+## Transactions
+
+Moving money between two rows needs both updates to land or neither. `tx`
+runs a block on one pooled connection and ends it for you - `COMMIT` when
+the block returns, `ROLLBACK` on any failure or panic - with the connection
+back in the pool either way:
+
+```bit
+fn transferCents(db: Pool, fromId: string, toId: string, cents: int): ()! {
+  db.tx((t) => {
+    t.exec(
+      "update accounts set balance = balance - $1 where id = $2",
+      [
+        Value.Int(cents), Value.Text(fromId),
+      ],
+    )?
+    t.exec(
+      "update accounts set balance = balance + $1 where id = $2",
+      [
+        Value.Int(cents), Value.Text(toId),
+      ],
+    )?
+  })?
+}
+```
+
+`Conn.begin` sends `START TRANSACTION` over `COM_QUERY`; `commit`/`rollback`
+send `COMMIT`/`ROLLBACK` on that same connection. Isolation levels are
+`std/sql`'s own job (`db.txAt`), not a statement this driver builds itself.
 
 ## The single-packet limit
 

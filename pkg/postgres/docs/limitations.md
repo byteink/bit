@@ -5,8 +5,6 @@ the end of a chapter.
 
 - **Typed decoding is `#3989`.** Columns arrive as text bytes with their
   type OIDs; `asInt` on an `int4` column fails today, `asText` works.
-- **Transactions are the rest of `#3986`.** `begin` fails naming the epic;
-  `std/sql` runs transactions through a closure (`stdlib/sql/tx.bit`).
 - **`Conn.prepare` does not name a statement on the server.** It holds the
   text and runs the ordinary path, so a `Stmt` is unnamed unless
   `statementCache` turned the cache on. A name is meaningful only on the

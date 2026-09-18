@@ -2,9 +2,6 @@
 
 What this driver does not do yet, and where each gap is tracked.
 
-- **Transactions are not implemented.** `Conn.begin` fails, naming epic #3986.
-  `query`, `exec` and `prepare` all take parameters today; only starting and
-  ending a transaction does not exist yet.
 - **Single packets only.** A statement whose bound form would exceed
   16,777,215 bytes - the protocol's multi-packet payload form - fails naming
   its size. It is never split across packets or silently truncated.
