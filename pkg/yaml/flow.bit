@@ -105,6 +105,56 @@ fn checkDepth(ctx: FlowCtx, depth: i64, offset: int): ()! {
   }
 }
 
+// --- token stream: a comment is noise anywhere a flow token is expected --
+//
+// `parse.bit`'s own `skipComments`/block context runs this between every
+// node it reads (that file's own comment: "the only noise token block
+// context ever produces"); flow.bit never had the equivalent, so a `#`
+// anywhere inside a flow collection — after an opening bracket, after a
+// key, after a comma — left the scanner sitting on a `Comment` token no
+// caller here knew to skip, surfacing as "expected a flow value" or
+// "expected ',' or closing bracket" at the comment's own position.
+
+// A `#` is only a real comment when whitespace (or the start of input)
+// precedes it — `dispatchIndicatorsMarked` (scan.bit) does not enforce that
+// itself, unconditionally emitting `Comment` for ANY `#` reached at a fresh
+// dispatch (`isCommentAhead`'s own check only stops a scalar EARLY when a
+// `#` is coming up, it is not re-checked once dispatch already lands on
+// one) — so `c,#invalid` hands this file a `Comment` token exactly where a
+// space-preceded one would sit. Skipping it regardless would silently
+// accept trailing garbage the core grammar rejects (spec 6.9's own
+// requirement, and the SAME already-tracked gap
+// `corpusExclusionsTrailingContent` names for parse.bit/scan.bit — CVW2).
+// Leaving it unskipped instead lets the normal "expected a flow value" /
+// "expected ',' or closing bracket" checks reject it exactly as they did
+// before this file understood comments at all.
+fn isLegitFlowComment(ctx: FlowCtx): bool {
+  let start = ctx.s.start
+  if (start == 0) {
+    return true
+  }
+  let p = ctx.s.src[start - 1]
+  return p == ' ' || p == '\t' || p == '\n' || p == '\r'
+}
+
+fn skipFlowComments(ctx: FlowCtx) {
+  let guard = 0
+  let bound = flowLoopBound(ctx)
+  while (ctx.s.kind == TokenKind.Comment && isLegitFlowComment(ctx) && guard <= bound) {
+    scanNext(ctx.s)
+    guard = guard + 1
+  }
+}
+
+// `scanNext` plus a comment skip — the one place this file advances the
+// scanner and expects to land on a real token afterward. `scanFlowPlainSpan`
+// below deliberately calls raw `scanNext` instead: a comment there must stop
+// a multi-line plain scalar's span, never be swallowed into it.
+fn advanceFlow(ctx: FlowCtx) {
+  scanNext(ctx.s)
+  skipFlowComments(ctx)
+}
+
 // --- key equality, for duplicate-key detection --------------------------
 
 // Structural equality between two `Yaml` values, used only to detect a
@@ -222,13 +272,89 @@ fn resolveFlowScalar(text: string, kind: TokenKind, resolver: (string, ScalarSty
   return resolver(text, ScalarStyle.Quoted)
 }
 
+// `scanPlainScalar` (scan.bit) stops at every `\n`/`\r` unconditionally, so
+// a plain scalar spanning a line break — legal in flow context exactly as
+// in block, since flow ignores indentation as a signal either way (this
+// file's header) — arrives as several consecutive `PlainScalar` tokens
+// with nothing between them but the break: nothing else can produce that
+// adjacency, since a comma, a colon followed by blank, a flow bracket or a
+// comment each end their OWN token first (`scanPlainScalar`'s own boundary
+// checks). Folds the same way `scalar.bit`'s `foldLines` already folds a
+// block plain scalar — that function reads only the raw text it is handed,
+// nothing about block vs. flow — so merging the spans and decoding once is
+// the whole fix. Bounded by `flowLoopBound` like every other flow loop.
+fn scanFlowPlainSpan(ctx: FlowCtx): int! {
+  let end = ctx.s.end
+  let guard = 0
+  let bound = flowLoopBound(ctx)
+  while (guard <= bound) {
+    guard = guard + 1
+    scanNext(ctx.s)
+    if (ctx.s.kind != TokenKind.PlainScalar) {
+      return end
+    }
+    end = ctx.s.end
+  }
+  fail flowError("yaml: unterminated flow plain scalar", end)
+}
+
 fn parseFlowScalar(ctx: FlowCtx): Yaml! {
   let start = ctx.s.start
   let kind = ctx.s.kind
-  let text = yamlDecodeScalar(ctx.s.src, ctx.s.kind, ctx.s.start, ctx.s.end)?
-  scanNext(ctx.s)
+  let end = ctx.s.end
+  if (kind == TokenKind.PlainScalar) {
+    end = scanFlowPlainSpan(ctx)?
+  } else {
+    scanNext(ctx.s)
+  }
+  skipFlowComments(ctx)
+  let text = yamlDecodeScalar(ctx.s.src, kind, start, end)?
   chargeNode(ctx, start)?
   return resolveFlowScalar(text, kind, ctx.resolver)
+}
+
+// Optional `&anchor`/`!tag` properties directly prefixing a flow value,
+// either order (the core grammar allows both — YAML 1.2.2 §8.2). Consumed,
+// never registered: `FlowCtx` carries no `AnchorTable` (this file's own
+// header names exactly what it does carry — the scan cursor, the budget,
+// the resolver — an anchor table is none of those), so a nested flow
+// anchor is dropped exactly like this package's own tag policy already
+// drops a tag elsewhere (`corpusExclusionsExplicitTagType`'s own comment,
+// pkg/yaml/corpus.test.bit: "this file's tag handling treats every tag
+// identically — consumed and ignored"). No fixture in this file's own scope
+// aliases a flow-defined anchor, so no resolution is lost by dropping it.
+// Returns whether a tag was seen: an explicitly tagged node with no scalar
+// or collection following it (`{ foo: !!str }`, tag directly against a
+// terminator) resolves to an empty STRING, never `YamlNull` — the same
+// "explicit form is never plain-typed" rule `schema.bit`'s own
+// `yamlResolveScalar` already applies to an explicitly quoted empty scalar,
+// generalized to any explicit tag rather than one specific tag name.
+fn consumeFlowNodeProperties(ctx: FlowCtx): bool {
+  let sawTag = false
+  let guard = 0
+  let bound = flowLoopBound(ctx)
+  while ((ctx.s.kind == TokenKind.Anchor || ctx.s.kind == TokenKind.Tag) && guard <= bound) {
+    if (ctx.s.kind == TokenKind.Tag) {
+      sawTag = true
+    }
+    advanceFlow(ctx)
+    guard = guard + 1
+  }
+  return sawTag
+}
+
+// A flow scalar's first byte reserves `-`/`?`/`:` for ambiguity with a
+// block construct (YAML 1.2.2 §7.3.3's `ns-plain-first` exception list):
+// each is a legal plain-scalar start only when NOT immediately followed by
+// whatever would make it a real indicator instead — `isColonBoundary` and
+// `followedByBlank` (scan.bit) already cover `:`/`?`, and a `-` followed by
+// blank already becomes its own `SeqEntry` token, never reaching here. The
+// one shape those rules let through is a BARE `-`, alone, directly abutting
+// a flow indicator (`scanDash`'s fallback, scan.bit) — a one-byte
+// `PlainScalar` this file cannot tell apart from the block sequence
+// indicator it is reserved for, so the grammar rejects it instead.
+fn isBareDashIndicator(ctx: FlowCtx): bool {
+  return ctx.s.end - ctx.s.start == 1 && ctx.s.src[ctx.s.start] == '-'
 }
 
 // Any single flow value at the current token: a nested `[`/`{` collection
@@ -239,12 +365,25 @@ fn parseFlowScalar(ctx: FlowCtx): Yaml! {
 // trailing comma before this function is ever reached again — this file's
 // header).
 fn parseFlowNode(ctx: FlowCtx, depth: i64): Yaml! {
+  let sawTag = consumeFlowNodeProperties(ctx)
   if (ctx.s.kind == TokenKind.FlowSeqStart || ctx.s.kind == TokenKind.FlowMapStart) {
     return parseFlowCollection(ctx, depth + 1)?
   }
-  let k = ctx.s.kind
-  if (k == TokenKind.PlainScalar || k == TokenKind.SingleQuoted || k == TokenKind.DoubleQuoted) {
+  if (ctx.s.kind == TokenKind.PlainScalar) {
+    if (isBareDashIndicator(ctx)) {
+      fail flowError(
+        "yaml: a bare '-' is reserved for the block sequence indicator, not a plain scalar",
+        ctx.s.start,
+      )
+    }
     return parseFlowScalar(ctx)?
+  }
+  if (ctx.s.kind == TokenKind.SingleQuoted || ctx.s.kind == TokenKind.DoubleQuoted) {
+    return parseFlowScalar(ctx)?
+  }
+  if (sawTag) {
+    chargeNode(ctx, ctx.s.start)?
+    return ctx.resolver("", ScalarStyle.Quoted)
   }
   fail flowError("yaml: expected a flow value", ctx.s.start)
 }
@@ -261,6 +400,68 @@ fn parseFlowValueOrNull(ctx: FlowCtx, depth: i64): Yaml! {
   return parseFlowNode(ctx, depth)?
 }
 
+// A key's value glued directly onto its `:` with no separating space —
+// legal straight after a JSON-like key (a quoted scalar or a flow
+// collection; YAML 1.2.2's JSON-compatible flow-mapping production needs no
+// `s-separate` around that `:`). `isColonBoundary` (scan.bit) only turns
+// `:` into its own `ValueIndicator` token when it IS followed by blank, so
+// a glued `:value` instead scans as one `PlainScalar` token starting with
+// `:` (`scanPlainScalar`'s own boundary check fires on THAT colon needing a
+// following blank too, so it is folded into the very token it starts) —
+// detected here, not in scan.bit, because interpreting what a leading `:`
+// inside a raw span means is this file's grammar layer, not the scanner's
+// (this file's header: the scanner only says where a span ends).
+fn isGluedValueToken(ctx: FlowCtx): bool {
+  return ctx.s.kind == TokenKind.PlainScalar &&
+    ctx.s.end > ctx.s.start &&
+    ctx.s.src[ctx.s.start] == ':'
+}
+
+// `scanPlainScalar` stops exactly AT the boundary that ends a token (a
+// comma, a closer, a comment) without trimming back over any blank bytes
+// that sat before it — this construct is the only place in this file that
+// slices a token's span by hand (everywhere else hands the token's own
+// `start`/`end` straight to `yamlDecodeScalar`), so it is the one place
+// that dangling trailing blank needs stripping before decoding.
+fn trimTrailingFlowBlank(ctx: FlowCtx, floor: int, end: int): int {
+  let e = end
+  while (e > floor && (ctx.s.src[e - 1] == ' ' || ctx.s.src[e - 1] == '\t')) {
+    e = e - 1
+  }
+  return e
+}
+
+// Decodes a glued `:value` token's value half — everything past the one
+// leading `:` the scanner folded in — exactly like `parseFlowScalar` decodes
+// an ordinary `PlainScalar`, just shifted one byte past the indicator and
+// trimmed of any trailing blank `trimTrailingFlowBlank` left dangling.
+fn parseGluedFlowValue(ctx: FlowCtx): Yaml! {
+  let start = ctx.s.start
+  let end = trimTrailingFlowBlank(ctx, start + 1, ctx.s.end)
+  let text = yamlDecodeScalar(ctx.s.src, TokenKind.PlainScalar, start + 1, end)?
+  advanceFlow(ctx)
+  chargeNode(ctx, start)?
+  return ctx.resolver(text, ScalarStyle.Plain)
+}
+
+// Whether a value follows the key/entry just parsed — a real `ValueIndicator`
+// token, or a glued `:value` `PlainScalar` (`isGluedValueToken`'s own
+// comment) — shared by both `parseFlowSeqEntry` and `parseFlowMapEntry` so
+// neither special-cases the glued spelling on its own.
+fn flowHasValueIndicator(ctx: FlowCtx): bool {
+  return ctx.s.kind == TokenKind.ValueIndicator || isGluedValueToken(ctx)
+}
+
+// Consumes whichever shape `flowHasValueIndicator` found true and returns
+// the value — callers must not call this unless that check already passed.
+fn consumeFlowValue(ctx: FlowCtx, depth: i64): Yaml! {
+  if (ctx.s.kind == TokenKind.ValueIndicator) {
+    advanceFlow(ctx)
+    return parseFlowValueOrNull(ctx, depth)?
+  }
+  return parseGluedFlowValue(ctx)?
+}
+
 // --- shared close/comma handling ------------------------------------------
 
 // After one entry: `closeKind` alone closes the collection. A `,` is
@@ -272,13 +473,13 @@ fn parseFlowValueOrNull(ctx: FlowCtx, depth: i64): Yaml! {
 // `,` at all, is a syntax error.
 fn flowAfterEntry(ctx: FlowCtx, closeKind: TokenKind): bool! {
   if (ctx.s.kind == closeKind) {
-    scanNext(ctx.s)
+    advanceFlow(ctx)
     return true
   }
   if (ctx.s.kind == TokenKind.FlowEntry) {
-    scanNext(ctx.s)
+    advanceFlow(ctx)
     if (ctx.s.kind == closeKind) {
-      scanNext(ctx.s)
+      advanceFlow(ctx)
       return true
     }
     return false
@@ -301,17 +502,24 @@ fn flowLoopBound(ctx: FlowCtx): int {
 // pair, which becomes a single-entry `YamlMapping` (`[a: 1]` is a sequence
 // holding one mapping — ticket). `?` is legal here exactly as in a flow
 // mapping entry; sharing the same shape is why `parseFlowMapEntry` (below)
-// and this function both start with the same explicit-key check.
+// and this function both start with the same explicit-key check. UNLIKE a
+// real flow mapping's entry, the glued `key:value` spelling
+// (`isGluedValueToken`'s own comment) is NOT accepted here: the core
+// grammar's compact-pair-in-sequence production (`ns-flow-pair`) requires a
+// real separating space after the `:` even for a JSON-like key, where the
+// flow MAPPING production it borrows the JSON-key shape from does not
+// (ZXT5 — `[ "key"\n  :value ]` must be REJECTED, not read as `[{key:
+// value}]`) — so this checks `ValueIndicator` alone, never
+// `flowHasValueIndicator`.
 fn parseFlowSeqEntry(ctx: FlowCtx, depth: i64): Yaml! {
   let entryStart = ctx.s.start
   let explicit = ctx.s.kind == TokenKind.KeyIndicator
   if (explicit) {
-    scanNext(ctx.s)
+    advanceFlow(ctx)
   }
   let first = parseFlowNode(ctx, depth)?
   if (ctx.s.kind == TokenKind.ValueIndicator) {
-    scanNext(ctx.s)
-    let value = parseFlowValueOrNull(ctx, depth)?
+    let value = consumeFlowValue(ctx, depth)?
     chargeNode(ctx, entryStart)?
     return Yaml.YamlMapping([YamlEntry{ key: first, value: value }])
   }
@@ -324,9 +532,9 @@ fn parseFlowSeqEntry(ctx: FlowCtx, depth: i64): Yaml! {
 
 fn parseFlowSeq(ctx: FlowCtx, depth: i64): Yaml! {
   let start = ctx.s.start
-  scanNext(ctx.s)
+  advanceFlow(ctx)
   if (ctx.s.kind == TokenKind.FlowSeqEnd) {
-    scanNext(ctx.s)
+    advanceFlow(ctx)
     chargeNode(ctx, start)?
     return Yaml.YamlSequence([]Yaml(0))
   }
@@ -360,13 +568,12 @@ fn parseFlowMapEntry(ctx: FlowCtx, depth: i64): FlowMapEntryOut! {
   let keyStart = ctx.s.start
   let explicit = ctx.s.kind == TokenKind.KeyIndicator
   if (explicit) {
-    scanNext(ctx.s)
+    advanceFlow(ctx)
   }
   let key = parseFlowNode(ctx, depth)?
   let value = Yaml.YamlNull
-  if (ctx.s.kind == TokenKind.ValueIndicator) {
-    scanNext(ctx.s)
-    value = parseFlowValueOrNull(ctx, depth)?
+  if (flowHasValueIndicator(ctx)) {
+    value = consumeFlowValue(ctx, depth)?
   } else {
     chargeNode(ctx, keyStart)?
   }
@@ -375,9 +582,9 @@ fn parseFlowMapEntry(ctx: FlowCtx, depth: i64): FlowMapEntryOut! {
 
 fn parseFlowMap(ctx: FlowCtx, depth: i64): Yaml! {
   let start = ctx.s.start
-  scanNext(ctx.s)
+  advanceFlow(ctx)
   if (ctx.s.kind == TokenKind.FlowMapEnd) {
-    scanNext(ctx.s)
+    advanceFlow(ctx)
     chargeNode(ctx, start)?
     return Yaml.YamlMapping([]YamlEntry(0))
   }
