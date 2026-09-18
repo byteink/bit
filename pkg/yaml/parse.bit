@@ -351,7 +351,13 @@ fn checkNotMergeKey(key: Yaml, offset: i64): ()! {
 // node-start position (a document/sequence root, a genuinely nested
 // `Indent`, or an explicit `?`/`:` entry's own content, M2N8/00's and
 // M2N8/01's own compact-mapping-as-key shape) leaves it true.
-class NodeCtx { atMarker: bool, foldFloor: i64, allowCompact: bool }
+// `seqItem` is true only for a block sequence ITEM's own value slot
+// (`parseSeqItemValue`'s two `NodeCtx` literals below) — `dispatchBlockNode`'s
+// `SeqEntry` case needs it: YAML 1.2.2 §8.19 exempts a block sequence from
+// indenting past its parent only for a block MAPPING value (SKE5), never a
+// sequence item's own value, so a sibling `-` at the enclosing sequence's
+// own column can never start a nested sequence there, only end this item empty.
+class NodeCtx { atMarker: bool, foldFloor: i64, allowCompact: bool, seqItem: bool }
 
 // Parses one block node at or past `indent`. `colHint < 0` means "derive
 // this node's own column from `Scanner.col`" (the normal case — the node
@@ -395,6 +401,7 @@ fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, ctx: No
       rejectImplicitKey: false,
       pendingProps: noPendingProps(),
       hadAnchor: hadAnchor,
+      seqItem: ctx.seqItem,
     }
     let value = dispatchBlockNode(p, indent, chain.col, dctx, ctx.foldFloor)?
     if (len(chain.names) > 1 && !yamlIsMapping(value)) {
@@ -408,8 +415,20 @@ fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, ctx: No
     rejectImplicitKey: (ctx.atMarker && hadAnchor) || !ctx.allowCompact,
     pendingProps: PendingProps{ anchor: onlyAnchor, tag: chain.tag },
     hadAnchor: hadAnchor,
+    seqItem: ctx.seqItem,
   }
-  return dispatchBlockNode(p, indent, colHint, dctx, ctx.foldFloor)?
+  // `colHint`, when set, names whatever token immediately followed the
+  // `-`/`:` that led here (`parseSeqItemValue`'s `inlineCol`) — valid only
+  // while still on THAT physical line. `consumePropertyChain` may have since
+  // consumed a property and crossed onto a fresh line (FH7J/PW8X item 1:
+  // `- !!str` then a SIBLING `-` below it) — once it has, `colHint` names
+  // the property's own column, not this token's, and `Scanner.col` (already
+  // re-measured for the fresh line) is the only correct source left.
+  let freshColHint = colHint
+  if (hasLineBreak(p.src, chain.lastEnd, p.s.start)) {
+    freshColHint = -1
+  }
+  return dispatchBlockNode(p, indent, freshColHint, dctx, ctx.foldFloor)?
 }
 
 // Bundles `dispatchBlockNode`'s three least-central flags (spec/LINT.md's
@@ -429,21 +448,35 @@ class DispatchCtx {
   rejectImplicitKey: bool,
   pendingProps: PendingProps,
   hadAnchor: bool,
+  seqItem: bool,
 }
 
-// A bare ':' starting a node's own content is an implicit, empty (null)
-// mapping key (2JQS/NHX8/SM9W-01/UKK6-00; `readMappingEntry`'s own new
-// branch, blockmapping.bit, handles every entry after the first) — UNLESS
-// `rejectImplicitKey` (ZCZ6's `a: b: c: d`, an inline VALUE chaining
-// straight into another implicit key with no indentation,
-// `NodeCtx.allowCompact`'s own header). Split out of `dispatchBlockNode`'s
-// own switch to keep that function's complexity under spec/LINT.md's
-// ceiling.
-fn dispatchImplicitEmptyKey(p: Parser, col: i64, ctx: DispatchCtx): Yaml! {
-  if (ctx.rejectImplicitKey) {
-    fail parseError("yaml: unexpected token in block context", p.s.start)
+// `dispatchImplicitEmptyKey` (blockmapping.bit) handles a bare ':' starting
+// a node's own content — an implicit, empty (null) mapping key.
+// §8.19 exempts a block sequence from indenting past its parent only for a
+// block MAPPING value (`parseAfterIndicator`'s own header, SKE5), never a
+// sequence ITEM's own value — no property-decorated value can start a
+// sequence DEDENTED past its own `foldFloor`, that always belongs to an
+// outer structure. `col < foldFloor` catches a property-only mapping VALUE
+// whose sibling `-` dedents past the mapping's own column (FH7J's
+// `b: !!str`); `ctx.seqItem && col == foldFloor` catches the same shape one
+// level shallower, at the ENCLOSING sequence's own column (PW8X/FH7J item
+// 1). Either way `dispatchBlockNode`'s `SeqEntry` case must treat this
+// node's value as empty, left unconsumed for the caller's own loop. Gated
+// on a pending property, same reason as `dispatchImplicitEmptyKey`
+// (blockmapping.bit): a bare `-` with none never reaches `SeqEntry` here
+// (`parseSeqItemValue`'s own checks return `YamlNull` first), and a CHAINED
+// inline dash's own `col` (7ZZ5's `- - - []`) is computed off a
+// `Scanner.col` never measured past a line's first token (`columnOf`'s own
+// header, blockmapping.bit), so it can coincidentally land AT `foldFloor`
+// too. Split out purely for `dispatchBlockNode`'s own complexity ceiling.
+fn dispatchSeqEntry(p: Parser, ctx: DispatchCtx, col: i64, foldFloor: i64): Yaml! {
+  let pendingProp = isSome(ctx.pendingProps.anchor) || isSome(ctx.pendingProps.tag)
+  let endsEmpty = pendingProp && (col < foldFloor || (ctx.seqItem && col == foldFloor))
+  if (endsEmpty) {
+    return applyAnchor(p, ctx.pendingProps, resolveByKind("", TokenKind.PlainScalar, p.resolver))?
   }
-  return applyAnchor(p, ctx.pendingProps, parseBlockMapping(p, col, Option<Yaml>.None, 0)?)?
+  return applyAnchor(p, ctx.pendingProps, parseBlockSequence(p, col)?)?
 }
 
 fn dispatchBlockNode(
@@ -460,12 +493,14 @@ fn dispatchBlockNode(
   switch (p.s.kind) {
     case TokenKind.Alias:
       return parseAlias(p, col, ctx.hadAnchor)?
+    // PW8X/FH7J item 1, 7ZZ5's mutation control — `dispatchSeqEntry`'s own
+    // header above has the rule and the ids.
     case TokenKind.SeqEntry:
-      return applyAnchor(p, ctx.pendingProps, parseBlockSequence(p, col)?)?
+      return dispatchSeqEntry(p, ctx, col, foldFloor)?
     case TokenKind.KeyIndicator:
       return applyAnchor(p, ctx.pendingProps, parseBlockMapping(p, col, Option<Yaml>.None, 0)?)?
     case TokenKind.ValueIndicator:
-      return dispatchImplicitEmptyKey(p, col, ctx)?
+      return dispatchImplicitEmptyKey(p, col, foldFloor, ctx)?
     case TokenKind.FlowSeqStart, TokenKind.FlowMapStart:
       return parseFlowOrMapping(p, col, foldFloor, ctx.pendingProps, ctx.rejectImplicitKey)?
     case TokenKind.BlockScalarHeader:
@@ -606,7 +641,7 @@ fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dash
       childCol,
       -1,
       true,
-      NodeCtx{ atMarker: false, foldFloor: itemCol, allowCompact: true },
+      NodeCtx{ atMarker: false, foldFloor: itemCol, allowCompact: true, seqItem: true },
     )?
   }
   if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
@@ -621,7 +656,7 @@ fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dash
     itemCol,
     inlineCol,
     false,
-    NodeCtx{ atMarker: false, foldFloor: itemCol, allowCompact: true },
+    NodeCtx{ atMarker: false, foldFloor: itemCol, allowCompact: true, seqItem: true },
   )?
 }
 
@@ -678,7 +713,7 @@ fn parseDocumentContent(p: Parser, docMarkerEnd: i64): Yaml! {
     0,
     -1,
     true,
-    NodeCtx{ atMarker: atMarker, foldFloor: -1, allowCompact: true },
+    NodeCtx{ atMarker: atMarker, foldFloor: -1, allowCompact: true, seqItem: false },
   )?
   skipComments(p)?
   if (!isDocBoundary(p.s.kind)) {
