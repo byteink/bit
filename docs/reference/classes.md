@@ -16,7 +16,7 @@ class Link {
 
 fn storeLink() {
   let links = map<string, Link>()
-  links["abc123"] = Link{ url: "https://example.com", created: 0, hits: 0 }
+  links["abc123"] = Link{ url = "https://example.com", created = 0, hits = 0 }
 
   let l = links["abc123"]
   println("abc123 -> ${l.url} (hits=${l.hits})")
@@ -41,7 +41,7 @@ zero value [Variables](variables.md#zero-values) covers for a plain `let`:
 
 ```bit
 fn freshLink(url: string): Link {
-  return Link{ url: url } // created: 0, hits: 0, filled in automatically
+  return Link{ url = url } // created: 0, hits: 0, filled in automatically
 }
 ```
 
@@ -62,7 +62,7 @@ copies the handle, not the fields:
 
 ```bit
 fn sameLink() {
-  let l = Link{ url: "https://example.com", created: 0, hits: 0 }
+  let l = Link{ url = "https://example.com", created = 0, hits = 0 }
   let sameOne = l // copies the handle, not the fields
   sameOne.hits = 1
   // l.hits is 1 too - they are the same Link
@@ -91,7 +91,7 @@ class LinkStats {
 }
 
 fn visit() {
-  let l = LinkStats{ url: "https://example.com", created: 0, hits: 0 }
+  let l = LinkStats{ url = "https://example.com", created = 0, hits = 0 }
   l.recordHit()
   l.recordHit()
   println("hits: ${l.hits}") // 2
@@ -113,7 +113,7 @@ count as it gets visited.
 ```bit
 fn trackVisits() {
   let links = map<string, LinkStats>()
-  links["abc123"] = LinkStats{ url: "https://example.com", created: 0, hits: 0 }
+  links["abc123"] = LinkStats{ url = "https://example.com", created = 0, hits = 0 }
 
   let l = links["abc123"]
   l.recordHit()
@@ -161,8 +161,8 @@ class Opts {
 }
 
 fn defaults(): int {
-  let a = Opts{}             // port 8080, host "127.0.0.1"
-  let b = Opts{ port: 3000 } // port 3000, host still defaulted
+  let a = Opts{}              // port 8080, host "127.0.0.1"
+  let b = Opts{ port = 3000 } // port 3000, host still defaulted
   return a.port + b.port
 }
 ```
@@ -180,7 +180,7 @@ scope:
 fn shorthandLiteral() {
   let url = "https://example.com"
   let created = 0
-  let l = Link{ url, created, hits: 0 } // same as url: url, created: created
+  let l = Link{ url, created, hits = 0 } // same as url: url, created: created
 }
 ```
 
@@ -195,7 +195,7 @@ class Timestamp {
 }
 
 fn buildReadonly() {
-  let t = Timestamp{ ns: 5 }
+  let t = Timestamp{ ns = 5 }
   println("${t.ns}") // 5
 }
 ```
@@ -232,12 +232,12 @@ class Inner {
 
 class Configured {
   export a: int,
-  export b: Inner = Inner{ n: 1 },
+  export b: Inner = Inner{ n = 1 },
 }
 
 fn separateDefaults(): int {
-  let x = Configured{ a: 1 }
-  let y = Configured{ a: 2 }
+  let x = Configured{ a = 1 }
+  let y = Configured{ a = 2 }
   x.b.n = 99
   return y.b.n // 1, not 99: x and y never shared the default
 }

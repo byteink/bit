@@ -55,8 +55,8 @@ import { newEncoder, newDecoder, HeaderField } from "std/http3"
 fn roundTrip(): []HeaderField! {
   let enc = newEncoder()
   let fields = []HeaderField{
-    HeaderField{ name: ":method", value: "GET", sensitive: false },
-    HeaderField{ name: ":path", value: "/index.html", sensitive: false },
+    HeaderField{ name = ":method", value = "GET", sensitive = false },
+    HeaderField{ name = ":path", value = "/index.html", sensitive = false },
   }
   let block = enc.encodeFieldSection(0, enc.insertCount(), fields)
 
@@ -82,7 +82,7 @@ fn dynamic(): []HeaderField! {
   dec.applyEncoderStream(enc.insertLiteral("x-trace-id", "abc123")?)?
 
   let fields = []HeaderField{
-    HeaderField{ name: "x-trace-id", value: "abc123", sensitive: false },
+    HeaderField{ name = "x-trace-id", value = "abc123", sensitive = false },
   }
   let block = enc.encodeFieldSection(0, enc.insertCount(), fields)
   return dec.decodeFieldSection(block)?
@@ -105,7 +105,7 @@ fn acknowledge(): int! {
   dec.applyEncoderStream(enc.insertLiteral("x-trace-id", "abc123")?)?
 
   let fields = []HeaderField{
-    HeaderField{ name: "x-trace-id", value: "abc123", sensitive: false },
+    HeaderField{ name = "x-trace-id", value = "abc123", sensitive = false },
   }
   let block = enc.encodeFieldSection(4, enc.insertCount(), fields)
   dec.decodeFieldSection(block)?
@@ -288,12 +288,12 @@ import { h3Dial, H3Request, H3Response, HeaderField } from "std/http3"
 fn getIndex(): H3Response! {
   let conn = h3Dial("127.0.0.1", 443, "example.com")?
   let req = H3Request{
-    method: "GET",
-    scheme: "https",
-    authority: "example.com",
-    path: "/",
-    headers: []HeaderField(0),
-    body: []byte(0),
+    method = "GET",
+    scheme = "https",
+    authority = "example.com",
+    path = "/",
+    headers = []HeaderField(0),
+    body = []byte(0),
   }
   return conn.request(req)?
 }
@@ -314,9 +314,9 @@ fn serve(certChainPem: string, keyPem: string): ()! {
   let conn = h3Accept(sock, certChainPem, keyPem)?
   let sr = conn.accept()?
   let resp = H3Response{
-    status: 200,
-    headers: []HeaderField(0),
-    body: []byte("ok"),
+    status = 200,
+    headers = []HeaderField(0),
+    body = []byte("ok"),
   }
   conn.respond(sr, resp)?
   conn.close()

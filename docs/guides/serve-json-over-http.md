@@ -25,12 +25,12 @@ fn route(req: Request): Response {
   let task = jsonDecodeText<Task>(req.body) catch e {
     return respond(400, "bad request: ${e.message()}")
   }
-  let saved = Task{ id: 1, title: task.title, done: true }
+  let saved = Task{ id = 1, title = task.title, done = true }
   return Response{
-    status: 201,
-    contentType: "application/json",
-    headers: "",
-    body: jsonEncode(saved.toJson()),
+    status = 201,
+    contentType = "application/json",
+    headers = "",
+    body = jsonEncode(saved.toJson()),
   }
 }
 

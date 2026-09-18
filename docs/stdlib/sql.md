@@ -430,7 +430,7 @@ import { Adapter, Datasource, Pool, pool, SslMode } from "std/sql"
 
 // The whole target in one string, as DATABASE_URL supplies it.
 fn fromUrl(a: Adapter, url: string): Pool! {
-  return pool(a, Datasource{ uri: url })?
+  return pool(a, Datasource{ uri = url })?
 }
 
 // Or field by field, with a bigger pool.
@@ -438,8 +438,8 @@ fn fromFields(a: Adapter, password: string): Pool! {
   return pool(
     a,
     Datasource{
-      host: "db.internal", user: "app", password: password,
-      database: "erp", sslmode: SslMode.VerifyFull, maxOpen: 20,
+      host = "db.internal", user = "app", password = password,
+      database = "erp", sslmode = SslMode.VerifyFull, maxOpen = 20,
     },
   )?
 }
@@ -622,7 +622,7 @@ connection pool per replica URI alongside the writer's own.
 import { Adapter, Datasource, Pool, pool } from "std/sql"
 
 fn withReplicas(a: Adapter, writerUrl: string, replicaUrls: []string): Pool! {
-  return pool(a, Datasource{ uri: writerUrl, replicas: replicaUrls })?
+  return pool(a, Datasource{ uri = writerUrl, replicas = replicaUrls })?
 }
 ```
 
@@ -1083,9 +1083,9 @@ class Order {
 fn orderMapper(rows: Rows): Order! {
   let cols = rows.columns()
   return Order{
-    id: sqlReqInt(rows, cols, "id")?,
-    price: sqlReqDecimal(rows, cols, "price")?,
-    refunded: sqlOptDecimal(rows, cols, "refunded")?,
+    id = sqlReqInt(rows, cols, "id")?,
+    price = sqlReqDecimal(rows, cols, "price")?,
+    refunded = sqlOptDecimal(rows, cols, "refunded")?,
   }
 }
 ```
@@ -1173,26 +1173,26 @@ class Shipment {
 fn shipmentMapper(rows: Rows): Shipment! {
   let cols = rows.columns()
   return Shipment{
-    id: sqlReqInt(rows, cols, "id")?,
-    trackingId: sqlReqUuid(rows, cols, "tracking_id")?,
-    externalId: sqlOptUuid(rows, cols, "external_id")?,
-    placedAt: sqlReqTimestamp(rows, cols, "placed_at")?,
-    cancelledAt: sqlOptTimestamp(rows, cols, "cancelled_at")?,
-    shipDate: sqlReqDate(rows, cols, "ship_date")?,
-    deliveredDate: sqlOptDate(rows, cols, "delivered_date")?,
-    cutoff: sqlReqTime(rows, cols, "cutoff")?,
-    pickupTime: sqlOptTime(rows, cols, "pickup_time")?,
-    manifest: sqlReqJson(rows, cols, "manifest")?,
-    extra: sqlOptJson(rows, cols, "extra")?,
-    settings: sqlReqJsonAs<ShipmentSettings>(rows, cols, "settings")?,
-    backorderSettings: sqlOptJsonAs<ShipmentSettings>(rows, cols, "backorder_settings")?,
-    itemIds: sqlReqArray<i64>(rows, cols, "item_ids", sqlElemInt)?,
-    weights: sqlReqArray<f64>(rows, cols, "weights", sqlElemFloat)?,
-    flags: sqlReqArray<bool>(rows, cols, "flags", sqlElemBool)?,
-    notes: sqlReqArray<string>(rows, cols, "notes", sqlElemText)?,
-    photos: sqlReqArray<[]byte>(rows, cols, "photos", sqlElemBlob)?,
-    totals: sqlReqArray<decimal>(rows, cols, "totals", sqlElemDecimal)?,
-    backorderIds: sqlOptArray<i64>(rows, cols, "backorder_ids", sqlElemInt)?,
+    id = sqlReqInt(rows, cols, "id")?,
+    trackingId = sqlReqUuid(rows, cols, "tracking_id")?,
+    externalId = sqlOptUuid(rows, cols, "external_id")?,
+    placedAt = sqlReqTimestamp(rows, cols, "placed_at")?,
+    cancelledAt = sqlOptTimestamp(rows, cols, "cancelled_at")?,
+    shipDate = sqlReqDate(rows, cols, "ship_date")?,
+    deliveredDate = sqlOptDate(rows, cols, "delivered_date")?,
+    cutoff = sqlReqTime(rows, cols, "cutoff")?,
+    pickupTime = sqlOptTime(rows, cols, "pickup_time")?,
+    manifest = sqlReqJson(rows, cols, "manifest")?,
+    extra = sqlOptJson(rows, cols, "extra")?,
+    settings = sqlReqJsonAs<ShipmentSettings>(rows, cols, "settings")?,
+    backorderSettings = sqlOptJsonAs<ShipmentSettings>(rows, cols, "backorder_settings")?,
+    itemIds = sqlReqArray<i64>(rows, cols, "item_ids", sqlElemInt)?,
+    weights = sqlReqArray<f64>(rows, cols, "weights", sqlElemFloat)?,
+    flags = sqlReqArray<bool>(rows, cols, "flags", sqlElemBool)?,
+    notes = sqlReqArray<string>(rows, cols, "notes", sqlElemText)?,
+    photos = sqlReqArray<[]byte>(rows, cols, "photos", sqlElemBlob)?,
+    totals = sqlReqArray<decimal>(rows, cols, "totals", sqlElemDecimal)?,
+    backorderIds = sqlOptArray<i64>(rows, cols, "backorder_ids", sqlElemInt)?,
   }
 }
 ```

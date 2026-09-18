@@ -38,12 +38,12 @@ class LinkPage {
       return Option.None
     }
     this.n = this.n - 1
-    return Option.Some(Link{ url: "https://example.com", created: 0, hits: 0 })
+    return Option.Some(Link{ url = "https://example.com", created = 0, hits = 0 })
   }
 }
 
 fn main() {
-  let page = LinkPage{ n: 3 }
+  let page = LinkPage{ n = 3 }
   let count = 0
   while (true) {
     match (page.next()) {

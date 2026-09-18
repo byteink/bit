@@ -536,7 +536,7 @@ Fails if `value` contains a raw CR, LF or NUL - again the same check
 import { Header, serializeHeaders } from "std/http"
 
 fn authHeaders(token: string): []Header {
-  return [Header{ name: "Authorization", value: "Bearer ${token}" }]
+  return [Header{ name = "Authorization", value = "Bearer ${token}" }]
 }
 
 fn wireBlockFor(token: string): string! {
@@ -1084,6 +1084,6 @@ fn authedClient(token: string): Client! {
 
 // One call with an extra header layered on top of the client's default.
 fn fetchWithTrace(c: Client, url: string, traceId: string): Response! {
-  return c.requestWith("GET", url, [Header{ name: "X-Request-Id", value: traceId }], "")?
+  return c.requestWith("GET", url, [Header{ name = "X-Request-Id", value = traceId }], "")?
 }
 ```

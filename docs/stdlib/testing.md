@@ -123,7 +123,7 @@ class Point {
 }
 
 test "points" {
-  eq<Point>(Point{ x: 1, y: 2 }, Point{ x: 1, y: 2 }, "same point")
+  eq<Point>(Point{ x = 1, y = 2 }, Point{ x = 1, y = 2 }, "same point")
 }
 ```
 
@@ -230,9 +230,9 @@ class Case { name: string, got: int, want: int }
 test "table" {
   defer checkDone()
   let cases = [
-    Case{ name: "a", got: 1, want: 1 },
-    Case{ name: "b", got: 2, want: 20 },
-    Case{ name: "c", got: 3, want: 30 },
+    Case{ name = "a", got = 1, want = 1 },
+    Case{ name = "b", got = 2, want = 20 },
+    Case{ name = "c", got = 3, want = 30 },
   ]
   for (let i = 0; i < len(cases); i++) {
     checkEq(cases[i].got, cases[i].want, "case ${cases[i].name}")

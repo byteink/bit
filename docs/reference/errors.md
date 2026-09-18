@@ -33,8 +33,8 @@ class MemoryStore {
 }
 
 fn main() {
-  let store = MemoryStore{ links: map<string, Link>() }
-  let l = store.get("abc123") catch Link{ url: "", created: 0, hits: 0 }
+  let store = MemoryStore{ links = map<string, Link>() }
+  let l = store.get("abc123") catch Link{ url = "", created = 0, hits = 0 }
   println("abc123 -> ${l.url}")
 }
 ```
@@ -103,11 +103,11 @@ class MemoryStore {
 }
 
 fn main() {
-  let store = MemoryStore{ links: map<string, Link>() }
+  let store = MemoryStore{ links = map<string, Link>() }
 
   store.get("zzz") catch e {
     println("zzz -> unresolved: ${e.message()}")
-    Link{ url: "", created: 0, hits: 0 }
+    Link{ url = "", created = 0, hits = 0 }
   }
 }
 ```
@@ -157,7 +157,7 @@ class Link {
 
 fn recordHit(l: Link): Link {
   assert(l.hits >= 0, "hit count must not go negative")
-  return Link{ url: l.url, created: l.created, hits: l.hits + 1 }
+  return Link{ url = l.url, created = l.created, hits = l.hits + 1 }
 }
 ```
 

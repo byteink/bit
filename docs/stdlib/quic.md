@@ -76,7 +76,7 @@ One ACK Range (RFC 9000 §19.3.1): a `gap` of unacknowledged packets and a
 import { AckRange } from "std/quic"
 
 fn example(): AckRange {
-  return AckRange{ gap: 1, rangeLength: 4 }
+  return AckRange{ gap = 1, rangeLength = 4 }
 }
 ```
 
@@ -91,14 +91,14 @@ import { AckFrame, AckRange } from "std/quic"
 
 fn example(): AckFrame {
   return AckFrame{
-    largest: 10,
-    delay: 3,
-    firstRange: 2,
-    ranges: [AckRange{ gap: 1, rangeLength: 4 }],
-    ecn: false,
-    ect0: 0,
-    ect1: 0,
-    ce: 0,
+    largest = 10,
+    delay = 3,
+    firstRange = 2,
+    ranges = [AckRange{ gap = 1, rangeLength = 4 }],
+    ecn = false,
+    ect0 = 0,
+    ect1 = 0,
+    ce = 0,
   }
 }
 ```
@@ -114,12 +114,12 @@ import { StreamFrame } from "std/quic"
 
 fn example(data: []byte): StreamFrame {
   return StreamFrame{
-    id: 4,
-    offset: 8,
-    data: data,
-    hasOffset: true,
-    hasLength: true,
-    fin: true,
+    id = 4,
+    offset = 8,
+    data = data,
+    hasOffset = true,
+    hasLength = true,
+    fin = true,
   }
 }
 ```
