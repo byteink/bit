@@ -1,0 +1,296 @@
+// Self-host: judging a resolved call's ARGUMENTS once arity is already
+// decided (#5601, split off validatecall.bit under the 800-line lint
+// limit — validatecall.bit's own header and validateoperator.bit for the
+// operator-operand rules #4548 moved out before this; this is that file's
+// SECOND split). Owns the `...` spread legality scan and the per-argument
+// TYPE judgement, for both a resolved free-function call (`vCallArgTypes`,
+// reading `CallDecl`'s declaration-shaped parameters) and a method/
+// func-value call (`vFuncSigArgTypes`, reading an interned signature's
+// `members`) — deliberately two functions reading the same rule off two
+// different shapes (see `vFuncSigArgTypes`'s own comment) rather than one
+// that would need to branch on which shape it was given (E0204).
+//
+// `vCallArgsAreTyped`/`vCallArity` (arity, not argument types) stayed in
+// namedargs.bit under #5244 rather than following here: they share
+// `CallDecl`/`CallArity` with the named-argument path in that file, while
+// everything here is pure per-argument TYPE judgement with no named-
+// argument concern of its own.
+
+// The `...` spread scan: E0063 for a spread that is duplicated, aimed at a
+// non-variadic callee, or not final — reported at the spread argument, as
+// the seed does. Returns its index, or -1 if the call carries none. Split
+// out of `vCallKnownDecl` for the same complexity reason.
+fn vCallSpreadAt(c: Checker, args: []int, variadic: bool, got: int): int {
+  let spreadAt = -1
+  let ai = 0
+  while (ai < got) {
+    if (getNode(c.tree, args[ai]).tag == Tag.ArgSpread) {
+      if (spreadAt >= 0 || !variadic || ai != got - 1) {
+        reportNoHint(
+          c.diags, ecInvalidSpread, vSpan(c, args[ai]),
+          "'...' spread is only valid as the final argument of a variadic call",
+        )
+      }
+      spreadAt = ai
+    }
+    ai = ai + 1
+  }
+  return spreadAt
+}
+
+// The `...` spread shapes `vCallArgTypes` can judge: at most one spread, and it
+// final, on a variadic callee, landing on the rest parameter's own index — two
+// spreads means the first is not final, so the "final" test covers duplication
+// too. Any other placement is E0063 (position) or E0050 (count), and leaves no
+// argument-to-parameter mapping to judge against.
+//
+// #4655: this was a flat "any spread at all, undecidable", which left EVERY
+// argument of a spread call unchecked — the spread and the fixed prefix in
+// front of it alike. `takesInts(...s)` with `s: string` into `...xs: i64` read
+// the string header as a slice header and summed its bytes, `bit check` and
+// `bit run` both exiting 0.
+fn vSpreadsAreTyped(c: Checker, args: []int, variadic: bool, want: int): bool {
+  let i = 0
+  while (i < len(args)) {
+    if (getNode(c.tree, args[i]).tag == Tag.ArgSpread) {
+      if (!variadic || i != len(args) - 1 || i != want - 1) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `vCallArgsAreTyped`/`vCallArity` moved to namedargs.bit (SPEC §10.3,
+// #5244): both grew a `minWant` parameter for defaulted-argument arity and
+// pushed this file past its 800-line ceiling; namedargs.bit already owns
+// `CallDecl`/`CallArity`, the shapes they read, so it is the natural home
+// rather than a new split file.
+
+// A GENERIC callee's substitution env (#2243): its type arguments,
+// inferred from THIS call, bound onto its type params. `ok` is false when
+// inference left a gap — THE SAFETY RULE: an un-inferred type param comes
+// back as `void` from `genericTypeArgs`, and substituting that would
+// manufacture `expected '()', found 'i64'` on code this validator has
+// always accepted, so the gap is never JUDGED here — bail on the whole call
+// rather than report against a type nobody wrote. `vGenericGap`
+// (validategeneric.bit) reports the gap ITSELF as E0068 when the arguments
+// are all typed, which is SPEC §15.3 and not a judgement of any of them.
+// Split out of `vCallKnownDecl` for the same complexity reason. Takes the
+// whole `CallDecl` rather than three of its fields (E0202, and `vGenericGap`
+// needs the parameter list).
+//
+// #4597: a VARIADIC generic callee is judged here too. #4548 bailed on one
+// unchecked because an EMPTY variadic slot binds nothing — `each()` for
+// `fn each<T>(...xs: T)` runs on main and became E0068 the moment it reached
+// `vGenericGap`, which had been measured only on the fixed-arity shape. That
+// gap is now told apart from a program's own (`vEmptyRestGapIsSilent`,
+// validategeneric.bit) instead of the whole shape being refused, so
+// `each("a", 1)` — two element types in one variadic slot — is rejected and
+// `tally(7)` no longer segfaults on an `int` in a `label: string` prefix.
+// #4633 narrowed that silence to a type parameter `()` is a legal argument
+// for: an empty slot at a BOUNDED `<T: Named>` is E0068 here, not E0092 inside
+// the template.
+fn vCallGenericEnv(c: Checker, node: int, cd: CallDecl): (TypeEnv, bool) {
+  let targs = genericTypeArgs(c, cd.name, node)
+  if (vGenericGap(c, node, cd, targs)) {
+    return emptyTypeEnv(), false
+  }
+  let env = genericEnvOf(cd.owner, cd.decl, targs)
+  if (len(env.params) == 0) {
+    return env, false
+  }
+  return env, true
+}
+
+// Argument TYPES, checked only once `vCallArity` has proven the call
+// decidable. The parameter's declared type is read from its OWNING module's
+// tree (`owner`, via declOwner) — a cross-module call reads the exporter's
+// nodes, never this module's. Type ids are interned in the shared ctx, so
+// the id compared here is the same id either side would produce.
+//
+// A GENERIC callee is judged against its parameter types with THIS call's
+// inferred type arguments substituted in (#2243). Judging the declared type
+// raw would decide nothing — `vAssignable` accepts a bare type param on either
+// side unchecked — which is why `eq(got: T, want: T, label: string)` accepted
+// `eq(1, true, "x")`, reported `ok`, and made every assertion in the corpus
+// unable to fail in the green direction. Substituting is what turns `want: T`
+// into `want: i64` and lets the ordinary expectation answer.
+//
+// Bound by ID over the CHECKED parameter type, not by name over its node:
+// `genericEnvOf` keys on the ids `registerGenerics` recorded for THIS decl,
+// so a module declaring two generics that both spell a param `T` cannot bind
+// one decl's body against the other's id. Same env and same `substType` that
+// `validateInstantiations` uses one phase later.
+//
+// #3050 FIX: an interface parameter is no longer skipped here. vExpectExpr
+// routes to vAssignable's §14.3 branch, which answers BOTH the narrow
+// "non-class value can't sit behind an interface" case (E0041, the
+// "cannot store" wording) AND the general case this bug is about — a
+// class that is storable but does not satisfy the parameter's method set
+// (E0041, the "'T' has no method ...' / 'is (...) => ...'" wording). Before
+// this fix neither vCall nor vCallAgainstFuncSig (validatemethodcall.bit) ever
+// reached the general case for ANY call shape (free, method, or
+// func-value): each assumed the other covered it via vIfaceStore, which
+// covers only the narrow case (its own header, validateiface.bit:264-273,
+// says so explicitly) — so a class argument that did not implement the
+// required interface built rc=0 and segfaulted at the uninitialized method
+// dispatch slot.
+//
+// #4548 FIX: a VARIADIC callee is judged here too, so the parameter index
+// clamps at `cd.fixed`. `...xs: T` absorbs every argument past the fixed
+// prefix and each one must be a T — and a `ParamRest`'s declared type NODE
+// already IS the element type T, since `paramBindType` (checklookup.bit)
+// widens it to `[]T` only for the body's own binding. Returning before this
+// loop for every variadic call, as `vCallArity` did, left the whole call
+// unchecked: an arrow literal passed to `...xs: int` printed its address,
+// and an `int` passed to the FIXED `label` of `tag(label: string, ...xs:
+// int)` segfaulted. Both `bit check` rc=0.
+//
+// vCallArgIface (validateiface.bit) answers the narrow "cannot store" case
+// via vIfaceStore and skips exactly the shape this loop reaches, so the two
+// never double-report `take(7)` for `take(p: Any)`: its guard ASKS
+// `vCallArgsAreTyped`, above. Split out of `vCallKnownDecl`
+// for the same complexity reason as its siblings above.
+fn vCallArgTypes(c: Checker, cd: CallDecl, args: []int, got: int, env: TypeEnv) {
+  let i = 0
+  while (i < got) {
+    let a = args[i]
+    // An `...xs` spread wraps its operand exactly as an `Arg` node does, but
+    // supplies the WHOLE rest slice rather than one element of it, so it is
+    // judged against `[]P` for the rest parameter's declared element type P.
+    // That is the same `[]T` `lowerVariadicTail` (lowerprim.bit) forwards the
+    // operand as, and P is the same element type `spreadElemType`
+    // (checkexprcall.bit) binds a type parameter from (#4645) — checker,
+    // validator and lowering read one element type or the callee binds a
+    // header it was not passed.
+    let spread = getNode(c.tree, a).tag == Tag.ArgSpread
+    if (spread || getNode(c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(c.tree, a)[0]
+    }
+    vCallArgExpect(c, a, vCallArgWant(c, cd, i, spread, env))
+    i = i + 1
+  }
+}
+
+// The type argument `i` is judged against: its parameter's declared type, with
+// this call's inferred type arguments substituted in for a generic callee, and
+// widened to `[]P` when the argument is a `...` spread. Split out of the loop
+// above purely to keep THAT function's McCabe complexity under E0204's 10
+// (spec/LINT.md) once #4655 added the spread widening, exactly as its siblings
+// were split out of `vCallKnownDecl`.
+//
+// A variadic signature's parameter index clamps at `cd.fixed`: `...xs: T`
+// absorbs every argument past the fixed prefix and a `ParamRest`'s declared type
+// NODE already IS the element type T, since `paramBindType` (checklookup.bit)
+// widens it to `[]T` only for the body's own binding. The spread is the one
+// argument that supplies that `[]T` itself, so it — and only it — is judged
+// against the widened type.
+fn vCallArgWant(c: Checker, cd: CallDecl, i: int, spread: bool, env: TypeEnv): int {
+  let pi = i
+  if (cd.variadic && pi > cd.fixed) {
+    pi = cd.fixed
+  }
+  let pty = paramDeclaredType(cd.owner, kidsOf(cd.owner.tree, cd.params[pi]))
+  if (cd.generic) {
+    pty = substType(cd.owner, pty, env, 0)
+    // Still open or still rigid after substitution: this parameter's type was
+    // not settled by inference, so it decides nothing. Same guard, same
+    // reason, as validateinst.bit's per-monomorphization pass.
+    if (pty != 0 && (vMentionsInvalid(c, pty, 0) || vHasTypeParam(c, pty, 0))) {
+      pty = 0
+    }
+  }
+  if (spread && pty != 0) {
+    return mkSlice(c.ctx, pty)
+  }
+  return pty
+}
+
+// Every argument of a method or func-value call `vCallAgainstFuncSig`
+// (validatemethodcall.bit) has proven decidable, against the parameter it lands on.
+// Kept HERE, beside `vCallArgTypes`/`vCallArgWant`: this is the same rule read
+// off an interned signature's `members` instead of a declaration's parameter
+// nodes, and the two spellings drift the moment they stop being read together
+// (#4661 was exactly that drift). Two functions so neither carries the
+// other's branches (E0204).
+fn vFuncSigArgTypes(c: Checker, params: []int, args: []int, variadic: bool) {
+  let i = 0
+  while (i < len(args)) {
+    let a = args[i]
+    // An `...xs` spread wraps its operand exactly as an `Arg` node does.
+    let spread = getNode(c.tree, a).tag == Tag.ArgSpread
+    if (spread || getNode(c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(c.tree, a)[0]
+    }
+    // #3050 FIX: was vExpectExprNonIface, skipping an interface parameter on
+    // the claim that "vIfaceStore's rule" covered it "elsewhere" — but
+    // vIfaceStore is never called on a method or func-value call's arguments
+    // at all (re-derived by grep on 2026-09-08, #4491: its ONE remaining call
+    // site is vCallArgIface, free calls only — the plain-assignment site it
+    // also had is now vAssign's vExpectExpr). So a class argument that did not
+    // satisfy an interface-typed method or func-value parameter was never
+    // checked: `h.take(cash)` built rc=0 and segfaulted exactly like the
+    // free-call shape vCall now fixes. No double-report risk here: nothing
+    // else answers an interface-typed argument for this call shape.
+    vExpectExpr(c, a, vFuncSigArgWant(c, params, variadic, i, spread))
+    i = i + 1
+  }
+}
+
+// The type argument `i` is judged against: `vCallArgWant`'s rule above, read
+// off an interned signature's `members` rather than a declaration's parameter
+// nodes. The spread is the one argument supplying the whole `[]P` instead of a
+// single element of it, so it — and only it — is judged widened.
+fn vFuncSigArgWant(c: Checker, params: []int, variadic: bool, i: int, spread: bool): int {
+  let pi = i
+  let rest = len(params) - 1
+  if (variadic && pi > rest) {
+    pi = rest
+  }
+  let pty = params[pi]
+  if (spread && pty != 0) {
+    return mkSlice(c.ctx, pty)
+  }
+  return pty
+}
+
+// One argument against its parameter type, and the #4583 exemption. `pty == 0`
+// is "no expectation" as everywhere else. A node classfieldattrbuild.bit
+// synthesized (`compiler/ast.bit`'s `synth`) is exempt because the field's own
+// value is passed as the desugared call's FIRST argument carrying the FIELD's
+// span: E0041 there restates E0135 against a line the reader never wrote as a
+// call. The mark is never set on an expression cloned from source, so an
+// attribute's own extra arguments (`@min(this.name, "3")`) are still judged
+// here -- those have no E0135 of their own and E0041 is their only diagnostic.
+fn vCallArgExpect(c: Checker, a: int, pty: int) {
+  if (pty == 0 || isSynth(c.tree, a)) {
+    return
+  }
+  vExpectExpr(c, a, pty)
+  vNoteStringConversion(c, a, pty)
+}
+
+// #5324 SPEC §12.12: a `string` argument that got a primitive instead (a JSX
+// attribute value, `data-id={n}`, most often) gets a note naming the
+// interpolation spelling that converts it. Re-derives `vExpectExpr`'s own
+// verdict via `vAssignableNode`, `TypeKind.Prim`-only per SPEC §5.7.
+fn vNoteStringConversion(c: Checker, node: int, pty: int) {
+  if (pty != primType(c.ctx, 11)) {
+    return
+  }
+  let ty = checkExprType(c, node)
+  if (ty == 0 || vMentionsInvalid(c, ty, 0) || c.ctx.types[ty].kind != TypeKind.Prim) {
+    return
+  }
+  if (vAssignableNode(c, node, ty, pty)) {
+    return
+  }
+  let sp = getNode(c.tree, node).span
+  note(
+    c.diags,
+    vSpan(c, node),
+    "convert with string interpolation: \"\${${c.source[sp.start:sp.end]}}\"",
+  )
+}
