@@ -48,5 +48,14 @@ scalars, anchors and the expansion budget that bounds them, encoding a
 value back to text, and the errors this package raises - is in
 [`docs/`](docs/README.md).
 
+<!-- BENCH:START -->
+Pending: `pkg/yaml/bench/run.sh` (#5501) publishes the parse-throughput table
+against `github.com/goccy/go-yaml` and `gopkg.in/yaml.v3` here on its next
+full run (15+ runs, an idle box — see `pkg/yaml/bench/README.md`). The
+harness is built, and every implementation is proven to parse
+`bench/data/k8s-manifests.yaml` to the identical checksum by `./run.sh
+--verify`; only the timed measurement itself has not been taken yet.
+<!-- BENCH:END -->
+
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
