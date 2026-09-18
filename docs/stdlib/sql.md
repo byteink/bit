@@ -1,11 +1,13 @@
 # std/sql
 
-The database driver contract - an interface with **no driver behind it**.
-Nothing here talks to a database; `bit/pkg/` is where a concrete driver will
-eventually live, consumed by name through the `Registry` this module defines.
-Shipping the contract from stdlib rather than as a package is deliberate: a
-contract shipped as a package invites a second, competing one, and every
-driver ends up picking a side. Go's `database/sql` is the shape this follows.
+The database driver contract. Two drivers exist today, `bit/pkg/postgres` and
+`bit/pkg/mysql` - see "The freeze" below for what building both proved.
+Neither talks to `std/sql` through the `Driver`/`Registry` pair this page
+opens with; both ship their own `Adapter` instead (`Datasource` and `Adapter`
+are documented under "The connection pool"). Shipping the contract from
+stdlib rather than as a package is still deliberate: a contract shipped as a
+package invites a second, competing one, and every driver ends up picking a
+side. Go's `database/sql` is the shape this follows.
 
 **The only way to supply a value is `params []Value`.** `query`/`exec` take
 the literal SQL text and an ordered list of typed `Value`s as two separate
@@ -202,6 +204,188 @@ fn firstName(conn: Conn, id: string): string! {
   return asText(rows.value(0))?
 }
 ```
+
+## The freeze
+
+`bit/pkg/postgres` (#3987-3989) and `bit/pkg/mysql` (#3993-3995) were built
+together, deliberately, to answer one question: is `std/sql`'s contract
+actually driver-agnostic, or does building the first driver quietly bend it
+to fit? Postgres landed first. MySQL was explicitly free to change `Value`,
+`Driver`, `Conn`, `Rows`, `Stmt`, `Tx` or `Registry` if it needed to. This is
+the record of what it actually needed, checked against the real history
+rather than against what either ticket expected to find - and, now that both
+have shipped, the point at which these seven names stop moving.
+
+### Proving the swap is one line
+
+The design's whole claim is that switching database costs one import line.
+Here it is checked directly rather than asserted: the same tiny handler,
+built once against each driver.
+
+```bit ignore
+// pkg/postgres version
+import { pool, Datasource, sqlReqText, Value, Pool } from "std/sql"
+import { adapter } from "postgres"
+import { App, Config, Ctx, Res } from "web"
+import { env } from "std/os"
+
+fn userName(c: Ctx, db: Pool): Res! {
+  let rows = db.query("select name from users where id = $1", []Value{ Value.Text(c.param("id")) })?
+  defer rows.close()
+  rows.next()?
+  return c.text(sqlReqText(rows, rows.columns(), "name")?)
+}
+
+fn main(): ()! {
+  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
+  let app = App(Config{ secret: env("APP_SECRET") })
+  app.get("/users/:id", (c) => userName(c, db))
+  app.listen()?
+}
+```
+
+```bit ignore
+// pkg/mysql version
+import { pool, Datasource, sqlReqText, Value, Pool } from "std/sql"
+import { adapter } from "mysql"
+import { App, Config, Ctx, Res } from "web"
+import { env } from "std/os"
+
+fn userName(c: Ctx, db: Pool): Res! {
+  let rows = db.query("select name from users where id = $1", []Value{ Value.Text(c.param("id")) })?
+  defer rows.close()
+  rows.next()?
+  return c.text(sqlReqText(rows, rows.columns(), "name")?)
+}
+
+fn main(): ()! {
+  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
+  let app = App(Config{ secret: env("APP_SECRET") })
+  app.get("/users/:id", (c) => userName(c, db))
+  app.listen()?
+}
+```
+
+Both are fenced `ignore` here because a page checked by `test-docs` only ever
+resolves `std/*` (`_tests_/bit/docs.bit`'s own header: "against the real
+prelude and the real `std/*`"), and no gate anywhere typechecks a page that
+imports two `pkg/` packages at once - `test-package-docs` wires exactly one
+package (the one whose own `docs/` tree it is scanning) as a local
+dependency per page (`_tests_/bit/pkgdocsgate.bit`'s header). So this pair
+was checked by hand instead of by a standing gate: a scratch project per
+variant, each declaring `postgres`/`web` or `mysql`/`web` as a local-path
+dependency on this checkout's own `pkg/`, `bit check` on both (clean, exit
+0), and a mutation control - breaking the import name - failing loudly (exit
+1, `E0045`) to confirm the check was live rather than vacuous. `diff` on the
+two source files shows exactly one changed line, the import naming the
+driver package; nothing else in the handler, the route or `main` moves. This
+is a one-time hand verification, not a gate; a future change to either
+adapter's public shape is not re-checked by it automatically.
+
+### What each interface actually did, six of six
+
+`stdlib/sql/sql.bit` - the file declaring `Value`, `Driver`, `Conn`, `Rows`,
+`Stmt`, `Tx` and `Registry` - has exactly four commits since it was created
+(`9b720102`): the creation itself, and three purely mechanical, repo-wide
+formatter sweeps (`13017a3e`'s receiver-form-to-class-body move, and
+`1e15ec44` plus its own revert `143f9e02` for the `=` `field_init` spelling).
+**Zero commits from #3987-3995 - either driver's own work - touch this
+file at all.** Checked directly: neither `mysql` nor `#399[3-5]` matches
+any commit on `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
+(`Adapter`/`Datasource`) or `stdlib/sql/tx.bit` (`Executor`).
+
+| Interface | Changed by either driver | What actually happened |
+|---|---|---|
+| `Value` | No | Stayed `{Null, Int, Float, Text, Blob}` (#5421, owner ruling: extend by accessor, not by enum variant - see below). |
+| `Driver` | No | Neither adapter implements it. `pkg/postgres/adapter.bit:86` and `pkg/mysql/adapter.bit:104` both export `fn adapter(): Adapter` (`config.bit`'s `Adapter`, added by #3962 before either driver existed), never a `Driver`. The only implementer anywhere in the tree is `stdlib/sql/sqlcheck.bit`'s `fakeDriver`, a self-test double. |
+| `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:30`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The one gap this froze open," below, for `begin`. |
+| `Rows` | No | `pgRows`/`myRows` implement `next`/`columns`/`value`/`close` verbatim. MySQL's `TINYINT(1)`-as-bool and JSON-as-the-field's-own-type ambiguities are resolved by which accessor the caller reaches for (`sqlReqBool` vs `sqlReqInt`, `sqlReqJson`), never by `Rows` itself. |
+| `Stmt` | No | `pgStmt`/`myStmt` implement `query`/`exec`/`close` verbatim. MySQL's `$1`-to-`?` placeholder rewrite (`pkg/mysql/rewrite.bit`) and its statement cache both run *inside* `prepare`, invisible at the `Stmt` boundary. |
+| `Tx` | No (but see below) | Signature untouched, and both drivers fail `begin` with the same shape - which is the interesting finding, not a change. |
+| `Registry` | No | Unused by both real drivers, same as `Driver`; exercised only by `sqlcheck.bit`'s fake. |
+
+**6 of 6 checked. 0 of 6 changed.** What MySQL actually needed - the session
+`time_zone='+00:00'` pin at connect, the reversed `TIMESTAMP`/`DATETIME`
+mapping, its own DECIMAL binary format - all landed *inside* `myConn`/its
+codecs, never at the `Conn`/`Rows`/`Stmt` boundary. The one place the design
+predicted an extension point and a driver actually used it is `Value`:
+#5421 settled that a type a codec produces (`decimal`, later `Instant`,
+`UUID`, `Json`, arrays) gets a `sqlReqX`/`sqlOptX` pair in
+`stdlib/sql/row.bit`/`rowtypes.bit`, reading `Value.Text` and converting -
+exactly the shape `pkg/mysql`'s own `mysqlDecimal` had already shipped by
+hand before the decision was written down. `Value` itself never grew a
+variant.
+
+### The one gap this froze open
+
+`Conn.begin(): Tx!` is declared and implemented by both drivers - and both
+implementations are the same one line:
+
+```
+pkg/postgres/conn.bit:70   fail newError("postgres: begin is not implemented yet (epic #3986)")
+pkg/mysql/conn.bit:217     fail newError("mysql: begin is not implemented yet (epic #3986)")
+```
+
+Neither ever issues `BEGIN`/`START TRANSACTION`. That stub predates #3979
+(closure-scoped transactions, the *only* public transaction API - see
+[Transactions](#transactions)), which built `tx`/`txAt`/`txValue`/`txValueAt`
+on top of `Pool`'s own (unexported) `begin`, which in turn calls straight
+through to `Conn.begin`. Nobody went back to wire either driver's `begin` up
+once #3979 landed. The result: `pool.tx((db) => { ... })` against a real
+Postgres or MySQL connection fails immediately, every time, with the message
+above - not a gap in the interface, a gap in both implementations of it.
+`stdlib/sql/pool.test.bit`'s `stubConn.begin()` is the only `begin` in the
+whole tree that actually starts anything, which is why `tx.test.bit`'s and
+`pool.test.bit`'s own suites are green: they prove the closure machinery
+against a fake that behaves, never against either shipped driver. Filed as
+#5587, since fixing two drivers' connection code is out of a docs ticket's
+reach and out of this ticket's own "do not change an interface" constraint -
+`Conn.begin`'s signature is fine as declared; issuing real SQL from inside it
+is the missing part.
+
+### What a third driver breaks
+
+Postgres and MySQL are both networked servers with users, passwords and a
+TLS handshake, so building only these two hid every place the contract
+assumes that. SQLite does not:
+
+- **`Datasource.host`/`port`/`connectTimeout`.** `config.bit`'s own comment
+  on the class already flags this for this ticket by number: *"`host`/
+  `port`/`sslmode` bake a network database assumption into the generic
+  layer. SQLite has no host and no port and would leave all three at their
+  defaults."* A SQLite adapter's `connect` would ignore three of
+  `Datasource`'s fields outright rather than reading them, which is a
+  silent gap the type system cannot flag.
+- **`SslMode`.** All five variants (`Negotiate`, `VerifyFull`, `VerifyCa`,
+  `Require`, `Disable`) describe a TLS negotiation against a server socket.
+  SQLite opens a local file; there is no handshake to negotiate, so a
+  SQLite `Adapter.connect` has no correct answer for a caller who sets
+  `sslmode=verify-full` beyond refusing it outright.
+- **`Pool`'s concurrency model.** `Datasource.maxOpen` defaults to 10
+  because a *server* arbitrates many physical connections concurrently
+  (`config.bit`'s own HikariCP citation). SQLite locks at the database
+  file, not per-connection, so a pool of ten connections against one
+  SQLite file mostly serializes on `SQLITE_BUSY` rather than gaining the
+  concurrency the default was sized for - the pool would need a
+  fundamentally different policy (a single writer, or busy-retry with
+  backoff), not just a smaller number.
+- **`FatalError`.** The marker exists so `Pool` can tell a dead *transport*
+  (a dropped socket, a short read) from an ordinary statement failure and
+  discard only the former. SQLite has no transport to drop; its
+  connection-poisoning failure modes - a corrupted file, a lock that never
+  clears - are a different class this interface was never shaped to name.
+
+### The freeze itself
+
+After this ticket, `Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and
+`Registry` are frozen: a change to any of their exported shapes is a stdlib
+API change under
+[`docs/release/VERSIONING.md`](../release/VERSIONING.md)'s surface 3, which
+takes at minimum a MINOR bump (MAJOR is pinned at 0 pre-1.0) whether the
+change is additive or breaking. Two independent drivers built against these
+seven names without moving one of them; a third driver is expected to extend
+`Value`'s reach through a new `sqlReqX`/`sqlOptX` pair, the way #5421 already
+settled, not by asking any of the seven to change shape.
 
 ## The connection pool
 
