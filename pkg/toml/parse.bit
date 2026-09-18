@@ -15,9 +15,9 @@
 // and lets that file answer.
 //
 // NO RECURSION FOR VALUE NESTING. `parseCompoundValue` drives an explicit
-// `[]Ctx` stack for arrays and inline tables, never a function calling
-// itself, so a maliciously deep run of `[`/`{` cannot grow the Bit call
-// stack — `pushContainer` refuses once `len(stack) >= tomlMaxDepth`
+// stack of `Ctx` frames for arrays and inline tables, never a function
+// calling itself, so a maliciously deep run of `[`/`{` cannot grow the Bit
+// call stack — `pushContainer` refuses once `frames.n >= tomlMaxDepth`
 // (`lex.bit`'s own bracket-depth cap, reused here as this parser's own flat
 // counter).
 //
@@ -35,10 +35,10 @@
 // bare words `true`/`false`/`inf`/`nan` and any all-digit run as
 // `Bool`/`Number` even in key position (its own header: a key-position digit
 // run has no way to tell itself apart from a value at the scanner level).
-// `parseKeySegment` accepts those tokens back as bare-key text too. A
+// `readKeyName` accepts those tokens back as bare-key text too. A
 // `Number` span that is a plain `digits '.' digits` float — no sign, no
 // exponent — is TOML's "numeric dotted key" (`1.2 = 3` meaning table `1`
-// key `2`): `parseNumericKeySegment`/`numericKeyDot` re-split it into two
+// key `2`): `numericKeySplit`/`numericKeyDot` re-split it into two
 // segments here, at the layer that knows a key path is expected, without
 // touching `lex.bit`'s own — correct — classification of that span as a
 // number. A sign or an exponent in a `Number` key span has no bare-key
@@ -134,7 +134,6 @@ fn expectLineEnd(p: Parser): ()! {
 
 // `[a.b.c]` / `[[a.b.c]]`: one `[` already confirmed by the caller.
 fn parseHeaderLine(p: Parser): ()! {
-  let start = p.lx.start
   advance(p)
   let isArray = p.lx.kind == TokenKind.LBracket
   if (isArray) {
@@ -146,25 +145,19 @@ fn parseHeaderLine(p: Parser): ()! {
     expectRBracket(p)?
   }
   expectLineEnd(p)?
-  p.current = resolveHeader(p, path, isArray, start)?
+  p.current = resolveHeader(p, path, isArray)?
   return
 }
 
-fn resolveHeader(p: Parser, path: []KeySeg, isArray: bool, start: int): WTable! {
-  if (len(path) == 0) {
-    fail tomlParseError("empty table header", start)
-  }
-  let t = p.root
-  let i = 0
-  while (i < len(path) - 1) {
-    t = descendIntermediate(t, path[i])?
-    i = i + 1
-  }
-  let last = path[len(path) - 1]
+// A header's own path resolution. `path` always carries at least its first
+// segment — `parseKeyPath` reads one or fails — so `[]` is `readKeyName`'s
+// own "expected a key", never an empty path this has to answer for.
+fn resolveHeader(p: Parser, path: KeyPath, isArray: bool): WTable! {
+  let t = descendPrefix(p.root, path)?
   if (isArray) {
-    return openArrayTableHeader(t, last)?
+    return openArrayTableHeader(t, lastName(path), lastOffset(path))?
   }
-  return openTableHeader(t, last)?
+  return openTableHeader(t, lastName(path), lastOffset(path))?
 }
 
 fn parseKeyValueLine(p: Parser): ()! {
@@ -179,93 +172,175 @@ fn parseKeyValueLine(p: Parser): ()! {
   return
 }
 
-fn applyKeyValue(t: WTable, path: []KeySeg, value: Toml): ()! {
-  let cur = t
-  let i = 0
-  while (i < len(path) - 1) {
-    cur = descendIntermediate(cur, path[i])?
-    i = i + 1
-  }
-  setLeaf(cur, path[len(path) - 1], value)?
+fn applyKeyValue(t: WTable, path: KeyPath, value: Toml): ()! {
+  let cur = descendPrefix(t, path)?
+  setLeaf(cur, lastName(path), lastOffset(path), value)?
   return
 }
 
+// Descends every segment of `path` but the last, creating implicit tables on
+// the way — the prefix walk a `[header]` and a dotted key/value line share.
+// An undotted path has no prefix at all, which is the common case.
+fn descendPrefix(t: WTable, path: KeyPath): WTable! {
+  let n = len(path.rest)
+  if (n == 0) {
+    return t
+  }
+  let cur = descendIntermediate(t, path.name, path.offset)?
+  let i = 0
+  while (i < n - 1) {
+    cur = descendIntermediate(cur, path.rest[i].name, path.rest[i].offset)?
+    i = i + 1
+  }
+  return cur
+}
+
+// The terminal segment — the one `setLeaf`/`openTableHeader`/
+// `openArrayTableHeader` acts on. Its name and its offset are read
+// separately so an undotted path never has to materialize a segment object
+// for a name and an offset `KeyPath` already holds inline.
+fn lastName(path: KeyPath): string {
+  let n = len(path.rest)
+  if (n == 0) {
+    return path.name
+  }
+  return path.rest[n - 1].name
+}
+
+fn lastOffset(path: KeyPath): int {
+  let n = len(path.rest)
+  if (n == 0) {
+    return path.offset
+  }
+  return path.rest[n - 1].offset
+}
+
+// A parsed key path: the first segment's name and the byte offset of its own
+// token, held INLINE — the only segment an undotted key has, which is nearly
+// every key in a document — with `rest` left at its zero value (SPEC §13.4:
+// an omitted slice field IS the empty slice, no allocation) until a `.` is
+// actually seen. Before #5583 a path was a `[]KeySeg`, so every key in the
+// document paid a slice header, a one-element element buffer and a `KeySeg`
+// object to say one name and one offset.
+class KeyPath { name: string, offset: int, rest: []KeySeg }
+
+// One path segment past the first, paired with the byte offset of its own
+// token — `TomlError.offset` names the failing construct, not the whole line.
+class KeySeg { name: string, offset: int }
+
 // One or more `.`-separated key segments. Bounded by `tokenBound`: each
 // extra segment consumes at least a `.` and a key token.
-fn parseKeyPath(p: Parser): []KeySeg! {
-  let segs = parseKeySegment(p)?
+fn parseKeyPath(p: Parser): KeyPath! {
+  let path = startKeyPath(p)?
   let guard = 0
   let bound = tokenBound(p)
   while (p.lx.kind == TokenKind.Dot && guard <= bound) {
     advance(p)
-    segs = append(segs, ...parseKeySegment(p)?)
+    extendKeyPath(p, path)?
     guard = guard + 1
   }
-  return segs
+  return path
 }
 
-// One path segment, or — only for a numeric dotted key — two: a bare key,
-// `true`/`false` (lexed as `Bool` even in key position), a quoted key, or a
-// `Number` span (an all-digit/`inf`/`nan` run as one segment, or a plain
-// `digits '.' digits` float re-split into two; see this file's header).
-fn parseKeySegment(p: Parser): []KeySeg! {
+// The path's first segment — or its first TWO, for a numeric dotted key,
+// the one token that stands for two segments (see this file's header).
+fn startKeyPath(p: Parser): KeyPath! {
+  let start = p.lx.start
+  let end = p.lx.end
+  let split = numericKeySplit(p)
+  match (split) {
+    Some(d) => {
+      advance(p)
+      let path = KeyPath{ name: p.src[start:d], offset: start }
+      path.rest = append(path.rest, KeySeg{ name: p.src[d + 1:end], offset: d + 1 })
+      return path
+    }
+    None => { return KeyPath{ name: readKeyName(p)?, offset: start } }
+  }
+}
+
+// One more segment appended to `path` — or two, for a numeric dotted key.
+fn extendKeyPath(p: Parser, path: KeyPath): ()! {
+  let start = p.lx.start
+  let end = p.lx.end
+  let split = numericKeySplit(p)
+  match (split) {
+    Some(d) => {
+      advance(p)
+      path.rest = append(path.rest, KeySeg{ name: p.src[start:d], offset: start })
+      path.rest = append(path.rest, KeySeg{ name: p.src[d + 1:end], offset: d + 1 })
+      return
+    }
+    None => {
+      path.rest = append(path.rest, KeySeg{ name: readKeyName(p)?, offset: start })
+      return
+    }
+  }
+}
+
+// The offset of the `.` inside the token under the cursor when that token is
+// TOML's numeric dotted key — a `Number` span that is a plain
+// `digits '.' digits` float, no sign and no exponent. None for every other
+// token, other `Number` spans included, which is what lets the readers below
+// treat one token as exactly one segment.
+fn numericKeySplit(p: Parser): Option<int> {
+  if (p.lx.kind != TokenKind.Number) {
+    return Option<int>.None
+  }
+  return numericKeyDot(p.src, p.lx.start, p.lx.end)
+}
+
+// One key segment's text, consumed: a bare key, `true`/`false` (lexed as
+// `Bool` even in key position), a quoted key, or a `Number`/`DateTime` span
+// that stays inside the bare-key charset. The segment's own OFFSET is
+// `p.lx.start`, which every caller reads before calling — a second return
+// value would allocate a pair to carry an integer the caller already has.
+fn readKeyName(p: Parser): string! {
   let kind = p.lx.kind
   let start = p.lx.start
   let end = p.lx.end
   switch (kind) {
     case TokenKind.BareKey, TokenKind.Bool:
       advance(p)
-      return [KeySeg{ name: p.src[start:end], offset: start }]
+      return p.src[start:end]
     case TokenKind.BasicString, TokenKind.LiteralString:
       advance(p)
-      return [KeySeg{ name: tomlDecodeString(p.src, kind, start, end)?, offset: start }]
+      return tomlDecodeString(p.src, kind, start, end)?
     case TokenKind.Number:
-      return parseNumericKeySegment(p, start, end)?
+      return numericKeyName(p, start, end)?
     case TokenKind.DateTime:
-      return parseDateTimeKeySegment(p, start, end)?
+      return dateTimeKeyName(p, start, end)?
     default:
       fail tomlParseError("expected a key", start)
   }
 }
 
-// A key segment the lexer read as `Number` — `A-Za-z0-9_-` is the bare-key
-// charset (TOML 1.0.0 §Keys), a strict superset of digits, so any Number
-// span that never leaves that charset is a bare key re-read as text
-// (`-1`, `10e3`, `34-11`, a lone `-`), never a hard error; only a plain
-// `digits '.' digits` float span splits into the two dotted segments it
-// stands for, and `inf`/`nan` are checked ahead of the fallback for the
-// same reason `scanWordOrBareKey` checks them ahead of `BareKey` — both
-// are this package's ONLY unquoted-numeric-word literals.
-fn parseNumericKeySegment(p: Parser, start: int, end: int): []KeySeg! {
-  let dot = numericKeyDot(p.src, start, end)
-  match (dot) {
-    Some(d) => {
-      advance(p)
-      return [
-        KeySeg{ name: p.src[start:d], offset: start },
-        KeySeg{ name: p.src[d + 1:end], offset: d + 1 },
-      ]
-    }
-    None => {}
-  }
+// A key segment the lexer read as `Number`, `numericKeySplit` having already
+// ruled out the dotted form — `A-Za-z0-9_-` is the bare-key charset (TOML
+// 1.0.0 §Keys), a strict superset of digits, so any Number span that never
+// leaves that charset is a bare key re-read as text (`-1`, `10e3`, `34-11`,
+// a lone `-`), never a hard error; `inf`/`nan` are checked ahead of the
+// fallback for the same reason `scanWordOrBareKey` checks them ahead of
+// `BareKey` — both are this package's ONLY unquoted-numeric-word literals.
+fn numericKeyName(p: Parser, start: int, end: int): string! {
   let text = p.src[start:end]
   if (text == "inf" || text == "nan" || isAllBareKeyChars(p.src, start, end)) {
     advance(p)
-    return [KeySeg{ name: text, offset: start }]
+    return text
   }
   fail tomlParseError("unsupported numeric key form", start)
 }
 
 // A key segment the lexer read as `DateTime` (e.g. a bare `2001-02-03`,
 // whose digits-then-dash shape happens to match TOML's date-time grammar)
-// — the same bare-key-charset fallback as `parseNumericKeySegment`, since
+// — the same bare-key-charset fallback as `numericKeyName`, since
 // `isDateTimeChar` permits `:`/`.`/`+`, which are never legal in a bare
 // key, so a genuine date-time-shaped SPAN (not just its digit-and-dash
 // prefix) in key position still correctly falls through to the error.
-fn parseDateTimeKeySegment(p: Parser, start: int, end: int): []KeySeg! {
+fn dateTimeKeyName(p: Parser, start: int, end: int): string! {
   if (isAllBareKeyChars(p.src, start, end)) {
     advance(p)
-    return [KeySeg{ name: p.src[start:end], offset: start }]
+    return p.src[start:end]
   }
   fail tomlParseError("expected a key", start)
 }
@@ -377,85 +452,88 @@ class Ctx {
   kind: CKind,
   items: []Toml,
   table: WTable,
-  pendingPath: []KeySeg,
-  hasPendingKey: bool,
+  pendingKey: Option<KeyPath>,
   expectSeparator: bool,
 }
 
+// Only `table` is built up front: every other field's zero value (SPEC
+// §13.4) is already the state a fresh frame is in — an omitted slice field
+// IS the empty slice and an omitted `Option` IS `None` — so a frame
+// allocates nothing for a field it has not been given anything to hold.
 fn newCtx(kind: CKind): Ctx {
-  return Ctx{
-    kind: kind,
-    items: []Toml(0),
-    table: newRootTable(),
-    pendingPath: []KeySeg(0),
-    hasPendingKey: false,
-    expectSeparator: false,
-  }
+  return Ctx{ kind: kind, table: newRootTable() }
 }
 
-// What one token-driven step of the innermost open container did.
+// What one token-driven step of the innermost open container did. One
+// payload word carried by one payload-carrying variant is SPEC §14.7's
+// VALUE form: two machine words, no heap object, nothing allocated to
+// report a step. Opening a container is deliberately NOT an outcome —
+// `pushContainer` grows the frame stack itself and reports `Continue` —
+// because a second payload type here would box every step (#5583).
 enum StepOutcome {
   Continue,
-  Push(Ctx),
   Close(Toml),
 }
 
+// The open containers, innermost last: `items[0:n]`. A class rather than a
+// bare `[]Ctx` local so a step that opens a container can grow the stack in
+// place instead of handing a new slice value back through a result object —
+// that shape cost an `ApplyResult` plus its `Option<Toml>` on every step of
+// every array and inline table (#5583). `n` is the live depth rather than
+// `len(items)` so a pop keeps the buffer instead of reslicing it.
+class Frames { items: []Ctx, n: int }
+
+fn pushFrame(f: Frames, ctx: Ctx) {
+  if (f.n < len(f.items)) {
+    f.items[f.n] = ctx
+  } else {
+    f.items = append(f.items, ctx)
+  }
+  f.n = f.n + 1
+}
+
+fn topFrame(f: Frames): Ctx {
+  return f.items[f.n - 1]
+}
+
 // Reads one whole array or inline table (`p.lx` already confirmed to sit on
-// `[`/`{`) without ever calling itself: nesting is an explicit `[]Ctx`
-// stack, so an arbitrarily deep run of open brackets grows Bit heap memory,
-// never the call stack (see this file's header).
+// `[`/`{`) without ever calling itself: nesting is an explicit frame stack,
+// so an arbitrarily deep run of open brackets grows Bit heap memory, never
+// the call stack (see this file's header). `Close` pops, and either hands
+// the finished value to the frame below or — with none left — reports it as
+// the whole compound value.
 fn parseCompoundValue(p: Parser): Toml! {
   let firstKind = CKind.CArr
   if (p.lx.kind == TokenKind.LBrace) {
     firstKind = CKind.CObj
   }
   advance(p)
-  let stack = []Ctx(0)
-  stack = append(stack, newCtx(firstKind))
+  let frames = Frames{}
+  pushFrame(frames, newCtx(firstKind))
   let guard = 0
   let bound = tokenBound(p)
   while (guard <= bound) {
-    let stackLen = len(stack)
-    let outcome = stepFrame(p, stack[stackLen - 1], stackLen)?
-    let applied = applyOutcome(outcome, stack)?
-    stack = applied.stack
-    match (applied.value) {
-      Some(v) => { return v }
-      None => {}
+    let outcome = stepFrame(p, topFrame(frames), frames)?
+    match (outcome) {
+      Continue => {}
+      Close(v) => {
+        frames.n = frames.n - 1
+        if (frames.n == 0) {
+          return v
+        }
+        attachValue(topFrame(frames), v)?
+      }
     }
     guard = guard + 1
   }
   fail tomlParseError("value nesting exceeds token bound", p.lx.start)
 }
 
-fn stepFrame(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+fn stepFrame(p: Parser, top: Ctx, frames: Frames): StepOutcome! {
   if (top.kind == CKind.CArr) {
-    return stepArray(p, top, stackLen)?
+    return stepArray(p, top, frames)?
   }
-  return stepObject(p, top, stackLen)?
-}
-
-class ApplyResult { stack: []Ctx, value: Option<Toml> }
-
-// Applies one `StepOutcome` to `stack`: `Push` grows it, `Close` pops it and
-// either hands the finished value to the new top (still nested) or reports
-// it as the whole compound value's result (stack now empty).
-fn applyOutcome(outcome: StepOutcome, stack: []Ctx): ApplyResult! {
-  match (outcome) {
-    Continue => { return ApplyResult{ stack: stack, value: Option<Toml>.None } }
-    Push(ctx) => {
-      stack = append(stack, ctx)
-      return ApplyResult{ stack: stack, value: Option<Toml>.None }
-    }
-    Close(v) => {
-      let popped = stack[0:len(stack) - 1]
-      if (len(popped) == 0) {
-        return ApplyResult{ stack: popped, value: Option<Toml>.Some(v) }
-      }
-      attachValue(popped[len(popped) - 1], v)?
-      return ApplyResult{ stack: popped, value: Option<Toml>.None }
-    }
-  }
+  return stepObject(p, top, frames)?
 }
 
 // Attaches a just-closed nested value to its parent frame — the array-
@@ -468,17 +546,25 @@ fn attachValue(parent: Ctx, v: Toml): ()! {
     parent.expectSeparator = true
     return
   }
-  applyKeyValue(parent.table, parent.pendingPath, v)?
-  parent.hasPendingKey = false
+  let pending = parent.pendingKey
+  match (pending) {
+    Some(path) => { applyKeyValue(parent.table, path, v)? }
+    // A `CObj` frame opens a nested container only from `readInlineValue`,
+    // which runs with a key already pending, so this arm is an invariant
+    // this parser holds, never a document it can be handed.
+    None => { panic("pkg/toml: inline table closed a nested value with no key pending") }
+  }
+  parent.pendingKey = Option<KeyPath>.None
   parent.expectSeparator = true
   return
 }
 
-// Refuses to open a new container once `stackLen` already sits at
-// `tomlMaxDepth` — this parser's own flat depth counter (`len(stack)`),
-// independent of `lex.bit`'s own bracket-depth cap.
-fn pushContainer(p: Parser, stackLen: int): StepOutcome! {
-  if (stackLen >= tomlMaxDepth) {
+// Opens a new container, refusing once `frames.n` already sits at
+// `tomlMaxDepth` — this parser's own flat depth counter, independent of
+// `lex.bit`'s own bracket-depth cap. The frame is pushed here rather than
+// returned, which is what keeps `StepOutcome` unboxed (above).
+fn pushContainer(p: Parser, frames: Frames): StepOutcome! {
+  if (frames.n >= tomlMaxDepth) {
     fail tomlParseError("value nesting exceeds maximum depth", p.lx.start)
   }
   let kind = CKind.CArr
@@ -486,7 +572,8 @@ fn pushContainer(p: Parser, stackLen: int): StepOutcome! {
     kind = CKind.CObj
   }
   advance(p)
-  return StepOutcome.Push(newCtx(kind))
+  pushFrame(frames, newCtx(kind))
+  return StepOutcome.Continue
 }
 
 // Newlines and comments are insignificant inside `[ ]` (TOML 1.0.0
@@ -495,7 +582,7 @@ fn skipArrayFiller(p: Parser) {
   skipBlankLines(p)
 }
 
-fn stepArray(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+fn stepArray(p: Parser, top: Ctx, frames: Frames): StepOutcome! {
   skipArrayFiller(p)
   if (top.expectSeparator) {
     if (p.lx.kind == TokenKind.RBracket) {
@@ -513,12 +600,12 @@ fn stepArray(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
     advance(p)
     return StepOutcome.Close(Toml.TomlArray(top.items))
   }
-  return readArrayElement(p, top, stackLen)?
+  return readArrayElement(p, top, frames)?
 }
 
-fn readArrayElement(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+fn readArrayElement(p: Parser, top: Ctx, frames: Frames): StepOutcome! {
   if (atContainerStart(p)) {
-    return pushContainer(p, stackLen)?
+    return pushContainer(p, frames)?
   }
   top.items = append(top.items, readScalar(p)?)
   top.expectSeparator = true
@@ -526,12 +613,14 @@ fn readArrayElement(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
 }
 
 // No trailing comma, no newline (TOML 1.0.0 "Inline Table": both illegal).
-fn stepObject(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+fn stepObject(p: Parser, top: Ctx, frames: Frames): StepOutcome! {
   if (p.lx.kind == TokenKind.Newline) {
     fail tomlParseError("newline not allowed in inline table", p.lx.start)
   }
-  if (top.hasPendingKey) {
-    return readInlineValue(p, top, stackLen)?
+  let pending = top.pendingKey
+  match (pending) {
+    Some(path) => { return readInlineValue(p, top, path, frames)? }
+    None => {}
   }
   if (top.expectSeparator) {
     if (p.lx.kind == TokenKind.RBrace) {
@@ -561,18 +650,17 @@ fn readInlineKey(p: Parser, top: Ctx): StepOutcome! {
     fail tomlParseError("expected '=' after key", p.lx.start)
   }
   advance(p)
-  top.pendingPath = path
-  top.hasPendingKey = true
+  top.pendingKey = Option<KeyPath>.Some(path)
   return StepOutcome.Continue
 }
 
-fn readInlineValue(p: Parser, top: Ctx, stackLen: int): StepOutcome! {
+fn readInlineValue(p: Parser, top: Ctx, path: KeyPath, frames: Frames): StepOutcome! {
   if (atContainerStart(p)) {
-    return pushContainer(p, stackLen)?
+    return pushContainer(p, frames)?
   }
   let v = readScalar(p)?
-  applyKeyValue(top.table, top.pendingPath, v)?
-  top.hasPendingKey = false
+  applyKeyValue(top.table, path, v)?
+  top.pendingKey = Option<KeyPath>.None
   top.expectSeparator = true
   return StepOutcome.Continue
 }
