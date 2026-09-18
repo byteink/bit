@@ -226,8 +226,20 @@ fmt_gate_trees() {
 # deeper because that is the granularity every routing table here and in
 # scripts/gate-classify.sh uses. A `.bit` file at the repo root belongs to no
 # tree and is skipped — there are none, and one would resolve to `full` anyway.
+#
+# `:(exclude)_tests_/fuzz/crashes/**` (#5595) drops committed fuzzer
+# crash-repro artifacts (`hang-414710f0571de5ec.bit`, added at 0467fc2b,
+# #5348) from the query — a saved crash input, not a maintained source file,
+# and `bit fmt --check` has no gate to run over it and none should: unlike
+# `_tests_/bit`'s checker fixtures (deliberately invalid programs, but folded
+# under a tree `test-fmt-testsbit` already covers and tolerates being
+# unparseable), `_tests_/fuzz` has no fmt gate at all, so counting this one
+# artifact as its own "source tree" makes assert_fmt_gate_per_bucket() below
+# fail on every `scripts/gate.sh` run that reaches it. Scoped to `crashes/`
+# only, not the whole `_tests_/fuzz` tree, so a real `.bit` source added
+# elsewhere under `_tests_/fuzz` (none exist today) is still discovered.
 bit_source_trees() {
-  git ls-files '*.bit' |
+  git ls-files '*.bit' ':(exclude)_tests_/fuzz/crashes/**' |
     awk -F/ 'NF < 2 { next } { if ($1 == "_tests_") print $1 "/" $2; else print $1 }' |
     sort -u
 }

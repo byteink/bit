@@ -179,7 +179,7 @@
 # drifted. This list is the only hand-maintained part left and is read only by
 # assert_sharedmodule_gates_current(): a module missing from it loses its
 # assertion, not its mapping.
-SHARED_HARNESS_MODULES="objread childrun docsrunner"
+SHARED_HARNESS_MODULES="objread childrun docsrunner pmvanityhelpers"
 
 # Every file that imports shared harness module `_tests_/bit/$1`. Both
 # spellings are matched and both are ANCHORED at column 1: `import { ... }
@@ -243,6 +243,16 @@ gates_for_file() {
     _tests_/bit/objread/*) shared_module_gates objread; return 0 ;;
     _tests_/bit/childrun/*) shared_module_gates childrun; return 0 ;;
     _tests_/bit/docsrunner/*) shared_module_gates docsrunner; return 0 ;;
+    # #5595: pmvanityhelpers has had no arm since #4183 split it out of
+    # pmvanity.bit; pmvanitymulti (#5586) is the same unmapped shape. A
+    # pmvanitymulti/* is NOT added to SHARED_HARNESS_MODULES: it is itself an
+    # importer of pmvanityhelpers (../pmvanityhelpers), and
+    # assert_sharedmodule_importer's cycle guard trips on any importer whose
+    # own path sits inside a LISTED module's directory, regardless of import
+    # direction — its mapping below is still fully derived, only its own
+    # staleness self-check is skipped.
+    _tests_/bit/pmvanityhelpers/*) shared_module_gates pmvanityhelpers; return 0 ;;
+    _tests_/bit/pmvanitymulti/*) shared_module_gates pmvanitymulti; return 0 ;;
     _tests_/stress/*)
       # A different top-level directory from the harness that reads it
       # (_tests_/bit/stress/, matched by the `_tests_/bit/stress/*)` arm just
