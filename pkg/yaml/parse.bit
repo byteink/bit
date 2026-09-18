@@ -53,10 +53,9 @@
 //
 // SCOPE. Merge keys (`<<`, YAML 1.1) are rejected by name
 // (`checkNotMergeKey`), never silently treated as a mapping key. A bare
-// multi-line bare document at the top level with no `---` separators —
-// `hello\nworld` — is YAML's multi-line plain scalar folding, which this
-// file does not implement; rather than silently split it into two
-// documents, `parseStream` reports it as unexpected trailing content.
+// multi-line document at the top level with no `---` separators —
+// `hello\nworld` — folds into one plain scalar (`extendPlainFold`,
+// plainfold.bit, #5544), never silently split into two documents.
 
 // The caller's own choice of resource budget and scalar resolver
 // (`yamlResolveScalar` by default; `yamlResolveRaw` opts a whole parse out of
@@ -398,9 +397,12 @@ fn rejectAnchorMisplaced(p: Parser, far: Option<string>, here: Option<string>, e
 // &node2\n  &v2 val2` (4JVG) has no mapping key between `&node2` and
 // `&v2` to split them into distinct nodes the way `&node1`/`&k1` are, so
 // both would end up bound to the identical scalar `"val2"`; rejected
-// outright rather than silently keeping only the last one. `atMarker` (only
-// the document-root call) feeds `parseScalarOrMapping`'s header.
-fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, atMarker: bool): Yaml! {
+// outright rather than silently keeping only the last one.
+//
+// `NodeCtx` bundles two least-central flags (spec/LINT.md's max-params).
+class NodeCtx { atMarker: bool, foldFloor: i64 }
+
+fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, ctx: NodeCtx): Yaml! {
   let (anchorName, anchorEnd) = consumeNodeProperties(p, indent, descended)?
   skipComments(p)?
   if (p.s.kind == TokenKind.Indent) {
@@ -408,7 +410,7 @@ fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, atMarke
     let childCol = p.s.col
     let (innerAnchor, innerAnchorEnd) = consumeNodeProperties(p, childCol, true)?
     rejectAnchorMisplaced(p, anchorName, innerAnchor, innerAnchorEnd)?
-    let value = dispatchBlockNode(p, indent, childCol, false)?
+    let value = dispatchBlockNode(p, indent, childCol, false, ctx.foldFloor)?
     if (isSome(anchorName) && isSome(innerAnchor) && !yamlIsMapping(value)) {
       fail parseError("yaml: a node cannot carry two distinct anchors", p.s.start)
     }
@@ -416,11 +418,23 @@ fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, atMarke
     return applyAnchor(p, anchorName, withInner)?
   }
   rejectAnchorMisplaced(p, Option<string>.None, anchorName, anchorEnd)?
-  let value = dispatchBlockNode(p, indent, colHint, atMarker && isSome(anchorName))?
+  let value = dispatchBlockNode(
+    p,
+    indent,
+    colHint,
+    ctx.atMarker && isSome(anchorName),
+    ctx.foldFloor,
+  )?
   return applyAnchor(p, anchorName, value)?
 }
 
-fn dispatchBlockNode(p: Parser, indent: i64, colHint: i64, rejectImplicitKey: bool): Yaml! {
+fn dispatchBlockNode(
+  p: Parser,
+  indent: i64,
+  colHint: i64,
+  rejectImplicitKey: bool,
+  foldFloor: i64,
+): Yaml! {
   let col = colHint
   if (col < 0) {
     col = p.s.col
@@ -437,7 +451,7 @@ fn dispatchBlockNode(p: Parser, indent: i64, colHint: i64, rejectImplicitKey: bo
     case TokenKind.BlockScalarHeader:
       return parseBlockScalarValue(p, indent)?
     case TokenKind.PlainScalar, TokenKind.SingleQuoted, TokenKind.DoubleQuoted:
-      return parseScalarOrMapping(p, col, rejectImplicitKey)?
+      return parseScalarOrMapping(p, col, rejectImplicitKey, foldFloor)?
     default:
       fail parseError("yaml: unexpected token in block context", p.s.start)
   }
@@ -474,33 +488,6 @@ fn parseBlockScalarValue(p: Parser, indent: i64): Yaml! {
   return p.resolver(text, ScalarStyle.Block)
 }
 
-// A plain/quoted scalar that might turn out to be a mapping's first key —
-// the one place this file must consume a token before it can tell which. A
-// `ValueIndicator` only makes this scalar a key when it sits on the SAME
-// line: a `?`/`: value` pair whose key is a bare scalar (`? a\n: 1`) would
-// otherwise misread the NEXT line's unrelated `:` as belonging to `a`,
-// since a same-column new line leaves `Scanner.col` reading exactly like a
-// same-line continuation (`hasLineBreak`, same ambiguity as
-// `parseAfterIndicator`). `rejectImplicitKey` (`parseBlockNode`'s header) is
-// CXX2's root-shares-`---`-line case (§8.2.3); `false` off `Indent`-branch.
-fn parseScalarOrMapping(p: Parser, col: i64, rejectImplicitKey: bool): Yaml! {
-  let kind = p.s.kind
-  let start = p.s.start
-  let end = p.s.end
-  let text = yamlDecodeScalar(p.src, kind, p.s.start, p.s.end)?
-  advance(p)
-  if (p.s.kind == TokenKind.ValueIndicator && !hasLineBreak(p.src, end, p.s.start)) {
-    if (rejectImplicitKey) {
-      fail parseError("yaml: a mapping cannot start on the document marker's own line", start)
-    }
-    let key = resolveByKind(text, kind, p.resolver)
-    checkNotMergeKey(key, start)?
-    return parseBlockMapping(p, col, Option<Yaml>.Some(key), start)?
-  }
-  chargeBlockNode(p, start)?
-  return resolveByKind(text, kind, p.resolver)
-}
-
 // --- the value after `:` or the key after `?` -----------------------------
 
 // A byte in `[start, end)` is a line break — used only to tell "still on the
@@ -524,15 +511,14 @@ fn hasLineBreak(src: string, start: i64, end: i64): bool {
 // on a strictly deeper line (`Indent`), or nothing at all (`YamlNull`).
 // `afterOffset` is the byte offset right past the `:`/`?` token that led
 // here, needed only to resolve the same-line-vs-new-line ambiguity above.
-// The same-column sequence case (this file's header) is the one shape a new
-// line at this exact column is NOT empty: `SeqEntry` falls straight through
-// to `parseBlockNode`, which finds it waiting at `indent`.
+// The same-column sequence case (this file's header): `SeqEntry` falls
+// through to `parseBlockNode`, which finds it waiting at `indent`.
 fn parseAfterIndicator(p: Parser, indent: i64, afterOffset: i64): Yaml! {
   skipComments(p)?
   if (p.s.kind == TokenKind.Indent) {
     advance(p)
     let childCol = p.s.col
-    return parseBlockNode(p, childCol, -1, true, false)?
+    return parseBlockNode(p, childCol, -1, true, NodeCtx{ atMarker: false, foldFloor: indent })?
   }
   if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
     return Yaml.YamlNull
@@ -541,7 +527,7 @@ fn parseAfterIndicator(p: Parser, indent: i64, afterOffset: i64): Yaml! {
   if (!sameLine && p.s.kind != TokenKind.SeqEntry) {
     return Yaml.YamlNull
   }
-  return parseBlockNode(p, indent, -1, false, false)?
+  return parseBlockNode(p, indent, -1, false, NodeCtx{ atMarker: false, foldFloor: indent })?
 }
 
 // --- block mapping ---------------------------------------------------------
@@ -571,6 +557,9 @@ fn readExplicitEntry(p: Parser, col: i64): MapEntryOut! {
   let key = parseAfterIndicator(p, col, afterQ)?
   checkNotMergeKey(key, keyStart)?
   skipComments(p)?
+  while (p.s.kind == TokenKind.Dedent) {
+    advance(p)
+  }
   if (p.s.col == col && p.s.kind == TokenKind.ValueIndicator) {
     let afterColon = p.s.end
     advance(p)
@@ -657,7 +646,7 @@ fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dash
   if (p.s.kind == TokenKind.Indent) {
     advance(p)
     let childCol = p.s.col
-    return parseBlockNode(p, childCol, -1, true, false)?
+    return parseBlockNode(p, childCol, -1, true, NodeCtx{ atMarker: false, foldFloor: itemCol })?
   }
   if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
     return Yaml.YamlNull
@@ -666,7 +655,13 @@ fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dash
     return Yaml.YamlNull
   }
   let inlineCol = dashCol + (p.s.start - dashStart)
-  return parseBlockNode(p, itemCol, inlineCol, false, false)?
+  return parseBlockNode(
+    p,
+    itemCol,
+    inlineCol,
+    false,
+    NodeCtx{ atMarker: false, foldFloor: itemCol },
+  )?
 }
 
 // One block sequence, all `-` markers at exactly `col`.
@@ -715,9 +710,9 @@ fn parseDocumentContent(p: Parser, docMarkerEnd: i64): Yaml! {
   // `descended: true` — the document root has no enclosing key/dash column
   // a chained property line would need to clear; column 0 is already the
   // floor a second property line may legally repeat (9KAX: `&a1\n!!str\n
-  // scalar1`, both properties AT column 0).
+  // scalar1`, both AT column 0). `foldFloor: -1` is spec 9.1.3's root `n`.
   let atMarker = docMarkerEnd >= 0 && !hasLineBreak(p.src, docMarkerEnd, p.s.start)
-  let doc = parseBlockNode(p, 0, -1, true, atMarker)?
+  let doc = parseBlockNode(p, 0, -1, true, NodeCtx{ atMarker: atMarker, foldFloor: -1 })?
   skipComments(p)?
   if (!isDocBoundary(p.s.kind)) {
     fail parseError("yaml: unexpected content after document (missing '---'?)", p.s.start)
