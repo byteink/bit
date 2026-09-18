@@ -618,7 +618,20 @@ case "${BUCKET}" in
     # other), so a pkg/**-only diff that moves or renames a cited doc page
     # reddened only the pre-push suite. It was already wired into `runtime`
     # and `stdlib` for the identical `${repo}/<tree>` reason.
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations)
+    #
+    # test-package-tags (#5597) is the seventh: 0.20.0 shipped a regression
+    # (#5569) that broke `web/v0.5.0` and `yaml/v0.1.0` for every user while
+    # every gate above stayed green, because every one of them (including
+    # test-packages) builds a package from the WORKING TREE, never the
+    # already-PUBLISHED git tag `bit add` actually resolves. Resolves each
+    # package's newest tag through the real, offline `bit add` vanity path
+    # (_tests_/bit/packagetagsgate.bit) and compiles against it with the
+    # compiler under test. NOTE: #5569 itself touched `compiler/project.bit`,
+    # not `pkg/**` — a compiler-only diff does not resolve to this bucket, so
+    # this wiring alone does not close the gap for that direction; see
+    # _tests_/bit/packagetagsgate.bit's own header ("SCOPE GAP") and its
+    # follow-up ticket for wiring it into selfhost/runtime/stdlib too.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags)
     ;;
   spec)
     BUILD_STEPS=(test-spec)
