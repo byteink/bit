@@ -67,6 +67,13 @@ build_go() {
     -e GOOS="$HOST_GOOS" -e GOARCH="$HOST_GOARCH" -e CGO_ENABLED=0 \
     "$GO_IMAGE" sh -c "go get $module@latest && go mod tidy && go build -o /src/$out ."
   cp "$HERE/apps/$dir/$out" "$HERE/out/bin/$out"
+  # `go mod tidy` just wrote a resolved `require` line into the committed,
+  # deliberately bare go.mod (matching pkg/web/bench/apps/gin/go.mod's own
+  # precedent: never pin a competitor's version this package does not
+  # control). Restored from HEAD so a `run.sh` invocation never leaves the
+  # tree dirty; go.sum is untracked (bench/.gitignore) so it needs no such
+  # restore.
+  git -C "$REPO" checkout -- "pkg/toml/bench/apps/$dir/go.mod" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- verify
