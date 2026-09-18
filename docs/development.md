@@ -316,7 +316,7 @@ uses it.
 
 **Correct invocation: ONE command, not two (#3126).** `BIT_LIBBITRT_TREE=1`
 must be visible to the same process that runs `selfhost`, because
-`tools/build/defs.bit` declares `Step{name: "selfhost", deps: ["libbitrt"]}` -
+`tools/build/defs.bit` declares `Step{ name = "selfhost", deps = []string{ "libbitrt" } }` -
 a bare `./make selfhost` re-invokes `stepLibbitrt` as its own dependency,
 inside `selfhost`'s own process. A shell scopes `VAR=1 cmd1 && cmd2` to `cmd1`
 only (plain POSIX behaviour, not a bug in either command), so:
