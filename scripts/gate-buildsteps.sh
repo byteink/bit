@@ -5,7 +5,12 @@
 # union_testsbit_steps() and validate_build_steps() each wrap a previously-
 # inline block with no change to the statements inside it. union_spec_steps()
 # (#4136) is the one function here that is NOT a pure move — see its own
-# comment. This file owns the BUCKET-side invariants (what a bucket must run);
+# comment. `union_touched_buckets()` and the `union` arms in
+# build_steps_for_bucket()/bucket_scripts() (#5594, gate.sh's --union) are new:
+# composing --full's every-bucket-runs invariant across whichever areas a real
+# diff touched, using composite_parents()/composite_buckets() the same way
+# `stdlibdocs` already does for its fixed pair. This file owns the BUCKET-side
+# invariants (what a bucket must run);
 # scripts/gate-envscope.sh owns the GATE-side ones (what a gate declares).
 # THE SPLIT THIS HEADER DEMANDED HAS HAPPENED (#4466): at 797 of the 800-line
 # hard-zero ceiling (_tests_/bit/shellsize.bit) the three assert_*() functions
@@ -110,6 +115,31 @@ bucket_scripts() {
     # packagesgate.bit) have no differential script — same shape as
     # testcases/stdlib/docs/testsbit above, which also fall through with
     # both empty.
+    union)
+      # THE UNION OF EVERY TOUCHED AREA'S OWN scripts (#5594), deduplicated —
+      # `selfhost` and `runtime` both name scripts/selfhost-diffruntime.sh, so
+      # a diff touching both must still run it once, not twice. Same
+      # composite_parents() table build_steps_for_bucket()'s `union` arm below
+      # reads, so the two can never disagree about which areas are unioned.
+      local parent s seen=" " acc_pre="" acc_post=""
+      for parent in $(composite_parents union); do
+        bucket_scripts "${parent}"
+        for s in ${BUCKET_PRE}; do
+          case "${seen}" in
+            *" pre:${s} "*) ;;
+            *) acc_pre="${acc_pre}${s} "; seen="${seen}pre:${s} " ;;
+          esac
+        done
+        for s in ${BUCKET_POST}; do
+          case "${seen}" in
+            *" post:${s} "*) ;;
+            *) acc_post="${acc_post}${s} "; seen="${seen}post:${s} " ;;
+          esac
+        done
+      done
+      BUCKET_PRE="${acc_pre% }"
+      BUCKET_POST="${acc_post% }"
+      ;;
     full)
       # THE UNION OF EVERY BUCKET ABOVE, and it must stay that way — enforced
       # below, not merely intended.
@@ -119,15 +149,41 @@ bucket_scripts() {
   esac
 }
 
+# THE AREAS A --union DIFF ACTUALLY TOUCHED (#5594), read off the has_*
+# globals gate.sh's own classify_changed_files() sets, in the same order
+# build_steps_for_bucket()'s case arms list them. UNLIKE composite_parents()'s
+# other arms this is not a fixed table — `stdlibdocs` always means exactly
+# {stdlib, docs}, but `union`'s constituents are whichever of the eight areas
+# THIS diff touched, so it can only be computed, never written down. Reads
+# has_spec too: a spec/SPEC.md paired with two or more other areas is exactly
+# the case SPEC_PARTNER's own bucket_count==2 pairing does not cover, and
+# `union`'s own `spec` arm (BUILD_STEPS=(test-spec)) is what closes it.
+union_touched_buckets() {
+  local list=""
+  [ "${has_selfhost:-0}" -eq 1 ] && list="${list}selfhost "
+  [ "${has_runtime:-0}" -eq 1 ] && list="${list}runtime "
+  [ "${has_testcases:-0}" -eq 1 ] && list="${list}testcases "
+  [ "${has_examples:-0}" -eq 1 ] && list="${list}examples "
+  [ "${has_stdlib:-0}" -eq 1 ] && list="${list}stdlib "
+  [ "${has_pkg:-0}" -eq 1 ] && list="${list}pkg "
+  [ "${has_docs:-0}" -eq 1 ] && list="${list}docs "
+  [ "${has_spec:-0}" -eq 1 ] && list="${list}spec "
+  printf '%s' "${list}"
+}
+
 # THE COMPOSITE BUCKETS AND THEIR CONSTITUENTS — the one place the membership
 # is written down. build_steps_for_bucket()'s `stdlibdocs` arm derives its step
 # list from this, and assert_composite_is_superset() checks the result against
 # it, so the two cannot disagree the way a bucket and its hand-copied union did
 # for the whole life of that arm (#4480). Prints nothing and returns 1 for a
-# bucket that is not composite.
+# bucket that is not composite. `union`'s parents come from
+# union_touched_buckets() rather than a literal, per that function's own
+# comment — assert_composite_is_superset() still checks it the same way,
+# against whatever this diff actually touched.
 composite_parents() {
   case "$1" in
     stdlibdocs) printf 'stdlib docs\n' ;;
+    union) printf '%s\n' "$(union_touched_buckets)" ;;
     *) return 1 ;;
   esac
 }
@@ -138,6 +194,7 @@ composite_parents() {
 # the new bucket is unchecked rather than wrongly checked.
 composite_buckets() {
   printf 'stdlibdocs\n'
+  printf 'union\n'
 }
 
 build_steps_for_bucket() {
@@ -461,6 +518,32 @@ case "${BUCKET}" in
     local parent step acc="" seen=" "
     local BUCKET
     for parent in $(composite_parents stdlibdocs); do
+      BUCKET="${parent}"
+      build_steps_for_bucket
+      for step in "${BUILD_STEPS[@]}"; do
+        case "${seen}" in
+          *" ${step} "*) ;;
+          *) acc="${acc}${step} "; seen="${seen}${step} " ;;
+        esac
+      done
+    done
+    BUILD_STEPS=()
+    for step in ${acc}; do
+      BUILD_STEPS+=("${step}")
+    done
+    ;;
+  union)
+    # THE UNION OF EVERY TOUCHED AREA (#5594) — same shape as the
+    # `stdlibdocs` arm above, generalized from a fixed pair to however many of
+    # the eight areas union_touched_buckets() finds touched. Composed from the
+    # LIVE build_steps_for_bucket() of each, never a second copy of any step
+    # list, so a table this diff's areas were already correct in (selfhost's
+    # 21 hand-added gates, stdlib's test-release-surface, ...) cannot
+    # disagree with what union runs — the whole reason this ticket is
+    # composition, not new mappings.
+    local parent step acc="" seen=" "
+    local BUCKET
+    for parent in $(composite_parents union); do
       BUCKET="${parent}"
       build_steps_for_bucket
       for step in "${BUILD_STEPS[@]}"; do

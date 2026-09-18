@@ -28,6 +28,22 @@
 #                                      # scripts/x64gate.sh (real x86_64 hardware)
 #   scripts/gate.sh --arm64            # route the computed build steps through
 #                                      # scripts/arm64gate.sh (native aarch64-linux)
+#   scripts/gate.sh --union            # a diff spanning two or more of the
+#                                      # eight scoped areas runs the UNION of
+#                                      # what each touched area's own bucket
+#                                      # would run, instead of collapsing to
+#                                      # `full` (#5594). Still `full` whenever
+#                                      # any area cannot be confidently scoped
+#                                      # (has_other, or an unmapped _tests_/bit/**
+#                                      # /_tests_/imports/**/_tests_/stress/** file) —
+#                                      # under-selection stays the one thing
+#                                      # this script refuses to do. See
+#                                      # scripts/gate-buildsteps.sh's
+#                                      # union_touched_buckets() for how the set
+#                                      # is computed and assert_composite_is_
+#                                      # superset() (scripts/gate-bucketasserts.sh)
+#                                      # for the mirror check this owes #2084's
+#                                      # invariant in its own direction.
 #   scripts/gate.sh --mark-green       # after a real full `./make test` pass
 #                                      # (or --full), record HEAD as the last
 #                                      # fully-green commit (#3257). Verifies
@@ -84,7 +100,9 @@
 # unlisted below), or spanning MORE THAN ONE of those eight areas, is
 # ambiguous and always runs the full `./make test` — never a partial skip —
 # EXCEPT the narrow stdlib+docs pairing bucket `stdlibdocs` (#3055, see the
-# "THREE NARROW EXCEPTIONS" block below).
+# "THREE NARROW EXCEPTIONS" block below) and, under --union (#5594), bucket
+# `union`: the deduplicated union of every touched area's own steps, still
+# strictly narrower than `full` and strictly wider than any one area.
 #
 # `pkg/` IS THE ONE BUCKET WHOSE STEP LIST IS NOT ARGV/ENV INTERSECTION
 # (#3271, epic: first-party packages under pkg/<name>/). `test-packages`'s own
@@ -232,16 +250,18 @@ cd "$(dirname "$0")/.."
 FULL=0
 RESUME=0
 MARK_GREEN=0
+UNION=0
 TARGET=local
 for arg in "$@"; do
   case "$arg" in
     --full) FULL=1 ;;
     --resume) RESUME=1 ;;
     --mark-green) MARK_GREEN=1 ;;
+    --union) UNION=1 ;;
     --x64) TARGET=x64 ;;
     --arm64) TARGET=arm64 ;;
     *)
-      echo "gate: unknown flag '${arg}' (expected --full, --resume, --mark-green, --x64, or --arm64)" >&2
+      echo "gate: unknown flag '${arg}' (expected --full, --resume, --mark-green, --union, --x64, or --arm64)" >&2
       exit 2
       ;;
   esac
@@ -251,8 +271,12 @@ if [ "${RESUME}" -eq 1 ] && [ "${FULL}" -eq 1 ]; then
   echo "gate: --resume and --full are mutually exclusive" >&2
   exit 2
 fi
-if [ "${MARK_GREEN}" -eq 1 ] && { [ "${FULL}" -eq 1 ] || [ "${RESUME}" -eq 1 ]; }; then
-  echo "gate: --mark-green is exclusive of --full/--resume" >&2
+if [ "${UNION}" -eq 1 ] && [ "${FULL}" -eq 1 ]; then
+  echo "gate: --union and --full are mutually exclusive" >&2
+  exit 2
+fi
+if [ "${MARK_GREEN}" -eq 1 ] && { [ "${FULL}" -eq 1 ] || [ "${RESUME}" -eq 1 ] || [ "${UNION}" -eq 1 ]; }; then
+  echo "gate: --mark-green is exclusive of --full/--resume/--union" >&2
   exit 2
 fi
 
@@ -422,6 +446,14 @@ elif [ -n "${SPEC_PARTNER}" ] && [ "${testsbit_unmapped}" -eq 0 ]; then
   # `full`.
   BUCKET="${SPEC_PARTNER}"
   REASON="only ${SPEC_PARTNER}/** and spec/SPEC.md changed (${touched_list})"
+elif [ "${bucket_count}" -gt 1 ] && [ "${UNION}" -eq 1 ] && [ "${testsbit_unmapped}" -eq 0 ]; then
+  # --union (#5594): compose rather than collapse. Guarded by testsbit_unmapped
+  # for the same reason the stdlibdocs/spec-pairing exceptions above are — an
+  # unmapped _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** file riding
+  # alongside a multi-area diff must still force `full`; union has nothing to
+  # union it against. See scripts/gate-buildsteps.sh's union_touched_buckets().
+  BUCKET="union"
+  REASON="spans more than one bucket, unioned under --union: ${touched_list}"
 elif [ "${bucket_count}" -gt 1 ]; then
   BUCKET="full"
   REASON="spans more than one bucket: ${touched_list}"

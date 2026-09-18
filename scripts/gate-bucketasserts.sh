@@ -43,7 +43,7 @@ assert_full_is_superset() {
 # a renamed script is the #1593 class of silent hole.
 bucket_scripts full
 FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
-for b in full selfhost runtime testcases examples stdlib pkg docs stdlibdocs spec testsbit; do
+for b in full selfhost runtime testcases examples stdlib pkg docs stdlibdocs spec testsbit union; do
   bucket_scripts "${b}"
   for s in ${BUCKET_PRE} ${BUCKET_POST}; do
     [ -f "${s}" ] || {
