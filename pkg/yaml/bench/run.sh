@@ -142,7 +142,7 @@ measure() {
   local size
   size=$(stat -f%z "$DATA")
   for impl in bit yamlv3 goccy; do
-    : > "$OUT/rs.$impl"; : > "$OUT/ms.$impl"
+    : > "$OUT/$impl.rs"; : > "$OUT/$impl.ms"
   done
   local i=0
   while [ "$i" -lt "$RUNS" ]; do
@@ -158,8 +158,8 @@ measure() {
     esac
     for impl in $order; do
       set -- $(time_run "$BIN/${impl}bench")
-      echo "$1" >> "$OUT/rs.$impl"
-      echo "$2" >> "$OUT/ms.$impl"
+      echo "$1" >> "$OUT/$impl.rs"
+      echo "$2" >> "$OUT/$impl.ms"
     done
     i=$((i+1))
   done
@@ -167,8 +167,8 @@ measure() {
     echo "impl,mbps,rss_mb"
     for impl in bit yamlv3 goccy; do
       local t r mbps rmb
-      t=$(trimmean < "$OUT/rs.$impl")
-      r=$(trimmean < "$OUT/ms.$impl")
+      t=$(trimmean < "$OUT/$impl.rs")
+      r=$(trimmean < "$OUT/$impl.ms")
       mbps=$(awk -v s="$size" -v t="$t" 'BEGIN{printf "%.2f", s/t/1000000}')
       rmb=$(awk -v r="$r" 'BEGIN{printf "%.1f", r/1048576}')
       echo "$impl,$mbps,$rmb"
