@@ -1,0 +1,177 @@
+// compiler/lowerforiter.bit — #5562: lowers `for x of it` over a
+// `next(): Option<T>` iterable (docs/reference/iterator-trait.md). Sibling of
+// lowerctrl.bit/lowerforin.bit: same module, so this needs no imports and no
+// call-site changes.
+//
+// New file rather than a branch inside lowerforin.bit (255 lines) or
+// lowerctrl.bit (670 lines): either stays comfortably under the 800-line
+// ceiling on line count alone, but the SHAPE here shares nothing with either
+// file's counted-loop skeleton — no `$idx`, no slice/array/map kind switch —
+// so folding it in would be a fourth unrelated concern riding one file's
+// complexity budget rather than a genuine extension of it. A dedicated file
+// keeps `lowerForOfIter`'s own guards from ever competing with
+// `lowerForOf`'s or `lowerForIn`'s for the 10-per-function ceiling, the same
+// reasoning lowerforin.bit's own header already gives for its split.
+//
+// THE SHAPE: no cursor at all, closer to `lowerForOfChan` (lowerctrl.bit)
+// than to the counted loop — call `next()` in the header, branch on the
+// result's tag (Some -> body, None -> exit), bind the Some payload as the
+// loop variable, run the body, step back to the header to call `next()`
+// again. Byte-for-byte the `while (true) { match (it.next()) { Some(v) =>
+// ...; None => break } }` a caller would otherwise hand-write
+// (docs/reference/iterator-trait.md's own opening example).
+//
+// WHY THIS DOES NOT WALK A SYNTHESIZED `match` AST. `lowerMatch`
+// (lowerflow.bit) and its helpers (`lowerMatchSubject`, `bindArmPayload`,
+// lowerbranch.bit) are built to walk a SOURCE match's arm nodes, which this
+// loop has none of — there is exactly one variant this ever tests (`Some`)
+// and exactly one binder (the loop variable), a fixed shape `Option<T>`
+// guarantees by construction. Reusing the AST-shaped helpers here would mean
+// building a fake arm to hand them, which is more indirection than the two
+// facts they exist to encode: read the tag, read the one payload word when
+// it says `Some`. `matchTag`/`freshEnumBoxWords`
+// (lowerbranch.bit) — the two pieces that do NOT assume an arm — are reused
+// directly instead.
+//
+// THE ALLOCATION STORY (docs/reference/iterator-trait.md, "The allocation
+// story"), and why nothing here builds it by hand. `emitStaticMethodCall`
+// (lowerexplodemethod.bit, direct class dispatch) and `emitIfaceMethodCall`
+// (lowerexplodeiface.bit, trait-typed dispatch) already rebuild the
+// `Option` result from exploded return WORDS in the CALLER's own block when
+// the callee is eligible (#5445/#5446) — that rebuild is what
+// `freshEnumBoxWords` recognizes right below it, in the SAME block, letting
+// the optimizer cancel the `gc_alloc` this loop never needed to see in the
+// first place. An ineligible callee (not multi-word-return on this target,
+// a still-generic declaration, ...) falls back to reading the tag and
+// payload off a genuine box exactly as an ordinary `match` does — never a
+// second, hand-rolled call-and-unpack path, so correctness here never
+// depends on that optimization landing.
+
+// The scrutinee's tag and (when it says `Some`) `T`'s payload word — the one
+// fact this loop ever asks its `next()` result. `payload` is only valid
+// on the caller's own Some path; nothing here reads it otherwise.
+class NextUnpack {
+  tag: int,
+  payload: int,
+}
+
+// Calls `it.next()` through the SAME dispatch every other method call site
+// uses (lowercall.bit): `emitIfaceMethodCall` for a trait-typed receiver
+// (`Op.CallIface`, vtable), `emitStaticMethodCall` for a concrete class
+// (`Op.Call`, direct). `next()` is declared with no parameters
+// (`iteratorElementType`, checkmatch.bit, requires zero), so there is no
+// argument list to lower — the receiver is the whole call.
+fn lowerNextCall(fc: FnCtx, isIface: bool, recvTy: int, recvV: int, optTy: int): int {
+  if (isIface) {
+    return emitIfaceMethodCall(fc, "next", recvV, []int(0), optTy)
+  }
+  let fr = methodRefAt(fc.c, recvTy, "next")
+  return emitStaticMethodCall(
+    fc, fr, methodSymbol(fc.lowerer, "next", recvTy), optTy, withReceiver(recvV, []int(0)),
+  )
+}
+
+// Reads `optV`'s tag and Some payload word. `freshEnumBoxWords` answers
+// non-empty exactly when `optV` is the box `lowerNextCall` just rebuilt from
+// exploded return words in THIS block (see this file's banner); that is the
+// zero-allocation path. Anything else — an ineligible callee, or a target
+// with no multi-word return at all — means `optV` is a genuine box the
+// callee built and returned, read back the same way `bindArmPayload`'s own
+// rebuild arm does: `matchTag` for word 0, a `field_get` at
+// `enumPayloadBase` for the one payload word, decimal's 16-byte payload
+// boxed exactly as `bindArmPayload` boxes it (#5417).
+fn unpackNextResult(fc: FnCtx, optTy: int, optV: int, elemTy: int): NextUnpack {
+  let fresh = freshEnumBoxWords(fc, optV, optTy)
+  if (len(fresh) != 0) {
+    return NextUnpack{ tag: fresh[0], payload: fresh[1] }
+  }
+  let fty = elemTy
+  if (isDecimalPrim(fc.c.ctx, elemTy)) {
+    fty = decimalTupleType(fc.c.ctx)
+  }
+  let fg = mkInstr(Op.FieldGet, fty)
+  fg.lhs = optV
+  fg.ival = enumPayloadBase
+  return NextUnpack{ tag: matchTag(fc, optV, optTy, true), payload: builderEmit(fc.b, fg) }
+}
+
+// Lowers `for x of it` where `it`'s type declares `next(): Option<T>`
+// (`iteratorElementType`, checkmatch.bit — `id` is `it`'s type, already
+// known Struct or Interface, `elemTy` the bound `T`). No cursor: `next()` is
+// called once per iteration in the header, its tag decides Some (bind the
+// payload, run the body) or None (exit), and the step block's only job is to
+// jump back to the header so `next()` runs again.
+fn lowerForOfIter(fc: FnCtx, k: []int, iterTy: int, id: Type, elemTy: int, binderNode: Node) {
+  if (binderNode.tag != Tag.Ident) {
+    fcFail(
+      fc,
+      binderNode.span,
+      "a `for … of` over a `next(): Option<T>` iterable with a binder that is not a single name",
+    )
+    return
+  }
+  let iterV = lowerExpr(fc, k[1])
+  if (fc.failed) {
+    return
+  }
+  let isIface = id.kind == TypeKind.Interface
+  let optTy = unwrapFallible(fc.c, methodResultLookup(fc.c, "${iterTy}.next"))
+  declareLocal(fc, "$iter", iterV, iterTy)
+  let preLen = len(fc.env)
+  let iterSlot = preLen - 1
+  let header = builderNewBlock(fc.b)
+  let bodyBlk = builderNewBlock(fc.b)
+  let stepBlk = builderNewBlock(fc.b)
+  let exitBlk = builderNewBlock(fc.b)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Header: call next(), branch on its tag — Some to the body, None to exit.
+  builderBeginBlock(fc.b, header)
+  addJoinParams(fc, preLen)
+  let iterCur = fc.env[iterSlot].value
+  let optV = lowerNextCall(fc, isIface, iterTy, iterCur, optTy)
+  let nx = unpackNextResult(fc, optTy, optV, elemTy)
+  let ci = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+  ci.ival = variantOrdinal(fc.c, optTy, "Some")
+  let eq = mkInstr(Op.ICmpEq, primType(fc.c.ctx, 10))
+  eq.lhs = nx.tag
+  eq.rhs = builderEmit(fc.b, ci)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, eq)
+  br.ival = bodyBlk
+  br.thenArgs = []int(0)
+  br.ival2 = exitBlk
+  br.elseArgs = snapshotValues(fc, preLen)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  // Body: bind the Some payload (the header dominates it, so it needs no
+  // block param), run the body, fall to the step.
+  fc.loops = append(
+    fc.loops,
+    LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen, isSwitch: false, exitUsed: false },
+  )
+  builderBeginBlock(fc.b, bodyBlk)
+  fc.terminated = false
+  let bodyMark = len(fc.env)
+  declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], nx.payload, elemTy)
+  rebindCheckerName(fc, k[0], elemTy)
+  lowerStmtList(fc, k[2])
+  truncateEnv(fc, bodyMark)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  if (!fc.terminated) {
+    emitJump(fc, stepBlk, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  // Step: `continue`'s target. There is no cursor to advance — next() runs
+  // again at the top of the header.
+  builderBeginBlock(fc.b, stepBlk)
+  addJoinParams(fc, preLen)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Exit.
+  builderBeginBlock(fc.b, exitBlk)
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+  // Drop the hidden $iter local.
+  truncateEnv(fc, preLen - 1)
+}
