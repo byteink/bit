@@ -6,41 +6,43 @@
 // states the YAML-specific deltas).
 //
 // TWO ENTRY POINTS, ONE GRAMMAR. `scan(source, limits)` materializes the
-// whole stream as `[]Token`, for tests and any caller wanting random access.
-// A future parser (same module, no import needed — pkg/README.md's flat
-// namespace) drives `scanNext(s)` directly instead, reading the current
-// token off `Scanner`'s own `kind`/`start`/`end` fields: a class is a heap
-// object in Bit, so materializing a `Token` per token is a `gc_alloc` each,
-// and JSON's own lexer paid exactly that cost before `lexNext` existed
-// (stdlib/json/lex.bit:26-34). `scanTok` below is the only function that
-// builds a `Token`, so the two entry points cannot drift apart.
+// whole stream as `[]Token`, for tests and random access. A future parser
+// (same module, flat namespace) drives `scanNext(s)` directly instead,
+// reading `Scanner.kind`/`start`/`end` — a `Token` is a heap `gc_alloc` per
+// token, the cost `stdlib/json/lex.bit`'s `lexNext` exists to avoid.
+// `scanTok` is the only function that builds one, so the two cannot drift.
 //
-// RAW SPANS ONLY. Every token carries `[start, end)` byte offsets into
+// RAW SPANS, MOSTLY. Every token carries `[start, end)` byte offsets into
 // `source`. Escapes inside quoted scalars are not decoded, block scalar
-// bodies are not read, and no value is constructed — later files in this
-// package own all of that. This layer slices, it never normalizes.
+// bodies are not read, no value is constructed — later files own all of
+// that. The one exception: a plain scalar's span excludes trailing
+// spaces/tabs (never its content per the core grammar), trimmed in
+// `scanPlainScalar` itself rather than left for a later file to strip.
 //
 // INDENTATION. Nesting lives on `Scanner.indentStack`, an explicit `[]int`
-// of column numbers, bounded by `YamlLimits.maxDepth` (read from the caller,
-// never a second constant — pkg/yaml/value.bit is this package's one budget).
-// A document nested past that depth yields an `Invalid` token, never a stack
-// overflow; `Scanner.flowDepth` gets the same cap for the same reason, since
-// a pathological run of `[[[[...` is the same shape of attack. Flow context
-// (`flowDepth > 0`) suppresses indentation entirely, per YAML: a blank line
-// or a comment-only line carries no indentation signal either way, checked
-// before the column comparison so neither can emit a stray `Dedent`.
+// of columns, bounded by `YamlLimits.maxDepth` (the caller's, never a
+// second constant — pkg/yaml/value.bit is this package's one budget); past
+// that depth is `Invalid`, never a stack overflow. `Scanner.flowDepth` gets
+// the same cap against `[[[[...` and suppresses indentation entirely inside
+// it, per YAML. A blank or comment-only line carries no indentation signal,
+// checked before the column comparison so neither emits a stray `Dedent`.
 //
-// THE COLON RULE. `:` only closes a key when followed by a space, a newline,
-// or end of input (`isColonBoundary`) — this is what keeps `http://x` one
-// `PlainScalar` instead of splitting on its first colon, and it is checked
-// inside `scanPlainScalar`'s own loop, not just at the token's start, so a
-// colon buried mid-scalar is caught too. `-` and `?` get the same
-// followed-by-blank test (`followedByBlank`): `-3` is a scalar, `- ` is a
-// `SeqEntry`. `#` only starts a `Comment` when it is reached as the first
-// byte of a token — which, structurally, only happens at the start of a
-// line or right after whitespace was skipped — so `scanPlainScalar` need
-// only check for a *space* immediately before a `#` to stop early; `a#b`
-// never hits that check and stays one scalar.
+// THE COLON RULE. `:` only closes a key when followed by a space, a
+// newline, or end of input (`isColonBoundary`) — keeps `http://x` one
+// `PlainScalar`, checked inside `scanPlainScalar`'s own loop so a colon
+// buried mid-scalar is caught too, not just at the token's start. `-` and
+// `?` get the same followed-by-blank test (`followedByBlank`): `-3` is a
+// scalar, `- ` is a `SeqEntry`. `#` starts a `Comment` only right after
+// whitespace was skipped, so `scanPlainScalar` need only check for a
+// *space* before it; `a#b` stays one scalar.
+//
+// THE TAB RULE. A tab stands in for a separation space (`tabSeparatorLegal`)
+// only when nothing past it, this line, reads as a bare block indicator —
+// its column would be undefined, a tab having no fixed width. Same test:
+// leading indentation (`lineStartStep`), a tab already crossed as
+// inter-token whitespace (`sawTabInRun`), a tab after `:` mid-scalar
+// (`isColonBoundary`), a tab-led `"..."` continuation unless the scalar is
+// the document's own root, `atRoot` (`scanDoubleQuoted`).
 
 // The lexical categories a YAML scan can produce.
 export enum TokenKind {
@@ -89,6 +91,8 @@ class Scanner {
   pendingDedents: int,
   freshLine: bool,
   col: int,
+  sawTabInRun: bool,
+  firstToken: bool,
   kind: TokenKind,
   start: int,
   end: int,
@@ -96,8 +100,7 @@ class Scanner {
 
 // A scanner positioned before `source`'s first byte, top-level indentation
 // at column 0. `kind` is `Eof` until the first `scanNext`, same as an empty
-// source would yield, so a caller reading the cursor unscanned sees "no
-// token" rather than garbage.
+// source, so an unscanned cursor reads as "no token", not garbage.
 fn newScanner(source: string, limits: YamlLimits): Scanner {
   return Scanner{
     src: source,
@@ -110,6 +113,8 @@ fn newScanner(source: string, limits: YamlLimits): Scanner {
     pendingDedents: 0,
     freshLine: true,
     col: 0,
+    sawTabInRun: false,
+    firstToken: true,
     kind: TokenKind.Eof,
     start: 0,
     end: 0,
@@ -140,8 +145,8 @@ fn emit(s: Scanner, start: int, n: int, k: TokenKind) {
 }
 
 // True when the next byte closes a `:`/`-`/`?` indicator: a space, a
-// newline, or end of input. Shared by `scanColon`, `scanDash` and
-// `scanQuestion` so the three follow the identical rule.
+// newline, or end of input — a tab is `emitIndicator`'s own job (tab rule,
+// see header), not this function's.
 fn followedByBlank(s: Scanner): bool {
   if (s.i + 1 >= s.srcLen) {
     return true
@@ -150,11 +155,62 @@ fn followedByBlank(s: Scanner): bool {
   return n == ' ' || n == '\n' || n == '\r'
 }
 
+// First byte at or past `start` that is not a space or a tab.
+fn skipBlankRun(s: Scanner, start: int): int {
+  let j = start
+  while (j < s.srcLen && (s.src[j] == ' ' || s.src[j] == '\t')) {
+    j = j + 1
+  }
+  return j
+}
+
+// `followedByBlank`'s own rule, evaluated at `j` instead of `s.i`.
+fn isBareIndicatorAt(s: Scanner, j: int): bool {
+  let c = s.src[j]
+  if (c != '-' && c != '?' && c != ':') {
+    return false
+  }
+  if (j + 1 >= s.srcLen) {
+    return true
+  }
+  let n = s.src[j + 1]
+  return n == ' ' || n == '\n' || n == '\r'
+}
+
+// `isColonBoundary`'s own rule, scanning ahead to end of line — the tab
+// rule (see header) needs this before deciding the tab itself is legal.
+fn lineHasColonBoundary(s: Scanner, start: int): bool {
+  let j = start
+  while (j < s.srcLen && s.src[j] != '\n' && s.src[j] != '\r') {
+    if (s.src[j] == ':' && isBareIndicatorAt(s, j)) {
+      return true
+    }
+    j = j + 1
+  }
+  return false
+}
+
+// The tab rule (see header). `tabPos` is the tab byte itself.
+fn tabSeparatorLegal(s: Scanner, tabPos: int): bool {
+  let j = skipBlankRun(s, tabPos)
+  if (j >= s.srcLen || s.src[j] == '\n' || s.src[j] == '\r' || s.src[j] == '#') {
+    return true
+  }
+  let c = s.src[j]
+  if (c == '[' || c == '{') {
+    return true
+  }
+  if (isBareIndicatorAt(s, j)) {
+    return false
+  }
+  return !lineHasColonBoundary(s, j)
+}
+
 // --- indentation -----------------------------------------------------
 
 // Advances over the spaces at the start of the current line, returning the
 // column reached. Stops (without consuming it) at the first non-space byte,
-// including a tab: tab-as-indentation is rejected by the caller, not here.
+// including a tab — the caller decides whether that tab is legal.
 fn skipLineIndentSpaces(s: Scanner): int {
   let col = 0
   while (s.i < s.srcLen && s.src[s.i] == ' ') {
@@ -209,21 +265,23 @@ fn applyIndent(s: Scanner, col: int): bool {
   return false
 }
 
-// One line-start step. Measures this line's indentation and decides whether
-// an `Indent`/`Dedent`/`Invalid` token is due right now. Returns `true` when
-// it emitted one (caller returns immediately); `false` means either a blank
-// line was consumed with no signal (caller loops to the next line) or this
-// line's content starts here with no indentation change (caller falls
-// through to content dispatch). A comment-only line and a blank line both
-// take the `false` paths without ever reaching `applyIndent`, so neither
-// can emit a `Dedent`.
+// One line-start step. Measures this line's indentation and decides
+// whether an `Indent`/`Dedent`/`Invalid` token is due right now. Returns
+// `true` when it emitted one (caller returns immediately); `false` means a
+// blank line was consumed with no signal, or this line's content starts
+// here with no indentation change — neither ever reaches `applyIndent`, so
+// neither can emit a stray `Dedent`.
 fn lineStartStep(s: Scanner): bool {
+  s.sawTabInRun = false
   let col = skipLineIndentSpaces(s)
   s.col = col
   if (s.i < s.srcLen && s.src[s.i] == '\t') {
-    emit(s, s.i, 1, TokenKind.Invalid)
-    s.atLineStart = false
-    return true
+    if (!tabSeparatorLegal(s, s.i)) {
+      emit(s, s.i, 1, TokenKind.Invalid)
+      s.atLineStart = false
+      return true
+    }
+    s.i = skipBlankRun(s, s.i)
   }
   if (s.i >= s.srcLen) {
     s.atLineStart = false
@@ -298,10 +356,9 @@ fn dispatchFlowBrackets(s: Scanner, c: u8): bool {
 
 // --- plain scalars -----------------------------------------------------
 
-// `:` only closes a key when followed by a space, a newline or end of
-// input (checked at the scanner's *current* position, so this doubles as
-// both the dispatch test on `scanColon` and the mid-scalar stop test on
-// `scanPlainScalar`).
+// `:` closes a key when followed by a space, a newline, end of input, or a
+// tab the tab rule accepts (see header) — doubles as the dispatch test on
+// `scanColon` and the mid-scalar stop test on `scanPlainScalar`.
 fn isColonBoundary(s: Scanner): bool {
   if (s.src[s.i] != ':') {
     return false
@@ -310,57 +367,93 @@ fn isColonBoundary(s: Scanner): bool {
     return true
   }
   let n = s.src[s.i + 1]
-  return n == ' ' || n == '\n' || n == '\r'
+  if (n == ' ' || n == '\n' || n == '\r') {
+    return true
+  }
+  if (n == '\t') {
+    return tabSeparatorLegal(s, s.i + 1)
+  }
+  return false
 }
 
 fn isFlowStopperChar(c: u8): bool {
   return c == ',' || c == ']' || c == '}' || c == '[' || c == '{'
 }
 
-// A space immediately followed by `#` stops a plain scalar and hands the
-// `#` to the comment dispatch; `a#b` never sees this (no space before it),
-// so it never breaks the scalar.
+// A space or tab immediately followed by `#` stops a plain scalar and
+// hands the `#` to the comment dispatch; `a#b` never sees this (no
+// whitespace before it), so it never breaks the scalar.
 fn isCommentAhead(s: Scanner): bool {
   return s.i + 1 < s.srcLen && s.src[s.i + 1] == '#'
 }
 
+fn plainScalarShouldBreak(s: Scanner, c: u8): bool {
+  if (c == '\n' || c == '\r') {
+    return true
+  }
+  if (isColonBoundary(s)) {
+    return true
+  }
+  if (s.flowDepth > 0 && isFlowStopperChar(c)) {
+    return true
+  }
+  return (c == ' ' || c == '\t') && isCommentAhead(s)
+}
+
 // A greedy single-line raw span: everything up to a newline, a
-// `:`/space+`#` boundary, or (inside flow) a flow indicator. No escape
-// handling, no line folding — later files own the grammar above this span.
+// `:`/whitespace+`#` boundary, or (inside flow) a flow indicator. No escape
+// handling, no line folding. Trailing spaces/tabs are not content per the
+// core grammar, so the span is trimmed back to the last non-blank byte.
 fn scanPlainScalar(s: Scanner) {
   let start = s.i
+  let lastContent = start - 1
   while (s.i < s.srcLen) {
     let c = s.src[s.i]
-    if (c == '\n' || c == '\r') {
+    if (plainScalarShouldBreak(s, c)) {
       break
     }
-    if (isColonBoundary(s)) {
-      break
-    }
-    if (s.flowDepth > 0 && isFlowStopperChar(c)) {
-      break
-    }
-    if (c == ' ' && isCommentAhead(s)) {
-      break
+    if (c != ' ' && c != '\t') {
+      lastContent = s.i
     }
     s.i = s.i + 1
   }
-  setTok(s, TokenKind.PlainScalar, start, s.i)
+  setTok(s, TokenKind.PlainScalar, start, lastContent + 1)
 }
 
 // --- single-char indicators with a lookahead ---------------------------
 
-fn scanQuestion(s: Scanner) {
+// Shared by `scanDash`/`scanQuestion`/`scanColon`: emits `kind` when legal,
+// `Invalid` per the tab rule (see header), or `false` ("not an indicator")
+// so the caller falls back to a plain scalar.
+fn emitIndicator(s: Scanner, kind: TokenKind, tabBefore: bool): bool {
+  if (s.i + 1 < s.srcLen && s.src[s.i + 1] == '\t') {
+    if (tabSeparatorLegal(s, s.i + 1)) {
+      emit(s, s.i, 1, kind)
+    } else {
+      emit(s, s.i, 1, TokenKind.Invalid)
+    }
+    return true
+  }
   if (followedByBlank(s)) {
-    emit(s, s.i, 1, TokenKind.KeyIndicator)
+    if (tabBefore) {
+      emit(s, s.i, 1, TokenKind.Invalid)
+      return true
+    }
+    emit(s, s.i, 1, kind)
+    return true
+  }
+  return false
+}
+
+fn scanQuestion(s: Scanner, tabBefore: bool) {
+  if (emitIndicator(s, TokenKind.KeyIndicator, tabBefore)) {
     return
   }
   scanPlainScalar(s)
 }
 
-fn scanColon(s: Scanner) {
-  if (followedByBlank(s)) {
-    emit(s, s.i, 1, TokenKind.ValueIndicator)
+fn scanColon(s: Scanner, tabBefore: bool) {
+  if (emitIndicator(s, TokenKind.ValueIndicator, tabBefore)) {
     return
   }
   scanPlainScalar(s)
@@ -382,13 +475,12 @@ fn isDocMarker(s: Scanner, marker: string): bool {
 // `---` is only a `DocStart` at column 0 of a fresh line; anywhere else
 // (including `-3` — see `followedByBlank`) it falls through to `SeqEntry`
 // or a plain scalar, exactly like a lone `-`.
-fn scanDash(s: Scanner, fresh: bool) {
+fn scanDash(s: Scanner, fresh: bool, tabBefore: bool) {
   if (fresh && s.col == 0 && isDocMarker(s, "---")) {
     emit(s, s.i, 3, TokenKind.DocStart)
     return
   }
-  if (followedByBlank(s)) {
-    emit(s, s.i, 1, TokenKind.SeqEntry)
+  if (emitIndicator(s, TokenKind.SeqEntry, tabBefore)) {
     return
   }
   scanPlainScalar(s)
@@ -416,8 +508,7 @@ fn isIndicatorNameChar(c: u8): bool {
 }
 
 // `&name` / `*name` / `!...`: one indicator byte plus a run of name bytes,
-// raw span only — resolving/expanding an alias or looking up a tag is a
-// later file's job.
+// raw span only — resolving/expanding an alias or tag is a later file's job.
 fn scanIndicatorSpan(s: Scanner, k: TokenKind) {
   let start = s.i
   s.i = s.i + 1
@@ -443,9 +534,7 @@ fn scanBlockScalarHeader(s: Scanner) {
   setTok(s, TokenKind.BlockScalarHeader, start, s.i)
 }
 
-// `#` to end of line, or `%YAML` / `%TAG` to end of line: same shape, kept
-// as two functions so each token kind stays independently named at its call
-// site.
+// `#` to end of line, or `%YAML` / `%TAG` to end of line: same shape.
 fn scanToEol(s: Scanner, k: TokenKind) {
   let start = s.i
   while (s.i < s.srcLen && s.src[s.i] != '\n' && s.src[s.i] != '\r') {
@@ -478,10 +567,11 @@ fn scanSingleQuoted(s: Scanner) {
   setTok(s, TokenKind.Invalid, start, s.i)
 }
 
-// `"..."`, quotes included, raw — a `\` always protects the byte after it
-// (so an escaped quote does not close the scalar), mirroring
-// `stdlib/json/lex.bit`'s `scanString`. Escapes are not decoded here.
-fn scanDoubleQuoted(s: Scanner) {
+// `"..."`, quotes included, raw — a `\` protects the byte after it, like
+// `stdlib/json/lex.bit`'s `scanString`; escapes are not decoded here. A
+// tab-led continuation line is `Invalid` (tab rule, see header) unless
+// `atRoot`, which has no enclosing indentation to fall short of.
+fn scanDoubleQuoted(s: Scanner, atRoot: bool) {
   let start = s.i
   s.i = s.i + 1
   while (s.i < s.srcLen) {
@@ -489,6 +579,10 @@ fn scanDoubleQuoted(s: Scanner) {
     if (c == '"') {
       s.i = s.i + 1
       setTok(s, TokenKind.DoubleQuoted, start, s.i)
+      return
+    }
+    if (!atRoot && c == '\n' && s.i + 1 < s.srcLen && s.src[s.i + 1] == '\t') {
+      setTok(s, TokenKind.Invalid, start, s.i + 1)
       return
     }
     if (c == '\\' && s.i + 1 < s.srcLen) {
@@ -500,13 +594,13 @@ fn scanDoubleQuoted(s: Scanner) {
   setTok(s, TokenKind.Invalid, start, s.i)
 }
 
-fn dispatchQuoted(s: Scanner, c: u8): bool {
+fn dispatchQuoted(s: Scanner, c: u8, atRoot: bool): bool {
   if (c == '\'') {
     scanSingleQuoted(s)
     return true
   }
   if (c == '"') {
-    scanDoubleQuoted(s)
+    scanDoubleQuoted(s, atRoot)
     return true
   }
   return false
@@ -514,23 +608,22 @@ fn dispatchQuoted(s: Scanner, c: u8): bool {
 
 // --- top-level content dispatch ------------------------------------------
 
-// `-`, `.`, `?`, `:` all need lookahead beyond a single byte compare, so
-// they get their own group, split from the plain marked-indicator group
-// below to keep each function's branch count small (E0204).
-fn dispatchIndicatorsStructural(s: Scanner, c: u8, fresh: bool): bool {
+// `-`, `.`, `?`, `:` need lookahead beyond a single byte compare, split
+// from the plain marked-indicator group below to keep branch counts small.
+fn dispatchIndicatorsStructural(s: Scanner, c: u8, fresh: bool, tabBefore: bool): bool {
   if (c == '-') {
-    scanDash(s, fresh)
+    scanDash(s, fresh, tabBefore)
     return true
   }
   if (c == '.') {
     return scanDot(s, fresh)
   }
   if (c == '?') {
-    scanQuestion(s)
+    scanQuestion(s, tabBefore)
     return true
   }
   if (c == ':') {
-    scanColon(s)
+    scanColon(s, tabBefore)
     return true
   }
   return false
@@ -564,27 +657,33 @@ fn dispatchIndicatorsMarked(s: Scanner, c: u8): bool {
   return false
 }
 
-fn dispatchIndicators(s: Scanner, c: u8, fresh: bool): bool {
-  if (dispatchIndicatorsStructural(s, c, fresh)) {
+fn dispatchIndicators(s: Scanner, c: u8, fresh: bool, tabBefore: bool): bool {
+  if (dispatchIndicatorsStructural(s, c, fresh, tabBefore)) {
     return true
   }
   return dispatchIndicatorsMarked(s, c)
 }
 
 // The only place a real (non-indent/dedent) content token is dispatched.
-// `fresh` — this line's very first content token — is read once here and
-// cleared, so a later token on the same line never re-triggers a document
-// marker check.
+// `fresh` (this line's first token), `tabBefore` (a tab crossed since the
+// last token, tab rule, see header) and `atRoot` (this is the document's
+// very first token — a flow scalar there has no enclosing node's
+// indentation to fall short of, YAML's own n=-1 root case) are each read
+// once here and cleared, so a later token never re-sees a stale value.
 fn dispatchToken(s: Scanner, c: u8) {
   let fresh = s.freshLine
   s.freshLine = false
+  let tabBefore = s.sawTabInRun
+  s.sawTabInRun = false
+  let atRoot = s.firstToken
+  s.firstToken = false
   if (dispatchFlowBrackets(s, c)) {
     return
   }
-  if (dispatchIndicators(s, c, fresh)) {
+  if (dispatchIndicators(s, c, fresh, tabBefore)) {
     return
   }
-  if (dispatchQuoted(s, c)) {
+  if (dispatchQuoted(s, c, atRoot)) {
     return
   }
   scanPlainScalar(s)
@@ -592,19 +691,34 @@ fn dispatchToken(s: Scanner, c: u8) {
 
 // --- the shared grammar (rule 3 of this file's header) -------------------
 
-// `\n` or `\r\n`, outside flow context resets `atLineStart` so the next
-// `scanNext` call measures the following line's indentation; inside flow
-// context a newline is plain whitespace. Returns whether it consumed one,
-// so `scanNext` knows to loop rather than dispatch.
+// Ordinary inter-token space or tab, mid-line: consumed silently, but a
+// tab sets `sawTabInRun` for the tab rule (see header).
+fn skipInlineBlank(s: Scanner, c: u8): bool {
+  if (c != ' ' && c != '\t') {
+    return false
+  }
+  if (c == '\t') {
+    s.sawTabInRun = true
+  }
+  s.i = s.i + 1
+  return true
+}
+
+// `\n` or `\r\n`, outside flow resets `atLineStart` so the next `scanNext`
+// measures the following line's indentation; inside flow it is plain
+// whitespace. Returns whether it consumed one, so `scanNext` loops instead
+// of dispatching.
 fn consumeNewline(s: Scanner, c: u8): bool {
   if (c == '\n') {
     s.i = s.i + 1
     s.atLineStart = s.flowDepth == 0
+    s.sawTabInRun = false
     return true
   }
   if (c == '\r' && s.i + 1 < s.srcLen && s.src[s.i + 1] == '\n') {
     s.i = s.i + 2
     s.atLineStart = s.flowDepth == 0
+    s.sawTabInRun = false
     return true
   }
   return false
@@ -641,8 +755,7 @@ fn scanNext(s: Scanner) {
     if (consumeNewline(s, c)) {
       continue
     }
-    if (c == ' ' || c == '\t') {
-      s.i = s.i + 1
+    if (skipInlineBlank(s, c)) {
       continue
     }
     dispatchToken(s, c)
@@ -657,18 +770,15 @@ fn scanTok(s: Scanner): Token {
   return Token{ kind: s.kind, start: s.start, end: s.end }
 }
 
-// The full token stream for `source`, ending with one `Eof`. Bounded the
-// same way `stdlib/json/lex.bit:lexImpl` is: every iteration either records
-// a token that strictly advances `s.i`, or an `Indent`/`Dedent` bounded by
-// `limits.maxDepth` per line — so `(srcLen + 8) * (maxDepth + 2)` is a
-// generous but provable ceiling on total tokens, not an open-ended loop.
+// The full token stream for `source`, ending with one `Eof`. Bounded like
+// `stdlib/json/lex.bit:lexImpl`: every iteration advances `s.i` or drains
+// `pendingDedents` (bounded by `limits.maxDepth`), so `(srcLen + 8) *
+// (maxDepth + 2)` is a provable ceiling, not an open-ended loop.
 //
-// `scan` is the outermost public door untrusted bytes pass through in this
-// package (#5508) — `newScanner`/`scanNext` are unexported — so
-// `limits.maxDocumentBytes` is checked here, before a single byte is
-// scanned, rather than truncated: a caller past the limit gets a `fail`
-// naming both the limit and the size it sent, never a silently shortened
-// document.
+// `scan` is the outermost public door untrusted bytes pass through (#5508)
+// — `newScanner`/`scanNext` are unexported — so `limits.maxDocumentBytes`
+// is checked here, before a byte is scanned, rather than truncated: past
+// the limit is a `fail` naming both numbers, never a silently short doc.
 export fn scan(source: string, limits: YamlLimits): []Token! {
   let n = len(source)
   if (n > limits.maxDocumentBytes) {
