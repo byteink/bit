@@ -2243,7 +2243,7 @@ fn signAndVerify(curve: Curve, scalar: []byte, digest: []byte): bool! {
   let sig = ecdsaSign(priv, digest, sha256Hash)?
   let der = ecdsaSignatureToDer(sig)
   let parsed = ecdsaSignatureFromDer(der)?
-  let pub = EcdsaPublicKey{ curve: curve, q: priv.q }
+  let pub = EcdsaPublicKey{ curve = curve, q = priv.q }
   return ecdsaVerify(pub, digest, parsed)
 }
 ```

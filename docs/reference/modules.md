@@ -79,7 +79,7 @@ export fn shortCode(n: int): string {
 export trait Existence {
   get(code: string): Link!
   has(code: string): bool {
-    let l = this.get(code) catch Link{ url: "", created: 0, hits: 0, expiresAt: 0 }
+    let l = this.get(code) catch Link{ url = "", created = 0, hits = 0, expiresAt = 0 }
     return len(l.url) > 0
   }
 }
@@ -107,7 +107,7 @@ export class MemoryStore {
 }
 
 export fn memoryStore(): MemoryStore {
-  return MemoryStore{ links: map<string, Link>() }
+  return MemoryStore{ links = map<string, Link>() }
 }
 
 export class Counter<T> {
@@ -122,7 +122,7 @@ export class Counter<T> {
 }
 
 export fn counter<T>(): Counter<T> {
-  return Counter<T>{ counts: map<T, int>() }
+  return Counter<T>{ counts = map<T, int>() }
 }
 
 // Removes every link whose expiresAt has passed nowNs, returning the count.

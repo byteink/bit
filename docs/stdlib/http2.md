@@ -36,9 +36,9 @@ import { newEncoder, newDecoder, HeaderField } from "std/http2"
 fn roundTrip(): []HeaderField! {
   let enc = newEncoder()
   let fields = []HeaderField{
-    HeaderField{ name: ":method", value: "GET", sensitive: false },
-    HeaderField{ name: ":path", value: "/", sensitive: false },
-    HeaderField{ name: ":authority", value: "example.com", sensitive: false },
+    HeaderField{ name = ":method", value = "GET", sensitive = false },
+    HeaderField{ name = ":path", value = "/", sensitive = false },
+    HeaderField{ name = ":authority", value = "example.com", sensitive = false },
   }
   let block = enc.encode(fields)
 
@@ -57,7 +57,7 @@ import { newEncoder, HeaderField } from "std/http2"
 fn encodeSecret(): []byte {
   let enc = newEncoder()
   let fields = []HeaderField{
-    HeaderField{ name: "authorization", value: "Bearer s3cr3t", sensitive: true },
+    HeaderField{ name = "authorization", value = "Bearer s3cr3t", sensitive = true },
   }
   return enc.encode(fields)
 }
@@ -198,8 +198,8 @@ import { encodeSettings, SettingsFrame, Setting, settingsMaxFrameSize } from "st
 
 // A SETTINGS frame advertising a 32 KiB max frame size.
 fn settingsBytes(): []byte! {
-  let params = []Setting{ Setting{ id: settingsMaxFrameSize, value: 32768 } }
-  return encodeSettings(SettingsFrame{ ack: false, settings: params })?
+  let params = []Setting{ Setting{ id = settingsMaxFrameSize, value = 32768 } }
+  return encodeSettings(SettingsFrame{ ack = false, settings = params })?
 }
 ```
 
@@ -213,19 +213,19 @@ import { newEncoder, HeaderField, encodeHeaders, HeadersFrame } from "std/http2"
 fn headersFrame(sid: int): []byte! {
   let enc = newEncoder()
   let block = enc.encode(
-    []HeaderField{ HeaderField{ name: ":status", value: "200", sensitive: false } },
+    []HeaderField{ HeaderField{ name = ":status", value = "200", sensitive = false } },
   )
   return encodeHeaders(
     HeadersFrame{
-      streamId: sid,
-      blockFragment: block,
-      endStream: true,
-      endHeaders: true,
-      padLength: 0 - 1,
-      hasPriority: false,
-      exclusive: false,
-      streamDependency: 0,
-      weight: 0,
+      streamId = sid,
+      blockFragment = block,
+      endStream = true,
+      endHeaders = true,
+      padLength = 0 - 1,
+      hasPriority = false,
+      exclusive = false,
+      streamDependency = 0,
+      weight = 0,
     },
   )?
 }

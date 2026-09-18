@@ -77,8 +77,8 @@ import { newMessage, newAttachment, Address } from "std/smtp"
 // A two-part message with an attachment: text, an HTML alternative, and a file.
 // The body comes out `multipart/mixed` wrapping a `multipart/alternative`.
 fn invoice(pdf: []byte): string! {
-  let m = newMessage(Address{ name: "Billing", email: "billing@example.com" })
-  m.addTo(Address{ name: "", email: "customer@example.net" })
+  let m = newMessage(Address{ name = "Billing", email = "billing@example.com" })
+  m.addTo(Address{ name = "", email = "customer@example.net" })
   m.setSubject("Your invoice")
   m.setText("The invoice is attached.\n")
   m.setHtml("<p>The invoice is attached.</p>\n")
