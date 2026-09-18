@@ -1,26 +1,38 @@
 // Bit toml package — tree.bit, the document tree `parse.bit` builds and the
 // redefinition rules that govern it (TOML 1.0.0, #5484, epic #1481).
 //
-// Split out of `parse.bit` unchanged: that file owns the token-level grammar
-// — key/value lines, headers, the iterative array/inline-table machine —
-// while this one owns the SHAPE a key path resolves to, which redefinitions
-// are errors, and how the working tree becomes the `Toml` `tomlParse`
-// returns.
+// Split out of `parse.bit`: that file owns the token-level grammar — key/
+// value lines, headers, the iterative array/inline-table machine — while
+// this one owns the SHAPE a key path resolves to, which redefinitions are
+// errors, and how the working tree becomes the `Toml` `tomlParse` returns.
 //
-// THE WORKING DOCUMENT TREE. `Toml.TomlTable` is immutable ([]TomlEntry), but
-// a table under construction needs to be extended key by key, sometimes long
-// after it was first created. `WTable` is the mutable counterpart this file
-// builds against and converts to `Toml` only once, in `finalizeTable`:
+// ONE TREE, NOT TWO. Every key/value pair in a document costs exactly one
+// `TomlEntry`: the one `setLeaf` allocates, appended to the `[]TomlEntry`
+// its table accumulates, which IS the slice `finalizeTable` hands to
+// `Toml.TomlTable` — no per-entry copy on the way out. Before #5576 a
+// parallel `WEntry`/`WNode.WLeaf` spine was built first and converted pair
+// by pair, three allocations and two growing arrays per pair instead of one
+// and one.
 //
-//   enum WNode { WLeaf(Toml), WSub(WTable), WArr([]WTable) }
+// WHAT STILL NEEDS A MUTABLE HALF is the one thing a finished `[]TomlEntry`
+// cannot say: which children are STILL OPEN for extension, sometimes long
+// after they were first created. That is `WTable.open` — one `WOpen` per
+// child that is a table or an array of tables, and none at all for a leaf:
 //
-// A `WLeaf` is a value that can never be extended: every ordinary scalar,
-// every `TomlArray`, and — critically — a closed inline table, which becomes
-// a `WLeaf(TomlTable(...))` the instant its `}` is seen. Reaching a `WLeaf`
-// while resolving any later path (a header, a dotted key) is always an
-// error, and that ONE check is what implements three of the spec's separate
-// rules at once: colliding with a plain value, redefining an intermediate as
-// a non-table, and extending an inline table — they are the same case here.
+//   enum WNode { WSub(WTable), WArr([]WTable) }
+//
+// A `WOpen` holds the very `TomlEntry` it stands for, whose `value` is a
+// placeholder until `finalizeTable` overwrites it in place with the closed
+// table.
+//
+// A key in `entries` with no `WOpen` is therefore a value that can never be
+// extended: every ordinary scalar, every `TomlArray`, and — critically — a
+// closed inline table, which becomes a plain `TomlTable` entry the instant
+// its `}` is seen. Reaching one while resolving any later path (a header, a
+// dotted key) is always an error, and that ONE check — `findOpen` empty,
+// `hasEntry` true — is what implements three of the spec's separate rules at
+// once: colliding with a plain value, redefining an intermediate as a
+// non-table, and extending an inline table. They are the same case here.
 //
 // EXPLICIT VS IMPLICIT. `WTable.explicit` is true exactly when a `[header]`
 // (not `[[...]]`) has claimed this exact table. A dotted key's intermediate
@@ -41,23 +53,35 @@
 // `tomlMaxDepth` on the way in, so its worst case is a compile-time-bounded
 // 128 frames, not input-driven.
 
-// --- the mutable working tree -----------------------------------------
+// --- the mutable half of the working tree ------------------------------
 
+// A child that is still open for extension.
 enum WNode {
-  WLeaf(Toml),
   WSub(WTable),
   WArr([]WTable),
 }
 
-class WEntry { key: string, node: WNode }
+// The mutable half of ONE child entry: `entry` is the very `TomlEntry` the
+// parent's `entries` already holds, and `finalizeTable` writes the closed
+// table straight into its `value`. A leaf has no `WOpen` at all.
+class WOpen { entry: TomlEntry, node: WNode }
 
-// `depth` is this table's distance from the root, checked by `newChildTable`
-// against `tomlMaxDepth` so `finalizeTable`'s recursion is bounded by a
-// constant rather than by how many dots a header or key chain contains.
-class WTable { entries: []WEntry, explicit: bool, depth: int }
+// `entries` is the table's final `[]TomlEntry`, in source order, built in
+// place; `open` is the subset of those entries still extensible. `depth` is
+// this table's distance from the root, checked by `newChildTable` against
+// `tomlMaxDepth` so `finalizeTable`'s recursion is bounded by a constant
+// rather than by how many dots a header or key chain contains.
+class WTable { entries: []TomlEntry, open: []WOpen, explicit: bool, depth: int }
+
+// The value an open child's entry carries until its table closes. Never
+// observable: `finalizeTable` overwrites every one of them before the tree
+// leaves `tomlParse`.
+fn wPending(): Toml {
+  return Toml.TomlBool(false)
+}
 
 fn newRootTable(): WTable {
-  return WTable{ entries: []WEntry(0), explicit: true, depth: 0 }
+  return WTable{ entries: []TomlEntry(0), open: []WOpen(0), explicit: true, depth: 0 }
 }
 
 // A new child of `parent`, refusing once nesting would exceed
@@ -67,19 +91,47 @@ fn newChildTable(parent: WTable, explicit: bool, offset: int): WTable! {
   if (parent.depth + 1 > tomlMaxDepth) {
     fail tomlParseError("table nesting exceeds maximum depth", offset)
   }
-  return WTable{ entries: []WEntry(0), explicit: explicit, depth: parent.depth + 1 }
+  return WTable{
+    entries: []TomlEntry(0),
+    open: []WOpen(0),
+    explicit: explicit,
+    depth: parent.depth + 1,
+  }
 }
 
-// Finds `key` among `t`'s own entries (not recursive), or none.
-fn findEntry(t: WTable, key: string): Option<WEntry> {
+// Whether `t` already holds any entry — leaf or table — under `key` (not
+// recursive). A bool, not an `Option<TomlEntry>`: this runs once per
+// key/value pair in the document and no caller needs the entry itself.
+fn hasEntry(t: WTable, key: string): bool {
   let i = 0
   while (i < len(t.entries)) {
     if (t.entries[i].key == key) {
-      return Option<WEntry>.Some(t.entries[i])
+      return true
     }
     i = i + 1
   }
-  return Option<WEntry>.None
+  return false
+}
+
+// The still-open child named `key`, or none — which means either no such
+// key at all or a key whose entry is a leaf; `hasEntry` tells those apart.
+fn findOpen(t: WTable, key: string): Option<WOpen> {
+  let i = 0
+  while (i < len(t.open)) {
+    if (t.open[i].entry.key == key) {
+      return Option<WOpen>.Some(t.open[i])
+    }
+    i = i + 1
+  }
+  return Option<WOpen>.None
+}
+
+// Appends one open child: its `TomlEntry` takes its place in `t.entries` in
+// source order now, and `finalizeTable` fills in the value later.
+fn addOpen(t: WTable, key: string, node: WNode) {
+  let entry = TomlEntry{ key: key, value: wPending() }
+  t.entries = append(t.entries, entry)
+  t.open = append(t.open, WOpen{ entry: entry, node: node })
 }
 
 // One key path segment, paired with the byte offset of its own token —
@@ -87,30 +139,29 @@ fn findEntry(t: WTable, key: string): Option<WEntry> {
 class KeySeg { name: string, offset: int }
 
 // Descends one INTERMEDIATE path segment (never the terminal one) from `t`:
-// creates an implicit `WSub` the first time `seg.name` is seen, otherwise
+// creates an implicit sub-table the first time `seg.name` is seen, otherwise
 // descends into an existing table — or, per TOML's array-of-tables
-// extension rule, the LAST element of an existing array of tables. A
-// `WLeaf` here is always an error: the segment already names a value, not a
-// table.
+// extension rule, the LAST element of an existing array of tables. A leaf
+// here is always an error: the segment already names a value, not a table.
 fn descendIntermediate(t: WTable, seg: KeySeg): WTable! {
-  let found = findEntry(t, seg.name)
-  match (found) {
+  let open = findOpen(t, seg.name)
+  match (open) {
+    Some(o) => { return descendIntoExisting(o) }
     None => {
+      if (hasEntry(t, seg.name)) {
+        fail tomlParseError("'${seg.name}' is already defined and is not a table", seg.offset)
+      }
       let sub = newChildTable(t, false, seg.offset)?
-      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WSub(sub) })
+      addOpen(t, seg.name, WNode.WSub(sub))
       return sub
     }
-    Some(e) => { return descendIntoExisting(e, seg)? }
   }
 }
 
-fn descendIntoExisting(e: WEntry, seg: KeySeg): WTable! {
-  match (e.node) {
+fn descendIntoExisting(o: WOpen): WTable {
+  match (o.node) {
     WSub(sub) => { return sub }
     WArr(tables) => { return tables[len(tables) - 1] }
-    WLeaf(_) => {
-      fail tomlParseError("'${seg.name}' is already defined and is not a table", seg.offset)
-    }
   }
 }
 
@@ -119,19 +170,22 @@ fn descendIntoExisting(e: WEntry, seg: KeySeg): WTable! {
 // already explicit, an array of tables, or a plain value are all
 // redefinitions.
 fn openTableHeader(t: WTable, seg: KeySeg): WTable! {
-  let found = findEntry(t, seg.name)
-  match (found) {
+  let open = findOpen(t, seg.name)
+  match (open) {
+    Some(o) => { return reopenTableHeader(o, seg)? }
     None => {
+      if (hasEntry(t, seg.name)) {
+        fail tomlParseError("'${seg.name}' is already defined", seg.offset)
+      }
       let sub = newChildTable(t, true, seg.offset)?
-      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WSub(sub) })
+      addOpen(t, seg.name, WNode.WSub(sub))
       return sub
     }
-    Some(e) => { return reopenTableHeader(e, seg)? }
   }
 }
 
-fn reopenTableHeader(e: WEntry, seg: KeySeg): WTable! {
-  match (e.node) {
+fn reopenTableHeader(o: WOpen, seg: KeySeg): WTable! {
+  match (o.node) {
     WSub(sub) => {
       if (sub.explicit) {
         fail tomlParseError("table '${seg.name}' redefined", seg.offset)
@@ -140,7 +194,6 @@ fn reopenTableHeader(e: WEntry, seg: KeySeg): WTable! {
       return sub
     }
     WArr(_) => { fail tomlParseError("'${seg.name}' is already an array of tables", seg.offset) }
-    WLeaf(_) => { fail tomlParseError("'${seg.name}' is already defined", seg.offset) }
   }
 }
 
@@ -148,64 +201,67 @@ fn reopenTableHeader(e: WEntry, seg: KeySeg): WTable! {
 // the array (or creates a one-element array the first time), unless `key`
 // already names a plain table or a value.
 fn openArrayTableHeader(t: WTable, seg: KeySeg): WTable! {
-  let found = findEntry(t, seg.name)
-  match (found) {
+  let open = findOpen(t, seg.name)
+  match (open) {
+    Some(o) => { return appendArrayTable(t, o, seg)? }
     None => {
+      if (hasEntry(t, seg.name)) {
+        fail tomlParseError("'${seg.name}' is already defined", seg.offset)
+      }
       let fresh = newChildTable(t, true, seg.offset)?
-      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WArr([fresh]) })
+      addOpen(t, seg.name, WNode.WArr([fresh]))
       return fresh
     }
-    Some(e) => { return appendArrayTable(t, e, seg)? }
   }
 }
 
-fn appendArrayTable(t: WTable, e: WEntry, seg: KeySeg): WTable! {
-  match (e.node) {
+fn appendArrayTable(t: WTable, o: WOpen, seg: KeySeg): WTable! {
+  match (o.node) {
     WArr(tables) => {
       let fresh = newChildTable(t, true, seg.offset)?
-      e.node = WNode.WArr(append(tables, fresh))
+      o.node = WNode.WArr(append(tables, fresh))
       return fresh
     }
     WSub(_) => { fail tomlParseError("'${seg.name}' is already a table", seg.offset) }
-    WLeaf(_) => { fail tomlParseError("'${seg.name}' is already defined", seg.offset) }
   }
 }
 
 // Sets a terminal key/value pair on `t`: any existing entry under this
-// exact name — leaf, table, or array of tables — is a duplicate key.
+// exact name — leaf, table, or array of tables — is a duplicate key. The
+// `TomlEntry` appended here is the one the caller of `tomlParse` gets back,
+// never a copy of it (see this file's header).
 fn setLeaf(t: WTable, seg: KeySeg, value: Toml): ()! {
-  let found = findEntry(t, seg.name)
-  match (found) {
-    None => {
-      t.entries = append(t.entries, WEntry{ key: seg.name, node: WNode.WLeaf(value) })
-      return
-    }
-    Some(_) => { fail tomlParseError("duplicate key '${seg.name}'", seg.offset) }
+  if (hasEntry(t, seg.name)) {
+    fail tomlParseError("duplicate key '${seg.name}'", seg.offset)
   }
+  t.entries = append(t.entries, TomlEntry{ key: seg.name, value: value })
+  return
 }
 
-// --- converting the working tree to `Toml` -----------------------------
+// --- closing the open children -----------------------------------------
 //
 // Safe as ordinary (mutual) recursion: `newChildTable` already refused any
 // table past `tomlMaxDepth` on the way in, so this walk is bounded by that
 // same compile-time constant, not by anything still under an attacker's
 // control (see this file's header).
 
+// Overwrites each open child's placeholder value with its closed table and
+// boxes `t.entries` as it already stands — no per-entry copy: leaves have
+// been in their final form since `setLeaf` built them.
 fn finalizeTable(t: WTable): Toml {
-  let entries = []TomlEntry(0, len(t.entries))
   let i = 0
-  while (i < len(t.entries)) {
-    entries = append(entries, finalizeEntry(t.entries[i]))
+  while (i < len(t.open)) {
+    let o = t.open[i]
+    o.entry.value = finalizeNode(o.node)
     i = i + 1
   }
-  return Toml.TomlTable(entries)
+  return Toml.TomlTable(t.entries)
 }
 
-fn finalizeEntry(e: WEntry): TomlEntry {
-  match (e.node) {
-    WLeaf(v) => { return TomlEntry{ key: e.key, value: v } }
-    WSub(sub) => { return TomlEntry{ key: e.key, value: finalizeTable(sub) } }
-    WArr(tables) => { return TomlEntry{ key: e.key, value: Toml.TomlArray(finalizeArray(tables)) } }
+fn finalizeNode(n: WNode): Toml {
+  match (n) {
+    WSub(sub) => { return finalizeTable(sub) }
+    WArr(tables) => { return Toml.TomlArray(finalizeArray(tables)) }
   }
 }
 
