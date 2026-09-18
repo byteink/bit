@@ -1,5 +1,5 @@
 module yamlv3bench
 
-go 1.27
+go 1.25
 
 require gopkg.in/yaml.v3 v3.0.1
