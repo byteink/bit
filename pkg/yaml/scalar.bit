@@ -1,7 +1,8 @@
 // pkg/yaml/scalar.bit — yaml module, plain/single-quoted/double-quoted
-// scalar decoding (#5493, epic #1482). Turns the raw `[start, end)` spans
-// `pkg/yaml/scan.bit` produces into decoded `string` values; `value.bit` and
-// `scan.bit` are siblings in this same flat module (pkg/README.md).
+// scalar decoding (#5493, epic #1482; the flow-fold fix is #5531). Turns the
+// raw `[start, end)` spans `pkg/yaml/scan.bit` produces into decoded
+// `string` values; `value.bit` and `scan.bit` are siblings in this same
+// flat module (pkg/README.md).
 //
 // THREE STYLES, three rule sets — see `yamlDecodeScalar` for the dispatch:
 //
@@ -25,22 +26,28 @@
 //   - DOUBLE-QUOTED is the only style with backslash escapes, and the only
 //     one that mixes escapes with line folding: an escaped line break
 //     (`\` immediately before `\n`/`\r\n`) is a continuation that removes
-//     the break entirely (no space, no fold), while every OTHER embedded
-//     break is subject to the same `foldContent` plain scalars use.
+//     the break entirely (no space, no fold — though the resumed line's own
+//     leading indentation is still trimmed, same as any other line's), and
+//     every OTHER embedded break folds too. Because a decoded escape can
+//     itself be a whitespace byte (spec 5.7's ns-esc-horizontal-tab/
+//     ns-esc-space — DE56/00's trailing `\t` must survive as content, not
+//     get trimmed away as if it were indentation), double-quoted trims
+//     against the RAW source bytes before decoding any escape
+//     (`decodeDoubleQuotedLines` below) rather than sharing plain and
+//     single-quoted's decode-then-trim `foldContent`.
 //
-// LINE FOLDING (`foldContent`, shared by plain, single-quoted and
-// double-quoted): given
-// content already free of escapes, split it into physical lines. A single
-// break between two content lines becomes one space. A run of N consecutive
-// breaks (extra breaks come from blank lines in between) becomes N-1
-// literal newlines. The first continuation line (`lines[1]`) sets the
-// scalar's baseline indentation — a raw byte span carries no external
-// column context the way a real block-context parser would supply, so this
-// file establishes the baseline from the content itself. A later line
-// indented past that baseline is "more indented": its break is NOT folded
-// (kept as a literal, unreduced run of newlines) and its extra indentation
-// beyond the baseline is preserved as content, mirroring how YAML never
-// folds around more-indented material (spec 6.5).
+// LINE FOLDING (spec 6.5's core-grammar rule — no more-indented exception:
+// that one is spec 6.5's own `>`-style block-scalar rule, which belongs to
+// `block.bit`'s `foldSeparator` call, not to any of the three styles here,
+// #5531): split content into physical lines. A single break between two
+// lines becomes one space. A run of N consecutive breaks (extra breaks come
+// from blank lines in between) becomes N-1 literal newlines. Every line's
+// leading AND trailing space/tab is trimmed, uniformly, with exactly two
+// exceptions: the whole scalar's own first byte (never trimmed on its
+// leading side — it is the content's own boundary, not a fold edge) and its
+// own last byte (never trimmed on its trailing side). `foldLines` (plain,
+// single-quoted) and `decodeDoubleQuotedLines` (double-quoted) each trim
+// their own lines this way; `foldJoin` does the shared joining.
 //
 // TYPES ARE NOT RESOLVED HERE. Every style decodes to a `string`; whether
 // `no` is a boolean or `123` is an int is `pkg/yaml/schema.bit`'s decision.
@@ -54,7 +61,7 @@
 // `repeat` is already imported into this module by scan.test.bit (same
 // module, importing it again here would be E0042 — pkg/README.md's flat
 // namespace).
-import { Builder, newBuilder, trim, trimRight } from "std/strings"
+import { Builder, newBuilder, trim, trimLeft, trimRight } from "std/strings"
 
 // This package's own error convention for this file: a message plus the
 // byte offset it happened at, mirroring `stdlib/json/parse.bit`'s
@@ -145,49 +152,17 @@ fn splitRawLines(content: string): []string {
   return lines
 }
 
-// A line with nothing but spaces/tabs (or nothing at all) — carries no
-// content of its own, only an extra break for the N/N-1 fold count.
-fn isBlankLine(line: string): bool {
-  return trim(line, " \t") == ""
-}
-
-// The count of leading space/tab bytes — this file's only notion of
-// "indentation" for a raw span with no external column context.
-fn lineIndent(line: string): i64 {
-  let n = len(line)
-  let i = 0
-  while (i < n && (line[i] == ' ' || line[i] == '\t')) {
-    i = i + 1
-  }
-  return i
-}
-
-// `line` with its leading and trailing space/tab stripped — every folded
-// line's content, per this file's header.
+// `line` with its leading and trailing space/tab stripped — every interior
+// folded line's content, per this file's header.
 fn trimEdges(line: string): string {
   return trim(line, " \t")
 }
 
-// The baseline indentation this content's fold decisions are measured
-// against: the first non-blank continuation line's own indentation (see
-// this file's header — `lines[0]` is the scalar's own first line and never
-// sets it). Content with no non-blank continuation line at all falls back
-// to 0, so any indented continuation would count as more-indented.
-fn foldBaseline(lines: []string): i64 {
-  let i = 1
-  while (i < len(lines)) {
-    if (!isBlankLine(lines[i])) {
-      return lineIndent(lines[i])
-    }
-    i = i + 1
-  }
-  return 0
-}
-
-// The separator folding emits before a content line: a more-indented line
-// gets its break run preserved literally (folding is suspended, not
-// reduced); otherwise one break folds to a space and N breaks fold to N-1
-// newlines.
+// The separator folding emits before a content line: block.bit's own
+// more-indented lines (spec 6.5's `>`-style rule, absent from every style in
+// this file, #5531) get their break run preserved literally via
+// `moreIndented`; flow's own `foldJoin` below never passes `true`. Otherwise
+// one break folds to a space and N breaks fold to N-1 newlines.
 fn foldSeparator(breakCount: i64, moreIndented: bool): string {
   if (moreIndented) {
     return repeat("\n", breakCount)
@@ -198,41 +173,58 @@ fn foldSeparator(breakCount: i64, moreIndented: bool): string {
   return repeat("\n", breakCount - 1)
 }
 
-// A content line's own folded text: a more-indented line keeps everything
-// past the baseline's column (its extra indentation is content), trimmed
-// only on the trailing side; any other line is trimmed on both sides.
-fn foldLineText(line: string, baseline: i64, moreIndented: bool): string {
-  if (moreIndented) {
-    return trimRight(line[baseline:len(line)], " \t")
-  }
-  return trimEdges(line)
-}
-
-// Folds already-split `lines` per this file's header. Shared by plain
-// (`foldContent`, `lines` split on every raw byte in the span) and
-// double-quoted (`decodeDoubleQuoted`, `lines` are already-escape-decoded
-// segments split only at a raw, un-escaped source break) — the two need
-// different splitters, since a double-quoted segment's decoded bytes can
-// legitimately contain a `\n` BYTE from a `\n` escape that is not a line
-// break to fold at all, but once split, both fold the same way.
-fn foldLines(lines: []string): string {
-  let baseline = foldBaseline(lines)
-  let b = newBuilder().write(trimEdges(lines[0]))
+// Joins already-trimmed `lines` — each one's own leading/trailing edge
+// already handled by the caller (`foldLines` below for plain/single-quoted,
+// `decodeDoubleQuotedLines` for double-quoted) — with spec 6.5's flow line
+// folding: a single break becomes one space, a run of N breaks becomes N-1
+// literal newlines, and an empty entry (a blank line, or nothing left past
+// the content's last real break) contributes only its share of the break
+// count, never text of its own. Shared by every style; none of them ever
+// passes `foldSeparator` a `moreIndented` of `true` (that is block.bit's
+// rule alone).
+fn foldJoin(lines: []string): string {
+  let last = len(lines) - 1
+  let b = newBuilder().write(lines[0])
   let breakCount = 1
   let i = 1
   while (i < len(lines)) {
-    if (isBlankLine(lines[i])) {
+    let blank = lines[i] == ""
+    if (blank && i < last) {
       breakCount = breakCount + 1
       i = i + 1
       continue
     }
-    let moreIndented = lineIndent(lines[i]) > baseline
-    b = b.write(foldSeparator(breakCount, moreIndented))
-    b = b.write(foldLineText(lines[i], baseline, moreIndented))
+    b = b.write(foldSeparator(breakCount, false))
+    if (!blank) {
+      b = b.write(lines[i])
+    }
     breakCount = 1
     i = i + 1
   }
   return b.toString()
+}
+
+// Trims already-split `lines` per this file's header — every line's leading
+// AND trailing edge, except the content's own first leading edge and its
+// own last trailing edge — then joins them with `foldJoin`. Plain and
+// single-quoted only: neither has a backslash escape (single-quoted's only
+// one, `''`, is already collapsed before this is called), so trimming can
+// run directly on their text; double-quoted trims before decoding instead
+// (`decodeDoubleQuotedLines`, this file's header explains why).
+fn foldLines(lines: []string): string {
+  let last = len(lines) - 1
+  let trimmed = []string(0)
+  trimmed = append(trimmed, trimRight(lines[0], " \t"))
+  let i = 1
+  while (i < len(lines)) {
+    if (i == last) {
+      trimmed = append(trimmed, trimLeft(lines[i], " \t"))
+    } else {
+      trimmed = append(trimmed, trimEdges(lines[i]))
+    }
+    i = i + 1
+  }
+  return foldJoin(trimmed)
 }
 
 // Folds `content`'s embedded line breaks per this file's header. Callers
@@ -240,10 +232,7 @@ fn foldLines(lines: []string): string {
 // least one break (each style's own fast path) — a single-line `content`
 // still folds correctly (the loop below never runs), but skipping the call
 // entirely is what keeps the no-op case allocation-free. Plain and
-// single-quoted only: neither has an escape that can write a `\n`/`\r\n`
-// byte of its own (single-quoted's only escape, `''`, is already collapsed
-// before this is called), so every break in the span is a real source
-// break, unlike double-quoted (see `foldLines`).
+// single-quoted only (see `foldLines`).
 fn foldContent(content: string): string {
   return foldLines(splitRawLines(content))
 }
@@ -435,60 +424,131 @@ fn decodeOneEscape(src: string, i: i64, end: i64, escStart: i64, b: Builder): i6
   fail scalarError("yaml: unknown escape character", escStart)
 }
 
+// Writes `src[pendingStart:at)` into `b` and returns the cleared (`-1`)
+// pending-start — the raw space/tab run `decodeDoubleQuotedLines` buffered
+// turns out NOT to be trailing whitespace (an ordinary byte or an escape
+// follows it, so it is real content after all), unlike the one place that
+// discards the run instead: right at a real line break.
+fn flushPendingSpan(src: string, b: Builder, pendingStart: i64, at: i64): i64 {
+  if (pendingStart >= 0) {
+    b.write(src[pendingStart:at])
+  }
+  return -1
+}
+
+// `c` is a byte the RAW-source trim in `decodeDoubleQuotedLines` treats as
+// indentation (never a decoded escape's payload, which is written directly
+// and never passes through this check).
+fn isRawWsByte(c: u8): bool {
+  return c == ' ' || c == '\t'
+}
+
+// `src[i]` starts a `\n` or `\r\n` break — shared by `decodeDoubleQuotedLines`'s
+// two uses: a plain (real) break, and the one byte right after a backslash,
+// where the same shape means an escaped continuation instead.
+fn isBreakAt(src: string, i: i64, end: i64): bool {
+  return src[i] == '\n' || isCRLFAt(src, i, end)
+}
+
+// `i` moved past the one real break `isBreakAt(src, i, end)` already
+// confirmed starts there — one byte for a bare `\n`, two for `\r\n`.
+fn advancePastBreak(src: string, i: i64, end: i64): i64 {
+  if (src[i] == '\n') {
+    return i + 1
+  }
+  return i + 2
+}
+
+// One un-escaped space/tab byte at `i`: skipped outright (never buffered)
+// while still at a line's own leading edge, buffered as an open pending
+// span (its raw start offset) otherwise — an already-open span keeps its
+// original start.
+fn bufferWsByte(i: i64, atLineStart: bool, pendingStart: i64): i64 {
+  if (atLineStart) {
+    return pendingStart
+  }
+  if (pendingStart < 0) {
+    return i
+  }
+  return pendingStart
+}
+
 // `src[start:end)` (the double-quoted span's inside, no quotes) split into
-// escape-decoded segments, one per RAW (un-escaped) source line — never one
-// string with the breaks left in it. A decoded `\n` escape is a literal LF
-// BYTE indistinguishable from a real line break once it is sitting in a
-// string, so segmenting has to happen here, against the source bytes,
-// before that ambiguity exists; an escaped break (`\` immediately before
-// `\n`/`\r\n`) never reaches the two break checks below at all —
-// `decodeOneEscape` already consumed it and wrote nothing, so it starts no
-// new segment. `firstSpecial` is where `indexOfEscapeOrBreak` found the
-// first byte needing handling.
-fn decodeDoubleQuotedSegments(src: string, start: i64, end: i64, firstSpecial: i64): []string! {
-  let segs = []string(0)
-  let b = newBuilder().write(src[start:firstSpecial])
-  let i = firstSpecial
+// already fold-trimmed, escape-decoded strings, one per RAW (un-escaped)
+// source line. Trimming runs against the RAW bytes, before any escape
+// decodes — this file's header explains why a post-decode trim cannot tell
+// a decoded whitespace escape apart from real indentation.
+//
+// A run of un-escaped space/tab bytes is buffered (`pendingStart`, the raw
+// offset it began at, or `-1` when none is open) rather than written
+// immediately: an ordinary byte or an escape that follows it means the run
+// was genuine content and gets flushed (`flushPendingSpan`), while a REAL
+// break means it was trailing indentation and gets discarded instead —
+// the one place trimming actually removes anything, since leading
+// indentation (`atLineStart`) is simply never buffered at all. `atLineStart`
+// starts `false`, so the content's own first byte is never leading-trimmed,
+// and is set back to `true` after every real break AND every escaped
+// continuation (spec 5.7's line-continuation escape resumes on a new line
+// too — 565N's continuation lines need their own leading space trimmed
+// exactly like any other line's). An escaped continuation itself never
+// trims around itself — NP9H's tab survives immediately before its own
+// `\<break>` — only a REAL break discards what came before it. End of
+// content flushes whatever is still pending, preserving the content's own
+// last byte on its trailing side.
+fn decodeDoubleQuotedLines(src: string, start: i64, end: i64): []string! {
+  let lines = []string(0)
+  let b = newBuilder()
+  let pendingStart = i64(-1)
+  let atLineStart = false
+  let i = start
   while (i < end) {
     let c = src[i]
+    if (isRawWsByte(c)) {
+      pendingStart = bufferWsByte(i, atLineStart, pendingStart)
+      i = i + 1
+      continue
+    }
+    if (isBreakAt(src, i, end)) {
+      pendingStart = -1
+      lines = append(lines, b.toString())
+      b = newBuilder()
+      atLineStart = true
+      i = advancePastBreak(src, i, end)
+      continue
+    }
     if (c == '\\') {
       if (i + 1 >= end) {
         fail scalarError("yaml: unterminated escape", i)
       }
+      let continuesLine = isBreakAt(src, i + 1, end)
+      pendingStart = flushPendingSpan(src, b, pendingStart, i)
       i = decodeOneEscape(src, i + 1, end, i, b)?
+      atLineStart = continuesLine
       continue
     }
-    if (c == '\n' || isCRLFAt(src, i, end)) {
-      segs = append(segs, b.toString())
-      b = newBuilder()
-      if (c == '\n') {
-        i = i + 1
-      } else {
-        i = i + 2
-      }
-      continue
-    }
+    pendingStart = flushPendingSpan(src, b, pendingStart, i)
+    atLineStart = false
     b.writeByte(c)
     i = i + 1
   }
-  segs = append(segs, b.toString())
-  return segs
+  pendingStart = flushPendingSpan(src, b, pendingStart, end)
+  lines = append(lines, b.toString())
+  return lines
 }
 
 // `"..."`: strips the surrounding quotes, decodes every escape, and folds
-// any real (un-escaped) line break across the resulting segments.
+// any real (un-escaped) line break across the resulting lines.
 fn decodeDoubleQuoted(src: string, start: i64, end: i64): string! {
   let inner0 = start + 1
   let inner1 = end - 1
-  let firstSpecial = indexOfEscapeOrBreak(src, inner0, inner1)
-  if (firstSpecial < 0) {
+  if (indexOfEscapeOrBreak(src, inner0, inner1) < 0) {
     return src[inner0:inner1]
   }
-  let segs = decodeDoubleQuotedSegments(src, inner0, inner1, firstSpecial)?
-  if (len(segs) == 1) {
-    return segs[0]
+  let lines = decodeDoubleQuotedLines(src, inner0, inner1)?
+  if (len(lines) == 1) {
+    return lines[0]
   }
-  return foldLines(segs)
+  return foldJoin(lines)
 }
 
 // --- plain -----------------------------------------------------------
