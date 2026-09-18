@@ -212,14 +212,40 @@ fn checkNotMergeKey(key: Yaml, offset: i64): ()! {
 // and otherwise ignored — the epic forbids type-tag-driven construction, so
 // this file has no notion of tag-driven typing to wire up. Bounded to two
 // iterations: YAML permits at most one anchor and one tag per node.
-fn consumeNodeProperties(p: Parser): Option<string> {
+//
+// `indent` is the column this node's properties must clear once a SECOND
+// property (the tag after an anchor, or vice versa) starts a fresh line —
+// the first property is always accepted at whatever column the caller
+// already placed the cursor at. Whether "clear" means STRICTLY past
+// `indent` or AT LEAST `indent` depends on `descended`: `parseBlockNode`'s
+// callers that just consumed an `Indent` token to get here (`descended`
+// true) already validated `indent` itself as one genuine level deeper than
+// the true parent — `top4: \n  &node4\n  &k4 key4: four` (U3XV) has both
+// properties AT that same already-validated column, which is fine. A
+// caller that has NOT just descended (`descended` false, `indent` is still
+// the untouched parent's own column, e.g. a same-line `key: &x`) requires
+// the second property to be STRICTLY deeper — `key: &x\n!!map\n  a: b`
+// (H7J7): `!!map` sits at the SAME column as `key:` itself, so it can
+// never be `&x`'s tag.
+fn consumeNodeProperties(p: Parser, indent: i64, descended: bool): Option<string>! {
   let anchorName = Option<string>.None
   let i = 0
+  let prevEnd = p.s.start
   while (i < 2) {
-    if (p.s.kind == TokenKind.Anchor) {
-      anchorName = Option<string>.Some(p.src[p.s.start + 1:p.s.end])
-      advance(p)
-    } else if (p.s.kind == TokenKind.Tag) {
+    if (p.s.kind == TokenKind.Anchor || p.s.kind == TokenKind.Tag) {
+      if (i > 0 && hasLineBreak(p.src, prevEnd, p.s.start)) {
+        let tooShallow = p.s.col <= indent
+        if (descended) {
+          tooShallow = p.s.col < indent
+        }
+        if (tooShallow) {
+          fail parseError("yaml: node property is not indented past its parent", p.s.start)
+        }
+      }
+      if (p.s.kind == TokenKind.Anchor) {
+        anchorName = Option<string>.Some(p.src[p.s.start + 1:p.s.end])
+      }
+      prevEnd = p.s.end
       advance(p)
     } else {
       return anchorName
@@ -231,22 +257,63 @@ fn consumeNodeProperties(p: Parser): Option<string> {
 
 // --- one node, of any kind ------------------------------------------------
 
-// Parses one block node at or past `indent`. `colHint < 0` means "derive
-// this node's own column from `Scanner.col`" (the normal case — the node
-// starts at a just-measured line start); a non-negative `colHint` overrides
-// it, used only by `parseSeqItemValue` for a compact `- key: value` whose
-// key did not start a fresh line of its own.
-fn parseBlockNode(p: Parser, indent: i64, colHint: i64): Yaml! {
-  let anchorName = consumeNodeProperties(p)
-  let value = dispatchBlockNode(p, indent, colHint)?
-  match (anchorName) {
-    Some(name) => {
+// Defines `name` (when present) against `value` and returns `value`
+// unchanged — the tail every `parseBlockNode` exit path shares, whether the
+// node's own properties were consumed right here or one recursive level
+// down (`parseBlockNode`'s own `Indent` branch).
+fn applyAnchor(p: Parser, name: Option<string>, value: Yaml): Yaml! {
+  match (name) {
+    Some(n) => {
       chargeBlockNode(p, p.s.start)?
-      yamlAnchorDefine(p.anchors, name, value)?
+      yamlAnchorDefine(p.anchors, n, value)?
     }
     None => {}
   }
   return value
+}
+
+// Parses one block node at or past `indent`. `colHint < 0` means "derive
+// this node's own column from `Scanner.col`" (the normal case — the node
+// starts at a just-measured line start); a non-negative `colHint` overrides
+// it, used only by `parseSeqItemValue` for a compact `- key: value` whose
+// key did not start a fresh line of its own. `descended` is
+// `consumeNodeProperties`'s own parameter, threaded through unchanged —
+// true exactly when this call was reached by consuming an `Indent` token
+// (this file's own header, "value starts one line down").
+//
+// A node's real content sometimes sits on a DEEPER line than this call's
+// own properties did — either the document/flow root itself is indented
+// (`parseDocumentContent` always starts the search at indent 0), or this
+// node's anchor/tag were alone on their own line and the value starts one
+// line further down (`lineStartStep`, scan.bit, already measured
+// `Scanner.col` for the `Indent` token itself). That deeper line may carry
+// its OWN anchor/tag pair — `top1: &node1\n  &k1 key1: one` (U3XV) — so
+// this reads its properties directly (`consumeNodeProperties` again,
+// `descended: true`) rather than falling through to `dispatchBlockNode`
+// blind to them; recursion is bounded by `Scanner.indentStack`'s own
+// `maxDepth` ceiling (`pushIndent`).
+//
+// Two anchors can still target the exact same node even so — `top2:
+// &node2\n  &v2 val2` (4JVG) has no mapping key between `&node2` and
+// `&v2` to split them into distinct nodes the way `&node1`/`&k1` are, so
+// both would end up bound to the identical scalar `"val2"`; rejected
+// outright rather than silently keeping only the last one.
+fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool): Yaml! {
+  let anchorName = consumeNodeProperties(p, indent, descended)?
+  skipComments(p)
+  if (p.s.kind == TokenKind.Indent) {
+    advance(p)
+    let childCol = p.s.col
+    let innerAnchor = consumeNodeProperties(p, childCol, true)?
+    let value = dispatchBlockNode(p, indent, childCol)?
+    if (isSome(anchorName) && isSome(innerAnchor) && !yamlIsMapping(value)) {
+      fail parseError("yaml: a node cannot carry two distinct anchors", p.s.start)
+    }
+    let withInner = applyAnchor(p, innerAnchor, value)?
+    return applyAnchor(p, anchorName, withInner)?
+  }
+  let value = dispatchBlockNode(p, indent, colHint)?
+  return applyAnchor(p, anchorName, value)?
 }
 
 fn dispatchBlockNode(p: Parser, indent: i64, colHint: i64): Yaml! {
@@ -357,7 +424,7 @@ fn parseAfterIndicator(p: Parser, indent: i64, afterOffset: i64): Yaml! {
   if (p.s.kind == TokenKind.Indent) {
     advance(p)
     let childCol = p.s.col
-    return parseBlockNode(p, childCol, -1)?
+    return parseBlockNode(p, childCol, -1, true)?
   }
   if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
     return Yaml.YamlNull
@@ -366,7 +433,7 @@ fn parseAfterIndicator(p: Parser, indent: i64, afterOffset: i64): Yaml! {
   if (!sameLine && p.s.kind != TokenKind.SeqEntry) {
     return Yaml.YamlNull
   }
-  return parseBlockNode(p, indent, -1)?
+  return parseBlockNode(p, indent, -1, false)?
 }
 
 // --- block mapping ---------------------------------------------------------
@@ -479,7 +546,7 @@ fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dash
   if (p.s.kind == TokenKind.Indent) {
     advance(p)
     let childCol = p.s.col
-    return parseBlockNode(p, childCol, -1)?
+    return parseBlockNode(p, childCol, -1, true)?
   }
   if (isDocBoundary(p.s.kind) || p.s.kind == TokenKind.Dedent) {
     return Yaml.YamlNull
@@ -488,7 +555,7 @@ fn parseSeqItemValue(p: Parser, itemCol: i64, dashStart: i64, dashEnd: i64, dash
     return Yaml.YamlNull
   }
   let inlineCol = dashCol + (p.s.start - dashStart)
-  return parseBlockNode(p, itemCol, inlineCol)?
+  return parseBlockNode(p, itemCol, inlineCol, false)?
 }
 
 // One block sequence, all `-` markers at exactly `col`.
@@ -523,7 +590,11 @@ fn parseBlockSequence(p: Parser, col: i64): Yaml! {
 // One document's content, already known not to be an empty boundary —
 // `parseStream` charges the anchor table reset and the boundary check.
 fn parseDocumentContent(p: Parser): Yaml! {
-  let doc = parseBlockNode(p, 0, -1)?
+  // `descended: true` — the document root has no enclosing key/dash column
+  // a chained property line would need to clear; column 0 is already the
+  // floor a second property line may legally repeat (9KAX: `&a1\n!!str\n
+  // scalar1`, both properties AT column 0).
+  let doc = parseBlockNode(p, 0, -1, true)?
   skipStreamNoise(p)
   if (!isDocBoundary(p.s.kind)) {
     fail parseError("yaml: unexpected content after document (missing '---'?)", p.s.start)
