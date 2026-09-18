@@ -152,6 +152,14 @@ fn isScalarStart(k: TokenKind): bool {
   return k == TokenKind.PlainScalar || k == TokenKind.SingleQuoted || k == TokenKind.DoubleQuoted
 }
 
+// A mapping key wrapped in its own `&anchor`/`!tag` prefix, or an alias
+// used directly as a key (26DV/E76Z/HMQ5/ZWK4), starts with one of these
+// instead of a bare scalar — `parseBlockMapping`'s own sibling-continuation
+// check needs to recognize it too, not just `isScalarStart`/`KeyIndicator`.
+fn isKeyProperty(k: TokenKind): bool {
+  return k == TokenKind.Anchor || k == TokenKind.Tag || k == TokenKind.Alias
+}
+
 // True when `src[pos - 1]` is whitespace, a line break, or `pos` is the
 // source's own first byte — the only positions a `#` comment may legally
 // start from without an explicit separator (spec 6.9's `s-b-comment`: a
@@ -340,32 +348,67 @@ class NodeCtx { atMarker: bool, foldFloor: i64 }
 // would end up bound to the identical scalar `"val2"`; rejected outright
 // (only once the dispatched value's own kind is known) rather than
 // silently keeping only the last one.
+// `descended` (crossed a real `Indent` to reach this node's own body) and
+// NOT-descended (still on the property's own line) apply an anchor at
+// DIFFERENT times, not just different places. Descended: the anchor
+// decorates whatever the deeper content resolves to AS A WHOLE (U3XV,
+// 4JVG, 26DV's `top3: &node3\n  *alias1 : scalar3` — `&node3` targets the
+// MAPPING `*alias1` becomes the first key of, applied only once dispatch
+// returns it, via `applyAnchorChain`). Same-line: the anchor decorates the
+// scalar/alias PRIMARY ITSELF (E76Z's `&a a: &b b` — `*a`, read later,
+// must already resolve to the scalar `"a"`, not to the enclosing mapping
+// `{"a":"b"}` — HMQ5 the same, tag+anchor before a quoted key) — deferring
+// it the way the descended branch does would bind it to the wrong thing
+// once that scalar's own trailing `:` promotes it to a key, since
+// `parseBlockMapping` resolves later aliases INSIDE that same call, before
+// `parseBlockNode` ever gets control back. `DispatchCtx.pendingAnchor`
+// threads it down so `parseScalarOrMapping` can apply it immediately,
+// before the key-or-value decision.
 fn parseBlockNode(p: Parser, indent: i64, colHint: i64, descended: bool, ctx: NodeCtx): Yaml! {
   let chain = consumePropertyChain(p, indent, descended)?
+  let hadAnchor = len(chain.names) > 0
   if (chain.descended) {
-    let value = dispatchBlockNode(p, indent, chain.col, false, ctx.foldFloor)?
+    let dctx = DispatchCtx{
+      rejectImplicitKey: false,
+      pendingAnchor: Option<string>.None,
+      hadAnchor: hadAnchor,
+    }
+    let value = dispatchBlockNode(p, indent, chain.col, dctx, ctx.foldFloor)?
     if (len(chain.names) > 1 && !yamlIsMapping(value)) {
       fail parseError("yaml: a node cannot carry two distinct anchors", p.s.start)
     }
     return applyAnchorChain(p, chain.names, value)?
   }
-  let onlyAnchor = len(chain.names) > 0 ? Option<string>.Some(chain.names[0]) : Option<string>.None
+  let onlyAnchor = hadAnchor ? Option<string>.Some(chain.names[0]) : Option<string>.None
   rejectAnchorMisplaced(p, Option<string>.None, onlyAnchor, chain.lastEnd)?
-  let value = dispatchBlockNode(
-    p,
-    indent,
-    colHint,
-    ctx.atMarker && isSome(onlyAnchor),
-    ctx.foldFloor,
-  )?
-  return applyAnchorChain(p, chain.names, value)?
+  let dctx = DispatchCtx{
+    rejectImplicitKey: ctx.atMarker && hadAnchor,
+    pendingAnchor: onlyAnchor,
+    hadAnchor: hadAnchor,
+  }
+  return dispatchBlockNode(p, indent, colHint, dctx, ctx.foldFloor)?
 }
+
+// Bundles `dispatchBlockNode`'s three least-central flags (spec/LINT.md's
+// max-params, same reason `NodeCtx` exists). `pendingAnchor` is only ever
+// non-`None` from `parseBlockNode`'s SAME-LINE branch (that function's own
+// header) — every case here applies it to its OWN result (`applyAnchor`,
+// a no-op passthrough when `None`, which is always what the DESCENDED
+// branch passes: C4HZ's `center: &ORIGIN {x: 73, y: 129}` needs the
+// SAME-line anchor on an inline flow mapping applied here, same as
+// `parseScalarOrMapping` already does for a scalar/key). `hadAnchor` is
+// broader — true whenever ANY anchor is pending anywhere in the chain,
+// same-line or not — `parseAlias` reads only this one: an alias reached
+// with one pending, and no `:` promoting it to a mapping key, is invalid
+// regardless of which level the anchor came from (an alias node has no
+// properties production at all, §7.5).
+class DispatchCtx { rejectImplicitKey: bool, pendingAnchor: Option<string>, hadAnchor: bool }
 
 fn dispatchBlockNode(
   p: Parser,
   indent: i64,
   colHint: i64,
-  rejectImplicitKey: bool,
+  ctx: DispatchCtx,
   foldFloor: i64,
 ): Yaml! {
   let col = colHint
@@ -374,28 +417,50 @@ fn dispatchBlockNode(
   }
   switch (p.s.kind) {
     case TokenKind.Alias:
-      return parseAlias(p)?
+      return parseAlias(p, col, ctx.hadAnchor)?
     case TokenKind.SeqEntry:
-      return parseBlockSequence(p, col)?
+      return applyAnchor(p, ctx.pendingAnchor, parseBlockSequence(p, col)?)?
     case TokenKind.KeyIndicator:
-      return parseBlockMapping(p, col, Option<Yaml>.None, 0)?
+      return applyAnchor(p, ctx.pendingAnchor, parseBlockMapping(p, col, Option<Yaml>.None, 0)?)?
     case TokenKind.FlowSeqStart, TokenKind.FlowMapStart:
-      return parseBlockFlow(p)?
+      return applyAnchor(p, ctx.pendingAnchor, parseBlockFlow(p)?)?
     case TokenKind.BlockScalarHeader:
-      return parseBlockScalarValue(p, indent)?
+      return applyAnchor(p, ctx.pendingAnchor, parseBlockScalarValue(p, indent)?)?
     case TokenKind.PlainScalar, TokenKind.SingleQuoted, TokenKind.DoubleQuoted:
-      return parseScalarOrMapping(p, col, rejectImplicitKey, foldFloor)?
+      return parseScalarOrMapping(p, col, ctx.rejectImplicitKey, foldFloor, ctx.pendingAnchor)?
     default:
       fail parseError("yaml: unexpected token in block context", p.s.start)
   }
 }
 
-fn parseAlias(p: Parser): Yaml! {
-  let name = p.src[p.s.start + 1:p.s.end]
-  let offset = p.s.start
-  advance(p)
-  let value = yamlAnchorResolve(p.anchors, name, p.limits)?
-  chargeBlockNode(p, offset)?
+// An alias that might turn out to be a mapping's first key (`*b : *a` —
+// E76Z; `ValueIndicator` on the SAME line, `hasLineBreak`) — the identical
+// check `parseScalarOrMapping` (plainfold.bit) already runs for a bare
+// plain/quoted scalar, an alias never got until now. `resolveAliasToken`
+// (properties.bit) does the raw name lookup, shared with `readKeyPrimary`'s
+// own alias-as-key case, which needs the SAME lookup without this peek
+// (its caller runs its own `:` check instead).
+//
+// An alias never accepts a pending anchor OF ITS OWN (§7.5: an alias node
+// has no properties production) — `hadAnchor && !isKey` rejects a BARE
+// aliased value with one pending, same-line (SR86: `key2: &b *a`) or
+// cross-level (a hypothetical `&x\n  *y` with nothing else). `isKey` true
+// exempts it: `hadAnchor` can ALSO be true there from an outer, different
+// level's anchor (26DV's `top3: &node3\n  *alias1 : scalar3` — `&node3`
+// targets the MAPPING `*alias1` opens as its first key, applied by
+// `parseBlockNode`'s DESCENDED branch after this call returns, never by
+// this function itself).
+fn parseAlias(p: Parser, col: i64, hadAnchor: bool): Yaml! {
+  let (value, start, end) = resolveAliasToken(p)?
+  let isKey = p.s.kind == TokenKind.ValueIndicator && !hasLineBreak(p.src, end, p.s.start)
+  if (hadAnchor && !isKey) {
+    fail parseError("yaml: an alias node cannot carry an anchor property", start)
+  }
+  if (isKey) {
+    checkNotMergeKey(value, start)?
+    return parseBlockMapping(p, col, Option<Yaml>.Some(value), start)?
+  }
+  chargeBlockNode(p, start)?
   return value
 }
 
@@ -516,99 +581,12 @@ fn parseAfterIndicator(p: Parser, indent: i64, afterOffset: i64, allowInlineSeq:
 }
 
 // --- block mapping ---------------------------------------------------------
-
-class MapEntryOut { key: Yaml, keyStart: i64, value: Yaml }
-
-fn readMappingEntry(p: Parser, col: i64, pending: Option<Yaml>, pendingStart: i64): MapEntryOut! {
-  if (isSome(pending)) {
-    let afterColon = p.s.end
-    advance(p)
-    let value = parseAfterIndicator(p, col, afterColon, false)?
-    return MapEntryOut{ key: unwrap(pending), keyStart: pendingStart, value: value }
-  }
-  if (p.s.kind == TokenKind.KeyIndicator) {
-    return readExplicitEntry(p, col)?
-  }
-  return readImplicitEntry(p, col)?
-}
-
-// `? key` with an optional `: value` — the value indicator, if present,
-// must sit back at this mapping's own column (a nested key that itself
-// contains a colon-bearing scalar must not be mistaken for one).
-fn readExplicitEntry(p: Parser, col: i64): MapEntryOut! {
-  let keyStart = p.s.start
-  let afterQ = p.s.end
-  advance(p)
-  let key = parseAfterIndicator(p, col, afterQ, true)?
-  checkNotMergeKey(key, keyStart)?
-  skipComments(p)?
-  while (p.s.kind == TokenKind.Dedent) {
-    advance(p)
-  }
-  if (p.s.col == col && p.s.kind == TokenKind.ValueIndicator) {
-    let afterColon = p.s.end
-    advance(p)
-    let value = parseAfterIndicator(p, col, afterColon, true)?
-    return MapEntryOut{ key: key, keyStart: keyStart, value: value }
-  }
-  return MapEntryOut{ key: key, keyStart: keyStart, value: Yaml.YamlNull }
-}
-
-fn readImplicitEntry(p: Parser, col: i64): MapEntryOut! {
-  let keyStart = p.s.start
-  let kind = p.s.kind
-  let text = yamlDecodeScalar(p.src, kind, p.s.start, p.s.end)?
-  advance(p)
-  if (p.s.kind != TokenKind.ValueIndicator) {
-    fail parseError("yaml: expected ':' after mapping key", p.s.start)
-  }
-  let key = resolveByKind(text, kind, p.resolver)
-  checkNotMergeKey(key, keyStart)?
-  let afterColon = p.s.end
-  advance(p)
-  let value = parseAfterIndicator(p, col, afterColon, false)?
-  return MapEntryOut{ key: key, keyStart: keyStart, value: value }
-}
-
-fn finishMapping(p: Parser, entries: []YamlEntry): Yaml! {
-  chargeBlockNode(p, p.s.start)?
-  return Yaml.YamlMapping(entries)
-}
-
-// One block mapping, all entries at exactly `col`. `firstKey`, when present,
-// is a scalar key `dispatchBlockNode` already consumed while checking for a
-// `:` — `readMappingEntry` folds it into the very first loop iteration so
-// every entry after it goes through the identical path.
-fn parseBlockMapping(p: Parser, col: i64, firstKey: Option<Yaml>, firstKeyStart: i64): Yaml! {
-  let entries = []YamlEntry(0)
-  let pending = firstKey
-  let pendingStart = firstKeyStart
-  let guard = 0
-  let bound = p.s.srcLen + 8
-  while (guard <= bound) {
-    guard = guard + 1
-    let out = readMappingEntry(p, col, pending, pendingStart)?
-    pending = Option<Yaml>.None
-    if (flowKeyPresent(entries, out.key)) {
-      fail parseError("yaml: duplicate key in block mapping", out.keyStart)
-    }
-    entries = append(entries, YamlEntry{ key: out.key, value: out.value })
-    skipComments(p)?
-    if (p.s.col != col) {
-      return finishMapping(p, entries)?
-    }
-    if (p.s.kind != TokenKind.Eof && !startsOnFreshLine(p.src, p.s.start)) {
-      fail parseError("yaml: unexpected content after mapping entry", p.s.start)
-    }
-    while (p.s.kind == TokenKind.Dedent || compactContinuation(p, col)) {
-      advance(p)
-    }
-    if (p.s.kind != TokenKind.KeyIndicator && !isScalarStart(p.s.kind)) {
-      return finishMapping(p, entries)?
-    }
-  }
-  fail parseError("yaml: block mapping scan did not terminate", p.s.start)
-}
+//
+// `MapEntryOut`/`readMappingEntry`/`readExplicitEntry`/`readImplicitEntry`/
+// `finishMapping`/`mappingEntryContinues`/`parseBlockMapping` live in
+// blockmapping.bit, split out at #5549 for the same 800-line reason
+// plainfold.bit and properties.bit were (same flat module, pkg/README.md;
+// reached unqualified below with no import).
 
 // --- block sequence ---------------------------------------------------------
 
