@@ -1,0 +1,167 @@
+// pkg/yaml/flowentry.bit — yaml module, one flow entry's key/value shapes:
+// a glued `:value` with no separating space, an omitted (implicit or
+// explicit) key, and the glued-`:`-terminated key spelling
+// (`parseFlowKeyScalar`). Split out of `flow.bit` purely to stay under
+// spec/LINT.md's 800-line ceiling (#5546, #5557 having already taken that
+// file to the limit) — the same reason `flowanchor.bit` was split out at
+// #5555. Every function here is called only from `flow.bit`'s
+// `parseFlowSeqEntry`/`parseFlowMapEntry`, against the `FlowCtx` that file
+// defines (module-private, same flat namespace, pkg/README.md, reached
+// unqualified, no import).
+
+// The value half of a `key: value` entry, where the value may be omitted —
+// `{a: }` is `{a: null}` exactly like `{a}` (ticket): a terminator token
+// right after the `:` means "no value", not "parse whatever comes next".
+fn parseFlowValueOrNull(ctx: FlowCtx, depth: i64): Yaml! {
+  let k = ctx.s.kind
+  if (k == TokenKind.FlowEntry || k == TokenKind.FlowSeqEnd || k == TokenKind.FlowMapEnd) {
+    chargeNode(ctx, ctx.s.start)?
+    return Yaml.YamlNull
+  }
+  return parseFlowNode(ctx, depth)?
+}
+
+// A key's value glued directly onto its `:` with no separating space —
+// legal straight after a JSON-like key (a quoted scalar or a flow
+// collection; YAML 1.2.2's JSON-compatible flow-mapping production needs no
+// `s-separate` around that `:`). `isColonBoundary` (scan.bit) only turns
+// `:` into its own `ValueIndicator` token when it IS followed by blank, so
+// a glued `:value` instead scans as one `PlainScalar` token starting with
+// `:` (`scanPlainScalar`'s own boundary check fires on THAT colon needing a
+// following blank too, so it is folded into the very token it starts) —
+// detected here, not in scan.bit, because interpreting what a leading `:`
+// inside a raw span means is this file's grammar layer, not the scanner's
+// (`flow.bit`'s own header: the scanner only says where a span ends).
+fn isGluedValueToken(ctx: FlowCtx): bool {
+  return ctx.s.kind == TokenKind.PlainScalar &&
+    ctx.s.end > ctx.s.start &&
+    ctx.s.src[ctx.s.start] == ':'
+}
+
+// `scanPlainScalar` stops exactly AT the boundary that ends a token (a
+// comma, a closer, a comment) without trimming back over any blank bytes
+// that sat before it — this construct is the only place in this file that
+// slices a token's span by hand (everywhere else hands the token's own
+// `start`/`end` straight to `yamlDecodeScalar`), so it is the one place
+// that dangling trailing blank needs stripping before decoding.
+fn trimTrailingFlowBlank(ctx: FlowCtx, floor: int, end: int): int {
+  let e = end
+  while (e > floor && (ctx.s.src[e - 1] == ' ' || ctx.s.src[e - 1] == '\t')) {
+    e = e - 1
+  }
+  return e
+}
+
+// Decodes a glued `:value` token's value half — everything past the one
+// leading `:` the scanner folded in — exactly like `parseFlowScalar` decodes
+// an ordinary `PlainScalar`, just shifted one byte past the indicator and
+// trimmed of any trailing blank `trimTrailingFlowBlank` left dangling.
+fn parseGluedFlowValue(ctx: FlowCtx): Yaml! {
+  let start = ctx.s.start
+  let end = trimTrailingFlowBlank(ctx, start + 1, ctx.s.end)
+  let text = yamlDecodeScalar(ctx.s.src, TokenKind.PlainScalar, start + 1, end)?
+  advanceFlow(ctx)
+  chargeNode(ctx, start)?
+  return ctx.resolver(text, ScalarStyle.Plain)
+}
+
+// Whether a value follows the key/entry just parsed — a real `ValueIndicator`
+// token, or a glued `:value` `PlainScalar` (`isGluedValueToken`'s own
+// comment) — shared by both `parseFlowSeqEntry` and `parseFlowMapEntry` so
+// neither special-cases the glued spelling on its own.
+fn flowHasValueIndicator(ctx: FlowCtx): bool {
+  return ctx.s.kind == TokenKind.ValueIndicator || isGluedValueToken(ctx)
+}
+
+// Consumes whichever shape `flowHasValueIndicator` found true and returns
+// the value — callers must not call this unless that check already passed.
+fn consumeFlowValue(ctx: FlowCtx, depth: i64): Yaml! {
+  if (ctx.s.kind == TokenKind.ValueIndicator) {
+    advanceFlow(ctx)
+    return parseFlowValueOrNull(ctx, depth)?
+  }
+  return parseGluedFlowValue(ctx)?
+}
+
+// --- implicit/omitted keys ---------------------------------------------
+
+// The entry's own KEY position starts with a real `ValueIndicator` — a `:`
+// the scanner already confirmed is followed by blank (`isColonBoundary`,
+// scan.bit) — meaning the key itself is empty (`e-node`, YAML 1.2.2's own
+// name for an omitted node): `[: x]`/`{: x}`'s leading `:` and `{a, : x}`'s
+// second entry are this shape. Deliberately NOT `isGluedValueToken` too: a
+// PlainScalar that merely starts with `:` and is glued straight to
+// non-blank content (`::vector`, `HM87/00`'s `[:x]`) is ordinary scalar
+// content, not an omitted key — `isGluedValueToken` only means "omitted
+// key" once a key has already been read and this token sits in VALUE
+// position (`flowHasValueIndicator`'s own use of it); at entry START, where
+// no key has been read yet, it cannot tell the two shapes apart, so this
+// function does not use it. Shared by both `parseFlowSeqEntry` and
+// `parseFlowMapEntry` so neither special-cases the omitted-key spelling on
+// its own.
+fn startsImplicitFlowKey(ctx: FlowCtx): bool {
+  return ctx.s.kind == TokenKind.ValueIndicator
+}
+
+// The token right after a bare `?` is already this entry's own terminator
+// (a `,` or `closeKind`, the collection's own closer) — the explicit key
+// itself is empty, with no node to parse at all, exactly as
+// `parseFlowValueOrNull`'s own bare-terminator check means an omitted
+// VALUE. `{ ? \n }`'s trailing `?` is this shape.
+fn flowExplicitKeyOmitted(ctx: FlowCtx, closeKind: TokenKind): bool {
+  return ctx.s.kind == TokenKind.FlowEntry || ctx.s.kind == closeKind
+}
+
+// The result of `parseFlowKeyScalar`: the key itself, plus whether its own
+// trailing glued `:` already supplied (and consumed) an implicit null
+// value, so the caller must not look for a second value indicator.
+class FlowKeyOut { key: Yaml, valueOmitted: bool }
+
+// The node in KEY position of one entry: identical to `parseFlowNode`
+// except a bare PLAIN scalar ending in a `:` glued directly to the flow
+// terminator that follows it (`omitted value:,`, `? foo :,` — no
+// separating blank, the mirror image of `isGluedValueToken`'s LEADING
+// glued `:`) is split here instead of folded whole into the key's own
+// text: `scanPlainScalar` (scan.bit) only stops AT a `:` that is itself
+// followed by blank, so a `:` glued to what comes after it never breaks
+// the span, and keeps consuming until the next real stopper — a `PlainScalar`
+// token ending in `:` can therefore only arise this way (`flow.bit`'s own
+// PLAIN SCALAR TERMINATION header). A tag/anchor-prefixed key or a
+// non-plain key (quoted, a flow collection) is untouched: those go through
+// `parseFlowNode` exactly as before.
+fn parseFlowKeyScalar(ctx: FlowCtx, depth: i64): FlowKeyOut! {
+  if (ctx.s.kind != TokenKind.PlainScalar) {
+    return FlowKeyOut{ key: parseFlowNode(ctx, depth)?, valueOmitted: false }
+  }
+  let start = ctx.s.start
+  let end = scanFlowPlainSpan(ctx)?
+  if (end > start && ctx.s.src[end - 1] == ':') {
+    let trimmed = trimTrailingFlowBlank(ctx, start, end - 1)
+    return FlowKeyOut{
+      key: finishFlowScalar(ctx, TokenKind.PlainScalar, start, trimmed)?,
+      valueOmitted: true,
+    }
+  }
+  return FlowKeyOut{
+    key: finishFlowScalar(ctx, TokenKind.PlainScalar, start, end)?,
+    valueOmitted: false,
+  }
+}
+
+// A JSON-like key (a quoted scalar or a flow collection — the two node
+// kinds YAML 1.2.2's `ns-flow-pair-json-key-entry` names) directly, with
+// ZERO gap, abutted by a glued `:value` (`isGluedValueToken`): legal in a
+// flow SEQUENCE's own compact-pair position exactly when nothing at all —
+// not even a line break — separates the key from its `:`.
+// `ctx.s.src[ctx.s.start - 1]` is the one byte right before the glued
+// colon token, so it names the key's own closing byte when truly adjacent,
+// a blank or line break otherwise: `{JSON: like}:adjacent` (9MMW) is
+// legal, `"key"\n  :value` (ZXT5, `flow.bit`'s own canary) stays rejected —
+// a blank byte never matches any of the four closers below.
+fn isJsonKeyGluedValue(ctx: FlowCtx): bool {
+  if (!isGluedValueToken(ctx) || ctx.s.start == 0) {
+    return false
+  }
+  let before = ctx.s.src[ctx.s.start - 1]
+  return before == '"' || before == '\'' || before == ']' || before == '}'
+}
