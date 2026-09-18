@@ -1,0 +1,389 @@
+// `./make test-package-tags` (#5597).
+//
+// THE INCIDENT THIS CLOSES. Bit 0.20.0 shipped #5569 (compiler/project.bit:
+// a `.test.bit` file is excluded when a module loads as a DEPENDENCY).
+// `pkg/web/res.bit` used `JsonEntry`, imported only by a sibling test file;
+// `pkg/yaml/scalar.bit`/`encode.bit` used `repeat`/`contains`/`trim` the same
+// way. #5569 fixed the SOURCES in `pkg/`, so every in-tree gate (`test-packages`,
+// `test-package-docs`, `test-package-release-drift`) stayed green — all three
+// build against the WORKING TREE, with the fix already in it. Nothing built
+// against the already-PUBLISHED tags `web/v0.5.0`/`yaml/v0.1.0`, so
+// `bit add bitlang.org/pkg/web` kept resolving those broken tags and failing
+// with `error[E0040]: undefined name 'JsonEntry'` until the website's own
+// deploy hook caught it by accident. This gate is that missing check: resolve
+// each package's newest published tag the way a user's `bit add` does, and
+// compile a program against it with the compiler under test.
+//
+// WHICH TAGS: NEWEST PER PACKAGE, NOT EVERY TAG EVER PUBLISHED. A bare
+// `bit add bitlang.org/pkg/<name>` with no version constraint resolves the
+// HIGHEST available tag (docs/package-manager.md's resolution algorithm: "the
+// resolved version is the highest of them") — that is exactly what a fresh
+// `bit add` hands a user today, so checking only the newest tag checks the
+// thing a user actually gets. Checking every historical tag would grow this
+// gate without bound and pin ancient releases forever; a package that broke
+// an old release and fixed it in the next one (exactly this incident: `web`
+// went v0.5.0 -> v0.5.1) has nothing left to prove about the old tag once a
+// newer one exists and is what `bit add` resolves.
+//
+// THE FAILURE MESSAGE NEVER POINTS AT `pkg/`. The broken bytes are inside an
+// immutable git tag object; no working-tree edit under `pkg/<name>/` can
+// reach them. `buildDetail()` below says so explicitly — the only two fixes
+// are cutting a new package tag or a compiler change — so the next person
+// hitting this red does not "fix" it by editing `pkg/` and watch the gate
+// stay red for a tag that was never touched.
+//
+// MECHANISM, NO NETWORK. `_tests_/bit/pmvanity.bit`'s helper module
+// (`./pmvanityhelpers`) already has the whole offline `bit add` rig: a scoped
+// `GIT_CONFIG_GLOBAL` carrying `url.<file-path>.insteadOf <https-url>`, so
+// `git` itself rewrites the real package remote
+// (`https://github.com/byteink/bit.git`, `pkg/README.md`'s own documented
+// `bit-import:` line) to `file://${BIT_REPO}` — THIS checkout, which already
+// holds every tag under test, since packages live in this repo's own `pkg/`
+// (docs/package-manager.md, "First-party packages"). No fixture repo needs
+// building: the published tags already exist on disk. `BIT_VANITY_ORIGIN`
+// redirects the `bit-import:` document fetch to a local one-shot HTTP server
+// (`startVanityServer`); `git fetch --depth 1` (compiler/pmfetchresolve.bit)
+// is a single shallow local fetch, not a clone. `BIT_PKG_CACHE` points at a
+// scratch root, so nothing touches `~/.bit/pkg`.
+//
+// THE SMOKE PROGRAM: one import, unused, exactly the shape of this ticket's
+// own reproduction (`bit add bitlang.org/pkg/web` then
+// `import { Res } from "web"` with `Res` never called — the E0040 fires
+// inside `res.bit` itself, from compiling the MODULE, not from calling
+// anything). The imported symbol is the first top-level `export ...` found
+// in the package's own sorted, non-test `.bit` files at HEAD — derived, never
+// hand-copied — since Bit compiles a directory module as one unit
+// (SPEC §17.1 — an import binds per MODULE), so any exported symbol reaches
+// every file in the module including the one carrying the incident's own bug.
+//
+// SCOPE GAP, NAMED RATHER THAN HIDDEN. #5569 itself touched
+// `compiler/project.bit`, not `pkg/**` — a pure compiler diff. This gate is
+// wired into the `pkg` bucket only (scripts/gate-buildsteps.sh), so a
+// compiler-only diff that reintroduces this exact incident class would NOT
+// re-run it in a scoped gate, only in `full`. Extending it into the
+// `selfhost`/`runtime`/`stdlib` buckets alongside `test-packages` is real,
+// separate work (a `BUILD_STEPS` edit per bucket, each needing its own
+// measurement) and is filed as its own follow-up ticket rather than folded in
+// here.
+//
+// NO PUBLISHED TAG AT ALL is not a failure — same "reddening on a
+// correctly-shaped empty input is worse than never having run" convention
+// `_tests_/bit/packagesgate.bit`'s header uses for zero packages; the message
+// says outright the run proved nothing rather than silently reporting "0 of 0
+// build" as if it were a pass with content.
+//
+// BIT_WORKERS=2 IS REQUIRED to run this file (`tools/build/gates.bit`'s
+// `test-package-tags` entry sets it) — the vanity-document server runs on a
+// spawned green thread while the main thread blocks inside the `bit add`
+// child; see `_tests_/bit/pmvanity.bit`'s own header for the full mechanism.
+// Reproduced directly before adding this: `BIT_WORKERS=1` (the runtime's own
+// default) times out every vanity fetch after 5000ms.
+//
+// Configure by environment, since `bit run` forwards no argv to a program:
+//   BIT_REPO             repo root, so pkg/ and its tags resolve regardless of cwd (required)
+//   BIT_BIN               compiler under test    (default ${BIT_REPO}/bit-out/bin/bit)
+//   BIT_STDLIB             stdlib root             (default ${BIT_REPO}/stdlib)
+//   BIT_TEST_TIMEOUT_S    per-subprocess deadline, seconds (default 120, max 3600)
+
+import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { env, envOr, exit } from "std/os"
+import { join } from "std/path"
+import { hasPrefix, hasSuffix, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import {
+  Capture, CliEnv, Run, fatal, mkdirp, mustSucceed, rmrf, runBitCli, startVanityServer,
+} from "./pmvanityhelpers"
+
+const realGitUrl: string = "https://github.com/byteink/bit.git"
+const defaultTimeoutS: int = 120
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+const harnessName: string = "packagetagsgate"
+
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("packagetagsgate: BIT_REPO is not set — run this through `./make test-package-tags`")
+  }
+  return r
+}
+
+fn timeoutMs(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) {
+    return defaultTimeoutS * 1000
+  }
+  let n = parseInt(raw) catch _ {
+    defaultTimeoutS
+  }
+  if (n < 1) {
+    return 1000
+  }
+  if (n > maxTimeoutS) {
+    return maxTimeoutS * 1000
+  }
+  return n * 1000
+}
+
+fn isIdentChar(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn identLen(s: string, start: int): int {
+  let i = start
+  while (i < len(s) && isIdentChar(s[i])) {
+    i = i + 1
+  }
+  return i - start
+}
+
+// "export <keyword> <Name> ..." -> ("<Name>", true); anything else -> ("", false).
+fn exportNameOnLine(line: string): (string, bool) {
+  let t = trimSpace(line)
+  if (!hasPrefix(t, "export ")) {
+    return "", false
+  }
+  let rest = t[7:len(t)]
+  let kwLen = identLen(rest, 0)
+  if (kwLen == 0) {
+    return "", false
+  }
+  let afterKw = trimSpace(rest[kwLen:len(rest)])
+  let nameLen = identLen(afterKw, 0)
+  if (nameLen == 0) {
+    return "", false
+  }
+  return afterKw[0:nameLen], true
+}
+
+// The first top-level exported symbol across `pkgDir`'s own sorted,
+// non-test `.bit` files — the smoke program's one import. See the module
+// header for why any exported symbol suffices.
+fn firstExportedSymbol(pkgDir: string): (string, bool) {
+  let names = readDir(pkgDir) catch e {
+    fatal(harnessName, "cannot read ${pkgDir}: ${e.message()}")
+    return "", false
+  }
+  for name of names {
+    if (!hasSuffix(name, ".bit") || hasSuffix(name, ".test.bit")) {
+      continue
+    }
+    let text = readFile(join(pkgDir, name)) catch e {
+      fatal(harnessName, "cannot read ${join(pkgDir, name)}: ${e.message()}")
+      ""
+    }
+    for line of split(text, "\n") {
+      let (sym, ok) = exportNameOnLine(line)
+      if (ok) {
+        return sym, true
+      }
+    }
+  }
+  return "", false
+}
+
+// The first line of `git tag -l '<name>/v*' --sort=-v:refname` — version
+// order, so a retagged release still sorts by what it actually names. ""
+// means `<name>` has no published tag yet.
+fn newestTagFor(repo: string, name: string, scratchRoot: string, ms: int): string {
+  let log = "${scratchRoot}/tags-${name}.log"
+  let pattern = "${name}/v*"
+  mustSucceed(
+    harnessName,
+    "list tags for ${name}",
+    "set -e\ngit -C '${repo}' tag -l '${pattern}' --sort=-v:refname > '${log}'\n",
+  )
+  let text = readFile(log) catch e {
+    fatal(harnessName, "cannot read ${log}: ${e.message()}")
+    ""
+  }
+  let trimmed = trimSpace(text)
+  if (len(trimmed) == 0) {
+    return ""
+  }
+  return trimSpace(split(trimmed, "\n")[0])
+}
+
+// One package with a resolvable newest tag and a smoke-testable symbol.
+class Published { name: string, tag: string, version: string, symbol: string }
+
+// Every `pkg/<name>/` directory that has a published `<name>/v*` tag,
+// paired with the newest such tag and a symbol to smoke-test it with. A
+// package with no tag yet is skipped (printed, not fatal) — the same
+// zero-is-not-a-failure convention this file's header describes.
+fn discoverPublished(repo: string, pkgRoot: string, scratchRoot: string, ms: int): []Published {
+  let names = readDir(pkgRoot) catch e {
+    fatal(harnessName, "cannot read ${pkgRoot}: ${e.message()}")
+    return []Published(0)
+  }
+  let out = []Published(0)
+  for name of names {
+    if (len(name) > 0 && name[0] == '.') {
+      continue
+    }
+    let dir = join(pkgRoot, name)
+    if (!isDir(dir)) {
+      continue
+    }
+    let tag = newestTagFor(repo, name, scratchRoot, ms)
+    if (len(tag) == 0) {
+      print("packagetagsgate: pkg/${name} has no published <name>/v* tag yet — skipped\n")
+      continue
+    }
+    let (sym, ok) = firstExportedSymbol(dir)
+    if (!ok) {
+      fatal(
+        harnessName,
+        "pkg/${name} has a published tag ${tag} but no top-level export to smoke-test against",
+      )
+    }
+    out = append(
+      out,
+      Published{ name: name, tag: tag, version: tag[len(name) + 1:len(tag)], symbol: sym },
+    )
+  }
+  return out
+}
+
+// Shared, run-wide plumbing every package's `bit add` reuses: the compiler
+// and stdlib under test, a scratch package cache, and the one insteadOf
+// rewrite that makes `https://github.com/byteink/bit.git` resolve to this
+// checkout instead of the network.
+class RunEnv {
+  bin: string,
+  stdRoot: string,
+  cacheRoot: string,
+  rewriteConfigPath: string,
+  addHome: string,
+}
+
+// The failure message this ticket exists to write: the broken bytes are
+// inside an immutable, already-published tag, so the fix is a new tag or a
+// compiler change, never an edit to `pkg/<name>/` in this checkout.
+fn buildDetail(p: Published, r: Run): string {
+  return "pkg/${p.name}@${p.tag}: `bit build` exited ${r.code} against the PUBLISHED tag ${p.tag} — " +
+    "the broken bytes are inside that already-published git tag, not in this checkout's pkg/${p.name}. " +
+    "The only fixes are a NEW package tag or a compiler change; editing pkg/${p.name} here cannot reach " +
+    "a published tag and will not turn this gate green.\n  stderr: ${r.stderr}"
+}
+
+// Resolves `p`'s newest tag through the real `bit add` vanity path (offline,
+// see the module header) and compiles one program against it. Returns
+// (built, failureDetail) — failureDetail is "" iff built is true.
+fn checkOnePackage(re: RunEnv, p: Published, idx: int): (bool, string) {
+  let root = "/tmp/bit-packagetagsgate-${p.name}-${idx}"
+  mkdirp(harnessName, root)
+  let projDir = root + "/proj"
+  mkdirp(harnessName, projDir)
+  writeFile(projDir + "/bit.json", "{}\n") catch e {
+    fatal(harnessName, "cannot write bit.json: " + e.message())
+  }
+
+  let vanityName = "bitlang.org/pkg/${p.name}"
+  let doc = "bit-import: ${vanityName} git ${realGitUrl} dir pkg/${p.name}\n"
+  let (srv, port) = startVanityServer(harnessName, doc)
+
+  let addEnv = [
+    "BIT_VANITY_ORIGIN=http://127.0.0.1:${port}",
+    "GIT_CONFIG_GLOBAL=" + re.rewriteConfigPath,
+    "GIT_CONFIG_SYSTEM=/dev/null",
+    "HOME=" + re.addHome,
+  ]
+  let cliEnv = CliEnv{
+    bitExe: re.bin,
+    stdRoot: re.stdRoot,
+    pkgCache: re.cacheRoot,
+    projDir: projDir,
+  }
+  let addResult = runBitCli(
+    harnessName, cliEnv, addEnv, ["add", "${vanityName}@${p.version}"],
+    Capture{ outPath: root + "/add.out", errPath: root + "/add.err" },
+  )
+  srv.close()
+  if (addResult.code != 0) {
+    fatal(
+      harnessName,
+      "`bit add ${vanityName}@${p.version}` exited ${addResult.code} — a setup failure, not the incident under test\n  stdout: ${addResult.stdout}  stderr: ${addResult.stderr}",
+    )
+  }
+
+  writeFile(
+    projDir + "/main.bit",
+    "import { ${p.symbol} } from \"${p.name}\"\nfn main() {\n  print(\"ok\\n\")\n}\n",
+  ) catch e {
+    fatal(harnessName, "cannot write main.bit: " + e.message())
+  }
+
+  let buildResult = runBitCli(
+    harnessName, cliEnv, []string(0), ["build", ".", "-o", "smoke"],
+    Capture{ outPath: root + "/build.out", errPath: root + "/build.err" },
+  )
+  rmrf(root)
+  if (buildResult.code == 0) {
+    return true, ""
+  }
+  return false, buildDetail(p, buildResult)
+}
+
+fn runAll(re: RunEnv, published: []Published): (int, []string) {
+  let built = 0
+  let failures = []string(0)
+  let i = 0
+  while (i < len(published)) {
+    let (ok, detail) = checkOnePackage(re, published[i], i)
+    if (ok) {
+      built = built + 1
+      print("ok pkg/${published[i].name}@${published[i].tag}\n")
+    } else {
+      failures = append(failures, detail)
+    }
+    i = i + 1
+  }
+  return built, failures
+}
+
+fn main() {
+  let repo = repoRoot()
+  let bin = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
+  let stdRoot = envOr("BIT_STDLIB", "${repo}/stdlib")
+  if (!exists(bin)) {
+    fatal(harnessName, "no compiler under test at '${bin}' — set BIT_BIN")
+  }
+  if (!exists(stdRoot)) {
+    fatal(harnessName, "no stdlib at '${stdRoot}' — set BIT_STDLIB")
+  }
+
+  let ms = timeoutMs()
+  let scratchRoot = "/tmp/bit-packagetagsgate-scan-" + uuidFormat(uuidV4())
+  mkdirp(harnessName, scratchRoot)
+
+  let published = discoverPublished(repo, "${repo}/pkg", scratchRoot, ms)
+  if (len(published) == 0) {
+    rmrf(scratchRoot)
+    print("packagetagsgate: 0 published package(s) under ${repo}/pkg — the run proved nothing\n")
+    return
+  }
+
+  let rewriteConfigPath = scratchRoot + "/git-rewrite-config"
+  writeFile(rewriteConfigPath, "[url \"file://${repo}\"]\n\tinsteadOf = ${realGitUrl}\n") catch e {
+    fatal(harnessName, "cannot write the git insteadOf config: " + e.message())
+  }
+  let addHome = scratchRoot + "/add-home"
+  mkdirp(harnessName, addHome)
+  let runEnv = RunEnv{
+    bin: bin, stdRoot: stdRoot, cacheRoot: scratchRoot + "/cache",
+    rewriteConfigPath: rewriteConfigPath, addHome: addHome,
+  }
+
+  let (built, failures) = runAll(runEnv, published)
+  rmrf(scratchRoot)
+
+  print("${built} of ${len(published)} published package(s) build\n")
+  if (len(failures) > 0) {
+    for f of failures {
+      eprint("FAIL ${f}\n")
+    }
+    eprint("packagetagsgate: FAILED — ${len(failures)} of ${len(published)} published package(s) failed to build against their own newest tag\n")
+    exit(1)
+  }
+}
