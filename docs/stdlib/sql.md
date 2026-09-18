@@ -298,10 +298,10 @@ any commit on `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
 |---|---|---|
 | `Value` | No | Stayed `{Null, Int, Float, Text, Blob}` (#5421, owner ruling: extend by accessor, not by enum variant - see below). |
 | `Driver` | No | Neither adapter implements it. `pkg/postgres/adapter.bit:86` and `pkg/mysql/adapter.bit:104` both export `fn adapter(): Adapter` (`config.bit`'s `Adapter`, added by #3962 before either driver existed), never a `Driver`. The only implementer anywhere in the tree is `stdlib/sql/sqlcheck.bit`'s `fakeDriver`, a self-test double. |
-| `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:30`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The one gap this froze open," below, for `begin`. |
+| `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:33`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The gap the freeze found, and #5587 closed," below, for `begin`'s history. |
 | `Rows` | No | `pgRows`/`myRows` implement `next`/`columns`/`value`/`close` verbatim. MySQL's `TINYINT(1)`-as-bool and JSON-as-the-field's-own-type ambiguities are resolved by which accessor the caller reaches for (`sqlReqBool` vs `sqlReqInt`, `sqlReqJson`), never by `Rows` itself. |
 | `Stmt` | No | `pgStmt`/`myStmt` implement `query`/`exec`/`close` verbatim. MySQL's `$1`-to-`?` placeholder rewrite (`pkg/mysql/rewrite.bit`) and its statement cache both run *inside* `prepare`, invisible at the `Stmt` boundary. |
-| `Tx` | No (but see below) | Signature untouched, and both drivers fail `begin` with the same shape - which is the interesting finding, not a change. |
+| `Tx` | No | Signature untouched. Both drivers stubbed `begin` until #5587 wired it up - see below. |
 | `Registry` | No | Unused by both real drivers, same as `Driver`; exercised only by `sqlcheck.bit`'s fake. |
 
 **6 of 6 checked. 0 of 6 changed.** What MySQL actually needed - the session
@@ -316,32 +316,36 @@ exactly the shape `pkg/mysql`'s own `mysqlDecimal` had already shipped by
 hand before the decision was written down. `Value` itself never grew a
 variant.
 
-### The one gap this froze open
+### The gap the freeze found, and #5587 closed
 
-`Conn.begin(): Tx!` is declared and implemented by both drivers - and both
-implementations are the same one line:
-
-```
-pkg/postgres/conn.bit:70   fail newError("postgres: begin is not implemented yet (epic #3986)")
-pkg/mysql/conn.bit:217     fail newError("mysql: begin is not implemented yet (epic #3986)")
-```
-
-Neither ever issues `BEGIN`/`START TRANSACTION`. That stub predates #3979
-(closure-scoped transactions, the *only* public transaction API - see
+`Conn.begin(): Tx!` was declared and implemented by both drivers when this
+freeze was written, but both bodies were an unconditional failure - the
+freeze proved the other six interfaces against real traffic while leaving
+`begin` itself unwired. That stub predated #3979 (closure-scoped
+transactions, the *only* public transaction API - see
 [Transactions](#transactions)), which built `tx`/`txAt`/`txValue`/`txValueAt`
 on top of `Pool`'s own (unexported) `begin`, which in turn calls straight
-through to `Conn.begin`. Nobody went back to wire either driver's `begin` up
-once #3979 landed. The result: `pool.tx((db) => { ... })` against a real
-Postgres or MySQL connection fails immediately, every time, with the message
-above - not a gap in the interface, a gap in both implementations of it.
-`stdlib/sql/pool.test.bit`'s `stubConn.begin()` is the only `begin` in the
-whole tree that actually starts anything, which is why `tx.test.bit`'s and
-`pool.test.bit`'s own suites are green: they prove the closure machinery
-against a fake that behaves, never against either shipped driver. Filed as
-#5587, since fixing two drivers' connection code is out of a docs ticket's
-reach and out of this ticket's own "do not change an interface" constraint -
-`Conn.begin`'s signature is fine as declared; issuing real SQL from inside it
-is the missing part.
+through to `Conn.begin`. So `pool.tx((db) => { ... })` could not run against
+either shipped driver at all - not a gap in the interface, a gap in both
+implementations of it. This is exactly what an interface freeze is for: it
+caught the hole and named it rather than shipping it silently.
+
+#5587 (merged `f2b32c86`) closed it without moving the interface.
+`pgConn.begin()` (`pkg/postgres/conn.bit:73`) sends `BEGIN`; `myConn.begin()`
+(`pkg/mysql/conn.bit:224`) sends `START TRANSACTION`. Both return a `Tx`
+(`pgTx`/`myTx`) whose `commit` and `rollback` send `COMMIT`/`ROLLBACK` on the
+same connection (`pkg/postgres/conn.bit:113,117`;
+`pkg/mysql/conn.bit:265,269`), and both `begin` methods fail closed - a
+`transportError` naming the closed connection - before sending anything
+(`pkg/postgres/conn.bit:75`, `pkg/mysql/conn.bit:226`).
+
+Three live-container tests per driver are the acceptance for this: `pool.tx`
+commits a row that a second, independent connection can then see
+(`pkg/postgres/live.test.bit:521`, `pkg/mysql/live.test.bit:503`); `pool.tx`
+rolls back on a failure and leaves the connection usable for the next call
+(`pkg/postgres/live.test.bit:550`, `pkg/mysql/live.test.bit:532`); and
+`pool.txValue` returns the block's value once the commit has succeeded
+(`pkg/postgres/live.test.bit:584`, `pkg/mysql/live.test.bit:564`).
 
 ### What a third driver breaks
 
