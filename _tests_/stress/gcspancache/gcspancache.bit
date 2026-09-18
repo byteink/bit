@@ -1,0 +1,222 @@
+// #5592: a reserve-owned-span stale-positive probe for the #5584 direct-mapped
+// span-presence cache (`idxSpanPresent`, `runtime/gc/gcindex.bit`).
+//
+// WHY A CALLER-BOUND ARENA CANNOT CATCH A MISSING INVALIDATION. `idxRemoveSpan`
+// clears one cache slot when a span leaves the index; the corpus's existing GC
+// stress programs bind an arena large enough that every span they carve is
+// `spanOwned == false` (never reclaimed, `reserveHeadOwns`), so a stale cache
+// entry there just keeps answering for a span that is still live and whose bits
+// are already correctly clear — right by accident, not because invalidation
+// ran. Only a RESERVE-owned span (`heapGiveSmallLocked`'s reclaim hysteresis,
+// `allocSpanKeep`) is ever pushed into the #3045 span cache
+// (`runtime/alloc/spancache.bit`), which overwrites the span's own first word
+// (its `spanClass` field) with a free-list link — so a stale cache hit on one
+// of these calls `allocSpanClass` on garbage, `allocClassSize` on that garbage
+// class index, and `allocSpanBytes / cs` panics on whatever class-index math
+// happens to zero `cs`. `ARENA_WORDS` below is one span's worth, so the very
+// first refill already exhausts it and every span this program carves comes
+// from `reserveGrow`, `owned = true` — see `_tests_/stress/gcslotbitmap`'s own
+// `RC_ARENA_WORDS` note, which this mirrors.
+//
+// FIVE SPANS, WELL UNDER THE CACHE'S 64-SLOT CAPACITY (`allocSpanCache`), SO
+// THE CORRUPTED SPAN IS OBSERVED BEFORE ANYTHING POPS IT BACK OUT. Priming
+// class 10 (body 160, 681 slots/span — `gcslotbitmap`'s own `RC_SRC_*`) with 5
+// spans reclaims 4 non-anchor ones once every root is zeroed and two
+// collections run (`allocSpanKeep` = 2, and 4 empty spans is at least half of
+// 5) — `heapGiveSmallLocked`'s exact hysteresis condition, `runtime/alloc/
+// alloc.bit`. Those 4 sit in the #3045 cache, corrupted, until something pops
+// them: step 4 below checks every saved body address BEFORE that happens.
+//
+// Then a single allocation of a DIFFERENT class (`RECARVE_BODY`) pops one
+// cached span back out and legitimately refills its header — repeating the
+// check afterward is `gcslotbitmap` phase A's own recycling-guard shape, a
+// second, independent pass over the same addresses.
+//
+// Mutation (delete the two-line cache clear from `idxRemoveSpan`): the
+// observed failure is `panic: integer division by zero`, rc=2, before this
+// program prints anything. Reverting restores `mismatches=0`.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import {
+  gcInit,
+  gcConfigure,
+  gcBindMemory,
+  gcAlloc,
+  gcCollectRoots,
+  gcOwns,
+  gcOwnsLinear,
+  gcDeinit,
+  gcWords,
+} from "../../../runtime/gc"
+
+// One span's worth of head, so `reserveTake` fails on the very first refill
+// and every span this program ever carves comes from `reserveGrow` —
+// `owned = true`, reclaimable, unlike every caller-bound arena in this corpus.
+const ARENA_WORDS: int = 512
+const INDEX_WORDS: int = 4096
+const META_WORDS: int = 8
+
+// Class 10 (body 160 + 16-byte header = 176), 681 slots/span, `gcslotbitmap`'s
+// own proven `RC_SRC_*` figures: 5 spans (1 anchor, 4 releasable) is enough to
+// clear `allocSpanKeep`(2) with the empties at least half of the class's spans.
+const SRC_BODY: int = 160
+const SRC_SPAN_SLOTS: int = 681
+const SRC_SPANS: int = 5
+const ROOTS: int = SRC_SPANS * SRC_SPAN_SLOTS
+
+// A different class from SRC, carved over the reclaimed spans in step 5.
+const RECARVE_BODY: int = 4088
+
+fn fillMeta(meta: []i64, bodySize: int) {
+  meta[0] = bodySize
+  meta[1] = 0
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+}
+
+// Step 2: allocate ROOTS objects, keep them rooted, save every body address in
+// a NON-root array, and call `gcOwns` once per body — that PRIMES the
+// span-presence cache with a positive for each of the 5 spans.
+fn primeAndSave(g: *i64, rootsAddr: int, roots: []i64, bodies: []i64, metaAddr: int): int {
+  let primed = 0
+  let i = 0
+  while (i < ROOTS) { // bounded: ROOTS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p != 0) {
+      primed = primed + 1
+    }
+    roots[i] = p
+    bodies[i] = p
+    let _ = gcOwns(g, p)
+    i = i + 1
+  }
+  gcCollectRoots(g, rootsAddr, ROOTS) // still all live: nothing swept
+  return primed
+}
+
+// Steps 4/5's shared assertion: every saved body must agree between `gcOwns`
+// and the authoritative linear oracle. Under the mutation this panics with
+// "integer division by zero" on the first body whose span sits, corrupted,
+// in the #3045 cache — it never reaches the return below.
+fn checkAgree(g: *i64, bodies: []i64): int {
+  let mismatches = 0
+  let i = 0
+  while (i < ROOTS) { // bounded: ROOTS iterations
+    let b = bodies[i]
+    if (b != 0 && gcOwns(g, b) != gcOwnsLinear(g, b)) {
+      mismatches = mismatches + 1
+    }
+    i = i + 1
+  }
+  return mismatches
+}
+
+// Step 3: zero every root and collect TWICE. The first sweep frees every
+// object and fires the reclaim hysteresis for the 4 non-anchor spans; the
+// second is `gcindexchurn`'s own steady-state repeat, run here so a
+// one-collection-only reclaim path is not the only one this probe exercises.
+fn dropAndReclaim(g: *i64, rootsAddr: int, roots: []i64) {
+  let z = 0
+  while (z < ROOTS) { // bounded: ROOTS iterations
+    roots[z] = 0
+    z = z + 1
+  }
+  gcCollectRoots(g, rootsAddr, ROOTS)
+  gcCollectRoots(g, rootsAddr, ROOTS)
+}
+
+// Step 5: re-carve one of the reclaimed spans for a DIFFERENT class and
+// repeat step 4's differential — `gcslotbitmap` phase A's own
+// recycling-guard shape. Returns (recarved body address, mismatches added).
+fn recarveAndCheck(g: *i64, bodies: []i64): (int, int) {
+  let meta2 = []i64(META_WORDS)
+  fillMeta(meta2, RECARVE_BODY)
+  let meta2Addr = int(ptrOf(meta2))
+  let recarved = gcAlloc(g, meta2Addr)
+  let recarveRoot = []i64(1)
+  recarveRoot[0] = recarved
+  let recarveRootAddr = int(ptrOf(recarveRoot))
+  gcCollectRoots(g, recarveRootAddr, 1) // keep it alive for the second pass
+  return (recarved, checkAgree(g, bodies))
+}
+
+// Load-bearing, not decorative: see `gcindexchurn`'s own leading comment for
+// why this read matters under `BIT_GC=stress` (#4097/#4184). Split in two,
+// under E0202's 5-param limit, the same reason `gcindexchurn` splits its own.
+fn gcStillRooted(arena: []i64, indexArena: []i64, roots: []i64, bodies: []i64, state: []i64): bool {
+  return len(arena) == ARENA_WORDS &&
+    len(indexArena) == INDEX_WORDS &&
+    len(roots) == ROOTS &&
+    len(bodies) == ROOTS &&
+    len(state) == gcWords
+}
+
+fn heapStillRooted(meta: []i64, heapBlock: []i64, heapLock: []i32, lock: []i32): bool {
+  return len(meta) == META_WORDS &&
+    len(heapBlock) == heapWords &&
+    len(heapLock) == 1 &&
+    len(lock) == 1
+}
+
+fn main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let roots = []i64(ROOTS)
+  let bodies = []i64(ROOTS)
+  let meta = []i64(META_WORDS)
+
+  let metaAddr = int(ptrOf(meta))
+  fillMeta(meta, SRC_BODY)
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, false, 4096, 200, false)
+
+  let primed = primeAndSave(g, rootsAddr, roots, bodies, metaAddr)
+  dropAndReclaim(g, rootsAddr, roots)
+
+  // Step 4: the differential, before anything pops the reclaimed spans back
+  // out of the #3045 cache.
+  let mismatches = checkAgree(g, bodies)
+  let (recarved, addedMismatches) = recarveAndCheck(g, bodies)
+  mismatches = mismatches + addedMismatches
+
+  let staleowned = 0
+  if (mismatches > 0) {
+    staleowned = 1
+  }
+  let live2 = 0
+  if (recarved != 0) {
+    live2 = 1
+  }
+
+  gcDeinit(g)
+
+  let rooted = 0
+  if (gcStillRooted(arena, indexArena, roots, bodies, state) &&
+    heapStillRooted(meta, heapBlock, heapLock, lock)) {
+    rooted = 1
+  }
+
+  print("spancache primed=${primed} staleowned=${staleowned} mismatches=${mismatches} live2=${live2} rooted=${rooted}\n")
+}
