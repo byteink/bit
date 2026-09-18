@@ -244,15 +244,18 @@ gates_for_file() {
     _tests_/bit/childrun/*) shared_module_gates childrun; return 0 ;;
     _tests_/bit/docsrunner/*) shared_module_gates docsrunner; return 0 ;;
     # #5595: pmvanityhelpers has had no arm since #4183 split it out of
-    # pmvanity.bit; pmvanitymulti (#5586) is the same unmapped shape. A
-    # pmvanitymulti/* is NOT added to SHARED_HARNESS_MODULES: it is itself an
-    # importer of pmvanityhelpers (../pmvanityhelpers), and
-    # assert_sharedmodule_importer's cycle guard trips on any importer whose
-    # own path sits inside a LISTED module's directory, regardless of import
-    # direction — its mapping below is still fully derived, only its own
-    # staleness self-check is skipped.
+    # pmvanity.bit; pmvanitymulti (#5586) is the same unmapped shape.
+    # pmvanitychecks (#5604's second E0200 split of pmvanity.bit) is a third
+    # instance — missing since #5604's merge, tripping the source-time
+    # `assert_sharedmodule_importer` check on every branch off main (found
+    # while verifying #5606). Neither is added to SHARED_HARNESS_MODULES:
+    # both are themselves importers of pmvanityhelpers, and
+    # assert_sharedmodule_importer's cycle guard trips on any importer
+    # inside a LISTED module's directory either way — each mapping below is
+    # still fully derived, only its staleness self-check is skipped.
     _tests_/bit/pmvanityhelpers/*) shared_module_gates pmvanityhelpers; return 0 ;;
     _tests_/bit/pmvanitymulti/*) shared_module_gates pmvanitymulti; return 0 ;;
+    _tests_/bit/pmvanitychecks/*) shared_module_gates pmvanitychecks; return 0 ;;
     _tests_/stress/*)
       # A different top-level directory from the harness that reads it
       # (_tests_/bit/stress/, matched by the `_tests_/bit/stress/*)` arm just
