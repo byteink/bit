@@ -15,7 +15,7 @@
 # binary timed through Docker Desktop's VM would carry that VM's overhead
 # into a number compared against pkg/toml's native process, so both
 # competitors are built as native binaries for the host running this script
-# and executed exactly like pkg/toml's — same OS, same scheduler, same `time`.
+# and executed exactly like pkg/toml's - same OS, same scheduler, same `time`.
 #
 # EXCLUSIVE (per the epic and #5488's own ticket): dispatch this alone, with
 # nothing else running. Waiting behind boxlock's `solo` costs the whole box.
@@ -31,7 +31,7 @@ RUNS=15                                  # timed runs per side; see trimmean() b
 MODE=${1:-full}
 
 [ -x "$BIT" ] || { echo "$BIT not built (run: ./make selfhost in $REPO)" >&2; exit 1; }
-[ -f "$FIXTURE" ] || { echo "$FIXTURE missing — checked-in fixture, never generated at run time" >&2; exit 1; }
+[ -f "$FIXTURE" ] || { echo "$FIXTURE missing - checked-in fixture, never generated at run time" >&2; exit 1; }
 command -v docker >/dev/null || { echo "docker not found on PATH" >&2; exit 1; }
 
 HOST_GOOS=darwin
@@ -47,7 +47,7 @@ say() { printf '%s\n' "$*"; }
 
 build_bit() {
   # Written here and not committed (bench/.gitignore): the path is this
-  # box's, not the repo's — the same convention pkg/web/bench/remote.sh
+  # box's, not the repo's - the same convention pkg/web/bench/remote.sh
   # uses for its own apps/bit/{bit.json,bit.lock}.
   printf '{"name": "tomlbench", "dependencies": {"toml": "%s"}}\n' "$PKG" > "$HERE/apps/bit/bit.json"
   printf '{"toml": {"path": "%s", "requires": {}}}\n' "$PKG" > "$HERE/apps/bit/bit.lock"
@@ -79,7 +79,7 @@ build_go() {
 # ---------------------------------------------------------------- verify
 
 # Runs `<binary> checksum <fixture>` for all three sides and aborts, named,
-# on the first disagreement — pkg/web/bench/remote.sh's "prove identical
+# on the first disagreement - pkg/web/bench/remote.sh's "prove identical
 # responses before timing anything", the same guarantee for a parser instead
 # of an HTTP server: a throughput number from two parsers that disagree
 # measures nothing.
@@ -92,7 +92,7 @@ verify() {
   say "burntsushi: $out_bs"
   say "go-toml/v2: $out_gt"
   if [ "$out_bit" != "$out_bs" ] || [ "$out_bit" != "$out_gt" ]; then
-    echo "toml bench: checksum mismatch — the three parsers disagree on $FIXTURE, refusing to time anything" >&2
+    echo "toml bench: checksum mismatch - the three parsers disagree on $FIXTURE, refusing to time anything" >&2
     exit 1
   fi
   say "checksums agree: $out_bit"
@@ -117,7 +117,7 @@ time_run() {
 
 median() { sort -n | awk '{a[NR]=$1} END{n=NR; if(n%2){print a[(n+1)/2]} else {printf "%.6f\n",(a[n/2]+a[n/2+1])/2}}'; }
 
-# Trimmed mean — the mean of the samples left after dropping the slowest
+# Trimmed mean - the mean of the samples left after dropping the slowest
 # fifth. Same estimator and the same reasoning bench/run.sh:34-59 (repo
 # root, #4040) settled on after comparing four: a plain minimum is the worst
 # of the four against a box that is not perfectly idle, and RUNS=15 is where

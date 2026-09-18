@@ -51,7 +51,7 @@ value back to text, and the errors this package raises - is in
 <!-- BENCH:START -->
 Pending: `pkg/yaml/bench/run.sh` (#5501) publishes the parse-throughput table
 against `github.com/goccy/go-yaml` and `gopkg.in/yaml.v3` here on its next
-full run (15+ runs, an idle box — see `pkg/yaml/bench/README.md`). The
+full run (15+ runs, an idle box - see `pkg/yaml/bench/README.md`). The
 harness is built, and every implementation is proven to parse
 `bench/data/k8s-manifests.yaml` to the identical checksum by `./run.sh
 --verify`; only the timed measurement itself has not been taken yet.
