@@ -39,61 +39,68 @@ a parser that accepts too much, and it is the more valuable half.
 `./make test-package-yaml` like any other `*.test.bit` file in this
 module. Nothing about it needs separate registration. It reports one
 line, re-derived here by running
-`BIT_REPO="$PWD" ./bit-out/bin/bit test pkg/yaml` on commit `d92ed35d`:
+`BIT_REPO="$PWD" ./bit-out/bin/bit test pkg/yaml` on commit `cab1d7e2`:
 
 ```text
-yaml-test-suite: parse 284/308, error 81/94, excluded 37/402
+yaml-test-suite: parse 293/308, error 86/94, excluded 23/402
 ```
 
-Read plainly: of 402 fixtures on disk, 37 (9%) are excluded, and the
-other 365 (91%) either parse correctly or are correctly rejected. The
-denominator is every fixture present on disk, so an excluded case stays
-visible in the ratio rather than quietly leaving it.
+Read plainly: of 402 fixtures on disk, this package correctly parses or
+correctly rejects 379 (94%). The denominator is every fixture present on
+disk, so an excluded case stays visible in the ratio rather than quietly
+leaving it. The other 23 (6%) are excluded, each named below with the
+file that owes it.
 
-## What the 37 exclusions are
+## What the 23 exclusions are
 
 Every excluded fixture is named individually, with its own reason, in
 `corpusExclusionList()` in `pkg/yaml/corpusexclusions.test.bit`. That
 list is what the harness actually reads; this section groups it for a
-reader by which file owes the fix, since that is what stays current as
-fixtures move between groups. Fixing any of these means deleting its
-entry there, which moves the counts above - re-derive them from a run
-rather than quoting this page.
+reader. Fixing any of these means deleting its entry there, which moves
+the counts above - re-derive them from a run rather than quoting this
+page.
 
-* **8 need an owner decision, not a parser fix.** Each is a valid
-  document whose expected value depends on an anchor's name, an alias's
-  identity, or an explicit tag's text - a `&name`, a `*name` referencing
-  one, or a `<tag:...>` (including the bare `!` non-specific tag). `Yaml`
-  (`value.bit`) has no field for any of that today: it resolves an
-  anchored or aliased node straight through to its plain value and drops
-  the decoration, so there is nothing for this suite's own oracle to
-  compare against. Reproducing the decoration instead of dropping it
-  would need a `value.bit` change; decision **#5548** is still open on
-  whether `Yaml` should carry that information at all, and these 8 stay
-  excluded until it answers one way or the other - this is not
-  engineering work waiting on a queue, it cannot proceed without that
-  answer. See [Anchors](anchors.md) for what this package's anchor
-  support covers today, independent of how #5548 resolves.
-* **29 are open gaps that route through `pkg/yaml/parse.bit`** - 20 of
-  them in `parse.bit` alone, 5 jointly with `scan.bit`, 4 jointly with
-  `flow.bit`. Examples: an implicit block-mapping key spanning more than
-  one physical line; a colon chain (`a: b: c: d`) accepted as nested
-  mappings where the spec does not define that shorthand; a malformed
-  `%TAG` handle whose scope outlives its own document; content accepted
-  after a construct that should already be closed (a flow collection, a
-  quoted scalar, a `...` marker). Epic **#5524** tracks closing this
-  area; its child list shows most of it already closed, with `#5546`
-  (thread a flow collection's own enclosing block indentation into
-  `yamlParseFlow`) the one open child naming a specific mechanism today.
-  The rest are grouped by construct in
-  `pkg/yaml/corpusexclusions.test.bit`'s own `corpusExclusions*`
-  functions, each recording the exact fixture IDs and the `parse.bit`
-  site a fix needs.
+* **8 are pending implementation, not excluded by design.** Each is a
+  valid document whose expected value depends on an anchor's name, an
+  alias's identity, or an explicit tag's text - a `&name`, a `*name`
+  referencing one, or a `<tag:...>`. `Yaml` (`value.bit`) does not carry
+  any of that today. Whether it should was an open question; it is
+  settled now - YAML 1.2.2 makes a tag part of what a node is (3.2.1.1)
+  and an alias the same node, not merely an equal one (3.2.2, 7.1), so
+  `Yaml`'s value model will carry anchor identity and tag text. These 8
+  close once that change lands, the same way any other open gap here
+  does. See [Anchors](anchors.md) for what this package's anchor support
+  covers today.
+* **3 are permanent: tag-driven typing.** `S4JQ` needs the bare `!` tag
+  to force implicit typing off; `74H7` needs an explicit `!!str` to force
+  a mapping key to a string over its own implicit int resolution; `LE5A`
+  needs the same for an untagged-looking empty scalar. All three need
+  this package to choose a value's type from its tag rather than from its
+  own spelling - the type-tag-driven object instantiation epic **#1482**
+  rules out by decision. These do not move; nothing here is pending.
+* **12 are open gaps spread across six files.** `parse.bit` owns four,
+  each its own mechanism: a bare `:` starting a block-context line as an
+  implicit empty key; an anchored empty node followed by a same-column
+  sibling key; a `%TAG` handle's scope not tracked past its own document;
+  a flow collection's own multi-line minimum indentation not threaded
+  through block context. `flow.bit` owns four: a flow sequence's own
+  indentation floor, a flow mapping's key or entries split across lines,
+  and `---`/`...` used as flow content. `scan.bit` owns one: `&`/`*` need
+  the same fold-sensitive dispatch `!`/`%` already got. `scalar.bit` owns one
+  jointly with `parse.bit` and `flow.bit`: a multi-line quoted value's
+  own minimum indentation, which none of the three currently threads
+  through. `block.bit` owns one: a block scalar header's own trailing
+  comment. The last is not a parser gap at all - the harness's own
+  float-equality check in `corpus.test.bit`/`value.bit` never coerces an
+  expected int to compare against a parsed float. Two of the twelve (the
+  sibling-key one and the flow-indentation one) already record one
+  attempt tried and reverted after it regressed other, previously-passing
+  fixtures - not unattempted, just not yet solved.
 
-Neither group is a majority, and neither is unexplained: this package
-still rejects anything else it does not implement with a named error
-rather than silently accepting or dropping part of a document - see
-[Errors](errors.md).
+None of the 23 is unexplained, and none is close to a majority: this
+package correctly handles 94% of the corpus today, and rejects anything
+else it does not implement with a named error rather than silently
+accepting or dropping part of a document - see [Errors](errors.md).
 
 ## Mapping equality does not depend on key order
 
