@@ -136,10 +136,16 @@ across all three arms and confirmed stable across five repeated runs of
 each binary. **None of the three allocates per element.** The per-call
 box that forced this epic's original rejection is gone for a concrete
 class's direct calls (#5445) and for a trait-typed value's vtable calls
-(#5446) alike. The harness that produced these numbers is reproducible
-from the three `.bit` files in smash#4107's closing comment; it is
-deliberately not committed to the tree, because it exists to prove a
-compiler property, not to exercise a stdlib API.
+(#5446) alike. Three identical zeros are also what a probe reports when the
+optimizer has folded the whole loop away, so the measurement carries a
+control: the same class and the same driver returning a `Pair` enum whose
+two payload variants hold different types, which is not eligible for the
+unboxed representation. It reports `swept=917487 live=82521
+allocbytes=32,528,768` on the same binary and the same stdout, one box per
+element. The instrument can see a box; the `Option<i64>` arms do not have
+one. The four `.bit` files, including that control, are on smash#4107; they
+are deliberately not committed, because they exist to prove a compiler
+property, not to exercise a stdlib API.
 
 `next(): Option<T>` is therefore accepted on allocation grounds, not
 merely on protocol grounds. A future change to `explodesParams`,
