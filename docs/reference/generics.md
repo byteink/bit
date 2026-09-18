@@ -25,7 +25,7 @@ class Counter<T> {
 }
 
 fn counter<T>(): Counter<T> {
-  return Counter<T>{ counts: map<T, int>() }
+  return Counter<T>{ counts = map<T, int>() }
 }
 
 fn main() {
@@ -117,7 +117,7 @@ class MemoryStore {
 }
 
 fn memoryStore(): MemoryStore {
-  return MemoryStore{ links: map<string, Link>() }
+  return MemoryStore{ links = map<string, Link>() }
 }
 
 class Counter<T> {
@@ -132,13 +132,13 @@ class Counter<T> {
 }
 
 fn counter<T>(): Counter<T> {
-  return Counter<T>{ counts: map<T, int>() }
+  return Counter<T>{ counts = map<T, int>() }
 }
 
 fn main() {
   let store: Store = memoryStore()
   let code = shortCode(12345)
-  store.put(code, Link{ url: "https://example.com", created: 0, hits: 0 })
+  store.put(code, Link{ url = "https://example.com", created = 0, hits = 0 })
 
   let lookups = counter<string>()
   lookups.bump(code)

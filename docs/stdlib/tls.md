@@ -426,15 +426,15 @@ fn demo(): string! {
   exts = append(exts, extServerName("example.com"))
   exts = append(exts, extSupportedVersionsClient([versionTls13]))
   let shares = []KeyShareEntry(0)
-  shares = append(shares, KeyShareEntry{ group: groupX25519, keyExchange: []byte(32) })
+  shares = append(shares, KeyShareEntry{ group = groupX25519, keyExchange = []byte(32) })
   exts = append(exts, extKeyShareClient(shares))
 
   let hello = ClientHello{
-    legacyVersion: 0x0303,
-    random: []byte(32),
-    sessionId: []byte(0),
-    cipherSuites: [0x1301],
-    extensions: exts,
+    legacyVersion = 0x0303,
+    random = []byte(32),
+    sessionId = []byte(0),
+    cipherSuites = [0x1301],
+    extensions = exts,
   }
   let wire = encodeClientHello(hello)
 
@@ -952,16 +952,16 @@ import { newTrustStore, TlsClientConfig, tlsClientStart, TlsGroup, GroupKeypair 
 // first flight to send.
 fn begin(rootsPem: string): []byte! {
   let config = TlsClientConfig{
-    serverName: "example.com",
-    alpn: ["h2", "http/1.1"],
-    trust: newTrustStore(rootsPem)?,
-    insecureSkipVerify: false,
-    nowUnix: 1700000000,
-    groups: [TlsGroup.X25519MLKEM768, TlsGroup.X25519],
-    keyShareGroups: []TlsGroup(0),
-    suites: []int(0),
-    clientHelloOverride: []byte(0),
-    ephemeralOverride: []GroupKeypair(0),
+    serverName = "example.com",
+    alpn = ["h2", "http/1.1"],
+    trust = newTrustStore(rootsPem)?,
+    insecureSkipVerify = false,
+    nowUnix = 1700000000,
+    groups = [TlsGroup.X25519MLKEM768, TlsGroup.X25519],
+    keyShareGroups = []TlsGroup(0),
+    suites = []int(0),
+    clientHelloOverride = []byte(0),
+    ephemeralOverride = []GroupKeypair(0),
   }
   let h = tlsClientStart(config)?
   return h.hello

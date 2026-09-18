@@ -24,7 +24,7 @@ import { Json, JsonEntry, jsonGet, jsonAsString } from "std/json"
 
 fn run(): ()! {
   let secret = []byte("a shared secret at least this long")
-  let payload = Json.JsonObject([JsonEntry{ key: "sub", value: Json.JsonString("alice") }])
+  let payload = Json.JsonObject([JsonEntry{ key = "sub", value = Json.JsonString("alice") }])
 
   let token = sign(SigningKey.Hs256Key(secret), payload)?
   let got = verify(token, VerifyKey.Hs256Key(secret))?

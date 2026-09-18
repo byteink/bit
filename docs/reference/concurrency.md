@@ -118,7 +118,7 @@ fn shortCode(n: int): string {
 trait Existence {
   get(code: string): Link!
   has(code: string): bool {
-    let l = this.get(code) catch Link{ url: "", created: 0, hits: 0, expiresAt: 0 }
+    let l = this.get(code) catch Link{ url = "", created = 0, hits = 0, expiresAt = 0 }
     return len(l.url) > 0
   }
 }
@@ -146,7 +146,7 @@ class MemoryStore {
 }
 
 fn memoryStore(): MemoryStore {
-  return MemoryStore{ links: map<string, Link>() }
+  return MemoryStore{ links = map<string, Link>() }
 }
 
 // Removes every link whose expiresAt has passed nowNs, returning the count.
@@ -186,10 +186,10 @@ fn main() {
   store.put(
     expiring,
     Link{
-      url: "https://example.org",
-      created: now().ns,
-      hits: 0,
-      expiresAt: now().ns + 10 * Millisecond,
+      url = "https://example.org",
+      created = now().ns,
+      hits = 0,
+      expiresAt = now().ns + 10 * Millisecond,
     },
   )
 
