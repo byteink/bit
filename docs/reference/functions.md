@@ -164,7 +164,7 @@ fn shortCode(n: int): string {
 fn main() {
   let links = map<string, Link>()
   let code = shortCode(12345)
-  links[code] = Link{ url: "https://example.com", created: 0, hits: 0 }
+  links[code] = Link{ url = "https://example.com", created = 0, hits = 0 }
 
   let l = links[code]
   println("${code} -> ${l.url} (hits=${l.hits})")
@@ -283,7 +283,7 @@ class LinkStats {
 }
 
 fn main() {
-  let l = LinkStats{ url: "https://example.com", created: 0, hits: 3 }
+  let l = LinkStats{ url = "https://example.com", created = 0, hits = 3 }
   println(l.describe())
   println(l.describe("short URL"))
 }

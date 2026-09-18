@@ -107,8 +107,8 @@ import { Json, JsonEntry, jsonAsObject } from "std/json"
 fn countKeys(): int {
   let obj = Json.JsonObject(
     []JsonEntry{
-      JsonEntry{ key: "a", value: Json.JsonInt(1) },
-      JsonEntry{ key: "a", value: Json.JsonInt(2) },
+      JsonEntry{ key = "a", value = Json.JsonInt(1) },
+      JsonEntry{ key = "a", value = Json.JsonInt(2) },
     },
   )
   match (jsonAsObject(obj)) {
@@ -176,8 +176,8 @@ import { Json, JsonEntry, jsonGet, jsonAsInt } from "std/json"
 fn lastWins(): i64 {
   let obj = Json.JsonObject(
     []JsonEntry{
-      JsonEntry{ key: "a", value: Json.JsonInt(1) },
-      JsonEntry{ key: "a", value: Json.JsonInt(2) },
+      JsonEntry{ key = "a", value = Json.JsonInt(1) },
+      JsonEntry{ key = "a", value = Json.JsonInt(2) },
     },
   )
   match (jsonGet(obj, "a")) {
@@ -233,8 +233,8 @@ import { Json, JsonEntry, jsonEncode, jsonEncodePretty } from "std/json"
 fn encodeExample(): string {
   let obj = Json.JsonObject(
     []JsonEntry{
-      JsonEntry{ key: "name", value: Json.JsonString("bit\n") },
-      JsonEntry{ key: "count", value: Json.JsonInt(2) },
+      JsonEntry{ key = "name", value = Json.JsonString("bit\n") },
+      JsonEntry{ key = "count", value = Json.JsonInt(2) },
     },
   )
   return jsonEncode(obj) + "\n" + jsonEncodePretty(obj, "  ")
