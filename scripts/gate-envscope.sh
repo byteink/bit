@@ -424,6 +424,13 @@ argvscope_floor_for_tree() {
 #     wiring it into a bucket would buy nothing and cost every stdlib and pkg
 #     diff the run. It scans both trees because a package's surface is compared
 #     against the stdlib it builds on, which is why it lands in two scopes.
+#   stdlib test-package-tags (#5597) — its sole stdlib-pattern hit is its
+#     default `envOr("BIT_STDLIB", "${repo}/stdlib")` (_tests_/bit/
+#     packagetagsgate.bit), the same fallback-path shape as test-pmvanity/
+#     test-pmimports/test-pmaddgit just above, not a scan of stdlib SOURCE
+#     for gating purposes: it builds a program against a PUBLISHED PACKAGE
+#     TAG (compiler/pmfetchresolve.bit's git fetch), so a stdlib-only diff
+#     cannot be what turns it red.
 #   compiler test-taskwords-sizing (#5087) — its sole compiler-pattern hit is
 #     `exists("${c}/compiler/codegen.bit")`, the repo-root-locator idiom
 #     _tests_/bit/threadtokenbytes.bit's own header cites as shared convention
@@ -442,6 +449,7 @@ argvscope_exempt_gate() {
   case "$1 $2" in
     'stdlib test-pmimports' | 'stdlib test-pmvanity' | 'stdlib test-pmaddgit') return 0 ;;
     'stdlib test-pmrangegate' | 'stdlib test-stdlib-rebuild') return 0 ;;
+    'stdlib test-package-tags') return 0 ;;
     'pkg test-package-${p}') return 0 ;;
     'stdlib test-package-surface-${p}') return 0 ;;
     'pkg test-package-surface-${p}') return 0 ;;

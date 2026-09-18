@@ -89,11 +89,23 @@ if [ -z "${composite}" ]; then
 fi
 while IFS= read -r composite; do
   [ -n "${composite}" ] || continue
-  denom=$((denom + 1))
   parents="$(composite_parents "${composite}")" || {
     echo "gate: assert_composite_is_superset: composite_buckets() names '${composite}' but composite_parents() has no arm for it — the two adjacent tables in scripts/gate-buildsteps.sh have diverged." >&2
     exit 2
   }
+  # #5595 fallout: "union" (#5594) is diff-shaped — composite_parents union
+  # reads union_touched_buckets(), the LIVE touched-area state, which is
+  # legitimately empty whenever this run's diff touches none of the five
+  # tracked areas (e.g. a testsbit-only diff — exactly what this ticket's
+  # own pmvanityhelpers/pmvanitymulti routing fix now reaches for the first
+  # time). Nothing to be a superset OF, and forcing BUCKET="${composite}"
+  # through build_steps_for_bucket() would assign BUILD_STEPS=() — a
+  # genuinely empty array, which this file's own bucket_scripts() header
+  # says never happens and bash 3.2 cannot even read back under `set -u`
+  # (reproduced directly: an empty `arr=()` assigned in a callee is
+  # "unbound" to the caller on this repo's bash). Skip rather than crash.
+  [ -n "${parents}" ] || continue
+  denom=$((denom + 1))
   BUCKET="${composite}"
   BUILD_STEPS=(__no_arm__)
   build_steps_for_bucket
@@ -226,8 +238,20 @@ fmt_gate_trees() {
 # deeper because that is the granularity every routing table here and in
 # scripts/gate-classify.sh uses. A `.bit` file at the repo root belongs to no
 # tree and is skipped — there are none, and one would resolve to `full` anyway.
+#
+# `:(exclude)_tests_/fuzz/crashes/**` (#5595) drops committed fuzzer
+# crash-repro artifacts (`hang-414710f0571de5ec.bit`, added at 0467fc2b,
+# #5348) from the query — a saved crash input, not a maintained source file,
+# and `bit fmt --check` has no gate to run over it and none should: unlike
+# `_tests_/bit`'s checker fixtures (deliberately invalid programs, but folded
+# under a tree `test-fmt-testsbit` already covers and tolerates being
+# unparseable), `_tests_/fuzz` has no fmt gate at all, so counting this one
+# artifact as its own "source tree" makes assert_fmt_gate_per_bucket() below
+# fail on every `scripts/gate.sh` run that reaches it. Scoped to `crashes/`
+# only, not the whole `_tests_/fuzz` tree, so a real `.bit` source added
+# elsewhere under `_tests_/fuzz` (none exist today) is still discovered.
 bit_source_trees() {
-  git ls-files '*.bit' |
+  git ls-files '*.bit' ':(exclude)_tests_/fuzz/crashes/**' |
     awk -F/ 'NF < 2 { next } { if ($1 == "_tests_") print $1 "/" $2; else print $1 }' |
     sort -u
 }
