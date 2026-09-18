@@ -1,0 +1,210 @@
+// pkg/toml's side of the parse-throughput comparison against BurntSushi/toml
+// and go-toml/v2 (#5488). ../burntsushi and ../gotoml implement the exact
+// same two modes so run.sh can drive all three identically.
+//
+//   bitbench parse <file>      read + parse once, print "entries=<N>"
+//   bitbench checksum <file>   read + parse once, print "entries=<N> hash=<H>"
+//
+// TWO MODES, NOT ONE, because hashing walks and sorts the whole tree on top
+// of the parse itself — folding that into every timed run would measure
+// parse+hash throughput, not parse throughput. `checksum` runs once per side
+// before any timing to prove the three parsers agree; `parse` is what
+// run.sh's 15 timed invocations actually run, and still consumes the parsed
+// value (an entry count) so the optimizer cannot discard the parse as dead.
+//
+// THE CHECKSUM ITSELF is CRC-32C (std/hash), chained with crc32cUpdate over
+// a canonical byte stream built by walking the parsed document: table
+// entries sorted by key (both BurntSushi/toml and go-toml/v2 decode a table
+// into a Go map, which has no defined iteration order — sorting is the only
+// order the three sides can agree on), arrays left in source order (a Go
+// slice keeps it), and every temporal value folded as its own YYYY-MM-DD /
+// HH:MM:SS.nnnnnnnn components rather than a library's own toString, so a
+// formatting difference between three independent time libraries can never
+// register as a checksum mismatch. TomlFloat is untagged ("F;", no payload)
+// rather than folding the f64 bit pattern: this fixture (data/fixture.toml)
+// deliberately carries no float literals, because pkg/toml's own decimal
+// decoder is not yet correctly rounded (#5514, excluded from the toml-test
+// corpus for the same reason) and a benchmark fixture is not the place to
+// re-discover that bug.
+import { readFile } from "std/fs"
+import { args } from "std/os"
+import { crc32cUpdate } from "std/hash"
+import { DateTime, NaiveDateTime, Date, Time } from "std/time"
+import { Toml, TomlEntry, tomlParse } from "toml"
+
+// Zero-padded decimal, `width` digits. `n` is always a non-negative calendar
+// field here (year/month/day/hour/minute/second/nanosecond), so no sign case.
+fn pad(n: i64, width: i64): string {
+  let s = "${n}"
+  while (len(s) < width) {
+    s = "0" + s
+  }
+  return s
+}
+
+fn canonDate(d: Date): string {
+  return pad(d.year(), 4) + "-" + pad(d.month(), 2) + "-" + pad(d.day(), 2)
+}
+
+fn canonTime(t: Time): string {
+  return pad(t.hour(), 2) +
+    ":" +
+    pad(t.minute(), 2) +
+    ":" +
+    pad(t.second(), 2) +
+    "." +
+    pad(t.nanosecond(), 9)
+}
+
+fn canonNaive(n: NaiveDateTime): string {
+  return canonDate(n.date()) + "T" + canonTime(n.time())
+}
+
+// Seconds-east-of-UTC offset, "+HH:MM" / "-HH:MM" — never the library's own
+// zone name or DST rendering, so this depends only on the byte offset the
+// TOML source spelled.
+fn canonOffset(dt: DateTime): string {
+  let base = canonDate(dt.date()) + "T" + canonTime(dt.time())
+  let off = dt.offset()
+  let sign = "+"
+  let mag = off
+  if (off < 0) {
+    sign = "-"
+    mag = 0 - off
+  }
+  let hh = mag / 3600
+  let mm = mag % 3600 / 60
+  return base + sign + pad(hh, 2) + ":" + pad(mm, 2)
+}
+
+fn foldStr(seed: u32, s: string): u32 {
+  return crc32cUpdate(seed, []byte(s))
+}
+
+// Number of key/value pairs in the whole tree — every `TomlEntry` visited,
+// at any depth. Cheap (no sort, no string building), so `parse` mode can
+// print it on every timed run without skewing the parse-throughput number.
+fn countEntries(v: Toml): i64 {
+  match (v) {
+    TomlTable(entries) => {
+      let n = len(entries)
+      let i = 0
+      let total = n
+      while (i < n) {
+        total = total + countEntries(entries[i].value)
+        i = i + 1
+      }
+      return total
+    }
+    TomlArray(items) => {
+      let total = 0
+      let i = 0
+      while (i < len(items)) {
+        total = total + countEntries(items[i])
+        i = i + 1
+      }
+      return total
+    }
+    _ => { return 0 }
+  }
+}
+
+// `std/sort`'s generic `sorted<T>` allocates a zeroed `[]T(n)` scratch slice
+// internally, and `Toml`'s first variant carries a payload (SPEC 13.4:
+// "a payload-carrying enum's declaration-order first variant has no zero
+// value"), so `TomlEntry` — which embeds a `Toml` — has none either. A
+// hand-rolled insertion sort over a plain `append`-built copy never
+// allocates a zeroed element, only moves existing ones, so it sidesteps
+// that entirely. Tables in this fixture fan out to at most a handful of
+// keys, so O(n^2) costs nothing here.
+fn sortEntriesByKey(entries: []TomlEntry): []TomlEntry {
+  let out = []TomlEntry(0)
+  let i = 0
+  while (i < len(entries)) {
+    out = append(out, entries[i])
+    i = i + 1
+  }
+  let j = 1
+  while (j < len(out)) {
+    let cur = out[j]
+    let k = j - 1
+    while (k >= 0 && cur.key < out[k].key) {
+      out[k + 1] = out[k]
+      k = k - 1
+    }
+    out[k + 1] = cur
+    j = j + 1
+  }
+  return out
+}
+
+fn hashTable(seed: u32, entries: []TomlEntry): u32 {
+  let ordered = sortEntriesByKey(entries)
+  let h = foldStr(seed, "T${len(ordered)}:")
+  let i = 0
+  while (i < len(ordered)) {
+    let e = ordered[i]
+    h = foldStr(h, "K${len(e.key)}:" + e.key + "=")
+    h = hashValue(h, e.value)
+    i = i + 1
+  }
+  return foldStr(h, "}")
+}
+
+fn hashArray(seed: u32, items: []Toml): u32 {
+  let h = foldStr(seed, "A${len(items)}:")
+  let i = 0
+  while (i < len(items)) {
+    h = hashValue(h, items[i])
+    i = i + 1
+  }
+  return foldStr(h, "]")
+}
+
+// Split three ways (SPEC LINT.md's complexity ceiling: a single match with
+// all ten `Toml` variants scores 12 against E0204's limit of 10):
+// containers and the four temporal variants here (each needs its own
+// canonicalizer, so folding them into a `_` arm gains nothing), the four
+// scalar variants in `hashScalar` below.
+fn hashValue(seed: u32, v: Toml): u32 {
+  match (v) {
+    TomlTable(entries) => { return hashTable(seed, entries) }
+    TomlArray(items) => { return hashArray(seed, items) }
+    TomlOffsetDateTime(dt) => { return foldStr(seed, "O" + canonOffset(dt) + ";") }
+    TomlLocalDateTime(dt) => { return foldStr(seed, "N" + canonNaive(dt) + ";") }
+    TomlLocalDate(d) => { return foldStr(seed, "D" + canonDate(d) + ";") }
+    TomlLocalTime(t) => { return foldStr(seed, "M" + canonTime(t) + ";") }
+    _ => { return hashScalar(seed, v) }
+  }
+}
+
+// The four scalar variants. The trailing `_` covers every variant handled
+// above, unreachable here since `hashValue` never calls this with one, but
+// still required for match exhaustiveness (SPEC 13.8).
+fn hashScalar(seed: u32, v: Toml): u32 {
+  match (v) {
+    TomlString(s) => { return foldStr(seed, "S${len(s)}:" + s) }
+    TomlInt(n) => { return foldStr(seed, "I${n};") }
+    TomlFloat(_) => { return foldStr(seed, "F;") }
+    TomlBool(b) => { return foldStr(seed, b ? "Bt;" : "Bf;") }
+    _ => { return seed }
+  }
+}
+
+fn main(): ()! {
+  let a = args()
+  if (len(a) < 3) {
+    fail newError("usage: bitbench <parse|checksum> <file.toml>")
+  }
+  let mode = a[1]
+  let path = a[2]
+  let src = readFile(path)?
+  let doc = tomlParse(src)?
+  let n = countEntries(doc)
+  if (mode == "checksum") {
+    let h = hashValue(0, doc)
+    println("entries=${n} hash=${h}")
+    return
+  }
+  println("entries=${n}")
+}
