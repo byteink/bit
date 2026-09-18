@@ -229,6 +229,66 @@ import { heapClassAnchor } from "../alloc"
   return table + i * 8
 }
 
+// #5584: THE SPAN-PRESENCE CACHE in front of ONE query -- `gcOwns`'
+// (`./gcalloc.bit`) "is the 2^17-aligned span this address falls in currently
+// carved?", once per traced reference, and through `idxContains` below 10.91%
+// of a `pkg/yaml` parse's self time over 77,432,288 calls: 22.8 cycles for a
+// 43-instruction hit, IPC 1.89 against the program's 5.35. Not the
+// instructions -- `idxHash`'s serial multiplies feed a load whose ADDRESS they
+// compute, so a mix latency plus a scattered table load sit on every call's
+// dependent chain (#5571 is the opposite regime one level down, where
+// shortening the path COST time). A hit is a shift, a mask and one 4 KiB load.
+//
+// POSITIVE ANSWERS ONLY, INVALIDATED EXACTLY. A stale NEGATIVE would drop a
+// live object; a stale POSITIVE would let `allocSpanClass` dereference an
+// unmapped span. An entry is written only where `idxContains` answered TRUE,
+// and a positive for span S lives in exactly one slot, `(S >> 17) & mask`,
+// tagged with S -- so clearing that one slot in `idxRemoveSpan`, the one site
+// that turns a presence answer false, clears every answer for S. The other
+// three mutation points owe nothing: `idxInsertSpan` only turns
+// false into true (negatives are never cached), `idxGrow` zeroes the region
+// below before publishing it, and `idxDisable` zeroes `gcIndexCap`, which
+// readers return on. STORAGE IS THE TABLE'S OWN TAIL, NOT NEW STATE (`gcWords`
+// is 39, boot-pinned): allocated, zeroed, reclaimed and abandoned with the
+// table, at `gcIndexAddr + gcIndexCap * 8`.
+const idxSpanCacheSlots: int = 512
+const idxSpanCacheMask: int = 511
+// `1 << idxSpanShift == allocSpanBytes` (`../alloc/alloc.bit`, 131072). Only
+// the DISTRIBUTION depends on it: the tag compare is exact for any index
+// function, so drift costs hit rate, not correctness.
+const idxSpanShift: int = 17
+
+// Bytes for a table of `ncap` slots: the table plus its cache. 0 for the empty
+// table, so `idxReclaimRetired` protects nothing for an absent spare.
+@nosplit fn idxTableBytes(ncap: int): int {
+  if (ncap == 0) {
+    return 0
+  }
+  return (ncap + idxSpanCacheSlots) * 8
+}
+
+@nosplit fn idxSpanCacheSlotAddr(g: *i64, ncap: int, span: int): int {
+  return idxSlotAddr(*(g + gcIndexAddr), ncap + ((span >> idxSpanShift) & idxSpanCacheMask))
+}
+
+// `gcOwns`' span-presence query, identical in ANSWER to
+// `idxContains(g, span + 1)`, which it still calls on a miss.
+@nosplit fn idxSpanPresent(g: *i64, span: int): bool {
+  let ncap = *(g + gcIndexCap)
+  if (ncap == 0) {
+    return false
+  }
+  let slot = idxSpanCacheSlotAddr(g, ncap, span)
+  if (loadWord(slot) == span) {
+    return true
+  }
+  if (!idxContains(g, span + 1)) {
+    return false
+  }
+  storeWord(slot, span)
+  return true
+}
+
 // True if `addr` is present. Probes until an empty slot, which terminates
 // because the load factor is held below 100%. Bounded by `ncap` regardless.
 //
@@ -366,15 +426,18 @@ import { heapClassAnchor } from "../alloc"
     // `reserveGrow`, not `reserveTake`: the index scales with the live object
     // count, so a fixed reserve silently disables it on a large heap and drops
     // `owns` back to the O(objects) linear scan (#1638).
-    newTable = reserveGrow(g + gcIdxRes, newCap * 8)
+    newTable = reserveGrow(g + gcIdxRes, idxTableBytes(newCap))
   }
   if (newTable == 0) {
     idxDisable(g)
     return false
   }
-  // Zero the fresh table: every slot must read `idxEmpty`.
+  // Zero the fresh table: every slot must read `idxEmpty`. The #5584 span
+  // cache is the tail of the same allocation and is zeroed with it -- an
+  // unzeroed tag word would be a stale POSITIVE, the one failure that
+  // dereferences an unmapped span.
   let i = 0
-  while (i < newCap) {
+  while (i < newCap + idxSpanCacheSlots) {
     storeWord(idxSlotAddr(newTable, i), idxEmpty)
     i = i + 1
   }
@@ -428,9 +491,9 @@ import { heapClassAnchor } from "../alloc"
   let _ = reserveReclaimChunks(
     g + gcIdxRes,
     newTable,
-    newCap * 8,
+    idxTableBytes(newCap),
     *(g + gcIdxSpareAddr),
-    *(g + gcIdxSpareCap) * 8,
+    idxTableBytes(*(g + gcIdxSpareCap)),
   )
 }
 
@@ -609,6 +672,16 @@ import { heapClassAnchor } from "../alloc"
 @nosplit fn idxRemoveSpan(g: *i64, spanAddr: int) {
   spinAcquire(lockPtr(g))
   idxRemove(g, spanAddr + 1)
+  // #5584: drop any cached positive for this span, under the same lock and at
+  // the only site that owes one. Exactly one slot can hold it, tagged with the
+  // span itself, so clearing that slot clears every answer for `spanAddr`.
+  let ncap = *(g + gcIndexCap)
+  if (ncap != 0) {
+    let slot = idxSpanCacheSlotAddr(g, ncap, spanAddr)
+    if (loadWord(slot) == spanAddr) {
+      storeWord(slot, idxEmpty)
+    }
+  }
   spinRelease(lockPtr(g))
 }
 
