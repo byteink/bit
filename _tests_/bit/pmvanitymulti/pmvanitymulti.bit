@@ -1,0 +1,291 @@
+// _tests_/bit/pmvanitymulti — the #5586 multi-package-per-commit scenario,
+// split out of `_tests_/bit/pmvanity.bit` under #5593 (spec/LINT.md:186's
+// 800-line E0200 limit; #5586 took pmvanity.bit from 669 to 864). A pure
+// move: every declaration below is unchanged from what pmvanity.bit carried,
+// except `addMultiPkg`'s seven parameters, bundled into `MultiAddCtx` to
+// clear spec/LINT.md's five-parameter E0202 ceiling (the same reasoning
+// `pmvanityhelpers.bit`'s `CliEnv`/`FixtureCtx` already follow: past five,
+// the arguments want to be a class).
+//
+// A real directory module, imported via a relative path
+// (`import { ... } from "../pmvanityhelpers"`) — `compiler/project.bit`'s
+// `isRelativeImportPath` resolves `../x` against the importing module's own
+// directory exactly like `./x`, so this module reaches its sibling
+// `_tests_/bit/pmvanityhelpers/` the same way `pmvanity.bit` does.
+// `_tests_/bit/pmvanity.bit` is invoked directly by `tools/build/gates.bit`'s
+// `test-pmvanity` gate as a single file (`bit run _tests_/bit/pmvanity.bit`),
+// which loads it as a module of exactly that one file (SPEC §17.1) — it
+// cannot see a bare sibling `.bit` file in the same directory, only a real
+// subdirectory reached through an explicit import. This file is that
+// subdirectory; `pmvanity.bit` reaches it as `./pmvanitymulti`.
+import { readFile, writeFile } from "std/fs"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import {
+  Capture, CliEnv, fatal, isFullSha, mkdirp, mustSucceed, rcGitAbsent, rmrf,
+  runBitCli, shQuote, startVanityServer, trimEol,
+} from "../pmvanityhelpers"
+
+// One package's own identity within the shared #5586 monorepo fixture:
+// its vanity name, the `dir` field naming its own subdirectory, and the
+// exported function its module carries (distinct per package, so a run
+// that silently read a SIBLING'S subdirectory would print the wrong text
+// rather than pass by accident).
+class MultiPkg { key: string, vanityName: string, dir: string, fnName: string }
+
+// The git remote every #5586 fixture package shares, and the shared tag
+// each package's own `<key>/` namespace is built from (#4472's
+// `vanityTagPrefix`). `multiTagWritten` is #2367's canonicalisation of the
+// `v`-prefixed `multiTag` typed on the command line.
+const multiGitRemoteUrl: string = "https://git.pmvanitymulti.invalid/acme/monorepo.git"
+const multiTag: string = "v1.0.0"
+const multiTagWritten: string = "1.0.0" // #2367 canonicalisation of "v1.0.0"
+
+fn multiPkgs(): []MultiPkg {
+  return [
+    MultiPkg{
+      key: "alpha",
+      vanityName: "pmvanitymulti.invalid/pkg/alpha",
+      dir: "pkg/alpha",
+      fnName: "alphaGreet",
+    },
+    MultiPkg{
+      key: "beta",
+      vanityName: "pmvanitymulti.invalid/pkg/beta",
+      dir: "pkg/beta",
+      fnName: "betaGreet",
+    },
+    MultiPkg{
+      key: "gamma",
+      vanityName: "pmvanitymulti.invalid/pkg/gamma",
+      dir: "pkg/gamma",
+      fnName: "gammaGreet",
+    },
+  ]
+}
+
+// Builds the fixture repo, adds `multiPkgs()` to one fresh project + one
+// freshly cleared cache in exactly the order `order` (a permutation of
+// `[0, 1, 2]`) names, then proves a program importing all three runs. Each
+// call gets its own uuid-named scratch root, so two calls with different
+// `order`s never share a cache — the "cleared cache" half of #5586's
+// acceptance.
+export fn runMultiPkgOrder(bitExe: string, stdRoot: string, order: []int) {
+  let name = "vanity-add-same-commit-multi"
+  let pkgs = multiPkgs()
+  let root = "/tmp/bit-pmvanitymulti-" + uuidFormat(uuidV4())
+  let srcDir = root + "/fixture-repo"
+
+  let i = 0
+  while (i < len(pkgs)) {
+    let modDir = srcDir + "/" + pkgs[i].dir
+    mkdirp(name, modDir)
+    writeFile(
+      modDir + "/" + pkgs[i].key + ".bit",
+      "export fn ${pkgs[i].fnName}(): string {\n  return \"hi from ${pkgs[i].key}\\n\"\n}\n",
+    ) catch e {
+      fatal(name, "cannot write the fixture module for ${pkgs[i].key}: " + e.message())
+    }
+    i = i + 1
+  }
+
+  let fixtureHome = root + "/fixture-home"
+  mkdirp(name, fixtureHome)
+  let noConfigPath = root + "/git-noconfig"
+  writeFile(noConfigPath, "") catch e {
+    fatal(name, "cannot write the git isolation config: " + e.message())
+  }
+  let sha = buildMultiFixtureRepo(name, root, srcDir, fixtureHome, noConfigPath)
+
+  let rewriteConfigPath = root + "/git-rewrite-multi-config"
+  writeFile(rewriteConfigPath, "[url \"file://${srcDir}\"]\n\tinsteadOf = ${multiGitRemoteUrl}\n") catch e {
+    fatal(name, "cannot write the git insteadOf config: " + e.message())
+  }
+
+  let projDir = root + "/proj"
+  mkdirp(name, projDir)
+  writeFile(projDir + "/bit.json", "{}\n") catch e {
+    fatal(name, "cannot write bit.json: " + e.message())
+  }
+
+  let cacheRoot = root + "/cache"
+  let addHome = root + "/add-home"
+  mkdirp(name, addHome)
+  let cliEnv = CliEnv{ bitExe: bitExe, stdRoot: stdRoot, pkgCache: cacheRoot, projDir: projDir }
+  let addCtx = MultiAddCtx{
+    root: root,
+    rewriteConfigPath: rewriteConfigPath,
+    addHome: addHome,
+    sha: sha,
+  }
+
+  let j = 0
+  while (j < len(order)) {
+    addMultiPkg(name, cliEnv, addCtx, pkgs[order[j]])
+    j = j + 1
+  }
+
+  checkMultiPkgUsage(name, cliEnv, root, pkgs)
+  rmrf(root)
+}
+
+// The fixture/environment state one `addMultiPkg` call needs beyond
+// `cliEnv`/`pkg`, bundled into one value rather than four separate
+// positional parameters — `addMultiPkg` was at seven params before this
+// split (spec/LINT.md's own E0202 guidance: past five, "the arguments want
+// to be a class", the same reasoning `pmvanityhelpers.bit`'s `CliEnv`
+// follows). Built once per `runMultiPkgOrder` call and passed unchanged to
+// every package it adds — only `pkg` varies per call.
+class MultiAddCtx { root: string, rewriteConfigPath: string, addHome: string, sha: string }
+
+// `bit add`s a single #5586 fixture package into the already-created
+// `cliEnv.projDir`/`cliEnv.pkgCache` — the SAME cache every call in one
+// `runMultiPkgOrder` invocation shares, so the second and third calls are
+// exactly the "does a sibling package at the same commit already occupy
+// this cache entry" case #5586 is about.
+fn addMultiPkg(name: string, cliEnv: CliEnv, ctx: MultiAddCtx, pkg: MultiPkg) {
+  let doc = "bit-import: ${pkg.vanityName} git ${multiGitRemoteUrl} dir ${pkg.dir}\n"
+  let (srv, port) = startVanityServer(name, doc)
+  let addEnv = [
+    "BIT_VANITY_ORIGIN=http://127.0.0.1:${port}",
+    "GIT_CONFIG_GLOBAL=" + ctx.rewriteConfigPath,
+    "GIT_CONFIG_SYSTEM=/dev/null",
+    "HOME=" + ctx.addHome,
+  ]
+  let addResult = runBitCli(
+    name, cliEnv, addEnv, ["add", "${pkg.vanityName}@${multiTag}"],
+    Capture{ outPath: ctx.root + "/add-${pkg.key}.out", errPath: ctx.root + "/add-${pkg.key}.err" },
+  )
+  srv.close()
+
+  if (addResult.code != 0) {
+    fatal(
+      name,
+      "`bit add ${pkg.vanityName}@${multiTag}` exited ${addResult.code}, want 0 -- a sibling package already fetched at this commit must never make this fail with a missing-dir error (#5586)\n  stdout: ${addResult.stdout}  stderr: ${addResult.stderr}",
+    )
+  }
+  let expectedAddStdout = "bit add: ${pkg.key} -> ${pkg.vanityName}@${multiTagWritten} (${ctx.sha})\n"
+  if (addResult.stdout != expectedAddStdout) {
+    fatal(
+      name,
+      "bit add stdout for ${pkg.key} was '${addResult.stdout}', want exactly '${expectedAddStdout}'\n  stderr: ${addResult.stderr}",
+    )
+  }
+}
+
+// Writes a program importing every #5586 fixture package and runs it —
+// proving all of them, fetched from the same repo at the same commit,
+// actually resolve together in one project. `want` is built from the SAME
+// per-package strings `addMultiPkg`'s own fixture modules print, so a run
+// that silently read one package's SIBLING subdirectory would produce a
+// visibly different, still-checked, stdout rather than pass unnoticed.
+fn checkMultiPkgUsage(name: string, cliEnv: CliEnv, root: string, pkgs: []MultiPkg) {
+  let program = ""
+  let want = ""
+  let i = 0
+  while (i < len(pkgs)) {
+    program = program + "import { ${pkgs[i].fnName} } from \"${pkgs[i].key}\"\n"
+    want = want + "hi from ${pkgs[i].key}\n"
+    i = i + 1
+  }
+  program = program + "fn main() {\n"
+  let j = 0
+  while (j < len(pkgs)) {
+    program = program + "  print(${pkgs[j].fnName}())\n"
+    j = j + 1
+  }
+  program = program + "}\n"
+  writeFile(cliEnv.projDir + "/main.bit", program) catch e {
+    fatal(name, "cannot write main.bit: " + e.message())
+  }
+
+  let runResult = runBitCli(
+    name, cliEnv, []string(0),
+    ["run", "main.bit"], Capture{ outPath: root + "/run.out", errPath: root + "/run.err" },
+  )
+  if (runResult.code != 0) {
+    fatal(
+      name,
+      "`bit run main.bit` exited ${runResult.code}, want 0 -- every #5586 fixture package must resolve together\n  stdout: ${runResult.stdout}  stderr: ${runResult.stderr}",
+    )
+  }
+  if (runResult.stdout != want) {
+    fatal(
+      name,
+      "bit run stdout was '${runResult.stdout}', want exactly '${want}'\n  stderr: ${runResult.stderr}",
+    )
+  }
+}
+
+// One commit carrying every #5586 fixture package's subdirectory (`git add
+// -A .`, since there is more than one path to commit), tagged once per
+// package in ITS OWN `<key>/v1.0.0` namespace (#4472's `vanityTagPrefix`:
+// a `dir`-carrying document's versions live in `<key>/vX.Y.Z`, never the
+// bare namespace) — every package here shares the commit but not the tag.
+// Returns the tagged commit's own 40-hex sha.
+fn buildMultiFixtureRepo(
+  name: string,
+  root: string,
+  srcDir: string,
+  fixtureHome: string,
+  noConfigPath: string,
+): string {
+  let shaPath = root + "/fixture-head"
+  let q = shQuote(srcDir)
+  let setup = "set -e\n" +
+    "command -v git > /dev/null 2>&1 || exit ${rcGitAbsent}\n" +
+    "export HOME=" +
+    shQuote(fixtureHome) +
+    "\n" +
+    "export GIT_CONFIG_GLOBAL=" +
+    shQuote(noConfigPath) +
+    "\n" +
+    "export GIT_CONFIG_SYSTEM=/dev/null\n" +
+    "git init --quiet -b main " +
+    q +
+    "\n" +
+    "git -C " +
+    q +
+    " config user.email " +
+    shQuote("pmvanitymulti@example.com") +
+    "\n" +
+    "git -C " +
+    q +
+    " config user.name " +
+    shQuote("pmvanitymulti fixture") +
+    "\n" +
+    "git -C " +
+    q +
+    " add -A .\n" +
+    "git -C " +
+    q +
+    " commit --quiet --no-gpg-sign -m " +
+    shQuote("multi-package monorepo fixture") +
+    "\n"
+  let pkgs = multiPkgs()
+  let i = 0
+  while (i < len(pkgs)) {
+    let nsTag = "${pkgs[i].key}/${multiTag}"
+    setup = setup +
+      "git -C " +
+      q +
+      " tag -a " +
+      shQuote(nsTag) +
+      " --no-sign -m " +
+      shQuote(nsTag) +
+      "\n"
+    i = i + 1
+  }
+  setup = setup + "git -C " + q + " rev-parse HEAD > " + shQuote(shaPath) + "\n"
+  mustSucceed(name, "git fixture repo (multi-pkg)", setup)
+
+  let sha = trimEol(
+    readFile(shaPath) catch e {
+      fatal(name, "cannot read the fixture HEAD: " + e.message())
+      ""
+    },
+  )
+  if (!isFullSha(sha)) {
+    fatal(name, "fixture HEAD is not a 40-hex commit sha: '${sha}'")
+  }
+  return sha
+}
