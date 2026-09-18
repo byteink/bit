@@ -89,11 +89,23 @@ if [ -z "${composite}" ]; then
 fi
 while IFS= read -r composite; do
   [ -n "${composite}" ] || continue
-  denom=$((denom + 1))
   parents="$(composite_parents "${composite}")" || {
     echo "gate: assert_composite_is_superset: composite_buckets() names '${composite}' but composite_parents() has no arm for it — the two adjacent tables in scripts/gate-buildsteps.sh have diverged." >&2
     exit 2
   }
+  # #5595 fallout: "union" (#5594) is diff-shaped — composite_parents union
+  # reads union_touched_buckets(), the LIVE touched-area state, which is
+  # legitimately empty whenever this run's diff touches none of the five
+  # tracked areas (e.g. a testsbit-only diff — exactly what this ticket's
+  # own pmvanityhelpers/pmvanitymulti routing fix now reaches for the first
+  # time). Nothing to be a superset OF, and forcing BUCKET="${composite}"
+  # through build_steps_for_bucket() would assign BUILD_STEPS=() — a
+  # genuinely empty array, which this file's own bucket_scripts() header
+  # says never happens and bash 3.2 cannot even read back under `set -u`
+  # (reproduced directly: an empty `arr=()` assigned in a callee is
+  # "unbound" to the caller on this repo's bash). Skip rather than crash.
+  [ -n "${parents}" ] || continue
+  denom=$((denom + 1))
   BUCKET="${composite}"
   BUILD_STEPS=(__no_arm__)
   build_steps_for_bucket
