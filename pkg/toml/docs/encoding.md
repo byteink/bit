@@ -17,8 +17,8 @@ import { Toml, TomlEntry, tomlEncode } from "toml"
 fn main(): ()! {
   let doc = Toml.TomlTable(
     [
-      TomlEntry{ key: "name", value: Toml.TomlString("waypoint") },
-      TomlEntry{ key: "version", value: Toml.TomlString("1.4.2") },
+      TomlEntry{ key = "name", value = Toml.TomlString("waypoint") },
+      TomlEntry{ key = "version", value = Toml.TomlString("1.4.2") },
     ],
   )
   print(tomlEncode(doc)?)
@@ -48,7 +48,7 @@ fn withEntry(entries: []TomlEntry, key: string, value: Toml): []TomlEntry {
   let out = []TomlEntry(0, len(entries))
   for e of entries {
     if (e.key == key) {
-      out = append(out, TomlEntry{ key: key, value: value })
+      out = append(out, TomlEntry{ key = key, value = value })
     } else {
       out = append(out, e)
     }

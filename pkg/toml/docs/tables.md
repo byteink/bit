@@ -94,7 +94,7 @@ fn routes(server: []TomlEntry): []Route! {
     let t = unwrap(tomlAsTable(item))
     let path = unwrap(tomlAsString(field(t, "path")?))
     let handler = unwrap(tomlAsString(field(t, "handler")?))
-    out = append(out, Route{ path: path, handler: handler })
+    out = append(out, Route{ path = path, handler = handler })
   }
   return out
 }

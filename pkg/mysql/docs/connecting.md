@@ -20,7 +20,7 @@ import { pool, Datasource, Pool, Value } from "std/sql"
 import { adapter } from "mysql"
 
 fn firstRow(url: string): Value! {
-  let db = pool(adapter(), Datasource{ uri: url })?
+  let db = pool(adapter(), Datasource{ uri = url })?
   defer db.close()
   let rows = db.query("select 1", []Value(0))?
   defer rows.close()
@@ -43,7 +43,7 @@ Both schemes are accepted, and so is the individual-field form of
 ```
 mysql://app:pw@localhost:3306/dev
 mariadb://app:pw@db.internal/erp?ssl-mode=VERIFY_IDENTITY
-Datasource{ host: "localhost", user: "app", database: "dev" }
+Datasource{ host = "localhost", user = "app", database = "dev" }
 ```
 
 `uri` and the individual fields are mutually exclusive - `Datasource.validate`
