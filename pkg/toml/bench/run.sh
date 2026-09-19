@@ -24,7 +24,29 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)      # pkg/toml/bench
 PKG=$(cd "$HERE/.." && pwd)              # pkg/toml
 REPO=$(cd "$HERE/../../.." && pwd)       # repo root
-BIT=${BIT:-$REPO/bit-out/bin/bit}
+BIT=${BIT:-$(command -v bit || true)}
+# The RELEASED toolchain, not this checkout's ./bit-out/bin/bit. A package
+# bench is a published claim about software a user installs, and that user has
+# the release - so the release is what the table has to measure. The repo's own
+# bench/run.sh is the opposite case and correctly builds from the tree: it
+# measures the language being tagged. pkg/web/bench/remote.sh already works this
+# way, pinning a ghcr image (#5623). Set BIT= to measure a dev build on purpose.
+if [ -z "${BIT}" ]; then
+  echo "bench: no 'bit' on PATH. Install the release (brew install byteink/tap/bit)" >&2
+  echo "       or set BIT=<path> to measure a specific compiler." >&2
+  exit 1
+fi
+# A dev build reports 0.1.0-dev, a hardcoded placeholder ./make never stamps.
+# Publishing that against pinned competitor versions is what #5658 fixed; refuse
+# rather than let it reach the table again.
+_bitver=$("$BIT" --version 2>&1 | head -1)
+case "${_bitver}" in
+  *-dev*)
+    echo "bench: ${BIT} reports '${_bitver}' - a development build." >&2
+    echo "       The published table must name a release. Use the released bit," >&2
+    echo "       or set BIT= deliberately and do not commit the result." >&2
+    exit 1 ;;
+esac
 # Same env var name and same default tag as pkg/yaml/bench/run.sh (#5559):
 # two sibling harnesses publishing Go-comparison numbers on two different Go
 # toolchains cannot be read against each other.
