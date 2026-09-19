@@ -43,7 +43,7 @@ cpu_hi() { cpu_list | cut -d- -f2; }
 SERVER_CPUS=${BENCH_SERVER_CPUS:-$(cpu_lo)-$(( $(cpu_hi) - 2 ))}
 LOAD_CPUS=${BENCH_LOAD_CPUS:-$(( $(cpu_hi) - 1 ))-$(cpu_hi)}
 
-BIT_IMAGE=ghcr.io/byteink/bit:0.19.0
+BIT_IMAGE=${BENCH_BIT_IMAGE:-ghcr.io/byteink/bit:0.19.0}
 OHA_IMAGE=ghcr.io/hatoo/oha:latest
 
 # name:port:image:workdir:command. Ports are distinct so all six stay up for
@@ -352,7 +352,7 @@ record_env() {
 
 versions() {
   {
-    say "bit $(docker run --rm "$BIT_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}')"
+    say "bit $BIT_IMAGE ($(docker run --rm "$BIT_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}'))"
     say "gin $(grep -m1 'gin-gonic/gin' "$ROOT/apps/gin/go.mod" | awk '{print $NF}')"
     say "go $(docker run --rm golang:1-alpine go version | awk '{print $3}')"
     say "express $(docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
