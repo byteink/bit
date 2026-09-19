@@ -2,7 +2,7 @@
 
 An ORM for `std/sql`, built on `@table` (SPEC section 10.5's class attribute)
 and the descriptor it synthesizes. This package is under active development
-(epic #5050); today it exports `Data`, the interface every ORM function is
+today it exports `Data`, the interface every ORM function is
 written against instead of a concrete `Pool`, the name mapping from a Bit
 field to its SQL table and column, the schema builder that declares tables,
 columns, indexes and foreign keys as an intent tree for a dialect to
@@ -130,12 +130,12 @@ KEY UPDATE`, `attach`/`sync`'s idempotent insert, `forUpdate`'s
 `SKIP LOCKED` (which needs the real MySQL version, not just the engine),
 and the migration runner's advisory lock.
 
-They stay separate types (#5325, #5384) because folding the value into the
+They stay separate types because folding the value into the
 interface would make every `upsert` caller hand it a full `Dialect`
 implementation to express a syntax choice, and because a `Dialect` renders
 DDL while a `ServerDialect` renders nothing at all.
 
-`ServerDialect` replaced two narrower types in #5384: `UpsertDialect`, a
+`ServerDialect` replaced two narrower types: `UpsertDialect`, a
 bare engine tag, and `LockDialect`, which carried a version. The richer
 shape won because a tag cannot answer a version question - and with it went
 `LockDialect.Neutral`, whose meaning was "trust me, this MySQL is 8.0 or

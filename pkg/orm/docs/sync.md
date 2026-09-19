@@ -79,8 +79,8 @@ instead of printed.
 ```text
 pkg/orm: sync: refusing - schema_history has 3 row(s); this database is
 under migration control and applying a computed diff on top of a reviewed
-history would make it a lie. Use 'generate' (#5067) to write a migration
-and 'up' (#5068) to apply it instead
+history would make it a lie. Use 'generate' to write a migration
+and 'up' to apply it instead
 ```
 
 Before touching a single table, `syncSchema` checks whether `schema_history`

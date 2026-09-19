@@ -203,7 +203,7 @@ pick one answer to "what happens when the row is already locked," not both.
 
 ### SKIP LOCKED and NOWAIT need MySQL 8.0
 
-Nothing reaching `Data` carries a server version (#5384 settled this: `Data`
+Nothing reaching `Data` carries a server version, by design (`Data`
 stays a bare alias to `Executor`, never a wrapper this package would have to
 populate), so `forUpdate`'s third argument, `dialect: ServerDialect`, is how
 you supply it - `ServerDialect.Postgres` (every example above uses this;
@@ -240,7 +240,7 @@ reaches the driver:
 pkg/orm: MySQL 5.7 does not support FOR UPDATE SKIP LOCKED (added in MySQL 8.0); omit skipLocked or upgrade the server
 ```
 
-This is a behavior change from an earlier version of `forUpdate` (#5384):
+This is a behavior change from an earlier version of `forUpdate`:
 that version let a MySQL caller pass a dialect tag that meant "trust me,
 this server is 8.0 or newer" and skipped the check entirely - asserting a
 fact about the server with no evidence behind it. That tag is gone.

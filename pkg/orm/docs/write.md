@@ -156,7 +156,7 @@ identifier. Omit it and `upsert` uses the primary key.
 
 A MySQL call here has to supply a `MysqlVersion` on `ServerDialect.Mysql`
 that `upsert` never reads - `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` is a
-syntax choice, not a version-gated one. `ServerDialect` (#5384) is the one
+syntax choice, not a version-gated one. `ServerDialect` is the one
 type every dialect-sensitive function in this package takes now, replacing
 an earlier, narrower `UpsertDialect` that existed only for `upsert`; the
 version-carrying shape came from [Locking](locking.md)'s `forUpdate`, which

@@ -76,8 +76,8 @@ page.
   a mapping key to a string over its own implicit int resolution; `LE5A`
   needs the same for an untagged-looking empty scalar. All three need
   this package to choose a value's type from its tag rather than from its
-  own spelling - the type-tag-driven object instantiation epic **#1482**
-  rules out by decision. These do not move; nothing here is pending.
+  own spelling, which this package rules out by design. These do not move;
+  nothing here is pending.
 * **12 are open gaps spread across six files.** `parse.bit` owns four,
   each its own mechanism: a bare `:` starting a block-context line as an
   implicit empty key; an anchored empty node followed by a same-column

@@ -131,7 +131,7 @@ fn setBalanceBlind(db: Data, id: i64, newCents: i64): int! {
 ```
 
 ```text
-pkg/orm: update on the class mapped to 'accounts' carries a @version field - supply it explicitly with where("<field>", ...) before run(), or use save() (#5059) for automatic optimistic locking
+pkg/orm: update on the class mapped to 'accounts' carries a @version field - supply it explicitly with where("<field>", ...) before run(), or use save() for automatic optimistic locking
 ```
 
 Naming the version in `where` is what "supplied explicitly" means here -

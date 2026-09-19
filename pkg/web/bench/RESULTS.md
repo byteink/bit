@@ -2,7 +2,7 @@
 
 TechEmpower's test types 1 and 2, the same two every framework here
 already publishes a number for. Types 3 to 5 need a database and are not
-measured: `pkg/postgres`'s type codecs are open as #3989, so there is no
+measured: `pkg/postgres`'s type codecs are not implemented yet, so there is no
 Bit side to compare yet.
 
 ### Plaintext, `text/plain`, 13 bytes
