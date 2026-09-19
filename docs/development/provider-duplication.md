@@ -2,7 +2,7 @@
 
 Input for the follow-up work that pulls shared non-OS logic out of
 `runtime/{root,net,thread,park}/{linux,darwin}/`
-into each module's core `.bit` file. `docs/development.md:785`
+into each module's core `.bit` file. `docs/development.md:784`
 ("Runtime core and OS providers") states the rule this inventory feeds - read
 that first; this file does not repeat it, it only lists what to move.
 
@@ -44,7 +44,7 @@ below.
 `scripts/provider-move-check.sh <root|net|thread|park>` (already landed) is the
 proof each of these moves owes: `--emit-obj` before/after per (directory,
 target), plus a line-multiset check across the whole module. It still cannot
-see two things a green build also misses (`docs/development.md:793`): emitted
+see two things a green build also misses (`docs/development.md:792`): emitted
 **diagnostic order** is normative (SPEC §14.8, checked by `selfhost-diffdiags`),
 and filename order drives `optimizeModule`'s inlining depth (checked by
 relocation counts, never by wall clock).
