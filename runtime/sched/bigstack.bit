@@ -1,0 +1,247 @@
+// Split out of ./sched.bit (#5648, kept the 800-line E0200 cap): the
+// oversized-stack registry `main` and any other task the masked-identity
+// scheme (./identity.bit) cannot name register with instead. Same module as
+// sched.bit — no import needed for anything declared there.
+
+// Stack headroom for a masked task: ./headroom.bit (#3374, same module).
+// ---------------------------------------------------------------------------
+// OVERSIZED STACKS (#1843): the tasks masking cannot name
+// ---------------------------------------------------------------------------
+// `main` is the one task that needs more than the granule — see
+// `schedMainStackBytes` and `schedStackBytes` in ./identity.bit for why
+// raising the granule itself is not the answer (every masked task would pay
+// for it). So oversized stacks get a REGISTRY instead, and the fast path
+// never sees it: `schedCurrentTask` masks first, exactly as before, and only
+// consults this when masking finds no tag. That miss already happened on
+// every worker OS thread, so the cost is a few compares on a path that
+// previously just returned 0.
+//
+// A FIXED FOUR ENTRIES, not a growable list, and the read loop is bounded by the
+// constant rather than by a live count so its limit is statically provable. Four
+// is `main` plus slack; a fifth registration is refused rather than silently
+// dropped, since a task whose stack nothing can name would resolve to 0 and
+// null-deref at its first `schedYield`.
+//
+// A slot freed by `schedUnregisterBigStack` becomes available to a later
+// `schedRegisterBigStack` call — the table has no notion of "retired", only
+// "occupied" and "free" — so a long-lived process that spawns and tears down
+// oversized-stack tasks one at a time never exhausts the four slots.
+export const schedBigStackMax: int = 4
+
+// Three words per entry — base, bytes, task — and a zero base means empty.
+let schedBigStacks: [12]i64
+
+// How many of the four slots are occupied. BOOKKEEPING ONLY: the scan loops in
+// `schedRegisterBigStack`/`schedTaskOnBigStack` stay bounded by the constant
+// `schedBigStackMax` above, not by this count, for the same provability reason
+// the comment above gives — a live count could in principle be read torn or
+// stale across a race and would then no longer bound anything, whereas the
+// constant needs no read at all. This exists so a caller (or a future
+// diagnostic) can ask "how full is the table" without a linear scan.
+//
+// The `+ 1` (below) and `- 1` (`schedUnregisterBigStack`) are plain
+// read-modify-writes, not atomics, and that is safe for the identical
+// boot-order reason `schedRegisterBigStack`'s header gives (#3298): the
+// increment runs on the process's one boot thread before any worker OS
+// thread exists, and the decrement path is presently unreachable (zero
+// callers anywhere in the tree). Re-derive both if a second caller of either
+// function is ever added.
+let schedBigStackCount: int = 0
+
+// Record `task` as owning `[base, base + bytes)`. False if the table is full or
+// the arguments are not a usable range, and the caller MUST treat that as fatal:
+// an unregistered oversized stack is a task `schedCurrentTask` cannot name.
+//
+// Pinned: `runtime/root/{linux,darwin}/boot.bit` calls it across a module
+// boundary and emits `--freestanding`, which refuses a mangled name.
+//
+// THE CLAIM LOOP BELOW IS A PLAIN LOAD-THEN-STORE, NOT A CAS, AND THAT IS
+// SAFE BY BOOT ORDER, NOT BY LUCK (#3298, epic #3275). There are exactly two
+// callers in the whole tree — `runtime/root/darwin/boot.bit:639` and
+// `runtime/root/linux/boottail.bit:331` — mutually exclusive at build time
+// (a binary links one platform's boot, never both), and each calls this
+// exactly once, to register `main`'s own oversized stack, at step 5 of
+// `boot`, strictly BEFORE step 6 spawns the first worker OS thread
+// (`threadStart`). `boot` itself cannot run twice in one process (guarded by
+// `root.bit`'s `booted` flag, asserted false on entry). So at every call that
+// ever executes, this is the only thread that exists: no second writer can
+// ever be mid-scan. This is `runtime/ABI.md` §22's
+// write-once-before-any-worker-exists category — the same one `gArgc` and
+// `booted` are in — not the single-worker contract and not adjacency (§5.1).
+// `schedUnregisterBigStack` below has ZERO callers anywhere in the tree, so
+// the free-slot-reuse path this scan exists for is presently unreachable
+// too. A CAS here would guard a race that cannot happen, at the cost of a
+// compare-exchange no caller needs — do not add one without a third caller
+// first, and re-derive this whole comment if one is ever added.
+export @nosplit @symbol("bit_rt_port_sched_register_big_stack") fn schedRegisterBigStack(
+  base: int,
+  bytes: int,
+  task: int,
+): bool {
+  if (base <= 0 || bytes <= 0 || task == 0) {
+    return false
+  }
+  let tbl: *i64 = ptrOf(schedBigStacks)
+  let i = 0
+  // Bounded by the constant, and first-free wins.
+  while (i < schedBigStackMax) {
+    if (*(tbl + i * 3) == 0) {
+      *(tbl + i * 3 + 1) = bytes
+      *(tbl + i * 3 + 2) = task
+      // Base LAST: it is the validity flag every reader tests, so publishing it
+      // after the other two words means a reader can never see a live entry
+      // whose length and task are not yet written.
+      *(tbl + i * 3) = base
+      schedBigStackCount = schedBigStackCount + 1
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Undo a `schedRegisterBigStack(base, ...)`, freeing its slot for reuse. A no-op
+// when `base` is not currently registered — including `base <= 0`, which can
+// never be a live entry — so a caller does not need to track whether it already
+// unregistered.
+//
+// Bounded by `schedBigStackMax`, exactly as the register and lookup paths are.
+export @nosplit fn schedUnregisterBigStack(base: int) {
+  if (base <= 0) {
+    return
+  }
+  let tbl: *i64 = ptrOf(schedBigStacks)
+  let i = 0
+  while (i < schedBigStackMax) {
+    if (*(tbl + i * 3) == base) {
+      // Base FIRST: it is the validity flag every reader tests (see
+      // `schedRegisterBigStack`), so clearing it before the other two words
+      // means a concurrent reader can never observe a half-cleared entry as
+      // still valid — it either sees the old, fully-formed entry or an empty
+      // slot, never a base-less task/bytes pair.
+      *(tbl + i * 3) = 0
+      *(tbl + i * 3 + 1) = 0
+      *(tbl + i * 3 + 2) = 0
+      schedBigStackCount = schedBigStackCount - 1
+      return
+    }
+    i = i + 1
+  }
+}
+
+// The registry's FIRST entry if it contains `sp`, as a pointer to its three
+// words; `nil` otherwise. Loop-free on purpose, and CALLED BEFORE THE MASK.
+// THE COST OF THE TWO SCANS BELOW IS THEIR CALL FRAME, NOT THEIR TRIP COUNT
+// (#5580). `main` is the first stack ever registered (every
+// `runtime/root/*/boot{,tail}.bit` calls `schedRegisterBigStack` once, at boot
+// step 5, before any worker exists) and the claim loop takes the first free
+// slot, so `main` is slot 0 and both scans already answer on their first
+// iteration. What they pay for is a `bl` and a frame: `optinlinecost.bit`'s
+// `calleeShapeOk` "refuses a back edge outright", so a loop-bearing callee is
+// never spliced and `schedCurrentTask` reached its answer three frames deep.
+// This is that first iteration hoisted into a back-edge-free leaf the inliner
+// splices; the scans stay the general answer for an entry past the first.
+//
+// FIRST, NOT LAST, AND THE REASON IS A CACHE LINE. Order cannot change the
+// answer — a registered oversized stack and a granule stack are separate
+// mappings and never overlap, so at most one probe matches any `sp` — it
+// changes what `main` pays. On `main` the mask always misses, and its tag load
+// sits at `sp & ~(schedStackBytes - 1)`: an interior granule boundary up to
+// 256KiB BELOW `sp`, in the unused part of an 8MiB stack, on a different page
+// every time `sp` crosses a granule, touched by nothing else in the process — a
+// cold line per fallible call. On a granule task that same load lands on the
+// task's own base, holding the self-pointer, tag and chan scratch — hot.
+//
+// A POINTER TO THE ENTRY, not the task or the base, so one probe serves both
+// twins below with no duplicated range test: `*(p + 2)` is what the first
+// returns, `*p` what the second does. Three early returns rather than one `&&`
+// chain: a chain in value position lowers to a `cset` per comparison plus a
+// `mov` per join to materialize the intermediate bool, where guards branch
+// straight out — 23 -> 17 executed for `main`'s hit, nil test included.
+// `base != 0` stays FIRST and is load-bearing, for the reason
+// `schedTaskOnBigStack` gives below: a slot can transiently hold `base == 0`
+// with a live `bytes`.
+@nosplit fn schedBigStackHead(sp: int): *i64 {
+  let z: *i64 = nil
+  let p: *i64 = ptrOf(schedBigStacks)
+  let base = *p
+  if (base == 0) {
+    return z
+  }
+  if (sp < base) {
+    return z
+  }
+  if (sp - base >= *(p + 1)) {
+    return z
+  }
+  return p
+}
+
+// The oversized-stack task containing `sp`, or 0.
+//
+// A WALKING POINTER, NOT AN INDEX RE-SCALED PER ACCESS (#4409, and see
+// `../gc/gcalloc.bit`'s `zeroBytes` for the same three changes under #4045).
+// The index form wrote each of the three words as `*(tbl + i * 3 + k)`, and the
+// backend has no CSE for that address: it re-emitted `mov #3` / `mul` /
+// `lsl #3` / `add` at EVERY use, three times per iteration, 49 static
+// instructions for a twelve-word table. Advancing a `*i64` by the three-word
+// stride computes the entry address once and turns the other two words into
+// `[p, #8]` and `[p, #16]` offsets that cost nothing: 36 static, and 41 -> 27
+// executed for a hit on the first slot.
+//
+// #4409 AND #4321 BOTH SIZED THIS AS IF `main` REACHED IT, AND SINCE #5580 IT
+// DOES NOT: `schedBigStackHead` above answers slot 0 inline and `main` is slot
+// 0. What is left is the genuine scan for an entry past the first, which no
+// shipped program has yet. (#4321's 93-vs-25 figure came from a synthetic leaf
+// built to call this once per object; not this function's rate anywhere.)
+//
+// STILL BOUNDED BY THE CONSTANT, not by `schedBigStackCount`: `n` starts at
+// `schedBigStackMax`, only ever decrements, and nothing in the body touches it,
+// so the trip count is statically the constant exactly as `i < schedBigStackMax`
+// was. See the count's own comment above for why a live count must not bound it.
+//
+// `base != 0` is load-bearing and stays FIRST. `schedRegisterBigStack` publishes
+// `bytes` before `base` and `schedUnregisterBigStack` clears `base` before
+// `bytes`, so a slot can transiently hold `base == 0` with a live `bytes`; the
+// range test alone would then answer for an entry that is not there.
+@nosplit fn schedTaskOnBigStack(sp: int): int {
+  let p: *i64 = ptrOf(schedBigStacks)
+  let n = schedBigStackMax
+  while (n > 0) {
+    let base = *p
+    if (base != 0 && sp >= base && sp < base + *(p + 1)) {
+      return *(p + 2)
+    }
+    p = p + 3
+    n = n - 1
+  }
+  return 0
+}
+
+// The base of the registered big stack containing `sp`, or 0 if none. Same
+// scan as `schedTaskOnBigStack` above, answering the base a headroom caller
+// needs instead of the task id: `./headroom.bit`'s `schedStackHeadroom`
+// (#3749) uses this to compute real headroom on `main`'s oversized stack —
+// masking cannot name it (see the "OVERSIZED STACKS" header above), but the
+// registry already carries the exact base `schedTaskInit` wrote the
+// self-pointer/tag scratch area at, so the same "distance to the scratch
+// floor" arithmetic applies unchanged — including the walking pointer and the
+// constant bound, for the reasons that function's header gives.
+//
+// THIS USED TO BE THE ONE THAT PAID, and #5580 moved that traffic off it:
+// `markObject` calls `schedStackHeadroom` once per newly marked object, so on
+// `main` this scan was per-mark (#4409). `./headroom.bit` now probes
+// `schedBigStackHead` first and reaches this only past slot 0.
+@nosplit fn schedBigStackBaseFor(sp: int): int {
+  let p: *i64 = ptrOf(schedBigStacks)
+  let n = schedBigStackMax
+  while (n > 0) {
+    let base = *p
+    if (base != 0 && sp >= base && sp < base + *(p + 1)) {
+      return base
+    }
+    p = p + 3
+    n = n - 1
+  }
+  return 0
+}

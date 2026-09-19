@@ -1,0 +1,169 @@
+// Split out of ./sched.bit (#5648, kept the 800-line E0200 cap): the
+// masked-identity stack scheme — how a task is found from nothing but the
+// stack pointer, with no thread-local storage, and the geometry constants
+// that scheme depends on. Same module as sched.bit — no import needed for
+// anything declared there.
+
+// ---------------------------------------------------------------------------
+// Finding the current task without thread-local storage
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched/` reaches the running task through `threadlocal var tls: ?*Worker`.
+// THAT MECHANISM IS NOT AVAILABLE TO THIS PORT, and the reason is not effort:
+//
+//   - `@threadlocal` (§11.11) is implemented on ELF but REJECTED FOR MACH-O at
+//     emission, because a Mach-O TLV access calls a resolver thunk instead of
+//     doing arithmetic off a thread pointer. So it cannot carry a Darwin worker.
+//   - RE-MEASURED (#2616): "`@nosplit` REJECTS BOTH an `extern` call and a
+//     `syscall` (E0075)" was WRONG. SPEC §11.7/§11.8 permit both, `asm`'s own
+//     footing (§11.6); `gcthread.bit`'s `@nosplit fn gcThreadToken()` already
+//     calls an `extern fn`. A one-instruction segment-prefixed/system-register
+//     TLS read via `asm` is legal too — a `@nosplit` fn built from
+//     `gcthread.bit`'s `TPIDRRO_EL0`/`fs:0` bytes: `bit run`, exit 0,
+//     `nonzero=true`. The gap is WRITE: nothing here REWRITES per switch like
+//     Linux-only `../thread/linux/tls.bit`; `gcThreadToken` only READS once.
+//
+// So the task pointer is carried by the one piece of per-thread state that
+// needs no OS help at all: THE RUNNING TASK'S OWN STACK. Every task stack is
+// `schedStackBytes` bytes, aligned to that size, its lowest usable word
+// holding the owning task — masking `sp` down to that boundary names the
+// current task in two instructions, on every target, inside `@nosplit`.
+//
+// It is also robust in a way a thread-local is not: it is a property of the
+// stack rather than of the OS thread, so a task that migrates to another worker
+// carries it along automatically and there is no per-switch bookkeeping to
+// forget. `runtime/sched/` has to re-fetch `Worker.current()` after `fn_ptr` returns
+// precisely because its answer changes under migration; this one cannot go
+// stale.
+//
+// THE COST IS AN ALIGNMENT CONTRACT, and it is on the caller who maps the
+// stack: `schedTaskInit`'s `stackBase` MUST be a multiple of `schedStackBytes`.
+// Nothing can check that at compile time, so `schedStackAligned` is provided to
+// check it at run time and the mapping code is expected to use it. A misaligned
+// stack does not fault — it silently resolves to the wrong task, which is why
+// the check exists rather than a comment asking for care.
+//
+// THIS IS THE IDENTITY GRANULE, and only incidentally a stack size (#1843).
+// Identity is "mask sp down to this and read the tag at the lowest word", so a
+// stack masked from anywhere inside it must land on ITS OWN base — which caps a
+// masked-identity stack at exactly this size. The interior boundaries cannot
+// carry copies of the tag: they fall inside the usable stack, where ordinary
+// frames overwrite them.
+//
+// So a task wanting MORE than this cannot use masking, and `main` is exactly
+// that task — see `schedMainStackBytes` below and `schedRegisterBigStack` in
+// ./bigstack.bit.
+//
+// 256KiB matches `runtime/sched/`'s `stack_size` (#2613; it was 64KiB, from
+// #1843, until then). Raising the granule raises what every masked-identity
+// task reserves, so #2613 also rescaled every stress fixture that carves
+// `(n+1) * schedStackBytes` arenas out of a fixed module array: sized for the
+// old granule, one would silently run its stacks off the end of its own array.
+//
+// The bottom of the stack is not all usable: `scratchOf` puts the chan scratch
+// area at words 0..`chanScratchWords` of this same base, words 0 and 1 being the
+// self-pointer and tag. Usable stack starts above that.
+export const schedStackBytes: int = 262144
+
+// `main` runs user code and is the deepest recursion in any program — #1761
+// was `bit fmt`'s formatter overflowing the old 64KiB default, caught by
+// `_tests_/stress/deeprecursion`. Masking cannot name a stack this size (see
+// above), so `runtime/root/{linux,darwin,windows}/boot.bit` map it directly
+// and record it with `schedRegisterBigStack` instead of the granule. THE ONE
+// canonical value: each platform imports it directly (`export`, like
+// `schedStackBytes` above — a plain `int` const crosses `--freestanding`
+// fine, SPEC §17.6) rather than hardcoding its own copy.
+export const schedMainStackBytes: int = 8388608
+
+// Written next to the self-pointer to mark a region as a TASK stack.
+//
+// Without it this scheme is unsound off a task, and not in a subtle way:
+// `runtime/sched/`'s `Worker.tls` is simply null on a non-worker thread, but masking
+// the stack pointer always yields SOME address, so a call from the boot thread
+// or from a worker's own loop would read whatever that thread's stack happens to
+// hold there and then dereference it as a task. `Scheduler.spawn` is documented
+// callable from any thread, so that path is reachable by design rather than by
+// misuse.
+//
+// OVERTURNED (#3910): this used to say a plain constant match was "not a case
+// worth costing anything to exclude further", on the theory that a stray
+// collision was a 2^-64 coincidence. It is not: a thread that is never on a
+// task stack (the boot thread parked in `bootWaitForMain`, which still polls
+// a safepoint per `BIT_GC=stress` collection) can mask its own `sp` onto a
+// stale word pair. That masked base lands inside the calling thread's own
+// readable stack region every time sampled (120/120, #3918), so a stray
+// `{garbage, schedStackTag}` word there would be handed back as a task
+// pointer. #3905 captured exactly that on x86_64-linux: the check passed and
+// `*(base+8)` genuinely held the raw tag.
+//
+// CORRECTED (#3918): the #3910 comment further claimed spilled copies of the
+// raw constant "litter every thread's stack" because `schedTaskOnStack`
+// materializes it into a register on every call — i.e. on every safepoint
+// poll. Measured otherwise: only 2 of 997 symbols ever materialize the
+// constant, `schedTaskOnStack` has zero stores and zero calls, and 4
+// mutation-proven lldb whole-process scans found zero stray copies after up
+// to 110k calls. The raw constant is not spilled and not scattered around.
+// How the word #3905 captured got onto that thread's stack is genuinely
+// unexplained — ruling candidates in or out is #3919, not this comment.
+//
+// The fix is to make the tag POSITION-DEPENDENT: `schedTaskInit` writes
+// `base ^ schedStackTag`, and `schedTaskOnStack` compares against
+// `base ^ schedStackTag` for the base it is checking, not the raw constant.
+// A stray register spill is always the raw, un-XORed constant (nothing else
+// in this file ever computes `base ^ schedStackTag` and writes it anywhere
+// but a task's own tag word), so it can only pass this check at `base == 0`.
+// Reading them is still always safe either way: both words live inside the
+// caller's own live stack. The value itself is arbitrary and deliberately not
+// a plausible pointer, small integer, or ASCII run.
+const schedStackTag: int = 0x5CED7A5C5CED7A5C
+
+// Whether `base` satisfies the alignment contract above.
+export @nosplit fn schedStackAligned(base: int): bool {
+  return base % schedStackBytes == 0
+}
+
+// The live stack pointer. One instruction, so it is inline by construction and
+// legal in a `@nosplit` body.
+//
+// Reading `sp` inside a callee rather than at the use site is deliberate and
+// safe: a callee's prologue only ever moves `sp` DOWN within the same stack, and
+// the mask below discards everything below the 256KiB boundary, so the answer is
+// the same whichever frame asks.
+@nosplit fn readSp(): int {
+  return asm {
+    arm64 { 0x910003E0 }     // mov x0, sp
+    x64 { 0x48, 0x89, 0xE0 } // mov rax, rsp
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// The task running on this thread, or 0 when the caller is not on a task stack.
+//
+// The zero answer is what a worker's own loop gets, since a worker runs on the
+// OS thread stack its `threadStart` mapped, not on a task stack. That word is
+// whatever the thread stack happens to hold there, so callers must treat this
+// as "ask only from task code" — which is exactly `runtime/sched/`'s contract for
+// `Worker.current()` ("task code only ever runs on a worker OS thread").
+// `let` then `return` rather than `return *(...)` throughout this file: a
+// dereference is not accepted in return position today (E0021), only in `let`
+// and assignment position. Filed on #1421; harmless, but it shapes every
+// accessor here.
+// The task owning the stack region based at `base`, or 0 if that region is not
+// a task stack.
+//
+// Split out from `schedCurrentTask` so the tag check is REACHABLE BY A TEST.
+// Driven only through `schedCurrentTask`, the check cannot be made to fail: a
+// fresh thread stack reads 0 at its 256KiB boundary whether or not the tag is
+// consulted, so a test asserting "0 off a task" passes even with the check
+// deleted — measured, not assumed. Taking the base as a parameter lets a test
+// point it at a region it has deliberately filled with garbage, which is the
+// only way to tell a working check from an absent one.
+export @nosplit @symbol("bit_rt_port_sched_task_on_stack") fn schedTaskOnStack(base: int): int {
+  let b = taskAt(base)
+  let tag = *(b + 1)
+  if (tag != (base ^ schedStackTag)) {
+    return 0
+  }
+  let t = *b
+  return t
+}
