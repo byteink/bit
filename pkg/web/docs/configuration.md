@@ -12,12 +12,12 @@ import { env } from "std/os"
 fn build(): App {
   return App(
     Config{
-      secret: env("APP_SECRET"),
-      maxBody: 2_000_000,
-      rejectUnknownFields: true,
-      sessions: MemoryStore(10_000),
-      host: "0.0.0.0",
-      port: 8080,
+      secret = env("APP_SECRET"),
+      maxBody = 2_000_000,
+      rejectUnknownFields = true,
+      sessions = MemoryStore(10_000),
+      host = "0.0.0.0",
+      port = 8080,
     },
   )
 }

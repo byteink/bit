@@ -13,7 +13,7 @@ import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn run(): ()! {
-  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
+  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL") })?
   let rows = db.query("select * from users where id = $1", []Value{ Value.Int(7) })?
 }
 ```

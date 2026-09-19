@@ -237,8 +237,8 @@ fn userName(c: Ctx, db: Pool): Res! {
 }
 
 fn main(): ()! {
-  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
-  let app = App(Config{ secret: env("APP_SECRET") })
+  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL") })?
+  let app = App(Config{ secret = env("APP_SECRET") })
   app.get("/users/:id", (c) => userName(c, db))
   app.listen()?
 }
@@ -259,8 +259,8 @@ fn userName(c: Ctx, db: Pool): Res! {
 }
 
 fn main(): ()! {
-  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
-  let app = App(Config{ secret: env("APP_SECRET") })
+  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL") })?
+  let app = App(Config{ secret = env("APP_SECRET") })
   app.get("/users/:id", (c) => userName(c, db))
   app.listen()?
 }
@@ -929,8 +929,8 @@ and its type.
 When `T` also carries `@table`, the generated mapper calls
 `markPersisted(true)` (SPEC §10.5) on the value it built, right before
 handing it back - so anything `find`/`findOne`/`findOneOrFail` returns reads
-`isPersisted() == true`. A composite literal never does this: `User{ id: 1,
-email: "a@b.com" }` reads `isPersisted() == false` until something calls
+`isPersisted() == true`. A composite literal never does this: `User{ id = 1,
+email = "a@b.com" }` reads `isPersisted() == false` until something calls
 `markPersisted(true)` on it by hand. That distinction is what `db.save` (in
 `bitlang.org/pkg/orm`) needs to choose an UPDATE over an INSERT without
 inspecting the primary key, which a UUID or application-assigned key rules

@@ -33,8 +33,8 @@ import { FieldDesc, AttrDesc } from "std/sql"
 }
 
 fn showTableNames() {
-  println(tableName("Person", Person{ id: 0 }.tableAttrs())) // "people"
-  println(tableName("Order", []AttrDesc(0)))                 // "orders" - the four rules, no override
+  println(tableName("Person", Person{ id = 0 }.tableAttrs())) // "people"
+  println(tableName("Order", []AttrDesc(0)))                  // "orders" - the four rules, no override
 }
 ```
 

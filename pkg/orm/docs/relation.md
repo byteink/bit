@@ -44,7 +44,7 @@ import { AttrDesc, FieldDesc, Rows, sqlReqInt } from "std/sql"
 }
 
 fn idField(): FieldDesc {
-  return FieldDesc{ name: "id", typeName: "i64", attrs: []AttrDesc(0) }
+  return FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }
 }
 
 // A class-typed field (`author`, `profile`) has no zero value in Bit - it
@@ -52,29 +52,29 @@ fn idField(): FieldDesc {
 // placeholder even for a relation it is not loading. A `with()`-driven
 // loader's `assign` overwrites it exactly like any other field write.
 fn personPlaceholder(): Person {
-  return Person{ id: 0, profile: Profile{ id: 0, personId: 0 } }
+  return Person{ id = 0, profile = Profile{ id = 0, personId = 0 } }
 }
 
 fn personMapper(rows: Rows): Person! {
   // `posts` is left unset ON PURPOSE: a relation field starts "unloaded"
   // until a `with()`-driven loader assigns it - see the sharp edge below.
   return Person{
-    id: sqlReqInt(rows, rows.columns(), "id")?,
-    profile: Profile{ id: 0, personId: 0 },
+    id = sqlReqInt(rows, rows.columns(), "id")?,
+    profile = Profile{ id = 0, personId = 0 },
   }
 }
 
 fn postMapper(rows: Rows): Post! {
   let cols = rows.columns()
   return Post{
-    id: sqlReqInt(rows, cols, "id")?,
-    authorId: sqlReqInt(rows, cols, "author_id")?,
-    author: personPlaceholder(),
+    id = sqlReqInt(rows, cols, "id")?,
+    authorId = sqlReqInt(rows, cols, "author_id")?,
+    author = personPlaceholder(),
   }
 }
 
 fn posts(db: Data): Query<Post> {
-  let fields = [idField(), FieldDesc{ name: "authorId", typeName: "i64", attrs: []AttrDesc(0) }]
+  let fields = [idField(), FieldDesc{ name = "authorId", typeName = "i64", attrs = []AttrDesc(0) }]
   return find<Post>(db, "posts", fields, postMapper)
 }
 
@@ -169,7 +169,10 @@ import { hasOne } from "orm"
 
 fn profileMapper(rows: Rows): Profile! {
   let cols = rows.columns()
-  return Profile{ id: sqlReqInt(rows, cols, "id")?, personId: sqlReqInt(rows, cols, "person_id")? }
+  return Profile{
+    id = sqlReqInt(rows, cols, "id")?,
+    personId = sqlReqInt(rows, cols, "person_id")?,
+  }
 }
 
 fn profileLoader(): RelationLoader<Person> {
@@ -178,7 +181,7 @@ fn profileLoader(): RelationLoader<Person> {
     (db) => find<Profile>(
       db, "profiles", [
         idField(),
-        FieldDesc{ name: "personId", typeName: "i64", attrs: []AttrDesc(0) },
+        FieldDesc{ name = "personId", typeName = "i64", attrs = []AttrDesc(0) },
       ],
       profileMapper,
     ),

@@ -26,7 +26,7 @@ fn devSync(db: Data): ()! {
   return syncSchema(
     db,
     [Widget{}],
-    RunnerDialect{ render: Postgres{}, server: ServerDialect.Postgres },
+    RunnerDialect{ render = Postgres{}, server = ServerDialect.Postgres },
   )?
 }
 ```
@@ -64,7 +64,7 @@ fn devSyncStatus(db: Data): ()! {
   return syncSchema(
     db,
     [WidgetWithStatus{}],
-    RunnerDialect{ render: Postgres{}, server: ServerDialect.Postgres },
+    RunnerDialect{ render = Postgres{}, server = ServerDialect.Postgres },
   )?
 }
 ```

@@ -47,8 +47,8 @@ connection, read once per connection (see [HTTP/3](#http3)).
 `peer` is `""`, never a placeholder address, whenever there is no address to be
 had: a `Request` you build yourself, and one whose connection died before the
 address could be read. Reading the address never fails a request. Because `""` is the zero value
-of `string`, a literal that omits the field - `Request{ method: "GET", path:
-"/", headers: "", body: "" }` - is legal and means "no peer known".
+of `string`, a literal that omits the field - `Request{ method = "GET", path =
+"/", headers = "", body = "" }` - is legal and means "no peer known".
 
 ```bit
 import { Request, Response, ok, respond } from "std/http"

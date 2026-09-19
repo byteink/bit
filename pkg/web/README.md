@@ -25,7 +25,7 @@ import { App, Config } from "web"
 import { env } from "std/os"
 
 fn main(): ()! {
-  let app = App(Config{ secret: env("APP_SECRET") })
+  let app = App(Config{ secret = env("APP_SECRET") })
   app.get("/", (c) => c.text("hello, bit"))
   app.listen()?
 }

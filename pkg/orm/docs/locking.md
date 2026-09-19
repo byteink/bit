@@ -34,11 +34,11 @@ import { AttrDesc, FieldDesc, Pool, Rows, Value, sqlReqInt, sqlReqText } from "s
 
 fn jobMapper(rows: Rows): Job! {
   let cols = rows.columns()
-  return Job{ id: sqlReqInt(rows, cols, "id")?, state: sqlReqText(rows, cols, "state")? }
+  return Job{ id = sqlReqInt(rows, cols, "id")?, state = sqlReqText(rows, cols, "state")? }
 }
 
 fn pendingJobs(db: Data): Query<Job> {
-  let fields = Job{ id: 0, state: "" }.tableDescriptor()
+  let fields = Job{ id = 0, state = "" }.tableDescriptor()
   return find<Job>(db, "jobs", fields, jobMapper).where("state", Value.Text("pending"))
 }
 
@@ -99,7 +99,7 @@ free, right now:
 ```bit
 fn claimUpTo(db: Data, n: int): LockedQuery<Job> {
   return forUpdate<Job>(
-    pendingJobs(db).limit(n), LockOpts{ skipLocked: true }, ServerDialect.Postgres,
+    pendingJobs(db).limit(n), LockOpts{ skipLocked = true }, ServerDialect.Postgres,
   )
 }
 
@@ -121,7 +121,7 @@ fn runClaimBatch(p: Pool, n: int): []Job! {
 }
 ```
 
-`LockOpts{ skipLocked: true }` **never blocks**. It quietly leaves out any
+`LockOpts{ skipLocked = true }` **never blocks**. It quietly leaves out any
 row another transaction already has locked and returns the rest
 immediately. Call `runClaimBatch(p, 10)` while other workers together hold
 seven of the ten matching rows, and it returns three `Job` records - not
@@ -196,7 +196,7 @@ Count or check existence on the plain, unlocked query instead, the way
 `pendingCount` above does; reach for `forUpdate` only on the terminals that
 actually return rows (`all`/`one`/`oneOrFail`).
 
-`LockOpts{ skipLocked: true, nowait: true }` together are refused too
+`LockOpts{ skipLocked = true, nowait = true }` together are refused too
 (`LockCause.ConflictingOptions`) - `skipLocked` returns fewer rows without
 waiting, `nowait` fails immediately instead of waiting, and a caller has to
 pick one answer to "what happens when the row is already locked," not both.
@@ -220,7 +220,7 @@ check above gives:
 fn claimBatchOnMysql(db: Data, n: int, version: MysqlVersion): []Job! {
   let jobs = forUpdate<Job>(
     pendingJobs(db).limit(n),
-    LockOpts{ skipLocked: true },
+    LockOpts{ skipLocked = true },
     ServerDialect.Mysql(version),
   ).all()?
   for j of jobs {
@@ -233,7 +233,7 @@ fn claimBatchOnMysql(db: Data, n: int, version: MysqlVersion): []Job! {
 }
 ```
 
-Called with `MysqlVersion{ major: 5, minor: 7 }`, this fails before any SQL
+Called with `MysqlVersion{ major = 5, minor = 7 }`, this fails before any SQL
 reaches the driver:
 
 ```text

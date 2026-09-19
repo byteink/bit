@@ -29,9 +29,9 @@ import { AttrDesc, FieldDesc, Value } from "std/sql"
 
 fn personDesc(): TableDesc {
   return TableDesc{
-    table: "people",
-    fields: Person{ id: 0, name: "", email: "" }.tableDescriptor(),
-    classAttrs: []AttrDesc(0),
+    table = "people",
+    fields = Person{ id = 0, name = "", email = "" }.tableDescriptor(),
+    classAttrs = []AttrDesc(0),
   }
 }
 
@@ -59,8 +59,8 @@ fn savePersonOrFail(db: Data, p: Person): Person! {
 ```
 
 `classify(e, desc.table)` asks the failure for its SQLSTATE. A unique
-violation on `people` comes back as `UniqueViolation{ table: "people",
-constraint: "...", columns: [...] }` - the table and constraint names,
+violation on `people` comes back as `UniqueViolation{ table = "people",
+constraint = "...", columns = [...] }` - the table and constraint names,
 never the row's email address, which is exactly what let this handler
 write a clean message instead of forwarding the driver's.
 

@@ -38,7 +38,7 @@ import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn openDefault(): ()! {
-  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL"), maxOpen: 20 })?
+  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL"), maxOpen = 20 })?
 }
 ```
 
@@ -53,7 +53,7 @@ fn openCached(): ()! {
   let db = pool(
     adapter(),
     Datasource{
-      uri: env("DATABASE_URL"), maxOpen: 20, statementCache: 256,
+      uri = env("DATABASE_URL"), maxOpen = 20, statementCache = 256,
     },
   )?
 }

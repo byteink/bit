@@ -33,7 +33,7 @@ fn main(): ()! {
   let wire = encodeCommand(["GET", "missing"])
   println(wire)
 
-  let (reply, _) = decodeReply(fixedSource{ data: "\$-1\r\n" }, "")?
+  let (reply, _) = decodeReply(fixedSource{ data = "\$-1\r\n" }, "")?
   match (reply) {
     Bulk(v) => {
       match (v) {
