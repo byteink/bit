@@ -62,6 +62,66 @@ const markStackMinHeadroom: int = 4096
   return schedStackHeadroom() < markStackMinHeadroom
 }
 
+// Double the mark worklist in place, up to `gcMaxMarkStack` (`./gc.bit`).
+// Answers the overflow below; returns false when the worklist is already at the
+// ceiling or the heap cannot spare the bytes, which is when `recoverOverflow`'s
+// rescan is the only answer left.
+//
+// WHY HERE AND NOT AFTER THE CYCLE (#5620). The obvious cheaper shape is to
+// notice at the end of a collection that this one overflowed and widen the
+// worklist for the NEXT one. Measured on `bench/cases/json`, that shape is
+// worth nothing: it grew the worklist exactly once, on the last collection of
+// the run, and moved instructions retired by +0.11% -- inside a 0.08% null
+// spread of no effect at all. That case overflows in ONE cycle, not in every
+// cycle, because the frontier only outgrows the worklist once its root array
+// is fully built; a rule that reacts after the fact therefore always arrives
+// one cycle too late. The cost being avoided is not spread over the run
+// either: a single overflowing cycle costs `bench/cases/json` 7.72e9 ->
+// 5.90e9 instructions, because `recoverOverflow` answers it with a full
+// `gcWalkHeap(g, gcWalkRescan)` over a 2.55M-object live set, per pass.
+//
+// Growing here pays a copy of at most `gcStackLen` words instead. Nothing
+// caches the base address across a `markObject` call -- `drain` below re-reads
+// `gcStackAddr` on every pop for exactly this reason -- so the move is
+// invisible to the mark phase in progress.
+@nosplit fn growMarkStack(g: *i64): bool {
+  let len = *(g + gcStackLen)
+  if (len >= gcMaxMarkStack) {
+    return false
+  }
+  let nlen = len * 2
+  if (nlen > gcMaxMarkStack) {
+    nlen = gcMaxMarkStack
+  }
+  let bytes = nlen * 8
+  // From the OBJECT heap, spelled exactly as `gcInit` (`./gc.bit`) spells the
+  // first one, for the reason stated there: the worklist counts toward
+  // `liveBytes` in both implementations, so the growth trigger schedules
+  // identically. Cache entry 0 for the same reason it is 0 there -- the
+  // collector's own allocation, with the world stopped, is not an object
+  // lifecycle and has no thread to contend with. The block carries no
+  // occupied-slot bit (`setSlotBit` runs in `linkObject`, `./gcalloc.bit`, not
+  // in the heap allocator), so the sweep that follows cannot see it.
+  let stack = gcHeapAlloc(g, bytes, 8, allocClassify(bytes, 8), 0)
+  if (stack == 0) {
+    return false
+  }
+  let old = *(g + gcStackAddr)
+  let top = *(g + gcStackTop)
+  // Bounded: `top` entries, and `top <= len` by the check that brought us here.
+  let i = 0
+  while (i < top) {
+    storeWord(stack + i * 8, loadWord(old + i * 8))
+    i = i + 1
+  }
+  *(g + gcStackAddr) = stack
+  *(g + gcStackLen) = nlen
+  // Released only once the replacement is installed: a failure above leaves the
+  // worklist exactly as it was, never `gcStackAddr` at 0.
+  gcHeapFree(g, old, len * 8, 8, allocClassify(len * 8, 8))
+  return true
+}
+
 @nosplit fn markObject(g: *i64, h: int) {
   if (hdrMarked(h)) {
     return
@@ -71,14 +131,17 @@ const markStackMinHeadroom: int = 4096
   }
   hdrSetMark(h)
   let top = *(g + gcStackTop)
-  if (top < *(g + gcStackLen)) {
-    storeWord(*(g + gcStackAddr) + top * 8, h)
-    *(g + gcStackTop) = top + 1
-  } else {
-    // Worklist full: the object is marked (so it survives) but its children are
-    // not yet traced. A rescan pass will scan it.
+  // The test is the same one, and the same single compare-and-branch, that this
+  // function has always run per marked object; the growth is only ever reached
+  // from the arm that used to give up (#5620).
+  if (top >= *(g + gcStackLen) && !growMarkStack(g)) {
+    // Worklist full and no bigger one to be had: the object is marked (so it
+    // survives) but its children are not yet traced. A rescan pass will scan it.
     *(g + gcOverflow) = 1
+    return
   }
+  storeWord(*(g + gcStackAddr) + top * 8, h)
+  *(g + gcStackTop) = top + 1
 }
 
 // Mark a single reference, marking it ONLY IF it is exactly the body base of a
