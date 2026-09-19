@@ -131,7 +131,15 @@ esac
 # The pin names the exact artifact. Reading the FILENAME out of the digest file
 # rather than composing it from a version variable means there is one source of
 # truth for which build is stage0.
-line="$(grep -E "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
+#
+# `-a`: SUMS carries hand-written comments, three of which contain a non-ASCII
+# `§`. Bind-mounting the repo into bit-linux-gate:latest (GNU grep 3.8, no
+# locale configured) makes grep call the whole file binary off that byte alone
+# and print "binary file matches" to stderr with EMPTY stdout and rc=0 — a
+# silent false "no digest" rather than a crash. `-a` treats it as text
+# unconditionally, so the next non-ASCII character typed into a comment here
+# does not repeat this (#5634).
+line="$(grep -aE "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
 [ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
 [ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
   || die "more than one digest for triple '${triple}' in ${SUMS} — ambiguous, refusing"
