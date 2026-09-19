@@ -1737,7 +1737,7 @@ actually exercised. §22 audits every remaining module-level cell in
   migrated task's next read lands on a different, unfilled slot (#3273 had to
   move `netSendTo`'s fill inside its loop for exactly this reason).
 - **`@nosplit` does NOT mean "cannot park."** `schedPark`
-  (`runtime/sched/task.bit`) and `schedSwitch` (`runtime/sched/sched.bit`) are
+  (`runtime/sched/task.bit`) and `schedSwitch` (`runtime/sched/switch.bit`) are
   themselves `@nosplit`, so E0075 permits calling them from a `@nosplit` body.
   Prove a span cannot park by what it actually calls, never by inferring it
   from the attribute alone.
@@ -3607,7 +3607,7 @@ answer somewhere other than the primitive:
     provider's `syscall` and a Linux one refuses the Darwin provider's
     `extern fn`, both even on an uncalled declaration.
   - the **arch** is an `asm` block's per-arch sub-blocks (SPEC §11.6), which the
-    backend selects at codegen — `runtime/sched/sched.bit`'s `entryBias` shape.
+    backend selects at codegen — `runtime/sched/switch.bit`'s `entryBias` shape.
     This is the axis the directory split does NOT draw, and x86_64-linux vs
     aarch64-linux is exactly where it is needed.
 
@@ -4244,7 +4244,7 @@ per-worker storage, not a single shared word (§5.1):**
   read, adjacency holds: nothing parks in between, so the two see the same
   slot — and that slot is this task's worker's own, not shared with any other.
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
-  running task's own stack pointer (`sched.bit:625`'s `schedCurrentTask`),
+  running task's own stack pointer (`sched.bit:15`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
   resume on a *different* OS thread (#1466): a cached thread pointer would
   hand back the previous thread's stale `Worker`. No global backs this at

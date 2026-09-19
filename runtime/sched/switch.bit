@@ -1,0 +1,349 @@
+// Split out of ./sched.bit (#5648, kept the 800-line E0200 cap): the
+// context switch itself — the saved register layout, the entry-time stack
+// bias, `schedSwitch`'s asm block, and the small helpers only
+// `schedTaskContext` and the module's spinlock callers need. Same module as
+// sched.bit — no import needed for anything declared there.
+
+// Green-thread scheduling core: the context switch, a task's saved register
+// context, and the two run queues a worker pool draws from.
+//
+// Stage-2 port of `runtime/sched/` (#1364). Both exist during the port;
+//
+// ---------------------------------------------------------------------------
+// THE CONTEXT SWITCH IS SHAPED DIFFERENTLY HERE, AND THE REASON IS FORCED
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched/`'s switch saves only `sp`/`fp`/`pc` and declares every other GPR
+// CLOBBERED, letting LLVM spill and reload the callee-saved registers around
+// the block. It can do that because it is an `inline fn`: the asm lands in the
+// caller's body, so the caller's allocator sees the clobber and spills to the
+// caller's own frame — which `sp` restores on resume.
+//
+// Bit's `asm` has different semantics, stated in SPEC §11.6: a register named
+// by `input`/`result`/`clobber` is "excluded from the register allocator for
+// the whole enclosing function". EXCLUDED, not spilled. So a clobber list here
+// does not cause the enclosing function to save anything — it merely stops that
+// function from using the register, which means the CALLER's live value sits
+// in it untouched and the switch would hand it to the resumed side. Clobbering
+// is therefore not a substitute for saving, the way it is under LLVM.
+//
+// Nor can this be an inlined switch: Bit has no inline functions, and a
+// per-call-site copy of a hand-encoded block is exactly the duplication that
+// makes a hand-encoded block dangerous.
+//
+// So `schedSwitch` saves and restores the callee-saved file EXPLICITLY, which
+// is what every standalone (non-compiler-assisted) context switch does —
+// Boost.Context, Go's `gogo`, musl's `swapcontext`. The register sets are taken
+// from this compiler's own backends, not from the ABI documents, because it is
+// this compiler's allocation that must survive:
+//
+//   arm64  x19..x28 (`isCalleeSavedInt`), d8..d15 (`isCalleeSavedFloat`),
+//          x29 (frame), x30 (link), sp
+//   x64    rbx, r12..r15, rsi, rdi, rbp (frame), rsp, xmm6..xmm15; the return
+//          address lives on the stack, so there is no link register to save
+//
+// See compiler/arm64compile.bit `isCalleeSavedInt`/`isCalleeSavedFloat` and
+// compiler/x64.bit's equivalents.
+//
+// ---------------------------------------------------------------------------
+// x64: THE SET IS THE UNION OF SysV AND Win64, NOT A PER-OS VARIANT (#3335)
+// ---------------------------------------------------------------------------
+//
+// `asm` carries ONE `x64` sub-block for every x64 target (SPEC §11.6: no
+// arch-conditional compilation) — the same bytes run on x86_64-linux and
+// x86_64-windows. `compiler/x64.bit`'s `xIsCalleeSavedInt`/`xIsCalleeSavedFloat`
+// (asserted `compiler/x64check.bit:42-50`) disagree: SysV preserves rbx,
+// r12..r15, rbp, rsp only; Win64 ALSO preserves rsi, rdi and xmm6..xmm15.
+// Win64's set is a strict superset, so this block saves the UNION — safe
+// under SysV too, the precedent deviation 2 below sets for arm64's d8..d15.
+// XMM is saved SCALAR (low 64 bits): Bit has no vector/SIMD type and every
+// XMM use in this compiler's codegen is a scalar f64 (`xFScratch1/2`,
+// compiler/x64.bit); 8 not 16 bytes also fits every new slot in the 14
+// spare words `ctxWords` already leaves on the x64 side, so it did not move.
+//
+// `old`/`new` are now pinned to rcx/rdx, not rdi/rsi. `input` relocates the
+// argument via ordinary MOVs BEFORE this block's own bytes run, regardless
+// of which register the calling convention placed it in — verified by
+// disassembling the pre-fix `schedSwitch` for x86_64-linux: even under
+// SysV, which already hands `old`/`new` to rdi/rsi, the compiler
+// round-trips them through rcx/rdx first. Under Win64 rsi/rdi are
+// callee-saved, so pinning `old`/`new` there would let that marshalling
+// clobber a caller's live value before this block could save it. rcx/rdx
+// are caller-saved under both conventions, so nothing is lost; `rsi`/`rdi`
+// join the x64 `clobber` list so marshalling cannot use them as scratch.
+//
+// VERIFIED (this file's "checked against the system assembler's own bytes"
+// standard): assembled by `clang -c -target x86_64-unknown-linux-gnu`, read
+// back with `llvm-objdump -d`, confirmed byte-identical against the actual
+// compiler's own output for `_tests_/stress/sched/sched.bit`.
+//
+// ---------------------------------------------------------------------------
+// THE x18 TRAP, AND WHY IT DOES NOT REACH THIS PORT
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched/` must clobber `x18` on Linux and must NOT on Darwin. AArch64 calls
+// x18 the platform register: Darwin reserves it, Linux leaves it
+// general-purpose, so LLVM will park a live value there across the block on
+// Linux only. A task that parks on one worker and resumes on another whose x18
+// differs then faults on the first use — invisible on macOS, corrupting on
+// Linux. That bug has already cost this project once.
+//
+// It cannot arise here, and the reason is structural rather than lucky: this
+// compiler's arm64 backend never allocates x18 at all. `masterGprs`
+// (compiler/arm64.bit) is x0..x8, x12..x15, x19..x28 — x18 is absent from
+// the allocatable file on every target, so no Bit value can ever live in it,
+// so there is nothing for a switch to preserve or destroy. An LLVM-based
+// backend needs a clobber here because its allocatable set includes x18; this
+// backend's does not.
+//
+// This is an argument from the backend's register file, so it is only as good
+// as that file. If `masterGprs` ever gains x18, this switch must gain a save
+// slot for it in the same change. The comment is the guard; the register list
+// above is the thing to re-read.
+//
+// ---------------------------------------------------------------------------
+// DELIBERATE DEVIATIONS FROM THE USUAL SHAPE, ALL DISCLOSED
+// ---------------------------------------------------------------------------
+//
+// 1. Callee-saved registers are saved explicitly rather than via clobbers.
+//    Forced by §11.6's exclusion semantics (above). Behaviourally identical:
+//    both preserve the caller's live state across the switch.
+//
+// 2. d8..d15 ARE preserved here; `runtime/sched/`'s clobber list names no FP
+//    register at all. That is a latent hazard in the original — this backend
+//    allocates d8..d15 as callee-saved (`isCalleeSavedFloat`), so a task
+//    holding a live float across a park would have it destroyed. Preserving
+//    strictly MORE state than the original cannot change queue discipline,
+//    ordering, or liveness; it only removes a corruption. Called out because
+//    "behavioural equivalence" is the rule and this is the one place this port
+//    is a superset.
+//
+//    THIS HALF IS NOT COVERED BY _tests_/stress/sched, and the gap is a
+//    notational one rather than an oversight. The test pins register
+//    preservation by writing sentinels into named physical registers and
+//    reserving them against the allocator with a `clobber` list — but §11.6
+//    admits only `x0`..`x30`, `sp` and `xzr` there, with no spelling for `d8`.
+//    So an FP sentinel cannot be protected from the allocator, and a check
+//    built on one would report the allocator's choices rather than the
+//    switch's. Mutating the d8 slot away is confirmed NOT to fail the suite.
+//    The 16 FP instructions are therefore carried on the strength of the
+//    encoding review (disassembled and read back) alone, which is weaker
+//    evidence than the rest of this file rests on. Treat them accordingly: the
+//    integer file is proven, the FP file is argued.
+//
+// 3. Atomics are sequentially consistent throughout, because §11.5 exposes no
+//    weaker ordering, where a scheduler would normally mix
+//    acquire/release/relaxed. SC is strictly stronger than every ordering it
+//    replaces, so every happens-before still holds.
+//
+// ---------------------------------------------------------------------------
+// MEMORY MODEL: EVERY STRUCTURE HERE IS CALLER-OWNED
+// ---------------------------------------------------------------------------
+//
+// A task control block, a deque and a global queue are each a WORD-INDEXED
+// BLOCK the caller supplies as a `*i64`, exactly as `runtime/alloc` and
+// `runtime/gc` take their arenas. Nothing here allocates, and none of this
+// memory may live on the GC heap: a `Task` holds a raw stack address with no
+// `GcHeader`, so tracing it would decode arbitrary bytes as an object header
+// (§11.11 makes the same argument for module state).
+//
+// It also keeps this file platform-free. Mapping a guarded stack is a syscall
+// on Linux and a libSystem call on Darwin, and §11.7/§11.8 reject even an
+// uncalled declaration of the wrong one, so the core cannot contain either.
+// The consumer maps the memory and hands it over — the same handoff
+// `gc/mem.bit` settled on.
+
+// ---------------------------------------------------------------------------
+// Saved register context
+// ---------------------------------------------------------------------------
+
+// Words in a saved context. Shared by both architectures; each uses the
+// prefix it needs — a word unused by one is never touched by that arch's
+// `asm` block, as `4..13` already worked before x64 used only `4..7`.
+//
+//   0        stack pointer
+//   1        resume address
+//   2        frame register   (x29 / rbp)
+//   3        link register    (x30) / rbx on x64
+//   4..13    arm64: x19..x28  |  x64: 4..7 r12..r15, 8..9 rsi/rdi (Win64-only)
+//   14..21   arm64: d8..d15   |  x64: 10..19 xmm6..xmm15, scalar (union-set
+//                                note above `schedSwitch`)
+//
+// x64 uses words 0..19 (spare 20-21); arm64 uses all 22. Neither total grew,
+// so `ctxWords` did not move and no `taskWords`/`workerWords` array resized.
+export const ctxWords: int = 22
+
+export const ctxSp: int = 0
+export const ctxPc: int = 1
+
+const stackAlign: int = 16
+
+// The entry-time stack-pointer bias, in bytes, for the architecture being
+// compiled: 8 on x86-64, 0 on AArch64.
+//
+// The two disagree and there is no way to split the difference. x86-64 enters a
+// function as though `call` had just pushed an 8-byte return address, so it
+// requires `rsp % 16 == 8`; AAPCS64 requires `sp % 16 == 0` and enforces it in
+// hardware — a misaligned `sp` faults on the first push. Biasing both alike
+// SIGBUSes on arm64, which is exactly how this was found.
+//
+// The value is read out of a one-instruction `asm` block rather than from
+// `hostTarget()` (§11.8) because `hostTarget` lowers to an out-of-line runtime
+// call, which a `@nosplit` body may not make. A single immediate move is inline
+// by construction, so it is legal in the nosplit callers below, and the
+// distinction it draws is architectural rather than per-target: the same answer
+// serves x86_64-linux, and both aarch64 targets share the other.
+@nosplit fn entryBias(): int {
+  return asm {
+    arm64 { 0xD2800000 }                 // mov x0, #0
+    x64 { 0xB8, 0x08, 0x00, 0x00, 0x00 } // mov eax, 8
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// Save the caller's callee-saved state into the context at `old`, restore the
+// context at `new`, and resume there. Returns when some later switch names this
+// context as its `new`.
+//
+// `volatile` is not spelled because §11.6 guarantees an `asm` block is never
+// dropped, hoisted or deduplicated regardless.
+//
+// `@nosplit` (§10.3.1) for two reasons, both load-bearing. A safepoint must
+// never land inside a half-saved context — the collector would read a task's
+// registers from a slot the switch has not written yet. And a task body that is
+// itself `@nosplit` (because the collector does not yet know its stack) can only
+// call other `@nosplit` functions, so an ordinary switch would be unreachable
+// from exactly the code that needs it. The block qualifies on the same proof as
+// the atomics: it is a fixed inline sequence that neither allocates nor calls.
+//
+// The arm64 `adr` displacement (+184 bytes = 46 words) is the distance from the
+// `adr` to the first word past `br`, hand-computed per §11.6 since there are no
+// block-local labels. The x64 `lea` displacement (+220) is measured the same
+// way, to the first byte past `jmp rax` — recomputed for the Win64 register
+// additions (#3335), see the union-set note above. BOTH ARE
+// POSITION-DEPENDENT ON THE INSTRUCTION COUNT: inserting or removing any
+// instruction in either block invalidates them silently — the program
+// branches into the middle of the block instead of resuming. There is no
+// check for this; _tests_/stress/sched is what catches it.
+export @nosplit fn schedSwitch(old: *i64, new: *i64) {
+  asm {
+    arm64 {
+      0x910003E2,                                     // mov x2, sp
+      0xF9000002,                                     // str x2, [x0, #0]
+      0x100005C2,                                     // adr x2, +184 (resume)
+      0xF9000402,                                     // str x2, [x0, #8]
+      0xF900081D, 0xF9000C1E,                         // str x29, x30
+      0xF9001013, 0xF9001414, 0xF9001815, 0xF9001C16, // str x19..x22
+      0xF9002017, 0xF9002418, 0xF9002819, 0xF9002C1A, // str x23..x26
+      0xF900301B, 0xF900341C,                         // str x27, x28
+      0xFD003808, 0xFD003C09, 0xFD00400A, 0xFD00440B, // str d8..d11
+      0xFD00480C, 0xFD004C0D, 0xFD00500E, 0xFD00540F, // str d12..d15
+      0xF9400022,                                     // ldr x2, [x1, #0]   sp
+      0xF9400423,                                     // ldr x3, [x1, #8]   pc
+      0xF940083D, 0xF9400C3E,                         // ldr x29, x30
+      0xF9401033, 0xF9401434, 0xF9401835, 0xF9401C36, // ldr x19..x22
+      0xF9402037, 0xF9402438, 0xF9402839, 0xF9402C3A, // ldr x23..x26
+      0xF940303B, 0xF940343C,                         // ldr x27, x28
+      0xFD403828, 0xFD403C29, 0xFD40402A, 0xFD40442B, // ldr d8..d11
+      0xFD40482C, 0xFD404C2D, 0xFD40502E, 0xFD40542F, // ldr d12..d15
+      0x9100005F,                                     // mov sp, x2
+      0xD61F0060,                                     // br x3
+    }
+    // old=rcx, new=rdx (union-set note above): [rcx+N]/[rdx+N] read as such.
+    x64 {
+      0x48, 0x8D, 0x05, 0xDC, 0x00, 0x00, 0x00,             // lea rax, [rip+220]
+      0x48, 0x89, 0x41, 0x08,                               // mov [rcx+8], rax
+      0x48, 0x89, 0x21,                                     // mov [rcx+0], rsp
+      0x48, 0x89, 0x69, 0x10,                               // mov [rcx+16], rbp
+      0x48, 0x89, 0x59, 0x18,                               // mov [rcx+24], rbx
+      0x4C, 0x89, 0x61, 0x20,                               // mov [rcx+32], r12
+      0x4C, 0x89, 0x69, 0x28,                               // mov [rcx+40], r13
+      0x4C, 0x89, 0x71, 0x30,                               // mov [rcx+48], r14
+      0x4C, 0x89, 0x79, 0x38,                               // mov [rcx+56], r15
+      0x48, 0x89, 0x71, 0x40,                               // mov [rcx+64], rsi
+      0x48, 0x89, 0x79, 0x48,                               // mov [rcx+72], rdi
+      0xF2, 0x0F, 0x11, 0x71, 0x50,                         // movsd [rcx+80], xmm6
+      0xF2, 0x0F, 0x11, 0x79, 0x58,                         // movsd [rcx+88], xmm7
+      0xF2, 0x44, 0x0F, 0x11, 0x41, 0x60,                   // movsd [rcx+96], xmm8
+      0xF2, 0x44, 0x0F, 0x11, 0x49, 0x68,                   // movsd [rcx+104], xmm9
+      0xF2, 0x44, 0x0F, 0x11, 0x51, 0x70,                   // movsd [rcx+112], xmm10
+      0xF2, 0x44, 0x0F, 0x11, 0x59, 0x78,                   // movsd [rcx+120], xmm11
+      0xF2, 0x44, 0x0F, 0x11, 0xA1, 0x80, 0x00, 0x00, 0x00, // movsd [rcx+128], xmm12
+      0xF2, 0x44, 0x0F, 0x11, 0xA9, 0x88, 0x00, 0x00, 0x00, // movsd [rcx+136], xmm13
+      0xF2, 0x44, 0x0F, 0x11, 0xB1, 0x90, 0x00, 0x00, 0x00, // movsd [rcx+144], xmm14
+      0xF2, 0x44, 0x0F, 0x11, 0xB9, 0x98, 0x00, 0x00, 0x00, // movsd [rcx+152], xmm15
+      0x48, 0x8B, 0x22,                                     // mov rsp, [rdx+0]
+      0x48, 0x8B, 0x6A, 0x10,                               // mov rbp, [rdx+16]
+      0x48, 0x8B, 0x5A, 0x18,                               // mov rbx, [rdx+24]
+      0x4C, 0x8B, 0x62, 0x20,                               // mov r12, [rdx+32]
+      0x4C, 0x8B, 0x6A, 0x28,                               // mov r13, [rdx+40]
+      0x4C, 0x8B, 0x72, 0x30,                               // mov r14, [rdx+48]
+      0x4C, 0x8B, 0x7A, 0x38,                               // mov r15, [rdx+56]
+      0x48, 0x8B, 0x72, 0x40,                               // mov rsi, [rdx+64]
+      0x48, 0x8B, 0x7A, 0x48,                               // mov rdi, [rdx+72]
+      0xF2, 0x0F, 0x10, 0x72, 0x50,                         // movsd xmm6, [rdx+80]
+      0xF2, 0x0F, 0x10, 0x7A, 0x58,                         // movsd xmm7, [rdx+88]
+      0xF2, 0x44, 0x0F, 0x10, 0x42, 0x60,                   // movsd xmm8, [rdx+96]
+      0xF2, 0x44, 0x0F, 0x10, 0x4A, 0x68,                   // movsd xmm9, [rdx+104]
+      0xF2, 0x44, 0x0F, 0x10, 0x52, 0x70,                   // movsd xmm10, [rdx+112]
+      0xF2, 0x44, 0x0F, 0x10, 0x5A, 0x78,                   // movsd xmm11, [rdx+120]
+      0xF2, 0x44, 0x0F, 0x10, 0xA2, 0x80, 0x00, 0x00, 0x00, // movsd xmm12, [rdx+128]
+      0xF2, 0x44, 0x0F, 0x10, 0xAA, 0x88, 0x00, 0x00, 0x00, // movsd xmm13, [rdx+136]
+      0xF2, 0x44, 0x0F, 0x10, 0xB2, 0x90, 0x00, 0x00, 0x00, // movsd xmm14, [rdx+144]
+      0xF2, 0x44, 0x0F, 0x10, 0xBA, 0x98, 0x00, 0x00, 0x00, // movsd xmm15, [rdx+152]
+      0x48, 0x8B, 0x42, 0x08,                               // mov rax, [rdx+8]
+      0xFF, 0xE0,                                           // jmp rax
+    }
+    input arm64 x0 x64 rcx = old
+    input arm64 x1 x64 rdx = new
+    clobber arm64 { x2, x3, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x30, memory }
+    clobber x64 { rax, rbx, rsi, rdi, r12, r13, r14, r15, memory }
+  }
+}
+
+// Round `addr` DOWN to the arch's entry-time stack alignment.
+//
+// Rounding down rather than up is deliberate: a stack grows downward from its
+// top, so the aligned top must stay inside the mapping. Rounding up would place
+// the first push above the last mapped byte — on a guarded mapping that is a
+// fault on the first call the task makes, and on an unguarded one it is silent
+// corruption of whatever follows.
+@nosplit fn alignDown(addr: int): int {
+  return addr - addr % stackAlign
+}
+
+// Build a fresh task's context at `ctx`, entering `entry` on a stack whose
+// highest usable address is `stackTop`.
+//
+// `entry` comes from `entryOf(f)` (§11.10) — a named function's code entry.
+// This is the call the whole task could not be constructed without, and the
+// reason #1364 sat blocked: `int(f)` yields the closure OBJECT's heap address,
+// which differs on every run, so a context built from it branches into the heap.
+//
+// The entered function is reached by a plain branch, never a call, so it takes
+// no arguments and MUST NOT RETURN — there is no return address for it to
+// return through (the link register is left 0 on arm64, and the x64 word at the
+// initial `sp` is uninitialized stack). It recovers what to run from scheduler
+// state and switches away when finished.
+export @nosplit fn schedTaskContext(ctx: *i64, stackTop: int, entry: *byte) {
+  *(ctx + ctxSp) = alignDown(stackTop) - entryBias()
+  *(ctx + ctxPc) = int(entry)
+  let i = 2
+  while (i < ctxWords) {
+    *(ctx + i) = 0
+    i = i + 1
+  }
+}
+
+// The lock word of a queue block, as the `*i32` `runtime/spinlock` requires.
+//
+// `spinlock.bit` fixed on i32 because §11.5 needs an integer prim and 32 bits
+// is the conventional lock width. These blocks are word-indexed `*i64`, so the
+// cell has to be re-addressed at its own width: a `*i32` scales by 4, so the
+// byte address divided by 4 off the null pointer names the same cell. This is
+// §11.4's stated inverse of pointer arithmetic, and the low half of the word is
+// the one the spinlock touches on both targets (both are little-endian).
+@nosplit fn lockOf(q: *i64, slot: int): *i32 {
+  let z: *i32 = nil
+  return z + int(q + slot) / 4
+}
