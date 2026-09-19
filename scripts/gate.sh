@@ -64,6 +64,16 @@
 #                                      # silent fallback, never a false pass.
 #                                      # A gate registered since the baseline
 #                                      # is always force-run.
+#   scripts/gate.sh --plan             # print BUCKET, REASON and the exact
+#                                      # step plan (same text as a real run)
+#                                      # and exit 0 — RUNS NOTHING, not even
+#                                      # the differential/`./make` steps a
+#                                      # resolved plan names (#5618). The only
+#                                      # way to answer "what would this
+#                                      # select?" without paying for it; every
+#                                      # other flag above composes with it
+#                                      # (the plan shown is whatever that
+#                                      # combination would have selected).
 #
 # EXIT CODES:
 #   0  ran and PASSED — covers GATE_RESULT=PASS and the two distinct
@@ -93,6 +103,16 @@
 #      sibling and reports GATE_RESULT=FAIL/exit 1 — re-run
 #      `scripts/gate.sh` (or the named script directly) when the machine is
 #      quieter.
+#   5  the resolved plan (BUCKET_PRE/BUCKET_POST/BUILD_STEPS) includes a
+#      scripts/selfhost-*.sh differential or the bare `test` step, and $PWD is
+#      under .claude/worktrees/ (GATE_RESULT=WORKTREE_REFUSED, #5618). NOTHING
+#      RAN. `scripts/gate.sh` on its own can print this same plan (the "gate:
+#      plan:" lines below) from a worktree with zero enforcement — the hook
+#      that refuses `./make test`/`./make test-differentials` only matches
+#      those literal argv strings, and never sees what a script it approved
+#      goes on to run internally. Run `scripts/gate.sh --plan` for the same
+#      preview with no possibility of this refusal, or ask the integrator to
+#      run it from the shared checkout, drained, under boxlock.sh solo.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
 # _tests_/cases/, examples/, stdlib/, pkg/, docs/**/*.md, or spec/SPEC.md runs
@@ -256,6 +276,7 @@ FULL=0
 RESUME=0
 MARK_GREEN=0
 UNION=0
+PLAN=0
 TARGET=local
 for arg in "$@"; do
   case "$arg" in
@@ -263,10 +284,11 @@ for arg in "$@"; do
     --resume) RESUME=1 ;;
     --mark-green) MARK_GREEN=1 ;;
     --union) UNION=1 ;;
+    --plan) PLAN=1 ;;
     --x64) TARGET=x64 ;;
     --arm64) TARGET=arm64 ;;
     *)
-      echo "gate: unknown flag '${arg}' (expected --full, --resume, --mark-green, --union, --x64, or --arm64)" >&2
+      echo "gate: unknown flag '${arg}' (expected --full, --resume, --mark-green, --union, --plan, --x64, or --arm64)" >&2
       exit 2
       ;;
   esac
@@ -619,6 +641,43 @@ if [ "${TARGET}" != "local" ]; then
   if [ -n "${PRE_SCRIPTS}${POST_SCRIPTS}" ] || [ "${has_windows}" -eq 1 ]; then
     echo "gate: note: the compiler/examples diff script(s) above run LOCALLY even under --${TARGET} — they need both compilers already built on this machine, not just the remote build steps."
   fi
+fi
+
+# --plan (#5618): the plan above is exactly what runs next — stop here,
+# before any of it does.
+if [ "${PLAN}" -eq 1 ]; then
+  echo "GATE_RESULT=PLAN"
+  exit 0
+fi
+
+# #5618: a worktree invocation of `scripts/gate.sh` with NO flags at all
+# reaches this same point, and the loop below runs PRE_SCRIPTS/`./make
+# ${BUILD_STEPS[*]}`/POST_SCRIPTS for real — including any
+# scripts/selfhost-*.sh differential and the bare `test` step `full`'s
+# BUILD_STEPS names. dev-speed-rules.sh's hook pattern-matches only the
+# literal argv of the Bash tool call it is asked to approve ("./make
+# test"/"./make test-differentials"); it has no way to see that the call it
+# just approved, `scripts/gate.sh` itself, is about to shell out to those
+# same steps internally. Refuse here instead, in the one place every
+# bucket's plan already flows through, rather than teaching the hook to
+# re-derive a bucket it cannot compute without running this file.
+WORKTREE_HIT=""
+case "${PWD}" in
+  */.claude/worktrees/task-*)
+    for s in ${PRE_SCRIPTS} ${POST_SCRIPTS}; do
+      case "${s}" in scripts/selfhost-*.sh) WORKTREE_HIT="${WORKTREE_HIT}${s} " ;; esac
+    done
+    for s in "${BUILD_STEPS[@]}"; do
+      [ "${s}" = "test" ] && WORKTREE_HIT="${WORKTREE_HIT}(./make test) "
+    done
+    ;;
+esac
+if [ -n "${WORKTREE_HIT}" ]; then
+  echo "gate: REFUSED: this plan runs ${WORKTREE_HIT}from a worktree (${PWD})." >&2
+  echo "gate: an agent worktree never runs a differential or the full suite as a side effect of a plain gate.sh call (#5618)." >&2
+  echo "gate: use 'scripts/gate.sh --plan' to preview with zero execution, or ask the integrator to run this from the shared checkout under boxlock.sh solo." >&2
+  echo "GATE_RESULT=WORKTREE_REFUSED"
+  exit 5
 fi
 
 OVERALL_RC=0
