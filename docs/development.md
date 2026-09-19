@@ -426,7 +426,7 @@ green differential as the stronger claim.
 **A second, separate limit: `diffir`/`diffiropt`/`difftypes` never run the
 resolver, so they cannot see a bug that only exists on the resolver-active
 path.** `--dump-ir-pre`/`--dump-ir`/`--dump-types` all reach `checkModule`
-through `lowerSourceModule`/`checkSourceDump` (`compiler/lowerdriver.bit:312`,
+through `lowerSourceModule`/`checkSourceDump` (`compiler/lowerdriver.bit:38`,
 `compiler/checkmodule.bit:510`) and never call `resolveModule`.
 `compiler/check.bit:163`'s own field comment says so: `nodeSymbols` is "[e]mpty
 on the bare dump entry points ... checkExprType falls back to the flat env
