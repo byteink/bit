@@ -204,7 +204,7 @@ one deeper indent level, preserving the author's own item grouping (`grouped`,
 `compiler/fmtwrap.bit:256-285`) - two items the source kept on the same line stay
 on the same output line when the list is already exploding for some other
 item's sake. `{`/`}` pad with an inner space when the whole thing renders
-flat (`Point{x: 0}` → `Point{ x: 0 }`).
+flat (`map<string, int>{"a": 1}` → `map<string, int>{ "a": 1 }`).
 
 **Check:** a hand-wrapped multi-line comma list (one item per source line, or
 broken right after the opener) is never rejoined by `bit fmt`, no matter how
