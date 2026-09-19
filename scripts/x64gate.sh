@@ -88,7 +88,11 @@ gate_stream() { git archive HEAD; baseline_archive; }
 # Which real-x86_64 box runs the gate. No hostname is baked into the repo —
 # machine names are the operator's, not the project's. Resolution order:
 #   1. $X64GATE_HOST
-#   2. scripts/.x64gate-host  (gitignored, one line: an ssh host alias)
+#   2. scripts/.x64gate-host  (gitignored, one line: an ssh host alias) --
+#                              PROBED with the same 8s ConnectTimeout budget
+#                              x64host.sh's candidates use; an unreachable pin
+#                              is skipped, not fatal, so a stale pin cannot
+#                              send the gate to a dead host
 #   3. scripts/x64host.sh     (shared resolver: $BIT_X64_HOST, $BIT_X64_HOSTS,
 #                              $BIT_X64_HOSTS_FILE, ./.x64hosts,
 #                              ~/.config/bit/x64hosts — first candidate that
@@ -101,7 +105,16 @@ gate_stream() { git archive HEAD; baseline_archive; }
 # byte-identical image and a host swap cannot change what is being tested.
 X64GATE_HOST="${X64GATE_HOST:-}"
 if [ -z "${X64GATE_HOST}" ] && [ -f "$(dirname "$0")/.x64gate-host" ]; then
-  X64GATE_HOST=$(tr -d '[:space:]' < "$(dirname "$0")/.x64gate-host")
+  PIN_HOST=$(tr -d '[:space:]' < "$(dirname "$0")/.x64gate-host")
+  if [ -n "${PIN_HOST}" ]; then
+    # Same probe x64host.sh's _probe uses: </dev/null so ssh does not drain
+    # the caller's stdin (#3899).
+    if ssh -o ConnectTimeout=8 -o BatchMode=yes "${PIN_HOST}" true </dev/null >/dev/null 2>&1; then
+      X64GATE_HOST="${PIN_HOST}"
+    else
+      echo "x64gate: scripts/.x64gate-host names ${PIN_HOST}, which did not answer ssh within 8s -- skipping the pin and falling through to scripts/x64host.sh" >&2
+    fi
+  fi
 fi
 if [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; then
   # Opt-in: every reachable candidate, not just the first that answers — see
