@@ -1,0 +1,160 @@
+// Self-host (#3329, epic #3322): atom placement primitives and the
+// reachability walk pelink.bit's driver runs before it lays anything out —
+// split out of pelink.bit (docs/development.md's 800-line rule) once #3842's
+// `:` -> `=` separator sweep pushed the canonical-formatted file back over
+// the ceiling. Mirrors machogot.bit's shape: PlLinkState/plDeadStripWithImports
+// is the PE counterpart of macholink.bit's meDeadStripWithImports, walking
+// from `_start` with plUndefinedIsImport deciding which still-undefined
+// globals are DLL imports rather than link errors (see the module comment on
+// pelink.bit for the full pipeline). plPlaceAtoms/plCollect assign RVAs to
+// the kept atoms the walk found; pelink.bit's driver calls both in sequence
+// and owns everything downstream (layout, relocation application,
+// header/section emission, ingest). Named for readability, sorting bytewise
+// after "pelink.bit"; sibling .bit files are the same module, so no import
+// is needed for either side to call the other.
+
+// ---- atom placement -------------------------------------------------------
+
+// An atom assigned an RVA (relative to the image base — NOT a file offset;
+// see the module comment on why those differ here).
+class PlPlaced {
+  id: int,
+  rva: int,
+}
+
+// Assigns each atom in `items` an RVA, honouring its own alignment, and
+// returns the cursor past the last one. Structs are reference types, so the
+// PlPlaced records are updated in place.
+fn plPlaceAtoms(modules: []LoModule, items: []PlPlaced, cursor: int): int {
+  let c = cursor
+  let i = 0
+  while (i < len(items)) {
+    let a = modules[atomKeyModule(items[i].id)].atoms[atomKeyAtom(items[i].id)]
+    c = alignForward(c, a.alignment)
+    items[i].rva = c
+    c = c + a.size
+    i = i + 1
+  }
+  return c
+}
+
+// The atoms of one output class, in module then declaration order.
+fn plCollect(modules: []LoModule, kept: map<int, bool>, kind: LoSectionKind): []PlPlaced {
+  let out = []PlPlaced(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let id = atomKey(mi, ai)
+      let (_, keep) = kept[id]
+      if (keep && atoms[ai].kind == kind) {
+        out = append(out, PlPlaced{ id = id, rva = 0 })
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return out
+}
+
+// ---- reachability walk with DLL imports as leaves --------------------------
+
+// Whether an undefined global referenced from module `mi` is a legitimate
+// DLL import rather than a link error. Mirrors machogot.bit's
+// meUndefinedIsImport: an ARCHIVE member (libbitrt.a) is externally-linked
+// code whose undefined names ARE the Windows surface; the PROGRAM object is
+// emitted by us, so every name in it must resolve except a declared §11.7
+// `extern function` (exactly `allowedImports`).
+fn plUndefinedIsImport(
+  mi: int, name: string, programModules: int,
+  allowedImports: []string,
+): bool {
+  if (mi >= programModules) {
+    return true
+  }
+  for a of allowedImports {
+    if (a == name) {
+      return true
+    }
+  }
+  return false
+}
+
+class PlLinkState {
+  kept: map<int, bool>,
+  // Undefined globals, in first-seen order — these become DLL imports. Order
+  // is load-bearing: stub placement and the IAT index into this (after
+  // DLL-grouping) both key off it.
+  importOrder: []string,
+}
+
+// Walks the reachability graph from `_start`. An undefined global is not
+// automatically an error — it may be a DLL import (plUndefinedIsImport
+// decides), and then it is a leaf. Only a Pc32 (call/lea rel32) reference may
+// target an import: this compiler never takes an extern function's address as
+// data, only ever calls it, so an Abs64 pointed at an import is refused
+// rather than guessed at (mirrors the reference linker's `isBranch` gate).
+fn plDeadStripWithImports(
+  modules: []LoModule, globals: map<string, int>,
+  programModules: int, allowedImports: []string,
+): PlLinkState! {
+  let kept = map<int, bool>{}
+  let importOrder = []string(0)
+  let importSeen = map<string, bool>{}
+
+  let (entry, hasEntry) = globals[plEntrySymbol()]
+  if (!hasEntry) {
+    fail newError("pe: missing entry symbol ${plEntrySymbol()}")
+  }
+  kept[entry] = true
+  let stack = [entry]
+  while (len(stack) > 0) {
+    let id = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    let atom = modules[atomKeyModule(id)].atoms[atomKeyAtom(id)]
+    let r = 0
+    while (r < len(atom.relocs)) {
+      let rel = atom.relocs[r]
+      if (rel.kind != LoRelocKind.Pc32 && rel.kind != LoRelocKind.Abs64) {
+        fail newError("pe: unsupported relocation kind")
+      }
+      if (!rel.target.isGlobal) {
+        let tid = atomKey(atomKeyModule(id), rel.target.local)
+        let (_, seen) = kept[tid]
+        if (!seen) {
+          kept[tid] = true
+          stack = append(stack, tid)
+        }
+      } else {
+        let (tid, defined) = globals[rel.target.name]
+        if (defined) {
+          let (_, seen) = kept[tid]
+          if (!seen) {
+            kept[tid] = true
+            stack = append(stack, tid)
+          }
+        } else {
+          if (!plUndefinedIsImport(
+            atomKeyModule(id),
+            rel.target.name,
+            programModules,
+            allowedImports,
+          )) {
+            fail newError("undefined symbol '${rel.target.name}', referenced from ${modules[atomKeyModule(id)].name}")
+          }
+          if (rel.kind != LoRelocKind.Pc32) {
+            fail newError("pe: unsupported non-call reference to import '${rel.target.name}'")
+          }
+          let (_, known) = importSeen[rel.target.name]
+          if (!known) {
+            importSeen[rel.target.name] = true
+            importOrder = append(importOrder, rel.target.name)
+          }
+        }
+      }
+      r = r + 1
+    }
+  }
+  return PlLinkState{ kept = kept, importOrder = importOrder }
+}
