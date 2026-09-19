@@ -21,7 +21,7 @@ class User {
 }
 
 fn userSeed(n: i64): User {
-  return User{ email: "user${n}@example.test", name: "User ${n}" }
+  return User{ email = "user${n}@example.test", name = "User ${n}" }
 }
 
 fn insertOneUser(pool: Pool, seq: Seq): ()! {
@@ -44,7 +44,7 @@ next test runs.
 returns a `User` built from `seq`'s next value. `make`/`create` do not fill
 `userSeed`'s fields for you the way `orm.make<User>(email = "a@b.c")` might
 suggest - a function generic over an unconstrained `T` cannot build a `T{
-field: value }` composite literal, because the compiler has to know `T`'s
+field = value }` composite literal, because the compiler has to know `T`'s
 field names to check one, and an unconstrained type parameter carries none
 (the same E0057 gap [Write](write.md)'s own header documents). `userSeed` is
 that one place your entity's shape is spelled out, written once per entity,

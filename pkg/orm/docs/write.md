@@ -24,9 +24,9 @@ import { AttrDesc, FieldDesc, Value } from "std/sql"
 
 fn personDesc(): TableDesc {
   return TableDesc{
-    table: "people",
-    fields: Person{ id: 0, name: "", email: "" }.tableDescriptor(),
-    classAttrs: []AttrDesc(0),
+    table = "people",
+    fields = Person{ id = 0, name = "", email = "" }.tableDescriptor(),
+    classAttrs = []AttrDesc(0),
   }
 }
 
@@ -58,12 +58,12 @@ fn intValue(v: Value): i64 {
 }
 
 fn createPerson(db: Data, name: string, email: string): Person! {
-  let p = Person{ id: 0, name: name, email: email }
+  let p = Person{ id = 0, name = name, email = email }
   return savePerson(db, p)?
 }
 ```
 
-`Person{ id: 0, name: name, email: email }` is a composite literal, so
+`Person{ id = 0, name = name, email = email }` is a composite literal, so
 `p.isPersisted()` reads `false` and `save` emits an `INSERT` naming every
 column, `id` included, as a `$n` placeholder - never the value pasted into
 the SQL text. Postgres hands the row it actually wrote back through

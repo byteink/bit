@@ -26,14 +26,14 @@ import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql
 fn personMapper(rows: Rows): Person! {
   let cols = rows.columns()
   return Person{
-    id: sqlReqInt(rows, cols, "id")?,
-    name: sqlReqText(rows, cols, "name")?,
-    email: sqlReqText(rows, cols, "email")?,
+    id = sqlReqInt(rows, cols, "id")?,
+    name = sqlReqText(rows, cols, "name")?,
+    email = sqlReqText(rows, cols, "email")?,
   }
 }
 
 fn people(db: Data): Query<Person> {
-  let fields = Person{ id: 0, name: "", email: "" }.tableDescriptor()
+  let fields = Person{ id = 0, name = "", email = "" }.tableDescriptor()
   return find<Person>(db, "people", fields, personMapper)
 }
 

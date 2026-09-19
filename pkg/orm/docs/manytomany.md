@@ -45,13 +45,13 @@ import { AttrDesc, FieldDesc, Rows, sqlReqInt } from "std/sql"
 }
 
 fn idField(): FieldDesc {
-  return FieldDesc{ name: "id", typeName: "i64", attrs: []AttrDesc(0) }
+  return FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }
 }
 
 fn postTagsDesc(): ManyToManyDesc {
   return ManyToManyDesc{
-    joinTable: "post_tags", ownerColumn: "post_id", ownerTable: "posts", ownerIdColumn: "id",
-    targetColumn: "tag_id", targetTable: "tags", targetIdColumn: "id",
+    joinTable = "post_tags", ownerColumn = "post_id", ownerTable = "posts", ownerIdColumn = "id",
+    targetColumn = "tag_id", targetTable = "tags", targetIdColumn = "id",
   }
 }
 ```
@@ -112,11 +112,11 @@ that stops being enough.
 ```bit
 fn tagMapper(rows: Rows): Tag! {
   let cols = rows.columns()
-  return Tag{ id: sqlReqInt(rows, cols, "id")?, posts: []Post(0) }
+  return Tag{ id = sqlReqInt(rows, cols, "id")?, posts = []Post(0) }
 }
 
 fn postMapper(rows: Rows): Post! {
-  return Post{ id: sqlReqInt(rows, rows.columns(), "id")?, tags: []Tag(0) }
+  return Post{ id = sqlReqInt(rows, rows.columns(), "id")?, tags = []Tag(0) }
 }
 
 fn tagsLoader(): RelationLoader<Post> {

@@ -28,8 +28,8 @@ import { now } from "std/time"
 
 fn personDesc(): TableDesc {
   return TableDesc{
-    table: "people",
-    fields: Person{ id: 0, name: "", email: "", createdAt: 0, updatedAt: 0 }.tableDescriptor(),
+    table = "people",
+    fields = Person{ id = 0, name = "", email = "", createdAt = 0, updatedAt = 0 }.tableDescriptor(),
   }
 }
 
@@ -88,14 +88,14 @@ import { update } from "orm"
 import { withUpdatedAt } from "orm"
 
 fn renamePerson(db: Data, id: i64, name: string): int! {
-  let fields = Person{ id: 0, name: "", email: "", createdAt: 0, updatedAt: 0 }.tableDescriptor()
+  let fields = Person{ id = 0, name = "", email = "", createdAt = 0, updatedAt = 0 }.tableDescriptor()
   let p = update<Person>(db, "people", fields).where("id", Value.Int(id)).set(
     "name",
     Value.Text(name),
   )
   return withUpdatedAt(
     p,
-    Person{ id: 0, name: "", email: "", createdAt: 0, updatedAt: 0 }.tableAttrs(),
+    Person{ id = 0, name = "", email = "", createdAt = 0, updatedAt = 0 }.tableAttrs(),
     now(),
   ).run()?
 }

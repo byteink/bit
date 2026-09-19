@@ -25,9 +25,9 @@ import { AttrDesc, FieldDesc, Value } from "std/sql"
 
 fn accountDesc(): TableDesc {
   return TableDesc{
-    table: "accounts",
-    fields: Account{ id: 0, version: 0, balanceCents: 0 }.tableDescriptor(),
-    classAttrs: []AttrDesc(0),
+    table = "accounts",
+    fields = Account{ id = 0, version = 0, balanceCents = 0 }.tableDescriptor(),
+    classAttrs = []AttrDesc(0),
   }
 }
 

@@ -21,8 +21,8 @@ import { AttrDesc, FieldDesc, Value } from "std/sql"
 
 fn personDesc(): TableDesc {
   return TableDesc{
-    table: "people",
-    fields: Person{ id: 0, name: "", email: "" }.tableDescriptor(),
+    table = "people",
+    fields = Person{ id = 0, name = "", email = "" }.tableDescriptor(),
   }
 }
 

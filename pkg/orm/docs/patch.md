@@ -22,7 +22,7 @@ import { AttrDesc, FieldDesc, Value } from "std/sql"
 }
 
 fn personFields(): []FieldDesc {
-  return Person{ id: 0, name: "", email: "", lastSeenAt: 0 }.tableDescriptor()
+  return Person{ id = 0, name = "", email = "", lastSeenAt = 0 }.tableDescriptor()
 }
 
 fn touchLastSeen(db: Data, id: i64, now: i64): int! {
@@ -125,7 +125,7 @@ fn setBalanceBlind(db: Data, id: i64, newCents: i64): int! {
   return update<Account>(
     db,
     "accounts",
-    Account{ id: 0, version: 0, balanceCents: 0 }.tableDescriptor(),
+    Account{ id = 0, version = 0, balanceCents = 0 }.tableDescriptor(),
   ).where("id", Value.Int(id)).set("balanceCents", Value.Int(newCents)).run()?
 }
 ```
