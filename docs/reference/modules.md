@@ -174,7 +174,7 @@ fn main() {
   let ms = memoryStore()
   let store: Store = ms
   let code = shortCode(12345)
-  store.put(code, Link{ url: "https://example.com", created: 0, hits: 0, expiresAt: 0 })
+  store.put(code, Link{ url = "https://example.com", created = 0, hits = 0, expiresAt = 0 })
 
   let lookups = counter<string>()
   lookups.bump(code)

@@ -7,7 +7,7 @@ Stage 03 of the shortener stores links in a bare `map<string, Link>`, and
 
 ```bit ignore
 let links = map<string, Link>()
-links[code] = Link{ url: "https://example.com", created: 0, hits: 0 }
+links[code] = Link{ url = "https://example.com", created = 0, hits = 0 }
 let l = links[code]
 ```
 

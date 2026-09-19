@@ -1898,7 +1898,7 @@ exponent, used for blinding), `d` (private exponent), and the CRT parameters
 Build one with `rsaParsePrivateKey` / `rsaParsePkcs1PrivateKey`. A class literal
 must name **all eight** fields: `Nat` is itself a class, and a class-typed
 field has no zero value, so leaving one out is `E0083` (spec §13.4). There is no
-`RsaPrivateKey{ n: ..., e: ..., d: ... }` short form.
+`RsaPrivateKey{ n = ..., e = ..., d = ... }` short form.
 
 ### `rsaParsePublicKey(der: []byte): RsaPublicKey!`
 
