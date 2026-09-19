@@ -42,6 +42,29 @@ take() {
   REMAINING="$(printf '%s\n' "${REMAINING}" | grep -vxF -e "${BODY}" || true)"
 }
 
+# Internal task ids are meaningless to a reader: nothing outside this workspace
+# can resolve one, and this repo writes `(#NNNN)` into almost every commit
+# subject. Strip them as the subject is rendered, so a release note cannot carry
+# one whatever the commit said. The short sha stays - anyone with a clone can
+# resolve that, which is exactly what the id is not.
+#
+# Three shapes, in order, because the later rules would mangle the earlier ones:
+#   1. a parenthetical group opening with the id, with or without trailing words
+#      ("(#3842)", "(#5597 fallout)", "(#1906/#4253)")
+#   2. a possessive ("#5604's split") -> "the split", which keeps the sentence
+#      grammatical; deleting the token outright leaves "after split"
+#   3. anything else still bare
+# Deliberately NO punctuation tidying. An earlier draft collapsed " :" to ":"
+# and corrupted the subject "fmt: emit = for keyed class field inits, not :",
+# whose trailing colon is the thing the commit is about.
+stripInternalRefs() {
+  sed -E -e 's/[[:space:]]*\(#[0-9]{2,6}[^)]*\)//g' \
+         -e "s/#[0-9]{2,6}'s/the/g" \
+         -e 's/(^|[^0-9A-Za-z_])#[0-9]{2,6}([^0-9A-Za-z_]|$)/\1\2/g' \
+         -e 's/[[:space:]]{2,}/ /g' \
+         -e 's/[[:space:]]+$//'
+}
+
 emit() {
   local title="$1" body="$2"
   [ -n "${body}" ] || return 0
@@ -50,7 +73,8 @@ emit() {
   printf '%s\n' "${body}" | while IFS='|' read -r subject sha; do
     printf -- '- %s (%s)\n' \
       "$(printf '%s' "${subject}" \
-         | sed -E 's/@([A-Za-z0-9][A-Za-z0-9-]*)/`@\1`/g')" \
+         | sed -E 's/@([A-Za-z0-9][A-Za-z0-9-]*)/`@\1`/g' \
+         | stripInternalRefs)" \
       "${sha}"
   done
   printf '\n'

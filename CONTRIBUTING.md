@@ -44,7 +44,7 @@ changes the spec **in the same commit**, not afterwards.
    instead of guessing - exit 3, nothing run, printing what to do next - except
    a `stdlib/**` change paired only with its own mandatory
    `docs/stdlib/<mod>.md` page, which stays scoped rather than forcing full
-   (#3055 - `_tests_/bit/stdlibdocs.bit` makes that page mandatory, so an
+   (`_tests_/bit/stdlibdocs.bit` makes that page mandatory, so an
    ordinary stdlib-export change always spans both). Run `scripts/gate.sh
    --full` or `./make test` directly (every gate, 18-18.5 min) to actually
    verify a change like that. Do not skip a red step - a hang counts as a
@@ -81,7 +81,7 @@ Verification happens on machines that can actually prove things:
 - `scripts/gate.sh` reads your diff and runs only the steps it can affect,
   refusing (exit 3, nothing run) rather than falling back to the full
   `./make test` when the change is cross-cutting - run `scripts/gate.sh --full`
-  or `./make test` directly to verify one of those yourself (#2872).
+  or `./make test` directly to verify one of those yourself.
 - `scripts/arm64gate.sh` and `scripts/x64gate.sh` run the suite on real
   aarch64-linux and real x86-64 Linux. The x86-64 host is resolved by
   `scripts/x64host.sh` from a machine-local list, never hardcoded - an emulated

@@ -77,6 +77,5 @@ done < /tmp/leaves.txt
 the `data` branch, so copied in here from `main` at the same retrieval date).
 
 Exclusions this package cannot pass without a change to `pkg/yaml`'s own
-`*.bit` files (none of which this ticket owns or edits) are listed on smash
-ticket #5500, grouped by root cause, and enumerated in
+`*.bit` files are enumerated, grouped by root cause, in
 `pkg/yaml/corpus.test.bit`'s own `corpusExclusionList()`.

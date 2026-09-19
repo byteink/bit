@@ -6,11 +6,11 @@ Dates, times, time zones, durations, clocks and timers.
 
 ## Status of this document
 
-The calendar rewrite that replaces the superseded, UTC-only `Civil` API (#4062)
+The calendar rewrite that replaces the superseded, UTC-only `Civil` API
 has landed: this page documents the shipped `Date`/`Time`/`NaiveDateTime`/
 `DateTime`/`Timestamp`/`Zone` API throughout, and `Civil`, `civilFromUnix`,
 `unixFromCivil`, `formatUnix`, `formatRfc3339`, `parseRfc3339` and `utcOffset`
-have been deleted (#4084) rather than merely superseded.
+have been deleted rather than merely superseded.
 
 Every function this page documents is implemented; every example compiles.
 

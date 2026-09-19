@@ -30,8 +30,8 @@ bit init: bit.json already exists - refusing to overwrite
 
 `[name]`, when given, is written verbatim: `{"name": "<name>", "dependencies":
 {}}`. Omitted, it defaults to the current directory's own basename
-(`defaultInitName`, `compiler/pmcliinit.bit:85`, via `std/fs`'s `cwd()` -
-#3502), the way `npm init -y` derives one from
+(`defaultInitName`, `compiler/pmcliinit.bit:85`, via `std/fs`'s `cwd()`),
+the way `npm init -y` derives one from
 `path.basename(process.cwd())`. If that basename is not usable - empty, or
 holding a path separator (`isUsableProjectName`, same file) - `bit init`
 fails instead of writing an unnamed manifest; pass `[name]` explicitly in
@@ -268,7 +268,7 @@ bit list
 
 Prints each of the project's *direct* dependencies - the ones declared in
 `bit.json` - one line each: name, the spec `bit.json` records for it, and
-the commit `bit.lock` resolved it to (#2271). A transitive dependency (one
+the commit `bit.lock` resolved it to. A transitive dependency (one
 reachable only through another dependency's own `requires`) is not listed -
 it has no entry of its own in `bit.json`, only inside a direct dependency's
 `bit.lock` `requires` map.
@@ -468,7 +468,7 @@ An import naming something absent from `bit.lock` fails with a hint to run
 `bit add`, rather than reaching for the network mid-build - `bit build` never
 adds an unlocked dependency itself.
 
-`bit doc <name>` (#2271) resolves the same way, so a dependency's exported
+`bit doc <name>` resolves the same way, so a dependency's exported
 surface is reachable by the name a program imports it by rather than the
 on-disk cache path it happens to be fetched to: a name declared in
 `bit.lock` first, then a `std/x` name against the standard library, and

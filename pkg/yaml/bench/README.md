@@ -22,18 +22,18 @@ never installed on the machine itself. `BENCH_RUNS` overrides the run count
 
 Both competitors are pinned: `apps/yamlv3/go.{mod,sum}` and
 `apps/goccy/go.{mod,sum}` are committed, and `build_go` never runs `go get`
-at build time. This matches the policy `pkg/toml/bench` (#5488) was
+at build time. This matches the policy `pkg/toml/bench` was
 converted to, not `pkg/web/bench/apps/gin`'s bare `go.mod`: a published
 figure that cannot be reproduced next month, against whatever goccy/go-yaml
-or yaml.v3 happened to resolve to on the day it ran, is worse than no figure
-(#5559). The pinned version is read back out of `go.mod` and published in
+or yaml.v3 happened to resolve to on the day it ran, is worse than no figure.
+The pinned version is read back out of `go.mod` and published in
 the block's `Versions:` line, never resolved separately from what was
 actually built. Bumping either pin is a deliberate, reviewed change to this
 repo, the same as any other dependency version bump.
 
 The Go image is `${BENCH_GO_IMAGE:-golang:1.25}` - same env var name and
 same default tag as `pkg/toml/bench/run.sh`, so the two sibling harnesses'
-Go-comparison numbers are read against the same toolchain (#5559).
+Go-comparison numbers are read against the same toolchain.
 
 ## What is compared, and what is not
 
@@ -84,4 +84,4 @@ Bit's own driver does not pay.
 the repo tree entirely - `${BENCH_CACHE_DIR:-$TMPDIR/bit-bench-gomod/yaml}` -
 because Go writes module-cache files mode 0444, and a cache under `out/`
 survives into `git worktree remove`, which then fails with Permission
-denied (#5559).
+denied.
