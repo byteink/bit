@@ -655,7 +655,22 @@ case "${BUCKET}" in
     BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags)
     ;;
   spec)
-    BUILD_STEPS=(test-spec)
+    # test-fmt-citations (#5615) is spec's second gate. test-spec alone is a
+    # self-contained grammar check over spec/SPEC.md's own productions — it
+    # never reads a CITING file — so it cannot catch what a line-count-
+    # changing edit does to every `spec/SPEC.md:<line>` citation below the
+    # edit point, and those citations live in _tests_/bit/**, compiler/**
+    # and tools/build/**, none of which this bucket touches. #5611 (a net
+    # -1 line edit to spec/SPEC.md's S12.2) passed this bucket at `test-spec`
+    # and reddened test-fmt-citations on merged main; fixed by hand in
+    # 26734e61. Reproduced on 6fd9efc5: a one-line insertion above
+    # spec/SPEC.md:70 passes `./make test-spec` and this bucket's plan never
+    # names test-fmt-citations, while `./make test-fmt-citations` run
+    # directly on the same diff fails with 12 finding(s) (drifted citations
+    # in compiler/arm64compile.bit, compiler/lexinvisible.bit,
+    # _tests_/bit/checkercases/** and three _tests_/bit/fmtcitations/**
+    # files). Already registered in `full`.
+    BUILD_STEPS=(test-spec test-fmt-citations)
     ;;
   testsbit)
     # Populated from `testsbit_steps`, which the bucket-selection above
@@ -697,20 +712,29 @@ esac
 }
 
 # #4136's FOURTH NARROW EXCEPTION — same shape as union_testsbit_steps() just
-# above: folds one extra gate (test-spec) into whichever bucket
-# build_steps_for_bucket already selected, rather than owning a bucket of its
-# own. SPEC_PARTNER (scripts/gate.sh, set ahead of bucket selection) is empty
-# unless the diff resolved BUCKET by way of the spec-pairing exception, so
-# this is a no-op for every other bucket, including `full` (test-spec already
-# runs there via the aggregate `test` step) and `testsbit`/`stdlibdocs` (spec
-# cannot pair with either — see SPEC_PARTNER's own computation).
+# above: folds spec/SPEC.md's own gates (test-spec, and test-fmt-citations
+# since #5615 — see the `spec` bucket's own comment above) into whichever
+# bucket build_steps_for_bucket already selected, rather than owning a
+# bucket of its own. SPEC_PARTNER (scripts/gate.sh, set ahead of bucket
+# selection) is empty unless the diff resolved BUCKET by way of the
+# spec-pairing exception, so this is a no-op for every other bucket,
+# including `full` (both already run there via the aggregate `test` step)
+# and `testsbit`/`stdlibdocs` (spec cannot pair with either — see
+# SPEC_PARTNER's own computation). test-fmt-citations is a dedupe no-op for
+# the four partners that already carry it (selfhost, runtime, stdlib, pkg)
+# and a real addition for the three that do not (testcases, examples, docs)
+# — #5615 found the SPEC_PARTNER path had the identical gap its `spec`-alone
+# fix closed: pairing spec/SPEC.md with _tests_/cases/**, examples/** or
+# docs/**/*.md unioned in test-spec only, never test-fmt-citations.
 union_spec_steps() {
   [ -n "${SPEC_PARTNER:-}" ] || return 0
-  case " ${BUILD_STEPS[*]} " in
-    *" test-spec "*) ;;
-    *) BUILD_STEPS+=("test-spec") ;;
-  esac
-  REASON="${REASON}; spec/SPEC.md also changed — added gate(s): test-spec"
+  for s in test-spec test-fmt-citations; do
+    case " ${BUILD_STEPS[*]} " in
+      *" ${s} "*) ;;
+      *) BUILD_STEPS+=("${s}") ;;
+    esac
+  done
+  REASON="${REASON}; spec/SPEC.md also changed — added gate(s): test-spec test-fmt-citations"
 }
 
 # The three BUCKET-SIDE assertions — assert_full_is_superset (#2194),

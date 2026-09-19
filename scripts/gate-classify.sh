@@ -98,8 +98,9 @@ while IFS= read -r f; do
     # test-spec) DOES read it — a grammar-consistency check, not prose with no
     # gate — so it gets a REAL bucket too (#2962), matched ahead of the
     # `spec/*` no-gate arm below the same way docs/*.md is matched ahead of
-    # nothing-reads-this prose. spec/LINT.md and every other spec/* path still
-    # fall through to that arm unchanged.
+    # nothing-reads-this prose. spec/FMT.md and spec/LINT.md are matched by
+    # their own arm just below (also real gates, not the no-gate one); every
+    # OTHER spec/* path still falls through to the no-gate arm unchanged.
     spec/SPEC.md)
       has_spec=1
       if [ -n "${spec_list}" ]; then
@@ -108,14 +109,22 @@ while IFS= read -r f; do
         spec_list="${f}"
       fi
       ;;
-    # spec/FMT.md IS read by test-fmt-citations (wired into selfhost, #4453).
-    spec/FMT.md) has_selfhost=1 ;;
+    # spec/FMT.md and spec/LINT.md are BOTH read by test-fmt-citations
+    # (FMT.md wired into selfhost, #4453). LINT.md joined it by #5615, found
+    # by the same ticket's audit of the `spec` bucket: `spec/LINT.md:186` is
+    # cited ~20 times outside _tests_/bit/fmtcitations/ (tools/build/gates.bit,
+    # abilayout.bit, abiarity.bit, artifactsteps.bit, _tests_/bit/abimembers/**,
+    # _tests_/bit/externarchive/arread.bit among them) and a line-count-
+    # changing LINT.md edit drifts them exactly like a SPEC.md edit drifts its
+    # own citers — before this it fell through to the no-gate arm below and a
+    # LINT.md-only diff resolved to `noop`, running nothing at all.
+    spec/FMT.md|spec/LINT.md) has_selfhost=1 ;;
     # These paths are pure documentation that no gate reads: runtime/**/*.md
     # (the runtime CODE bucket below is for runtime/*.bit etc, not prose),
-    # spec/* other than SPEC.md and FMT.md (LINT.md and any future sibling —
-    # checked by no automated gate), bench/**/*.md (bench/**/*.bit and
-    # bench/run.sh still fall through to `full`, unproven output-irrelevant),
-    # and the three standalone READMEs nothing greps.
+    # spec/* other than SPEC.md, FMT.md and LINT.md (any future sibling —
+    # checked by no automated gate unless it too gains real citers), bench/**/*.md
+    # (bench/**/*.bit and bench/run.sh still fall through to `full`, unproven
+    # output-irrelevant), and the three standalone READMEs nothing greps.
     # Deliberately NOT added to has_other or bucket_count — has_noop and
     # noop_list ARE set below, but mixed with a real bucket the noop path
     # must be silently ignored, never force `full` and never downgrade the
