@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render out/results.csv as the README block bench/run.sh injects (#5418).
+"""Render out/results.csv as the README block bench/run.sh injects.
 
 The whole block is produced here, prose included, so that nothing between the
 BENCH markers can be typed by hand and quietly drift from the numbers beside
@@ -177,9 +177,9 @@ def main():
     p("## Benchmarks")
     p("")
     p("TechEmpower's test types 1 and 2, the same two every framework here")
-    p("already publishes a number for. Types 3 to 5 need a database and are not")
-    p("measured: `pkg/postgres`'s type codecs are open as #3989, so there is no")
-    p("Bit side to compare yet.")
+    p("already publishes a number for. Types 3 to 5 need a database-backed")
+    p("endpoint, and none of the six apps under `bench/apps/` has one, so there")
+    p("is no Bit side to compare yet.")
     p("")
     for test, title in TESTS:
         p("### %s" % title)
