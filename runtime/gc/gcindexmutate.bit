@@ -1,0 +1,559 @@
+// runtime/gc/gcindexmutate.bit — split out of gcindex.bit (#5647), itself
+// split out of ./gc.bit (#1503). Sibling of gc.bit and gcindex.bit: same
+// module, so this needs no imports and no call-site changes. Mutation
+// (idxPlace, idxDisable, idxGrow, idxReclaimRetired, idxInsert, idxRemove,
+// idxInsertSpan, idxRemoveSpan) plus the bitmap-replacement design record
+// that documents why `gcOwns` still reads this table rather than a
+// per-span occupied-slot bitmap.
+
+// ---------------------------------------------------------------------------
+// The address->object membership index
+// ---------------------------------------------------------------------------
+//
+// `owns` is the mark hot path: it runs once per traced reference. A linear walk
+// of the all-objects list there makes tracing O(objects^2) — that was a real,
+// measured regression in this codebase (fixed in 3dc87a3, ~9x on
+// the h2 download path), so the index is ported, not skipped.
+//
+// Open addressing with linear probing over a power-of-two table of body
+// addresses. A general-purpose hash map would do; the internal layout is
+// NOT part of any contract (the index is a pure speed structure over the
+// authoritative all-objects list), so a simpler scheme is free to differ as
+// long as `owns` answers identically. It does: the index mirrors exactly the
+// insert/remove points that mutate `all`.
+//
+// Backed by its OWN reserve, never the object heap — the
+// `index_alloc = std.heap.page_allocator`. Index bytes must not count toward
+// `liveBytes`, or they would perturb the growth trigger.
+
+// ---------------------------------------------------------------------------
+// THE PLANNED REPLACEMENT (#3147): a per-span allocated-slot bitmap
+// ---------------------------------------------------------------------------
+//
+// #3147 measured this table at 24 bytes per slot at peak capacity (three
+// tables resident at once — live, spare, and every smaller table ever
+// abandoned into the bump-only `gcIdxRes`): 30% of the `alloc` bench's RSS,
+// 208 MiB on `json`. This is #3175's design for the fix — DESIGN ONLY, no
+// code below this comment changed. #3176 adds the bitmap write-only, #3177
+// rewires `gcOwns` to read it, #3178 stops `idxInsert`/`idxRemove` for
+// span-backed objects, #3179 unmaps what is left of `gcIdxRes`.
+//
+// 1. WHERE IT LIVES: AN EXTENSION OF THE SPAN HEADER, PER CLASS, NOT A TABLE
+// ---------------------------------------------------------------------------
+// Since #2374 a span (`runtime/alloc/alloc.bit`) is self-describing and
+// aligned to its own size (`allocSpanBytes` = 131072, `allocSpanOf` a mask),
+// so the bitmap belongs INSIDE the span it describes: immediately after the
+// existing 10 fixed header words (`allocSpanHdrWords`, spanmeta.bit) and
+// before the first carved slot — an extension of the reserved PREFIX
+// `spanSkip` already computes (spanmeta.bit: "Slots ... the header
+// consumes at the span base. Rounded UP to a whole slot"), not a change to
+// the fixed 10-word block's own offsets (spanClass..spanEmpty keep their
+// exact positions).
+//
+// NOT a side table: a side table reintroduces exactly the disease this epic
+// is curing — a structure that must grow, rehash and outlive what it
+// describes, when the span already needs no such table for its OWN
+// bookkeeping (alloc.bit:9-12: "no address->span lookup table ... a span is
+// aligned to its own size"). Embedding it also means the bitmap needs no
+// reclaim step of its own — see the #3179 note below.
+//
+// SIZING, AVOIDING THE CIRCULARITY. The bitmap must hold at least
+// `allocSpanSlots(idx)` bits, but that count already SUBTRACTS the skip the
+// bitmap is part of, so sizing off the final slot count is circular. Size it
+// instead off the slot count BEFORE any prefix is removed — `naive(idx) =
+// allocSpanBytes / allocClassSize(idx)` — a safe upper bound
+// (`allocSpanSlots(idx) < naive(idx)` always, removing a nonzero prefix only
+// shrinks the usable count): `bitmapWords(idx) = (naive(idx) + 63) / 64`.
+// The reserved prefix becomes `ceil((allocSpanHdrWords*8 + bitmapWords(idx)*8)
+// / cs)` slots — the same "round up to a whole slot" shape `spanSkip` already
+// has, fed a larger byte count. Comptime per class, so it costs nothing at
+// carve time beyond what `spanSkip` already costs.
+//
+// COST: worst case is class 0 (8-byte slots, `naive` = 16384) at 256 words =
+// 2048 bytes, ~1.6% of a 131072-byte span. Every larger class costs
+// proportionally less. This is a FIXED, comptime, per-class overhead —
+// unlike the table's `24 x cap`, it does not scale with how many objects the
+// GC trigger has let accumulate.
+//
+// THIS DOES NOT WIDEN `gcWords` (39) OR `heapWords` (43, #4057) — both are
+// unrelated word-block sizes (the `Gc` class, the heap-state block); this
+// changes only `allocSpanHdrWords`'s per-class SKIP, which already varies by
+// class today (`spanSkip(cs)`) and is not one of the two boot-pinned totals.
+//
+// 2. THE SEMANTICS gcOwns MUST MATCH, BIT FOR BIT
+// ---------------------------------------------------------------------------
+// Today: `gcOwns(g, body)` is `idxContains` — or, index disabled,
+// `gcOwnsLinear`, the oracle. #4059 retired the all-objects list this note was
+// written against; `gcOwnsLinear` now answers from the span's occupied-slot
+// bitmap for a small object and from the large-object list for a large one, and
+// the four cases below are unchanged (see that function's own header, which
+// re-derives each of them against the new structure). It is still populated at
+// exactly two call sites, `linkObject` and `freeObject`:
+//   - EXACT BASE of a linked object: true (the list holds exactly this).
+//   - INTERIOR (any nonzero offset into a live object's body): the list
+//     holds unique object bases, so an interior address never equals one —
+//     false, with no special-casing in the linear scan.
+//   - FREED (post-sweep, back on the allocator's free list): its slot bit is
+//     cleared, and a large object is unlinked, before the allocator gets the
+//     memory back — false.
+//   - FOREIGN (never came from this heap): never linked — false.
+//
+// A DIVISION-BASED BITMAP LOOKUP DOES NOT GET "INTERIOR" RIGHT FOR FREE, AND
+// THAT IS THE SHARPEST CORRECTNESS POINT HERE. Given a candidate `ref`, the
+// arithmetic is `raw = ref - gcHeaderSize` (gc.bit:79, the header sits before
+// the body), `span = allocSpanOf(raw)`, `carveStart = span + spanSkip*cs`
+// (the address of slot 0), `n = (raw - carveStart) / cs` (floored). Floor
+// division maps EVERY address inside a slot's `cs` bytes to the SAME `n` as
+// the slot's own base — an interior `ref` and its slot's base alias to one
+// bit, so the bit alone cannot tell them apart. The base check must be
+// separate and explicit — `(raw - carveStart) % cs == 0` AND `0 <= n <
+// spanTotal` — BEFORE the bitmap is consulted; only then does testing bit
+// `n` answer the "exact base" question `gcOwnsLinear`'s exact-equality scan
+// answers for free. Skipping the remainder check is a live false positive —
+// "scan garbage as if it were a pointer" — for every nonzero offset into a
+// live object's body a conservative root scan (ABI.md §5) or a
+// reference-array trace (gcmark.bit:74-85) could present.
+//
+// THE BIT MUST BE SET/CLEARED AT THE SAME CALL SITES `idxInsert`/`idxRemove`
+// ARE TODAY — `linkObject`/`freeObject` — NOT inside `runtime/alloc/`'s
+// `heapTakeSmallLocked`/`heapGiveSmallLocked`. This corrects how #3176 was
+// scoped, not a preference: `gcHeapAlloc`/`gcHeapFree` have a THIRD caller
+// besides `gcAlloc`/`gcAllocRaw` — `gcInit`'s mark worklist (gc.bit:202-274,
+// freed at gc.bit:506-509) — which allocates and frees straight through the
+// heap WITHOUT ever calling `linkObject`, exactly so the worklist is never
+// treated as a traced object. `gcOwns` on the worklist's own body address is
+// FALSE today (it is never linked), and that address IS reachable to
+// `gcMarkRoot` in practice — `noteBody` (gcalloc.bit:10-17) is skipped for it
+// too, so `[gcLoAddr, gcHiAddr)` does not exclude it once other objects in
+// the same span widen the bounds around it. A bitmap set at ALLOCATOR
+// take-time (what `heapTakeSmallLocked`/`heapGiveSmallLocked` see) cannot
+// make this distinction: `runtime/alloc/` is deliberately GC-oblivious
+// (module header: "no imports at all", "this file compiles unchanged for
+// every target") and has no way to know a given take is the worklist rather
+// than a real object. Setting the bit at `linkObject`/`freeObject` instead —
+// which already have exactly the "is this a real, tracked object" context
+// `idxInsert`/`idxRemove` use — keeps the worklist's slot bit permanently 0,
+// matching `gcOwnsLinear` exactly. `runtime/alloc/` should only be asked for
+// the pure addressing primitive (span + slot index from an address,
+// mirroring `allocSpanOf`); the DECISION of when to flip a bit stays in
+// `runtime/gc/`, the same layering `idxInsert`/`idxRemove` already have.
+//
+// THE TIMING GAP THIS OPENS IS SAFE, AND WHY, EXPLICITLY, SO IT IS NOT
+// "FIXED" LATER BY MOVING A SAFEPOINT INTO IT: `linkObject` runs strictly
+// after `gcHeapAlloc` returns (gcalloc.bit:129-142), so between a slot
+// leaving the allocator's free list and the bit actually being set there is
+// a window with no GC-visible record of the object at all — the SAME window
+// that exists today between `heapTakeSmallLocked` returning and `idxInsert`
+// running. It is unobservable by a concurrent mark pass only because nothing
+// in that window is `@nosplit`-legal to interrupt at a safepoint (§10.3) and
+// this thread is already registered — since #4060 by `bit_rt_gc_thread_enter`
+// at its OS-thread entry rather than by the allocation door on every object,
+// but registered either way BEFORE any allocation reaches here — so a stop
+// rendezvous BLOCKS on it rather than proceeding without a stack map. Do not
+// add a safepoint poll between `gcHeapAlloc` and `linkObject` without
+// re-deriving this.
+//
+// 3. LARGE OBJECTS: NOT SPAN-BACKED, SO THE HASH INDEX SURVIVES FOR THEM
+// ---------------------------------------------------------------------------
+// `heapLargeAllocLocked`/`heapLargeFreeLocked` (alloc.bit:734-747) carry NO
+// per-object metadata at all — pure byte counters over a direct
+// `memMapPages` region (gc.bit:386-399). There is no span to mask to and
+// nowhere to embed a bitmap; `allocClassify` returns -1 for exactly this
+// population (classify.bit:74: `needed > allocMaxSmall`, i.e. > 16384 bytes,
+// or an alignment wider than a page). So the bitmap answers ONLY span-backed
+// addresses; a large object's `gcOwns` must keep going through
+// `idxContains`/`gcOwnsLinear` exactly as today, scoped down to large
+// objects once #3178 stops calling `idxInsert`/`idxRemove` for span-backed
+// ones. THE HASH INDEX DOES NOT RETIRE. #3177 must dispatch on
+// span-backed-ness (an owning span found) before falling to the hash path,
+// and #3178's `idxInsert`/`idxRemove` removal is scoped to that same
+// span-backed case only.
+//
+// #3178'S "idxbytes=0" TARGET, AS WRITTEN, IS NOT REACHABLE ON
+// `bench/cases/alloc/alloc.bit`, AND THE TICKET'S OWN PREMISE THAT IT HAS "no
+// large allocations" IS WRONG (flagged there directly, #3175's comment, not
+// a silent edit). Its `batch` slice grows by doubling
+// (`runtime/root/slices.bit:218`, `newcap = vcap * 2`) from 1 toward `per` =
+// 5000 backing WORDS — every slice, including `[]Node`, stores one 8-byte
+// handle per element regardless of element width, and `Node` is itself
+// boxed, a separate 48-byte class-3 object (`fieldLayoutFor`,
+// lowerlayout.bit: "string/slice/map/chan/tuple/class/... are 8-byte
+// handles"). The doubling sequence crosses `allocMaxSmall` (16384 bytes =
+// 2048 words) once length passes 2048, so for roughly the back half of every
+// 5000-element batch the LIVE `batch` backing buffer is a large,
+// direct-mapped allocation — 2000 times over the run, one per batch. Worse,
+// `reserveGrow`'s minimum unit is a full `reserveChunkBytes` = 4194304
+// (mem.bit:299,351) regardless of how small the request is, so the FIRST
+// large allocation of the run maps one whole 4 MiB chunk that a bump reserve
+// (`gcIdxRes`, no free list) never releases on its own — which is exactly
+// today's baseline (#3146: `idxchunks=1 idxbytes=4194304`) and will very
+// likely read UNCHANGED immediately after #3178, not zero. Only #3179's
+// ownership-walk unmap can move that number, and only once the chunk holds
+// no live large entry at unmap time. #3178 should restate its acceptance
+// around a MEASURED post-fix number — expect it to stay near 4194304 until
+// #3179 lands, not to reach zero at #3178 alone.
+//
+// WHAT THIS MEANS FOR #3179's OWNERSHIP WALK: the bitmap itself adds NO new
+// reclaim work — it dies with its span under the EXISTING `spanOwned`-gated
+// path (#2375, `heapReclaimSpansLocked`), unchanged by any of this. #3179's
+// walk stays scoped to `gcIdxRes`'s own chunks exactly as filed, but per the
+// paragraph above it must not assume `gcIdxRes` is retirable wholesale after
+// #3178 — the shrunk, large-object-only table is still LIVE in it, so the
+// walk must distinguish "an orphaned chunk" from "the chunk the live (now
+// much smaller) table still occupies," the same distinction `spanOwned`
+// already draws for spans.
+//
+// #3179 LANDED: `idxGrow` below calls `reserveReclaimChunks` (`./mem.bit`)
+// after every capacity growth, passing the live and spare table's own
+// addresses as the two ranges it must never unmap — exactly the distinction
+// this paragraph asked for. The boot arena and any caller-bound arena
+// (`gcindexchurn`'s Bit-managed `[]i64`) stay untouched by construction: that
+// function only ever walks `gcIdxRes`'s OWN chunk list, which `reserveInit`
+// never populates.
+
+// Place `addr` into `table` assuming capacity is available and `addr` is
+// absent. Used by both insert and rehash.
+@nosplit fn idxPlace(table: int, ncap: int, addr: int): bool {
+  let mask = ncap - 1
+  let i = idxHash(addr, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let slotAddr = idxSlotAddr(table, i)
+    let v = loadWord(slotAddr)
+    if (v == idxEmpty || v == idxTombstone) {
+      storeWord(slotAddr, addr)
+      return true
+    }
+    if (v == addr) {
+      return true
+    }
+    // Masks rather than divides, for the reason `idxContains`'s own comment
+    // (gcindex.bit) states: `ncap` is a power of two and `idxHash` already
+    // relies on it (#5570).
+    i = (i + 1) & mask
+    probes = probes + 1
+  }
+  return false
+}
+
+// Disable the index permanently and release its table. `owns` then reverts to
+// the exact `gcOwnsLinear` scan, which is Theta(live) per root rather than
+// O(1) — not merely slower. Measured on real compiles (#3930, same source,
+// same machine): 27x-494x user CPU, and a 439,809-live-object run did not
+// finish in 900s (>=774x) — the controlled sweep is quadratic (2x input =
+// 3.95x added cost). Correctness holds; what a failure here actually costs is
+// the process not finishing. `gcIdxOk` (#4094) is the only way this state is
+// observable from outside — it is on `BIT_GC_STATS` as `indexok=`.
+@nosplit fn idxDisable(g: *i64) {
+  *(g + gcIndexOk) = 0
+  *(g + gcIndexAddr) = 0
+  *(g + gcIndexCap) = 0
+  *(g + gcIndexLive) = 0
+  *(g + gcIndexUsed) = 0
+}
+
+// Grow (or first-allocate) the table so one more entry fits under the load
+// factor, rehashing the live entries and dropping tombstones.
+@nosplit fn idxGrow(g: *i64): bool {
+  let oldTable = *(g + gcIndexAddr)
+  let oldCap = *(g + gcIndexCap)
+  let live = *(g + gcIndexLive)
+
+  // FLOOR AT `oldCap` (#2922). `idxRemove` leaves a tombstone without
+  // decrementing `gcIndexUsed`, so right after a big sweep `used` is still
+  // high (triggering this rehash on the next insert) while `live` has
+  // crashed to the survivor count. Sizing purely off `live` shrank the table
+  // to `idxMinCap` and abandoned the old, large one into the bump-only
+  // `gcIdxRes` forever, forcing a full doubling regrowth every collection —
+  // unbounded RSS growth with a flat `liveBytes`. Capacity must only grow.
+  let newCap = idxMinCap
+  if (oldCap > newCap) {
+    newCap = oldCap
+  }
+  // Bounded: doubles until the load factor admits `live + 1`; `live` is bounded
+  // by the number of live objects, so this terminates in <= 63 iterations.
+  let guard = 0
+  while (guard < 64) {
+    if ((live + 1) * 100 < newCap * idxLoadPct) {
+      break
+    }
+    newCap = newCap * 2
+    guard = guard + 1
+  }
+
+  // Reuse the spare when it is the right capacity. This is what keeps the
+  // index reserve from draining: removals leave TOMBSTONES, which count toward
+  // the load factor, so a long alloc/free workload rehashes repeatedly at an
+  // UNCHANGED capacity just to clear them. Taking fresh storage each time would
+  // exhaust any reserve and permanently disable the index — which would drop
+  // `owns` back to the O(objects) linear scan and make tracing O(n^2), the exact
+  // regression 3dc87a3 fixed. It is avoided by giving the table
+  // back to `page_allocator`; a bump reserve cannot, so one slot is cached.
+  // Capacity changes are O(log n) over a whole run, so at most that many tables
+  // are ever abandoned.
+  let newTable = 0
+  if (*(g + gcIdxSpareCap) == newCap) {
+    newTable = *(g + gcIdxSpareAddr)
+    *(g + gcIdxSpareAddr) = 0
+    *(g + gcIdxSpareCap) = 0
+  } else {
+    // `reserveGrow`, not `reserveTake`: the index scales with the live object
+    // count, so a fixed reserve silently disables it on a large heap and drops
+    // `owns` back to the O(objects) linear scan (#1638).
+    newTable = reserveGrow(g + gcIdxRes, idxTableBytes(newCap))
+  }
+  if (newTable == 0) {
+    idxDisable(g)
+    return false
+  }
+  // Zero the fresh table: every slot must read `idxEmpty`. The #5584 span
+  // cache is the tail of the same allocation and is zeroed with it -- an
+  // unzeroed tag is a stale POSITIVE, dereferencing an unmapped span.
+  let i = 0
+  while (i < newCap + idxSpanCacheSlots) {
+    storeWord(idxSlotAddr(newTable, i), idxEmpty)
+    i = i + 1
+  }
+
+  // Rehash live entries. Bounded by `oldCap`.
+  let moved = 0
+  let j = 0
+  while (j < oldCap) {
+    let v = loadWord(idxSlotAddr(oldTable, j))
+    if (v != idxEmpty && v != idxTombstone) {
+      if (!idxPlace(newTable, newCap, v)) {
+        // Cannot happen: the new table was sized for `live + 1`. Treat as an
+        // index failure rather than silently losing a membership entry.
+        idxDisable(g)
+        return false
+      }
+      moved = moved + 1
+    }
+    j = j + 1
+  }
+
+  // Park the old table as the spare rather than abandoning it.
+  if (oldTable != 0) {
+    *(g + gcIdxSpareAddr) = oldTable
+    *(g + gcIdxSpareCap) = oldCap
+  }
+  *(g + gcIndexAddr) = newTable
+  *(g + gcIndexCap) = newCap
+  *(g + gcIndexLive) = moved
+  *(g + gcIndexUsed) = moved
+  idxReclaimRetired(g, newTable, newCap)
+  return true
+}
+
+// #3179: reclaim whatever `gcIdxRes` chunk the table `idxGrow` just retired
+// from spare now sits alone in. Split out of `idxGrow` itself (already over
+// this file's pre-existing line-count finding — `git show main:./gcindex.bit`
+// confirms 87 lines before this ticket — so the fix is a call, not more body)
+// rather than inline, and it is needed at all because every capacity growth
+// overwrites `gcIdxSpareAddr`/`gcIdxSpareCap` with the table that was live a
+// moment ago, silently discarding whatever was in spare before — "every
+// smaller table ever allocated" (#3147's own framing of the leak). The only
+// two tables anything still points to after `idxGrow` finishes are the new
+// live one (`newTable`/`newCap`, passed in rather than re-read, since this
+// runs before the caller's own locals go out of scope) and the new spare;
+// `reserveReclaimChunks` (`./mem.bit`) keeps exactly those two chunks (plus
+// the always-protected head) and unmaps the rest. Cheap to call on every
+// growth: growth itself is O(log live-objects) over a whole run, and the walk
+// it drives is bounded by chunk count, not by table size.
+@nosplit fn idxReclaimRetired(g: *i64, newTable: int, newCap: int) {
+  let _ = reserveReclaimChunks(
+    g + gcIdxRes,
+    newTable,
+    idxTableBytes(newCap),
+    *(g + gcIdxSpareAddr),
+    idxTableBytes(*(g + gcIdxSpareCap)),
+  )
+}
+
+// Record `body` in the index, growing first if the load factor demands it.
+@nosplit fn idxInsert(g: *i64, body: int) {
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  let ncap = *(g + gcIndexCap)
+  let used = *(g + gcIndexUsed)
+  if (ncap == 0 || (used + 1) * 100 >= ncap * idxLoadPct) {
+    if (!idxGrow(g)) {
+      return
+    }
+    ncap = *(g + gcIndexCap)
+  }
+  let table = *(g + gcIndexAddr)
+  if (!idxPlace(table, ncap, body)) {
+    idxDisable(g)
+    return
+  }
+  *(g + gcIndexLive) = *(g + gcIndexLive) + 1
+  *(g + gcIndexUsed) = *(g + gcIndexUsed) + 1
+}
+
+// Remove `body` from the index, leaving a tombstone so probe chains through
+// this slot keep working. Tombstones are reclaimed by the next `idxGrow`.
+@nosplit fn idxRemove(g: *i64, body: int) {
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  let ncap = *(g + gcIndexCap)
+  if (ncap == 0) {
+    return
+  }
+  let table = *(g + gcIndexAddr)
+  let i = idxHash(body, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let slotAddr = idxSlotAddr(table, i)
+    let v = loadWord(slotAddr)
+    if (v == idxEmpty) {
+      return
+    }
+    if (v == body) {
+      storeWord(slotAddr, idxTombstone)
+      *(g + gcIndexLive) = *(g + gcIndexLive) - 1
+      return
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// #3147/#3177: WHY `gcOwns` STILL DOES NOT READ THE BITMAP — three findings
+// ---------------------------------------------------------------------------
+//
+// #3177 built the reader described above (mask to the span, find the span,
+// read the class and the occupied-slot bit) and it is REVERTED. The ANSWER was
+// right: an enumerated 9832-address differential against `gcOwnsLinear`
+// (`_tests_/stress/gcslotbitmap`) reported 0 mismatches, and a shadow-mode build
+// that computed both answers on `bench/cases/json` disagreed 0 times. What
+// defeated it was everything around the answer, and all three findings are
+// recorded here because each one will bite the next attempt.
+//
+// 1. THE MASK CANNOT DECIDE SPAN-BACKED-NESS, AND NOTHING ELSE IN THE RUNTIME
+// CAN EITHER. `gcOwns` takes ARBITRARY integers: the conservative stack scan
+// (ABI.md §5) pushes every raw machine word of a parked frame through
+// `gcMarkConservative`, and `gcMarkRoot`'s `[gcLoAddr, gcHiAddr)` gate is a
+// body-address hull, not a map of what is mapped — reclaimed spans are
+// `munmap`ped inside it (#2375), large blocks are separate mappings, and both
+// reserves' chunks sit between them. So masking to a span base and
+// DEREFERENCING it is a wild read in the collector. There is no O(1) structure
+// today that answers "is this address inside a currently-mapped span": the
+// reserve chunk list is O(chunks) (99 on `json`), and per-class span lists are
+// O(spans). A correct reader needs a real span-presence structure keyed on the
+// MAPPING's lifetime, which needs stored words — and `gcWords` (39) and
+// `heapWords` (43, #4057) are both full and boot-pinned.
+//
+// 2. A SPAN BASE IS A VALUE A LIVE OBJECT BODY CAN TAKE, so reusing this table
+// for presence keys must TAG them. "No body inside a span equals its base" is
+// true and is the wrong question: a body inside span S can equal the base of
+// span S+1. Solve `spanSkip(cs)*cs + k*cs + gcHeaderSize == allocSpanBytes` and
+// classes 0, 1 and 2 each have an in-range solution — class 0 at slot 16114 of
+// 16118, class 1 at 8121 of 8123, class 2 at 4076 of 4077. Untagged, the
+// presence probe hits those bodies and dereferences the NEXT span, which may be
+// unmapped. `key = base + 1` separates the populations by residue mod 8 (bodies
+// are `slotBase + gcHeaderSize`, both multiples of 8) and costs nothing.
+//
+// 3. THE MARK PATH HAS A STACK BUDGET, AND `bench/cases/json` IS ALREADY AT IT.
+// A task stack is `schedStackBytes` = 65536 bytes, fixed, non-growable, and the
+// task descriptor is found by MASKING the stack pointer to that boundary
+// (`runtime/sched/scratch.bit`, `runtime/sched/sched.bit`) — so an overflow does
+// not fault, it silently resolves to ANOTHER TASK's descriptor. The collector
+// runs at a safepoint on top of whatever user code was running, and json's
+// recursive-descent DOM parser is the deepest such stack in the bench suite.
+// The reverted reader added ~224 bytes to the deepest mark chain (`slotBitSet`
+// 0x50 + `allocSlotIndex` 0x60 + `allocSpanSlots` 0x30, measured with objdump on
+// `runtime_gc.o`/`runtime_alloc.o`) and json went from 12/12 clean on `main` to
+// crashing about half of all runs — with the ANSWER held at `main`'s, which is
+// what proves it is the frames and not the logic. Raising `schedStackBytes` to
+// 262144 as a diagnostic took it back to 7/8. Growing `idxGrow`'s 0x180 frame
+// into `gcHeapAlloc` (an earlier placement of the presence insert) reproduced
+// the same crash on the ALLOCATION path for the same reason.
+//
+// So the next attempt needs the stack budget addressed first, or a reader that
+// adds no frames at all — and it must not buy that by copying
+// `runtime/alloc/`'s span-layout arithmetic into this module, which is the
+// duplication `bitlang-ws/CLAUDE.md` records as having caused divergent safety
+// in `scripts/` ("a fix applied to a copy does not reach its siblings").
+//
+// FINDING 3 IS DISPROVEN — #3388/#3854, 2026-08-28. A re-run with the
+// reader's answer PINNED to main's (excluding the logic entirely) still
+// crashed, and a direct lldb measurement on the reader build found the mark
+// path's stack pointer only 1632 bytes deep in a MAPPED 8 MiB region — 12
+// frames (`slotBitSet <- gcOwns <- gcMarkRoot <- scanFrame <-
+// gc_scan_snapshot <- stwCollect <- ... <- main`), nowhere near exhausted.
+// `bench/cases/json`'s `main()` never calls `spawn`, so it never runs on the
+// 64 KiB `schedStackBytes` stack at all — confirmed independently by #3374
+// (`693a03f6`): shrinking `schedStackBytes` 4x had zero effect on json,
+// 6/6 clean. The ~224-byte frame-depth correlation this finding reported was
+// real but coincidental with the actual cause below, not causal.
+//
+// THE ACTUAL CAUSE: `gcOwns`'s reader is a boolean membership predicate over
+// ONE table that, once span keys exist, holds TWO key populations — it
+// cannot tell which population a hit belongs to, so any leaked candidate
+// that happens to equal a key answers TRUE. Finding 2's tag (`base + 1`) is
+// necessary but was shown NOT sufficient alone: the tagged literal is
+// computed into a register/stack slot around the insert/remove call and
+// leaks onto the stack the same way an untagged span base did — three
+// ASLR-enabled runs faulted with the "object body" reading exactly
+// `spanBase + 1`, the tag value itself, which exists nowhere else in the
+// program. The fix is `./gcalloc.bit`'s `gcOwns`: reject any query that is
+// not 8-aligned BEFORE any table probe (ABI.md §1/§3 — every real object
+// body is 8-aligned; the tag deliberately is not). Tag alone: 0/16 clean.
+// Tag plus the alignment guard: 32/32 clean. See the SPAN PRESENCE section
+// below (#3854) for the landed primitives.
+
+// ---------------------------------------------------------------------------
+// #3854 (#3147/#3177): SPAN PRESENCE — the second key population
+// ---------------------------------------------------------------------------
+//
+// The table is meant to hold two kinds of key once #3177 lands: object BODY
+// addresses (as it always has, via `idxInsert`/`idxRemove` above) and the
+// BASE ADDRESS of every span currently carved onto a class list — the
+// presence check `gcOwns` needs before it may read a span's own
+// occupied-slot bitmap (`./gcalloc.bit`'s `setSlotBit` and `./gcwalk.bit`'s
+// `gcVisitWord`, #3176). These two functions are the safe primitives for that; #3177 wires
+// the actual call sites (`idxInsertSpan(g, span)` right after
+// `heapRefillLocked`, `idxRemoveSpan(g, chain)` before either reclaim
+// disposal, mirroring `linkObject`/`freeObject`'s own pairing).
+//
+// TAGGED, NOT RAW. `idxContains`/`idxInsert`/`idxRemove` take arbitrary
+// integers and have no notion of "which population" — and a span base IS a
+// value a live object body can legitimately take (solve `spanSkip(cs)*cs +
+// k*cs + gcHeaderSize == allocSpanBytes`; classes 0, 1 and 2 each have an
+// in-range solution, finding 2 above). `key = spanAddr + 1` separates the
+// two populations by residue mod 8: every real body is `slotBase +
+// gcHeaderSize`, both multiples of 8 (ABI.md §1), so a tagged span key can
+// never equal a live body.
+//
+// THE TAG ALONE DOES NOT MAKE THIS SAFE — that is the corrected finding
+// above, not restated here. `./gcalloc.bit`'s `gcOwns` MUST reject any
+// non-8-aligned query before probing this table at all, and that guard must
+// land in the SAME commit as these two functions start being called.
+// Landing a span-presence key without it is measurably broken (#3854/#3388:
+// tag-only crashed 16/16 on `bench/cases/json`; tag plus the query guard ran
+// 32/32 clean).
+
+@nosplit fn idxInsertSpan(g: *i64, spanAddr: int) {
+  spinAcquire(lockPtr(g))
+  idxInsert(g, spanAddr + 1)
+  spinRelease(lockPtr(g))
+}
+
+@nosplit fn idxRemoveSpan(g: *i64, spanAddr: int) {
+  spinAcquire(lockPtr(g))
+  idxRemove(g, spanAddr + 1)
+  // #5584: drop any cached positive for this span, under the same lock and at
+  // the only site that owes one. One slot can hold it, tagged with the span.
+  let ncap = *(g + gcIndexCap)
+  if (ncap != 0) {
+    let slot = idxSpanCacheSlotAddr(g, ncap, spanAddr)
+    if (loadWord(slot) == spanAddr) {
+      storeWord(slot, idxEmpty)
+    }
+  }
+  spinRelease(lockPtr(g))
+}
