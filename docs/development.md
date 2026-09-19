@@ -630,7 +630,7 @@ own:
    to the OS thread it watches create/join, and to the pthread mutex/cond it
    intercepts. Bit's scheduler is M:N (`runtime/ABI.md` §9, §23): a task
    (green thread) moves between worker OS threads, and the move itself is
-   `schedSwitch` (`runtime/sched/sched.bit`) - a hand-written, `@nosplit`
+   `schedSwitch` (`runtime/sched/switch.bit`) - a hand-written, `@nosplit`
    register-file swap that saves and restores the callee-saved union
    directly. It is not a pthread primitive, so TSan has no hook into it. A
    task migrating mid-execution from one worker's OS thread to another's
