@@ -1,8 +1,9 @@
-# Worker pool sizing: decision
+# Worker pool sizing
 
-Filed under epic #1911 (parent #1899). This is the decision record; it does not
-flip the default. The flip is #2592 (worker start after boot) / #2593 (grow-on-demand
-policy) / #2594 (Linux boot wiring) / #2595 (Darwin boot wiring).
+Why the scheduler boots at one worker and grows on demand, and why the
+obvious alternative of sizing the pool to the core count at boot does not
+work. This records the design and its measurements; the boot wiring itself
+lives in the platform root files.
 
 ## Chosen design: grow on demand (option 3)
 
@@ -38,9 +39,9 @@ workload this repo runs on every push.
 
 - `parkCpuCount()` reads `sched_getaffinity`, so a container cpuset is already
   respected.
-- #1900 measured 18 idle workers burning 84x the CPU of one worker.
-- #1902 fixed that with per-worker futex park words, and the idle repro is now
-  flat at 0.04s for 1..18 workers.
+- 18 idle workers once burned 84x the CPU of one worker.
+- Per-worker futex park words fixed that, and the idle repro is now flat at
+  0.04s for 1..18 workers.
 - A `parkCpuCount()` default still failed `./make test` because
   `_tests_/bit/docs.bit` runs 12 `bit` processes at once, giving 204 parked
   worker threads on 18 cores and blowing the 300000ms batch deadline.
@@ -52,7 +53,7 @@ workload this repo runs on every push.
 The default pool size is 1, and it changes when the run queue has stayed
 non-empty, growing the pool up to the platform's core count.
 
-## #5622: `parkCpuCount()` is wired in, and it is not Option 2
+## `parkCpuCount()` is wired in, and it is not Option 2
 
 The "measured facts" above record a `parkCpuCount()` default failing
 `./make test`, and Option 2 above was rejected for exactly that reason. This
@@ -64,7 +65,7 @@ without the distinction that makes it safe:
   worker count to the core count. Twelve concurrent `bit` processes each
   booted ~18 workers before any of them had a task queued, giving 204 parked
   threads on 18 cores.
-- **What #5622 does instead:** the boot count is still 1 (`nworkers` in
+- **What the current wiring does instead:** the boot count is still 1 (`nworkers` in
   `boot`'s step 4 is untouched). `parkCpuCount()` is read only as the input to
   `rootWorkersCeiling`'s non-explicit branch, which becomes the ceiling
   `schedMaybeGrow` (`../sched/grow.bit`) checks before starting worker N+1.
@@ -79,5 +80,5 @@ without the distinction that makes it safe:
 
 `parkCpuCount()` returning 0 on a failed query passes straight through:
 `growCeiling(0)` already treats 0 as "no ceiling" and falls back to
-`schedMaxWorkers`, so a failed read reproduces the pre-#5622 default rather
+`schedMaxWorkers`, so a failed read reproduces the unceilinged default rather
 than wrongly pinning growth at 0.

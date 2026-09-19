@@ -25,7 +25,6 @@ asserts is rejected.
 `valid/`: 208 fixture pairs. `invalid/`: 501 fixtures. `LICENSE` is
 toml-test's own (MIT).
 
-Exclusions (cases this package cannot pass without a change to
-`pkg/toml/*.bit`, which this ticket does not own) are listed on smash ticket
-#5487, not here — `pkg/toml/docs/` is owned by ticket #5489 while this
-vendoring lands.
+Exclusions, meaning cases this package cannot pass without a change to
+`pkg/toml/*.bit`, are enumerated in `pkg/toml/corpus.test.bit` rather than
+here.

@@ -75,5 +75,5 @@ one, without recompiling.
 Per SemVer §4: during `0.x`, a MINOR bump may carry breaking changes on any
 of the four surfaces above - `0.(y+1).0` is not held to the MAJOR-only
 breaking-change rule that applies at `1.0+`. PATCH bumps stay fix-only even
-pre-1.0. This ends the moment `#366` (v1.0) ships: version freezes to
+pre-1.0. This ends the moment v1.0 ships: version freezes to
 `1.0.0` and full SemVer (breaking ⇒ MAJOR) applies from then on.
