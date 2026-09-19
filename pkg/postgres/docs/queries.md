@@ -18,10 +18,13 @@ fn placeholderReuse(db: Pool): ()! {
 }
 ```
 
-Values come back in the protocol's **text format**, so every non-NULL
-column is `Value.Text` whatever its type, and the result set carries each
-column's type OID beside it. Turning those bytes into
-`Value.Int`/`Value.Float`/... is `#3989` - see [Limitations](limitations.md).
+Values come back in the protocol's **text format**. A column typed
+`int2`/`int4`/`int8`, `float4`/`float8`, `bool` or `bytea` is decoded from
+that text into `Value.Int`/`Value.Float`/`Value.Blob` before you see it;
+every other type arrives as `Value.Text`, the server's own rendering, for a
+typed accessor to parse - `sqlReqDecimal`/`sqlReqUuid`/`sqlReqTimestamp`/
+`sqlReqDate`/`sqlReqTime`/`sqlReqJson`/`sqlReqArray` (`std/sql`) cover
+`numeric`, `uuid`, the temporal types, `json`/`jsonb` and arrays.
 
 `exec` reports the count from the server's own `CommandComplete` tag.
 Parameters are sent with their types left for the server to infer, except a
