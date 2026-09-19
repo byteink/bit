@@ -636,13 +636,20 @@ the ratchet - no separate baseline mechanism, and nothing to keep in sync.
 Since every stamp carried a reason, the initial commit also recorded which
 files were known debt rather than deliberate exceptions.
 
-By 2026-09-19 every file in the table above had been split under E0200's
-default limit of 800 lines, and every stamp had been removed along with it.
-No production file carries a `max-file-lines` override today; the only
-matches for the directive outside test fixtures are the diagnostic's own
-message text and the checker's unit tests. The override mechanism itself is
-unchanged and still specified below (§5.4.1); it is simply idle - nothing in
-the repository currently exercises it as a real exception.
+By 2026-09-19 every file in the table above had been split well under
+E0200's default limit of 800 lines. No production file carries a
+`max-file-lines` override today; the only matches for the directive outside
+test fixtures are the diagnostic's own message text and the checker's unit
+tests.
+
+The table describes the adoption this section planned, not a state the
+repository reached. At most four production files ever carried a real stamp:
+`lower.bit` and `check.bit` from the table above, plus `lint.bit` and
+`lintcheck.bit`, which were not in it. The last two were dropped by #2470 and
+#2471 when those files were split under the limit. The other nine files in
+the table were brought under 800 without ever being stamped. The override
+mechanism itself is unchanged and still specified below (§5.4.1); it is
+simply idle, and has been for most of the repository's life.
 
 #### 5.4.1 The override mechanism
 
