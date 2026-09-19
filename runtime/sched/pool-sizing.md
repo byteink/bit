@@ -51,33 +51,3 @@ workload this repo runs on every push.
 
 The default pool size is 1, and it changes when the run queue has stayed
 non-empty, growing the pool up to the platform's core count.
-
-## #5622: `parkCpuCount()` is wired in, and it is not Option 2
-
-The "measured facts" above record a `parkCpuCount()` default failing
-`./make test`, and Option 2 above was rejected for exactly that reason. This
-section exists because `rootWorkersCeiling` (`../root/rootconfig.bit`) now
-calls `parkCpuCount()` anyway, and the two would read as a contradiction
-without the distinction that makes it safe:
-
-- **What failed (Option 2):** `rootEnvWorkers(parkCpuCount())` set the BOOT
-  worker count to the core count. Twelve concurrent `bit` processes each
-  booted ~18 workers before any of them had a task queued, giving 204 parked
-  threads on 18 cores.
-- **What #5622 does instead:** the boot count is still 1 (`nworkers` in
-  `boot`'s step 4 is untouched). `parkCpuCount()` is read only as the input to
-  `rootWorkersCeiling`'s non-explicit branch, which becomes the ceiling
-  `schedMaybeGrow` (`../sched/grow.bit`) checks before starting worker N+1.
-  Growth is already gated on the run queue staying non-empty across
-  `growStreakThreshold` calls (the rule above); this only lowers the ceiling
-  that gate grows toward from the fixed `schedMaxWorkers` (32) to the
-  process's actual usable-core count. A process that never fills its run
-  queue never grows past 1 worker regardless of what the ceiling is, so
-  twelve idle-ish compilers stay near twelve threads rather than 204 — the
-  boot-time snapshot problem Option 2 had does not apply, because nothing is
-  sized against it at boot.
-
-`parkCpuCount()` returning 0 on a failed query passes straight through:
-`growCeiling(0)` already treats 0 as "no ceiling" and falls back to
-`schedMaxWorkers`, so a failed read reproduces the pre-#5622 default rather
-than wrongly pinning growth at 0.
