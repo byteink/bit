@@ -90,7 +90,7 @@ import { Bind, Unknown } from "web"
 }
 
 fn importRow(c: Ctx): Res! {
-  let row = c.bodyWith<Legacy>(Bind{ unknown: Unknown.Ignore })?
+  let row = c.bodyWith<Legacy>(Bind{ unknown = Unknown.Ignore })?
   return c.text(row.name)
 }
 ```

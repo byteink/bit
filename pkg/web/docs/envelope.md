@@ -19,7 +19,7 @@ import { Json, JsonEntry } from "std/json"
 }
 
 fn showUser(c: Ctx): Res! {
-  return c.json(User{ id: 42, name: "ada" })
+  return c.json(User{ id = 42, name = "ada" })
 }
 
 fn mount(app: App) {
@@ -56,7 +56,7 @@ reusing its `User` class and its `envelope()` mount:
 import { page } from "web"
 
 fn listUsers(c: Ctx): Res! {
-  let users = []User{ User{ id: 1, name: "ada" }, User{ id: 2, name: "grace" } }
+  let users = []User{ User{ id = 1, name = "ada" }, User{ id = 2, name = "grace" } }
   return page(users, 940, 50, "cursor-abc")
 }
 ```

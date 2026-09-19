@@ -58,12 +58,12 @@ import { YamlLimits, YamlOptions, yamlParseWith, yamlResolveScalar } from "yaml"
 
 fn main(): ()! {
   let limits = YamlLimits{
-    maxDepth: 128,
-    maxAliasExpansions: 1,
-    maxTotalNodes: 1_000_000,
-    maxDocumentBytes: 10_000_000,
+    maxDepth = 128,
+    maxAliasExpansions = 1,
+    maxTotalNodes = 1_000_000,
+    maxDocumentBytes = 10_000_000,
   }
-  let opts = YamlOptions{ limits: limits, resolver: yamlResolveScalar }
+  let opts = YamlOptions{ limits = limits, resolver = yamlResolveScalar }
   let src = "value: &shared 1\nfirst: *shared\nsecond: *shared\n"
 
   yamlParseWith(src, opts) catch e {
