@@ -132,13 +132,14 @@ esac
 # rather than composing it from a version variable means there is one source of
 # truth for which build is stage0.
 #
-# `-a`: SUMS carries hand-written comments, three of which contain a non-ASCII
-# `§`. Bind-mounting the repo into bit-linux-gate:latest (GNU grep 3.8, no
-# locale configured) makes grep call the whole file binary off that byte alone
-# and print "binary file matches" to stderr with EMPTY stdout and rc=0 — a
-# silent false "no digest" rather than a crash. `-a` treats it as text
-# unconditionally, so the next non-ASCII character typed into a comment here
-# does not repeat this (#5634).
+# `-a`: bind-mounting this repo into a container over virtiofs (e.g. an ad-hoc
+# `docker run -v` against bit-linux-gate:latest — the hardware gates never do
+# this, they stream `git archive HEAD | tar xi` instead) makes virtiofs answer
+# SEEK_HOLE/SEEK_DATA as though SUMS were entirely one hole. GNU grep (3.5+)
+# uses that to detect sparse files and reads an all-holes file as binary, so it
+# calls SUMS binary regardless of content, prints "binary file matches" to
+# stderr, and exits 0 with EMPTY stdout — a silent false "no digest" rather
+# than a crash. `-a` disables the heuristic (#5634).
 line="$(grep -aE "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
 [ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
 [ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
