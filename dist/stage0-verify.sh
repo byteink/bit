@@ -50,7 +50,7 @@ base="$(basename "${artifact}")"
 # Match the triple, not the exact filename: the version moves, the triple does
 # not, and pinning the whole name here would mean editing this script per release.
 #
-# `-a`: same file and same reason as scripts/stage0.sh's identical grep — a
+# `-a`: same file and same reason as scripts/stage0.sh's identical grep - a
 # virtiofs bind mount (an ad-hoc `docker run -v`; the hardware gates never do
 # this, they stream `git archive HEAD | tar xi`) answers SEEK_HOLE/SEEK_DATA
 # as though SUMS were entirely one hole, so GNU grep's sparse-file check calls
