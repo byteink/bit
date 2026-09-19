@@ -15,8 +15,8 @@ import { Yaml, YamlEntry, yamlEncode } from "yaml"
 fn main(): ()! {
   let doc = Yaml.YamlMapping(
     [
-      YamlEntry{ key: Yaml.YamlString("name"), value: Yaml.YamlString("waypoint") },
-      YamlEntry{ key: Yaml.YamlString("version"), value: Yaml.YamlString("1.4.2") },
+      YamlEntry{ key = Yaml.YamlString("name"), value = Yaml.YamlString("waypoint") },
+      YamlEntry{ key = Yaml.YamlString("version"), value = Yaml.YamlString("1.4.2") },
     ],
   )
   print(yamlEncode(doc)?)
@@ -74,7 +74,9 @@ import { Yaml, YamlEntry, yamlAsSequence, yamlEncodeAll, yamlParseAll } from "ya
 
 fn main(): ()! {
   let docs = [
-    Yaml.YamlMapping([YamlEntry{ key: Yaml.YamlString("name"), value: Yaml.YamlString("waypoint") }]),
+    Yaml.YamlMapping(
+      [YamlEntry{ key = Yaml.YamlString("name"), value = Yaml.YamlString("waypoint") }],
+    ),
     Yaml.YamlSequence([Yaml.YamlString("us"), Yaml.YamlString("eu")]),
   ]
   let text = yamlEncodeAll(docs)?

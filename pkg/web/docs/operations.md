@@ -13,7 +13,7 @@ import { App, Limit, MemoryCounter, byIp, rateLimit } from "web"
 
 fn mount(app: App) {
   let counter = MemoryCounter(10_000)
-  app.use(rateLimit(Limit{ requests: 100, window: 60, by: byIp, store: counter }))
+  app.use(rateLimit(Limit{ requests = 100, window = 60, by = byIp, store = counter }))
 }
 ```
 
