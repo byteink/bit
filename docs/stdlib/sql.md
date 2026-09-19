@@ -207,14 +207,14 @@ fn firstName(conn: Conn, id: string): string! {
 
 ## The freeze
 
-`bit/pkg/postgres` (#3987-3989) and `bit/pkg/mysql` (#3993-3995) were built
+`bit/pkg/postgres` and `bit/pkg/mysql` were built
 together, deliberately, to answer one question: is `std/sql`'s contract
 actually driver-agnostic, or does building the first driver quietly bend it
 to fit? Postgres landed first. MySQL was explicitly free to change `Value`,
 `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` or `Registry` if it needed to. This is
 the record of what it actually needed, checked against the real history
-rather than against what either ticket expected to find - and, now that both
-have shipped, the point at which these seven names stop moving.
+rather than against what either driver was expected to need - and, now that
+both have shipped, the point at which these seven names stop moving.
 
 ### Proving the swap is one line
 
@@ -289,19 +289,19 @@ adapter's public shape is not re-checked by it automatically.
 (`9b720102`): the creation itself, and three purely mechanical, repo-wide
 formatter sweeps (`13017a3e`'s receiver-form-to-class-body move, and
 `1e15ec44` plus its own revert `143f9e02` for the `=` `field_init` spelling).
-**Zero commits from #3987-3995 - either driver's own work - touch this
-file at all.** Checked directly: neither `mysql` nor `#399[3-5]` matches
-any commit on `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
+**No commit from either driver's own work touches this file at all.**
+Checked directly: no commit matching `mysql` or either driver's build
+touches `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
 (`Adapter`/`Datasource`) or `stdlib/sql/tx.bit` (`Executor`).
 
 | Interface | Changed by either driver | What actually happened |
 |---|---|---|
-| `Value` | No | Stayed `{Null, Int, Float, Text, Blob}` (#5421, owner ruling: extend by accessor, not by enum variant - see below). |
-| `Driver` | No | Neither adapter implements it. `pkg/postgres/adapter.bit:86` and `pkg/mysql/adapter.bit:104` both export `fn adapter(): Adapter` (`config.bit`'s `Adapter`, added by #3962 before either driver existed), never a `Driver`. The only implementer anywhere in the tree is `stdlib/sql/sqlcheck.bit`'s `fakeDriver`, a self-test double. |
-| `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:33`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The gap the freeze found, and #5587 closed," below, for `begin`'s history. |
+| `Value` | No | Stayed `{Null, Int, Float, Text, Blob}`; the rule is to extend by accessor, not by enum variant - see below. |
+| `Driver` | No | Neither adapter implements it. `pkg/postgres/adapter.bit:86` and `pkg/mysql/adapter.bit:104` both export `fn adapter(): Adapter` (`config.bit`'s `Adapter`, which predates either driver), never a `Driver`. The only implementer anywhere in the tree is `stdlib/sql/sqlcheck.bit`'s `fakeDriver`, a self-test double. |
+| `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:33`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The gap the freeze found, and how it was closed," below, for `begin`'s history. |
 | `Rows` | No | `pgRows`/`myRows` implement `next`/`columns`/`value`/`close` verbatim. MySQL's `TINYINT(1)`-as-bool and JSON-as-the-field's-own-type ambiguities are resolved by which accessor the caller reaches for (`sqlReqBool` vs `sqlReqInt`, `sqlReqJson`), never by `Rows` itself. |
 | `Stmt` | No | `pgStmt`/`myStmt` implement `query`/`exec`/`close` verbatim. MySQL's `$1`-to-`?` placeholder rewrite (`pkg/mysql/rewrite.bit`) and its statement cache both run *inside* `prepare`, invisible at the `Stmt` boundary. |
-| `Tx` | No | Signature untouched. Both drivers stubbed `begin` until #5587 wired it up - see below. |
+| `Tx` | No | Signature untouched. Both drivers stubbed `begin` until it was wired up - see below. |
 | `Registry` | No | Unused by both real drivers, same as `Driver`; exercised only by `sqlcheck.bit`'s fake. |
 
 **6 of 6 checked. 0 of 6 changed.** What MySQL actually needed - the session
@@ -309,19 +309,19 @@ any commit on `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
 mapping, its own DECIMAL binary format - all landed *inside* `myConn`/its
 codecs, never at the `Conn`/`Rows`/`Stmt` boundary. The one place the design
 predicted an extension point and a driver actually used it is `Value`:
-#5421 settled that a type a codec produces (`decimal`, later `Instant`,
+The rule settled here is that a type a codec produces (`decimal`, later `Instant`,
 `UUID`, `Json`, arrays) gets a `sqlReqX`/`sqlOptX` pair in
 `stdlib/sql/row.bit`/`rowtypes.bit`, reading `Value.Text` and converting -
 exactly the shape `pkg/mysql`'s own `mysqlDecimal` had already shipped by
 hand before the decision was written down. `Value` itself never grew a
 variant.
 
-### The gap the freeze found, and #5587 closed
+### The gap the freeze found, and how it was closed
 
 `Conn.begin(): Tx!` was declared and implemented by both drivers when this
 freeze was written, but both bodies were an unconditional failure - the
 freeze proved the other six interfaces against real traffic while leaving
-`begin` itself unwired. That stub predated #3979 (closure-scoped
+`begin` itself unwired. That stub predated closure-scoped
 transactions, the *only* public transaction API - see
 [Transactions](#transactions)), which built `tx`/`txAt`/`txValue`/`txValueAt`
 on top of `Pool`'s own (unexported) `begin`, which in turn calls straight
@@ -330,7 +330,7 @@ either shipped driver at all - not a gap in the interface, a gap in both
 implementations of it. This is exactly what an interface freeze is for: it
 caught the hole and named it rather than shipping it silently.
 
-#5587 (merged `f2b32c86`) closed it without moving the interface.
+The fix (merged `f2b32c86`) closed it without moving the interface.
 `pgConn.begin()` (`pkg/postgres/conn.bit:73`) sends `BEGIN`; `myConn.begin()`
 (`pkg/mysql/conn.bit:224`) sends `START TRANSACTION`. Both return a `Tx`
 (`pgTx`/`myTx`) whose `commit` and `rollback` send `COMMIT`/`ROLLBACK` on the
@@ -354,7 +354,7 @@ TLS handshake, so building only these two hid every place the contract
 assumes that. SQLite does not:
 
 - **`Datasource.host`/`port`/`connectTimeout`.** `config.bit`'s own comment
-  on the class already flags this for this ticket by number: *"`host`/
+  on the class already flags it: *"`host`/
   `port`/`sslmode` bake a network database assumption into the generic
   layer. SQLite has no host and no port and would leave all three at their
   defaults."* A SQLite adapter's `connect` would ignore three of
@@ -381,15 +381,15 @@ assumes that. SQLite does not:
 
 ### The freeze itself
 
-After this ticket, `Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and
+From here on, `Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and
 `Registry` are frozen: a change to any of their exported shapes is a stdlib
 API change under
 [`docs/release/VERSIONING.md`](../release/VERSIONING.md)'s surface 3, which
 takes at minimum a MINOR bump (MAJOR is pinned at 0 pre-1.0) whether the
 change is additive or breaking. Two independent drivers built against these
 seven names without moving one of them; a third driver is expected to extend
-`Value`'s reach through a new `sqlReqX`/`sqlOptX` pair, the way #5421 already
-settled, not by asking any of the seven to change shape.
+`Value`'s reach through a new `sqlReqX`/`sqlOptX` pair, the way the rule above
+settles, not by asking any of the seven to change shape.
 
 ## The connection pool
 
@@ -916,7 +916,7 @@ fn mustUserById(db: Executor, id: i64): User! {
 A field's column is its own name in **snake_case** - `createdAt` claims
 `created_at` - unless the field carries `@column("...")`, which overrides it
 exactly: `@column("e_mail")` claims `e_mail`. `@column` is compiler-known,
-excluded from #3879's field-attribute call-desugaring the same way `@key`
+excluded from field-attribute call-desugaring the same way `@key`
 is, so a plain class needs no import to use it.
 
 A result column no field claims is **ignored**: `select *` is ordinary SQL,

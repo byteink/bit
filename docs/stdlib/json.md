@@ -151,8 +151,8 @@ One token: `kind`, and its `[start, end)` byte span in the source.
 ### `jsonMaxDepth`
 
 The combined `{`/`[` nesting limit: 128 levels. Opening a 129th level
-yields an `Invalid` token instead of tracking it. Raised from 64 (#2256,
-too low in practice) but deliberately not raised to 1000 (#2345, reverted:
+yields an `Invalid` token instead of tracking it. Raised from 64, which was
+too low in practice, but deliberately not raised to 1000 (tried and reverted:
 a green thread's smaller stack overflowed inside `spawn` around depth 250,
 so a higher cap gave a false sense of headroom that crashed the process
 instead of erroring cleanly).
@@ -426,8 +426,8 @@ fn cstExample(): string {
 ## Editing the CST
 
 The path-based edit layer `bit add` (the package manager) calls
-to change `bit.json` without disturbing anything it didn't touch - the json
-epic's namesake "edit layer". A path is `[]string` of object keys only
+to change `bit.json` without disturbing anything it didn't touch. A path is
+`[]string` of object keys only
 (array-index paths are out of scope; `bit.json`'s dependency map is
 object-keyed). Every function mutates and returns its `root` - class and
 slice writes along the path are visible in place, but an append or a

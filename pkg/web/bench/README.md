@@ -26,7 +26,7 @@ change to get there and each one is commented where it was made: express's
 chunked unless the handler declares a length, and Kestrel frames chunked
 unless `ContentLength` is set.
 
-Types 3 to 5 need a database. `pkg/postgres`'s type codecs are open as #3989,
+Types 3 to 5 need a database. `pkg/postgres`'s type codecs are not implemented yet,
 so they are not measured and the published block says so rather than leaving
 the gap to be rediscovered.
 

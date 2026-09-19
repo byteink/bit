@@ -71,7 +71,7 @@ MODE=${1:-full}
 CACHE=${BENCH_CACHE_DIR:-${TMPDIR:-/tmp}/bit-bench-gomod/yaml}
 mkdir -p "$BIN" "$CACHE/gocache" "$CACHE/gomodcache"
 
-command -v docker >/dev/null || { echo "docker not found; required to cross-compile the Go competitors (#5501 forbids installing Go on this machine)" >&2; exit 1; }
+command -v docker >/dev/null || { echo "docker not found; required to cross-compile the Go competitors, because Go is deliberately never installed on this machine" >&2; exit 1; }
 [ -x "$BIT" ] || { echo "$BIT not built (run: ./make selfhost)" >&2; exit 1; }
 [ -f "$DATA" ] || { echo "fixture missing: $DATA (checked in, never generated at run time)" >&2; exit 1; }
 

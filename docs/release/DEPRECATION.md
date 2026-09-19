@@ -31,7 +31,7 @@ line and the next interim release, is not sufficient; the clock only counts
 full LTS-to-LTS spans anchored at each line's GA.
 
 Pre-1.0, there is no LTS line yet (`docs/release/SUPPORT.md`'s pre-1.0
-phasing note), so this rule has no floor to enforce until #366 (v1.0) ships
+phasing note), so this rule has no floor to enforce until v1.0 ships
 and the first LTS line is designated. Before that point, 0.x deprecations
 still carry the compiler warning below as a courtesy, but removal timing is
 unconstrained - consistent with 0.x's "MINOR may break" rule in

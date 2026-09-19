@@ -4,8 +4,8 @@ This file is the contract between the release pipeline
 (`dist/release.sh`, run by hand from a maintainer machine, never from CI - this
 repo has no GitHub Actions and never will, see `CONTRIBUTING.md`'s "No GitHub
 Actions") and everything downstream that consumes a published release:
-the Homebrew tap (#359), the `curl | sh` installer (#360), and the
-PowerShell/winget path (#361). Change this file first, then the pipeline, then
+the Homebrew tap, the `curl | sh` installer, and the
+PowerShell/winget path. Change this file first, then the pipeline, then
 the consumers.
 
 ## Which targets actually ship
@@ -20,9 +20,9 @@ are published today.
 | `x86_64-linux`  | `bit-<version>-linux-x86_64.tar.xz`  | shipping |
 | `aarch64-linux` | `bit-<version>-linux-aarch64.tar.xz` | shipping |
 | `aarch64-macos` | `bit-<version>-macos-aarch64.tar.xz` | shipping |
-| `x86_64-windows` | `bit-<version>-windows-x86_64.zip`  | shipping (#3342), smoke-tested on real hardware over SSH |
+| `x86_64-windows` | `bit-<version>-windows-x86_64.zip`  | shipping, smoke-tested on real hardware over SSH |
 | `x86_64-macos`  | `bit-<version>-macos-x86_64.tar.xz`  | **not built** - the Mach-O linker has no x86-64 relocation support; `./make libbitrt` emits the archive but no compiler target selects it |
-| `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** - out of scope for the Windows port (epic #3322 targets x86_64-windows only) |
+| `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** - out of scope for the Windows port, which targets x86_64-windows only |
 
 `dist/release.sh` is a maintainer-run script with no CI behind it (this repo
 has no GitHub Actions and never will; see `CONTRIBUTING.md`'s "No GitHub
@@ -50,7 +50,7 @@ bit-<version>.cdx.json                # CycloneDX SBOM, one per release
 
 `bit-<version>.cdx.json` is a CycloneDX 1.7 SBOM, one per release (not one per
 target - the three archives share the same toolchain and dependency set).
-Generated automatically, as one of `dist/release.sh`'s own steps (#2748) - no
+Generated automatically, as one of `dist/release.sh`'s own steps - no
 maintainer ever runs `dist/sbom.py` by hand or decides whether to. The script
 builds it via `cyclonedx-python-lib` (version pinned once, in
 `dist/sbom-requirements.txt`, read by both the release flow and
@@ -74,11 +74,11 @@ bit-<version>-<os>-<arch>/
   lib/aarch64-linux/libbitrt.a         #   can link, so a single install can
   lib/aarch64-macos/libbitrt.a         #   cross-produce the other targets
   stdlib/...                           # the Bit standard library source tree
-  docs/...                             # the docs/ tree, verbatim (#3500) - so
+  docs/...                             # the docs/ tree, verbatim - so
                                         #   README.md's relative docs/ links
                                         #   resolve inside the install instead
                                         #   of 404ing
-  libexec/upgrade.sh                   # what `bit upgrade` runs (#4329) - it
+  libexec/upgrade.sh                   # what `bit upgrade` runs - it
                                         #   must live in the install, because
                                         #   an artifact is all a curl|sh user
                                         #   has on disk
@@ -198,7 +198,7 @@ bit 1.2.3
 
 The pinned stage0 that compiles it prints the same line for its own release,
 both reading `compiler/version.bit` as the single source of truth. (`bit-seed`
-used to be the other half of this sentence; it was deleted in #1593.)
+used to be the other half of this sentence; it no longer exists.)
 
 An unrecognised subcommand is a usage error on stderr with exit status 2; it
 does **not** fall through to the banner, so a typo cannot be mistaken for a

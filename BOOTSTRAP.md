@@ -1,6 +1,6 @@
 # Bootstrap
 
-**The seed is gone (#1593). [`docs/release/bootstrap.md`](docs/release/bootstrap.md)
+**The seed is gone. [`docs/release/bootstrap.md`](docs/release/bootstrap.md)
 is the authority for how Bit builds today.** This file is the short version plus
 the history, because the long version it used to contain describes a compiler
 that no longer exists and would mislead anyone who found it first.
@@ -37,7 +37,7 @@ bash scripts/selfhost-fixpoint.sh
 Builds `compiler/` with `bit`, builds it again with the result, and requires the
 two binaries to be byte-identical. This is the proof that matters: `bit` ==
 `bit`-built-by-`bit`. It never depended on the seed, which is why it is the one
-gate #1593 did not have to re-base.
+gate removing the seed did not have to re-base.
 
 Compare stages built to the **same basename in different directories**. A Mach-O
 ad-hoc signature embeds the binary's own file name, so `-o /tmp/stage2` versus
