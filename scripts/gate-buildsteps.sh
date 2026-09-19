@@ -325,7 +325,17 @@ case "${BUCKET}" in
     # compiler/lowerlayout.bit — is compiler-only, so `gates_for_file
     # compiler/lowerdecimal.bit` resolving to this bucket (not to one gate)
     # left every compiler/**-only diff blind to it before this line.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword)
+    #
+    # test-package-tags (#5606) closes the gap the `pkg` bucket's own
+    # comment above names ("NOTE: #5569 itself touched compiler/project.bit
+    # ..."): #5569, the regression test-package-tags exists to catch, was a
+    # `compiler/project.bit` change, not `pkg/**`, so a compiler-only diff
+    # never resolved to the one bucket that ran it. Same reason as
+    # test-packages just above it in this array — a compiler/**-only change
+    # can break how every published package resolves even though no package
+    # imports compiler/ directly. Measured `./make test-package-tags` 0m24s
+    # (4 of 4 published packages build) on this branch's own tip.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -407,7 +417,12 @@ case "${BUCKET}" in
     # is wired here by hand, and scripts/gate-envscope.sh's
     # assert_taskwordssizing_scope_current() re-checks this membership on
     # every run rather than leaving it unaudited.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing)
+    #
+    # test-package-tags (#5606), same reason as the selfhost bucket's own
+    # #5606 comment: runtime/** can break how a published package resolves
+    # just as much as compiler/** can, and #5597 wired it only into `pkg`.
+    # Measured `./make test-package-tags` 0m24s on this branch's own tip.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
@@ -480,7 +495,13 @@ case "${BUCKET}" in
     # tax (#3778's test-golden cause) paid 291 times by the harness's own
     # single-use scripts, not work: see shellrun.bit's header for the fix and
     # the before/after numbers.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface)
+    #
+    # test-package-tags (#5606), same reason as the selfhost/runtime
+    # buckets' own #5606 comments: stdlib/** can break how a published
+    # package resolves just as much as compiler/** can (every package
+    # builds against stdlib/), and #5597 wired it only into `pkg`. Measured
+    # `./make test-package-tags` 0m24s on this branch's own tip.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-package-tags test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
@@ -628,9 +649,9 @@ case "${BUCKET}" in
     # (_tests_/bit/packagetagsgate.bit) and compiles against it with the
     # compiler under test. NOTE: #5569 itself touched `compiler/project.bit`,
     # not `pkg/**` — a compiler-only diff does not resolve to this bucket, so
-    # this wiring alone does not close the gap for that direction; see
-    # _tests_/bit/packagetagsgate.bit's own header ("SCOPE GAP") and its
-    # follow-up ticket for wiring it into selfhost/runtime/stdlib too.
+    # this wiring alone did not close the gap for that direction; #5606
+    # closed it by adding `test-package-tags` to the `selfhost`, `runtime`
+    # and `stdlib` buckets too (see each bucket's own comment above).
     BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags)
     ;;
   spec)
