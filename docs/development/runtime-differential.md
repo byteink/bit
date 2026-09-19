@@ -1,10 +1,10 @@
 # Runtime codegen differential: design record
 
-Moved out of `scripts/selfhost-diffruntime.sh`'s header (#4264) to keep the
+Moved out of `scripts/selfhost-diffruntime.sh`'s header to keep the
 script itself under the 800-line ceiling. Nothing below was reworded - only
 moved and reflowed from `#`-comments into Markdown.
 
-Runtime codegen differential (#1859): run every `runtime/**/*.bit` through both
+Runtime codegen differential: run every `runtime/**/*.bit` through both
 compilers' `--dump-ir-pre` and diff the lowered SSA text.
 
 ## Why this exists
@@ -18,16 +18,16 @@ The other fifteen `selfhost-diff*.sh` all walk the same corpus:
 `runtime/` is in none of them. The compiler had therefore NEVER been
 differentially tested against the source it compiles into every user binary.
 
-That blind spot has a price tag. #1857: `parseFloat` had no hex-float branch,
+That blind spot has a price tag. `parseFloat` once had no hex-float branch,
 so every `0x…p…` literal became ±0.0. `runtime/root` is the only place in the
 repo that uses hex float literals, so no differential could ever have compared
 the construct. The bug survived the entire self-hosting effort and surfaced
-only when #1593 made the self-hosted compiler build `libbitrt.a` for the first
+only once the self-hosted compiler built `libbitrt.a` for the first
 time - where it silently zeroed `bit_rt_log`'s whole polynomial and made
 `log(x)` return 0 for every input. The differentials were green throughout.
 They were not wrong; they were asked about a corpus that excluded the code.
 
-## Why IR text alone is not the whole picture (#2741)
+## Why IR text alone is not the whole picture
 
 Measured on `main` at `948ec5fd`, over the same 87 files this walk compares:
 966 function bodies dumped, 477 EMPTY (49.4%). A single `.bit` file cannot
@@ -45,34 +45,36 @@ does not error - it emits an EMPTY body and exits 0. `runtime/root/root.bit`'s
 `--dump-ir-pre` is also PRE-optimisation, so a divergence inside a small
 `@nosplit` helper inlined by `compiler/opt.bit`'s `-O1` pass (`spinRelease`,
 `spinTryAcquire`) is invisible in every per-file dump - it exists only in the
-caller's post-inline body. #2569's divergence had 38 machine-code sites
-across 6 modules; this walk alone named 2 files and 3 sites.
+caller's post-inline body. The v0.1.10 atomic-width divergence had 38
+machine-code sites across 6 modules; this walk alone named 2 files and 3 sites.
 
-The whole-module object-byte comparison below (added by #2741) closes both
+The whole-module object-byte comparison below closes both
 gaps: a module build resolves its own siblings (no empty stubs) and emits
 the actual post-optimisation machine code (inlining and all). It does not
 replace this walk - IR text is still the right surface for a mis-parsed
 constant, which appears in it directly as `const_float f64 0.5`, and
-catches it (#1857) at the file granularity a module build cannot isolate.
+catches the hex-float bug at the file granularity a module build cannot isolate.
 
-## Why byte-for-byte identity against the pinned release stopped being a valid invariant, and what replaced it (#3103)
+## Why byte-for-byte identity against the pinned release stopped being a valid invariant, and what replaced it
 
-#1859 first proposed object bytes here; the measurement then was
+Object bytes were first proposed here; the measurement then was
 seed-vs-selfhost, every module differed (root 147941 vs 171069, gc 50661 vs
-57173, ...) - #1851's backend optimiser gap, not a correctness difference -
+57173, ...) - an earlier backend optimiser gap, not a correctness difference -
 and the conclusion was "object bytes only mean something between two builds
-of the SAME implementation." #2741 (measured on `main` at `948ec5fd`, 23/23
-modules byte-identical) argued that since #1593 the pinned stage0 IS that
-same implementation, one release back, so byte identity became meaningful.
+of the SAME implementation." A later measurement (on `main` at `948ec5fd`, 23/23
+modules byte-identical) argued that since the seed was removed the pinned
+stage0 IS that same implementation, one release back, so byte identity became
+meaningful.
 
 It held only because no intentional codegen improvement had landed in that
-window. #1852 closed #1851's own backend gap on aarch64 (`_scanObject` 120
-movs -> 60) and reopened exactly the seed-vs-selfhost condition #1859
-rejected: 22 of 23 modules diverge, every one SMALLER on this tree, none of
-them a bug (`gc` 63528 -> 55184 bytes, `chan` 37345 -> 31393, measured
-#3103). Byte identity cannot pass an optimisation that is doing its job, so
+window. A backend optimization closed that earlier gap on aarch64
+(`_scanObject` 120 movs -> 60) and reopened exactly the seed-vs-selfhost
+condition rejected above: 22 of 23 modules diverge, every one SMALLER on this
+tree, none of them a bug (`gc` 63528 -> 55184 bytes, `chan` 37345 -> 31393).
+Byte identity cannot pass an optimisation that is doing its job, so
 it is no longer the invariant on **aarch64** hosts (macOS and Linux share
-the ISA). What must still hold, because it is what #2569 actually broke:
+the ISA). What must still hold, because it is what the v0.1.10 bug actually
+broke:
 
 > no atomic memory access changes WIDTH between its source type and the
 > instruction the backend emits.
@@ -83,7 +85,7 @@ only has a value operand to mis-widen on those three op kinds) across 6
 modules, corrupting the 4 adjacent bytes every time. Width is not a style
 choice the way instruction selection is - it is fixed by the pointee's
 declared type (§11.5) - so an optimisation pass has no reason to touch it.
-Verified rather than assumed (#3103), on all 23 modules, #1852's tree
+Verified rather than assumed, on all 23 modules, the optimized tree
 against the pinned 0.1.17: **0 atomic-signature mismatches where 22 of 23
 byte-compares diverge.**
 
@@ -94,30 +96,29 @@ but keeps the register CLASS - `w` (32-bit) vs `x` (64-bit) - sorts, dedupes
 to a SET, and requires the sets to match. A width flip changes SET
 membership (a `stlr w`/`stlr x` pair appears or disappears); an inlining
 change that duplicates an already-emitted atomic, or a scheduling change,
-does not (#3170 - an earlier `cmp` on the un-deduped, count-sensitive
-multiset reddened this exact way when #3164's algebraic folding let
+does not (an earlier `cmp` on the un-deduped, count-sensitive
+multiset reddened this exact way when an algebraic folding change let
 `trampRelease` inline into both its callers, doubling `_stlxr x`/`_ldaxr x`
 without touching a single width).
 
-Mutation-tested (#3103) against the real bug, not a synthetic stand-in:
+Mutation-tested against the real bug, not a synthetic stand-in:
 `BIT_STAGE0_BIN` cannot point directly at v0.1.10 against TODAY's runtime
-source any more - v0.1.10 predates the `function`->`fn` rename (#2760) and
-cannot parse it (`E0021` on every `@nosplit fn`). Filed separately as #3109,
-which re-ran the ticket's own repro on 2026-08-16 (stage0 pinned to 0.1.19
-by then) and reconfirmed it: `BIT_STDLIB="$PWD/stdlib"
+source any more - v0.1.10 predates the `function`->`fn` rename and
+cannot parse it (`E0021` on every `@nosplit fn`). Re-run on 2026-08-16
+(stage0 pinned to 0.1.19 by then) and reconfirmed: `BIT_STDLIB="$PWD/stdlib"
 <v0.1.10's bin/bit> build runtime/gc -c --freestanding -o /dev/null` still
 fails, `error[E0021]: expected 'function' or 'let' after an attribute, found
 an identifier` at `runtime/gc/gc.bit:177` (the first `@nosplit fn`). This is
 not something a repin will ever fix - v0.1.10 is frozen at release time, so
 the parse failure against current source is permanent.
 
-The historical #2569 divergence itself still reproduces, on ERA-MATCHED
-source - v0.1.10/v0.1.11 never need to parse today's tree, only the tree as
-it stood the commit before the repin. No fixture is committed for this: the
-source is one `git archive` away and both release binaries are one `curl`
-away (same GitHub-releases path `scripts/stage0.sh` fetches from), and a
-frozen copy would only be a second thing to go stale the same way this
-recipe did. Re-run and reconfirmed by #3109 for the `gc` module (the other 5
+The historical v0.1.10 atomic-width divergence itself still reproduces, on
+ERA-MATCHED source - v0.1.10/v0.1.11 never need to parse today's tree, only
+the tree as it stood the commit before the repin. No fixture is committed for
+this: the source is one `git archive` away and both release binaries are one
+`curl` away (same GitHub-releases path `scripts/stage0.sh` fetches from), and
+a frozen copy would only be a second thing to go stale the same way this
+recipe did. Re-run and reconfirmed for the `gc` module (the other 5
 named below follow the identical shape - swap the path):
 
 ```
@@ -134,17 +135,17 @@ named below follow the identical shape - swap the path):
 ```
 
 (<triple> is macos-aarch64 / linux-aarch64 / linux-x86_64 - the same host
-mapping scripts/stage0.sh uses.) #3109 ran exactly this: both binaries build
-the era-matched `gc` module cleanly (exit 0 each, 98826 bytes each), then
-`cmp` exits 1 at byte 145 - the raw-byte divergence #2569 actually shipped,
-reproduced without reasoning about it. #3109 also re-ran the atomic-width
-signature this file actually gates on (aarch64's `atomicSignature()` below,
-lifted into a scratch script rather than re-derived by hand):
-`gc10.o` (v0.1.10, the bug) yields `{ldar x, ldaxr x, stlr x, stlxr w}` -
-missing `ldaxr w` and `stlr w` entirely; `gc11.o` (v0.1.11, the fix) yields
-both the `w` and `x` forms of each. That is #2569 exactly: v0.1.10 never
-emits the 32-bit acquire/release form at all, because it always widens to
-`x` regardless of the pointee's declared type.
+mapping scripts/stage0.sh uses.) This reproduction ran exactly this: both
+binaries build the era-matched `gc` module cleanly (exit 0 each, 98826 bytes
+each), then `cmp` exits 1 at byte 145 - the raw-byte divergence v0.1.10
+actually shipped, reproduced without reasoning about it. It also re-ran the
+atomic-width signature this file actually gates on (aarch64's
+`atomicSignature()` below, lifted into a scratch script rather than
+re-derived by hand): `gc10.o` (v0.1.10, the bug) yields `{ldar x, ldaxr x,
+stlr x, stlxr w}` - missing `ldaxr w` and `stlr w` entirely; `gc11.o`
+(v0.1.11, the fix) yields both the `w` and `x` forms of each. That is the bug
+exactly: v0.1.10 never emits the 32-bit acquire/release form at all, because
+it always widens to `x` regardless of the pointee's declared type.
 
 This block demonstrates the invariant catches the real bug ONCE; it needs
 re-running only if the invariant itself changes, not on every stage0 repin.
@@ -156,10 +157,11 @@ What this deliberately no longer asserts, on aarch64: that instruction
 COUNT, SCHEDULE or SELECTION for anything but atomic width matches the
 pinned release. A backend bug that is not a width mismatch (wrong
 arithmetic, a dropped instruction, a wrong branch) is not guaranteed to be
-caught here - it never truly was, before #1852, except by the accident that
-any difference at all was suspicious; #1852 broke that accident on purpose,
-and un-breaking it would block every future codegen improvement, which
-#3103's own ticket weighs and rejects (gating on pin currency is silently
+caught here - it never truly was, before the backend optimization above,
+except by the accident that any difference at all was suspicious; that
+optimization broke that accident on purpose, and un-breaking it would block
+every future codegen improvement, which was weighed and rejected when this
+invariant was narrowed (gating on pin currency is silently
 vacuous between releases; informational-only is a check nobody fails; a
 release-and-repin per change serialises all performance work). The per-file
 IR walk above is unweakened by any of this - still exact-text.
@@ -173,15 +175,15 @@ self-build fixed point never touches runtime codegen at all; a from-scratch
 two-generation runtime rebuild would only reconfirm what
 `selfhost-fixpoint.sh` already proves (this tree reproduces itself), a
 different property from "matches a known-good reference", and it would have
-scored #2569 a MATCH - v0.1.10's bug was baked identically into every
+scored the v0.1.10 bug a MATCH - the bug was baked identically into every
 self-build generation, so a same-tree comparison has nothing external to
-diverge from by construction. Confirmed empirically (#3103): reverting the
-exact #2569 fix commit on current HEAD does not even reach a silent byte
-divergence any more - it now trips `assertAtomicOperandWidth`'s compile-time
-panic (#2742, added after #2569), caught by the existing build-failure
-branch below independent of anything in this section.
+diverge from by construction. Confirmed empirically: reverting the
+exact fix commit for that bug on current HEAD does not even reach a silent
+byte divergence any more - it now trips `assertAtomicOperandWidth`'s
+compile-time panic (added after the bug shipped), caught by the existing
+build-failure branch below independent of anything in this section.
 
-x86-64 gets the SAME narrowed invariant now (#3110), verified on real
+x86-64 gets the SAME narrowed invariant now, verified on real
 x86_64-linux hardware (hl-master), not guessed. x86-64's TSO model has no
 single per-instruction acquire/release mnemonic the way aarch64's
 `ldar`/`stlr` do, so the signal is structurally different, found by
@@ -194,15 +196,15 @@ an `mfence`:
   x86 has no native fetch-and-and/or) lower to `lock xadd`/`lock cmpxchg`
   (`compiler/x64select.bit`'s `xEmitAtomicRmw`/`xEmitAtomicCmpxchg`), width
   visible in the register operand's class - exactly the RMW mnemonic plus
-  register-width signal #3110's own hypothesis guessed.
+  register-width signal the x86-64 hypothesis guessed.
 - STORE carries no `lock` PREFIX in the disassembly - x86-TSO already
   orders a store against earlier stores, so there is no dedicated
   release-store mnemonic, and the store-load barrier a seq-cst store still
   owes is bought by making the store itself an implicitly-locked
-  `xchg <reg>,MEM` (`xEmitAtomicStore`, #5317; it was a plain
+  `xchg <reg>,MEM` (`xEmitAtomicStore`; it was a plain
   `mov <reg>,MEM` immediately followed by `mfence` until then, which cost
-  2.3x as much on the x86_64-linux gate host and is the whole of that
-  ticket). BOTH forms are still extracted and both normalise to one
+  2.3x as much on the x86_64-linux gate host and is the whole reason for the
+  change). BOTH forms are still extracted and both normalise to one
   `store <class>` token, because this differential runs the pinned stage0
   against the tree: for exactly one release the oracle emits the old form
   and the tree the new one, and normalising is what keeps that from reading
@@ -222,7 +224,7 @@ an `mfence`:
 
 Mutation-tested against a synthesized width-class miscompile - no
 historical x86-64 case exists, so one was built the same shape as the real
-#2569 bug, as #3103's own precedent and this ticket allow.
+v0.1.10 bug, following the same precedent as the aarch64 narrowing above.
 `xEmitAtomicStore`'s `xMovStore(cx.buf, xMemB(base, 0), val, w.bytes)`
 mutated to hardcode `8` (always emit a 64-bit store regardless of the
 pointee's declared width), rebuilt, and compared against the pinned oracle
@@ -243,7 +245,7 @@ stores. So an instruction-count-only diff - the naive cheaper alternative -
 would have passed this exact bug; the signature and full byte identity
 both catch it, and unlike byte identity the signature does not also flag a
 legitimate codegen improvement that changes bytes without changing width
-(#3103's own reason for narrowing the aarch64 invariant in the first
+(the same reason the aarch64 invariant was narrowed in the first
 place).
 
 Verified on x86_64-linux ONLY: no x86_64-macOS host exists to check
@@ -259,7 +261,7 @@ carries no `LC_CODE_SIGNATURE` load command and no embedded filename or
 path - confirmed by building the same module to two different basenames in
 two different directories and finding all four outputs byte-identical.
 
-## Why a third arm compares each module's set of cross-object references (#4365)
+## Why a third arm compares each module's set of cross-object references
 
 Both arms above are structurally blind to a lowering change that only fires on
 a CROSS-MODULE call, and that is not a hypothetical class:
@@ -270,8 +272,8 @@ a CROSS-MODULE call, and that is not a hypothetical class:
 - the atomic-width signature only looks at acquire/release mnemonics, which a
   non-atomic codegen change never moves.
 
-#4345 lowered `loadByte`/`storeByte` inline instead of as a cross-object call
-and removed **193 of 2483** `ARM64_RELOC_BRANCH26` relocations from
+A later change lowered `loadByte`/`storeByte` inline instead of as a
+cross-object call and removed **193 of 2483** `ARM64_RELOC_BRANCH26` relocations from
 `libbitrt-aarch64-macos.a` (`_bit_rt_port_mem_load_byte` 115 -> 0,
 `_bit_rt_port_mem_store_byte` 78 -> 0; archive 922226 -> 911930 bytes). This
 differential printed `PASS - 154/155 runtime file(s) lower identically`. It was
@@ -285,18 +287,18 @@ module's code and data reference but do not define - extracted with
 `objdump -r` and keyed on `(TYPE, SYMBOL)`. Mach-O and ELF both print one
 `OFFSET TYPE VALUE` record per line under `RELOCATION RECORDS FOR [...]`
 banners, so one extraction covers both; the OFFSET column is dropped (it moves
-with every scheduling and register-allocation change - exactly the noise #3103
-narrowed the byte-identity invariant to escape) and an ELF section-relative
+with every scheduling and register-allocation change - exactly the noise the
+byte-identity invariant was narrowed to escape) and an ELF section-relative
 addend (`.text+0x10`) is stripped down to the symbol.
 
-**As a SET, not a multiset**, for #3170's reason one arm up: inlining an
+**As a SET, not a multiset**, for the same false-red reason one arm up: inlining an
 already-emitted call into a second call site duplicates a record without
 changing which symbols the module references, and a count-sensitive compare
 reddens on that legitimate fold. Set membership moves only when a reference
 appears or disappears entirely, which is what a cross-module lowering change
 does.
 
-**The rejected alternative.** #4365 weighed dumping IR per MODULE instead, so
+**The rejected alternative.** Dumping IR per MODULE instead, so
 imports resolve. That is not a script change: `--dump-ir-pre` reads exactly
 one file (`readDumpSource` in compiler/main.bit calls `readFile` on its
 argument) and a directory still fails outright - re-checked on this tree, not
@@ -308,26 +310,27 @@ atomic-width arm already built.
 
 **Measured when the arm was added**, on `main` at `b23c33c4` against the
 pinned oracle: 19478 relocation sites over 25 modules, and 25/25 modules
-identical at set AND multiset granularity. So unlike object bytes (#3103,
-where 22 of 23 modules legitimately differ) this invariant is not already
+identical at set AND multiset granularity. So unlike object bytes (where 22
+of 23 modules legitimately differ) this invariant is not already
 broken by the optimisation work that has landed since the pin. `MIN_RELOC_SITES`
 (12000) is the same "a count is not coverage" floor as `MIN_ATOMIC_SITES`: a
 missing or renamed `objdump` empties the signature on BOTH sides and every
 module then compares equal.
 
 **Why there is a declared-change table** (`RELOC_DECLARED`, empty today). The
-codegen work under #4342 is deliberately in the business of removing
-cross-object calls from the runtime, so this arm WILL go red on a correct
-change, and a gate with no way to record that is #1895's routed-around-red
-hazard. A line names one exact `<module> <-|+> <TYPE> <SYMBOL>` reference, so
-it is a signature and not the per-file allowlist #1883 deleted: a second,
+codegen work removing cross-object calls from the runtime is deliberately
+ongoing, so this arm WILL go red on a correct
+change, and a gate with no way to record that routes around the red instead
+of fixing it. A line names one exact `<module> <-|+> <TYPE> <SYMBOL>` reference, so
+it is a signature and not the deleted per-file allowlist: a second,
 unrelated reference change inside an already-declared module still fails. It
 is asserted BOTH WAYS - a declared line that is no longer observed fails too,
 which is what empties the table at the next stage0 repin instead of leaving a
 stale entry masking a later regression on that exact symbol.
 
-**Proved live against #4345, not reasoned about.** `7b84b9c9` (the #4345
-commit) built in one scratch worktree, its parent `145077ca` in another, the
+**Proved live against the `loadByte`/`storeByte` change above, not reasoned
+about.** `7b84b9c9` (that commit) built in one scratch worktree, its parent
+`145077ca` in another, the
 arm run with `BIT_STAGE0_BIN` pointing at the parent's compiler:
 
 ```
@@ -370,19 +373,19 @@ directory is a compiler feature, not a script; until then, per-file is the
 whole surface this walk can reach. It happens to cost nothing: the walk
 below skips zero files.
 
-## Why a mismatch is checked against a declared-transform signature first (#3132)
+## Why a mismatch is checked against a declared-transform signature first
 
 This IR walk has its OWN shell-out to `--dump-ir-pre` - it never routed
-through scripts/selfhost-diffdump.sh - so #3125's fix (score a mismatch
+through scripts/selfhost-diffdump.sh - so the fix that scores a mismatch
 against a table of declared lowering-transform signatures before calling it
-a regression) never reached it. #3107's inline slice-index lowering
-(compiler/loweraccess.bit) reddened this arm exactly the way it reddened
-diffdump's ir/iropt rows before #3125: `runtime/park/darwin/wait.bit`,
+a regression never reached it, until now. An inline slice-index lowering
+change (compiler/loweraccess.bit) reddened this arm exactly the way it
+reddened diffdump's ir/iropt rows before that fix: `runtime/park/darwin/wait.bit`,
 `runtime/root/{floatbig,floatfmt,floatparse}.bit` and
 `runtime/thread/darwin/spawn.bit` all index buffers and lower differently
 by design. This sources `explainMismatch` from
 scripts/selfhost-ir-signatures.sh - the same function selfhost-diffdump.sh
 sources, not a second copy - and downgrades a mismatch to EXPLAINED only
-when it satisfies the registered #3107 identity; anything else still fails
-exactly as before.
+when it satisfies the registered slice-index-lowering identity; anything else
+still fails exactly as before.
 
