@@ -37,14 +37,14 @@ offset  size  field
 - `size` and the mark bit are owned by the runtime. Codegen must not read or
   write them, and must not assume their meaning — only `info` and the 16-byte
   offset are stable ABI for codegen. The rest may change with the collector.
-- **The mark bit lives in bit 63 of the size word** (#4083). A single
+- **The mark bit lives in bit 63 of the size word.** A single
   allocation's byte count is positive and far below 2^63, so the top bit is free
   by construction. `runtime/gc/gc.bit`'s `hdrSize`/`hdrMarked`/`hdrSetMark`/
   `hdrTakeMark` are the only sanctioned readers; a bare load of the word reads
   a NEGATIVE value for any marked object.
-- **The header is two words and has no spare one** (#4086). It was 32 bytes
-  until #4083 packed the mark bit into the size word's sign bit and #4059
-  retired the all-objects list link; #4086 deleted both words in a single ABI
+- **The header is two words and has no spare one.** It was 32 bytes until the
+  mark bit was packed into the size word's sign bit and the all-objects list
+  link was retired, then both freed words were deleted in a single ABI
   change. `runtime/alloc/classify.bit` rounds `header + body` to a size class,
   so a third header word costs one whole class at every body size from 8 to 48
   bytes. Adding one is a measurable regression on every allocation, not a
@@ -115,8 +115,8 @@ a declared value type into a reference type.
 ### 1.2 Payload-carrying enums
 
 A payload-carrying enum construction (`Enum.Variant(args)`) is **one**
-`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @8, arg1 @16, ... }` (#4018,
-base moved from 16 to 8 by #4026). Body size is `8 + 8*argc`. The tag word at
+`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @8, arg1 @16, ... }` (base
+moved from 16 to 8). Body size is `8 + 8*argc`. The tag word at
 offset 0 is never a GC reference; each argument word at `8 + 8*i` is listed in
 `ptr_offsets` (§2) exactly when that argument's static type holds a GC reference
 — there is no separate payload box and no intermediate payload pointer to trace.
@@ -136,14 +136,14 @@ an argc=1 variant whose argument is a reference produces a byte-identical
 collector traces a value that is always nil on that path. That is deliberate and
 it is the SAFE direction — tracing a nil word is wasted work, whereas omitting a
 word that turned out to hold a reference is a missed root and a wrong answer.
-**#4026 kept it** for exactly that asymmetry: under the merged base it is the
-same word `arg0` occupies, so the pointer map is right for both forms with no
-per-variant reasoning.
+**The merged base keeps that asymmetry** on purpose: under it, the no-payload
+form's always-nil word is the same word `arg0` occupies, so the pointer map is
+right for both forms with no per-variant reasoning.
 
-**Why offset 8 and not 16 (#4026).** `runtime/alloc/classify.bit` rounds every
+**Why offset 8 and not 16.** `runtime/alloc/classify.bit` rounds every
 request to a size class, and classes 1..7 are the multiples of 16 up to 112, so
 an odd argc is what crosses a class boundary. The figures below were measured
-against the **then-32-byte** header, before #4086 shrank it to 16: at base 16 an
+against the **then-32-byte** header, before it shrank to 16: at base 16 an
 argc=1 object needed 56 bytes and took the 64 class; at base 8 it needed 48 and
 took the 48 class — 16 bytes, 25%, on every `Option.Some`, `Result.Ok`,
 `Result.Err` and every payload variant of `Json`. argc=3 dropped 80 -> 64 the
@@ -165,7 +165,7 @@ take the offset from `enumPayloadBase` in `compiler/lowerlayout.bit`, because a
 writer and a reader that disagree here produce a wrong answer with no
 diagnostic, not a crash.
 
-### 1.2.1 The value form: an eligible enum as two words (#5312, #5313, #5340)
+### 1.2.1 The value form: an eligible enum as two words
 
 Everything above describes the **boxed** form. An enum TYPE that satisfies the
 predicate below is not boxed at all while it is passed, returned or matched: it
@@ -190,22 +190,22 @@ boxed form absorbs unchanged:
 | every recorded payload type is fully substituted | the generic DECLARATION `Option<T>`, whose own `ctx.variantPayloads` entry holds a bare `TypeParam` | only an INSTANTIATION (`fillInstVariants`) has a word anything has sized |
 | every payload-carrying variant carries the SAME type (`enumCommonPayloadType` returns a type, not `-1`) | `Result<i64, string>` | the arm must read back the type the constructor wrote — see below |
 
-The last clause is #5340's, and it is the one that is not merely conservative.
-#5312 typed the shared word as a declaration-wide union (`ctx.errorId` whenever
-ANY variant's payload word was a pointer), which is the only SAFE answer for a
-mixed declaration but a WRONG one for the shape real code is made of:
-`forwardOneLoad` (`compiler/optstore.bit`) forwards a store into a load only when
-the two IR types are EQUAL, and `explodedArgWords` (`compiler/lowerexplode.bit`)
-gates a call site's argument explosion on the argument VALUE's IR type. A word
-typed `error` can therefore never answer an arm that binds a `Json`: the rebuild
+The last clause is the one that is not merely conservative. Typing the shared
+word as a declaration-wide union (`ctx.errorId` whenever ANY variant's payload
+word was a pointer) is the only SAFE answer for a mixed declaration but a
+WRONG one for the shape real code is made of: `forwardOneLoad`
+(`compiler/optstore.bit`) forwards a store into a load only when the two IR
+types are EQUAL, and `explodedArgWords` (`compiler/lowerexplode.bit`) gates a
+call site's argument explosion on the argument VALUE's IR type. A word typed
+`error` can therefore never answer an arm that binds a `Json`: the rebuild
 survives every pass, and a call-result subject rebuilds a box per match. So a
 declaration with one payload type explodes with that type EXACTLY, and a mixed
-one goes back on the boxed path it was on before #5313 — never a lost root, and
-no shape can regress.
+one goes back on the boxed path it used before the value-form mechanism
+existed — never a lost root, and no shape can regress.
 
 **GC references.** The payload word carries its own static `isRef`, which
 `regalloc` records into a safepoint's registers or slots with no stack-map format
-change (#4236). `enumPayloadWordIsRef` (`compiler/lowerlayout.bit`) remains the
+change. `enumPayloadWordIsRef` (`compiler/lowerlayout.bit`) remains the
 conservative union — the word is traced if ANY variant's payload there is a
 pointer, never only if every variant's is. Over-tracing a plain integer costs a
 scan; under-tracing loses a root and frees a live object, so the union errs in
@@ -243,9 +243,9 @@ apart:
 
 | compiler | objects | allocbytes | cycles |
 |---|---|---|---|
-| `d0b16a06`, before #5312 | 5,400,061 | 273,929,536 | 1,377,592,364 |
-| `608a4ab3`, #5313 with the union-typed word | 9,300,064 | 398,729,632 | 3,989,032,924 |
-| `1d92321c`, after #5340 | 4,350,060 | 240,329,504 | 1,297,601,527 |
+| `d0b16a06`, before the value-form mechanism | 5,400,061 | 273,929,536 | 1,377,592,364 |
+| `608a4ab3`, with the union-typed word | 9,300,064 | 398,729,632 | 3,989,032,924 |
+| `1d92321c`, after the exact-typing clause | 4,350,060 | 240,329,504 | 1,297,601,527 |
 
 Against the pre-mechanism compiler that is **-1,050,001 objects (-19.4%) and
 -33,600,032 bytes (-12.3%)**, which is 32.0 bytes per removed object exactly: the
@@ -258,7 +258,7 @@ row is why the exact-typing clause exists: the value form without it cost json
 
 ---
 
-### 1.2.2 Which functions return an eligible enum in words (#4405, #5445, #5446)
+### 1.2.2 Which functions return an eligible enum in words
 
 §1.1's "a `ret` carries at most one value" is the BOXED form and still describes
 every position not named here. The return-word convention is the exception, and
@@ -271,7 +271,7 @@ without seeing any other caller.
 parameters, no variadic parameter list, no `@symbol`. Its result type must
 explode (§1.2.1's eligibility, `explodedWordTypes`) and the word list must fit
 the return-register budget (`retWordsFitRegisters`; a return word past the
-eighth has no path, #4238).
+eighth has no path).
 
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
@@ -399,7 +399,7 @@ Method {                         // extern class, 16 bytes, 8-aligned
 - Entries are unordered; `methods_len` may be 0 (a type with no methods).
 
 Dispatch (`call_iface value.id(args)`): codegen first tests `value` for null
-and panics via `bit_rt_panic_nil_iface` (§12.1, #2240) if so — `value` IS the
+and panics via `bit_rt_panic_nil_iface` (§12.1) if so — `value` IS the
 receiver pointer, and a nil interface is a legal, checker-blessed zero value
 (SPEC §13.4) with no `TypeInfo` to load `-16` bytes from. Only once that
 passes does the callee load `info = *(value - 16)` (the header's `info`
@@ -456,7 +456,7 @@ holds — see the fabricated-header bug at `runtime/root/slices.bit:443-451`
 element's own byte stride (`elem_size`, §9) — `1` for `[]u8` (a non-ref,
 1-byte element, `elem_size = 1`), or a class `T`'s own body size
 (`elem_size = layout.size`) when EVERY field of `T` is a non-reference scalar
-(`ptr_offsets` empty, epic #2945, #3861/#3862). `elem_size` is a per-call-site
+(`ptr_offsets` empty). `elem_size` is a per-call-site
 compile-time constant, never runtime state, and travels as an explicit
 argument to every slice entry point below — the collector needs no change to
 support it: a packed, non-ref buffer keeps the LEAF `slice_buf_info`
@@ -525,12 +525,12 @@ bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has me
   scratch rather than a process-wide word, it is also safe against a second,
   genuinely concurrent OS thread writing it at the same real time once
   `BIT_WORKERS>1` (§9) — the same reason `bit_rt_chan_recv_ok` (§11) and the
-  fallible-call error slot (§13) are safe at any worker count. Until #3280
-  this was a single process-wide flag and that was a live gap; see §22's
-  audit and §5's note on what adjacency does and does not buy.
+  fallible-call error slot (§13) are safe at any worker count. Before it moved
+  to per-task scratch this was a single process-wide flag and that was a live
+  gap; see §22's audit and §5's note on what adjacency does and does not buy.
 - `bit_rt_iface_assert` names both types in its panic message; the descriptors
   already carry them.
-- `bit_rt_iface_has` (#4512) is the INTERFACE-target assertion `iface.(I)`,
+- `bit_rt_iface_has` is the INTERFACE-target assertion `iface.(I)`,
   where the question is not descriptor identity but whether the dynamic type's
   method set satisfies `I` (SPEC §14.3/§14.4). `id` is the `bit_rt_iface_lookup`
   dispatch id (§2.1) of ONE method of `I`; the answer for the whole set is built
@@ -545,14 +545,15 @@ bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has me
 
 ### 2.3 `string` value, and shared-backing views (`s[lo:hi]`)
 
-**RULING (#3892, 2026-08-28): `{ptr, len, base}`, superseding the `{base, len,
-off}` decision this section previously recorded under #3123/#3435.** That
+**RULING (2026-08-28): `{ptr, len, base}`, superseding the `{base, len,
+off}` decision this section previously recorded.** That
 design measured out on macOS — silent garbage under `BIT_GC=stress`, `rc=0` —
-and segfaulted booting `fn main(){}` on x86_64-linux; #3892 reproduced both
-failures and this layout end to end on both platforms, emitter unchanged, with
-neither failure mode. Epic **#3894** lands it in three independently-landable
-steps instead of a flag day; this document describes the shape that exists
-once Step A (#3895) has landed and marks what Steps B/C still owe.
+and segfaulted booting `fn main(){}` on x86_64-linux — both failures were
+reproduced, and the `{ptr, len, base}` layout was verified end to end on both
+platforms, emitter unchanged, with neither failure mode. This lands in three
+independently-landable steps instead of a flag day; this document describes
+the shape that exists once Step A has landed and marks what Steps B/C still
+owe.
 
 ```
 string header {                  // TypeInfo{ size = 24, ptr_offsets = [16] }
@@ -580,7 +581,7 @@ opposite shape from the superseded `{base, len, off}` decision, which moved
 still expecting `{ptr, len}` at all — that is what made it a 17-file flag day
 rather than three independent steps.
 
-- **Step A (#3895) — widen the heap allocator.** `allocString` now allocates
+- **Step A — widen the heap allocator.** `allocString` now allocates
   `strAllocHeader + n` bytes (`n` the byte count) and writes a self-owning
   header: `ptr = body + strAllocHeader`, `len = n`, `base = body`. All nine
   `strBytes`/`strBytesOf`/`strData`/`strLenOf`/`strSize` reader
@@ -589,11 +590,11 @@ rather than three independent steps.
   neither offset moved. The compiler's literal emission is unchanged, so a
   literal is still a bare two-word `{ptr, len}` header — valid, per the
   landability property above.
-- **Step B (#3896) — 3-word literals.** `compiler/emitmacho.bit`,
+- **Step B — 3-word literals.** `compiler/emitmacho.bit`,
   `compiler/emitelf.bit`, `compiler/emitpecode.bit` append a third word
   (`base = 0`) to every emitted string literal header; symbol size 16 -> 24.
   The existing absolute reloc in slot 0 and `len` in slot 1 are untouched.
-- **Step C (#3897) — the payoff.** `rtStringSlice` is a header-only
+- **Step C — the payoff.** `rtStringSlice` is a header-only
   allocation (24 bytes, no byte copy): `ptr = ptr(s) + lo`, `len = hi - lo`,
   `base = s` — sharing `s`'s bytes instead of copying them, which is what
   Step A and Step B alone did not yet buy. `allocStringView` is the one
@@ -618,7 +619,7 @@ written once, by `rootInit` — rather than a rule every future write site has
 to re-derive correctly. `gcOwns` (§3) is the collector's own backstop should
 that confinement ever be violated: it is exact base-address equality, so an
 interior pointer fed to `gcMarkRoot` is rejected outright — a no-op, not a
-corruption. #3892 measured this directly under `BIT_GC=stress`: forcing
+corruption. Measured directly under `BIT_GC=stress`: forcing
 `ptr` into `ptr_offsets` produced 4004/4004 rejections and 0 marks.
 
 **Why `riString`'s declared `size` must be `strAllocHeader` (24), never 0 or
@@ -652,7 +653,7 @@ allocation (E0075), so several panic-message constructors and one deadlock
 constructor assemble a `{ptr, len}` header **by hand** in module-static
 scalar arrays and pass its address straight to `bit_rt_panic` — or, for the
 two runtime-internal ones (`panicDeadlock` and `runtime/gc/stackmap.bit`'s
-pair), to the always-fatal `bit_rt_fatal` instead (§12, #4744):
+pair), to the always-fatal `bit_rt_fatal` instead (§12):
 
 | File | Function | Static array |
 |---|---|---|
@@ -698,7 +699,7 @@ that changes emitted `.text`, not just data layout.
   pointer — interior and foreign pointers return false. It backs the debug/test
   check for this contract.
 - **Confirmed for a traced field beside untraced derived fields in the same
-  object (#3123).** A `TypeInfo` may list one field as a traced reference
+  object.** A `TypeInfo` may list one field as a traced reference
   (always a base pointer, per this section) while its neighbours in the same
   object are plain integers, or a stored interior address, a reader combines
   with that reference — this is what the dynamic slice header already does
@@ -707,7 +708,7 @@ that changes emitted `.text`, not just data layout.
   `ptr_offsets = [16]`; `ptr` an untraced, unlisted interior pointer; `len` an
   untraced integer). The rule above is not weakened by this, but §2.3's
   `string` header is the sharper case: unlike the slice header, `ptr` **is** a
-  stored derived interior address (#3892's `{ptr, len, base}` ruling,
+  stored derived interior address (the `{ptr, len, base}` ruling,
   superseding the `{base, len, off}` shape this section previously described
   as chosen specifically to avoid storing one at all). Safety rests entirely
   on `ptr` never being listed in `ptr_offsets` — an invariant every future
@@ -748,7 +749,7 @@ RootScanner {
 **Register file.** A live reference at a safepoint is in a register the walk can
 recover, or spilled to a frame slot — never one that is simply lost. Which
 registers those are depends on WHICH KIND of safepoint it is, and the two
-answers differ on AArch64 since #4429:
+answers differ on AArch64:
 
 - **An ordinary call.** Its stack map is consulted only for a frame the walk has
   already unwound INTO, and the register values it reads have been restored from
@@ -794,12 +795,12 @@ root class 10, `stwParkedLo`), not merely as a pointer to the fields above.
 This is load-bearing, not incidental: a shim that ever built this frame
 anywhere else would make class 10 silently inert — `stwTaskHoldsSp` would be
 false for every task, no bound would ever lower, and a stopped mutator's live
-stack would go unscanned again with no error and no red gate (#1834).
+stack would go unscanned again with no error and no red gate.
 
 The snapshot's `regs` array is **not** zeroed (the shim runs at every loop
 back-edge; clearing 32 words per poll is not free). Only the saved file is
 written — the callee-saved subset on x86-64, the whole allocatable integer file
-on AArch64 (#4429). That is sound in both directions: the register file
+on AArch64. That is sound in both directions: the register file
 restriction above means a stack map can only ever name a register the shim *did*
 save, and every word the walk reads is routed through `markRoot`, which marks it
 only if it is exactly a live object base. An unwritten slot can therefore
@@ -830,7 +831,7 @@ per-object terminator is worse than useless: concatenation would give
 `[e1][T][e2][T]` and the walk would stop at the first `T`, silently losing every
 later member's frames. Entries are self-delimiting and the extent is the bound.
 
-Entry atoms are **8-aligned** (#1927): the writer follows every entry's fields
+Entry atoms are **8-aligned**: the writer follows every entry's fields
 with zero PADDING bytes out to a multiple of 8, and the section declares 8-byte
 alignment to match. Because every atom's *length* is already a multiple of 8,
 the linker never has to insert padding of its own to honor that alignment —
@@ -843,7 +844,7 @@ never a linker-inserted gap to mistake for an entry, because none is ever
 inserted. On Mach-O the section is in `__DATA` so dyld rebases its absolute
 code pointers under PIE; on ELF it is read-only, since the image is non-PIE.
 
-Before #1927, entries were 1-aligned and tightly packed with no padding at
+Before entries became 8-aligned, they were 1-aligned and tightly packed with no padding at
 all — equally safe against a linker-inserted gap (there was nothing to align,
 so nothing to pad), but it left every `__bitsm_N` atom's *declared* alignment
 truthfully at 1, and `ld` warns on that: the atom's leading `u64 code_addr` is
@@ -857,7 +858,7 @@ guaranteed 8-aligned, only the entry boundaries are):
 ```
 per function (repeated to the end of the extent):
   u64 code_addr        # abs reloc -> the function's code symbol
-  u16 version           # format-version stamp (#3189); must equal
+  u16 version           # format-version stamp; must equal
                          # smFormatVersion (1) in both compiler/codegen.bit
                          # and runtime/gc/stackmap.bit, checked before any
                          # count-driven field below is trusted
@@ -879,15 +880,16 @@ per function (repeated to the end of the extent):
 ```
 
 **The producer and the reader are separate build inputs, and this format's
-correctness depends on them agreeing (#3198).** The padding above is written by
+correctness depends on them agreeing.** The padding above is written by
 whichever compiler emitted an object (`compiler/codegen.bit`'s
 `writeStackMaps`) and read by whichever `runtime/gc/stackmap.bit` this tree
 currently has — two different build stages, not one. The default
 `./make libbitrt` path compiles `runtime/**` with the *pinned stage0*, a
 previous release's compiler frozen at build time, while the reader is always
-the working tree's current source. A stage0 built before #1927 landed emits
-unpadded, 1-aligned entries; the tree's post-#1927 reader unconditionally
-rounds every entry's cursor up to 8 regardless of what the writer did — the
+the working tree's current source. A stage0 built before entries became
+8-aligned emits unpadded, 1-aligned entries; the tree's current reader
+unconditionally rounds every entry's cursor up to 8 regardless of what the
+writer did — the
 walk desyncs on the first entry whose own length is not already a multiple
 of 8 and dereferences garbage on the first collection. `BIT_GC=off` on such
 a binary runs fine, because the walk that dereferences garbage never
@@ -902,10 +904,11 @@ guard against this *class* of skew — any future change to this wire format
 that a stage0 repin has not yet caught up to — not a promise that today's
 exact field layout is what a mismatch would ever reproduce again.
 
-**#3189: a per-entry format-version stamp, shipped.** The padding checker
+**A per-entry format-version stamp, shipped.** The padding checker
 above is a build-time guard for one specific historical skew; it does not
-generalize to the *next* layout change, and #1927 reached production as a
-silent bus error before any guard existed for it at all. The fix is the
+generalize to the *next* layout change, and the entry-alignment change
+reached production as a silent bus error before any guard existed for it at
+all. The fix is the
 `u16 version` field in the format block above, placed right after
 `code_addr` (so the field the object writer's relocation logic depends on —
 `code_addr` sitting at each entry's offset 0 — is untouched, and neither
@@ -920,13 +923,13 @@ writes, and `runtime/gc/stackmap.bit` carries the matching reader half
 `scanFrame`'s live parse: the fixed-header bounds check widened 14 -> 16
 bytes to cover the new field, and the version is read and compared before
 `num_saved` or any other count-driven field is trusted. Proven against a
-synthetic blob through a temporary C-driver hook (#1839's technique) in both
+synthetic blob through a temporary C-driver hook in both
 directions — match walks normally, mismatch refuses with `"gc: stack-map
 format version mismatch: expected <E>, found <F>"`. Because the writer and
 reader landed in the same change, a default single-pass build's merged table
 only ever carries one version; the mismatch path fires only across a stage0
 repin boundary (see the paragraph above) — the loud failure this stamp
-exists to produce instead of #1927's silent bus error.
+exists to produce instead of the entry-alignment change's silent bus error.
 
 The walk, per frame: find the function whose code range contains `pc`; at the
 matching `ret_offset`, `markRoot` each `slot_fp_off` slot and each live register
@@ -944,7 +947,7 @@ no frames at all. The linker decides it after dead-strip, in the same pass that
 orders the merged group. Dead-stripping `libbitrt.a` is thereby *finer*-grained
 than a whole-program table allowed, not coarser.
 
-**The SLOT half of an entry is currently redundant for correctness (#4046),
+**The SLOT half of an entry is currently redundant for correctness,
 and this is proven, not assumed.** `slot_fp_off[num_slots]` above is read by
 exactly two root classes, both walking `gcScanSnapshot`
 (`runtime/gc/stackmap.bit`): the collecting thread's own frames
@@ -958,14 +961,14 @@ every single collection, in production as well as under `BIT_GC=stress`:
 - The collecting thread's own live `sp` (`stwReadSp`, `runtime/stw/stwscan.bit:144`)
   is read strictly deeper in the call chain than the `SafepointFrame` the
   safepoint shim recorded above, so it is always a lower (or equal) address.
-  Root class 8 (`runtime/stw/stwscan.bit:311-317`, #1832) lowers that task's
+  Root class 8 (`runtime/stw/stwscan.bit:311-317`) lowers that task's
   conservative scan bound to this `sp` before the unconditional
   `stwScanStackRange(g, lo, top)` at `runtime/stw/stwscan.bit:327` — a range that
   is therefore always a superset of every address `gcScanSnapshot`'s
   frame-pointer-chain walk can reach on that same stack (frame pointers only
   grow toward higher addresses, `runtime/gc/stackmap.bit:496-498`).
 - A parked mutator's scan bound is lowered the same way by root class 10
-  (`stwParkedLo`, `runtime/stw/stwscan.bit:247-261`, #1834) to the exact address
+  (`stwParkedLo`, `runtime/stw/stwscan.bit:247-261`) to the exact address
   of that mutator's own published `SafepointFrame` — the very address
   `gcScanSnapshot`'s unwind starts from — before the same unconditional
   `stwScanStackRange` call.
@@ -975,16 +978,15 @@ spilled reference.** Confirmed empirically as well as by this argument:
 mutating `compiler/regalloc.bit`'s `slots = append(slots, loc.index)` to a
 no-op drops every emitted entry's `num_slots` to 0 while a program built
 against the mutated compiler still runs tens of thousands of `BIT_GC=stress`
-collections to an unchanged result (#4046's ticket comment thread has the
-counts). **This does not mean the field should be removed or that class 8/10
+collections to an unchanged result. **This does not mean the field should be removed or that class 8/10
 are optional** — a future generational or moving collector, or any future
 narrowing of class 8/10's conservative range for performance, would make the
 slot list load-bearing again. It means today's always-on conservative
 fallback happens to make it redundant for correctness right now, and nothing
 in the codebase currently tests that the slot list is itself correct.
 
-**The REGISTER half is a different story: it is genuinely load-bearing
-(#4111), not shadowed.** `runtime/stw/stwscan.bit:328-336` skips class 7's ctx
+**The REGISTER half is a different story: it is genuinely load-bearing,
+not shadowed.** `runtime/stw/stwscan.bit:328-336` skips class 7's ctx
 scan for the running task, so `gcMarkRoot(g, *(regs + rn))` is, for a
 self-collecting task, the only thing marking a live register directly.
 Mutating `compiler/regalloc.bit`'s `regs = append(regs, loc.index)` to a
@@ -1066,10 +1068,10 @@ Two alternatives were weighed and rejected:
   model: `bit` links a *prebuilt* `libbitrt.a`, and this would require the
   runtime to be recompiled into every user program's object.
 
-### 4.2 Debug-info line table (emitted since #3283/#3591; function names since #3662)
+### 4.2 Debug-info line table
 
-Decided by #3281 (`spec/SPEC.md` §18.6.1: bespoke over DWARF, and why). The
-walker that symbolizes a panic (#3285) reads a second, independent side table,
+See `spec/SPEC.md` §18.6.1 for the choice of bespoke over DWARF, and why. The
+walker that symbolizes a panic reads a second, independent side table,
 laid out like §4's stack maps because that shape is already proven against
 dead-stripping, cross-object merging, and reading with no allocation.
 
@@ -1103,7 +1105,7 @@ per function (repeated to the end of the extent):
   u32 code_size
   u16 num_rows
   u64 name_hdr_ptr      # abs reloc -> this FUNCTION's own display name's
-                         # string-pool header (#3662) — one per entry, not
+                         # string-pool header — one per entry, not
                          # one per row, unlike file_hdr_ptr below
   per row (num_rows times):
     u32 pc_offset        # code_addr + pc_offset is this row's start address;
@@ -1122,21 +1124,20 @@ the function's first instruction is mandatory, so a `pc` inside a found
 function's range can never fail to match some row — "no row covers this
 offset" is not a state the walker has to handle.
 
-**`format_version`, shipped from the first line, not retrofitted.** #3189
-added a version stamp for `.bit_gc` (§4) after #1927 reached production as a
-silent bus error with no guard at all — producer and reader are different
+**`format_version`, shipped from the first line, not retrofitted.** §4's
+version stamp was added to `.bit_gc` after the entry-alignment change
+reached production as a silent bus error with no guard at all — producer and reader are different
 build stages (`libbitrt`'s own entries come from the pinned stage0; every
 other entry in the same link comes from whatever compiler built it), and
 this table has the identical exposure. Rather than repeat that retrofit
 later, this table's `format_version` is present from its first line: the
 walker reads and compares it *before* trusting `code_size`, `num_rows`, or
-any row — placed immediately after `code_addr`, the same position #3189
+any row — placed immediately after `code_addr`, the same position §4's stamp
 chose, so the one field the relocation logic depends on sitting at offset 0
 is undisturbed. A mismatch does **not** call `bit_rt_panic` (below): it is
 treated exactly like "no record."
 
-**`format_version` bumped 1 -> 2 by #3662**, the change that added
-`name_hdr_ptr` — a reader built against version 1's 16-byte header must not
+**`format_version` bumped 1 -> 2 when `name_hdr_ptr` was added** — a reader built against version 1's 16-byte header must not
 misinterpret version 2's 24-byte one as though the byte at old offset 16 were
 already the first row's `pc_offset`. Per the paragraph above, a mismatch
 degrades to "no record" rather than misreading bytes.
@@ -1152,7 +1153,7 @@ header. This is required for the format's size to be what SPEC §18.6.1
 measures, not an optional optimization.
 
 **Function names reuse the same string pool, interned per object, once per
-entry rather than once per row (#3662).** `name_hdr_ptr` points at the
+entry rather than once per row.** `name_hdr_ptr` points at the
 function's own display name — the same string codegen already names that
 function's `code_addr` relocation with — interned into `module.stringPool`
 exactly once per debug-info entry, mirroring the file-path interning above
@@ -1174,7 +1175,7 @@ raw-offset reads (no composite locals, `@nosplit`-legal per §10.3):
    function* are sorted by construction, since `code_size` and pc_offset
    monotonicity depend only on that function's own final code layout,
    decided by codegen when the entry is written — not on link order (unlike
-   step 1). **#3283 must not skip this**: if codegen reorders basic blocks
+   step 1). **Any block-reordering pass must not skip this**: if codegen reorders basic blocks
    after IR emission (the x86-64 backend's RPO block ordering already does),
    rows must be sorted by final `pc_offset` at the point the entry is
    serialized, not emitted in source or IR order.
@@ -1224,8 +1225,8 @@ its own debug-info entries needs no companion restriction.
   stable across a collection and no pointer fix-up is required.
 
 **WHERE THE POLLS ACTUALLY ARE, AND WHY THAT SENTENCE WAS CORRECTED.** The bullet
-above read "at least at loop back-edges and function entry/allocation" until
-#4200. The second half never existed. Each backend has **exactly one** poll
+above once read "at least at loop back-edges and function entry/allocation."
+The second half never existed. Each backend has **exactly one** poll
 emission site — `emitBackEdgeSafepointIfNeeded` (`compiler/arm64call.bit`) and
 `xEmitBackEdgeSafepointIfNeeded` (`compiler/x64controlflow.bit`) — and both are
 gated on `isBackEdge`. Nothing is emitted at a function entry, and nothing is
@@ -1238,7 +1239,7 @@ runtime.** `gcShouldCollect` is reached from exactly two places, both of them
 under the poll: `gcSafepointRoots` (`runtime/gc/gccollect.bit`), and the
 under-the-lock re-test in `runtime/stw/stwpoll.bit`, whose own fast path mirrors
 the same predicate inline. Measured by ablating the
-back-edge poll (#4038): `bench/cases/alloc`'s collection count goes 181 → **1**
+back-edge poll: `bench/cases/alloc`'s collection count goes 181 → **1**
 and its peak RSS 6.2 MB → **745.2 MB**; `allocflat` 66 → 1 and 6.0 → 264.3 MB;
 `strings` 10 → 1 and 137.2 → 558.2 MB. Removing the poll does not remove a
 latency mechanism, it removes the collector. Anything that proposes to replace
@@ -1246,7 +1247,7 @@ the poll — signal-based preemption is the recurring one — has to supply a
 trigger as well as a yield, and the corrected sentence above is what makes that
 cost visible.
 
-**THE BACK-EDGE POLL IS A LOAD, A COMPARE AND A BRANCH (#4203).** A polling
+**THE BACK-EDGE POLL IS A LOAD, A COMPARE AND A BRANCH.** A polling
 function fetches ONE address at entry — `bit_rt_port_sched_poll_attention_addr`,
 the address of `runtime/sched/pollreq.bit`'s `pollAttention` word — into one slot
 of its own frame. Every back edge then emits, on arm64:
@@ -1261,19 +1262,19 @@ bl   bit_rt_safepoint
 and the same four steps on x86-64, where the compare cannot fold into the branch
 (`mov`, `mov`, `test`, `je`). It replaces an eighteen-instruction inlined ladder
 that re-derived `stwPollNeeded`'s whole predicate — ten loads, three of them
-`ldar`, seven branches — plus #4200's four-instruction countdown that existed
-only to make evaluating it rarer. Measured on `_spin`, a bare counting loop:
+`ldar`, seven branches — plus the poll-thinning countdown's four-instruction
+sequence that existed only to make evaluating it rarer. Measured on `_spin`, a bare counting loop:
 84 emitted instructions to 34, entry prefetch 11 instructions and 3 calls to 2
 and 1, frame 0x60 to 0x50 bytes.
 
-**THE WORD HAS A SECOND, RELAXED READER, AND IT IS NOT A POLL (#4457).**
+**THE WORD HAS A SECOND, RELAXED READER, AND IT IS NOT A POLL.**
 `Op.PollAttention` reads the same word through the same cached frame slot —
 `ldr`/`ldr` on arm64, `movq`/`movq` on x86-64, no call and no relocation — and
 exists so a compiler pass can ask "is anything already asking?" from inside a
 loop without a `bl`, whose caller-saved clobber costs an allocated register for
 the whole function. It is a **relaxed** read on purpose, where the poll's own
-load is `ldar`: nothing acts on its answer. Its only consumer (#4204's strip
-miner) uses it to choose how many iterations to run before the next poll, so a
+load is `ldar`: nothing acts on its answer. Its only consumer (the strip-mining
+pass) uses it to choose how many iterations to run before the next poll, so a
 stale answer costs at most one wide strip, and the poll on the outer back edge
 then re-reads the word with the acquire that decides whether to act. **Do not
 read the acquire below as a property of every read of this word — it is a
@@ -1331,13 +1332,14 @@ the allocation door a collection point — collection still happens only at a
 safepoint, where the roots are precise. It records the fact so the back edge can
 act on it in three instructions instead of re-deriving it in eighteen.
 
-**The latency bound is back to what it was before #4200: one back edge.** A stop
+**The latency bound is back to what it was before the poll-thinning countdown
+existed: one back edge.** A stop
 request is acknowledged at the requesting thread's slowest peer's very next back
-edge, not within `N` of it. #4200's countdown, its `stress ? 1 : pollThinN()`
+edge, not within `N` of it. The countdown, its `stress ? 1 : pollThinN()`
 reset and its bounded-latency argument are all deleted, and `pollThinN` with
 them.
 
-**#4204 STRIP MINING WIDENS THAT BOUND FOR ONE LOOP SHAPE, TO AT MOST 256 INNER
+**STRIP MINING WIDENS THAT BOUND FOR ONE LOOP SHAPE, TO AT MOST 256 INNER
 ITERATIONS OF BOUNDED STRAIGHT-LINE WORK.** `stripMine` (`compiler/optstrip.bit`)
 wraps a qualifying counted loop in an outer loop and moves the poll to the outer
 back edge; the inner back edge emits none. `stripSize()` is therefore a LATENCY
@@ -1379,8 +1381,8 @@ whose loops the predicate refuses — collections are **4104 = 4104, 521 = 521 a
 x86-64, where that last +/-1 is run-to-run jitter present on the base side too
 (base over five runs: 578 577 577 577 577). Mutation-proven rather than asserted:
 ignoring the attention read and always taking the wide strip drops the
-2000-iteration probe from **4104 to 531**, which is the #4200 shape this
-paragraph exists to prevent.
+2000-iteration probe from **4104 to 531**, which is the un-thinned-poll shape
+this paragraph exists to prevent.
 
 **Thinning the cheap poll was BUILT AND MEASURED before it was deleted, not
 argued away.** Three configurations, arm64, 21 interleaved rounds under `boxlock
@@ -1400,7 +1402,7 @@ four instructions carrying a loop-carried store-to-load dependency through a
 frame slot, on the path that skips a three-instruction poll, so it costs more
 than it saves — and the thinned variant measured here did NOT yet carry the
 stress arm it would need to be landable, so the comparison is generous to it.
-Cutting the eighteen-instruction ladder was worth a countdown (#4200 measured
+Cutting the eighteen-instruction ladder was worth a countdown (measured
 −5.95%); cutting a three-instruction one is not.
 
 **`BIT_GC=stress` IS NOT THINNED — now by construction rather than by a special
@@ -1408,11 +1410,12 @@ case.** Under stress `gcShouldCollect` is unconditionally true, so `gcConfigure`
 publishes at boot and `stwSafepoint`'s republish keeps the word set for the whole
 run: every back edge takes the poll and every poll collects, which is what makes
 the stress suite this runtime's precise-rooting oracle ("any root the caller
-fails to report is swept on the very next poll", `gcSafepointRoots`). #4200
-needed a four-instruction stress arm on its reset path to preserve this, and
-measured what its omission cost — collections under stress 303 → 128 on a
-200-iteration if/else loop, with every behavioural gate still green. #4203 has no
-reset path to protect: the same probe reads 302 = 302 against `main`.
+fails to report is swept on the very next poll", `gcSafepointRoots`). The
+poll-thinning countdown needed a four-instruction stress arm on its reset path
+to preserve this, and measured what its omission cost — collections under
+stress 303 → 128 on a 200-iteration if/else loop, with every behavioural gate
+still green. The current load-compare-branch poll has no reset path to
+protect: the same probe reads 302 = 302 against `main`.
 
 **The stop-the-world handshake.** "Stop the world" is a real rendezvous, not an
 assumption about there being one thread. Any number of OS threads may execute Bit
@@ -1424,7 +1427,7 @@ statically sized registry (no allocation after startup; a slot is claimed by
 one of three states:
 
 **THE REGISTRY BLOCK IS `runtime/gc`'s OWN MODULE STATE, AND THERE IS NO WAY TO
-SUPPLY ONE (#1991/#2184).** `runtime/gc/gcworldsync.bit` declares `worldBlock`
+SUPPLY ONE.** `runtime/gc/gcworldsync.bit` declares `worldBlock`
 and `syscallRegBlock`; `bit_rt_gc_world_ready` tells it boot has finished, and
 carries no address. `bit_rt_gc_world_addr` reads the block's address back out and
 answers 0 until readiness — which is what every door tests before reading a
@@ -1432,7 +1435,7 @@ thread token, because the x86-64 token is a `%fs:0` load that faults on a thread
 whose FS base is not installed yet.
 
 There used to be a `bit_rt_gc_world_bind(addr)` taking the block's address as a
-plain integer. That is what #1991 was. A bound address is invisible to the
+plain integer — the old, unsafe binding API. A bound address is invisible to the
 collector — not a root, never traced, never rewritten — and there was no unbind,
 so handing it managed memory type-checked, linked and ran until a collection
 swept the block, after which every safepoint poll in the process read freed
@@ -1448,11 +1451,11 @@ because it carries no address.
 A program that wants a **private** registry passes its own block to the
 parameterised doors (`bit_rt_port_stw_poll_on`,
 `bit_rt_port_gc_current_mutator_on`), which never touch the process-wide
-**registry block** — the rule #1833 established and `_tests_/stress/stwcollect`
-follows. #1833's defect was a private caller REPLACING the live runtime's own
-address binding, so its own worker registered into the wrong registry entirely;
-"never touch" is about that block/binding, not about every word this file's
-module state holds. The per-thread poll hint (`mutHintSlot`, #1698/#2821) IS one
+**registry block** — a rule `_tests_/stress/stwcollect`
+follows. The defect this rule fixes was a private caller REPLACING the live
+runtime's own address binding, so its own worker registered into the wrong
+registry entirely; "never touch" is about that block/binding, not about every
+word this file's module state holds. The per-thread poll hint (`mutHintSlot`) IS one
 process-wide word shared by both the global and the parameterised doors, and
 that is deliberate, not a hole in this rule: it never identifies which registry
 to consult (the `world` parameter always does that) and it is re-validated
@@ -1468,7 +1471,7 @@ syscall   stopped in the kernel, holding live references; scanned in place (belo
 ```
 
 **REGISTRATION IS LAZY, BUT "A THREAD IS NEVER INVISIBLE" IS FALSE AS A BLANKET
-CLAIM — IT IS FALSIFIED, NOT MERELY UNCONFIRMED (#1677).** A thread claims its
+CLAIM — IT IS FALSIFIED, NOT MERELY UNCONFIRMED.** A thread claims its
 slot on its **first touch of the collector by either door** — any allocation, or
 its first safepoint poll. Before that first touch the thread holds NO slot:
 `rendezvous` does not wait for it, no snapshot exists for it (root classes 2/3,
@@ -1481,7 +1484,7 @@ started — is invisible to every root class this file documents, and a
 concurrent collection running on an already-registered mutator elsewhere WILL
 sweep it.
 
-This is not hypothetical. #1677 built a reproducer: a raw OS thread (started via
+This is not hypothetical. A reproducer was built: a raw OS thread (started via
 `runtime/thread`'s `threadStart`, the same primitive `runtime/root/<os>/boot.bit`
 uses to start the scheduler's own worker) whose first statements read a live
 object's sole address out of an otherwise-cleared mailbox and hold it in a local
@@ -1495,22 +1498,22 @@ The window is narrow (a thread must hold a reference nowhere a root class
 covers, before its first door-touch, while a collection completes) but it is
 real, and it is exactly what `runtime/sched/worker.bit`'s `Worker.run` closes by calling
 `gc_hooks.threadEnter()` **eagerly** at OS-thread entry rather than relying on
-lazy registration alone. The Bit port dropped that eager call (#1671) on the
-reasoning that lazy registration was sufficient on its own; #1677/#1699 correct
-that — the eager call is being restored at OS-thread entry points, measured for
-`abandoned`-count regression on all three targets (#1699). Calling
+lazy registration alone. The Bit port dropped that eager call on the
+reasoning that lazy registration was sufficient on its own; that reasoning was
+wrong — the eager call is being restored at OS-thread entry points, measured for
+`abandoned`-count regression on all three targets. Calling
 `bit_rt_gc_thread_enter` explicitly at a thread's start is not merely
 "preferred", it is what closes this gap; a thread that skips it is exposed for
 as long as its first door-touch is delayed.
 
-**Since #4060 the allocation door does NOT register, and
+**The allocation door does NOT register, and
 `bit_rt_gc_thread_enter` at OS-thread entry is the only claim a thread gets.**
 It used to be the fallback that mattered, and it had to cover *every*
 allocation entry point rather than just `bit_rt_gc_alloc` — strings, slice
 headers, slice buffers, slice growth, map control blocks, map headers and
 select-case buffers all allocate, and a thread can reach any of them long
 before its first loop back edge, so a runtime that registered at only some of
-them had threads whose live objects were swept underneath them (#1431). The
+them had threads whose live objects were swept underneath them. The
 property that fallback maintained is unchanged; what changed is where it is
 paid. Re-establishing "this thread is in the registry" once per OBJECT cost 79
 instructions and 11-15 cycles per allocation on `bench/cases/alloc`, to
@@ -1557,7 +1560,7 @@ acknowledgement a prior round already collected stays valid and a round only
 has to gather whatever mutator has not yet reached `parked`. Only once
 `stwRendezvousRetryBound` (`runtime/stw/stwpoll.bit`) rounds have all expired
 does the collector clear the stop request, release every parked thread, and
-return *without* collecting. (#5322: clearing the stop on every individual
+return *without* collecting. (Clearing the stop on every individual
 expiry used to release the whole parked herd into a race for the collector
 lock, whose winner bumped the epoch again and discarded every acknowledgement
 the previous round had banked — a self-sustaining livelock under CPU
@@ -1583,7 +1586,7 @@ worker would hold up every collection for the length of its sleep. Calling it
 around a region that *does* hold references is a collector bug — the references
 are invisible and will be swept.
 
-**The boot thread (#1660; the ABI names confirmed by #2542, not duplicated).**
+**The boot thread (its ABI names are confirmed elsewhere, not duplicated here).**
 The OS thread that runs `boot` is itself a registered mutator, not exempt from
 the rendezvous. Its wait for `main` to finish — an exponential-backoff
 `parkSleepNs` loop — must bracket the sleep, and only the sleep, with
@@ -1596,9 +1599,9 @@ nothing on the managed heap before `main` starts, so everything live across the
 wait is a scalar or a raw pointer into module state, never a heap reference. The
 two call sites are `runtime/root/darwin/boot.bit`'s step-7 loop and, on Linux,
 `runtime/root/linux/boottail.bit`'s (the same loop, split out of
-`runtime/root/linux/boot.bit` by #2882).
+`runtime/root/linux/boot.bit`).
 
-**The `syscall` contract (#1904).** `bit_rt_gc_syscall_begin` / `_end` bracket a
+**The `syscall` contract.** `bit_rt_gc_syscall_begin` / `_end` bracket a
 region in which the calling thread blocks in the kernel **while still holding
 live Bit references**. It is the state `blocked` cannot express and `running`
 cannot afford: the collector neither waits for the thread (like `blocked`) nor
@@ -1611,7 +1614,8 @@ frame cannot supply precisely, since such code carries no stack map:
   task's `ctxSp` (where it last *parked*, arbitrarily far above where it now is)
   to where it actually stands;
 - its **callee-saved integer registers**, because a live reference the allocator
-  parked in one of those is on no stack at all — the #1742 defect exactly.
+  parked in one of those is on no stack at all — exactly the defect this
+  precondition exists to prevent.
 
 The two overlap deliberately. If an intervening frame clobbered a callee-saved
 register, the ABI required it to spill the original above the published `sp`
@@ -1624,7 +1628,7 @@ claiming `blocked` while holding references. `_end` re-checks the stop flag
 before running, like `blocking_end`, because a `syscall` slot is passed without
 acknowledging.
 
-**Known limitation, narrowed by #1904 but not closed.** Blocking runtime calls
+**Known limitation, narrowed by the `syscall` contract but not closed.** Blocking runtime calls
 made *from* Bit code (`bit_rt_print` on a full pipe, `bit_rt_fs_read` on stdin,
 `bit_rt_net_resolve`'s DNS timeout) mostly do **not** use either contract: their
 frames legitimately hold live references, so `blocked` is wrong, and they have
@@ -1640,8 +1644,8 @@ same refinement applied to the same pattern.
 
 The same limitation covers a thread asleep in `parkSleepNs`, and there the cost
 is proportional to the sleep: every concurrent collection waits out whatever is
-left of it. The Linux provider therefore drops the calling thread's timer slack
-(#1439), because the kernel's 50us default rounded a 1us sleep to ~75us and made
+left of it. The Linux provider therefore drops the calling thread's timer slack,
+because the kernel's 50us default rounded a 1us sleep to ~75us and made
 that wait two orders of magnitude larger than the sleep actually asked for. That
 narrows the tax; it does not remove it, and a caller that genuinely sleeps for
 milliseconds still holds up every collection for its whole sleep.
@@ -1665,10 +1669,10 @@ where its frames currently are — is on the registry but the conservative scan
 of `[ctx.sp, stack_top)` covers essentially none of its real stack while it
 runs. The Bit port's `runtime/sched/worker.bit` can dispatch straight into an
 already-queued task on a fresh OS thread before that thread's own run-loop
-back edge is ever reached (#1677's finding, stated there for the OS-thread
-registry rather than this one, applies identically here): the same "holds no
-live Bit references before its first door-touch" gap. #1699 tracks closing
-both with the same eager-registration fix.
+back edge is ever reached (the same finding above — stated there for the
+OS-thread registry rather than this one — applies identically here): the same
+"holds no live Bit references before its first door-touch" gap. The same
+eager-registration fix is what closes both.
 
 ### 5.1 The adjacency contract: what it guarantees, and what it never did
 
@@ -1693,19 +1697,20 @@ thread, running at the same real time*. Adjacency is a property of one task's
 own instruction stream; it says nothing about a different mutator
 concurrently reading or writing the same storage. A value read back purely by
 adjacency is safe from a **second caller** only when the runtime boots exactly
-one worker. **#1900 ended that.** Once `BIT_WORKERS>1`, a second worker's
+one worker. **That guarantee ended with multi-worker support.** Once `BIT_WORKERS>1`, a second worker's
 identical call pair is not interleaved with the first — it runs simultaneously
 on another core — and if both write the same process-wide or module-level
 word, one worker's result is whatever the other happened to leave there. This
 was read into the adjacency contract by every site that cited it as a safety
 argument for a *shared* buffer; adjacency was never that.
 
-**#3272** (`udpSenderBuf`/`udpSenderValid`, `runtime/net/{darwin,linux}/
-netabi.bit` — the root cause behind #1912, open six months across three wrong
-hypotheses before this was found) and **#3273** (`saBuf`/`saBuf2`/`optBuf`/
-`lenBuf`/`ipBuf`, `runtime/net/{darwin,linux}/sock.bit`, mutation-tested both
-directions, whose pre-fix fingerprint was `gotport == the other socket's
-port` — an outright swap) proved the distinction above the hard way: a
+**Two fixes** proved the distinction above the hard way: one to
+`udpSenderBuf`/`udpSenderValid` (`runtime/net/{darwin,linux}/netabi.bit`) —
+the root cause of a shared-buffer race open six months across three wrong
+hypotheses before this was found — and one to `saBuf`/`saBuf2`/`optBuf`/
+`lenBuf`/`ipBuf` (`runtime/net/{darwin,linux}/sock.bit`, mutation-tested both
+directions), whose pre-fix fingerprint was `gotport == the other socket's
+port` — an outright swap. A
 comment reading "sound only under the single-worker contract" and a live
 cross-worker race were the same code, before and after `BIT_WORKERS>1` was
 actually exercised. §22 audits every remaining module-level cell in
@@ -1728,14 +1733,15 @@ actually exercised. §22 audits every remaining module-level cell in
   capacity (`let a: [N]i64` needs a literal `N`), plus one fallback slot for a
   caller with no current task.
 - If the span can **park**, decide the slot **after** the park returns, not
-  before it starts — `netAbiUdpRecv` (#3273) writes the raw result into
+  before it starts — `netAbiUdpRecv` (the sockaddr scratch-buffer fix) writes the raw result into
   throwaway per-call scratch and only asks for its worker slot once
   `netRecvFrom` has actually returned, because the task can resume on a
   different worker mid-call.
 - Filling a buffer once outside a retry loop that can park is unsound under
   per-worker slots even though it was harmless under one shared buffer — a
-  migrated task's next read lands on a different, unfilled slot (#3273 had to
-  move `netSendTo`'s fill inside its loop for exactly this reason).
+  migrated task's next read lands on a different, unfilled slot (the sockaddr
+  scratch-buffer fix had to move `netSendTo`'s fill inside its loop for
+  exactly this reason).
 - **`@nosplit` does NOT mean "cannot park."** `schedPark`
   (`runtime/sched/task.bit`) and `schedSwitch` (`runtime/sched/switch.bit`) are
   themselves `@nosplit`, so E0075 permits calling them from a `@nosplit` body.
@@ -1743,7 +1749,7 @@ actually exercised. §22 audits every remaining module-level cell in
   from the attribute alone.
 
 **A closed gap.** §2.2's `bit_rt_iface_as_ok` flag used to be the process-wide
-shape this note describes as unsound at `BIT_WORKERS>1`. #3280 converted it to
+shape this note describes as unsound at `BIT_WORKERS>1`. It was converted to
 per-task scratch (`scrIfaceOk`, `runtime/sched/scratch.bit`) alongside its
 §11/§13 siblings; `rtIfaceAs`/`rtIfaceAsOk` (`runtime/root/iface.bit`) now read
 and write that slot, and the module-level `ifaceOk` global is gone from
@@ -1755,7 +1761,7 @@ same way it does for the rest of §5.1.
 ## 6. Allocation and collection entry points
 
 v1 exposes the runtime API in Bit (`runtime/gc/gc.bit`); the runtime-init/codegen
-ticket wires the process-wide collector instance and any C-callable export
+path wires the process-wide collector instance and any C-callable export
 symbols.
 
 ```
@@ -1803,7 +1809,7 @@ bit_rt_gc_syscall_end()    -> void   // leave it
 `_enter` is idempotent per thread and is also performed lazily by the first
 safepoint poll, so a thread can never be invisible to the collector.
 
-**`_exit` IS NO LONGER THE THREAD BODY'S RESPONSIBILITY (#1801).** A leaked slot
+**`_exit` IS NO LONGER THE THREAD BODY'S RESPONSIBILITY.** A leaked slot
 stays `running` forever, which does not corrupt anything but does make every
 later rendezvous time out, i.e. collection stops — and that is silent, so a rule
 each new caller had to remember was the wrong place for it (measured: 247 of
@@ -1848,7 +1854,7 @@ Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 | `BIT_GC_GROWTH_PCT` | 200     | Heap growth percent between collections (>= 100)   |
 | `BIT_GC_MARKSTACK`  | 8192    | Mark worklist capacity in entries (> 0)            |
 | `BIT_GC_STATS`      | off     | `1`/`on` prints one summary line to stderr at exit  |
-| `BIT_GC_ALLOCCACHE` | off     | `1`/`on` arms the per-OS-thread slot cache at boot instead of on first lock contention (#5441) |
+| `BIT_GC_ALLOCCACHE` | off     | `1`/`on` arms the per-OS-thread slot cache at boot instead of on first lock contention |
 
 `BIT_GC_ALLOCCACHE` is the one row that is NOT `configFromEnv`'s: it names this
 port's own allocator (`runtime/gc/gcheap.bit`), it selects which of two paths a
@@ -1860,7 +1866,7 @@ POSIX only in v1; Windows keeps the compiled defaults until the runtime adds
 `GetEnvironmentVariableW`.
 
 **`bit` itself is a Bit program**, so every row above also configures `bit`'s
-own process, not only the program it is building or running (#2425). `bit
+own process, not only the program it is building or running. `bit
 build`/`check` compile in-process and simply run slower under `BIT_GC=stress`
 (the compiler's own heap, not the input program, pays the per-safepoint
 collection) — no exec follows, so a slow compile is the whole story.
@@ -1870,17 +1876,17 @@ as a separate child that inherits the environment fresh — `run` the program
 it just built, `test` a synthetic `BIT_TEST_INDEX`-dispatch binary
 (`compiler/testgen.bit`'s `injectTestMain`) — so under `BIT_GC=stress` neither
 would ever reach that exec: the compile alone does not finish in useful time
-(#2425 measured a six-line input still compiling after 60s, zero collections
+(measured: a six-line input still compiling after 60s, zero collections
 even logged). Both therefore **refuse** `BIT_GC=stress` outright
 (`compiler/build.bit`'s `refuseRunUnderStressGc`/`refuseTestUnderStressGc`,
-the latter called from `compiler/testrun.bit`'s `testCmd`, #2979) rather than
+the latter called from `compiler/testrun.bit`'s `testCmd`) rather than
 appearing to hang.
 
 | Subcommand   | In-process compile? | Under `BIT_GC=stress` | Supported route to stress the subject |
 |--------------|----------------------|------------------------|----------------------------------------|
 | `bit build`/`check` | yes, no exec after | slow compile, honestly reported (`warnCompilerUnderStressGc`) | run the output binary directly under `BIT_GC=stress` |
-| `bit run`    | yes, execs the built binary | **refuses immediately** (#2425) | `bit build` the source, then run the output binary directly under `BIT_GC=stress` |
-| `bit test`   | yes, execs a synthetic test binary per `test_*` | **refuses immediately** (#2979) | no build-only step is exposed for the synthetic test binary; move the logic into a normal `fn main()`, `bit build` it, and run that directly under `BIT_GC=stress` |
+| `bit run`    | yes, execs the built binary | **refuses immediately** | `bit build` the source, then run the output binary directly under `BIT_GC=stress` |
+| `bit test`   | yes, execs a synthetic test binary per `test_*` | **refuses immediately** | no build-only step is exposed for the synthetic test binary; move the logic into a normal `fn main()`, `bit build` it, and run that directly under `BIT_GC=stress` |
 
 ---
 
@@ -1893,7 +1899,7 @@ mark traces from roots via the pointer maps using a fixed-capacity worklist
 constant); sweep frees unmarked objects back to the size-class heap. Upgrade path
 is incremental/generational collection when pause times matter.
 
-### 8.1 What goes back to the OS, and what does not (informative, #4000)
+### 8.1 What goes back to the OS, and what does not (informative)
 
 Three things are returned, and all three are live paths today:
 
@@ -1941,14 +1947,14 @@ with `heapLive` byte-identical. Peak RSS moves 0.27% on `json` and 3.15% on
 second independent baseline series whose own spread was under 2%). The trade was
 therefore rejected, not overlooked.
 
-### 8.2 `BIT_GC_STATS` byte fields (#4057)
+### 8.2 `BIT_GC_STATS` byte fields
 
-Before #4057, every heap figure `BIT_GC_STATS=1` printed was a COUNT — of
+Before these byte fields existed, every heap figure `BIT_GC_STATS=1` printed was a COUNT — of
 objects (`collections=`/`swept=`/`live=`) or of reserve chunks
 (`chunks=`/`chunkbytes=`/`idxchunks=`/`idxbytes=`) — so no memory claim could
 be attributed without ablating the collector (`BIT_GC=off` for a total, a
-tuned min/growth pair for a live high-water bound; both used independently by
-#4026/#4000/#4045 before this landed). Four byte fields close that gap:
+tuned min/growth pair for a live high-water bound; both used independently,
+more than once, before this landed). Four byte fields close that gap:
 
 | field | source | rounding |
 |---|---|---|
@@ -1967,8 +1973,9 @@ matches them deliberately, so `allocbytes=` divided by (`swept=` + `live=`)
 answers "average bytes ACTUALLY SPENT per object" rather than a number no
 external measurement (RSS, `/usr/bin/time -l`) could ever be checked against.
 Requested-vs-rounded is not a rounding-error footnote here — it is the entire
-subject of #4026, which this field now lets a caller see directly instead of
-inferring from an RSS delta across two size classes.
+subject of the base-offset discussion in §1.2 above, which this field now
+lets a caller see directly instead of inferring from an RSS delta across two
+size classes.
 
 **`peakbytes=` exists because the value at exit is not the peak.** For a
 program whose heap fell after its high point — spans reclaimed, `mappedbytes=`
@@ -2003,7 +2010,7 @@ same block already carries for the same reason.
 
 ### Process entry
 
-The linker (task #345) designates `_start` as the object's entry point (the
+The linker designates `_start` as the object's entry point (the
 standard convention on every target this runtime supports — ELF `e_entry`,
 Mach-O `LC_MAIN`/`LC_UNIXTHREAD`, PE `AddressOfEntryPoint`; wiring the header
 field is the linker's concern, not this one). `_start` is hand-written asm per
@@ -2027,9 +2034,9 @@ calls `boot`, and exits the process with `boot`'s returned code.
    both verbatim). First: an idle worker ran its find-work/steal/backoff loop
    regardless of runnable work, so a pool wider than the work cost more than
    it saved — on an 18-core box, four CPU-bound tasks took 108% of one task's
-   time with four workers and 215% with eighteen. #1902 fixed that (idle
-   workers now park on a futex instead of spinning; the same repro is flat at
-   0.04-0.05s for 1..18 idle workers). Second, even after idle cost was fixed,
+   time with four workers and 215% with eighteen. This was fixed by making
+   idle workers park on a futex instead of spinning; the same repro is flat
+   at 0.04-0.05s for 1..18 idle workers. Second, even after idle cost was fixed,
    a core-count default still failed `./make test`: a boot-time snapshot of
    "cores available right now" is a claim on the *whole machine*, wrong for a
    process that is itself one of N run at once. `_tests_/bit/docs.bit` runs 12
@@ -2039,7 +2046,7 @@ calls `boot`, and exits the process with `boot`'s returned code.
    parked (sampled at 0:00.00 CPU), not spinning.
 
    **The rule that changes the pool size at run time**
-   (`runtime/sched/grow.bit`, #2593/#3569/#3583 — grow-on-demand, the design
+   (`runtime/sched/grow.bit` — grow-on-demand, the design
    chosen in `runtime/sched/pool-sizing.md`): every `spawn` tracks backlog two
    ways, one for each of the queues a task can land on. `schedGrowObserve`
    counts a streak of consecutive enqueues that find the scheduler's global
@@ -2052,36 +2059,37 @@ calls `boot`, and exits the process with `boot`'s returned code.
    more OS thread and resets. Both paths matter: an ordinary CPU-bound
    program's spawns stay on the calling worker's own local ring, so without
    the local check the global one alone never sees them and the pool never
-   grows past 1 regardless of backlog (#3583). A program that never has
+   grows past 1 regardless of backlog. A program that never has
    parallel work never pays for a pool it doesn't use; a program with
    sustained backlog grows toward the machine's actual, current free
    capacity instead of a boot-time guess at it — UNLESS `BIT_WORKERS` was
    explicitly set, in which case it is also a hard ceiling on that growth,
-   not only the boot-time floor (#4313): `schedGrowArm`/`schedMaybeGrow`
+   not only the boot-time floor: `schedGrowArm`/`schedMaybeGrow`
    (`runtime/sched/grow.bit`) refuse to grow the pool past it. The implicit
    default (unset `BIT_WORKERS`) is unaffected and still grows to
    `schedMaxWorkers` exactly as described above.
 
-   This was pinned to **exactly one** until #1900. It was never a *collector*
+   This was pinned to **exactly one** until multi-worker support landed. It was never a *collector*
    requirement — §5's handshake makes concurrent mutators safe, and each worker
    registers as a mutator for the life of its run loop — only a
    scheduler-maturity choice, because work stealing across several workers had
    no test that exercised it.
 
-   **What that means for anyone reading a stack trace from before #1900:** with
+   **What that means for anyone reading a stack trace from before multi-worker support landed:** with
    one worker, a worker's steal path could never find a victim, so the stealing
    branch of `schedFindWorkAt` was unreachable in every binary this runtime ever
    produced. It runs for the first time with `nthreads > 1`. Treat a failure
    that appears only under multiple workers as a first execution, not a
    regression.
 
-   `BIT_WORKERS=1` fixes the *boot-time* pool at pre-#1900's single worker,
-   and exists so a suspected concurrency failure can be bisected against it
-   without a rebuild. As of #4313, an explicit `BIT_WORKERS` is ALSO a hard
-   ceiling on growth, so `BIT_WORKERS=1` now keeps the pool at exactly one
-   worker for the life of the run rather than merely starting it there — the
-   pre-#4313 behaviour (growth ignoring which count started the pool) is no
-   longer accurate for an explicit setting. The implicit default (no
+   `BIT_WORKERS=1` fixes the *boot-time* pool at the single-worker default that
+   existed before multi-worker support landed, and exists so a suspected
+   concurrency failure can be bisected against it without a rebuild. An
+   explicit `BIT_WORKERS` is ALSO a hard ceiling on growth, so `BIT_WORKERS=1`
+   now keeps the pool at exactly one worker for the life of the run rather
+   than merely starting it there — the earlier behaviour (growth ignoring
+   which count started the pool) is no longer accurate for an explicit
+   setting. The implicit default (no
    `BIT_WORKERS` set at all) is unchanged: it still starts at 1 and grows
    under sustained backlog exactly as before.
 3. Spawn `main_fn` (§10) as the first green thread.
@@ -2094,15 +2102,13 @@ calls `boot`, and exits the process with `boot`'s returned code.
 
 ### Preemption: the sysmon monitor and the preempt request flag
 
-**All five of epic #1768's child tickets have landed.** Epic #1768 splits
-preemption into a state module plus four consumers: #2576, #2577, #2578,
-#2579 and #2580 are all Done. Every claim below was checked directly
-against the source with the greps shown, not against ticket text or a
-comment's stated intent.
+**Preemption is fully landed: a state module plus four consumers.** Every
+claim below was checked directly against the source with the greps shown,
+not against a comment's stated intent.
 
-**The state module (`runtime/sched/preempt.bit`, #2576, landed).** No
-function in this file makes an OS call, and since #4736 none of them reads a
-clock at all: the budget is counted in SYSMON TICKS. `sysmonTick` bumps the
+**The state module (`runtime/sched/preempt.bit`, landed).** No
+function in this file makes an OS call, and none of them reads a
+clock at all anymore: the budget is counted in SYSMON TICKS. `sysmonTick` bumps the
 module's own `sysmonEpoch` counter once per call, `preemptTickNow()` reads it,
 and both the dispatch stamp and the over-budget comparison use that one value.
 It defines:
@@ -2114,7 +2120,7 @@ It defines:
 - `preemptBudgetTicks: i64 = preemptBudgetNs / sysmonPeriodNs + 1` (6) — the
   threshold actually tested. The `+ 1` is tick granularity: the first tick
   after a dispatch can land arbitrarily soon, so `k` observed ticks prove only
-  `(k - 1) * sysmonPeriodNs` of elapsed time, and 6 preserves #2578's promise
+  `(k - 1) * sysmonPeriodNs` of elapsed time, and 6 preserves the promise
   that a worker is never flagged before a real 10 ms of holding its task.
 - `preemptTickNow(): i64` — `sysmonEpoch + 1`, so never 0. The value a
   dispatch stamps and the value `sysmonTick` measures ages against; one epoch,
@@ -2133,16 +2139,15 @@ It defines:
   every worker slot — bounded by both the scheduler's worker-count constant
   and `preemptSlots` — setting `requested[w] = 1` for any worker whose
   `preemptTickNow() - startTick[w]` has reached `preemptBudgetTicks`, and
-  returning the count set this call. It takes no argument and reads no clock
-  (#4736).
+  returning the count set this call. It takes no argument and reads no clock.
 - `preemptRequested(worker: i64): bool`, which reads the flag without
   clearing it (`runtime/sched/preempt.bit:109-111`).
 - `maybePreempt(worker: i64): bool`, which reports a pending request and
   clears it in the same call. It only reports — the caller is responsible
   for the actual yield (`runtime/sched/preempt.bit:117-123`).
-- **#3746:** `anyRequested`, a `[1]i64` SUMMARY of `requested`, with its pinned
+- `anyRequested`, a `[1]i64` SUMMARY of `requested`, with its pinned
   address accessor `bit_rt_port_sched_preempt_any_addr` (`preemptAnyAddr(): int`)
-  and, since #4203, its pinned value accessor
+  and its pinned value accessor
   `bit_rt_port_sched_preempt_any` (`preemptAnyPending(): bool`). The word may
   read 1 with nothing pending; it can never read 0 with something pending.
   `sysmonTick` publishes it AFTER setting a flag, `maybePreempt`/`preemptStamp`
@@ -2150,7 +2155,7 @@ It defines:
   one-way error one-way, and the proof is on the declaration in
   `runtime/sched/preempt.bit`.
 
-  **#4203: no backend reads this word any more.** Both inlined poll guards
+  **No backend reads this word any more.** Both inlined poll guards
   cached its address beside `bit_rt_world_addr` and `bit_rt_gc_addr` and read it
   at every back edge to decide whether to spend `schedCurrentWorker` +
   `preemptRequested`. The back edge now reads `pollAttention`
@@ -2160,15 +2165,15 @@ It defines:
   replaced used to run.
 
   NOTE: the `runtime/sched/preempt.bit:NN` line citations in this section
-  predate #3560/#3563/#3564/#3746 and have drifted. Resolve by NAME.
+  may have drifted from later edits. Resolve by NAME.
 
-**Wired: the stamp on dispatch (#2578, landed; #4736 changed what it
+**Wired: the stamp on dispatch (landed; later changed what it
 stamps).** `schedWorkerStep` calls `preemptStamp(*(w + wkId),
 preemptTickNow())` once per task dispatch, immediately before `schedSwitch`
 hands control to the task (`runtime/sched/workerrun.bit`) — the only call site
 for `preemptStamp` in the tree (`git grep -n preemptStamp -- '*.bit'`).
 
-**#4736: THE DISPATCH PATH READS NO CLOCK.** #2578 stamped `monoNs()` here.
+**THE DISPATCH PATH READS NO CLOCK.** It used to stamp `monoNs()` here.
 On Linux that pins `parkMonoNs` (`runtime/park/linux/wait.bit`), a raw
 `clock_gettime` `svc` rather than a vDSO call, so every green-task dispatch —
 once per context switch — took a kernel trap: +147 ns/switch, 285 -> 423
@@ -2179,7 +2184,7 @@ only remaining tie between ticks and real time, which is why
 `preemptBudgetTicks` is derived from `sysmonPeriodNs` and both monitor threads
 import that constant.
 
-**Wired: the monitor ticks the flag (#2579 darwin, #2580 linux, both
+**Wired: the monitor ticks the flag (darwin and linux, both
 landed).** `sysmonRun` is a `nanosleep`-then-`sysmonTick` loop, sleeping
 ~2ms between ticks, bounded by `WORKER_MAX_STEPS`
 (`runtime/sched/workerrun.bit:65`; 1e9 iterations at ~2ms is over 20 days,
@@ -2195,7 +2200,7 @@ header makes the same argument rather than repeating it). So `requested` is
 set by a real, clock-driven tick on both platforms, not only by the
 dispatch-time stamp described above.
 
-**Wired: the safepoint consumes the flag (#2577, landed).**
+**Wired: the safepoint consumes the flag (landed).**
 `schedMaybeYieldForPreempt` (`runtime/sched/task.bit:286-292`) calls
 `maybePreempt(workerId)` at `runtime/sched/task.bit:290` and yields via the
 existing `schedYield` path when it returns true. `stwSafepoint`
@@ -2205,7 +2210,7 @@ the real, pinned safepoint entry point (`bit_rt_port_stw_safepoint`).
 
 **Net effect today:** the flag is stamped at dispatch and set by a real
 tick on both platforms (above), and it is consumed whenever a task reaches
-the real safepoint poll (#2577, above). A task with no safepoint is still
+the real safepoint poll (above). A task with no safepoint is still
 not preemptible even when `sysmonTick` has set its flag: the flag is only
 acted on where `maybePreempt` is called, and a task that never reaches that
 call point keeps running regardless of `requested`'s value.
@@ -2231,7 +2236,7 @@ its one packed-argument pointer, never `f` and its raw arguments directly.
 Never fails visibly: OOM is fatal here (SPEC.md §16.1's `spawn` has no
 fallible surface form), so codegen never checks a return value.
 
-### Task-local storage slot (#5028, `docs/context-propagation.md` decision B)
+### Task-local storage slot (`docs/context-propagation.md` decision B)
 
 One word, **offset 32, size 8 bytes**, inside every task control block
 (`runtime/sched/task.bit`'s `taskLocal`, index `taskWords - 1` — `taskWords`
@@ -2272,7 +2277,7 @@ needs before it can be built on top of this slot.
 `stdlib/runtime`'s `taskLocalGet`/`taskLocalSet` (`docs/stdlib/runtime.md`)
 are the only sanctioned callers. **No public `Context` API lands with this
 slot** — see `docs/context-propagation.md`'s decision: this is the primitive
-`std/trace` (#3969) and later request-scoped mechanisms build on, not a
+`std/trace` and later request-scoped mechanisms build on, not a
 finished feature.
 
 ### Exported C symbols (all `bit_rt_*`, one process-wide runtime instance)
@@ -2283,7 +2288,7 @@ change, `git grep -ho '@symbol("bit_rt_[a-z0-9_]*")' -- runtime | sort -u`
 reports 594 pinned names against the 137 rows below. Most of the gap is
 `bit_rt_port_*` test pins and GC/scheduler/provider internals, but not all of
 it — `bit_rt_chan_recv_ok`, an ordinary §11 entry point generated code calls
-directly, has no row. Every `bit_rt_fs_*` symbol does have one as of #4643,
+directly, has no row. Every `bit_rt_fs_*` symbol does have one now,
 which is a fact about §14 today rather than a rule the table follows. **Each
 section's own prose is the authority for its family**; use this table as an
 index into them, never as the exported-symbol list.
@@ -2340,24 +2345,24 @@ defined exactly once).
 | `bit_rt_print`        | `(s: *const RtBytes) -> void` (§12, fd 1)               |
 | `bit_rt_eprint`       | `(s: *const RtBytes) -> void` (§12, fd 2)               |
 | `bit_rt_string_concat`| `(a: *const RtBytes, b: *const RtBytes) -> *const RtBytes` (§2) |
-| `bit_rt_string_concat5`| `(a: *const RtBytes, ..., e: *const RtBytes) -> *const RtBytes` (§2, five operands joined in ONE sized allocation; an operand past the last real part is the empty string, which lowering materializes as a pooled `const_string ""` — a null header reads the same way through §2's string funnel. Interpolation joins four new parts per call instead of folding one per binary `string_concat`, #4037) |
+| `bit_rt_string_concat5`| `(a: *const RtBytes, ..., e: *const RtBytes) -> *const RtBytes` (§2, five operands joined in ONE sized allocation; an operand past the last real part is the empty string, which lowering materializes as a pooled `const_string ""` — a null header reads the same way through §2's string funnel. Interpolation joins four new parts per call instead of folding one per binary `string_concat`) |
 | `bit_rt_string_eq`    | `(a: *const RtBytes, b: *const RtBytes) -> bool` (§2)   |
-| `bit_rt_string_eq_words` | `(a_ptr: *const u8, a_len: usize, b_ptr: *const u8, b_len: usize) -> bool` (§2, #4443 — the same comparison over the two views' `ptr`/`len` words instead of two boxed headers, and the form lowering emits for `==`/`!=`. `bit_rt_string_eq` stays exported and delegates here, so the two cannot drift. The boxed form is what forced a 24-byte view to exist at every comparison: a one-handle call NAMES the box, which `optalloc.bit` treats as an escape, so the allocation could never be dropped. Keeping the backing rooted across the call is the CALLER's job — this side is `@nosplit` — and lowering does it with the #4406 keepalive edges `unboxStringWords` records.) |
+| `bit_rt_string_eq_words` | `(a_ptr: *const u8, a_len: usize, b_ptr: *const u8, b_len: usize) -> bool` (§2 — the same comparison over the two views' `ptr`/`len` words instead of two boxed headers, and the form lowering emits for `==`/`!=`. `bit_rt_string_eq` stays exported and delegates here, so the two cannot drift. The boxed form is what forced a 24-byte view to exist at every comparison: a one-handle call NAMES the box, which `optalloc.bit` treats as an escape, so the allocation could never be dropped. Keeping the backing rooted across the call is the CALLER's job — this side is `@nosplit` — and lowering does it with the keepalive edges `unboxStringWords` records.) |
 | `bit_rt_string_cmp`   | `(a: *const RtBytes, b: *const RtBytes) -> i64` (§2, three-way lexicographic order; unsigned bytes, shorter-is-less on a common prefix) |
 | `bit_rt_string_byte`  | `(s: *const RtBytes, index: usize) -> u64` (§2, `s[i]`; u64-widened) |
-| `bit_rt_string_slice` | `(s: *const RtBytes, lo: usize, hi: usize) -> *const RtBytes` (§2, `s[lo:hi]`; a shared-backing view since #3897 — header only, `base = s`, no byte copy) |
+| `bit_rt_string_slice` | `(s: *const RtBytes, lo: usize, hi: usize) -> *const RtBytes` (§2, `s[lo:hi]`; a shared-backing view — header only, `base = s`, no byte copy) |
 | `bit_rt_bytes_from_string` | `(s: *const RtBytes) -> *SliceHeader` (§2, `[]byte(s)`) |
 | `bit_rt_string_from_bytes` | `(h: *const SliceHeader) -> *const RtBytes` (§2, `string(b)`) |
 | `bit_rt_string_from_int`   | `(v: i64) -> *const RtBytes` (§2, the signed prims i8..i64) |
-| `bit_rt_string_from_uint`  | `(v: u64) -> *const RtBytes` (§2, the unsigned prims u8..u64, zero-extended by the caller; #2011) |
+| `bit_rt_string_from_uint`  | `(v: u64) -> *const RtBytes` (§2, the unsigned prims u8..u64, zero-extended by the caller) |
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_parse_float`  | `(s: *const RtBytes) -> f64` (§2, correctly-rounded text->f64; the inverse of `bit_rt_string_from_float`) |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
-| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, a class's own body size for a packed all-scalar `T`, `8` for every other element type, #3861) |
-| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `is_ref`/`elem_size` are the static element type's — a null `h` has no header to read them from, #1569; for `elem_size > 8` writes only the element's low word, since the payload is one `u64` — the caller fills the rest at its own computed offset, #3861) |
-| `bit_rt_slice_append_str` | `(h: ?*SliceHeader, s: ?*const RtBytes) -> *SliceHeader` (§2, #4371 — appends the string's BYTES to a `[]u8` in one call, the shape `append(dst, s)` lowers to when `dst`'s element is `u8`. Stride and `is_ref` are fixed at `1`/`0` by that operand rule, so neither travels. A null `h` allocates a fresh header exactly as `bit_rt_slice_append` does; a null `s` is the empty string (§2's null-header contract) and appends nothing. Grows ONCE to `max(2 * cap, len + n)`, so a long string costs one allocation rather than one per doubling. Same aliasing contract as `bit_rt_slice_append`.) |
-| `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2; FATAL for a packed, non-ref buffer with `elem_size` neither `1` nor `8` — one `u64` cannot represent a wider element without truncating, #3861) |
-| `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64, elem_size: usize) -> void` (§2; FATAL under the identical condition `bit_rt_slice_get` is, and for the identical reason, #3861) |
+| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, a class's own body size for a packed all-scalar `T`, `8` for every other element type) |
+| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `is_ref`/`elem_size` are the static element type's — a null `h` has no header to read them from; for `elem_size > 8` writes only the element's low word, since the payload is one `u64` — the caller fills the rest at its own computed offset) |
+| `bit_rt_slice_append_str` | `(h: ?*SliceHeader, s: ?*const RtBytes) -> *SliceHeader` (§2 — appends the string's BYTES to a `[]u8` in one call, the shape `append(dst, s)` lowers to when `dst`'s element is `u8`. Stride and `is_ref` are fixed at `1`/`0` by that operand rule, so neither travels. A null `h` allocates a fresh header exactly as `bit_rt_slice_append` does; a null `s` is the empty string (§2's null-header contract) and appends nothing. Grows ONCE to `max(2 * cap, len + n)`, so a long string costs one allocation rather than one per doubling. Same aliasing contract as `bit_rt_slice_append`.) |
+| `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2; FATAL for a packed, non-ref buffer with `elem_size` neither `1` nor `8` — one `u64` cannot represent a wider element without truncating) |
+| `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64, elem_size: usize) -> void` (§2; FATAL under the identical condition `bit_rt_slice_get` is, and for the identical reason) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2, unchanged — reslicing works in element counts already, `runtime/root/slices.bit` `rtSliceSlice`) |
 | `bit_rt_map_new`      | `(key_desc: usize, val_is_ref: usize, cap_hint: i64) -> *MapHeader` (§15, §15.1; `cap_hint <= 0` is no hint) |
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
@@ -2370,11 +2375,11 @@ defined exactly once).
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 | `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15; a NEGATIVE slot reads as `0`, so `map_slot`'s miss marker needs no branch at the call site) |
-| `bit_rt_fs_open`      | `(path: *const RtBytes, write: bool) -> i64` (§14, fd, or `-1`; `write=false` opens read-only, `write=true` creates+truncates write-only at mode `0644`. Rejects a DIRECTORY (#2149) — `open(2)` on one succeeds `O_RDONLY`, handing out a `File` nothing can read) |
+| `bit_rt_fs_open`      | `(path: *const RtBytes, write: bool) -> i64` (§14, fd, or `-1`; `write=false` opens read-only, `write=true` creates+truncates write-only at mode `0644`. Rejects a DIRECTORY — `open(2)` on one succeeds `O_RDONLY`, handing out a `File` nothing can read) |
 | `bit_rt_fs_append`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_read`      | `(fd: i64, max: i64) -> *const RtBytes` (§14)           |
-| `bit_rt_fs_read_all`  | `(fd: i64) -> *const RtBytes` (§14, the whole file, regular files only — sized by `lseek(SEEK_END)`, then TRIMMED to the bytes actually read, never zero-padded (#2990). An empty result is ambiguous in-band, since `string` has no nil sentinel; `bit_rt_fs_read_all_failed` below carries the distinction) |
-| `bit_rt_fs_read_all_failed` | `() -> bool` (§14, #2994/#3065/#2996, the out-of-band companion flag for the row above: true when `lseek` failed or the allocation for an already-known-non-empty file failed, and NEVER for a genuinely empty file. Per-task state cleared at each `bit_rt_fs_read_all` entry, so it must be read immediately after that call with no yield between) |
+| `bit_rt_fs_read_all`  | `(fd: i64) -> *const RtBytes` (§14, the whole file, regular files only — sized by `lseek(SEEK_END)`, then TRIMMED to the bytes actually read, never zero-padded. An empty result is ambiguous in-band, since `string` has no nil sentinel; `bit_rt_fs_read_all_failed` below carries the distinction) |
+| `bit_rt_fs_read_all_failed` | `() -> bool` (§14, the out-of-band companion flag for the row above: true when `lseek` failed or the allocation for an already-known-non-empty file failed, and NEVER for a genuinely empty file. Per-task state cleared at each `bit_rt_fs_read_all` entry, so it must be read immediately after that call with no yield between) |
 | `bit_rt_fs_write`     | `(fd: i64, s: *const RtBytes) -> i64` (§14, bytes written, or `-1`) |
 | `bit_rt_fs_close`     | `(fd: i64) -> i64` (§14, always `0` — the raw wrapper swallows `EINTR`/`EBADF`, so a caller has no close error to handle) |
 | `bit_rt_fs_exists`    | `(path: *const RtBytes) -> bool` (§14)                  |
@@ -2384,26 +2389,26 @@ defined exactly once).
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
 | `bit_rt_fs_chmod`     | `(path: *const RtBytes, mode: i64) -> i64` (§14, sets `path`'s permission bits to `mode`; `0`, or `-1` on any error. Darwin calls libc `chmod`, Linux the raw `chmod`/`fchmodat(AT_FDCWD, ...)` syscall. Windows maps ONLY the POSIX owner-write bit (`mode & 0o200`) to `FILE_ATTRIBUTE_READONLY` — see that provider's header scope note, `runtime/root/windows/fs.bit:85`) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
-| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the FIRST entry point shaped this way (#2152) and now the family's convention — eight `bit_rt_fs_*_w` symbols share it, six carrying a path (this, `bit_rt_fs_open_rw_w`, `bit_rt_fs_open_nofollow_w`, `bit_rt_fs_stat_w`, `bit_rt_fs_lstat_w`, `bit_rt_fs_sync_dir_w`) and two a data buffer (`bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`)) |
+| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2) — not NUL-terminated, not `RtBytes`; the FIRST entry point shaped this way and now the family's convention — eight `bit_rt_fs_*_w` symbols share it, six carrying a path (this, `bit_rt_fs_open_rw_w`, `bit_rt_fs_open_nofollow_w`, `bit_rt_fs_stat_w`, `bit_rt_fs_lstat_w`, `bit_rt_fs_sync_dir_w`) and two a data buffer (`bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`)) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
-| `bit_rt_fs_truncate`  | `(fd: i64, size: i64) -> i64` (§14, #4016, sets `fd`'s length; `0`, or negative on any failure. Never moves the fd's own cursor, matching `bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`; growing leaves a HOLE rather than reserving blocks, so a later write can still fail `ENOSPC`, and the new length is not durable until `bit_rt_fs_sync`) |
-| `bit_rt_fs_size`      | `(fd: i64) -> i64` (§14, #4016, `fd`'s length in bytes, or negative on any failure; `fstat` on Darwin/Linux, `GetFileSizeEx` on Windows) |
-| `bit_rt_fs_lock`      | `(fd: i64, exclusive: bool, blocking: bool) -> i64` (§14, #4014, whole-file advisory lock — `flock(2)` on Darwin/Linux, `LockFileEx` over the `MAXDWORD`/`MAXDWORD` range on Windows. A normalized THREE-WAY result, deliberately not the `-errno` of `bit_rt_fs_stat_w`: `0` success; `-1` ONLY when `blocking` is false and the lock is held elsewhere, which is `tryLock`'s expected outcome rather than a failure; `-2` any other error) |
-| `bit_rt_fs_unlock`    | `(fd: i64) -> i64` (§14, #4014, releases the lock above; `0`, or `-2` — `-1` has no meaning here, since releasing a lock has no "would block" outcome. A no-op success on an fd holding no lock, on every platform, so a caller never tracks whether it currently holds one) |
-| `bit_rt_fs_pread_w`   | `(fd: i64, buf: usize, max: i64, off: i64) -> i64` (§14, #3463, positional read: `buf` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not `RtBytes`, not NUL-terminated, same convention `bit_rt_fs_is_symlink_w` uses; byte count transferred, or negative on any I/O error; a short count, including 0 at end of file, is NOT an error) |
-| `bit_rt_fs_pwrite_w`  | `(fd: i64, buf: usize, n: i64, off: i64) -> i64` (§14, #3463, positional write: same `buf` convention as `bit_rt_fs_pread_w`; byte count transferred, or negative on any I/O error; extends the file or leaves a zero-filled hole as POSIX `pwrite(2)` does) |
-| `bit_rt_fs_open_rw_w` | `(words: usize, n: i64) -> i64` (§14, #3533, read-write open: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDWR\|O_CREAT`, deliberately WITHOUT `O_TRUNC` -- creates `path` if absent, never destroys existing content on open; fd, or -1. Darwin/Linux only -- windows deferred, see runtime/root/{darwin,linux}/fsopenrw.bit and fs.bit) |
-| `bit_rt_fs_stat_w`    | `(words: usize, n: i64, out: usize) -> i64` (§14, #2153, same packed-bytes `words`/`n` path convention as `bit_rt_fs_is_symlink_w`; fills the caller-owned 5-word `out` buffer in fixed order — `size`, `mtime`, `mode`, `isDir`, `isSymlink` — FOLLOWING a trailing symlink, so `isSymlink` is always 0 here. Not the flat `-1` of the primitives above: 0 on success, `-errno` on failure) |
-| `bit_rt_fs_lstat_w`   | `(words: usize, n: i64, out: usize) -> i64` (§14, #2153, identical to `bit_rt_fs_stat_w` except it does NOT follow a trailing symlink, so `out`'s `isSymlink` word reports whether `words` itself is a link; same 0/`-errno` return) |
-| `bit_rt_fs_open_nofollow_w` | `(words: usize, n: i64) -> i64` (§14, #4720, read-only open that REFUSES a symlinked final path component instead of following it: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDONLY|O_NOFOLLOW` on darwin/linux, `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` plus a `GetFileInformationByHandle` reparse-point refusal on windows; a directory is refused too; fd/handle, or -1) |
-| `bit_rt_fs_sync_dir_w` | `(words: usize, n: i64) -> i64` (§14, #4017, fsyncs the DIRECTORY named by the packed-bytes `words`/`n` path — the durability half `bit_rt_fs_sync` on a file does not cover; `0`, or `-1`; windows always reports 0) |
-| `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
+| `bit_rt_fs_truncate`  | `(fd: i64, size: i64) -> i64` (§14, sets `fd`'s length; `0`, or negative on any failure. Never moves the fd's own cursor, matching `bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`; growing leaves a HOLE rather than reserving blocks, so a later write can still fail `ENOSPC`, and the new length is not durable until `bit_rt_fs_sync`) |
+| `bit_rt_fs_size`      | `(fd: i64) -> i64` (§14, `fd`'s length in bytes, or negative on any failure; `fstat` on Darwin/Linux, `GetFileSizeEx` on Windows) |
+| `bit_rt_fs_lock`      | `(fd: i64, exclusive: bool, blocking: bool) -> i64` (§14, whole-file advisory lock — `flock(2)` on Darwin/Linux, `LockFileEx` over the `MAXDWORD`/`MAXDWORD` range on Windows. A normalized THREE-WAY result, deliberately not the `-errno` of `bit_rt_fs_stat_w`: `0` success; `-1` ONLY when `blocking` is false and the lock is held elsewhere, which is `tryLock`'s expected outcome rather than a failure; `-2` any other error) |
+| `bit_rt_fs_unlock`    | `(fd: i64) -> i64` (§14, releases the lock above; `0`, or `-2` — `-1` has no meaning here, since releasing a lock has no "would block" outcome. A no-op success on an fd holding no lock, on every platform, so a caller never tracks whether it currently holds one) |
+| `bit_rt_fs_pread_w`   | `(fd: i64, buf: usize, max: i64, off: i64) -> i64` (§14, positional read: `buf` is a `[]byte`'s backing, packed one byte per element (§2) — not `RtBytes`, not NUL-terminated, same convention `bit_rt_fs_is_symlink_w` uses; byte count transferred, or negative on any I/O error; a short count, including 0 at end of file, is NOT an error) |
+| `bit_rt_fs_pwrite_w`  | `(fd: i64, buf: usize, n: i64, off: i64) -> i64` (§14, positional write: same `buf` convention as `bit_rt_fs_pread_w`; byte count transferred, or negative on any I/O error; extends the file or leaves a zero-filled hole as POSIX `pwrite(2)` does) |
+| `bit_rt_fs_open_rw_w` | `(words: usize, n: i64) -> i64` (§14, read-write open: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDWR\|O_CREAT`, deliberately WITHOUT `O_TRUNC` -- creates `path` if absent, never destroys existing content on open; fd, or -1. Darwin/Linux only -- windows deferred, see runtime/root/{darwin,linux}/fsopenrw.bit and fs.bit) |
+| `bit_rt_fs_stat_w`    | `(words: usize, n: i64, out: usize) -> i64` (§14, same packed-bytes `words`/`n` path convention as `bit_rt_fs_is_symlink_w`; fills the caller-owned 5-word `out` buffer in fixed order — `size`, `mtime`, `mode`, `isDir`, `isSymlink` — FOLLOWING a trailing symlink, so `isSymlink` is always 0 here. Not the flat `-1` of the primitives above: 0 on success, `-errno` on failure) |
+| `bit_rt_fs_lstat_w`   | `(words: usize, n: i64, out: usize) -> i64` (§14, identical to `bit_rt_fs_stat_w` except it does NOT follow a trailing symlink, so `out`'s `isSymlink` word reports whether `words` itself is a link; same 0/`-errno` return) |
+| `bit_rt_fs_open_nofollow_w` | `(words: usize, n: i64) -> i64` (§14, read-only open that REFUSES a symlinked final path component instead of following it: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDONLY|O_NOFOLLOW` on darwin/linux, `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` plus a `GetFileInformationByHandle` reparse-point refusal on windows; a directory is refused too; fd/handle, or -1) |
+| `bit_rt_fs_sync_dir_w` | `(words: usize, n: i64) -> i64` (§14, fsyncs the DIRECTORY named by the packed-bytes `words`/`n` path — the durability half `bit_rt_fs_sync` on a file does not cover; `0`, or `-1`; windows always reports 0) |
+| `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_round`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_trunc`        | `(x: f64) -> f64` (§17)                                |
-| `bit_rt_float_bits`   | `(v: f64) -> u64` (§17, IEEE-754 bit pattern, no conversion; unreached by generated code since #1442 — `floatBits` lowers to an inline bitcast) |
+| `bit_rt_float_bits`   | `(v: f64) -> u64` (§17, IEEE-754 bit pattern, no conversion; unreached by generated code — `floatBits` lowers to an inline bitcast) |
 | `bit_rt_float32_bits` | `(v: f32) -> u32` (§17, same, for f32/`float32Bits`)   |
 | `bit_rt_pow`          | `(x: f64, y: f64) -> f64` (§17)                        |
 | `bit_rt_atan2`        | `(y: f64, x: f64) -> f64` (§17)                        |
@@ -2426,15 +2431,15 @@ defined exactly once).
 | `bit_rt_auxv`         | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
-| `bit_rt_net_peer_ip_w` | `(fd: i64) -> i64` (§20, #4526, the connected peer's IPv4 address PACKED into one integer; `-1` when `fd` has no peer. Reached through a plain `extern fn`, the same class as the deadline entries below, not the compiler-recognized builtins the rows around it lower to) |
+| `bit_rt_net_peer_ip_w` | `(fd: i64) -> i64` (§20, the connected peer's IPv4 address PACKED into one integer; `-1` when `fd` has no peer. Reached through a plain `extern fn`, the same class as the deadline entries below, not the compiler-recognized builtins the rows around it lower to) |
 | `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
 | `bit_rt_net_dial`     | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
-| `bit_rt_net_dial_deadline_w` | `(hostWords: usize, hostLen: i64, port: i64, deadlineNs: i64) -> i64` (§20, #2291, `bit_rt_net_dial` bounded by ONE absolute monotonic `deadlineNs` on `bit_rt_time_mono_ns`'s clock rather than parking forever; `host` crosses as a packed `[]byte`'s backing plus a length (§2, #3121/#3226) because §11.7 admits no `string` across an `extern fn`. fd, `-1` hard failure, `-2` timed out) |
+| `bit_rt_net_dial_deadline_w` | `(hostWords: usize, hostLen: i64, port: i64, deadlineNs: i64) -> i64` (§20, `bit_rt_net_dial` bounded by ONE absolute monotonic `deadlineNs` on `bit_rt_time_mono_ns`'s clock rather than parking forever; `host` crosses as a packed `[]byte`'s backing plus a length (§2) because §11.7 admits no `string` across an `extern fn`. fd, `-1` hard failure, `-2` timed out) |
 | `bit_rt_net_read`     | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
-| `bit_rt_net_read_deadline_w` | `(fd: i64, outWords: usize, cap: i64, deadlineNs: i64) -> i64` (§20, #2291, same deadline shape as `bit_rt_net_dial_deadline_w`; writes into the caller's own packed `outWords` buffer instead of returning a fresh string. Byte count, `0` peer closed, `-1` hard error, `-2` timed out) |
+| `bit_rt_net_read_deadline_w` | `(fd: i64, outWords: usize, cap: i64, deadlineNs: i64) -> i64` (§20, same deadline shape as `bit_rt_net_dial_deadline_w`; writes into the caller's own packed `outWords` buffer instead of returning a fresh string. Byte count, `0` peer closed, `-1` hard error, `-2` timed out) |
 | `bit_rt_net_write`    | `(fd: i64, s: *const RtBytes) -> i64` (§20)            |
-| `bit_rt_net_write_deadline_w` | `(fd: i64, words: usize, n: i64, deadlineNs: i64) -> i64` (§20, #2291, same deadline shape; the body crosses as packed `words`/`n`. Bytes written, `-1` hard error, `-2` timed out) |
-| `bit_rt_net_shutdown_sock_w` | `(fd: i64) -> bool` (§20, #3016, shuts BOTH directions of `fd` down without releasing it for reuse — see `netShutdownSock` in runtime/net/{darwin,linux,windows}/tcp.bit for why this exists alongside plain close. No buffer, so unlike its `_w` siblings it needs no packed-byte scratch; `true` on success) |
+| `bit_rt_net_write_deadline_w` | `(fd: i64, words: usize, n: i64, deadlineNs: i64) -> i64` (§20, same deadline shape; the body crosses as packed `words`/`n`. Bytes written, `-1` hard error, `-2` timed out) |
+| `bit_rt_net_shutdown_sock_w` | `(fd: i64) -> bool` (§20, shuts BOTH directions of `fd` down without releasing it for reuse — see `netShutdownSock` in runtime/net/{darwin,linux,windows}/tcp.bit for why this exists alongside plain close. No buffer, so unlike its `_w` siblings it needs no packed-byte scratch; `true` on success) |
 | `bit_rt_net_udp_bind` | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_udp_send` | `(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) -> i64` (§20) |
 | `bit_rt_net_udp_recv` | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
@@ -2456,9 +2461,9 @@ defined exactly once).
 | `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_sha256_hw_blocks` | `(state: i64, data: i64, blocks: u64) -> void` (§21f) |
-| `bit_rt_bytes_copy`   | `(dst: *byte, src: *byte, n: i64) -> void` (§11.4/§11.7, #3207, `@nosplit`, bounded by `n` — copies `n` bytes; regions must be disjoint) |
-| `bit_rt_bytes_equal`  | `(a: *byte, b: *byte, n: i64) -> bool` (§11.4/§11.7, #3207, `@nosplit`, bounded by `n`) |
-| `bit_rt_bytes_indexbyte` | `(p: *byte, n: i64, b: u8) -> i64` (§11.4/§11.7, #3207, `@nosplit`, bounded by `n` — first index of `b` in `[0, n)`, or -1) |
+| `bit_rt_bytes_copy`   | `(dst: *byte, src: *byte, n: i64) -> void` (§11.4/§11.7, `@nosplit`, bounded by `n` — copies `n` bytes; regions must be disjoint) |
+| `bit_rt_bytes_equal`  | `(a: *byte, b: *byte, n: i64) -> bool` (§11.4/§11.7, `@nosplit`, bounded by `n`) |
+| `bit_rt_bytes_indexbyte` | `(p: *byte, n: i64, b: u8) -> i64` (§11.4/§11.7, `@nosplit`, bounded by `n` — first index of `b` in `[0, n)`, or -1) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -2526,14 +2531,14 @@ as the program's own logging. No new runtime symbol: `bit_rt_get_err`,
 
 The ok arm returns the declared `int` as the exit code for `main(): int!`
 (§17.4's fourth signature), widened to `i64` first, and `0` for `main(): ()!`.
-Since #2236's checker rule (E0085), these are the only two ok types that reach
+Under checker rule E0085, these are the only two ok types that reach
 this code — every other shape (`f64!`, `string!`, `bool!`, ...) is rejected at
 `bit check` before lowering ever runs, rather than silently returning `0` with
 a float ok value handed back in `d0`/`xmm0` and read out of `x0`/`eax` as
 whatever was left there.
 
-Before #2235 this row did not exist in code at all: `fail` set the slot, nothing
-read it, and a failed `main` exited 0 with an empty stderr.
+This row did not always exist in code: `fail` used to set the slot with
+nothing reading it, and a failed `main` exited 0 with an empty stderr.
 
 ---
 
@@ -2633,7 +2638,8 @@ live-task registry are both future work. This is safe today only because
 nothing yet emits `bit_rt_safepoint` calls (no codegen exists that does), so
 there is no live stack-held reference for the gap to lose. The gap becomes
 real the moment codegen starts inserting safepoint polls, and closing it
-(stack maps + task registry) is that ticket's job, not this one's.
+(stack maps + task registry) is separate future work, not part of what this
+section defines.
 
 ---
 
@@ -2678,7 +2684,7 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   runs. The trace is opt-in, not default: the `//
   panic` golden mode (`_tests_/cases/*.bit`) compares stderr byte-for-byte, so
   an always-on trace would need every `.expected` file updated in the same
-  change. See `runtime/root/backtrace.bit` (#3285, #3820) for the walker and
+  change. See `runtime/root/backtrace.bit` for the walker and
   its degrade rules — an unresolvable frame prints a raw `0x<hex>` address, a
   `format_version` mismatch untrusts the whole table for that process, and a
   missing or corrupt `name_hdr_ptr` omits just the name and keeps
@@ -2690,7 +2696,7 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   the process. The panic boundary below does not change this: it discards
   the intervening frames without running anything in them.
 
-**The panic boundary (#4739, epic).** Six further symbols, specified here and
+**The panic boundary.** Six further symbols, specified here and
 provided by `runtime/sched/boundary.bit` and the three `runtime/root/<os>/io.bit`
 providers (not yet in the tree — this section is the contract they are written
 against):
@@ -2729,7 +2735,7 @@ bit_rt_fatal(msg: *const RtBytes)               -> noreturn
   last `take` recorded. They are meaningful only in the armed frame after a
   resume, and the message bytes must be copied out immediately: the record is
   reused by the next `take` and dies with the arming frame.
-- **The message bytes live in the record, copied at `take` time (#4957).**
+- **The message bytes live in the record, copied at `take` time.**
   `take` does not keep the caller's `*const RtBytes`: it copies the bytes it
   points at into the record and `bit_rt_panic_boundary_msg` answers a
   `{ptr, len}` header inside that same record. It must, because a
@@ -2769,7 +2775,7 @@ and linux have one. That is existing state, recorded here so the per-OS work
 is not read as three-quarters finished; adding a fourth windows door is a
 separate decision, not part of wiring the boundary.
 
-### 12.1 Backend-injected, argument-free panics (#2016, #2018, #2240, #3078)
+### 12.1 Backend-injected, argument-free panics
 
 ```
 bit_rt_panic_div_zero()  -> noreturn
@@ -2800,8 +2806,8 @@ reporting a broken invariant.
   which operation trapped. Unlike the other panics in this section, the
   backend's check here is gated on debug-mode codegen, not unconditional: in a
   release build the operation wraps and this symbol is never called. Not yet
-  called from any codegen path (#3080-#3085 add the checked codegen; this
-  ticket, #3078, only adds the callable symbol).
+  called from any codegen path (a later change adds the checked codegen; this
+  one only adds the callable symbol).
 - `bit_rt_panic_nil_call` — an indirect call through a nil function value
   (SPEC.md §13.4, §18.4: "call of a `nil` function"). The backend tests the
   closure cell for null immediately before loading its `{code, env}` fields
@@ -2820,7 +2826,7 @@ call can appear (including inside another `@nosplit` function, exactly as
 the caller on the branch that reaches them, so nothing after the call site
 needs to treat their argument-free signature as clobbering anything live.
 
-**The reason code (#4739).** These four doors cannot build a string and must
+**The reason code.** These four doors cannot build a string and must
 not allocate, so what they hand `bit_rt_panic_boundary_take` (§12) is a small
 integer naming the reason instead of a message:
 
@@ -2889,20 +2895,20 @@ instant it reads it.
 bit_rt_fs_open(path, write: bool) -> i64        // fd, or -1
 bit_rt_fs_append(path)            -> i64        // fd opened O_APPEND, or -1
 bit_rt_fs_read_all(fd)            -> string     // whole file (regular files only)
-bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
+bit_rt_fs_read_all_failed()       -> bool       // see below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
-bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or negative (#3463)
-bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative (#3463)
-bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; fd, or -1 (#3533)
-bit_rt_fs_open_nofollow_w(words, n) -> i64      // read-only, refuses a symlinked final component; fd, or -1 (#4720)
-bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
-bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1 (#4016)
-bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1 (#4016)
-bit_rt_fs_lock(fd, exclusive: bool, blocking: bool) -> i64  // whole-file advisory lock; 0/-1/-2 (#4014)
-bit_rt_fs_unlock(fd)              -> i64        // release; 0, or -2 (#4014)
-bit_rt_fs_sync_dir_w(words, n)    -> i64        // fsync the directory itself; 0, or -1; windows always 0 (#4017)
-bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
+bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or negative
+bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative
+bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; fd, or -1
+bit_rt_fs_open_nofollow_w(words, n) -> i64      // read-only, refuses a symlinked final component; fd, or -1
+bit_rt_fs_sync(fd)                -> i64        // 0, or -1
+bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1
+bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1
+bit_rt_fs_lock(fd, exclusive: bool, blocking: bool) -> i64  // whole-file advisory lock; 0/-1/-2
+bit_rt_fs_unlock(fd)              -> i64        // release; 0, or -2
+bit_rt_fs_sync_dir_w(words, n)    -> i64        // fsync the directory itself; 0, or -1; windows always 0
+bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
 bit_rt_fs_is_dir(path)            -> bool
@@ -2912,8 +2918,8 @@ bit_rt_fs_rename(oldPath, newPath) -> i64       // 0, or -1
 bit_rt_fs_chmod(path, mode: i64)  -> i64        // permission bits; 0, or -1; windows maps only owner-write
 bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 bit_rt_fs_is_symlink_w(words, n)  -> bool        // path is a symlink itself (readlink-based)
-bit_rt_fs_stat_w(words, n, out)   -> i64        // fills `out`, follows a trailing symlink; 0 or -errno (#2153)
-bit_rt_fs_lstat_w(words, n, out)  -> i64        // fills `out`, does not follow;             0 or -errno (#2153)
+bit_rt_fs_stat_w(words, n, out)   -> i64        // fills `out`, follows a trailing symlink; 0 or -errno
+bit_rt_fs_lstat_w(words, n, out)  -> i64        // fills `out`, does not follow;             0 or -errno
 ```
 
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
@@ -2936,32 +2942,32 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   symbol `bit_rt_fs_read_all_failed()` (below); a genuine empty file (`lseek`
   reports 0) never does — `string` has no nil sentinel to carry the
   distinction in-band, which is why the flag exists at all. The one earlier
-  attempt to add this signal (#2994) was reverted because the pinned stage0's
+  attempt to add this signal was reverted because the pinned stage0's
   `libbitrt.a` predated the symbol: `std/fs` referencing it made the
   clean-tree driver build fail `E0078` against the OLD pinned archive, and
   repinning to a release that predates the symbol cannot make it appear
-  (#2996) — a cycle, not a wait. **#3065 and #2996 broke the cycle in two
-  passes.** Pass 1 (#3065) re-added `bit_rt_fs_read_all_failed` and its setter
+  — a cycle, not a wait. **The two-pass landing pattern broke the cycle in two
+  passes.** Pass 1 re-added `bit_rt_fs_read_all_failed` and its setter
   (`runtime/root/slots.bit`) with no caller anywhere on the driver's import
   path, so the clean-tree build kept linking the OLD pinned archive without
   complaint; that landed in `v0.1.17`. Once the stage0 pin moved to `v0.1.17`,
-  pass 2 (#2996) wired `rtFsReadAll`'s `end < 0` and `s == 0` branches to the
+  pass 2 wired `rtFsReadAll`'s `end < 0` and `s == 0` branches to the
   setter and `stdlib/fs/fs.bit`'s `File.readAll` to the getter — `fail
   newError(...)` on a read failure, same as `open`/`create`/`write`. The read
   loop's own I/O-error paths (an interrupted-but-failed read, or the retry
   budget exhausted before EOF) are NOT wired to the flag; those still trim
   silently to the bytes actually read. A short read — EOF before `end`, or an
-  I/O error partway through — is NEVER zero-padded (#2990): the result is the
+  I/O error partway through — is NEVER zero-padded: the result is the
   string TRIMMED to the bytes actually verified read, retrying on `EINTR` up
   to `maxReadAllRetries` (1000) times.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
-- `fs_pread_w`/`fs_pwrite_w` (#3463) transfer bytes at an EXPLICIT offset
+- `fs_pread_w`/`fs_pwrite_w` transfer bytes at an EXPLICIT offset
   instead of a shared file cursor, so several green threads may issue
   positional calls on the same `fd` concurrently without racing over
   position — the reason this pair exists rather than a stateful `seek`, which
   a shared fd cannot safely carry across concurrent callers. `buf` is a
-  `[]byte`'s packed backing store (§2, #3121/#3226), the same convention
+  `[]byte`'s packed backing store (§2), the same convention
   `bit_rt_fs_is_symlink_w` uses, not a Bit `string`. Darwin and Linux use
   `pread(2)`/`pwrite(2)` — Linux issues the raw `pread64`/`pwrite64` syscall
   numbers directly, no libc; Darwin calls the bare libc externs. Windows uses
@@ -2973,17 +2979,17 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   `pread`/`pwrite`. All three return the byte count transferred, or a
   negative value on any I/O error; a SHORT count — including 0 at end of
   file — is never an error, exactly as `fs_read` above. **No `stdlib/`
-  caller exists yet** — the same `tools/build/` bootstrap cycle #2153's
-  `stat_w`/`lstat_w` bullet and #3462's `fs_sync` bullet both describe:
+  caller exists yet** — the same `tools/build/` bootstrap cycle the
+  `stat_w`/`lstat_w` bullet and the `fs_sync` bullet both describe:
   `tools/build/artifacts.bit` imports `std/fs`, which the PINNED stage0
   compiles against its own frozen `libbitrt.a`, so a `stdlib/fs/fs.bit`
   reference to either symbol breaks the driver bootstrap with E0078 on every
   fresh clone until a release ships this commit and the pin moves. This
-  landing is pass 1 of 2 (the #3065/#3462/#3489 pattern): the runtime
+  landing is pass 1 of a deliberate two-pass sequence: the runtime
   primitives only, no consumer. Pass 2 (`File.readAt`/`File.writeAt` methods
-  in `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
+  in `stdlib/fs/fs.bit`) is a follow-up, gated on a release containing
   this commit and a stage0 repin to it.
-- `fs_sync` (#3462) flushes `fd`'s already-written bytes to stable storage,
+- `fs_sync` flushes `fd`'s already-written bytes to stable storage,
   0 on success, -1 on any failure — a successful `fs_write` only reaches the
   OS page cache, and pulling power before `fs_sync` returns can still lose
   it. **Bare `fsync(2)` is not durable on Darwin**: it stops at the drive's
@@ -2996,16 +3002,16 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   call, no fallback needed. Windows' provider calls `FlushFileBuffers`,
   which per MSDN forces the OS cache and any intermediate hardware cache to
   the physical device. **No `stdlib/` caller exists yet** — the same
-  `tools/build/` bootstrap cycle #2153's `stat_w`/`lstat_w` bullet describes
+  `tools/build/` bootstrap cycle the `stat_w`/`lstat_w` bullet describes
   below applies here too: `tools/build/artifacts.bit` imports `std/fs`, which
   the PINNED stage0 compiles against its own frozen `libbitrt.a`, so a
   `stdlib/fs/fs.bit` reference to this symbol breaks the driver bootstrap
   with E0078 on every fresh clone until a release ships this commit and the
-  pin moves. This landing is pass 1 of 2 (the #3065 pattern): the runtime
+  pin moves. This landing is pass 1 of a deliberate two-pass sequence: the runtime
   primitives only, no consumer. Pass 2 (a `File.sync()` method in
-  `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
+  `stdlib/fs/fs.bit`) is a follow-up, gated on a release containing
   this commit and a stage0 repin to it.
-- `fs_truncate`/`fs_size` (#4016) set and read `fd`'s length. Darwin and
+- `fs_truncate`/`fs_size` set and read `fd`'s length. Darwin and
   Linux call `ftruncate(2)`/`fstat(2)` — Darwin via the bare libc externs,
   Linux via the raw `ftruncate`/`fstat` syscall numbers, no libc. Windows'
   `fs_truncate` saves the handle's current position with
@@ -3021,16 +3027,16 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   a negative value on any failure — the OS itself rejects a negative `size`
   before `fs_truncate`'s own body runs, verified on Darwin and Linux (`-1`,
   no crash). **No `stdlib/` caller exists yet** — the same `tools/build/`
-  bootstrap cycle #2153's `stat_w`/`lstat_w` bullet below describes:
+  bootstrap cycle the `stat_w`/`lstat_w` bullet below describes:
   `tools/build/artifacts.bit` imports `std/fs`, which the PINNED stage0
   compiles against its own frozen `libbitrt.a`, so a `stdlib/fs/fs.bit`
   reference to either symbol breaks the driver bootstrap with E0078 on every
   fresh clone until a release ships this commit and the pin moves. This
-  landing is pass 1 of 2 (the #3065 pattern): the runtime primitives only,
+  landing is pass 1 of a deliberate two-pass sequence: the runtime primitives only,
   no consumer. Pass 2 (`File.truncate()`/`File.size()` methods in
-  `stdlib/fs/fs.bit`, #4215) is a follow-up ticket, gated on a release
+  `stdlib/fs/fs.bit`) is a follow-up, gated on a release
   containing this commit and a stage0 repin to it.
-- `fs_lock`/`fs_unlock` (#4014) take/release a WHOLE-FILE advisory lock on
+- `fs_lock`/`fs_unlock` take/release a WHOLE-FILE advisory lock on
   `fd`, exclusive or shared, blocking or non-blocking. Darwin and Linux both
   call `flock(2)` — Darwin via the bare libc extern, Linux via the raw
   syscall number (73 on x86-64, 32 on aarch64) — deliberately NOT
@@ -3041,7 +3047,7 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   conflict with the first under `fcntl` — `flock`'s lock is keyed on the
   OPEN FILE DESCRIPTION instead, so two fds from two separate opens
   correctly contend even within one process, which the stdlib-level
-  acceptance test (once #4296 lands it) exercises directly. This also means
+  acceptance test (once it lands) exercises directly. This also means
   Unix needs no explicit unlock-on-close: `flock` releases automatically
   when the last fd referring to that open file description closes, so
   `fs_close` needs no change. Windows has no such guarantee (undocumented
@@ -3051,11 +3057,11 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   has no separate whole-file lock call — so the STDLIB `close()` wrapper
   MUST call `fs_unlock` before `fs_close` on that platform once it lands.
   `fs_lock` blocks indefinitely when `blocking` is true (bracketed with
-  `gcSyscallBegin`/`gcSyscallEnd`, #2207, plus a bounded `EINTR` retry on
+  `gcSyscallBegin`/`gcSyscallEnd`, plus a bounded `EINTR` retry on
   Darwin/Linux, the same shape `fs_read_all`'s loop uses); non-blocking is a
   single unbracketed attempt. Both return a normalized THREE-WAY result,
-  deliberately not the raw `-errno` convention #2343 documents for
-  `stat_w`/`lstat_w`: `0` on success; `-1` only when `blocking` is false and
+  deliberately not the raw `-errno` convention `stat_w`/`lstat_w` use:
+  `0` on success; `-1` only when `blocking` is false and
   the lock is held elsewhere (`EWOULDBLOCK` on Darwin/Linux,
   `ERROR_LOCK_VIOLATION` on Windows) — the expected outcome for
   `tryLock`/`tryLockShared`, not a failure; `-2` for any other error. Each
@@ -3078,26 +3084,26 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   defined and `LockFileEx`/`UnlockFileEx`/`GetLastError` resolve as PE
   imports. **No `stdlib/` caller exists yet**, the same `tools/build/`
   bootstrap cycle the `fs_truncate`/`fs_size` bullet above describes: this
-  landing is pass 1 of 2 (the #3065 pattern), the runtime primitives only,
+  landing is pass 1 of a deliberate two-pass sequence, the runtime primitives only,
   no consumer. Pass 2 (`File.lock()`/`tryLock()`/`lockShared()`/
-  `tryLockShared()`/`unlock()` in `stdlib/fs/fs.bit`, #4296) is a follow-up
-  ticket, gated on a release containing this commit and a stage0 repin to it.
-- `fs_open_nofollow_w` (#4720) opens the `n` path bytes at `words` read-only
+  `tryLockShared()`/`unlock()` in `stdlib/fs/fs.bit`) is a follow-up,
+  gated on a release containing this commit and a stage0 repin to it.
+- `fs_open_nofollow_w` opens the `n` path bytes at `words` read-only
   and REFUSES the open when the FINAL path component is a symlink, instead of
   following it. It exists because no composition of the existing primitives
   can do this: `fs_is_symlink_w` answers about a PATH, so a caller that probes
   first and calls `fs_open` second loses to whoever can replace that name in
-  between, which is exactly the window #4554's owner ruling ("O_NOFOLLOW on
-  the final open plus fstat") closes. Packed-bytes `(words, n)`, like
+  between, which is exactly the window this primitive closes by using
+  O_NOFOLLOW on the final open plus fstat. Packed-bytes `(words, n)`, like
   `fs_open_rw_w`/`fs_is_symlink_w`/`fs_stat_w`/`fs_lstat_w` above, for the
   same §11.7 reason. Only the FINAL component is protected: an intermediate
   directory component that is a symlink is still traversed, exactly as
   `open(2)`'s own `O_NOFOLLOW` specifies. A DIRECTORY is refused on all three
-  platforms, matching `fs_open`'s #2149 guard — `O_RDONLY` on a directory
+  platforms, matching `fs_open`'s directory-refusal guard — `O_RDONLY` on a directory
   succeeds on darwin and linux and would hand back a `File` no read can fill.
   Darwin and Linux pass `O_NOFOLLOW` on the read-only open and let the kernel
   fail it with `ELOOP` — Darwin's value is `0x100`; Linux's is PER-ARCH
-  (`runtime/root/linux/fs.bit`, #5626): `0o400000` on x86_64, but aarch64 does
+  (`runtime/root/linux/fs.bit`): `0o400000` on x86_64, but aarch64 does
   NOT use `asm-generic/fcntl.h` for this bit — `arch/arm64/include/uapi/asm/
   fcntl.h` overrides it to `0o100000`, and `0o400000` is `O_LARGEFILE` there
   instead, a harmless no-op that silently let the open follow the symlink.
@@ -3112,11 +3118,11 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   reparse point is not this primitive's contract on any platform. The return
   is a flat fd/handle or -1 — a malformed path, a directory, a symlink and an
   ordinary open failure are indistinguishable to the caller. **No `stdlib/`
-  caller exists yet**: this landing is pass 1 of 2 (the #3065 pattern), the
+  caller exists yet**: this landing is pass 1 of a deliberate two-pass sequence, the
   runtime primitive only, for the same `tools/build` bootstrap cycle the
-  `fs_sync_dir_w` bullet below describes — pass 2 is #4554's `std/fs` half,
+  `fs_sync_dir_w` bullet below describes — pass 2 is the `std/fs` half,
   gated on a stage0 repin past this commit.
-- `fs_sync_dir_w` (#4017) fsyncs the DIRECTORY named by the `n` path bytes at
+- `fs_sync_dir_w` fsyncs the DIRECTORY named by the `n` path bytes at
   `words`, not a file inside it — durability for the directory ENTRY a
   newly created file needs, not for that file's contents. `fs_sync`ing a
   freshly written file only guarantees its own blocks reach disk; on ext4
@@ -3145,12 +3151,12 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   file — a regular-file path opens and fsyncs successfully like any other
   fd, which is why that check belongs to the `stdlib/` caller (mirroring
   `readDir`'s own `is_dir` guard before it lists), not to this primitive.
-  The caller is `std/fs`'s `syncDir` (#4312, pass 2 of the #3065 pattern),
+  The caller is `std/fs`'s `syncDir` (pass 2 of the same two-pass sequence),
   which landed once the 0.13.0 pin carried this symbol in its own
   `libbitrt.a` — until then declaring the `extern` in `stdlib/fs/fs.bit`
   broke `tools/build`'s cold bootstrap with E0078, the same cycle the
   `fs_truncate`/`fs_size` bullet above describes.
-- `fs_cwd` (#3501) takes NO argument — nothing to encode through
+- `fs_cwd` takes NO argument — nothing to encode through
   `fsPathZ`/`checkedPathW`. It shares that with `fs_read_all_failed` above,
   the family's only other zero-argument entry point. Darwin and Linux both
   call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
@@ -3164,14 +3170,14 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   `GetCurrentDirectoryW` returning 0, or either result not fitting its
   platform's ceiling) — the same flat-failure shape `fs_open`/`fs_mkdir`
   already use, no companion out-of-band flag. **No `stdlib/` caller exists
-  yet** — the identical `tools/build/` bootstrap cycle #2153's and #3462's own
-  bullets describe: `tools/build/artifacts.bit` imports `std/fs`, which the
+  yet** — the identical `tools/build/` bootstrap cycle the `stat_w`/`lstat_w`
+  and `fs_sync` bullets describe: `tools/build/artifacts.bit` imports `std/fs`, which the
   PINNED stage0 compiles against its own frozen `libbitrt.a`, so a
   `stdlib/fs/fs.bit` reference to `bit_rt_fs_cwd` breaks the driver bootstrap
   with E0078 on every fresh clone until a release ships this commit and the
-  pin moves. This landing is pass 1 of 2 (the #3065 pattern): the runtime
+  pin moves. This landing is pass 1 of a deliberate two-pass sequence: the runtime
   primitive only, no consumer. Pass 2 (a `std/fs` function surfacing it) is a
-  follow-up ticket, gated on a release containing this commit and a stage0
+  follow-up, gated on a release containing this commit and a stage0
   repin to it.
 - `fs_read` reads once and returns what it got, so it is the primitive for
   pipes, sockets, and stdin — none of which have a size to seek to.
@@ -3182,23 +3188,23 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
 - `exists` opens `path` rather than probing directory-ness — Darwin via
   `access(F_OK)`, Linux via an `open` immediately closed again on success — so
   a mode-000 file, or a directory hit by an fd-exhausted process, still
-  reports present; only `ENOENT`/`ENOTDIR` mean genuinely absent (#2114).
+  reports present; only `ENOENT`/`ENOTDIR` mean genuinely absent.
   `is_dir` is the one that actually distinguishes a directory: Darwin's
   `opendir` succeeding, Linux's `getdents64` succeeding on the opened fd.
 - `is_symlink_w` was the FIRST path-taking `bit_rt_fs_*` entry point to drop
-  the Bit `string` argument (#2152); `open_rw_w`, `stat_w`, `lstat_w` and
+  the Bit `string` argument; `open_rw_w`, `stat_w`, `lstat_w` and
   `sync_dir_w` have since followed it. Its caller is `std/fs`, which can reach
   a runtime symbol only through an `extern function` (SPEC §11.7), and §11.7
   admits no `string` across that boundary — so `words` is the raw backing
-  store of a Bit `[]byte` instead, `n` **packed** bytes (§2, #3121/#3226), not
+  store of a Bit `[]byte` instead, `n` **packed** bytes (§2), not
   NUL-terminated and not an `RtBytes`. The provider copies those bytes into
   its own NUL-terminated buffer before probing it, applying the same
   `max_path` and embedded-NUL rejections every other path-taking entry point
-  applies (#2146). It answers with `readlink`, not `lstat` + `S_IFLNK`:
+  applies. It answers with `readlink`, not `lstat` + `S_IFLNK`:
   `readlink` succeeds only on a symbolic link and needs no POSIX `stat`
   structure layout, so a dangling link still answers `true` — the link exists
   whether its target does or not.
-- `stat_w`/`lstat_w` (#2153) share `is_symlink_w`'s `words`/`n` path
+- `stat_w`/`lstat_w` share `is_symlink_w`'s `words`/`n` path
   encoding, for the identical reason — a `std/fs` caller can reach them only
   through `extern fn`, which admits no `string` (SPEC §11.7). `out` is a
   caller-owned 5-word buffer the provider fills in fixed order: `size`,
@@ -3207,26 +3213,26 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   symlink (`isSymlink` is therefore always 0 in its result); `lstat_w` does
   not, and reports whether `words` itself is a link. Unlike every other
   `bit_rt_fs_*` primitive above, a failure is **not** a flat `-1`: the return
-  is 0 on success or `-errno` on failure, the convention #2343 gives the net
-  primitives. Darwin's `stat`/`lstat` set a *positive* errno reachable
+  is 0 on success or `-errno` on failure, the same convention the net
+  primitives use. Darwin's `stat`/`lstat` set a *positive* errno reachable
   through `__error()`; the provider negates it. Linux's raw `syscall`
   already returns `-errno` directly on failure, passed through unchanged.
-  **No `stdlib/` caller exists yet.** #2153 landed once before (`03cbbd41`)
+  **No `stdlib/` caller exists yet.** This landed once before (`03cbbd41`)
   wiring both the runtime and a `stdlib/fs` consumer in one commit, and was
   reverted (`0dd25c35`): the pinned stage0 that compiles `tools/build/` links
   its own frozen release runtime, which had never shipped these symbols, so
   the `stdlib/` reference broke `./make`'s driver bootstrap with E0078 on
-  every fresh clone. This landing is pass 1 of 2 (the #3065 pattern): the
+  every fresh clone. This landing is pass 1 of a deliberate two-pass sequence: the
   runtime primitives only, no consumer, so nothing on the driver's import
   path references them. Pass 2 (the `FileInfo` class and `stat`/`lstat`
-  wrappers in `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release
+  wrappers in `stdlib/fs/fs.bit`) is a follow-up, gated on a release
   containing this commit and a stage0 repin to it.
 - `fs_rename` is the only `bit_rt_fs_*` entry point that needs two encoded
   paths live at the same time, and that is why it is backed by two separate
   scratch buffers instead of the one every other path-taking entry point
   shares. `oldPath` still goes through `fsPathZ`/`checkedPathZ` into the usual
   module-level `fsPathBuf`; `newPath` goes through a second, distinct pair —
-  `fsPathZ2`/`checkedPathZ2` into `fsPathBuf2` (`runtime/root/fs.bit`, #2712)
+  `fsPathZ2`/`checkedPathZ2` into `fsPathBuf2` (`runtime/root/fs.bit`)
   — so `rename(2)`/`sysRename` receives two pointers that can never alias.
   Encoding `newPath` through the shared `fsPathBuf` a second time, the way
   every single-path entry point does, would overwrite `oldPath`'s bytes
@@ -3281,7 +3287,7 @@ the handle of a string CONSTANT, which is static for the life of the process.
 - **Growth.** At `(used+1)*8 >= cap*7` the table doubles and rehashes, dropping
   tombstones (`used` resets to `len`). This keeps an EMPTY slot present at all
   times, so every probe terminates in `<= cap` steps (a statically bounded loop).
-- **Capacity hint** (`map<K,V>(n)`, SPEC §11.2/§12.9, #4064). `map_new`'s
+- **Capacity hint** (`map<K,V>(n)`, SPEC §11.2/§12.9). `map_new`'s
   `cap_hint` picks the initial `cap` directly instead of starting at
   `mapInitCap` and growing there: the smallest power of two with
   `cap*7 > n*8`, so `n` entries can be inserted without an immediate grow.
@@ -3296,7 +3302,7 @@ the handle of a string CONSTANT, which is static for the life of the process.
 - **Two-result read** (`let (v, ok) = m[k]`, §12.6) is ONE probe: `map_slot`
   returns the key's slot or `-1`, `ok` is `slot >= 0`, and `map_val_at` reads the
   value word (yielding `0` for the `-1`). It used to be `map_get` + `map_has` —
-  two probes of the same key for one expression (#4019).
+  two probes of the same key for one expression.
 - **Iteration** (`for (k, v) of m`, §13.5) is by slot cursor: `map_iter_init`
   returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
   then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
@@ -3326,7 +3332,7 @@ constant, one byte per body word — and passes it at the comparison site and to
 's'              a `string` handle, compared and hashed BY ITS BYTES
 'r'              an opaque reference (slice, map, chan, func, interface),
                  compared and hashed BY IDENTITY
-'e' block* ')'   a boxed payload enum (#4341): `block` is one `"{...}"`
+'e' block* ')'   a boxed payload enum: `block` is one `"{...}"`
                  payload program per variant, in declaration order, over the
                  words past the tag (§1.2). The tag is read directly and
                  compared/mixed by the dispatcher; which block applies is a
@@ -3352,8 +3358,8 @@ constant, one byte per body word — and passes it at the comparison site and to
   IEEE. This keeps composite equality reflexive — a key not equal to itself
   could never be found or deleted — and matches what a bare `map<f64,int>` key
   already does. `+0.0` and `-0.0` therefore differ in a field.
-- **A field whose type is not comparable at all never reaches lowering** as of
-  #4341: the checker's `vComparable` (`compiler/validateattr.bit`) recurses into
+- **A field whose type is not comparable at all never reaches lowering:**
+  the checker's `vComparable` (`compiler/validateattr.bit`) recurses into
   a class's fields and a boxed enum's variant payloads and rejects such a type
   at compile time, naming the offending field or variant. `'r'` remains the
   depth/budget backstop below for a field that IS comparable but too deep or
@@ -3401,7 +3407,7 @@ reinterpret an f64/f32's IEEE-754 bit pattern as a same-width unsigned integer
 with no value conversion** (`FMOV`/`movq` on both targets). They are the only
 way a Bit program can observe `-0.0` or distinguish two NaN payloads, since
 `==` reports `-0.0 == +0.0` as true and `NaN == NaN` as false either way.
-Since #1442 the compiler's own `floatBits`/`float32Bits` primitives lower to
+The compiler's own `floatBits`/`float32Bits` primitives lower to
 an inline `Op.Bitcast`, not an `ir.RtFn` call (`compiler/lowerprim.bit`), so
 neither pinned symbol is reached by generated code — `_tests_/bit/rootpins/`
 proves that (§9). The exports (`runtime/root/floats.bit:121-129`) remain
@@ -3469,7 +3475,7 @@ binary the caller execs directly. The child inherits the captured `envp`. It is
 `fork` + immediate `execve` (Linux: raw syscalls; Darwin: libSystem), the only
 work between fork and exec, so it is safe with scheduler worker threads live.
 Result encoding, the same one the bounded pair below uses minus the `-2` case it
-has no deadline to produce (#2019):
+has no deadline to produce:
 
 ```
  >= 0     child exited normally with this code (0-255)
@@ -3483,7 +3489,7 @@ then crashed indistinguishable from one that never started — `bit run` reporte
 every segfault as "could not run". A caller that only tests `code < 0` keeps its
 old behaviour; one that wants the distinction subtracts.
 
-**`bit_rt_os_run` gained `argv` in place (#2399, `bit run <src> [args...]`)
+**`bit_rt_os_run` gained `argv` in place (`bit run <src> [args...]`)
 rather than through a new symbol beside it.** A new symbol was tried first and
 reverted: `compiler/build.bit` — part of `compiler/`'s own self-hosting
 source — is what needed to call it, and `compiler/`'s own build (`./make
@@ -3514,14 +3520,14 @@ The runtime builds this argv vector into a FIXED buffer (Power of 10 rules
 bytes each (`runtime/root/os.bit`'s consts). Above either bound the call is
 REJECTED — `bit_rt_os_run` returns `-1`, the same sentinel a spawn failure
 uses — never truncated: a silently shortened argument would be the same
-class of bug #2023 closed for a silently dropped one. `compiler/build.bit`'s
+class of bug as a silently dropped one. `compiler/build.bit`'s
 `runMaxForwardedArgs` mirrors the count so `bit run` itself reports a
 specific, named rejection before ever reaching the runtime's generic one.
 
 `bit_rt_host_target` returns the ordinal of the `BuildTarget` this binary's own
 host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos` — the enum in
 compiler/build.bit). The runtime archive is compiled once per target, so the answer
-is fixed when the archive is built; the Bit provider (#1635) takes the OS from its
+is fixed when the archive is built; the Bit provider takes the OS from its
 own provider directory and the arch from an `asm` per-arch immediate, the code it
 replaces read `builtin.target`. It is the default `bit build`/`bit run` target when
 `--target` is absent, so a wrong ordinal silently mis-targets the compiler.
@@ -3540,9 +3546,9 @@ inherited value). `bit test` calls it once per discovered test so the test
 binary's synthetic `main` (compiler/testgen.bit) dispatches to test `idx`.
 
 **`bit_rt_os_run_bounded`/`bit_rt_os_run_test_bounded` are `os_run`/`os_run_test`
-with a wall-clock deadline (#1744).** `os_run`'s synchronous `waitpid` blocks the
+with a wall-clock deadline.** `os_run`'s synchronous `waitpid` blocks the
 calling green thread forever if the child never exits, exactly the hazard
-the harnesses needed closed (#1637/#1652) —
+the harnesses needed closed —
 and one a Bit harness needs closed the same way, since nothing
 else in this ABI lets Bit code bound a subprocess wait. `os_run`/`os_run_test`
 themselves are unchanged: `bit run`/`bit test` still depend on their unbounded
@@ -3560,8 +3566,8 @@ race-free idiom) with pgid equal to its own pid, so anything it or a wrapper
 it execs (e.g. a harness's `/bin/sh` script) later forks inherits that same
 group unless it detaches on its own. **If the deadline elapses before the
 child exits, the parent `SIGKILL`s the whole group, not just the direct
-child, and reaps the direct child before returning** (#2986: a single-pid
-kill left a grandchild — a compile the direct child's wrapper shell had
+child, and reaps the direct child before returning** (a single-pid
+kill used to leave a grandchild — a compile the direct child's wrapper shell had
 spawned — running indefinitely, reparented to pid 1, after the timeout had
 already been reported). Result encoding (three outcomes in one `i64`, no
 separate signal channel):
@@ -3584,10 +3590,10 @@ deadline check inside the loop is what actually ends every real call.
 
 **`hostTarget()` and `auxv()` are compiler `prim_rt_fns` entries — the CALLER side
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
-that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
-body called the primitive would therefore be a call to itself, now that #1369
-has dropped the `_root` infix (the pin cycle `_tests_/bit/rootpins/` guards). Both are
-PORTED regardless — `auxv` by #1617, `host_target` by #1635 — each by finding the
+that lowering stays permanent for both (SEAM 6).** A Bit *provider* whose
+body called the primitive would therefore be a call to itself, now that the
+`_root` infix has been dropped (the pin cycle `_tests_/bit/rootpins/` guards). Both are
+PORTED regardless — each by finding the
 answer somewhere other than the primitive:
 
 - `host_target` is a **property of the emit**, not a runtime computation. The
@@ -3597,7 +3603,7 @@ answer somewhere other than the primitive:
   `--target` (`libbitrtPath`), a cross-built binary reports the target it was
   built FOR, not the host it was built ON.
 
-  **The provider is `runtime/root/linux/os.bit` or `runtime/root/darwin/os.bit` (#1635), selected by
+  **The provider is `runtime/root/linux/os.bit` or `runtime/root/darwin/os.bit`, selected by
   the OS axis below.** The old claim here, that a running Bit program has no
   compile-time `builtin` and so this could never be ported, mistook "no `builtin`"
   for "no compile-time knowledge". The emit carries both axes the ordinal needs:
@@ -3615,13 +3621,13 @@ answer somewhere other than the primitive:
   aarch64-only, so (provider, arch) names all three exactly; Darwin therefore needs
   no `asm` at all and returns the literal 2. The provider must never call
   `hostTarget()` — that primitive lowers to a call to this very symbol, now that
-  #1583 has dropped the `_root` infix (the pin cycle `_tests_/bit/rootpins/`
+  the `_root` infix has been dropped (the pin cycle `_tests_/bit/rootpins/`
   guards) — and an `asm` immediate is inline by construction, so there is no
   callee for the rename to redirect. Verified running on all three targets, not
   just by disassembly:
   `_tests_/stress/roothost{darwin,linux}`.
-- `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
-  `bit_rt_auxv`'s provider is `runtime/root/os.bit` (#1617). The kernel places the
+- `auxv` is a **process-entry fact owned by the boot layer (SEAM 3)**, and
+  `bit_rt_auxv`'s provider is `runtime/root/os.bit`. The kernel places the
   auxiliary vector on the initial stack, unreachable once any Bit code runs, so only
   the entry (`rtStartMain`) can capture it — a single writer, Linux-only;
   `machoMain` captures none. The Bit Linux entry walks past `envp`'s NULL to the
@@ -3630,7 +3636,7 @@ answer somewhere other than the primitive:
   the reader `bit_rt_auxv` hands that cell back. This is the move promised
   above — ownership of the cell moved from `runtime/root/root.bit`'s `g_auxv`
   to the boot layer (the old `g_auxv`/`bit_rt_auxv` stayed live only until the
-  #1369 archive swap made the Bit entry the real one, which it now is). The reader
+  archive swap made the Bit entry the real one, which it now is). The reader
   reads `gAuxv` DIRECTLY, never through the `auxv()` primitive, precisely to avoid
   the self-reference the pin-cycle gate forbids; `runtime/auxv` still does the scan
   (`getauxval`) over what the reader returns, and `runtime/thread/linux` reads
@@ -3657,7 +3663,7 @@ bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
-**THE PEER ADDRESS IS PACKED, NOT A DOTTED QUAD (#4525, #4526).**
+**THE PEER ADDRESS IS PACKED, NOT A DOTTED QUAD.**
 `bit_rt_net_peer_ip_w(fd)` returns the connected peer's IPv4 address with the
 FIRST OCTET IN THE HIGH BYTE — 127.0.0.1 is `0x7F000001`, 2130706433 — or `-1`
 for every "there is no peer": an unconnected or listening socket (ENOTCONN), a
@@ -3670,7 +3676,7 @@ not an error.
 It is packed rather than formatted, unlike `bit_rt_net_udp_sender_host` below,
 so that all three wrappers stay `@nosplit`: formatting means allocating a
 managed octet scratch and a string, which costs four entries in
-`_tests_/bit/pollfree`'s REVIEWED exception list (§5's #1656 hazard — a raw GC
+`_tests_/bit/pollfree`'s REVIEWED exception list (§5's hazard of a raw GC
 address held across a poll). `std/net`'s `Conn.peerIp()` spells the quad
 instead, where string interpolation is free.
 
@@ -3698,7 +3704,7 @@ and `compiler/pmfetch.bit` pulls `std/http` -> `std/net` into that build, so a
 freshly added predeclared name is `E0040: undefined name` there.
 
 **UDP** (connectionless). `recv` records the sender in per-OS module state,
-**one `[4]i64` sockaddr and one valid flag PER WORKER** (fixed by #3272) —
+**one `[4]i64` sockaddr and one valid flag PER WORKER** —
 `udpSenderBuf`/`udpSenderValid` (`runtime/net/linux/netabi.bit:407-408`;
 `runtime/net/darwin/netabi.bit:396-397`), indexed by the calling task's own
 worker id (`wkId`, §9's `runtime/sched/worker.bit`) via `udpSenderSlot()`,
@@ -3708,14 +3714,14 @@ threadlocal nor the §13 per-task scratch slot: the provider's own header
 says so outright ("THE LAST SENDER IS PER-WORKER SCRATCH, NOT A
 THREADLOCAL", `runtime/net/linux/netabi.bit:355`).
 
-**Before #3272 this was a single SHARED slot for the whole process** — sound,
+**This used to be a single SHARED slot for the whole process** — sound,
 the header used to claim, "only because v1 pins the scheduler to one worker
-(§5/§9)". That was false as soon as #1900 booted more than one worker: two
+(§5/§9)". That was false as soon as the scheduler could boot more than one worker: two
 green threads on two OS threads racing `recv` clobbered the shared flag —
 one succeeds and sets it, the other (a different worker) zeroes it, the
 first reads back "no sender" — and one such clobber on a listener socket
-wedged it permanently (`stdlib/quic/listener.bit`'s `catch _ { return }`,
-found via #1912). Per-worker slots fix the concurrent-task case; they remain
+wedged it permanently (`stdlib/quic/listener.bit`'s `catch _ { return }`).
+Per-worker slots fix the concurrent-task case; they remain
 sound under a single task's own migration between the two calls too,
 because `netRecvFrom`'s park is the only park in `udp_recv`, and the slot is
 chosen only AFTER that park returns — see the provider's own header comment
@@ -3741,7 +3747,7 @@ right trade for an occasional lookup (see the note in `runtime/net/net.bit`).
 bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on failure
 ```
 
-**Deadline-bounded dial/read/write (#2291).** A server that completes the
+**Deadline-bounded dial/read/write.** A server that completes the
 handshake (or accepts) and then never writes parks `bit_rt_net_read`/
 `bit_rt_net_dial` above forever — nothing bounds their park on the netpoller.
 These three give `std/net`'s `dialDeadline`/`readDeadline`/`writeDeadline` a
@@ -3751,7 +3757,7 @@ per-iteration" shape §19's `osForkExecWaitBounded` uses. They are reached
 through a plain `extern fn`, not the compiler-recognized builtins the four
 entries above lower to, because §11.7 admits no `string` across an `extern`
 boundary: `host`/the written body cross as a raw pointer into a packed Bit
-`[]byte`'s backing (§2, #3121/#3226) plus a length, and a read result is
+`[]byte`'s backing (§2) plus a length, and a read result is
 written into the caller's own such buffer rather than returned as a fresh
 string, the same shape §14's `bit_rt_fs_is_symlink_w` uses. `deadlineNs` is an
 absolute
@@ -3772,7 +3778,7 @@ poll/timer race to the scheduler: on each `EAGAIN` the deadline is checked,
 then the calling task sleeps a short, bounded slice (2ms, matching §19's
 `osPollNs`) via `schedSleepUntil` before retrying the syscall itself, capped
 at a one-hour wait ceiling (`netDeadlineMaxWaitNs`, `runtime/net/net.bit`) —
-kept independent of §19's own clamp on purpose (#3720): that one governs
+kept independent of §19's own clamp on purpose: that one governs
 test/gate wall-clock capacity, this one bounds a caller's own deadline input
 against a unit typo, a different reason with no tie to gate timing —
 expressed as a worst-case poll count (`netDeadlineMaxPolls`) so the loop is
@@ -3831,7 +3837,7 @@ lingering in memory.
 
 ---
 
-## 21b. Hardware crypto fast paths (`runtime/cryptohw` + `runtime/cryptohw`, task #1223)
+## 21b. Hardware crypto fast paths (`runtime/cryptohw` + `runtime/cryptohw`)
 
 x86-64 AES-NI / PCLMULQDQ / SHA-NI, runtime-CPUID-gated, reached from
 `stdlib/crypto/{aes,gcm,sha256}.bit` through plain `extern fn`
@@ -3911,7 +3917,7 @@ truncation, both applied outside `compress`).
 
 ---
 
-## 21c. ARM64 crypto hardware-capability detection (`runtime/cryptohw`, #2520, epic #1224)
+## 21c. ARM64 crypto hardware-capability detection (`runtime/cryptohw`)
 
 ```
 bit_rt_crypto_hwcaps() -> u64   // bit 0 = AES, bit 1 = PMULL, bit 2 = SHA2
@@ -3919,8 +3925,8 @@ bit_rt_crypto_hwcaps() -> u64   // bit 0 = AES, bit 1 = PMULL, bit 2 = SHA2
 
 The ARM64 mirror of §21b's x86-64 probes, and unlike them, a real
 implementation rather than an ABI-membership placeholder: it is the feature
-*detector* epic #1224's remaining children build the AESE/PMULL/SHA256H
-primitives and stdlib routing on top of.
+*detector* that the AESE/PMULL/SHA256H primitives and stdlib routing are
+built on top of.
 
 **Per-target behavior**, split across `runtime/cryptohw/{linux,darwin}/cryptohw.bit`
 because each side calls something the other cannot even compile (§19's
@@ -3949,7 +3955,7 @@ timebase makes.
 
 ---
 
-## 21d. ARM64 AES block cipher and key schedule (`runtime/cryptohw/armaes.bit`, #2522, epic #1224)
+## 21d. ARM64 AES block cipher and key schedule (`runtime/cryptohw/armaes.bit`)
 
 ```
 bit_rt_aes_hw_expand_key(key, keyBits, roundKeys)          // FIPS-197 KeyExpansion
@@ -3971,7 +3977,7 @@ file is compiled once per TARGET (x86_64-linux, aarch64-linux, aarch64-macos)
 the same way `runtime/syscalls/syscalls.bit` already is. Every exported
 function starts `if (onX64())`, which must COMPILE on x86_64 since Bit has no
 arch-conditional compilation (SPEC §11.8) — but reaching it there panics
-(#3669) rather than silently returning: nothing may legitimately call these
+rather than silently returning: nothing may legitimately call these
 pins on x86_64, so a call that gets there is the bug, and a silent no-op left
 the caller's buffer unmodified with no error, the worst failure mode a crypto
 primitive has.
@@ -3984,9 +3990,10 @@ of `bit_rt_crypto_hwcaps()` and panics with a clear message rather than
 letting the CPU fault — a diagnosable panic beats a raw illegal-instruction
 crash, which is worse than the alternative of simply being slower.
 
-**NO CALLER YET.** These three pins exist so #2526 (route `stdlib/crypto`'s
-AES through them) has something to call; wiring them up hits the same
-stage0-bootstrap wall #2521 documented and needs its own release + repin.
+**NO CALLER YET.** These three pins exist so a future change routing
+`stdlib/crypto`'s AES through them has something to call; wiring them up
+hits the same stage0-bootstrap wall documented above and needs its own
+release + repin.
 
 **Key schedule** is textbook FIPS-197 §5.2 KeyExpansion — RotWord, SubWord,
 Rcon every `Nk` words, plus one extra SubWord at word 4 of the core for
@@ -4007,7 +4014,7 @@ unchanged, `dw[i] = AESIMC(w[Nr-i])` for the interior keys.
 
 ---
 
-## 21e. ARM64 GHASH (`runtime/cryptohw/armghash.bit`, #2523, epic #1224)
+## 21e. ARM64 GHASH (`runtime/cryptohw/armghash.bit`)
 
 ```
 bit_rt_ghash_hw_mul(h, x, out)             // out = H*X in GF(2^128), GCM bit order
@@ -4023,12 +4030,12 @@ same recurrence `stdlib/crypto/gcm.bit`'s software `gcmAbsorb` does: `state =
 
 **PLATFORM-FREE**, same reasoning as §21d's AES pins — one source file per
 TARGET, every exported function starts `if (onX64())` and panics if reached
-there rather than silently returning (#3669, same reasoning as §21d), and
+there rather than silently returning (same reasoning as §21d), and
 every exported function also calls `ghashRequireHwSupport` (bit 1, PMULL, of
 `bit_rt_crypto_hwcaps()`) before issuing PMULL/PMULL2, for the same "optional
 extension, SIGILL otherwise" reason §21d documents for AES.
 
-**NO CALLER YET**, same as §21d — these pins exist for a later ticket to wire
+**NO CALLER YET**, same as §21d — these pins exist for later work to wire
 `stdlib/crypto/gcm.bit` through.
 
 **The algorithm.** PMULL always treats a 64-bit register as LSB-first (bit 0
@@ -4064,7 +4071,7 @@ citation.
 
 ---
 
-## 21f. ARM64 SHA-256 compression (`runtime/cryptohw/armsha256.bit`, #2524, epic #1224)
+## 21f. ARM64 SHA-256 compression (`runtime/cryptohw/armsha256.bit`)
 
 ```
 bit_rt_sha256_hw_blocks(state, data, blocks)   // fold `blocks` 64-byte blocks into state
@@ -4085,14 +4092,14 @@ in order.
 
 **PLATFORM-FREE**, same reasoning as §21d/§21e — one source file per TARGET,
 the exported function starts `if (onX64())` and panics if reached there
-rather than silently returning (#3669, same reasoning as §21d), and it also
+rather than silently returning (same reasoning as §21d), and it also
 calls `sha256RequireHwSupport` (bit 2, SHA2, of `bit_rt_crypto_hwcaps()`) before
 issuing SHA256H/SHA256H2/SHA256SU0/SHA256SU1, for the same "optional
 extension, SIGILL otherwise" reason §21d documents for AES — the SHA-2
 extension is a separate ARMv8 Cryptographic Extension feature bit from both
 AES and PMULL, and is likewise optional in the base architecture.
 
-**NO CALLER YET**, same as §21d/§21e — this pin exists for a later ticket to
+**NO CALLER YET**, same as §21d/§21e — this pin exists for later work to
 wire `stdlib/crypto/sha256.bit`'s `compress` through.
 
 **The algorithm** is the standard ARMv8 crypto-extension SHA-256 sequence:
@@ -4114,21 +4121,20 @@ executed on this Mac's real SHA2-capable hardware, checked against
 `hashlib.sha256` (FIPS 180-4 test vectors plus block-boundary edge cases);
 (2) the hand-assembled `.s` translation of that identical sequence — the one
 transcribed into `armsha256.bit` — independently linked and run against the
-same vector set with the same result. Full harness and vector list on smash
-#2524.
+same vector set with the same result.
 
 ---
 
-## 22. Shared mutable state audit (#1248)
+## 22. Shared mutable state audit
 
 Every container-scope mutable in `runtime/**/*.bit` (grep: `^let ` at module
 scope — this port has no module-scope `var` anywhere in `runtime/`, and
 `^threadlocal var` matches nothing at all: Mach-O rejects `@threadlocal` in
 the freestanding emit, so no runtime module uses it), classified per-worker /
-per-task / synchronized, with why. This is the M:N epic's enumeration ticket
-— §5 and §13 above already argue the two hardest cases (mutator
-registration, the error slot) in depth; this section is the complete list so
-nothing was skipped.
+per-task / synchronized, with why, as the complete enumeration the M:N
+scheduler work needs — §5 and §13 above already argue the two hardest cases
+(mutator registration, the error slot) in depth; this section is the
+complete list so nothing was skipped.
 
 **Write-once-before-any-worker-exists, read-only after (safe by boot order):**
 `rtStartMain` runs on the process's one and only thread before `boot` spawns
@@ -4162,8 +4168,8 @@ this port has no `Heap`/`Gc`/`World`/`Scheduler` class type anywhere):**
   belongs to `runtime/root/`" (`gc.bit:12-17`); `gc.bit` declares no module
   state of its own.
 - `runtime/gc/gcworldsync.bit`: `worldBlock` (`gcworldsync.bit:187`) — the §5
-  stop-the-world Mutator registry. NOT `root.bit`: #2184 moved it once
-  `ptrOf` on module data was fixed (#1421), retiring the caller-owned bind
+  stop-the-world Mutator registry. NOT `root.bit`: this moved once
+  `ptrOf` on module data was fixed, retiring the caller-owned bind
   this file used to need. §5 above already documents the current shape ("THE
   REGISTRY BLOCK IS `runtime/gc`'s OWN MODULE STATE... `gcworldsync.bit`
   declares `worldBlock`").
@@ -4175,7 +4181,7 @@ this port has no `Heap`/`Gc`/`World`/`Scheduler` class type anywhere):**
   16-word block and the process-global address `bit_rt_spawn` reads back
   through `gSched`.
 
-**Per-task scratch (#1577 — NOT module state and NOT `threadlocal`, the
+**Per-task scratch (NOT module state and NOT `threadlocal`, the
 M:N-migration-safe replacement): nothing between the write and its matching
 read can cross a scheduling point here either, but the value lives at the
 base of the running task's own stack, so it survives the task migrating to a
@@ -4192,25 +4198,26 @@ different OS thread — a per-OS-thread slot could not:**
   `bit_rt_chan_recv` on every receive path. Same file and mechanism as
   `pending_err` above; not the same mechanism as `udp_last_sender` below,
   despite the two being listed together before this audit.
-- `last_fs_read_all_failed` (§14, #2994) — `bit_rt_fs_read_all_failed`
+- `last_fs_read_all_failed` (§14) — `bit_rt_fs_read_all_failed`
   (`slots.bit`'s `rtFsReadAllFailed`) reads `scrFsReadFailed`, word 265 of the
   same per-task block (`scratch.bit`'s `scrFsReadFailed`). Same file and
-  mechanism as `pending_err`/`last_recv_ok` above. #3065 (pass 1 of #2996)
-  re-added the word and the accessor pair with no caller; #2996 (pass 2) wired
+  mechanism as `pending_err`/`last_recv_ok` above. The two-pass landing pattern's pass 1
+  re-added the word and the accessor pair with no caller; its pass 2 wired
   `runtime/root/{darwin,linux}/fs.bit`'s `rtFsReadAll` to publish it on its
   `end < 0` and `s == 0` paths (cleared at entry, so a prior call's outcome on
   this task never leaks into the next) and `stdlib/fs/fs.bit`'s
   `File.readAll` to read it.
-- `iface_as_ok` (§2.2, #3280) — `runtime/root/iface.bit`'s `rtIfaceAs`/
+- `iface_as_ok` (§2.2) — `runtime/root/iface.bit`'s `rtIfaceAs`/
   `rtIfaceAsOk` (`bit_rt_iface_as`/`bit_rt_iface_as_ok`) read/write
   `scrIfaceOk`, word 266 of the same per-task block
   (`runtime/sched/scratch.bit:98`). Same file and mechanism as the three
-  entries above. **Until #3280 this was a single process-wide word**
+  entries above. **This used to be a single process-wide word**
   (`runtime/root/root.bit`'s `let ifaceOk: i64 = 0`, now removed), sound only
   against a second assertion on the *same* task — adjacency does nothing to
   stop a different, concurrently running OS thread from writing the same
-  global word once `BIT_WORKERS>1`, the identical false conclusion #3272 and
-  #3273 disproved for their own buffers. Reproduced and fixed by moving the
+  global word once `BIT_WORKERS>1`, the identical false conclusion the UDP
+  sender-buffer and sockaddr scratch-buffer fixes disproved for their own
+  buffers. Reproduced and fixed by moving the
   flag to per-task scratch, the same migration-safety reason `scrRecvOk` and
   the error slot are shaped this way.
 
@@ -4222,11 +4229,11 @@ per-worker storage, not a single shared word (§5.1):**
   (`linux/netabi.bit:407-408`; `darwin/netabi.bit:396-397`) — per-OS, not
   `root.bit`, and NOT a `threadlocal` (Mach-O refuses one, §11.11).
 
-  **UNTIL #3272 this bullet described a SINGLE shared slot for the whole
+  **This bullet used to describe a SINGLE shared slot for the whole
   process**, claimed sound "only because v1 pins the scheduler to one worker
-  (§5/§9)". That claim was false as soon as #1900 booted more than one
-  worker: two tasks on two OS threads racing `udp_recv` clobbered the one
-  shared flag, and #1912 traced a permanently wedged UDP listener to exactly
+  (§5/§9)". That claim was false as soon as more than one worker could boot:
+  two tasks on two OS threads racing `udp_recv` clobbered the one
+  shared flag, and a permanently wedged UDP listener was traced to exactly
   that. Fixed by giving each WORKER its own `[4]i64`/valid-flag slot, indexed
   by the calling task's own worker id (`wkId`, `runtime/sched/worker.bit`)
   via `udpSenderSlot()`, double-bounded against `schedMaxWorkers` and the
@@ -4246,13 +4253,13 @@ per-worker storage, not a single shared word (§5.1):**
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
   running task's own stack pointer (`sched.bit:15`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
-  resume on a *different* OS thread (#1466): a cached thread pointer would
+  resume on a *different* OS thread: a cached thread pointer would
   hand back the previous thread's stale `Worker`. No global backs this at
   all, in this file or any other — there is nothing to race because there is
   nothing stored.
 
 **NOT yet converted: NOT FOUND.** This category held exactly one entry,
-`iface_as_ok`'s `ifaceOk` flag, and #3280 converted it to per-task scratch —
+`iface_as_ok`'s `ifaceOk` flag, which was converted to per-task scratch —
 see the "Per-task scratch" list above. Nothing in `runtime/**/*.bit` is
 currently a single process-wide word carrying a live cross-task race under
 `BIT_WORKERS>1`.
@@ -4285,7 +4292,7 @@ need no synchronization under any worker count.
 
 **Racy-but-idempotent memoization caches (no lock, correct anyway because every
 racing writer computes the identical value):**
-- `runtime/cryptohw/{linux,darwin}/cryptohw.bit`: `hwcapsCache` (#2520) — the
+- `runtime/cryptohw/{linux,darwin}/cryptohw.bit`: `hwcapsCache` — the
   `bit_rt_crypto_hwcaps` AES/PMULL/SHA2 bitmask, sentinel `-1` for "not yet
   computed." Every racing OS thread reads the identical `AT_HWCAP` word (linux)
   or the identical three `sysctlbyname` results (darwin) and therefore computes
@@ -4337,7 +4344,7 @@ access on most targets permits the reordering the edge exists to forbid:
    acquire/release CAS-then-store pairing already proven by `runtime/chan/chan.bit` and
    `runtime/sched/sched.bit`'s deques above. `Once`/`WaitGroup` (edges 7, 8) are expected to
    compose from the same Mutex/atomic primitives and inherit the same
-   pairing. This is `std/sync`'s implementation contract (#1251), not yet
+   pairing. This is `std/sync`'s implementation contract, not yet
    built on this branch.
 5. **`std/sync` atomics — `Release`/`Acquire`/`Relaxed` (edge 9, SPEC.md
    §13.7.1).** These must lower to the target's native ordered forms, not to
@@ -4350,7 +4357,7 @@ access on most targets permits the reordering the edge exists to forbid:
    underlying instruction atomic — it is never a plain non-atomic load/store,
    which would reintroduce word-tearing SPEC.md §13.7 defines away for
    single-word values. This is new codegen surface (tracked with `std/sync`'s
-   implementation, #1251) — the seq-cst-only raw builtins (§11.5) cannot be
+   implementation) — the seq-cst-only raw builtins (§11.5) cannot be
    reused as-is for `Relaxed`/`Release`/`Acquire` because they hard-code the
    strongest ordering at every callsite.
 
@@ -4370,7 +4377,7 @@ why the audit in §22 above only needed to reason about *runtime*-internal
 state: user Bit code gets no such audit for free, which is the whole reason
 §13.7 and this section exist.
 
-## 24. CPU sampling profiler (`runtime/root/darwin/prof.bit`, #1906)
+## 24. CPU sampling profiler (`runtime/root/darwin/prof.bit`)
 
 ```
 bit_rt_prof_start(intervalMicros: int) -> int   // 0 ok, -1 on a libSystem failure
