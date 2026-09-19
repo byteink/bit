@@ -3095,8 +3095,13 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   `open(2)`'s own `O_NOFOLLOW` specifies. A DIRECTORY is refused on all three
   platforms, matching `fs_open`'s #2149 guard — `O_RDONLY` on a directory
   succeeds on darwin and linux and would hand back a `File` no read can fill.
-  Darwin and Linux pass `O_NOFOLLOW` (0x100 and 0o400000 respectively) on the
-  read-only open and let the kernel fail it with `ELOOP`. **Windows inverts
+  Darwin and Linux pass `O_NOFOLLOW` on the read-only open and let the kernel
+  fail it with `ELOOP` — Darwin's value is `0x100`; Linux's is PER-ARCH
+  (`runtime/root/linux/fs.bit`, #5626): `0o400000` on x86_64, but aarch64 does
+  NOT use `asm-generic/fcntl.h` for this bit — `arch/arm64/include/uapi/asm/
+  fcntl.h` overrides it to `0o100000`, and `0o400000` is `O_LARGEFILE` there
+  instead, a harmless no-op that silently let the open follow the symlink.
+  **Windows inverts
   the shape and REFUSES a reparse point rather than following it**: it has no
   `O_NOFOLLOW`, so `CreateFileW` is given `FILE_FLAG_OPEN_REPARSE_POINT`,
   which SUCCEEDS on the link itself, and the provider then reads
