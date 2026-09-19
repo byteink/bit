@@ -1,0 +1,198 @@
+// compiler/checktraitvalidate.bit — split out of checktrait.bit (#5641,
+// which was at the 800-line E0200 ceiling with zero headroom). Sibling
+// .bit file, same module: nothing here needs an import. See
+// checktrait.bit's header for how this fits the overall trait-injection
+// design (SPEC §10.7, #3369).
+//
+// The three structural checks SPEC §10.7 requires before any injection
+// happens: a trait `use` graph has no cycles (checkTraitCycles), a trait
+// is never used as a type (checkTraitAsType), and `Self` appears only in
+// a trait method's own signature, never in a body or a field type
+// (checkSelfPositions). All three run once per module, over `ctx.traits`
+// or the whole arena, before collectClassUseSites' classes are touched.
+
+// ---- trait `use` cycles (SPEC §10.7) --------------------------------------
+
+fn pathPush(path: []string, name: string): []string {
+  let out = []string(len(path) + 1)
+  let i = 0
+  while (i < len(path)) {
+    out[i] = path[i]
+    i = i + 1
+  }
+  out[len(path)] = name
+  return out
+}
+
+fn pathContains(path: []string, name: string): bool {
+  let k = 0
+  while (k < len(path)) {
+    if (path[k] == name) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+fn traitCycleDFS(ctx: TraitCtx, name: string, path: []string, visited: map<string, bool>): bool {
+  if (pathContains(path, name)) {
+    reportNoHint(
+      ctx.diags, ecTraitCycle, getNode(ctx.tree, ctx.traits[name]).span,
+      "trait cycle: '${name}' uses itself, directly or indirectly",
+    )
+    return true
+  }
+  visited[name] = true
+  let (node, ok) = ctx.traits[name]
+  if (!ok || len(path) > 64) {
+    return false
+  }
+  let nextPath = pathPush(path, name)
+  let members = kidsOf(ctx.tree, kidsOf(ctx.tree, node)[1])
+  let i = 0
+  while (i < len(members)) {
+    if (getNode(ctx.tree, members[i]).tag == Tag.UseStmt) {
+      let usedIdents = kidsOf(ctx.tree, members[i])
+      let j = 0
+      while (j < len(usedIdents)) {
+        let usedName = identText(ctx.tree, ctx.source, usedIdents[j])
+        if (traitCycleDFS(ctx, usedName, nextPath, visited)) {
+          return true
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn checkTraitCycles(ctx: TraitCtx) {
+  let visited = map<string, bool>{}
+  for (name, _) of ctx.traits {
+    let (_, done) = visited[name]
+    if (!done) {
+      let _ = traitCycleDFS(ctx, name, []string(0), visited)
+    }
+  }
+}
+
+// ---- a trait is never a type (SPEC §10.7) --------------------------------
+
+fn walkTypeForTrait(ctx: TraitCtx, node: int) {
+  if (node == 0) {
+    return
+  }
+  let n = getNode(ctx.tree, node)
+  if (n.tag == Tag.Ident) {
+    let name = ctx.source[n.span.start:n.span.end]
+    let (_, isTrait) = ctx.traits[name]
+    if (isTrait) {
+      report(
+        ctx.diags, ecTraitAsType, n.span,
+        "trait '${name}' cannot be used as a type",
+        "traits are injected into a class, not stored in one — declare a structural interface instead (SPEC §14.3)",
+      )
+    }
+    return
+  }
+  let kids = kidsOf(ctx.tree, node)
+  let i = 0
+  while (i < len(kids)) {
+    walkTypeForTrait(ctx, kids[i])
+    i = i + 1
+  }
+}
+
+// The single-kid-at-index-1 type slots: a param/field's type, a variable's
+// annotation, a type assertion's target.
+fn checkTraitAsTypeSlot1(ctx: TraitCtx, n: Node, i: int) {
+  if (n.tag == Tag.Param ||
+    n.tag == Tag.ParamRest ||
+    n.tag == Tag.Field ||
+    n.tag == Tag.Binding ||
+    n.tag == Tag.TypeAssert) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[1])
+  }
+}
+
+// The result-type slots, whose kid index varies by declaration shape: a
+// type alias' target, a function/method/trait-method/interface-method
+// result. `TraitMethod` carries a generics kid `ExternFnDecl`/`MethodSig`
+// don't, so its result sits one slot further in ([name, generics, params,
+// result, body]) than those two ([name, params, result]).
+fn checkTraitAsTypeSlot2(ctx: TraitCtx, n: Node, i: int) {
+  if (n.tag == Tag.TypeAlias) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[2])
+  } else if (n.tag == Tag.FuncDecl) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[4])
+  } else if (n.tag == Tag.TraitMethod) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[3])
+  } else if (n.tag == Tag.ExternFnDecl || n.tag == Tag.MethodSig) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[2])
+  }
+}
+
+// Every declared "type slot" in the module. Composite shapes (`[]Trait`,
+// `Box<Trait>`, `Trait!E`) are covered by recursion from each of these
+// anchors (walkTypeForTrait), not by a separate case per shape.
+fn checkTraitAsType(ctx: TraitCtx) {
+  let i = 1
+  while (i < len(ctx.tree.nodes)) {
+    let n = getNode(ctx.tree, i)
+    checkTraitAsTypeSlot1(ctx, n, i)
+    checkTraitAsTypeSlot2(ctx, n, i)
+    i = i + 1
+  }
+}
+
+// ---- `Self` only in a trait method's own signature -----------------------
+
+fn forbidSelfIn(ctx: TraitCtx, node: int) {
+  if (node == 0) {
+    return
+  }
+  let n = getNode(ctx.tree, node)
+  if (n.tag == Tag.Ident) {
+    if (ctx.source[n.span.start:n.span.end] == "Self") {
+      report(
+        ctx.diags, ecSelfOutsideSignature, n.span,
+        "'Self' is only legal as a trait method's own parameter or result type",
+        "not a local variable's type, a field type, or anywhere else in the body",
+      )
+    }
+    return
+  }
+  let kids = kidsOf(ctx.tree, node)
+  let i = 0
+  while (i < len(kids)) {
+    forbidSelfIn(ctx, kids[i])
+    i = i + 1
+  }
+}
+
+// A provided method's BODY may reference `this`, but `Self` stays a
+// signature-only name (SPEC §10.7) — checked here rather than by scoping it
+// into the resolver, because a trait body is never independently resolved
+// at all (see this file's header). A field's TYPE (#3370) is never a legal
+// `Self` position either — only a trait method's own parameter or result
+// type is — so it gets the same walk.
+fn checkSelfPositions(ctx: TraitCtx) {
+  for (_, node) of ctx.traits {
+    let members = kidsOf(ctx.tree, kidsOf(ctx.tree, node)[1])
+    let i = 0
+    while (i < len(members)) {
+      let tag = getNode(ctx.tree, members[i]).tag
+      if (tag == Tag.TraitMethod) {
+        let body = kidsOf(ctx.tree, members[i])[4]
+        if (body != 0) {
+          forbidSelfIn(ctx, body)
+        }
+      } else if (tag == Tag.Field) {
+        forbidSelfIn(ctx, kidsOf(ctx.tree, members[i])[1])
+      }
+      i = i + 1
+    }
+  }
+}
