@@ -2387,13 +2387,12 @@ map_entry     = expression ":" expression .
 type_args     = type { "," type } .
 ```
 
-`field_init` accepts both `:` and `=` for one release (#3840): `Point{ x: 1.0 }`
+`field_init` accepts both `:` and `=`: `Point{ x: 1.0 }`
 and `Point{ x = 1.0 }` are equivalent, and the two spellings may be freely mixed
 within one literal. **`=` is the target spelling** - `:` means "has type", `=`
 means "gets value", and `:` here is the one inconsistent use of `:` in the
-language. The formatter still emits `:` regardless of which spelling the source
-used; existing source is not rewritten by this release. A later release removes
-the `:` spelling from the grammar and flips the formatter to emit `=`.
+language. `bit fmt` rewrites `:` to `=` on every `field_init` it formats,
+regardless of which spelling the source used.
 `map_entry` is unaffected and keeps `:` permanently - its left side is a key
 *expression*, not a field name, so the "has type" vs. "gets value" distinction
 does not apply.
