@@ -49,7 +49,13 @@ esac
 base="$(basename "${artifact}")"
 # Match the triple, not the exact filename: the version moves, the triple does
 # not, and pinning the whole name here would mean editing this script per release.
-line="$(grep -E "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
+#
+# `-a`: same file and same reason as scripts/stage0.sh's identical grep — a
+# virtiofs bind mount (an ad-hoc `docker run -v`; the hardware gates never do
+# this, they stream `git archive HEAD | tar xi`) answers SEEK_HOLE/SEEK_DATA
+# as though SUMS were entirely one hole, so GNU grep's sparse-file check calls
+# it binary regardless of content and returns empty stdout at rc=0 (#5634).
+line="$(grep -aE "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
 [ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
 [ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
   || die "more than one digest for triple '${triple}' in ${SUMS} - ambiguous, refusing"
