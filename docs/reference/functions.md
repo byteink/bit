@@ -6,7 +6,7 @@
 that names it is still typed in by hand:
 
 ```bit ignore
-links["abc123"] = Link{ url: "https://example.com", created: 0, hits: 0 }
+links["abc123"] = Link{ url = "https://example.com", created = 0, hits = 0 }
 ```
 
 A real shortener cannot ask someone to invent a code. It needs something

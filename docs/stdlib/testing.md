@@ -98,7 +98,7 @@ method and the type:
 class Point { x: int, y: int }
 
 test "points" {
-  eq<Point>(Point{ x: 1, y: 2 }, Point{ x: 1, y: 2 }, "same point")
+  eq<Point>(Point{ x = 1, y = 2 }, Point{ x = 1, y = 2 }, "same point")
 }
 ```
 
