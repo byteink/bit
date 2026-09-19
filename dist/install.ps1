@@ -8,12 +8,13 @@
 # SHA256SUMS, unpacks it under %LOCALAPPDATA%\bit and adds its bin\ to the
 # user PATH. No wrapper script or env vars needed: bit.exe resolves
 # stdlib/libbitrt.a relative to its own install location, same as the POSIX
-# installers post-#1452 (dist/README.md, "Path resolution").
+# installers (dist/README.md, "Path resolution").
 #
-# NOTE: x86_64-windows and aarch64-windows are not published yet (#1103's
-# runtime port + #358's release matrix are the remaining blockers) - until
-# they are, this script downloads a real URL built from the naming contract
-# and fails cleanly with a 404/"not found" rather than installing anything.
+# NOTE: x86_64-windows ships and is smoke-tested on real hardware each release.
+# aarch64-windows is NOT built and is out of scope for the Windows port, which
+# targets x86_64-windows only, so on an ARM64 host this script downloads a real
+# URL built from the naming contract and fails cleanly with a 404/"not found"
+# rather than installing anything.
 #
 # All errors use `throw`, never `exit`: this script is meant to be piped
 # through `iex`, and `exit` in that context would close the caller's whole
