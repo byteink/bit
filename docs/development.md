@@ -45,9 +45,9 @@ that declares an `extern fn` the pinned stage0's bundled `libbitrt.a`
 does not provide cannot land until stage0 is repinned to a release that has
 it - the checker resolves every extern a module declares whether or not the
 importer calls it, so it is not enough for the driver to avoid *calling* the
-new function. #2152 landed exactly this (`bit_rt_fs_is_symlink_w`, added to
+new function. This happened in practice: `bit_rt_fs_is_symlink_w`, added to
 `stdlib/fs/fs.bit` and reached through `tools/build/artifacts.bit`'s `import {
-walk } from "std/fs"`) and reverted at `49e74817` once `rm -rf bit-out &&
+walk } from "std/fs"`, landed and was reverted at `49e74817` once `rm -rf bit-out &&
 ./make` was tried against it - every warm-`bit-out` gate had stayed green.
 
 **`./make test-coldboot` is what catches that class before it lands.** It
@@ -63,8 +63,8 @@ before merging to main, or right after a stage0 repin.
 ### Landing a runtime ABI change
 
 **Changing an exported `runtime/**` symbol's arity or parameter types needs
-the two-pass `BIT_STAGE0_BIN` bootstrap (#1857) - a single `./make selfhost`
-is not safe for it, and #3152 is why.** `stepSelfhost`
+the two-pass `BIT_STAGE0_BIN` bootstrap - a single `./make selfhost`
+is not safe for it.** `stepSelfhost`
 (`tools/build/artifactsteps.bit`) links THIS TREE's `libbitrt.a` (built from
 current `runtime/**` source) against a compiler produced by compiling
 `compiler/**` with the PINNED stage0 - a previous
@@ -78,7 +78,7 @@ now declares. The linker resolves a symbol NAME, not a signature, so this
 links without error; the callee then reads an argument register the caller
 never wrote.
 
-#3152's concrete case: `runtime/root/slices.bit`'s `rtSliceNew` (and three
+One concrete case: `runtime/root/slices.bit`'s `rtSliceNew` (and three
 neighbouring exports) gained a trailing `elemSize` parameter, and the
 resulting `bit-out/bin/bit` allocated 11.3 GB in 3 seconds compiling a
 12-line program - the COMPILER'S OWN internal slice allocations (not
@@ -111,8 +111,8 @@ the pinned release, so there is no committed tag to diff its tree against -
 and it is precisely the supported recovery path, not a mismatch to refuse.
 
 **The fix is NOT the plain two-pass bootstrap `scripts/stage0.sh`'s own
-header documents for #1857.** That recipe's pass 1 is a bare `./make`, and
-#1857 was a compiler-only fix - the runtime was unchanged, so pass 1's
+header documents for a compiler-only fix.** That recipe's pass 1 is a bare
+`./make`, which is correct when the runtime is unchanged, so pass 1's
 `./make` already builds against a runtime stage0 is self-consistent with.
 Here the runtime is what changed: the working tree's `runtime/**` already
 carries the new arity, which is exactly what this guard just refused to link
@@ -154,7 +154,7 @@ Two traps, each cost a real run when skipped:
   that it happened.
 
 **Regression coverage for the escape hatch itself is `./make
-test-stage0override`** (#3118, `_tests_/bit/stage0override.bit`): asserts
+test-stage0override`** (`_tests_/bit/stage0override.bit`): asserts
 `BIT_STAGE0_BIN` is actually honoured (not silently ignored) and that
 `fingerprint()`'s override-hashing invalidates the `libbitrt` cache when the
 override binary's content changes at a fixed path. It does not assert that a
@@ -162,13 +162,13 @@ two-pass ABI-change bootstrap produces a *correct* runtime - that is a
 property of the specific change being landed - only that the mechanism
 itself works as documented.
 
-## Does `./make libbitrt` build `runtime/**` with the tree compiler? (#3054)
+## Does `./make libbitrt` build `runtime/**` with the tree compiler?
 
 **No - it stays pinned-stage0-built by default.** The status quo is not free of
 risk either, though, so the fix is an opt-in, not silence. This is the decision
 recorded so it is not re-derived from scratch the next time it comes up.
 
-**The two paths, as of #3034.** `dist/release.sh:198` - the **shipped**
+**The two paths, today.** `dist/release.sh:198` - the **shipped**
 `libbitrt.a` is compiled by `bit1`, this tree's own self-hosted compiler, not
 stage0. It gets there with a genuine two-pass bootstrap: `./make libbitrt`
 first builds a bootstrap archive (L0) with the pinned stage0, stage0 uses L0 to
@@ -184,7 +184,7 @@ stage0. There is no L1 pass in the everyday build.
 current tree's source on every build. What the pinned-stage0 path freezes is
 *codegen* - the machine code stage0's own, already-built copy of
 `compiler/codegen.bit`/`emitmacho.bit`/`emitelf.bit` emits for `runtime/**`'s
-own functions. #1927 is exactly a codegen-freeze bug: it needs a writer change
+own functions. A codegen-freeze bug looks exactly like this: it needs a writer change
 (`compiler/codegen.bit`, pad each stack-map entry to 8 bytes) and a reader
 change (the runtime's walk) to move together. The writer change reaches
 `bit-out/bin/bit` immediately - stage0 recompiles `compiler/**` from tree
@@ -198,20 +198,19 @@ build between "the fix lands" and "the next repin" silently misdecode
 `libbitrt.a`'s own stack maps. Waiting for the next repin does not avoid that
 window, it only bounds its length - and `dist/stage0/SHA256SUMS`'s `git log`
 shows recent repins landing roughly every 1-3 days, so the window is real, not
-theoretical. The same reasoning applies to any future writer/reader pair, not
-just #1927.
+theoretical. The same reasoning applies to any future writer/reader pair.
 
 **Also worth naming, because the top-priority performance work depends on
 getting this precise: same source-vs-codegen split, opposite direction.** A
-*source* fix in `compiler/**` (#1852/#1853, landed) improves the machine code
+*source* fix in `compiler/**` (already landed) improves the machine code
 the tree compiler emits for user programs immediately - the next
 `./make selfhost` recompiles `compiler/**` from source. It does **not** improve
 the machine code inside `libbitrt.a` itself, because that machine code was
 already emitted, once, by the frozen pinned stage0 - no amount of rebuilding
-re-emits it. #3113 measured `strings` at 137.4x C / 55.9x Go and found the time
+re-emits it. Measured: `strings` runs at 137.4x C / 55.9x Go, and the time
 is spent in exactly that frozen code (GC, allocator, slice/string primitives).
-So `#1852`/`#1853`/queued `#3104`/`#3105`/`#3107` cannot move that number until
-either a repin happens or the opt-in below exists and is used.
+So neither the landed backend improvements nor the ones still queued can move
+that number until either a repin happens or the opt-in below exists and is used.
 
 ### The four questions
 
@@ -221,10 +220,11 @@ fixed-point assert runs on every release?** The fixed-point assert
 `stageB`, `sha256(stageB)==sha256(stageC)`) proves only that the compiler
 reliably *reproduces itself*. It says nothing about whether the compiler
 correctly compiles `runtime/**` - a deterministic miscompile (the same wrong
-bytes every time, exactly #2569's shape) passes a fixed-point check as cleanly
+bytes every time, exactly the shape of the v0.1.10 atomic-width bug described
+below) passes a fixed-point check as cleanly
 as a correct compiler does. The actual backstop for runtime correctness is
 `scripts/selfhost-diffruntime.sh`, and both it and the fixed-point check run
-only via `./make test-differentials` (#2570, registered in `coreSteps()`, not
+only via `./make test-differentials` (registered in `coreSteps()`, not
 `gateSteps()`) - once per push, not on every commit that touches codegen.
 Repins have landed roughly every 1-3 days recently (`git log` on
 `dist/stage0/SHA256SUMS`), so in practice a runtime-affecting codegen
@@ -240,11 +240,12 @@ bootstrap. No test anywhere sets `BIT_STAGE0_BIN` and asserts the resulting
 build is correct. `scripts/stage0.sh`'s own header calls the override
 "DELIBERATELY UNVERIFIED, unlike the pinned path... there is no digest to
 check an arbitrary local binary against." The escape hatch a switch would lean
-on more heavily has zero regression coverage today. Filed as #3118.
+on more heavily has zero regression coverage today - closed by writing
+`./make test-stage0override` (above).
 
 **3. Do the selfhost differentials still mean what they mean if the runtime is
 tree-built?** Yes on aarch64, and non-obviously: they already exercise exactly
-that scenario, continuously, regardless of what `stepLibbitrt` does. #2741's
+that scenario, continuously, regardless of what `stepLibbitrt` does. The
 module-level object comparison in `scripts/selfhost-diffruntime.sh` builds
 every `runtime/**` module *twice* purely for the comparison - once with the
 pinned oracle, once with `bit-out/bin/bit` (the tree's own self-hosted
@@ -254,25 +255,25 @@ reads the archive `stepLibbitrt` actually writes. So "the tree compiler builds
 `test-differentials` run; switching `stepLibbitrt` changes which compiler
 produces the *shipped* archive, not what this gate has been checking.
 
-What did just change (#3103) is the invariant itself, and it happens to be
+What changed is the invariant itself, and it happens to be
 exactly right for a tree-built world: byte-for-byte identity against the
 pinned oracle stopped being valid the moment a real backend optimization
-(#1852) landed, because an optimization is supposed to change bytes (22 of 23
+landed, because an optimization is supposed to change bytes (22 of 23
 modules now diverge, all smaller, none a bug). On aarch64 hosts the check now
 disassembles both objects and compares only the acquire/release
 atomic-instruction *width* signature (mnemonic + register class, register
-number stripped) - the exact property #2569's bug broke, and nothing else.
-Mutation-tested against the real bug (#3103): 0/23 modules diverge by
-signature between #1852's tree and the pinned oracle, where 22/23 diverge by
-raw bytes; the real v0.1.10 #2569 defect diverges 6/6 by both. So the
+number stripped) - the exact property the v0.1.10 atomic-width bug broke, and
+nothing else. Mutation-tested against that real bug: 0/23 modules diverge by
+signature between the optimized tree and the pinned oracle, where 22/23
+diverge by raw bytes; the actual v0.1.10 defect diverges 6/6 by both. So the
 invariant tolerates the legitimate codegen improvement a tree-built archive
 would carry, while still catching the class of bug a switch actually risks.
 
 x86-64 is the one gap, and it predates this decision. The differential keeps
 strict byte identity there (no local x86-64 host to verify a
-signature-extraction regex against - tracked separately, #3110). No x86-64
+signature-extraction regex against - tracked separately). No x86-64
 codegen improvement has landed yet, so this has not bitten anyone, but using a
-tree-built archive on x86_64-linux before #3110 closes would make that
+tree-built archive on x86_64-linux before that gap closes would make that
 target's differential go red the moment one does, for a reason unrelated to
 correctness.
 
@@ -285,12 +286,12 @@ exactly the moment its coverage is weakest, and it would change
 `bit-out/lib/*/libbitrt.a`'s bytes for every dev build on every platform, where
 only aarch64's invariant is proven tolerant of legitimate codegen change
 (question 3). Stage0-by-default preserves today's build cost and verified
-safety envelope for the common case, while giving #1927 - and any future
-writer/reader pair that must move together - a real, load-bearing mechanism
-instead of the purely-manual, unverified two-pass `BIT_STAGE0_BIN` dance
-`scripts/stage0.sh` currently documents.
+safety envelope for the common case, while giving the codegen-freeze case
+above - and any future writer/reader pair that must move together - a real,
+load-bearing mechanism instead of the purely-manual, unverified two-pass
+`BIT_STAGE0_BIN` dance `scripts/stage0.sh` currently documents.
 
-**What the opt-in requires, filed as #3117, not done here.**
+**What the opt-in requires, not done here.**
 `tools/build/defs.bit` declares `selfhost`'s only dependency as `["libbitrt"]`,
 and `stepSelfhost` always resolves stage0 fresh via `runArtifact`
 (`tools/build/main.bit:128`) - there is no path that reuses a previously-built
@@ -308,13 +309,12 @@ needs to fold in `compiler/**` when the opt-in is active - today it
 deliberately excludes `compiler/**` because `compiler/**` cannot affect
 stage0-built bytes, but it would under a tree-built archive, and a fix landing
 there with the cache unaware of it is the same stale-archive shape
-`fingerprint()` already guards against for `BIT_STAGE0_BIN` (#1863).
+`fingerprint()` already guards against for `BIT_STAGE0_BIN`.
 
-**#1927 stays blocked, now on #3117 rather than on #3054 directly** - the
-decision is made, but nothing changes for it until the opt-in exists and #1927
-uses it.
+**The codegen-freeze case above stays blocked** - the decision is made, but
+nothing changes for it until the opt-in exists and is used.
 
-**Correct invocation: ONE command, not two (#3126).** `BIT_LIBBITRT_TREE=1`
+**Correct invocation: ONE command, not two.** `BIT_LIBBITRT_TREE=1`
 must be visible to the same process that runs `selfhost`, because
 `tools/build/defs.bit` declares `Step{ name = "selfhost", deps = []string{ "libbitrt" } }` -
 a bare `./make selfhost` re-invokes `stepLibbitrt` as its own dependency,
@@ -359,8 +359,8 @@ edit runs the selfhost diffs plus `test-imports-bit`, `test-lint-filelines`,
 Every bucket runs every gate whose OWN declared file set (its `argv`/`env` in
 `tools/build/gates.bit`) intersects that bucket's paths, not just the one gate
 the bucket was originally named after - see `scripts/gate.sh`'s own header
-comment for the full bucket→gate table (#2962). One narrow exception to "a mix
-of areas forces full" (#3055): `_tests_/bit/stdlibdocs.bit` makes a
+comment for the full bucket→gate table. One narrow exception to "a mix
+of areas forces full": `_tests_/bit/stdlibdocs.bit` makes a
 `docs/stdlib/<mod>.md` page mandatory for every exported stdlib symbol, so an
 ordinary stdlib-export change is structurally required to touch both the
 `stdlib` and `docs` buckets in the same diff - resolving that to `full` would
@@ -375,7 +375,7 @@ one bucket that isn't that narrow pairing, or anything
 else it cannot confidently scope, `gate.sh` (no flags) **refuses rather than
 guessing**: it
 prints the resolved bucket and the reason, runs nothing, and exits 3
-(`GATE_RESULT=FULL_REQUIRED`, #2872). Run `scripts/gate.sh --full` or
+(`GATE_RESULT=FULL_REQUIRED`). Run `scripts/gate.sh --full` or
 `./make test` directly (every gate, **18-18.5 min** - measured four separate
 times, 18m13s-18m36s, most recently on `8f5e49e8`; the driver prints its own
 `make: test - total` line, which is the number to trust over anything
@@ -393,9 +393,9 @@ line-1 directive selects the mode - `// run` (execute, compare stdout),
 `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics),
 `// fmt` (canonicalization), `// types` (inferred-type dump), `// lint`.
 
-**A `diffimports` guard (#1436, comparing the seed's and self-hosted compiler's
+**A `diffimports` guard (comparing the seed's and self-hosted compiler's
 undefined-symbol sets for an `extern fn` colliding with a predeclared builtin)
-was RETIRED, not ported, when the Zig seed was deleted (#2359).** The defect it
+was RETIRED, not ported, when the Zig seed was deleted.** The defect it
 caught - self-hosted `lowerCall`/`checkCall`/`vCall`/`vUnmanagedBuiltin`
 dispatching on a callee's raw source text before its resolved declaration, so a
 user's own `close`/`timeMonoNs`/`fsClose`/… silently lost to the ~70-name
@@ -435,7 +435,7 @@ there." `bit build`/`run`/`test`/`check`/`doc` all resolve first
 check - a different branch inside `checkExprType`, with different staleness
 behaviour, so the two paths can disagree on the same source.
 
-Demonstrated on `_tests_/cases/run_generic_let_chain.bit` (#3069, the #3068
+Demonstrated on `_tests_/cases/run_generic_let_chain.bit` (the
 degenerate-generic-instance repro, live in the corpus): `--dump-ir-pre` and
 `--dump-ir` both show `f1(x)` inside `build<T>` targeting the CONCRETE
 `f1$3`. A real `bit build --emit-obj` of the same file, disassembled
@@ -453,11 +453,11 @@ differentials plus `diffruntime`'s file-level (`--dump-ir-pre`) half. None of
 those resolver-active differentials would have caught *this particular* bug
 either, but each for an unrelated reason (verdict-only, stdout-only, or an
 unrelated codegen property) - none of them compares instantiation targeting or
-emitted call symbols, which is the level this bug lives at. Full per-differential
-table on #3069. No new differential was added; the gap is accepted and
+emitted call symbols, which is the level this bug lives at. No new
+differential was added; the gap is accepted and
 documented here rather than fixed, because fixing it means changing what the
 dump commands' entry points do, which is a compiler change with its own
-sequencing (see #3069).
+sequencing.
 
 **Both sides of a differential must read THIS tree's stdlib and runtime.** The
 stage0 tarball ships its own `stdlib/` and `libbitrt.a`, and `bit` resolves them
@@ -522,10 +522,10 @@ program's risk.
 **`_tests_/stress/quicwire/timeout-s` holds `1200`** - the one program in the
 corpus that needs a wider budget than the 300s default. It used to get that
 budget from a second, less discoverable mechanism instead: `timeoutMsForProgram`
-hardcoded `baseMs * 4` for the name `quicwire` (#3210, 2026-08-17, predating
-this file's mechanism). #2696 replaced the hardcode with the file and deleted
-`timeoutMsForProgram` outright - nothing else called it - so quicwire's budget
-is one mechanism now, not two.
+hardcoded `baseMs * 4` for the name `quicwire` (2026-08-17, predating
+this file's mechanism). That hardcode was later replaced with the file, and
+`timeoutMsForProgram` was deleted outright - nothing else called it - so
+quicwire's budget is one mechanism now, not two.
 
 **A valid file always wins outright; the two never layer**
 (`resolveTimeoutMs`, `_tests_/bit/stress/setup.bit:179-188`: an absent file falls
@@ -533,9 +533,9 @@ through to `cx.timeoutMs`, i.e. `defaultTimeoutS` scaled by `BIT_TEST_TIMEOUT_S`
 host load; a present one returns instead of adding to it). That non-layering is
 why migrating quicwire off the hardcode had to land in the same commit as the
 file: writing a `timeout-s` file for a program still covered by a name-based
-hook replaces its budget rather than widening it - #2696 itself would have
-halved quicwire's from 1200s to 600s had it shipped the file alone without
-also removing the hook.
+hook replaces its budget rather than widening it - that migration itself
+would have halved quicwire's from 1200s to 600s had it shipped the file alone
+without also removing the hook.
 
 Doc snippets are gated: `_tests_/bit/docs.bit` typechecks every Bit-tagged fenced
 code block under `docs/`, and `_tests_/bit/stdlibdocs.bit` fails on an undocumented
@@ -560,9 +560,9 @@ not about scope.) Three measured instances, all re-measured on `main` at
   'examples/*.bit' | wc -l`). `compiler/`, `runtime/` and `_tests_/` - 997 of
   1182 (84%, `git ls-files -- 'compiler/*.bit' 'runtime/*.bit' '_tests_/*.bit' |
   wc -l`) - are checked for fmt-canonicality by nothing, which is why four
-  genuine formatter bugs (#2878, #2879, #2880, #2140) sat unreported in the
+  genuine formatter bugs sat unreported in the
   directories it omits.
-- **#2570**: none of the **19** `scripts/selfhost-*.sh` differentials (every
+- None of the **19** `scripts/selfhost-*.sh` differentials (every
   `selfhost-*.sh` file except the shared `selfhost-diffdump.sh` driver behind
   six of them) is invoked from `tools/build/**` - `grep -n "selfhost-"
   tools/build/*.bit dist/release.sh` turns up only comments - so the
@@ -571,10 +571,10 @@ not about scope.) Three measured instances, all re-measured on `main` at
 The tell is the same in all three and it is cheap: a gate that prints a count
 with no denominator cannot be read as coverage. A scoped gate should print
 both its scope and the size of what it excludes, so the ratio is visible in
-the log rather than reconstructible only by someone who goes looking. #2747
-gates E0200 (the same 800-line rule) over `compiler/**` and `runtime/**`,
-closing the gap instance 1 leaves outside `_tests_/bit/`; #2876 widens
-`test-fmt` itself, closing instance 2.
+the log rather than reconstructible only by someone who goes looking. E0200
+(the same 800-line rule) is gated over `compiler/**` and `runtime/**` too,
+closing the gap instance 1 leaves outside `_tests_/bit/`; `test-fmt` was
+widened too, closing instance 2.
 
 **A benchmark win is not landed until its baseline moves down with it.**
 `_tests_/bit/benchgate/{benchgate,baselines}.bit` compares peak RSS and user CPU
@@ -593,16 +593,16 @@ fails today: the improved run just clears 1.5x more comfortably, and a later
 change that regresses the benchmark back toward the OLD, unlowered baseline
 still passes cleanly.
 
-Once #3130 lands, this is mechanically enforced for one metric: deterministic
-object counts get a two-sided band, so an unrecorded improvement there fails
-the gate on its own. Peak RSS and user CPU stay noisy by design - that
+Once deterministic object counts get a two-sided band, this will be
+mechanically enforced for one metric: an unrecorded improvement there will
+fail the gate on its own. Peak RSS and user CPU stay noisy by design - that
 noise is exactly why they need the 1.5x slack in the first place - so a
 two-sided band is not sound for either, and re-recording those two stays a
 written convention rather than something the gate checks for you.
 
 ### Race detection
 
-Decided (#2537): whether an optional deeper race-detection gate - the
+Decided: whether an optional deeper race-detection gate - the
 `-fsanitize=thread` (ThreadSanitizer / TSan) style checker other compiled
 languages ship as a build mode - is feasible for this runtime.
 
@@ -651,13 +651,13 @@ logical thread, and Bit spawns tasks precisely because they are meant to be
 cheap - a vector clock per task reintroduces the cost `spawn` exists to avoid.
 
 A detector would still have nothing to report a finding against today:
-`runtime/ABI.md` §4.2's debug-info line table (design landed #3281) is now
+`runtime/ABI.md` §4.2's debug-info line table is now
 emitted - both `compiler/emitelf.bit` and `compiler/emitmacho.bit` write the
-`.bit_dbg` / `__bit_dbg` section and its `bit_debug_lines` extent symbols
-(#3283, wired through the self-hosted linker by #3591) - but nothing on
+`.bit_dbg` / `__bit_dbg` section and its `bit_debug_lines` extent symbols,
+wired through the self-hosted linker - but nothing on
 `main` reads it yet: the panic-time stack walker that would consume it is
-complete but held out of `main` pending a stage0 repin (#3285). (#3662,
-unmerged, adds a per-function name field to the wire format; this paragraph
+complete but held out of `main` pending a stage0 repin. (An unmerged change
+adds a per-function name field to the wire format; this paragraph
 describes what's on `main` today.) So the only thing any tool can currently
 name for a bad access is still a raw code address, not a source line.
 
@@ -706,8 +706,8 @@ the parser. It runs `bit check` on each mutant and watches only for a crash
 or a hang. It sees front-end crashes only: a program that parses cleanly and
 later computes the wrong value is invisible to it.
 
-**A crash is not the pass condition.** Bug #1857 made every `0x1p-1` hex
-float literal silently become `0.0`. There was no crash and no diagnostic. A
+**A crash is not the pass condition.** A real bug once made every `0x1p-1`
+hex float literal silently become `0.0`. There was no crash and no diagnostic. A
 crash-only fuzzer passes against a bug shaped exactly like that one. Finding
 it needs a fuzzer that compares a computed value against a known-correct
 answer - a wrong-answer oracle, not a crash detector.
@@ -717,37 +717,36 @@ same compiler one release back, so it shares any bug present in both trees. A
 differential against stage0 can only show "unchanged since the last release";
 it cannot show "correct".
 
-### Planned: a wrong-answer oracle (epic #1907, not yet shipped)
+### Planned: a wrong-answer oracle (not yet shipped)
 
-Three more fuzz modes are designed to close this gap, tracked as tickets
-#2605-#2609 under epic #1907. **None of them exists in the tree yet.** As of
+Three more fuzz modes are designed to close this gap.
+**None of them exists in the tree yet.** As of
 this writing there is no `tools/fuzz/` directory at all, and `tools/build/gates.bit`
 declares only the one `test-fuzz` gate described above. Treat every name below
-as a planned interface, not a shipped one, until its ticket lands.
+as a planned interface, not a shipped one.
 
-  - **`test-fuzz-selfcheck`** (#2606, depends on #2605) will run programs
+  - **`test-fuzz-selfcheck`** will run programs
     generated by `tools/fuzz/genprog.bit` and fail on any non-zero compiler
     exit, missing `OK ` line, or a generated program's own reported failure.
-    The generator, `tools/fuzz/genprog.bit` (#2605), computes each expected
+    The generator, `tools/fuzz/genprog.bit`, computes each expected
     value while building the expression, then emits a check comparing the
     runtime value against that constant - the program carries its own oracle.
-  - **`test-fuzz-odiff`** (#2607, depends on #2605) will compile each
+  - **`test-fuzz-odiff`** will compile each
     generated program with `-O0` and with `-O1` and require identical
-    stdout, stderr and exit code from both.
-  - **`test-fuzz-xtarget`** (#2608, depends on #2605) will compile each
+    stdout, stderr and exit code from both. It depends on the generator above.
+  - **`test-fuzz-xtarget`** will compile each
     generated program for aarch64 and for x86_64, run both, and require the
     two runs to agree. It is designed to print `SKIP: hl-master unreachable`
     and exit 0 when the remote box is down, so a dead remote never reddens
-    the gate.
-  - **#2609** wires all three as `test-fuzz-*` steps into `./make test`,
-    once #2606-#2608 land.
+    the gate. It also depends on the generator above.
+  - The three modes above wire in as `test-fuzz-*` steps into `./make test`
+    once they land.
 
 Once built, `genprog.bit` is designed so `bit run tools/fuzz/genprog.bit --
 --seed <n>` always reproduces the same generated program, and every driver
 above is designed to print that seed on failure so the exact input can be
-regenerated. See epic #1907 for the full design and its acceptance criteria,
-including a requirement to demonstrate the new fuzzing catches a deliberately
-reintroduced #1857-style bug before it is considered done.
+regenerated, including a requirement to demonstrate the new fuzzing catches a
+deliberately reintroduced hex-float-style bug before it is considered done.
 
 ## File size
 
@@ -797,27 +796,27 @@ by wall clock.
 
 ## ARM64 crypto acceleration
 
-**As of #2520 (2026-08-23), ARM64 has a real capability *detector* - but still
+**As of 2026-08-23, ARM64 has a real capability *detector* - but still
 no ARM64 compute acceleration, and nothing consults the detector yet, so AES,
 GHASH and SHA-256 still run the software path on every target, ARM64
 included.** Read this section as "what actually exists today", not as a
-description of an intention; it previously (#2529) said flatly "there is no
-ARM64 crypto acceleration", which #2520 made only half true.
+description of an intention; it previously said flatly "there is no
+ARM64 crypto acceleration", which the detector's landing made only half true.
 
 **What the hardware-crypto ABI names actually are.** `runtime/ABI.md` §21b
 documents three probes and five compute primitives under the bare
-`bit_rt_crypto_*` ABI name (task #1223, extended by #1811):
+`bit_rt_crypto_*` ABI name:
 `bit_rt_crypto_{aes,ghash,sha256}_hw_available() -> bool` and
 `bit_rt_crypto_{aes_encrypt,aes_decrypt,aes_invert_schedule,ghash_mul,sha256_compress}_hw`.
 Their scope is **x86-64 AES-NI / PCLMULQDQ / SHA-NI**, gated at run time via
 `cpuid`/`xgetbv` - nothing ARMv8, nothing NEON. `stdlib/crypto/{aes,gcm,sha256}.bit`
 call the three `_hw_available` probes and branch on the result before taking
-either path; #2520 did not touch `stdlib/crypto` at all, so this dispatch is
-unchanged. A ninth name, `bit_rt_crypto_hwcaps() -> u64` (§21c), is the ARM64
-mirror - see below.
+either path; the detector's landing did not touch `stdlib/crypto` at all, so
+this dispatch is unchanged. A ninth name, `bit_rt_crypto_hwcaps() -> u64`
+(§21c), is the ARM64 mirror - see below.
 
 **The 8 names above remain ABI-membership placeholders, identical to before
-#2520.** `runtime/cryptohw/cryptohw.bit` (87 lines) still backs all three
+the detector landed.** `runtime/cryptohw/cryptohw.bit` (87 lines) still backs all three
 targets with the same body, and its own header still calls it "ABI-MEMBERSHIP
 PLACEHOLDERS, not a port." The three `*_hw_available` providers are a
 hardcoded `return false`, unconditionally, with no `@target` gating -
@@ -827,7 +826,7 @@ immediately if called, which the dispatch above prevents from happening in
 practice, since every caller checks the (always-false) probe first.
 
 **The ninth name, `bit_rt_crypto_hwcaps`, is different: a real per-OS
-detector, not a placeholder (#2520, epic #1224).** It is a bitmask (bit 0 =
+detector, not a placeholder.** It is a bitmask (bit 0 =
 AES, bit 1 = PMULL, bit 2 = SHA2), split across two new files because each
 side calls something the other cannot compile:
 `runtime/cryptohw/linux/cryptohw.bit` (65 lines) reads `getauxval(AT_HWCAP)`
@@ -841,7 +840,7 @@ x86_64-macos target. Both cache the result after first computing it. Grepping
 the tree for `getauxval`, `AT_HWCAP`, `sysctlbyname` and `FEAT_AES` now DOES
 turn up real hits under `runtime/cryptohw/` (`linux/cryptohw.bit:29,53`,
 `darwin/cryptohw.bit:24,33,64`) - the opposite of the claim this section made
-before #2520.
+before the detector landed.
 
 **But the detector has no caller yet, so behavior is unchanged.** Nothing
 under `runtime/` or `stdlib/crypto/` calls `bit_rt_crypto_hwcaps` - grep for
@@ -850,7 +849,7 @@ it turns up only its own definitions and one comment in
 still dispatches only on the three x86-64-scoped `_hw_available` probes
 above, which are still hardcoded `false` everywhere. So AES, GHASH and
 SHA-256 run through the constant-time software path on ARM64 today, the same
-as on every other target - same conclusion as before #2520, reached for a
+as on every other target - same conclusion as before, reached for a
 different reason: not "no detector exists" but "the real detector is wired to
 nothing."
 
@@ -872,20 +871,20 @@ unset, `BIT_CRYPTO_HW=0`, `BIT_CRYPTO_HW=1`, and `BIT_CRYPTO_NO_HW=1` on
 aarch64-macos. Every run: `hwAvailable*() == false`, and stdout matched each
 suite's golden `expected` file byte-for-byte in all four cases - the switch is
 provably a no-op under every name and every value tried, not merely unlikely
-to matter. This was run before #2520 landed; since #2520 touched only
-`runtime/cryptohw/{linux,darwin}/` and never `stdlib/crypto`, the dispatch
-this measured is unchanged and the result still holds.
+to matter. This was run before the detector landed; since that change touched
+only `runtime/cryptohw/{linux,darwin}/` and never `stdlib/crypto`, the
+dispatch this measured is unchanged and the result still holds.
 
 **Practical fallout, worth knowing before writing a "test both hardware
 settings" ticket:** since every setting drives the identical software-only
 branch, there is currently only one code path to test on any target. A KAT run
 "under both `BIT_CRYPTO_HW` settings" cannot exercise two different
-implementations until the x86-64 hardware path in #1223 is actually built
+implementations until the x86-64 hardware path is actually built
 (§21b's own header: "ABI-membership placeholders, not a port") - before that,
 running it twice proves the same branch twice. The same is true of
 `bit_rt_crypto_hwcaps`: it can now return a real nonzero bitmask on capable
-ARM64 hardware, but until epic #1224's remaining children route
-`stdlib/crypto` through it, there is still only the one software branch to
+ARM64 hardware, but until the remaining work to route
+`stdlib/crypto` through it lands, there is still only the one software branch to
 test.
 
 **ChaCha20 with NEON is not a deferred ARM64 item either.** §21b does mark
@@ -899,10 +898,10 @@ SIMD registers.
 
 Old notes and tickets will mislead you:
 
-- **`compiler/` was `selfhost/`** (#1841). The self-hosted compiler is *the*
+- **`compiler/` was `selfhost/`.** The self-hosted compiler is *the*
   compiler; "selfhost" only carried information while a non-self-hosted one
   existed.
-- **`seed/` no longer exists** (#1593). `./make selfhost` keeps its step name
+- **`seed/` no longer exists.** `./make selfhost` keeps its step name
   because fifteen `scripts/selfhost-diff*.sh` invoke it, but it now means "run
   the pinned stage0 over `compiler/`".
 
