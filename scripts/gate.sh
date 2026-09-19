@@ -467,7 +467,17 @@ elif [ "${testsbit_unmapped}" -eq 1 ]; then
   REASON="_tests_/bit/**, _tests_/imports/**, or _tests_/stress/** changed but at least one file could not be mapped to a gate by name — falling through to full"
 elif [ "${has_selfhost}" -eq 1 ]; then
   BUCKET="selfhost"
-  REASON="only compiler/** changed"
+  # has_selfhost is set by two unrelated case arms in gate-classify.sh
+  # (compiler/* and spec/FMT.md|spec/LINT.md, #5617) — pick the REASON text
+  # that matches which arm(s) actually fired instead of always naming the
+  # compiler/** arm.
+  if [ "${has_selfhost_specdoc:-0}" -eq 1 ] && [ "${has_selfhost_compiler:-0}" -eq 1 ]; then
+    REASON="compiler/** and spec/FMT.md|spec/LINT.md changed (test-fmt-citations reads both): ${selfhost_specdoc_list}"
+  elif [ "${has_selfhost_specdoc:-0}" -eq 1 ]; then
+    REASON="only spec/FMT.md and/or spec/LINT.md changed (routed to selfhost, test-fmt-citations reads both): ${selfhost_specdoc_list}"
+  else
+    REASON="only compiler/** changed"
+  fi
 elif [ "${has_runtime}" -eq 1 ]; then
   BUCKET="runtime"
   REASON="only runtime/** changed"
