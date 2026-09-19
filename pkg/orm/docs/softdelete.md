@@ -23,7 +23,7 @@ import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql
 }
 
 fn accountEntity(): Account {
-  return Account{ id: 0, email: "", deletedAt: Option.None }
+  return Account{ id = 0, email = "", deletedAt = Option.None }
 }
 
 fn accountFields(): []FieldDesc {
@@ -35,7 +35,7 @@ fn accountAttrs(): []AttrDesc {
 }
 
 fn accountDesc(): TableDesc {
-  return TableDesc{ table: "accounts", fields: accountFields(), classAttrs: accountAttrs() }
+  return TableDesc{ table = "accounts", fields = accountFields(), classAttrs = accountAttrs() }
 }
 
 fn accountValues(a: Account): map<string, Value> {
@@ -65,9 +65,9 @@ filter to every terminal automatically:
 fn accountMapper(rows: Rows): Account! {
   let cols = rows.columns()
   return Account{
-    id: sqlReqInt(rows, cols, "id")?,
-    email: sqlReqText(rows, cols, "email")?,
-    deletedAt: Option.None,
+    id = sqlReqInt(rows, cols, "id")?,
+    email = sqlReqText(rows, cols, "email")?,
+    deletedAt = Option.None,
   }
 }
 
@@ -142,7 +142,7 @@ bug your own code can report, same as any other `catch`:
 
 ```bit ignore
 fn brokenDesc(): TableDesc {
-  return TableDesc{ table: "brokens", fields: [], classAttrs: [AttrDesc{ name: "softDelete", args: []string(0) }] }
+  return TableDesc{ table = "brokens", fields = [], classAttrs = [AttrDesc{ name = "softDelete", args = []string(0) }] }
 }
 
 fn probe(db: Data): ()! {
@@ -219,7 +219,7 @@ fn teamAccountsLoader(): RelationLoader<Team> {
 }
 
 fn teamMapper(rows: Rows): Team! {
-  return Team{ id: sqlReqInt(rows, rows.columns(), "id")? }
+  return Team{ id = sqlReqInt(rows, rows.columns(), "id")? }
 }
 
 fn teams(db: Data): Query<Team> {
@@ -227,7 +227,7 @@ fn teams(db: Data): Query<Team> {
     find<Team>(
       db,
       "teams",
-      [FieldDesc{ name: "id", typeName: "i64", attrs: []AttrDesc(0) }],
+      [FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }],
       teamMapper,
     ),
     map<string, RelationLoader<Team>>{ "accounts": teamAccountsLoader() },

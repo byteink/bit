@@ -218,9 +218,9 @@ fn paymentById(db: Pool, id: string): Payment! {
   defer rows.close()
   rows.next()?
   return Payment{
-    id: mysqlUuid("id", rows.value(0))?,
-    payoutId: mysqlOptUuid("payout_id", rows.value(1))?,
-    sourceIp: asText(rows.value(2))?,
+    id = mysqlUuid("id", rows.value(0))?,
+    payoutId = mysqlOptUuid("payout_id", rows.value(1))?,
+    sourceIp = asText(rows.value(2))?,
   }
 }
 ```

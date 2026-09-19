@@ -17,7 +17,7 @@ import { adapter } from "postgres"
 import { env } from "std/os"
 
 fn run(): ()! {
-  let db = pool(adapter(), Datasource{ uri: env("DATABASE_URL") })?
+  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL") })?
   let rows = db.query("select * from users where id = $1", []Value{ Value.Int(7) })?
 }
 ```
@@ -30,7 +30,7 @@ form of `Datasource`:
 ```
 postgres://app:pw@localhost:5432/dev
 postgresql://app:pw@db.internal/erp?sslmode=verify-full
-Datasource{ host: "localhost", user: "app", database: "dev" }
+Datasource{ host = "localhost", user = "app", database = "dev" }
 ```
 
 `uri` and the individual fields are mutually exclusive - `std/sql`'s

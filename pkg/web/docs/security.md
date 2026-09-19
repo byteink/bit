@@ -22,7 +22,7 @@ import { App, Config, MemoryStore } from "web"
 import { env } from "std/os"
 
 fn build(): App {
-  return App(Config{ secret: env("APP_SECRET"), sessions: MemoryStore(10_000) })
+  return App(Config{ secret = env("APP_SECRET"), sessions = MemoryStore(10_000) })
 }
 ```
 
@@ -48,7 +48,7 @@ import { App, Limit, MemoryCounter, byIp, rateLimit, csrf } from "web"
 
 fn mount(app: App) {
   let pages = app.group("/")
-  pages.use(rateLimit(Limit{ requests: 30, window: 60, by: byIp, store: MemoryCounter(10_000) }))
+  pages.use(rateLimit(Limit{ requests = 30, window = 60, by = byIp, store = MemoryCounter(10_000) }))
   pages.use(csrf())
 }
 ```
@@ -72,11 +72,11 @@ fn mount(app: App) {
   app.use(
     cors(
       Cors{
-        origins: []string{ "https://app.example.com" },
-        methods: []string{ "GET", "POST" },
-        headers: []string{ "Content-Type", "Authorization" },
-        credentials: true,
-        maxAge: 600,
+        origins = []string{ "https://app.example.com" },
+        methods = []string{ "GET", "POST" },
+        headers = []string{ "Content-Type", "Authorization" },
+        credentials = true,
+        maxAge = 600,
       },
     ),
   )
@@ -103,7 +103,7 @@ in a proxy is the only party that knows), and is what turns on
 import { App, Headers, secureHeaders } from "web"
 
 fn mount(app: App) {
-  app.use(secureHeaders(Headers{ https: true }))
+  app.use(secureHeaders(Headers{ https = true }))
 }
 ```
 

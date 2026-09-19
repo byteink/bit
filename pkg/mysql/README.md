@@ -7,7 +7,7 @@ import { pool, Datasource, Pool } from "std/sql"
 import { adapter } from "mysql"
 
 fn connect(url: string): Pool! {
-  return pool(adapter(), Datasource{ uri: url })?
+  return pool(adapter(), Datasource{ uri = url })?
 }
 ```
 

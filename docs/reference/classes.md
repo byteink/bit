@@ -25,8 +25,8 @@ fn storeLink() {
 
 `class Link { ... }` declares the shape: three named fields, each with a
 type. `export` on a field means code outside this module can read and write
-it; leave it off and only this module can. `Link{ url: ..., created: ...,
-hits: ... }` is a **composite literal**: it always starts with the type name,
+it; leave it off and only this module can. `Link{ url = ..., created = ...,
+hits = ... }` is a **composite literal**: it always starts with the type name,
 so a `{` at the start of a statement is never ambiguous between a literal and
 a plain block. `l.url` and `l.hits` read fields with `.`.
 
@@ -134,7 +134,7 @@ let bad = { url: "https://example.com" } // this is a block, not a Link
 ```
 
 Write the type name every time, even when it seems obvious from context:
-`Link{ url: "https://example.com" }`.
+`Link{ url = "https://example.com" }`.
 
 ## When not to use a class
 
@@ -214,8 +214,8 @@ given a value everywhere a `Link`-shaped field could otherwise be omitted:
 class Inner { n: int }
 class Outer { a: int, b: Inner }
 
-let bad = Outer{ a: 1 }              // error[E0083]: 'b' omitted
-let good = Outer{ a: 1, b: Inner{} } // fine
+let bad = Outer{ a = 1 }              // error[E0083]: 'b' omitted
+let good = Outer{ a = 1, b = Inner{} } // fine
 ```
 
 A class-typed field can still be omitted if it declares its own default,
@@ -244,8 +244,8 @@ fn separateDefaults(): int {
 ```
 
 A shared default object was considered and rejected: it would make
-`Configured{ a: 1 }.b` an alias of every other omission's `b`, with nothing
-in `Configured{ a: 1 }` to suggest that. Mutating one caller's copy would
+`Configured{ a = 1 }.b` an alias of every other omission's `b`, with nothing
+in `Configured{ a = 1 }` to suggest that. Mutating one caller's copy would
 silently reach every other caller's.
 
 ### Comparability

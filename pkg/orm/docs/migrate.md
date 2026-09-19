@@ -53,17 +53,17 @@ import { Timestamp, now } from "std/time"
 fn migrations(): []Migration {
   return [
     Migration{
-      version: 7,
-      name: "add_widget_phone",
+      version = 7,
+      name = "add_widget_phone",
       // A stable identifier for this migration's content - nothing computes
       // one for you yet, so today it's a hand-picked string, kept unique.
-      checksum: "a1b2c3",
-      apply: () => [
+      checksum = "a1b2c3",
+      apply = () => [
         alter("widgets", (t) => {
           t.addString("phone", 255)
         }),
       ],
-      revert: () => [
+      revert = () => [
         alter("widgets", (t) => {
           t.dropColumn("phone")
         }),
@@ -73,7 +73,7 @@ fn migrations(): []Migration {
 }
 
 fn postgresDialect(): RunnerDialect {
-  return RunnerDialect{ render: Postgres{}, server: ServerDialect.Postgres }
+  return RunnerDialect{ render = Postgres{}, server = ServerDialect.Postgres }
 }
 ```
 
@@ -106,7 +106,7 @@ still pending in ascending version order. It returns an `UpReport` -
 `applied: []AppliedMigration`, one entry per migration that actually ran,
 each carrying `version`, `name`, `checksum`, `appliedAt` and `durationMs`.
 On a database with no `widgets.phone` column yet, `deploy(db)` returns a
-report with one `AppliedMigration{ version: 7, name: "add_widget_phone",
+report with one `AppliedMigration{ version = 7, name = "add_widget_phone",
 ... }`. Run it again and the report's `applied` list is empty - version 7
 is already in the ledger.
 
@@ -174,7 +174,7 @@ fn seedLocalHistory(db: Data, m: Migration, at: Timestamp): ()! {
   recordApplied(
     db,
     HistoryEntry{
-      version: m.version, name: m.name, checksum: m.checksum, appliedAt: at.ns, durationMs: 0,
+      version = m.version, name = m.name, checksum = m.checksum, appliedAt = at.ns, durationMs = 0,
     },
   )?
 }
