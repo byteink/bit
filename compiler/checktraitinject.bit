@@ -1,0 +1,270 @@
+// compiler/checktraitinject.bit — split out of checktrait.bit (#5641,
+// which was at the 800-line E0200 ceiling with zero headroom). Sibling
+// .bit file, same module: nothing here needs an import. See
+// checktrait.bit's header for how this fits the overall trait-injection
+// design (SPEC §10.7, #3369).
+//
+// Two halves that only make sense together: cloning a provided
+// trait_method into a `func_decl` the using class could have written
+// itself (cloneTraitMethod and its Self-substitution/generics helpers),
+// and per-class injection (injectIntoClass), which reports a still-
+// required method as E0104 and calls the cloning half for everything the
+// class's `use` statements actually supply.
+
+// ---- cloning a provided method into a using class ------------------------
+
+// A deep copy of `node`, with every bare `Self` identifier replaced by
+// `classSpan` — the using class's own name. Every other node is copied with
+// its ORIGINAL span (so a diagnostic inside the injected body still points
+// at the trait's own source), which is safe because these clones are never
+// compared node-identity-wise against the original.
+fn cloneWithSelf(tree: Tree, source: string, node: int, classSpan: Span): int {
+  if (node == 0) {
+    return 0
+  }
+  let n = getNode(tree, node)
+  if (isLeafTag(n.tag)) {
+    if (n.tag == Tag.Ident && source[n.span.start:n.span.end] == "Self") {
+      return addLeaf(tree, Tag.Ident, classSpan)
+    }
+    return addLeaf(tree, n.tag, n.span)
+  }
+  let kids = kidsOf(tree, node)
+  let newKids = []int(0)
+  let i = 0
+  while (i < len(kids)) {
+    newKids = append(newKids, cloneWithSelf(tree, source, kids[i], classSpan))
+    i = i + 1
+  }
+  return addNode(tree, n.tag, n.span, n.main, newKids)
+}
+
+// A type reference to the using class, mirroring parsertype.bit's
+// `classTypeRef` at the Tree level (that one runs at parse time, off a live
+// Parser; this one runs after parsing, off the Tree it left behind).
+fn traitClassTypeRef(tree: Tree, className: int, classGenerics: int): int {
+  let dup = addLeaf(tree, Tag.Ident, getNode(tree, className).span)
+  if (classGenerics == 0) {
+    return dup
+  }
+  let gps = kidsOf(tree, classGenerics)
+  let targItems = []int(0)
+  let gi = 0
+  while (gi < len(gps)) {
+    targItems = append(targItems, kidsOf(tree, gps[gi])[0])
+    gi = gi + 1
+  }
+  let targs = addNode(tree, Tag.TypeArgs, getNode(tree, classGenerics).span, 0, targItems)
+  return addNode(tree, Tag.GenericInst, getNode(tree, classGenerics).span, 0, [dup, targs])
+}
+
+// A fresh copy of the class's own generic-param list, mirroring
+// parsertype.bit's `dupGenericParams`: `registerGenerics` mints a TypeParam
+// id per NODE IDENTITY, so the injected method needs its own node, not the
+// class's.
+fn dupGenericParamsTree(tree: Tree, genNode: int): int {
+  let gps = kidsOf(tree, genNode)
+  let items = []int(0)
+  let gi = 0
+  while (gi < len(gps)) {
+    items = append(
+      items,
+      addNode(tree, Tag.GenericParam, getNode(tree, gps[gi]).span, 0, kidsOf(tree, gps[gi])),
+    )
+    gi = gi + 1
+  }
+  return addNode(tree, Tag.GenericParams, getNode(tree, genNode).span, 0, items)
+}
+
+// Tree-level mirror of parsertype.bit's `mergeGenericParams` (that one runs
+// off a live Parser; injection runs after parsing, off the Tree it left
+// behind). Same "receiver params first" contract: `a` (the using class's own,
+// already duplicated by `dupGenericParamsTree`) precedes `b` (the trait
+// method's own, likewise duplicated) so the checker can zip a class's
+// declared params against its own by position exactly as it does for an
+// in-body method (checkbind.bit's `noteOwnTypeParams`).
+fn mergeGenericParamsTree(tree: Tree, a: int, b: int): int {
+  if (a == 0) {
+    return b
+  }
+  if (b == 0) {
+    return a
+  }
+  let items = []int(0)
+  let ak = kidsOf(tree, a)
+  let i = 0
+  while (i < len(ak)) {
+    items = append(items, ak[i])
+    i = i + 1
+  }
+  let bk = kidsOf(tree, b)
+  let j = 0
+  while (j < len(bk)) {
+    items = append(items, bk[j])
+    j = j + 1
+  }
+  return addNode(tree, Tag.GenericParams, unionSpan(tree, items, getNode(tree, a).span), 0, items)
+}
+
+fn unionSpan(tree: Tree, kids: []int, fallback: Span): Span {
+  let start = -1
+  let end = -1
+  let i = 0
+  while (i < len(kids)) {
+    let k = kids[i]
+    if (k != 0) {
+      let s = getNode(tree, k).span
+      if (!(s.start == 0 && s.end == 0)) {
+        if (start < 0 || s.start < start) {
+          start = s.start
+        }
+        if (end < 0 || s.end > end) {
+          end = s.end
+        }
+      }
+    }
+    i = i + 1
+  }
+  if (start < 0) {
+    return fallback
+  }
+  return Span{ file = fallback.file, start = start, end = end }
+}
+
+// Clones trait_method `methodNode` into a `func_decl [receiver name generics
+// params result body]` — the same shape #3367's in-body methods desugar to
+// — with `this` typed as the using class and every `Self` replaced by it.
+// The generics kid is the using class's own params (so the receiver's `T` is
+// in scope) merged with the METHOD's own (SPEC §10.7's optional
+// `generic_params`), duplicated fresh here rather than reused from the trait:
+// each USE SITE monomorphises independently (SPEC §13.6), so two classes
+// using the same generic trait method must not share one TypeParam identity
+// (parsertype.bit's `dupGenericParams` doc explains the #3765 hazard this
+// avoids).
+fn cloneTraitMethod(
+  tree: Tree,
+  source: string,
+  methodNode: int,
+  classNameNode: int,
+  classGenerics: int,
+): int {
+  let mk = kidsOf(tree, methodNode) // [name, generics, params, result, body]
+  let classSpan = getNode(tree, classNameNode).span
+  let name = cloneWithSelf(tree, source, mk[0], classSpan)
+  let params = cloneWithSelf(tree, source, mk[2], classSpan)
+  let result = cloneWithSelf(tree, source, mk[3], classSpan)
+  let body = cloneWithSelf(tree, source, mk[4], classSpan)
+  let classGen = 0
+  if (classGenerics != 0) {
+    classGen = dupGenericParamsTree(tree, classGenerics)
+  }
+  let ownGen = 0
+  if (mk[1] != 0) {
+    ownGen = dupGenericParamsTree(tree, mk[1])
+  }
+  let generics = mergeGenericParamsTree(tree, classGen, ownGen)
+  let recv = addNode(
+    tree, Tag.Receiver, getNode(tree, name).span, 0,
+    [0, traitClassTypeRef(tree, classNameNode, classGenerics)],
+  )
+  let kids = [recv, name, generics, params, result, body]
+  return addNode(tree, Tag.FuncDecl, unionSpan(tree, kids, getNode(tree, methodNode).span), 0, kids)
+}
+
+// ---- per-class injection ---------------------------------------------------
+
+fn reportMissingRequired(
+  diags: Diagnostics,
+  className: string,
+  traitName: string,
+  methodName: string,
+  span: Span,
+) {
+  report(
+    diags, ecTraitMethodMissing, span,
+    "class '${className}' does not supply '${methodName}', required by trait '${traitName}'",
+    "declare '${methodName}' on '${className}' itself",
+  )
+}
+
+// The (required, provided) set for everything a class's `use` statements
+// bring in, one merge per named trait. Unknown trait names are reported
+// here (E0107) and otherwise ignored — nothing to merge.
+fn effectiveUses(ctx: TraitCtx, cu: ClassUse): TraitMethodSet {
+  let effective = emptyTraitMethodSet()
+  let j = 0
+  while (j < len(cu.useStmts)) {
+    let names = kidsOf(ctx.tree, cu.useStmts[j])
+    let k = 0
+    while (k < len(names)) {
+      let tSpan = getNode(ctx.tree, names[k]).span
+      let tName = ctx.source[tSpan.start:tSpan.end]
+      let (_, known) = ctx.traits[tName]
+      if (!known) {
+        reportNoHint(
+          ctx.diags,
+          ecUnknownTrait,
+          tSpan,
+          "no trait named '${tName}' is declared in this module",
+        )
+      } else {
+        mergeTraitSets(effective, resolveTraitMethods(ctx, tName, 0), ctx.diags, tSpan)
+      }
+      k = k + 1
+    }
+    j = j + 1
+  }
+  return effective
+}
+
+fn reportMissingIn(
+  ctx: TraitCtx,
+  className: string,
+  ownMethods: map<string, bool>,
+  cu: ClassUse,
+  effective: TraitMethodSet,
+) {
+  for (mname, isReq) of effective.required {
+    if (isReq) {
+      let (_, ownHas) = ownMethods["${className}.${mname}"]
+      if (!ownHas) {
+        reportMissingRequired(
+          ctx.diags,
+          className,
+          effective.requiredFrom[mname],
+          mname,
+          getNode(ctx.tree, cu.classNode).span,
+        )
+      }
+    }
+  }
+}
+
+fn injectProvidedIn(
+  ctx: TraitCtx,
+  className: string,
+  ownMethods: map<string, bool>,
+  cu: ClassUse,
+  effective: TraitMethodSet,
+): []int {
+  let injected = []int(0)
+  for (mname, node) of effective.providedNode {
+    let (_, ownHas) = ownMethods["${className}.${mname}"]
+    if (node != 0 && !ownHas) {
+      injected = append(
+        injected,
+        cloneTraitMethod(ctx.tree, ctx.source, node, cu.className, cu.classGenerics),
+      )
+    }
+  }
+  return injected
+}
+
+// Validates and injects for one class, returning the new `func_decl` nodes
+// (possibly none) to attach as top-level declarations.
+fn injectIntoClass(ctx: TraitCtx, ownMethods: map<string, bool>, cu: ClassUse): []int {
+  let className = identText(ctx.tree, ctx.source, cu.className)
+  let effective = effectiveUses(ctx, cu)
+  reportMissingIn(ctx, className, ownMethods, cu, effective)
+  return injectProvidedIn(ctx, className, ownMethods, cu, effective)
+}
