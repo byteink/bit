@@ -12,13 +12,13 @@ summary the generator emits per commit.
 `dist/release.sh` run, and `dist/out/` is gitignored, so nothing written
 directly into `NOTES.md` survives past the release that produced it. Before
 this file there was no tracked, durable home for a hand-written note, and
-that is exactly why the #3208 disclosure below missed both the 0.1.21 and
-the 0.1.22 release notes (see #3213) even though the fix itself had already
-shipped in 0.1.21.
+that is exactly why the disclosure below missed both the 0.1.21 and the
+0.1.22 release notes even though the fix itself had already shipped in
+0.1.21.
 
 ## How to use this file
 
-**The fold-in half is automatic (#3392).** `dist/release.sh` reads this file
+**The fold-in half is automatic.** `dist/release.sh` reads this file
 right after `dist/changelog.sh` writes `dist/out/NOTES.md`, and if it finds
 any entries below the `---` separator, appends each one (heading demoted one
 level, under the version title) to `dist/out/NOTES.md` - on both a real run

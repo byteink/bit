@@ -1,6 +1,6 @@
 # Request-scoped context propagation: decision
 
-**Status:** decided (#3968). Task-local storage in the runtime (candidate B),
+**Status:** decided. Task-local storage in the runtime (candidate B),
 copy-on-spawn. No public API lands from this decision - it is scoped to the
 `spawn` runtime contract that any future `Context` type must be built on.
 Cancellation/deadlines are explicitly out of scope (see below for whether B can
@@ -9,7 +9,7 @@ carry them later).
 ## The gap
 
 Bit has no way to carry a value that belongs to *this request* through the code
-the request runs - distributed tracing (#3969), request-scoped logging,
+the request runs - distributed tracing, request-scoped logging,
 per-request deadlines, and an authenticated identity all need this and none of
 them exist today. `stdlib/http/server.bit` already spawns one green task per
 accepted connection to read the request (`Server`'s own comment), so a real
@@ -113,9 +113,8 @@ site - is a real but bounded cost, not an open-ended one.
 B's natural superset that we build when a real caller needs it.
 
 **Reject the false alternative of designing nothing.** The four consumers
-named in this ticket (#3969 tracing, request-scoped logging, deadlines,
-identity) all need this exact primitive; deferring the decision defers all
-four.
+named above (tracing, request-scoped logging, deadlines, identity) all need
+this exact primitive; deferring the decision defers all four.
 
 ## The prototype
 
@@ -198,5 +197,5 @@ cancellation (not decided here, per the ticket's scope) is the reverse
 direction: a parent needs a way to reach into a *live* child's slot to signal
 cancellation, which the copy-on-spawn design does not provide - copying is
 one-shot, parent-to-child, at spawn time. That reachability (or a
-subscribe/notify channel instead of a polled flag) is #3968's explicit
-out-of-scope item and is real design work for whichever ticket takes it on.
+subscribe/notify channel instead of a polled flag) is explicitly out of
+scope here, and is real design work of its own.

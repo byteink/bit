@@ -66,7 +66,7 @@ Published advisories live in **GitHub Security Advisories** on this
 repository: https://github.com/byteink/bit/security/advisories
 
 They are also cross-linked from [`docs/release/SUPPORT.md`](docs/release/SUPPORT.md)
-(landing via #1748, alongside this file).
+(landing alongside this file).
 
 A security-relevant fix that also needs a plain-language mention in the next
 release's notes (affected versions, observable symptom) stages that text in
@@ -88,7 +88,7 @@ duplicated here to avoid drift.
 | Latest LTS line                 | Yes, until its EOL date (see SUPPORT.md) |
 | Latest interim (non-LTS) release | Yes, until superseded or its support window ends |
 | Older / EOL lines               | No - upgrade to a supported line |
-| Pre-1.0 (`0.x`)                 | No support guarantee; upgrade-only until v1.0 (#366) activates this policy |
+| Pre-1.0 (`0.x`)                 | No support guarantee; upgrade-only until v1.0 activates this policy |
 
 If `docs/release/SUPPORT.md` and this table ever disagree, `SUPPORT.md`
 governs.
