@@ -54,13 +54,20 @@ take() {
 #   2. a possessive ("#5604's split") -> "the split", which keeps the sentence
 #      grammatical; deleting the token outright leaves "after split"
 #   3. anything else still bare
+# A run is slash- or comma-separated ("Fix #5409/#5410:", "merging #2344/#2022")
+# and must be matched as one: a per-id rule consumes the separator, so the
+# second id in a run survives. Removing a run that OPENED the subject leaves a
+# stray ": " or " : ", hence the two punctuation rules - both narrow, and the
+# trailing-colon case is deliberately untouched.
 # Deliberately NO punctuation tidying. An earlier draft collapsed " :" to ":"
 # and corrupted the subject "fmt: emit = for keyed class field inits, not :",
 # whose trailing colon is the thing the commit is about.
 stripInternalRefs() {
   sed -E -e 's/[[:space:]]*\(#[0-9]{2,6}[^)]*\)//g' \
          -e "s/#[0-9]{2,6}'s/the/g" \
-         -e 's/(^|[^0-9A-Za-z_])#[0-9]{2,6}([^0-9A-Za-z_]|$)/\1\2/g' \
+         -e 's/(^|[^0-9A-Za-z_])#[0-9]{2,6}((\/|, ?)#[0-9]{2,6})*/\1/g' \
+         -e 's/[[:space:]]+:([[:space:]])/:\1/g' \
+         -e 's/^[[:space:]]*[:,;]*[[:space:]]*//' \
          -e 's/[[:space:]]{2,}/ /g' \
          -e 's/[[:space:]]+$//'
 }
