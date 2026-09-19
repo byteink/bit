@@ -604,13 +604,13 @@ has already relaxed. A `bit.json` with no `"lint"` key, or no `bit.json` at
 all, is exactly today's model - no project layer, no user layer, no
 inheritance beyond what is shown above.
 
-### 5.4 Day-one adoption
+### 5.4 Day-one adoption (2026-07, historical)
 
-Rules fail by default from the first commit. The repository is made green not
-by a baseline file but by stamping overrides on the files already in
+Rules failed by default from the first commit. Rather than a baseline file,
+the repository was made green by stamping overrides on the files already in
 violation:
 
-| File | Lines |
+| File | Lines at day one |
 |---|---|
 | `compiler/selfcheck.bit` | 7078 |
 | `compiler/lower.bit` | 5109 |
@@ -624,19 +624,32 @@ violation:
 | `compiler/validate.bit` | 1280 |
 | `compiler/machoexec.bit` | 1221 |
 
-Each stamped number is that file's current length, so the file is frozen at its
-present size and any growth fails:
+Each stamped number was that file's then-current length, so the file was
+frozen at its present size and any further growth failed:
 
 ```
 // bit:lint max-file-lines=5109 -- pre-dates lint; split tracked separately
 ```
 
-The number only ever moves down, as the file is split. The override *is* the
-ratchet - no separate baseline mechanism, and nothing to keep in sync. Since
-every stamp carries a reason, the initial commit also records which files are
-known debt rather than deliberate exceptions.
+The number only ever moved down, as the file was split. The override *was*
+the ratchet - no separate baseline mechanism, and nothing to keep in sync.
+Since every stamp carried a reason, the initial commit also recorded which
+files were known debt rather than deliberate exceptions.
 
-New files get the default and no grace.
+By 2026-09-19 every file in the table above had been split under E0200's
+default limit of 800 lines, and every stamp had been removed along with it.
+No production file carries a `max-file-lines` override today; the only
+matches for the directive outside test fixtures are the diagnostic's own
+message text and the checker's unit tests. The override mechanism itself is
+unchanged and still specified below (§5.4.1); it is simply idle - nothing in
+the repository currently exercises it as a real exception.
+
+#### 5.4.1 The override mechanism
+
+New files get the default and no grace. A file that crosses the limit can
+still raise it with the same stamp form shown above, one directive per file,
+carrying a reason. `_tests_/bit/lintfilelines.bit` and
+`_tests_/cases/lint_override.bit` exercise this path directly.
 
 ### 5.5 Per-finding overrides (`allow`, #2438)
 
