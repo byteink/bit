@@ -24,15 +24,15 @@ import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql
 fn personMapper(rows: Rows): Person! {
   let cols = rows.columns()
   return Person{
-    id: sqlReqInt(rows, cols, "id")?,
-    name: sqlReqText(rows, cols, "name")?,
-    email: sqlReqText(rows, cols, "email")?,
-    joinedAt: sqlReqInt(rows, cols, "joined_at")?,
+    id = sqlReqInt(rows, cols, "id")?,
+    name = sqlReqText(rows, cols, "name")?,
+    email = sqlReqText(rows, cols, "email")?,
+    joinedAt = sqlReqInt(rows, cols, "joined_at")?,
   }
 }
 
 fn people(db: Data): Query<Person> {
-  let fields = Person{ id: 0, name: "", email: "", joinedAt: 0 }.tableDescriptor()
+  let fields = Person{ id = 0, name = "", email = "", joinedAt = 0 }.tableDescriptor()
   return find<Person>(db, "people", fields, personMapper)
 }
 

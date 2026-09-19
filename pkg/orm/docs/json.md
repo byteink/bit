@@ -87,9 +87,9 @@ different" below for what that means on the Bit side.
 fn nonCanonicalPayload(): Json {
   return Json.JsonObject(
     [
-      JsonEntry{ key: "b", value: Json.JsonInt(2) },
-      JsonEntry{ key: "a", value: Json.JsonString("x") },
-      JsonEntry{ key: "a", value: Json.JsonBool(true) },
+      JsonEntry{ key = "b", value = Json.JsonInt(2) },
+      JsonEntry{ key = "a", value = Json.JsonString("x") },
+      JsonEntry{ key = "a", value = Json.JsonBool(true) },
     ],
   )
 }
@@ -129,7 +129,7 @@ values, never the raw bytes.
 }
 
 fn writeAndReadMeta(): EventMeta! {
-  let meta = EventMeta{ source: "webhook", retryCount: 2 }
+  let meta = EventMeta{ source = "webhook", retryCount = 2 }
   let bound = jsonColumnValue(meta.toJson())
   return jsonColumnDecode<EventMeta>(bound, "meta")?
 }
