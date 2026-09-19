@@ -1,0 +1,229 @@
+// compiler/lowerinstemit.bit — split out of compiler/lowerdriver.bit (#5640,
+// which was at the 800-line E0200 ceiling with zero headroom). Sibling of
+// lowerdriver.bit: same module (directory-scanned), so this needs no imports
+// and no call-site changes.
+//
+// Pass A2 (lowerInstance and its symbol/label/note helpers) and Pass A3
+// (lowerModuleMethods, lowerMethodInstances): emits the bodies Pass A1
+// (lowerinstclosure.bit) decided were needed — one per generic function
+// instantiation and one per nominal instantiation of a generic-receiver
+// method.
+
+// Pass A3 for one module: its methods, in declaration order. Three shapes, and
+// the instantiation ledger owns one of them outright:
+//
+//   - a plain method on a plain class: one body, emitted here;
+//   - a method that declares its OWN type params (SPEC 10.4's `scaled<T>`,
+//     #4495): monomorphized, so Pass A2 has already emitted one body per ledger
+//     entry and the template itself emits nothing — its `T` slots have no
+//     concrete type to lower against, which is exactly why lowering used to
+//     refuse the whole program with E0092;
+//   - a method on a GENERIC receiver: one body per nominal instantiation, and
+//     an uninstantiated template emits nothing (#1540).
+//
+// The generic-receiver arm is checked SECOND: a method that is generic in both
+// its receiver and itself is a ledger entry, and its receiver arguments are
+// bound in that same entry, so `lowerMethodInstances` must not also emit it
+// once per receiver instantiation under an unsuffixed symbol.
+fn lowerModuleMethods(
+  c: Checker, consts: map<string, int>, lowerer: Lowerer, out: []IrFunc,
+): []IrFunc {
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let n = getNode(c.tree, m)
+    if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0 && methodOwnGenericCount(c, m) == 0) {
+      let recvName = typeNodeName(c, kidsOf(c.tree, kidsOf(c.tree, m)[0])[1])
+      if (len(declTypeParamIds(c, recvName)) == 0) {
+        out = append(out, lowerFunc(c, m, consts, lowerer))
+      } else {
+        out = lowerMethodInstances(c, m, consts, lowerer, recvName, out)
+      }
+    }
+    m = m + 1
+  }
+  return out
+}
+
+// Lowers method `decl` once per nominal instantiation of its generic receiver
+// `recvName`, appending each to `out` in the checker's instantiation order (the
+// seed's emission order). Returns `out` unchanged when the generic was never
+// instantiated — a template has no concrete slot types, so there is nothing to
+// emit and nothing that could call it.
+//
+// The receiver's type-argument NAMES are rebound positionally onto the concrete
+// args, exactly as `lowerInstance` does for a generic function: that fixes every
+// site which RE-RESOLVES a type node, while `genEnv` fixes every site that
+// reads a type the checker already recorded against the template — see nodeType.
+fn lowerMethodInstances(
+  c: Checker, decl: int, consts: map<string, int>,
+  lowerer: Lowerer, recvName: string, out: []IrFunc,
+): []IrFunc {
+  let params = declTypeParamIds(c, recvName)
+  let argNames = receiverTypeParamNames(c, decl)
+  let nm = getNode(c.tree, kidsOf(c.tree, decl)[1])
+  let fname = c.source[nm.span.start:nm.span.end]
+  let i = 0
+  while (i < len(c.ctx.typeInsts)) {
+    let inst = c.ctx.typeInsts[i]
+    if (inst.module != c.moduleId ||
+      inst.name != recvName ||
+      len(inst.args) != len(params) ||
+      !typeInstArgsConcrete(c.ctx, inst.args)) {
+      i = i + 1
+      continue
+    }
+    let saved = bindReceiverTypeParams(c, argNames, inst.args)
+    let genEnv = methodInstEnv(c, decl, recvName, inst.args)
+    out = append(
+      out,
+      lowerFuncNamed(
+        c, decl, consts, lowerer,
+        lowerer.modPrefix + fname + "\$t${inst.result}", genEnv,
+      ),
+    )
+    restoreReceiverTypeParams(c, argNames, saved)
+    i = i + 1
+  }
+  return out
+}
+
+// The type-parameter names a method declares, in order — the `A, B` of
+// `(p: Pair<A, B>) first()`. The parser merges a receiver's `<...>` in FRONT of
+// the method's own `<...>`, so this one list covers both, and position is what
+// lines it up with an instantiation's arguments (a method may name the
+// receiver's parameters differently from the class declaration, #1325).
+fn receiverTypeParamNames(c: Checker, decl: int): []string {
+  let out = []string(0)
+  let genNode = kidsOf(c.tree, decl)[2]
+  if (genNode == 0) {
+    return out
+  }
+  let tps = kidsOf(c.tree, genNode)
+  let i = 0
+  while (i < len(tps)) {
+    let n = getNode(c.tree, kidsOf(c.tree, tps[i])[0])
+    out = append(out, c.source[n.span.start:n.span.end])
+    i = i + 1
+  }
+  return out
+}
+
+// The link symbol of instantiation `g`: the declaring module's prefix, the
+// ledger name, and the ledger INDEX, which IS the `$n` suffix. One formula,
+// read by the definition (Pass A2) and by both call sites — a plain `f(...)`
+// and a method `recv.m(...)` — so a caller cannot name an instance the emitter
+// did not write.
+fn instanceSymbol(ctx: TypeContext, root: int, g: int): string {
+  let inst = ctx.instantiations[g]
+  return "${modulePrefix(inst.module, root)}${inst.name}\$${g}"
+}
+
+// The instantiation `g` as a reader would write it — `freeName<Dog>` — for a
+// diagnostic ONLY. `instanceSymbol` above stays the single place a name anything
+// links against is built; nothing may resolve against what this returns.
+//
+// A generic METHOD is a ledger entry too (#4495) under the mangled name
+// `<method>$t<recvTypeId>` (check.bit's `Instantiation`), which is an internal
+// spelling no diagnostic should show; the suffix is cut here, and the receiver
+// is already under the primary span. A zero-argument entry cannot occur — a
+// generic declares at least one parameter — but it renders as the bare name
+// rather than as `name<>` if one ever does.
+fn instantiationLabel(ctx: TypeContext, g: int): string {
+  let inst = ctx.instantiations[g]
+  let cut = indexOf(inst.name, "$")
+  let bare = inst.name
+  if (cut >= 0) {
+    bare = inst.name[0:cut]
+  }
+  if (len(inst.args) == 0) {
+    return bare
+  }
+  let out = bare + "<"
+  let i = 0
+  while (i < len(inst.args)) {
+    if (i > 0) {
+      out = out + ", "
+    }
+    out = out + typeName(ctx, inst.args[i])
+    i = i + 1
+  }
+  return out + ">"
+}
+
+// #4553: every refusal `lowerFuncNamed` recorded while emitting instantiation
+// `g` gains a note naming the specialisation and pointing at the call that put
+// it in the ledger (`Instantiation.site`, kept since #3827). The primary span is
+// untouched — it is where lowering actually failed, inside the generic's own
+// source, and that source is usually correct code in a file the reader does not
+// own, which is why the message alone sent readers to the wrong file (#4531).
+//
+// Attributed HERE rather than in `fcFail` because this is the one point that
+// holds both halves: the failure has just been recorded and `g` is in hand. The
+// alternative — a "which instance am I emitting" field on `FnCtx` — would have
+// to be threaded through the closure bodies that share the enclosing `FnCtx`
+// and given a sentinel in three other `FnCtx` literals, where a zero-filled 0
+// is a VALID ledger index and so would misattribute rather than say nothing.
+//
+// `first` is read before the body lowers, so a stub an earlier instance left in
+// the list can never be re-attributed to this one; every entry at or past it
+// belongs to this instantiation, closures inside it included.
+fn noteInstantiationStubs(ctx: TypeContext, lowerer: Lowerer, first: int, g: int) {
+  if (first >= len(lowerer.stubbed)) {
+    return
+  }
+  let label = instantiationLabel(ctx, g)
+  let i = first
+  while (i < len(lowerer.stubbed)) {
+    let s = lowerer.stubbed[i]
+    s.note = "while emitting '${label}', instantiated here"
+    s.noteSite = ctx.instantiations[g].site
+    i = i + 1
+  }
+}
+
+// Lowers generic instantiation `g` of module `c` — the type params bound to the
+// instantiation's concrete args for the duration, then restored. A generic
+// METHOD is one of these too (#4495); its declaration carries a receiver, which
+// `lowerFuncNamed` already lowers as the leading parameter.
+//
+// `c` is the entry's `declModule`, which is its `module` for everything except a
+// retargeted `jsonDecode<C>` (#4563). The SYMBOL still comes from `module`, so
+// the caller and the definition agree without either of them knowing which.
+fn lowerInstance(
+  c: Checker, consts: map<string, int>, lowerer: Lowerer, g: int,
+): IrFunc {
+  let inst = c.ctx.instantiations[g]
+  // The ledger's own decl node, indexing `c`'s tree — `c` IS the module that
+  // holds the body (lowerProject picks it by `inst.declModule`). Carried rather than looked
+  // up by name: `funcDeclLookup` answers for free functions only, and a second
+  // way to reach the declaration is a second thing that can disagree with the
+  // entry that was recorded.
+  let decl = inst.decl
+  let tps = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  // Built BEFORE the rebinding below, so it captures the template's own TypeParam
+  // ids — what the body's checked types actually mention. Rebinding `userTypes`
+  // only fixes sites that RE-RESOLVE a type node during lowering; every site that
+  // reads a checked node type needs this env instead (see nodeType).
+  let genEnv = genericEnvOf(c, decl, inst.args)
+  let saved = []int(0)
+  let j = 0
+  while (j < len(tps)) {
+    let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])
+    let tpname = c.source[tpn.span.start:tpn.span.end]
+    saved = append(saved, userTypeLookup(c, tpname))
+    if (j < len(inst.args)) {
+      c.userTypes[tpname] = inst.args[j]
+    }
+    j = j + 1
+  }
+  let stubsBefore = len(lowerer.stubbed)
+  let f = lowerFuncNamed(c, decl, consts, lowerer, instanceSymbol(c.ctx, lowerer.root, g), genEnv)
+  noteInstantiationStubs(c.ctx, lowerer, stubsBefore, g)
+  j = 0
+  while (j < len(tps)) {
+    let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])
+    c.userTypes[c.source[tpn.span.start:tpn.span.end]] = saved[j]
+    j = j + 1
+  }
+  return f
+}
