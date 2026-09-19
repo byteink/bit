@@ -45,6 +45,15 @@
 
 classify_changed_files() {
 has_selfhost=0
+# has_selfhost is set by TWO unrelated case arms below (compiler/* and
+# spec/FMT.md|spec/LINT.md) so gate.sh's REASON text can tell them apart —
+# these two track which arm(s) actually fired, same accumulator shape
+# docs_list already uses for has_docs. selfhost_specdoc_list is the file
+# list (at most spec/FMT.md and/or spec/LINT.md); has_selfhost_compiler
+# needs no list, since gate.sh's REASON for that arm stays generic.
+has_selfhost_compiler=0
+has_selfhost_specdoc=0
+selfhost_specdoc_list=""
 has_runtime=0
 has_testcases=0
 has_examples=0
@@ -118,7 +127,11 @@ while IFS= read -r f; do
     # changing LINT.md edit drifts them exactly like a SPEC.md edit drifts its
     # own citers — before this it fell through to the no-gate arm below and a
     # LINT.md-only diff resolved to `noop`, running nothing at all.
-    spec/FMT.md|spec/LINT.md) has_selfhost=1 ;;
+    spec/FMT.md|spec/LINT.md)
+      has_selfhost=1
+      has_selfhost_specdoc=1
+      selfhost_specdoc_list="${selfhost_specdoc_list:+${selfhost_specdoc_list}, }${f}"
+      ;;
     # These paths are pure documentation that no gate reads: runtime/**/*.md
     # (the runtime CODE bucket below is for runtime/*.bit etc, not prose),
     # spec/* other than SPEC.md, FMT.md and LINT.md (any future sibling —
@@ -137,7 +150,10 @@ while IFS= read -r f; do
         noop_list="${f}"
       fi
       ;;
-    compiler/*) has_selfhost=1 ;;
+    compiler/*)
+      has_selfhost=1
+      has_selfhost_compiler=1
+      ;;
     # A runtime/<pair>/windows/*.bit change ALSO sets has_windows, on top of
     # (never instead of) has_runtime=1 — the compiler can already cross-build
     # for x86_64-windows with no hardware (scripts/g2archive.sh), and #4294 had
