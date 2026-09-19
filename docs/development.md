@@ -404,7 +404,7 @@ predeclared list - was fixed at all four sites (`3ca737c`) and is covered by
 mandatory suite), which exercises one name per resolution site under the same
 precedence check. `extern fn` declarations are not an independent code path
 that could regress without also tripping that golden:
-`compiler/checkbind.bit`'s `collectExternFnDecl` records an extern's signature
+`compiler/checkbindfunc.bit`'s `collectExternFnDecl` records an extern's signature
 in the exact same `c.funcDecls`/`c.funcResults` maps `collectFuncDecl` uses for
 a regular function ("so call sites type-check through the ordinary path"), and
 `compiler/lowercall.bit`'s `lowerCall` resolves both through the identical
