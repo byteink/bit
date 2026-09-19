@@ -1,8 +1,8 @@
 # Lint remediation policy: `runtime/`
 
-#2567. This is the policy for every `bit lint runtime` finding **except
-E0211** `unused-local` (already fixed and gated: #2515,
-`_tests_/bit/lintruntime.bit`, `test-lint-runtime`) and **except E0214**
+This is the policy for every `bit lint runtime` finding **except
+E0211** `unused-local` (already fixed and gated: `_tests_/bit/lintruntime.bit`,
+`test-lint-runtime`) and **except E0214**
 `append-aliasing` (a correctness rule with its own settled per-instance
 triage elsewhere in this repo, out of scope for a readability-policy
 document).
@@ -26,8 +26,7 @@ concurrency, an actual program run - never claimed here without one).
 
 ## How to read this document
 
-Same mechanics as `policy.md` - restated because they are easy to get wrong
-and this ticket exists partly because they were:
+Same mechanics as `policy.md` - restated because they are easy to get wrong:
 
 1. `bit lint` writes every finding to **stderr**. Always `2>&1`.
 2. The denominator is `bit lint`'s own printed `lint: N findings, M overrides
@@ -44,9 +43,9 @@ grep -oE '^(warning|error)\[E[0-9]+\]' "$LOG" | sort | uniq -c
 
 ## Counts this policy was written against
 
-Re-derived this session (the ticket's own "63" is stale - see below), branch
-`task-2567-runtime-lint-policy`, worktree built via `./make selfhost`. One
-override already exists in the tree
+Re-derived this session (a stale count of 63 was previously recorded - see
+below), worktree built via `./make selfhost`. One override already exists in
+the tree
 (`runtime/cryptohw/cryptohw.bit:48`, `max-params=7`, landed separately for
 `bit_rt_crypto_ghash_mul_hw`'s fixed hardware-AES arity - pre-existing, not
 part of this policy's scope, shown here only because it changes the "1
@@ -63,52 +62,53 @@ overrides active" denominator).
 | E0212 `unreachable-code` | 0 | 0 | n/a - see note below |
 | E0215 `unused-result` | 30 | 30 | **out of scope - filed separately, see below** |
 
-In-scope total (the 7 codes named in this ticket's acceptance):
+In-scope total (the 7 codes this document covers):
 **85 → 84** findings after the one E0210 fix (`grep -cE
 '\[(E0200|E0201|E0202|E0203|E0204|E0210|E0212)\]'` against a fresh
 `bit lint runtime 2>&1` log - matches 0+18+18+7+41+0+0). The linter's own
 overall total (all 8 codes it reports here, including out-of-scope E0215)
 moved **115 → 114** over the same fix, printed as `lint: 114 findings, 1
 overrides active` - the "1 overrides active" is the pre-existing
-`cryptohw.bit` override, unrelated to this ticket.
+`cryptohw.bit` override, unrelated to this document's fixes.
 
-**The ticket's "63" was measured 2026-08-08 and has drifted upward, not
-down, despite #2515's E0211 work and heavy runtime/ churn since (#3340
-Windows sockets, #3592 safepoint shim, #2613 stack sizes, #3595 `@nosplit`
-annotations) - re-derive, never quote.** Two rule codes the original ticket
-counted (E0200: 3, E0212: 1) are now **zero** - already cleared by unrelated
-work (E0200 is also independently gated: `test-lint-filelines` covers
-`runtime/` as one of its seven scanned trees per the corrected note in this
-workspace's `CLAUDE.md`, so a regression there is already caught without
-this ticket adding anything). One new rule code, **E0215
-`unused-result`, did not exist when this ticket was filed** (#2117 landed
-after) and now accounts for 30 findings - see "Out of scope" below for why
-it is not dispositioned here.
+**A stale count of 63 was measured 2026-08-08 and has drifted upward, not
+down, despite E0211 already being fixed across `runtime/` and heavy
+`runtime/` churn since (Windows IOCP socket support, a Win64
+callee-saved-register fix to the safepoint snapshot, stack-size changes,
+`@nosplit` annotations added to Windows net functions) - re-derive, never
+quote.** Two rule codes the original count included (E0200: 3, E0212: 1) are
+now **zero** - already cleared by unrelated work (E0200 is also
+independently gated: `test-lint-filelines` covers `runtime/` as one of its
+seven scanned trees per the corrected note in this workspace's `CLAUDE.md`,
+so a regression there is already caught without this document adding
+anything). One new rule code, **E0215 `unused-result`, did not exist when
+the original count was taken** and now accounts for 30 findings - see "Out
+of scope" below for why it is not dispositioned here.
 
 ## Out of scope: E0215 `unused-result` - deliberately excluded from THIS
-document, dispositioned separately in #3618 (see below)
+document, dispositioned separately below
 
 **This is not a readability rule and does not belong in this document's risk
 class.** `spec/LINT.md:242` describes it as "the one case E0211 cannot see
 because nothing was ever named" - i.e. it is E0211's sibling in the
 discarded-result family, which already has its own gate
-(`test-lint-runtime`) and its own settled fix pattern (`let _ = ...`,
-#2515). The 7 codes this ticket's acceptance names (E0200/201/202/203/204/
-210/212) are explicitly the readability class the original ticket text
-distinguishes from "the discarded-result class E0211 is." Bundling 30
-E0215 sites into this document would guarantee exactly what #2515's own
-constraint warns against: reviewing a correctness-adjacent class alongside
-a purely cosmetic one so the correctness-adjacent ones get skimmed. Its own
-per-site disposition is below, kept in its own section rather than woven
-into the readability rules above it, for the same reason.
+(`test-lint-runtime`) and its own settled fix pattern (`let _ = ...`). The 7
+codes this document covers (E0200/201/202/203/204/210/212) are explicitly
+the readability class, distinct from the discarded-result class E0211 and
+E0215 belong to. Bundling 30 E0215 sites into this document would repeat the
+mistake E0211 was kept separate to avoid: reviewing a correctness-adjacent
+class alongside a purely cosmetic one so the correctness-adjacent ones get
+skimmed. Its own per-site disposition is below, kept in its own section
+rather than woven into the readability rules above it, for the same reason.
 
-## E0215 `unused-result` (30 findings, re-derived unchanged from #2567's count, see #3618) - FIX, per-site, with `let _ = ...`
+## E0215 `unused-result` (30 findings, re-derived unchanged from the count above) - FIX, per-site, with `let _ = ...`
 
 **Decision: fix all 30, no correctness routing needed.** Re-running
-`bit lint runtime` on `main` at the time #3618 was worked reproduced the
-exact same 30 findings, same file:line distribution as #2567's table above -
-`runtime/` churn since (#3592, #2613, #3595) touched none of these call
-sites. Every one is a raw syscall or Win32 API wrapper (`nanosleep`,
+`bit lint runtime` on `main` reproduced the exact same 30 findings, same
+file:line distribution as the table above - `runtime/` churn since (Windows
+IOCP sockets, the Win64 safepoint-snapshot fix, stack-size changes,
+`@nosplit` annotations) touched none of these call sites. Every one is a raw
+syscall or Win32 API wrapper (`nanosleep`,
 `closedir`, `close`, `execve`, `kill`, `setpgid`, `waitpid`, `sigaltstack`,
 `sigaction`, `joinWorker`, `WaitForSingleObject`, `CloseHandle`,
 `FindClose`, `FreeEnvironmentStringsW`, `AddVectoredExceptionHandler`,
@@ -127,7 +127,7 @@ Two are worth recording because a shallower read would have missed them:
   `threadRelease` on the same handle. That looked, on first read, like a
   possible use-after-free (releasing a thread's stack while it might still
   be running). It is not: `threadRelease`
-  (`runtime/thread/linux/spawn.bit:611`, #1801) does not take a timed-out
+  (`runtime/thread/linux/spawn.bit:611`) does not take a timed-out
   join at its word either - it spins on the child's own on-stack flag and,
   if the child never leaves its stack, leaks the reservation and reports
   `false` rather than unmapping live memory. A comment recording this is
@@ -154,7 +154,7 @@ with fixed, always-valid arguments, matching this document's own
 call is advisory or cannot fail in a way the caller could act on.
 
 **Fix applied:** `let _ = <call>` at all 30 sites - a `LetDecl`, never
-visited by this rule (the same idiom E0210/E0211/#2515 already use).
+visited by this rule (the same idiom E0210/E0211 already use).
 Verified: `bit lint runtime 2>&1 | tail -1` moved from `lint: 114 findings,
 1 overrides active` to `lint: 84 findings, 1 overrides active` (84 = the
 18+18+7+41 already dispositioned above, unaffected); `grep -c '\[E0215\]'`
@@ -182,7 +182,7 @@ gate. Nothing to add.
 ## E0212 `unreachable-code` - NO FINDINGS TODAY; POLICY FOR IF ONE APPEARS: FIX, NO OVERRIDE
 
 Zero in `runtime/` today. `docs/lint/policy.md`'s own E0212 section
-(`#3211`) established, empirically rather than by argument, that this rule's
+established, empirically rather than by argument, that this rule's
 findings in this codebase are always real dead code, never a checker-gap
 false positive, because `lintUnreachableCode` reuses the exact same
 `vDiverges` predicate `bit check` itself uses - the two consumers can never
@@ -239,16 +239,16 @@ boot-entrypoint or a `@nosplit` primitive by extracting a helper is not
 provably safe from a green build - it needs the resulting binary to
 actually boot on darwin/linux/windows, and `runtime/root/**` changes are on
 this project's mandatory-full-suite list for exactly that reason. That
-verification is real work belonging to a dedicated execution ticket per
-site (or per small cluster), not to a decision ticket. The numeric-algorithm
+verification is real work belonging to a dedicated follow-up pass per
+site (or per small cluster), not to this decision. The numeric-algorithm
 ports (`dragon4`, `parseHexBits`, `rtPow`, …) carry a second, independent
 reason: their branch structure mirrors the published algorithm's own
 variable names and case structure, so an arbitrary split risks a silent
 ULP-level correctness change with no existing gate that would catch it.
 
-**Follow-up:** #2450-equivalent execution ticket, one per file or small
-cluster, each override reason naming the specific shape (boot entrypoint /
-nosplit primitive / ABI shim / algorithm port) and the exact symbol.
+**Follow-up:** one paydown pass per file or small cluster, each override
+reason naming the specific shape (boot entrypoint / nosplit primitive / ABI
+shim / algorithm port) and the exact symbol.
 
 **Test:**
 ```sh
@@ -309,12 +309,13 @@ the same group plus its own callback trio; it is included because it is the
 same call family, not because its signature is byte-identical to the other
 three.
 
-**Why this is a fix ticket and not done here:** worker-launch code is
+**Why this is deferred and not done here:** worker-launch code is
 concurrency-sensitive scheduler internals. A struct-grouping refactor here
 needs verification beyond `bit check` - an actual concurrent run
 (`test-stress` or the scheduler's own stress fixtures), not just a clean
 build, to be trustworthy. That is real, separate work; scope discipline
-means it is its own ticket, not a same-session edit to a decision ticket.
+means it is its own follow-up, not a same-session edit alongside this
+decision.
 
 **Test:**
 ```sh
@@ -334,14 +335,14 @@ multi-platform syscall-marshalling functions:
 
 Every site's nesting comes from sequential syscall error handling (each OS
 call has its own failure branch) inside a `@nosplit` freestanding function -
-exactly the shape this ticket's own brief names as a legitimate override
-class. Unlike a typical "missing early return," restructuring these without
-running the resulting binary on all three platforms (darwin/linux/windows)
-to confirm the exec/list/fork path still behaves is out of this decision
-ticket's scope and arguably out of any single ticket's scope without
-cross-platform hardware. A future ticket MAY revisit any one of these
-case-by-case if someone can verify it end-to-end on the specific OS; default
-policy until then is override.
+exactly the shape this document names as a legitimate override class. Unlike
+a typical "missing early return," restructuring these without running the
+resulting binary on all three platforms (darwin/linux/windows) to confirm
+the exec/list/fork path still behaves is out of this decision's scope and
+arguably out of scope for any single change without cross-platform hardware.
+A future pass MAY revisit any one of these case-by-case if someone can
+verify it end-to-end on the specific OS; default policy until then is
+override.
 
 **Test:**
 ```sh
@@ -376,7 +377,7 @@ grep -c '^warning\[E0204\]' "$LOG"   # target: 0, all via override directives
 
 ## The constraint this whole document is answerable to
 
-Inherited from #2354/#2567, verbatim: *"Do not silence this with a blanket
+The owner's constraint, verbatim: *"Do not silence this with a blanket
 suppression or by raising every limit until the count reaches zero - an
 override must carry the reason it is safe."* Every override decided above is
 per-function or per-small-cluster with a stated, specific reason (a named
@@ -385,23 +386,22 @@ blanket "runtime is special" waiver, and the one rule split three ways
 (E0202) is split precisely because a uniform disposition would have been
 exactly that kind of waiver in one direction.
 
-## Gate extension - not done here, and blocked on #3616
+## Gate extension - not done here
 
 **Superseded, and kept as the record of what was decided when.** `runtime/`
-did get into that gate's scope (#3620), and `tools/build/lint-ceiling.txt`
-no longer exists: #4149 replaced its counts with the named `<CODE>
+did get folded into that gate's scope, and `tools/build/lint-ceiling.txt`
+no longer exists: its counts were replaced with the named `<CODE>
 <repo-relative-path>` debt list in `tools/build/lint-debt.txt`, on the
 owner's 2026-09-10 ruling that a debt list is a paydown queue to zero and
 never a count. Read the two paragraphs below as history, not as the current
 mechanism - `_tests_/bit/lintself.bit`'s own header states that.
 
-The original ticket's step 2 ("extend the settled count into a gate") is
-explicitly deferred, for two reasons stated in this ticket's own dispatch:
-first, this ticket's deliverable is the decision, not the mechanical
-gate-wiring (`tools/build/lint-ceiling.txt` only supports exactly two scopes
-today, `compiler`/`stdlib` - `_tests_/bit/lintself.bit:224` hard-requires
-both lines and no others - so adding `runtime` needs a real code change to
-that harness, not a data-file edit); second, **#3616 is concurrently
-tightening `tools/build/lint-ceiling.txt` to the measured counts**, so
-touching that file or its harness here would race it. Filed as its own
-follow-up ticket, to run after #3616 lands.
+Extending the settled count into a gate was originally deferred for two
+reasons: first, the immediate deliverable here was the decision, not the
+mechanical gate-wiring (`tools/build/lint-ceiling.txt` only supported
+exactly two scopes at the time, `compiler`/`stdlib` -
+`_tests_/bit/lintself.bit:224` hard-required both lines and no others - so
+adding `runtime` needed a real code change to that harness, not a data-file
+edit); second, a concurrent change was tightening
+`tools/build/lint-ceiling.txt` to the measured counts at the same time, so
+touching that file or its harness here would have raced it.

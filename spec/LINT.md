@@ -1,6 +1,6 @@
 # Bit Lint Specification
 
-Status: proposed (smash #1376). Normative once implemented.
+Status: proposed. Normative once implemented.
 
 `bit lint` reports code-health problems that the type checker does not consider
 errors and the formatter cannot mechanically fix. It exists to bound the growth
@@ -133,7 +133,7 @@ step over a meta-code.
 | E0298 | override directive names an unknown rule |
 | E0299 | override directive is malformed, its reason is missing or empty, or it is well-formed but placed outside the leading comment block (§5.2) |
 
-### 3.1 Why the `E` registry and not a distinct `L%04d` (settled, #1378)
+### 3.1 Why the `E` registry and not a distinct `L%04d` (settled)
 
 Decided, and effectively **irreversible from the first release that ships a
 lint code** - the registry rule is that a code is never renumbered once shipped,
@@ -248,10 +248,10 @@ These need scope and symbol information and land after phase 1.
 see phase 1 above, where it is actually implemented.)
 
 **`unused-import` (E0210) is scoped to the MODULE, not the file being linted**
-(#2284) - a directory of sibling `.bit` files sharing one flat import
+- a directory of sibling `.bit` files sharing one flat import
 namespace, matching [compiler/project.bit](../compiler/project.bit)'s
 `SrcModule` contract: the same scope the binder already uses for cross-file
-name resolution, and the reason #2121's E0042 "already declared in this
+name resolution, and the reason E0042 "already declared in this
 scope" fires across sibling files at all. An import used only by a sibling
 file in the same module is not reported - the finding's own suggested fix is
 "remove the import", and removing one a sibling genuinely needs would break
@@ -277,7 +277,7 @@ here rather than only in SPEC.md because it is the direct sibling of
 to leave this file. It fires (as a warning, never blocking
 `bit check`) on any module-scope or local declaration whose name matches a
 predeclared identifier (SPEC §5.3) - with two exemptions, both **narrowing
-when the rule fires, never suppressing an individual finding** (#3383):
+when the rule fires, never suppressing an individual finding**:
 
 - **An `extern fn` declaration is never reported.** Its bare declared name IS
   the external symbol it binds (SPEC §11.7); there is no alternate spelling,
@@ -295,11 +295,9 @@ when the rule fires, never suppressing an individual finding** (#3383):
 declaration."** The resolver also reserves a much wider set of ABI-boundary
 primitive names beyond SPEC §5.3's list (`netLocalPort`, `netResolve`,
 `fsOpen`, ... - `compiler/symbols.bit`'s `predeclaredFuncs()`), and an
-exported function accidentally reusing one of *those* still warns: #3353
-found and renamed exactly two such accidents in `runtime/net/**`
-(`netResolve`, `netLocalPort`, both `export`ed), and a broader exemption would
-silently stop warning if either recurred. Only the eight names SPEC §5.3
-itself documents are exempt when exported.
+exported function accidentally reusing one of *those* still warns - a
+broader exemption would silently stop warning on such a collision. Only the
+eight names SPEC §5.3 itself documents are exempt when exported.
 
 A **local** shadowing a predeclared name (a `let`/`const`/parameter matching
 `len`, `close`, etc.) is unaffected by either exemption and still warns -
@@ -324,7 +322,7 @@ Bit-specific aliasing rule the type system does not express, and one this
 repository has already paid for once in the self-hosted compiler. It fires when
 `append`'s first argument resolves to a parameter of slice type, and the result
 is not assigned back to that same parameter **and then handed out of the
-function through its own return value** (#3688). It is the rule most likely to
+function through its own return value**. It is the rule most likely to
 need overriding, since appending to a locally-owned copy is legitimate and not
 always distinguishable from the AST.
 
@@ -342,13 +340,13 @@ one hop:
   is not misread as never returning its parameter at all;
 - `return Bundle{ field: out, ... }` - threaded through one field of a
   returned composite literal (`compiler/emitelf.bit`'s
-  `EmElfBlobs{ symbols: symbols, ... }`, #3648).
+  `EmElfBlobs{ symbols: symbols, ... }`).
 
 A self-assignment whose function does none of the three is reported exactly
 like a bare, unassigned `append(out, x)` - self-assignment alone reaches none
 of the three shapes above, so this rule's own former suggested fix, "assign
 the result back to the parameter," was recommending the exact broken pattern
-it should have been catching (#3688). The current suggestion instead names
+it should have been catching. The current suggestion instead names
 the two shapes above that actually work: return the slice, or thread it
 through a returned bundle field.
 
@@ -395,18 +393,17 @@ Recorded so they are not re-proposed.
   cheap and certain from the AST, because a rule that is occasionally wrong
   becomes a rule everyone silences, and a silenced rule reports nothing.
 
-**"Discarded call result" used to be listed here too, as "already errors in
-`bit check` - E0065".** That was wrong (#2117) and is corrected, not merely
-removed, because the mechanism is worth recording: E0065 `invalid-expr-statement`
+**Discarded call results are not already caught by `bit check`.** E0065
+`invalid-expr-statement`
 ([compiler/validatecall.bit](../compiler/validatecall.bit)) governs which
 *shapes* of expression may stand alone as a statement - a bare `x + 1` is
 rejected, a bare call is not - and it accepts **every** call regardless of its
 declared result type (`vLegalExprStmt`'s `Tag.Call` arm has no type check at
 all). So `double(x)` beside `fn double(n: int): int` compiles, and `bit check`
-says nothing - confirmed empirically by the ticket's own repro before this
-bullet was corrected. §4.3 is the rule this repository actually needed.
+says nothing about the discarded result. §4.3 is the rule this repository
+actually needs.
 
-### 4.3 `unused-result` (E0215, #2117): why it is scoped to same-file calls
+### 4.3 `unused-result` (E0215): why it is scoped to same-file calls
 
 The obvious reading - flag any statement-position call whose declared result is
 non-void - would also fire on a builder returning an updated copy of itself
@@ -430,11 +427,10 @@ insert) are already excluded by construction, because they are almost always
 either a method call or a call across a module boundary - so the "everything
 non-void" reading turns out to be affordable once the rule is this narrow, and
 restricting it further to fallible/`Option`/`Result` was not needed to keep it
-quiet. See the finding counts recorded against #2117 for the measurement that
-justifies this.
+quiet.
 
 The corollary, stated plainly so it is not rediscovered as a bug report: this
-rule does **not** catch `#2117`'s own headline example, `strings.Builder.write`
+rule does **not** catch the motivating example for this rule, `strings.Builder.write`
 returning a new `Builder` instead of mutating one, when called from outside
 the file that declares it - that is a method call, out of reach by the same
 constraint. Catching it needs `bit lint` to gain cross-file type information,
@@ -447,7 +443,7 @@ never visits a `LetDecl` written this way). The file-scoped `// bit:lint
 disable unused-result` directive (§5) is available too, for a file where the
 pattern is pervasive enough that call-by-call annotation is not worth it.
 
-### 4.4 Phase 3 - ORM misuse, syntactic (epic #5050)
+### 4.4 Phase 3 - ORM misuse, syntactic
 
 Neither rule here needs the resolver (both are AST-only, like phase 1), but
 each targets one specific `pkg/orm`/`std/sql` call shape rather than a
@@ -485,7 +481,7 @@ Reason        = { any character } .          // to end of line, non-empty
 Examples:
 
 ```
-// bit:lint max-file-lines=7100 -- bootstrap oracle, split tracked in #1376
+// bit:lint max-file-lines=7100 -- bootstrap oracle, split pending
 // bit:lint disable max-nesting -- generated dispatch table
 // bit:lint allow E0214 -- the function owns this buffer, never returns it
 ```
@@ -565,7 +561,7 @@ reworking this.
 built-in default  <  bit.json "lint" key  <  file directive
 ```
 
-Most specific wins. `bit.json`'s top-level `"lint"` key (#4156) is a
+Most specific wins. `bit.json`'s top-level `"lint"` key is a
 project-wide layer between the built-in default and a file's own directive:
 
 ```jsonc
@@ -645,8 +641,8 @@ tests.
 The table describes the adoption this section planned, not a state the
 repository reached. At most four production files ever carried a real stamp:
 `lower.bit` and `check.bit` from the table above, plus `lint.bit` and
-`lintcheck.bit`, which were not in it. The last two were dropped by #2470 and
-#2471 when those files were split under the limit. The other nine files in
+`lintcheck.bit`, which were not in it. The last two were split under the
+limit and their overrides removed. The other nine files in
 the table were brought under 800 without ever being stamped. The override
 mechanism itself is unchanged and still specified below (§5.4.1); it is
 simply idle, and has been for most of the repository's life.
@@ -658,7 +654,7 @@ still raise it with the same stamp form shown above, one directive per file,
 carrying a reason. `_tests_/bit/lintfilelines.bit` and
 `_tests_/cases/lint_override.bit` exercise this path directly.
 
-### 5.5 Per-finding overrides (`allow`, #2438)
+### 5.5 Per-finding overrides (`allow`)
 
 `// bit:lint allow <CODE> -- <reason>` silences exactly **one finding**: the
 one reported on the line directly below it. It exists for the rules §4 already
@@ -700,8 +696,8 @@ prevent.
 **The reason threshold is stricter than §5.1's bare non-empty check: at
 least 10 characters after trimming.** `Assignment` and `Disable` are added
 rarely and reviewed individually; `allow` is meant to be stamped at the rate
-of roughly one per call site across a repository-wide sweep (#2440-#2442),
-which is exactly the setting where a placeholder like `"x"` or `"why not"`
+of roughly one per call site across a repository-wide sweep, which is
+exactly the setting where a placeholder like `"x"` or `"why not"`
 would otherwise go unnoticed. 10 characters forces a few real words without
 demanding a paragraph.
 
@@ -711,8 +707,8 @@ E0297, not through §2.1's hard-error/exit-2 path.** This is a deliberate
 difference from every other directive error in this spec. §5.1's forms are
 one-per-file and a broken one invalidating the *entire file's* run (findings
 withheld, exit 2) is a proportionate cost. `allow` is one-per-call-site, and a
-sweep touching hundreds of them cannot have call site #200's typo blank out
-every finding call sites #1-#199 already fixed. The underlying finding an
+sweep touching hundreds of them cannot have call site 200's typo blank out
+every finding call sites 1-199 already fixed. The underlying finding an
 invalid `allow` was aimed at is **never suppressed** by the attempt - a
 broken override must not make its target silently vanish. A bare
 `// bit:lint allow` with no code following is not a directive at all: it
@@ -801,7 +797,7 @@ Required coverage:
 | File | Change |
 |---|---|
 | `compiler/lint.bit` | new - registry, directive reader, runner, rule passes |
-| `compiler/lintallow.bit` | new - per-finding `allow` override (§5.5, #2438) |
+| `compiler/lintallow.bit` | new - per-finding `allow` override (§5.5) |
 | `compiler/lintcheck.bit` | new - in-Bit self-checks, run by `selfcheck()` |
 | `compiler/main.bit` | `lint` subcommand dispatch |
 | `_tests_/bit/lintcmd/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
@@ -822,7 +818,7 @@ lint is selfhost-only and the differential stays valid.
 
 1. **Phase 2 placement.** `unused-import` / `unused-local` as lint warnings, or
    as `bit check` errors in Go's style? Decide before 1.0 (§4).
-2. **A file that does not parse (settled, #1383).** Decided: the parser's own
+2. **A file that does not parse (settled).** Decided: the parser's own
    diagnostics are reported through the same sink and exit path as a malformed
    override directive (§2.1, §5.2) - exit 2, findings withheld for that run.
    Linting the parser's recovered tree would invent findings from nodes it

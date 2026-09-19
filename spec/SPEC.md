@@ -133,7 +133,7 @@ while
 
 `struct` is not a keyword. Pre-0.1.24 code that declared types with `struct` is
 rejected with `error[E0102]: 'struct' is not a keyword`, naming `class` as the
-replacement (§10.5). The rename (#3425) is mechanical: only the keyword changes -
+replacement (§10.5). The rename is mechanical: only the keyword changes -
 field access, method syntax, and reference semantics are identical either way.
 
 `assert` is *not* reserved: like `panic` and `len` it is a predeclared builtin
@@ -573,12 +573,12 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
 - A parameter may carry a default value, either with the type written,
-  `x: int = 1` (#5244), or read off the default, `x = 1` (#5258): a call may
+  `x: int = 1`, or read off the default, `x = 1`: a call may
   omit it and every parameter after it that also has one, and the default is
   used instead. `const_expr` is a bare literal (int, float, string, bool, or
   `nil`; not a compound expression, a call, or an allocation) - defaults
   evaluated at the call site (Swift's `#file`/`#line` shape) were considered
-  and rejected (#2905). A defaulted parameter may not precede one with no
+  and rejected. A defaulted parameter may not precede one with no
   default (**E0158**): a call supplying only its own positional prefix could
   never reach a later required parameter otherwise. A default whose value is
   not a literal is **E0159**. When the type is written, the default need only
@@ -1116,7 +1116,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   write. **The discriminator is resolution and nothing else** - whether the
   name binds to some function, never a compiler-known list of which names are
   metadata. A field attribute whose name DOES resolve to a function keeps
-  every one of #3879's own diagnostics (E0133/E0134/E0135) if that function is
+  every one of the field-attribute diagnostics (E0133/E0134/E0135) if that function is
   the wrong shape; this split never widens or narrows those - a validator with
   a typo'd signature is still a compile error, not a silently recorded
   attribute. Both a called and a recorded attribute may appear on one field.
@@ -1134,7 +1134,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   win silently would make `@table` appear to work while `pkg/orm` never sees a
   field it does not already know about.
 - **`@table("...")` - a table-name override.** `@table` takes at most one
-  argument, a non-empty string literal (#5189): `@table("people")`. Anything
+  argument, a non-empty string literal: `@table("people")`. Anything
   else that argument could be - an empty string, a non-literal expression, a
   second argument - is **E0156**, naming the class; a second argument is
   **E0137** at the position that defines the legal set (§10.3.1), before this
@@ -1160,8 +1160,8 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   rule, for the same reason, `@json`'s **E0142** is.
 - Fields are ordered; that order is the memory layout order, exactly as
   `@json`'s is.
-- **`@hasMany`/`@hasOne`/`@belongsTo` are compiler-known relation marks**
-  (#5053), matched by name and excluded from #3879's field-attribute
+- **`@hasMany`/`@hasOne`/`@belongsTo` are compiler-known relation marks**,
+  matched by name and excluded from the field-attribute
   desugaring exactly as `@key` is - a relation that reached the call path
   would desugar to a call to a function nobody declared. Recognition is all
   this buys today: a relation field is otherwise an ordinary recorded
@@ -1170,7 +1170,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   not carry `@table` is **E0160**, naming the field, the attribute and the
   class - the same reasoning `@key` outside `@json` (E0139) already gives.
 - **A relation field on a `@table` class starts "unloaded" and panics on
-  read until it is set** (#5053 steps 2/3, #5271). No hidden word is added
+  read until it is set**. No hidden word is added
   for this: a relation field is a normal `[]T` field with a normal
   GC-traced pointer slot (`FieldLayout.isPtr`), and that slot is what holds
   the reserved state - a non-8-aligned integer (`1`) no `gc_alloc`'d object
@@ -1190,7 +1190,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   the reserved value, so it reads as length 0 with no panic - "no rows" and
   "never loaded" stay distinguishable.
 - **A hidden persisted-flag word, read and written by `isPersisted()`/
-  `markPersisted(v: bool)`** (#5052). `db.save` must issue an INSERT for a
+  `markPersisted(v: bool)`**. `db.save` must issue an INSERT for a
   new entity and an UPDATE for one that came from a query, decided WITHOUT
   inspecting the primary key - a UUID or application-assigned key already
   has a non-zero value on a brand-new row, and a composite key has no single
@@ -1255,7 +1255,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - **A field's column is its own name in snake_case**, unless the field
   carries `@column("...")`: `createdAt` claims `created_at`,
   `@column("e_mail")` claims `e_mail`. `@column` is compiler-known, matched
-  by name and excluded from #3879's field-attribute desugaring exactly as
+  by name and excluded from the field-attribute desugaring exactly as
   `@key` is.
 - **A field's declared type must be one of the five scalars above, or
   `Option<>` of one** - any other type is **E0154**. A field's column
@@ -1282,9 +1282,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - When a `where`/`whereIn`/`whereNull`/`whereLike`/`orderBy` call
   syntactically chained off a `find<T>(...)` call names a **string
   literal** column that is not one of `T`'s declared fields, that is
-  **E0163**, naming the field and the class - the check the ticket that
-  added this (#5057) calls "the whole point": a misspelled column caught
-  before the program runs, at no runtime cost. A column reached any other
+  **E0163**, naming the field and the class - catching a misspelled column
+  before the program runs, at no runtime cost, is the whole point of the
+  check. A column reached any other
   way (held in a variable, chained off a `Query<T>` this syntactic walk
   cannot trace back to its own `find<T>(...)` root) is not flagged here; it
   is never silently accepted either - `Query.columnFor` performs the
@@ -1328,7 +1328,7 @@ trait_field  = [ "export" ] IDENT ":" type .    (* no `readonly` - §10.5 is cla
 **A trait declares no type parameters of its own** - unlike `class_decl` (§10.1)
 and `interface_decl` (§14.3), `trait_decl` has no `[ generic_params ]` after the
 name. Writing `trait Existence<T> { ... }` is E0021, naming the rule rather than
-just the unexpected `<`. This was a deliberate choice (#5275), not an omission:
+just the unexpected `<`. This was a deliberate choice, not an omission:
 a trait's type parameters would have to be either its own - instantiated with an
 explicit argument at each `use`, mirroring how a class names an interface's - or
 inherited from the `use`-ing type, so a trait body's `T` resolves to whichever
@@ -1337,8 +1337,8 @@ mechanisms, not two spellings of one, and the second is the one novel to Bit:
 nothing else in the language lets an inner declaration's identifier bind through
 an enclosing declaration's scope implicitly. It would also read a trait body's
 free type names through the same module-wide name table `buildSignatures`
-(checkbind.bit) already resolves every other generic through, which #4602
-documents as corrupting two unrelated generics that both spell a parameter `T` -
+(checkbind.bit) already resolves every other generic through, which is known
+to corrupt two unrelated generics that both spell a parameter `T` -
 a trait would be a further, unfixed reader of that table. A trait that needs to
 abstract over a type therefore stays scoped to one concrete type per trait; the
 class or interface it serves takes the type parameter instead.
@@ -2293,7 +2293,7 @@ is emitted as an undefined external and resolved at link, so the failure mode fo
 a build that somehow omits the table is a link error naming the symbol, not
 silent zeroes.
 
-**`debugLinesBegin(): *byte` and `debugLinesEnd(): *byte` (#3285)** are the
+**`debugLinesBegin(): *byte` and `debugLinesEnd(): *byte`** are the
 identical shape, over a second, independent linker-merged table: the debug-info
 line table (ABI.md §4.2) `bit_rt_panic`'s own trace walker symbolizes a return
 address against. Same rules throughout - unmanaged subset, zero arity (E0050 on
@@ -2325,7 +2325,7 @@ the one exception is the conditional expression at level 2, which is
 Assignment is a **statement**, not an expression (§13.2), so `=` never appears
 inside an expression. `&&` and `||` short-circuit.
 
-**Conditional expression** `cond ? a : b` (#3941): `cond` must be `bool` - no
+**Conditional expression** `cond ? a : b`: `cond` must be `bool` - no
 truthiness - and `a`/`b` must meet at one type under the untyped-constant rules
 of §15.4; the result is that common type. Right-associative, so
 `a ? b : c ? d : e` reads `a ? b : (c ? d : e)`, and looser than every binary
@@ -2356,7 +2356,7 @@ slice        = "[" [ expression ] ":" [ expression ] "]" .
 member       = "." ( IDENT | INT_LIT ) .        (* INT_LIT selects a tuple element *)
 type_assert  = "." "(" type ")" .               (* §14.4 *)
 call_args    = call_arg { "," call_arg } [ "," ] .
-call_arg     = arg | IDENT "=" expression .     (* named, §12.11, #3839 *)
+call_arg     = arg | IDENT "=" expression .     (* named, §12.11 *)
 arguments    = arg { "," arg } [ "," ] .        (* bare slice literal / type-conversion call: no callee to name *)
 arg          = [ "..." ] expression .           (* '...' spreads a slice, §12.4 *)
 
@@ -2481,8 +2481,8 @@ Outer{ x: Inner{ a: "s" } }     // Outer.x is an int
 the `a: "s"` mismatch is reported before the `x:` one, even though `x:` starts
 earlier in the source. Order is user-facing, and the two compilers must render
 byte-identical output, so it is fixed here rather than left to whichever
-traversal each implementation happens to use (#1489;
-_tests_/cases/check_composite_order.bit).
+traversal each implementation happens to use
+(_tests_/cases/check_composite_order.bit).
 
 ### 12.4 Calls, Variadics, Spread
 
@@ -2813,7 +2813,7 @@ jsx_name     = ( IDENT | KEYWORD ) { "-" ( IDENT | KEYWORD ) } [ ":" ( IDENT | K
 jsx_tag_name = jsx_name { "." jsx_name } .
 ```
 
-**`jsx_name` is not a Bit identifier (#5155, #5170).** JSX's own grammar
+**`jsx_name` is not a Bit identifier.** JSX's own grammar
 names this production `JSXIdentifier`/`JSXNamespacedName`, and it differs
 from `IDENT` in exactly three ways, all permitted only here, in a tag's own
 name or one of its attribute names, never anywhere else a Bit identifier is
@@ -2836,7 +2836,7 @@ expected:
    is a compile error, since outside this exact production `-` is always the
    subtraction/negation operator (§8).
 3. **A colon joins a namespace onto a `jsx_name`, at most once, with no
-   whitespace on either side** - JSXNamespacedName (#5170) - so `<svg:circle
+   whitespace on either side** - JSXNamespacedName - so `<svg:circle
    xlink:href="#a">` is ordinary JSX, both the tag's own name and an
    attribute's. `xlink : href` (whitespace around the colon) does not merge,
    and a SECOND colon (`a:b:c`) is a compile error: outside this exact
@@ -2851,7 +2851,7 @@ an uppercase component call as the named argument's name, matched by text
 the same way any other named argument is (§12.11).
 
 **`jsx_tag_name` may chain `.jsx_name` onto itself** - JSXMemberExpression
-(#5171) - so `<Foo.Bar />` is ordinary JSX, reaching a component through a
+- so `<Foo.Bar />` is ordinary JSX, reaching a component through a
 module path exactly as `Foo.Bar(...)` would as an ordinary call, each `.`
 glued with no whitespace on either side the same way a namespace's `:` is. A
 `jsx_tag_name` with at least one `.` is ALWAYS a component call, regardless
@@ -2866,7 +2866,7 @@ names' full text exactly as a plain tag's closer already is.
 An attribute written without `=` has the value `true`, so `<input disabled />`
 and `<input disabled={true} />` mean the same thing.
 
-**A `{ expression }` attribute value has no JSX-specific type rule** (#5324):
+**A `{ expression }` attribute value has no JSX-specific type rule**:
 the desugaring below turns it into an ordinary call argument - `attr`'s own
 `(string, string)` signature on a lowercase tag, the named parameter's own
 declared type on an uppercase (component) tag - typed exactly as any other
@@ -2875,7 +2875,7 @@ E0041, `expected 'string', found 'i64'`, the same diagnostic a hand-written
 `attr("data-id", n)` call gets; write `data-id="${n}"` (§5.7's
 interpolation) to convert it explicitly.
 
-**A spread attribute** (`<div {...props} />`, #5172) inserts every attribute
+**A spread attribute** (`<div {...props} />`) inserts every attribute
 `props` (a `pkg/web` `[]Node`) carries at the position it is written, mixed
 freely with ordinary attributes and children in the same tag: `<div
 {...props} class="card">hi</div>` renders `props`' own attributes, then
@@ -2939,7 +2939,7 @@ disappears - while `<b>bold</b> <i>italic</i>` on one line has three, the middle
 one being the single space, and `<p> hi </p>` has one child whose text is
 ` hi ` with both spaces intact.
 
-**An empty expression child is not a child at all** (#5173) - `jsx_child`'s
+**An empty expression child is not a child at all** - `jsx_child`'s
 `"{" [ expression ] "}"` makes the expression OPTIONAL, unlike an
 attribute's own `{expr}` value (`jsx_attr`, above, which still requires one).
 `{}` and the standard `{/* comment */}` idiom - a comment leaves no
@@ -2948,7 +2948,7 @@ verdict a whitespace-only run already gets: `<p>a{}b{/* note */}c</p>` has
 the single text child `abc`. An attribute's `{}` is unaffected and stays a
 compile error, since `jsx_attr`'s own production was not widened.
 
-**Desugaring (#3944).** A JSX element's meaning depends only on its tag's
+**Desugaring.** A JSX element's meaning depends only on its tag's
 first letter, UNLESS it is a member-expression tag (`<Foo.Bar />`, above),
 which is always a component call regardless of case - case is the
 discriminator every JSX implementation uses for an undotted name, and the
@@ -3167,7 +3167,7 @@ c: chan<T>
 It does not any more: that is a position, so it is spelled `for (i, x) in xs`,
 and the `of` spelling now splits the element instead.
 
-**Field-pattern binder (#4106).** `for_of`'s binder also accepts a `field_pat` -
+**Field-pattern binder.** `for_of`'s binder also accepts a `field_pat` -
 `for { a, b, ... } of xs`, legal only when `xs`'s element is a class. Each
 name binds a local of the same name to that field's value, the for-of analogue
 of composite-literal shorthand's `Point{ x, y }` (§12.2). Order in the pattern
@@ -3763,7 +3763,7 @@ See §15.4.
 - Arrays and tuples are comparable if their element types are; classes are
   comparable if all fields are comparable (field-wise).
 - A C-like enum (all variants payload-free) compares with `==`/`!=` by tag, and
-  may be a map key. A payload-carrying enum compares STRUCTURALLY (#4341): two
+  may be a map key. A payload-carrying enum compares STRUCTURALLY: two
   values are equal when their tags match and, for that tag, every payload word
   is equal - the same rule a class gets, applied to a variant's arguments
   instead of a class's fields. An enum is comparable exactly when every
@@ -3919,7 +3919,7 @@ Three consequences, each of which has caused the two compilers to diverge:
 
 Order is user-facing, and the two compilers must render byte-identical output,
 so this is fixed rather than left to whichever traversal each implementation
-happens to use (#1489, #1521; _tests_/cases/check_typenode_order.bit).
+happens to use (_tests_/cases/check_typenode_order.bit).
 
 ---
 
@@ -4818,7 +4818,7 @@ explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
 deterministic resource release without finalizers on every path that returns.
 
-### 18.6 Caller Location and Stack Traces (#2905)
+### 18.6 Caller Location and Stack Traces
 
 No mechanism exists in v0.1 for a callee to learn its call site's `file:line`,
 and a panic today reports nothing beyond its message. **Decision: v1 will get
@@ -4826,7 +4826,7 @@ caller location and full stack traces from debug info emitted by both object
 writers, read back by a runtime stack walk at panic time.** This entry records
 the decision and its cost; it does not implement it - parser, checker, IR,
 codegen, both object writers, and the runtime walker are all separate,
-follow-on tickets, and none of them lands here.
+follow-on work, and none of them lands here.
 
 **This reverses a documented v1 position, and says so rather than superseding
 it silently.** `runtime/ABI.md` §12 ("Panics") stated, at the time of this
@@ -4837,9 +4837,9 @@ no debug-info format yet to symbolize one if it did."* Both halves of that
 sentence are now deliberately becoming false: codegen will make that promise,
 and a debug-info format will exist to symbolize a walk with. (Its `recover`
 clause is stale as well: §18.4 above now specifies a per-task panic boundary.)
-`runtime/ABI.md` itself is not edited here - this ticket's own constraints keep
-it out of `runtime/` - so that document read as it did until #3286 updated it
-(§12 now describes the opt-in `BIT_BACKTRACE=1` walk, #3285/#3820); this entry
+`runtime/ABI.md` itself is not edited here - this decision's own scope keeps
+it out of `runtime/` - so that document read as it did until a later update
+(§12 now describes the opt-in `BIT_BACKTRACE=1` walk); this entry
 is what authorized that update. §18.4 above already claims "a message and a
 stack trace to stderr" for every panic; until this decision, that clause named
 no reachable implementation and flatly contradicted `runtime/ABI.md`'s own text
@@ -4868,22 +4868,22 @@ narrower ones requires saying so:
   chain for the GC's stack-map walker: `runtime/ABI.md` §4 ("Frame chain")
   states *"Both backends establish an identical frame record: `*(fp)` is the
   caller's frame pointer and `*(fp+8)` is the return address."* But that
-  promise is not universal today. `#2929`'s `frameless` optimization
+  promise is not universal today. The `frameless` optimization
   (`compiler/arm64compile.bit:506-525`) elides the frame record entirely for
   any function that makes no call and closes no loop back-edge, and its own
   comment says why that is sound *today*: "this backend's panic path never
   walks a frame chain at all," quoting the `bit_rt_panic` doc comment as it
   then read in `runtime/root/darwin/io.bit` and `runtime/root/linux/io.bit`
-  (both since rewritten by #3285/#3820 to describe the `BIT_BACKTRACE=1`
+  (both since rewritten to describe the `BIT_BACKTRACE=1`
   walk - neither file still carries this text, so no current line citation
   applies): *"No stack trace: codegen makes no frame-pointer-chain
   promise..."*). A frameless leaf can still contain one of §12.1's
   backend-injected, argument-free panics (`bit_rt_panic_div_zero`,
   `bit_rt_panic_nil_call`, `bit_rt_panic_nil_iface`), which are deliberately
   excluded from `hasSafepoints` on that same reasoning. Once a walk exists,
-  the reasoning is gone: this decision requires revisiting `#2929` for the
-  panic-reachable subset of frameless functions, which is a real codegen
-  change, not a no-op.
+  the reasoning is gone: this decision requires revisiting that optimization
+  for the panic-reachable subset of frameless functions, which is a real
+  codegen change, not a no-op.
 - **Symbolization that still works on a binary a user has run `strip` on.**
   Nothing in the current release pipeline strips (`dist/release.sh`,
   `tools/build/` invoke no `strip`), so this is a forward design constraint,
@@ -4934,13 +4934,13 @@ narrower ones requires saying so:
    walk starts from the panic call's own frame, discovered by the runtime
    from the stack it is already standing on when it runs, not passed in as
    an argument. **This is not an ABI change.** If a future implementation
-   ticket ever needs to widen either signature after all, that is the moment
+   ever needs to widen either signature after all, that is the moment
    to say so explicitly in `runtime/ABI.md`, per that document's own rule
    that a frozen signature never changes silently.
 
 **Inlined frames - the question this decision creates and must answer.**
-`maxInlineDepth()` is 2 and splicing is recursive (`compiler/optinline.bit:10-44`,
-#3163): level 1 splices the callee's body whole into the caller; level 2
+`maxInlineDepth()` is 2 and splicing is recursive (`compiler/optinline.bit:10-44`):
+level 1 splices the callee's body whole into the caller; level 2
 splices a call already inside that spliced body the same way. A call the
 source shows as two or three frames deep can exist as **one** physical frame
 at runtime, because the optimizer flattened it before codegen ever built a
@@ -4959,7 +4959,7 @@ getting one frame per syntactic call are different guarantees; this decision
 commits to the first and explicitly not to the second. A trace can therefore
 be shorter than the source's call nesting suggests, with nothing in the trace
 itself distinguishing "inlined away" from "never a separate call" - whether to
-add such a marker is left to the implementation ticket.
+add such a marker is left to a future implementation.
 
 **Rejected alternatives, and why:**
 
@@ -4982,7 +4982,7 @@ add such a marker is left to the implementation ticket.
 - **Default arguments evaluated at the call site**, plus predeclared `file`/
   `line` defaults (how Swift's `#file`/`#line` parameter defaults work). Bit
   does have a default-argument feature (§10.3, `param = ... [ "=" const_expr ]
-  .`, #5244), added after this decision, but deliberately not this shape: a
+  .`), added after this decision, but deliberately not this shape: a
   default there is a bare literal the CHECKER folds once, at the declaration,
   identically regardless of where or how many times the function is called -
   never an expression re-evaluated per call site the way `#file`/`#line`
@@ -5003,16 +5003,13 @@ add such a marker is left to the implementation ticket.
   trace-free indefinitely, was judged an unacceptable permanent gap once a
   real, general fix was on the table.
 
-**Consequence for #2252 and #2266.** Both stay blocked - this entry lands the
-decision, not the mechanism - but the shape of their eventual fix changes.
-Under the rejected `@caller_location` shape, `std/testing` would have received
-a location as an ordinary parameter threaded through its assertion helpers.
-Under this decision it instead asks the runtime for a trace once the walk and
-its symbolization exist. Whoever implements those tickets must build the
-runtime-trace consumer, not the parameter-passing version either ticket was
-filed expecting.
+**Consequence for `std/testing`.** Under the rejected `@caller_location`
+shape, `std/testing` would have received a location as an ordinary parameter
+threaded through its assertion helpers. Under this decision it instead asks
+the runtime for a trace once the walk and its symbolization exist - the
+runtime-trace consumer, not the parameter-passing version.
 
-### 18.6.1 Debug-info format: decision (#3281)
+### 18.6.1 Debug-info format: decision
 
 **Decision: a bespoke, non-strippable, address-keyed side table - not
 DWARF.** Wire format: `runtime/ABI.md` §4.2. This entry is the *why*; it does
@@ -5020,14 +5017,14 @@ not repeat the *what* ABI.md already states precisely enough for two
 independent object-writer implementations (`emitmacho.bit`, `emitelf.bit`) to
 converge without re-deciding anything.
 
-**The disqualifying constraint, confirmed rather than assumed.** Epic #1905:
+**The disqualifying constraint, confirmed rather than assumed:**
 *"a static Bit binary with no libc must symbolize its own panic ... no
 external debugger, no external symbolization tool."* A DWARF
 `.debug_info`/`.debug_line` pair is, by definition and by every shipping
 `strip`'s default behavior, debug metadata: macOS `strip` and GNU/LLVM
 `strip` both specifically recognize and remove `__DWARF`/`.debug_*` sections
 with no flag telling them to. Choosing DWARF for the table `bit_rt_panic`
-itself must read means the one constraint the epic states as
+itself must read means the constraint stated above as
 **non-negotiable** - surviving an end user's own `strip` - fails on the most
 ordinary invocation of that tool. This is not a matter of emitting DWARF
 carefully; it is disqualified by what the format *is*.
@@ -5063,8 +5060,8 @@ per-function side table referenced only by two extent symbols the runtime
 resolves internally, never surfaced to anything an external `strip`
 recognizes as debug data.
 
-**A related finding, filed separately rather than assumed away here
-(#3387):** the epic's second acceptance criterion - *"`sample <pid>` ...
+**A related finding, noted separately rather than assumed away here:**
+a second constraint - *"`sample <pid>` ...
 resolves frames to function names instead of raw offsets"* - is **not
 achievable by picking a debug-info format at all**, bespoke or DWARF, while
 the final linker emits zero local symbol-table entries (measured above:
@@ -5073,10 +5070,10 @@ function's *name* primarily from `nlist` entries; DWARF's own DIEs can
 substitute in principle (a stripped-binary-plus-dSYM workflow works precisely
 because DWARF is address-range-keyed, not `nlist`-keyed), but nothing in this
 tree emits a DIE tree either, and whether `sample` specifically falls back to
-embedded DWARF with no `nlist` present was not tested here - #3387 owns
-settling it. Either way this is a **linker gap**, independent of and prior to
-this decision; the panic-trace mechanism this ticket specifies does not
-depend on it and is not blocked by it.
+embedded DWARF with no `nlist` present was not tested here - left for a
+follow-up to settle. Either way this is a **linker gap**, independent of and
+prior to this decision; the panic-trace mechanism this decision specifies
+does not depend on it and is not blocked by it.
 
 **Measured size, against the real precedent, not asserted.** `.bit_gc` in the
 current `libbitrt-aarch64-macos.a` (`580c65e8`):
@@ -5091,16 +5088,16 @@ total __text bytes (same 23 objects): 319,012   (.bit_gc / __text = 18.6%)
 `bit-out/bin/bit`'s whole `__text` is 4,406,220 bytes. Extrapolating the
 runtime's own per-function averages (387 bytes code, 72 bytes stack-map data
 per function) to the whole binary gives roughly **11,400 functions**. The
-debug-info table's per-function cost is 24 bytes of header (16 originally;
-#3662 added an 8-byte per-entry function-name field) plus 16 bytes per
+debug-info table's per-function cost is 24 bytes of header (16 originally,
+plus an 8-byte per-entry function-name field added later) plus 16 bytes per
 line-table row (ABI.md §4.2); **the row count per function cannot be
-measured before #3283 exists** - there is no emitter to measure - so what
+measured before an emitter exists** - there is no emitter to measure - so what
 follows is stated as an estimate, not a fact: at an assumed 8 rows/function
 (a function of the compiler's own average size, ~387 bytes, touching perhaps
 8-15 distinct source lines), the table costs roughly 152 bytes/function,
-**~1.7 MB total, ~26% of the current 6.5 MB dev binary**. #3283 should
-replace the 8-rows assumption with a measured figure the first time a real
-emitter exists, and revise this number rather than repeat it.
+**~1.7 MB total, ~26% of the current 6.5 MB dev binary**. Replace the
+8-rows assumption with a measured figure the first time a real emitter
+exists, and revise this number rather than repeat it.
 
 **DWARF's cost, measured rather than remembered**, via `clang -g
 -gline-tables-only` (the closest DWARF mode to what this table carries - no
@@ -5131,19 +5128,19 @@ the strip-survival constraint alone; the ecosystem cost (no `lldb`, no `gdb`,
 no third-party profiler support) is accepted as the price, not hidden.
 
 **Rejected, for now: emit DWARF *in addition*, as a separate opt-in output
-for external tools** - the "third shape" this ticket was asked to weigh
-rather than assume away. Not disqualified in principle: DWARF's address-range
-keying means it does not need `nlist` either, so it is not blocked by #3387
-the way `sample`'s current failure mode is. Rejected from *this* ticket's
-scope because it is a materially different, larger feature: a `.debug_line`
-state-machine encoder, DIE emission, and a decision on whether it ships
-inside the binary (reintroducing the exact strip hazard this decision exists
-to avoid) or as a separate artifact (a dSYM-equivalent bundle, with its own
-distribution and `dist/release.sh` questions). Filing it as future work
-rather than deciding it here keeps this ticket's deliverable to what #1905
-actually requires: self-symbolization with no external tool. Whoever picks
-this up next should file it as its own ticket against #1905, not fold it
-into #3283.
+for external tools** - the "third shape" worth weighing rather than
+assuming away. Not disqualified in principle: DWARF's address-range
+keying means it does not need `nlist` either, so it is not blocked by the
+linker gap noted above the way `sample`'s current failure mode is. Rejected
+from this decision's scope because it is a materially different, larger
+feature: a `.debug_line` state-machine encoder, DIE emission, and a decision
+on whether it ships inside the binary (reintroducing the exact strip hazard
+this decision exists to avoid) or as a separate artifact (a dSYM-equivalent
+bundle, with its own distribution and `dist/release.sh` questions). Noting
+it as future work rather than deciding it here keeps this decision's scope
+to what self-symbolization with no external tool actually requires. Whoever
+picks this up next should treat it as its own follow-up, not fold it into
+this one.
 
 **Rejected: reusing `.bit_gc` itself rather than a second table.** Considered
 because it is the existing precedent and avoids a second section entirely.
@@ -5154,10 +5151,10 @@ because independence is a real property worth keeping: a debug-info entry
 must carry an *inlined* callee's original span on rows spliced into a
 caller's list (below), which the stack-map table has no reason to ever do to
 its own per-safepoint entries. Coupling the two would make a future change to
-either format's cost model - retention, alignment, or a #3189-style version
-stamp - a change to both.
+either format's cost model - retention, alignment, or a version-stamp
+mechanism - a change to both.
 
-**Inlined frames: this ticket does not reopen §18.6's decision above, and
+**Inlined frames: this entry does not reopen §18.6's decision above, and
 confirms the format satisfies it.** §18.6 already committed to *one physical
 frame, correct leaf `file:line`, not one frame per syntactic call* - an
 inlined call contributes no frame of its own, but the innermost row must
@@ -5165,16 +5162,17 @@ still name the original callee's file and line. This format satisfies that
 by construction: each row's `(file_hdr_ptr, line)` is independent per `pc`
 range, so a splice that flattens a callee's body into its caller's code can
 still carry the callee's *original* source position on the rows that came
-from it, provided #3282 keeps that original span on the spliced `IrInstr`
-rather than relabeling it to the splice site (§18.6's own stated requirement
-on that ticket). Nothing here asks for a synthesized "logical" frame, and
-nothing here needs one.
+from it, provided a future implementation keeps that original span on the
+spliced `IrInstr` rather than relabeling it to the splice site (§18.6's own
+stated requirement). Nothing here asks for a synthesized "logical" frame,
+and nothing here needs one.
 
 **Why not defer the whole decision.** A hedge here (leave DWARF-vs-bespoke
-open, let #3283 pick) is exactly the failure mode this ticket's acceptance
-guards against: #3283, #3284, and #3285 all need the same answer to converge
-independently, and "TBD" would mean the first implementer re-litigates this
-research under a code-review deadline instead of a design one.
+open, let a future implementer pick) is exactly the failure mode this
+decision guards against: every downstream implementation needs the same
+answer to converge independently, and "TBD" would mean the first
+implementer re-litigates this research under a code-review deadline instead
+of a design one.
 
 ---
 
@@ -5219,10 +5217,7 @@ test "concat" {
   whatever `main` it finds before synthesizing its own entry point (§17.4),
   so a user's `fn main(){}` in a `.test.bit` file is an ordinary function,
   never flagged. A `test` declaration can never collide with `main` - its
-  own name is a string, never a symbol. (A shape-based legacy form -
-  discovered with no `test` keyword at all - existed here from #3786 until
-  #4148 removed it; this file no longer describes that form because it no
-  longer exists.)
+  own name is a string, never a symbol.
 - Tests live in one of two places: beside the file they test, as
   `<name>.test.bit`, or grouped under a `_tests_/` subdirectory for
   black-box tests that exercise only a module's exported surface. A
@@ -5267,8 +5262,8 @@ test "concat" {
   The benefit subtests are usually reached for, naming the failing row of a
   table-driven test, is delivered instead by the `label` parameter every
   `std/testing` assertion requires (`stdlib/testing/testing.bit`): it is a
-  positional parameter with no default (§10.3's `= const_expr` production,
-  #5244, is never written on it) - so the row a failure came from can never
+  positional parameter with no default (§10.3's `= const_expr` production
+  is never written on it) - so the row a failure came from can never
   go unnamed.
 - Tests are ordinary unreferenced declarations to `bit build`/`bit run`, so the
   linker's dead-strip drops them from a normal program's binary - every
@@ -5471,7 +5466,7 @@ while_stmt    = "while" "(" expression ")" block .
 for_stmt      = "for" ( for_c | for_of | for_in | (* empty -> infinite *) ) block .
 for_c         = "(" [ value_decl | assign_stmt ] ";" [ expression ] ";" [ inc_dec_stmt | assign_stmt ] ")" .
 for_of        = ( IDENT | tuple_pat | field_pat ) "of" expression .   (* the pattern splits the VALUE; §12.6 *)
-for_in        = ( IDENT | "(" pat "," pat ")" ) "in" expression .   (* pair binder: §12.6, #4333 *)
+for_in        = ( IDENT | "(" pat "," pat ")" ) "in" expression .   (* pair binder: §12.6 *)
 field_pat     = "{" IDENT { "," IDENT } "}" .   (* for-of field-name binder; §12.6 *)
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
 switch_case   = "case" expression { "," expression } ":" { statement ";" }

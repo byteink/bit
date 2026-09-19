@@ -1,9 +1,9 @@
 # Lint baseline: compiler/ and stdlib/
 
-Epic #2354. A one-time snapshot of what `bit lint` currently reports over the
-project's own source, taken so #2453 (the count-ratchet gate, blocked on this
-ticket) has a starting number to compare against. It is not itself read by any
-gate - see "What this is for" below.
+A one-time snapshot of what `bit lint` currently reports over the
+project's own source, taken so a future count-ratchet gate has a starting
+number to compare against. It is not itself read by any gate - see "What this
+is for" below.
 
 ## Measured at
 
@@ -81,10 +81,10 @@ number is evidence the 708 is not the whole story - some findings were
 already dispositioned before this snapshot (E0214 among them: see below) and
 are not sitting in the 708.
 
-`E0212 unreachable-code` reads 0 in both scopes because #3211 fixed the
-underlying dead code rather than suppressing the rule - see
-`docs/lint/policy.md`'s E0212 section (corrected by #3233 the same day). It is
-not a gap in this measurement.
+`E0212 unreachable-code` reads 0 in both scopes because the underlying dead
+code was fixed rather than the rule suppressed - see `docs/lint/policy.md`'s
+E0212 section, which documents that E0212 catches real dead code, not a
+checker gap. It is not a gap in this measurement.
 
 ## E0214 append aliasing
 
@@ -104,9 +104,9 @@ $ grep -c 'warning\[E0214\]' /tmp/lint-stdlib.txt; echo $?
 not a finding count. Recorded so a zero-count reading is never mistaken for a
 command that didn't run.)
 
-This is not an absence of scrutiny: #3209 (`compiler/`, merged `844967b9`)
-dispositioned all 8 findings the widened rule exposed there, and #3208
-(`stdlib/`, merged `92d03397`) dispositioned all 22 in `stdlib/` - one of
+This is not an absence of scrutiny: a `compiler/` triage (merged `844967b9`)
+dispositioned all 8 findings the widened rule exposed there, and a `stdlib/`
+triage (merged `92d03397`) dispositioned all 22 in `stdlib/` - one of
 which (`stdlib/tls/handshakewire.bit:144`, the TLS transcript aliasing bug)
 was FIXED with a defensive copy rather than overridden; the other 29 across
 both scopes carry a per-finding `// bit:lint allow E0214 -- <reason>`. Those
@@ -115,9 +115,8 @@ both scopes carry a per-finding `// bit:lint allow E0214 -- <reason>`. Those
 ## What this is for
 
 This file is a **snapshot**, not a live check. Nothing currently reads it.
-**#2453** ("Add the lint-self gate to tools/build/gates.bit as a count
-ratchet", blocked on this ticket) is expected to add a gate that compares a
-future `bit lint` run's totals against the numbers recorded here and fails on
-regression. Until #2453 lands, this document has no enforcement behind it -
-treat any number above as informational only, and re-run the commands in
-"Regenerating this file" before relying on it for anything.
+A count-ratchet gate is expected to compare a future `bit lint` run's totals
+against the numbers recorded here and fail on regression. Until that gate
+reads this file, this document has no enforcement behind it - treat any
+number above as informational only, and re-run the commands in "Regenerating
+this file" before relying on it for anything.

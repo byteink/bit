@@ -1,10 +1,9 @@
 # Lint remediation policy: the non-aliasing rules
 
-Epic #2354. This is the policy for what to do with every `bit lint` finding in
+This is the policy for what to do with every `bit lint` finding in
 `compiler/` and `stdlib/` **except E0214** `append-aliasing`, which is a
-correctness rule, not a readability one, and has its own settled history
-(#2440, #2441, #2442, #3205, #3208, #3209). Do not use this document to
-disposition an E0214 finding.
+correctness rule, not a readability one, and has its own settled history.
+Do not use this document to disposition an E0214 finding.
 
 **This is not a second rulebook.** [spec/LINT.md](../../spec/LINT.md) is the
 authority for every rule's definition, default limit, and override grammar;
@@ -19,7 +18,7 @@ citing those two, not restating a competing definition.
 For each rule: a decision (`fix`, `raise the limit to N`, or `suppress with
 allow`), the reason, and a **mechanical test** - a command whose output
 settles whether that rule is clean, so an executor never has to guess. Every
-test command follows the two rules this epic already learned the hard way:
+test command follows the two rules already learned the hard way:
 
 1. `bit lint` writes every finding to **stderr**. Every command below
    redirects `2>&1` before counting anything.
@@ -43,9 +42,8 @@ overall exit code is.
 
 Measured this session, `main` @ `e6f170d3`, with `bit lint compiler 2>&1` /
 `bit lint stdlib 2>&1` and the linter's own summary line as the denominator.
-**Re-derive before trusting these** - the ticket that produced them says so
-explicitly, and this run already drifted from the same-day baseline quoted in
-the dispatch (E0201 compiler 77→79; every other cell matched exactly):
+**Re-derive before trusting these** - this run already drifted from a
+same-day baseline (E0201 compiler 77→79; every other cell matched exactly):
 
 | rule | compiler/ | stdlib/ | decision |
 |---|--:|--:|---|
@@ -60,12 +58,12 @@ the dispatch (E0201 compiler 77→79; every other cell matched exactly):
 | E0210 `unused-import` | 0 | 1 | fix |
 
 `compiler/ 712 findings, stdlib/ 680 findings` including E0214 (8 compiler, 22
-stdlib - out of scope here, live on #3208/#3209). Excluding E0214: compiler
-704, stdlib 658.
+stdlib - out of scope here, already dispositioned; see docs/lint/baseline.md's
+E0214 section). Excluding E0214: compiler 704, stdlib 658.
 
 ## The constraint this whole document is answerable to
 
-Inherited from #2354, verbatim: *"Do not silence this with a blanket
+The owner's constraint, verbatim: *"Do not silence this with a blanket
 suppression or by raising every limit until the count reaches zero - an
 override must carry the reason it is safe."* Nowhere below is "raise the
 limit" applied uniformly to a rule's whole finding set. Every raise is
@@ -95,9 +93,8 @@ change.
   read, a multi-assign that only cares about one side): rename it to the
   **literal blank identifier `_`**, not an underscore-prefixed name.
 
-**Verified this session, empirically, per the ticket's own instruction to
-check rather than assume - an `_`-prefix does NOT silence E0211, only the
-bare `_` does:**
+**Verified this session, empirically - an `_`-prefix does NOT silence E0211,
+only the bare `_` does:**
 
 ```sh
 $ cat t.bit
@@ -120,8 +117,8 @@ This is not a convention this codebase invented - it falls out of
 `compiler/resolve.bit`'s `rInsertModuleSymbol`, which never binds a symbol at
 all for the literal name `"_"` (three call sites: lines 273, 300, 361). A
 name that merely starts with `_` is bound normally and is exactly as reportable
-as any other unused local. `#2444`/`#2445`/`#2446` must rename to bare `_`,
-never to `_foo`, when the binding has to stay.
+as any other unused local. The remaining `_foo`-prefixed bindings must rename
+to bare `_`, never to `_foo`, when the binding has to stay.
 
 **Test:**
 ```sh
@@ -134,11 +131,11 @@ grep -c '^warning\[E0211\]' "$LOG"   # must be 0
 > hint: `remove the import, or bind it to '_' if it is needed only for a side effect`
 
 **Decision: fix.** Same rule and same reasoning as E0211 - `docs/reference/lint.md`
-names both together. #2443 already cleared this rule's findings; the single
-remaining `stdlib/` finding is either new debt from a later commit or drift
-between #2443's landing and this session's baseline. Delete it, or if the
-import exists purely for a side effect (registering something at load time),
-bind it `as _`.
+names both together. A prior pass dropped the three unused `std/http3`
+imports in `stdlib/http/http.bit` that this rule's findings traced to; the
+single remaining `stdlib/` finding is either new debt from a later commit or
+drift since that pass. Delete it, or if the import exists purely for a side
+effect (registering something at load time), bind it `as _`.
 
 **Test:**
 ```sh
@@ -234,8 +231,8 @@ grep -c '^warning\[E0203\]' "$LOG"   # must be 0
 **Decision: fix by default. Raise, file-scoped, only for a function proven
 flat by the SAME nesting cross-check used for E0201.** This is the rule with
 the widest spread (scores from 11 to 112 against a limit of 10 - up to 11x),
-so a single global number is not defensible and is exactly what the epic
-constraint forbids. Every raise is decided function by function.
+so a single global number is not defensible and is exactly what the owner's
+constraint above forbids. Every raise is decided function by function.
 
 **The discriminator, verified on this session's four highest scores:**
 `compiler/fmtdispatch.bit:9` (`fmtDispatch`, complexity 112), `compiler/ast.bit:213`
@@ -266,15 +263,16 @@ grep -c '^warning\[E0204\]' "$LOG"   # must be 0
 > `unreachable code`
 > hint: `line ${n} always diverts control; nothing after it in this block runs`
 
-**#2439 documented this rule set under the wrong theory, and #3211 disproved it
-empirically rather than by argument.** The claim this section used to make was
-that two shapes were structurally forced on the author - the checker itself
-supposedly required a trailing filler statement that E0212 then flagged as
-dead, making this "mostly a checker gap" pending a rule change. That is false.
-Both shapes compile fine with the filler deleted, in the tree as it exists
-today. #3211 deleted the filler statements outright: 112 in `compiler/`
-(`b172585e`) and 12 in `stdlib/` (`c4e63d81`) - not because a rule changed, but
-because the code really was unreachable and always had been.
+**This section originally documented E0212 under the wrong theory, later
+disproved empirically rather than by argument.** The claim this section used
+to make was that two shapes were structurally forced on the author - the
+checker itself supposedly required a trailing filler statement that E0212
+then flagged as dead, making this "mostly a checker gap" pending a rule
+change. That is false. Both shapes compile fine with the filler deleted, in
+the tree as it exists today. The filler statements were deleted outright: 112
+in `compiler/` (`b172585e`) and 12 in `stdlib/` (`c4e63d81`) - not because a
+rule changed, but because the code really was unreachable and always had
+been.
 
 **Why the two can never actually disagree.** E0212 is not a second,
 independently-invented divergence check - `lintUnreachableCode`
@@ -305,10 +303,10 @@ never checker-mandated. The two shapes:
   (`compiler/validatestmt.bit:367-375`) already treats a match whose every arm
   diverges as diverging - both independent of anything written after them. So
   E0055's missing-return check was already satisfied without the dummy
-  `return`, in every one of the twelve `stdlib` findings #3211 removed.
+  `return`, in every one of the twelve `stdlib` findings removed above.
 
 **Policy: fix - delete the trailing statement. There is no `allow` path and no
-downstream ticket to file**, because there is no rule defect to track.
+follow-up work to file**, because there is no rule defect to track.
 Mechanically, for a live E0212 finding:
 
 1. Read the statement immediately preceding the flagged one.
@@ -373,7 +371,7 @@ grep -c '^warning\[E0215\]' "$LOG"   # must be 0
 > `'${name}' is used here, but this block already has its own transaction
 > handle '${param}'`
 
-New with #5077 (epic #5050, compiler/linttx.bit): like E0214
+Added alongside `compiler/linttx.bit`: like E0214
 `append-aliasing`, this is a correctness rule, not a readability one, and it
 is excluded from the "current findings, fix/raise/suppress" framing this
 document is otherwise for - there is no legacy debt to disposition, because
@@ -395,13 +393,13 @@ code is what a CI gate reads, never `bit build`'s.
 > `'${var}.${field}' reads relation field '${field}' on '${class}' with no
 > preceding '.with("${field}")' in this function`
 
-New with #5247 (epic #5050, compiler/lintrelation.bit), the compile-time half
-of #5271's runtime panic on the same misuse - the two are meant to be
-recognisable as the same mistake, so their wording agrees on naming the
+Added alongside `compiler/lintrelation.bit`, this is the compile-time half
+of the unloaded-relation runtime panic on the same misuse - the two are meant
+to be recognisable as the same mistake, so their wording agrees on naming the
 class, the field, and the exact `.with("field")` call that is missing.
 Scoped narrowly, on purpose: it only sees a local bound straight from
-`find<T>(db, table, fields, mapper)` (pkg/orm's real chain builder, #5061 -
-`T` written as an explicit type argument, needing no type inference the
+`find<T>(db, table, fields, mapper)` (pkg/orm's real chain builder - `T`
+written as an explicit type argument, needing no type inference the
 resolver cannot give it - see the file's own header), optionally chained
 through `Query<T>`'s other non-failable builder methods and `.with("field")`
 links, terminated by `.oneOrFail()`. It flags a read of that local's
@@ -412,7 +410,7 @@ predicate, later in the SAME function and not among the fields a
 **Covers `@hasMany`, `@hasOne` and `@belongsTo` alike.** The predicate this
 rule asks is the field's compiler-known relation attribute, never the
 field's own `[]T`/class-typed shape. This matters most for `@hasOne`/
-`@belongsTo`: #5271's runtime sentinel only encodes "unloaded" for a `[]T`
+`@belongsTo`: the runtime sentinel only encodes "unloaded" for a `[]T`
 (`@hasMany`) field's zero value - a `@hasOne`/`@belongsTo` target is
 class-typed with no zero value that can carry it, so the runtime panic never
 fires for those two kinds (pkg/orm/relation.bit's own header). E0218 is
