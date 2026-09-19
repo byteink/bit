@@ -43,7 +43,10 @@ cpu_hi() { cpu_list | cut -d- -f2; }
 SERVER_CPUS=${BENCH_SERVER_CPUS:-$(cpu_lo)-$(( $(cpu_hi) - 2 ))}
 LOAD_CPUS=${BENCH_LOAD_CPUS:-$(( $(cpu_hi) - 1 ))-$(cpu_hi)}
 
-BIT_IMAGE=${BENCH_BIT_IMAGE:-ghcr.io/byteink/bit:0.19.0}
+# No default. A benchmark whose toolchain version is implicit publishes whichever
+# version the script was last edited against; run.sh always passes this, and a
+# run started by hand over here has to say which compiler it is measuring.
+BIT_IMAGE=${BENCH_BIT_IMAGE:?set BENCH_BIT_IMAGE, e.g. ghcr.io/byteink/bit:0.21.1}
 OHA_IMAGE=ghcr.io/hatoo/oha:latest
 
 # name:port:image:workdir:command. Ports are distinct so all six stay up for

@@ -20,7 +20,8 @@
 # happily republish a stale or partial results.csv. Use --fetch after a run
 # that was started by hand over there.
 #
-# Environment: BIT_X64_HOST and friends, resolved by scripts/x64host.sh.
+# Environment: BIT_X64_HOST and friends, resolved by scripts/x64host.sh, and
+# BENCH_BIT_IMAGE, the toolchain image the Bit server is built with.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)     # pkg/web/bench
@@ -28,6 +29,12 @@ PKG=$(cd "$HERE/.." && pwd)             # pkg/web
 REPO=$(cd "$HERE/../../.." && pwd)      # repo root
 REMOTE_DIR=${BENCH_REMOTE_DIR:-t5418-web-bench}
 MODE=${1:-full}
+# The image is resolved HERE, not on the box: remote.sh has no git and cannot
+# tell which release is current, and a version frozen into either script is how
+# this table published 0.19.0 numbers two releases after 0.19.0 (#5631).
+BIT_IMAGE=${BENCH_BIT_IMAGE:-ghcr.io/byteink/bit:$(git -C "$REPO" tag --list 'v*' \
+  --sort=-v:refname | head -1 | sed 's/^v//')}
+case $BIT_IMAGE in *:) echo "no released v* tag to build against" >&2; exit 1 ;; esac
 
 host=$(sh "$REPO/scripts/x64host.sh") || {
   echo "no x86-64 Linux host configured; see scripts/x64host.sh" >&2; exit 1; }
@@ -58,7 +65,8 @@ ship() {
 measure() {
   local stage=all
   [ "$MODE" != --reuse ] || stage=run
-  ssh "$host" "cd ~/$REMOTE_DIR/web/bench && ./remote.sh $stage" < /dev/null
+  ssh "$host" "cd ~/$REMOTE_DIR/web/bench && BENCH_BIT_IMAGE=$BIT_IMAGE ./remote.sh $stage" \
+    < /dev/null
 }
 
 fetch() {
