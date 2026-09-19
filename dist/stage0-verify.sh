@@ -49,7 +49,11 @@ esac
 base="$(basename "${artifact}")"
 # Match the triple, not the exact filename: the version moves, the triple does
 # not, and pinning the whole name here would mean editing this script per release.
-line="$(grep -E "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
+#
+# `-a`: same file as scripts/stage0.sh's identical grep, and the same reason —
+# a hand-written comment's `§` makes GNU grep call the file binary and return
+# empty stdout at rc=0 inside bit-linux-gate:latest's bind mount (#5634).
+line="$(grep -aE "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
 [ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
 [ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
   || die "more than one digest for triple '${triple}' in ${SUMS} - ambiguous, refusing"
