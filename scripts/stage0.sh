@@ -131,7 +131,16 @@ esac
 # The pin names the exact artifact. Reading the FILENAME out of the digest file
 # rather than composing it from a version variable means there is one source of
 # truth for which build is stage0.
-line="$(grep -E "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
+#
+# `-a`: bind-mounting this repo into a container over virtiofs (e.g. an ad-hoc
+# `docker run -v` against bit-linux-gate:latest — the hardware gates never do
+# this, they stream `git archive HEAD | tar xi` instead) makes virtiofs answer
+# SEEK_HOLE/SEEK_DATA as though SUMS were entirely one hole. GNU grep (3.5+)
+# uses that to detect sparse files and reads an all-holes file as binary, so it
+# calls SUMS binary regardless of content, prints "binary file matches" to
+# stderr, and exits 0 with EMPTY stdout — a silent false "no digest" rather
+# than a crash. `-a` disables the heuristic (#5634).
+line="$(grep -aE "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
 [ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
 [ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
   || die "more than one digest for triple '${triple}' in ${SUMS} — ambiguous, refusing"
