@@ -255,10 +255,44 @@ needs code to measure against:
   what today's four built-in lowerings already do (they do not consume
   the iterator further, so likely nothing, but this needs a fixture, not
   an assertion).
-- A wall-clock/cycle comparison of the direct-method and trait-typed loop
-  shapes against the equivalent raw slice loop, on a drained box. Object
-  counts and `allocbytes` are safe to measure beside other work and are
-  reported above; a cycle count is not, and none is claimed here.
+## Measured cost of the three loop shapes
+
+**Measured for #5564 on `4a208905`**, drained box under `boxlock.sh solo`,
+nothing else running. Three programs summing 1,000,000 `i64` elements per
+repetition: (a) `for x of xs` over a `[]i64`, (b) `for x of it` over a
+concrete class whose `next(): Option<i64>`, (c) the same with `it`
+declared as an interface type, so `next()` dispatches dynamically.
+
+Counters from `/usr/bin/time -l` (`instructions retired`, `cycles
+elapsed`). **Each figure is a two-point delta** -- the same binary run at
+40 and 80 repetitions, subtracted -- so slice construction, process boot
+and the first-execve tax cancel rather than being estimated away. Median
+of 15 runs at each point, every binary warmed first.
+
+| shape | instructions/element | cycles/element | IPC | vs (a) |
+|---|--:|--:|--:|--:|
+| (a) raw `[]i64` slice loop | 11.00 | ~1.9 | 5.6-6.0 | 1.00x |
+| (b) concrete `next(): Option<i64>` | 18.00 | ~2.5 | 7.2-7.5 | **~1.3x** |
+| (c) interface-typed `next()` | 52.01 | ~7.6 | 6.7-6.8 | **~3.9-4.3x** |
+
+**Instruction counts are exact and reproduced to three decimal places
+across two independent collections.** Cycle figures moved about 5% between
+those collections and the per-point spread was 8-30%, so the ratios are
+quoted as ranges; do not restate them as single numbers.
+
+**All three loops run at IPC 5.6-7.5, which is near this core's issue
+width.** That is the regime #4389 documented: high IPC here is saturation,
+not headroom. It is why (b)'s 1.64x instruction cost buys only ~1.3x
+cycles -- the extra work fits in issue slots the slice loop was not using
+-- and it is also why adding instructions to any of these shapes should be
+expected to cost roughly proportionally. An optimization here that trades
+instructions for stalls will lose; see #5571, which measured -1.12%
+instructions at +3.01% cycles in comparable code and was rejected.
+
+The interface arm is the one worth knowing about: **~4.7x the instructions
+and ~4x the cycles** of a slice loop, because every element pays a dynamic
+dispatch that cannot inline. A concrete-typed iterator is close enough to
+a raw loop to be uninteresting; an interface-typed one is not.
 
 ## Specification
 
