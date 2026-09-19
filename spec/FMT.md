@@ -449,7 +449,7 @@ naming its residual debt by file rather than by count.
 **The concrete instance that prompted this.** Six files in `runtime/`
 carry `asm` byte-array literals with each instruction's mnemonic in a
 trailing `//` comment, column-aligned so the encoding reads against the
-instruction it produces, e.g. (`runtime/sched/sched.bit:198`):
+instruction it produces, e.g. (`runtime/sched/switch.bit:198`):
 
 ```
 arm64 { 0xD2800000 }                    // mov x0, #0
@@ -469,7 +469,7 @@ gofmt has for years.
 
 **`#3673` is the fix, not an exception, and its verification set is exactly
 these six files:** `runtime/stw/stwpoll.bit`,
-`runtime/root/linux/boottail.bit`, `runtime/sched/sched.bit`,
+`runtime/root/linux/boottail.bit`, `runtime/sched/switch.bit`,
 `runtime/sched/task.bit`, `runtime/sched/timer.bit`,
 `runtime/sched/windows/spawn.bit`. Once it lands, `bit fmt` produces the
 alignment these files were hand-maintaining, and they become ordinary
