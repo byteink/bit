@@ -163,8 +163,11 @@
 # CODE bucket by riding a shared prefix (runtime/*.md is not runtime/*.bit).
 # docs/**/*.md gets its own bucket (test-docs compiles its code fences), and
 # spec/SPEC.md gets its own bucket too (test-spec, #2758, is a real gate over
-# it — it is NOT prose with no gate, unlike its sibling spec/LINT.md).
-# runtime/**/*.md, spec/LINT.md (and any other spec/* besides SPEC.md),
+# it, plus test-fmt-citations since #5615 — see the `spec` bucket's own
+# comment in scripts/gate-buildsteps.sh). spec/FMT.md and spec/LINT.md are
+# NOT prose with no gate either: test-fmt-citations reads both as cited
+# documents, so both route to `has_selfhost` (scripts/gate-classify.sh).
+# runtime/**/*.md, any OTHER spec/* besides SPEC.md/FMT.md/LINT.md,
 # bench/**/*.md, README.md, CONTRIBUTING.md, and dist/README.md are known to
 # have no gate at all — a diff confined to those runs nothing and says so,
 # distinct from a `full` PASS that implies something ran. Mixed with a real
@@ -223,14 +226,16 @@
 #     check. Any docs/*.md outside docs/stdlib/, or a docs/stdlib/<mod>.md with
 #     no matching stdlib/<mod>/** change, still forces `full`.
 #   - spec/SPEC.md paired with exactly ONE other bucket (#4136): spec/SPEC.md's
-#     own gate (test-spec, #2758) is a single self-contained grammar check
-#     with no PRE/POST script and no cross-file consistency requirement
-#     (unlike the stdlib+docs pairing just above, which needs
-#     stdlib_docs_pairing_ok's per-module check) — pairing it with ANY other
-#     single bucket can never make that bucket's own steps insufficient, so
-#     unioning in test-spec is unconditionally safe. Resolves to the OTHER
-#     bucket's own name (not a new "<x>spec" bucket) with test-spec unioned
-#     into its BUILD_STEPS by union_spec_steps() (scripts/gate-buildsteps.sh)
+#     own gates (test-spec, #2758, and test-fmt-citations, #5615) are each a
+#     standalone step with no PRE/POST script and no cross-file consistency
+#     requirement of their own (unlike the stdlib+docs pairing just above,
+#     which needs stdlib_docs_pairing_ok's per-module check) — pairing them
+#     with ANY other single bucket can never make that bucket's own steps
+#     insufficient, so unioning them in is unconditionally safe (a dedupe
+#     no-op wherever the partner bucket already carries one, e.g.
+#     test-fmt-citations in selfhost/runtime/stdlib/pkg). Resolves to the
+#     OTHER bucket's own name (not a new "<x>spec" bucket) with both gates
+#     unioned into its BUILD_STEPS by union_spec_steps() (scripts/gate-buildsteps.sh)
 #     — the same shape testsbit already uses to ride alongside a bucket
 #     without owning one (see the first exception above). Only fires when
 #     spec is paired with exactly one of the other seven areas (bucket_count
