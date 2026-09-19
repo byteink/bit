@@ -1,0 +1,221 @@
+// In-Bit self-checks for the x86-64 backend's call-lowering: xEmitCallLike's
+// void/bool/i64 return handling, the indirect call_value/call_iface paths
+// (closure-cell layout, interface TypeInfo offset), the Win64 incoming-arg
+// shadow-space fix (#3355/#3373/#3376/#3411), and the shared call helpers
+// (safepoint return-address recording, per-convention arg0, closure-cell
+// layout). Split out of compiler/x64compilecheck.bit (#5638), which sat at
+// exactly the 800-line E0200 ceiling; the per-function compile driver
+// stayed there, and the dispatch and control-flow checks moved to
+// x64dispatchcheck.bit and x64controlflowcheck.bit — see that file's
+// header.
+//
+// Split out of selfcheck.bit originally (#1503); sibling .bit files are the
+// same module, so `selfcheck()` still calls these directly and nothing here
+// is imported.
+
+fn checkX64CallLike() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let boolt = primType(ctx, 10)
+
+  // A void callee takes no result: nothing may be moved out of rax.
+  let cx = xFnCtx([i64t], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 1 }])
+  cx.ctx = ctx
+  cx.safepointCodeOffsets = [0]
+  xEmitCallLike(cx, "bit_rt_safepoint", []int(0), false, 0, 0, true)
+  assert(cx.nextSafepointIdx == 1)
+  assert(xHex(cx.buf) == "e800000000") // just the call — no marshalling, no result
+  assert(cx.safepointCodeOffsets[0] == 5)
+
+  // A bool return MUST be zero-extended: the C ABI returns it in `al` and leaves
+  // rax's upper bits unspecified. bit_rt_string_eq happened to zero eax,
+  // bit_rt_fs_exists did not, and `!fsExists(missing)` silently read false.
+  let cb = xFnCtx([boolt], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 1 }])
+  cb.ctx = ctx
+  cb.safepointCodeOffsets = [0]
+  xEmitCallLike(cb, "bit_rt_fs_exists", []int(0), true, 0, boolt, true)
+  assert(xHexHas(cb.buf, "480fb6c0")) // movzbq %al, %rax
+
+  // An i64 return must NOT be — narrowing a real 64-bit value to its low byte
+  // would be a silent truncation.
+  let ci = xFnCtx([i64t], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 1 }])
+  ci.ctx = ctx
+  ci.safepointCodeOffsets = [0]
+  xEmitCallLike(ci, "bit_rt_time_mono_ns", []int(0), true, 0, i64t, true)
+  assert(!xHexHas(ci.buf, "480fb6c0"))
+}
+
+// Goldens from clang + llvm-objdump. The indirect-call paths: a closure cell is
+// {code, env} and an interface receiver's TypeInfo is *(recv - 16).
+fn checkX64IndirectCalls() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let voidt = ctx.voidId
+  let blocks = [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 2 }]
+
+  // call_value: the cell's CODE is at +0 and its ENV at +8. Swapping them calls
+  // the environment as if it were code.
+  let cx = xFnCtx([i64t, i64t], blocks)
+  cx.ctx = ctx
+  cx.safepointCodeOffsets = [0]
+  xEmitCallValue(cx, 0, voidt, 0, []int(0))
+  assert(xHexHas(cx.buf, "4c8b930800000")) // mov 8(%rbx), %r10   env  at +8
+  assert(xHexHas(cx.buf, "4c8ba30000000")) // mov (%rbx),  %r12   code at +0
+  // env goes in arg0, and the call is INDIRECT through r12 — neither r10 nor r12
+  // is an argument register, so marshalling cannot disturb them.
+  assert(xHexHas(cx.buf, "4c89d7")) // mov %r10, %rdi
+  assert(xHexHas(cx.buf, "41ffd4")) // call *%r12
+  assert(cx.nextSafepointIdx == 1)
+  // #2018: one reloc now -- the nil-check's own call to bit_rt_panic_nil_call.
+  // The real dispatch is still an indirect call through %r12 and names no
+  // symbol of its own.
+  assert(len(cx.relocs) == 1 && cx.relocs[0].symbol == "bit_rt_panic_nil_call")
+
+  // An argument must land in arg1, NOT arg0 — arg0 is reserved for the
+  // environment, which is moved in after marshalling and would overwrite it.
+  let ca = xFnCtx([i64t, i64t], blocks)
+  ca.ctx = ctx
+  ca.safepointCodeOffsets = [0]
+  xEmitCallValue(ca, 0, voidt, 0, [1])       // vreg 1 is spilled
+  assert(xHexHas(ca.buf, "488bb5f0ffffff"))  // mov -16(%rbp), %rsi   -> arg1
+  assert(!xHexHas(ca.buf, "488bbdf0ffffff")) // NOT   ...    , %rdi
+
+  // call_iface: the receiver's TypeInfo lives at *(recv - 16) — the object
+  // header's info field sits BELOW the body pointer (ABI.md §2.1).
+  let ci = xFnCtx([i64t, i64t], blocks)
+  ci.ctx = ctx
+  ci.safepointCodeOffsets = [0]
+  xEmitCallIface(ci, 0, voidt, 0, 7, []int(0))
+  assert(xHexHas(ci.buf, "4c8b93f0ffffff")) // mov -16(%rbx), %r10
+  assert(xHexHas(ci.buf, "48c7c607000000")) // mov $7, %rsi        the method id
+  // #2240: the nil-check's own call to bit_rt_panic_nil_iface now precedes
+  // the real bit_rt_iface_lookup call, so it is relocs[0].
+  assert(ci.relocs[0].symbol == "bit_rt_panic_nil_iface")
+  assert(ci.relocs[1].symbol == "bit_rt_iface_lookup")
+  assert(xHexHas(ci.buf, "4989c4")) // mov %rax, %r12      stash the target
+  assert(xHexHas(ci.buf, "41ffd4")) // call *%r12
+  // Only the METHOD call is a safepoint — the lookup itself never collects.
+  assert(ci.nextSafepointIdx == 1)
+
+  // A SPILLED receiver must be RELOADED after the lookup: xGetInt hands it back
+  // in scratch1 (r11), which the lookup call clobbers. With the receiver in a
+  // callee-saved register the reload is a no-op, so only the spilled case can
+  // tell a correct emitter from one that reuses the stale register.
+  let cs = xFnCtx([i64t, i64t], blocks)
+  cs.ctx = ctx
+  cs.safepointCodeOffsets = [0]
+  xEmitCallIface(cs, 0, voidt, 1, 7, []int(0))     // vreg 1 is spilled
+  assert(xHexCount(cs.buf, "4c8b9df0ffffff") == 2) // mov -16(%rbp), %r11  TWICE
+  assert(xHexHas(cs.buf, "4d8b93f0ffffff"))        // mov -16(%r11), %r10
+}
+
+// #3411: xBindIncomingArgs mirrored xMarshalArgs (compiler/x64call.bit) for the
+// register banks but was never updated for Win64's 32-byte shadow space, which
+// the CALLER reserves between the return address and its outgoing stack args
+// (xEmitCallLike) — so the callee's incoming stack params must skip it too.
+// This is the fourth Win64 home-space bug (#3355, #3373, #3376) and pins the
+// offset directly so a fifth cannot land unnoticed.
+fn checkX64BindIncomingArgsWin64() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  // Seven int params: SysV takes 6 in registers, Win64 only 4 — seven always
+  // leaves at least one on the stack in both conventions.
+  let types = [i64t, i64t, i64t, i64t, i64t, i64t, i64t]
+  let entry = IrBlock{ instsStart = 0, paramCount = 7, instsLen = 7 }
+  let instrs = []IrInstr(0)
+  let i = 0
+  while (i < 7) {
+    instrs = append(instrs, mkInstr(Op.BlockParam, i64t))
+    i = i + 1
+  }
+  // Destinations that collide with NO argument register in either convention
+  // (rdi/rsi/rdx/rcx/r8/r9 SysV, rcx/rdx/r8/r9 Win64), so every incoming move
+  // is independent of its own source and of every other move.
+  let dsts = [XReg64.Rbx, XReg64.R10, XReg64.R11, XReg64.R12, XReg64.R13, XReg64.R14, XReg64.R15]
+
+  // SysV: the 7th param (index 6) is the only one on the stack, and it must
+  // stay at [rbp+16] — this fix must not move x86_64-linux/macos at all.
+  let sv = newXCtx(XCallConv.SysV)
+  sv.ctx = ctx
+  sv.f = IrFunc{
+    name = "f7", paramTypes = types, result = i64t, blocks = [entry],
+    instrs = instrs, isFallible = false,
+  }
+  sv.intRegs = dsts
+  let svLocs = []RegLoc(0)
+  let p = 0
+  while (p < 7) {
+    svLocs = append(svLocs, RegLoc{ isSpill = false, index = p })
+    p = p + 1
+  }
+  sv.alloc = RegAllocResult{ locations = svLocs, numSpillSlots = 0, stackMaps = []StackMapEntry(0) }
+  xBindIncomingArgs(sv)
+  let svWant = newXCtx(XCallConv.SysV)
+  xMovLoad(svWant.buf, dsts[6], xMemB(XReg64.Rbp, 16), 8, false)
+  assert(xHexHas(sv.buf, xHex(svWant.buf)))
+
+  // Win64: only the first 4 params arrive in registers, so params 4, 5 and 6
+  // are all on the stack, past the caller's 32-byte shadow space — at
+  // [rbp+48], [rbp+56], [rbp+64]. Before this fix they read [rbp+16],
+  // [rbp+24], [rbp+32]: the shadow space's own words, not the arguments.
+  let win = newXCtx(XCallConv.Win64)
+  win.ctx = ctx
+  win.f = IrFunc{
+    name = "f7", paramTypes = types, result = i64t, blocks = [entry],
+    instrs = instrs, isFallible = false,
+  }
+  win.intRegs = dsts
+  let winLocs = []RegLoc(0)
+  let q = 0
+  while (q < 7) {
+    winLocs = append(winLocs, RegLoc{ isSpill = false, index = q })
+    q = q + 1
+  }
+  win.alloc = RegAllocResult{
+    locations = winLocs,
+    numSpillSlots = 0,
+    stackMaps = []StackMapEntry(0),
+  }
+  xBindIncomingArgs(win)
+  let w48 = newXCtx(XCallConv.Win64)
+  xMovLoad(w48.buf, dsts[4], xMemB(XReg64.Rbp, 48), 8, false)
+  assert(xHexHas(win.buf, xHex(w48.buf)))
+  let w56 = newXCtx(XCallConv.Win64)
+  xMovLoad(w56.buf, dsts[5], xMemB(XReg64.Rbp, 56), 8, false)
+  assert(xHexHas(win.buf, xHex(w56.buf)))
+  let w64 = newXCtx(XCallConv.Win64)
+  xMovLoad(w64.buf, dsts[6], xMemB(XReg64.Rbp, 64), 8, false)
+  assert(xHexHas(win.buf, xHex(w64.buf)))
+
+  // The regression itself, pinned directly: the pre-fix code read the first
+  // Win64 stack arg at [rbp+16] — assert that instruction is now absent.
+  let wrong = newXCtx(XCallConv.Win64)
+  xMovLoad(wrong.buf, dsts[4], xMemB(XReg64.Rbp, 16), 8, false)
+  assert(!xHexHas(win.buf, xHex(wrong.buf)))
+}
+
+fn checkX64CallHelpers() {
+  // A safepoint is recorded at the RETURN ADDRESS — the offset AFTER the call —
+  // because that is what the collector's stack walker looks a frame up by
+  // (runtime/ABI.md §5). Recording the call's own offset leaves every lookup
+  // missing.
+  let cx = newXCtx(XCallConv.SysV)
+  xCallReloc(cx, "bit_rt_gc_alloc")
+  cx.safepointCodeOffsets = [0]
+  xRecordSafepoint(cx)
+  assert(cx.nextSafepointIdx == 1)
+  assert(cx.safepointCodeOffsets[0] == 5)                   // past the whole e8+rel32
+  assert(cx.safepointCodeOffsets[0] != cx.relocs[0].offset) // NOT the reloc's field offset
+
+  // The first argument register is the one place the conventions differ for a
+  // single-argument runtime call.
+  assert(xArg0(XCallConv.SysV) == XReg64.Rdi)
+  assert(xArg0(XCallConv.Win64) == XReg64.Rcx)
+
+  // The closure cell: {code_ptr at +0, env_ptr at +8}, 16 bytes, with the env
+  // as its ONLY GC field — the code pointer points into .text and must never be
+  // traced.
+  assert(xClosureCellSize() == 16)
+  assert(len(xClosureCellPtrOffsets()) == 1)
+  assert(xClosureCellPtrOffsets()[0] == 8)
+}

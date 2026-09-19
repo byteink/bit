@@ -1,0 +1,272 @@
+// In-Bit self-checks for the x86-64 backend's per-instruction dispatch: which
+// registers a function's body forbids the allocator from handing out
+// (checkX64ScanFlags), the clobber points a safepoint or the poll-cache
+// prefetch forces (checkX64ClobberPoints), signed-vs-unsigned condition
+// codes, the arith/shift/fcmp op-to-machine-op tables, and f32/f64 constant
+// bit patterns. Split out of compiler/x64compilecheck.bit (#5638), which sat
+// at exactly the 800-line E0200 ceiling; the per-function compile driver
+// stayed there, and the call/ABI and control-flow checks moved to
+// x64callcheck.bit and x64controlflowcheck.bit — see that file's header.
+//
+// Split out of selfcheck.bit originally (#1503); sibling .bit files are the
+// same module, so `selfcheck()` still calls these directly and nothing here
+// is imported.
+
+// SysV passes the first six integer arguments in registers; the rest overflow to
+// an outgoing stack area the CALLER reserves and reclaims. The pieces
+// (xStackReserve/xEmitStackArgStore) are unit-tested separately; this pins that
+// xMarshalArgs actually wires them together.
+// Which registers a function's body forbids the allocator from handing out.
+fn checkX64ScanFlags() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let one = IrBlock{ instsStart = 0, paramCount = 0, instsLen = 1 }
+
+  // A self-loop is a back-edge, whose safepoint POLL is a real call — so it
+  // restricts the file to callee-saved exactly as a user call does. Scanning only
+  // for call ops missed this and left a loop-carried value in a caller-saved
+  // register that the poll then destroyed (#1236).
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 0
+  let loop = IrFunc{
+    name = "l", paramTypes = []int(0), result = ctx.voidId, blocks = [one],
+    instrs = [jmp], isFallible = false,
+  }
+  assert(xScanFuncFlags(loop).hasSafepoints)
+
+  // A FORWARD jump is not a back-edge and forces nothing.
+  let fwd = mkInstr(Op.Jump, ctx.voidId)
+  fwd.ival = 1
+  let two = IrFunc{
+    name = "f", paramTypes = []int(0), result = ctx.voidId,
+    blocks = [one, IrBlock{ instsStart = 1, paramCount = 0, instsLen = 1 }],
+    instrs = [fwd, mkInstr(Op.Ret, ctx.voidId)], isFallible = false,
+  }
+  assert(!xScanFuncFlags(two).hasSafepoints)
+
+  // Division fixes rax/rdx as idiv's operands.
+  let dv = mkInstr(Op.SDiv, i64t)
+  let dvf = IrFunc{
+    name = "d", paramTypes = []int(0), result = i64t, blocks = [one],
+    instrs = [dv], isFallible = false,
+  }
+  assert(xScanFuncFlags(dvf).needsRaxRdx)
+  assert(!xScanFuncFlags(loop).needsRaxRdx)
+
+  // cl is x86-64's ONLY variable shift count, so a non-constant amount reserves
+  // rcx — but a CONSTANT amount uses the immediate form and reserves nothing.
+  let amt = mkInstr(Op.ConstInt, i64t)
+  amt.ival = 3
+  let shC = mkInstr(Op.Shl, i64t)
+  shC.lhs = 0
+  shC.rhs = 0 // points at the const_int: an immediate shift
+  let shConst = IrFunc{
+    name = "sc", paramTypes = []int(0), result = i64t,
+    blocks = [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 2 }],
+    instrs = [amt, shC], isFallible = false,
+  }
+  assert(!xScanFuncFlags(shConst).needsRcx)
+
+  let dyn = mkInstr(Op.BlockParam, i64t)
+  let shV = mkInstr(Op.Shl, i64t)
+  shV.lhs = 0
+  shV.rhs = 0 // points at the block param: a variable shift
+  let shVar = IrFunc{
+    name = "sv", paramTypes = [i64t], result = i64t,
+    blocks = [IrBlock{ instsStart = 0, paramCount = 1, instsLen = 2 }],
+    instrs = [dyn, shV], isFallible = false,
+  }
+  assert(xScanFuncFlags(shVar).needsRcx)
+  checkX64ClobberPoints()
+}
+
+// #3171: the positions at which the allocator must treat caller-saved registers
+// as destroyed. Every safepoint, PLUS the poll-address prefetch, which is a
+// run of real calls (three since #3746, two before) that deliberately records
+// no safepoint. They are contiguous, so they are ONE position, not three.
+//
+// Deleting that extra position is silent at the source level and NOT silent in
+// the emitted code, which is why this is pinned here rather than by a program
+// that prints a number. Removing it and rebuilding turns beforeLoop() in
+// tests/x64 probing into:
+//
+//   callq <bit_rt_world_addr>      ; the prefetch run
+//   callq <bit_rt_gc_addr>
+//   callq <bit_rt_port_sched_preempt_any_addr>
+//   movsd %xmm0, %xmm14            ; reads float param `a` OUT OF THE REGISTER
+//   addsd %xmm1, %xmm14            ; the two calls were free to destroy
+//
+// against the correct form, which binds both params to spill slots BEFORE the
+// pair and reloads them after. The broken build still printed the right answer,
+// because those two runtime helpers happen not to touch xmm0/xmm1 today — so
+// runtime output is the wrong instrument for this and the guard belongs here.
+fn checkX64ClobberPoints() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+
+  // Two entry params and a self-loop: the back edge means the prefetch run is
+  // emitted, so the entry block's first NON-parameter index (2) is prepended.
+  let p0 = mkInstr(Op.BlockParam, i64t)
+  let p1 = mkInstr(Op.BlockParam, i64t)
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 0
+  let loop = IrFunc{
+    name = "l", paramTypes = [i64t, i64t], result = ctx.voidId,
+    blocks = [IrBlock{ instsStart = 0, paramCount = 2, instsLen = 3 }],
+    instrs = [p0, p1, jmp], isFallible = false,
+  }
+  assert(hasBackEdgeSafepoint(loop))
+  let withPoll = xClobberPoints(loop, [9])
+  assert(len(withPoll) == 2, "a back-edge function must gain the prefetch clobber point")
+  assert(
+    withPoll[0] == 2,
+    "the prefetch clobber point is the entry block's first non-parameter index",
+  )
+  assert(withPoll[1] == 9, "the given safepoints must follow, in order")
+
+  // A FORWARD jump emits no prefetch pair, so the list is the safepoints alone.
+  let fwd = mkInstr(Op.Jump, ctx.voidId)
+  fwd.ival = 1
+  let straight = IrFunc{
+    name = "f", paramTypes = [i64t, i64t], result = ctx.voidId,
+    blocks = [
+      IrBlock{ instsStart = 0, paramCount = 2, instsLen = 3 },
+      IrBlock{ instsStart = 3, paramCount = 0, instsLen = 1 },
+    ],
+    instrs = [p0, p1, fwd, mkInstr(Op.Ret, ctx.voidId)], isFallible = false,
+  }
+  assert(!hasBackEdgeSafepoint(straight))
+  let noPoll = xClobberPoints(straight, [9])
+  assert(len(noPoll) == 1 && noPoll[0] == 9, "no back edge means no extra clobber point")
+  // #4464: a call whose very next instruction is `Op.Unreachable` -- every
+  // bounds check's `bit_rt_panic` -- is a safepoint but NOT a clobber, since
+  // nothing after it can read a register it destroyed. Its panic block sits in
+  // the middle of the enclosing loop's INDEX range while sitting off its
+  // control-flow path entirely, so treating it as one confined every value
+  // spanning the check to rbx/r13/r14/r15. Reverting the filter fails the third
+  // assertion here with its own message and leaves every other one passing.
+  let live = mkInstr(Op.RtCall, i64t)
+  let panicCall = mkInstr(Op.RtCall, ctx.voidId)
+  let nr = IrFunc{
+    name = "np", paramTypes = [i64t], result = ctx.voidId,
+    blocks = [IrBlock{ instsStart = 0, paramCount = 1, instsLen = 4 }],
+    instrs = [p0, live, panicCall, mkInstr(Op.Unreachable, ctx.voidId)], isFallible = false,
+  }
+  assert(!hasBackEdgeSafepoint(nr)) // no prefetch position to confuse the count
+  assert(isNonReturningCall(nr, 2), "a call followed by unreachable is non-returning")
+  assert(!isNonReturningCall(nr, 1), "a call followed by another call is not")
+  let cl = xClobberPoints(nr, [1, 2])
+  assert(len(cl) == 1, "a call whose successor is unreachable is not a clobber")
+  assert(cl[0] == 1, "the returning call must survive the filter, in order")
+}
+
+// Signed and unsigned compares are DIFFERENT condition codes for the same
+// relation. Reading a signed compare with an unsigned code silently reorders
+// every negative value — no crash, just wrong answers.
+fn checkX64IcmpCc() {
+  assert(xCcForIcmp(Op.ICmpEq) == ccE())
+  assert(xCcForIcmp(Op.ICmpNe) == ccNe())
+  assert(xCcForIcmp(Op.ICmpSlt) == ccL() && xCcForIcmp(Op.ICmpUlt) == ccB())
+  assert(xCcForIcmp(Op.ICmpSle) == ccLe() && xCcForIcmp(Op.ICmpUle) == ccBe())
+  assert(xCcForIcmp(Op.ICmpSgt) == ccG() && xCcForIcmp(Op.ICmpUgt) == ccA())
+  assert(xCcForIcmp(Op.ICmpSge) == ccGe() && xCcForIcmp(Op.ICmpUge) == ccAe())
+  // The pairs must not collide — that is the whole point.
+  assert(ccL() != ccB() && ccLe() != ccBe() && ccG() != ccA() && ccGe() != ccAe())
+}
+
+// Every IR op must map to its OWN machine operation. A swap in these tables is
+// pure silent wrongness — the code encodes fine and computes something else.
+fn checkX64DispatchMaps() {
+  assert(xArithForOp(Op.Add) == XArith.Add)
+  assert(xArithForOp(Op.Sub) == XArith.Sub)
+  assert(xArithForOp(Op.BAnd) == XArith.And)
+  assert(xArithForOp(Op.BOr) == XArith.Or)
+  assert(xArithForOp(Op.BXor) == XArith.Xor)
+
+  assert(xShiftForOp(Op.Shl) == XShift.Shl)
+  assert(xShiftForOp(Op.LShr) == XShift.Shr) // LOGICAL: zero-fills
+  assert(xShiftForOp(Op.AShr) == XShift.Sar) // ARITHMETIC: sign-fills
+  // shr and sar differ only in whether the sign propagates — mixing them is
+  // invisible on positive values and wrong on every negative one.
+  assert(XShift.Shr != XShift.Sar)
+
+  assert(xFArithForOp(Op.FAdd) == XFArith.FAdd)
+  assert(xFArithForOp(Op.FSub) == XFArith.FSub)
+  assert(xFArithForOp(Op.FMul) == XFArith.FMul)
+  assert(xFArithForOp(Op.FDiv) == XFArith.FDiv)
+
+  assert(xFCmpForOp(Op.FCmpEq) == XFCmp.FEq)
+  assert(xFCmpForOp(Op.FCmpNe) == XFCmp.FNe)
+  assert(xFCmpForOp(Op.FCmpLt) == XFCmp.FLt)
+  assert(xFCmpForOp(Op.FCmpLe) == XFCmp.FLe)
+  assert(xFCmpForOp(Op.FCmpGt) == XFCmp.FGt)
+  assert(xFCmpForOp(Op.FCmpGe) == XFCmp.FGe)
+}
+
+// A float compare's operand width comes from its OPERANDS, never from its own
+// result — the result is a bool (1 byte), which would select the single-precision
+// compare for a pair of doubles and read half of each value.
+fn checkX64DispatchFcmpWidth() {
+  let ctx = newTypeContext()
+  let f64t = primType(ctx, 9)
+  let boolt = primType(ctx, 10)
+  let cmp = mkInstr(Op.FCmpLt, boolt)
+  cmp.lhs = 0
+  cmp.rhs = 1
+  let cx = xFnCtx([f64t, f64t, boolt], [IrBlock{ instsStart = 0, paramCount = 2, instsLen = 3 }])
+  cx.ctx = ctx
+  cx.f.instrs[0] = mkInstr(Op.BlockParam, f64t)
+  cx.f.instrs[1] = mkInstr(Op.BlockParam, f64t)
+  cx.f.instrs[2] = cmp
+  assert(xEmitInst(cx, 2))
+  // ucomisd %xmm0, %xmm15 — note the REX (44) sits BETWEEN the 0x66 prefix and
+  // the 0f opcode, so a "660f2e" probe never matches. Taking the width from the
+  // bool result drops the 0x66, emitting ucomiss and comparing the low halves.
+  assert(xHexHas(cx.buf, "66440f2ef8"))
+}
+
+// The dispatch must consult xConstShiftAmount per instruction: a CONSTANT amount
+// takes the immediate form, a variable one must route through cl. Hard-wiring
+// either way silently shifts by the wrong amount.
+fn checkX64DispatchShift() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+
+  // Variable: the amount is a block param, so it goes through cl (opcode d3).
+  let shV = mkInstr(Op.Shl, i64t)
+  shV.lhs = 0
+  shV.rhs = 1
+  let cv = xFnCtx([i64t, i64t, i64t], [IrBlock{ instsStart = 0, paramCount = 2, instsLen = 3 }])
+  cv.ctx = ctx
+  // xFnCtx fills every slot with a const_int, so the amount must be made a real
+  // block param — otherwise xConstShiftAmount reads it as the constant 0 and this
+  // "variable" case is not variable at all.
+  cv.f.instrs[1] = mkInstr(Op.BlockParam, i64t)
+  cv.f.instrs[2] = shV
+  assert(xEmitInst(cv, 2))
+  assert(xHexHas(cv.buf, "49d3e5"))  // shl %cl, %r13 (dst's own register)
+  assert(!xHexHas(cv.buf, "49c1e5")) // NOT the immediate form
+
+  // Constant: the amount is a const_int, so it takes the immediate form (c1).
+  let amt = mkInstr(Op.ConstInt, i64t)
+  amt.ival = 3
+  let shC = mkInstr(Op.Shl, i64t)
+  shC.lhs = 1
+  shC.rhs = 0
+  let cc = xFnCtx([i64t, i64t, i64t], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 }])
+  cc.ctx = ctx
+  cc.f.instrs[0] = amt
+  cc.f.instrs[2] = shC
+  assert(xEmitInst(cc, 2))
+  assert(xHexHas(cc.buf, "49c1e503")) // shl $3, %r13 (dst's own register)
+  assert(!xHexHas(cc.buf, "49d3e5"))  // NOT the cl form
+}
+
+// An f32 constant must be narrowed and its 32-bit pattern used; handing the f64
+// bits to a 4-byte movd loads the wrong half of the value.
+fn checkX64FloatConstBits() {
+  assert(xFloatConstBits(1.0, 8) == 4607182418800017408) // 0x3FF0000000000000
+  assert(xFloatConstBits(1.0, 4) == 1065353216)          // 0x3F800000
+  assert(xFloatConstBits(1.0, 4) != xFloatConstBits(1.0, 8))
+  assert(xFloatConstBits(0.0, 8) == 0 && xFloatConstBits(0.0, 4) == 0)
+}

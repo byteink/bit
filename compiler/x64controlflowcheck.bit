@@ -1,0 +1,181 @@
+// In-Bit self-checks for the x86-64 backend's control flow: the forward-jump
+// vs back-edge safepoint split, the poll-cache prefetch and
+// Op.PollAttention (register and spilled slot shapes, its dispatch arm),
+// the `br` self-test, and `ret` ordering including the multi-value refusal.
+// Split out of compiler/x64compilecheck.bit (#5638), which sat at exactly
+// the 800-line E0200 ceiling; the per-function compile driver stayed there,
+// and the dispatch and call/ABI checks moved to x64dispatchcheck.bit and
+// x64callcheck.bit — see that file's header.
+//
+// Split out of selfcheck.bit originally (#1503); sibling .bit files are the
+// same module, so `selfcheck()` still calls these directly and nothing here
+// is imported.
+
+fn checkX64ControlFlow() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  // Two blocks: block 0 (one instr), block 1 (one param + one instr).
+  let blocks = [
+    IrBlock{ instsStart = 0, paramCount = 0, instsLen = 1 },
+    IrBlock{ instsStart = 1, paramCount = 1, instsLen = 2 },
+  ]
+
+  // A FORWARD jump polls nothing — only a back-edge needs the collector.
+  let cx = xFnCtx([i64t, i64t, i64t], blocks)
+  cx.ctx = ctx
+  cx.safepointCodeOffsets = [0]
+  cx.curBlock = 0
+  // #4372: instruction 0 is block 0's last, and block 1 is the next block to be
+  // emitted, so the jump itself is elided — the edge's param move still is not.
+  xEmitJump(cx, 0, 1, [0])
+  assert(cx.nextSafepointIdx == 0)
+  assert(!xHexHas(cx.buf, "e8")) // no call at all
+  assert(!xHexHas(cx.buf, "e9")) // and no jmp: block 1 is fallen into
+  assert(len(cx.buf.code) > 0)   // the param move is still emitted
+  assert(len(cx.fixups) == 0)    // an elided jump registers no fixup
+
+  // A BACK-edge polls the collector before the edge moves, so an allocation-free
+  // loop still yields. The poll is a call: running it after the moves would
+  // observe a half-written param set.
+  // #3169/#4203: the fast path calls nothing but the real poll. #2926's guard
+  // call was replaced by stwPollNeeded's own condition inlined (#3169), and
+  // that eighteen-clause ladder — plus #3565's two real calls into the
+  // scheduler and #4200's countdown — was replaced by one word the runtime
+  // publishes (runtime/sched/pollreq.bit).
+  let cb = xFnCtx([i64t, i64t, i64t], blocks)
+  cb.ctx = ctx
+  cb.safepointCodeOffsets = [0]
+  cb.curBlock = 1
+  xEmitJump(cb, 2, 1, [0])         // target == curBlock: a self-loop
+  assert(cb.nextSafepointIdx == 1) // only the real poll is a safepoint
+  assert(len(cb.relocs) == 1)
+  assert(cb.relocs[0].symbol == "bit_rt_safepoint")
+
+  // Rebuilt through the SAME emitters rather than as fixed hex, so a future
+  // change to an encoding cannot silently desync the two (#2927's concern on
+  // the arm64 side, carried forward). Still the load-bearing check: an inverted
+  // condition here is a poll that never fires or one that always does, and
+  // neither fails a build.
+  let want = xFnCtx([i64t, i64t, i64t], blocks)
+  want.ctx = ctx
+  want.safepointCodeOffsets = [0]
+  let r = xScratch1()
+  xMovLoad(want.buf, r, xMemB(XReg64.Rbp, xPollCacheOffset(want.frame, 0)), 8, false)
+  xMovLoad(want.buf, r, xMemB(r, 0), 8, false)
+  xTestRR(want.buf, r, r)
+  let skip = xJccRel32Placeholder(want, ccE())
+  xEmitCallLike(want, safepointSymbol(), []int(0), false, 0, 0, true)
+  xPatchRel32Here(want, skip)
+  // The edge's own moves come AFTER the poll — running them first would let the
+  // collector observe a half-written param set — then the jump itself.
+  xEmitParamMoves(want, 1, [0])
+  xJmpRel32(want, 1)
+  assert(xHex(cb.buf) == xHex(want.buf))
+  // The real poll's return address is where the one safepoint sits — not the
+  // end of the emitted edge.
+  assert(cb.safepointCodeOffsets[0] == want.safepointCodeOffsets[0])
+  assert(cb.safepointCodeOffsets[0] > 0)
+
+  checkX64ControlFlowPollAttentionAndRet(ctx, i64t, blocks)
+}
+
+// The entry-side poll-cache prefetch, the poll_attention op (register and
+// spilled slot shapes), its dispatch arm, the br self-test, and ret ordering
+// incl. the multi-value refusal -- split from checkX64ControlFlow, which set
+// up `ctx`/`i64t`/`blocks` above.
+fn checkX64ControlFlowPollAttentionAndRet(ctx: TypeContext, i64t: int, blocks: []IrBlock) {
+  // The entry-side half: ONE call, ONE store, into poll-cache slot 0. It was
+  // three calls and four slots (worldAddr, gcAddr, preemptAnyAddr, countdown)
+  // while the back edge re-derived the predicate itself.
+  let cp = xFnCtx([i64t, i64t, i64t], blocks)
+  cp.ctx = ctx
+  // hasBackEdgeSafepoint is what gates the prefetch, so the fixture needs a
+  // real self-loop: block 1's last instruction jumps to block 1.
+  let backEdge = mkInstr(Op.Jump, 0)
+  backEdge.ival = 1
+  cp.f.instrs = [cp.f.instrs[0], cp.f.instrs[1], backEdge]
+  assert(hasBackEdgeSafepoint(cp.f))
+  xEmitPollCachePrefetch(cp)
+  let wp = xFnCtx([i64t, i64t, i64t], blocks)
+  wp.ctx = ctx
+  xEmitCallLike(wp, pollAttentionAddrSymbol(), []int(0), false, 0, 0, false)
+  xMovStore(wp.buf, xMemB(XReg64.Rbp, xPollCacheOffset(wp.frame, 0)), XReg64.Rax, 8)
+  assert(xHex(cp.buf) == xHex(wp.buf))
+  assert(len(cp.relocs) == 1)
+  assert(cp.relocs[0].symbol == pollAttentionAddrSymbol())
+  assert(cp.nextSafepointIdx == 0) // a true leaf: never recorded as a safepoint
+
+  // #4457: `Op.PollAttention` reads the word through that same slot, and the
+  // whole point of the op is that it CALLS NOTHING — an `Op.Call` to the
+  // accessor clobbers every caller-saved register, which with one location per
+  // interval put a spill reload inside bench/cases/matrix's inner loop. A
+  // relocation count of zero is the check a call cannot satisfy, so it is
+  // asserted directly rather than inferred from the byte length.
+  //
+  // Slot 0 lives in a register and slot 1 is SPILLED in xFnCtx, so the two
+  // calls below cover both destination shapes; the spilled one is what a
+  // strip-mined function under register pressure actually takes.
+  let ca = xFnCtx([i64t, i64t], blocks)
+  ca.ctx = ctx
+  xEmitPollAttention(ca, 0)
+  xEmitPollAttention(ca, 1)
+  let wa = xFnCtx([i64t, i64t], blocks)
+  wa.ctx = ctx
+  let ar = wa.intRegs[0]
+  xMovLoad(wa.buf, ar, xMemB(XReg64.Rbp, xPollCacheOffset(wa.frame, 0)), 8, false)
+  xMovLoad(wa.buf, ar, xMemB(ar, 0), 8, false)
+  let sr = xScratch1()
+  xMovLoad(wa.buf, sr, xMemB(XReg64.Rbp, xPollCacheOffset(wa.frame, 0)), 8, false)
+  xMovLoad(wa.buf, sr, xMemB(sr, 0), 8, false)
+  xMovStore(wa.buf, xMemB(XReg64.Rbp, xSpillOffset(wa.frame, 0)), sr, 8)
+  assert(len(ca.relocs) == 0, "x64 poll_attention emitted a relocation: it called something")
+  assert(ca.nextSafepointIdx == 0, "x64 poll_attention recorded a safepoint")
+  assert(xHex(ca.buf) == xHex(wa.buf), "x64 poll_attention emitted unexpected bytes")
+
+  // The DISPATCH arm, through xCompileInstValue rather than the emitter again:
+  // an op wired into no dispatch emits nothing, and a fixture that only calls
+  // the emitter directly cannot tell that from a correct one.
+  let cdp = xFnCtx([i64t, i64t], blocks)
+  cdp.ctx = ctx
+  cdp.f.instrs[0] = mkInstr(Op.PollAttention, i64t)
+  assert(xEmitInst(cdp, 0))
+  let wdp = xFnCtx([i64t, i64t], blocks)
+  wdp.ctx = ctx
+  xEmitPollAttention(wdp, 0)
+  assert(len(cdp.relocs) == 0, "x64 poll_attention via dispatch emitted a relocation")
+  assert(xHex(cdp.buf) == xHex(wdp.buf), "x64 poll_attention via dispatch emitted unexpected bytes")
+
+  checkX64ControlFlowBrAndRet(ctx, i64t, blocks)
+}
+
+// The br self-test and ret ordering incl. the multi-value refusal -- split
+// from checkX64ControlFlowPollAttentionAndRet, which set up ctx/i64t/blocks.
+fn checkX64ControlFlowBrAndRet(ctx: TypeContext, i64t: int, blocks: []IrBlock) {
+  // A br tests the condition against ITSELF — `test r,r` sets ZF iff r is zero,
+  // which is the whole condition; comparing against an immediate would need an
+  // extra materialization.
+  let cr = xFnCtx([i64t, i64t, i64t], blocks)
+  cr.ctx = ctx
+  cr.safepointCodeOffsets = [0, 0]
+  cr.curBlock = 0
+  xEmitBr(cr, 0, xMkBr(0, 1, 1, [0], [0]))
+  assert(xHexHas(cr.buf, "4885db")) // test %rbx, %rbx  (vreg 0 lives in rbx)
+  assert(cr.nextSafepointIdx == 0)  // both targets are forward
+
+  // ret moves the value into the ABI return register, then runs the epilogue —
+  // in that order. The epilogue pops the callee-saved registers, so computing the
+  // return value after it would read restored (caller-owned) values.
+  let cq = xFnCtx([i64t], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 1 }])
+  cq.ctx = ctx
+  assert(xEmitRet(cq, [0]))
+  assert(xHexHas(cq.buf, "4889d8")) // mov %rbx, %rax  BEFORE the pops
+  assert(xHexHas(cq.buf, "5b"))     // pop %rbx
+  assert(xHexHas(cq.buf, "c3"))     // ret
+  let hexq = xHex(cq.buf)
+  assert(len(hexq) >= 6 && hexq[0:6] == "4889d8") // the move is FIRST
+
+  // A multi-value ret has no settled packing: refuse rather than emit something.
+  let cm = xFnCtx([i64t, i64t], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 2 }])
+  cm.ctx = ctx
+  assert(!xEmitRet(cm, [0, 1]))
+}
