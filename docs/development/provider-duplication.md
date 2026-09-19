@@ -1,18 +1,19 @@
 # Provider duplication inventory: linux/darwin
 
-Input for #2551-#2554 (pull shared non-OS logic out of `runtime/{root,net,thread,park}/{linux,darwin}/`
-into each module's core `.bit` file). #1710 is the epic. `docs/development.md:785`
+Input for the follow-up work that pulls shared non-OS logic out of
+`runtime/{root,net,thread,park}/{linux,darwin}/`
+into each module's core `.bit` file. `docs/development.md:785`
 ("Runtime core and OS providers") states the rule this inventory feeds - read
 that first; this file does not repeat it, it only lists what to move.
 
-**Do not perform any of the moves from this file** - #2551-#2554 do the moves.
-This file is the audit only.
+**Do not perform any of the moves from this file** - that follow-up work does
+the moves. This file is the audit only.
 
 ## Scope
 
-Only the `linux`/`darwin` provider pair, per #1710's mandate. `runtime/{root,thread,park}/windows/`
-also exist now (#3322 epic) but are out of scope here - a third provider is a
-third body to diff, and #3322's own tickets own that audit.
+Only the `linux`/`darwin` provider pair, by design. `runtime/{root,thread,park}/windows/`
+also exist now but are out of scope here - a third provider is a
+third body to diff, and its own follow-up work owns that audit.
 
 ## Method
 
@@ -40,8 +41,8 @@ below.
 
 ## Risk this inventory does not resolve - measure it, do not reason about it
 
-`scripts/provider-move-check.sh <root|net|thread|park>` (#2549, landed) is the
-proof each of #2551-#2554 owes: `--emit-obj` before/after per (directory,
+`scripts/provider-move-check.sh <root|net|thread|park>` (already landed) is the
+proof each of these moves owes: `--emit-obj` before/after per (directory,
 target), plus a line-multiset check across the whole module. It still cannot
 see two things a green build also misses (`docs/development.md:793`): emitted
 **diagnostic order** is normative (SPEC §14.8, checked by `selfhost-diffdiags`),
@@ -62,7 +63,7 @@ candidate total below:
 - `runtime/net/net.bit` is **480** lines. All four net provider files
   (netabi/sock/tcp/udp) currently land ONLY in `net.bit` - no per-file core
   split exists. Their candidates total ~425 lines: 480 + 425 = 905, **well over
-  the cap**. #2552 cannot dump every candidate into `net.bit`; it needs at
+  the cap**. The net pull-up cannot dump every candidate into `net.bit`; it needs at
   least one new core file (e.g. `runtime/net/netabi.bit`, mirroring the
   provider split) before it starts moving code, not after.
 - `runtime/thread/thread.bit` (237 lines) and `runtime/park/park.bit` (156
@@ -83,7 +84,7 @@ by hand before being excluded from the candidate list. None of these are bugs:
   "the one line...a reader copying from the Darwin twin would get wrong."
 - `netAwaitReady` (net/sock.bit): Linux's epoll needs separate fd descriptors
   for read vs. write interest (`EPOLL_CTL_MOD` replaces both the mask and the
-  parked task, so co-resident readers/writers evict each other otherwise, #1910);
+  parked task, so co-resident readers/writers evict each other otherwise);
   kqueue keys on `(fd, filter)` and needs none of this. Documented in the code.
 - `rtTimeMonoNs` / `rtTimeSleepNs` / `netClockNowNs`: call `parkMonoNs` with a
   scratch-slot argument on Linux (`clock_gettime` needs an output buffer) and
@@ -96,16 +97,16 @@ by hand before being excluded from the candidate list. None of these are bugs:
   per-architecture `asm{}` on Linux, a plain literal on Darwin - genuinely
   arch/OS-identifying code, not shared logic.
 
-## Divergence found and filed separately (not folded into a pull-up ticket)
+## Divergence found and tracked separately (not folded into a pull-up)
 
-**#3460**: `osForkExecWait` and `osForkExecWaitBounded`
+`osForkExecWait` and `osForkExecWaitBounded`
 (`runtime/root/{linux,darwin}/os.bit`) share intent - fork, exec, block/poll on
 the child's exit - but Linux's blocking `wait4`/polling loop explicitly retries
-on errno 4 (EINTR), citing `#1904` in a comment; Darwin's `waitpid` equivalent
-has no such retry and treats any negative return as a hard failure. Filed as
-its own ticket per this file's own instruction not to bury a real behavior gap
-inside a pure-move ticket - fixing it changes Darwin's observable behavior, so
-it is not a candidate for #2551.
+on errno 4 (EINTR), documented in a comment; Darwin's `waitpid` equivalent
+has no such retry and treats any negative return as a hard failure. Tracked
+separately per this file's own instruction not to bury a real behavior gap
+inside a pure move - fixing it changes Darwin's observable behavior, so
+it is not a candidate for the pull-up.
 
 ## Totals
 

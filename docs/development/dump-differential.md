@@ -1,11 +1,11 @@
 # selfhost-diffdump.sh: design record
 
-Moved out of `scripts/selfhost-diffdump.sh`'s header (#4265, to keep the
-script under the 800-line ceiling `_tests_/bit/shellsize.bit` (#4232) enforces
-on shell scripts). Nothing below was reworded -- only moved and reflowed from
+Moved out of `scripts/selfhost-diffdump.sh`'s header, to keep the
+script under the 800-line ceiling `_tests_/bit/shellsize.bit` enforces
+on shell scripts. Nothing below was reworded -- only moved and reflowed from
 `#`-comments into Markdown.
 
-## Why one driver, not six scripts (#2743)
+## Why one driver, not six scripts
 
 `selfhost-diff{ast,tokens,diags,types,ir,iropt}.sh` were six copies of the
 same script, one flag apart, and three of the six (ast/tokens/diags) had no
@@ -21,11 +21,11 @@ had no bound at all, so a hung ORACLE wedged the whole gate indefinitely."
 
 THE SECTIONS BELOW ARE CARRIED OVER FROM THE SIX FILES THIS REPLACES, one per
 original file -- except the `tokens` section's old two-compilers-in-
-different-languages framing, corrected by #2600 across the family: the
+different-languages framing, corrected across the family: the
 oracle is the pinned stage0 (an earlier release of this same compiler), not a
 second implementation written in something else.
 
-## Reading a red types/ir/iropt run: outpaced oracle vs. real regression (#2382)
+## Reading a red types/ir/iropt run: outpaced oracle vs. real regression
 
 All three of these compare against the PINNED STAGE0 -- a fixed earlier
 release -- so any inference or lowering improvement that has landed since
@@ -37,8 +37,8 @@ What to do about it while landing a fix, in the window before the next repin
 (when nothing an author does makes this gate green): land the fix WITH its
 golden case, and record on the fix's own ticket that types/ir/iropt are
 expected red until stage0 repins past it. Do not delete the case, and do not
-try to keep the exercising program out of the swept corpus -- #2280's two
-lint_deferloop_* files are pre-existing corpus entries whose IR a legitimate
+try to keep the exercising program out of the swept corpus -- two
+`lint_deferloop_*` files are pre-existing corpus entries whose IR a legitimate
 lowering fix changed, which is proof there is no such workaround even in
 principle: the corpus holds a program for every construct on purpose.
 
@@ -54,11 +54,11 @@ only that MISMATCH is the number you expected. A repin can make a broken
 harness agree for the wrong reason -- both sides silently failing to parse
 the same input reads identically to a real fix. This nearly happened on
 `selfhost-diffverdict.sh`: its synthesized test source was still emitting
-the `function` keyword #2773 had removed, so runs were scoring on rejected
-input until #2846/#2848/#2850 fixed the emission sites.
+the `function` keyword an earlier lowering change had removed, so runs were
+scoring on rejected input until the emission sites were fixed.
 
 Why route 1 (repin) over the alternatives: a scoped expected-mismatch list
-was tried and deleted for exactly this class of problem (#1883, "nothing is
+was tried and deleted for exactly this class of problem ("nothing is
 permitted to differ now" below) -- re-admitting one bets against that
 history. Making `--dump-ir-pre` refuse what `build` refuses only fixes the
 signature-only-stub sub-case, not a file where both compilers lower and
@@ -66,22 +66,23 @@ legitimately disagree because one of them is right, and it would be a
 compiler change made to serve a test harness rather than the other way
 round.
 
-### UPDATE (#3125)
+### UPDATE
 
 The above is still the whole story for `types`, and for any `ir`/`iropt`
 divergence that is a genuine gap rather than an intentional improvement. But
 repin-and-wait made every future lowering IMPROVEMENT (opcode count going
-DOWN, not a coverage gap) block on a release cycle by construction -- #3107
-was the first to hit it. `ir`/`iropt` now check a mismatch against
+DOWN, not a coverage gap) block on a release cycle by construction -- the
+inline slice-index lowering change was the first to hit it. `ir`/`iropt` now
+check a mismatch against
 `explainMismatch`'s declared-signature table (`scripts/selfhost-ir-signatures.sh`,
 used from `run_ir` in `selfhost-diffdump.sh`) first: a divergence that
 matches a registered signature is EXPLAINED immediately, no repin needed.
-This is deliberately NOT the #1883 list reborn -- see that function's header
-for why a signature checked against an identity is a different, narrower
-thing than a file checked against nothing. `types` is unchanged; it has no
-signature table.
+This is deliberately NOT the deleted expected-mismatch list reborn -- see
+that function's header for why a signature checked against an identity is a
+different, narrower thing than a file checked against nothing. `types` is
+unchanged; it has no signature table.
 
-## AST differential (#1332/#1335)
+## AST differential
 
 Parse every corpus `.bit` file with both the oracle and this tree's `bit`
 and diff their `--dump-ast` output. They must be byte-identical. Files the
@@ -92,7 +93,7 @@ diagnostics rather than trees and belongs to diffdiags.
 Usage: `./make selfhost && bash scripts/selfhost-diffast.sh`. Exits
 non-zero (printing the first divergence) on any mismatch.
 
-## Token differential (#1332/#1334)
+## Token differential
 
 Lex every corpus `.bit` file with both the PINNED STAGE0 (the previous
 release) and the working tree's compiler, and diff their `--dump-tokens`
@@ -101,7 +102,7 @@ error are skipped -- the two lexers disagree about how far to lex past an
 error, so those files measure the diagnostic renderer rather than the
 lexer.
 
-THE ORACLE CHANGED IN #1593, AND SO DID WHAT A GREEN RUN MEANS. It used to
+THE ORACLE CHANGED, AND SO DID WHAT A GREEN RUN MEANS. It used to
 be `bit-out/bin/bit-seed`, a compiler written in a different language, so
 green meant two separately-written implementations agreed. It is now the
 last release of this same compiler, so green means "this version did not
@@ -111,7 +112,7 @@ change behaviour versus the last release". See `docs/release/bootstrap.md`
 Usage: `./make selfhost && bash scripts/selfhost-difftokens.sh`. Exits
 non-zero (printing the first divergence) on any mismatch.
 
-## Diagnostic differential (#1335/#363)
+## Diagnostic differential
 
 Self-host front-end diagnostic differential: run every corpus `.bit` file
 through both compilers' `--dump-diags` (lexer + parser diagnostics only --
@@ -124,7 +125,7 @@ frontend-only so checker `// error` cases are empty on both sides too.
 Usage: `./make selfhost && bash scripts/selfhost-diffdiags.sh`. Exits
 non-zero (printing the first divergence) on any mismatch.
 
-## Type differential (#1337/#364)
+## Type differential
 
 Self-host type differential: run every corpus `.bit` through both
 compilers' `--dump-types` (the binding/param/call type dump) and diff.
@@ -133,9 +134,9 @@ partial). This tracks Stage-2 inference coverage: MATCH grows as more
 constructs are ported; a byte diff pins the exact expression whose inferred
 type differs.
 
-### It had no exit status either (#1478)
+### It had no exit status either
 
-Found by the #1478 audit, one script down from `selfhost-diffiropt.sh`: this
+Found in an audit of the differential scripts, one script down from `selfhost-diffiropt.sh`: this
 printed `MISMATCH=n` and a first-divergence diff, then fell off the end at
 the `if`'s status -- always 0. Quoting it as verification was never a true
 claim.
@@ -151,7 +152,7 @@ a mismatch.
 
 Usage: `./make selfhost && bash scripts/selfhost-difftypes.sh`.
 
-## IR (pre-opt) differential (#1337/#364)
+## IR (pre-opt) differential
 
 Run every corpus `.bit` through both compilers' `--dump-ir-pre` (the lowered
 SSA text) and diff. Files the oracle cannot lower/check are skipped (bit2's
@@ -159,7 +160,7 @@ lowering is still partial). This tracks Stage-2 lowering coverage: MATCH
 grows as more constructs lower; a byte diff pins the exact function whose IR
 differs.
 
-### Why this gates on the SET, not the count (#1469)
+### Why this gates on the SET, not the count
 
 It used to print `MISMATCH=4` and name only the first offender. A count is
 not a set: MATCH could grow 141 -> 145 with MISMATCH steady at 4 while a
@@ -170,14 +171,14 @@ unverifiable.
 So every mismatching path is NAMED, and any mismatch at all fails the gate.
 There was an expected-mismatch list for a while, so a known difference
 could be written down instead of fixed; its last entry closed and it was
-deleted with its reader (#1883). Nothing is permitted to differ now.
+deleted with its reader. Nothing is permitted to differ now.
 
 A timeout is likewise not evidence. A file whose run is killed by the alarm
 is reported separately and fails the gate, rather than being folded into
 the mismatch count -- a load-sensitive counter that silently self-confirms
 is the exact bug this script was fixed for.
 
-### The bound, and why BOTH sides carry it (#2070)
+### The bound, and why BOTH sides carry it
 
 The alarm is a HANG guard, not a performance budget, so it belongs well
 above the slowest legitimate file rather than beside it. 20s was below the
@@ -194,14 +195,14 @@ outcomes.
 
 Usage: `./make selfhost && bash scripts/selfhost-diffir.sh`.
 
-## IR (post-opt) differential (#1339)
+## IR (post-opt) differential
 
 Diff `bit --dump-ir` (optimized) against the pinned stage0's optimized
 `--dump-ir` over the corpus. Tracks optimizer coverage -- MATCH grows as
 fold/DCE/inline passes land. Mirror of the pre-opt differential above but
 for the post-optimizer surface.
 
-### Why this gates on the SET, not the count (#1478)
+### Why this gates on the SET, not the count
 
 It used to print `MISMATCH=3`, name only the first offender, and exit 0 --
 so it could not fail under any circumstance, and its output was quoted as
@@ -214,7 +215,7 @@ A timeout is likewise not evidence. A file whose run is killed by the alarm
 is reported separately and fails the gate, rather than being scored as a
 mismatch that happens to sit in the expected set.
 
-### The bound, and why BOTH sides carry it (#2070)
+### The bound, and why BOTH sides carry it
 
 The alarm is a HANG guard, not a performance budget, so it must sit well
 above the slowest legitimate file rather than near it. It was 20s while the
@@ -224,7 +225,7 @@ a margin; the gate went red with MISMATCH=0 whenever the box was busy,
 which is the shape `docs/development.md` warns about ("do not read a TIMED
 OUT as a hang until you have timed the program standalone"). 300s is ~12x
 the slowest observed file, in the spirit of the suite's own
-900s-against-158s choice from #1637/#1652.
+900s-against-158s choice elsewhere.
 
 The oracle used to run UNBOUNDED, so a hung stage0 wedged this script
 forever with no message -- and merging that into SKIP would have been
