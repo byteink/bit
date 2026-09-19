@@ -86,7 +86,7 @@ fn postTagsTableSql(): []string {
 
 `manyToManyTable` builds two plain `int` columns, a **composite primary
 key** across both of them (`Table.primaryKey(...)`, the real schema.bit
-builder from #5084 - not `t.raw(...)`, schema.bit's escape hatch, which is
+builder - not `t.raw(...)`, schema.bit's escape hatch, which is
 what this table needed before that builder existed), a foreign key per
 column with `on delete cascade` so removing a `Post` or a `Tag` also
 removes its pairs, and an index on the target column so traversal from
@@ -171,7 +171,7 @@ renders `on conflict (post_id, tag_id) do nothing`; on MySQL it renders `on
 duplicate key update post_id = post_id`, a self-assignment that changes no
 column and only ever fires on the pair's own key conflict. Both take
 `dialect: ServerDialect` explicitly because nothing reaching `Data` carries
-a server dialect (#5384 settled this: it never will) - the same package-wide
+a server dialect (it never will) - the same package-wide
 type `write.bit`'s `upsert` and `lock.bit`'s `forUpdate` also take. Neither
 `attach` nor `sync` reads the `MysqlVersion` that `ServerDialect.Mysql`
 carries - `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` is a syntax choice, not

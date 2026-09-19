@@ -9,10 +9,10 @@ implemented yet. `for x of` accepts exactly four shapes today (slice,
 array, map, channel) and every other iterable, including every user
 class, is rejected at lowering with `E0092`. This page settles the
 protocol, reports the allocation and inlining evidence the protocol
-depends on, and answers the open questions epic smash#4107 listed. Once
+depends on, and answers the protocol's open questions. Once
 the trait lands, this page is rewritten into a normal guide page under
 `bit/docs/STYLE.md`, the way `docs/stdlib/time.md` was rewritten from
-design doc to shipped reference once std/time (#4062) landed.
+design doc to shipped reference once std/time landed.
 
 ## The problem
 
@@ -105,22 +105,23 @@ The concern was real: a payload-carrying enum used to allocate a boxed
 one per element. A per-element allocation would put a trait-based iterator
 far behind a raw slice loop, which allocates nothing.
 
-#4335 (per-enum-TYPE unboxed representation) removed that box across a
-**free function's** return boundary (measured by #5314). It did not, on
+The per-enum-TYPE unboxed representation removed that box across a
+**free function's** return boundary. It did not, on
 its own, cover a **method's** return boundary: `explodedRetWords`
 (`compiler/lowerexplode.bit`) gated the return side on `explodesParams`,
 whose second exclusion refused any declaration with a receiver, because a
 method also reaches its callers through `Op.CallIface`, where the
 interface's signature is the contract, not the class's. Measured
-2026-09-17 at main `0c035ef0` (smash#4107 comment 5): a method
+2026-09-17 at main `0c035ef0`: a method
 `Counter.next(): Opt` boxed one object per call against a byte-identical
 free function's zero, at 1,000,000 elements:
 
     free-function driver   obj (swept+live)         7    allocbytes    528,736
     method driver          obj (swept+live) 1,000,007    allocbytes 32,528,736
 
-**That gap is now closed.** #5445 (direct method dispatch) and #5446
-(`Op.CallIface`) both landed and merged to `main` since that measurement.
+**That gap is now closed.** Direct method dispatch, and exploded return
+words across `Op.CallIface`, both landed and merged to `main` since that
+measurement.
 Re-run 2026-09-18 at main `13f215824b89bb7ad72288743bda1feb4d794f82`,
 same methodology, three arms this time (free function, direct method call,
 interface/vtable call), 1,000,000 elements, `BIT_GC_STATS=1`, identical
@@ -134,25 +135,24 @@ stdout (`499999499999`) on every arm:
 (runtime init, the two `Counter` values, `Option` type metadata), constant
 across all three arms and confirmed stable across five repeated runs of
 each binary. **None of the three allocates per element.** The per-call
-box that forced this epic's original rejection is gone for a concrete
-class's direct calls (#5445) and for a trait-typed value's vtable calls
-(#5446) alike. Three identical zeros are also what a probe reports when the
+box that forced the protocol's original rejection is gone for a concrete
+class's direct calls and for a trait-typed value's vtable calls alike.
+Three identical zeros are also what a probe reports when the
 optimizer has folded the whole loop away, so the measurement carries a
 control: the same class and the same driver returning a `Pair` enum whose
 two payload variants hold different types, which is not eligible for the
 unboxed representation. It reports `swept=917487 live=82521
 allocbytes=32,528,768` on the same binary and the same stdout, one box per
 element. The instrument can see a box; the `Option<i64>` arms do not have
-one. The four `.bit` files, including that control, are on smash#4107; they
-are deliberately not committed, because they exist to prove a compiler
-property, not to exercise a stdlib API.
+one. The four `.bit` files, including that control, are deliberately not
+committed, because they exist to prove a compiler property, not to
+exercise a stdlib API.
 
 `next(): Option<T>` is therefore accepted on allocation grounds, not
 merely on protocol grounds. A future change to `explodesParams`,
 `methodRetExplodes` or `ifaceWordRetMethods` that reopens this box needs a
 regression test; `_tests_/cases/run_enum_explode_method.bit` already pins
-the shape by name and calls this epic out by number in its own header
-comment.
+the shape by name and says so in its own header comment.
 
 ## The inlining story
 
@@ -178,7 +178,7 @@ typed as the trait, not a concrete class) is `Op.CallIface`, a vtable
 dispatch the inliner cannot see through: the callee depends on the
 receiver's runtime type, which is exactly the information a
 monomorphic-only inliner does not have. That call stays a real call every
-iteration. #5446 is what keeps that real call from allocating regardless,
+iteration. Exploded return words keep that real call from allocating regardless,
 by carrying exploded return words across the vtable slot on any method
 name every implementor and every interface declaration agree on
 (`ifaceWordRetMethods`, `compiler/lowerexplodeiface.bit`). So the
@@ -186,12 +186,12 @@ trait-typed loop does not reach the raw-loop shape a slice gets, but it
 does reach the no-allocation shape, which is the gap the allocation
 measurement closes.
 
-#3163 (inlining order-independence) matters here because a `for … of`
+Inlining order-independence matters here because a `for … of`
 loop's own body is itself a candidate the inliner walks into after
 splicing `next()`, and a splice order that depended on iteration order
 would make the same program inline differently depending on unrelated
-code elsewhere in the file. It does not have to be re-verified for this
-epic; it already removed the dependency this feature would otherwise have
+code elsewhere in the file. It does not have to be re-verified here; it
+already removed the dependency this feature would otherwise have
 reintroduced.
 
 ## Do the four built-ins migrate to the trait?
@@ -215,7 +215,7 @@ Two mechanisms under two names, kept as they are, is the honest version of
 what is already true: a slice is not a lazily-computed sequence, it is a
 contiguous block of memory with a length, and the compiler should keep
 saying so directly. The trait is the extension point for every type that
-is **not** that, which is what this epic asked for. Maps and channels stay
+is **not** that. Maps and channels stay
 special for the same reason: `for (k, v) of m` reads the map's own bucket
 layout (`typeForOfBinder`, `compiler/checkmatch.bit:106`) and a channel
 `for … of` is a receive-until-closed loop with its own runtime protocol,
@@ -231,7 +231,7 @@ trait to exist.
 ## `for (k, v) of m`
 
 Unaffected. A map's `of` already yields the `(K, V)` pair as one value
-(`elementType`, `compiler/checkmatch.bit:69`, epic #4332's owner ruling),
+(`elementType`, `compiler/checkmatch.bit:69`),
 and `for (k, v) of m` is that pair destructured positionally through the
 same `checkTupleBinders` a tuple-typed `next(): Option<(K, V)>` would use.
 A user type that wants to be ranged over as pairs declares
@@ -257,7 +257,7 @@ needs code to measure against:
   an assertion).
 ## Measured cost of the three loop shapes
 
-**Measured for #5564 on `4a208905`**, drained box under `boxlock.sh solo`,
+**Measured on `4a208905`**, drained box under `boxlock.sh solo`,
 nothing else running. Three programs summing 1,000,000 `i64` elements per
 repetition: (a) `for x of xs` over a `[]i64`, (b) `for x of it` over a
 concrete class whose `next(): Option<i64>`, (c) the same with `it`
@@ -281,12 +281,12 @@ those collections and the per-point spread was 8-30%, so the ratios are
 quoted as ranges; do not restate them as single numbers.
 
 **All three loops run at IPC 5.6-7.5, which is near this core's issue
-width.** That is the regime #4389 documented: high IPC here is saturation,
+width.** In that regime high IPC means saturation,
 not headroom. It is why (b)'s 1.64x instruction cost buys only ~1.3x
 cycles -- the extra work fits in issue slots the slice loop was not using
 -- and it is also why adding instructions to any of these shapes should be
 expected to cost roughly proportionally. An optimization here that trades
-instructions for stalls will lose; see #5571, which measured -1.12%
+instructions for stalls will lose: one such attempt measured -1.12%
 instructions at +3.01% cycles in comparable code and was rejected.
 
 The interface arm is the one worth knowing about: **~4.7x the instructions
@@ -297,4 +297,4 @@ a raw loop to be uninteresting; an interface-typed one is not.
 ## Specification
 
 `for … of` today: SPEC §12.6. `for … in`: owner decision 2026-08-10,
-SPEC §12.6. Traits: SPEC, added by #3367.
+SPEC §12.6. Traits: SPEC.

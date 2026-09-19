@@ -87,7 +87,7 @@ needs: a `RunnerDialect`, two facts about the target server bundled into one
 parameter - `render`, the [Dialect](dialect.md) that turns a migration's
 `SchemaOp`s into real DDL (`Postgres{}` here), and `server: ServerDialect`,
 which server `up`/`down` take their advisory lock against. The two are
-never derived from each other (#5384): "how do I render this migration's
+never derived from each other: "how do I render this migration's
 SQL" and "which server locks the run" are different questions, and a real
 MySQL deployment answers both the same way, but nothing here assumes it -
 see "The sharp edge" below for what `server` actually controls.
@@ -215,7 +215,7 @@ partially-applied migration to finish by hand, not a rejected one.
 The advisory lock (`pg_advisory_lock`, released at the end of the run
 whether it succeeds or fails) is taken when `server: ServerDialect.Postgres`.
 Pass `ServerDialect.Mysql(version)` instead and `up`/`down` refuse
-immediately, before issuing any statement (#5384) - there is no MySQL
+immediately, before issuing any statement - there is no MySQL
 advisory lock implemented yet, and running a MySQL migration unlocked would
 mean two instances deploying at the same moment could interleave their DDL
 with nothing stopping them, exactly what this lock exists to prevent. That
@@ -228,7 +228,7 @@ catchable one. **MySQL migrations cannot run through `up`/`down` today** -
 see the next section for the statement sequencing they will use once a
 MySQL lock exists.
 
-### On MySQL, the ledger row moves to the end (#5378)
+### On MySQL, the ledger row moves to the end
 
 The sequencing below is real, tested code (`applyMigration` in
 `pkg/orm/runner.bit`) - it is what `up` will do for a MySQL migration once

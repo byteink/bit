@@ -136,7 +136,7 @@ left `schema_history` recording it as applied.
 
 The runner no longer does that: when a migration renders no transactional
 statements at all, `up` runs every statement first and writes the ledger row
-only once they have all succeeded (#5378). A statement failing anywhere in a
+only once they have all succeeded. A statement failing anywhere in a
 MySQL migration leaves no `schema_history` row for it, so the next `up` still
 sees it as pending. The trade-off is stated in
 [Migrate](migrate.md)'s own section on it: a crash between the last statement
@@ -153,8 +153,8 @@ advisory lock is `pg_advisory_lock`, a Postgres statement hardcoded into the
 runner. `Dialect` has no lock or unlock method today, so there is nothing for
 a MySQL `up` to call - two instances deploying at the same moment both start
 applying pending migrations with no coordination between them at all. This
-is a separate gap from the ledger-ordering one above; fixing #5378 does not
-fix this.
+is a separate gap from the ledger-ordering one above; fixing that ordering
+does not fix this.
 
 ## Every divergence, in one place
 
@@ -175,7 +175,7 @@ fix this.
 
 `Mysql{}.render` only produces SQL text - it never opens a connection. Do not
 run [Migrate](migrate.md)'s `up`/`down` against a MySQL database from more
-than one place at a time: the ledger-ordering bug is fixed (#5378), but no
+than one place at a time: the ledger-ordering bug is fixed, but no
 lock stops two deploys from racing each other on MySQL the way
 `pg_advisory_lock` does on Postgres. A single deploy applying a migration
 that fails partway is now recoverable - nothing records it as applied - but
