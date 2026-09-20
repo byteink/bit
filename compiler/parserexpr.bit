@@ -191,6 +191,135 @@ fn parseDotPostfix(p: Parser, expr: int): int {
   return mkNode(p, Tag.Member, 0, [expr, name])
 }
 
+// The LParen arm of `parsePostfix`'s dispatch: a plain call `expr(a, b)`.
+// `exprStart` is the whole postfix expression's start offset, `--dump-types`'s
+// span for the resulting `Tag.Call` node (see `parsePostfix`'s own comment).
+fn parsePostfixCall(p: Parser, exprStart: int, expr: int): int {
+  advance(p)
+  let argNodes = []int(0)
+  while (!atListClose(p, Kind.RParen)) {
+    argNodes = append(argNodes, parseCallArgItem(p))
+    if (!acceptTok(p, Kind.Comma)) {
+      break
+    }
+  }
+  let rpEnd = peekTok(p).end
+  expect(p, Kind.RParen)
+  let args = mkNode(p, Tag.Args, 0, argNodes)
+  let call = mkNode(p, Tag.Call, 0, [expr, 0, args])
+  p.tree.nodes[call].span = Span{ file = p.file, start = exprStart, end = rpEnd }
+  return call
+}
+
+// The FloatLit arm: `t.0` — the lexer emits ONE FloatLit token `.0`; no `Dot`
+// token is ever produced, so `parsePostfix`'s `Kind.Dot` arm cannot see a
+// glued tuple index. Split it here exactly as the seed does: the index leaf
+// starts one byte past the `.` so its text is the digits alone, which is
+// what parseIntText reads. mkNode's kid-derived span is already the seed's
+// `join(span(expr), full)` — the leaf ends at `full.end`.
+fn parsePostfixTupleIndex(p: Parser, expr: int): int {
+  let full = peekTok(p)
+  advance(p)
+  let idx = addLeaf(
+    p.tree, Tag.IntLit,
+    Span{ file = p.file, start = full.start + 1, end = full.end },
+  )
+  return mkNode(p, Tag.TupleIndex, 0, [expr, idx])
+}
+
+// The Question arm: `?` is ALSO the conditional's opener (§12, #3941), and
+// nothing here knows the operand's fallibility — that is a checker fact
+// (E0116), not a parser one. Whichever `?` a `cond ? a : b` ends with
+// (`cond` itself, or one of the ordinary operators/operands nested inside
+// it) is the LAST token of `cond`, so it reaches this arm before the
+// conditional layer ever sees it. `looksLikeTernaryQuestion` (parsercond.bit)
+// answers "would `? <then> :` actually parse from here" with a real,
+// rolled-back speculative parse (the same mark/reset idiom the generic
+// turbofish below uses) — a clean YES means this `?` is not propagation at
+// all, so `parsePostfix` must end its chain here (returns `ok = false`) and
+// let `parseConditional` open the ternary normally, however deep the TRUE
+// tail of `cond` sits. Returns (newExpr, ok): `ok` false means "not consumed,
+// end the postfix chain"; true means newExpr is the `TryExpr`-wrapped result.
+fn tryPostfixQuestion(p: Parser, expr: int): (int, bool) {
+  if (looksLikeTernaryQuestion(p)) {
+    return (expr, false)
+  }
+  let q = peekTok(p)
+  advance(p)
+  // The seed spans `expr?` from the operand's start through the `?` (join),
+  // not just the operand — `mkNode`'s kid-only span would drop the `?`.
+  let next = addNode(
+    p.tree, Tag.TryExpr,
+    Span{ file = p.file, start = getNode(p.tree, expr).span.start, end = q.end }, 0, [expr],
+  )
+  return (next, true)
+}
+
+// The Lt arm: turbofish `expr<T, U>` — a generic call `(...)`, generic
+// composite `{...}`, or generic instantiation before `.` (`Option<i64>.None`).
+//
+// The WHOLE attempt is speculative, exactly as the seed's `tryGenericPostfix`
+// is: the type-arg list, the close, and then the call's argument list or the
+// composite literal's BODY all run with `speculating > 0`, so a `fail`
+// anywhere inside rewinds the lot to a comparison. The port's equivalent of
+// "a fail was raised" is "the attempt appended a diagnostic", so success
+// requires both a shape the seed accepts and a clean diagnostic list.
+//
+// Committing at the `{` instead — which this used to do — made a truncated
+// `Shapes<i64>{` report EOF errors from inside the literal where the seed
+// rewinds and reads `Shapes < i64 > {`, reporting "expected an expression,
+// found '{'" at the brace (#1567). Returns (newExpr, ok) exactly as
+// `tryPostfixQuestion` does: `ok` false means the whole attempt rewound and
+// `parsePostfix` must end its chain here.
+fn tryPostfixTurbofish(p: Parser, expr: int, exprStart: int, bareName: bool): (int, bool) {
+  let mark = p.pos
+  let dmark = len(p.diags.list)
+  let smark = splitMark(p)
+  advance(p)
+  let tys = []int(0)
+  let done = false
+  while (!done) {
+    tys = append(tys, parseType(p))
+    if (!acceptTok(p, Kind.Comma)) {
+      done = true
+    }
+  }
+  // Built into `cand` rather than `expr`, so a rewind leaves `expr` as the
+  // primary it was. The orphaned nodes are the seed's behaviour too — its
+  // `reset` restores the token stream, never the tree.
+  let cand = 0
+  if (len(tys) >= 1 && atListClose(p, Kind.Gt)) {
+    expectGenericClose(p)
+    let targs = mkNode(p, Tag.TypeArgs, 0, tys)
+    let nk = peekKind(p)
+    if (nk == Kind.LParen) {
+      advance(p)
+      let argNodes = []int(0)
+      while (!atListClose(p, Kind.RParen)) {
+        argNodes = append(argNodes, parseCallArgItem(p))
+        if (!acceptTok(p, Kind.Comma)) {
+          break
+        }
+      }
+      let rpEnd = peekTok(p).end
+      expect(p, Kind.RParen)
+      cand = mkNode(p, Tag.Call, 0, [expr, targs, mkNode(p, Tag.Args, 0, argNodes)])
+      p.tree.nodes[cand].span = Span{ file = p.file, start = exprStart, end = rpEnd }
+    } else if (bareName && !p.noComposite && nk == Kind.LBrace) {
+      cand = parseCompositeLit(p, mkNode(p, Tag.GenericInst, 0, [expr, targs]))
+    } else if (nk == Kind.Dot) {
+      cand = mkNode(p, Tag.GenericInst, 0, [expr, targs])
+    }
+  }
+  if (cand == 0 || len(p.diags.list) != dmark) {
+    truncateDiags(p.diags, dmark)
+    undoSplits(p, smark)
+    p.pos = mark
+    return (expr, false)
+  }
+  return (cand, true)
+}
+
 // Postfix chain: `f(a, b)` calls and `.name` member access. `call` is
 // `[callee, type_args_or_none, args]`; `args` holds `arg` nodes each `[expr]`,
 // or a `named_arg` node `[name, expr]` (SPEC §12.11, #3839, `parseCallArgItem`
@@ -206,19 +335,7 @@ fn parsePostfix(p: Parser): int {
   while (guard < 4096) {
     let k = peekKind(p)
     if (k == Kind.LParen) {
-      advance(p)
-      let argNodes = []int(0)
-      while (!atListClose(p, Kind.RParen)) {
-        argNodes = append(argNodes, parseCallArgItem(p))
-        if (!acceptTok(p, Kind.Comma)) {
-          break
-        }
-      }
-      let rpEnd = peekTok(p).end
-      expect(p, Kind.RParen)
-      let args = mkNode(p, Tag.Args, 0, argNodes)
-      expr = mkNode(p, Tag.Call, 0, [expr, 0, args])
-      p.tree.nodes[expr].span = Span{ file = p.file, start = exprStart, end = rpEnd }
+      expr = parsePostfixCall(p, exprStart, expr)
       bareName = false
     } else if (k == Kind.LBrace &&
       !p.noComposite &&
@@ -234,111 +351,25 @@ fn parsePostfix(p: Parser): int {
       expr = parseIndexOrSlice(p, expr)
       bareName = false
     } else if (k == Kind.Question) {
-      // `?` is ALSO the conditional's opener (§12, #3941), and nothing here
-      // knows the operand's fallibility — that is a checker fact (E0116), not
-      // a parser one. Whichever `?` a `cond ? a : b` ends with (`cond` itself,
-      // or one of the ordinary operators/operands nested inside it) is the
-      // LAST token of `cond`, so it reaches exactly this branch before the
-      // conditional layer ever sees it. `looksLikeTernaryQuestion` (parsercond.bit)
-      // answers "would `? <then> :` actually parse from here" with a real,
-      // rolled-back speculative parse (the same mark/reset idiom the generic
-      // turbofish above uses) — a clean YES means this `?` is not propagation
-      // at all, so leaving it unconsumed and ending the chain here is what
-      // lets `parseConditional` open the ternary normally, however deep the
-      // TRUE tail of `cond` sits.
-      if (looksLikeTernaryQuestion(p)) {
+      let (next, ok) = tryPostfixQuestion(p, expr)
+      if (!ok) {
         break
       }
-      let q = peekTok(p)
-      advance(p)
-      // The seed spans `expr?` from the operand's start through the `?` (join),
-      // not just the operand — `mkNode`'s kid-only span would drop the `?`.
-      expr = addNode(
-        p.tree, Tag.TryExpr,
-        Span{ file = p.file, start = getNode(p.tree, expr).span.start, end = q.end }, 0, [expr],
-      )
+      expr = next
       bareName = false
     } else if (k == Kind.Dot) {
       advance(p)
       expr = parseDotPostfix(p, expr)
       bareName = false
     } else if (k == Kind.FloatLit && isDotDigits(curText(p))) {
-      // `t.0` — the lexer emits ONE FloatLit token `.0`; no `Dot` token is ever
-      // produced, so the `Kind.Dot` arm above cannot see a glued tuple index.
-      // Split it here exactly as the seed does: the
-      // index leaf starts one byte past the `.` so its text is the digits alone,
-      // which is what parseIntText reads. mkNode's kid-derived span is already
-      // the seed's `join(span(expr), full)` — the leaf ends at `full.end`.
-      let full = peekTok(p)
-      advance(p)
-      let idx = addLeaf(
-        p.tree, Tag.IntLit,
-        Span{ file = p.file, start = full.start + 1, end = full.end },
-      )
-      expr = mkNode(p, Tag.TupleIndex, 0, [expr, idx])
+      expr = parsePostfixTupleIndex(p, expr)
       bareName = false
     } else if (k == Kind.Lt) {
-      // Turbofish `expr<T, U>` — a generic call `(...)`, generic composite
-      // `{...}`, or generic instantiation before `.` (`Option<i64>.None`).
-      //
-      // The WHOLE attempt is speculative, exactly as the seed's
-      // `tryGenericPostfix` is: the type-arg list, the close, and then the
-      // call's argument list or the composite literal's BODY all run with
-      // `speculating > 0`, so a `fail` anywhere inside rewinds the lot to a
-      // comparison. The port's equivalent of "a fail was raised" is "the
-      // attempt appended a diagnostic", so success requires both a shape the
-      // seed accepts and a clean diagnostic list.
-      //
-      // Committing at the `{` instead — which this used to do — made a
-      // truncated `Shapes<i64>{` report EOF errors from inside the literal
-      // where the seed rewinds and reads `Shapes < i64 > {`, reporting
-      // "expected an expression, found '{'" at the brace (#1567).
-      let mark = p.pos
-      let dmark = len(p.diags.list)
-      let smark = splitMark(p)
-      advance(p)
-      let tys = []int(0)
-      let done = false
-      while (!done) {
-        tys = append(tys, parseType(p))
-        if (!acceptTok(p, Kind.Comma)) {
-          done = true
-        }
-      }
-      // Built into `cand` rather than `expr`, so a rewind leaves `expr` as the
-      // primary it was. The orphaned nodes are the seed's behaviour too — its
-      // `reset` restores the token stream, never the tree.
-      let cand = 0
-      if (len(tys) >= 1 && atListClose(p, Kind.Gt)) {
-        expectGenericClose(p)
-        let targs = mkNode(p, Tag.TypeArgs, 0, tys)
-        let nk = peekKind(p)
-        if (nk == Kind.LParen) {
-          advance(p)
-          let argNodes = []int(0)
-          while (!atListClose(p, Kind.RParen)) {
-            argNodes = append(argNodes, parseCallArgItem(p))
-            if (!acceptTok(p, Kind.Comma)) {
-              break
-            }
-          }
-          let rpEnd = peekTok(p).end
-          expect(p, Kind.RParen)
-          cand = mkNode(p, Tag.Call, 0, [expr, targs, mkNode(p, Tag.Args, 0, argNodes)])
-          p.tree.nodes[cand].span = Span{ file = p.file, start = exprStart, end = rpEnd }
-        } else if (bareName && !p.noComposite && nk == Kind.LBrace) {
-          cand = parseCompositeLit(p, mkNode(p, Tag.GenericInst, 0, [expr, targs]))
-        } else if (nk == Kind.Dot) {
-          cand = mkNode(p, Tag.GenericInst, 0, [expr, targs])
-        }
-      }
-      if (cand == 0 || len(p.diags.list) != dmark) {
-        truncateDiags(p.diags, dmark)
-        undoSplits(p, smark)
-        p.pos = mark
+      let (next, ok) = tryPostfixTurbofish(p, expr, exprStart, bareName)
+      if (!ok) {
         break
       }
-      expr = cand
+      expr = next
       bareName = false
     } else {
       break
