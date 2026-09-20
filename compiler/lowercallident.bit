@@ -1,0 +1,281 @@
+// compiler/lowercallident.bit — split out of lowercall.bit (#2450) to keep
+// both files under the 800-line lint limit. Same module as lowercall.bit, so
+// this needs no imports and no call-site changes: it is the `cn.tag ==
+// Tag.Ident` half of `lowerCall`, unchanged.
+
+// The `cn.tag == Tag.Ident` half of `lowerCall`: every builtin, local
+// function value and user declaration dispatched by the callee's bare name.
+// A tail-call chain over ~18 mutually exclusive name/shape checks, in the
+// seed's own precedence order (see the PRECEDENCE comment below) — split
+// this way rather than by builtin CATEGORY so the order stays visibly the
+// order this function tests it in. Returns -1, the same "no id produced"
+// sentinel `lowerCallNonIdent`'s `Tag.Member` arm already uses, when no
+// check in the whole chain matches (an Ident callee that is none of these —
+// falls through to `lowerCallNonIdent`'s generic function-value dispatch).
+fn lowerCallIdent(fc: FnCtx, node: int, cn: Node, name: string): int {
+  // PRECEDENCE: local binding > user declaration > builtin (§17.5), which is
+  // what the seed gets for free by resolving the callee to a SYMBOL
+  // (`env.lookup`/`nodeSymbol`) instead of matching its source text. Matching
+  // text put the whole ~70-name `predeclaredFuncs()` list ahead of the user's
+  // own declarations, so a program declaring any of those names — including an
+  // `extern function close` — silently got the builtin instead of its own
+  // function. Almost all of it failed quietly: a user `timeMonoNs` returned the
+  // real clock, `fsClose` returned 0. These two paths must therefore stay ABOVE
+  // the builtin block below, and in this order.
+  // A local/param of function type called directly (`f(x)`) dispatches through
+  // the closure via `call_value`.
+  let lvi = envIndex(fc, name)
+  if (lvi != -1 && fc.c.ctx.types[fc.env[lvi].ty].kind == TypeKind.Func) {
+    let members = fc.c.ctx.types[fc.env[lvi].ty].members
+    let vfixed = -1
+    let velem = 0
+    if (fc.c.ctx.types[fc.env[lvi].ty].variadic && len(members) > 0) {
+      vfixed = len(members) - 1
+      velem = members[vfixed]
+    }
+    let a = lowerArgsRest(fc, node, members, vfixed, velem)
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, nodeType(fc, node)))
+    ins.lhs = localRead(fc, lvi)
+    ins.args = a
+    return builderEmit(fc.b, ins)
+  }
+  if (funcRefAt(fc.c, calleeNodeOf(fc.c, node), name).decl != 0) {
+    let t = resolveCallTarget(fc, name, node)
+    if (!t.ok) {
+      fcFail(fc, cn.span, "a call whose target could not be resolved")
+      return 0
+    }
+    // Hint each argument with the CONCRETE parameter type this call binds.
+    // `lowerArgsForCall` (lowernamedarg.bit, #3839) is `lowerArgsFor` for
+    // every ordinary call and routes a named-argument one through its own
+    // written-order evaluation instead.
+    let a = lowerArgsForCall(fc, node, t.owner, t.decl, t.paramTypes)
+    if (fc.failed) {
+      return 0
+    }
+    return emitResolvedCall(fc, t, a)
+  }
+  return lowerCallIdentOps2(fc, node, cn, name)
+}
+
+fn lowerCallIdentOps2(fc: FnCtx, node: int, cn: Node, name: string): int {
+  // `print` (fd 1) and `eprint` (fd 2): one string arg, void, distinct rt
+  // primitives (ABI.md §12).
+  if (name == "print" || name == "eprint") {
+    let a = lowerArgs(fc, node, []int(0))
+    if (fc.failed || len(a) != 1) {
+      fcFail(fc, cn.span, "`print`/`eprint` called with other than one argument")
+      return 0
+    }
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = name
+    ins.args = a
+    return emitRtCall(fc, ins)
+  }
+  if (name == "panic") {
+    let a = lowerArgs(fc, node, []int(0))
+    if (fc.failed || len(a) != 1) {
+      fcFail(fc, cn.span, "`panic` called with other than one argument")
+      return 0
+    }
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = "panic"
+    ins.args = a
+    // #3282 (SPEC S18.6's named gap): blame the call itself, not merely
+    // the enclosing statement -- set directly on `ins` (not via
+    // builderSetSpan) so it survives regardless of what curSpan is by the
+    // time emitRtCall's own builderEmit runs.
+    ins.span = remapModuleSpan(fc.c, cn.span)
+    let r = emitRtCall(fc, ins)
+    // panic never returns: the block ends with unreachable.
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    fc.terminated = true
+    return r
+  }
+  return lowerCallIdentOps3(fc, node, cn, name)
+}
+
+fn lowerCallIdentOps3(fc: FnCtx, node: int, cn: Node, name: string): int {
+  if (name == "assert") {
+    let a = lowerArgs(fc, node, []int(0))
+    if (fc.failed) {
+      return 0
+    }
+    // The runtime assert has a frozen 2-arg signature (ABI.md §12); a 1-arg
+    // source form supplies the default message.
+    if (len(a) == 1) {
+      let cs = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+      cs.sval = "assertion failed"
+      cs.ival = internPoolString(fc, cs.sval)
+      a = append(a, builderEmit(fc.b, cs))
+    }
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = "assert"
+    ins.args = a
+    ins.span = remapModuleSpan(fc.c, cn.span) // #3282, see the panic branch above
+    return emitRtCall(fc, ins)
+  }
+  if (name == "len" || name == "cap") {
+    return lowerLen(fc, node, name == "cap")
+  }
+  if (name == "append") {
+    return lowerAppend(fc, node)
+  }
+  return lowerCallIdentOps4(fc, node, cn, name)
+}
+
+fn lowerCallIdentOps4(fc: FnCtx, node: int, cn: Node, name: string): int {
+  if (name == "delete") {
+    let a0 = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])[0]
+    if (getNode(fc.c.tree, a0).tag == Tag.Arg) {
+      a0 = kidsOf(fc.c.tree, a0)[0]
+    }
+    let keyTy = fc.c.ctx.types[defaultType(fc.c, nodeType(fc, a0))].mapKey
+    let a = lowerArgs(fc, node, [0, keyTy])
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = "map_delete"
+    ins.args = a
+    return emitRtCall(fc, ins)
+  }
+  if (name == "close") {
+    let ca = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])[0]
+    if (getNode(fc.c.tree, ca).tag == Tag.Arg) {
+      ca = kidsOf(fc.c.tree, ca)[0]
+    }
+    let cv = lowerExpr(fc, ca)
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = "chan_close"
+    ins.args = [cv]
+    return emitRtCall(fc, ins)
+  }
+  return lowerCallIdentOps5(fc, node, cn, name)
+}
+
+fn lowerCallIdentOps5(fc: FnCtx, node: int, cn: Node, name: string): int {
+  // Atomics (§11.5): dedicated inline IR ops on a raw `*T` (never an rt_call).
+  if (name == "atomicLoad" ||
+    name == "atomicStore" ||
+    name == "atomicCmpxchg" ||
+    name == "atomicAdd" ||
+    name == "atomicSub" ||
+    name == "atomicAnd" ||
+    name == "atomicOr" ||
+    name == "atomicXchg") {
+    return lowerAtomic(fc, node, name)
+  }
+  return lowerCallIdentOps6(fc, node, cn, name)
+}
+
+fn lowerCallIdentOps6(fc: FnCtx, node: int, cn: Node, name: string): int {
+  // `ptrOf(s)`: the address of a slice's element 0, as a `*T`.
+  if (name == "ptrOf") {
+    return lowerPtrOf(fc, node)
+  }
+  // `entryOf(f)` (§11.10): `f`'s code address, through the SAME FuncAddr op
+  // `spawn` already uses for its trampoline — a source spelling for an existing
+  // mechanism, not a new one. validate.bit has already proved the operand names
+  // a non-generic, non-extern function declaration.
+  if (name == "entryOf") {
+    return lowerEntryOf(fc, node)
+  }
+  // `stackMapsBegin()`/`stackMapsEnd()` (§11.12): one bound of the merged
+  // stack-map table each, as a `*byte`. No operands to lower — the whole
+  // instruction is a relocation against a name only the linker defines.
+  // `debugLinesBegin()`/`debugLinesEnd()` (#3285) share the same lowering:
+  // a second linker-defined extent, over the debug-info table instead.
+  if (name == "stackMapsBegin" ||
+    name == "stackMapsEnd" ||
+    name == "debugLinesBegin" ||
+    name == "debugLinesEnd") {
+    return lowerStackMapsAddr(fc, node, name)
+  }
+  return lowerCallIdentOps7(fc, node, cn, name)
+}
+
+fn lowerCallIdentOps7(fc: FnCtx, node: int, cn: Node, name: string): int {
+  // `syscall` (§11.8) is the one builtin with no `bit_rt_*` symbol behind it —
+  // the backends emit the kernel trap inline — so it takes its own IR op and
+  // deliberately never reaches the `primRtName` path below.
+  if (name == "syscall") {
+    // Unhinted deliberately: `syscall` is variadic over i64 words, which is
+    // exactly what an untyped int literal already defaults to.
+    let a = lowerArgs(fc, node, []int(0))
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.Syscall, primType(fc.c.ctx, 3))
+    ins.lhs = a[0]
+    ins.args = a[1:len(a)]
+    return builderEmit(fc.b, ins)
+  }
+  // Primitives that ARE a machine instruction rather than a runtime call.
+  // Checked before `primRtName` and single-operand by construction. An
+  // `rt_call` here would make the matching `bit_rt_*` unimplementable in Bit
+  // — its body would compile to a call to itself.
+  let uop = primUnaryOp(name)
+  if (uop != Op.BlockParam) {
+    // Hinted by the primitive's declared signature: `float32Bits(4.5)` must
+    // materialize its literal as f32, not at the untyped default f64 (#1467).
+    let ua = lowerArgs(fc, node, builtinParamTypes(fc.c, name))
+    if (fc.failed) {
+      return 0
+    }
+    let uins = mkInstr(uop, nodeType(fc, node))
+    uins.lhs = ua[0]
+    return builderEmit(fc.b, uins)
+  }
+  // A runtime-primitive builtin lowers 1:1 to its `rt_call`, result already
+  // typed by the checker.
+  let rt = primRtName(name)
+  if (rt != "") {
+    let a = lowerArgs(fc, node, builtinParamTypes(fc.c, name))
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.RtCall, nodeType(fc, node))
+    ins.name = rt
+    ins.args = a
+    return emitRtCall(fc, ins)
+  }
+  return lowerCallIdentOps8(fc, node, name)
+}
+
+fn lowerCallIdentOps8(fc: FnCtx, node: int, name: string): int {
+  // A primitive-named callee is a type conversion `T(x)`.
+  if (primIndexByName(name) >= 0) {
+    return lowerConvert(fc, node)
+  }
+  // A USER-DECLARED type in call position is equally a conversion (SPEC §12.9,
+  // "a type used in call position converts or constructs"). #1898: only the
+  // builtin and compound spellings above were ever dispatched, so `E(car)`,
+  // `MyInt(5)` and `Point(p)` typechecked and then reached the end of this
+  // function unhandled — which marks the whole enclosing function unlowerable
+  // and refuses the binary, with no span and no named expression.
+  //
+  // Every one of the three targets is already expressible by `lowerConvert`:
+  // an alias resolves to its underlying type and a class-to-itself is the
+  // identity, both of which its `srcTy == dstTy` arm returns unchanged; an
+  // interface target is a no-op at the value level, since `call_iface`
+  // resolves methods from the receiver's own header via `bit_rt_iface_lookup`
+  // rather than from a fat pointer built here.
+  let ut = userTypeLookup(fc.c, name)
+  if (ut != 0) {
+    // A class declaring 'init' (classinit.bit, #3371): `Account(500)`
+    // allocates and calls the constructor, rather than converting.
+    let initNode = classInitNode(fc.c, ut)
+    if (initNode != 0) {
+      return lowerClassConstruct(fc, node, ut)
+    }
+    return lowerConvert(fc, node)
+  }
+  return -1
+}
