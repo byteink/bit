@@ -40,6 +40,20 @@ IMAGE="bit-linux-gate-amd64:latest"
 # STEP defaults to the full suite but an exported STEP env wins (scripts/gate.sh
 # sets it to a scoped set like "test-golden test-imports-bit"). #1772.
 STEP="${STEP:-test}"
+
+# Environment does NOT cross an ssh plus `docker run` boundary on its own, so a
+# knob set on the Mac is silently ignored inside the container unless it is
+# named here. `_tests_/bit/stress/stress.bit` documents BIT_STRESSGATE_ONLY and
+# BIT_STRESSGATE_DIR as the way to narrow a stress run for debugging, and
+# neither reached the gate before this: the filter read as accepted and the
+# full corpus ran anyway, which looks exactly like the filter matching
+# everything. Add a variable here to make it forwardable, and keep the quoting
+# so an unset one expands to nothing rather than to an empty assignment.
+GATE_ENV=""
+for v in BIT_STRESSGATE_ONLY BIT_STRESSGATE_DIR; do
+  eval "val=\${$v-}"
+  [ -z "$val" ] || GATE_ENV="$GATE_ENV $v=$val"
+done
 if [ "${MODE}" = "fuzz" ]; then
   STEP="fuzz -- ${FUZZ_SECS:-60}"
   MODE="fast"
@@ -203,7 +217,7 @@ while IFS= read -r host; do
       fi
       docker run --rm -i -e CACHE_ENV=\$CACHE_ENV \$CACHE_FLAG \$CACHE_VOL ${IMAGE} bash -c '
         mkdir -p /work && cd /work && tar xi &&
-        BIT_STAGE0_CACHE=\$CACHE_ENV/stage0 BIT_ABI_BASELINE_DIR=${ABI_BASELINE_DIR}/runtime BIT_GATE_HEAD_SHA=${GATE_HEAD_SHA} ./make ${STEP} > /tmp/o 2>&1
+        BIT_STAGE0_CACHE=\$CACHE_ENV/stage0 BIT_ABI_BASELINE_DIR=${ABI_BASELINE_DIR}/runtime BIT_GATE_HEAD_SHA=${GATE_HEAD_SHA} ${GATE_ENV} ./make ${STEP} > /tmp/o 2>&1
         e=\$?
         if [ \$e -eq 0 ]; then
           echo ===TAIL===
