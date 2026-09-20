@@ -42,6 +42,154 @@ fn invalidLvalue(): Lvalue {
   }
 }
 
+// The Tag.Ident arm of resolveLvalue: a local slot, or a module-level `let`
+// written through the ordinary FieldSet at offset 0 (the same lvalue shape
+// `*p = x` uses).
+fn resolveLvalueIdent(fc: FnCtx, node: int, n: Node): Lvalue {
+  let name = fc.c.source[n.span.start:n.span.end]
+  let idx = envIndex(fc, name)
+  if (idx != -1) {
+    return Lvalue{
+      kind = LvKind.Local,
+      envIdx = idx,
+      recv = 0,
+      ty = 0,
+      offset = 0,
+      index = 0,
+      isSlice = false,
+      arrayLen = 0,
+    }
+  }
+  let sym = moduleGlobalSym(fc, name)
+  if (sym == "") {
+    fcFail(fc, n.span, "an assignment target that is neither a local nor a module-level variable")
+    return invalidLvalue()
+  }
+  let addr = emitGlobalAddrVal(fc, sym)
+  return Lvalue{
+    kind = LvKind.Global,
+    envIdx = -1,
+    recv = addr,
+    ty = nodeType(fc, node),
+    offset = 0,
+    index = 0,
+    isSlice = false,
+    arrayLen = 0,
+  }
+}
+
+// The Tag.Member arm of resolveLvalue: a class field write.
+fn resolveLvalueMember(fc: FnCtx, node: int, n: Node): Lvalue {
+  let mk = kidsOf(fc.c.tree, node)
+  let recvTy = nodeType(fc, mk[0])
+  if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
+    fcFail(fc, n.span, "a field assignment whose receiver is not a class")
+    return invalidLvalue()
+  }
+  let decl = structDeclOf(fc.c, recvTy)
+  if (decl == 0) {
+    fcFail(fc, n.span, "a field assignment on a class with no declaration in scope")
+    return invalidLvalue()
+  }
+  let oc = typeOwner(fc.c, recvTy)
+  let fields = structFieldNodes(oc, decl)
+  let mn = getNode(fc.c.tree, mk[1])
+  let fidx = fieldIndexByName(oc, fields, fc.c.source[mn.span.start:mn.span.end])
+  if (fidx == -1) {
+    fcFail(fc, n.span, "assignment to an unknown class field")
+    return invalidLvalue()
+  }
+  let fty = typeFromNode(oc, kidsOf(oc.tree, fields[fidx])[1])
+  // Inline-array fields are copy semantics, not a scalar lvalue — matches
+  // lowerFieldStore's deferral.
+  if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+    fcFail(fc, n.span, "assignment to an inline-array class field")
+    return invalidLvalue()
+  }
+  // Substituted so a generic field's declared `T` is laid out at the
+  // instantiation's real argument width; must stay in step with the
+  // matching field_get/field_set in lowerFieldAccess/lowerFieldStore (#1565).
+  let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, recvTy))
+  // lowerMemberReceiver: #3862's packed-`xs[i]` case (loweraccess.bit).
+  let recv = lowerMemberReceiver(fc, mk[0], recvTy)
+  if (fc.failed) {
+    return invalidLvalue()
+  }
+  return Lvalue{
+    kind = LvKind.Field,
+    envIdx = -1,
+    recv = recv,
+    ty = fieldAccessType(fc, oc, fields[fidx], node),
+    offset = layout.offsets[fidx],
+    index = 0,
+    isSlice = false,
+    arrayLen = 0,
+  }
+}
+
+// The Tag.Index arm of resolveLvalue: a map, slice or fixed-array element.
+fn resolveLvalueIndex(fc: FnCtx, node: int, n: Node): Lvalue {
+  let k = kidsOf(fc.c.tree, node)
+  let recvTy = defaultType(fc.c, nodeType(fc, k[0]))
+  let rd = fc.c.ctx.types[recvTy]
+  if (rd.kind == TypeKind.Map) {
+    let recv = lowerExpr(fc, k[0])
+    let key = lowerExpr(fc, k[1])
+    if (fc.failed) {
+      return invalidLvalue()
+    }
+    return Lvalue{
+      kind = LvKind.MapElem,
+      envIdx = -1,
+      recv = recv,
+      ty = rd.mapVal,
+      offset = 0,
+      index = key,
+      isSlice = false,
+      arrayLen = 0,
+    }
+  }
+  let isSlice = rd.kind == TypeKind.Slice
+  // The fixed-array case is a TESTED arm, not a fallthrough (#2390) — the
+  // write-side twin of the guard #2385 put in lowerIndex. `isSlice: false`
+  // routes readLvalue/writeLvalue to `index_get`/`index_set`, raw word
+  // addressing (`base + i*width`) over an inline block, so a receiver that is
+  // not an inline block gets STORED THROUGH as if it were: measured under
+  // 0.1.8, `xs[0] += 1` on a bare `T` bound to an int segfaults, on a class
+  // it silently increments field `a`, and on a string it writes over the
+  // string object and turns "abc" into "bc". A string has no arm here on
+  // purpose — it is immutable, so `s[0] += 1` must be refused, not lowered.
+  // The checker is the layer that owes a diagnostic (#2391); until it has one
+  // the lowerer must not invent an answer.
+  if (!isSlice && rd.kind != TypeKind.Array) {
+    fcFail(
+      fc,
+      n.span,
+      "an indexed assignment to a value that is not a slice, array or map (e.g. a string, which is immutable)",
+    )
+    return invalidLvalue()
+  }
+  let recv = lowerExpr(fc, k[0])
+  let idx = lowerExpr(fc, k[1])
+  if (fc.failed) {
+    return invalidLvalue()
+  }
+  let elemTy = defaultType(fc.c, nodeType(fc, node))
+  return Lvalue{
+    kind = LvKind.Elem,
+    envIdx = -1,
+    recv = recv,
+    ty = elemTy,
+    offset = 0,
+    index = idx,
+    isSlice = isSlice,
+    // 0 for a slice (readLvalue/writeLvalue never reads it on that arm) —
+    // #4270's bounds check on the fixed-array arm needs the compile-time
+    // length, which only `rd` (the receiver's own type) carries.
+    arrayLen = rd.arrayLen,
+  }
+}
+
 // Classifies a read-modify-write target into its lvalue shape, evaluating the
 // base receiver and any index/key expression exactly once so the caller's
 // read and write share the same SSA values — `m[f()]++` must call `f` once,
@@ -49,146 +197,13 @@ fn invalidLvalue(): Lvalue {
 fn resolveLvalue(fc: FnCtx, node: int): Lvalue {
   let n = getNode(fc.c.tree, node)
   if (n.tag == Tag.Ident) {
-    let name = fc.c.source[n.span.start:n.span.end]
-    let idx = envIndex(fc, name)
-    if (idx != -1) {
-      return Lvalue{
-        kind = LvKind.Local,
-        envIdx = idx,
-        recv = 0,
-        ty = 0,
-        offset = 0,
-        index = 0,
-        isSlice = false,
-        arrayLen = 0,
-      }
-    }
-    // Not a local: a module-level `let` (§11.11). Its cell is written through
-    // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
-    let sym = moduleGlobalSym(fc, name)
-    if (sym == "") {
-      fcFail(fc, n.span, "an assignment target that is neither a local nor a module-level variable")
-      return invalidLvalue()
-    }
-    let addr = emitGlobalAddrVal(fc, sym)
-    return Lvalue{
-      kind = LvKind.Global,
-      envIdx = -1,
-      recv = addr,
-      ty = nodeType(fc, node),
-      offset = 0,
-      index = 0,
-      isSlice = false,
-      arrayLen = 0,
-    }
+    return resolveLvalueIdent(fc, node, n)
   }
   if (n.tag == Tag.Member) {
-    let mk = kidsOf(fc.c.tree, node)
-    let recvTy = nodeType(fc, mk[0])
-    if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
-      fcFail(fc, n.span, "a field assignment whose receiver is not a class")
-      return invalidLvalue()
-    }
-    let decl = structDeclOf(fc.c, recvTy)
-    if (decl == 0) {
-      fcFail(fc, n.span, "a field assignment on a class with no declaration in scope")
-      return invalidLvalue()
-    }
-    let oc = typeOwner(fc.c, recvTy)
-    let fields = structFieldNodes(oc, decl)
-    let mn = getNode(fc.c.tree, mk[1])
-    let fidx = fieldIndexByName(oc, fields, fc.c.source[mn.span.start:mn.span.end])
-    if (fidx == -1) {
-      fcFail(fc, n.span, "assignment to an unknown class field")
-      return invalidLvalue()
-    }
-    let fty = typeFromNode(oc, kidsOf(oc.tree, fields[fidx])[1])
-    // Inline-array fields are copy semantics, not a scalar lvalue — matches
-    // lowerFieldStore's deferral.
-    if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
-      fcFail(fc, n.span, "assignment to an inline-array class field")
-      return invalidLvalue()
-    }
-    // Substituted so a generic field's declared `T` is laid out at the
-    // instantiation's real argument width; must stay in step with the
-    // matching field_get/field_set in lowerFieldAccess/lowerFieldStore (#1565).
-    let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, recvTy))
-    // lowerMemberReceiver: #3862's packed-`xs[i]` case (loweraccess.bit).
-    let recv = lowerMemberReceiver(fc, mk[0], recvTy)
-    if (fc.failed) {
-      return invalidLvalue()
-    }
-    return Lvalue{
-      kind = LvKind.Field,
-      envIdx = -1,
-      recv = recv,
-      ty = fieldAccessType(fc, oc, fields[fidx], node),
-      offset = layout.offsets[fidx],
-      index = 0,
-      isSlice = false,
-      arrayLen = 0,
-    }
+    return resolveLvalueMember(fc, node, n)
   }
   if (n.tag == Tag.Index) {
-    let k = kidsOf(fc.c.tree, node)
-    let recvTy = defaultType(fc.c, nodeType(fc, k[0]))
-    let rd = fc.c.ctx.types[recvTy]
-    if (rd.kind == TypeKind.Map) {
-      let recv = lowerExpr(fc, k[0])
-      let key = lowerExpr(fc, k[1])
-      if (fc.failed) {
-        return invalidLvalue()
-      }
-      return Lvalue{
-        kind = LvKind.MapElem,
-        envIdx = -1,
-        recv = recv,
-        ty = rd.mapVal,
-        offset = 0,
-        index = key,
-        isSlice = false,
-        arrayLen = 0,
-      }
-    }
-    let isSlice = rd.kind == TypeKind.Slice
-    // The fixed-array case is a TESTED arm, not a fallthrough (#2390) — the
-    // write-side twin of the guard #2385 put in lowerIndex. `isSlice: false`
-    // routes readLvalue/writeLvalue to `index_get`/`index_set`, raw word
-    // addressing (`base + i*width`) over an inline block, so a receiver that is
-    // not an inline block gets STORED THROUGH as if it were: measured under
-    // 0.1.8, `xs[0] += 1` on a bare `T` bound to an int segfaults, on a class
-    // it silently increments field `a`, and on a string it writes over the
-    // string object and turns "abc" into "bc". A string has no arm here on
-    // purpose — it is immutable, so `s[0] += 1` must be refused, not lowered.
-    // The checker is the layer that owes a diagnostic (#2391); until it has one
-    // the lowerer must not invent an answer.
-    if (!isSlice && rd.kind != TypeKind.Array) {
-      fcFail(
-        fc,
-        n.span,
-        "an indexed assignment to a value that is not a slice, array or map (e.g. a string, which is immutable)",
-      )
-      return invalidLvalue()
-    }
-    let recv = lowerExpr(fc, k[0])
-    let idx = lowerExpr(fc, k[1])
-    if (fc.failed) {
-      return invalidLvalue()
-    }
-    let elemTy = defaultType(fc.c, nodeType(fc, node))
-    return Lvalue{
-      kind = LvKind.Elem,
-      envIdx = -1,
-      recv = recv,
-      ty = elemTy,
-      offset = 0,
-      index = idx,
-      isSlice = isSlice,
-      // 0 for a slice (readLvalue/writeLvalue never reads it on that arm) —
-      // #4270's bounds check on the fixed-array arm needs the compile-time
-      // length, which only `rd` (the receiver's own type) carries.
-      arrayLen = rd.arrayLen,
-    }
+    return resolveLvalueIndex(fc, node, n)
   }
   fcFail(fc, n.span, "an assignment target that is not a name, field or index expression")
   return invalidLvalue()
