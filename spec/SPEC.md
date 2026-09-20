@@ -1666,8 +1666,16 @@ ARM64 - never an out-of-line call, so a spin/CAS loop stays call-free.
 
 A `*T` for these ops comes from `ptrOf(s: []T): *T` - the address of slice `s`'s
 first element - the one bridge from traced memory to a raw pointer (Bit has no
-`&`). The slice keeps its backing storage alive, so the pointer stays valid for
-as long as the slice is reachable.
+`&`). The slice keeps its backing storage alive, and the compiler keeps the
+slice reachable on the pointer's behalf, not the caller: the slice stays alive
+for as long as the pointer's own value is live at the point it was computed,
+and, when `ptrOf(s)` is written directly as a class field's initializer in a
+composite literal (`X{ f = ptrOf(s) }`, §12.2), for as long as that object
+stays reachable. A pointer that instead flows through an intermediate binding
+before it is stored, is assigned through a selector (`obj.f = ptrOf(s)`), is
+stored into an array or slice element, or is passed to a function that stores
+it, is not yet covered by this guarantee - treat the slice's own liveness as
+the program's responsibility there.
 
 ```
 let cell = []i64(1)                        // one shared word, kept alive here
