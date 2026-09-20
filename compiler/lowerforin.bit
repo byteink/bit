@@ -55,6 +55,24 @@ fn rejectForInBinderShape(fc: FnCtx, binderNode: Node, k: []int, isMap: bool): b
   return false
 }
 
+// The block ids and loop-invariant state `lowerForInHeader`/
+// `lowerForInStepExit` need — bundled purely to keep those two functions
+// under spec/LINT.md's E0202 param limit (5) after being split out of
+// `lowerForIn` (#2450) to fit E0201's 80-line limit. One allocation per
+// `for … in` loop LOWERED at compile time, never per runtime iteration.
+class ForInLoopCtx {
+  id: Type,
+  isMap: bool,
+  i64ty: int,
+  preLen: int,
+  idxSlot: int,
+  iterSlot: int,
+  header: int,
+  bodyBlk: int,
+  stepBlk: int,
+  exitBlk: int,
+}
+
 fn lowerForIn(fc: FnCtx, node: int) {
   // #5670: the body may run zero, one or many times (lowerkeepalive.bit's
   // banner).
@@ -82,6 +100,44 @@ fn lowerForIn(fc: FnCtx, node: int) {
   }
   // Carry the iterable + cursor as hidden locals so they thread through the
   // loop's block params — identical setup to lowerForOf's.
+  let ctx = lowerForInSetupLoop(fc, iterVal, iterTy, i64ty, id)
+  lowerForInHeader(fc, ctx)
+  // Body: bind the cursor itself — the index for a slice/array, the key for a
+  // map — then run the body and fall to the step.
+  let idxVal = fc.env[ctx.idxSlot].value
+  let iterCur = fc.env[ctx.iterSlot].value
+  fc.loops = append(
+    fc.loops,
+    LoopFrame{
+      exit = ctx.exitBlk,
+      cont = ctx.stepBlk,
+      preLen = ctx.preLen,
+      isSwitch = false,
+      exitUsed = false,
+    },
+  )
+  builderBeginBlock(fc.b, ctx.bodyBlk)
+  fc.terminated = false
+  let bodyMark = len(fc.env)
+  lowerForInBindCursor(
+    fc, binderNode, k,
+    ForInBindCtx{ id = id, isMap = ctx.isMap, iterCur = iterCur, idxVal = idxVal, i64ty = i64ty },
+  )
+  lowerStmtList(fc, k[2])
+  truncateEnv(fc, bodyMark)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  if (!fc.terminated) {
+    emitJump(fc, ctx.stepBlk, snapshotValues(fc, ctx.preLen))
+  }
+  builderEndBlock(fc.b)
+  lowerForInStepExit(fc, ctx)
+}
+
+// Declares the loop's hidden `$iter`/`$idx` locals, allocates its four block
+// ids, and threads the result into a `ForInLoopCtx` — split out of
+// `lowerForIn` purely to fit E0201's 80-line limit.
+fn lowerForInSetupLoop(fc: FnCtx, iterVal: int, iterTy: int, i64ty: int, id: Type): ForInLoopCtx {
+  let isMap = id.kind == TypeKind.Map
   declareLocal(fc, "$iter", iterVal, iterTy)
   let startV = 0
   if (isMap) {
@@ -103,25 +159,34 @@ fn lowerForIn(fc: FnCtx, node: int) {
   let exitBlk = builderNewBlock(fc.b)
   emitJump(fc, header, snapshotValues(fc, preLen))
   builderEndBlock(fc.b)
-  // Header: the same test lowerForOf's uses — a map continues while the slot
-  // cursor is >= 0; a slice/array while the index is below the length.
-  builderBeginBlock(fc.b, header)
-  addJoinParams(fc, preLen)
-  let idxVal = fc.env[idxSlot].value
-  let iterCur = fc.env[iterSlot].value
+  return ForInLoopCtx{
+    id = id, isMap = isMap, i64ty = i64ty, preLen = preLen,
+    idxSlot = idxSlot, iterSlot = iterSlot,
+    header = header, bodyBlk = bodyBlk, stepBlk = stepBlk, exitBlk = exitBlk,
+  }
+}
+
+// The loop-condition test block for `lowerForIn` — the same shape
+// `lowerForOf` uses (map: cursor >= 0; slice/array: index < length) — split
+// out purely to fit E0201's 80-line limit.
+fn lowerForInHeader(fc: FnCtx, ctx: ForInLoopCtx) {
+  builderBeginBlock(fc.b, ctx.header)
+  addJoinParams(fc, ctx.preLen)
+  let idxVal = fc.env[ctx.idxSlot].value
+  let iterCur = fc.env[ctx.iterSlot].value
   let cmp = mkInstr(Op.ICmpSge, primType(fc.c.ctx, 10))
-  if (isMap) {
-    let z = mkInstr(Op.ConstInt, i64ty)
+  if (ctx.isMap) {
+    let z = mkInstr(Op.ConstInt, ctx.i64ty)
     cmp.lhs = idxVal
     cmp.rhs = builderEmit(fc.b, z)
   } else {
     let lenVal = 0
-    if (id.kind == TypeKind.Array) {
-      let ci = mkInstr(Op.ConstInt, i64ty)
-      ci.ival = id.arrayLen
+    if (ctx.id.kind == TypeKind.Array) {
+      let ci = mkInstr(Op.ConstInt, ctx.i64ty)
+      ci.ival = ctx.id.arrayLen
       lenVal = builderEmit(fc.b, ci)
     } else {
-      let sl = mkInstr(Op.SliceLen, i64ty)
+      let sl = mkInstr(Op.SliceLen, ctx.i64ty)
       sl.lhs = iterCur
       lenVal = builderEmit(fc.b, sl)
     }
@@ -131,63 +196,42 @@ fn lowerForIn(fc: FnCtx, node: int) {
   }
   let br = mkInstr(Op.Br, fc.c.ctx.voidId)
   br.lhs = builderEmit(fc.b, cmp)
-  br.ival = bodyBlk
+  br.ival = ctx.bodyBlk
   br.thenArgs = []int(0)
-  br.ival2 = exitBlk
-  br.elseArgs = snapshotValues(fc, preLen)
+  br.ival2 = ctx.exitBlk
+  br.elseArgs = snapshotValues(fc, ctx.preLen)
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
-  // Body: bind the cursor itself — the index for a slice/array, the key for a
-  // map — then run the body and fall to the step.
-  fc.loops = append(
-    fc.loops,
-    LoopFrame{
-      exit = exitBlk,
-      cont = stepBlk,
-      preLen = preLen,
-      isSwitch = false,
-      exitUsed = false,
-    },
-  )
-  builderBeginBlock(fc.b, bodyBlk)
-  fc.terminated = false
-  let bodyMark = len(fc.env)
-  lowerForInBindCursor(
-    fc, binderNode, k,
-    ForInBindCtx{ id = id, isMap = isMap, iterCur = iterCur, idxVal = idxVal, i64ty = i64ty },
-  )
-  lowerStmtList(fc, k[2])
-  truncateEnv(fc, bodyMark)
-  fc.loops = fc.loops[0:len(fc.loops) - 1]
-  if (!fc.terminated) {
-    emitJump(fc, stepBlk, snapshotValues(fc, preLen))
-  }
-  builderEndBlock(fc.b)
-  // Step: advance the cursor (map: next live slot; slice/array: +1), back to
-  // the header — identical to lowerForOf's.
-  builderBeginBlock(fc.b, stepBlk)
-  addJoinParams(fc, preLen)
-  if (isMap) {
-    let nx = mkInstr(Op.RtCall, i64ty)
+}
+
+// Advances the cursor (map: next live slot; slice/array: +1) and re-enters
+// the header — identical to `lowerForOf`'s step — then closes the loop's
+// env slots at exit. Split out of `lowerForIn` alongside `lowerForInHeader`
+// for the same E0201-fit reason.
+fn lowerForInStepExit(fc: FnCtx, ctx: ForInLoopCtx) {
+  builderBeginBlock(fc.b, ctx.stepBlk)
+  addJoinParams(fc, ctx.preLen)
+  if (ctx.isMap) {
+    let nx = mkInstr(Op.RtCall, ctx.i64ty)
     nx.name = "map_iter_next"
-    nx.args = [fc.env[iterSlot].value, fc.env[idxSlot].value]
-    fc.env[idxSlot].value = emitRtCall(fc, nx)
+    nx.args = [fc.env[ctx.iterSlot].value, fc.env[ctx.idxSlot].value]
+    fc.env[ctx.idxSlot].value = emitRtCall(fc, nx)
   } else {
-    let one = mkInstr(Op.ConstInt, i64ty)
+    let one = mkInstr(Op.ConstInt, ctx.i64ty)
     one.ival = 1
-    let add = mkInstr(Op.Add, i64ty)
-    add.lhs = fc.env[idxSlot].value
+    let add = mkInstr(Op.Add, ctx.i64ty)
+    add.lhs = fc.env[ctx.idxSlot].value
     add.rhs = builderEmit(fc.b, one)
-    fc.env[idxSlot].value = builderEmit(fc.b, add)
+    fc.env[ctx.idxSlot].value = builderEmit(fc.b, add)
   }
-  emitJump(fc, header, snapshotValues(fc, preLen))
+  emitJump(fc, ctx.header, snapshotValues(fc, ctx.preLen))
   builderEndBlock(fc.b)
   // Exit.
-  builderBeginBlock(fc.b, exitBlk)
-  addJoinParams(fc, preLen)
+  builderBeginBlock(fc.b, ctx.exitBlk)
+  addJoinParams(fc, ctx.preLen)
   fc.terminated = false
   // Drop the hidden $iter/$idx locals.
-  truncateEnv(fc, preLen - 2)
+  truncateEnv(fc, ctx.preLen - 2)
 }
 
 // The loop-invariant values `lowerForInBindCursor`/`lowerForInPairBinder`
