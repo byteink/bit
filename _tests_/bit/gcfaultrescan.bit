@@ -1,0 +1,276 @@
+// `./make test-gc-fault-rescan` (#5671, follow-up to #5624). Runs #5624's own
+// hand-verified recipe mechanically instead of by hand: scratch-copy
+// `runtime/`, flip `gcFaultInjectEnabled` to `true` in the COPY only, build
+// the archive through `BIT_G2ARCHIVE_RT` (`scripts/g2archive.sh`), symlink
+// `_tests_` alongside the flipped copy so the fixture's own relative
+// `"../../../runtime/gc"` import resolves into the SAME scratch tree, run
+// `_tests_/stress/gcbit/gcbit.bit` against it, and assert the debug line:
+// `recoverOverflow lost=0 checked=<non-zero> stacklen_before=<n>
+// stacklen_after=<n>` with the two stack lengths EQUAL — that equality is
+// what proves `growMarkStack`'s replacement buffer really failed (the rescan
+// ran) rather than the probe quietly exercising growth a second time.
+//
+// THE TRAP THIS EXISTS TO CLOSE, not merely avoid: `BIT_LIBBITRT` alone
+// links the right archive but does not stop the fixture's own compile from
+// resolving its relative import against the checkout's `false` source and
+// folding the whole `gcFaultArmNextHeapAlloc` call away before the linked
+// archive is ever consulted — a debug archive linked but never exercised,
+// reading as a pass while testing nothing. The symlink below is what closes
+// it; both `runtime/gc/gcfaultcfg.bit` and this fixture's own header
+// document the same mechanism.
+//
+// NOT part of the default `./make test`: registered in
+// `tools/build/defs.bit`'s `coreSteps()`, not `gateSteps()` — same shape as
+// `test-stage0override`/`test-windows-smoke`/`test-coldboot`, every other
+// gate in this repo that builds a runtime archive from a scratch tree rather
+// than reading the one `./make libbitrt` already built. Measured cost
+// (#5671, this ticket): scratch copy of `runtime/` <0.1s, one
+// `BIT_G2ARCHIVE_RT` archive build ~5s, one `bit run` of the fixture ~1s —
+// around 6s total, not free enough to add silently to every routine run.
+//
+// Nothing under `bit-out/` or the checkout is written by this program: every
+// mutated path is under a fresh `$TMPDIR` scratch directory, and the
+// symlink it creates only ever points INTO the checkout, never writes to it.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, writeFile } from "std/fs"
+import { count, hasPrefix, parseInt, replace, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Generous for one scratch archive build plus one run; see this file's own
+// header for the measured ~6s.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "120")) catch _ {
+    120
+  }
+  if (s <= 0) {
+    return 120000
+  }
+  return s * 1000
+}
+
+// BIT_REPO IS REQUIRED, same reason as every other shell-out gate in this
+// repo (_tests_/bit/coldboot.bit's header): a silent "." default would copy
+// and archive whatever directory `bit` happened to be invoked from.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("gcfaultrescan: BIT_REPO is not set — run this through `./make test-gc-fault-rescan`")
+  }
+  return r
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel, never a program's exit status
+// (ABI.md §19) — same shape as _tests_/bit/coldboot.bit's `shell()`.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("gcfaultrescan: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("gcfaultrescan: TIMED OUT after ${ms}ms — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("gcfaultrescan: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("gcfaultrescan: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// Runs `script`, recording ITS OWN command's exit code to `codePath` — same
+// wrapper shape as _tests_/bit/windowssmoke.bit's `runCaptured`, so a named
+// setup failure (an `exit N` inside `script`) is never confused with the
+// command under test failing.
+fn runCaptured(scratch: string, tag: string, script: string, ms: int): (int, string) {
+  let outPath = "${scratch}/${tag}.out"
+  let codePath = "${scratch}/${tag}.code"
+  let wrapped = "#!/bin/sh\n{\n" +
+    script +
+    "\n} > '${outPath}' 2>&1\necho $? > '${codePath}'\nexit 0\n"
+  let wrapperRc = shell("${scratch}/${tag}.sh", wrapped, ms) catch e {
+    panic("gcfaultrescan: ${e.message()}")
+    0
+  }
+  if (wrapperRc != 0) {
+    panic("gcfaultrescan: ${tag} wrapper script exited ${wrapperRc}, which it never should")
+  }
+  if (!exists(codePath)) {
+    panic("gcfaultrescan: no exit code recorded for '${tag}' — it never ran")
+  }
+  let codeText = trimSpace(
+    readFile(codePath) catch e {
+      panic("gcfaultrescan: cannot read ${codePath}: ${e.message()}")
+      ""
+    },
+  )
+  let code = parseInt(codeText) catch _ {
+    panic("gcfaultrescan: ${codePath} did not contain a number: '${codeText}'")
+    0 - 1
+  }
+  let out = readFile(outPath) catch ""
+  return code, out
+}
+
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ {
+    return
+  }
+}
+
+// Stage 1: `cp -R runtime` into a scratch copy and symlink `_tests_`
+// alongside it, so the fixture's own relative import resolves into the SAME
+// scratch tree — the trap this file's header and gcfaultcfg.bit's own header
+// both document.
+fn stageCopy(root: string, scratch: string, ms: int): string {
+  let repo = "${scratch}/repo"
+  let script = "cd '${root}' || exit 90\n" +
+    "mkdir -p '${repo}' || exit 91\n" +
+    "cp -R runtime '${repo}/runtime' || exit 92\n" +
+    "ln -s '${root}/_tests_' '${repo}/_tests_' || exit 93\n"
+  let (code, out) = runCaptured(scratch, "copy", script, ms)
+  if (code != 0) {
+    eprint(out)
+    panic("gcfaultrescan: scratch-copy stage exited ${code}")
+  }
+  return repo
+}
+
+// Stage 2: flip `gcFaultInjectEnabled` to `true` in the SCRATCH COPY only —
+// never the checkout. Asserts the source line it is replacing occurs exactly
+// once, so a future rename of the const silently no-ops this instead of
+// flipping nothing and reading as a pass.
+fn flipFaultConst(repo: string) {
+  let path = "${repo}/runtime/gc/gcfaultcfg.bit"
+  let src = readFile(path) catch e {
+    panic("gcfaultrescan: cannot read ${path}: ${e.message()}")
+    ""
+  }
+  let want = "gcFaultInjectEnabled: bool = false"
+  let n = count(src, want)
+  if (n != 1) {
+    panic("gcfaultrescan: expected exactly one '${want}' in ${path}, found ${n} — has gcfaultcfg.bit changed shape?")
+  }
+  let flipped = replace(src, want, "gcFaultInjectEnabled: bool = true")
+  writeFile(path, flipped) catch e {
+    panic("gcfaultrescan: cannot write ${path}: ${e.message()}")
+  }
+}
+
+// Stage 3: build the debug archive through BIT_G2ARCHIVE_RT, targeting
+// whichever OS/arch this host actually is — same case arms as
+// tools/build/artifacts.bit's own hostTriple(), POSIX sh (no zsh-isms) to
+// match scripts/g2archive.sh's own convention.
+fn stageArchive(root: string, bin: string, repo: string, scratch: string, ms: int): string {
+  let archivePath = "${scratch}/libbitrt-debug.a"
+  let script = "cd '${root}' || exit 90\n" +
+    "case \"$(uname -s)-$(uname -m)\" in\n" +
+    "  Darwin-arm64) TARGET=aarch64-macos ;;\n" +
+    "  Linux-aarch64|Linux-arm64) TARGET=aarch64-linux ;;\n" +
+    "  Linux-x86_64) TARGET=x86_64-linux ;;\n" +
+    "  *) echo \"gcfaultrescan: unsupported host $(uname -s)-$(uname -m)\" >&2; exit 91 ;;\n" +
+    "esac\n" +
+    "BIT_G2ARCHIVE_RT='${repo}/runtime' BIT='${bin}' bash scripts/g2archive.sh \"$TARGET\" '${archivePath}' || exit 92\n"
+  let (code, out) = runCaptured(scratch, "archive", script, ms)
+  if (code != 0) {
+    eprint(out)
+    panic("gcfaultrescan: debug-archive build stage exited ${code}")
+  }
+  return archivePath
+}
+
+// Stage 4: run the fixture linked against the debug archive — the fixture
+// path itself is inside the scratch tree (via the Stage 1 symlink), so its
+// own compile reads runtime/gc's SOURCE from the same flipped copy the
+// archive was built from.
+fn stageRun(bin: string, repo: string, archivePath: string, scratch: string, ms: int): string {
+  let fixture = "${repo}/_tests_/stress/gcbit/gcbit.bit"
+  let script = "BIT_LIBBITRT='${archivePath}' '${bin}' run '${fixture}'\n"
+  let (code, out) = runCaptured(scratch, "run", script, ms)
+  if (code != 0) {
+    eprint(out)
+    panic("gcfaultrescan: debug-linked gcbit run exited ${code}, want 0")
+  }
+  return out
+}
+
+// First line with the given prefix, or "" if none exists.
+fn findLine(lines: []string, prefix: string): string {
+  let i = 0
+  while (i < len(lines)) {
+    if (hasPrefix(lines[i], prefix)) {
+      return lines[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// The value of `key=` in a space-separated `key=value ...` line.
+fn fieldInt(line: string, key: string): int {
+  let fields = split(line, " ")
+  let i = 0
+  while (i < len(fields)) {
+    let kv = split(fields[i], "=")
+    if (len(kv) == 2 && kv[0] == key) {
+      return parseInt(kv[1]) catch _ {
+        panic("gcfaultrescan: field '${key}' in line is not a number: ${line}")
+        0 - 1
+      }
+    }
+    i = i + 1
+  }
+  panic("gcfaultrescan: field '${key}' not found in line: ${line}")
+  return 0 - 1
+}
+
+// The discriminator: `lost=0` over a non-zero `checked=`, with
+// `stacklen_before` EQUAL to `stacklen_after`. Equal widths are what prove
+// the replacement buffer's allocation really failed (the rescan ran) rather
+// than the probe quietly exercising growth a second time and reading as a
+// pass. Never asserts on exit code alone — stageRun already checked that.
+fn assertRescanLine(out: string) {
+  let line = findLine(split(out, "\n"), "recoverOverflow ")
+  if (len(line) == 0) {
+    eprint(out)
+    println("gcfaultrescan: FAIL — no 'recoverOverflow ' line in the debug-linked run's output")
+    exit(1)
+  }
+  let lost = fieldInt(line, "lost")
+  let checked = fieldInt(line, "checked")
+  let before = fieldInt(line, "stacklen_before")
+  let after = fieldInt(line, "stacklen_after")
+  if (lost != 0 || checked <= 0 || before != after) {
+    println("gcfaultrescan: FAIL — want lost=0 checked=<non-zero> stacklen_before==stacklen_after, got: ${line}")
+    exit(1)
+  }
+  println("gcfaultrescan: PASS — ${line}")
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let bin = "${root}/bit-out/bin/bit"
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-gcfaultrescan-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("gcfaultrescan: cannot create ${scratch}: ${e.message()}")
+  }
+
+  let repo = stageCopy(root, scratch, ms)
+  flipFaultConst(repo)
+  let archivePath = stageArchive(root, bin, repo, scratch, ms)
+  let out = stageRun(bin, repo, archivePath, scratch, ms)
+
+  teardown(scratch, ms)
+  assertRescanLine(out)
+}
