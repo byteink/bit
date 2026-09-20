@@ -10,6 +10,151 @@
 // Named to sort after compiler/x64select.bit — module files concatenate in
 // bytewise filename order (compiler/project.bit:7).
 
+// ---- #5655: the constant-offset displacement fold ---------------------------
+// Which address-forming `add`s emit nothing because the memory access that
+// consumes them carries the constant in its ModRM disp32 instead. Kept next to
+// the emitters that read the answer rather than beside the other skip map in
+// compiler/x64dispatch.bit, which was at 806 lines against the 800-line E0200
+// ceiling; `xUseCounts` and `xSkipWhenEveryUseFolds` stay there, shared.
+
+// #5655: address-forming `add`s that emit NOTHING because every use of them is
+// a memory access that carries the constant in its ModRM disp32 instead.
+// Indexed by instruction id, read by `xEmitInst` (x64dispatch.bit, which skips
+// the add) and by `xMemAddrOf` below, which rebuilds the operand from the add's
+// own base. Same bookkeeping as `xComputeSkipConstMaterialize`
+// (x64dispatch.bit) and the same hazard: under-naming costs an `addq`,
+// over-naming leaves a memory access reading a register nothing ever wrote.
+fn xComputeSkipAddrFold(ctx: TypeContext, f: IrFunc, debug: bool): []bool {
+  let n = len(f.instrs)
+  let foldCount = []int(n)
+  let i = 0
+  while (i < n) {
+    let p = xAddrFoldPtrOperand(ctx, f, i, debug)
+    if (p >= 0) {
+      foldCount[p] = foldCount[p] + 1
+    }
+    i = i + 1
+  }
+  return xSkipWhenEveryUseFolds(xUseCounts(f), foldCount)
+}
+
+// `cx.skipAddr` for `v`. The selector self-checks build an XCtx by hand and
+// leave the map empty, which reads as "nothing folds" — the conservative answer
+// and the one a fixture pinning an unfolded encoding wants. The assert is what
+// keeps that from covering for a production mis-sizing: any map that is neither
+// empty nor exactly one entry per instruction is a bug, not a fixture.
+fn xSkipsAddr(cx: XCtx, v: int): bool {
+  if (len(cx.skipAddr) != len(cx.f.instrs)) {
+    assert(len(cx.skipAddr) == 0, "skipAddr must be empty or one entry per instruction")
+    return false
+  }
+  return cx.skipAddr[v]
+}
+
+// The pointer operand of the memory access at `i` that folds into its disp32,
+// or -1. The one predicate both readers of `skipAddr` consult, for the reason
+// `xImmFoldConstOperand` is one predicate: an emitter folding an operand this
+// function did not name — or declining one it did — is a miscompile that no
+// register is left holding evidence of.
+//
+// Five conditions, each of them load-bearing:
+//
+//  1. `xMemOpFoldsPtr` restricts this to the four emitters that actually call
+//     `xMemAddrOf` below. Adding an op here without changing its emitter is the
+//     over-naming failure above.
+//  2. `ins.lhs == i - 1` — ADJACENCY, and it is the liveness argument, not a
+//     tidiness one. The allocator sees the `add`'s base die at the `add` when
+//     that is its last use, so with any instruction in between the base's
+//     register may already have been handed to something else by the time the
+//     load runs. Adjacent, the only thing emitted between the two is the `add`
+//     itself, which this fold deletes. Same-block comes free: a block's last
+//     instruction is always a terminator, never an `add`.
+//  3. 64-bit int width. The displacement is added by the ADDRESSING unit at
+//     full width with no wrap, so folding a narrower `add` — whose result
+//     `xCanonNarrow` would have truncated — would address somewhere else.
+//  4. A `const_int` rhs inside the signed imm32 window, checked BEFORE the
+//     offset is added to it so the sum itself cannot overflow. Only the rhs:
+//     `xConstIntOf` on the lhs would need the base on the right, and lower.bit
+//     puts the pointer there already.
+//  5. `debug` refuses outright. A debug build's `add` carries an overflow trap
+//     (`xMaybeOverflowTrap`, x64selectovf.bit); deleting the `add` would delete
+//     the check with it, and a fold is never worth a lost trap.
+//
+// Not a condition, but the reason one is not needed: the `add` this deletes can
+// never be a GC root. `isRefType` (codegen.bit) is false for every type an
+// `Op.Add` can produce, and in any case condition 2 leaves its live range one
+// instruction long with no safepoint inside it, so no stack map can name it.
+fn xAddrFoldPtrOperand(ctx: TypeContext, f: IrFunc, i: int, debug: bool): int {
+  if (debug || !xMemOpFoldsPtr(f.instrs[i].op)) {
+    return -1
+  }
+  let p = f.instrs[i].lhs
+  if (p != i - 1 || f.instrs[p].op != Op.Add) {
+    return -1
+  }
+  let w = widthOf(ctx, f.instrs[p].ty)
+  if (w.regClass != RegClass.Int || w.bytes != 8) {
+    return -1
+  }
+  let c = xConstIntOf(f, f.instrs[p].rhs)
+  if (!c.known || !fitsXArithImm32(c.ival)) {
+    return -1
+  }
+  if (!fitsXArithImm32(xMemOpConstOffset(f.instrs[i]) + c.ival)) {
+    return -1
+  }
+  return p
+}
+
+// The ops whose emitters address through `xMemAddrOf` and so can carry a folded
+// displacement: the plain field load/store and the two atomic forms that take
+// the same base (SPEC §11.5). This list and those four emitters are one fact
+// written twice; nothing else may join it without joining them.
+//
+// `Op.SliceLen` and the header/array arms of `Op.FieldGet` are absent on
+// purpose rather than by oversight — see `xMemAddrOf`'s header for why they
+// could not fold even if they were listed.
+fn xMemOpFoldsPtr(op: Op): bool {
+  return op == Op.FieldGet || op == Op.FieldSet || op == Op.AtomicLoad || op == Op.AtomicStore
+}
+
+// The constant byte offset `ins` already carries in its memory operand, which
+// the folded `add`'s constant is added to. `ival` is the field offset for both
+// field ops; an atomic dereferences its pointer at zero.
+fn xMemOpConstOffset(ins: IrInstr): int {
+  if (ins.op == Op.FieldGet || ins.op == Op.FieldSet) {
+    return ins.ival
+  }
+  return 0
+}
+
+// The memory operand a field or atomic access addresses through: `ptr`'s own
+// register plus `offset`, or — when `cx.skipAddr` says the `add` that defines
+// `ptr` is never materialized (#5655) — that add's BASE register plus
+// `offset + k`. One `movq base,tmp` and one `addq $k,tmp` become nothing, and
+// the disp32 the load already spent four zero bytes on carries the constant.
+//
+// The base always comes back through `xGetInt`, so it is the base VREG's own
+// home register (or a reload of its spill slot). It is never `ptr`'s allocated
+// register: that register is exactly what the skipped `add` would have written
+// and now holds whatever was there before.
+//
+// `xAddrFoldPtrOperand` above is what decides; this function only reads its
+// answer, and the two must name the same four ops. Two arms of
+// `xEmitFieldGet` below call this and could not fold even so, which is why they
+// need no guard of their own: the array arm needs the result type to be
+// `TypeKind.Array` and the header arm needs the BASE's type to be a slice or a
+// string, and an `Op.Add` produces neither — so `f.instrs[ptr].op != Op.Add`
+// has already refused both before `skipAddr` is consulted.
+fn xMemAddrOf(cx: XCtx, ptr: int, offset: int, scratch: XReg64): XMem {
+  if (!xSkipsAddr(cx, ptr)) {
+    return xMemB(xGetInt(cx, ptr, scratch), offset)
+  }
+  let add = cx.f.instrs[ptr]
+  let k = constIntValue(cx.f.instrs[add.rhs])
+  return xMemB(xGetInt(cx, add.lhs, scratch), offset + k)
+}
+
 // `dst = base.field`. `base` is already the GC body pointer (runtime/ABI.md §1:
 // codegen never sees the header), so `offset` is a plain byte offset with no
 // header adjustment.
@@ -30,10 +175,11 @@ fn xEmitFieldGet(
   isArray: bool,
   isSliceBase: bool,
 ) {
-  let baseReg = xGetInt(cx, base, xScratch2())
+  let m = xMemAddrOf(cx, base, offset, xScratch2())
+  let baseReg = m.base
   if (isArray) {
     let lacc = xIntAcc(cx, dst)
-    xLea(cx.buf, lacc, baseReg, offset)
+    xLea(cx.buf, lacc, baseReg, m.disp)
     xPutInt(cx, dst, lacc)
     return
   }
@@ -41,20 +187,20 @@ fn xEmitFieldGet(
   // header must read as 0 here exactly as it does for len (#1564). Keyed on the
   // base's own type, so a class field read is untouched and pays nothing.
   if (isSliceBase) {
-    xEmitHeaderWordOrZero(cx, baseReg, offset)
+    xEmitHeaderWordOrZero(cx, baseReg, m.disp)
     xPutInt(cx, dst, xScratch1())
     return
   }
   if (w.regClass == RegClass.Int) {
     let acc = xIntAcc(cx, dst)
-    xMovLoad(cx.buf, acc, xMemB(baseReg, offset), w.bytes, w.signed)
+    xMovLoad(cx.buf, acc, m, w.bytes, w.signed)
     xPutInt(cx, dst, acc)
     return
   }
   // #3171: load straight into dst's own register when it has one. The address
   // is already in an INT register, so no float operand is pending.
   let facc = xFloatAcc(cx, dst, xFScratch1())
-  xMovFLoad(cx.buf, facc, xMemB(baseReg, offset), w.bytes)
+  xMovFLoad(cx.buf, facc, m, w.bytes)
   xPutFloat(cx, dst, facc)
 }
 
@@ -62,14 +208,14 @@ fn xEmitFieldGet(
 // primary stays free for the value — fetching both into the same scratch would
 // have the second overwrite the first.
 fn xEmitFieldSet(cx: XCtx, base: int, offset: int, value: int, w: Width) {
-  let baseReg = xGetInt(cx, base, xScratch2())
+  let m = xMemAddrOf(cx, base, offset, xScratch2())
   if (w.regClass == RegClass.Int) {
     let v = xGetInt(cx, value, xScratch1())
-    xMovStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
+    xMovStore(cx.buf, m, v, w.bytes)
     return
   }
   let v = xGetFloat(cx, value, xFScratch1())
-  xMovFStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
+  xMovFStore(cx.buf, m, v, w.bytes)
 }
 
 // ---- atomics (§11.5) -------------------------------------------------------
@@ -77,9 +223,12 @@ fn xEmitFieldSet(cx: XCtx, base: int, offset: int, value: int, w: Width) {
 // `lock`-prefixed forms are seq-cst regardless of the requested ordering.
 
 fn xEmitAtomicLoad(cx: XCtx, dst: int, ptr: int, w: Width) {
-  let base = xGetInt(cx, ptr, xScratch2())
+  // #5655's displacement fold is pure ADDRESSING: which bytes this reads is
+  // unchanged, and the instruction is the same plain `mov`, so the ordering
+  // argument above is untouched.
+  let m = xMemAddrOf(cx, ptr, 0, xScratch2())
   let acc = xIntAcc(cx, dst)
-  xMovLoad(cx.buf, acc, xMemB(base, 0), w.bytes, w.signed) // plain load is acquire on x86-TSO
+  xMovLoad(cx.buf, acc, m, w.bytes, w.signed) // plain load is acquire on x86-TSO
   xPutInt(cx, dst, acc)
 }
 
@@ -113,10 +262,13 @@ fn xEmitAtomicLoad(cx: XCtx, dst: int, ptr: int, w: Width) {
 // allocatable (`xMasterGprs` omits r10/r11/r12), so this can collide with
 // nothing.
 fn xEmitAtomicStore(cx: XCtx, ptr: int, value: int, w: Width) {
-  let base = xGetInt(cx, ptr, xScratch2())
+  // #5655's displacement fold reaches here too. It is an ADDRESSING change and
+  // only that: the instruction stays the same implicitly-locked `XCHG`, so
+  // every word above about what this orders still holds verbatim.
+  let m = xMemAddrOf(cx, ptr, 0, xScratch2())
   let val = xGetInt(cx, value, xScratch1())
   xMovRR(cx.buf, xScratch1(), val) // encodes nothing when `val` already IS the scratch
-  xXchgMem(cx.buf, xScratch1(), base, w.bytes)
+  xXchgMem(cx.buf, xScratch1(), m, w.bytes)
 }
 
 // `ptr`/`expected`/`desired`/`w` bundled so `xEmitAtomicCmpxchg` stays under
@@ -158,7 +310,7 @@ fn xEmitAtomicRmw(cx: XCtx, op: Op, dst: int, ptr: int, operand: int, w: Width) 
       xNegR(cx.buf, xScratch1()) // fetch-and-sub == fetch-and-add(-v)
       xLockXaddMem(cx.buf, xScratch1(), base, w.bytes)
     } else {
-      xXchgMem(cx.buf, xScratch1(), base, w.bytes)
+      xXchgMem(cx.buf, xScratch1(), xMemB(base, 0), w.bytes)
     }
   } else {
     let oper = xGetInt(cx, operand, xScratch3())
