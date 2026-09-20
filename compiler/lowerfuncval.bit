@@ -111,6 +111,92 @@ fn closureExprReturn(cfc: FnCtx, body: int, resultTy: int) {
   builderEmit(cfc.b, rt)
 }
 
+// The three values lowerClosureParams computes together, since every one of
+// them is read by lowerClosureBody after the param loop: the env block param
+// (captures are unpacked against it), the per-declared-param block-param ids,
+// and the full param-type list the closure's IrFunc is built with.
+class ClosureParamBind {
+  envParam: int,
+  paramIds: []int,
+  allParams: []int,
+}
+
+// Adds the closure's block params (env first, then each declared param) and
+// binds each declared param to its FnCtx local. Split out of lowerClosureBody
+// (E0201): this is compile-time lowering setup, not a runtime hot path, so
+// returning the three results as one class costs one allocation per closure
+// synthesized rather than per call.
+fn lowerClosureParams(
+  fc: FnCtx,
+  cfc: FnCtx,
+  ft: Type,
+  closureTy: int,
+  pnodes: []int,
+): ClosureParamBind {
+  // `cfc.b` is the same builder lowerClosureBody created — cfc is built with
+  // `b = b` before this is called, so there is no separate builder to thread.
+  let envParam = builderAddParam(cfc.b, closureTy)
+  let allParams = [closureTy]
+  // Params first, then their bindings: a boxed param's `declareLocal` emits its
+  // cell's `gc_alloc`, and a block's params must all precede its instructions.
+  let paramIds = []int(0)
+  let i = 0
+  while (i < len(pnodes)) {
+    paramIds = append(paramIds, builderAddParam(cfc.b, ft.members[i]))
+    allParams = append(allParams, ft.members[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < len(pnodes)) {
+    let pn = getNode(fc.c.tree, kidsOf(fc.c.tree, pnodes[i])[0])
+    let pname = fc.c.source[pn.span.start:pn.span.end]
+    declareLocal(cfc, pname, paramIds[i], ft.members[i])
+    fc.c.env[pname] = ft.members[i]
+    i = i + 1
+  }
+  return ClosureParamBind{ envParam = envParam, paramIds = paramIds, allParams = allParams }
+}
+
+// Unpacks each capture from the closure env object (field_get word i) into
+// cfc's locals. Split out of lowerClosureBody (E0201): a self-contained loop
+// over caps/layout with no return value, only side effects on cfc/fc that
+// lowerClosureBody already owns.
+fn lowerClosureCaptures(
+  fc: FnCtx,
+  cfc: FnCtx,
+  caps: CaptureSet,
+  layout: StructLayout,
+  envParam: int,
+) {
+  // A boxed capture's slot holds the CELL POINTER, and the body keeps it boxed:
+  // that is what makes a write in here land in the cell the enclosing frame and
+  // every sibling closure read.
+  let slotTypes = captureSlotTypes(caps)
+  let i = 0
+  while (i < len(caps.names)) {
+    // #5429: the read-side twin of the env-packing fix above. A decimal
+    // capture's slot is 16 inline bytes; read its two i64 words back and
+    // rebox them into the two-word tuple every decimal VALUE is, the same
+    // shape `tupleElem` (lowertuple.bit) now uses for a boxed local's cell.
+    let capVal = 0
+    if (isDecimalPrim(fc.c.ctx, slotTypes[i])) {
+      capVal = buildTuple(
+        cfc,
+        decimalTupleType(cfc.c.ctx),
+        decimalFieldWords(cfc, envParam, layout.offsets[i]),
+      )
+    } else {
+      let fg = mkInstr(Op.FieldGet, slotTypes[i])
+      fg.lhs = envParam
+      fg.ival = layout.offsets[i]
+      capVal = builderEmit(cfc.b, fg)
+    }
+    declareLocalRaw(cfc, caps.names[i], capVal, caps.types[i], caps.boxTys[i])
+    fc.c.env[caps.names[i]] = caps.types[i]
+    i = i + 1
+  }
+}
+
 // Synthesizes a closure function `closure$<fid>(env, params) { body }`: the body
 // reads its captures from the env object (word i) and its params from block
 // params. Returns the FuncId (post-order: nested closures get lower ids). Appends
@@ -139,53 +225,11 @@ fn lowerClosureBody(
     fallibleOk = fallibleOk, fallibleErr = fallibleErr, genEnv = fc.genEnv, resultTy = ft.result,
     boxedNames = fc.boxedNames,
   }
-  let envParam = builderAddParam(b, closureTy)
-  let allParams = [closureTy]
   let pnodes = kidsOf(fc.c.tree, k[0])
-  // Params first, then their bindings: a boxed param's `declareLocal` emits its
-  // cell's `gc_alloc`, and a block's params must all precede its instructions.
-  let paramIds = []int(0)
-  let i = 0
-  while (i < len(pnodes)) {
-    paramIds = append(paramIds, builderAddParam(b, ft.members[i]))
-    allParams = append(allParams, ft.members[i])
-    i = i + 1
-  }
-  i = 0
-  while (i < len(pnodes)) {
-    let pn = getNode(fc.c.tree, kidsOf(fc.c.tree, pnodes[i])[0])
-    let pname = fc.c.source[pn.span.start:pn.span.end]
-    declareLocal(cfc, pname, paramIds[i], ft.members[i])
-    fc.c.env[pname] = ft.members[i]
-    i = i + 1
-  }
-  // Unpack captures from the env object (field_get word i). A boxed capture's slot
-  // holds the CELL POINTER, and the body keeps it boxed: that is what makes a write
-  // in here land in the cell the enclosing frame and every sibling closure read.
-  let slotTypes = captureSlotTypes(caps)
-  i = 0
-  while (i < len(caps.names)) {
-    // #5429: the read-side twin of the env-packing fix above. A decimal
-    // capture's slot is 16 inline bytes; read its two i64 words back and
-    // rebox them into the two-word tuple every decimal VALUE is, the same
-    // shape `tupleElem` (lowertuple.bit) now uses for a boxed local's cell.
-    let capVal = 0
-    if (isDecimalPrim(fc.c.ctx, slotTypes[i])) {
-      capVal = buildTuple(
-        cfc,
-        decimalTupleType(cfc.c.ctx),
-        decimalFieldWords(cfc, envParam, layout.offsets[i]),
-      )
-    } else {
-      let fg = mkInstr(Op.FieldGet, slotTypes[i])
-      fg.lhs = envParam
-      fg.ival = layout.offsets[i]
-      capVal = builderEmit(b, fg)
-    }
-    declareLocalRaw(cfc, caps.names[i], capVal, caps.types[i], caps.boxTys[i])
-    fc.c.env[caps.names[i]] = caps.types[i]
-    i = i + 1
-  }
+  let bind = lowerClosureParams(fc, cfc, ft, closureTy, pnodes)
+  let envParam = bind.envParam
+  let allParams = bind.allParams
+  lowerClosureCaptures(fc, cfc, caps, layout, envParam)
   let body = k[1]
   if (getNode(fc.c.tree, body).tag == Tag.Block) {
     // Reserve every defer's flag+operand slots at function entry, same as an
