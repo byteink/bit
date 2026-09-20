@@ -1,0 +1,284 @@
+// Split out of emitelf.bit (#2450 E0201 paydown, pass fifteen): the per-phase
+// helpers behind emitElfBlobs — string pool, TypeInfo blobs, GC stack-map
+// entries, and the undefined-externals sweep. emitElfBlobs itself, its
+// EmElfBlobs return type, emElfSym/emElfAbs64, and emitElfObject stay in
+// emitelf.bit; same module, no import needed (#2910's pattern).
+
+// The symbol/reloc/defined-set triple threaded across emitElfBlobs' phases —
+// each phase below hands its caller an updated one, since Bit gives a helper
+// no way to mutate three of its caller's locals in place across a call
+// boundary (same reason emitelf.bit's EmElfDbgLines exists, generalized past
+// just the debug-lines phase since every OTHER blob phase needed the
+// identical shape).
+class EmElfSymAccum {
+  symbols: []ElfSymbol,
+  relocs: []ElfRelocation,
+  defined: map<string, bool>,
+}
+
+// ---- string pool -> .rodata bytes + a {ptr,len} header -------------------
+// §17.6: a freestanding object is one archive member among many, so every
+// symbol it defines globally is one a sibling member may define too. A string
+// literal has no external linkage — nothing outside this object ever names
+// __bitstr_N — so the header goes local and two members' literals stop
+// colliding at link.
+//
+// NOT REACHABLE TODAY, and deliberately kept: §10.3's @nosplit whitelist
+// admits no string operation, so a freestanding module's string pool is always
+// empty. Kept because that whitelist must widen for #1363/#1364, and the day a
+// literal becomes reachable a global binding would surface as a __bitstr_0
+// duplicate between two members.
+fn emitElfStringPool(
+  module: IrModule, rodata: ByteBuf, blobBinding: ElfBinding, acc: EmElfSymAccum,
+): EmElfSymAccum {
+  let symbols = acc.symbols
+  let relocs = acc.relocs
+  let defined = acc.defined
+  let si = 0
+  while (si < len(module.stringPool)) {
+    let s = module.stringPool[si]
+    let dataOff = len(rodata.bytes)
+    appendBytes(rodata, []byte(s))
+    let dataName = "__bitstr_${si}_data"
+    symbols = append(
+      symbols,
+      emElfSym(
+        dataName, ElfSectionKind.Rodata, dataOff,
+        len([]byte(s)), ElfBinding.Local, ElfSymKind.Object,
+      ),
+    )
+    defined[dataName] = true
+
+    emPadTo8(rodata)
+    let hdrOff = len(rodata.bytes)
+    appendU64(rodata, 0)              // ptr — filled by the reloc below
+    appendU64(rodata, len([]byte(s))) // len
+    appendU64(rodata, 0)              // base — 0: a literal is not GC-owned
+    let hdrName = "__bitstr_${si}"
+    symbols = append(
+      symbols,
+      emElfSym(
+        hdrName, ElfSectionKind.Rodata, hdrOff, 24,
+        blobBinding, ElfSymKind.Object,
+      ),
+    )
+    defined[hdrName] = true
+    relocs = append(relocs, emElfAbs64(hdrOff, dataName))
+    si = si + 1
+  }
+  return EmElfSymAccum{ symbols = symbols, relocs = relocs, defined = defined }
+}
+
+// The ptr-offsets side table for one TypeInfo blob — split out of
+// emitElfTypeInfoOne below purely to keep it and the driver loop each under
+// max-fn-lines.
+fn emitElfTypeInfoOffsets(
+  rodata: ByteBuf, t: TypeInfoLayout, name: string, acc: EmElfSymAccum,
+): (string, EmElfSymAccum) {
+  let symbols = acc.symbols
+  let defined = acc.defined
+  let offsName = ""
+  if (len(t.ptrOffsets) > 0) {
+    emPadTo8(rodata)
+    let offsOff = len(rodata.bytes)
+    let k = 0
+    while (k < len(t.ptrOffsets)) {
+      appendU64(rodata, t.ptrOffsets[k])
+      k = k + 1
+    }
+    offsName = name + "_offs"
+    symbols = append(
+      symbols,
+      emElfSym(
+        offsName, ElfSectionKind.Rodata, offsOff,
+        len(t.ptrOffsets) * 8, ElfBinding.Local, ElfSymKind.Object,
+      ),
+    )
+    defined[offsName] = true
+  }
+  return (offsName, EmElfSymAccum{ symbols = symbols, relocs = acc.relocs, defined = defined })
+}
+
+// The display-name side table for one TypeInfo blob — same reason as
+// emitElfTypeInfoOffsets above.
+fn emitElfTypeInfoName(
+  module: IrModule, rodata: ByteBuf, t: TypeInfoLayout, name: string, acc: EmElfSymAccum,
+): (string, string, EmElfSymAccum) {
+  let symbols = acc.symbols
+  let defined = acc.defined
+  let tname = ""
+  if (module.ctx.types[t.disc].hasName) {
+    tname = module.ctx.types[t.disc].name
+  }
+  let nameSym = ""
+  if (len([]byte(tname)) > 0) {
+    let nmOff = len(rodata.bytes)
+    appendBytes(rodata, []byte(tname))
+    nameSym = name + "_name"
+    symbols = append(
+      symbols,
+      emElfSym(
+        nameSym, ElfSectionKind.Rodata, nmOff,
+        len([]byte(tname)), ElfBinding.Local, ElfSymKind.Object,
+      ),
+    )
+    defined[nameSym] = true
+  }
+  return (
+    tname,
+    nameSym,
+    EmElfSymAccum{ symbols = symbols, relocs = acc.relocs, defined = defined },
+  )
+}
+
+// One TypeInfo blob's rodata record, method table, and the relocations
+// linking it to its side tables — split out of emitElfTypeInfoBlobs below so
+// the per-type body (this function) and the loop driving it each stay well
+// under max-fn-lines/max-complexity on their own.
+fn emitElfTypeInfoOne(
+  module: IrModule, rodata: ByteBuf, t: TypeInfoLayout, acc: EmElfSymAccum,
+): EmElfSymAccum {
+  let name = typeInfoSymbol(t.disc, t.size, t.ptrOffsets)
+  let (offsName, acc1) = emitElfTypeInfoOffsets(rodata, t, name, acc)
+  let (tname, nameSym, acc2) = emitElfTypeInfoName(module, rodata, t, name, acc1)
+  let symbols = acc2.symbols
+  let relocs = acc2.relocs
+  let defined = acc2.defined
+  let methods = emitMethodTable(module, rodata, t.disc, name)
+  if (methods.sym != "") {
+    symbols = append(
+      symbols,
+      emElfSym(
+        methods.sym, ElfSectionKind.Rodata,
+        methods.off, methods.size, ElfBinding.Local, ElfSymKind.Object,
+      ),
+    )
+    defined[methods.sym] = true
+  }
+
+  emPadTo8(rodata)
+  let tiOff = len(rodata.bytes)
+  appendU64(rodata, t.size)             // size
+  appendU64(rodata, 0)                  // ptr_offsets_ptr (reloc below if any)
+  appendU64(rodata, len(t.ptrOffsets))  // ptr_offsets_len
+  appendU64(rodata, 0)                  // name_ptr (reloc below if any)
+  appendU64(rodata, len([]byte(tname))) // name_len
+  appendU64(rodata, 0)                  // methods_ptr (reloc below if any)
+  appendU64(rodata, methods.size / 16)  // methods_len
+  symbols = append(
+    symbols,
+    emElfSym(
+      name, ElfSectionKind.Rodata, tiOff, 56,
+      ElfBinding.Global, ElfSymKind.Object,
+    ),
+  )
+  defined[name] = true
+  if (len(t.ptrOffsets) > 0) {
+    relocs = append(relocs, emElfAbs64(tiOff + 8, offsName))
+  }
+  if (nameSym != "") {
+    relocs = append(relocs, emElfAbs64(tiOff + 24, nameSym))
+  }
+  if (methods.sym != "") {
+    relocs = append(relocs, emElfAbs64(tiOff + 40, methods.sym))
+    let mr = 0
+    while (mr < len(methods.relocs)) {
+      relocs = append(relocs, emElfAbs64(methods.relocs[mr].off, methods.relocs[mr].sym))
+      mr = mr + 1
+    }
+  }
+  return EmElfSymAccum{ symbols = symbols, relocs = relocs, defined = defined }
+}
+
+// ---- gc_alloc TypeInfo blobs -> .rodata -----------------------------------
+// §17.6: empty on the freestanding path — see refuseManagedMetadata.
+fn emitElfTypeInfoBlobs(
+  module: IrModule, rodata: ByteBuf, freestanding: bool, acc: EmElfSymAccum,
+): EmElfSymAccum {
+  let tis = collectTypeInfos(module, freestanding)
+  let ti = 0
+  while (ti < len(tis)) {
+    acc = emitElfTypeInfoOne(module, rodata, tis[ti], acc)
+    ti = ti + 1
+  }
+  return acc
+}
+
+// ---- GC stack-map entries (runtime/ABI.md §4) -> .bit_gc ------------------
+// Per-MEMBER, not per-program: every object emits its own entries into the
+// dedicated .bit_gc section and the linker concatenates them between the
+// symbols it defines at the extent's ends. That is what lets an archive member
+// carry stack maps at all, which in turn is what lets a runtime module reach a
+// safepoint (ABI.md §4.1). No object defines bit_stack_maps: one global name
+// owned by several members would be a duplicate definition, so the linker owns
+// it instead.
+//
+// One section, one LOCAL symbol per function — not one section per function,
+// which both object writers reject as a duplicate section kind. The readers
+// carve one atom per symbol offset, so per-function symbols are exactly what
+// makes the linker able to drop an entry whose function it dropped.
+// `emittedNames` is indexed in stackmap order, which is NOT module.funcs order
+// once anything is skipped.
+fn emitElfGcStackMaps(
+  gc: ByteBuf, stackmaps: []FuncStackMap, emittedNames: []string, acc: EmElfSymAccum,
+): EmElfSymAccum {
+  let symbols = acc.symbols
+  let relocs = acc.relocs
+  let defined = acc.defined
+  let smCodeRelocs = writeStackMaps(gc, stackmaps)
+  let smi = 0
+  while (smi < len(smCodeRelocs)) {
+    let smOff = smCodeRelocs[smi]
+    let smEnd = len(gc.bytes)
+    if (smi + 1 < len(smCodeRelocs)) {
+      smEnd = smCodeRelocs[smi + 1]
+    }
+    symbols = append(
+      symbols,
+      emElfSym(
+        "__bitsm_${smi}", ElfSectionKind.GcMeta,
+        smOff, smEnd - smOff, ElfBinding.Local, ElfSymKind.Object,
+      ),
+    )
+    defined["__bitsm_${smi}"] = true
+    // Offsets are already section-relative, and an entry starts with its
+    // codeAddr field — so the entry offset IS the reloc offset.
+    relocs = append(
+      relocs,
+      ElfRelocation{
+        section = ElfSectionKind.GcMeta,
+        offset = smOff, symbol = emittedNames[smi], kind = ElfRelocKind.Abs64,
+        addend = 0,
+      },
+    )
+    smi = smi + 1
+  }
+  return EmElfSymAccum{ symbols = symbols, relocs = relocs, defined = defined }
+}
+
+// ---- undefined externals (the runtime's bit_rt_* symbols) ----------------
+fn emitElfUndefinedExterns(acc: EmElfSymAccum): EmElfSymAccum {
+  let symbols = acc.symbols
+  let relocs = acc.relocs
+  let defined = acc.defined
+  let externs = map<string, bool>{}
+  let ri = 0
+  while (ri < len(relocs)) {
+    let sym = relocs[ri].symbol
+    let (_, isDef) = defined[sym]
+    let (_, isExt) = externs[sym]
+    if (!isDef && !isExt) {
+      externs[sym] = true
+      symbols = append(
+        symbols,
+        ElfSymbol{
+          name = sym, hasSection = false,
+          section = ElfSectionKind.Text, offset = 0, size = 0,
+          binding = ElfBinding.Global, kind = ElfSymKind.Notype,
+        },
+      )
+    }
+    ri = ri + 1
+  }
+  return EmElfSymAccum{ symbols = symbols, relocs = relocs, defined = defined }
+}
