@@ -150,14 +150,19 @@ fn xdUnwindPiece(name: string, fnSize: int, info: XUnwindInfo): XdUnwindPiece {
   return XdUnwindPiece{ pdataRec = rec, pdataRelocs = relocs, xdataBytes = info.bytes }
 }
 
-fn checkPeLinkUnwindDerisk() {
-  // Every function's relocations start out LOCAL (relative to that
-  // function's OWN bytes, from xdCallRel32/xdEmitFuncCBody) — PeRelocation
-  // offsets are SECTION-relative, though, so each list gets rebased by its
-  // function's now-known position in the combined `text` below via
-  // xdRebaseRelocs. _start sits at offset 0, so its own rebase is a no-op;
-  // every other function's is not (an earlier draft skipped this and got a
-  // real, reproduced failure — see the task-3345 report).
+// One of the four synthetic PE functions checkPeLinkUnwindDerisk assembles to
+// exercise the linker's unwind-info path. One allocation per synthetic
+// function built — 4 per derisk run, whether that is the one golden case
+// that calls checkPeLinkUnwindDerisk or a hand run under
+// BIT_PE_UNWIND_DERISK_OUT — never per instruction emitted.
+class PdFuncBuild {
+  bytes: []u8,
+  size: int,
+  u: XUnwindInfo,
+  relocs: []PeRelocation,
+}
+
+fn pdBuildStartFunc(): PdFuncBuild {
   // _start: minimal prologue, calls funcA.
   let cxStart = newXCtx(XCallConv.Win64)
   cxStart.frame = XFrame{
@@ -167,12 +172,14 @@ fn checkPeLinkUnwindDerisk() {
     frameSize = 32,
   }
   let uStart = xEmitPrologue(cxStart)
-  let startLocalRelocs = xdCallRel32(cxStart.buf, []PeRelocation(0), "funcA")
+  let relocs = xdCallRel32(cxStart.buf, []PeRelocation(0), "funcA")
   xEmitEpilogue(cxStart)
   xRet(cxStart.buf)
-  let startBytes = cxStart.buf.code
-  let startSize = len(startBytes)
+  let bytes = cxStart.buf.code
+  return PdFuncBuild{ bytes = bytes, size = len(bytes), u = uStart, relocs = relocs }
+}
 
+fn pdBuildFuncA(): PdFuncBuild {
   // funcA: two callee-saved GPRs, a real (small) frame, calls funcB.
   let cxA = newXCtx(XCallConv.Win64)
   cxA.frame = XFrame{
@@ -182,12 +189,14 @@ fn checkPeLinkUnwindDerisk() {
     frameSize = 32,
   }
   let uA = xEmitPrologue(cxA)
-  let aLocalRelocs = xdCallRel32(cxA.buf, []PeRelocation(0), "funcB")
+  let relocs = xdCallRel32(cxA.buf, []PeRelocation(0), "funcB")
   xEmitEpilogue(cxA)
   xRet(cxA.buf)
-  let aBytes = cxA.buf.code
-  let aSize = len(aBytes)
+  let bytes = cxA.buf.code
+  return PdFuncBuild{ bytes = bytes, size = len(bytes), u = uA, relocs = relocs }
+}
 
+fn pdBuildFuncB(): PdFuncBuild {
   // funcB: frame over one guard page — #3327's stack probe — calls funcC.
   let cxB = newXCtx(XCallConv.Win64)
   cxB.frame = XFrame{
@@ -224,12 +233,14 @@ fn checkPeLinkUnwindDerisk() {
     assert(len(uB.bytes) == 12 && uB.bytes[3] == u8(5))
     uB.bytes[3] = u8(1)
   }
-  let bLocalRelocs = xdCallRel32(cxB.buf, []PeRelocation(0), "funcC")
+  let relocs = xdCallRel32(cxB.buf, []PeRelocation(0), "funcC")
   xEmitEpilogue(cxB)
   xRet(cxB.buf)
-  let bBytes = cxB.buf.code
-  let bSize = len(bBytes)
+  let bytes = cxB.buf.code
+  return PdFuncBuild{ bytes = bytes, size = len(bytes), u = uB, relocs = relocs }
+}
 
+fn pdBuildFuncC(): PdFuncBuild {
   // funcC: one saved GPR, a frame holding the capture buffer — no epilogue,
   // it ends in ExitProcess and never returns.
   let cxC = newXCtx(XCallConv.Win64)
@@ -240,33 +251,90 @@ fn checkPeLinkUnwindDerisk() {
     frameSize = 120,
   }
   let uC = xEmitPrologue(cxC)
-  let cLocalRelocs = xdEmitFuncCBody(cxC)
-  xdAssertHomeSpace(cxC.buf.code, cLocalRelocs, true)
-  let cBytes = cxC.buf.code
-  let cSize = len(cBytes)
+  let relocs = xdEmitFuncCBody(cxC)
+  xdAssertHomeSpace(cxC.buf.code, relocs, true)
+  let bytes = cxC.buf.code
+  return PdFuncBuild{ bytes = bytes, size = len(bytes), u = uC, relocs = relocs }
+}
 
-  let text = xdAppendAllR([]u8(0), startBytes)
+// The four synthetic functions checkPeLinkUnwindDerisk lays out and links.
+// One allocation per derisk run, bundling the four PdFuncBuild results above.
+class PdUnwindFuncs {
+  start: PdFuncBuild,
+  a: PdFuncBuild,
+  b: PdFuncBuild,
+  c: PdFuncBuild,
+}
+
+fn pdBuildUnwindFuncs(): PdUnwindFuncs {
+  return PdUnwindFuncs{
+    start = pdBuildStartFunc(), a = pdBuildFuncA(), b = pdBuildFuncB(), c = pdBuildFuncC(),
+  }
+}
+
+// The combined `.text` layout for the four synthetic functions and their
+// rebased relocations. One allocation per derisk run.
+//
+// Every function's relocations start out LOCAL (relative to that function's
+// OWN bytes, from xdCallRel32/xdEmitFuncCBody) — PeRelocation offsets are
+// SECTION-relative, though, so each list gets rebased by its function's
+// now-known position in the combined `text` below via xdRebaseRelocs. _start
+// sits at offset 0, so its own rebase is a no-op; every other function's is
+// not (an earlier draft skipped this and got a real, reproduced failure —
+// see the task-3345 report).
+// One allocation per derisk run, like the three classes around it.
+class PdTextLayout {
+  text: []u8,
+  aOff: int,
+  bOff: int,
+  cOff: int,
+  relocs: []PeRelocation,
+}
+
+fn pdBuildTextLayout(funcs: PdUnwindFuncs): PdTextLayout {
+  let text = xdAppendAllR([]u8(0), funcs.start.bytes)
   let aOff = len(text)
-  text = xdAppendAllR(text, aBytes)
+  text = xdAppendAllR(text, funcs.a.bytes)
   let bOff = len(text)
-  text = xdAppendAllR(text, bBytes)
+  text = xdAppendAllR(text, funcs.b.bytes)
   let cOff = len(text)
-  text = xdAppendAllR(text, cBytes)
+  text = xdAppendAllR(text, funcs.c.bytes)
 
-  let relocs = xdRebaseRelocs(startLocalRelocs, 0)
-  relocs = xdMergeRebased(relocs, aLocalRelocs, aOff)
-  relocs = xdMergeRebased(relocs, bLocalRelocs, bOff)
-  relocs = xdMergeRebased(relocs, cLocalRelocs, cOff)
+  let relocs = xdRebaseRelocs(funcs.start.relocs, 0)
+  relocs = xdMergeRebased(relocs, funcs.a.relocs, aOff)
+  relocs = xdMergeRebased(relocs, funcs.b.relocs, bOff)
+  relocs = xdMergeRebased(relocs, funcs.c.relocs, cOff)
 
+  return PdTextLayout{ text = text, aOff = aOff, bOff = bOff, cOff = cOff, relocs = relocs }
+}
+
+// The combined `.xdata`/`.pdata` streams for the four synthetic functions,
+// each function's per-piece symbol offset, and `relocs` extended with the
+// pdata-record relocations. One allocation per derisk run.
+class PdUnwindTables {
+  xdata: []u8,
+  pdata: []u8,
+  relocs: []PeRelocation,
+  xdataSymOff: map<string, int>,
+  pdataSymOff: map<string, int>,
+}
+
+fn pdBuildUnwindTables(funcs: PdUnwindFuncs, layout: PdTextLayout): PdUnwindTables {
   let pieces = [
-    xdUnwindPiece("_start", startSize, uStart), xdUnwindPiece("funcA", aSize, uA),
-    xdUnwindPiece("funcB", bSize, uB), xdUnwindPiece("funcC", cSize, uC),
+    xdUnwindPiece("_start", funcs.start.size, funcs.start.u),
+    xdUnwindPiece("funcA", funcs.a.size, funcs.a.u),
+    xdUnwindPiece("funcB", funcs.b.size, funcs.b.u), xdUnwindPiece(
+      "funcC",
+      funcs.c.size,
+      funcs.c.u,
+    ),
   ]
   let names = ["_start", "funcA", "funcB", "funcC"]
   let xdata = []u8(0)
   let pdata = []u8(0)
   let xdataSymOff = map<string, int>{}
   let pdataSymOff = map<string, int>{}
+  let relocs = layout.relocs
   let pi = 0
   while (pi < len(pieces)) {
     let p = pieces[pi]
@@ -289,14 +357,22 @@ fn checkPeLinkUnwindDerisk() {
     }
     pi = pi + 1
   }
+  return PdUnwindTables{
+    xdata = xdata, pdata = pdata, relocs = relocs, xdataSymOff = xdataSymOff,
+    pdataSymOff = pdataSymOff,
+  }
+}
 
-  let symbols = [
+// The four function symbols (_start/funcA/funcB/funcC), each `hasSection` in
+// `.text` at its layout offset.
+fn pdBuildSymbolsCode(funcs: PdUnwindFuncs, layout: PdTextLayout): []PeSymbol {
+  return [
     PeSymbol{
       name = "_start",
       hasSection = true,
       section = PeSectionKind.Text,
       offset = 0,
-      size = startSize,
+      size = funcs.start.size,
       binding = PeBinding.Global,
       kind = PeSymKind.Func,
     },
@@ -304,8 +380,8 @@ fn checkPeLinkUnwindDerisk() {
       name = "funcA",
       hasSection = true,
       section = PeSectionKind.Text,
-      offset = aOff,
-      size = aSize,
+      offset = layout.aOff,
+      size = funcs.a.size,
       binding = PeBinding.Global,
       kind = PeSymKind.Func,
     },
@@ -313,8 +389,8 @@ fn checkPeLinkUnwindDerisk() {
       name = "funcB",
       hasSection = true,
       section = PeSectionKind.Text,
-      offset = bOff,
-      size = bSize,
+      offset = layout.bOff,
+      size = funcs.b.size,
       binding = PeBinding.Global,
       kind = PeSymKind.Func,
     },
@@ -322,17 +398,24 @@ fn checkPeLinkUnwindDerisk() {
       name = "funcC",
       hasSection = true,
       section = PeSectionKind.Text,
-      offset = cOff,
-      size = cSize,
+      offset = layout.cOff,
+      size = funcs.c.size,
       binding = PeBinding.Global,
       kind = PeSymKind.Func,
     },
+  ]
+}
+
+// The local `$xdata$<fn>` symbols, one per synthetic function's unwind-info
+// bytes in `.xdata`.
+fn pdBuildSymbolsXdata(funcs: PdUnwindFuncs, tables: PdUnwindTables): []PeSymbol {
+  return [
     PeSymbol{
       name = "\$xdata\$_start",
       hasSection = true,
       section = PeSectionKind.Xdata,
-      offset = xdataSymOff["_start"],
-      size = len(uStart.bytes),
+      offset = tables.xdataSymOff["_start"],
+      size = len(funcs.start.u.bytes),
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
     },
@@ -340,8 +423,8 @@ fn checkPeLinkUnwindDerisk() {
       name = "\$xdata\$funcA",
       hasSection = true,
       section = PeSectionKind.Xdata,
-      offset = xdataSymOff["funcA"],
-      size = len(uA.bytes),
+      offset = tables.xdataSymOff["funcA"],
+      size = len(funcs.a.u.bytes),
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
     },
@@ -349,8 +432,8 @@ fn checkPeLinkUnwindDerisk() {
       name = "\$xdata\$funcB",
       hasSection = true,
       section = PeSectionKind.Xdata,
-      offset = xdataSymOff["funcB"],
-      size = len(uB.bytes),
+      offset = tables.xdataSymOff["funcB"],
+      size = len(funcs.b.u.bytes),
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
     },
@@ -358,16 +441,23 @@ fn checkPeLinkUnwindDerisk() {
       name = "\$xdata\$funcC",
       hasSection = true,
       section = PeSectionKind.Xdata,
-      offset = xdataSymOff["funcC"],
-      size = len(uC.bytes),
+      offset = tables.xdataSymOff["funcC"],
+      size = len(funcs.c.u.bytes),
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
     },
+  ]
+}
+
+// The local `$pdata$<fn>` symbols, one per synthetic function's RUNTIME_FUNCTION
+// record in `.pdata` (each record is `sizeofPePdataEntry()` == 12 bytes).
+fn pdBuildSymbolsPdata(tables: PdUnwindTables): []PeSymbol {
+  return [
     PeSymbol{
       name = "\$pdata\$_start",
       hasSection = true,
       section = PeSectionKind.Pdata,
-      offset = pdataSymOff["_start"],
+      offset = tables.pdataSymOff["_start"],
       size = 12,
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
@@ -376,7 +466,7 @@ fn checkPeLinkUnwindDerisk() {
       name = "\$pdata\$funcA",
       hasSection = true,
       section = PeSectionKind.Pdata,
-      offset = pdataSymOff["funcA"],
+      offset = tables.pdataSymOff["funcA"],
       size = 12,
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
@@ -385,7 +475,7 @@ fn checkPeLinkUnwindDerisk() {
       name = "\$pdata\$funcB",
       hasSection = true,
       section = PeSectionKind.Pdata,
-      offset = pdataSymOff["funcB"],
+      offset = tables.pdataSymOff["funcB"],
       size = 12,
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
@@ -394,11 +484,19 @@ fn checkPeLinkUnwindDerisk() {
       name = "\$pdata\$funcC",
       hasSection = true,
       section = PeSectionKind.Pdata,
-      offset = pdataSymOff["funcC"],
+      offset = tables.pdataSymOff["funcC"],
       size = 12,
       binding = PeBinding.Local,
       kind = PeSymKind.Notype,
     },
+  ]
+}
+
+// The four imports `checkPeLinkUnwindDerisk`'s allowed-import list lets the
+// linker leave undefined (RtlCaptureStackBackTrace, plus the stdio/exit set
+// funcC's body actually calls).
+fn pdBuildSymbolsImports(): []PeSymbol {
+  return [
     PeSymbol{
       name = "RtlCaptureStackBackTrace",
       hasSection = false,
@@ -436,14 +534,35 @@ fn checkPeLinkUnwindDerisk() {
       kind = PeSymKind.Notype,
     },
   ]
+}
+
+fn pdBuildSymbols(funcs: PdUnwindFuncs, layout: PdTextLayout, tables: PdUnwindTables): []PeSymbol {
+  let out = pdBuildSymbolsCode(funcs, layout)
+  for x of pdBuildSymbolsXdata(funcs, tables) {
+    out = append(out, x)
+  }
+  for x of pdBuildSymbolsPdata(tables) {
+    out = append(out, x)
+  }
+  for x of pdBuildSymbolsImports() {
+    out = append(out, x)
+  }
+  return out
+}
+
+fn checkPeLinkUnwindDerisk() {
+  let funcs = pdBuildUnwindFuncs()
+  let layout = pdBuildTextLayout(funcs)
+  let tables = pdBuildUnwindTables(funcs, layout)
+  let symbols = pdBuildSymbols(funcs, layout, tables)
 
   let bytes = plWriteProbe(
     [
-      PeSection{ kind = PeSectionKind.Text, data = text, size = 0, alignment = 16 },
-      PeSection{ kind = PeSectionKind.Pdata, data = pdata, size = 0, alignment = 4 },
-      PeSection{ kind = PeSectionKind.Xdata, data = xdata, size = 0, alignment = 4 },
+      PeSection{ kind = PeSectionKind.Text, data = layout.text, size = 0, alignment = 16 },
+      PeSection{ kind = PeSectionKind.Pdata, data = tables.pdata, size = 0, alignment = 4 },
+      PeSection{ kind = PeSectionKind.Xdata, data = tables.xdata, size = 0, alignment = 4 },
     ],
-    symbols, relocs,
+    symbols, tables.relocs,
   )
 
   let allowed = ["RtlCaptureStackBackTrace", "GetStdHandle", "WriteFile", "ExitProcess"]
