@@ -35,15 +35,39 @@ fn xTargetRegs(cc: XCallConv, intRegs: []XReg64, floatRegs: []XmmReg): TargetReg
   }
 }
 
-// Compiles one function to x86-64 machine code for `cc`. Runs register
-// allocation itself (intervals and safepoints come from the shared
-// buildIntervals), lays out the frame, then emits the prologue, every block in
-// f.blocks order — which back-edge detection assumes is the original builder/RPO
-// order (see isBackEdge) — and finally patches the jump targets.
-//
-// Returns a FuncCode with an empty name when the function contains a construct
-// this backend refuses (a multi-value ret): the caller must not emit a binary.
-fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): FuncCode {
+// The register files for one function, before interval building or
+// allocation: the master int/float lists, narrowed by whatever an `asm`/
+// `syscall` block reserves and, for a @naked function, to the volatile-only
+// file (see xBuildFrameSetup's doc comment for why). Carries module/cc/ctx
+// alongside them since every later phase needs the same three.
+class XFrameRegs {
+  module: IrModule,
+  cc: XCallConv,
+  ctx: TypeContext,
+  flags: XFuncFlags,
+  intRegs: []XReg64,
+  floatRegs: []XmmReg,
+}
+
+// Register files (post-naked-filtering), the interval/allocation result and
+// the finished frame layout -- everything xCompileFunction needs before it
+// can start emitting code. nakedSpillOverflow substitutes for a fallible
+// return: an empty FuncCode is a legitimate backend answer for a @naked
+// function that outgrew its volatile-only file, and xCompileFunction still
+// owns deciding what to do about it, not this phase.
+class XFrameSetup {
+  built: IntervalBuild,
+  result: RegAllocResult,
+  skipConst: []bool,
+  needsCallAlign: bool,
+  frame: XFrame,
+  nakedSpillOverflow: bool,
+}
+
+// The register files this function will allocate out of: the master
+// int/float lists, narrowed by whatever an `asm`/`syscall` block reserves
+// and, for a @naked function, to the volatile-only file.
+fn xBuildFrameRegs(module: IrModule, f: IrFunc, cc: XCallConv): XFrameRegs {
   let ctx = module.ctx
   let flags = xScanFuncFlags(f)
   let intRegs = xBuildIntRegs(flags)
@@ -91,13 +115,30 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
     floatRegs = nakedFloat
   }
 
-  let built = buildIntervals(ctx, f)
+  return XFrameRegs{
+    module = module, cc = cc, ctx = ctx, flags = flags,
+    intRegs = intRegs, floatRegs = floatRegs,
+  }
+}
+
+// Interval building, register allocation and the two saved-register lists --
+// the inputs the frame-layout phase below needs but does not itself compute.
+class XAllocPhase {
+  built: IntervalBuild,
+  result: RegAllocResult,
+  skipConst: []bool,
+  savedGpr: []XReg64,
+  savedXmm: []XmmReg,
+}
+
+fn xBuildAllocPhase(f: IrFunc, regs: XFrameRegs): XAllocPhase {
+  let built = buildIntervals(regs.ctx, f)
   // #3738's `built.roots` on the same terms as arm64: the two backends share
   // buildIntervals and regalloc, so a coalescing rule that only one of them
   // consumed would be exactly the per-backend liveness drift codegenlive.bit's
   // header exists to prevent.
   let result = allocateCoalesced(
-    xTargetRegs(cc, intRegs, floatRegs),
+    xTargetRegs(regs.cc, regs.intRegs, regs.floatRegs),
     built.intervals,
     allocPoints(built.safepoints, xClobberPoints(f, built.safepoints)),
     built.roots,
@@ -107,16 +148,31 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
   // `const_int` a fold consumes whole is never materialized, so it never writes
   // the register it was allocated, and counting it saved a register the body
   // provably never touches. `cx.skipConst` below is this same array.
-  let skipConst = xComputeSkipConstMaterialize(ctx, f)
+  let skipConst = xComputeSkipConstMaterialize(regs.ctx, f)
   let savedGpr = xBuildSavedGpr(
-    cc, intRegs,
-    xUsedIntRegs(ctx, f, skipConst, built.intervals, result.locations, len(intRegs)),
+    regs.cc, regs.intRegs,
+    xUsedIntRegs(regs.ctx, f, skipConst, built.intervals, result.locations, len(regs.intRegs)),
   )
   // Deliberately NOT narrowed the same way: under SysV `xIsCalleeSavedFloat` is
   // false for every XMM, so this is already empty on the one convention #3860
   // measured, and Win64 — where xmm6..xmm13 are both callee-saved and
   // allocatable — has no hardware here to prove it on.
-  let savedXmm = xBuildSavedXmm(cc, floatRegs)
+  let savedXmm = xBuildSavedXmm(regs.cc, regs.floatRegs)
+
+  return XAllocPhase{
+    built = built, result = result, skipConst = skipConst,
+    savedGpr = savedGpr, savedXmm = savedXmm,
+  }
+}
+
+// Runs interval building and register allocation (xBuildAllocPhase), then
+// lays out the frame. See XFrameSetup's doc comment for nakedSpillOverflow.
+fn xBuildFrameSetup(f: IrFunc, debug: bool, regs: XFrameRegs): XFrameSetup {
+  let alloc = xBuildAllocPhase(f, regs)
+  let built = alloc.built
+  let result = alloc.result
+  let savedXmm = alloc.savedXmm
+  let savedGpr = alloc.savedGpr
 
   // #3169/#4203: a function that polls a loop back edge gets ONE EXTRA spill
   // slot on top of the ones the allocator asked for, caching the address of the
@@ -133,7 +189,7 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
   if (hasBackEdgeSafepoint(f)) {
     pollCacheSlots = 1
   }
-  assert(pollCacheSlots == 0 || flags.hasSafepoints)
+  assert(pollCacheSlots == 0 || regs.flags.hasSafepoints)
 
   // The XMMs live inside the carved frame alongside the spill slots; the GPRs are
   // pushed, so they are NOT part of frameSize — only its alignment (an odd number
@@ -143,7 +199,7 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
   // #3906: the rounding exists so rsp is 16-aligned AT A CALL, so a function
   // that emits none pays nothing for it. `flags` alone is NOT that predicate —
   // see xNeedsCallAlign (x64frame.bit), which takes it and finishes the job.
-  let needsCallAlign = xNeedsCallAlign(f, flags, debug)
+  let needsCallAlign = xNeedsCallAlign(f, regs.flags, debug)
   // #5667: an 8-byte ALIGNMENT pad is cheaper as one more callee-saved push
   // than as a `subq`/`addq` pair, so xPadSavedGpr (x64frame.bit) may append a
   // free callee-saved register here. It must run before the XFrame literal
@@ -153,7 +209,7 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
   // `xPadCandidates` is what refuses a @naked function: it hands the pad an
   // EMPTY file, so the refusal costs no branch here and reads as one expression.
   savedGpr = xPadSavedGpr(
-    cc, xPadCandidates(intRegs, f.isNaked), savedGpr, rawFrame, needsCallAlign,
+    regs.cc, xPadCandidates(regs.intRegs, f.isNaked), savedGpr, rawFrame, needsCallAlign,
   )
   let frame = XFrame{
     savedGpr = savedGpr, savedXmm = savedXmm, numSpillSlots = numSlots,
@@ -169,34 +225,55 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
   // allocator to hand out, so nothing can reach either list. Naked functions
   // allocate out of that file, so a spill here means the body outgrew what a
   // prologue-less function can hold.
-  if (f.isNaked && result.numSpillSlots != 0) {
-    return FuncCode{
-      name = "", code = []u8(0), relocs = []Reloc(0),
-      safepoints = []SafepointView(0), savedRegs = []SavedReg(0), frameSize = 0,
-      lines = []DebugLineRow(0),
-    }
+  return XFrameSetup{
+    built = built, result = result, skipConst = alloc.skipConst,
+    needsCallAlign = needsCallAlign, frame = frame,
+    nakedSpillOverflow = f.isNaked && result.numSpillSlots != 0,
   }
+}
 
-  let cx = newXCtx(cc)
-  cx.module = module
-  cx.ctx = ctx
+// One shared empty-name FuncCode literal for both refusal points below: a
+// multi-value-ret construct this backend refuses, and an emission pass that
+// came back !ok. Either way the caller must not emit a binary.
+fn xEmptyFuncCode(): FuncCode {
+  return FuncCode{
+    name = "", code = []u8(0), relocs = []Reloc(0),
+    safepoints = []SafepointView(0), savedRegs = []SavedReg(0), frameSize = 0,
+    lines = []DebugLineRow(0),
+  }
+}
+
+// Allocates a fresh XCtx and fills it from the register/setup phases, ready
+// for emission.
+fn xNewFuncCtx(f: IrFunc, debug: bool, regs: XFrameRegs, setup: XFrameSetup): XCtx {
+  let cx = newXCtx(regs.cc)
+  cx.module = regs.module
+  cx.ctx = regs.ctx
   cx.f = f
   cx.debug = debug
-  cx.skipConst = skipConst
+  cx.skipConst = setup.skipConst
   // #5655. Not hoisted next to `skipConst` above: `xUsedIntRegs` deliberately
   // does NOT read it. A skipped `add` leaves its allocated register written by
   // nothing, so dropping it from the used set would be legal, but over-reporting
   // a used register only costs a push that was already there before this fold
   // existed, while under-reporting one loses a callee-saved value.
-  cx.skipAddr = xComputeSkipAddrFold(ctx, f, debug)
-  cx.alloc = result
-  cx.intRegs = intRegs
-  cx.floatRegs = floatRegs
-  cx.frame = frame
-  cx.noCallAlign = !needsCallAlign // arms xCallReloc/xCallReg's backstop assert
+  cx.skipAddr = xComputeSkipAddrFold(regs.ctx, f, debug)
+  cx.alloc = setup.result
+  cx.intRegs = regs.intRegs
+  cx.floatRegs = regs.floatRegs
+  cx.frame = setup.frame
+  cx.noCallAlign = !setup.needsCallAlign // arms xCallReloc/xCallReg's backstop assert
   cx.blockOffsets = []int(len(f.blocks))
-  cx.safepointCodeOffsets = []int(len(built.safepoints))
+  cx.safepointCodeOffsets = []int(len(setup.built.safepoints))
+  return cx
+}
 
+// Emits the prologue, every block in f.blocks order — which back-edge
+// detection assumes is the original builder/RPO order (see isBackEdge) — and
+// finally patches the jump targets. Returns false when the function contains
+// a construct this backend refuses (a multi-value ret): the caller must not
+// emit a binary then.
+fn xEmitFuncBody(cx: XCtx, f: IrFunc): bool {
   // §10.3.1 @naked: no prologue — the function runs on its caller's frame.
   if (!f.isNaked) {
     xEmitPrologue(cx)
@@ -231,28 +308,25 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
     bi = bi + 1
   }
   xPatchJumpFixups(cx)
+  return ok
+}
 
-  if (!ok) {
-    return FuncCode{
-      name = "", code = []u8(0), relocs = []Reloc(0),
-      safepoints = []SafepointView(0), savedRegs = []SavedReg(0), frameSize = 0,
-      lines = []DebugLineRow(0),
-    }
-  }
-
+// Builds the safepoint stack-map table and the register-recovery table from a
+// finished, successful emission, and assembles the final FuncCode.
+fn xBuildFuncCode(cx: XCtx, f: IrFunc): FuncCode {
   // Every safepoint the interval builder predicted must have been reached during
   // emission, or the stack maps below pair with the wrong return addresses.
-  assert(cx.nextSafepointIdx == len(built.safepoints))
+  assert(cx.nextSafepointIdx == len(cx.safepointCodeOffsets))
 
   // Pair each allocator stack map with the code offset emission recorded for it —
   // the two lists are in the same order by construction.
   let safepoints = []SafepointView(0)
   let si = 0
-  while (si < len(result.stackMaps)) {
-    let sm = result.stackMaps[si]
+  while (si < len(cx.alloc.stackMaps)) {
+    let sm = cx.alloc.stackMaps[si]
     let regs = []int(0)
     for r of sm.regs {
-      regs = append(regs, xRegNum(intRegs[r]))
+      regs = append(regs, xRegNum(cx.intRegs[r]))
     }
     // Only the ALLOCATOR's own slot indices, which is what keeps #3169's
     // poll-cache slots out of the table: they sit above every index that can
@@ -260,8 +334,8 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
     // module-state address as a managed object.
     let slots = []int(0)
     for s of sm.slots {
-      assert(s < frame.numSpillSlots - pollCacheSlots)
-      slots = append(slots, xSpillOffset(frame, s))
+      assert(s < cx.frame.numSpillSlots - cx.frame.pollCacheSlots)
+      slots = append(slots, xSpillOffset(cx.frame, s))
     }
     safepoints = append(
       safepoints,
@@ -278,14 +352,38 @@ fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): Fu
   // frame-pointer-relative, matching SafepointView's own offsets.
   let savedRegs = []SavedReg(0)
   let gi = 0
-  while (gi < len(savedGpr)) {
-    savedRegs = append(savedRegs, SavedReg{ reg = xRegNum(savedGpr[gi]), fpOff = -8 * (gi + 1) })
+  while (gi < len(cx.frame.savedGpr)) {
+    savedRegs = append(
+      savedRegs,
+      SavedReg{ reg = xRegNum(cx.frame.savedGpr[gi]), fpOff = -8 * (gi + 1) },
+    )
     gi = gi + 1
   }
 
   return FuncCode{
     name = f.name, code = cx.buf.code, relocs = cx.relocs,
-    safepoints = safepoints, savedRegs = savedRegs, frameSize = frame.frameSize,
+    safepoints = safepoints, savedRegs = savedRegs, frameSize = cx.frame.frameSize,
     lines = cx.dbgRows,
   }
+}
+
+// Compiles one function to x86-64 machine code for `cc`. Runs register
+// allocation itself (intervals and safepoints come from the shared
+// buildIntervals), lays out the frame, then emits the prologue, every block in
+// f.blocks order, and finally patches the jump targets.
+//
+// Returns a FuncCode with an empty name when the function contains a construct
+// this backend refuses (a multi-value ret): the caller must not emit a binary.
+fn xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv, debug: bool): FuncCode {
+  let regs = xBuildFrameRegs(module, f, cc)
+  let setup = xBuildFrameSetup(f, debug, regs)
+  if (setup.nakedSpillOverflow) {
+    return xEmptyFuncCode()
+  }
+  let cx = xNewFuncCtx(f, debug, regs, setup)
+  let ok = xEmitFuncBody(cx, f)
+  if (!ok) {
+    return xEmptyFuncCode()
+  }
+  return xBuildFuncCode(cx, f)
 }
