@@ -9,7 +9,9 @@
 #
 # Reads the working tree, writes only its own `mktemp -d` scratch and $OUT; the
 # shared `bit-out/lib/<target>/libbitrt.a` is explicitly refused. Set BIT=<path>
-# to use a `bit` other than `bit-out/bin/bit` (e.g. a fresher seed).
+# to use a `bit` other than `bit-out/bin/bit` (e.g. a fresher seed). Set
+# BIT_G2ARCHIVE_RT=<path> to compile a `runtime/` tree other than this
+# checkout's own (#5624; a debug-only build from a scratch copy).
 #
 # Three traps this script exists to encode rather than let the next reader
 # rediscover:
@@ -79,7 +81,17 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # would compile committed source and silently ignore every uncommitted runtime
 # edit. That is #1486's stale-archive failure with a new cause. Only the
 # emitted objects go to scratch; the checkout is still never written.
-RT="$REPO_ROOT/runtime"
+#
+# BIT_G2ARCHIVE_RT (#5624) overrides which `runtime/` tree gets compiled,
+# defaulting to unchanged behavior (the checkout's own). It exists for a
+# debug-only build: a scratch COPY of `runtime/` with one file's `const`
+# flipped, so a fault-injection seam gated `false` in every ordinary build
+# (`runtime/gc/gcfaultcfg.bit`) can be exercised without ever writing that
+# flip into the checkout. `_tests_/stress/gcbit/gcbit.bit`'s own header has
+# the exact command. The completeness check below still runs against
+# whichever tree this resolves to, so a scratch copy missing a module fails
+# the same way an incomplete checkout would.
+RT="${BIT_G2ARCHIVE_RT:-$REPO_ROOT/runtime}"
 
 # The rename is a SOURCE property now, so this is a verification rather than a
 # transformation: zero live (non-comment) `bit_rt_root_` pins may exist. Kept
