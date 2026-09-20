@@ -378,14 +378,92 @@ fn loSortByOffset(symbols: []LoRawSymbol, items: []int): []int {
 // section label, or merged constant-pool labels all folded to the same bytes) —
 // they collapse to a single atom that every alias resolves to, preferring a
 // global among them for the atom's identity.
+//
+// Driver only (#2450): each phase below is its own function so this one stays
+// under E0201's line limit. `atoms` grows via `append` in `loAtomizeSymbolGroups`
+// (called once per section), so it threads through there as a parameter+return
+// with a bare `return atoms` — the shape compiler/lintappend.bit's E0214 check
+// requires before it will treat a self-assigned `atoms = append(atoms, ...)`
+// as protected, since Bit gives a function no way to mutate a caller's
+// slice-length local across a call boundary otherwise (the same reason
+// `EmElfSymAccum` exists in compiler/emitelfblobs.bit). `loMakeLeadingAtom`
+// avoids the same hazard a different way: it never takes `atoms` as a
+// parameter at all, returning a 0/1-element slice instead and leaving the
+// single append on `atoms` to this driver. `atomOfSymbol` and `sectionAnon`
+// are fixed-size and only ever written at existing indices, which IS visible
+// across a call boundary (`[]T` is a reference type, spec/SPEC.md §5
+// "Reference | ... []T slices ... | copy of the reference (shared underlying
+// data)") -- so those two stay plain parameters, no bundling class needed.
 fn atomizeModule(
   name: string, sections: []LoRawSection,
   symbols: []LoRawSymbol, relocs: []LoRawReloc,
 ): LoModule! {
   let atoms = []LoAtom(0)
+  let perSection = loBuildSectionOrder(sections, symbols)
 
-  // Per section: symbol indices in that section, sorted by offset — used both to
-  // lay out atoms and, later, to find which atom a raw section+offset falls in.
+  // atomOfSymbol[i] is only meaningful once that symbol's section has been
+  // atomized (every section is, in the loop below, before relocs are processed).
+  let atomOfSymbol = []int(len(symbols))
+  // The anonymous atom holding each section's LEADING symbol-less region — how a
+  // relocation owned by or targeting those bytes finds its atom, since no symbol
+  // covers them. Spans the whole section when it has no symbols at all; spans
+  // [0, first symbol offset) when the first symbol starts past the section base.
+  // -1 when a symbol already sits at offset 0, leaving no leading region.
+  let sectionAnon = []int(len(sections))
+  let i = 0
+  while (i < len(sections)) {
+    sectionAnon[i] = -1
+    i = i + 1
+  }
+
+  let secIdx = 0
+  while (secIdx < len(sections)) {
+    let section = sections[secIdx]
+    let order = perSection[secIdx].items
+    let lead = loMakeLeadingAtom(section, order, symbols)
+    let anonIdx = -1
+    if (len(lead) > 0) {
+      anonIdx = len(atoms)
+      atoms = append(atoms, lead[0])
+    }
+    sectionAnon[secIdx] = anonIdx
+    if (len(order) > 0) {
+      atoms = loAtomizeSymbolGroups(section, order, symbols, atoms, atomOfSymbol)
+    }
+    secIdx = secIdx + 1
+  }
+
+  // Read-only lookup tables every relocation resolution needs (symbols +
+  // per-section order + atomOfSymbol + sectionAnon): bundled because
+  // loResolveSectionOffset takes all four together and the loop below calls it
+  // twice per relocation (once for the reloc's own section, once for a
+  // SectionOffset target's section). Cost: one heap allocation per
+  // `atomizeModule` call (once per object read by the linker), negligible next
+  // to the per-symbol/per-relocation slices this same function already builds.
+  let ctx = LoAtomizeCtx{
+    symbols = symbols, perSection = perSection,
+    atomOfSymbol = atomOfSymbol, sectionAnon = sectionAnon,
+  }
+  loApplyRelocsToAtoms(relocs, ctx, atoms)?
+
+  return LoModule{ name = name, atoms = atoms }
+}
+
+// Read-only lookup tables shared by every atom/relocation resolution in
+// atomizeModule — see its own comment for why these four travel together.
+// Cost: one heap allocation per `atomizeModule` call, so once per object the
+// linker reads, negligible next to the per-symbol and per-relocation slices
+// that same function already builds.
+class LoAtomizeCtx {
+  symbols: []LoRawSymbol,
+  perSection: []LoOrder,
+  atomOfSymbol: []int,
+  sectionAnon: []int,
+}
+
+// Symbol indices for each section, sorted by offset — used both to lay out
+// atoms and, later, to find which atom a raw section+offset falls in.
+fn loBuildSectionOrder(sections: []LoRawSection, symbols: []LoRawSymbol): []LoOrder {
   let perSection = []LoOrder(0)
   let i = 0
   while (i < len(sections)) {
@@ -403,152 +481,167 @@ fn atomizeModule(
     perSection[i].items = loSortByOffset(symbols, perSection[i].items)
     i = i + 1
   }
+  return perSection
+}
 
-  // atomOfSymbol[i] is only meaningful once that symbol's section has been
-  // atomized (every section is, in the loop below, before relocs are processed).
-  let atomOfSymbol = []int(len(symbols))
-  // The anonymous atom holding each section's LEADING symbol-less region — how a
-  // relocation owned by or targeting those bytes finds its atom, since no symbol
-  // covers them. Spans the whole section when it has no symbols at all; spans
-  // [0, first symbol offset) when the first symbol starts past the section base.
-  // -1 when a symbol already sits at offset 0, leaving no leading region.
-  let sectionAnon = []int(len(sections))
-  i = 0
-  while (i < len(sections)) {
-    sectionAnon[i] = -1
-    i = i + 1
+// Bytes before a section's first symbol belong to no symbol, so the per-symbol
+// loop below would drop them, and any relocation into them would resolve
+// against the first symbol's atom with a NEGATIVE addend — pointing outside
+// that atom, at whatever layout happened to place before it. An AArch64
+// literal pool is exactly this shape: the mapping symbols are excluded and the
+// only real symbol is a named constant partway in. Give the region its own
+// atom. Also covers a SIZE-0 section, e.g. AArch64's empty unreachable-bodied
+// vtable stubs, whose address a vtable's abs64 pointer needs even though the
+// body is empty. The atom dead-strips if nothing references it.
+//
+// Returns the leading atom as a 0- or 1-element slice (empty when the section
+// has no leading region — a symbol already sits at offset 0) rather than a
+// `(LoAtom, bool)` pair: a slice return lets the caller do its own `append`
+// on ITS `atoms` local, so this function never takes `atoms` as a parameter
+// and never trips E0214 (`append` on a slice-typed parameter aliases the
+// caller's backing array) the way threading `atoms` through here would.
+fn loMakeLeadingAtom(section: LoRawSection, order: []int, symbols: []LoRawSymbol): []LoAtom {
+  let leading = section.size
+  if (len(order) > 0) {
+    leading = symbols[order[0]].offset
   }
-
-  let secIdx = 0
-  while (secIdx < len(sections)) {
-    let section = sections[secIdx]
-    let order = perSection[secIdx].items
-    // Bytes before the section's first symbol belong to no symbol, so the
-    // per-symbol loop below would drop them, and any relocation into them would
-    // resolve against the first symbol's atom with a NEGATIVE addend — pointing
-    // outside that atom, at whatever layout happened to place before it. An
-    // AArch64 literal pool is exactly this shape: the mapping symbols are
-    // excluded and the only real symbol is a named constant partway in. Give the
-    // region its own atom.
-    let leading = section.size
-    if (len(order) > 0) {
-      leading = symbols[order[0]].offset
-    }
-    if (len(order) == 0 || leading > 0) {
-      // Also covers a SIZE-0 section, e.g. AArch64's empty unreachable-bodied
-      // vtable stubs, whose address a vtable's abs64 pointer needs even though
-      // the body is empty. The atom dead-strips if nothing references it.
-      sectionAnon[secIdx] = len(atoms)
-      let d = []u8(0)
-      if (!loIsBss(section.kind)) {
-        let n = leading
-        if (n > len(section.data)) {
-          n = len(section.data)
-        }
-        d = section.data[0:n]
+  if (len(order) == 0 || leading > 0) {
+    let d = []u8(0)
+    if (!loIsBss(section.kind)) {
+      let n = leading
+      if (n > len(section.data)) {
+        n = len(section.data)
       }
-      atoms = append(
-        atoms,
-        LoAtom{
-          name = section.name, kind = section.kind,
-          binding = LoBinding.Local, data = d, size = leading,
-          // The section's own alignment: there is no symbol to inherit one from,
-          // and an AArch64 literal pool loaded with `ldr q0` faults if it lands
-          // under-aligned.
-          alignment = section.alignment, weak = false, relocs = []LoReloc(0),
-        },
-      )
+      d = section.data[0:n]
     }
-    if (len(order) > 0) {
-      // Walk `order` (sorted by offset) one offset-group at a time. Symbols
-      // sharing an offset are aliases -> one atom; the group spans until the next
-      // distinct offset, which also bounds the atom's extent.
-      let gi = 0
-      while (gi < len(order)) {
-        let off = symbols[order[gi]].offset
-        let gj = gi
-        let primary = order[gi] // prefer a global, and a strong one, for identity
-        // The first atom starts at the section's base, so it inherits the
-        // section's alignment; a later atom's is its symbols' own.
-        let maxAlign = 1
-        if (off == 0) {
-          maxAlign = section.alignment
-        }
-        while (gj < len(order) && symbols[order[gj]].offset == off) {
-          let s = symbols[order[gj]]
-          let p = symbols[primary]
-          let better = (s.binding == LoBinding.Global && p.binding != LoBinding.Global) ||
-            (s.binding == LoBinding.Global && p.binding == LoBinding.Global && !s.weak && p.weak)
-          if (better) {
-            primary = order[gj]
-          }
-          if (s.alignment > maxAlign) {
-            maxAlign = s.alignment
-          }
-          gj = gj + 1
-        }
-        let nextOffset = section.size
-        if (gj < len(order)) {
-          nextOffset = symbols[order[gj]].offset
-        }
-        assert(nextOffset >= off)
-        // Span to the next symbol, not the symbol's declared size: any
-        // padding/data between a symbol's size and the next symbol still carries
-        // bytes and relocations that must belong to some atom.
-        let size = nextOffset - off
-        let atomIdx = len(atoms)
-        let k = gi
-        while (k < gj) {
-          atomOfSymbol[order[k]] = atomIdx
-          k = k + 1
-        }
-        let psym = symbols[primary]
-        let d = []u8(0)
-        if (!loIsBss(section.kind)) {
-          // Clamp the data slice to what the section actually holds: a symbol's
-          // declared size can exceed its extent to the next symbol; the trailing
-          // bytes are then implicitly zero.
-          let n = size
-          if (n > len(section.data) - off) {
-            n = len(section.data) - off
-          }
-          d = section.data[off:off + n]
-        }
-        atoms = append(
-          atoms,
-          LoAtom{
-            name = psym.name, kind = section.kind,
-            binding = psym.binding, data = d, size = size, alignment = maxAlign,
-            weak = psym.weak, relocs = []LoReloc(0),
-          },
-        )
-        gi = gj
-      }
-    }
-    secIdx = secIdx + 1
+    return append(
+      []LoAtom(0),
+      LoAtom{
+        name = section.name, kind = section.kind,
+        binding = LoBinding.Local, data = d, size = leading,
+        // The section's own alignment: there is no symbol to inherit one from,
+        // and an AArch64 literal pool loaded with `ldr q0` faults if it lands
+        // under-aligned.
+        alignment = section.alignment, weak = false, relocs = []LoReloc(0),
+      },
+    )
   }
+  return []LoAtom(0)
+}
 
-  i = 0
+// The end (exclusive) of the alias group starting at `order[gi]` (every symbol
+// sharing `order[gi]`'s offset), that offset, and the atom's alignment: the
+// first atom in a section inherits the section's own alignment (no symbol to
+// take it from), a later one takes its aliases' own declared alignment.
+fn loGroupExtentAndAlign(
+  order: []int, symbols: []LoRawSymbol, section: LoRawSection, gi: int,
+): (int, int, int) {
+  let off = symbols[order[gi]].offset
+  let maxAlign = 1
+  if (off == 0) {
+    maxAlign = section.alignment
+  }
+  let gj = gi
+  while (gj < len(order) && symbols[order[gj]].offset == off) {
+    if (symbols[order[gj]].alignment > maxAlign) {
+      maxAlign = symbols[order[gj]].alignment
+    }
+    gj = gj + 1
+  }
+  return (gj, off, maxAlign)
+}
+
+// Which symbol in the alias group [gi, gj) names the atom: prefer a global,
+// and a strong (non-weak) one, over a local or weak alias.
+fn loGroupPrimary(order: []int, symbols: []LoRawSymbol, gi: int, gj: int): int {
+  let primary = order[gi]
+  let k = gi
+  while (k < gj) {
+    let s = symbols[order[k]]
+    let p = symbols[primary]
+    let better = (s.binding == LoBinding.Global && p.binding != LoBinding.Global) ||
+      (s.binding == LoBinding.Global && p.binding == LoBinding.Global && !s.weak && p.weak)
+    if (better) {
+      primary = order[k]
+    }
+    k = k + 1
+  }
+  return primary
+}
+
+// Walks `order` (sorted by offset) one offset-group at a time. Symbols sharing
+// an offset are aliases -> one atom; the group spans until the next distinct
+// offset, which also bounds the atom's extent.
+fn loAtomizeSymbolGroups(
+  section: LoRawSection, order: []int, symbols: []LoRawSymbol,
+  atoms: []LoAtom, atomOfSymbol: []int,
+): []LoAtom {
+  let gi = 0
+  while (gi < len(order)) {
+    let (gj, off, maxAlign) = loGroupExtentAndAlign(order, symbols, section, gi)
+    let primary = loGroupPrimary(order, symbols, gi, gj)
+    let nextOffset = section.size
+    if (gj < len(order)) {
+      nextOffset = symbols[order[gj]].offset
+    }
+    assert(nextOffset >= off)
+    // Span to the next symbol, not the symbol's declared size: any
+    // padding/data between a symbol's size and the next symbol still carries
+    // bytes and relocations that must belong to some atom.
+    let size = nextOffset - off
+    let atomIdx = len(atoms)
+    let k = gi
+    while (k < gj) {
+      atomOfSymbol[order[k]] = atomIdx
+      k = k + 1
+    }
+    let psym = symbols[primary]
+    let d = []u8(0)
+    if (!loIsBss(section.kind)) {
+      // Clamp the data slice to what the section actually holds: a symbol's
+      // declared size can exceed its extent to the next symbol; the trailing
+      // bytes are then implicitly zero.
+      let n = size
+      if (n > len(section.data) - off) {
+        n = len(section.data) - off
+      }
+      d = section.data[off:off + n]
+    }
+    atoms = append(
+      atoms,
+      LoAtom{
+        name = psym.name, kind = section.kind,
+        binding = psym.binding, data = d, size = size, alignment = maxAlign,
+        weak = psym.weak, relocs = []LoReloc(0),
+      },
+    )
+    gi = gj
+  }
+  return atoms
+}
+
+// Section-offset targets carry a raw section byte offset with no addend of
+// their own; rebase that offset to be relative to the atom it falls in and
+// fold the difference into the addend. Symbol and global targets keep the
+// reloc's own addend untouched.
+fn loApplyRelocsToAtoms(relocs: []LoRawReloc, ctx: LoAtomizeCtx, atoms: []LoAtom): ()! {
+  let i = 0
   while (i < len(relocs)) {
     let r = relocs[i]
     let owner = loResolveSectionOffset(
-      symbols, perSection[r.section].items,
-      atomOfSymbol, sectionAnon[r.section], r.offset,
+      ctx.symbols, ctx.perSection[r.section].items,
+      ctx.atomOfSymbol, ctx.sectionAnon[r.section], r.offset,
     )?
     let intraOffset = r.offset - owner.base
 
-    // Section-offset targets carry a raw section byte offset with no addend of
-    // their own; rebase that offset to be relative to the atom it falls in and
-    // fold the difference into the addend. Symbol and global targets keep the
-    // reloc's own addend untouched.
     let addend = r.addend
     let target = loGlobalRef(r.target.name)
     if (r.target.kind == LoRawTargetKind.Symbol) {
-      target = loLocalRef(atomOfSymbol[r.target.symbol])
+      target = loLocalRef(ctx.atomOfSymbol[r.target.symbol])
     } else if (r.target.kind == LoRawTargetKind.SectionOffset) {
       let t = loResolveSectionOffset(
-        symbols, perSection[r.target.section].items,
-        atomOfSymbol, sectionAnon[r.target.section], r.target.offset,
+        ctx.symbols, ctx.perSection[r.target.section].items,
+        ctx.atomOfSymbol, ctx.sectionAnon[r.target.section], r.target.offset,
       )?
       addend = addend + r.target.offset - t.base
       target = loLocalRef(t.atom)
@@ -559,8 +652,6 @@ fn atomizeModule(
     )
     i = i + 1
   }
-
-  return LoModule{ name = name, atoms = atoms }
 }
 
 // The names `modules` reference through a GLOBAL relocation without any of
