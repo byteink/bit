@@ -1671,11 +1671,20 @@ slice reachable on the pointer's behalf, not the caller: the slice stays alive
 for as long as the pointer's own value is live at the point it was computed,
 and, when `ptrOf(s)` is written directly as a class field's initializer in a
 composite literal (`X{ f = ptrOf(s) }`, §12.2), for as long as that object
-stays reachable. A pointer that instead flows through an intermediate binding
-before it is stored, is assigned through a selector (`obj.f = ptrOf(s)`), is
-stored into an array or slice element, or is passed to a function that stores
-it, is not yet covered by this guarantee - treat the slice's own liveness as
-the program's responsibility there.
+stays reachable.
+
+The same holds when the pointer reaches that field through ONE intermediate
+binding, as in `let p = ptrOf(s)` followed by `X{ f = p }`, provided the
+binding is never reassigned and no branch or loop is entered between the two
+statements. A second hop, a reassigned binding, or a binding read inside a
+loop body or a conditional is outside the guarantee: the compiler refuses
+those rather than risk a wrong answer, so they behave as if the guarantee were
+absent.
+
+A pointer that is assigned through a selector (`obj.f = ptrOf(s)`), stored
+into an array or slice element, or passed to a function that stores it, is
+also not covered. Treat the slice's own liveness as the program's
+responsibility in every case this section does not name.
 
 ```
 let cell = []i64(1)                        // one shared word, kept alive here
