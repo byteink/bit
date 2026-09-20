@@ -109,115 +109,148 @@ fn checkMemberCallResult(c: Checker, node: int, callee: int): int {
 // Infers a call expression's result type: a void builtin is `()`; a top-level
 // function call is its declared result; `chan<T>(n)`/`map<K,V>{}`-style
 // constructors are the constructed type. Unknown callees infer to invalid (0).
+// The `Tag.Ident` callee half of `checkCall`'s dispatch: local binding > user
+// declaration > builtin/atomic/introspection builtins (SPEC 17.5's precedence,
+// explained on the section below). Split off `checkCall` itself purely to
+// keep that function under E0201's 80-line limit; further split into
+// `checkCallIdentConv` for the same reason applied to E0204's complexity 10 —
+// each half stays under it on its own rather than trading one unlisted
+// finding for another.
+fn checkCallIdent(c: Checker, node: int, callee: int, name: string): int {
+  // PRECEDENCE: local binding > user declaration > builtin (SPEC 17.5).
+  // Matching the callee's SOURCE TEXT against the predeclared names first put
+  // every one of them ahead of the user's own declarations, so a program
+  // declaring `close`/`osExit`/`print` typed its own call as the builtin's `()`
+  // and failed with a spurious E0073 — while `fsClose`/`timeMonoNs` typed
+  // wrongly but silently. Shadowing a predeclared name is legal (E0048 is a
+  // warning), so these must be consulted BEFORE the cascade below. lowerCall
+  // hoists the same two paths in the same order; the two must agree, or the
+  // checker and the lowerer disagree about which function is being called.
+  // Calling a func-typed value `f(...)` yields the value's result type, keyed
+  // by the callee NODE — the flat env is NAME-keyed module-wide (#4570).
+  let ev = identEnvType(c, callee, name)
+  if (ev != 0 && c.ctx.types[ev].kind == TypeKind.Func) {
+    return c.ctx.types[ev].result
+  }
+  // A generic call `identity(42)` whose result is a bare type parameter binds
+  // that parameter from the matching argument's type.
+  let g = genericResultAt(c, name, node)
+  if (g != -1) {
+    return g
+  }
+  let r = funcResultLookup(c, name)
+  if (r != 0) {
+    return r
+  }
+  if (builtinReturnsVoid(name)) {
+    return c.ctx.voidId
+  }
+  // `len`/`cap` always yield i64 regardless of argument.
+  if (name == "len" || name == "cap") {
+    return primType(c.ctx, 3)
+  }
+  // `append(slice, ...)` yields the slice's type (its first argument's).
+  if (name == "append") {
+    return checkArgType(c, node, 0)
+  }
+  return checkCallIdentBuiltinArgs(c, node, name)
+}
+
+// The atomic/introspection builtins half of `checkCallIdent`'s dispatch —
+// every one of these is zero- or fixed-arity with no user-declaration or
+// generic-binding precedence left to check, so this half never re-touches
+// `callee`, only `node`/`name`.
+fn checkCallIdentBuiltinArgs(c: Checker, node: int, name: string): int {
+  // Atomics (§11.5): the `*T` first argument's element type drives the result.
+  // Load and the rmw family return `T`; `atomicCmpxchg` returns `bool`.
+  if (name == "atomicLoad" || name == "atomicAdd" || name == "atomicSub" ||
+    name == "atomicAnd" || name == "atomicOr" || name == "atomicXchg") {
+    return c.ctx.types[checkArgType(c, node, 0)].elem
+  }
+  if (name == "atomicCmpxchg") {
+    return primType(c.ctx, 10)
+  }
+  return checkCallIdentIntrospect(c, node, name)
+}
+
+// The address/introspection builtins half of `checkCallIdentBuiltinArgs`'s
+// dispatch, split for the same complexity-10 reason.
+fn checkCallIdentIntrospect(c: Checker, node: int, name: string): int {
+  // `ptrOf(s: []T): *T` — a raw pointer to the slice's element 0. Module
+  // state (§11.11) is also addressable: its cell has a static address, which
+  // is the addressability the atomic builtins need. A scalar cell yields
+  // `*T`; an array cell yields a pointer to its element 0, like a slice.
+  if (name == "ptrOf") {
+    let at = checkArgType(c, node, 0)
+    if (at != 0 && c.ctx.types[at].kind == TypeKind.Prim) {
+      return mkPtr(c.ctx, at)
+    }
+    return mkPtr(c.ctx, c.ctx.types[at].elem)
+  }
+  // `entryOf(f): *byte` (§11.10) — a named function's code entry address. The
+  // result never depends on the operand: it is one machine address whatever
+  // `f`'s signature is, so unlike `ptrOf` there is no argument to inspect.
+  // validate.bit is what proves the operand may have an address at all.
+  if (name == "entryOf") {
+    return mkPtr(c.ctx, primType(c.ctx, 4))
+  }
+  // `stackMapsBegin()`/`stackMapsEnd(): *byte` (§11.12) — the two bounds of
+  // the stack-map table (ABI.md §4). Zero-arity by construction: there is
+  // exactly one table per link, so there is nothing to select and no argument
+  // to inspect. validate.bit is what rejects a call that passes one.
+  // `debugLinesBegin()`/`debugLinesEnd()` (#3285) join on the identical
+  // proof: one half-open extent per link, for the debug-info table instead.
+  if (name == "stackMapsBegin" || name == "stackMapsEnd" ||
+      name == "debugLinesBegin" || name == "debugLinesEnd") {
+    return mkPtr(c.ctx, primType(c.ctx, 4))
+  }
+  // `syscall(nr, a0..a5): i64` (§11.8) — variable arity, every operand and
+  // the result i64, so the result needs no argument inspection at all.
+  if (name == "syscall") {
+    return primType(c.ctx, 3)
+  }
+  return checkCallIdentConv(c, node, name)
+}
+
+// The conversion half of `checkCallIdent`'s dispatch: a runtime-primitive
+// builtin, a primitive-type conversion, or a user-declared-type conversion
+// (including one routed through `init`). Reached only once every builtin and
+// precedence-driven case above has been ruled out.
+fn checkCallIdentConv(c: Checker, node: int, name: string): int {
+  // A runtime-primitive builtin (`cryptoRandomBytes`, `fsReadAll`, ...).
+  let bt = builtinResultType(c, name)
+  if (bt != -1) {
+    return bt
+  }
+  // A primitive name used as a call is a conversion: `f64(x)` -> f64.
+  let p = primIndexByName(name)
+  if (p >= 0) {
+    return primType(c.ctx, p)
+  }
+  // A USER-DECLARED type used as a call is equally a conversion (SPEC §12.9),
+  // and its result is that type: `E(car)`, `MyInt(5)`, `Point(p)`. #1898 —
+  // without this the call fell to the `return 0` below and was left with the
+  // INVALID type id, which no diagnostic reports: `bit check` exited 0 and the
+  // lowerer then refused the whole enclosing function with no span, because a
+  // conversion whose destination type is 0 cannot be emitted.
+  let ut = userTypeLookup(c, name)
+  if (ut != 0) {
+    // A class declaring 'init' (SPEC §10.4, #3371) routes THIS call through
+    // the constructor rather than the plain identity/alias conversion above
+    // — `Account(500)` calls 'init', it does not convert 500 to Account.
+    // classinit.bit is permissive (returns `ut` unchanged) when there is no
+    // 'init', so the two branches agree on every other user type.
+    return classConstructResultType(c, ut, classInitNode(c, ut))
+  }
+  return 0
+}
+
 fn checkCall(c: Checker, node: int): int {
   let callee = kidsOf(c.tree, node)[0]
   let cn = getNode(c.tree, callee)
   if (cn.tag == Tag.Ident) {
     let name = c.source[cn.span.start:cn.span.end]
-    // PRECEDENCE: local binding > user declaration > builtin (SPEC 17.5).
-    // Matching the callee's SOURCE TEXT against the predeclared names first put
-    // every one of them ahead of the user's own declarations, so a program
-    // declaring `close`/`osExit`/`print` typed its own call as the builtin's `()`
-    // and failed with a spurious E0073 — while `fsClose`/`timeMonoNs` typed
-    // wrongly but silently. Shadowing a predeclared name is legal (E0048 is a
-    // warning), so these must be consulted BEFORE the cascade below. lowerCall
-    // hoists the same two paths in the same order; the two must agree, or the
-    // checker and the lowerer disagree about which function is being called.
-    // Calling a func-typed value `f(...)` yields the value's result type, keyed
-    // by the callee NODE — the flat env is NAME-keyed module-wide (#4570).
-    let ev = identEnvType(c, callee, name)
-    if (ev != 0 && c.ctx.types[ev].kind == TypeKind.Func) {
-      return c.ctx.types[ev].result
-    }
-    // A generic call `identity(42)` whose result is a bare type parameter binds
-    // that parameter from the matching argument's type.
-    let g = genericResultAt(c, name, node)
-    if (g != -1) {
-      return g
-    }
-    let r = funcResultLookup(c, name)
-    if (r != 0) {
-      return r
-    }
-    if (builtinReturnsVoid(name)) {
-      return c.ctx.voidId
-    }
-    // `len`/`cap` always yield i64 regardless of argument.
-    if (name == "len" || name == "cap") {
-      return primType(c.ctx, 3)
-    }
-    // `append(slice, ...)` yields the slice's type (its first argument's).
-    if (name == "append") {
-      return checkArgType(c, node, 0)
-    }
-    // Atomics (§11.5): the `*T` first argument's element type drives the result.
-    // Load and the rmw family return `T`; `atomicCmpxchg` returns `bool`.
-    if (name == "atomicLoad" || name == "atomicAdd" || name == "atomicSub" ||
-      name == "atomicAnd" || name == "atomicOr" || name == "atomicXchg") {
-      return c.ctx.types[checkArgType(c, node, 0)].elem
-    }
-    if (name == "atomicCmpxchg") {
-      return primType(c.ctx, 10)
-    }
-    // `ptrOf(s: []T): *T` — a raw pointer to the slice's element 0. Module
-    // state (§11.11) is also addressable: its cell has a static address, which
-    // is the addressability the atomic builtins need. A scalar cell yields
-    // `*T`; an array cell yields a pointer to its element 0, like a slice.
-    if (name == "ptrOf") {
-      let at = checkArgType(c, node, 0)
-      if (at != 0 && c.ctx.types[at].kind == TypeKind.Prim) {
-        return mkPtr(c.ctx, at)
-      }
-      return mkPtr(c.ctx, c.ctx.types[at].elem)
-    }
-    // `entryOf(f): *byte` (§11.10) — a named function's code entry address. The
-    // result never depends on the operand: it is one machine address whatever
-    // `f`'s signature is, so unlike `ptrOf` there is no argument to inspect.
-    // validate.bit is what proves the operand may have an address at all.
-    if (name == "entryOf") {
-      return mkPtr(c.ctx, primType(c.ctx, 4))
-    }
-    // `stackMapsBegin()`/`stackMapsEnd(): *byte` (§11.12) — the two bounds of
-    // the stack-map table (ABI.md §4). Zero-arity by construction: there is
-    // exactly one table per link, so there is nothing to select and no argument
-    // to inspect. validate.bit is what rejects a call that passes one.
-    // `debugLinesBegin()`/`debugLinesEnd()` (#3285) join on the identical
-    // proof: one half-open extent per link, for the debug-info table instead.
-    if (name == "stackMapsBegin" || name == "stackMapsEnd" ||
-        name == "debugLinesBegin" || name == "debugLinesEnd") {
-      return mkPtr(c.ctx, primType(c.ctx, 4))
-    }
-    // `syscall(nr, a0..a5): i64` (§11.8) — variable arity, every operand and
-    // the result i64, so the result needs no argument inspection at all.
-    if (name == "syscall") {
-      return primType(c.ctx, 3)
-    }
-    // A runtime-primitive builtin (`cryptoRandomBytes`, `fsReadAll`, ...).
-    let bt = builtinResultType(c, name)
-    if (bt != -1) {
-      return bt
-    }
-    // A primitive name used as a call is a conversion: `f64(x)` -> f64.
-    let p = primIndexByName(name)
-    if (p >= 0) {
-      return primType(c.ctx, p)
-    }
-    // A USER-DECLARED type used as a call is equally a conversion (SPEC §12.9),
-    // and its result is that type: `E(car)`, `MyInt(5)`, `Point(p)`. #1898 —
-    // without this the call fell to the `return 0` below and was left with the
-    // INVALID type id, which no diagnostic reports: `bit check` exited 0 and the
-    // lowerer then refused the whole enclosing function with no span, because a
-    // conversion whose destination type is 0 cannot be emitted.
-    let ut = userTypeLookup(c, name)
-    if (ut != 0) {
-      // A class declaring 'init' (SPEC §10.4, #3371) routes THIS call through
-      // the constructor rather than the plain identity/alias conversion above
-      // — `Account(500)` calls 'init', it does not convert 500 to Account.
-      // classinit.bit is permissive (returns `ut` unchanged) when there is no
-      // 'init', so the two branches agree on every other user type.
-      return classConstructResultType(c, ut, classInitNode(c, ut))
-    }
-    return 0
+    return checkCallIdent(c, node, callee, name)
   }
   // `chan<T>(n)` / `[]T(n)` / `map<K,V>()` — the callee is a type node, so the
   // result is that type.
