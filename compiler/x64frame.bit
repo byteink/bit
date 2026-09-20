@@ -304,6 +304,97 @@ fn xAlignFrame(raw: int, savedCount: int, needsCallAlign: bool): int {
   return raw + (16 - (rem - needed))
 }
 
+// The bytes xAlignFrame adds to `raw` purely for ALIGNMENT: 0 or 8, never
+// anything else. `raw` is `8 * (numSlots + len(savedXmm))` at the one real call
+// site (x64compile.bit), so its residue mod 16 is 0 or 8 and xAlignFrame either
+// leaves it alone or moves it to the other one.
+fn xAlignPad(raw: int, savedCount: int, needsCallAlign: bool): int {
+  let pad = xAlignFrame(raw, savedCount, needsCallAlign) - raw
+  assert(pad == 0 || pad == 8)
+  return pad
+}
+
+// Whether the frame already preserves `r`.
+fn xRegSaved(saved: []XReg64, r: XReg64): bool {
+  for s of saved {
+    if (s == r) {
+      return true
+    }
+  }
+  return false
+}
+
+// #5667: when the frame is nothing BUT 8 bytes of alignment padding, buy it
+// with one more callee-saved push instead of `subq $0x8, %rsp` in the prologue
+// plus `addq $0x8, %rsp` on every return path. Same instruction count, 2 bytes
+// against 7 at each site, and what clang emits. A push flips the saved count's
+// parity, which is the one thing xAlignFrame's 8 bytes exist to correct, so the
+// assert below holds the frame's TOTAL footprint — 8 (return address) + 8 (push
+// rbp) + 8*savedCount + frameSize — exactly where it was. Only which
+// instruction pads it changes. Any other padding amount, and the case where no
+// register is free, keep the explicit adjust.
+//
+// `raw != 0` is REFUSED, and it is not a conservatism — it is the boundary
+// where this stops being a win and becomes a regression. The push only removes
+// the adjust when the adjust was the padding and nothing else: with a real
+// frame under it the `subq` survives (8 bytes smaller, but the encoding is
+// always imm32, so the same seven bytes), and the push/pop pair is then pure
+// addition — one more instruction in the prologue and one on EVERY return path.
+// checkX64CompileLoop (x64compilecheck.bit) is exactly that shape: one
+// poll-cache slot, `raw` 8, frameSize 16.
+//
+// THE PUSHED REGISTER IS A REAL SAVE, which is the whole correctness argument.
+// It is appended to `savedGpr` BEFORE the XFrame is built, so every consumer of
+// that list sees it and none can be left describing a prologue that no longer
+// exists: xEmitPrologue pushes it and records its Win64 UWOP_PUSH_NONVOL in the
+// same statement (x64call.bit), xEmitEpilogue pops it on every return path,
+// x64compile.bit's savedRegs loop lists it in the GC stack map's recovery table
+// at the frame offset it really occupies, and xSpillOffset/xXmmSaveOffset are
+// both len(savedGpr)-relative so every slot below it moves with it. A frame
+// whose unwind data disagrees with its prologue is a corrupted stack walk at
+// collection time, not a fault at the point of the bug.
+//
+// Candidates come from `regs`, this function's ALLOCATABLE file: a register the
+// allocator could have handed out is one nothing else in the backend pins
+// (xScratch1/2/3 are r10/r11/r12, none of them in xMasterGprs; an `asm` or
+// `syscall` block's reserved registers are removed upstream by xCollectReserved;
+// rsp/rbp are not in the file at all). The body cannot write it — had it, it
+// would be in `used` and xBuildSavedGpr would already have taken it — so the
+// push/pop pair is value-neutral, and it is callee-saved, so preserving it is
+// what this frame owes its caller anyway.
+//
+// `isNaked` is refused outright: a @naked function runs on its caller's frame
+// and emits no prologue (x64compile.bit §10.3.1), so the push would never be
+// issued while the pop ate the return address. Its file carries no callee-saved
+// register either, which makes the guard belt and braces rather than the only
+// thing standing between here and that.
+fn xPadSavedGpr(
+  cc: XCallConv, regs: []XReg64, saved: []XReg64,
+  raw: int, needsCallAlign: bool, isNaked: bool,
+): []XReg64 {
+  let n = len(saved)
+  if (isNaked || raw != 0 || xAlignPad(raw, n, needsCallAlign) != 8) {
+    return saved
+  }
+  for r of regs {
+    if (xIsCalleeSavedInt(cc, r) && !xRegSaved(saved, r)) {
+      let padded = append(saved, r)
+      // Against `n`, READ BEFORE THE APPEND. `append` may extend `saved` in
+      // place (SPEC §16: only the returned value is guaranteed to observe the
+      // growth, but the destination is permitted to), and on this build it
+      // does — so `len(saved)` here would be `len(padded)` and the assertion
+      // would compare the padded frame against itself, which cannot fail.
+      assert(len(padded) == n + 1)
+      assert(
+          8 * len(padded) + xAlignFrame(raw, len(padded), needsCallAlign) ==
+          8 * n + xAlignFrame(raw, n, needsCallAlign),
+      )
+      return padded
+    }
+  }
+  return saved
+}
+
 // The ops whose x86-64 emitter plants a `call` REGARDLESS of build mode.
 // Deliberately WIDER than isSafepointOp (codegenlive.bit), which answers a
 // different question — "is this a GC point" — and so correctly omits two
