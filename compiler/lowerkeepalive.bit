@@ -6,7 +6,10 @@
 // (#4406) and the two word decomposers it backs: builderKeepAlive,
 // recordWordKeepAlive, recordParamKeepAlive, emitWordReads,
 // explodeValueWords. Also holds recordClassFieldPtrOfKeepAlive (#5669), the
-// DIRECT class-literal-field-init site road A adds.
+// DIRECT class-literal-field-init site road A adds, and (#5670)
+// findKeepAliveBase, recordLetBindingPtrOfBase, recordClassFieldPtrOfBinding-
+// KeepAlive and clearPtrOfBindings, which follow a `ptrOf(...)` through one
+// intermediate `let`/`var` binding to that same storing site.
 
 // ===========================================================================
 // Keepalive edges (#4406)
@@ -191,35 +194,141 @@ fn explodeValueWords(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []
 // `[before:]` window, and picks the `hbuf` companion straight out of the edge
 // that is already there instead of re-deriving it.
 //
-// SCOPE: THE DIRECT SHAPE ONLY, `X{ f = ptrOf(local) }`. Ruled on, and
-// deliberately not implemented, by shape:
-//   - `let p = ptrOf(local)` then `X{ f = p }` in the SAME straight-line block
-//     happens to still work, because SSA gives `p` the identical id `ptrOf`
-//     produced and this scan cannot tell the two spellings apart -- that is
-//     incidental, not analysis, and stops at the first branch, loop or
-//     reassignment between the two statements. The GENERAL indirect shape --
-//     any `let`/`var` binding of `ptrOf(...)` followed by a store somewhere
-//     else in the function -- is #5670's to prove or to fix.
-//   - `obj.f = ptrOf(local)` through a SELECTOR assignment (`lowerFieldStore`,
-//     lowerflow.bit) is a DIFFERENT storing site this function never runs for
-//     -- zero sites in the tree today, and left for #5670 or a future ticket
-//     to rule on rather than silently covered by widening this one.
-//   - an array or slice element store (`xs[i] = ptrOf(local)`) is a third
-//     storing site, also untouched here.
-//   - `ptrOf(local)` passed as a function argument that the CALLEE stores is
-//     out of reach of this function by construction: nothing at this call
-//     site sees what the callee does with it.
-// The caller has already gated this on `isRawPtrType(fty)` -- lint's
-// max-params=5 (spec/LINT.md) leaves no room for that check's own `ctx` here
-// too, and the type test belongs with the field-type decision the caller is
-// already making, not duplicated into this one.
+// SCOPE: THE DIRECT SHAPE, `X{ f = ptrOf(local) }`. `val` is the field
+// initializer's OWN lowered id, so this only finds a pair `lowerPtrOf`
+// recorded WHILE lowering this exact initializer (between `before` and now) --
+// a bare `X{ f = p }` reading an ALREADY-BOUND `p` adds no new pair in that
+// window and this returns without recording anything. That is the split with
+// `recordClassFieldPtrOfBindingKeepAlive` below, not an overlap: this one
+// owns the literal-call spelling, that one owns the intermediate binding.
 fn recordClassFieldPtrOfKeepAlive(b: IrBuilder, obj: int, val: int, before: int) {
+  let base = findKeepAliveBase(b, val, before)
+  if (base != -1) {
+    builderKeepAlive(b, obj, base)
+  }
+}
+
+// The base id `lowerPtrOf` paired with `val` in the window `b.keepAlive[before:]`,
+// or -1 if `val` was never recorded there (0 is a real value id -- block 0's
+// first instruction -- so it cannot double as "not found").
+fn findKeepAliveBase(b: IrBuilder, val: int, before: int): int {
   let i = before
   while (i + 1 < len(b.keepAlive)) {
     if (b.keepAlive[i] == val) {
-      builderKeepAlive(b, obj, b.keepAlive[i + 1])
-      return
+      return b.keepAlive[i + 1]
     }
     i = i + 2
+  }
+  return -1
+}
+
+// ===========================================================================
+// Intermediate-binding keepalive (#5670, road A on #5644, second child)
+//
+// THE GAP #5669 LEFT NAMED. `let p = ptrOf(local); ...; X{ f = p }`: `p`'s
+// live interval already reaches the field init (it is read there), and the
+// existing `(p, local)` edge `lowerPtrOf` recorded unconditionally extends
+// `local` to cover `p`'s reach -- but `p`'s own last use is that field init,
+// the same void-result shape `recordClassFieldPtrOfKeepAlive`'s banner
+// explains for the direct case. `local` dies there while `obj` (the
+// constructed object) is read on. Confirmed live on main, not assumed:
+// probe fixture, keepalive edge removed, `BIT_GC=stress` reclaimed `local`'s
+// storage and read back garbage, 10/10 -- see
+// _tests_/cases/run_classlit_ptrof_binding_keepalive.bit for the mutation
+// proof this ticket recorded.
+//
+// THE FIX TRACKS THE BINDING, NOT THE SSA ID. `recordClassFieldPtrOfKeepAlive`
+// cannot see across statements because its window starts AFTER earlier
+// statements already lowered. So `local`'s identity is carried on `p`'s own
+// `LocalBind.ptrOfBase` (lower.bit) instead: `recordLetBindingPtrOfBase`, run
+// from `lowerBinding` right after a `let`/`var` declares `p`, records it
+// there directly from the same `findKeepAliveBase` window this file already
+// uses for the direct case. `recordClassFieldPtrOfBindingKeepAlive` then reads
+// it back by NAME at the storing site and records `(obj, local)` straight --
+// one hop, never chained through `p`, for the reason `recordClassFieldPtrOf-
+// KeepAlive`'s own banner gives: `extendKeepAlive` computes every value's
+// reach once, from pre-extension intervals, so a second edge stacked on a
+// first is never followed.
+//
+// BOUNDED, ON PURPOSE: STRAIGHT-LINE, NO REASSIGNMENT, ONE HOP.
+// `ptrOfBase` is cleared by `localWrite` on ANY reassignment of the name (it
+// may no longer BE that pointer) and by `clearPtrOfBindings` on entering any
+// branch or loop (`lowerStmt`, lowerfunc.bit) -- a loop body is lowered once
+// but runs many times, so a reassignment appearing textually AFTER a read in
+// the same body would, on the second iteration, have already run before that
+// read; a branch may reassign on only some incoming paths. Neither is
+// something this single forward pass over the AST can prove sound, so both
+// are refused rather than risked -- an under-approximation, never a wrong
+// answer: a binding this analysis does not cover is simply left unrecorded,
+// same as before this ticket.
+//
+// STILL EXCLUDED, unchanged from #5669's list and not widened here:
+//   - `obj.f = ptrOf(local)` / `obj.f = p` through a SELECTOR assignment
+//     (`lowerFieldStore`, lowerflow.bit) is a DIFFERENT storing site this
+//     function never runs for -- zero sites in the tree today.
+//   - an array or slice element store (`xs[i] = ptrOf(local)` or `xs[i] = p`)
+//     is a third storing site, also untouched here.
+//   - `ptrOf(local)` (direct or via a binding) passed as a function argument
+//     that the CALLEE stores is out of reach of this function by
+//     construction: nothing at this call site sees what the callee does
+//     with it.
+//   - a binding chained through MORE than one hop (`let p = ptrOf(local); let
+//     q = p; X{ f = q }`) -- `q`'s declaration copies `p`'s value id, not a
+//     fresh `ptrOf` pair, so `recordLetBindingPtrOfBase` finds nothing to
+//     record for `q` and this stops at one level exactly as scoped.
+// ===========================================================================
+
+// Called from `lowerBinding` (lowerctrl.bit) right after a `let`/`var` name
+// binds to `value`: if `value` is exactly what a `ptrOf(...)` call just
+// produced (the window `[before:]` this body's `keepAlive` list grew by while
+// lowering the initializer), record that base on the LocalBind itself so a
+// later class-literal field init reading this name by NAME can find it. A
+// no-op for every initializer that is not a bare `ptrOf(...)` call, which is
+// every local `LocalBind.ptrOfBase` stays -1 for.
+fn recordLetBindingPtrOfBase(fc: FnCtx, idx: int, value: int, before: int) {
+  fc.env[idx].ptrOfBase = findKeepAliveBase(fc.b, value, before)
+}
+
+// Called from `lowerClassLitFieldInit` (lowerlit.bit) alongside
+// `recordClassFieldPtrOfKeepAlive`, after that one has already tried and
+// possibly found nothing: if the field's initializer expression is a bare
+// name and that name currently carries a `ptrOfBase` (set by
+// `recordLetBindingPtrOfBase`, not yet cleared by a reassignment or a branch/
+// loop), record `obj` directly against that base -- the same one-hop shape
+// the direct case uses, sourced from the binding instead of from `val`'s own
+// SSA id.
+fn recordClassFieldPtrOfBindingKeepAlive(fc: FnCtx, obj: int, node: int) {
+  if (getNode(fc.c.tree, node).tag != Tag.Ident) {
+    return
+  }
+  let n = getNode(fc.c.tree, node)
+  let idx = envIndex(fc, fc.c.source[n.span.start:n.span.end])
+  if (idx == -1) {
+    return
+  }
+  let base = fc.env[idx].ptrOfBase
+  if (base != -1) {
+    builderKeepAlive(fc.b, obj, base)
+  }
+}
+
+// Invalidates every locally-tracked `ptrOfBase` on entering a branch or loop
+// (`lowerStmt`, lowerfunc.bit): a single forward pass over the AST cannot
+// prove a binding's association still holds past a construct that may run its
+// body zero, one or many times, or on only some incoming paths -- see this
+// file's banner above.
+// Called first thing by every branch/loop lowerer (lowerIf, lowerWhile,
+// lowerForInf, lowerForOf, lowerForIn, lowerForC, lowerMatch, lowerSwitch,
+// lowerSelect -- lowerctrl.bit/lowerflow.bit) rather than dispatched from
+// lowerStmt's tag switch, which stays untouched by this ticket. A body one of
+// these lowers may run zero, one or many times, or on only some incoming
+// paths, and a single forward pass over the AST cannot prove a `let`/`var`'s
+// ptrOf association still holds past that, so every tracked one is dropped
+// before it is entered.
+fn clearPtrOfBindings(fc: FnCtx) {
+  let i = 0
+  while (i < len(fc.env)) {
+    fc.env[i].ptrOfBase = -1
+    i = i + 1
   }
 }
