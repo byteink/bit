@@ -30,6 +30,124 @@ fn caseTest(fc: FnCtx, hasSubject: bool, subject: int, subjectTy: int, expr: int
   )
 }
 
+// Counts a switch's `SwitchCase` clauses and finds its (single) `default`
+// body, if any — `lowerSwitch` needs `m` before it can size `dflt`'s block,
+// and `defaultStmts` only once dispatch itself is done.
+fn switchCaseCounts(tree: Tree, cases: []int): (int, int) {
+  let m = 0
+  let defaultStmts = 0
+  let ci = 0
+  while (ci < len(cases)) {
+    let t = getNode(tree, cases[ci]).tag
+    if (t == Tag.SwitchCase) {
+      m = m + 1
+    } else if (t == Tag.SwitchDefault) {
+      defaultStmts = kidsOf(tree, cases[ci])[0]
+    }
+    ci = ci + 1
+  }
+  return (m, defaultStmts)
+}
+
+// Per-switch lowering state threaded from `lowerSwitch`'s setup into its two
+// halves below (the case-dispatch loop, the default/join tail): a `switch`
+// carries more independent values (the subject triple, `dflt`/`join`/`m`,
+// the pre-case value snapshot) than fit as scalar parameters under this
+// repo's 5-param ceiling. One heap allocation per `switch` STATEMENT lowered
+// (never per case), so it scales with the source, not with anything runtime
+// — negligible next to the `LoopFrame` append and the per-case blocks
+// `lowerSwitch` already allocates for the same switch.
+class SwitchLowerState {
+  hasSubject: bool,
+  subject: int,
+  subjectTy: int,
+  boolTy: int,
+  m: int,
+  dflt: int,
+  join: int,
+  preLen: int,
+  orig: []int,
+}
+
+// Runs the per-case dispatch loop of a `switch`: each `SwitchCase`'s
+// `subject == label` (OR-folded across its labels, `st.boolTy`) branches to
+// its own body block or falls through to the next test, `st.dflt`/`st.join`
+// already sized by the caller. Returns whether any case body fell through
+// to `st.join` without terminating — false when every arm returns/breaks/etc.
+fn lowerSwitchCases(fc: FnCtx, cases: []int, st: SwitchLowerState): bool {
+  let joinReachable = false
+  let seen = 0
+  let ci = 0
+  while (ci < len(cases) && !fc.failed) {
+    if (getNode(fc.c.tree, cases[ci]).tag != Tag.SwitchCase) {
+      ci = ci + 1
+      continue
+    }
+    let ck = kidsOf(fc.c.tree, cases[ci])
+    let exprs = kidsOf(fc.c.tree, ck[0])
+    let cond = caseTest(fc, st.hasSubject, st.subject, st.subjectTy, exprs[0])
+    let ei = 1
+    while (ei < len(exprs)) {
+      let bor = mkInstr(Op.BOr, st.boolTy)
+      bor.lhs = cond
+      bor.rhs = caseTest(fc, st.hasSubject, st.subject, st.subjectTy, exprs[ei])
+      cond = builderEmit(fc.b, bor)
+      ei = ei + 1
+    }
+    let bodyBlk = builderNewBlock(fc.b)
+    let nextBlk = st.dflt
+    if (seen != st.m - 1) {
+      nextBlk = builderNewBlock(fc.b)
+    }
+    let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+    br.lhs = cond
+    br.ival = bodyBlk
+    br.thenArgs = []int(0)
+    br.ival2 = nextBlk
+    br.elseArgs = []int(0)
+    builderEmit(fc.b, br)
+    builderEndBlock(fc.b)
+    builderBeginBlock(fc.b, bodyBlk)
+    fc.terminated = false
+    restoreValues(fc, st.orig)
+    let mark = len(fc.env)
+    lowerStmtList(fc, ck[1])
+    truncateEnv(fc, mark)
+    if (!fc.terminated) {
+      joinReachable = true
+      emitJump(fc, st.join, snapshotValues(fc, st.preLen))
+    }
+    builderEndBlock(fc.b)
+    restoreValues(fc, st.orig)
+    builderBeginBlock(fc.b, nextBlk)
+    seen = seen + 1
+    ci = ci + 1
+  }
+  return joinReachable
+}
+
+// Runs the "no case matched" tail of a `switch`: the default body (if any)
+// in `st.dflt`'s block (or the caller's block when there is no case at
+// all), then closes into `st.join`. Returns whether THIS half left join
+// reachable; the caller ORs it with `lowerSwitchCases`' own answer.
+fn lowerSwitchDefault(fc: FnCtx, defaultStmts: int, st: SwitchLowerState): bool {
+  fc.terminated = false
+  restoreValues(fc, st.orig)
+  if (defaultStmts != 0) {
+    let mark = len(fc.env)
+    lowerStmtList(fc, defaultStmts)
+    truncateEnv(fc, mark)
+  }
+  let joinReachable = false
+  if (!fc.terminated) {
+    joinReachable = true
+    emitJump(fc, st.join, snapshotValues(fc, st.preLen))
+  }
+  builderEndBlock(fc.b)
+  restoreValues(fc, st.orig)
+  return joinReachable
+}
+
 // Lowers a `switch (subject) { case a, b: ...; default: ... }` over a value to a
 // decision chain: each case's `subject == expr` (OR-folded across its labels)
 // branches to the body or the next test; an unmatched value falls to `default`.
@@ -55,19 +173,7 @@ fn lowerSwitch(fc: FnCtx, node: int) {
   let preLen = len(fc.env)
   let orig = snapshotValues(fc, preLen)
   let cases = kidsOf(fc.c.tree, k[1])
-  // Count the non-default cases and find the default body.
-  let m = 0
-  let defaultStmts = 0
-  let ci = 0
-  while (ci < len(cases)) {
-    let t = getNode(fc.c.tree, cases[ci]).tag
-    if (t == Tag.SwitchCase) {
-      m = m + 1
-    } else if (t == Tag.SwitchDefault) {
-      defaultStmts = kidsOf(fc.c.tree, cases[ci])[0]
-    }
-    ci = ci + 1
-  }
+  let (m, defaultStmts) = switchCaseCounts(fc.c.tree, cases)
   let join = builderNewBlock(fc.b)
   let dflt = 0
   if (m > 0) {
@@ -78,68 +184,20 @@ fn lowerSwitch(fc: FnCtx, node: int) {
     fc.loops,
     LoopFrame{ exit = join, cont = join, preLen = preLen, isSwitch = true, exitUsed = false },
   )
-  let joinReachable = false
-  let seen = 0
-  ci = 0
-  while (ci < len(cases) && !fc.failed) {
-    if (getNode(fc.c.tree, cases[ci]).tag != Tag.SwitchCase) {
-      ci = ci + 1
-      continue
-    }
-    let ck = kidsOf(fc.c.tree, cases[ci])
-    let exprs = kidsOf(fc.c.tree, ck[0])
-    let cond = caseTest(fc, hasSubject, subject, subjectTy, exprs[0])
-    let ei = 1
-    while (ei < len(exprs)) {
-      let bor = mkInstr(Op.BOr, boolTy)
-      bor.lhs = cond
-      bor.rhs = caseTest(fc, hasSubject, subject, subjectTy, exprs[ei])
-      cond = builderEmit(fc.b, bor)
-      ei = ei + 1
-    }
-    let bodyBlk = builderNewBlock(fc.b)
-    let nextBlk = dflt
-    if (seen != m - 1) {
-      nextBlk = builderNewBlock(fc.b)
-    }
-    let br = mkInstr(Op.Br, fc.c.ctx.voidId)
-    br.lhs = cond
-    br.ival = bodyBlk
-    br.thenArgs = []int(0)
-    br.ival2 = nextBlk
-    br.elseArgs = []int(0)
-    builderEmit(fc.b, br)
-    builderEndBlock(fc.b)
-    builderBeginBlock(fc.b, bodyBlk)
-    fc.terminated = false
-    restoreValues(fc, orig)
-    let mark = len(fc.env)
-    lowerStmtList(fc, ck[1])
-    truncateEnv(fc, mark)
-    if (!fc.terminated) {
-      joinReachable = true
-      emitJump(fc, join, snapshotValues(fc, preLen))
-    }
-    builderEndBlock(fc.b)
-    restoreValues(fc, orig)
-    builderBeginBlock(fc.b, nextBlk)
-    seen = seen + 1
-    ci = ci + 1
+  let st = SwitchLowerState{
+    hasSubject = hasSubject,
+    subject = subject,
+    subjectTy = subjectTy,
+    boolTy = boolTy,
+    m = m,
+    dflt = dflt,
+    join = join,
+    preLen = preLen,
+    orig = orig,
   }
-  // Positioned in the "no case matched" block (dflt when m>0, else the caller's).
-  fc.terminated = false
-  restoreValues(fc, orig)
-  if (defaultStmts != 0) {
-    let mark = len(fc.env)
-    lowerStmtList(fc, defaultStmts)
-    truncateEnv(fc, mark)
-  }
-  if (!fc.terminated) {
-    joinReachable = true
-    emitJump(fc, join, snapshotValues(fc, preLen))
-  }
-  builderEndBlock(fc.b)
-  restoreValues(fc, orig)
+  let caseReach = lowerSwitchCases(fc, cases, st)
+  let defaultReach = lowerSwitchDefault(fc, defaultStmts, st)
+  let joinReachable = caseReach || defaultReach
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   builderBeginBlock(fc.b, join)
   if (joinReachable) {
