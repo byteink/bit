@@ -224,8 +224,55 @@ if [ "${EMITTED}" -ne "${TOTAL}" ]; then
   exit 1
 fi
 
+# THE TARGET LIST IS DERIVED, NEVER RESTATED. dist/release.sh writes
+# SHA256SUMS immediately before it calls this, so the artifacts this release
+# actually produced are on disk and can be read. This paragraph used to name
+# three targets in a hardcoded sentence while every release since the Windows
+# artifact landed shipped four, and nothing noticed, because a sentence cannot
+# go red. Same failure the release checklist's asset check was rewritten to
+# avoid: a restated value certifies whatever the release happened to do the day
+# it was written.
+#
+# Filenames are <os>-<arch>; the prose says <arch>-<os>, hence the swap.
+SUMS_FILE="$(dirname "$0")/out/SHA256SUMS"
+TARGETS=""
+if [ -f "${SUMS_FILE}" ]; then
+  VER_RE="$(printf '%s' "${VERSION}" | sed 's/\./\\./g')"
+  TARGETS="$(awk 'NF>=2 {print $2}' "${SUMS_FILE}" |
+    sed -n "s/^bit-${VER_RE}-\(.*\)\.tar\.xz$/\1/p; s/^bit-${VER_RE}-\(.*\)\.zip$/\1/p" |
+    awk -F- 'NF==2 {print $2"-"$1}' | sort -u)"
+  # An empty derivation is a fact about the QUERY, not about the release: it
+  # means SHA256SUMS exists and no line in it looked like an artifact for this
+  # version. Refuse rather than print a shorter, confident sentence.
+  [ -n "${TARGETS}" ] || {
+    echo "changelog.sh: ${SUMS_FILE} names no bit-${VERSION}-<target> artifact" >&2
+    exit 1
+  }
+fi
+
+# "a", "a and b", "a, b and c" - an Oxford-comma-free list, built from however
+# many targets there turn out to be.
+target_sentence() {
+  local n item out=""
+  n="$(printf '%s\n' "${TARGETS}" | grep -c .)"
+  local i=0
+  while IFS= read -r item; do
+    i=$((i + 1))
+    if [ "${i}" -eq 1 ]; then
+      out="\`${item}\`"
+    elif [ "${i}" -eq "${n}" ]; then
+      out="${out} and \`${item}\`"
+    else
+      out="${out}, \`${item}\`"
+    fi
+  done <<< "${TARGETS}"
+  printf '%s' "${out}"
+}
+
 printf '### Artifacts\n\n'
-printf 'Published for `x86_64-linux`, `aarch64-linux` and `aarch64-macos`.\n'
+if [ -n "${TARGETS}" ]; then
+  printf 'Published for %s.\n' "$(target_sentence)"
+fi
 printf 'See `dist/README.md` for the full target table, the archive layout,\n'
 printf 'the required `BIT_STDLIB`/`BIT_LIBBITRT` environment, and the\n'
 printf '`SHA256SUMS` format.\n\n'
