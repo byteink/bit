@@ -1,0 +1,302 @@
+// compiler/buildrun.bit -- split out of build.bit (#5675, build.bit was
+// 844 lines formatted against the 800-line limit, #4099/#4103's
+// canonical-format debt on BIT_FMTZERO_DEBT). Same module as build.bit,
+// so this needs no imports and no call-site changes.
+//
+// Running and archiving what build.bit already produced, as opposed to
+// producing it: scratchNonce and the three refuse*UnderStressGc gates
+// (BIT_GC=stress, #2425) that share it, runForwardedArgs/runScratchDir/
+// runCmd (`bit run`/`bit test`'s exec), signalName (runCmd's exit-status
+// rendering), arCmd (`bit build` archiving objects into a .a), and
+// libbitrtPath (locating the runtime archive to link or archive against).
+// Moved as one group: nothing in build.bit's own IR/object/exe pipeline
+// (buildIr/buildObjCmd/buildCmd/emitAndLinkExe/writeModuleExe) calls any
+// of them.
+
+// A per-invocation nonce for scratch paths that are WRITTEN and then EXEC'd
+// (`bit run`, `bit test`). A fixed name lets two concurrent processes clobber
+// one file while another execs it — ETXTBSY, or a binary that is half one build
+// and half another, surfacing as a hang rather than an error (#1459, #1463).
+//
+// Drawn from the OS entropy pool via the `cryptoRandomBytes` primitive rather
+// than `crypto/rand`'s `randomU64`: the compiler's own module can only import
+// `std/*`, and prelude primitives need no import at all.
+fn scratchNonce(): uint {
+  let b = []byte(cryptoRandomBytes(8))
+  let x: uint = 0
+  let i = 0
+  while (i < 8) {
+    x = (x << 8) | uint(b[i])
+    i = i + 1
+  }
+  return x
+}
+
+// `bit run` and `bit test` both compile `bit`'s OWN process before doing
+// anything with the result — `run` execs the built binary, `test` execs its
+// synthetic test binary (compiler/testrun.bit) — so `BIT_GC=stress` (collect
+// at every safepoint) lands on the COMPILER's heap, not the subject, and the
+// compile does not finish in any useful time. #2425 measured `run` still
+// compiling after 60s on a six-line input, zero collections even logged,
+// while the same program as a built binary run under stress finishes
+// instantly with 162; #2979 is the identical shape for `test`. Refusing
+// before the compile starts turns a silent false-verification hang into an
+// immediate, actionable diagnostic. `cmd` and `subject` are the only things
+// that differ between the two call sites below.
+//
+// `bit build`/`bit check` are left as the existing warn-and-proceed (#1438,
+// `warnCompilerUnderStressGc`): neither execs anything afterward, so a slow
+// compile is the whole story and honestly reported.
+fn refuseCompileUnderStressGc(cmd: string, src: string, subject: string): bool {
+  if (envOr("BIT_GC", "") != "stress") {
+    return false
+  }
+  eprint("bit ${cmd}: refusing BIT_GC=stress — it would stress this compiler's own compile of ${pathBase(src)}, not ${subject}.\n")
+  return true
+}
+
+// `bit run`'s refusal (#2425): the supported route is exactly `build`'s own
+// output — a binary run directly under `BIT_GC=stress`, a single process
+// that gets the policy that was actually intended.
+fn refuseRunUnderStressGc(src: string): bool {
+  if (!refuseCompileUnderStressGc("run", src, "the program")) {
+    return false
+  }
+  eprint("bit run: build it first, then run the binary directly under BIT_GC=stress:\n")
+  eprint("bit run:   bit build ${src} -o <out> && BIT_GC=stress <out>\n")
+  return true
+}
+
+// `bit test`'s refusal (#2979). Unlike `run`, there is no `bit build`
+// equivalent that produces a runnable test binary — `injectTestMain`
+// (compiler/testgen.bit) synthesizes the `BIT_TEST_INDEX` dispatch main
+// entirely inside `bit test`'s own build pipeline, with no exposed
+// build-only step. So the diagnostic cannot honestly name "build the tests,
+// then run them" — it names the nearest real route instead: pull the logic
+// under test into a normal `fn main()` and drive IT through `bit
+// build`/`BIT_GC=stress`, same as `run`'s route.
+fn refuseTestUnderStressGc(src: string): bool {
+  if (!refuseCompileUnderStressGc("test", src, "the tests")) {
+    return false
+  }
+  eprint("bit test: BIT_GC=stress is not supported through `bit test` — it builds and execs its own synthetic test binary in one step, with no build-only equivalent to `bit build` exposed for it.\n")
+  eprint("bit test: to stress the logic under test under GC pressure, move it into a normal fn main(), then: bit build ${src} -o <out> && BIT_GC=stress <out>\n")
+  return true
+}
+
+// The ceiling `bit run <src> [args...]` forwards to the program it launches
+// (#2399) — mirrors `runtime/root/os.bit`'s `osRunMaxArgv`, the runtime-side
+// bound `bit_rt_os_run`'s fixed argv scratch actually enforces. Kept equal to
+// that literal rather than shared: this file cannot see into `runtime/`'s
+// tree, the same reason `runtime/root/fs.bit`'s `fsLinkMaxPath`
+// mirrors `fsMaxPath`. This one exists so a caller who forwards too many
+// arguments gets a specific, named rejection here rather than the runtime's
+// generic "could not launch" fallback.
+const runMaxForwardedArgs: int = 64
+
+// The tail of argv after `bit run <src>`, with the first `--` consumed as an
+// end-of-flags separator (`cli.bit`'s `cliScanArgs` implements the identical
+// rule for its own flag/operand scan) and everything else — including a
+// later literal `--` and any flag-looking token past the separator —
+// forwarded to the program verbatim. `cliFrontEnd` has already validated this
+// tail (no unknown flag before the separator), so this is pure collection,
+// not a second validation pass.
+fn runForwardedArgs(a: []string, start: int): []string {
+  let out = []string(0)
+  let sawSeparator = false
+  let i = start
+  while (i < len(a)) {
+    if (!sawSeparator && a[i] == "--") {
+      sawSeparator = true
+    } else {
+      out = append(out, a[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The directory `bit run`, `bit test` and `bit selfcheck`'s throwaway
+// write-then-exec scratch binaries are written to, on the HOST this binary
+// is actually running on (`hostBuildTarget()`, the same primitive
+// `hostBackslashSep()` in mainpaths.bit already relies on — never the
+// `--target` being cross-compiled to). POSIX's conventional override is
+// `$TMPDIR` (mktemp(3), Python's tempfile, Node's os.tmpdir() all prefer it
+// the same way), falling back to `/tmp` when unset — never a hard failure,
+// since `envOr` only consults the variable when it is actually set. Every
+// harness under `_tests_/bit/**` and the package-fetch scratch paths
+// (`pmfetchtail.bit`, `pmfetchresolvecheck.bit`) already follow this; this
+// helper used to special-case POSIX to a bare `/tmp`, which was the one
+// inconsistent spelling left (#4173). Windows has no /tmp at all: the
+// conventional lookup there is `%TEMP%`, then `%TMP%`, matching what
+// `GetTempPathW` itself checks first — `env`/`envOr` already resolve
+// through the runtime's own `envp` scan (`runtime/root/os.bit`), which is
+// populated on every target including Windows, so this needs no new
+// runtime primitive. The literal fallback is Windows' own documented
+// default (`GetTempPathW`'s own last resort) for the vanishingly rare case
+// neither variable is set. `envOr` never returns "" here — the final
+// argument is always non-empty — so this can never yield an empty scratch
+// dir and never panics; an unwritable result still surfaces cleanly via
+// `buildCmd`'s own "bit: cannot write ..." diagnostic below, same as today.
+fn runScratchDir(): string {
+  if (isWindowsTarget(hostBuildTarget())) {
+    return envOr("TEMP", envOr("TMP", "C:\\Windows\\Temp"))
+  }
+  return envOr("TMPDIR", "/tmp")
+}
+
+// `bit run <src> [args...]`: build for the host, launch the binary with
+// `argv` forwarded after its own path, and exit with its exit code (#2399).
+// Builds to a scratch-dir path keyed by the source stem plus a random nonce
+// — a FIXED name is written and then exec'd, which is exactly the
+// clobber/ETXTBSY shape #1459 records, and two agents running `bit run` on
+// same-named modules is routine here. Returns the child's exit code, or 1
+// if the build failed, or 1 if it refused (BIT_GC=stress, see
+// refuseRunUnderStressGc above), or 2 if `argv` exceeds
+// `runMaxForwardedArgs` (a usage error, same class as every other CLI
+// rejection — never a truncation).
+fn runCmd(src: string, argv: []string): int {
+  if (refuseRunUnderStressGc(src)) {
+    return 1
+  }
+  if (len(argv) > runMaxForwardedArgs) {
+    eprint("bit run: too many arguments to forward (max ${runMaxForwardedArgs}, got ${len(argv)})\n")
+    return 2
+  }
+  let tmp = "${runScratchDir()}/bit-run-${pathStem(src)}-${scratchNonce()}"
+  if (!buildCmd(src, tmp, hostBuildTarget(), false, false)) {
+    return 1
+  }
+  let code = osRun(tmp, argv)
+  // Best-effort cleanup; a leftover temp binary is harmless, so ignore errors.
+  fsRemove(tmp)
+  // `osRun`'s three outcomes (ABI.md §19). A signal death is NOT a launch
+  // failure: the program ran, then crashed, so say which signal killed it and
+  // exit 128+sig the way a shell would. Naming `tmp` is wrong in either case —
+  // `fsRemove` above already deleted it (#2019).
+  if (code <= 0 - 100) {
+    let sig = 0 - code - 100
+    eprint("bit: ${pathBase(src)} was killed by ${signalName(sig)}\n")
+    return 128 + sig
+  }
+  if (code < 0) {
+    eprint("bit: could not launch the program built from ${pathBase(src)}\n")
+    return 1
+  }
+  return code
+}
+
+// The signals a `bit run` child realistically dies on, named. Anything else
+// reports its number — the point is to stop saying "could not run", not to
+// carry a full signal table. EVERY branch parenthesises the number, including
+// the fallback: _tests_/bit/runcmd.bit reads it back out to assert the exit code
+// is 128 plus the signal actually named, and one shape is all it has to parse.
+fn signalName(sig: int): string {
+  if (sig == 4) {
+    return "SIGILL (4)"
+  }
+  if (sig == 6) {
+    return "SIGABRT (6)"
+  }
+  if (sig == 8) {
+    return "SIGFPE (8)"
+  }
+  if (sig == 9) {
+    return "SIGKILL (9)"
+  }
+  if (sig == 10) {
+    return "SIGBUS (10)"
+  }
+  if (sig == 11) {
+    return "SIGSEGV (11)"
+  }
+  if (sig == 13) {
+    return "SIGPIPE (13)"
+  }
+  return "an unnamed signal (${sig})"
+}
+
+// `bit test`'s CLI entry point (`testCmd`) and the directory walk behind its
+// recursion into sub-modules (#2247) live in testrun.bit — it calls
+// `buildIr`/`readRtArchive`/`writeModuleExe` above, and `moduleRootProblem`
+// below, same as `run`/`build` do, but its own body outgrew what belonged
+// beside them here.
+
+// `bit ar <out.a> <obj...> [--target t]`: bundles already-emitted relocatable
+// objects into an `ar` archive (#1398) — the `ar rcs` half of the toolchain
+// that `bit build --emit-obj` feeds. The name encoding follows the target's own
+// convention (BSD for Mach-O, GNU for ELF), which is what parseArchive and every
+// platform `ar` expect. Each member is named by its file's basename. `a` is the
+// whole argv, so a[2] is the output and a[3..] the inputs.
+fn arCmd(a: []string): bool {
+  let out = a[2]
+  let members = []ArMember(0)
+  let target = hostBuildTarget()
+  let ai = 3
+  while (ai < len(a)) {
+    if ((a[ai] == "--target" || a[ai] == "-t") && ai + 1 < len(a)) {
+      let ti = parseBuildTarget(a[ai + 1])
+      if (ti < 0) {
+        eprint("bit ar: unknown target '${a[ai + 1]}'\n")
+        return false
+      }
+      target = buildTargetOf(ti)
+      ai = ai + 2
+      continue
+    }
+    let data = readFile(a[ai]) catch e {
+      eprint("bit ar: ${a[ai]}: ${e.message()}\n")
+      return false
+    }
+    // Refuse a member that is not an object (#1876). Checked here rather than
+    // after the loop so the error names the offending file while it is in hand,
+    // and so nothing is written when any input is bad — a partial archive is
+    // worse than none, because it looks like a successful build.
+    let raw = []byte(data)
+    if (!arIsObject(raw)) {
+      eprint("bit ar: ${a[ai]}: not a relocatable object (no ELF or Mach-O magic)\n")
+      return false
+    }
+    members = append(members, ArMember{ name = pathBase(a[ai]), data = raw })
+    ai = ai + 1
+  }
+  if (len(members) == 0) {
+    eprint("bit ar: no input objects\n")
+    return false
+  }
+  let format = arFormatGnu()
+  if (isMachoTarget(target)) {
+    format = arFormatBsd()
+  }
+  writeFile(out, string(writeArchive(members, format))) catch e {
+    eprint("bit ar: cannot write ${out}: ${e.message()}\n")
+    return false
+  }
+  return true
+}
+
+// The runtime archive this compiler links against, per target. Overridable so a
+// build tree that keeps it elsewhere still works, matching the seed's
+// BIT_LIBBITRT — though an override names ONE archive, so it only makes sense
+// alongside a matching --target.
+//
+// Already correct for x86_64-windows with no Windows-specific branch: `name`
+// is data-driven off buildTargetName ("x86_64-windows"), so this resolves to
+// bit-out/lib/x86_64-windows/libbitrt.a like every other target. That archive
+// doesn't exist yet (#3341) — buildCmd reads it via readRtArchive before
+// touching the front end, so a LINKING Windows build fails there with the
+// real readFile error naming this exact path, an accurate refusal rather than
+// a separately-maintained one that could drift. `-c --emit-obj` never calls
+// readRtArchive (no link performed), so it is unaffected by the absence.
+fn libbitrtPath(target: BuildTarget): string {
+  let name = buildTargetName(target)
+  let override = envOr("BIT_LIBBITRT", "")
+  if (len(override) > 0) {
+    return override
+  }
+  let near = resolveNearExe("lib/${name}/libbitrt.a")
+  if (len(near) > 0) {
+    return near
+  }
+  return "bit-out/lib/${name}/libbitrt.a"
+}

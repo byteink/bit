@@ -1878,7 +1878,7 @@ it just built, `test` a synthetic `BIT_TEST_INDEX`-dispatch binary
 would ever reach that exec: the compile alone does not finish in useful time
 (measured: a six-line input still compiling after 60s, zero collections
 even logged). Both therefore **refuse** `BIT_GC=stress` outright
-(`compiler/build.bit`'s `refuseRunUnderStressGc`/`refuseTestUnderStressGc`,
+(`compiler/buildrun.bit`'s `refuseRunUnderStressGc`/`refuseTestUnderStressGc`,
 the latter called from `compiler/testrun.bit`'s `testCmd`) rather than
 appearing to hang.
 
@@ -3502,7 +3502,7 @@ ALREADY-recognized `osRun` identifier sidesteps that entirely: this compiler
 validates no builtin call's arity (`compiler/validatecall.bit`'s `vCall`),
 so stage0 accepts a 2-argument call to a name it has always known, with
 nothing new required of its own predeclared-name table. Every caller was
-updated in the same commit instead: `compiler/build.bit`'s `runCmd`,
+updated in the same commit instead: `compiler/buildrun.bit`'s `runCmd`,
 `compiler/pmfetchtail.bit`'s `runGit`, and the fixtures that call the
 predeclared `osRun` builtin directly rather than through a `std/os` wrapper
 (none exists) — `_tests_/cases/fs_walk_symlink.bit`,
