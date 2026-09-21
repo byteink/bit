@@ -198,8 +198,8 @@ fmt_gate_trees() {
         'fn '*) name=""; inargv=0 ;;
       esac
       case "${line}" in
-        *'Gate{name: "'*)
-          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p')"
+        *'Gate{name = "'*)
+          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
           inargv=0
           ;;
       esac

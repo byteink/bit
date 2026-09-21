@@ -192,7 +192,7 @@ for e in $EXPRS; do
   v: f32,
 }
 fn main() {
-  let s = S{ v: $e }
+  let s = S{ v = $e }
   print(\"ok\")
 }"
   cell "map value map<string,f32> = $e" \

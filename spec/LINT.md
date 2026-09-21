@@ -338,9 +338,9 @@ one hop:
 - `return append(out, ...)` - grown once more on the way out, so a function
   whose every `append` is self-assigned-then-returned-through-another-`append`
   is not misread as never returning its parameter at all;
-- `return Bundle{ field: out, ... }` - threaded through one field of a
+- `return Bundle{ field = out, ... }` - threaded through one field of a
   returned composite literal (`compiler/emitelf.bit`'s
-  `EmElfBlobs{ symbols: symbols, ... }`).
+  `EmElfBlobs{ symbols = symbols, ... }`).
 
 A self-assignment whose function does none of the three is reported exactly
 like a bare, unassigned `append(out, x)` - self-assignment alone reaches none

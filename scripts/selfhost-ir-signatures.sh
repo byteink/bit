@@ -208,9 +208,9 @@ explainMismatch() {
     # `catch Circle{ r = 1 }` as a multi-line bind block (`catch Circle {` /
     # `  r = 1` / `}`, each additionally indented by the enclosing scope);
     # this tree, parsing it as a composite default, formats it glued and
-    # single-line (`catch Circle{ r: 1 }` -- the formatter canonical
-    # field_init separator is `:`, not the `=` #3840 merely made legal to
-    # parse). Line-
+    # single-line (`catch Circle{ r = 1 }` -- the formatter canonical
+    # field_init separator has been `=` since #3842 step A, and #3842 step F
+    # retired `:` from the parser entirely). Line-
     # array based, not raw-text index(): the multi-line-vs-one-line shape
     # means the surrounding line COUNT changes (3 oracle lines collapse to 1),
     # so what must match is "every line before/after the block is identical,
@@ -242,7 +242,7 @@ explainMismatch() {
         if (linesA[k + 2] != indent "}") { continue }
 
         wantB = linesA[k]
-        sub(/ catch .*$/, " catch " ty "{ " fld ": " val " }", wantB)
+        sub(/ catch .*$/, " catch " ty "{ " fld " = " val " }", wantB)
 
         if (nA - 2 != nB) { continue }
         if (k > nB) { continue }
