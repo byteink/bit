@@ -369,7 +369,7 @@ gates_for_file() {
   esac
   # Excludes any extracted name containing a literal `${` — that is a
   # per-instance template (e.g. tools/build/gates.bit's `packageGates()`
-  # loop emitting `Gate{name: "test-package-${p}", ...}` inside `for p of
+  # loop emitting `Gate{name = "test-package-${p}", ...}` inside `for p of
   # ...`), only meaningful once Bit interpolates it at runtime inside its
   # own generator, never a literal invocable step name on its own. The
   # plain-text grep above cannot tell a template apart from a real gate
@@ -384,7 +384,7 @@ gates_for_file() {
   # the 800-line ceiling) — `-h` suppresses the per-file prefix grep adds once
   # more than one file is given, which the `sed` below does not expect.
   grep -hF "runArgs(\"$1\")" tools/build/gates.bit tools/build/gatestable2.bit 2>/dev/null |
-    sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' |
+    sed -n 's/.*Gate{name[[:space:]]*[:=][[:space:]]*"\([^"]*\)".*/\1/p' |
     grep -vF '${' || true
 }
 
