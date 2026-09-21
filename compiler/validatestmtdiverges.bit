@@ -1,0 +1,245 @@
+// compiler/validatestmtdiverges.bit -- split out of validatestmt.bit
+// (#5673, no room in that file for the vStmt function split #2450 needs)
+// to keep both files under the 800-line lint limit. Same module as
+// validatestmt.bit, so this needs no imports and no call-site changes.
+//
+// The divergence analysis: does executing a statement guarantee control
+// never falls through past it (SS10.3)? vDiverges is the entry point `bit
+// check` uses for E0055 missing-return and catch-block completeness
+// (validatestmt.bit's vCatchIncomplete/vCatchTailExpect); vBlockDiverges,
+// vDivergesCompound/Switch/Match/Select are its per-shape helpers, and
+// vIsDivergingCall/vContainsOwnBreak are the two leaf checks (process-exit
+// calls, and whether a break/continue targets THIS construct) the analysis
+// bottoms out on. Moved as one group: every function here exists only to
+// answer vDiverges' question, and nothing outside this group calls any of
+// them except vDiverges/vBlockDiverges themselves (compiler/lintapply.bit's
+// E0212 unreachable-code, compiler/lowerclosure.bit, compiler/validatefuncdecl.bit).
+
+// A call that diverges by terminating the process: the builtin `panic`, or
+// `std/os`'s `exit` (#3471 — `exit` calls `osExit`, which never returns, so a
+// `catch` tail of `eprint(...); exit(2)` was rejected with E0041 for falling
+// off the end, even though it never falls anywhere).
+//
+// `panic`'s case mirrors the seed's isPanicCall: the bare name `panic`,
+// shadowed by neither a local value nor a user function (the same
+// permissiveness vCall uses to identify a builtin) — panic has NO
+// declaration anywhere, so `funcRefAt(...).decl == 0` alone tells "the real
+// builtin" apart from "a user redefinition".
+//
+// `exit` cannot use that same test: unlike `panic` it is an ordinary EXPORTED
+// function, so once imported it always resolves to a real decl and
+// `decl == 0` would never fire — a fix that reused panic's exact condition
+// would be as vacuous as checking a `noreturn` type that this language does
+// not have (grep confirms zero occurrences of "noreturn" in spec/ or
+// compiler/). What distinguishes the real `std/os.exit` from a local
+// redefinition of the same name is which module owns the resolved decl: an
+// import resolves to a decl owned by the EXPORTING module (a different
+// `moduleId` from this call site's own), while a local `fn exit(...)` in
+// THIS module resolves to a decl `funcRefAt` reports as owned by `c` itself.
+// Only the former is trusted to diverge.
+fn vIsDivergingCall(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Call) {
+    return false
+  }
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return false
+  }
+  let cn = getNode(c.tree, callee)
+  let name = c.source[cn.span.start:cn.span.end]
+  if (name != "panic" && name != "exit") {
+    return false
+  }
+  if (shadowedByValue(c, callee, name)) {
+    return false
+  }
+  let fr = funcRefAt(c, callee, name)
+  if (name == "panic") {
+    return fr.decl == 0
+  }
+  return fr.decl != 0 && fr.owner.moduleId != c.moduleId
+}
+
+// Does `node` (a loop body) contain a `break` targeting THIS loop — i.e. one not
+// shadowed by a nested loop/switch/select? Bounded depth, mirrors the seed.
+fn vContainsOwnBreak(c: Checker, node: int, depth: int): bool {
+  if (node == 0 || depth >= 64) {
+    return false
+  }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.BreakStmt) {
+    return true
+  }
+  if (t == Tag.ForC ||
+    t == Tag.ForOf ||
+    t == Tag.ForIn ||
+    t == Tag.ForInf ||
+    t == Tag.WhileStmt ||
+    t == Tag.SwitchStmt ||
+    t == Tag.SelectStmt) {
+    return false
+  }
+  if (t == Tag.Block || t == Tag.StmtList) {
+    for s of kidsOf(c.tree, node) {
+      if (vContainsOwnBreak(c, s, depth + 1)) {
+        return true
+      }
+    }
+    return false
+  }
+  if (t == Tag.IfStmt) {
+    let k = kidsOf(c.tree, node) // [cond, then, else]
+    if (vContainsOwnBreak(c, k[1], depth + 1)) {
+      return true
+    }
+    if (k[2] != 0) {
+      return vContainsOwnBreak(c, k[2], depth + 1)
+    }
+    return false
+  }
+  // A match is not a break target (`vIsBreakable` excludes it, and `lowerMatch`
+  // pushes no loop frame), so a `break` in an arm body targets THIS loop (#1531).
+  if (t == Tag.MatchStmt) {
+    let k = kidsOf(c.tree, node) // [subject, arm_list]
+    for arm of kidsOf(c.tree, k[1]) {
+      if (vContainsOwnBreak(c, kidsOf(c.tree, arm)[1], depth + 1)) {
+        return true
+      }
+    }
+    return false
+  }
+  return false
+}
+
+// Any statement in a block/stmt-list diverges.
+fn vBlockDiverges(c: Checker, node: int, countBrk: bool): bool {
+  for s of kidsOf(c.tree, node) {
+    if (vDiverges(c, s, countBrk)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Does executing `node` guarantee control never falls through past it? (§10.3)
+fn vDiverges(c: Checker, node: int, countBrk: bool): bool {
+  if (node == 0) {
+    return false
+  }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.ReturnStmt || t == Tag.FailStmt) {
+    return true
+  }
+  if (t == Tag.BreakStmt || t == Tag.ContinueStmt) {
+    return countBrk
+  }
+  if (t == Tag.Block) {
+    return vBlockDiverges(c, node, countBrk)
+  }
+  if (t == Tag.ExprStmt) {
+    return vIsDivergingCall(c, kidsOf(c.tree, node)[0])
+  }
+  if (t == Tag.IfStmt) {
+    let k = kidsOf(c.tree, node) // [cond, then, else]
+    if (k[2] == 0) {
+      return false
+    }
+    return vDiverges(c, k[1], countBrk) && vDiverges(c, k[2], countBrk)
+  }
+  if (t == Tag.WhileStmt) {
+    let k = kidsOf(c.tree, node) // [cond, body]
+    if (vIsTrueLit(c, k[0])) {
+      return !vContainsOwnBreak(c, k[1], 0)
+    }
+    return false
+  }
+  if (t == Tag.ForInf) {
+    return !vContainsOwnBreak(c, kidsOf(c.tree, node)[0], 0)
+  }
+  if (t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn) {
+    return false
+  }
+  return vDivergesCompound(c, node, t, countBrk)
+}
+
+// The three compound-statement cases of `vDiverges`, unchanged fallthrough
+// order (switch, then match, then select), split out so the tag dispatch
+// above stays a flat table instead of growing with every compound-statement
+// case added. Each case is its own function below rather than inlined here:
+// grouping them into one dispatch body alone still left an unlisted E0204
+// finding (complexity 18), so this is one level deeper than dumpCallInst's
+// grouping pattern.
+fn vDivergesCompound(c: Checker, node: int, t: Tag, countBrk: bool): bool {
+  if (t == Tag.SwitchStmt) {
+    return vDivergesSwitch(c, node, countBrk)
+  }
+  if (t == Tag.MatchStmt) {
+    return vDivergesMatch(c, node, countBrk)
+  }
+  if (t == Tag.SelectStmt) {
+    return vDivergesSelect(c, node, countBrk)
+  }
+  return false
+}
+
+// A `switch` diverges only if every case (including a default) diverges —
+// no default means a fallthrough-to-nothing path that does not.
+fn vDivergesSwitch(c: Checker, node: int, countBrk: bool): bool {
+  let k = kidsOf(c.tree, node) // [subject, case_list]
+  let hasDefault = false
+  let all = true
+  for cse of kidsOf(c.tree, k[1]) {
+    let ct = getNode(c.tree, cse).tag
+    if (ct == Tag.SwitchCase) {
+      if (!vBlockDiverges(c, kidsOf(c.tree, cse)[1], countBrk)) {
+        all = false
+      }
+    } else if (ct == Tag.SwitchDefault) {
+      hasDefault = true
+      if (!vBlockDiverges(c, kidsOf(c.tree, cse)[0], countBrk)) {
+        all = false
+      }
+    }
+  }
+  return hasDefault && all
+}
+
+// A `match` is exhaustive by construction, so it diverges iff every arm does
+// (and a zero-arm match cannot occur here, but is handled defensively).
+fn vDivergesMatch(c: Checker, node: int, countBrk: bool): bool {
+  let k = kidsOf(c.tree, node) // [subject, arm_list]
+  let arms = kidsOf(c.tree, k[1])
+  if (len(arms) == 0) {
+    return false
+  }
+  for arm of arms {
+    if (!vDiverges(c, kidsOf(c.tree, arm)[1], countBrk)) {
+      return false
+    }
+  }
+  return true
+}
+
+// A zero-clause `select {}` blocks forever (diverges); otherwise every
+// clause (comm case or default) must diverge.
+fn vDivergesSelect(c: Checker, node: int, countBrk: bool): bool {
+  let clauses = kidsOf(c.tree, node)
+  if (len(clauses) == 0) {
+    return true
+  } // `select {}` blocks forever
+  for cl of clauses {
+    let clt = getNode(c.tree, cl).tag
+    let body = 0
+    if (clt == Tag.CommCase) {
+      body = kidsOf(c.tree, cl)[1]
+    } else if (clt == Tag.CommDefault) {
+      body = kidsOf(c.tree, cl)[0]
+    } else {
+      continue
+    }
+    if (!vBlockDiverges(c, body, countBrk)) {
+      return false
+    }
+  }
+  return true
+}
