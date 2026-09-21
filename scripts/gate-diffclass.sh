@@ -52,13 +52,19 @@
 # Trims a class-literal-shaped diff hunk `$1` (one field's worth of added
 # lines, `+` already stripped, comment/blank lines allowed anywhere) down to
 # its first and last non-comment, non-blank line, and requires the first to
-# open a NEW entry (starts with `$2`, e.g. `Step{name:`) and the last to close
+# open a NEW entry (matches the glob `$2`, e.g. `Step{name[ :=]`) and the last to close
 # one (ends with `}` or `},`). A hunk of comments only (no entry at all) is
 # harmless and passes. This is a shape check, not a parser: it cannot see a
 # rogue line planted in the MIDDLE of a genuinely new multi-line entry, and it
 # does not need to — the earlier all-additions check plus this shape are
 # together the mechanical proxy #2435 asks for, and anything they cannot
 # clear falls through to `full` via `is_additive_registration`'s caller.
+# `$2` IS A GLOB, NOT A LITERAL, and the `case` below leaves it unquoted on
+# purpose. The keyed class-literal separator moved from `:` to `=` (#3842), and
+# a literal `Gate{name:` matched nothing the day the table was swept while this
+# function still returned "safe" for every hunk -- the failure was silent in the
+# direction that scopes a diff to no gate. `[ :=]` spans both spellings so the
+# reverse flip cannot break it either. Do not re-quote it.
 hunk_is_safe() {
   local block="$1" prefix="$2"
   local first="" last="" t
@@ -75,7 +81,7 @@ ${block}
 EOF
   [ -z "${first}" ] && return 0
   case "${first}" in
-    "${prefix}"*) ;;
+    ${prefix}*) ;;
     *) return 1 ;;
   esac
   case "${last}" in
@@ -94,13 +100,13 @@ EOF
 # entry always removes its old line first, so it is caught by the deletion
 # check alone; inserting a statement into an existing function body without
 # deleting anything is caught by the shape check, because that block does
-# not open with `Step{name:`/`Gate{name:}`.
+# not open with `Step{name`/`Gate{name`, in either the ":" or the "=" spelling.
 is_additive_registration() {
   local file="$1" diff prefix
   case "${file}" in
-    tools/build/defs.bit) prefix="Step{name:" ;;
-    tools/build/gates.bit) prefix="Gate{name:" ;;
-    tools/build/gatestable2.bit) prefix="Gate{name:" ;;
+    tools/build/defs.bit) prefix="Step{name[ :=]" ;;
+    tools/build/gates.bit) prefix="Gate{name[ :=]" ;;
+    tools/build/gatestable2.bit) prefix="Gate{name[ :=]" ;;
     *) return 1 ;;
   esac
   diff="$(
