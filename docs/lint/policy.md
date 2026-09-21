@@ -230,19 +230,28 @@ grep -c '^warning\[E0203\]' "$LOG"   # must be 0
 
 **Decision: fix by default. Raise, file-scoped, only for a function proven
 flat by the SAME nesting cross-check used for E0201.** This is the rule with
-the widest spread (scores from 11 to 112 against a limit of 10 - up to 11x),
-so a single global number is not defensible and is exactly what the owner's
-constraint above forbids. Every raise is decided function by function.
+the widest observed spread - at `f341e5c13`, scores ranged from 11 to 112
+against a limit of 10, up to 11x - so a single global number is not
+defensible and is exactly what the owner's constraint above forbids. Every
+raise is decided function by function.
 
-**The discriminator, verified on this session's four highest scores:**
-`compiler/fmtdispatch.bit:9` (`fmtDispatch`, complexity 112), `compiler/ast.bit:213`
-(complexity 108), `compiler/lexkinds.bit:102` (`kindName`, complexity 93),
-`compiler/main.bit:256` (`main`, complexity 84) are all flat one-branch-per-case
-dispatches or if-chains with no nested nesting - none of them also appears in
-this file's E0203 findings. Cyclomatic complexity conflates "many independent
+**The discriminator, historical audit as of `f341e5c13` (the four highest
+E0204 scores in the tree at that commit):** `compiler/fmtdispatch.bit:9`
+(`fmtDispatch`, complexity 112), `compiler/ast.bit:213` (complexity 108),
+`compiler/lexkinds.bit:102` (`kindName`, complexity 93), `compiler/main.bit:256`
+(`main`, complexity 84) were all flat one-branch-per-case dispatches or
+if-chains with no nested nesting - none of them also appeared in this file's
+E0203 findings at the time. Cyclomatic complexity conflates "many independent
 flat branches" with "genuinely tangled logic"; spec/LINT.md §4 says as much
 ("a 300-line match with 60 one-line arms scores 61 while nesting stays at 1").
-Nesting is the signal that tells them apart.
+Nesting is the signal that tells them apart. All four functions have since
+been split and none scores anywhere near this high any more -
+`compiler/ast.bit` itself was later split into `compiler/ast.bit` and
+`compiler/astnames.bit`, so line 213 no longer holds a function at all. As of
+`9c9864295`, the highest E0204 score in `compiler/` is 63
+(`linkPeExecutable`, `compiler/pelink.bit:108`), against 176 open findings;
+the discriminator above still governs whichever functions currently sit at
+the top.
 
 - **Nesting clean on the same function** → read it to confirm each branch is
   independently trivial (no branch itself contains further compounding
