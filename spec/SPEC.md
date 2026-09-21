@@ -1146,7 +1146,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   ```
 
   carrying `@table`'s own argument in the identical shape a field's recorded
-  attribute is - `[AttrDesc{ name: "table", args: ["people"] }]` when given,
+  attribute is - `[AttrDesc{ name = "table", args = ["people"] }]` when given,
   `[]AttrDesc(0)` when `@table` carried none. The table's own name is not a
   field, so it does not appear in `tableDescriptor`'s `[]FieldDesc` - that
   return value stays exactly one entry per field. `pkg/orm`'s `tableName`
@@ -2423,23 +2423,17 @@ composite_lit = type_name [ "<" type_args ">" ] "{" [ field_inits ] "}"
               | array_type   "{" [ arguments ] "}"
               | map_type     "{" [ map_entries ] "}" .
 field_inits   = field_init { "," field_init } [ "," ] .
-field_init    = IDENT [ ( ":" | "=" ) expression ] .       (* keyed; order-independent; bare IDENT is shorthand for IDENT "=" IDENT *)
+field_init    = IDENT [ "=" expression ] .       (* keyed; order-independent; bare IDENT is shorthand for IDENT "=" IDENT *)
 map_entries   = map_entry { "," map_entry } [ "," ] .
 map_entry     = expression ":" expression .
 type_args     = type { "," type } .
 ```
 
-`field_init` accepts both `:` and `=`: `Point{ x: 1.0 }`
-and `Point{ x = 1.0 }` are equivalent, and the two spellings may be freely mixed
-within one literal. **`=` is the target spelling** - `:` means "has type", `=`
-means "gets value", and `:` here is the one inconsistent use of `:` in the
-language. `bit fmt` rewrites `:` to `=` on every `field_init` it formats,
-regardless of which spelling the source used.
-`map_entry` is unaffected and keeps `:` permanently - its left side is a key
-*expression*, not a field name, so the "has type" vs. "gets value" distinction
-does not apply.
+A `field_init` is keyed with `=`: `Point{ x = 1.0 }`. `map_entry` keeps `:`
+permanently - its left side is a key *expression*, not a field name, so the
+"gets value" reading `=` gives a `field_init` does not apply to it.
 
-A class literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0 }`.
+A class literal is **always** prefixed by its type name: `Point{ x = 1.0, y = 2.0 }`.
 This is the rule that removes the block-versus-object-literal ambiguity - a bare
 `{` in statement position is **always** a block (§13.1), never a class or map
 literal. Class literals are keyed; any field omitted from the literal takes its
@@ -2451,10 +2445,10 @@ cannot supply itself a default, so `E0083` applies to it exactly as before.
 Fields not visible to the current module (unexported fields of a foreign class)
 may not appear.
 
-A `field_init` with no `: expression` is **shorthand**: `Point{ x, y }` means
-`Point{ x: x, y: y }` - the field name doubles as the name of a binding already
+A `field_init` with no `= expression` is **shorthand**: `Point{ x, y }` means
+`Point{ x = x, y = y }` - the field name doubles as the name of a binding already
 in scope. Shorthand and keyed fields may be freely mixed in one literal
-(`Point{ x, y: 2.0 }`), and field order stays irrelevant either way. There is no
+(`Point{ x, y = 2.0 }`), and field order stays irrelevant either way. There is no
 positional form: `Point{ 1.0, 2.0 }` is rejected (a bare number cannot start a
 `field_init`), which is what keeps a bare `IDENT` unambiguous - it can only mean
 the shorthand, never a position. A shorthand field is two independent things
@@ -2466,9 +2460,9 @@ the enclosing scope, and a name with no binding in scope is **E0040 undefined
 name** - not a field diagnostic, since the mistake is a missing variable, not a
 missing field.
 
-**A class declaring `init` (§10.4) seals its composite literal.** `Point{ x:
-1.0, y: 2.0 }` is unaffected - the rule bites only a class that declares a
-constructor. `Account{ balance: -500 }` is legal **inside** the module that
+**A class declaring `init` (§10.4) seals its composite literal.** `Point{ x =
+1.0, y = 2.0 }` is unaffected - the rule bites only a class that declares a
+constructor. `Account{ balance = -500 }` is legal **inside** the module that
 declares `Account`, where the literal form is how `init` itself (and any
 other code in that module) builds the value; from **any other module** it is
 a compile error naming the constructor, `Account(...)`. Without this an
@@ -2517,10 +2511,10 @@ entry interleaves at slot granularity: key expression, key assignability, value
 expression, value assignability. So in
 
 ```
-Outer{ x: Inner{ a: "s" } }     // Outer.x is an int
+Outer{ x = Inner{ a = "s" } }     // Outer.x is an int
 ```
 
-the `a: "s"` mismatch is reported before the `x:` one, even though `x:` starts
+the `a = "s"` mismatch is reported before the `x =` one, even though `x =` starts
 earlier in the source. Order is user-facing, and the two compilers must render
 byte-identical output, so it is fixed here rather than left to whichever
 traversal each implementation happens to use
@@ -3347,14 +3341,14 @@ default-constructed.** Both forms that would ask for one are **E0083**:
 ```
 class Inner { xs: []u32 }
 class Outer { a: int, b: Inner }
-class Config { a: int, b: Inner = Inner{ xs: []u32(0) } }
+class Config { a: int, b: Inner = Inner{ xs = []u32(0) } }
 
-let o = Outer{ a: 1 }          // E0083 - omits the class-typed `b`
+let o = Outer{ a = 1 }          // E0083 - omits the class-typed `b`
 let p: Outer                   // E0083 - no initializer at all
 let s = []Outer(2)             // E0083 - `[]T(n)` means n zero values (§12.9)
-let q = Outer{ a: 1, b: Inner{} }   // ok; `Inner` has no class-typed field
+let q = Outer{ a = 1, b = Inner{} }   // ok; `Inner` has no class-typed field
 let e = []Outer(0)             // ok; asks for no zero values at all
-let c = Config{ a: 1 }         // ok; `b`'s declared default (§10.5) supplies
+let c = Config{ a = 1 }         // ok; `b`'s declared default (§10.5) supplies
                                 // a fresh `Inner`, rebuilt at this site
 ```
 
@@ -3677,7 +3671,7 @@ A value of type `S` is assignable to a location of type `T` if:
   interface Reply { intoRes(): int }
   class Res { code: int
     export intoRes(): int { return this.code } }
-  fn old(x: int): Res { return Res{ code: x } }
+  fn old(x: int): Res { return Res{ code = x } }
   fn takesHandler(h: (int) => Reply): int { return h(1).intoRes() }
   fn main() { print("${takesHandler(old)}\n") }
   ```
@@ -3693,7 +3687,7 @@ A value of type `S` is assignable to a location of type `T` if:
   interface Reply { intoRes(): int }
   class Res { code: int
     export intoRes(): int { return this.code } }
-  fn old(x: int): Res! { return Res{ code: x } }
+  fn old(x: int): Res! { return Res{ code = x } }
   fn takesHandler(h: (int) => Reply!): int {
     let r = h(1) catch _ { panic("unreachable") }
     return r.intoRes()
@@ -5370,7 +5364,7 @@ fn worker(x: int, out: chan<int>) {
 }
 
 fn main(): ()! {
-  let shapes: []Shape = [Circle{ r: 1.0 }, Rect{ w: 2.0, h: 3.0 }]
+  let shapes: []Shape = [Circle{ r = 1.0 }, Rect{ w = 2.0, h = 3.0 }]
   println("area = ${totalArea(shapes)}")
   println("sum  = ${sumSquares(4)}")
   let count = loadCount("count.txt") catch 0
@@ -5555,7 +5549,7 @@ composite_lit = type_name [ "<" type { "," type } ">" ] "{" [ field_inits ] "}"
               | array_type "{" [ arguments ] "}"
               | map_type   "{" [ map_entries ] "}" .
 field_inits   = field_init { "," field_init } [ "," ] .
-field_init    = IDENT [ ( ":" | "=" ) expression ] .
+field_init    = IDENT [ "=" expression ] .
 map_entries   = map_entry { "," map_entry } [ "," ] .
 map_entry     = expression ":" expression .
 
