@@ -1,0 +1,281 @@
+// compiler/lowerclasslit.bit — split out of lowerlit.bit (#5706) to keep both
+// files under the 800-line lint limit; see lowerlit.bit for slice/array/chan
+// literal construction and the composite-literal dispatcher. Sibling of
+// lowerlit.bit: same module, so this needs no imports and no call-site
+// changes. Class/struct composite literals: field lookup by name, the
+// type-param substitution a generic class's layout and field types need, and
+// the two writers that store field values — one behind a fresh `gc_alloc`
+// (`lowerClassLit`), one directly into an already-allocated packed slot
+// (`storePackedCompositeLit`, called from a packed slice literal or append in
+// lowerlit.bit and lowerappend.bit).
+
+// The declared-order index of a field name in a class, or -1.
+fn fieldIndexByName(c: Checker, fields: []int, name: string): int {
+  let i = 0
+  while (i < len(fields)) {
+    let fldNode = getNode(c.tree, kidsOf(c.tree, fields[i])[0])
+    if (c.source[fldNode.span.start:fldNode.span.end] == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// One packed slice element's address inputs (#3862) — the receiver slice
+// value, the target index, its runtime stride and its (all-scalar) class
+// type — bundled so the writer below and its callers stay under E0202's
+// max-params=5 (spec/LINT.md).
+class PackedSlot {
+  recv: int,
+  idxV: int,
+  stride: int,
+  elemTy: int,
+}
+
+// Fills a freshly-allocated PACKED `[]elemTy` slice literal's elements
+// directly (#3862): every item here is written straight into its slot
+// rather than boxed via `lowerCompositeLit` and then copied — boxing first
+// would pay exactly the per-element allocation packing exists to remove.
+// This is safe ONLY because `sliceElemInlineSafe`'s whole-module scan
+// (lowersliceinline.bit) disqualifies elemTy — so `inlineElemStride` never
+// returns a packed stride and this function is never called — for any
+// module where some item here is not a `Tag.CompositeLit` of elemTy:
+// `scanSliceLitItems` for this literal's own elements, `scanAppendArgs` for
+// `append(xs, ...)`'s trailing arguments (the only other caller of
+// `storePackedCompositeLit` below). #3933 found this comment asserting that
+// invariant with nothing in the scan actually checking it.
+fn fillPackedSliceLitElems(fc: FnCtx, s: int, elemTy: int, stride: int, items: []int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let i = 0
+  while (i < len(items)) {
+    let a = items[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    let idxI = mkInstr(Op.ConstInt, i64ty)
+    idxI.ival = i
+    let idxV = builderEmit(fc.b, idxI)
+    storePackedCompositeLit(
+      fc,
+      PackedSlot{ recv = s, idxV = idxV, stride = stride, elemTy = elemTy },
+      a,
+    )
+    if (fc.failed) {
+      return 0
+    }
+    i = i + 1
+  }
+  return s
+}
+
+// Writes `litNode`'s field values directly into the packed slot at
+// `slot.recv[slot.idxV]` (#3862) — never through `GcAlloc` + `FieldSet` on a
+// throwaway boxed object (which `lowerCompositeLit` builds), and never
+// through `slice_set` (word-valued, FATAL above 8 bytes since #3861). A
+// field the literal omits is left at whatever the slot already holds, which
+// is always zero: the slot is either freshly allocated (`slice_new`) or a
+// `slice_append` tail slot, and #3861's grow-copy only ever exposes fresh or
+// never-written bytes as a NEW element's storage — the same zero a boxed
+// `GcAlloc` would give an omitted field.
+//
+// REQUIRES `litNode` to be a `Tag.CompositeLit` of `slot.elemTy` — this
+// function indexes `kidsOf(fc.c.tree, litNode)[0]`/`[1]` below with no shape
+// check of its own, and panics (an `Ident`) or silently writes no field (a
+// zero-arg `Call`) if the caller hands it anything else. The two callers of
+// `fillPackedSliceLitElems` are the only route here, and it is THEIR job to
+// have already excluded elemTy via `sliceElemInlineSafe` when this does not
+// hold (#3933 shipped without that exclusion for a slice literal's own
+// items).
+fn storePackedCompositeLit(fc: FnCtx, slot: PackedSlot, litNode: int) {
+  let lk = kidsOf(fc.c.tree, litNode)
+  let decl = structDeclOf(fc.c, slot.elemTy)
+  let oc = typeOwner(fc.c, slot.elemTy)
+  let sub = structLitSubst(fc.c, oc, decl, lk[0], fc.genEnv)
+  let layout = structLayout(fc, oc, decl, sub)
+  let fields = structFieldNodes(oc, decl)
+  let addr = emitPackedElemAddr(fc, slot.recv, slot.idxV, slot.stride)
+  let inits = kidsOf(fc.c.tree, lk[1])
+  let i = 0
+  while (i < len(inits) && !fc.failed) {
+    let ik = kidsOf(fc.c.tree, inits[i])
+    let fldNode = getNode(fc.c.tree, ik[0])
+    let fidx = fieldIndexByName(oc, fields, fc.c.source[fldNode.span.start:fldNode.span.end])
+    if (fidx == -1) {
+      fcFail(fc, fldNode.span, "a composite literal field that does not exist on the class")
+      return
+    }
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[fidx])[1], sub)
+    let val = lowerExprH(fc, ik[1], fty)
+    if (fc.failed) {
+      return
+    }
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = addr
+    fs.ival = layout.offsets[fidx]
+    fs.rhs = val
+    fs.ival2 = fty
+    builderEmit(fc.b, fs)
+    i = i + 1
+  }
+}
+
+// The zero value of a type as an IR value (SPEC §13.4): a scalar constant, a
+// fresh zeroed array/class body (a live instance, not nil), else a nil word.
+// The field substitution behind a class TypeId: the declaration's type-param
+// names bound to the instantiation's recorded arguments, so `Box<string>` lays
+// out `v: T` as a string (a traced pointer) and `Box<i64>` as a scalar. Without
+// it a generic field falls back to the bare param and the layout's pointer map
+// is wrong for one of the two. Empty for a non-generic class; a TEMPLATE binds
+// its own rigid params, which changes nothing.
+fn structTySubst(fc: FnCtx, oc: Checker, decl: int, ty: int): TypeSubst {
+  let sub = noSubst()
+  let gen = kidsOf(oc.tree, decl)[1]
+  if (gen == 0) {
+    return sub
+  }
+  let params = kidsOf(oc.tree, gen)
+  let args = nominalArgsOf(fc.c, ty)
+  let i = 0
+  while (i < len(params) && i < len(args)) {
+    let pn = getNode(oc.tree, kidsOf(oc.tree, params[i])[0])
+    sub.names = append(sub.names, oc.source[pn.span.start:pn.span.end])
+    sub.types = append(sub.types, args[i])
+    i = i + 1
+  }
+  return sub
+}
+
+// Binds a generic class's declared type-param names to the concrete arguments
+// at a composite-literal site: `Box<i64>{...}` yields {T: i64}; empty for a
+// non-generic class. Param names come from the declaration (`oc`), argument
+// types from the construction site (`c`) — the two differ across a module
+// boundary. `genEnv` (#5706, `fc.genEnv`): `targs[i]` resolves bare-name to
+// the enclosing decl's own ABSTRACT id (#5701) and needs it too.
+fn structLitSubst(c: Checker, oc: Checker, decl: int, typeNode: int, genEnv: TypeEnv): TypeSubst {
+  let sub = noSubst()
+  if (getNode(c.tree, typeNode).tag != Tag.GenericInst) {
+    return sub
+  }
+  let params = kidsOf(oc.tree, kidsOf(oc.tree, decl)[1])
+  let targs = kidsOf(c.tree, kidsOf(c.tree, typeNode)[1])
+  let i = 0
+  while (i < len(params) && i < len(targs)) {
+    let pn = getNode(oc.tree, kidsOf(oc.tree, params[i])[0])
+    sub.names = append(sub.names, oc.source[pn.span.start:pn.span.end])
+    sub.types = append(sub.types, substType(c, typeFromNode(c, targs[i]), genEnv, 0))
+    i = i + 1
+  }
+  return sub
+}
+
+// The class-literal arm of `lowerCompositeLit` (lowerlit.bit), split out by
+// #3935 to keep that function under E0204's complexity ceiling (spec/LINT.md
+// max-complexity = 10; it was 15 before this split). A `gc_alloc` (its GC
+// descriptor is the ref-field offsets) followed by a `field_set` per field, in
+// the literal's source order. An inline array field is copied into the class's
+// own storage via `copyArrayInto` (lowerlit.bit) instead, since its elements
+// live in the class body rather than behind a shared handle. Any field the
+// literal OMITS is filled afterward by `fillOmittedFields` (lowerslicefill.bit)
+// with its declared default (#3838) or its §13.4 zero value (#4182) — a no-op
+// for a field that declares no default and whose zero value IS zero bits,
+// which GcAlloc already handed back.
+fn lowerClassLit(fc: FnCtx, node: int, structTy: int): int {
+  let kids = kidsOf(fc.c.tree, node)
+  let decl = structDeclOf(fc.c, structTy)
+  if (decl == 0) {
+    fcFail(
+      fc,
+      getNode(fc.c.tree, node).span,
+      "a class composite literal with no declaration in scope",
+    )
+    return 0
+  }
+  let oc = typeOwner(fc.c, structTy)
+  let sub = structLitSubst(fc.c, oc, decl, kids[0], fc.genEnv)
+  let layout = structLayout(fc, oc, decl, sub)
+  let fields = structFieldNodes(oc, decl)
+  let ga = mkInstr(Op.GcAlloc, structTy)
+  ga.ival = layout.size
+  ga.offsets = layout.ptrOffsets
+  let obj = builderEmit(fc.b, ga)
+  let inits = kidsOf(fc.c.tree, kids[1])
+  let i = 0
+  while (i < len(inits)) {
+    let fk = kidsOf(fc.c.tree, inits[i])
+    let fldNode = getNode(fc.c.tree, fk[0])
+    let idx = fieldIndexByName(oc, fields, fc.c.source[fldNode.span.start:fldNode.span.end])
+    if (idx == -1) {
+      fcFail(fc, fldNode.span, "a composite literal field that does not exist on the class")
+      return 0
+    }
+    // Substituted, for the same reason the layout above is: `items: []T` on a
+    // `Stack<i64>{...}` must lower its initializer under `[]i64`. Under the bare
+    // `[]T` the slice materializes with is_ref set, and the GC then walks plain
+    // integers as pointers.
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[idx])[1], sub)
+    lowerClassLitFieldInit(fc, obj, layout.offsets[idx], fty, fk)
+    if (fc.failed) {
+      return 0
+    }
+    i = i + 1
+  }
+  fillOmittedFields(fc, obj, structTy, inits, getNode(fc.c.tree, node).span)
+  if (fc.failed) {
+    return 0
+  }
+  return obj
+}
+
+// Stores one initializer's value into `obj`'s field `idx`, once
+// `lowerClassLit`'s loop has resolved `fty`. Pulled out to keep that loop
+// under the line budget: an inline array is copied into the class's own
+// storage (its elements live in the class body, not a shared handle); a
+// decimal field is 16 inline bytes, never one `field_set` at prim 12 (that
+// would store the two-word tuple's POINTER as the field's raw bytes, #3982),
+// so it explodes back to its words and stores each at offset/offset+8
+// (`emitDecimalFieldSet`, lowerdecimal.bit) — the same pair
+// `lowerFieldStore`'s decimal arm uses; everything else is the one
+// `field_set` the seed always emitted. The field's own type is the hint the
+// initializer lowers under — without it an untyped literal materializes at
+// its DEFAULT type (`4.5` as an `f64`) and the field_set then writes the
+// field's width from it, storing the low half of an f64 into an `f32`
+// field: a silent zero (#1457).
+fn lowerClassLitFieldInit(fc: FnCtx, obj: int, offset: int, fty: int, fk: []int) {
+  if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+    let src = lowerExpr(fc, fk[1])
+    if (fc.failed) {
+      return
+    }
+    let fg = mkInstr(Op.FieldGet, fty)
+    fg.lhs = obj
+    fg.ival = offset
+    copyArrayInto(fc, builderEmit(fc.b, fg), src, fty)
+    return
+  }
+  // #5669: `hp.h = ptrOf(hbuf)` roots nothing on its own -- see
+  // recordClassFieldPtrOfKeepAlive (lowerkeepalive.bit) for why a second edge
+  // belongs here and not just at the `ptrOf` call itself.
+  let before = len(fc.b.keepAlive)
+  let val = lowerExprH(fc, fk[1], fty)
+  if (fc.failed) {
+    return
+  }
+  if (isRawPtrType(fc.c.ctx, fty)) {
+    recordClassFieldPtrOfKeepAlive(fc.b, obj, val, before)
+    // #5670: `let p = ptrOf(local); X{ f = p }` -- the call above finds
+    // nothing for it, so this looks `p` up by name instead.
+    recordClassFieldPtrOfBindingKeepAlive(fc, obj, fk[1])
+  }
+  if (isDecimalPrim(fc.c.ctx, fty)) {
+    let words = explodeValueWords(fc.c.ctx, fc.b, val, decimalWordTypes(fc.c.ctx))
+    emitDecimalFieldSet(fc.c.ctx, fc.b, obj, offset, words)
+    return
+  }
+  let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs.lhs = obj
+  fs.ival = offset
+  fs.rhs = val
+  fs.ival2 = fty
+  builderEmit(fc.b, fs)
+}
