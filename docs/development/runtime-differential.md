@@ -170,7 +170,7 @@ What was tried and rejected: comparing the tree's OWN runtime object output
 across two `selfhost-fixpoint.sh`-style self-build generations, instead of
 against the pinned release. Rejected on inspection, not on principle: `bit
 build compiler -o X` links a PRE-BUILT `libbitrt.a` rather than recompiling
-runtime/ from source (`compiler/build.bit`'s `libbitrtPath`), so a
+runtime/ from source (`compiler/buildrun.bit`'s `libbitrtPath`), so a
 self-build fixed point never touches runtime codegen at all; a from-scratch
 two-generation runtime rebuild would only reconfirm what
 `selfhost-fixpoint.sh` already proves (this tree reproduces itself), a
