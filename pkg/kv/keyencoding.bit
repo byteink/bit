@@ -1,0 +1,200 @@
+// pkg/kv — order-preserving key encoding for int, float and string keys
+// (#3467's own stated hazard: a B+tree key that does not sort, as raw bytes,
+// in the same order as the value it encodes makes a range scan silently
+// return wrong answers with no crash). This file is a pure codec: no page
+// I/O, no B+tree, no storage dependency. It only turns a value into bytes
+// that plain unsigned byte comparison (SPEC 14.6 — how string `<` already
+// compares, and how a B+tree compares keys) orders the same way the value
+// itself orders.
+//
+// Three encodings, each documented at its own function below:
+//   encodeInt/decodeInt       8-byte big-endian, sign bit flipped
+//   encodeFloat/decodeFloat   8-byte big-endian, sign-bit transform
+//   encodeString/decodeString escaped content + a two-byte terminator
+//
+// int and float are FIXED 8 bytes with no length prefix, so two encoded
+// values of the same type always compare byte-for-byte with no ambiguity.
+// string is self-terminating so a later composite key built by concatenating
+// several of these (e.g. `encodeInt(id) + encodeString(name)`) still
+// compares field by field, left field deciding before the next is read.
+
+const kvSignBit: u64 = 0x8000000000000000
+
+// `v` as 8 big-endian bytes, ordered so byte comparison matches numeric
+// comparison across the FULL i64 range, including the sign change at zero.
+//
+// Two's-complement bytes alone do not do this: read straight as u64, a
+// negative number's bit pattern is numerically LARGER (unsigned) than any
+// positive number's, so -1 (0xFF..FF) would sort after +1 (0x00..01).
+// Flipping the top bit turns the range into "excess-2^63": i64::MIN
+// (0x80..00) becomes 0x00..00, the smallest encoding; i64::MAX (0x7F..FF)
+// becomes 0xFF..FF, the largest. Flipping one fixed bit relabels two
+// adjacent unsigned ranges (negatives, then positives) into their correct
+// relative order without reordering anything within either range.
+export fn encodeInt(v: i64): []byte {
+  return kvBytesFromU64(u64(v) ^ kvSignBit)
+}
+
+// The inverse of `encodeInt`. `b` must be `encodeInt`'s own output (8 bytes).
+export fn decodeInt(b: []byte): i64 {
+  return i64(kvU64FromBytes(b) ^ kvSignBit)
+}
+
+// `v` as 8 big-endian bytes of its IEEE-754 bit pattern, transformed so byte
+// comparison matches numeric comparison for every accepted float, including
+// negatives, where raw IEEE-754 byte order runs backwards.
+//
+// Raw IEEE-754 bits already sort correctly among positive floats: exponent
+// then mantissa read as a larger unsigned integer for a larger value. Among
+// negatives the same reading runs backwards, since a more negative number
+// (bigger magnitude) has a LARGER raw bit pattern. The fix is sign-dependent:
+//   - sign bit set (negative): flip every bit. This reverses the backwards
+//     run among negatives, and it also turns the sign bit itself to 0, so
+//     every negative now sorts below every positive.
+//   - sign bit clear (positive): flip only the sign bit, to 1, so positives
+//     land above negatives without disturbing their already-correct order.
+//
+// NaN is REJECTED (panics). It has no total order — NaN != NaN under
+// IEEE-754 — and letting it through would place it at whatever byte position
+// its particular payload happens to produce instead of refusing the
+// operation outright. A caller needing "no value" should use `None` above
+// this layer, never a NaN key.
+//
+// Negative zero is accepted and kept distinct from positive zero: they have
+// different bit patterns (only the sign bit differs) and this transform
+// gives them adjacent but different encodings, with -0.0 immediately below
+// +0.0. Collapsing them would make decode lossy about which sign came in;
+// the transform's own bit pattern already places -0.0 there and nowhere else
+// keeps every other negative correctly below it.
+//
+// Both infinities are accepted and land at the two extremes: -Inf below
+// every finite negative, +Inf above every finite positive.
+export fn encodeFloat(v: f64): []byte {
+  if (v != v) {
+    panic("kv.encodeFloat: NaN has no order-preserving encoding")
+  }
+  let bits = floatBits(v)
+  if ((bits & kvSignBit) != 0) {
+    bits = ~bits
+  } else {
+    bits = bits ^ kvSignBit
+  }
+  return kvBytesFromU64(bits)
+}
+
+// The inverse of `encodeFloat`. `b` must be `encodeFloat`'s own output.
+export fn decodeFloat(b: []byte): f64 {
+  let bits = kvU64FromBytes(b)
+  if ((bits & kvSignBit) != 0) {
+    bits = bits ^ kvSignBit
+  } else {
+    bits = ~bits
+  }
+  return bitsToFloat(bits)
+}
+
+// The byte reserved as both the escape lead and the terminator lead. Chosen
+// as 0x00: it is also the smallest possible byte, matching plain string
+// comparison's own rule that a NUL is an ordinary byte with no terminating
+// meaning (SPEC 14.6) and that the empty string sorts first. Terminating
+// every encoded string with the smallest byte is what makes a string that is
+// a prefix of another sort before the longer one — see `encodeString`.
+const kvSep: byte = 0x00
+
+// The byte following a `kvSep`: `kvTermTail` means "the string ends here",
+// `kvEscTail` means "that `kvSep` was a literal content byte, keep reading".
+// `kvTermTail` (0x00) is chosen strictly less than `kvEscTail` (0xFF) so
+// that when one string is a strict prefix of another, the shorter one's
+// terminator sorts before the longer one's next byte, whatever that byte is
+// — see `encodeString`.
+const kvTermTail: byte = 0x00
+const kvEscTail: byte = 0xff
+
+// `s`'s bytes verbatim, with every literal `kvSep` (0x00) byte escaped to
+// `kvSep, kvEscTail` and the whole thing closed with `kvSep, kvTermTail`.
+// Self-terminating so a later composite key can concatenate several of
+// these and still compare field by field: without escaping, a string
+// containing a literal 0x00 could be mistaken for a field boundary once
+// concatenated with the next field's encoding.
+//
+// Order-preserving, including SPEC 14.6's rule for plain strings that "when
+// one operand is a prefix of the other the shorter one is less": at the
+// first byte position where two encodings diverge, that position is either
+// an ordinary content byte (compares exactly as the original bytes did) or
+// it is where the shorter string's `kvSep` terminator begins. `kvSep` is
+// 0x00, less than every non-terminator continuation there — another real
+// content byte (0x01-0xff) or the longer string's own `kvSep, kvEscTail`
+// escape, whose first byte ties at 0x00 but whose second byte (0xff) then
+// loses to the shorter string's own second byte (`kvTermTail`, 0x00) at the
+// very next position. Either way the shorter string sorts first.
+export fn encodeString(s: string): []byte {
+  let raw = []byte(s)
+  let out = []byte(0)
+  let i = 0
+  while (i < len(raw)) {
+    let b = raw[i]
+    if (b == kvSep) {
+      out = append(out, kvSep)
+      out = append(out, kvEscTail)
+    } else {
+      out = append(out, b)
+    }
+    i = i + 1
+  }
+  out = append(out, kvSep)
+  out = append(out, kvTermTail)
+  return out
+}
+
+// The inverse of `encodeString`. `b` must be `encodeString`'s own output.
+export fn decodeString(b: []byte): string {
+  let out = []byte(0)
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] == kvSep) {
+      if (i + 1 >= len(b)) {
+        panic("kv.decodeString: truncated separator at end of input")
+      }
+      if (b[i + 1] == kvTermTail) {
+        return string(out)
+      }
+      out = append(out, kvSep)
+      i = i + 2
+    } else {
+      out = append(out, b[i])
+      i = i + 1
+    }
+  }
+  panic("kv.decodeString: missing terminator")
+}
+
+// `bits` as 8 big-endian bytes. Shared by `encodeInt` and `encodeFloat`,
+// which differ only in how they derive `bits`, never in how bytes are laid
+// out.
+fn kvBytesFromU64(bits: u64): []byte {
+  let out = []byte(8)
+  let i = 0
+  while (i < 8) {
+    let shift = u64((7 - i) * 8)
+    out[i] = byte((bits >> shift) & 0xff)
+    i = i + 1
+  }
+  return out
+}
+
+// The inverse of `kvBytesFromU64`. `b` must be exactly 8 bytes: the whole
+// point of the fixed-width int/float encodings is that no length prefix is
+// needed, so a wrong length here means the caller mixed up which encoder
+// produced these bytes.
+fn kvU64FromBytes(b: []byte): u64 {
+  if (len(b) != 8) {
+    panic("kv: fixed-width key expects exactly 8 bytes, got ${len(b)}")
+  }
+  let bits: u64 = 0
+  let i = 0
+  while (i < 8) {
+    bits = (bits << 8) | u64(b[i])
+    i = i + 1
+  }
+  return bits
+}
