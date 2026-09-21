@@ -34,7 +34,7 @@
 # `"BIT_*_TREES=name:relpath name:relpath ..."` env string, scanning both gate
 # tables in one pass. Line-based, like scripts/gate-filemap.sh's
 # `is_additive_registration()`'s hunk scan: tracks the most recently seen
-# `Gate{name: "..."` as it goes, and pairs any `"..._TREES=..."` string that
+# `Gate{name = "..."` as it goes, and pairs any `"..._TREES=..."` string that
 # follows it. Good enough because every Gate{} in this codebase opens with
 # its own `name:` on its own logical line and none is ever nested inside
 # another's env list — the exact assumption assert_dirgates_current's own sed
@@ -45,8 +45,8 @@ envscoped_gate_trees() {
     name=""
     while IFS= read -r line; do
       case "${line}" in
-        *'Gate{name: "'*)
-          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p')"
+        *'Gate{name = "'*)
+          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
           ;;
         *'_TREES='*)
           m="$(printf '%s' "${line}" | sed -n 's/.*_TREES=\([^"]*\)".*/\1/p')"
@@ -265,7 +265,7 @@ assert_envscope_deps() {
 # bucket for as long as that bucket existed, with this comment asserting it was
 # covered.
 argv_gate_paths() {
-  sed -n 's/.*Gate{name: "\([^"]*\)".*runArgs("\([^"]*\)").*/\1 \2/p' \
+  sed -n 's/.*Gate{name = "\([^"]*\)".*runArgs("\([^"]*\)").*/\1 \2/p' \
     tools/build/gates.bit tools/build/gatestable2.bit
 }
 
@@ -603,8 +603,8 @@ argvliteral_gate_paths() {
         'fn '*) name="" ;;
       esac
       case "${line}" in
-        *'Gate{name: "'*)
-          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p')"
+        *'Gate{name = "'*)
+          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name = "\([^"]*\)".*/\1/p')"
           ;;
       esac
       [ -n "${name}" ] || continue

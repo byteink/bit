@@ -54,7 +54,7 @@
 
 GATE_LAST_GREEN_FILE="bit-out/make/gate-last-green"
 
-# Every `Step{name: "..."` inside `fn gateSteps(): []Step { ... }` in Bit
+# Every `Step{name = "..."` inside `fn gateSteps(): []Step { ... }` in Bit
 # source text on stdin — the exact set `deps: gateNames()` (tools/build/
 # defs.bit) resolves `test` to, i.e. what a plain `./make test` run stamps
 # one rc file per name for. Shape-based like `hunk_is_safe` in gate.sh (a
@@ -62,8 +62,8 @@ GATE_LAST_GREEN_FILE="bit-out/make/gate-last-green"
 # convention) rather than a real parser.
 gate_step_names_from() {
   sed -n '/^fn gateSteps(): \[\]Step {$/,/^}$/p' |
-    grep -oE 'Step\{name: "[^"]+"' |
-    sed -n 's/^Step{name: "\(.*\)"$/\1/p' |
+    grep -oE 'Step\{name = "[^"]+"' |
+    sed -n 's/^Step{name = "\(.*\)"$/\1/p' |
     sort -u
 }
 
