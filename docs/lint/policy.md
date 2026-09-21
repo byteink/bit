@@ -277,9 +277,9 @@ been.
 **Why the two can never actually disagree.** E0212 is not a second,
 independently-invented divergence check - `lintUnreachableCode`
 (`compiler/lintapply.bit:388-399`) reuses the exact same `vDiverges`/
-`vBlockDiverges` analysis (`compiler/validatestmt.bit`) that `bit check` itself
-uses for E0055 missing-return and for catch-block completeness. The comment at
-the call site says why: *"A second, hand-rolled divergence check would
+`vBlockDiverges` analysis (`compiler/validatestmtdiverges.bit`) that `bit
+check` itself uses for E0055 missing-return and catch-block completeness.
+The comment at the call site says why: *"A second, hand-rolled divergence check would
 disagree with the checker's on some construct and report a finding on code the
 checker itself considers fine."* Because both consumers run the identical
 predicate, nothing the checker treats as "control cannot fall through here" can

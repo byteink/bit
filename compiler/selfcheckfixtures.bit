@@ -1,0 +1,336 @@
+// compiler/selfcheckfixtures.bit -- split out of selfcheck.bit (#5673, no
+// room in that file for the selfcheck() function split #2450 needs) to
+// keep both files under the 800-line lint limit. Same module as
+// selfcheck.bit, so this needs no imports and no call-site changes.
+//
+// The fixture builders and byte-level inspectors selfcheck() and
+// checkBuildTargetRoundTrip() (selfcheck.bit) call into: synthetic A64Ctx/
+// XCtx compile contexts (testA64Ctx, a64FixtureCompile, xTestCtx,
+// xCallTestCtx, xFnCtx), raw-byte readers over an emitted ELF object or x64
+// buffer (wordAt, leAt, name16At, elfBytes/elfShdrAt/elfStrAt/
+// elfShstrtabOff/elfFindSection, xEmitContains/hexOfBytes/hexHasIn/xHexHas/
+// xHexCount/xHex), plus checkBackEdge, the one isolated check small enough
+// to need no isolation machinery of its own. selfcheckOnly/
+// runSelfcheckOnlyPanics — the BIT_SELFCHECK_ONLY isolation mechanism — and
+// selfcheck() itself stay in selfcheck.bit, next to the ~400 checks that
+// mechanism exists for.
+
+// Reads the little-endian 32-bit word at `off` in an emitted code buffer.
+fn wordAt(code: ByteBuf, off: int): int {
+  return int(code.bytes[off]) |
+    (int(code.bytes[off + 1]) << 8) |
+    (int(code.bytes[off + 2]) << 16) |
+    (int(code.bytes[off + 3]) << 24)
+}
+
+// Stage 3 (#1342) ARM64 loads/stores, floats, and branches — seed goldens.
+// Stage 3 (#1342 slice 3) ARM64 per-function context: relocations, branch
+// fixups, frame layout, and parallel-move sequencing.
+fn testA64Ctx(): A64Ctx {
+  let ctx = newTypeContext()
+  return A64Ctx{
+    module = IrModule{ funcs = []IrFunc(0), ctx = ctx, sm = newSourceManager() },
+    f = IrFunc{
+      name = "t", paramTypes = []int(0), result = ctx.voidId,
+      blocks = []IrBlock(0), instrs = []IrInstr(0), isFallible = false,
+    },
+    code = newByteBuf(),
+    relocs = []Reloc(0),
+    instToVreg = []int(0),
+    result = RegAllocResult{
+      locations = []RegLoc(0), numSpillSlots = 0,
+      stackMaps = []StackMapEntry(0),
+    },
+    intRegs = []int(0),
+    floatRegs = []int(0),
+    frame = FrameInfo{
+      savedGpr = []int(0), savedFpr = []int(0), numSpillSlots = 0,
+      outgoingBytes = 0, frameSize = 0,
+    },
+    blockOffsets = []int(0),
+    jumpFixups = []JumpFixup(0),
+    safepoints = []SafepointView(0),
+    safepointPositions = []int(0),
+    nextSafepointIdx = 0,
+    // #3101: sized, not omitted — every selector these fixtures drive resolves a
+    // vreg through noteIntReg/noteFloatReg, which indexes by register number.
+    wroteInt = []bool(32),
+    wroteFloat = []bool(32),
+    debug = false,
+    // #4316: the ARMv8.0-A LL/SC form, which is what aarch64-linux ships and
+    // what every atomic fixture below already asserts byte-for-byte. The LSE
+    // fixtures (arm64selcheckmem.bit) set this true on their own context.
+    lse = false,
+  }
+}
+
+// #4316: the whole-function fixtures (arm64selcheckgen.bit) compile for
+// aarch64-macos, the target the shipping compiler is built for. None of them
+// contains an atomic, so the FEAT_LSE arm changes not one emitted byte there;
+// the LSE encodings themselves are asserted in arm64selcheckmem.bit.
+fn a64FixtureCompile(m: IrModule, f: IrFunc): FuncCode {
+  return compileFunction(m, f, false, BuildTarget.Aarch64Macos)
+}
+
+fn assertSameBytes(got: ByteBuf, want: ByteBuf) {
+  assert(len(got.bytes) == len(want.bytes))
+  let i = 0
+  while (i < len(got.bytes)) {
+    assert(got.bytes[i] == want.bytes[i])
+    i = i + 1
+  }
+}
+
+fn w64(): Width { return mkWidth(8, RegClass.Int, true) }
+fn w8s(): Width { return mkWidth(1, RegClass.Int, true) }
+
+// Stage 3 (#1343) Mach-O64 object writer. Ports the seed's own tests: the
+// structural assertions on a real object's header/sections/relocations, and
+// every rejection case.
+
+// Reads a little-endian field of `n` bytes at `off`.
+fn leAt(b: []u8, off: int, n: int): int {
+  let v = 0
+  let i = 0
+  while (i < n) {
+    v = v | (int(b[off + i]) << (i * 8))
+    i = i + 1
+  }
+  return v
+}
+
+// The NUL-terminated name in a 16-byte fixed field.
+fn name16At(b: []u8, off: int): string {
+  let out = []u8(0)
+  let i = 0
+  while (i < 16 && b[off + i] != u8(0)) {
+    out = append(out, b[off + i])
+    i = i + 1
+  }
+  return string(out)
+}
+
+fn elfBytes(t: ElfTarget, obj: ElfObject): []u8 {
+  return writeElfObject(t, obj) catch _ {
+    []u8(0)
+  }
+}
+
+// The section-header table entry `i`, as a byte offset into `b`.
+fn elfShdrAt(b: []u8, i: int): int {
+  return leAt(b, 40, 8) + i * sizeofElfShdr()
+}
+
+// The NUL-terminated string at `off` in the section named by shstrndx.
+fn elfStrAt(b: []u8, strtabOff: int, off: int): string {
+  let out = []u8(0)
+  let i = strtabOff + off
+  while (i < len(b) && b[i] != u8(0)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// The file offset of the section-header string table's contents.
+fn elfShstrtabOff(b: []u8): int {
+  return leAt(b, elfShdrAt(b, leAt(b, 62, 2)) + 24, 8)
+}
+
+// The index of the section header named `name`, or -1.
+fn elfFindSection(b: []u8, name: string): int {
+  let strs = elfShstrtabOff(b)
+  let n = leAt(b, 60, 2)
+  let i = 0
+  while (i < n) {
+    if (elfStrAt(b, strs, leAt(b, elfShdrAt(b, i), 4)) == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Stage 3 (#1346) the x86-64 encoder substrate. Every expected byte string here
+// came out of the system assembler (`clang --target=x86_64 -c` + objdump) rather
+// than from reading the manual — a hand-derived encoding that is plausible but
+// wrong assembles happily and misbehaves only at run time.
+
+// True when `b` contains the byte `v`. Used to check that a specific opcode was
+// emitted, where comparing whole sequences would let a swapped opcode hide
+// behind some other difference.
+fn xEmitContains(b: X64Buf, v: int): bool {
+  for by of b.code {
+    if (by == u8(v)) {
+      return true
+    }
+  }
+  return false
+}
+
+// The lowercase hex of a raw byte slice — FuncCode carries `code: []u8`, not a
+// buffer, so the byte-level helpers take the bytes and xHex/xHexHas wrap them.
+fn hexOfBytes(code: []u8): string {
+  let out = ""
+  let d = "0123456789abcdef"
+  for by of code {
+    out = out + d[int(by) >> 4:(int(by) >> 4) + 1] + d[int(by) & 15:(int(by) & 15) + 1]
+  }
+  return out
+}
+
+// True when the hex string `h` contains the SEQUENCE `hex`.
+fn hexHasIn(h: string, hex: string): bool {
+  if (len(hex) == 0) {
+    return true
+  }
+  let i = 0
+  while (i + len(hex) <= len(h)) {
+    if (h[i:i + len(hex)] == hex) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// True when `b`'s bytes contain the hex SEQUENCE `hex`. Byte presence
+// (xEmitContains) is too weak for a multi-byte encoding — an opcode byte often
+// doubles as some other instruction's ModRM — and comparing the whole buffer is
+// too strict when the surrounding moves are not what the test is pinning.
+fn xHexHas(b: X64Buf, hex: string): bool {
+  return hexHasIn(xHex(b), hex)
+}
+
+// How many times the hex sequence `hex` occurs in `b`. Presence alone cannot
+// distinguish "loaded once" from "reloaded after a clobbering call".
+fn xHexCount(b: X64Buf, hex: string): int {
+  let h = xHex(b)
+  if (len(hex) == 0) {
+    return 0
+  }
+  let n = 0
+  let i = 0
+  while (i + len(hex) <= len(h)) {
+    if (h[i:i + len(hex)] == hex) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// The bytes of `b`, as lowercase hex, for comparing against an objdump line.
+fn xHex(b: X64Buf): string {
+  return hexOfBytes(b.code)
+}
+
+fn checkBackEdge() {
+  // A back-edge is a target at or before the branching block — the RPO shape.
+  // It gets a safepoint poll so an allocation-free loop still lets the
+  // collector run (runtime/ABI.md §5). Shared by both backends (codegen.bit).
+  assert(isBackEdge(3, 3)) // a self-loop IS a back-edge
+  assert(isBackEdge(5, 2))
+  assert(!isBackEdge(2, 5)) // a forward jump is not
+  assert(!isBackEdge(0, 1))
+}
+
+// Builds a context whose vreg 0 lives in intRegs[0] and vreg 1 is spilled to
+// slot 0, with one saved GPR so the spill offsets are not trivially -8.
+fn xTestCtx(): XCtx {
+  let cx = newXCtx(XCallConv.SysV)
+  cx.intRegs = [XReg64.Rax, XReg64.Rbx]
+  cx.floatRegs = [XmmReg.Xmm0, XmmReg.Xmm1]
+  cx.frame = XFrame{
+    savedGpr = [XReg64.Rbx], savedXmm = []XmmReg(0), numSpillSlots = 2,
+    frameSize = 32,
+  }
+  cx.alloc = RegAllocResult{
+    locations = [
+      RegLoc{ isSpill = false, index = 0 },
+      RegLoc{ isSpill = true, index = 0 },
+    ], numSpillSlots = 2,
+    stackMaps = []StackMapEntry(0),
+  }
+  // A real (non-const) value at vreg 0 and vreg 1, so xConstIntOf's
+  // `f.instrs[v]` lookup (the #1853 add/sub-immediate fold) reads a genuine
+  // block param instead of indexing the empty instrs newXCtx() defaults `f`
+  // to. Checks that need the fold path overwrite a slot with a real const_int.
+  cx.f = IrFunc{
+    name = "t", paramTypes = []int(0), result = 0, blocks = []IrBlock(0),
+    instrs = [mkInstr(Op.BlockParam, 0), mkInstr(Op.BlockParam, 0)],
+    isFallible = false,
+  }
+  return cx
+}
+
+// Goldens from clang --target=x86_64-unknown-linux-gnu + llvm-objdump.
+// A ctx shaped like a function that CONTAINS CALLS. buildIntRegs restricts such
+// a function to the callee-saved subset, so no vreg can live in rax or r11 —
+// which is exactly why emitters may read an operand AFTER a call (the return
+// value lands in rax) and use r11 as scratch freely. The plain xTestCtx puts
+// vreg 0 in rax and so tests a state real codegen never produces.
+fn xCallTestCtx(): XCtx {
+  let cx = newXCtx(XCallConv.SysV)
+  cx.intRegs = [XReg64.Rbx, XReg64.R13]
+  cx.floatRegs = [XmmReg.Xmm0, XmmReg.Xmm1]
+  // THREE spill slots since #4203: the allocator's two (`cx.alloc` below) plus
+  // the ONE poll-cache slot xCompileFunction carves above them, which is what
+  // xPollCacheOffset's `numSpillSlots >= 1` addresses from the TOP of the spill
+  // area. It was four while the poll cache held worldAddr, gcAddr, the preempt
+  // summary (#3746) and a countdown (#4200); #4203 left one address. 48 bytes
+  // covers 1 saved GPR plus 3 slots at 16-byte alignment. xTestCtx above is
+  // deliberately left at 2 — nothing that reaches the poll cache runs against
+  // it.
+  // #4457 makes the poll-cache half of that 3 explicit. xPollCacheOffset now
+  // asks `pollCacheSlots`, because "the poll slot exists" and "the allocator
+  // asked for a slot" are different facts and `numSpillSlots >= 1` could only
+  // ask the second.
+  cx.frame = XFrame{
+    savedGpr = [XReg64.Rbx], savedXmm = []XmmReg(0), numSpillSlots = 3,
+    pollCacheSlots = 1, frameSize = 48,
+  }
+  cx.alloc = RegAllocResult{
+    locations = [
+      RegLoc{ isSpill = false, index = 0 },
+      RegLoc{ isSpill = true, index = 0 },
+    ], numSpillSlots = 2,
+    stackMaps = []StackMapEntry(0),
+  }
+  return cx
+}
+
+// A ctx carrying a real IrFunc, so the marshalling paths can classify values by
+// type. `types` gives one type per instruction slot, in value-id order.
+//
+// EVERY slot gets a location — an emitter binds its own result, so a function
+// with N instructions needs N locations, not just one per operand. Slot 0 stays
+// in a register and slot 1 stays spilled (the two shapes the tests lean on);
+// the rest share a second register, which is enough to exercise a dispatch.
+fn xFnCtx(types: []int, blocks: []IrBlock): XCtx {
+  let cx = xCallTestCtx()
+  let instrs = []IrInstr(0)
+  let locs = []RegLoc(0)
+  let i = 0
+  while (i < len(types)) {
+    instrs = append(instrs, mkInstr(Op.ConstInt, types[i]))
+    if (i == 1) {
+      locs = append(locs, RegLoc{ isSpill = true, index = 0 })
+    } else if (i == 0) {
+      locs = append(locs, RegLoc{ isSpill = false, index = 0 })
+    } else {
+      locs = append(locs, RegLoc{ isSpill = false, index = 1 })
+    }
+    i = i + 1
+  }
+  cx.f = IrFunc{
+    name = "f", paramTypes = []int(0), result = 0, blocks = blocks,
+    instrs = instrs, isFallible = false,
+  }
+  cx.alloc = RegAllocResult{
+    locations = locs, numSpillSlots = 2,
+    stackMaps = []StackMapEntry(0),
+  }
+  cx.blockOffsets = [0, 0, 0]
+  return cx
+}
