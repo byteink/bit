@@ -1653,16 +1653,41 @@ primitive. `T` must be an integer prim (`i8`…`u64`).
 
 - `atomicLoad(p: *T): T` - atomically read `*p`.
 - `atomicStore(p: *T, v: T)` - atomically write `v` to `*p`.
+- `atomicStoreRelease(p: *T, v: T)` - atomically write `v` to `*p` with
+  **release** ordering only, which is weaker than every other operation here;
+  see below.
 - `atomicCmpxchg(p: *T, old: T, new: T): bool` - if `*p == old`, store `new` and
   return `true`; otherwise leave `*p` unchanged and return `false` (Go-style).
 - `atomicAdd` / `atomicSub` / `atomicAnd` / `atomicOr` / `atomicXchg(p: *T, v: T): T` -
 atomically apply the operation to `*p`, returning the **previous** value
   (fetch-and-op; `atomicXchg` just swaps `v` in).
 
-All operations use the **strongest ordering** (sequential consistency); a weaker
-ordering is not yet exposed. Every operation lowers to inline machine
-instructions - a `lock`-prefixed op on x86-64, an `LDAXR`/`STLXR` retry loop on
-ARM64 - never an out-of-line call, so a spin/CAS loop stays call-free.
+Every operation except `atomicStoreRelease` uses the **strongest ordering**
+(sequential consistency). All of them lower to inline machine instructions - a
+`lock`-prefixed op on x86-64, an `LDAXR`/`STLXR` retry loop on ARM64 - never an
+out-of-line call, so a spin/CAS loop stays call-free.
+
+`atomicStoreRelease` is the one weaker form, and what it orders is exactly
+this: every memory write the storing thread performed **before** it is visible
+to any thread that afterwards reads `*p` with `atomicLoad` and observes `v`.
+That reader sees those earlier writes too. Nothing else is promised. In
+particular it does **not** order the store against a **later load** on the
+storing thread: a load written after it may take effect before it becomes
+visible to other threads. So it publishes (write the payload, then
+`atomicStoreRelease` the flag) and it releases (drop a lock word a thread
+holds), and it is **not** a fence: a store-then-load handshake where two
+threads each write their own flag and then read the other's - Dekker's shape -
+needs `atomicStore`, whose global total order is the whole point of it. There
+is no matching `atomicLoadRelease`, because `atomicLoad` already provides the
+acquire side that pairs with this store on both targets.
+
+The saving is real on x86-64 and zero on ARM64, which is a property of the
+hardware, not of the compiler: x86-TSO already orders store-store and
+load-store, so a release store is a plain `mov` there while `atomicStore` must
+issue a `lock`ed access, whereas ARM64 lowers both to the same single `STLR`.
+Reach for `atomicStore` unless a release store is what the algorithm actually
+calls for; the weaker form buys one instruction on one target and costs the
+global order everywhere.
 
 A `*T` for these ops comes from `ptrOf(s: []T): *T` - the address of slice `s`'s
 first element - the one bridge from traced memory to a raw pointer (Bit has no
@@ -3545,8 +3570,8 @@ fn main() {
 
 `std/sync`'s atomic operations (`Atomic<T>` and the free `Add` /
 `CompareAndSwap` / `Load` / `Store` / `Swap` functions) take an explicit
-ordering, independent of the raw `*T` builtins in §11.5 (which stay
-sequentially consistent only - no weaker mode is exposed there):
+ordering, independent of the raw `*T` builtins in §11.5 (which are seq-cst
+apart from `atomicStoreRelease`, the single release-only form exposed there):
 
 - **`SeqCst`** (the default when no ordering is given) - every `SeqCst`
   operation, across every location, is seen in one global total order by every
@@ -5368,9 +5393,10 @@ Intentionally **not** in v0.1, to keep the surface minimal:
 - Operator overloading; user-defined implicit conversions.
 - A `recover` builtin or keyword, and any catch syntax for panics: a panic
   boundary is a plain `std/runtime` call, not language surface (§18.4).
-- Weaker memory orderings on the raw `*T` unmanaged-subset atomics (§11.5) - a
-  seq-cst-only surface ships there; `std/sync`'s `Atomic<T>` (§13.7.1) is
-  where `Relaxed`/`Release`/`Acquire` live instead. `std/sync` itself
+- An ordering OPERAND on the raw `*T` unmanaged-subset atomics (§11.5) - that
+  surface exposes one weaker operation, `atomicStoreRelease`, as its own
+  named builtin, and nothing else; `std/sync`'s `Atomic<T>` (§13.7.1) is where
+  `Relaxed`/`Release`/`Acquire` live as selectable modes. `std/sync` itself
   (`Mutex`, `RWMutex`, `WaitGroup`, `Once`) is no longer reserved - see §13.7.
 - Nominal newtypes (all `type` aliases are transparent in v0.1).
 - Thread handles / structured concurrency for `spawn`.
