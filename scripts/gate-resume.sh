@@ -54,21 +54,58 @@
 
 GATE_LAST_GREEN_FILE="bit-out/make/gate-last-green"
 
-# Every `Step{name = "..."` inside `fn gateSteps(): []Step { ... }` in Bit
-# source text on stdin — the exact set `deps: gateNames()` (tools/build/
-# defs.bit) resolves `test` to, i.e. what a plain `./make test` run stamps
-# one rc file per name for. Shape-based like `hunk_is_safe` in gate.sh (a
-# lone `}` alone on a line closes the fn body, by this file's own
-# convention) rather than a real parser.
+# Every gate step name inside `fn gateSteps(): []Step { ... }` in Bit source
+# text on stdin — the exact set `deps: gateNames()` (tools/build/defs.bit)
+# resolves `test` to, i.e. what a plain `./make test` run stamps one rc file
+# per name for. Shape-based like `hunk_is_safe` in gate.sh (a lone `}` alone
+# on a line closes the fn body, by this file's own convention) rather than a
+# real parser.
+#
+# THREE SHAPES, AND ALL THREE ARE LOAD-BEARING. registered_gate_names_at()
+# feeds this the file as it stood at an arbitrary OLD commit, so an extractor
+# that knows only today's spelling silently returns nothing for history and
+# gates_added_since() can then never report a new gate:
+#
+#   gateDepStep("<name>\t<desc>")   current, since #5603 made the table
+#                                   data-driven. NOTE the \t is a literal
+#                                   backslash-t in the Bit source, two bytes,
+#                                   not a tab -- an ERE class excluding \t
+#                                   therefore excludes the letter t and
+#                                   matches nothing, which is how the first
+#                                   draft of this fix still returned zero.
+#                                   data-driven; 107 of them today and the
+#                                   only shape in gateSteps() now
+#   Step{ name = "<name>"           a literal, after #3842 retired `:`
+#   Step{ name: "<name>"            a literal, before that
+#
+# #5698: this function matched the literal spelling alone and returned ZERO
+# against the data-driven table, which had been true since #5603 and is not a
+# separator-sweep artifact. Zero reads as "no gates are registered", so
+# gates_added_since() reported nothing new and a resumed batch skipped every
+# gate added since the last green — silent, and in the direction that runs
+# less.
 gate_step_names_from() {
   sed -n '/^fn gateSteps(): \[\]Step {$/,/^}$/p' |
-    grep -oE 'Step\{name = "[^"]+"' |
-    sed -n 's/^Step{name = "\(.*\)"$/\1/p' |
+    grep -oE 'gateDepStep\("[^"]+|Step\{ *name *[:=] *"[^"]+"' |
+    sed -e 's/^gateDepStep("//' \
+        -e 's/^Step{ *name *[:=] *"//' -e 's/"$//' \
+        -e 's/\\.*$//' |
     sort -u
 }
 
+# FAILS LOUDLY ON ZERO, because zero is indistinguishable from "no gates are
+# registered" at every call site and that is the direction that runs less.
+# The `_at` variant below deliberately does NOT floor: empty is a legitimate
+# answer for a sha that predates the file.
 registered_gate_names() {
-  gate_step_names_from <tools/build/defs.bit
+  local names
+  names="$(gate_step_names_from <tools/build/defs.bit)"
+  if [ -z "${names}" ]; then
+    echo "gate-resume: gate_step_names_from matched no step name in tools/build/defs.bit's gateSteps()." >&2
+    echo "gate-resume: the table's shape changed and this extractor did not follow it (#5698). Fix it before trusting any resume." >&2
+    return 1
+  fi
+  printf '%s\n' "${names}"
 }
 
 # Same set as of `$1` (a commit-ish). Empty (not an error) when `$1` predates
