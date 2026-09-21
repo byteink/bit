@@ -88,7 +88,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
   # The fmt arm, real formatted-file text (#5510) from the same fixture:
   # `bit-oracle fmt` (multi-line bind-block rendering) vs `bit-out/bin/bit fmt`
-  # (single-line composite-default rendering, `:` separator).
+  # (single-line composite-default rendering, `=` separator).
   oracle_catch_fmt='// run
 class Circle {
   r: int
@@ -108,7 +108,7 @@ class Circle {
 fn f(): Circle! { fail newError("boom") }
 
 fn main() {
-  let x = f() catch Circle{ r: 1 }
+  let x = f() catch Circle{ r = 1 }
   println("r=${x.r}")
 }'
 
@@ -129,7 +129,7 @@ class Circle {
 fn f(): Circle! { fail newError("boom") }
 
 fn main() {
-  let x = f() catch Circle{ r: 1 }
+  let x = f() catch Circle{ r = 1 }
   println("changed")
 }'
   sigcfp=$(explainMismatch "$oracle_catch_fmt" "$bit2_catch_fmt_plus" fmt)
