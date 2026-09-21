@@ -215,66 +215,104 @@ fn lowerIndexStore(fc: FnCtx, lhs: int, rhs: int) {
   builderEmit(fc.b, ins)
 }
 
-fn lowerAssign(fc: FnCtx, node: int) {
-  let opKind = getNode(fc.c.tree, node).main
-  let k = kidsOf(fc.c.tree, node)
-  let lhsItems = kidsOf(fc.c.tree, k[0])
-  let rhsItems = kidsOf(fc.c.tree, k[1])
-  // A two-result comma-ok assign to existing locals, either bare `v, ok = m[k]`
-  // (two lhs items) or parenthesized `(v, ok) = m[k]` (one tuple_pat item).
-  if (opKind == int(Kind.Eq) && len(rhsItems) == 1) {
-    let targets = []int(0)
-    if (len(lhsItems) == 2) {
-      targets = lhsItems
-    } else if (len(lhsItems) == 1 && getNode(fc.c.tree, lhsItems[0]).tag == Tag.TuplePat) {
-      targets = kidsOf(fc.c.tree, lhsItems[0])
+// The comma-ok / positional-tuple-spread half of `lowerAssign`'s dispatch:
+// a two-result comma-ok assign to existing locals, either bare `v, ok = m[k]`
+// (two lhs items) or parenthesized `(v, ok) = m[k]` (one tuple_pat item), or
+// `a, b = f()` where `f` returns a matching tuple (SPEC §13.1). Returns
+// whether it fully handled the assignment (every original `return` here
+// becomes `return true`; falling out the bottom — `targets` never reached
+// size 2 — becomes `return false`, telling the caller to fall through to the
+// single-target dispatch, exactly as the original inline block did).
+fn lowerAssignMulti(fc: FnCtx, lhsItems: []int, rhsItems: []int): bool {
+  let targets = []int(0)
+  if (len(lhsItems) == 2) {
+    targets = lhsItems
+  } else if (len(lhsItems) == 1 && getNode(fc.c.tree, lhsItems[0]).tag == Tag.TuplePat) {
+    targets = kidsOf(fc.c.tree, lhsItems[0])
+  }
+  if (len(targets) == 2) {
+    let two = lowerTwoResult(fc, rhsItems[0])
+    if (fc.failed) {
+      return true
     }
-    if (len(targets) == 2) {
-      let two = lowerTwoResult(fc, rhsItems[0])
-      if (fc.failed) {
-        return
-      }
-      if (len(two) == 2) {
-        let t = 0
-        while (t < 2) {
-          assignEnvSlot(fc, targets[t], two[t])
-          if (fc.failed) {
-            return
-          }
-          t = t + 1
-        }
-        return
-      }
-    }
-    // `a, b = f()` / `(a, b) = f()` where `f` returns a tuple (SPEC §13.1): one
-    // value spread positionally over the targets.
-    if (len(targets) > 1) {
-      let tupTy = nodeType(fc, rhsItems[0])
-      if (tupTy != 0 &&
-        fc.c.ctx.types[tupTy].kind == TypeKind.Tuple &&
-        len(fc.c.ctx.types[tupTy].members) == len(targets)) {
-        let val = lowerExpr(fc, rhsItems[0])
+    if (len(two) == 2) {
+      let t = 0
+      while (t < 2) {
+        assignEnvSlot(fc, targets[t], two[t])
         if (fc.failed) {
-          return
+          return true
         }
-        let ti = 0
-        while (ti < len(targets)) {
-          assignEnvSlot(fc, targets[ti], tupleElem(fc, tupTy, val, ti))
-          if (fc.failed) {
-            return
-          }
-          ti = ti + 1
-        }
-        return
+        t = t + 1
       }
-      fcFail(
-        fc,
-        getNode(fc.c.tree, rhsItems[0]).span,
-        "a multi-target assignment whose right side is not a matching tuple",
-      )
-      return
+      return true
     }
   }
+  if (len(targets) > 1) {
+    let tupTy = nodeType(fc, rhsItems[0])
+    if (tupTy != 0 &&
+      fc.c.ctx.types[tupTy].kind == TypeKind.Tuple &&
+      len(fc.c.ctx.types[tupTy].members) == len(targets)) {
+      let val = lowerExpr(fc, rhsItems[0])
+      if (fc.failed) {
+        return true
+      }
+      let ti = 0
+      while (ti < len(targets)) {
+        assignEnvSlot(fc, targets[ti], tupleElem(fc, tupTy, val, ti))
+        if (fc.failed) {
+          return true
+        }
+        ti = ti + 1
+      }
+      return true
+    }
+    fcFail(
+      fc,
+      getNode(fc.c.tree, rhsItems[0]).span,
+      "a multi-target assignment whose right side is not a matching tuple",
+    )
+    return true
+  }
+  return false
+}
+
+// The "not a local" half of the single-target ident assignment: a
+// module-level `let` (§11.11), written through the ordinary FieldSet at
+// offset 0, the same lvalue shape `*p = x` uses. `lnSpan`/`lhsNode`/`rhsNode`
+// stand in for `ln.span`/`lhsItems[0]`/`rhsItems[0]` — same values, passed in
+// rather than re-derived, since the caller already has `ln` and the item
+// arrays.
+fn lowerAssignModuleGlobal(fc: FnCtx, lnSpan: Span, lname: string, lhsNode: int, rhsNode: int) {
+  let wsym = moduleGlobalSym(fc, lname)
+  if (wsym == "") {
+    fcFail(
+      fc,
+      lnSpan,
+      "an assignment target that is neither a local nor a module-level variable",
+    )
+    return
+  }
+  // The lvalue's address is materialized BEFORE the right-hand side, which
+  // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
+  // two compilers' IR byte-identical.
+  let waddr = emitGlobalAddrVal(fc, wsym)
+  let wty = nodeType(fc, lhsNode)
+  let wv = lowerExprH(fc, rhsNode, wty)
+  if (fc.failed) {
+    return
+  }
+  let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  st.lhs = waddr
+  st.ival = 0
+  st.rhs = wv
+  st.ival2 = wty
+  builderEmit(fc.b, st)
+}
+
+// The single-lhs/single-rhs half of `lowerAssign`'s dispatch: class field,
+// collection element, pointer dereference, compound-assign, or a plain
+// ident (local or module global).
+fn lowerAssignSingle(fc: FnCtx, node: int, opKind: int, lhsItems: []int, rhsItems: []int) {
   if (len(lhsItems) != 1 || len(rhsItems) != 1) {
     fcFail(
       fc,
@@ -319,32 +357,7 @@ fn lowerAssign(fc: FnCtx, node: int) {
   let lname = fc.c.source[ln.span.start:ln.span.end]
   let idx = envIndex(fc, lname)
   if (idx == -1) {
-    // Not a local: a module-level `let` (§11.11). Its cell is written through
-    // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
-    let wsym = moduleGlobalSym(fc, lname)
-    if (wsym == "") {
-      fcFail(
-        fc,
-        ln.span,
-        "an assignment target that is neither a local nor a module-level variable",
-      )
-      return
-    }
-    // The lvalue's address is materialized BEFORE the right-hand side, which
-    // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
-    // two compilers' IR byte-identical.
-    let waddr = emitGlobalAddrVal(fc, wsym)
-    let wty = nodeType(fc, lhsItems[0])
-    let wv = lowerExprH(fc, rhsItems[0], wty)
-    if (fc.failed) {
-      return
-    }
-    let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-    st.lhs = waddr
-    st.ival = 0
-    st.rhs = wv
-    st.ival2 = wty
-    builderEmit(fc.b, st)
+    lowerAssignModuleGlobal(fc, ln.span, lname, lhsItems[0], rhsItems[0])
     return
   }
   let ty = fc.env[idx].ty
@@ -355,6 +368,19 @@ fn lowerAssign(fc: FnCtx, node: int) {
   }
   // A concrete value assigned into an interface-typed local is relabelled.
   localWrite(fc, idx, coerceToIface(fc, v, rhsTy, ty))
+}
+
+fn lowerAssign(fc: FnCtx, node: int) {
+  let opKind = getNode(fc.c.tree, node).main
+  let k = kidsOf(fc.c.tree, node)
+  let lhsItems = kidsOf(fc.c.tree, k[0])
+  let rhsItems = kidsOf(fc.c.tree, k[1])
+  if (opKind == int(Kind.Eq) && len(rhsItems) == 1) {
+    if (lowerAssignMulti(fc, lhsItems, rhsItems)) {
+      return
+    }
+  }
+  lowerAssignSingle(fc, node, opKind, lhsItems, rhsItems)
 }
 
 fn lowerIncDec(fc: FnCtx, node: int, base: int) {
