@@ -222,7 +222,7 @@ E0212; only its table row moves. It needs no resolver - whether a statement
 follows one that diverges (`return`/`fail`/`break`/`continue`/`panic`) is
 answered from the AST alone, by reusing the same `diverges` analysis
 `bit check` already uses for E0055 missing-return and catch-block
-completeness (compiler/validatestmt.bit:610).
+completeness (compiler/validatestmtdiverges.bit:129).
 
 `empty-test-file` is E0216 for the same reason `unreachable-code` is E0212:
 assigned from the next free E02xx slot at the time, landing here despite the
