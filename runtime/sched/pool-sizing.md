@@ -47,6 +47,12 @@ workload this repo runs on every push.
   worker threads on 18 cores and blowing the 300000ms batch deadline.
 - A sample during that failing run showed every one of the 204 threads at
   0:00.00 CPU, so the cause is oversubscription, not a spin.
+- The width this policy reaches is workload-specific and is NOT 4, so a
+  default-versus-`BIT_WORKERS=4` reading measures width rather than growth.
+  On 52703111c (darwin arm64, 18 usable cores, build lock held, fleet
+  drained), a timer-only workload — eight green tasks each sleeping 200us
+  five thousand times — settles at ten workers, twelve OS threads counting
+  boot and sysmon, inside the first second and does not move again (#5729).
 
 ## The rule
 
