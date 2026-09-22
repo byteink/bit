@@ -1,0 +1,177 @@
+// pkg/kv/engine.test.bit — page I/O and meta-page recovery (#3467, #5716).
+//
+// The load-bearing property here is TORN-WRITE DETECTION: a meta page whose
+// on-disk bytes were corrupted directly (bypassing the engine entirely, via
+// a raw `File.writeAt`) must never be trusted, and `open` must still recover
+// as long as the OTHER meta page is intact. A checksum test that only ever
+// sees checksums it computed itself proves nothing — see the CRC-flip test
+// below, which corrupts real on-disk bytes and checks `open`'s behavior
+// changes, not just that some internal comparison runs.
+
+import { envOr } from "std/os"
+
+// Nonce'd per call (bitlang-ws/CLAUDE.md: `$TMPDIR` is shared by every
+// concurrent agent, and a fixed name is the bug this rule exists for).
+fn scratchPath(tag: string): string {
+  return "${envOr("TMPDIR", "/tmp")}/bit-kv-5716-${tag}-${timeUnixNs()}"
+}
+
+// `open`, with failure turned into `None` instead of propagated, so a test
+// can assert "open must fail" without needing a dummy Engine to return from
+// a catch block.
+fn tryOpen(path: string): Option<Engine> {
+  let eng = open(path) catch _ {
+    return Option<Engine>.None
+  }
+  return Option.Some(eng)
+}
+
+// Overwrites meta page `id` (0 = meta A, 1 = meta B) at `path` with garbage,
+// bypassing the Engine entirely — a raw `File.writeAt`, exactly the
+// "caller can force one meta page's bytes to be garbage" scenario #5716's
+// acceptance describes.
+//
+// Flips ONE byte, in the page's RESERVED tail past the header (leaves magic,
+// version, page size and txid untouched) so the ONLY thing that can catch
+// this corruption is the checksum — a corruption a magic/version/size check
+// would also happen to reject would not prove the CRC check does anything.
+// This is the mutation this file's own header promises: engine.bit's CRC
+// comparison was disabled by hand, this same corruption was applied, and
+// `bit test pkg/kv` went from green to a `both meta pages are corrupted`
+// failure (meta A no longer rejected, so meta B's still-valid page failed to
+// win); reverting made it green again.
+fn corruptMetaPage(path: string, id: int, pageSize: int) {
+  let raw = openReadWrite(path) catch e {
+    panic("corruptMetaPage: openReadWrite ${path}: ${e.message()}")
+  }
+  let off = i64(id * pageSize)
+  let buf = []byte(pageSize)
+  let n = raw.readAt(buf, off) catch e {
+    panic("corruptMetaPage: readAt page ${id}: ${e.message()}")
+  }
+  if (n != pageSize) {
+    panic("corruptMetaPage: short read of page ${id}: got ${n} of ${pageSize} bytes")
+  }
+  buf[pageSize - 1] = buf[pageSize - 1] ^ 0xff
+  raw.writeAt(buf, off) catch e {
+    panic("corruptMetaPage: writeAt page ${id}: ${e.message()}")
+  }
+  raw.sync() catch e {
+    panic("corruptMetaPage: sync: ${e.message()}")
+  }
+  raw.close()
+}
+
+test "create, close, reopen: open() reports the same page size and the initial txid" {
+  let path = scratchPath("roundtrip")
+  let eng1 = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  let pageSize1 = eng1.pageSize
+  eng1.close()
+
+  let eng2 = open(path) catch e {
+    panic("open after create: ${e.message()}")
+  }
+  assert(
+    eng2.pageSize == pageSize1,
+    "reopened page size ${eng2.pageSize} != created page size ${pageSize1}",
+  )
+  assert(eng2.txid == 0, "reopened txid ${eng2.txid} != initial txid 0")
+  eng2.close()
+}
+
+test "open recovers via meta B when meta A's on-disk bytes are corrupted" {
+  let path = scratchPath("recoverb")
+  let created = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  let pageSize = created.pageSize
+  created.close()
+
+  corruptMetaPage(path, 0, pageSize)
+
+  let got = tryOpen(path)
+  assert(isSome(got), "open must succeed by falling back to meta B when only meta A is corrupted")
+  let eng = unwrap(got)
+  assert(eng.pageSize == pageSize, "recovered page size ${eng.pageSize} != ${pageSize}")
+  assert(eng.txid == 0, "recovered txid ${eng.txid} != initial txid 0")
+  eng.close()
+}
+
+test "open recovers via meta A when meta B's on-disk bytes are corrupted" {
+  let path = scratchPath("recovera")
+  let created = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  let pageSize = created.pageSize
+  created.close()
+
+  corruptMetaPage(path, 1, pageSize)
+
+  let got = tryOpen(path)
+  assert(isSome(got), "open must succeed by falling back to meta A when only meta B is corrupted")
+  let eng = unwrap(got)
+  assert(eng.txid == 0, "recovered txid ${eng.txid} != initial txid 0")
+  eng.close()
+}
+
+test "open fails, not a bogus Engine, when both meta pages are corrupted" {
+  let path = scratchPath("bothbad")
+  let created = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  let pageSize = created.pageSize
+  created.close()
+
+  corruptMetaPage(path, 0, pageSize)
+  corruptMetaPage(path, 1, pageSize)
+
+  let got = tryOpen(path)
+  assert(
+    isNone(got),
+    "open must fail, not silently return an Engine, when neither meta page validates",
+  )
+}
+
+test "writePage/readPage round-trips an arbitrary page's exact bytes" {
+  let path = scratchPath("pageio")
+  let eng = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  let pageSize = eng.pageSize
+  let want = []byte(pageSize)
+  let i = 0
+  while (i < pageSize) {
+    want[i] = byte((i * 167 + 13) % 256)
+    i = i + 1
+  }
+  eng.writePage(2, want) catch e {
+    panic("writePage: ${e.message()}")
+  }
+  let got = eng.readPage(2) catch e {
+    panic("readPage: ${e.message()}")
+  }
+  assert(len(got) == pageSize, "readPage returned ${len(got)} bytes, want ${pageSize}")
+  let j = 0
+  while (j < pageSize) {
+    assert(got[j] == want[j], "page byte ${j}: got ${got[j]}, want ${want[j]}")
+    j = j + 1
+  }
+  eng.close()
+}
+
+// `bit test` treats the `testpanic_` prefix as a verdict modifier (SPEC
+// 18.4): this PASSES only if the call below panics, in its own child
+// process. `data` must be exactly `pageSize` bytes; handing writePage a
+// wrong-sized buffer is a programmer error, so it must panic loudly rather
+// than silently truncate, pad, or write a short page.
+test "testpanic_writePage rejects a buffer that is not exactly pageSize" {
+  let path = scratchPath("wrongsize")
+  let eng = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  eng.writePage(5, []byte(10)) catch e {
+    panic("writePage failed instead of panicking: ${e.message()}")
+  }
+}

@@ -1,0 +1,277 @@
+// pkg/kv — page I/O and the meta-page format (#3467, #5716).
+//
+// One file on disk, fixed-size pages. Page 0 and page 1 are ALWAYS the two
+// meta pages ("meta A" and "meta B"): `create` writes both, identical, at
+// txid 0; a later writer ticket alternates between them on every commit so a
+// crash mid-write always leaves the OTHER one intact. This ticket only
+// establishes the format, `readPage`/`writePage`, and the open/recovery
+// path — no B+tree, no writer lock, no free-list allocator (those are later
+// tickets, see the Constraints on #5716).
+//
+// #3467's stated hazard is a wrong answer with nothing to see. At this layer
+// that is a page that reads back as valid when it is not, so every
+// validation failure here is loud: it fails naming what it found and what it
+// expected, never degrading to a zero value, an empty page, or a default.
+
+import { openReadWrite, syncDir, exists, File } from "std/fs"
+import { dir as dirOf } from "std/path"
+import { crc32cUpdate } from "std/hash"
+
+// --- meta page layout ------------------------------------------------------
+// Fixed-size header at fixed byte offsets, all big-endian (see the packing
+// helpers at the bottom of this file). Bytes 12..15 are reserved/zero so
+// `txid` lands 8-byte aligned; bytes past `kvMetaHeaderSize` are reserved
+// padding, zero-filled by `buildMetaPage` and covered by the checksum like
+// everything else in the page (see `kvComputeCrc`).
+const kvMagicOffset: int = 0
+const kvVersionOffset: int = 4
+const kvPageSizeOffset: int = 8
+const kvTxidOffset: int = 16
+const kvFreeListRootOffset: int = 24
+const kvCrcOffset: int = 32
+const kvMetaHeaderSize: int = 36
+
+const kvMagic: u32 = 0x4b565031 // ASCII "KVP1": KV Page format 1
+const kvFormatVersion: u32 = 1
+const kvPageSize: int = 4096
+const kvNoFreeListRoot: i64 = -1 // no free-list allocated yet; page id 0 is meta A, never a valid root
+
+// An open database file: fixed-size pages, with page 0/1 reserved for the
+// alternating meta pages. `pageSize`, `txid` and `freeListRoot` reflect
+// whichever meta page `open`/`create` picked as current.
+export class Engine {
+  file: File
+  export pageSize: int
+  export txid: u64
+  export freeListRoot: i64
+  activeMeta: int // 0 (meta A) or 1 (meta B): the page id this Engine's state was read from
+
+  // Page `id`'s full `pageSize` bytes, read at `id * pageSize` via
+  // `File.readAt`. Fails on a short read (`readAt` never fails on a short
+  // read itself — only a negative OS result does — so a page beyond the end
+  // of file reads back short here, not silently zero-filled).
+  export readPage(id: i64): []byte! {
+    let buf = []byte(this.pageSize)
+    let n = this.file.readAt(buf, id * i64(this.pageSize))?
+    if (n != this.pageSize) {
+      fail newError("kv: short read of page ${id}: got ${n} of ${this.pageSize} bytes")
+    }
+    return buf
+  }
+
+  // Writes `data` as page `id`, at `id * pageSize` via `File.writeAt`. `data`
+  // must be exactly `pageSize` bytes — a caller handing a wrong-sized buffer
+  // is a programmer error, not an I/O failure, so this panics rather than
+  // silently truncating or zero-padding it.
+  export writePage(id: i64, data: []byte): ()! {
+    if (len(data) != this.pageSize) {
+      panic("kv: writePage(${id}): data is ${len(data)} bytes, must be exactly pageSize (${this.pageSize})")
+    }
+    let n = this.file.writeAt(data, id * i64(this.pageSize))?
+    if (n != this.pageSize) {
+      fail newError("kv: short write of page ${id}: wrote ${n} of ${this.pageSize} bytes")
+    }
+  }
+
+  // Closes the underlying file. Does not sync first — callers that need the
+  // last write durable must `file.sync()` before closing (mirrors
+  // `std/fs.File.close`'s own contract).
+  export close() {
+    this.file.close()
+  }
+}
+
+// The decoded, VALIDATED contents of one meta page. Never constructed except
+// by `parseMetaPage`, which is the only place format validation happens.
+class metaPage {
+  txid: u64,
+  pageSize: int,
+  freeListRoot: i64,
+}
+
+// Creates a brand-new database file at `path`, or fails if anything already
+// exists there — `create` never overwrites. Allocates page 0 (meta A) and
+// page 1 (meta B), both starting at txid 0 with no free-list yet, syncs the
+// file and then its directory entry (#4017: an unsynced create is invisible
+// after a crash) before returning.
+export fn create(path: string): Engine! {
+  if (exists(path)) {
+    fail newError("kv: create: ${path} already exists")
+  }
+  let f = openReadWrite(path)?
+  let eng = Engine{
+    file = f,
+    pageSize = kvPageSize,
+    txid = 0,
+    freeListRoot = kvNoFreeListRoot,
+    activeMeta = 0,
+  }
+  let meta = buildMetaPage(0, kvNoFreeListRoot)
+  eng.writePage(0, meta)?
+  eng.writePage(1, meta)?
+  f.sync()?
+  syncDir(dirOf(path))?
+  return eng
+}
+
+// Opens an existing database at `path`. Reads meta A (page 0) and meta B
+// (page 1), validates each independently, and builds the `Engine` from
+// whichever is valid with the HIGHER txid — meta A wins a tie, since
+// `create` writes both with the same initial txid. Fails if the file is too
+// short to hold two meta pages, or if BOTH meta pages fail validation: a
+// database with no valid meta page is unrecoverable, and returning a bogus
+// `Engine` anyway would be exactly the silent-wrong-answer hazard #3467
+// exists to avoid.
+export fn open(path: string): Engine! {
+  let f = openReadWrite(path)?
+  let bufA = []byte(kvPageSize)
+  let bufB = []byte(kvPageSize)
+  let nA = f.readAt(bufA, 0)?
+  let nB = f.readAt(bufB, i64(kvPageSize))?
+  if (nA != kvPageSize || nB != kvPageSize) {
+    fail newError("kv: open: ${path} is too short to hold two ${kvPageSize}-byte meta pages (read ${nA} then ${nB} bytes)")
+  }
+  let metaA = kvTryParseMeta(bufA)
+  let metaB = kvTryParseMeta(bufB)
+  if (isNone(metaA) && isNone(metaB)) {
+    fail newError("kv: open: ${path}: both meta page A and meta page B failed validation, no recoverable meta page")
+  }
+  if (isSome(metaA) && (isNone(metaB) || unwrap(metaA).txid >= unwrap(metaB).txid)) {
+    let m = unwrap(metaA)
+    return Engine{
+      file = f,
+      pageSize = m.pageSize,
+      txid = m.txid,
+      freeListRoot = m.freeListRoot,
+      activeMeta = 0,
+    }
+  }
+  let m = unwrap(metaB)
+  return Engine{
+    file = f,
+    pageSize = m.pageSize,
+    txid = m.txid,
+    freeListRoot = m.freeListRoot,
+    activeMeta = 1,
+  }
+}
+
+// `parseMetaPage`, with failure turned into `None` instead of propagated —
+// `open` needs to try BOTH meta pages and pick the better one, never abort
+// on the first bad one.
+fn kvTryParseMeta(buf: []byte): Option<metaPage> {
+  let m = parseMetaPage(buf) catch _ {
+    return Option<metaPage>.None
+  }
+  return Option.Some(m)
+}
+
+// Serializes a fresh meta page: `kvPageSize` bytes, header fields at the
+// fixed offsets above, CRC32C over everything except the checksum field
+// itself (`kvComputeCrc`).
+fn buildMetaPage(txid: u64, freeListRoot: i64): []byte {
+  let buf = []byte(kvPageSize)
+  putU32(buf, kvMagicOffset, kvMagic)
+  putU32(buf, kvVersionOffset, kvFormatVersion)
+  putU32(buf, kvPageSizeOffset, u32(kvPageSize))
+  putU64(buf, kvTxidOffset, txid)
+  putI64(buf, kvFreeListRootOffset, freeListRoot)
+  putU32(buf, kvCrcOffset, kvComputeCrc(buf))
+  return buf
+}
+
+// Validates `buf` as a meta page and decodes it, or fails naming exactly
+// what was wrong: a checksum mismatch (the torn-write/corruption case), a
+// bad magic (not a kv meta page at all), an unsupported format version, or a
+// page size this build cannot use. Checked in that order because a bad
+// checksum means every OTHER field in `buf` is unverified garbage — no point
+// reporting "bad magic" for a value that might just be corruption noise.
+fn parseMetaPage(buf: []byte): metaPage! {
+  if (len(buf) != kvPageSize) {
+    fail newError("kv: meta page is ${len(buf)} bytes, want exactly ${kvPageSize}")
+  }
+  let storedCrc = getU32(buf, kvCrcOffset)
+  let computedCrc = kvComputeCrc(buf)
+  if (storedCrc != computedCrc) {
+    fail newError("kv: meta page checksum mismatch: stored ${storedCrc}, computed ${computedCrc}")
+  }
+  let magic = getU32(buf, kvMagicOffset)
+  if (magic != kvMagic) {
+    fail newError("kv: meta page bad magic: got ${magic}, want ${kvMagic}")
+  }
+  let version = getU32(buf, kvVersionOffset)
+  if (version != kvFormatVersion) {
+    fail newError("kv: meta page format version ${version} is not supported, this build supports ${kvFormatVersion}")
+  }
+  let pageSize = int(getU32(buf, kvPageSizeOffset))
+  if (pageSize != kvPageSize) {
+    fail newError("kv: meta page page size ${pageSize} does not match this build's ${kvPageSize}")
+  }
+  return metaPage{
+    txid = getU64(buf, kvTxidOffset),
+    pageSize = pageSize,
+    freeListRoot = getI64(buf, kvFreeListRootOffset),
+  }
+}
+
+// CRC32C over the whole page EXCEPT the 4 checksum bytes at `kvCrcOffset` —
+// covers the header fields before it AND every reserved/padding byte after
+// it, so any single-byte corruption anywhere in the page is caught, not just
+// inside the fields this format version happens to use.
+fn kvComputeCrc(buf: []byte): u32 {
+  let seed = crc32cUpdate(0, buf[0:kvCrcOffset])
+  return crc32cUpdate(seed, buf[kvCrcOffset + 4:len(buf)])
+}
+
+// --- fixed-width big-endian byte packing ------------------------------------
+// Same convention pkg/kv/keyencoding.bit's fixed-width key helpers and
+// stdlib/crypto/sha256.bit use: most-significant byte first, `byte(v >> n)`
+// truncating to the low 8 bits with no explicit mask needed.
+
+fn putU32(buf: []byte, off: int, v: u32) {
+  buf[off] = byte(v >> 24)
+  buf[off + 1] = byte(v >> 16)
+  buf[off + 2] = byte(v >> 8)
+  buf[off + 3] = byte(v)
+}
+
+fn getU32(buf: []byte, off: int): u32 {
+  return (u32(buf[off]) << 24) |
+    (u32(buf[off + 1]) << 16) |
+    (u32(buf[off + 2]) << 8) |
+    u32(buf[off + 3])
+}
+
+fn putU64(buf: []byte, off: int, v: u64) {
+  buf[off] = byte(v >> 56)
+  buf[off + 1] = byte(v >> 48)
+  buf[off + 2] = byte(v >> 40)
+  buf[off + 3] = byte(v >> 32)
+  buf[off + 4] = byte(v >> 24)
+  buf[off + 5] = byte(v >> 16)
+  buf[off + 6] = byte(v >> 8)
+  buf[off + 7] = byte(v)
+}
+
+fn getU64(buf: []byte, off: int): u64 {
+  return (u64(buf[off]) << 56) |
+    (u64(buf[off + 1]) << 48) |
+    (u64(buf[off + 2]) << 40) |
+    (u64(buf[off + 3]) << 32) |
+    (u64(buf[off + 4]) << 24) |
+    (u64(buf[off + 5]) << 16) |
+    (u64(buf[off + 6]) << 8) |
+    u64(buf[off + 7])
+}
+
+// i64 reinterpreted bit-for-bit as u64 and back — the same reinterpret cast
+// pkg/kv/keyencoding.bit's encodeInt/decodeInt rely on, never a value
+// conversion, so the full i64 range (including a negative free-list-root
+// sentinel) round-trips exactly.
+fn putI64(buf: []byte, off: int, v: i64) {
+  putU64(buf, off, u64(v))
+}
+
+fn getI64(buf: []byte, off: int): i64 {
+  return i64(getU64(buf, off))
+}
