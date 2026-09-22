@@ -1321,7 +1321,7 @@ interface error { message(): string }
 trait_decl   = "trait" IDENT "{" { trait_member } "}" .
 trait_member = use_stmt | trait_method | trait_field .
 use_stmt     = "use" IDENT { "," IDENT } .
-trait_method = IDENT [ generic_params ] signature [ block ] .
+trait_method = [ "export" ] IDENT [ generic_params ] signature [ block ] .
 trait_field  = [ "export" ] IDENT ":" type .    (* no `readonly` - §10.5 is class-only *)
 ```
 
@@ -1398,6 +1398,9 @@ Injection rules:
   class **as if declared there**, with `this` typed as the class and every
   `Self` (below) resolved to it. The injected method participates in structural
   interface satisfaction (§14.3) exactly like a method the class wrote itself.
+- A provided method's own `export` carries onto the injected copy: the copy
+  is exported (§17.3) exactly when the trait's own declaration was, mirroring
+  how an exported trait field's status carries onto its injected copy (above).
 - If the class **itself** declares a method with the same name, that
   declaration wins silently - there is no `insteadof`/`as` conflict syntax.
 - Two `use`d traits (directly, or transitively through a trait's own `use`)
@@ -5500,7 +5503,7 @@ fsep          = ";" | "," .
 trait_decl    = "trait" IDENT "{" { trait_member } "}" .
 trait_member  = use_stmt | trait_method | trait_field .
 use_stmt      = "use" IDENT { "," IDENT } .
-trait_method  = IDENT [ generic_params ] signature [ block ] .
+trait_method  = [ "export" ] IDENT [ generic_params ] signature [ block ] .
 trait_field   = [ "export" ] IDENT ":" type .
 enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_member { fsep enum_member } [ fsep ] ] "}" .
 enum_member   = enum_variant | method_decl .
