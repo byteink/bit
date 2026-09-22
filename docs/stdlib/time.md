@@ -1014,6 +1014,73 @@ the two wall clocks, so 09:00 Dubai is before 09:00 London.
 To compare wall clocks instead, compare `.naive()` on both sides. To compare
 across types at all, convert both to `Timestamp` first.
 
+### `Date.compare(other: Date): int`
+
+`-1`, `0` or `1` as `this` is an earlier, the same, or a later calendar day
+than `other`. Every other `Date` comparison method is written in terms of
+this one.
+
+### `Date.isBefore(other: Date): bool`
+
+### `Date.isAfter(other: Date): bool`
+
+### `Date.isSame(other: Date): bool`
+
+### `Date.isBetween(lo: Date, hi: Date): bool`
+
+### `Time.compare(other: Time): int`
+
+`-1`, `0` or `1` comparing time of day, to the nanosecond: `09:00:00` is
+before `09:00:00.000000001`.
+
+### `Time.isBefore(other: Time): bool`
+
+### `Time.isAfter(other: Time): bool`
+
+### `Time.isSame(other: Time): bool`
+
+### `Time.isBetween(lo: Time, hi: Time): bool`
+
+### `NaiveDateTime.compare(other: NaiveDateTime): int`
+
+`-1`, `0` or `1` comparing two wall-clock readings with no zone between them -
+what "compare the wall clocks" means for two `DateTime` values compared
+through `.naive()`.
+
+### `NaiveDateTime.isBefore(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isAfter(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isSame(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isBetween(lo: NaiveDateTime, hi: NaiveDateTime): bool`
+
+### `DateTime.compare(other: DateTime): int`
+
+`-1`, `0` or `1` as `this` names an earlier **instant** than `other`, the same
+instant, or a later one - never by wall clock (above). Two readings of the
+same instant in different zones compare equal.
+
+### `DateTime.isBefore(other: DateTime): bool`
+
+### `DateTime.isAfter(other: DateTime): bool`
+
+### `DateTime.isSame(other: DateTime): bool`
+
+### `DateTime.isBetween(lo: DateTime, hi: DateTime): bool`
+
+### `Timestamp.compare(other: Timestamp): int`
+
+`-1`, `0` or `1` comparing two instants directly, as nanosecond counts.
+
+### `Timestamp.isBefore(other: Timestamp): bool`
+
+### `Timestamp.isAfter(other: Timestamp): bool`
+
+### `Timestamp.isSame(other: Timestamp): bool`
+
+### `Timestamp.isBetween(lo: Timestamp, hi: Timestamp): bool`
+
 Convenience predicates on `Date`:
 
 | Method | Meaning |
@@ -1023,11 +1090,66 @@ Convenience predicates on `Date`:
 | `isSameMonth(other)` `isSameYear(other)` | |
 | `isWeekend()` `isWeekday()` | see [Business days](#business-days) |
 
+### `Date.isSameDay(other: Date): bool`
+
+Same answer as `isSame` on a `Date` - spelled out separately so the same call
+reads the same on all three calendar types.
+
+### `Date.isSameMonth(other: Date): bool`
+
+True when `this` and `other` fall in the same month of the same year.
+2026-01-31 and 2026-01-01 are the same month; 2025-01-31 and 2026-01-31 are
+not.
+
+### `Date.isSameYear(other: Date): bool`
+
+### `NaiveDateTime.isSameDay(other: NaiveDateTime): bool`
+
+True when `this` and `other` fall on the same calendar day, whatever the time
+of day: 2026-09-17T00:00 and 2026-09-17T23:59 are the same day, though
+`isSame` on that pair is false.
+
+### `NaiveDateTime.isSameMonth(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isSameYear(other: NaiveDateTime): bool`
+
+Forwards to the matching `Date.isSame*`, read off the wall clock's date.
+
+### `DateTime.isSameDay(other: DateTime): bool`
+
+True when the two **wall clocks** fall on the same calendar day, each read in
+its own zone - the same wall-clock reading `add*` and `startOf*` use. Two
+zones are rarely worth mixing here: convert one side with `withZone` first
+when the question is about a single observer's day.
+
+### `DateTime.isSameMonth(other: DateTime): bool`
+
+### `DateTime.isSameYear(other: DateTime): bool`
+
+Same wall-clock reading as `isSameDay`.
+
 On `Timestamp` and `DateTime`:
 
 | Method | Meaning |
 |---|---|
 | `isPast()` `isFuture()` | compared against `now()` |
+
+### `DateTime.isPast(): bool`
+
+True when this instant is strictly before `now()`. Reads the clock on every
+call, so a value that is future now becomes past later; to pin a moment,
+hold a `Timestamp` and compare against it instead.
+
+### `DateTime.isFuture(): bool`
+
+True when this instant is strictly after `now()`. `isPast()` and `isFuture()`
+are both false in the one nanosecond a value names exactly.
+
+### `Timestamp.isPast(): bool`
+
+### `Timestamp.isFuture(): bool`
+
+Same meaning as the `DateTime` pair, compared directly as nanosecond counts.
 
 ---
 
