@@ -1,6 +1,8 @@
 // bit — bit.json's ROOT-ONLY "link" array: external `.a`/`.o` paths handed
-// to the linker (#5711). This is the parse-and-resolve half only; threading
-// the result into `emitAndLinkExe` is the next ticket in this chain (#5712).
+// to the linker (#5711), resolved and read into bytes here, then threaded
+// by `buildIr` (build.bit) through `IrModule.linkArchives` into both the
+// §11.7 admission gate (`rejectExternForTarget`'s `extraArchives`,
+// buildextern.bit/#5712) and the real link step (`emitAndLinkExe`, #5713).
 // Sibling of build.bit (same module).
 //
 // "Root-only" is enforced STRUCTURALLY, not by a runtime check:
@@ -49,15 +51,59 @@ export fn readLinkArchives(rootDir: string): []string! {
   return out
 }
 
-// Proves `readLinkArchives`'s result is reachable from `buildIr` without yet
-// threading it into the link step (the next ticket in this chain does that):
-// every resolved path is non-empty, since `pathJoinResolve` never returns "".
+// Proves `readLinkArchives`'s result is reachable from `buildIr`: every
+// resolved path is non-empty, since `pathJoinResolve` never returns "".
 fn assertLinkArchivesResolved(archives: []string) {
   let i = 0
   while (i < len(archives)) {
     assert(len(archives[i]) > 0)
     i = i + 1
   }
+}
+
+// Reads each of `paths`' bytes, in order -- the resolved absolute paths
+// `readLinkArchives` returned -- and confirms each one parses as an `ar`
+// archive at all (`parseArchive`, archive.bit -- the same GNU/BSD-detecting
+// reader every backend's own `*ArchiveDefines` already builds on, so this
+// asks nothing a real link would not itself need to answer).
+//
+// A path that does not exist, cannot be read, or does not parse as `ar`
+// fails the BUILD, naming the path and the bit.json it came from, rather
+// than degrading to a silently shorter (or empty) archive list: a name
+// missing from `extraArchives` only because its OWN read failed would look
+// identical to "this symbol genuinely is not in the archive" (E0078) --
+// exactly the debugging trap #3579 exists to close. A member that parses as
+// `ar` but holds the wrong target's object format is left to the existing
+// per-target membership check (machoArchiveDefines/peArchiveDefines/
+// archiveDefines), which already treats "cannot read this member" as "does
+// not define this symbol" rather than silently dropping the whole archive.
+fn readLinkArchiveBytes(rootDir: string, paths: []string): [][]u8! {
+  let manifestPath = pmJoin(rootDir, "bit.json")
+  let out = [][]u8(0)
+  let i = 0
+  while (i < len(paths)) {
+    let path = paths[i]
+    let text = readFile(path) catch e {
+      fail newError("${manifestPath}: \"link\" archive ${path}: ${e.message()}")
+    }
+    let bytes = []byte(text)
+    parseArchive(bytes) catch e {
+      fail newError("${manifestPath}: \"link\" archive ${path} is not a valid ar archive: ${e.message()}")
+    }
+    out = append(out, bytes)
+    i = i + 1
+  }
+  return out
+}
+
+// `buildIr`'s one call site into this file: resolve bit.json's "link" array
+// under `rootDir`, then read every entry's bytes. Bundled into one function
+// (rather than three calls at the call site) so a change to this file's own
+// internal plumbing never touches `buildIr`'s line count or param list.
+export fn resolveLinkArchives(rootDir: string): [][]u8! {
+  let paths = readLinkArchives(rootDir)?
+  assertLinkArchivesResolved(paths)
+  return readLinkArchiveBytes(rootDir, paths)?
 }
 
 // ---- self-checks (compiler/selfcheck.bit's selfcheckPhaseProject calls
@@ -124,6 +170,15 @@ fn pmTryReadLinkArchivesMessage(dir: string): string {
   return ""
 }
 
+// `readLinkArchiveBytes`'s failure message, or "" on success — same shape as
+// pmTryReadLinkArchivesMessage above.
+fn pmTryReadLinkArchiveBytesMessage(dir: string, paths: []string): string {
+  readLinkArchiveBytes(dir, paths) catch e {
+    return e.message()
+  }
+  return ""
+}
+
 // "link" present but not an array must FAIL, not degrade to []: a wrong
 // shape is a real parse error (this file's own header explains why).
 fn checkReadLinkArchivesRejectsNonArrayShape() {
@@ -160,6 +215,58 @@ fn checkReadLinkArchivesIgnoresDependencyDir() {
   }
   assert(len(archives) == 1)
   assert(archives[0] == pathResolve(dir + "/lib/a.a"))
+
+  removeTree(root, pmCheckTimeoutMs)
+}
+
+// A resolved path that IS a well-formed (empty) `ar` archive reads back its
+// exact bytes — the ordinary case `readLinkArchiveBytes` exists for.
+fn checkReadLinkArchiveBytesReadsArchive() {
+  let root = pmCheckScratchDir()
+  let dir = root + "/bytes-ok"
+  pmCheckMkdirAll(dir)
+  let archiveBytes = writeArchive([]ArMember(0), arFormatGnu())
+  writeFile(dir + "/a.a", string(archiveBytes)) catch e {
+    panic("buildlink: cannot write a.a: " + e.message())
+  }
+  let bytes = readLinkArchiveBytes(dir, [dir + "/a.a"]) catch e {
+    panic("buildlink: readLinkArchiveBytes unexpectedly failed: " + e.message())
+  }
+  assert(len(bytes) == 1)
+  assert(len(bytes[0]) == len(archiveBytes))
+
+  removeTree(root, pmCheckTimeoutMs)
+}
+
+// A resolved path readLinkArchives named but nothing wrote to disk must FAIL,
+// naming the path — the "silently skip a missing archive" trap this file's
+// own header warns against.
+fn checkReadLinkArchiveBytesRejectsMissingPath() {
+  let root = pmCheckScratchDir()
+  let dir = root + "/bytes-missing"
+  pmCheckMkdirAll(dir)
+  let missing = dir + "/nope.a"
+  let message = pmTryReadLinkArchiveBytesMessage(dir, [missing])
+  assert(message != "")
+  assert(pkgTestContains(message, missing))
+
+  removeTree(root, pmCheckTimeoutMs)
+}
+
+// A path that exists but is not a valid `ar` archive must FAIL too, naming
+// the path — the same trap, one step later: the file reads fine, only its
+// shape is wrong.
+fn checkReadLinkArchiveBytesRejectsMalformedArchive() {
+  let root = pmCheckScratchDir()
+  let dir = root + "/bytes-malformed"
+  pmCheckMkdirAll(dir)
+  let bad = dir + "/bad.a"
+  writeFile(bad, "not an archive") catch e {
+    panic("buildlink: cannot write bad.a: " + e.message())
+  }
+  let message = pmTryReadLinkArchiveBytesMessage(dir, [bad])
+  assert(message != "")
+  assert(pkgTestContains(message, bad))
 
   removeTree(root, pmCheckTimeoutMs)
 }
