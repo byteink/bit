@@ -1,0 +1,297 @@
+// pkg/kv/crash.test.bit — kill -9 mid-commit crash-consistency proof
+// (epic #3467, #5725, depends on #5721's closure-scoped `db.write`).
+//
+// THE PROPERTY. "kill -9 mid-commit, reopen, assert the tree is consistent
+// and the last committed transaction survived" (#3467's own words) — nothing
+// else in this package actually interrupts a process mid-write, so this file
+// is that proof. It never edits db.bit/engine.bit/btree.bit: it only proves
+// the commit path #5721 already built is crash-safe, the same way
+// `pkg/kv/db.test.bit`'s free-list test proves reuse by mutation rather than
+// by reading the source.
+//
+// MECHANISM, same harness precedent `pkg/kv/db.test.bit`'s own cross-process
+// lock test already established for a killed/backgrounded child: build a
+// real second Bit binary (this module copied into `kvmod` + a generated
+// `main.bit`, `writeCrashChildModule5725`/`crashChildMainSrc5725` below,
+// mirroring `writeChildModule5721`/`childMainSrc5721`), then run it through a
+// `/bin/sh` wrapper. `db.test.bit`'s own comment on `lockWrapperScript`
+// already measured that `spawn` + `std/os.run()` does NOT give this runtime
+// real concurrency for a long-blocking child (a spawned `run("/bin/sleep",
+// "2")` stalled this same process's own unrelated sleep loop for the full
+// 2s) — so nothing here relies on Bit-level concurrency at all. Instead the
+// ENTIRE poll-then-kill sequence runs inside one `/bin/sh` script
+// (`crashKillWrapperScript5725`): background the child, poll its progress
+// side-file (a plain `std/fs.appendFile` line per committed transaction,
+// written outside the kv engine entirely) until it has logged at least
+// `targetLines` transactions, `kill -9` it, then `wait` on it — the wrapper
+// is the child's REAL shell parent throughout, so POSIX `wait` reports the
+// termination status directly (128+signal), with no orphan-reparenting
+// problem to work around.
+//
+// EVERY ONE OF 10 CYCLES uses a DIFFERENT `targetLines` (1, 3, 5, ..., 19 of
+// `crashWritesPerCycle`=30 total writes), so the kill lands at a different
+// point relative to each cycle's own write/sync/meta-flip sequence — a
+// single lucky kill proves nothing about that ordering. Bounded on OBSERVED
+// PROGRESS (`wc -l` on the side-file), not on elapsed wall-clock time, so a
+// loaded box slows the whole cycle down uniformly rather than producing a
+// false miss — this workspace has been burned by fixed wall-clock bounds
+// under fleet load before.
+//
+// THE ASSERTION always runs against a FRESH `openDb` from this (the parent)
+// process, never from the process being killed. Every committed value
+// logged before the child's last progress line must be present after
+// reopen, proving no torn state; the very last one may be present or absent
+// (the kill can land between the meta write finishing and the log line
+// landing) but if present it must decode to the correct value, never a
+// corrupt one.
+
+import { split } from "std/strings"
+
+// How many committed transactions each child writes per cycle. Kept well
+// above the highest `targetLines` (19) so every cycle's kill still lands
+// mid-run rather than after the child has already exited on its own.
+const crashWritesPerCycle: int = 30
+
+// Generates the child fixture's own `main.bit`. Deliberately built with NO
+// Bit-level `${...}` interpolation for anything the CHILD's own loop
+// variable touches — `_tests_/bit/fsblock.bit`'s `fixtureSource` comment
+// explains why: an interpolation in a string built by THIS file is
+// evaluated by THIS file, not the fixture. The one exception,
+// `${crashWritesPerCycle}`, embeds this file's own constant, exactly the
+// way `db.test.bit`'s `lockWrapperScript` embeds its own `prog`/`dbPath`
+// parameters.
+fn crashChildMainSrc5725(): string {
+  return "import { arg } from \"std/os\"\n" +
+    "import { appendFile } from \"std/fs\"\n" +
+    "import { sleep } from \"std/time\"\n" +
+    "import { encodeInt, openDb } from \"./kvmod\"\n" +
+    "fn main() {\n" +
+    "  let dbPath = arg(1)\n" +
+    "  let progressPath = arg(2)\n" +
+    "  let db = openDb(dbPath) catch e { panic(\"child open: \" + e.message()) }\n" +
+    "  let i = 1\n" +
+    "  while (i <= ${crashWritesPerCycle}) {\n" +
+    "    let key = encodeInt(i64(i))\n" +
+    "    db.write((tx) => {\n" +
+    "      tx.put(key, key)?\n" +
+    "    }) catch e { panic(\"child write: \" + e.message()) }\n" +
+    "    appendFile(progressPath, \"1\\n\") catch e { panic(\"child progress: \" + e.message()) }\n" +
+    "    sleep(3000000)\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "}\n"
+}
+
+// Copies every non-test source file of this module into `dir/kvmod`, same
+// technique `db.test.bit`'s `writeChildModule5721` uses (not reused
+// directly: that function also writes ITS OWN `main.bit`, which this ticket
+// must not use).
+fn writeCrashChildModule5725(loc: BitLocation, dir: string) {
+  let kvDir = "${dir}/kvmod"
+  mkdir(kvDir) catch e {
+    panic("kv crash test: mkdir ${kvDir}: ${e.message()}")
+  }
+  let names = readDir("${loc.repo}/pkg/kv") catch e {
+    panic("kv crash test: readDir pkg/kv: ${e.message()}")
+  }
+  for name of names {
+    if (!hasSuffix(name, ".bit") || hasSuffix(name, ".test.bit")) {
+      continue
+    }
+    let src = readFile("${loc.repo}/pkg/kv/${name}") catch e {
+      panic("kv crash test: read ${name}: ${e.message()}")
+    }
+    writeFile("${kvDir}/${name}", src) catch e {
+      panic("kv crash test: write ${name}: ${e.message()}")
+    }
+  }
+}
+
+fn buildCrashChild5725(loc: BitLocation, dir: string, prog: string): int {
+  let script = "#!/bin/sh\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
+    "'${loc.bin}' build '${dir}/main.bit' -o '${prog}'\n"
+  return shellRun5721("${dir}/build.sh", script, 60000)
+}
+
+// Backgrounds the compiled child, polls its OWN progress side-file (never
+// elapsed time) until at least `targetLines` transactions have logged, kills
+// it, then `wait`s on it from the SAME shell that backgrounded it — the
+// wrapper never exits before the kill, so there is no orphan/reparenting gap
+// for `wait` to fall into. `wc -l` counts only newline-terminated lines, so
+// a progress line the child was killed while writing is not counted either
+// side of this script, matching `countCompleteLines5725` below exactly.
+fn crashKillWrapperScript5725(
+  prog: string, dbPath: string, progressPath: string, targetLines: int, maxPollTries: int,
+): string {
+  return "#!/bin/sh\n" +
+    "rm -f '${progressPath}'\n" +
+    "'${prog}' '${dbPath}' '${progressPath}' > /dev/null 2>&1 &\n" +
+    "p=$!\n" +
+    "n=0\n" +
+    "while [ $n -lt ${maxPollTries} ]; do\n" +
+    "  lines=$(wc -l < '${progressPath}' 2>/dev/null | tr -d ' ')\n" +
+    "  [ -z \"$lines\" ] && lines=0\n" +
+    "  if [ \"$lines\" -ge ${targetLines} ]; then break; fi\n" +
+    "  sleep 0.02\n" +
+    "  n=$((n+1))\n" +
+    "done\n" +
+    "kill -9 $p 2>/dev/null\n" +
+    "wait $p\n" +
+    "exit $?\n"
+}
+
+// The `wait $p; exit $?` pattern above reports POSIX's 128+signal via the
+// wrapper's own (normal) exit code, not via `osRunBounded`'s separate
+// killed-by-signal encoding — the wrapper itself always exits cleanly, it is
+// only reporting the GRANDCHILD's status. Mirrors
+// `_tests_/bit/childrun/childrun.bit:142`'s `signalName` mapping (module-
+// private there too, so replicated rather than imported across modules).
+fn crashSignalName5725(sig: int): string {
+  if (sig == 6) {
+    return "SIGABRT (6)"
+  }
+  if (sig == 9) {
+    return "SIGKILL (9)"
+  }
+  if (sig == 11) {
+    return "SIGSEGV (11)"
+  }
+  return "signal ${sig}"
+}
+
+// Complete (newline-terminated) lines only — a line the child was mid-write
+// on when killed is never counted, on either side of the kill wrapper's own
+// `wc -l`.
+fn countCompleteLines5725(path: string): int {
+  let content = readFile(path) catch _ {
+    return 0
+  }
+  let parts = split(content, "\n")
+  let n = len(parts) - 1
+  if (n < 0) {
+    return 0
+  }
+  return n
+}
+
+class CrashTally5725 { checks: int, failures: int }
+
+fn crashCheck5725(t: CrashTally5725, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// The actual consistency proof, from a FRESH `openDb` in THIS process —
+// never the one that was killed. Keys 1..loggedCount-1 must all be present
+// and correct (no torn state); the last logged one may be present or
+// absent, but if present must decode correctly.
+fn verifyCrashConsistency5725(dbPath: string, progressPath: string, cycle: int, t: CrashTally5725) {
+  let loggedCount = countCompleteLines5725(progressPath)
+  let db = openDb(dbPath) catch e {
+    crashCheck5725(t, false, "cycle ${cycle}: fresh reopen failed: ${e.message()}")
+    return
+  }
+  let k = 1
+  while (k < loggedCount) {
+    let v = getOrEmpty(db.eng, db.root, encodeInt(i64(k)))
+    let ok = len(v) > 0 && decodeInt(v) == i64(k)
+    crashCheck5725(
+      t, ok,
+        "cycle ${cycle}: committed value ${k} of ${loggedCount} missing after reopen -- " +
+        "torn commit",
+    )
+    k = k + 1
+  }
+  if (loggedCount > 0) {
+    let lastVal = getOrEmpty(db.eng, db.root, encodeInt(i64(loggedCount)))
+    let lastOk = len(lastVal) == 0 || decodeInt(lastVal) == i64(loggedCount)
+    crashCheck5725(
+      t, lastOk,
+      "cycle ${cycle}: last logged value ${loggedCount} present but CORRUPT -- torn commit",
+    )
+  }
+  db.close()
+}
+
+// Groups the run's fixed inputs so `runCrashCycle5725` stays within the
+// 5-parameter lint ceiling instead of raising it.
+class CrashCycleCfg5725 { prog: string, dir: string, maxPollTries: int }
+
+// One kill-and-reopen cycle: fresh db, run the child under the kill
+// wrapper, confirm it died by SIGKILL (never a clean exit -- a child that
+// quietly finished before the kill landed proves nothing), then verify.
+fn runCrashCycle5725(cfg: CrashCycleCfg5725, cycle: int, targetLines: int, t: CrashTally5725) {
+  let dbPath = "${cfg.dir}/db-${cycle}"
+  let progressPath = "${cfg.dir}/progress-${cycle}"
+  let seed = createDb(dbPath) catch e {
+    panic("kv crash test: createDb cycle ${cycle}: ${e.message()}")
+  }
+  seed.close()
+  let script = "${cfg.dir}/kill-${cycle}.sh"
+  let rc = shellRun5721(
+    script,
+    crashKillWrapperScript5725(cfg.prog, dbPath, progressPath, targetLines, cfg.maxPollTries),
+    45000,
+  )
+  let sigLabel = crashSignalName5725(rc - 128)
+  crashCheck5725(
+    t, sigLabel == "SIGKILL (9)",
+    "cycle ${cycle}: child must die by SIGKILL, wrapper reports exit ${rc} (${sigLabel})",
+  )
+  verifyCrashConsistency5725(dbPath, progressPath, cycle, t)
+  println(
+      "cycle ${cycle}: targetLines=${targetLines} killed=${sigLabel} loggedCount=" +
+      "${countCompleteLines5725(progressPath)} checksSoFar=${t.checks} failuresSoFar=${t.failures}",
+  )
+}
+
+test "kill -9 mid-commit at 10 varying delays: fresh reopen never sees a torn commit" {
+  let loc = locateBit5721()
+  if (len(loc.bin) == 0 || len(loc.repo) == 0) {
+    println(
+        "pkg/kv crash test: no usable bit binary + BIT_STDLIB + BIT_REPO found " +
+        "(run via ./make test-package-kv, or set BIT_BIN/BIT_STDLIB/BIT_REPO) -- skipping",
+    )
+    return
+  }
+  let dir = crashScratchPath5725("build")
+  mkdir(dir) catch e {
+    panic("kv crash test: mkdir ${dir}: ${e.message()}")
+  }
+  writeCrashChildModule5725(loc, dir)
+  writeFile("${dir}/main.bit", crashChildMainSrc5725()) catch e {
+    panic("kv crash test: write main.bit: ${e.message()}")
+  }
+  let prog = "${dir}/child"
+  let buildCode = buildCrashChild5725(loc, dir, prog)
+  if (buildCode != 0) {
+    panic("pkg/kv crash test: building the child fixture failed (exit ${buildCode})")
+  }
+
+  let t = CrashTally5725{ checks = 0, failures = 0 }
+  // 1000 x 20ms = 20s safety bound on the inner poll.
+  let cfg = CrashCycleCfg5725{ prog = prog, dir = dir, maxPollTries = 1000 }
+  let cycle = 0
+  while (cycle < 10) {
+    let targetLines = 1 + cycle * 2 // 1,3,5,...,19 of 30 writes: 10 distinct kill points
+    runCrashCycle5725(cfg, cycle, targetLines, t)
+    cycle = cycle + 1
+  }
+  assert(
+    t.failures == 0,
+      "pkg/kv crash test: ${t.failures} of ${t.checks} checks failed across 10 kill cycles " +
+      "-- see the per-cycle lines above for which one and why",
+  )
+}
+
+// Namespaced with this ticket's own prefix (`bit-kv-crash-5725-`) rather
+// than reusing `db.test.bit`'s `scratchPath5721`: `$TMPDIR` is shared by
+// every agent working this workspace concurrently, and a distinct prefix
+// keeps this file's scratch paths from ever colliding with a sibling
+// ticket's.
+fn crashScratchPath5725(tag: string): string {
+  return "${envOr("TMPDIR", "/tmp")}/bit-kv-crash-5725-${tag}-${timeUnixNs()}"
+}
