@@ -1,0 +1,195 @@
+// pkg/kv/btree.test.bit — B+tree insert/lookup/scan/delete over #5716's page
+// engine (#3467, #5719). Two properties, matching the shape #5715 and #5716
+// each established (round-trip/order for the codec, torn-write detection
+// for the engine): every key put() is there under get() and scan(), and
+// exactly there — deleted keys are gone from both; and copy-on-write itself,
+// proven by reading the OLD root id back through a REOPENED engine after
+// further writes, never through any value this test still has in memory.
+
+// `scratchPath`/`envOr` come from engine.test.bit — same module (pkg/kv),
+// so no second import or redeclaration here.
+
+fn mustCreate(path: string): Engine {
+  let eng = create(path) catch e {
+    panic("create: ${e.message()}")
+  }
+  return eng
+}
+
+// `n` keys, order-preserving-encoded from consecutive integers via #5715's
+// `encodeInt` (same module, no import needed) so the expected order is
+// known by construction rather than re-derived by sorting in the test.
+fn testKey(i: i64): []byte {
+  return encodeInt(i)
+}
+
+fn testValue(i: i64): []byte {
+  return []byte("value-${i}")
+}
+
+// Whether `key` is present under `root` — `get`'s failure turned into a
+// bool so a test can assert absence without a throwaway panic message.
+fn keyExists(eng: Engine, root: i64, key: []byte): bool {
+  get(eng, root, key) catch _ {
+    return false
+  }
+  return true
+}
+
+test "put/get/scan/delete round-trips 2000 keys across multiple node splits" {
+  let path = scratchPath("bigtree")
+  let eng = mustCreate(path)
+  let n: i64 = 2000
+
+  let root = noRoot
+  let i: i64 = 0
+  while (i < n) {
+    root = put(eng, root, testKey(i), testValue(i)) catch e {
+      panic("put(${i}): ${e.message()}")
+    }
+    i = i + 1
+  }
+
+  // Every inserted key is there under get(), with its own value — proves
+  // the splits triggered by 2000 keys (well past one 4096-byte page) never
+  // lost or misrouted an entry.
+  i = 0
+  while (i < n) {
+    let got = get(eng, root, testKey(i)) catch e {
+      panic("get(${i}) after inserting all ${n}: ${e.message()}")
+    }
+    assert(
+      string(got) == string(testValue(i)),
+      "get(${i}) = '${string(got)}', want '${string(testValue(i))}'",
+    )
+    i = i + 1
+  }
+
+  // scan() over a subrange returns exactly that subrange, in order.
+  let subFrom: i64 = 500
+  let subTo: i64 = 1500
+  let sub = scan(eng, root, testKey(subFrom), testKey(subTo)) catch e {
+    panic("scan(500,1500): ${e.message()}")
+  }
+  assert(
+    len(sub) == int(subTo - subFrom),
+    "scan(500,1500) returned ${len(sub)} values, want ${subTo - subFrom}",
+  )
+  i = 0
+  while (i < len(sub)) {
+    let want = testValue(subFrom + i)
+    assert(
+      string(sub[i]) == string(want),
+      "scan(500,1500)[${i}] = '${string(sub[i])}', want '${string(want)}'",
+    )
+    i = i + 1
+  }
+
+  // Delete every even key.
+  i = 0
+  while (i < n) {
+    if (i % 2 == 0) {
+      root = delete(eng, root, testKey(i)) catch e {
+        panic("delete(${i}): ${e.message()}")
+      }
+    }
+    i = i + 1
+  }
+
+  // get(): deleted (even) keys are gone, surviving (odd) keys are unchanged.
+  i = 0
+  while (i < n) {
+    if (i % 2 == 0) {
+      assert(!keyExists(eng, root, testKey(i)), "get(${i}) succeeded after delete(${i})")
+    } else {
+      let got = get(eng, root, testKey(i)) catch e {
+        panic("get(${i}) after deleting evens: ${e.message()}")
+      }
+      assert(
+        string(got) == string(testValue(i)),
+        "get(${i}) after deleting evens = '${string(got)}', want '${string(testValue(i))}'",
+      )
+    }
+    i = i + 1
+  }
+
+  // scan() over the whole range now returns only the odd keys, still in order.
+  let all = scan(eng, root, testKey(0), testKey(n)) catch e {
+    panic("scan(full range) after deletes: ${e.message()}")
+  }
+  assert(len(all) == int(n / 2), "post-delete scan returned ${len(all)} values, want ${n / 2}")
+  i = 0
+  while (i < len(all)) {
+    let want = testValue(1 + i * 2)
+    assert(
+      string(all[i]) == string(want),
+      "post-delete scan[${i}] = '${string(all[i])}', want '${string(want)}'",
+    )
+    i = i + 1
+  }
+
+  eng.close()
+}
+
+test "copy-on-write: the old root survives untouched, verified through a reopened engine" {
+  let path = scratchPath("cow")
+  let eng = mustCreate(path)
+
+  // Enough keys to force at least one split, so this exercises a rewritten
+  // INTERNAL node's COW too, not just a single leaf's.
+  let n: i64 = 400
+  let rootBefore = noRoot
+  let i: i64 = 0
+  while (i < n) {
+    rootBefore = put(eng, rootBefore, testKey(i), testValue(i)) catch e {
+      panic("put(${i}): ${e.message()}")
+    }
+    i = i + 1
+  }
+
+  // One more put(), on top of rootBefore, produces a DIFFERENT root — this
+  // is the id the old tree must remain completely unreachable-through.
+  let rootAfter = put(eng, rootBefore, testKey(n), testValue(n)) catch e {
+    panic("put(${n}): ${e.message()}")
+  }
+  assert(rootAfter != rootBefore, "put() of a new key must return a different root id")
+
+  eng.close()
+  let reopened = open(path) catch e {
+    panic("reopen: ${e.message()}")
+  }
+
+  // rootBefore, reread through a fresh Engine handle, still has exactly the
+  // first n keys — proves the put() that produced rootAfter copied every
+  // node on its path instead of mutating rootBefore's pages.
+  i = 0
+  while (i < n) {
+    let got = get(reopened, rootBefore, testKey(i)) catch e {
+      panic("get(${i}, rootBefore) after a later put(): ${e.message()}")
+    }
+    assert(
+      string(got) == string(testValue(i)),
+      "get(${i}, rootBefore) = '${string(got)}', want '${string(testValue(i))}'",
+    )
+    i = i + 1
+  }
+  assert(
+    !keyExists(reopened, rootBefore, testKey(n)),
+    "get(n, rootBefore) must fail: rootBefore was built before key n existed",
+  )
+
+  // rootAfter has both the original n keys and the new one.
+  i = 0
+  while (i <= n) {
+    let got = get(reopened, rootAfter, testKey(i)) catch e {
+      panic("get(${i}, rootAfter): ${e.message()}")
+    }
+    assert(
+      string(got) == string(testValue(i)),
+      "get(${i}, rootAfter) = '${string(got)}', want '${string(testValue(i))}'",
+    )
+    i = i + 1
+  }
+
+  reopened.close()
+}
