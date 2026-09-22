@@ -35,7 +35,12 @@
 // final B+tree root) with a fresh CRC32C, `File.sync()` the data pages FIRST,
 // then write and sync the meta page NOT currently active — COW-then-flip, so
 // a crash before the meta write leaves the old meta page, and everything it
-// points at, exactly as it was. Rollback on failure (the closure's `?` or an
+// points at, exactly as it was. That guarantee depends on `commit` never
+// truncating or reusing this transaction's OWN freed pages or the old free
+// list's own storage pages before the flip — both are still reachable from
+// the meta page that is active RIGHT NOW, not yet superseded; see `commit`'s
+// own comment and #5734 (the free-list-truncate-before-flip window that
+// broke this). Rollback on failure (the closure's `?` or an
 // explicit `fail`) or on panic: simply never write the new meta page. Nothing
 // this ticket does is undone by rolling anything back — #5719's COW already
 // guarantees the old tree was never touched — so "rollback" here really is
@@ -210,28 +215,49 @@ fn kvReadFreeList(e: Engine, head: i64): ([]i64, []i64)! {
   return ids, chainPages
 }
 
-// Persists `ids` as a fresh chain, chunked to `kvFreeListMaxEntries` ids per
-// page, and returns the new head (`kvNoFreeListRoot` if `ids` is empty).
-// Allocates through the same `kvAllocatePage` `kvAllocator` falls back to —
-// the free list's own storage pages are not reuse candidates for themselves
-// within one commit, only from the NEXT transaction onward, same rule as
-// every other page this commit frees (see `kvAllocator`'s own comment).
-fn kvWriteFreeList(e: Engine, ids: []i64): i64! {
-  if (len(ids) == 0) {
+// Persists `ids` (deferred pages, not yet safe to touch physically — see
+// `Db.commit`) plus `reusable` (pages already safe to overwrite right now)
+// as a fresh chain, and returns the new head (`kvNoFreeListRoot` if both are
+// empty). Storage for the chain's OWN pages is drawn from `reusable` FIRST,
+// falling back to growing the file — #5734: unconditionally growing here
+// (via `kvAllocatePage`, ignoring `reusable` entirely) left every commit's
+// own chain-storage page permanently unreclaimed once `Db.commit` correctly
+// stopped truncating a still-active meta's own free-list pages out from
+// under it, an unbounded per-commit leak (`pkg/kv/db.test.bit`'s
+// delete/reinsert test caught it: file grew every cycle instead of
+// returning to baseline). `pageCount` is sized for the WORST case (as if
+// none of `reusable` were reused as storage) so it never under-allocates;
+// whatever chunk capacity that leaves unused past the real payload simply
+// encodes as trailing empty pages, never a wrong id.
+fn kvWriteFreeList(e: Engine, ids: []i64, reusable: []i64): i64! {
+  let maxPer = kvFreeListMaxEntries(e.pageSize)
+  let total = len(ids) + len(reusable)
+  if (total == 0) {
     return kvNoFreeListRoot
   }
-  let maxPer = kvFreeListMaxEntries(e.pageSize)
+  let pageCount = (total + maxPer - 1) / maxPer
+  let a = kvAllocator{ e = e, free = reusable }
+  let storage: []i64 = []
+  let p = 0
+  while (p < pageCount) {
+    storage = append(storage, a.alloc()?)
+    p = p + 1
+  }
+  // Whichever `reusable` pages `a` did NOT consume as this chain's own
+  // storage are still genuinely free — recorded as data alongside `ids`.
+  let payload = append(a.free, ...ids)
   let next = kvNoFreeListRoot
-  let i = len(ids)
-  while (i > 0) {
+  let i = len(payload)
+  let s = len(storage) - 1
+  while (s >= 0) {
     let lo = i - maxPer
     if (lo < 0) {
       lo = 0
     }
-    let chunk = ids[lo:i]
-    let id = kvAllocatePage(e)?
-    e.writePage(id, kvEncodeFreeListPage(chunk, next))?
-    next = id
+    let chunk = payload[lo:i]
+    e.writePage(storage[s], kvEncodeFreeListPage(chunk, next))?
+    next = storage[s]
+    s = s - 1
     i = lo
   }
   return next
@@ -582,10 +608,27 @@ export class Db {
   // "this never ran": the old meta page, and every page it reaches, is
   // untouched by everything above this point.
   commit(tx: Tx, oldChain: []i64): ()! {
-    let allFree = append(tx.alloc.free, ...tx.freed.ids)
-    allFree = append(allFree, ...oldChain)
-    let kept = kvTruncateFreePages(this.eng, allFree)?
-    let newFreeListRoot = kvWriteFreeList(this.eng, kept)?
+    // Only `tx.alloc.free` (this transaction's leftover `avail`, i.e. pages
+    // already recorded free by the PRIOR commit and not popped by this
+    // transaction's own `kvAllocator`) is safe to truncate or hand back for
+    // reuse right now: the meta page still active at this point -- untouched
+    // until the write below -- was built from exactly the tree/free-list
+    // state those pages were already superseded by. `tx.freed.ids` (this
+    // transaction's own COW casualties, reachable from that same active
+    // meta's root) and `oldChain` (that meta's own free-list storage pages,
+    // reachable via its freeListRoot) are NOT superseded yet -- truncating or
+    // reusing either before the flip below is exactly the #5734 hazard
+    // (`pkg/kv/commitwindow.test.bit` proves it deterministically, no
+    // kill -9 required): a crash in this window would leave the still-active
+    // meta as the only recovery target, pointing at a page already cut off
+    // the file. Both are still safe to WRITE into the free list this commit
+    // builds -- nothing may pop them back out until a LATER `db.write()`
+    // reads that list, and the single-writer lock means that can only happen
+    // after this commit's meta flip has already made the pages they
+    // reference unreachable from any meta a reopen could ever choose.
+    let kept = kvTruncateFreePages(this.eng, tx.alloc.free)?
+    let pending = append(tx.freed.ids, ...oldChain)
+    let newFreeListRoot = kvWriteFreeList(this.eng, pending, kept)?
     this.eng.file.sync()?
     let newTxid = this.eng.txid + 1
     let buf = buildMetaPage(newTxid, newFreeListRoot)
