@@ -1,0 +1,166 @@
+// Nesting the write-interest epoll descriptor inside the read one (#5736,
+// epic #3913) for the Linux netpoller, so ONE blocking wait sees BOTH
+// directions.
+//
+// A SIBLING FILE, NOT A NEW MODULE, for the reason ./pollwake.bit records:
+// `runtime/sched/linux` is a directory module, so everything here stays
+// module-private to exactly the readers it had inside ./poll.bit, shares that
+// file's imports, and reaches `pollScratchBytes`, `eventDataOffNosplit`,
+// `ctlAdd`/`ctlDel`, `epollIn` and the `readU64`/`writeU32`/`writeU64`
+// cursors unchanged. ./poll.bit is at the 800-line lint ceiling; this is the
+// second section to move out from under it.
+//
+// `@nosplit` THROUGHOUT (`_tests_/bit/pollfree.bit`): leaf syscall wrappers
+// with no allocation and no safepoint to lose.
+
+// --------------------------------------------------------------------------
+// The nested write descriptor (#5736, epic #3913): making ONE blocking wait
+// see BOTH directions.
+// --------------------------------------------------------------------------
+
+// Read interest lives on `scPollFd` and write interest on `scPollFdWrite`
+// (#1910), because epoll keys a registration on the fd alone and
+// `EPOLL_CTL_MOD` would otherwise have the two directions evict each other on
+// a socket with a concurrent reader and writer. `pollDrain` blocks on the
+// first and drains the second with a zero timeout AFTERWARDS, so a socket
+// becoming WRITABLE could not end the blocking wait — which is why worker 0
+// (`runtime/root/linux/bootworker.bit`) had to shorten its whole wait to 1ms
+// whenever `schedPollPendingCount()` was non-zero. That counter is one
+// process-global fed by both descriptors and cannot say WHICH, so the wait
+// had to assume "it might be a write" or a full send buffer would stall for
+// up to a second.
+//
+// AN EPOLL DESCRIPTOR IS ITSELF POLLABLE, and that is the whole mechanism: an
+// epoll fd reports readable exactly while its own set has a ready event. So
+// `scPollFdWrite` is registered INTO `scPollFd`'s set once, at bind time, and
+// one blocking `epoll_pwait2` on `scPollFd` now ends on write readiness too.
+//
+// LEVEL-TRIGGERED AND PERMANENT, the same two choices `pollArmWake` argues
+// for the wake eventfd and for the same reason: the child stays readable
+// while its set holds anything ready, so a report cannot be lost by arriving
+// before anyone was waiting, and it stops being reported the moment
+// `pollDrain`'s own second `pollDrainOne` call has drained the child. There
+// is nothing to re-arm and nothing that can spin: a child with nothing ready
+// is not readable.
+//
+// NO RECURSION, DELIBERATELY. `pollDrainOne` does NOT drain the child when it
+// sees this event — `pollDrain` already drains the write descriptor
+// unconditionally on the very next line, which is the whole reason this
+// needed no new drain path. The nested event's only job is to END THE WAIT;
+// the existing non-blocking second pass then collects the events and unparks
+// the tasks exactly as it does today.
+
+// The `data` word this registration carries, and the second sentinel in this
+// file. `pollArmWake` already owns `0`; a real registration's `data` is a
+// `Task` address, which `schedRegister`'s precondition makes non-zero and
+// which is a `*i64` — 8-byte aligned by construction, so no ODD value can
+// ever be one. `1` is therefore unforgeable in the same way `0` is.
+@nosplit fn nestSentinel(): int { return 1 }
+
+// One (parent, child) pair per slot, interleaved two words to a slot.
+//
+// FOUR SLOTS, NOT ONE, AND THAT IS NOT DEFENSIVENESS FOR ITS OWN SAKE. The
+// boot path (`runtime/root/linux/boottail.bit`) makes exactly one nesting for
+// this process's whole life, so one slot would be "exact" by the same
+// argument `wakeSlots` used to make — and that argument was WRONG there for a
+// reason that applies identically here: a `_tests_/stress/schedpoll*linux`
+// program creates its own pair of poll descriptors ON TOP of the runtime that
+// already booted underneath it, and an exactly-sized table refuses it while
+// looking correct. See `wakeSlots` in ./pollwake.bit for the incident.
+const nestSlots: int = 4
+let nestFds: [8]i64
+let nestUsed: [1]i64
+
+// Byte cursors, the same shape and for the same reason as `wakeFdBytes` and
+// friends in ./pollwake.bit: `[]` indexing on a `@nosplit` path costs a
+// bounds check whose failure arm reaches the panic formatter (E0075).
+@nosplit fn nestBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(nestFds))
+}
+
+@nosplit fn nestCountBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(nestUsed))
+}
+
+// The slot whose parent OR child is `fd`, or -1. BOTH ENDS ARE MATCHED
+// because `pollClose` is called on each descriptor in turn and either one
+// arriving first must be able to find and retract the registration — see
+// `pollClose`'s own comment for why a surviving entry is a live hazard and
+// not a leak. Bounded by `nestSlots` regardless of the count word (Power of
+// 10); `pollNestWrite` is its only writer and never exceeds it.
+@nosplit fn nestSlotFor(fd: int): int {
+  let n = readU64(nestCountBytes(), 0)
+  if (n > nestSlots) {
+    n = nestSlots
+  }
+  let i = 0
+  while (i < n) {
+    if (readU64(nestBytes(), i * 16) == fd || readU64(nestBytes(), i * 16 + 8) == fd) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// Nest `child` into `parent`'s epoll set. Called once per pair at bind time,
+// from `runtime/root/linux/boottail.bit` right after both descriptors are
+// bound to the scheduler — the earliest point at which BOTH numbers exist,
+// and still before any worker has run, so no `pollDrain` can observe the
+// half-built state.
+//
+// FAILS RATHER THAN HALF-REGISTERS: a table that is full, or an `epoll_ctl`
+// the kernel refuses, returns false with nothing recorded, and the caller
+// treats that as fatal. A silently un-nested write descriptor would cost a
+// writable socket up to `worker0WaitCeilingNs` of stall with no other
+// symptom, which is exactly the class of silent degrade the boot path
+// refuses.
+export @symbol("bit_rt_port_sched_poll_nest_write") @nosplit fn pollNestWrite(
+  parent: int,
+  child: int,
+): bool {
+  if (parent <= 0 || child <= 0 || parent == child) {
+    return false
+  }
+  let n = readU64(nestCountBytes(), 0)
+  if (n >= nestSlots) {
+    return false
+  }
+  let base = pollScratchBytes()
+  writeU32(base, 0, epollIn())
+  writeU64(base, eventDataOffNosplit(), nestSentinel())
+  let evAddr = i64(int(base))
+  let add = int(syscall(sysEpollCtl(), i64(parent), i64(ctlAdd()), i64(child), evAddr))
+  if (add != 0) {
+    return false
+  }
+  writeU64(nestBytes(), n * 16, parent)
+  writeU64(nestBytes(), n * 16 + 8, child)
+  writeU64(nestCountBytes(), 0, n + 1)
+  return true
+}
+
+// Retract the nesting either descriptor of a pair belongs to, and forget it.
+// Swap-with-last removal, O(1) and bounded, the same shape as
+// `wakeSlotRemove`. Called only from `pollClose`.
+@nosplit fn pollNestClear(fd: int) {
+  let slot = nestSlotFor(fd)
+  if (slot < 0) {
+    return
+  }
+  let parent = readU64(nestBytes(), slot * 16)
+  let child = readU64(nestBytes(), slot * 16 + 8)
+  // The kernel does not read the event struct for `EPOLL_CTL_DEL`; it only
+  // needs a non-null pointer, the pre-2.6.9 workaround `pollUnregister`
+  // documents. A failure here is unactionable and ignored: the parent may
+  // already be closed, which removes the registration on its own.
+  let _ = int(
+    syscall(sysEpollCtl(), i64(parent), i64(ctlDel()), i64(child), i64(int(pollScratchBytes()))),
+  )
+  let last = readU64(nestCountBytes(), 0) - 1
+  writeU64(nestBytes(), slot * 16, readU64(nestBytes(), last * 16))
+  writeU64(nestBytes(), slot * 16 + 8, readU64(nestBytes(), last * 16 + 8))
+  writeU64(nestCountBytes(), 0, last)
+}

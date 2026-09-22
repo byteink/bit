@@ -1,0 +1,122 @@
+// The nested write descriptor (#5736, epic #3913) against a REAL kernel,
+// Linux/epoll. Proves what #1910's two-descriptor split cost and this closes:
+// a socket becoming WRITABLE could not end the blocking wait, because
+// `pollDrain` blocks on `scPollFd` and drains `scPollFdWrite` non-blocking
+// only AFTERWARDS.
+//
+// A/B IN ONE PROGRAM, THE UN-NESTED CASE FIRST, because the assertion is
+// about WHICH descriptor ended the wait and no single reading can say that.
+// Both phases arm the same write interest on the same fd and both return the
+// same event count — the trailing non-blocking drain picks it up either way.
+// The ONLY thing that differs is how long the drain took:
+//
+//   - phase 1, NOT NESTED: the blocking wait on `scPollFd` cannot see write
+//     readiness, so it blocks out the whole `timeoutNs` and only then drains
+//     the write descriptor. This is today's behaviour, measured, not assumed.
+//   - phase 2, NESTED: `scPollFdWrite` is registered into `scPollFd`'s set,
+//     so the same wait ends immediately on the same readiness.
+//
+// Phase 1 is therefore this program's control AND the mutation proof: delete
+// the `pollNestWrite` call between the phases and phase 2 becomes phase 1.
+//
+// THE READY FD IS AN EVENTFD, chosen because it is writable from the moment
+// it exists — its counter is zero, nowhere near the 2^64-2 that would make a
+// write block. A socket would prove the same thing behind a connect.
+//
+// THE TASK IS A ZEROED BLOCK THAT NEVER RUNS, and that is deliberate rather
+// than lazy: `pollRegister` only needs a non-zero `data` word, and
+// `schedPollUnpark` reaching it will fail every one of its three
+// compare-and-exchanges (`taskState` is 0, i.e. `taskRunnable`, and none of
+// the three expects that) and report false. So no task is woken, `n` is 0 in
+// both phases, and the timing is the whole verdict — which is what this
+// program is measuring anyway.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/sched/linux, which reaches the kernel through `syscall` (SPEC
+// §11.8) — rejected on Darwin even for an uncalled declaration.
+
+import { schedInit, schedSetPollFd, schedSetPollFdWrite, taskAt } from "../../../runtime/sched"
+import { pollWrite, taskWords } from "../../../runtime/sched"
+import { pollCreate, pollClose, pollRegister, pollDrain } from "../../../runtime/sched/linux"
+import { pollNestWrite } from "../../../runtime/sched/linux"
+import { parkMonoNs } from "../../../runtime/park/linux"
+
+const pollWorkers: int = 1
+
+// eventfd2(initval, flags) as a raw syscall (§11.8): the ELF output is fully
+// static with no libc. x86-64 290, aarch64 19 — the same pair
+// `runtime/syscalls/syscalls.bit`'s `sysEventfd2` carries, and `hostTarget()`
+// is 0 for x86_64-linux and 1 for aarch64-linux, so the two cases are
+// exhaustive on a Linux-only program.
+fn nrEventfd2(): int {
+  if (hostTarget() == 0) {
+    return 290
+  }
+  return 19
+}
+
+// Well over the 1ms `worker0Wait` used to fall back to, so a phase that
+// blocks it out is unmistakably a full-timeout block rather than jitter.
+const timeoutNs: int = 50000000
+
+// Phase 1 must block nearly the whole timeout. 40ms of a 50ms deadline leaves
+// 10ms of slack for the kernel returning early, and is 40x above anything
+// phase 2 can produce.
+const unnestedFloorNs: int = 40000000
+
+// Phase 2 must return in well under a millisecond: the readiness is already
+// there when the wait starts, so `epoll_pwait2` reports it on entry without
+// ever sleeping. 1ms is ~2% of the timeout and still 1000x the syscall cost.
+const nestedCeilingNs: int = 1000000
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+let monoScratch: [2]i64
+let idleTask: [taskWords]i64
+
+fn schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+fn nowNs(): int {
+  return parkMonoNs(ptrOf(monoScratch))
+}
+
+fn main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), pollWorkers)
+
+  let pfd = pollCreate()
+  let wfd = pollCreate()
+  let created = pfd >= 0 && wfd >= 0 && pfd != wfd
+  schedSetPollFd(s, pfd)
+  schedSetPollFdWrite(s, wfd)
+
+  let efd = int(syscall(nrEventfd2(), 0, 0))
+  let opened = efd > 0
+  let task = int(ptrOf(idleTask))
+
+  // Phase 1: write interest armed, nothing nested. The blocking wait is on
+  // `pfd` and the readiness is on `wfd`, so it cannot be seen until the
+  // timeout expires and the trailing non-blocking drain runs.
+  let armed1 = pollRegister(wfd, efd, pollWrite, task)
+  let t0 = nowNs()
+  let n1 = pollDrain(schedAddr(), timeoutNs)
+  let unnested = nowNs() - t0
+
+  // Phase 2: the same interest, re-armed because the registration is
+  // `EPOLLONESHOT`, with `wfd` now inside `pfd`'s set.
+  let nested = pollNestWrite(pfd, wfd)
+  let armed2 = pollRegister(wfd, efd, pollWrite, task)
+  let t1 = nowNs()
+  let n2 = pollDrain(schedAddr(), timeoutNs)
+  let elapsed2 = nowNs() - t1
+
+  pollClose(pfd)
+  pollClose(wfd)
+
+  println("poller ${created} efd ${opened} nested ${nested}")
+  println("armed ${armed1 && armed2} drained ${n1 == n2}")
+  println("unnested ${unnested >= unnestedFloorNs}")
+  println("wokeearly ${elapsed2 < nestedCeilingNs}")
+}
