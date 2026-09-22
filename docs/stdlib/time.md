@@ -574,6 +574,108 @@ Every method returns a new value. `n` may be negative.
 never carries into a date, because a `Time` has no date to carry into. Use
 `NaiveDateTime` when the carry matters.
 
+### `Date.addYears(n: int): Date`
+
+`n` calendar years later, clamped the way [Month arithmetic
+clamps](#month-arithmetic-clamps) describes. `n` may be negative.
+
+### `Date.addMonths(n: int): Date`
+
+`n` calendar months later, clamped the same way. `n` may be negative.
+
+### `Date.addWeeks(n: int): Date`
+
+Exactly `n * 7` days later - exact across a month or year boundary, since it
+never touches the clamp `addMonths` uses. `n` may be negative.
+
+### `Date.addDays(n: int): Date`
+
+`n` days later. `n` may be negative.
+
+### `Time.addHours(n: int): Time`
+
+`n` hours later, wrapping within the day - never carries into a date, because
+a `Time` has no date. `n` may be negative.
+
+### `Time.addMinutes(n: int): Time`
+
+`n` minutes later, wrapping within the day. `n` may be negative.
+
+### `Time.addSeconds(n: int): Time`
+
+`n` seconds later, wrapping within the day. `n` may be negative.
+
+### `Time.addNanoseconds(n: int): Time`
+
+`n` nanoseconds later, wrapping within the day. `n` may be negative.
+
+### `NaiveDateTime.addYears(n: int): NaiveDateTime`
+
+`n` calendar years later (clamped), time of day unchanged. `n` may be
+negative.
+
+### `NaiveDateTime.addMonths(n: int): NaiveDateTime`
+
+`n` calendar months later (clamped), time of day unchanged. `n` may be
+negative.
+
+### `NaiveDateTime.addWeeks(n: int): NaiveDateTime`
+
+`n` weeks later, time of day unchanged. `n` may be negative.
+
+### `NaiveDateTime.addDays(n: int): NaiveDateTime`
+
+`n` days later, time of day unchanged. `n` may be negative.
+
+### `NaiveDateTime.addHours(n: int): NaiveDateTime`
+
+`n` hours later, **carrying into the date** when the shift crosses midnight -
+unlike `Time.addHours`, which wraps within the day and never carries. `n` may
+be negative.
+
+### `NaiveDateTime.addMinutes(n: int): NaiveDateTime`
+
+`n` minutes later, carrying into the date. `n` may be negative.
+
+### `NaiveDateTime.addSeconds(n: int): NaiveDateTime`
+
+`n` seconds later, carrying into the date. `n` may be negative.
+
+### `NaiveDateTime.addNanoseconds(n: int): NaiveDateTime`
+
+`n` nanoseconds later, carrying into the date. `n` may be negative.
+
+### `DateTime.addYears(n: int): DateTime`
+
+`n` calendar years later, on the **wall clock** - see [Arithmetic across a
+transition](#arithmetic-across-a-transition). `n` may be negative.
+
+### `DateTime.addMonths(n: int): DateTime`
+
+### `DateTime.addWeeks(n: int): DateTime`
+
+### `DateTime.addDays(n: int): DateTime`
+
+### `DateTime.addHours(n: int): DateTime`
+
+### `DateTime.addMinutes(n: int): DateTime`
+
+### `DateTime.addSeconds(n: int): DateTime`
+
+### `DateTime.addNanoseconds(n: int): DateTime`
+
+All seven operate on the wall clock and re-resolve the zone offset the same
+way `addYears` does: adding a day to 09:00 gives 09:00 the next day even
+across a daylight saving transition, though the elapsed real time was 23 or
+25 hours. `n` may be negative.
+
+### `Timestamp.add(ns: int): Timestamp`
+
+`ns` nanoseconds of **real elapsed time** added to the instant - the one
+method in this family that adds to the instant rather than the wall clock;
+see [Arithmetic across a transition](#arithmetic-across-a-transition). `ns`
+may be negative.
+
 ### Month arithmetic clamps
 
 `addMonths` and `addYears` keep the day of month where they can and **clamp to the
@@ -600,12 +702,86 @@ from it, rather than stepping forward one month at a time from the last one.
 
 | Method | Notes |
 |---|---|
-| `withYear(y)` `withMonth(m)` `withDay(d)` | clamps the day the same way |
+| `withYear(y)` `withMonth(m)` | clamps the day to fit the new year/month |
+| `withDay(d)` | **not** clamped - `d` is written through directly |
 | `withHour(h)` `withMinute(m)` `withSecond(s)` `withNanosecond(n)` | |
 | `withTime(h, m, s)` | on `NaiveDateTime` and `DateTime` |
 | `withZone(z)` | on `DateTime`, keeps the instant |
 
 `withMonth` clamps: 2026-01-31 `withMonth(2)` is 2026-02-28.
+
+### `Date.withYear(y: int): Date`
+
+`this` with the year replaced, day clamped to the last valid day of `y` and
+`this` month.
+
+### `Date.withMonth(m: int): Date`
+
+`this` with the month replaced, day clamped to the last valid day of that
+month: 2026-01-31 `withMonth(2)` is 2026-02-28.
+
+### `Date.withDay(d: int): Date`
+
+`this` with the day of month replaced by `d`. **Not clamped** - `d` is
+written through directly, unlike `withYear`/`withMonth`, so
+`date(2026, 1, 15).withDay(31)` is `2026-01-31` and `date(2026, 2, 15).withDay(31)`
+produces a `Date` reading `2026-02-31`, a day `February` does not have.
+
+### `Time.withHour(h: int): Time`
+
+### `Time.withMinute(m: int): Time`
+
+### `Time.withSecond(s: int): Time`
+
+### `Time.withNanosecond(n: int): Time`
+
+Each replaces exactly that field of `this`, the others unchanged. Not
+clamped: any `int` is written through.
+
+### `NaiveDateTime.withYear(y: int): NaiveDateTime`
+
+### `NaiveDateTime.withMonth(m: int): NaiveDateTime`
+
+### `NaiveDateTime.withDay(d: int): NaiveDateTime`
+
+Forwards to the matching `Date.with*`, time of day unchanged - `withDay` is
+not clamped, the same as `Date.withDay`.
+
+### `NaiveDateTime.withHour(h: int): NaiveDateTime`
+
+### `NaiveDateTime.withMinute(m: int): NaiveDateTime`
+
+### `NaiveDateTime.withSecond(s: int): NaiveDateTime`
+
+### `NaiveDateTime.withNanosecond(n: int): NaiveDateTime`
+
+Forwards to the matching `Time.with*`, date unchanged.
+
+### `NaiveDateTime.withTime(hour: int, minute: int, second: int): NaiveDateTime`
+
+`this` with the time of day replaced by `hour`:`minute`:`second`, nanosecond
+and date unchanged.
+
+### `DateTime.withYear(y: int): DateTime`
+
+### `DateTime.withMonth(m: int): DateTime`
+
+### `DateTime.withDay(d: int): DateTime`
+
+### `DateTime.withHour(h: int): DateTime`
+
+### `DateTime.withMinute(m: int): DateTime`
+
+### `DateTime.withSecond(s: int): DateTime`
+
+### `DateTime.withNanosecond(n: int): DateTime`
+
+### `DateTime.withTime(hour: int, minute: int, second: int): DateTime`
+
+Each sets the field on the **wall clock** and re-resolves the zone offset for
+it, the same rule `addYears` follows - see [Arithmetic across a
+transition](#arithmetic-across-a-transition). `withDay` is not clamped, the
+same as `Date.withDay`.
 
 ```bit
 import { Date } from "std/time"
