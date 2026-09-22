@@ -1,0 +1,94 @@
+// pkg/kv/commitwindow.test.bit — deterministic proof of the commit-window
+// meta hazard (#5734, epic #3467).
+//
+// `pkg/kv/crash.test.bit`'s kill -9 harness catches this defect only when a
+// SIGKILL happens to land inside a narrow, box-load-dependent window (the
+// #5734 integrator comment measured 19/19 clean runs on a quiet box against
+// the exact same defect). This file needs no process kill at all: `Db.commit`
+// (`pkg/kv/db.bit`) never rewrites a meta page in place, so the meta page
+// that was ACTIVE during a commit's truncate/reuse step is still on disk,
+// byte-for-byte, once that commit finishes and flips — it is simply the
+// now-INACTIVE one. Reading it back after a normal (uninterrupted) commit and
+// checking whether it references a page at or past the POST-COMMIT end of
+// file proves, with no timing dependence at all, that a crash landing during
+// that commit's window would have handed a reopen a meta pointing past EOF.
+
+fn commitWindowScratchPath5734(tag: string): string {
+  return "${envOr("TMPDIR", "/tmp")}/bit-kv-commitwindow-5734-${tag}-${timeUnixNs()}"
+}
+
+// True, plus a description, iff the meta page that was active DURING the
+// commit `db` just finished (now `1 - db.eng.activeMeta`, unmodified since
+// that commit's window: `Db.commit` only ever writes the INACTIVE slot)
+// references a page id at or past `db.eng.file.size() / pageSize` — exactly
+// what a crash before that commit's own meta flip would have left as the
+// only valid recovery target.
+fn kvProbeStaleMetaDangles5734(db: Db): (bool, string)! {
+  let staleSlot = i64(1 - db.eng.activeMeta)
+  let buf = db.eng.readPage(staleSlot)?
+  let parsed = kvTryParseMeta(buf)
+  if (isNone(parsed)) {
+    return false, ""
+  }
+  let meta = unwrap(parsed)
+  let pages = db.eng.file.size()? / i64(db.eng.pageSize)
+  let root = kvReadRoot(buf)
+  if (root != noRoot && root >= pages) {
+    return true, "stale meta (txid ${meta.txid}) root=${root} >= file pages ${pages}"
+  }
+  if (meta.freeListRoot != kvNoFreeListRoot && meta.freeListRoot >= pages) {
+    return true,
+      "stale meta (txid ${meta.txid}) freeListRoot=${meta.freeListRoot} >= file pages ${pages}"
+  }
+  return false, ""
+}
+
+// One probed cycle: delete `k`, probe, reinsert `k`, probe again — the same
+// delete/reinsert shape `db.test.bit`'s free-list reuse test already uses to
+// force `kvTruncateFreePages` to actually shrink the file, which is exactly
+// the operation this hazard lives in.
+fn probeCommitWindowCycle5734(db: Db, cycle: int, firstHitIn: string): string! {
+  let firstHit = firstHitIn
+  db.write((tx) => {
+    tx.delete([]byte("k"))?
+  })?
+  let (hitD, whyD) = kvProbeStaleMetaDangles5734(db)?
+  if (hitD && len(firstHit) == 0) {
+    firstHit = "cycle ${cycle} (delete): ${whyD}"
+  }
+  db.write((tx) => {
+    tx.put([]byte("k"), []byte("v"))?
+  })?
+  let (hitP, whyP) = kvProbeStaleMetaDangles5734(db)?
+  if (hitP && len(firstHit) == 0) {
+    firstHit = "cycle ${cycle} (put): ${whyP}"
+  }
+  return firstHit
+}
+
+test "no commit ever leaves the stale meta page referencing a truncated-away page" {
+  let path = commitWindowScratchPath5734("db")
+  let db = createDb(path) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  db.write((tx) => {
+    tx.put([]byte("k"), []byte("v"))?
+  }) catch e {
+    panic("seed write: ${e.message()}")
+  }
+
+  let firstHit = ""
+  let cycle = 0
+  while (cycle < 8) {
+    firstHit = probeCommitWindowCycle5734(db, cycle, firstHit) catch e {
+      panic("probe cycle ${cycle}: ${e.message()}")
+    }
+    cycle = cycle + 1
+  }
+  db.close()
+  assert(
+    len(firstHit) == 0,
+      "pkg/kv commit-window probe: a commit left the stale meta page dangling past " +
+      "EOF -- ${firstHit} (a crash during that commit would corrupt recovery)",
+  )
+}
