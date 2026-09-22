@@ -1392,6 +1392,82 @@ holiday run is a caller error, not a runtime condition, so it is not reported as
 failure. The cap is on the consecutive non-business-day run, not on the whole call:
 `addBusinessDays(c, 5000)` is fine.
 
+### `Date.isWeekend(w: Weekend): bool`
+
+True when this day is one of `w`'s days off.
+
+### `Date.isWeekday(w: Weekend): bool`
+
+Exactly `!isWeekend(w)`: holidays play no part, a holiday is still a
+weekday.
+
+### `Date.isBusinessDay(c: Calendar): bool`
+
+True when this day is neither a weekend day nor one of `c`'s holidays.
+
+### `Date.nextBusinessDay(c: Calendar): Date`
+
+The next business day strictly after this one.
+
+### `Date.previousBusinessDay(c: Calendar): Date`
+
+The last business day strictly before this one.
+
+### `Date.addBusinessDays(c: Calendar, n: int): Date`
+
+This day moved `n` business days; `n` may be negative, and `n == 0` returns
+this day unchanged even when it is not itself a business day.
+
+### `Date.differenceInBusinessDays(c: Calendar, other: Date): int`
+
+Complete business days from this day to `other`, excluding the earlier of
+the two and including the later, negative when `other` is earlier.
+
+### `NaiveDateTime.isWeekend(w: Weekend): bool`
+
+### `NaiveDateTime.isWeekday(w: Weekend): bool`
+
+True when this wall clock's **date** is or is not one of `w`'s days off -
+the time of day carries no information here.
+
+### `NaiveDateTime.isBusinessDay(c: Calendar): bool`
+
+### `NaiveDateTime.nextBusinessDay(c: Calendar): Date`
+
+### `NaiveDateTime.previousBusinessDay(c: Calendar): Date`
+
+### `NaiveDateTime.addBusinessDays(c: Calendar, n: int): Date`
+
+### `NaiveDateTime.differenceInBusinessDays(c: Calendar, other: Date): int`
+
+Each reads this wall clock's date and answers exactly as the matching
+`Date` method does; the three that return a date return a `Date`, not a
+`NaiveDateTime` - the time of day is not carried.
+
+### `DateTime.isWeekend(w: Weekend): bool`
+
+### `DateTime.isWeekday(w: Weekend): bool`
+
+True when this zoned value's **wall-clock date** is or is not one of `w`'s
+days off - read from the wall clock, not the instant, so it answers in the
+caller's zone rather than in UTC.
+
+### `DateTime.isBusinessDay(c: Calendar): bool`
+
+Unaffected by a daylight saving transition on this date: the calendar day
+is the same whether it ran 23, 24 or 25 hours.
+
+### `DateTime.nextBusinessDay(c: Calendar): Date`
+
+### `DateTime.previousBusinessDay(c: Calendar): Date`
+
+### `DateTime.addBusinessDays(c: Calendar, n: int): Date`
+
+### `DateTime.differenceInBusinessDays(c: Calendar, other: Date): int`
+
+Each reads this zoned value's wall-clock date and answers exactly as the
+matching `Date` method does, returning a `Date` with no zone and no offset.
+
 ```bit
 import { calendar, weekendSatSun, Date } from "std/time"
 
@@ -1407,6 +1483,31 @@ fn paymentDue(invoiced: Date, holidays: []Date): Date {
 
 **Shipped**, on `Date`, `Time`, `NaiveDateTime` and `DateTime`. Parsing, the
 other direction, is shipped too - see [Parsing](#parsing).
+
+### `Date.format(pattern: string): string!`
+
+This date, rendered with the LDML symbols below. Fails on `Y` or `D`, on an
+unknown pattern letter, on an unterminated quoted literal, and on any time or
+zone symbol - a `Date` has neither.
+
+### `Time.format(pattern: string): string!`
+
+This time of day, rendered with the LDML symbols below. Fails on any date or
+zone symbol - a `Time` carries neither - as well as on the pattern errors
+every receiver rejects.
+
+### `NaiveDateTime.format(pattern: string): string!`
+
+This wall clock, rendered with the LDML symbols below. Date and time symbols
+both resolve; a zone symbol fails, because a `NaiveDateTime` has no zone and
+no offset to render.
+
+### `DateTime.format(pattern: string): string!`
+
+This zoned value, rendered with the LDML symbols below. Every symbol this
+module implements resolves. Date and time symbols read the **wall clock**,
+not the instant, so they answer in this value's own zone; `Z` and `X` render
+the offset resolved at construction, and `V` the zone identifier.
 
 ### `format(pattern: string): string!`
 
