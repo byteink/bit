@@ -1,0 +1,249 @@
+// The wake eventfd (#5718, epic #3913) for the Linux netpoller — the
+// producer-triggered fd `./poll.bit` registers into its own epoll set, and
+// the only wake source that file had no way to express before.
+//
+// SPLIT OUT OF `./poll.bit` VERBATIM (#5737), which crossed the 800-line lint
+// ceiling once `pollWaitEvents` landed there. A SIBLING FILE, NOT A NEW
+// MODULE: `runtime/sched/linux` is a directory module, so these declarations
+// stay module-private to exactly the same set of readers they were before,
+// share `./poll.bit`'s imports, and reach `pollScratchBytes`,
+// `eventDataOffNosplit`, `ctlAdd`/`ctlDel`, `epollIn` and the `readU64`/
+// `writeU32`/`writeU64` cursors unchanged. Nothing here was rewritten; the
+// move is the whole change.
+//
+// `@nosplit` THROUGHOUT, for the reason `_tests_/bit/pollfree.bit` states:
+// every top-level function under `runtime/sched/**` carries it or an entry on
+// that gate's reviewed exception list, and these are all leaf syscall
+// wrappers with no allocation and no safepoint to lose.
+
+// --------------------------------------------------------------------------
+// The wake eventfd (#5718, epic #3913): a producer-triggered fd registered
+// into an epoll set, the real wake source this file was missing — same
+// missing-mechanism comment darwin's twin carried before #5717, and the same
+// role `bit_rt_port_park_wake` plays for a parked worker's word, aimed at the
+// poller's epoll set instead.
+// --------------------------------------------------------------------------
+
+// The runtime's own two epoll descriptors — `../worker.bit`'s `scPollFd` and
+// `scPollFdWrite`, both created at boot by `runtime/root/linux/boottail.bit`'s
+// two `pollCreate()` calls, neither ever re-created without an intervening
+// `pollClose` — plus HEADROOM FOR A CALLER THAT IS NOT THE BOOT PATH.
+//
+// TWO WAS EXACT AND THAT WAS THE BUG (found 2026-09-22 on x86_64 Linux,
+// kernel 6.6, while writing `_tests_/stress/schedpollwait2linux`). Boot fills
+// both slots before any Bit code runs, so the NEXT `pollCreate()` in the
+// process — every `_tests_/stress/schedpoll*linux` program makes one, on top
+// of the runtime that already booted underneath it — found `wakeSlotInsert`
+// full, and `pollArmWake` correctly refused to hand back a descriptor whose
+// wake side would silently do nothing. `pollCreate` then returned -1, which
+// those programs report as `poller false` and every later `pollDrain` answers
+// instantly because `pollDrainSkippable` reads an unbound descriptor as
+// nothing to do — a vacuous pass shaped exactly like a real one.
+// `_tests_/stress/schedpollwakelinux` has been in that state since #5718.
+// Four slots is two for the runtime and two for whoever else is in the
+// process; the extra 32 bytes of `.bss` buy the table back its defensive
+// bound, which is what it should have had.
+//
+// UNLIKE `pollScratchBytes`'s PER-WORKER SLOTS, this table is keyed by
+// `pollFd`, not by worker: `pollWake` runs from whichever worker or thread is
+// publishing work, with no access to which epoll descriptor "belongs" to it,
+// so the lookup has to go the other way — from the descriptor a caller
+// already has (from `schedSetPollFd`'s own return value, threaded back
+// through whatever producer-side state the dependent wiring ticket adds) to
+// the eventfd `pollArmWake` created for it.
+const wakeSlots: int = 4
+let wakePollFd: [wakeSlots]i64
+let wakeEventFd: [wakeSlots]i64
+let wakeSlotsUsed: [1]i64
+
+// Byte cursors over the three arrays above, in the SAME shape `bytesOf`/
+// `readU64`/`writeU64` already established for `evBuf`: `[]` INDEXING IS NOT
+// USED ON A `@nosplit` PATH IN THIS FILE, because a runtime-computed index
+// costs a bounds check whose failure arm calls into the panic formatter —
+// not itself `@nosplit` (E0075) even on a branch these three functions never
+// take. Reading and writing 8-byte words through a `*u8` cursor is unchecked
+// pointer arithmetic instead, the same tradeoff `readU64`'s own header makes.
+@nosplit fn wakeFdBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(wakePollFd))
+}
+
+@nosplit fn wakeEfdBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(wakeEventFd))
+}
+
+@nosplit fn wakeCountBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(wakeSlotsUsed))
+}
+
+// Linear scan, bounded by `wakeSlots` regardless of how many are filled
+// (Power of 10) — `wakeSlotInsert` below is the only writer of the count word
+// and never lets it exceed `wakeSlots`, so the clamp here is defense in
+// depth, not a case this file can reach.
+@nosplit fn wakeSlotFor(pollFd: int): int {
+  let n = readU64(wakeCountBytes(), 0)
+  if (n > wakeSlots) {
+    n = wakeSlots
+  }
+  let i = 0
+  while (i < n) {
+    if (readU64(wakeFdBytes(), i * 8) == pollFd) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+@nosplit fn wakeSlotInsert(pollFd: int, eventFd: int): bool {
+  let n = readU64(wakeCountBytes(), 0)
+  if (n >= wakeSlots) {
+    return false
+  }
+  writeU64(wakeFdBytes(), n * 8, pollFd)
+  writeU64(wakeEfdBytes(), n * 8, eventFd)
+  writeU64(wakeCountBytes(), 0, n + 1)
+  return true
+}
+
+// Swap-with-last removal, O(1) and bounded. Called only from `pollClose`, so
+// that the table can never answer `wakeSlotFor` with a stale eventfd after a
+// `pollFd` number the kernel has since recycled to an unrelated descriptor —
+// see `pollClose`'s own comment for why that reuse is a real hazard here and
+// not a hypothetical one.
+@nosplit fn wakeSlotRemove(pollFd: int) {
+  let slot = wakeSlotFor(pollFd)
+  if (slot < 0) {
+    return
+  }
+  let last = readU64(wakeCountBytes(), 0) - 1
+  writeU64(wakeFdBytes(), slot * 8, readU64(wakeFdBytes(), last * 8))
+  writeU64(wakeEfdBytes(), slot * 8, readU64(wakeEfdBytes(), last * 8))
+  writeU64(wakeCountBytes(), 0, last)
+}
+
+// The 8-byte payload `pollWake` writes to trigger the counter, and the 8-byte
+// scratch `pollDrainWakeEvent` reads it back into. Two separate buffers,
+// deliberately: `wakeWriteBuf` is written to `1` exactly once, from
+// `pollArmWake` at boot, and every later `pollWake` call only ever READS its
+// address — an unchanging shared buffer has no reader/reader race no matter
+// how many producers call it concurrently. `wakeReadBuf` is a genuine mutable
+// scratch and is sound as a shared buffer for the same reason `evBuf` above
+// is: `schedPollTryEnter`'s try-lock admits one worker at a time into
+// `pollDrainOne`, which is `pollDrainWakeEvent`'s only caller.
+let wakeWriteBuf: [1]i64
+let wakeReadBuf: [1]i64
+
+@nosplit fn wakeWriteBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(wakeWriteBuf))
+}
+
+@nosplit fn wakeReadBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(wakeReadBuf))
+}
+
+// Register the wake eventfd `pollWake`/`pollDrainWakeEvent` share, into the
+// SAME epoll set `pollFd` already owns. Called exactly once per descriptor,
+// from `pollCreate` only — before `pollCreate` returns, matching darwin's
+// `pollArmWake`: nothing outside that call has seen `pollFd` yet, so no
+// `pollWake` can run against it before this registration exists.
+//
+// LEVEL-TRIGGERED (no `EPOLLET`) AND PERMANENT (no `EPOLLONESHOT`) — the two
+// choices that make this safe, argued in full at `pollWake`'s own header.
+// `data` is the fixed sentinel `0`: every real registration `pollRegister`
+// makes carries a live task address, which is never `0` (`schedRegister`'s
+// own precondition), so `0` can never collide with a real wake target and
+// `pollDrainOne`'s existing `task != 0` check already treats it as "ignore,
+// no task" — this file adds `pollDrainWakeEvent` as the one thing that check
+// was still missing: draining the counter.
+@nosplit fn pollArmWake(pollFd: int): bool {
+  let efd = int(syscall(sysEventfd2(), 0, i64(efdNonBlock())))
+  if (efd < 0) {
+    return false
+  }
+  writeU64(wakeWriteBytes(), 0, 1)
+
+  let base = pollScratchBytes()
+  writeU32(base, 0, epollIn())
+  writeU64(base, eventDataOffNosplit(), 0)
+  let evAddr = i64(int(base))
+  let add = int(syscall(sysEpollCtl(), i64(pollFd), i64(ctlAdd()), i64(efd), evAddr))
+  if (add != 0) {
+    let _ = int(syscall(sysClose(), i64(efd)))
+    return false
+  }
+  if (!wakeSlotInsert(pollFd, efd)) {
+    let _ = int(syscall(sysEpollCtl(), i64(pollFd), i64(ctlDel()), i64(efd), evAddr))
+    let _ = int(syscall(sysClose(), i64(efd)))
+    return false
+  }
+  return true
+}
+
+// Trigger the wake eventfd `pollArmWake` armed on `pollFd` — the producer
+// side of this ticket's primitive.
+//
+// EVENTFD'S OWN SEMANTICS, ARGUED ON THEIR OWN TERMS. An eventfd holds a
+// 64-bit kernel-side counter; `write` ADDS to it (never blocks here — an
+// overflow near 2^64 is the only case that would, and this file only ever
+// writes `1`), `read` returns the counter and resets it to `0`, and
+// LEVEL-TRIGGERED `epoll` (no `EPOLLET` — see `pollArmWake`) reports the fd
+// readable whenever that counter is non-zero, checked fresh every time
+// `epoll_pwait` is entered or while a call is blocked inside it — not a
+// one-shot signal that a waiter-less write drops. That is what makes every
+// interleaving of "trigger" against a consumer's "check, then block" safe:
+//
+//   - trigger lands before the consumer's `epoll_pwait` call starts: the
+//     counter is already non-zero, so the call sees the wake fd ready on
+//     entry and returns without ever sleeping — what makes a sub-millisecond
+//     `pollDrain` timeout safe to combine with a trigger that already
+//     happened.
+//   - trigger lands while the consumer is asleep inside `epoll_pwait`: the
+//     kernel wakes the blocked call directly once the counter goes non-zero —
+//     the ordinary case this fd exists for.
+//   - trigger lands after the consumer's `epoll_pwait` call already returned
+//     (a stale or spurious trigger, nobody currently blocked): the counter
+//     stays non-zero in the kernel until something reads it, so the NEXT
+//     `epoll_pwait` call sees it ready immediately — nothing lost, only
+//     deferred by at most one drain.
+//
+// DRAINING DOES NOT REOPEN THE WINDOW IT JUST CLOSED. `pollDrainWakeEvent`
+// reads the counter back to `0` only after `epoll_pwait` has already
+// reported the fd ready — i.e. only after some trigger is already known to
+// have landed — so a `pollWake` that lands AFTER that read simply sets the
+// counter non-zero again, independent of whether anyone drained it a moment
+// before, and the next `epoll_pwait` call reports it ready in turn. The
+// property this relies on and does not itself provide is memory visibility
+// of "publish work" before "call this" — ordinary release ordering on
+// whatever queue the producer pushed to, the same requirement every
+// `bit_rt_port_park_wake` caller already meets.
+export @symbol("bit_rt_port_sched_poll_wake") @nosplit fn pollWake(pollFd: int): bool {
+  if (pollFd <= 0) {
+    return false
+  }
+  let slot = wakeSlotFor(pollFd)
+  if (slot < 0) {
+    return false
+  }
+  let efd = readU64(wakeEfdBytes(), slot * 8)
+  return int(syscall(sysWrite(), i64(efd), i64(int(wakeWriteBytes())), 8)) == 8
+}
+
+// The wake eventfd's event (#5718) — `task == 0`, `pollArmWake`'s sentinel.
+// Drains the counter so a level-triggered `epoll_pwait` does not keep
+// reporting this fd ready forever; there is no task to unpark, since
+// `pollWake` carries no task of its own, only a signal that the caller
+// should re-check its own work. See `pollWake`'s header for why draining
+// here cannot lose a trigger that lands after this read returns.
+@nosplit fn pollDrainWakeEvent(pollFd: int) {
+  let slot = wakeSlotFor(pollFd)
+  if (slot < 0) {
+    return
+  }
+  let efd = readU64(wakeEfdBytes(), slot * 8)
+  let _ = int(syscall(sysRead(), i64(efd), i64(int(wakeReadBytes())), 8))
+}

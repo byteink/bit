@@ -252,23 +252,6 @@ fn tryGrowPool(sched: *i64) {
 // stated target instead — a 2-second idle process should retire about 2 wakes.
 const worker0WaitCeilingNs: int = 1000000000
 
-// `epoll_pwait`'s own resolution, and therefore both of `worker0Wait`'s
-// thresholds below.
-//
-// It is the SHORTEST WAIT THE SYSCALL CAN EXPRESS: the timeout argument is a
-// whole-millisecond `int`, so `nsToEpollMs` (`../../sched/linux/poll.bit`)
-// must round a sub-millisecond deadline UP to 1ms rather than truncate it to
-// the non-blocking sentinel. And it is the RECHECK INTERVAL this loop has
-// always fallen back on when the poller has work outstanding —
-// `parkMaxBackoffNs` (`../../park`), the ceiling the ramp this file used to
-// run stopped at.
-//
-// ../darwin/bootworker.bit needs neither threshold: `kevent` takes a
-// `timespec`, so it can wait for exactly the deadline it computed. That is
-// the whole reason this platform needs a `worker0Wait` where darwin inlines
-// one call.
-const worker0PollRecheckNs: int = 1000000
-
 // Worker 0's idle wait (#5723, epic #3913), the one place the ONE worker that
 // never parks on `schedIdlePark` goes to the kernel (`parks` is false only for
 // `wkId == 0`). It used to be a BLIND `backoff` ramp —
@@ -282,37 +265,37 @@ const worker0PollRecheckNs: int = 1000000
 // workers 1..N-1 never read it.
 //
 // WHICH SYSCALL WAITS IS A LINUX-ONLY DECISION. `pollDrain` blocks in
-// `epoll_pwait`, which watches every registered fd AND #5718's wake eventfd in
+// `epoll_pwait2`, which watches every registered fd AND #5718's wake eventfd in
 // the same syscall this worker must keep making anyway (`../../sched/sleep.bit`:
 // worker 0 is the only thread guaranteed to be looking), so one blocking drain
 // replaces the drain-then-sleep PAIR of syscalls every idle turn used to make.
-// Two epoll properties stop that being the whole answer, and both are why the
-// two thresholds above exist:
+// EVERY wait goes there now, at its exact length. The two epoll properties
+// that used to stop that being the whole answer are both gone, and the wait
+// is one unconditional blocking drain because of it:
 //
-//   - `epoll_pwait` COUNTS IN WHOLE MILLISECONDS. `nsToEpollMs` rounds up, so
-//     a 200us deadline handed to `pollDrain` becomes a 1ms wait — a 5x
-//     overshoot of a deadline `clock_nanosleep` hits exactly. A wait shorter
-//     than `worker0PollRecheckNs` therefore still goes to `parkSleepNs`, which
-//     is nanosecond-precise. That branch gives up the syscall pairing and
-//     keeps the ramp removal, which is where a sub-millisecond timer
-//     workload's win is anyway.
-//   - READ AND WRITE INTEREST LIVE ON TWO DIFFERENT DESCRIPTORS (#1910),
-//     because epoll keys a registration on the fd alone. `pollDrain` blocks on
-//     `scPollFd` and drains `scPollFdWrite` non-blocking AFTERWARDS, so a
-//     socket becoming WRITABLE cannot end this wait; kqueue keys on
-//     `(fd, filter)` and has no such split. So the ceiling drops back to
-//     `worker0PollRecheckNs` — today's rate, nothing regressed — whenever
-//     `schedPollPendingCount` reports anything armed at all. The count cannot
-//     say WHICH descriptor, and answering "it might be a write" with a 1s wait
-//     would turn a full send buffer into a 1s stall.
+//   - `epoll_pwait` COUNTED IN WHOLE MILLISECONDS, so a 200us deadline became
+//     a 1ms wait and anything shorter than that had to go to `parkSleepNs`
+//     instead, paying a drain-then-sleep PAIR of syscalls per idle turn to
+//     keep the precision. `pollDrain` waits in `epoll_pwait2` now (#5737),
+//     whose `timespec` carries the nanoseconds it was given.
+//   - READ AND WRITE INTEREST LIVED ON TWO DIFFERENT DESCRIPTORS (#1910) with
+//     only `scPollFd` blocked on, so write readiness could not end this wait
+//     and the whole ceiling had to drop to 1ms whenever
+//     `schedPollPendingCount` reported anything armed at all — that counter
+//     is one process-global fed by both descriptors and cannot say which, so
+//     the answer had to be "it might be a write". `scPollFdWrite` is now
+//     registered INSIDE `scPollFd`'s set (#5736), so the one blocking wait
+//     sees both directions and no counter is consulted.
 //
 // EVERY WAY THIS WAIT CAN END, enumerated because a wait this long turns a
 // missed wake into a hang rather than a delay:
-//   - THE DEADLINE JUST COMPUTED needs no signal on either branch: the wait's
-//     own duration ends exactly then, same as the `parkSleepNs` this replaces.
-//   - NETPOLLER READ READINESS is delivered by the kernel straight into this
-//     `epoll_pwait`, unchanged from today — and only ever reaches a wait the
-//     count above has already shortened to `worker0PollRecheckNs`.
+//   - THE DEADLINE JUST COMPUTED needs no signal: the wait's own duration ends
+//     exactly then, to the nanosecond, same as the `parkSleepNs` this
+//     replaces.
+//   - NETPOLLER READINESS, IN EITHER DIRECTION, is delivered by the kernel
+//     straight into this `epoll_pwait2`: read interest from `scPollFd`'s own
+//     set, write interest through the nested `scPollFdWrite` (#5736), which
+//     reports readable exactly while its set holds something ready.
 //   - SHUTDOWN is signalled: `./boottail.bit`'s step 8 calls `pollWake` right
 //     after `schedShutdown`, because `schedWakeIdle` skips this worker by
 //     construction and the join that follows would otherwise wait out the
@@ -328,12 +311,6 @@ const worker0PollRecheckNs: int = 1000000
 //     one more `schedFindWorkAt` a fixed 1s later, never an unbounded wait.
 //     Same fallback as the darwin twin (#5722), which still rides shutdown on
 //     it too.
-//   - A WRITE REGISTRATION ARMED BUT NOT YET COUNTED is the one window the
-//     count cannot close, and it is this platform's own: `pollRegister` arms
-//     with the kernel and only then calls `schedPollPendingInc`, so a read
-//     here can miss it by a few instructions and start a full-ceiling wait on
-//     a descriptor that will never report it. Bounded the same way, and closed
-//     by the same missing producer-side `pollWake`.
 //
 // The caller holds `gcBlockingBegin`/`gcBlockingEnd` across this, which is what
 // lets it block in a syscall at all: no frame here holds a live Bit reference,
@@ -342,17 +319,9 @@ const worker0PollRecheckNs: int = 1000000
 //
 // DECLARED ABOVE ITS CALLER, same reason `spinForWork` above is.
 fn worker0Wait(s: *i64, w: *i64) {
-  let ceiling = worker0WaitCeilingNs
-  if (schedPollPendingCount() != 0) {
-    ceiling = worker0PollRecheckNs
-  }
   // The clock is read HERE, not reused from the find-work pass above: a stale
   // `now` lengthens the wait by however long that pass took.
-  let waitNs = schedParkBoundNs(ceiling, parkMonoNs(w + wkSleepReq))
-  if (waitNs < worker0PollRecheckNs) {
-    parkSleepNs(waitNs, w + wkSleepReq)
-    return
-  }
+  let waitNs = schedParkBoundNs(worker0WaitCeilingNs, parkMonoNs(w + wkSleepReq))
   let _ = pollDrain(int(s), waitNs)
 }
 
@@ -421,9 +390,9 @@ fn worker0Wait(s: *i64, w: *i64) {
 // `runtime/sched/`'s own idle path and this file's `boot`/`joinWorker` sleeps: no
 // frame here holds a live Bit reference while parked, so the collector may pass
 // this worker's slot without waiting for a safepoint it will not reach until
-// the wait returns — `parkSleepNs` for a parking worker, and either of
-// `worker0Wait`'s two syscalls for worker 0, which is exactly what lets that
-// function block in `epoll_pwait` for as long as a second. `scStopping` is
+// the wait returns — `parkSleepNs` for a parking worker, and `worker0Wait`'s
+// blocking drain for worker 0, which is exactly what lets that function block
+// in `epoll_pwait2` for as long as a second. `scStopping` is
 // checked first and by hand, matching `schedWorkerStep`'s own order, so a
 // shutdown signalled while idle is still seen before a wait starts rather than
 // after one; a shutdown signalled DURING worker 0's wait ends it through
