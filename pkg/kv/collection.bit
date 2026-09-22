@@ -1,0 +1,279 @@
+// pkg/kv/collection.bit — the typed collection layer (#3467, #5724): `save`/
+// `get`/`delete`/`all`/`by` over #5721's `Tx`, with declared secondary
+// indexes maintained inside the same transaction as the record they index.
+//
+// USES ONLY THE ENGINE'S PUBLIC API — `Tx.get`/`put`/`delete`/`scan`, never a
+// page or B+tree internal directly (this ticket's own constraint, and the
+// reason this file lives apart from engine.bit/btree.bit: bbolt is the
+// differential oracle for the engine alone and has no collections).
+//
+// ONE SHARED B+TREE NAMESPACE, TWO KEY SPACES PER COLLECTION. A `Db` has one
+// key/value space; every `Collection` carves out its own name-prefixed slice
+// of it (`kvRecordKey`) plus one further-prefixed slice per declared index
+// (`kvIndexKey`). Every prefix this file builds ends in `kvSep`
+// (pkg/kv/keyencoding.bit's own 0x00 separator, reused here rather than
+// redeclared — a second `const kvSep` in this module would be E0042) placed
+// deliberately so a shorter name can never be a byte-for-byte prefix of a
+// longer one: "user" and "users" produce "r\x00user\x00..." and
+// "r\x00users\x00...", which diverge at the byte right after "user".
+//
+// AN INDEX ENTRY'S VALUE IS THE PRIMARY ID, NOT EMPTY. #5719's `scan`
+// (`pkg/kv/btree.bit`) returns `[][]byte` of VALUES only — it does not hand
+// back the keys it scanned. So `by()` cannot recover a match's primary id by
+// parsing an index key's tail; it reads the id back from the entry's VALUE
+// instead, which this file writes as exactly the id bytes it was given. The
+// id is still appended to the index key too (`idx:name:indexName:value\x00`
+// + id), because two records sharing the same indexed value need distinct
+// keys to both be storable — the "tail is the primary key" framing in the
+// epic's own body is about that uniqueness, not about extraction.
+//
+// THE PROPERTY THIS FILE EXISTS FOR: an index entry and the record it
+// indexes are never observable apart, even transiently within one `tx`.
+// `save()` on an id that already has a record reads the OLD value first (the
+// only way to know which index entries are now stale), deletes every stale
+// index entry, writes the new record, then writes every new index entry —
+// all before returning, all in the caller's own `tx`. Saving a brand-new id
+// only ever adds entries, which is why a test that never re-saves cannot
+// exercise this: see collection.test.bit's re-save test for the property
+// the ticket's acceptance names by name.
+//
+// T MARSHALING IS THE CALLER'S, NOT THIS FILE'S. `Collection<T>` never
+// inspects a `T` value's shape — it calls two caller-supplied closures,
+// `marshal`/`unmarshal` (`newCollection`), the same way `declareIndex`'s
+// `keyOf` is caller-supplied. This sidesteps #4495 (a generic METHOD calling
+// a method on its own class's type parameter does not lower: `E0092`) by
+// never calling a method ON a `T` value from inside a generic method here —
+// only closure values are invoked. `pkg/web/res.bit`'s own `Jsonable`
+// header documents the same bug from the other side. The existing
+// marshaling convention this codebase already has — verified before writing
+// any of this — is `@json` (SPEC §10.5): a class carrying it gets a
+// synthesized `toJson(): Json`, paired with `stdlib/json`'s `jsonEncode`/
+// `jsonParse`/`jsonDecode<T>`. `collection.test.bit`'s `Widget` fixture
+// builds its `marshal`/`unmarshal` closures out of exactly that pair, rather
+// than this file inventing a second, competing marshaling contract.
+//
+// SIGN OF ZERO: NOT THIS FILE'S TO CANONICALIZE (epic #3467 comment 9's own
+// hazard, decided here). `-0.0 == 0.0` in the language, but #5715's
+// `encodeFloat` keeps them byte-distinct by design (its own contract, not
+// to be collapsed). This file never calls `encodeFloat` itself — only a
+// caller's `keyOf` does, when indexing a float field — so it cannot
+// canonicalize a value it never sees. Documented decision, per the epic
+// comment's own two options: `-0.0` and `0.0` are DISTINCT index keys here,
+// exactly as `encodeFloat` already treats them; a caller wanting them to
+// collide must normalize the sign itself before calling `encodeFloat` in
+// its own `keyOf`.
+
+// One caller-declared secondary index: a name plus the closure that turns a
+// `T` into the bytes it is indexed under. Module-private — reached only
+// through `declareIndex` and a `Collection`'s own methods.
+class kvIndexDef<T> {
+  name: string,
+  keyOf: (T) => []byte,
+}
+
+// One name-prefixed collection over a `Db`'s shared key/value space. Built
+// by `newCollection`, never by a bare `Collection<T>{...}` literal (its
+// fields are module-private, matching `Tx`/`Db` in `pkg/kv/db.bit`).
+export class Collection<T> {
+  name: string
+  marshal: (T) => []byte
+  unmarshal: ([]byte) => T!
+  indexes: []kvIndexDef<T>
+  export save( // Reads the current record at `id` (if any), removes every stale index
+    // entry it implies, writes the new record, then writes every new index
+    // entry — all inside the caller's own `tx`. See this file's header for
+    // why the read-before-write is load-bearing, not optional.
+    tx: Tx,
+    id: []byte,
+    value: T,
+  ): ()! {
+    let recKey = kvRecordKey(this.name, id)
+    let existing = kvTxGetOrNone(tx, recKey)
+    if (isSome(existing)) {
+      let oldValue = this.unmarshal(unwrap(existing))?
+      let i = 0
+      while (i < len(this.indexes)) {
+        let idx = this.indexes[i]
+        tx.delete(kvIndexKey(this.name, idx.name, idx.keyOf(oldValue), id))?
+        i = i + 1
+      }
+    }
+    tx.put(recKey, this.marshal(value))?
+    let j = 0
+    while (j < len(this.indexes)) {
+      let idx = this.indexes[j]
+      tx.put(kvIndexKey(this.name, idx.name, idx.keyOf(value), id), id)?
+      j = j + 1
+    }
+  }
+  export get( // The record at `id`, or a failure naming it absent (`Tx.get`'s own
+    // "key not found").
+    tx: Tx,
+    id: []byte,
+  ): T! {
+    let raw = tx.get(kvRecordKey(this.name, id))?
+    return this.unmarshal(raw)?
+  }
+  export delete( // Removes the record at `id` and every index entry it had — a no-op, not
+    // a failure, if `id` has no record (matches `Tx.delete`'s own semantics).
+    tx: Tx,
+    id: []byte,
+  ): ()! {
+    let recKey = kvRecordKey(this.name, id)
+    let existing = kvTxGetOrNone(tx, recKey)
+    if (isNone(existing)) {
+      return
+    }
+    let oldValue = this.unmarshal(unwrap(existing))?
+    tx.delete(recKey)?
+    let i = 0
+    while (i < len(this.indexes)) {
+      let idx = this.indexes[i]
+      tx.delete(kvIndexKey(this.name, idx.name, idx.keyOf(oldValue), id))?
+      i = i + 1
+    }
+  }
+  export all( // Every saved record in this collection, regardless of any index — a
+    // prefix scan over the collection's own record key space.
+    tx: Tx,
+  ): []T! {
+    let (lo, hi) = kvPrefixRange(kvRecordPrefix(this.name))
+    let raws = tx.scan(lo, hi)?
+    let out: []T = []T(0)
+    let i = 0
+    while (i < len(raws)) {
+      out = append(out, this.unmarshal(raws[i])?)
+      i = i + 1
+    }
+    return out
+  }
+  export by( // Every record whose `index`-declared field equals `value` (already
+    // encoded, e.g. via #5715's `encodeInt`/`encodeFloat`/`encodeString`) — a
+    // prefix scan over that index's value range, then one record read per
+    // match. A `value` that matches no declared index's entries simply
+    // returns empty; `index` naming a never-declared index does too, the same
+    // way an empty prefix scan reads no differently from one that never had
+    // entries — no query language or planner here (this ticket's own scope).
+    tx: Tx,
+    index: string,
+    value: []byte,
+  ): []T! {
+    let (lo, hi) = kvPrefixRange(kvIndexValuePrefix(this.name, index, value))
+    let ids = tx.scan(lo, hi)?
+    let out: []T = []T(0)
+    let i = 0
+    while (i < len(ids)) {
+      let raw = tx.get(kvRecordKey(this.name, ids[i]))?
+      out = append(out, this.unmarshal(raw)?)
+      i = i + 1
+    }
+    return out
+  }
+}
+
+// Builds a `Collection<T>` named `name`, storing records via `marshal`/
+// `unmarshal`. A generic FUNCTION returning `Collection<T>{...}`, the same
+// shape `pkg/orm/query.bit`'s `find<T>` uses (and the one #5320 fixed: a
+// literal `Collection<Widget>{...}` written outside a generic body is a
+// second, working way to reach the same construction, but this file offers
+// only the generic-function form since it needs no caller-visible fields).
+export fn newCollection<T>(
+  name: string, marshal: (T) => []byte, unmarshal: ([]byte) => T!,
+): Collection<T> {
+  return Collection<T>{
+    name = name, marshal = marshal, unmarshal = unmarshal, indexes = []kvIndexDef<T>(0),
+  }
+}
+
+// Declares a secondary index named `name` on `c`, keyed by `keyOf(v)` for
+// every `v` saved from here on. `c`'s own fields are mutated in place
+// (classes are reference types, SPEC §13.3), so every later `save`/
+// `delete`/`by` on this same `Collection` sees it. Does NOT backfill: only
+// records saved AFTER this call are indexed, matching every acceptance
+// scenario (`collection.test.bit`), which always declares before saving.
+export fn declareIndex<T>(c: Collection<T>, name: string, keyOf: (T) => []byte): ()! {
+  let i = 0
+  while (i < len(c.indexes)) {
+    if (c.indexes[i].name == name) {
+      fail newError("kv: declareIndex: index '${name}' is already declared on collection '${c.name}'")
+    }
+    i = i + 1
+  }
+  c.indexes = append(c.indexes, kvIndexDef<T>{ name = name, keyOf = keyOf })
+}
+
+// `Tx.get`, with "not found" (or any other read failure) turned into
+// `Option<[]byte>.None` instead of propagated — `save`/`delete` both need
+// "does this id already have a record", never the distinction between
+// absent and erroring: a genuinely broken `tx` still fails loudly on the
+// unconditional `put`/`delete` call that follows either of them.
+fn kvTxGetOrNone(tx: Tx, key: []byte): Option<[]byte> {
+  let v = tx.get(key) catch _ {
+    return Option<[]byte>.None
+  }
+  return Option.Some(v)
+}
+
+// Tags distinguishing a collection's own records from its index entries in
+// the shared key space — distinct first bytes ("r" vs "i"), so neither tag
+// can ever be mistaken for the other regardless of what a collection or
+// index is named.
+const kvRecTag: string = "r"
+const kvIdxTag: string = "i"
+
+// The fixed prefix for every record `kvRecordKey` under `name` — ends in
+// `kvSep`, as `kvPrefixRange` requires.
+fn kvRecordPrefix(name: string): []byte {
+  let out = []byte(kvRecTag)
+  out = append(out, kvSep)
+  out = append(out, ...[]byte(name))
+  out = append(out, kvSep)
+  return out
+}
+
+// The exact key `id`'s record is stored under, within collection `name`.
+fn kvRecordKey(name: string, id: []byte): []byte {
+  return append(kvRecordPrefix(name), ...id)
+}
+
+// The fixed prefix for every index entry of collection `name`'s index
+// `indexName` whose indexed value is exactly `value` — ends in `kvSep`, as
+// `kvPrefixRange` requires, regardless of what `value`'s own trailing byte
+// is (fixed-width int/float or self-terminating string, per #5715, or
+// anything else a caller's `keyOf` returns).
+fn kvIndexValuePrefix(name: string, indexName: string, value: []byte): []byte {
+  let out = []byte(kvIdxTag)
+  out = append(out, kvSep)
+  out = append(out, ...[]byte(name))
+  out = append(out, kvSep)
+  out = append(out, ...[]byte(indexName))
+  out = append(out, kvSep)
+  out = append(out, ...value)
+  out = append(out, kvSep)
+  return out
+}
+
+// The exact key one index entry (collection `name`, index `indexName`,
+// value `value`, record `id`) is stored under. The value stored there is
+// `id` itself — see this file's header for why the entry's VALUE, not its
+// key tail, is what `by()` actually reads back.
+fn kvIndexKey(name: string, indexName: string, value: []byte, id: []byte): []byte {
+  return append(kvIndexValuePrefix(name, indexName, value), ...id)
+}
+
+// `[lo, hi)` bounding every key with prefix `p`. Every prefix this file
+// builds ends in `kvSep` (0x00) by construction; `hi` is `p` with that final
+// byte bumped to 0x01 and every earlier byte left untouched. That is
+// strictly greater than `p` plus ANY suffix — the byte at that position is
+// 0x00 for every key sharing the prefix and 0x01 for `hi`, so the comparison
+// is decided right there regardless of what follows — and no greater than
+// necessary, since nothing this file produces shares `p`'s bytes up to but
+// not including that final `kvSep`.
+fn kvPrefixRange(p: []byte): ([]byte, []byte) {
+  if (len(p) == 0 || p[len(p) - 1] != kvSep) {
+    panic("kv: kvPrefixRange: prefix must end in the separator byte")
+  }
+  let hi = append([]byte(0), ...p)
+  hi[len(hi) - 1] = 0x01
+  return (p, hi)
+}
