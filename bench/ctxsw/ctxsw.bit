@@ -1,0 +1,160 @@
+// Context switches per timer wake, on Linux — the cost of worker 0's idle wait.
+//
+// WHY THIS EXISTS. Epic #3913's whole subject is what an idle process pays the
+// kernel: worker 0 does not park like the other workers, it blocks in
+// `epoll_pwait2` inside `worker0Wait` (runtime/root/linux/bootworker.bit) with a
+// deadline taken from the timer queue. Every change on that path — #5723,
+// #5736, #5737, #5744, #5745, #5746 — moves either how often worker 0 enters
+// that wait or what one entry costs, and NOTHING IN THE TREE MEASURED IT. Two
+// of those tickets shipped without a number for exactly that reason, and the
+// ad-hoc harness the first one used was never landed. This is that harness.
+//
+// THE DENOMINATOR IS THE PROGRAM'S OWN COUNTER. `wakes` is the number of
+// `sleep` calls that actually returned, summed over the sleeper tasks and
+// carried back over a channel — not the product of tasks and turns, and not
+// anything the wrapper assumes. A ratio whose denominator is assumed is not a
+// measurement.
+//
+// THE NUMERATOR IS ONE THREAD'S, NOT THE PROCESS'S. `/proc/thread-self/status`
+// is the CALLING thread's own status file, and a `std/fs` read blocks the green
+// thread's worker for the duration of the syscall (stdlib/fs/fs.bit's header),
+// so both reads below happen on the OS thread running this task. Run with
+// BIT_WORKERS=1 and that thread IS worker 0, which is what makes the reading
+// attributable to it. The program does not assume that: it prints the thread id
+// from both reads and `same_thread`, so a task that migrated between them is
+// visible rather than silently averaged, and it prints `threads_end` so a pool
+// that grew under it is visible too.
+//
+// Linux only, by construction: `/proc` is the instrument. On any other platform
+// it prints one `ctxsw error=` line and exits — a Darwin reading of this
+// workload would not be comparable and must never stand in for one.
+//
+// Run it through ./ctxsw.sh, which cross-builds, ships it to real x86_64
+// hardware, interleaves the subjects and carries a byte-identical null control.
+import { sleep, monotonic, since } from "std/time"
+import { open } from "std/fs"
+import { reader } from "std/io"
+import { hasPrefix, split, trimSpace, parseInt } from "std/strings"
+import { envOr } from "std/os"
+
+// The calling thread's own counters. `/proc/self/status` would report the
+// thread group LEADER instead, which is the boot thread waiting in the join —
+// not worker 0, and not the thread doing the waiting under test.
+const threadStatusPath: string = "/proc/thread-self/status"
+const procStatusPath: string = "/proc/self/status"
+
+// `name` as an integer, or `fallback` when unset or unparseable.
+fn envInt(name: string, fallback: int): int {
+  return parseInt(trimSpace(envOr(name, ""))) catch fallback
+}
+
+// A whole `/proc` status file. Read through `std/io`, not `readFile`: a procfs
+// file reports size 0, and `File.readAll` seeks to the size, so `readFile`
+// returns "" here while a buffered reader loop reads the real content.
+fn statusText(path: string): string! {
+  let f = open(path)?
+  defer f.close()
+  return reader(f.fd).readAll()
+}
+
+// The integer value of `key` (given with its colon) in a status text, or -1 when
+// the field is absent or does not parse — which is how a non-Linux host and an
+// unreadable /proc both report themselves.
+fn statusField(text: string, key: string): int {
+  for line of split(text, "\n") {
+    if (hasPrefix(line, key)) {
+      let parts = split(line, ":")
+      if (len(parts) < 2) {
+        return -1
+      }
+      return parseInt(trimSpace(parts[1])) catch -1
+    }
+  }
+  return -1
+}
+
+// How much `key` advanced between two status texts.
+fn delta(before: string, after: string, key: string): int {
+  return statusField(after, key) - statusField(before, key)
+}
+
+// `num / den` to three decimal places, in integer arithmetic. Deliberately not
+// an f64 print: the reading is compared across compilers built from different
+// commits, and float formatting is one more thing that could differ between them.
+fn ratio3(num: int, den: int): string {
+  if (den <= 0 || num < 0) {
+    return "n/a"
+  }
+  let milli = num * 1000 / den
+  let frac = milli % 1000
+  let pad = "00"
+  if (frac >= 100) {
+    pad = ""
+  } else if (frac >= 10) {
+    pad = "0"
+  }
+  return "${milli / 1000}.${pad}${frac}"
+}
+
+// One sleeper: `turns` sleeps of `period` nanoseconds each, then reports how
+// many of them actually returned. Every `sleep` arms one timer and takes one
+// wake, so this count IS the wake count — a task that never woke never reports.
+fn sleeper(turns: int, period: int, done: chan<int>) {
+  let n = 0
+  while (n < turns) {
+    sleep(period)
+    n = n + 1
+  }
+  done <- n
+}
+
+// `tasks` concurrent sleepers, joined; the total number of wakes they saw.
+fn runRound(tasks: int, turns: int, period: int): int {
+  let done = chan<int>(tasks)
+  let i = 0
+  while (i < tasks) {
+    spawn sleeper(turns, period, done)
+    i = i + 1
+  }
+  let wakes = 0
+  i = 0
+  while (i < tasks) {
+    wakes = wakes + <- done
+    i = i + 1
+  }
+  return wakes
+}
+
+fn main() {
+  let tasks = envInt("BIT_CTXSW_TASKS", 8)
+  let turns = envInt("BIT_CTXSW_TURNS", 2000)
+  let period = envInt("BIT_CTXSW_PERIOD_NS", 200000)
+
+  // Warmup, OUTSIDE the counters: thread bring-up, the first timer arming and
+  // any grow-on-demand happen once and would otherwise be charged to the wakes.
+  let warmup = runRound(tasks, 1, period)
+
+  let before = statusText(threadStatusPath) catch ""
+  let start = monotonic()
+  let wakes = runRound(tasks, turns, period)
+  let elapsed = since(start)
+  let after = statusText(threadStatusPath) catch ""
+  let proc = statusText(procStatusPath) catch ""
+
+  let tidBefore = statusField(before, "Pid:")
+  let tidAfter = statusField(after, "Pid:")
+  if (tidBefore < 0 || tidAfter < 0) {
+    println("ctxsw error=no ${threadStatusPath} (this harness is Linux only)")
+    return
+  }
+
+  let vol = delta(before, after, "voluntary_ctxt_switches:")
+  let non = delta(before, after, "nonvoluntary_ctxt_switches:")
+  let workers = envOr("BIT_WORKERS", "unset")
+  let threads = statusField(proc, "Threads:")
+  let same = tidBefore == tidAfter
+  println("ctxsw config tasks=${tasks} turns=${turns} period_ns=${period} workers=${workers} warmup_wakes=${warmup}")
+  println("ctxsw thread tid_before=${tidBefore} tid_after=${tidAfter} same_thread=${same} threads_end=${threads}")
+  println("ctxsw counts voluntary=${vol} nonvoluntary=${non} total=${vol + non} wakes=${wakes}")
+  println("ctxsw cs_per_wake=${ratio3(vol + non, wakes)} ns_per_wake=${ratio3(elapsed, wakes)} elapsed_ms=${elapsed / 1000000}")
+}
