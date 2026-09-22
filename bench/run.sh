@@ -21,8 +21,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
 source bench/buildlib.sh         # BIT, CFLAGS, buildBit/buildC/buildGo -- shared with profile.sh
-# Explicit on purpose, NOT a glob over bench/cases/*/ -- that directory holds 14
-# entries and only these 11 have all three of <case>.bit, <case>.go and <case>.c.
+# Explicit on purpose, NOT a glob over bench/cases/*/ -- that directory holds 15
+# entries and only these 12 have all three of <case>.bit, <case>.go and <case>.c.
 # churn/ and trustcache/ are Bit-only (nothing to compare against) and startup/
 # is the per-language empty-program baseline subtracted below, not a case. A
 # glob here would try to `go build` a .go that does not exist and abort the run.
@@ -30,7 +30,13 @@ source bench/buildlib.sh         # BIT, CFLAGS, buildBit/buildC/buildGo -- share
 # scalar hash and the scalar probe path, so nothing published here reached the
 # string path (wyhash + the group probe) and a change there read as "no
 # regression" and "no improvement" identically.
-CASES="fib mandelbrot collatz alloc allocflat strings map strmap sort matrix json"
+# `allocpar` joined in #5728 for the same reason one case further out: every
+# other case here is SINGLE-mutator, so the allocator's contended costs were
+# unmeasurable by construction. One mutator never loses the heap-lock race,
+# which is the only thing that arms runtime/gc's per-OS-thread allocation
+# cache, so a change to that cache could land correct, land regressed, or not
+# land at all and this suite would print the same numbers.
+CASES="fib mandelbrot collatz alloc allocflat allocpar strings map strmap sort matrix json"
 RUNS=15                          # timed runs per case; see trimmean() for why 15
 CRUNS=3                          # compile-time samples per case; median reported
 STARTUP_ITERS=200                # exec count for startup timing
@@ -353,6 +359,7 @@ md="$WORK/results.md"
   echo "> Method: ${RUNS} runs per case per language. Cycles and instructions are a trimmed mean of those runs, meaning the mean after dropping the slowest fifth, which was the most reproducible of four estimators measured over 40 samples per series; wall clock and RSS are the median. C built \`cc ${CFLAGS}\`, Go \`go build\`, Bit \`bit build\`, each language's standard optimized build."
   echo "> Mandelbrot: Bit and C agree to the last bit; Go differs by ~0.0002% because it contracts \`a*b+c\` to a hardware FMA. Not a bug: cross-compiler float bit-identity is not guaranteed."
   echo "> alloc measures the ALLOCATOR: 10M short-lived nodes, each its own heap object in all three languages (Bit's element class has a reference field, Go holds \`[]*Node\`, C mallocs per node). allocflat measures DATA LAYOUT: the same 10M nodes and the same printed total, stored by value in one buffer per batch (Bit packs \`[]Node\` inline, Go holds \`[]Node\`, C mallocs the batch once). The gap between the two rows is what per-node heap allocation costs a language."
+  echo "> allocpar measures the allocator under CONTENTION: the identical 10M nodes and the identical printed total as alloc, partitioned across 8 concurrent workers (Bit \`spawn\`, Go goroutines, C pthreads), worker count fixed in all three sources and never read from the host core count. The gap between the alloc and allocpar rows is what a language's allocator costs when more than one thread is in it; every other case in this table is single-mutator, so that cost appears nowhere else."
   echo "> The allocation table above is how those two claims are checked rather than asserted: same order of magnitude across a row means the three sources still express the same data structure, which is exactly what \`alloc\` silently lost for a day. Bit's count is \`swept+live\` from \`BIT_GC_STATS=1\`; Go's is \`runtime.MemStats.Mallocs\` and C's a \`malloc\` counter, both opt-in (\`BENCH_ALLOC_STATS\`, \`-DBENCH_ALLOC_STATS\`) and both absent from every timed binary."
   echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows is quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed. Both counters come from the same \`/usr/bin/time -l\` invocation that already produced the wall clock and the RSS; nothing extra is run and nothing extra is installed. The wall-clock table is kept as context and carries no ratio column."
   echo "> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (\`bench/cases/startup\`, ${STARTBASE}) subtracted, because dyld and runtime init differ per language and are a fifth of C's \`allocflat\` row. Every other table is raw."
