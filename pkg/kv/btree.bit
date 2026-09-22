@@ -1,0 +1,555 @@
+// pkg/kv — the ordered B+tree index, copy-on-write, over #5716's page
+// engine (#3467, #5719). `[]byte` keys and `[]byte` values only: a later
+// ticket maps typed values through #5715's key encoding onto this file, so
+// nothing here parses a key's bytes for anything but plain unsigned byte
+// comparison (`string(a) < string(b)`, the same rule SPEC 14.6 gives
+// `string` `<` and the rule #5715's codec was built to satisfy).
+//
+// COPY-ON-WRITE, load-bearing: `put`/`delete` never overwrite an existing
+// page's bytes. Every node on the root-to-leaf path is decoded, rebuilt with
+// the change applied, and written to a BRAND NEW page id (`kvAllocatePage`);
+// the old page's bytes are left exactly as they were. This is also why
+// there is no in-memory node cache anywhere in this file: every one of
+// `get`/`put`/`delete`/`scan` re-reads a node's bytes from the engine on
+// every visit, so a caller holding an old root id keeps reading the old,
+// untouched tree with no special-casing needed and no way to accidentally
+// see a mutation through a stale handle.
+//
+// Node format, both kinds sorted by key ascending:
+//   leaf:     (key, value)     pairs — the data.
+//   internal: (key, childId)   pairs — `key` is a LOWER BOUND on the keys
+//             reachable through `childId` (see `kvFindChild`'s own comment
+//             for why it need not be exact, only a valid bound).
+// A node that would overflow one page (`Engine.pageSize`) on `put` splits in
+// half by entry count, promoting the new right half's first key to the
+// parent; a split at the root allocates a new root page one level taller.
+// This ticket does not add overflow pages: a single key/value pair too
+// large to fit one page on its own is out of scope, matching the "one page
+// per record" limitation #5716 already accepted for the meta format.
+//
+// Free-page reuse (recovering the pages COW obsoletes) is explicitly OUT OF
+// SCOPE (epic #3467's Constraints): `kvAllocatePage` only ever grows the
+// file. `delete` likewise never merges or rebalances underfull nodes after
+// removing a key — the tree stays structurally valid (every internal entry
+// still points at a real, correctly-bounded child) but may be sparser than
+// it needs to be. Both are the writer/free-list ticket's job, not this
+// one's.
+//
+// SIGN OF ZERO (epic #3467's recorded hazard, decided here): #5715's
+// `encodeFloat` keeps `-0.0` and `0.0` as distinct byte sequences on
+// purpose — decode must not lose which sign came in. But `-0.0 == 0.0` in
+// Bit, so a typed collection built directly on those bytes would let
+// `put(-0.0, x)` and `get(0.0)` silently miss each other: two different
+// keys in this tree, one value in the language's own equality. This layer
+// never sees a typed float (byte keys only), so it has nothing to
+// canonicalize. The decision for whoever builds that typed layer: canonicalize
+// the sign of zero to +0.0 (`if (v == 0.0) { v = 0.0 }`) BEFORE calling
+// `encodeFloat`, never inside it — `encodeFloat`/`decodeFloat` must stay a
+// lossless bijection, which is what #5715 was accepted against.
+
+// One leaf entry: a stored key/value pair.
+class kvLeafEntry {
+  key: []byte,
+  value: []byte,
+}
+
+// One internal entry: `key` bounds the keys reachable through `child` from
+// below (see `kvFindChild`).
+class kvInternalEntry {
+  key: []byte,
+  child: i64,
+}
+
+// A decoded node. Exactly one of the two shapes a page can hold.
+enum kvNode {
+  Leaf([]kvLeafEntry),
+  Internal([]kvInternalEntry),
+}
+
+const kvNodeLeafTag: byte = 0
+const kvNodeInternalTag: byte = 1
+// 1 byte node-type tag + 4 byte entry count (u32, reusing engine.bit's
+// putU32/getU32 rather than defining a second length width).
+const kvNodeHeaderSize: int = 5
+
+// No tree yet. `get`/`scan`/`delete` treat it as an empty tree; `put` treats
+// it as "allocate the very first leaf page" — the one case where this
+// package hands back a root id with no prior `put` to have produced it, so
+// a caller's very first call is `put(e, noRoot, key, value)`.
+export const noRoot: i64 = -1
+
+// The next never-yet-used page id: the file is always an exact multiple of
+// `pageSize` (every write goes through `Engine.writePage`, which always
+// writes a full page), so `size / pageSize` is the next free id. Pages are
+// never reused (see this file's header) so ids only ever grow.
+fn kvAllocatePage(e: Engine): i64! {
+  let sz = e.file.size()?
+  return sz / i64(e.pageSize)
+}
+
+// `bits` appended as 4 big-endian bytes, via `string`'s bytes-append shape
+// (SPEC §5.3) — the same big-endian layout `engine.bit`'s `putU32` writes,
+// reused here instead of a second copy of the bit-shifting.
+fn kvAppendU32(out: []byte, v: u32): []byte {
+  let b = []byte(4)
+  putU32(b, 0, v)
+  out = append(out, string(b))
+  return out
+}
+
+// The 8-byte counterpart of `kvAppendU32`, reusing `engine.bit`'s `putI64`.
+fn kvAppendI64(out: []byte, v: i64): []byte {
+  let b = []byte(8)
+  putI64(b, 0, v)
+  out = append(out, string(b))
+  return out
+}
+
+// The exact byte length `kvEncodeNode` would produce for `n` — checked
+// against `Engine.pageSize` BEFORE encoding, so a node that must split is
+// caught before `kvEncodeNode` ever builds an oversized buffer.
+fn kvNodeEncodedSize(n: kvNode): int {
+  match (n) {
+    Leaf(entries) => {
+      let size = kvNodeHeaderSize
+      for e of entries {
+        size = size + 4 + len(e.key) + 4 + len(e.value)
+      }
+      return size
+    }
+    Internal(entries) => {
+      let size = kvNodeHeaderSize
+      for e of entries {
+        size = size + 4 + len(e.key) + 8
+      }
+      return size
+    }
+  }
+}
+
+// `n` as exactly `pageSize` bytes: the header, every entry (u32 key length +
+// key, then either u32 value length + value, or the 8-byte child id),
+// zero-padded to `pageSize`. Panics if `n` does not fit — a caller handing
+// an oversized node here skipped the split `kvWriteLeafOrSplit`/
+// `kvWriteInternalOrSplit` are for, a programmer error, not a runtime one.
+fn kvEncodeNode(n: kvNode): []byte {
+  let size = kvNodeEncodedSize(n)
+  if (size > kvPageSize) {
+    panic("kv: encoded node is ${size} bytes, exceeds page size ${kvPageSize} — caller must split before encoding")
+  }
+  let out = []byte(0)
+  match (n) {
+    Leaf(entries) => {
+      out = append(out, kvNodeLeafTag)
+      out = kvAppendU32(out, u32(len(entries)))
+      for e of entries {
+        out = kvAppendU32(out, u32(len(e.key)))
+        out = append(out, string(e.key))
+        out = kvAppendU32(out, u32(len(e.value)))
+        out = append(out, string(e.value))
+      }
+    }
+    Internal(entries) => {
+      out = append(out, kvNodeInternalTag)
+      out = kvAppendU32(out, u32(len(entries)))
+      for e of entries {
+        out = kvAppendU32(out, u32(len(e.key)))
+        out = append(out, string(e.key))
+        out = kvAppendI64(out, e.child)
+      }
+    }
+  }
+  while (len(out) < kvPageSize) {
+    out = append(out, byte(0))
+  }
+  return out
+}
+
+// The inverse of `kvEncodeNode`. `buf` must be one exact page as `readPage`
+// returns it. Fails loudly on an unrecognized type tag (#3467: a page that
+// reads back as a node when it is not is exactly the hazard this package
+// exists to avoid) rather than guessing a shape.
+fn kvDecodeNode(buf: []byte): kvNode {
+  let kind = buf[0]
+  let count = int(getU32(buf, 1))
+  let off = kvNodeHeaderSize
+  if (kind == kvNodeLeafTag) {
+    let entries: []kvLeafEntry = []
+    let i = 0
+    while (i < count) {
+      let keyLen = int(getU32(buf, off))
+      off = off + 4
+      let key = buf[off:off + keyLen]
+      off = off + keyLen
+      let valLen = int(getU32(buf, off))
+      off = off + 4
+      let value = buf[off:off + valLen]
+      off = off + valLen
+      entries = append(entries, kvLeafEntry{ key = key, value = value })
+      i = i + 1
+    }
+    return kvNode.Leaf(entries)
+  }
+  if (kind == kvNodeInternalTag) {
+    let entries: []kvInternalEntry = []
+    let i = 0
+    while (i < count) {
+      let keyLen = int(getU32(buf, off))
+      off = off + 4
+      let key = buf[off:off + keyLen]
+      off = off + keyLen
+      let child = getI64(buf, off)
+      off = off + 8
+      entries = append(entries, kvInternalEntry{ key = key, child = child })
+      i = i + 1
+    }
+    return kvNode.Internal(entries)
+  }
+  panic("kv: corrupt node page: unrecognized node type byte ${kind}")
+}
+
+// The index of `key` in `entries`, or -1. Leaf entries are few enough per
+// page (bounded by `pageSize`) that a linear scan keeps this function
+// simple; the tree's depth, not this scan, is what keeps lookups fast.
+fn kvFindLeaf(entries: []kvLeafEntry, key: []byte): int {
+  let i = 0
+  while (i < len(entries)) {
+    if (string(entries[i].key) == string(key)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The child to descend into for `key`: the largest `i` with
+// `entries[i].key <= key`, or 0 if `key` is below every entry.
+//
+// `entries[0].key` is NEVER read by this function — index 0 is always the
+// fallback — so it only ever needs to be a valid LOWER BOUND on its
+// subtree, never an exact one. That is what makes every mutation below safe
+// without extra bookkeeping: `put`ting a new global minimum, or `delete`ing
+// the current one, can leave a parent's separator smaller than its child's
+// true minimum key, and every key that legitimately lives in that child is
+// still `>=` that stale bound, so it still routes there correctly; a query
+// for a key that no longer exists there just correctly reports not-found
+// once it arrives. A separator only ever needs to be safe, not exact.
+fn kvFindChild(entries: []kvInternalEntry, key: []byte): int {
+  let i = 0
+  while (i + 1 < len(entries) && string(entries[i + 1].key) <= string(key)) {
+    i = i + 1
+  }
+  return i
+}
+
+// `entries` with `key`/`value` inserted in sorted position, replacing any
+// existing entry for `key` (put's upsert semantics). Returns a NEW slice —
+// this file never mutates a decoded node's entries in place, since every
+// caller is about to write the result to a brand new page id anyway.
+fn kvUpsertLeaf(entries: []kvLeafEntry, key: []byte, value: []byte): []kvLeafEntry {
+  let out: []kvLeafEntry = []
+  let i = 0
+  while (i < len(entries) && string(entries[i].key) < string(key)) {
+    out = append(out, entries[i])
+    i = i + 1
+  }
+  let replacing = i < len(entries) && string(entries[i].key) == string(key)
+  out = append(out, kvLeafEntry{ key = key, value = value })
+  if (replacing) {
+    i = i + 1
+  }
+  while (i < len(entries)) {
+    out = append(out, entries[i])
+    i = i + 1
+  }
+  return out
+}
+
+// The result of inserting into one subtree: either the subtree's single
+// page was rewritten in place (COW: to a NEW id) with no split, or it
+// overflowed and split into two siblings plus the key to promote to the
+// parent.
+enum kvInsertResult {
+  Replaced(i64),
+  Split(i64, []byte, i64),
+}
+
+// Writes `entries` as one leaf page if it fits, else splits it in half by
+// entry count and writes both halves — always to freshly allocated ids
+// (COW), never back to a page this file has already read.
+fn kvWriteLeafOrSplit(e: Engine, entries: []kvLeafEntry): kvInsertResult! {
+  let whole = kvNode.Leaf(entries)
+  if (kvNodeEncodedSize(whole) <= kvPageSize) {
+    let id = kvAllocatePage(e)?
+    e.writePage(id, kvEncodeNode(whole))?
+    return kvInsertResult.Replaced(id)
+  }
+  let mid = len(entries) / 2
+  let left = entries[0:mid]
+  let right = entries[mid:len(entries)]
+  let leftId = kvAllocatePage(e)?
+  e.writePage(leftId, kvEncodeNode(kvNode.Leaf(left)))?
+  let rightId = kvAllocatePage(e)?
+  e.writePage(rightId, kvEncodeNode(kvNode.Leaf(right)))?
+  return kvInsertResult.Split(leftId, right[0].key, rightId)
+}
+
+// The internal-node counterpart of `kvWriteLeafOrSplit`. The promoted key on
+// a split is the new right sibling's own first entry key — the same "key is
+// a lower bound on this child" shape an ordinary internal entry has, so an
+// internal split needs no different rule than a leaf split.
+fn kvWriteInternalOrSplit(e: Engine, entries: []kvInternalEntry): kvInsertResult! {
+  let whole = kvNode.Internal(entries)
+  if (kvNodeEncodedSize(whole) <= kvPageSize) {
+    let id = kvAllocatePage(e)?
+    e.writePage(id, kvEncodeNode(whole))?
+    return kvInsertResult.Replaced(id)
+  }
+  let mid = len(entries) / 2
+  let left = entries[0:mid]
+  let right = entries[mid:len(entries)]
+  let leftId = kvAllocatePage(e)?
+  e.writePage(leftId, kvEncodeNode(kvNode.Internal(left)))?
+  let rightId = kvAllocatePage(e)?
+  e.writePage(rightId, kvEncodeNode(kvNode.Internal(right)))?
+  return kvInsertResult.Split(leftId, right[0].key, rightId)
+}
+
+// `entries` with index `idx`'s child id replaced (no split below it) or
+// split into two adjacent entries (a split below it) — the parent-side half
+// of propagating one level's `kvInsertResult` up to the next.
+fn kvApplyChildResult(
+  entries: []kvInternalEntry,
+  idx: int,
+  result: kvInsertResult,
+): []kvInternalEntry {
+  let out: []kvInternalEntry = []
+  let i = 0
+  while (i < len(entries)) {
+    if (i != idx) {
+      out = append(out, entries[i])
+      i = i + 1
+      continue
+    }
+    match (result) {
+      Replaced(newId) => {
+        out = append(out, kvInternalEntry{ key = entries[i].key, child = newId })
+      }
+      Split(leftId, promoteKey, rightId) => {
+        out = append(out, kvInternalEntry{ key = entries[i].key, child = leftId })
+        out = append(out, kvInternalEntry{ key = promoteKey, child = rightId })
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Inserts `key`/`value` into the subtree rooted at `nodeId`, reading it
+// fresh from the engine, and returns how that changed (see
+// `kvInsertResult`). Always allocates at least one new page — COW never
+// writes back to `nodeId` itself, even when nothing but the target leaf
+// changed, because every node on the path down to it also needs a new id
+// once its child's id changes underneath it.
+fn kvInsertInto(e: Engine, nodeId: i64, key: []byte, value: []byte): kvInsertResult! {
+  let buf = e.readPage(nodeId)?
+  let node = kvDecodeNode(buf)
+  match (node) {
+    Leaf(entries) => {
+      let newEntries = kvUpsertLeaf(entries, key, value)
+      return kvWriteLeafOrSplit(e, newEntries)?
+    }
+    Internal(entries) => {
+      let idx = kvFindChild(entries, key)
+      let childResult = kvInsertInto(e, entries[idx].child, key, value)?
+      let newEntries = kvApplyChildResult(entries, idx, childResult)
+      return kvWriteInternalOrSplit(e, newEntries)?
+    }
+  }
+}
+
+// Reads `key`'s value from the tree rooted at `root`, or fails if absent.
+export fn get(e: Engine, root: i64, key: []byte): []byte! {
+  if (root == noRoot) {
+    fail newError("kv: get: key not found")
+  }
+  let buf = e.readPage(root)?
+  let node = kvDecodeNode(buf)
+  match (node) {
+    Leaf(entries) => {
+      let idx = kvFindLeaf(entries, key)
+      if (idx < 0) {
+        fail newError("kv: get: key not found")
+      }
+      return entries[idx].value
+    }
+    Internal(entries) => {
+      let idx = kvFindChild(entries, key)
+      return get(e, entries[idx].child, key)?
+    }
+  }
+}
+
+// Inserts or replaces `key`/`value`, copy-on-write, and returns the NEW
+// root page id. `root` reachable through any id returned by an EARLIER call
+// (or `noRoot`) is untouched — see this file's header.
+export fn put(e: Engine, root: i64, key: []byte, value: []byte): i64! {
+  if (root == noRoot) {
+    let entries: []kvLeafEntry = [kvLeafEntry{ key = key, value = value }]
+    let id = kvAllocatePage(e)?
+    e.writePage(id, kvEncodeNode(kvNode.Leaf(entries)))?
+    return id
+  }
+  let result = kvInsertInto(e, root, key, value)?
+  match (result) {
+    Replaced(id) => return id
+    Split(leftId, promoteKey, rightId) => {
+      // The new root's leftmost entry never needs a real lower bound
+      // (`kvFindChild` never reads it, see its own comment) — an empty key
+      // is the smallest possible byte string, so it also reads correctly
+      // as "no lower bound" if anything ever did read it.
+      let rootEntries: []kvInternalEntry = [
+        kvInternalEntry{ key = []byte(0), child = leftId },
+        kvInternalEntry{ key = promoteKey, child = rightId },
+      ]
+      let newRootId = kvAllocatePage(e)?
+      e.writePage(newRootId, kvEncodeNode(kvNode.Internal(rootEntries)))?
+      return newRootId
+    }
+  }
+}
+
+// `entries` with the entry at `idx` removed.
+fn kvRemoveLeafAt(entries: []kvLeafEntry, idx: int): []kvLeafEntry {
+  let out: []kvLeafEntry = []
+  let i = 0
+  while (i < len(entries)) {
+    if (i != idx) {
+      out = append(out, entries[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// `entries` with index `idx`'s child id replaced; no-split counterpart of
+// `kvApplyChildResult` for the delete path, which never splits.
+fn kvReplaceChild(entries: []kvInternalEntry, idx: int, newChild: i64): []kvInternalEntry {
+  let out: []kvInternalEntry = []
+  let i = 0
+  while (i < len(entries)) {
+    if (i == idx) {
+      out = append(out, kvInternalEntry{ key = entries[i].key, child = newChild })
+    } else {
+      out = append(out, entries[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Whether `key` was found anywhere on the path deleted from — `Unchanged`
+// lets `delete` hand back the SAME root id, untouched, with no page
+// rewritten and nothing allocated, when the key was never there.
+enum kvDeleteResult {
+  Unchanged,
+  Removed(i64),
+}
+
+// Deletes `key` from the subtree rooted at `nodeId`, reading it fresh from
+// the engine. No merge/rebalance on underflow — see this file's header.
+fn kvDeleteFrom(e: Engine, nodeId: i64, key: []byte): kvDeleteResult! {
+  let buf = e.readPage(nodeId)?
+  let node = kvDecodeNode(buf)
+  match (node) {
+    Leaf(entries) => {
+      let idx = kvFindLeaf(entries, key)
+      if (idx < 0) {
+        return kvDeleteResult.Unchanged
+      }
+      let newEntries = kvRemoveLeafAt(entries, idx)
+      let newId = kvAllocatePage(e)?
+      e.writePage(newId, kvEncodeNode(kvNode.Leaf(newEntries)))?
+      return kvDeleteResult.Removed(newId)
+    }
+    Internal(entries) => {
+      let idx = kvFindChild(entries, key)
+      let childResult = kvDeleteFrom(e, entries[idx].child, key)?
+      match (childResult) {
+        Unchanged => return kvDeleteResult.Unchanged
+        Removed(newChildId) => {
+          let newEntries = kvReplaceChild(entries, idx, newChildId)
+          let newId = kvAllocatePage(e)?
+          e.writePage(newId, kvEncodeNode(kvNode.Internal(newEntries)))?
+          return kvDeleteResult.Removed(newId)
+        }
+      }
+    }
+  }
+}
+
+// Deletes `key`, copy-on-write, and returns the (possibly unchanged) root
+// page id. Deleting an absent key is a no-op: `root` is returned as-is,
+// with nothing read past the path that established it was absent and
+// nothing written.
+export fn delete(e: Engine, root: i64, key: []byte): i64! {
+  if (root == noRoot) {
+    return noRoot
+  }
+  let result = kvDeleteFrom(e, root, key)?
+  match (result) {
+    Unchanged => return root
+    Removed(newId) => return newId
+  }
+}
+
+// Whether the child at `entries[i]`'s key range — `[entries[i].key,
+// entries[i+1].key)`, or unbounded above for the last entry — can overlap
+// `[lo, hi)`. May over-approximate when a stale separator understates a
+// child's true minimum (see `kvFindChild`'s comment): that only costs an
+// extra visit to a child whose own entries then filter out cleanly, never a
+// missed result.
+fn kvChildMayOverlap(entries: []kvInternalEntry, i: int, lo: []byte, hi: []byte): bool {
+  let lowerOk = string(entries[i].key) < string(hi)
+  let upperOk = i + 1 >= len(entries) || string(entries[i + 1].key) > string(lo)
+  return lowerOk && upperOk
+}
+
+// Collects every value for a key in `[lo, hi)`, in ascending key order,
+// from the subtree rooted at `nodeId`, into `acc`.
+fn kvScanInto(e: Engine, nodeId: i64, lo: []byte, hi: []byte, acc: [][]byte): [][]byte! {
+  let buf = e.readPage(nodeId)?
+  let node = kvDecodeNode(buf)
+  match (node) {
+    Leaf(entries) => {
+      let i = 0
+      while (i < len(entries)) {
+        let k = string(entries[i].key)
+        if (k >= string(lo) && k < string(hi)) {
+          acc = append(acc, entries[i].value)
+        }
+        i = i + 1
+      }
+    }
+    Internal(entries) => {
+      let i = 0
+      while (i < len(entries)) {
+        if (kvChildMayOverlap(entries, i, lo, hi)) {
+          acc = kvScanInto(e, entries[i].child, lo, hi, acc)?
+        }
+        i = i + 1
+      }
+    }
+  }
+  return acc
+}
+
+// The values for every key in `[lo, hi)`, in ascending key order.
+export fn scan(e: Engine, root: i64, lo: []byte, hi: []byte): [][]byte! {
+  if (root == noRoot) {
+    let empty: [][]byte = []
+    return empty
+  }
+  let out = kvScanInto(e, root, lo, hi, [])?
+  return out
+}
