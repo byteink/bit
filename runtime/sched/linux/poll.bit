@@ -15,6 +15,7 @@
 import { taskAt, schedPollUnpark, scPollFd, scPollFdWrite, pollRead } from "../../sched"
 import { schedPollTryEnter, schedPollLeave } from "../../sched"
 import { schedPollPendingInc, schedPollPendingDec, schedPollPendingCount } from "../../sched"
+import { pollDrainWakeOnly } from "../../sched"
 import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
 import { sysClose, sysEpollCreate1, sysEpollCtl, sysEpollPwait } from "../../syscalls"
 import { sysEpollPwait2 } from "../../syscalls"
@@ -435,7 +436,8 @@ export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
 }
 
 // Drain ready events and unpark the waiting task for each. Returns how many
-// were woken. `runtime/sched/`'s `pollReady`.
+// were woken, or `pollDrainWakeOnly` when the only event was worker 0's wake.
+// `runtime/sched/`'s `pollReady`.
 //
 // NANOSECONDS (#5718) — darwin's twin was widened first, by #5717, under the
 // same exported linker name, `bit_rt_port_sched_poll_drain`; that symbol
@@ -482,10 +484,19 @@ export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, time
   // up to 20ms; and the caller's contract is "drain what is ready", which a
   // non-blocking second pass satisfies. `scPollFdWrite` is 0 when unbound, which
   // `pollDrainOne` reads as "nothing to do".
-  let woken = pollDrainOne(s, pollFd, timeoutNs)
-  woken = woken + pollDrainOne(s, *(s + scPollFdWrite), 0)
+  //
+  // THE TWO ANSWERS ARE COMBINED, NOT ADDED. Either may be
+  // `pollDrainWakeOnly`, which is a signal and not a count, so adding it to the
+  // other descriptor's count would both understate the count and lose the
+  // signal. `pollDrainTasks` takes the count half of each and `pollDrainAnswer`
+  // re-applies the signal once, for the pair.
+  let readAnswer = pollDrainOne(s, pollFd, timeoutNs)
+  let writeAnswer = pollDrainOne(s, *(s + scPollFdWrite), 0)
   schedPollLeave(s)
-  return woken
+  return pollDrainAnswer(
+    pollDrainTasks(readAnswer) + pollDrainTasks(writeAnswer),
+    readAnswer == pollDrainWakeOnly || writeAnswer == pollDrainWakeOnly,
+  )
 }
 
 // Round a nanosecond deadline UP to whole milliseconds for `epoll_pwait`,
@@ -636,8 +647,34 @@ export @nosplit fn pollDisablePwait2() {
   )
 }
 
+// `pollDrainOne`/`pollDrain`'s answer, given how many tasks the drain unparked
+// and whether it also consumed worker 0's wake. Two independent facts, one
+// return value: a positive count wins, because it already sends the caller down
+// the find-work path, and `pollDrainWakeOnly` (../../sched/sleep.bit) carries
+// the rest — "no task, but something asked you to look again".
+@nosplit fn pollDrainAnswer(woken: int, sawWake: bool): int {
+  if (woken > 0) {
+    return woken
+  }
+  if (sawWake) {
+    return pollDrainWakeOnly
+  }
+  return 0
+}
+
+// The TASK-COUNT half of a `pollDrainOne` answer, so `pollDrain` can add the
+// read and write descriptors' counts without `pollDrainWakeOnly` being added to
+// one of them. The wake half is recovered by comparing against the sentinel.
+@nosplit fn pollDrainTasks(answer: int): int {
+  if (answer < 0) {
+    return 0
+  }
+  return answer
+}
+
 // Drain one epoll descriptor and unpark the task behind each ready event.
-// Returns how many tasks it woke. A non-positive descriptor is "not bound" and
+// Returns how many tasks it woke, or `pollDrainWakeOnly` when the only thing it
+// drained was the wake eventfd. A non-positive descriptor is "not bound" and
 // drains nothing.
 //
 // Split out of `pollDrain` so the read and write descriptors share this body
@@ -650,6 +687,7 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
   }
   let rc = pollWaitEvents(pollFd, timeoutNs)
   let woken = 0
+  let sawWake = false
   if (rc > 0) {
     // Bounded by the batch, not by the kernel's answer, so a bogus oversized
     // `rc` cannot walk off the buffer (Power of 10).
@@ -683,10 +721,18 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
           woken = woken + 1
         }
       } else {
+        // The wake eventfd. Draining the counter is only half the job: the
+        // caller asked "is there anything to do", and a wake IS something to
+        // do — it is a producer saying it published work or a deadline after
+        // this caller's own find-work pass had already looked. Reporting 0
+        // here hands the caller a drained counter and a claimed `scPollWait`
+        // and then tells it to sleep, which is the wake dropped AFTER being
+        // delivered; `sawWake` is what stops that.
         pollDrainWakeEvent(pollFd)
+        sawWake = true
       }
       i = i + 1
     }
   }
-  return woken
+  return pollDrainAnswer(woken, sawWake)
 }

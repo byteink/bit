@@ -3,7 +3,7 @@
 // lacked: a producer can interrupt a BLOCKING drain instead of that drain
 // only ever being safe to call with a 0 timeout.
 //
-// TWO CALLS, ONE KQUEUE, DELIBERATELY SINGLE-THREADED. A cross-thread
+// THREE CALLS, ONE KQUEUE, DELIBERATELY SINGLE-THREADED. A cross-thread
 // producer would prove the same thing with a race on the assertion's timing
 // budget instead of the mechanism; this program proves the mechanism itself
 // by relying on EVFILT_USER's documented level-ish persistence (see
@@ -21,8 +21,14 @@
 //     fire, this call must still observe it and return almost immediately —
 //     proving the wake survived being triggered before anyone was waiting,
 //     the exact interleaving a lost-wakeup bug would drop.
+//   - call 3: one armed read registration, `pollWake` triggered, and a
+//     NON-BLOCKING `pollDrain(s, 0)` — the call
+//     ../../../runtime/root/darwin/bootworker.bit makes once per idle turn
+//     before deciding whether to sleep. It must report the wake rather than
+//     0; see its own comment in `main` for why 0 there is a hang and not a
+//     delay, and why the registration is load-bearing.
 //
-// Both calls use the SAME sub-millisecond timeout, so call 2's early return
+// Calls 1 and 2 use the SAME sub-millisecond timeout, so call 2's early return
 // against call 1's full block is the whole discriminator — no clock
 // comparison against a value invented separately from what was asked for.
 //
@@ -31,9 +37,13 @@
 // function` (SPEC §11.7) — rejected on Linux even for an uncalled
 // declaration.
 
-import { schedInit, schedSetPollFd, taskAt } from "../../../runtime/sched"
+import { schedInit, schedSetPollFd, taskAt, pollRead } from "../../../runtime/sched"
 import { pollCreate, pollClose, pollWake, pollDrain } from "../../../runtime/sched/darwin"
+import { pollRegister } from "../../../runtime/sched/darwin"
 import { parkMonoNs } from "../../../runtime/park/darwin"
+
+// int pipe(int fds[2]). Only C-representable types cross the boundary (§11.7).
+extern fn pipe(fds: *u8): i32
 
 const pollWorkers: int = 1
 
@@ -51,6 +61,19 @@ const wokenCeilingNs: int = 200000
 
 let schedBlock: [16]i64
 let workerBlocks: [292]i64
+
+// `int fds[2]` is TWO PACKED 32-BIT FIELDS IN ONE 8-BYTE WORD, so this is an
+// `[1]i64` read through a byte cursor rather than the `[2]i32` it looks like —
+// a Bit array stores one 8-byte word per element (§11.8). ../schedpolldarwin
+// documents the SIGSEGV the obvious spelling produces.
+let pipeFds: [1]i64
+
+// The address call 3's registration carries in its `udata`. NEVER DISPATCHED:
+// the pipe is registered and then never written, so the kernel can never report
+// that filter and `schedPollUnpark` is never handed this address. It exists
+// only to be non-zero, since `pollArmWake` claimed `udata` 0 as the wake's
+// sentinel and a real registration must not collide with it.
+let standinTask: [1]i64
 
 fn schedAddr(): int {
   return int(ptrOf(schedBlock))
@@ -74,6 +97,28 @@ fn main() {
   let n2 = pollDrain(schedAddr(), timeoutNs)
   let elapsed2 = parkMonoNs() - t1
 
+  // CALL 3 — THE DROPPED WAKE. Calls 1 and 2 ask whether a wake ENDS a
+  // blocking drain; this asks what a NON-BLOCKING drain REPORTS when the wake
+  // is the only thing it finds. Reporting 0 is a hang and not a delay: the
+  // producer that fired this wake also claimed worker 0's `scPollWait`, so a
+  // worker told "nothing happened" here enters its bounded wait with the
+  // trigger already consumed AND the claim already spent, and nothing can end
+  // that wait before the 1s ceiling.
+  //
+  // THE ARMED REGISTRATION IS LOAD-BEARING, NOT SCENERY. With nothing armed,
+  // `pollDrainSkippable` answers `timeoutNs == 0` without entering the kernel,
+  // which leaves the trigger in the kqueue for the next call to find — the
+  // defect cannot appear at all. One registered pipe, never written so it never
+  // produces an event of its own, is what puts `schedPollPendingCount()` above
+  // zero and forces the real `kevent`.
+  pipeFds[0] = 0
+  let zb: *u8 = nil
+  let piped = int(pipe(zb + int(ptrOf(pipeFds)))) == 0
+  let readFd = int(pipeFds[0]) % 4294967296
+  let armed = pollRegister(pfd, readFd, pollRead, int(ptrOf(standinTask)))
+  let woke3 = pollWake(pfd)
+  let n3 = pollDrain(schedAddr(), 0)
+
   pollClose(pfd)
 
   let blocked = elapsed1 >= blockedFloorNs
@@ -82,4 +127,5 @@ fn main() {
   println("poller ${created}")
   println("blocked ${blocked} n1 ${n1}")
   println("woke ${woke} observed ${observed} n2 ${n2}")
+  println("piped ${piped} armed ${armed} woke3 ${woke3} n3 ${n3}")
 }
