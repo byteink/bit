@@ -2069,6 +2069,18 @@ calls `boot`, and exits the process with `boot`'s returned code.
    default (unset `BIT_WORKERS`) is unaffected and still grows to
    `schedMaxWorkers` exactly as described above.
 
+   **The width the implicit default actually reaches is not 4, and a
+   default-versus-pinned reading is therefore a WIDTH reading** (#5729,
+   measured on 52703111c, darwin arm64, 18 usable cores, under the
+   workspace build lock with the fleet drained). On a timer-only workload
+   — eight green tasks, each sleeping 200us five thousand times — the
+   unset default settles at **ten workers** (twelve OS threads: boot, ten
+   workers, sysmon) inside the first second and does not move again. So an
+   unset `BIT_WORKERS` against `BIT_WORKERS=4` compares ten workers with
+   four; it does not compare grow-on-demand against a steady pool. Derive
+   the width before attributing any such difference to the growth
+   machinery.
+
    This was pinned to **exactly one** until multi-worker support landed. It was never a *collector*
    requirement — §5's handshake makes concurrent mutators safe, and each worker
    registers as a mutator for the life of its run loop — only a
