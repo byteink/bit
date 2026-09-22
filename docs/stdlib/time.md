@@ -1186,6 +1186,97 @@ a daylight saving transition even though 25 hours of real time elapsed. Subtract
 two `Timestamp` values when real elapsed time is what matters. These two answers
 differing is correct, not a bug.
 
+### `Date.differenceInDays(other: Date): int`
+
+Complete calendar days from `this` to `other`, negative when `other` is
+earlier. Exact: a `Date` has no time of day, so nothing is truncated away.
+
+### `Date.differenceInWeeks(other: Date): int`
+
+`differenceInDays` divided by 7, truncated toward zero: six days is 0, eight
+days is 1.
+
+### `Date.differenceInMonths(other: Date): int`
+
+Complete months from `this` to `other` (the `addMonths` anniversary rule
+above): 2026-01-31 to 2026-02-28 is 1.
+
+### `Date.differenceInYears(other: Date): int`
+
+`differenceInMonths` divided by 12.
+
+### `NaiveDateTime.differenceInSeconds(other: NaiveDateTime): int`
+
+Complete seconds from `this` to `other`, truncated toward zero. Nanoseconds
+count toward completeness but are never reported here: a gap of 1.9 seconds
+is 1.
+
+### `NaiveDateTime.differenceInMinutes(other: NaiveDateTime): int`
+
+### `NaiveDateTime.differenceInHours(other: NaiveDateTime): int`
+
+`differenceInSeconds` divided by 60 or 3600.
+
+### `NaiveDateTime.differenceInDays(other: NaiveDateTime): int`
+
+Complete days from `this` to `other`. A wall-clock day here is exactly 24
+hours, so 2026-09-17T09:00 to 2026-09-18T08:59 is 0 days, not 1.
+
+### `NaiveDateTime.differenceInWeeks(other: NaiveDateTime): int`
+
+### `NaiveDateTime.differenceInMonths(other: NaiveDateTime): int`
+
+Complete months, time of day included: the anniversary must have been
+reached, so 2026-01-31T09:00 to 2026-02-28T08:00 is 0 months and
+2026-02-28T09:00 is 1.
+
+### `NaiveDateTime.differenceInYears(other: NaiveDateTime): int`
+
+`differenceInMonths` divided by 12.
+
+### `DateTime.differenceInSeconds(other: DateTime): int`
+
+Complete seconds of **real elapsed time** from `this` to `other` - the
+instant difference, so it agrees with `compare` and with subtracting the two
+`Timestamp` values: 90000 across a fall-back day, not 86400.
+
+### `DateTime.differenceInMinutes(other: DateTime): int`
+
+### `DateTime.differenceInHours(other: DateTime): int`
+
+Real elapsed time, from `differenceInSeconds`: 25 across a fall-back day, 23
+across a spring-forward day.
+
+### `DateTime.differenceInDays(other: DateTime): int`
+
+Complete **calendar** days from `this` to `other`, read on the wall clock: 1
+across a daylight saving transition even though 25 hours of real time
+elapsed. Cross-zone callers convert one side with `withZone` first - this
+reads each side's own wall clock.
+
+### `DateTime.differenceInWeeks(other: DateTime): int`
+
+### `DateTime.differenceInMonths(other: DateTime): int`
+
+### `DateTime.differenceInYears(other: DateTime): int`
+
+Complete calendar weeks, months or years from `this` to `other`, on the wall
+clock.
+
+### `Timestamp.differenceInNanoseconds(other: Timestamp): int`
+
+Nanoseconds of real elapsed time from `this` to `other`, exact and negative
+when `other` is earlier.
+
+### `Timestamp.differenceInSeconds(other: Timestamp): int`
+
+### `Timestamp.differenceInMinutes(other: Timestamp): int`
+
+### `Timestamp.differenceInHours(other: Timestamp): int`
+
+`differenceInNanoseconds` divided down to whole seconds, minutes or hours,
+truncated toward zero.
+
 ```bit
 import { Date } from "std/time"
 
