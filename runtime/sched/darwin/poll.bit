@@ -79,6 +79,36 @@ extern fn bit_rt_fs_close(fd: i64): i64
 // "stop watching this fd".
 @nosplit fn evDelete(): int { return 2 }
 
+// EVFILT_USER (-10), from <sys/event.h> — the real wake source this file was
+// missing (#5717, epic #3913): a producer-triggered event this kqueue can
+// block on, so `pollDrain`'s timeout can be the whole idle budget instead of
+// the 1ms recheck floor `parkMaxBackoffNs` otherwise pins it to.
+//
+// NOT a file descriptor: EVFILT_USER's `ident` is a namespace private to the
+// filter, chosen by the caller and scoped per (kq, filter) pair (XNU keys a
+// knote by the pair, not by `ident` alone), so `wakeIdent` below can never
+// collide with a real fd's EVFILT_READ/EVFILT_WRITE registration on the same
+// kqueue.
+@nosplit fn evfiltUser(): int { return 0 - 10 }
+
+// EV_ADD (0x0001) | EV_CLEAR (0x0020), from <sys/event.h>. `pollArmWake`
+// below registers the wake filter with these ONCE, not EV_ONESHOT: EV_CLEAR
+// is what makes `NOTE_TRIGGER` level-ish rather than a signal that is lost
+// when nobody is listening — see `pollWake`'s header for the argument this
+// buys.
+@nosplit fn evAddClear(): int { return 33 }
+
+// NOTE_TRIGGER (0x01000000), from <sys/event.h> — the only fflag EVFILT_USER
+// understands for "fire this filter now". Written as `writeU32`'s `fflags`
+// argument, never OR'd with anything else here: this file uses no other
+// EVFILT_USER fflag.
+const noteTrigger: int = 16777216
+
+// The `ident` `pollArmWake`/`pollWake` always use. Arbitrary — see
+// `evfiltUser`'s comment for why any value is safe — one kqueue needs only
+// one wake filter, so one fixed ident is all this file ever registers.
+const wakeIdent: int = 1
+
 // `kevent` (a C structure) on macOS, from <sys/event.h> — which pins every one of these with
 // a comptime `@offsetOf` assertion because `sys/types.h` applies `#pragma
 // pack(4)` and the layout is therefore NOT what natural alignment would give:
@@ -199,7 +229,79 @@ export @symbol("bit_rt_port_sched_poll_create") @nosplit fn pollCreate(): int {
   if (rc <= 0) {
     return 0 - 1
   }
+  // ARMED BEFORE THIS RETURNS, AND THAT ORDERING IS PART OF THE CORRECTNESS
+  // ARGUMENT. `rc` is not published anywhere a producer can reach — nothing
+  // outside this call has seen it yet, `schedSetPollFd` is always the
+  // caller's very next step (`runtime/root/<os>/boot.bit`) — so no
+  // `pollWake` can possibly run against this descriptor before the wake
+  // filter exists on it. A registration failure closes the kqueue rather
+  // than handing back a descriptor whose wake side silently does nothing.
+  if (!pollArmWake(rc)) {
+    let _ = int(bit_rt_fs_close(i64(rc)))
+    return 0 - 1
+  }
   return rc
+}
+
+// Register the EVFILT_USER wake filter `pollWake` triggers. Called exactly
+// once per descriptor, from `pollCreate` only — see its header for why the
+// ordering there matters. `EV_ADD | EV_CLEAR`, not `EV_ONESHOT`: this
+// registration must survive being triggered, since `pollWake` may fire many
+// times over the descriptor's life.
+@nosplit fn pollArmWake(pollFd: int): bool {
+  let base = pollScratchBytes()
+  writeU64(base, kqIdentOff, wakeIdent)
+  writeI16(base, kqFilterOff, evfiltUser())
+  writeI16(base, kqFlagsOff, evAddClear())
+  writeU32(base, kqFflagsOff, 0)
+  writeU64(base, kqDataOff, 0)
+  writeU64(base, kqUdataOff, 0)
+  let none: *u8 = nil
+  return int(kevent(i32(pollFd), base, i32(1), none, i32(0), none)) >= 0
+}
+
+// Trigger the wake filter `pollArmWake` armed — the producer side of this
+// ticket's primitive, the same role `bit_rt_port_park_wake` plays for a
+// parked worker's word, aimed at the poller's kqueue instead.
+//
+// THE LOST-WAKEUP ARGUMENT. A producer's sequence is "publish work, then call
+// this"; a consumer blocked in `pollDrain` is "check for work, then block in
+// `kevent`". `NOTE_TRIGGER` is LEVEL-ish, not edge-ish, in the one way that
+// matters here: firing it sets the knote's state IN THE KERNEL, independent
+// of whether anything is blocked in `kevent` at that instant, and `EV_CLEAR`
+// (armed once, not `EV_ONESHOT`) means that state persists until a `kevent`
+// call actually retrieves it — it is not consumed by merely being set, the
+// way a condition-variable signal with no waiter is. So every interleaving
+// of "trigger" against "block" is safe:
+//
+//   - trigger lands before the consumer's `kevent` call starts: the knote is
+//     already active, so `kevent` sees it ready on entry and returns without
+//     ever sleeping — this is what makes a sub-millisecond `pollDrain`
+//     timeout safe to combine with a trigger that already happened.
+//   - trigger lands while the consumer is asleep inside `kevent`: the kernel
+//     wakes the blocked call directly — the ordinary case this filter exists
+//     for.
+//   - trigger lands after the consumer's `kevent` call already returned (a
+//     stale or spurious trigger): the state persists for the NEXT call, so
+//     nothing is lost, only deferred by at most one drain.
+//
+// The one property this relies on and does not itself provide is memory
+// visibility of "publish work" before "call this" — ordinary release
+// ordering on whatever queue the producer pushed to, the same requirement
+// every `bit_rt_port_park_wake` caller already meets.
+export @symbol("bit_rt_port_sched_poll_wake") @nosplit fn pollWake(pollFd: int): bool {
+  if (pollFd <= 0) {
+    return false
+  }
+  let base = pollScratchBytes()
+  writeU64(base, kqIdentOff, wakeIdent)
+  writeI16(base, kqFilterOff, evfiltUser())
+  writeI16(base, kqFlagsOff, 0)
+  writeU32(base, kqFflagsOff, noteTrigger)
+  writeU64(base, kqDataOff, 0)
+  writeU64(base, kqUdataOff, 0)
+  let none: *u8 = nil
+  return int(kevent(i32(pollFd), base, i32(1), none, i32(0), none)) >= 0
 }
 
 // Close it. A non-positive descriptor is "never created" and closing it would
@@ -341,16 +443,19 @@ export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
 // True when this drain can answer without entering the kernel — either there
 // is no poller at all, or nothing is armed on it.
 //
-// NOTHING ARMED => NOTHING CAN BE READY (#3736). Every registration this
-// poller has is EV_ONESHOT and is counted by `schedPollPendingInc` on the
-// success path of `pollRegister` — the only path that arms one — and
-// decremented only when the kernel reports its one edge. So a zero count
-// means the kqueue holds no armed filter, and a `kevent` against it can only
-// return 0 events. Skipping the syscall is therefore not an approximation; it
-// returns what the call was going to return.
+// NOTHING ARMED => NOTHING CAN BE READY FOR A NON-BLOCKING CALL (#3736,
+// narrowed by #5717). `schedPollPendingCount` counts only the EV_ONESHOT
+// read/write registrations `pollRegister`/`pollUnregister` own — it does NOT
+// count the permanent EVFILT_USER wake filter `pollCreate` arms, which is
+// deliberate: a zero count still means no READ/WRITE event can be ready, and
+// for `timeoutNs == 0` that is the whole question, since a non-blocking call
+// has nothing to gain from the wake filter either way — it only matters to a
+// call that would otherwise SLEEP, which this skip path never reaches
+// (`timeoutNs == 0` is exactly excluded below). Skipping the syscall here is
+// therefore still exact, not an approximation, for the case it covers.
 //
 // ONLY FOR THE NON-BLOCKING DRAIN, and that condition is load-bearing rather
-// than caution. A caller passing a positive `timeoutMs` is asking to WAIT,
+// than caution. A caller passing a positive `timeoutNs` is asking to WAIT,
 // not merely to collect — `runtime/net/windows/tcp.bit`'s deadline threads
 // drive `pollDrain(schedAddr, netDeadlinePollMs)` in a bounded loop and depend
 // on it blocking. Returning 0 immediately there would convert a bounded park
@@ -375,28 +480,36 @@ export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
 // SEPARATE FUNCTION rather than two `if`s inline because `pollDrain` was
 // already at E0204's complexity ceiling of 10; folding both early exits in
 // here keeps it there instead of buying the check with a lint suppression.
-@nosplit fn pollDrainSkippable(pollFd: int, timeoutMs: int): bool {
+@nosplit fn pollDrainSkippable(pollFd: int, timeoutNs: int): bool {
   if (pollFd == 0) {
     return true
   }
-  return timeoutMs == 0 && schedPollPendingCount() == 0
+  return timeoutNs == 0 && schedPollPendingCount() == 0
 }
 
 // Drain ready events and unpark the waiting task for each. Returns how many
 // were woken. `runtime/sched/`'s `pollReady`.
 //
-// THE RUN LOOP CALLS THIS WITH `timeoutMs` 0 — a non-blocking drain, which is
-// what `runtime/sched/` passes too. That is what keeps the poller compatible with
-// stop-the-world: a worker never blocks inside `kevent`, so it is never sitting
-// in a syscall where it is neither `running` nor `parked` and cannot answer the
-// collector's rendezvous.
+// NANOSECOND RESOLUTION (#5717), not milliseconds: a sub-millisecond deadline
+// used to truncate to 0, which `pollDrainSkippable` reads as the non-blocking
+// form — hot-spinning a caller that asked to wait a few hundred microseconds
+// rather than blocking it. `secs`/`nsecs` below decompose `timeoutNs`
+// directly; nothing upstream of this function scales units anymore.
+//
+// THE RUN LOOP CALLS THIS WITH `timeoutNs` 0 TODAY — a non-blocking drain,
+// which is what `runtime/sched/` passes too. That is what keeps the poller
+// compatible with stop-the-world: a worker never blocks inside `kevent`, so
+// it is never sitting in a syscall where it is neither `running` nor
+// `parked` and cannot answer the collector's rendezvous. A caller wiring in
+// a genuinely blocking `timeoutNs` (the dependent ticket this one unblocks)
+// takes on that obligation — nothing here relaxes it.
 export @symbol("bit_rt_port_sched_poll_drain") @nosplit fn pollDrain(
   schedAddr: int,
-  timeoutMs: int,
+  timeoutNs: int,
 ): int {
   let s = taskAt(schedAddr)
   let pollFd = *(s + scPollFd)
-  if (pollDrainSkippable(pollFd, timeoutMs)) {
+  if (pollDrainSkippable(pollFd, timeoutNs)) {
     return 0
   }
   if (!schedPollTryEnter(s)) {
@@ -404,11 +517,11 @@ export @symbol("bit_rt_port_sched_poll_drain") @nosplit fn pollDrain(
   }
 
   let ts = tsBytes()
-  let secs = timeoutMs / 1000
+  let secs = timeoutNs / 1000000000
   if (secs < 0) {
     secs = 0
   }
-  let nsecs = timeoutMs % 1000 * 1000000
+  let nsecs = timeoutNs % 1000000000
   if (nsecs < 0) {
     nsecs = 0
   }
