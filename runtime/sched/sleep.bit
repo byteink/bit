@@ -125,6 +125,18 @@ extern fn bit_rt_port_park_wake(p: *i32, all: bool): i64
 // `parkWait` for why it is unused there.
 extern fn bit_rt_port_park_wait(p: *i32, expected: i32, timeoutNs: i64, scratch: *i64): i64
 
+// `bit_rt_port_sched_poll_wake` (`runtime/sched/<os>`, #5717/#5718) — worker
+// 0's wake, the counterpart of `bit_rt_port_park_wake` above for the one
+// worker that sleeps in the poller instead of on a futex word. Declared
+// `extern` for exactly the reason that one is: this module may import no
+// platform provider, and an `extern` is the only call a `@nosplit` body may
+// make into one (E0075, #1640). E0078 validates the name against `libbitrt.a`
+// here, so every provider owes a definition — the Windows provider's is a
+// deliberate `false` (`./windows/poll.bit`): its worker 0 waits in
+// `parkSleepNs`, never in `pollDrain`, so `schedPollerArm` is never called
+// there and this extern is unreachable on that target.
+extern fn bit_rt_port_sched_poll_wake(pollFd: int): bool
+
 // The longest a parked worker sleeps without being woken. A pure safety net —
 // see the header: worker 0 never parks, so nothing depends on this firing.
 //
@@ -292,6 +304,94 @@ export @nosplit @symbol("bit_rt_port_sched_idle_park") fn schedIdlePark(s: *i64,
   atomicSub(s + scIdleCount, 1)
 }
 
+// ---------------------------------------------------------------------------
+// Worker 0's arm, and the wake that was missing (#5744)
+// ---------------------------------------------------------------------------
+//
+// #5722 moved worker 0 off a 1ms backoff ramp and into ONE bounded wait inside
+// `pollDrain`, bounded by the next known deadline or by a 1s ceiling when none
+// is armed. It shipped with no producer for that wake, so two of the three
+// transitions it enumerates — a NEWER, EARLIER DEADLINE armed after worker 0
+// read the old one, and WORK PUBLISHED to the global queue or a spawn — reached
+// worker 0 only when the ceiling expired. Measured on 52703111c: eight tasks
+// each sleeping 200us achieved 21,830,301 ns per sleep with `BIT_WORKERS`
+// unset, because the work was in fact arriving on some parked PEER's
+// `idleParkMaxNs` timeout, at a rate proportional to the number of parked peers.
+//
+// The arm below is `wkPark`'s discipline, unchanged, applied to worker 0's
+// different sleeping place, so the interleaving argument in this file's header
+// covers it verbatim. Stated once more against this cell because getting it
+// backwards reinstates the same stall with a smaller window:
+//
+//   - WORKER 0 ARMS BEFORE ITS FIND-WORK PASS (`runtime/root/darwin/
+//     bootworker.bit`, top of the turn, where workers 1..N-1 call
+//     `schedIdleArm`), never between the failed pass and the wait. A producer
+//     that publishes after the arm therefore cannot read 0.
+//   - THE PRODUCER PUBLISHES BEFORE IT READS THIS CELL. So a producer that does
+//     read 0 published BEFORE worker 0's arm, and worker 0's own next find-work
+//     pass — which comes after that arm — sees the work with no wake at all.
+//   - A CLAIM THAT LANDS BEFORE WORKER 0 IS ACTUALLY INSIDE `kevent` IS NOT
+//     LOST. `pollWake` is `NOTE_TRIGGER` on an `EV_CLEAR` (not `EV_ONESHOT`)
+//     EVFILT_USER filter: the trigger sets kernel state that persists until a
+//     `kevent` call retrieves it, so the wait returns immediately on entry
+//     instead of sleeping through it. That is the property `wkPark`'s
+//     `parkWait` gets from comparing the word under its own lock; see
+//     `../darwin/poll.bit`'s `pollWake` header for the full three-interleaving
+//     argument.
+//
+// `atomicStore` and `atomicCmpxchg` are sequentially consistent (SPEC §"atomic
+// primitives"), which is what orders the producer's publish-then-read against
+// worker 0's arm-then-scan. `atomicStoreRelease` would NOT do here: it does not
+// order the store against a later load on the storing thread, and both sides of
+// this handshake are exactly a store followed by a load of the other's cell.
+
+// Worker 0 is about to look for work and will wait in the poller if it finds
+// none. MUST be called before its find-work pass, for `schedIdleArm`'s reason.
+export @nosplit @symbol("bit_rt_port_sched_poller_arm") fn schedPollerArm(s: *i64) {
+  atomicStore(s + scPollWait, 1)
+}
+
+// Worker 0 is awake: it found work, or its wait has ended. Cleared
+// unconditionally, whichever way the wait ended, exactly as `schedIdlePark`
+// clears `wkPark` on every exit path.
+export @nosplit @symbol("bit_rt_port_sched_poller_disarm") fn schedPollerDisarm(s: *i64) {
+  atomicStore(s + scPollWait, 0)
+}
+
+// Claim worker 0 and trigger the poller it is waiting in. A no-op when it is
+// not waiting, which is what keeps this off the hot path: at `BIT_WORKERS=1`
+// the only worker is the one running the producer, so the cell reads 0 and this
+// costs one shared-state load and a branch, never a syscall.
+//
+// THE PLAIN LOAD BEFORE THE CAS IS NOT REDUNDANT. A compare-and-exchange takes
+// the line exclusively even when it fails, and this cell shares a scheduler
+// block with `scIdleCount` and `scGlobal` that every worker reads; the load
+// keeps the overwhelmingly common "nobody is waiting" answer read-only. Same
+// reason `schedWakeIdle` below guards its scan with `scIdleCount`.
+//
+// THE CLAIM IS WHAT BOUNDS THE SYSCALL COUNT. Eight tasks arming eight timers
+// into one idle stretch issue ONE `kevent`, not eight: the first producer wins
+// the exchange and the rest read 0. They lose nothing by it — each published
+// its own work before reading this cell, and worker 0 re-arms and sweeps after
+// the wait, so that sweep is strictly later than every one of those publishes.
+//
+// `scPollFd` IS READ FIRST so a claim is never spent on a scheduler with no
+// poller bound: there the wake has nowhere to go, and worker 0 is not waiting
+// in `pollDrain` anyway (its `pollFd == 0` guard returns at once).
+@nosplit fn schedWakePoller(s: *i64) {
+  let fd = *(s + scPollFd)
+  if (fd <= 0) {
+    return
+  }
+  if (atomicLoad(s + scPollWait) == 0) {
+    return
+  }
+  if (!atomicCmpxchg(s + scPollWait, 1, 0)) {
+    return
+  }
+  let _ = bit_rt_port_sched_poll_wake(fd)
+}
+
 // Work is now reachable by another worker: wake exactly one parked worker.
 //
 // Call sites are the transitions that PUBLISH work others can reach — a spill to
@@ -305,9 +405,13 @@ export @nosplit @symbol("bit_rt_port_sched_idle_park") fn schedIdlePark(s: *i64,
 // loop's bound is provable from this body (Power of 10). Claiming with a
 // compare-and-exchange is what keeps two producers from spending two wakes on the
 // same worker.
-export @nosplit @symbol("bit_rt_port_sched_wake_idle") fn schedWakeIdle(s: *i64) {
+// The parked-peer half, split out of `schedWakeIdle` (#5744) so that function
+// reads as the two-place choice it now is. True when one peer was claimed and
+// woken — the caller then owes worker 0 nothing, because the worker that will
+// run the work is already on its way.
+@nosplit fn schedWakeParkedPeer(s: *i64): bool {
   if (atomicLoad(s + scIdleCount) <= 0) {
-    return
+    return false
   }
   let n = atomicLoad(s + scNWorkers)
   let i = 0
@@ -315,10 +419,21 @@ export @nosplit @symbol("bit_rt_port_sched_wake_idle") fn schedWakeIdle(s: *i64)
     let p = workerParkAddr(schedWorkerAt(s, i))
     if (atomicCmpxchg(p, 1, 0)) {
       let _ = bit_rt_port_park_wake(p, false)
-      return
+      return true
     }
     i = i + 1
   }
+  return false
+}
+
+export @nosplit @symbol("bit_rt_port_sched_wake_idle") fn schedWakeIdle(s: *i64) {
+  if (schedWakeParkedPeer(s)) {
+    return
+  }
+  // No peer was parked to take it. Worker 0 may be waiting in the poller, and
+  // until #5744 nothing could reach it there — `schedWakeParkedPeer`'s scan
+  // skips worker 0 by construction, since worker 0 never arms `wkPark`.
+  schedWakePoller(s)
 }
 
 // Shutdown's wake, and the one caller that genuinely wants the whole pool: every
