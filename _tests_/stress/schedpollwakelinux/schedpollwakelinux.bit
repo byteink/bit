@@ -5,7 +5,7 @@
 // ../schedpollwakedarwin for exactly that reason — a divergence between the
 // two means a real platform difference rather than a spelling one.
 //
-// TWO CALLS, ONE EPOLL SET, DELIBERATELY SINGLE-THREADED. A cross-thread
+// THREE CALLS, ONE EPOLL SET, DELIBERATELY SINGLE-THREADED. A cross-thread
 // producer would prove the same thing with a race on the assertion's timing
 // budget instead of the mechanism; this program proves the mechanism itself
 // by relying on the eventfd counter's documented persistence (see
@@ -22,6 +22,12 @@
 //     still observe it and return almost immediately — proving the wake
 //     survived being triggered before anyone was waiting, the exact
 //     interleaving a lost-wakeup bug would drop.
+//   - call 3: one armed read registration, `pollWake` triggered, and a
+//     NON-BLOCKING `pollDrain(s, 0)` — the call
+//     ../../../runtime/root/linux/bootworker.bit makes once per idle turn
+//     before deciding whether to sleep. It must report the wake rather than
+//     0; see its own comment in `main` for why 0 there is a hang and not a
+//     delay, and why the registration is load-bearing.
 //
 // THE TIMEOUT IS DELIBERATELY SUB-MILLISECOND (400us) — the value that would
 // have truncated to a non-blocking 0ms drain under the old millisecond-only
@@ -39,9 +45,26 @@
 // runtime/sched/linux, which reaches the kernel through `syscall` (SPEC
 // §11.8) — rejected on Darwin even for an uncalled declaration.
 
-import { schedInit, schedSetPollFd, taskAt } from "../../../runtime/sched"
+import { schedInit, schedSetPollFd, taskAt, pollRead } from "../../../runtime/sched"
 import { pollCreate, pollClose, pollWake, pollDrain } from "../../../runtime/sched/linux"
+import { pollRegister } from "../../../runtime/sched/linux"
 import { parkMonoNs } from "../../../runtime/park/linux"
+
+// pipe2(2) as a raw syscall (§11.8) — the ELF output is fully static with no
+// libc, so the Darwin twin's `extern` declaration has no counterpart here.
+// Numbers read out of the pinned reference toolchain's std/os/linux/syscalls,
+// never from memory; `hostTarget()` is 0 for x86_64-linux and 1 for
+// aarch64-linux, and this program is only ever built for a Linux target.
+//
+// pipe2 rather than pipe: aarch64 has NO `pipe` syscall at all, only `pipe2`
+// — the same shape of trap as `epoll_wait`'s absence there. Flags 0 makes it
+// plain `pipe(2)`. Identical to ../schedpolllinux's own `nrPipe2`.
+fn nrPipe2(): int {
+  if (hostTarget() == 0) {
+    return 293
+  }
+  return 59
+}
 
 const pollWorkers: int = 1
 
@@ -61,6 +84,19 @@ const wokenCeilingNs: int = 150000
 let schedBlock: [16]i64
 let workerBlocks: [292]i64
 let monoScratch: [2]i64
+
+// `int fds[2]` is TWO PACKED 32-BIT FIELDS IN ONE 8-BYTE WORD, so this is an
+// `[1]i64` read through a byte cursor rather than the `[2]i32` it looks like —
+// a Bit array stores one 8-byte word per element (§11.8). ../schedpolllinux
+// documents the SIGSEGV the obvious spelling produces.
+let pipeFds: [1]i64
+
+// The address call 3's registration carries in its epoll `data` word. NEVER
+// DISPATCHED: the pipe is registered and then never written, so the kernel can
+// never report it and `schedPollUnpark` is never handed this address. It exists
+// only to be non-zero, since `pollArmWake` claimed `data` 0 as the wake
+// eventfd's sentinel and a real registration must not collide with it.
+let standinTask: [1]i64
 
 fn schedAddr(): int {
   return int(ptrOf(schedBlock))
@@ -88,6 +124,27 @@ fn main() {
   let n2 = pollDrain(schedAddr(), timeoutNs)
   let elapsed2 = nowNs() - t1
 
+  // CALL 3 — THE DROPPED WAKE. Calls 1 and 2 ask whether a wake ENDS a
+  // blocking drain; this asks what a NON-BLOCKING drain REPORTS when the wake
+  // is the only thing it finds. Reporting 0 is a hang and not a delay: the
+  // producer that fired this wake also claimed worker 0's `scPollWait`, so a
+  // worker told "nothing happened" here enters its bounded wait with the
+  // eventfd counter already drained AND the claim already spent, and nothing
+  // can end that wait before the 1s ceiling.
+  //
+  // THE ARMED REGISTRATION IS LOAD-BEARING, NOT SCENERY. With nothing armed,
+  // `pollDrainSkippable` answers `timeoutNs == 0` without entering the kernel,
+  // which leaves the counter for the next call to find — the defect cannot
+  // appear at all. One registered pipe, never written so it never produces an
+  // event of its own, is what puts `schedPollPendingCount()` above zero and
+  // forces the real `epoll_pwait2`.
+  pipeFds[0] = 0
+  let piped = int(syscall(nrPipe2(), i64(int(ptrOf(pipeFds))), 0)) == 0
+  let readFd = int(pipeFds[0]) % 4294967296
+  let armed = pollRegister(pfd, readFd, pollRead, int(ptrOf(standinTask)))
+  let woke3 = pollWake(pfd)
+  let n3 = pollDrain(schedAddr(), 0)
+
   pollClose(pfd)
 
   let blocked = elapsed1 >= blockedFloorNs
@@ -96,4 +153,5 @@ fn main() {
   println("poller ${created}")
   println("blocked ${blocked} n1 ${n1}")
   println("woke ${woke} observed ${observed} n2 ${n2}")
+  println("piped ${piped} armed ${armed} woke3 ${woke3} n3 ${n3}")
 }
