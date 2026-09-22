@@ -311,7 +311,7 @@ fn buildBenchCase(
 // that ran and produced a bad result; that split is validateRep()'s job.
 //
 // #4702: the run script used to be chmod'd and handed to `osRunBounded`
-// itself, so all 66 children one gate run starts (13 cases x reps, plus the
+// itself, so all 70 children one gate run starts (14 cases x reps, plus the
 // builds and the flip leg) were the first exec of a brand-new file and paid
 // macOS's system-wide provenance validation once each. Nothing about what is
 // MEASURED moved: `measureScript`'s body is unchanged and still `exec`s the
@@ -409,10 +409,11 @@ fn validateRep(resText: string, outText: string, b: Baseline): RepCheck {
 // see runCase()'s reps loop for how `gapAtMin` is chosen.
 class CaseMetrics { minCpu: int, minRss: int, minObj: int, gapAtMin: int }
 
-// Prints the unconditional per-case summary line (#2931) and runs the four
-// CPU/RSS/object-count checks against `b`'s ceilings and floor, marking `t`
-// for each one that trips. Pure reporting/comparison — no filesystem, no
-// subprocess. Extracted from runCase() (#3542).
+// Prints the unconditional per-case summary line (#2931) and runs the
+// RSS/object-count checks against `b`'s ceilings and floor, marking `t` for
+// each one that trips; the CPU arm is checkCpu() below. Pure
+// reporting/comparison — no filesystem, no subprocess. Extracted from
+// runCase() (#3542).
 // #5196: `gap` is the wall-clock time this rep's process spent off a core
 // (real minus total CPU, from the SAME `/usr/bin/time -l` reading or Linux
 // timestamp pair — see benchrun.bit's DESCHEDULE DETECTION note), `-1` when
@@ -430,14 +431,77 @@ class CaseMetrics { minCpu: int, minRss: int, minObj: int, gapAtMin: int }
 // min-cpu rep ran uninterrupted) and correctly stayed FAIL; matrix and
 // strmap breached ceiling with gap 44-45cs against cpu 53cs (real ~98/97cs,
 // cpu*1.5 ~79/79cs) and correctly opened INCONCLUSIVE.
+//
+// IT CANNOT OPEN AT ALL FOR A MULTI-THREADED CASE, AND THAT IS STRUCTURAL
+// (#5732). `gap` is computed as `real - user - sys` and clamped at 0
+// (benchrun.bit's darwinMeasureBranch/linuxMeasureBranch). The premise above
+// — "`real` cannot be LESS than total CPU" — holds only while the process
+// occupies at most one core. With N mutator threads total CPU runs up to N x
+// real, so the subtraction is negative on every rep and the clamp reports 0:
+// measured on bench/cases/allocpar (8 workers), gap was 0 on 45 of 45
+// readings, quiet and loaded alike, while single-threaded `alloc` on the same
+// box and the same instrument reported 0-46cs. So for a multi-mutator case
+// this valve is welded shut and every over-ceiling CPU reading is a hard
+// FAIL, contention or not — which is why allocpar's CPU is not gated at all
+// rather than gated behind a valve that cannot open; see the MULTI-MUTATOR
+// CPU note on `Baseline.cpuCentis` in baselinesdefs.bit.
 fn wasDescheduled(gap: int, cpu: int): bool {
   return gap >= 0 && cpu + gap > ceiling(cpu)
 }
 
-fn reportAndCheck(b: Baseline, m: CaseMetrics, t: Tally) {
+// One case's CPU arm. Split out of reportAndCheck() (#5732) so the opt-out
+// below is one guard in one place rather than a third condition on a
+// function that already carries the deschedule branch.
+//
+// `Baseline.cpuCentis < 0` means this case's user CPU is NOT GATED — see
+// that field's MULTI-MUTATOR CPU note in baselinesdefs.bit for the policy
+// and the readings behind it. The reading is still taken and still printed
+// by reportAndCheck() below; only the comparison is skipped, so the suite
+// log still carries a real number for whoever re-baselines it.
+fn checkCpu(b: Baseline, m: CaseMetrics, t: Tally) {
+  if (b.cpuCentis < 0) {
+    return
+  }
   // CPU reads its own per-case ceiling (#2982); RSS always uses the blanket
   // 1.5x — see cpuCeiling()'s and Baseline.cpuCeilingPct's comments above.
   let cpuCeil = cpuCeiling(b)
+  if (m.minCpu <= cpuCeil) {
+    return
+  }
+  // #5196: contention can only ever inflate user CPU (see WHY USER CPU IS
+  // NOT IMMUNE TO CONTENTION above), so an over-ceiling reading taken on a
+  // rep the SAME measurement shows was descheduled for longer than it ran
+  // cannot be told apart from a real regression — report INCONCLUSIVE,
+  // naming the gap, and do not fail the gate for it. A reading whose own
+  // rep ran without interruption is unchanged: FAIL.
+  if (wasDescheduled(m.gapAtMin, m.minCpu)) {
+    markInconclusive(
+      t,
+        "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
+        "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%), " +
+        "descheduled ${m.gapAtMin}cs of wall time on that rep — " +
+        "host contention or a genuine regression; re-run on a quiet host to tell them apart",
+    )
+    return
+  }
+  markFail(
+    t,
+      "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
+      "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%)",
+  )
+}
+
+// The `cpu=` field of the per-case line below, which prints for every case
+// whether or not checkCpu() above judges it (#5732): an ungated axis must
+// say so in the log rather than print a ceiling nothing is compared to.
+fn cpuReport(b: Baseline, minCpu: int): string {
+  if (b.cpuCentis < 0) {
+    return "cpu=${minCpu}cs (NOT GATED — see cpuCentis in baselinesdefs.bit)"
+  }
+  return "cpu=${minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeiling(b)}cs)"
+}
+
+fn reportAndCheck(b: Baseline, m: CaseMetrics, t: Tally) {
   let rssCeil = ceiling(b.rssBytes)
   // objects is TWO-SIDED (#3130) — see objCeiling()/objFloor()'s comment
   // above. Baseline.objects == -1 means "not measured on this platform"; the
@@ -451,35 +515,15 @@ fn reportAndCheck(b: Baseline, m: CaseMetrics, t: Tally) {
   // without a quiet-host distribution to compare against there is no way to
   // tell a working discriminator from a broken one.
   print(
-      "benchgate: ${b.name} cpu=${m.minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs) " +
+      "benchgate: ${b.name} " +
+      cpuReport(b, m.minCpu) +
+      " " +
       "rss=${m.minRss}B (baseline ${b.rssBytes}B, ceiling ${rssCeil}B) " +
       "obj=${m.minObj} (baseline ${b.objects}, floor ${objFlr}, ceiling ${objCeil}) " +
       "descheduled ${m.gapAtMin}cs of wall time at min-cpu rep\n",
   )
 
-  if (m.minCpu > cpuCeil) {
-    // #5196: contention can only ever inflate user CPU (see WHY USER CPU IS
-    // NOT IMMUNE TO CONTENTION above), so an over-ceiling reading taken on a
-    // rep the SAME measurement shows was descheduled for longer than it ran
-    // cannot be told apart from a real regression — report INCONCLUSIVE,
-    // naming the gap, and do not fail the gate for it. A reading whose own
-    // rep ran without interruption is unchanged: FAIL.
-    if (wasDescheduled(m.gapAtMin, m.minCpu)) {
-      markInconclusive(
-        t,
-          "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
-          "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%), " +
-          "descheduled ${m.gapAtMin}cs of wall time on that rep — " +
-          "host contention or a genuine regression; re-run on a quiet host to tell them apart",
-      )
-    } else {
-      markFail(
-        t,
-          "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
-          "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%)",
-      )
-    }
-  }
+  checkCpu(b, m, t)
   if (m.minRss > rssCeil) {
     markFail(
       t,
