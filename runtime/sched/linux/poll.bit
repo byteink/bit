@@ -20,6 +20,12 @@ import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
 import { sysClose, sysEpollCreate1, sysEpollCtl, sysEpollPwait } from "../../syscalls"
 import { sysEpollPwait2 } from "../../syscalls"
 import { sysRead, sysWrite, sysEventfd2 } from "../../syscalls"
+// `pollWaitEvents`'s timer-slack drop. Imported from the park provider rather
+// than re-issuing the prctl here, so `PR_SET_TIMERSLACK` and the slack this
+// runtime asks for have one definition; `runtime/net/linux/tcp.bit` already
+// reaches into this module the same way, and neither park module imports
+// `runtime/sched/`, so the dependency stays one-directional.
+import { parkLowerTimerSlack } from "../../park/linux"
 
 // Syscall numbers are per-architecture and Bit has no arch-conditional
 // compilation, so the number is selected at run time (§11.8). `hostTarget()` is
@@ -612,7 +618,35 @@ export @nosplit fn pollDisablePwait2() {
 // A NULL `timeout` IS `epoll_pwait2`'s "block forever", so a non-positive
 // `timeoutNs` must still pass a real, zeroed `timespec` — `pollDrain` drains
 // the write descriptor with a literal 0 and must not be parked on it.
+//
+// THE THREAD'S TIMER SLACK IS DROPPED FIRST, AND THAT IS NOT A `nanosleep`
+// DETAIL LEAKING IN (#5749). `timer_slack_ns` is per-THREAD state that floors
+// `schedule_hrtimeout_range`'s range through `select_estimate_accuracy()`, so
+// it lengthens the deadline of THIS wait exactly as it lengthens
+// `parkSleepNs`'s. Worker 0 used to take its sub-millisecond waits through
+// `parkSleepNs`, which lowers the slack on every call, and inherited the drop
+// for free; sending every wait here instead (above) left its thread on the
+// kernel's 50000ns default and cost a flat ~50us on every wake — see
+// `parkLowerTimerSlack`'s header for the three-period measurement and for the
+// SCHED_FIFO control that isolates the slack from everything else.
+//
+// ON EVERY BLOCKING WAIT, NOT ONCE, for the reason `parkSleepNs` states and
+// one more this path adds. The state is per-thread and the kernel copies it at
+// clone time, so any "already lowered" flag would itself have to be per-thread
+// or it would skip the call on a worker thread created after the first wait —
+// and this function has no thread identity to hang one on, only the poller
+// try-lock, which admits a DIFFERENT worker each pass. The call is idempotent,
+// it is the same one the pre-#5737 path made per idle turn, and it is paid
+// only where the caller is about to block for real.
+//
+// NOT ON THE NON-BLOCKING DRAIN. `timeoutNs == 0` is `pollDrain`'s write-side
+// drain and `runtime/sched/`'s hot idle poll, which return without sleeping;
+// a syscall per turn there would be a new steady-state cost in place of the
+// one this removes, and a wait of zero has no deadline for slack to move.
 @nosplit fn pollWaitEvents(pollFd: int, timeoutNs: int): int {
+  if (timeoutNs > 0) {
+    parkLowerTimerSlack()
+  }
   if (*ptrOf(pwait2Latch) == 0) {
     let ns = timeoutNs
     if (ns < 0) {
