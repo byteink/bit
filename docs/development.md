@@ -162,6 +162,54 @@ two-pass ABI-change bootstrap produces a *correct* runtime - that is a
 property of the specific change being landed - only that the mechanism
 itself works as documented.
 
+### Landing a syntax change that `stdlib/**` then uses
+
+**A new piece of syntax cannot be used in `stdlib/**` in the same pass that
+teaches the compiler to parse it.** The pinned stage0 is a previous release,
+so it does not know the syntax, and `tools/build/` imports `std/time`. The
+moment a `stdlib/time/*.bit` file uses the new form, stage0 fails to compile
+the build driver and `./make` stops before it builds anything at all:
+
+```
+error[E0021]: expected ')', found ':'
+   --> stdlib/time/ldmlfmt.bit:448:24
+    |
+448 |   export format(pattern: string): string! {
+bit: tools/build: check failed
+make: cannot build the driver from tools/build
+```
+
+**The plain compiler-only recipe above does not apply**, because it assumes
+pass 1's bare `./make` succeeds. Here it cannot: that is the cycle. Pass 1
+needs the OLD `stdlib/` checked out, exactly like the runtime-ABI recipe
+needs the old `runtime/`:
+
+```sh
+rm -rf bit-out
+git checkout <commit before the stdlib change> -- stdlib/
+./make                                  # pass 1: new compiler/**, OLD stdlib
+cp -c bit-out/bin/bit "$TMPDIR/bit1"
+git checkout HEAD -- stdlib/            # restore before anything else reads the tree
+BIT_STAGE0_BIN="$TMPDIR/bit1" ./make    # pass 2 -- do NOT rm -rf bit-out here
+```
+
+Same two traps as the runtime recipe: no `rm -rf` between the passes, and
+restore `stdlib/` on every exit path including failure. `cp -c` is the
+enforced clonefile copy.
+
+**Until the next stage0 repin, a clean build needs this recipe**, and that
+is a real cost to weigh before landing one of these. `./make test-coldboot`
+deletes `bit-out/` and rebuilds from the pinned stage0, so it stays red for
+the whole window; it is excluded from `./make test` on cost, which means
+nothing in the normal suite will remind you. The differentials compare
+against that same pinned stage0 and will fail on precisely the files using
+the new syntax, which is an oracle limitation rather than a regression. Both
+resolve the moment a release is cut and `dist/stage0/SHA256SUMS` is repinned,
+so cut one promptly rather than leaving the tree in this state.
+
+This was first written down when `export` was added to trait methods and
+`stdlib/time` plus `stdlib/sql` started using it.
+
 ## Does `./make libbitrt` build `runtime/**` with the tree compiler?
 
 **No - it stays pinned-stage0-built by default.** The status quo is not free of
