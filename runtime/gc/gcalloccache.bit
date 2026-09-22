@@ -48,10 +48,14 @@
 // the live total every time a DIFFERENT request size in the same class popped a
 // slot out of it — the classes are size buckets, not exact sizes. The refill
 // therefore takes its slots at `size` 0 and the pop adds the caller's own
-// `size`, which leaves `gcLiveBytes` exactly the number it was before this
-// cache existed at every point a caller can observe it: `gcShouldCollect`'s
-// trigger, `_tests_/stress/gcbit`'s `sizeRoundTrip` (which compares it across
-// collections) and `_tests_/stress/gcslotbitmap`'s post-`gcDeinit` leak read.
+// `size` — since #5709 to this thread's OWN `acLive` word rather than to the
+// shared total, reconciled by `gcAllocCacheFlush` below. `gcLiveBytes` is still
+// exactly the number it was before this cache existed at every point a caller
+// can observe it — `gcShouldCollect`'s trigger, `_tests_/stress/gcbit`'s
+// `sizeRoundTrip` (which compares it across collections) and
+// `_tests_/stress/gcslotbitmap`'s post-`gcDeinit` leak read — because the flush
+// is what stands in front of each of those reads; `acLive` states the bound on
+// what is un-flushed in between.
 //
 // `heapAllocBytes` — the cumulative, never-decremented `allocbytes=` stat whose
 // only reader is `runtime/stw/stwstats.bit`'s `statsReport` — DOES move: it is
@@ -99,6 +103,22 @@ const acHeads = 3 // `acHeads + idx`: head of class `idx`'s cached chain
 // it is private to the owning OS thread by exactly the argument the heads are
 // (see `acOwner`) and shares no line with another thread's.
 const acBudget = 40
+
+// #5709: bytes this thread has popped out of its own cache and not yet added to
+// the SHARED `heapLiveWord`. Word 41, so private by exactly the argument
+// `acBudget` above is and inside the same 512-byte entry.
+//
+// WHAT IS OWED IS BOUNDED BY THE BUDGET, not by the cache's capacity, and that
+// is why this is sound rather than merely cheap. Every allocation that can
+// charge this word charges `acBudget` the same bytes — `../gc/gcalloc.bit`
+// calls `gcAllocBudgetSpend` on exactly the allocations `allocCachePop` can
+// serve — and `gcAllocBudgetSpend` flushes BEFORE it reads the shared total. So
+// the arrears never exceed one budget (`gcBudgetMax`, 64 KiB per thread,
+// `./gccollect.bit`) and are zero at the instant any trigger is evaluated.
+// Under `BIT_GC=stress` `gcTriggerBudget` answers 0, so the flush runs on every
+// allocation and the shared word is never behind at all — which is the state
+// every stress oracle that reads `gcLiveBytes` was written against.
+const acLive = 41
 
 // Most bytes of ONE class ONE thread may hold, and the hard ceiling on the
 // batch. A cap in BYTES rather than in slots is what keeps the idle footprint
@@ -244,6 +264,20 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   return allocCacheEntry(g)
 }
 
+// Add what this thread owes the shared live total, and clear the debt. `h` is
+// the heap block those bytes were taken from. The word is private to this OS
+// thread, so the read and the store need no atomic; only the shared add does,
+// and it is the same `atomicAdd` on the same word `allocCachePop` used to do
+// once per object.
+@nosplit fn gcAllocCacheFlush(e: *i64, h: *i64) {
+  let owed = *(e + acLive)
+  if (owed == 0) {
+    return
+  }
+  *(e + acLive) = 0
+  let _ = atomicAdd(h + heapLiveWord, owed)
+}
+
 // Charge `total` bytes to this thread's private allocation budget and answer
 // whether an allocation-door poll request is due (#5472).
 //
@@ -267,6 +301,10 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
     *(e + acBudget) = left
     return false
   }
+  // BEFORE `gcTriggerBudget`, not after (#5709): its first act is
+  // `heapLiveBytes`, the shared word this thread is in arrears on. Settling
+  // here is what keeps every trigger read exact.
+  gcAllocCacheFlush(e, heapBlock(g))
   let budget = gcTriggerBudget(g)
   *(e + acBudget) = budget
   if (budget > 0) {
@@ -313,6 +351,9 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   let lk = n + (lockAddr >> 2)
   spinAcquire(lk)
   let h = wordAt(heapAddr)
+  // #5709: these bytes were popped out of THIS heap, so they are settled here,
+  // under its own lock, before the entry can be rebound to another one.
+  gcAllocCacheFlush(e, h)
   let idx = 0
   // Bounded: `allocNumClasses` iterations outside, `acMaxBatch` inside — a
   // chain is only ever built by `allocCacheFillLocked`, which stops there.
@@ -351,6 +392,10 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
         *(e + acHeads + idx) = 0
         idx = idx + 1
       }
+      // #5709: dropped, not settled — the live word these bytes are owed to is
+      // inside the heap `gcDeinit` is about to unmap. Carrying the debt into
+      // the entry's next heap would charge it to a heap that never saw them.
+      *(e + acLive) = 0
       *(e + acHeap) = 0
       *(e + acLock) = 0
     }
@@ -383,16 +428,28 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
 }
 
 // Hand out one cached slot of class `idx`, or 0 when the cache is empty. NO
-// LOCK — see this section's header for why the entry needs none, and for why
-// the caller's `size` is charged here rather than at the refill.
-@nosplit fn allocCachePop(e: *i64, h: *i64, idx: int, size: int): int {
+// LOCK AND NO ATOMIC — see this file's header for why the entry needs neither.
+//
+// IT NEITHER TAKES THE HEAP BLOCK NOR CHARGES ANY BYTES ANY MORE (#5709). This
+// used to end in `atomicAdd(h + heapLiveWord, size)` — the last atomic
+// read-modify-write left on a warm cached allocation, and a read-modify-write
+// of the one line every other allocating thread is also writing. The charge is
+// a plain add into `acLive` now, and it is written at the one call site in
+// `gcHeapAlloc` (`./gcheap.bit`) rather than here FOR A MEASURED REASON: this
+// function sat at exactly `maxInlineLeafInsts()` = 16
+// (`compiler/optinlinecost.bit`), so the three IR instructions a private add
+// costs pushed it over and turned the hit path's splice into a real `bl` —
+// `objdump -r` went from 0 `ARM64_RELOC_BRANCH26` relocations naming
+// `_allocCachePop` to 1. Charging in the caller puts the same three
+// instructions in the same place the splice would have put them, and keeps the
+// splice. Do not move it back without re-running that relocation count.
+@nosplit fn allocCachePop(e: *i64, idx: int): int {
   let head = e + acHeads + idx
   let addr = *head
   if (addr == 0) {
     return 0
   }
   *head = *wordAt(addr)
-  let _ = atomicAdd(h + heapLiveWord, size)
   return addr
 }
 
@@ -418,6 +475,10 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
 // return; and `*head` as the splice's tail so a chain that is somehow non-empty
 // is extended rather than stranded, which is what the prepending loop did.
 @nosplit fn allocCacheFillLocked(g: *i64, e: *i64, idx: int, size: int) {
+  // #5709: the caller holds `heapLock(g)` and is about to touch the shared heap
+  // anyway, so a refill is the cheapest place to settle what the pops since the
+  // last one owe.
+  gcAllocCacheFlush(e, heapBlock(g))
   let head = e + acHeads + idx
   let want = acMaxBytes / size
   if (want > acMaxBatch) {
