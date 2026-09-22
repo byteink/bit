@@ -30,7 +30,7 @@
 // no headroom for a new import, so this one lives here instead, next to its
 // only caller (workerBody, below) rather than beside boot.bit's other sched
 // imports.
-import { schedGrowObserveBacklog } from "../../sched"
+import { schedGrowObserveBacklog, schedPollerArm, schedPollerDisarm } from "../../sched"
 
 // The ceiling on worker 0's idle wait (#5722, epic #3913) — see its call
 // site in `workerBody` below for the full enumeration of what this bounds.
@@ -41,6 +41,31 @@ import { schedGrowObserveBacklog } from "../../sched"
 // so it is sized off #3913's own stated target instead — a 2-second idle
 // process should retire about 2 wakes.
 const worker0WaitCeilingNs: int = 1000000000
+
+// Publish this worker's intent to wait, before its find-work pass. Two
+// sleeping places, one arm order (#5744): workers 1..N-1 sleep on their own
+// `wkPark` word, worker 0 sleeps in the poller, and each producer claims the
+// one that matches. Written as a function rather than an `if` inside
+// `workerBody` so the loop body keeps one statement per transition, and
+// declared here — above its caller — for the inlining reason `spinForWork`
+// below states.
+@nosplit fn armForWork(s: *i64, w: *i64, parks: bool) {
+  if (parks) {
+    schedIdleArm(w)
+    return
+  }
+  schedPollerArm(s)
+}
+
+// Found work instead of sleeping: drop the arm on whichever word this worker
+// set, so a producer does not spend its one wake on a worker already running.
+@nosplit fn disarmForWork(s: *i64, w: *i64, parks: bool) {
+  if (parks) {
+    schedIdleDisarm(w)
+    return
+  }
+  schedPollerDisarm(s)
+}
 
 // The idle worker's bounded userspace retry (#3260): up to `idleSpinTurns`
 // further find-work passes, returning the first task found, or 0 when the
@@ -300,9 +325,7 @@ fn workerBody(arg: *byte): *byte {
     schedGrowObserveBacklog(w)
     tryGrowPool(s)
     // Arm BEFORE looking for work; see the Linux twin for the window this closes.
-    if (parks) {
-      schedIdleArm(w)
-    }
+    armForWork(s, w, parks)
     let addr = schedFindWorkAt(w, parkMonoNs())
     let woke = 0
     if (addr == 0) {
@@ -339,17 +362,24 @@ fn workerBody(arg: *byte): *byte {
           //     replaces.
           //   - NETPOLLER READINESS is delivered by the kernel straight into
           //     this `kevent` call, unchanged from today.
-          //   - A NEWER, EARLIER DEADLINE pushed by another worker after
-          //     `schedFindWorkAt` above already read the old one, WORK
-          //     PUBLISHED to the global queue or a spawn, and SHUTDOWN have
-          //     no producer calling #5717's `pollWake` anywhere in the tree
-          //     yet — wiring every producer through it touches cross-platform
-          //     files (`task.bit`, `workerrun.bit`, `timer.bit`) this ticket
-          //     does not own, so it is not done here. These three instead
-          //     ride `worker0WaitCeilingNs` as a bounded fallback: worst
-          //     case one more `schedFindWorkAt` a fixed 1s later, never an
-          //     unbounded wait.
+          //   - SHUTDOWN is signalled: `./boot.bit`'s teardown triggers
+          //     `pollWake` on this descriptor (#5735).
+          //   - A NEWER, EARLIER DEADLINE armed after `schedFindWorkAt` above
+          //     read the old one, and WORK PUBLISHED to the global queue or a
+          //     spawn, trigger it too since #5744: `armForWork` published this
+          //     worker's intent to wait BEFORE that find-work pass, and
+          //     `sleep.bit`'s `schedWakePoller` — reached from
+          //     `schedTimerPush` and `schedWakeIdle` — claims the word and
+          //     fires the filter. Left unwired by #5722, they rode the ceiling
+          //     alone and cost a 200us sleep 15.4ms at the default worker
+          //     count (measured on 52703111c).
+          //
+          // `worker0WaitCeilingNs` stays the backstop for anything not yet
+          // wired: worst case one more `schedFindWorkAt` a fixed 1s later.
           let _ = pollDrain(int(s), schedParkBoundNs(worker0WaitCeilingNs, parkMonoNs()))
+          // Awake, whichever way the wait ended — the arm is cleared on every
+          // exit path, exactly as `schedIdlePark` clears `wkPark` on its own.
+          schedPollerDisarm(s)
         }
         gcBlockingEnd()
         backoff = parkNextBackoff(backoff)
@@ -358,9 +388,7 @@ fn workerBody(arg: *byte): *byte {
     }
     // Running instead of parking: clear the arm so a producer does not spend
     // its one wake on a worker that is already busy.
-    if (parks) {
-      schedIdleDisarm(w)
-    }
+    disarmForWork(s, w, parks)
     // Work found — re-arm the budget for the next idle stretch (#3260).
     spin = true
     backoff = schedWorkerStepAt(w, addr, woke, backoff)
@@ -392,6 +420,10 @@ fn workerBody(arg: *byte): *byte {
       break
     }
   }
+  // Leaving for good, by any of the three exits. Drop the arm (#5744): a stale
+  // 1 in worker 0's word would have producers trigger a descriptor teardown is
+  // about to close.
+  disarmForWork(s, w, parks)
 
   // RELEASE THE MUTATOR SLOT (#1666). `runtime/sched/`'s `Worker.run` — the oracle
   // this function ports — carries `gc_hooks.threadEnter()` /
