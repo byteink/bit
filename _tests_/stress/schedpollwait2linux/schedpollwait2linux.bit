@@ -1,0 +1,127 @@
+// `epoll_pwait2` (#5737, epic #3913) against a REAL kernel, Linux/epoll.
+// Proves the one thing `epoll_pwait` cannot do: wait for a SUB-MILLISECOND
+// deadline without rounding it up to the next whole millisecond.
+//
+// THE DISCRIMINATOR IS A FLOOR THE OLD CALL COULD NOT GO UNDER. `epoll_pwait`
+// takes a whole-millisecond `int`, so `nsToEpollMs`
+// (../../../runtime/sched/linux/poll.bit) rounds a 400us deadline UP to 1ms —
+// round DOWN and it becomes 0, which `pollDrainSkippable` reads as the
+// deliberate non-blocking sentinel. So under the old call a 400us drain took
+// at least 1ms, and this program's phase 2 asserting it takes LESS than that
+// is exactly the assertion the old code could not pass.
+//
+// THREE PHASES, IN THIS ORDER, because the interesting failures are on either
+// side of the answer and a single reading cannot tell them apart:
+//
+//   - phase 1, TEN REPS, the aggregate. One 400us drain landing under 1ms
+//     could be one unlucky clock read; ten of them summing under 8ms cannot
+//     be, because the old call's floor for ten reps is a hard 10ms. This is
+//     the reading that carries the verdict.
+//   - phase 2, ONE REP, the acceptance criterion as written: a single 400us
+//     drain returning in under 1ms.
+//   - phase 3, THE -ENOSYS DEGRADE, forced with `pollDisablePwait2` because
+//     no kernel this is developed on refuses `epoll_pwait2`. The same 400us
+//     drain must then block for a REAL 1ms-ish wait — NOT return instantly.
+//     An instant return is the failure the degrade must never have: it would
+//     mean the fallback truncated to a 0 timeout, turning worker 0's bounded
+//     wait into a hot spin with nothing crashing and no other gate observing
+//     it. So phase 3 asserts a FLOOR, the mirror of phase 2's ceiling, and
+//     the two together are what make the fallback proven rather than written.
+//
+// Nothing is registered on the poller at all, deliberately: a drain with a
+// positive timeout and an empty set is the cleanest possible measurement of
+// the timeout itself, with no readiness to cut it short. `pollDrainSkippable`
+// does not skip it — that shortcut is for `timeoutNs == 0` only.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/sched/linux, which reaches the kernel through `syscall` (SPEC
+// §11.8) — rejected on Darwin even for an uncalled declaration.
+
+import { schedInit, schedSetPollFd, taskAt } from "../../../runtime/sched"
+import { pollCreate, pollClose, pollDrain } from "../../../runtime/sched/linux"
+import { pollDisablePwait2 } from "../../../runtime/sched/linux"
+import { parkMonoNs } from "../../../runtime/park/linux"
+
+const pollWorkers: int = 1
+
+// The deadline under test. Sub-millisecond, so `epoll_pwait` could only ever
+// serve it by rounding up to 1ms.
+const timeoutNs: int = 400000
+
+const reps: int = 10
+
+// Ten 400us waits are nominally 4ms. The old call's floor is ten 1ms waits =
+// 10ms exactly, so anything under 10ms already fails today; 8ms leaves 4ms of
+// slack over the nominal for scheduler jitter and still cannot be reached by
+// ten rounded-up waits.
+const repsCeilingNs: int = 8000000
+
+// One 400us wait, nominally 400us. Under 1ms is impossible with the rounding.
+const oneCeilingNs: int = 1000000
+
+// Every wait must still be a REAL wait. 250us is comfortably under the 400us
+// nominal and far above any plausible syscall-entry cost, so a drain that
+// returned without waiting (a truncated-to-zero timeout) cannot clear it.
+const oneFloorNs: int = 250000
+
+// The forced-degrade wait, which rounds 400us up to 1ms. Its floor is the
+// same 250us: what phase 3 must rule out is an INSTANT return, not a slow
+// one. A ceiling here would be asserting the kernel's own timer slack, which
+// is not this program's property to pin.
+const degradeFloorNs: int = 250000
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+let monoScratch: [2]i64
+
+fn schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+fn nowNs(): int {
+  return parkMonoNs(ptrOf(monoScratch))
+}
+
+// One drain of `timeoutNs`, returning how long it actually took.
+fn timedDrain(): int {
+  let t0 = nowNs()
+  let _ = pollDrain(schedAddr(), timeoutNs)
+  return nowNs() - t0
+}
+
+fn main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), pollWorkers)
+
+  let pfd = pollCreate()
+  let created = pfd >= 0
+  schedSetPollFd(s, pfd)
+
+  let total = 0
+  let slowest = 0
+  let fastest = 0
+  let i = 0
+  while (i < reps) {
+    let d = timedDrain()
+    total = total + d
+    if (d > slowest) {
+      slowest = d
+    }
+    if (i == 0 || d < fastest) {
+      fastest = d
+    }
+    i = i + 1
+  }
+
+  let one = timedDrain()
+
+  pollDisablePwait2()
+  let degraded = timedDrain()
+
+  pollClose(pfd)
+
+  println("poller ${created}")
+  println("reps ${total < repsCeilingNs} waited ${fastest >= oneFloorNs}")
+  println("one ${one < oneCeilingNs && one >= oneFloorNs}")
+  println("degraded ${degraded >= degradeFloorNs}")
+}
