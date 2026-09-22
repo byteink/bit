@@ -821,6 +821,147 @@ a `Date` has no time of day to floor.
 None of them fails, and no month length is written down: `endOfMonth` is 28, 29,
 30 or 31 as the month and the year require.
 
+### `Date.startOfDay(): Date`
+
+### `Date.endOfDay(): Date`
+
+The identity: a `Date` has no time of day to floor or ceil.
+
+### `Date.startOfWeek(): Date`
+
+The Monday of the week containing `this`, ISO 8601. 2026-09-17, a Thursday,
+gives 2026-09-14.
+
+### `Date.endOfWeek(): Date`
+
+The Sunday of the week containing `this`: six days after `startOfWeek()`.
+
+### `Date.startOfWeekOn(firstDay: int): Date`
+
+The first day of the week containing `this`, when a week starts on
+`firstDay` (1 Monday .. 7 Sunday, clamped to that range). The explicit-first-
+day form of `startOfWeek()` - a separate name, not an overload, because Bit
+has no function overloading. `startOfWeekOn(7)` on 2026-09-17 gives
+2026-09-13.
+
+### `Date.endOfWeekOn(firstDay: int): Date`
+
+Six days after `startOfWeekOn(firstDay)`.
+
+### `Date.startOfMonth(): Date`
+
+The first day of `this` month.
+
+### `Date.endOfMonth(): Date`
+
+The last day of `this` month, derived from `daysInMonth()`, never
+hardcoded.
+
+### `Date.startOfQuarter(): Date`
+
+The first day of `this` quarter: 1 January, 1 April, 1 July or 1 October.
+
+### `Date.endOfQuarter(): Date`
+
+The last day of `this` quarter: 31 March, 30 June, 30 September or
+31 December.
+
+### `Date.startOfYear(): Date`
+
+1 January of `this` year.
+
+### `Date.endOfYear(): Date`
+
+31 December of `this` year.
+
+### `NaiveDateTime.startOfDay(): NaiveDateTime`
+
+`this` date at 00:00:00.000000000.
+
+### `NaiveDateTime.endOfDay(): NaiveDateTime`
+
+`this` date at 23:59:59.999999999 - the last representable nanosecond, not
+the next midnight.
+
+### `NaiveDateTime.startOfWeek(): NaiveDateTime`
+
+The Monday of `this` week, at midnight.
+
+### `NaiveDateTime.endOfWeek(): NaiveDateTime`
+
+The Sunday of `this` week, at 23:59:59.999999999.
+
+### `NaiveDateTime.startOfWeekOn(firstDay: int): NaiveDateTime`
+
+The first day of `this` week at midnight, when a week starts on `firstDay`.
+
+### `NaiveDateTime.endOfWeekOn(firstDay: int): NaiveDateTime`
+
+The last day of `this` week at 23:59:59.999999999, when a week starts on
+`firstDay`.
+
+### `NaiveDateTime.startOfMonth(): NaiveDateTime`
+
+### `NaiveDateTime.endOfMonth(): NaiveDateTime`
+
+### `NaiveDateTime.startOfQuarter(): NaiveDateTime`
+
+### `NaiveDateTime.endOfQuarter(): NaiveDateTime`
+
+### `NaiveDateTime.startOfYear(): NaiveDateTime`
+
+### `NaiveDateTime.endOfYear(): NaiveDateTime`
+
+Each is the matching `Date` boundary, at midnight or at
+23:59:59.999999999.
+
+### `DateTime.startOfDay(): DateTime`
+
+`this` date at 00:00:00.000000000 in `this` zone, with the offset
+**re-resolved** for that new wall time. This is the one boundary method
+where the distinction bites: in a handful of zones midnight itself falls
+inside a spring-forward gap and does not exist, and re-resolving through
+`inZone` is what a plain instant computation would not do - see [`inZone`
+pushes forward](#inzone-and-withzone-are-different-operations).
+
+### `DateTime.endOfDay(): DateTime`
+
+`this` date at 23:59:59.999999999 in `this` zone, offset re-resolved. On a
+day carrying a transition this is not the same offset as `startOfDay`'s.
+
+### `DateTime.startOfWeek(): DateTime`
+
+The Monday of `this` week, at midnight in `this` zone.
+
+### `DateTime.endOfWeek(): DateTime`
+
+The Sunday of `this` week, at 23:59:59.999999999 in `this` zone.
+
+### `DateTime.startOfWeekOn(firstDay: int): DateTime`
+
+The first day of `this` week at midnight in `this` zone, when a week starts
+on `firstDay`.
+
+### `DateTime.endOfWeekOn(firstDay: int): DateTime`
+
+The last day of `this` week at 23:59:59.999999999 in `this` zone, when a
+week starts on `firstDay`.
+
+### `DateTime.startOfMonth(): DateTime`
+
+### `DateTime.endOfMonth(): DateTime`
+
+### `DateTime.startOfQuarter(): DateTime`
+
+### `DateTime.endOfQuarter(): DateTime`
+
+### `DateTime.startOfYear(): DateTime`
+
+### `DateTime.endOfYear(): DateTime`
+
+Each is the matching wall-clock boundary in `this` zone, offset re-resolved
+the same way `startOfDay` is.
+
 `endOfDay` on a `DateTime` is the last representable nanosecond, not the next
 midnight. A range check on a whole day should prefer a half-open interval:
 
