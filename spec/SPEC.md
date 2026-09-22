@@ -1867,29 +1867,35 @@ linker binds a still-undefined global as a libSystem import, so an extern needs
 no new linker machinery there. The ELF output is deliberately the opposite: a
 fully static binary with no interpreter, no dynamic symbol table and no libc.
 There is no load-time resolution at all - but that is not the same as *no
-resolution*. The static link already merges the runtime archive (`libbitrt.a`),
-and a symbol **defined inside that archive** resolves exactly like any other
-cross-module reference, through the same global symbol table and the same
-dead-strip reachability the runtime's own calls use.
+resolution*. The static link already merges the runtime archive (`libbitrt.a`)
+and any archive the project's own `bit.json` names in a `"link"` array
+(§17.7), and a symbol **defined inside one of those archives** resolves
+exactly like any other cross-module reference, through the same global
+symbol table and the same dead-strip reachability the runtime's own calls
+use.
 
 So the rule is where a symbol may legitimately come from, not the platform:
 
-- Targeting `aarch64-macos`, symbol **defined in the linked `libbitrt.a`** or
-  **exported by libSystem**: accepted. Those are the image's two sources - the
-  merged archive and the `LC_LOAD_DYLIB` dyld binds at load.
-- Targeting `aarch64-macos`, symbol in **neither**: rejected with **E0078**
-  `extern_unsupported_target`, naming the symbol. Darwin does not fail such a
-  link: it falls through to a libSystem import and the process aborts at dyld
-  load instead, far from the declaration that caused it. The compiler therefore
-  has to decide it, which is the one thing accepting everything cannot do.
-- Targeting a Linux triple, symbol **defined in the linked `libbitrt.a`, or
-  defined by this build's own modules under a §11.9 `@symbol` pin**: accepted.
-  The archive case resolves statically at link time; the pinned case resolves
-  the same way - out of the program's own object, exactly as `bit_main` always
-  has - so a static link has something to resolve it against either way.
-- Targeting a Linux triple, symbol **absent** from that archive **and unpinned**:
-  rejected with **E0078**, naming the symbol. A fully static ELF has nothing to
-  resolve it against, so this would otherwise fail deep inside the linker.
+- Targeting `aarch64-macos`, symbol **defined in the linked `libbitrt.a`, in
+  an archive named by a `"link"` array (§17.7),** or **exported by
+  libSystem**: accepted. Those are the image's sources - the merged archives
+  and the `LC_LOAD_DYLIB` dyld binds at load.
+- Targeting `aarch64-macos`, symbol in **none of those**: rejected with
+  **E0078** `extern_unsupported_target`, naming the symbol. Darwin does not
+  fail such a link: it falls through to a libSystem import and the process
+  aborts at dyld load instead, far from the declaration that caused it. The
+  compiler therefore has to decide it, which is the one thing accepting
+  everything cannot do.
+- Targeting a Linux triple, symbol **defined in the linked `libbitrt.a` or in
+  an archive named by a `"link"` array (§17.7), or defined by this build's
+  own modules under a §11.9 `@symbol` pin**: accepted. The archive case
+  resolves statically at link time; the pinned case resolves the same way -
+  out of the program's own object, exactly as `bit_main` always has - so a
+  static link has something to resolve it against either way.
+- Targeting a Linux triple, symbol **absent** from those archives **and
+  unpinned**: rejected with **E0078**, naming the symbol. A fully static ELF
+  has nothing to resolve it against, so this would otherwise fail deep inside
+  the linker.
 - In a build whose archive **cannot be read**: rejected on either platform.
   Membership is undecidable there, and an undecided case must fall back to
   rejection - an accept-on-unknown would convert a compile error into a link
@@ -4200,12 +4206,14 @@ runtime archive, and neither links. An object destined for an archive is
 normally emitted `--freestanding` (§17.6).
 
 `bit ar` is how the toolchain builds its own `libbitrt.a`; it is not a
-packaging mechanism for user code. Nothing consumes its output today -
-`bit build` has no link-input flag and `bit.json` has no field naming an
-archive to link - and an `extern fn` (§11.7)/`@symbol` (§11.9) pin would be
-needed to call into one even if it did, since every other Bit type is
+packaging mechanism for user code by itself. `bit build` consumes such an
+archive when the project's own `bit.json` names it in a `"link"` array (see
+**External archives**, §17.7); an `extern fn` (§11.7) can then resolve
+against a symbol that archive defines, since every other Bit type is
 GC-managed and cannot cross that boundary. `bit add` (§17.7) - source, not a
-prebuilt archive - is the supported way to ship or consume Bit code.
+prebuilt archive - remains the supported way to ship or consume a Bit
+package; `"link"` is for linking a prebuilt native archive into the current
+project alone.
 
 ### 17.5 Prelude
 
@@ -4615,11 +4623,50 @@ Per resolved dependency it records:
   from its `bit.json`, so resolution can re-run from the lockfile alone
   without re-fetching every transitive dependency's manifest.
 
+**External archives.** A project's own `bit.json` may also list prebuilt
+archives for the linker to merge into the build, alongside the runtime
+archive:
+
+```
+link_array = '"link"' ':' '[' [ STRING_LIT { ',' STRING_LIT } ] ']' .
+```
+
+Each string is a path to an `ar` archive - one built by `bit ar` (§17.4) or
+any compatible archiver - resolved relative to the project's own root
+directory, never a fetched dependency's:
+
+```json
+{
+  "link": ["vendor/libfoo.a"]
+}
+```
+
+Naming an archive here is what lets an `extern fn` (§11.7) resolve against a
+symbol that archive defines, in addition to `libbitrt.a` and, on Darwin,
+libSystem; a symbol defined in none of those is still rejected with
+**E0078**. `libbitrt.a` is always linked first, so a name it already defines
+is bound to the runtime's own definition - an archive named by `"link"` can
+only supply a name `libbitrt.a` does not.
+
+Omitting `"link"` is not an error: the archive list is empty, the same as
+omitting `"dependencies"`. A `"link"` value that is not a JSON array is a
+hard error, and so is any element that is not a string, naming its index. A
+path that cannot be read, or whose contents are not a valid `ar` archive, is
+a hard error naming both the manifest and the path.
+
+**`"link"` is read from the project's own root `bit.json` only.** Resolution
+reads exactly the directory passed to `bit build`, never a directory a
+dependency was fetched into, so a package this project depends on cannot
+make this project link an archive of its own choosing - a dependency's own
+`"link"` array, if it has one, is never consulted.
+
 **No install-time code execution.** Fetching a dependency reads only its
 `bit.json` and source tree. There is no build script, no postinstall hook,
 and no field in `bit.json` that names one - a fetched manifest is never
 scanned for, or permitted to run, arbitrary code during `add`/`up`/`remove`
-or any other resolution step.
+or any other resolution step. This includes `"link"` (above): a fetched
+dependency's own `bit.json` may contain a `"link"` array, but only the
+project's own root manifest's `"link"` entries are ever linked.
 
 ### 17.8 Documentation
 
