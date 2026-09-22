@@ -243,6 +243,113 @@ fn tryGrowPool(sched: *i64) {
   schedGrowCommit(sched, ptrOf(startHandles), h)
 }
 
+// The ceiling on worker 0's idle wait (#5723, epic #3913) — see `worker0Wait`
+// below for the full enumeration of what it bounds. 1s, not `sleep.bit`'s
+// `idleParkMaxNs` (100ms): that constant bounds a missed wake on workers
+// 1..N-1, where `schedWakeIdle` is the normal path and the timeout is a
+// rarely-hit safety net; here it is the ONLY bound for the wake sources
+// nothing calls #5718's `pollWake` for yet, so it is sized off #3913's own
+// stated target instead — a 2-second idle process should retire about 2 wakes.
+const worker0WaitCeilingNs: int = 1000000000
+
+// `epoll_pwait`'s own resolution, and therefore both of `worker0Wait`'s
+// thresholds below.
+//
+// It is the SHORTEST WAIT THE SYSCALL CAN EXPRESS: the timeout argument is a
+// whole-millisecond `int`, so `nsToEpollMs` (`../../sched/linux/poll.bit`)
+// must round a sub-millisecond deadline UP to 1ms rather than truncate it to
+// the non-blocking sentinel. And it is the RECHECK INTERVAL this loop has
+// always fallen back on when the poller has work outstanding —
+// `parkMaxBackoffNs` (`../../park`), the ceiling the ramp this file used to
+// run stopped at.
+//
+// ../darwin/bootworker.bit needs neither threshold: `kevent` takes a
+// `timespec`, so it can wait for exactly the deadline it computed. That is
+// the whole reason this platform needs a `worker0Wait` where darwin inlines
+// one call.
+const worker0PollRecheckNs: int = 1000000
+
+// Worker 0's idle wait (#5723, epic #3913), the one place the ONE worker that
+// never parks on `schedIdlePark` goes to the kernel (`parks` is false only for
+// `wkId == 0`). It used to be a BLIND `backoff` ramp —
+// `parkSleepNs(schedParkBoundNs(backoff, now), ...)` with `backoff` doubling
+// from `parkMinBackoffNs` — so an idle process woke worker 0 at up to 1000 Hz
+// forever, and a worker whose only pending work was a 200us timer woke about
+// eight times on the way to a deadline it already knew the exact value of. The
+// ramp is gone from this path: the wait is the next known deadline, or
+// `worker0WaitCeilingNs` when none is armed. `backoff` itself is untouched and
+// still ramps — it still feeds `schedWorkerStepAt`'s race-loss retry, and
+// workers 1..N-1 never read it.
+//
+// WHICH SYSCALL WAITS IS A LINUX-ONLY DECISION. `pollDrain` blocks in
+// `epoll_pwait`, which watches every registered fd AND #5718's wake eventfd in
+// the same syscall this worker must keep making anyway (`../../sched/sleep.bit`:
+// worker 0 is the only thread guaranteed to be looking), so one blocking drain
+// replaces the drain-then-sleep PAIR of syscalls every idle turn used to make.
+// Two epoll properties stop that being the whole answer, and both are why the
+// two thresholds above exist:
+//
+//   - `epoll_pwait` COUNTS IN WHOLE MILLISECONDS. `nsToEpollMs` rounds up, so
+//     a 200us deadline handed to `pollDrain` becomes a 1ms wait — a 5x
+//     overshoot of a deadline `clock_nanosleep` hits exactly. A wait shorter
+//     than `worker0PollRecheckNs` therefore still goes to `parkSleepNs`, which
+//     is nanosecond-precise. That branch gives up the syscall pairing and
+//     keeps the ramp removal, which is where a sub-millisecond timer
+//     workload's win is anyway.
+//   - READ AND WRITE INTEREST LIVE ON TWO DIFFERENT DESCRIPTORS (#1910),
+//     because epoll keys a registration on the fd alone. `pollDrain` blocks on
+//     `scPollFd` and drains `scPollFdWrite` non-blocking AFTERWARDS, so a
+//     socket becoming WRITABLE cannot end this wait; kqueue keys on
+//     `(fd, filter)` and has no such split. So the ceiling drops back to
+//     `worker0PollRecheckNs` — today's rate, nothing regressed — whenever
+//     `schedPollPendingCount` reports anything armed at all. The count cannot
+//     say WHICH descriptor, and answering "it might be a write" with a 1s wait
+//     would turn a full send buffer into a 1s stall.
+//
+// EVERY WAY THIS WAIT CAN END, enumerated because a wait this long turns a
+// missed wake into a hang rather than a delay:
+//   - THE DEADLINE JUST COMPUTED needs no signal on either branch: the wait's
+//     own duration ends exactly then, same as the `parkSleepNs` this replaces.
+//   - NETPOLLER READ READINESS is delivered by the kernel straight into this
+//     `epoll_pwait`, unchanged from today — and only ever reaches a wait the
+//     count above has already shortened to `worker0PollRecheckNs`.
+//   - A NEWER, EARLIER DEADLINE pushed by another worker after
+//     `schedFindWorkAt` already read the old one, WORK PUBLISHED to the global
+//     queue or a spawn, and SHUTDOWN have no producer calling #5718's
+//     `pollWake` anywhere in the tree yet — wiring every producer through it
+//     touches cross-platform files (`task.bit`, `workerrun.bit`, `timer.bit`)
+//     this ticket does not own. These three ride `worker0WaitCeilingNs` as a
+//     bounded fallback: worst case one more `schedFindWorkAt` a fixed 1s
+//     later, never an unbounded wait. Same three, same fallback, as the darwin
+//     twin (#5722).
+//   - A WRITE REGISTRATION ARMED BUT NOT YET COUNTED is the one window the
+//     count cannot close, and it is this platform's own: `pollRegister` arms
+//     with the kernel and only then calls `schedPollPendingInc`, so a read
+//     here can miss it by a few instructions and start a full-ceiling wait on
+//     a descriptor that will never report it. Bounded the same way, and closed
+//     by the same missing producer-side `pollWake`.
+//
+// The caller holds `gcBlockingBegin`/`gcBlockingEnd` across this, which is what
+// lets it block in a syscall at all: no frame here holds a live Bit reference,
+// so the collector passes this worker's slot instead of waiting for a safepoint
+// it will not reach until the wait returns.
+//
+// DECLARED ABOVE ITS CALLER, same reason `spinForWork` above is.
+fn worker0Wait(s: *i64, w: *i64) {
+  let ceiling = worker0WaitCeilingNs
+  if (schedPollPendingCount() != 0) {
+    ceiling = worker0PollRecheckNs
+  }
+  // The clock is read HERE, not reused from the find-work pass above: a stale
+  // `now` lengthens the wait by however long that pass took.
+  let waitNs = schedParkBoundNs(ceiling, parkMonoNs(w + wkSleepReq))
+  if (waitNs < worker0PollRecheckNs) {
+    parkSleepNs(waitNs, w + wkSleepReq)
+    return
+  }
+  let _ = pollDrain(int(s), waitNs)
+}
+
 // The worker OS-thread entry: unpack the {worker address, done-word address}
 // block `schedStart` armed, drive green tasks until shutdown, then clear the
 // done word so `joinWorker` observes the worker has left. TIMERS AND THE
@@ -282,7 +389,9 @@ fn tryGrowPool(sched: *i64) {
 // line and hung forever, against a Bit-sourced `libbitrt.a`.
 //
 // ---------------------------------------------------------------------------
-// THE IDLE SLEEP (#1665) — kept identical in ../darwin/boot.bit
+// THE IDLE SLEEP (#1665) — the parking worker's half is still identical in
+// ../darwin/bootworker.bit; worker 0's half diverged at #5722/#5723, see
+// `worker0Wait` above for what epoll forces here that kqueue does not
 // ---------------------------------------------------------------------------
 //
 // `runtime/sched`'s `schedWorkerStep` cannot reach a platform sleep for idle
@@ -306,9 +415,13 @@ fn tryGrowPool(sched: *i64) {
 // `runtime/sched/`'s own idle path and this file's `boot`/`joinWorker` sleeps: no
 // frame here holds a live Bit reference while parked, so the collector may pass
 // this worker's slot without waiting for a safepoint it will not reach until
-// `parkSleepNs` returns. `scStopping` is checked first and by hand, matching
-// `schedWorkerStep`'s own order, so a shutdown signalled while idle is still
-// seen within one backoff step rather than after a sleep starts.
+// the wait returns — `parkSleepNs` for a parking worker, and either of
+// `worker0Wait`'s two syscalls for worker 0, which is exactly what lets that
+// function block in `epoll_pwait` for as long as a second. `scStopping` is
+// checked first and by hand, matching `schedWorkerStep`'s own order, so a
+// shutdown signalled while idle is still seen before a wait starts rather than
+// after one; a shutdown signalled DURING worker 0's wait is one of the three
+// sources `worker0Wait` documents as riding its ceiling.
 //
 // ---------------------------------------------------------------------------
 // THE IDLE SPIN (#3260) — kept identical in ../darwin/bootworker.bit
@@ -351,19 +464,26 @@ fn tryGrowPool(sched: *i64) {
 //     anyway.
 //
 //
-// THE PARK IS BOUNDED BY THE NEXT KNOWN DEADLINE (#3911). `backoff` is a BLIND
-// ramp that knows nothing about what this worker is idle FOR, so a worker whose
-// only pending work is a timer sleeps past a deadline it already knows the exact
-// value of. The sweeps immediately above publish that deadline; the park is the
-// shorter of it and `backoff`, and is exactly `backoff` when nothing is armed.
-// The ramp itself is untouched. Full argument: `schedParkBoundNs`
+// THE PARK IS BOUNDED BY THE NEXT KNOWN DEADLINE (#3911). The sweeps
+// immediately above publish that deadline; no wait below is ever longer than
+// it. Full argument for the bound itself: `schedParkBoundNs`
 // (`runtime/sched/timer.bit`) — it lives with the mechanism rather than being
-// copied into both platform leaves. The clock is read HERE, not reused from the
-// pass above: a stale `now` lengthens the park by however long that pass took.
-// `schedCheckDeadlock` is reached through `schedFindWorkAt` here exactly as it
-// is on the outer turn, and its verdict cannot change with the number of passes:
-// it acts only at `nworkers == 1`, where the burst asks the same question the
-// outer turn just asked and gets the same answer.
+// copied into both platform leaves. `schedCheckDeadlock` is reached through
+// `schedFindWorkAt` here exactly as it is on the outer turn, and its verdict
+// cannot change with the number of passes: it acts only at `nworkers == 1`,
+// where the burst asks the same question the outer turn just asked and gets the
+// same answer.
+//
+// #5723 (epic #3913) CHANGED WHAT THE FIRST ARGUMENT TO `schedParkBoundNs`
+// IS, FOR WORKER 0 ONLY, and moved the whole wait into `worker0Wait` above —
+// read that function's header for the mechanism, the two epoll properties that
+// shape it and the enumeration of what can end the wait. The short version:
+// worker 0 no longer bounds its idle wait with the blind `backoff` ramp, so an
+// idle process stops waking at up to 1000 Hz and a worker waiting on one timer
+// stops waking about eight times on the way to it. `backoff` is untouched and
+// still ramps: workers 1..N-1 never read it (they use `idleParkMaxNs`,
+// `sleep.bit`), and it still feeds `schedWorkerStepAt`'s race-loss retry below,
+// which is unrelated to this change.
 fn workerBody(arg: *byte): *byte {
   // ARM THIS THREAD'S CRASH DIAGNOSTIC FIRST (#2246, ./signal.bit): every
   // green task this worker will ever run executes below this line, so the
@@ -394,9 +514,13 @@ fn workerBody(arg: *byte): *byte {
   let s: *i64 = ptrOf(schedBlock)
   let backoff = parkMinBackoffNs
   // WORKER 0 POLLS, THE REST PARK (#1902). See `runtime/sched/sleep.bit` for the
-  // argument; the short version is that leaving one worker on today's 1ms loop
-  // keeps the netpoller and the timer queue driven with no new machinery, and
-  // makes a wake this runtime forgets to send cost latency instead of a hang.
+  // argument; the short version is that leaving one worker driving the netpoller
+  // and the timer queue needs no new machinery, and makes a wake this runtime
+  // forgets to send cost latency instead of a hang. #5723 replaced that worker's
+  // 1ms recheck loop with `worker0Wait` above, which keeps exactly that property
+  // — every wake source it cannot yet be signalled for is bounded, never
+  // unbounded. Workers 1..N-1 are unchanged on both platforms: `futex(2)` here
+  // and `__ulock_wait` on darwin, entirely inside `runtime/park/<os>`.
   let parks = *(w + wkId) != 0
   // The spin budget (#3260, "THE IDLE SPIN" above). Starts false: a worker that
   // has run nothing yet has no reason to believe work is moments away, and boot
@@ -444,7 +568,7 @@ fn workerBody(arg: *byte): *byte {
         if (parks) {
           schedIdlePark(s, w)
         } else {
-          parkSleepNs(schedParkBoundNs(backoff, parkMonoNs(w + wkSleepReq)), w + wkSleepReq)
+          worker0Wait(s, w)
         }
         gcBlockingEnd()
         backoff = parkNextBackoff(backoff)
