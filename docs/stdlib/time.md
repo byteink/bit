@@ -574,6 +574,108 @@ Every method returns a new value. `n` may be negative.
 never carries into a date, because a `Time` has no date to carry into. Use
 `NaiveDateTime` when the carry matters.
 
+### `Date.addYears(n: int): Date`
+
+`n` calendar years later, clamped the way [Month arithmetic
+clamps](#month-arithmetic-clamps) describes. `n` may be negative.
+
+### `Date.addMonths(n: int): Date`
+
+`n` calendar months later, clamped the same way. `n` may be negative.
+
+### `Date.addWeeks(n: int): Date`
+
+Exactly `n * 7` days later - exact across a month or year boundary, since it
+never touches the clamp `addMonths` uses. `n` may be negative.
+
+### `Date.addDays(n: int): Date`
+
+`n` days later. `n` may be negative.
+
+### `Time.addHours(n: int): Time`
+
+`n` hours later, wrapping within the day - never carries into a date, because
+a `Time` has no date. `n` may be negative.
+
+### `Time.addMinutes(n: int): Time`
+
+`n` minutes later, wrapping within the day. `n` may be negative.
+
+### `Time.addSeconds(n: int): Time`
+
+`n` seconds later, wrapping within the day. `n` may be negative.
+
+### `Time.addNanoseconds(n: int): Time`
+
+`n` nanoseconds later, wrapping within the day. `n` may be negative.
+
+### `NaiveDateTime.addYears(n: int): NaiveDateTime`
+
+`n` calendar years later (clamped), time of day unchanged. `n` may be
+negative.
+
+### `NaiveDateTime.addMonths(n: int): NaiveDateTime`
+
+`n` calendar months later (clamped), time of day unchanged. `n` may be
+negative.
+
+### `NaiveDateTime.addWeeks(n: int): NaiveDateTime`
+
+`n` weeks later, time of day unchanged. `n` may be negative.
+
+### `NaiveDateTime.addDays(n: int): NaiveDateTime`
+
+`n` days later, time of day unchanged. `n` may be negative.
+
+### `NaiveDateTime.addHours(n: int): NaiveDateTime`
+
+`n` hours later, **carrying into the date** when the shift crosses midnight -
+unlike `Time.addHours`, which wraps within the day and never carries. `n` may
+be negative.
+
+### `NaiveDateTime.addMinutes(n: int): NaiveDateTime`
+
+`n` minutes later, carrying into the date. `n` may be negative.
+
+### `NaiveDateTime.addSeconds(n: int): NaiveDateTime`
+
+`n` seconds later, carrying into the date. `n` may be negative.
+
+### `NaiveDateTime.addNanoseconds(n: int): NaiveDateTime`
+
+`n` nanoseconds later, carrying into the date. `n` may be negative.
+
+### `DateTime.addYears(n: int): DateTime`
+
+`n` calendar years later, on the **wall clock** - see [Arithmetic across a
+transition](#arithmetic-across-a-transition). `n` may be negative.
+
+### `DateTime.addMonths(n: int): DateTime`
+
+### `DateTime.addWeeks(n: int): DateTime`
+
+### `DateTime.addDays(n: int): DateTime`
+
+### `DateTime.addHours(n: int): DateTime`
+
+### `DateTime.addMinutes(n: int): DateTime`
+
+### `DateTime.addSeconds(n: int): DateTime`
+
+### `DateTime.addNanoseconds(n: int): DateTime`
+
+All seven operate on the wall clock and re-resolve the zone offset the same
+way `addYears` does: adding a day to 09:00 gives 09:00 the next day even
+across a daylight saving transition, though the elapsed real time was 23 or
+25 hours. `n` may be negative.
+
+### `Timestamp.add(ns: int): Timestamp`
+
+`ns` nanoseconds of **real elapsed time** added to the instant - the one
+method in this family that adds to the instant rather than the wall clock;
+see [Arithmetic across a transition](#arithmetic-across-a-transition). `ns`
+may be negative.
+
 ### Month arithmetic clamps
 
 `addMonths` and `addYears` keep the day of month where they can and **clamp to the
@@ -600,12 +702,86 @@ from it, rather than stepping forward one month at a time from the last one.
 
 | Method | Notes |
 |---|---|
-| `withYear(y)` `withMonth(m)` `withDay(d)` | clamps the day the same way |
+| `withYear(y)` `withMonth(m)` | clamps the day to fit the new year/month |
+| `withDay(d)` | **not** clamped - `d` is written through directly |
 | `withHour(h)` `withMinute(m)` `withSecond(s)` `withNanosecond(n)` | |
 | `withTime(h, m, s)` | on `NaiveDateTime` and `DateTime` |
 | `withZone(z)` | on `DateTime`, keeps the instant |
 
 `withMonth` clamps: 2026-01-31 `withMonth(2)` is 2026-02-28.
+
+### `Date.withYear(y: int): Date`
+
+`this` with the year replaced, day clamped to the last valid day of `y` and
+`this` month.
+
+### `Date.withMonth(m: int): Date`
+
+`this` with the month replaced, day clamped to the last valid day of that
+month: 2026-01-31 `withMonth(2)` is 2026-02-28.
+
+### `Date.withDay(d: int): Date`
+
+`this` with the day of month replaced by `d`. **Not clamped** - `d` is
+written through directly, unlike `withYear`/`withMonth`, so
+`date(2026, 1, 15).withDay(31)` is `2026-01-31` and `date(2026, 2, 15).withDay(31)`
+produces a `Date` reading `2026-02-31`, a day `February` does not have.
+
+### `Time.withHour(h: int): Time`
+
+### `Time.withMinute(m: int): Time`
+
+### `Time.withSecond(s: int): Time`
+
+### `Time.withNanosecond(n: int): Time`
+
+Each replaces exactly that field of `this`, the others unchanged. Not
+clamped: any `int` is written through.
+
+### `NaiveDateTime.withYear(y: int): NaiveDateTime`
+
+### `NaiveDateTime.withMonth(m: int): NaiveDateTime`
+
+### `NaiveDateTime.withDay(d: int): NaiveDateTime`
+
+Forwards to the matching `Date.with*`, time of day unchanged - `withDay` is
+not clamped, the same as `Date.withDay`.
+
+### `NaiveDateTime.withHour(h: int): NaiveDateTime`
+
+### `NaiveDateTime.withMinute(m: int): NaiveDateTime`
+
+### `NaiveDateTime.withSecond(s: int): NaiveDateTime`
+
+### `NaiveDateTime.withNanosecond(n: int): NaiveDateTime`
+
+Forwards to the matching `Time.with*`, date unchanged.
+
+### `NaiveDateTime.withTime(hour: int, minute: int, second: int): NaiveDateTime`
+
+`this` with the time of day replaced by `hour`:`minute`:`second`, nanosecond
+and date unchanged.
+
+### `DateTime.withYear(y: int): DateTime`
+
+### `DateTime.withMonth(m: int): DateTime`
+
+### `DateTime.withDay(d: int): DateTime`
+
+### `DateTime.withHour(h: int): DateTime`
+
+### `DateTime.withMinute(m: int): DateTime`
+
+### `DateTime.withSecond(s: int): DateTime`
+
+### `DateTime.withNanosecond(n: int): DateTime`
+
+### `DateTime.withTime(hour: int, minute: int, second: int): DateTime`
+
+Each sets the field on the **wall clock** and re-resolves the zone offset for
+it, the same rule `addYears` follows - see [Arithmetic across a
+transition](#arithmetic-across-a-transition). `withDay` is not clamped, the
+same as `Date.withDay`.
 
 ```bit
 import { Date } from "std/time"
@@ -644,6 +820,147 @@ a `Date` has no time of day to floor.
 
 None of them fails, and no month length is written down: `endOfMonth` is 28, 29,
 30 or 31 as the month and the year require.
+
+### `Date.startOfDay(): Date`
+
+### `Date.endOfDay(): Date`
+
+The identity: a `Date` has no time of day to floor or ceil.
+
+### `Date.startOfWeek(): Date`
+
+The Monday of the week containing `this`, ISO 8601. 2026-09-17, a Thursday,
+gives 2026-09-14.
+
+### `Date.endOfWeek(): Date`
+
+The Sunday of the week containing `this`: six days after `startOfWeek()`.
+
+### `Date.startOfWeekOn(firstDay: int): Date`
+
+The first day of the week containing `this`, when a week starts on
+`firstDay` (1 Monday .. 7 Sunday, clamped to that range). The explicit-first-
+day form of `startOfWeek()` - a separate name, not an overload, because Bit
+has no function overloading. `startOfWeekOn(7)` on 2026-09-17 gives
+2026-09-13.
+
+### `Date.endOfWeekOn(firstDay: int): Date`
+
+Six days after `startOfWeekOn(firstDay)`.
+
+### `Date.startOfMonth(): Date`
+
+The first day of `this` month.
+
+### `Date.endOfMonth(): Date`
+
+The last day of `this` month, derived from `daysInMonth()`, never
+hardcoded.
+
+### `Date.startOfQuarter(): Date`
+
+The first day of `this` quarter: 1 January, 1 April, 1 July or 1 October.
+
+### `Date.endOfQuarter(): Date`
+
+The last day of `this` quarter: 31 March, 30 June, 30 September or
+31 December.
+
+### `Date.startOfYear(): Date`
+
+1 January of `this` year.
+
+### `Date.endOfYear(): Date`
+
+31 December of `this` year.
+
+### `NaiveDateTime.startOfDay(): NaiveDateTime`
+
+`this` date at 00:00:00.000000000.
+
+### `NaiveDateTime.endOfDay(): NaiveDateTime`
+
+`this` date at 23:59:59.999999999 - the last representable nanosecond, not
+the next midnight.
+
+### `NaiveDateTime.startOfWeek(): NaiveDateTime`
+
+The Monday of `this` week, at midnight.
+
+### `NaiveDateTime.endOfWeek(): NaiveDateTime`
+
+The Sunday of `this` week, at 23:59:59.999999999.
+
+### `NaiveDateTime.startOfWeekOn(firstDay: int): NaiveDateTime`
+
+The first day of `this` week at midnight, when a week starts on `firstDay`.
+
+### `NaiveDateTime.endOfWeekOn(firstDay: int): NaiveDateTime`
+
+The last day of `this` week at 23:59:59.999999999, when a week starts on
+`firstDay`.
+
+### `NaiveDateTime.startOfMonth(): NaiveDateTime`
+
+### `NaiveDateTime.endOfMonth(): NaiveDateTime`
+
+### `NaiveDateTime.startOfQuarter(): NaiveDateTime`
+
+### `NaiveDateTime.endOfQuarter(): NaiveDateTime`
+
+### `NaiveDateTime.startOfYear(): NaiveDateTime`
+
+### `NaiveDateTime.endOfYear(): NaiveDateTime`
+
+Each is the matching `Date` boundary, at midnight or at
+23:59:59.999999999.
+
+### `DateTime.startOfDay(): DateTime`
+
+`this` date at 00:00:00.000000000 in `this` zone, with the offset
+**re-resolved** for that new wall time. This is the one boundary method
+where the distinction bites: in a handful of zones midnight itself falls
+inside a spring-forward gap and does not exist, and re-resolving through
+`inZone` is what a plain instant computation would not do - see [`inZone`
+pushes forward](#inzone-and-withzone-are-different-operations).
+
+### `DateTime.endOfDay(): DateTime`
+
+`this` date at 23:59:59.999999999 in `this` zone, offset re-resolved. On a
+day carrying a transition this is not the same offset as `startOfDay`'s.
+
+### `DateTime.startOfWeek(): DateTime`
+
+The Monday of `this` week, at midnight in `this` zone.
+
+### `DateTime.endOfWeek(): DateTime`
+
+The Sunday of `this` week, at 23:59:59.999999999 in `this` zone.
+
+### `DateTime.startOfWeekOn(firstDay: int): DateTime`
+
+The first day of `this` week at midnight in `this` zone, when a week starts
+on `firstDay`.
+
+### `DateTime.endOfWeekOn(firstDay: int): DateTime`
+
+The last day of `this` week at 23:59:59.999999999 in `this` zone, when a
+week starts on `firstDay`.
+
+### `DateTime.startOfMonth(): DateTime`
+
+### `DateTime.endOfMonth(): DateTime`
+
+### `DateTime.startOfQuarter(): DateTime`
+
+### `DateTime.endOfQuarter(): DateTime`
+
+### `DateTime.startOfYear(): DateTime`
+
+### `DateTime.endOfYear(): DateTime`
+
+Each is the matching wall-clock boundary in `this` zone, offset re-resolved
+the same way `startOfDay` is.
 
 `endOfDay` on a `DateTime` is the last representable nanosecond, not the next
 midnight. A range check on a whole day should prefer a half-open interval:
@@ -697,6 +1014,73 @@ the two wall clocks, so 09:00 Dubai is before 09:00 London.
 To compare wall clocks instead, compare `.naive()` on both sides. To compare
 across types at all, convert both to `Timestamp` first.
 
+### `Date.compare(other: Date): int`
+
+`-1`, `0` or `1` as `this` is an earlier, the same, or a later calendar day
+than `other`. Every other `Date` comparison method is written in terms of
+this one.
+
+### `Date.isBefore(other: Date): bool`
+
+### `Date.isAfter(other: Date): bool`
+
+### `Date.isSame(other: Date): bool`
+
+### `Date.isBetween(lo: Date, hi: Date): bool`
+
+### `Time.compare(other: Time): int`
+
+`-1`, `0` or `1` comparing time of day, to the nanosecond: `09:00:00` is
+before `09:00:00.000000001`.
+
+### `Time.isBefore(other: Time): bool`
+
+### `Time.isAfter(other: Time): bool`
+
+### `Time.isSame(other: Time): bool`
+
+### `Time.isBetween(lo: Time, hi: Time): bool`
+
+### `NaiveDateTime.compare(other: NaiveDateTime): int`
+
+`-1`, `0` or `1` comparing two wall-clock readings with no zone between them -
+what "compare the wall clocks" means for two `DateTime` values compared
+through `.naive()`.
+
+### `NaiveDateTime.isBefore(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isAfter(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isSame(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isBetween(lo: NaiveDateTime, hi: NaiveDateTime): bool`
+
+### `DateTime.compare(other: DateTime): int`
+
+`-1`, `0` or `1` as `this` names an earlier **instant** than `other`, the same
+instant, or a later one - never by wall clock (above). Two readings of the
+same instant in different zones compare equal.
+
+### `DateTime.isBefore(other: DateTime): bool`
+
+### `DateTime.isAfter(other: DateTime): bool`
+
+### `DateTime.isSame(other: DateTime): bool`
+
+### `DateTime.isBetween(lo: DateTime, hi: DateTime): bool`
+
+### `Timestamp.compare(other: Timestamp): int`
+
+`-1`, `0` or `1` comparing two instants directly, as nanosecond counts.
+
+### `Timestamp.isBefore(other: Timestamp): bool`
+
+### `Timestamp.isAfter(other: Timestamp): bool`
+
+### `Timestamp.isSame(other: Timestamp): bool`
+
+### `Timestamp.isBetween(lo: Timestamp, hi: Timestamp): bool`
+
 Convenience predicates on `Date`:
 
 | Method | Meaning |
@@ -706,11 +1090,66 @@ Convenience predicates on `Date`:
 | `isSameMonth(other)` `isSameYear(other)` | |
 | `isWeekend()` `isWeekday()` | see [Business days](#business-days) |
 
+### `Date.isSameDay(other: Date): bool`
+
+Same answer as `isSame` on a `Date` - spelled out separately so the same call
+reads the same on all three calendar types.
+
+### `Date.isSameMonth(other: Date): bool`
+
+True when `this` and `other` fall in the same month of the same year.
+2026-01-31 and 2026-01-01 are the same month; 2025-01-31 and 2026-01-31 are
+not.
+
+### `Date.isSameYear(other: Date): bool`
+
+### `NaiveDateTime.isSameDay(other: NaiveDateTime): bool`
+
+True when `this` and `other` fall on the same calendar day, whatever the time
+of day: 2026-09-17T00:00 and 2026-09-17T23:59 are the same day, though
+`isSame` on that pair is false.
+
+### `NaiveDateTime.isSameMonth(other: NaiveDateTime): bool`
+
+### `NaiveDateTime.isSameYear(other: NaiveDateTime): bool`
+
+Forwards to the matching `Date.isSame*`, read off the wall clock's date.
+
+### `DateTime.isSameDay(other: DateTime): bool`
+
+True when the two **wall clocks** fall on the same calendar day, each read in
+its own zone - the same wall-clock reading `add*` and `startOf*` use. Two
+zones are rarely worth mixing here: convert one side with `withZone` first
+when the question is about a single observer's day.
+
+### `DateTime.isSameMonth(other: DateTime): bool`
+
+### `DateTime.isSameYear(other: DateTime): bool`
+
+Same wall-clock reading as `isSameDay`.
+
 On `Timestamp` and `DateTime`:
 
 | Method | Meaning |
 |---|---|
 | `isPast()` `isFuture()` | compared against `now()` |
+
+### `DateTime.isPast(): bool`
+
+True when this instant is strictly before `now()`. Reads the clock on every
+call, so a value that is future now becomes past later; to pin a moment,
+hold a `Timestamp` and compare against it instead.
+
+### `DateTime.isFuture(): bool`
+
+True when this instant is strictly after `now()`. `isPast()` and `isFuture()`
+are both false in the one nanosecond a value names exactly.
+
+### `Timestamp.isPast(): bool`
+
+### `Timestamp.isFuture(): bool`
+
+Same meaning as the `DateTime` pair, compared directly as nanosecond counts.
 
 ---
 
@@ -746,6 +1185,97 @@ transition `differenceInDays` is 1 while `differenceInHours` is 25.
 a daylight saving transition even though 25 hours of real time elapsed. Subtract
 two `Timestamp` values when real elapsed time is what matters. These two answers
 differing is correct, not a bug.
+
+### `Date.differenceInDays(other: Date): int`
+
+Complete calendar days from `this` to `other`, negative when `other` is
+earlier. Exact: a `Date` has no time of day, so nothing is truncated away.
+
+### `Date.differenceInWeeks(other: Date): int`
+
+`differenceInDays` divided by 7, truncated toward zero: six days is 0, eight
+days is 1.
+
+### `Date.differenceInMonths(other: Date): int`
+
+Complete months from `this` to `other` (the `addMonths` anniversary rule
+above): 2026-01-31 to 2026-02-28 is 1.
+
+### `Date.differenceInYears(other: Date): int`
+
+`differenceInMonths` divided by 12.
+
+### `NaiveDateTime.differenceInSeconds(other: NaiveDateTime): int`
+
+Complete seconds from `this` to `other`, truncated toward zero. Nanoseconds
+count toward completeness but are never reported here: a gap of 1.9 seconds
+is 1.
+
+### `NaiveDateTime.differenceInMinutes(other: NaiveDateTime): int`
+
+### `NaiveDateTime.differenceInHours(other: NaiveDateTime): int`
+
+`differenceInSeconds` divided by 60 or 3600.
+
+### `NaiveDateTime.differenceInDays(other: NaiveDateTime): int`
+
+Complete days from `this` to `other`. A wall-clock day here is exactly 24
+hours, so 2026-09-17T09:00 to 2026-09-18T08:59 is 0 days, not 1.
+
+### `NaiveDateTime.differenceInWeeks(other: NaiveDateTime): int`
+
+### `NaiveDateTime.differenceInMonths(other: NaiveDateTime): int`
+
+Complete months, time of day included: the anniversary must have been
+reached, so 2026-01-31T09:00 to 2026-02-28T08:00 is 0 months and
+2026-02-28T09:00 is 1.
+
+### `NaiveDateTime.differenceInYears(other: NaiveDateTime): int`
+
+`differenceInMonths` divided by 12.
+
+### `DateTime.differenceInSeconds(other: DateTime): int`
+
+Complete seconds of **real elapsed time** from `this` to `other` - the
+instant difference, so it agrees with `compare` and with subtracting the two
+`Timestamp` values: 90000 across a fall-back day, not 86400.
+
+### `DateTime.differenceInMinutes(other: DateTime): int`
+
+### `DateTime.differenceInHours(other: DateTime): int`
+
+Real elapsed time, from `differenceInSeconds`: 25 across a fall-back day, 23
+across a spring-forward day.
+
+### `DateTime.differenceInDays(other: DateTime): int`
+
+Complete **calendar** days from `this` to `other`, read on the wall clock: 1
+across a daylight saving transition even though 25 hours of real time
+elapsed. Cross-zone callers convert one side with `withZone` first - this
+reads each side's own wall clock.
+
+### `DateTime.differenceInWeeks(other: DateTime): int`
+
+### `DateTime.differenceInMonths(other: DateTime): int`
+
+### `DateTime.differenceInYears(other: DateTime): int`
+
+Complete calendar weeks, months or years from `this` to `other`, on the wall
+clock.
+
+### `Timestamp.differenceInNanoseconds(other: Timestamp): int`
+
+Nanoseconds of real elapsed time from `this` to `other`, exact and negative
+when `other` is earlier.
+
+### `Timestamp.differenceInSeconds(other: Timestamp): int`
+
+### `Timestamp.differenceInMinutes(other: Timestamp): int`
+
+### `Timestamp.differenceInHours(other: Timestamp): int`
+
+`differenceInNanoseconds` divided down to whole seconds, minutes or hours,
+truncated toward zero.
 
 ```bit
 import { Date } from "std/time"
@@ -862,6 +1392,82 @@ holiday run is a caller error, not a runtime condition, so it is not reported as
 failure. The cap is on the consecutive non-business-day run, not on the whole call:
 `addBusinessDays(c, 5000)` is fine.
 
+### `Date.isWeekend(w: Weekend): bool`
+
+True when this day is one of `w`'s days off.
+
+### `Date.isWeekday(w: Weekend): bool`
+
+Exactly `!isWeekend(w)`: holidays play no part, a holiday is still a
+weekday.
+
+### `Date.isBusinessDay(c: Calendar): bool`
+
+True when this day is neither a weekend day nor one of `c`'s holidays.
+
+### `Date.nextBusinessDay(c: Calendar): Date`
+
+The next business day strictly after this one.
+
+### `Date.previousBusinessDay(c: Calendar): Date`
+
+The last business day strictly before this one.
+
+### `Date.addBusinessDays(c: Calendar, n: int): Date`
+
+This day moved `n` business days; `n` may be negative, and `n == 0` returns
+this day unchanged even when it is not itself a business day.
+
+### `Date.differenceInBusinessDays(c: Calendar, other: Date): int`
+
+Complete business days from this day to `other`, excluding the earlier of
+the two and including the later, negative when `other` is earlier.
+
+### `NaiveDateTime.isWeekend(w: Weekend): bool`
+
+### `NaiveDateTime.isWeekday(w: Weekend): bool`
+
+True when this wall clock's **date** is or is not one of `w`'s days off -
+the time of day carries no information here.
+
+### `NaiveDateTime.isBusinessDay(c: Calendar): bool`
+
+### `NaiveDateTime.nextBusinessDay(c: Calendar): Date`
+
+### `NaiveDateTime.previousBusinessDay(c: Calendar): Date`
+
+### `NaiveDateTime.addBusinessDays(c: Calendar, n: int): Date`
+
+### `NaiveDateTime.differenceInBusinessDays(c: Calendar, other: Date): int`
+
+Each reads this wall clock's date and answers exactly as the matching
+`Date` method does; the three that return a date return a `Date`, not a
+`NaiveDateTime` - the time of day is not carried.
+
+### `DateTime.isWeekend(w: Weekend): bool`
+
+### `DateTime.isWeekday(w: Weekend): bool`
+
+True when this zoned value's **wall-clock date** is or is not one of `w`'s
+days off - read from the wall clock, not the instant, so it answers in the
+caller's zone rather than in UTC.
+
+### `DateTime.isBusinessDay(c: Calendar): bool`
+
+Unaffected by a daylight saving transition on this date: the calendar day
+is the same whether it ran 23, 24 or 25 hours.
+
+### `DateTime.nextBusinessDay(c: Calendar): Date`
+
+### `DateTime.previousBusinessDay(c: Calendar): Date`
+
+### `DateTime.addBusinessDays(c: Calendar, n: int): Date`
+
+### `DateTime.differenceInBusinessDays(c: Calendar, other: Date): int`
+
+Each reads this zoned value's wall-clock date and answers exactly as the
+matching `Date` method does, returning a `Date` with no zone and no offset.
+
 ```bit
 import { calendar, weekendSatSun, Date } from "std/time"
 
@@ -877,6 +1483,31 @@ fn paymentDue(invoiced: Date, holidays: []Date): Date {
 
 **Shipped**, on `Date`, `Time`, `NaiveDateTime` and `DateTime`. Parsing, the
 other direction, is shipped too - see [Parsing](#parsing).
+
+### `Date.format(pattern: string): string!`
+
+This date, rendered with the LDML symbols below. Fails on `Y` or `D`, on an
+unknown pattern letter, on an unterminated quoted literal, and on any time or
+zone symbol - a `Date` has neither.
+
+### `Time.format(pattern: string): string!`
+
+This time of day, rendered with the LDML symbols below. Fails on any date or
+zone symbol - a `Time` carries neither - as well as on the pattern errors
+every receiver rejects.
+
+### `NaiveDateTime.format(pattern: string): string!`
+
+This wall clock, rendered with the LDML symbols below. Date and time symbols
+both resolve; a zone symbol fails, because a `NaiveDateTime` has no zone and
+no offset to render.
+
+### `DateTime.format(pattern: string): string!`
+
+This zoned value, rendered with the LDML symbols below. Every symbol this
+module implements resolves. Date and time symbols read the **wall clock**,
+not the instant, so they answer in this value's own zone; `Z` and `X` render
+the offset resolved at construction, and `V` the zone identifier.
 
 ### `format(pattern: string): string!`
 
