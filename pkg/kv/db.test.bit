@@ -1,0 +1,375 @@
+// pkg/kv/db.test.bit — the closure-scoped write API (#3467, #5721).
+//
+// The load-bearing properties, one test each: a commit is visible to a fresh
+// read, a failed or panicked block leaves nothing visible and the meta txid
+// unchanged, a nested `db.write` is a hard error rather than a savepoint, a
+// SECOND OS PROCESS truly contends for the writer lock (not merely an
+// in-process mutex), and a delete-then-reinsert cycle proves the free list is
+// REUSED — the file returns to its pre-cycle size, not merely tracked while
+// still growing. The last one is this file's own mutation-tested property:
+// `kvTruncateFreePages` short-circuited to `return free` unmodified (never
+// reclaiming a trailing garbage page) turned it red — see the comment above
+// that test.
+
+import { readFile, writeFile, mkdir, readDir } from "std/fs"
+import { contains, hasSuffix } from "std/strings"
+
+fn scratchPath5721(tag: string): string {
+  return "${envOr("TMPDIR", "/tmp")}/bit-kv-5721-${tag}-${timeUnixNs()}"
+}
+
+// `get`, with a not-found (or any other failure) read back as an empty
+// slice instead of propagated — every rollback test below only needs "is
+// this key visible", not the distinction between absent and erroring.
+fn getOrEmpty(e: Engine, root: i64, key: []byte): []byte {
+  let v = get(e, root, key) catch _ {
+    return []byte(0)
+  }
+  return v
+}
+
+test "committed writes are visible via a read-only get() after write() returns" {
+  let path = scratchPath5721("commit")
+  let db = createDb(path) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  db.write((tx) => {
+    tx.put([]byte("a"), []byte("1"))?
+    tx.put([]byte("b"), []byte("2"))?
+    tx.put([]byte("c"), []byte("3"))?
+  }) catch e {
+    panic("write: ${e.message()}")
+  }
+  assert(string(getOrEmpty(db.eng, db.root, []byte("a"))) == "1", "a")
+  assert(string(getOrEmpty(db.eng, db.root, []byte("b"))) == "2", "b")
+  assert(string(getOrEmpty(db.eng, db.root, []byte("c"))) == "3", "c")
+  db.close()
+}
+
+test "a failing block leaves no new data visible and the meta txid unchanged" {
+  let path = scratchPath5721("fail")
+  let db = createDb(path) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  let txidBefore = db.eng.txid
+  let rootBefore = db.root
+  let failed = false
+  db.write((tx) => {
+    tx.put([]byte("x"), []byte("1"))?
+    fail newError("forced failure")
+  }) catch _ {
+    failed = true
+  }
+  assert(failed, "db.write must fail when the block fails")
+  assert(
+    db.eng.txid == txidBefore,
+    "txid changed on a failed write: ${db.eng.txid} != ${txidBefore}",
+  )
+  assert(db.root == rootBefore, "root changed on a failed write")
+  assert(
+    len(getOrEmpty(db.eng, db.root, []byte("x"))) == 0,
+    "key must not be visible after a failed write",
+  )
+  db.close()
+}
+
+test "a panicking block leaves no new data visible and the meta txid unchanged" {
+  let path = scratchPath5721("panic")
+  let db = createDb(path) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  let txidBefore = db.eng.txid
+  let (panicked, msg) = runRecovering(() => {
+    db.write((tx) => {
+      tx.put([]byte("y"), []byte("1"))?
+      panic("forced panic")
+    }) catch e {
+      panic("write returned a failure instead of propagating the panic: ${e.message()}")
+    }
+  })
+  assert(panicked, "db.write must propagate a panicking block's own panic")
+  assert(contains(msg, "forced panic"), "panic message: ${msg}")
+  assert(
+    db.eng.txid == txidBefore,
+    "txid changed on a panicked write: ${db.eng.txid} != ${txidBefore}",
+  )
+  assert(
+    len(getOrEmpty(db.eng, db.root, []byte("y"))) == 0,
+    "key must not be visible after a panicked write",
+  )
+  db.close()
+}
+
+test "a nested db.write() call fails rather than running as a savepoint" {
+  let path = scratchPath5721("nested")
+  let db = createDb(path) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  let failed = false
+  db.write((tx) => {
+    tx.put([]byte("outer"), []byte("1"))?
+    db.write((inner) => {
+      inner.put([]byte("inner"), []byte("1"))?
+    })?
+  }) catch e {
+    failed = true
+    assert(
+      contains(e.message(), "nested") || contains(e.message(), "already running"),
+      "unexpected failure: ${e.message()}",
+    )
+  }
+  assert(failed, "a nested db.write() must fail, not run as a savepoint")
+  assert(
+    len(getOrEmpty(db.eng, db.root, []byte("outer"))) == 0,
+    "the outer write must roll back too",
+  )
+  db.close()
+}
+
+// MUTATION-TESTED: `kvTruncateFreePages` changed to `return free` as its
+// first line (never reclaiming a trailing garbage page) turned this red —
+// `after` grew every cycle instead of returning to `baseline`. Reverting
+// made it green again.
+test "repeated delete-then-reinsert cycles reuse the free list instead of growing the file" {
+  let path = scratchPath5721("freelist")
+  let db = createDb(path) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  db.write((tx) => {
+    tx.put([]byte("k"), []byte("v"))?
+  }) catch e {
+    panic("seed write: ${e.message()}")
+  }
+  let baseline = db.eng.file.size() catch e {
+    panic("size: ${e.message()}")
+  }
+
+  let i = 0
+  while (i < 5) {
+    db.write((tx) => {
+      tx.delete([]byte("k"))?
+    }) catch e {
+      panic("delete cycle ${i}: ${e.message()}")
+    }
+    db.write((tx) => {
+      tx.put([]byte("k"), []byte("v"))?
+    }) catch e {
+      panic("put cycle ${i}: ${e.message()}")
+    }
+    i = i + 1
+  }
+  let after = db.eng.file.size() catch e {
+    panic("size after: ${e.message()}")
+  }
+  assert(
+    after == baseline,
+      "file grew from ${baseline} to ${after} bytes across 5 delete/put cycles " +
+      "-- the free list is being leaked, not reused",
+  )
+  db.close()
+}
+
+// --- cross-process writer lock ---------------------------------------------
+//
+// Builds a real second Bit binary (a copy of this module plus a generated
+// `main.bit`, same technique `pkg/web/node.test.bit`'s allocation benchmark
+// uses) and runs it as a genuine child OS process, matching #4014's own
+// cross-process acceptance pattern -- backgrounded from a `/bin/sh` wrapper
+// rather than a Bit-side `spawn`; see `lockWrapperScript`'s own comment for
+// why. Skips, rather than fails, when no usable compiler is discoverable --
+// same contract as `pkg/web`'s bench test.
+
+class BitLocation {
+  bin: string,
+  stdlib: string,
+  repo: string,
+}
+
+fn locateBit5721(): BitLocation {
+  let bin = envOr("BIT_BIN", "")
+  let stdlib = envOr("BIT_STDLIB", "")
+  let repo = envOr("BIT_REPO", "")
+  let fromEnv = len(bin) > 0 && exists(bin) && len(stdlib) > 0 && exists(stdlib)
+  fromEnv = fromEnv && len(repo) > 0 && exists("${repo}/pkg/kv/db.bit")
+  if (fromEnv) {
+    return BitLocation{ bin = bin, stdlib = stdlib, repo = repo }
+  }
+  if (exists("bit-out/bin/bit") && exists("stdlib") && exists("pkg/kv/db.bit")) {
+    return BitLocation{ bin = "bit-out/bin/bit", stdlib = "stdlib", repo = "." }
+  }
+  return BitLocation{ bin = "", stdlib = "", repo = "" }
+}
+
+// Reads its db path, ready-file path and hold duration (ns) from argv, opens
+// the db, and holds the writer lock across a sleep before committing -- the
+// window the parent's own write() attempt has to prove it waited.
+//
+// `main.bit` IMPORTS the copied module from "./kvmod" rather than sitting
+// alongside it as one combined directory module: built as its own directory,
+// pkg/kv's `open` (engine.bit) collides with a runtime-resolved extern link
+// name at the ROOT module only (E0096, SPEC §11.7) -- every other module is
+// unaffected, since only the root module keeps bare link names. A single
+// file named on the command line is its own one-file module (SPEC §17.1), so
+// `main.bit` built directly is the root and `./kvmod` is not.
+fn childMainSrc5721(): string {
+  return "import { arg } from \"std/os\"\n" +
+    "import { writeFile } from \"std/fs\"\n" +
+    "import { sleep } from \"std/time\"\n" +
+    "import { parseInt } from \"std/strings\"\n" +
+    "import { openDb } from \"./kvmod\"\n" +
+    "fn main() {\n" +
+    "  let dbPath = arg(1)\n" +
+    "  let readyPath = arg(2)\n" +
+    "  let heldNs = parseInt(arg(3)) catch _ { 0 }\n" +
+    "  let db = openDb(dbPath) catch e { panic(\"child open: \" + e.message()) }\n" +
+    "  db.write((tx) => {\n" +
+    "    writeFile(readyPath, \"1\")?\n" +
+    "    sleep(heldNs)\n" +
+    "    tx.put([]byte(\"child\"), []byte(\"1\"))?\n" +
+    "  }) catch e { panic(\"child write: \" + e.message()) }\n" +
+    "}\n"
+}
+
+// Every non-test source file in pkg/kv, copied verbatim, plus the generated
+// entry point -- the same "copy the real module" technique `pkg/web`'s own
+// cross-process benchmark uses, for the same reason: a hand-picked file list
+// goes stale the next time this module gains a file.
+fn writeChildModule5721(loc: BitLocation, dir: string) {
+  let kvDir = "${dir}/kvmod"
+  mkdir(kvDir) catch e {
+    panic("kv lock test: mkdir ${kvDir}: ${e.message()}")
+  }
+  let names = readDir("${loc.repo}/pkg/kv") catch e {
+    panic("kv lock test: readDir pkg/kv: ${e.message()}")
+  }
+  for name of names {
+    if (!hasSuffix(name, ".bit") || hasSuffix(name, ".test.bit")) {
+      continue
+    }
+    let src = readFile("${loc.repo}/pkg/kv/${name}") catch e {
+      panic("kv lock test: read ${name}: ${e.message()}")
+    }
+    writeFile("${kvDir}/${name}", src) catch e {
+      panic("kv lock test: write ${name}: ${e.message()}")
+    }
+  }
+  writeFile("${dir}/main.bit", childMainSrc5721()) catch e {
+    panic("kv lock test: write main.bit: ${e.message()}")
+  }
+}
+
+fn buildChild5721(loc: BitLocation, dir: string, prog: string): int {
+  let script = "#!/bin/sh\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
+    "'${loc.bin}' build '${dir}/main.bit' -o '${prog}'\n"
+  return shellRun5721("${dir}/build.sh", script, 60000)
+}
+
+fn shellRun5721(path: string, script: string, timeoutMs: int): int {
+  writeFile(path, script) catch _ {
+    return -999
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700: owner rwx only
+    return -998
+  }
+  return osRunBounded(path, timeoutMs)
+}
+
+// Backgrounds the compiled child fixture INSIDE the shell (`&`) and polls
+// for its readiness file there too, rather than a Bit-side `spawn` — proven
+// necessary, not stylistic: `std/os.run`'s blocking fork/exec/wait ties up
+// this test binary's own worker for its ENTIRE lifetime (measured directly —
+// a `spawn`ed `run("/bin/sleep", "2")` stalled this SAME process's own
+// unrelated `sleep`-based loop for the full 2s, not just the spawned task),
+// so a `spawn`+`run()` child never lets the parent's own `write()` attempt
+// proceed concurrently; it only ever observes the lock AFTER the child has
+// already released it. The wrapper script returns as soon as it sees the
+// ready file (bounded poll, `readyTries` of 100ms), leaving the actual
+// database-holding child detached and still running — confirmed separately
+// that a backgrounded grandchild survives its wrapper's own exit under
+// `osRunBounded`.
+fn lockWrapperScript(
+  prog: string,
+  dbPath: string,
+  readyPath: string,
+  heldNsArg: string,
+  readyTries: int,
+): string {
+  return "#!/bin/sh\n" +
+    "'${prog}' '${dbPath}' '${readyPath}' '${heldNsArg}' > /dev/null 2>&1 &\n" +
+    "n=0\n" +
+    "while [ $n -lt ${readyTries} ]; do\n" +
+    "  [ -f '${readyPath}' ] && exit 0\n" +
+    "  sleep 0.1\n" +
+    "  n=$((n+1))\n" +
+    "done\n" +
+    "exit 3\n"
+}
+
+test "a second os-level process holding the writer lock blocks the parent's write()" {
+  let loc = locateBit5721()
+  if (len(loc.bin) == 0 || len(loc.repo) == 0) {
+    println(
+        "pkg/kv cross-process lock test: no usable bit binary + BIT_STDLIB + " +
+        "BIT_REPO found (run via ./make test-package-kv, or set BIT_BIN/BIT_STDLIB/BIT_REPO) " +
+        "-- skipping",
+    )
+    return
+  }
+  let dir = scratchPath5721("lock")
+  mkdir(dir) catch e {
+    panic("mkdir ${dir}: ${e.message()}")
+  }
+  writeChildModule5721(loc, dir)
+  let prog = "${dir}/child"
+  let buildCode = buildChild5721(loc, dir, prog)
+  if (buildCode != 0) {
+    panic("pkg/kv cross-process lock test: building the child fixture failed (exit ${buildCode})")
+  }
+
+  let dbPath = "${dir}/db"
+  let seed = createDb(dbPath) catch e {
+    panic("createDb: ${e.message()}")
+  }
+  seed.close()
+
+  let readyPath = "${dir}/ready"
+  let heldMs = 1500
+  let readyTries = 100 // 100 x 100ms = 10s bound on the wrapper's own poll
+  let wrapCode = shellRun5721(
+    "${dir}/lock.sh",
+    lockWrapperScript(prog, dbPath, readyPath, "${heldMs * 1000000}", readyTries),
+    15000,
+  )
+  assert(
+    wrapCode == 0,
+      "the child process never signaled it took the writer lock within " +
+      "${readyTries * 100}ms (wrapper exit ${wrapCode})",
+  )
+
+  let db2 = openDb(dbPath) catch e {
+    panic("openDb: ${e.message()}")
+  }
+  let started = timeUnixNs()
+  db2.write((tx) => {
+    tx.put([]byte("parent"), []byte("1"))?
+  }) catch e {
+    panic("parent write failed: ${e.message()}")
+  }
+  let elapsedMs = (timeUnixNs() - started) / 1000000
+
+  assert(
+    elapsedMs >= heldMs - 300,
+      "the parent's write() returned after only ${elapsedMs}ms; it must WAIT for the " +
+      "child's ${heldMs}ms hold on the writer lock -- proving cross-process exclusion, " +
+      "not merely an in-process one",
+  )
+  assert(
+    string(getOrEmpty(db2.eng, db2.root, []byte("child"))) == "1",
+    "the child's own write must have committed",
+  )
+  assert(
+    string(getOrEmpty(db2.eng, db2.root, []byte("parent"))) == "1",
+    "the parent's write must have committed",
+  )
+  db2.close()
+}

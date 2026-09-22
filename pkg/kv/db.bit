@@ -1,0 +1,617 @@
+// pkg/kv/db.bit — the closure-scoped `db.write((tx) => {...})` transaction API
+// (#3467, #5721), plus the two things #5719 deliberately left for this
+// ticket: cross-process writer exclusivity and free-list page reuse.
+//
+// CLOSURE-ONLY, per the epic's OWNER RULING (#3467 comment 7, matching
+// `std/sql`'s #3979 shape, `stdlib/sql/tx.bit`): no `begin`/`commit`/
+// `rollback` exposed as public API. Bit's `?` returns early, so a correctness
+// property that depends on every caller remembering a `defer tx.rollback()`
+// is not a property, and in a SINGLE-writer engine a leaked write transaction
+// blocks every subsequent writer forever — worse than #3979's pooled
+// connections, where a leak costs one connection out of many.
+//
+// THE LOCK, STATED PRECISELY. `Db.write` takes `stdlib/fs/fs.bit`'s
+// `File.lock()` (#4014) on the database file before running the closure and
+// releases it (`unlock()`) once the closure returns, panics, or fails — that
+// is the actual cross-process guarantee, not merely an in-process mutex.
+// `bit_rt_fs_lock` is `flock(2)` (fs.bit's own comment on the extern), and
+// flock's lock lives on the OPEN FILE DESCRIPTION: if the holding process
+// dies for any reason, including `kill -9`, the kernel releases the lock when
+// the last descriptor referencing it closes — no second writer is ever
+// blocked forever by a dead holder, and no lock file is left to clean up by
+// hand. A SECOND writer's `db.write` call observes this by blocking inside
+// `File.lock()` until the first one's closure returns and its meta commit
+// finishes; `pkg/kv/db.test.bit`'s cross-process test proves this by timing
+// it, not by inspecting `flock`'s internal state, which nothing here exposes.
+//
+// flock is reentrant for the SAME open file description, so it does nothing
+// to stop a task from calling `db.write` again from inside its own closure —
+// `Db.writing` below is the actual guard for that, and it is what makes a
+// nested call fail loudly instead of quietly running unguarded against a
+// transaction still in flight.
+//
+// COMMIT/ROLLBACK, STATED PRECISELY. Commit on normal return: build a new
+// meta page (txid incremented, free-list root updated, the closure's own
+// final B+tree root) with a fresh CRC32C, `File.sync()` the data pages FIRST,
+// then write and sync the meta page NOT currently active — COW-then-flip, so
+// a crash before the meta write leaves the old meta page, and everything it
+// points at, exactly as it was. Rollback on failure (the closure's `?` or an
+// explicit `fail`) or on panic: simply never write the new meta page. Nothing
+// this ticket does is undone by rolling anything back — #5719's COW already
+// guarantees the old tree was never touched — so "rollback" here really is
+// "discard what was about to become the new meta page", not an undo log.
+// Either way `tx` stops working once the block returns (`Tx.usable`): an
+// escaped handle would mutate pages outside the transaction that owned it.
+//
+// A partial write is NEVER observable: every page a `put`/`delete` call
+// writes during the closure is reachable only from `tx.root`, which reaches
+// disk in exactly one write — the new meta page — that happens only after
+// the whole closure has returned normally. A reader (any fresh `openDb`, or
+// `get`/`scan` called directly against `db.root` between transactions) can
+// only ever see the LAST fully committed root, never one mid-construction.
+//
+// BYTE KEYS ONLY, so the sign-of-zero hazard #5719's header records is not
+// this file's to canonicalize — `Tx.put`/`Tx.get`/`Tx.delete` take `[]byte`
+// exactly as `#5719`'s own `get`/`put`/`delete` do. A typed layer built on
+// top of this file (pkg/kv's own #5724) is the one that must canonicalize
+// `-0.0` before calling `encodeFloat`; this file never sees a float.
+//
+// FREE-LIST DESIGN. See kvAllocator's own comment for why the free-list-aware
+// put/delete below is NOT a call to #5719's exported `put`/`delete`, and
+// kvTruncateFreePages' comment for exactly which freed pages become real
+// disk-space savings (trailing ones) versus merely tracked-for-later-reuse
+// ones (interior ones) — "no compaction/coalescing required" (this ticket's
+// own constraint) is why the difference is left standing rather than closed.
+
+import { runRecovering } from "std/runtime"
+
+// Re-reads whichever meta page is now current, using the ALREADY-OPEN (and,
+// by the time `Db.write` calls this, already LOCKED) file handle — picking
+// up any commit another writer made since this `Engine` was last read, the
+// same newer-valid-wins rule `open` itself uses (engine.bit), just without
+// opening a second file handle, and so a second flock, to do it. Without
+// this, a `Db` handle reused across two `write()` calls would silently
+// overwrite whatever the FIRST writer committed with a tree built from the
+// stale root this handle was opened (or last committed) with — the
+// lost-update bug `pkg/kv/db.test.bit`'s cross-process test caught: the
+// parent's `Db` was opened before the child's commit, and without this
+// refresh its own commit clobbered the child's.
+fn kvRefreshMeta(e: Engine): ()! {
+  let bufA = e.readPage(0)?
+  let bufB = e.readPage(1)?
+  let metaA = kvTryParseMeta(bufA)
+  let metaB = kvTryParseMeta(bufB)
+  if (isNone(metaA) && isNone(metaB)) {
+    fail newError("kv: write: both meta pages failed validation; cannot commit")
+  }
+  if (isSome(metaA) && (isNone(metaB) || unwrap(metaA).txid >= unwrap(metaB).txid)) {
+    let m = unwrap(metaA)
+    e.txid = m.txid
+    e.freeListRoot = m.freeListRoot
+    e.activeMeta = 0
+    return
+  }
+  let m = unwrap(metaB)
+  e.txid = m.txid
+  e.freeListRoot = m.freeListRoot
+  e.activeMeta = 1
+}
+
+// --- B+tree root persistence (this ticket's own extension of the meta page)
+//
+// #5716's meta format has no root field — #5719's B+tree needed none, since
+// nothing before this ticket persisted a committed tree across a reopen. The
+// bytes right after the header (`kvMetaHeaderSize`, 36) are zero-filled
+// padding #5716's own CRC already covers (`kvComputeCrc` spans the whole page
+// except the checksum field itself), so this stakes out 8 of them without
+// touching engine.bit or invalidating anything #5716 built: a page
+// `parseMetaPage` already validated is still exactly as valid with these 8
+// bytes read, and `buildMetaPage`'s zero-filled buffer already means an
+// unwritten root reads back as the stamp below, not garbage.
+const kvRootOffset: int = kvMetaHeaderSize
+
+// `create`'s meta pages are all-zero past the header, and page id 0 is
+// always meta A (never a valid B+tree root), so 0 doubles as the on-disk
+// "no root yet" stamp — avoiding a rewrite of the two meta pages #5716's own
+// `create` already wrote durably.
+fn kvReadRoot(buf: []byte): i64 {
+  let stamp = getI64(buf, kvRootOffset)
+  if (stamp == 0) {
+    return noRoot
+  }
+  return stamp
+}
+
+fn kvWriteRootField(buf: []byte, root: i64) {
+  if (root == noRoot) {
+    putI64(buf, kvRootOffset, 0)
+  } else {
+    putI64(buf, kvRootOffset, root)
+  }
+}
+
+// --- free list (this ticket's own format; #5716 only reserved the field) --
+//
+// A singly-linked chain of pages rooted at the meta page's `freeListRoot`,
+// each holding a batch of free page ids plus the next page in the chain (-1
+// for the last one). Rebuilt FRESH every commit, never patched in place: a
+// commit already knows the complete set of ids the next transaction may draw
+// from (this transaction's leftover unconsumed free ids, its own newly
+// orphaned pages, and the OLD chain's own storage pages, now superseded by
+// the chain this section is about to write), so there is nothing worth
+// preserving from the old chain's own page layout.
+
+const kvFreeListTag: byte = 2        // distinct from btree.bit's leaf(0)/internal(1)
+const kvFreeListHeaderSize: int = 13 // 1 tag + 4 count (u32) + 8 next (i64)
+
+fn kvFreeListMaxEntries(pageSize: int): int {
+  return (pageSize - kvFreeListHeaderSize) / 8
+}
+
+// `ids` (at most `kvFreeListMaxEntries(kvPageSize)` of them) plus `next`, as
+// one exact `kvPageSize`-byte page. Panics on overflow — same contract as
+// `kvEncodeNode`: the caller (`kvWriteFreeList`) chunks so this never fires.
+fn kvEncodeFreeListPage(ids: []i64, next: i64): []byte {
+  let max = kvFreeListMaxEntries(kvPageSize)
+  if (len(ids) > max) {
+    panic("kv: free-list page holds ${len(ids)} ids, exceeds capacity ${max}")
+  }
+  let buf = []byte(kvPageSize)
+  buf[0] = kvFreeListTag
+  putU32(buf, 1, u32(len(ids)))
+  putI64(buf, 5, next)
+  let off = kvFreeListHeaderSize
+  let i = 0
+  while (i < len(ids)) {
+    putI64(buf, off, ids[i])
+    off = off + 8
+    i = i + 1
+  }
+  return buf
+}
+
+// The inverse of `kvEncodeFreeListPage`. Fails loudly on a tag this format
+// does not recognize (#3467: a page that reads back as valid when it is not)
+// — `freeListRoot` only ever points at pages this file itself wrote, so a
+// wrong tag here means corruption or a bug, never valid input.
+fn kvDecodeFreeListPage(buf: []byte): ([]i64, i64)! {
+  if (buf[0] != kvFreeListTag) {
+    fail newError("kv: free-list page has tag ${buf[0]}, want ${kvFreeListTag}")
+  }
+  let count = int(getU32(buf, 1))
+  let next = getI64(buf, 5)
+  let ids: []i64 = []
+  let off = kvFreeListHeaderSize
+  let i = 0
+  while (i < count) {
+    ids = append(ids, getI64(buf, off))
+    off = off + 8
+    i = i + 1
+  }
+  return ids, next
+}
+
+// Every id on the chain rooted at `head`, plus the chain's OWN page ids (the
+// storage `kvWriteFreeList` allocated for a past commit's list) — the caller
+// needs both: the first to hand to `kvAllocator`, the second because this
+// transaction is about to replace the whole chain, so its old storage pages
+// are garbage too (see this section's header).
+fn kvReadFreeList(e: Engine, head: i64): ([]i64, []i64)! {
+  let ids: []i64 = []
+  let chainPages: []i64 = []
+  let id = head
+  while (id != kvNoFreeListRoot) {
+    chainPages = append(chainPages, id)
+    let buf = e.readPage(id)?
+    let (pageIds, next) = kvDecodeFreeListPage(buf)?
+    ids = append(ids, ...pageIds)
+    id = next
+  }
+  return ids, chainPages
+}
+
+// Persists `ids` as a fresh chain, chunked to `kvFreeListMaxEntries` ids per
+// page, and returns the new head (`kvNoFreeListRoot` if `ids` is empty).
+// Allocates through the same `kvAllocatePage` `kvAllocator` falls back to —
+// the free list's own storage pages are not reuse candidates for themselves
+// within one commit, only from the NEXT transaction onward, same rule as
+// every other page this commit frees (see `kvAllocator`'s own comment).
+fn kvWriteFreeList(e: Engine, ids: []i64): i64! {
+  if (len(ids) == 0) {
+    return kvNoFreeListRoot
+  }
+  let maxPer = kvFreeListMaxEntries(e.pageSize)
+  let next = kvNoFreeListRoot
+  let i = len(ids)
+  while (i > 0) {
+    let lo = i - maxPer
+    if (lo < 0) {
+      lo = 0
+    }
+    let chunk = ids[lo:i]
+    let id = kvAllocatePage(e)?
+    e.writePage(id, kvEncodeFreeListPage(chunk, next))?
+    next = id
+    i = lo
+  }
+  return next
+}
+
+// Reclaims trailing garbage: while the file's LAST page is present in
+// `free`, truncates it off and removes it from the set. This is the only
+// page-reuse this ticket turns into actual disk space back — an interior
+// free page (not at the tail) stays recorded in `free` and persisted to the
+// next commit's chain (`kvWriteFreeList`) rather than reclaimed here,
+// because reclaiming it would mean relocating whatever live page follows
+// it, which is the compaction this ticket's constraints explicitly exclude.
+// `kvAllocator` is what turns a page recorded here back into a REUSED page,
+// not merely a tracked one: pop it off `free`, and the next allocation
+// writes new content there instead of growing the file — proven by
+// `pkg/kv/db.test.bit`'s grow/shrink cycle, where the freed leaf and the
+// freed old free-list page both end up at the tail and both get reclaimed.
+fn kvTruncateFreePages(e: Engine, free: []i64): []i64! {
+  let remaining = free
+  let pages = e.file.size()? / i64(e.pageSize)
+  while (pages > 2) {
+    let last = pages - 1
+    let (kept, found) = kvRemoveId(remaining, last)
+    if (!found) {
+      return remaining
+    }
+    remaining = kept
+    e.file.truncate(last * i64(e.pageSize))?
+    pages = last
+  }
+  return remaining
+}
+
+fn kvRemoveId(ids: []i64, x: i64): ([]i64, bool) {
+  let out: []i64 = []
+  let found = false
+  let i = 0
+  while (i < len(ids)) {
+    if (!found && ids[i] == x) {
+      found = true
+    } else {
+      out = append(out, ids[i])
+    }
+    i = i + 1
+  }
+  return out, found
+}
+
+// --- free-list-aware put/delete orchestration ------------------------------
+//
+// Mirrors #5719's own `kvInsertInto`/`kvDeleteFrom`/`kvWriteLeafOrSplit`/
+// `kvWriteInternalOrSplit` exactly, reusing every one of its node-shape
+// functions (`kvUpsertLeaf`, `kvEncodeNode`, `kvDecodeNode`, `kvFindChild`,
+// `kvApplyChildResult`, `kvRemoveLeafAt`, `kvReplaceChild`,
+// `kvNodeEncodedSize`) — the one difference is the allocator. #5719's own
+// versions call `kvAllocatePage` directly, hardcoding the grow-only policy
+// this ticket exists to replace; modifying #5719's file to accept a
+// pluggable allocator would move free-list ownership into a ticket #5719
+// already shipped. `Tx.get`/`Tx.scan` below DO call #5719's exported
+// `get`/`scan` directly — reads allocate nothing, so there is no policy for
+// this ticket to own there.
+
+// Free-list-aware page allocator for one `write()` transaction: pops the
+// free list's last entry if one is available (no ordering promise needed —
+// see `kvTruncateFreePages`), else grows the file exactly like #5719's own
+// `kvAllocatePage`.
+class kvAllocator {
+  e: Engine
+  free: []i64
+
+  alloc(): i64! {
+    let n = len(this.free)
+    if (n > 0) {
+      let id = this.free[n - 1]
+      this.free = this.free[0:n - 1]
+      return id
+    }
+    return kvAllocatePage(this.e)?
+  }
+}
+
+// The page ids one transaction's put/delete calls superseded — every node
+// COW rewrote to a new id, collected as the walk goes so commit can persist
+// them onto the free list for the NEXT transaction. Never fed back into
+// THIS transaction's own `kvAllocator`: reusing a page this same transaction
+// just freed, before the transaction is known to commit, would need to be
+// undone again on rollback, for a saving that only matters within one
+// transaction's own page count — left as a possible future optimization,
+// not attempted here.
+class kvIdSet {
+  ids: []i64
+
+  add(id: i64) {
+    this.ids = append(this.ids, id)
+  }
+}
+
+fn kvTxWriteLeafOrSplit(a: kvAllocator, entries: []kvLeafEntry): kvInsertResult! {
+  let whole = kvNode.Leaf(entries)
+  if (kvNodeEncodedSize(whole) <= kvPageSize) {
+    let id = a.alloc()?
+    a.e.writePage(id, kvEncodeNode(whole))?
+    return kvInsertResult.Replaced(id)
+  }
+  let mid = len(entries) / 2
+  let left = entries[0:mid]
+  let right = entries[mid:len(entries)]
+  let leftId = a.alloc()?
+  a.e.writePage(leftId, kvEncodeNode(kvNode.Leaf(left)))?
+  let rightId = a.alloc()?
+  a.e.writePage(rightId, kvEncodeNode(kvNode.Leaf(right)))?
+  return kvInsertResult.Split(leftId, right[0].key, rightId)
+}
+
+fn kvTxWriteInternalOrSplit(a: kvAllocator, entries: []kvInternalEntry): kvInsertResult! {
+  let whole = kvNode.Internal(entries)
+  if (kvNodeEncodedSize(whole) <= kvPageSize) {
+    let id = a.alloc()?
+    a.e.writePage(id, kvEncodeNode(whole))?
+    return kvInsertResult.Replaced(id)
+  }
+  let mid = len(entries) / 2
+  let left = entries[0:mid]
+  let right = entries[mid:len(entries)]
+  let leftId = a.alloc()?
+  a.e.writePage(leftId, kvEncodeNode(kvNode.Internal(left)))?
+  let rightId = a.alloc()?
+  a.e.writePage(rightId, kvEncodeNode(kvNode.Internal(right)))?
+  return kvInsertResult.Split(leftId, right[0].key, rightId)
+}
+
+fn kvTxInsertInto(
+  a: kvAllocator,
+  freed: kvIdSet,
+  nodeId: i64,
+  key: []byte,
+  value: []byte,
+): kvInsertResult! {
+  let buf = a.e.readPage(nodeId)?
+  let node = kvDecodeNode(buf)
+  freed.add(nodeId)
+  match (node) {
+    Leaf(entries) => {
+      let newEntries = kvUpsertLeaf(entries, key, value)
+      return kvTxWriteLeafOrSplit(a, newEntries)?
+    }
+    Internal(entries) => {
+      let idx = kvFindChild(entries, key)
+      let childResult = kvTxInsertInto(a, freed, entries[idx].child, key, value)?
+      let newEntries = kvApplyChildResult(entries, idx, childResult)
+      return kvTxWriteInternalOrSplit(a, newEntries)?
+    }
+  }
+}
+
+// The new root after `kvTxInsertInto`'s result — the root-split half of
+// #5719's own `put`, ported the same way (an empty lower-bound key: see
+// `put`'s own comment on why `kvFindChild` never needs it to be exact).
+fn kvApplyInsertRoot(a: kvAllocator, result: kvInsertResult): i64! {
+  match (result) {
+    Replaced(id) => return id
+    Split(leftId, promoteKey, rightId) => {
+      let rootEntries: []kvInternalEntry = [
+        kvInternalEntry{ key = []byte(0), child = leftId },
+        kvInternalEntry{ key = promoteKey, child = rightId },
+      ]
+      let newRootId = a.alloc()?
+      a.e.writePage(newRootId, kvEncodeNode(kvNode.Internal(rootEntries)))?
+      return newRootId
+    }
+  }
+}
+
+fn kvTxDeleteFrom(a: kvAllocator, freed: kvIdSet, nodeId: i64, key: []byte): kvDeleteResult! {
+  let buf = a.e.readPage(nodeId)?
+  let node = kvDecodeNode(buf)
+  match (node) {
+    Leaf(entries) => {
+      let idx = kvFindLeaf(entries, key)
+      if (idx < 0) {
+        return kvDeleteResult.Unchanged
+      }
+      freed.add(nodeId)
+      let newEntries = kvRemoveLeafAt(entries, idx)
+      let id = a.alloc()?
+      a.e.writePage(id, kvEncodeNode(kvNode.Leaf(newEntries)))?
+      return kvDeleteResult.Removed(id)
+    }
+    Internal(entries) => {
+      let idx = kvFindChild(entries, key)
+      let childResult = kvTxDeleteFrom(a, freed, entries[idx].child, key)?
+      match (childResult) {
+        Unchanged => return kvDeleteResult.Unchanged
+        Removed(newChildId) => {
+          freed.add(nodeId)
+          let newEntries = kvReplaceChild(entries, idx, newChildId)
+          let id = a.alloc()?
+          a.e.writePage(id, kvEncodeNode(kvNode.Internal(newEntries)))?
+          return kvDeleteResult.Removed(id)
+        }
+      }
+    }
+  }
+}
+
+// --- the public API ---------------------------------------------------------
+
+// One transaction, live only for the duration of the `write()` block that
+// owns it. `tx.root` starts at the Db's last committed root and is updated
+// after every `put`/`delete`; `write()` reads it back at commit time.
+export class Tx {
+  db: Db
+  root: i64
+  alloc: kvAllocator
+  freed: kvIdSet
+  live: bool = true
+
+  // "The handle must not remain usable after the block returns" (#3467): an
+  // escaped `tx` would otherwise mutate pages outside the transaction that
+  // owned it, on a lock that transaction no longer holds.
+  usable(): ()! {
+    if (!this.live) {
+      fail newError(
+          "kv: tx: this transaction handle is dead; it works only inside the " +
+          "block db.write() gave it to",
+      )
+    }
+  }
+
+  get(key: []byte): []byte! {
+    this.usable()?
+    return get(this.db.eng, this.root, key)?
+  }
+
+  scan(lo: []byte, hi: []byte): [][]byte! {
+    this.usable()?
+    return scan(this.db.eng, this.root, lo, hi)?
+  }
+
+  put(key: []byte, value: []byte): ()! {
+    this.usable()?
+    if (this.root == noRoot) {
+      let id = this.alloc.alloc()?
+      this.db.eng.writePage(
+        id,
+        kvEncodeNode(kvNode.Leaf([kvLeafEntry{ key = key, value = value }])),
+      )?
+      this.root = id
+      return
+    }
+    let result = kvTxInsertInto(this.alloc, this.freed, this.root, key, value)?
+    this.root = kvApplyInsertRoot(this.alloc, result)?
+  }
+
+  delete(key: []byte): ()! {
+    this.usable()?
+    if (this.root == noRoot) {
+      return
+    }
+    let result = kvTxDeleteFrom(this.alloc, this.freed, this.root, key)?
+    match (result) {
+      Unchanged => {}
+      Removed(id) => { this.root = id }
+    }
+  }
+}
+
+// A single database file: one writer at a time (in-process AND
+// cross-process, see this file's header), unlimited concurrent readers
+// against whatever root the last commit left in `root`.
+export class Db {
+  eng: Engine
+  root: i64
+  writing: bool = false
+
+  clearWriting() {
+    this.writing = false
+  }
+
+  // Best-effort: `File.close` releases the lock unconditionally on Unix and
+  // Windows alike (fs.bit's own comment on `close`), so a failed explicit
+  // unlock here is not a stuck lock, only a lock that outlives this call a
+  // little longer than intended.
+  unlockQuiet() {
+    this.eng.file.unlock() catch _ {
+      return
+    }
+  }
+
+  export close() {
+    this.eng.close()
+  }
+
+  // Runs `f` against a fresh `Tx`: commit on normal return, rollback (never
+  // write the new meta page) on failure or panic. See this file's header for
+  // the full commit/rollback/lock contract.
+  export write(f: (Tx) => ()!): ()! {
+    if (this.writing) {
+      fail newError(
+          "kv: db.write: a write is already running on this Db handle; a " +
+          "nested db.write is an error, not a savepoint — a single-writer " +
+          "engine has no second writer to grant, and joining the outer one " +
+          "would let an inner rollback discard outer work (epic #3467)",
+      )
+    }
+    this.writing = true
+    defer this.clearWriting()
+    this.eng.file.lock()?
+    defer this.unlockQuiet()
+
+    kvRefreshMeta(this.eng)?
+    let metaBuf = this.eng.readPage(i64(this.eng.activeMeta))?
+    this.root = kvReadRoot(metaBuf)
+
+    let (avail, oldChain) = kvReadFreeList(this.eng, this.eng.freeListRoot)?
+    let tx = Tx{
+      db = this,
+      root = this.root,
+      alloc = kvAllocator{ e = this.eng, free = avail },
+      freed = kvIdSet{ ids = []i64(0) },
+    }
+    let failed = false
+    let cause = newError("kv: db.write: the block failed without reporting an error")
+    // The panic boundary, same shape `stdlib/sql/tx.bit`'s `txValueAt` uses:
+    // nothing here relies on `defer` to roll back, since a recovered panic
+    // runs no deferred call (SPEC §18.5) — "rollback" on this path is simply
+    // that the commit below never runs, reached by ordinary control flow.
+    let (panicked, msg) = runRecovering(() => {
+      f(tx) catch e {
+        failed = true
+        cause = e
+        return
+      }
+    })
+    tx.live = false
+    if (panicked) {
+      panic(msg)
+    }
+    if (failed) {
+      fail cause
+    }
+    this.commit(tx, oldChain)?
+  }
+
+  // Free-list maintenance, then the COW-then-flip meta commit (data synced
+  // before the meta page that points at it — this ticket's own constraint).
+  // Only ever called after `f` has returned normally, so rollback really is
+  // "this never ran": the old meta page, and every page it reaches, is
+  // untouched by everything above this point.
+  commit(tx: Tx, oldChain: []i64): ()! {
+    let allFree = append(tx.alloc.free, ...tx.freed.ids)
+    allFree = append(allFree, ...oldChain)
+    let kept = kvTruncateFreePages(this.eng, allFree)?
+    let newFreeListRoot = kvWriteFreeList(this.eng, kept)?
+    this.eng.file.sync()?
+    let newTxid = this.eng.txid + 1
+    let buf = buildMetaPage(newTxid, newFreeListRoot)
+    kvWriteRootField(buf, tx.root)
+    putU32(buf, kvCrcOffset, kvComputeCrc(buf))
+    let inactive = 1 - this.eng.activeMeta
+    this.eng.writePage(i64(inactive), buf)?
+    this.eng.file.sync()?
+    this.eng.txid = newTxid
+    this.eng.freeListRoot = newFreeListRoot
+    this.eng.activeMeta = inactive
+    this.root = tx.root
+  }
+}
+
+// Creates a brand-new database at `path` (delegates to #5716's own `create`
+// for the file/meta-page format) with an empty tree and an empty free list.
+export fn createDb(path: string): Db! {
+  let eng = create(path)?
+  return Db{ eng = eng, root = noRoot }
+}
+
+// Opens an existing database, reading the committed root out of whichever
+// meta page #5716's own `open` picked as current.
+export fn openDb(path: string): Db! {
+  let eng = open(path)?
+  let buf = eng.readPage(i64(eng.activeMeta))?
+  return Db{ eng = eng, root = kvReadRoot(buf) }
+}
