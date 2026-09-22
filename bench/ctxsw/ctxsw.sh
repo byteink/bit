@@ -87,20 +87,29 @@ while [ $r -le "$ROUNDS" ]; do
       "cd $REMOTE && BIT_WORKERS=$WORKERS BIT_CTXSW_TASKS=$TASKS BIT_CTXSW_TURNS=$TURNS BIT_CTXSW_PERIOD_NS=$PERIOD ./'${LABELS[$i]}'" </dev/null)
     echo "$out" | sed "s/^/[${LABELS[$i]} r$r] /"
     cs=$(echo "$out" | sed -n 's/.*cs_per_wake=\([0-9.]*\).*/\1/p')
+    ns=$(echo "$out" | sed -n 's/.*ns_per_wake=\([0-9.]*\).*/\1/p')
     same=$(echo "$out" | sed -n 's/.*same_thread=\([a-z]*\).*/\1/p')
     [ "$same" = "true" ] || { echo "ctxsw: ${LABELS[$i]} round $r migrated between reads — reading discarded" >&2; cs=""; }
-    [ -n "$cs" ] && echo "${LABELS[$i]} $cs" >> "$RES"
+    [ -n "$cs" ] && echo "${LABELS[$i]} $cs ${ns:-0}" >> "$RES"
     i=$((i + 1))
   done
   r=$((r + 1))
 done
 
 # --- report -----------------------------------------------------------------
-echo "ctxsw summary (cs per timer wake, median of the kept readings)"
+# BOTH numbers, because they answer different questions and the cheap one is not
+# always the one asked: cs_per_wake says whether a change added a block/wake
+# pair, ns_per_wake says what one wake COST. #5743 found a change that left
+# cs_per_wake at exactly 1.000 and moved ns_per_wake by ~55us, and the summary
+# printed only the column that could not see it.
+_median() {                        # $1 = label, $2 = column in $RES
+  awk -v l="$1" -v c="$2" '$1 == l { print $c }' "$RES" | sort -n |
+    awk '{a[NR]=$1} END{ if (NR%2) print a[(NR+1)/2]; else printf "%.3f\n", (a[NR/2]+a[NR/2+1])/2 }'
+}
+echo "ctxsw summary (medians of the kept readings)"
 for l in "${LABELS[@]}"; do
-  vals=$(awk -v l="$l" '$1 == l { print $2 }' "$RES" | sort -n)
-  n=$(echo "$vals" | grep -c . || true)
+  n=$(awk -v l="$l" '$1 == l' "$RES" | grep -c . || true)
   [ "$n" -gt 0 ] || { echo "  $l  no readings"; continue; }
-  med=$(echo "$vals" | awk '{a[NR]=$1} END{ if (NR%2) print a[(NR+1)/2]; else printf "%.3f\n", (a[NR/2]+a[NR/2+1])/2 }')
-  echo "  $l  median=$med  n=$n  all=$(echo "$vals" | tr '\n' ' ')"
+  echo "  $l  cs_per_wake=$(_median "$l" 2)  ns_per_wake=$(_median "$l" 3)  n=$n"
+  echo "      ns all=$(awk -v l="$l" '$1 == l { print $3 }' "$RES" | sort -n | tr '\n' ' ')"
 done
