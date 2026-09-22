@@ -51,7 +51,10 @@
 // backend); this is the first point where the selected target and the AST are
 // both in hand, and the archive path is a pure function of the target. Mirrors
 // the seed's rejectExternForTarget.
-fn rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8, linking: bool): bool {
+fn rejectExternForTarget(
+  p: Project, target: BuildTarget, rtArchive: []u8, extraArchives: [][]u8,
+  linking: bool,
+): bool {
   if (!linking) {
     return false
   }
@@ -96,18 +99,10 @@ fn rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8, linki
       if (symbol == "bit_main") {
         continue
       }
-      if (externResolvable(target, rtArchive, symbol, pins)) {
+      if (externResolvable(target, rtArchive, extraArchives, symbol, pins)) {
         continue
       }
-      let what = "is not defined in the runtime archive for target"
-      let note = "the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved"
-      if (target == BuildTarget.Aarch64Macos) {
-        what = "is defined neither in the runtime archive nor by libSystem, for target"
-        note = "dyld would bind it to libSystem and abort at load: only a symbol inside libbitrt.a or exported by libSystem can be resolved"
-      } else if (target == BuildTarget.X86_64Windows) {
-        what = "is defined neither in the runtime archive nor by the admitted kernel32 import surface, for target"
-        note = "the loader would refuse to bind it: only a symbol inside libbitrt.a or admitted by pesyms.bit's windowsImportDefines can be resolved"
-      }
+      let (what, note) = externRejectionMessage(target, extraArchives)
       report(
         p.diags, ecExternUnsupportedTarget, getNode(m.tree, inner).span,
         "'extern fn' ${symbol} ${what} ${buildTargetName(target)}", note,
@@ -120,6 +115,35 @@ fn rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8, linki
   return found
 }
 
+// The rejected-symbol diagnostic's (what, note) pair for `target`, split out
+// of rejectExternForTarget to keep that function's own branching off the
+// complexity debt list (tools/build/complexity-debt.txt) it is already on.
+// `note` always names libbitrt.a and, when `extraArchives` is non-empty, also
+// says how many external archives were checked -- so the note never reads as
+// "only libbitrt.a was consulted" when it was not (#5711/#5712).
+fn externRejectionMessage(target: BuildTarget, extraArchives: [][]u8): (string, string) {
+  let checked = "libbitrt.a"
+  if (len(extraArchives) > 0) {
+    checked = "libbitrt.a and ${len(extraArchives)} external archive(s) from bit.json's \"link\" array"
+  }
+  if (target == BuildTarget.Aarch64Macos) {
+    return (
+      "is defined neither in the runtime archive nor by libSystem, for target",
+      "dyld would bind it to libSystem and abort at load: only a symbol inside ${checked} or exported by libSystem can be resolved",
+    )
+  }
+  if (target == BuildTarget.X86_64Windows) {
+    return (
+      "is defined neither in the runtime archive nor by the admitted kernel32 import surface, for target",
+      "the loader would refuse to bind it: only a symbol inside ${checked} or admitted by pesyms.bit's windowsImportDefines can be resolved",
+    )
+  }
+  return (
+    "is not defined in the runtime archive for target",
+    "the Linux output is fully static: only a symbol already inside ${checked} can be resolved",
+  )
+}
+
 // Whether the link this build is about to perform can resolve `symbol`, per
 // SPEC §11.7. One function so the two targets' answers cannot drift into two AST
 // walks: what differs between them is only where a symbol may legitimately come
@@ -128,22 +152,27 @@ fn rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8, linki
 //   - Every target: a §11.9 pin one of this build's own modules defines
 //     (`pins`) — the final link resolves it out of the program's own object,
 //     exactly the way `bit_main` is resolved above.
-//   - Linux: otherwise the merged libbitrt.a, and nothing else — the image is
+//   - Linux: otherwise the merged libbitrt.a or any of `extraArchives`
+//     (bit.json's "link" array, #5711), and nothing else — the image is
 //     static, with no interpreter and no dynamic symbol table.
-//   - Darwin: otherwise that same archive OR libSystem, which the Mach-O image
-//     loads as LC_LOAD_DYLIB and dyld binds at load.
-//   - Windows: otherwise that same archive (empty until #3341 builds it, so
-//     peArchiveDefines always answers false meanwhile) OR pesyms.bit's
-//     windowsImportDefines, which the loader binds via the PE import
-//     directory (pelink.bit's .idata).
+//   - Darwin: otherwise that same archive set OR libSystem, which the
+//     Mach-O image loads as LC_LOAD_DYLIB and dyld binds at load.
+//   - Windows: otherwise that same archive set (rtArchive empty until #3341
+//     builds it, so peArchiveDefines always answers false meanwhile) OR
+//     pesyms.bit's windowsImportDefines, which the loader binds via the PE
+//     import directory (pelink.bit's .idata).
 //
-// Undecidable inputs (an empty or malformed archive) answer false on both, so
-// the caller rejects — the sound direction, since accepting on unknown trades a
-// compile error for a crash. The pin lookup runs first because it is O(1) while
-// archiveDefines reparses every archive member, and a pinned name is by design
-// absent from the archive. Mirrors the seed's externResolvable.
+// `extraArchives` is checked with the SAME per-target membership function as
+// `rtArchive` — machoArchiveDefines/peArchiveDefines/archiveDefines detect an
+// archive FORMAT, not a specific archive's purpose, so calling one again on a
+// second archive's bytes is correct, not a hack. Undecidable inputs (an empty
+// or malformed archive) answer false on both, so the caller rejects — the
+// sound direction, since accepting on unknown trades a compile error for a
+// crash. The pin lookup runs first because it is O(1) while archiveDefines
+// reparses every archive member, and a pinned name is by design absent from
+// the archive. Mirrors the seed's externResolvable.
 fn externResolvable(
-  target: BuildTarget, rtArchive: []u8, symbol: string,
+  target: BuildTarget, rtArchive: []u8, extraArchives: [][]u8, symbol: string,
   pins: map<string, bool>,
 ): bool {
   let (_, pinned) = pins[symbol]
@@ -151,18 +180,56 @@ fn externResolvable(
     return true
   }
   if (target == BuildTarget.Aarch64Macos) {
-    if (machoArchiveDefines(rtArchive, symbol)) {
+    if (machoArchiveDefines(rtArchive, symbol) || machoArchiveDefinesAny(extraArchives, symbol)) {
       return true
     }
     return libsystemDefines(symbol)
   }
   if (target == BuildTarget.X86_64Windows) {
-    if (peArchiveDefines(rtArchive, symbol)) {
+    if (peArchiveDefines(rtArchive, symbol) || peArchiveDefinesAny(extraArchives, symbol)) {
       return true
     }
     return windowsImportDefines(symbol)
   }
-  return archiveDefines(elfLinkTargetOf(target), rtArchive, symbol)
+  let lt = elfLinkTargetOf(target)
+  return archiveDefines(lt, rtArchive, symbol) || archiveDefinesAny(lt, extraArchives, symbol)
+}
+
+// Whether any member of `archives` defines `symbol`, per `machoArchiveDefines`
+// (Darwin). Same detector, called once per extra archive (this file's header).
+fn machoArchiveDefinesAny(archives: [][]u8, symbol: string): bool {
+  let i = 0
+  while (i < len(archives)) {
+    if (machoArchiveDefines(archives[i], symbol)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Windows twin of machoArchiveDefinesAny, over `peArchiveDefines`.
+fn peArchiveDefinesAny(archives: [][]u8, symbol: string): bool {
+  let i = 0
+  while (i < len(archives)) {
+    if (peArchiveDefines(archives[i], symbol)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Linux twin of machoArchiveDefinesAny, over `archiveDefines`.
+fn archiveDefinesAny(target: ElfLinkTarget, archives: [][]u8, symbol: string): bool {
+  let i = 0
+  while (i < len(archives)) {
+    if (archiveDefines(target, archives[i], symbol)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 // Whether the ROOT module of `p` — the code the operand actually named,
