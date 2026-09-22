@@ -702,13 +702,14 @@ from it, rather than stepping forward one month at a time from the last one.
 
 | Method | Notes |
 |---|---|
-| `withYear(y)` `withMonth(m)` | clamps the day to fit the new year/month |
-| `withDay(d)` | **not** clamped - `d` is written through directly |
+| `withYear(y)` `withMonth(m)` `withDay(d)` | clamps the day to fit the new year/month |
 | `withHour(h)` `withMinute(m)` `withSecond(s)` `withNanosecond(n)` | |
 | `withTime(h, m, s)` | on `NaiveDateTime` and `DateTime` |
 | `withZone(z)` | on `DateTime`, keeps the instant |
 
-`withMonth` clamps: 2026-01-31 `withMonth(2)` is 2026-02-28.
+`withMonth` clamps: 2026-01-31 `withMonth(2)` is 2026-02-28. `withDay` clamps
+the same way: it can only produce a day that already exists in `this` month,
+so it never builds a `Date` reading, say, February 31.
 
 ### `Date.withYear(y: int): Date`
 
@@ -722,10 +723,10 @@ month: 2026-01-31 `withMonth(2)` is 2026-02-28.
 
 ### `Date.withDay(d: int): Date`
 
-`this` with the day of month replaced by `d`. **Not clamped** - `d` is
-written through directly, unlike `withYear`/`withMonth`, so
+`this` with the day of month replaced by `d`, clamped to the last valid day
+of `this` year and month, the same as `withYear`/`withMonth`:
 `date(2026, 1, 15).withDay(31)` is `2026-01-31` and `date(2026, 2, 15).withDay(31)`
-produces a `Date` reading `2026-02-31`, a day `February` does not have.
+is `2026-02-28`, not a `Date` reading a day `February` does not have.
 
 ### `Time.withHour(h: int): Time`
 
@@ -744,8 +745,8 @@ clamped: any `int` is written through.
 
 ### `NaiveDateTime.withDay(d: int): NaiveDateTime`
 
-Forwards to the matching `Date.with*`, time of day unchanged - `withDay` is
-not clamped, the same as `Date.withDay`.
+Forwards to the matching `Date.with*`, time of day unchanged - `withDay`
+clamps the same as `Date.withDay`.
 
 ### `NaiveDateTime.withHour(h: int): NaiveDateTime`
 
@@ -780,8 +781,8 @@ and date unchanged.
 
 Each sets the field on the **wall clock** and re-resolves the zone offset for
 it, the same rule `addYears` follows - see [Arithmetic across a
-transition](#arithmetic-across-a-transition). `withDay` is not clamped, the
-same as `Date.withDay`.
+transition](#arithmetic-across-a-transition). `withDay` clamps the same as
+`Date.withDay`.
 
 ```bit
 import { Date } from "std/time"
