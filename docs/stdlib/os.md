@@ -108,8 +108,8 @@ process's environment and this process's stdout/stderr. Returns the child's
 exit code, or `-1` if it could not be spawned.
 
 There is no way to capture the child's output through this function - only
-its exit status. Route output through a temp file and `readFile` until this
-module grows a capture variant.
+its exit status. When you need the text the child printed, not just whether
+it succeeded, use [`std/process`'s `output`](process.md) instead.
 
 ```bit
 import { run } from "std/os"
