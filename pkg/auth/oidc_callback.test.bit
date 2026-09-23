@@ -1,0 +1,254 @@
+// pkg/auth/oidc_callback.test.bit — #5777's acceptance: a full
+// `beginAuthorization` -> `handleCallback` round trip (stubbed token
+// endpoint and JWKS) returns an `Identity` built from the verified ID
+// token, posts a well-formed code exchange, and regenerates the session; a
+// state mismatch fails `unauthorized` WITHOUT calling the token endpoint
+// (call-counting double); a missing `code_verifier` fails the same way; and
+// two callbacks carrying the same `state` — a race or a replayed callback
+// URL, the shapes #5787's TOCTOU ruling and this ticket's own acceptance
+// both name — resolve to exactly one success, the second failing with the
+// identical error an unrecognized `state` produces.
+//
+// Every test goes through `app.handle(req)`, the seam
+// `oidc_authorize.test.bit`/`password.test.bit` already use: no
+// `NameRegistry`/`Ctx` constructor of this package's own, so a `Ctx` is
+// only reachable through a real `App`. `handleCallbackFetch` (not the
+// exported `handleCallback`) is called directly so a route can inject a
+// `TokenFetch` double — no real network, the same shape
+// `oidc_discovery.test.bit`'s `HttpFetch` fakes already use.
+//
+// `authReq` (oidc_authorize.test.bit); `testIssuer`, `tlsStub`,
+// `oneCallFetch`, `contains` (oidc_discovery.test.bit); `clientId`,
+// `testKid`, `testJwksUri`, `testJwksBody`, `signIdToken`
+// (oidc_verify.test.bit); `split` (oidc_verify.bit); `newJwksCacheFetch`
+// (oidc_discovery.bit); `now`, `Second`, `Header`, `TokenFetch`,
+// `encodeBase64`, `percentEncode`, `handleCallbackFetch`,
+// `stateSessionKey`/`nonceSessionKey`/`verifierSessionKey` (oidc_callback.bit/
+// oidc_authorize.bit) are all already bound module-wide (an import binds per
+// MODULE, SPEC §17.1); nothing here is new to the module.
+
+fn callbackJwks(): JwksCache {
+  return newJwksCacheFetch(testJwksUri, tlsStub(), oneCallFetch(200, testJwksBody())) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+}
+
+fn callbackStrategy(): OidcStrategy {
+  return OidcStrategy{
+    config = OidcConfig{
+      issuer = testIssuer,
+      authorizationEndpoint = testIssuer + "/authorize",
+      tokenEndpoint = testIssuer + "/token",
+      jwksUri = testJwksUri,
+    },
+    clientId = clientId,
+    clientSecret = "test-client-secret",
+    redirectUri = "https://app.example.com/callback",
+    jwks = callbackJwks(),
+  }
+}
+
+// The token endpoint double: counts calls, records the last request's URL,
+// body and `Authorization` header (so a test can prove the exchange's
+// shape), and answers `box.token` as the `id_token`.
+class TokenCallBox {
+  calls: int,
+  token: string,
+  lastUrl: string,
+  lastBody: string,
+  lastAuthHeader: string,
+}
+
+fn authHeaderValue(headers: []Header): string {
+  for h of headers {
+    if (h.name == "Authorization") {
+      return h.value
+    }
+  }
+  return ""
+}
+
+fn tokenFetchFor(box: TokenCallBox): TokenFetch {
+  let f: TokenFetch = (url, headers, body) => {
+    box.calls = box.calls + 1
+    box.lastUrl = url
+    box.lastBody = body
+    box.lastAuthHeader = authHeaderValue(headers)
+    return "{\"id_token\":\"" + box.token + "\"}"
+  }
+  return f
+}
+
+// A valid, freshly-signed ID token for `roundTripSub`, naming `nonce` — the
+// one field a caller only learns after `beginAuthorization` has run.
+const roundTripSub = "user-42"
+
+fn roundTripToken(nonce: string): string {
+  let nowSeconds = now().ns / Second
+  let payload = Json.JsonObject(
+    [
+      JsonEntry{ key = "iss", value = Json.JsonString(testIssuer) },
+      JsonEntry{ key = "aud", value = Json.JsonString(clientId) },
+      JsonEntry{ key = "sub", value = Json.JsonString(roundTripSub) },
+      JsonEntry{ key = "exp", value = Json.JsonInt(i64(nowSeconds + 3600)) },
+      JsonEntry{ key = "iat", value = Json.JsonInt(i64(nowSeconds - 10)) },
+      JsonEntry{ key = "nonce", value = Json.JsonString(nonce) },
+    ],
+  )
+  return signIdToken(testKid, payload)
+}
+
+// An app with `beginAuthorization`, a `/session` peek, a `/forgetVerifier`
+// fault injector, `/callback` (running `handleCallbackFetch` against
+// `box`'s double), and `/whoami` (`currentIdentity`, middleware.bit) — so a
+// test can prove the Identity was stored the way `requireAuth` stores one.
+fn callbackApp(s: OidcStrategy, box: TokenCallBox): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/begin", (c) => {
+    return beginAuthorization(s, c)
+  })
+  app.get("/session", (c) => {
+    let session = c.session() catch e {
+      panic("session: ${e.message()}")
+    }
+    return c.text(
+        session.get(stateSessionKey) +
+        "|" +
+        session.get(nonceSessionKey) +
+        "|" +
+        session.get(verifierSessionKey),
+    )
+  })
+  app.get("/forgetVerifier", (c) => {
+    let session = c.session() catch e {
+      panic("session: ${e.message()}")
+    }
+    session.delete(verifierSessionKey)
+    session.save() catch e {
+      panic("save: ${e.message()}")
+    }
+    return c.text("ok")
+  })
+  app.get("/callback", (c) => {
+    let identity = handleCallbackFetch(s, c, tokenFetchFor(box))?
+    return c.text(identity.id)
+  })
+  app.get("/whoami", (c) => {
+    let identity = currentIdentity(c)?
+    return c.text(identity.id)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn callbackReq(cookie: string, code: string, state: string): Request {
+  return authReq(
+    "/callback?code=" + percentEncode(code) + "&state=" + percentEncode(state),
+    cookie,
+  )
+}
+
+fn newBox(): TokenCallBox {
+  return TokenCallBox{ calls = 0, token = "", lastUrl = "", lastBody = "", lastAuthHeader = "" }
+}
+
+test "beginAuthorization -> handleCallback: a full round trip returns the verified Identity, posts a well-formed exchange, and regenerates the session" {
+  let box = newBox()
+  let app = callbackApp(callbackStrategy(), box)
+
+  let begin = app.handle(authReq("/begin", ""))
+  let beginCookie = begin.getHeader("Set-Cookie")
+  let stored = split(app.handle(authReq("/session", beginCookie)).body, "|")
+  let nonce = stored[1]
+  let verifier = stored[2]
+  box.token = roundTripToken(nonce)
+
+  let res = app.handle(callbackReq(beginCookie, "test-auth-code", stored[0]))
+  assert(res.status == 200, "want 200, got ${res.status}: ${res.body}")
+  assert(
+    res.body == roundTripSub,
+    "want the verified token's sub '${roundTripSub}', got '${res.body}'",
+  )
+
+  assert(box.calls == 1, "want exactly one token endpoint call, got ${box.calls}")
+  assert(box.lastUrl == testIssuer + "/token", "wrong token endpoint URL: '${box.lastUrl}'")
+  assert(
+    contains(box.lastBody, "grant_type=authorization_code"),
+    "missing grant_type: '${box.lastBody}'",
+  )
+  assert(contains(box.lastBody, "code=test-auth-code"), "missing code: '${box.lastBody}'")
+  assert(
+    contains(box.lastBody, "code_verifier=" + percentEncode(verifier)),
+    "missing code_verifier: '${box.lastBody}'",
+  )
+  let wantAuth = "Basic " +
+    encodeBase64([]byte(percentEncode(clientId) + ":" + percentEncode("test-client-secret")))
+  assert(
+    box.lastAuthHeader == wantAuth,
+    "wrong client_secret_basic Authorization header: '${box.lastAuthHeader}'",
+  )
+
+  let newCookie = res.getHeader("Set-Cookie")
+  assert(len(newCookie) > 0, "a successful callback must issue a Set-Cookie")
+  assert(!contains(newCookie, beginCookie), "regenerate() did not rotate the session id")
+  let whoami = app.handle(authReq("/whoami", newCookie))
+  assert(
+    whoami.body == roundTripSub,
+    "the Identity was not stored under identitySessionKey: '${whoami.body}'",
+  )
+}
+
+test "handleCallback fails without calling the token endpoint when state does not match" {
+  let box = newBox()
+  let app = callbackApp(callbackStrategy(), box)
+  let cookie = app.handle(authReq("/begin", "")).getHeader("Set-Cookie")
+
+  let res = app.handle(callbackReq(cookie, "some-code", "not-the-real-state"))
+  assert(res.status == 401, "want 401 for a state mismatch, got ${res.status}")
+  assert(
+    box.calls == 0,
+    "the token endpoint must not be called before state is checked, got ${box.calls}",
+  )
+}
+
+test "handleCallback fails when code_verifier is missing from the session" {
+  let box = newBox()
+  let app = callbackApp(callbackStrategy(), box)
+  let cookie = app.handle(authReq("/begin", "")).getHeader("Set-Cookie")
+  let stored = split(app.handle(authReq("/session", cookie)).body, "|")
+  app.handle(authReq("/forgetVerifier", cookie))
+
+  let res = app.handle(callbackReq(cookie, "some-code", stored[0]))
+  assert(res.status == 401, "want 401 for a missing code_verifier, got ${res.status}")
+  assert(
+    box.calls == 0,
+    "the token endpoint must not be called with no code_verifier, got ${box.calls}",
+  )
+}
+
+test "two callbacks carrying the same state: exactly one succeeds, the second fails exactly like an unknown state (#5787 TOCTOU)" {
+  let box = newBox()
+  let app = callbackApp(callbackStrategy(), box)
+  let cookie = app.handle(authReq("/begin", "")).getHeader("Set-Cookie")
+  let stored = split(app.handle(authReq("/session", cookie)).body, "|")
+  box.token = roundTripToken(stored[1])
+
+  let first = app.handle(callbackReq(cookie, "test-auth-code", stored[0]))
+  assert(first.status == 200, "the first callback must succeed, got ${first.status}: ${first.body}")
+
+  let second = app.handle(callbackReq(cookie, "test-auth-code", stored[0]))
+  assert(
+    second.status == 401,
+    "the second, racing/replayed callback must fail, got ${second.status}",
+  )
+
+  let unknownBox = newBox()
+  let unknownApp = callbackApp(callbackStrategy(), unknownBox)
+  let unknownRes = unknownApp.handle(callbackReq("", "test-auth-code", "never-issued-state"))
+  assert(
+    second.body == unknownRes.body,
+    "a raced/replayed state must fail exactly like an unknown one, got '${second.body}' vs '${unknownRes.body}'",
+  )
+}
