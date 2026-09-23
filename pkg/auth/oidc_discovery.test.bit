@@ -3,7 +3,9 @@
 // https-only issuer check, byte-for-byte issuer matching (OIDC Discovery
 // 1.0 §4.3), a JWKS cache hit with NO HTTP call, exactly one refetch on an
 // unknown `kid`, and a refetch cooldown that survives 100 unknown-kid
-// lookups with at most one more HTTP call.
+// lookups with at most one more HTTP call. #5788's acceptance: two tasks
+// racing an unknown `kid` under real parallelism claim the refetch cooldown
+// at most once between them.
 //
 // Every test goes through a `FetchCounter`-backed `HttpFetch` fake — never
 // `getTls` — so nothing here touches the network or a TLS handshake. The
@@ -12,10 +14,33 @@
 // proven against production logic and not a re-implementation of it.
 //
 // `Response` and `getTls` are already bound module-wide by
-// `oidc_discovery.bit`; `TlsConfig` likewise. `contains` and
-// `emptyTrustStore` are new to the module (E0042 governs the rest).
-import { contains } from "std/strings"
+// `oidc_discovery.bit`; `TlsConfig` likewise. `contains`, `parseInt`,
+// `emptyTrustStore`, `env`, `AtomicI64` and `newAtomicI64` are new to the
+// module (E0042 governs the rest).
+import { contains, parseInt } from "std/strings"
 import { emptyTrustStore } from "std/tls"
+import { envOr } from "std/os"
+import { AtomicI64, newAtomicI64 } from "std/sync"
+
+// The cooldown-claim race (#5788): with no synchronization, two concurrent
+// misses on the same unknown `kid` can both read `hasRefetched == false`
+// before either sets it, so both claim the refetch. Reproducing that needs
+// genuine hardware parallelism, not just interleaved green threads on one
+// OS thread — a channel park always lets a cooperative scheduler resume the
+// other task, never letting both execute the check-then-set at once — so
+// this asserts the run actually has it rather than silently passing at the
+// runtime's default of 1 worker, where the race below cannot happen.
+fn requireRealParallelism(): int {
+  let raw = envOr("BIT_WORKERS", "1")
+  let workers = parseInt(raw) catch _ {
+    panic("BIT_WORKERS='${raw}' is not a number")
+  }
+  assert(
+    workers >= 2,
+    "this test needs BIT_WORKERS>=2 (e.g. BIT_WORKERS=4) for real parallelism; got BIT_WORKERS=${workers}, so it would be vacuous",
+  )
+  return workers
+}
 
 const testIssuer = "https://idp.example.com"
 
@@ -180,4 +205,119 @@ test "a lookup inside the cooldown window returns the prior refetch's failure" {
     first == second,
     "want the cooldown to return the SAME failure, got '${first}' then '${second}'",
   )
+}
+
+// One `HttpFetch` shared by both racing tasks below. `calls` is an atomic
+// index, never a plain `int` — a plain `box.calls = box.calls + 1` (like
+// `FetchCounter` above) is itself racy under the exact concurrent calls
+// this test forces, which would silently undercount the very bug under
+// test. Call index 0 is the cache's own constructor fetch, made before any
+// race starts; every later call announces itself on `entered` and then
+// parks on `proceed`, so the test can see exactly how many calls are in
+// flight before letting any of them finish.
+class RaceFetch {
+  calls: AtomicI64,
+  entered: chan<bool>,
+  proceed: chan<bool>,
+  statuses: []int,
+  bodies: []string,
+}
+
+fn raceFetchFn(rc: RaceFetch): HttpFetch {
+  let f: HttpFetch = (url) => {
+    let i = rc.calls.add(1) - 1
+    if (i > 0) {
+      rc.entered <- true
+      <- rc.proceed
+    }
+    return checkStatus(
+      url,
+      Response{ status = rc.statuses[i], contentType = "", headers = "", body = rc.bodies[i] },
+    )?
+  }
+  return f
+}
+
+fn raceTask(cache: JwksCache, kid: string, gate: chan<bool>, results: chan<string>) {
+  <- gate
+  results <- findErr(cache, kid)
+}
+
+// One trial of #5788's reproduction: two tasks miss the same unknown `kid`
+// at once. Both are parked on `gate` until `close(gate)` releases them
+// together (SPEC §16.2 — close broadcasts to every waiter), so neither's
+// check-then-claim gets a head start on the other's. Whichever task(s) pass
+// the cooldown check park inside `raceFetchFn` on `rc.proceed`; this
+// classifies both tasks — claim winner or claim loser — through a fair
+// `select` before releasing the winner(s)' fetch, so it never assumes which
+// one runs first. Returns how many tasks won the claim: on the branch
+// (`claimRefetch` under `refetchLock`) that is always exactly 1,
+// deterministically, because the claim is one atomic step; on main (no lock
+// around the check-and-set) it is occasionally 2.
+fn raceOneTrial(): int {
+  let rc = RaceFetch{
+    calls = newAtomicI64(0),
+    entered = chan<bool>(2),
+    proceed = chan<bool>(),
+    statuses = [200, 200, 200],
+    bodies = [jwksOneKey, jwksOneKey, jwksOneKey],
+  }
+  let cache = newJwksCacheFetch("https://idp.example.com/jwks", tlsStub(), raceFetchFn(rc)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+
+  let gate = chan<bool>()
+  let results = chan<string>(2)
+  spawn raceTask(cache, "unknown", gate, results)
+  spawn raceTask(cache, "unknown", gate, results)
+  close(gate)
+
+  // A claim loser fails with `newError(this.lastError)`, and `lastError`'s
+  // zero value is itself "" until a refetch has completed once — so an
+  // empty `results` message here is a legitimate loser, not a success, and
+  // is not asserted on; `find()` returning a real key for "unknown" is
+  // impossible given `jwksOneKey`, so no separate check is needed.
+  let winners = 0
+  let i = 0
+  while (i < 2) {
+    select {
+      case _ = <- rc.entered:
+        winners = winners + 1
+      case _ = <- results:
+        {}
+    }
+    i = i + 1
+  }
+  close(rc.proceed)
+
+  // Drain the winner(s)' results now that their fetch has been released.
+  let j = 0
+  while (j < winners) {
+    <- results
+    j = j + 1
+  }
+  return winners
+}
+
+// The check-then-claim window main leaves open is a couple of unguarded
+// instructions wide, so a single trial catches it only some of the time —
+// measured empirically against pre-fix main (10 of 300 trials, ~3%) before
+// this test was written this way. Running 300 independent trials (a fresh
+// cache each time), a static and provably bounded loop, drives the chance
+// of a false pass on main below 1 in 10000 ((1 - 0.03)^300 ≈ 5e-5) while
+// staying exact and deterministic on the branch: `claimRefetch` guarantees
+// every single trial is exactly 1, so 300 of them cannot flip that.
+test "two tasks racing the same unknown kid claim the refetch cooldown at most once, over 300 trials (#5788)" {
+  let _ = requireRealParallelism()
+
+  let trials = 300
+  let t = 0
+  while (t < trials) {
+    let winners = raceOneTrial()
+    assert(
+      winners == 1,
+      "trial ${t}/${trials}: want exactly one concurrent refetch claim between the two racing tasks, got ${winners}",
+    )
+    t = t + 1
+  }
 }
