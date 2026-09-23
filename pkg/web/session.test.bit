@@ -354,11 +354,116 @@ test "a session written into the store with no keys at all is adopted, not repla
   let store = MemoryStore(1000)
   let cfg = Config{ secret = "x", sessions = store }
   let sid = newSessionId()
-  store.write(sid, map<string, string>(), sessionTTLSeconds) catch e {
-    panic("write: ${e.message()}")
+  store.compareAndSet(sid, 0, map<string, string>(), sessionTTLSeconds) catch e {
+    panic("compareAndSet: ${e.message()}")
   }
 
   let s = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
   assert(s.id() == sid, "a stored keyless id was replaced: '${s.id()}' vs '${sid}'")
   assert(!s.isNew(), "a stored keyless id must not start a new session")
+}
+
+// --- concurrent requests sharing one cookie (#5794, TOCTOU) ------------
+//
+// Three deterministic interleavings, reusing #5787's audit shape: two
+// `Session` objects loaded from the same store against the same id, their
+// steps ordered by hand rather than by real concurrency — exactly how the
+// rest of this file already simulates two requests (a shared `Config`/store,
+// one `Ctx` per request). Each reproduces on unmodified `main`, where the
+// store's `write` is an unconditional upsert with no version to check.
+
+test "a destroyed session stays destroyed even when a stale writer tries to save over it" {
+  let cfg = memConfig()
+  let s0 = mustSession(sessCtx(cfg, ""))
+  s0.set("userId", "42")
+  mustSave(s0)
+  let sid = s0.id()
+
+  // B: an ordinary request (a preference update) loads the session first.
+  let b = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  // A: logout, on another connection, completes before B finishes.
+  let a = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  a.destroy() catch e {
+    panic("destroy: ${e.message()}")
+  }
+
+  // B finishes its work against the snapshot it loaded before A's destroy,
+  // and tries to save. The store must refuse it, not resurrect the session.
+  b.set("theme", "dark")
+  let conflict = ""
+  b.save() catch e {
+    conflict = e.message()
+  }
+  assert(conflict != "", "a stale save() after destroy() must fail, it silently succeeded")
+  assert(contains(conflict, "destroyed"), "expected a destroyed-id conflict, got: '${conflict}'")
+
+  let after = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  assert(after.isNew(), "the old cookie must miss after the stale save lost the race")
+  assert(after.get("userId") == "", "a destroyed session came back: '${after.get("userId")}'")
+}
+
+test "two concurrent set()+save() calls on one session: the loser gets a conflict, not a silent loss" {
+  let cfg = memConfig()
+  let s0 = mustSession(sessCtx(cfg, ""))
+  s0.set("userId", "42")
+  mustSave(s0)
+  let sid = s0.id()
+
+  let x = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  let y = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  x.set("cart", "book")
+  y.set("csrfRotatedAt", "1")
+
+  mustSave(x)
+  let conflict = ""
+  y.save() catch e {
+    conflict = e.message()
+  }
+  assert(conflict != "", "the loser's save() must fail, it silently overwrote the winner")
+  assert(contains(conflict, "conflict"), "expected a version conflict, got: '${conflict}'")
+
+  let z = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  assert(z.get("cart") == "book", "the winner's update was lost: cart='${z.get("cart")}'")
+  assert(
+    z.get("csrfRotatedAt") == "",
+    "the loser's update leaked in despite the conflict: '${z.get("csrfRotatedAt")}'",
+  )
+}
+
+test "takeAtomic: two requests racing the same one-time value, exactly one gets it" {
+  let cfg = memConfig()
+  let s0 = mustSession(sessCtx(cfg, ""))
+  s0.set("otp", "123456")
+  mustSave(s0)
+  let sid = s0.id()
+
+  let x = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  let y = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+
+  let xValue = x.takeAtomic("otp") catch e {
+    panic("takeAtomic: ${e.message()}")
+  }
+  let yValue = y.takeAtomic("otp") catch e {
+    panic("takeAtomic: ${e.message()}")
+  }
+
+  let winners = 0
+  if (isSome(xValue)) {
+    winners = winners + 1
+  }
+  if (isSome(yValue)) {
+    winners = winners + 1
+  }
+  assert(winners == 1, "expected exactly one caller to get the value, got ${winners}")
+  let winnerValue = xValue
+  if (isSome(yValue)) {
+    winnerValue = yValue
+  }
+  assert(
+    unwrap(winnerValue) == "123456",
+    "the winner must see the real value, got '${unwrap(winnerValue)}'",
+  )
+
+  let z = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  assert(z.get("otp") == "", "the one-time value survived being taken: '${z.get("otp")}'")
 }
