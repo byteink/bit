@@ -34,6 +34,54 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
   return atomicLoad(m + muAcked) == atomicLoad(world + worldEpochWord)
 }
 
+// Sleep until the pending stop clears, or until `stwWaitTimeoutUs` elapses.
+// `worldResumeWhenClear`'s tail past the first burst, and the whole of #5750.
+//
+// THE LOST WAKE IS THE ONLY WAY THIS SHAPE FAILS, AND IT IS CLOSED BY A DEKKER
+// PAIR, not by ordering luck. Against `worldRestart` below:
+//
+//     waiter:    atomicAdd(waiters, +1)  then  atomicLoad(stop)
+//     restarter: atomicStore(stop, 0)    then  atomicLoad(waiters)
+//
+// Both accesses on both sides are seq_cst (constraint 2, ../gc/gcworld.bit), so
+// the two cannot both read the stale value: either this waiter loads 0 from the
+// stop word and never sleeps, or the restarter loads a non-zero waiter count and
+// issues the wake. That is the SAME store-then-load argument
+// `worldResumeWhenClear` and `worldRendezvous` already pair on, applied to a
+// second pair of cells, and it is why the counter is incremented BEFORE the
+// stop word is read rather than after.
+//
+// THE COMPARE IS THE THIRD GUARD AND THE REASON THE COMPARAND IS THE WORD'S OWN
+// VALUE. `bit_rt_port_gc_world_stop_wait` sleeps only if the word still holds
+// `v`, atomically against the wake — so a restart landing in the gap between
+// the load below and the kernel enqueue is caught by the kernel's own read, not
+// missed. A separate "someone may sleep" flag would have no such compare and
+// would need a lock to be correct.
+//
+// ONE WINDOW SURVIVES ALL THREE AND IS BOUNDED, NOT ARGUED AWAY: the stop word
+// is 0/1, so a restart followed by a FRESH stop inside that same gap restores
+// the very value `v` this waiter is comparing against, and the kernel sleeps on
+// the new collection. Safe — `worldMustStayPut` above would have released this
+// thread, and the new collection's rendezvous simply does not count a `parked`
+// slot whose ack names the older epoch, so it abandons rather than marking
+// behind a running mutator (ABI.md §5, always safe) — but it is latency, which
+// is what `stwWaitTimeoutUs` caps. Every path that sets the stop word reaches
+// `worldRestart`, on success AND on abandonment (`../stw/stwpoll.bit` restarts
+// on both), so the sleep is bounded twice over.
+//
+// The counter is decremented on EVERY exit path, including the one that never
+// slept, because the guard in `worldRestart` reads it as "is a wake worth a
+// syscall" and a leaked increment would make every later restart pay for one.
+@nosplit fn worldWaitForStop(world: *i64) {
+  let w = world + worldWaiters
+  let _ = atomicAdd(w, 1)
+  let v = atomicLoad(world + worldStopWord)
+  if (v != 0) {
+    let _ = bit_rt_port_gc_world_stop_wait(world + worldStopWord, v, stwWaitTimeoutUs)
+  }
+  let _ = atomicAdd(w, 0 - 1)
+}
+
 // Sit in `waiting` until this thread may run Bit code again.
 //
 // THE NAIVE VERSION ("wait for `stop` to clear, then store `running`") IS
@@ -51,11 +99,12 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
 //     point of the contract — so the re-check below is load-bearing there:
 //     publish `running`, re-read `stop`, and go back if one is pending.
 //
-// PAST THE FIRST BURST THE WAIT YIELDS ON EVERY CHECK (#5748), where it used to
-// yield once per `stwSpinBurst` checks for the whole wait. The burst itself is
-// untouched, so #2415's "a mutator that acks within the first burst never
-// reaches an OS call at all" still holds: what changed is the TAIL, and the
-// tail is not a handshake, it is a whole mark and sweep.
+// PAST THE FIRST BURST THE WAIT SLEEPS ON THE STOP WORD (#5750), where #5748
+// yielded on every check and #2415 before it yielded once per `stwSpinBurst`.
+// The burst itself is untouched through all three, so #2415's "a mutator that
+// acks within the first burst never reaches an OS call at all" still holds:
+// what changed is the TAIL, and the tail is not a handshake, it is a whole
+// mark and sweep.
 //
 // Measured on `bench/cases/allocpar` (8 mutators, 10,002,000 objects,
 // `BIT_GC_STATS=1` with the wait loop's iterations counted): 726,120,821
@@ -70,11 +119,13 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
 // mutator (7626 M) and eight, NOT the whole of it. The remaining 14.5 G is not
 // this loop and is still unattributed; do not read this as having closed it.
 //
-// AND IT DOES NOT MAKE allocpar FASTER. Cycles are unchanged: 22468 M ->
+// AND IT DID NOT MAKE allocpar FASTER. Cycles were unchanged: 22468 M ->
 // 22457 M, per-rep sign 9/21, which is exactly the byte-identical null
-// control's own 9/21. A yielding thread still owns its core, so the cycles move
-// into the yield syscall instead of disappearing. #5750 blocks on
-// `worldStopWord` so they are never spent, and its acceptance is on cycles.
+// control's own 9/21. A yielding thread still owns its core, so the cycles
+// moved into the yield syscall instead of disappearing — which is why #5750
+// replaced the yield with a blocking wait on `worldStopWord` itself
+// (`worldWaitForStop` below, `./gcstopwait.bit`) and was accepted on cycles
+// rather than on instructions.
 @nosplit fn worldResumeWhenClear(world: *i64, slot: int, waiting: int) {
   let m = wMut(world, slot)
   let outer = 0
@@ -96,21 +147,23 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
     // Same primitive (`worldYield`), and the same first burst, so the
     // handshake still carries one spin/yield policy rather than two.
     //
-    // THE FIRST BURST SPINS, EVERYTHING AFTER IT YIELDS (#5748); the numbers,
-    // and what they do and do not prove, are in this function's header.
+    // THE FIRST BURST SPINS, EVERYTHING AFTER IT SLEEPS (#5750, after #5748's
+    // yield); the numbers, and what they do and do not prove, are in this
+    // function's header.
     //
     // THE BOUND IS UNCHANGED AND STAYS CONSERVATIVE: still exactly
-    // `stwParkBound` checks before "the stop never cleared" is declared, and
-    // each of those checks now costs a yield rather than a few cycles, so the
-    // wall clock the bound represents only grows. `>=` rather than `%` also
-    // drops a signed modulo from every iteration of the loop it guards.
+    // `stwParkBound` checks before "the stop never cleared" is declared,
+    // counted the same way, and each of those checks now costs a bounded sleep
+    // rather than a few cycles, so the wall clock the bound represents only
+    // grows. `>=` rather than `%` also drops a signed modulo from every
+    // iteration of the loop it guards.
     while (spins < stwParkBound) {
       if (!worldMustStayPut(world, slot, waiting)) {
         break
       }
       spins = spins + 1
       if (spins >= stwSpinBurst) {
-        worldYield()
+        worldWaitForStop(world)
       }
     }
     if (spins >= stwParkBound) {
@@ -369,7 +422,28 @@ export @nosplit @symbol("bit_rt_port_gc_world_rendezvous") fn worldRendezvous(
 
 // Let every parked mutator go. Clears the stop; every waiter's
 // `worldResumeWhenClear` observes it and resumes.
+//
+// THE WAKE IS GATED ON THE WAITER COUNT AND THAT GATE IS NOT AN OPTIMISATION
+// DETAIL (#5750). This used to be one `atomicStore` and nothing else, and it
+// runs on EVERY collection of EVERY program — including the single-mutator ones
+// where nobody has ever waited out a stop. An unconditional `__ulock_wake`
+// there would buy `bench/cases/allocpar` its parallel win by charging a syscall
+// to `bench/cases/alloc` and to every other case in the suite, which is the
+// #5722 shape exactly: a mechanism sized for the workload being thought about
+// and wrong everywhere else. With the gate, the no-waiter restart costs one
+// seq_cst load of a word in a cache line nothing on the poll path touches (see
+// `worldWaiters`, ../gc/gcworld.bit) and a not-taken branch.
+//
+// A STALE READ IS SAFE IN BOTH DIRECTIONS, which is what makes a plain load
+// enough: too high costs one wake on an empty queue (the provider reports 0
+// woken), and too low cannot lose a wake, because a waiter that had not yet
+// published its count had also not yet read the stop word — see the Dekker pair
+// in `worldWaitForStop` above.
 export @nosplit @symbol("bit_rt_port_gc_world_restart") fn worldRestart(world: *i64) {
   atomicStore(world + worldStopWord, 0)
+  if (atomicLoad(world + worldWaiters) == 0) {
+    return
+  }
+  let _ = bit_rt_port_gc_world_stop_wake(world + worldStopWord)
 }
 
