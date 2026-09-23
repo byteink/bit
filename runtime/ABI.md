@@ -3657,6 +3657,66 @@ answer somewhere other than the primitive:
   `runtime/auxv` resolves the symbol there too), and the vector must never be
   captured a second time.
 
+**`bit_rt_os_run_captured` is `os_run_bounded` with its child's stdout and
+stderr captured into memory instead of left attached to the parent's own
+file descriptors, plus three out-of-band companions to read the result:**
+
+```
+bit_rt_os_run_captured(path, argv, timeout_ms)  -> i64     // same encoding as os_run_bounded
+bit_rt_os_run_captured_stdout()                 -> string  // must be called immediately after, no yield between
+bit_rt_os_run_captured_stderr()                 -> string  // same
+bit_rt_os_run_captured_truncated()              -> i64     // bit 0: stdout hit the cap; bit 1: stderr did; same contract
+```
+
+`path` and `argv` are the same `*const RtBytes` / SliceHeader pair `bit_rt_os_run`
+takes (`argv` appended after `path`, above); `timeout_ms` is the same
+wall-clock deadline `bit_rt_os_run_bounded` takes, clamped to the same
+`os_run_bounded_max_ms`. `bit_rt_os_run_captured` reuses `os_run_bounded`'s
+own result encoding exactly, unchanged by capture or by truncation of either
+stream:
+
+```
+ >= 0     child exited normally with this code (0-255)
+ -1       spawn failure (fork/exec/wait error), same sentinel as os_run
+ -2       timed out: the deadline elapsed, so the child was SIGKILLed and reaped
+ <= -100  child was killed by a signal observed during a poll; signal number
+          is -(result) - 100 (e.g. -109 = killed by SIGKILL from outside)
+```
+
+Each stream is capped at `osRunCaptureMaxBytes` (4 MiB, `runtime/root/os.bit`).
+Both pipes are drained to EOF regardless of the cap: bytes read past the cap
+on either stream are discarded rather than appended, but the read loop on
+that stream keeps consuming them instead of stopping. A pipe's kernel buffer
+is small, so once it fills the child blocks on its next write to that pipe
+until the parent reads more of it; stopping one stream's drain at the cap
+while the other still has output to produce would leave the child blocked
+writing to the stopped pipe forever, deadlocking the still-open sibling
+stream along with it. Both drain loops therefore run to EOF independent of
+the cap, matching `bit_rt_fs_read_all`'s "sized... then TRIMMED, never
+zero-padded" allocate-once shape (`runtime/root/linux/fsrw.bit`).
+
+`_stdout`, `_stderr` and `_truncated` are out-of-band companions reading
+per-task state, the same shape `bit_rt_fs_read_all_failed` uses (§14): "per-task
+state... must be read immediately after that call with no yield between" is
+the identical contract here, all three cleared and repopulated together at
+each `bit_rt_os_run_captured` entry. Calling any of the three on a task that
+has not yet made a `bit_rt_os_run_captured` call reads that field's zero
+value: `_stdout`/`_stderr` return `""`, `_truncated` returns `0`.
+
+`_truncated`'s two bits are independent, not mutually exclusive: bit 0
+(value 1) set means the child's stdout produced more than
+`osRunCaptureMaxBytes` bytes and the excess was trimmed; bit 1 (value 2) set
+means stderr did; both set together reads 3, neither set reads 0. Truncation
+never changes the exit encoding above: a child that exceeds the cap on one
+or both streams and then exits normally still reports `>= 0`, with the data
+loss visible only through `_truncated`, never folded into the exit result.
+
+The four symbols are reached only through `extern fn` declarations in
+`stdlib/os/os.bit`, the same way `bit_rt_fs_stat_w` is declared directly in
+`stdlib/fs/fs.bit:429`: no `compiler/checktype.bit`, `compiler/symbols.bit`,
+`compiler/validatecall.bit` or `compiler/lowerprim.bit` entry registers any
+of the four as a compiler builtin.
+
 ---
 
 ## 20. Networking (`runtime/net` + `runtime/root`)
