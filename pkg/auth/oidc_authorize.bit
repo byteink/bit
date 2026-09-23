@@ -1,0 +1,158 @@
+// pkg/auth/oidc_authorize.bit — OidcStrategy and beginAuthorization (#5776):
+// the redirect half of the OIDC authorization-code flow, PKCE S256 only
+// (RFC 7636), on top of `OidcConfig` (oidc_discovery.bit, #5772) and the
+// package's session wiring (`pkg/web/session.bit:36`). No callback/token
+// exchange here — that is the next child (#5777, depends on this one).
+//
+// PKCE, RFC 7636:
+//   - §4.1: `code_verifier` is a high-entropy random string built from the
+//     unreserved character set (RFC 3986 §2.3), 43-128 characters. This file
+//     draws 32 CSPRNG bytes (256 bits, `randomBytes` — already bound
+//     module-wide by `password.bit`) and base64url-encodes them
+//     (`encodeBase64Url`, std/crypto), which is exactly RFC 7636 §4.1's own
+//     worked construction and lands at 43 characters, entirely inside the
+//     unreserved set.
+//   - §4.2/§4.3: `code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`
+//     with `code_challenge_method=S256` — never `plain`. `plain` exists in
+//     the RFC only for a client that cannot compute SHA-256, which nothing
+//     in this package needs to accommodate, so it is not implemented here.
+//
+// `state`/`nonce` (OpenID Connect Core 1.0 §3.1.2.1) are drawn the same way
+// `pkg/web/session.bit`'s own `newSessionId` draws a session id: 16 CSPRNG
+// bytes (128 bits, the ticket's floor), hex-encoded rather than base64url —
+// "unambiguous... no padding or alphabet variants to get wrong" is that
+// file's own reason and applies here unchanged.
+//
+// All three values are stored on `c.session()` (session.bit:36) under fixed
+// keys and `save()`d EXPLICITLY before the redirect: `adapter.bit` seals the
+// session COOKIE onto the response (`Ctx.finish`/`sealSession`) but never
+// calls `Session.save()` itself, so a handler that sets session data and
+// returns without saving loses it — the store is never written, only the
+// cookie is issued. Skipping `save()` here would send the browser a cookie
+// naming a session the callback (#5777) can never find data in.
+//
+// `Ctx` is already bound module-wide by `strategy.bit`; `TlsConfig` by
+// `oidc_discovery.bit` (an import binds per MODULE, SPEC §17.1), so
+// re-importing either here is E0042. `randomBytes` is likewise already
+// bound by `password.bit`, and `newSha256`/`encodeBase64Url` by
+// `oidc_verify.test.bit`.
+import { Res } from "web"
+import { digest, encodeHex } from "std/crypto"
+import { percentEncode } from "std/http"
+
+// Bytes of CSPRNG output for the PKCE code_verifier before base64url
+// encoding: 32 bytes = 256 bits, RFC 7636 §4.1's own worked example.
+const codeVerifierBytes = 32
+
+// Bytes of CSPRNG output for `state` and `nonce`: 16 bytes = 128 bits, the
+// ticket's floor and `pkg/web/session.bit`'s own `sessionIdBytes`.
+const authTokenBytes = 16
+
+// Fixed session keys `beginAuthorization` writes under and the callback
+// (#5777) will read back atomically. `strategy.bit`'s `identitySessionKey`
+// is the same "one fixed key, never configurable" shape.
+const stateSessionKey = "auth:oidc:state"
+const nonceSessionKey = "auth:oidc:nonce"
+const verifierSessionKey = "auth:oidc:verifier"
+
+// The four fields `beginAuthorization` and the token exchange (#5777) need
+// to run one OIDC client against `config`.
+export class OidcStrategy {
+  export config: OidcConfig,
+  export clientId: string,
+  export clientSecret: string,
+  export redirectUri: string,
+}
+
+// Discovers `issuer` (`discover`, oidc_discovery.bit) and builds an
+// `OidcStrategy` around it. `tls` is the same explicit, caller-supplied
+// `TlsConfig` `discover`/`newJwksCache` already require — oidc_discovery.bit's
+// file header explains why this package never guesses one.
+export fn newOidcStrategy(
+  issuer: string,
+  clientId: string,
+  clientSecret: string,
+  redirectUri: string,
+  tls: TlsConfig,
+): OidcStrategy! {
+  let config = discover(issuer, tls)?
+  return OidcStrategy{
+    config = config,
+    clientId = clientId,
+    clientSecret = clientSecret,
+    redirectUri = redirectUri,
+  }
+}
+
+// A fresh PKCE code_verifier (RFC 7636 §4.1) — see the file header.
+fn newCodeVerifier(): string {
+  return encodeBase64Url(randomBytes(codeVerifierBytes))
+}
+
+// `code_challenge` for `verifier`, method S256 only (RFC 7636 §4.2): the
+// SHA-256 digest of the verifier's ASCII bytes, base64url-encoded.
+fn codeChallengeFor(verifier: string): string {
+  return encodeBase64Url(digest(newSha256(), []byte(verifier)))
+}
+
+// A fresh `state`/`nonce` value: 128 bits from the CSPRNG, hex-encoded —
+// see the file header.
+fn newAuthToken(): string {
+  return encodeHex(randomBytes(authTokenBytes))
+}
+
+// `url` (`s.config.authorizationEndpoint`), checked https the same way
+// `discover` checks the issuer (OIDC Discovery 1.0 §4.3) — a discovery
+// document is trusted no further than the transport that served it, and a
+// discovered endpoint gets the identical check before this package ever
+// redirects a browser to it.
+fn requireHttpsEndpoint(url: string): ()! {
+  if (!hasPrefix(url, "https://")) {
+    fail newError("auth: beginAuthorization(): authorization_endpoint '${url}' must be an https URL (OIDC Discovery 1.0 §4.3)")
+  }
+}
+
+// The full authorization URL: `s.config.authorizationEndpoint` plus every
+// OIDC Core 1.0 §3.1.2.1 authorization-request parameter this package
+// sends, each value percent-encoded (`percentEncode`, std/http) so none of
+// state/nonce/code_challenge/redirect_uri/client_id can break the query
+// string.
+fn authorizeUrl(s: OidcStrategy, state: string, nonce: string, codeChallenge: string): string {
+  let query = "response_type=" +
+    percentEncode("code") +
+    "&client_id=" +
+    percentEncode(s.clientId) +
+    "&redirect_uri=" +
+    percentEncode(s.redirectUri) +
+    "&scope=" +
+    percentEncode("openid") +
+    "&state=" +
+    percentEncode(state) +
+    "&nonce=" +
+    percentEncode(nonce) +
+    "&code_challenge=" +
+    percentEncode(codeChallenge) +
+    "&code_challenge_method=" +
+    percentEncode("S256")
+  return s.config.authorizationEndpoint + "?" + query
+}
+
+// Starts the OIDC authorization-code flow with PKCE (RFC 7636): generates
+// `state`, `nonce` and a code_verifier, stores all three on `c.session()`
+// (session.bit:36), and returns a 302 redirecting to
+// `s.config.authorizationEndpoint` with the S256 `code_challenge` and every
+// other OIDC Core 1.0 §3.1.2.1 parameter. See the file header for why
+// `save()` runs before the redirect.
+export fn beginAuthorization(s: OidcStrategy, c: Ctx): Res! {
+  requireHttpsEndpoint(s.config.authorizationEndpoint)?
+  let state = newAuthToken()
+  let nonce = newAuthToken()
+  let verifier = newCodeVerifier()
+  let session = c.session()?
+  session.set(stateSessionKey, state)
+  session.set(nonceSessionKey, nonce)
+  session.set(verifierSessionKey, verifier)
+  session.save()?
+  let url = authorizeUrl(s, state, nonce, codeChallengeFor(verifier))
+  return c.redirect(url)
+}
