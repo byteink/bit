@@ -210,6 +210,18 @@ so cut one promptly rather than leaving the tree in this state.
 This was first written down when `export` was added to trait methods and
 `stdlib/time` plus `stdlib/sql` started using it.
 
+**`dist/release.sh` now handles this by-hand recipe itself.**
+`dist/abitwopass-run.sh` guards both `./make libbitrt` and `./make`; on a
+stdlib reserved-keyword refusal it mechanically derives and verifies the
+pass-1 base by asking the pinned stage0's own `check` against each
+offending file's package directory at successive ancestors
+(`dist/abitwopass.py`), then runs the same two-pass bootstrap this section
+documents (`dist/abitwopass-boot.sh <base-sha> stdlib`) - #5752, mirroring
+the runtime ABI transition's own `dist/abitwopass-run.sh` handling (#4197).
+Cutting a release while `stdlib/**` is mid-transition needs no manual
+intervention; this recipe remains the reference for what that automation
+does and why.
+
 ## Does `./make libbitrt` build `runtime/**` with the tree compiler?
 
 **No - it stays pinned-stage0-built by default.** The status quo is not free of

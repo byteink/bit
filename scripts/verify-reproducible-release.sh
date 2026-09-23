@@ -196,7 +196,11 @@ if [ "${L0_RC}" -ne 0 ]; then
         exit 1
       }
       echo "verify-reproducible-release.sh: two-pass bootstrap, pass-1 base ${TWOPASS_BASE}" >&2
-      ( cd "${WORK}/src" && bash dist/abitwopass-boot.sh "${TWOPASS_BASE}" ) >>"${WORK}/build.log" 2>&1 ||
+      # "runtime": this branch only ever reaches abitwopass-boot.sh via the
+      # runtime ABI arity refusal detected above (#5752 parameterised
+      # abitwopass-boot.sh by directory; the stdlib syntax transition is not
+      # yet wired into this script's own detection -- see #5752's ticket).
+      ( cd "${WORK}/src" && bash dist/abitwopass-boot.sh "${TWOPASS_BASE}" runtime ) >>"${WORK}/build.log" 2>&1 ||
         { echo "verify-reproducible-release.sh: dist/abitwopass-boot.sh (${TWOPASS_ORIGIN}) failed; the build log path is printed at exit" >&2; exit 1; }
       L0_RC=0
     else
