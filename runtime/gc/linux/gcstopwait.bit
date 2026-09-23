@@ -1,34 +1,155 @@
-// Linux's stop-wait provider (#5750). See ../gcstopwait.bit for the contract.
+// Linux's blocking-stop-wait provider (#5751, porting #5750's Darwin body). See
+// ../gcstopwait.bit for the contract this satisfies and for why the wait and
+// the wake are two primitives rather than one.
 //
-// DELIBERATELY STILL THE YIELD PATH, unchanged from what #5748 shipped: this
-// body is one `gcWorldYield()` (./gcyield.bit, same module) and the wake is a
-// no-op, so `worldResumeWhenClear` behaves on this target exactly as it did
-// before #5750. The blocking wait is `futex(2)` here and would be a
-// straightforward twin of the Darwin provider — `../../park/linux/wait.bit`
-// already carries the FUTEX_WAIT/FUTEX_WAKE encoding this would use — but a win
-// measured on one architecture is not a win until it is measured on the other,
-// and #5750's numbers are aarch64-macos only. Porting it is its own ticket with
-// its own A/B on Linux hardware.
+// `futex(2)`, the twin of the Darwin provider's `__ulock_wait`: both give the
+// compare-then-sleep guarantee that makes a wake impossible to lose. The
+// encoding is not re-derived here — ../../park/linux/wait.bit already issues
+// these two operations and its header carries the argument for every constant,
+// read out of `<linux/futex.h>` rather than from memory.
 //
-// The sibling's `gcWorldYield` is called rather than re-declaring
-// `sysSchedYield` here: a directory is one module (§17.1), so a second
-// declaration of the same name would be E0042.
+// `sysFutex` is IMPORTED from ../../syscalls/syscalls.bit, which is where the
+// per-architecture syscall numbers live for the whole runtime. The two
+// operation codes below are RE-DECLARED instead, and that asymmetry is not an
+// oversight: `futexWaitPrivate` and `futexWakePrivate` are module-private in
+// ../../park/linux/wait.bit and carry no `@symbol`, so a cross-module call to
+// either is a mangled name no sibling object defines and `--freestanding`
+// refuses it (SPEC §11.9). Exporting them would mint two runtime ABI symbols
+// to ship two integers. ../darwin/gcstopwait.bit re-declares its own
+// `gcUlCompareAndWait` beside ../../park/darwin/wait.bit's for exactly this
+// reason; `_tests_/stress/park` pins the park spellings against the kernel, and
+// the names here are prefixed so the two sets can never be confused.
+import { sysFutex } from "../../syscalls"
+
+// FUTEX_WAIT (cmd 0) and FUTEX_WAKE (cmd 1), each OR'd with FUTEX_PRIVATE_FLAG
+// (bit 7 = 128). See ../../park/linux/wait.bit's `futexWaitPrivate` for why
+// PRIVATE is a correctness statement and not a tuning knob; it holds here for
+// the same reason, and more plainly — `worldStopWord` (../gcworld.bit) is one
+// cell inside the collector's own `World` block, which is allocated straight
+// from the OS and never shared with another process.
+@nosplit fn gcFutexWaitPrivate(): int { return 128 }
+@nosplit fn gcFutexWakePrivate(): int { return 129 }
+
+// Microseconds per second and nanoseconds per microsecond: `timeoutUs` arrives
+// in the unit ../gcstopwait.bit's contract names (Darwin's `__ulock_wait` takes
+// microseconds directly) and futex wants a split `timespec`.
+@nosplit fn gcUsPerSec(): int { return 1000000 }
+@nosplit fn gcNsPerUs(): int { return 1000 }
+
+// FUTEX_WAKE's "every waiter" count, INT32_MAX — the kernel's own idiom for it,
+// and the same value ../../park/linux/wait.bit's `parkWake` passes for `all`.
+// Waking one would leave the rest of a stopped world asleep until their
+// timeouts, which is the latency regression ../darwin/gcstopwait.bit's
+// `gcUlCompareAndWaitAll` header describes.
+@nosplit fn gcWakeAll(): int { return 2147483647 }
+
+// The `timespec` FUTEX_WAIT is handed, ONE COPY PER THREAD.
 //
-// `p`, `expected` and `timeoutUs` are accepted and unused, exactly as
-// `parkWait`'s `scratch` is on the providers that do not need it: the ONE
-// extern declaration in ../gcstopwait.bit must have a single signature every
-// platform's provider satisfies.
+// WHY THIS IS `@threadlocal` AND NOT A PLAIN MODULE CELL — the one design
+// question this port had to settle, recorded here rather than rediscovered.
+//
+// FUTEX_WAIT takes a `timespec *`, where `__ulock_wait` takes a microsecond
+// count, so this provider needs 16 bytes of addressable memory that Darwin's
+// did not. `gcWorldStopWait` gets no scratch parameter — unlike `parkWait`,
+// whose caller owns its two words — and it cannot carve its own: `ptrOf`
+// requires a slice or module-level state (E0053), and this is a `@nosplit` body
+// on the collector's wait path, so a heap slice is out twice over (it would
+// allocate, and it is the #3914 shape: a live reference held by a thread the
+// collector has been told not to scan).
+//
+// READ-ONLY MODULE STATE WAS CHECKED FIRST AND IS NOT EXPRESSIBLE. The value is
+// a constant — `stwWaitTimeoutUs` (../gcworld.bit) is 1000, so the words are
+// always {0, 1000000} — so an immutable cell would need no writer at all and
+// would end the question. SPEC §11.11 rule 2 closes it: a module-level `let`
+// takes a compile-time-constant initializer OR none, and "an array-typed `let`
+// takes no initializer at all", so a `[2]i64` is necessarily zero and
+// necessarily written at run time. The spec's read-only static-image class,
+// which would carry an initialized image, has no surface syntax yet. Two
+// scalar `let` cells cannot stand in for the array either: every module-level
+// cell is 16-byte aligned (§11.11), so two i64s are 16 bytes apart and a
+// `timespec` needs its second word at +8.
+//
+// A SINGLE SHARED MUTABLE CELL IS REJECTED even though every waiter would store
+// identical bytes. Eight mutators waiting out one collection would be eight
+// concurrent writers of one object with a plain store, and "they all write the
+// same value" is an argument about today's callers, not a property of the cell;
+// the next caller with a different timeout inherits a torn `timespec` and a
+// wait of the wrong length, which is invisible (a wrong bound on a missed wake
+// costs latency, never a wrong answer) and therefore exactly the class of bug
+// this runtime pays most for.
+//
+// `@threadlocal` (§11.11) gives one cell per thread, so there is no shared
+// writer to reason about. It is usable HERE and nowhere else in this runtime
+// for a reason that is a property of this file, not a preference: Mach-O
+// refuses `@threadlocal` at emission (`UnsupportedTlsStorage`), which is why
+// ../gcthread.bit and runtime/root/root.bit both had to route around it — but
+// this module is compiled only for Linux targets, both of which are ELF, where
+// a per-thread read is `mrs TPIDR_EL0` plus a tprel ADD on aarch64 and
+// `mov fs:[0]` plus a TPOFF32 ADD on x86-64. Call-free on both, which is what
+// `@nosplit` requires. Every thread that can reach this has a thread pointer:
+// the main thread's block is installed by `initLinuxTls`
+// (runtime/root/linux/boottail.bit) before any worker starts, and a spawned
+// one's by the kernel from `CLONE_SETTLS` (`cloneThreadFlags`,
+// runtime/thread/linux/spawn.bit).
+@threadlocal let gcStopWaitTs: [2]i64
+
+// Sleep while the i64 word at `p` still holds `expected`, for at most
+// `timeoutUs` microseconds. See ../gcstopwait.bit for the contract and for why
+// the result is discarded by every caller.
+//
+// THE WORD IS 64 BITS AND FUTEX_WAIT COMPARES 32. Same argument
+// ../darwin/gcstopwait.bit makes, restated rather than inherited silently
+// because it rests on the TARGET and the target is different here: both Linux
+// targets this compiler ships, x86_64-linux and aarch64-linux, are
+// little-endian, so the LOW half of the i64 at `p` lives at `p` itself — and
+// `worldStopWord`'s entire domain is {0, 1} (../gcworld.bit), which fits that
+// half. A kernel comparing either width reaches the same verdict on the same
+// bytes. It cannot fail dangerously either way: a compare that disagrees
+// returns WITHOUT sleeping, costing one wasted call and never a lost wake.
+//
+// THE RAW RETURN CODE IS PASSED THROUGH, unmapped. `parkWait`
+// (../../park/linux/wait.bit) has to fold -ETIMEDOUT into its own status
+// because its caller reads it; this one's caller does not — ../gcstopwait.bit
+// makes the return deliberately unread, and `worldWaitForStop`
+// (../gcworldstop.bit) discards it and re-checks the stop word itself, which is
+// the only correct use of any compare-and-wait primitive. So Linux's 110 and
+// Darwin's 60 never have to be encoded here at all, and the constant that would
+// have differed between the two providers simply does not exist in either.
+//
+// A non-positive `timeoutUs` passes a null `timespec`, which is futex's "wait
+// forever" — the same spelling `parkWait` uses, kept so the two providers do
+// not disagree on a boundary. No caller reaches it: `worldWaitForStop` passes
+// `stwWaitTimeoutUs` (1000).
 export @nosplit @symbol("bit_rt_port_gc_world_stop_wait") fn gcWorldStopWait(
   p: *i64,
   expected: int,
   timeoutUs: int,
 ): int {
-  return gcWorldYield()
+  if (timeoutUs <= 0) {
+    return int(syscall(sysFutex(), i64(int(p)), i64(gcFutexWaitPrivate()), i64(expected), 0))
+  }
+  gcStopWaitTs[0] = i64(timeoutUs / gcUsPerSec())
+  gcStopWaitTs[1] = i64(timeoutUs % gcUsPerSec() * gcNsPerUs())
+  return int(
+    syscall(
+      sysFutex(), i64(int(p)), i64(gcFutexWaitPrivate()), i64(expected),
+      i64(int(ptrOf(gcStopWaitTs))),
+    ),
+  )
 }
 
-// No waiter ever sleeps on this target, so there is never one to wake. Reports
-// 0 woken, which is the same answer the Darwin provider gives for an empty
-// wait queue and is what its caller already treats as normal.
+// Wake every thread sleeping on the word at `p`.
+//
+// A negative return is reported as 0 woken. futex answers 0 rather than an
+// errno when nobody was waiting, so unlike Darwin's -ENOENT there is no benign
+// negative to normalise — but the caller gates this on a waiter count that can
+// go stale (`worldRestart`, ../gcworldstop.bit), a wake is advisory by
+// construction, and a `@nosplit` caller inside the collector's restart has
+// nothing it could do differently with an error code.
 export @nosplit @symbol("bit_rt_port_gc_world_stop_wake") fn gcWorldStopWake(p: *i64): int {
-  return 0
+  let rc = int(syscall(sysFutex(), i64(int(p)), i64(gcFutexWakePrivate()), i64(gcWakeAll()), 0))
+  if (rc < 0) {
+    return 0
+  }
+  return rc
 }
