@@ -1,0 +1,797 @@
+// Windows stdout/stderr capture provider (#5782, epic #3459): the four
+// `bit_rt_os_run_captured*` ABI wrappers (ABI.md §19, its "os_run_captured"
+// subsection added at 3e7ede723) — `os_run_captured`, `_stdout`, `_stderr`,
+// `_truncated`. A SIBLING file to ./osrun.bit, same module, reusing that
+// file's path/argv/command-line resolution and job-object tree-kill
+// machinery verbatim (`winResolveRunTarget`, `checkedPathW`,
+// `winBuildCommandLine`, `winKillAndReap`, `winReadExitCode`,
+// `winBoundedMaxMs`, `winInfiniteMs`/`winReapWaitMs`, `winProcessInfoBuf`) —
+// nothing here re-derives what that file already solved for the unbounded
+// and bounded `os_run*` family; only the pipe/STARTUPINFOEX/drain layer is
+// new.
+//
+// NO COMPILER BUILTIN REGISTRATION (constraint, matching the POSIX sibling
+// tickets #5780/#5781): the three exported symbols below are reached only
+// through `extern fn` declarations a caller writes itself (e.g.
+// `stdlib/os/os.bit`, landing separately) — nothing in `compiler/checktype.bit`,
+// `compiler/symbols.bit`, `compiler/validatecall.bit` or
+// `compiler/lowerprim.bit` knows their names.
+//
+// ---------------------------------------------------------------------------
+// THE HANDLE-INHERITANCE RACE, AND MICROSOFT'S OWN DOCUMENTED FIX
+// ---------------------------------------------------------------------------
+//
+// `bInheritHandles = TRUE` on `CreateProcessW` (required for both this file
+// and ./osrun.bit's `os_run`/`os_run_bounded`, which rely on it for their own
+// "child inherits everything" contract) hands the new process EVERY
+// inheritable handle open in THIS process at the moment of the call — not
+// just the two pipe write-ends this call cares about. Under this runtime's
+// worker scheduler, a SECOND task can be mid-flight through its own
+// `os_run_captured` call at the same real time, holding its own pair of pipe
+// write-ends open and inheritable; without a filter, the FIRST call's child
+// would inherit copies of the SECOND call's write-ends too, and a copy of a
+// pipe's write end held open ANYWHERE keeps that pipe from ever reporting EOF
+// to its reader — hanging the second call's own final drain forever, even
+// after ITS child has already exited and ITS own local write-end copy is
+// closed.
+//
+// Microsoft's own documented fix (learn.microsoft.com/windows/win32/procthread/
+// child-process-creation, "if you're creating a process that inherits some
+// handles but not others" — the same guidance
+// learn.microsoft.com/en-us/cpp/security/hp02-fixing-handle-inheritance-vulnerabilities
+// walks through end to end) is `STARTUPINFOEXW` +
+// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: `InitializeProcThreadAttributeList`
+// (processthreadsapi.h) sizes and initializes an opaque attribute-list
+// buffer, `UpdateProcThreadAttribute` (processthreadsapi.h) installs a
+// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` entry naming EXACTLY the handles that
+// should be inherited, and `CreateProcessW` is called with
+// `EXTENDED_STARTUPINFO_PRESENT` and this extended startup info. Per that
+// same page: "the target process inherits only the handles specified in the
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST list" — `bInheritHandles = TRUE` is still
+// required (the attribute list can only ever narrow what it would otherwise
+// inherit), but every OTHER inheritable handle in the process, including a
+// sibling task's own capture pipes, is excluded regardless of its own
+// inherit flag. `DeleteProcThreadAttributeList` (processthreadsapi.h) frees
+// the attribute list's internal state once `CreateProcessW` has returned.
+//
+// The pipe READ ends are marked non-inheritable directly (`SetHandleInformation`,
+// winbase.h, `HANDLE_FLAG_INHERIT`) as a second, independent line of defense —
+// a read end reaching the child at all would let the child's own eventual
+// exit leave OUR read unable to distinguish "child closed its handle" from
+// "child is still running", the same class of hang from the opposite side.
+//
+// ---------------------------------------------------------------------------
+// THE DRAIN LOOP: NEVER STOP EITHER SIDE, EVEN PAST THE CAP
+// ---------------------------------------------------------------------------
+//
+// Same deadlock-freedom property ABI.md §19 documents and the POSIX siblings'
+// own headers restate: a pipe's kernel buffer is small, so a child blocked on
+// a full pipe write stalls forever unless the parent keeps reading — on
+// EITHER stream, independent of the other. `winCapDrainStream` below always
+// drains everything `PeekNamedPipe` reports available on its handle, every
+// call, copying up to `osRunCaptureMaxBytes` (#5779) into the capture buffer
+// and discarding (never storing) anything past it — draining, not stopping.
+// Called once per poll tick (`winCapPollMs`, matching the POSIX pollers'
+// `osPollNs` = 2ms cadence) while the child runs, and once more after
+// `WaitForSingleObject` or the timeout kill confirms it is dead, to catch
+// whatever was still buffered at the moment it exited.
+//
+// ---------------------------------------------------------------------------
+// EXIT ENCODING: THE `<= -100` CASE NEVER OCCURS HERE
+// ---------------------------------------------------------------------------
+//
+// Same as ./osrun.bit's own bounded pair: `>= 0` normal exit (masked to a
+// byte), `-1` spawn/setup failure, `-2` timed out (killed via the job object
+// and reaped). Windows has no POSIX signals and no `WIFSIGNALED`-style
+// distinction — an unhandled exception simply becomes the process's own exit
+// code, which `GetExitCodeProcess` reports like any other, so this function
+// never returns `<= -100`.
+
+import { osRunCaptureMaxBytes } from "../../root"
+
+// kernel32 imports beyond what ./os.bit, ./boot.bit, ./fs.bit and ./osrun.bit
+// already declare in this module. All six are NEW admissions this ticket
+// adds to `compiler/pesyms.bit`'s table — documented at processthreadsapi.h
+// (`CreatePipe`, `InitializeProcThreadAttributeList`,
+// `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList` are actually
+// in namedpipeapi.h/processthreadsapi.h per Microsoft's own reference) and
+// winbase.h (`SetHandleInformation`), kernel32.dll; not hardware-probed,
+// matching this table's own honesty note for documentation-sourced entries —
+// `PeekNamedPipe` is namedpipeapi.h, kernel32.dll.
+extern fn CreatePipe(readOut: *byte, writeOut: *byte, secAttrs: *byte, size: i32): i32
+extern fn SetHandleInformation(handle: *byte, mask: i32, flags: i32): i32
+extern fn PeekNamedPipe(
+  handle: *byte, buf: *u8, bufSize: i32, bytesReadOut: *i32,
+  totalAvailOut: *i32, bytesLeftMsgOut: *i32,
+): i32
+extern fn InitializeProcThreadAttributeList(
+  attrList: *byte,
+  attrCount: i32,
+  flags: i32,
+  sizeOut: *i64,
+): i32
+extern fn UpdateProcThreadAttribute(
+  attrList: *byte, flags: i32, attribute: int, value: *byte, size: int,
+  prevValue: *byte, returnSize: *byte,
+): i32
+// Documented VOID (processthreadsapi.h); declared `i32`-returning like every
+// other extern in this file family (SPEC §11.7 requires a scalar or `void`
+// result) and its return discarded at every call site — reading an unused
+// register costs nothing and the ABI still matches for a caller that ignores it.
+extern fn DeleteProcThreadAttributeList(attrList: *byte): i32
+
+// ---------------------------------------------------------------------------
+// Struct layouts and flags (processthreadsapi.h/winbase.h/namedpipeapi.h) —
+// offsets verified against Microsoft's own documented field order, matching
+// ./osrun.bit's own comment's standard for this project.
+// ---------------------------------------------------------------------------
+
+// SECURITY_ATTRIBUTES: nLength(DWORD)@0, pad@4, lpSecurityDescriptor(PVOID)@8,
+// bInheritHandle(BOOL)@16, pad@20. Total 24 bytes.
+const winCapSecAttrBytes: int = 24
+
+// STARTUPINFOEXW: STARTUPINFOW (./osrun.bit's `winStartupInfoBytes`, 104
+// bytes) followed by lpAttributeList(PVOID)@104. Total 112 bytes.
+const winCapStartupInfoExBytes: int = 112
+
+// Fixed budget for `InitializeProcThreadAttributeList`'s opaque buffer, for
+// ONE attribute (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) — the documented size
+// for a single attribute is well under this on every observed Windows
+// release; the query call below still verifies it at runtime and this
+// primitive REJECTS (spawn failure) rather than overflow if a future release
+// ever needs more, the same "reject, never truncate" rule this file family
+// applies everywhere else.
+const winCapAttrListBytes: int = 256
+
+// Two HANDLEs (the stdout and stderr pipe write ends), the
+// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` value array.
+const winCapHandleListBytes: int = 16
+
+// Per-tick discard scratch for bytes read past `osRunCaptureMaxBytes` on a
+// stream that has already hit its cap — never retained, just drained so the
+// child cannot block writing to a pipe nobody is emptying.
+const winCapDiscardBytes: int = 4096
+
+// STARTF_USESTDHANDLES (winbase.h STARTUPINFOW.dwFlags).
+const winCapUseStdHandles: int = 256 // 0x00000100
+// EXTENDED_STARTUPINFO_PRESENT (winbase.h CreateProcess dwCreationFlags).
+const winCapExtendedStartupInfoPresent: int = 524288 // 0x00080000
+// HANDLE_FLAG_INHERIT (winbase.h SetHandleInformation dwMask/dwFlags).
+const winCapHandleFlagInherit: int = 1
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(
+//   ProcThreadAttributeHandleList=2, Thread=FALSE, Input=TRUE, Additive=FALSE)
+// = PROC_THREAD_ATTRIBUTE_INPUT(0x00020000) | 2. processthreadsapi.h.
+const winCapAttributeHandleList: int = 131074 // 0x00020002
+
+// Poll cadence matching the POSIX pollers' own `osPollNs` = 2,000,000ns = 2ms
+// (`runtime/root/linux/os.bit`). `WaitForSingleObject` doubles as both the
+// wait AND the tick here — no separate sleep call is needed the way the
+// POSIX `nanosleep`-based pollers need one, since Windows can wait with a
+// bounded timeout directly.
+const winCapPollMs: int = 2
+
+// Bounded (Power of 10 rule 2) ceiling on poll iterations, matching
+// ./osrun.bit's own `winBoundedMaxMs`-derived sizing for its bounded wait:
+// enough ticks to cover the full clamped timeout at `winCapPollMs` cadence,
+// plus slack.
+const winCapMaxPolls: int = winBoundedMaxMs / winCapPollMs + 16
+
+// Bounded (Power of 10 rule 2) ceiling on PeekNamedPipe+ReadFile chunks
+// drained in one `winCapDrainStream` call — generous against any real pipe
+// kernel buffer (typically a few KiB), never reached in practice; it exists
+// so the loop has a provable static bound rather than trusting the OS to
+// eventually report zero available.
+const winCapDrainMaxChunks: int = 4096
+
+// Per-slot BYTE strides for the raw scratch blocks below that are addressed
+// via `int(ptrOf(arr)) + slot * STRIDE` + `loadWord`/`storeWord`/`hAt`
+// (manual byte arithmetic, matching `./osrun.bit`'s own `winStartupInfoBuf`/
+// `winProcessInfoBuf` convention) rather than typed `*T` pointer arithmetic
+// (which the compiler itself scales by `sizeOf(T)` — used instead for the
+// single-DWORD/SIZE_T scratch below, `winCapDwordScratch`/`winCapSizeScratch`).
+const winCapChildStrideBytes: int = 40 // hProcess, hReadOut, hReadErr, job, haveJob
+const winCapStateStrideBytes: int = 8  // one i64 per slot
+const winCapPipeStrideBytes: int = 32  // hReadOut, hWriteOut, hReadErr, hWriteErr
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch (#3274-style, matching ./osrun.bit's own per-worker
+// buffers): `osScratchSlots` (32) + 1 fallback slot.
+// ---------------------------------------------------------------------------
+
+let winCapSecAttrBuf: [99]i64        // 33 * (24/8 = 3)
+let winCapStartupInfoExBuf: [462]i64 // 33 * (112/8 = 14)
+let winCapAttrListBuf: [1056]i64     // 33 * (256/8 = 32)
+let winCapHandleListBuf: [66]i64     // 33 * (16/8 = 2)
+let winCapDiscardBuf: [16896]i64     // 33 * (4096/8 = 512)
+let winCapPipeBuf: [132]i64          // 33 * 4 -- hReadOut, hWriteOut, hReadErr, hWriteErr
+let winCapSizeScratch: [33]i64       // one SIZE_T per slot
+let winCapDwordScratch: [33]i32      // one DWORD per slot (Peek avail / ReadFile n)
+
+// The last completed call's captured output, per worker — `_stdout`/
+// `_stderr`/`_truncated` read this immediately after, the same per-task
+// adjacency contract `bit_rt_fs_read_all_failed` documents (ABI.md §14),
+// kept LOCAL to this file rather than routed through `runtime/root/slots.bit`
+// (that file is shared cross-platform; the two POSIX sibling tickets need
+// their own equivalent state at the same time and a shared layout would be a
+// three-way collision over one file none of the three tickets was scoped to
+// touch). A fresh worker's slot reads 0 until its first call — the getters
+// below turn a 0 string-pointer into `emptyStr()` explicitly, matching
+// `rtFsRead`'s own "never trust raw BSS zero as a valid string" rule.
+let winCapStdoutStr: [33]i64
+let winCapStderrStr: [33]i64
+let winCapTruncatedBits: [33]i64
+
+// ---------------------------------------------------------------------------
+// Pipe + STARTUPINFOEX + attribute-list setup
+// ---------------------------------------------------------------------------
+
+// One anonymous pipe, write end inheritable (via `secAttrsAddr`), read end
+// explicitly marked non-inheritable — the second line of defense the header
+// describes. Writes `hRead` to `outAddr`, `hWrite` to `outAddr + 8` (the
+// exact layout `CreatePipe`'s own two out-params need, so no extra copy is
+// needed). Returns whether the pipe was created — no tuple: `--freestanding`
+// (ABI.md §1.1) boxes a multi-value `return` on the managed heap, which this
+// module cannot use, so every multi-result helper below writes into scratch
+// and returns a single scalar instead.
+@nosplit fn winCapMakePipe(secAttrsAddr: int, outAddr: int): bool {
+  let ok = CreatePipe(hAt(outAddr), hAt(outAddr + 8), hAt(secAttrsAddr), i32(0))
+  if (int(ok) == 0) {
+    return false
+  }
+  let hRead = loadWord(outAddr)
+  let _ = SetHandleInformation(hAt(hRead), i32(winCapHandleFlagInherit), i32(0))
+  return true
+}
+
+// Fills `secAttrsAddr` with a `bInheritHandle = TRUE` SECURITY_ATTRIBUTES,
+// required for `CreatePipe` to hand back an inheritable write end at all
+// (see header for why inheriting it at all is safe here: the attribute list
+// below is what actually narrows inheritance to just the two write ends).
+@nosplit fn winCapFillSecAttrs(secAttrsAddr: int) {
+  winZeroBytes(secAttrsAddr, winCapSecAttrBytes)
+  storeWord(secAttrsAddr, winCapSecAttrBytes)
+  storeWord(secAttrsAddr + 16, 1)
+}
+
+// Builds the `PROC_THREAD_ATTRIBUTE_LIST` restricting inheritance to exactly
+// `hWriteOut`/`hWriteErr` (the header's race fix). Returns the attribute
+// list's address, or `0` if the queried size does not fit
+// `winCapAttrListBytes` or either API call fails — REJECTED, matching this
+// file family's "reject, never overflow" rule.
+@nosplit fn winCapBuildAttrList(slot: int, hWriteOut: int, hWriteErr: int): int {
+  let sizeAddr = ptrOf(winCapSizeScratch) + slot
+  let nilAttrList: *byte = nil
+  let _ = InitializeProcThreadAttributeList(nilAttrList, i32(1), i32(0), sizeAddr)
+  let needed = int(atomicLoad(sizeAddr))
+  if (needed <= 0 || needed > winCapAttrListBytes) {
+    return 0
+  }
+  let attrList = int(ptrOf(winCapAttrListBuf)) + slot * winCapAttrListBytes
+  let ok = InitializeProcThreadAttributeList(hAt(attrList), i32(1), i32(0), sizeAddr)
+  if (int(ok) == 0) {
+    return 0
+  }
+  let handleList = int(ptrOf(winCapHandleListBuf)) + slot * winCapHandleListBytes
+  storeWord(handleList, hWriteOut)
+  storeWord(handleList + 8, hWriteErr)
+  let nilPrev: *byte = nil
+  let nilRet: *byte = nil
+  let uok = UpdateProcThreadAttribute(
+    hAt(attrList), i32(0), winCapAttributeHandleList, hAt(handleList),
+    winCapHandleListBytes, nilPrev, nilRet,
+  )
+  if (int(uok) == 0) {
+    let _ = DeleteProcThreadAttributeList(hAt(attrList))
+    return 0
+  }
+  return attrList
+}
+
+// Builds the STARTUPINFOEXW at this worker's slot: `cb` = the EX struct's own
+// size (Microsoft's own STARTUPINFOEX samples set `cb` to `sizeof(STARTUPINFOEX)`,
+// not the plain `STARTUPINFO` size, once `EXTENDED_STARTUPINFO_PRESENT` is in
+// play), `dwFlags` = `STARTF_USESTDHANDLES`, `hStdOutput`/`hStdError` = the
+// two pipe write ends, `hStdInput` left `0` (NULL — this primitive captures
+// output only; a child reading its own stdin sees an invalid handle, the
+// same degradation Windows documents for a `0` std-handle override), and
+// `lpAttributeList` = `attrList`. Returns the STARTUPINFOEXW's own address
+// (identical to its embedded STARTUPINFOW's, so it is also what
+// `CreateProcessW`'s `lpStartupInfo` parameter takes directly).
+@nosplit fn winCapBuildStartupInfoEx(
+  slot: int,
+  hWriteOut: int,
+  hWriteErr: int,
+  attrList: int,
+): int {
+  let si = int(ptrOf(winCapStartupInfoExBuf)) + slot * winCapStartupInfoExBytes
+  winZeroBytes(si, winCapStartupInfoExBytes)
+  storeWord(si, winCapStartupInfoExBytes)
+  storeWord(si + 60, winCapUseStdHandles)
+  storeWord(si + 88, hWriteOut)
+  storeWord(si + 96, hWriteErr)
+  storeWord(si + 104, attrList)
+  return si
+}
+
+// ---------------------------------------------------------------------------
+// Draining: peek, then read up to the cap into the capture buffer and
+// discard (never stop reading) past it. See header for the deadlock-freedom
+// argument.
+// ---------------------------------------------------------------------------
+
+// How many bytes `handle` currently has buffered, non-blocking. `0` on
+// either "nothing available" or a peek failure (e.g. the pipe's other end
+// already closed) — both mean "nothing to drain right now", never an error
+// this primitive surfaces.
+@nosplit fn winCapPeekAvail(handle: int): int {
+  let availAddr = ptrOf(winCapDwordScratch) + osScratchSlot()
+  let nilBuf: *u8 = nil
+  let nilOut: *i32 = nil
+  let ok = PeekNamedPipe(hAt(handle), nilBuf, i32(0), nilOut, availAddr, nilOut)
+  if (int(ok) == 0) {
+    return 0
+  }
+  return int(atomicLoad(availAddr))
+}
+
+// Reads up to `min(avail, maxBytes - used)` bytes from `handle` into `base +
+// used` (the capture buffer's own remaining room). Returns how much of
+// `avail` this call consumed (0 if `used` was already at `maxBytes`, or on a
+// read failure) — the caller computes `used + consumed` itself and knows how
+// much of `avail` is still left to discard (`avail - consumed`). A single
+// scalar return, not a tuple: `--freestanding` (ABI.md §1.1) boxes a
+// multi-value `return` on the managed heap, which this module cannot use.
+@nosplit fn winCapFillFromPipe(handle: int, base: int, used: int, maxBytes: int, avail: int): int {
+  if (used >= maxBytes) {
+    return 0
+  }
+  let room = maxBytes - used
+  let want = avail
+  if (want > room) {
+    want = room
+  }
+  let nAddr = ptrOf(winCapDwordScratch) + osScratchSlot()
+  let nilOverlapped: *byte = nil
+  let ok = ReadFile(hAt(handle), u8At(base + used), i32(want), nAddr, nilOverlapped)
+  let n = int(atomicLoad(nAddr))
+  if (int(ok) == 0 || n <= 0) {
+    return 0
+  }
+  return n
+}
+
+// Reads and throws away `remain` bytes from `handle`, in chunks bounded by
+// this worker's `winCapDiscardBytes` scratch, bounded overall by
+// `winCapDrainMaxChunks` (Power of 10 rule 2). Returns whether anything was
+// actually discarded (the stream exceeded its cap on this drain call).
+@nosplit fn winCapDiscardRemainder(handle: int, remain: int): bool {
+  let discard = int(ptrOf(winCapDiscardBuf)) + osScratchSlot() * winCapDiscardBytes
+  let nilOverlapped: *byte = nil
+  let left = remain
+  let hit = false
+  let chunks = 0
+  while (left > 0 && chunks < winCapDrainMaxChunks) {
+    let want = left
+    if (want > winCapDiscardBytes) {
+      want = winCapDiscardBytes
+    }
+    let nAddr = ptrOf(winCapDwordScratch) + osScratchSlot()
+    let ok = ReadFile(hAt(handle), u8At(discard), i32(want), nAddr, nilOverlapped)
+    let n = int(atomicLoad(nAddr))
+    if (int(ok) == 0 || n <= 0) {
+      left = 0
+    } else {
+      left = left - n
+      hit = true
+    }
+    chunks = chunks + 1
+  }
+  return hit
+}
+
+// Drains everything currently buffered on `handle`: fills the capture
+// buffer at `base + used` up to `maxBytes`, then discards (never stops
+// reading) whatever is left — the deadlock-freedom property the header
+// describes. Returns `(newUsed << 1) | hitCap` — `newUsed` fits comfortably
+// under `osRunCaptureMaxBytes` (4 MiB, 23 bits), so packing it with the one
+// `hitCap` bit into a single `int` avoids a multi-value `return` (see
+// `winCapFillFromPipe`'s own comment for why). `winCapDrainUnpackUsed`/
+// `winCapDrainUnpackHit` below decode it.
+@nosplit fn winCapDrainStream(handle: int, base: int, used: int, maxBytes: int): int {
+  let avail = winCapPeekAvail(handle)
+  if (avail <= 0) {
+    return used << 1
+  }
+  let consumed = winCapFillFromPipe(handle, base, used, maxBytes, avail)
+  let hit = winCapDiscardRemainder(handle, avail - consumed)
+  let hitBit = 0
+  if (hit) {
+    hitBit = 1
+  }
+  return ((used + consumed) << 1) | hitBit
+}
+
+@nosplit fn winCapDrainUnpackUsed(packed: int): int {
+  return packed >> 1
+}
+
+@nosplit fn winCapDrainUnpackHit(packed: int): bool {
+  return (packed & 1) != 0
+}
+
+// Copies the `used` captured bytes at throwaway scratch `base` into a fresh,
+// exactly-sized string — the same "throwaway max-sized scratch, then trim"
+// shape `../fsrw.bit`'s `rtFsRead`/`rtFsReadAll` both use (their own headers
+// explain why: `rtStringSlice` since #3897 retains the WHOLE backing buffer
+// for a view, so a `cap`-sized capture buffer must never be returned or
+// sliced directly for a small result).
+@nosplit fn winCapFinalize(base: int, used: int): int {
+  if (used <= 0) {
+    return emptyStr()
+  }
+  let out = rtStrAlloc(used)
+  if (out == 0) {
+    return emptyStr()
+  }
+  let dst = strData(out)
+  let i = 0
+  while (i < used) {
+    storeByte(dst + i, loadByte(base + i))
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Spawn + capture, bounded (unbounded is not part of this ABI — `run_captured`
+// always takes a `timeoutMs`, per ABI.md §19).
+// ---------------------------------------------------------------------------
+
+// This worker's own child-handle bundle for the call in progress: hProcess,
+// hReadOut, hReadErr, job, haveJob(as 0/1) — five words per slot. NOT a
+// GC-managed value (every field is a raw OS handle or int), so — unlike
+// `outCap`/`errCap` below — stashing these in a `[N]i64` scratch array
+// between `winCapOpenChild` and `winCapPollAndDrain` is safe; it is what
+// keeps `winCapPollAndDrain` under the 5-param lint ceiling.
+let winCapChildBuf: [165]i64 // 33 * 5
+
+// Pipe pair + attribute-list setup (the header's race fix), for both
+// streams: writes `hReadOut`/`hWriteOut`/`hReadErr`/`hWriteErr` into
+// `winCapPipeBuf[slot]` (offsets 0/8/16/24) and returns whether every step
+// succeeded; on failure every already-opened handle is closed before
+// returning `false` — the caller has nothing left to clean up. `attrList`'s
+// own address is not returned (no tuple, see `winCapMakePipe`'s comment): it
+// is a deterministic function of `slot`, recomputed by whoever needs it once
+// this returns `true`.
+@nosplit fn winCapOpenPipesAndAttr(slot: int): bool {
+  let secAttrs = int(ptrOf(winCapSecAttrBuf)) + slot * winCapSecAttrBytes
+  winCapFillSecAttrs(secAttrs)
+  let pipeBase = int(ptrOf(winCapPipeBuf)) + slot * winCapPipeStrideBytes
+
+  let ok1 = winCapMakePipe(secAttrs, pipeBase)
+  if (!ok1) {
+    return false
+  }
+  let ok2 = winCapMakePipe(secAttrs, pipeBase + 16)
+  if (!ok2) {
+    CloseHandle(hAt(loadWord(pipeBase)))
+    CloseHandle(hAt(loadWord(pipeBase + 8)))
+    return false
+  }
+  let hWriteOut = loadWord(pipeBase + 8)
+  let hWriteErr = loadWord(pipeBase + 24)
+  let attrList = winCapBuildAttrList(slot, hWriteOut, hWriteErr)
+  if (attrList == 0) {
+    CloseHandle(hAt(loadWord(pipeBase)))
+    CloseHandle(hAt(hWriteOut))
+    CloseHandle(hAt(loadWord(pipeBase + 16)))
+    CloseHandle(hAt(hWriteErr))
+    return false
+  }
+  return true
+}
+
+// Opens the pipes/attribute list, spawns `appName`/`cmdLine` CREATE_SUSPENDED
+// with the extended startup info, assigns it to a job object (the same
+// race-free tree-kill setup `./osrun.bit`'s `winSpawnAndWaitBounded` uses),
+// and resumes it. The parent's own copies of the write ends are closed
+// immediately after `CreateProcessW` returns (success or failure) so the
+// read ends can see EOF once the child's own copies close. Stores the
+// resulting handle bundle in `winCapChildBuf[slot]`. Returns whether a
+// process now exists to poll.
+@nosplit fn winCapOpenChild(appName: int, cmdLine: int, slot: int): bool {
+  let setupOk = winCapOpenPipesAndAttr(slot)
+  if (!setupOk) {
+    return false
+  }
+  let pipeBase = int(ptrOf(winCapPipeBuf)) + slot * winCapPipeStrideBytes
+  let hReadOut = loadWord(pipeBase)
+  let hWriteOut = loadWord(pipeBase + 8)
+  let hReadErr = loadWord(pipeBase + 16)
+  let hWriteErr = loadWord(pipeBase + 24)
+  // `winCapOpenPipesAndAttr` only returns `true` once `winCapBuildAttrList`
+  // has succeeded, so this address is guaranteed live.
+  let attrList = int(ptrOf(winCapAttrListBuf)) + slot * winCapAttrListBytes
+  let si = winCapBuildStartupInfoEx(slot, hWriteOut, hWriteErr, attrList)
+  let pi = int(ptrOf(winProcessInfoBuf)) + slot * winProcessInfoBytes
+  let flags = winCreateSuspended | winCapExtendedStartupInfoPresent
+  let nilEnv: *byte = nil
+  let nilDir: *byte = nil
+  let ok = CreateProcessW(
+    hAt(appName), hAt(cmdLine), hAt(0), hAt(0),
+    i32(1), i32(flags), nilEnv, nilDir,
+    hAt(si), hAt(pi),
+  )
+  let _ = DeleteProcThreadAttributeList(hAt(attrList))
+  CloseHandle(hAt(hWriteOut))
+  CloseHandle(hAt(hWriteErr))
+  if (int(ok) == 0) {
+    CloseHandle(hAt(hReadOut))
+    CloseHandle(hAt(hReadErr))
+    return false
+  }
+  let hProcess = loadWord(pi)
+  let hThread = loadWord(pi + 8)
+  let job = int(CreateJobObjectW(hAt(0), hAt(0)))
+  let haveJob = job != 0
+  if (haveJob) {
+    let _ = AssignProcessToJobObject(hAt(job), hAt(hProcess))
+  }
+  let _ = ResumeThread(hAt(hThread))
+  CloseHandle(hAt(hThread))
+
+  let c = int(ptrOf(winCapChildBuf)) + slot * winCapChildStrideBytes
+  storeWord(c, hProcess)
+  storeWord(c + 8, hReadOut)
+  storeWord(c + 16, hReadErr)
+  storeWord(c + 24, job)
+  let haveJobInt = 0
+  if (haveJob) {
+    haveJobInt = 1
+  }
+  storeWord(c + 32, haveJobInt)
+  return true
+}
+
+// One poll tick against `winCapChildBuf[slot]`: wait `winCapPollMs`, drain
+// both streams regardless of the wait's own result (never let a full pipe
+// block the child while the parent is only checking exit status). Updates
+// `usedOut`/`usedErr` (this worker's own drain-progress scratch,
+// `winCapProgressBuf`) and ORs any newly-hit cap into `winCapTruncatedBits`
+// directly — no return value carries them, since a multi-value `return`
+// would box on the managed heap (`--freestanding`, see `winCapMakePipe`'s
+// comment). Returns whether the process has exited.
+let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
+
+@nosplit fn winCapPollTick(slot: int, outCap: int, errCap: int): bool {
+  let c = int(ptrOf(winCapChildBuf)) + slot * winCapChildStrideBytes
+  let hProcess = loadWord(c)
+  let hReadOut = loadWord(c + 8)
+  let hReadErr = loadWord(c + 16)
+  let wait = int(WaitForSingleObject(hAt(hProcess), i32(winCapPollMs)))
+
+  let prog = int(ptrOf(winCapProgressBuf)) + slot * 16
+  let packedOut = winCapDrainStream(hReadOut, strData(outCap), loadWord(prog), osRunCaptureMaxBytes)
+  let packedErr = winCapDrainStream(
+    hReadErr,
+    strData(errCap),
+    loadWord(prog + 8),
+    osRunCaptureMaxBytes,
+  )
+  storeWord(prog, winCapDrainUnpackUsed(packedOut))
+  storeWord(prog + 8, winCapDrainUnpackUsed(packedErr))
+
+  let bitsAddr = int(ptrOf(winCapTruncatedBits)) + slot * winCapStateStrideBytes
+  let bits = loadWord(bitsAddr)
+  if (winCapDrainUnpackHit(packedOut)) {
+    bits = bits | 1
+  }
+  if (winCapDrainUnpackHit(packedErr)) {
+    bits = bits | 2
+  }
+  storeWord(bitsAddr, bits)
+  return wait == winWaitObject0
+}
+
+// Polls until the child spawned by `winCapOpenChild` exits or `clampedMs`
+// elapses, then does one final drain pass to catch whatever was still
+// buffered at the moment it died, and closes every handle in
+// `winCapChildBuf[slot]`. Returns `>= 0` (masked exit code) or `-2` (timed
+// out, killed and reaped via the job object, matching `./osrun.bit`'s own
+// bounded pair). `winCapProgressBuf[slot]` and `winCapTruncatedBits[slot]`
+// hold the final drain state on return, for the caller to finalize.
+@nosplit fn winCapPollAndDrain(slot: int, clampedMs: int, outCap: int, errCap: int): int {
+  // Reset this worker's drain-progress and truncated-bits scratch: both are
+  // reused across calls, and `winCapPollTick` reads them before its first
+  // write (accumulating onto whatever was there), so a stale value from a
+  // PRIOR call on this same slot must not leak into this one.
+  let prog0 = int(ptrOf(winCapProgressBuf)) + slot * 16
+  storeWord(prog0, 0)
+  storeWord(prog0 + 8, 0)
+  storeWord(int(ptrOf(winCapTruncatedBits)) + slot * winCapStateStrideBytes, 0)
+
+  let ticks = clampedMs / winCapPollMs + 1
+  let polls = 0
+  let done = false
+  while (!done && polls < ticks && polls <= winCapMaxPolls) {
+    done = winCapPollTick(slot, outCap, errCap)
+    polls = polls + 1
+  }
+
+  let c = int(ptrOf(winCapChildBuf)) + slot * winCapChildStrideBytes
+  let hProcess = loadWord(c)
+  let hReadOut = loadWord(c + 8)
+  let hReadErr = loadWord(c + 16)
+  let job = loadWord(c + 24)
+  let haveJob = loadWord(c + 32) != 0
+
+  let result = 0
+  if (done) {
+    result = winReadExitCode(hProcess)
+  } else {
+    winKillAndReap(hProcess, job, haveJob)
+    result = 0 - 2
+  }
+  // Final drain: whatever was still buffered when the child died. Reusing
+  // `winCapPollTick`'s own drain-and-store step would need one more
+  // WaitForSingleObject call on an already-dead process, so this repeats
+  // just the drain half directly.
+  let prog = int(ptrOf(winCapProgressBuf)) + slot * 16
+  let packedOut = winCapDrainStream(hReadOut, strData(outCap), loadWord(prog), osRunCaptureMaxBytes)
+  let packedErr = winCapDrainStream(
+    hReadErr,
+    strData(errCap),
+    loadWord(prog + 8),
+    osRunCaptureMaxBytes,
+  )
+  storeWord(prog, winCapDrainUnpackUsed(packedOut))
+  storeWord(prog + 8, winCapDrainUnpackUsed(packedErr))
+  let bitsAddr = int(ptrOf(winCapTruncatedBits)) + slot * winCapStateStrideBytes
+  let bits = loadWord(bitsAddr)
+  if (winCapDrainUnpackHit(packedOut)) {
+    bits = bits | 1
+  }
+  if (winCapDrainUnpackHit(packedErr)) {
+    bits = bits | 2
+  }
+  storeWord(bitsAddr, bits)
+
+  CloseHandle(hAt(hReadOut))
+  CloseHandle(hAt(hReadErr))
+  if (haveJob) {
+    CloseHandle(hAt(job))
+  }
+  CloseHandle(hAt(hProcess))
+  return result
+}
+
+// Clamp `timeoutMs` to `./osrun.bit`'s own `winBoundedMaxMs` ceiling — same
+// bound, same reasoning (ABI.md §19's documented `os_run_bounded_max_ms`).
+@nosplit fn winCapClampTimeout(timeoutMs: int): int {
+  let clamped = timeoutMs
+  if (clamped < 0) {
+    clamped = 0
+  }
+  if (clamped > winBoundedMaxMs) {
+    clamped = winBoundedMaxMs
+  }
+  return clamped
+}
+
+// Kills the child bundle in `winCapChildBuf[slot]` and closes every handle
+// in it — shared by `winCapSpawnAndCapture`'s own allocation-failure path
+// below, the one place outside `winCapPollAndDrain` that must abandon an
+// already-resumed child.
+@nosplit fn winCapAbortChild(slot: int) {
+  let c = int(ptrOf(winCapChildBuf)) + slot * winCapChildStrideBytes
+  let hProcess = loadWord(c)
+  let hReadOut = loadWord(c + 8)
+  let hReadErr = loadWord(c + 16)
+  let job = loadWord(c + 24)
+  let haveJob = loadWord(c + 32) != 0
+  winKillAndReap(hProcess, job, haveJob)
+  CloseHandle(hAt(hReadOut))
+  CloseHandle(hAt(hReadErr))
+  if (haveJob) {
+    CloseHandle(hAt(job))
+  }
+  CloseHandle(hAt(hProcess))
+}
+
+// The full `bit_rt_os_run_captured` body: open the child, capture both
+// streams to a throwaway `osRunCaptureMaxBytes`-sized scratch each (the
+// managed allocation `rtStrAlloc` performs — the one this whole freestanding
+// file is permitted, the same primitive `../fsrw.bit`'s `rtFsReadAll`
+// counterpart already uses), poll/drain, then publish the trimmed strings
+// and truncated bits into this worker's own companion slots
+// (`winCapStdoutStr`/`winCapStderrStr`/`winCapTruncatedBits`, read by the
+// three exported companions below). Returns the exit result only — no
+// tuple, see `winCapMakePipe`'s comment.
+@nosplit fn winCapSpawnAndCapture(appName: int, cmdLine: int, timeoutMs: int): int {
+  let slot = osScratchSlot()
+  let opened = winCapOpenChild(appName, cmdLine, slot)
+  if (!opened) {
+    return 0 - 1
+  }
+  let outCap = rtStrAlloc(osRunCaptureMaxBytes)
+  let errCap = rtStrAlloc(osRunCaptureMaxBytes)
+  if (outCap == 0 || errCap == 0) {
+    // Allocation failure with a live (already-resumed) child: kill it
+    // rather than leave it running with nothing draining its pipes.
+    winCapAbortChild(slot)
+    return 0 - 1
+  }
+
+  let clamped = winCapClampTimeout(timeoutMs)
+  let code = winCapPollAndDrain(slot, clamped, outCap, errCap)
+  let prog = int(ptrOf(winCapProgressBuf)) + slot * 16
+  let outStr = winCapFinalize(strData(outCap), loadWord(prog))
+  let errStr = winCapFinalize(strData(errCap), loadWord(prog + 8))
+
+  storeWord(int(ptrOf(winCapStdoutStr)) + slot * winCapStateStrideBytes, outStr)
+  storeWord(int(ptrOf(winCapStderrStr)) + slot * winCapStateStrideBytes, errStr)
+  // `winCapTruncatedBits[slot]` already holds the final bits — set by
+  // `winCapPollAndDrain`'s own last drain pass; nothing left to store here.
+  return code
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §19)
+// ---------------------------------------------------------------------------
+
+// `bit_rt_os_run_captured(path, argv, timeoutMs)`: run `path` (appended with
+// `argv`, the same `*const RtBytes`/SliceHeader pair `bit_rt_os_run` takes —
+// reused verbatim via `./osrun.bit`'s own `winResolveRunTarget`/
+// `checkedPathW`/`winBuildCommandLine`) as a child with its stdout and
+// stderr captured instead of inherited. Same exit encoding as
+// `bit_rt_os_run_bounded` (`>= 0` / `-1` / `-2`); the `<= -100` signal case
+// never occurs on Windows (see header).
+export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
+  path: int,
+  argv: int,
+  timeoutMs: int,
+): int {
+  let ab = winResolveRunTarget(path, argv)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let appName = checkedPathW(path)
+  if (appName == 0) {
+    return 0 - 1
+  }
+  let cmdLine = winBuildCommandLine(ab)
+  if (cmdLine == 0) {
+    return 0 - 1
+  }
+  return winCapSpawnAndCapture(appName, cmdLine, timeoutMs)
+}
+
+// `bit_rt_os_run_captured_stdout()`/`_stderr()`: this worker's own captured
+// stream from the call just made — per-task state, read immediately after
+// with no yield between (ABI.md §19, the same `bit_rt_fs_read_all_failed`
+// contract, §14). A worker that has never called `bit_rt_os_run_captured`
+// reads its slot's raw zero, turned into a real empty string here rather
+// than trusted as one directly (`rtFsRead`'s own rule).
+export @nosplit @symbol("bit_rt_os_run_captured_stdout") fn rtOsRunCapturedStdout(): int {
+  let v = loadWord(int(ptrOf(winCapStdoutStr)) + osScratchSlot() * winCapStateStrideBytes)
+  if (v == 0) {
+    return emptyStr()
+  }
+  return v
+}
+
+export @nosplit @symbol("bit_rt_os_run_captured_stderr") fn rtOsRunCapturedStderr(): int {
+  let v = loadWord(int(ptrOf(winCapStderrStr)) + osScratchSlot() * winCapStateStrideBytes)
+  if (v == 0) {
+    return emptyStr()
+  }
+  return v
+}
+
+// `bit_rt_os_run_captured_truncated()`: bit 0 = stdout hit `osRunCaptureMaxBytes`,
+// bit 1 = stderr did (ABI.md §19). `0` for a worker that has never called
+// `bit_rt_os_run_captured` — the slot's own zero value needs no translation
+// here, unlike the two string companions above.
+export @nosplit @symbol("bit_rt_os_run_captured_truncated") fn rtOsRunCapturedTruncated(): int {
+  return loadWord(int(ptrOf(winCapTruncatedBits)) + osScratchSlot() * winCapStateStrideBytes)
+}
