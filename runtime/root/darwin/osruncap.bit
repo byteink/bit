@@ -1,0 +1,513 @@
+import { osRunCaptureMaxBytes } from "../../root"
+import { schedCurrentScratch } from "../../sched"
+import { scrOsCapStdout, scrOsCapStderr, scrOsCapTruncated } from "../../sched"
+
+// `bit_rt_os_run_captured` + its three out-of-band companions (ABI.md §19,
+// #5781, epic #3459): `os_run_bounded` with the child's stdout/stderr
+// captured into memory instead of left attached to this process's own fds.
+// Sibling of ./os.bit in the same directory — SAME MODULE (an import is
+// per-module, not per-file), so `osEnvp`, `osScratchSlot`, `osScratchSlots`,
+// `osBoundedMaxMs`, `osBoundedMaxPolls`, `osPollSleep`, `osMonoNs`,
+// `osKillGroup`, `osWnohang`, `osWStatusMask`, `osWExitShift`,
+// `osStatusBuf`, `osMarkChildOutstanding`, `osOutstandingChildPid`,
+// `fsPathZ`, `osBuildRunArgv`, `close`, `read`, `readAllErrno`, `eWouldBlock`,
+// `rtStrAlloc`, `strData`, `loadByte`, `storeByte`, `emptyStr` and
+// `rtFsReadAllTrim` are all ./os.bit's/./fs.bit's/./fsrw.bit's own
+// declarations or imports, already in scope — no new import needed for any
+// of them, and re-declaring one would be E0042.
+//
+// KEPT DELIBERATELY IN THE SAME FUNCTION-FOR-FUNCTION SHAPE AS
+// ../linux/osruncap.bit (#5780), mirroring how ./os.bit itself mirrors
+// ../linux/os.bit: a divergence is a real platform difference, not a
+// stylistic one. The two real differences: (1) `pipe`/`dup2`/`fcntl` are
+// libSystem `extern fn`s here rather than raw syscall traps (no stable
+// Apple syscall numbers, ../darwin/io.bit); (2) Darwin's `fcntl` needs the
+// same padded-variadic-argument shape `runtime/net/darwin/sock.bit`'s own
+// `fcntl` extern already carries (#1462) — declared fresh here because this
+// is a different module and an extern declaration does not cross one.
+//
+// FD_CLOEXEC RACE WINDOW, MEASURED NOT ASSUMED (per this ticket's own
+// acceptance): `runtime/root/darwin/os.bit`'s header records that NOTHING
+// serialises `bit_rt_os_run`/`_bounded`/`_test` against each other — "grep
+// found no lock anywhere near these call sites" — and that is still true
+// after this file: grepping `runtime/root/darwin/*.bit` and
+// `runtime/sched/**/*.bit` for `Lock`/`mutex`/`sema` around a fork call
+// finds worker-pool and GC locks, never one guarding fork/exec. macOS has no
+// `pipe2`, so `pipe()` and the `fcntl(F_SETFD, FD_CLOEXEC)` below it are TWO
+// separate syscalls with a real gap between them. Every fd this file opens
+// is marked CLOEXEC in that gap, immediately after `pipe()` returns and
+// BEFORE this function's own `fork()` — but a DIFFERENT worker thread
+// running a DIFFERENT `bit_rt_os_run*` call can `fork()` at any point in
+// that gap, and that concurrent child inherits this thread's still-open,
+// not-yet-CLOEXEC pipe fd (fork duplicates the WHOLE fd table as it stands
+// at the instant of the call, not as it will stand after this thread's next
+// instruction). If that concurrent child then execs before this thread's
+// `fcntl` runs, it holds our write end open past our own child's exit, and
+// the reader here never sees EOF on that stream. The window is real and
+// OPEN, not merely narrowed: nothing in this runtime takes a lock across
+// `pipe()`+`fcntl()`, and this file adds none — closing it needs a
+// process-wide fork lock around every `bit_rt_os_run*` entry point, which is
+// wider than this ticket's `files:` and is `runtime/root/darwin/os.bit`'s
+// own #1436-adjacent hazard, recorded rather than fixed here.
+
+// `pipe(2)`: writes two `int`s (read-end, write-end) into the 8 bytes at
+// `fds`. `dup2(2)`: makes `newfd` a copy of `oldfd`, closing `newfd` first if
+// it was open; POSIX guarantees the NEW fd never carries `FD_CLOEXEC`
+// regardless of the source fd's own flag, which is what lets the child's
+// fd 1/fd 2 survive `execve` while every original pipe fd (CLOEXEC'd below)
+// does not.
+extern fn pipe(fds: *u8): i32
+extern fn dup2(oldfd: i32, newfd: i32): i32
+
+// `fcntl` is ALREADY declared module-wide, same padded-variadic shape
+// (#1462, see ./fsrw.bit's own header for the full account of why a naive
+// fixed-arity third parameter silently applies nothing and reports success
+// on Apple ARM64) — sibling file `./fsrw.bit`'s `bit_rt_fs_sync` declares
+// it; a second `extern fn fcntl` here is E0042.
+//
+// `<sys/fcntl.h>`: F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (identical on
+// Darwin and Linux — POSIX-standard fcntl commands, the same pair
+// `runtime/net/sock.bit`'s `fGetFl`/`fSetFl` already cite as "3 and 4 on
+// both platforms"). FD_CLOEXEC=1. O_NONBLOCK is Darwin bit 2 (value 4) —
+// NOT Linux's bit 11 (2048) — matching `runtime/net/darwin/sock.bit`'s own
+// `oNonBlock()`, re-declared locally rather than imported since that file is
+// a different module.
+const osCapFGetfd: int = 1
+const osCapFSetfd: int = 2
+const osCapFGetfl: int = 3
+const osCapFSetfl: int = 4
+const osCapFdCloexec: int = 1
+const osCapNonBlock: int = 4
+
+// Set `cmd` on `fd` to `val`, padded both ways (register slot AND stack
+// slot) exactly as `sock.bit`'s `netSetNonBlock` does, then return.
+@nosplit fn osCapFcntlSet(fd: int, cmd: int, val: int): int {
+  return int(fcntl(i32(fd), i32(cmd), i64(val), 0, 0, 0, 0, 0, i64(val)))
+}
+
+// Read `cmd`'s current value on `fd` — the zero-argument form, still padded
+// so the same declaration serves both directions.
+@nosplit fn osCapFcntlGet(fd: int, cmd: int): int {
+  return int(fcntl(i32(fd), i32(cmd), 0, 0, 0, 0, 0, 0, 0))
+}
+
+// Set FD_CLOEXEC on `fd` and READ IT BACK to confirm (#1462's own lesson:
+// "the return value of fcntl is not evidence that the flag was set"). A
+// fresh `pipe()` fd starts with descriptor flags 0, so this is a plain SET,
+// not sock.bit's get-then-OR — there is no pre-existing bit to preserve.
+@nosplit fn osCapSetCloexec(fd: int): bool {
+  let _ = osCapFcntlSet(fd, osCapFSetfd, osCapFdCloexec)
+  let flags = osCapFcntlGet(fd, osCapFGetfd)
+  if (flags < 0) {
+    return false
+  }
+  return (flags & osCapFdCloexec) != 0
+}
+
+// Set O_NONBLOCK on `fd` and read it back, same reasoning as
+// `osCapSetCloexec` and the identical `netSetNonBlock` idiom.
+@nosplit fn osCapSetNonBlock(fd: int): bool {
+  let _ = osCapFcntlSet(fd, osCapFSetfl, osCapNonBlock)
+  let flags = osCapFcntlGet(fd, osCapFGetfl)
+  if (flags < 0) {
+    return false
+  }
+  return flags / osCapNonBlock % 2 != 0
+}
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch: two pipe pairs, packed one word per pair
+// ---------------------------------------------------------------------------
+//
+// `pipe(2)` writes its two `int`s (read-end, write-end) tightly packed, 4
+// bytes apart, into the SAME 8-byte word this zeroes first: fd0 in the low
+// 32 bits, fd1 in the high 32 bits (little-endian on both Darwin
+// architectures) — the identical "zero then read the whole word" trick
+// `osForkExecWaitBounded`'s `waitpid` status cell already relies on for a
+// kernel-written 4-byte field. One word per pipe, two pipes (stdout, stderr)
+// per slot, PER-WORKER (`osScratchSlot()`) like every other raw-syscall
+// scratch buffer in ./os.bit — the same "never migrates workers mid-call"
+// proof applies here: nothing below parks. Scalars, never scanned (rule 1).
+let osCapFdBuf: [66]i64 // 2 words/slot * (osScratchSlots+1)
+
+@nosplit fn osCapFdBase(): int {
+  return int(ptrOf(osCapFdBuf)) + osScratchSlot() * 16
+}
+
+@nosplit fn osCapFdLow(pairAddr: int): int {
+  return loadWord(pairAddr) & 0xFFFFFFFF
+}
+
+@nosplit fn osCapFdHigh(pairAddr: int): int {
+  return loadWord(pairAddr) >> 32
+}
+
+// Open one pipe at `pairAddr` and CLOEXEC both resulting fds before this
+// function returns — the whole point being that no OTHER code, including a
+// concurrently forking sibling worker, observes either fd non-CLOEXEC for
+// longer than these two calls take. `false` on any failure (pipe, or either
+// fcntl's own verified readback), so the caller never treats a
+// half-protected pair as usable.
+@nosplit fn osCapOpenPipe(pairAddr: int): bool {
+  storeWord(pairAddr, 0)
+  if (int(pipe(u8At(pairAddr))) != 0) {
+    return false
+  }
+  let ok0 = osCapSetCloexec(osCapFdLow(pairAddr))
+  let ok1 = osCapSetCloexec(osCapFdHigh(pairAddr))
+  return ok0 && ok1
+}
+
+@nosplit fn osCapClosePair(pairAddr: int) {
+  let _ = close(i32(osCapFdLow(pairAddr)))
+  let _ = close(i32(osCapFdHigh(pairAddr)))
+}
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch: the non-blocking read chunk
+// ---------------------------------------------------------------------------
+//
+// One raw (non-GC) scratch buffer per worker, reused sequentially for the
+// stdout read then the err read within the same poll tick — never needed for
+// both at once. 8192 bytes: comparable to a Darwin pipe's own kernel buffer,
+// so one non-blocking read per tick keeps pace with the 2ms poll cadence
+// without an unbounded per-tick drain loop.
+const osCapChunkBytes: int = 8192
+
+let osCapChunkBuf: [33792]i64 // (osCapChunkBytes/8)/slot * (osScratchSlots+1)
+
+@nosplit fn osCapChunkPtr(): int {
+  return int(ptrOf(osCapChunkBuf)) + osScratchSlot() * osCapChunkBytes
+}
+
+// One non-blocking read of `fd` into the worker's chunk buffer, copying up
+// to `cap - curLen` of it into `buf`'s data area at `curLen` (matching
+// `bit_rt_fs_read_all`'s allocate-then-trim shape — `buf` is
+// `osRunCaptureMaxBytes`-sized, allocated once by the caller). Bytes read
+// past `cap` are still consumed from the pipe (the discard branch below),
+// never left unread, so draining this stream never stalls the sibling
+// (ABI.md §19). `cap == 0` (the caller's allocation-failure fallback) takes
+// the same path with `copy` forced to 0 by the `room` clamp — never touches
+// `buf`.
+//
+// Return encoding: `-1` genuine EOF or a non-EAGAIN read error (treated
+// alike — a short, silent stop, same policy `bit_rt_fs_read_all`'s own
+// non-EINTR error paths already use); `-2` not ready (EAGAIN, no progress
+// this tick); otherwise `newLen * 2 + (1 if this call truncated else 0)` —
+// packed so the two results travel in one scalar without a second scratch
+// write.
+@nosplit fn osCapStep(fd: int, chunkPtr: int, buf: int, curLen: int, capBytes: int): int {
+  let n = int(read(i32(fd), u8At(chunkPtr), i64(osCapChunkBytes)))
+  if (n == 0) {
+    return 0 - 1
+  }
+  if (n < 0) {
+    if (readAllErrno() == eWouldBlock) {
+      return 0 - 2
+    }
+    return 0 - 1
+  }
+  let room = capBytes - curLen
+  let copy = n
+  let truncated = false
+  if (copy > room) {
+    copy = room
+    truncated = true
+  }
+  if (copy > 0) {
+    let dst = strData(buf)
+    let i = 0
+    while (i < copy) {
+      storeByte(dst + curLen + i, loadByte(chunkPtr + i))
+      i = i + 1
+    }
+  }
+  let newLen = curLen + copy
+  if (truncated) {
+    return newLen * 2 + 1
+  }
+  return newLen * 2
+}
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch: the poll loop's cross-tick state
+// ---------------------------------------------------------------------------
+//
+// 9 words/slot: outLen, errLen, outTrunc, errTrunc, outEof, errEof,
+// childExited, result, deadline — generalised by `which` (0=out, 1=err) so
+// `osCapDrain` below is ONE function, not two copies: outLen/errLen are
+// `which`/`4+which` words apart by construction (0,1 then 4,5), and
+// outTrunc/errTrunc the same at `2+which`. PER-WORKER like every buffer
+// above — this state is scratch for the ONE poll loop this worker is
+// running, never read by another worker.
+let osCapStateBuf: [297]i64 // 9 words/slot * (osScratchSlots+1)
+
+@nosplit fn osCapStateBase(): int {
+  return int(ptrOf(osCapStateBuf)) + osScratchSlot() * 72
+}
+
+@nosplit fn osCapStateReset(base: int, timeoutMs: int) {
+  let i = 0
+  while (i < 7) {
+    storeWord(base + i * 8, 0)
+    i = i + 1
+  }
+  let clamped = timeoutMs
+  if (clamped < 0) {
+    clamped = 0
+  }
+  if (clamped > osBoundedMaxMs) {
+    clamped = osBoundedMaxMs
+  }
+  storeWord(base + 56, 0 - 1) // default result, overwritten before every real return
+  storeWord(base + 64, osMonoNs() + clamped * 1000000)
+}
+
+// Drain stream `which` (0=out, 1=err) of `fd` into `buf` by one non-blocking
+// `osCapStep`, folding its packed result into this worker's state words. A
+// no-op once that stream's EOF word is already set.
+@nosplit fn osCapDrain(base: int, fd: int, buf: int, which: int) {
+  let eofOff = base + (4 + which) * 8
+  if (loadWord(eofOff) != 0) {
+    return
+  }
+  let lenOff = base + which * 8
+  let r = osCapStep(fd, osCapChunkPtr(), buf, loadWord(lenOff), osRunCaptureMaxBytes)
+  if (r == 0 - 1) {
+    storeWord(eofOff, 1)
+    return
+  }
+  if (r == 0 - 2) {
+    return
+  }
+  storeWord(lenOff, r / 2)
+  if (r % 2 == 1) {
+    storeWord(base + (2 + which) * 8, 1)
+  }
+}
+
+// Never a real exit/timeout/signal encoding (those range -164..255): a
+// distinct sentinel for "no state change worth recording yet" out of the
+// single-attempt `waitpid` below.
+const osCapStillRunning: int = 0 - 1000000
+
+// One non-blocking `waitpid` attempt against `pid`, mirroring
+// `osForkExecWaitBounded`'s own decode exactly (same encoding, ABI.md §19):
+// exit code, `-1` on wait failure, `-2` (with a synchronous kill+reap) once
+// `deadline` has passed, `<= -100` on a signal death, or `osCapStillRunning`
+// when nothing has changed yet. `sb` is the caller's status-cell address
+// (`osStatusBuf`, reused — this file never runs concurrently with another
+// `os_run*` call on the SAME worker).
+@nosplit fn osCapWaitOnce(pid: int, sb: int, deadline: int): int {
+  storeWord(sb, 0)
+  let w = int(waitpid(i32(pid), u8At(sb), i32(osWnohang)))
+  if (w == pid) {
+    let status = loadWord(sb)
+    let sig = status & osWStatusMask
+    if (sig == 0) {
+      return (status / osWExitShift) & 255
+    }
+    if (sig == 127) {
+      return 0 - 1
+    }
+    return 0 - 100 - sig
+  }
+  if (w < 0) {
+    return 0 - 1
+  }
+  if (w == 0 && osMonoNs() >= deadline) {
+    osKillGroup(pid)
+    storeWord(sb, 0)
+    let _ = waitpid(i32(pid), u8At(sb), i32(0))
+    return 0 - 2
+  }
+  return osCapStillRunning
+}
+
+@nosplit fn osCapCheckChild(base: int, pid: int) {
+  if (loadWord(base + 48) != 0) {
+    return
+  }
+  let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
+  let r = osCapWaitOnce(pid, sb, loadWord(base + 64))
+  if (r == osCapStillRunning) {
+    return
+  }
+  storeWord(base + 48, 1)
+  storeWord(base + 56, r)
+}
+
+// Reached only when `osBoundedMaxPolls` elapsed without both streams
+// reaching EOF and the child being reaped — the same hard ceiling
+// `osForkExecWaitBounded`'s own fallback hits (Power of 10 rule 2: a bounded
+// loop must have a bound, even one this generous). If the child itself
+// never exited, force the timeout path; if it already had, this is a no-op
+// and whatever was captured before the ceiling stands.
+@nosplit fn osCapForceTimeout(base: int, pid: int) {
+  if (loadWord(base + 48) != 0) {
+    return
+  }
+  osKillGroup(pid)
+  let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
+  storeWord(sb, 0)
+  let _ = waitpid(i32(pid), u8At(sb), i32(0))
+  storeWord(base + 48, 1)
+  storeWord(base + 56, 0 - 2)
+}
+
+// Trim `outBuf`/`errBuf` to their final lengths (`rtFsReadAllTrim`, the same
+// allocate-then-trim helper `bit_rt_fs_read_all` uses) and publish both
+// strings plus the packed truncation bitset into THIS TASK's scratch
+// (ABI.md §19's three companions) — cleared and repopulated together here,
+// matching `bit_rt_fs_read_all_failed`'s adjacency contract.
+@nosplit fn osCapStoreResult(base: int, outBuf: int, errBuf: int) {
+  let outLen = loadWord(base)
+  let errLen = loadWord(base + 8)
+  let outStr = emptyStr()
+  if (outBuf != 0 && outLen > 0) {
+    outStr = rtFsReadAllTrim(outBuf, outLen)
+  }
+  let errStr = emptyStr()
+  if (errBuf != 0 && errLen > 0) {
+    errStr = rtFsReadAllTrim(errBuf, errLen)
+  }
+  let bits = 0
+  if (loadWord(base + 16) != 0) {
+    bits = bits + 1
+  }
+  if (loadWord(base + 24) != 0) {
+    bits = bits + 2
+  }
+  let scr = schedCurrentScratch()
+  *(scr + scrOsCapStdout) = outStr
+  *(scr + scrOsCapStderr) = errStr
+  *(scr + scrOsCapTruncated) = bits
+}
+
+// The forked child: own process group (mirrors `osExecChild`, ./os.bit),
+// then the write ends of both pipes replace fd 1/fd 2 — `dup2`'s result is
+// never CLOEXEC regardless of the source fd, so these two survive `execve`
+// while every original pipe fd (CLOEXEC'd at open time above) does not,
+// with no explicit close needed here. Never returns.
+@nosplit fn osCapExecChild(pathPtr: int, argvPtr: int, envpPtr: int, outWrite: int, errWrite: int) {
+  let _ = setpgid(i32(0), i32(0))
+  let _ = dup2(i32(outWrite), i32(1))
+  let _ = dup2(i32(errWrite), i32(2))
+  let _ = execve(u8At(pathPtr), u8At(argvPtr), u8At(envpPtr))
+  rootExit(127)
+}
+
+// The 2ms-tick poll loop proper: drain both streams non-blocking, check the
+// child non-blocking, sleep once per tick if nothing changed, until both
+// streams are at EOF AND the child has been reaped. Allocates both capture
+// buffers up front (`osRunCaptureMaxBytes` each, the same `rtStrAlloc`
+// primitive `bit_rt_fs_read_all` uses — this runtime does no OTHER
+// managed-heap allocation) and stores the trimmed result before returning
+// just the exit encoding.
+@nosplit fn osCapRunLoop(pid: int, outFd: int, errFd: int, timeoutMs: int): int {
+  let base = osCapStateBase()
+  osCapStateReset(base, timeoutMs)
+  let outBuf = rtStrAlloc(osRunCaptureMaxBytes)
+  let errBuf = rtStrAlloc(osRunCaptureMaxBytes)
+  let polls = 0
+  let done = false
+  while (!done && polls <= osBoundedMaxPolls) {
+    osCapDrain(base, outFd, outBuf, 0)
+    osCapDrain(base, errFd, errBuf, 1)
+    osCapCheckChild(base, pid)
+    if (loadWord(base + 48) != 0 && loadWord(base + 32) != 0 && loadWord(base + 40) != 0) {
+      done = true
+    } else {
+      osPollSleep()
+    }
+    polls = polls + 1
+  }
+  if (!done) {
+    osCapForceTimeout(base, pid)
+  }
+  osCapStoreResult(base, outBuf, errBuf)
+  return loadWord(base + 56)
+}
+
+// `bit_rt_os_run_captured(path, argv, timeout_ms)` (ABI.md §19): `path`/`argv`
+// are the identical `*const RtBytes`/SliceHeader pair `bit_rt_os_run` takes,
+// `timeout_ms` the same clamped deadline `bit_rt_os_run_bounded` takes.
+// Cleared-then-repopulated companions, spawn/timeout/signal encoding: all as
+// documented there.
+export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
+  path: int,
+  argv: int,
+  timeoutMs: int,
+): int {
+  osCapClearResult()
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let ab = osBuildRunArgv(p, argv)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let fdBase = osCapFdBase()
+  if (!osCapOpenPipe(fdBase)) {
+    return 0 - 1
+  }
+  if (!osCapOpenPipe(fdBase + 8)) {
+    osCapClosePair(fdBase)
+    return 0 - 1
+  }
+  let pid = int(fork())
+  if (pid < 0) {
+    osCapClosePair(fdBase)
+    osCapClosePair(fdBase + 8)
+    return 0 - 1
+  }
+  if (pid == 0) {
+    osCapExecChild(p, ab, osEnvp(), osCapFdHigh(fdBase), osCapFdHigh(fdBase + 8))
+  }
+  let _ = setpgid(i32(pid), i32(pid))
+  let outstanding = osMarkChildOutstanding(pid)
+  // Parent closes both write ends immediately so EOF becomes observable on
+  // the read ends (ABI.md §19's deadlock argument) — it never writes to
+  // either pipe itself.
+  let _ = close(i32(osCapFdHigh(fdBase)))
+  let _ = close(i32(osCapFdHigh(fdBase + 8)))
+  let outReadFd = osCapFdLow(fdBase)
+  let errReadFd = osCapFdLow(fdBase + 8)
+  let _ = osCapSetNonBlock(outReadFd)
+  let _ = osCapSetNonBlock(errReadFd)
+  let result = osCapRunLoop(pid, outReadFd, errReadFd, timeoutMs)
+  let _ = close(i32(outReadFd))
+  let _ = close(i32(errReadFd))
+  storeWord(outstanding, 0)
+  return result
+}
+
+// Cleared at every `rtOsRunCaptured` entry, including every early-failure
+// return above, so a prior call's result never leaks into a spawn failure's
+// "" / "" / 0 (ABI.md §19's own stated default for a task that has not yet
+// captured anything).
+@nosplit fn osCapClearResult() {
+  let scr = schedCurrentScratch()
+  *(scr + scrOsCapStdout) = emptyStr()
+  *(scr + scrOsCapStderr) = emptyStr()
+  *(scr + scrOsCapTruncated) = 0
+}
+
+// `bit_rt_os_run_captured_stdout`/`_stderr`/`_truncated` (ABI.md §19): the
+// three per-task companions, read immediately after
+// `bit_rt_os_run_captured` with no yield between.
+export @nosplit @symbol("bit_rt_os_run_captured_stdout") fn rtOsRunCapturedStdout(): int {
+  let scr = schedCurrentScratch()
+  return *(scr + scrOsCapStdout)
+}
+
+export @nosplit @symbol("bit_rt_os_run_captured_stderr") fn rtOsRunCapturedStderr(): int {
+  let scr = schedCurrentScratch()
+  return *(scr + scrOsCapStderr)
+}
+
+export @nosplit @symbol("bit_rt_os_run_captured_truncated") fn rtOsRunCapturedTruncated(): int {
+  let scr = schedCurrentScratch()
+  return *(scr + scrOsCapTruncated)
+}

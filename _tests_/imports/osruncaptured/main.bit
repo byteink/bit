@@ -1,0 +1,229 @@
+// End-to-end coverage for `bit_rt_os_run_captured` and its three companions
+// (ABI.md §19, #5781, epic #3459) on Darwin — the property under test is
+// stdout/stderr capture through fork+pipe+dup2, which no `_tests_/cases/*.bit`
+// single-file fixture can reach (spawning a real child process, timing a
+// real bounded wait, and running two real captures concurrently are all
+// outside that harness's build-then-run-the-binary convention).
+//
+// TEMPORARY RAW `extern fn` TEST SHIM (per this ticket and its Linux twin
+// #5780): the four symbols are deliberately NOT compiler builtins (ABI.md
+// §19's own text), so an ordinary Bit program cannot pass them a `string`
+// or `[]string` directly — E0077 refuses a GC-managed type as an `extern
+// fn` parameter or result. This file instead builds the exact raw
+// `*const RtBytes` view `bit_rt_os_run` documents (`ptr` at word 0, `len` at
+// word 1 — `runtime/root/root.bit`'s `strPtr`/`strLen` constants, 0 and 8)
+// by hand, and reads a captured result back through the ALREADY-EXPORTED
+// `bit_rt_port_root_fs_str_data`/`_str_len_of`/`bit_rt_port_mem_load_byte`
+// primitives (`runtime/root/fs.bit`, `runtime/gc/mem.bit`) rather than
+// inventing a fifth ABI symbol. The real `std/os` wrapper, which will hide
+// all of this, lands separately (#5783).
+import { exit, envOr } from "std/os"
+import { writeFile, mkdir, isDir } from "std/fs"
+
+extern fn bit_rt_os_run_captured(path: i64, argv: i64, timeoutMs: i64): i64
+extern fn bit_rt_os_run_captured_stdout(): i64
+extern fn bit_rt_os_run_captured_stderr(): i64
+extern fn bit_rt_os_run_captured_truncated(): i64
+extern fn bit_rt_port_root_fs_str_data(s: i64): i64
+extern fn bit_rt_port_root_fs_str_len_of(s: i64): i64
+extern fn bit_rt_port_mem_load_byte(addr: i64): i64
+
+// `osRunCaptureMaxBytes` (`runtime/root/os.bit`), re-derived here rather than
+// imported: a `runtime/**` internal const is not on `std/`'s import graph
+// from userland source. 4 MiB, unchanged since #5779.
+const capMaxBytes: int = 4194304
+
+// The `*const RtBytes` view `bit_rt_os_run_captured`'s `path` argument is
+// (ABI.md §19: "the same `*const RtBytes` / SliceHeader pair `bit_rt_os_run`
+// takes"): two words, `ptr` then `len`, matching `runtime/root/root.bit`'s
+// `strPtr`=0/`strLen`=8. `[]byte(p)` is a fresh, packed, GC-managed copy of
+// `p`'s bytes (SPEC §2's `[]byte(s)` conversion) that stays alive for as
+// long as the local `bytes`/`view` slices below are — i.e. for this whole
+// call, since neither is reassigned before `bit_rt_os_run_captured` returns.
+fn pathView(p: string): i64 {
+  let bytes = []byte(p)
+  let view = []i64(2)
+  view[0] = int(ptrOf(bytes))
+  view[1] = len(bytes)
+  return i64(ptrOf(view))
+}
+
+fn spawnCaptured(scriptPath: string, timeoutMs: i64): i64 {
+  return bit_rt_os_run_captured(pathView(scriptPath), 0, timeoutMs)
+}
+
+fn capturedLen(raw: i64): i64 {
+  return bit_rt_port_root_fs_str_len_of(raw)
+}
+
+fn capturedByte(raw: i64, i: i64): i64 {
+  return bit_rt_port_mem_load_byte(bit_rt_port_root_fs_str_data(raw) + i)
+}
+
+fn bail(msg: string) {
+  eprint("FAIL: ${msg}\n")
+  exit(1)
+}
+
+// `raw`'s captured content, byte for byte, equals `want` — used for the
+// "exact byte content of a small capture" and "each concurrent capture gets
+// its own output" cases, neither of which a length check alone would prove.
+fn assertContent(label: string, raw: i64, want: string) {
+  let n = capturedLen(raw)
+  if (n != i64(len(want))) {
+    bail("${label}: len=${n} want=${len(want)}")
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (capturedByte(raw, i64(i)) != i64(want[i])) {
+      bail("${label}: byte ${i} mismatch")
+    }
+    i = i + 1
+  }
+}
+
+fn writeScript(path: string, body: string) {
+  writeFile(path, body) catch e {
+    bail("writeFile ${path}: ${e.message()}")
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700
+    bail("fsChmod ${path}")
+  }
+}
+
+// One capture on its own goroutine (the "two captures running concurrently
+// from two tasks" case, checking the per-task companion storage
+// `runtime/sched/scratch.bit`'s `scrOsCapStdout` etc. — a shared per-worker
+// slot would let one task's read see the other's content).
+fn concurrentWorker(scriptPath: string, want: string, results: chan<bool>) {
+  let rc = spawnCaptured(scriptPath, 5000)
+  if (rc != 0) {
+    results <- false
+    return
+  }
+  let out = bit_rt_os_run_captured_stdout()
+  let n = capturedLen(out)
+  if (n != i64(len(want))) {
+    results <- false
+    return
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (capturedByte(out, i64(i)) != i64(want[i])) {
+      results <- false
+      return
+    }
+    i = i + 1
+  }
+  results <- true
+}
+
+// 1. Exact byte content of a small capture — not just the length.
+fn testSmall(scratch: string) {
+  let smallPath = scratch + "/small.sh"
+  writeScript(smallPath, "#!/bin/sh\nprintf 'hello-osruncap-42\\n'\nexit 0\n")
+  let smallRc = spawnCaptured(smallPath, 5000)
+  if (smallRc != 0) {
+    bail("small: rc=${smallRc}")
+  }
+  assertContent("small", bit_rt_os_run_captured_stdout(), "hello-osruncap-42\n")
+  if (bit_rt_os_run_captured_truncated() != 0) {
+    bail("small: unexpected truncation")
+  }
+  print("small: OK\n")
+}
+
+// 2. > 64 KiB on BOTH stdout and stderr, neither truncated: the deadlock
+// property ABI.md §19 documents (both pipes must drain to EOF regardless of
+// the other's cap) — a wrong drain order hangs this call instead of
+// returning within the 10s the ticket's acceptance names.
+fn testBig(scratch: string) {
+  let bigPath = scratch + "/big.sh"
+  writeScript(
+    bigPath,
+    "#!/bin/sh\nyes B | head -c 100000\nyes C | head -c 100000 1>&2\nexit 7\n",
+  )
+  let bigRc = spawnCaptured(bigPath, 10000)
+  if (bigRc != 7) {
+    bail("big: rc=${bigRc}")
+  }
+  let bigOutLen = capturedLen(bit_rt_os_run_captured_stdout())
+  let bigErrLen = capturedLen(bit_rt_os_run_captured_stderr())
+  if (bigOutLen <= 65536) {
+    bail("big: stdout too short ${bigOutLen}")
+  }
+  if (bigErrLen <= 65536) {
+    bail("big: stderr too short ${bigErrLen}")
+  }
+  if (bit_rt_os_run_captured_truncated() != 0) {
+    bail("big: unexpected truncation")
+  }
+  print("big: OK\n")
+}
+
+// 3. `_truncated`: a child writing more than the 4 MiB cap to stdout — bit 0
+// set, captured length == the cap exactly, exit code still correct.
+fn testTrunc(scratch: string) {
+  let truncPath = scratch + "/trunc.sh"
+  writeScript(truncPath, "#!/bin/sh\nyes A | head -c 4200000\nexit 42\n")
+  let truncRc = spawnCaptured(truncPath, 20000)
+  if (truncRc != 42) {
+    bail("trunc: rc=${truncRc}")
+  }
+  let truncLen = capturedLen(bit_rt_os_run_captured_stdout())
+  if (truncLen != i64(capMaxBytes)) {
+    bail("trunc: stdout len=${truncLen} want=${capMaxBytes}")
+  }
+  let truncBits = bit_rt_os_run_captured_truncated()
+  if ((truncBits & 1) == 0) {
+    bail("trunc: stdout truncation bit not set")
+  }
+  if ((truncBits & 2) != 0) {
+    bail("trunc: stderr unexpectedly marked truncated")
+  }
+  print("trunc: OK\n")
+}
+
+// 4. Bounded call against a slow child: `-2`, child reaped.
+fn testTimeout(scratch: string) {
+  let slowPath = scratch + "/slow.sh"
+  writeScript(slowPath, "#!/bin/sh\nsleep 30\n")
+  let slowRc = spawnCaptured(slowPath, 300)
+  if (slowRc != 0 - 2) {
+    bail("timeout: rc=${slowRc}")
+  }
+  print("timeout: OK\n")
+}
+
+// 5. Two captures running concurrently from two tasks, each getting its own
+// output — the per-task companion storage check.
+fn testConcurrent(scratch: string) {
+  let concAPath = scratch + "/conc_a.sh"
+  let concBPath = scratch + "/conc_b.sh"
+  writeScript(concAPath, "#!/bin/sh\nprintf 'concurrent-A-output\\n'\nexit 0\n")
+  writeScript(concBPath, "#!/bin/sh\nprintf 'concurrent-B-output\\n'\nexit 0\n")
+  let results = chan<bool>()
+  spawn concurrentWorker(concAPath, "concurrent-A-output\n", results)
+  spawn concurrentWorker(concBPath, "concurrent-B-output\n", results)
+  let firstOk = <- results
+  let secondOk = <- results
+  if (!firstOk || !secondOk) {
+    bail("concurrent: one or both captures got the wrong output")
+  }
+  print("concurrent: OK\n")
+}
+
+fn main() {
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-osruncaptured-fixture"
+  if (!isDir(scratch)) {
+    mkdir(scratch) catch e {
+      bail("mkdir ${scratch}: ${e.message()}")
+    }
+  }
+  testSmall(scratch)
+  testBig(scratch)
+  testTrunc(scratch)
+  testTimeout(scratch)
+  testConcurrent(scratch)
+  print("PASS\n")
+}
