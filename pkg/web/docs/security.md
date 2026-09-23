@@ -33,6 +33,18 @@ a better failure than the process growing until it is killed, but is still a
 failure worth pairing with a rate limit (see
 [Operational middleware](operations.md)).
 
+Every write a `SessionStore` accepts is a versioned compare-and-set: two
+requests that raced the same cookie - one calling `destroy()` while the other
+still held the session it loaded before that - must never let the loser's
+`save()` resurrect a destroyed session or silently overwrite the winner's
+update. A `Session` tracks the version it last saw and sends it back on
+`save()`; a store whose version has moved fails the write with a conflict
+instead of applying it, and the app decides whether to reload and retry. A
+type implementing `SessionStore` directly - a future `SqlStore` or
+`RedisStore` - carries this contract too, including `destroy()` leaving a
+tombstone bounded by the same session ttl, so a stale writer can never bring
+a destroyed id back once its tombstone exists.
+
 ## CSRF and anonymous visitors
 
 `c.csrfToken()` returns the value a form puts in its hidden `_csrf` field. It
