@@ -1,0 +1,183 @@
+// pkg/auth/oidc_discovery.test.bit — #5772's acceptance: `discover()`
+// parses a well-known document and fails on a non-200 response, an
+// https-only issuer check, byte-for-byte issuer matching (OIDC Discovery
+// 1.0 §4.3), a JWKS cache hit with NO HTTP call, exactly one refetch on an
+// unknown `kid`, and a refetch cooldown that survives 100 unknown-kid
+// lookups with at most one more HTTP call.
+//
+// Every test goes through a `FetchCounter`-backed `HttpFetch` fake — never
+// `getTls` — so nothing here touches the network or a TLS handshake. The
+// fake still runs every response through `checkStatus` (oidc_discovery.bit),
+// the same status-rejection code the real path uses, so the non-200 case is
+// proven against production logic and not a re-implementation of it.
+//
+// `Response` and `getTls` are already bound module-wide by
+// `oidc_discovery.bit`; `TlsConfig` likewise. `contains` and
+// `emptyTrustStore` are new to the module (E0042 governs the rest).
+import { contains } from "std/strings"
+import { emptyTrustStore } from "std/tls"
+
+const testIssuer = "https://idp.example.com"
+
+const discoveryDoc = "{\"issuer\":\"https://idp.example.com\"," +
+  "\"authorization_endpoint\":\"https://idp.example.com/authorize\"," +
+  "\"token_endpoint\":\"https://idp.example.com/token\"," +
+  "\"jwks_uri\":\"https://idp.example.com/jwks\"}"
+
+const discoveryDocWrongIssuer = "{\"issuer\":\"https://evil.example.com\"," +
+  "\"authorization_endpoint\":\"https://idp.example.com/authorize\"," +
+  "\"token_endpoint\":\"https://idp.example.com/token\"," +
+  "\"jwks_uri\":\"https://idp.example.com/jwks\"}"
+
+// `kty: "oct"` (RFC 7518 §6.4) needs only `k`, a base64url secret — the
+// simplest JWK this fixture can parse with, since these tests never verify
+// a signature, only key SELECTION by `kid`.
+const jwksOneKey = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"k1\",\"k\":\"a2V5\"}]}"
+const jwksTwoKeys = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"k1\",\"k\":\"a2V5\"}," +
+  "{\"kty\":\"oct\",\"kid\":\"k2\",\"k\":\"a2V5\"}]}"
+
+// A `TlsConfig` no test here ever dials with — every fake `HttpFetch` skips
+// `getTls` entirely (`fetchGet`, oidc_discovery.bit), so this exists only to
+// satisfy the parameter.
+fn tlsStub(): TlsConfig {
+  return TlsConfig{
+    roots = emptyTrustStore(),
+    insecureSkipVerify = false,
+    alpn = []string(0),
+    serverName = "",
+    minVersion = 0,
+    nowUnix = 0,
+    certPem = "",
+    keyPem = "",
+  }
+}
+
+// One HTTP call's canned answer, and the call counter every fake shares —
+// a class, because the closure below must keep seeing the current value
+// (classes are reference types, SPEC §13.3), the same shape
+// `pkg/web/ratelimit.test.bit`'s `RlClock` uses for its test clock.
+class FetchCounter {
+  calls: int,
+  statuses: []int,
+  bodies: []string,
+}
+
+// An `HttpFetch` answering from `box.statuses[box.calls]`/`box.bodies[box.calls]`
+// and incrementing `box.calls` on every call — through `checkStatus`, so a
+// canned non-200 status fails exactly as the real `getTls` path would.
+fn fakeFetch(box: FetchCounter): HttpFetch {
+  let f: HttpFetch = (url) => {
+    let i = box.calls
+    box.calls = box.calls + 1
+    return checkStatus(
+      url,
+      Response{ status = box.statuses[i], contentType = "", headers = "", body = box.bodies[i] },
+    )?
+  }
+  return f
+}
+
+fn oneCallFetch(status: int, body: string): HttpFetch {
+  return fakeFetch(FetchCounter{ calls = 0, statuses = [status], bodies = [body] })
+}
+
+fn discoverErr(issuer: string, fetch: HttpFetch): string {
+  discoverFetch(issuer, tlsStub(), fetch) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+fn findErr(cache: JwksCache, kid: string): string {
+  cache.find(kid) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "discover() parses a well-known document into OidcConfig" {
+  let cfg = discoverFetch(testIssuer, tlsStub(), oneCallFetch(200, discoveryDoc)) catch e {
+    panic("discover: ${e.message()}")
+  }
+  assert(cfg.issuer == testIssuer, "want issuer '${testIssuer}', got '${cfg.issuer}'")
+  assert(
+    cfg.authorizationEndpoint == "https://idp.example.com/authorize",
+    "wrong authorization_endpoint: '${cfg.authorizationEndpoint}'",
+  )
+  assert(
+    cfg.tokenEndpoint == "https://idp.example.com/token",
+    "wrong token_endpoint: '${cfg.tokenEndpoint}'",
+  )
+  assert(cfg.jwksUri == "https://idp.example.com/jwks", "wrong jwks_uri: '${cfg.jwksUri}'")
+}
+
+test "discover() fails on a non-200 response" {
+  let msg = discoverErr(testIssuer, oneCallFetch(500, "internal error"))
+  assert(contains(msg, "500"), "want the status in the error, got '${msg}'")
+}
+
+test "discover() rejects a non-https issuer before any HTTP call" {
+  // `nil` fetch: a real HTTP call here would prove nothing was skipped.
+  let msg = discoverErr("http://idp.example.com", nil)
+  assert(contains(msg, "https"), "want an https complaint, got '${msg}'")
+}
+
+test "discover() rejects a discovery document whose issuer disagrees" {
+  let msg = discoverErr(testIssuer, oneCallFetch(200, discoveryDocWrongIssuer))
+  assert(contains(msg, "issuer mismatch"), "want an issuer-mismatch error, got '${msg}'")
+}
+
+test "JwksCache.find() returns a key present in the initial fetch without a second HTTP call" {
+  let box = FetchCounter{ calls = 0, statuses = [200], bodies = [jwksOneKey] }
+  let cache = newJwksCacheFetch("https://idp.example.com/jwks", tlsStub(), fakeFetch(box)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+  cache.find("k1") catch e {
+    panic("find('k1') must succeed from the initial fetch: ${e.message()}")
+  }
+  assert(box.calls == 1, "want exactly the initial fetch, got ${box.calls} calls")
+}
+
+test "JwksCache.find() on an unknown kid triggers exactly one refetch and succeeds" {
+  let box = FetchCounter{ calls = 0, statuses = [200, 200], bodies = [jwksOneKey, jwksTwoKeys] }
+  let cache = newJwksCacheFetch("https://idp.example.com/jwks", tlsStub(), fakeFetch(box)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+  cache.find("k2") catch e {
+    panic("find('k2') must succeed after exactly one refetch: ${e.message()}")
+  }
+  assert(box.calls == 2, "want the initial fetch plus exactly one refetch, got ${box.calls} calls")
+}
+
+// #5772's security requirement: a sustained attack spraying unknown `kid`s
+// costs the JWKS endpoint at most one refetch inside the cooldown window,
+// never one per lookup.
+test "100 unknown-kid lookups inside the cooldown window cause at most one refetch" {
+  let box = FetchCounter{ calls = 0, statuses = [200, 200], bodies = [jwksOneKey, jwksOneKey] }
+  let cache = newJwksCacheFetch("https://idp.example.com/jwks", tlsStub(), fakeFetch(box)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+  let i = 0
+  while (i < 100) {
+    cache.find("unknown-${i}") catch _ {
+      i = i + 1
+      continue
+    }
+    panic("find(unknown-${i}): an unknown kid must never succeed")
+  }
+  assert(box.calls == 2, "want the initial fetch plus at most one refetch, got ${box.calls} calls")
+}
+
+test "a lookup inside the cooldown window returns the prior refetch's failure" {
+  let box = FetchCounter{ calls = 0, statuses = [200, 200], bodies = [jwksOneKey, jwksOneKey] }
+  let cache = newJwksCacheFetch("https://idp.example.com/jwks", tlsStub(), fakeFetch(box)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+  let first = findErr(cache, "unknown-a")
+  let second = findErr(cache, "unknown-b")
+  assert(box.calls == 2, "want exactly one refetch across both lookups, got ${box.calls} calls")
+  assert(
+    first == second,
+    "want the cooldown to return the SAME failure, got '${first}' then '${second}'",
+  )
+}
