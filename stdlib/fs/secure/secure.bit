@@ -14,8 +14,9 @@
 // revert. Nothing on the compiler's import path reaches this module, so a
 // release that ships this commit can fold both functions into "std/fs"
 // once the pin moves past it.
-import { File } from "std/fs"
+import { File, splitEntries } from "std/fs"
 import { join, contains } from "std/path"
+import { sortInPlace } from "std/sort"
 
 // `bit_rt_fs_open_beneath_w` (runtime/root/{darwin,linux}/fsbeneath.bit):
 // `root` and `rel` travel SEPARATELY, not pre-joined — `root` is opened
@@ -99,4 +100,109 @@ export fn statOpen(f: File): OpenInfo! {
     isSymlink = out[4] != 0,
     isRegular = out[5] != 0,
   }
+}
+
+// `bit_rt_fs_open_dir_w`/`bit_rt_fs_open_dir_beneath_fd_w`/
+// `bit_rt_fs_list_dir_fd_w` (runtime/root/{darwin,linux}/fsbeneath.bit,
+// #5800): the fd-based primitives `walkBeneath` below is built on. `root`
+// is opened once, following its own symlinks (the trusted boundary, same as
+// `openBeneath`'s `root`); every descent after that opens a listed child
+// no-follow relative to the fd already held, never by re-resolving a path.
+extern fn bit_rt_fs_open_dir_w(words: *byte, n: int): i64
+extern fn bit_rt_fs_open_dir_beneath_fd_w(dirFd: i64, nameWords: *byte, nameN: int): i64
+extern fn bit_rt_fs_list_dir_fd_w(fd: i64, outPtr: *byte, outCap: int): i64
+
+// Bound on `walkBeneath`'s recursion (Power of 10 rule 2), mirroring
+// `std/fs`'s own private `maxWalkDepth` (stdlib/fs/fs.bit) — same value,
+// same rationale (a bound on nesting depth, not a symlink-loop defence:
+// `walkBeneath` never opens a symlink at all, so no link can add depth).
+// A private copy rather than an import: `std/fs`'s constant is unexported,
+// and duplicating one `int` is cheaper than widening that module's surface
+// for it.
+const maxWalkDepth: int = 64
+
+// The names (not paths) of the already-open directory `fd`'s entries,
+// through `bit_rt_fs_list_dir_fd_w`'s two-pass measure/fill convention —
+// the fd-based twin of `std/fs`'s own path-based `readDir`. Does not close
+// `fd`: `walkBeneathInto` below still needs it open to descend into each
+// child.
+fn listDirFd(fd: i64): []string! {
+  let probe = []byte(1)
+  let needed = bit_rt_fs_list_dir_fd_w(fd, ptrOf(probe), 0)
+  if (needed < 0) {
+    fail newError("cannot list directory")
+  }
+  if (needed == 0) {
+    return []string(0)
+  }
+  let buf = []byte(needed)
+  let got = bit_rt_fs_list_dir_fd_w(fd, ptrOf(buf), needed)
+  if (got < 0) {
+    fail newError("cannot list directory")
+  }
+  if (got > needed) {
+    got = needed
+  }
+  return splitEntries(string(buf[0:got]))
+}
+
+// The race-free twin of `std/fs`'s `walk` (#5800): every *file* path
+// beneath `root`, depth-first and sorted at each level, for a caller
+// walking a tree an untrusted party can modify WHILE this runs (a
+// multi-tenant upload directory, say). `std/fs`'s `walk` checks
+// `isRealDir(p)` then calls `readDir(p)` BY PATH — two separate lookups of
+// the same name, so a directory swapped for a symlink to outside `root`
+// between them is followed. `walkBeneath` never re-resolves a path once it
+// holds an fd: `root` is opened once (following its own symlinks, the
+// trusted boundary), and every descent below it lists the CURRENTLY-open
+// directory by fd and opens a listed child no-follow relative to that same
+// fd — a swap of any ancestor after this walk holds its fd can no longer
+// change what that fd names.
+//
+// Symbolic links are reported but never followed, and `root` itself is used
+// as given — the same two contracts `std/fs`'s `walk` doc comment states,
+// unchanged here.
+export fn walkBeneath(root: string): []string! {
+  let rootW = []byte(root)
+  let fd = bit_rt_fs_open_dir_w(ptrOf(rootW), len(root))
+  if (fd < 0) {
+    fail newError("cannot open directory: ${root}")
+  }
+  return walkBeneathInto(fd, root, maxWalkDepth)?
+}
+
+// `defer`'s target must be a resolvable Bit function, not a bare compiler
+// primitive (E0092) — `fsClose` is one of `std/fs`'s low-level primitives
+// (ABI.md §14), so `walkBeneathInto`'s `defer` below wraps it in this
+// one-line function instead of naming it directly.
+fn closeDirFd(fd: i64) {
+  fsClose(fd)
+}
+
+// `out` starts fresh every call — never assigned from a parameter — so
+// growing it below is never an aliasing hazard: this function is the sole
+// owner of its own backing array, and a child level's contribution is
+// merged in by value (`for ... of walkBeneathInto(...)?`), not by handing
+// this level's array down for a callee to grow.
+fn walkBeneathInto(dirFd: i64, prefix: string, depth: int): []string! {
+  defer closeDirFd(dirFd)
+  if (depth <= 0) {
+    fail newError("walkBeneath: directory nesting exceeds ${maxWalkDepth} at ${prefix}")
+  }
+  let names = listDirFd(dirFd)?
+  sortInPlace(names, (a, b) => a < b)
+  let out = []string(0)
+  for name of names {
+    let p = join(prefix, name)
+    let nameW = []byte(name)
+    let childFd = bit_rt_fs_open_dir_beneath_fd_w(dirFd, ptrOf(nameW), len(name))
+    if (childFd >= 0) {
+      for childPath of walkBeneathInto(childFd, p, depth - 1)? {
+        out = append(out, childPath)
+      }
+    } else {
+      out = append(out, p)
+    }
+  }
+  return out
 }
