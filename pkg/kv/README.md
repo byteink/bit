@@ -4,6 +4,15 @@ An embedded, ordered key-value store: one file on disk, no server to run, no
 network round trip. Reads and writes go through a single transaction API, and
 every commit is crash-safe.
 
+## Compiler requirement
+
+Requires a Bit compiler newer than the released 0.25.0. `create` opens the
+database file exclusively through `std/fs/secure`'s `createExclusive`, which
+has not shipped in a release yet. With 0.25.0 or older, a build fails at
+compile time with "cannot find symbol createExclusive" (E0045), never
+silently. `bit.json` has no field for a minimum compiler version, so this is
+stated here rather than enforced.
+
 ## Install
 
 ```json
