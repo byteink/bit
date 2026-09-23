@@ -39,10 +39,12 @@
 // WHAT IS LOWERED. Exactly the set `xDivisorPlan` admits: `SDiv`/`UDiv` whose
 // divisor is a non-zero `const_int` that is NOT a positive power of two (that
 // shape is a shift, strictly cheaper, and stays in the backend) and for which
-// `divisorMagic` produces a sequence (it declines 0, 1 and -1). `%` is not
-// lowered -- #4722 measured the same sequence at +4.77% on `SRem`, because the
-// `msub` recovering the remainder then waits on the multiply chain instead of
-// overlapping with the divider.
+// `divisorMagic` produces a sequence (it declines 0, 1 and -1). `SRem`/`URem`
+// by the same divisors only where `remTakesMagic` says so for the build
+// target: the remainder is `n - q*d` on the same quotient, and whether that
+// beats the machine divide is a property of the target's divider, not of the
+// sequence (#4722/#4389 measured it slower on Apple arm64, #5785 measured it
+// faster on Graviton3).
 //
 // WIDTH. Every value the sequence mints is typed i64/u64 whatever the divide's
 // declared type, because a magic sequence reproduces the 64-BIT machine divide
@@ -53,13 +55,23 @@
 // |n/d| <= |n|/2 and the quotient is width-canonical in whatever type `n`
 // already was.
 
+// Whether `op` is one this pass may lower at all: `/` always, `%` only on a
+// target whose `remTakesMagic` is true.
+fn dmAdmitsOp(op: Op, rem: bool): bool {
+  if (op == Op.SDiv || op == Op.UDiv) {
+    return true
+  }
+  return rem && (op == Op.SRem || op == Op.URem)
+}
+
 // The magic sequence for instruction `idx`, or `noDivMagic()` when this pass
 // leaves it to the backend. One predicate, asked by the rewrite and by
 // `hasLowerableDiv` alike, so the "does this function need rebuilding" scan and
 // the rewrite itself cannot disagree about a single instruction.
-fn divMagicForInstr(ctx: TypeContext, f: IrFunc, idx: int): DivMagic {
+// `rem` is the module's `remTakesMagic` verdict; without it a `%` is declined.
+fn divMagicForInstr(ctx: TypeContext, f: IrFunc, idx: int, rem: bool): DivMagic {
   let ins = f.instrs[idx]
-  if (ins.op != Op.SDiv && ins.op != Op.UDiv) {
+  if (!dmAdmitsOp(ins.op, rem)) {
     return noDivMagic()
   }
   let w = widthOf(ctx, ins.ty)
@@ -68,7 +80,7 @@ fn divMagicForInstr(ctx: TypeContext, f: IrFunc, idx: int): DivMagic {
   // unsigned magic to a signed divide is a silent wrong answer. lower.bit
   // derives both from one type, so a disagreement means something upstream is
   // unusual -- decline and let the backend divide for real.
-  if (ins.op == Op.SDiv != w.signed) {
+  if ((ins.op == Op.SDiv || ins.op == Op.SRem) != w.signed) {
     return noDivMagic()
   }
   if (f.instrs[ins.rhs].op != Op.ConstInt || f.instrs[ins.rhs].ival == 0) {
@@ -78,6 +90,23 @@ fn divMagicForInstr(ctx: TypeContext, f: IrFunc, idx: int): DivMagic {
     return noDivMagic() // a shift beats a multiply; `emitPow2DivInt` keeps it
   }
   return divisorMagic(f.instrs[ins.rhs].ival, w.signed)
+}
+
+// #5792: whether `%` by a constant takes the magic quotient on target `t`,
+// recovering the remainder as `n - q*d`, instead of the machine divide and its
+// `msub`. The ONE place the answer is written per target, so adding a target
+// is one line here plus its row in `checkRemTakesMagicPolicy`.
+//
+// Measured per target on #5785 (trimmed-mean cycles, 31 interleaved runs):
+//   * aarch64-linux: YES. Graviton3: strings -45%, rem12 -66%, sort -2%,
+//     strmap -3%, every other case within the null floor.
+//   * aarch64-macos: NO. Apple's `sdiv` is ~2 cycles, and the sequence
+//     measured slower there (#4389: strings +2.81%, +3.98%) while its
+//     multiplier is still rematerialized per iteration (#5786).
+//   * x86_64-linux, x86_64-windows: NO, held. Skylake-SP won big (strings -53%)
+//     but matrix regressed +25%, reproducibly and unexplained (#5791).
+fn remTakesMagic(t: BuildTarget): bool {
+  return t == BuildTarget.Aarch64Linux
 }
 
 // One expansion's fixed operands: the builder, the 64-bit type every value in
@@ -144,14 +173,18 @@ fn dmEmitUnsigned(e: DmEmit, n: int, m: int, mg: DivMagic): int {
   return q
 }
 
+// The 64-bit type every value of `mg`'s sequence carries (see WIDTH above).
+fn dmType(ctx: TypeContext, mg: DivMagic): int {
+  if (mg.signed) {
+    return primType(ctx, 3)
+  }
+  return primType(ctx, 7)
+}
+
 // The whole sequence for one divide. `n` is the DIVIDEND's already-translated
 // id; the divisor's `const_int` is simply not read, and dies with the divide.
 fn dmEmitQuotient(x: DivMagicCtx, n: int, mg: DivMagic, span: Span): int {
-  let ty = primType(x.ctx, 7)
-  if (mg.signed) {
-    ty = primType(x.ctx, 3)
-  }
-  let e = DmEmit{ b = x.b, ty = ty, span = span }
+  let e = DmEmit{ b = x.b, ty = dmType(x.ctx, mg), span = span }
   let m = dmConst(e, mg.m)
   if (mg.signed) {
     return dmEmitSigned(e, n, m, mg)
@@ -169,6 +202,26 @@ class DivMagicCtx {
   remap: []int,
   blockMap: []int,
   known: []ConstVal,
+  rem: bool,
+}
+
+// The replacement for instruction `idx`: its quotient, or for a `%` the
+// remainder `n - q*d` recovered from it. Same 64-bit type as the quotient and
+// for the same reason; the result is width-canonical because truncating
+// division gives `|n - q*d| <= |n|` with `n`'s sign. Neither the multiply nor
+// the subtract can wrap: `|q*d| <= |n|`. A fresh `const_int d` at that type
+// rather than the divisor's own, which is narrow-typed and may sit in another
+// block.
+fn dmEmitFor(x: DivMagicCtx, idx: int, mg: DivMagic): int {
+  let ins = x.f.instrs[idx]
+  let n = x.remap[ins.lhs]
+  let q = dmEmitQuotient(x, n, mg, ins.span)
+  if (ins.op != Op.SRem && ins.op != Op.URem) {
+    return q
+  }
+  let e = DmEmit{ b = x.b, ty = dmType(x.ctx, mg), span = ins.span }
+  let d = dmConst(e, x.f.instrs[ins.rhs].ival)
+  return dmBin(e, Op.Sub, n, dmBin(e, Op.Mul, q, d))
 }
 
 fn dmBlock(x: DivMagicCtx, bi: int) {
@@ -182,11 +235,9 @@ fn dmBlock(x: DivMagicCtx, bi: int) {
   }
   let end = blk.instsStart + blk.instsLen
   while (idx < end) {
-    let mg = divMagicForInstr(x.ctx, x.f, idx)
+    let mg = divMagicForInstr(x.ctx, x.f, idx, x.rem)
     if (mg.ok) {
-      x.remap[idx] = dmEmitQuotient(
-        x, x.remap[x.f.instrs[idx].lhs], mg, x.f.instrs[idx].span,
-      )
+      x.remap[idx] = dmEmitFor(x, idx, mg)
     } else {
       emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
     }
@@ -197,10 +248,10 @@ fn dmBlock(x: DivMagicCtx, bi: int) {
 
 // Whether `f` contains a divide this pass would rewrite. Asked first so a
 // function with none is returned untouched and the pass cannot perturb it.
-fn hasLowerableDiv(ctx: TypeContext, f: IrFunc): bool {
+fn hasLowerableDiv(ctx: TypeContext, f: IrFunc, rem: bool): bool {
   let i = 0
   while (i < len(f.instrs)) {
-    if (divMagicForInstr(ctx, f, i).ok) {
+    if (divMagicForInstr(ctx, f, i, rem).ok) {
       return true
     }
     i = i + 1
@@ -208,7 +259,8 @@ fn hasLowerableDiv(ctx: TypeContext, f: IrFunc): bool {
   return false
 }
 
-// Replace every lowerable constant divide in `f` with its magic sequence.
+// Replace every lowerable constant divide in `f` with its magic sequence, and
+// every constant `%` too when `rem` (the build target's `remTakesMagic`).
 //
 // Runs BEFORE the second `foldConstantsAndPrune`/`deadCodeElim` pair in
 // `optimizeModule`, which is what makes the multiplier hoistable: that pair
@@ -216,8 +268,8 @@ fn hasLowerableDiv(ctx: TypeContext, f: IrFunc): bool {
 // before strip mining for the reason optstrip.bit's header gives -- strip
 // mining allocates block ids in final emission order and nothing may renumber
 // behind it.
-fn lowerMagicDivides(ctx: TypeContext, f: IrFunc): IrFunc {
-  if (!hasLowerableDiv(ctx, f)) {
+fn lowerMagicDivides(ctx: TypeContext, f: IrFunc, rem: bool): IrFunc {
+  if (!hasLowerableDiv(ctx, f, rem)) {
     return f
   }
   let n = len(f.blocks)
@@ -245,6 +297,7 @@ fn lowerMagicDivides(ctx: TypeContext, f: IrFunc): IrFunc {
   }
   let x = DivMagicCtx{
     b = b, f = f, ctx = ctx, remap = remap, blockMap = blockMap, known = known,
+    rem = rem,
   }
   i = 0
   while (i < n) {
