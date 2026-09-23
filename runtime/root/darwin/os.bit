@@ -60,6 +60,9 @@ extern fn waitpid(pid: i32, status: *u8, options: i32): i32
 extern fn setpgid(pid: i32, pgid: i32): i32
 extern fn _NSGetExecutablePath(buf: *u8, size: *u8): i32
 extern fn realpath(path: *u8, resolved: *u8): *u8
+// `unlink` is already declared by ./fs.bit (module-scoped sibling, same
+// module) — reused by `osUnlinkAllOutstandingTestPaths` below, not
+// re-declared (a redeclaration is E0042).
 
 // `max_path`/`PATH_MAX` (runtime/root/ / runtime/sched/): the ceiling for the exec path and
 // its resolution. `realpath` writes up to PATH_MAX; a smaller buffer would be an
@@ -503,6 +506,48 @@ let osOutstandingChildPid: [33]i64 // (osScratchSlots+1) * 1
   return addr
 }
 
+// #5765: the CURRENT `bit test` binary's path outstanding per worker slot —
+// a raw C-string pointer, the same value `fsPathZ` returns, 0 = none. Same
+// single-writer-per-slot shape as `osOutstandingChildPid` above: written ONLY
+// by `rtOsRunTestBounded` below, right after it resolves the child's path,
+// and cleared once `osForkExecWaitBounded` returns. Never written from
+// `rtOsRunBounded`: that primitive's own callers (`osRunBounded` and its
+// `_tests_/bit/testtimeout/testtimeout.bit` teardown scripts) are NOT test
+// binaries and must never be auto-deleted on kill. `termHandler`
+// (../signal.bit) reads every slot for the same reason
+// `osKillAllOutstandingChildren`'s comment gives: the kernel may deliver the
+// signal to any thread, not necessarily the one that owns the slot.
+let osOutstandingTestPath: [33]i64 // (osScratchSlots+1) * 1
+
+// Unlink every worker slot's outstanding test binary (#5765), so a `bit
+// test` runner killed directly by SIGTERM/SIGINT does not leave the Mach-O
+// executable `compiler/testrun.bit` compiled it into behind in `$TMPDIR` —
+// `osForkExecWaitBounded`'s own poll loop, which has no unlink of its own
+// either, never runs once the process dies at `rootExit` below. `@nosplit`,
+// called from the signal handler: no allocation, no Bit string op, just the
+// raw pointer straight into `unlink(2)`.
+@nosplit fn osUnlinkAllOutstandingTestPaths() {
+  let base = int(ptrOf(osOutstandingTestPath))
+  let i = 0
+  while (i <= osScratchSlots) {
+    let p = loadWord(base + i * 8)
+    if (p != 0) {
+      let _ = unlink(u8At(p))
+    }
+    i = i + 1
+  }
+}
+
+// Publish `p` as this worker's outstanding test binary path (#5765) and
+// return the slot address, so `rtOsRunTestBounded` below can clear it with a
+// single `storeWord` once `osForkExecWaitBounded` returns — same split as
+// `osMarkChildOutstanding` above.
+@nosplit fn osMarkTestPathOutstanding(p: int): int {
+  let addr = int(ptrOf(osOutstandingTestPath)) + osScratchSlot() * 8
+  storeWord(addr, p)
+  return addr
+}
+
 // Ceiling on `timeoutMs`: 100 minutes. This is the `os_run_bounded_max_ms` clamp
 // ABI.md §19 specifies, and every harness clamps to match — a caller typo must
 // not reinstate an unbounded wait.
@@ -653,6 +698,9 @@ export @nosplit @symbol("bit_rt_os_run_test_bounded") fn rtOsRunTestBounded(
   if (p == 0) {
     return 0 - 1
   }
+  // #5765: track this worker's outstanding test binary BEFORE fork/exec, so
+  // a SIGTERM/SIGINT landing anywhere below is unlinked by `termHandler`.
+  let testPathSlot = osMarkTestPathOutstanding(p)
   let ab = int(ptrOf(osArgvBuf)) + osScratchSlot() * 16
   storeWord(ab, p)
   storeWord(ab + 8, 0)
@@ -681,7 +729,9 @@ export @nosplit @symbol("bit_rt_os_run_test_bounded") fn rtOsRunTestBounded(
     next = next + 1
   }
   storeWord(ce + next * 8, 0)
-  return osForkExecWaitBounded(p, ab, ce, timeoutMs)
+  let result = osForkExecWaitBounded(p, ab, ce, timeoutMs)
+  storeWord(testPathSlot, 0)
+  return result
 }
 
 // ---------------------------------------------------------------------------
