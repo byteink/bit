@@ -1,0 +1,175 @@
+// pkg/auth/oidc_verify.bit — ID token validation (#5773), on top of
+// `OidcConfig`/`JwksCache` (oidc_discovery.bit, #5772) and `std/jwt`.
+//
+// OpenID Connect Core 1.0 §3.1.3.7 lists the ID Token validation steps this
+// file enforces:
+//
+//   - the algorithm is never read from the token's own `alg` header. The
+//     `kid` header selects a `VerifyKey` out of the issuer's own JWKS
+//     (`JwksCache.find`, oidc_discovery.bit) — an attacker-controlled `alg`
+//     can therefore never select which key material or algorithm runs,
+//     only fail to match it. `std/jwt`'s `verify` (jwt.bit:302) then rejects
+//     outright if the header's `alg` disagrees with that key's own
+//     algorithm — this is what closes the RS256-to-HS256 confusion attack
+//     and makes `alg: none` (RFC 7518 §3.6) unreachable, exactly as
+//     `stdlib/jwt/jwt.bit`'s file header documents.
+//   - `iss` (§2) is checked against `config.issuer` — the discovered
+//     issuer — never against whatever `opts.expectedIss` a caller passed:
+//     `claimsOptionsFor` below overwrites it, the same "fixed by this
+//     function, not read from an untrusted input" shape as the algorithm.
+//   - `aud` (§2) must contain the client id, and when it holds more than
+//     one entry `azp` must equal it too (§3.1.3.7 rules 5-6) — `checkAzp`.
+//   - `exp`/`iat` with bounded clock skew are `std/jwt`'s own
+//     `validateClaims` (`checkExp`/`checkIat`, jwt.bit:354-398), run inside
+//     `verifyToken` before this file ever sees the payload.
+//   - `nonce` has no field in `std/jwt`'s `ClaimsOptions` (it is an OIDC
+//     concept, not a registered JWT claim, RFC 7519), so `checkNonce`
+//     compares it here, constant-time (`ctEq`, `std/crypto/subtle.bit`),
+//     against the value the caller stored for this authorization request.
+//
+// No claim is read before `verifyToken` returns: `extractKid` reads only
+// the header segment, and `jwks.find`/algorithm-mismatch/signature checks
+// all run before `claimsOptionsFor`'s payload-shaped work (`checkAzp`,
+// `checkNonce`) ever executes.
+//
+// `ClaimsOptions`, `Json`, `JsonEntry`, `Option`, `isSome`, `unwrap`,
+// `VerifyKey`, `hasPrefix`/`contains` are already bound module-wide by
+// `strategy.bit`/`oidc_discovery.bit` (an import binds per MODULE, SPEC
+// §17.1); re-importing any of them here is E0042.
+import { ClaimsOptions, verifyToken } from "std/jwt"
+import { decodeBase64Url, ctEq } from "std/crypto"
+import { jsonAsString, jsonAsArray } from "std/json"
+import { split } from "std/strings"
+
+// The header segment of `token`, decoded and JSON-parsed only far enough
+// to read `kid` (RFC 7515 §4.1.4) — never `alg`, which `verifyToken` reads
+// and checks against the key's own algorithm, not this file. Fails on a
+// malformed token, an unparseable header, or a missing/empty `kid`, all
+// before `jwks.find` or any signature check runs.
+fn extractKid(token: string): string! {
+  let parts = split(token, ".")
+  if (len(parts) != 3) {
+    fail newError("auth: verifyIdToken(): malformed token: expected 3 segments, got ${len(parts)}")
+  }
+  let raw = decodeBase64Url(parts[0])?
+  let header = jsonParse(string(raw))?
+  let kidVal = jsonGet(header, "kid")
+  if (!isSome(kidVal)) {
+    fail newError("auth: verifyIdToken(): header has no 'kid' field")
+  }
+  let kid = jsonAsString(unwrap(kidVal))
+  if (!isSome(kid) || unwrap(kid) == "") {
+    fail newError("auth: verifyIdToken(): header 'kid' field is missing or not a string")
+  }
+  return unwrap(kid)
+}
+
+// The client id every ID token check below needs: `opts.expectedAud` IS
+// that client id (aud must contain it; azp, when checked, must equal it).
+// Required rather than defaulted, because an OIDC verifier with no client
+// id to check `aud` against is not validating anything.
+fn requireClientId(opts: ClaimsOptions): string! {
+  if (!isSome(opts.expectedAud)) {
+    fail newError("auth: verifyIdToken(): opts.expectedAud (the client_id) is required")
+  }
+  return unwrap(opts.expectedAud)
+}
+
+// `opts` with `expectedIss` overwritten to `config.issuer` — the discovered
+// issuer, never a caller-supplied value that could disagree with it — and
+// `expectedAud` set to `clientId`, so `std/jwt`'s own `validateClaims`
+// (jwt.bit:458) runs the `iss`/`aud`/`exp`/`nbf`/`iat` checks inside
+// `verifyToken` with no way for `iss` to be left unchecked.
+fn claimsOptionsFor(config: OidcConfig, opts: ClaimsOptions, clientId: string): ClaimsOptions {
+  return ClaimsOptions{
+    now = opts.now,
+    leewaySeconds = opts.leewaySeconds,
+    expectedIss = Option.Some(config.issuer),
+    expectedAud = Option.Some(clientId),
+  }
+}
+
+// Whether `payload`'s `aud` claim (RFC 7519 §4.1.3) holds more than one
+// audience — the trigger for OIDC Core 1.0 §3.1.3.7 rule 5's `azp`
+// requirement. A single-string `aud`, or one missing/malformed, is not
+// "multiple" and needs no `azp`.
+fn audIsMultiple(payload: Json): bool {
+  let claim = jsonGet(payload, "aud")
+  if (!isSome(claim)) {
+    return false
+  }
+  let arr = jsonAsArray(unwrap(claim))
+  if (!isSome(arr)) {
+    return false
+  }
+  return len(unwrap(arr)) > 1
+}
+
+// OIDC Core 1.0 §3.1.3.7 rules 5-6: when `aud` names more than one
+// audience, `azp` must be present and equal `clientId`. `validateClaims`
+// (std/jwt) already proved `aud` contains `clientId` by the time this
+// runs.
+fn checkAzp(payload: Json, clientId: string): ()! {
+  if (!audIsMultiple(payload)) {
+    return
+  }
+  let claim = jsonGet(payload, "azp")
+  if (!isSome(claim)) {
+    fail newError("auth: verifyIdToken(): multiple audiences require an 'azp' claim (OIDC Core 1.0 §3.1.3.7)")
+  }
+  let azp = jsonAsString(unwrap(claim))
+  if (!isSome(azp) || unwrap(azp) != clientId) {
+    fail newError("auth: verifyIdToken(): azp mismatch")
+  }
+}
+
+// `payload`'s `nonce` claim against `expectedNonce`, constant-time (`ctEq`,
+// `std/crypto/subtle.bit`) — `std/jwt`'s `ClaimsOptions` has no `nonce`
+// field (it is an OIDC concept, not an RFC 7519 registered claim), so this
+// file owns the check.
+fn checkNonce(payload: Json, expectedNonce: string): ()! {
+  let claim = jsonGet(payload, "nonce")
+  if (!isSome(claim)) {
+    fail newError("auth: verifyIdToken(): missing 'nonce' claim")
+  }
+  let nonce = jsonAsString(unwrap(claim))
+  if (!isSome(nonce)) {
+    fail newError("auth: verifyIdToken(): 'nonce' claim is not a string")
+  }
+  if (!ctEq([]byte(unwrap(nonce)), []byte(expectedNonce))) {
+    fail newError("auth: verifyIdToken(): nonce mismatch")
+  }
+}
+
+// Validates `token` as an OIDC ID token issued by `config.issuer`,
+// reachable at a key in `jwks`, against `expectedNonce` and `opts`
+// (`now`/`leewaySeconds` only — `expectedIss`/`expectedAud` are
+// overwritten, see `claimsOptionsFor`). Returns the token's payload once
+// every check below has passed:
+//
+//   1. `opts.expectedAud` names a client id to check against (fails closed
+//      otherwise, before the token is even parsed).
+//   2. `extractKid` reads the header's `kid` — fails on a malformed token
+//      or a missing `kid`.
+//   3. `jwks.find(kid)` selects the `VerifyKey` — fails on an unknown
+//      `kid` after `JwksCache`'s rate-limited refetch (#5772).
+//   4. `verifyToken` (std/jwt) rejects an `alg` header that disagrees with
+//      that key's own algorithm, then checks the signature, then
+//      `exp`/`nbf`/`iat`/`iss`/`aud`.
+//   5. `checkAzp` — `azp` when `aud` names more than one audience.
+//   6. `checkNonce` — constant-time against `expectedNonce`.
+export fn verifyIdToken(
+  token: string,
+  config: OidcConfig,
+  jwks: JwksCache,
+  expectedNonce: string,
+  opts: ClaimsOptions,
+): Json! {
+  let clientId = requireClientId(opts)?
+  let kid = extractKid(token)?
+  let key = jwks.find(kid)?
+  let payload = verifyToken(token, key, claimsOptionsFor(config, opts, clientId))?
+  checkAzp(payload, clientId)?
+  checkNonce(payload, expectedNonce)?
+  return payload
+}

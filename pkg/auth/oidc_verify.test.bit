@@ -1,0 +1,271 @@
+// pkg/auth/oidc_verify.test.bit — #5773's acceptance: `verifyIdToken`
+// accepts a valid token and rejects each of the following with a distinct
+// message: an `alg` header that disagrees with the JWKS key's algorithm,
+// `alg: none`, a wrong `iss`, a wrong `aud`, an `azp` that disagrees with
+// the client id when `aud` names more than one audience, an expired token,
+// a token issued in the future beyond skew, a `nonce` mismatch, a tampered
+// payload, and an unknown `kid` (after `JwksCache`'s one rate-limited
+// refetch, #5772).
+//
+// Every token is hand-assembled (`buildToken`) rather than produced by
+// `std/jwt`'s own `sign`, because `sign` never writes a `kid` header
+// (jwt.bit:281) and `verifyIdToken`'s first read of the token IS `kid`
+// (`extractKid`, oidc_verify.bit) — matching `stdlib/jwt/jwt.test.bit`'s own
+// precedent of hand-building a token for its `alg: none` and malformed-token
+// cases. No real network: `newCache`/`newCacheTwoCalls` go through the same
+// `FetchCounter`-backed `HttpFetch` fake `oidc_discovery.test.bit` uses.
+//
+// `OidcConfig`, `JwksCache`, `newJwksCacheFetch`, `tlsStub`, `oneCallFetch`,
+// `fakeFetch`, `FetchCounter`, `testIssuer`, `verifyIdToken`, `ClaimsOptions`,
+// `Option`, `Json`, `JsonEntry`, `jsonEncode`, `isSome`, `unwrap` are already
+// bound module-wide (SPEC §17.1); re-importing any of them here is E0042.
+import { hmac, newSha256, encodeBase64Url } from "std/crypto"
+
+const fixedNow: int = 1700000000
+const clientId = "client-123"
+const testKid = "k1"
+const testNonce = "nonce-abc123"
+const testJwksUri = "https://idp.example.com/jwks"
+
+fn hmacSecret(): []byte { return []byte("auth-oidc-verify-test-hmac-secret!") }
+
+fn testJwksBody(): string {
+  return "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"" +
+    testKid +
+    "\",\"k\":\"" +
+    encodeBase64Url(hmacSecret()) +
+    "\"}]}"
+}
+
+fn defaultConfig(): OidcConfig {
+  return OidcConfig{
+    issuer = testIssuer,
+    authorizationEndpoint = testIssuer + "/authorize",
+    tokenEndpoint = testIssuer + "/token",
+    jwksUri = testJwksUri,
+  }
+}
+
+fn defaultOpts(): ClaimsOptions {
+  return ClaimsOptions{
+    now = fixedNow,
+    leewaySeconds = 60,
+    expectedIss = Option.None,
+    expectedAud = Option.Some(clientId),
+  }
+}
+
+fn newCache(): JwksCache {
+  let box = FetchCounter{ calls = 0, statuses = [200], bodies = [testJwksBody()] }
+  return newJwksCacheFetch(testJwksUri, tlsStub(), fakeFetch(box)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+}
+
+// A cache whose fake `HttpFetch` answers up to two calls with the SAME JWKS
+// body (still only `testKid`) -- lets a test drive exactly one refetch and
+// observe the still-unknown-`kid` failure, like
+// `oidc_discovery.test.bit`'s own cooldown tests.
+fn newCacheTwoCalls(): JwksCache {
+  let box = FetchCounter{
+    calls = 0,
+    statuses = [200, 200],
+    bodies = [testJwksBody(), testJwksBody()],
+  }
+  return newJwksCacheFetch(testJwksUri, tlsStub(), fakeFetch(box)) catch e {
+    panic("newJwksCache: ${e.message()}")
+  }
+}
+
+// The registered + OIDC claims one test wants on an ID token payload, each
+// mutable so a test can start from `validClaims()` and change only what it
+// is testing -- the same shape `stdlib/jwt/jwt.test.bit`'s `ClaimSet` uses.
+class IdTokenClaims {
+  iss: string,
+  aud: Json,
+  exp: int,
+  iat: int,
+  azp: Option<string>,
+}
+
+// A claim set that passes every check: `iss` is the configured issuer,
+// `aud` names the client id alone (no `azp` needed), `exp`/`iat` sit well
+// inside `fixedNow`'s skew window.
+fn validClaims(): IdTokenClaims {
+  return IdTokenClaims{
+    iss = testIssuer,
+    aud = Json.JsonString(clientId),
+    exp = fixedNow + 3600,
+    iat = fixedNow - 10,
+    azp = Option.None,
+  }
+}
+
+// `c` plus the fixed `sub`/`nonce` claims every test token carries.
+fn idTokenPayload(c: IdTokenClaims): Json {
+  let entries = []JsonEntry{
+    JsonEntry{ key = "iss", value = Json.JsonString(c.iss) },
+    JsonEntry{ key = "aud", value = c.aud },
+    JsonEntry{ key = "sub", value = Json.JsonString("user-1") },
+    JsonEntry{ key = "exp", value = Json.JsonInt(i64(c.exp)) },
+    JsonEntry{ key = "iat", value = Json.JsonInt(i64(c.iat)) },
+    JsonEntry{ key = "nonce", value = Json.JsonString(testNonce) },
+  }
+  if (isSome(c.azp)) {
+    entries = append(entries, JsonEntry{ key = "azp", value = Json.JsonString(unwrap(c.azp)) })
+  }
+  return Json.JsonObject(entries)
+}
+
+// A hand-built compact JWS: `{"alg":alg,"typ":"JWT","kid":kid}` over
+// `payload`, HMAC-SHA256-signed under `secret` regardless of what `alg`
+// claims -- exactly what lets the alg-mismatch and alg:none tests reach
+// `verifyToken`'s header check with a structurally valid signature segment.
+fn buildToken(alg: string, kid: string, secret: []byte, payload: Json): string {
+  let header = Json.JsonObject(
+    [
+      JsonEntry{ key = "alg", value = Json.JsonString(alg) },
+      JsonEntry{ key = "typ", value = Json.JsonString("JWT") },
+      JsonEntry{ key = "kid", value = Json.JsonString(kid) },
+    ],
+  )
+  let h = encodeBase64Url([]byte(jsonEncode(header)))
+  let p = encodeBase64Url([]byte(jsonEncode(payload)))
+  let signingInput = []byte(h + "." + p)
+  let sig = hmac(newSha256, secret, signingInput)
+  return h + "." + p + "." + encodeBase64Url(sig)
+}
+
+// A correctly algorithm-tagged (`HS256`, matching `testKid`'s JWKS entry)
+// token over `payload`.
+fn signIdToken(kid: string, payload: Json): string {
+  return buildToken("HS256", kid, hmacSecret(), payload)
+}
+
+// `verifyIdToken`'s error message, or `""` on success.
+fn verifyIdTokenErrorMsg(
+  token: string,
+  config: OidcConfig,
+  cache: JwksCache,
+  nonce: string,
+  opts: ClaimsOptions,
+): string {
+  verifyIdToken(token, config, cache, nonce, opts) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+test "verifyIdToken accepts a valid token and returns its payload" {
+  let token = signIdToken(testKid, idTokenPayload(validClaims()))
+  let payload = verifyIdToken(token, defaultConfig(), newCache(), testNonce, defaultOpts()) catch e {
+    panic("verifyIdToken: ${e.message()}")
+  }
+  let sub = jsonAsString(unwrap(jsonGet(payload, "sub")))
+  assert(isSome(sub) && unwrap(sub) == "user-1", "valid token lost 'sub': ${jsonEncode(payload)}")
+}
+
+test "an alg header that disagrees with the JWKS key's algorithm is rejected" {
+  let token = buildToken("RS256", testKid, hmacSecret(), idTokenPayload(validClaims()))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "alg-mismatch token was accepted")
+  assert(
+    contains(msg, "algorithm mismatch") && contains(msg, "RS256"),
+    "wrong rejection reason: ${msg}",
+  )
+}
+
+test "alg: none is rejected, never dispatched" {
+  let token = buildToken("none", testKid, hmacSecret(), idTokenPayload(validClaims()))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "alg:none token was accepted")
+  assert(
+    contains(msg, "algorithm mismatch") && contains(msg, "none"),
+    "wrong rejection reason: ${msg}",
+  )
+}
+
+test "a token with the wrong iss is rejected" {
+  let c = validClaims()
+  c.iss = "https://evil.example.com"
+  let token = signIdToken(testKid, idTokenPayload(c))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "wrong-issuer token was accepted")
+  assert(contains(msg, "issuer"), "wrong rejection reason: ${msg}")
+}
+
+test "a token with the wrong aud is rejected" {
+  let c = validClaims()
+  c.aud = Json.JsonString("some-other-client")
+  let token = signIdToken(testKid, idTokenPayload(c))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "wrong-audience token was accepted")
+  assert(contains(msg, "audience"), "wrong rejection reason: ${msg}")
+}
+
+test "multiple audiences with an azp that disagrees with the client id is rejected" {
+  let c = validClaims()
+  c.aud = Json.JsonArray([]Json{ Json.JsonString(clientId), Json.JsonString("other-aud") })
+  c.azp = Option.Some("someone-else")
+  let token = signIdToken(testKid, idTokenPayload(c))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "azp-mismatch token was accepted")
+  assert(contains(msg, "azp"), "wrong rejection reason: ${msg}")
+}
+
+test "an expired token is rejected" {
+  let c = validClaims()
+  c.exp = fixedNow - 3600
+  let token = signIdToken(testKid, idTokenPayload(c))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "expired token was accepted")
+  assert(contains(msg, "expired"), "wrong rejection reason: ${msg}")
+}
+
+test "a token issued in the future beyond skew is rejected" {
+  let c = validClaims()
+  c.iat = fixedNow + 3600
+  let token = signIdToken(testKid, idTokenPayload(c))
+  let msg = verifyIdTokenErrorMsg(token, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "future-iat token was accepted")
+  assert(contains(msg, "future"), "wrong rejection reason: ${msg}")
+}
+
+test "a nonce mismatch is rejected" {
+  let token = signIdToken(testKid, idTokenPayload(validClaims()))
+  let msg = verifyIdTokenErrorMsg(
+    token,
+    defaultConfig(),
+    newCache(),
+    "a-different-nonce",
+    defaultOpts(),
+  )
+  assert(msg != "", "nonce-mismatch token was accepted")
+  assert(contains(msg, "nonce mismatch"), "wrong rejection reason: ${msg}")
+}
+
+test "a tampered payload fails signature verification" {
+  let token = signIdToken(testKid, idTokenPayload(validClaims()))
+  let parts = split(token, ".")
+  let tampered = parts[0] +
+    "." +
+    encodeBase64Url([]byte("{\"iss\":\"${testIssuer}\",\"aud\":\"${clientId}\"}")) +
+    "." +
+    parts[2]
+  let msg = verifyIdTokenErrorMsg(tampered, defaultConfig(), newCache(), testNonce, defaultOpts())
+  assert(msg != "", "tampered payload was accepted")
+  assert(contains(msg, "invalid signature"), "wrong rejection reason: ${msg}")
+}
+
+test "an unknown kid fails after JwksCache's one rate-limited refetch" {
+  let token = signIdToken("unknown-kid", idTokenPayload(validClaims()))
+  let msg = verifyIdTokenErrorMsg(
+    token,
+    defaultConfig(),
+    newCacheTwoCalls(),
+    testNonce,
+    defaultOpts(),
+  )
+  assert(msg != "", "unknown-kid token was accepted")
+  assert(contains(msg, "kid"), "wrong rejection reason: ${msg}")
+}
