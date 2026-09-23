@@ -38,6 +38,7 @@ import { Response, getTls } from "std/http"
 import { hasPrefix } from "std/strings"
 import { Mono, Second, monotonic, since } from "std/time"
 import { Jwks, VerifyKey, jwksFindByKid, parseJwks, refreshJwks } from "std/jwt"
+import { Mutex, RWMutex, newMutex, newRWMutex } from "std/sync"
 
 // The path every OIDC provider serves its discovery document at (RFC 8414 /
 // OIDC Discovery 1.0 §4.1), appended to the issuer with no separator: the
@@ -153,10 +154,28 @@ fn parseOidcConfig(body: string, issuer: string): OidcConfig! {
 // wholesale, never appends to it — so the cache's size is the size of one
 // JWKS document, however many times `find` refetches over the cache's
 // lifetime.
+//
+// CONCURRENCY (#5788): one cache is shared by every request handler, and
+// `pkg/web` runs handlers as concurrent tasks, so `find` must be safe under
+// concurrent calls. Two locks, deliberately not one:
+//
+//   - `refetchLock` (`std/sync.Mutex`) makes "is the cooldown over, and if
+//     so claim this fetch" ONE atomic step (`claimRefetch`) — only the
+//     caller that flips `hasRefetched`/`lastRefetch` under this lock goes on
+//     to fetch; every other concurrent miss loses the claim and fails with
+//     `lastError`, exactly as it would inside a real cooldown window. The
+//     lock is held only across the check-and-set, never across the network
+//     call in `doRefetch` — holding it there would serialize every
+//     verification behind one slow provider round-trip.
+//   - `jwksLock` (`std/sync.RWMutex`) guards `this.jwks` itself: `find`
+//     reads it under `rLock`, `doRefetch` replaces it under `lock` after the
+//     fetch completes, so a concurrent reader always sees a complete `Jwks`
+//     — the old one or the new one, never a torn write in between.
 export class JwksCache {
   jwksUri: string
   tls: TlsConfig
   jwks: Jwks
+  jwksLock: RWMutex
   // Whether a refetch (beyond the constructor's initial fetch) has ever run.
   // `false` lets the FIRST unknown-`kid` miss always refetch, regardless of
   // how recently the cache was constructed — the cooldown below is about
@@ -166,27 +185,53 @@ export class JwksCache {
   // The error a refetch produced (a fetch failure, or "kid not found" after
   // a clean reparse) — returned verbatim to every miss inside the cooldown
   // window, so a caller sees why the KEY is unavailable rather than a
-  // generic "try later" that hides a real outage.
+  // generic "try later" that hides a real outage. Read and written only
+  // under `refetchLock`, the same lock that decides whether a miss claims a
+  // fetch, so a concurrent reader never observes a half-written message.
   lastError: string
+  refetchLock: Mutex
   fetch: HttpFetch
 
   // The key for `kid`: a cache hit returns it with no HTTP call; a miss
   // refetches at most once per `jwksRefetchCooldownNs`.
   export find(kid: string): VerifyKey! {
+    this.jwksLock.rLock()
     let key = jwksFindByKid(this.jwks, kid) catch _ {
+      this.jwksLock.rUnlock()
       return this.refetchAndFind(kid)?
     }
+    this.jwksLock.rUnlock()
     return key
   }
 
-  refetchAndFind(kid: string): VerifyKey! {
+  // Atomically checks the cooldown and, if it has passed, claims the fetch
+  // by flipping `hasRefetched`/`lastRefetch` before releasing `refetchLock`
+  // — the check and the claim are one critical section, so two concurrent
+  // callers can never both read "cooldown over" before either has claimed
+  // it (#5788).
+  claimRefetch(): bool {
+    this.refetchLock.lock()
     if (this.hasRefetched && since(this.lastRefetch) < jwksRefetchCooldownNs) {
-      fail newError(this.lastError)
+      this.refetchLock.unlock()
+      return false
     }
     this.hasRefetched = true
     this.lastRefetch = monotonic()
+    this.refetchLock.unlock()
+    return true
+  }
+
+  refetchAndFind(kid: string): VerifyKey! {
+    if (!this.claimRefetch()) {
+      this.refetchLock.lock()
+      let err = this.lastError
+      this.refetchLock.unlock()
+      fail newError(err)
+    }
     let key = this.doRefetch(kid) catch e {
+      this.refetchLock.lock()
       this.lastError = e.message()
+      this.refetchLock.unlock()
       fail e
     }
     return key
@@ -195,7 +240,9 @@ export class JwksCache {
   doRefetch(kid: string): VerifyKey! {
     let body = fetchGet(this.fetch, this.tls, this.jwksUri)?
     let refreshed = refreshJwks(body)?
+    this.jwksLock.lock()
     this.jwks = refreshed
+    this.jwksLock.unlock()
     return jwksFindByKid(refreshed, kid)?
   }
 }
@@ -218,9 +265,11 @@ fn newJwksCacheFetch(jwksUri: string, tls: TlsConfig, fetch: HttpFetch): JwksCac
     jwksUri = jwksUri,
     tls = tls,
     jwks = jwks,
+    jwksLock = newRWMutex(),
     hasRefetched = false,
     lastRefetch = Mono{ ns = 0 },
     lastError = "",
+    refetchLock = newMutex(),
     fetch = fetch,
   }
 }
