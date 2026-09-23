@@ -46,11 +46,3 @@ instead, as the entry below does. `dist/release.sh` refuses to fold an entry
 that violates this rather than let it corrupt the count silently.
 
 ---
-
-## Strings no longer allocate on slice, call or return
-
-A `string` held in a local variable, passed as an argument or returned from a function now travels as its three words (pointer, length and owning buffer) instead of a pointer to a heap box. Taking `s[lo:hi]` and handing a string to a function no longer allocates. Strings stored in arrays, maps, channels and class fields keep their existing representation.
-
-On `bench/cases/strings` (Apple M5 Max), against the 0.23.0 benchmark table: heap objects 7,125,035 to 37, cycles 952.9 M to 211.4 M, peak RSS 134.6 MB to 78.6 MB. Bit now runs that case in 0.60x the cycles of Go, down from 2.68x.
-
-`BIT_STRING_EXPLODE=0` at build time selects the previous representation.
