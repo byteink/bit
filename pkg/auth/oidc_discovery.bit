@@ -1,0 +1,226 @@
+// pkg/auth/oidc_discovery.bit — OIDC discovery (#5772) and a JWKS cache with
+// key-rotation and a rate-limited refetch-on-miss, independent of
+// `PasswordStrategy`.
+//
+// `discover`/`newJwksCache` both take an explicit `TlsConfig` rather than
+// reaching for a package default: `stdlib/http/client.bit`'s own
+// `defaultClientConfig`/`defaultRoots` are module-private, and nothing in
+// `std/http`/`std/tls` exports a way to build a secure-by-default config from
+// outside those modules. `pkg/postgres/tlsnegotiate.bit` and
+// `pkg/mysql/tlsnegotiate.bit` hit the identical gap and made the same call —
+// `roots`/`TlsConfig` is the caller's to supply, never guessed by the package.
+//
+// Two OIDC Discovery 1.0 requirements this file enforces, not merely
+// documents (#5772 security requirements):
+//
+//   - the issuer is only ever fetched over https (§2, §4.3) — checked before
+//     any network access, not left to `requestTls`'s own https-only check,
+//     so the error names the issuer rather than a generic "not https" one;
+//   - the discovery document's own `issuer` member must equal the configured
+//     issuer BYTE-FOR-BYTE (§4.3) — a provider whose document disagrees with
+//     the issuer the caller configured is rejected outright, which is what
+//     stops a compromised or misconfigured discovery endpoint from vouching
+//     for a different issuer than the one the application trusts.
+//
+// `HttpFetch` is the one seam between this file and the network, exactly the
+// shape `pkg/web/ratelimit.bit`'s `RateClock` uses for its clock: a
+// module-private function type, `nil` meaning "the real one"
+// (`httpsGetTls`, which calls `std/http`'s `getTls`), and a test substitutes
+// a call-counting fake so the rate limiter and the HTTP-call counts in this
+// file's tests are provable with NO real network and no TLS handshake.
+//
+// `isSome`, `unwrap`, `Json`, `JsonEntry`, `jsonDecMember`, `jsonDecObject`,
+// `jsonDecString`, `jsonEncode`, `jsonGet` and `jsonParse` are already bound
+// module-wide by `strategy.bit` (an import binds per MODULE, SPEC §17.1), so
+// re-importing any of them here is E0042.
+import { TlsConfig } from "std/tls"
+import { Response, getTls } from "std/http"
+import { hasPrefix } from "std/strings"
+import { Mono, Second, monotonic, since } from "std/time"
+import { Jwks, VerifyKey, jwksFindByKid, parseJwks, refreshJwks } from "std/jwt"
+
+// The path every OIDC provider serves its discovery document at (RFC 8414 /
+// OIDC Discovery 1.0 §4.1), appended to the issuer with no separator: the
+// issuer itself must carry no trailing slash for the concatenation to be the
+// canonical URL, which is the same requirement the spec places on the
+// issuer identifier.
+const wellKnownPath = "/.well-known/openid-configuration"
+
+// How long `JwksCache.find` waits after a refetch — successful or not —
+// before it will attempt another one for a still-unknown `kid`. 60 seconds:
+// long enough that a sustained attack spraying unknown `kid`s costs the
+// JWKS endpoint at most one request per minute per cache, short enough that
+// a genuine key rotation is picked up well inside any reasonable token
+// lifetime. Documented here rather than left a bare literal because #5772's
+// security requirement is that this number exists and is deliberate, not
+// whatever `since` happened to return first.
+const jwksRefetchCooldownNs: int = 60 * Second
+
+// One HTTP GET, returning the response body on success. Module-private and
+// injectable — see the file header. Production code always passes `nil`.
+type HttpFetch = (string) => string!
+
+// `fetch(url)` when a test supplied one, else a real `getTls` GET under
+// `tls`, treating any non-200 status as a failure (`Response.status`,
+// `stdlib/http/http.bit`).
+fn fetchGet(fetch: HttpFetch, tls: TlsConfig, url: string): string! {
+  if (fetch == nil) {
+    return httpsGetTls(url, tls)?
+  }
+  return fetch(url)?
+}
+
+fn httpsGetTls(url: string, tls: TlsConfig): string! {
+  let res = getTls(url, tls)?
+  return checkStatus(url, res)?
+}
+
+// `res.body` on a 200, else a failure naming `url` and the status. Split out
+// of `httpsGetTls` so a test can prove the non-200 rejection against an
+// in-memory `Response` (`std/http`) with no real network and no TLS
+// handshake — `oidc_discovery.test.bit`'s fake `HttpFetch` calls this same
+// function, so the fake and the real path share the one rejection rule.
+fn checkStatus(url: string, res: Response): string! {
+  if (res.status != 200) {
+    fail newError("GET ${url}: HTTP ${res.status}")
+  }
+  return res.body
+}
+
+// The four fields `OidcStrategy` (#5776) needs out of a discovery document.
+// `...` in #5772's ticket body is deliberately not more than this: nothing
+// downstream of this ticket reads a fifth field yet, and one that does can
+// add it without touching what is already here.
+export class OidcConfig {
+  export issuer: string,
+  export authorizationEndpoint: string,
+  export tokenEndpoint: string,
+  export jwksUri: string,
+}
+
+// Fetches `issuer + "/.well-known/openid-configuration"` over TLS under
+// `tls` and parses it into an `OidcConfig`. Fails, naming `issuer`, on a
+// non-https issuer, a non-200 response, a malformed document, or a document
+// whose own `issuer` member disagrees with `issuer` (OIDC Discovery 1.0
+// §4.3 — see the file header).
+export fn discover(issuer: string, tls: TlsConfig): OidcConfig! {
+  return discoverFetch(issuer, tls, nil)?
+}
+
+// `discover` against an injected `HttpFetch` — the test seam.
+fn discoverFetch(issuer: string, tls: TlsConfig, fetch: HttpFetch): OidcConfig! {
+  if (!hasPrefix(issuer, "https://")) {
+    fail newError("auth: discover(): issuer '${issuer}' must be an https URL (OIDC Discovery 1.0 §4.3)")
+  }
+  let url = issuer + wellKnownPath
+  let body = fetchGet(fetch, tls, url) catch e {
+    fail newError("auth: discover(): fetching ${url}: ${e.message()}")
+  }
+  let cfg = parseOidcConfig(body, issuer) catch e {
+    fail newError("auth: discover(): ${issuer}: ${e.message()}")
+  }
+  return cfg
+}
+
+// The one required string member `path` of the parsed discovery document
+// `entries`, or a `parseOidcConfig`-shaped failure naming it.
+fn discoveryMember(entries: []JsonEntry, path: string): string! {
+  return jsonDecString(
+    jsonDecMember(entries, "oidc discovery document", path)?,
+    "oidc discovery document.${path}",
+  )?
+}
+
+fn parseOidcConfig(body: string, issuer: string): OidcConfig! {
+  let j = jsonParse(body)?
+  let entries = jsonDecObject(j, "oidc discovery document", 0)?
+  let docIssuer = discoveryMember(entries, "issuer")?
+  if (docIssuer != issuer) {
+    fail newError("issuer mismatch: configured '${issuer}', document says '${docIssuer}'")
+  }
+  return OidcConfig{
+    issuer = docIssuer,
+    authorizationEndpoint = discoveryMember(entries, "authorization_endpoint")?,
+    tokenEndpoint = discoveryMember(entries, "token_endpoint")?,
+    jwksUri = discoveryMember(entries, "jwks_uri")?,
+  }
+}
+
+// A `Jwks` (`std/jwt`) kept fresh across key rotation, with a rate-limited
+// refetch on a `kid` miss (#5772's security requirement).
+//
+// BOUNDED: exactly one `Jwks` is ever held — `doRefetch` REPLACES `this.jwks`
+// wholesale, never appends to it — so the cache's size is the size of one
+// JWKS document, however many times `find` refetches over the cache's
+// lifetime.
+export class JwksCache {
+  jwksUri: string
+  tls: TlsConfig
+  jwks: Jwks
+  // Whether a refetch (beyond the constructor's initial fetch) has ever run.
+  // `false` lets the FIRST unknown-`kid` miss always refetch, regardless of
+  // how recently the cache was constructed — the cooldown below is about
+  // consecutive REFETCHES, not about the initial fetch.
+  hasRefetched: bool
+  lastRefetch: Mono
+  // The error a refetch produced (a fetch failure, or "kid not found" after
+  // a clean reparse) — returned verbatim to every miss inside the cooldown
+  // window, so a caller sees why the KEY is unavailable rather than a
+  // generic "try later" that hides a real outage.
+  lastError: string
+  fetch: HttpFetch
+
+  // The key for `kid`: a cache hit returns it with no HTTP call; a miss
+  // refetches at most once per `jwksRefetchCooldownNs`.
+  export find(kid: string): VerifyKey! {
+    let key = jwksFindByKid(this.jwks, kid) catch _ {
+      return this.refetchAndFind(kid)?
+    }
+    return key
+  }
+
+  refetchAndFind(kid: string): VerifyKey! {
+    if (this.hasRefetched && since(this.lastRefetch) < jwksRefetchCooldownNs) {
+      fail newError(this.lastError)
+    }
+    this.hasRefetched = true
+    this.lastRefetch = monotonic()
+    let key = this.doRefetch(kid) catch e {
+      this.lastError = e.message()
+      fail e
+    }
+    return key
+  }
+
+  doRefetch(kid: string): VerifyKey! {
+    let body = fetchGet(this.fetch, this.tls, this.jwksUri)?
+    let refreshed = refreshJwks(body)?
+    this.jwks = refreshed
+    return jwksFindByKid(refreshed, kid)?
+  }
+}
+
+// Fetches `jwksUri` over TLS under `tls` and parses it into a `JwksCache`
+// ready for `find`.
+export fn newJwksCache(jwksUri: string, tls: TlsConfig): JwksCache! {
+  return newJwksCacheFetch(jwksUri, tls, nil)?
+}
+
+// `newJwksCache` against an injected `HttpFetch` — the test seam.
+fn newJwksCacheFetch(jwksUri: string, tls: TlsConfig, fetch: HttpFetch): JwksCache! {
+  let body = fetchGet(fetch, tls, jwksUri) catch e {
+    fail newError("auth: newJwksCache(): fetching ${jwksUri}: ${e.message()}")
+  }
+  let jwks = parseJwks(body) catch e {
+    fail newError("auth: newJwksCache(): parsing ${jwksUri}: ${e.message()}")
+  }
+  return JwksCache{
+    jwksUri = jwksUri,
+    tls = tls,
+    jwks = jwks,
+    hasRefetched = false,
+    lastRefetch = Mono{ ns = 0 },
+    lastError = "",
+    fetch = fetch,
+  }
+}
