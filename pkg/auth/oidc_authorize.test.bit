@@ -1,0 +1,182 @@
+// pkg/auth/oidc_authorize.test.bit — #5776's acceptance: `beginAuthorization`
+// returns a 302 whose Location carries `code_challenge_method=S256` and a
+// `code_challenge` equal to base64url(sha256(the code_verifier stored in the
+// session)); `state`/`nonce` are non-empty, random across calls, and match
+// what was written to the session; a non-https `authorization_endpoint` is
+// refused; and `codeChallengeFor` matches RFC 7636 Appendix B.1's test
+// vector.
+//
+// The vector below was re-derived independently for this ticket (`openssl
+// dgst -sha256` piped through `openssl base64` and RFC 4648 §5's `+/` ->
+// `-_` translation, plus Python's `hashlib`/`base64.urlsafe_b64encode`) —
+// both agree with each other and with the value hard-coded here, which is
+// the value that appears verbatim in RFC 7636 Appendix B.1 as
+// `code_challenge`.
+//
+// Route handlers, not a directly-built `Ctx`: this package has no
+// `NameRegistry`/`newCtx` constructor of its own (`pkg/web` exports
+// neither), so a `Ctx` is only reachable through a real `App`, the same
+// shape `middleware.test.bit` uses. A second route reads the session back
+// (`/session`) so the "match what was written to the session" half of the
+// acceptance is checked against the STORE, not just the redirect URL.
+//
+// `Ctx`, `OidcConfig`, `hasPrefix`, `split`, `contains`, `Response`, `App`,
+// `Config` and `MemoryStore` are already bound module-wide by
+// `strategy.bit`/`oidc_discovery.bit`/`oidc_verify.bit`/
+// `oidc_discovery.test.bit`/`middleware.test.bit` (an import binds per
+// MODULE, SPEC §17.1); `stateSessionKey`/`nonceSessionKey`/
+// `verifierSessionKey`/`codeChallengeFor`/`requireHttpsEndpoint` are
+// declared, not imported, in this module. `splitTarget`/`parseQuery` are new.
+import { splitTarget, parseQuery } from "std/http"
+
+const testAuthEndpoint = "https://idp.example.com/authorize"
+
+fn testStrategy(): OidcStrategy {
+  return OidcStrategy{
+    config = OidcConfig{
+      issuer = "https://idp.example.com",
+      authorizationEndpoint = testAuthEndpoint,
+      tokenEndpoint = "https://idp.example.com/token",
+      jwksUri = "https://idp.example.com/jwks",
+    },
+    clientId = "test-client",
+    clientSecret = "test-client-secret",
+    redirectUri = "https://app.example.com/callback",
+  }
+}
+
+// An app with one route that runs `beginAuthorization(s, c)` and one that
+// reads the three session values `state|nonce|verifier` back out, so a test
+// can prove the round trip without a store constructor of its own.
+fn beginApp(s: OidcStrategy): App {
+  let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
+  app.get("/begin", (c) => {
+    return beginAuthorization(s, c)
+  })
+  app.get("/session", (c) => {
+    let session = c.session() catch e {
+      panic("session: ${e.message()}")
+    }
+    return c.text(
+        session.get(stateSessionKey) +
+        "|" +
+        session.get(nonceSessionKey) +
+        "|" +
+        session.get(verifierSessionKey),
+    )
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+fn authReq(path: string, cookie: string): Request {
+  if (len(cookie) == 0) {
+    return Request{ method = "GET", path = path, headers = "", body = "" }
+  }
+  return Request{ method = "GET", path = path, headers = "Cookie: " + cookie, body = "" }
+}
+
+fn queryFrom(location: string): map<string, string> {
+  let (_, raw) = splitTarget(location)
+  return parseQuery(raw)
+}
+
+fn paramOrPanic(params: map<string, string>, key: string): string {
+  let (v, ok) = params[key]
+  if (!ok) {
+    panic("query has no '${key}' parameter")
+  }
+  return v
+}
+
+test "beginAuthorization redirects to the discovered endpoint with S256 and every OIDC Core 1.0 3.1.2.1 parameter" {
+  let app = beginApp(testStrategy())
+  let res = app.handle(authReq("/begin", ""))
+  assert(res.status == 302, "want 302, got ${res.status}")
+
+  let location = res.getHeader("Location")
+  assert(
+    hasPrefix(location, testAuthEndpoint + "?"),
+    "want a redirect to ${testAuthEndpoint}, got '${location}'",
+  )
+
+  let params = queryFrom(location)
+  assert(paramOrPanic(params, "response_type") == "code", "want response_type=code")
+  assert(paramOrPanic(params, "client_id") == "test-client", "want the strategy's client_id echoed")
+  assert(
+    paramOrPanic(params, "redirect_uri") == "https://app.example.com/callback",
+    "want the strategy's redirect_uri echoed",
+  )
+  assert(paramOrPanic(params, "scope") == "openid", "want scope=openid")
+  assert(
+    paramOrPanic(params, "code_challenge_method") == "S256",
+    "want code_challenge_method=S256, never plain",
+  )
+
+  let state = paramOrPanic(params, "state")
+  let nonce = paramOrPanic(params, "nonce")
+  let challenge = paramOrPanic(params, "code_challenge")
+  assert(len(state) > 0, "state must not be empty")
+  assert(len(nonce) > 0, "nonce must not be empty")
+  assert(len(challenge) > 0, "code_challenge must not be empty")
+
+  // The session must hold all three values, and state/nonce there must
+  // match exactly what went out in the URL.
+  let cookie = res.getHeader("Set-Cookie")
+  assert(len(cookie) > 0, "a fresh session must issue a Set-Cookie")
+  let stored = split(app.handle(authReq("/session", cookie)).body, "|")
+  assert(
+    stored[0] == state,
+    "state stored in the session must match the URL: '${stored[0]}' vs '${state}'",
+  )
+  assert(
+    stored[1] == nonce,
+    "nonce stored in the session must match the URL: '${stored[1]}' vs '${nonce}'",
+  )
+  assert(len(stored[2]) > 0, "the session must hold a code_verifier")
+
+  // The acceptance's core PKCE claim: the URL's code_challenge equals
+  // base64url(sha256(the code_verifier actually stored in the session)).
+  assert(
+    challenge == codeChallengeFor(stored[2]),
+    "code_challenge must equal base64url(sha256(the stored code_verifier))",
+  )
+}
+
+test "two calls to beginAuthorization produce different state, nonce and code_verifier" {
+  let app = beginApp(testStrategy())
+  let p1 = queryFrom(app.handle(authReq("/begin", "")).getHeader("Location"))
+  let p2 = queryFrom(app.handle(authReq("/begin", "")).getHeader("Location"))
+
+  assert(
+    paramOrPanic(p1, "state") != paramOrPanic(p2, "state"),
+    "state must be random across calls",
+  )
+  assert(
+    paramOrPanic(p1, "nonce") != paramOrPanic(p2, "nonce"),
+    "nonce must be random across calls",
+  )
+  assert(
+    paramOrPanic(p1, "code_challenge") != paramOrPanic(p2, "code_challenge"),
+    "code_challenge (derived from a random verifier) must differ across calls",
+  )
+}
+
+test "beginAuthorization refuses a non-https authorization_endpoint (OIDC Discovery 1.0 4.3)" {
+  requireHttpsEndpoint("http://idp.example.com/authorize") catch e {
+    assert(contains(e.message(), "https"), "want an https complaint, got '${e.message()}'")
+    return
+  }
+  panic("requireHttpsEndpoint must reject a non-https URL")
+}
+
+// RFC 7636 Appendix B.1 — see the file header for how this value was
+// independently re-derived.
+test "codeChallengeFor matches RFC 7636 Appendix B.1's test vector" {
+  let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+  let want = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+  let got = codeChallengeFor(verifier)
+  assert(got == want, "want '${want}', got '${got}'")
+}
