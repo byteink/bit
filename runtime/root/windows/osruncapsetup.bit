@@ -1,0 +1,212 @@
+// Pipe + STARTUPINFOEX + PROC_THREAD_ATTRIBUTE_HANDLE_LIST setup for
+// `bit_rt_os_run_captured` (#5782, epic #3459, ABI.md §19) — split out of
+// ./osruncap.bit at write time (803 lines, `spec/LINT.md`'s 800-line
+// ceiling, E0200), the same "path-taking vs. handle-moving" kind of seam
+// ../fsrw.bit's own header cites for its own split, applied here to "sets
+// up a child's handles" vs. "polls and drains an already-running one". A
+// real, nameable seam, not an arbitrary line cut: everything in this file
+// runs BEFORE `CreateProcessW`; everything in ./osruncap.bit runs at or
+// after it. Same module as ./osruncap.bit (an import is per-module, not
+// per-file), so nothing here needs a new `import` — `winZeroBytes`, `hAt`,
+// `winBoundedMaxMs` are ./osrun.bit's own declarations, already in scope.
+//
+// See ./osruncap.bit's own header for the full handle-inheritance-race
+// argument these functions implement the fix for (Microsoft's
+// STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST guidance).
+
+// kernel32 imports beyond what ./os.bit, ./boot.bit, ./fs.bit and ./osrun.bit
+// already declare in this module. All six are NEW admissions this ticket
+// adds to `compiler/pesyms.bit`'s table — documented at processthreadsapi.h
+// (`CreatePipe`, `InitializeProcThreadAttributeList`,
+// `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList` are actually
+// in namedpipeapi.h/processthreadsapi.h per Microsoft's own reference) and
+// winbase.h (`SetHandleInformation`), kernel32.dll; not hardware-probed,
+// matching this table's own honesty note for documentation-sourced entries —
+// `PeekNamedPipe` is namedpipeapi.h, kernel32.dll, used by ./osruncap.bit's
+// own drain loop rather than anything in this file, but declared here
+// alongside its five siblings rather than splitting the Win32 surface
+// across both files.
+extern fn CreatePipe(readOut: *byte, writeOut: *byte, secAttrs: *byte, size: i32): i32
+extern fn SetHandleInformation(handle: *byte, mask: i32, flags: i32): i32
+extern fn PeekNamedPipe(
+  handle: *byte, buf: *u8, bufSize: i32, bytesReadOut: *i32,
+  totalAvailOut: *i32, bytesLeftMsgOut: *i32,
+): i32
+extern fn InitializeProcThreadAttributeList(
+  attrList: *byte,
+  attrCount: i32,
+  flags: i32,
+  sizeOut: *i64,
+): i32
+extern fn UpdateProcThreadAttribute(
+  attrList: *byte, flags: i32, attribute: int, value: *byte, size: int,
+  prevValue: *byte, returnSize: *byte,
+): i32
+// Documented VOID (processthreadsapi.h); declared `i32`-returning like every
+// other extern in this file family (SPEC §11.7 requires a scalar or `void`
+// result) and its return discarded at every call site — reading an unused
+// register costs nothing and the ABI still matches for a caller that ignores it.
+extern fn DeleteProcThreadAttributeList(attrList: *byte): i32
+
+// ---------------------------------------------------------------------------
+// Struct layouts and flags (processthreadsapi.h/winbase.h/namedpipeapi.h) —
+// offsets verified against Microsoft's own documented field order, matching
+// ./osrun.bit's own comment's standard for this project.
+// ---------------------------------------------------------------------------
+
+// SECURITY_ATTRIBUTES: nLength(DWORD)@0, pad@4, lpSecurityDescriptor(PVOID)@8,
+// bInheritHandle(BOOL)@16, pad@20. Total 24 bytes.
+const winCapSecAttrBytes: int = 24
+
+// STARTUPINFOEXW: STARTUPINFOW (./osrun.bit's `winStartupInfoBytes`, 104
+// bytes) followed by lpAttributeList(PVOID)@104. Total 112 bytes.
+const winCapStartupInfoExBytes: int = 112
+
+// Fixed budget for `InitializeProcThreadAttributeList`'s opaque buffer, for
+// ONE attribute (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) — the documented size
+// for a single attribute is well under this on every observed Windows
+// release; the query call below still verifies it at runtime and this
+// primitive REJECTS (spawn failure) rather than overflow if a future release
+// ever needs more, the same "reject, never truncate" rule this file family
+// applies everywhere else.
+const winCapAttrListBytes: int = 256
+
+// Two HANDLEs (the stdout and stderr pipe write ends), the
+// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` value array.
+const winCapHandleListBytes: int = 16
+
+// STARTF_USESTDHANDLES (winbase.h STARTUPINFOW.dwFlags).
+const winCapUseStdHandles: int = 256 // 0x00000100
+// EXTENDED_STARTUPINFO_PRESENT (winbase.h CreateProcess dwCreationFlags).
+const winCapExtendedStartupInfoPresent: int = 524288 // 0x00080000
+// HANDLE_FLAG_INHERIT (winbase.h SetHandleInformation dwMask/dwFlags).
+const winCapHandleFlagInherit: int = 1
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(
+//   ProcThreadAttributeHandleList=2, Thread=FALSE, Input=TRUE, Additive=FALSE)
+// = PROC_THREAD_ATTRIBUTE_INPUT(0x00020000) | 2. processthreadsapi.h.
+const winCapAttributeHandleList: int = 131074 // 0x00020002
+
+// `winCapPipeStrideBytes` (./osruncap.bit) is the per-slot BYTE stride for
+// `winCapPipeBuf` below — declared there, since only that file's
+// `winCapOpenPipesAndAttr` indexes into it; the two functions in THIS file
+// that touch the buffer (`winCapMakePipe`) take an already-computed
+// `outAddr` instead.
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch (#3274-style, matching ./osrun.bit's own per-worker
+// buffers): `osScratchSlots` (32) + 1 fallback slot. None of these hold GC
+// references (raw handles, DWORDs, struct bytes), so per-worker (rather than
+// per-task) storage is correct here — unlike ./osruncap.bit's own captured
+// STRINGS, which live in the per-task scheduler scratch instead (see that
+// file's header).
+// ---------------------------------------------------------------------------
+
+let winCapSecAttrBuf: [99]i64        // 33 * (24/8 = 3)
+let winCapStartupInfoExBuf: [462]i64 // 33 * (112/8 = 14)
+let winCapAttrListBuf: [1056]i64     // 33 * (256/8 = 32)
+let winCapHandleListBuf: [66]i64     // 33 * (16/8 = 2)
+let winCapPipeBuf: [132]i64          // 33 * 4 -- hReadOut, hWriteOut, hReadErr, hWriteErr
+let winCapSizeScratch: [33]i64       // one SIZE_T per slot
+
+// ---------------------------------------------------------------------------
+// Pipe + STARTUPINFOEX + attribute-list setup
+// ---------------------------------------------------------------------------
+
+// One anonymous pipe, write end inheritable (via `secAttrsAddr`), read end
+// explicitly marked non-inheritable — the second line of defense
+// ./osruncap.bit's header describes. Writes `hRead` to `outAddr`, `hWrite`
+// to `outAddr + 8` (the exact layout `CreatePipe`'s own two out-params
+// need, so no extra copy is needed). Returns whether the pipe was created —
+// no tuple: `--freestanding` (ABI.md §1.1) boxes a multi-value `return` on
+// the managed heap, which this module cannot use, so every multi-result
+// helper in this file family writes into scratch and returns a single
+// scalar instead.
+@nosplit fn winCapMakePipe(secAttrsAddr: int, outAddr: int): bool {
+  let ok = CreatePipe(hAt(outAddr), hAt(outAddr + 8), hAt(secAttrsAddr), i32(0))
+  if (int(ok) == 0) {
+    return false
+  }
+  let hRead = loadWord(outAddr)
+  let _ = SetHandleInformation(hAt(hRead), i32(winCapHandleFlagInherit), i32(0))
+  return true
+}
+
+// Fills `secAttrsAddr` with a `bInheritHandle = TRUE` SECURITY_ATTRIBUTES,
+// required for `CreatePipe` to hand back an inheritable write end at all
+// (see ./osruncap.bit's header for why inheriting it at all is safe here:
+// the attribute list below is what actually narrows inheritance to just the
+// two write ends).
+@nosplit fn winCapFillSecAttrs(secAttrsAddr: int) {
+  winZeroBytes(secAttrsAddr, winCapSecAttrBytes)
+  storeWord(secAttrsAddr, winCapSecAttrBytes)
+  storeWord(secAttrsAddr + 16, 1)
+}
+
+// Builds the `PROC_THREAD_ATTRIBUTE_LIST` restricting inheritance to exactly
+// `hWriteOut`/`hWriteErr` (./osruncap.bit's header's race fix). Returns the
+// attribute list's address, or `0` if the queried size does not fit
+// `winCapAttrListBytes` or either API call fails — REJECTED, matching this
+// file family's "reject, never overflow" rule.
+@nosplit fn winCapBuildAttrList(slot: int, hWriteOut: int, hWriteErr: int): int {
+  let sizeAddr = ptrOf(winCapSizeScratch) + slot
+  let nilAttrList: *byte = nil
+  let _ = InitializeProcThreadAttributeList(nilAttrList, i32(1), i32(0), sizeAddr)
+  let needed = int(atomicLoad(sizeAddr))
+  if (needed <= 0 || needed > winCapAttrListBytes) {
+    return 0
+  }
+  let attrList = int(ptrOf(winCapAttrListBuf)) + slot * winCapAttrListBytes
+  let ok = InitializeProcThreadAttributeList(hAt(attrList), i32(1), i32(0), sizeAddr)
+  if (int(ok) == 0) {
+    return 0
+  }
+  let handleList = int(ptrOf(winCapHandleListBuf)) + slot * winCapHandleListBytes
+  storeWord(handleList, hWriteOut)
+  storeWord(handleList + 8, hWriteErr)
+  let nilPrev: *byte = nil
+  let nilRet: *byte = nil
+  let uok = UpdateProcThreadAttribute(
+    hAt(attrList), i32(0), winCapAttributeHandleList, hAt(handleList),
+    winCapHandleListBytes, nilPrev, nilRet,
+  )
+  if (int(uok) == 0) {
+    let _ = DeleteProcThreadAttributeList(hAt(attrList))
+    return 0
+  }
+  return attrList
+}
+
+// Builds the STARTUPINFOEXW at this worker's slot: `cb` = the EX struct's own
+// size (Microsoft's own STARTUPINFOEX samples set `cb` to `sizeof(STARTUPINFOEX)`,
+// not the plain `STARTUPINFO` size, once `EXTENDED_STARTUPINFO_PRESENT` is in
+// play), `dwFlags` = `STARTF_USESTDHANDLES`, `hStdOutput`/`hStdError` = the
+// two pipe write ends, `hStdInput` left `0` (NULL — this primitive captures
+// output only; a child reading its own stdin sees an invalid handle, the
+// same degradation Windows documents for a `0` std-handle override), and
+// `lpAttributeList` = `attrList`. Returns the STARTUPINFOEXW's own address
+// (identical to its embedded STARTUPINFOW's, so it is also what
+// `CreateProcessW`'s `lpStartupInfo` parameter takes directly).
+@nosplit fn winCapBuildStartupInfoEx(
+  slot: int,
+  hWriteOut: int,
+  hWriteErr: int,
+  attrList: int,
+): int {
+  let si = int(ptrOf(winCapStartupInfoExBuf)) + slot * winCapStartupInfoExBytes
+  winZeroBytes(si, winCapStartupInfoExBytes)
+  storeWord(si, winCapStartupInfoExBytes)
+  // `dwFlags`@60 is NOT 8-byte aligned (60 mod 8 == 4) — unlike every other
+  // field this function sets, all of which sit on an 8-byte boundary. A
+  // `storeWord` here would span bytes 60-67, straddling the 64-byte-aligned
+  // boundary at 64 that also covers `wShowWindow`/`cbReserved2`; written
+  // byte-by-byte instead so this write can never depend on whatever
+  // alignment guarantee `storeWord` does or does not make.
+  storeByte(si + 60, winCapUseStdHandles & 255)
+  storeByte(si + 61, (winCapUseStdHandles >> 8) & 255)
+  storeByte(si + 62, (winCapUseStdHandles >> 16) & 255)
+  storeByte(si + 63, (winCapUseStdHandles >> 24) & 255)
+  storeWord(si + 88, hWriteOut)
+  storeWord(si + 96, hWriteErr)
+  storeWord(si + 104, attrList)
+  return si
+}
