@@ -1,0 +1,116 @@
+// `bit run _tests_/bit/openbeneath` (#5793): the parent-swap race
+// `openBeneath` (stdlib/fs/secure/secure.bit) exists to close. A `spawn`ed
+// green thread flips `<root>/a` between a real directory and a symlink to
+// `<root>/outside`'s sibling, `<scratch>/outside` — content
+// `OUTSIDE-LEAK`, never written under `root` — in a tight rename loop
+// exactly the shape the #5787 skeptic's original probe used (four plain
+// `rename`s per cycle: swap `a` out to `R`, swap the pre-made symlink `L`
+// in as `a`, swap `a` back out to `L`, swap `R` back in as `a`), while the
+// main thread calls `openBeneath(root, "a/target.txt")` in a tight loop.
+// `iterations` opens later: `LEAKED-OUTSIDE` must be 0 — a single non-zero
+// read of `OUTSIDE-LEAK` through `openBeneath` is the race #5787 found,
+// reproduced against the OLD lstat-then-open code as `race.log`'s
+// `LEAKED-OUTSIDE=3` of 400000 (`#5787`'s ticket).
+//
+// RUN WITH `BIT_WORKERS=4` (or higher): the default worker pool starts at
+// ONE OS thread and grows lazily (runtime/ABI.md §9), so `main` and the
+// `spawn`ed `swapLoop` run cooperatively on the SAME thread by default —
+// never truly interleaved, so the race never fires either way. Proved on
+// this ticket by mutating `rtFsOpenBeneathW` (runtime/root/darwin/
+// fsbeneath.bit) to drop `O_NOFOLLOW_ANY`: under `BIT_WORKERS=1` (the
+// default) LEAKED-OUTSIDE stayed 0 even with the guard removed (the race
+// was never exercised); under `BIT_WORKERS=4` the SAME mutation leaked
+// 61079 of 400000, and the restored guard is back to 0 of 400000 with
+// `refused` in the hundreds of thousands — the race is genuinely hit only
+// once real concurrency exists.
+import { mkdir, writeFile, rename } from "std/fs"
+import { openBeneath } from "std/fs/secure"
+import { run, envOr, exit } from "std/os"
+
+const iterations: int = 400000
+
+fn mustMkdir(path: string) {
+  mkdir(path) catch e {
+    panic("openbeneath race: mkdir ${path}: ${e.message()}")
+  }
+}
+
+fn mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    panic("openbeneath race: write ${path}: ${e.message()}")
+  }
+}
+
+fn mustLink(target: string, link: string) {
+  let rc = run("/bin/ln", ["-s", target, link])
+  if (rc != 0) {
+    panic("openbeneath race: /bin/ln -s ${target} ${link} exited ${rc}")
+  }
+}
+
+fn mv(x: string, y: string): bool {
+  rename(x, y) catch _ {
+    return false
+  }
+  return true
+}
+
+// The swapper: renames carry no result the main loop needs, only the
+// `done` signal once `iterations` cycles have run.
+fn swapLoop(root: string, iters: int, done: chan<int>) {
+  let n = 0
+  while (n < iters) {
+    let _ = mv("${root}/a", "${root}/R")
+    let _ = mv("${root}/L", "${root}/a")
+    let _ = mv("${root}/a", "${root}/L")
+    let _ = mv("${root}/R", "${root}/a")
+    n = n + 1
+  }
+  done <- 1
+}
+
+fn main() {
+  let dir = "${envOr("TMPDIR", "/tmp")}/t5793-race-${timeUnixNs()}"
+  mustMkdir(dir)
+  let root = "${dir}/root"
+  mustMkdir(root)
+  mustMkdir("${root}/a")
+  mustWrite("${root}/a/target.txt", "INSIDE")
+  let outside = "${dir}/outside"
+  mustMkdir(outside)
+  mustWrite("${outside}/target.txt", "OUTSIDE-LEAK")
+  mustLink(outside, "${root}/L")
+
+  let done = chan<int>()
+  spawn swapLoop(root, iterations, done)
+
+  let served = 0
+  let leaked = 0
+  let refused = 0
+  let n = 0
+  while (n < iterations) {
+    let f = openBeneath(root, "a/target.txt") catch _ {
+      refused = refused + 1
+      n = n + 1
+      continue
+    }
+    let body = f.readAll() catch _ {
+      ""
+    }
+    f.close()
+    if (body == "OUTSIDE-LEAK") {
+      leaked = leaked + 1
+    } else {
+      served = served + 1
+    }
+    n = n + 1
+  }
+  let _ = <- done
+
+  print("requests=${iterations} served-inside=${served} LEAKED-OUTSIDE=${leaked} refused=${refused}\n")
+  if (leaked != 0) {
+    print("FAIL: openBeneath leaked ${leaked} outside read(s) of ${iterations} requests\n")
+    exit(1)
+  }
+  print("ok   openbeneath-race\n")
+}

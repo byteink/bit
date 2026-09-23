@@ -1,0 +1,237 @@
+// `bit_rt_fs_open_beneath_w`/`bit_rt_fs_fstat_w` (ABI.md §14 addendum, #5793):
+// close the TOCTOU #5787 found through pkg/web's static file server — it
+// validates every path component with `lstat` and then opens by path, so a
+// parent directory swapped for a symlink to outside the served root between
+// the check and the open is followed. `../fs.bit`'s `rtFsOpenNoFollowW`
+// (#4720) only refuses a symlink in the FINAL component; every ancestor is
+// still an unguarded lookup.
+//
+// Sibling file to ../fs.bit rather than added there for the same reason
+// ../darwin/fsbeneath.bit's header states: these two symbols are wired to
+// Bit through "std/fs/secure", NOT "std/fs" itself, which compiler/ and
+// tools/build import and which the pinned 0.24.0 stage0's libbitrt cannot
+// link against until a release repins.
+//
+// `root` AND `rel` ARRIVE SEPARATELY, NOT PRE-JOINED, the same reason
+// ../darwin/fsbeneath.bit gives: `root` is opened normally, following its
+// own symlinks (a real static-file root is routinely reached through one —
+// this machine's own `$TMPDIR` on Darwin, `/tmp` in some container setups
+// on Linux); only `rel`'s resolution against `root`'s dirfd is walked with
+// `O_NOFOLLOW` refusing every component.
+//
+// UNCONDITIONAL PER-COMPONENT `openat` WALK OF `rel`, not `openat2`/
+// `RESOLVE_BENEATH` with an `ENOSYS` fallback: opening each component
+// against the fd the PREVIOUS component's own open just returned (rather
+// than re-resolving the remaining suffix from `root` every time) is exactly
+// as race-free as `openat2`'s single syscall — a parent renamed or swapped
+// for a symlink after this walk has already opened it by fd can no longer
+// change what that fd names — just more syscalls per open. Deferred the
+// single-syscall `openat2` fast path as a follow-up perf ticket rather than
+// spending this one's budget on the kernel `struct open_how` marshaling;
+// this walk already meets the race and containment acceptance on kernels
+// with no `openat2` at all (< 5.6), which an `openat2`-only implementation
+// would not.
+//
+// `atFdCwd`, `wordsPathZ`, `isX64`, `sysClose`, `sysFstat`, `sysOpen`,
+// `fsStatBuf`, `fsScratchSlot`, `fsStatSlotWords`, `statSizeOff`,
+// `statMtimeSecOff`, `statModeOffX64`, `statModeOffArm64`, `sIfmt`,
+// `sIfdir`, `loadWord`, `storeWord`, `loadByte`, `storeByte`, `permFile`,
+// `permDir` are NOT imported here: ../fs.bit and ../fsrw.bit, siblings in
+// this same module, already declare/import every one of them, and Bit's
+// imports and top-level declarations are module-scoped — a second import
+// or a redeclaration here would be E0042.
+import { sysOpenatX64 } from "../../syscalls"
+
+// `O_DIRECTORY`: NOT the shared `asm-generic/fcntl.h` bit the header comment
+// here first assumed — an ACTUAL divergence, same as `O_NOFOLLOW`
+// (../fs.bit's `oNoFollowX64`/`oNoFollowArm64`) has, just not documented
+// anywhere this file's author could find by memory. Measured with a throwaway
+// C probe (`openat(AT_FDCWD, dir, O_DIRECTORY|O_RDONLY)`, printing the
+// macro) built and run via `gcc:latest --platform linux/{amd64,arm64}`,
+// NOT transcribed from a header: x86-64 `0o200000` = 65536
+// (`asm-generic/fcntl.h`'s value, which glibc/musl on x86-64 use directly),
+// aarch64 `0o040000` = 16384 (ARM's own `bits/fcntl-linux.h` numbering,
+// same file `arch/arm64/include/uapi/asm/fcntl.h` gives `O_NOFOLLOW`). The
+// FIRST version of this constant used 65536 on both arches and made every
+// `openBeneath` call on aarch64-linux fail `EINVAL` on the root open alone
+// — caught by this ticket's own race-test run in the `bit-linux-gate`
+// docker image, not by review.
+const oDirectoryX64: int = 65536  // 0o200000
+const oDirectoryArm64: int = 16384 // 0o040000
+
+@nosplit fn oDirectoryVal(): int {
+  if (isX64()) {
+    return oDirectoryX64
+  }
+  return oDirectoryArm64
+}
+
+// `openat(dirfd, pathPtr, flags)`, permissions defaulting to `permFile`
+// (irrelevant without `O_CREAT`, which this walk never sets). Raw syscall
+// return: the new fd, or `-errno`.
+@nosplit fn sysOpenAt(dirfd: int, pathPtr: int, flags: int): int {
+  if (isX64()) {
+    return int(syscall(sysOpenatX64(), i64(dirfd), i64(pathPtr), i64(flags), i64(permFile)))
+  }
+  return int(syscall(sysOpenatArm64(), i64(dirfd), i64(pathPtr), i64(flags), i64(permFile)))
+}
+
+// The per-arch `O_NOFOLLOW` value ../fs.bit's `sysOpen` mode 4 already picks
+// the same way.
+@nosplit fn oNoFollowVal(): int {
+  if (isX64()) {
+    return oNoFollowX64
+  }
+  return oNoFollowArm64
+}
+
+// Whether the open fd `fd` names a directory — `fstat(2)`, not `O_DIRECTORY`
+// on the leaf open itself: a bare `openat` with no `O_DIRECTORY` on a
+// directory SUCCEEDS on Linux (../fs.bit's header, `#2149`), so this is the
+// same after-the-fact guard `rtFsOpen`/`rtFsOpenNoFollowW` apply there via
+// `isDirAtP`, applied here to an fd instead of a path.
+@nosplit fn fdIsDir(fd: int): bool {
+  let slotBase = int(ptrOf(fsStatBuf)) + fsScratchSlot() * fsStatSlotWords * 8
+  if (int(syscall(sysFstat(), i64(fd), i64(slotBase))) < 0) {
+    return false
+  }
+  let modeOff = statModeOffX64
+  if (!isX64()) {
+    modeOff = statModeOffArm64
+  }
+  let mode = loadWord(slotBase + modeOff) & 4294967295
+  return (mode & sIfmt) == sIfdir
+}
+
+// Whether the NUL-terminated C path `p` (`n` bytes, not counting the NUL)
+// contains a bare `..` COMPONENT anywhere. The `O_NOFOLLOW` walk below
+// refuses a symlink in `rel`'s resolution, but `..` is an ordinary
+// directory entry, never a symlink — it resolves straight through and
+// would climb out of `root` with no symlink involved at all. This is the
+// runtime's OWN containment check, independent of `stdlib/fs/secure/
+// secure.bit`'s lexical `std/path.contains` call: a security primitive
+// does not get to assume every future caller remembers to run that check
+// first. BOUNDED (Power of 10 rule 2): by `n`, `p`'s own length.
+@nosplit fn hasDotDotComponent(p: int, n: int): bool {
+  let i = 0
+  let start = 0
+  while (i <= n) {
+    if (i == n || loadByte(p + i) == 47) {
+      let clen = i - start
+      if (clen == 2 && loadByte(p + start) == 46 && loadByte(p + start + 1) == 46) {
+        return true
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Walk the NUL-terminated, RELATIVE C path `rel` (`n` bytes) against the
+// already-open directory fd `rootFd` one component at a time,
+// `O_NOFOLLOW`ing and (for every component but the last) `O_DIRECTORY`ing
+// each — opening a component against the fd the PREVIOUS component's own
+// open just returned, rather than re-resolving the remaining suffix from
+// `rootFd` each time, is what makes this race-free. `rel` is `wordsPathZ`'s
+// per-worker scratch copy, so temporarily overwriting its `/` bytes to
+// isolate one component at a time is safe — no other call reads this slot
+// until this one returns. BOUNDED (Power of 10 rule 2): by `n`. fd, or -1
+// for any open failure or a directory result. Always closes `rootFd`.
+@nosplit fn openBeneathWalk(rootFd: int, rel: int, n: int): int {
+  let curFd = rootFd
+  let i = 0
+  while (i < n) {
+    let start = i
+    while (i < n && loadByte(rel + i) != 47) {
+      i = i + 1
+    }
+    let isLast = i >= n
+    let saved = loadByte(rel + i)
+    if (i < n) {
+      storeByte(rel + i, 0)
+    }
+    let flags = oNoFollowVal()
+    if (!isLast) {
+      flags = flags | oDirectoryVal()
+    }
+    let nextFd = sysOpenAt(curFd, rel + start, flags)
+    if (i < n) {
+      storeByte(rel + i, saved)
+    }
+    syscall(sysClose(), i64(curFd))
+    if (nextFd < 0) {
+      return 0 - 1
+    }
+    curFd = nextFd
+    i = i + 1
+  }
+  if (fdIsDir(curFd)) {
+    syscall(sysClose(), i64(curFd))
+    return 0 - 1
+  }
+  return curFd
+}
+
+// `bit_rt_fs_open_beneath_w`: open `root` (the `rootN`-byte packed path at
+// `rootWords`, following its own symlinks, via ../fs.bit's `sysOpen`-style
+// `O_DIRECTORY` open) then walk `rel` (the `relN`-byte packed path at
+// `relWords`) against it, refusing a symlink or a `..` in any component
+// (`openBeneathWalk`/`hasDotDotComponent` above). The caller —
+// `stdlib/fs/secure/secure.bit`'s `openBeneath` — has already run
+// `std/path`'s `join`+`contains` on `root`/`rel` to refuse a lexical `..`
+// escape before this call reaches the kernel at all; `hasDotDotComponent`
+// is this primitive's own second, independent check.
+export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
+  rootWords: int, rootN: int, relWords: int, relN: int,
+): int {
+  let rootP = wordsPathZ(rootWords, rootN)
+  if (rootP == 0) {
+    return 0 - 1
+  }
+  let rootFd = sysOpenAt(atFdCwd, rootP, oDirectoryVal())
+  if (rootFd < 0) {
+    return 0 - 1
+  }
+  // `wordsPathZ` reuses ONE per-worker scratch slot -- `rootP`'s bytes are
+  // already consumed by `sysOpenAt` above, so computing `relP` into the
+  // same slot next is safe reuse, not a clobber.
+  let relP = wordsPathZ(relWords, relN)
+  if (relP == 0 || loadByte(relP) == 47 || hasDotDotComponent(relP, relN)) {
+    syscall(sysClose(), i64(rootFd))
+    return 0 - 1
+  }
+  let rc = openBeneathWalk(rootFd, relP, relN)
+  if (rc < 0) {
+    return 0 - 1
+  }
+  return rc
+}
+
+// `bit_rt_fs_fstat_w`: `fd`'s metadata via `fstat(2)` — the same 5-word
+// `out` shape ../fs.bit's `fillStat` fills from a path (size, mtime, mode,
+// isDir, isSymlink), read from the already-open handle so a caller never
+// re-resolves a name that could have moved since `open` returned.
+// `isSymlink` is always `false`: `fstat` on an fd reports the target a
+// followed fd already is. 0 on success, -1 on failure.
+export @nosplit @symbol("bit_rt_fs_fstat_w") fn rtFsFstatW(fd: int, out: int): int {
+  let slotBase = int(ptrOf(fsStatBuf)) + fsScratchSlot() * fsStatSlotWords * 8
+  if (int(syscall(sysFstat(), i64(fd), i64(slotBase))) < 0) {
+    return 0 - 1
+  }
+  let modeOff = statModeOffX64
+  if (!isX64()) {
+    modeOff = statModeOffArm64
+  }
+  let mode = loadWord(slotBase + modeOff) & 4294967295
+  storeWord(out, loadWord(slotBase + statSizeOff))
+  storeWord(out + 8, loadWord(slotBase + statMtimeSecOff))
+  storeWord(out + 16, mode & 4095)
+  let isDir = 0
+  if ((mode & sIfmt) == sIfdir) {
+    isDir = 1
+  }
+  storeWord(out + 24, isDir)
+  storeWord(out + 32, 0)
+  return 0
+}
