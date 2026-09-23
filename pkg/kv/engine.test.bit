@@ -8,7 +8,8 @@
 // below, which corrupts real on-disk bytes and checks `open`'s behavior
 // changes, not just that some internal comparison runs.
 
-import { envOr } from "std/os"
+import { envOr, run } from "std/os"
+import { remove } from "std/fs"
 
 // Nonce'd per call (bitlang-ws/CLAUDE.md: `$TMPDIR` is shared by every
 // concurrent agent, and a fixed name is the bug this rule exists for).
@@ -184,4 +185,122 @@ test "testpanic_writePage rejects a buffer that is not exactly pageSize" {
   eng.writePage(5, []byte(10)) catch e {
     panic("writePage failed instead of panicking: ${e.message()}")
   }
+}
+
+// --- #5797: create is atomic (O_CREAT|O_EXCL|O_NOFOLLOW), not exists-then-open ---
+
+// `create`, with success/failure collapsed to a `bool` — the race test below
+// only needs "did I win", and closes the handle itself on a win so it never
+// leaks one across 500 iterations.
+fn tryCreate(path: string): bool {
+  let eng = create(path) catch _ {
+    return false
+  }
+  eng.close()
+  return true
+}
+
+// Reaches the `ready` rendezvous, then blocks on `go` before racing `create`
+// — proves the OTHER spawned task has ALSO already reached the rendezvous
+// (the test body below only releases `go` after receiving from `ready`
+// twice), so both tasks are genuinely live and about to call `create` at
+// the same time, not accidentally serialized by the scheduler.
+fn raceCreate(path: string, ready: chan<int>, go: chan<int>, done: chan<bool>) {
+  ready <- 1
+  let start = <- go
+  if (start != 1) {
+    panic("raceCreate: bad go signal ${start}")
+  }
+  done <- tryCreate(path)
+}
+
+// #5787's audit: main's `create` checked `exists(path)` then opened without
+// `O_EXCL` — two concurrent creates on one path both succeeded 1997 and 1998
+// times out of 2000. Two `spawn`ed tasks race `create` on the SAME path,
+// `iterations` times; the single `O_CREAT|O_EXCL|O_NOFOLLOW` syscall this
+// ticket adds must let exactly one win every time.
+//
+// RUN WITH BIT_WORKERS=4 (`_tests_/bit/openbeneath/openbeneath.bit`'s own
+// header explains why): the default worker pool starts at ONE OS thread and
+// grows lazily, so two spawned tasks run cooperatively on that one thread by
+// default — never truly concurrent, so a TOCTOU window between two Bit-level
+// green threads would never actually open either. The `ready`/`go`
+// rendezvous above is the second, in-test half of that same proof: it is
+// not enough for `BIT_WORKERS` to be set, both tasks must be OBSERVED to
+// have reached the starting line before either attempts `create`.
+test "concurrent create on one path over N iterations: exactly one winner every time, both racers ran" {
+  let iterations = 500
+  let i = 0
+  let totalWinners = 0
+  while (i < iterations) {
+    let path = scratchPath("race-${i}")
+    let ready = chan<int>(2)
+    let go = chan<int>(2)
+    let done = chan<bool>(2)
+    spawn raceCreate(path, ready, go, done)
+    spawn raceCreate(path, ready, go, done)
+    let readyA = <- ready
+    let readyB = <- ready
+    assert(
+      readyA == 1 && readyB == 1,
+      "iteration ${i}: both racer tasks must reach the rendezvous before either calls create",
+    )
+    go <- 1
+    go <- 1
+    let r1 = <- done
+    let r2 = <- done
+    let winners = 0
+    if (r1) {
+      winners = winners + 1
+    }
+    if (r2) {
+      winners = winners + 1
+    }
+    assert(
+      winners == 1,
+      "iteration ${i}: expected exactly 1 winner of 2 concurrent creates on ${path}, got ${winners} (r1=${r1} r2=${r2})",
+    )
+    totalWinners = totalWinners + winners
+    // A plain `remove`, not `kvTestTeardown`: every iteration's leftover is
+    // exactly one file (the winner's), never a directory, and this loop
+    // runs hundreds of times per test — `kvTestTeardown`'s own `#!/bin/sh`
+    // subprocess per call is the right tool for a handful of directory
+    // teardowns elsewhere in this suite, not this tight a loop.
+    remove(path) catch _ {}
+    i = i + 1
+  }
+  assert(
+    totalWinners == iterations,
+    "expected exactly ${iterations} total winners across ${iterations} iterations (one per path), got ${totalWinners}",
+  )
+}
+
+// #5787's audit: `create` checked `exists(path)` then opened without
+// `O_NOFOLLOW`. `exists` follows a symlink, so it only ever catches a LIVE
+// one by accident — a DANGLING symlink (its target absent) reads as "does
+// not exist" to `exists` (the underlying open fails ENOENT the same as a
+// genuinely missing path), so `create` proceeded straight into
+// `openReadWrite`, which itself follows the link and `O_CREAT`s a brand
+// new file at wherever the symlink points: a database file planted at an
+// attacker-chosen destination, entirely bypassing the caller's own
+// `path`. `create` must now refuse outright (`O_NOFOLLOW`) and leave that
+// destination untouched. Deterministic and single-shot, not a race: the
+// gap is in what `exists` can observe about a dangling link at all, not a
+// window between two calls.
+test "create refuses a pre-planted dangling symlink at the target path; nothing is planted at its destination" {
+  let victim = scratchPath("victim") // never written — must stay absent throughout
+  let target = scratchPath("symlink-target")
+  let rc = run("/bin/ln", ["-s", victim, target])
+  if (rc != 0) {
+    panic("/bin/ln -s ${victim} ${target} exited ${rc}")
+  }
+  assert(
+    !tryCreate(target),
+    "create must refuse when ${target} is a pre-planted symlink to ${victim}",
+  )
+  assert(
+    !exists(victim),
+    "create must not plant a database file at ${victim}, the dangling symlink's destination",
+  )
+  kvTestTeardown(target)
 }
