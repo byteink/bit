@@ -245,8 +245,17 @@ echo "release.sh: SBOM dependencies resolved"
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos x86_64-windows)
 
 # Bootstraps bit1 off the pinned stage0, falling back to the two-pass
-# BIT_STAGE0_BIN bootstrap on a runtime ABI transition (dist/abitwopass-run.sh, #4197).
-PASS1_BASE="$(bash dist/abitwopass-run.sh)"
+# BIT_STAGE0_BIN bootstrap on a runtime ABI or stdlib syntax transition
+# (dist/abitwopass-run.sh, #4197/#5752). PASS1_DIR_FILE is the second signal
+# (#5753): abitwopass-run.sh's own stdout stays exactly one line (PASS1_BASE)
+# by design, and it runs inside this `$(...)` subshell, so anything it set in
+# its OWN environment would vanish the moment it exits -- a file the caller
+# names is the only channel that survives to tell NOTES.md/the SBOM below
+# which directory (runtime|stdlib) actually triggered the two-pass build.
+PASS1_DIR_FILE="$(mktemp)"
+PASS1_BASE="$(PASS1_DIR_FILE="${PASS1_DIR_FILE}" bash dist/abitwopass-run.sh)"
+PASS1_DIR="$(cat "${PASS1_DIR_FILE}")"
+rm -f "${PASS1_DIR_FILE}"
 
 echo "release.sh: resolving the pinned stage0"
 # Downloads + digest-verifies against dist/stage0/SHA256SUMS; refuses on failure.
@@ -602,7 +611,7 @@ echo "release.sh: x86_64-windows smoke ok on real hardware (${WINDOWS_HOST})"
 # are already proven by the time we get here, so only the actual generation,
 # whose output path depends on ${OUT}, happens at this site.
 echo "release.sh: generating SBOM"
-"${SBOM_VENV}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" "${PASS1_BASE}" \
+"${SBOM_VENV}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" "${PASS1_BASE}" "${PASS1_DIR}" \
 	> "${OUT}/bit-${VERSION}.cdx.json"
 rm -rf "${SBOM_VENV}"
 echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
@@ -619,9 +628,23 @@ if [ "${RESUME_NOTES}" -eq 0 ]; then
 		echo "release.sh: changelog.sh failed; writing a minimal note" >&2
 		printf '# Bit %s\n' "${VERSION}" > "${OUT}/NOTES.md"
 	}
-	# #4197: record the extra bootstrap link; skipped on an ordinary release.
-	[ -n "${PASS1_BASE}" ] && printf '%s\n\n## Build provenance\n\nRooted at stage0 v%s via the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, "Landing a runtime ABI change"), pass-1 base %s.\n\n%s\n' \
-		"$(head -n1 "${OUT}/NOTES.md")" "${STAGE0_VERSION}" "${PASS1_BASE}" "$(tail -n +2 "${OUT}/NOTES.md")" > "${OUT}/NOTES.md"
+	# #4197/#5752: record the extra bootstrap link; skipped on an ordinary
+	# release. #5753: the docs/development.md section named depends on
+	# PASS1_DIR -- a stdlib syntax transition took the OTHER documented
+	# two-pass path, and naming the runtime ABI one regardless would be a
+	# false statement in a published artifact.
+	if [ -n "${PASS1_BASE}" ]; then
+		case "${PASS1_DIR}" in
+		runtime) PASS1_SECTION='Landing a runtime ABI change' ;;
+		stdlib) PASS1_SECTION='Landing a syntax change that `stdlib/**` then uses' ;;
+		*)
+			echo "release.sh: internal error: PASS1_BASE=${PASS1_BASE} set but PASS1_DIR='${PASS1_DIR}' is neither runtime nor stdlib" >&2
+			exit 1
+			;;
+		esac
+		printf '%s\n\n## Build provenance\n\nRooted at stage0 v%s via the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, "%s"), pass-1 base %s.\n\n%s\n' \
+			"$(head -n1 "${OUT}/NOTES.md")" "${STAGE0_VERSION}" "${PASS1_SECTION}" "${PASS1_BASE}" "$(tail -n +2 "${OUT}/NOTES.md")" > "${OUT}/NOTES.md"
+	fi
 else
 	# Publishes a NOTES.md that was edited by hand (#4124): reuse it AS-IS,
 	# never regenerate it - regenerating is exactly what clobbered the

@@ -86,12 +86,33 @@ def main() -> int:
             check=True,
         )
         out2 = subprocess.run(
-            [python2, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.1.4", "deadbeef1234"],
+            [python2, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.1.4", "deadbeef1234", "runtime"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout
         doc2 = json.loads(out2)
+
+        # #5753: a stdlib syntax transition's pass1-base-commit is a DIFFERENT
+        # directory than a runtime ABI one's -- the SBOM must say which
+        # rather than always describing runtime/**.
+        out3 = subprocess.run(
+            [python2, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.1.4", "cafef00d5678", "stdlib"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        doc3 = json.loads(out3)
+
+        # #5753: <pass1-dir> is required once <pass1-base-commit> is given --
+        # a missing/invalid one must refuse rather than silently default to
+        # "runtime", which was exactly the bug this test file is guarding
+        # against.
+        bad = subprocess.run(
+            [python2, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.1.4", "deadbeef1234"],
+            capture_output=True,
+            text=True,
+        )
     props2 = {p["name"]: p["value"] for p in doc2["metadata"]["properties"]}
     if props2.get("bit:pass1-base-commit") != "deadbeef1234":
         print(f"FAIL: two-pass SBOM's bit:pass1-base-commit is {props2.get('bit:pass1-base-commit')!r}, want 'deadbeef1234'", file=sys.stderr)
@@ -101,6 +122,27 @@ def main() -> int:
         print("FAIL: two-pass SBOM's stage0 tool description does not name the pass1 base commit", file=sys.stderr)
         return 1
     print("ok: stage0 tool description names the pass1 base commit")
+    if props2.get("bit:pass1-dir") != "runtime":
+        print(f"FAIL: runtime two-pass SBOM's bit:pass1-dir is {props2.get('bit:pass1-dir')!r}, want 'runtime'", file=sys.stderr)
+        return 1
+    if "runtime/**" not in get(doc2, "metadata/tools/components/0/description"):
+        print("FAIL: runtime two-pass SBOM's stage0 tool description does not name runtime/**", file=sys.stderr)
+        return 1
+    print("ok: runtime two-pass SBOM names runtime/** and bit:pass1-dir=runtime")
+
+    props3 = {p["name"]: p["value"] for p in doc3["metadata"]["properties"]}
+    if props3.get("bit:pass1-dir") != "stdlib":
+        print(f"FAIL: stdlib two-pass SBOM's bit:pass1-dir is {props3.get('bit:pass1-dir')!r}, want 'stdlib'", file=sys.stderr)
+        return 1
+    if "stdlib/**" not in get(doc3, "metadata/tools/components/0/description"):
+        print("FAIL: stdlib two-pass SBOM's stage0 tool description does not name stdlib/**", file=sys.stderr)
+        return 1
+    print("ok: stdlib two-pass SBOM names stdlib/** and bit:pass1-dir=stdlib")
+
+    if bad.returncode == 0:
+        print("FAIL: sbom.py exited 0 with a pass1-base-commit but no pass1-dir", file=sys.stderr)
+        return 1
+    print("ok: sbom.py refuses a pass1-base-commit given without a pass1-dir")
 
     print("dist/sbom_test.py: all checks passed")
     return 0
