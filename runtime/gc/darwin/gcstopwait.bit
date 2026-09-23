@@ -1,0 +1,80 @@
+// Darwin's blocking-stop-wait provider (#5750). See ../gcstopwait.bit for why
+// this exists as a paired module and what it replaces on this target.
+//
+// `__ulock_wait`/`__ulock_wake` are PRIVATE libSystem symbols. The full
+// argument for using them anyway — Darwin has no futex, every public
+// alternative is the wrong shape, and this is what Apple's own libc++,
+// libdispatch and Swift runtime park on — is made once in
+// `../../park/darwin/wait.bit`, whose declarations these match field for field
+// and whose values `_tests_/stress/park` checks against the real kernel rather
+// than trusting. `compiler/machosyms.bit`'s `libsystemSymbols` already admits
+// both names (verified there against a live `dlsym(RTLD_DEFAULT, ...)`), so
+// this half of the port needed no compiler-side change either.
+//
+// int __ulock_wait(uint32_t operation, void *addr, uint64_t value,
+//                  uint32_t timeout_us);
+// int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+//
+// Only C-representable types cross the boundary (§11.7), so the address of the
+// stop word travels as a `*u8`.
+extern fn __ulock_wait(op: u32, addr: *u8, value: u64, timeout_us: u32): i32
+extern fn __ulock_wake(op: u32, addr: *u8, wake_value: u64): i32
+
+// UL_COMPARE_AND_WAIT (1) — the operation whose semantics match futex's
+// compare-and-sleep — OR'd with ULF_NO_ERRNO (0x01000000), which makes the call
+// RETURN the negated errno instead of setting the thread's errno and returning
+// -1. That flag is not a convenience: reading `errno` from Bit would mean
+// reaching into libSystem's thread-local errno slot, which this runtime has no
+// way to address. 1 | 0x01000000 = 16777217.
+@nosplit fn gcUlCompareAndWait(): int { return 16777217 }
+
+// ULF_WAKE_ALL (0x00000100) OR'd into the wake operation: release EVERY waiter,
+// not one. 16777217 | 256 = 16777473. `worldRestart` (../gcworldstop.bit) ends
+// a stop for all seven-odd waiting mutators at once, so waking one and leaving
+// the rest to their timeouts would convert this whole change into a latency
+// regression.
+@nosplit fn gcUlCompareAndWaitAll(): int { return 16777473 }
+
+// Sleep while the i64 word at `p` still holds `expected`. See ../gcstopwait.bit
+// for the contract and for why the result is discarded by every caller.
+//
+// THE WORD IS 64 BITS AND UL_COMPARE_AND_WAIT COMPARES 32. That is safe here,
+// and stated rather than left to be rediscovered: the only Darwin target this
+// compiler ships is aarch64-macos, which is little-endian, so the LOW half of
+// the i64 at `p` lives at `p` itself — and `worldStopWord`'s entire domain is
+// {0, 1} (`../gcworld.bit`), which fits that half. A kernel comparing either
+// width therefore reaches the same verdict on the same bytes. It cannot fail in
+// the dangerous direction either way: a compare that disagrees returns WITHOUT
+// sleeping, which costs one wasted call and never a lost wake.
+//
+// `timeoutUs` of 0 is `__ulock_wait`'s "wait forever"; callers pass a positive
+// bound, so no floor is applied here (unlike `parkWait`, whose caller's
+// shortest legitimate request is sub-microsecond).
+export @nosplit @symbol("bit_rt_port_gc_world_stop_wait") fn gcWorldStopWait(
+  p: *i64,
+  expected: int,
+  timeoutUs: int,
+): int {
+  let base: *u8 = nil
+  let addr = base + int(p)
+  return int(__ulock_wait(u32(gcUlCompareAndWait()), addr, u64(expected), u32(timeoutUs)))
+}
+
+// Wake every waiter on the word at `p`.
+//
+// `__ulock_wake` reports -ENOENT (-2) when no thread was waiting. That is the
+// expected, benign case — the waiter count this is gated on is a HINT that can
+// go stale between the load and this call — so it is normalised to 0 rather
+// than surfaced. Any other negative code is likewise reported as 0 woken: a
+// wake is advisory by construction (every waiter re-checks the stop word), and
+// a `@nosplit` caller inside the collector's restart has nothing it could do
+// differently.
+export @nosplit @symbol("bit_rt_port_gc_world_stop_wake") fn gcWorldStopWake(p: *i64): int {
+  let base: *u8 = nil
+  let addr = base + int(p)
+  let rc = int(__ulock_wake(u32(gcUlCompareAndWaitAll()), addr, u64(0)))
+  if (rc < 0) {
+    return 0
+  }
+  return rc
+}
