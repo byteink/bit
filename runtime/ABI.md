@@ -3712,10 +3712,11 @@ or both streams and then exits normally still reports `>= 0`, with the data
 loss visible only through `_truncated`, never folded into the exit result.
 
 The four symbols are reached only through `extern fn` declarations in
-`stdlib/os/os.bit`, the same way `bit_rt_fs_stat_w` is declared directly in
-`stdlib/fs/fs.bit:429`: no `compiler/checktype.bit`, `compiler/symbols.bit`,
-`compiler/validatecall.bit` or `compiler/lowerprim.bit` entry registers any
-of the four as a compiler builtin.
+`stdlib/process/process.bit`, the same way `bit_rt_fs_stat_w` is declared
+directly in `stdlib/fs/fs.bit:429`: no `compiler/checktype.bit`,
+`compiler/symbols.bit`, `compiler/validatecall.bit` or
+`compiler/lowerprim.bit` entry registers any of the four as a compiler
+builtin.
 
 ---
 
