@@ -18,50 +18,74 @@
 // refuses for every other check here.
 //
 // The deterministic regression for `37f00152` (the fix `#5228`'s stats wiring
-// was built to observe) is structural instead: `worldResumeWhenClear`
-// (`../../../runtime/gc/gcworldstop.bit`) must still call `worldYield()`
-// inside its inner spin, every `stwSpinBurst` checks — `#2415`'s own fix for
-// `worldRendezvous`'s identical spin, extended to this one by `37f00152`
-// because a pure busy-spin here starves the collector thread it is waiting on
-// exactly as a pure busy-spin there starved the mutator `worldRendezvous`
-// waits on. `worldYield()` is a one-statement `@nosplit` wrapper around the
-// extern `bit_rt_port_gc_world_yield`, and it inlines into its callers (same
-// shape as `pollcreatebind.bit`'s `pollCreate`): the relocation this edge
-// checks names the extern directly, not the wrapper. `worldResumeWhenClear`
-// itself survives as its own atom — unlike `worldYield`, it is well over the
-// inliner's size budget (a bounded outer loop around a bounded inner spin) —
-// so its atom bounds the search the same way every `Edge{}` in
-// `stwwiring.bit` bounds its own.
+// was built to observe) is structural instead, and #5750 moved WHICH primitive
+// it names without changing what it proves. The waiting mutator must still
+// reach an OS-level "stop burning this core" call past its first burst; that
+// call is no longer `worldYield()`.
 //
-// `path: "runtime/gc"` (not a `darwin`/`linux` subdirectory) because both the
-// caller and the wrapper are cross-platform files (`gcworldstop.bit`,
-// `gcyield.bit`); `bit_rt_port_gc_world_yield` itself is declared `extern` —
-// same seam `gcmark.bit`'s own header documents for
-// `bit_rt_gc_mark_stack_overflow` — and stays UNDEFINED in this freestanding
-// object regardless of target, so one macOS build is enough to see the edge;
-// a second Linux build would exercise the identical cross-platform source.
+// WHY IT MOVED. #5748 made the tail yield on EVERY check rather than one in a
+// thousand and measured the result: 44239 M -> 22135 M instructions on
+// `bench/cases/allocpar` (21/21 reps) and CYCLES UNCHANGED (22468 M -> 22457 M,
+// per-rep sign 9/21, identical to the byte-identical null control's own 9/21).
+// A yielding thread still owns its core. #5750 therefore replaced the yield
+// with a BLOCKING wait on the stop word itself
+// (`../../../runtime/gc/gcstopwait.bit`, `__ulock_wait` on Darwin), woken by
+// `worldRestart`. Both halves are edges here because a wait with no wake is a
+// hang and a wake with no wait is a wasted syscall on every collection of every
+// program — the two only mean anything as a pair.
 //
-// MEASURED, NOT ASSUMED. `bit build runtime/gc --emit-obj --freestanding
-// --target aarch64-macos` (#5229) shows `_worldResumeWhenClear` defined at
-// 0x342c, the next symbol (`_bit_rt_port_gc_world_park`) at 0x35ac, and a
-// `BR26` relocation to `_bit_rt_port_gc_world_yield` at 0x34e0 — inside that
-// span — matching #5195's engineer's by-hand disassembly (`bl
-// _bit_rt_port_gc_world_yield` at 0x34e0, gated on `spins % stwSpinBurst`,
-// the identical shape `worldRendezvous` compiles to).
-const whyResumeYield: string = "worldResumeWhenClear's inner spin must call worldYield() (-> bit_rt_port_gc_world_yield) every stwSpinBurst checks, or a real stop-the-world starves the collector thread precisely as #2415 found for worldRendezvous's identical spin; the give-up counter this fix also wired (#5228) cannot itself be asserted at 0, since #5229's bound scan measured it unreachable by any legitimate workload (stwParkBound sized not to be reached) - see that ticket for the campaign"
+// THE FIRST BURST IS UNTOUCHED BY ALL THREE TICKETS, which is what keeps #2415's
+// "a mutator that acks within the first burst never reaches an OS call at all"
+// true; these edges pin the tail, not the burst.
+//
+// MEASURED, NOT ASSUMED, ON THIS BRANCH. `bit build runtime/gc --emit-obj
+// --freestanding --target aarch64-macos` places `_worldWaitForStop` at
+// 0x4250 (next symbol `_worldResumeWhenClear` at 0x42c8) with a `BR26`
+// relocation to `_bit_rt_port_gc_world_stop_wait` at 0x42a0 — inside that span —
+// and `_bit_rt_port_gc_world_restart` at 0x47c4 (next symbol
+// `_bit_rt_port_gc_world_lock` at 0x4820) with a `BR26` to
+// `_bit_rt_port_gc_world_stop_wake` at 0x480c, reached only through the
+// `cbnz` on the waiter-count load at 0x47ec. `worldResumeWhenClear` calls
+// `worldWaitForStop` rather than inlining it (its own atom survives at 120
+// bytes), so the wait edge is anchored on the helper; `worldRendezvous`'s own
+// `bit_rt_port_gc_world_yield` edge at 0x4798 is untouched by #5750 and is
+// deliberately NOT claimed here.
+//
+// `path: "runtime/gc"` (not a `darwin`/`linux` subdirectory) because every atom
+// named here lives in a cross-platform file (`gcworldstop.bit`,
+// `gcstopwait.bit`); both externs stay UNDEFINED in this freestanding object
+// regardless of target — the same seam `gcmark.bit`'s header documents for
+// `bit_rt_gc_mark_stack_overflow` — so one macOS build is enough to see the
+// edges, and a second Linux build would exercise the identical cross-platform
+// source.
+const whyResumeWait: string = "worldResumeWhenClear's tail must still reach an OS-level wait past the first burst, or a real stop-the-world burns every waiting mutator's core for a whole mark and sweep; #5750 made that wait a blocking one on worldStopWord (bit_rt_port_gc_world_stop_wait) because #5748 measured the yield it replaces as instruction-only - 22.1 G instructions removed, cycles flat at the null control's own per-rep sign"
 
-// The one edge: `worldResumeWhenClear`'s atom must still reference the yield
-// extern. Delete the `worldYield()` call in
-// `runtime/gc/gcworldstop.bit`'s `worldResumeWhenClear` -> red.
+// The wake half. Deleting the `bit_rt_port_gc_world_stop_wake` call in
+// `worldRestart` leaves every sleeping mutator to its `stwWaitTimeoutUs`
+// timeout instead of resuming when the stop clears, which is a latency
+// regression no timing assertion in this suite would attribute correctly.
+const whyRestartWake: string = "worldRestart must wake the waiters worldResumeWhenClear parks on worldStopWord (bit_rt_port_gc_world_stop_wake), gated on the waiter count so an uncontended restart still costs one load and a not-taken branch rather than a syscall - #5722's shape, where a mechanism sized for the workload being imagined was 5000x wrong on the shortest real one"
+
+// The two edges. Delete the `worldWaitForStop(world)` call in
+// `runtime/gc/gcworldstop.bit`'s `worldResumeWhenClear`, or the wake in
+// `worldRestart` -> red.
 fn worldResumeYieldEdges(): []Edge {
   return [
     Edge{
       path = "runtime/gc",
       target = tMacos,
       forbid = false,
-      fromSym = "worldResumeWhenClear",
-      toSym = "bit_rt_port_gc_world_yield",
-      why = whyResumeYield,
+      fromSym = "worldWaitForStop",
+      toSym = "bit_rt_port_gc_world_stop_wait",
+      why = whyResumeWait,
+    },
+    Edge{
+      path = "runtime/gc",
+      target = tMacos,
+      forbid = false,
+      fromSym = "bit_rt_port_gc_world_restart",
+      toSym = "bit_rt_port_gc_world_stop_wake",
+      why = whyRestartWake,
     },
   ]
 }
