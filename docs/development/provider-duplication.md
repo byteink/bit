@@ -2,7 +2,7 @@
 
 Input for the follow-up work that pulls shared non-OS logic out of
 `runtime/{root,net,thread,park}/{linux,darwin}/`
-into each module's core `.bit` file. `docs/development.md:832`
+into each module's core `.bit` file. `docs/development.md:844`
 ("Runtime core and OS providers") states the rule this inventory feeds - read
 that first; this file does not repeat it, it only lists what to move.
 
