@@ -53,7 +53,7 @@ The new `std/process` module adds `output(path, args, timeoutMs = 0)`. It runs a
 
 ## Open a file inside a directory without following links
 
-The new `std/fs/secure` module adds `openBeneath(root, rel)` and `statOpen(file)`. `openBeneath` refuses a symbolic link in any component of `rel` and any `..` that would leave `root`, in one operation that a concurrent rename cannot race. `statOpen` reads the size, modification time and file type from the opened file itself rather than from a path. Supported on macOS and Linux; on Windows `openBeneath` currently returns an error.
+The new `std/fs/secure` module adds `openBeneath(root, rel)` and `statOpen(file)`. `openBeneath` refuses a symbolic link in any component of `rel` and any `..` that would leave `root`, and a concurrent rename cannot race it past either check. `statOpen` reads the size, modification time and file type from the opened file itself rather than from a path. Supported on macOS and Linux; on Windows `openBeneath` currently returns an error.
 
 ## Faster `%` by a constant on ARM Linux
 
