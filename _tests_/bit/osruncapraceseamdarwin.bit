@@ -1,0 +1,109 @@
+// #5790 (epic #3459), Darwin only. Reproduces the `pipe()`+`fcntl(FD_CLOEXEC)`
+// race `runtime/root/darwin/osruncap.bit`'s own header used to record: a
+// concurrent `fork()` from any OTHER `bit_rt_os_run*` entry point can land
+// between our `pipe()` and our `fcntl(FD_CLOEXEC)`, inherit our still-open
+// write end, and keep our reader from ever seeing EOF on that stream even
+// though OUR OWN child exited cleanly. Verified directly against this
+// kernel outside Bit entirely (see this ticket's own comment): a background
+// process holding an inherited, unshared pipe write end open delays a
+// `cat` of the read end by exactly that process's own lifetime.
+//
+// MEASURED METRIC IS WALL-CLOCK DELAY, NOT THE `-2` RETURN CODE. Tracing
+// `osCapRunLoop`/`osCapForceTimeout` (`../../runtime/root/darwin/
+// osruncap.bit`): `osCapForceTimeout` is a no-op once the CHILD is already
+// reaped (`if (loadWord(base + 48) != 0) { return }`), so a child that
+// exited cleanly can never get the `-2` sentinel written over its real exit
+// code — the race's only observable effect, in the code as it stands
+// today, is that a landed race stalls the whole call for as long as the
+// racing sibling keeps our write end open (bounded above by
+// `osBoundedMaxPolls`, ~100 minutes — no separate deadline governs stream
+// draining once the child itself is done). That gap is real but is a
+// SEPARATE, wider defect than this ticket's own `files:`
+// (`osruncap.bit`/`os.bit`'s fork lock) and is reported on the ticket
+// rather than fixed here. This harness's own racing sibling (`sleep 1`)
+// is short-lived on purpose so a landed race costs ~1s, not ~100 minutes.
+//
+// `osCapSetRaceSeamSpins` is a TEST-ONLY hook (`../../runtime/root/darwin/
+// osruncap.bit`, not `@symbol`-exported — no ABI surface): it widens the
+// pipe()-to-fcntl() gap deterministically instead of relying on real
+// scheduler timing to land a fork inside a genuinely tiny window. This file
+// reaches it the same way `_tests_/bit/pollguardpreempt.bit` reaches
+// `runtime/sched`'s `preemptStamp` — a direct module import, not an
+// `extern fn`, so nothing here touches the ABI.
+//
+// WITH the #5790 fix (the process-wide fork lock), the seam is harmless
+// regardless of how wide it is: the lock serialises every `fork()` site
+// against this pipe's own critical section, so no capture can ever observe
+// a non-CLOEXEC pipe fd, and `slow` stays 0 no matter how long
+// `osCapRaceSeam` spins. That is what makes this file a durable regression
+// gate, not just a one-shot repro.
+import { exit } from "std/os"
+import { newWaitGroup, WaitGroup } from "std/sync"
+import { monotonic, since } from "std/time"
+import { osCapSetRaceSeamSpins } from "../../runtime/root/darwin"
+
+extern fn bit_rt_os_run_captured(path: i64, argv: i64, timeoutMs: i64): i64
+
+// A capture of `/usr/bin/true` normally returns in low single-digit ms. A
+// landed race stalls it for roughly `sleepSeconds` (the racing sibling's
+// own lifetime) — `slowMs` sits two orders of magnitude above normal and
+// one below `sleepSeconds * 1000`, so it cannot fire from scheduling noise
+// alone but always fires when the race lands.
+const captures: int = 10
+const forkers: int = 4
+const forkerIters: int = 6
+const seamSpins: int = 150000000
+const sleepSeconds: string = "1"
+const slowMs: int = 500
+
+class Shared { wg: WaitGroup }
+
+// The `*const RtBytes` view `bit_rt_os_run_captured`'s `path` argument
+// takes (ABI.md §19), identical to `_tests_/imports/osruncaptured/main.bit`'s
+// own `pathView`.
+fn pathView(p: string): i64 {
+  let bytes = []byte(p)
+  let view = []i64(2)
+  view[0] = int(ptrOf(bytes))
+  view[1] = len(bytes)
+  return i64(ptrOf(view))
+}
+
+fn forkerLoop(sh: Shared) {
+  let i = 0
+  while (i < forkerIters) {
+    let _ = osRun("/bin/sleep", [sleepSeconds])
+    i = i + 1
+  }
+  sh.wg.done()
+}
+
+fn main() {
+  osCapSetRaceSeamSpins(seamSpins)
+  let sh = Shared{ wg = newWaitGroup() }
+  let f = 0
+  while (f < forkers) {
+    sh.wg.add(1)
+    spawn forkerLoop(sh)
+    f = f + 1
+  }
+  let truePath = pathView("/usr/bin/true")
+  let slow = 0
+  let c = 0
+  while (c < captures) {
+    let start = monotonic()
+    let rc = bit_rt_os_run_captured(truePath, 0, 5000)
+    let elapsedMs = since(start) / 1000000
+    print("cap ${c}: rc=${rc} elapsedMs=${elapsedMs}\n")
+    if (rc != 0 || elapsedMs >= slowMs) {
+      slow = slow + 1
+    }
+    c = c + 1
+  }
+  sh.wg.wait()
+  osCapSetRaceSeamSpins(0)
+  print("osruncapraceseam: slow=${slow} of ${captures}\n")
+  if (slow != 0) {
+    exit(1)
+  }
+}

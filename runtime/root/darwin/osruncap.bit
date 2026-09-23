@@ -1,5 +1,13 @@
 import { osRunCaptureMaxBytes, rtOsRunCapturedSet } from "../../root"
 
+// #5790's fork lock reuses `runtime/spinlock.bit`'s spin lock -- the same
+// primitive `runtime/gc/gc.bit`'s heap lock and `runtime/sched/worker.bit`'s
+// `scRegLock` already use (`spinAcquire`/`spinRelease`) -- rather than
+// inventing a second lock kind. Imported once here; `./os.bit` is the same
+// MODULE (sibling file, same directory) and uses these two names directly,
+// no re-import (a second import of the same name is E0042).
+import { spinAcquire, spinRelease } from "../../"
+
 // `bit_rt_os_run_captured` (ABI.md §19, #5781, epic #3459): `os_run_bounded`
 // with the child's stdout/stderr captured into memory instead of left
 // attached to this process's own fds. The three out-of-band companions
@@ -29,29 +37,32 @@ import { osRunCaptureMaxBytes, rtOsRunCapturedSet } from "../../root"
 // `fcntl` extern already carries (#1462) — declared fresh here because this
 // is a different module and an extern declaration does not cross one.
 //
-// FD_CLOEXEC RACE WINDOW, MEASURED NOT ASSUMED (per this ticket's own
-// acceptance): `runtime/root/darwin/os.bit`'s header records that NOTHING
-// serialises `bit_rt_os_run`/`_bounded`/`_test` against each other — "grep
-// found no lock anywhere near these call sites" — and that is still true
-// after this file: grepping `runtime/root/darwin/*.bit` and
-// `runtime/sched/**/*.bit` for `Lock`/`mutex`/`sema` around a fork call
-// finds worker-pool and GC locks, never one guarding fork/exec. macOS has no
-// `pipe2`, so `pipe()` and the `fcntl(F_SETFD, FD_CLOEXEC)` below it are TWO
-// separate syscalls with a real gap between them. Every fd this file opens
-// is marked CLOEXEC in that gap, immediately after `pipe()` returns and
-// BEFORE this function's own `fork()` — but a DIFFERENT worker thread
-// running a DIFFERENT `bit_rt_os_run*` call can `fork()` at any point in
-// that gap, and that concurrent child inherits this thread's still-open,
-// not-yet-CLOEXEC pipe fd (fork duplicates the WHOLE fd table as it stands
-// at the instant of the call, not as it will stand after this thread's next
-// instruction). If that concurrent child then execs before this thread's
-// `fcntl` runs, it holds our write end open past our own child's exit, and
-// the reader here never sees EOF on that stream. The window is real and
-// OPEN, not merely narrowed: nothing in this runtime takes a lock across
-// `pipe()`+`fcntl()`, and this file adds none — closing it needs a
-// process-wide fork lock around every `bit_rt_os_run*` entry point, which is
-// wider than this ticket's `files:` and is `runtime/root/darwin/os.bit`'s
-// own #1436-adjacent hazard, recorded rather than fixed here.
+// FD_CLOEXEC RACE WINDOW — CLOSED (#5790). macOS has no `pipe2`, so `pipe()`
+// and the `fcntl(F_SETFD, FD_CLOEXEC)` below it are TWO separate syscalls
+// with a real gap between them, during which a DIFFERENT worker thread
+// forking through `bit_rt_os_run`/`_bounded`/`_test` (`./os.bit`,
+// `osForkExecWait`/`osForkExecWaitBounded`) could inherit this thread's
+// still-open, not-yet-CLOEXEC pipe fd (fork duplicates the WHOLE fd table as
+// it stands at the instant of the call). If that concurrent child then
+// execs before this thread's `fcntl` runs, it holds our write end open past
+// our own child's exit, and the reader here never sees EOF until that
+// SIBLING exits too — a capture whose own child exited cleanly still stalls
+// for however long the racing sibling keeps running (verified directly
+// against this kernel outside Bit, #5790's own ticket comment: a background
+// process holding an inherited pipe write end open delays a plain `cat` of
+// the read end by exactly that process's own lifetime). `osCapForceTimeout`
+// below is a no-op once the child is already reaped, so a landed race never
+// substitutes the `-2` sentinel for a clean child's real exit code — the
+// observable defect is added latency, unbounded by this function's own
+// `timeoutMs` (only `osBoundedMaxPolls`, far larger, ends the stall).
+//
+// Closed by `osForkLockWord` below: ONE process-wide spin lock, held across
+// both `pipe()`+`fcntl()` pairs AND this function's own `fork()` in
+// `rtOsRunCaptured`, and across the bare `fork()` call (never the wait) at
+// `./os.bit`'s two sites (`osForkExecWait`, `osForkExecWaitBounded`) — the
+// full set found by grepping this module and `./os.bit` for `fork(`, three
+// call sites total. Never held across `waitpid`, a yield, or an allocation:
+// every acquire/release pair below brackets nothing but the syscalls named.
 
 // `pipe(2)`: writes two `int`s (read-end, write-end) into the 8 bytes at
 // `fds`. `dup2(2)`: makes `newfd` a copy of `oldfd`, closing `newfd` first if
@@ -145,17 +156,74 @@ let osCapFdBuf: [66]i64 // 2 words/slot * (osScratchSlots+1)
   return loadWord(pairAddr) >> 32
 }
 
+// ---------------------------------------------------------------------------
+// #5790: the process-wide fork lock
+// ---------------------------------------------------------------------------
+//
+// One word, one spin lock, guarding the whole process — not per-worker
+// scratch like everything above. `spinAcquire`/`spinRelease` take a `*i32`
+// (§11.5); this block is `*i64`-indexed like every other runtime lock
+// owner, so the cell needs the same re-addressing `runtime/sched/switch.bit`'s
+// `lockOf` does for its own callers — repeated here rather than imported
+// because `lockOf` is not `export`ed and this is a different module (an
+// import of a non-exported name is E0040).
+let osForkLockWord: [1]i64
+
+@nosplit fn osForkLockAddr(): *i32 {
+  let z: *i32 = nil
+  return z + int(ptrOf(osForkLockWord)) / 4
+}
+
+// TEST-ONLY WINDOW WIDENER (#5790). A plain, allocation-free busy spin --
+// never a syscall, never a park -- so it changes only TIMING, whether or not
+// the caller holds `osForkLockWord` around it. `osCapRaceSeamSpins` is 0 in
+// every real build: nothing but the reproduction harness
+// (`_tests_/bit/osruncapraceseamdarwin.bit`) ever calls
+// `osCapSetRaceSeamSpins` to set it nonzero, and that harness runs only when
+// invoked directly. Not `@symbol`-exported: no ABI surface (ABI.md), reached
+// by ordinary Bit test files the same way `_tests_/bit/pollguardpreempt.bit`
+// reaches `runtime/sched`'s `preemptStamp` -- a direct module import, not an
+// `extern fn`. `osCapRaceSeamMaxSpins` bounds the loop below at a compile
+// constant (Power of 10 rule 2: a bounded loop needs a provable bound, not
+// just a caller's good behaviour).
+const osCapRaceSeamMaxSpins: int = 200000000
+let osCapRaceSeamSpins: [1]i64
+let osCapRaceSeamSink: [1]i64
+
+export @nosplit fn osCapSetRaceSeamSpins(n: int) {
+  let clamped = n
+  if (clamped < 0) {
+    clamped = 0
+  }
+  if (clamped > osCapRaceSeamMaxSpins) {
+    clamped = osCapRaceSeamMaxSpins
+  }
+  storeWord(int(ptrOf(osCapRaceSeamSpins)), clamped)
+}
+
+@nosplit fn osCapRaceSeam() {
+  let n = loadWord(int(ptrOf(osCapRaceSeamSpins)))
+  let i = 0
+  while (i < n) {
+    storeWord(int(ptrOf(osCapRaceSeamSink)), loadWord(int(ptrOf(osCapRaceSeamSink))) + 1)
+    i = i + 1
+  }
+}
+
 // Open one pipe at `pairAddr` and CLOEXEC both resulting fds before this
 // function returns — the whole point being that no OTHER code, including a
 // concurrently forking sibling worker, observes either fd non-CLOEXEC for
 // longer than these two calls take. `false` on any failure (pipe, or either
 // fcntl's own verified readback), so the caller never treats a
-// half-protected pair as usable.
+// half-protected pair as usable. Every caller holds `osForkLockWord` across
+// this (`rtOsRunCaptured` below): the widened gap `osCapRaceSeam` can insert
+// here is real only when a caller does not.
 @nosplit fn osCapOpenPipe(pairAddr: int): bool {
   storeWord(pairAddr, 0)
   if (int(pipe(u8At(pairAddr))) != 0) {
     return false
   }
+  osCapRaceSeam()
   let ok0 = osCapSetCloexec(osCapFdLow(pairAddr))
   let ok1 = osCapSetCloexec(osCapFdHigh(pairAddr))
   return ok0 && ok1
@@ -449,14 +517,21 @@ export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
     return 0 - 1
   }
   let fdBase = osCapFdBase()
+  // #5790: one continuous critical section from the first `pipe()` through
+  // this function's own `fork()` — see the header above. Released on every
+  // exit from here down, including both early-failure returns.
+  spinAcquire(osForkLockAddr())
   if (!osCapOpenPipe(fdBase)) {
+    spinRelease(osForkLockAddr())
     return 0 - 1
   }
   if (!osCapOpenPipe(fdBase + 8)) {
+    spinRelease(osForkLockAddr())
     osCapClosePair(fdBase)
     return 0 - 1
   }
   let pid = int(fork())
+  spinRelease(osForkLockAddr())
   if (pid < 0) {
     osCapClosePair(fdBase)
     osCapClosePair(fdBase + 8)
