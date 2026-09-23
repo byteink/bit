@@ -13,6 +13,11 @@ package; it does not restate this.
 - Tests are `<file>.test.bit` beside the file they test, run by
   `bit test pkg/<name>` (SPEC §19).
 - No `bit.json` unless the package has third-party dependencies of its own.
+  A package that depends on another first-party package declares it in
+  `bit.json` by vanity name and version, the same as any third-party
+  dependency, never by a relative import: `bit add` fetches only the
+  depended-on package's own directory, so a relative import resolves in
+  this repo and fails for every consumer.
 - A `README.md` with install, usage and the exported surface, and a `docs/`
   tree of chapters beside it (see Documentation, below).
 - No separate repository. One repo, one gate, one atomic change when a
