@@ -88,80 +88,31 @@
 // never returns `<= -100`.
 
 import { osRunCaptureMaxBytes } from "../../root"
+// Per-task companions (ABI.md §19, #5781/#5780 established this shape while
+// this ticket was in flight): the captured strings are live GC references,
+// and the M:N scheduler can migrate a task between workers between
+// `bit_rt_os_run_captured` and its companion reads, so a per-WORKER scratch
+// array (never scanned, the shape this file uses everywhere else for raw
+// handles/ints) is the wrong place for them — only the per-task scratch
+// (part of the scanned stack) keeps them reachable across that migration.
+// Mirrors `../darwin/osruncap.bit`'s own `scrOsCapStdout`/`_stderr`/
+// `_truncated` use exactly, for the identical reason.
+import { schedCurrentScratch } from "../../sched"
+import { scrOsCapStdout, scrOsCapStderr, scrOsCapTruncated } from "../../sched"
 
-// kernel32 imports beyond what ./os.bit, ./boot.bit, ./fs.bit and ./osrun.bit
-// already declare in this module. All six are NEW admissions this ticket
-// adds to `compiler/pesyms.bit`'s table — documented at processthreadsapi.h
-// (`CreatePipe`, `InitializeProcThreadAttributeList`,
-// `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList` are actually
-// in namedpipeapi.h/processthreadsapi.h per Microsoft's own reference) and
-// winbase.h (`SetHandleInformation`), kernel32.dll; not hardware-probed,
-// matching this table's own honesty note for documentation-sourced entries —
-// `PeekNamedPipe` is namedpipeapi.h, kernel32.dll.
-extern fn CreatePipe(readOut: *byte, writeOut: *byte, secAttrs: *byte, size: i32): i32
-extern fn SetHandleInformation(handle: *byte, mask: i32, flags: i32): i32
-extern fn PeekNamedPipe(
-  handle: *byte, buf: *u8, bufSize: i32, bytesReadOut: *i32,
-  totalAvailOut: *i32, bytesLeftMsgOut: *i32,
-): i32
-extern fn InitializeProcThreadAttributeList(
-  attrList: *byte,
-  attrCount: i32,
-  flags: i32,
-  sizeOut: *i64,
-): i32
-extern fn UpdateProcThreadAttribute(
-  attrList: *byte, flags: i32, attribute: int, value: *byte, size: int,
-  prevValue: *byte, returnSize: *byte,
-): i32
-// Documented VOID (processthreadsapi.h); declared `i32`-returning like every
-// other extern in this file family (SPEC §11.7 requires a scalar or `void`
-// result) and its return discarded at every call site — reading an unused
-// register costs nothing and the ABI still matches for a caller that ignores it.
-extern fn DeleteProcThreadAttributeList(attrList: *byte): i32
-
-// ---------------------------------------------------------------------------
-// Struct layouts and flags (processthreadsapi.h/winbase.h/namedpipeapi.h) —
-// offsets verified against Microsoft's own documented field order, matching
-// ./osrun.bit's own comment's standard for this project.
-// ---------------------------------------------------------------------------
-
-// SECURITY_ATTRIBUTES: nLength(DWORD)@0, pad@4, lpSecurityDescriptor(PVOID)@8,
-// bInheritHandle(BOOL)@16, pad@20. Total 24 bytes.
-const winCapSecAttrBytes: int = 24
-
-// STARTUPINFOEXW: STARTUPINFOW (./osrun.bit's `winStartupInfoBytes`, 104
-// bytes) followed by lpAttributeList(PVOID)@104. Total 112 bytes.
-const winCapStartupInfoExBytes: int = 112
-
-// Fixed budget for `InitializeProcThreadAttributeList`'s opaque buffer, for
-// ONE attribute (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) — the documented size
-// for a single attribute is well under this on every observed Windows
-// release; the query call below still verifies it at runtime and this
-// primitive REJECTS (spawn failure) rather than overflow if a future release
-// ever needs more, the same "reject, never truncate" rule this file family
-// applies everywhere else.
-const winCapAttrListBytes: int = 256
-
-// Two HANDLEs (the stdout and stderr pipe write ends), the
-// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` value array.
-const winCapHandleListBytes: int = 16
+// The six new kernel32 externs (`CreatePipe`, `SetHandleInformation`,
+// `PeekNamedPipe`, `InitializeProcThreadAttributeList`,
+// `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList`), the
+// STARTUPINFOEXW/SECURITY_ATTRIBUTES/PROC_THREAD_ATTRIBUTE_LIST struct
+// layouts, and the pipe/attribute-list setup helpers this file calls
+// (`winCapMakePipe`, `winCapFillSecAttrs`, `winCapBuildAttrList`,
+// `winCapBuildStartupInfoEx`) all live in ./osruncapsetup.bit — same
+// module, no import needed (an import is per-module, not per-file).
 
 // Per-tick discard scratch for bytes read past `osRunCaptureMaxBytes` on a
 // stream that has already hit its cap — never retained, just drained so the
 // child cannot block writing to a pipe nobody is emptying.
 const winCapDiscardBytes: int = 4096
-
-// STARTF_USESTDHANDLES (winbase.h STARTUPINFOW.dwFlags).
-const winCapUseStdHandles: int = 256 // 0x00000100
-// EXTENDED_STARTUPINFO_PRESENT (winbase.h CreateProcess dwCreationFlags).
-const winCapExtendedStartupInfoPresent: int = 524288 // 0x00080000
-// HANDLE_FLAG_INHERIT (winbase.h SetHandleInformation dwMask/dwFlags).
-const winCapHandleFlagInherit: int = 1
-// PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(
-//   ProcThreadAttributeHandleList=2, Thread=FALSE, Input=TRUE, Additive=FALSE)
-// = PROC_THREAD_ATTRIBUTE_INPUT(0x00020000) | 2. processthreadsapi.h.
-const winCapAttributeHandleList: int = 131074 // 0x00020002
 
 // Poll cadence matching the POSIX pollers' own `osPollNs` = 2,000,000ns = 2ms
 // (`runtime/root/linux/os.bit`). `WaitForSingleObject` doubles as both the
@@ -190,7 +141,6 @@ const winCapDrainMaxChunks: int = 4096
 // (which the compiler itself scales by `sizeOf(T)` — used instead for the
 // single-DWORD/SIZE_T scratch below, `winCapDwordScratch`/`winCapSizeScratch`).
 const winCapChildStrideBytes: int = 40 // hProcess, hReadOut, hReadErr, job, haveJob
-const winCapStateStrideBytes: int = 8  // one i64 per slot
 const winCapPipeStrideBytes: int = 32  // hReadOut, hWriteOut, hReadErr, hWriteErr
 
 // ---------------------------------------------------------------------------
@@ -198,120 +148,8 @@ const winCapPipeStrideBytes: int = 32  // hReadOut, hWriteOut, hReadErr, hWriteE
 // buffers): `osScratchSlots` (32) + 1 fallback slot.
 // ---------------------------------------------------------------------------
 
-let winCapSecAttrBuf: [99]i64        // 33 * (24/8 = 3)
-let winCapStartupInfoExBuf: [462]i64 // 33 * (112/8 = 14)
-let winCapAttrListBuf: [1056]i64     // 33 * (256/8 = 32)
-let winCapHandleListBuf: [66]i64     // 33 * (16/8 = 2)
-let winCapDiscardBuf: [16896]i64     // 33 * (4096/8 = 512)
-let winCapPipeBuf: [132]i64          // 33 * 4 -- hReadOut, hWriteOut, hReadErr, hWriteErr
-let winCapSizeScratch: [33]i64       // one SIZE_T per slot
-let winCapDwordScratch: [33]i32      // one DWORD per slot (Peek avail / ReadFile n)
-
-// The last completed call's captured output, per worker — `_stdout`/
-// `_stderr`/`_truncated` read this immediately after, the same per-task
-// adjacency contract `bit_rt_fs_read_all_failed` documents (ABI.md §14),
-// kept LOCAL to this file rather than routed through `runtime/root/slots.bit`
-// (that file is shared cross-platform; the two POSIX sibling tickets need
-// their own equivalent state at the same time and a shared layout would be a
-// three-way collision over one file none of the three tickets was scoped to
-// touch). A fresh worker's slot reads 0 until its first call — the getters
-// below turn a 0 string-pointer into `emptyStr()` explicitly, matching
-// `rtFsRead`'s own "never trust raw BSS zero as a valid string" rule.
-let winCapStdoutStr: [33]i64
-let winCapStderrStr: [33]i64
-let winCapTruncatedBits: [33]i64
-
-// ---------------------------------------------------------------------------
-// Pipe + STARTUPINFOEX + attribute-list setup
-// ---------------------------------------------------------------------------
-
-// One anonymous pipe, write end inheritable (via `secAttrsAddr`), read end
-// explicitly marked non-inheritable — the second line of defense the header
-// describes. Writes `hRead` to `outAddr`, `hWrite` to `outAddr + 8` (the
-// exact layout `CreatePipe`'s own two out-params need, so no extra copy is
-// needed). Returns whether the pipe was created — no tuple: `--freestanding`
-// (ABI.md §1.1) boxes a multi-value `return` on the managed heap, which this
-// module cannot use, so every multi-result helper below writes into scratch
-// and returns a single scalar instead.
-@nosplit fn winCapMakePipe(secAttrsAddr: int, outAddr: int): bool {
-  let ok = CreatePipe(hAt(outAddr), hAt(outAddr + 8), hAt(secAttrsAddr), i32(0))
-  if (int(ok) == 0) {
-    return false
-  }
-  let hRead = loadWord(outAddr)
-  let _ = SetHandleInformation(hAt(hRead), i32(winCapHandleFlagInherit), i32(0))
-  return true
-}
-
-// Fills `secAttrsAddr` with a `bInheritHandle = TRUE` SECURITY_ATTRIBUTES,
-// required for `CreatePipe` to hand back an inheritable write end at all
-// (see header for why inheriting it at all is safe here: the attribute list
-// below is what actually narrows inheritance to just the two write ends).
-@nosplit fn winCapFillSecAttrs(secAttrsAddr: int) {
-  winZeroBytes(secAttrsAddr, winCapSecAttrBytes)
-  storeWord(secAttrsAddr, winCapSecAttrBytes)
-  storeWord(secAttrsAddr + 16, 1)
-}
-
-// Builds the `PROC_THREAD_ATTRIBUTE_LIST` restricting inheritance to exactly
-// `hWriteOut`/`hWriteErr` (the header's race fix). Returns the attribute
-// list's address, or `0` if the queried size does not fit
-// `winCapAttrListBytes` or either API call fails — REJECTED, matching this
-// file family's "reject, never overflow" rule.
-@nosplit fn winCapBuildAttrList(slot: int, hWriteOut: int, hWriteErr: int): int {
-  let sizeAddr = ptrOf(winCapSizeScratch) + slot
-  let nilAttrList: *byte = nil
-  let _ = InitializeProcThreadAttributeList(nilAttrList, i32(1), i32(0), sizeAddr)
-  let needed = int(atomicLoad(sizeAddr))
-  if (needed <= 0 || needed > winCapAttrListBytes) {
-    return 0
-  }
-  let attrList = int(ptrOf(winCapAttrListBuf)) + slot * winCapAttrListBytes
-  let ok = InitializeProcThreadAttributeList(hAt(attrList), i32(1), i32(0), sizeAddr)
-  if (int(ok) == 0) {
-    return 0
-  }
-  let handleList = int(ptrOf(winCapHandleListBuf)) + slot * winCapHandleListBytes
-  storeWord(handleList, hWriteOut)
-  storeWord(handleList + 8, hWriteErr)
-  let nilPrev: *byte = nil
-  let nilRet: *byte = nil
-  let uok = UpdateProcThreadAttribute(
-    hAt(attrList), i32(0), winCapAttributeHandleList, hAt(handleList),
-    winCapHandleListBytes, nilPrev, nilRet,
-  )
-  if (int(uok) == 0) {
-    let _ = DeleteProcThreadAttributeList(hAt(attrList))
-    return 0
-  }
-  return attrList
-}
-
-// Builds the STARTUPINFOEXW at this worker's slot: `cb` = the EX struct's own
-// size (Microsoft's own STARTUPINFOEX samples set `cb` to `sizeof(STARTUPINFOEX)`,
-// not the plain `STARTUPINFO` size, once `EXTENDED_STARTUPINFO_PRESENT` is in
-// play), `dwFlags` = `STARTF_USESTDHANDLES`, `hStdOutput`/`hStdError` = the
-// two pipe write ends, `hStdInput` left `0` (NULL — this primitive captures
-// output only; a child reading its own stdin sees an invalid handle, the
-// same degradation Windows documents for a `0` std-handle override), and
-// `lpAttributeList` = `attrList`. Returns the STARTUPINFOEXW's own address
-// (identical to its embedded STARTUPINFOW's, so it is also what
-// `CreateProcessW`'s `lpStartupInfo` parameter takes directly).
-@nosplit fn winCapBuildStartupInfoEx(
-  slot: int,
-  hWriteOut: int,
-  hWriteErr: int,
-  attrList: int,
-): int {
-  let si = int(ptrOf(winCapStartupInfoExBuf)) + slot * winCapStartupInfoExBytes
-  winZeroBytes(si, winCapStartupInfoExBytes)
-  storeWord(si, winCapStartupInfoExBytes)
-  storeWord(si + 60, winCapUseStdHandles)
-  storeWord(si + 88, hWriteOut)
-  storeWord(si + 96, hWriteErr)
-  storeWord(si + 104, attrList)
-  return si
-}
+let winCapDiscardBuf: [16896]i64 // 33 * (4096/8 = 512)
+let winCapDwordScratch: [33]i32  // one DWORD per slot (Peek avail / ReadFile n)
 
 // ---------------------------------------------------------------------------
 // Draining: peek, then read up to the cap into the capture buffer and
@@ -557,10 +395,13 @@ let winCapChildBuf: [165]i64 // 33 * 5
 // both streams regardless of the wait's own result (never let a full pipe
 // block the child while the parent is only checking exit status). Updates
 // `usedOut`/`usedErr` (this worker's own drain-progress scratch,
-// `winCapProgressBuf`) and ORs any newly-hit cap into `winCapTruncatedBits`
-// directly — no return value carries them, since a multi-value `return`
-// would box on the managed heap (`--freestanding`, see `winCapMakePipe`'s
-// comment). Returns whether the process has exited.
+// `winCapProgressBuf` — plain byte counts, not GC references, so per-worker
+// scratch is fine for these, unlike the captured strings themselves) and ORs
+// any newly-hit cap into the CURRENT TASK's `scrOsCapTruncated` slot
+// (`runtime/sched/scratch.bit`) directly — no return value carries them,
+// since a multi-value `return` would box on the managed heap
+// (`--freestanding`, see `winCapMakePipe`'s comment). Returns whether the
+// process has exited.
 let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
 
 @nosplit fn winCapPollTick(slot: int, outCap: int, errCap: int): bool {
@@ -581,15 +422,15 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
   storeWord(prog, winCapDrainUnpackUsed(packedOut))
   storeWord(prog + 8, winCapDrainUnpackUsed(packedErr))
 
-  let bitsAddr = int(ptrOf(winCapTruncatedBits)) + slot * winCapStateStrideBytes
-  let bits = loadWord(bitsAddr)
+  let scr = schedCurrentScratch()
+  let bits = *(scr + scrOsCapTruncated)
   if (winCapDrainUnpackHit(packedOut)) {
     bits = bits | 1
   }
   if (winCapDrainUnpackHit(packedErr)) {
     bits = bits | 2
   }
-  storeWord(bitsAddr, bits)
+  *(scr + scrOsCapTruncated) = bits
   return wait == winWaitObject0
 }
 
@@ -598,17 +439,18 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
 // buffered at the moment it died, and closes every handle in
 // `winCapChildBuf[slot]`. Returns `>= 0` (masked exit code) or `-2` (timed
 // out, killed and reaped via the job object, matching `./osrun.bit`'s own
-// bounded pair). `winCapProgressBuf[slot]` and `winCapTruncatedBits[slot]`
-// hold the final drain state on return, for the caller to finalize.
+// bounded pair). `winCapProgressBuf[slot]` and the current task's
+// `scrOsCapTruncated` hold the final drain state on return, for the caller
+// to finalize. The caller (`rtOsRunCaptured`, via `winCapClearResult`) has
+// already zeroed `scrOsCapTruncated` for THIS call before this runs.
 @nosplit fn winCapPollAndDrain(slot: int, clampedMs: int, outCap: int, errCap: int): int {
-  // Reset this worker's drain-progress and truncated-bits scratch: both are
-  // reused across calls, and `winCapPollTick` reads them before its first
-  // write (accumulating onto whatever was there), so a stale value from a
-  // PRIOR call on this same slot must not leak into this one.
+  // Reset this worker's drain-progress scratch: reused across calls, and
+  // `winCapPollTick` reads it before its first write (accumulating onto
+  // whatever was there), so a stale value from a PRIOR call on this same
+  // slot must not leak into this one.
   let prog0 = int(ptrOf(winCapProgressBuf)) + slot * 16
   storeWord(prog0, 0)
   storeWord(prog0 + 8, 0)
-  storeWord(int(ptrOf(winCapTruncatedBits)) + slot * winCapStateStrideBytes, 0)
 
   let ticks = clampedMs / winCapPollMs + 1
   let polls = 0
@@ -646,15 +488,15 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
   )
   storeWord(prog, winCapDrainUnpackUsed(packedOut))
   storeWord(prog + 8, winCapDrainUnpackUsed(packedErr))
-  let bitsAddr = int(ptrOf(winCapTruncatedBits)) + slot * winCapStateStrideBytes
-  let bits = loadWord(bitsAddr)
+  let scr = schedCurrentScratch()
+  let bits = *(scr + scrOsCapTruncated)
   if (winCapDrainUnpackHit(packedOut)) {
     bits = bits | 1
   }
   if (winCapDrainUnpackHit(packedErr)) {
     bits = bits | 2
   }
-  storeWord(bitsAddr, bits)
+  *(scr + scrOsCapTruncated) = bits
 
   CloseHandle(hAt(hReadOut))
   CloseHandle(hAt(hReadErr))
@@ -703,10 +545,10 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
 // managed allocation `rtStrAlloc` performs — the one this whole freestanding
 // file is permitted, the same primitive `../fsrw.bit`'s `rtFsReadAll`
 // counterpart already uses), poll/drain, then publish the trimmed strings
-// and truncated bits into this worker's own companion slots
-// (`winCapStdoutStr`/`winCapStderrStr`/`winCapTruncatedBits`, read by the
-// three exported companions below). Returns the exit result only — no
-// tuple, see `winCapMakePipe`'s comment.
+// into the CURRENT TASK's `scrOsCapStdout`/`scrOsCapStderr` companion slots
+// (`runtime/sched/scratch.bit`) — `scrOsCapTruncated` is already current,
+// kept live by `winCapPollAndDrain`'s own last drain pass. Returns the exit
+// result only — no tuple, see `winCapMakePipe`'s comment.
 @nosplit fn winCapSpawnAndCapture(appName: int, cmdLine: int, timeoutMs: int): int {
   let slot = osScratchSlot()
   let opened = winCapOpenChild(appName, cmdLine, slot)
@@ -728,11 +570,22 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
   let outStr = winCapFinalize(strData(outCap), loadWord(prog))
   let errStr = winCapFinalize(strData(errCap), loadWord(prog + 8))
 
-  storeWord(int(ptrOf(winCapStdoutStr)) + slot * winCapStateStrideBytes, outStr)
-  storeWord(int(ptrOf(winCapStderrStr)) + slot * winCapStateStrideBytes, errStr)
-  // `winCapTruncatedBits[slot]` already holds the final bits — set by
-  // `winCapPollAndDrain`'s own last drain pass; nothing left to store here.
+  let scr = schedCurrentScratch()
+  *(scr + scrOsCapStdout) = outStr
+  *(scr + scrOsCapStderr) = errStr
   return code
+}
+
+// Cleared at every `rtOsRunCaptured` entry, including every early-failure
+// return below, so a prior call's result never leaks into a spawn failure's
+// "" / "" / 0 (ABI.md §19's own stated default for a task that has not yet
+// captured anything) — mirrors `../darwin/osruncap.bit`'s own
+// `osCapClearResult` exactly.
+@nosplit fn winCapClearResult() {
+  let scr = schedCurrentScratch()
+  *(scr + scrOsCapStdout) = emptyStr()
+  *(scr + scrOsCapStderr) = emptyStr()
+  *(scr + scrOsCapTruncated) = 0
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +604,7 @@ export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
   argv: int,
   timeoutMs: int,
 ): int {
+  winCapClearResult()
   let ab = winResolveRunTarget(path, argv)
   if (ab == 0) {
     return 0 - 1
@@ -766,32 +620,26 @@ export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
   return winCapSpawnAndCapture(appName, cmdLine, timeoutMs)
 }
 
-// `bit_rt_os_run_captured_stdout()`/`_stderr()`: this worker's own captured
-// stream from the call just made — per-task state, read immediately after
-// with no yield between (ABI.md §19, the same `bit_rt_fs_read_all_failed`
-// contract, §14). A worker that has never called `bit_rt_os_run_captured`
-// reads its slot's raw zero, turned into a real empty string here rather
-// than trusted as one directly (`rtFsRead`'s own rule).
+// `bit_rt_os_run_captured_stdout()`/`_stderr()`/`_truncated()`: the current
+// TASK's own three companions, read immediately after
+// `bit_rt_os_run_captured` with no yield between (ABI.md §19) — per-task,
+// not per-worker, so they survive the M:N scheduler migrating this task
+// between workers between the primitive call and these reads (see the
+// import comment above; mirrors `../darwin/osruncap.bit` exactly). Already
+// cleared to `""`/`""`/`0` by `winCapClearResult` for a task that has never
+// called `bit_rt_os_run_captured` (or whose call failed before spawning),
+// so no zero-translation is needed here.
 export @nosplit @symbol("bit_rt_os_run_captured_stdout") fn rtOsRunCapturedStdout(): int {
-  let v = loadWord(int(ptrOf(winCapStdoutStr)) + osScratchSlot() * winCapStateStrideBytes)
-  if (v == 0) {
-    return emptyStr()
-  }
-  return v
+  let scr = schedCurrentScratch()
+  return *(scr + scrOsCapStdout)
 }
 
 export @nosplit @symbol("bit_rt_os_run_captured_stderr") fn rtOsRunCapturedStderr(): int {
-  let v = loadWord(int(ptrOf(winCapStderrStr)) + osScratchSlot() * winCapStateStrideBytes)
-  if (v == 0) {
-    return emptyStr()
-  }
-  return v
+  let scr = schedCurrentScratch()
+  return *(scr + scrOsCapStderr)
 }
 
-// `bit_rt_os_run_captured_truncated()`: bit 0 = stdout hit `osRunCaptureMaxBytes`,
-// bit 1 = stderr did (ABI.md §19). `0` for a worker that has never called
-// `bit_rt_os_run_captured` — the slot's own zero value needs no translation
-// here, unlike the two string companions above.
 export @nosplit @symbol("bit_rt_os_run_captured_truncated") fn rtOsRunCapturedTruncated(): int {
-  return loadWord(int(ptrOf(winCapTruncatedBits)) + osScratchSlot() * winCapStateStrideBytes)
+  let scr = schedCurrentScratch()
+  return *(scr + scrOsCapTruncated)
 }
