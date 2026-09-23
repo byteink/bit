@@ -46,3 +46,12 @@ instead, as the entry below does. `dist/release.sh` refuses to fold an entry
 that violates this rather than let it corrupt the count silently.
 
 ---
+
+### Breaking: `run` moved from `std/os` to `std/process`
+
+`run` is no longer exported from `std/os`. It now lives in `std/process`,
+next to `output`, since both run a child process the same way and differ
+only in whether the child's stdout and stderr are captured or left attached
+to the terminal. A program importing `run` from `std/os` needs to import it
+from `std/process` instead; nothing about `run`'s signature or behavior
+changed.
