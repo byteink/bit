@@ -55,20 +55,23 @@
 // the loads write -- and it is exactly the kind of change an instruction count
 // argues against (-1.6%) and cycles pay for (-17.3%).
 
-// Claims `slot` for a key not already present, and writes the entry. Shared by
+// Claims `slot` of table `t` for a key not already present. Shared by
 // `rtMapSet`'s two arms so the `used`/`len` accounting has ONE definition:
 // `used` counts slots consumed from EMPTY, so reusing a TOMB leaves it alone —
 // that is what makes tombstones cost capacity until the next grow rather than
 // forever.
-@nosplit fn mapClaimSlot(m: int, slot: int, tag: int, key: int, val: int) {
-  let ctrl = loadWord(m + mapCtrl)
+//
+// `t` is the table the caller probed, never a reload (maptable.bit), and the
+// CALLER writes the key and value words first: that is what keeps this at four
+// parameters with `t` added, and it also means the ctrl tag, which is what a
+// racing probe matches on, is the entry's last write rather than its first.
+@nosplit fn mapClaimSlot(m: int, t: int, slot: int, tag: int) {
+  let ctrl = t + tblCtrl
   if (loadByte(ctrl + slot) == ctrlEmpty) {
     storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
   }
   storeByte(ctrl + slot, tag)
   storeWord(m + mapLen, loadWord(m + mapLen) + 1)
-  storeWord(loadWord(m + mapKeys) + slot * 8, key)
-  storeWord(loadWord(m + mapVals) + slot * 8, val)
 }
 
 // The shared `m[key] = val` for a `string` or composite key: hash and probe
@@ -82,14 +85,14 @@
 // most recently assigned one, which is what iteration then yields.
 @nosplit fn mapSetSlow(m: int, key: int, val: int) {
   let h = mapHash(m, key)
-  let r = mapProbe(m, key, h)
+  let t = mapTable(m)
+  let r = mapProbe(m, t, key, h)
   let slot = mapProbeSlot(r)
-  if (mapProbeFound(r)) {
-    storeWord(loadWord(m + mapKeys) + slot * 8, key)
-    storeWord(loadWord(m + mapVals) + slot * 8, val)
-    return
+  storeWord(loadWord(t + tblKeys) + slot * 8, key)
+  storeWord(loadWord(t + tblVals) + slot * 8, val)
+  if (!mapProbeFound(r)) {
+    mapClaimSlot(m, t, slot, mapCtrlTag(h))
   }
-  mapClaimSlot(m, slot, mapCtrlTag(h), key, val)
 }
 
 // `bit_rt_map_set`: insert or overwrite `m[key] = val`.
@@ -106,16 +109,17 @@ export @nosplit @symbol("bit_rt_map_set") fn rtMapSet(m: int, key: int, val: int
     return
   }
   let used = loadWord(m + mapUsed)
-  let vcap0 = loadWord(m + mapCap)
+  let vcap0 = loadWord(mapTable(m) + tblCap)
   if ((used + 1) * mapLoadDen >= vcap0 * mapLoadNum) {
     mapGrow(m)
   }
   if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
     let hs = scalarHash(u64(key)) // FIRST: see the header note on the callee-saved set
-    let vcap = loadWord(m + mapCap)
+    let t = mapTable(m)
+    let vcap = loadWord(t + tblCap)
     let mask = vcap - 1
-    let ctrl = loadWord(m + mapCtrl)
-    let keys = loadWord(m + mapKeys)
+    let ctrl = t + tblCtrl
+    let keys = loadWord(t + tblKeys)
     let i = int(hs & u64(mask))
     let tag = mapCtrlTag(hs)
     let ins = -1 // the insert position: first TOMB, else the EMPTY that stops us
@@ -130,12 +134,14 @@ export @nosplit @symbol("bit_rt_map_set") fn rtMapSet(m: int, key: int, val: int
           ins = i
         }
         if (c == ctrlEmpty) {
-          mapClaimSlot(m, ins, tag, key, val)
+          storeWord(keys + ins * 8, key)
+          storeWord(loadWord(t + tblVals) + ins * 8, val)
+          mapClaimSlot(m, t, ins, tag)
           return
         }
       } else if (c == tag) {
         if (loadWord(keys + i * 8) == key) {
-          storeWord(loadWord(m + mapVals) + i * 8, val)
+          storeWord(loadWord(t + tblVals) + i * 8, val)
           return
         }
       }
@@ -159,10 +165,11 @@ export @nosplit @symbol("bit_rt_map_get") fn rtMapGet(m: int, key: int): int {
   }
   if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
     let h = scalarHash(u64(key)) // FIRST: see the header note on the callee-saved set
-    let vcap = loadWord(m + mapCap)
+    let t = mapTable(m)
+    let vcap = loadWord(t + tblCap)
     let mask = vcap - 1
-    let ctrl = loadWord(m + mapCtrl)
-    let keys = loadWord(m + mapKeys)
+    let ctrl = t + tblCtrl
+    let keys = loadWord(t + tblKeys)
     let i = int(h & u64(mask))
     let tag = mapCtrlTag(h)
     let steps = 0
@@ -174,7 +181,7 @@ export @nosplit @symbol("bit_rt_map_get") fn rtMapGet(m: int, key: int): int {
       }
       if (c == tag) {
         if (loadWord(keys + i * 8) == key) {
-          return loadWord(loadWord(m + mapVals) + i * 8)
+          return loadWord(loadWord(t + tblVals) + i * 8)
         }
       }
       i = (i + 1) & mask
@@ -182,22 +189,26 @@ export @nosplit @symbol("bit_rt_map_get") fn rtMapGet(m: int, key: int): int {
     }
     // Unreachable; the shared path below gives the same answer.
   }
-  let slot = mapProbe(m, key, mapHash(m, key))
+  let h = mapHash(m, key)
+  let t = mapTable(m)
+  let slot = mapProbe(m, t, key, h)
   if (!mapProbeFound(slot)) {
     return 0
   }
-  let v = loadWord(loadWord(m + mapVals) + slot * 8)
-  return v
+  return loadWord(loadWord(t + tblVals) + slot * 8)
 }
 
-// `bit_rt_map_slot`: the slot `key` occupies, or -1 when it is absent.
+// `bit_rt_map_slot`: a token for the slot `key` occupies, or -1 when it is
+// absent. The token is not an index: it names the value word in the table this
+// probe used, so `bit_rt_map_val_at` reads that table even if a grow publishes
+// another in between (#5796; maptable.bit has the argument).
 //
 // The two-result read `let (v, ok) = m[k]` (SPEC §12.6) used to lower to
 // `bit_rt_map_get` followed by `bit_rt_map_has`: two exported calls that hashed
 // and probed the SAME key for one source expression, which #4019 measured at
 // 20.0% of `bench/cases/map`. This is the probe half of that read, done once —
 // `ok` is `slot >= 0`, and the value comes from `bit_rt_map_val_at`, which only
-// indexes and never probes.
+// dereferences the token and never probes.
 export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
   if (m == 0) {
     return -1
@@ -207,10 +218,11 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
   }
   if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
     let h = scalarHash(u64(key)) // FIRST: see the header note on the callee-saved set
-    let vcap = loadWord(m + mapCap)
+    let t = mapTable(m)
+    let vcap = loadWord(t + tblCap)
     let mask = vcap - 1
-    let ctrl = loadWord(m + mapCtrl)
-    let keys = loadWord(m + mapKeys)
+    let ctrl = t + tblCtrl
+    let keys = loadWord(t + tblKeys)
     let i = int(h & u64(mask))
     let tag = mapCtrlTag(h)
     let steps = 0
@@ -222,7 +234,7 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
       }
       if (c == tag) {
         if (loadWord(keys + i * 8) == key) {
-          return i
+          return mapValToken(t, i)
         }
       }
       i = (i + 1) & mask
@@ -230,11 +242,13 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
     }
     // Unreachable; the shared path below gives the same answer.
   }
-  let r = mapProbe(m, key, mapHash(m, key))
+  let h = mapHash(m, key)
+  let t = mapTable(m)
+  let r = mapProbe(m, t, key, h)
   if (!mapProbeFound(r)) {
     return -1
   }
-  return r
+  return mapValToken(t, r)
 }
 
 // `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
@@ -252,10 +266,11 @@ export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
   }
   if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
     let h = scalarHash(u64(key)) // FIRST: see the header note on the callee-saved set
-    let vcap = loadWord(m + mapCap)
+    let t = mapTable(m)
+    let vcap = loadWord(t + tblCap)
     let mask = vcap - 1
-    let ctrl = loadWord(m + mapCtrl)
-    let keys = loadWord(m + mapKeys)
+    let ctrl = t + tblCtrl
+    let keys = loadWord(t + tblKeys)
     let i = int(h & u64(mask))
     let tag = mapCtrlTag(h)
     let steps = 0
@@ -269,7 +284,7 @@ export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
         if (loadWord(keys + i * 8) == key) {
           storeByte(ctrl + i, ctrlTomb)
           storeWord(keys + i * 8, 0)
-          storeWord(loadWord(m + mapVals) + i * 8, 0)
+          storeWord(loadWord(t + tblVals) + i * 8, 0)
           storeWord(m + mapLen, loadWord(m + mapLen) - 1)
           return
         }
@@ -279,12 +294,14 @@ export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
     }
     // Unreachable; the shared path below gives the same answer.
   }
-  let slot = mapProbe(m, key, mapHash(m, key))
+  let h = mapHash(m, key)
+  let t = mapTable(m)
+  let slot = mapProbe(m, t, key, h)
   if (!mapProbeFound(slot)) {
     return
   }
-  storeByte(loadWord(m + mapCtrl) + slot, ctrlTomb)
-  storeWord(loadWord(m + mapKeys) + slot * 8, 0)
-  storeWord(loadWord(m + mapVals) + slot * 8, 0)
+  storeByte(t + tblCtrl + slot, ctrlTomb)
+  storeWord(loadWord(t + tblKeys) + slot * 8, 0)
+  storeWord(loadWord(t + tblVals) + slot * 8, 0)
   storeWord(m + mapLen, loadWord(m + mapLen) - 1)
 }

@@ -1,0 +1,102 @@
+// #5796: a comma-ok read racing a grow must return the key's own value.
+//
+// One green thread builds a fresh `map<int, int>` per round: it sets `probeKey`
+// to `probeVal`, hands the map to every reader over a channel (a happens-before
+// edge, so the readers see that entry), then inserts `perRound` more keys,
+// which takes the table from 8 slots through ten doublings. The readers spin
+// on `let (v, ok) = m[probeKey]` for as long as that round's inserts run.
+// `probeKey` is never written again, so every `ok=false` is a FALSE MISS and
+// every `ok=true` with another value is ANOTHER KEY'S value — both breaking
+// SPEC §13.7's "some value some write actually stored there".
+//
+// Before #5796, `mapGrow` replaced `cap`/`ctrl`/`keys`/`vals` as four plain
+// stores and the comma-ok read loaded them afresh in each of its two calls
+// (`bit_rt_map_slot`, then `bit_rt_map_val_at`). Measured on main 734cbb96c,
+// aarch64-macos, BIT_WORKERS=4, three readers, 2000 rounds of 8192: 1122 false
+// misses and 4121 wrong values in 118.8M reads. runtime/root/maptable.bit is
+// the fix and the argument.
+//
+// THE RACE HAS TO BE REAL, so the program proves it ran rather than assuming.
+// `workers` pins BIT_WORKERS=4: at one worker the green threads never run at
+// the same time, and a race that cannot happen reads as fixed. And a reader
+// counts OVERLAPPED reads: the churner's insert counter read before and after
+// ONE comma-ok read, with no back edge between the two loads, so no poll and
+// no preemption can land in that window. A counter that moved across it moved
+// on another OS thread while this read ran. `concurrent=false` means the run
+// proved nothing, and it fails the `.expected` like a wrong value would.
+
+// flags words: [0] the round being grown (negated once its inserts are done),
+// [1] how many keys this round has inserted so far.
+fn churn(chans: []chan<map<int, int>>, flags: []i64, acks: chan<int>) {
+  let fp = ptrOf(flags)
+  for (let r = 1; r <= rounds; r++) {
+    let m = map<int, int>()
+    m[probeKey] = probeVal
+    atomicStore(fp + 1, 0)
+    atomicStore(fp, r)
+    for (let c = 0; c < len(chans); c++) {
+      chans[c] <- m
+    }
+    for (let k = 1; k <= perRound; k++) {
+      m[k] = k * 10
+      atomicStore(fp + 1, k)
+    }
+    atomicStore(fp, -r)
+    for (let c = 0; c < len(chans); c++) {
+      <- acks
+    }
+  }
+}
+
+// One reader: [0] reads, [1] false misses, [2] wrong values, [3] overlapped.
+fn reader(ch: chan<map<int, int>>, flags: []i64, acks: chan<int>, out: chan<[]int>) {
+  let fp = ptrOf(flags)
+  let counts = []int(4)
+  for (let r = 1; r <= rounds; r++) {
+    let m = <- ch
+    while (atomicLoad(fp) == r) {
+      let p0 = atomicLoad(fp + 1)
+      let (v, ok) = m[probeKey]
+      let p1 = atomicLoad(fp + 1)
+      counts[0] = counts[0] + 1
+      if (!ok) {
+        counts[1] = counts[1] + 1
+      } else if (v != probeVal) {
+        counts[2] = counts[2] + 1
+      }
+      if (p1 != p0) {
+        counts[3] = counts[3] + 1
+      }
+    }
+    acks <- 0
+  }
+  out <- counts
+}
+
+const probeKey: int = -12345
+const probeVal: int = 777
+const perRound: int = 4096
+const rounds: int = 200
+const readers: int = 3
+
+fn main() {
+  let flags = []i64(2)
+  let chans = []chan<map<int, int>>(0)
+  let acks = chan<int>(readers)
+  let out = chan<[]int>(readers)
+  for (let c = 0; c < readers; c++) {
+    let ch = chan<map<int, int>>(1)
+    chans = append(chans, ch)
+    spawn reader(ch, flags, acks, out)
+  }
+  spawn churn(chans, flags, acks)
+  let total = []int(4)
+  for (let c = 0; c < readers; c++) {
+    let counts = <- out
+    for (let i = 0; i < 4; i++) {
+      total[i] = total[i] + counts[i]
+    }
+  }
+  eprint("maprace: reads=${total[0]} overlapped=${total[3]}\n")
+  print("maprace: concurrent=${total[3] > 0} miss=${total[1]} wrong=${total[2]}\n")
+}
