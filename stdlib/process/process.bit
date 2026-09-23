@@ -1,0 +1,206 @@
+// Bit standard library — process module (epic #3459).
+//
+// `output` runs a child process and captures its stdout/stderr, the way
+// `std/os`'s `run` runs one with output streamed straight to the terminal.
+// Kept in its OWN module, separate from `std/os`, on purpose: `compiler/`
+// and `tools/build` import `std/os`, and `./make selfhost` builds them with
+// the PINNED stage0 release (`dist/stage0/SHA256SUMS`), whose runtime
+// predates `bit_rt_os_run_captured` and its three companions (ABI.md §19).
+// Declaring those `extern fn`s in `stdlib/os/os.bit` would link-fail every
+// clean bootstrap until the next stage0 repin; a module the compiler never
+// imports has no such caller, so it carries the new symbols safely today.
+
+// The four symbols of ABI.md §19's `bit_rt_os_run_captured` family, declared
+// directly with `extern fn` — matching `stdlib/fs/fs.bit:429`'s
+// `bit_rt_fs_stat_w` — with no compiler builtin registration for any of the
+// four (`compiler/checktype.bit`/`symbols.bit`/`validatecall.bit`/
+// `lowerprim.bit` know nothing of them). `path`/`argv` are raw addresses of
+// hand-built `*const RtBytes`/`SliceHeader` views (`buildCaptureViews`
+// below): the C ABI has no representation for `string`/`[]string`
+// themselves (§11.7, E0077), and `bit_rt_os_run`'s own `[]string` argv
+// marshalling is compiler-builtin codegen this module cannot reach. The
+// three companions likewise return a raw address (or, for `_truncated`, a
+// two-bit set) rather than a `string`, for the same E0077 reason.
+extern fn bit_rt_os_run_captured(path: int, argv: int, timeoutMs: int): int
+extern fn bit_rt_os_run_captured_stdout(): int
+extern fn bit_rt_os_run_captured_stderr(): int
+extern fn bit_rt_os_run_captured_truncated(): int
+extern fn bit_rt_bytes_copy(dst: *byte, src: *byte, n: int)
+
+// The `ptr`/`len` word offsets of a `*const RtBytes`-shaped structure
+// (runtime/ABI.md §2.3/§19: "ptr" then "len") and the five word offsets of a
+// `SliceHeader` (runtime/root/root.bit's `slcBuf`(0)/`slcLen`(8)/`slcOff`(16)/
+// `slcCap`(24)/`slcIsRef`(32)) — re-derived here rather than imported, since
+// a `runtime/**` internal layout is not on `std/`'s import graph from
+// userland source (the same reason `_tests_/imports/osruncaptured/main.bit`
+// re-derives `osRunCaptureMaxBytes` instead of importing it).
+const rtBytesWords: int = 2 // ptr, len
+const rtBytesPtrOff: int = 0
+const rtBytesLenOff: int = 8
+const sliceHeaderWords: int = 5 // buf, len, off, cap, isRef
+
+// The runtime's own ceiling on `timeoutMs` (ABI.md §19's `os_run_bounded_max_ms`
+// clamp, "100 minutes"; `runtime/root/{linux,darwin}/os.bit`'s `osBoundedMaxMs`,
+// `6000000` — re-derived here for the same reason as the offsets above). A
+// caller's `timeoutMs` above this is already clamped down to it inside the
+// runtime; `output`'s own `timeoutMs = 0` default maps to it directly, so
+// "no caller-imposed limit" reads as this bound rather than a second,
+// invented one.
+const outputMaxTimeoutMs: int = 6000000
+
+// The word at raw address `addr` — reads a `*const RtBytes`-shaped result's
+// `ptr`/`len` fields, handed back as a bare integer because no Bit type
+// names "a pointer to a string object this module did not allocate"
+// (mirrors `stdlib/runtime/runtime.bit`'s `wordAt`, built for the identical
+// problem: reading `bit_rt_panic_boundary_msg`'s result).
+fn wordAt(addr: int): int {
+  let zero: *i64 = nil
+  let p = zero + (addr >> 3)
+  return *p
+}
+
+// Raw address `addr` as a byte pointer, for `bit_rt_bytes_copy`.
+fn bytesAt(addr: int): *byte {
+  let zero: *byte = nil
+  return zero + addr
+}
+
+// A fresh `string` copy of the `*const RtBytes`-shaped value at `addr` — one
+// of `bit_rt_os_run_captured_stdout`/`_stderr`'s own results. `addr == 0` or
+// an empty view reads as `""`, the same reading a task that never called
+// `bit_rt_os_run_captured` gets (ABI.md §19).
+fn copyCaptured(addr: int): string {
+  if (addr == 0) {
+    return ""
+  }
+  let n = wordAt(addr + rtBytesLenOff)
+  if (n <= 0) {
+    return ""
+  }
+  let out = []byte(n)
+  bit_rt_bytes_copy(ptrOf(out), bytesAt(wordAt(addr + rtBytesPtrOff)), n)
+  return string(out)
+}
+
+// Everything `output` (below) hands `bit_rt_os_run_captured`, hand-built by
+// `buildCaptureViews`: `pathBytes` and `argBytes` are fresh packed copies of
+// `path`'s and each of `args`' bytes (a Bit `string`'s own layout is not
+// RtBytes-shaped, and — unlike `stdlib/fs/fs.bit`'s `pathWords` case —
+// `ptrOf` refuses a `[]string` outright: "'ptrOf' requires an integer
+// element", so `args`' own backing buffer is never reachable from this
+// module either). `scratch` packs, back to back: one `*const RtBytes` view
+// per argument (a `strSize`/`strBytes`-shaped `{ptr, len}` pair —
+// `runtime/root/root.bit`'s two string readers take any address in that
+// shape, not only a real heap string, which is what makes a hand-built view
+// usable here at all), then the argv data array (one pointer per argument,
+// into its own view above), then the argv `SliceHeader` pointing at that
+// array, then the path's own `*const RtBytes` view last.
+//
+// `pathBytes`, `argBytes` and `scratch` are read again in `output` below,
+// AFTER the extern call returns — that is what keeps all three live across
+// it. A view held only as a raw address, with nothing read after the call,
+// let a collection mid-call reclaim it and the child exec'd garbage
+// (rc=127): `_tests_/imports/osruncaptured/main.bit`'s own `PathView`
+// history, the same hazard for the path view this generalizes.
+class captureViews {
+  pathBytes: []byte,
+  argBytes: [][]byte,
+  scratch: []i64,
+  pathOff: int,
+  argvHeaderOff: int,
+}
+
+fn buildCaptureViews(path: string, args: []string): captureViews {
+  let pathBytes = []byte(path)
+  let n = len(args)
+  let argBytes = [][]byte(n)
+  let i = 0
+  while (i < n) {
+    argBytes[i] = []byte(args[i])
+    i = i + 1
+  }
+  let argViewsOff = 0
+  let argDataOff = argViewsOff + n * rtBytesWords
+  let argHeaderOff = argDataOff + n
+  let pathOff = argHeaderOff + sliceHeaderWords
+  let scratch = []i64(pathOff + rtBytesWords)
+  let base = int(ptrOf(scratch))
+  i = 0
+  while (i < n) {
+    let viewWord = argViewsOff + i * rtBytesWords
+    scratch[viewWord] = int(ptrOf(argBytes[i]))
+    scratch[viewWord + 1] = len(argBytes[i])
+    scratch[argDataOff + i] = base + viewWord * 8
+    i = i + 1
+  }
+  scratch[argHeaderOff] = base + argDataOff * 8 // buf
+  scratch[argHeaderOff + 1] = n                 // len
+  scratch[argHeaderOff + 2] = 0                 // off
+  scratch[argHeaderOff + 3] = n                 // cap
+  scratch[argHeaderOff + 4] = 1                 // isRef: []string's elements are references
+  scratch[pathOff] = int(ptrOf(pathBytes))
+  scratch[pathOff + 1] = len(pathBytes)
+  return captureViews{
+    pathBytes = pathBytes,
+    argBytes = argBytes,
+    scratch = scratch,
+    pathOff = pathOff,
+    argvHeaderOff = argHeaderOff,
+  }
+}
+
+// The result of `output` (below): a completed child's captured streams, its
+// exit code, and whether either stream was cut off at the capture cap.
+export class RunResult {
+  export stdout: string,
+  export stderr: string,
+  export exitCode: int,
+  export truncated: bool,
+}
+
+// Run `path` as a child process with `args` as its argument vector — the
+// same exec/argv/environment contract as `std/os`'s `run` (see its doc
+// comment) — but capture its stdout and stderr into memory instead of
+// leaving them attached to this process's own file descriptors, bounding
+// its wall-clock runtime to `timeoutMs`. Returns a `RunResult` carrying both
+// streams, the exit code (the same encoding `run` returns, plus `-2` for
+// "timed out: the child was killed"), and whether either stream was cut
+// off.
+//
+// Each stream is capped at 4 MiB (ABI.md §19's `osRunCaptureMaxBytes`);
+// content past the cap is still read — leaving it unread would block the
+// child writing to a full pipe forever, deadlocking the other stream behind
+// it — but discarded, and `truncated` is set if either stream hit its cap.
+//
+// `timeoutMs` defaults to `0`, meaning "no caller-imposed limit": that maps
+// to the runtime's own bound rather than lifting it, since there is no
+// unbounded form of this call (ABI.md §19's `os_run_bounded_max_ms`, 100
+// minutes). A caller wanting a real deadline passes one explicitly, e.g.
+// `output(path, args, 5000)` for five seconds; `output(path, args)` alone
+// runs to completion or the 100-minute ceiling, whichever comes first.
+export fn output(path: string, args: []string, timeoutMs: int = 0): RunResult {
+  let boundedTimeoutMs = timeoutMs
+  if (boundedTimeoutMs == 0) {
+    boundedTimeoutMs = outputMaxTimeoutMs
+  }
+  let cv = buildCaptureViews(path, args)
+  let base = int(ptrOf(cv.scratch))
+  let pathAddr = base + cv.pathOff * 8
+  let argvAddr = base + cv.argvHeaderOff * 8
+  let code = bit_rt_os_run_captured(pathAddr, argvAddr, boundedTimeoutMs)
+  if (len(cv.scratch) < 0) {
+    // Keeps `cv` (path bytes, arg bytes, and the scratch buffer built from
+    // both) live across the call above — see `buildCaptureViews`'s doc
+    // comment. Never taken.
+    return RunResult{ stdout = "", stderr = "", exitCode = 0, truncated = false }
+  }
+  let outAddr = bit_rt_os_run_captured_stdout()
+  let errAddr = bit_rt_os_run_captured_stderr()
+  let truncBits = bit_rt_os_run_captured_truncated()
+  return RunResult{
+    stdout = copyCaptured(outAddr),
+    stderr = copyCaptured(errAddr),
+    exitCode = code,
+    truncated = truncBits != 0,
+  }
+}
