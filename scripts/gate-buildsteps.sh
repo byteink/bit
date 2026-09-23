@@ -263,13 +263,15 @@ case "${BUCKET}" in
     # their own fixtures, `_tests_/bit/stringexplode` and
     # `_tests_/bit/stringkeepalive.bit`), not in an env entry, and not in a
     # harness walk of compiler/ the way test-abimembers' is — each one
-    # COMPILES AND RUNS a fixture twice, once with BIT_STRING_EXPLODE_TEST=1,
+    # COMPILES AND RUNS a fixture twice, once with BIT_STRING_EXPLODE=0,
     # and the code under test is the flip itself, which lives entirely in
     # compiler/lowerexplode*, compiler/lower.bit and compiler/codegenlive.bit.
     # So `gates_for_file compiler/codegenlive.bit` is empty (correctly — the
     # changed file is compiler/*.bit, which resolves to this bucket, not to
     # one gate) and before this line a compiler-only diff ran NEITHER gate
-    # that executes the BIT_STRING_EXPLODE_TEST path at all.
+    # that executes the BIT_STRING_EXPLODE=0 off path at all — the flip is
+    # ON by default since #5755/#4411, so every other gate already runs the
+    # on path.
     #
     # The gap is narrower than "unguarded", and the narrower statement is the
     # useful one: test-selfcheck is in this bucket and does fire on the
