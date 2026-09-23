@@ -28,6 +28,15 @@
 # accepting an opaque override, which would make the SBOM's provenance claim
 # unre-derivable from the tag alone. Any OTHER failure -- of either step --
 # is re-raised with its original exit code, unexamined.
+#
+# #5753: a caller that also needs to know WHICH directory (runtime|stdlib)
+# triggered the two-pass build -- dist/release.sh, for its NOTES.md/SBOM
+# provenance wording -- sets PASS1_DIR_FILE to a path before invoking this
+# script; on a documented refusal this writes that word there. Not stdout:
+# this script runs inside the caller's `$(...)`, a subshell, so nothing it
+# sets in its own environment survives past its exit, and stdout's contract
+# above must stay exactly one line. Left unset, the write is skipped -- a
+# caller that only wants the sha pays nothing for it.
 set -euo pipefail
 
 ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -58,6 +67,7 @@ tryTwoPass() {
 		exit 1
 	}
 	echo "release.sh: two-pass transition detected (${dir}/**); pass-1 base ${PASS1_BASE}" >&2
+	[ -n "${PASS1_DIR_FILE:-}" ] && printf '%s' "${dir}" >"${PASS1_DIR_FILE}"
 	bash dist/abitwopass-boot.sh "${PASS1_BASE}" "${dir}" >&2
 }
 
