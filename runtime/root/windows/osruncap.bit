@@ -87,18 +87,17 @@
 // code, which `GetExitCodeProcess` reports like any other, so this function
 // never returns `<= -100`.
 
-import { osRunCaptureMaxBytes } from "../../root"
-// Per-task companions (ABI.md §19, #5781/#5780 established this shape while
-// this ticket was in flight): the captured strings are live GC references,
-// and the M:N scheduler can migrate a task between workers between
-// `bit_rt_os_run_captured` and its companion reads, so a per-WORKER scratch
-// array (never scanned, the shape this file uses everywhere else for raw
-// handles/ints) is the wrong place for them — only the per-task scratch
-// (part of the scanned stack) keeps them reachable across that migration.
-// Mirrors `../darwin/osruncap.bit`'s own `scrOsCapStdout`/`_stderr`/
-// `_truncated` use exactly, for the identical reason.
-import { schedCurrentScratch } from "../../sched"
-import { scrOsCapStdout, scrOsCapStderr, scrOsCapTruncated } from "../../sched"
+import { osRunCaptureMaxBytes, rtOsRunCapturedSet } from "../../root"
+// `rtOsRunCapturedSet` (`runtime/root/slots.bit`, #5780's consolidation):
+// the shared setter behind all three `bit_rt_os_run_captured_stdout`/
+// `_stderr`/`_truncated` getters, which are ALSO defined there now — this
+// file must not redefine them (E0080, each `@symbol` pinned exactly once).
+// Publishes into the CURRENT TASK's per-task scratch, not a per-worker one:
+// the captured strings are live GC references, and the M:N scheduler can
+// migrate a task between workers between `bit_rt_os_run_captured` and its
+// companion reads, so only the per-task scratch (part of the scanned stack)
+// keeps them reachable across that migration. Mirrors
+// `../darwin/osruncap.bit` and `../linux/osruncap.bit` exactly.
 
 // The six new kernel32 externs (`CreatePipe`, `SetHandleInformation`,
 // `PeekNamedPipe`, `InitializeProcThreadAttributeList`,
@@ -179,23 +178,41 @@ let winCapDwordScratch: [33]i32  // one DWORD per slot (Peek avail / ReadFile n)
 // much of `avail` is still left to discard (`avail - consumed`). A single
 // scalar return, not a tuple: `--freestanding` (ABI.md §1.1) boxes a
 // multi-value `return` on the managed heap, which this module cannot use.
+//
+// LOOPS until either `avail` or the remaining room is exhausted (bounded,
+// `winCapDrainMaxChunks`), rather than issuing one `ReadFile` and trusting it
+// to satisfy the full `want`. `ReadFile` on a pipe is free to return FEWER
+// bytes than requested even when both more room and more `avail` remain
+// (found on real hardware: a single-call version silently lost ~0.5% of a
+// large capture — `winCapDrainStream` was treating "not consumed by this
+// one read" as "beyond the cap, discard it", when it was really just
+// unread room). A short read here now simply drives another loop iteration
+// instead of being handed to the discard path.
 @nosplit fn winCapFillFromPipe(handle: int, base: int, used: int, maxBytes: int, avail: int): int {
-  if (used >= maxBytes) {
-    return 0
-  }
-  let room = maxBytes - used
-  let want = avail
-  if (want > room) {
-    want = room
-  }
-  let nAddr = ptrOf(winCapDwordScratch) + osScratchSlot()
+  let totalConsumed = 0
+  let remaining = avail
+  let curUsed = used
+  let chunks = 0
   let nilOverlapped: *byte = nil
-  let ok = ReadFile(hAt(handle), u8At(base + used), i32(want), nAddr, nilOverlapped)
-  let n = int(atomicLoad(nAddr))
-  if (int(ok) == 0 || n <= 0) {
-    return 0
+  while (remaining > 0 && curUsed < maxBytes && chunks < winCapDrainMaxChunks) {
+    let room = maxBytes - curUsed
+    let want = remaining
+    if (want > room) {
+      want = room
+    }
+    let nAddr = ptrOf(winCapDwordScratch) + osScratchSlot()
+    let ok = ReadFile(hAt(handle), u8At(base + curUsed), i32(want), nAddr, nilOverlapped)
+    let n = int(atomicLoad(nAddr))
+    if (int(ok) == 0 || n <= 0) {
+      remaining = 0
+    } else {
+      curUsed = curUsed + n
+      totalConsumed = totalConsumed + n
+      remaining = remaining - n
+    }
+    chunks = chunks + 1
   }
-  return n
+  return totalConsumed
 }
 
 // Reads and throws away `remain` bytes from `handle`, in chunks bounded by
@@ -394,15 +411,16 @@ let winCapChildBuf: [165]i64 // 33 * 5
 // One poll tick against `winCapChildBuf[slot]`: wait `winCapPollMs`, drain
 // both streams regardless of the wait's own result (never let a full pipe
 // block the child while the parent is only checking exit status). Updates
-// `usedOut`/`usedErr` (this worker's own drain-progress scratch,
-// `winCapProgressBuf` — plain byte counts, not GC references, so per-worker
-// scratch is fine for these, unlike the captured strings themselves) and ORs
-// any newly-hit cap into the CURRENT TASK's `scrOsCapTruncated` slot
-// (`runtime/sched/scratch.bit`) directly — no return value carries them,
-// since a multi-value `return` would box on the managed heap
-// (`--freestanding`, see `winCapMakePipe`'s comment). Returns whether the
-// process has exited.
-let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
+// `usedOut`/`usedErr`/`bits` in this worker's own drain-progress scratch,
+// `winCapProgressBuf` — plain byte counts and a bitmask, not GC references,
+// so per-worker scratch is fine for these, unlike the captured STRINGS
+// themselves, which only reach the per-task scratch once, at the very end
+// (`winCapSpawnAndCapture`'s single `rtOsRunCapturedSet` call, matching
+// `../darwin/osruncap.bit`'s own `osCapStoreResult`/`osCapRunLoop` shape:
+// accumulate locally, publish once). No return value carries them either —
+// a multi-value `return` would box on the managed heap (`--freestanding`,
+// see `winCapMakePipe`'s comment). Returns whether the process has exited.
+let winCapProgressBuf: [99]i64 // 33 * 3 -- usedOut, usedErr, bits
 
 @nosplit fn winCapPollTick(slot: int, outCap: int, errCap: int): bool {
   let c = int(ptrOf(winCapChildBuf)) + slot * winCapChildStrideBytes
@@ -410,8 +428,16 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
   let hReadOut = loadWord(c + 8)
   let hReadErr = loadWord(c + 16)
   let wait = int(WaitForSingleObject(hAt(hProcess), i32(winCapPollMs)))
+  winCapDrainTick(slot, outCap, errCap, hReadOut, hReadErr)
+  return wait == winWaitObject0
+}
 
-  let prog = int(ptrOf(winCapProgressBuf)) + slot * 16
+// Drains both streams once (fill-to-cap + discard-the-rest, see
+// `winCapDrainStream`) and folds the results into `winCapProgressBuf[slot]`
+// — shared by `winCapPollTick`'s own per-tick drain and
+// `winCapPollAndDrain`'s post-exit final drain below.
+@nosplit fn winCapDrainTick(slot: int, outCap: int, errCap: int, hReadOut: int, hReadErr: int) {
+  let prog = int(ptrOf(winCapProgressBuf)) + slot * 24
   let packedOut = winCapDrainStream(hReadOut, strData(outCap), loadWord(prog), osRunCaptureMaxBytes)
   let packedErr = winCapDrainStream(
     hReadErr,
@@ -421,36 +447,41 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
   )
   storeWord(prog, winCapDrainUnpackUsed(packedOut))
   storeWord(prog + 8, winCapDrainUnpackUsed(packedErr))
-
-  let scr = schedCurrentScratch()
-  let bits = *(scr + scrOsCapTruncated)
+  let bits = loadWord(prog + 16)
   if (winCapDrainUnpackHit(packedOut)) {
     bits = bits | 1
   }
   if (winCapDrainUnpackHit(packedErr)) {
     bits = bits | 2
   }
-  *(scr + scrOsCapTruncated) = bits
-  return wait == winWaitObject0
+  storeWord(prog + 16, bits)
+}
+
+// Whether either read end still has anything buffered — used to decide
+// whether the post-exit final drain needs another pass.
+@nosplit fn winCapAnyAvail(hReadOut: int, hReadErr: int): bool {
+  return winCapPeekAvail(hReadOut) > 0 || winCapPeekAvail(hReadErr) > 0
 }
 
 // Polls until the child spawned by `winCapOpenChild` exits or `clampedMs`
-// elapses, then does one final drain pass to catch whatever was still
-// buffered at the moment it died, and closes every handle in
+// elapses, then drains until both streams report nothing left buffered
+// (bounded, `winCapFinalDrainMaxPasses`) to catch whatever was still queued
+// at the moment the child died, and closes every handle in
 // `winCapChildBuf[slot]`. Returns `>= 0` (masked exit code) or `-2` (timed
 // out, killed and reaped via the job object, matching `./osrun.bit`'s own
-// bounded pair). `winCapProgressBuf[slot]` and the current task's
-// `scrOsCapTruncated` hold the final drain state on return, for the caller
-// to finalize. The caller (`rtOsRunCaptured`, via `winCapClearResult`) has
-// already zeroed `scrOsCapTruncated` for THIS call before this runs.
+// bounded pair). `winCapProgressBuf[slot]` holds the final drain state on
+// return, for the caller (`winCapSpawnAndCapture`) to finalize and publish.
+const winCapFinalDrainMaxPasses: int = 64
+
 @nosplit fn winCapPollAndDrain(slot: int, clampedMs: int, outCap: int, errCap: int): int {
   // Reset this worker's drain-progress scratch: reused across calls, and
-  // `winCapPollTick` reads it before its first write (accumulating onto
+  // `winCapDrainTick` reads it before its first write (accumulating onto
   // whatever was there), so a stale value from a PRIOR call on this same
   // slot must not leak into this one.
-  let prog0 = int(ptrOf(winCapProgressBuf)) + slot * 16
+  let prog0 = int(ptrOf(winCapProgressBuf)) + slot * 24
   storeWord(prog0, 0)
   storeWord(prog0 + 8, 0)
+  storeWord(prog0 + 16, 0)
 
   let ticks = clampedMs / winCapPollMs + 1
   let polls = 0
@@ -474,29 +505,19 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
     winKillAndReap(hProcess, job, haveJob)
     result = 0 - 2
   }
-  // Final drain: whatever was still buffered when the child died. Reusing
-  // `winCapPollTick`'s own drain-and-store step would need one more
-  // WaitForSingleObject call on an already-dead process, so this repeats
-  // just the drain half directly.
-  let prog = int(ptrOf(winCapProgressBuf)) + slot * 16
-  let packedOut = winCapDrainStream(hReadOut, strData(outCap), loadWord(prog), osRunCaptureMaxBytes)
-  let packedErr = winCapDrainStream(
-    hReadErr,
-    strData(errCap),
-    loadWord(prog + 8),
-    osRunCaptureMaxBytes,
-  )
-  storeWord(prog, winCapDrainUnpackUsed(packedOut))
-  storeWord(prog + 8, winCapDrainUnpackUsed(packedErr))
-  let scr = schedCurrentScratch()
-  let bits = *(scr + scrOsCapTruncated)
-  if (winCapDrainUnpackHit(packedOut)) {
-    bits = bits | 1
+  // Final drain: the child is now dead (reaped above on the timeout path,
+  // exited on the normal path), so nothing writes to either pipe again —
+  // but a fast writer can leave more than one `PeekNamedPipe` snapshot's
+  // worth still queued in the kernel buffer at the instant `done`/the kill
+  // was observed. Repeat the drain until both report empty, bounded by
+  // `winCapFinalDrainMaxPasses` (Power of 10 rule 2) rather than trusting a
+  // single pass to have caught everything.
+  let finalPasses = 0
+  winCapDrainTick(slot, outCap, errCap, hReadOut, hReadErr)
+  while (winCapAnyAvail(hReadOut, hReadErr) && finalPasses < winCapFinalDrainMaxPasses) {
+    winCapDrainTick(slot, outCap, errCap, hReadOut, hReadErr)
+    finalPasses = finalPasses + 1
   }
-  if (winCapDrainUnpackHit(packedErr)) {
-    bits = bits | 2
-  }
-  *(scr + scrOsCapTruncated) = bits
 
   CloseHandle(hAt(hReadOut))
   CloseHandle(hAt(hReadErr))
@@ -545,10 +566,10 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
 // managed allocation `rtStrAlloc` performs — the one this whole freestanding
 // file is permitted, the same primitive `../fsrw.bit`'s `rtFsReadAll`
 // counterpart already uses), poll/drain, then publish the trimmed strings
-// into the CURRENT TASK's `scrOsCapStdout`/`scrOsCapStderr` companion slots
-// (`runtime/sched/scratch.bit`) — `scrOsCapTruncated` is already current,
-// kept live by `winCapPollAndDrain`'s own last drain pass. Returns the exit
-// result only — no tuple, see `winCapMakePipe`'s comment.
+// and the accumulated truncated bits via ONE `rtOsRunCapturedSet` call
+// (`runtime/root/slots.bit`) — the current task's per-task scratch, so the
+// result survives a migration between workers before the companion reads.
+// Returns the exit result only — no tuple, see `winCapMakePipe`'s comment.
 @nosplit fn winCapSpawnAndCapture(appName: int, cmdLine: int, timeoutMs: int): int {
   let slot = osScratchSlot()
   let opened = winCapOpenChild(appName, cmdLine, slot)
@@ -566,31 +587,22 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
 
   let clamped = winCapClampTimeout(timeoutMs)
   let code = winCapPollAndDrain(slot, clamped, outCap, errCap)
-  let prog = int(ptrOf(winCapProgressBuf)) + slot * 16
+  let prog = int(ptrOf(winCapProgressBuf)) + slot * 24
   let outStr = winCapFinalize(strData(outCap), loadWord(prog))
   let errStr = winCapFinalize(strData(errCap), loadWord(prog + 8))
-
-  let scr = schedCurrentScratch()
-  *(scr + scrOsCapStdout) = outStr
-  *(scr + scrOsCapStderr) = errStr
+  rtOsRunCapturedSet(outStr, errStr, loadWord(prog + 16))
   return code
-}
-
-// Cleared at every `rtOsRunCaptured` entry, including every early-failure
-// return below, so a prior call's result never leaks into a spawn failure's
-// "" / "" / 0 (ABI.md §19's own stated default for a task that has not yet
-// captured anything) — mirrors `../darwin/osruncap.bit`'s own
-// `osCapClearResult` exactly.
-@nosplit fn winCapClearResult() {
-  let scr = schedCurrentScratch()
-  *(scr + scrOsCapStdout) = emptyStr()
-  *(scr + scrOsCapStderr) = emptyStr()
-  *(scr + scrOsCapTruncated) = 0
 }
 
 // ---------------------------------------------------------------------------
 // The exported ABI surface (ABI.md §19)
 // ---------------------------------------------------------------------------
+//
+// `_stdout`/`_stderr`/`_truncated` are NOT defined in this file: the shared
+// getters (and the `rtOsRunCapturedSet` setter this file calls above) live
+// in `runtime/root/slots.bit` (#5780's consolidation, the same shape
+// `bit_rt_fs_read_all_failed` already uses there) — a second definition
+// here would be E0080, "symbol already pinned by another declaration".
 
 // `bit_rt_os_run_captured(path, argv, timeoutMs)`: run `path` (appended with
 // `argv`, the same `*const RtBytes`/SliceHeader pair `bit_rt_os_run` takes —
@@ -598,13 +610,17 @@ let winCapProgressBuf: [66]i64 // 33 * 2 -- usedOut, usedErr
 // `checkedPathW`/`winBuildCommandLine`) as a child with its stdout and
 // stderr captured instead of inherited. Same exit encoding as
 // `bit_rt_os_run_bounded` (`>= 0` / `-1` / `-2`); the `<= -100` signal case
-// never occurs on Windows (see header).
+// never occurs on Windows (see header). Cleared to `""`/`""`/`0` at entry
+// (`rtOsRunCapturedSet(emptyStr(), emptyStr(), 0)`), including on every
+// early-failure return below, so a prior call's result never leaks into a
+// spawn failure's default (ABI.md §19) — mirrors `../darwin/osruncap.bit`'s
+// own `osCapClearResult` call.
 export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
   path: int,
   argv: int,
   timeoutMs: int,
 ): int {
-  winCapClearResult()
+  rtOsRunCapturedSet(emptyStr(), emptyStr(), 0)
   let ab = winResolveRunTarget(path, argv)
   if (ab == 0) {
     return 0 - 1
@@ -618,28 +634,4 @@ export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
     return 0 - 1
   }
   return winCapSpawnAndCapture(appName, cmdLine, timeoutMs)
-}
-
-// `bit_rt_os_run_captured_stdout()`/`_stderr()`/`_truncated()`: the current
-// TASK's own three companions, read immediately after
-// `bit_rt_os_run_captured` with no yield between (ABI.md §19) — per-task,
-// not per-worker, so they survive the M:N scheduler migrating this task
-// between workers between the primitive call and these reads (see the
-// import comment above; mirrors `../darwin/osruncap.bit` exactly). Already
-// cleared to `""`/`""`/`0` by `winCapClearResult` for a task that has never
-// called `bit_rt_os_run_captured` (or whose call failed before spawning),
-// so no zero-translation is needed here.
-export @nosplit @symbol("bit_rt_os_run_captured_stdout") fn rtOsRunCapturedStdout(): int {
-  let scr = schedCurrentScratch()
-  return *(scr + scrOsCapStdout)
-}
-
-export @nosplit @symbol("bit_rt_os_run_captured_stderr") fn rtOsRunCapturedStderr(): int {
-  let scr = schedCurrentScratch()
-  return *(scr + scrOsCapStderr)
-}
-
-export @nosplit @symbol("bit_rt_os_run_captured_truncated") fn rtOsRunCapturedTruncated(): int {
-  let scr = schedCurrentScratch()
-  return *(scr + scrOsCapTruncated)
 }
