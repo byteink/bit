@@ -50,8 +50,9 @@ fn main(): ()! {
 ID token's claims hold arrays and nested objects a string map would
 truncate, and a password lookup's callback already builds a JSON object.
 
-This package currently exports only the `Strategy` seam and the middleware
-that runs it — `PasswordStrategy` and `OidcStrategy` are later work under
+This package exports the `Strategy` seam, the middleware that runs it, and
+`newPasswordStrategy` (`password.bit`) — an Argon2id `Strategy` over an
+application-supplied `Lookup` callback. `OidcStrategy` is later work under
 the same epic.
 
 For how first-party packages in this repository are laid out, gated,
