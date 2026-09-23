@@ -148,66 +148,94 @@ echo "L0: building bootstrap runtime archives at ${TAG}..."
 EXIT_ABI_SEAM=3
 L0_RC=0
 TWOPASS_BASE=""
+TWOPASS_DIR=""
+
+# #4198: ${TAG}'s OWN tree may carry #4197/#5752's two-pass recovery tooling
+# (dist/abitwopass.py derives+verifies the pass-1 base mechanically from
+# whichever refusal it is handed; dist/abitwopass-boot.sh performs the
+# two-pass BIT_STAGE0_BIN build in whichever directory -- runtime|stdlib --
+# ABI_TWOPASS_DIR reports, never hardcoded). Invoke THAT COPY, with cwd
+# ${WORK}/src -- never this checkout's own dist/ -- same principle already
+# applied to stage0 resolution below: an old tag rebuilds with the
+# toolchain it was actually cut with.
+#
+# #3971: a tag predating #4197 (v0.4.0, the tag the ABI refusal was first
+# seen on) has no dist/abitwopass.py at all. Its seam is still a seam and
+# the recipe for crossing it is unchanged, so fall back to THIS checkout's
+# copy of the tooling rather than refusing -- INSTALLED INTO the tag's
+# worktree, because both tools take their root from their own location
+# (`dirname $0/..`): run from ${WORK}/src/dist they walk the TAG's history
+# to derive the pass-1 base and build in the TAG's tree, which is the whole
+# point, whereas running the caller's copy in place would derive from
+# main's history and build in the caller's checkout. The one thing that
+# cannot come from a tag older than the tool is the `./make` dump step
+# abitwopass.py reads candidate commits through (stepDumpAbiSymbols,
+# tools/build/abiarity.bit) -- a pure parse of whatever source it is
+# handed, so BIT_ABITWOPASS_DRIVER_ROOT points that lookup, and only it,
+# back at ${ROOT}. Absent the tooling on BOTH sides, runTwoPass returns 1
+# and the caller falls through to its own EXIT_ABI_SEAM=3 refusal.
+#
+# #5753: shared by both refusal branches below -- they differ only in how
+# they DETECT the refusal (grep pattern) and in the wording of their own
+# EXIT_ABI_SEAM fallback message; the recovery mechanics, including reading
+# ABI_TWOPASS_DIR rather than assuming "runtime", are identical, so they
+# share this one implementation instead of drifting into two copies of the
+# same bug.
+runTwoPass() {
+  local pinned_tag="$1"
+  TWOPASS_DRIVER=""
+  TWOPASS_ORIGIN="${TAG}'s own tree"
+  if [ ! -f "${WORK}/src/dist/abitwopass.py" ] && [ -f "${ROOT}/dist/abitwopass.py" ]; then
+    cp "${ROOT}/dist/abitwopass.py" "${ROOT}/dist/abitwopass-boot.sh" "${WORK}/src/dist/"
+    TWOPASS_DRIVER="${ROOT}"
+    TWOPASS_ORIGIN="this checkout (${TAG} predates #4197 and carries none), installed into the tag's worktree"
+  fi
+  [ -f "${WORK}/src/dist/abitwopass.py" ] || return 1
+  echo "verify-reproducible-release.sh: ${TAG} refuses a single-pass build (pinned stage0 ${pinned_tag:-an earlier release}); using #4197/#5752's two-pass recovery tooling from ${TWOPASS_ORIGIN}." >&2
+  local plan="${WORK}/abiplan.txt"
+  if ! ( cd "${WORK}/src" && BIT_ABITWOPASS_DRIVER_ROOT="${TWOPASS_DRIVER}" python3 dist/abitwopass.py "${WORK}/build.log" ) >"${plan}"; then
+    echo "verify-reproducible-release.sh: dist/abitwopass.py (${TWOPASS_ORIGIN}) could not derive a two-pass base for this refusal -- see its diagnostics above." >&2
+    exit 1
+  fi
+  TWOPASS_BASE="$(sed -n 's/^ABI_TWOPASS_BASE=//p' "${plan}")"
+  TWOPASS_DIR="$(sed -n 's/^ABI_TWOPASS_DIR=//p' "${plan}")"
+  [ -n "${TWOPASS_BASE}" ] && [ -n "${TWOPASS_DIR}" ] || {
+    echo "verify-reproducible-release.sh: dist/abitwopass.py (${TWOPASS_ORIGIN}) exited 0 but printed no ABI_TWOPASS_BASE/ABI_TWOPASS_DIR" >&2
+    exit 1
+  }
+  echo "verify-reproducible-release.sh: two-pass bootstrap (${TWOPASS_DIR}/**), pass-1 base ${TWOPASS_BASE}" >&2
+  ( cd "${WORK}/src" && bash dist/abitwopass-boot.sh "${TWOPASS_BASE}" "${TWOPASS_DIR}" ) >>"${WORK}/build.log" 2>&1 ||
+    { echo "verify-reproducible-release.sh: dist/abitwopass-boot.sh (${TWOPASS_ORIGIN}) failed; the build log path is printed at exit" >&2; exit 1; }
+}
+
 ( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 || L0_RC=$?
 if [ "${L0_RC}" -ne 0 ]; then
   if grep -q 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log"; then
     pinned_tag="$(grep -m1 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log" |
       grep -oE '\(v[^)]*\)' | tr -d '()')"
-    # #4198: ${TAG}'s OWN tree may carry #4197's two-pass recovery tooling
-    # (dist/abitwopass.py derives+verifies the pass-1 base mechanically from
-    # this exact refusal's mismatch set; dist/abitwopass-boot.sh performs the
-    # two-pass BIT_STAGE0_BIN build). Invoke THAT COPY, with cwd ${WORK}/src
-    # -- never this checkout's own dist/ -- same principle already applied to
-    # stage0 resolution below: an old tag rebuilds with the toolchain it was
-    # actually cut with.
-    #
-    # #3971: a tag predating #4197 (v0.4.0, the tag this refusal was first
-    # seen on) has no dist/abitwopass.py at all. Its ABI seam is still a
-    # seam and the recipe for crossing it is unchanged, so fall back to THIS
-    # checkout's copy of the tooling rather than refusing -- INSTALLED INTO
-    # the tag's worktree, because both tools take their root from their own
-    # location (`dirname $0/..`): run from ${WORK}/src/dist they walk the
-    # TAG's history to derive the pass-1 base and build in the TAG's tree,
-    # which is the whole point, whereas running the caller's copy in place
-    # would derive from main's history and build in the caller's checkout.
-    # The one thing that cannot come from a tag older than the tool is the
-    # `./make` dump step abitwopass.py reads candidate commits through
-    # (stepDumpAbiSymbols, tools/build/abiarity.bit) -- a pure parse of
-    # whatever source it is handed, so BIT_ABITWOPASS_DRIVER_ROOT points
-    # that lookup, and only it, back at ${ROOT}. Absent the tooling on BOTH
-    # sides, fall through to the EXIT_ABI_SEAM=3 refusal exactly as before.
-    TWOPASS_DRIVER=""
-    TWOPASS_ORIGIN="${TAG}'s own tree"
-    if [ ! -f "${WORK}/src/dist/abitwopass.py" ] && [ -f "${ROOT}/dist/abitwopass.py" ]; then
-      cp "${ROOT}/dist/abitwopass.py" "${ROOT}/dist/abitwopass-boot.sh" "${WORK}/src/dist/"
-      TWOPASS_DRIVER="${ROOT}"
-      TWOPASS_ORIGIN="this checkout (${TAG} predates #4197 and carries none), installed into the tag's worktree"
-    fi
-    if [ -f "${WORK}/src/dist/abitwopass.py" ]; then
-      echo "verify-reproducible-release.sh: ${TAG} refuses a single-pass build (pinned stage0 ${pinned_tag:-an earlier release}); using #4197's two-pass recovery tooling from ${TWOPASS_ORIGIN}." >&2
-      PLAN="${WORK}/abiplan.txt"
-      if ! ( cd "${WORK}/src" && BIT_ABITWOPASS_DRIVER_ROOT="${TWOPASS_DRIVER}" python3 dist/abitwopass.py "${WORK}/build.log" ) >"${PLAN}"; then
-        echo "verify-reproducible-release.sh: dist/abitwopass.py (${TWOPASS_ORIGIN}) could not derive a two-pass base for this refusal -- see its diagnostics above." >&2
-        exit 1
-      fi
-      TWOPASS_BASE="$(sed -n 's/^ABI_TWOPASS_BASE=//p' "${PLAN}")"
-      [ -n "${TWOPASS_BASE}" ] || {
-        echo "verify-reproducible-release.sh: dist/abitwopass.py (${TWOPASS_ORIGIN}) exited 0 but printed no ABI_TWOPASS_BASE" >&2
-        exit 1
-      }
-      echo "verify-reproducible-release.sh: two-pass bootstrap, pass-1 base ${TWOPASS_BASE}" >&2
-      # "runtime": this branch only ever reaches abitwopass-boot.sh via the
-      # runtime ABI arity refusal detected above (#5752 parameterised
-      # abitwopass-boot.sh by directory; the stdlib syntax transition is not
-      # yet wired into this script's own detection -- see #5752's ticket).
-      ( cd "${WORK}/src" && bash dist/abitwopass-boot.sh "${TWOPASS_BASE}" runtime ) >>"${WORK}/build.log" 2>&1 ||
-        { echo "verify-reproducible-release.sh: dist/abitwopass-boot.sh (${TWOPASS_ORIGIN}) failed; the build log path is printed at exit" >&2; exit 1; }
+    if runTwoPass "${pinned_tag}"; then
       L0_RC=0
     else
       echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
       echo "verify-reproducible-release.sh: its own dist/stage0/SHA256SUMS pins ${pinned_tag:-an earlier release}, whose runtime/** predates a runtime ABI change now present in ${TAG} -- #3152's guard correctly refuses to link the mismatched pair (unsafe, not merely unavailable)." >&2
       echo "verify-reproducible-release.sh: reproducing ${TAG} needs the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, \"Landing a runtime ABI change\"), and #4197's tooling for it (dist/abitwopass.py) is present neither in ${TAG}'s own tree nor in this checkout. Guard output:" >&2
       sed -n '/runtime ABI arity mismatch against the pinned stage0/,$p' "${WORK}/build.log" >&2
+      exit "${EXIT_ABI_SEAM}"
+    fi
+  elif grep -qE "^error\[E[0-9]+\]: '[A-Za-z_][A-Za-z0-9_]*' is a reserved keyword\$" "${WORK}/build.log" \
+      && grep -qE '^   --> .*stdlib/[^:]+:[0-9]+:[0-9]+$' "${WORK}/build.log"; then
+    # #5752/#5753: stdlib/** started using a keyword the pinned stage0 (an
+    # earlier release) still parses as reserved -- the same seam as the ABI
+    # branch above, one directory over. Mirrors dist/abitwopass.py's own
+    # STDLIB_SYNTAX_KEYWORD_RE / STDLIB_SYNTAX_LOCATION_RE rather than
+    # inventing a third detection shape.
+    if runTwoPass ""; then
+      L0_RC=0
+    else
+      echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
+      echo "verify-reproducible-release.sh: this tree's stdlib/** now uses a keyword the pinned stage0 still parses as reserved -- a stdlib syntax transition (#5752), the same class of seam as a runtime ABI change." >&2
+      echo "verify-reproducible-release.sh: reproducing ${TAG} needs the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, \"Landing a syntax change that \`stdlib/**\` then uses\"), and #5752's tooling for it (dist/abitwopass.py) is present neither in ${TAG}'s own tree nor in this checkout. Guard output:" >&2
+      sed -n "/is a reserved keyword/,\$p" "${WORK}/build.log" >&2
       exit "${EXIT_ABI_SEAM}"
     fi
   else
