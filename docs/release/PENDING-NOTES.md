@@ -46,19 +46,3 @@ instead, as the entry below does. `dist/release.sh` refuses to fold an entry
 that violates this rather than let it corrupt the count silently.
 
 ---
-
-## Run a program and read what it printed
-
-The new `std/process` module adds `output(path, args, timeoutMs = 0)`. It runs a program and returns a `RunResult` holding its `stdout`, its `stderr`, its `exitCode` and whether either stream was `truncated`. Each stream is capped at 4 MiB, and both are read concurrently, so a program that fills both streams cannot deadlock its caller. A `timeoutMs` of 0 means no caller-imposed limit. A program that runs out of time reports exit code -2, and a program that cannot be started reports 127. `std/os.run` is unchanged and still streams output straight to the terminal.
-
-## Open a file inside a directory without following links
-
-The new `std/fs/secure` module adds `openBeneath(root, rel)` and `statOpen(file)`. `openBeneath` refuses a symbolic link in any component of `rel` and any `..` that would leave `root`, and a concurrent rename cannot race it past either check. `statOpen` reads the size, modification time and file type from the opened file itself rather than from a path. Supported on macOS and Linux; on Windows `openBeneath` currently returns an error.
-
-## Faster `%` by a constant on ARM Linux
-
-On aarch64-linux, the remainder by a constant divisor is now computed with a multiply instead of a hardware divide. On an AWS Graviton3, `bench/cases/strings` used 45% fewer cycles and a `% 12` loop 66% fewer. Other targets are unchanged.
-
-## Safer temporary programs in `bit run` and `bit test`
-
-`bit run` and `bit test` now build each temporary executable inside a fresh private directory (mode 0700) that refuses to reuse an existing path, and `bit test` removes that directory when it is interrupted with Ctrl-C or SIGTERM.
