@@ -8,7 +8,7 @@
 // expired entries are swept on a schedule instead of waiting for their own
 // id to be read again.
 //
-// The expiry tests drive the module-private `readAt(sid, nowNs)` rather than
+// The expiry tests drive the module-private `loadAt(sid, nowNs)` rather than
 // sleeping. A timed test would be both slow and flaky, and a store whose only
 // testable ttl were 0 would leave the arithmetic behind a positive one
 // unexercised — which is where an off-by-a-billion would live.
@@ -23,9 +23,27 @@ fn storeData(pairs: []string): map<string, string> {
   return m
 }
 
+// This id's current version, or 0 when it is absent or tombstoned — exactly
+// the `expectedVersion` a fresh `compareAndSet` on it must send (#5794).
+// A test helper is allowed to read-then-write like this because these tests
+// are single-threaded and sequential; the store itself never does.
+fn currentVersion(s: MemoryStore, sid: string, nowNs: i64): i64 {
+  let found = s.loadAt(sid, nowNs)
+  if (isSome(found)) {
+    let (_, version) = unwrap(found)
+    return version
+  }
+  return 0
+}
+
+// Writes `data` for `sid` unconditionally from the test's point of view: it
+// reads the current version itself and sends exactly that as
+// `compareAndSet`'s `expectedVersion`, so a test can keep writing "the way
+// `write` used to work" while the store underneath is versioned.
 fn mustWrite(s: MemoryStore, sid: string, data: map<string, string>, ttl: i64) {
-  s.write(sid, data, ttl) catch e {
-    panic("write: ${e.message()}")
+  let nowNs = now().ns
+  s.compareAndSet(sid, currentVersion(s, sid, nowNs), data, ttl) catch e {
+    panic("compareAndSet: ${e.message()}")
   }
 }
 
@@ -35,20 +53,21 @@ fn mustWrite(s: MemoryStore, sid: string, data: map<string, string>, ttl: i64) {
 // that had stopped reporting presence at all (#4483). The tests about
 // absence use `readIsMiss`.
 fn mustRead(s: MemoryStore, sid: string): map<string, string> {
-  let got = s.read(sid) catch e {
-    panic("read: ${e.message()}")
+  let got = s.load(sid) catch e {
+    panic("load: ${e.message()}")
   }
   if (!isSome(got)) {
-    panic("read('${sid}'): expected a stored session, got a miss")
+    panic("load('${sid}'): expected a stored session, got a miss")
   }
-  return unwrap(got)
+  let (data, _) = unwrap(got)
+  return data
 }
 
 // Whether `sid` is absent from the store. `Option.None` is the only spelling
 // of absent; a hit carrying no keys is NOT one.
 fn readIsMiss(s: MemoryStore, sid: string): bool {
-  let got = s.read(sid) catch e {
-    panic("read: ${e.message()}")
+  let got = s.load(sid) catch e {
+    panic("load: ${e.message()}")
   }
   return !isSome(got)
 }
@@ -66,7 +85,7 @@ test "an unknown id reads as a miss, not a failure" {
   // A miss is the normal case on a public endpoint — a forged, expired or
   // long-destroyed id — so it must not look like a store outage.
   let s = MemoryStore(1000)
-  let got = s.read("never-written") catch e {
+  let got = s.load("never-written") catch e {
     panic("a miss must not fail: ${e.message()}")
   }
   assert(!isSome(got), "a never-written id must read as Option.None")
@@ -79,28 +98,26 @@ test "a stored session with no keys reads as present, not as a miss" {
   // `Some` for everything would fail it.
   let s = MemoryStore(1000)
   mustWrite(s, "abc", map<string, string>(), 3600)
-  let got = s.read("abc") catch e {
-    panic("read: ${e.message()}")
+  let got = s.load("abc") catch e {
+    panic("load: ${e.message()}")
   }
   assert(isSome(got), "a stored session with no keys read as a miss")
-  assert(
-    len(unwrap(got)) == 0,
-    "the stored session must still be empty, got ${len(unwrap(got))} key(s)",
-  )
+  let (data, _) = unwrap(got)
+  assert(len(data) == 0, "the stored session must still be empty, got ${len(data)} key(s)")
 }
 
 test "destroy removes the entry, and a second destroy is not an error" {
   let s = MemoryStore(1000)
   mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 3600)
   assert(len(mustRead(s, "abc")) == 1, "precondition: the entry must exist first")
-  s.destroy("abc") catch e {
+  s.destroy("abc", 3600) catch e {
     panic("destroy: ${e.message()}")
   }
   assert(readIsMiss(s, "abc"), "destroy left the entry readable")
-  s.destroy("abc") catch e {
+  s.destroy("abc", 3600) catch e {
     panic("destroying an absent id must be a no-op: ${e.message()}")
   }
-  s.destroy("never-written") catch e {
+  s.destroy("never-written", 3600) catch e {
     panic("destroying an unknown id must be a no-op: ${e.message()}")
   }
 }
@@ -109,7 +126,7 @@ test "destroy removes only the id it names" {
   let s = MemoryStore(1000)
   mustWrite(s, "a", storeData([]string{ "k", "1" }), 3600)
   mustWrite(s, "b", storeData([]string{ "k", "2" }), 3600)
-  s.destroy("a") catch e {
+  s.destroy("a", 3600) catch e {
     panic("destroy: ${e.message()}")
   }
   assert(readIsMiss(s, "a"), "'a' should be gone")
@@ -122,10 +139,11 @@ test "a positive ttl is honoured: alive inside the window, gone past it" {
   mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 60)
 
   // Both sides, so a store that always expired — or never did — fails one.
-  let inside = s.readAt("abc", writtenAt + 59 * nsPerSecond)
+  let inside = s.loadAt("abc", writtenAt + 59 * nsPerSecond)
   assert(isSome(inside), "the entry must still be readable 59s into a 60s ttl")
-  assert(len(unwrap(inside)) == 1, "expected 1 key inside the window, got ${len(unwrap(inside))}")
-  let past = s.readAt("abc", writtenAt + 61 * nsPerSecond)
+  let (insideData, _) = unwrap(inside)
+  assert(len(insideData) == 1, "expected 1 key inside the window, got ${len(insideData)}")
+  let past = s.loadAt("abc", writtenAt + 61 * nsPerSecond)
   assert(!isSome(past), "a 60s ttl must have expired at 61s")
 }
 
@@ -137,15 +155,15 @@ test "an expired entry reads as a miss, not as a present-but-empty session" {
   let writtenAt = now().ns
   mustWrite(s, "abc", map<string, string>(), 60)
   // The control: while it is alive it is a hit, keyless or not.
-  assert(isSome(s.readAt("abc", writtenAt + 59 * nsPerSecond)), "precondition: alive at 59s")
-  assert(!isSome(s.readAt("abc", writtenAt + 61 * nsPerSecond)), "an expired entry must be a miss")
+  assert(isSome(s.loadAt("abc", writtenAt + 59 * nsPerSecond)), "precondition: alive at 59s")
+  assert(!isSome(s.loadAt("abc", writtenAt + 61 * nsPerSecond)), "an expired entry must be a miss")
 }
 
 test "an expired entry is dropped, not merely hidden" {
   let s = MemoryStore(1000)
   mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 60)
   assert(len(s.entries) == 1, "precondition: one entry")
-  let _ = s.readAt("abc", now().ns + 61 * nsPerSecond)
+  let _ = s.loadAt("abc", now().ns + 61 * nsPerSecond)
   assert(len(s.entries) == 0, "the expired entry is still held: ${len(s.entries)}")
 }
 
@@ -186,11 +204,12 @@ test "a second write to the same id replaces the entry and refreshes the window"
   let got = mustRead(s, "abc")
   assert(len(got) == 1, "the second write must replace, not merge: ${len(got)} key(s)")
   assert(got["theme"] == "dark", "theme: got '${got["theme"]}'")
-  let refreshed = s.readAt("abc", t0 + 61 * nsPerSecond)
+  let refreshed = s.loadAt("abc", t0 + 61 * nsPerSecond)
   assert(isSome(refreshed), "the second write must refresh the expiry window")
+  let (refreshedData, _) = unwrap(refreshed)
   assert(
-    len(unwrap(refreshed)) == 1,
-    "the refreshed entry must still hold its key, got ${len(unwrap(refreshed))}",
+    len(refreshedData) == 1,
+    "the refreshed entry must still hold its key, got ${len(refreshedData)}",
   )
 }
 
@@ -201,13 +220,23 @@ test "a second write to the same id replaces the entry and refreshes the window"
 // of it. These tests are the store's half of the answer: a hard cap, eviction
 // of the oldest-expiring entry when a write would cross it, and a sweep of
 // expired entries every `memoryStoreSweepEvery` writes. They drive the
-// module-private `writeAt(sid, data, ttl, nowNs)` for `readAt`'s reason —
-// eviction order is decided by expiry times, and two writes racing the wall
-// clock cannot be ordered deterministically.
+// module-private `compareAndSetAt(sid, expectedVersion, data, ttl, nowNs)`
+// for `loadAt`'s reason — eviction order is decided by expiry times, and two
+// writes racing the wall clock cannot be ordered deterministically.
 
-// One entry, written against a caller-supplied clock.
+// One entry, written against a caller-supplied clock. Reads the id's current
+// version itself (`currentVersion`'s doc explains why a test helper may),
+// so the tests below keep writing "the way `write` used to work".
 fn writeAtNs(s: MemoryStore, sid: string, value: string, ttl: i64, nowNs: i64) {
-  s.writeAt(sid, storeData([]string{ "k", value }), ttl, nowNs)
+  s.compareAndSetAt(
+    sid,
+    currentVersion(s, sid, nowNs),
+    storeData([]string{ "k", value }),
+    ttl,
+    nowNs,
+  ) catch e {
+    panic("compareAndSetAt: ${e.message()}")
+  }
 }
 
 test "a write past the cap evicts the oldest-expiring entry instead of failing" {
@@ -225,14 +254,15 @@ test "a write past the cap evicts the oldest-expiring entry instead of failing" 
   writeAtNs(s, "d", "4", 9000, t0)
 
   assert(len(s.entries) == 3, "the cap was crossed: ${len(s.entries)} entries under a cap of 3")
-  assert(!isSome(s.readAt("a", t0)), "the oldest-expiring entry must be the one evicted")
-  assert(isSome(s.readAt("b", t0)), "b expires last and must survive")
-  assert(isSome(s.readAt("c", t0)), "c must survive")
+  assert(!isSome(s.loadAt("a", t0)), "the oldest-expiring entry must be the one evicted")
+  assert(isSome(s.loadAt("b", t0)), "b expires last and must survive")
+  assert(isSome(s.loadAt("c", t0)), "c must survive")
   // The write itself must have landed — an implementation that "bounded" the
   // store by dropping the incoming write would satisfy every line above.
-  let got = s.readAt("d", t0)
+  let got = s.loadAt("d", t0)
   assert(isSome(got), "the write past the cap must still land")
-  assert(unwrap(got)["k"] == "4", "d: got '${unwrap(got)["k"]}'")
+  let (gotData, _) = unwrap(got)
+  assert(gotData["k"] == "4", "d: got '${gotData["k"]}'")
 }
 
 test "the entry count never exceeds the cap, however many distinct ids are written" {
@@ -266,8 +296,8 @@ test "at the cap, an expired entry is spent before a live one" {
   writeAtNs(s, "new", "3", 3600, later)
 
   assert(len(s.entries) == 2, "the cap was crossed: ${len(s.entries)} entries under a cap of 2")
-  assert(isSome(s.readAt("live", later)), "a live session was evicted while a dead one was held")
-  assert(isSome(s.readAt("new", later)), "the new entry must be present")
+  assert(isSome(s.loadAt("live", later)), "a live session was evicted while a dead one was held")
+  assert(isSome(s.loadAt("new", later)), "the new entry must be present")
 }
 
 test "a write to an id already present replaces it and evicts nothing" {
@@ -283,10 +313,11 @@ test "a write to an id already present replaces it and evicts nothing" {
   writeAtNs(s, "a", "9", 7200, t0)
 
   assert(len(s.entries) == 2, "a replacement must not change the count: ${len(s.entries)}")
-  assert(isSome(s.readAt("b", t0)), "replacing 'a' evicted 'b'")
-  let got = s.readAt("a", t0)
+  assert(isSome(s.loadAt("b", t0)), "replacing 'a' evicted 'b'")
+  let got = s.loadAt("a", t0)
   assert(isSome(got), "'a' must still be present after its replacement")
-  assert(unwrap(got)["k"] == "9", "the replacement must win: got '${unwrap(got)["k"]}'")
+  let (gotData, _) = unwrap(got)
+  assert(gotData["k"] == "9", "the replacement must win: got '${gotData["k"]}'")
 }
 
 test "expired entries are swept every Nth write, not held until their id is read again" {
@@ -343,7 +374,7 @@ test "a cap of one constructs, and the store then holds exactly one entry" {
   writeAtNs(s, "a", "1", 3600, t0)
   writeAtNs(s, "b", "2", 3600, t0)
   assert(len(s.entries) == 1, "a cap of 1 must hold exactly one entry, got ${len(s.entries)}")
-  assert(isSome(s.readAt("b", t0)), "the most recent write must be the entry that is held")
+  assert(isSome(s.loadAt("b", t0)), "the most recent write must be the entry that is held")
 }
 
 // `testpanic_` reads the child's exit status only and cannot see the

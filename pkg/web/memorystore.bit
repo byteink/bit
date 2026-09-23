@@ -52,9 +52,20 @@ const memoryStoreCapMessage = "web: MemoryStore(maxEntries): the cap must be " +
 // One stored session. `expiresAtNs` is absolute (nanoseconds since the
 // epoch, `now().ns`) rather than a ttl plus a write time, so expiry is one
 // comparison and no arithmetic can drift between the two fields.
+//
+// `version` (#5794) is the compare-and-set counter: it starts at 1 on the
+// entry's first write and increments on every later `compareAndSet` or
+// `destroy`. `tombstone` marks an entry `destroy()` left behind rather than
+// one holding live session data — `load` reports it as a miss like any
+// expired entry, but `compareAndSet` refuses it unconditionally, which is
+// what stops a stale writer from resurrecting a destroyed session. A
+// tombstone is bounded the same way a live entry is: it carries its own
+// `expiresAtNs` and is swept and evicted exactly like one.
 class MemoryEntry {
   data: map<string, string>,
   expiresAtNs: i64,
+  version: i64,
+  tombstone: bool,
 }
 
 export class MemoryStore {
@@ -68,7 +79,7 @@ export class MemoryStore {
   writesSinceSweep: int
   // A store is shared by every request, and requests are concurrent. The
   // map is not safe for concurrent use, so every method takes the lock —
-  // including `read`, which mutates on the expiry path.
+  // including `load`, which mutates on the expiry path.
   mu: Mutex
 
   init(maxEntries: int) {
@@ -86,36 +97,52 @@ export class MemoryStore {
     this.mu = newMutex()
   }
 
-  // `Option.None` is a miss; `Option.Some(data)` is a hit, whether or not
-  // `data` has any keys (#4483). Emptiness is a property of the session, not
-  // an encoding of absence.
-  export read(sid: string): Option<map<string, string>>! {
-    return this.readAt(sid, now().ns)
+  // `Option.None` is a miss; `Option.Some((data, version))` is a hit,
+  // whether or not `data` has any keys (#4483). Emptiness is a property of
+  // the session, not an encoding of absence. A tombstoned id is a miss too —
+  // `load` never distinguishes "never written" from "destroyed"; only
+  // `compareAndSet` needs to, and only it sees the tombstone.
+  export load(sid: string): Option<(map<string, string>, i64)>! {
+    return this.loadAt(sid, now().ns)
   }
 
-  export write(sid: string, data: map<string, string>, ttl: i64): ()! {
-    this.writeAt(sid, data, ttl, now().ns)
+  // Writes `data` only when `expectedVersion` still matches this id's
+  // current version and the id is not tombstoned; returns the new version.
+  // Fails with a conflict, naming what changed, otherwise — the caller
+  // decides whether to reload and retry, this store never overwrites a
+  // version it was not handed (#5794).
+  export compareAndSet(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    return this.compareAndSetAt(sid, expectedVersion, data, ttl, now().ns)?
   }
 
-  export destroy(sid: string): ()! {
-    this.mu.lock()
-    defer this.mu.unlock()
-    delete(this.entries, sid)
+  // Unconditional: tombstones `sid` so no `compareAndSet` holding an older
+  // version can resurrect it, bounded by `tombstoneTtl` the same way a live
+  // entry is bounded by its own ttl (#5794).
+  export destroy(sid: string, tombstoneTtl: i64): ()! {
+    this.destroyAt(sid, tombstoneTtl, now().ns)
   }
 
-  // `write` against a caller-supplied clock, module-private for `readAt`'s
-  // reason: it is what lets a test drive the sweep and the eviction order
-  // deterministically instead of racing the wall clock.
+  // `compareAndSet` against a caller-supplied clock, module-private for
+  // `readAt`'s original reason: it is what lets a test drive the sweep and
+  // the eviction order deterministically instead of racing the wall clock.
   //
   // Order is load-bearing. The sweep runs BEFORE the cap is tested, so a
   // store full of expired entries makes room from the dead rather than
-  // evicting a live session; the cap is then tested only for an id that is
-  // not already present, since replacing an entry cannot grow the map.
-  //
-  // Not fallible, and a write past the cap is not an error: a store that
-  // refused writes when full would turn a full store into a broken app,
-  // and the caller has nothing useful to do with the failure.
-  writeAt(sid: string, data: map<string, string>, ttl: i64, nowNs: i64) {
+  // evicting a live session; the version check runs before the cap is
+  // touched at all, so a losing writer never pays for a slot it will not
+  // get.
+  compareAndSetAt(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    ttl: i64,
+    nowNs: i64,
+  ): i64! {
     this.mu.lock()
     defer this.mu.unlock()
     this.writesSinceSweep = this.writesSinceSweep + 1
@@ -123,10 +150,21 @@ export class MemoryStore {
       this.writesSinceSweep = 0
       this.sweepExpired(nowNs)
     }
-    let (_, present) = this.entries[sid]
+    let (e, present) = this.entries[sid]
+    if (present && e.tombstone) {
+      fail conflictError(sid, expectedVersion, "the id was destroyed")
+    }
+    let liveVersion: i64 = 0
+    if (present && e.expiresAtNs > nowNs) {
+      liveVersion = e.version
+    }
+    if (liveVersion != expectedVersion) {
+      fail conflictError(sid, expectedVersion, "the store has version ${liveVersion}")
+    }
     if (!present && len(this.entries) >= this.maxEntries) {
       this.evictOldestExpiring()
     }
+    let newVersion = expectedVersion + 1
     // The caller's map is copied, not aliased. A store is a persistence
     // boundary: a real one serialises here, so an in-memory one that kept
     // handing back the very map a previous request is still mutating would
@@ -135,6 +173,32 @@ export class MemoryStore {
     this.entries[sid] = MemoryEntry{
       data = copyData(data),
       expiresAtNs = nowNs + ttl * nsPerSecond,
+      version = newVersion,
+      tombstone = false,
+    }
+    return newVersion
+  }
+
+  // `destroy` against a caller-supplied clock, `compareAndSetAt`'s reason.
+  // Shares its cap-eviction rule — a tombstone for an id this store has
+  // never seen still takes a slot — so tombstones are bounded by the exact
+  // same mechanism live entries are, nothing new to keep in sync.
+  destroyAt(sid: string, tombstoneTtl: i64, nowNs: i64) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (e, present) = this.entries[sid]
+    let currentVersion: i64 = 0
+    if (present) {
+      currentVersion = e.version
+    }
+    if (!present && len(this.entries) >= this.maxEntries) {
+      this.evictOldestExpiring()
+    }
+    this.entries[sid] = MemoryEntry{
+      data = map<string, string>(),
+      expiresAtNs = nowNs + tombstoneTtl * nsPerSecond,
+      version = currentVersion + 1,
+      tombstone = true,
     }
   }
 
@@ -142,8 +206,8 @@ export class MemoryStore {
   // first and deleted after: mutating a map while iterating it is not a
   // thing to rely on.
   //
-  // The LOCK IS ALREADY HELD by `writeAt`, the only caller. `Mutex` is not
-  // reentrant, so this must not take it.
+  // The LOCK IS ALREADY HELD by `compareAndSetAt`, the only caller. `Mutex`
+  // is not reentrant, so this must not take it.
   sweepExpired(nowNs: i64) {
     let dead = []string(0)
     for (sid, e) of this.entries {
@@ -165,7 +229,8 @@ export class MemoryStore {
   // O(n) per eviction, which is the honest cost of not keeping a second
   // index. A store where that matters is a `RedisStore`.
   //
-  // The LOCK IS ALREADY HELD by `writeAt`, the only caller.
+  // The LOCK IS ALREADY HELD by `compareAndSetAt` or `destroyAt`, its only
+  // callers.
   evictOldestExpiring() {
     let victim = ""
     let victimNs: i64 = 0
@@ -182,7 +247,7 @@ export class MemoryStore {
     }
   }
 
-  // `read` against a caller-supplied clock. Module-private: it exists so a
+  // `load` against a caller-supplied clock. Module-private: it exists so a
   // test can prove a POSITIVE ttl really expires, deterministically, without
   // sleeping — the only alternatives being a flaky timed test or a ttl the
   // store was never asked to hold.
@@ -190,11 +255,15 @@ export class MemoryStore {
   // An entry found expired is deleted here rather than merely reported
   // absent: the id has just been proven dead, and this is the one moment the
   // store is certain of it. An expired entry is a MISS, not a present-but-
-  // empty session — its id is dead and must not be adopted.
+  // empty session — its id is dead and must not be adopted. A live tombstone
+  // is ALSO a miss, but is deliberately NOT deleted here (#5794): the next
+  // request presenting a just-destroyed cookie calls exactly this path, and
+  // deleting the tombstone on that read would remove the very guard that
+  // stops a still-in-flight stale `compareAndSet` from resurrecting it.
   //
-  // Not fallible: an in-memory map cannot fail. `read` is, only because the
+  // Not fallible: an in-memory map cannot fail. `load` is, only because the
   // interface says so for the stores that do I/O.
-  readAt(sid: string, nowNs: i64): Option<map<string, string>> {
+  loadAt(sid: string, nowNs: i64): Option<(map<string, string>, i64)> {
     this.mu.lock()
     defer this.mu.unlock()
     let (e, ok) = this.entries[sid]
@@ -208,17 +277,32 @@ export class MemoryStore {
       delete(this.entries, sid)
       return Option.None
     }
-    return Option.Some(copyData(e.data))
+    if (e.tombstone) {
+      return Option.None
+    }
+    return Option.Some((copyData(e.data), e.version))
   }
 }
 
 // An independent copy of `m`. Maps are reference types (SPEC §13.3), so
-// without this both `write` and `read` would hand out an alias into the
-// store's own state.
+// without this both `compareAndSet` and `load` would hand out an alias into
+// the store's own state.
 fn copyData(m: map<string, string>): map<string, string> {
   let out = map<string, string>()
   for (k, v) of m {
     out[k] = v
   }
   return out
+}
+
+// A `compareAndSet` refusal: `sid`'s current state no longer matches
+// `expectedVersion` — either another writer's version already moved past it
+// (`detail` names the version actually found) or the id was tombstoned by
+// `destroy`. The caller reloads and retries, or gives up; this store never
+// picks a winner on its own (#5794).
+fn conflictError(sid: string, expectedVersion: i64, detail: string): error {
+  return newError(
+      "web: session: compareAndSet(${sid}): conflict, expected version " +
+      "${expectedVersion}, ${detail}",
+  )
 }

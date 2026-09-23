@@ -67,26 +67,47 @@ const sessionCookieName = "sid"
 // traffic. That is the safer of the two and the simpler one to reason about.
 const sessionTTLSeconds: i64 = 86400
 
+// The bound on `Session.takeAtomic`'s load-then-compareAndSet retry loop
+// (Power-of-10: no loop without a static limit). Not tuned against any
+// measurement — it only has to be small and fixed, since a real conflict
+// resolves in the very next attempt and this is purely the ceiling that
+// keeps the loop provably bounded.
+const sessionCasMaxAttempts: int = 8
+
 // A store of session data, keyed by session id. Structural (§14.3): a type
 // satisfies this by having the three methods, with no declaration anywhere.
 //
-// `read` answers `Option.None` for a miss — an unknown, forged, destroyed or
+// Every write is a versioned compare-and-set (#5794, TOCTOU: two concurrent
+// requests sharing one cookie — one `destroy()`s while the other still holds
+// the pre-destroy snapshot — otherwise let the loser's `write` resurrect a
+// destroyed session or silently overwrite the winner's update). The store
+// holds one version counter per id; a `compareAndSet` whose `expectedVersion`
+// no longer matches, or whose id was destroyed, fails rather than writing.
+//
+// `load` answers `Option.None` for a miss — an unknown, forged, destroyed or
 // expired id is the normal case on a public endpoint, not an error — and
-// `Option.Some(data)` for a hit, INCLUDING a hit whose map has no keys.
-// Presence and emptiness are separate facts and the type has to keep them
-// apart: #4483, where a miss WAS the empty map, so `loadSession` could not
-// tell a stored keyless session from an id that was never written and
+// `Option.Some((data, version))` for a hit, INCLUDING a hit whose map has no
+// keys. Presence and emptiness are separate facts and the type has to keep
+// them apart: #4483, where a miss WAS the empty map, so `loadSession` could
+// not tell a stored keyless session from an id that was never written and
 // rotated its id. Anything bound to the id itself rather than to the data —
 // #3948's CSRF token is `HMAC(secret, session id)` — is silently invalidated
 // by that rotation.
+//
+// `destroy` is unconditional — it always succeeds and always bumps the
+// version — and leaves a TOMBSTONE rather than merely removing the id: a
+// stale `compareAndSet` still holding the pre-destroy version must fail
+// forever, not merely until some other write reuses the version number. The
+// tombstone is bounded, not permanent: `tombstoneTtl` is the same window a
+// live entry gets, so it expires and is swept exactly like one (#5794).
 //
 // The `!` is for the store itself failing (a dropped SQL connection, a Redis
 // timeout); reporting that as a miss would silently log every user out
 // during an outage.
 export interface SessionStore {
-  read(sid: string): Option<map<string, string>>!,
-  write(sid: string, data: map<string, string>, ttl: i64): ()!,
-  destroy(sid: string): ()!,
+  load(sid: string): Option<(map<string, string>, i64)>!,
+  compareAndSet(sid: string, expectedVersion: i64, data: map<string, string>, ttl: i64): i64!,
+  destroy(sid: string, tombstoneTtl: i64): ()!,
 }
 
 // One request's session. Obtained from `Ctx.session()` (ctx.bit), which
@@ -96,6 +117,11 @@ export class Session {
   sid: string
   data: map<string, string>
   store: SessionStore
+  // The store's version for `data` as of the last load or successful write.
+  // 0 means "this id has never been written" — the version a brand-new,
+  // never-seen id starts at, and what `persist()` sends as `compareAndSet`'s
+  // `expectedVersion` for a session this object never loaded from the store.
+  version: i64
   // True when this id was minted during THIS request: either no cookie
   // arrived, or the one that did missed in the store. #3884/#3885 use it to
   // decide whether the response needs a `Set-Cookie` at all.
@@ -166,28 +192,88 @@ export class Session {
   // `SessionStore.read` reported a miss AS the empty map, so an empty write
   // read back as a miss and this method could not have worked.
   //
+  // A CONDITIONAL write (#5794): `compareAndSet` sends `this.version`, the
+  // version this object last saw, and fails rather than overwriting when the
+  // store's version has moved since — another request updated this same
+  // session, or destroyed it — or errors for any other reason. The caller
+  // gets that error back; this method never retries and never silently
+  // drops the conflict, because guessing which side should win is exactly
+  // the bug this exists to close. A caller that wants to retry reloads the
+  // session first, so its next `compareAndSet` starts from the current
+  // version.
+  //
   // Module-private: the framework decides when an id must survive. A no-op
   // on a destroyed session, for `save()`'s reason.
   persist(): ()! {
     if (this.destroyed) {
       return
     }
-    this.store.write(this.sid, this.data, sessionTTLSeconds)?
+    this.version = this.store.compareAndSet(this.sid, this.version, this.data, sessionTTLSeconds)?
     this.dirty = false
   }
 
-  // Revokes this session: the store forgets the id, the in-memory data is
-  // dropped, and every later `set`/`delete` on this object panics. A
-  // subsequent request presenting the same cookie misses in the store and is
-  // issued a fresh id.
+  // Revokes this session: the store tombstones the id (bounded — the
+  // tombstone expires after `sessionTTLSeconds`, the same window a live
+  // entry gets), the in-memory data is dropped, and every later
+  // `set`/`delete` on this object panics. A subsequent request presenting
+  // the same cookie misses in the store and is issued a fresh id.
+  //
+  // Unconditional on purpose, unlike `persist()`: a logout must win over
+  // whatever another request is doing with this session, never merely
+  // "win if nobody else touched it since". It is the tombstone this leaves,
+  // not a version check here, that stops a concurrent `persist()` still
+  // holding the pre-destroy version from resurrecting the session (#5794).
   export destroy(): ()! {
     if (this.destroyed) {
       return
     }
-    this.store.destroy(this.sid)?
+    this.store.destroy(this.sid, sessionTTLSeconds)?
     this.data = map<string, string>()
     this.dirty = false
     this.destroyed = true
+  }
+
+  // Atomically reads and removes `key`, for a value that must be consumed
+  // at most once — an OTP, an OIDC `state`/`nonce` (#5777) — even when two
+  // requests race the same cookie. Unlike `get`/`delete`/`save`, it never
+  // reads this object's own in-memory snapshot: it always starts from the
+  // store's CURRENT version, because the whole point is a sibling `Session`
+  // object on another request holding the same id. Two racing calls for the
+  // same key: exactly one sees `Option.Some(value)`, the other
+  // `Option.None`, whether it lost the value to this call or the key was
+  // never there.
+  //
+  // Retries the load-then-compareAndSet on a losing race against a THIRD
+  // writer, bounded by `sessionCasMaxAttempts` (Power-of-10: no unbounded
+  // loop) — losing that many races in a row to unrelated writers on one
+  // session id is not a case this method serves; it fails naming the key.
+  export takeAtomic(key: string): Option<string>! {
+    this.mustBeLive("takeAtomic")
+    let attempt = 0
+    while (attempt < sessionCasMaxAttempts) {
+      let found = this.store.load(this.sid)?
+      if (!isSome(found)) {
+        return Option.None
+      }
+      let (data, version) = unwrap(found)
+      let (value, ok) = data[key]
+      if (!ok) {
+        return Option.None
+      }
+      delete(data, key)
+      let newVersion = this.store.compareAndSet(this.sid, version, data, sessionTTLSeconds) catch _ {
+        attempt = attempt + 1
+        continue
+      }
+      this.data = data
+      this.version = newVersion
+      this.dirty = false
+      return Option.Some(value)
+    }
+    fail newError(
+        "web: session: takeAtomic(${key}): lost the compare-and-set race " +
+        "${sessionCasMaxAttempts} times in a row",
+    )
   }
 
   // The `Set-Cookie` VALUE for this session — what #3884's response layer
@@ -237,12 +323,14 @@ export fn newSessionId(): string {
 // to, so rotating it is never free, whatever the map holds.
 fn loadSession(store: SessionStore, sid: string): Session! {
   if (len(sid) > 0) {
-    let found = store.read(sid)?
+    let found = store.load(sid)?
     if (isSome(found)) {
+      let (data, version) = unwrap(found)
       return Session{
         sid = sid,
-        data = unwrap(found),
+        data = data,
         store = store,
+        version = version,
         fresh = false,
         dirty = false,
         destroyed = false,
@@ -253,6 +341,7 @@ fn loadSession(store: SessionStore, sid: string): Session! {
     sid = newSessionId(),
     data = map<string, string>(),
     store = store,
+    version = 0,
     fresh = true,
     dirty = false,
     destroyed = false,
