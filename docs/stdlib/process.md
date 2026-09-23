@@ -1,17 +1,53 @@
 # std/process
 
-A build script shells out to `wc -l` to see how many lines a generated file
-has, so it can decide whether the generator actually ran. `std/os`'s `run`
-starts the child with its stdout and stderr wired straight to this process's
-own, exactly like typing the command at a terminal yourself: you see what it
-printed, but your program never gets that text back as a value, only the
-exit code. `std/process`'s `output` runs the child the same way but hands
-you its stdout, its stderr and its exit code back as a `RunResult`, so the
+A build script shells out to `make -C vendor` to rebuild a dependency, then
+to `wc -l` on the file that build produced, to see how many lines it has
+and decide whether the generator actually ran.
+
+The `make` step just needs to happen; whatever it prints belongs on the
+terminal, not in your program. That is `run`: it starts the child with its
+stdout and stderr wired straight to this process's own, exactly like typing
+the command yourself, and hands back only the exit code.
+
+The `wc` step is different: the script needs the number `wc` printed as a
+value it can compare. `run` cannot give you that - only the exit code. That
+is what `output` is for: it runs the child the same way but hands back its
+stdout, its stderr and its exit code together as a `RunResult`, so the
 script can actually read what `wc` said.
 
 <!-- doctest: per-block -->
 
 ## The simplest call
+
+### `run(path: string, args: []string): int`
+
+```bit
+import { run } from "std/process"
+
+fn main() {
+  let code = run("/usr/bin/make", ["-C", "vendor"])
+  print("make exit: ${code}\n")
+}
+```
+
+```
+make exit: 0
+```
+
+`path` is exec'd directly, never through a shell, so nothing in `args` is
+ever reinterpreted as shell syntax; `path` itself is never resolved against
+`PATH`, so it has to be an absolute path or a path relative to the current
+directory. The child inherits this process's environment and its
+stdout/stderr are left attached to this process's own, so whatever `make`
+prints appears immediately, the way it would at a terminal. `run` returns
+the child's exit code, or `-1` if it could not be spawned at all.
+
+## Capturing what the child said
+
+`run` cannot answer "how many lines did `wc` count" - it only tells you
+whether `wc` succeeded, never what it printed. `output` runs the same way
+but captures both streams into memory instead of leaving them attached to
+the terminal.
 
 ### `output(path: string, args: []string, timeoutMs: int = 0): RunResult`
 
@@ -32,10 +68,8 @@ stderr empty: true
 exit: 0 truncated: false
 ```
 
-`output(path, args)` runs `path` exactly the way `run` does (no shell, `args`
-is the argument vector, `path` itself is never resolved against `PATH` so it
-has to be an absolute path or a path relative to the current directory) and
-waits for it to finish.
+`output(path, args)` runs `path` exactly the way `run` does (no shell, no
+`PATH` lookup) and waits for it to finish.
 
 ### `RunResult`
 
@@ -137,11 +171,11 @@ nothing appears until the very end. This is the same split as Rust's
 versus `.Output()`.
 
 `run` is unaffected by any of this - it still just streams and returns the
-exit code - so existing callers of `run` need no changes.
+exit code.
 
 ## Where next
 
-- [`std/os`](os.md) for `run`, the process's arguments, its environment, and
-  how it exits.
+- [`std/os`](os.md) for the process's arguments, its environment, and how it
+  exits.
 
 Specification: `runtime/ABI.md` §19.
