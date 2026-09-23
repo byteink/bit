@@ -1,0 +1,202 @@
+// pkg/auth/oidc_callback.bit — the callback half of the OIDC
+// authorization-code flow (#5777): state/nonce/code_verifier consumption,
+// the code exchange, ID token verification, and the `Identity` this package
+// hands back, completing `Strategy` (strategy.bit) alongside
+// `beginAuthorization` (oidc_authorize.bit) and `verifyIdToken`
+// (oidc_verify.bit).
+//
+// SINGLE-USE, ATOMIC (#5787 TOCTOU, owner direction 2026-09-23, integrator
+// comments on this ticket): `state`, `nonce` and `code_verifier` are each
+// consumed with `Session.takeAtomic` (#5794, pkg/web/session.bit) — one
+// store operation that reads and removes the value, never `get()` then
+// `delete()` then `save()`. Two callbacks racing the same session's `state`:
+// exactly one `takeAtomic` call sees `Option.Some` and can proceed: the
+// other sees `Option.None`, the identical shape a state that was never
+// issued produces, so a replayed or raced callback URL fails with the same
+// message an unrecognized one would — neither reveals which case it hit.
+//
+// `requireStateMatch` — the `takeAtomic` plus a constant-time compare
+// (`ctEq`, `stdlib/crypto/subtle.bit`) against the query parameter — is the
+// FIRST thing `handleCallback` does after loading the session, so a wrong or
+// missing `state` fails before any HTTP call to the token endpoint.
+//
+// THE CODE EXCHANGE (OIDC Core 1.0 §3.1.3.1) POSTs
+// `grant_type=authorization_code&code=...&redirect_uri=...&client_id=...&code_verifier=...`,
+// form-urlencoded, to `s.config.tokenEndpoint` — https only, checked the
+// same way `oidc_authorize.bit`'s `requireHttpsEndpoint` checks the
+// authorization endpoint — authenticating the client with HTTP Basic
+// (`client_secret_basic`, OIDC Core 1.0 §9's default, RFC 6749 §2.3.1): an
+// `Authorization: Basic base64(client_id:client_secret)` header, both
+// percent-encoded before the colon join per RFC 6749 §2.3.1.
+//
+// No real network in tests: `tokenFetch` is a module-private, injectable
+// seam over the POST — `nil` means the real call, a test substitutes a
+// call-counting fake — the same shape `oidc_discovery.bit`'s `HttpFetch`
+// already uses for `discover`/`JwksCache`.
+//
+// A verified login regenerates the session id (`Session.regenerate()`,
+// pkg/web/session.bit — #5795, session fixation) right after `verifyIdToken`
+// succeeds and before the `Identity` is built, the same point
+// `PasswordStrategy.authenticate` (password.bit) and `requireAuth`
+// (middleware.bit) call it at, then stores the `Identity` under
+// `identitySessionKey` (strategy.bit) the way `requireAuth` does.
+//
+// `Ctx`, `Json`, `JsonEntry`, `jsonParse`, `jsonGet`, `jsonAsString`,
+// `isSome`, `unwrap`, `ctEq`, `ClaimsOptions`, `verifyIdToken`, `TlsConfig`,
+// `Response`, `percentEncode`, `hasPrefix`, `unauthorized`, `identitySessionKey`,
+// `encodeIdentity`, `stateSessionKey`, `nonceSessionKey`, `verifierSessionKey`,
+// `requireHttpsEndpoint`, `checkStatus` are already bound module-wide
+// (strategy.bit/oidc_verify.bit/oidc_authorize.bit/middleware.bit/
+// oidc_discovery.bit — an import binds per MODULE, SPEC §17.1); `Session`,
+// `Header`, `newClientTls`, `defaultClaimsOptions`, `now`, `encodeBase64` are
+// new to this module.
+import { Session } from "web"
+import { Header, newClientTls } from "std/http"
+import { defaultClaimsOptions } from "std/jwt"
+import { now } from "std/time"
+import { encodeBase64 } from "std/crypto"
+
+// One HTTP POST to the token endpoint, returning the response body on
+// success. Module-private and injectable — see the file header. Production
+// code always passes `nil`.
+type TokenFetch = (string, []Header, string) => string!
+
+// `fetch(url, headers, body)` when a test supplied one, else a real POST
+// under `tls` through `std/http`'s `Client` (needed over `postTls` here
+// because the token exchange must carry an `Authorization` header, which
+// `postTls` has no parameter for).
+fn tokenPost(
+  fetch: TokenFetch,
+  tls: TlsConfig,
+  url: string,
+  headers: []Header,
+  body: string,
+): string! {
+  if (fetch == nil) {
+    return httpsPostTls(url, headers, body, tls)?
+  }
+  return fetch(url, headers, body)?
+}
+
+fn httpsPostTls(url: string, headers: []Header, body: string, tls: TlsConfig): string! {
+  let res = newClientTls(tls).requestWith("POST", url, headers, body)?
+  return checkStatus(url, res)?
+}
+
+// The `Authorization: Basic ...` header for `client_secret_basic` (OIDC
+// Core 1.0 §9, RFC 6749 §2.3.1): `clientId`/`clientSecret`, each
+// percent-encoded, joined with a colon, base64-encoded (`encodeBase64`,
+// std/crypto — RFC 7617 §2's `userid:password`, standard alphabet).
+fn basicAuthHeader(clientId: string, clientSecret: string): Header {
+  let creds = percentEncode(clientId) + ":" + percentEncode(clientSecret)
+  return Header{ name = "Authorization", value = "Basic " + encodeBase64([]byte(creds)) }
+}
+
+// The form-urlencoded token request body (OIDC Core 1.0 §3.1.3.1): every
+// value percent-encoded, the same discipline `oidc_authorize.bit`'s
+// `authorizeUrl` applies to the authorization request.
+fn tokenRequestBody(s: OidcStrategy, code: string, verifier: string): string {
+  return "grant_type=" +
+    percentEncode("authorization_code") +
+    "&code=" +
+    percentEncode(code) +
+    "&redirect_uri=" +
+    percentEncode(s.redirectUri) +
+    "&client_id=" +
+    percentEncode(s.clientId) +
+    "&code_verifier=" +
+    percentEncode(verifier)
+}
+
+// The parsed token response's `id_token` field (OIDC Core 1.0 §3.1.3.3), or
+// a failure naming what was wrong: not JSON, no `id_token` key, or
+// `id_token` not a string.
+fn extractIdToken(body: string): string! {
+  let j = jsonParse(body)?
+  let field = jsonGet(j, "id_token")
+  if (!isSome(field)) {
+    fail newError("auth: handleCallback(): token response has no 'id_token' field")
+  }
+  let idToken = jsonAsString(unwrap(field))
+  if (!isSome(idToken) || unwrap(idToken) == "") {
+    fail newError("auth: handleCallback(): token response's 'id_token' is missing or not a string")
+  }
+  return unwrap(idToken)
+}
+
+// Exchanges `code`/`verifier` for tokens at `s.config.tokenEndpoint`
+// (https-only, checked before any HTTP call) and returns the `id_token`.
+fn exchangeCode(s: OidcStrategy, fetch: TokenFetch, code: string, verifier: string): string! {
+  requireHttpsEndpoint(s.config.tokenEndpoint)?
+  let body = tokenRequestBody(s, code, verifier)
+  let headers = []Header{
+    basicAuthHeader(s.clientId, s.clientSecret),
+    Header{ name = "Content-Type", value = "application/x-www-form-urlencoded" },
+  }
+  let resBody = tokenPost(fetch, s.jwks.tls, s.config.tokenEndpoint, headers, body)?
+  return extractIdToken(resBody)?
+}
+
+// `session.takeAtomic(key)` (#5794), consumed once: `Option.Some` on a win,
+// or a failure naming `what` when it was never issued or another caller
+// already took it — replay and "never there" are indistinguishable on
+// purpose, per the file header.
+fn takeRequired(session: Session, key: string, what: string): string! {
+  let found = session.takeAtomic(key)?
+  if (!isSome(found)) {
+    fail unauthorized("missing or already-used ${what}")
+  }
+  return unwrap(found)
+}
+
+// Consumes `state` (`takeAtomic`, single-use) and compares it constant-time
+// against `queryState` — see the file header for why this runs, and fails,
+// before any HTTP call, and why a missing state fails identically to a
+// mismatched one.
+fn requireStateMatch(session: Session, queryState: string): ()! {
+  let found = session.takeAtomic(stateSessionKey)?
+  if (!isSome(found) || !ctEq([]byte(unwrap(found)), []byte(queryState))) {
+    fail unauthorized("state mismatch")
+  }
+}
+
+// The `Identity` (strategy.bit) built from a verified ID token payload:
+// `sub` (OIDC Core 1.0 §2) as the id, the whole payload as `claims`.
+fn identityFromPayload(payload: Json): Identity! {
+  let subField = jsonGet(payload, "sub")
+  if (!isSome(subField)) {
+    fail newError("auth: handleCallback(): verified token has no 'sub' claim")
+  }
+  let sub = jsonAsString(unwrap(subField))
+  if (!isSome(sub) || unwrap(sub) == "") {
+    fail newError("auth: handleCallback(): verified token's 'sub' claim is missing or not a string")
+  }
+  return Identity{ id = unwrap(sub), claims = payload }
+}
+
+// The `Strategy.authenticate` implementation for the OIDC callback route:
+// validates `state`, exchanges `code` for tokens, verifies the ID token
+// against the session's `nonce`, regenerates the session id, and stores the
+// resulting `Identity` — see the file header for the ordering and why.
+export fn handleCallback(s: OidcStrategy, c: Ctx): Identity! {
+  return handleCallbackFetch(s, c, nil)?
+}
+
+// `handleCallback` against an injected `TokenFetch` — the test seam.
+fn handleCallbackFetch(s: OidcStrategy, c: Ctx, fetch: TokenFetch): Identity! {
+  let queryState = c.query("state")
+  let code = c.query("code")
+  let session = c.session()?
+  requireStateMatch(session, queryState)?
+  let verifier = takeRequired(session, verifierSessionKey, "code_verifier")?
+  let nonce = takeRequired(session, nonceSessionKey, "nonce")?
+  let idToken = exchangeCode(s, fetch, code, verifier)?
+  let opts = defaultClaimsOptions(now().ns / Second)
+  opts.expectedAud = Option.Some(s.clientId)
+  let payload = verifyIdToken(idToken, s.config, s.jwks, nonce, opts)?
+  session.regenerate()?
+  let identity = identityFromPayload(payload)?
+  session.set(identitySessionKey, encodeIdentity(identity))
+  session.save()?
+  return identity
+}
