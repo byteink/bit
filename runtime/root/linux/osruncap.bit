@@ -1,0 +1,503 @@
+// `bit_rt_os_run_captured` (#5780, ABI.md §19): `os_run_bounded` with the
+// child's stdout/stderr captured into memory instead of left attached to the
+// parent's own fds, plus the three out-of-band companions that read the
+// result (`runtime/root/slots.bit`'s `rtOsRunCapturedStdout`/`Stderr`/
+// `Truncated`, which this file's own `rtOsRunCapturedSet` publishes into).
+//
+// Sibling of ./os.bit in the same directory — SAME MODULE (SPEC §3: "a module
+// is a directory... shares one flat declaration namespace"), so every name
+// ./os.bit defines or itself imports (`osEnvp`, `osBuildRunArgv`, `fsPathZ`,
+// `osScratchSlot`, `osScratchSlots`, `osMonoNs`, `osPollSleep`, `osKillGroup`,
+// `osBoundedMaxMs`, `osBoundedMaxPolls`, `osWnohang`, `osSigChld`,
+// `osWStatusMask`, `osWExitShift`, `osStatusBuf`, `osMarkChildOutstanding`,
+// `isX64`, `rootExit`, `storeWord`/`loadWord`/`storeByte`/`loadByte`,
+// `syscall`, `ptrOf`) is already in scope here with NO import and no `export`
+// needed on ./os.bit's side — `export` only gates visibility to a DIFFERENT
+// module (SPEC §11.9's own distinction), and re-importing a name another file
+// in this module already imported is E0042. Likewise ./fsrw.bit's
+// `rtFsReadAllTrim` (the "sized... then TRIMMED, never zero-padded"
+// allocate-once helper `bit_rt_fs_read_all` uses) and `errnoIntr` are reused
+// directly, unqualified, for the same reason.
+//
+// EVERY SYSCALL NUMBER IS THE KERNEL'S: `sysPipe2`/`sysDup3`
+// (`runtime/syscalls/syscalls.bit`) cite their own sourcing in their own doc
+// comments, read out of `linux-libc-dev` in throwaway containers, not memory.
+//
+// THE PER-WORKER STATE BLOCK BELOW HOLDS NO GC REFERENCE, ON PURPOSE. It is a
+// `[N]i64` module-level array — "a scalar array is never scanned by the
+// collector" (rule 1, ./os.bit's own recurring comment on `osArgvBuf` et
+// al) — so it is the right home for the four raw pipe fds, the two running
+// byte counts, the two EOF flags, the truncated-bits accumulator and the
+// poll deadline, and the WRONG home for the two captured `string` objects
+// themselves. Those stay plain LOCAL variables (`outBuf`/`errBuf`), threaded
+// through this file's own calls as parameters: a local live across this
+// file's `gcSyscallBegin`/`gcSyscallEnd`-bracketed syscalls (only
+// `osPollSleep`'s `nanosleep` blocks; every read here is non-blocking once
+// `osCapPreparePoll` sets `O_NONBLOCK`) is exactly what that bracket exists to
+// protect — `../fsrw.bit`'s own `rtFsReadAll` holds its live string `s` across
+// an identical bracketed `read` loop, for the identical reason. Once trimmed,
+// the two result strings cross into `runtime/root/slots.bit`'s per-task
+// scratch via `rtOsRunCapturedSet` (that file's own header has the full GC-root
+// argument for why THAT mechanism, not this one, is where a `string` value
+// waiting to be read back out by a separate ABI call belongs).
+//
+// NO MANAGED-HEAP ALLOCATION HERE beyond `rtStrAlloc` — the same primitive
+// `bit_rt_fs_read_all` already uses (`../fsrw.bit`) — called exactly twice per
+// `bit_rt_os_run_captured` call, once per stream, up front.
+
+import { sysPipe2, sysDup3, sysFcntl } from "../../syscalls"
+// `rtOsRunCapturedSet` (`runtime/root/slots.bit`): the port-internal setter
+// for the three out-of-band companions, a cross-module reference (§11.9) so
+// it needs both the import and that file's own `@symbol` pin. `osRunCaptureMaxBytes`
+// (`runtime/root/os.bit`) is the per-stream cap #5779 landed; ./os.bit does not
+// import it yet, so it is imported here, its first consumer.
+import { rtOsRunCapturedSet, osRunCaptureMaxBytes } from "../../root"
+
+// O_CLOEXEC (0o2000000): applied to BOTH pipes at creation via `pipe2`'s own
+// `flags` argument, not a separate `fcntl` afterward — so no concurrently
+// forked SIBLING task's child (a totally different `bit_rt_os_run*` call on
+// another worker, mid-fork between our `pipe2` and our own `fork` below)
+// ever inherits one of our four original fds into ITS child, which would
+// hold our pipe's write end open and defeat the read side's own EOF. Same
+// numeric value as `runtime/net/linux/sock.bit`'s `sockCloExec` (Linux
+// defines `SOCK_CLOEXEC` as `O_CLOEXEC`), not imported from there: that file
+// is a different module (`runtime/net`), and `runtime/root` does not import
+// from it (layering — net depends on root, never the reverse).
+const osCapCloexec: int = 524288
+
+// O_NONBLOCK (0o4000) / F_GETFL (3) / F_SETFL (4): the exact idiom
+// `runtime/net/linux/sock.bit`'s `netSetNonBlock` uses, reproduced locally
+// rather than imported for the same layering reason `osCapCloexec` gives.
+const osCapNonBlock: int = 2048
+const osCapFGetFl: int = 3
+const osCapFSetFl: int = 4
+
+// EAGAIN/EWOULDBLOCK (`<asm-generic/errno-base.h>`), already negated to match
+// a raw `syscall` failure's own `-errno` convention (this module's fs.bit
+// header) — the non-blocking read's "nothing available right now" outcome,
+// never a real error.
+const osCapEwouldblock: int = 0 - 11
+
+// The low 32 bits of a 64-bit word — `../fs.bit`'s `fillStat` already uses
+// this exact mask to pull a 32-bit kernel field out of a `loadWord`. `pipe2`
+// writes a raw C `int pipefd[2]` (TWO tightly packed 32-bit ints, 8 bytes,
+// zero padding between them since both are already 4-byte aligned) into the
+// address it is given, so ONE `loadWord` of that address captures both:
+// `raw & osCap32Mask` is `pipefd[0]` (the read fd), `raw >> 32` is
+// `pipefd[1]` (the write fd). `osCapOpenPipes` below unpacks each pair once,
+// immediately, into this file's own separate word-per-fd layout — nothing
+// past that point ever re-reads a packed pair.
+const osCap32Mask: int = 4294967295
+
+// Per-stream drain: bytes past `osRunCaptureMaxBytes` (`../os.bit`) land here
+// instead, so the read loop can keep draining a capped stream (never stopping
+// it, or the sibling stream deadlocks on the pipe's own kernel buffer) without
+// growing the captured string past its cap. Sized to a whole pipe's default
+// kernel buffer (65536 bytes) so one discard read can drain a full pipeful.
+// PER-WORKER, matching every other scratch buffer in this file's sibling
+// ./os.bit: two concurrent `bit_rt_os_run_captured` calls on two workers must
+// not share a destination address for an in-flight `read`, even though its
+// content is thrown away either way.
+const osCapDiscardBytes: int = 65536
+
+// Bounded reads attempted per fd per poll tick (Power of 10 rule 2): a
+// non-blocking `read` returns immediately either way, so this only bounds how
+// much of one already-buffered pipeful this tick drains before moving on to
+// the sibling stream and the `wait4` check — a handful is enough to keep pace
+// with `osPollNs`'s 2ms cadence long before a 4 MiB cap is in sight.
+const osCapMaxReadsPerTick: int = 8
+
+// Extra poll ticks run AFTER the child is confirmedly gone (normal exit or
+// post-timeout reap), to reach true EOF on both streams: the tick that
+// detected the exit may have drained less than everything the child had
+// already written. Bounded (Power of 10 rule 2); in practice both streams
+// reach EOF within one or two ticks once the writer side is closed.
+const osCapPostReapMaxTicks: int = 64
+
+// ---------------------------------------------------------------------------
+// Per-worker capture state (#5780): PER-WORKER SLOT, the same
+// `osScratchSlot()` shape `../os.bit`'s `osArgvBuf`/`osStatusBuf` establish
+// and for the identical reason — nothing serialises two concurrent
+// `bit_rt_os_run_captured` callers, and this function never parks (no
+// `schedPark`/`schedSwitch` anywhere in its callee chain: every syscall below
+// is either non-blocking or `gcSyscallBegin`/`gcSyscallEnd`-bracketed, the
+// same no-migration proof `../os.bit`'s own scratch buffers rely on).
+//
+// Word layout, byte offsets (raw fds and counters only — see this file's own
+// header for why the two `string` results are NOT stored here):
+//   0  outReadFd   4  stdoutLen    8  stderrLen    +64 truncatedBits
+//   8  outWriteFd  40 stdoutDone   56 stderrDone    +72 pollDeadlineNs
+//   16 errReadFd
+//   24 errWriteFd
+const osCapOutReadOff: int = 0
+const osCapOutWriteOff: int = 8
+const osCapErrReadOff: int = 16
+const osCapErrWriteOff: int = 24
+const osCapStdoutLenOff: int = 32
+const osCapStdoutDoneOff: int = 40
+const osCapStderrLenOff: int = 48
+const osCapStderrDoneOff: int = 56
+const osCapTruncOff: int = 64
+const osCapDeadlineOff: int = 72
+const osCapStateWords: int = 10
+
+// (osScratchSlots+1) * osCapStateWords = 33 * 10 = 330. A scalar array, never
+// scanned by the collector (rule 1) — every word above is a raw fd, a byte
+// count, a flag or a nanosecond deadline, never an object reference.
+let osCapState: [330]i64
+
+@nosplit fn osCapStateAddr(): int {
+  return int(ptrOf(osCapState)) + osScratchSlot() * osCapStateWords * 8
+}
+
+// (osScratchSlots+1) * (osCapDiscardBytes/8) = 33 * 8192 = 270336. Same
+// never-scanned rationale: raw discarded bytes, no object reference.
+let osCapDiscard: [270336]i64
+
+@nosplit fn osCapDiscardAddr(): int {
+  return int(ptrOf(osCapDiscard)) + osScratchSlot() * osCapDiscardBytes
+}
+
+// ---------------------------------------------------------------------------
+// Setup: two `O_CLOEXEC` pipes, deadline, parent-side non-blocking read ends
+// ---------------------------------------------------------------------------
+
+@nosplit fn osCapResetState(stateBase: int, timeoutMs: int) {
+  storeWord(stateBase + osCapStdoutLenOff, 0)
+  storeWord(stateBase + osCapStdoutDoneOff, 0)
+  storeWord(stateBase + osCapStderrLenOff, 0)
+  storeWord(stateBase + osCapStderrDoneOff, 0)
+  storeWord(stateBase + osCapTruncOff, 0)
+  let clamped = timeoutMs
+  if (clamped < 0) {
+    clamped = 0
+  }
+  if (clamped > osBoundedMaxMs) {
+    clamped = osBoundedMaxMs
+  }
+  storeWord(stateBase + osCapDeadlineOff, osMonoNs() + clamped * 1000000)
+}
+
+// `pipe2(fds, O_CLOEXEC)` for both pairs, each unpacked out of its own packed
+// 32/32 word (this file's header) into the clean per-fd layout above. On the
+// second pipe's failure, the first is closed before reporting failure — no fd
+// leak on the partial-success path.
+@nosplit fn osCapOpenPipes(stateBase: int): bool {
+  let rc1 = int(syscall(sysPipe2(), i64(stateBase + osCapOutReadOff), i64(osCapCloexec)))
+  if (rc1 < 0) {
+    return false
+  }
+  let raw1 = loadWord(stateBase + osCapOutReadOff)
+  storeWord(stateBase + osCapOutReadOff, raw1 & osCap32Mask)
+  storeWord(stateBase + osCapOutWriteOff, raw1 >> 32)
+
+  let rc2 = int(syscall(sysPipe2(), i64(stateBase + osCapErrReadOff), i64(osCapCloexec)))
+  if (rc2 < 0) {
+    syscall(sysClose(), i64(loadWord(stateBase + osCapOutReadOff)))
+    syscall(sysClose(), i64(loadWord(stateBase + osCapOutWriteOff)))
+    return false
+  }
+  let raw2 = loadWord(stateBase + osCapErrReadOff)
+  storeWord(stateBase + osCapErrReadOff, raw2 & osCap32Mask)
+  storeWord(stateBase + osCapErrWriteOff, raw2 >> 32)
+  return true
+}
+
+@nosplit fn osCapCloseAllFds(stateBase: int) {
+  syscall(sysClose(), i64(loadWord(stateBase + osCapOutReadOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapOutWriteOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapErrReadOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapErrWriteOff)))
+}
+
+@nosplit fn osCapCloseReadFds(stateBase: int) {
+  syscall(sysClose(), i64(loadWord(stateBase + osCapOutReadOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapErrReadOff)))
+}
+
+@nosplit fn osCapSetNonBlock(fd: int) {
+  let flags = int(syscall(sysFcntl(), i64(fd), i64(osCapFGetFl), i64(0)))
+  if (flags < 0) {
+    return
+  }
+  // Bit-or spelled as an add guarded by a test, `netSetNonBlock`'s own idiom
+  // (`runtime/net/linux/sock.bit`): the flag is either already set, in which
+  // case adding it again would corrupt an unrelated bit, or it is not.
+  if (flags / osCapNonBlock % 2 == 0) {
+    syscall(sysFcntl(), i64(fd), i64(osCapFSetFl), i64(flags + osCapNonBlock))
+  }
+}
+
+// Parent-side post-fork setup (ABI.md §19): close both write ends
+// IMMEDIATELY — the pipe's read side never sees EOF while ANY fd referencing
+// the write end stays open anywhere, this process's own copy included — then
+// arm both read ends non-blocking so the poll loop's drain never stalls.
+@nosplit fn osCapPreparePoll(stateBase: int) {
+  syscall(sysClose(), i64(loadWord(stateBase + osCapOutWriteOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapErrWriteOff)))
+  osCapSetNonBlock(loadWord(stateBase + osCapOutReadOff))
+  osCapSetNonBlock(loadWord(stateBase + osCapErrReadOff))
+}
+
+// ---------------------------------------------------------------------------
+// The forked child: mirrors ./os.bit's `osExecChild`, plus the dup2-onto-1/2
+// and four-fd close this ticket adds.
+// ---------------------------------------------------------------------------
+
+@nosplit fn osExecChildCaptured(pathPtr: int, argvPtr: int, envpPtr: int, stateBase: int) {
+  syscall(sysSetpgid(), i64(0), i64(0))
+  // `dup3(old, new, 0)`: aarch64's generic syscall table has no `dup2` entry
+  // (`sysDup3`'s own doc comment), so this is the one call shape both arches
+  // share — `flags = 0` behaves as `dup2` for `old != new` (always true
+  // here, since `new` is 1/2 and `old` is one of this call's own pipe fds).
+  syscall(sysDup3(), i64(loadWord(stateBase + osCapOutWriteOff)), i64(1), i64(0))
+  syscall(sysDup3(), i64(loadWord(stateBase + osCapErrWriteOff)), i64(2), i64(0))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapOutReadOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapOutWriteOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapErrReadOff)))
+  syscall(sysClose(), i64(loadWord(stateBase + osCapErrWriteOff)))
+  syscall(sysExecve(), i64(pathPtr), i64(argvPtr), i64(envpPtr))
+  rootExit(127)
+}
+
+// ---------------------------------------------------------------------------
+// The drain: non-blocking read of ONE stream, capped-and-discarded past
+// `osRunCaptureMaxBytes`, EOF/error/would-block all bounded and terminal for
+// this call (the OUTER poll loop decides whether to call again).
+// ---------------------------------------------------------------------------
+
+// `isErr`'s "done" word, split out purely so `osCapDrainOne`'s own early-exit
+// check does not need the other two per-stream offsets `osCapDrainStep`
+// below derives for itself — keeps both under the house complexity ceiling.
+@nosplit fn osCapStreamDoneOff(isErr: bool): int {
+  if (isErr) {
+    return osCapStderrDoneOff
+  }
+  return osCapStdoutDoneOff
+}
+
+// One non-blocking read attempt on ONE stream: past-cap bytes go to
+// `discardAddr` and only flip the truncated bit, real bytes extend the
+// captured length. Returns `true` when this stream has nothing more to give
+// THIS tick (EOF, a real error, or EAGAIN) — `osCapDrainOne`'s own loop
+// stops on it — and `false` to keep draining (a successful read, or EINTR).
+@nosplit fn osCapDrainStep(fd: int, buf: int, discardAddr: int, stateBase: int, isErr: bool): bool {
+  let lenOff = osCapStdoutLenOff
+  let doneOff = osCapStdoutDoneOff
+  let truncBit = 1
+  if (isErr) {
+    lenOff = osCapStderrLenOff
+    doneOff = osCapStderrDoneOff
+    truncBit = 2
+  }
+  let curLen = loadWord(stateBase + lenOff)
+  let dst = discardAddr
+  let want = osCapDiscardBytes
+  if (curLen < osRunCaptureMaxBytes) {
+    dst = buf + curLen
+    want = osRunCaptureMaxBytes - curLen
+  }
+  let n = int(syscall(sysRead(), i64(fd), i64(dst), i64(want)))
+  if (n > 0 && dst != discardAddr) {
+    storeWord(stateBase + lenOff, curLen + n)
+    return false
+  }
+  if (n > 0) {
+    storeWord(stateBase + osCapTruncOff, loadWord(stateBase + osCapTruncOff) | truncBit)
+    return false
+  }
+  if (n == 0) {
+    storeWord(stateBase + doneOff, 1)
+    return true
+  }
+  if (n == osCapEwouldblock) {
+    return true
+  }
+  if (n != errnoIntr) {
+    // A genuine I/O error (not EINTR, not EAGAIN): stop this stream rather
+    // than spin on it forever — matching `../os.bit`'s own wait4 failure
+    // handling, a real error ends the attempt rather than retrying it.
+    storeWord(stateBase + doneOff, 1)
+    return true
+  }
+  return false
+}
+
+@nosplit fn osCapDrainOne(fd: int, buf: int, discardAddr: int, stateBase: int, isErr: bool) {
+  if (loadWord(stateBase + osCapStreamDoneOff(isErr)) != 0) {
+    return
+  }
+  let reads = 0
+  let stop = false
+  // BOUNDED (Power of 10 rule 2): `reads` rises every iteration; `stop`
+  // ends it early on EOF, a real error, or EAGAIN (nothing more right now).
+  while (!stop && reads < osCapMaxReadsPerTick) {
+    stop = osCapDrainStep(fd, buf, discardAddr, stateBase, isErr)
+    reads = reads + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The poll loop and its tail drain
+// ---------------------------------------------------------------------------
+
+// Status decode shared by the exit-detected path below — `../os.bit`'s
+// `osForkExecWaitBounded` own inline version, factored out here purely to
+// keep `osCapPollLoop` under the house complexity ceiling (E0201's line-limit
+// cousin), the same reason that file's own `osExecChild`/
+// `osMarkChildOutstanding` were split out.
+@nosplit fn osCapExitStatus(status: int): int {
+  let sig = status & osWStatusMask
+  if (sig == 0) {
+    return (status / osWExitShift) & 255
+  }
+  if (sig == osWStatusMask) {
+    return 0 - 1
+  }
+  return 0 - 100 - sig
+}
+
+// Each tick: drain BOTH fds (never stdout-then-stderr-to-completion, or a
+// >64KiB single-stream write deadlocks the sibling on the pipe's own kernel
+// buffer — ABI.md §19), THEN `wait4(WNOHANG)`, THEN sleep only if nothing
+// changed. `../os.bit`'s `osForkExecWaitBounded` body, with the two drain
+// calls added at the top of every iteration.
+@nosplit fn osCapPollLoop(forked: int, stateBase: int, outBuf: int, errBuf: int): int {
+  let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
+  let discardAddr = osCapDiscardAddr()
+  let deadline = loadWord(stateBase + osCapDeadlineOff)
+  let polls = 0
+  let result = 0 - 1
+  let done = false
+  while (!done && polls <= osBoundedMaxPolls) {
+    osCapDrainOne(loadWord(stateBase + osCapOutReadOff), outBuf, discardAddr, stateBase, false)
+    osCapDrainOne(loadWord(stateBase + osCapErrReadOff), errBuf, discardAddr, stateBase, true)
+    storeWord(sb, 0)
+    let w = int(syscall(sysWait4(), i64(forked), i64(sb), i64(osWnohang), i64(0)))
+    if (w == forked) {
+      result = osCapExitStatus(loadWord(sb))
+      done = true
+    } else if (w < 0 && 0 - w != errnoIntr) {
+      result = 0 - 1
+      done = true
+    } else if (w == 0 && osMonoNs() >= deadline) {
+      osKillGroup(forked)
+      storeWord(sb, 0)
+      syscall(sysWait4(), i64(forked), i64(sb), i64(0), i64(0))
+      result = 0 - 2
+      done = true
+    } else if (w == 0) {
+      osPollSleep()
+    }
+    polls = polls + 1
+  }
+  if (!done) {
+    osKillGroup(forked)
+    storeWord(sb, 0)
+    syscall(sysWait4(), i64(forked), i64(sb), i64(0), i64(0))
+    result = 0 - 2
+  }
+  return result
+}
+
+// After the child is confirmedly gone (exit detected or post-timeout reap),
+// keep draining until both streams report EOF or the bounded tick budget
+// runs out (this file's header: the tick that detected the exit may not have
+// drained everything already written).
+@nosplit fn osCapDrainToEof(stateBase: int, outBuf: int, errBuf: int) {
+  let discardAddr = osCapDiscardAddr()
+  let outRead = loadWord(stateBase + osCapOutReadOff)
+  let errRead = loadWord(stateBase + osCapErrReadOff)
+  let ticks = 0
+  while (ticks < osCapPostReapMaxTicks) {
+    osCapDrainOne(outRead, outBuf, discardAddr, stateBase, false)
+    osCapDrainOne(errRead, errBuf, discardAddr, stateBase, true)
+    if (loadWord(stateBase + osCapStdoutDoneOff) != 0 &&
+      loadWord(stateBase + osCapStderrDoneOff) != 0) {
+      ticks = osCapPostReapMaxTicks
+    } else {
+      osPollSleep()
+      ticks = ticks + 1
+    }
+  }
+}
+
+@nosplit fn osCapForkAndRun(
+  stateBase: int,
+  outBuf: int,
+  errBuf: int,
+  pathPtr: int,
+  argvPtr: int,
+): int {
+  let forked = 0
+  if (isX64()) {
+    forked = int(syscall(sysForkX64()))
+  } else {
+    forked = int(syscall(sysClone(), i64(osSigChld), i64(0)))
+  }
+  if (forked < 0) {
+    osCapCloseAllFds(stateBase)
+    return 0 - 1
+  }
+  if (forked == 0) {
+    osExecChildCaptured(pathPtr, argvPtr, osEnvp(), stateBase)
+  }
+  // Mirrors the child's own `setpgid` above so the group exists no matter
+  // which side runs first — `../os.bit`'s `osForkExecWaitBounded` gives the
+  // full fork/setpgid race argument.
+  syscall(sysSetpgid(), i64(forked), i64(forked))
+  osCapPreparePoll(stateBase)
+  // #3507/#4172: publish the outstanding bounded child so a SIGTERM/SIGINT
+  // landing mid-call still reaps it, the identical mechanism
+  // `osForkExecWaitBounded` uses — reused, not re-implemented.
+  let outstanding = osMarkChildOutstanding(forked)
+  let result = osCapPollLoop(forked, stateBase, outBuf, errBuf)
+  storeWord(outstanding, 0)
+  osCapDrainToEof(stateBase, outBuf, errBuf)
+  osCapCloseReadFds(stateBase)
+  return result
+}
+
+// ---------------------------------------------------------------------------
+// `bit_rt_os_run_captured` (ABI.md §19)
+// ---------------------------------------------------------------------------
+
+export @nosplit @symbol("bit_rt_os_run_captured") fn rtOsRunCaptured(
+  path: int,
+  argv: int,
+  timeoutMs: int,
+): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let ab = osBuildRunArgv(p, argv)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let stateBase = osCapStateAddr()
+  osCapResetState(stateBase, timeoutMs)
+  if (!osCapOpenPipes(stateBase)) {
+    return 0 - 1
+  }
+  // The two captured results, allocated up front — `rtStrAlloc`, the same
+  // primitive `bit_rt_fs_read_all` uses (this file's own header). `outBuf`/
+  // `errBuf` are the STRING OBJECT addresses (`rtFsReadAllTrim`'s own `s`
+  // argument shape); the fork/drain chain below writes into the underlying
+  // byte storage instead, `strData(outBuf)`/`strData(errBuf)` — the same
+  // "object address vs. data address" distinction `rtFsRead`
+  // (`./fsrw.bit`) draws between `big` and `strData(big)`.
+  let outBuf = rtStrAlloc(osRunCaptureMaxBytes)
+  let errBuf = rtStrAlloc(osRunCaptureMaxBytes)
+  if (outBuf == 0 || errBuf == 0) {
+    osCapCloseAllFds(stateBase)
+    return 0 - 1
+  }
+  let result = osCapForkAndRun(stateBase, strData(outBuf), strData(errBuf), p, ab)
+  rtOsRunCapturedSet(
+    rtFsReadAllTrim(outBuf, loadWord(stateBase + osCapStdoutLenOff)),
+    rtFsReadAllTrim(errBuf, loadWord(stateBase + osCapStderrLenOff)),
+    loadWord(stateBase + osCapTruncOff),
+  )
+  return result
+}
