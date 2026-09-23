@@ -8,19 +8,26 @@
 // PATH CHECK OF ITS OWN: `safePath` (stdlib/path/path.bit:298) is the one
 // copy, hoisted there by #3953 from examples/staticserver. What this file
 // does own is the half `safePath` cannot do — a pure string function cannot
-// see a symlink — and that is `staticParentsSafe`, one `lstat` per path
-// component below the served root.
+// see a symlink — and that is a single `std/fs/secure.openBeneath` call
+// (#5798, #5793): every component of `rel` is resolved against `base`'s
+// already-open directory fd, refusing a symlink or a `..` ANYWHERE along
+// the way, in one syscall the kernel makes race-free end to end. The
+// earlier design (#4554/#4517) checked every ancestor component with its
+// own `lstat` and then opened the file by path — two separate syscalls a
+// swapped parent directory could race between, which #5787's skeptic
+// reproduced as a live 3-in-400000 outside-root read. `openBeneath` closes
+// that window by construction: there is no path left to re-resolve once
+// the single `openat` call has returned an fd.
 //
 // ORDER IS THE SECURITY PROPERTY. `mountRelative` and `safePath` are pure
 // string functions — neither can touch the filesystem — and both run to
 // completion before `staticServe` makes its first syscall. A rejected path
-// therefore causes no `lstat`, no `open`, and no read anywhere, inside the
-// root or outside it. `full` is `base + rel`, a plain concatenation, NOT
-// `path.join(base, rel)`: `join` returns `b` whole when `b` is absolute
-// (stdlib/path/path.bit:24), so joining an attacker-controlled absolute
-// remainder would discard the root entirely. `rel` always begins with `/`
-// (safePath rejects anything that does not) and carries no `..`, no `\`, no
-// NUL/CR/LF and no `%XX`, so the concatenation cannot leave `base`.
+// therefore causes no `open` and no read anywhere, inside the root or
+// outside it. `rel` always begins with `/` (safePath rejects anything that
+// does not) and carries no `..`, no `\`, no NUL/CR/LF and no `%XX`, so the
+// byte after that leading `/` is what `openBeneath` resolves relative to
+// `base`; `secure.bit`'s own lexical `contains` check and the runtime's
+// `..`-component refusal are the second, independent layer behind it.
 //
 // A rejected path is a 404, never a 403, and it is byte-for-byte the
 // adapter's own 404 (`notFoundBody`, adapter.bit): a 403 tells the client
@@ -83,20 +90,26 @@
 // `notFoundBody` (adapter.bit) are already declared or imported module-wide
 // — an import binds per MODULE (SPEC §17.1), so re-importing any of them
 // here is E0042, and redeclaring a constant is a redeclaration error.
-// `readFileNoFollow` (#4554), not `readFile`, is what actually reads the
-// bytes: it opens the final path component with the runtime's
-// `bit_rt_fs_open_nofollow_w`, which REFUSES the open outright when that
-// component is a symlink instead of following it (runtime/root/{darwin,
-// linux,windows}/fs*.bit). `staticServe`'s own `lstat(full)` below runs
-// first and rejects a symlink it can see, but that check and this open are
-// two separate syscalls — an attacker who can rewrite `full` between them
-// (the exact TOCTOU window #4554 closes) would otherwise have the OLD
-// `readFile`, which just calls the plain follow-symlinks `open`, hand back
-// bytes from wherever the swapped name now points. This file must import it
-// itself — a library build of pkg/web compiles no `*.test.bit` — but unlike
-// `readFile`, `readFileNoFollow` is not bound anywhere else in the package,
-// so no alias is needed to dodge an `E0042` collision.
-import { readFileNoFollow as staticReadFile, lstat, FileInfo } from "std/fs"
+//
+// `File` (used only for `staticFileRes`'s parameter type — the handle
+// itself always arrives already open) is `std/fs`'s own, unaffected by the
+// #5798 rewrite below; `openBeneath`/`statOpen`/`OpenInfo` are
+// `std/fs/secure`'s (#5793), a module `std/fs` itself does not import
+// (module header, stdlib/fs/secure/secure.bit) precisely so a package that
+// pulls it in, like this one now does, needs a compiler built past #5793 —
+// see pkg/web/README.md's "Compiler requirement" section.
+//
+// WINDOWS: `bit_rt_fs_open_beneath_w`/`bit_rt_fs_fstat_w` have no Windows
+// implementation (#5808 — `runtime/root/windows/fs.bit` declares neither
+// extern; `openBeneath`'s own module header, stdlib/fs/secure/secure.bit,
+// says the same). This is fail-CLOSED, not a gap this file has to guard:
+// any program that imports `std/fs/secure` — this one now does — fails to
+// LINK for a Windows target with an unresolved external symbol, so no
+// Windows binary using `static()` can exist at all until #5808 lands. There
+// is no unsafe path-based fallback to accidentally take, because there is
+// no build to take it in.
+import { File } from "std/fs"
+import { openBeneath, statOpen, OpenInfo } from "std/fs/secure"
 import { safePath, ext } from "std/path"
 import { Timestamp, parseDateTime, utc } from "std/time"
 
@@ -214,87 +227,51 @@ fn mountRelative(mountAt: string, path: string): (string, bool) {
 
 // The response for a request already known to be a GET or HEAD below the
 // mount. Declared `Res!` for `staticFileRes`'s signature, but nothing below
-// actually fails: a `staticReadFile` (`readFileNoFollow`) refusal after
-// `lstat` succeeded — whether a permission change, an unlink, or the
-// symlink swap #4554 closes — is answered 404 by `staticFileRes` itself,
-// same as every other rejection here. `bit_rt_fs_open_nofollow_w`'s own
-// contract (runtime/root/*/fs*.bit) does not distinguish those reasons —
-// "the caller learns only that it did not get a file" — so this cannot
-// either, and 404 is the response that leaks the least about which one it
-// was.
+// actually fails: an `openBeneath` refusal — a missing file, a permission
+// change, a symlink anywhere in `rel`, or the parent-swap race #5787 found —
+// is answered 404 by `staticFileRes`'s callers here, same as every other
+// rejection. `openBeneath`'s own contract (stdlib/fs/secure/secure.bit)
+// does not distinguish those reasons — "the caller learns only that it did
+// not get a file" — so this cannot either, and 404 is the response that
+// leaks the least about which one it was.
+//
+// `rel[1:len(rel)]` strips the leading `/` `safePath` guarantees: `rel` is
+// the untrusted remainder below the mount, and `openBeneath` takes it as a
+// path relative to `base` — a leading `/` is one of the forms its own
+// runtime primitive refuses outright (rtFsOpenBeneathW, runtime/root/
+// {darwin,linux}/fsbeneath.bit), being indistinguishable there from an
+// absolute escape.
+//
+// `f` is closed on every path out of this function, `defer` being the one
+// idiomatic way `std/fs`'s own `File` asks for it (fs.bit's module header).
+// A non-regular file — a FIFO, device or socket placed directly under the
+// served root, none of which `openBeneath` itself rejects (only a directory
+// or a symlink is) — is refused here rather than read: reading a FIFO with
+// no writer blocks the worker that opened it forever, the other finding
+// #5798 closes alongside the outside-root read.
 fn staticServe(base: string, mimes: map<string, string>, c: Ctx, rel: string): Res! {
   if (!safePath(rel)) {
     return staticNotFound()
   }
-  if (!staticParentsSafe(base, rel)) {
+  let f = openBeneath(base, rel[1:len(rel)]) catch _ {
     return staticNotFound()
   }
-  let full = base + rel
-  let info = lstat(full) catch _ {
+  defer f.close()
+  let info = statOpen(f) catch _ {
     return staticNotFound()
   }
-  if (info.isDir) {
+  if (!info.isRegular) {
     return staticNotFound()
   }
-  if (info.isSymlink) {
-    return staticNotFound()
-  }
-  return staticFileRes(full, mimes, c, info)?
+  return staticFileRes(f, base + rel, mimes, c, info)?
 }
 
-// Whether every DIRECTORY component of `rel` — each one strictly below the
-// served root, and strictly above the final component `staticServe` lstats
-// itself — is a real directory rather than a symlink. Together with that
-// final `lstat`, this is one `lstat` per component below the root, refusing
-// the request at the first symlink found.
-//
-// This is the filesystem-facing half of the check `safePath` says it cannot
-// make: it is lexical, and its own comment states it "cannot see a symlink
-// planted inside an already-safe path — that is a filesystem-facing check,
-// not this one" (stdlib/path/path.bit:270). `lstat` on the final component
-// alone is not that check either, because the kernel resolves every earlier
-// component on the way: `<root>/sub -> /etc` makes `/assets/sub/passwd`
-// lstat `<root>/sub/passwd`, which is a regular file with `isSymlink`
-// false, and the file is served from outside the root (#4517).
-//
-// COMPONENTS AT OR ABOVE THE ROOT ARE DELIBERATELY NOT CHECKED, which is
-// why the walk starts at `base` and never stats it. A root reached through
-// a symlinked parent is the operator's own choice and must keep working —
-// on macOS `$TMPDIR` is `/var/folders/...` and `/var` is itself a symlink,
-// so checking upwards would refuse every request under a scratch root.
-//
-// An empty segment is skipped rather than stat'd: `safePath` admits a
-// doubled slash (`//etc/passwd` resolves inside the root), and `<root>/`
-// followed by `/etc` is the same path the kernel would resolve. A component
-// that cannot be stat'd at all is a refusal too — the final `lstat` would
-// fail for the same reason a moment later, so this returns the same 404
-// without the extra syscall.
-//
-// The cost is one extra `lstat` per intermediate directory component per
-// request: none at all for `/assets/app.css`, one for `/assets/css/app.css`.
-fn staticParentsSafe(base: string, rel: string): bool {
-  let segs = split(rel, "/")
-  let cur = base
-  let i = 0
-  while (i < len(segs) - 1) {
-    let seg = segs[i]
-    if (len(seg) > 0) {
-      cur = cur + "/" + seg
-      let info = lstat(cur) catch _ {
-        return false
-      }
-      if (info.isSymlink) {
-        return false
-      }
-    }
-    i = i + 1
-  }
-  return true
-}
-
-// The 200, 304 or HEAD response for a file `staticServe` has already
-// lstat'd and accepted.
-fn staticFileRes(full: string, mimes: map<string, string>, c: Ctx, info: FileInfo): Res! {
+// The 200, 304 or HEAD response for a file `staticServe` has already opened
+// through `openBeneath` and `statOpen`'d. `full` is used only for its
+// extension, a pure string lookup (`mimeFor`) that touches no filesystem;
+// every byte, size, mtime and freshness decision below comes from `info` or
+// from `f` itself, never from `full` again.
+fn staticFileRes(f: File, full: string, mimes: map<string, string>, c: Ctx, info: OpenInfo): Res! {
   let etag = staticEtag(info)
   if (staticFresh(c, etag, info.mtime)) {
     return staticHeaders(newRes(statusNotModified, "", ""), etag, info.mtime)
@@ -318,7 +295,11 @@ fn staticFileRes(full: string, mimes: map<string, string>, c: Ctx, info: FileInf
     head.declaredLen = info.size
     return head
   }
-  let body = staticReadFile(full) catch _ {
+  // Read from `f`, the SAME handle `statOpen` above just read metadata
+  // from — never a second, separately racy open by `full`'s path. That is
+  // the whole point of routing this middleware through `openBeneath` in
+  // the first place (see the file header).
+  let body = f.readAll() catch _ {
     return staticNotFound()
   }
   return staticHeaders(newRes(statusOK, mime, body), etag, info.mtime)
@@ -341,13 +322,13 @@ fn staticHeaders(r: Res, etag: string, mtime: i64): Res {
 
 // Size and mtime, the construction nginx uses, emitted as a STRONG
 // validator. Its one blind spot, stated rather than left to be discovered:
-// mtime has one-second granularity here (`FileInfo.mtime` is whole seconds),
+// mtime has one-second granularity here (`OpenInfo.mtime` is whole seconds),
 // so a file replaced within the same second by content of exactly the same
 // length is indistinguishable from the original. The alternative — a digest
 // of the content — is strong with no such gap, but it costs a full read of
 // the file on every conditional request, which is the read a 304 exists to
 // avoid.
-fn staticEtag(info: FileInfo): string {
+fn staticEtag(info: OpenInfo): string {
   return "\"${info.size}-${info.mtime}\""
 }
 

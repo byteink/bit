@@ -1,0 +1,132 @@
+// `bit run _tests_/bit/staticbeneath` (#5798): the skeptic's parent-swap race
+// (#5787) reproduced THROUGH pkg/web's `static()` middleware and
+// `App.handle()`, not against `std/fs/secure`'s `openBeneath` directly —
+// `_tests_/bit/openbeneath/openbeneath.bit` already proves the primitive
+// itself is race-free; this harness proves pkg/web's WIRING to it is.
+//
+// A spawn'ed green thread flips `<root>/a` between a real directory and a
+// symlink to `<root>/outside`'s sibling, `<scratch>/outside` — content
+// `OUTSIDE-LEAK`, never written under `root` — in a tight rename loop (four
+// plain `rename`s per cycle: swap `a` out to `R`, swap the pre-made symlink
+// `L` in as `a`, swap `a` back out to `L`, swap `R` back in as `a`), the
+// exact shape `openbeneath.bit` uses, while the main thread requests
+// `/assets/a/target.txt` through `app.handle()` in a tight loop.
+// `iterations` opens later: `LEAKED-OUTSIDE` must be 0.
+//
+// STANDALONE, not a `pkg/web/static.test.bit` `test{}` block: a statistically
+// reliable reproduction needs the same ~400000-request magnitude
+// `openbeneath.bit` uses (#5787's measured leak rate is 3-5 per 400000
+// requests), and `bit test pkg/web`'s own per-test timeout killed a run at
+// that count before it could finish, on the pre-#5798 code AND on the fix
+// alike (observed on this ticket). `bit run` has no such timeout.
+//
+// RUN WITH `BIT_WORKERS=4` (or higher): the default worker pool starts at
+// ONE OS thread and grows lazily (runtime/ABI.md §9), so `main` and the
+// spawned `swapLoop` run cooperatively on the SAME thread by default —
+// never truly interleaved, so the race never fires either way, the same
+// non-vacuity `openbeneath.bit` checks and this harness checks below too.
+import { App, Config, static as staticMount } from "../../../pkg/web"
+import { Request } from "std/http"
+import { mkdir, writeFile, rename } from "std/fs"
+import { run, envOr, exit } from "std/os"
+
+const iterations: int = 400000
+const outsideBody = "OUTSIDE-LEAK"
+const insideBody = "INSIDE"
+const mountPrefix = "/assets"
+const secret = "staticbeneath-harness-secret"
+
+fn mustMkdir(path: string) {
+  mkdir(path) catch e {
+    panic("staticbeneath: mkdir ${path}: ${e.message()}")
+  }
+}
+
+fn mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    panic("staticbeneath: write ${path}: ${e.message()}")
+  }
+}
+
+fn mustLink(target: string, link: string) {
+  let rc = run("/bin/ln", ["-s", target, link])
+  if (rc != 0) {
+    panic("staticbeneath: /bin/ln -s ${target} ${link} exited ${rc}")
+  }
+}
+
+fn mv(x: string, y: string): bool {
+  rename(x, y) catch _ {
+    return false
+  }
+  return true
+}
+
+// The swapper: renames carry no result the main loop needs, only the `done`
+// signal once `iterations` cycles have run.
+fn swapLoop(root: string, iters: int, done: chan<int>) {
+  let n = 0
+  while (n < iters) {
+    let _ = mv("${root}/a", "${root}/R")
+    let _ = mv("${root}/L", "${root}/a")
+    let _ = mv("${root}/a", "${root}/L")
+    let _ = mv("${root}/R", "${root}/a")
+    n = n + 1
+  }
+  done <- 1
+}
+
+fn main() {
+  let dir = "${envOr("TMPDIR", "/tmp")}/t5798-staticbeneath-${timeUnixNs()}"
+  mustMkdir(dir)
+  let root = "${dir}/public"
+  mustMkdir(root)
+  mustMkdir("${root}/a")
+  mustWrite("${root}/a/target.txt", insideBody)
+  let outside = "${dir}/outside"
+  mustMkdir(outside)
+  mustWrite("${outside}/target.txt", outsideBody)
+  mustLink(outside, "${root}/L")
+
+  let app = App(Config{ secret = secret })
+  app.use(staticMount(mountPrefix, root))
+  app.freeze() catch e {
+    panic("staticbeneath: freeze: ${e.message()}")
+  }
+
+  let done = chan<int>()
+  spawn swapLoop(root, iterations, done)
+
+  let served = 0
+  let leaked = 0
+  let refused = 0
+  let n = 0
+  while (n < iterations) {
+    let req = Request{ method = "GET", path = "/assets/a/target.txt", headers = "", body = "" }
+    let res = app.handle(req)
+    if (res.status == 404) {
+      refused = refused + 1
+    } else if (res.body == outsideBody) {
+      leaked = leaked + 1
+    } else {
+      served = served + 1
+    }
+    n = n + 1
+  }
+  let _ = <- done
+
+  print("requests=${iterations} served-inside=${served} LEAKED-OUTSIDE=${leaked} refused=${refused}\n")
+  if (leaked != 0) {
+    print("FAIL: static() leaked ${leaked} outside response(s) of ${iterations} requests\n")
+    exit(1)
+  }
+  // Non-vacuity: 0 leaks only means something if the swapper really raced
+  // the requests. Under BIT_WORKERS=1 the two green threads never
+  // interleave, every open lands on a real directory, and `refused` stays
+  // 0: a pass that tested nothing.
+  if (refused == 0 || served == 0) {
+    print("FAIL: race never interleaved (served=${served} refused=${refused}); run with BIT_WORKERS=4\n")
+    exit(1)
+  }
+  print("ok   staticbeneath-race\n")
+}

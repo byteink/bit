@@ -236,8 +236,9 @@ test "a directory below the mount is 404, with no listing" {
 }
 
 // A symlink is the one traversal `safePath` cannot see, and its own comment
-// says so (stdlib/path/path.bit:270). This is the FINAL component: `lstat`
-// on the requested path itself sees it.
+// says so (stdlib/path/path.bit:270). This is the FINAL component:
+// `openBeneath`'s `O_NOFOLLOW_ANY` resolution (stdlib/fs/secure/secure.bit)
+// refuses it directly, with no separate stat needed.
 test "a symlink below the mount is 404 even when its target is readable" {
   let f = newStaticFixture("symlink")
   let link = "${f.root}/link.txt"
@@ -249,10 +250,11 @@ test "a symlink below the mount is 404 even when its target is readable" {
   nodeTestTeardown(f.dir)
 }
 
-// The case `lstat` on the final component alone cannot see (#4517): the
-// kernel resolves `away` on the way to `secret.txt`, so the final `lstat`
-// reports a plain readable file and the sentinel is served from OUTSIDE the
-// root. Only a stat of `away` itself refuses it.
+// The case a final-component-only check cannot see (#4517): the kernel
+// resolves `away` on the way to `secret.txt`, so a check of the leaf alone
+// reports a plain readable file and the sentinel would be served from
+// OUTSIDE the root. `openBeneath`'s `O_NOFOLLOW_ANY` resolves EVERY
+// component of `rel`, `away` included, refusing it there.
 test "a symlinked intermediate directory below the mount is 404" {
   let f = newStaticFixture("linkdir")
   mustLink(f.dir, "${f.root}/away")
@@ -479,15 +481,13 @@ test "a failing chain outside the mount propagates through static() to the adapt
   nodeTestTeardown(f.dir)
 }
 
-// The other half: a read failure raised INSIDE the mount, after `lstat` has
-// already accepted the file. Before #4554 this was a generic 500 — the only
-// way `staticServe` failed at all — but `bit_rt_fs_open_nofollow_w`
-// (`readFileNoFollow`, the read `staticFileRes` now uses to close the
-// symlink-swap race) does not say WHY an open failed: "the caller learns
-// only that it did not get a file" (runtime/root/darwin/fs.bit). A
+// The other half: an open failure raised INSIDE the mount. Before #4554 this
+// was a generic 500 — the only way `staticServe` failed at all — but
+// `openBeneath` (stdlib/fs/secure/secure.bit, #5798/#5793) does not say WHY
+// an open failed: "the caller learns only that it did not get a file". A
 // permission change and a symlink swapped in mid-request reach this site
-// through the identical -1, so they get the identical answer, and 404 —
-// never confirming to the client which one happened, or that anything
+// through the identical refusal, so they get the identical answer, and
+// 404 — never confirming to the client which one happened, or that anything
 // changed on disk at all — is that answer.
 //
 // If this suite is ever run as root the chmod is not enforced, the file reads
@@ -587,60 +587,51 @@ test "on the wire, a static HEAD declares the file's real length and sends no co
   nodeTestTeardown(fx.dir)
 }
 
-// --- open-time symlink refusal (#4554) --------------------------------------
+// --- parent-swap race (#5787, #5798) ----------------------------------------
 //
-// `staticServe`'s own `lstat(full)` sees a real file and accepts it; the
-// actual read happens afterwards, via `staticReadFile` (`readFileNoFollow`).
-// Those are two separate syscalls a fraction of a second apart, so whoever
-// can swap `full` for a symlink in that gap races it -- and going through
-// `app.handle()` cannot force the swap into that exact gap deterministically,
-// because both syscalls run inside ONE synchronous call a test cannot pause
-// in the middle of. A test that swaps the file BEFORE calling `app.handle()`
-// proves nothing either: `staticServe`'s own fresh `lstat` would catch that
-// symlink on the OLD racy code exactly as on the fix, since lstat runs again
-// at request time regardless of which read primitive follows it.
+// The skeptic's finding, reproduced THROUGH `app.handle()` rather than
+// against the underlying primitive directly, lives as a STANDALONE harness,
+// `_tests_/bit/staticbeneath/staticbeneath.bit`, not a `test{}` block here:
+// a statistically reliable reproduction needs the same ~400000-request
+// magnitude `_tests_/bit/openbeneath/openbeneath.bit` uses (#5787's measured
+// leak rate is 3-5 per 400000 requests; a smaller count risks a clean run by
+// chance rather than by the fix), and `bit test`'s own per-test timeout
+// killed that run both against the pre-#5798 code AND against the fix
+// itself before either could finish (observed on this ticket). Run it with
+// `BIT_WORKERS=4 bit run _tests_/bit/staticbeneath/staticbeneath.bit`.
+
+// --- FIFO refusal (#5798) ---------------------------------------------------
 //
-// So this reproduces the underlying primitive's contract directly instead:
-// lstat a real file (what `staticServe`'s check sees), swap it to a symlink
-// (what an attacker does in the gap a live race needs), then read it with
-// EXACTLY what `staticReadFile` is bound to. `readFileNoFollow` makes no
-// assumption about anything checked earlier -- the open itself decides, not
-// a prior stat -- so it refuses every time, not on a scheduling win. The
-// control read with plain `readFile` (module-wide from node.test.bit; the
-// exact primitive `staticReadFile` used before this ticket) proves the swap
-// is real: it follows the same symlink and returns the sentinel.
-import { readFileNoFollow, remove } from "std/fs"
+// `openBeneath` itself only refuses a directory or a symlink anywhere in
+// `rel`'s resolution (stdlib/fs/secure/secure.bit) -- a FIFO placed directly
+// under the served root opens clean. Reading it would then block the worker
+// that opened it forever, waiting on a writer that will never come: the
+// other half of #5798's fix is `statOpen`'s `isRegular` bit, checked in
+// `staticServe` BEFORE any read is attempted. Bounded by `after(Second)`: on
+// the pre-fix code this request would simply hang, so a fixed timeout tells
+// "refused promptly" apart from "the request itself never returns" instead
+// of letting a regression stall the whole suite.
+import { after, Second } from "std/time"
 
-test "a file swapped to a symlink after being lstat'd is refused, not read" {
-  let f = newStaticFixture("swap")
-  let target = "${f.root}/swap.css"
-  writeFixture(target, cssBody)
+fn fifoRequest(app: App, done: chan<Response>) {
+  let res = app.handle(staticReq("GET", "/assets/pipe", ""))
+  done <- res
+}
 
-  let before = lstat(target) catch e {
-    panic("static.test: lstat ${target}: ${e.message()}")
+test "a FIFO under the mount is a 404 within one second, never read" {
+  let f = newStaticFixture("fifo")
+  let pipe = "${f.root}/pipe"
+  let rc = run("/usr/bin/mkfifo", [pipe])
+  assert(rc == 0, "/usr/bin/mkfifo ${pipe} exited ${rc} -- the fixture could not be built")
+
+  let done = chan<Response>(1)
+  spawn fifoRequest(f.app, done)
+
+  select {
+    case res = <- done:
+      assert(res.status == 404, "want 404, got ${res.status}")
+    case <- after(Second):
+      panic("static.test: FIFO request did not return within 1s -- the worker is hung reading the FIFO")
   }
-  assert(!before.isSymlink, "the fixture must start as a real file, not a symlink")
-
-  // `mustLink` uses plain `ln -s`, which refuses an existing name -- remove
-  // the regular file `lstat` just accepted before swapping in the symlink.
-  remove(target) catch e {
-    panic("static.test: remove ${target}: ${e.message()}")
-  }
-  mustLink("${f.dir}/secret.txt", target)
-
-  let leaked = readFile(target) catch e {
-    panic("static.test: control read of ${target} unexpectedly failed: ${e.message()}")
-  }
-  assert(
-    leaked == sentinelBody,
-    "control: plain readFile must still follow the swapped symlink, got '${leaked}'",
-  )
-
-  let refused = false
-  let _ = readFileNoFollow(target) catch _ {
-    refused = true
-    ""
-  }
-  assert(refused, "readFileNoFollow followed the swapped symlink instead of refusing it")
   nodeTestTeardown(f.dir)
 }

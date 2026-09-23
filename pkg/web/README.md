@@ -8,6 +8,19 @@ tree with escaping, sessions, and the middleware set (`logger`, `cors`,
 Versioning, tags and the release procedure for every first-party package are in
 [`pkg/README.md`](../README.md).
 
+## Compiler requirement
+
+As of #5798, `static()` imports `std/fs/secure` (`openBeneath`/`statOpen`),
+which exists only past commit 44fb9b844 on this repository: no compiler
+release ships it yet (the latest release at the time of #5798 is `v0.24.0`).
+`bit.json` has no field a package can use to declare a minimum compiler
+version (`docs/package-manager.md`: "There is no `version` field. Nothing in
+the compiler reads a `"version"` key anywhere in `bit.json`"), so this is
+stated here rather than enforced: install a `bit` built from `main` at or
+past that commit, or wait for the release that repins it. A `bit.json`
+resolving `web` against an older compiler fails at compile time with "cannot
+find module std/fs/secure" (E0045), not silently.
+
 ## Install
 
 ```json
