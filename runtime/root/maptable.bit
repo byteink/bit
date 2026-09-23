@@ -1,0 +1,135 @@
+// THE SLOT TABLE (#5796): everything one map operation indexes, as ONE object.
+// Sibling of `maps.bit` (hash, probe, grow, the ABI surface), `mapscalar.bit`
+// (the four hot entry points), `mapswar.bit` and `mapcaps.bit`, same module.
+//
+// WHAT WAS WRONG. The header used to carry `cap`, `ctrl`, `keys` and `vals` as
+// four separate words, and `mapGrow` replaced them with four plain stores. A
+// reader on another worker loaded them as four plain loads, with nothing
+// ordering either side, so it could pair a NEW `ctrl` with an OLD `cap` (a
+// probe from the wrong home slot: a false miss), an old `cap` with a new
+// `keys`, or a NEW `cap` with an OLD `ctrl` — an index up to `2*cap - 1` into a
+// `cap`-byte array, which is a read past the allocation. And the comma-ok read
+// is TWO calls, `bit_rt_map_slot` then `bit_rt_map_val_at`, each loading
+// `vals` afresh: a grow between them indexed the NEW `vals` with the OLD slot,
+// so `ok=true` came back carrying another key's value. `_tests_/stress/maprace`
+// measured both on main at BIT_WORKERS=4.
+//
+// THE LAYOUT. A table is one GC object: a fixed prefix `{cap, keys, vals}` and
+// then `cap` ctrl bytes inline. `riMapTbl` (root.bit) traces `keys` and `vals`
+// in the prefix and leaves the ctrl bytes untraced, the same fixed-prefix-plus-
+// raw-tail shape `riString` uses. The ctrl bytes are INLINE rather than a third
+// buffer so a probe reaches them in the same number of dependent loads as
+// before (`m` -> table -> byte, where it was `m` -> ctrl -> byte): the one
+// pointer costs no extra load on the path every lookup takes.
+//
+// THE INVARIANT. A table's prefix is written before it is published and never
+// after, and every buffer it names holds exactly `cap` slots. The header's
+// `mapTbl` word is written by `mapPublish` alone (a release store, after the
+// rehash has filled the new buffers) and read by `mapTable` alone (an acquire
+// load). So a reader that loads the table word ONCE and derives `cap`, the
+// ctrl bytes, `keys` and `vals` from that one table sees a table that was
+// complete when it was published, and every index it computes is `h & (cap-1)`
+// or bounded by `< cap` of THAT table: in bounds by construction, whatever a
+// writer on another worker publishes meanwhile. Every entry point below and in
+// `mapscalar.bit`/`mapswar.bit` loads the table once and threads it through
+// its helpers (`mapProbe`, `mapProbeSwar`, `mapClaimSlot`) instead of letting
+// them reload it.
+//
+// A table's slot CONTENTS are still written in place by `m[k] = v` and
+// `delete`, exactly as before; what is immutable is the prefix, which is what
+// every bound is computed from.
+//
+// THE CALL PAIR, AND WHY NO INDEX CROSSES IT. `bit_rt_map_slot` cannot hand an
+// index to `bit_rt_map_val_at`: the second call would have to load the table
+// again, and a grow in between moves the key to a different slot of a
+// different table. No index encoding repairs that without the key, and the key
+// is not an argument of `map_val_at` (ABI.md §15; adding it is an ABI change
+// the pinned stage0 cannot build). So a HIT returns a TOKEN instead: the
+// address of the key's value word in the table the probe used, tagged with
+// `mapTokenBit`. `map_val_at` dereferences it without touching the header, so
+// it reads the value word of the table the slot came from — by construction,
+// not by a re-check.
+//
+// WHY THE TOKEN'S TABLE IS STILL THERE. The token is an untraced interior
+// address, so it is safe exactly as long as nothing can free or move that
+// table between the two calls. The collector never moves an object (ABI.md
+// §5). It frees only after a stop-the-world mark, and a mutator reaches a stop
+// only at a back-edge poll (§5: "at loop back-edges, and nowhere else").
+// `emitMapCommaOk` (compiler/lowermapaccess.bit) emits the two calls back to
+// back with no back edge between them, both callees are `@nosplit` and call
+// nothing that parks — the adjacency contract (§5.1). So no collection can
+// begin between the calls, the table the probe used is intact when
+// `map_val_at` reads it, and the token addresses `vals + i*8` with `i < cap`
+// of that table: in bounds. The word it names holds a value some write
+// actually stored for that key (SPEC §13.7) — the rehash copy or a later `set`
+// on that table; once a grow has retired it, no `set` writes it again.
+//
+// ITERATION STILL PASSES INDICES. `map_iter_next` returns a plain slot index
+// and the loop body runs between it and `map_key_at`/`map_val_at` — a body
+// with back-edge polls, where an address would not survive. An index cannot
+// collide with a token: an index is below its table's `cap`, far below 2^62,
+// and a token is 2^62 plus a user address, which is below 2^57 on both targets
+// even under x86-64 five-level paging. So `map_val_at` tells the two apart by
+// magnitude, and the index path bounds-checks against the table it loads.
+// That check is not redundant with "grow never shrinks": two concurrent
+// WRITERS can each rehash the same old table and publish out of order, which
+// does shrink `cap`, and a racing iteration must still read in bounds (SPEC
+// §13.5 leaves its RESULT unspecified, never its memory safety).
+//
+// No imports: the helpers here use only what the root module already brings
+// in (SPEC §17.1; a duplicate import is E0042).
+
+// The table prefix. `tblCtrl` is where the inline ctrl bytes start, and is
+// also `riMapTbl`'s declared size: the traced part ends there.
+export const tblCap: int = 0
+export const tblKeys: int = 8
+export const tblVals: int = 16
+export const tblCtrl: int = 24
+
+// 1 << 62: marks a `bit_rt_map_slot` hit token. Bit 63 stays clear, so a token
+// is still `>= 0` and the compiler's `ok = slot >= 0` holds unchanged.
+const mapTokenBit: int = 4611686018427387904
+
+// The current table: the ONLY read of `mapTbl`, and an acquire, so the prefix
+// and the rehashed buffers `mapPublish` released are visible through it.
+@nosplit fn mapTable(m: int): int {
+  return atomicLoad(wordAt(m + mapTbl))
+}
+
+// The ONLY write of `mapTbl`: a release store, after the new table is filled.
+@nosplit fn mapPublish(m: int, t: int) {
+  atomicStoreRelease(wordAt(m + mapTbl), t)
+}
+
+// A fresh `vcap`-slot table for map `m`, every ctrl byte EMPTY (`gcAllocRaw`
+// zeroes). Tracing of `keys`/`vals` follows the header's key descriptor and
+// value flag, as `rtMapNew` documents. Exhaustion is fatal inside `gcAlloc*`
+// (root.bit constraint 3), never a returned 0.
+@nosplit fn allocTable(m: int, vcap: int): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  // `elemSize` is explicit 8: maps stay word-per-element regardless of key/value
+  // type (ABI.md §2/#3119).
+  let keys = allocBuf(vcap, loadWord(m + mapKeyDesc) != mapKeyScalar, 8)
+  let vals = allocBuf(vcap, loadWord(m + mapValIsRef) != 0, 8)
+  let t = gcAllocRaw(g, tblCtrl + vcap, base + riMapTbl * 8)
+  storeWord(t + tblCap, vcap)
+  storeWord(t + tblKeys, keys)
+  storeWord(t + tblVals, vals)
+  return t
+}
+
+// The token `bit_rt_map_slot` returns for a hit at slot `i` of table `t`.
+@nosplit fn mapValToken(t: int, i: int): int {
+  return mapTokenBit + loadWord(t + tblVals) + i * 8
+}
+
+// `bit_rt_map_val_at` for an iteration index: the value word at `slot` of the
+// CURRENT table, or the zero word for an index that table does not have.
+@nosplit fn mapValAtIndex(m: int, slot: int): int {
+  let t = mapTable(m)
+  if (slot >= loadWord(t + tblCap)) {
+    return 0
+  }
+  return loadWord(loadWord(t + tblVals) + slot * 8)
+}
