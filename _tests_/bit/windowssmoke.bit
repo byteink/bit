@@ -78,7 +78,7 @@
 // happened rather than the property passing vacuously because none did.
 import { env, envOr, exit } from "std/os"
 import { exists, mkdir, readFile, writeFile } from "std/fs"
-import { contains, hasPrefix, parseInt, trimSpace } from "std/strings"
+import { contains, hasPrefix, parseInt, repeat, trimSpace } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 
 // Generous for a cross-build; the SSH round trips are seconds. A hang here
@@ -464,6 +464,105 @@ fn runThreadRegPhase(s: Session, archivePath: string) {
   println("windowssmoke: thread registration — PASS, ${s.host}")
 }
 
+// PHASE 5 (#5801): a many-small-print() regression guard for the child's own
+// `print()` -> `WriteFile` path (runtime/root/windows/io.bit's
+// `rootWriteAll`/`rootPrint`) under a REAL redirect on real hardware.
+//
+// #5801's own triage found NO byte loss in that path — a 43,000-call/98-
+// byte-line repro (4,214,000 bytes) round-tripped byte-for-byte through both
+// a `cmd /c "... > file"` redirect and a raw, backpressured .NET pipe read,
+// with a temporary GetLastError()/WriteFile-return-value probe recording
+// ZERO short or failed writes. The reported "43,000 bytes short" instead
+// exactly matches (to the byte) PowerShell's own line-splitting: `Get-Item`
+// on a `cmd`-redirected file, vs. `Get-Content | Measure-Object -Character`
+// on the SAME file, differ by exactly one byte per line (a 3-line/33-byte
+// sanity file measures 30 characters) — `Measure-Object -Character` strips
+// every line object's trailing `\n` before counting. That is why this gate
+// asserts via `cmd /c "... > file"` + `(Get-Item ...).Length` — a raw HANDLE
+// redirect with no text reprocessing — and NEVER a PowerShell `>` (which
+// itself re-encodes native stdout as UTF-16, Windows PowerShell 5.1's
+// `Out-File` default) or a text cmdlet pipe.
+const manyPrintsLineLen: int = 98
+const manyPrintsCount: int = 20000
+
+// Cross-builds the many-prints program against `archivePath` and returns the
+// built exe path — same shape as `buildProgram` above.
+fn buildManyPrintsProgram(s: Session, archivePath: string): string {
+  let progDir = "${s.scratch}/manyprints"
+  mkdir(progDir) catch e {
+    panic("windowssmoke: cannot create ${progDir}: ${e.message()}")
+  }
+  let line = repeat("a", 97)
+  writeFile(
+    "${progDir}/main.bit",
+      "fn main() {\n" +
+      "  let line = \"${line}\\n\"\n" +
+      "  let i = 0\n" +
+      "  while (i < ${manyPrintsCount}) {\n" +
+      "    print(line)\n" +
+      "    i = i + 1\n" +
+      "  }\n" +
+      "}\n",
+  ) catch e {
+    panic("windowssmoke: cannot write ${progDir}/main.bit: ${e.message()}")
+  }
+  let exePath = "${s.scratch}/${s.runId}-manyprints.exe"
+  let (rc, out) = runCaptured(
+    s.scratch, "buildmanyprints",
+      "cd '${s.root}' || exit 90\n" +
+      "BIT_LIBBITRT='${archivePath}' '${s.bitBin}' build '${progDir}' --target x86_64-windows -o '${exePath}'\n", s.ms,
+  )
+  if (rc != 0) {
+    failStage(s, "cross-build the manyprints program", rc, out)
+  }
+  return exePath
+}
+
+// Ships `exePath`, runs it on `s.host` with stdout redirected through
+// `cmd /c "... > file"` (see the header above for why this and not a
+// PowerShell `>`/pipe), and asserts the redirected file's exact byte length.
+fn shipAndRunManyPrints(s: Session, exePath: string) {
+  let remoteName = "${s.runId}-manyprints.exe"
+  let outName = "${s.runId}-manyprints.out"
+  let (rcShip, outShip) = runCaptured(
+    s.scratch, "manyprints-ship",
+    "scp -q -o BatchMode=yes -o ConnectTimeout=8 '${exePath}' '${s.host}:${remoteName}'\n", s.ms,
+  )
+  if (rcShip != 0) {
+    failStage(s, "scp manyprints to ${s.host}", rcShip, outShip)
+  }
+  let (rcRun, outRun) = runCaptured(
+    s.scratch, "manyprints-run",
+      "ssh -o BatchMode=yes -o ConnectTimeout=8 '${s.host}' " +
+      "'cmd /c \"${remoteName} > ${outName}\"'\n", s.ms,
+  )
+  if (rcRun != 0) {
+    failStage(s, "run manyprints on ${s.host}", rcRun, outRun)
+  }
+  let (rcLen, outLen) = runCaptured(
+    s.scratch, "manyprints-len",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 '${s.host}' " + "\"(Get-Item ${outName}).Length\"\n", s.ms,
+  )
+  let _ = runCaptured(
+    s.scratch, "manyprints-cleanup",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 '${s.host}' 'Remove-Item -Force ${remoteName},${outName}'\n", s.ms,
+  )
+  if (rcLen != 0) {
+    failStage(s, "read manyprints output length on ${s.host}", rcLen, outLen)
+  }
+  let want = manyPrintsCount * manyPrintsLineLen
+  let got = parseInt(trimSpace(outLen)) catch _ {
+    failStage(s, "parse manyprints output length '${trimSpace(outLen)}'", 1, outLen)
+    0 - 1
+  }
+  if (got != want) {
+    teardown(s.scratch, s.host, s.runId, s.ms)
+    println("windowssmoke: FAIL — manyprints wrote ${got} bytes, want ${want} (redirected stdout, ${manyPrintsCount} print() calls of ${manyPrintsLineLen} bytes each)")
+    exit(1)
+  }
+  println("windowssmoke: manyprints byte-exact — PASS (${got} bytes over ${manyPrintsCount} print() calls, ${s.host})")
+}
+
 fn main() {
   let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
   let root = repoRoot()
@@ -489,6 +588,8 @@ fn main() {
   let exePath = buildProgram(s, archivePath)
   shipAndRun(s, exePath)
   runThreadRegPhase(s, archivePath)
+  let manyPrintsExe = buildManyPrintsProgram(s, archivePath)
+  shipAndRunManyPrints(s, manyPrintsExe)
   teardown(s.scratch, s.host, s.runId, s.ms)
   println("windowssmoke: PASS — ${s.host}")
 }
