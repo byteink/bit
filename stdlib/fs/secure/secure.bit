@@ -1,0 +1,84 @@
+// std/fs/secure — openBeneath/fstat (#5793), the root cause fix for #5787's
+// worst finding: pkg/web's static file server validates every path
+// component with `lstat` and then opens by path, so a parent directory
+// swapped for a symlink to outside the served root between the check and
+// the open is followed. `std/fs`'s only no-follow open, `openNoFollow`,
+// refuses a symlink in the FINAL path component only (#4720) — every
+// ancestor component is still an unguarded lookup.
+//
+// A SEPARATE submodule from "std/fs" ON PURPOSE, not a second function
+// added there: compiler/ and tools/build import "std/fs" and are built by
+// the pinned 0.24.0 stage0, whose libbitrt has no `bit_rt_fs_open_beneath_w`
+// or `bit_rt_fs_fstat_w` symbol yet, so a reachable reference from "std/fs"
+// breaks `rm -rf bit-out && ./make`'s bootstrap the way #2153 did before its
+// revert. Nothing on the compiler's import path reaches this module, so a
+// release that ships this commit can fold both functions into "std/fs"
+// once the pin moves past it.
+import { File, FileInfo } from "std/fs"
+import { join, contains } from "std/path"
+
+// `bit_rt_fs_open_beneath_w` (runtime/root/{darwin,linux}/fsbeneath.bit):
+// `root` and `rel` travel SEPARATELY, not pre-joined — `root` is opened
+// normally, following its own symlinks (a real deployment's configured
+// static root is routinely reached through one, this machine's own
+// `$TMPDIR` included); only `rel`'s resolution against `root` refuses a
+// symlink in any component and a `..` that would climb out. fd, or -1 for
+// a malformed `root` or `rel`, a directory, a symlink or a `..` anywhere in
+// `rel`, or any other open failure alike.
+extern fn bit_rt_fs_open_beneath_w(root: *byte, rootN: int, rel: *byte, relN: int): i64
+
+// `bit_rt_fs_fstat_w`: `fd`'s metadata (size, mtime, mode, isDir, isSymlink
+// — always `false`) read from the already-open handle, not the path, so a
+// caller never re-resolves a name that could have moved since `open`
+// returned. 0 on success, -1 on failure.
+extern fn bit_rt_fs_fstat_w(fd: i64, out: *i64): i64
+
+const fstatOutWords: int = 5
+
+// Open `rel`, resolved beneath `root`, refusing every symlink along the way
+// and any `..` that would climb out of `root`. `root` is the trusted
+// boundary — a caller's configured static-file directory, say — and is
+// itself opened normally (following its own symlinks, exactly like `open`);
+// only `rel`, the untrusted part of the path, gets the no-follow, no-escape
+// treatment.
+//
+// Containment is checked TWICE, for two different reasons: `std/path`'s
+// `contains` below is a lexical, pre-syscall refusal of a `..` that would
+// climb out of `root` textually (cheap, and catches the common case before
+// any syscall runs); the runtime's `O_NOFOLLOW_ANY`/per-component walk is
+// what still holds if a symlink is planted on disk AFTER this lexical check
+// passes but BEFORE the open reaches it — the exact race #5787 found.
+// Neither alone is sufficient; #5787's finding is what the second one closes.
+export fn openBeneath(root: string, rel: string): File! {
+  if (!contains(root, join(root, rel))) {
+    fail newError("openBeneath: escapes root: ${rel}")
+  }
+  let rootW = []byte(root)
+  let relW = []byte(rel)
+  let fd = bit_rt_fs_open_beneath_w(ptrOf(rootW), len(root), ptrOf(relW), len(rel))
+  if (fd < 0) {
+    fail newError("cannot open file beneath root: ${rel}")
+  }
+  return File{ fd = fd }
+}
+
+// `f`'s metadata, read from the open handle rather than re-resolving its
+// path — the pairing `openBeneath` needs so a caller takes size/mtime/type
+// from the SAME object it just opened, never from a second, separately
+// racy path lookup. Named `statOpen`, not `fstat`: the root module keeps
+// bare link names, and `fstat` collides with the libc symbol the runtime
+// resolves externally (SPEC §11.7, E0096).
+export fn statOpen(f: File): FileInfo! {
+  let out = []i64(fstatOutWords)
+  let rc = bit_rt_fs_fstat_w(f.fd, ptrOf(out))
+  if (rc < 0) {
+    fail newError("fstat failed")
+  }
+  return FileInfo{
+    size = out[0],
+    mtime = out[1],
+    mode = out[2],
+    isDir = out[3] != 0,
+    isSymlink = out[4] != 0,
+  }
+}
