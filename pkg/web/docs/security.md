@@ -45,6 +45,30 @@ type implementing `SessionStore` directly - a future `SqlStore` or
 tombstone bounded by the same session ttl, so a stale writer can never bring
 a destroyed id back once its tombstone exists.
 
+### Regenerating the id after login
+
+`Session.regenerate()` moves this session's data to a freshly minted id,
+destroys the old one, and arms a `Set-Cookie` for the new one. Call it the
+moment a request proves who it is - a successful password check, an OIDC
+callback, any change of privilege - and before writing that identity onto the
+session:
+
+```bit
+import { Ctx } from "web"
+
+fn afterLogin(c: Ctx): ()! {
+  c.session()?.regenerate()?
+}
+```
+
+This closes session fixation: without it, an id an attacker set on a victim
+before login (in a cookie the attacker already knows) stays valid after
+login, so the attacker's known id now carries an authenticated session. OWASP's
+Session Management Cheat Sheet states the rule this follows: renew the
+session id after any privilege change, not only at login. The old id is
+destroyed through the store's atomic path (see above), so it is invalid the
+instant `regenerate()` returns, even to a request that had already loaded it.
+
 ## CSRF and anonymous visitors
 
 `c.csrfToken()` returns the value a form puts in its hidden `_csrf` field. It
