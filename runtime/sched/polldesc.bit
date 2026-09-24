@@ -19,53 +19,77 @@
 // `atomicCmpxchg`/`atomicLoad` calls, never a spin-lock.
 //
 // ---------------------------------------------------------------------------
-// The state each (fd, direction) slot holds, and the invariants
+// The packed slot word, and why the generation lives INSIDE it
 // ---------------------------------------------------------------------------
 //
-// `pdRSlot[fd]` / `pdWSlot[fd]` hold one of three things:
-//   pdEmpty (0)   -- nobody waiting, no edge pending.
-//   pdReady (-1)  -- a readiness edge arrived with nobody parked to catch it.
-//   a task id (>0)-- exactly one task is parked here.
+// `pdRSlot[fd]` / `pdWSlot[fd]` each hold ONE 64-bit word: the fd's
+// generation in the high `pdGenBits` bits, and the slot's own state in the
+// low `pdTaskBits` bits (`pdPack`/`pdTaskOf`/`pdGenOf`). The low field is one
+// of pdEmpty (0, nobody waiting), pdReady (all `pdTaskBits` bits set, a
+// readiness edge arrived with nobody parked to catch it), or a task id
+// (1..pdReady-1, exactly one task parked here).
+//
+// Packing them together means every state transition below is ONE
+// compare-and-swap whose EXPECTED value already carries the generation, so a
+// stale generation makes the CAS itself fail -- there is no separate
+// recheck, and therefore no window in which a transition is transiently
+// visible before being undone. `pdTaskBits`=44 gives 16 TiB of task-id range,
+// far past any address this runtime's green-thread stacks or heap can reach;
+// the remaining `pdGenBits`=20 wraps a single fd's generation only after
+// 1,048,576 open/close cycles -- even a sustained, unrealistic 100k
+// reopens/sec would need ten seconds of continuous scheduling starvation on
+// ONE stale operation to collide with it, far past any pause `BIT_GC=stress`
+// or a real GC produces.
+//
+// TWO EARLIER DESIGNS, BOTH REPLACED. #5864's original shipped a separate
+// `pdGenTable[fd]` word, checked by re-reading it immediately after a plain
+// CAS and undoing the write if it had moved. That left a real window: a
+// `pdClose` racing the tail of that undo could read the slot back-to-empty
+// before the undo landed, and (since it trusted a single "empty" read as
+// final) report "nobody was waiting" for a task about to be restored right
+// behind it -- caught live under `BIT_WORKERS=8 BIT_GC=stress`
+// (`resolved 9599 bad 1` on the #5864 stress program). The first attempted
+// fix reordered `pdClose`/`pdOpen` to sweep before bumping the separate gen
+// word, which closed that window but opened its mirror: a `pdWait` racing a
+// sweep that had ALREADY run could still CAS its task in under the
+// not-yet-bumped generation and park with nobody left to ever wake it --
+// caught by `waitCloseDriver` below, added for exactly this case (27/30
+// failures at `BIT_WORKERS=8 BIT_GC=stress` on that reorder alone). Packing
+// the generation into the SAME word the state transition CASes removes the
+// two-word gap both designs still had, rather than reordering around it.
+//
+// ---------------------------------------------------------------------------
+// The invariants
+// ---------------------------------------------------------------------------
 //
 // INVARIANT 1 (exactly-once wake): a parked task id is removed from a slot by
-// exactly one of `pdWake`, `pdCancel` or `pdClose` -- all three mutate the
-// slot only through `atomicCmpxchg`, so at most one of them can ever observe
-// the task id and swap it out. Enforced by `pdWakeStep`'s and `pdSweep`'s CAS
-// on the occupied branch, and `pdCancel`'s CAS via `pdCasChecked`.
+// exactly one of `pdWake`, `pdCancel` or `pdSweep` (`pdClose`'s sweep) --
+// all three transition the slot only through a single `atomicCmpxchg` on the
+// full packed word, so at most one of them can ever observe the task id and
+// swap it out.
 //
 // INVARIANT 2 (no lost edge): an edge that arrives before any waiter is
-// recorded (`pdEmpty` -> `pdReady`) rather than dropped, and the next
-// `pdWait` on that slot consumes it immediately instead of parking. Enforced
-// by `pdWaitStep`'s `pdReady` branch and `pdWakeStep`'s `pdEmpty` branch.
+// recorded (`pdEmpty` -> `pdReady`, same generation) rather than dropped, and
+// the next `pdWait` on that slot consumes it immediately instead of parking.
+// Enforced by `pdWaitStep`'s `pdReady` branch and `pdWakeStep`'s `pdEmpty`
+// branch.
 //
-// INVARIANT 3 (stale-gen events are ignored, never corrupt a live slot): a
-// generation counter per fd (`pdGenTable`), bumped at `pdOpen` and `pdClose`,
-// is checked by every write via `pdCasChecked` -- a write is durable only if
-// the fd's generation is still what the caller expected IMMEDIATELY AFTER the
-// CAS; if it moved on, the write is undone (or, if something else already
-// consumed it in the interim, left as delivered -- see `pdCasChecked`'s own
-// header for why both outcomes are safe). This is what lets a wake or cancel
-// computed against a closed-and-reused fd number touch nothing.
+// INVARIANT 3 (stale-gen events are ignored, never corrupt a live slot): the
+// generation packed into a slot word is bumped by every `pdOpen`/`pdClose`
+// (`pdGenTable[fd]`, the source of the NEXT generation number, masked into
+// `pdGenBits` when packed -- see `pdGenTag`). Every transition's CAS expects
+// the caller's generation packed alongside the old state, so a stale
+// generation makes the CAS fail outright, before any state is ever written.
+// This is what lets a wake or cancel computed against a closed-and-reused fd
+// number touch nothing.
 //
-// INVARIANT 4 (close wakes every waiter): `pdClose` bumps the generation
-// FIRST, then unconditionally sweeps both slots (`pdSweep`, no gen check --
-// `pdClose` IS the authority that just advanced the generation, so whatever
-// it finds belongs to the generation it is closing). A task parked in either
-// direction is therefore always reported to the caller closing the fd.
-//
-// ---------------------------------------------------------------------------
-// Why the gen re-check is AFTER the CAS, not only before
-// ---------------------------------------------------------------------------
-//
-// Checking the generation once, before attempting a slot CAS, is not enough:
-// a `pdClose` can land in the window between that check and the CAS, and the
-// CAS would then plant a stale-generation value into a slot the NEW
-// generation already owns. `pdCasChecked` closes that window by re-reading
-// the generation immediately after its CAS succeeds and undoing the write if
-// it no longer matches -- the same "arm, then re-check" shape
-// `../sched/task.bit`'s `schedParkArm`/`schedPollUnpark` protocol uses for
-// the identical class of race, applied here to a generation counter instead
-// of a task-state word.
+// INVARIANT 4 (close wakes every waiter): `pdClose` unconditionally
+// transitions both slots to the new generation's empty state (`pdSweep`,
+// looping past ordinary CAS contention from a concurrent wake/cancel/wait,
+// never past a generation mismatch since `pdSweep` sets the target
+// generation itself) and reports whatever task id it displaced. A task
+// parked in either direction is therefore always reported to the caller
+// closing the fd.
 //
 // ---------------------------------------------------------------------------
 // What is deliberately NOT here
@@ -89,10 +113,6 @@ export const pdDirWrite: int = 1
 // non-positive `taskId`).
 export const pdEmpty: int = 0
 
-// The "an edge is waiting, nobody has claimed it yet" sentinel. Negative, so
-// it can never collide with a real (positive) task id.
-const pdReady: int = 0 - 1
-
 // `pdWait`'s answer.
 export const pdClaimed: int = 0      // the slot now holds `taskId`; go park.
 export const pdAlreadyReady: int = 1 // an edge was already there; consumed.
@@ -111,6 +131,16 @@ let pdGenTable: [65536]i64
 let pdRSlot: [65536]i64
 let pdWSlot: [65536]i64
 
+// Packed slot word layout: `pdTaskBits` low bits for state, `pdGenBits` high
+// bits for generation -- see the header's "packed slot word" section for the
+// width reasoning. `pdReady` is the low field's all-ones value, distinct from
+// 0 (empty) and from every real task id, which is masked to fewer bits.
+const pdTaskBits: int = 44
+const pdGenBits: int = 64 - pdTaskBits
+const pdTaskMask: int = (1 << pdTaskBits) - 1
+const pdGenLimit: int = 1 << pdGenBits
+const pdReady: int = pdTaskMask
+
 // CAS retry bound for a single slot under real contention: at most a handful
 // of actors ever touch one (fd, direction) at once -- the parking task, one
 // drain, one timer cancel, one close -- so this is generous rather than
@@ -122,11 +152,6 @@ const pdMaxRetries: int = 8
 // codes are 0-3, `pdWake`'s are 0 or a positive task id.
 const pdWaitRetry: int = 0 - 1
 const pdWakeRetry: int = 0 - 1
-
-// `pdCasChecked`'s outcome.
-const pdCasFailed: int = 0 // the CAS itself did not apply; `old` was stale.
-const pdCasOk: int = 1     // the write is durable.
-const pdCasStale: int = 2  // the write was undone; the fd's generation moved.
 
 @nosplit fn pdValidFd(fd: int): bool {
   return fd >= 0 && fd < pdCapacity
@@ -147,91 +172,85 @@ const pdCasStale: int = 2  // the write was undone; the fd's generation moved.
   return ptrOf(pdWSlot) + fd
 }
 
-// One CAS, made safe against a concurrent generation bump (see the header's
-// "gen re-check" section). Returns `pdCasFailed` if `*slot != old` (the
-// caller should reread and retry, not treat this as staleness); `pdCasOk` if
-// the write is durable; `pdCasStale` if the fd's generation moved on and the
-// write was undone.
-//
-// A FAILED UNDO (the second `atomicCmpxchg` below) MEANS SOMEONE ELSE ALREADY
-// CONSUMED `newv`, not that this call failed. Whatever legitimately swapped
-// `newv` back out (a wake, a cancel, or the close itself) already owns
-// delivering it, so this call reports `pdCasOk` -- treating its own write as
-// delivered is correct, not a race lost silently, because exactly one of
-// {this call, whoever raced it} ever observes `newv` and that is what
-// invariant 1 requires.
-@nosplit fn pdCasChecked(fd: int, slot: *i64, old: int, newv: int, gen: int): int {
-  if (!atomicCmpxchg(slot, old, newv)) {
-    return pdCasFailed
-  }
-  if (atomicLoad(pdGenAddr(fd)) == gen) {
-    return pdCasOk
-  }
-  if (atomicCmpxchg(slot, newv, old)) {
-    return pdCasStale
-  }
-  return pdCasOk
+// Mask a raw, ever-growing `pdGenTable` value down to the `pdGenBits` a
+// packed word actually carries. `pdGenTable` itself never wraps (a plain
+// `int` counter); only the packed representation is bounded width, which is
+// the wraparound headroom the header's width reasoning is about.
+@nosplit fn pdGenTag(gen: int): int {
+  return gen & (pdGenLimit - 1)
 }
 
-// Unconditional (no gen check -- see invariant 4): swap `slot` to empty and
-// report what was there, `pdEmpty` for "nothing to wake" whether it was
-// truly empty or only an unclaimed ready edge.
-@nosplit fn pdSweep(slot: *i64): int {
+@nosplit fn pdPack(genTag: int, taskOrTag: int): int {
+  return (genTag << pdTaskBits) | (taskOrTag & pdTaskMask)
+}
+
+@nosplit fn pdTaskOf(word: int): int {
+  return word & pdTaskMask
+}
+
+@nosplit fn pdGenOf(word: int): int {
+  return (word >> pdTaskBits) & (pdGenLimit - 1)
+}
+
+// Unconditionally transition `slot` to `(targetGenTag, pdEmpty)` and report
+// whatever task id it displaced (`pdEmpty` for none, whether the slot was
+// truly empty or only held an unclaimed ready edge). Used by `pdOpen` and
+// `pdClose`, both of which own `targetGenTag` outright (they just minted it),
+// so no generation check is needed here -- only ordinary CAS contention from
+// a concurrent `pdWait`/`pdWake`/`pdCancel` still racing the OLD generation,
+// which this loop's retry absorbs exactly like `pdWaitStep`/`pdWakeStep` do.
+@nosplit fn pdSweep(slot: *i64, targetGenTag: int): int {
   let k = 0
   while (k < pdMaxRetries) {
     let cur = atomicLoad(slot)
-    if (cur == pdEmpty) {
-      return pdEmpty
-    }
-    if (atomicCmpxchg(slot, cur, pdEmpty)) {
-      if (cur == pdReady) {
+    if (atomicCmpxchg(slot, cur, pdPack(targetGenTag, pdEmpty))) {
+      let tag = pdTaskOf(cur)
+      if (tag == pdReady) {
         return pdEmpty
       }
-      return cur
+      return tag
     }
     k = k + 1
   }
   return pdEmpty
 }
 
-// Open (or reopen) `fd`: bump its generation and clear both slots. Returns
-// the new generation, or -1 for an out-of-range fd. Must be called before any
-// `pdWait`/`pdWake`/`pdCancel` against this fd, and again every time the
-// underlying kernel fd number is reused for a new connection -- the bumped
-// generation is what makes a straggler from the PREVIOUS connection's waits
-// inert (invariant 3).
+// Open (or reopen) `fd`: mint a new generation and transition both slots to
+// it, empty. Returns the new generation, or -1 for an out-of-range fd. Must
+// be called before any `pdWait`/`pdWake`/`pdCancel` against this fd, and
+// again every time the underlying kernel fd number is reused for a new
+// connection -- the new generation is what makes a straggler from the
+// PREVIOUS connection's waits inert (invariant 3).
 export @nosplit fn pdOpen(fd: int): int {
   if (!pdValidFd(fd)) {
     return 0 - 1
   }
   let g = atomicAdd(pdGenAddr(fd), 1) + 1
-  let _ = pdSweep(pdSlotAddr(fd, pdDirRead))
-  let _ = pdSweep(pdSlotAddr(fd, pdDirWrite))
+  let genTag = pdGenTag(g)
+  let _ = pdSweep(pdSlotAddr(fd, pdDirRead), genTag)
+  let _ = pdSweep(pdSlotAddr(fd, pdDirWrite), genTag)
   return g
 }
 
-// One attempt at `pdWait`'s slot transition. Returns a terminal `pdWait` code,
-// or `pdWaitRetry` when another writer raced the slot and the caller should
+// One attempt at `pdWait`'s slot transition. Returns a terminal `pdWait`
+// code, or `pdWaitRetry` when the CAS lost to ordinary contention (not a
+// generation mismatch, which is terminal on its own) and the caller should
 // reread and try again.
-@nosplit fn pdWaitStep(fd: int, slot: *i64, gen: int, taskId: int): int {
+@nosplit fn pdWaitStep(genTag: int, slot: *i64, taskId: int): int {
   let cur = atomicLoad(slot)
-  if (cur == pdEmpty) {
-    let r = pdCasChecked(fd, slot, pdEmpty, taskId, gen)
-    if (r == pdCasOk) {
+  if (pdGenOf(cur) != genTag) {
+    return pdStaleGen
+  }
+  let tag = pdTaskOf(cur)
+  if (tag == pdEmpty) {
+    if (atomicCmpxchg(slot, cur, pdPack(genTag, taskId))) {
       return pdClaimed
-    }
-    if (r == pdCasStale) {
-      return pdStaleGen
     }
     return pdWaitRetry
   }
-  if (cur == pdReady) {
-    let r = pdCasChecked(fd, slot, pdReady, pdEmpty, gen)
-    if (r == pdCasOk) {
+  if (tag == pdReady) {
+    if (atomicCmpxchg(slot, cur, pdPack(genTag, pdEmpty))) {
       return pdAlreadyReady
-    }
-    if (r == pdCasStale) {
-      return pdStaleGen
     }
     return pdWaitRetry
   }
@@ -241,7 +260,8 @@ export @nosplit fn pdOpen(fd: int): int {
 // Claim `fd`'s `dir` slot for `taskId`, or consume an edge that is already
 // there. `gen` must be the value `pdOpen` (or a prior successful `pdWait` on
 // this fd) returned; a mismatch against the fd's CURRENT generation is
-// answered with `pdStaleGen` before any slot is touched.
+// answered with `pdStaleGen`, decided by the SAME compare-and-swap that
+// claims the slot -- there is no separate check to race.
 //
 // `taskId` MUST be a caller-chosen non-zero positive value stable for the
 // whole time this task may be parked -- #5865/#5866 pass a real task address;
@@ -250,13 +270,11 @@ export @nosplit fn pdWait(fd: int, dir: int, gen: int, taskId: int): int {
   if (!pdValidFd(fd) || !pdValidDir(dir) || taskId <= 0) {
     return pdBusy
   }
-  if (atomicLoad(pdGenAddr(fd)) != gen) {
-    return pdStaleGen
-  }
+  let genTag = pdGenTag(gen)
   let slot = pdSlotAddr(fd, dir)
   let k = 0
   while (k < pdMaxRetries) {
-    let r = pdWaitStep(fd, slot, gen, taskId)
+    let r = pdWaitStep(genTag, slot, taskId)
     if (r != pdWaitRetry) {
       return r
     }
@@ -268,24 +286,23 @@ export @nosplit fn pdWait(fd: int, dir: int, gen: int, taskId: int): int {
 // One attempt at `pdWake`'s slot transition. Returns a task id (deliver the
 // wake), `pdEmpty` (nothing to deliver -- recorded as ready, already ready,
 // or the gen was stale), or `pdWakeRetry` to reread and try again.
-@nosplit fn pdWakeStep(fd: int, slot: *i64, gen: int): int {
+@nosplit fn pdWakeStep(genTag: int, slot: *i64): int {
   let cur = atomicLoad(slot)
-  if (cur == pdEmpty) {
-    let r = pdCasChecked(fd, slot, pdEmpty, pdReady, gen)
-    if (r == pdCasFailed) {
-      return pdWakeRetry
+  if (pdGenOf(cur) != genTag) {
+    return pdEmpty // a stale-generation wake touches nothing
+  }
+  let tag = pdTaskOf(cur)
+  if (tag == pdEmpty) {
+    if (atomicCmpxchg(slot, cur, pdPack(genTag, pdReady))) {
+      return pdEmpty
     }
+    return pdWakeRetry
+  }
+  if (tag == pdReady) {
     return pdEmpty
   }
-  if (cur == pdReady) {
-    return pdEmpty
-  }
-  let r = pdCasChecked(fd, slot, cur, pdEmpty, gen)
-  if (r == pdCasOk) {
-    return cur
-  }
-  if (r == pdCasStale) {
-    return pdEmpty
+  if (atomicCmpxchg(slot, cur, pdPack(genTag, pdEmpty))) {
+    return tag
   }
   return pdWakeRetry
 }
@@ -304,10 +321,11 @@ export @nosplit fn pdWake(fd: int, dir: int, gen: int): int {
   if (!pdValidFd(fd) || !pdValidDir(dir)) {
     return pdEmpty
   }
+  let genTag = pdGenTag(gen)
   let slot = pdSlotAddr(fd, dir)
   let k = 0
   while (k < pdMaxRetries) {
-    let r = pdWakeStep(fd, slot, gen)
+    let r = pdWakeStep(genTag, slot)
     if (r != pdWakeRetry) {
       return r
     }
@@ -318,23 +336,32 @@ export @nosplit fn pdWake(fd: int, dir: int, gen: int): int {
 
 // The timer side of a deadline race won: retract `taskId` from `fd`'s `dir`
 // slot. Returns true only when this call is the one that removed it -- false
-// means it was already resolved by a `pdWake`, a `pdClose`, or was never
-// claimed (or `gen` is stale), and the caller must not touch the task again.
+// means it was already resolved by a `pdWake`, a `pdClose`, was never
+// claimed, `gen` is stale, or a DIFFERENT task is now parked there (a later
+// wait within the same generation -- checking the exact task id, not just
+// the generation, is what keeps a stale cancel from evicting it). The caller
+// must not touch the task again on a `false` return.
 export @nosplit fn pdCancel(fd: int, dir: int, taskId: int, gen: int): bool {
   if (!pdValidFd(fd) || !pdValidDir(dir) || taskId <= 0) {
     return false
   }
+  let genTag = pdGenTag(gen)
   let slot = pdSlotAddr(fd, dir)
-  return pdCasChecked(fd, slot, taskId, pdEmpty, gen) == pdCasOk
+  let cur = atomicLoad(slot)
+  if (pdGenOf(cur) != genTag || pdTaskOf(cur) != taskId) {
+    return false
+  }
+  return atomicCmpxchg(slot, cur, pdPack(genTag, pdEmpty))
 }
 
-// Close `fd`: bump its generation, then unconditionally wake both directions
-// (invariant 4) so a task parked in either one sees the close rather than
-// hanging until a syscall that will never come. The task id woken on each
-// direction (`pdEmpty` for none) is written through `outR`/`outW` rather than
-// returned as a pair -- no tuple return, no allocation; a caller not
-// interested in one direction may pass `nil` for it. Returns the new
-// generation, or -1 for an out-of-range fd (both outputs left at `pdEmpty`).
+// Close `fd`: mint a new generation and unconditionally transition both
+// slots to it, empty (invariant 4), so a task parked in either one sees the
+// close rather than hanging until a syscall that will never come. The task
+// id woken on each direction (`pdEmpty` for none) is written through
+// `outR`/`outW` rather than returned as a pair -- no tuple return, no
+// allocation; a caller not interested in one direction may pass `nil` for
+// it. Returns the new generation, or -1 for an out-of-range fd (both outputs
+// left at `pdEmpty`).
 export @nosplit fn pdClose(fd: int, outR: *i64, outW: *i64): int {
   if (!pdValidFd(fd)) {
     if (outR != nil) {
@@ -346,8 +373,9 @@ export @nosplit fn pdClose(fd: int, outR: *i64, outW: *i64): int {
     return 0 - 1
   }
   let g = atomicAdd(pdGenAddr(fd), 1) + 1
-  let r = pdSweep(pdSlotAddr(fd, pdDirRead))
-  let w = pdSweep(pdSlotAddr(fd, pdDirWrite))
+  let genTag = pdGenTag(g)
+  let r = pdSweep(pdSlotAddr(fd, pdDirRead), genTag)
+  let w = pdSweep(pdSlotAddr(fd, pdDirWrite), genTag)
   if (outR != nil) {
     *outR = r
   }
