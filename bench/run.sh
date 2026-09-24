@@ -51,6 +51,10 @@ RES="$WORK/res"      # lines: "<case> <lang> <median_s> <rss_bytes> <bin_bytes> 
 : > "$RES"
 ALC="$WORK/alc"      # lines: "<case> <lang> <heap_allocations_per_run>"
 : > "$ALC"
+GCRES="$WORK/gcres"  # bit lines: "<case> bit <pauses> <pausens_ms> <pausemaxns_ms> <share>"
+: > "$GCRES"          # go lines:  "<case> go <gc_count> <stw_ms> <stwmax_ms> <share>"
+APW="$WORK/apwall"   # allocpar_W1/allocpar_W8 wall rows: "<case> <lang> <wall_ms>"
+: > "$APW"
 
 now()    { perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time()'; }
 median() { sort -n | awk '{a[NR]=$1} END{n=NR; if(n%2){print a[(n+1)/2]} else {printf "%.6f\n",(a[n/2]+a[n/2+1])/2}}'; }
@@ -74,6 +78,8 @@ size()   { stat -f%z "$1"; }
 get()    { awk -v c="$1" -v l="$2" -v k="$3" '$1==c&&$2==l{print $(k)}' "$RES"; }  # k: 3=s 4=rss 5=bin 6=cyc 7=instr
 alc()    { awk -v c="$1" -v l="$2" '$1==c&&$2==l{print $3}' "$ALC"; }
 alcmd()  { n=$(alc "$1" "$2"); [ -n "$n" ] && echo "$n" || echo "n/a"; }
+apwget() { awk -v c="$1" -v l="$2" '$1==c&&$2==l{print $3}' "$APW"; }                       # <case>_W<n> lang -> wall ms
+gcget()  { awk -v c="$1" -v l="$2" -v k="$3" '$1==c&&$2==l{print $(k)}' "$GCRES"; }  # k: 3=count/pauses 4=ms 5=maxms 6=share
 
 # Heap allocations one run of a case performs, per language — the number that
 # proves the three sources still express the SAME data structure (#3934: the
@@ -91,11 +97,107 @@ tag_allocs() { awk '/^\[allocs\]/{print $2}' "$1"; }
 # "<real_seconds> <max_rss_bytes> <cycles_elapsed> <instructions_retired>".
 # The last two are printed by /usr/bin/time -l on Apple silicon from the same
 # invocation -- no second run, no sampling profiler, no extra dependency.
+# `real` is /usr/bin/time's own field, at BSD time(1)'s hundredth-of-a-second
+# resolution -- too coarse for the millisecond wall table below, which uses
+# wall_run() instead. It is still parsed here because this function's other
+# three fields need the invocation anyway and a caller may want it.
 time_run() {
   /usr/bin/time -l "$@" >/dev/null 2>"$WORK/t"
   awk '/ real/{r=$1} /maximum resident set size/{m=$1}
        /cycles elapsed/{c=$1} /instructions retired/{n=$1}
        END{print r, m, c+0, n+0}' "$WORK/t"
+}
+
+# Runs $1 once, fork-to-reap, echoes elapsed milliseconds (one decimal). $2,
+# if given, captures the child's stderr (used for BIT_GC_STATS / GODEBUG
+# probes); otherwise stderr is discarded like stdout.
+#
+# ONE perl process does the fork, exec and waitpid, and reads Time::HiRes
+# immediately before and after itself -- not two separate now() calls
+# bracketing the run the way the compile-time loop above does. Two calls
+# would each pay perl's own ~5-10ms startup after the child has already
+# exited, and that jitter would land inside the measured interval; allocpar's
+# W8 pause share needs low-noise wall time to be meaningful at all. No
+# intermediate shell: fork()+exec() runs $1 directly, so no extra process
+# startup is inside the timed window either.
+wall_run() {
+  local errfile="${2:-/dev/null}"
+  perl -MTime::HiRes -e '
+    my ($bin, $errfile) = @ARGV;
+    open(my $devnull, ">", "/dev/null") or die $!;
+    open(my $errfh, ">", $errfile) or die $!;
+    my $t0 = Time::HiRes::time();
+    my $pid = fork();
+    if (!defined $pid) { die "fork: $!" }
+    if ($pid == 0) {
+      open(STDOUT, ">&", $devnull);
+      open(STDERR, ">&", $errfh);
+      exec($bin) or exit 127;
+    }
+    waitpid($pid, 0);
+    printf "%.1f\n", (Time::HiRes::time() - $t0) * 1000;
+  ' "$1" "$errfile"
+}
+
+# One `field=value` token out of a BIT_GC_STATS or `[bit-gc] ...` line --
+# shared by the allocation probe above (kept as bit_allocs/tag_allocs, its own
+# two-field parse) and the pause fields below, which are one field each.
+gcstat() { awk -v f="$2" '{for(i=1;i<=NF;i++) if(index($i,f"=")==1){print substr($i,length(f)+2); exit}}' "$1"; }
+
+# `pauses=`/`pausens=`/`pausemaxns=` (#5834) from one BIT_GC_STATS=1 run's
+# captured stderr, ns converted to ms.
+bit_pauses()     { n=$(gcstat "$1" pauses); [ -n "$n" ] && echo "$n" || echo 0; }
+bit_pausens_ms() { awk -v v="$(gcstat "$1" pausens)" 'BEGIN{printf "%.1f", (v+0)/1000000}'; }
+bit_pausemax_ms(){ awk -v v="$(gcstat "$1" pausemaxns)" 'BEGIN{printf "%.1f", (v+0)/1000000}'; }
+
+# Go's `GODEBUG=gctrace=1` log: one `gc N @Ts P%: A+B+C ms clock, ...` line
+# per collection, where A is the sweep-termination STW pause, B is concurrent
+# mark (not a stop) and C is the mark-termination STW pause -- `go doc
+# runtime`'s gctrace entry, go1.27.1, confirmed against a live run of
+# bench/cases/allocpar/allocpar.go. GC count is the number of lines; the STW
+# sum is every line's A+C; the max is the single longest INDIVIDUAL A or C
+# segment, matching what pausemaxns= reports for Bit (the longest one stop),
+# not a per-collection sum.
+go_gc_n()       { awk '/^gc [0-9]+ /{n++} END{print n+0}' "$1"; }
+go_gc_stw_ms()  { awk '/^gc [0-9]+ /{split($5,a,"+"); s+=a[1]+0; s+=a[3]+0} END{printf "%.1f", s+0}' "$1"; }
+go_gc_stwmax_ms(){ awk '/^gc [0-9]+ /{split($5,a,"+"); if(a[1]+0>m)m=a[1]+0; if(a[3]+0>m)m=a[3]+0} END{printf "%.1f", m+0}' "$1"; }
+
+# Pause share of a probe run's own wall time -- $1 pause/STW ms, $2 that same
+# run's wall ms from wall_run(). n/a on a zero-length run rather than a
+# division by zero.
+pause_share() { awk -v a="$1" -v b="$2" 'BEGIN{if(b+0<=0){printf "n/a"}else{printf "%.1f%%", a/b*100}}'; }
+
+# `allocpar W1`/`allocpar W8` rows (#5835): BIT_WORKERS/GOMAXPROCS resize the
+# scheduler's worker-thread pool while the source's own 8-way `spawn`/`go`
+# fan-out stays fixed -- see allocpar.bit's header for why that knob, not the
+# source constant, is what varies. C is unchanged: WORKERS is a C #define,
+# never read from env in any of the three sources, so its wall figure reuses
+# the baseline allocpar row already measured above instead of re-running the
+# identical binary; the pause table has no C column at all (n/a, always).
+# Appends one wall row per language to $WORK/apwall and one pause row per
+# language to $GCRES, in the same shapes their non-allocpar counterparts use.
+allocparExtraRows() {
+  local w="$1"
+  : > "$WORK/apwb"; : > "$WORK/apwg"
+  local i=0
+  while [ "$i" -lt "$RUNS" ]; do
+    BIT_WORKERS="$w" wall_run "$WORK/allocpar.bit" >> "$WORK/apwb"
+    GOMAXPROCS="$w" wall_run "$WORK/allocpar.go" >> "$WORK/apwg"
+    i=$((i+1))
+  done
+  local cms
+  cms=$(awk -v x="$(get allocpar c 3)" 'BEGIN{printf "%.1f", x*1000}')
+  echo "allocpar_W$w bit $(median < "$WORK/apwb")" >> "$APW"
+  echo "allocpar_W$w go $(median < "$WORK/apwg")" >> "$APW"
+  echo "allocpar_W$w c $cms" >> "$APW"
+
+  local bwms gwms
+  bwms=$(BIT_WORKERS="$w" BIT_GC_STATS=1 wall_run "$WORK/allocpar.bit" "$WORK/apb")
+  gwms=$(GOMAXPROCS="$w" GODEBUG=gctrace=1 wall_run "$WORK/allocpar.go" "$WORK/apg")
+  echo "allocpar_W$w bit $(bit_pauses "$WORK/apb") $(bit_pausens_ms "$WORK/apb") $(bit_pausemax_ms "$WORK/apb")" \
+       "$(pause_share "$(bit_pausens_ms "$WORK/apb")" "$bwms")" >> "$GCRES"
+  echo "allocpar_W$w go $(go_gc_n "$WORK/apg") $(go_gc_stw_ms "$WORK/apg") $(go_gc_stwmax_ms "$WORK/apg")" \
+       "$(pause_share "$(go_gc_stw_ms "$WORK/apg")" "$gwms")" >> "$GCRES"
 }
 
 comp_total=0; comp_n=0
@@ -140,6 +242,18 @@ for c in $CASES; do
     [ "$ob" = "$oc" ] && [ "$oc" = "$og" ] || { echo "verify failed: $c (bit=$ob c=$oc go=$og)" >&2; exit 1; }
   fi
 
+  # --- GC pause probe (#5835): ONE untimed run per case, kept OUT of the
+  # timed loop below because BIT_GC_STATS/GODEBUG add their own overhead.
+  # wall_run's own fork-to-reap ms is this SAME run's wall, so pause share is
+  # computed against the run that produced the pause numbers, not the timed
+  # loop's median from a different set of runs.
+  bwms=$(BIT_GC_STATS=1 wall_run "$WORK/$c.bit" "$WORK/pb")
+  gwms=$(GODEBUG=gctrace=1 wall_run "$WORK/$c.go" "$WORK/pg")
+  echo "$c bit $(bit_pauses "$WORK/pb") $(bit_pausens_ms "$WORK/pb") $(bit_pausemax_ms "$WORK/pb")" \
+       "$(pause_share "$(bit_pausens_ms "$WORK/pb")" "$bwms")" >> "$GCRES"
+  echo "$c go $(go_gc_n "$WORK/pg") $(go_gc_stw_ms "$WORK/pg") $(go_gc_stwmax_ms "$WORK/pg")" \
+       "$(pause_share "$(go_gc_stw_ms "$WORK/pg")" "$gwms")" >> "$GCRES"
+
   # --- timed runs (interleaved run-for-run, #4398) ---
   # #4383 measured two BYTE-IDENTICAL copies of the same binary under the old
   # shape -- run all RUNS of bit, then all RUNS of c, then all RUNS of go --
@@ -150,7 +264,7 @@ for c in $CASES; do
   # every ratio share the same drift. Interleaved, the same protocol gave
   # 0/10 pairs above 4%. Rotate the language order each iteration so no
   # language keeps a fixed position in the triple.
-  for l in bit c go; do : > "$WORK/rs.$l"; : > "$WORK/ms.$l"; : > "$WORK/cy.$l"; : > "$WORK/in.$l"; done
+  for l in bit c go; do : > "$WORK/ms.$l"; : > "$WORK/cy.$l"; : > "$WORK/in.$l"; : > "$WORK/wm.$l"; done
   i=0
   while [ "$i" -lt "$RUNS" ]; do
     case $((i % 3)) in
@@ -160,15 +274,23 @@ for c in $CASES; do
     esac
     for l in $order; do
       set -- $(time_run "$WORK/$c.$l")
-      echo "$1" >> "$WORK/rs.$l"; echo "$2" >> "$WORK/ms.$l"
+      echo "$2" >> "$WORK/ms.$l"
       echo "$3" >> "$WORK/cy.$l"; echo "$4" >> "$WORK/in.$l"
+      wall_run "$WORK/$c.$l" >> "$WORK/wm.$l"
     done
     i=$((i+1))
   done
   for l in bit c go; do
-    echo "$c $l $(median < "$WORK/rs.$l") $(median < "$WORK/ms.$l") $(size "$WORK/$c.$l")" \
+    wsec=$(awk -v x="$(median < "$WORK/wm.$l")" 'BEGIN{printf "%.6f", x/1000}')
+    echo "$c $l $wsec $(median < "$WORK/ms.$l") $(size "$WORK/$c.$l")" \
          "$(trimmean < "$WORK/cy.$l") $(trimmean < "$WORK/in.$l")" >> "$RES"
   done
+  # allocpar's own worker-count variants (#5835) -- need $RES's baseline
+  # allocpar row above for the C column, so this runs only once it exists.
+  if [ "$c" = allocpar ]; then
+    allocparExtraRows 1
+    allocparExtraRows 8
+  fi
   echo "  $c ok (= $ob) allocs bit=$(alcmd "$c" bit) go=$(alcmd "$c" go) c=$(alcmd "$c" c)"
 done
 
@@ -217,7 +339,7 @@ STAMP=$(date -u +%FT%TZ)
 CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
 OSV=$(sw_vers -productVersion 2>/dev/null || uname -sr)
 
-secs() { awk -v x="$1" 'BEGIN{printf "%.3f", x}'; }
+ms1()  { awk -v x="$1" 'BEGIN{printf "%.1f", x*1000}'; }  # seconds (from $RES col 3) -> ms, one decimal
 mb()   { awk -v x="$1" 'BEGIN{printf "%.1f", x/1048576}'; }
 kb()   { awk -v x="$1" 'BEGIN{printf "%.0f", x/1024}'; }
 mil()  { awk -v x="$1" 'BEGIN{printf "%.1f", x/1000000}'; }
@@ -315,12 +437,32 @@ md="$WORK/results.md"
     echo "| $c | $(mil "$(netins "$c" bit)") M | $(mil "$(netins "$c" go)") M | $(mil "$(netins "$c" c)") M |"
   done
   echo
-  echo "### Wall clock: median of ${RUNS} runs, context only"
+  echo "### Wall clock: median of ${RUNS} runs, milliseconds"
   echo
   echo "| Benchmark | Bit | Go | C |"
   echo "|---|--:|--:|--:|"
   for c in $CASES; do
-    echo "| $c | $(secs "$(get "$c" bit 3)")s | $(secs "$(get "$c" go 3)")s | $(secs "$(get "$c" c 3)")s |"
+    echo "| $c | $(ms1 "$(get "$c" bit 3)") ms | $(ms1 "$(get "$c" go 3)") ms | $(ms1 "$(get "$c" c 3)") ms |"
+  done
+  for w in 1 8; do
+    echo "| allocpar W$w | $(apwget "allocpar_W$w" bit) ms | $(apwget "allocpar_W$w" go) ms | $(apwget "allocpar_W$w" c) ms |"
+  done
+  echo
+  echo "### GC pauses: one untimed run per case, share of that run's own wall clock"
+  echo
+  echo "| Benchmark | Bit pauses | Bit pausens ms (share) | Bit pausemax ms | Go GCs | Go STW ms (share) | Go STW max ms | C |"
+  echo "|---|--:|--:|--:|--:|--:|--:|--:|"
+  for c in $CASES; do
+    bp=$(gcget "$c" bit 3); bms=$(gcget "$c" bit 4); bmax=$(gcget "$c" bit 5); bsh=$(gcget "$c" bit 6)
+    gp=$(gcget "$c" go 3);  gms=$(gcget "$c" go 4);  gmax=$(gcget "$c" go 5);  gsh=$(gcget "$c" go 6)
+    echo "| $c | $bp | $bms ms ($bsh) | $bmax ms | $gp | $gms ms ($gsh) | $gmax ms | n/a |"
+  done
+  for w in 1 8; do
+    bp=$(gcget "allocpar_W$w" bit 3); bms=$(gcget "allocpar_W$w" bit 4)
+    bmax=$(gcget "allocpar_W$w" bit 5); bsh=$(gcget "allocpar_W$w" bit 6)
+    gp=$(gcget "allocpar_W$w" go 3);  gms=$(gcget "allocpar_W$w" go 4)
+    gmax=$(gcget "allocpar_W$w" go 5);  gsh=$(gcget "allocpar_W$w" go 6)
+    echo "| allocpar W$w | $bp | $bms ms ($bsh) | $bmax ms | $gp | $gms ms ($gsh) | $gmax ms | n/a |"
   done
   echo
   echo "### Peak memory: max RSS, lower is better"
@@ -361,7 +503,8 @@ md="$WORK/results.md"
   echo "> alloc measures the ALLOCATOR: 10M short-lived nodes, each its own heap object in all three languages (Bit's element class has a reference field, Go holds \`[]*Node\`, C mallocs per node). allocflat measures DATA LAYOUT: the same 10M nodes and the same printed total, stored by value in one buffer per batch (Bit packs \`[]Node\` inline, Go holds \`[]Node\`, C mallocs the batch once). The gap between the two rows is what per-node heap allocation costs a language."
   echo "> allocpar measures the allocator under CONTENTION: the identical 10M nodes and the identical printed total as alloc, partitioned across 8 concurrent workers (Bit \`spawn\`, Go goroutines, C pthreads), worker count fixed in all three sources and never read from the host core count. The gap between the alloc and allocpar rows is what a language's allocator costs when more than one thread is in it; every other case in this table is single-mutator, so that cost appears nowhere else."
   echo "> The allocation table above is how those two claims are checked rather than asserted: same order of magnitude across a row means the three sources still express the same data structure, which is exactly what \`alloc\` silently lost for a day. Bit's count is \`swept+live\` from \`BIT_GC_STATS=1\`; Go's is \`runtime.MemStats.Mallocs\` and C's a \`malloc\` counter, both opt-in (\`BENCH_ALLOC_STATS\`, \`-DBENCH_ALLOC_STATS\`) and both absent from every timed binary."
-  echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows is quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed. Both counters come from the same \`/usr/bin/time -l\` invocation that already produced the wall clock and the RSS; nothing extra is run and nothing extra is installed. The wall-clock table is kept as context and carries no ratio column."
+  echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows would be quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed. Cycles and instructions come from the same \`/usr/bin/time -l\` invocation that also produced the RSS; nothing extra is run and nothing extra is installed for those three. Wall clock is a separate one-decimal-millisecond measurement (\`wall_run()\`, one \`fork\`+\`exec\`+\`waitpid\` perl process per run, not \`/usr/bin/time\`'s own field) so it stays usable below \`/usr/bin/time\`'s 10ms floor; it still carries no ratio column and is kept as context."
+  echo "> GC pauses: one untimed run per case, separate from the timed runs above (BIT_GC_STATS/GODEBUG both add real overhead). Bit's fields are \`pausens=\`/\`pausemaxns=\`/\`pauses=\` from \`BIT_GC_STATS=1\`. Go's are parsed from one \`GODEBUG=gctrace=1\` run: each \`gc N @Ts P%: A+B+C ms clock\` line's A (sweep termination) and C (mark termination) are its two STW segments (\`go doc runtime\`, go1.27.1), summed for the STW total, maxed individually for the longest single pause; B (concurrent mark) is not a stop and is excluded. C has no collector (n/a). Share is that probe run's own \`wall_run()\` wall time, not the timed loop's median. \`allocpar W1\`/\`W8\` reruns the same probe with \`BIT_WORKERS\`/\`GOMAXPROCS\` set; C is unchanged (its worker count is a compile-time \`#define\`, never read from env) so its wall-table cell reuses the baseline \`allocpar\` row rather than a redundant rerun."
   echo "> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (\`bench/cases/startup\`, ${STARTBASE}) subtracted, because dyld and runtime init differ per language and are a fifth of C's \`allocflat\` row. Every other table is raw."
   echo
   echo "> On \`matrix\`, read the Go column as the target and not the C one. The C side vectorises: it retires 2.06 instructions per inner-loop iteration against Go's 9.09, so the Bit:C ratio on this row compares a scalar loop against a vectorised one and is not a statement about codegen quality. A scalar \`cc -O2 -fno-vectorize\` control build of the same case retires 8.07, which is the like-for-like figure. Denominator for all three: \`trials * n^3 = 6 * 512^3 = 805,306,368\` inner iterations."
