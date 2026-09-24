@@ -1,0 +1,81 @@
+// #5845: `rtSchedTimerChanArm` published a channel-timer deadline with no
+// wake for worker 0 — the only worker that watches deadlines
+// (`runtime/sched/timer.bit`'s "Worker 0's arm" section, `runtime/sched/
+// sleep.bit`). A channel timer armed by a task on worker k != 0 while worker
+// 0 is already parked in `pollDrain` reached worker 0 only when its own bound
+// expired (`worker0WaitCeilingNs`, 1s) or a parked peer's `idleParkMaxNs`
+// (100ms) timeout happened to sweep the channel-timer pool.
+//
+// ONLY ONE ARMING TASK, DELIBERATELY, AGAINST THE TICKET'S OWN FIRST DRAFT OF
+// EIGHT. Measured on this repro before any fix (`BIT_WORKERS=8`, 5 runs):
+// eight concurrent `<- time.after` loops never overshot past 3.2ms, because
+// with eight tasks cycling near-independently there is almost always ANOTHER
+// task's expiry keeping some worker's `schedFindWorkAt` pass active —
+// `schedTimerChanExpire` runs unconditionally on every such pass
+// (`runtime/sched/workerfind.bit`), not only worker 0's — so the corpus
+// self-heals the exact window this program exists to catch. One armer plus
+// the accept-blocked listener below is the minimum that lets every OTHER
+// worker actually reach `idleParkMaxNs`/reach worker 0's own poller wait with
+// nothing to interrupt it: 4 of 5 `BIT_WORKERS=8` runs measured 98.7-100ms
+// (`worker0WaitCeilingNs` territory) with the wake removed, against under
+// 5.2ms on all 5 `BIT_WORKERS=1` control runs (arm and sweep on the same
+// thread there, so the missing wake cannot matter).
+//
+// A LIVE NETPOLL REGISTRATION IS REQUIRED FOR THIS TO REPRODUCE AT ALL.
+// `pollDrainSkippable` (`runtime/sched/darwin/poll.bit`) skips the kernel
+// `kevent` call entirely when `schedPollPendingCount() == 0`, and the
+// stolen-wake path #5843 fixed for task timers — a peer's non-blocking drain
+// retrieving the trigger worker 0 needed — can only happen through a real
+// `kevent`/`epoll_wait`. A TCP listener blocked in `accept()`, never
+// connected to, holds exactly that registration for the life of the run.
+//
+// THE VERDICT IS A WALL-CLOCK THRESHOLD, not an exact value: the armer loops
+// `iters` times over `<- time.after(tickNs)`, recording the worst overshoot
+// past the nominal 2ms it ever saw. With the wake in place a channel timer
+// fires within microseconds of its deadline; without it the worst case
+// tracks the mechanism above — both are enormously far from
+// `overshootBudgetNs` (50ms), so the threshold is not a close call either
+// way. Pinned to `BIT_WORKERS=8` by the sibling `workers` file.
+
+import { listen, Listener } from "std/net"
+import { after, monotonic, since, Millisecond } from "std/time"
+
+const iters: int = 1000
+const tickNs: int = 2 * Millisecond
+const overshootBudgetNs: int = 50 * Millisecond
+
+class AcceptArgs { l: Listener }
+
+// Parks on the netpoller for the whole run: nothing ever connects, so this
+// `accept()` never returns. See the file header for why this registration is
+// what makes the bug (and the fix) reachable at all.
+fn holdAccept(a: AcceptArgs) {
+  let _ = a.l.accept() catch _ {
+    return
+  }
+}
+
+fn main() {
+  let l = listen("127.0.0.1", 0) catch _ {
+    print("chantimerwake bind-fail\n")
+    return
+  }
+  spawn holdAccept(AcceptArgs{ l = l })
+
+  let worstNs = i64(0)
+  let i = 0
+  while (i < iters) {
+    let start = monotonic()
+    let c = after(tickNs)
+    let _ = <- c
+    let overshoot = i64(since(start) - tickNs)
+    if (overshoot > worstNs) {
+      worstNs = overshoot
+    }
+    i = i + 1
+  }
+  l.close()
+
+  let ok = worstNs <= i64(overshootBudgetNs)
+  print("chantimerwake ${ok}\n")
+}
