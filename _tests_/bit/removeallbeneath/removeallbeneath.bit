@@ -1,0 +1,256 @@
+// `bit run _tests_/bit/removeallbeneath` (#5816): the parent-swap race a
+// hand-written recursive delete has (the TOCTOU class behind Rust's
+// CVE-2022-21658), and `std/fs/secure`'s `removeAll` closes. Same swap shape
+// as _tests_/bit/walkbeneath/walkbeneath.bit: a `spawn`ed green thread flips
+// `<sub>/a` between a real directory and a symlink `L` to `<scratch>/outside`
+// (marker file KEEP.txt, never written under `<sub>` itself), four plain
+// `rename`s per cycle, while the main thread repeatedly rebuilds `<sub>` and
+// deletes it. TWO PHASES, one swapper each, run sequentially: phase 1 races
+// a naive by-path recursive remove (the shape every hand-written copy in
+// this repo has today -- a positive count here is the control, proving the
+// race interleaves at all), phase 2 races `removeAll` (this ticket's fix --
+// must stay 0).
+//
+// Unlike walkbeneath's non-destructive walk, both phases here actually
+// DELETE `<sub>` on every iteration, so `<sub>` is rebuilt from scratch
+// before each call; `<root>` and `<scratch>/outside` are built once and
+// persist across every iteration of both phases.
+//
+// RUN WITH `BIT_WORKERS=4` (or higher): see openbeneath.bit's header for why
+// the default of 1 never truly interleaves the swapper and the remover.
+import { mkdir, writeFile, remove, readDir, isDir, isSymlink, rename, exists } from "std/fs"
+import { removeAll } from "std/fs/secure"
+import { envOr, exit } from "std/os"
+import { output } from "std/process"
+
+const iterations: int = 20000
+const marker: string = "KEEP.txt"
+
+fn mustMkdir(path: string) {
+  mkdir(path) catch e {
+    panic("removeallbeneath race: mkdir ${path}: ${e.message()}")
+  }
+}
+
+fn mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    panic("removeallbeneath race: write ${path}: ${e.message()}")
+  }
+}
+
+fn mustLink(target: string, link: string) {
+  let r = output("/bin/ln", ["-s", target, link])
+  if (r.exitCode != 0) {
+    panic("removeallbeneath race: /bin/ln -s ${target} ${link} exited ${r.exitCode}")
+  }
+}
+
+// Clear `path`, never shelling out to `rm`, best-effort. Only ever called
+// on `clearing` below, a name the swapper never touches, so -- unlike a
+// direct attempt to clear `sub` itself while the swapper is still live --
+// this one races nothing and a single pass is enough.
+fn clearNoRace(path: string) {
+  naiveRemoveAll(path) catch _ {}
+}
+
+fn mv(x: string, y: string): bool {
+  rename(x, y) catch _ {
+    return false
+  }
+  return true
+}
+
+// The swapper: renames carry no result the removing loop needs, only the
+// `done` signal once `iters` cycles have run.
+fn swapLoop(sub: string, iters: int, done: chan<int>) {
+  let n = 0
+  while (n < iters) {
+    let _ = mv("${sub}/a", "${sub}/R")
+    let _ = mv("${sub}/L", "${sub}/a")
+    let _ = mv("${sub}/a", "${sub}/L")
+    let _ = mv("${sub}/R", "${sub}/a")
+    n = n + 1
+  }
+  done <- 1
+}
+
+// One attempt at building the `sub/a`+`sub/L` fixture. `false` on ANY step's
+// failure -- the swapper is live and races this construction exactly like it
+// races the removal that follows, so a transient failure here (it renamed
+// Build the `a`+`L` fixture under `staging`, a name the swapper never
+// targets -- entirely uncontested, unlike building directly under `sub`
+// (see `setupSub`'s own comment for why that loses to the swapper).
+fn buildStaging(staging: string, outside: string): bool {
+  let builtOk = true
+  mkdir(staging) catch _ {
+    builtOk = false
+  }
+  if (builtOk) {
+    mkdir("${staging}/a") catch _ {
+      builtOk = false
+    }
+  }
+  if (builtOk) {
+    writeFile("${staging}/a/inside.txt", "INSIDE") catch _ {
+      builtOk = false
+    }
+  }
+  if (builtOk) {
+    builtOk = output("/bin/ln", ["-s", outside, "${staging}/L"]).exitCode == 0
+  }
+  return builtOk
+}
+
+// A fresh `sub` fixture under `parent`: `sub/a` (a real directory holding one
+// file) and `sub/L`, a pre-made symlink to `outside` the swapper flips `a`
+// against.
+//
+// Neither building nor clearing ever happens directly under the shared name
+// `sub` while the swapper is live -- `swapLoop` below always renames the
+// same literal `${sub}/a`-shaped paths, captured once, so its four bare
+// `rename` syscalls per cycle are far cheaper than any multi-step
+// mkdir/write/readDir/remove pass and can win every single such attempt for
+// as long as it keeps running. Instead:
+//   1. a previous generation's leftover `sub` is RENAMED to `clearing` in
+//      one uncontested syscall (the swapper targets entries INSIDE `sub`,
+//      never the name `sub` itself), after which its stale `mv` calls fail
+//      harmlessly (ENOENT) until step 3 recreates `sub`;
+//   2. the next generation is built under `staging`, a name the swapper
+//      never touches at all;
+//   3. `staging` is RENAMED to `sub` in one syscall -- the swapper's
+//      renames only start succeeding again the instant this lands, so
+//      construction is as atomic, from its point of view, as the fixture
+//      appearing all at once.
+// `clearing`/`staging` themselves race nothing, so one pass of each always
+// suffices; the bounded retry is only for the sub-microsecond window
+// between this rename and the swapper's next cycle landing first.
+fn setupSub(parent: string, outside: string): string {
+  let sub = "${parent}/sub"
+  let clearing = "${parent}/sub-clearing"
+  let staging = "${parent}/sub-staging"
+  clearNoRace(clearing)
+  rename(sub, clearing) catch _ {}
+  clearNoRace(clearing)
+  clearNoRace(staging)
+  let attempts = 0
+  while (attempts < 50) {
+    if (buildStaging(staging, outside)) {
+      rename(staging, sub) catch _ {
+        clearNoRace(staging)
+        attempts = attempts + 1
+        continue
+      }
+      return sub
+    }
+    clearNoRace(staging)
+    attempts = attempts + 1
+  }
+  panic("removeallbeneath race: could not set up ${sub} after 50 attempts")
+}
+
+// The naive, by-path recursive delete every hand-written copy in this repo
+// uses today (_tests_/bit/pmaddgit.bit:713, pmimports.bit:579,
+// pmvanityhelpers/pmvanityhelpers.bit:234): `isDir`/`isSymlink` then
+// `readDir` then recurse then `remove`, ALL BY PATH -- the exact TOCTOU
+// `removeAll` closes. A directory swapped for a symlink between the check
+// and `readDir` is followed straight through.
+fn naiveRemoveAll(path: string): ()! {
+  if (isDir(path) && !isSymlink(path)) {
+    for name of readDir(path)? {
+      naiveRemoveAll("${path}/${name}")?
+    }
+  }
+  remove(path)?
+}
+
+fn ensureMarker(outside: string) {
+  if (!exists("${outside}/${marker}")) {
+    mustWrite("${outside}/${marker}", "KEEP")
+  }
+}
+
+class PhaseCounts {
+  ok: int,
+  deleted: int,
+  err: int,
+}
+
+// One phase: repeatedly rebuild `sub` under `parent` and delete it, racing
+// the live swapper the whole time. `useSafe` picks `removeAll` over the
+// naive by-path remover -- the two phases share every other line, so one
+// function parameterized on the remover, not two near-identical copies.
+fn runPhase(parent: string, outside: string, useSafe: bool): PhaseCounts {
+  mustMkdir(parent)
+  let done = chan<int>()
+  spawn swapLoop("${parent}/sub", iterations, done)
+  let counts = PhaseCounts{ ok = 0, deleted = 0, err = 0 }
+  let n = 0
+  while (n < iterations) {
+    let sub = setupSub(parent, outside)
+    let failed = false
+    if (useSafe) {
+      removeAll(sub) catch _ {
+        failed = true
+      }
+    } else {
+      naiveRemoveAll(sub) catch _ {
+        failed = true
+      }
+    }
+    if (failed) {
+      counts.err = counts.err + 1
+    } else {
+      counts.ok = counts.ok + 1
+    }
+    // Checked regardless of `failed`: a call that errors partway through can
+    // still have deleted something outside the tree first (unlinking a
+    // child beneath a followed symlink, say, before failing on a LATER
+    // step) -- folding this into the `failed` branch above would hide
+    // exactly that leak behind an error count.
+    if (!exists("${outside}/${marker}")) {
+      counts.deleted = counts.deleted + 1
+      ensureMarker(outside)
+    }
+    n = n + 1
+  }
+  let _ = <- done
+  // The swapper has finished (the `done` receive above blocks on it), so
+  // `parent` is no longer racing anything -- a plain, single-shot recursive
+  // remove clears it. `naiveRemoveAll`, not `removeAll`: no attacker is
+  // present at this point, and this keeps the cleanup independent of the
+  // very primitive the mutation-testing procedure deliberately breaks.
+  naiveRemoveAll(parent) catch _ {}
+  return counts
+}
+
+fn main() {
+  let dir = "${envOr("TMPDIR", "/tmp")}/t5816-race-${timeUnixNs()}"
+  mustMkdir(dir)
+  let outside = "${dir}/outside"
+  mustMkdir(outside)
+  mustWrite("${outside}/${marker}", "KEEP")
+
+  // Phase 1: naive by-path recursive remove (unsafe) -- the pre-existing
+  // bug shape, the control proving the race genuinely interleaves.
+  let unsafeCounts = runPhase("${dir}/p1", outside, false)
+  // Phase 2: `removeAll` (safe) -- this ticket's fix.
+  let safeCounts = runPhase("${dir}/p2", outside, true)
+  // Both swappers have finished by now -- see runPhase's own comment.
+  naiveRemoveAll(dir) catch _ {}
+
+  print("naive(unsafe):     iters=${iterations} ok=${unsafeCounts.ok} DELETED-OUTSIDE=${unsafeCounts.deleted} errored=${unsafeCounts.err}\n")
+  print("removeAll(safe):   iters=${iterations} ok=${safeCounts.ok} DELETED-OUTSIDE=${safeCounts.deleted} errored=${safeCounts.err}\n")
+
+  if (safeCounts.deleted != 0) {
+    print("FAIL: removeAll deleted the outside marker ${safeCounts.deleted} time(s) of ${iterations} iterations\n")
+    exit(1)
+  }
+  // Non-vacuity: 0 deletions through removeAll only means something if the
+  // swapper really raced the removals -- see walkbeneath.bit's header for
+  // why an error counts as interleaving too.
+  if (unsafeCounts.deleted == 0 && unsafeCounts.err == 0) {
+    print("FAIL: race never interleaved through the naive remove (no delete, no error); run with BIT_WORKERS=4\n")
+    exit(1)
+  }
+  print("ok   removeallbeneath-race\n")
+}

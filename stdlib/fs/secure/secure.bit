@@ -14,8 +14,8 @@
 // bootstrap the way #2153 did before its revert. Nothing on the compiler's
 // import path reaches this module, so a release that ships this commit can
 // fold these functions into "std/fs" once the pin moves past it.
-import { File } from "std/fs"
-import { join, contains } from "std/path"
+import { File, exists } from "std/fs"
+import { base, clean, contains, dir, join } from "std/path"
 import { sortInPlace } from "std/sort"
 
 // `bit_rt_fs_open_beneath_w` (runtime/root/{darwin,linux}/fsbeneath.bit):
@@ -152,6 +152,16 @@ extern fn bit_rt_fs_open_dir_w(words: *byte, n: int): i64
 extern fn bit_rt_fs_open_dir_beneath_fd_w(dirFd: i64, nameWords: *byte, nameN: int): i64
 extern fn bit_rt_fs_list_dir_fd_w(fd: i64, outPtr: *byte, outCap: int): i64
 
+// `bit_rt_fs_unlink_at_w` (runtime/root/{darwin,linux}/fsbeneath.bit, #5816):
+// `removeAll` below's one removal primitive. Removes the single entry named
+// `name`/`n` relative to the already-open directory `dirFd`, via `unlinkat` —
+// never by re-resolving a path, the same fd-relative discipline
+// `walkBeneath` above uses to read a tree. `isDir` selects `AT_REMOVEDIR`;
+// the caller decides which by whether opening `name` as a directory
+// (`bit_rt_fs_open_dir_beneath_fd_w`) just succeeded no-follow. 0 on
+// success, -1 for a malformed name or any other failure.
+extern fn bit_rt_fs_unlink_at_w(dirFd: i64, name: *byte, n: int, isDir: bool): i64
+
 // Bound on `walkBeneath`'s recursion (Power of 10 rule 2), mirroring
 // `std/fs`'s own private `maxWalkDepth` (stdlib/fs/fs.bit) — same value,
 // same rationale (a bound on nesting depth, not a symlink-loop defence:
@@ -266,4 +276,102 @@ fn walkBeneathInto(dirFd: i64, prefix: string, depth: int): []string! {
     }
   }
   return out
+}
+
+// The race-free twin of a hand-written recursive delete (#5816): every copy
+// this ticket replaces (`_tests_/bit/pmaddgit.bit`, `pmimports.bit`,
+// `pmvanityhelpers/pmvanityhelpers.bit`) does `lstat` then `readDir` then
+// recurse then `remove` BY PATH — the exact shape of Rust's CVE-2022-21658:
+// a directory swapped for a symlink between the check and the use is
+// followed, and the "recursive delete" walks and deletes OUTSIDE the tree.
+// `removeAll` never re-resolves a path once it holds an fd, the same
+// invariant `walkBeneath` above gives reading: it lists the CURRENTLY-open
+// directory by fd and removes a listed child relative to that same fd — a
+// swap of any ancestor after this call holds its fd can no longer change
+// what gets deleted.
+
+// Remove the single entry named `name`, wherever `parentFd` says it is,
+// recursing first if it turns out to be a real directory. Never re-resolves
+// `name` by path: `bit_rt_fs_open_dir_beneath_fd_w` (no-follow) is the ONE
+// classification this makes, and whichever branch it takes, the matching
+// removal (`bit_rt_fs_unlink_at_w`) runs against the SAME `parentFd` — a
+// swap of `name` itself, mid-call, cannot retarget either step, because
+// neither one ever looks `name` up by path again.
+//
+// Each packed-bytes call gets its OWN fresh `[]byte(name)` immediately
+// before the call it feeds, followed immediately by `keepAlive` — never one
+// copy held across the recursive `removeChildren` call in between, which can
+// allocate and would leave an earlier `ptrOf` with nothing provably keeping
+// it live.
+fn removeEntry(parentFd: i64, name: string, depth: int): ()! {
+  if (depth <= 0) {
+    fail newError("removeAll: directory nesting exceeds ${maxWalkDepth} at ${name}")
+  }
+  let openW = []byte(name)
+  let childFd = bit_rt_fs_open_dir_beneath_fd_w(parentFd, ptrOf(openW), len(name))
+  keepAlive(openW)
+  if (childFd < 0) {
+    let leafW = []byte(name)
+    let rc = bit_rt_fs_unlink_at_w(parentFd, ptrOf(leafW), len(name), false)
+    keepAlive(leafW)
+    if (rc < 0) {
+      fail newError("removeAll: cannot remove: ${name}")
+    }
+    return
+  }
+  removeChildren(childFd, depth - 1)?
+  let dirW = []byte(name)
+  let rc = bit_rt_fs_unlink_at_w(parentFd, ptrOf(dirW), len(name), true)
+  keepAlive(dirW)
+  if (rc < 0) {
+    fail newError("removeAll: cannot remove directory: ${name}")
+  }
+}
+
+// Remove every entry inside the already-open directory `dirFd`, then close
+// it (`defer`). Does not remove `dirFd` itself: `removeEntry` above does
+// that, one level up, once this returns.
+fn removeChildren(dirFd: i64, depth: int): ()! {
+  defer closeDirFd(dirFd)
+  let names = listDirFd(dirFd)?
+  for name of names {
+    removeEntry(dirFd, name, depth)?
+  }
+}
+
+// Remove `path` and everything beneath it, race-free: a directory or file
+// swapped in beneath `path` WHILE this runs cannot make it delete anything
+// outside the tree `path` named when this call started (#5816, epic #5787).
+//
+// `path` itself is opened no-follow, exactly like every entry beneath it:
+// this function opens `path`'s PARENT normally (following its own symlinks,
+// the same trusted-boundary treatment `walkBeneath`'s `root` gets above),
+// then treats `path`'s own final component as just another entry under that
+// parent fd, through the SAME `removeEntry` a nested child goes through. A
+// symlink named by `path` is therefore unlinked itself, never followed into
+// whatever it points at — matching Go's `os.RemoveAll`, and refusing the
+// #5787 finding class this module exists to close.
+//
+// Depth beneath `path` is bounded by `maxWalkDepth`, the same bound
+// `walkBeneath` gives. A missing `path` is success, matching `os.RemoveAll`
+// — checked once, lexically, on this top-level argument only; the recursive
+// descent below never re-checks existence by path.
+export fn removeAll(path: string): ()! {
+  if (!exists(path)) {
+    return
+  }
+  let cleaned = clean(path)
+  let parent = dir(cleaned)
+  let name = base(cleaned)
+  if (len(name) == 0) {
+    fail newError("removeAll: refuses to remove: ${path}")
+  }
+  let parentW = []byte(parent)
+  let parentFd = bit_rt_fs_open_dir_w(ptrOf(parentW), len(parent))
+  keepAlive(parentW)
+  if (parentFd < 0) {
+    fail newError("removeAll: cannot open parent directory: ${parent}")
+  }
+  defer closeDirFd(parentFd)
+  removeEntry(parentFd, name, maxWalkDepth)?
 }
