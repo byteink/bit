@@ -304,6 +304,111 @@ explainMismatch() {
       # per-opcode-delta derivations are in git history at the state of this
       # file before #5509.
 
+      # --- #5871: sub-word tuple explosion (word-sized `ret`/`call_word`
+      # instead of `gc_alloc`+`field_set`/`field_get`) ---
+      #
+      # `tupleWordTypes` (compiler/lowerexplode.bit) explodes a tuple whose
+      # members all sit at byte offset 8k under the class layout rule into
+      # separate WORDS -- a multi-word `ret`/`call` result read back with
+      # `call_word`, instead of boxing the tuple on the heap and reading its
+      # fields with `field_get`. Reddened the `--dump-ir-pre`/`--dump-ir` of 10 files
+      # against the pinned (pre-#5871) stage0: every one of them only ever
+      # gains `call_word` and loses `gc_alloc`+`field_get` traffic; nothing
+      # else moves. Derived from real dumps of all 10 (this tree at cd7e781c2,
+      # oracle stage0.sh, both `ir`/`iropt`):
+      #
+      #   file                                    call_word field_get gc_alloc  (pre-opt delta)
+      #   recover_boundary.bit                         +1        0        +1
+      #   run_tuple_eq.bit                            +16       +3        +8
+      #   run_tuple_literal_expr.bit                   +3       +10        +6
+      #   run_tuple_multi_return.bit                   +4        +3        +2
+      #   run_tuple_subword.bit                       +29       +58       +72
+      #   examples/tuples/tuples.bit                   +4        +6        +2
+      #   stdlib/csv/csv.bit                           +1       +10        +1
+      #   stdlib/metrics/labelkey.bit                  +1        +8        +1
+      #   stdlib/runtime/runtime.bit                    0        +4         0
+      #   stdlib/smtp/header.bit                       +3       +18        +2
+      #
+      # Pre-opt still builds the box explicitly (word-explode a call/ret, then
+      # re-box it for anything reading a field off it (opt.bit has not run
+      # yet), so all three counts only ever go UP: a fresh `call_word` read,
+      # plus the round-trip own `gc_alloc` and its `field_get`s. Post-opt
+      # forwards the box away instead (the freshly-built box is dead on
+      # arrival once nothing but field reads observes it), so `field_get` and
+      # `gc_alloc` only ever go DOWN; `call_word` still only goes up (same 9
+      # of 10 files, `call_word` deltas identical to the pre-opt table above
+      # except recover_boundary/csv/labelkey/header, still all >=0) or is
+      # untouched. The `run_tuple_subword.bit` post-opt delta additionally
+      # includes a branch-fold cascade (below) and is NOT explained here.
+      okTupleExplode = 1
+      for (op in moved) {
+        if (op != "call_word" && op != "field_get" && op != "gc_alloc") okTupleExplode = 0
+      }
+      if (kind == "ir") {
+        if (delta["call_word"] < 0 || delta["field_get"] < 0 || delta["gc_alloc"] < 0) okTupleExplode = 0
+        if (delta["call_word"] + delta["field_get"] + delta["gc_alloc"] <= 0) okTupleExplode = 0
+      } else {
+        if (delta["call_word"] < 0 || delta["field_get"] > 0 || delta["gc_alloc"] > 0) okTupleExplode = 0
+        if (delta["call_word"] - delta["field_get"] - delta["gc_alloc"] <= 0) okTupleExplode = 0
+      }
+      if (okTupleExplode) {
+        print "5871-tuple-word-explode"
+        exit 0
+      }
+
+      # --- #5871, POST-OPT ONLY: branch fold enabled by the box going away
+      # ---
+      #
+      # `run_tuple_subword.bit` `main()` calls its `bi*`/`ib*`/`bs*` helpers
+      # with LITERAL `true`/`false` arguments. Once the tuple bool member is
+      # a plain SSA value instead of a `field_get` off a freshly-built box,
+      # inlining plus constant folding sees straight through it and turns
+      # `br %cond, bbT(), bbF()` into an unconditional `jump`, deleting
+      # whichever arm the literal proves dead -- the #3862/#3107-style
+      # "small pre-opt change, large post-opt echo" shape (a real fold
+      # cascade, not a miscompile): the pre-opt delta for this exact file is
+      # the clean 3-opcode table above (call_word +29, field_get +58, gc_alloc
+      # +72, nothing else), so the cascade is entirely opt.bit own doing,
+      # confirming it is downstream of the fold and not a second, independent
+      # change.
+      #
+      # Measured (this tree at cd7e781c2 vs the pinned stage0, `--dump-ir`):
+      #   add -4  br -14  call -2  call_word -4  const_int -8  const_nil -2
+      #   const_string +2  field_get -42  gc_alloc -10  icmp_eq -4  icmp_ne -2
+      #   mul -8  rt_call:string_concat +2  sub -4
+      # (`call_word` goes negative here only because the oracle already emits
+      # `call_word` for `string` own pre-existing two-word ABI, unrelated to
+      # #5871 -- string-returning arms folding away removes some of THOSE too.)
+      #
+      # Anchored on two things a same-shape but unrelated bug cannot satisfy
+      # by accident: (1) `gc_alloc`/`field_get` strictly fall and `br` strictly
+      # falls -- a real fold, not zero movement; (2) `add`/`sub` move by the
+      # IDENTICAL amount. Every dead arm here is one half of a `p.1 + k` /
+      # `p.1 - k` pair (`biDirect`/`ibDirect`/`biLoop`/`ibLoop` two literal
+      # calls each discard the opposite arm of the pair once), so `add` and
+      # `sub` move in lockstep by construction. #3125 canonical mutation
+      # (`Op.Sub` -> `Op.Add` in `compiler/lower.bit` binOpFor) breaks that
+      # lockstep on any single flipped site and is rejected (mutation-tested
+      # below and in the self-check). The remaining opcodes
+      # (call/call_word/const_int/const_nil/const_string/icmp_eq/icmp_ne/mul/
+      # rt_call:string_concat) are left at unconstrained magnitude, the same
+      # allowance the #3107/#3862 post-opt arms make for DCE-shaped
+      # opcodes retired by #5509 -- a dead arm can contain anything the
+      # source wrote, and its exact size is not this signature business;
+      # the closed opcode SET plus the two anchors above is.
+      okFold = (kind != "ir")
+      split("call_word field_get gc_alloc br add sub mul icmp_eq icmp_ne const_int const_nil const_string call rt_call:string_concat", foldlist, " ")
+      for (i in foldlist) foldok[foldlist[i]] = 1
+      for (op in moved) { if (!(op in foldok)) okFold = 0 }
+      if (delta["gc_alloc"] >= 0) okFold = 0
+      if (delta["field_get"] >= 0) okFold = 0
+      if (delta["br"] >= 0) okFold = 0
+      if (delta["add"] != delta["sub"]) okFold = 0
+      if (okFold) {
+        print "5871-tuple-word-explode-branch-fold"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -325,21 +430,29 @@ explainMismatch() {
 # kind argument omitted there, since that check is "does this name exist at
 # all", not "under which kind").
 #
-# `ir`/`iropt` currently declare ZERO signatures: 5486-variant-payload-reorder,
-# 5429-decimal-boxed-slot-explode, 5506-enum-nil-payload-retype,
-# 5445-method-return-explode-direct-call, 5521-void-return-bare-ret and
-# 5486-variant-payload-redundant-read-elim were retired by the stage0 0.20.0
-# repin (#5607) — the pinned oracle now carries every fix each one used to
-# explain, so each explained zero corpus files. `ast` and `fmt` are a
-# different, disjoint kind space entirely -- #5474's two signatures never
-# fire under `ir`/`iropt` and vice versa, so they are returned only for their
-# own exact kind.
+# 5486-variant-payload-reorder, 5429-decimal-boxed-slot-explode,
+# 5506-enum-nil-payload-retype, 5445-method-return-explode-direct-call,
+# 5521-void-return-bare-ret and 5486-variant-payload-redundant-read-elim were
+# retired by the stage0 0.20.0 repin (#5607) — the pinned oracle now carries
+# every fix each one used to explain, so each explained zero corpus files.
+# `ir`/`iropt` now declare #5871's two: `5871-tuple-word-explode` fires under
+# both kinds (explainMismatch's `kind` branch only changes which SIGN the
+# core opcodes must move in, not whether the check runs at all);
+# `5871-tuple-word-explode-branch-fold` is gated `kind != "ir"` inside
+# explainMismatch, so it can only ever fire under `iropt` and is listed only
+# there. `ast` and `fmt` are a different, disjoint kind space entirely --
+# #5474's two signatures never fire under `ir`/`iropt` and vice versa, so
+# they are returned only for their own exact kind.
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
+    ir) printf '%s\n' "5871-tuple-word-explode"; return ;;
+    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt"
+  [ -n "$kind" ] || printf '%s\n' \
+    "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
+    "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold"
 }
 

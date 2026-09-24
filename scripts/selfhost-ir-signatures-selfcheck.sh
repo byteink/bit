@@ -42,6 +42,160 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
+  # --- #5871: sub-word tuple explosion, both `ir`/`iropt` kinds ---
+  #
+  # Real dump text from `_tests_/cases/recover_boundary.bit` (this tree at
+  # cd7e781c2 vs the pinned stage0): `call @m1$runRecovering` used to return
+  # a boxed `(bool, string)`, now returns `bool` plus a `call_word`-read
+  # second word.
+  oracle_tuple_pre='%5 = call @m1$runRecovering(%4) (bool, string)
+%6 = field_get %5[0] bool
+%7 = field_get %5[8] string'
+  bit2_tuple_pre='%5 = call @m1$runRecovering(%4) bool
+%6 = call_word %5[1] string
+%7 = gc_alloc size=16 ptrs=[%8] (bool, string)
+field_set %7[0] = %5
+field_set %7[8] = %6
+%10 = field_get %7[0] bool
+%11 = field_get %7[8] string'
+
+  sigt1=$(explainMismatch "$oracle_tuple_pre" "$bit2_tuple_pre" ir)
+  rct1=$?
+  if [ "$rct1" -ne 0 ] || [ "$sigt1" != "5871-tuple-word-explode" ]; then
+    echo "FAIL: the real #5871 pre-opt tuple-explode delta was not explained (rc=$rct1 sig='$sigt1')"
+    fail=1
+  fi
+
+  # Same call site, post-opt: opt.bit forwards the freshly-built box away
+  # (dead on arrival), so `field_get`/`gc_alloc` only ever fall now.
+  oracle_tuple_opt="$oracle_tuple_pre"
+  bit2_tuple_opt='%5 = call @m1$runRecovering(%4) bool
+%6 = call_word %5[1] string'
+
+  sigt2=$(explainMismatch "$oracle_tuple_opt" "$bit2_tuple_opt" iropt)
+  rct2=$?
+  if [ "$rct2" -ne 0 ] || [ "$sigt2" != "5871-tuple-word-explode" ]; then
+    echo "FAIL: the real #5871 post-opt tuple-explode delta was not explained (rc=$rct2 sig='$sigt2')"
+    fail=1
+  fi
+
+  # REJECTION: an unrelated opcode riding along an otherwise-genuine #5871
+  # pre-opt delta must still fail -- the identity is the WHOLE delta, not a
+  # per-opcode allowlist.
+  bit2_tuple_pre_plus="$bit2_tuple_pre
+%99 = xor i64 %5, %6"
+  sigt3=$(explainMismatch "$oracle_tuple_pre" "$bit2_tuple_pre_plus" ir)
+  rct3=$?
+  if [ "$rct3" -eq 0 ] || [ -n "$sigt3" ]; then
+    echo "FAIL: a #5871 pre-opt delta carrying an unrelated opcode was wrongly explained (rc=$rct3 sig='$sigt3')"
+    fail=1
+  fi
+
+  # --- #5871, POST-OPT ONLY: branch fold enabled by the box going away ---
+  #
+  # Real dump text from `_tests_/cases/run_tuple_subword.bit`'s `main()`
+  # (this tree at cd7e781c2 vs the pinned stage0): `biDirect(true, 10)` and
+  # `biDirect(false, 10)` each fold their `br` on the now-literal bool member
+  # away, discarding the opposite arm of the `p.1 + 1` / `p.1 - 1` pair.
+  oracle_fold='%81 = const_string "biDirect="
+%82 = const_bool true
+%83 = const_int i64 10
+%84 = gc_alloc size=16 ptrs=[] (bool, i64)
+field_set %84[0] = %82
+field_set %84[8] = %83
+br %82, bb1(), bb2(%82, %83, %84)
+bb1():
+%88 = field_get %84[8] i64
+%89 = const_int i64 1
+%90 = add i64 %88, %89
+jump bb3(%90)
+bb2(%92: bool, %93: i64, %94: (bool, i64)):
+%95 = field_get %94[8] i64
+%96 = const_int i64 1
+%97 = sub i64 %95, %96
+jump bb3(%97)
+bb3(%99: i64):
+%100 = rt_call string_from_int(%99) string
+%101 = const_string ","
+%102 = const_bool false
+%103 = gc_alloc size=16 ptrs=[] (bool, i64)
+field_set %103[0] = %102
+field_set %103[8] = %83
+br %102, bb4(), bb5(%102, %83, %103)
+bb4():
+%107 = field_get %103[8] i64
+%108 = const_int i64 1
+%109 = add i64 %107, %108
+jump bb6(%109)
+bb5(%111: bool, %112: i64, %113: (bool, i64)):
+%114 = field_get %113[8] i64
+%115 = const_int i64 1
+%116 = sub i64 %114, %115
+jump bb6(%116)
+bb6(%118: i64):
+%119 = rt_call string_from_int(%118) string'
+  bit2_fold='%81 = const_string "biDirect="
+%82 = const_bool true
+%83 = const_int i64 10
+jump bb1()
+bb1():
+%85 = const_int i64 11
+jump bb2(%85)
+bb2(%87: i64):
+%88 = rt_call string_from_int(%87) string
+%89 = const_string ","
+%90 = const_bool false
+jump bb3(%90, %83, %90, %83)
+bb3(%92: bool, %93: i64, %94: bool, %95: i64):
+%96 = const_int i64 9
+jump bb4(%96)
+bb4(%98: i64):
+%99 = rt_call string_from_int(%98) string'
+
+  sigt4=$(explainMismatch "$oracle_fold" "$bit2_fold" iropt)
+  rct4=$?
+  if [ "$rct4" -ne 0 ] || [ "$sigt4" != "5871-tuple-word-explode-branch-fold" ]; then
+    echo "FAIL: the real #5871 branch-fold delta was not explained (rc=$rct4 sig='$sigt4')"
+    fail=1
+  fi
+
+  # REJECTION: the identical two texts scored under `ir` (the wrong kind) --
+  # the branch-fold arm is gated `kind != "ir"` and the plain tuple-explode
+  # arm above requires field_get/gc_alloc to RISE at pre-opt, not fall.
+  sigt5=$(explainMismatch "$oracle_fold" "$bit2_fold" ir)
+  rct5=$?
+  if [ "$rct5" -eq 0 ] || [ -n "$sigt5" ]; then
+    echo "FAIL: a #5871 branch-fold delta was wrongly explained under kind=ir (rc=$rct5 sig='$sigt5')"
+    fail=1
+  fi
+
+  # REJECTION: #3125's canonical mutation shape (`Op.Sub` -> `Op.Add` in
+  # `compiler/lower.bit` binOpFor) applied to ONE site of this exact real
+  # delta -- an extra `sub` disappearing from the oracle side that bit2's
+  # `add` count does not match breaks the add==sub lockstep this signature
+  # anchors on, even though every opcode is still inside the closed set and
+  # gc_alloc/field_get/br still all fall.
+  oracle_fold_asym="$oracle_fold
+%999 = sub i64 %1, %2"
+  sigt6=$(explainMismatch "$oracle_fold_asym" "$bit2_fold" iropt)
+  rct6=$?
+  if [ "$rct6" -eq 0 ] || [ -n "$sigt6" ]; then
+    echo "FAIL: a #5871 branch-fold delta with an asymmetric add/sub mutation was wrongly explained (rc=$rct6 sig='$sigt6')"
+    fail=1
+  fi
+
+  # REJECTION: an unrelated opcode riding along an otherwise-genuine
+  # branch-fold delta must still fail -- same closed-set requirement as the
+  # plain tuple-explode arm above.
+  bit2_fold_plus="$bit2_fold
+%999 = xor i64 %1, %2"
+  sigt7=$(explainMismatch "$oracle_fold" "$bit2_fold_plus" iropt)
+  rct7=$?
+  if [ "$rct7" -eq 0 ] || [ -n "$sigt7" ]; then
+    echo "FAIL: a #5871 branch-fold delta carrying an unrelated opcode was wrongly explained (rc=$rct7 sig='$sigt7')"
+    fail=1
+  fi
+
   # --- #5474: catch composite-default disambiguation, ast + fmt kinds (#5510) ---
   #
   # Real dump/format text (#5510), from `_tests_/cases/catch_composite_default_single_field.bit`:
