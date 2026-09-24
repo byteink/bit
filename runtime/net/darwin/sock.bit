@@ -24,7 +24,16 @@ import { netDnsId, netBuildQuery, netParseAnswer, netMaxDnsMsg } from "../../net
 import { netDnsTimeoutMs, netDnsRetries } from "../../net"
 import { taskAt, schedCurrentTask, taskWorker, wkSched, scPollFd } from "../../sched"
 import { schedParkArm, schedParkDisarm, schedPark, pollRead, pollWrite } from "../../sched"
-import { pollRegister } from "../../sched/darwin"
+import { schedPollUnpark, schedPollPendingInc, schedPollPendingDec } from "../../sched"
+import { pollDescRegister, pollDescUnregister } from "../../sched/darwin"
+// pollDesc (#5864/#5865): the register-once model's per-fd table --
+// `netPollDescOpen` below (accept/connect/listen) and `netClose` are this
+// file's two lifecycle ends, `netAwaitReady` and `../tcp.bit`'s deadline race
+// are the two waiters.
+import {
+  pdOpen, pdWait, pdClose, pdGen, pdDirRead, pdDirWrite,
+  pdClaimed, pdAlreadyReady, pdEmpty,
+} from "../../sched"
 // `schedCurrentWorker`, `wkId` and `schedMaxWorkers` are already imported by
 // ../netabi.bit (same module — an import is per-module, not per-file).
 // Byte/wire-format marshalling and the sockaddr fields that read the same on
@@ -37,7 +46,7 @@ import {
   saAddrOff, saBytes, saBytes2, optBytes,
   lenBytes, ipBytes, tvBytes, dnsBytes, putU8, getU8, putU16Be,
   putU32Le, getU32Le, getU64Le, putU64Le,
-  netSockAddrIpv4, netSockAddrPort,
+  netSockAddrIpv4, netSockAddrPort, sockScratchSlot,
 } from "../../net"
 
 // int socket(int, int, int); int bind(int, const sockaddr *, socklen_t);
@@ -303,6 +312,7 @@ export @symbol("bit_rt_port_net_sys_socket") @nosplit fn netSysSocket(dgram: boo
     netClose(fd)
     return 0 - 1
   }
+  netPollDescOpen(fd)
   return fd
 }
 
@@ -342,7 +352,75 @@ export @symbol("bit_rt_port_net_set_non_block") @nosplit fn netSetNonBlock(fd: i
   return netIsNonBlock(fd)
 }
 
+// Register `fd` with the kernel poller ONCE, for its whole life (#5865) —
+// called right after the runtime makes a socket non-blocking (accept,
+// connect, listen; `netAcceptTcp`/`netSysSocket` are the two call sites). A
+// no-op when there is no current task or no poller bound: an unscheduled
+// caller's retry loops never park (`netAwaitReady`'s own `false` path), so
+// nothing needs a kernel registration to wake them.
+@nosplit fn netPollDescOpen(fd: int) {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  let pollFd = *(s + scPollFd)
+  if (pollFd == 0) {
+    return
+  }
+  let gen = pdOpen(fd)
+  let _ = pollDescRegister(pollFd, fd, gen)
+}
+
+// Retract `fd`'s kernel registration and wake anything still parked on it
+// BEFORE `close(fd)` (#5865) — a closed-and-reused fd number must never
+// deliver a stale knote or a stale wake into a new connection's slots.
+// `netShutdownSock`'s own header is the reason `netClose` is where this has
+// to happen rather than in `pdClose`'s caller further up: this IS the one
+// place the fd number is actually released back to the kernel.
+// Per-worker scratch for `pdClose`'s two out-parameters (#5865) — same shape
+// as `../sock.bit`'s `saBuf`/`sockScratchSlot()`: this is `@nosplit` code, so
+// a heap-allocated `[]i64(2)` is not available, and a shared buffer would let
+// two workers closing different fds concurrently stomp each other's result.
+let netCloseOutBuf: [66]i64
+
+@nosplit fn netCloseOutR(): *i64 {
+  return ptrOf(netCloseOutBuf) + sockScratchSlot() * 2
+}
+
+@nosplit fn netCloseOutW(): *i64 {
+  return netCloseOutR() + 1
+}
+
 export @symbol("bit_rt_port_net_close") @nosplit fn netClose(fd: int) {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr != 0) {
+    let t = taskAt(taskAddr)
+    let wAddr = *(t + taskWorker)
+    if (wAddr != 0) {
+      let s = taskAt(*(taskAt(wAddr) + wkSched))
+      let pollFd = *(s + scPollFd)
+      if (pollFd != 0) {
+        let _ = pollDescUnregister(pollFd, fd)
+        let outR = netCloseOutR()
+        let outW = netCloseOutW()
+        let _ = pdClose(fd, outR, outW)
+        if (*outR != pdEmpty) {
+          schedPollPendingDec()
+          let _ = schedPollUnpark(s, *outR)
+        }
+        if (*outW != pdEmpty) {
+          schedPollPendingDec()
+          let _ = schedPollUnpark(s, *outW)
+        }
+      }
+    }
+  }
   let _ = int(bit_rt_fs_close(i64(fd)))
 }
 
@@ -420,16 +498,29 @@ export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(fd: int, interest
   if (pollFd == 0) {
     return false
   }
+  let dir = pdDirWrite
+  if (interest == pollRead) {
+    dir = pdDirRead
+  }
+  let gen = pdGen(fd)
   if (!schedParkArm()) {
     return false
   }
-  if (!pollRegister(pollFd, fd, interest, taskAddr)) {
-    // Nothing will ever wake this task, so it must not park. `schedParkDisarm`
-    // also consumes a wake that a drain handed over while we were registering —
-    // its answer is ignored here because either way the caller keeps running.
+  let r = pdWait(fd, dir, gen, taskAddr)
+  if (r == pdAlreadyReady) {
+    // An edge was already recorded (register-once/EV_CLEAR, #5865) — no
+    // kernel call needed, no park needed, the caller retries the syscall now.
+    let _ = schedParkDisarm()
+    return true
+  }
+  if (r != pdClaimed) {
+    // `pdStaleGen` (the fd was closed and reused since it was opened) or
+    // `pdBusy` (another waiter already holds this direction's slot) — either
+    // way nothing will wake this task, so it must not park.
     let _ = schedParkDisarm()
     return false
   }
+  schedPollPendingInc()
   schedPark()
   return true
 }
