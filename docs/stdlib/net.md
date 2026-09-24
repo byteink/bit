@@ -161,6 +161,34 @@ clean close, exactly like `read` - an orderly end of stream, never an error.
 A timeout is a `fail` whose message names it, so the two are never
 confusable: a value back (even `""`) was never on the timeout path.
 
+### `Conn.readDeadlineInto(buf: []byte, max: int): int!`
+
+`readDeadline` allocates a fresh buffer on every call. A server that reads
+thousands of requests over one connection pays for that allocation on every
+one of them. `readDeadlineInto` reads into a buffer the caller owns and keeps.
+It returns how many bytes landed at `buf[0:n]`, with `0` for a clean close,
+and fails exactly as `readDeadline` does on a timeout or a read error.
+
+It reads at most `max` bytes, and never more than `len(buf)` whatever `max`
+says. Take the bytes out before the next call, because that call overwrites
+them:
+
+```bit
+import { Conn } from "std/net"
+
+// One buffer for the whole connection, not one per read.
+fn echoLines(c: Conn): ()! {
+  let buf = []byte(4096)
+  while (true) {
+    let n = c.readDeadlineInto(buf, len(buf))?
+    if (n == 0) {
+      return
+    }
+    c.writeDeadline(string(buf[0:n]))?
+  }
+}
+```
+
 ### `Conn.writeDeadline(s: string): ()!`
 
 Like `write`, but bounded by the connection's deadline.
