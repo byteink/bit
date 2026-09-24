@@ -292,10 +292,11 @@ fn checkRegallocCoalesce() {
   let r6 = allocate(mkRegs(2, 0), ivs, []int(0), []int(0))
   assert(r5.locations[0].index == r6.locations[0].index && r5.locations[1].index == r6.locations[1].index)
   checkRegallocSpillCost()
+  checkRegallocLoopWeight()
   checkRegallocRemat()
 }
 
-// Three intervals over the SAME range, `uses` set per vreg. The shape the
+// Three intervals over the SAME range, `cost` set per vreg. The shape the
 // allocator meets constantly and could not see: `forceParamInterference`
 // (codegenlive.bit) gives every parameter of one block an identical range, so
 // under an end-point rule the whole group is indistinguishable and the victim
@@ -304,14 +305,14 @@ fn sameRangeTrio(u0: int, u1: int, u2: int): []LiveInterval {
   let a = mkIv(0, RegClass.Int, 0, 100, false)
   let b = mkIv(1, RegClass.Int, 0, 100, false)
   let c = mkIv(2, RegClass.Int, 0, 100, false)
-  a.uses = u0
-  b.uses = u1
-  c.uses = u2
+  a.cost = u0
+  b.cost = u1
+  c.cost = u2
   return [a, b, c]
 }
 
-// #4503: which interval eviction sends to the stack, and the pin that `uses`
-// left at zero changes nothing.
+// #4503/#5824: which interval eviction sends to the stack, and the pin that
+// `cost` left at zero changes nothing.
 fn checkRegallocSpillCost() {
   // Two registers, three equal-range intervals, only v1 read once. v1 must be
   // the one to spill — 1 reload rather than 10. The end-point rule cannot make
@@ -325,25 +326,104 @@ fn checkRegallocSpillCost() {
   // THE INERTNESS PIN. The same three intervals with no use counts at all must
   // allocate exactly as Poletto & Sarkar's furthest-end rule did: every cost
   // collapses to 1, nothing outranks anything, and the interval being processed
-  // spills. A caller that does not populate `uses` is unaffected by #4503, and
+  // spills. A caller that does not populate `cost` is unaffected by it, and
   // every arm above this one is a further instance of that pin.
   let rz = allocate(mkRegs(2, 0), sameRangeTrio(0, 0, 0), []int(0), []int(0))
   assert(rz.locations[2].isSpill, "with no use counts the scanned interval spills, as before")
   assert(!rz.locations[0].isSpill && !rz.locations[1].isSpill)
 
-  // THE RULE STOPS AT THE TIE, and this pins that it does. v0 outlives v1 and is
-  // read forty times against v1's one, so a cost-per-register-time ranking would
-  // evict v1 — and measured on the bench suite that ranking cost json 1.30% and
-  // matrix 0.86% of their cycles, because `uses` carries no execution frequency
-  // and the value it gave up was carried by an inner loop. Different ends, so
-  // the furthest-end rule has real information and keeps it: v0 spills.
+  // #5824: past the tie, cost PER UNIT OF REGISTER TIME decides, both ways.
+  // v0 costs 40 over 101 positions, v1 1 over 51: v1 is the cheaper spill even
+  // though the furthest-end rule would evict v0.
+  let r2 = allocate(mkRegs(1, 0), longShort(40, 50, 1), []int(0), []int(0))
+  assert(r2.locations[1].isSpill, "the lower cost per register time spills")
+  assert(!r2.locations[0].isSpill, "the dearer interval keeps its register")
+  // v0 costs 20 over 101 positions, v1 3 over 11: v0 is cheaper per position
+  // although it costs more in total, because evicting it frees nine times the
+  // register time.
+  let r3 = allocate(mkRegs(1, 0), longShort(20, 10, 3), []int(0), []int(0))
+  assert(r3.locations[0].isSpill, "register time freed divides the cost")
+  assert(!r3.locations[1].isSpill)
+}
+
+// v0 over [0, 100] and v1 over [0, shortEnd], one register between them.
+fn longShort(longCost: int, shortEnd: int, shortCost: int): []LiveInterval {
   let long = mkIv(0, RegClass.Int, 0, 100, false)
-  let short = mkIv(1, RegClass.Int, 0, 50, false)
-  long.uses = 40
-  short.uses = 1
-  let r2 = allocate(mkRegs(1, 0), [long, short], []int(0), []int(0))
-  assert(r2.locations[0].isSpill, "with different ends the furthest end still decides")
-  assert(!r2.locations[1].isSpill, "the shorter interval keeps its register")
+  let short = mkIv(1, RegClass.Int, 0, shortEnd, false)
+  long.cost = longCost
+  short.cost = shortCost
+  return [long, short]
+}
+
+// #5824: the loop-depth weight, end to end through `buildIntervals`. C (%0) is
+// read five times, all outside the loop; i (%4) is the loop's induction value,
+// read three times inside it and once after. When the entry edge binds i, all
+// three registers are held and one value must go:
+//
+//   - furthest end spills i, whose range reaches past C's (#5824's shape);
+//   - static counts spill i too: 6 accesses over 7 positions against C's 6
+//     over 6, which is #4503's measured regression in miniature;
+//   - weighted by loop depth i costs 34 and C 6, so C goes.
+//
+//   b0: %0 = 5; %1 = %0 + %0; %2 = %1 + %0; jump b1(%2)
+//   b1: %4 = param; %5 = %4 + %4; %6 = %4 < %5; br %6, b1(%5), b2()
+//   b2: %8 = %0 + %0; %9 = %8 + %4; ret %9
+fn checkRegallocLoopWeight() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let c = mkInstr(Op.ConstInt, i64t)
+  c.ival = 5
+  let f = IrFunc{
+    name = "loopweight", paramTypes = []int(0), result = i64t,
+    blocks = [
+      IrBlock{ instsStart = 0, paramCount = 0, instsLen = 4 },
+      IrBlock{ instsStart = 4, paramCount = 1, instsLen = 4 },
+      IrBlock{ instsStart = 8, paramCount = 0, instsLen = 3 },
+    ],
+    instrs = [
+      c, mkBin(Op.Add, i64t, 0, 0), mkBin(Op.Add, i64t, 1, 0), mkJump(ctx, 1, [2]),
+      mkInstr(Op.BlockParam, i64t), mkBin(Op.Add, i64t, 4, 4),
+      mkBin(Op.ICmpSlt, i64t, 4, 5), mkLoopBr(ctx, 6, 5),
+      mkBin(Op.Add, i64t, 0, 0), mkBin(Op.Add, i64t, 8, 4), mkRet(ctx, 9),
+    ],
+    isFallible = false,
+  }
+  let b = buildIntervals(ctx, f)
+  let r = allocate(mkRegs(3, 0), b.intervals, []int(0), []int(0))
+  assert(r.locations[0].isSpill, "the value no loop block touches spills")
+  assert(!r.locations[4].isSpill, "the loop-carried value keeps its register")
+  assert(b.intervals[4].cost == 34, "i: edge writes 1 + 8, reads 8 + 8 + 8 + 1")
+  assert(b.intervals[0].cost == 6, "C: a definition and five reads, none in a loop")
+}
+
+fn mkBin(op: Op, ty: int, lhs: int, rhs: int): IrInstr {
+  let ins = mkInstr(op, ty)
+  ins.lhs = lhs
+  ins.rhs = rhs
+  return ins
+}
+
+fn mkJump(ctx: TypeContext, target: int, args: []int): IrInstr {
+  let ins = mkInstr(Op.Jump, ctx.voidId)
+  ins.ival = target
+  ins.args = args
+  return ins
+}
+
+// `br %cond, b1(%arg), b2()` — the back edge to block 1 and the exit to 2.
+fn mkLoopBr(ctx: TypeContext, cond: int, arg: int): IrInstr {
+  let ins = mkInstr(Op.Br, ctx.voidId)
+  ins.lhs = cond
+  ins.ival = 1
+  ins.ival2 = 2
+  ins.thenArgs = [arg]
+  return ins
+}
+
+fn mkRet(ctx: TypeContext, v: int): IrInstr {
+  let ins = mkInstr(Op.Ret, ctx.voidId)
+  ins.args = [v]
+  return ins
 }
 
 // Three intervals, one register short, with the SHORTEST-ended one marked
