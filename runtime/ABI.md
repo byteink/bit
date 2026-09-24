@@ -2124,10 +2124,15 @@ heap corruption once helpers sweep (#5838). Only time the coordinator itself
 observed counts, each check capped at 50 ms, so a whole-process stop
 (SIGSTOP, a debugger, a paused VM) is never charged to the helper.
 
+**The gang kick (#5853).** Each phase that publishes work wakes the gang
+through `worldGangKick`, which stores into `worldStopWord` a value it does not
+hold: **3**, or **4** when it holds 3. The mark kick and the sweep kick
+therefore always differ, so a helper that loaded one and sleeps on it wakes
+for the next. Every reader of `worldStopWord` tests `!= 0`.
+
 **The sweep phase (#5838).** Under `heapLock`, the coordinator fills a side
 table with every small-class span, publishes it (`gcSwOpen = g`,
-`runtime/gc/gcsweeppar.bit`), wakes the gang by storing **3** into
-`worldStopWord` (`worldGangKick`), and claims spans by `atomicAdd` on one
+`runtime/gc/gcsweeppar.bit`), wakes the gang (`worldGangKick`), and claims spans by `atomicAdd` on one
 cursor alongside every helper that joins. A helper sweeps only the span it
 claimed and writes only that span and its table entry. The coordinator then
 closes the table and drains its claim-loop count the same fatal-or-zero way,
