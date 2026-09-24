@@ -46,3 +46,12 @@ instead, as the entry below does. `dist/release.sh` refuses to fold an entry
 that violates this rather than let it corrupt the count silently.
 
 ---
+
+### Fixed: concurrent map reads during a growing write
+
+With more than one worker thread, a map read that ran while another thread's
+write was growing the same map could report a key that is present as
+missing, or return a different key's value with `ok` set to true. Every
+earlier release that runs maps on more than one worker is affected. A map
+operation now reads one published table for its whole duration, so a read
+sees either the table before the grow or the table after it, never a mix.
