@@ -3,6 +3,19 @@
 // hash, the descriptor walks, the shared `mapProbe`, `mapGrow` and the rest of
 // the ABI surface.
 //
+// PER ARCHITECTURE, ONE PATH (#5796): `rtMapSlot`'s scalar hit is shaped for
+// the target through `onX64()` (runtime/syscalls), the asm immediate every
+// per-arch branch in the runtime already uses: a constant `mov` and a branch
+// that always goes the same way. arm64 builds the token at the hit inside the
+// probe loop; x86-64 leaves the loop first (`mapSlotScalarX64`). Each shape
+// lost on the other target in the server A/B on #5796. Built at the hit, the
+// token's temporaries pushed x86-64's `i` to the stack (b6375a61d, +3.36% on
+// a Xeon 8168). Leaving the loop first, with `bit_rt_map_val_at`'s bit test,
+// measured +5.7-7.3% on Graviton3's int map (e2461f835): in its profile the
+// comma-ok pair gained 51 of about 1300 samples, `bit_rt_map_slot`'s key-load
+// stall 273 -> 334, while `bit_rt_map_get` — changed only from `ldar` to
+// `ldr` — stayed at 415 -> 413, which rules the table load out.
+//
 // WHY THEY LIVE HERE. Each of these four used to be two out-of-line calls —
 // `mapHash(m, key)` re-loading `mapKeyDesc` to pick a hash, then
 // `mapProbe(m, key, h)` whose loop called `mapKeyEq(m, k, key)`, which loaded
@@ -35,6 +48,8 @@
 // `steps < cap` bound, same "first tombstone else the empty slot that stopped
 // the walk" insert position. The three read-only entry points keep no tombstone
 // state at all — it only ever picks an INSERT slot, and they never insert.
+
+import { onX64 } from "../syscalls"
 
 // HASH BEFORE THE HEADER LOADS, IN ALL FOUR (#4399). `scalarHash` is an
 // out-of-line call, so every value live across it must sit in a callee-saved
@@ -216,6 +231,13 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
     return -1
   }
   if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
+    // x86-64 leaves here for its own loop. The call costs this frame one
+    // callee-saved register on arm64 (x19-x23, 0x40) wherever it sits; placing
+    // it after the loop or moving the string arm out of line did not win it
+    // back.
+    if (onX64()) {
+      return mapSlotScalarX64(m, key)
+    }
     let h = scalarHash(u64(key)) // FIRST: see the header note on the callee-saved set
     let tb = mapTableBase(m)
     let vcap = loadWord(tb + baseCap)
@@ -225,7 +247,8 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
     let i = int(h & u64(mask))
     let tag = mapCtrlTag(h)
     let steps = 0
-    // Bounded by `cap`, as `mapProbe`'s loop is.
+    // Bounded by `cap`, as `mapProbe`'s loop is. arm64: the token is built at
+    // the hit, inside the loop (see the header note).
     while (steps < vcap) {
       let c = loadByte(ctrl + i)
       if (c == ctrlEmpty) {
@@ -233,18 +256,11 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
       }
       if (c == tag) {
         if (loadWord(keys + i * 8) == key) {
-          break
+          return mapValTokenBase(tb, i)
         }
       }
       i = (i + 1) & mask
       steps = steps + 1
-    }
-    // A hit leaves the loop by `break`, so `steps < vcap` still holds. The
-    // token is built out here rather than at the hit: its temporaries inside
-    // the loop cost x86-64 a register, and `i` went to the stack, a store and
-    // a reload on every probe step.
-    if (steps < vcap) {
-      return mapValToken(ctrl, i)
     }
     // Unreachable; the shared path below gives the same answer.
   }
@@ -255,6 +271,48 @@ export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
     return -1
   }
   return mapValToken(ctrl, r)
+}
+
+// `rtMapSlot`'s scalar probe on x86-64: the same loop, left by `break` on a hit
+// so the token is built after it. Built at the hit, the token's temporaries
+// (the value array, `i * 8`, the 2^62 constant, which x86-64 cannot encode as
+// an immediate) pushed `i` to the stack: a store and a store-forwarded reload
+// on the loop-carried chain, every probe step. A leaf, so its loop has every
+// caller-saved register to itself.
+//
+// Exhausting `cap` steps is unreachable (the load factor guarantees an EMPTY
+// slot) and answers a miss, which is what `rtMapSlot`'s shared path reports
+// for the same table; returning it here keeps a call off this loop's exit,
+// which would promote its whole live set to callee-saved (mapcaps.bit).
+@nosplit fn mapSlotScalarX64(m: int, key: int): int {
+  let h = scalarHash(u64(key))
+  let tb = mapTableBase(m)
+  let vcap = loadWord(tb + baseCap)
+  let mask = vcap - 1
+  let ctrl = tb + tblPrefix
+  let keys = loadWord(tb + baseKeys)
+  let i = int(h & u64(mask))
+  let tag = mapCtrlTag(h)
+  let steps = 0
+  // Bounded by `cap`, as `mapProbe`'s loop is.
+  while (steps < vcap) {
+    let c = loadByte(ctrl + i)
+    if (c == ctrlEmpty) {
+      return -1
+    }
+    if (c == tag) {
+      if (loadWord(keys + i * 8) == key) {
+        break
+      }
+    }
+    i = (i + 1) & mask
+    steps = steps + 1
+  }
+  // A hit leaves the loop by `break`, so `steps < vcap` still holds.
+  if (steps < vcap) {
+    return mapValToken(ctrl, i)
+  }
+  return -1
 }
 
 // `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
