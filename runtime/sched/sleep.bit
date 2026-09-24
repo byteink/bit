@@ -331,13 +331,11 @@ export @nosplit @symbol("bit_rt_port_sched_idle_park") fn schedIdlePark(s: *i64,
 //     read 0 published BEFORE worker 0's arm, and worker 0's own next find-work
 //     pass — which comes after that arm — sees the work with no wake at all.
 //   - A CLAIM THAT LANDS BEFORE WORKER 0 IS ACTUALLY INSIDE `kevent` IS NOT
-//     LOST. `pollWake` is `NOTE_TRIGGER` on an `EV_CLEAR` (not `EV_ONESHOT`)
-//     EVFILT_USER filter: the trigger sets kernel state that persists until a
-//     `kevent` call retrieves it, so the wait returns immediately on entry
-//     instead of sleeping through it. That is the property `wkPark`'s
-//     `parkWait` gets from comparing the word under its own lock; see
-//     `../darwin/poll.bit`'s `pollWake` header for the full three-interleaving
-//     argument.
+//     LOST, but the kernel trigger is not what keeps it (#5843): ANY worker's
+//     `kevent` retrieves that trigger, and a peer's non-blocking drain used to
+//     spend it. `schedPollerWaitNs` below reads the claim itself under the
+//     poller lock instead, which is the property `wkPark`'s `parkWait` gets
+//     from comparing the word under its own lock.
 //
 // `atomicStore` and `atomicCmpxchg` are sequentially consistent (SPEC §"atomic
 // primitives"), which is what orders the producer's publish-then-read against
@@ -379,6 +377,39 @@ export @nosplit @symbol("bit_rt_port_sched_poller_disarm") fn schedPollerDisarm(
   atomicStore(s + scPollWait, 0)
 }
 
+// `scPollWait` after a producer's claim (#5843): distinct from 0 so that the
+// poller can tell "armed, then claimed" apart from "never armed".
+const pollWaitClaimed: int = 2
+
+// How long a drain that already holds the poller may block: `timeoutNs`, or 0
+// once a producer has claimed worker 0's wait (#5843). Call it AFTER
+// `schedPollTryEnter`, never before.
+//
+// THE CLAIM IS THE WAKE; THE KERNEL TRIGGER ONLY CARRIES IT. The trigger is
+// one event on a descriptor every idle worker drains, so a peer's
+// non-blocking `pollDrain` can retrieve it and spend it on itself while
+// worker 0 is between its find-work pass and its wait. Worker 0 then blocked
+// with nothing left to end the wait but its bound, and nothing else wakes a
+// due timer (peers park for `idleParkMaxNs` and never look at the timer
+// queue): measured at `BIT_WORKERS=8` on pkg/web, worker 0 slept 1.002s, all
+// 64 connection tasks sat due in the timer queue, and requests stalled
+// 101-107ms each time until a parked peer's 100ms timeout ran them.
+//
+// Read under the poller lock, the claim is exact. A claim before this read
+// shortens the wait to a non-blocking drain. A claim after it fires its
+// trigger while this caller holds the lock, and no other thread can drain
+// until this caller's wait has returned, so the trigger reaches this wait.
+// A caller that never armed (0) always gets `timeoutNs` back unchanged.
+export @nosplit @symbol("bit_rt_port_sched_poller_wait_ns") fn schedPollerWaitNs(
+  s: *i64,
+  timeoutNs: int,
+): int {
+  if (atomicLoad(s + scPollWait) == pollWaitClaimed) {
+    return 0
+  }
+  return timeoutNs
+}
+
 // Claim worker 0 and trigger the poller it is waiting in. A no-op when it is
 // not waiting, which is what keeps this off the hot path: at `BIT_WORKERS=1`
 // the only worker is the one running the producer, so the cell reads 0 and this
@@ -392,9 +423,10 @@ export @nosplit @symbol("bit_rt_port_sched_poller_disarm") fn schedPollerDisarm(
 //
 // THE CLAIM IS WHAT BOUNDS THE SYSCALL COUNT. Eight tasks arming eight timers
 // into one idle stretch issue ONE `kevent`, not eight: the first producer wins
-// the exchange and the rest read 0. They lose nothing by it — each published
-// its own work before reading this cell, and worker 0 re-arms and sweeps after
-// the wait, so that sweep is strictly later than every one of those publishes.
+// the exchange and the rest read the claim. They lose nothing by it — each
+// published its own work before reading this cell, and worker 0 re-arms and
+// sweeps after the wait, so that sweep is strictly later than every one of
+// those publishes.
 //
 // `scPollFd` IS READ FIRST so a claim is never spent on a scheduler with no
 // poller bound: there the wake has nowhere to go, and worker 0 is not waiting
@@ -404,10 +436,10 @@ export @nosplit @symbol("bit_rt_port_sched_poller_disarm") fn schedPollerDisarm(
   if (fd <= 0) {
     return
   }
-  if (atomicLoad(s + scPollWait) == 0) {
+  if (atomicLoad(s + scPollWait) != 1) {
     return
   }
-  if (!atomicCmpxchg(s + scPollWait, 1, 0)) {
+  if (!atomicCmpxchg(s + scPollWait, 1, pollWaitClaimed)) {
     return
   }
   let _ = bit_rt_port_sched_poll_wake(fd)
