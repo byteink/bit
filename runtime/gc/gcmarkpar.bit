@@ -1,0 +1,486 @@
+// The parallel mark (#5839). Sibling of `./gcmark.bit`, same module: that
+// file's `drain` is the serial mark and stays the path of every collection
+// with no parked mutator to help; this file runs the same trace across the
+// helper gang (#5837) when at least one slot is parked for the open epoch.
+//
+// ---------------------------------------------------------------------------
+// THE PROTOCOL
+// ---------------------------------------------------------------------------
+//
+// The coordinator is the thread running `gcDrainAndSweep` (./gccollect.bit),
+// with the world stopped and every root already pushed, serially, onto the
+// one LIFO at `g + gcStackAddr`. It:
+//
+//   1. takes the segment pool (`gcMkOwner`), cuts the LIFO's entries into
+//      segments on the global list and puts every other budgeted segment on
+//      the free list (`gcMkSeed`);
+//   2. publishes the phase by storing `g` into `gcMkOpen` and wakes the gang
+//      (`worldGangKick`, ./gcworldstop.bit);
+//   3. marks as a member itself until termination (`gcMkWork`);
+//   4. stores 0 into `gcMkOpen`, then waits for `gcMkIn` to read 0;
+//   5. adds every member's bad-offset count into `gcStBadOffset`. Any push
+//      that found no free segment set `gcOverflow`, and `recoverOverflow`
+//      (./gcmark.bit) then runs serially, unchanged.
+//
+// A member holds one local segment of `gcMkSegEntries` entries. It pops and
+// scans from it, and pushes the children it wins with `hdrTryMark` (./gc.bit)
+// onto it. A full local goes onto the global list in exchange for a free one
+// (`gcMkSwap`); an empty one goes back to the free list in exchange for a
+// full one (`gcMkRefill`).
+//
+// ---------------------------------------------------------------------------
+// INVARIANTS, AND WHERE EACH IS ENFORCED
+// ---------------------------------------------------------------------------
+//
+// M1. Each object is queued at most once per collection. Only the thread
+//     whose `hdrTryMark` saw the mark clear pushes it (`gcMkMark`), so every
+//     object is scanned at most once and each member's loop is bounded.
+// M2. `gcMkJoined`, `gcMkIdle`, `gcMkFull`, `gcMkFree`, both lists and
+//     `gcMkDone` change only under `gcMkLock`. `gcMkFull` and `gcMkDone` are
+//     also read without it, as hints; every decision that acts on them is
+//     re-taken under the lock (`gcMkTakeIdle`).
+// M3. Termination is decided once, under the lock, on "every joined member is
+//     idle and the global list is empty" (`gcMkRefill`). An idle member holds
+//     no segment, and only a busy member publishes, so once `gcMkDone` is set
+//     no entry exists anywhere and none can be published. A lock-free
+//     wait-count/list pair cannot say this: the two reads are not one moment.
+// M4. With `gcMkDone` clear, `gcMkIdle < gcMkJoined` at every lock release.
+//     The member that makes them equal sets `gcMkDone` in the same critical
+//     section; an idle helper that times out takes one off BOTH
+//     (`gcMkLeave`), which keeps the inequality, so a leave never strands
+//     termination and a late joiner (`gcMkJoin`) only raises `gcMkJoined`.
+// M5. No helper is inside the phase once step 5 starts. The Dekker pair of
+//     step 4 against the helper's add-then-re-check (`gcMarkHelp`, the shape
+//     of `gcSweepHelp`): either the helper reads `gcMkOpen != g` and does
+//     nothing, or the coordinator reads its increment and waits, fatal-or-zero
+//     (`worldDrainOrDie`). Every region counted in `gcMkIn` is bounded: a
+//     member's trace is bounded by M1, and its idle wait by a spin count.
+// M6. Step 5 sees every helper's marks, pushes and counts. Each helper's last
+//     write precedes its seq-cst decrement of `gcMkIn`, which the
+//     coordinator's seq-cst load of 0 reads. A segment's entries are written
+//     before the lock release that publishes it and read after the acquire
+//     that takes it.
+// M7. Nothing waits for a helper to START. With none, the coordinator is the
+//     only member, and `gcMkJoined == 1` terminates on its first empty local.
+// M8. The pool never holds more than `gcStackLen` entries rounded up to whole
+//     segments, and `gcStackLen <= gcMaxMarkStack` (./gc.bit). A push that
+//     finds no free segment drops the child it just marked and sets
+//     `gcOverflow`: today's overflow contract, answered by today's rescan.
+//
+// THE POOL is a side mapping (`memMapPages`), never GC heap, mapped once and
+// reused by every collection. If it cannot be taken (another heap is marking,
+// or the map failed) the coordinator runs the serial `drain` instead, and
+// helpers find `gcMkOpen != g` and do nothing.
+
+const gcMkSegEntries = 256
+const gcMkSegBytes = 2048 // gcMkSegEntries * 8
+const gcMkSegMax = 4096   // gcMaxMarkStack / gcMkSegEntries
+
+// Member context: one per slot plus the coordinator's (index 0), padded to a
+// 128-byte line so two members never share one. Words: local segment base (0
+// when none), entries in it, bad offsets counted, the collector block.
+const gcMkCtxBytes = 128
+const gcMkCtxSeg = 0
+const gcMkCtxN = 1
+const gcMkCtxBad = 2
+const gcMkCtxG = 3
+
+// Side-mapping layout: segments, the global list (base, count per entry),
+// the free list (base per entry), then the member contexts.
+const gcMkFullOff = 8388608  // gcMkSegMax * gcMkSegBytes
+const gcMkFreeOff = 8454144  // gcMkFullOff + gcMkSegMax * 16
+const gcMkCtxOff = 8486912   // gcMkFreeOff + gcMkSegMax * 8
+const gcMkMapBytes = 8519808 // gcMkCtxOff + (maxMutators + 1) * gcMkCtxBytes
+
+// Idle turns a helper spins before it leaves (`gcMkLeave`). It is back on the
+// next turn of its park loop (`worldGangTryHelp`) while the phase is open.
+const gcMkHelperIdleSpins = 64000
+
+let gcMkBase: i64 = 0   // the side mapping, 0 until first use
+let gcMkLock: i32 = 0   // M2
+let gcMkOwner: i64 = 0  // 1 while a coordinator holds the pool
+let gcMkOpen: i64 = 0   // 0, or the `g` whose phase is published
+let gcMkIn: i64 = 0     // helpers inside `gcMarkHelp`'s counted region (M5)
+let gcMkJoined: i64 = 0 // members in the phase, coordinator included (M2)
+let gcMkIdle: i64 = 0   // members with no work (M2)
+let gcMkFull: i64 = 0   // entries on the global list (M2)
+let gcMkFree: i64 = 0   // entries on the free list (M2)
+let gcMkDone: i64 = 0   // 1 once termination is decided (M3)
+let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
+
+@nosplit fn gcMkCtx(k: int): *i64 {
+  return wordAt(gcMkBase + gcMkCtxOff + k * gcMkCtxBytes)
+}
+
+@nosplit fn gcMkFullAt(i: int): *i64 {
+  return wordAt(gcMkBase + gcMkFullOff + i * 16)
+}
+
+@nosplit fn gcMkFreeAt(i: int): *i64 {
+  return wordAt(gcMkBase + gcMkFreeOff + i * 8)
+}
+
+// Map the pool on first use. False if the OS refused.
+@nosplit fn gcMkReserve(): bool {
+  if (gcMkBase != 0) {
+    return true
+  }
+  gcMkBase = memMapPages(gcMkMapBytes)
+  return gcMkBase != 0
+}
+
+// Point a member context at `g` with no segment.
+@nosplit fn gcMkCtxReset(c: *i64, g: *i64) {
+  *(c + gcMkCtxSeg) = 0
+  *(c + gcMkCtxN) = 0
+  *(c + gcMkCtxBad) = 0
+  *(c + gcMkCtxG) = int(g)
+}
+
+// Move up to one segment's worth of LIFO entries from index `start` into `seg`;
+// returns how many.
+@nosplit fn gcMkCopyIn(g: *i64, seg: int, start: int): int {
+  let n = *(g + gcStackTop) - start
+  if (n > gcMkSegEntries) {
+    n = gcMkSegEntries
+  }
+  let src = *(g + gcStackAddr) + start * 8
+  let i = 0
+  while (i < n) { // bounded: gcMkSegEntries
+    storeWord(seg + i * 8, loadWord(src + i * 8))
+    i = i + 1
+  }
+  return n
+}
+
+// Step 1: the budget is `gcStackLen` in whole segments (M8), the roots are
+// cut into segments on the global list, and the rest go on the free list.
+// CALLER HOLDS THE POOL (`gcMkOwner`); no helper can be in the phase yet.
+@nosplit fn gcMkSeed(g: *i64) {
+  let segs = (*(g + gcStackLen) + gcMkSegEntries - 1) / gcMkSegEntries
+  if (segs > gcMkSegMax) {
+    segs = gcMkSegMax
+  }
+  gcMkFull = 0
+  gcMkFree = 0
+  let taken = 0
+  let k = 0
+  while (k < segs) { // bounded: segs <= gcMkSegMax
+    let seg = gcMkBase + k * gcMkSegBytes
+    if (taken < *(g + gcStackTop)) {
+      let n = gcMkCopyIn(g, seg, taken)
+      let e = gcMkFullAt(gcMkFull)
+      *e = seg
+      *(e + 1) = n
+      gcMkFull = gcMkFull + 1
+      taken = taken + n
+    } else {
+      let f = gcMkFreeAt(gcMkFree)
+      *f = seg
+      gcMkFree = gcMkFree + 1
+    }
+    k = k + 1
+  }
+  if (taken != *(g + gcStackTop)) {
+    worldHelperFatal() // M8 broken: a root did not fit the budget
+  }
+  *(g + gcStackTop) = 0
+  gcMkJoined = 1
+  gcMkIdle = 0
+  atomicStore(ptrOf(gcMkBad), 0)
+  atomicStore(ptrOf(gcMkDone), 0)
+}
+
+// Publish a full local and take a free segment in its place. False, with the
+// local untouched, when no free segment is left (M8). Takes the lock.
+@nosplit fn gcMkSwap(c: *i64): bool {
+  spinAcquire(ptrOf(gcMkLock))
+  if (gcMkFree == 0) {
+    spinRelease(ptrOf(gcMkLock))
+    return false
+  }
+  let e = gcMkFullAt(gcMkFull)
+  *e = *(c + gcMkCtxSeg)
+  *(e + 1) = *(c + gcMkCtxN)
+  atomicStore(ptrOf(gcMkFull), gcMkFull + 1)
+  gcMkFree = gcMkFree - 1
+  *(c + gcMkCtxSeg) = *gcMkFreeAt(gcMkFree)
+  *(c + gcMkCtxN) = 0
+  spinRelease(ptrOf(gcMkLock))
+  return true
+}
+
+// The parallel twin of `markObject` (./gcmark.bit). A twin rather than a
+// shared body because a collection with no parked mutator must run today's
+// plain mark unchanged, byte for byte. M1 is the `hdrTryMark` test.
+@nosplit fn gcMkMark(c: *i64, h: int) {
+  if (hdrMarked(h)) {
+    return
+  }
+  if (markStackTight()) {
+    let _ = bit_rt_gc_mark_stack_overflow()
+  }
+  if (!hdrTryMark(h)) {
+    return
+  }
+  let n = *(c + gcMkCtxN)
+  if (n >= gcMkSegEntries) {
+    if (!gcMkSwap(c)) {
+      // Marked, so it survives; its children wait for the serial rescan.
+      atomicStore(wordAt(*(c + gcMkCtxG)) + gcOverflow, 1)
+      return
+    }
+    n = 0
+  }
+  storeWord(*(c + gcMkCtxSeg) + n * 8, h)
+  *(c + gcMkCtxN) = n + 1
+}
+
+// `gcMarkRoot`'s validation (./gcmark.bit), feeding `gcMkMark`.
+@nosplit fn gcMkRoot(c: *i64, ref: int) {
+  if (ref == 0) {
+    return
+  }
+  let g = wordAt(*(c + gcMkCtxG))
+  if (ref < *(g + gcLoAddr) || ref >= *(g + gcHiAddr)) {
+    return
+  }
+  if (gcOwns(g, ref)) {
+    gcMkMark(c, headerFromBody(ref))
+  }
+}
+
+// The parallel twin of `scanObject` (./gcmark.bit), for the reason
+// `gcMkMark` gives. A bad offset is counted in the member's own context.
+@nosplit fn gcMkScan(c: *i64, h: int) {
+  let body = bodyFromHeader(h)
+  let infoAddr = loadWord(h + gcHdrInfo)
+  let g = wordAt(*(c + gcMkCtxG))
+  if (infoAddr == *(g + gcRefArrayInfo)) {
+    let nwords = (hdrSize(h) - gcHeaderSize) / 8
+    let w = 0
+    while (w < nwords) { // bounded: the buffer's word count
+      gcMkRoot(c, loadWord(body + w * 8))
+      w = w + 1
+    }
+    return
+  }
+  let offs = loadWord(infoAddr + gcTiPtrOffsetsPtr)
+  let n = loadWord(infoAddr + gcTiPtrOffsetsLen)
+  let size = loadWord(infoAddr + gcTiSize)
+  let i = 0
+  while (i < n) { // bounded: the type's pointer-field count
+    let off = loadWord(offs + i * 8)
+    if (off % 8 != 0 || off + 8 > size) {
+      *(c + gcMkCtxBad) = *(c + gcMkCtxBad) + 1
+    } else {
+      gcMkRoot(c, loadWord(body + off))
+    }
+    i = i + 1
+  }
+}
+
+// Scan the local segment until it is empty. Bounded by M1.
+@nosplit fn gcMkDrainLocal(c: *i64) {
+  while (*(c + gcMkCtxN) > 0) {
+    let n = *(c + gcMkCtxN) - 1
+    *(c + gcMkCtxN) = n
+    gcMkScan(c, loadWord(*(c + gcMkCtxSeg) + n * 8))
+  }
+}
+
+// Pop one global-list segment into the empty-handed context `c`. CALLER HOLDS
+// THE LOCK; false when the list is empty.
+@nosplit fn gcMkPopFull(c: *i64): bool {
+  if (gcMkFull == 0) {
+    return false
+  }
+  let e = gcMkFullAt(gcMkFull - 1)
+  *(c + gcMkCtxSeg) = *e
+  *(c + gcMkCtxN) = *(e + 1)
+  atomicStore(ptrOf(gcMkFull), gcMkFull - 1)
+  return true
+}
+
+// The empty local goes back on the free list, and a full segment replaces it
+// if one exists. Otherwise the member turns idle, and the one that makes every
+// joined member idle decides termination (M3, M4). Then the idle wait.
+@nosplit fn gcMkRefill(c: *i64, helper: bool): bool {
+  spinAcquire(ptrOf(gcMkLock))
+  if (*(c + gcMkCtxSeg) != 0) {
+    let f = gcMkFreeAt(gcMkFree)
+    *f = *(c + gcMkCtxSeg)
+    gcMkFree = gcMkFree + 1
+    *(c + gcMkCtxSeg) = 0
+  }
+  if (gcMkPopFull(c)) {
+    spinRelease(ptrOf(gcMkLock))
+    return true
+  }
+  gcMkIdle = gcMkIdle + 1
+  if (gcMkIdle == gcMkJoined) {
+    atomicStore(ptrOf(gcMkDone), 1)
+  }
+  spinRelease(ptrOf(gcMkLock))
+  if (helper) {
+    return gcMkHelperWait(c)
+  }
+  return gcMkCoordWait(c)
+}
+
+// An idle member saw the global list non-empty: take a segment and stop being
+// idle in one critical section (M2). False if another member got there first.
+@nosplit fn gcMkTakeIdle(c: *i64): bool {
+  spinAcquire(ptrOf(gcMkLock))
+  let got = gcMkPopFull(c)
+  if (got) {
+    gcMkIdle = gcMkIdle - 1
+  }
+  spinRelease(ptrOf(gcMkLock))
+  return got
+}
+
+// One idle check: 1 = work taken, 0 = terminated, -1 = keep waiting.
+@nosplit fn gcMkIdlePoll(c: *i64): int {
+  if (atomicLoad(ptrOf(gcMkDone)) != 0) {
+    return 0
+  }
+  if (atomicLoad(ptrOf(gcMkFull)) > 0 && gcMkTakeIdle(c)) {
+    return 1
+  }
+  return -1
+}
+
+// An idle helper leaves: off both counts at once, so M4 holds (it held no
+// segment, being idle). A no-op once termination is decided.
+@nosplit fn gcMkLeave() {
+  spinAcquire(ptrOf(gcMkLock))
+  if (atomicLoad(ptrOf(gcMkDone)) == 0) {
+    gcMkIdle = gcMkIdle - 1
+    gcMkJoined = gcMkJoined - 1
+  }
+  spinRelease(ptrOf(gcMkLock))
+}
+
+// A helper's idle wait: true with a segment taken, false once it must leave,
+// by termination or by its spin bound.
+@nosplit fn gcMkHelperWait(c: *i64): bool {
+  let spins = 0
+  while (spins < gcMkHelperIdleSpins) { // bounded: gcMkHelperIdleSpins
+    let r = gcMkIdlePoll(c)
+    if (r >= 0) {
+      return r == 1
+    }
+    spins = spins + 1
+    if (spins % stwSpinBurst == 0) {
+      worldYield()
+    }
+  }
+  gcMkLeave()
+  return false
+}
+
+// The coordinator's idle wait. It cannot leave: it waits for termination, on
+// the same watched-time budget as `worldDrainOrDie`, because a helper still
+// tracing is bounded work (M1) and never finishing it is a runtime bug.
+@nosplit fn gcMkCoordWait(c: *i64): bool {
+  let last = gcTicks()
+  let seen = 0
+  let spins = 0
+  while (spins < worldDrainSpinBound) { // bounded: worldDrainSpinBound checks
+    let r = gcMkIdlePoll(c)
+    if (r >= 0) {
+      return r == 1
+    }
+    spins = spins + 1
+    if (spins % stwSpinBurst == 0) {
+      let now = gcTicks()
+      seen = seen + worldDrainStep(now - last)
+      last = now
+      if (seen > worldDrainBudgetNs) {
+        break
+      }
+      worldYield()
+    }
+  }
+  worldHelperFatal()
+  return false
+}
+
+// A member's whole share: drain the local, refill, until termination (or, for
+// a helper, its idle bound). Each refill but the last takes a segment that
+// was published holding at least one entry, so the rounds are bounded by the
+// marked objects plus the seeded segments.
+@nosplit fn gcMkWork(c: *i64, helper: bool) {
+  let g = wordAt(*(c + gcMkCtxG))
+  let bound = *(g + gcNumObjectsIdx) + gcMkSegMax + 2
+  let rounds = 0
+  while (rounds < bound) { // bounded: see above
+    gcMkDrainLocal(c)
+    if (!gcMkRefill(c, helper)) {
+      return
+    }
+    rounds = rounds + 1
+  }
+  worldHelperFatal() // M1 broken: more segments than objects
+}
+
+// A late joiner enters under the lock, and not at all once termination is
+// decided (M4).
+@nosplit fn gcMkJoin(): bool {
+  spinAcquire(ptrOf(gcMkLock))
+  let ok = atomicLoad(ptrOf(gcMkDone)) == 0
+  if (ok) {
+    gcMkJoined = gcMkJoined + 1
+  }
+  spinRelease(ptrOf(gcMkLock))
+  return ok
+}
+
+// A gang helper's share of the mark (`gcGangHelp`, ./gccollect.bit), as the
+// parked mutator in slot `slot`. Returns at once unless a phase is published
+// for `g`. M5 is this function.
+@nosplit fn gcMarkHelp(g: *i64, slot: int) {
+  if (atomicLoad(ptrOf(gcMkOpen)) != int(g)) {
+    return
+  }
+  let _ = atomicAdd(ptrOf(gcMkIn), 1)
+  if (atomicLoad(ptrOf(gcMkOpen)) != int(g)) {
+    let _ = atomicAdd(ptrOf(gcMkIn), 0 - 1)
+    return
+  }
+  if (slot >= 0 && slot < maxMutators && gcMkJoin()) {
+    let c = gcMkCtx(slot + 1)
+    gcMkCtxReset(c, g)
+    gcMkWork(c, true)
+    let _ = atomicAdd(ptrOf(gcMkBad), *(c + gcMkCtxBad))
+  }
+  let _ = atomicAdd(ptrOf(gcMkIn), 0 - 1)
+}
+
+// Mark everything the roots reach across the gang. False, having done
+// nothing, when the serial `drain` must run instead: no slot is parked for
+// the open gang on `g`, or the pool cannot be taken.
+@nosplit fn gcMarkPar(g: *i64): bool {
+  if (!worldGangHasParked(g)) {
+    return false
+  }
+  if (!atomicCmpxchg(ptrOf(gcMkOwner), 0, 1)) {
+    return false
+  }
+  if (!gcMkReserve()) {
+    atomicStore(ptrOf(gcMkOwner), 0)
+    return false
+  }
+  gcMkSeed(g)
+  let c = gcMkCtx(0)
+  gcMkCtxReset(c, g)
+  atomicStore(ptrOf(gcMkOpen), int(g))
+  worldGangKick(g)
+  gcMkWork(c, false)
+  atomicStore(ptrOf(gcMkOpen), 0)
+  worldDrainOrDie(ptrOf(gcMkIn))
+  *(g + gcStBadOffset) = *(g + gcStBadOffset) + *(c + gcMkCtxBad) + atomicLoad(ptrOf(gcMkBad))
+  atomicStore(ptrOf(gcMkOwner), 0)
+  return true
+}
