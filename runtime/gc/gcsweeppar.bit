@@ -1,0 +1,218 @@
+// The parallel sweep of small-class spans (#5838). Sibling of `./gcwalk.bit`,
+// same module: `gcSweepSpan` there is the unit of work, and this file only
+// decides WHO sweeps each span and applies the results once they are all in.
+//
+// ---------------------------------------------------------------------------
+// THE PROTOCOL
+// ---------------------------------------------------------------------------
+//
+// The coordinator is the thread running `sweep` (./gcmark.bit), under
+// `heapLock(g)` with the world stopped. It:
+//
+//   1. takes the span table (`gcSwOwner`), fills it with one entry per span
+//      carved onto a small class, in `gcWalkSmall`'s own order;
+//   2. resets the claim cursor, publishes the table by storing `g` into
+//      `gcSwOpen`, and wakes the helper gang (`worldGangKick`,
+//      ./gcworldstop.bit);
+//   3. claims spans itself until the cursor is spent;
+//   4. stores 0 into `gcSwOpen`, then waits for `gcSwIn` to read 0;
+//   5. applies every span's result, in table order, serially.
+//
+// A helper is a parked mutator inside the gang (`gcGangHelp`,
+// ./gccollect.bit). It increments `gcSwIn`, re-checks `gcSwOpen == g`, and
+// only then claims spans, decrementing `gcSwIn` when the cursor is spent.
+//
+// ---------------------------------------------------------------------------
+// INVARIANTS, AND WHERE EACH IS ENFORCED
+// ---------------------------------------------------------------------------
+//
+// I1. Each span is swept by exactly one thread. `atomicAdd` on `gcSwNext`
+//     hands out each index once (`gcSwClaimLoop`).
+// I2. A helper writes only the span it claimed (its header, bitmap, chain and
+//     object headers, `gcSweepSpan`) and that span's table entry. Nothing
+//     class-level, nothing process-level, no lock. Every class-list relink,
+//     counter and reclaim is the coordinator's, in step 5 (`gcSwApply`).
+// I3. No helper is sweeping once step 5 starts. The Dekker pair of step 4
+//     against the helper's add-then-re-check (`gcSweepHelp`, the same shape
+//     as `worldGangTryHelp`): either the helper reads `gcSwOpen != g` and
+//     claims nothing, or the coordinator reads its increment and waits. The
+//     wait is `worldDrainOrDie`: it reads 0 or ends the process, never
+//     proceeds.
+// I4. Step 5 sees every helper's writes. Each helper's last write precedes
+//     its seq-cst decrement of `gcSwIn`, which the coordinator's seq-cst load
+//     of 0 reads.
+// I5. A helper never reads a table published for another collection. It
+//     reads `gcSwTab`/`gcSwN` only after its re-check read `gcSwOpen == g`,
+//     and while it is counted in `gcSwIn` the coordinator cannot reach step
+//     5, release the table or republish it.
+// I6. The result is the serial sweep's, bit for bit. Sweeping a span is
+//     span-local, and step 5 relinks, counts and reclaims in the order
+//     `gcWalkClass` did. Reclaiming class c before or after sweeping class
+//     c+1 touches disjoint spans.
+// I7. With no helper at all, step 3 sweeps every span. Nothing waits for a
+//     helper to START.
+//
+// THE TABLE is a side mapping (`memMapPages`), never GC heap, reused across
+// collections and remapped only when the heap outgrows it. If it cannot be
+// taken (another heap is sweeping, the map failed, or it cannot hold every
+// span) the coordinator runs the serial `gcWalkSmall` instead, and helpers
+// find `gcSwOpen != g` and do nothing.
+
+// Words per table entry: span address, class, objects freed, bytes freed.
+const gcSwWords = 4
+const gcSwEntryBytes = 32 // gcSwWords * 8
+
+let gcSwTab: i64 = 0   // base of the side mapping, 0 until first use
+let gcSwCap: i64 = 0   // entries the mapping holds
+let gcSwN: i64 = 0     // entries published for the current sweep
+let gcSwNext: i64 = 0  // claim cursor (I1)
+let gcSwIn: i64 = 0    // helpers inside `gcSwClaimLoop` (I3)
+let gcSwOpen: i64 = 0  // 0, or the `g` whose table is published
+let gcSwOwner: i64 = 0 // 1 while a coordinator holds the table
+
+// Make the table hold at least `need` entries. False if the OS refused.
+@nosplit fn gcSwReserve(need: int): bool {
+  if (need <= gcSwCap) {
+    return true
+  }
+  let cap = need * 2
+  let tab = memMapPages(cap * gcSwEntryBytes)
+  if (tab == 0) {
+    return false
+  }
+  memUnmapPages(gcSwTab, gcSwCap * gcSwEntryBytes)
+  gcSwTab = tab
+  gcSwCap = cap
+  return true
+}
+
+// Append every span of class `cls` from entry `n` on; returns the new count,
+// or -1 if the table filled. The `seen < maxSpans` bound is `gcWalkClass`'s.
+@nosplit fn gcSwFillClass(g: *i64, cls: int, n: int, maxSpans: int): int {
+  let s = heapClassAnchor(heapBlock(g), cls)
+  let seen = 0
+  let k = n
+  while (s != 0 && seen < maxSpans) { // bounded: maxSpans iterations
+    if (k >= gcSwCap) {
+      return -1
+    }
+    let e = wordAt(gcSwTab + k * gcSwEntryBytes)
+    *e = s
+    *(e + 1) = cls
+    k = k + 1
+    s = allocSpanNext(s)
+    seen = seen + 1
+  }
+  return k
+}
+
+// Fill the table with every small-class span, class by class. Returns the
+// entry count, or -1 when the table is unusable (serial fallback).
+@nosplit fn gcSwFill(g: *i64): int {
+  let maxSpans = heapMappedBytes(heapBlock(g)) / allocSpanBytes + 1
+  if (!gcSwReserve(maxSpans)) {
+    return -1
+  }
+  let n = 0
+  let cls = 0
+  while (cls < allocNumClasses) { // bounded: allocNumClasses iterations
+    n = gcSwFillClass(g, cls, n, maxSpans)
+    if (n < 0) {
+      return -1
+    }
+    cls = cls + 1
+  }
+  return n
+}
+
+// Claim and sweep spans until the cursor is spent. Bounded: every pass but
+// the last consumes one of the `n` indices, which no other pass can reuse.
+@nosplit fn gcSwClaimLoop(g: *i64, tab: int, n: int) {
+  let pass = 0
+  while (pass <= n) { // bounded: n + 1 passes
+    let i = atomicAdd(ptrOf(gcSwNext), 1)
+    if (i >= n) {
+      return
+    }
+    let e = wordAt(tab + i * gcSwEntryBytes)
+    let span = *e
+    let before = allocSpanFree(span)
+    let bytes = gcSweepSpan(g, span, *(e + 1), gcWalkSweep)
+    *(e + 2) = allocSpanFree(span) - before
+    *(e + 3) = bytes
+    pass = pass + 1
+  }
+}
+
+// A gang helper's share of the sweep (`gcGangHelp`, ./gccollect.bit). Returns
+// at once unless a table is published for `g`. I3 and I5 are this function.
+@nosplit fn gcSweepHelp(g: *i64) {
+  if (atomicLoad(ptrOf(gcSwOpen)) != int(g)) {
+    return
+  }
+  let _ = atomicAdd(ptrOf(gcSwIn), 1)
+  if (atomicLoad(ptrOf(gcSwOpen)) != int(g)) {
+    let _ = atomicAdd(ptrOf(gcSwIn), 0 - 1)
+    return
+  }
+  gcSwClaimLoop(g, atomicLoad(ptrOf(gcSwTab)), atomicLoad(ptrOf(gcSwN)))
+  let _ = atomicAdd(ptrOf(gcSwIn), 0 - 1)
+}
+
+// One class's close-out, once all its spans are applied: `gcWalkClass`'s
+// tail, unchanged.
+@nosplit fn gcSwFlushClass(g: *i64, cls: int, freed: int) {
+  if (freed <= 0) {
+    return
+  }
+  *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) - freed
+  *(g + gcStTotalFreed) = *(g + gcStTotalFreed) + freed
+  gcReclaimClassLocked(g, cls)
+}
+
+// Step 5: every span's class and heap accounting, in table order, then each
+// class's counters and reclaim once its last span is in (I6). Returns the
+// objects freed. Entries are class-contiguous, so a class ends where the next
+// entry's class differs.
+@nosplit fn gcSwApply(g: *i64, n: int): int {
+  let total = 0
+  let run = 0
+  let i = 0
+  while (i < n) { // bounded: n entries
+    let e = wordAt(gcSwTab + i * gcSwEntryBytes)
+    let cls = *(e + 1)
+    heapGiveSpanRunLocked(heapBlock(g), *e, cls, *(e + 2), *(e + 3))
+    run = run + *(e + 2)
+    if (i + 1 == n || *(e + gcSwWords + 1) != cls) {
+      gcSwFlushClass(g, cls, run)
+      total = total + run
+      run = 0
+    }
+    i = i + 1
+  }
+  return total
+}
+
+// The small-object half of `sweep`: every span swept by the coordinator and
+// whichever gang helpers join. CALLER HOLDS `heapLock(g)`. Returns the
+// objects freed, as `gcWalkSmall(g, gcWalkSweep)` would.
+@nosplit fn gcSweepSmall(g: *i64): int {
+  if (!atomicCmpxchg(ptrOf(gcSwOwner), 0, 1)) {
+    return gcWalkSmall(g, gcWalkSweep)
+  }
+  let n = gcSwFill(g)
+  if (n < 0) {
+    atomicStore(ptrOf(gcSwOwner), 0)
+    return gcWalkSmall(g, gcWalkSweep)
+  }
+  atomicStore(ptrOf(gcSwNext), 0)
+  atomicStore(ptrOf(gcSwN), n)
+  atomicStore(ptrOf(gcSwOpen), int(g))
+  worldGangKick(g)
+  gcSwClaimLoop(g, gcSwTab, n)
+  atomicStore(ptrOf(gcSwOpen), 0)
+  worldDrainOrDie(ptrOf(gcSwIn))
+  let freed = gcSwApply(g, n)
+  atomicStore(ptrOf(gcSwOwner), 0)
+  return freed
+}
