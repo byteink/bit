@@ -126,6 +126,47 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
 // replaced the yield with a blocking wait on `worldStopWord` itself
 // (`worldWaitForStop` below, `./gcstopwait.bit`) and was accepted on cycles
 // rather than on instructions.
+// The helper-gang join attempt (#5837), one turn of `worldResumeWhenClear`'s
+// own wait loop. `m` is that thread's own `wMut(world, slot)`, already in the
+// caller's hands.
+//
+// GATED ON THE EPOCH, NOT ON "OPEN" ALONE. A gang open for an epoch this slot
+// has not acknowledged is not one it may join — the same reason
+// `worldMustStayPut` compares `muAcked` to `worldEpochWord` rather than
+// trusting a bare stop flag: a straggler still parked FOR an older stop must
+// not be counted into (or, here, do work for) a newer one it was never
+// admitted to.
+//
+// THE RE-CHECK AFTER THE ADD IS WHAT #5837 MEANS BY "HANDLE A HELPER THAT
+// RACES THE CLOSE". `worldGangClose` stores 0 into `worldGangWord` BEFORE it
+// waits for `worldGangIn` to drain, so a helper that read the OLD epoch and
+// is about to `atomicAdd(worldGangIn, +1)` can land after that close store.
+// Without the second load below, such a helper would be counted into
+// `worldGangIn` AFTER the coordinator already observed 0 there and moved on
+// to `worldRestart` — exactly the race the drain wait exists to prevent. The
+// second load closes it: seq_cst orders the add-then-load here against the
+// coordinator's store-then-load in `worldGangClose` the same way every other
+// Dekker pair in this file does, so a helper that still sees the old epoch
+// here is guaranteed the coordinator's own wait has not yet returned.
+@nosplit fn worldGangTryHelp(world: *i64, m: *i64) {
+  let e = atomicLoad(world + worldGangWord)
+  if (e == 0 || e != atomicLoad(m + muAcked)) {
+    return
+  }
+  let _ = atomicAdd(world + worldGangIn, 1)
+  if (atomicLoad(world + worldGangWord) != e) {
+    // Lost the race with the close: undo the add and go back to waiting
+    // rather than call into a collector block the coordinator may already be
+    // past. `gcGangHelp` never ran, so there is nothing else to unwind.
+    let _ = atomicAdd(world + worldGangIn, 0 - 1)
+    return
+  }
+  // #5837: counts the join only. `g` is the collector block the coordinator
+  // published in `worldGangOpen`, below, before it opened the gang for `e`.
+  gcGangHelp(wordAt(atomicLoad(ptrOf(gcGangBlock))))
+  let _ = atomicAdd(world + worldGangIn, 0 - 1)
+}
+
 @nosplit fn worldResumeWhenClear(world: *i64, slot: int, waiting: int) {
   let m = wMut(world, slot)
   let outer = 0
@@ -160,6 +201,15 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
     while (spins < stwParkBound) {
       if (!worldMustStayPut(world, slot, waiting)) {
         break
+      }
+      // #5837: only a `parked` slot has an ack to match a gang epoch against
+      // — `blocked`/`syscall` pass without one (see `worldMustStayPut`'s own
+      // header) and so can never legally join. Tried every turn, including
+      // during the busy-spin burst above the sleep, so a mutator that parks
+      // into an already-open gang helps at once rather than waiting out a
+      // full burst first.
+      if (waiting == mParked) {
+        worldGangTryHelp(world, m)
       }
       spins = spins + 1
       if (spins >= stwSpinBurst) {
@@ -445,5 +495,82 @@ export @nosplit @symbol("bit_rt_port_gc_world_restart") fn worldRestart(world: *
     return
   }
   let _ = bit_rt_port_gc_world_stop_wake(world + worldStopWord)
+}
+
+// ---------------------------------------------------------------------------
+// The helper gang (#5837) — `World.gangOpen` / `gangClose`
+// ---------------------------------------------------------------------------
+
+// The collector block the currently open gang belongs to — plain module
+// state (like `worldBlock`/`worldReady`/`mutHintSlot`, ./gcworldsync.bit,
+// #2184: `@nosplit` may take an address of module state, so there is no need
+// to thread this through the World block itself). Published by `worldGangOpen`
+// as a seq_cst store BEFORE the epoch it gates on, and read by
+// `worldGangTryHelp` only after that epoch's own seq_cst load confirms the
+// gang is open — the same store-then-load order every publish/consume pair in
+// this file uses, so a helper that observes the open epoch is guaranteed to
+// observe THIS write, never a stale or torn one.
+let gcGangBlock: i64 = 0
+
+// Open the helper gang for the collection `stwRetryRendezvous` just won
+// (`../stw/stwpoll.bit`'s `stwPollOn`, called only once rendezvous succeeds).
+// `g` is the collector block `gcGangHelp` (../gc/gccollect.bit) will read.
+//
+// STORING 2 INTO `worldStopWord`, NOT LEAVING IT AT 1, is deliberate and is
+// what #5837 means by keeping every reader of that word honest: every
+// existing reader (`worldMustStayPut`, `worldStopRequested`, `stwPollNeeded`,
+// `stwPollOn`'s inlined mirror) tests `!= 0`, never `== 1`, so a gang-open
+// stop is stopped exactly as a plain one is. The distinct value only matters
+// to `worldWaitForStop`'s blocking wait: a thread mid-way into that call reads
+// the word BEFORE it sleeps and passes what it read as the kernel's own
+// compare-and-wait value, so a value that visibly changed underneath it
+// (rather than being restored to the same 1 a plain restart-then-restop could
+// produce, see that function's own header) can never be mistaken for the
+// stop this thread already knows about.
+export @nosplit @symbol("bit_rt_port_gc_world_gang_open") fn worldGangOpen(world: *i64, g: int) {
+  atomicStore(ptrOf(gcGangBlock), g)
+  let e = atomicLoad(world + worldEpochWord)
+  atomicStore(world + worldGangWord, e)
+  atomicStore(world + worldStopWord, 2)
+  let _ = bit_rt_port_gc_world_stop_wake(world + worldStopWord)
+}
+
+// Close the helper gang and wait for every joined helper to leave, before the
+// caller (`../stw/stwstats.bit`'s `stwFinishPause`) calls `worldRestart`.
+//
+// SAFE TO CALL UNCONDITIONALLY, including when the gang was never opened (an
+// abandoned rendezvous never calls `worldGangOpen` at all): storing 0 into an
+// already-0 `worldGangWord` is a no-op, and `worldGangIn` is then already 0,
+// so the wait below returns on its very first check. No special case for
+// "nothing to close" — deleting that case rather than adding a guard for it.
+//
+// BOUNDED, same budget and pulse as `worldRendezvous`'s own spin (deviation 6,
+// ./gcworld.bit): this only waits for helpers that ALREADY joined to leave,
+// and `worldGangTryHelp` leaves unconditionally on every path, so under any
+// sound run this resolves within the first handful of checks. Give-up is
+// counted, never panicked or looped forever (Power-of-10 rule 2) — the same
+// "runtime bug, not a hang" signal `worldStatResumeGiveUp` gives a different
+// wait.
+let worldGangDrainGiveUp: i64 = 0
+
+export @nosplit @symbol("bit_rt_port_gc_world_gang_close") fn worldGangClose(world: *i64) {
+  atomicStore(world + worldGangWord, 0)
+  let spins = 0
+  while (spins < stwSpinBound) {
+    if (atomicLoad(world + worldGangIn) == 0) {
+      return
+    }
+    spins = spins + 1
+    if (spins % stwSpinBurst == 0) {
+      worldYield()
+    }
+  }
+  let _ = atomicAdd(ptrOf(worldGangDrainGiveUp), 1)
+}
+
+// The give-up count above, so a test can assert it stayed 0 — the same
+// exposure `worldResumeGiveUp` gives its own counter.
+export @nosplit @symbol("bit_rt_port_gc_world_gang_drain_giveup") fn worldGangDrainGiveUpCount(): int {
+  return atomicLoad(ptrOf(worldGangDrainGiveUp))
 }
 
