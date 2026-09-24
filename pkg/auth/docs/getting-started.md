@@ -32,7 +32,15 @@ every authentication method in this package implements: a `name()` and an
 
 ```bit
 import { App, Config, MemoryStore, unauthorized } from "web"
-import { Identity, Lookup, LookupResult, Strategy, currentIdentity, newPasswordStrategy, requireAuth } from "auth"
+import {
+  Identity,
+  Lookup,
+  LookupResult,
+  Strategy,
+  currentIdentity,
+  newPasswordStrategy,
+  requireAuth,
+} from "auth"
 import { Json } from "std/json"
 
 fn users(username: string): LookupResult! {
