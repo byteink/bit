@@ -2118,9 +2118,11 @@ acknowledged, it increments `worldGangIn`, RE-CHECKS the gang is still open
 that store is visible) and wait for `worldGangIn` to read 0 — safe to call
 even when the gang was never opened, since an unopened gang closes on its very
 first check. The wait never gives up and proceeds: every helper region is
-bounded work, so a drain still unfinished after 10 s is `bit_rt_fatal`
-(`worldDrainOrDie`), because restarting with a helper inside is heap
-corruption once helpers sweep (#5838).
+bounded work, so a drain the coordinator has watched for 10 s is
+`bit_rt_fatal` (`worldDrainOrDie`), because restarting with a helper inside is
+heap corruption once helpers sweep (#5838). Only time the coordinator itself
+observed counts, each check capped at 50 ms, so a whole-process stop
+(SIGSTOP, a debugger, a paused VM) is never charged to the helper.
 
 **The sweep phase (#5838).** Under `heapLock`, the coordinator fills a side
 table with every small-class span, publishes it (`gcSwOpen = g`,
