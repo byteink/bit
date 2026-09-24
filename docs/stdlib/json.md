@@ -782,6 +782,14 @@ the root value itself), and `expected`/`found`, which are filled for
 cause, so a caller that only logs still gets the field. Reach the fields with
 a type assertion on the caught `error`: `e.(JsonDecodeError)`.
 
+### `JsonDecodeError.message`
+
+The same sentence the `error` interface reports, callable on the narrowed
+value too, so a handler that has already asserted `e.(JsonDecodeError)` to
+branch on `cause` can still log the full text without keeping `e` around:
+`"json: missing key 'id'"`, or `the root value` in place of the quoted path
+when `path` is `""`.
+
 ### `jsonMaxDecodeDepth`
 
 How deep a decode may recurse -- 128 -- before it fails with `MaxDepth`
