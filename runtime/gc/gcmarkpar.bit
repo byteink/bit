@@ -26,7 +26,15 @@
 // scans from it, and pushes the children it wins with `hdrTryMark` (./gc.bit)
 // onto it. A full local goes onto the global list in exchange for a free one
 // (`gcMkSwap`); an empty one goes back to the free list in exchange for a
-// full one (`gcMkRefill`).
+// full one (`gcMkRefill`). The roots are seeded across up to `gcMkSeedSegs`
+// segments (#5853), so the members start on different roots at once.
+//
+// AN IDLE HELPER SPINS BRIEFLY, THEN LEAVES (#5853). It polls for
+// `gcMkHelperIdleSpins` turns, leaves (`gcMkLeave`), and returns to its park
+// loop, which sleeps on `worldStopWord` until the next kick or
+// `stwWaitTimeoutUs`. While the phase it left is open it rejoins only when
+// the list holds work (`gcMkRejoin`), so a helper past its park loop's burst
+// does not cycle through the lock.
 //
 // ---------------------------------------------------------------------------
 // INVARIANTS, AND WHERE EACH IS ENFORCED
@@ -66,6 +74,8 @@
 //     segments, and `gcStackLen <= gcMaxMarkStack` (./gc.bit). A push that
 //     finds no free segment drops the child it just marked and sets
 //     `gcOverflow`: today's overflow contract, answered by today's rescan.
+//     Seeding takes min(`gcMkSeedSegs`, budget) segments, or whole ones when
+//     the roots need more (`gcMkSeedChunk`), so it stays within the budget.
 //
 // THE POOL is a side mapping (`memMapPages`), never GC heap, mapped once and
 // reused by every collection. If it cannot be taken (another heap is marking,
@@ -78,12 +88,19 @@ const gcMkSegMax = 4096   // gcMaxMarkStack / gcMkSegEntries
 
 // Member context: one per slot plus the coordinator's (index 0), padded to a
 // 128-byte line so two members never share one. Words: local segment base (0
-// when none), entries in it, bad offsets counted, the collector block.
+// when none), entries in it, bad offsets counted, the collector block, and
+// the last phase (`gcMkPhase`) this helper left idle.
 const gcMkCtxBytes = 128
 const gcMkCtxSeg = 0
 const gcMkCtxN = 1
 const gcMkCtxBad = 2
 const gcMkCtxG = 3
+const gcMkCtxLeft = 4
+
+// The roots are cut into at most this many segments (`gcMkSeed`), so every
+// member can start on a root of its own instead of waiting for the one member
+// holding them all to fill and publish a local.
+const gcMkSeedSegs = 16
 
 // Side-mapping layout: segments, the global list (base, count per entry),
 // the free list (base per entry), then the member contexts.
@@ -92,9 +109,10 @@ const gcMkFreeOff = 8454144  // gcMkFullOff + gcMkSegMax * 16
 const gcMkCtxOff = 8486912   // gcMkFreeOff + gcMkSegMax * 8
 const gcMkMapBytes = 8519808 // gcMkCtxOff + (maxMutators + 1) * gcMkCtxBytes
 
-// Idle turns a helper spins before it leaves (`gcMkLeave`). It is back on the
-// next turn of its park loop (`worldGangTryHelp`) while the phase is open.
-const gcMkHelperIdleSpins = 64000
+// Idle turns a helper spins before it leaves (`gcMkLeave`) and sleeps in its
+// park loop. Covers a busy member's next swap; the tail of a phase is longer
+// and is slept through (#5853, was 64000).
+const gcMkHelperIdleSpins = 2000
 
 let gcMkBase: i64 = 0   // the side mapping, 0 until first use
 let gcMkLock: i32 = 0   // M2
@@ -107,6 +125,7 @@ let gcMkFull: i64 = 0   // entries on the global list (M2)
 let gcMkFree: i64 = 0   // entries on the free list (M2)
 let gcMkDone: i64 = 0   // 1 once termination is decided (M3)
 let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
+let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
 
 @nosplit fn gcMkCtx(k: int): *i64 {
   return wordAt(gcMkBase + gcMkCtxOff + k * gcMkCtxBytes)
@@ -129,7 +148,8 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
   return gcMkBase != 0
 }
 
-// Point a member context at `g` with no segment.
+// Point a member context at `g` with no segment. `gcMkCtxLeft` survives: it
+// names the phase, not the join.
 @nosplit fn gcMkCtxReset(c: *i64, g: *i64) {
   *(c + gcMkCtxSeg) = 0
   *(c + gcMkCtxN) = 0
@@ -137,12 +157,12 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
   *(c + gcMkCtxG) = int(g)
 }
 
-// Move up to one segment's worth of LIFO entries from index `start` into `seg`;
-// returns how many.
-@nosplit fn gcMkCopyIn(g: *i64, seg: int, start: int): int {
+// Move up to `k` (<= `gcMkSegEntries`) LIFO entries from index `start` into
+// `seg`; returns how many.
+@nosplit fn gcMkCopyIn(g: *i64, seg: int, start: int, k: int): int {
   let n = *(g + gcStackTop) - start
-  if (n > gcMkSegEntries) {
-    n = gcMkSegEntries
+  if (n > k) {
+    n = k
   }
   let src = *(g + gcStackAddr) + start * 8
   let i = 0
@@ -153,14 +173,38 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
   return n
 }
 
+// Entries per seeded segment for `top` roots and a budget of `segs` segments:
+// enough for at most min(`gcMkSeedSegs`, `segs`) segments, and never more
+// than one segment holds. Either way ceil(top / result) <= segs, because
+// top <= segs * `gcMkSegEntries` (M8).
+@nosplit fn gcMkSeedChunk(top: int, segs: int): int {
+  let want = gcMkSeedSegs
+  if (want > segs) {
+    want = segs
+  }
+  if (want < 1) {
+    return gcMkSegEntries // no budget: gcMkSeed's own check reports it
+  }
+  let k = (top + want - 1) / want
+  if (k > gcMkSegEntries) {
+    return gcMkSegEntries
+  }
+  if (k < 1) {
+    return 1
+  }
+  return k
+}
+
 // Step 1: the budget is `gcStackLen` in whole segments (M8), the roots are
-// cut into segments on the global list, and the rest go on the free list.
+// cut into up to `gcMkSeedSegs` segments on the global list, and the rest go
+// on the free list.
 // CALLER HOLDS THE POOL (`gcMkOwner`); no helper can be in the phase yet.
 @nosplit fn gcMkSeed(g: *i64) {
   let segs = (*(g + gcStackLen) + gcMkSegEntries - 1) / gcMkSegEntries
   if (segs > gcMkSegMax) {
     segs = gcMkSegMax
   }
+  let chunk = gcMkSeedChunk(*(g + gcStackTop), segs)
   gcMkFull = 0
   gcMkFree = 0
   let taken = 0
@@ -168,7 +212,7 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
   while (k < segs) { // bounded: segs <= gcMkSegMax
     let seg = gcMkBase + k * gcMkSegBytes
     if (taken < *(g + gcStackTop)) {
-      let n = gcMkCopyIn(g, seg, taken)
+      let n = gcMkCopyIn(g, seg, taken, chunk)
       let e = gcMkFullAt(gcMkFull)
       *e = seg
       *(e + 1) = n
@@ -185,6 +229,7 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
     worldHelperFatal() // M8 broken: a root did not fit the budget
   }
   *(g + gcStackTop) = 0
+  atomicStore(ptrOf(gcMkPhase), gcMkPhase + 1)
   gcMkJoined = 1
   gcMkIdle = 0
   atomicStore(ptrOf(gcMkBad), 0)
@@ -352,8 +397,10 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
 }
 
 // An idle helper leaves: off both counts at once, so M4 holds (it held no
-// segment, being idle). A no-op once termination is decided.
-@nosplit fn gcMkLeave() {
+// segment, being idle). A no-op once termination is decided. `c` records the
+// phase it left, for `gcMkRejoin`.
+@nosplit fn gcMkLeave(c: *i64) {
+  *(c + gcMkCtxLeft) = atomicLoad(ptrOf(gcMkPhase))
   spinAcquire(ptrOf(gcMkLock))
   if (atomicLoad(ptrOf(gcMkDone)) == 0) {
     gcMkIdle = gcMkIdle - 1
@@ -376,7 +423,7 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
       worldYield()
     }
   }
-  gcMkLeave()
+  gcMkLeave(c)
   return false
 }
 
@@ -425,6 +472,16 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
   worldHelperFatal() // M1 broken: more segments than objects
 }
 
+// Whether the helper with context `c` should join the open phase: always the
+// first time, and after leaving it idle only once the list holds work. A
+// hint; `gcMkJoin` and `gcMkRefill` decide under the lock.
+@nosplit fn gcMkRejoin(c: *i64): bool {
+  if (*(c + gcMkCtxLeft) != atomicLoad(ptrOf(gcMkPhase))) {
+    return true
+  }
+  return atomicLoad(ptrOf(gcMkFull)) > 0
+}
+
 // A late joiner enters under the lock, and not at all once termination is
 // decided (M4).
 @nosplit fn gcMkJoin(): bool {
@@ -449,7 +506,7 @@ let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
     let _ = atomicAdd(ptrOf(gcMkIn), 0 - 1)
     return
   }
-  if (slot >= 0 && slot < maxMutators && gcMkJoin()) {
+  if (slot >= 0 && slot < maxMutators && gcMkRejoin(gcMkCtx(slot + 1)) && gcMkJoin()) {
     let c = gcMkCtx(slot + 1)
     gcMkCtxReset(c, g)
     gcMkWork(c, true)
