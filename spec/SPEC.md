@@ -1995,7 +1995,8 @@ syscall(nr, a0, a1, a2, a3, a4, a5)
 - **Syscall numbers are per-architecture** and are not part of this
   specification. Bit has no arch-conditional compilation, so a program that
   targets both architectures selects the number itself at run time (see
-  `hostTarget()`).
+  `hostTarget()`). The runtime selects it with `onX64()`, which the compiler
+  folds to a constant (§11.9).
 - A `syscall` is never dropped, hoisted, or deduplicated, even when its result
   is unused: its effect belongs to the kernel, outside the compiler's view.
 - Pointer arguments are ordinary integers here. A raw pointer (§11.4) reaches
@@ -2076,6 +2077,18 @@ platform's convention for a C symbol (Mach-O prefixes a leading underscore, so
 `@symbol("bit_rt_alloc")` appears as `_bit_rt_alloc`). As with any function, an
 executable's linker still dead-strips a definition nothing references; what is
 pinned is the name, not its retention.
+
+**The architecture test is folded.** A call to the pinned
+`bit_rt_port_syscalls_on_x64` - the runtime's `onX64(): bool` in
+`runtime/syscalls` - is replaced by the constant the build target gives it:
+`true` on `x86_64-linux` and `x86_64-windows`, `false` on `aarch64-linux` and
+`aarch64-macos`. The target decides the answer exactly as it decides which arm
+of an `asm` block (§11.6) is emitted, so the call, the compare and the untaken
+arm of `if (onX64())` are all removed before code generation. The definition's
+own body answers identically, and is what runs for a caller the fold does not
+reach: a runtime built by a compiler that predates the fold, or code linking
+the symbol from outside Bit. A root-module function merely spelled
+`bit_rt_port_syscalls_on_x64`, without the pin, is an ordinary call.
 
 ### 11.10 Function Entry Address (unmanaged subset)
 

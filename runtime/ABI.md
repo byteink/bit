@@ -4049,7 +4049,10 @@ Cryptographic Extension instructions (AESE/AESMC/AESD/AESIMC), so one source
 file is compiled once per TARGET (x86_64-linux, aarch64-linux, aarch64-macos)
 the same way `runtime/syscalls/syscalls.bit` already is. Every exported
 function starts `if (onX64())`, which must COMPILE on x86_64 since Bit has no
-arch-conditional compilation (SPEC §11.8) — but reaching it there panics
+arch-conditional compilation (SPEC §11.8). A compiler with the `onX64()` fold
+(SPEC §11.9) deletes the untaken arm from each target's object; the pinned
+stage0 predates it, so an archive it builds keeps both. Reaching the arm on
+x86_64 panics
 rather than silently returning: nothing may legitimately call these
 pins on x86_64, so a call that gets there is the bug, and a silent no-op left
 the caller's buffer unmodified with no error, the worst failure mode a crypto
