@@ -1,0 +1,186 @@
+// stdlib/http/transport.bit — the byte stream a message is read from and
+// written to. Split out of http.bit (#5860) to stay under the 800-line
+// ceiling; a pure move, no behavior change. `Conn` (std/net), `TlsConn`
+// (std/tls) and `newBuilder` (std/strings) are http.bit's own imports,
+// already module-wide (SPEC §19) — a second import of any of them here
+// would be E0042.
+
+// ---------------------------------------------------------------------------
+// Transport: the byte stream a message is read from and written to
+// ---------------------------------------------------------------------------
+
+// The transport an HTTP/1.1 exchange runs over: read up to `n` bytes (empty at
+// end of stream), write a whole string, and close. `netStream` wraps a cleartext
+// std/net socket; `tlsStream` wraps a std/tls connection. The wire logic
+// (`readMessage`, `serializeResponse`, `readAllStream`) speaks only this
+// interface, so http:// and https:// share one code path and differ only in which
+// stream they carry. `forceClose` is `shutdown`'s (server.bit, #3963) hook to
+// interrupt whichever green thread is currently parked reading this stream —
+// unlike `shut`, which just releases the fd, this is a real state transition the
+// parked read observes as an orderly EOF (`net.Conn.shutdown`'s doc comment has
+// the full mechanism); calling it never blocks and is safe from a different
+// green thread than the one doing the reading.
+// `peer` is the connected client's IPv4 address in dotted quad, or `""` when
+// there is none to read (see `Request.peer`). It is deliberately NOT fallible:
+// a peer address is metadata, and a socket that cannot name its peer — the
+// connection died, or it is a test double with no fd — must not turn into a
+// failed request. Every implementation answers `""` in that case.
+// `unread` puts `extra` back in front of whatever this stream returns next —
+// the mechanism that keeps a persistent connection's pipelined bytes (the
+// start of the NEXT request, already delivered in the same read as the
+// current message's end) from being discarded by a framing function that
+// only wanted a prefix of what it read (#5419: `readRequestContentLengthBody`,
+// `decodeChunkedBody`, `readRequestBody`, message.bit). `setIdleDeadline`
+// bounds the NEXT `readUp` (and everything read to complete the message it
+// starts) by an absolute `std/time.monotonic().ns` deadline, 0 clearing it —
+// the mechanism `serveOne` (server.bit) uses to close a connection that goes
+// idle between requests.
+interface byteStream {
+  readUp(n: int): string!,
+  writeStr(s: string): ()!,
+  shut(),
+  forceClose(),
+  peer(): string,
+  unread(extra: string),
+  setIdleDeadline(deadlineNs: int),
+}
+
+// A cleartext transport over a std/net TCP connection. `conn.deadline() != 0`
+// (set by `dialDeadline`/`setDeadline`, #2291) routes through the
+// deadline-bound siblings; the zero value — every `dial()`-made `Conn` — takes
+// the exact call it always has, so a caller with no timeout sees no change.
+class netStream {
+  conn: Conn
+  // Bytes `unread` pushed back, served before the next real socket read
+  // (#5419). "" the whole life of a one-shot connection — only a keep-alive
+  // loop that pipelines ever sets it.
+  pending: string
+  // The deadline-read scratch buffer, reused across every request on this
+  // connection instead of the fresh `[]byte(4096)` `Conn.readDeadline` would
+  // allocate per call (#5850, #5857: 26.3% of the bytes moved per plaintext
+  // request). Zero value `[]byte(0)` — nothing under `stdlib/net` allocates
+  // until the first deadline-armed read actually happens. NEVER handed to a
+  // caller or captured past the `readDeadlineInto` call below: `readUp`
+  // converts the read bytes to a fresh `string` before returning, and a
+  // `string` copies out of `rbuf` rather than aliasing it, so nothing keeps a
+  // slice of it alive across the next read that overwrites it.
+  rbuf: []byte
+  readUp(n: int): string! {
+    if (len(this.pending) > 0) {
+      if (len(this.pending) <= n) {
+        let out = this.pending
+        this.pending = ""
+        return out
+      }
+      let out = this.pending[0:n]
+      this.pending = this.pending[n:len(this.pending)]
+      return out
+    }
+    if (this.conn.deadline() != 0) {
+      if (len(this.rbuf) == 0) {
+        this.rbuf = []byte(4096)
+      }
+      let want = n
+      if (want > len(this.rbuf)) {
+        want = len(this.rbuf)
+      }
+      let got = this.conn.readDeadlineInto(this.rbuf, want)?
+      if (got == 0) {
+        return ""
+      }
+      return string(this.rbuf[0:got])
+    }
+    return this.conn.read(n)
+  }
+
+  writeStr(data: string): ()! {
+    if (this.conn.deadline() != 0) {
+      this.conn.writeDeadline(data)?
+      return
+    }
+    this.conn.write(data)?
+  }
+
+  shut() { this.conn.close() }
+
+  forceClose() { this.conn.shutdown() }
+
+  peer(): string { return this.conn.peerIp() catch "" }
+
+  unread(extra: string) { this.pending = extra + this.pending }
+
+  setIdleDeadline(deadlineNs: int) { this.conn.setDeadline(deadlineNs) }
+}
+// A TLS transport over a std/tls connection; strings cross the byte-oriented
+// record API as raw bytes, no reinterpretation.
+class tlsStream {
+  conn: TlsConn
+  // See `netStream.pending`.
+  pending: string
+  readUp(n: int): string! {
+    if (len(this.pending) > 0) {
+      if (len(this.pending) <= n) {
+        let out = this.pending
+        this.pending = ""
+        return out
+      }
+      let out = this.pending[0:n]
+      this.pending = this.pending[n:len(this.pending)]
+      return out
+    }
+    return string(this.conn.read(n)?)
+  }
+
+  writeStr(data: string): ()! { this.conn.write([]byte(data))? }
+
+  shut() { this.conn.close() }
+
+  forceClose() { this.conn.shutdown() }
+
+  peer(): string { return this.conn.peerIp() catch "" }
+
+  unread(extra: string) { this.pending = extra + this.pending }
+
+  // No-op: `TlsConn` (std/tls) exposes no setter for the deadline an
+  // accept()-side connection reads under — only `dialDeadline` sets one, on
+  // the client side. A TLS server connection therefore persists across
+  // requests (`maxRequests` still caps it) with no idle timeout; closing that
+  // gap needs a `TlsConn.setDeadline` in std/tls, out of this file's scope
+  // (#5419's ticket names stdlib/http/http.bit, stdlib/http/server.bit,
+  // pkg/web/adapter.bit only).
+  setIdleDeadline(deadlineNs: int) {}
+}
+// Read `s` to end of stream (an empty read) onto `buffered` — the body-position
+// bytes that already arrived with the headers — and no further than
+// `maxBodyBytes` (#4585). Only safe against a peer that closes —
+// `Connection: close` guarantees it here.
+//
+// Read-to-EOF is RFC 9112 §6.3's case-7 framing: there is no declared length
+// to refuse in advance, so the budget is enforced as the bytes accumulate, on
+// the read that would cross it, the way `decodeChunkedBody` enforces it on
+// chunk sizes. `buffered` goes through the same check, because bytes that
+// arrived early are still body bytes. Written as a subtraction, not
+// `total + len(piece) > maxBodyBytes`: `total` is never above `maxBodyBytes`
+// (this check is what keeps it there), so the left side cannot overflow,
+// while the addition can for a length near the top of the range and would
+// then compare as negative — i.e. the obvious spelling is a bypass.
+//
+// The budget is also what bounds this loop: every iteration past the first
+// adds at least one byte to `total` (an empty read returns), and `total` can
+// never exceed `maxBodyBytes`, so the iteration count is bounded by it.
+fn readAllStream(s: byteStream, buffered: string, maxBodyBytes: int): string! {
+  let out = newBuilder()
+  let total = 0
+  let piece = buffered
+  while (true) {
+    if (len(piece) > maxBodyBytes - total) {
+      fail newError("readResponse: body exceeds ${maxBodyBytes} bytes")
+    }
+    out.write(piece)
+    total = total + len(piece)
+    piece = s.readUp(65536)?
+    if (len(piece) == 0) {
+      return out.toString()
+    }
+  }
+}
