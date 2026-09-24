@@ -21,7 +21,15 @@ needs to know which one ran.
 
 ```bit
 import { App, Config, MemoryStore, unauthorized } from "web"
-import { Identity, Lookup, LookupResult, Strategy, currentIdentity, newPasswordStrategy, requireAuth } from "auth"
+import {
+  Identity,
+  Lookup,
+  LookupResult,
+  Strategy,
+  currentIdentity,
+  newPasswordStrategy,
+  requireAuth,
+} from "auth"
 import { Json } from "std/json"
 
 fn users(username: string): LookupResult! {
