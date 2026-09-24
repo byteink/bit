@@ -3286,8 +3286,10 @@ MapTable {
 ```
 
 A table's `cap`/`keys`/`vals` are written once, before a release store
-publishes it into `tbl`, and never after; every operation acquires `tbl` once
-and indexes only that table (#5796, `runtime/root/maptable.bit`). `map_info`'s
+publishes it into `tbl`, and never after; every operation loads `tbl` once and
+indexes only that table (#5796, `runtime/root/maptable.bit`). That load is
+plain: every later read takes its address from it, and both targets order an
+address-dependent load after the load it depends on. `map_info`'s
 pointer map is `{0}`; `map_tbl_info`'s is `{8, 16}` with a declared size of 24,
 so the inline ctrl bytes past it are untraced. The two buffer bases are traced
 as references. The `keys`/`vals` buffers use `ref_array_info` (every word traced)
