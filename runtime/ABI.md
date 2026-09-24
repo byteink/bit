@@ -2380,7 +2380,7 @@ defined exactly once).
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
 | `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
 | `bit_rt_map_has`      | `(m: ?*MapHeader, key: u64) -> bool` (§15)              |
-| `bit_rt_map_slot`     | `(m: ?*MapHeader, key: u64) -> i64` (§15, the key's slot or `-1`) |
+| `bit_rt_map_slot`     | `(m: ?*MapHeader, key: u64) -> i64` (§15, a hit token `>= 0` for `map_val_at`, or `-1`) |
 | `bit_rt_map_delete`   | `(m: ?*MapHeader, key: u64) -> void` (§15)              |
 | `bit_rt_map_len`      | `(m: ?*MapHeader) -> i64` (§15)                         |
 | `bit_rt_map_iter_init`| `(m: ?*MapHeader) -> i64` (§15)                         |
@@ -3264,24 +3264,35 @@ other green threads on other workers keep running.
 
 ## 15. Maps (`runtime/root`)
 
-`map<K,V>` (SPEC §11.2, §13.5) is a `MapHeader` GC object over three parallel
-`cap`-slot buffers — an open-addressing hash table with linear probing.
+`map<K,V>` (SPEC §11.2, §13.5) is a `MapHeader` GC object naming ONE slot
+table — an open-addressing hash table with linear probing. Compiled code never
+reads either layout; it calls the entry points below.
 
 ```
 MapHeader {
-  keys: [*]u64          // +0   slot keys   (ref-array iff key_is_string) — traced
-  vals: [*]u64          // +8   slot values (ref-array iff val_is_ref)    — traced
-  ctrl: [*]u8           // +16  per-slot state: 0 EMPTY / 1 FULL / 2 TOMB — traced base
-  len:  usize           // +24  live entries
-  cap:  usize           // +32  slot count (power of two, >= 8)
-  used: usize           // +40  FULL + TOMB (drives growth)
-  key_desc: usize       // +48  0 scalar / 1 string / else a descriptor (§15.1)
-  val_is_ref:    usize  // +56
+  tbl:  *MapTable       // +0   the current table — traced; replaced whole by a grow
+  len:  usize           // +8   live entries
+  used: usize           // +16  FULL + TOMB (drives growth)
+  key_desc: usize       // +24  0 scalar / 1 string / else a descriptor (§15.1)
+  val_is_ref:    usize  // +32
+}
+
+MapTable {
+  cap:  usize           // +0   slot count (power of two, >= 8)
+  keys: [*]u64          // +8   slot keys   (ref-array iff key_desc != 0) — traced
+  vals: [*]u64          // +16  slot values (ref-array iff val_is_ref)    — traced
+  ctrl: [cap]u8         // +24  per-slot state, inline: 0 EMPTY / 1 TOMB / 128|tag FULL
 }
 ```
 
-`map_info`'s pointer map is `{0, 8, 16}`: the three buffer bases are traced as
-references. The `keys`/`vals` buffers use `ref_array_info` (every word traced)
+A table's `cap`/`keys`/`vals` are written once, before a release store
+publishes it into `tbl`, and never after; every operation loads `tbl` once and
+indexes only that table (#5796, `runtime/root/maptable.bit`). That load is
+plain: every later read takes its address from it, and both targets order an
+address-dependent load after the load it depends on. `map_info`'s
+pointer map is `{0}`; `map_tbl_info`'s is `{8, 16}` with a declared size of 24,
+so the inline ctrl bytes past it are untraced. The two buffer bases are traced
+as references. The `keys`/`vals` buffers use `ref_array_info` (every word traced)
 exactly when their flag is set — for `keys` that is `key_desc != 0`, i.e. every
 reference key type, `string` and composite alike. The `ctrl` buffer is always a
 leaf; tracing its base only keeps it alive. Empty, tombstoned, and unused slots
@@ -3312,13 +3323,20 @@ the handle of a string CONSTANT, which is static for the life of the process.
 - **Nil.** Reads on a nil map (`?*MapHeader == null`) yield the zero word /
   `false` / `0`; `map_set` on a nil map is fatal (SPEC §11.2, Go semantics).
 - **Two-result read** (`let (v, ok) = m[k]`, §12.6) is ONE probe: `map_slot`
-  returns the key's slot or `-1`, `ok` is `slot >= 0`, and `map_val_at` reads the
-  value word (yielding `0` for the `-1`). It used to be `map_get` + `map_has` —
-  two probes of the same key for one expression.
+  returns a non-negative TOKEN on a hit or `-1`, `ok` is `slot >= 0`, and
+  `map_val_at` reads the value word (yielding `0` for the `-1`). It used to be
+  `map_get` + `map_has` — two probes of the same key for one expression. The
+  token is `2^62` plus the address of the value word in the table the probe
+  used, not an index, so a grow between the two calls cannot hand back another
+  key's value (#5796). It is valid only for the `map_val_at` codegen emits
+  immediately after it, under the adjacency contract (§5.1): with no poll
+  between the calls no collection can free that table.
 - **Iteration** (`for (k, v) of m`, §13.5) is by slot cursor: `map_iter_init`
   returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
   then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
   protocol assumes no concurrent mutation (a resize would invalidate the cursor).
+  An iteration slot is a plain index, below `2^62`, into the current table;
+  `map_key_at`/`map_val_at` read an index that table does not have as `0`.
 
 ### 15.1 Composite values — descriptor programs
 
