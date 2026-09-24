@@ -205,6 +205,130 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") fn stwBadOffsetsOn(gcA
   return gcStatBadOffsets(wordAt(gcA))
 }
 
+// ---------------------------------------------------------------------------
+// GC pause timing (#5834): `pauses=`/`pausens=`/`pausemaxns=`/`rdvns=`/
+// `rootsns=`/`drainns=`/`sweepns=` on `BIT_GC_STATS`
+// ---------------------------------------------------------------------------
+//
+// Plain words, written only by the thread holding the world lock
+// (`worldLockTry`, ./stwpoll.bit) while it runs `stwPollOn` — the same
+// single-writer argument `../gc/linux/gcstopwait.bit`'s clock scratch makes,
+// and why these are ordinary module state (like `gcAddr`/`stwAbandoned` in
+// ./stw.bit) rather than a new `gcWords` slot: that block is boot-pinned
+// exactly full (`../gc/gc.bit`, `export const gcWords = 39`), and this
+// ticket does not grow it.
+let stwTkN: int = 0
+let stwTkPauseNs: int = 0
+let stwTkPauseMaxNs: int = 0
+let stwTkRdvNs: int = 0
+let stwTkRootsNs: int = 0
+let stwTkDrainNs: int = 0
+let stwTkSweepNs: int = 0
+
+// The {drainNs, sweepNs} pair `../gc/gccollect.bit`'s `gcCollectFinish`
+// writes on every collection, through the `tk` pointer `./stw.bit`'s
+// `stwCollect` passes it. Single writer (the world-lock holder), single
+// reader (`stwRecordPause` below, right after `stwCollect` returns) — a
+// fresh buffer per collection would cost nothing this one does not already
+// have for free.
+let stwCollectTk: [2]i64
+
+// Folds one pause's timing into the accumulators above (#5834). Split out of
+// `stwPollOn` (./stwpoll.bit) for the same reason `stwRetryRendezvous` was
+// (#5322): kept off that function's own complexity count.
+//
+// `collected` is false on the ABANDON path: `stwCollect` never ran, so
+// `stwCollectTk` still holds the PRIOR collection's numbers, and reading it
+// would double-count them into `rootsns=`/`drainns=`/`sweepns=` — those three
+// stay at 0 for an abandoned round, matching a round that stopped the world
+// and did no root/drain/sweep work at all. `rdvns=`/`pausens=`/`pausemaxns=`/
+// `pauses=` still advance: the rendezvous ran, and the world was stopped for
+// `tk3 - tk0` either way.
+@nosplit fn stwRecordPause(tk0: int, tk1: int, tk2: int, tk3: int, collected: bool) {
+  let drainNs = 0
+  let sweepNs = 0
+  let rootsNs = 0
+  if (collected) {
+    drainNs = stwCollectTk[0]
+    sweepNs = stwCollectTk[1]
+    rootsNs = tk2 - tk1 - drainNs - sweepNs
+  }
+  let pauseNs = tk3 - tk0
+  stwTkN = stwTkN + 1
+  stwTkPauseNs = stwTkPauseNs + pauseNs
+  if (pauseNs > stwTkPauseMaxNs) {
+    stwTkPauseMaxNs = pauseNs
+  }
+  stwTkRdvNs = stwTkRdvNs + (tk1 - tk0)
+  stwTkRootsNs = stwTkRootsNs + rootsNs
+  stwTkDrainNs = stwTkDrainNs + drainNs
+  stwTkSweepNs = stwTkSweepNs + sweepNs
+}
+
+// The pause's closing half (#5834): restart the world, then fold the timing
+// into the accumulators above via `stwRecordPause`. Split out of `stwPollOn`
+// (./stwpoll.bit) for the identical reason `stwRetryRendezvous` there is:
+// kept off that function's own line count and complexity, both already over
+// spec/LINT.md's ceilings before this ticket. `tk0`/`tk1` are `stwPollOn`'s
+// own reads, "just before stwRetryRendezvous" and "just after" — `tk2` here
+// is "just after stwCollect returns" (or the abandoned round's equivalent
+// point) and `tk3` is "just after worldRestart", so this function's own body
+// is exactly the pause's last two timestamps.
+@nosplit fn stwFinishPause(world: *i64, tk0: int, tk1: int, collected: bool) {
+  let tk2 = gcTicks()
+  // Restart on BOTH paths: `rendezvous` sets the stop flag before it waits, so
+  // an expired rendezvous leaves it set and every mutator that already parked
+  // would never resume.
+  worldRestart(world)
+  let tk3 = gcTicks()
+  stwRecordPause(tk0, tk1, tk2, tk3, collected)
+}
+
+// `pauses=` — collections this collector STOPPED THE WORLD for, counted
+// whenever `gcShouldCollect` held under the world lock (`stwPollOn`), whether
+// the round collected or abandoned (`stwAbandonedCount` above). Equal to
+// `stwCollections()` on every run this ticket measured: an abandoned round is
+// the rare, contention-bound exception `stwRetryRendezvous`'s own header
+// describes, not a case any of `allocpar`/`alloc`/`json` reach.
+export @nosplit @symbol("bit_rt_port_stw_pauses") fn stwPauses(): int {
+  return stwTkN
+}
+
+// `pausens=` — summed wall time the world was stopped for, across every
+// pause `stwPauses()` counted.
+export @nosplit @symbol("bit_rt_port_stw_pause_ns") fn stwPauseNs(): int {
+  return stwTkPauseNs
+}
+
+// `pausemaxns=` — the single longest pause.
+export @nosplit @symbol("bit_rt_port_stw_pause_max_ns") fn stwPauseMaxNs(): int {
+  return stwTkPauseMaxNs
+}
+
+// `rdvns=` — summed time in `stwRetryRendezvous`, success and abandon alike.
+export @nosplit @symbol("bit_rt_port_stw_rdv_ns") fn stwRdvNs(): int {
+  return stwTkRdvNs
+}
+
+// `rootsns=` — summed root-scan time: `stwCollect`'s own span (./stw.bit)
+// minus the `drainns=`/`sweepns=` `gcCollectFinish` reports for the same
+// collection.
+export @nosplit @symbol("bit_rt_port_stw_roots_ns") fn stwRootsNs(): int {
+  return stwTkRootsNs
+}
+
+// `drainns=` — summed `drain` + `recoverOverflow` time
+// (`../gc/gccollect.bit`'s `gcDrainAndSweep`).
+export @nosplit @symbol("bit_rt_port_stw_drain_ns") fn stwDrainNs(): int {
+  return stwTkDrainNs
+}
+
+// `sweepns=` — summed `sweep` time (`../gc/gccollect.bit`'s
+// `gcDrainAndSweep`).
+export @nosplit @symbol("bit_rt_port_stw_sweep_ns") fn stwSweepNs(): int {
+  return stwTkSweepNs
+}
+
 // Whether a collection is even permissible: every root source must be
 // reachable. See "THE ROOT SET" above — this is the guard that keeps a
 // partially-bound runtime from running a collection with a smaller root set
