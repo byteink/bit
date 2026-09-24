@@ -14,42 +14,48 @@
 // so `ok=true` came back carrying another key's value. `_tests_/stress/maprace`
 // measured both on main at BIT_WORKERS=4.
 //
-// THE LAYOUT. A table is one GC object: a fixed prefix `{cap, keys, vals}` and
-// then `cap` ctrl bytes inline. `riMapTbl` (root.bit) traces `keys` and `vals`
-// in the prefix and leaves the ctrl bytes untraced, the same fixed-prefix-plus-
-// raw-tail shape `riString` uses. The ctrl bytes are INLINE rather than a third
-// buffer so a probe reaches them in the same number of dependent loads as
-// before (`m` -> table -> byte, where it was `m` -> ctrl -> byte): the one
-// pointer costs no extra load on the path every lookup takes.
+// THE LAYOUT. A table is ONE allocation: two range words, then `cap` ctrl
+// bytes, `cap` key words and `cap` value words, in that order:
 //
-// CODE HOLDS A TABLE BY ITS CTRL BYTES, `c`, not by its object base: `mapTable`
-// returns `base + tblPrefix`, the prefix words sit at the NEGATIVE offsets
-// `tblCap`/`tblKeys`/`tblVals` from it, and slot `i`'s ctrl byte is `c + i`.
-// One register then names the whole table. Holding the base as well as the
-// ctrl pointer made every probe loop one value wider, and the server A/B on
-// b6375a61d paid for it: `mapProbe`'s loop spilled `m` and reloaded it on
-// every tag match, `rtMapSet`'s frame grew 0x90 -> 0xa0, and strmap retired
-// 2.02% more instructions on Graviton3 (+4.17% cycles on a Xeon 8168). The
-// base is seen only by `mapPublish`, the collector, and the first two loads of
-// the read-only scalar entry points (`mapTableBase`, below).
+//   [lo | hi | ctrl: cap bytes | keys: cap words | vals: cap words]
 //
-// THE INVARIANT. A table's prefix is written before it is published and never
-// after, and every buffer it names holds exactly `cap` slots. The header's
-// `mapTbl` word is written by `mapPublish` alone (a release store, after the
-// rehash has filled the new buffers) and read only by `mapTable` and
-// `mapTableBase` (plain loads, whose ordering the note on `mapTable` argues). So a reader that loads
-// the table word ONCE and derives `cap`, the
-// ctrl bytes, `keys` and `vals` from that one table sees a table that was
-// complete when it was published, and every index it computes is `h & (cap-1)`
-// or bounded by `< cap` of THAT table: in bounds by construction, whatever a
-// writer on another worker publishes meanwhile. Every entry point below and in
-// `mapscalar.bit`/`mapswar.bit` loads the table once and threads it through
-// its helpers (`mapProbe`, `mapProbeSwar`, `mapClaimSlot`) instead of letting
-// them reload it.
+// `cap` is a power of two of at least 8 (mapcaps.bit), so the key words start
+// 8-aligned. A table holding references is a `ref_range_info` object whose
+// collector traces exactly body words `[lo, hi)` — the keys, the values, or
+// both (`scanRefRange`, runtime/gc/gcmark.bit) — so tracing is as precise as
+// the three separate buffers this replaced; one holding none is a leaf.
+//
+// ONE WORD NAMES IT, AND ONE LOAD READS EVERYTHING. The header's `mapTblW`
+// packs the ctrl pointer with `64 - log2(cap)` in its top byte (`mapPack`).
+// From that one load, `ctrl` is a mask, `cap - 1` is one shift of all-ones,
+// and `keys` and `vals` are adds: no second load before the first ctrl byte,
+// the first key word or the value word. That is the point of the layout. The
+// first two cuts held a pointer to a `{cap, keys, vals}` prefix instead, one
+// more L1 load in front of every probe; the second measured +5.7% to +7.3%
+// cycles on Graviton3's int map for +0.67% instructions (server A/B of
+// e2461f835 on #5796), a latency cost and not work. Main reached cap, ctrl
+// and keys in one load level; this does too, plus two shifts. The loops bound
+// themselves by `mask` rather than `cap` so the decoded `cap` is not one more
+// value live across them.
+//
+// The header's `mapTbl` holds the table's object base as well, the one traced
+// word, and exists only to keep the table alive; no operation reads it.
+//
+// THE INVARIANT. A table's layout is fixed by `cap`, which lives only in the
+// packed word, and every array in it holds exactly `cap` slots. `mapTblW` is
+// written by `mapPublish` alone (a release store, after the rehash has filled
+// the new table) and read by `mapTableW` alone. So a reader that loads it ONCE
+// and derives `cap`, the ctrl bytes, `keys` and `vals` from that one word gets
+// a table that was complete when it was published, and every index it
+// computes is `h & (cap-1)` or bounded by `< cap` of THAT table: in bounds by
+// construction, whatever a writer on another worker publishes meanwhile.
+// Every entry point loads the word once and threads it, or the pointers
+// decoded from it, through its helpers (`mapProbe`, `mapProbeSwar`,
+// `mapClaimSlot`) instead of letting them reload it.
 //
 // A table's slot CONTENTS are still written in place by `m[k] = v` and
-// `delete`, exactly as before; what is immutable is the prefix, which is what
-// every bound is computed from.
+// `delete`, exactly as before; what is fixed is `cap`, which is what every
+// bound is computed from.
 //
 // THE CALL PAIR, AND WHY NO INDEX CROSSES IT. `bit_rt_map_slot` cannot hand an
 // index to `bit_rt_map_val_at`: the second call would have to load the table
@@ -62,118 +68,160 @@
 // it reads the value word of the table the slot came from — by construction,
 // not by a re-check.
 //
-// WHY THE TOKEN'S TABLE IS STILL THERE. The token is an untraced interior
-// address, so it is safe exactly as long as nothing can free or move that
-// table between the two calls. The collector never moves an object (ABI.md
-// §5). It frees only after a stop-the-world mark, and a mutator reaches a stop
-// only at a back-edge poll (§5: "at loop back-edges, and nowhere else").
-// `emitMapCommaOk` (compiler/lowermapaccess.bit) emits the two calls back to
-// back with no back edge between them, both callees are `@nosplit` and call
-// nothing that parks — the adjacency contract (§5.1). So no collection can
-// begin between the calls, the table the probe used is intact when
-// `map_val_at` reads it, and the token addresses `vals + i*8` with `i < cap`
-// of that table: in bounds. The word it names holds a value some write
-// actually stored for that key (SPEC §13.7) — the rehash copy or a later `set`
-// on that table; once a grow has retired it, no `set` writes it again.
+// WHY THE TABLE IS STILL THERE. Every pointer decoded from `mapTblW`, and the
+// token, is an untraced address, so each is safe exactly as long as nothing
+// can free or move that table while it is held. The collector never moves an
+// object (ABI.md §5). It frees only after a stop-the-world mark, and a mutator
+// reaches a stop only at a back-edge poll (§5: "at loop back-edges, and
+// nowhere else"). Every function here is `@nosplit` and calls nothing that
+// parks, so none can be stopped while it holds a decoded pointer. Across the
+// call pair, `emitMapCommaOk` (compiler/lowermapaccess.bit) emits the two
+// calls back to back with no back edge between them — the adjacency contract
+// (§5.1). So no collection can begin while a table is in use, and the token
+// addresses `vals + i*8` with `i < cap` of that table: in bounds. The word it
+// names holds a value some write actually stored for that key (SPEC §13.7) —
+// the rehash copy or a later `set` on that table; once a grow has retired it,
+// no `set` writes it again.
 //
 // ITERATION STILL PASSES INDICES. `map_iter_next` returns a plain slot index
 // and the loop body runs between it and `map_key_at`/`map_val_at` — a body
 // with back-edge polls, where an address would not survive. An index cannot
 // collide with a token: an index is below its table's `cap`, far below 2^62,
-// and a token is 2^62 plus a user address, which is below 2^57 on both targets
-// even under x86-64 five-level paging. So `map_val_at` tells the two apart by
-// magnitude, and the index path bounds-checks against the table it loads.
-// That check is not redundant with "grow never shrinks": two concurrent
-// WRITERS can each rehash the same old table and publish out of order, which
-// does shrink `cap`, and a racing iteration must still read in bounds (SPEC
-// §13.5 leaves its RESULT unspecified, never its memory safety).
+// and a token is 2^62 plus a user address, which `mapPack` checks is below
+// 2^56. So `map_val_at` tells the two apart by one bit, and the index path
+// bounds-checks against the table it loads. That check is not redundant with
+// "grow never shrinks": two concurrent WRITERS can each rehash the same old
+// table and publish out of order, which does shrink `cap`, and a racing
+// iteration must still read in bounds (SPEC §13.5 leaves its RESULT
+// unspecified, never its memory safety).
 //
 // No imports: the helpers here use only what the root module already brings
 // in (SPEC §17.1; a duplicate import is E0042).
 
-// The prefix: `tblPrefix` bytes from the object base to the ctrl bytes, and
-// `riMapTbl`'s declared size, since the traced part ends there. The three
-// prefix words, as offsets from the ctrl pointer `c` that code holds.
-export const tblPrefix: int = 24
-export const tblCap: int = -24
-export const tblKeys: int = -16
-export const tblVals: int = -8
+// Bytes before the ctrl array: the two range words.
+const tblHdr: int = 16
 
-// `cap` and `keys` again, as offsets from the object BASE (`mapTableBase`).
-// The read-only scalar entry points read both straight after loading the table
-// word, and `base + 24` followed by `c - 24` is two instructions this backend
-// does not fold away (#1853): one per lookup on the hottest path there is.
-// `rtMapSet` does NOT use them: its probe loop spans a call, so everything
-// live in it is callee-saved, and holding the base beside the ctrl pointer
-// cost it a 0x90 -> 0xa0 frame, more than the one instruction saved.
-const baseCap: int = tblPrefix + tblCap
-const baseKeys: int = tblPrefix + tblKeys
+// The packed word's top byte holds `64 - log2(cap)`; the low 56 bits hold the
+// ctrl pointer. Every user address on both targets is below 2^48 (2^57 only
+// for an mmap hint above 2^47, which this heap never passes), and `mapPack`
+// refuses one that is not below 2^56 rather than truncate it.
+export const tblShift: int = 56
+const tblAddrMask: int = 72057594037927935 // 2^56 - 1
+const tblOnes: u64 = 0xffffffffffffffff
 
 // 1 << 62: marks a `bit_rt_map_slot` hit token. Bit 63 stays clear, so a token
 // is still `>= 0` and the compiler's `ok = slot >= 0` holds unchanged. A single
 // bit, so setting, testing and clearing it are one logical-immediate
 // instruction each on arm64, where an add of 2^62 needed the constant in a
 // register first. `bit_rt_map_val_at` tests `slot < 0` BEFORE the bit (-1 has
-// every bit set), which keeps a comma-ok MISS at base's five instructions:
+// every bit set), which keeps a comma-ok MISS at main's five instructions:
 // testing the bit first saved a hit two and cost each miss three, and
 // bench/cases/strmap's comma-ok reads are all misses.
 const mapTokenBit: int = 4611686018427387904
 
-// The current table's ctrl pointer. With `mapTableBase` below, the only reads
-// of `mapTbl`.
+// The current table's packed word: the only read of `mapTblW`.
 //
 // A PLAIN LOAD, NOT AN ACQUIRE, and the ordering still holds. Every read a
-// caller makes through the result — the prefix words, the ctrl bytes, the
-// `keys`/`vals` buffers through the prefix's pointers, and the value word a
-// `bit_rt_map_slot` token names, whose address `bit_rt_map_val_at` receives in
-// a register — takes its ADDRESS from this load's value. Both targets order a load after the load its address
-// depends on: x86-64 orders every load after every earlier load (TSO), and
-// ARMv8 orders an address-dependent read after the read that produced the
-// address (the architecture's dependency ordering, the same guarantee Linux's
+// caller makes through it — the ctrl bytes, the key and value words, and the
+// value word a `bit_rt_map_slot` token names, whose address
+// `bit_rt_map_val_at` receives in a register — takes its ADDRESS from this
+// load's value. Both targets order a load after the load its address depends
+// on: x86-64 orders every load after every earlier load (TSO), and ARMv8
+// orders an address-dependent read after the read that produced the address
+// (the architecture's dependency ordering, the same guarantee Linux's
 // `rcu_dereference` is a plain load for). Paired with `mapPublish`'s release,
-// a reader that sees the new pointer sees everything written before it. The
+// a reader that sees the new word sees everything written before it. The
 // backend keeps that dependency: it computes each address from the loaded
-// register and never predicts a loaded value. `atomicLoad` was an `ldar` on
-// arm64, whose RCsc ordering against every earlier store-release this path
-// never needed; x86 already emitted a plain `mov` for it.
-@nosplit fn mapTable(m: int): int {
-  return loadWord(m + mapTbl) + tblPrefix
+// register and never predicts a loaded value. An `atomicLoad` here would be an
+// `ldar` on arm64, whose RCsc ordering this path never needs.
+@nosplit fn mapTableW(m: int): int {
+  return loadWord(m + mapTblW)
 }
 
-// The same load, returning the object base: for the scalar entry points,
-// which read `cap` and `keys` at `baseCap`/`baseKeys` from it and then hold
-// only the ctrl pointer, `base + tblPrefix`. Not written as a call from
-// `mapTable` or into it: the inliner splices one level, and a nested call left
-// `mapTable` out of line, which gave `bit_rt_map_val_at` a frame.
-@nosplit fn mapTableBase(m: int): int {
-  return loadWord(m + mapTbl)
+// The ctrl pointer packed in `w`. One instruction; the inliner splices it.
+@nosplit fn tblCtrlOf(w: int): int {
+  return w & tblAddrMask
 }
 
-// The ONLY write of `mapTbl`: a release store of the object base, after the
-// table at ctrl pointer `c` is filled.
-@nosplit fn mapPublish(m: int, c: int) {
-  atomicStoreRelease(wordAt(m + mapTbl), c - tblPrefix)
+// `cap - 1` for the table packed in `w`: all-ones shifted right by the top
+// byte. Two instructions, where `(1 << log2) - 1` took three on the path to
+// the first ctrl byte.
+@nosplit fn tblMaskOf(w: int): int {
+  return int(tblOnes >> u64(w >> tblShift))
 }
 
-// A fresh `vcap`-slot table for map `m`, every ctrl byte EMPTY (`gcAllocRaw`
-// zeroes); returns its ctrl pointer. Tracing of `keys`/`vals` follows the
-// header's key descriptor and value flag, as `rtMapNew` documents. Exhaustion
-// is fatal inside `gcAlloc*` (root.bit constraint 3), never a returned 0.
+// The packed word for the table whose ctrl array is at `ctrl`, `vcap` slots.
+@nosplit fn mapPack(ctrl: int, vcap: int): int {
+  if ((ctrl >> tblShift) != 0) {
+    panicMapAddr()
+  }
+  let lg = 0
+  // Bounded by `tblShift`: `vcap` is a power of two, far below 2^56.
+  while (lg < tblShift && (1 << lg) < vcap) {
+    lg = lg + 1
+  }
+  return ctrl | ((64 - lg) << tblShift)
+}
+
+// Publishes the table packed in `w`: the traced base first, for the collector
+// alone, then the packed word with a release store, after the table is filled.
+// Neither store can be separated by a collection (see WHY THE TABLE IS STILL
+// THERE), so which the collector sees first does not matter.
+@nosplit fn mapPublish(m: int, w: int) {
+  storeWord(m + mapTbl, tblCtrlOf(w) - tblHdr)
+  atomicStoreRelease(wordAt(m + mapTblW), w)
+}
+
+// A fresh `vcap`-slot table for map `m`, every ctrl byte EMPTY and every key
+// and value word 0 (`gcAllocRaw` zeroes); returns its packed word. It is a
+// `ref_range_info` object tracing exactly the key words when the key
+// descriptor names a reference, the value words when `mapValIsRef`, both, or
+// a leaf when neither — what the three buffers it replaced traced. Exhaustion
+// is fatal inside `gcAllocRaw` (root.bit constraint 3), never a returned 0.
 @nosplit fn allocTable(m: int, vcap: int): int {
   let g = wordAt(gcAddr)
-  let base = infoAddr
-  // `elemSize` is explicit 8: maps stay word-per-element regardless of key/value
-  // type (ABI.md §2/#3119).
-  let keys = allocBuf(vcap, loadWord(m + mapKeyDesc) != mapKeyScalar, 8)
-  let vals = allocBuf(vcap, loadWord(m + mapValIsRef) != 0, 8)
-  let c = gcAllocRaw(g, tblPrefix + vcap, base + riMapTbl * 8) + tblPrefix
-  storeWord(c + tblCap, vcap)
-  storeWord(c + tblKeys, keys)
-  storeWord(c + tblVals, vals)
-  return c
+  let keyRef = loadWord(m + mapKeyDesc) != mapKeyScalar
+  let valRef = loadWord(m + mapValIsRef) != 0
+  let info = infoAddr + riSliceBuf * 8
+  if (keyRef || valRef) {
+    info = infoAddr + riRefRange * 8
+  }
+  let body = gcAllocRaw(g, tblHdr + vcap * 17, info)
+  // Word indices into the body: the key words start past the range words and
+  // the ctrl bytes.
+  let kw = 2 + vcap / 8
+  let lo = kw
+  if (!keyRef) {
+    lo = kw + vcap
+  }
+  let hi = kw + vcap * 2
+  if (!valRef) {
+    hi = kw + vcap
+  }
+  storeWord(body, lo)
+  storeWord(body + 8, hi)
+  return mapPack(body + tblHdr, vcap)
 }
 
-// The token `bit_rt_map_slot` returns for a hit at slot `i` of table `c`.
-@nosplit fn mapValToken(c: int, i: int): int {
-  return (loadWord(c + tblVals) + i * 8) | mapTokenBit
+// The token `bit_rt_map_slot` returns for a hit at slot `i`, `vals` being the
+// value array of the table the probe used.
+@nosplit fn mapValToken(vals: int, i: int): int {
+  return (vals + i * 8) | mapTokenBit
+}
+
+// The "map table addr" panic, for an address `mapPack` cannot pack. Built in
+// `nilMapMsg` (maps.bit) for the reason that buffer exists: the panic path must
+// not allocate. NEVER RETURNS.
+const mapAddrWord0: int = 7809911855202197869
+const mapAddrWord1: int = 125775506382949
+const mapAddrLen: int = 14
+
+@nosplit fn panicMapAddr() {
+  let base = int(ptrOf(nilMapMsg))
+  let text = base + strHeaderSize
+  storeWord(base + strPtr, text)
+  storeWord(base + strLen, mapAddrLen)
+  storeWord(text + 0, mapAddrWord0)
+  storeWord(text + 8, mapAddrWord1)
+  bit_rt_panic(base)
 }
