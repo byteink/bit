@@ -1,9 +1,10 @@
 # pkg/auth
 
-Authentication for [`pkg/web`](../web): a `Strategy` interface for how a
-request proves who it is, and a `requireAuth` middleware that runs a
-request through one or more of them, storing the result on the request's
-session.
+Authentication for [`pkg/web`](../web). An app proves who is calling in one
+of two ways: a password checked against a lookup you supply, or an OpenID
+Connect provider like Google or Microsoft Entra ID. Both produce the same
+`Identity`, stored on the request's session, so the rest of your app never
+needs to know which one ran.
 
 ## Install
 
@@ -19,41 +20,73 @@ session.
 ## Usage
 
 ```bit
-import { App, Config, Ctx, MemoryStore } from "web"
-import { Identity, Strategy, currentIdentity, requireAuth } from "auth"
+import { App, Config, MemoryStore, unauthorized } from "web"
+import {
+  Identity,
+  Lookup,
+  LookupResult,
+  Strategy,
+  currentIdentity,
+  newPasswordStrategy,
+  requireAuth,
+} from "auth"
 import { Json } from "std/json"
 
-class ApiKeyStrategy {
-  export name(): string {
-    return "api-key"
+fn users(username: string): LookupResult! {
+  if (username != "ada") {
+    fail newError("users: no such user '${username}'")
   }
-  export authenticate(c: Ctx): Identity! {
-    if (c.header("x-api-key") != "secret") {
-      fail newError("api-key: invalid key")
-    }
-    return Identity{ id = "service", claims = Json.JsonNull }
+  return LookupResult{
+    hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQAAAAAAAAAAA$dGVzdGhhc2h0ZXN0aGFzaHRlc3RoYXNoMTIz",
+    id = "u1",
+    claims = Json.JsonNull,
   }
 }
 
-fn main(): ()! {
+fn build(): App {
   let app = App(Config{ secret = "change-me", sessions = MemoryStore(10_000) })
-  app.use(requireAuth([]Strategy{ ApiKeyStrategy{} }))
+  let lookup: Lookup = users
+
+  let login = app.group("/login")
+  login.use(requireAuth([]Strategy{ newPasswordStrategy(lookup) }))
+  login.post("/", (c) => c.text("welcome"))
+
   app.get("/me", (c) => {
-    let identity = currentIdentity(c)?
+    let identity: Identity = currentIdentity(c) catch _ {
+      fail unauthorized()
+    }
     return c.text(identity.id)
   })
-  app.listen()?
+  return app
 }
 ```
 
-`Identity.claims` is a `Json` value (`std/json`), not a string map: an OIDC
-ID token's claims hold arrays and nested objects a string map would
-truncate, and a password lookup's callback already builds a JSON object.
+`requireAuth` runs a request through one or more `Strategy` values until one
+authenticates it, regenerates the session id, and stores the result. A
+protected route that is not itself doing the authenticating just reads
+`currentIdentity(c)` and turns a miss into `unauthorized()`.
 
-This package exports the `Strategy` seam, the middleware that runs it, and
-`newPasswordStrategy` (`password.bit`): an Argon2id `Strategy` over an
-application-supplied `Lookup` callback. `OidcStrategy` is later work under
-the same epic.
+## The exported surface
+
+- `Strategy`, `Identity` - the seam every authentication method implements,
+  and what a successful one produces.
+- `requireAuth`, `currentIdentity` - the middleware that runs a `Strategy`
+  list, and the accessor a protected route reads the result with.
+- `hashPassword`, `Lookup`, `LookupResult`, `newPasswordStrategy` - a
+  password `Strategy` over your own user lookup, Argon2id underneath.
+- `OidcStrategy`, `newOidcStrategy`, `withScopes`, `beginAuthorization`,
+  `handleCallback` - the OpenID Connect authorization-code flow with PKCE.
+- `googleStrategy`, `microsoftStrategy`, `genericOidcStrategy` - provider
+  presets over `newOidcStrategy`.
+- `OidcConfig`, `discover`, `JwksCache`, `newJwksCache`, `verifyIdToken` - the
+  discovery document and key set `OidcStrategy` is built from, and the ID
+  token verifier, for a client that already holds a token and skips the
+  redirect flow.
+
+Every one of these is used in a full example in [`docs/`](docs/README.md),
+along with the security properties this package enforces (PKCE, constant-time
+state comparison, session regeneration, and the Microsoft single-tenant
+restriction).
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).
