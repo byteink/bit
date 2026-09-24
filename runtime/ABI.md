@@ -2069,6 +2069,65 @@ boot-pinned exactly full (§8.2), and this change does not grow it or
 is needed — the same argument `gcAddr`/`stwAbandoned` (`runtime/stw/stw.bit`)
 already rest on.
 
+### 8.4 The helper gang (#5837)
+
+§8.3 found that seven of eight `BIT_WORKERS` sit idle through every
+`allocpar` collection while the world is stopped. This ticket opens the
+mechanism a later one spends: a parked mutator can now JOIN the stopped
+collection instead of only waiting it out, and leaves again before
+`worldRestart`. No work moves through a join yet — #5838 (parallel sweep) and
+#5839 (parallel mark) are what give a helper something to do — so this only
+adds one field:
+
+```
+helpers=<n>
+```
+
+| field | meaning |
+|---|---|
+| `helpers=` | total joins into the helper gang across the whole run (`stwGangJoins`, `runtime/stw/stwstats.bit`, forwarding `gcGangHelp`'s counter, `runtime/gc/gccollect.bit`) |
+
+**Two new World words, and that is the whole layout change.**
+`worldGangWord` (0 = closed, otherwise the stop EPOCH the gang is open for)
+and `worldGangIn` (helpers currently inside a join) sit immediately after
+`worldWaiters` (`runtime/gc/gcworld.bit`), growing `worldWords` from 1801 to
+1803. No existing World word moves. `runtime/gc/gcworldsync.bit`'s
+`worldBlock` and `runtime/root/root.bit`'s boot-time width assertion both
+carry the new 1803, the same pair that already asserted 1801 (see §8.2's
+"boot-pinned exactly full" for why the GC state block, `gcState`, could never
+have taken this instead — the World block is the caller-owned one, and it is
+runtime-internal, appearing nowhere else in this document).
+
+**The protocol, in the order it runs.** Once `stwRetryRendezvous`
+(`runtime/stw/stwpoll.bit`) wins a full stop, the coordinator calls
+`worldGangOpen`: publish the collector block `g` a helper will read, store the
+stop's own epoch into `worldGangWord`, store **2** — not 1 — into
+`worldStopWord`, and wake every sleeper. Storing a value distinct from the
+plain stop's 1 is what lets a thread mid-way into its own blocking wait
+distinguish "the stop this thread already knows about" from a fresh signal,
+closing the same restart-then-restop ambiguity §5's stop-word wait already
+names; every reader of `worldStopWord` tests `!= 0`, never `== 1`, so nothing
+elsewhere needed to change for the new value to be legal. A parked mutator
+tries to join on every turn of its own wait loop (`worldGangTryHelp`,
+`runtime/gc/gcworldstop.bit`): if the open epoch matches the one it itself
+acknowledged, it increments `worldGangIn`, RE-CHECKS the gang is still open
+(undoing the increment and backing off if a close landed in the gap — the
+"helper that races the close" case), calls `gcGangHelp(g)`, then decrements
+`worldGangIn` unconditionally. Before `worldRestart`, the coordinator calls
+`worldGangClose`: store 0 into `worldGangWord` (no new helper can start after
+that store is visible) and wait, bounded, for `worldGangIn` to read 0 — safe
+to call even when the gang was never opened, since an unopened gang closes on
+its very first check.
+
+**A helper never returns to mutator code while the world is stopped.** It is
+still inside `worldResumeWhenClear`'s own wait loop for the whole of a join;
+`gcGangHelp` returning is not a resumption, it is one more turn of that loop.
+The coordinator waits for every JOINED helper to LEAVE before it restarts, and
+a helper leaves unconditionally on every path through `worldGangTryHelp`
+(including the raced-close case, which never called `gcGangHelp` at all), so
+the collector stays correct with zero helpers exactly as it did before this
+ticket — nothing about `stwCollect`'s own root scan changed.
+
 ---
 
 ## 9. Program entry, boot, and spawn (`runtime/root`)
