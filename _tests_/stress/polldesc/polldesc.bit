@@ -1,0 +1,259 @@
+// Stress harness for #5864's polldesc protocol (`runtime/sched/polldesc.bit`):
+// OS-thread-parallel (BIT_WORKERS controls how many real worker threads run
+// these green tasks) racing of wait/wake/cancel/close/reopen against a small,
+// deliberately reused fd range. NO poller is wired in -- every "readiness
+// edge" and "timer firing" below is a direct call into polldesc's exported
+// protocol, exactly as the ticket asks for "proven in isolation".
+//
+// WHAT IS COUNTED, AND WHY IT IS DETERMINISTIC. `claimed` and `ready` depend
+// only on the fixed round structure below (which round pre-arms an edge is
+// decided by `k % PREWAKE_EVERY`, never by scheduling), so both are pinned
+// exactly in `.expected`. WHICH of {pdWake, pdCancel, pdClose} wins a given
+// round's race is scheduler-timing dependent and therefore never printed;
+// what IS asserted, every round, is that EXACTLY ONE of them won --
+// `resolved == claimed`, where `resolved` sums however many total wins were
+// recorded across every round. A double-resolve or a lost edge breaks that
+// equality, which `ok` catches.
+//
+// THE STALE-GENERATION PROOF is separate and single-threaded
+// (`staleGenCheck`), run after every driver has joined: open, claim, close
+// (which legitimately wakes the claim), reopen, then a wake and a cancel
+// carrying the OLD generation must both report "nothing to do" and must not
+// disturb the fresh generation's slot -- proven by a normal wait/wake on the
+// new generation working right afterward.
+
+import {
+  pdOpen, pdWait, pdWake, pdCancel, pdClose,
+  pdDirRead, pdDirWrite, pdClaimed, pdAlreadyReady, pdEmpty,
+} from "../../../runtime/sched"
+
+const FDS: int = 6
+const ROUNDS: int = 2000
+const PREWAKE_EVERY: int = 5
+const THREEWAY_EVERY: int = 20
+
+// `counters[]` layout, one shared buffer every driver task accumulates into
+// through `atomicAdd` -- never a lock, matching the ticket's own constraint.
+const cClaimed: int = 0
+const cWake: int = 1
+const cCancel: int = 2
+const cClose: int = 3
+const cReady: int = 4
+const cBad: int = 5
+const counterCount: int = 6
+
+fn nextId(idCounter: *i64): int {
+  return atomicAdd(idCounter, 1) + 1
+}
+
+fn wakeResolver(fd: int, dir: int, gen: int, out: chan<i64>) {
+  out <- pdWake(fd, dir, gen)
+}
+
+fn cancelResolver(fd: int, dir: int, taskId: int, gen: int, out: chan<i64>) {
+  let hit = 0
+  if (pdCancel(fd, dir, taskId, gen)) {
+    hit = 1
+  }
+  out <- hit
+}
+
+fn closeResolver(fd: int, dir: int, out: chan<i64>) {
+  let rbuf = []i64(1)
+  let wbuf = []i64(1)
+  pdClose(fd, ptrOf(rbuf), ptrOf(wbuf))
+  let woke = rbuf[0]
+  if (dir == pdDirWrite) {
+    woke = wbuf[0]
+  }
+  out <- woke
+}
+
+// Race wake+cancel -- the deadline-read shape #5861 measured -- against one
+// claimed wait. Returns true iff exactly one of the two resolved it.
+//
+// EACH RESOLVER GETS ITS OWN CHANNEL. A single shared channel would still be
+// correct as a rendezvous, but reading two results off ONE channel cannot
+// tell which resolver a given value came from without tagging it -- an
+// ambiguity in this harness, not in the protocol under test.
+fn raceTwo(fd: int, dir: int, gen: int, myId: int, counters: *i64): bool {
+  let wakeCh = chan<i64>(1)
+  let cancelCh = chan<i64>(1)
+  spawn wakeResolver(fd, dir, gen, wakeCh)
+  spawn cancelResolver(fd, dir, myId, gen, cancelCh)
+  let a = <- wakeCh
+  let b = <- cancelCh
+  let wins = 0
+  if (a == myId) {
+    atomicAdd(counters + cWake, 1)
+    wins = wins + 1
+  }
+  if (b == 1) {
+    atomicAdd(counters + cCancel, 1)
+    wins = wins + 1
+  }
+  return wins == 1
+}
+
+// Race wake+cancel+close together. Returns true iff exactly one resolved it.
+fn raceThree(fd: int, dir: int, gen: int, myId: int, counters: *i64): bool {
+  let wakeCh = chan<i64>(1)
+  let cancelCh = chan<i64>(1)
+  let closeCh = chan<i64>(1)
+  spawn wakeResolver(fd, dir, gen, wakeCh)
+  spawn cancelResolver(fd, dir, myId, gen, cancelCh)
+  spawn closeResolver(fd, dir, closeCh)
+  let a = <- wakeCh
+  let b = <- cancelCh
+  let c = <- closeCh
+  let wins = 0
+  if (a == myId) {
+    atomicAdd(counters + cWake, 1)
+    wins = wins + 1
+  }
+  if (b == 1) {
+    atomicAdd(counters + cCancel, 1)
+    wins = wins + 1
+  }
+  if (c == myId) {
+    atomicAdd(counters + cClose, 1)
+    wins = wins + 1
+  }
+  return wins == 1
+}
+
+// One prewake round: fire the edge before anyone waits, then confirm the
+// following `pdWait` consumes it immediately (invariant 2, no lost edge).
+// Opens `fd` itself (rather than taking `gen` as a parameter) to keep every
+// round function at or under the 5-param lint ceiling.
+fn prewakeRound(fd: int, dir: int, myId: int, counters: *i64): bool {
+  let gen = pdOpen(fd)
+  let pw = pdWake(fd, dir, gen)
+  if (pw != pdEmpty) {
+    return false // a spurious task id: nothing was parked to hand it to
+  }
+  let r = pdWait(fd, dir, gen, myId)
+  if (r != pdAlreadyReady) {
+    return false
+  }
+  atomicAdd(counters + cReady, 1)
+  let rbuf = []i64(1)
+  let wbuf = []i64(1)
+  pdClose(fd, ptrOf(rbuf), ptrOf(wbuf))
+  return rbuf[0] == 0 && wbuf[0] == 0
+}
+
+// One claim-and-race round: open+claim the slot, then race it against the
+// wake and cancel resolvers (and, when `useThree`, close too), then always
+// close to reset for the next round's reopen. Opens `fd` itself for the same
+// reason `prewakeRound` does.
+fn claimRound(fd: int, dir: int, myId: int, useThree: bool, counters: *i64): bool {
+  let gen = pdOpen(fd)
+  let r = pdWait(fd, dir, gen, myId)
+  if (r != pdClaimed) {
+    return false
+  }
+  atomicAdd(counters + cClaimed, 1)
+  let clean = false
+  if (useThree) {
+    clean = raceThree(fd, dir, gen, myId, counters)
+  } else {
+    clean = raceTwo(fd, dir, gen, myId, counters)
+  }
+  let rbuf = []i64(1)
+  let wbuf = []i64(1)
+  pdClose(fd, ptrOf(rbuf), ptrOf(wbuf))
+  return clean && rbuf[0] == 0 && wbuf[0] == 0
+}
+
+fn driver(fd: int, idCounter: *i64, counters: *i64, done: chan<i64>) {
+  let bad = 0
+  let k = 0
+  while (k < ROUNDS) {
+    let dir = k % 2
+    let myId = nextId(idCounter)
+    let ok = true
+    if (k % PREWAKE_EVERY == 0) {
+      ok = prewakeRound(fd, dir, myId, counters)
+    } else {
+      ok = claimRound(fd, dir, myId, k % THREEWAY_EVERY == 1, counters)
+    }
+    if (!ok) {
+      bad = bad + 1
+    }
+    k = k + 1
+  }
+  atomicAdd(counters + cBad, bad)
+  done <- 1
+}
+
+// Single-threaded: proves a stale generation's wake/cancel touches nothing.
+fn staleGenCheck(fd: int): bool {
+  let gen1 = pdOpen(fd)
+  let id1 = 8000001
+  if (pdWait(fd, pdDirRead, gen1, id1) != pdClaimed) {
+    return false
+  }
+  let rbuf = []i64(1)
+  let wbuf = []i64(1)
+  let gen2 = pdClose(fd, ptrOf(rbuf), ptrOf(wbuf))
+  if (rbuf[0] != id1) {
+    return false // the close did not wake the outstanding claim
+  }
+  let gen3 = pdOpen(fd)
+  if (gen3 != gen2 + 1) {
+    return false
+  }
+  if (pdWake(fd, pdDirRead, gen1) != pdEmpty) {
+    return false // a stale-generation wake must never report a task
+  }
+  if (pdCancel(fd, pdDirRead, id1, gen1)) {
+    return false // a stale-generation cancel must never report success
+  }
+  let id2 = 8000002
+  if (pdWait(fd, pdDirRead, gen3, id2) != pdClaimed) {
+    return false // the stale noise above must not have touched the fresh slot
+  }
+  if (pdWake(fd, pdDirRead, gen3) != id2) {
+    return false
+  }
+  pdClose(fd, nil, nil)
+  return true
+}
+
+fn main() {
+  let counters = []i64(counterCount)
+  let cp = ptrOf(counters)
+  let idbuf = []i64(1)
+  let idCounter = ptrOf(idbuf)
+  let done = chan<i64>(FDS)
+
+  let f = 0
+  while (f < FDS) {
+    spawn driver(f, idCounter, cp, done)
+    f = f + 1
+  }
+  let j = 0
+  while (j < FDS) {
+    let _ = <- done
+    j = j + 1
+  }
+
+  let staleOk = staleGenCheck(FDS)
+
+  let claimed = counters[cClaimed]
+  let ready = counters[cReady]
+  let bad = counters[cBad]
+  let resolved = counters[cWake] + counters[cCancel] + counters[cClose]
+
+  let expectClaimed = FDS * (ROUNDS - ROUNDS / PREWAKE_EVERY)
+  let expectReady = FDS * (ROUNDS / PREWAKE_EVERY)
+
+  let ok = staleOk &&
+    bad == 0 &&
+    claimed == expectClaimed &&
+    ready == expectReady &&
+    resolved == claimed
+
+  print("ok ${ok} claimed ${claimed} ready ${ready} resolved ${resolved} bad ${bad} stale ${staleOk}\n")
+}
