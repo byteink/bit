@@ -84,9 +84,10 @@
 const acEntries = 64
 
 // Words per entry, and the same figure in bytes. 64 words = 512 bytes = eight
-// whole cache lines, so no two threads' entries share one. The entry uses 40 of
-// them (3 header words + one head per class), so even a table base that is only
-// 8-byte aligned leaves 24 dead words between one entry's last live word and
+// whole cache lines, so no two threads' entries share one. The entry uses 44 of
+// them (3 header words, one head per class, 4 accounting words), so even a
+// table base that is only 8-byte aligned leaves 20 dead words between one
+// entry's last live word and
 // the next entry's first — false sharing is impossible without depending on the
 // block's alignment.
 const acEntryWords = 64
@@ -119,6 +120,14 @@ const acBudget = 40
 // allocation and the shared word is never behind at all — which is the state
 // every stress oracle that reads `gcLiveBytes` was written against.
 const acLive = 41
+
+// #5821: objects this thread has allocated and not yet added to the SHARED
+// `gcNumObjectsIdx`, and the collector block (`g`) they are owed to. Words 42
+// and 43, private by the argument `acBudget` gives. `acGc` exists because the
+// count lives in `g` and the drain (`allocCacheDrainInto`) is reached with no
+// `g` in hand; it is bound beside `acHeap` and cleared beside it.
+const acObjs = 42
+const acGc = 43
 
 // Most bytes of ONE class ONE thread may hold, and the hard ceiling on the
 // batch. A cap in BYTES rather than in slots is what keeps the idle footprint
@@ -238,6 +247,7 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
     allocCacheDrainInto(e, *(e + acHeap), *(e + acLock))
     *(e + acHeap) = heapAddr
     *(e + acLock) = *(g + gcHeapLockAddr)
+    *(e + acGc) = int(g)
   }
   return addr
 }
@@ -264,12 +274,17 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   return allocCacheEntry(g)
 }
 
-// Add what this thread owes the shared live total, and clear the debt. `h` is
-// the heap block those bytes were taken from. The word is private to this OS
-// thread, so the read and the store need no atomic; only the shared add does,
-// and it is the same `atomicAdd` on the same word `allocCachePop` used to do
-// once per object.
+// Add what this thread owes the shared live total and object count, and clear
+// both debts. `h` is the heap block those bytes were taken from; the objects
+// go to the entry's own `acGc`, the block bound with it. The words are private
+// to this OS thread, so the reads and the stores need no atomic; only the
+// shared adds do.
 @nosplit fn gcAllocCacheFlush(e: *i64, h: *i64) {
+  let objs = *(e + acObjs)
+  if (objs != 0) {
+    *(e + acObjs) = 0
+    let _ = atomicAdd(wordAt(*(e + acGc)) + gcNumObjectsIdx, objs)
+  }
   let owed = *(e + acLive)
   if (owed == 0) {
     return
@@ -278,8 +293,59 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   let _ = atomicAdd(h + heapLiveWord, owed)
 }
 
-// Charge `total` bytes to this thread's private allocation budget and answer
-// whether an allocation-door poll request is due (#5472).
+// #5821: THE OBJECT COUNT IS CHARGED BY `gcAllocBudgetSpend` BELOW for a
+// thread with an entry, into its private `acObjs`; a thread with none still
+// adds to the shared `gcNumObjectsIdx` directly (`allocObject`,
+// `./gcalloc.bit`), which is what every allocation did before. The charge sits
+// in the budget spend rather than in a helper of its own because a helper was
+// not inlined, and one call per allocation is what the single-mutator path
+// cannot afford.
+//
+// THE SHARED ADD WAS THE WHOLE PARALLEL-ALLOCATION PENALTY. `gcNumObjectsIdx`
+// is word 4 of the collector block, on the same 128-byte line as `gcHeapAddr`
+// (word 0), which `allocCacheFor` reads on every allocation, and `noteBody`'s
+// two bounds (words 15, 16). One `ldaddal` per allocation per thread kept that
+// line moving between cores, so every allocation's first read of the block
+// missed. `bench/cases/allocpar` (8 mutators, M5 Max): `allocCacheFor` was 53%
+// of on-CPU samples, and deleting the add outright took the case from 15.8G to
+// 6.2G cycles. With no write on the line between collections, every thread
+// keeps a shared copy of it.
+//
+// WHAT IS OWED IS BOUNDED BY THE BUDGET, as `acLive`'s is: every object charged
+// here also spends at least its header's bytes of `acBudget`, and
+// `gcAllocBudgetSpend` flushes both words before any trigger read, so the
+// object half of `gcShouldCollect` is exact whenever it is asked on this
+// thread. OTHER threads' counts are settled by `gcAllocCacheSettle` below at
+// every collection start, so mark, sweep and `gcCollectFinish` all read the
+// exact population.
+
+// Fold every entry's un-flushed object count into `g` (#5821). CALLED WITH THE
+// WORLD STOPPED OR BY THE ONLY MUTATOR: from `gcMarkBegin` (`./gccollect.bit`),
+// the first step of every collection, and from `gcDeinit` (`./gc.bit`) before
+// its walk. `gcMarkBegin` needs it because `recoverOverflow` bounds its passes
+// by `gcNumObjectsIdx` and the sweep decrements that word once per freed
+// object, so a count that trailed the population would bound the rescan short
+// and could go negative. A plain read-modify-write of another thread's word is
+// sound here for `gcAllocBudgetClear`'s reason: every owner is parked outside
+// `allocObject`, which has no poll.
+@nosplit fn gcAllocCacheSettle(g: *i64) {
+  let base = int(ptrOf(allocCacheBlock))
+  let gaddr = int(g)
+  let i = 0
+  // Bounded: exactly `acEntries` iterations.
+  while (i < acEntries) {
+    let e = wordAt(base + i * acEntryBytes)
+    if (*(e + acGc) == gaddr && *(e + acObjs) != 0) {
+      *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) + *(e + acObjs)
+      *(e + acObjs) = 0
+    }
+    i = i + 1
+  }
+}
+
+// Charge `total` bytes to this thread's private allocation budget, and one
+// object to its private count (#5821, see above), and answer whether an
+// allocation-door poll request is due (#5472).
 //
 // THE POINT IS THE READ IT REMOVES. `gcShouldCollect` opens with
 // `heapLiveBytes`, an `ldar` on `heapLiveWord` — the one word EVERY allocating
@@ -296,6 +362,7 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
 // against an old `gcNextBytes` cannot outlive it.
 @nosplit fn gcAllocBudgetSpend(g: *i64, entry: int, total: int): bool {
   let e = wordAt(entry)
+  *(e + acObjs) = *(e + acObjs) + 1
   let left = *(e + acBudget) - total
   if (left > 0) {
     *(e + acBudget) = left
@@ -373,6 +440,7 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   }
   *(e + acHeap) = 0
   *(e + acLock) = 0
+  *(e + acGc) = 0
   spinRelease(lk)
 }
 
@@ -396,8 +464,10 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
       // inside the heap `gcDeinit` is about to unmap. Carrying the debt into
       // the entry's next heap would charge it to a heap that never saw them.
       *(e + acLive) = 0
+      *(e + acObjs) = 0
       *(e + acHeap) = 0
       *(e + acLock) = 0
+      *(e + acGc) = 0
     }
     i = i + 1
   }
