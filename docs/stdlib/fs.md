@@ -336,3 +336,53 @@ fn scratch(path: string): ()! {
   return
 }
 ```
+
+## Removing a directory tree safely
+
+`remove` only takes a file or an **empty** directory - the usual next step,
+recursively deleting a whole tree, is easy to get wrong. The obvious way to
+write it is `readDir`, recurse into each subdirectory, `remove` what is left:
+check what a path is, then act on it. Between the check and the act, another
+process can swap that subdirectory out for a symbolic link to somewhere else
+entirely - `/etc`, another tenant's upload directory, anywhere the deleting
+process can reach. The recursive delete follows the link and destroys
+whatever is on the other end. This is a real, named vulnerability class -
+Rust's standard library shipped exactly this bug as CVE-2022-21658.
+
+`std/fs/secure`'s `removeAll` closes it. It never asks "what is this path"
+and then acts on the answer with a second, separate lookup. It opens a
+directory once, lists it by that same open handle, and removes each entry
+relative to that handle - so a swap after the open cannot change what gets
+deleted.
+
+```bit
+import { removeAll } from "std/fs/secure"
+import { mkdir, writeFile } from "std/fs"
+
+fn clearUploads(dir: string): ()! {
+  mkdir(dir)?
+  writeFile("${dir}/report.csv", "id,total\n")?
+  mkdir("${dir}/tmp")?
+  writeFile("${dir}/tmp/partial.dat", "x")?
+  removeAll(dir)?
+}
+```
+
+`removeAll(dir)` deletes `report.csv`, `tmp/partial.dat`, `tmp`, and `dir`
+itself. If any entry in the tree is a symbolic link, `removeAll` unlinks the
+link itself and never follows it - the pointed-to file or directory is
+untouched, exactly the guarantee the naive version does not have. `path`
+itself gets the same treatment: naming a symlink as `path` removes the link,
+not its target.
+
+A missing `path` is not an error - `removeAll` on a path that is already
+gone succeeds, the same as Go's `os.RemoveAll`. Nesting deeper than 64 real
+directories fails rather than recursing further, the same bound `walk`
+gives.
+
+Reach for `remove` when you know the target is a single file or an already-
+empty directory; reach for `removeAll` the moment you are deleting a tree
+whose shape you have not verified yourself, such as anything under a path a
+caller or another process could also be writing to.
+
+Specification: `spec/SPEC.md` §11 (I/O), ABI.md §14 (`bit_rt_fs_*`).
