@@ -76,12 +76,15 @@ import {
   allocSpanOf,
   allocSpanHdrWords,
   allocSpanSlots,
+  allocSpanFree,
   allocSlotIndex,
   allocCarveStart,
   allocClassSize,
   heapTakeSmallLocked,
   heapTakeBatchLocked,
   heapGiveSmallLocked,
+  heapGiveChainLocked,
+  heapGiveSpanRunLocked,
   heapRefillLocked,
   heapReclaimSpansLocked,
   heapLargeAllocLocked,
@@ -263,9 +266,10 @@ const gcStCollections = 17
 //
 // The statistic is not lost, it is DERIVED: total allocated is the live count
 // plus everything that has ever been freed, and freeing is the rarer event —
-// it happens once per object in `gcVisitSlot` (`./gcwalk.bit`), which runs
-// under the stopped world beside the `gcNumObjectsIdx` decrement it is paired
-// with, so it needs no atomic at all. `gcStatTotalAllocated` (`./gccollect.bit`)
+// it is counted by `./gcwalk.bit`, per large object in `gcVisitSlot` and once
+// per size class for the small ones in `gcWalkClass` (#5836), always under the
+// stopped world beside the `gcNumObjectsIdx` decrement it is paired with, so
+// it needs no atomic at all. `gcStatTotalAllocated` (`./gccollect.bit`)
 // adds the two. Every zeroing of `gcNumObjectsIdx` that is not a full `gcInit`
 // must fold the discarded count in here first, or the derived total goes down
 // — `gcDeinit` below is the one such site.
@@ -372,26 +376,30 @@ const idxLoadPct = 80 // grow at 80% occupancy, the conventional open-addressing
   storeWord(h + gcHdrSize, loadWord(h + gcHdrSize) | ~gcAddrMax)
 }
 
-// The sweep's whole per-survivor test: clear the mark if it is set, and say
-// whether it WAS. One accessor rather than a `hdrMarked` read plus a
-// clear-if-set store at the one call site that does both (#4059), because
-// that pair addresses the word FOUR times and loads it twice —
-// `loadWord`/`storeWord` each recompute `h + gcHdrSize` and re-mask it, and
-// this backend has no CSE across them. It lives here, beside its siblings,
-// for the reason the block comment above gives: the packing gets exactly one
-// definition, and the sweep does not open-code a mask.
+// The sweep's whole per-object test: clear the mark if it is set, and return 0
+// if it WAS (the object survives), else the object's size (it is dead, and
+// that is the byte count its free takes off `heapLiveWord`, #5836). The size is
+// positive by construction (`gcHdrSize` above), so 0 cannot be a dead object.
+// One accessor rather than a `hdrMarked` read plus a clear-if-set store plus a
+// `hdrSize` read at the one call site that needs all three (#4059), because
+// each of those addresses the word again — `loadWord`/`storeWord` recompute
+// `h + gcHdrSize` and re-mask it, and this backend has no CSE across them. It
+// lives here, beside its siblings, for the reason the block comment above
+// gives: the packing gets exactly one definition, and the sweep does not
+// open-code a mask.
 //
-// THE STORE IS UNCONDITIONAL, which is not a slip: for an object that was not
-// marked, `v & gcAddrMax` IS `v`, so the store writes the value back unchanged.
-// It buys a branchless body of four statements, which is what lets this be
-// inlined into the sweep's inner loop rather than reached by `bl` per object,
-// and it dirties no line the sweep was not already about to touch — an unmarked
-// object is on its way to `heapGiveSmallLocked`, which writes the same slot.
-@nosplit fn hdrTakeMark(h: int): bool {
+// BRANCHLESS, and both halves are deliberate. The store is unconditional: for
+// an unmarked object `v & gcAddrMax` IS `v`, so it writes the value back
+// unchanged and dirties no line the sweep was not about to write (a dead slot's
+// first word takes its chain link). The result is `v` masked by the inverse of
+// its own sign spread: `v >> 63` is -1 for a marked word and 0 otherwise, so a
+// marked object yields 0 and an unmarked one its whole word, which is its
+// size. One block is what keeps this inlinable into the sweep's per-slot visit.
+@nosplit fn hdrTakeMark(h: int): int {
   let p = wordAt(h + gcHdrSize)
   let v = *p
   *p = v & gcAddrMax
-  return v < 0
+  return v & ~(v >> 63)
 }
 
 @nosplit fn headerFromBody(body: int): int {
