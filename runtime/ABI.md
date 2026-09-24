@@ -2112,7 +2112,7 @@ tries to join on every turn of its own wait loop (`worldGangTryHelp`,
 `runtime/gc/gcworldstop.bit`): if the open epoch matches the one it itself
 acknowledged, it increments `worldGangIn`, RE-CHECKS the gang is still open
 (undoing the increment and backing off if a close landed in the gap — the
-"helper that races the close" case), calls `gcGangHelp(g)`, then decrements
+"helper that races the close" case), calls `gcGangHelp(g, slot)`, then decrements
 `worldGangIn` unconditionally. Before `worldRestart`, the coordinator calls
 `worldGangClose`: store 0 into `worldGangWord` (no new helper can start after
 that store is visible) and wait for `worldGangIn` to read 0 — safe to call
@@ -2133,6 +2133,19 @@ claimed and writes only that span and its table entry. The coordinator then
 closes the table and drains its claim-loop count the same fatal-or-zero way,
 and applies every entry's class and heap accounting serially, in the serial
 walk's order, so the heap it leaves is the serial sweep's.
+
+**The mark phase (#5839).** Only when a slot is parked for the open epoch
+(`worldGangHasParked`); otherwise the serial mark runs unchanged. The roots
+are still pushed serially. The coordinator cuts them into 256-entry segments
+on one global list (`runtime/gc/gcmarkpar.bit`), publishes the phase
+(`gcMkOpen = g`), kicks the gang, and marks alongside every helper that joins.
+Only the thread whose `atomicOr` on the header size word finds the mark clear
+(`hdrTryMark`) queues an object. The joined and idle counts, the global list
+and the done flag change only under `gcMkLock`, and termination is decided
+there, on every joined member idle with the list empty. The pool holds at most
+`gcStackLen` entries. A push with no free segment sets `gcOverflow`, and the
+serial `recoverOverflow` answers it after the phase closes. The coordinator
+drains the phase's helper count the same fatal-or-zero way before the sweep.
 
 **A helper never returns to mutator code while the world is stopped.** It is
 still inside `worldResumeWhenClear`'s own wait loop for the whole of a join;
