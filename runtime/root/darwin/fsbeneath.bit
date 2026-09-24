@@ -69,6 +69,16 @@ const sIfreg: int = 32768 // 0o100000
 // blocking behaviour on a FIFO, device or socket.
 const oNonBlock: int = 4
 
+// `fdopendir(int): DIR *` / `dup(int): int` (`<dirent.h>`/`<unistd.h>`),
+// needed by `bit_rt_fs_list_dir_fd_w` below (#5800): `fdopendir` is the only
+// libSystem way to `readdir()`-enumerate an ALREADY-OPEN fd instead of
+// re-opening by path, and `dup` exists because `closedir` closes whatever
+// `fdopendir` wraps — `walkBeneath` still needs its own `dirFd` open
+// afterward to descend into each child, so listing operates on a DUP, never
+// the caller's fd itself.
+extern fn fdopendir(fd: i32): *u8
+extern fn dup(fd: i32): i32
+
 // `openat(int, const char *, int, ...)` — VARIADIC exactly like ./fs.bit's
 // `open`, and for the identical reason: `mode` is the single variadic
 // argument, and arm64 Apple's calling convention puts every variadic
@@ -127,6 +137,15 @@ extern fn openat(
   return (mode & sIfmt) == sIfdir
 }
 
+// Open the already-scratch-copied, NUL-terminated C path `p` as a
+// directory, FOLLOWING its own symlinks — `rtFsOpenBeneathW`'s root-open
+// step, factored out so `rtFsOpenDirW` below (`walkBeneath`'s root open,
+// #5800) shares it instead of repeating the `open(..., oDirectory, ...)`
+// call.
+@nosplit fn openDirFollowingP(p: int): int {
+  return int(open(u8At(p), i32(oDirectory), i64(0), 0, 0, 0, 0, 0, i64(0)))
+}
+
 // `bit_rt_fs_open_beneath_w`: open `root` (the `rootN`-byte packed path at
 // `rootWords`, following its own symlinks) as a directory, then `rel` (the
 // `relN`-byte packed path at `relWords`) against it via `openat` with
@@ -144,7 +163,7 @@ export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
   if (rootP == 0) {
     return 0 - 1
   }
-  let rootFd = int(open(u8At(rootP), i32(oDirectory), i64(0), 0, 0, 0, 0, 0, i64(0)))
+  let rootFd = openDirFollowingP(rootP)
   if (rootFd < 0) {
     return 0 - 1
   }
@@ -198,4 +217,162 @@ export @nosplit @symbol("bit_rt_fs_fstat_w") fn rtFsFstatW(fd: int, out: int): i
   }
   storeWord(out + 40, isRegular)
   return 0
+}
+
+// `bit_rt_fs_open_dir_w`/`bit_rt_fs_open_dir_beneath_fd_w`/
+// `bit_rt_fs_list_dir_fd_w` (#5800): the three primitives `std/fs/secure`'s
+// `walkBeneath` needs to close #5787's OTHER TOCTOU — `std/fs`'s own `walk`
+// (stdlib/fs/fs.bit) checks `isRealDir(p)` then calls `readDir(p)` BY PATH,
+// so a directory swapped for a symlink to outside the tree between the two
+// calls is followed, exactly the race `openBeneath` above closes for a
+// single file open. `walkBeneath` never re-resolves a path once it has an
+// fd: it lists each directory FROM the fd it already opened no-follow, and
+// descends into a child only by opening it no-follow relative to that SAME
+// fd — a swap of any ancestor after this walk holds its fd can no longer
+// change what that fd names, the same invariant `rtFsOpenBeneathW`'s
+// `O_NOFOLLOW_ANY` open relies on.
+
+// `bit_rt_fs_open_dir_w`: open the `n`-byte packed path at `words` as a
+// directory, FOLLOWING its own symlinks — `walkBeneath`'s ROOT open. `root`
+// is the trusted boundary the caller named, exactly like `openBeneath`'s
+// `root` argument, so it is opened normally; only the DESCENT below it
+// (`rtFsOpenDirBeneathFdW`) refuses a symlink. fd, or -1 for a malformed
+// path, a non-directory, or any other open failure.
+export @nosplit @symbol("bit_rt_fs_open_dir_w") fn rtFsOpenDirW(words: int, n: int): int {
+  let p = wordsPathZ(words, n)
+  if (p == 0) {
+    return 0 - 1
+  }
+  return openDirFollowingP(p)
+}
+
+// Whether the NUL-terminated `n`-byte name at `p` is safe to open as a
+// SINGLE path component: no `/` anywhere (a real directory entry can never
+// contain one; this only guards a future caller that hands this primitive
+// something other than one listed name), and not `.`/`..` (`walkBeneath`'s
+// own listing, `rtFsListDirFdW` below, already excludes both, the same
+// defense-in-depth reasoning `hasDotDotComponent` above gives for
+// `rtFsOpenBeneathW`'s `rel`). BOUNDED (Power of 10 rule 2): by `n`.
+@nosplit fn isSingleSafeComponent(p: int, n: int): bool {
+  if (n == 0) {
+    return false
+  }
+  if (n == 1 && loadByte(p) == 46) {
+    return false
+  }
+  if (n == 2 && loadByte(p) == 46 && loadByte(p + 1) == 46) {
+    return false
+  }
+  let i = 0
+  while (i < n) {
+    if (loadByte(p + i) == 47) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `bit_rt_fs_open_dir_beneath_fd_w`: open the SINGLE path component
+// `nameWords[0:nameN)` relative to the already-open directory `dirFd`,
+// refusing a symlink (`O_NOFOLLOW_ANY`, same flag `rtFsOpenBeneathW` uses)
+// and requiring the result to be a directory (`O_DIRECTORY`) —
+// `walkBeneath`'s DESCENT step. `dirFd` is already open and pinned by this
+// process's own fd table, so a rename or symlink-swap of an entry after
+// `walkBeneath` LISTED `dirFd` (`rtFsListDirFdW`) cannot change what
+// `dirFd` itself names; only what the CHILD resolves to, which
+// `O_NOFOLLOW_ANY` catches here. fd of the child directory, or -1 for a
+// symlink, a non-directory, `.`/`..`/an embedded `/`, or any other open
+// failure — `walkBeneath` reports every one of these as a LEAF path, the
+// same contract `std/fs`'s path-based `walk` gives a symlink or a plain
+// file.
+export @nosplit @symbol("bit_rt_fs_open_dir_beneath_fd_w") fn rtFsOpenDirBeneathFdW(
+  dirFd: int, nameWords: int, nameN: int,
+): int {
+  let nameP = wordsPathZ(nameWords, nameN)
+  if (nameP == 0 || !isSingleSafeComponent(nameP, nameN)) {
+    return 0 - 1
+  }
+  let fd = int(
+    openat(i32(dirFd), u8At(nameP), i32(oNoFollowAny | oDirectory), i64(0), 0, 0, 0, 0, 0, i64(0)),
+  )
+  if (fd < 0) {
+    return 0 - 1
+  }
+  return fd
+}
+
+// Copy ONE `readdir` entry (`nameAddr`, NUL-terminated) into `outPtr[0:outCap)`
+// at offset `totalIn`, skipping `.`/`..`, and return the updated total.
+// Split out of `rtFsListDirFdW` below to keep that function's nesting under
+// spec/LINT.md's limit — inlined, the copy loop plus the `.`/`..` guard put
+// it one level past `./fs.bit`'s own `sysList`, which already carries that
+// depth as undocumented debt; this one does not repeat it.
+@nosplit fn copyDirentName(nameAddr: int, outPtr: int, outCap: int, totalIn: int): int {
+  let nlen = cstrLen(nameAddr)
+  if (isDotName(nameAddr, nlen)) {
+    return totalIn
+  }
+  let total = totalIn
+  let j = 0
+  while (j < nlen) {
+    if (total + j < outCap) {
+      storeByte(outPtr + total + j, loadByte(nameAddr + j))
+    }
+    j = j + 1
+  }
+  if (total + nlen < outCap) {
+    storeByte(outPtr + total + nlen, 0)
+  }
+  return total + nlen + 1
+}
+
+// `bit_rt_fs_list_dir_fd_w`: the already-open directory `fd`'s entries
+// (`.`/`..` omitted), snprintf-shaped exactly like `./fs.bit`'s path-based
+// `bit_rt_fs_list_dir` (measure with `outCap == 0`, then fill) — but listed
+// straight off `fd` via `fdopendir`, never by re-resolving a path, so a
+// rename or symlink-swap of the directory itself after `walkBeneath` opened
+// it cannot change what gets listed. `fd` is `dup`'d first (see the extern
+// declarations' comment above): `closedir` closes whatever `fdopendir`
+// wraps, and `walkBeneath` still needs its own `fd` open afterward to
+// descend into each child (`rtFsOpenDirBeneathFdW`). Total bytes needed, or
+// -1 if `fd` does not name a directory or `dup`/`fdopendir` fails. BOUNDED
+// (Power of 10 rule 2): the same argument `./fs.bit`'s `sysList` gives —
+// `readdir` returns nil at end of directory (or on error, treated
+// identically), and a directory has finitely many entries.
+export @nosplit @symbol("bit_rt_fs_list_dir_fd_w") fn rtFsListDirFdW(
+  fd: int, outPtr: int, outCap: int,
+): int {
+  // `dup` shares `fd`'s underlying OPEN FILE DESCRIPTION, which carries the
+  // directory read position: without this reset, a first (measuring, #5800)
+  // call already reading `fd` to EOF left the SECOND (filling) call's `dup`
+  // inheriting that same EOF position and returning 0 every time, no matter
+  // how many entries `fd` actually names. `lseek` back to the start on
+  // `fd` ITSELF, before the `dup`, so every call to this primitive is
+  // independent of how many times it (or a caller reusing `fd`) has been
+  // called before. Harmless to `fd`'s own later use: `walkBeneath` only
+  // ever opens children relative to `fd` afterward, which does not care
+  // about its read offset.
+  let _ = lseek(i32(fd), i64(0), i32(seekSet))
+  let dupFd = int(dup(i32(fd)))
+  if (dupFd < 0) {
+    return 0 - 1
+  }
+  let dir = fdopendir(i32(dupFd))
+  if (int(dir) == 0) {
+    let _ = close(i32(dupFd))
+    return 0 - 1
+  }
+  let total = 0
+  let done = false
+  while (!done) {
+    let ent = readdir(dir)
+    if (int(ent) == 0) {
+      done = true
+    } else {
+      total = copyDirentName(int(ent) + direntNameOff, outPtr, outCap, total)
+    }
+  }
+  let _ = closedir(dir)
+  return total
 }
