@@ -91,6 +91,7 @@
 //   BIT_TEST_TIMEOUT_S    per-job deadline, seconds (default 60, max 3600)
 
 import { exists, isDir, mkdir, readDir, readFile, remove, writeFile } from "std/fs"
+import { JsonEntry, jsonAsObject, jsonAsString, jsonGet, jsonParse } from "std/json"
 import { envOr, exit } from "std/os"
 import { clean, dir as pageDir, join } from "std/path"
 import { contains, hasPrefix, hasSuffix, indexOf, parseInt, split, toLower, trimSpace } from "std/strings"
@@ -113,6 +114,14 @@ const maxBlocksPerPage: int = 64
 // today (`pkg/orm/docs/README.md`) carries about two dozen.
 const maxLinksPerPage: int = 256
 
+// `pkg/*/bit.json`'s only first-party dependency form today (`pkg/auth`'s
+// own): `bitlang.org/pkg/<name>[@<ref>]`, resolved onto this repo's own
+// `pkg/<name>` — no fetch, same as `main()` resolves the package under test.
+const vanityPkgPrefix: string = "bitlang.org/pkg/"
+
+// Bound on a first-party dependency chain (Power of 10 rule 2).
+const maxDepDepth: int = 8
+
 // `osRunBounded`'s result encoding (ABI.md §19), same constants
 // `_tests_/bit/packagesgate.bit` already names.
 const rcSpawnFailed: int = -1
@@ -125,15 +134,20 @@ class Cfg { bin: string, deadlineMs: int }
 
 class Block { src: string }
 
-// One check: a page (joined) or one page+block (per-block), the source to
-// check, which package it belongs to (for the local dependency the scratch
-// project declares), and where it came from for reporting.
+// One more first-party dependency the scratch project must declare.
+class DepEntry { name: string, path: string }
+
+// The package under test plus its own transitive first-party deps
+// (`firstPartyDeps`) — bundled like `Cfg` for the 5-param ceiling.
+class PkgInfo { name: string, absPath: string, deps: []DepEntry }
+
+// One check: a page (joined) or one page+block (per-block), its source,
+// its package (scratch-project deps), and where it came from for reporting.
 class Job {
   page: string,
   block: int, // 0 for a joined job, 1-based for a per-block job
   src: string,
-  pkgName: string,
-  pkgAbsPath: string,
+  pkg: PkgInfo,
 }
 
 class Stats {
@@ -196,6 +210,85 @@ fn packagePages(pkgDir: string, name: string): []string {
   let readme = join(join(pkgDir, name), "README.md")
   if (exists(readme)) {
     out = append(out, readme)
+  }
+  return out
+}
+
+// `manifestPath`'s "dependencies" entries, or none; a non-object one fatals.
+fn readDepsObject(manifestPath: string): []JsonEntry {
+  let text = readFile(manifestPath) catch e {
+    fatal("cannot read ${manifestPath}: ${e.message()}")
+    ""
+  }
+  let root = jsonParse(text) catch e {
+    fatal("cannot parse ${manifestPath}: ${e.message()}")
+    return []JsonEntry(0)
+  }
+  let depsField = jsonGet(root, "dependencies")
+  if (isNone(depsField)) {
+    return []JsonEntry(0)
+  }
+  let entries = jsonAsObject(unwrap(depsField))
+  if (isNone(entries)) {
+    fatal("${manifestPath}'s \"dependencies\" is not an object")
+  }
+  return unwrap(entries)
+}
+
+// `entry`'s first-party dep name (`bitlang.org/pkg/<name>[@<ref>]` ->
+// `<name>`), or "" when it is not that vanity form, or already in `deps`.
+fn resolveFirstPartyDep(entry: JsonEntry, deps: []DepEntry): string {
+  let value = jsonAsString(entry.value)
+  if (isNone(value)) {
+    return ""
+  }
+  let dep = unwrap(value)
+  if (!hasPrefix(dep, vanityPkgPrefix)) {
+    return ""
+  }
+  let rest = dep[len(vanityPkgPrefix):]
+  let at = indexOf(rest, "@")
+  let name = rest
+  if (at >= 0) {
+    name = rest[0:int(at)]
+  }
+  for d of deps {
+    if (d.name == name) {
+      return ""
+    }
+  }
+  return name
+}
+
+// `name` reappearing in `seen` (the walk's path so far) fatals as a cycle.
+fn stepSeen(seen: []string, pkgPath: string, name: string): []string {
+  for s of seen {
+    if (s == name) {
+      fatal("first-party dependency cycle: '${name}' reappears under ${pkgPath}")
+    }
+  }
+  // bit:lint allow E0214 -- seen is consumed only as this call's own return, read synchronously by the immediate caller and never retained afterward, same shape compiler/json.bit's jsonEsc2 allows
+  return append(seen, name)
+}
+
+// `pkgPath`'s own deps, recursed into each dep's own `bit.json` in turn, so
+// a whole chain lands in the scratch project, not just the direct ones.
+fn firstPartyDeps(pkgDir: string, pkgPath: string, seen: []string, out: []DepEntry): []DepEntry {
+  if (len(seen) > maxDepDepth) {
+    fatal("first-party dependency chain under ${pkgPath} exceeds the ${maxDepDepth}-deep bound")
+  }
+  let manifestPath = join(pkgPath, "bit.json")
+  if (!exists(manifestPath)) {
+    return out
+  }
+  for entry of readDepsObject(manifestPath) {
+    let name = resolveFirstPartyDep(entry, out)
+    if (len(name) == 0) {
+      continue
+    }
+    let depPath = join(pkgDir, name)
+    out = append(out, DepEntry{ name = name, path = depPath })
+    out = firstPartyDeps(pkgDir, depPath, stepSeen(seen, pkgPath, name), out)
   }
   return out
 }
@@ -454,13 +547,7 @@ fn checkPageLinks(page: string, md: string, st: Stats): Stats {
   return out
 }
 
-fn jobsForPage(
-  page: string,
-  md: string,
-  blocks: []Block,
-  pkgName: string,
-  pkgAbsPath: string,
-): []Job {
+fn jobsForPage(page: string, md: string, blocks: []Block, pkg: PkgInfo): []Job {
   if (contains(md, perBlockMarker)) {
     let out = []Job(0)
     let i = 0
@@ -469,7 +556,7 @@ fn jobsForPage(
         out,
         Job{
           page = page, block = i + 1, src = normalizeTrailingNewline(blocks[i].src),
-          pkgName = pkgName, pkgAbsPath = pkgAbsPath,
+          pkg = pkg,
         },
       )
       i = i + 1
@@ -481,8 +568,7 @@ fn jobsForPage(
       page = page,
       block = 0,
       src = joinBlocks(blocks),
-      pkgName = pkgName,
-      pkgAbsPath = pkgAbsPath,
+      pkg = pkg,
     },
   ]
 }
@@ -510,17 +596,22 @@ fn timeoutMs(): int {
   return n * 1000
 }
 
-// One job's scratch project: `bit.json`/`bit.lock` declaring `pkgName` as a
-// local-path dependency on `pkgAbsPath` (verified against a real `bit add
-// <abs-path>` run — see this file's header), and the job's own source as
-// `main.bit`. Nothing else — no sibling file can lend it an import that its
-// own source did not declare.
-fn writeJobProject(dir: string, pkgName: string, pkgAbsPath: string, src: string) {
+// One job's scratch project: `bit.json`/`bit.lock` declaring `pkg.name` (see
+// this file's header) plus one entry per `pkg.deps` (`firstPartyDeps`), and
+// the job's own source as `main.bit`. Nothing else — no sibling file lends
+// it an import its own source did not declare.
+fn writeJobProject(dir: string, pkg: PkgInfo, src: string) {
   mkdir(dir) catch e {
     fatal("cannot create ${dir}: ${e.message()}")
   }
-  let bitJson = "{\"name\": \"pkgdocsgate-check\", \"dependencies\": {\"${pkgName}\": \"${pkgAbsPath}\"}}\n"
-  let bitLock = "{\"${pkgName}\": {\"path\": \"${pkgAbsPath}\", \"requires\": {}}}\n"
+  let deps = "\"${pkg.name}\": \"${pkg.absPath}\""
+  let locks = "\"${pkg.name}\": {\"path\": \"${pkg.absPath}\", \"requires\": {}}"
+  for d of pkg.deps {
+    deps = "${deps}, \"${d.name}\": \"${d.path}\""
+    locks = "${locks}, \"${d.name}\": {\"path\": \"${d.path}\", \"requires\": {}}"
+  }
+  let bitJson = "{\"name\": \"pkgdocsgate-check\", \"dependencies\": {${deps}}}\n"
+  let bitLock = "{${locks}}\n"
   writeFile(join(dir, "bit.json"), bitJson) catch e {
     fatal("cannot write ${dir}/bit.json: ${e.message()}")
   }
@@ -600,8 +691,8 @@ fn jobLabel(j: Job): string {
 // `docs/`.
 fn runJob(cfg: Cfg, j: Job, idx: int, st: Stats): Stats {
   let out = st
-  let dir = "/tmp/bit-pkgdocsgate-${j.pkgName}-${now().ns}-${idx}"
-  writeJobProject(dir, j.pkgName, j.pkgAbsPath, j.src)
+  let dir = "/tmp/bit-pkgdocsgate-${j.pkg.name}-${now().ns}-${idx}"
+  writeJobProject(dir, j.pkg, j.src)
 
   let checkLog = "${dir}.check.log"
   let checkCmd = "exec \"${cfg.bin}\" check \"${dir}\""
@@ -635,7 +726,7 @@ fn runJob(cfg: Cfg, j: Job, idx: int, st: Stats): Stats {
 // job(s). Split out of `main` to keep both functions under the complexity
 // ceiling (spec/LINT.md) — the walk itself (which packages, which pages) and
 // one page's own extract-and-check work are two different concerns.
-fn processPage(cfg: Cfg, pkgName: string, pkgAbsPath: string, page: string, st: Stats): Stats {
+fn processPage(cfg: Cfg, pkg: PkgInfo, page: string, st: Stats): Stats {
   let out = st
   out.pages = out.pages + 1
   let md = readFile(page) catch e {
@@ -652,7 +743,7 @@ fn processPage(cfg: Cfg, pkgName: string, pkgAbsPath: string, page: string, st: 
   }
   out.pagesWithBlocks = out.pagesWithBlocks + 1
   out.totalBlocks = out.totalBlocks + len(blocks)
-  for j of jobsForPage(page, md, blocks, pkgName, pkgAbsPath) {
+  for j of jobsForPage(page, md, blocks, pkg) {
     out.jobs = out.jobs + 1
     out = runJob(cfg, j, out.nextIdx, out)
     out.nextIdx = out.nextIdx + 1
@@ -698,8 +789,10 @@ fn main() {
   let st = zeroStats()
   for name of names {
     let pkgAbsPath = join(pkgDir, name)
+    let deps = firstPartyDeps(pkgDir, pkgAbsPath, [name], []DepEntry(0))
+    let pkg = PkgInfo{ name = name, absPath = pkgAbsPath, deps = deps }
     for page of packagePages(pkgDir, name) {
-      st = processPage(cfg, name, pkgAbsPath, page, st)
+      st = processPage(cfg, pkg, page, st)
     }
   }
 
