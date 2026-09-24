@@ -310,7 +310,17 @@ reloc_sites_seen=0
 # deleted before codegen, and with them the x86-64-only panic messages those
 # arms referenced (the ___bitstr_* strings below). stage0 0.26.0 still emits
 # both arms. Empties at the next repin.
+#
+# 2026-09-24, #5796 (9ef3c9994, the map table fix): runtime/root's map hit
+# path now branches on `onX64()`. stage0 inlines that call, and the inlined
+# body carries a source-location reference to `syscalls/syscalls.bit`, one
+# string in root.o's table, numbered ___bitstr_300 there. This tree folds the
+# call to a constant, so the filename and its string never appear. Confirmed by
+# building runtime/root with both compilers: 301 strings against 300, and
+# `syscalls/syscalls.bit` is the only one missing. Empties at the next repin.
 RELOC_DECLARED="
+runtime/root - ARM64_RELOC_UNSIGNED ___bitstr_300
+runtime/root - ARM64_RELOC_UNSIGNED ___bitstr_300_data
 runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_1
 runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_10
 runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_3
