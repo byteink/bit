@@ -1,0 +1,256 @@
+// Shared core for #5846's alloc-cache migration proof, run once per platform
+// by `../../gcallocmigratedarwin` and `../../gcallocmigratelinux` — the same
+// shape `../gcprops` and `../exitprops` use to run one copy of a check
+// against either platform's thread provider.
+//
+// WHAT THIS PROVES. `gcNumObjects(g)`/`gcLiveBytes(g)`
+// (`../../../../runtime/gc/gccollect.bit`) read `gcNumObjectsIdx`/
+// `heapLiveWord` directly. Since #5821/#5709 a thread with an alloc-cache
+// entry (`../../../../runtime/gc/gcalloccache.bit`) charges each allocation
+// to its own private `acObjs`/`acLive` first and only folds that into the
+// shared words on budget expiry, refill or drain (`gcAllocCacheFlush`) or at
+// a collection's start (`gcAllocCacheSettle`). A private collector that never
+// collects and never drains, with the cache armed, therefore carries a
+// PENDING debt in every entry it ever allocated through for the whole run —
+// exactly what `../../../../runtime/stw/stwstats.bit`'s exit report used to
+// read straight through (#5846).
+//
+// TWO ENTRIES, ONE HEAP. The alloc-cache table is keyed by OS THREAD, not by
+// `g`, so two OS threads allocating against the SAME collector get two
+// independent entries with two independent budgets — the "task migrates
+// between worker threads" case #5846 diagnosed, reproduced with a raw OS
+// thread rather than the scheduler's own green-task migration, the same
+// substitution this suite's other private-heap programs make for the
+// identical reason (see `../gcprops`'s own header).
+//
+// SEQUENTIAL, NOT CONCURRENT, ON PURPOSE. The parent finishes every one of
+// its own allocations before the child is even started, so which entry each
+// thread claims is deterministic (the table starts empty; the child's 4-probe
+// window can collide with the parent's one claimed slot in at most one of its
+// four probes, so it always finds a free one) and NOTHING serializes the
+// two threads' access to the shared collector, which two real mutators
+// racing `gcAlloc` were already going to need and this program does not test.
+//
+// EACH THREAD'S OWN ALLOCATIONS RUN `@nosplit` (`allocN` below), WITH NO
+// SAFEPOINT BETWEEN THEM. An ordinary loop polls at every back edge, and the
+// scheduler is free to resume a preempted green task on a DIFFERENT OS
+// worker thread at that poll — which would claim ANOTHER alloc-cache entry
+// mid-loop and spread each side's allocations across however many entries
+// the scheduler happened to touch. `naiveShort`/`exactMatch` (below) hold
+// either way, but the exact "flushed" vs "pending" split would then depend on
+// scheduler timing, not on this program; measured with an ordinary
+// (non-`@nosplit`) loop, a real run read `naive=7` where the argument below
+// predicts 2. `@nosplit` removes the poll entirely, so both this program's
+// OWN OS thread (the parent) and the raw thread `threadStart` creates (the
+// child) allocate on the ONE token each keeps for their whole loop.
+//
+// WHY `MAIN_N`/`CHILD_N` ARE BOTH > 1. `gcAllocBudgetSpend`
+// (`../../../../runtime/gc/gcalloccache.bit`) takes its flush arm on a FRESH
+// entry — `acBudget` starts at 0, so the very first charge always exceeds it
+// — so AT LEAST one allocation per entry lands in the shared count directly
+// regardless of anything else this program controls; a size class's own
+// refill/flush cadence inside `gcHeapAlloc` can charge more of the twelve
+// straight to the shared word too. What stays constant across runs (5/5,
+// `@nosplit` on both loops) is that SOME of the twelve stay pending and
+// unflushed for this program's whole life — nothing here ever collects or
+// drains the cache — which is all `naiveShort`/`exactMatch` below need:
+// `gcNumObjects` reads short of `total` and `gcNumObjectsExact` reads it
+// exactly, however the flush/pending split falls out underneath.
+//
+// WHY THE CACHE MUST BE ARMED WITH NOTHING ELSE ALLOCATED IN BETWEEN.
+// `gcArmAllocCache` (below) is a single process-wide, monotonic flag — it is
+// not scoped to this program's private `g`. Arming it before any OTHER
+// allocation this thread makes (the setup slices below are all allocated
+// first, while the cache is still off) keeps the parent's FIRST cache-eligible
+// allocation ever also its first allocation against THIS heap, so the "fresh
+// entry" argument above holds. Nothing between arming and the last private
+// allocation may allocate through the ordinary (ambient) collector — no
+// `print`, no slice literal — or the parent's entry would bind to the AMBIENT
+// heap first and this program's numbers would depend on load-bearing
+// ambient allocations nothing here controls.
+import { wordAt } from "../../../../runtime/gc"
+import {
+  gcBindMemory, gcInit, gcConfigure, gcAlloc, gcArmAllocCache,
+  gcNumObjects, gcNumObjectsExact, gcWords,
+} from "../../../../runtime/gc"
+import { heapInit, heapWords } from "../../../../runtime/alloc"
+import { spinUnlocked } from "../../../../runtime"
+import { threadJoin, threadJoinDone } from "../../../../runtime/thread"
+
+const ARENA_WORDS: int = 65536
+const INDEX_WORDS: int = 4096
+const META_WORDS: int = 7
+const MARK_STACK: int = 64
+const MIN_TRIGGER: int = 1048576 // 1 MiB: far above this program's whole
+// allocation total (12 objects, 32 bytes apiece), so `gcTriggerBudget` never
+// answers 0 and no allocation here is ever forced through the
+// trigger-crossing arm of `gcAllocBudgetSpend`.
+const GROWTH_PCT: int = 200
+const BODY_SIZE: int = 16
+const MAIN_N: int = 6
+const CHILD_N: int = 6
+const JOIN_NS: int = 10000000000 // 10s
+
+// Module state the raw child thread reads. Set by the parent BEFORE
+// `threadStart`, which happens-before the child's first read of either word
+// (the platform thread provider's own create call is the synchronizing
+// event; see `runtime/thread/thread.bit`'s own contract).
+let sharedG: [1]i64
+let sharedMeta: [1]i64
+let doneWord: [1]i32
+
+// `n` back-to-back allocations against `g`, with NO safepoint between them —
+// `@nosplit` emits no poll at all, so the calling OS thread cannot change
+// mid-loop. That is load-bearing here: an ordinary (non-`@nosplit`) loop
+// polls at every back edge, and a green task the scheduler reschedules onto
+// a DIFFERENT OS thread mid-loop would claim a fresh alloc-cache entry
+// there too — this program's `naiveShort`/`exactMatch` booleans would still
+// hold either way, but the SPLIT between "flushed" and "pending" would
+// depend on the scheduler's own timing rather than on this program, which
+// is not the property under test. `gcAlloc` is itself `@nosplit`, so it may
+// be called from here (E0075).
+@nosplit fn allocN(g: *i64, metaAddr: int, n: int) {
+  let i = 0
+  while (i < n) { // bounded: `n` iterations (MAIN_N or CHILD_N, both constants)
+    let _ = gcAlloc(g, metaAddr)
+    i = i + 1
+  }
+}
+
+// Runs on the spawned raw OS thread: allocates `CHILD_N` objects against the
+// SAME `g`/heap the parent bound, claiming its OWN alloc-cache entry (a
+// distinct OS thread token), then signals done. No allocation here goes
+// through the ambient collector — only `gcAlloc` against the private `g` —
+// so this thread's entry binds to the private heap on its very first
+// allocation, exactly as the parent's did.
+@nosplit fn migrateChild(arg: *byte): *byte {
+  let g = wordAt(int(sharedG[0]))
+  let metaAddr = int(sharedMeta[0])
+  allocN(g, metaAddr, CHILD_N)
+  atomicStore(ptrOf(doneWord), i32(0))
+  return nil
+}
+
+// `entryOf` (SPEC §11.10) needs its operand to name a function declaration
+// directly, so the address is taken here, where that function is declared.
+export fn migrateChildEntry(): *byte {
+  return entryOf(migrateChild)
+}
+
+// Result the platform driver prints. Booleans only, never the raw counts —
+// same reason `../../stwownstack`'s own header gives: the discriminating
+// facts are "the buggy accessor under-reports" and "the fixed one is exact",
+// both of which hold however the two threads happen to divide the twelve
+// allocations, so nothing here needs the exact split to be reproducible.
+export class MigrateResult {
+  export started: bool,
+  export joined: bool,
+  export released: bool,
+  export naiveShort: bool,
+  export exactMatch: bool,
+}
+
+// `gcInit`, non-stress `gcConfigure`, arming the cache, and the parent's own
+// `MAIN_N` allocations — split out of `migrateRun` below to keep that
+// function under spec/LINT.md's 80-line ceiling. Bundled into 5 params
+// (E0202): `g` plus the three addresses `gcInit` itself takes, plus the
+// shared `metaAddr` both `gcInit` (as the mark worklist's ref-array
+// TypeInfo, exactly `../gcgrow`'s own shortcut) and the alloc loop need.
+fn migrateBootAndFill(g: *i64, hp: int, heapLockAddr: int, listLockAddr: int, metaAddr: int): bool {
+  if (!gcInit(g, hp, heapLockAddr, listLockAddr, metaAddr, MARK_STACK)) {
+    return false
+  }
+  gcConfigure(g, true, false, MIN_TRIGGER, GROWTH_PCT, false)
+  // Arm the per-thread cache now — nothing between here and the parent's
+  // last private allocation below may allocate through the ambient
+  // collector (see this file's own header on why the order matters).
+  gcArmAllocCache()
+  allocN(g, metaAddr, MAIN_N)
+  return true
+}
+
+// Run the whole program against one platform's thread provider. The provider
+// arrives as function VALUES, which is what lets one copy of this check run
+// on either platform — `../gcprops`'s own `gcThreadsRun` is the same shape.
+export fn migrateRun(
+  startFn: (*byte, *byte, *i32) => int,
+  releaseFn: (int) => bool,
+  sleepFn: (int) => (),
+  monoFn: () => int,
+): MigrateResult {
+  // Ambient allocations: everything the private heap needs, built BEFORE the
+  // cache is armed (see this file's own header on why the order matters).
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let listLock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = BODY_SIZE
+  meta[1] = 0
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  atomicStore(ptrOf(heapLock), spinUnlocked)
+  atomicStore(ptrOf(listLock), spinUnlocked)
+
+  let g = ptrOf(state)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  let empty = MigrateResult{
+    started = false,
+    joined = false,
+    released = false,
+    naiveShort = false,
+    exactMatch = false,
+  }
+  if (!migrateBootAndFill(g, int(hp), int(ptrOf(heapLock)), int(ptrOf(listLock)), metaAddr)) {
+    return empty
+  }
+
+  // `sharedG`/`sharedMeta` are published before the create call, which
+  // happens-before the child's first read of either (the provider's own
+  // create call is the synchronizing event) — `threadStart` itself arms
+  // `doneWord` with `runningSentinel()`, so this must not race it.
+  sharedG[0] = i64(int(g))
+  sharedMeta[0] = i64(metaAddr)
+
+  let handle = startFn(migrateChildEntry(), byteAt0(), ptrOf(doneWord))
+  let started = handle != 0
+
+  let joined = false
+  if (started) {
+    joined = threadJoin(ptrOf(doneWord), JOIN_NS, sleepFn, monoFn) == threadJoinDone
+  }
+
+  let released = false
+  if (started) {
+    released = releaseFn(int(handle))
+  }
+
+  let total = MAIN_N + CHILD_N
+  return MigrateResult{
+    started = started,
+    joined = joined,
+    released = released,
+    naiveShort = gcNumObjects(g) < total,
+    exactMatch = gcNumObjectsExact(g) == total,
+  }
+}
+
+// `threadStart` (both platforms) takes an `arg: *byte` the child never reads
+// here — everything it needs travels through `sharedG`/`sharedMeta` above,
+// set by the parent before the create call happens-before the child's first
+// read. A null pointer says so directly rather than packing an address this
+// program never uses.
+fn byteAt0(): *byte {
+  let z: *byte = nil
+  return z
+}
