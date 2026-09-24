@@ -305,36 +305,7 @@ reloc_sites_seen=0
 # too, which is what empties the table at the next stage0 repin instead of
 # leaving a stale entry masking a later regression on that exact symbol.
 #
-# 2026-09-24, #5820 (24c3d7438, onX64() folded to the build target): on
-# aarch64 the x86-64 arms of runtime/cryptohw's `if (onX64())` guards are now
-# deleted before codegen, and with them the x86-64-only panic messages those
-# arms referenced (the ___bitstr_* strings below). stage0 0.26.0 still emits
-# both arms. Empties at the next repin.
-#
-# 2026-09-24, #5796 (9ef3c9994, the map table fix): runtime/root's map hit
-# path now branches on `onX64()`. stage0 inlines that call, and the inlined
-# body carries a source-location reference to `syscalls/syscalls.bit`, one
-# string in root.o's table, numbered ___bitstr_300 there. This tree folds the
-# call to a constant, so the filename and its string never appear. Confirmed by
-# building runtime/root with both compilers: 301 strings against 300, and
-# `syscalls/syscalls.bit` is the only one missing. Empties at the next repin.
 RELOC_DECLARED="
-runtime/root - ARM64_RELOC_UNSIGNED ___bitstr_300
-runtime/root - ARM64_RELOC_UNSIGNED ___bitstr_300_data
-runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_1
-runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_10
-runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_3
-runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_4
-runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_7
-runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_8
-runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_1
-runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_10
-runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_3
-runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_4
-runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_7
-runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_8
-runtime/cryptohw - ARM64_RELOC_UNSIGNED ___bitstr_58
-runtime/cryptohw - ARM64_RELOC_UNSIGNED ___bitstr_58_data
 "
 
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —
