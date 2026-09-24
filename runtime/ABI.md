@@ -1326,7 +1326,10 @@ is the load-bearing part rather than the instruction count.
 **The GC trigger moved to the allocation door, and that is where it belongs.**
 `heapLive` and `gcNumObjectsIdx` rise in `allocObject` and nowhere else; a free
 only lowers them and a collection only raises the trigger they are compared
-against. So the allocation door is the only place `gcShouldCollect` can turn from
+against. (A thread with an allocation-cache entry charges both privately and
+settles them into the shared words from its own allocation path, or, for the
+object count, at the start of a collection, which recomputes the trigger anyway:
+#5709, #5821, `runtime/gc/gcalloccache.bit`.) So the allocation door is the only place `gcShouldCollect` can turn from
 false to true, and it is the only place that publishes for it. This does NOT make
 the allocation door a collection point — collection still happens only at a
 safepoint, where the roots are precise. It records the fact so the back edge can
