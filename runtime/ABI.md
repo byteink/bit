@@ -2007,6 +2007,68 @@ Both live in the HEAP BLOCK (`heapWords` 41 → 43), never the GC state block
 and a new counter belongs beside `heapLiveWord`/`heapMappedWord`, which the
 same block already carries for the same reason.
 
+### 8.3 `BIT_GC_STATS` pause-time fields
+
+Before these fields existed, `BIT_GC_STATS=1` could show a wall-clock
+regression with no collector-side counter that moved — #5828 found
+`bench/cases/allocpar` running ~4x Go's wall time on identical cycle counts,
+because seven of eight `BIT_WORKERS` sit idle through every collection while
+the world is stopped, and nothing on the line said how long that was. Seven
+fields close that gap, appended AFTER `allocbytes=` (§8.2) so `bench/run.sh`
+and `bench/objprobe`, which parse `swept=`/`live=` by name, are unaffected:
+
+```
+pauses=<n> pausens=<n> pausemaxns=<n> rdvns=<n> rootsns=<n> drainns=<n> sweepns=<n>
+```
+
+| field | meaning |
+|---|---|
+| `pauses=` | rounds `stwPollOn` (`runtime/stw/stwpoll.bit`) stopped the world for — `gcShouldCollect` held under the world lock, success or ABANDON alike |
+| `pausens=` | summed wall nanoseconds the world was stopped, across every pause `pauses=` counts |
+| `pausemaxns=` | the single longest pause, in nanoseconds |
+| `rdvns=` | summed nanoseconds in the rendezvous (`stwRetryRendezvous`), success and ABANDON alike |
+| `rootsns=` | summed nanoseconds scanning roots — `stwCollect`'s own span minus `drainns=`/`sweepns=` for the same collection |
+| `drainns=` | summed nanoseconds in `drain` + `recoverOverflow` (`runtime/gc/gccollect.bit`'s `gcDrainAndSweep`) |
+| `sweepns=` | summed nanoseconds in `sweep` (`gcDrainAndSweep`) |
+
+**`pauses=` is not always `collections=`.** An ABANDONED round (every
+`stwRendezvousRetryBound` retry expired, `abandoned=` above) stops the world
+and restarts it without collecting, so it advances `pauses=`/`pausens=`/
+`pausemaxns=`/`rdvns=` but not `rootsns=`/`drainns=`/`sweepns=`, which stay at
+that round's 0. This is the rare, contention-bound exception
+`stwRetryRendezvous`'s own header describes; `pauses=` equals `collections=`
+on every ordinary run.
+
+**One clock, three targets, reused rather than reinvented.** The nanosecond
+read is `runtime/gc/gcstopwait.bit`'s `bit_rt_port_gc_ticks`, whose three
+provider bodies (`runtime/gc/{darwin,linux,windows}/gcstopwait.bit`) each
+forward to the SAME monotonic clock `runtime/park`'s `bit_rt_port_park_mono_ns`
+already provides for that OS — `mach_absolute_time` scaled by the cached
+`mach_timebase_info` ratio on Darwin, `clock_gettime(CLOCK_MONOTONIC)` through
+a raw `syscall` on Linux, `QueryPerformanceCounter`/`QueryPerformanceFrequency`
+on Windows — rather than a second cache of the same ratio. Called only by the
+thread holding the world lock (`worldLockTry`, `runtime/gc/gcworld.bit`), so
+there is exactly one caller at a time and the Linux/Windows scratch words each
+provider keeps for the underlying clock call are plain module state, not
+`@threadlocal` — unlike `runtime/gc/linux/gcstopwait.bit`'s existing
+`gcStopWaitTs`, which every parked mutator writes at once.
+
+**Once per COLLECTION, never per allocation.** The four timestamps a pause
+takes (`runtime/stw/stwpoll.bit`'s `stwPollOn`/`stwFinishPause`,
+`runtime/gc/gccollect.bit`'s `gcDrainAndSweep`) are read only inside the
+already-stopped-world section a collection pays for regardless; no allocation
+or safepoint poll reads the clock. Measured (`BIT_LIBBITRT_TREE=1`, a null
+copy, 15 interleaved runs): `allocpar`/`alloc`/`json` cycles with
+`BIT_GC_STATS` UNSET are indistinguishable from the same runs before this
+change, inside the null copy's own run-to-run spread.
+
+The seven accumulators are plain words in `runtime/stw`'s own module state
+(`runtime/stw/stwstats.bit`), not a new `gcWords` slot: that block is
+boot-pinned exactly full (§8.2), and this change does not grow it or
+`heapWords`. Written only by the thread holding the world lock, so no atomic
+is needed — the same argument `gcAddr`/`stwAbandoned` (`runtime/stw/stw.bit`)
+already rest on.
+
 ---
 
 ## 9. Program entry, boot, and spawn (`runtime/root`)
