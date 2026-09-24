@@ -16,6 +16,10 @@ fn mkIv(vreg: int, regClass: RegClass, start: int, end: int, isRef: bool): LiveI
   return LiveInterval{ vreg = vreg, regClass = regClass, start = start, end = end, isRef = isRef }
 }
 
+fn noEdges(): []CfgEdge {
+  return []CfgEdge(0)
+}
+
 fn mkRegs(intCount: int, floatCount: int): TargetRegs {
   return TargetRegs{
     intRegs = RegFile{ count = intCount, calleeSaved = 0, pollSaved = 0 },
@@ -253,7 +257,7 @@ fn checkRegallocCoalesce() {
   // v1 aliases v0. They must land on the SAME register — that identity is what
   // turns the block edge's `v1 := v0` into a self-move the sequencer drops.
   let ivs = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 5, 12, false)]
-  let r = allocateCoalesced(mkRegs(2, 0), ivs, allocPoints([]int(0), []int(0)), [0, 0])
+  let r = allocateCoalesced(mkRegs(2, 0), ivs, allocPoints([]int(0), []int(0)), [0, 0], noEdges())
   assert(!r.locations[0].isSpill && !r.locations[1].isSpill)
   assert(r.locations[0].index == r.locations[1].index, "an alias must take its root's register")
 
@@ -265,7 +269,13 @@ fn checkRegallocCoalesce() {
     mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 5, 12, false),
     mkIv(2, RegClass.Int, 8, 20, false),
   ]
-  let r2 = allocateCoalesced(mkRegs(1, 0), ivs2, allocPoints([]int(0), []int(0)), [0, 0, 2])
+  let r2 = allocateCoalesced(
+    mkRegs(1, 0),
+    ivs2,
+    allocPoints([]int(0), []int(0)),
+    [0, 0, 2],
+    noEdges(),
+  )
   assert(r2.locations[0].index == r2.locations[1].index && !r2.locations[0].isSpill)
   assert(
     r2.locations[2].isSpill,
@@ -274,25 +284,32 @@ fn checkRegallocCoalesce() {
 
   // Coalescing also BUYS a register: the same three intervals without the alias
   // relation need two registers, and v2 gets one here where it spilled above.
-  let r3 = allocateCoalesced(mkRegs(2, 0), ivs2, allocPoints([]int(0), []int(0)), [0, 0, 2])
+  let r3 = allocateCoalesced(
+    mkRegs(2, 0),
+    ivs2,
+    allocPoints([]int(0), []int(0)),
+    [0, 0, 2],
+    noEdges(),
+  )
   assert(!r3.locations[2].isSpill && r3.locations[2].index != r3.locations[0].index)
 
   // A reference reaching a safepoint only through its alias is still reported,
   // once — the root carries the merged interval and the shared location, so
   // listing the alias too would name the same register twice.
   let ivs4 = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 5, 12, true)]
-  let r4 = allocateCoalesced(mkRegs(2, 0), ivs4, allocPoints([9], []int(0)), [0, 0])
+  let r4 = allocateCoalesced(mkRegs(2, 0), ivs4, allocPoints([9], []int(0)), [0, 0], noEdges())
   assert(len(r4.stackMaps[0].regs) == 1, "a shared live reference is reported exactly once")
   assert(r4.stackMaps[0].regs[0] == r4.locations[1].index)
 
   // Inertness pin: identity roots must allocate exactly as an empty roots array
   // does, which is exactly as `allocate` did before this parameter existed.
-  let r5 = allocateCoalesced(mkRegs(2, 0), ivs, allocPoints([]int(0), []int(0)), [0, 1])
+  let r5 = allocateCoalesced(mkRegs(2, 0), ivs, allocPoints([]int(0), []int(0)), [0, 1], noEdges())
   assert(r5.locations[0].index != r5.locations[1].index || r5.locations[1].isSpill)
   let r6 = allocate(mkRegs(2, 0), ivs, []int(0), []int(0))
   assert(r5.locations[0].index == r6.locations[0].index && r5.locations[1].index == r6.locations[1].index)
   checkRegallocSpillCost()
   checkRegallocRemat()
+  checkRegallocClearsDeadRefSlot()
 }
 
 // Three intervals over the SAME range, `uses` set per vreg. The shape the
@@ -386,9 +403,63 @@ fn checkRegallocRemat() {
   let rc = mkIv(2, RegClass.Int, 1, 5, false)
   ra.remat = true
   let r2 = allocateCoalesced(
-    mkRegs(1, 0), [ra, rb, rc], allocPoints([]int(0), []int(0)), [0, 0, 2],
+    mkRegs(1, 0), [ra, rb, rc], allocPoints([]int(0), []int(0)), [0, 0, 2], noEdges(),
   )
   assert(r2.locations[0].isSpill && r2.locations[0].index == 0, "an aliased root keeps its slot")
   assert(r2.numSpillSlots == 1)
   assert(r2.locations[1].isSpill && r2.locations[1].index == 0, "the alias shares that slot")
+}
+
+// #5847. Four blocks: B0 [0,2] -> header B1 [3,5] -> body B2 [6,8] -> back to
+// B1, and B1 -> exit B3 [9,14]. One register, so the reference v0, live from
+// B0 to the latch, is evicted by v1 into a fresh slot that nothing rewrites.
+fn loopEdges(): []CfgEdge {
+  return [
+    CfgEdge{ src = 0, dst = 1, srcStart = 0, srcLast = 2, dstStart = 3 },
+    CfgEdge{ src = 1, dst = 2, srcStart = 3, srcLast = 5, dstStart = 6 },
+    CfgEdge{ src = 1, dst = 3, srcStart = 3, srcLast = 5, dstStart = 9 },
+    CfgEdge{ src = 2, dst = 1, srcStart = 6, srcLast = 8, dstStart = 3 },
+  ]
+}
+
+fn onlyClear(r: RegAllocResult, src: int, dst: int, slot: int): bool {
+  return len(r.clears) == 1 &&
+    r.clears[0].src == src &&
+    r.clears[0].dst == dst &&
+    r.clears[0].slot == slot
+}
+
+fn checkRegallocClearsDeadRefSlot() {
+  let none = allocPoints([]int(0), []int(0))
+  let v0 = mkIv(0, RegClass.Int, 1, 8, true)
+  let v1 = mkIv(1, RegClass.Int, 2, 5, false)
+  let v2 = mkIv(2, RegClass.Int, 6, 12, false)
+  let r = allocateCoalesced(mkRegs(1, 0), [v0, v1, v2], none, []int(0), loopEdges())
+  assert(r.locations[0].isSpill && r.locations[0].index == 0)
+  assert(
+    onlyClear(r, 1, 3, 0),
+    "the loop exit zeroes the dead reference's slot, and nothing else does",
+  )
+
+  // v3 recycles slot 0 at B3's first position, so zeroing it there would
+  // destroy a live value.
+  let v3 = mkIv(3, RegClass.Int, 9, 14, false)
+  let r2 = allocateCoalesced(mkRegs(1, 0), [v0, v1, v2, v3], none, []int(0), loopEdges())
+  assert(r2.locations[3].isSpill && r2.locations[3].index == 0)
+  assert(len(r2.clears) == 0, "a slot another interval holds across the edge is not zeroed")
+
+  // Only references: the frame scan cannot be fooled by an integer.
+  let r3 = allocateCoalesced(
+    mkRegs(1, 0), [mkIv(0, RegClass.Int, 1, 8, false), v1, v2], none, []int(0), loopEdges(),
+  )
+  assert(r3.locations[0].isSpill && len(r3.clears) == 0)
+
+  // A reference that dies in the header: B1 -> B2 stays inside the loop body
+  // and would pay a store every iteration, so only the exit edge clears it.
+  let r4 = allocateCoalesced(
+    mkRegs(1, 0), [mkIv(0, RegClass.Int, 2, 4, false), mkIv(1, RegClass.Int, 3, 4, true)],
+    none, []int(0), loopEdges(),
+  )
+  assert(r4.locations[1].isSpill)
+  assert(onlyClear(r4, 1, 3, 0), "no clear on an edge inside a loop body")
 }

@@ -1,0 +1,181 @@
+// #5847: zeroing a DEAD spilled reference's stack slot on the control-flow
+// edges where its interval ends. Sibling of regalloc.bit, same module;
+// `allocateCoalesced` calls `computeSlotClears` once its locations are final,
+// and each backend emits the answer on the edge it names.
+//
+// ## Why a dead slot is a root
+//
+// runtime/ABI.md scans every frame CONSERVATIVELY on every collection
+// (`stwScanStackRange`), so any word in a spill slot that looks like a heap
+// pointer keeps its object alive, whatever the stack map says. A spill slot
+// keeps its last value until something rewrites it. An evicted interval gets
+// a slot nothing else has ever used (`assignSpill`, `reuse = false`), so once
+// its value is dead nothing may ever write that slot again: the pointer stays
+// a root for the rest of the call. #5824 measured it: `bench/cases/alloc`
+// kept one batch's 5000 nodes reachable through the next batch's build loop,
+// GC drain 3.0 ms -> 21.5 ms on x86-64.
+//
+// ## Why zeroing it is sound
+//
+// codegenlive.bit builds one interval per value with no holes, and lowering
+// threads every value live across a back edge through the header's params
+// (optloop.bit's header states and keeps that invariant). So a value live on
+// entry to block B covers B's first position, and `B.start > iv.end` means
+// the value is dead on entry to B on every path. That is the same fact slot
+// recycling already relies on: `expireSpills` hands the slot to any interval
+// starting after `iv.end`. A zero store is one more such write, so it needs
+// exactly one extra check: no OTHER interval sharing the slot may be live
+// across the edge. A param of B is written by the edge's own moves, which is
+// why the window runs from the source block's last position, not from B.
+//
+// ## Why on the edge, and not on every edge
+//
+// The clear is emitted ON the edge, after its parallel moves (which may read
+// the dead value as an argument) and before its jump, so it runs exactly as
+// often as the edge. Emitting it at B's start instead would run it on every
+// entry to B: a loop header entered from its preheader would pay a store per
+// iteration for a value that died before the loop.
+//
+// An edge that stays inside one loop body is skipped. Such a candidate always
+// belongs to a value the same iteration defines (a value from outside the loop
+// that is read inside it is a header param, live to the latch), so the store
+// would run every iteration while the next definition rewrites the slot
+// anyway. What is left runs at most once per loop entry: an edge that leaves
+// a loop, one that enters a loop at its header, and one outside every loop.
+// Only forward edges qualify at all, so a back edge never carries a clear
+// and no clear ever sits next to a back-edge poll.
+
+// One CFG edge, in the position numbering the intervals use. `src`/`dst` are
+// block ids in layout order (a back edge has `dst <= src`); `srcStart` and
+// `srcLast` are the source block's first and last positions, `dstStart` the
+// target's first.
+class CfgEdge {
+  src: int,
+  dst: int,
+  srcStart: int,
+  srcLast: int,
+  dstStart: int,
+}
+
+// Store zero to spill `slot` on the edge `src` -> `dst`.
+class SlotClear {
+  src: int,
+  dst: int,
+  slot: int,
+}
+
+// A reference that lives in a real stack word. A remat interval owns no slot
+// (index -1), a register holds nothing the frame scan reads, and an alias's
+// `isRef` was moved onto its root by `mergeAliases`, so each slot is judged
+// once, through the interval that owns the merged range.
+fn ownsRefSlot(iv: LiveInterval, loc: RegLoc): bool {
+  return iv.isRef && loc.isSpill && loc.index >= 0
+}
+
+// The interval reaches into the edge's source block and is dead on entry to
+// its target.
+fn edgeEndsInterval(iv: LiveInterval, e: CfgEdge): bool {
+  return e.dstStart > iv.end && e.srcStart <= iv.end && e.srcLast >= iv.start
+}
+
+// Another interval assigned `slot` is live somewhere between the source
+// block's terminator and the target's first position.
+fn slotBusyOnEdge(
+  scan: []LiveInterval, locations: []RegLoc, owner: int, slot: int, e: CfgEdge,
+): bool {
+  let i = 0
+  while (i < len(scan)) {
+    if (i != owner && holdsSlotAcross(scan[i], locations[scan[i].vreg], slot, e)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn holdsSlotAcross(w: LiveInterval, loc: RegLoc, slot: int, e: CfgEdge): bool {
+  return loc.isSpill && loc.index == slot && w.start <= e.dstStart && w.end >= e.srcLast
+}
+
+// The last block of the loop headed by `header`: its furthest back-edge
+// source. -1 when `header` is not a loop header. Loops are block ranges
+// because lowering emits a loop's blocks between its header and its latch.
+fn loopEndOf(edges: []CfgEdge, header: int): int {
+  let end = -1
+  for b of edges {
+    if (b.dst == header && b.dst <= b.src && b.src > end) {
+      end = b.src
+    }
+  }
+  return end
+}
+
+// Runs at most once per loop entry: see the header. `e` enters a loop, leaves
+// one, or lies in none.
+fn edgeOutsideLoopBody(edges: []CfgEdge, e: CfgEdge): bool {
+  if (loopEndOf(edges, e.dst) >= 0) {
+    return true
+  }
+  let inLoop = false
+  for b of edges {
+    if (b.dst <= b.src && b.dst <= e.src && e.src <= b.src) {
+      inLoop = true
+      if (e.dst > loopEndOf(edges, b.dst)) {
+        return true
+      }
+    }
+  }
+  return !inLoop
+}
+
+fn hasSlotClear(clears: []SlotClear, src: int, dst: int, slot: int): bool {
+  for c of clears {
+    if (c.src == src && c.dst == dst && c.slot == slot) {
+      return true
+    }
+  }
+  return false
+}
+
+// Every clear, in interval order then edge order, each (edge, slot) once.
+// `locations` must be final: aliases propagated, float slots shifted.
+fn computeSlotClears(scan: []LiveInterval, locations: []RegLoc, edges: []CfgEdge): []SlotClear {
+  let out = []SlotClear(0)
+  let owner = 0
+  while (owner < len(scan)) {
+    if (ownsRefSlot(scan[owner], locations[scan[owner].vreg])) {
+      out = appendSlotClears(out, scan, locations, owner, edges)
+    }
+    owner = owner + 1
+  }
+  return out
+}
+
+// `out` plus the clears `scan[owner]` needs.
+fn appendSlotClears(
+  out: []SlotClear, scan: []LiveInterval, locations: []RegLoc, owner: int, edges: []CfgEdge,
+): []SlotClear {
+  let iv = scan[owner]
+  let slot = locations[iv.vreg].index
+  for e of edges {
+    if (edgeEndsInterval(iv, e) && edgeOutsideLoopBody(edges, e)) {
+      assert(e.dst > e.src) // dead on entry to the target: never a back edge
+      if (!slotBusyOnEdge(scan, locations, owner, slot, e) &&
+        !hasSlotClear(out, e.src, e.dst, slot)) {
+        out = append(out, SlotClear{ src = e.src, dst = e.dst, slot = slot })
+      }
+    }
+  }
+  return out
+}
+
+// The slots a backend zeroes on the edge `src` -> `dst`, in `clears` order.
+fn edgeClearSlots(clears: []SlotClear, src: int, dst: int): []int {
+  let out = []int(0)
+  for c of clears {
+    if (c.src == src && c.dst == dst) {
+      out = append(out, c.slot)
+    }
+  }
+  return out
+}
