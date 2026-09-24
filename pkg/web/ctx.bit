@@ -33,25 +33,51 @@ import { indexOf, trimSpace } from "std/strings"
 const maxHeaderBytes = 8192
 const maxHeaderCount = 100
 
-// Parses a raw header block into a case-insensitive, multi-value lookup
-// keyed by lowercased name. Fails outright — never truncates — when either
-// cap is exceeded, since a truncated parse would silently drop a header a
-// handler goes on to trust. A line with no colon, or an empty name (a
-// colon at position 0), is dropped rather than guessed at: it is never
-// recorded as a name with an empty value, so `headers(name)` on a dropped
-// line's text returns an empty slice, not a one-element slice holding "".
-fn parseHeaders(raw: string): map<string, []string>! {
+// Enforces the two caps `parseHeaders` used to enforce inline, without
+// building anything: `newCtx` (below) calls this on EVERY request, whether
+// or not the request's handler ever reads a header, so a cap check that
+// allocated would tax every request for a map only some of them build.
+//
+// The line count matches `len(split(raw, "\r\n"))` exactly — the number of
+// "\r\n" occurrences plus one for a non-empty `raw` — computed by a byte
+// scan rather than by calling `split`, since `"\r\n"` cannot overlap itself
+// (its first byte differs from its second), a scan that never skips ahead
+// counts the identical set of occurrences `split` would.
+fn checkHeaderCaps(raw: string): ()! {
   if (len(raw) > maxHeaderBytes) {
     fail newError("web: header block is ${len(raw)} byte(s), exceeds the ${maxHeaderBytes}-byte cap")
   }
+  if (len(raw) == 0) {
+    return
+  }
+  let lines = 1
+  let i = 0
+  while (i < len(raw) - 1) {
+    if (raw[i] == '\r' && raw[i + 1] == '\n') {
+      lines = lines + 1
+    }
+    i = i + 1
+  }
+  if (lines > maxHeaderCount) {
+    fail newError("web: request has ${lines} header line(s), exceeds the ${maxHeaderCount}-line cap")
+  }
+}
+
+// Parses a raw header block into a case-insensitive, multi-value lookup
+// keyed by lowercased name. Never fails — `checkHeaderCaps` above already
+// refused anything over either cap before `newCtx` ever calls this, and it
+// is only called at all on a `Ctx` whose first `headers()`/`header()` call
+// has arrived (`Ctx.headersParsed`, below). A line with no colon, or an
+// empty name (a colon at position 0), is dropped rather than guessed at: it
+// is never recorded as a name with an empty value, so `headers(name)` on a
+// dropped line's text returns an empty slice, not a one-element slice
+// holding "".
+fn buildHeaderMap(raw: string): map<string, []string> {
   let out = map<string, []string>()
   if (len(raw) == 0) {
     return out
   }
   let lines = split(raw, "\r\n")
-  if (len(lines) > maxHeaderCount) {
-    fail newError("web: request has ${len(lines)} header line(s), exceeds the ${maxHeaderCount}-line cap")
-  }
   for line of lines {
     if (len(line) == 0) {
       continue
@@ -76,10 +102,28 @@ fn parseHeaders(raw: string): map<string, []string>! {
 export class Ctx {
   req: Request
   reqPath: string
+  // The raw (still percent-encoded) query string `newCtx` split off
+  // `req.path`, held so `query()` can decode it lazily — see `queryValues`
+  // and `queryParsed` below, the same shape `headerValues`/`headersParsed`
+  // use for the header block.
+  rawQuery: string
+  // Built on the first `query()` call, from `rawQuery` above — a request
+  // whose handler never reads a query value, true of most benchmark
+  // traffic and every plain GET with no query string, never pays for
+  // `parseQuery`'s map and percent-decoding. `nil` (a map's zero value)
+  // until then, exactly as `headerValues` is.
   queryValues: map<string, string>
+  queryParsed: bool
   params: map<string, string>
   registry: NameRegistry
+  // Built on the first `header()`/`headers()` call (`headersParsed` below),
+  // not by `newCtx` — a request whose handler never reads a header, which
+  // is most of a plaintext or JSON benchmark's traffic, never pays for the
+  // map. `nil` (a map's zero value, SPEC §5.8/§13.4) until then, which is
+  // safe because every reader goes through `headers()`, and it is the only
+  // place this field is ever read.
   headerValues: map<string, []string>
+  headersParsed: bool
   // The fully-prefixed pattern the router matched for this request
   // (`Match.pattern`, router.bit) — `/api/v1/users`, never `/users`, because
   // `Group.register` folds every group prefix in before the router sees it.
@@ -125,7 +169,15 @@ export class Ctx {
   // A decoded query-string value by name, or "" if absent. Percent-decoding
   // and the last-wins duplicate policy are std/http's own (`parseQuery`,
   // stdlib/http/query.bit) — reused here, not reimplemented.
+  //
+  // Builds `queryValues` on the first call, from `rawQuery` `newCtx` already
+  // split off the request path — so a request that never reaches here never
+  // decodes it at all.
   export query(name: string): string {
+    if (!this.queryParsed) {
+      this.queryValues = parseQuery(this.rawQuery)
+      this.queryParsed = true
+    }
     let (v, ok) = this.queryValues[name]
     if (ok) {
       return v
@@ -145,7 +197,15 @@ export class Ctx {
   // Every value of header `name` (case-insensitive), in the order they
   // appeared. A repeated header is never overwritten — this is the only
   // accessor that can see a repeat; `header()` returns just the first.
+  //
+  // Builds `headerValues` on the first call, from the raw block `newCtx`
+  // already validated with `checkHeaderCaps` — so a request that never
+  // reaches here never builds it at all.
   export headers(name: string): []string {
+    if (!this.headersParsed) {
+      this.headerValues = buildHeaderMap(this.req.headers)
+      this.headersParsed = true
+    }
     let (v, ok) = this.headerValues[toLower(name)]
     if (ok) {
       return v
@@ -564,9 +624,13 @@ fn fillRoutePattern(name: string, pattern: string, args: []string): string! {
 
 // Builds a `Ctx` for one request: splits `req.path` into the matched path
 // and the raw query once (std/http's `splitTarget`), decodes the query
-// (`parseQuery`), and parses `req.headers` (`parseHeaders`, above) —
-// failing rather than constructing a `Ctx` on a request whose header block
-// breaks either cap. `params` is the router's own `Match.params` (#3881);
+// (`parseQuery`), and checks `req.headers` against both caps
+// (`checkHeaderCaps`, above) — failing rather than constructing a `Ctx` on a
+// request whose header block breaks either cap, without building the header
+// map itself: that happens on the first `header()`/`headers()` call,
+// `Ctx.headers` above. The query string is likewise only SPLIT off here
+// (`splitTarget`), never decoded — `query()` does that lazily too, from
+// `rawQuery`. `params` is the router's own `Match.params` (#3881);
 // `registry` is the App's `NameRegistry` (app.bit) that named this route,
 // if any; `routePattern` is that same `Match`'s `pattern` — the fully
 // prefixed route the request matched, which `c.created(id)` derives a
@@ -581,14 +645,13 @@ export fn newCtx(
   routePattern: string,
 ): Ctx! {
   let (path, rawQuery) = splitTarget(req.path)
-  let headerValues = parseHeaders(req.headers)?
+  checkHeaderCaps(req.headers)?
   return Ctx{
     req = req,
     reqPath = path,
-    queryValues = parseQuery(rawQuery),
+    rawQuery = rawQuery,
     params = params,
     registry = registry,
-    headerValues = headerValues,
     config = config,
     routePattern = routePattern,
   }
