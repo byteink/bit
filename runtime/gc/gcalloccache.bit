@@ -28,14 +28,14 @@
 // `runtime/spinlock.bit`), so the fix is to stop reaching the lock rather than
 // to spin better.
 //
-// A thread takes a BATCH of slots out of a class's free list under the lock and
-// hands them out one at a time with no lock at all, so the lock is taken once
-// per `acMaxBytes / size` allocations instead of once per allocation.
+// A thread takes one CHAIN of a span's free slots under the lock and hands them
+// out one at a time with no lock at all, so the lock is taken once per chain
+// instead of once per allocation.
 //
 // WHAT THE COLLECTOR SEES IS UNCHANGED, and that is the whole correctness
-// argument. A cached slot is in exactly the state a free-list slot is in: it is
-// off the free list, its span's `spanLive`/`spanFree`/`spanEmpty` moved when it
-// was taken (so `heapCheckSpansLocked`'s `sum(total - free) == spanLive` still
+// argument. A cached slot is in exactly the state of a slot just taken off its
+// span: it is off its span's chains, its span's `spanLive`/`spanFree`/
+// `spanEmpty` moved when it was taken (so `heapCheckSpansLocked`'s `sum(total - free) == spanLive` still
 // balances, stress-mode check included), no `setSlotBit` bit is set for it, it
 // is on no object list, and `gcOwns` therefore answers false for its address.
 // Nothing marks it, nothing sweeps it, and nothing can hand it out twice — it
@@ -59,7 +59,7 @@
 //
 // `heapAllocBytes` — the cumulative, never-decremented `allocbytes=` stat whose
 // only reader is `runtime/stw/stwstats.bit`'s `statsReport` — DOES move: it is
-// charged where the slot leaves the free list, so it now runs ahead of the
+// charged where the slot leaves its span, so it now runs ahead of the
 // bytes actually handed out by whatever is sitting in caches, bounded by
 // `acSpanBytes` per class per thread.
 //
@@ -129,32 +129,29 @@ const acLive = 41
 const acObjs = 42
 const acGc = 43
 
-// Most bytes of ONE class ONE thread may hold, and the hard ceiling on the
-// batch. A cap in BYTES rather than in slots is what keeps the idle footprint
-// flat across the 37 classes: the same rule gives 512 slots' worth of an 8-byte
-// class (clamped to `acMaxBatch`) and none at all above 4 KiB, where an
+// Classes a thread caches: every class of at most `acMaxBytes / 2` bytes, so a
+// cached class always yields at least two slots per refill. Above that an
 // allocation is rare enough that the lock it takes is not measurable and the
 // memory a cache would hold is not.
 const acMaxBytes = 4096
-const acMaxBatch = 64
 
-// Most bytes ONE refill may hand ONE thread (#5827). A refill takes at least
-// the `acMaxBytes` batch above and then runs on to the end of the span its
-// last slot came from (`heapTakeBatchLocked`, `../alloc/freelist.bit`), so a
-// span's slots, bitmap words and header stay with one thread instead of being
-// dealt out 64 slots at a time to every thread that refills.
+// Most bytes ONE refill hands ONE thread: one chain, at most
+// `allocSpanChainBytes` of one span (#5831, `../alloc/spanmeta.bit`). The
+// refill takes it whole with constant work under the lock
+// (`heapTakeBatchLocked`, `../alloc/freelist.bit`), and its slots, bitmap words
+// and lines stay with one thread instead of being dealt out to every thread
+// that refills (#5827).
 //
-// THE CAP IS A QUARTER SPAN, CHOSEN BY MEASUREMENT. `bench/cases/allocpar`
-// (8 mutators, M5 Max, 7 interleaved runs, cycles / peak RSS): no run cap
-// 5749M / 12.05 MB; 8 KiB 3739M / 12.36 MB; 32 KiB 2118M / 12.27 MB; a whole
-// 128 KiB span 1887M / 13.42 MB. The whole span buys 11% more cycles for 1.4
-// MB of RSS; a quarter span is where the cycles stop falling faster than the
-// memory rises. WORST-CASE IDLE FOOTPRINT, per thread: 28 cacheable classes
-// (every class of at most `acMaxBytes / 2` bytes) x `acSpanBytes` = 896 KiB,
-// against 28 x `acMaxBytes` = 112 KiB before. `acMaxChain` is the longest
-// chain that allows, `acSpanBytes / 8`, and bounds every walk of one.
-const acSpanBytes = 32768
-const acMaxChain = 4096
+// THE CAP IS A QUARTER SPAN, CHOSEN BY MEASUREMENT. #5827 measured the run
+// taken slot by slot (`bench/cases/allocpar`, 8 mutators, M5 Max): 32 KiB
+// 2118M cycles / 12.27 MB, a whole 128 KiB span 1887M / 13.42 MB. #5831
+// measured both with the chain taken in O(1); the figures are on that ticket.
+// WORST-CASE IDLE FOOTPRINT, per OS thread with an entry: 28 cacheable classes
+// (every class of at most `acMaxBytes / 2` bytes) x `acSpanBytes` = 896 KiB.
+// `acMaxChain` is the longest chain that allows, `acSpanBytes / 8`, and bounds
+// every walk of one.
+const acSpanBytes = allocSpanChainBytes
+const acMaxChain = allocSpanChainBytes / 8
 
 // Probes before giving up and using the lock. Linear, so a collision costs the
 // colliding thread one extra load per allocation and nothing else.
@@ -452,9 +449,8 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   gcAllocCacheFlush(e, h)
   let idx = 0
   // Bounded: `allocNumClasses` iterations outside, `acMaxChain` inside — a
-  // chain is only ever built by `allocCacheFillLocked`, which stops at
-  // `acSpanBytes / allocClassSize(idx)` slots, never more than
-  // `acSpanBytes / 8`.
+  // chain is only ever one chain of one span (`allocCacheFillLocked`), which
+  // holds at most `acSpanBytes / 8` slots.
   while (idx < allocNumClasses) {
     let a = *(e + acHeads + idx)
     let k = 0
@@ -554,42 +550,31 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
   return addr
 }
 
-// Top up class `idx`'s chain. CALLER MUST HOLD `heapLock(g)`, and must already
-// have taken the slot it is about to return to its own caller — this only fills
-// the cache, so a class that cannot yield a single extra slot simply leaves it
-// empty and the next allocation refills through the lock again.
+// Fill class `idx`'s empty chain with one whole chain of the heap's. CALLER
+// MUST HOLD `heapLock(g)`, and must already have taken the slot it is about to
+// return to its own caller — this only fills the cache, so a class that cannot
+// yield a single extra slot simply leaves it empty and the next allocation
+// refills through the lock again.
 //
-// ONE SPLICE, NOT `want` POPS (#5448). This used to call `heapTakeSmallLocked`
-// once per cached slot, which left the total work done UNDER the lock per
-// allocation exactly what it was before the cache existed — the batch made the
-// lock rarer, not shorter, and a saturated lock does not care which. A 4x larger
-// batch was measured and bought nothing, which is what sent this here;
-// `../alloc/freelist.bit`'s `heapTakeBatchLocked` carries the figures and the list
-// of per-slot work that disappears.
+// ONE TAKE OF CONSTANT WORK (#5831), where #5448 made it one splice and #5436
+// `want` pops: the work done under the lock per refill no longer grows with
+// the slots it hands over. `../alloc/freelist.bit`'s `heapTakeBatchLocked`
+// carries the figures.
 //
-// THE REFILL STILL NEVER GROWS THE HEAP: it takes only what the class's free
-// list already holds, so it cannot map a span and cannot fail, and the span
-// bookkeeping it does is the same bookkeeping `heapTakeSmallLocked` does, slot
-// for slot, in the same order.
+// THE REFILL STILL NEVER GROWS THE HEAP: it takes only what the class's spans
+// already hold, so it cannot map a span and cannot fail.
 //
-// `want - 1`, because the caller has already taken the slot it is about to
-// return; and `*head` as the splice's tail so a chain that is somehow non-empty
-// is extended rather than stranded, which is what the prepending loop did.
-@nosplit fn allocCacheFillLocked(g: *i64, e: *i64, idx: int, size: int) {
+// A chain that is not empty is left alone: the one caller reaches here only
+// after `allocCachePop` found it empty on this thread, and no other thread can
+// fill it, so a non-empty one would be a chain this refill must not strand.
+@nosplit fn allocCacheFillLocked(g: *i64, e: *i64, idx: int) {
   // #5709: the caller holds `heapLock(g)` and is about to touch the shared heap
   // anyway, so a refill is the cheapest place to settle what the pops since the
   // last one owe.
   gcAllocCacheFlush(e, heapBlock(g))
   let head = e + acHeads + idx
-  let floor = acMaxBytes / size
-  if (floor > acMaxBatch) {
-    floor = acMaxBatch
+  if (*head != 0) {
+    return
   }
-  // The class size, not the request's: a request smaller than its class
-  // would otherwise ask for more slots than `acSpanBytes` holds.
-  let most = acSpanBytes / allocClassSize(idx)
-  let got = heapTakeBatchLocked(heapBlock(g), idx, floor - 1, most - 1, *head)
-  if (got != 0) {
-    *head = got
-  }
+  *head = heapTakeBatchLocked(heapBlock(g), idx)
 }
