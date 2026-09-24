@@ -207,10 +207,10 @@ let scanRegs: [32]i64
 // 65535]`) times a small constant — never negative. `&&` compiles to a
 // multi-block short-circuit, which disqualifies a callee from
 // `compiler/optinline.bit`'s single-block inliner (confirmed: zero `bl
-// _inBlob` relocations into `scanFrame` with this single-comparison form,
+// _inBlob` relocations into the entry parse with this single-comparison form,
 // against nonzero with the `&&` form).
 //
-// Even fully inlined, this is NOT free on `scanFrame`'s hot path: `#1839`'s
+// Even fully inlined, this is NOT free on the entry parse's hot path: `#1839`'s
 // own measurement is `_tests_/bit/stress/quicwire` under `BIT_GC=stress` going
 // from ~182s (baseline, no bounds check) to ~420-450s wall / ~670s user CPU
 // with every read checked — a real ~2.4x, not contention noise (reproduced
@@ -288,7 +288,7 @@ let smBoundsMsg: [8]i64
 // disagree with its writer with NOTHING to catch it — #1927 hit exactly this
 // as a bus error on first collection, no message, no named cause.
 //
-// WIRED into `scanFrame`'s live parse below: the version field sits between
+// WIRED into `smSpsStart`'s live parse below: the version field sits between
 // `codeAddr` and `codeSize` in the entry header (the fixed-header `inBlob`
 // check widened 14 -> 16 bytes to cover it) and is checked before `numSaved`
 // or any other count-driven read. `compiler/codegen.bit`'s `writeStackMaps`
@@ -384,6 +384,229 @@ let smVersionMsg: [11]i64
 }
 
 // ---------------------------------------------------------------------------
+// One entry — the checked parse `scanFrame` and the index build share
+// ---------------------------------------------------------------------------
+//
+// A parse step returns the offset it reached or a NEGATIVE refusal code, and
+// the caller decides what a refusal costs. The linear walk and `scanEntry`
+// turn it into the named panic (`smRefuse`) at the same entry and in the same
+// order the one-function walk did. The index build (./stackmapidx.bit) turns it
+// into "no index", which leaves the refusal to the linear walk, so a malformed
+// table still fails at the scan that reaches the bad entry and not at boot.
+// Every read is still checked against `inBlob` first (#1839).
+
+const smBadBounds = -1
+const smBadVersion = -2
+
+// The table extent, both linker-defined (ABI.md §4) and fixed for the life of
+// the process.
+@nosplit fn smTblBase(): int {
+  return int(stackMapsBegin())
+}
+
+@nosplit fn smTblLen(): int {
+  return int(stackMapsEnd()) - int(stackMapsBegin())
+}
+
+// Panic with the message a refusal code names, for the entry at `off`. NEVER
+// RETURNS.
+@nosplit fn smRefuse(base: int, off: int, why: int) {
+  if (why == smBadVersion) {
+    // `smSpsStart` returns this only after proving the fixed header in bounds.
+    panicStackMapVersion(smFormatVersion, blobU16(base, off + 8))
+    return
+  }
+  panicStackMapBounds()
+}
+
+// The offset of the first safepoint record of the entry at `off`, once the
+// fixed header, the version stamp, the saved-register table and
+// `num_safepoints` are proven in bounds; else a refusal code.
+@nosplit fn smSpsStart(base: int, tblLen: int, off: int): int {
+  // One check for the whole fixed-size entry header (codeAddr 8 + version 2 +
+  // codeSize 4 + numSaved 2 = 16 bytes, #3189): none of these offsets depends
+  // on a count read out of the table, so this one check covers all four.
+  if (!inBlob(off, 16, tblLen)) {
+    return smBadBounds
+  }
+  // Checked before any count-driven read (numSaved is the first): after a
+  // version mismatch every offset past this point is meaningless.
+  if (blobU16(base, off + 8) != smFormatVersion) {
+    return smBadVersion
+  }
+  // The WHOLE saved-register span (u16 reg + i32 fp_off each) at once, so
+  // `smRestoreSaved`'s per-element reads need no check of their own.
+  let numSaved = blobU16(base, off + 14)
+  if (!inBlob(off + 16, numSaved * 6, tblLen)) {
+    return smBadBounds
+  }
+  let p = off + 16 + numSaved * 6
+  if (!inBlob(p, 2, tblLen)) {
+    return smBadBounds
+  }
+  return p + 2
+}
+
+// The offset just past the safepoint record at `sp` (u32 ret_off, u16
+// num_slots, i32 slot_fp_off each, u16 num_regs, u16 reg each), every span
+// proven in bounds before the count after it is read; else `smBadBounds`.
+@nosplit fn smSpEnd(base: int, tblLen: int, sp: int): int {
+  // retOff (4) + numSlots (2): fixed, one check covers both.
+  if (!inBlob(sp, 6, tblLen)) {
+    return smBadBounds
+  }
+  let numSlots = blobU16(base, sp + 4)
+  if (!inBlob(sp + 6, numSlots * 4, tblLen)) {
+    return smBadBounds
+  }
+  let p = sp + 6 + numSlots * 4
+  if (!inBlob(p, 2, tblLen)) {
+    return smBadBounds
+  }
+  let numRegs = blobU16(base, p)
+  if (!inBlob(p + 2, numRegs * 2, tblLen)) {
+    return smBadBounds
+  }
+  return p + 2 + numRegs * 2
+}
+
+// The offset of the entry after the one at `off`, the whole entry proven in
+// bounds; else a refusal code.
+@nosplit fn smEntryEnd(base: int, tblLen: int, off: int): int {
+  let p = smSpsStart(base, tblLen, off)
+  if (p < 0) {
+    return p
+  }
+  let numSps = blobU16(base, p - 2)
+  let si = 0
+  // Bounded: this entry's safepoint count.
+  while (si < numSps) {
+    p = smSpEnd(base, tblLen, p)
+    if (p < 0) {
+      return p
+    }
+    si = si + 1
+  }
+  // Round up past this entry's trailing pad (#1927, ABI.md §4): the writer
+  // pads every entry to a multiple of 8 bytes, and the walk must round by the
+  // same rule or it lands inside the pad instead of at the next entry.
+  let rem = p % 8
+  if (rem != 0) {
+    p = p + 8 - rem
+  }
+  return p
+}
+
+// Whether the entry at `off`, its header already proven, spans `pc`.
+@nosplit fn smEntryHolds(base: int, off: int, pc: int): bool {
+  let codeAddr = blobU64(base, off)
+  return pc >= codeAddr && pc < codeAddr + blobU32(base, off + 10)
+}
+
+// The offset of the FIRST entry in table order whose code range spans `pc`,
+// or -1. This is the walk every frame paid before #5852, and `scanFrame`'s
+// fallback while the index is unbuilt or declined. It parses every entry up to
+// the hit, byte by byte, and a pc in no Bit function parses the whole table.
+export @nosplit fn smLinearFind(pc: int): int {
+  let base = smTblBase()
+  let tblLen = smTblLen()
+  let off = 0
+  let fi = 0
+  // Bounded by the extent AND by `smMaxEntries`.
+  while (off < tblLen && fi < smMaxEntries) {
+    let next = smEntryEnd(base, tblLen, off)
+    if (next < 0) {
+      smRefuse(base, off, next)
+      return -1
+    }
+    if (smEntryHolds(base, off, pc)) {
+      return off
+    }
+    off = next
+    fi = fi + 1
+  }
+  return -1
+}
+
+// Marks every live reference the safepoint record at `sp` names: stack slots
+// through `fp`, registers through the working file. `smSpEnd` proved its spans.
+@nosplit fn smMarkSafepoint(g: *i64, base: int, sp: int, fp: int) {
+  let numSlots = blobU16(base, sp + 4)
+  let k = 0
+  // Bounded: this safepoint's slot count.
+  while (k < numSlots) {
+    gcMarkRoot(g, loadWord(fp + blobI32(base, sp + 6 + k * 4)))
+    k = k + 1
+  }
+  let regsOff = sp + 6 + numSlots * 4 + 2
+  let numRegs = blobU16(base, regsOff - 2)
+  let regs = ptrOf(scanRegs)
+  k = 0
+  // Bounded: this safepoint's register count.
+  while (k < numRegs) {
+    let rn = blobU16(base, regsOff + k * 2)
+    // §4 restricts a stack map to the callee-saved file, all below
+    // `smNumRegs`, so this cannot fire for a table this toolchain emitted.
+    // It is here because the alternative to skipping an impossible entry
+    // is READING PAST a 32-word module-state array — an in-bounds `regs[n]` is a
+    // bounds-checked array access and this is the same check, not a
+    // weakened one.
+    if (rn < smNumRegs) {
+      gcMarkRoot(g, *(regs + rn))
+    }
+    k = k + 1
+  }
+}
+
+// Rewrites the working file to the CALLER's callee-saved values the frame at
+// `fp` spilled, so the next frame out reads them. Reads land inside the saved
+// span `smSpsStart` proved.
+@nosplit fn smRestoreSaved(base: int, off: int, fp: int) {
+  let numSaved = blobU16(base, off + 14)
+  let regs = ptrOf(scanRegs)
+  let k = 0
+  // Bounded: this entry's saved-register count.
+  while (k < numSaved) {
+    let rn = blobU16(base, off + 16 + k * 6)
+    let foff = blobI32(base, off + 16 + k * 6 + 2)
+    if (rn < smNumRegs) {
+      *(regs + rn) = loadWord(fp + foff)
+    }
+    k = k + 1
+  }
+}
+
+// Scans the entry at `off`, which spans `pc`: marks what the safepoint at `pc`
+// names, then restores the caller's callee-saved values. Re-proves the entry's
+// spans as it goes, so no read depends on who found `off`.
+@nosplit fn scanEntry(g: *i64, off: int, pc: int, fp: int) {
+  let base = smTblBase()
+  let tblLen = smTblLen()
+  let p = smSpsStart(base, tblLen, off)
+  if (p < 0) {
+    smRefuse(base, off, p)
+    return
+  }
+  let codeAddr = blobU64(base, off)
+  let numSps = blobU16(base, p - 2)
+  let si = 0
+  // Bounded: this entry's safepoint count.
+  while (si < numSps) {
+    let next = smSpEnd(base, tblLen, p)
+    if (next < 0) {
+      smRefuse(base, off, next)
+      return
+    }
+    if (codeAddr + blobU32(base, p) == pc) {
+      smMarkSafepoint(g, base, p, fp)
+    }
+    p = next
+    si = si + 1
+  }
+  smRestoreSaved(base, off, fp)
+}
+
+// ---------------------------------------------------------------------------
 // One frame — `runtime/root/`'s `scanFrame`
 // ---------------------------------------------------------------------------
 //
@@ -393,145 +616,13 @@ let smVersionMsg: [11]i64
 // callee-saved values this frame spilled, so the next frame out reads them
 // correctly. Returns false when `pc` is in no Bit function, which is the top of
 // the Bit portion of the stack and stops the walk.
-@nosplit fn scanFrame(g: *i64, base: int, tblLen: int, pc: int, fp: int): bool {
-  let regs = ptrOf(scanRegs)
-  let off = 0
-  let fi = 0
-  // Bounded by the extent AND by `smMaxEntries`.
-  while (off < tblLen && fi < smMaxEntries) {
-    // One check for the whole fixed-size entry header (codeAddr 8 + version
-    // 2 + codeSize 4 + numSaved 2 = 16 bytes, #3189): none of these four
-    // offsets depends on a count read out of the table, so they cannot
-    // desync from each other — only from `tblLen` itself, which this single
-    // check already covers for all four reads below.
-    if (!inBlob(off, 16, tblLen)) {
-      panicStackMapBounds()
-      return false
-    }
-    let codeAddr = blobU64(base, off)
-    off = off + 8
-    // Checked before any count-driven read below (numSaved is the first):
-    // a version mismatch means every offset after this point is meaningless,
-    // so this must refuse before numSaved is even read, not merely before it
-    // is used.
-    let version = blobU16(base, off)
-    off = off + 2
-    if (version != smFormatVersion) {
-      panicStackMapVersion(smFormatVersion, version)
-      return false
-    }
-    let codeSize = blobU32(base, off)
-    off = off + 4
-    let numSaved = blobU16(base, off)
-    off = off + 2
-    let savedOff = off
-    // Checks the WHOLE saved-register table span at once (`numSaved * 6`
-    // bytes), before advancing past it: every per-element read of it below,
-    // at `savedOff + k * 6` for `k < numSaved`, then lands inside the span
-    // this already proved is in-bounds, with no per-element check needed.
-    if (!inBlob(savedOff, numSaved * 6, tblLen)) {
-      panicStackMapBounds()
-      return false
-    }
-    off = off + numSaved * 6 // u16 reg + i32 fp_off
-    if (!inBlob(off, 2, tblLen)) {
-      panicStackMapBounds()
-      return false
-    }
-    let numSps = blobU16(base, off)
-    off = off + 2
-
-    let hit = pc >= codeAddr && pc < codeAddr + codeSize
-
-    let si = 0
-    // Bounded: this entry's safepoint count. The body must run even when this
-    // is not the hit entry — it is what advances `off` past the entry.
-    while (si < numSps) {
-      // Same reasoning as the entry header above: retOff (4) + numSlots (2)
-      // = 6 fixed bytes, one check covers both reads.
-      if (!inBlob(off, 6, tblLen)) {
-        panicStackMapBounds()
-        return false
-      }
-      let retOff = blobU32(base, off)
-      off = off + 4
-      let numSlots = blobU16(base, off)
-      off = off + 2
-      let slotsOff = off
-      // Same whole-span check as the saved-register table above: covers
-      // every `blobI32(base, slotsOff + k * 4)` read under `hit` below.
-      if (!inBlob(slotsOff, numSlots * 4, tblLen)) {
-        panicStackMapBounds()
-        return false
-      }
-      off = off + numSlots * 4
-      if (!inBlob(off, 2, tblLen)) {
-        panicStackMapBounds()
-        return false
-      }
-      let numRegs = blobU16(base, off)
-      off = off + 2
-      let regsOff = off
-      // Same whole-span check, for every `blobU16(base, regsOff + k * 2)`
-      // read under `hit` below.
-      if (!inBlob(regsOff, numRegs * 2, tblLen)) {
-        panicStackMapBounds()
-        return false
-      }
-      off = off + numRegs * 2
-      if (hit && codeAddr + retOff == pc) {
-        let k = 0
-        // Bounded: this safepoint's slot count.
-        while (k < numSlots) {
-          gcMarkRoot(g, loadWord(fp + blobI32(base, slotsOff + k * 4)))
-          k = k + 1
-        }
-        k = 0
-        // Bounded: this safepoint's register count.
-        while (k < numRegs) {
-          let rn = blobU16(base, regsOff + k * 2)
-          // §4 restricts a stack map to the callee-saved file, all below
-          // `smNumRegs`, so this cannot fire for a table this toolchain emitted.
-          // It is here because the alternative to skipping an impossible entry
-          // is READING PAST a 32-word module-state array — an in-bounds `regs[n]` is a
-          // bounds-checked array access and this is the same check, not a
-          // weakened one.
-          if (rn < smNumRegs) {
-            gcMarkRoot(g, *(regs + rn))
-          }
-          k = k + 1
-        }
-      }
-      si = si + 1
-    }
-
-    // Round the cursor up past this entry's trailing pad (#1927, ABI.md §4):
-    // the writer pads every entry to a multiple of 8 bytes so every atom is
-    // 8-aligned, and the walk must round up by the same rule or it lands
-    // inside this entry's padding instead of at the next entry's start.
-    let rem = off % 8
-    if (rem != 0) {
-      off = off + 8 - rem
-    }
-
-    if (hit) {
-      let k = 0
-      // Bounded: this entry's saved-register count. Reads land inside the
-      // `savedOff` span the entry header already checked above; no
-      // per-element check needed here.
-      while (k < numSaved) {
-        let rn = blobU16(base, savedOff + k * 6)
-        let foff = blobI32(base, savedOff + k * 6 + 2)
-        if (rn < smNumRegs) {
-          *(regs + rn) = loadWord(fp + foff)
-        }
-        k = k + 1
-      }
-      return true
-    }
-    fi = fi + 1
+@nosplit fn scanFrame(g: *i64, pc: int, fp: int): bool {
+  let off = smFindEntry(pc)
+  if (off < 0) {
+    return false
   }
-  return false
+  scanEntry(g, off, pc, fp)
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -554,9 +645,7 @@ export @nosplit @symbol("bit_rt_port_gc_scan_snapshot") fn gcScanSnapshot(g: *i6
   if (ret == 0) {
     return
   }
-  let base = int(stackMapsBegin())
-  let tblLen = int(stackMapsEnd()) - base
-  if (tblLen <= 0) {
+  if (smTblLen() <= 0) {
     return
   }
 
@@ -574,7 +663,7 @@ export @nosplit @symbol("bit_rt_port_gc_scan_snapshot") fn gcScanSnapshot(g: *i6
   // Bounded by `smMaxFrames`; the real exits are "pc left the Bit call graph"
   // and the frame-pointer sanity test below.
   while (frame < smMaxFrames) {
-    if (!scanFrame(g, base, tblLen, pc, fp)) {
+    if (!scanFrame(g, pc, fp)) {
       break
     }
     let nextRet = loadWord(fp + 8)

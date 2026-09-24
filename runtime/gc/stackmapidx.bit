@@ -1,0 +1,219 @@
+// The sorted code-address index `scanFrame` (./stackmap.bit) binary-searches
+// instead of walking the stack-map table (#5852).
+//
+// WHY. Entries are self-delimiting and carry no count (ABI.md §4), so finding
+// the one that spans a pc meant parsing, byte by byte, every entry before it,
+// and a pc in no Bit function, which is how every snapshot walk ends, parsed
+// the whole table. #5840 measured about 30 ns per entry parsed. One snapshot
+// costs a partial walk per frame plus one full walk, and a collection walks
+// one snapshot per parked mutator, so root scanning grew with the worker count.
+//
+// WHAT. One {codeAddr, entryOff} pair per entry with a non-empty code range,
+// sorted by codeAddr, in a side mapping (`memMapPages`, never the GC heap).
+// `gcInit` builds it once. The table does not change after dyld has rebased it,
+// which happens before any Bit code runs, so one build serves every lookup.
+// Every linked object's entries sit in the one merged extent (ABI.md §4); the
+// sort makes the order the linker merged them in irrelevant.
+//
+// EXACT, NOT APPROXIMATE. The index must name the entry the linear walk
+// (`smLinearFind`) names for every pc: the FIRST in table order whose range
+// spans it. When no two ranges overlap, at most one entry spans a pc, and it
+// is the last one whose codeAddr is <= pc, which is what the search finds. So
+// the build PROVES the sorted ranges are disjoint and declines otherwise. An
+// empty range spans nothing, so it is left out rather than allowed to tie.
+//
+// DECLINING. When the table is malformed, the mapping is refused or two ranges
+// overlap, the build declines and `scanFrame` keeps the linear walk. A
+// malformed table then still fails where it always did, at the entry the
+// walk's own checks refuse, rather than at boot.
+//
+// Written by `smIdxBuild` alone, which `gcInit` calls at boot before a second
+// thread exists; after that it is only read. Idempotent, so a private
+// collector's own `gcInit` changes nothing.
+
+const smIdxUnbuilt = 0
+const smIdxBuilt = 1
+const smIdxDeclined = 2
+
+// A pair: codeAddr at +0, entry offset at +8.
+const smIdxPairBytes = 16
+
+// The smallest entry: the 16-byte header plus u16 num_safepoints, padded to 8.
+// It bounds the pair count by the table's length, so the mapping is sized once.
+const smIdxMinEntry = 24
+
+let smIdxState: i64 = 0 // smIdxUnbuilt until `smIdxBuild` runs
+let smIdxBase: i64 = 0  // the side mapping, 0 unless built
+let smIdxLen: i64 = 0   // pairs in it
+
+@nosplit fn smIdxAddr(tab: int, i: int): int {
+  return loadWord(tab + i * smIdxPairBytes)
+}
+
+@nosplit fn smIdxOff(tab: int, i: int): int {
+  return loadWord(tab + i * smIdxPairBytes + 8)
+}
+
+// Records {codeAddr, off} for every entry with a non-empty range, in table
+// order, into `cap` pairs at `tab`. Returns the pair count, or -1 when an entry
+// is malformed or the pairs would not fit.
+@nosplit fn smIdxCollect(tab: int, cap: int, tblLen: int): int {
+  let base = smTblBase()
+  let off = 0
+  let n = 0
+  let fi = 0
+  // Bounded by the extent AND by `smMaxEntries`, as `smLinearFind` is, so the
+  // index covers exactly the entries that walk can reach.
+  while (off < tblLen && fi < smMaxEntries) {
+    let next = smEntryEnd(base, tblLen, off)
+    if (next < 0 || n >= cap) {
+      return -1
+    }
+    if (blobU32(base, off + 10) != 0) {
+      storeWord(tab + n * smIdxPairBytes, blobU64(base, off))
+      storeWord(tab + n * smIdxPairBytes + 8, off)
+      n = n + 1
+    }
+    off = next
+    fi = fi + 1
+  }
+  return n
+}
+
+// Whether the `n` pairs at `tab` are in codeAddr order with each range ending
+// at or before the next one begins.
+@nosplit fn smIdxDisjoint(tab: int, n: int): bool {
+  let base = smTblBase()
+  let i = 1
+  // Bounded: `n` pairs.
+  while (i < n) {
+    let prev = smIdxOff(tab, i - 1)
+    if (smIdxAddr(tab, i) < smIdxAddr(tab, i - 1) + blobU32(base, prev + 10)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+@nosplit fn smIdxSwap(tab: int, i: int, j: int) {
+  let a = smIdxAddr(tab, i)
+  let o = smIdxOff(tab, i)
+  storeWord(tab + i * smIdxPairBytes, smIdxAddr(tab, j))
+  storeWord(tab + i * smIdxPairBytes + 8, smIdxOff(tab, j))
+  storeWord(tab + j * smIdxPairBytes, a)
+  storeWord(tab + j * smIdxPairBytes + 8, o)
+}
+
+// Restores the max-heap property below `root` in the first `n` pairs.
+@nosplit fn smIdxSiftDown(tab: int, root: int, n: int) {
+  let r = root
+  // Bounded: `r` more than doubles each turn and stays below `n`.
+  while (r * 2 + 1 < n) {
+    let c = r * 2 + 1
+    if (c + 1 < n && smIdxAddr(tab, c + 1) > smIdxAddr(tab, c)) {
+      c = c + 1
+    }
+    if (smIdxAddr(tab, r) >= smIdxAddr(tab, c)) {
+      return
+    }
+    smIdxSwap(tab, r, c)
+    r = c
+  }
+}
+
+// Heapsort by codeAddr: in place and O(n log n) with no recursion. Not stable,
+// which cannot matter: two entries with one codeAddr overlap, and the build
+// declines on overlap. That same check, run again after the sort, is what
+// keeps a faulty sort from misleading: a lost pair means a duplicated one,
+// and a duplicate overlaps itself, so the worst a bad sort can do is decline.
+@nosplit fn smIdxSort(tab: int, n: int) {
+  let i = n / 2
+  // Bounded: `n / 2` turns.
+  while (i > 0) {
+    i = i - 1
+    smIdxSiftDown(tab, i, n)
+  }
+  let end = n
+  // Bounded: `n - 1` turns.
+  while (end > 1) {
+    end = end - 1
+    smIdxSwap(tab, 0, end)
+    smIdxSiftDown(tab, 0, end)
+  }
+}
+
+// Sorts the `n` pairs at `tab` unless they are already disjoint and in order
+// (the common case: the linker lays text and table out in the same object
+// order), and reports whether they are now.
+@nosplit fn smIdxOrder(tab: int, n: int): bool {
+  if (smIdxDisjoint(tab, n)) {
+    return true
+  }
+  smIdxSort(tab, n)
+  return smIdxDisjoint(tab, n)
+}
+
+// Builds the index, or declines and leaves `scanFrame` on the linear walk.
+// Only the first call does anything.
+export @nosplit fn smIdxBuild() {
+  if (smIdxState != smIdxUnbuilt) {
+    return
+  }
+  smIdxState = smIdxDeclined
+  let tblLen = smTblLen()
+  if (tblLen <= 0) {
+    return
+  }
+  let cap = tblLen / smIdxMinEntry + 1
+  let tab = memMapPages(cap * smIdxPairBytes)
+  if (tab == 0) {
+    return
+  }
+  let n = smIdxCollect(tab, cap, tblLen)
+  if (n < 0 || !smIdxOrder(tab, n)) {
+    memUnmapPages(tab, cap * smIdxPairBytes)
+    return
+  }
+  smIdxBase = tab
+  smIdxLen = n
+  smIdxState = smIdxBuilt
+}
+
+// Whether `smIdxFind` is the lookup `scanFrame` uses.
+export @nosplit fn smIdxReady(): bool {
+  return smIdxState == smIdxBuilt
+}
+
+// The offset of the entry whose code range spans `pc`, or -1. Meaningful only
+// once `smIdxReady()`; before that it holds no pairs and answers -1.
+export @nosplit fn smIdxFind(pc: int): int {
+  let lo = 0
+  let hi = smIdxLen
+  // Pairs below `lo` have codeAddr <= pc and pairs from `hi` on have codeAddr
+  // > pc. Bounded: `hi - lo` halves each turn, so at most 64 turns.
+  while (lo < hi) {
+    let mid = lo + ((hi - lo) >> 1)
+    if (smIdxAddr(smIdxBase, mid) <= pc) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if (lo == 0) {
+    return -1
+  }
+  let off = smIdxOff(smIdxBase, lo - 1)
+  if (!smEntryHolds(smTblBase(), off, pc)) {
+    return -1
+  }
+  return off
+}
+
+// `scanFrame`'s lookup: the index when it is built, the linear walk otherwise.
+@nosplit fn smFindEntry(pc: int): int {
+  if (smIdxState == smIdxBuilt) {
+    return smIdxFind(pc)
+  }
+  return smLinearFind(pc)
+}
