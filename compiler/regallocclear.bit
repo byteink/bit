@@ -1,4 +1,4 @@
-// #5847: zeroing a DEAD spilled reference's stack slot on the control-flow
+// #5847: zeroing a DEAD spilled heap-word stack slot on the control-flow
 // edges where its interval ends. Sibling of regalloc.bit, same module;
 // `allocateCoalesced` calls `computeSlotClears` once its locations are final,
 // and each backend emits the answer on the edge it names.
@@ -15,6 +15,14 @@
 // kept one batch's 5000 nodes reachable through the next batch's build loop,
 // GC drain 3.0 ms -> 21.5 ms on x86-64.
 //
+// The scan is type-blind, so `isRef` is the wrong test for "can keep an
+// object alive". #5848: with #5824 applied, LICM hoists alloc's for-of slice
+// data word, a heap base typed `i64`, into a header param; x86 evicts it to a
+// fresh slot and it roots the same 5000 nodes. So a slot is cleared when its
+// value may hold a heap address: `isRef`, or `heapDerived` (codegenlivereach.bit,
+// `markHeapDerived`). Clearing every Int-class slot instead measured 1-3% on
+// x64 call-heavy code for stores over plain indices and counters.
+//
 // ## Why zeroing it is sound
 //
 // codegenlive.bit builds one interval per value with no holes, and lowering
@@ -24,9 +32,11 @@
 // the value is dead on entry to B on every path. That is the same fact slot
 // recycling already relies on: `expireSpills` hands the slot to any interval
 // starting after `iv.end`. A zero store is one more such write, so it needs
-// exactly one extra check: no OTHER interval sharing the slot may be live
-// across the edge. A param of B is written by the edge's own moves, which is
-// why the window runs from the source block's last position, not from B.
+// exactly one extra check: no OTHER interval sharing the slot may be live on
+// entry to B. By the same invariant such an interval covers B's first
+// position, and so does a param of B, which the edge's own moves write
+// (`extendParamsToPreds`). A value the moves only read is dead once they ran,
+// and so is an alias of the dead value: its range lies inside its root's.
 //
 // ## Why on the edge, and not on every edge
 //
@@ -44,6 +54,17 @@
 // a loop, one that enters a loop at its header, and one outside every loop.
 // Only forward edges qualify at all, so a back edge never carries a clear
 // and no clear ever sits next to a back-edge poll.
+//
+// ## Only where a safepoint follows
+//
+// The frame is scanned only while this call is parked at a safepoint: a call
+// that can reach the collector, an allocation, a back-edge poll. Preemption
+// is a request those polls read, never a signal (runtime/ABI.md). So a clear
+// on an edge from which every path returns before reaching one buys nothing:
+// no scan of this frame happens between the store and the return.
+// `safepointReach` answers
+// "some safepoint is reachable from this block" once per function, and a
+// back edge makes a loop's own safepoints reachable from its header.
 
 // One CFG edge, in the position numbering the intervals use. `src`/`dst` are
 // block ids in layout order (a back edge has `dst <= src`); `srcStart` and
@@ -64,12 +85,13 @@ class SlotClear {
   slot: int,
 }
 
-// A reference that lives in a real stack word. A remat interval owns no slot
-// (index -1), a register holds nothing the frame scan reads, and an alias's
-// `isRef` was moved onto its root by `mergeAliases`, so each slot is judged
-// once, through the interval that owns the merged range.
-fn ownsRefSlot(iv: LiveInterval, loc: RegLoc): bool {
-  return iv.isRef && loc.isSpill && loc.index >= 0
+// A value that may hold a heap address (`isRef` or `heapDerived`) and lives
+// in a real stack word. A remat interval owns no slot (index -1), a register
+// holds nothing the frame scan reads, and an alias shares its root's slot
+// inside the root's merged range (`mergeAliases`, which also moves both marks
+// onto the root), so each slot is judged once, through that root.
+fn ownsHeapSlot(iv: LiveInterval, loc: RegLoc, isAlias: bool): bool {
+  return (iv.isRef || iv.heapDerived) && !isAlias && loc.isSpill && loc.index >= 0
 }
 
 // The interval reaches into the edge's source block and is dead on entry to
@@ -78,8 +100,10 @@ fn edgeEndsInterval(iv: LiveInterval, e: CfgEdge): bool {
   return e.dstStart > iv.end && e.srcStart <= iv.end && e.srcLast >= iv.start
 }
 
-// Another interval assigned `slot` is live somewhere between the source
-// block's terminator and the target's first position.
+// Another interval assigned `slot` is live on entry to the edge's target.
+// #5848: not "anywhere between the source's terminator and the target", which
+// on a loop exit spans the whole body, so a header param aliasing the dead
+// value, dead on that exit too, kept its own root's slot from being cleared.
 fn slotBusyOnEdge(
   scan: []LiveInterval, locations: []RegLoc, owner: int, slot: int, e: CfgEdge,
 ): bool {
@@ -94,7 +118,7 @@ fn slotBusyOnEdge(
 }
 
 fn holdsSlotAcross(w: LiveInterval, loc: RegLoc, slot: int, e: CfgEdge): bool {
-  return loc.isSpill && loc.index == slot && w.start <= e.dstStart && w.end >= e.srcLast
+  return loc.isSpill && loc.index == slot && w.start <= e.dstStart && w.end >= e.dstStart
 }
 
 // The last block of the loop headed by `header`: its furthest back-edge
@@ -138,27 +162,135 @@ fn hasSlotClear(clears: []SlotClear, src: int, dst: int, slot: int): bool {
 }
 
 // Every clear, in interval order then edge order, each (edge, slot) once.
-// `locations` must be final: aliases propagated, float slots shifted.
-fn computeSlotClears(scan: []LiveInterval, locations: []RegLoc, edges: []CfgEdge): []SlotClear {
+// `locations` must be final: aliases propagated, float slots shifted. `alias`
+// is `mergeAliases`' answer, indexed like `scan`; `safepoints` are positions.
+fn computeSlotClears(
+  scan: []LiveInterval, locations: []RegLoc, alias: []bool, edges: []CfgEdge,
+  safepoints: []int,
+): []SlotClear {
+  assert(len(alias) == len(scan))
+  let clearable = clearableEdges(edges, safepointReach(edges, safepoints))
   let out = []SlotClear(0)
   let owner = 0
   while (owner < len(scan)) {
-    if (ownsRefSlot(scan[owner], locations[scan[owner].vreg])) {
-      out = appendSlotClears(out, scan, locations, owner, edges)
+    if (ownsHeapSlot(scan[owner], locations[scan[owner].vreg], alias[owner])) {
+      out = appendSlotClears(out, scan, locations, owner, clearable)
     }
     owner = owner + 1
   }
   return out
 }
 
-// `out` plus the clears `scan[owner]` needs.
+// The edges a clear may sit on: outside every loop body (see the header) and
+// into a block from which a safepoint is reachable.
+fn clearableEdges(edges: []CfgEdge, reach: []bool): []CfgEdge {
+  let out = []CfgEdge(0)
+  for e of edges {
+    if (reach[e.dst] && edgeOutsideLoopBody(edges, e)) {
+      out = append(out, e)
+    }
+  }
+  return out
+}
+
+// `reach[b]`: a safepoint lies in block `b` or in a block reachable from it.
+// Blocks are known only through `edges`; a block that is no edge's source (it
+// returns or traps) runs up to the next known block start, which can only
+// widen it and so keep a clear. Backward propagation to a fixed point: every
+// pass that changes anything sets one more block, so it ends within
+// `len(reach)` passes.
+fn safepointReach(edges: []CfgEdge, safepoints: []int): []bool {
+  let starts = blockStarts(edges)
+  let reach = []bool(len(starts))
+  let b = 0
+  while (b < len(starts)) {
+    reach[b] = starts[b] >= 0 && holdsSafepoint(safepoints, starts[b], blockLast(edges, starts, b))
+    b = b + 1
+  }
+  let passes = 0
+  while (propagateReach(edges, reach)) {
+    passes = passes + 1
+    assert(passes <= len(reach))
+  }
+  return reach
+}
+
+// First position of every block an edge names, -1 for the rest.
+fn blockStarts(edges: []CfgEdge): []int {
+  let n = 0
+  for e of edges {
+    if (e.src >= n) {
+      n = e.src + 1
+    }
+    if (e.dst >= n) {
+      n = e.dst + 1
+    }
+  }
+  let starts = []int(n)
+  let b = 0
+  while (b < n) {
+    starts[b] = -1
+    b = b + 1
+  }
+  for e of edges {
+    starts[e.src] = e.srcStart
+    starts[e.dst] = e.dstStart
+  }
+  return starts
+}
+
+// Block `b`'s last position, or -1 for "to the end of the function".
+fn blockLast(edges: []CfgEdge, starts: []int, b: int): int {
+  for e of edges {
+    if (e.src == b) {
+      return e.srcLast
+    }
+  }
+  let next = -1
+  for s of starts {
+    if (s > starts[b] && (next < 0 || s < next)) {
+      next = s
+    }
+  }
+  if (next < 0) {
+    return -1
+  }
+  return next - 1 // >= 0: `next` is after a start, so at least 1
+}
+
+// A safepoint at a position in [lo, hi], or in [lo, end) when `hi` is -1.
+fn holdsSafepoint(safepoints: []int, lo: int, hi: int): bool {
+  for p of safepoints {
+    if (p >= lo && (hi < 0 || p <= hi)) {
+      return true
+    }
+  }
+  return false
+}
+
+// One backward pass, sources after targets. True if any block changed.
+fn propagateReach(edges: []CfgEdge, reach: []bool): bool {
+  let changed = false
+  let i = len(edges) - 1
+  while (i >= 0) {
+    let e = edges[i]
+    if (reach[e.dst] && !reach[e.src]) {
+      reach[e.src] = true
+      changed = true
+    }
+    i = i - 1
+  }
+  return changed
+}
+
+// `out` plus the clears `scan[owner]` needs. `edges` are `clearableEdges`.
 fn appendSlotClears(
   out: []SlotClear, scan: []LiveInterval, locations: []RegLoc, owner: int, edges: []CfgEdge,
 ): []SlotClear {
   let iv = scan[owner]
   let slot = locations[iv.vreg].index
   for e of edges {
-    if (edgeEndsInterval(iv, e) && edgeOutsideLoopBody(edges, e)) {
+    if (edgeEndsInterval(iv, e)) {
       assert(e.dst > e.src) // dead on entry to the target: never a back edge
       if (!slotBusyOnEdge(scan, locations, owner, slot, e) &&
         !hasSlotClear(out, e.src, e.dst, slot)) {
@@ -167,6 +299,27 @@ fn appendSlotClears(
     }
   }
   return out
+}
+
+// #5848: a conditional branch naming an edge that carries clears jumps to an
+// out-of-line stub instead of the block. Deciding the branch's shape on the
+// clears flipped loop headers from an untaken `jge exit` to a `jl body` taken
+// every iteration (x64 sort +8.7%). Each backend emits its stubs after the
+// last block: the zero stores, then a jump to `dst`. `patchOffset` is the
+// branch's displacement field.
+class ClearStub {
+  patchOffset: int,
+  src: int,
+  dst: int,
+}
+
+fn edgeHasClears(clears: []SlotClear, src: int, dst: int): bool {
+  for c of clears {
+    if (c.src == src && c.dst == dst) {
+      return true
+    }
+  }
+  return false
 }
 
 // The slots a backend zeroes on the edge `src` -> `dst`, in `clears` order.
