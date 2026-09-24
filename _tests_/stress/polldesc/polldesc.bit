@@ -21,6 +21,19 @@
 // carrying the OLD generation must both report "nothing to do" and must not
 // disturb the fresh generation's slot -- proven by a normal wait/wake on the
 // new generation working right afterward.
+//
+// THE WAIT-VS-CLOSE RACE (`waitCloseDriver`) is separate again: every race
+// above pits `pdWake`/`pdCancel`/`pdClose` against an ALREADY-claimed slot,
+// never against a `pdWait` still trying to claim it. A design that makes
+// `pdClose` authoritative by running its sweep first and bumping the
+// generation after (rather than the reverse) can let a `pdWait` racing that
+// exact window CAS its task into the slot successfully, under the
+// still-current generation, ARM'ED AFTER the close's own sweep already ran
+// -- parked forever, since nothing sweeps that slot again. Two dedicated fds
+// (`waitCloseFdBase`/`+1`, never touched by `driver` or `staleGenCheck`) race
+// `pdWait` directly against `pdClose` thousands of times each; the one
+// forbidden outcome is `pdWait` reporting `pdClaimed` while `pdClose`'s own
+// report does not name that exact task.
 
 import {
   pdOpen, pdWait, pdWake, pdCancel, pdClose,
@@ -31,6 +44,9 @@ const FDS: int = 6
 const ROUNDS: int = 2000
 const PREWAKE_EVERY: int = 5
 const THREEWAY_EVERY: int = 20
+const WAITCLOSE_FD_BASE: int = FDS + 1
+const WAITCLOSE_FD_COUNT: int = 2
+const WAITCLOSE_ROUNDS: int = 4000
 
 // `counters[]` layout, one shared buffer every driver task accumulates into
 // through `atomicAdd` -- never a lock, matching the ticket's own constraint.
@@ -40,7 +56,8 @@ const cCancel: int = 2
 const cClose: int = 3
 const cReady: int = 4
 const cBad: int = 5
-const counterCount: int = 6
+const cWaitCloseBad: int = 6
+const counterCount: int = 7
 
 fn nextId(idCounter: *i64): int {
   return atomicAdd(idCounter, 1) + 1
@@ -187,6 +204,50 @@ fn driver(fd: int, idCounter: *i64, counters: *i64, done: chan<i64>) {
   done <- 1
 }
 
+fn waitResolver(fd: int, dir: int, gen: int, taskId: int, out: chan<i64>) {
+  out <- pdWait(fd, dir, gen, taskId)
+}
+
+fn closeReadResolver(fd: int, out: chan<i64>) {
+  let rbuf = []i64(1)
+  let wbuf = []i64(1)
+  pdClose(fd, ptrOf(rbuf), ptrOf(wbuf))
+  out <- rbuf[0]
+}
+
+// One wait-vs-close round on `fd`'s read direction: open, then race a
+// `pdWait` claim directly against a `pdClose` with no other participant. The
+// only forbidden outcome is `pdWait` reporting `pdClaimed` while `pdClose`'s
+// own report does not name `myId` -- that would mean the wait's CAS landed
+// after the close's sweep already ran, with the task now parked and nothing
+// left to ever wake it. `pdBusy` (the wait's retry budget exhausted under
+// contention) and `pdStaleGen` (the wait lost the race outright) are both
+// fine: the wait saw the close one way or the other.
+fn waitCloseRound(fd: int, myId: int): bool {
+  let gen = pdOpen(fd)
+  let waitCh = chan<i64>(1)
+  let closeCh = chan<i64>(1)
+  spawn waitResolver(fd, pdDirRead, gen, myId, waitCh)
+  spawn closeReadResolver(fd, closeCh)
+  let waitResult = <- waitCh
+  let closedTask = <- closeCh
+  return !(waitResult == pdClaimed && closedTask != myId)
+}
+
+fn waitCloseDriver(fd: int, idCounter: *i64, counters: *i64, done: chan<i64>) {
+  let bad = 0
+  let k = 0
+  while (k < WAITCLOSE_ROUNDS) {
+    let myId = nextId(idCounter)
+    if (!waitCloseRound(fd, myId)) {
+      bad = bad + 1
+    }
+    k = k + 1
+  }
+  atomicAdd(counters + cWaitCloseBad, bad)
+  done <- 1
+}
+
 // Single-threaded: proves a stale generation's wake/cancel touches nothing.
 fn staleGenCheck(fd: int): bool {
   let gen1 = pdOpen(fd)
@@ -233,10 +294,21 @@ fn main() {
     spawn driver(f, idCounter, cp, done)
     f = f + 1
   }
+  let wcDone = chan<i64>(WAITCLOSE_FD_COUNT)
+  let wf = 0
+  while (wf < WAITCLOSE_FD_COUNT) {
+    spawn waitCloseDriver(WAITCLOSE_FD_BASE + wf, idCounter, cp, wcDone)
+    wf = wf + 1
+  }
   let j = 0
   while (j < FDS) {
     let _ = <- done
     j = j + 1
+  }
+  let wj = 0
+  while (wj < WAITCLOSE_FD_COUNT) {
+    let _ = <- wcDone
+    wj = wj + 1
   }
 
   let staleOk = staleGenCheck(FDS)
@@ -244,6 +316,7 @@ fn main() {
   let claimed = counters[cClaimed]
   let ready = counters[cReady]
   let bad = counters[cBad]
+  let waitCloseBad = counters[cWaitCloseBad]
   let resolved = counters[cWake] + counters[cCancel] + counters[cClose]
 
   let expectClaimed = FDS * (ROUNDS - ROUNDS / PREWAKE_EVERY)
@@ -253,7 +326,8 @@ fn main() {
     bad == 0 &&
     claimed == expectClaimed &&
     ready == expectReady &&
-    resolved == claimed
+    resolved == claimed &&
+    waitCloseBad == 0
 
-  print("ok ${ok} claimed ${claimed} ready ${ready} resolved ${resolved} bad ${bad} stale ${staleOk}\n")
+  print("ok ${ok} claimed ${claimed} ready ${ready} resolved ${resolved} bad ${bad} waitclosebad ${waitCloseBad} stale ${staleOk}\n")
 }
