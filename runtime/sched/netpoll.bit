@@ -1,0 +1,135 @@
+// The netpoller's scheduler-side half, split out of `timer.bit` (#5845) to
+// clear its 800-line ceiling (E0200) after the #5845 wake fix — same move
+// `_tests_/bit/stress` made for the identical reason. Sibling file, so the
+// same module: nothing below changed but its home.
+
+// ---------------------------------------------------------------------------
+// Netpoller: the scheduler-side half
+// ---------------------------------------------------------------------------
+//
+// The poller ITSELF is platform code and lives in `runtime/sched/{linux,darwin}`
+// — epoll against kqueue is the least reconcilable split in the whole runtime,
+// and §11.7/§11.8 reject even an uncalled declaration for the other platform.
+// What stays here is the part that is the same on both: where the descriptor is
+// kept, and the mutual exclusion around the poll call.
+//
+// WHY THE TRY-LOCK EXISTS — this is `runtime/sched/`'s `polling` flag, and it is not
+// an optimisation. Every idle worker calls the drain from its own loop. Without
+// exclusion two workers can sit inside `epoll_wait`/`kevent` on the same shared
+// oneshot descriptor exactly as an fd becomes ready, and the kernel can report
+// that one event to both before oneshot disarms it. Both then unpark the same
+// task: the second delivery lands on a `Task` the first delivery's worker has
+// already run to completion and freed — a use-after-free, not a double-wake.
+//
+// It is a TRY-lock, never a blocking one, and deliberately so:
+// losing the race costs nothing, because the loser has the rest of its idle
+// pass to look for work and will poll on the next cycle anyway. A blocking lock
+// here would park a worker behind a poll it does not need.
+// Bind a created poll descriptor into the scheduler. The consumer's boot calls
+// this once, because `runtime/sched` may import neither provider and so cannot
+// create the descriptor itself — `runtime/root/<os>`'s `boot` does, right after
+// `schedInit`. #1673 is what happens when nothing calls it: `scPollFd` stays 0,
+// `netAwaitReady` reads that as "no poller", and every socket read that must wait
+// silently returns an empty string.
+//
+// A NON-POSITIVE `fd` IS REFUSED. 0 is this block's own "no poller bound"
+// sentinel (`schedInit` writes it), so binding 0 would be a no-op that reads as
+// success, and binding a negative value would hand `epoll_wait`/`kevent` a
+// fabricated descriptor on every idle pass. The providers' `pollCreate` already
+// reports both as -1; this is the second half of the same invariant, on the
+// storing side, so no caller can install a descriptor the readers cannot use.
+//
+// The guard is also what keeps this body out of its caller's object: the inliner
+// splices single-block callees (`compiler/optinline.bit`), and an inlined store
+// leaves no relocation naming this function — which makes the wiring edge in
+// `_tests_/bit/stwwiring/`'s `checkEdge` unverifiable, since there is nothing left
+// in `boot` to point at. See the providers' `pollCreate` for the same constraint.
+export @nosplit @symbol("bit_rt_port_sched_set_poll_fd") fn schedSetPollFd(s: *i64, fd: int) {
+  if (fd <= 0) {
+    return
+  }
+  *(s + scPollFd) = fd
+}
+
+// The write-interest descriptor's setter (#1910). Separate from the one above
+// rather than an extra parameter, because only the Linux consumer binds it and
+// the Darwin boot path must not have to pass a 0 it does not have.
+export @nosplit @symbol("bit_rt_port_sched_set_poll_fd_write") fn schedSetPollFdWrite(
+  s: *i64,
+  fd: int,
+) {
+  if (fd <= 0) {
+    return
+  }
+  *(s + scPollFdWrite) = fd
+}
+
+export @nosplit @symbol("bit_rt_port_sched_poll_try_enter") fn schedPollTryEnter(s: *i64): bool {
+  return atomicCmpxchg(s + scPollLock, 0, 1)
+}
+
+export @nosplit @symbol("bit_rt_port_sched_poll_leave") fn schedPollLeave(s: *i64) {
+  atomicStore(s + scPollLock, 0)
+}
+
+// Interest constants, shared by both providers so a caller names the same value
+// whichever platform it is built for. The providers map these onto
+// `EPOLLIN`/`EPOLLOUT` and `EVFILT_READ`/`EVFILT_WRITE`; the numbers here are
+// this runtime's own, deliberately NOT either kernel's, so that neither
+// provider's constants leak into a caller.
+export const pollRead: int = 0
+export const pollWrite: int = 1
+
+// ---------------------------------------------------------------------------
+// Outstanding one-shot registrations (#2530)
+// ---------------------------------------------------------------------------
+//
+// How many `pollRegister` calls (either provider) have succeeded but not yet
+// had their one-shot edge consumed by `pollDrain`. `schedFindWorkAt`'s deadlock
+// check (`../worker.bit`) reads this: a live registration is a live promise
+// that a worker will have something to run later, even though nothing is
+// runnable, timed or running RIGHT NOW — a server parked on `accept()` is the
+// case this exists to protect.
+//
+// PROCESS-GLOBAL, NOT A `Scheduler` FIELD, AND THAT IS A DELIBERATE, NARROWER
+// CHOICE THAN THE REST OF THIS FILE MAKES. `pollRegister` is called from
+// outside any task in at least one real caller —
+// `_tests_/stress/schedpolldarwin`'s own comment: "Register BEFORE the tasks
+// run... Doing it from inside a task would need the task to reach the
+// provider, which a `@nosplit` body cannot" — so there is no `Task.worker` to
+// recover a `Scheduler*` from at the call site, and `pollRegister`'s signature
+// is pinned ABI (ABI.md §9) called from `runtime/net` and five stress
+// harnesses outside `runtime/sched/**`'s boundary; threading a scheduler
+// pointer through it reaches all of them. In production there is exactly one
+// live poller per process (`runtime/root`'s boot), so a single counter names
+// it correctly. The only case this conflates is a stress harness that builds
+// a SECOND, private `Scheduler` + poller pair alongside root's real one for
+// its own isolated test — and only in the safe direction: a stray count left
+// over from that private poller can only make `schedFindWorkAt`'s check MORE
+// conservative (skip firing), never trigger it on a program that is not
+// actually stuck.
+let schedPollPending: [1]i64
+
+@nosplit fn pollPendingAddr(): *i64 {
+  return ptrOf(schedPollPending)
+}
+
+// PINNED (ABI.md §9): called across a module boundary by both
+// `runtime/sched/darwin` and `runtime/sched/linux`, each emitted
+// `--freestanding` (SPEC §11.9), which refuses an unpinned reference.
+
+// Called by `pollRegister` on a successful registration.
+export @nosplit @symbol("bit_rt_port_sched_poll_pending_inc") fn schedPollPendingInc() {
+  atomicAdd(pollPendingAddr(), 1)
+}
+
+// Called by `pollDrain`/`pollDrainOne` once per dispatched event — the
+// one-shot edge is consumed by the kernel reporting it, whether or not
+// `schedPollUnpark` finds a task to hand it to.
+export @nosplit @symbol("bit_rt_port_sched_poll_pending_dec") fn schedPollPendingDec() {
+  atomicSub(pollPendingAddr(), 1)
+}
+
+export @nosplit @symbol("bit_rt_port_sched_poll_pending_count") fn schedPollPendingCount(): int {
+  return atomicLoad(pollPendingAddr())
+}
