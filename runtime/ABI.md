@@ -3270,41 +3270,33 @@ reads either layout; it calls the entry points below.
 
 ```
 MapHeader {
-  tbl:  *MapTable       // +0   the current table's object base — traced, never read
-  tblw: usize           // +8   packed: ctrl pointer | (64 - log2(cap)) << 56 — untraced
-  len:  usize           // +16  live entries
-  used: usize           // +24  FULL + TOMB (drives growth)
-  key_desc: usize       // +32  0 scalar / 1 string / else a descriptor (§15.1)
-  val_is_ref:    usize  // +40
+  tbl:  *MapTable       // +0   the current table — traced; replaced whole by a grow
+  len:  usize           // +8   live entries
+  used: usize           // +16  FULL + TOMB (drives growth)
+  key_desc: usize       // +24  0 scalar / 1 string / else a descriptor (§15.1)
+  val_is_ref:    usize  // +32
 }
 
-MapTable {              // ONE allocation, 16 + 17*cap bytes
-  lo, hi: usize         // +0   traced word range [lo, hi) for ref_range_info
-  ctrl: [cap]u8         // +16  per-slot state: 0 EMPTY / 1 TOMB / 128|tag FULL
-  keys: [cap]u64        // +16+cap
-  vals: [cap]u64        // +16+9*cap
+MapTable {
+  cap:  usize           // +0   slot count (power of two, >= 8)
+  keys: [*]u64          // +8   slot keys   (ref-array iff key_desc != 0) — traced
+  vals: [*]u64          // +16  slot values (ref-array iff val_is_ref)    — traced
+  ctrl: [cap]u8         // +24  per-slot state, inline: 0 EMPTY / 1 TOMB / 128|tag FULL
 }
 ```
 
-Every operation loads `tblw` once and derives `cap` (a shift of all-ones gives
-`cap - 1`), the ctrl pointer (a mask) and the key and value arrays (adds) from
-that one word, so the first ctrl byte, key word and value word are each one
-dependent load past the header, as they were with separate buffers (#5796,
-`runtime/root/maptable.bit`). `tblw` is written once per table, by a release
-store after the table is filled; the load is plain, because every later read
-takes its address from it and both targets order an address-dependent load
-after the load it depends on. A packed address must be below 2^56, which every
-user address on both targets is; `mapPack` panics rather than truncate one.
-
-`map_info`'s pointer map is `{0}`: `tbl` exists only to keep the table alive.
-A table holding references carries the `ref_range_info` descriptor, a sentinel
-the collector matches by address (`gcSetRefRangeInfo`, `scanRefRange` in
-`runtime/gc/gcmark.bit`) and traces exactly body words `[lo, hi)`: the key
-words when `key_desc != 0` (every reference key type, `string` and composite
-alike), the value words when `val_is_ref`, or both. A table holding neither is
-a leaf. Tracing is therefore exactly as precise as three separate buffers:
-the ctrl bytes and any scalar half are never traced. Empty, tombstoned, and
-unused slots hold a zero key/value word, which `markRoot` skips.
+A table's `cap`/`keys`/`vals` are written once, before a release store
+publishes it into `tbl`, and never after; every operation loads `tbl` once and
+indexes only that table (#5796, `runtime/root/maptable.bit`). That load is
+plain: every later read takes its address from it, and both targets order an
+address-dependent load after the load it depends on. `map_info`'s
+pointer map is `{0}`; `map_tbl_info`'s is `{8, 16}` with a declared size of 24,
+so the inline ctrl bytes past it are untraced. The two buffer bases are traced
+as references. The `keys`/`vals` buffers use `ref_array_info` (every word traced)
+exactly when their flag is set — for `keys` that is `key_desc != 0`, i.e. every
+reference key type, `string` and composite alike. The `ctrl` buffer is always a
+leaf; tracing its base only keeps it alive. Empty, tombstoned, and unused slots
+hold a zero key/value word, which `markRoot` skips.
 
 `key_desc` itself is NOT traced and must not be: it is either a small integer or
 the handle of a string CONSTANT, which is static for the life of the process.
