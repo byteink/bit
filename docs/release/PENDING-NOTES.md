@@ -46,22 +46,3 @@ instead, as the entry below does. `dist/release.sh` refuses to fold an entry
 that violates this rather than let it corrupt the count silently.
 
 ---
-
-### Breaking: `run` moved from `std/os` to `std/process`
-
-`run` is no longer exported from `std/os`. It now lives in `std/process`,
-next to `output`, since both run a child process the same way and differ
-only in whether the child's stdout and stderr are captured or left attached
-to the terminal. A program importing `run` from `std/os` needs to import it
-from `std/process` instead; nothing about `run`'s signature or behavior
-changed.
-
-### Breaking: a non-test file can no longer use a name only a test file imports
-
-Imports bind per module, and a `.test.bit` file joins its module only under
-`bit test` and `bit check`. A non-test file that used a name imported only
-by a test sibling therefore compiled locally and failed with `undefined name`
-in every consumer's build, where test files are not loaded. The compiler now
-reports that same error in every build, with a note naming the test file
-that holds the import. The fix in affected code is to import the name in
-the non-test file that uses it.
