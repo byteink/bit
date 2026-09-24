@@ -467,22 +467,113 @@ fn rFindShadowedLocal(r: Resolver, scopeId: int, name: string): int {
   return -1
 }
 
+// True when `sp` does not fall inside its own file's REAL registered text —
+// the file-joining newline `loadModuleReadFiles` (project.bit) inserts between
+// a module's files, or synthtext.bit's tail `appendSynthText` appends past the
+// LAST one for a synthesized member's words. `fileOf` has nowhere else to put
+// either offset, so it attributes both to that last file regardless of which
+// file (if any) the synthesis was actually FOR. synthtext.bit's own invariant
+// — "no diagnostic ever lands on one of these spans" — is what this function
+// keeps true for #5818's test-file scoping too: a span here is not something
+// a user wrote in that file, so neither `rNodeInTestFile` nor
+// `rTestOnlyImportFile` may trust the file `fileOf` handed back for it.
+fn rSpanIsSynthTail(r: Resolver, sp: Span): bool {
+  return sp.start >= len(fileSource(r.diags.sm, sp.file))
+}
+
+// `node`'s own file, as a `.test.bit`-suffix check on the path `rSpan` would
+// blame a diagnostic on — same file-offset remap (`fileOf`/`filePath`)
+// `testgen.bit`'s `declInTestFile` uses for the `Checker`, mirrored here for
+// the `Resolver`, which has no `Checker` to borrow one from. A synthesized
+// reference (`rSpanIsSynthTail`) answers `true` — the permissive, pre-#5818
+// default — rather than trust the last-file fallback `fileOf` hands back for
+// an offset with no real file at all.
+fn rNodeInTestFile(r: Resolver, node: int): bool {
+  let sp = rSpan(r, node)
+  if (rSpanIsSynthTail(r, sp)) {
+    return true
+  }
+  return isTestBitFile(filePath(r.diags.sm, sp.file))
+}
+
+// #5818: the `.test.bit` sibling's filename when `sym`'s binding is an
+// IMPORT whose own `import` statement sits only in a `.test.bit` file — ""
+// for every other symbol. `sym.decl == 0` is the prelude auto-import and the
+// universe's builtins (`rInjectPrelude`, `builtinSymbol`), neither of which
+// was ever declared by a `.test.bit` import. Imports bind per module (§17.1)
+// and a duplicate is E0042, so at most one declaration can ever back a given
+// module-scope name — finding this one import here already means it is the
+// ONLY one. A synthesized import (`classjsondecodeimports.bit`'s
+// `synthImportDecl`) answers "" — `rSpanIsSynthTail` again — rather than let
+// its tail span's coincidental last-file attribution hide it from a real
+// non-test reference.
+fn rTestOnlyImportFile(r: Resolver, sym: Symbol): string {
+  if (sym.decl == 0) {
+    return ""
+  }
+  if (sym.kind != SymbolKind.ImportItem && sym.kind != SymbolKind.ImportNamespace) {
+    return ""
+  }
+  let sp = rSpan(r, sym.decl)
+  if (rSpanIsSynthTail(r, sp)) {
+    return ""
+  }
+  let path = filePath(r.diags.sm, sp.file)
+  if (!isTestBitFile(path)) {
+    return ""
+  }
+  return pathBase(path)
+}
+
+// #5818: the reason `rResolveIdentRef` must treat `found` (a symbol bound in
+// scope `cur`) as absent for `node` — the `.test.bit` filename that alone
+// backs it — or "" when `found` is a real, in-scope binding for `node`.
+// Split out of the resolve loop so that loop stays a plain scope walk; only
+// `r.moduleScope` can hold an import, and a reference already inside a
+// `.test.bit` file sees every binding unchanged (SPEC §17.1).
+fn rHiddenFromNonTestFile(r: Resolver, cur: int, node: int, found: int): string {
+  if (cur != r.moduleScope) {
+    return ""
+  }
+  if (rNodeInTestFile(r, node)) {
+    return ""
+  }
+  return rTestOnlyImportFile(r, r.symbols[found])
+}
+
 // Resolves an identifier reference: walks the parent chain, preferring an
 // already-active binding, falling back to a pending one to report
 // use_before_init instead of a misleading undefined_name. The blank identifier
 // never resolves and never errors (write-only, §5.1).
+//
+// #5818: a module-scope binding that came from a `.test.bit` file's OWN
+// `import` is invisible to a reference in a non-test file, even though
+// `bit check`/`bit test` load every file — including test files — into one
+// build and would otherwise bind it module-wide like any other import
+// (§17.1). A consumer's build never sees the test file at all (`project.bit`'s
+// `withoutTestFiles`), so treating it as in scope here would pass locally and
+// break for every consumer (#5817). A reference FROM a `.test.bit` file is
+// unaffected — it keeps seeing every binding, including ordinary ones from
+// non-test files, exactly as before.
 fn rResolveIdentRef(r: Resolver, node: int, scopeId: int) {
   let name = rIdentText(r, node)
   if (name == "_") {
     rSetNodeSymbol(r, node, 0)
     return
   }
+  let hiddenIn = ""
   let cur = scopeId
   while (cur >= 0) {
     let found = rScopeGet(r, cur, name)
     if (found >= 0) {
-      rSetNodeSymbol(r, node, found)
-      return
+      let testFile = rHiddenFromNonTestFile(r, cur, node, found)
+      if (testFile == "") {
+        rSetNodeSymbol(r, node, found)
+        return
+      }
+      hiddenIn = testFile
+      cur = r.scopes[cur].parent
+      continue
     }
     let (isPending, pendingOk) = r.scopes[cur].pending[name]
     if (pendingOk && isPending) {
@@ -494,6 +585,15 @@ fn rResolveIdentRef(r: Resolver, node: int, scopeId: int) {
       return
     }
     cur = r.scopes[cur].parent
+  }
+  if (hiddenIn != "") {
+    rError(
+      r, node, ecUndefinedName, "undefined name '${name}'",
+      "imported only by ${hiddenIn}, which is not part of the module outside tests",
+    )
+    rSetNodeSymbol(r, node, 0)
+    rEmitCatchSpacingHint(r, node)
+    return
   }
   // #2869: an unresolvable name may live in a sibling `.bit` file this build
   // never loaded — the build target named a FILE rather than the directory
