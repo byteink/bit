@@ -199,6 +199,14 @@ const oNonBlock: int = 2048
   return curFd
 }
 
+// Open the already-scratch-copied, NUL-terminated C path `p` as a
+// directory, FOLLOWING its own symlinks — `rtFsOpenBeneathW`'s root-open
+// step, factored out so `rtFsOpenDirW` below (`walkBeneath`'s root open,
+// #5800) shares it instead of repeating the `sysOpenAt(atFdCwd, ...)` call.
+@nosplit fn openDirFollowingP(p: int): int {
+  return sysOpenAt(atFdCwd, p, oDirectoryVal())
+}
+
 // `bit_rt_fs_open_beneath_w`: open `root` (the `rootN`-byte packed path at
 // `rootWords`, following its own symlinks, via ./fs.bit's `sysOpen`-style
 // `O_DIRECTORY` open) then walk `rel` (the `relN`-byte packed path at
@@ -215,7 +223,7 @@ export @nosplit @symbol("bit_rt_fs_open_beneath_w") fn rtFsOpenBeneathW(
   if (rootP == 0) {
     return 0 - 1
   }
-  let rootFd = sysOpenAt(atFdCwd, rootP, oDirectoryVal())
+  let rootFd = openDirFollowingP(rootP)
   if (rootFd < 0) {
     return 0 - 1
   }
@@ -266,4 +274,168 @@ export @nosplit @symbol("bit_rt_fs_fstat_w") fn rtFsFstatW(fd: int, out: int): i
   }
   storeWord(out + 40, isRegular)
   return 0
+}
+
+// `bit_rt_fs_open_dir_w`/`bit_rt_fs_open_dir_beneath_fd_w`/
+// `bit_rt_fs_list_dir_fd_w` (#5800): the three primitives `std/fs/secure`'s
+// `walkBeneath` needs to close #5787's OTHER TOCTOU — `std/fs`'s own `walk`
+// (stdlib/fs/fs.bit) checks `isRealDir(p)` then calls `readDir(p)` BY PATH,
+// so a directory swapped for a symlink to outside the tree between the two
+// calls is followed, exactly the race `openBeneath` above closes for a
+// single file open. `walkBeneath` never re-resolves a path once it has an
+// fd: it lists each directory FROM the fd it already opened no-follow, and
+// descends into a child only by opening it no-follow relative to that SAME
+// fd — a swap of any ancestor after this walk holds its fd can no longer
+// change what that fd names, the same invariant `rtFsOpenBeneathW`'s
+// per-component walk above relies on.
+
+// `bit_rt_fs_open_dir_w`: open the `n`-byte packed path at `words` as a
+// directory, FOLLOWING its own symlinks — `walkBeneath`'s ROOT open. `root`
+// is the trusted boundary the caller named, exactly like `openBeneath`'s
+// `root` argument, so it is opened normally; only the DESCENT below it
+// (`rtFsOpenDirBeneathFdW`) refuses a symlink. fd, or -1 for a malformed
+// path, a non-directory, or any other open failure.
+export @nosplit @symbol("bit_rt_fs_open_dir_w") fn rtFsOpenDirW(words: int, n: int): int {
+  let p = wordsPathZ(words, n)
+  if (p == 0) {
+    return 0 - 1
+  }
+  return openDirFollowingP(p)
+}
+
+// Whether the NUL-terminated `n`-byte name at `p` is safe to open as a
+// SINGLE path component: no `/` anywhere (a real directory entry can never
+// contain one; this only guards a future caller that hands this primitive
+// something other than one listed name), and not `.`/`..` (`walkBeneath`'s
+// own listing, `rtFsListDirFdW` below, already excludes both, the same
+// defense-in-depth reasoning `hasDotDotComponent` above gives for
+// `rtFsOpenBeneathW`'s `rel`). BOUNDED (Power of 10 rule 2): by `n`.
+@nosplit fn isSingleSafeComponent(p: int, n: int): bool {
+  if (n == 0) {
+    return false
+  }
+  if (n == 1 && loadByte(p) == 46) {
+    return false
+  }
+  if (n == 2 && loadByte(p) == 46 && loadByte(p + 1) == 46) {
+    return false
+  }
+  let i = 0
+  while (i < n) {
+    if (loadByte(p + i) == 47) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `bit_rt_fs_open_dir_beneath_fd_w`: open the SINGLE path component
+// `nameWords[0:nameN)` relative to the already-open directory `dirFd`,
+// refusing a symlink (`O_NOFOLLOW`) and requiring the result to be a
+// directory (`O_DIRECTORY`) — `walkBeneath`'s DESCENT step. `dirFd` is
+// already open and pinned by this process's own fd table, so a rename or
+// symlink-swap of an entry after `walkBeneath` LISTED `dirFd`
+// (`rtFsListDirFdW`) cannot change what `dirFd` itself names; only what the
+// CHILD resolves to, which `O_NOFOLLOW` catches here. fd of the child
+// directory, or -1 for a symlink, a non-directory, `.`/`..`/an embedded `/`,
+// or any other open failure — `walkBeneath` reports every one of these as a
+// LEAF path, the same contract `std/fs`'s path-based `walk` gives a symlink
+// or a plain file.
+export @nosplit @symbol("bit_rt_fs_open_dir_beneath_fd_w") fn rtFsOpenDirBeneathFdW(
+  dirFd: int, nameWords: int, nameN: int,
+): int {
+  let nameP = wordsPathZ(nameWords, nameN)
+  if (nameP == 0 || !isSingleSafeComponent(nameP, nameN)) {
+    return 0 - 1
+  }
+  let fd = sysOpenAt(dirFd, nameP, oNoFollowVal() | oDirectoryVal())
+  if (fd < 0) {
+    return 0 - 1
+  }
+  return fd
+}
+
+// `bit_rt_fs_list_dir_fd_w`: the already-open directory `fd`'s entries
+// (`.`/`..` omitted), snprintf-shaped exactly like `./fs.bit`'s path-based
+// `bit_rt_fs_list_dir` (measure with `outCap == 0`, then fill) — but listed
+// straight off `fd` via `getdents64`, never by re-resolving a path, so a
+// rename or symlink-swap of the directory itself after `walkBeneath` opened
+// it cannot change what gets listed. Does NOT close `fd`: unlike
+// `./fs.bit`'s `sysList` (which opened the fd itself and owns it),
+// `walkBeneath` still needs `dirFd` open afterward, to open each child
+// beneath it (`rtFsOpenDirBeneathFdW`). Total bytes needed, or -1 if `fd`
+// does not name a directory. BOUNDED (Power of 10 rule 2): the same
+// argument `./fs.bit`'s `sysList` gives — `getdents64` returns 0 at the end
+// of a directory with finitely many entries, and the inner loop advances by
+// `d_reclen`, which the kernel guarantees positive (the `reclen <= 0` guard
+// keeps it bounded even against a malformed record).
+// Copy one already-fetched `getdents64` batch (`dbuf[0:batchLen)`) into
+// `outPtr[0:outCap)`, skipping `.`/`..`, and return the updated running
+// total. Split out of `rtFsListDirFdW` below to keep that function's nesting
+// under spec/LINT.md's limit — inlined, this batch-decode loop plus the
+// outer `getdents64` retry loop put it two levels past `./fs.bit`'s own
+// `sysList`, which already carries that depth as undocumented debt; this one
+// does not repeat it. A `reclen <= 0` record ends THIS batch only (the
+// kernel guarantees a positive `d_reclen` for every real record, so this is
+// a malformed-buffer guard, not a real directory shape) — the outer loop's
+// next `getdents64` call still runs. BOUNDED (Power of 10 rule 2): by
+// `batchLen`, which the kernel itself bounds to `fsDirBufBytes`.
+@nosplit fn copyDirBatch(dbuf: int, batchLen: int, outPtr: int, outCap: int, totalIn: int): int {
+  let total = totalIn
+  let off = 0
+  while (off < batchLen) {
+    let reclen = loadU16(dbuf + off + direntReclenOff)
+    if (reclen <= 0) {
+      return total
+    }
+    let nameAddr = dbuf + off + direntNameOff
+    let nlen = cstrLen(nameAddr)
+    if (isDotName(nameAddr, nlen)) {
+      off = off + reclen
+      continue
+    }
+    let j = 0
+    while (j < nlen) {
+      if (total + j < outCap) {
+        storeByte(outPtr + total + j, loadByte(nameAddr + j))
+      }
+      j = j + 1
+    }
+    if (total + nlen < outCap) {
+      storeByte(outPtr + total + nlen, 0)
+    }
+    total = total + nlen + 1
+    off = off + reclen
+  }
+  return total
+}
+
+export @nosplit @symbol("bit_rt_fs_list_dir_fd_w") fn rtFsListDirFdW(
+  fd: int, outPtr: int, outCap: int,
+): int {
+  // `getdents64` reads from `fd`'s own kernel-tracked directory position:
+  // without this reset, a first (measuring, #5800) call already reading
+  // `fd` to EOF left the SECOND (filling) call starting from that same EOF
+  // position and returning 0 every time, no matter how many entries `fd`
+  // actually names. `lseek` back to the start so every call to this
+  // primitive is independent of how many times it (or a caller reusing
+  // `fd`) has been called before. Harmless to `fd`'s later use:
+  // `walkBeneath` only ever opens children relative to `fd` afterward,
+  // which does not care about its read offset.
+  syscall(sysLseek(), i64(fd), i64(0), i64(0))
+  let dbuf = int(ptrOf(fsDirBuf)) + fsScratchSlot() * fsDirBufBytes
+  let total = 0
+  let done = false
+  while (!done) {
+    let rc = int(syscall(sysGetdents64(), i64(fd), i64(dbuf), i64(fsDirBufBytes)))
+    if (rc < 0) {
+      return 0 - 1
+    }
+    if (rc == 0) {
+      done = true
+    }
+    total = copyDirBatch(dbuf, rc, outPtr, outCap, total)
+  }
+  return total
 }

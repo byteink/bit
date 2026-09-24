@@ -1,0 +1,161 @@
+// `bit run _tests_/bit/walkbeneath` (#5800): the parent-swap race `std/fs`'s
+// `walk` has, and `std/fs/secure`'s `walkBeneath` closes. `walk`
+// (stdlib/fs/fs.bit) checks `isRealDir(p)` then calls `readDir(p)` BY
+// PATH — two separate lookups of the same name, so a directory swapped for
+// a symlink to outside `root` between them is followed. `walkBeneath` never
+// re-resolves a path once it holds an fd: it lists and descends by
+// already-open, no-follow file descriptor.
+//
+// Same swap shape as #5793's _tests_/bit/openbeneath/openbeneath.bit: a
+// `spawn`ed green thread flips `<root>/a` between a real directory and a
+// symlink `L` to `<scratch>/outside` (marker file `OUTSIDE-MARKER.txt`,
+// never written under either `root`), four plain `rename`s per cycle, while
+// the main thread walks `root` in a tight loop and checks whether
+// `OUTSIDE-MARKER.txt` ever shows up in the returned paths. TWO PHASES, one
+// swapper each, same fixture shape, run sequentially: phase 1 races `walk`
+// (the PRE-EXISTING bug — a positive count here is the control, proving the
+// race interleaves at all), phase 2 races `walkBeneath` (this ticket's fix —
+// must stay 0).
+//
+// RUN WITH `BIT_WORKERS=4` (or higher): see openbeneath.bit's header for why
+// the default of 1 never truly interleaves the swapper and the walker.
+import { mkdir, writeFile, rename, walk } from "std/fs"
+import { walkBeneath } from "std/fs/secure"
+import { hasSuffix } from "std/strings"
+import { run, envOr, exit } from "std/os"
+
+const iterations: int = 300000
+const marker: string = "OUTSIDE-MARKER.txt"
+
+fn mustMkdir(path: string) {
+  mkdir(path) catch e {
+    panic("walkbeneath race: mkdir ${path}: ${e.message()}")
+  }
+}
+
+fn mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    panic("walkbeneath race: write ${path}: ${e.message()}")
+  }
+}
+
+fn mustLink(target: string, link: string) {
+  let rc = run("/bin/ln", ["-s", target, link])
+  if (rc != 0) {
+    panic("walkbeneath race: /bin/ln -s ${target} ${link} exited ${rc}")
+  }
+}
+
+fn mv(x: string, y: string): bool {
+  rename(x, y) catch _ {
+    return false
+  }
+  return true
+}
+
+// The swapper: renames carry no result the walking loop needs, only the
+// `done` signal once `iters` cycles have run.
+fn swapLoop(root: string, iters: int, done: chan<int>) {
+  let n = 0
+  while (n < iters) {
+    let _ = mv("${root}/a", "${root}/R")
+    let _ = mv("${root}/L", "${root}/a")
+    let _ = mv("${root}/a", "${root}/L")
+    let _ = mv("${root}/R", "${root}/a")
+    n = n + 1
+  }
+  done <- 1
+}
+
+fn hasMarker(paths: []string): bool {
+  for p of paths {
+    if (hasSuffix(p, marker)) {
+      return true
+    }
+  }
+  return false
+}
+
+// A fresh root fixture under `dir`: `root/a` (a real directory holding one
+// file) and `root/L`, a pre-made symlink to `outside` the swapper flips `a`
+// against.
+fn setupRoot(dir: string, outside: string): string {
+  let root = dir
+  mustMkdir(root)
+  mustMkdir("${root}/a")
+  mustWrite("${root}/a/inside.txt", "INSIDE")
+  mustLink(outside, "${root}/L")
+  return root
+}
+
+fn main() {
+  let dir = "${envOr("TMPDIR", "/tmp")}/t5800-race-${timeUnixNs()}"
+  mustMkdir(dir)
+  let outside = "${dir}/outside"
+  mustMkdir(outside)
+  mustWrite("${outside}/${marker}", "OUTSIDE-LEAK")
+
+  // Phase 1: `walk` (unsafe) -- the pre-existing bug, the control proving
+  // the race genuinely interleaves.
+  let root1 = setupRoot("${dir}/p1", outside)
+  let done1 = chan<int>()
+  spawn swapLoop(root1, iterations, done1)
+  let n = 0
+  let unsafeLeaked = 0
+  let unsafeOk = 0
+  let unsafeErr = 0
+  while (n < iterations) {
+    let paths = walk(root1) catch _ {
+      unsafeErr = unsafeErr + 1
+      n = n + 1
+      continue
+    }
+    if (hasMarker(paths)) {
+      unsafeLeaked = unsafeLeaked + 1
+    } else {
+      unsafeOk = unsafeOk + 1
+    }
+    n = n + 1
+  }
+  let _ = <- done1
+
+  // Phase 2: `walkBeneath` (safe) -- this ticket's fix.
+  let root2 = setupRoot("${dir}/p2", outside)
+  let done2 = chan<int>()
+  spawn swapLoop(root2, iterations, done2)
+  n = 0
+  let safeLeaked = 0
+  let safeOk = 0
+  let safeErr = 0
+  while (n < iterations) {
+    let paths = walkBeneath(root2) catch _ {
+      safeErr = safeErr + 1
+      n = n + 1
+      continue
+    }
+    if (hasMarker(paths)) {
+      safeLeaked = safeLeaked + 1
+    } else {
+      safeOk = safeOk + 1
+    }
+    n = n + 1
+  }
+  let _ = <- done2
+
+  print("walk(unsafe):      walks=${iterations} ok=${unsafeOk} LEAKED-OUTSIDE=${unsafeLeaked} errored=${unsafeErr}\n")
+  print("walkBeneath(safe): walks=${iterations} ok=${safeOk} LEAKED-OUTSIDE=${safeLeaked} errored=${safeErr}\n")
+
+  if (safeLeaked != 0) {
+    print("FAIL: walkBeneath leaked ${safeLeaked} outside path(s) of ${iterations} walks\n")
+    exit(1)
+  }
+  // Non-vacuity: 0 leaks through walkBeneath only means something if the
+  // swapper really raced the walks. Under BIT_WORKERS=1 the two green
+  // threads never interleave and phase 1 (walk, the KNOWN-buggy function)
+  // would show 0 leaks too -- a pass that tested nothing.
+  if (unsafeLeaked == 0) {
+    print("FAIL: race never interleaved through walk (unsafeLeaked=0); run with BIT_WORKERS=4\n")
+    exit(1)
+  }
+  print("ok   walkbeneath-race\n")
+}
