@@ -1,0 +1,92 @@
+// #5845: `schedTimerChanReset` moved a pending channel timer's deadline
+// EARLIER with no wake for worker 0, the same bug `rtSchedTimerChanArm` had
+// on a different entry point. Worker 0 parks in `pollDrain` bounded by the
+// deadline it last knew about (`schedParkBoundNs`, reading `dlChans`); a
+// reset that moves a slot's deadline earlier than that bound, while worker 0
+// is already asleep on it, was invisible until worker 0's own bound expired
+// or a parked peer's `idleParkMaxNs` timeout happened to sweep the pool —
+// `chanTimerLowerDeadline`/`chanTimerWakePoller` (`runtime/sched/timer.bit`)
+// are now called from both `rtSchedTimerChanArm` and `schedTimerChanReset`.
+//
+// EACH ITERATION ARMS A LONG TIMER, LETS IT SETTLE, THEN RESETS IT SHORT.
+// `newTimer(longNs)` first — the arm side already wakes worker 0 correctly,
+// so worker 0 promptly parks with a bound close to `longNs`.
+//
+// THE SETTLE IS A BUSY-SPIN, NOT `sleep`, AND THAT IS LOAD-BEARING. A
+// `sleep(settleNs)` parks the resetter on the TASK-timer path, and with only
+// one other task in the program (the accept-holder, itself permanently
+// parked), worker 0 is usually the only worker left to service that sleep's
+// own expiry — which means worker 0 itself ends up running the `reset` call
+// afterward, never having been genuinely asleep at the moment that matters.
+// Measured: with `sleep`, this program failed as few as 1 of 5
+// `BIT_WORKERS=8` runs pre-fix, and adding concurrent resetters to improve
+// the odds instead SELF-HEALED it to 0 of 5 (more resetters means more
+// frequent, unrelated chan-timer sweeps, the same masking `../chantimerwake`
+// documents for its own arm-side repro). A busy-spin never parks, so the OS
+// thread this task started on — this runtime has no scheduler preemption
+// (`../schedpreempt`) — keeps running it right up to the `reset` call. It
+// costs `spinBudget` calls to `monotonic()` and nothing else. Measured with
+// the busy-spin: 5 of 5 `BIT_WORKERS=8` runs pre-fix failed at 95.0-99.3ms
+// (`idleParkMaxNs` territory), all `BIT_WORKERS=1` control runs under 0.6ms.
+//
+// The live netpoll registration (an accept-blocked listener) and the
+// BIT_WORKERS=8 pin are the same requirements `../chantimerwake` documents,
+// for the same reasons.
+
+import { listen, Listener } from "std/net"
+import { newTimer, monotonic, since, Millisecond } from "std/time"
+
+const iters: int = 200
+const longNs: int = 300 * Millisecond
+const shortNs: int = 2 * Millisecond
+const settleNs: int = 5 * Millisecond
+const overshootBudgetNs: int = 50 * Millisecond
+
+// Bounds the busy-spin (Power of 10): comfortably more than `settleNs` could
+// ever take even on a heavily loaded box, so a `monotonic()` call that
+// somehow stalled would still end the loop rather than spin forever.
+const spinBudget: int = 100000000
+
+class AcceptArgs { l: Listener }
+
+// Parks on the netpoller for the whole run: nothing ever connects. See
+// `../chantimerwake/chantimerwake.bit` for why this registration is required.
+fn holdAccept(a: AcceptArgs) {
+  let _ = a.l.accept() catch _ {
+    return
+  }
+}
+
+fn busySpin(deadline: int) {
+  let n = 0
+  while (monotonic().ns < deadline && n < spinBudget) {
+    n = n + 1
+  }
+}
+
+fn main() {
+  let l = listen("127.0.0.1", 0) catch _ {
+    print("chantimerresetwake bind-fail\n")
+    return
+  }
+  spawn holdAccept(AcceptArgs{ l = l })
+
+  let worstNs = i64(0)
+  let i = 0
+  while (i < iters) {
+    let t = newTimer(longNs)
+    busySpin(monotonic().ns + settleNs)
+    let start = monotonic()
+    let _ = t.reset(shortNs)
+    let _ = <- t.c
+    let overshoot = i64(since(start) - shortNs)
+    if (overshoot > worstNs) {
+      worstNs = overshoot
+    }
+    i = i + 1
+  }
+  l.close()
+
+  let ok = worstNs <= i64(overshootBudgetNs)
+  print("chantimerresetwake ${ok}\n")
+}

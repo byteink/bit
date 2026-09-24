@@ -508,16 +508,53 @@ export @nosplit @symbol("bit_rt_port_sched_timer_chan_count") fn schedTimerChanC
 // non-positive `periodNs` fires once and frees its slot. Returns a timer id
 // greater than 0, or 0 if the pool is exhausted (`ctCap` slots all pending).
 //
+// MUST BE CALLED WITH `chanTimerLockAddr()` HELD, by any caller that just
+// published a new-or-moved deadline into the pool (#5845): lowers `dlChans`
+// to the earlier of its current value and `deadlineNs` (`earlierDeadline`,
+// never upward — a too-early `dlChans` costs one spurious wake, never a
+// missed one) and bumps `chanTimerArmSeqAddr()`, the signal
+// `schedTimerChanExpire`'s own publish reads to tell "my scan saw everything"
+// from "something changed under me, do not trust my `earliest` outright" (see
+// that function's header for the full argument). Both `rtSchedTimerChanArm`
+// and `schedTimerChanReset` call this — a reset that moves a pending entry
+// EARLIER while worker 0 sleeps on the old bound is the identical bug on a
+// different entry point.
+@nosplit fn chanTimerLowerDeadline(deadlineNs: int) {
+  let cur = atomicLoad(nextDeadlineAddr() + dlChans)
+  atomicStore(nextDeadlineAddr() + dlChans, earlierDeadline(cur, deadlineNs))
+  atomicAdd(chanTimerArmSeqAddr(), 1)
+}
+
+// Wakes worker 0 if it is parked in `pollDrain` (#5845). Call AFTER
+// `spinRelease(chanTimerLockAddr())`, never while holding it —
+// `schedWakePoller` can reach the poll provider's wake syscall, which has no
+// business running under this pool's lock. `s` is the CALLING TASK's
+// scheduler (`taskWorker` -> `wkSched`, the chain `schedSleepUntil` uses); no
+// current task means no worker to wake.
+@nosplit fn chanTimerWakePoller() {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr != 0) {
+    let t = taskAt(taskAddr)
+    let w = taskAt(*(t + taskWorker))
+    let s = taskAt(*(w + wkSched))
+    schedWakePoller(s)
+  }
+}
+
+// `runtime/sched/timer.bit`'s half of #2665: inserts a queue entry that, at
+// expiry, does a non-blocking send of `true` on `c` (dropped if `c` is full —
+// see `chanTrySendDrop`'s header, `runtime/chan/chanops.bit`). If `periodNs`
+// is positive the entry re-arms itself at `deadline + periodNs` on every
+// expiry instead of being freed (`schedTimerChanExpire` below); a
+// non-positive `periodNs` fires once and frees its slot. Returns a timer id
+// greater than 0, or 0 if the pool is exhausted (`ctCap` slots all pending).
+//
 // `c` is `int` here — the raw channel handle `compiler/lowercall.bit`'s
 // generic `primRtName` path hands an `Op.RtCall` argument as, exactly like
 // `chan_close`'s `cv`. This function is never called through an ordinary Bit
 // call expression (only the compiler's own lowering reaches it by this
 // symbol), so a `chan<bool>`-typed signature here would be misleading rather
 // than safe.
-//
-// WAKES WORKER 0 AFTER PUBLISHING (#5845, unlike `schedTimerPush` this had no
-// producer for it — `_tests_/stress/chantimerwake`). `s` is the CURRENT
-// TASK's (pinned prim signature); no task, no wake.
 export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
   deadlineNs: int,
   c: int,
@@ -538,21 +575,9 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
   *(e + ctPeriod) = periodNs
   *(e + ctChan) = c
   atomicAdd(chanTimerPendingAddr(), 1)
-  // Lower `dlChans` now, not just on the next sweep (#5845): a concurrent
-  // sweep that already started scanning past this slot cannot see this
-  // deadline, and its own publish must not raise `dlChans` back past it. The
-  // sequence bump is what tells that sweep its snapshot may be stale.
-  let cur = atomicLoad(nextDeadlineAddr() + dlChans)
-  atomicStore(nextDeadlineAddr() + dlChans, earlierDeadline(cur, deadlineNs))
-  atomicAdd(chanTimerArmSeqAddr(), 1)
+  chanTimerLowerDeadline(deadlineNs)
   spinRelease(cell)
-  let taskAddr = schedCurrentTask()
-  if (taskAddr != 0) {
-    let t = taskAt(taskAddr)
-    let w = taskAt(*(t + taskWorker))
-    let s = taskAt(*(w + wkSched))
-    schedWakePoller(s)
-  }
+  chanTimerWakePoller()
   return ctMakeId(slot, gen)
 }
 
@@ -607,7 +632,10 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_cancel") fn schedTimerChanCance
 
 // Moves a pending entry to a new absolute deadline. `false` when `id` is
 // unknown (already fired, or never valid) — the same lookup `cancel` uses, so
-// the two report unknown-ness identically.
+// the two report unknown-ness identically. Same shape as
+// `rtSchedTimerChanArm` deliberately (#5845): moving a deadline EARLIER while
+// worker 0 sleeps on the old bound is the identical bug arming one is, so
+// this calls the same two helpers, in the same order.
 export @nosplit @symbol("bit_rt_sched_timer_chan_reset") fn schedTimerChanReset(
   id: int,
   deadlineNs: int,
@@ -620,7 +648,9 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_reset") fn schedTimerChanReset(
     return false
   }
   *(ctEntryAt(slot) + ctDeadline) = deadlineNs
+  chanTimerLowerDeadline(deadlineNs)
   spinRelease(cell)
+  chanTimerWakePoller()
   return true
 }
 
