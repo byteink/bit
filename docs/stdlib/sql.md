@@ -1001,6 +1001,13 @@ empty for `NoRows`/`TooManyRows`, which name no column. `expected`/`found`
 are filled for `TypeMismatch` (the two type names) and `ColumnCount` (the
 wanted and the actual column count).
 
+### `SqlRowError.message`
+
+The sentence the `error` interface reports, also callable after narrowing
+with `e.(SqlRowError)`, so a handler that branches on `cause` can still log
+the full text: `"sql: column 'age' is NULL, and the field is not Option"`,
+or `"sql: no rows"` for a cause that names no column.
+
 ## Row-mapping primitives
 
 The named functions the compiler's synthesised mapper is written in terms
