@@ -174,8 +174,97 @@ fn checkX64ControlFlowBrAndRet(ctx: TypeContext, i64t: int, blocks: []IrBlock) {
   let hexq = xHex(cq.buf)
   assert(len(hexq) >= 6 && hexq[0:6] == "4889d8") // the move is FIRST
 
-  // A multi-value ret has no settled packing: refuse rather than emit something.
+  // A multi-value ret now lowers into the return-register list (#5868), end
+  // to end through xEmitRet rather than xEmitMultiWordRet alone: xFnCtx puts
+  // vreg 0 in rbx (a register) and vreg 1 in spill slot 0, landing word 0 in
+  // rax and word 1 (reloaded from its spill slot) in rdx, then the epilogue
+  // and ret still run.
   let cm = xFnCtx([i64t, i64t], [IrBlock{ instsStart = 0, paramCount = 0, instsLen = 2 }])
   cm.ctx = ctx
-  assert(!xEmitRet(cm, [0, 1]))
+  assert(xEmitRet(cm, [0, 1]))
+  assert(xHexHas(cm.buf, "4889d8")) // mov rax, rbx: word 0 <- vreg 0
+  let word1Load = newX64Buf()
+  xMovLoad(word1Load, XReg64.Rdx, xMemB(XReg64.Rbp, xSpillOffset(cm.frame, 0)), 8, false)
+  assert(xHexHas(cm.buf, xHex(word1Load))) // word 1 <- vreg 1, reloaded into rdx
+  assert(xHexHas(cm.buf, "5b"))            // pop rbx: the epilogue still runs
+  assert(xHexHas(cm.buf, "c3"))            // ret
+}
+
+// #5868: the return convention at W > 1 — xRetIntRegs/xRetFloatRegs/
+// xRetRegsFor (x64.bit) and xEmitMultiWordRet. Every function the front end
+// builds today returns W <= 1 (`return a, b` still boxes on x86_64 until the
+// flip ticket #5872), so this check is the capability's only gate, not a
+// supplement to one.
+fn checkX64MultiWordRet() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let f64t = primType(ctx, 9)
+
+  // A 2-int-word ret whose sources are EACH OTHER's destination — rax and
+  // rdx swap. A left-to-right pair of movs would destroy one word before it
+  // is read; the parallel-move sequencer must rotate through the reserved
+  // secondary scratch (r10), exactly as arm64's aliasing case does.
+  let cx = newXCtx(XCallConv.SysV)
+  cx.ctx = ctx
+  cx.intRegs = [XReg64.Rdx, XReg64.Rax] // vreg 0 -> rdx, vreg 1 -> rax
+  cx.alloc = RegAllocResult{
+    locations = [
+      RegLoc{ isSpill = false, index = 0 }, RegLoc{ isSpill = false, index = 1 },
+    ], numSpillSlots = 0, stackMaps = []StackMapEntry(0),
+  }
+  cx.f = IrFunc{
+    name = "f", paramTypes = []int(0), result = 0, blocks = []IrBlock(0),
+    instrs = [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t)],
+    isFallible = false,
+  }
+  xEmitMultiWordRet(cx, [0, 1])
+  let want = newXCtx(XCallConv.SysV)
+  xMovRR(want.buf, XReg64.R10, XReg64.Rax) // save what word 1 is about to overwrite
+  xMovRR(want.buf, XReg64.Rax, XReg64.Rdx) // word 0 <- vreg 0
+  xMovRR(want.buf, XReg64.Rdx, XReg64.R10) // word 1 <- vreg 1 (saved)
+  assert(xHex(cx.buf) == xHex(want.buf))
+
+  // (i64, f64, i64) lands in {rax, xmm0, rdx}, NOT {rax, xmm0, rax}: int and
+  // float words are counted independently, so the second int word takes the
+  // int file's SECOND register even though it is the run's third value.
+  let cy = newXCtx(XCallConv.SysV)
+  cy.ctx = ctx
+  cy.intRegs = [XReg64.Rbx, XReg64.R13]
+  cy.floatRegs = [XmmReg.Xmm2]
+  cy.alloc = RegAllocResult{
+    locations = [
+      RegLoc{ isSpill = false, index = 0 }, RegLoc{ isSpill = false, index = 0 },
+      RegLoc{ isSpill = false, index = 1 },
+    ], numSpillSlots = 0, stackMaps = []StackMapEntry(0),
+  }
+  cy.f = IrFunc{
+    name = "f", paramTypes = []int(0), result = 0, blocks = []IrBlock(0),
+    instrs = [
+      mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, f64t), mkInstr(Op.BlockParam, i64t),
+    ],
+    isFallible = false,
+  }
+  xEmitMultiWordRet(cy, [0, 1, 2])
+  let wantWord0 = newX64Buf()
+  xMovRR(wantWord0, XReg64.Rax, XReg64.Rbx)
+  let wantWord1 = newX64Buf()
+  xMovFRR(wantWord1, XmmReg.Xmm0, XmmReg.Xmm2, 8)
+  let wantWord2 = newX64Buf()
+  xMovRR(wantWord2, XReg64.Rdx, XReg64.R13)
+  assert(xHexHas(cy.buf, xHex(wantWord0)))
+  assert(xHexHas(cy.buf, xHex(wantWord1)))
+  assert(xHexHas(cy.buf, xHex(wantWord2)))
+  // No fourth move and nothing extra: exactly these three moves were emitted.
+  assert(len(cy.buf.code) == len(wantWord0.code) + len(wantWord1.code) + len(wantWord2.code))
+
+  // The Win64 list never hands out rsi/rdi — SysV treats them as argument
+  // registers, but Win64 callee-saves them, so a return word must not
+  // clobber one on its way out.
+  let win = xRetIntRegs(XCallConv.Win64)
+  assert(len(win) == 5)
+  let wi = 0
+  while (wi < len(win)) {
+    assert(win[wi] != XReg64.Rsi && win[wi] != XReg64.Rdi)
+    wi = wi + 1
+  }
 }

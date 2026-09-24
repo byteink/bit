@@ -558,6 +558,18 @@ fn xEmitCallLike(
     }
     return
   }
+  xEmitCallSeq(cx, symbol, args, isSafepoint)
+  if (hasRet) {
+    xTakeCallResult(cx, dst, retTy)
+  }
+}
+
+// The call sequence itself — marshal, Win64 home space, `call`, safepoint,
+// teardown — shared by the one-word form above and the multi-word form below
+// (#5869) so the two cannot drift apart. Only the BINDING differs between
+// them: xEmitCallLike's thread-token shortcut never applies here, since that
+// symbol takes no arguments and returns one word, never a W > 1 run.
+fn xEmitCallSeq(cx: XCtx, symbol: string, args: []int, isSafepoint: bool) {
   let argReserve = xMarshalArgs(cx, args, 0, 0, 0)
   // Win64's home space is reserved around just this call site rather than
   // baked into the frame: every other stack slot codegen touches is rbp-relative,
@@ -581,9 +593,85 @@ fn xEmitCallLike(
   if (argReserve > 0) {
     xRspAddSub(cx.buf, false, argReserve)
   }
-  if (hasRet) {
-    xTakeCallResult(cx, dst, retTy)
+}
+
+// Binds a W-word call result into `dsts`, word k from its own class's return
+// register (xRetRegsFor, x64.bit) — the x64 twin of arm64's bindCallResults
+// (arm64call.bit). `tys[k]` is REQUIRED even when `dsts[k] < 0` discards the
+// word, because a discarded word still consumes its class's return-register
+// ordinal — dropping it would slide every later word of the other class into
+// the wrong register.
+//
+// ONE parallel move, not W sequential ones: a destination may itself be
+// another word's return register (a swapped pair of int results), and a
+// left-to-right sequence would overwrite one before it is read.
+// xSequentializeAndEmit resolves that through the reserved secondary
+// scratch. NOTHING MAY BE EMITTED BETWEEN THE CALL AND THE LAST BINDING
+// (#4236) — callers run this immediately after xEmitCallSeq/
+// xEmitCallIfaceSeq, whose only teardown is `add rsp`, which touches no
+// return register.
+fn xTakeCallResults(cx: XCtx, dsts: []int, tys: []int) {
+  assert(len(dsts) == len(tys))
+  let classes = []RegClass(0)
+  let i = 0
+  while (i < len(tys)) {
+    classes = append(classes, regClassOf(cx.ctx, tys[i]))
+    i = i + 1
   }
+  let regs = xRetRegsFor(cx.cc, classes)
+  let moves = []PMove(0)
+  i = 0
+  while (i < len(dsts)) {
+    if (dsts[i] >= 0) {
+      // A C callee returns `bool` in the low byte and leaves the rest of the
+      // register unspecified (see xTakeCallResult) — normalize in place, in
+      // the word's OWN return register, before the move reads it.
+      if (classes[i] == RegClass.Int && xIsBoolTy(cx.ctx, tys[i])) {
+        xMovzxb(cx.buf, xRegOf(regs[i]), xRegOf(regs[i]))
+      }
+      moves = append(
+        moves,
+        PMove{ src = plocReg(regs[i], classes[i]), dst = xPlocOf(cx, dsts[i], classes[i]) },
+      )
+    }
+    i = i + 1
+  }
+  xSequentializeAndEmit(cx, moves)
+}
+
+// The W destinations of the call at `i` and its Op.CallWord run, word 0
+// first. Shared by xEmitCallWords and xEmitCallIfaceWords so a direct call
+// and a vtable call number their words identically.
+fn xCallWordDsts(cx: XCtx, i: int, w: int): []int {
+  let dsts = []int(0)
+  let k = 0
+  while (k < w) {
+    dsts = append(dsts, xDstOrNone(cx, i + k, cx.f.instrs[i + k].ty))
+    k = k + 1
+  }
+  return dsts
+}
+
+// The W word types of the call at `i` — see xTakeCallResults for why a
+// discarded word's type is still required.
+fn xCallWordTys(cx: XCtx, i: int, w: int): []int {
+  let tys = []int(0)
+  let k = 0
+  while (k < w) {
+    tys = append(tys, cx.f.instrs[i + k].ty)
+    k = k + 1
+  }
+  return tys
+}
+
+// #5869: the multi-word form of a direct call. Instruction `i` is the
+// Op.Call (word 0) and the `w - 1` Op.CallWords immediately after it carry
+// the rest, so ONE xTakeCallResults binds every word.
+fn xEmitCallWords(cx: XCtx, i: int, ins: IrInstr, w: int) {
+  let dsts = xCallWordDsts(cx, i, w)
+  let tys = xCallWordTys(cx, i, w)
+  xEmitCallSeq(cx, ins.name, ins.args, true)
+  xTakeCallResults(cx, dsts, tys)
 }
 
 // `call_value`: dispatch through a closure cell {code, env}. The env and code are
@@ -637,6 +725,17 @@ fn xEmitCallIface(
   cx: XCtx, dst: int, ty: int, ifaceVal: int, methodId: int,
   args: []int,
 ) {
+  xEmitCallIfaceSeq(cx, ifaceVal, methodId, args)
+  if (cx.ctx.types[ty].kind != TypeKind.Void) {
+    xTakeCallResult(cx, dst, ty)
+  }
+}
+
+// The call_iface sequence itself — nil check, method lookup, marshal, the
+// indirect call, safepoint, teardown — shared by the one-word form above and
+// the multi-word form below (#5869) so the two cannot drift apart. Only the
+// BINDING differs between them, the same split as xEmitCallSeq/xEmitCallLike.
+fn xEmitCallIfaceSeq(cx: XCtx, ifaceVal: int, methodId: int, args: []int) {
   let shadow = xShadowSpace(cx.cc)
   let recv = xGetInt(cx, ifaceVal, xScratch1())
   // #2240: a nil interface value's receiver is the null word (ABI.md §2: an
@@ -680,7 +779,14 @@ fn xEmitCallIface(
   if (argReserve > 0) {
     xRspAddSub(cx.buf, false, argReserve)
   }
-  if (cx.ctx.types[ty].kind != TypeKind.Void) {
-    xTakeCallResult(cx, dst, ty)
-  }
+}
+
+// #5869: the multi-word form of a vtable call. Identical to xEmitCallWords
+// but for the sequence it wraps; a vtable callee returns its words in the
+// same ABI registers a direct one does, so the binding is the same call.
+fn xEmitCallIfaceWords(cx: XCtx, i: int, ins: IrInstr, w: int) {
+  let dsts = xCallWordDsts(cx, i, w)
+  let tys = xCallWordTys(cx, i, w)
+  xEmitCallIfaceSeq(cx, ins.lhs, ins.ival, ins.args)
+  xTakeCallResults(cx, dsts, tys)
 }
