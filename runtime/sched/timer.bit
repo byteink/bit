@@ -443,6 +443,15 @@ let chanTimerPendingCount: [1]i64
   return ptrOf(chanTimerPendingCount)
 }
 
+// Bumped by every successful `rtSchedTimerChanArm`, under the same lock — see
+// `schedTimerChanExpire`'s use of it for the lost-update race this closes
+// (#5845).
+let chanTimerArmSeq: [1]i64
+
+@nosplit fn chanTimerArmSeqAddr(): *i64 {
+  return ptrOf(chanTimerArmSeq)
+}
+
 // A program parked ONLY on a channel timer (no task on the sleeping-task
 // list `schedTimerCount` sees, since a channel timer has no task) must not
 // read as deadlocked. `schedCheckDeadlock` checks this exactly where it
@@ -529,6 +538,13 @@ export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(
   *(e + ctPeriod) = periodNs
   *(e + ctChan) = c
   atomicAdd(chanTimerPendingAddr(), 1)
+  // Lower `dlChans` now, not just on the next sweep (#5845): a concurrent
+  // sweep that already started scanning past this slot cannot see this
+  // deadline, and its own publish must not raise `dlChans` back past it. The
+  // sequence bump is what tells that sweep its snapshot may be stale.
+  let cur = atomicLoad(nextDeadlineAddr() + dlChans)
+  atomicStore(nextDeadlineAddr() + dlChans, earlierDeadline(cur, deadlineNs))
+  atomicAdd(chanTimerArmSeqAddr(), 1)
   spinRelease(cell)
   let taskAddr = schedCurrentTask()
   if (taskAddr != 0) {
@@ -661,22 +677,48 @@ extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
 // sites `schedTimerExpire` is; unlike that function there is no task to
 // `gqPop` afterward. Bounded by `ctCap` (Power of 10).
 //
-// The publish is under `chanTimerLockAddr()` (#5845, the `timerPartition`
-// shape #5843 gave `dlTasks`): otherwise a sweep that ran first but finishes
-// last can overwrite a concurrent sweep's fresher answer with a stale one.
+// #5845: WRAPPING THE STORE IN `chanTimerLockAddr()` ALONE DOES NOT MAKE THIS
+// EXACT — read this before touching the publish below. Unlike `timerPartition`
+// (`dlTasks`, #5843), which holds `scTimerLock` for its ENTIRE walk and so
+// can never interleave with `schedTimerPush`'s own use of that same lock,
+// this sweep takes and drops `chanTimerLockAddr()` ONE SLOT AT A TIME
+// (`chanTimerExpireSlot`) — the lock around the final store only orders the
+// two stores against each other, it does not make the LATER store the more
+// accurate one. A sweep that scans past a slot before `rtSchedTimerChanArm`
+// claims it, finishes after a second sweep triggered by that arm's wake, and
+// publishes its own `earliest` — which never saw the new deadline — would
+// overwrite the second sweep's correct, tighter answer with a stale, LATER
+// one. A too-EARLY publish only costs a spurious wake; a too-LATE one is the
+// bug this whole ticket is about, so `rtSchedTimerChanArm` already lowers
+// `dlChans` itself (`earlierDeadline`, never upward) the instant it arms, and
+// bumps `chanTimerArmSeqAddr()` under the same lock. Reading that sequence
+// before the scan and comparing it after is what lets THIS publish tell "no
+// arm raced me, my `earliest` is exact" from "one did, my `earliest` may be
+// missing a deadline `dlChans` already has, so publish the smaller of the
+// two" — never an unconditional overwrite either way.
 export @nosplit @symbol("bit_rt_port_sched_timer_chan_expire") fn schedTimerChanExpire(now: int) {
   let high = atomicLoad(chanTimerHighAddr())
   if (high > ctCap) {
     high = ctCap
   }
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let seqStart = atomicLoad(chanTimerArmSeqAddr())
+  spinRelease(cell)
+
   let earliest = 0
   let slot = 0
   while (slot < high) {
     earliest = earlierDeadline(earliest, chanTimerExpireSlot(slot, now))
     slot = slot + 1
   }
-  let cell = chanTimerLockAddr()
+
   spinAcquire(cell)
-  atomicStore(nextDeadlineAddr() + dlChans, earliest)
+  if (atomicLoad(chanTimerArmSeqAddr()) == seqStart) {
+    atomicStore(nextDeadlineAddr() + dlChans, earliest)
+  } else {
+    let cur = atomicLoad(nextDeadlineAddr() + dlChans)
+    atomicStore(nextDeadlineAddr() + dlChans, earlierDeadline(earliest, cur))
+  }
   spinRelease(cell)
 }
