@@ -80,11 +80,17 @@ by its `TypeId` like any other type, so two tuples with identical element types
 are the same type and share one descriptor. Codegen sees a tuple exactly as it
 sees a class: one 8-byte traced handle.
 
-**A `ret` therefore carries at most one value.** `return a, b` in a function
-whose result type is `(A, B)` allocates a 2-element tuple record, stores the
-elements into it, and returns that single reference. Destructuring
-(`let (a, b) = f()`) and element access (`t.0`) read the elements back with
-ordinary field loads at the layout's offsets.
+**A `ret` therefore carries at most one value — for every position §1.2.2 does
+not name.** `return a, b` in a function whose result type is `(A, B)`
+allocates a 2-element tuple record, stores the elements into it, and returns
+that single reference, UNLESS the declaration qualifies for the return-word
+convention §1.2.2 describes: on a register-return target
+(`targetReturnsInRegisters`, `compiler/build.bit`; today the two AArch64
+targets and x86_64-linux) and within the word budget (§1.2.2), the words are
+returned directly with no box. Destructuring (`let (a, b) = f()`) and element
+access (`t.0`) read the elements back with ordinary field loads at the boxed
+layout's offsets, or from the returned words directly when they were never
+boxed.
 
 **Why this and not a register pair or a hidden out-pointer.** Both alternatives
 would change the calling convention — the caller/callee register contract, the
@@ -100,10 +106,10 @@ that is the same cost a class return already pays, and it is the price of the
 uniform "every aggregate is one traced handle" model this ABI is built on.
 
 This is not a new constraint being imposed on codegen — it is the contract
-codegen already implements. All four backends refuse a multi-value `ret` today
-(the codegen backends' `emitRet` / `.ret`,
-`compiler/x64.bit` `xEmitRet`, `compiler/arm64.bit` `Op.Ret`). Boxing in the
-lowerer is what makes that refusal unreachable rather than what works around it.
+codegen implements everywhere §1.2.2's exception does not apply. On a target
+outside that exception (x86_64-windows today), boxing in the lowerer is what
+makes a multi-value `ret` unreachable rather than what works around it: no
+backend has to refuse one, because the front end never produces one.
 
 **Element mutability.** Tuple elements are **read-only** (SPEC §12.5): `t.0` may
 be read but not assigned. That is what keeps the boxed representation faithful to
@@ -214,10 +220,11 @@ the one direction that cannot be wrong.
 **The target gate is on the RETURN side only.** `explodedRetWords`
 (`compiler/lowerexplode.bit`) returns the empty list unless `Lowerer.multiWordRet`
 — that is `targetReturnsInRegisters` (`compiler/build.bit`), true for
-`aarch64-macos` and `aarch64-linux` and false for both x86_64 targets — so an
-x86_64 build hands a returned enum back as one handle and keeps the boxed object
-at every `ret`. The PARAMETER side has no target gate: it rides `explodesParams`
-on every target, exactly as a tuple or a `decimal` parameter already does.
+`aarch64-macos`, `aarch64-linux` and `x86_64-linux`, and false for
+`x86_64-windows` — so an `x86_64-windows` build hands a returned enum back as
+one handle and keeps the boxed object at every `ret`. The PARAMETER side has
+no target gate: it rides `explodesParams` on every target, exactly as a tuple
+or a `decimal` parameter already does.
 
 **Materialization back to the box.** A use that needs one shared memory location
 — a class field, a slice or array element, a map key or value, a channel send, a
@@ -271,7 +278,7 @@ without seeing any other caller.
 parameters, no variadic parameter list, no `@symbol`. Its result type must
 explode (§1.2.1's eligibility, `explodedWordTypes`) and the word list must fit
 the return-register budget (`retWordsFitRegisters`; a return word past the
-eighth has no path).
+fifth int or sixth float word has no path).
 
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
@@ -314,8 +321,12 @@ synthesized ones, are excluded before agreement is computed.
 
 **Target gate.** All three forms are additionally gated on
 `Lowerer.multiWordRet`, seeded from `targetReturnsInRegisters`
-(`compiler/build.bit`). x86_64 boxes and every rule above reads "one handle"
-there.
+(`compiler/build.bit`): true for `aarch64-macos`, `aarch64-linux` and
+`x86_64-linux`. `x86_64-windows` boxes and every rule above reads "one
+handle" there. The word list must also fit the one target-independent
+return-register budget (`retWordsFitRegisters`; `maxRetIntWords()` = 5,
+`maxRetFloatWords()` = 6, `compiler/lowerexplode.bit`), the smallest lists
+any register-return target implements.
 
 **Measured, aarch64-macos**, a 1,000,000-crossing driver built at
 `03ed887b` + this change, `BIT_GC_STATS=1`, stdout byte-identical between the

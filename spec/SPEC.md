@@ -3288,7 +3288,11 @@ The same argument covers tuples from the other side: a tuple is a value type, bu
 because its elements are read-only (§12.5) an implementation may share one heap
 box between copies without that being observable. The reference implementation
 does exactly that - see `runtime/ABI.md` §1.1, which also fixes the multi-value
-return ABI: `return a, b` builds one boxed tuple and returns a single handle.
+return ABI: `return a, b` returns a qualifying result in registers on a
+register-return target (`runtime/ABI.md` §1.2.2) and otherwise builds one
+boxed tuple and returns a single handle. Either way the observable semantics
+are unchanged: tuple elements are read-only, so whether a box exists is never
+observable.
 Classes are reference types (like TypeScript objects): assigning a class copies
 the handle, and mutations through either handle are visible to both. To obtain an
 independent copy, define and call a `clone()` method. Zero values of reference
