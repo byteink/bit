@@ -304,14 +304,27 @@ reloc_sites_seen=0
 # It is asserted BOTH WAYS. A declared line that is no longer observed fails
 # too, which is what empties the table at the next stage0 repin instead of
 # leaving a stale entry masking a later regression on that exact symbol.
-# 2026-09-10, #4281 (5178c6f4, constants in optcse's availability table): CSE
-# now runs before the inliner snapshots a callee, so seven leaves that used to
-# carry duplicate constant materialisations fit maxInlineLeafInsts() and are
-# lowered inline; _mapKeyEq then inlines rtValueEq/descEqTop and gains their
-# _strBytes call. Bisected on #4559: c85984a0 PASS, 5178c6f4 FAIL, objdump
-# shows each former callee's body at the former call site. Empties at the
-# next repin.
+#
+# 2026-09-24, #5820 (24c3d7438, onX64() folded to the build target): on
+# aarch64 the x86-64 arms of runtime/cryptohw's `if (onX64())` guards are now
+# deleted before codegen, and with them the x86-64-only panic messages those
+# arms referenced (the ___bitstr_* strings below). stage0 0.26.0 still emits
+# both arms. Empties at the next repin.
 RELOC_DECLARED="
+runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_1
+runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_10
+runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_3
+runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_4
+runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_7
+runtime/cryptohw - ARM64_RELOC_PAGE21 ___bitstr_8
+runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_1
+runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_10
+runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_3
+runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_4
+runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_7
+runtime/cryptohw - ARM64_RELOC_PAGEOFF12 ___bitstr_8
+runtime/cryptohw - ARM64_RELOC_UNSIGNED ___bitstr_58
+runtime/cryptohw - ARM64_RELOC_UNSIGNED ___bitstr_58_data
 "
 
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —
