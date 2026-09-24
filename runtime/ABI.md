@@ -1922,9 +1922,9 @@ Four things are not, in decreasing order of measured cost:
    fixture's `[]i64`). It is `spanOwned == 0` and may never be unmapped —
    unmapping it would punch a hole in memory the caller owns.
 3. **Entirely-free owned spans below the reclaim trigger.** A pass is asked for
-   only when at least half a class's spans are entirely free, because
-   `heapReclaimSpansLocked` walks the class's flat free list and a pass has to
-   pay for itself. A class therefore settles at holding up to half its spans
+   only when at least half a class's spans are entirely free, because each
+   `heapReclaimSpansLocked` pass walks the class's spans and has to pay for
+   itself. A class therefore settles at holding up to half its spans
    free.
 4. **Reserve address space.** `reserveGrow`'s bump never rewinds; the chunk list
    is walked only by `reserveRelease` (`gcDeinit`) and `reserveReclaimChunks`
