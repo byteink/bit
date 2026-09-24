@@ -4107,6 +4107,10 @@ module of exactly that one file. Its siblings in the same directory are *not* pa
 of it - naming a file selects that file, naming a directory selects all of it. It
 is a module like any other: it gets the prelude (§17.5) and may import (§17.2).
 
+An import bound only by a `.test.bit` file is visible only to other `.test.bit`
+files of the module; a non-test file that uses such a name is rejected even though
+`bit check`/`bit test` load the whole module, test files included, together.
+
 ### 17.2 Imports
 
 ```
