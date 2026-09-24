@@ -61,7 +61,7 @@
 // only reader is `runtime/stw/stwstats.bit`'s `statsReport` — DOES move: it is
 // charged where the slot leaves the free list, so it now runs ahead of the
 // bytes actually handed out by whatever is sitting in caches, bounded by
-// `acMaxBytes` per class per thread.
+// `acSpanBytes` per class per thread.
 //
 // THE ENTRY IS KEYED BY THE OS THREAD, so the pop needs no atomic: no other
 // thread can reach it. `gcHeapAlloc` is `@nosplit` and contains no safepoint
@@ -138,6 +138,24 @@ const acGc = 43
 const acMaxBytes = 4096
 const acMaxBatch = 64
 
+// Most bytes ONE refill may hand ONE thread (#5827). A refill takes at least
+// the `acMaxBytes` batch above and then runs on to the end of the span its
+// last slot came from (`heapTakeBatchLocked`, `../alloc/freelist.bit`), so a
+// span's slots, bitmap words and header stay with one thread instead of being
+// dealt out 64 slots at a time to every thread that refills.
+//
+// THE CAP IS A QUARTER SPAN, CHOSEN BY MEASUREMENT. `bench/cases/allocpar`
+// (8 mutators, M5 Max, 7 interleaved runs, cycles / peak RSS): no run cap
+// 5749M / 12.05 MB; 8 KiB 3739M / 12.36 MB; 32 KiB 2118M / 12.27 MB; a whole
+// 128 KiB span 1887M / 13.42 MB. The whole span buys 11% more cycles for 1.4
+// MB of RSS; a quarter span is where the cycles stop falling faster than the
+// memory rises. WORST-CASE IDLE FOOTPRINT, per thread: 28 cacheable classes
+// (every class of at most `acMaxBytes / 2` bytes) x `acSpanBytes` = 896 KiB,
+// against 28 x `acMaxBytes` = 112 KiB before. `acMaxChain` is the longest
+// chain that allows, `acSpanBytes / 8`, and bounds every walk of one.
+const acSpanBytes = 32768
+const acMaxChain = 4096
+
 // Probes before giving up and using the lock. Linear, so a collision costs the
 // colliding thread one extra load per allocation and nothing else.
 const acProbes = 4
@@ -191,6 +209,17 @@ let allocCacheArmed: i64 = 0
 // whose module emits `--freestanding` and may not name a mangled callee.
 export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   allocCacheArmed = 1
+}
+
+// Arm on a failed `spinTryAcquire` (`gcHeapAlloc`, `./gcheap.bit`). STORES
+// ONLY WHEN THE WORD IS STILL 0 (#5826): every allocation reads it
+// (`allocCacheArm`), and a store of the same value still takes the line
+// exclusive and invalidates every other core's copy, on most refills of a
+// contended heap.
+@nosplit fn allocCacheArmOnContention() {
+  if (allocCacheArmed == 0) {
+    allocCacheArmed = 1
+  }
 }
 
 // This OS thread's entry address, or 0 when it can have none — before boot, on
@@ -422,12 +451,14 @@ export @nosplit @symbol("bit_rt_port_gc_arm_alloc_cache") fn gcArmAllocCache() {
   // under its own lock, before the entry can be rebound to another one.
   gcAllocCacheFlush(e, h)
   let idx = 0
-  // Bounded: `allocNumClasses` iterations outside, `acMaxBatch` inside — a
-  // chain is only ever built by `allocCacheFillLocked`, which stops there.
+  // Bounded: `allocNumClasses` iterations outside, `acMaxChain` inside — a
+  // chain is only ever built by `allocCacheFillLocked`, which stops at
+  // `acSpanBytes / allocClassSize(idx)` slots, never more than
+  // `acSpanBytes / 8`.
   while (idx < allocNumClasses) {
     let a = *(e + acHeads + idx)
     let k = 0
-    while (a != 0 && k < acMaxBatch) {
+    while (a != 0 && k < acMaxChain) {
       let nxt = *wordAt(a)
       // `size` 0: this slot was never handed out, so it was never charged any
       // live bytes — see this section's header.
@@ -550,11 +581,14 @@ export @nosplit fn gcDrainAllocCache(g: *i64) {
   // last one owe.
   gcAllocCacheFlush(e, heapBlock(g))
   let head = e + acHeads + idx
-  let want = acMaxBytes / size
-  if (want > acMaxBatch) {
-    want = acMaxBatch
+  let floor = acMaxBytes / size
+  if (floor > acMaxBatch) {
+    floor = acMaxBatch
   }
-  let got = heapTakeBatchLocked(heapBlock(g), idx, want - 1, *head)
+  // The class size, not the request's: a request smaller than its class
+  // would otherwise ask for more slots than `acSpanBytes` holds.
+  let most = acSpanBytes / allocClassSize(idx)
+  let got = heapTakeBatchLocked(heapBlock(g), idx, floor - 1, most - 1, *head)
   if (got != 0) {
     *head = got
   }
