@@ -2115,9 +2115,24 @@ acknowledged, it increments `worldGangIn`, RE-CHECKS the gang is still open
 "helper that races the close" case), calls `gcGangHelp(g)`, then decrements
 `worldGangIn` unconditionally. Before `worldRestart`, the coordinator calls
 `worldGangClose`: store 0 into `worldGangWord` (no new helper can start after
-that store is visible) and wait, bounded, for `worldGangIn` to read 0 — safe
-to call even when the gang was never opened, since an unopened gang closes on
-its very first check.
+that store is visible) and wait for `worldGangIn` to read 0 — safe to call
+even when the gang was never opened, since an unopened gang closes on its very
+first check. The wait never gives up and proceeds: every helper region is
+bounded work, so a drain the coordinator has watched for 10 s is
+`bit_rt_fatal` (`worldDrainOrDie`), because restarting with a helper inside is
+heap corruption once helpers sweep (#5838). Only time the coordinator itself
+observed counts, each check capped at 50 ms, so a whole-process stop
+(SIGSTOP, a debugger, a paused VM) is never charged to the helper.
+
+**The sweep phase (#5838).** Under `heapLock`, the coordinator fills a side
+table with every small-class span, publishes it (`gcSwOpen = g`,
+`runtime/gc/gcsweeppar.bit`), wakes the gang by storing **3** into
+`worldStopWord` (`worldGangKick`), and claims spans by `atomicAdd` on one
+cursor alongside every helper that joins. A helper sweeps only the span it
+claimed and writes only that span and its table entry. The coordinator then
+closes the table and drains its claim-loop count the same fatal-or-zero way,
+and applies every entry's class and heap accounting serially, in the serial
+walk's order, so the heap it leaves is the serial sweep's.
 
 **A helper never returns to mutator code while the world is stopped.** It is
 still inside `worldResumeWhenClear`'s own wait loop for the whole of a join;

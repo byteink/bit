@@ -161,8 +161,8 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
     let _ = atomicAdd(world + worldGangIn, 0 - 1)
     return
   }
-  // #5837: counts the join only. `g` is the collector block the coordinator
-  // published in `worldGangOpen`, below, before it opened the gang for `e`.
+  // `g` is the collector block the coordinator published in `worldGangOpen`,
+  // below, before it opened the gang for `e`. Bounded work (#5838).
   gcGangHelp(wordAt(atomicLoad(ptrOf(gcGangBlock))))
   let _ = atomicAdd(world + worldGangIn, 0 - 1)
 }
@@ -529,10 +529,137 @@ let gcGangBlock: i64 = 0
 // stop this thread already knows about.
 export @nosplit @symbol("bit_rt_port_gc_world_gang_open") fn worldGangOpen(world: *i64, g: int) {
   atomicStore(ptrOf(gcGangBlock), g)
+  atomicStore(ptrOf(gcGangWorld), int(world))
   let e = atomicLoad(world + worldEpochWord)
   atomicStore(world + worldGangWord, e)
   atomicStore(world + worldStopWord, 2)
   let _ = bit_rt_port_gc_world_stop_wake(world + worldStopWord)
+}
+
+// The World block the last `worldGangOpen` opened a gang on, so a phase of
+// the collection that has no `world` in hand (`sweep`, ./gcmark.bit) can
+// wake the gang for new work (`worldGangKick`). Same publication order as
+// `gcGangBlock`.
+let gcGangWorld: i64 = 0
+
+// Wake the helpers of the gang open on `g` because work was just published
+// for them (#5838: the parallel sweep's span table, ./gcsweeppar.bit). A
+// no-op when no gang is open on `g`: the caller then does all the work alone.
+//
+// A helper that found nothing to do in the mark phase went back to sleep on
+// `worldStopWord` holding 2. Storing 3 is the same move `worldGangOpen`
+// makes with 2: a sleeper's kernel compare now fails, and a thread between
+// its load and its sleep reads the new value. That thread then compares
+// against 3 and may sleep out one `stwWaitTimeoutUs`, which costs the sweep
+// one helper for at most 1 ms and never correctness: the coordinator claims
+// spans itself and needs no helper at all. The wake is gated on the waiter
+// count exactly as `worldRestart`'s is, and for its reason.
+@nosplit fn worldGangKick(g: *i64) {
+  let world = wordAt(atomicLoad(ptrOf(gcGangWorld)))
+  if (world == nil || atomicLoad(ptrOf(gcGangBlock)) != int(g)) {
+    return
+  }
+  if (atomicLoad(world + worldGangWord) == 0) {
+    return
+  }
+  atomicStore(world + worldStopWord, 3)
+  if (atomicLoad(world + worldWaiters) == 0) {
+    return
+  }
+  let _ = bit_rt_port_gc_world_stop_wake(world + worldStopWord)
+}
+
+// How long a drain may take before it is a runtime bug, the most one check
+// may add to that, and the static iteration cap under both (Power of 10 rule
+// 2). See `worldDrainOrDie`.
+const worldDrainBudgetNs = 10000000000
+const worldDrainStepCapNs = 50000000
+const worldDrainSpinBound = 1099511627776
+
+// "gc: a collector helper never finished" (37), packed little-endian the way
+// `stackmap.bit`'s messages are; module state so the fatal path allocates
+// nothing.
+const worldDrainMsgWord0: int = 8026294562428969831
+const worldDrainMsgWord1: int = 2338053702233189484
+const worldDrainMsgWord2: int = 7935468323430229352
+const worldDrainMsgWord3: int = 7956002506270930533
+const worldDrainMsgWord4: int = 431198073705
+const worldDrainMsgLen: int = 37
+let worldDrainMsg: [7]i64
+
+// Wait until the counter at `p` reads 0, or die. `p` counts helpers inside a
+// region the caller must not run past: `worldGangIn` for the whole gang, and
+// the parallel sweep's claim-loop count (./gcsweeppar.bit).
+//
+// THERE IS NO GIVE-UP THAT PROCEEDS (#5838). Up to #5837 an expired drain was
+// counted and the world restarted anyway, harmless while a helper only counted
+// its join. Once a helper sweeps, running past it is heap corruption: a
+// mutator allocating from a span a helper is still rebuilding. So expiry is
+// `bit_rt_fatal`, the runtime's own-invariant door (see `stackmap.bit`).
+//
+// EXPIRY IS UNREACHABLE WITHOUT A BUG because every region counted here is
+// bounded work: a helper inside the claim loop finishes the one span it holds
+// (at most `allocSpanBytes / 16` slots), finds the cursor spent and leaves;
+// outside that loop a join is a handful of loads. No helper blocks, sleeps or
+// takes a lock while counted. What is left is the OS descheduling a helper,
+// which is why the budget is time (10 s) rather than a spin count: a spin
+// count is a few milliseconds on an idle core, well inside one scheduler
+// quantum on a loaded box.
+//
+// THE BUDGET IS TIME THIS THREAD WATCHED, NOT TIME THAT PASSED. The whole
+// process can stop mid-drain (SIGSTOP then SIGCONT, a debugger, a paused VM),
+// and the clock runs on through it. Charging `now - start` would then kill a
+// correct run the moment it resumes, before the helper is scheduled to finish
+// its span. So each check adds the gap since the previous one, capped at
+// `worldDrainStepCapNs` (`worldDrainStep`): a gap longer than the cap is a gap
+// this thread was not running in, and it cannot count against the helper.
+@nosplit fn worldDrainOrDie(p: *i64) {
+  let last = gcTicks()
+  let seen = 0
+  let spins = 0
+  while (spins < worldDrainSpinBound) { // bounded: worldDrainSpinBound checks
+    if (atomicLoad(p) == 0) {
+      return
+    }
+    spins = spins + 1
+    if (spins % stwSpinBurst == 0) {
+      let now = gcTicks()
+      seen = seen + worldDrainStep(now - last)
+      last = now
+      if (seen > worldDrainBudgetNs) {
+        break
+      }
+      worldYield()
+    }
+  }
+  worldHelperFatal()
+}
+
+// One check's share of the drain budget: the clock gap `d` since the previous
+// check, clamped to [0, `worldDrainStepCapNs`].
+@nosplit fn worldDrainStep(d: int): int {
+  if (d < 0) {
+    return 0
+  }
+  if (d > worldDrainStepCapNs) {
+    return worldDrainStepCapNs
+  }
+  return d
+}
+
+// End the process: a collector helper did not finish work the caller is
+// about to run past. NEVER RETURNS. Also the parallel sweep's own check that
+// every span it applies was swept (`gcSwApply`, ./gcsweeppar.bit).
+@nosplit fn worldHelperFatal() {
+  let msg: *i64 = ptrOf(worldDrainMsg)
+  *msg = int(msg) + 16
+  *(msg + 1) = worldDrainMsgLen
+  *(msg + 2) = worldDrainMsgWord0
+  *(msg + 3) = worldDrainMsgWord1
+  *(msg + 4) = worldDrainMsgWord2
+  *(msg + 5) = worldDrainMsgWord3
+  *(msg + 6) = worldDrainMsgWord4
+  bit_rt_fatal(int(msg))
 }
 
 // Close the helper gang and wait for every joined helper to leave, before the
@@ -541,36 +668,12 @@ export @nosplit @symbol("bit_rt_port_gc_world_gang_open") fn worldGangOpen(world
 // SAFE TO CALL UNCONDITIONALLY, including when the gang was never opened (an
 // abandoned rendezvous never calls `worldGangOpen` at all): storing 0 into an
 // already-0 `worldGangWord` is a no-op, and `worldGangIn` is then already 0,
-// so the wait below returns on its very first check. No special case for
-// "nothing to close" — deleting that case rather than adding a guard for it.
+// so the wait below returns on its very first check.
 //
-// BOUNDED, same budget and pulse as `worldRendezvous`'s own spin (deviation 6,
-// ./gcworld.bit): this only waits for helpers that ALREADY joined to leave,
-// and `worldGangTryHelp` leaves unconditionally on every path, so under any
-// sound run this resolves within the first handful of checks. Give-up is
-// counted, never panicked or looped forever (Power-of-10 rule 2) — the same
-// "runtime bug, not a hang" signal `worldStatResumeGiveUp` gives a different
-// wait.
-let worldGangDrainGiveUp: i64 = 0
-
+// INVARIANT, enforced here: `worldRestart` never runs with a helper inside.
+// The store below stops new joins (`worldGangTryHelp`'s re-check), and the
+// drain either reads 0 or ends the process (`worldDrainOrDie`).
 export @nosplit @symbol("bit_rt_port_gc_world_gang_close") fn worldGangClose(world: *i64) {
   atomicStore(world + worldGangWord, 0)
-  let spins = 0
-  while (spins < stwSpinBound) {
-    if (atomicLoad(world + worldGangIn) == 0) {
-      return
-    }
-    spins = spins + 1
-    if (spins % stwSpinBurst == 0) {
-      worldYield()
-    }
-  }
-  let _ = atomicAdd(ptrOf(worldGangDrainGiveUp), 1)
+  worldDrainOrDie(world + worldGangIn)
 }
-
-// The give-up count above, so a test can assert it stayed 0 — the same
-// exposure `worldResumeGiveUp` gives its own counter.
-export @nosplit @symbol("bit_rt_port_gc_world_gang_drain_giveup") fn worldGangDrainGiveUpCount(): int {
-  return atomicLoad(ptrOf(worldGangDrainGiveUp))
-}
-
