@@ -710,6 +710,10 @@ explainMismatch() {
       } else {
         msw["gc_alloc"] = -MSn; msw["field_get"] = -2 * MSq; msw["icmp_eq"] = -2 * MSq
         msw["icmp_ne"] = -MSq; msw["const_nil"] = -MSq; msw["br"] = -3 * MSq
+        # Composed with #5905 (run_map_commaok_miss_zero): each dropped miss
+        # zero object is one more `gc_alloc`, under the #5905 anchor.
+        msx = msw["gc_alloc"] - (delta["gc_alloc"] + 0)
+        if (msx > 0 && b["rt_call:map_val_at"] >= msx) msw["gc_alloc"] -= msx
       }
       okMapStr = (MSn > 0)
       for (op in moved) { if (!(op in msw)) okMapStr = 0 }
