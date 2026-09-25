@@ -33,11 +33,17 @@
 // compare-and-swap whose EXPECTED value already carries the generation, so a
 // stale generation makes the CAS itself fail -- there is no separate
 // recheck, and therefore no window in which a transition is transiently
-// visible before being undone. `pdTaskBits`=44 gives 16 TiB of task-id range,
-// far past any address this runtime's green-thread stacks or heap can reach;
-// the remaining `pdGenBits`=20 wraps a single fd's generation only after
-// 1,048,576 open/close cycles -- even a sustained, unrealistic 100k
-// reopens/sec would need ten seconds of continuous scheduling starvation on
+// visible before being undone. A task id is a task ADDRESS, and Linux hands
+// out user addresses up to 2^47 (x86-64) or 2^48 (aarch64): a task mapped at
+// 0x7cd7f4a03000 on x86-64 is 47 bits wide. The field therefore stores the
+// id without its three always-zero low bits (task addresses are 8-byte
+// aligned, the same fact `taskAt`'s `>> 3` relies on), so `pdTaskBits`=45
+// covers the full 48-bit range. The first version packed 44 raw bits, which
+// fits every macOS address but silently truncated a Linux one: #5866's
+// first x86-64 run woke the truncated address from `netClose` and faulted.
+// The remaining `pdGenBits`=19 wraps a single fd's generation only after
+// 524,288 open/close cycles -- even a sustained, unrealistic 100k
+// reopens/sec would need five seconds of continuous scheduling starvation on
 // ONE stale operation to collide with it, far past any pause `BIT_GC=stress`
 // or a real GC produces.
 //
@@ -109,8 +115,8 @@ export const pdDirWrite: int = 1
 
 // Slot contents: 0 = empty. Never a valid task id (task addresses are
 // non-zero pointers cast to `int`, and this table's own caller-chosen ids in
-// tests/wiring must follow the same rule -- `pdWait`/`pdCancel` reject a
-// non-positive `taskId`).
+// tests/wiring must follow the same rule -- `pdWait`/`pdCancel` reject any
+// `taskId` that `pdTaskOk` does not accept).
 export const pdEmpty: int = 0
 
 // `pdWait`'s answer.
@@ -135,11 +141,13 @@ let pdWSlot: [65536]i64
 // bits for generation -- see the header's "packed slot word" section for the
 // width reasoning. `pdReady` is the low field's all-ones value, distinct from
 // 0 (empty) and from every real task id, which is masked to fewer bits.
-const pdTaskBits: int = 44
+const pdTaskBits: int = 45
 const pdGenBits: int = 64 - pdTaskBits
 const pdTaskMask: int = (1 << pdTaskBits) - 1
 const pdGenLimit: int = 1 << pdGenBits
 const pdReady: int = pdTaskMask
+// A task id's low bits, always zero, dropped when packed.
+const pdTaskShift: int = 3
 
 // CAS retry bound for a single slot under real contention: at most a handful
 // of actors ever touch one (fd, direction) at once -- the parking task, one
@@ -155,6 +163,15 @@ const pdWakeRetry: int = 0 - 1
 
 @nosplit fn pdValidFd(fd: int): bool {
   return fd >= 0 && fd < pdCapacity
+}
+
+// Whether `taskId` survives packing: positive, 8-byte aligned, and below
+// 2^48, so dropping `pdTaskShift` bits loses nothing and the packed value can
+// never collide with `pdReady`. A task address always is; anything else is
+// refused rather than stored truncated.
+@nosplit fn pdTaskOk(taskId: int): bool {
+  return taskId > 0 && (taskId & ((1 << pdTaskShift) - 1)) == 0 &&
+    (taskId >> pdTaskShift) < pdReady
 }
 
 @nosplit fn pdValidDir(dir: int): bool {
@@ -208,7 +225,7 @@ const pdWakeRetry: int = 0 - 1
       if (tag == pdReady) {
         return pdEmpty
       }
-      return tag
+      return tag << pdTaskShift
     }
     k = k + 1
   }
@@ -243,7 +260,7 @@ export @symbol("bit_rt_port_sched_polldesc_open") @nosplit fn pdOpen(fd: int): i
   }
   let tag = pdTaskOf(cur)
   if (tag == pdEmpty) {
-    if (atomicCmpxchg(slot, cur, pdPack(genTag, taskId))) {
+    if (atomicCmpxchg(slot, cur, pdPack(genTag, taskId >> pdTaskShift))) {
       return pdClaimed
     }
     return pdWaitRetry
@@ -263,16 +280,17 @@ export @symbol("bit_rt_port_sched_polldesc_open") @nosplit fn pdOpen(fd: int): i
 // answered with `pdStaleGen`, decided by the SAME compare-and-swap that
 // claims the slot -- there is no separate check to race.
 //
-// `taskId` MUST be a caller-chosen non-zero positive value stable for the
-// whole time this task may be parked -- #5865/#5866 pass a real task address;
-// this file assigns it no other meaning.
+// `taskId` MUST be stable for the whole time this task may be parked and
+// pass `pdTaskOk` (positive, 8-byte aligned, below 2^48) -- #5865/#5866 pass
+// a real task address; this file assigns it no other meaning. An id that
+// fails is answered `pdBusy`, so the caller does not park.
 export @symbol("bit_rt_port_sched_polldesc_wait") @nosplit fn pdWait(
   fd: int,
   dir: int,
   gen: int,
   taskId: int,
 ): int {
-  if (!pdValidFd(fd) || !pdValidDir(dir) || taskId <= 0) {
+  if (!pdValidFd(fd) || !pdValidDir(dir) || !pdTaskOk(taskId)) {
     return pdBusy
   }
   let genTag = pdGenTag(gen)
@@ -307,7 +325,7 @@ export @symbol("bit_rt_port_sched_polldesc_wait") @nosplit fn pdWait(
     return pdEmpty
   }
   if (atomicCmpxchg(slot, cur, pdPack(genTag, pdEmpty))) {
-    return tag
+    return tag << pdTaskShift
   }
   return pdWakeRetry
 }
@@ -356,13 +374,13 @@ export @symbol("bit_rt_port_sched_polldesc_cancel") @nosplit fn pdCancel(
   taskId: int,
   gen: int,
 ): bool {
-  if (!pdValidFd(fd) || !pdValidDir(dir) || taskId <= 0) {
+  if (!pdValidFd(fd) || !pdValidDir(dir) || !pdTaskOk(taskId)) {
     return false
   }
   let genTag = pdGenTag(gen)
   let slot = pdSlotAddr(fd, dir)
   let cur = atomicLoad(slot)
-  if (pdGenOf(cur) != genTag || pdTaskOf(cur) != taskId) {
+  if (pdGenOf(cur) != genTag || pdTaskOf(cur) != taskId >> pdTaskShift) {
     return false
   }
   return atomicCmpxchg(slot, cur, pdPack(genTag, pdEmpty))

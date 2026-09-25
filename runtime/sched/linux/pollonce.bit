@@ -1,0 +1,194 @@
+// The register-once model's arm/disarm half (#5866, linux twin of #5865),
+// split out of poll.bit before it (#4428's 800-line ceiling) — same module as
+// poll.bit (sibling file), so its `writeU32`, `eventDataOffNosplit`,
+// `pollScratchBytes`, `ctlAdd`/`ctlMod`/`ctlDel`, `sysEpollCtl`, `epollIn`/
+// `epollOut` are all already in scope, imported nowhere else. `pdWake`,
+// `pdDirRead`, `pdDirWrite`, `pdEmpty` are imported in poll.bit's own import
+// block (module-scoped, not per-file).
+//
+// ONE EPOLL REGISTRATION PER FD, NOT TWO FILTERS — unlike kqueue, epoll keys a
+// registration on the fd alone (`pollRegister`'s own "ADD/MOD split" comment
+// in poll.bit), so read and write interest for the SAME fd share one event
+// mask. Read is armed at open with `EPOLL_CTL_ADD`; write is added LAZILY with
+// `EPOLL_CTL_MOD` — which REPLACES the mask, so the write registration must
+// re-assert `EPOLLIN` alongside `EPOLLOUT` or the read side would silently
+// stop being reported. See `../darwin/pollonce.bit`'s header for why write is
+// armed lazily at all (a measured ~8% W1/c=64 regression from arming it
+// eagerly, on kqueue — epoll's own EAGAIN-only write-readiness semantics do
+// not carry BSD's `sowakeup` quirk, but the lazy-arm discipline costs nothing
+// here and keeps the two providers' shape in lockstep).
+
+// EPOLLRDHUP (0x2000), from include/uapi/linux/eventpoll.h — the peer's
+// half-close. A subsequent `read()` returns 0 (EOF) once this fires, so it is
+// folded into the READ direction's wake below, exactly like a real EPOLLIN.
+@nosplit fn epollRdhup(): int { return 8192 }
+
+// EPOLLERR (0x008) / EPOLLHUP (0x010) — the kernel reports both
+// UNCONDITIONALLY, regardless of the requested mask (epoll(7)). Either can
+// leave a waiter parked on the direction that never gets its OWN bit (a
+// write-side error with no EPOLLOUT, or the reverse), so `pollDrainDescEvent`
+// below wakes BOTH directions when either fires.
+@nosplit fn epollErr(): int { return 8 }
+@nosplit fn epollHup(): int { return 16 }
+
+// EPOLLET (1 << 31), edge-triggered — fires once per state transition rather
+// than once per `epoll_wait` call while the condition holds, which is what
+// makes a PERMANENT registration (armed once, for the fd's whole life) sound:
+// a level-triggered permanent registration would re-report the same readiness
+// on every drain forever. `1 << 31` does not overflow `int` (this runtime's
+// `int` is wider than 32 bits), so it is a plain literal, not two's
+// complement.
+@nosplit fn epollEt(): int { return 2147483648 }
+
+// The packed `data` word's generation width — a LOCAL choice, not
+// `../polldesc.bit`'s own `pdGenBits`: a caller-chosen mask only needs to be
+// at least as wide as `pdWait`/`pdWake`'s own (masking twice with a
+// wider-then-narrower mask is exactly masking once with the narrower one), so
+// this file has no reason to import a private constant from a different
+// module for it. `2^24` leaves `65536 * 2^24 ~ 1.1e12` comfortably inside
+// `int`'s range for the packed word below.
+const pdcGenBits: int = 24
+const pdcGenLimit: int = 1 << pdcGenBits
+
+// Pack `(fd, gen)` into the `data` field's value for a register-once
+// registration — ALWAYS NEGATIVE (the `+1` guarantees it even for `fd == 0`
+// with `gen`'s low `pdcGenBits` bits `== 0`), which is what lets
+// `pollDrainOne` (./poll.bit) tell this event apart from a legacy
+// `pollRegister` one (a real task pointer, always positive) and from the wake
+// eventfd (`data == 0`) by sign alone — the same discriminator
+// `../darwin/pollonce.bit` uses, adapted to epoll's single `data` field
+// carrying no separate `ident`/fd the way kqueue's `kevent` does.
+@nosplit fn pollDescPack(fd: int, gen: int): int {
+  return 0 - (1 + fd * pdcGenLimit + (gen & (pdcGenLimit - 1)))
+}
+
+// The fd a register-once `data` word names.
+@nosplit fn pollDescDataFd(data: int): int {
+  return (0 - data - 1) / pdcGenLimit
+}
+
+// The generation tag a register-once `data` word names (already masked to
+// `pdcGenBits`, which `pdWake`'s own masking reduces further/identically).
+@nosplit fn pollDescDataGen(data: int): int {
+  return (0 - data - 1) % pdcGenLimit
+}
+
+// Read a little-endian u32 at `off` — `events`, the one 4-byte field
+// `pollDrainDescEvent` below needs read back; `poll.bit`'s `readU64` would
+// over-read into the `data` field that immediately follows it.
+@nosplit fn readU32(base: *u8, off: int): int {
+  let v = 0
+  let k = 3
+  while (k >= 0) {
+    let p = base + off + k
+    v = v * 256 + int(*p)
+    k = k - 1
+  }
+  return v
+}
+
+// `poll.bit`'s `writeU64` uses `/`/`%`, which mishandle a NEGATIVE `v` — fine
+// for its existing callers (a task pointer is always positive), but
+// `pollDescCtl` below deliberately writes a negative `data`. This sibling
+// uses `>>`/`&` instead: exact for either sign, matching
+// `../darwin/pollonce.bit`'s identical `writeI64`.
+@nosplit fn writeI64(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 8) {
+    let p = base + off + k
+    *p = u8((v >> (8 * k)) & 255)
+    k = k + 1
+  }
+}
+
+@nosplit fn pollDescCtl(pollFd: int, fd: int, op: int, events: int, gen: int): bool {
+  let base = pollScratchBytes()
+  writeU32(base, 0, events)
+  writeI64(base, eventDataOffNosplit(), pollDescPack(fd, gen))
+  let evAddr = i64(int(base))
+  return int(syscall(sysEpollCtl(), i64(pollFd), i64(op), i64(fd), evAddr)) == 0
+}
+
+// Register `fd`'s read interest with the kernel ONCE, for its whole life
+// (#5866) — called right after the runtime makes a socket non-blocking
+// (`netSysSocket`, and `../../net/linux/tcp.bit`'s `netAcceptTcp` after
+// `accept4`). Write is armed lazily instead — see this file's header and
+// `pollDescRegisterWrite` below.
+export @symbol("bit_rt_port_sched_poll_desc_register") @nosplit fn pollDescRegister(
+  pollFd: int,
+  fd: int,
+  gen: int,
+): bool {
+  return pollDescCtl(pollFd, fd, ctlAdd(), epollIn() + epollRdhup() + epollEt(), gen)
+}
+
+// Arm the write side, lazily (#5866) — called the FIRST time a write on `fd`
+// actually returns EAGAIN and needs to park, not at open. `EPOLL_CTL_MOD`
+// REPLACES the whole mask, so this re-asserts `epollIn()`/`epollRdhup()`
+// alongside `epollOut()` — omitting them would silently disarm the read side
+// this fd's `pollDescRegister` call already armed.
+export @symbol("bit_rt_port_sched_poll_desc_register_write") @nosplit fn pollDescRegisterWrite(
+  pollFd: int,
+  fd: int,
+  gen: int,
+): bool {
+  return pollDescCtl(
+    pollFd, fd, ctlMod(),
+    epollIn() + epollOut() + epollRdhup() + epollEt(), gen,
+  )
+}
+
+// Retract `fd`'s registration — the close-path half (#5866): called BEFORE
+// `close(fd)` so a closed-and-reused fd number cannot deliver a stale event
+// into a new connection's registration. `EPOLL_CTL_DEL` removes the WHOLE
+// registration in one call (unlike kqueue's two independent knotes — see
+// `pollUnregister`'s own "ADD/MOD split" comment in poll.bit), so there is no
+// read/write split to retract separately here.
+export @symbol("bit_rt_port_sched_poll_desc_unregister") @nosplit fn pollDescUnregister(
+  pollFd: int,
+  fd: int,
+): bool {
+  if (pollFd <= 0 || fd < 0) {
+    return false
+  }
+  // The kernel does not read this struct for `EPOLL_CTL_DEL` (`pollUnregister`'s
+  // own comment) — the scratch slot's leftover bytes are never inspected.
+  let evAddr = i64(int(pollScratchBytes()))
+  return int(syscall(sysEpollCtl(), i64(pollFd), i64(ctlDel()), i64(fd), evAddr)) == 0
+}
+
+// `pdWake` one direction and unpark whatever it returns. Returns 1 when a
+// task was woken, 0 otherwise (nothing parked there, or the wake was already
+// consumed) — folded out of `pollDrainDescEvent` below so that function stays
+// under E0204's complexity ceiling with two call sites instead of one.
+@nosplit fn pollDescWakeDir(s: *i64, fd: int, dir: int, gen: int): int {
+  let taskId = pdWake(fd, dir, gen)
+  if (taskId == pdEmpty) {
+    return 0
+  }
+  schedPollPendingDec()
+  if (schedPollUnpark(s, taskId)) {
+    return 1
+  }
+  return 0
+}
+
+// One register-once event's outcome (#5866): decode `(fd, gen)` from `data`
+// and the ready direction(s) from `events`, `pdWake` each that fired, and
+// unpark whatever task each returns. Returns how many tasks this event woke
+// (0, 1 or 2 — a single edge-triggered report can carry both directions at
+// once, since epoll keys the registration on the fd alone).
+@nosplit fn pollDrainDescEvent(s: *i64, base: *u8, off: int, data: int): int {
+  let events = readU32(base, off)
+  let fd = pollDescDataFd(data)
+  let gen = pollDescDataGen(data)
+  let fatal = (events & (epollErr() + epollHup())) != 0
+  let woken = 0
+  if (fatal || (events & (epollIn() + epollRdhup())) != 0) {
+    woken = woken + pollDescWakeDir(s, fd, pdDirRead, gen)
+  }
+  if (fatal || (events & epollOut()) != 0) {
+    woken = woken + pollDescWakeDir(s, fd, pdDirWrite, gen)
+  }
+  return woken
+}
