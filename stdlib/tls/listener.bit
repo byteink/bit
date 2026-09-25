@@ -1,0 +1,192 @@
+// Bit standard library — std/tls, the socket-level server accept driver:
+// `TlsListener`, `listen`, `tlsapiSrvHandshaker` (the sole implementation of
+// tls.bit's `tlsapiHandshaker`, #5916), and the server handshake glue
+// (`tlsapiDriveServer`, `tlsapiReadMessageFlight`, `tlsapiSendAlert`,
+// `tlsapiAlertDescOf`) they call. Split out of `tls.bit` (#5916), which grew
+// past the 800-line ceiling once the deferred-handshake `TlsConn` fields and
+// methods landed there — a pure move, no behavior change. std/tls is one flat
+// module, so every name this file uses from `tls.bit` (`tlsapiFramer`,
+// `TlsConn`, `tlsapiSealer`, `tlsapiHandshaker`, `TlsConfig`, `tlsVersion13`,
+// `tlsapiCheckVersion`, `tlsapiTcpListen`, `NetListener`, `NetConn`) and from
+// its other siblings (`TlsServerConfig`, `newTlsServerConfig`, `TlsServerConn`,
+// `tlsServerStart`, `tlsAlertFail`, `alertHandshakeFailure`,
+// `tlsAlertPlaintextRecord`, `tlsAlertSealedRecord`, `tlsCcsType`,
+// `tlsWireRecordType`, `tlsHsPutBytes`, `newError`) is already module-wide; a
+// second import of any of them here would be E0042.
+
+// ---------------------------------------------------------------------------
+// listen / accept: server handshake
+// ---------------------------------------------------------------------------
+
+// The handshake deadline (#5916) a server-accept-side `TlsConn` gets when its
+// caller has armed none of its own: bounds `ensureHandshake` so a client that
+// opens the TCP connection and then stalls or never sends a ClientHello holds
+// only its own per-connection task, not the listener's accept loop, and does
+// not hold it forever either.
+const tlsHandshakeDeadlineNs = 10000000000
+
+// A listening TLS socket: the TCP `ln` and the server handshake `config` applied
+// to each accepted connection. Build it with `listen`.
+export class TlsListener {
+  ln: NetListener
+  config: TlsServerConfig
+  // Set by `close()`, read by `isClosed()` (#5916) — `std/http`'s
+  // `serveTlsOn` tells "this accept failed because `close()` closed the
+  // listener" (end its accept loop) from a transient accept failure such as
+  // the fd limit (retry with backoff), the same distinction `Server.closed`
+  // (stdlib/http/server.bit) already makes for plain HTTP.
+  closed: bool
+  // The port this listener is bound to — meaningful even when 0 was requested.
+  export port(): int! {
+    return this.ln.port()?
+  }
+
+  // Whether `close()` has been called on this listener (#5916).
+  export isClosed(): bool {
+    return this.closed
+  }
+
+  // Accept the next TCP connection and return it wrapped as a `TlsConn` whose
+  // handshake has NOT run yet (#5916) — unlike TCP accept itself, the TLS
+  // handshake is not run here, so a client that connects and then stalls or
+  // never sends a ClientHello cannot block any other accept. The handshake
+  // runs later, on the returned connection's own per-connection task, the
+  // first time it is read from, written to, or `handshake()` is called
+  // explicitly (`TlsConn.ensureHandshake`) — bounded there by
+  // `tlsHandshakeDeadlineNs`. Fails only on the TCP accept itself (a
+  // transient failure such as the fd limit, or the listener having been
+  // closed), never on a handshake failure — those surface later, from
+  // `read`/`write`/`handshake` on the connection this returns.
+  export accept(): TlsConn! {
+    let conn = this.ln.accept()?
+    return TlsConn{
+      framer = tlsapiFramer{ conn = conn, buf = []byte(0) },
+      handshaker = tlsapiSrvHandshaker{ config = this.config },
+      alpn = "",
+      peerCerts = [][]byte(0),
+      plain = []byte(0),
+      closed = false,
+      handshakeDone = false,
+    }
+  }
+
+  export close() {
+    this.closed = true
+    this.ln.close()
+  }
+}
+
+// Listen for TLS connections on `host:port`. `config.certPem` and `config.keyPem`
+// (the server's certificate chain and matching private key, PEM) are required;
+// `config.alpn` is the supported protocol list. `port` may be 0 to let the kernel
+// choose one — read it back with `port()`. Fails on a bad certificate/key or a
+// bind error.
+export fn listen(host: string, port: int, config: TlsConfig): TlsListener! {
+  if (config.minVersion == 0) {
+    config.minVersion = tlsVersion13
+  }
+  tlsapiCheckVersion(config.minVersion)?
+  if (len(config.certPem) == 0 || len(config.keyPem) == 0) {
+    fail newError("tls listen: config.certPem and config.keyPem are required for a TLS server")
+  }
+  let serverCfg = newTlsServerConfig(config.certPem, config.keyPem, config.alpn)?
+  let ln = tlsapiTcpListen(host, port)?
+  return TlsListener{ ln = ln, config = serverCfg }
+}
+
+// The AlertDescription (RFC 8446 §6.2) a caught handshake error carries, if
+// one of `server.bit`'s own fail-and-close sites tagged it (`tlsAlertFail`,
+// `alert.bit`); otherwise `handshake_failure` — the generic "could not
+// negotiate an acceptable set of parameters" alert (RFC 8446 §4.1.1), the
+// safe default for a failure this driver did not itself originate (e.g. a
+// parse or crypto error surfacing from a shared helper) and so has no
+// business naming more precisely.
+fn tlsapiAlertDescOf(e: error): int {
+  let (tagged, ok) = e.(tlsAlertFail)
+  if (ok) {
+    return tagged.desc
+  }
+  return alertHandshakeFailure
+}
+
+// Best-effort: write one already-framed Alert record to `conn` and return,
+// never failing the caller. One write, no retry, no loop — the same bound
+// every other record this module writes to the same peer already has
+// (`std/net` has no write deadline; a peer that could wedge this write could
+// already wedge the ServerHello write on the handshake's success path). A
+// failed write is swallowed here, not surfaced: the caller's own handshake
+// error is what must reach `accept()`'s caller, and a secondary transport
+// error from this best-effort send must never replace or block it.
+fn tlsapiSendAlert(conn: NetConn, rec: []byte) {
+  conn.write(string(rec)) catch _ {
+    return
+  }
+}
+
+// `tlsapiHandshaker`'s (tls.bit) only implementation: the deferred-handshake
+// driver `TlsListener.accept()` hands a fresh `TlsConn` (#5916), carrying the
+// `TlsServerConfig` `tlsapiDriveServer` needs once `ensureHandshake` calls
+// `drive` — on the connection's own per-connection task, not `accept()`.
+class tlsapiSrvHandshaker {
+  config: TlsServerConfig
+  drive(f: tlsapiFramer): tlsapiSealer! {
+    let sc: tlsapiSealer = tlsapiDriveServer(f, this.config)?
+    return sc
+  }
+}
+
+// Drive the server handshake: read the ClientHello flight, answer it (a
+// HelloRetryRequest loops back for the next ClientHello), then read and verify
+// the client Finished flight. Bounded to the ClientHello, one retry, and the
+// Finished.
+//
+// A failure while processing the ClientHello (negotiation, ALPN, signing —
+// #2955) happens before this endpoint's own flight has reached the wire, so
+// the peer holds no handshake traffic key yet: the alert is sent plaintext.
+// A failure while processing the client Finished happens after the sealed
+// auth flight was already written below, so the peer already derived the
+// handshake-traffic keys from it: the alert is sealed under the very same
+// `RecordKeys` (`s.hsWriteKeys`) that sealed that flight, continuing its
+// sequence rather than restarting one at an already-spent nonce.
+fn tlsapiDriveServer(f: tlsapiFramer, config: TlsServerConfig): TlsServerConn! {
+  let s = tlsServerStart(config)?
+  let guard = 0
+  while (guard < 4) {
+    guard = guard + 1
+    let chFlight = tlsapiReadMessageFlight(f)?
+    let step = s.processClientHello(chFlight) catch e {
+      tlsapiSendAlert(f.conn, tlsAlertPlaintextRecord(tlsapiAlertDescOf(e)))
+      fail e
+    }
+    f.conn.write(string(step.outbound))?
+    if (!step.retry) {
+      let finFlight = tlsapiReadMessageFlight(f)?
+      return s.processClientFinished(finFlight) catch e {
+        let alert = tlsAlertSealedRecord(s.hsWriteKeys, tlsapiAlertDescOf(e)) catch _ {
+          fail e
+        }
+        tlsapiSendAlert(f.conn, alert)
+        fail e
+      }
+    }
+  }
+  fail newError("tls: server handshake did not complete within the flight bound")
+}
+
+// Read a single-message flight: any change_cipher_spec records, then exactly one
+// content record. Both flights the server reads — the ClientHello and the client
+// Finished — are one record, so one non-CCS record completes the flight. Bounded
+// by a small CCS budget.
+fn tlsapiReadMessageFlight(f: tlsapiFramer): []byte! {
+  let flight = []byte(0)
+  let guard = 0
+  while (guard < 8) {
+    guard = guard + 1
+    let rec = f.nextRecord()?
+    flight = tlsHsPutBytes(flight, rec)
+    if (tlsWireRecordType(rec) != tlsCcsType) {
+      return flight
+    }
+  }
+  fail newError("tls: too many change_cipher_spec records before the message")
+}

@@ -1591,8 +1591,14 @@ may be `0` to let the kernel choose one - read it back with `port()`.
 
 ### `TlsListener.accept(): TlsConn!`
 
-Accept the next connection and run the TLS 1.3 server handshake to completion,
-returning its `TlsConn`. Fails on an accept or handshake error.
+Accept the next TCP connection and return its `TlsConn` at once, before any
+handshake byte is read. The TLS 1.3 server handshake runs later, on the first
+`read`, `write` or `handshake` call, so it runs on whichever task serves the
+connection. A client that stalls its ClientHello therefore only holds up its
+own task, never the next `accept`. The handshake is bounded by 10 seconds unless
+you set a deadline first with `setDeadline`. Fails only on the accept itself: a
+transient error such as the open-file limit, or a closed listener. A handshake
+error comes back from `read`, `write` or `handshake` instead.
 
 ### `TlsListener.port(): int!`
 
@@ -1601,6 +1607,35 @@ The port the listener is bound to - meaningful even when `0` was requested.
 ### `TlsListener.close()`
 
 Close the listening socket.
+
+### `TlsListener.isClosed(): bool`
+
+Whether `close()` has been called. An accept loop uses it to tell a failure
+caused by its own shutdown, which should end the loop, from a transient one such
+as the open-file limit, which should be retried.
+
+### `TlsConn.handshake(): ()!`
+
+Run the TLS handshake now if it has not run yet; a no-op on a client
+connection or one already handshaken. `read` and `write` call it for you, so
+you only need it when you must know the handshake's result before the first
+byte moves: a server that routes on `alpnProtocol()`, as `std/http` does to
+choose HTTP/2 or HTTP/1.1. Fails on a handshake error, closing the connection.
+
+```bit
+let conn = l.accept()?
+conn.handshake()?
+if (conn.alpnProtocol() == "h2") {
+  // serve HTTP/2
+}
+```
+
+### `TlsConn.setDeadline(deadlineNs: int)`
+
+Bound this connection's handshake, reads and writes by the absolute monotonic
+nanosecond deadline `deadlineNs`, or clear the bound with `0`. The TLS mirror of
+`std/net`'s `Conn.setDeadline`: a read or write still waiting at the deadline
+fails instead of blocking forever.
 
 ### `TlsConn.read(n: int): []byte!`
 
@@ -1646,11 +1681,13 @@ before any read; every subsequent read outcome overwrites it.
 
 ### `TlsConn.alpnProtocol(): string`
 
-The ALPN protocol negotiated during the handshake, or `""` if none.
+The ALPN protocol negotiated during the handshake, or `""` if none. On a
+server connection, call `handshake()` first: before the handshake it is `""`.
 
 ### `TlsConn.cipherSuiteId(): int`
 
-The negotiated cipher suite's IANA code point.
+The negotiated cipher suite's IANA code point, or `0` before the handshake has
+run on a server connection.
 
 ### `TlsConn.peerCertificates(): [][]byte`
 
