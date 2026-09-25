@@ -1,8 +1,8 @@
 // #3147/#3176: the per-span occupied-slot bitmap — sizing, addressing and a
 // test-only reader. Sibling of `./alloc.bit`, same module (SPEC §17.1):
 // `allocSpanBytes`, `allocSpanHdrWords`, `allocSpanOf`, `allocWordAt`,
-// `allocClassSize`, `allocSpanSlots` and `spanSkip` are all declared there and
-// visible here with no import, exactly as `./classify.bit` and
+// `allocClassSize`, `allocSpanSlots` and `allocClassTbl` are all declared in
+// this module and visible here with no import, exactly as `./classify.bit` and
 // `./spancache.bit` already rely on. Split out purely to keep `alloc.bit`
 // under `_tests_/bit/lintfilelines.bit`'s 800-line gate (E0200) — it was
 // already at exactly that limit before #3176 (see `./spancache.bit`'s
@@ -12,8 +12,8 @@
 //
 // THE FULL DESIGN, INCLUDING WHY WRITES LIVE IN `runtime/gc/` AND NOT HERE, IS
 // `../gc/gcindex.bit`'s design comment. In one line: the bitmap is a
-// per-class extension of the span's reserved header prefix (`spanSkip`,
-// `./alloc.bit`), sized off the slot count BEFORE the bitmap's own bytes
+// per-class extension of the span's reserved header prefix (`allocClassTbl`,
+// `./spanmeta.bit`), sized off the slot count BEFORE the bitmap's own bytes
 // remove any (avoiding a circular sizing dependency), and it is set/cleared
 // only by `runtime/gc/`'s `linkObject`/`freeObject` — `runtime/alloc/` cannot
 // tell a real object from `gcInit`'s mark worklist, which allocates through
@@ -34,7 +34,7 @@
 // WHY IT HAPPENS. The bitmap sits at a fixed offset and its extent depends on
 // the class: `allocBitmapWords` is LARGEST for the SMALLEST class (class 0: 256
 // words, ending at byte 2128) and smallest for the largest (class 36: 1 word,
-// ending at byte 88). A class's first slot, `spanSkip(cs) * cs`, starts as low
+// ending at byte 88). A class's first slot, its carve offset, starts as low
 // as byte 192 (class 10). So for 24 of the 37 classes the old slot area
 // overlaps a subsequent class-0 bitmap — and a reclaimed span's slots hold
 // free-list `next` POINTERS, never zeroes. Overlaps, in bytes, against class
@@ -95,23 +95,16 @@
 
 // 64-bit words needed for class `cs`'s occupied-slot bitmap (one bit per
 // slot). Sized off `naive(cs) = allocSpanBytes / cs`, the slot count BEFORE
-// `spanSkip`'s reservation removes any — sizing off the post-reservation
-// count would be circular, and `naive(cs)` is a safe upper bound because
-// `spanSkip` only ever shrinks the usable count further.
-@nosplit fn allocBitmapWords(cs: int): int {
-  return allocBitmapWordsFrom(allocSpanBytes / cs)
-}
-
-// The same sizing, from a `naive` the caller ALREADY HAS. `allocSlotIndex`
-// below needs `allocSpanBytes / cs` for its own bound check, and reaching the
-// bitmap size through `allocBitmapWords(cs)` made it divide for that a second
-// time (#5570) — one formula, two entry points, so the seam costs no copy.
+// the carve reservation removes any — sizing off the post-reservation count
+// would be circular, and `naive(cs)` is a safe upper bound because the
+// reservation only ever shrinks the usable count further. `allocClassTbl`
+// (`./spanmeta.bit`) holds the carve this sizes, per class.
 //
-// `>> 6`, not `/ 64`: `naive` is `allocSpanBytes / cs` for a small class, so it
-// is at least 1 (`allocMaxSmall` is a small fraction of `allocSpanBytes`) and
-// never negative. Same exactness argument as `allocClassSize`'s (`./classify.bit`).
-@nosplit fn allocBitmapWordsFrom(naive: int): int {
-  return (naive + 63) >> 6
+// `>> 6`, not `/ 64`: `naive` is at least 1 (`allocMaxSmall` is a small
+// fraction of `allocSpanBytes`) and never negative. Same exactness argument as
+// `allocClassSize`'s (`./classify.bit`).
+@nosplit fn allocBitmapWords(cs: int): int {
+  return (allocSpanBytes / cs + 63) >> 6
 }
 
 // The pure addressing primitive the occupied-slot bitmap is built on —
@@ -130,55 +123,44 @@
 // caller. This ticket's own callers (`linkObject`/`freeObject`, always exact
 // slot bases from the allocator itself) never hit the -1 case; a future
 // `gcOwns` caller (#3177) reading an arbitrary candidate pointer will.
-// EACH PER-CLASS QUANTITY IS COMPUTED ONCE (#4044). `cs` and `spanSkip(cs)` are
-// pure functions of `idx` — one of 37 values — and this used to derive both
-// TWICE: once here and once inside `allocSpanSlots`, which re-calls
-// `allocClassSize` and `spanSkip` from the same `idx`. Disassembly at
-// `94cc0cb3` showed four out-of-line calls and nine `sdiv` on the taken path,
-// measured at 162.03 instructions/call. `allocSpanSlots`'s body is one line —
-// `allocSpanBytes / cs - spanSkip(cs)` — so it is spelled out here from the
-// values already in hand rather than called.
 //
-// THAT IS A COPY OF A ONE-LINE FORMULA, and copies drift. `_tests_/stress/alloc`
-// property (n) (`./slotindex.bit`) pins the two together directly: for every
-// class it asks this function about the last carved slot and about the address
-// one slot past it, so a divergence between the inlined count and the exported
-// `allocSpanSlots` reddens rather than silently mis-bounding the bitmap.
+// NO DIVIDE, AND THAT IS THE POINT (#5891). `cs`, the carve offset, the slot
+// count and a reciprocal of `cs` are one row of `allocClassTbl`
+// (`./spanmeta.bit`). This used to derive them per call: `allocClassSize` out
+// of line, then `allocSpanBytes / cs`, the carve reservation's `/ cs` and
+// `off / cs`, three dependent 64-bit divides. #4044 (162 instructions in 19.11
+// cycles) and #5570 read that cost on arm64, where `sdiv` is cheap; on an
+// i7-6700 each `idiv r64` has tens of cycles of latency, and the function was
+// 10.68% of the `pkg/web` server's user cycles, 9.15% of it on the allocation
+// path.
 //
-// THE DIVIDES BY A CONSTANT WERE NOT THE COST; THE REDUNDANT ONES ARE (#5570).
-// #4044's reading above — 162 instructions in 19.11 cycles, 8.48 IPC, the
-// `sdiv`s absorbed by ILP — was taken on the ALLOCATION path, where this runs
-// once per object. `gcOwns` runs it once per TRACED REFERENCE, and there it
-// is 4.76% of a `pkg/yaml` parse and 5.65% of a `pkg/toml` one. Two of the
-// divides here were pure duplication rather than arithmetic that had to
-// happen: `allocSpanBytes / cs` was computed once inside `spanSkip` ->
-// `allocBitmapWords` and a SECOND time for the bound below, and `off % cs`
-// re-divided by `cs` to learn what `n * cs` already says. `naive` is now
-// computed once and threaded through `spanSkipFrom` (`./spanmeta.bit`), and
-// exactness is tested by multiplying back.
+// `(off * recip) >> 32` IS `off / cs` EXACTLY, for every class and every
+// `off` this can see. `recip = ceil(2^32 / cs) = (2^32 + e) / cs` with
+// `0 <= e < cs`, so `off * recip / 2^32 = off / cs + off * e / (cs * 2^32)`.
+// Writing `off = q * cs + r` with `r <= cs - 1`, the floor stays `q` whenever
+// `off * e < 2^32`, and here `off < allocSpanBytes = 2^17` and
+// `e < cs <= 2^14`, so `off * e < 2^31`. The product itself is below
+// `2^17 * (2^29 + 1)` (`recip` is largest for the 8-byte class), so it never
+// leaves the positive `int` range. `off < 2^17` holds for ANY `addr`: `off` is
+// `addr`'s offset inside its span minus the carve offset. `_tests_/stress/alloc`
+// property (n) checks it anyway, over every offset of every class.
 //
-// `n * cs != off` IS THE SAME TEST as `off % cs != 0`, not a weaker one: `off`
-// is non-negative (the guard above returns otherwise) and `cs` is positive, so
-// `n = off / cs` truncates toward zero and `n * cs == off` holds exactly when
-// the remainder is zero. The interior-pointer rejection the paragraph above
-// calls load-bearing is therefore unchanged, and `_tests_/stress/alloc`
-// property (n) still asks this function about an interior address.
+// `n * cs != off` IS `off % cs != 0`: `off` is non-negative (the guard above
+// returns otherwise) and `n` is the floor quotient, so `n * cs == off` holds
+// exactly when the remainder is zero. The interior-pointer rejection the
+// paragraph above calls load-bearing is unchanged, and so is the bound.
 export @nosplit @symbol("bit_rt_alloc_slot_index") fn allocSlotIndex(addr: int, idx: int): int {
-  let cs = allocClassSize(idx)
-  let naive = allocSpanBytes / cs
-  let skip = spanSkipFrom(cs, naive)
-  let carveStart = allocSpanOf(addr) + skip * cs
-  let off = addr - carveStart
+  let off = (addr & (allocSpanBytes - 1)) - allocClassCell(idx, rowCarve)
   if (off < 0) {
     return -1
   }
-  let n = off / cs
-  if (n * cs != off) {
+  let n = (off * allocClassCell(idx, rowRecip)) >> 32
+  if (n * allocClassCell(idx, rowCs) != off) {
     return -1
   }
-  if (n >= naive - skip) {
+  if (n >= allocClassCell(idx, rowSlots)) {
     return -1
-  } // == allocSpanSlots(idx)
+  }
   return n
 }
 
@@ -198,7 +180,7 @@ export @nosplit @symbol("bit_rt_alloc_span_bitmap_word") fn allocSpanBitmapWord(
 }
 
 // The address of slot 0 of class `idx` inside the span at `spanAddr` — the
-// `carveStart` `allocSlotIndex` computes and then divides against, exposed so a
+// carve start `allocSlotIndex` measures `off` from, exposed so a
 // caller going the other way (index -> address) can stride from it:
 // slot `n` is `allocCarveStart(s, i) + n * allocClassSize(i)`, and
 // `allocSlotIndex` of that is `n` for every `0 <= n < allocSpanSlots(i)`.
@@ -206,15 +188,14 @@ export @nosplit @symbol("bit_rt_alloc_span_bitmap_word") fn allocSpanBitmapWord(
 // THE COLLECTOR'S ENUMERATION RESTS ON THIS (#4059). Retiring the all-objects
 // list makes the per-span occupied-slot bitmap the authoritative record of every
 // small object, and a bitmap only yields slot INDICES — the walk needs the
-// address back. `spanSkip` is this module's private carve layout, so re-deriving
-// it in `runtime/gc/` would be a second copy, which is exactly what
-// `allocSlotIndex`'s own header warns copies do: they drift.
+// address back. `allocClassTbl` is this module's private carve layout, so re-deriving
+// it in `runtime/gc/` would be a second copy of it, and copies drift.
 //
 // PER SPAN, NOT PER SLOT, AND THAT IS THE WHOLE INTERFACE DECISION (#4044's
 // lesson, applied before the fact this time). The first draft of this took `n`
 // as well and returned the slot address directly — one call per OBJECT, and
-// each one re-derived `allocClassSize` (2 `sdiv`) and `spanSkip` ->
-// `allocBitmapWords` (2 more) from a class index that is constant for the whole
+// each one re-derived `allocClassSize` (2 `sdiv`) and the carve reservation
+// (2 more) from a class index that is constant for the whole
 // span. Measured on `bench/cases/alloc` against `main`, interleaved N=21 with a
 // byte-identical null control reading +0.27%: **+117 instructions and +23.5%
 // cycles per object**. Everything here is a pure function of `idx`, so the
@@ -223,6 +204,5 @@ export @nosplit @symbol("bit_rt_alloc_carve_start") fn allocCarveStart(
   spanAddr: int,
   idx: int,
 ): int {
-  let cs = allocClassSize(idx)
-  return spanAddr + spanSkip(cs) * cs
+  return spanAddr + allocClassCell(idx, rowCarve)
 }
