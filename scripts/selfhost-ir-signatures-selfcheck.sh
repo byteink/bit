@@ -302,6 +302,100 @@ fn main() {
     fail=1
   fi
 
+  # --- #5876: field store converted to its own declared type ---
+  #
+  # Real post-opt dump text from `_tests_/cases/run_tuple_narrow_boxed_convert.bit`
+  # (this tree vs the pinned stage0): `int(s[i])` keeps its `convert`
+  # (`fieldSetRhsTarget`, compiler/optfold.bit, declines the widening-alias
+  # fold that used to erase it) instead of the store reading the narrower
+  # `index_get` straight through.
+  oracle_fsc_opt='bb2():
+  %9 = index_get %0[%3] u8
+  br %4, bb4(), bb3()
+bb6():
+  %21 = index_get %0[%3] u8
+  %22 = const_int u8 127
+  %23 = icmp_ugt bool %21, %22
+  %24 = gc_alloc size=16 ptrs=[] (i64, i32, bool)
+  field_set %24[0] = %9'
+  bit2_fsc_opt='bb2():
+  %9 = index_get %0[%3] u8
+  %10 = convert i64 %9
+  br %4, bb4(), bb3()
+bb6():
+  %22 = index_get %0[%3] u8
+  %23 = const_int u8 127
+  %24 = icmp_ugt bool %22, %23
+  %25 = gc_alloc size=16 ptrs=[] (i64, i32, bool)
+  field_set %25[0] = %10'
+
+  sigf1=$(explainMismatch "$oracle_fsc_opt" "$bit2_fsc_opt" iropt)
+  rcf1=$?
+  if [ "$rcf1" -ne 0 ] || [ "$sigf1" != "5876-field-store-declared-type-convert" ]; then
+    echo "FAIL: the real #5876 post-opt field-store-convert delta was not explained (rc=$rcf1 sig='$sigf1')"
+    fail=1
+  fi
+
+  # Real pre-opt dump text from `_tests_/cases/untyped_const_expr_narrow.bit`:
+  # `S{ f = 1 + 1 }` stores a compile-time-known `i64` into a `u8` field, so
+  # `fieldStoreValue` (compiler/lowertuple.bit) inserts an explicit `convert`
+  # at lowering time -- present even before any optimization pass runs.
+  oracle_fsc_pre='%26 = const_int i64 2
+field_set %24[0] = %26'
+  bit2_fsc_pre='%27 = const_int i64 2
+%28 = convert u8 %27
+field_set %24[0] = %28'
+
+  sigf2=$(explainMismatch "$oracle_fsc_pre" "$bit2_fsc_pre" ir)
+  rcf2=$?
+  if [ "$rcf2" -ne 0 ] || [ "$sigf2" != "5876-field-store-declared-type-convert" ]; then
+    echo "FAIL: the real #5876 pre-opt field-store-convert delta was not explained (rc=$rcf2 sig='$sigf2')"
+    fail=1
+  fi
+
+  # ACCEPT: the same field-store convert PLUS a sibling store now also being
+  # forwarded, dropping a `field_get` -- the real `convert_widen_alias.bit`
+  # shape (`r.wide2 = int(hs[1])`), where `field_get` only ever falls or
+  # holds, never rises.
+  oracle_fsc_fwd='field_set %0[16] = %5
+%15 = field_get %2[0] i64
+%24 = field_get %0[16] i64'
+  bit2_fsc_fwd='%6 = convert i64 %5
+field_set %0[16] = %6
+%16 = field_get %2[0] i64'
+
+  sigf3=$(explainMismatch "$oracle_fsc_fwd" "$bit2_fsc_fwd" iropt)
+  rcf3=$?
+  if [ "$rcf3" -ne 0 ] || [ "$sigf3" != "5876-field-store-declared-type-convert" ]; then
+    echo "FAIL: the real #5876 forwarded-sibling-store delta was not explained (rc=$rcf3 sig='$sigf3')"
+    fail=1
+  fi
+
+  # REJECTION: the identical field-store-convert delta with a `field_get`
+  # that RISES instead of falling -- a shape this signature never allows,
+  # since #5876's own fix only ever lets a read get forwarded away, never
+  # adds a new one.
+  bit2_fsc_bad_get="$bit2_fsc_opt
+%50 = field_get %24[0] i64"
+  sigf4=$(explainMismatch "$oracle_fsc_opt" "$bit2_fsc_bad_get" iropt)
+  rcf4=$?
+  if [ "$rcf4" -eq 0 ] || [ -n "$sigf4" ]; then
+    echo "FAIL: a #5876 delta with a field_get that rises was wrongly explained (rc=$rcf4 sig='$sigf4')"
+    fail=1
+  fi
+
+  # REJECTION: an unrelated opcode riding along an otherwise-genuine #5876
+  # delta must still fail -- same closed-set requirement as every other
+  # signature in this file.
+  bit2_fsc_plus="$bit2_fsc_opt
+%99 = xor i64 %9, %10"
+  sigf5=$(explainMismatch "$oracle_fsc_opt" "$bit2_fsc_plus" iropt)
+  rcf5=$?
+  if [ "$rcf5" -eq 0 ] || [ -n "$sigf5" ]; then
+    echo "FAIL: a #5876 delta carrying an unrelated opcode was wrongly explained (rc=$rcf5 sig='$sigf5')"
+    fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
