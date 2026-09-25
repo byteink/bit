@@ -26,7 +26,7 @@
 // #2374 made it ANSWERABLE; #2375 answers it and gives the span back.
 //
 // THE HEADER IS AT THE SPAN'S BASE, AND THE FIRST FEW SLOTS PAY FOR IT. The
-// carve starts at the first whole slot past the header (`spanSkip` of them),
+// carve starts at the first whole slot past the header (`allocClassCarve`),
 // which keeps every slot at an exact multiple of the class size from the span
 // base — the alignment argument `allocClassify` rests on, unchanged. Rounding
 // the carve start to a fixed byte offset instead would break it for the classes
@@ -100,32 +100,90 @@ export @nosplit @symbol("bit_rt_alloc_span_of") fn allocSpanOf(addr: int): int {
   return addr & ~(allocSpanBytes - 1)
 }
 
-// Slots of size `cs` the header AND the #3176 occupied-slot bitmap
-// (`allocBitmapWords`, `./bitmap.bit`) consume at the span base. Rounded UP to
-// a whole slot so the carve stays on the class's own grid. The bitmap sits
-// immediately after the 12 fixed header words, so this is the only change to
-// the span's physical layout the bitmap requires.
-@nosplit fn spanSkip(cs: int): int {
-  return spanSkipFrom(cs, allocSpanBytes / cs)
+// THE CARVE LAYOUT, ONE ENTRY PER CLASS (#5891), and the only place it is
+// stated. Entry `idx` of the four tables below is class `idx`'s size `cs`;
+// `carveOff`, the byte offset of slot 0 from the span base; `slots`, the slots
+// a span yields; and `recip`, `ceil(2^32 / cs)`, which `allocSlotIndex`
+// (`./bitmap.bit`) multiplies by instead of dividing. `allocSpanSlots`,
+// `allocCarveStart` and `heapRefillLocked` read the same tables, so no second
+// copy of the formula exists.
+//
+// THE FORMULA. The 12 header words and the #3176 occupied-slot bitmap
+// (`allocBitmapWords`, `./bitmap.bit`) sit at the span base, and the carve
+// reserves them in whole slots so every slot stays on the class's own grid:
+//   naive    = allocSpanBytes / cs
+//   carveOff = ceil((allocSpanHdrWords * 8 + allocBitmapWords(cs) * 8) / cs) * cs
+//   slots    = naive - carveOff / cs
+// `_tests_/stress/alloc` property (n) (`slotindex.bit`) re-derives every entry
+// from these three lines, checks `cs` against `allocClassSize`, and runs the
+// reciprocal over every offset of every class.
+//
+// DATA, NOT ARITHMETIC, because the arithmetic was the cost. Computed per call,
+// this was three dependent 64-bit divides by `cs`, and on x86-64 `idiv r64` has
+// tens of cycles of latency: `allocSlotIndex` was 10.68% of the `pkg/web`
+// server's user cycles on an i7-6700 at 2352bdeb1. A `const [N]T` is rodata,
+// and `t[idx & 63]` reads it with one load and no bounds branch (#4270), which
+// is what `@nosplit` admits. Entries 37..63 are zero padding up to the mask: a
+// class index past 36 reads zeros, and zeros make `allocSlotIndex` answer -1.
+//
+// FOUR TABLES, NOT ONE OF FOUR-WORD ROWS, because the index is then the same
+// `idx & 63` for all four and is computed once; a row index `(idx * 4 + k) &
+// 255` is recomputed per field, which cost 73 instructions and two saved
+// registers on x86-64 against 54 and one.
+
+// Class size `cs`, bytes. Equal to `allocClassSize(idx)`.
+const allocClassCs: [64]i64 = [64]i64{
+  8, 16, 32, 48, 64, 80, 96, 112,
+  128, 160, 192, 224, 256, 320, 384, 448,
+  512, 640, 768, 896, 1024, 1280, 1536, 1792,
+  2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168,
+  8192, 10240, 12288, 14336, 16384, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
 }
 
-// The same carve reservation, from a `naive` slot count the caller already
-// divided for. `allocSlotIndex` (`./bitmap.bit`) needs `allocSpanBytes / cs`
-// for its own bound check and used to reach the bitmap size through
-// `allocBitmapWords(cs)`, which divided for it a second time — 4.76% of a
-// `pkg/yaml` parse runs through that path once per traced reference (#5570).
-// ONE formula with two entry points, never a second copy: `allocSlotIndex`'s
-// own header records what copies of this file's carve layout cost.
-@nosplit fn spanSkipFrom(cs: int, naive: int): int {
-  return (allocSpanHdrWords * 8 + allocBitmapWordsFrom(naive) * 8 + cs - 1) / cs
+// Byte offset of slot 0 from the span base.
+const allocClassCarve: [64]i64 = [64]i64{
+  2144, 1120, 608, 480, 384, 320, 288, 336,
+  256, 320, 192, 224, 256, 320, 384, 448,
+  512, 640, 768, 896, 1024, 1280, 1536, 1792,
+  2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168,
+  8192, 10240, 12288, 14336, 16384, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+}
+
+// Slots a span yields.
+const allocClassSlots: [64]i64 = [64]i64{
+  16116, 8122, 4077, 2720, 2042, 1634, 1362, 1167,
+  1022, 817, 681, 584, 511, 408, 340, 291,
+  255, 203, 169, 145, 127, 101, 84, 72,
+  63, 50, 41, 35, 31, 24, 20, 17,
+  15, 11, 9, 8, 7, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+}
+
+// `ceil(2^32 / cs)`.
+const allocClassRecip: [64]i64 = [64]i64{
+  536870912, 268435456, 134217728, 89478486, 67108864, 53687092, 44739243, 38347923,
+  33554432, 26843546, 22369622, 19173962, 16777216, 13421773, 11184811, 9586981,
+  8388608, 6710887, 5592406, 4793491, 4194304, 3355444, 2796203, 2396746,
+  2097152, 1677722, 1398102, 1198373, 1048576, 838861, 699051, 599187,
+  524288, 419431, 349526, 299594, 262144, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
 }
 
 // Slots a span yields for class `idx`. At least 1 for every class: the largest
 // class is `allocMaxSmall` and `allocSpanBytes` is eight times it, so the
 // header costs one of those eight slots and seven remain.
 export @nosplit @symbol("bit_rt_alloc_span_slots") fn allocSpanSlots(idx: int): int {
-  let cs = allocClassSize(idx)
-  return allocSpanBytes / cs - spanSkip(cs)
+  return allocClassSlots[idx & 63]
 }
 
 // `allocSlotIndex` (the #3176/#3177 occupied-slot bitmap's addressing
