@@ -477,6 +477,100 @@ fn refDriver(fd: int, counters: *i64, done: chan<i64>) {
   done <- 1
 }
 
+const FREE_FD_BASE: int = REF_FD_BASE + REF_FD_COUNT
+const FREE_FD_COUNT: int = 3
+const FREE_ROUNDS: int = 1000
+
+// The ORIGINAL, unordered driver (owner correction, #5888): each of
+// `REF_WORKERS` workers issues a brand-new `pdFdAcquire` at ANY point in the
+// cycle, freely racing the closer -- no barrier holds workers back until
+// every one has already acquired, unlike `refRound` above. This is real
+// production shape: a fresh `Conn.read` starting while another task closes
+// the same conn IS a fresh acquire racing a close, and no `pdFdClosing`
+// pre-check closes that window (check-then-act). Before `pdRefClosedBit`
+// (dc9a1331b) this reliably printed `total != 1` under real
+// `BIT_WORKERS=8` parallelism: after the fd's one legitimate close, a late
+// straggler's own add-then-undo took the count from 1 to 0 again, and
+// `pdFdRelease` reported that undo as a second "last out" too -- a real
+// double close(2) onto a possibly-reused fd number.
+fn refWorkerFree(fd: int, gen: int, out: chan<i64>) {
+  let r = pdFdAcquire(fd, gen)
+  let closed = 0
+  if (r == pdFdAcquired) {
+    if (pdFdRelease(fd)) {
+      closed = 1
+    }
+  } else if (r == pdFdRefusedLast) {
+    closed = 1
+  }
+  out <- closed
+}
+
+fn refRoundFree(fd: int, twoClose: bool, lateCounter: *i64): bool {
+  let gen = pdOpen(fd)
+  let workCh = chan<i64>(REF_WORKERS)
+  let w = 0
+  while (w < REF_WORKERS) {
+    spawn refWorkerFree(fd, gen, workCh)
+    w = w + 1
+  }
+  let closeCh = chan<i64>(1)
+  spawn refCloser(fd, gen, twoClose, closeCh, lateCounter)
+  let total = 0
+  let j = 0
+  while (j < REF_WORKERS) {
+    total = total + <- workCh
+    j = j + 1
+  }
+  total = total + <- closeCh
+  return total == 1
+}
+
+fn refDriverFree(fd: int, counters: *i64, done: chan<i64>) {
+  let bad = 0
+  let closedCycles = 0
+  let k = 0
+  while (k < FREE_ROUNDS) {
+    let twoClose = k % REF_TWOCLOSE_EVERY == 0
+    if (refRoundFree(fd, twoClose, counters + rcLateAcquire)) {
+      closedCycles = closedCycles + 1
+    } else {
+      bad = bad + 1
+    }
+    k = k + 1
+  }
+  atomicAdd(counters + rcClosed, closedCycles)
+  atomicAdd(counters + rcBadCycle, bad)
+  done <- 1
+}
+
+// Runs every `refDriverFree` to completion and prints the pinned unordered
+// summary line -- the second, freely-racing proof beside `runRefDrivers`'s
+// barrier-ordered one.
+fn runFreeRefDrivers() {
+  let freeCounters = []i64(refCounterCount)
+  let fcp = ptrOf(freeCounters)
+  let freeDone = chan<i64>(FREE_FD_COUNT)
+  let ff = 0
+  while (ff < FREE_FD_COUNT) {
+    spawn refDriverFree(FREE_FD_BASE + ff, fcp, freeDone)
+    ff = ff + 1
+  }
+  let fj = 0
+  while (fj < FREE_FD_COUNT) {
+    let _ = <- freeDone
+    fj = fj + 1
+  }
+
+  let freeClosed = freeCounters[rcClosed]
+  let freeBad = freeCounters[rcBadCycle]
+  let freeLate = freeCounters[rcLateAcquire]
+  let freeExpectClosed = FREE_FD_COUNT * FREE_ROUNDS
+  let freeOk = freeBad == 0 && freeClosed == freeExpectClosed && freeLate == 0
+
+  print("freeok ${freeOk} closed ${freeClosed} bad ${freeBad} late ${freeLate}\n")
+}
+
 // Runs every `refDriver` to completion and prints the pinned ref-count
 // summary line. Split out of `main` to keep it under the complexity ceiling.
 fn runRefDrivers() {
@@ -533,6 +627,7 @@ fn main() {
   }
 
   runRefDrivers()
+  runFreeRefDrivers()
 
   let staleOk = staleGenCheck(FDS)
 
