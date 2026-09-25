@@ -2558,6 +2558,8 @@ defined exactly once).
 | `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
 | `bit_rt_map_has`      | `(m: ?*MapHeader, key: u64) -> bool` (§15)              |
 | `bit_rt_map_slot`     | `(m: ?*MapHeader, key: u64) -> i64` (§15, a hit token `>= 0` for `map_val_at`, or `-1`) |
+| `bit_rt_map_get_str`  | `(m: ?*MapHeader, ptr: *const u8, len: usize) -> u64` (§15; `bit_rt_map_get` for a `string` key passed as its bytes, not a header) |
+| `bit_rt_map_slot_str` | `(m: ?*MapHeader, ptr: *const u8, len: usize) -> i64` (§15; `bit_rt_map_slot` for a `string` key passed as its bytes, not a header) |
 | `bit_rt_map_delete`   | `(m: ?*MapHeader, key: u64) -> void` (§15)              |
 | `bit_rt_map_len`      | `(m: ?*MapHeader) -> i64` (§15)                         |
 | `bit_rt_map_iter_init`| `(m: ?*MapHeader) -> i64` (§15)                         |
@@ -3508,6 +3510,13 @@ the handle of a string CONSTANT, which is static for the life of the process.
   key's value (#5796). It is valid only for the `map_val_at` codegen emits
   immediately after it, under the adjacency contract (§5.1): with no poll
   between the calls no collection can free that table.
+- **String-key reads by words** (#5906). `map_get_str`/`map_slot_str` are
+  `map_get`/`map_slot` for a `map<string, _>` key passed as `(ptr, len)`: the
+  same hash over the same bytes, so a key stored through a header is found
+  through its words. The compiler emits them when the key is a `string` box it
+  just built (an exploded local or an `s[lo:hi]` view), which then needs no
+  allocation; a key that already is a handle still goes to `map_get`/`map_slot`.
+  The caller keeps `base` live across the call; both entries are `@nosplit`.
 - **Iteration** (`for (k, v) of m`, §13.5) is by slot cursor: `map_iter_init`
   returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
   then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
