@@ -258,6 +258,60 @@ explainMismatch() {
       }
       return 0
     }
+    # scanOracleWideIntRets (#5883) -- scans the ORACLE side function
+    # headers (side A, `linesA`) for a tuple return type wider than the
+    # #5870 5-int-word budget but no wider than the pre-#5870 8-word one
+    # (`func NAME(params) (T1, T2, ..., TN) {`, N in 6..8, every T an int-
+    # classed register type -- not `f32`/`f64`, the only two AAPCS FLOAT-
+    # class types this IR ever prints). Outside that N range neither
+    # compiler `retWordsFitRegisters` (compiler/lowerexplode.bit) boxes
+    # (N<=5) or both already did before #5870 (N>8, `nine(n): (int x9)` in
+    # `_tests_/cases/run_multiword_return.bit` is exactly this case and
+    # contributes NOTHING -- confirmed by including it below and getting
+    # the wrong S5870/R5870 before this bound was added). Sets S5870 (how
+    # many such functions) and R5870 (their word counts summed) -- both are
+    # ORACLE-side facts, independent of what bit2 actually did, which is
+    # exactly what makes the #5870 identity below an INDEPENDENT check
+    # rather than a fit to the bit2 delta itself.
+    function scanOracleWideIntRets(   i, line, pos, stripped, rettype, parts, np, j, allInt) {
+      S5870 = 0; R5870 = 0
+      for (i = 1; i <= nA; i++) {
+        line = linesA[i]
+        if (substr(line, 1, 5) != "func ") continue
+        if (substr(line, length(line) - 1) != " {") continue
+        stripped = substr(line, 1, length(line) - 2)
+        if (substr(stripped, length(stripped)) != ")") continue
+        pos = index(stripped, ") (")
+        if (pos == 0) continue
+        rettype = substr(stripped, pos + 3, length(stripped) - pos - 3)
+        if (rettype == "" || rettype ~ /[()]/) continue
+        np = split(rettype, parts, ", ")
+        if (np <= 5 || np > 8) continue
+        allInt = 1
+        for (j = 1; j <= np; j++) { if (parts[j] == "f32" || parts[j] == "f64") allInt = 0 }
+        if (allInt) { S5870++; R5870 += np }
+      }
+    }
+    # fallibleWordsOk (#5874, pulled out into its own function by #5883 so
+    # the composed #5870+#5874 check below can run the identical rule
+    # against a RESIDUAL delta table, not just the raw one) -- see the
+    # #5874 block below for the derivation; behaviour is unchanged, this is
+    # a pure extraction.
+    function fallibleWordsOk(D, Mv, knd,    op, zm) {
+      for (op in Mv) { if (!(op in fwok)) return 0 }
+      zm = (("const_int" in Mv) || ("const_bool" in Mv) || ("const_float" in Mv) || ("const_nil" in Mv))
+      if (!zm) return 0
+      if (D["call_word"] < 0) return 0
+      if (knd == "ir") {
+        if (D["field_get"] < 0 || D["gc_alloc"] < 0) return 0
+        if (D["const_int"] < 0 || D["const_bool"] < 0 || D["const_float"] < 0) return 0
+        if (D["const_int"] + D["const_bool"] + D["const_float"] + D["const_nil"] <= 0) return 0
+      } else {
+        if (D["field_get"] > 0 || D["gc_alloc"] > 0) return 0
+        if (D["call_word"] - D["field_get"] - D["gc_alloc"] <= 0) return 0
+      }
+      return 1
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -282,6 +336,7 @@ explainMismatch() {
         if (catchDisambigFmt(nA, linesA, nB, linesB)) { print "5474-catch-composite-default-fmt"; exit 0 }
         exit 1
       }
+      scanOracleWideIntRets()
       for (op in a) allop[op] = 1
       for (op in b) allop[op] = 1
       # `moved` is the set of opcodes that ACTUALLY changed, recorded here and
@@ -480,28 +535,80 @@ explainMismatch() {
       # so their magnitude is unconstrained there; at least one must move, or
       # the delta has the #5871 shape and that signature, checked first, owns it.
       #
-      # run_multiword_return.bit is NOT explained by this: its `eight` returns
-      # 8 int words, which the stage0 oracle passed in registers and the #5870
-      # 5-word budget (d93a3d1e7) boxes again (call_word -7), a mismatch main
-      # already carried before #5874 with no signature of its own.
-      okFallibleWords = 1
+      # run_multiword_return.bit is NOT explained by this ALONE: its `eight`
+      # returns 8 int words, which the stage0 oracle passed in registers and
+      # the #5870 5-word budget (d93a3d1e7) boxes again (call_word -7), a
+      # mismatch main already carried before #5874 with no signature of its
+      # own -- see `5870-multiword-return-rebox` below, which subtracts
+      # exactly that #5870 contribution and hands the residual to this same
+      # `fallibleWordsOk` to explain the rest.
       split("call_word field_get gc_alloc const_int const_bool const_float const_nil", fwlist, " ")
       for (i in fwlist) fwok[fwlist[i]] = 1
-      for (op in moved) { if (!(op in fwok)) okFallibleWords = 0 }
-      zeroMoved = ("const_int" in moved) || ("const_bool" in moved) || ("const_float" in moved) || ("const_nil" in moved)
-      if (!zeroMoved) okFallibleWords = 0
-      if (delta["call_word"] < 0) okFallibleWords = 0
-      if (kind == "ir") {
-        if (delta["field_get"] < 0 || delta["gc_alloc"] < 0) okFallibleWords = 0
-        if (delta["const_int"] < 0 || delta["const_bool"] < 0 || delta["const_float"] < 0) okFallibleWords = 0
-        if (delta["const_int"] + delta["const_bool"] + delta["const_float"] + delta["const_nil"] <= 0) okFallibleWords = 0
-      } else {
-        if (delta["field_get"] > 0 || delta["gc_alloc"] > 0) okFallibleWords = 0
-        if (delta["call_word"] - delta["field_get"] - delta["gc_alloc"] <= 0) okFallibleWords = 0
-      }
-      if (okFallibleWords) {
+      if (fallibleWordsOk(delta, moved, kind)) {
         print "5874-fallible-tuple-words"
         exit 0
+      }
+
+      # --- #5870: a `ret` over the 5-integer-word budget boxes again (#5883)
+      # ---
+      #
+      # `retWordsFitRegisters` (compiler/lowerexplode.bit, d93a3d1e7) moved
+      # from the old aarch64 8-register budget to a target-independent 5-int
+      # word one. A function whose tuple return has 6..8 int-classed words
+      # (`_tests_/cases/run_multiword_return.bit`, `eight`, the only corpus
+      # file this hits) now boxes where the pinned stage0 still returned the
+      # words directly: the callee `ret` becomes `gc_alloc`+N `field_set`+
+      # `ret %box` instead of N register words, and the caller drops its
+      # N-1 `call_word` reads for N `field_get`s off the box.
+      #
+      # `scanOracleWideIntRets` (top of file) counts these sites from the
+      # ORACLE side alone (S5870 functions, R5870 total words) -- an
+      # INDEPENDENT fact about the divergence, not fit to the bit2 delta.
+      # Two real measurements confirm the exact per-site contribution this
+      # implies (this tree at 1c87cd749 vs the pinned stage0, `eight`
+      # isolated in its own file to remove any #5874 entanglement, S=1 R=8
+      # both times):
+      #
+      #   pre-opt (ir):    gc_alloc -S      call_word (S-R)   field_get -R
+      #   post-opt (iropt): gc_alloc +S      call_word (S-R)   field_get +R
+      #
+      # For `eight` (S=1, R=8): pre-opt gc_alloc -1, call_word -7,
+      # field_get -8; post-opt gc_alloc +1, call_word -7, field_get +8 --
+      # the WHOLE divergence when #5874 is not also in play (proven below
+      # with `eight` alone, no `checked`). Subtracting this from the actual
+      # delta and handing what is left to `fallibleWordsOk` explains the
+      # combined file: residual pre-opt is gc_alloc +2, call_word +1,
+      # const_nil -1, const_int +2, field_get +4 -- exactly the #5874-alone
+      # contribution the block above already derived for this file.
+      #
+      # Guarded on real #5870-shaped movement actually being present
+      # (`call_word` in `moved` and strictly negative, plus `gc_alloc` or
+      # `field_get` also moved) before subtracting anything: S5870>0 alone
+      # is an ORACLE-side fact that can be true of a file for reasons
+      # unrelated to this divergence, and subtracting a nonzero contribution
+      # from an UNMOVED opcode would fabricate box traffic no dump ever
+      # showed (mutation-tested in the self-check: an unrelated single-
+      # opcode delta in a file whose oracle happens to declare an 8-int-word
+      # return is correctly left unexplained).
+      if (S5870 > 0 && ("call_word" in moved) && delta["call_word"] < 0 && (("gc_alloc" in moved) || ("field_get" in moved))) {
+        if (kind == "ir") { c_gc = -S5870; c_fg = -R5870 } else { c_gc = S5870; c_fg = R5870 }
+        c_cw = S5870 - R5870
+        for (op in delta) resDelta[op] = delta[op]
+        resDelta["gc_alloc"] = delta["gc_alloc"] - c_gc
+        resDelta["call_word"] = delta["call_word"] - c_cw
+        resDelta["field_get"] = delta["field_get"] - c_fg
+        for (op in moved) resMoved[op] = 1
+        if (resDelta["gc_alloc"] == 0) { delete resMoved["gc_alloc"] } else { resMoved["gc_alloc"] = 1 }
+        if (resDelta["call_word"] == 0) { delete resMoved["call_word"] } else { resMoved["call_word"] = 1 }
+        if (resDelta["field_get"] == 0) { delete resMoved["field_get"] } else { resMoved["field_get"] = 1 }
+        residualEmpty = 1
+        for (op in resMoved) residualEmpty = 0
+        # residualEmpty: the #5870 identity alone accounts for the whole
+        # divergence (no #5874 or anything else stacked on this file).
+        if (residualEmpty || fallibleWordsOk(resDelta, resMoved, kind)) {
+          print "5870-multiword-return-rebox"
+          exit 0
+        }
       }
 
       exit 1
@@ -538,7 +645,13 @@ explainMismatch() {
 # there. `5876-field-store-declared-type-convert` fires under both kinds like
 # `5871-tuple-word-explode` (no `kind` branch of its own), and so does
 # `5874-fallible-tuple-words` (its `kind` branch picks signs, not whether it
-# runs). `ast` and `fmt` are
+# runs). `5870-multiword-return-rebox` (#5883) fires under both kinds too --
+# only on `_tests_/cases/run_multiword_return.bit`, and only COMPOSED with
+# `5874-fallible-tuple-words` in the current corpus (that file's `checked`
+# also goes through #5874's own words convention), so it is not gated on
+# `checked` disappearing, only on `eight`'s divergence from the pinned
+# stage0 closing (a repin past #5870, same as any other entry here). `ast`
+# and `fmt` are
 # a different, disjoint kind space entirely -- #5474's two signatures never
 # fire under `ir`/`iropt` and vice versa, so they are returned only for their
 # own exact kind.
@@ -547,12 +660,13 @@ declaredSignatureNames() {
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
-    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words"; return ;;
-    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words"; return ;;
+    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
+    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
     "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
-    "5876-field-store-declared-type-convert" "5874-fallible-tuple-words"
+    "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" \
+    "5870-multiword-return-rebox"
 }
 
