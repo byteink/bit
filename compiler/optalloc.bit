@@ -182,3 +182,476 @@ fn deadAllocs(f: IrFunc): []bool {
   }
   return dead
 }
+
+// ## Through a join (#5873)
+//
+// `deadAllocs` can only take a box nothing names, and a block argument names
+// it. So when an inlined callee has two `return a, b` sites, or a tuple is
+// built on both arms of a branch, each predecessor allocates its own box and
+// hands the handle to the join's block parameter P, and one `gc_alloc` per
+// execution survives even though P is only ever read. `splitJoinBoxes` turns
+// P into one parameter per field it reads, passes each edge the value its own
+// `field_set` stored there, and leaves the boxes with no reader, so
+// `deadAllocs` removes them in the same DCE rebuild.
+//
+// THE PROOF OBLIGATION. The value a `field_get` of P reads is the one the
+// predecessor's last `field_set` at that offset wrote, and nothing else, when:
+//
+// - every edge into P's block passes a `gc_alloc` of P's own type, made in the
+//   edge's source block, so the object is fresh on every path;
+// - that argument is the box's ONLY escaping use (`escapingUseCounts`), and
+//   every `field_set` into the box sits in that same block, so no write can
+//   land between the edge and the read, and none through another name;
+// - P is named by `field_get`s alone: never written, never passed on, never
+//   the endpoint of a keepalive edge.
+//
+// Distinct offsets are distinct slots for the reason optstore.bit's rule 2
+// gives: one SSA value has one static type, hence one layout, whose fields do
+// not overlap. A field no predecessor stored reads the allocator's zeroed body
+// (runtime/ABI.md §1), so it is passed a zero constant, and a field whose type
+// has no scalar zero refuses the join. Every field keeps its own type, so a
+// traced field stays a traced value for the register allocator. Anything else
+// is left boxed, which is always correct.
+
+// The analysis state and its answer. `first[p]` is where block param p's fields
+// start in the flat `off`/`ty`/`zero` lists, or -1 when p is not split, and
+// `count[p]` how many it has.
+class JoinSplit {
+  ctx: TypeContext,
+  f: IrFunc,
+  esc: []int,
+  first: []int,
+  count: []int,
+  off: []int,
+  ty: []int,
+  zero: []ConstVal,
+}
+
+// One candidate's reads: each distinct offset in first-read order with the type
+// it is read at. `ok` falls when P has a use this pass cannot see through.
+class JoinFields {
+  ok: bool,
+  uses: int,
+  off: []int,
+  ty: []int,
+}
+
+// The rebuild's working state. `newId` is parallel to `JoinSplit.off`: the new
+// parameter each field became, written when its block's params are emitted.
+class JoinRebuild {
+  b: IrBuilder,
+  js: JoinSplit,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+  newId: []int,
+}
+
+fn namedInKeepAlive(f: IrFunc, id: int): bool {
+  let i = 0
+  while (i < len(f.keepAlive)) {
+    if (f.keepAlive[i] == id) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The constant the allocator's zeroed bytes read as at type `ty`, or `noConst()`
+// when `ty` is not a scalar this pass can materialize.
+fn scalarZero(ctx: TypeContext, ty: int): ConstVal {
+  let p = primOfType(ctx, ty)
+  if (isIntPrim(p)) {
+    return intConst(0)
+  }
+  if (isFloatPrim(p)) {
+    return floatConst(0.0)
+  }
+  if (p == 10) {
+    return boolConst(false)
+  }
+  return noConst()
+}
+
+// Records a read of offset `off` at type `ty`. Two reads of one offset at two
+// types refuse: the forwarded value can have only one.
+fn addJoinField(jf: JoinFields, off: int, ty: int) {
+  let k = 0
+  while (k < len(jf.off)) {
+    if (jf.off[k] == off) {
+      jf.ok = jf.ok && jf.ty[k] == ty
+      return
+    }
+    k = k + 1
+  }
+  jf.off = append(jf.off, off)
+  jf.ty = append(jf.ty, ty)
+}
+
+// P's reads. A `field_set` through P is a write `escapingUseCounts` does not
+// count, so it is refused here.
+fn joinFieldReads(f: IrFunc, p: int): JoinFields {
+  let jf = JoinFields{ ok = true, uses = 0, off = []int(0), ty = []int(0) }
+  let i = p + 1
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.FieldGet && ins.lhs == p) {
+      jf.uses = jf.uses + 1
+      addJoinField(jf, ins.ival, ins.ty)
+    }
+    if (ins.op == Op.FieldSet && ins.lhs == p) {
+      jf.ok = false
+    }
+    i = i + 1
+  }
+  return jf
+}
+
+// The arguments terminator `ins` passes at position `pos` on its edges into
+// block `bi`: none, one, or two when both arms of a `br` land there.
+fn edgeArgsInto(ins: IrInstr, bi: int, pos: int): []int {
+  let out = []int(0)
+  if (ins.op == Op.Jump && ins.ival == bi) {
+    out = append(out, ins.args[pos])
+  }
+  if (ins.op == Op.Br && ins.ival == bi) {
+    out = append(out, ins.thenArgs[pos])
+  }
+  if (ins.op == Op.Br && ins.ival2 == bi) {
+    out = append(out, ins.elseArgs[pos])
+  }
+  return out
+}
+
+// The last `field_set` at `off` into `box` before instruction `end`, or -1.
+fn lastStoreAt(f: IrFunc, box: int, end: int, off: int): int {
+  let s = -1
+  let i = box + 1
+  while (i < end) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.FieldSet && ins.lhs == box && ins.ival == off) {
+      s = i
+    }
+    i = i + 1
+  }
+  return s
+}
+
+// Whether `box` is a `gc_alloc` of type `ty` made in block `b`, named by one
+// escaping use (the edge that found it) and written only inside `b`.
+fn isLocalFreshBox(x: JoinSplit, b: int, box: int, ty: int): bool {
+  let f = x.f
+  let blk = f.blocks[b]
+  let end = blk.instsStart + blk.instsLen
+  let a = f.instrs[box]
+  if (a.op != Op.GcAlloc || a.ty != ty || x.esc[box] != 1 || namedInKeepAlive(f, box)) {
+    return false
+  }
+  if (box < blk.instsStart || box >= end) {
+    return false
+  }
+  let i = end
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == Op.FieldSet && f.instrs[i].lhs == box) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether field `k` of the join reads a value this edge can pass: the box's
+// last store at that offset, which must be of the read's own type, or a zero.
+// #5876 made every tuple store's value carry the field's declared type
+// (`fieldStoreValue`, lowertuple.bit; `fieldSetRhsTarget`, optfold.bit); the
+// forwarded value is that stored value, so the invariant is asserted here.
+fn edgeFieldPasses(x: JoinSplit, box: int, term: int, off: int, ty: int): bool {
+  let s = lastStoreAt(x.f, box, term, off)
+  if (s < 0) {
+    return scalarZero(x.ctx, ty).known
+  }
+  let st = x.f.instrs[s]
+  if (st.ival2 != ty) {
+    return false
+  }
+  assert(x.f.instrs[st.rhs].ty == st.ival2)
+  return true
+}
+
+fn edgeBoxSplittable(x: JoinSplit, b: int, box: int, p: int, jf: JoinFields): bool {
+  if (!isLocalFreshBox(x, b, box, x.f.instrs[p].ty)) {
+    return false
+  }
+  let term = x.f.blocks[b].instsStart + x.f.blocks[b].instsLen - 1
+  let k = 0
+  while (k < len(jf.off)) {
+    if (!edgeFieldPasses(x, box, term, jf.off[k], jf.ty[k])) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// Whether every edge into block `bi` passes a splittable box for param `p`.
+// A block with no incoming edge refuses: there is nothing to prove fresh.
+fn joinEdgesSplittable(x: JoinSplit, bi: int, p: int, jf: JoinFields): bool {
+  let pos = p - x.f.blocks[bi].instsStart
+  let edges = 0
+  let b = 0
+  while (b < len(x.f.blocks)) {
+    let blk = x.f.blocks[b]
+    let args = edgeArgsInto(x.f.instrs[blk.instsStart + blk.instsLen - 1], bi, pos)
+    let k = 0
+    while (k < len(args)) {
+      if (!edgeBoxSplittable(x, b, args[k], p, jf)) {
+        return false
+      }
+      edges = edges + 1
+      k = k + 1
+    }
+    b = b + 1
+  }
+  return edges > 0
+}
+
+// Records block param `p` of block `bi` as split when every rule above holds.
+fn tryJoinSplit(x: JoinSplit, bi: int, p: int) {
+  let pty = x.f.instrs[p].ty
+  if (x.ctx.types[pty].kind != TypeKind.Tuple || namedInKeepAlive(x.f, p)) {
+    return
+  }
+  let jf = joinFieldReads(x.f, p)
+  if (!jf.ok || jf.uses != x.esc[p] || !joinEdgesSplittable(x, bi, p, jf)) {
+    return
+  }
+  x.first[p] = len(x.off)
+  x.count[p] = len(jf.off)
+  let k = 0
+  while (k < len(jf.off)) {
+    x.off = append(x.off, jf.off[k])
+    x.ty = append(x.ty, jf.ty[k])
+    x.zero = append(x.zero, scalarZero(x.ctx, jf.ty[k]))
+    k = k + 1
+  }
+}
+
+// Every splittable join param of `f`. Block 0 is skipped: its params are the
+// function's own, and no edge in `f` produces them.
+fn findJoinSplits(ctx: TypeContext, f: IrFunc): JoinSplit {
+  let first = []int(0)
+  let count = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    first = append(first, -1)
+    count = append(count, 0)
+    i = i + 1
+  }
+  let x = JoinSplit{
+    ctx = ctx, f = f, esc = escapingUseCounts(f), first = first, count = count,
+    off = []int(0), ty = []int(0), zero = []ConstVal(0),
+  }
+  let bi = 1
+  while (bi < len(f.blocks)) {
+    let blk = f.blocks[bi]
+    let p = blk.instsStart
+    while (p < blk.instsStart + blk.paramCount) {
+      tryJoinSplit(x, bi, p)
+      p = p + 1
+    }
+    bi = bi + 1
+  }
+  return x
+}
+
+// The field of split param `p` read at `off`. Asserts: the analysis recorded
+// every offset P is read at.
+fn joinFieldIndex(js: JoinSplit, p: int, off: int): int {
+  let k = js.first[p]
+  while (k < js.first[p] + js.count[p]) {
+    if (js.off[k] == off) {
+      return k
+    }
+    k = k + 1
+  }
+  assert(false)
+  return -1
+}
+
+// The values an edge passes in place of `box` for split param `p`, in field
+// order. Each is already emitted: the store sits before the terminator `term`
+// in this same block. A zero is emitted here, still ahead of the terminator.
+fn splitFieldValues(r: JoinRebuild, box: int, p: int, term: int): []int {
+  let js = r.js
+  let out = []int(0)
+  let k = js.first[p]
+  while (k < js.first[p] + js.count[p]) {
+    let s = lastStoreAt(js.f, box, term, js.off[k])
+    if (s >= 0) {
+      out = append(out, r.remap[js.f.instrs[s].rhs])
+    } else {
+      out = append(out, emitConst(r.b, js.zero[k], js.ty[k], js.f.instrs[term].span))
+    }
+    k = k + 1
+  }
+  return out
+}
+
+// `args` of the edge from terminator `term` into block `target`, translated,
+// with every split param's box replaced by its field values.
+fn splitEdgeArgs(r: JoinRebuild, term: int, args: []int, target: int): []int {
+  let base = r.js.f.blocks[target].instsStart
+  let out = []int(0)
+  let pos = 0
+  while (pos < len(args)) {
+    if (r.js.first[base + pos] < 0) {
+      out = append(out, r.remap[args[pos]])
+    } else {
+      let vals = splitFieldValues(r, args[pos], base + pos, term)
+      let k = 0
+      while (k < len(vals)) {
+        out = append(out, vals[k])
+        k = k + 1
+      }
+    }
+    pos = pos + 1
+  }
+  return out
+}
+
+// Emits terminator `term`. The new argument lists are built FIRST, so any zero
+// they need lands ahead of it, then written over what `emitTranslated` copied.
+fn emitSplitTerminator(r: JoinRebuild, term: int) {
+  let ins = r.js.f.instrs[term]
+  if (ins.op == Op.Jump) {
+    let args = splitEdgeArgs(r, term, ins.args, ins.ival)
+    emitTranslated(r.b, r.js.f, r.known, r.remap, r.blockMap, term)
+    let j = r.b.instrs[len(r.b.instrs) - 1]
+    j.args = args
+    return
+  }
+  if (ins.op == Op.Br) {
+    let thenArgs = splitEdgeArgs(r, term, ins.thenArgs, ins.ival)
+    let elseArgs = splitEdgeArgs(r, term, ins.elseArgs, ins.ival2)
+    emitTranslated(r.b, r.js.f, r.known, r.remap, r.blockMap, term)
+    let t = r.b.instrs[len(r.b.instrs) - 1]
+    t.thenArgs = thenArgs
+    t.elseArgs = elseArgs
+    return
+  }
+  emitTranslated(r.b, r.js.f, r.known, r.remap, r.blockMap, term)
+}
+
+// Block param `p`: itself, or one param per field when it is split.
+fn emitSplitParam(r: JoinRebuild, p: int) {
+  let js = r.js
+  if (js.first[p] < 0) {
+    r.remap[p] = builderAddParam(r.b, js.f.instrs[p].ty)
+    return
+  }
+  let k = js.first[p]
+  while (k < js.first[p] + js.count[p]) {
+    r.newId[k] = builderAddParam(r.b, js.ty[k])
+    k = k + 1
+  }
+}
+
+// One block. A `field_get` of a split param emits nothing and takes its field's
+// parameter; every other instruction is copied as it was.
+fn emitSplitBlock(r: JoinRebuild, bi: int) {
+  let f = r.js.f
+  let blk = f.blocks[bi]
+  assert(blk.instsLen > blk.paramCount)
+  builderBeginBlock(r.b, r.blockMap[bi])
+  let idx = blk.instsStart
+  while (idx < blk.instsStart + blk.paramCount) {
+    emitSplitParam(r, idx)
+    idx = idx + 1
+  }
+  let term = blk.instsStart + blk.instsLen - 1
+  while (idx < term) {
+    let ins = f.instrs[idx]
+    if (ins.op == Op.FieldGet && r.js.first[ins.lhs] >= 0) {
+      r.remap[idx] = r.newId[joinFieldIndex(r.js, ins.lhs, ins.ival)]
+    } else {
+      emitTranslated(r.b, f, r.known, r.remap, r.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  emitSplitTerminator(r, term)
+  builderEndBlock(r.b)
+}
+
+// `f` rebuilt with every split join param replaced. Every instruction but the
+// split params survives, so keepalive pairs translate straight through `remap`:
+// a split param is never an endpoint (`tryJoinSplit`), and a `field_get` of
+// one maps onto its field's parameter.
+fn rebuildJoinSplits(js: JoinSplit): IrFunc {
+  let f = js.f
+  let n = len(f.blocks)
+  let blockMap = []int(0)
+  let remap = []int(0)
+  let known = []ConstVal(0)
+  let newId = []int(0)
+  let i = 0
+  while (i < n) {
+    blockMap = append(blockMap, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    remap = append(remap, 0)
+    known = append(known, noConst())
+    i = i + 1
+  }
+  i = 0
+  while (i < len(js.off)) {
+    newId = append(newId, 0)
+    i = i + 1
+  }
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  i = 0
+  while (i < n) {
+    blockMap[order[i]] = builderNewBlock(b)
+    i = i + 1
+  }
+  let r = JoinRebuild{
+    b = b, js = js, remap = remap, blockMap = blockMap, known = known, newId = newId,
+  }
+  i = 0
+  while (i < n) {
+    emitSplitBlock(r, order[i])
+    i = i + 1
+  }
+  return IrFunc{
+    name = f.name, paramTypes = f.paramTypes, result = f.result,
+    blocks = b.blocks, instrs = b.instrs, isFallible = f.isFallible,
+    isNaked = f.isNaked, isNosplit = f.isNosplit,
+    // §17.6 module tag, §11.9 pin flag and #4406's keepalive edges ride every
+    // rebuild; see `rebuild`'s own note (optrebuild.bit) for what dropping any
+    // of them costs.
+    inRootModule = f.inRootModule, isPinned = f.isPinned,
+    keepAlive = trKeepAlive(f.keepAlive, remap),
+  }
+}
+
+// The pass: `f` with every join-carried fresh box split into its fields, or
+// `f` itself when there is none, so a function this has no work in cannot be
+// perturbed. Runs between the fold and `deadCodeElim`, whose `deadAllocs` then
+// takes the boxes the edges no longer name.
+fn splitJoinBoxes(ctx: TypeContext, f: IrFunc): IrFunc {
+  if (countGcAllocs(f) == 0) {
+    return f
+  }
+  let js = findJoinSplits(ctx, f)
+  let i = 0
+  while (i < len(js.first)) {
+    if (js.first[i] >= 0) {
+      return rebuildJoinSplits(js)
+    }
+    i = i + 1
+  }
+  return f
+}
