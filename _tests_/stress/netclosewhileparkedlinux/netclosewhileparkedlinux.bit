@@ -1,0 +1,125 @@
+// Proves `Conn.close()` itself wakes a green thread parked reading that
+// exact connection (#5866, linux twin of `netclosewhileparkeddarwin`, #5865):
+// `std/net`'s `close()` routes through the platform's own `netClose`
+// (`bit_rt_net_close_w`, `stdlib/net/net.bit`) rather than the generic
+// `fsClose` it called directly before #5865, and on linux that now means
+// `pollDescUnregister`/`pdClose` run — `EPOLL_CTL_DEL` before `close(fd)`,
+// and `pdClose`'s "close wakes every waiter" (invariant 4,
+// `runtime/sched/polldesc.bit`) delivers the wake instead of leaving the
+// parked reader to ride out its own (long) deadline.
+//
+// `linux-only`: `_tests_/stress/netreaddeadlinerace`'s own close-while-parked
+// case stays platform-neutral by using `shutdown()` instead, which has
+// always woken a parked reader on both platforms; this harness is the one
+// that needs the register-once `netClose` wiring specifically, which darwin
+// already proved (`netclosewhileparkeddarwin`) and linux proves here.
+//
+// THE ORACLE IS ELAPSED TIME, same shape as the darwin twin: a parked read
+// that returns before `boundMs` was woken by the close; one that only
+// returns at or after `deadlineMs` timed out instead, which is exactly what
+// a leftover, un-retracted register-once slot looks like — this is the
+// failure mode a regression here would produce, not a crash.
+
+import { listen, dial, Listener, Conn } from "std/net"
+import { newWaitGroup, WaitGroup } from "std/sync"
+import { monotonic, sleepUntil, Millisecond } from "std/time"
+
+const N: int = 40
+const deadlineMs: int = 4000
+const closeAfterMs: int = 30
+// Generous bound for "woke because of the close, not the deadline" — well
+// under `deadlineMs`, well over any real scheduling jitter.
+const boundMs: int = 1000
+
+class ServerArgs { c: Conn, wg: WaitGroup, ok: []i64, idx: int }
+
+fn serverReader(a: ServerArgs) {
+  a.c.setDeadline(monotonic().ns + deadlineMs * Millisecond)
+  let startNs = monotonic().ns
+  // A close-induced wake surfaces here as EITHER an error (`fail`) or an
+  // orderly empty read (`""`) depending on exactly how the fd tears down —
+  // this test only checks WHEN the call returns, not which shape it took.
+  let v = a.c.readDeadline(64) catch _ {
+    let elapsedMs = (monotonic().ns - startNs) / Millisecond
+    if (elapsedMs < boundMs) {
+      a.ok[a.idx] = 1
+    }
+    a.wg.done()
+    return
+  }
+  let elapsedMs = (monotonic().ns - startNs) / Millisecond
+  if (v == "" && elapsedMs < boundMs) {
+    a.ok[a.idx] = 1
+  }
+  a.wg.done()
+}
+
+// Closes the SAME `Conn` a sibling task is parked reading, from a SECOND
+// task, `closeAfterMs` after spawn — long enough that the reader has
+// certainly parked (`readDeadline`'s first non-blocking read always misses
+// on a connection nothing has written to, so it parks essentially
+// immediately; this margin is generous, not tight).
+fn serverCloser(c: Conn) {
+  sleepUntil(monotonic().ns + closeAfterMs * Millisecond)
+  c.close()
+}
+
+fn runServer(l: Listener, wg: WaitGroup, ok: []i64) {
+  let i = 0
+  while (i < N) {
+    let c = l.accept() catch _ {
+      return
+    }
+    spawn serverReader(ServerArgs{ c = c, wg = wg, ok = ok, idx = i })
+    spawn serverCloser(c)
+    i = i + 1
+  }
+}
+
+fn main() {
+  let l = listen("127.0.0.1", 0) catch _ {
+    print("bind fail\n")
+    return
+  }
+  let port = l.port() catch _ {
+    print("port fail\n")
+    return
+  }
+
+  let wg = newWaitGroup()
+  wg.add(i64(N))
+  let ok = []i64(N)
+  spawn runServer(l, wg, ok)
+
+  // The CLIENT side dials and does nothing else — no write, no close — kept
+  // alive in `clients` for the whole run so it is never the reason the
+  // server side sees an EOF; only the server's own `close()` (above) can be.
+  let clients = []Conn(N)
+  let i = 0
+  while (i < N) {
+    let c = dial("127.0.0.1", port) catch _ {
+      i = i + 1
+      continue
+    }
+    clients[i] = c
+    i = i + 1
+  }
+  wg.wait()
+  l.close()
+  let k = 0
+  while (k < N) {
+    clients[k].close()
+    k = k + 1
+  }
+
+  let okCount = 0
+  let j = 0
+  while (j < N) {
+    if (ok[j] == 1) {
+      okCount = okCount + 1
+    }
+    j = j + 1
+  }
+
+  print("netclosewhileparkedlinux ${okCount}\n")
+}
