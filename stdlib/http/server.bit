@@ -240,6 +240,21 @@ interface acceptor {
   port(): int!,
 }
 
+// `serveTlsOn`'s seam (#5916), the TLS mirror of `acceptor`: exactly the
+// `TlsListener` (std/tls) surface its accept loop calls. `TlsListener`
+// satisfies this purely structurally — nothing in std/tls changes, and every
+// existing caller keeps passing a `TlsListener` exactly as before — so this
+// exists only to let a test substitute one whose `accept()` fails on demand,
+// the same reason `acceptor` exists for `listenAndServeOn`'s test (#5913):
+// std/tls has no way to lower `RLIMIT_NOFILE` to reproduce EMFILE for real,
+// and unlike `Server.listener`, `TlsListener`'s fields are private to std/tls,
+// so a fake could not otherwise stand in for one from this module.
+interface tlsAcceptor {
+  accept(): TlsConn!,
+  isClosed(): bool,
+  port(): int!,
+}
+
 // Backoff `listenAndServeOn` and `serveTlsOn` share for a failed accept
 // (#5913): Go's `net/http` `Server.Serve` gives a temporary accept error
 // (EMFILE, ENFILE — the process or system's fd limit — and anything else
@@ -260,16 +275,14 @@ const maxAcceptBackoffNs = 1000 * Millisecond
 // the fd limit): it is dropped, the current backoff is slept and doubled —
 // capped at `maxBackoffNs` — for the next consecutive failure, and the
 // loop retries. A successful accept resets the backoff to
-// `initialAcceptBackoffNs`. `serveTlsOn`'s bare `TlsListener` carries no
-// "was this closed" signal of its own (unlike `Server`), so it passes
-// `() => false` — every accept error there is dropped and retried, never
-// ending the loop. It also passes `maxBackoffNs = 0`, so it retries at once
-// and never sleeps: `TlsListener.accept()` (std/tls) runs the handshake
-// inline, so a failure here is usually one client's rejected handshake
-// (RFC 7301 §3.2 ALPN mismatch, etc.), which this loop cannot tell apart from
-// the fd limit. A backoff would let any client stall every other client's
-// accept by sending bad handshakes. #5916 moves the handshake out of accept,
-// after which TLS gets the same backoff as plain HTTP.
+// `initialAcceptBackoffNs`. `serveTlsOn` passes `l.isClosed()` — `TlsListener`
+// gained the same "was this closed" signal `Server` already had (#5916) — and
+// `maxAcceptBackoffNs`, the same backoff plain HTTP gets: `TlsListener.accept()`
+// (std/tls) no longer runs the handshake inline (#5916), so a failure here is
+// a genuine TCP-level accept failure (most often the fd limit) and no longer
+// one client's rejected handshake — a bad ClientHello can no longer even make
+// this `accept` fail, since accepting the TCP connection and running its
+// handshake are different steps now, the second on the connection's own task.
 fn acceptLoop<C>(
   accept: () => C!,
   closed: () => bool,
@@ -468,13 +481,20 @@ fn answerOne(
 // Every response carries an `Alt-Svc: h3=":<port>"` header (RFC 7838)
 // advertising an HTTP/3 endpoint on `l`'s own bound port over UDP, so a client
 // can discover it and upgrade a later request — pair with `serveH3` on that
-// port. Never returns on its own (#5913): a bare `TlsListener` carries no
-// "was this closed" signal `acceptLoop` (above `listenAndServeOn`) could act
-// on, so every accept failure — a rejected handshake, the fd limit, anything
-// else — backs off and retries forever, the same as before this loop had a
-// backoff, minus the fd-limit hot-spin. Use `tlsServe`/`serveTlsServerOn`/
-// `TlsServer.shutdown` for a server that can be told to stop.
-export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
+// port. Parameter type `tlsAcceptor`, not the concrete `TlsListener`, purely
+// for testability (#5916, see that interface's own comment) — `l` is a
+// `TlsListener` at every real call site, unchanged. Returns only once `l`'s
+// `close()` has closed the listener (#5916: `TlsListener` gained the same
+// "was this closed" signal `Server` already had) — any other accept failure
+// (most often the fd limit) is retried with the same backoff
+// `listenAndServeOn` uses (`acceptLoop`, above) instead of ending the loop.
+// The TLS handshake itself no longer runs inside this loop's `accept` at all
+// (#5916: it runs on the connection's own task, in `serveTlsConn` below), so a
+// bad or stalled ClientHello can no longer make this loop retry, let alone
+// block another client's accept. Use `tlsServe`/`serveTlsServerOn`/
+// `TlsServer.shutdown` for a server whose shutdown also drains in-flight
+// requests.
+export fn serveTlsOn(l: tlsAcceptor, handler: (Request) => Response): ()! {
   let altPort = l.port()?
   // A private drain tracker, never exposed outside this call: `serveOne`
   // (server.bit) needs a `drainState` to register HTTP/1.1-over-TLS
@@ -482,26 +502,21 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
   // plain path. Nothing external can drain it — `shutdown` (shutdown.bit,
   // #3963) is scoped to `Server` only; see that file's header comment for why.
   let d = newDrainState()
-  // `serveTlsOn` takes a bare `TlsListener`, not a server object, so there is
+  // `serveTlsOn` takes a bare listener, not a server object, so there is
   // nothing to configure a body budget on: it serves under the default. Use
   // `tlsServe`/`serveTlsServerOn` (below) to raise or lower it.
-  // `tlsStream.setIdleDeadline` is a no-op (see its own comment — `TlsConn`
-  // has no accept-side deadline setter), so `idleTimeoutNs` here bounds
-  // nothing yet; `maxRequests` still caps a persistent HTTP/1.1-over-TLS
-  // connection.
   let opts = connOpts{
     altPort = altPort, maxBody = defaultMaxBodyBytes,
     idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
   }
-  // A per-connection failure (a bad or rejected TLS handshake — e.g. a
-  // client whose ALPN offer shares nothing with ours, RFC 7301 §3.2 — or a
-  // transient accept failure such as the fd limit, #5913) must drop THAT
-  // attempt, never the listener: propagating it would let one malformed
-  // client, or a passing burst of EMFILE, take down the whole server.
-  // `acceptLoop`'s `closed` is `() => false` here — see this function's own
-  // doc comment for why — so this never returns. It never sleeps either
-  // (`maxBackoffNs = 0`, see `acceptLoop`'s header for why).
-  acceptLoop(() => l.accept(), () => false, 0, (conn) => {
+  // A transient accept failure (most often the fd limit) must drop THAT
+  // attempt, never the listener: propagating it would let a passing burst of
+  // EMFILE take down the whole server. A per-connection handshake failure (a
+  // bad ClientHello, a client whose ALPN offer shares nothing with ours) no
+  // longer surfaces here at all (#5916) — `l.accept()` only ever fails on the
+  // TCP accept itself — so it can no longer reach this `catch` or affect the
+  // backoff; `serveTlsConn` drops it on the connection's own task instead.
+  acceptLoop(() => l.accept(), () => l.isClosed(), maxAcceptBackoffNs, (conn) => {
     spawn serveTlsConn(conn, handler, opts, d)
   })?
 }
@@ -536,9 +551,20 @@ fn altSvcHeader(port: int): string {
 }
 
 // Dispatch one accepted TLS connection to the HTTP/2 or HTTP/1.1 server path by
-// its negotiated ALPN protocol. Runs on the spawned per-connection green thread.
+// its negotiated ALPN protocol. Runs on the spawned per-connection green thread
+// (#5916), which is exactly what bounds the handshake this now runs first: a
+// stalled or malicious ClientHello parks only this connection's own thread,
+// under `TlsConn.ensureHandshake`'s handshake deadline, never the accept loop
+// that spawned it. A handshake failure (deadline elapsed, a bad ClientHello, an
+// ALPN offer sharing nothing with ours) drops this connection exactly as an
+// `l.accept()` failure used to before #5916 — silently, never propagated. Once
+// the handshake has run, dispatch follows the negotiated ALPN protocol.
 // `altPort` is the HTTP/3 port advertised in each response's Alt-Svc header.
 fn serveTlsConn(conn: TlsConn, handler: (Request) => Response, opts: connOpts, d: drainState) {
+  conn.handshake() catch _ {
+    conn.close()
+    return
+  }
   if (conn.alpnProtocol() == "h2") {
     // The h2 engine frames its own bodies (stdlib/http2) and does not read
     // through `readMessage`, so `opts.maxBody` reaches it as the engine's own
