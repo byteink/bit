@@ -31,7 +31,7 @@ import { pollDescRegister, pollDescUnregister } from "../../sched/darwin"
 // file's two lifecycle ends, `netAwaitReady` and `../tcp.bit`'s deadline race
 // are the two waiters.
 import {
-  pdOpen, pdWait, pdClose, pdGen, pdDirRead, pdDirWrite,
+  pdOpen, pdWait, pdClose, pdDirRead, pdDirWrite,
   pdClaimed, pdAlreadyReady, pdEmpty,
 } from "../../sched"
 // `schedCurrentWorker`, `wkId` and `schedMaxWorkers` are already imported by
@@ -352,12 +352,43 @@ export @symbol("bit_rt_port_net_set_non_block") @nosplit fn netSetNonBlock(fd: i
   return netIsNonBlock(fd)
 }
 
+// This connection's OWN generation, cached at `netPollDescOpen` time and
+// read (never re-fetched live) by every later wait on the same fd — see
+// that function's header for why a live `pdGen(fd)` read at wait time is
+// unsafe. 65536 is `pdCapacity` (`../../sched/polldesc.bit`) written as a
+// literal: a fixed-array length must be one (E0021), matching that file's
+// own `pdGenTable` for the identical reason. 65536 * 8 = 512KiB of `.bss`,
+// paid once at load, never resized.
+let netFdGen: [65536]i64
+
+@nosplit fn netFdGenAddr(fd: int): *i64 {
+  return ptrOf(netFdGen) + fd
+}
+
 // Register `fd` with the kernel poller ONCE, for its whole life (#5865) —
 // called right after the runtime makes a socket non-blocking (accept,
 // connect, listen; `netAcceptTcp`/`netSysSocket` are the two call sites). A
 // no-op when there is no current task or no poller bound: an unscheduled
 // caller's retry loops never park (`netAwaitReady`'s own `false` path), so
 // nothing needs a kernel registration to wake them.
+//
+// CACHES `gen` INTO `netFdGen`, AND THAT IS LOAD-BEARING, NOT A
+// CONVENIENCE. A wait that instead re-read `pdGen(fd)` live raced a
+// concurrent `netClose` on the SAME fd: `pdClose` bumps the generation
+// before it sweeps, so a wait whose `pdGen(fd)` read landed just after that
+// bump would claim the slot under the NEW generation with `pdWait` — a
+// legal CAS, since nothing else is contending at that instant — and then
+// park forever (or until its own long deadline) waiting for a kernel event
+// that will never come, because the fd this generation belongs to is
+// already closed. Caught empirically by
+// `_tests_/stress/netclosewhileparkeddarwin` at `BIT_WORKERS=8`: ~1-2 of 40
+// connections rode out the full deadline instead of waking on close, before
+// this cache replaced the live `pdGen(fd)` read in `netAwaitReady`/
+// `netAwaitReadyOrDeadline`. Reading the generation `pdOpen` mints HERE,
+// once, and never again, removes the window: a wait racing a close always
+// uses the generation that connection's `pdOpen` actually claimed, so
+// `pdWait`'s CAS fails with `pdStaleGen` the instant `pdClose` has run,
+// exactly the fast, correct outcome invariant 3 promises.
 @nosplit fn netPollDescOpen(fd: int) {
   let taskAddr = schedCurrentTask()
   if (taskAddr == 0) {
@@ -374,6 +405,7 @@ export @symbol("bit_rt_port_net_set_non_block") @nosplit fn netSetNonBlock(fd: i
     return
   }
   let gen = pdOpen(fd)
+  *netFdGenAddr(fd) = gen
   let _ = pollDescRegister(pollFd, fd, gen)
 }
 
@@ -502,7 +534,7 @@ export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(fd: int, interest
   if (interest == pollRead) {
     dir = pdDirRead
   }
-  let gen = pdGen(fd)
+  let gen = *netFdGenAddr(fd)
   if (!schedParkArm()) {
     return false
   }
