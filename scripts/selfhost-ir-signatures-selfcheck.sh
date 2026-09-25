@@ -396,6 +396,130 @@ field_set %0[16] = %6
     fail=1
   fi
 
+  # --- #5874: a fallible tuple `(A, B)!` returns its ok value in words ---
+  #
+  # Real pre-opt dump text from `_tests_/cases/run_tuple_fallible_words.bit`
+  # (`two`, this tree vs the pinned stage0): the err path returns one zero
+  # word per member where it returned one `const_nil`, and the ok path reads
+  # its words out of the box before the `err_set` clear.
+  oracle_fw_pre='bb1():
+  %4 = gc_alloc size=8 ptrs=[] Neg
+  field_set %4[0] = %0
+  %6 = rt_call err_set(%4) void
+  %7 = const_nil
+  ret %7
+bb2(%9: i64):
+  %15 = gc_alloc size=16 ptrs=[%8] (i64, string)
+  field_set %15[0] = %11
+  field_set %15[8] = %14
+  %18 = const_nil
+  %19 = rt_call err_set(%18) void
+  ret %15'
+  bit2_fw_pre='bb1():
+  %4 = gc_alloc size=8 ptrs=[] Neg
+  field_set %4[0] = %0
+  %6 = rt_call err_set(%4) void
+  %7 = const_int i64 0
+  %8 = const_nil
+  ret %7, %8
+bb2(%10: i64):
+  %16 = gc_alloc size=16 ptrs=[%8] (i64, string)
+  field_set %16[0] = %12
+  field_set %16[8] = %15
+  %19 = field_get %16[0] i64
+  %20 = field_get %16[8] string
+  %21 = const_nil
+  %22 = rt_call err_set(%21) void
+  ret %19, %20'
+
+  sigw1=$(explainMismatch "$oracle_fw_pre" "$bit2_fw_pre" ir)
+  rcw1=$?
+  if [ "$rcw1" -ne 0 ] || [ "$sigw1" != "5874-fallible-tuple-words" ]; then
+    echo "FAIL: the real #5874 pre-opt fallible-words delta was not explained (rc=$rcw1 sig='$sigw1')"
+    fail=1
+  fi
+
+  # Real post-opt dump text, same file (`three`, `(f64, bool, string)!`): the
+  # box is gone and the err path carries a zero in each register class.
+  oracle_fw_opt='  %6 = rt_call err_set(%4) void
+  %7 = const_nil
+  ret %7
+bb2(%9: i64):
+  %18 = gc_alloc size=24 ptrs=[%16] (f64, bool, string)
+  field_set %18[0] = %12
+  field_set %18[8] = %14
+  field_set %18[16] = %17
+  %22 = const_nil
+  %23 = rt_call err_set(%22) void
+  ret %18'
+  bit2_fw_opt='  %6 = rt_call err_set(%4) void
+  %7 = const_float f64 0
+  %8 = const_bool false
+  %9 = const_nil
+  ret %7, %8, %9
+bb2(%11: i64):
+  %20 = const_nil
+  %21 = rt_call err_set(%20) void
+  ret %14, %16, %19'
+
+  sigw2=$(explainMismatch "$oracle_fw_opt" "$bit2_fw_opt" iropt)
+  rcw2=$?
+  if [ "$rcw2" -ne 0 ] || [ "$sigw2" != "5874-fallible-tuple-words" ]; then
+    echo "FAIL: the real #5874 post-opt fallible-words delta was not explained (rc=$rcw2 sig='$sigw2')"
+    fail=1
+  fi
+
+  # REJECTION: an err path that LOST its ok value instead of widening it --
+  # `ret` with no zero constant at all, so the constants net-fall. Pre-opt the
+  # anchor is that every widened site ADDS (W - 1) constants.
+  bit2_fw_lost='bb1():
+  %4 = gc_alloc size=8 ptrs=[] Neg
+  field_set %4[0] = %0
+  %6 = rt_call err_set(%4) void
+  ret
+bb2(%10: i64):
+  %16 = gc_alloc size=16 ptrs=[%8] (i64, string)
+  field_set %16[0] = %12
+  field_set %16[8] = %15
+  %19 = field_get %16[0] i64
+  %20 = field_get %16[8] string
+  %21 = const_nil
+  %22 = rt_call err_set(%21) void
+  ret %19, %20'
+  sigw3=$(explainMismatch "$oracle_fw_pre" "$bit2_fw_lost" ir)
+  rcw3=$?
+  if [ "$rcw3" -eq 0 ] || [ -n "$sigw3" ]; then
+    echo "FAIL: a #5874 delta whose err path lost its ok value was wrongly explained (rc=$rcw3 sig='$sigw3')"
+    fail=1
+  fi
+
+  # REJECTION: the post-opt delta with a `field_get` that RISES -- a box read
+  # the optimizer failed to forward is not this transform. The `call_word`
+  # run keeps `call_word - field_get - gc_alloc` positive, so only the sign
+  # rule can reject it.
+  bit2_fw_bad_get="$bit2_fw_opt
+%41 = call_word %40[1] bool
+%42 = call_word %40[2] string
+%50 = field_get %18[0] f64"
+  sigw4=$(explainMismatch "$oracle_fw_opt" "$bit2_fw_bad_get" iropt)
+  rcw4=$?
+  if [ "$rcw4" -eq 0 ] || [ -n "$sigw4" ]; then
+    echo "FAIL: a #5874 post-opt delta with a field_get that rises was wrongly explained (rc=$rcw4 sig='$sigw4')"
+    fail=1
+  fi
+
+  # REJECTION: an unrelated opcode riding along an otherwise-genuine #5874
+  # delta must still fail -- the closed-set requirement every signature here
+  # carries.
+  bit2_fw_plus="$bit2_fw_pre
+%99 = xor i64 %19, %20"
+  sigw5=$(explainMismatch "$oracle_fw_pre" "$bit2_fw_plus" ir)
+  rcw5=$?
+  if [ "$rcw5" -eq 0 ] || [ -n "$sigw5" ]; then
+    echo "FAIL: a #5874 delta carrying an unrelated opcode was wrongly explained (rc=$rcw5 sig='$sigw5')"
+    fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever

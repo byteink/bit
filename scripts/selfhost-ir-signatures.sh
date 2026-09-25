@@ -445,6 +445,65 @@ explainMismatch() {
         exit 0
       }
 
+      # --- #5874: a fallible tuple `(A, B)!` returns its ok value in words ---
+      #
+      # `declPlainResultType` (compiler/lowerexplode.bit) admits a Fallible
+      # result whose ok type is a word tuple, so its call sites gain the
+      # `call_word` run and a rebuilt box, the `?`/`catch` joins read the words
+      # before `err_get` and rebuild the box past it (`field_get` + `gc_alloc`,
+      # compiler/lowerfail.bit), and each err-path `ret` returns one zero
+      # constant per WORD (`fallibleZeroArgs`) where it returned one
+      # `const_nil`. Changes the IR of six files against the pinned
+      # (pre-#5874) stage0: four newly red (one is this ticket case),
+      # stdlib/csv/csv.bit, which gained a `const_int` and so left
+      # `5871-tuple-word-explode`, and run_multiword_return.bit, already red
+      # (below). Derived from real dumps of all six (this tree at 7597162c1,
+      # oracle stage0.sh):
+      #
+      #   file                        pre-opt delta
+      #   run_fallible_zero_ret.bit   gc_alloc +22 call_word +24 field_get +69 const_int +5 const_bool +5
+      #   run_tuple_fallible_words    gc_alloc +23 call_word +15 field_get +55 const_int +2 const_bool +2 const_float +2
+      #   wsclientmask.bit            gc_alloc +2  call_word +2  field_get +6  const_int +5 const_bool +5
+      #   wsframing.bit               gc_alloc +26 call_word +20 field_get +38 const_int +6 const_bool +4
+      #   stdlib/csv/csv.bit          gc_alloc +3  call_word +2  field_get +16 const_int +1
+      #   run_multiword_return.bit    (the #5874 part) gc_alloc +2 call_word +1 field_get +4
+      #                               const_int +2 const_nil -1; see below for the rest
+      #
+      # The anchor is the err path, which only #5874 touches: a site that
+      # returned one `const_nil` now returns W >= 2 zero constants, so pre-opt
+      # the four constant opcodes rise by (W - 1) per site, strictly, and only
+      # `const_nil` may fall (a tuple with no reference word). The box traffic
+      # moves with the #5871 signs -- pre-opt only up, post-opt `field_get` and
+      # `gc_alloc` only down -- because it is the same mechanism reached
+      # through `?`/`catch`. Post-opt, CSE merges zero constants into ones the
+      # function already had (`ret %1, %7` in `two` reuses its `const_int 0`),
+      # so their magnitude is unconstrained there; at least one must move, or
+      # the delta has the #5871 shape and that signature, checked first, owns it.
+      #
+      # run_multiword_return.bit is NOT explained by this: its `eight` returns
+      # 8 int words, which the stage0 oracle passed in registers and the #5870
+      # 5-word budget (d93a3d1e7) boxes again (call_word -7), a mismatch main
+      # already carried before #5874 with no signature of its own.
+      okFallibleWords = 1
+      split("call_word field_get gc_alloc const_int const_bool const_float const_nil", fwlist, " ")
+      for (i in fwlist) fwok[fwlist[i]] = 1
+      for (op in moved) { if (!(op in fwok)) okFallibleWords = 0 }
+      zeroMoved = ("const_int" in moved) || ("const_bool" in moved) || ("const_float" in moved) || ("const_nil" in moved)
+      if (!zeroMoved) okFallibleWords = 0
+      if (delta["call_word"] < 0) okFallibleWords = 0
+      if (kind == "ir") {
+        if (delta["field_get"] < 0 || delta["gc_alloc"] < 0) okFallibleWords = 0
+        if (delta["const_int"] < 0 || delta["const_bool"] < 0 || delta["const_float"] < 0) okFallibleWords = 0
+        if (delta["const_int"] + delta["const_bool"] + delta["const_float"] + delta["const_nil"] <= 0) okFallibleWords = 0
+      } else {
+        if (delta["field_get"] > 0 || delta["gc_alloc"] > 0) okFallibleWords = 0
+        if (delta["call_word"] - delta["field_get"] - delta["gc_alloc"] <= 0) okFallibleWords = 0
+      }
+      if (okFallibleWords) {
+        print "5874-fallible-tuple-words"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -477,7 +536,9 @@ explainMismatch() {
 # `5871-tuple-word-explode-branch-fold` is gated `kind != "ir"` inside
 # explainMismatch, so it can only ever fire under `iropt` and is listed only
 # there. `5876-field-store-declared-type-convert` fires under both kinds like
-# `5871-tuple-word-explode` (no `kind` branch of its own). `ast` and `fmt` are
+# `5871-tuple-word-explode` (no `kind` branch of its own), and so does
+# `5874-fallible-tuple-words` (its `kind` branch picks signs, not whether it
+# runs). `ast` and `fmt` are
 # a different, disjoint kind space entirely -- #5474's two signatures never
 # fire under `ir`/`iropt` and vice versa, so they are returned only for their
 # own exact kind.
@@ -486,12 +547,12 @@ declaredSignatureNames() {
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
-    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert"; return ;;
-    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert"; return ;;
+    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words"; return ;;
+    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
     "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
-    "5876-field-store-declared-type-convert"
+    "5876-field-store-declared-type-convert" "5874-fallible-tuple-words"
 }
 
