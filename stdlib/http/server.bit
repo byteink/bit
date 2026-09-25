@@ -258,29 +258,36 @@ const maxAcceptBackoffNs = 1000 * Millisecond
 // closed out from under this loop (`Server.close()`/`drainServer`,
 // shutdown.bit:302/315). False means the failure is transient (most often
 // the fd limit): it is dropped, the current backoff is slept and doubled —
-// capped at `maxAcceptBackoffNs` — for the next consecutive failure, and the
+// capped at `maxBackoffNs` — for the next consecutive failure, and the
 // loop retries. A successful accept resets the backoff to
 // `initialAcceptBackoffNs`. `serveTlsOn`'s bare `TlsListener` carries no
 // "was this closed" signal of its own (unlike `Server`), so it passes
-// `() => false` — every accept error there backs off and retries, never
-// ending the loop, the same "one bad connection can never take down the
-// server" contract `serveTlsOn`'s own doc comment already documents, now
-// without the fd-limit hot-spin. One backoff duration this covers is a
-// rejected TLS handshake (RFC 7301 §3.2 ALPN mismatch, etc.): `TlsListener.
-// accept()` (std/tls) runs the handshake inline, so this loop cannot tell
-// that apart from a transient accept failure without a std/tls change; it
-// gets the same brief backoff rather than an immediate retry.
-fn acceptLoop<C>(accept: () => C!, closed: () => bool, onAccept: (C) => ()): ()! {
+// `() => false` — every accept error there is dropped and retried, never
+// ending the loop. It also passes `maxBackoffNs = 0`, so it retries at once
+// and never sleeps: `TlsListener.accept()` (std/tls) runs the handshake
+// inline, so a failure here is usually one client's rejected handshake
+// (RFC 7301 §3.2 ALPN mismatch, etc.), which this loop cannot tell apart from
+// the fd limit. A backoff would let any client stall every other client's
+// accept by sending bad handshakes. #5916 moves the handshake out of accept,
+// after which TLS gets the same backoff as plain HTTP.
+fn acceptLoop<C>(
+  accept: () => C!,
+  closed: () => bool,
+  maxBackoffNs: int,
+  onAccept: (C) => (),
+): ()! {
   let backoffNs = initialAcceptBackoffNs
   while (true) {
     let c = accept() catch e {
       if (closed()) {
         fail e
       }
-      sleep(backoffNs)
-      backoffNs = backoffNs * 2
-      if (backoffNs > maxAcceptBackoffNs) {
-        backoffNs = maxAcceptBackoffNs
+      if (maxBackoffNs > 0) {
+        sleep(backoffNs)
+        backoffNs = backoffNs * 2
+        if (backoffNs > maxBackoffNs) {
+          backoffNs = maxBackoffNs
+        }
       }
       continue
     }
@@ -320,9 +327,14 @@ export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
     altPort = 0, maxBody = s.maxBody,
     idleTimeoutNs = s.idleTimeoutNs, maxRequests = s.maxRequests,
   }
-  acceptLoop(() => s.listener.accept(), () => s.closed || drainStarted(s.drain), (c) => {
-    spawn serveOne(netStream{ conn = c }, handler, opts, s.drain)
-  })?
+  acceptLoop(
+    () => s.listener.accept(),
+    () => s.closed || drainStarted(s.drain),
+    maxAcceptBackoffNs,
+    (c) => {
+      spawn serveOne(netStream{ conn = c }, handler, opts, s.drain)
+    },
+  )?
 }
 
 // Bind `host:port` and serve HTTP forever, dispatching every request to
@@ -487,9 +499,9 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
   // attempt, never the listener: propagating it would let one malformed
   // client, or a passing burst of EMFILE, take down the whole server.
   // `acceptLoop`'s `closed` is `() => false` here — see this function's own
-  // doc comment for why — so this never returns; it only backs off between
-  // consecutive failures and retries.
-  acceptLoop(() => l.accept(), () => false, (conn) => {
+  // doc comment for why — so this never returns. It never sleeps either
+  // (`maxBackoffNs = 0`, see `acceptLoop`'s header for why).
+  acceptLoop(() => l.accept(), () => false, 0, (conn) => {
     spawn serveTlsConn(conn, handler, opts, d)
   })?
 }
