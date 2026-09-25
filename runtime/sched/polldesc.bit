@@ -137,6 +137,20 @@ let pdGenTable: [65536]i64
 let pdRSlot: [65536]i64
 let pdWSlot: [65536]i64
 
+// #5886: the per-fd in-flight reference count, Go-style (`poll.FD`'s
+// `fdMutex`) -- kept BESIDE `pdRSlot`/`pdWSlot` rather than folded into their
+// packed layout, per that ticket's constraint. `pdRefWord[fd]` packs one
+// `closing` bit above an in-flight count -- see the constants below. It
+// carries NO generation: `pdOpen` never resets the count, it only clears
+// `closing`, so a straggler's increment and its undo always land on the same
+// count (see `pdFdAcquire`), and staleness is read from `pdGenTable`, which
+// `pdClose` and `pdOpen` both advance. This is what makes `netClose` (runtime/net/{darwin,linux}/sock.bit)
+// safe to call while a read/write/accept is still parked or mid-retry on the
+// same fd: the real `close(2)` is deferred to whichever caller's release
+// finds the count at zero, so the fd NUMBER is never handed back to the
+// kernel while an old op could still retry a syscall on it.
+let pdRefWord: [65536]i64
+
 // Packed slot word layout: `pdTaskBits` low bits for state, `pdGenBits` high
 // bits for generation -- see the header's "packed slot word" section for the
 // width reasoning. `pdReady` is the low field's all-ones value, distinct from
@@ -208,6 +222,27 @@ const pdWakeRetry: int = 0 - 1
   return (word >> pdTaskBits) & (pdGenLimit - 1)
 }
 
+// `pdRefWord`'s packed layout (#5886): `pdRefCountBits` low bits for the
+// in-flight count, one bit above that for `closing`. 44 count bits is far past any realistic number of concurrent
+// in-flight ops on one fd (a Bit process is bounded by its own worker/task
+// count long before that), so a plain `+1`/`-1` on the packed word is safe:
+// it can never carry into the `closing` bit.
+const pdRefCountBits: int = 44
+const pdRefCountMask: int = (1 << pdRefCountBits) - 1
+const pdRefClosingBit: int = 1 << pdRefCountBits
+
+@nosplit fn pdRefAddr(fd: int): *i64 {
+  return ptrOf(pdRefWord) + fd
+}
+
+@nosplit fn pdRefClosingOf(word: int): bool {
+  return (word & pdRefClosingBit) != 0
+}
+
+@nosplit fn pdRefCountOf(word: int): int {
+  return word & pdRefCountMask
+}
+
 // Unconditionally transition `slot` to `(targetGenTag, pdEmpty)` and report
 // whatever task id it displaced (`pdEmpty` for none, whether the slot was
 // truly empty or only held an unclaimed ready edge). Used by `pdOpen` and
@@ -245,6 +280,8 @@ export @symbol("bit_rt_port_sched_polldesc_open") @nosplit fn pdOpen(fd: int): i
   let genTag = pdGenTag(g)
   let _ = pdSweep(pdSlotAddr(fd, pdDirRead), genTag)
   let _ = pdSweep(pdSlotAddr(fd, pdDirWrite), genTag)
+  // Clear `closing` only; the count stays exact (see `pdRefWord`'s header).
+  let _ = atomicAnd(pdRefAddr(fd), ~pdRefClosingBit)
   return g
 }
 
@@ -432,4 +469,125 @@ export @symbol("bit_rt_port_sched_polldesc_close") @nosplit fn pdClose(
     *outW = w
   }
   return g
+}
+
+// #5886: per-fd in-flight reference counting, Go-style (`poll.FD`'s
+// `fdMutex`) -- the mechanism that makes a real `close(2)` wait for every
+// acquired op to leave before the fd NUMBER is handed back to the kernel.
+// `net/{darwin,linux}/sock.bit`'s `netFdAcquire`/`netFdRelease` are the thin,
+// per-platform wrappers that also run the actual `close(2)` on the last
+// release; everything below is the OS-neutral CAS protocol they share.
+
+// Every transition below is built from unconditional atomic adds and ors,
+// never a CAS retry loop: a bounded CAS loop that runs out of retries under
+// contention would turn a busy fd into a spurious refusal (acquire), a
+// leaked fd (release), or a close that never runs (mark-closing). An add
+// cannot lose a race, so none of the three can fail for any reason but the
+// fd's own state.
+
+// `pdFdMarkClosing`'s three outcomes.
+export const pdFdCloseNow: int = 0      // a second, concurrent close(fd) found it was the last ref out: close(2) now, no unregister needed (the first caller already did it).
+export const pdFdCloseDeferred: int = 1 // you are the first closer: run unregister/pdClose, then release your own ref and close(2) only if that release says you were last.
+export const pdFdCloseAlready: int = 2  // another caller is already closing this fd and neither of you was last; nothing more to do.
+
+// `pdFdAcquire`'s three outcomes.
+export const pdFdAcquired: int = 0    // one ref taken; release it on every exit.
+export const pdFdRefused: int = 1     // closing, or `gen` is stale; no ref held.
+export const pdFdRefusedLast: int = 2 // refused, AND this caller must run close(2).
+
+// Acquire one in-flight ref on `fd`, valid only for `gen` (the value the
+// caller's own `pdOpen`/cached-generation read produced -- see
+// `net/darwin/sock.bit`'s `netFdGen` for why it must be read ONCE, at the
+// op's entry, never again inside its retry loop). Refused when `gen` is stale
+// (the fd was closed and reused since) or `closing` is already set; either
+// way nothing this op does with `fd` from here on may reach a syscall.
+//
+// The increment happens first, then `closing` (from the same add) and the
+// fd's live generation are checked; a refusal undoes the increment through
+// `pdFdRelease`. A `pdFdMarkClosing` that ran between the two counted this
+// caller as in flight and deferred the close to it, so the undo can be the
+// last reference out: that is `pdFdRefusedLast`, and the caller owes the real
+// `close(2)` exactly as a normal last release does. `pdClose` advances the
+// generation before `close(2)` can run, so a close anywhere after the add is
+// seen here as a stale `gen`.
+export @symbol("bit_rt_port_sched_polldesc_fd_acquire") @nosplit fn pdFdAcquire(
+  fd: int,
+  gen: int,
+): int {
+  if (!pdValidFd(fd)) {
+    return pdFdRefused
+  }
+  let old = atomicAdd(pdRefAddr(fd), 1)
+  if (!pdRefClosingOf(old) && atomicLoad(pdGenAddr(fd)) == gen) {
+    return pdFdAcquired
+  }
+  if (pdFdRelease(fd)) {
+    return pdFdRefusedLast
+  }
+  return pdFdRefused
+}
+
+// Release one in-flight ref on `fd`, taken by `pdFdAcquire` (including its
+// own undo). Returns true only when THIS call's decrement took the count to
+// zero while `closing` was set -- the caller, and only that caller, must then
+// run the real `close(2)`. The protocol never releases a ref it did not take,
+// so the count cannot underflow.
+export @symbol("bit_rt_port_sched_polldesc_fd_release") @nosplit fn pdFdRelease(fd: int): bool {
+  if (!pdValidFd(fd)) {
+    return false
+  }
+  let old = atomicAdd(pdRefAddr(fd), 0 - 1)
+  return pdRefClosingOf(old) && pdRefCountOf(old) == 1
+}
+
+// The netClose half of the protocol: set `closing` on `fd` (idempotent --
+// a second close on an already-closing fd is `pdFdCloseAlready`, a no-op).
+// The caller still runs `pollDescUnregister`/`pdClose` to wake any parked
+// waiter exactly as before; the return value decides whether `close(2)` runs
+// now, is left for the caller's own later release, or is someone else's job.
+//
+// The closer takes its OWN ref (`atomicAdd`) BEFORE the `atomicOr` that makes
+// `closing` visible to anyone else, and only releases it (via `pdFdRelease`,
+// after the caller has run `pollDescUnregister`/`pdClose`) at the very end of
+// `netClose`. Ordering the add before the or matters: if `closing` became
+// visible first, a straggling `pdFdAcquire` could add its own transient ref,
+// see `closing`, and undo -- and because the closer had not yet added its
+// ref, that straggler's undo could be the decrement that finds the count at
+// zero, so the straggler (not the closer) would call `close(2)` immediately,
+// racing the closer's own still-in-flight `pollDescUnregister`/`pdClose` and
+// double-closing the fd. Holding the closer's own ref for the whole decision
+// window makes it impossible for the count to reach zero before the closer's
+// own release, so "last out" always has exactly one caller: either the
+// closer itself (the common case, `pdFdCloseDeferred` -> `pdFdRelease`), or,
+// for a truly concurrent second `netClose(fd)` (defensive only --
+// `Conn.close`/`Listener.close` already guard the real double-close one layer
+// up), that second caller's own add+release pair, reported as `pdFdCloseNow`
+// so it runs `close(2)` without repeating `pollDescUnregister`/`pdClose`.
+export @symbol("bit_rt_port_sched_polldesc_fd_mark_closing") @nosplit fn pdFdMarkClosing(
+  fd: int,
+): int {
+  if (!pdValidFd(fd)) {
+    return pdFdCloseAlready
+  }
+  let _ = atomicAdd(pdRefAddr(fd), 1)
+  let old = atomicOr(pdRefAddr(fd), pdRefClosingBit)
+  if (pdRefClosingOf(old)) {
+    if (pdFdRelease(fd)) {
+      return pdFdCloseNow
+    }
+    return pdFdCloseAlready
+  }
+  return pdFdCloseDeferred
+}
+
+// Whether `fd` is (or has started) closing -- the check every blocking loop
+// makes after each wake, in place of retrying its syscall: `true` means the
+// wake was (or could have been) a close, and the loop must return the
+// existing closed-fd error without touching the fd again. An out-of-range
+// `fd` answers `true` defensively -- there is nothing valid to retry.
+export @symbol("bit_rt_port_sched_polldesc_fd_closing") @nosplit fn pdFdClosing(fd: int): bool {
+  if (!pdValidFd(fd)) {
+    return true
+  }
+  return pdRefClosingOf(atomicLoad(pdRefAddr(fd)))
 }
