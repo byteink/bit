@@ -409,6 +409,42 @@ explainMismatch() {
         exit 0
       }
 
+      # --- #5876: a field store converted to its own declared type ---
+      #
+      # `fieldStoreValue` (compiler/lowertuple.bit, called from
+      # lowerclasslit.bit too) converts a value narrower than the field it is
+      # stored into, and `fieldSetRhsTarget` (compiler/optfold.bit) stops the
+      # widening-alias fold (`convertAliasesSource`, optfoldconvert.bit) from
+      # retyping that stored value back to its narrow producer -- see the
+      # repro in `_tests_/cases/run_tuple_narrow_boxed_convert.bit`.
+      # Reddened 8 files against the pinned (pre-#5876) stage0, `iropt` only
+      # (a plain runtime-derived producer keeps its `convert`, unmoved, at
+      # `ir`; `untyped_const_expr_narrow.bit` stores a compile-time constant,
+      # so that convert folds straight to a materialized `const_int` once
+      # optimization runs -- verified against its own real dump, not
+      # assumed): `convert` and/or `const_int` only ever RISE (never both
+      # zero) and `field_get` only ever FALLS or holds -- one site
+      # (`convert_widen_alias.bit`, `r.wide2 = int(hs[1])`) now has its own
+      # pre-existing type-mismatched store forwarded for the first time,
+      # dropping a `field_get` the oracle could never eliminate. Nothing
+      # else in the opcode set moves in any of the 8. A wrong extension
+      # direction (u8 sign-extended, i32 zero-extended) changes a VALUE, not
+      # an opcode count, so it cannot satisfy this signature by accident --
+      # the `.expected` file for `run_tuple_narrow_boxed_convert.bit` is what
+      # catches that.
+      okFieldStoreConvert = 1
+      for (op in moved) {
+        if (op != "convert" && op != "const_int" && op != "field_get") okFieldStoreConvert = 0
+      }
+      if (delta["convert"] < 0) okFieldStoreConvert = 0
+      if (delta["const_int"] < 0) okFieldStoreConvert = 0
+      if (delta["field_get"] > 0) okFieldStoreConvert = 0
+      if (delta["convert"] + delta["const_int"] <= 0) okFieldStoreConvert = 0
+      if (okFieldStoreConvert) {
+        print "5876-field-store-declared-type-convert"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -440,19 +476,22 @@ explainMismatch() {
 # core opcodes must move in, not whether the check runs at all);
 # `5871-tuple-word-explode-branch-fold` is gated `kind != "ir"` inside
 # explainMismatch, so it can only ever fire under `iropt` and is listed only
-# there. `ast` and `fmt` are a different, disjoint kind space entirely --
-# #5474's two signatures never fire under `ir`/`iropt` and vice versa, so
-# they are returned only for their own exact kind.
+# there. `5876-field-store-declared-type-convert` fires under both kinds like
+# `5871-tuple-word-explode` (no `kind` branch of its own). `ast` and `fmt` are
+# a different, disjoint kind space entirely -- #5474's two signatures never
+# fire under `ir`/`iropt` and vice versa, so they are returned only for their
+# own exact kind.
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
-    ir) printf '%s\n' "5871-tuple-word-explode"; return ;;
-    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold"; return ;;
+    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert"; return ;;
+    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
-    "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold"
+    "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
+    "5876-field-store-declared-type-convert"
 }
 
