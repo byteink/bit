@@ -312,6 +312,42 @@ explainMismatch() {
       }
       return 1
     }
+    # scanOracleMapStrKeys (#5906) -- counts, from the ORACLE text alone, the
+    # `map_get`/`map_slot` reads whose key is a `string` box the function
+    # built: MSg/MSs sites in all, MSq of them keyed through the join param
+    # of a #4628 reuse diamond (`bbN(%k: string):`, entered by a `jump`
+    # carrying such a box) rather than by the box itself. Per function, since
+    # value ids restart at every `func`.
+    function scanOracleMapStrKeys(   i, lo) {
+      MSg = 0; MSs = 0; MSq = 0; lo = 1
+      for (i = 1; i <= nA + 1; i++) {
+        if (i <= nA && substr(linesA[i], 1, 5) != "func ") continue
+        mapStrFn(lo, i)
+        lo = i
+      }
+    }
+    function mapStrFn(lo, hi,    i, s, t, p, box, dj, par) {
+      for (i = lo; i < hi; i++) {
+        s = linesA[i]
+        if (s !~ /^ *%[0-9]+ = gc_alloc .* string$/) continue
+        t = s; sub(/^ */, "", t); sub(/ .*/, "", t); box[t] = 1
+      }
+      for (i = lo; i < hi; i++) {
+        s = linesA[i]
+        if (s ~ /^ *jump bb[0-9]+\(%[0-9]+\)$/) {
+          t = s; sub(/^ *jump /, "", t); split(t, p, "("); sub(/\)$/, "", p[2])
+          if (p[2] in box) dj[p[1]] = 1
+        }
+        if (s ~ /^bb[0-9]+\(%[0-9]+: string\):$/) { split(s, p, "("); sub(/:.*/, "", p[2]); par[p[2]] = p[1] }
+      }
+      for (i = lo; i < hi; i++) {
+        if (!match(linesA[i], /= rt_call map_(get|slot)\(%[0-9]+, %[0-9]+\)/)) continue
+        s = substr(linesA[i], RSTART, RLENGTH); t = s; sub(/.*, /, "", t); sub(/\)$/, "", t)
+        if (!(t in box) && !((t in par) && (par[t] in dj))) continue
+        if (s ~ /map_get/) { MSg++ } else { MSs++ }
+        if (!(t in box)) MSq++
+      }
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -654,6 +690,36 @@ explainMismatch() {
         }
       }
 
+      # --- #5906: a map read keyed by a fresh `string` box passes its words ---
+      #
+      # `setMapKeyArgs` (compiler/lowermapaccess.bit) sends such a read to
+      # `map_get_str`/`map_slot_str` with the box `ptr`/`len` words. Pre-opt each
+      # site renames its call and reads the box back: `field_get` +3 per site.
+      # Post-opt the box dies (gc_alloc -1 per site), and a site the oracle
+      # keyed through a #4628 diamond also loses the diamond: field_get -2,
+      # icmp_eq -2, icmp_ne -1, const_nil -1, br -3. Measured exact on all
+      # four corpus files it reddens (this tree at 65e6265d4 vs stage0):
+      # run_map_str_key_words, run_map_string_key_align, run_map_swar_scan,
+      # examples/wordcount. Nothing else may move.
+      scanOracleMapStrKeys()
+      MSn = MSg + MSs
+      msw["rt_call:map_get"] = -MSg; msw["rt_call:map_get_str"] = MSg
+      msw["rt_call:map_slot"] = -MSs; msw["rt_call:map_slot_str"] = MSs
+      if (kind == "ir") {
+        msw["field_get"] = 3 * MSn
+      } else {
+        msw["gc_alloc"] = -MSn; msw["field_get"] = -2 * MSq; msw["icmp_eq"] = -2 * MSq
+        msw["icmp_ne"] = -MSq; msw["const_nil"] = -MSq; msw["br"] = -3 * MSq
+        # Composed with #5905 (run_map_commaok_miss_zero): each dropped miss
+        # zero object is one more `gc_alloc`, under the #5905 anchor.
+        msx = msw["gc_alloc"] - (delta["gc_alloc"] + 0)
+        if (msx > 0 && b["rt_call:map_val_at"] >= msx) msw["gc_alloc"] -= msx
+      }
+      okMapStr = (MSn > 0)
+      for (op in moved) { if (!(op in msw)) okMapStr = 0 }
+      for (op in msw) { if ((delta[op] + 0) != msw[op]) okMapStr = 0 }
+      if (okMapStr) { print "5906-map-str-key-words"; exit 0 }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -696,7 +762,9 @@ explainMismatch() {
 # stage0 closing (a repin past #5870, same as any other entry here).
 # `5895-bce-trivial-param` is gated `kind == "iropt"` (bounds-check
 # elimination is an optimizer pass) and is listed only there, as is
-# `5905-commaok-miss-zero-drop` (an optimizer pass too). `ast`
+# `5905-commaok-miss-zero-drop` (an optimizer pass too).
+# `5906-map-str-key-words` fires under both (`kind` picks the opcode table).
+# `ast`
 # and `fmt` are
 # a different, disjoint kind space entirely -- #5474's two signatures never
 # fire under `ir`/`iropt` and vice versa, so they are returned only for their
@@ -706,14 +774,14 @@ declaredSignatureNames() {
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
-    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
-    iropt) printf '%s\n' "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
+    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox" "5906-map-str-key-words"; return ;;
+    iropt) printf '%s\n' "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox" "5906-map-str-key-words"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
     "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" \
     "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
     "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" \
-    "5870-multiword-return-rebox"
+    "5870-multiword-return-rebox" "5906-map-str-key-words"
 }
 
