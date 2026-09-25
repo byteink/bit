@@ -8,14 +8,10 @@
 //
 // `runtime/sched/`'s `TimerQueue`: sleeping green threads waiting on a deadline.
 //
-// An UNSORTED intrusive list, kept deliberately
-// — `push` is O(1) and `expire` is one bounded pass. Sorting would only pay off
-// with many sleepers AND frequent expiry checks, and the check runs solely on a
-// worker's idle path, so the scan is cheaper than maintaining the order. The
-// The upgrade path is a 4-ary heap if a
-// program ever holds enough concurrent sleepers for the scan to show in a
-// profile. Porting the "better" structure would have been a behaviour change
-// dressed as an improvement.
+// An UNSORTED intrusive list, kept deliberately — `push` is O(1) and `expire`
+// is one bounded pass, skipped outright while nothing can be due (#5900).
+// Sorting would only pay off with many sleepers AND frequent expiry checks;
+// the upgrade path is a 4-ary heap if the scan ever shows in a profile.
 //
 // THIS SECTION HOLDS NO CLOCK, AND THAT IS THE SEAM. `expire` takes `now` as a
 // parameter exactly as `runtime/sched/`'s does; the caller reads the clock. A
@@ -44,14 +40,16 @@
 // That is the same race `runtime/sched/`'s hook exists to close, closed at the
 // consumer end rather than the producer end. It costs at most one idle cycle of
 // extra latency in a window that is a few instructions wide.
-// WHY THIS WAKES THE POLLER (#5744): only the sweeps below publish into
-// `schedNextDeadline`, so a timer armed after worker 0's last sweep is invisible
-// to the wait it is already inside. NOT `schedWakeIdle`: nothing became runnable.
+// WHY THIS WAKES THE POLLER (#5744): a timer armed after worker 0's last sweep
+// is invisible to the wait it is already inside. NOT `schedWakeIdle`: nothing
+// became runnable. It also lowers both published bounds under the lock
+// (`timerLowerBounds`, #5900), never raises them.
 export @nosplit @symbol("bit_rt_port_sched_timer_push") fn schedTimerPush(s: *i64, task: int) {
   let t = taskAt(task)
   spinAcquire(lockOf(s, scTimerLock))
   *(t + taskTimerNext) = *(s + scTimerHead)
   *(s + scTimerHead) = task
+  timerLowerBounds(s, *(t + taskDeadline))
   spinRelease(lockOf(s, scTimerLock))
   schedWakePoller(s)
 }
@@ -153,6 +151,46 @@ let schedNextDeadline: [2]i64
   return ptrOf(schedNextDeadline)
 }
 
+// THE TIMER FLOOR (#5900), per scheduler: no deadline on `s`'s list is below
+// it. Plain `<`, not the 0-means-none encoding: 0 is the most conservative
+// floor and `timerFloorNone` an empty list's. INVARIANT, at every release of
+// `scTimerLock`: floor <= every linked deadline. Both writers hold that lock —
+// `timerPartition` stores the exact minimum it keeps, `schedTimerPush` lowers
+// it — and a cancel only removes nodes (an early floor costs one walk). The
+// lock-free read in `schedTimerExpire` that sees `now < floor` is a pass that
+// would have found nothing due; a push racing it is ordered after the pass,
+// as a push just after `timerPartition` unlocks always was, and it wakes
+// worker 0 (`schedWakePoller`), whose next pass reads the lowered floor.
+// NOT `dlTasks`: that cell is process-global and a process may run several
+// schedulers (schedgrowdemanddarwin runs five), so one's partition would
+// overwrite it with its own minimum and hide another's due timer for good.
+const timerFloorNone: int = 9223372036854775807
+
+@nosplit fn timerFloorAddr(s: *i64): *i64 {
+  return schedWorkerAt(s, 0) + wkTimerFloor
+}
+
+// Lower-only, and stores only on a change: the common push (later than the
+// earliest) dirties no line every idle worker reads.
+@nosplit fn timerLowerPublished(deadline: int) {
+  let cur = atomicLoad(nextDeadlineAddr() + dlTasks)
+  let lower = earlierDeadline(cur, deadline)
+  if (lower != cur) {
+    atomicStore(nextDeadlineAddr() + dlTasks, lower)
+  }
+}
+
+// `schedTimerPush`'s half of the invariant, `scTimerLock` held. `dlTasks`
+// too: a skipped pass no longer republishes it, so a woken worker 0 would park
+// on a bound older than this deadline (#5843's 1s ceiling with a timer due).
+@nosplit fn timerLowerBounds(s: *i64, deadline: int) {
+  let f = timerFloorAddr(s)
+  if (deadline < atomicLoad(f)) {
+    atomicStore(f, deadline)
+  }
+  timerLowerPublished(deadline)
+}
+
 // The earlier of two deadlines under the "0 means none" encoding, which plain
 // `min` gets wrong in exactly the case that matters (one queue empty).
 @nosplit fn earlierDeadline(a: int, b: int): int {
@@ -217,6 +255,7 @@ export @nosplit @symbol("bit_rt_port_sched_park_bound_ns") fn schedParkBoundNs(
   let due = 0
   let keep = 0
   let earliest = 0
+  let floor = timerFloorNone
   let it = *(s + scTimerHead)
   let n = 0
   while (it != 0 && n < schedMaxRegistered) {
@@ -231,11 +270,15 @@ export @nosplit @symbol("bit_rt_port_sched_park_bound_ns") fn schedParkBoundNs(
       *(t + taskTimerNext) = keep
       keep = it
       earliest = earlierDeadline(earliest, deadline)
+      if (deadline < floor) {
+        floor = deadline
+      }
     }
     it = next
   }
   *(s + scTimerHead) = keep
   atomicStore(nextDeadlineAddr() + dlTasks, earliest)
+  atomicStore(timerFloorAddr(s), floor)
   spinRelease(lockOf(s, scTimerLock))
   return due
 }
@@ -274,9 +317,13 @@ export @nosplit @symbol("bit_rt_port_sched_timer_still_pending") fn schedTimerSt
 //
 // A task whose deadline has passed but which has not yet reached `taskParked`
 // goes back on the list rather than being dropped or spun on; see
-// `schedTimerPush`'s ordering contract for why that case exists at all. Such a
-// task is due, not future, so it never contributes to the published deadline —
-// the worker retries it on its next idle turn exactly as it always has.
+// `schedTimerPush`'s ordering contract for why that case exists at all. The
+// re-push lowers the floor to that past deadline, so the next pass walks and
+// retries it; `dlTasks` drops to it too, which only shortens a park.
+//
+// THE SKIP (#5900): `now` below the floor means nothing linked is due (see
+// `timerFloorAddr`), so no lock and no walk. It still lowers `dlTasks` to the
+// floor, which another scheduler's partition may have overwritten since.
 //
 // Both walks are bounded by `schedMaxRegistered` (Power of 10) — the same
 // runaway backstop the registry walk uses, for the same reason: a corrupted link
@@ -304,6 +351,13 @@ export @nosplit @symbol("bit_rt_port_sched_timer_expire") fn schedTimerExpire(
   s: *i64,
   now: int,
 ): int {
+  let floor = atomicLoad(timerFloorAddr(s))
+  if (now < floor) {
+    if (floor != timerFloorNone) {
+      timerLowerPublished(floor)
+    }
+    return 0
+  }
   let due = timerPartition(s, now)
   let woken = 0
   let m = 0
@@ -500,14 +554,6 @@ export @nosplit @symbol("bit_rt_port_sched_timer_chan_count") fn schedTimerChanC
   return high
 }
 
-// `runtime/sched/timer.bit`'s half of #2665: inserts a queue entry that, at
-// expiry, does a non-blocking send of `true` on `c` (dropped if `c` is full —
-// see `chanTrySendDrop`'s header, `runtime/chan/chanops.bit`). If `periodNs`
-// is positive the entry re-arms itself at `deadline + periodNs` on every
-// expiry instead of being freed (`schedTimerChanExpire` below); a
-// non-positive `periodNs` fires once and frees its slot. Returns a timer id
-// greater than 0, or 0 if the pool is exhausted (`ctCap` slots all pending).
-//
 // MUST BE CALLED WITH `chanTimerLockAddr()` HELD, by any caller that just
 // published a new-or-moved deadline into the pool (#5845): lowers `dlChans`
 // to the earlier of its current value and `deadlineNs` (`earlierDeadline`,
