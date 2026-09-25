@@ -3355,7 +3355,8 @@ Every declared binding without an initializer is deterministically zero-valued:
 
 Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
-closed channel (§16.2), and the ok-value of a failed fallible call (§18.2).
+closed channel (§16.2), a failed type assertion (§14.4), and the ok-value of a
+failed fallible call (§18.2).
 This is why a field default (§10.5) belongs to the zero value rather than to the
 composite-literal form: `Opts{}` and `[]Opts(1)[0]` name the same value, and a
 default honoured by only one of them would make a field declared once mean two
@@ -3802,11 +3803,12 @@ assignment (like the map/channel two-result forms).
 - A target that cannot satisfy the receiver's interface is a **compile-time
   error**: the assertion could never succeed, so it is rejected rather than left
   to report `false` forever.
-- On a mismatch the two-result form yields `(nil, false)` - `nil`, not the
-  un-narrowed receiver. The value is typed as the target, so returning the
-  receiver would let a caller that ignores `ok` read one concrete type as
-  another. This is the same reason `ok` guards a reference-element channel
-  receive (§16.2).
+- On a mismatch the two-result form yields the target type's **zero value**
+  (§13.4) - a live instance for a class or a boxed enum, never `nil` - and
+  never the un-narrowed receiver. The value is typed as the target, so
+  returning the receiver would let a caller that ignores `ok` read one
+  concrete type as another. This is the same reason `ok` guards a
+  reference-element channel receive (§16.2).
 
 ### 14.5 Constants and Untyped Literals
 
