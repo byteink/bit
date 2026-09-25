@@ -720,6 +720,22 @@ explainMismatch() {
       for (op in msw) { if ((delta[op] + 0) != msw[op]) okMapStr = 0 }
       if (okMapStr) { print "5906-map-str-key-words"; exit 0 }
 
+      # --- #5910: closed-channel recv / failed type assertion builds the
+      # live zero (§13.4) --- one icmp_ne+br+const_nil per site (`jump`
+      # scores as nothing), N > 0; gc_alloc by N pre-opt, 0 < gc_alloc <= N
+      # post-opt (DCE drops an unread zero); tuple/enum adds const_int/
+      # bool/float. Composed with #5906 (`msw`) and #5905 (a now-live stored
+      # value can flip `nullCommaOkMisses` elsewhere, each extra `br` backed
+      # by its own `map_val_at`), the way #5906 composes with #5905 above.
+      for (op in moved) { res5910[op] = delta[op] }
+      for (op in msw) { res5910[op] -= msw[op]; if (res5910[op] == 0) delete res5910[op] }
+      n5910 = res5910["icmp_ne"] + 0; ga5910 = res5910["gc_alloc"] + 0
+      brx5910 = (res5910["br"] + 0) - n5910
+      ok5910 = (n5910 > 0) && (brx5910 >= 0) && (brx5910 <= (b["rt_call:map_val_at"]+0)) && (res5910["const_nil"]+0 == n5910) && (ga5910 > 0) && (ga5910 <= n5910)
+      delete res5910["br"]; split("icmp_ne const_nil gc_alloc const_int const_bool const_float", allow5910, " ")
+      for (i in allow5910) { allowed5910[allow5910[i]] = 1 }; for (op in res5910) { if (!(op in allowed5910)) ok5910 = 0 }
+      if (ok5910) { print "5910-chan-typeassert-live-zero"; exit 0 }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -760,28 +776,25 @@ explainMismatch() {
 # also goes through #5874's own words convention), so it is not gated on
 # `checked` disappearing, only on `eight`'s divergence from the pinned
 # stage0 closing (a repin past #5870, same as any other entry here).
-# `5895-bce-trivial-param` is gated `kind == "iropt"` (bounds-check
-# elimination is an optimizer pass) and is listed only there, as is
-# `5905-commaok-miss-zero-drop` (an optimizer pass too).
-# `5906-map-str-key-words` fires under both (`kind` picks the opcode table).
-# `ast`
-# and `fmt` are
-# a different, disjoint kind space entirely -- #5474's two signatures never
-# fire under `ir`/`iropt` and vice versa, so they are returned only for their
-# own exact kind.
+# `5895-bce-trivial-param` is gated `kind == "iropt"` (an optimizer pass) and
+# listed only there, as is `5905-commaok-miss-zero-drop`. `5906-map-str-key-
+# words` and `5910-chan-typeassert-live-zero` (no `kind` branch of its own)
+# both fire under both kinds. `ast`/`fmt` are a different, disjoint kind space
+# -- #5474's two signatures never fire under `ir`/`iropt` and vice versa, so
+# they are returned only for their own exact kind.
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
-    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox" "5906-map-str-key-words"; return ;;
-    iropt) printf '%s\n' "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox" "5906-map-str-key-words"; return ;;
+    ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox" "5906-map-str-key-words" "5910-chan-typeassert-live-zero"; return ;;
+    iropt) printf '%s\n' "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox" "5906-map-str-key-words" "5910-chan-typeassert-live-zero"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
     "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" \
     "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
     "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" \
-    "5870-multiword-return-rebox" "5906-map-str-key-words"
+    "5870-multiword-return-rebox" "5906-map-str-key-words" "5910-chan-typeassert-live-zero"
 }
 
