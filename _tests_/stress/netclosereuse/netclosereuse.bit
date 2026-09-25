@@ -1,0 +1,223 @@
+// #5886: proves a parked op woken by close() never retries on an fd number a
+// NEW socket has since taken over. Triaged on main 153e1f713: `netClose`
+// (`runtime/net/{darwin,linux}/sock.bit`) wakes a parked accept/read/write via
+// `pdClose` and then releases the fd number immediately; the woken task
+// resumes its retry loop on the fd NUMBER, which the kernel may already have
+// handed to a new socket (this program's own next `listen()`). Both platforms,
+// no host marker.
+//
+// PART 1 (accept side): each round opens listener `l1`, spawns an acceptor
+// parked in `l1.accept()`, closes `l1`, and immediately opens a second
+// listener `l2` — the freed fd number is the lowest free one, so the kernel
+// very likely hands it straight back. A client then dials `l2` and writes
+// this round's id as a tag. The CORRECT outcome: `l1`'s acceptor sees an
+// error (closed), never a connection, and `l2`'s own acceptor reads back its
+// own round id. Before the fix, `l1`'s acceptor's retry loop can legally park
+// on `l2`'s slot (it re-reads the fd's CURRENT generation each iteration) and
+// steal the connection meant for `l2`'s own acceptor — recorded here as
+// `staleAcceptOk` (the old acceptor got ANY connection at all, which should
+// never happen since nothing ever dials `l1`) and, when `l2`'s own acceptor
+// then times out waiting for a connection that was stolen, as `hung`.
+//
+// PART 2 (read side): a reader is parked in `c.read()` on a connection `c1`;
+// a second task closes `c1` (waking the parked read); a NEW connection `c2` is
+// dialed immediately after (reusing `c1`'s freed fd) and its peer writes a
+// distinct tag. The correct outcome: the parked reader on `c1` returns an
+// error or an empty read, never `c2`'s tag — recorded as `crossRead` if it
+// does.
+//
+// BOTH PHASES ARE BOUNDED: neither a stolen accept nor a parked read can block
+// this program forever — every round polls a bounded number of times
+// (`pollIters`) before giving up and counting the round as `hung`, so the
+// whole run is provably bounded (Power of 10) even against the un-fixed
+// behaviour, which really can wedge a task forever with nothing left to wake
+// it.
+
+import { listen, dial, Listener, Conn } from "std/net"
+import { newAtomicI64, AtomicI64 } from "std/sync"
+import { monotonic, sleepUntil, Millisecond } from "std/time"
+
+const rounds: int = 60
+const pollIters: int = 40
+const pollSliceMs: int = 25
+
+class AcceptState { done: AtomicI64, ok: AtomicI64 }
+
+// `l`'s accept, fired once and abandoned: a stale retry loop wedged on a
+// reused fd is left to the process exit rather than joined, matching how a
+// real server never waits for a connection that already went elsewhere.
+fn staleAcceptor(l: Listener, staleOk: AtomicI64) {
+  let c = l.accept() catch _ {
+    return // correct: closing this listener errored the parked accept.
+  }
+  staleOk.add(1)
+  c.close()
+}
+
+fn realAcceptor(l: Listener, roundId: int, st: AcceptState) {
+  let c = l.accept() catch _ {
+    st.done.store(1)
+    return
+  }
+  let tag = c.read(64)
+  if (tag == "${roundId}\n") {
+    st.ok.store(1)
+  }
+  c.close()
+  st.done.store(1)
+}
+
+// Poll `done` up to `pollIters` times, `pollSliceMs` apart, then give up —
+// bounded either way (Power of 10). Returns true only if it was set in time.
+fn waitDone(done: AtomicI64): bool {
+  let i = 0
+  while (i < pollIters) {
+    if (done.load() != 0) {
+      return true
+    }
+    sleepUntil(monotonic().ns + pollSliceMs * Millisecond)
+    i = i + 1
+  }
+  return false
+}
+
+// True only if the round finished in time AND `st.ok` was set.
+fn waitBounded(st: AcceptState): bool {
+  if (!waitDone(st.done)) {
+    return false
+  }
+  return st.ok.load() != 0
+}
+
+fn acceptRound(roundId: int, staleOk: AtomicI64, hung: AtomicI64) {
+  let l1 = listen("127.0.0.1", 0) catch _ {
+    return
+  }
+  spawn staleAcceptor(l1, staleOk)
+  l1.close()
+
+  let l2 = listen("127.0.0.1", 0) catch _ {
+    return
+  }
+  let port2 = l2.port() catch _ {
+    l2.close()
+    return
+  }
+  let st = AcceptState{ done = newAtomicI64(0), ok = newAtomicI64(0) }
+  spawn realAcceptor(l2, roundId, st)
+  let c = dial("127.0.0.1", port2) catch _ {
+    l2.close()
+    return
+  }
+  let _ = c.write("${roundId}\n") catch _ {}
+  if (!waitBounded(st)) {
+    hung.add(1)
+  }
+  c.close()
+  l2.close()
+}
+
+class ReadState { done: AtomicI64, crossed: AtomicI64 }
+
+fn staleReader(c: Conn, roundId: int, rs: ReadState) {
+  let v = c.read(64)
+  if (v == "cross${roundId}\n") {
+    rs.crossed.add(1)
+  }
+  rs.done.store(1)
+}
+
+// Accepts one connection on `l` and holds it open, never writing to it —
+// the peer this round's stale reader is parked against.
+fn acceptAndHold(l: Listener) {
+  let c = l.accept() catch _ {
+    return
+  }
+  let _ = c
+}
+
+// Accepts one connection on `l` and writes this round's cross-tag — the
+// legitimate peer of the fd-reused connection a stale reader must not see.
+fn acceptAndTag(l: Listener, roundId: int) {
+  let c = l.accept() catch _ {
+    return
+  }
+  let _ = c.write("cross${roundId}\n") catch _ {}
+}
+
+// Poll `rs.done` up to `pollIters` times, then tally the outcome: `hungRead`
+// if it never finished, `crossRead` if it finished having read the OTHER
+// connection's tag. Split out of `readRound` to keep that function's
+// complexity under the ceiling.
+fn finishReadRound(rs: ReadState, crossRead: AtomicI64, hungRead: AtomicI64) {
+  if (!waitDone(rs.done)) {
+    hungRead.add(1)
+  }
+  if (rs.crossed.load() != 0) {
+    crossRead.add(1)
+  }
+}
+
+fn readRound(roundId: int, crossRead: AtomicI64, hungRead: AtomicI64) {
+  let l1 = listen("127.0.0.1", 0) catch _ {
+    return
+  }
+  let port1 = l1.port() catch _ {
+    l1.close()
+    return
+  }
+  spawn acceptAndHold(l1)
+  let c1 = dial("127.0.0.1", port1) catch _ {
+    l1.close()
+    return
+  }
+  let rs = ReadState{ done = newAtomicI64(0), crossed = newAtomicI64(0) }
+  spawn staleReader(c1, roundId, rs)
+  // Give the reader time to park before closing out from under it.
+  sleepUntil(monotonic().ns + 5 * Millisecond)
+  c1.close()
+  l1.close()
+
+  // Reuse: a fresh listen/dial/accept, likely on `c1`'s just-freed fd number,
+  // whose peer writes a DISTINCT tag the stale reader must never observe.
+  let l2 = listen("127.0.0.1", 0) catch _ {
+    return
+  }
+  let port2 = l2.port() catch _ {
+    l2.close()
+    return
+  }
+  spawn acceptAndTag(l2, roundId)
+  let c2 = dial("127.0.0.1", port2) catch _ {
+    l2.close()
+    return
+  }
+
+  finishReadRound(rs, crossRead, hungRead)
+  c2.close()
+  l2.close()
+}
+
+fn main() {
+  let staleOk = newAtomicI64(0)
+  let hung = newAtomicI64(0)
+  let crossRead = newAtomicI64(0)
+  let hungRead = newAtomicI64(0)
+
+  let r = 0
+  while (r < rounds) {
+    acceptRound(r + 1, staleOk, hung)
+    r = r + 1
+  }
+
+  let r2 = 0
+  while (r2 < rounds) {
+    readRound(r2 + 1, crossRead, hungRead)
+    r2 = r2 + 1
+  }
+
+  print(
+      "netclosereuse staleAcceptOk=${staleOk.load()} hung=${hung.load()} " +
+      "crossRead=${crossRead.load()} hungRead=${hungRead.load()}\n",
+  )
+}
