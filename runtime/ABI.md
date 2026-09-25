@@ -2426,9 +2426,10 @@ fallible surface form), so codegen never checks a return value.
 
 ### Task-local storage slot (`docs/context-propagation.md` decision B)
 
-One word, **offset 32, size 8 bytes**, inside every task control block
+One word, **offset 33, size 8 bytes**, inside every task control block
 (`runtime/sched/task.bit`'s `taskLocal`, index `taskWords - 1` — `taskWords`
-grew from 32 to 33 words to hold it). Present on `main`'s task, every worker's
+grew from 32 to 33 words to hold it, then to 34 for `taskTimerPrev` at 32,
+#5887, which moved this slot from 32 to 33). Present on `main`'s task, every worker's
 idle-loop task, and every spawned task alike, because it lives in the same
 fixed-size block `schedTaskInit` zeroes for all of them, not in the one extra
 word `taskSpawnEntry` reserves for a spawned task only.

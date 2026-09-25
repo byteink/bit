@@ -47,8 +47,7 @@
 export @nosplit @symbol("bit_rt_port_sched_timer_push") fn schedTimerPush(s: *i64, task: int) {
   let t = taskAt(task)
   spinAcquire(lockOf(s, scTimerLock))
-  *(t + taskTimerNext) = *(s + scTimerHead)
-  *(s + scTimerHead) = task
+  *(s + scTimerHead) = timerLinkFront(*(s + scTimerHead), task)
   timerLowerBounds(s, *(t + taskDeadline))
   spinRelease(lockOf(s, scTimerLock))
   schedWakePoller(s)
@@ -63,45 +62,46 @@ export @nosplit @symbol("bit_rt_port_sched_timer_push") fn schedTimerPush(s: *i6
 // call no longer owns. See `../../net/darwin/tcp.bit`'s deadline-bounded
 // section for the consumer.
 //
-// Returns true when `task` was still linked and is now unlinked. False means
-// it was not found — either `schedTimerExpire`'s own `timerPartition` already
-// pulled it off (the timer won the race instead), or it was never pushed.
-// Either reading is safe for the caller: "not found" means there is nothing
-// left on this list for this task, which is exactly the postcondition a
-// caller that found `true` establishes here directly.
-//
-// Bounded by `schedMaxRegistered` (Power of 10), the same walk bound
-// `timerPartition`/`schedTimerCount` use, under the same lock those take —
-// mutual exclusion with `timerPartition` is what makes "found here" and
-// "already pulled by a concurrent expire pass" the only two outcomes; there
-// is no window in which both are examining the list at once.
+// True when `task` was linked and is now unlinked; false when a concurrent
+// `timerPartition` already pulled it (the timer won) or it was never pushed.
+// Either way nothing is left on this list for this task. O(1) through
+// `taskTimerPrev` (#5887; the predecessor walk it replaced sat near the tail at
+// c=64). EXACT: every unlink under `scTimerLock` stores `timerUnlinked`, as
+// `schedTaskInit` does, and a 0 back link off the head is a never-pushed block.
 export @nosplit @symbol("bit_rt_port_sched_timer_cancel") fn schedTimerCancel(
   s: *i64,
   task: int,
 ): bool {
+  let t = taskAt(task)
   spinAcquire(lockOf(s, scTimerLock))
-  let prev = 0
-  let it = *(s + scTimerHead)
-  let n = 0
-  let found = false
-  while (it != 0 && n < schedMaxRegistered) {
-    n = n + 1
-    if (it == task) {
-      let next = *(taskAt(it) + taskTimerNext)
-      if (prev == 0) {
-        *(s + scTimerHead) = next
-      } else {
-        *(taskAt(prev) + taskTimerNext) = next
-      }
-      found = true
-      it = 0
-    } else {
-      prev = it
-      it = *(taskAt(it) + taskTimerNext)
-    }
+  let prev = *(t + taskTimerPrev)
+  if (prev == timerUnlinked || (prev == 0 && *(s + scTimerHead) != task)) {
+    spinRelease(lockOf(s, scTimerLock))
+    return false
   }
+  let next = *(t + taskTimerNext)
+  if (prev == 0) {
+    *(s + scTimerHead) = next
+  } else {
+    *(taskAt(prev) + taskTimerNext) = next
+  }
+  if (next != 0) {
+    *(taskAt(next) + taskTimerPrev) = prev
+  }
+  *(t + taskTimerNext) = 0
+  *(t + taskTimerPrev) = timerUnlinked
   spinRelease(lockOf(s, scTimerLock))
-  return found
+  return true
+}
+
+// Link `task` in front of `head`, both links; the new head. Lock held.
+@nosplit fn timerLinkFront(head: int, task: int): int {
+  *(taskAt(task) + taskTimerNext) = head
+  *(taskAt(task) + taskTimerPrev) = 0
+  if (head != 0) {
+    *(taskAt(head) + taskTimerPrev) = task
+  }
+  return task
 }
 
 // ---------------------------------------------------------------------------
@@ -265,10 +265,10 @@ export @nosplit @symbol("bit_rt_port_sched_park_bound_ns") fn schedParkBoundNs(
     let deadline = *(t + taskDeadline)
     if (deadline <= now) {
       *(t + taskTimerNext) = due
+      *(t + taskTimerPrev) = timerUnlinked
       due = it
     } else {
-      *(t + taskTimerNext) = keep
-      keep = it
+      keep = timerLinkFront(keep, it)
       earliest = earlierDeadline(earliest, deadline)
       if (deadline < floor) {
         floor = deadline
