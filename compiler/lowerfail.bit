@@ -126,38 +126,58 @@ fn neNil(fc: FnCtx, errv: int, slotTy: int): int {
 // across the call boundary. Same two-kind test `deferZeroValue`
 // (lowerdefer.bit) applies to its own placeholder slot, for the same reason.
 //
-// THE DEADNESS IS STRUCTURAL, not a claim about today's callers. The err path's
-// value reaches a caller in ONE return register: `declPlainResultType`
-// (lowerexplode.bit) excludes a fallible result from #4405's multi-word return
-// whole, so `fc.retWords` is empty for every fallible body and no caller ever
-// sees the ok type's words. Every shape that consumes the handle places its
-// first read in the `err_get() == nil` successor, which the branch dominates:
-// `?` gives the value only in `cont`, whose single predecessor is that edge
-// (`lowerTryExpr` below); a value `catch` merges through a join whose err edge
-// carries the HANDLER's value (`lowerCatch`); a discarded call and `spawn`'s
-// thunk (`synthSpawnTrampoline`, lowerfuncval.bit) never read it; and the
-// func-value trampoline (`emitTrampolineRet`, lowerglobal.bit) passes the
-// handle straight to its own `ret`. The precedent is already shipped and load
-// bearing: `zeroValueEnumOrNil` returns this same `ConstNil` for an interface,
-// pointer, func or unboxed-enum ok type, so `fn mk(): Shape!` has handed
-// callers a nil on its error path since fallible results existed.
+// THE DEADNESS IS STRUCTURAL, not a claim about today's callers. Every shape
+// that consumes the ok value places its first read in the `err_get() == nil`
+// successor, which the branch dominates: `?` gives the value only in `cont`,
+// whose single predecessor is that edge (`lowerTryExpr` below); a value
+// `catch` merges through a join whose err edge carries the HANDLER's value
+// (`lowerCatch`); a discarded call and `spawn`'s thunk
+// (`synthSpawnTrampoline`, lowerfuncval.bit) never read it; and the func-value
+// trampoline (`emitTrampolineRet`, lowerglobal.bit) passes it straight to its
+// own `ret`. The precedent is already shipped and load bearing:
+// `zeroValueEnumOrNil` returns this same `ConstNil` for an interface, pointer,
+// func or unboxed-enum ok type, so `fn mk(): Shape!` has handed callers a nil
+// on its error path since fallible results existed.
+//
+// #5874 made the width part of that argument, not an exception to it. A
+// `(A, B)!` body whose result `explodedRetWords` (lowerexplode.bit) returns in
+// W words gives every `ret` W operands (`fallibleZeroArgs`), and the zero BITS
+// of each word are enough for the same reason the nil is: nothing reads them.
 fn emitFallibleZeroRet(fc: FnCtx, span: Span) {
   if (fc.fallibleOk == fc.c.ctx.voidId) {
     builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
     fc.terminated = true
     return
   }
-  let k = fc.c.ctx.types[fc.fallibleOk].kind
-  let zv = 0
-  if (k == TypeKind.Struct || k == TypeKind.Tuple) {
-    zv = builderEmit(fc.b, mkInstr(Op.ConstNil, fc.fallibleOk))
-  } else {
-    zv = zeroValue(fc, fc.fallibleOk, span)
-  }
   let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
-  r.args = [zv]
+  r.args = fallibleZeroArgs(fc, span)
   builderEmit(fc.b, r)
   fc.terminated = true
+}
+
+// The err-path `ret`'s operands: one zero constant per return WORD when the ok
+// value is returned in words, else one bare nil or the ok type's zero value.
+//
+// `zeroBitsConst` (lowerslicefill.bit) rather than `zeroValue`: a word is
+// never a tuple, class or array, so there is nothing to build, and a
+// reference word takes a `ConstNil` of its own type — the value `GcAlloc`'s
+// zeroed slot would have held — with no allocation even under
+// `--no-optimize`.
+fn fallibleZeroArgs(fc: FnCtx, span: Span): []int {
+  if (len(fc.retWords) != 0) {
+    let out = []int(0)
+    let i = 0
+    while (i < len(fc.retWords)) {
+      out = append(out, zeroBitsConst(fc, fc.retWords[i]))
+      i = i + 1
+    }
+    return out
+  }
+  let k = fc.c.ctx.types[fc.fallibleOk].kind
+  if (k == TypeKind.Struct || k == TypeKind.Tuple) {
+    return [builderEmit(fc.b, mkInstr(Op.ConstNil, fc.fallibleOk))]
+  }
+  return [zeroValue(fc, fc.fallibleOk, span)]
 }
 
 // `fail e` (§18.3): evaluate the error, run defers, publish it (boxed per
@@ -177,11 +197,16 @@ fn lowerFail(fc: FnCtx, node: int) {
 // return zero ok); on ok the value is the call's ok result.
 fn lowerTryExpr(fc: FnCtx, node: int): int {
   let operand = kidsOf(fc.c.tree, node)[0]
-  let errTy = fc.c.ctx.types[nodeType(fc, operand)].errTy
+  let fty = nodeType(fc, operand)
+  let errTy = fc.c.ctx.types[fty].errTy
   let okv = lowerExpr(fc, operand)
   if (fc.failed) {
     return 0
   }
+  // #5874: read BEFORE `getErr` — see `joinOkWords`.
+  let okTy = fc.c.ctx.types[fty].result
+  let words = joinOkWords(fc, okTy, okv)
+  let okWords = explodeValueWords(fc.c.ctx, fc.b, okv, words)
   // `errv` is already in slot representation; `setErr` below re-publishes it
   // as-is, no reboxing per `?` hop.
   let errv = getErr(fc, errTy)
@@ -205,8 +230,12 @@ fn lowerTryExpr(fc: FnCtx, node: int): int {
   builderBeginBlock(fc.b, cont)
   fc.terminated = false
   // `cont` has a single predecessor (dominated by the branch), so the ok value
-  // flows in directly — no block param.
-  return okv
+  // flows in directly — no block param. So do its words, and the aggregate is
+  // rebuilt from them HERE, in the block its consumer's reads sit in.
+  if (len(words) == 0) {
+    return okv
+  }
+  return materializeExplodedLocal(fc, okTy, okWords)
 }
 
 // The block-param args for a catch/match-expr join edge: the live locals, plus
@@ -223,6 +252,77 @@ fn catchEdgeArgs(fc: FnCtx, locals: []int, val: int, isVoid: bool): []int {
     out = append(out, val)
   }
   return out
+}
+
+// ===========================================================================
+// #5874: a `?`/`catch` join over an ok value that arrived in WORDS
+//
+// THE TRAP. `emitResolvedCall` (lowerprim.bit) rebuilds a word-returning
+// call's result as a fresh box, and the consumer's reads of it sit past the
+// `err_get` below and past the branch. Store-to-load forwarding
+// (optstore.bit) is block-local and every `rt_call` clears its table, so those
+// reads forward from nothing and the box survives: the callee stopped
+// allocating and the caller started. A `catch` is worse: its join merges the
+// value as a block argument, an escape optalloc.bit refuses outright, so both
+// the call's box and the handler's survive.
+//
+// THE SHAPE, from #4601's spike (`5bc0518e`). The words are read out of the
+// box ADJACENT to its `field_set`s, before `err_get`, where forwarding answers
+// every read; they cross the branch as values — directly into `?`'s
+// single-predecessor `cont`, as one block parameter per word into a `catch`
+// join — and the aggregate is rebuilt at the top of that block, where its
+// consumer's reads forward from the new `field_set`s. Where the consumer
+// really wants a handle the rebuilt box stays, one box as before.
+//
+// Keyed on #4586's predicate: the ok value is a box this lowerer JUST built
+// (`isFreshBox`, lowerexplodestr.bit), because killing that box is the only
+// thing the words can buy. A one-handle callee hands back its `call` itself,
+// which is never a `gc_alloc`, so every other fallible call keeps the join it
+// always had, instruction for instruction.
+// ===========================================================================
+
+// The per-word types a `?`/`catch` join threads its ok value through, or an
+// empty list for the one-value form. Its reads must be emitted BEFORE
+// `getErr`, adjacent to the box they take apart.
+fn joinOkWords(fc: FnCtx, okTy: int, okv: int): []int {
+  if (!isFreshBox(fc.b, okv)) {
+    return []int(0)
+  }
+  return tupleWordTypes(fc.c.ctx, okTy)
+}
+
+// A `catch` join edge: the live locals, then `val` as its words at an exploded
+// join, or `catchEdgeArgs`'s one handle (nothing for a void ok type).
+fn catchJoinArgs(fc: FnCtx, locals: []int, val: int, words: []int, isVoid: bool): []int {
+  if (len(words) == 0) {
+    return catchEdgeArgs(fc, locals, val, isVoid)
+  }
+  let out = catchEdgeArgs(fc, locals, val, true)
+  let ids = explodeValueWords(fc.c.ctx, fc.b, val, words)
+  let k = 0
+  while (k < len(ids)) {
+    out = append(out, ids[k])
+    k = k + 1
+  }
+  return out
+}
+
+// The `catch` join's merged value: the one parameter every other join takes,
+// or W word parameters put back together at the top of the join.
+fn joinOkValue(fc: FnCtx, okTy: int, words: []int): int {
+  if (len(words) == 0) {
+    return builderAddParam(fc.b, okTy)
+  }
+  let ids = []int(0)
+  let k = 0
+  while (k < len(words)) {
+    ids = append(ids, builderAddParam(fc.b, words[k]))
+    k = k + 1
+  }
+  // #4406: a join MINTS new ids, so the edges recorded where the words were
+  // read name values that do not exist on this side of it.
+  recordWordKeepAlive(fc.c.ctx, fc.b, words, ids)
+  return materializeExplodedLocal(fc, okTy, ids)
 }
 
 // The handler value and its type for `catch d` (bind=false) or
@@ -266,11 +366,14 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   if (fc.failed) {
     return 0
   }
+  let preLen = len(fc.env)
+  let orig = snapshotValues(fc, preLen)
+  // #5874: the ok edge is built BEFORE `getErr` — see `joinOkWords`.
+  let words = joinOkWords(fc, okTy, okv)
+  let okEdge = catchJoinArgs(fc, orig, okv, words, isVoid)
   // `errv` is in slot representation, unboxed below only where needed.
   let errv = getErr(fc, errTy)
   let isErr = neNil(fc, errv, errSlotTy(fc, errTy))
-  let preLen = len(fc.env)
-  let orig = snapshotValues(fc, preLen)
   let errBlk = builderNewBlock(fc.b)
   let join = builderNewBlock(fc.b)
   let br = mkInstr(Op.Br, fc.c.ctx.voidId)
@@ -278,7 +381,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   br.ival = errBlk
   br.thenArgs = []int(0)
   br.ival2 = join
-  br.elseArgs = catchEdgeArgs(fc, orig, okv, isVoid)
+  br.elseArgs = okEdge
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
   builderBeginBlock(fc.b, errBlk)
@@ -309,7 +412,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   }
   if (!fc.terminated) {
     let merged = coerceToIface(fc, handled, handledTy, okTy)
-    emitJump(fc, join, catchEdgeArgs(fc, snapshotValues(fc, preLen), merged, isVoid))
+    emitJump(fc, join, catchJoinArgs(fc, snapshotValues(fc, preLen), merged, words, isVoid))
   }
   builderEndBlock(fc.b)
   restoreValues(fc, orig)
@@ -319,7 +422,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   if (isVoid) {
     return okv
   }
-  return builderAddParam(fc.b, okTy)
+  return joinOkValue(fc, okTy, words)
 }
 
 // The body of a `catch e { … }`: a block of statements whose final expression (if
