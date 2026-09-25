@@ -15,6 +15,11 @@ import { netClampDeadline, netDeadlineMaxWaitNs } from "../../net"
 // are already in scope here).
 import { taskDeadline, schedTimerPush, schedTimerCancel } from "../../sched"
 import { pdCancel } from "../../sched"
+// Per-fd reference counting (#5886) -- every blocking loop in this file
+// acquires once at entry (`netFdAcquire`, `./sock.bit`) and releases on
+// every exit path (`netFdRelease`); `pdFdClosing` (also imported by
+// `./sock.bit` -- imports are per-module, not per-file) is the after-wake
+// check that stops a retry once `netClose` has run, without another syscall.
 
 // ---------------------------------------------------------------------------
 // TCP
@@ -80,7 +85,24 @@ export @symbol("bit_rt_port_net_local_port") @nosplit fn netSockLocalPort(fd: in
 
 // Accept one connection, parking until a peer arrives. The returned socket is
 // non-blocking, like every socket here. Negative on failure.
+//
+// #5886: a ref on `lfd` is held for the WHOLE call (acquired once here,
+// before the first syscall, released on every exit from `netAcceptTcpLoop`)
+// so `netClose(lfd)` from another task can never actually release the fd
+// number while this accept is still retrying on it -- see
+// `../../sched/polldesc.bit`'s header. Split into a thin wrapper plus
+// `netAcceptTcpLoop` to keep both under the complexity ceiling.
 export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
+  let gen = *netFdGenAddr(lfd)
+  if (!netFdAcquire(lfd, gen)) {
+    return 0 - 1
+  }
+  let fd = netAcceptTcpLoop(lfd, gen)
+  netFdRelease(lfd)
+  return fd
+}
+
+fn netAcceptTcpLoop(lfd: int, gen: int): int {
   let stalls = 0
   let spins = 0
   // Two bounds, both static (Power of 10): `stalls` counts parked waits and
@@ -98,7 +120,13 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
     }
     let e = lastErr()
     if (e == eAgain()) {
-      if (netAwaitReady(lfd, pollRead)) {
+      if (netAwaitReady(lfd, pollRead, gen)) {
+        // The wake may have been `netClose` rather than a real connection
+        // (#5886) -- checked BEFORE retrying `accept`, so a close never lets
+        // this loop's next syscall land on a reused fd number.
+        if (pdFdClosing(lfd)) {
+          return 0 - 1
+        }
         stalls = stalls + 1
       } else {
         spins = spins + 1
@@ -122,6 +150,10 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
 // outcome has to be read back from SO_ERROR. Skipping that read is the classic
 // bug: a refused connection looks connected until some later `write` fails far
 // away from the cause.
+// #5886: a ref on `fd` is held for the connect-wait loop (acquired once
+// right after the socket is created, released on every exit) — split into a
+// thin wrapper plus `netDialTcpConnect` to keep both under the complexity
+// ceiling, same shape as `netAcceptTcp`/`netAcceptTcpLoop` above.
 export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int, port: int): int {
   let ip = ipBytes()
   if (!netParseIpv4(host, hostLen, ip)) {
@@ -131,6 +163,63 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
   if (fd < 0) {
     return 0 - lastErr()
   }
+  let gen = *netFdGenAddr(fd)
+  if (!netFdAcquire(fd, gen)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  let rc = netDialTcpConnect(fd, gen, host, hostLen, port)
+  netFdRelease(fd)
+  return rc
+}
+
+// A negative `netDialTcpCheckDone` sentinel would collide with the errno
+// results it also has to carry (`0 - errno` and `0 - 1` are both plausible),
+// so completion is reported through an out-parameter instead — the same
+// shape `../../sched/polldesc.bit`'s `pdClose` uses for the identical
+// reason. Per-worker scratch (`./sock.bit`'s `netCloseOutBuf` is the same
+// pattern): `ptrOf` needs a slice or module-level state, not a local fixed
+// array, and a shared buffer would let two workers dialing concurrently
+// stomp each other's result.
+let netDialDoneBuf: [66]i64
+
+@nosplit fn netDialDoneAddr(): *i64 {
+  return ptrOf(netDialDoneBuf) + sockScratchSlot()
+}
+
+fn netDialTcpCheckDone(fd: int, rc2: int, ce: int, outResult: *i64): bool {
+  if (rc2 >= 0 || ce == eIsConn()) {
+    // Connected as far as the handshake is concerned; SO_ERROR is now the
+    // authority on whether it succeeded. `netSocketError` returns the
+    // deferred connect's own errno directly (SO_ERROR IS an errno value,
+    // e.g. ECONNREFUSED) — that is a stronger signal than `lastErr()` here,
+    // since no syscall this thread made just failed. A negative
+    // `netSocketError` result is its OWN getsockopt call failing, in which
+    // case `lastErr()` (read immediately, no syscall in between) is the
+    // right source instead.
+    let soErr = netSocketError(fd)
+    if (soErr != 0) {
+      netClose(fd)
+      if (soErr > 0) {
+        *outResult = i64(0 - soErr)
+      } else {
+        *outResult = i64(0 - lastErr())
+      }
+      return true
+    }
+    *outResult = i64(fd)
+    return true
+  }
+  if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
+    netClose(fd)
+    *outResult = i64(0 - ce)
+    return true
+  }
+  return false
+}
+
+fn netDialTcpConnect(fd: int, gen: int, host: *u8, hostLen: int, port: int): int {
+  let ip = ipBytes()
   netFillSockAddr(saBytes(), ip, port)
   let rc = int(connect(i32(fd), saBytes(), i32(saLen)))
   if (rc >= 0) {
@@ -167,7 +256,7 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
   // SO_ERROR is then read on the completed socket, where it IS meaningful, and
   // is what turns a handshake that completed-but-failed into an error.
   while (spins < netMaxSpins) {
-    if (netAwaitReady(fd, pollWrite)) {
+    if (netAwaitReady(fd, pollWrite, gen)) {
       spins = netMaxSpins
     } else {
       spins = spins + 1
@@ -190,28 +279,8 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
     netFillSockAddr(saBytes(), ip, port)
     let rc2 = int(connect(i32(fd), saBytes(), i32(saLen)))
     let ce = lastErr()
-    if (rc2 >= 0 || ce == eIsConn()) {
-      // Connected as far as the handshake is concerned; SO_ERROR is now the
-      // authority on whether it succeeded. `netSocketError` returns the
-      // deferred connect's own errno directly (SO_ERROR IS an errno value,
-      // e.g. ECONNREFUSED) — that is a stronger signal than `lastErr()` here,
-      // since no syscall this thread made just failed. A negative
-      // `netSocketError` result is its OWN getsockopt call failing, in which
-      // case `lastErr()` (read immediately, no syscall in between) is the
-      // right source instead.
-      let soErr = netSocketError(fd)
-      if (soErr != 0) {
-        netClose(fd)
-        if (soErr > 0) {
-          return 0 - soErr
-        }
-        return 0 - lastErr()
-      }
-      return fd
-    }
-    if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
-      netClose(fd)
-      return 0 - ce
+    if (netDialTcpCheckDone(fd, rc2, ce, netDialDoneAddr())) {
+      return int(*netDialDoneAddr())
     }
   }
   // Spin bound exhausted with the handshake still pending (EALREADY/
@@ -224,7 +293,22 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
 
 // Read up to `bufCap` bytes into `buf`, parking until some arrive. `0` means the
 // peer closed: an orderly end of stream, not an error. Negative on failure.
+//
+// #5886: this is the exact shape `_tests_/stress/netclosereuse`'s read-side
+// case exercises -- a ref on `fd` is held for the whole call so a `netClose`
+// racing this read can defer the real `close(2)` rather than hand the fd
+// number to a new connection while this loop might still retry on it.
 export @symbol("bit_rt_port_net_read_sock") fn netReadSock(fd: int, buf: *u8, bufCap: int): int {
+  let gen = *netFdGenAddr(fd)
+  if (!netFdAcquire(fd, gen)) {
+    return 0 - 1
+  }
+  let n = netReadSockLoop(fd, gen, buf, bufCap)
+  netFdRelease(fd)
+  return n
+}
+
+fn netReadSockLoop(fd: int, gen: int, buf: *u8, bufCap: int): int {
   let stalls = 0
   let spins = 0
   while (stalls < netMaxStalls && spins < netMaxSpins) {
@@ -234,7 +318,10 @@ export @symbol("bit_rt_port_net_read_sock") fn netReadSock(fd: int, buf: *u8, bu
     }
     let e = lastErr()
     if (e == eAgain()) {
-      if (netAwaitReady(fd, pollRead)) {
+      if (netAwaitReady(fd, pollRead, gen)) {
+        if (pdFdClosing(fd)) {
+          return 0 - 1
+        }
         stalls = stalls + 1
       } else {
         spins = spins + 1
@@ -285,7 +372,40 @@ export @symbol("bit_rt_port_net_shutdown_sock") @nosplit fn netShutdownSock(fd: 
 
 // Write all `n` bytes of `buf`, parking whenever the send buffer is full. A
 // short write is normal on a socket and is not an error — hence the loop.
+//
+// #5886: same ref-holding shape as `netReadSock` above.
 export @symbol("bit_rt_port_net_write_sock") fn netWriteSock(fd: int, buf: *u8, n: int): int {
+  let gen = *netFdGenAddr(fd)
+  if (!netFdAcquire(fd, gen)) {
+    return 0 - 1
+  }
+  let wrote = netWriteSockLoop(fd, gen, buf, n)
+  netFdRelease(fd)
+  return wrote
+}
+
+// One EAGAIN/EINTR/hard-error outcome from a `write` that made no progress.
+// `1` a stall (parked and woke, keep going), `0` a spin (nothing to retry
+// the syscall on yet), `-1` stop the caller's loop entirely -- a hard error,
+// or `netClose` having landed while this task waited (#5886). Split out of
+// `netWriteSockLoop` to keep it under the complexity ceiling.
+fn netWriteSockWaitStep(fd: int, gen: int): int {
+  if (lastErr() == eIntr()) {
+    return 0
+  }
+  if (lastErr() != eAgain()) {
+    return 0 - 1
+  }
+  if (!netAwaitReady(fd, pollWrite, gen)) {
+    return 0
+  }
+  if (pdFdClosing(fd)) {
+    return 0 - 1
+  }
+  return 1
+}
+
+fn netWriteSockLoop(fd: int, gen: int, buf: *u8, n: int): int {
   let off = 0
   let stalls = 0
   let spins = 0
@@ -298,422 +418,22 @@ export @symbol("bit_rt_port_net_write_sock") fn netWriteSock(fd: int, buf: *u8, 
       // not mistaken for a wedged socket.
       stalls = 0
       spins = 0
-    } else {
-      if (wrote == 0) {
-        return 0 - 1
-      }
-      let e = lastErr()
-      if (e == eAgain()) {
-        if (netAwaitReady(fd, pollWrite)) {
-          stalls = stalls + 1
-        } else {
-          spins = spins + 1
-        }
-      } else {
-        if (e == eIntr()) {
-          spins = spins + 1
-        } else {
-          return 0 - 1
-        }
-      }
-    }
-  }
-  if (off < n) {
-    return 0 - 1
-  }
-  return off
-}
-
-// ---------------------------------------------------------------------------
-// Deadline-bounded connect/read/write (#2291)
-// ---------------------------------------------------------------------------
-//
-// A server that completes the handshake (or accepts) and then never writes
-// parks `netReadSock`/`netDialTcp` above forever — nothing bounds
-// `netAwaitReady`'s park. These siblings bound the wait instead, resolving
-// ONE absolute monotonic deadline before the first poll and never restarting
-// it — the same shape `runtime/root/*/os.bit`'s `osForkExecWaitBounded`
-// documents at ABI.md §19.
-//
-// WHY THIS DOES NOT REUSE `netAwaitReady`: that primitive parks until the
-// kernel poller reports readiness, with no timeout of its own, and this
-// runtime has no primitive that races a poll registration against a timer for
-// the SAME task — adding one would touch `runtime/sched/**`, which three
-// other tickets are live in this week and which carries the
-// arm/register/park ordering invariants ../../sched/task.bit's "arming a park"
-// section documents; a half-tested change there is worse than not making it.
-// So instead of registering for readiness at all, `netAwaitDeadlineTick`
-// below parks the calling task on the scheduler's TIMER queue for a short,
-// bounded slice (`netDeadlinePollNs`) and returns, so the retry loop below
-// re-tries the non-blocking syscall itself — exactly the "poll, sleep,
-// recheck the deadline" shape `osForkExecWaitBounded` uses for a wait POSIX
-// itself gives no "select" for (there, waiting on a child's exit; here,
-// waiting on a peer that may never speak). The cost is up to one slice of
-// latency on an otherwise-fast wakeup; the benefit is zero new scheduler
-// surface. #5428 is what that cost is worth when a wait is SHORT and
-// repeated, and why the slice is no longer a single value — see
-// `netDeadlineFastPollNs` below.
-//
-// NO GC BRACKET: every syscall touched here (`read`/`write`/`connect`) runs
-// on the non-blocking sockets this provider always creates (`netSetNonBlock`
-// in `netAcceptTcp`/this file's dial path), so each call returns immediately
-// — EAGAIN or a result — rather than holding the OS thread in the kernel.
-// `netReadSock`/`netWriteSock`/`netDialTcp` above call the identical syscalls
-// with no `gcSyscallBegin`/`gcSyscallEnd` bracket for the same reason; the
-// bracket is for a call that genuinely blocks the OS thread (`rtFsRead`'s
-// worked example), which none of these are. The actual wait happens in
-// `schedSleepUntil`, a cooperative park that yields the OS thread to the
-// scheduler, not a blocking syscall.
-//
-// `@nosplit` (#3000, _tests_/bit/pollfree.bit): unlike `netAwaitReady` above —
-// which calls `pollRegister`, not itself `@nosplit` — `schedSleepUntil` IS
-// `@nosplit` (`runtime/sched/timer.bit`), because it is the scheduler's own
-// timer-queue park, the same primitive the idle loop uses. Choosing the
-// timer queue over a poll registration (the WHY above) is what makes this
-// whole section provably poll-free: `netClockNowNs`, `netClampDeadline`,
-// `netAwaitDeadlineTick` and the three `*Deadline` entry points below carry
-// no raw GC address across `schedSleepUntil`'s park because they hold none —
-// same as `netReadSock`/`netWriteSock`/`netDialTcp` — AND the compiler
-// proves it, so none of the six needs a `pollFreeExceptions` entry.
-
-// Poll interval while waiting for readiness or the deadline, whichever comes
-// first: 2ms, the same value `runtime/root/*/os.bit`'s `osPollNs` uses for an
-// analogous bounded wait. This is the STEADY-STATE slice, not the first one —
-// `netDeadlineFastPollNs` below is what a wait starts at.
-const netDeadlinePollNs: int = 2000000
-
-// TWO TIERS, AND WHY (#5428). A single 2ms slice makes every miss cost 2ms,
-// so a request/response protocol whose peer answers in microseconds — an
-// HTTP/1.1 keep-alive connection waiting for its next request is the case
-// that found this — is capped at 1/0.002s = 500 exchanges per second no
-// matter how far away the configured deadline is. Measured on a same-process
-// ping-pong over one reused loopback connection, 2000 exchanges: 466/s with a
-// deadline armed against 39,625/s with the identical read taking `netReadSock`
-// instead. The 2ms was never a latency budget; it was picked as a cheap
-// heartbeat for a wait that was expected to be long.
-//
-// NOT SOLVED BY LOWERING `netDeadlinePollNs`. That constant is also what makes
-// a GENUINELY idle wait nearly free: a 60s idle timeout costs 30,000 wakeups at
-// 2ms and 60 million at 1us, and it would be paid for the whole wait rather
-// than for the window where a byte is plausibly already in flight. So the
-// slice starts at `netDeadlineFastPollNs` and DOUBLES toward
-// `netDeadlinePollNs` instead of being short everywhere: a peer that is about
-// to speak is answered within one short slice, a peer that is not reaches the
-// cheap steady state within ~4ms and pays exactly the old cost from there on.
-//
-// NOW WIRED IN AS A READINESS RACE, for `netReadSockDeadline` only (#5865):
-// `netAwaitReadyOrDeadline` above races a register-once poll wait
-// (`pdWait`/`pdWake`, `../../sched/polldesc.bit`) against `schedTimerPush`,
-// with the loser retracted via `schedTimerCancel`'s return (`pdCancel` on the
-// poll side). `netWriteSockDeadline`/`netDialTcpDeadline` below still use the
-// ramp, per the ticket that wired this in — they are not blocked on anything,
-// just not yet done. This paragraph's history (`schedtimer`'s retraction
-// proof, #5430/#5433/#5438 landing `@nosplit` on both retraction primitives)
-// is why the wiring below was reachable without giving up `@nosplit`; it is
-// no longer the reason it is undone, since it is not undone.
-//
-// AND NOT BY SPINNING ON `schedYield`, which looks like the obvious way to
-// make the first retry free. A yielding task stays RUNNABLE, so
-// `schedFindWorkAt` hands it straight back and `workerBody` never reaches the
-// `pollDrain` it only runs when find-work returns 0 — a spin here starves the
-// poll drain that wakes the peer this read is waiting for. Parking, even for
-// a microsecond, is what lets the worker get to that drain, which is why the
-// fast tier is a short sleep rather than no sleep.
-//
-// WHAT THE SLICE POLICY IS WORTH, AND WHAT IT IS NOT. Three policies were
-// measured on the harness above, interleaved: a flat 1us first tier
-// (28,128/29,868/29,169 exchanges per second), a flat 2us one
-// (29,683/29,442/29,050), and the doubling ramp this file ships
-// (24,856/27,921/27,301), against a plain-`read` control of 36,028-39,617 on
-// the same runs. They are the same number. So what a miss COSTS is the
-// park/unpark round trip, not the nanoseconds slept — which is also why the
-// remaining ~8us per exchange against the control does not close by making
-// the slice smaller, and why the only thing that closes it is not polling at
-// all — a deadline-bound read parking on readiness the way `netReadSock`
-// does, which `netAwaitReadyOrDeadline` above now is (#5865); the ramp below
-// remains the fallback for an unscheduled caller or one with no poller bound.
-//
-// THE RAMP IS THE TIE-BREAK, not the win: among policies that measure the
-// same it is the one that needs no window constant fitted to one workload,
-// and it reaches the cheap steady state on its own for a wait that turns out
-// to be long. Same shape and same reason as `runtime/park`'s
-// `parkNextBackoff`, which ramps an idle worker for this identical problem;
-// kept local rather than imported because that ramp's ceiling is
-// `parkMaxBackoffNs` (1ms) and the ceiling here has to stay
-// `netDeadlinePollNs`.
-const netDeadlineFastPollNs: int = 1000
-
-// The slice after `cur`: double it, never past the steady-state interval.
-@nosplit fn netDeadlineNextSliceNs(cur: int): int {
-  let next = cur * 2
-  if (next > netDeadlinePollNs) {
-    return netDeadlinePollNs
-  }
-  return next
-}
-
-// Doublings from `netDeadlineFastPollNs` to `netDeadlinePollNs` (1us to 2ms
-// is 11), rounded up with slack: the extra iterations the ramp costs the
-// bound below over a loop that waited the full interval every time.
-const netDeadlineRampPolls: int = 16
-
-// Worst-case iterations of the retry loops below: the ramp in full, plus the
-// wait ceiling divided by the steady-state interval, plus slack (Power of 10
-// rule 2, no `while (true)`) — the monotonic-deadline check inside each loop
-// is what actually ends every real call, well before this bound is reached.
-const netDeadlineMaxPolls: int = netDeadlineRampPolls +
-  netDeadlineMaxWaitNs / netDeadlinePollNs +
-  16
-
-// The deadline elapsed before the operation completed — `osForkExecWaitBounded`'s
-// `-2` "timed out" sentinel, reused here for the same reason: one convention
-// for "a bounded wait gave up" across the runtime.
-const netDeadlineTimedOut: int = 0 - 2
-
-// The monotonic clock these deadlines are measured against — `runtime/park/darwin`'s
-// `parkMonoNs`, the same clock `std/time`'s `monotonic()` reaches. `@nosplit`
-// (#3000): `parkMonoNs` is now `@nosplit` too (pure arithmetic and `extern fn`
-// calls, no allocation), so the annotation closes here rather than needing a
-// `pollFreeExceptions` entry.
-@nosplit fn netClockNowNs(): int {
-  return parkMonoNs()
-}
-
-// `netClampDeadline`/`netDeadlineMaxWaitNs` are core now (../net.bit, #2552)
-// — pure deadline-vs-now arithmetic, no OS call.
-
-// Wait a short, bounded slice toward `deadlineNs`, or report there was nobody
-// to wait on — mirrors `netAwaitReady`'s `false` contract for an unscheduled
-// caller (a driver program the scheduler is not running), so that caller's
-// own `polls` bound below still protects it; there is no cooperative sleep
-// without a scheduler to drive `schedTimerExpire`; retrying tightly is thus
-// the correct fallback, and it can never run past `deadlineNs` because the
-// caller checks the clock again on every iteration.
-@nosplit fn netAwaitDeadlineTick(deadlineNs: int, sliceNs: int): bool {
-  let taskAddr = schedCurrentTask()
-  if (taskAddr == 0) {
-    return false
-  }
-  let now = netClockNowNs()
-  let wake = now + sliceNs
-  if (wake > deadlineNs) {
-    wake = deadlineNs
-  }
-  schedSleepUntil(wake)
-  return true
-}
-
-// Park until `fd` is ready for `interest` OR `deadlineNs` passes, whichever
-// comes first (#5865) — the register-once model's readiness-vs-timer race.
-// Same `false` contract as `netAwaitReady`: nobody to park on (unscheduled
-// caller, no poller bound, or the fd's generation moved / its slot is held
-// by another waiter) — the caller's own bounded fallback
-// (`netAwaitDeadlineTick` below) takes over exactly as it does when
-// `netAwaitReady` itself declines.
-//
-// EXACTLY-ONE-WAKEUP, told apart by `schedTimerCancel`'s return, same rule
-// as the pre-#5864 version of this function used: `true` means the timer
-// entry was still linked, so the POLL side woke this task — `pdWake`
-// (`../../sched/darwin/poll.bit`'s drain) already removed it from the slot,
-// nothing left to retract. `false` means the timer already fired
-// (`schedTimerExpire` unlinked it first), so the still-claimed poll slot is
-// retracted here, via `pdCancel`, before this task is touched again.
-@nosplit fn netAwaitReadyOrDeadline(fd: int, interest: int, deadlineNs: int): bool {
-  let taskAddr = schedCurrentTask()
-  if (taskAddr == 0) {
-    return false
-  }
-  let t = taskAt(taskAddr)
-  let wAddr = *(t + taskWorker)
-  if (wAddr == 0) {
-    return false
-  }
-  let s = taskAt(*(taskAt(wAddr) + wkSched))
-  let pollFd = *(s + scPollFd)
-  if (pollFd == 0) {
-    return false
-  }
-  let dir = pdDirWrite
-  if (interest == pollRead) {
-    dir = pdDirRead
-  }
-  let gen = *netFdGenAddr(fd)
-  if (!schedParkArm()) {
-    return false
-  }
-  let r = pdWait(fd, dir, gen, taskAddr)
-  if (r == pdAlreadyReady) {
-    let _ = schedParkDisarm()
-    return true
-  }
-  if (r != pdClaimed) {
-    let _ = schedParkDisarm()
-    return false
-  }
-  schedPollPendingInc()
-  *(t + taskDeadline) = deadlineNs
-  schedTimerPush(s, taskAddr)
-  schedPark()
-  if (!schedTimerCancel(s, taskAddr)) {
-    if (pdCancel(fd, dir, taskAddr, gen)) {
-      schedPollPendingDec()
-    }
-  }
-  return true
-}
-
-// Read up to `bufCap` bytes into `buf`, bounded by `deadlineNs` (absolute
-// monotonic ns) rather than parking forever. Same three-way result shape as
-// `osForkExecWaitBounded`: `n >= 0` bytes read (`0` — the peer closed, an
-// orderly end of stream, exactly as `netReadSock` reports it), `-1` a hard
-// I/O error, `-2` (`netDeadlineTimedOut`) the deadline elapsed first.
-export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDeadline(
-  fd: int,
-  buf: *u8,
-  bufCap: int,
-  deadlineNs: int,
-): int {
-  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
-  let polls = 0
-  let slice = netDeadlineFastPollNs
-  while (polls < netDeadlineMaxPolls) {
-    polls = polls + 1
-    let n = int(read(i32(fd), buf, i64(bufCap)))
-    if (n >= 0) {
-      return n
-    }
-    let e = lastErr()
-    if (e == eAgain()) {
-      if (netClockNowNs() >= deadline) {
-        return netDeadlineTimedOut
-      }
-      // Race readiness against the deadline (#5865) rather than the ramp;
-      // fall back to the tick only when there is no current task or no
-      // poller bound (`netAwaitReadyOrDeadline`'s own `false` contract) —
-      // the unscheduled/no-poller case the ramp was written for.
-      if (!netAwaitReadyOrDeadline(fd, pollRead, deadline)) {
-        let _ = netAwaitDeadlineTick(deadline, slice)
-        slice = netDeadlineNextSliceNs(slice)
-      }
-    } else if (e == eIntr()) {
-      // Interrupted; retry immediately, same as `netReadSock`.
-    } else if (e == eConnReset()) {
-      return 0
-    } else {
-      return 0 - 1
-    }
-  }
-  if (netClockNowNs() >= deadline) {
-    return netDeadlineTimedOut
-  }
-  return 0 - 1
-}
-
-// Write all `n` bytes of `buf`, bounded by `deadlineNs`. Same result shape as
-// `netReadSockDeadline`: `>= 0` bytes written (always `n` on success — a
-// short write is retried internally, exactly as `netWriteSock` does), `-1` a
-// hard error, `-2` the deadline elapsed first.
-export @symbol("bit_rt_port_net_write_sock_deadline") @nosplit fn netWriteSockDeadline(
-  fd: int,
-  buf: *u8,
-  n: int,
-  deadlineNs: int,
-): int {
-  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
-  let off = 0
-  let polls = 0
-  let slice = netDeadlineFastPollNs
-  while (off < n && polls < netDeadlineMaxPolls) {
-    polls = polls + 1
-    let wrote = int(write(i32(fd), buf + off, i64(n - off)))
-    if (wrote > 0) {
-      off = off + wrote
     } else if (wrote == 0) {
       return 0 - 1
     } else {
-      let e = lastErr()
-      if (e == eAgain()) {
-        if (netClockNowNs() >= deadline) {
-          return netDeadlineTimedOut
-        }
-        let _ = netAwaitDeadlineTick(deadline, slice)
-        slice = netDeadlineNextSliceNs(slice)
-      } else if (e != eIntr()) {
+      let step = netWriteSockWaitStep(fd, gen)
+      if (step < 0) {
         return 0 - 1
+      } else if (step == 1) {
+        stalls = stalls + 1
+      } else {
+        spins = spins + 1
       }
     }
   }
   if (off < n) {
-    if (netClockNowNs() >= deadline) {
-      return netDeadlineTimedOut
-    }
     return 0 - 1
   }
   return off
 }
 
-// Connect to `host:port`, bounded by `deadlineNs`. Same shape as
-// `netDialTcp` above (SO_ERROR read back only once the handshake has
-// completed one way or the other — see that function's comment for why),
-// with the unbounded spin loop there replaced by a deadline check.
-export @symbol("bit_rt_port_net_dial_tcp_deadline") @nosplit fn netDialTcpDeadline(
-  host: *u8,
-  hostLen: int,
-  port: int,
-  deadlineNs: int,
-): int {
-  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
-  let ip = ipBytes()
-  if (!netParseIpv4(host, hostLen, ip)) {
-    return 0 - 1
-  }
-  let fd = netSysSocket(false)
-  if (fd < 0) {
-    return 0 - 1
-  }
-  netFillSockAddr(saBytes(), ip, port)
-  let rc = int(connect(i32(fd), saBytes(), i32(saLen)))
-  if (rc >= 0) {
-    return fd
-  }
-  let e = lastErr()
-  if (e != eInProgress() && e != eAgain() && e != eIntr()) {
-    netClose(fd)
-    return 0 - 1
-  }
-  let polls = 0
-  let slice = netDeadlineFastPollNs
-  while (polls < netDeadlineMaxPolls) {
-    polls = polls + 1
-    if (netClockNowNs() >= deadline) {
-      netClose(fd)
-      return netDeadlineTimedOut
-    }
-    let _ = netAwaitDeadlineTick(deadline, slice)
-    slice = netDeadlineNextSliceNs(slice)
-    // THE ADDRESS IS REBUILT EVERY ATTEMPT — see `netDialTcp`'s identical
-    // comment; `netAwaitDeadlineTick` parks, so another task can leave its own
-    // address in this worker's `saBytes()`/`ipBytes()` slot, or this task can
-    // resume on a different worker's (unfilled) slot (#3273).
-    if (!netParseIpv4(host, hostLen, ip)) {
-      netClose(fd)
-      return 0 - 1
-    }
-    netFillSockAddr(saBytes(), ip, port)
-    let rc2 = int(connect(i32(fd), saBytes(), i32(saLen)))
-    let ce = lastErr()
-    if (rc2 >= 0 || ce == eIsConn()) {
-      if (netSocketError(fd) != 0) {
-        netClose(fd)
-        return 0 - 1
-      }
-      return fd
-    }
-    if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
-      netClose(fd)
-      return 0 - 1
-    }
-  }
-  netClose(fd)
-  return 0 - 1
-}

@@ -34,6 +34,16 @@ import {
   pdOpen, pdWait, pdClose, pdDirRead, pdDirWrite,
   pdClaimed, pdAlreadyReady, pdEmpty,
 } from "../../sched"
+// Per-fd in-flight reference counting (#5886): the Go-style `fdMutex` that
+// defers a real `close(2)` until the last acquired op releases, so a task
+// woken by `netClose` never retries a syscall on an fd number the kernel has
+// already handed to a new socket. `netFdAcquire`/`netFdRelease` below are the
+// thin platform wrappers -- the CAS protocol itself is OS-neutral and lives
+// in `../../sched/polldesc.bit`.
+import {
+  pdFdAcquire, pdFdRelease, pdFdMarkClosing, pdFdClosing,
+  pdFdCloseNow, pdFdCloseDeferred,
+} from "../../sched"
 // `schedCurrentWorker`, `wkId` and `schedMaxWorkers` are already imported by
 // ../netabi.bit (same module — an import is per-module, not per-file).
 // Byte/wire-format marshalling and the sockaddr fields that read the same on
@@ -448,7 +458,18 @@ let netCloseOutBuf: [66]i64
   return netCloseOutR() + 1
 }
 
+// #5886: `close(2)` itself is deferred, not just the wake. `pdFdMarkClosing`
+// decides whether ANY op still holds a ref on `fd` -- if one does, that op's
+// own `netFdRelease` (below) runs the real close when it drops the last ref,
+// and this call only wakes it so it stops retrying rather than actually
+// releasing the fd number out from under it. A second `netClose` on an
+// already-closing fd is `pdFdCloseAlready`: idempotent, matching `Conn.close`/
+// `Listener.close`'s own idempotence one layer up.
 export @symbol("bit_rt_port_net_close") @nosplit fn netClose(fd: int) {
+  let decision = pdFdMarkClosing(fd)
+  if (decision != pdFdCloseNow && decision != pdFdCloseDeferred) {
+    return
+  }
   let taskAddr = schedCurrentTask()
   if (taskAddr != 0) {
     let t = taskAt(taskAddr)
@@ -472,7 +493,26 @@ export @symbol("bit_rt_port_net_close") @nosplit fn netClose(fd: int) {
       }
     }
   }
-  let _ = int(bit_rt_fs_close(i64(fd)))
+  if (decision == pdFdCloseNow) {
+    let _ = int(bit_rt_fs_close(i64(fd)))
+  }
+}
+
+// Acquire one in-flight ref on `fd` for `gen` (the caller's entry-time,
+// cached generation -- see `netFdGen`'s header). Every blocking retry loop
+// in this file/`../darwin/tcp.bit` calls this ONCE, before its first
+// syscall, and must not reach a syscall at all when it fails.
+@nosplit fn netFdAcquire(fd: int, gen: int): bool {
+  return pdFdAcquire(fd, gen)
+}
+
+// Release the ref `netFdAcquire` took. THIS caller runs the real `close(2)`
+// when it turns out to be the last one out while `fd` is closing -- the
+// other half of `netClose`'s deferred close above.
+@nosplit fn netFdRelease(fd: int) {
+  if (pdFdRelease(fd)) {
+    let _ = int(bit_rt_fs_close(i64(fd)))
+  }
 }
 
 export @symbol("bit_rt_port_net_sys_bind") @nosplit fn netSysBind(fd: int, sa: *u8): bool {
@@ -534,7 +574,17 @@ export @symbol("bit_rt_port_net_socket_error") @nosplit fn netSocketError(fd: in
 // BEFORE parking and close the resulting window with `schedParkArm`. See
 // ../../sched/task.bit's "arming a park" section for the state machine and
 // _tests_/stress/netpark for the property.
-export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(fd: int, interest: int): bool {
+// `gen` is the caller's ENTRY-TIME generation (#5886): every retry loop in
+// `../darwin/tcp.bit`/`../darwin/udp.bit` reads it once, before its first
+// syscall, alongside its `netFdAcquire`, and passes the SAME value on every
+// call this loop makes here -- never a fresh `*netFdGenAddr(fd)` read, which
+// would (once the loop holds its own ref) always read as still-current and
+// so could never itself detect a close the way the entry-time value can.
+export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(
+  fd: int,
+  interest: int,
+  gen: int,
+): bool {
   let taskAddr = schedCurrentTask()
   if (taskAddr == 0) {
     return false
@@ -553,7 +603,6 @@ export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(fd: int, interest
   if (interest == pollRead) {
     dir = pdDirRead
   }
-  let gen = *netFdGenAddr(fd)
   // Write is armed LAZILY, here, the first time a write actually blocks —
   // see `pollDescRegisterWrite`'s header for why. Read needs no such check:
   // `netPollDescOpen` already armed it at open time.
