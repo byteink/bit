@@ -1724,6 +1724,18 @@ if (atomicCmpxchg(p, 1, 42)) {              // *p was 1 -> now 42, true
 }
 ```
 
+`ptrOf` also accepts a `string`: `ptrOf(s: string): *u8` is the absolute
+address of `s`'s first byte (runtime/ABI.md §2.3's `ptr` header word, offset
++0). Unlike the slice form there is no separate offset word to scale by an
+element stride - `ptr` is already absolute for a literal, a heap string, and
+an `s[lo:hi]` view alike. The pointer addresses read-only bytes for a static
+literal, whose bytes live in non-writable memory, so a store through it
+faults - the same failure mode as the read-only class's own `ptrOf` (§11.11).
+A store into a heap string's bytes breaks the immutability every other string
+API assumes, and is a program error the checker does not catch. As with the
+slice form, the string stays alive only while the caller keeps it live:
+`keepAlive(s)` after the last raw read.
+
 ### 11.6 Inline Assembly (unmanaged subset)
 
 `asm` embeds machine instructions directly in a function. Like `*T` and the
