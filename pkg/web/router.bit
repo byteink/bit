@@ -7,11 +7,11 @@
 // declaration namespace per directory), and this file's node class is
 // module-private, so it is the one that moved.
 //
-// Lookup cost is the number of segments in the REQUEST, not the number of
-// routes registered — 10 routes or 10,000, the same walk, and it
+// Lookup cost never depends on the number of routes registered: a path
+// naming a route with no `:param`/`*wildcard` segment is one map lookup
+// (`staticRoutes`, #5899); any other is a walk as long as the REQUEST, which
 // short-circuits: `/api/v1/users/123` fails at segment one if nothing is
-// registered under `/api` (see router.test.bit's `route table of 1000...`
-// case for the measurement).
+// registered under `/api` (router.test.bit's `route table of 1000...` case).
 //
 // Precedence at each node is static, then param, then wildcard, decided at
 // MATCH time by `tryStatic`/`tryParam`/`tryWildcard` in that order — never by
@@ -119,6 +119,14 @@ export class Router {
   root: TrieNode
   errors: []string
   frozen: bool
+  // Every node with handlers that is reached through static segments only,
+  // keyed by `staticKey` of its path — built once by `freeze()`, read first
+  // by `lookup()`. Exact, not a cache that can disagree with the trie:
+  // `matchNode` tries a static child before a param or wildcard at every
+  // level and accepts any node with handlers, so for such a path the walk
+  // returns this same node. `nil` until a clean `freeze()`, which reads as
+  // a miss and falls through to the walk.
+  staticRoutes: map<string, TrieNode>
 
   init() {
     this.root = newNode()
@@ -225,12 +233,16 @@ export class Router {
     if (len(this.errors) > 0) {
       fail newError(join(this.errors, "\n"))
     }
+    let routes = map<string, TrieNode>()
+    collectStatic(this.root, "", 0, routes)
+    this.staticRoutes = routes
   }
 
   // Matches `path` against the frozen trie and looks up `method` at the
-  // resolved node. Three outcomes: a `Match`, a plain "no route" `error`
-  // (nothing registered for this path under any method), or a
-  // `MethodNotAllowed` (this exact path IS registered, just not for
+  // resolved node — through `staticRoutes` when the path names a static
+  // route, else by the segment walk. Three outcomes: a `Match`, a plain
+  // "no route" `error` (nothing registered for this path under any method),
+  // or a `MethodNotAllowed` (this exact path IS registered, just not for
   // `method`) — the 404-vs-405 distinction the ticket requires.
   //
   // Named `lookup`, not the ticket's literal `match` — `match` is a
@@ -241,11 +253,15 @@ export class Router {
     if (!this.frozen) {
       fail newError("router: lookup() called before freeze()")
     }
+    let (node, hit) = this.staticRoutes[staticKey(path)]
+    if (hit) {
+      return finishMatch(node, nil, method, path)?
+    }
     let segs = splitSegments(path)
     let r = matchNode(this.root, segs, 0)
     match (r) {
       None => fail newError("no route matches ${method} ${path}")
-      Some(mi) => return finishMatch(mi, method, path)?
+      Some(mi) => return finishMatch(mi.node, paramsMap(mi.params), method, path)?
     }
   }
 }
@@ -284,6 +300,39 @@ fn splitSegments(path: string): []string {
     p = p[1:len(p)]
   }
   return split(p, "/")
+}
+
+// `path` spelled the way `splitSegments` reads it: `""` for the root, else
+// the path minus one leading `/`. `split` is exactly undone by `join`, so
+// two paths share a key iff they split to the same segments, which is what
+// lets `staticRoutes` stand in for the walk. A string slice is a view, not
+// a copy (SPEC §12.6), so computing the key allocates nothing.
+fn staticKey(path: string): string {
+  if (path == "/" || path == "") {
+    return ""
+  }
+  if (path[0] == '/') {
+    return path[1:len(path)]
+  }
+  return path
+}
+
+// Fills `out` for `Router.staticRoutes`: `node` is reached from the root by
+// static segments whose `staticKey` is `key`, `depth` of them. Only static
+// children are followed; a node under a param or wildcard edge needs a
+// capture, so it is the walk's. Recursion depth is the longest registered
+// pattern's segment count.
+fn collectStatic(node: TrieNode, key: string, depth: int, out: map<string, TrieNode>) {
+  if (len(node.handlers) > 0) {
+    out[key] = node
+  }
+  for (seg, child) of node.staticChildren {
+    let childKey = seg
+    if (depth > 0) {
+      childKey = "${key}/${seg}"
+    }
+    collectStatic(child, childKey, depth + 1, out)
+  }
 }
 
 fn joinFrom(segs: []string, idx: int): string {
@@ -385,12 +434,14 @@ fn tryWildcard(node: TrieNode, segs: []string, idx: int): Option<MatchInternal> 
   }
 }
 
-fn finishMatch(mi: MatchInternal, method: string, path: string): Match! {
-  let (h, ok) = mi.node.handlers[method]
+// `params` is `paramsMap` of the walk's bindings, or `nil` straight from
+// `staticRoutes` — a static route captures nothing either way.
+fn finishMatch(node: TrieNode, params: map<string, string>, method: string, path: string): Match! {
+  let (h, ok) = node.handlers[method]
   if (!ok) {
-    fail MethodNotAllowed{ method = method, path = path, allowed = allowedMethods(mi.node) }
+    fail MethodNotAllowed{ method = method, path = path, allowed = allowedMethods(node) }
   }
-  let (registered, hasPattern) = mi.node.handlerPattern[method]
+  let (registered, hasPattern) = node.handlerPattern[method]
   if (!hasPattern) {
     // Unreachable through `add()`, which writes both maps in one step
     // (`registerHandler`). Asserted rather than defaulted to "": an empty
@@ -398,7 +449,7 @@ fn finishMatch(mi: MatchInternal, method: string, path: string): Match! {
     // from nothing, and a wrong Location is worse than a loud stop.
     panic("web: router: ${method} ${path} has a handler but no registered pattern")
   }
-  return Match{ handler = h, params = paramsMap(mi.params), pattern = registered }
+  return Match{ handler = h, params = params, pattern = registered }
 }
 
 // #5863: most routes, and both of the bench app's, capture no dynamic

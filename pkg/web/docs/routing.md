@@ -2,10 +2,14 @@
 
 <!-- doctest: per-block -->
 
-The router is a radix trie over path segments: lookup cost is the number of
-segments in the *request*, not the number of routes registered, and it
-short-circuits on the first segment that matches nothing. This chapter is
-about registering a route and getting back what it captured.
+The router is a radix trie over path segments, and lookup cost never grows
+with the number of routes registered. A request for a route with no param or
+wildcard segment, such as `/health`, is one map lookup: the app indexes every
+such route by its path when it freezes its route table (`App.freeze()` or
+`App.listen()`). Any other request walks the trie one segment at a time and
+stops at the first segment that matches nothing. Either way the answer is the
+same, including which route wins below. This chapter is about registering a
+route and getting back what it captured.
 
 ## Static, param and wildcard segments
 
