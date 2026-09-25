@@ -23,7 +23,7 @@
 // sched block — beside its only callers (`armForWork`/`disarmForWork` below),
 // exactly as ../darwin/bootworker.bit does it, and without reformatting a file
 // `tools/build/gatesfmtdebt.bit` still lists as unformatted.
-import { schedPollerArm, schedPollerDisarm, worker0SpinTurns } from "../../sched"
+import { schedPollerArm, schedPollerDisarm, worker0SpinTurns, worker0SpinWindowNs } from "../../sched"
 // Set once per worker thread at the top of `workerBody` (#5884); see there.
 import { parkLowerTimerSlack } from "../../park/linux"
 
@@ -327,26 +327,43 @@ const worker0WaitCeilingNs: int = 1000000000
 // it will not reach until the wait returns.
 //
 // THE PRE-BLOCK POLL BURST (#5884). On a turn that followed work (`burst`,
-// the #3260 budget `workerBody` keeps), up to `worker0SpinTurns` probes run
-// before the wait: `schedWorkPending` and a zero-timeout drain. Any hit ends
-// the wait unslept, exactly as the blocking drain ending would, and the
-// caller's next turn re-arms and looks again. This is what catches the next
-// keep-alive request without a sleep and a wake; the arm stays set, so a
-// producer's wake is read by the burst's drain or ends the wait at once.
+// the #3260 budget `workerBody` keeps), and only while worker 0 last went
+// idle less than `worker0SpinWindowNs` before `now`, up to
+// `worker0SpinTurns` probes run before the wait: `schedWorkPending` and a
+// zero-timeout drain. Any hit ends the wait unslept, exactly as the blocking
+// drain ending would, and the caller's next turn re-arms and looks again.
+// This is what catches the next keep-alive request without a sleep and a
+// wake; the arm stays set, so a producer's wake is read by the burst's drain
+// or ends the wait at once. The window keeps a burst off where it cannot
+// pay: events further apart than it, and an idle process's periodic wakes.
 //
 // DECLARED ABOVE ITS CALLER, same reason `spinForWork` above is.
-fn worker0Wait(s: *i64, w: *i64, burst: bool) {
+fn worker0Wait(s: *i64, w: *i64, burst: bool, now: int) {
   let k = 0
-  while (burst && k < worker0SpinTurns) {
+  if (!burst || now - *ptrOf(worker0IdleAt) >= worker0SpinWindowNs) {
+    k = worker0SpinTurns
+  }
+  while (k < worker0SpinTurns) {
     k = k + 1
     if (schedWorkPending(w) || pollDrain(int(s), 0) != 0) {
+      worker0IdleSet(now)
       return
     }
   }
   // The clock is read HERE, not reused from the find-work pass above: a stale
   // `now` lengthens the wait by however long that pass took.
-  let waitNs = schedParkBoundNs(worker0WaitCeilingNs, parkMonoNs(w + wkSleepReq))
-  let _ = pollDrain(int(s), waitNs)
+  let t = parkMonoNs(w + wkSleepReq)
+  worker0IdleSet(t)
+  let _ = pollDrain(int(s), schedParkBoundNs(worker0WaitCeilingNs, t))
+}
+
+// When worker 0 last went idle: the start of its last blocking wait, or the
+// turn a burst caught work on. Read and written only by worker 0's thread.
+let worker0IdleAt: [1]i64
+
+@nosplit fn worker0IdleSet(t: int) {
+  let q = ptrOf(worker0IdleAt)
+  *q = t
 }
 
 // Publish this worker's intent to wait, before its find-work pass. Two
@@ -577,7 +594,8 @@ fn workerBody(arg: *byte): *byte {
     // for a parking worker, `worker0Wait`'s `epoll_pwait2` for worker 0
     // (#5745; the darwin twin is #5744).
     armForWork(s, w, parks)
-    let addr = schedFindWorkAt(w, parkMonoNs(w + wkSleepReq))
+    let now = parkMonoNs(w + wkSleepReq)
+    let addr = schedFindWorkAt(w, now)
     let woke = 0
     if (addr == 0) {
       woke = pollDrain(int(s), 0)
@@ -603,7 +621,7 @@ fn workerBody(arg: *byte): *byte {
         if (parks) {
           schedIdlePark(s, w)
         } else {
-          worker0Wait(s, w, spin)
+          worker0Wait(s, w, spin, now)
           spin = false
           // Awake, whichever way that wait ended — the arm is cleared on every
           // exit path, exactly as `schedIdlePark` clears `wkPark` on its own.
