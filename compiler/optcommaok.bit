@@ -1,8 +1,8 @@
 // compiler/optcommaok.bit: a comma-ok map read's miss edge stops building a
-// zero object that nothing on the miss path can read (#5905). Same module as
-// opt.bit, so nothing here needs an import. `optimizeModule` runs
-// `nullCommaOkMisses` ahead of the DCE whose `deadAllocs` (optalloc.bit) then
-// deletes the allocation this pass leaves unnamed, with its stores.
+// zero object when the key is absent and nothing can read it (#5905, #5911).
+// Same module as opt.bit, so nothing here needs an import. `optimizeModule`
+// runs `nullCommaOkMisses` after inlining, so a read is judged by its
+// caller's guards.
 //
 // ## What it removes
 //
@@ -15,23 +15,29 @@
 //   J(p): ...
 //
 // so `if (ok) { use(n) }` pays one allocation per miss for a `p` the miss path
-// never reads. Handing M's edge `v` (the null word) instead of `z` leaves `z`
-// with no reader.
+// never reads. The pass splits M on `ok`:
+//
+//   M':   br ok, Z(), J(v)
+//   Z:    z = gc_alloc V; ...; jump J(z)
+//
+// Z is M unchanged. An absent key leaves through M' with the null word and
+// skips the allocation; a present key holding null still gets the zero object.
 //
 // ## The proof obligation, and the refusal
 //
 // SPEC §12.6 and §13.4: a missing key reads as V's zero value, and "every
 // context that produces a zero value produces the same zero value". A program
-// that reads `p` after a miss must see the zero object, so the rewrite is
-// allowed only when no read of `p` can execute on a miss. Two facts carry it.
+// that reads `p` after a miss must see the zero object, so the null word is
+// allowed only where no read of `p` can execute. Two facts carry it.
 //
-// 1. M is entered exactly when `ok` is false. `map_val_at` at a negative slot
-//    reads the null word (runtime/ABI.md §15), and a value of a type whose zero
-//    is a live record is never the null word (§12.6: "a usable empty/zero
-//    object, never a null reference"). So `v == nil` iff `slot < 0` iff `!ok`.
-//    That is why the miss edge must carry a `gc_alloc` made in M: a string or
-//    slice zero allocates nothing, and an empty slice IS the null header
-//    (lowerslicefill.bit's `zeroValue`), so there `v == nil` is no miss proof.
+// 1. `p` is the null word only when `ok` is false. M' tests `ok` itself, so
+//    this holds by construction. It does NOT follow from `v == nil`: a key can
+//    be present and hold null (a failed two-result type assertion, SPEC §14.4,
+//    or a receive from a closed channel), and then `v == nil` with `ok` true.
+//    That hit enters M, takes M''s ok-true edge and builds the zero object
+//    exactly as it did before the pass (#5911). The miss edge must carry a
+//    `gc_alloc` made in M because that is what there is to skip: a string or
+//    slice zero allocates nothing.
 // 2. Every read of `p` is DOMINATED by an ok-true edge. A guard is a block X
 //    ending `br ok, S, _` or `br ok == false, _, S` whose ok-true successor S
 //    has X as its only predecessor, so S dominates what that edge dominates.
@@ -41,14 +47,16 @@
 //    path precedes every S, so if a use U is dominated by S, no path runs from
 //    a J to U without passing S after it (entry->J->U would avoid S). The `ok`
 //    that S's edge tested is therefore `p`'s own, and it was true, so by 1.
-//    `p` came from the hit edge. Liveness, not a pattern: a guard anywhere,
-//    any number of them, and a use anywhere they dominate.
+//    `p` is not the null word. Liveness, not a pattern: a guard anywhere, any
+//    number of them, and a use anywhere they dominate. This is judged on the
+//    CFG as lowered; the split only puts M' on the H->M edge, and M' reaches
+//    nothing but Z and J, so the pairing and every dominance it used survive.
 //
 // A block argument is not a read. `p` passed to a parameter nothing names is
 // dead there; `p` passed along a guard's own ok-true edge, or out of a block a
-// guard dominates, carries a value 2. already proved came from a hit. Any other
-// use refuses and the miss keeps its zero object: `p` read after the `if`,
-// passed to a call on both paths, stored into a field before the check
+// guard dominates, carries a value 2. already proved is not the null word. Any
+// other use refuses and M is left whole: `p` read after the `if`, passed to a
+// call on both paths, stored into a field before the check
 // (_tests_/cases/run_map_commaok_miss_zero.bit pins all three).
 
 // One rewritable miss: the probe block `h`, the miss block, the join and the
@@ -169,12 +177,16 @@ fn commaOkMissAt(f: IrFunc, mf: MissFacts, h: int): CommaOkMiss {
   return CommaOkMiss{ h = h, miss = br.ival2, join = br.ival, pi = pi, v = v, ok = ok, jump = jt }
 }
 
-// The miss block's `jump` when the CFG is exactly the header's: the miss block
-// has `h` as its only predecessor and jumps to the join, and the join, which is
-// not `h`, has those two predecessors and no other. -1 otherwise.
+// The miss block's `jump` when the CFG is exactly the header's: the miss block,
+// which takes no parameter, has `h` as its only predecessor and jumps to the
+// join, and the join, which is not `h`, has those two predecessors and no
+// other. -1 otherwise.
 fn missJump(f: IrFunc, pm: PredMap, h: int, br: IrInstr): int {
   let jt = blockTerm(f, br.ival2)
-  if (jt < 0 || br.ival == h || f.instrs[jt].op != Op.Jump || f.instrs[jt].ival != br.ival) {
+  if (jt < 0 || br.ival == h || br.ival2 == h || f.blocks[br.ival2].paramCount != 0) {
+    return -1
+  }
+  if (f.instrs[jt].op != Op.Jump || f.instrs[jt].ival != br.ival) {
     return -1
   }
   if (predCount(pm, br.ival2) != 1 || predCount(pm, br.ival) != 2) {
@@ -184,18 +196,23 @@ fn missJump(f: IrFunc, pm: PredMap, h: int, br: IrInstr): int {
 }
 
 // The join-parameter index where the hit edge passes `v` and the miss edge a
-// `gc_alloc` made in the miss block itself, or -1.
+// `gc_alloc` made in the miss block itself, or -1. Also -1 when the miss edge
+// passes anything else made there: the split's ok-false edge leaves before
+// the miss block's body runs, so it can only carry values from above it.
 fn zeroArgIndex(f: IrFunc, blockOf: []int, br: IrInstr, jump: IrInstr): int {
   let v = f.instrs[br.lhs].lhs
+  let pi = -1
   let k = 0
   while (k < len(jump.args) && k < len(br.thenArgs)) {
     let z = jump.args[k]
-    if (br.thenArgs[k] == v && f.instrs[z].op == Op.GcAlloc && blockOf[z] == br.ival2) {
-      return k
+    if (pi < 0 && br.thenArgs[k] == v && f.instrs[z].op == Op.GcAlloc && blockOf[z] == br.ival2) {
+      pi = k
+    } else if (blockOf[z] == br.ival2) {
+      return -1
     }
     k = k + 1
   }
-  return -1
+  return pi
 }
 
 // The ok-true successor of block `x`'s terminator, or -1 when `x` does not
@@ -358,28 +375,108 @@ fn namesValue(f: IrFunc, i: int, id: int): bool {
   return false
 }
 
-// The miss block's `jump` with `v` in place of the zero object. A fresh
-// instruction rather than an edit, so no other function holding the old one
-// sees the change.
-fn rewriteMissJump(f: IrFunc, c: CommaOkMiss) {
-  let old = f.instrs[c.jump]
-  let j = mkInstr(Op.Jump, old.ty)
-  j.ival = old.ival
-  j.span = old.span
+// The rebuild's state: per old block, the new id it maps to (a split miss
+// block maps to its `br ok` block) and, for a split one, the new id of the
+// block that keeps its body; `-1` where the block is not split.
+class SplitCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  remap: []int,
+  blockMap: []int,
+  zeroBlk: []int,
+  known: []ConstVal,
+}
+
+// Old block `bi` copied into the builder under new id `id`.
+fn copyBlock(x: SplitCtx, bi: int, id: int) {
+  let blk = x.f.blocks[bi]
+  builderBeginBlock(x.b, id)
+  let idx = blk.instsStart
+  while (idx < blk.instsStart + blk.paramCount) {
+    x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  while (idx < blk.instsStart + blk.instsLen) {
+    emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+    idx = idx + 1
+  }
+  builderEndBlock(x.b)
+}
+
+// The miss block's replacement: `br ok, Z(), J(..v..)`, the old jump's
+// arguments with `v` in place of the zero object. Z is the old miss block,
+// copied next, so a present key holding null still gets the zero object.
+fn emitOkSplit(x: SplitCtx, c: CommaOkMiss) {
+  let old = x.f.instrs[c.jump]
+  builderBeginBlock(x.b, x.blockMap[c.miss])
+  let br = mkInstr(Op.Br, old.ty)
+  br.lhs = x.remap[c.ok]
+  br.ival = x.zeroBlk[c.miss]
+  br.ival2 = x.blockMap[c.join]
+  br.span = old.span
   let k = 0
   while (k < len(old.args)) {
     let a = old.args[k]
     if (k == c.pi) {
       a = c.v
     }
-    j.args = append(j.args, a)
+    br.elseArgs = append(br.elseArgs, x.remap[a])
     k = k + 1
   }
-  f.instrs[c.jump] = j
+  builderEmit(x.b, br)
+  builderEndBlock(x.b)
 }
 
-// The pass. Adds no block and moves no edge, so the predecessor map and the
-// block of every instruction stay valid across the rewrites it makes.
+// `f` rebuilt with every candidate's miss block split on `ok`. New blocks
+// take their ids in emission order, the split one right before the body it
+// guards, so the rebuilt schedule stays the linear one `blockEmissionOrder`
+// read (optrebuild.bit). Every instruction is copied, so `f` keeps its flags.
+fn splitCommaOkMisses(f: IrFunc, cs: []CommaOkMiss): IrFunc {
+  let n = len(f.blocks)
+  let splitOf = []int(n)
+  let x = SplitCtx{
+    b = newBuilder(), f = f, remap = []int(len(f.instrs)), blockMap = []int(n),
+    zeroBlk = []int(n), known = []ConstVal(len(f.instrs)),
+  }
+  let i = 0
+  while (i < len(f.instrs)) {
+    x.known[i] = noConst()
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    splitOf[i] = -1
+    i = i + 1
+  }
+  i = 0
+  while (i < len(cs)) {
+    splitOf[cs[i].miss] = i
+    i = i + 1
+  }
+  let order = blockEmissionOrder(f)
+  for bi of order {
+    x.blockMap[bi] = builderNewBlock(x.b)
+    x.zeroBlk[bi] = -1
+    if (splitOf[bi] >= 0) {
+      x.zeroBlk[bi] = builderNewBlock(x.b)
+    }
+  }
+  for bi of order {
+    if (splitOf[bi] >= 0) {
+      emitOkSplit(x, cs[splitOf[bi]])
+      copyBlock(x, bi, x.zeroBlk[bi])
+    } else {
+      copyBlock(x, bi, x.blockMap[bi])
+    }
+  }
+  f.blocks = x.b.blocks
+  f.instrs = x.b.instrs
+  f.keepAlive = trKeepAlive(f.keepAlive, x.remap)
+  return f
+}
+
+// The pass. Every candidate is judged on the function as lowered, then all of
+// them are split in one rebuild, so no judgement reads a CFG the pass changed.
 fn nullCommaOkMisses(f: IrFunc): IrFunc {
   if (!hasMapValAt(f)) {
     return f
@@ -389,13 +486,17 @@ fn nullCommaOkMisses(f: IrFunc): IrFunc {
     blockOf = computeBlockOfInstr(f),
     uses = useCounts(f),
   }
+  let cs = []CommaOkMiss(0)
   let h = 0
   while (h < len(f.blocks)) {
     let c = commaOkMissAt(f, mf, h)
     if (c.h >= 0 && missReadsNothing(f, mf, c)) {
-      rewriteMissJump(f, c)
+      cs = append(cs, c)
     }
     h = h + 1
   }
-  return f
+  if (len(cs) == 0) {
+    return f
+  }
+  return splitCommaOkMisses(f, cs)
 }

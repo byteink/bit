@@ -584,23 +584,26 @@ bb5():
     fail=1
   fi
 
-  # --- #5905: a comma-ok miss's unread zero object, post-opt only ---
+  # --- #5905: a comma-ok miss split on `ok`, post-opt only (#5911) ---
   #
   # Real dump text from `_tests_/cases/ir_map_commaok_miss.bit`'s `hitOnly`
-  # (this tree vs the pinned stage0): the miss block passes the probed word.
+  # (this tree vs the pinned stage0): the miss block tests `ok` first.
   oracle_cm='  %5 = rt_call map_val_at(%0, %2) Obj
   br %7, bb2(%5), bb1()
 bb1():
   %9 = gc_alloc size=8 ptrs=[] Obj
   jump bb2(%9)'
   bit2_cm='  %5 = rt_call map_val_at(%0, %2) Obj
-  br %7, bb2(%5), bb1()
+  br %7, bb3(%5), bb1()
 bb1():
-  jump bb2(%5)'
+  br %4, bb2(), bb3(%5)
+bb2():
+  %10 = gc_alloc size=8 ptrs=[] Obj
+  jump bb3(%10)'
   sigc1=$(explainMismatch "$oracle_cm" "$bit2_cm" iropt)
   rcc1=$?
   if [ "$rcc1" -ne 0 ] || [ "$sigc1" != "5905-commaok-miss-zero-drop" ]; then
-    echo "FAIL: the real #5905 dropped zero object was not explained (rc=$rcc1 sig='$sigc1')"
+    echo "FAIL: the real #5905 split miss was not explained (rc=$rcc1 sig='$sigc1')"
     fail=1
   fi
   # REJECTION: lowering never drops it, so the same delta under `ir`.
@@ -610,14 +613,13 @@ bb1():
     echo "FAIL: a #5905 delta was wrongly explained pre-opt (rc=$rcc2 sig='$sigc2')"
     fail=1
   fi
-  # REJECTION: an allocation dropped where no comma-ok read exists is not
-  # this signature's (#5871's looser tuple identity may still take it).
+  # REJECTION: a `br` added where no comma-ok read exists.
   sigc3=$(explainMismatch "${oracle_cm//map_val_at/map_get}" "${bit2_cm//map_val_at/map_get}" iropt)
   if [ "$sigc3" = "5905-commaok-miss-zero-drop" ]; then
-    echo "FAIL: a dropped allocation with no map_val_at was explained as #5905"
+    echo "FAIL: an added br with no map_val_at was explained as #5905"
     fail=1
   fi
-  # REJECTION: the zero object is gone AND another opcode moved.
+  # REJECTION: the miss is split AND another opcode moved.
   sigc4=$(explainMismatch "$oracle_cm" "${bit2_cm}
   %99 = field_get %5[0] i64" iropt)
   rcc4=$?
@@ -704,16 +706,17 @@ bb25():
     fi
   done
 
-  # Composed with #5905 post-opt: the same site plus one dropped miss zero
-  # object is explained while a `map_val_at` backs each drop, not past that.
-  zo='  %140 = gc_alloc size=8 ptrs=[] (i64)'
+  # Composed with #5905 post-opt: the same site plus one miss split on `ok`
+  # (one more `br`) is explained while a `map_val_at` backs each split, not
+  # past that.
+  sb='  br %4, bb2(), bb3(%5)'
   va='  %132 = rt_call map_val_at(%105, %114) i64'
-  for ms in "0|$zo" "1|$zo
-$zo"; do
+  for ms in "0|$sb" "1|$sb
+$sb"; do
     IFS='|' read -r -d '' msk msz <<<"$ms"
     sigms=$(explainMismatch "$oracle_ms_opt
-${msz%$'\n'}
 $va" "$bit2_ms_opt
+${msz%$'\n'}
 $va" iropt)
     rcms=$?
     if [ "$rcms" != "$msk" ]; then

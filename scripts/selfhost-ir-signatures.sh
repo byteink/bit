@@ -413,19 +413,19 @@ explainMismatch() {
         }
       }
 
-      # --- #5905, POST-OPT ONLY: the unread zero object of a comma-ok miss ---
+      # --- #5905, POST-OPT ONLY: a comma-ok miss skips its zero object ---
       #
-      # `nullCommaOkMisses` (compiler/optcommaok.bit) hands a comma-ok map
-      # read miss edge the null word instead of the zero object when every
-      # read of the value sits behind an ok-true edge, and `deadAllocs` then
-      # deletes that `gc_alloc` (its `field_set`s score as nothing). Reaches
-      # two corpus files, both its own fixtures (this tree vs 0ddd85504,
-      # `iropt` only): `gc_alloc` falls by N >= 1 and nothing else moves.
-      # Every such miss belongs to a comma-ok read, so the file must still
-      # hold at least N `map_val_at` calls.
-      if (kind == "iropt" && ("gc_alloc" in moved) && delta["gc_alloc"] < 0) {
-        okMiss = (b["rt_call:map_val_at"] >= -delta["gc_alloc"])
-        for (op in moved) { if (op != "gc_alloc") okMiss = 0 }
+      # `nullCommaOkMisses` (compiler/optcommaok.bit) splits the miss block of a
+      # comma-ok map read on `ok` when every read of the value sits behind an
+      # ok-true edge: one new `br ok` whose ok-false edge passes the null
+      # word, while the zero object stays behind its ok-true edge for a
+      # present key holding null (#5911). Reaches three corpus files, all its
+      # own fixtures (this tree vs stage0, `iropt` only): `br` rises by
+      # N >= 1 and nothing else moves. Every split belongs to a comma-ok read,
+      # so the file must hold at least N `map_val_at` calls.
+      if (kind == "iropt" && ("br" in moved) && delta["br"] > 0) {
+        okMiss = (b["rt_call:map_val_at"] >= delta["br"])
+        for (op in moved) { if (op != "br") okMiss = 0 }
         if (okMiss) { print "5905-commaok-miss-zero-drop"; exit 0 }
       }
 
@@ -710,10 +710,10 @@ explainMismatch() {
       } else {
         msw["gc_alloc"] = -MSn; msw["field_get"] = -2 * MSq; msw["icmp_eq"] = -2 * MSq
         msw["icmp_ne"] = -MSq; msw["const_nil"] = -MSq; msw["br"] = -3 * MSq
-        # Composed with #5905 (run_map_commaok_miss_zero): each dropped miss
-        # zero object is one more `gc_alloc`, under the #5905 anchor.
-        msx = msw["gc_alloc"] - (delta["gc_alloc"] + 0)
-        if (msx > 0 && b["rt_call:map_val_at"] >= msx) msw["gc_alloc"] -= msx
+        # Composed with #5905 (run_map_commaok_miss_zero): each split miss
+        # is one more `br`, under the #5905 anchor.
+        msx = (delta["br"] + 0) - msw["br"]
+        if (msx > 0 && b["rt_call:map_val_at"] >= msx) msw["br"] += msx
       }
       okMapStr = (MSn > 0)
       for (op in moved) { if (!(op in msw)) okMapStr = 0 }
