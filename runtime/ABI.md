@@ -280,6 +280,14 @@ explode (§1.2.1's eligibility, `explodedWordTypes`) and the word list must fit
 the return-register budget (`retWordsFitRegisters`; a return word past the
 fifth int or sixth float word has no path).
 
+**A fallible result** `T!E` is decided on its ok type alone (#5874): the
+error rides §13's per-task slot and never a return register. An ok type that
+is a tuple of words (`tupleWordTypes`) returns in words under the rules here,
+and every err-path `ret` carries one zero constant per word
+(`fallibleZeroArgs`, `compiler/lowerfail.bit`), which no caller reads (§13).
+A `string`, `decimal` or enum ok type keeps one handle, and so does every
+method whose name an interface declares with a fallible result.
+
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
 per-declaration exclusions, plus the whole-project requirement that nothing can
@@ -3027,8 +3035,8 @@ have the mapping compiled into it.
 ## 13. Fallible results — the error channel (SPEC.md §18)
 
 A fallible function (`T!`) returns its **ok value** in the normal return
-register (`rax` / `x0`, or `xmm0` / `d0` for a float ok), exactly like a
-non-fallible one. The **error** rides a separate side channel: a per-task
+register (`rax` / `x0`, or `xmm0` / `d0` for a float ok), or in the return
+words of §1.2.2 for a tuple ok type, exactly like a non-fallible one. The **error** rides a separate side channel: a per-task
 scratch slot, accessed through two symbols.
 
 ```
