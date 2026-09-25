@@ -17,6 +17,12 @@ import { schedPollTryEnter, schedPollLeave } from "../../sched"
 import { schedPollPendingInc, schedPollPendingDec, schedPollPendingCount } from "../../sched"
 import { pollDrainWakeOnly, schedPollerWaitNs } from "../../sched"
 import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
+// pollDesc (#5864): the register-once model's per-fd table. `pollDescRegister`/
+// `pollDescUnregister` below arm/retract the kernel side exactly once per fd
+// life; `pollDrain`'s new decode branch routes a readiness event through
+// `pdWake` to find whichever task is CURRENTLY parked in that (fd, dir) slot,
+// instead of the kernel event itself carrying a task pointer.
+import { pdWake, pdDirRead, pdDirWrite, pdEmpty } from "../../sched"
 
 // int kqueue(void);
 // int kevent(int kq, const kevent *changelist, int nchanges,
@@ -182,6 +188,20 @@ let tsBuf: [2]i64
   while (k < 8) {
     let p = base + off + k
     *p = u8(v / (1 << (8 * k)) % 256)
+    k = k + 1
+  }
+}
+
+// `writeU64` above uses `/`/`%`, which mishandle a NEGATIVE `v` — fine for
+// its existing callers (a task pointer or an fd is always positive), but
+// `pollDescArm` below deliberately writes a negative `udata`. This sibling
+// uses `>>`/`&` instead: exact for either sign, since both only ever touch
+// the low 8 bits of `v >> (8 * k)`.
+@nosplit fn writeI64(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 8) {
+    let p = base + off + k
+    *p = u8((v >> (8 * k)) & 255)
     k = k + 1
   }
 }
@@ -443,6 +463,22 @@ export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
   return true
 }
 
+// Read a signed 16-bit field — `filter` (EVFILT_READ/WRITE are negative), the
+// one field `readU64` cannot serve. Little-endian, matching `writeI16`.
+@nosplit fn readI16(base: *u8, off: int): int {
+  let p0 = base + off
+  let p1 = base + off + 1
+  let u = int(*p0) + int(*p1) * 256
+  if (u >= 32768) {
+    u = u - 65536
+  }
+  return u
+}
+
+// pollDescRegister/pollDescRegisterWrite/pollDescArm/pollDescUnregister/
+// pollDescDisarm moved to ./pollonce.bit (#5865, #4428's 800-line ceiling) —
+// pure move, same module, no import needed.
+
 // True when this drain can answer without entering the kernel — either there
 // is no poller at all, or nothing is armed on it.
 //
@@ -558,6 +594,83 @@ export @symbol("bit_rt_port_sched_poll_unregister") @nosplit fn pollUnregister(
 //
 // The linux twin carries the same correction; see `_tests_/bit/pollfree/`'s
 // `exceptionsSchedPollLinux`, which rested on the identical claim (#5723).
+// One drained event's outcome — folded out of `pollDrain`'s loop body to
+// keep it under E0201/E0203/E0204's ceilings after #5865 added a second
+// decode branch. Neither constant collides with a real woken-task id: both
+// are non-positive, and `schedPollUnpark`'s caller never receives one back.
+const pollEventNothing: int = 0
+const pollEventWoken: int = 0 - 1
+const pollEventSawWake: int = 0 - 2
+
+// Register-once event (#5865): `udata` is `0 - gen`, not a task pointer —
+// EV_CLEAR means this filter stays armed, so the kernel event names the
+// (fd, dir) slot, and `pdWake` finds whoever is CURRENTLY parked there (or
+// records the edge for the next waiter). The count this decrements tracks
+// live PARKED WAITERS now, not live kernel registrations
+// (`netAwaitReady`/`netReadSockDeadline` increment it on a successful
+// `pdWait`), so it drops only when `pdWake` actually finds a task to remove.
+@nosplit fn pollDrainDescEvent(s: *i64, base: *u8, off: int, udata: int): int {
+  let fd = readU64(base, off + kqIdentOff)
+  let filter = readI16(base, off + kqFilterOff)
+  let dir = pdDirWrite
+  if (filter == evfiltRead()) {
+    dir = pdDirRead
+  }
+  let taskId = pdWake(fd, dir, 0 - udata)
+  if (taskId == pdEmpty) {
+    return pollEventNothing
+  }
+  schedPollPendingDec()
+  if (schedPollUnpark(s, taskId)) {
+    return pollEventWoken
+  }
+  return pollEventNothing
+}
+
+// Legacy one-shot `pollRegister` event: `udata` is the task pointer directly
+// (always positive — a real heap address never sets the sign bit), the
+// discriminator `pollDescArm`'s negative `udata` relies on. Kept for
+// `_tests_/stress/schedpolldarwin` and its siblings, which build their own
+// private scheduler+poller pair and call `pollRegister` directly
+// (../netpoll.bit's own header).
+@nosplit fn pollDrainLegacyEvent(s: *i64, task: int): int {
+  // The kernel's one-shot edge is consumed here regardless of what
+  // `schedPollUnpark` does with it below — the registration this decrements
+  // was armed once and the kernel just reported it exactly once, so the
+  // count must drop whether or not a task was there to catch it.
+  schedPollPendingDec()
+  // `schedPollUnpark`, NOT `schedUnpark`: a one-shot registration means this
+  // readiness edge is already consumed, so a task caught between registering
+  // and parking must be handed the wake rather than have it dropped. See
+  // ../task.bit's "arming a park" section.
+  if (schedPollUnpark(s, task)) {
+    return pollEventWoken
+  }
+  return pollEventNothing
+}
+
+// One event slot's outcome, `pollEventNothing`/`pollEventWoken`/
+// `pollEventSawWake`. `off` is this event's byte offset into `base`.
+@nosplit fn pollDrainEvent(s: *i64, base: *u8, off: int): int {
+  let udata = readU64(base, off + kqUdataOff)
+  if (udata < 0) {
+    return pollDrainDescEvent(s, base, off, udata)
+  }
+  if (udata != 0) {
+    return pollDrainLegacyEvent(s, udata)
+  }
+  // #5717's EVFILT_USER wake filter — `udata` 0, which `pollArmWake` chose
+  // precisely because no real registration can carry it. NOT counted by
+  // `schedPollPendingDec`: the filter is `EV_CLEAR` and permanent, never one
+  // of the `EV_ONESHOT` registrations that counter tracks.
+  //
+  // Retrieving it here is what CONSUMES it (`EV_CLEAR`), so reporting 0 for
+  // a drain whose only event was this hands the caller a spent wake and then
+  // tells it to sleep — with `scPollWait` already claimed by the producer,
+  // nothing can wake it again before `worker0WaitCeilingNs`.
+  return pollEventSawWake
+}
+
 export @symbol("bit_rt_port_sched_poll_drain") @nosplit fn pollDrain(
   schedAddr: int,
   timeoutNs: int,
@@ -597,32 +710,10 @@ export @symbol("bit_rt_port_sched_poll_drain") @nosplit fn pollDrain(
     }
     let i = 0
     while (i < n) {
-      let task = readU64(base, i * keventSize + kqUdataOff)
-      if (task != 0) {
-        // The kernel's one-shot edge is consumed here regardless of what
-        // `schedPollUnpark` does with it below — the registration this
-        // decrements was armed once and the kernel just reported it exactly
-        // once, so the count must drop whether or not a task was there to
-        // catch it.
-        schedPollPendingDec()
-        // `schedPollUnpark`, NOT `schedUnpark`: a one-shot registration means
-        // this readiness edge is already consumed, so a task caught between
-        // registering and parking must be handed the wake rather than have it
-        // dropped. See ../task.bit's "arming a park" section.
-        if (schedPollUnpark(s, task)) {
-          woken = woken + 1
-        }
-      } else {
-        // #5717's EVFILT_USER wake filter — `udata` 0, which `pollArmWake`
-        // chose precisely because no real registration can carry it. NOT
-        // counted by `schedPollPendingDec`: the filter is `EV_CLEAR` and
-        // permanent, never one of the `EV_ONESHOT` registrations that counter
-        // tracks.
-        //
-        // Retrieving it here is what CONSUMES it (`EV_CLEAR`), so reporting 0
-        // for a drain whose only event was this hands the caller a spent wake
-        // and then tells it to sleep — with `scPollWait` already claimed by the
-        // producer, nothing can wake it again before `worker0WaitCeilingNs`.
+      let outcome = pollDrainEvent(s, base, i * keventSize)
+      if (outcome == pollEventWoken) {
+        woken = woken + 1
+      } else if (outcome == pollEventSawWake) {
         sawWake = true
       }
       i = i + 1
