@@ -584,6 +584,48 @@ bb5():
     fail=1
   fi
 
+  # --- #5905: a comma-ok miss's unread zero object, post-opt only ---
+  #
+  # Real dump text from `_tests_/cases/ir_map_commaok_miss.bit`'s `hitOnly`
+  # (this tree vs the pinned stage0): the miss block passes the probed word.
+  oracle_cm='  %5 = rt_call map_val_at(%0, %2) Obj
+  br %7, bb2(%5), bb1()
+bb1():
+  %9 = gc_alloc size=8 ptrs=[] Obj
+  jump bb2(%9)'
+  bit2_cm='  %5 = rt_call map_val_at(%0, %2) Obj
+  br %7, bb2(%5), bb1()
+bb1():
+  jump bb2(%5)'
+  sigc1=$(explainMismatch "$oracle_cm" "$bit2_cm" iropt)
+  rcc1=$?
+  if [ "$rcc1" -ne 0 ] || [ "$sigc1" != "5905-commaok-miss-zero-drop" ]; then
+    echo "FAIL: the real #5905 dropped zero object was not explained (rc=$rcc1 sig='$sigc1')"
+    fail=1
+  fi
+  # REJECTION: lowering never drops it, so the same delta under `ir`.
+  sigc2=$(explainMismatch "$oracle_cm" "$bit2_cm" ir)
+  rcc2=$?
+  if [ "$rcc2" -eq 0 ] || [ -n "$sigc2" ]; then
+    echo "FAIL: a #5905 delta was wrongly explained pre-opt (rc=$rcc2 sig='$sigc2')"
+    fail=1
+  fi
+  # REJECTION: an allocation dropped where no comma-ok read exists is not
+  # this signature's (#5871's looser tuple identity may still take it).
+  sigc3=$(explainMismatch "${oracle_cm//map_val_at/map_get}" "${bit2_cm//map_val_at/map_get}" iropt)
+  if [ "$sigc3" = "5905-commaok-miss-zero-drop" ]; then
+    echo "FAIL: a dropped allocation with no map_val_at was explained as #5905"
+    fail=1
+  fi
+  # REJECTION: the zero object is gone AND another opcode moved.
+  sigc4=$(explainMismatch "$oracle_cm" "${bit2_cm}
+  %99 = field_get %5[0] i64" iropt)
+  rcc4=$?
+  if [ "$rcc4" -eq 0 ] || [ -n "$sigc4" ]; then
+    echo "FAIL: a #5905 delta carrying an unrelated opcode was wrongly explained (rc=$rcc4 sig='$sigc4')"
+    fail=1
+  fi
+
   # --- #5870: a `ret` over the 5-integer-word budget boxes again, composed
   # with #5874 in the one file it hits (#5883) --- moved verbatim to
   # scripts/ir-signatures-selfcheck-multiword.sh by #5885 to stay under the

@@ -1,0 +1,401 @@
+// compiler/optcommaok.bit: a comma-ok map read's miss edge stops building a
+// zero object that nothing on the miss path can read (#5905). Same module as
+// opt.bit, so nothing here needs an import. `optimizeModule` runs
+// `nullCommaOkMisses` ahead of the DCE whose `deadAllocs` (optalloc.bit) then
+// deletes the allocation this pass leaves unnamed, with its stores.
+//
+// ## What it removes
+//
+// `emitMapMiss` (lowermapaccess.bit) lowers `let (n, ok) = m[k]` over a value
+// type V whose zero is a live record as
+//
+//   H:    slot = map_slot(m, k); ok = slot >= 0; v = map_val_at(m, slot)
+//         br v != nil, J(v), M()
+//   M:    z = gc_alloc V; ...; jump J(z)
+//   J(p): ...
+//
+// so `if (ok) { use(n) }` pays one allocation per miss for a `p` the miss path
+// never reads. Handing M's edge `v` (the null word) instead of `z` leaves `z`
+// with no reader.
+//
+// ## The proof obligation, and the refusal
+//
+// SPEC §12.6 and §13.4: a missing key reads as V's zero value, and "every
+// context that produces a zero value produces the same zero value". A program
+// that reads `p` after a miss must see the zero object, so the rewrite is
+// allowed only when no read of `p` can execute on a miss. Two facts carry it.
+//
+// 1. M is entered exactly when `ok` is false. `map_val_at` at a negative slot
+//    reads the null word (runtime/ABI.md §15), and a value of a type whose zero
+//    is a live record is never the null word (§12.6: "a usable empty/zero
+//    object, never a null reference"). So `v == nil` iff `slot < 0` iff `!ok`.
+//    That is why the miss edge must carry a `gc_alloc` made in M: a string or
+//    slice zero allocates nothing, and an empty slice IS the null header
+//    (lowerslicefill.bit's `zeroValue`), so there `v == nil` is no miss proof.
+// 2. Every read of `p` is DOMINATED by an ok-true edge. A guard is a block X
+//    ending `br ok, S, _` or `br ok == false, _, S` whose ok-true successor S
+//    has X as its only predecessor, so S dominates what that edge dominates.
+//    H's exits reach only J (M's one exit is J), J's only predecessors are H
+//    and M, and `slot`, `ok` and `v` are all defined in H, so every execution
+//    of J pairs `p` with the `ok` of the H just before it. The first J on any
+//    path precedes every S, so if a use U is dominated by S, no path runs from
+//    a J to U without passing S after it (entry->J->U would avoid S). The `ok`
+//    that S's edge tested is therefore `p`'s own, and it was true, so by 1.
+//    `p` came from the hit edge. Liveness, not a pattern: a guard anywhere,
+//    any number of them, and a use anywhere they dominate.
+//
+// A block argument is not a read. `p` passed to a parameter nothing names is
+// dead there; `p` passed along a guard's own ok-true edge, or out of a block a
+// guard dominates, carries a value 2. already proved came from a hit. Any other
+// use refuses and the miss keeps its zero object: `p` read after the `if`,
+// passed to a call on both paths, stored into a field before the check
+// (_tests_/cases/run_map_commaok_miss_zero.bit pins all three).
+
+// One rewritable miss: the probe block `h`, the miss block, the join and the
+// index `pi` of `p` among its parameters, the `v` and `ok` fact 1 is stated
+// over, and the miss block's `jump` whose argument is rewritten. `h` is -1
+// when the block asked about is no such probe.
+class CommaOkMiss {
+  h: int,
+  miss: int,
+  join: int,
+  pi: int,
+  v: int,
+  ok: int,
+  jump: int,
+}
+
+// What the candidate tests read besides the function: the predecessor map,
+// the owning block of every instruction, and per-value use counts.
+class MissFacts {
+  preds: PredMap,
+  blockOf: []int,
+  uses: []int,
+}
+
+fn noCommaOkMiss(): CommaOkMiss {
+  return CommaOkMiss{ h = -1, miss = -1, join = -1, pi = -1, v = -1, ok = -1, jump = -1 }
+}
+
+fn predCount(pm: PredMap, b: int): int {
+  return pm.start[b + 1] - pm.start[b]
+}
+
+fn blockTerm(f: IrFunc, b: int): int {
+  let blk = f.blocks[b]
+  if (blk.instsLen == 0) {
+    return -1
+  }
+  return blk.instsStart + blk.instsLen - 1
+}
+
+fn hasMapValAt(f: IrFunc): bool {
+  for ins of f.instrs {
+    if (ins.op == Op.RtCall && ins.name == "map_val_at") {
+      return true
+    }
+  }
+  return false
+}
+
+// Per value id, how many operand slots name it.
+fn useCounts(f: IrFunc): []int {
+  let out = []int(len(f.instrs))
+  let i = 0
+  while (i < len(f.instrs)) {
+    for id of instrOperands(f, i) {
+      out[id] = out[id] + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// `ok` for the probe whose `map_val_at` is `v`: the `slot >= 0` over the same
+// slot, in the same block. -1 when there is none.
+fn commaOkFlag(f: IrFunc, blockOf: []int, v: int): int {
+  let slot = f.instrs[v].args[1]
+  let i = f.blocks[blockOf[v]].instsStart
+  while (i < v) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.ICmpSge && ins.lhs == slot && isConstZero(f, ins.rhs)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn isConstZero(f: IrFunc, id: int): bool {
+  return f.instrs[id].op == Op.ConstInt && f.instrs[id].ival == 0
+}
+
+// The `v` of `br v != nil` when `v` is a `map_val_at` made in `h` itself.
+fn probedValue(f: IrFunc, blockOf: []int, h: int, br: IrInstr): int {
+  let c = f.instrs[br.lhs]
+  if (c.op != Op.ICmpNe || f.instrs[c.rhs].op != Op.ConstNil) {
+    return -1
+  }
+  let v = f.instrs[c.lhs]
+  if (v.op != Op.RtCall || v.name != "map_val_at" || len(v.args) != 2) {
+    return -1
+  }
+  if (blockOf[c.lhs] != h || blockOf[v.args[1]] != h) {
+    return -1
+  }
+  return c.lhs
+}
+
+// Block `h` as the probe of the shape in this file's header, or `noCommaOkMiss()`.
+fn commaOkMissAt(f: IrFunc, mf: MissFacts, h: int): CommaOkMiss {
+  let t = blockTerm(f, h)
+  if (t < 0 || f.instrs[t].op != Op.Br || f.instrs[t].ival == f.instrs[t].ival2) {
+    return noCommaOkMiss()
+  }
+  let br = f.instrs[t]
+  let v = probedValue(f, mf.blockOf, h, br)
+  if (v < 0) {
+    return noCommaOkMiss()
+  }
+  let ok = commaOkFlag(f, mf.blockOf, v)
+  let jt = missJump(f, mf.preds, h, br)
+  if (ok < 0 || jt < 0) {
+    return noCommaOkMiss()
+  }
+  let pi = zeroArgIndex(f, mf.blockOf, br, f.instrs[jt])
+  if (pi < 0) {
+    return noCommaOkMiss()
+  }
+  return CommaOkMiss{ h = h, miss = br.ival2, join = br.ival, pi = pi, v = v, ok = ok, jump = jt }
+}
+
+// The miss block's `jump` when the CFG is exactly the header's: the miss block
+// has `h` as its only predecessor and jumps to the join, and the join, which is
+// not `h`, has those two predecessors and no other. -1 otherwise.
+fn missJump(f: IrFunc, pm: PredMap, h: int, br: IrInstr): int {
+  let jt = blockTerm(f, br.ival2)
+  if (jt < 0 || br.ival == h || f.instrs[jt].op != Op.Jump || f.instrs[jt].ival != br.ival) {
+    return -1
+  }
+  if (predCount(pm, br.ival2) != 1 || predCount(pm, br.ival) != 2) {
+    return -1
+  }
+  return jt
+}
+
+// The join-parameter index where the hit edge passes `v` and the miss edge a
+// `gc_alloc` made in the miss block itself, or -1.
+fn zeroArgIndex(f: IrFunc, blockOf: []int, br: IrInstr, jump: IrInstr): int {
+  let v = f.instrs[br.lhs].lhs
+  let k = 0
+  while (k < len(jump.args) && k < len(br.thenArgs)) {
+    let z = jump.args[k]
+    if (br.thenArgs[k] == v && f.instrs[z].op == Op.GcAlloc && blockOf[z] == br.ival2) {
+      return k
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// The ok-true successor of block `x`'s terminator, or -1 when `x` does not
+// branch on `ok` or that successor has another predecessor.
+fn guardSuccessor(f: IrFunc, pm: PredMap, x: int, ok: int): int {
+  let t = blockTerm(f, x)
+  if (t < 0 || f.instrs[t].op != Op.Br || f.instrs[t].ival == f.instrs[t].ival2) {
+    return -1
+  }
+  let br = f.instrs[t]
+  let s = -1
+  if (br.lhs == ok) {
+    s = br.ival
+  } else if (isNotFlag(f, br.lhs, ok)) {
+    s = br.ival2
+  }
+  // The entry is never an ok-true successor of valid SSA (it would precede the
+  // `ok` it tests); refusing it keeps `reachAvoiding` from starting inside `s`.
+  if (s <= 0 || predCount(pm, s) != 1) {
+    return -1
+  }
+  return s
+}
+
+// `c` is `ok == false`, the form `if (!ok)` lowers to.
+fn isNotFlag(f: IrFunc, c: int, ok: int): bool {
+  let ins = f.instrs[c]
+  if (ins.op != Op.ICmpEq || ins.lhs != ok) {
+    return false
+  }
+  let r = f.instrs[ins.rhs]
+  return r.op == Op.ConstBool && !r.bval
+}
+
+// Per block: reachable from the entry without entering `s`. A block `s`
+// dominates is exactly one this leaves false (or `s` itself). Bounded: each
+// block is pushed at most once.
+fn reachAvoiding(f: IrFunc, s: int): []bool {
+  let seen = []bool(len(f.blocks))
+  let work = [0]
+  seen[0] = true
+  while (len(work) > 0) {
+    let b = work[len(work) - 1]
+    work = work[0:len(work) - 1]
+    for t of licmTargets(f, b) {
+      if (t != s && !seen[t]) {
+        seen[t] = true
+        work = append(work, t)
+      }
+    }
+  }
+  return seen
+}
+
+// The guards' ok-true successors, each with its avoid-set from `reachAvoiding`.
+class Guards {
+  succ: []int,
+  reach: [][]bool,
+}
+
+fn guardsFor(f: IrFunc, pm: PredMap, ok: int): Guards {
+  let g = Guards{ succ = []int(0), reach = [][]bool(0) }
+  let x = 0
+  while (x < len(f.blocks)) {
+    let s = guardSuccessor(f, pm, x, ok)
+    if (s >= 0) {
+      g.succ = append(g.succ, s)
+      g.reach = append(g.reach, reachAvoiding(f, s))
+    }
+    x = x + 1
+  }
+  return g
+}
+
+fn guarded(g: Guards, b: int): bool {
+  let k = 0
+  while (k < len(g.succ)) {
+    if (g.succ[k] == b || !g.reach[k][b]) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+// One candidate's fact-2 question: the facts, its guards, and the join
+// parameter `p` whose every mention is being judged.
+class UseCheck {
+  mf: MissFacts,
+  g: Guards,
+  p: int,
+}
+
+// Fact 2 of the header for the terminator at `t` passing `p` to `target`'s
+// parameters `args`: each position holding `p` must be a dead parameter, a
+// guard's own ok-true edge (a guard successor's one predecessor is its guard,
+// so any edge into one is that edge), or leave a block a guard dominates.
+fn edgeArgsSafe(f: IrFunc, uc: UseCheck, t: int, target: int, args: []int): bool {
+  let k = 0
+  while (k < len(args)) {
+    let param = f.blocks[target].instsStart + k
+    let safe = args[k] != uc.p || uc.mf.uses[param] == 0 || guarded(uc.g, uc.mf.blockOf[t])
+    if (!safe && !isGuardEdge(uc.g, target)) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+fn isGuardEdge(g: Guards, target: int): bool {
+  for s of g.succ {
+    if (s == target) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether instruction `i`'s mention of `p` is allowed by fact 2.
+fn useSafe(f: IrFunc, uc: UseCheck, i: int): bool {
+  let ins = f.instrs[i]
+  if (ins.op == Op.Jump) {
+    return edgeArgsSafe(f, uc, i, ins.ival, ins.args)
+  }
+  if (ins.op == Op.Br && ins.lhs != uc.p) {
+    return edgeArgsSafe(f, uc, i, ins.ival, ins.thenArgs) &&
+      edgeArgsSafe(f, uc, i, ins.ival2, ins.elseArgs)
+  }
+  return guarded(uc.g, uc.mf.blockOf[i])
+}
+
+// Fact 2 for candidate `c`: every mention of `p` is dominated by an ok-true
+// edge or is a block argument that carries nothing a miss could read.
+fn missReadsNothing(f: IrFunc, mf: MissFacts, c: CommaOkMiss): bool {
+  let p = f.blocks[c.join].instsStart + c.pi
+  if (namedInKeepAlive(f, p)) {
+    return false
+  }
+  let uc = UseCheck{ mf = mf, g = guardsFor(f, mf.preds, c.ok), p = p }
+  if (len(uc.g.succ) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (namesValue(f, i, p) && !useSafe(f, uc, i)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn namesValue(f: IrFunc, i: int, id: int): bool {
+  for o of instrOperands(f, i) {
+    if (o == id) {
+      return true
+    }
+  }
+  return false
+}
+
+// The miss block's `jump` with `v` in place of the zero object. A fresh
+// instruction rather than an edit, so no other function holding the old one
+// sees the change.
+fn rewriteMissJump(f: IrFunc, c: CommaOkMiss) {
+  let old = f.instrs[c.jump]
+  let j = mkInstr(Op.Jump, old.ty)
+  j.ival = old.ival
+  j.span = old.span
+  let k = 0
+  while (k < len(old.args)) {
+    let a = old.args[k]
+    if (k == c.pi) {
+      a = c.v
+    }
+    j.args = append(j.args, a)
+    k = k + 1
+  }
+  f.instrs[c.jump] = j
+}
+
+// The pass. Adds no block and moves no edge, so the predecessor map and the
+// block of every instruction stay valid across the rewrites it makes.
+fn nullCommaOkMisses(f: IrFunc): IrFunc {
+  if (!hasMapValAt(f)) {
+    return f
+  }
+  let mf = MissFacts{
+    preds = licmPredMap(f),
+    blockOf = computeBlockOfInstr(f),
+    uses = useCounts(f),
+  }
+  let h = 0
+  while (h < len(f.blocks)) {
+    let c = commaOkMissAt(f, mf, h)
+    if (c.h >= 0 && missReadsNothing(f, mf, c)) {
+      rewriteMissJump(f, c)
+    }
+    h = h + 1
+  }
+  return f
+}
