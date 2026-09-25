@@ -357,6 +357,7 @@ run_types() {
   trap 'rm -rf "$work"' EXIT
   sep="  -> "
   : >"$work/mismatch"
+  : >"$work/explained"
   : >"$work/timeout"
   : >"$work/oracletimeout"
   : >"$work/oraclecrash"
@@ -390,16 +391,42 @@ run_types() {
     if [ "$seed" = "$b2" ]; then
       match=$((match + 1))
     else
-      echo "$f" >>"$work/mismatch"
+      # #5921: the same declared-signature escape valve #5510 gave the `ast`
+      # row — a `types` divergence that matches a registered identity
+      # (ptrofStringType, selfhost-ir-signatures.sh) is oracle lag, not a
+      # regression.
+      sig=$(explainMismatch "$seed" "$b2" types)
+      if [ -n "$sig" ]; then
+        echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
+      else
+        echo "$f" >>"$work/mismatch"
+      fi
     fi
   done
 
   mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
+  explained=$(wc -l <"$work/explained" | tr -d ' ')
   timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
   oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
   oraclecrashes=$(wc -l <"$work/oraclecrash" | tr -d ' ')
   oraclepanics=$(wc -l <"$work/oraclepanic" | tr -d ' ')
-  echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts ORACLE-CRASH=$oraclecrashes ORACLE-PANIC=$oraclepanics SKIP($SKIPLABEL)=$skip"
+
+  # A declared signature that never fires this run is not guarding anything
+  # (#5509, applied to `types` the same way run_ir() already applies it to
+  # `ir`/`iropt`): the oracle moves every stage0 repin, so a fixed type once
+  # it lands back in the pin agrees with this tree again on every site the
+  # signature used to explain. declaredSignatureNames() is the single source
+  # of truth for what "declared" means for this row too.
+  retired="" retiredcount=0
+  while IFS= read -r signame; do
+    [ -n "$signame" ] || continue
+    if ! grep -q "declared signature '${signame}'" "$work/explained" 2>/dev/null; then
+      retired="$retired $signame"
+      retiredcount=$((retiredcount + 1))
+    fi
+  done < <(declaredSignatureNames types)
+
+  echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts ORACLE-CRASH=$oraclecrashes ORACLE-PANIC=$oraclepanics SKIP($SKIPLABEL)=$skip"
 
   if [ -s "$work/mismatch" ]; then
     echo
@@ -412,6 +439,16 @@ run_types() {
       echo "--- diff (seed vs bit): $f"
       diff <(alarmrun "$ORACLE" "$FLAG" "$f") <(alarmrun "$BIT2" "$FLAG" "$f") | head -12
     done
+  fi
+
+  # Informational only, never fails the gate (#5921, same convention as
+  # run_ir()'s EXPLAINED block below it): each of these matched a declared
+  # transform signature's identity exactly (explainMismatch, selfhost-ir-
+  # signatures.sh) -- a stronger claim than "this file is allowed to differ".
+  if [ -s "$work/explained" ]; then
+    echo
+    echo "EXPLAINED: $explained file(s) diverge from the pinned stage0 but match a declared signature (not a regression):"
+    sed 's/^/  /' "$work/explained"
   fi
 
   # Reported apart from BIT2's timeout because it means something different: the
@@ -440,11 +477,25 @@ run_types() {
   # #3351 and selfhost-diffdump.sh's own run_basic() #3378). A PURE timeout —
   # zero mismatches — decided nothing, so it is could-not-decide (2), not the
   # same code a real MISMATCH uses (1).
-  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ]; then
+  # RETIRED signatures fail the run, same as a MISMATCH, and are reported by
+  # name (#5921, matching run_ir()'s #5509 convention): a signature this run
+  # never needed is evidence the signature itself is stale, not evidence of
+  # nothing.
+  if [ "$retiredcount" -gt 0 ]; then
     echo
-    echo "$PREFIX: the two checkers agree on every compared file."
+    echo "RETIRED: $retiredcount declared signature(s) explained zero files in this run's corpus and must be removed from scripts/selfhost-ir-signatures.sh (or, if this host legitimately cannot exercise them, confirmed dead on every other host this repo builds for first):"
+    for s in $retired; do echo "  retired: $s"; done
   fi
-  diffexit "$LABEL" -f "$mismatch" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
+
+  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ] && [ "$retiredcount" -eq 0 ]; then
+    echo
+    if [ "$explained" -gt 0 ]; then
+      echo "$PREFIX: the two checkers agree on every compared file, or the divergence is explained by a declared signature ($explained explained)."
+    else
+      echo "$PREFIX: the two checkers agree on every compared file."
+    fi
+  fi
+  diffexit "$LABEL" -f "$mismatch" "$retiredcount" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
 }
 
 # explainMismatch (the declared-transform-signature scoring used below) now
