@@ -1623,10 +1623,13 @@ byte moves: a server that routes on `alpnProtocol()`, as `std/http` does to
 choose HTTP/2 or HTTP/1.1. Fails on a handshake error, closing the connection.
 
 ```bit
-let conn = l.accept()?
-conn.handshake()?
-if (conn.alpnProtocol() == "h2") {
-  // serve HTTP/2
+import { TlsListener } from "std/tls"
+
+// Accept one connection and report whether it negotiated HTTP/2.
+fn acceptsH2(l: TlsListener): bool! {
+  let conn = l.accept()?
+  conn.handshake()?
+  return conn.alpnProtocol() == "h2"
 }
 ```
 
