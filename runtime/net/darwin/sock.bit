@@ -25,7 +25,7 @@ import { netDnsTimeoutMs, netDnsRetries } from "../../net"
 import { taskAt, schedCurrentTask, taskWorker, wkSched, scPollFd } from "../../sched"
 import { schedParkArm, schedParkDisarm, schedPark, pollRead, pollWrite } from "../../sched"
 import { schedPollUnpark, schedPollPendingInc, schedPollPendingDec } from "../../sched"
-import { pollDescRegister, pollDescUnregister } from "../../sched/darwin"
+import { pollDescRegister, pollDescRegisterWrite, pollDescUnregister } from "../../sched/darwin"
 // pollDesc (#5864/#5865): the register-once model's per-fd table --
 // `netPollDescOpen` below (accept/connect/listen) and `netClose` are this
 // file's two lifecycle ends, `netAwaitReady` and `../tcp.bit`'s deadline race
@@ -365,12 +365,30 @@ let netFdGen: [65536]i64
   return ptrOf(netFdGen) + fd
 }
 
-// Register `fd` with the kernel poller ONCE, for its whole life (#5865) —
-// called right after the runtime makes a socket non-blocking (accept,
-// connect, listen; `netAcceptTcp`/`netSysSocket` are the two call sites). A
-// no-op when there is no current task or no poller bound: an unscheduled
-// caller's retry loops never park (`netAwaitReady`'s own `false` path), so
-// nothing needs a kernel registration to wake them.
+// Whether `fd`'s WRITE filter has been armed with the kernel yet (#5865) — 0
+// (the `.bss` zero value, and what `netPollDescOpen` resets it to for a
+// reused fd number) until the first write on this connection actually
+// blocks. See `pollDescRegisterWrite`'s header (`../../sched/darwin/poll.bit`)
+// for why write is lazy where read is not. Plain load/store, not atomic: two
+// writers racing to arm the same fd is unusual but not forbidden, and
+// `EV_ADD` re-arming an already-armed filter is idempotent (that file's own
+// `pollRegister` header), so the only cost of losing that race is one
+// redundant `kevent` call, never a wrong final state.
+let netFdWriteArmed: [65536]i64
+
+@nosplit fn netFdWriteArmedAddr(fd: int): *i64 {
+  return ptrOf(netFdWriteArmed) + fd
+}
+
+// Register `fd`'s READ filter with the kernel poller ONCE, for its whole
+// life (#5865) — called right after the runtime makes a socket non-blocking
+// (accept, connect, listen; `netAcceptTcp`/`netSysSocket` are the two call
+// sites). Write is armed lazily instead, by `netAwaitReady` the first time a
+// write actually blocks (`pollDescRegisterWrite`'s own header,
+// `../../sched/darwin/poll.bit`, has the measured reason). A no-op when
+// there is no current task or no poller bound: an unscheduled caller's
+// retry loops never park (`netAwaitReady`'s own `false` path), so nothing
+// needs a kernel registration to wake them.
 //
 // CACHES `gen` INTO `netFdGen`, AND THAT IS LOAD-BEARING, NOT A
 // CONVENIENCE. A wait that instead re-read `pdGen(fd)` live raced a
@@ -406,6 +424,7 @@ let netFdGen: [65536]i64
   }
   let gen = pdOpen(fd)
   *netFdGenAddr(fd) = gen
+  *netFdWriteArmedAddr(fd) = 0
   let _ = pollDescRegister(pollFd, fd, gen)
 }
 
@@ -535,6 +554,13 @@ export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(fd: int, interest
     dir = pdDirRead
   }
   let gen = *netFdGenAddr(fd)
+  // Write is armed LAZILY, here, the first time a write actually blocks —
+  // see `pollDescRegisterWrite`'s header for why. Read needs no such check:
+  // `netPollDescOpen` already armed it at open time.
+  if (dir == pdDirWrite && *netFdWriteArmedAddr(fd) == 0) {
+    let _ = pollDescRegisterWrite(pollFd, fd, gen)
+    *netFdWriteArmedAddr(fd) = 1
+  }
   if (!schedParkArm()) {
     return false
   }
