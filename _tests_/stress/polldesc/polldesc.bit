@@ -38,6 +38,8 @@
 import {
   pdOpen, pdWait, pdWake, pdCancel, pdClose,
   pdDirRead, pdDirWrite, pdClaimed, pdAlreadyReady, pdEmpty, pdBusy,
+  pdFdAcquire, pdFdRelease, pdFdMarkClosing,
+  pdFdAcquired, pdFdRefusedLast, pdFdCloseNow, pdFdCloseDeferred,
 } from "../../../runtime/sched"
 
 const FDS: int = 6
@@ -299,6 +301,302 @@ fn unpackableIdsRefused(fd: int): bool {
   return true
 }
 
+// #5888: direct stress of #5886's per-fd ref-count protocol
+// (`pdFdAcquire`/`pdFdRelease`/`pdFdMarkClosing`), completely independent of
+// the wait/wake/close machinery above -- every driver above acquires its
+// task-id slot once at entry and never touches the ref-count API at all, so
+// #5886's own verifier found a `pdFdAcquire` that ignores `closing` left
+// every one of them green. The closer below is modeled exactly on `netClose`
+// (`runtime/net/darwin/sock.bit`): `pdFdCloseNow` means this call's own
+// decrement already found "last out" and this caller must close(2) itself;
+// `pdFdCloseDeferred` means this call is the first closer, so it still holds
+// the ref `pdFdMarkClosing` took and must release it itself (immediately,
+// not after a `pdClose`/unregister step, since this driver has none to
+// interleave); anything else (`pdFdCloseAlready`) is a no-op second close.
+const REF_FD_BASE: int = WAITCLOSE_FD_BASE + WAITCLOSE_FD_COUNT
+const REF_FD_COUNT: int = 3
+const REF_ROUNDS: int = 1000
+const REF_WORKERS: int = 4
+const REF_TWOCLOSE_EVERY: int = 7
+const REF_POSTOR_PROBES: int = 4
+
+const rcClosed: int = 0      // cycles where exactly one close was owed
+const rcBadCycle: int = 1    // cycles where the owed-close total was not 1
+const rcLateAcquire: int = 2 // a post-OR probe acquired after closing was visible
+const refCounterCount: int = 3
+
+// `armed` reports that this worker's OWN `pdFdAcquire` has already run
+// (so `refRound` knows every worker is either holding a ref or has already
+// backed one out before the closer's own `pdFdMarkClosing` even starts --
+// see `refRound`'s header for why that ordering is what makes "exactly one
+// close" provable), then `go` blocks until the closer has started, so the
+// release below races it for real.
+fn refWorker(fd: int, gen: int, armed: chan<i64>, go: chan<i64>, out: chan<i64>) {
+  let r = pdFdAcquire(fd, gen)
+  armed <- 1
+  let _ = <- go
+  let closed = 0
+  if (r == pdFdAcquired) {
+    if (pdFdRelease(fd)) {
+      closed = 1
+    }
+  } else if (r == pdFdRefusedLast) {
+    closed = 1
+  }
+  out <- closed
+}
+
+// The second, truly concurrent `netClose(fd)` a few cycles race in --
+// `pdFdMarkClosing` here always observes `closing` already set (the primary
+// closer's own OR ran before this task was even spawned) and this call's own
+// add+undo races real hardware visibility of that OR the same way a second
+// real `netClose` thread would. `pdFdCloseNow` is answered `false`: the
+// primary closer's own ref (held for this whole window -- see `refCloser`)
+// keeps the live count at 2+ for as long as this call can observe it, so its
+// own undo can never be the zero-crossing; only `pdFdCloseAlready` is
+// reachable here, proven, not assumed.
+fn refSecondCloser(fd: int, out: chan<i64>) {
+  let ok = 0
+  if (pdFdMarkClosing(fd) != pdFdCloseNow) {
+    ok = 1
+  }
+  out <- ok
+}
+
+// Modeled on `netClose`. On `pdFdCloseDeferred` the OR that made `closing`
+// visible just ran, in program order, before anything below -- and this
+// closer's own ref (taken by `pdFdMarkClosing`) is held until the very last
+// line, so the live count cannot reach zero through anyone else in between
+// (`refSecondCloser`'s own header proves it, `refWorker`'s refusal path
+// never sees a zero-crossing either since `pdFdRelease` only reports true
+// when `closing` was already visible to IT). Every post-OR probe below must
+// therefore see `closing` and refuse; `p` numbers each one, the "sequence
+// number" the ticket asks the closer to record. A probe reporting
+// `pdFdAcquired` is the exact violation a `pdFdAcquire` mutated to ignore
+// `closing` produces.
+fn refCloser(fd: int, gen: int, twoClose: bool, out: chan<i64>, lateCounter: *i64) {
+  let decision = pdFdMarkClosing(fd)
+  if (decision == pdFdCloseNow) {
+    out <- 1
+    return
+  }
+  if (decision != pdFdCloseDeferred) {
+    out <- 0
+    return
+  }
+  let secondOk = true
+  if (twoClose) {
+    let secondCh = chan<i64>(1)
+    spawn refSecondCloser(fd, secondCh)
+    secondOk = <- secondCh == 1
+  }
+  let p = 0
+  while (p < REF_POSTOR_PROBES) {
+    if (pdFdAcquire(fd, gen) == pdFdAcquired) {
+      atomicAdd(lateCounter, 1)
+    }
+    p = p + 1
+  }
+  let closed = 0
+  if (pdFdRelease(fd)) {
+    closed = 1
+  }
+  if (!secondOk) {
+    closed = 0 - 1 // impossible per refSecondCloser's proof; force a bad cycle
+  }
+  out <- closed
+}
+
+// One ref-count cycle: open, let `REF_WORKERS` tasks each acquire a ref (all
+// of them, before the closer even starts -- `armCh`'s join is what
+// guarantees that), then release them concurrently with one closer (which
+// itself races a second, concurrent `netClose` on some cycles -- see
+// `refCloser`). Acquiring every worker's ref BEFORE `pdFdMarkClosing` runs
+// is what makes "exactly one close" provable rather than scheduling-lucky:
+// the closer's own ref (held for the whole window, see `refCloser`) then
+// keeps the live count at 2+ until every worker AND the closer have each
+// released once, so only the SINGLE decrement that empties it can ever see
+// `pdFdRelease`'s old-count-was-1 condition. A worker whose fresh, unrelated
+// acquire attempt were allowed to land AFTER the count had already emptied
+// once could independently re-cross zero and also be told to close -- a real
+// double-close hazard this ordering rules out, not one this driver needs to
+// reproduce (real callers gate new ops on `pdFdClosing` before ever
+// reaching `pdFdAcquire`, exactly like the retry loops `pdFdClosing`'s own
+// header describes). `pdFdRelease`'s contract ("true only when THIS call's
+// decrement took the count to zero") makes the total below the direct proof
+// the count returned to 0 -- a leaked or double-released ref (e.g.
+// `pdFdMarkClosing` skipping its own ref) shows up here as anything but 1,
+// not a separate counter to read.
+fn refRound(fd: int, twoClose: bool, lateCounter: *i64): bool {
+  let gen = pdOpen(fd)
+  let armCh = chan<i64>(REF_WORKERS)
+  let goCh = chan<i64>(REF_WORKERS)
+  let workCh = chan<i64>(REF_WORKERS)
+  let w = 0
+  while (w < REF_WORKERS) {
+    spawn refWorker(fd, gen, armCh, goCh, workCh)
+    w = w + 1
+  }
+  let a = 0
+  while (a < REF_WORKERS) {
+    let _ = <- armCh
+    a = a + 1
+  }
+  let closeCh = chan<i64>(1)
+  spawn refCloser(fd, gen, twoClose, closeCh, lateCounter)
+  let g = 0
+  while (g < REF_WORKERS) {
+    goCh <- 1
+    g = g + 1
+  }
+  let total = 0
+  let j = 0
+  while (j < REF_WORKERS) {
+    total = total + <- workCh
+    j = j + 1
+  }
+  total = total + <- closeCh
+  return total == 1
+}
+
+fn refDriver(fd: int, counters: *i64, done: chan<i64>) {
+  let bad = 0
+  let closedCycles = 0
+  let k = 0
+  while (k < REF_ROUNDS) {
+    let twoClose = k % REF_TWOCLOSE_EVERY == 0
+    if (refRound(fd, twoClose, counters + rcLateAcquire)) {
+      closedCycles = closedCycles + 1
+    } else {
+      bad = bad + 1
+    }
+    k = k + 1
+  }
+  atomicAdd(counters + rcClosed, closedCycles)
+  atomicAdd(counters + rcBadCycle, bad)
+  done <- 1
+}
+
+const FREE_FD_BASE: int = REF_FD_BASE + REF_FD_COUNT
+const FREE_FD_COUNT: int = 3
+const FREE_ROUNDS: int = 1000
+
+// The ORIGINAL, unordered driver (owner correction, #5888): each of
+// `REF_WORKERS` workers issues a brand-new `pdFdAcquire` at ANY point in the
+// cycle, freely racing the closer -- no barrier holds workers back until
+// every one has already acquired, unlike `refRound` above. This is real
+// production shape: a fresh `Conn.read` starting while another task closes
+// the same conn IS a fresh acquire racing a close, and no `pdFdClosing`
+// pre-check closes that window (check-then-act). Before `pdRefClosedBit`
+// (dc9a1331b) this reliably printed `total != 1` under real
+// `BIT_WORKERS=8` parallelism: after the fd's one legitimate close, a late
+// straggler's own add-then-undo took the count from 1 to 0 again, and
+// `pdFdRelease` reported that undo as a second "last out" too -- a real
+// double close(2) onto a possibly-reused fd number.
+fn refWorkerFree(fd: int, gen: int, out: chan<i64>) {
+  let r = pdFdAcquire(fd, gen)
+  let closed = 0
+  if (r == pdFdAcquired) {
+    if (pdFdRelease(fd)) {
+      closed = 1
+    }
+  } else if (r == pdFdRefusedLast) {
+    closed = 1
+  }
+  out <- closed
+}
+
+fn refRoundFree(fd: int, twoClose: bool, lateCounter: *i64): bool {
+  let gen = pdOpen(fd)
+  let workCh = chan<i64>(REF_WORKERS)
+  let w = 0
+  while (w < REF_WORKERS) {
+    spawn refWorkerFree(fd, gen, workCh)
+    w = w + 1
+  }
+  let closeCh = chan<i64>(1)
+  spawn refCloser(fd, gen, twoClose, closeCh, lateCounter)
+  let total = 0
+  let j = 0
+  while (j < REF_WORKERS) {
+    total = total + <- workCh
+    j = j + 1
+  }
+  total = total + <- closeCh
+  return total == 1
+}
+
+fn refDriverFree(fd: int, counters: *i64, done: chan<i64>) {
+  let bad = 0
+  let closedCycles = 0
+  let k = 0
+  while (k < FREE_ROUNDS) {
+    let twoClose = k % REF_TWOCLOSE_EVERY == 0
+    if (refRoundFree(fd, twoClose, counters + rcLateAcquire)) {
+      closedCycles = closedCycles + 1
+    } else {
+      bad = bad + 1
+    }
+    k = k + 1
+  }
+  atomicAdd(counters + rcClosed, closedCycles)
+  atomicAdd(counters + rcBadCycle, bad)
+  done <- 1
+}
+
+// Runs every `refDriverFree` to completion and prints the pinned unordered
+// summary line -- the second, freely-racing proof beside `runRefDrivers`'s
+// barrier-ordered one.
+fn runFreeRefDrivers() {
+  let freeCounters = []i64(refCounterCount)
+  let fcp = ptrOf(freeCounters)
+  let freeDone = chan<i64>(FREE_FD_COUNT)
+  let ff = 0
+  while (ff < FREE_FD_COUNT) {
+    spawn refDriverFree(FREE_FD_BASE + ff, fcp, freeDone)
+    ff = ff + 1
+  }
+  let fj = 0
+  while (fj < FREE_FD_COUNT) {
+    let _ = <- freeDone
+    fj = fj + 1
+  }
+
+  let freeClosed = freeCounters[rcClosed]
+  let freeBad = freeCounters[rcBadCycle]
+  let freeLate = freeCounters[rcLateAcquire]
+  let freeExpectClosed = FREE_FD_COUNT * FREE_ROUNDS
+  let freeOk = freeBad == 0 && freeClosed == freeExpectClosed && freeLate == 0
+
+  print("freeok ${freeOk} closed ${freeClosed} bad ${freeBad} late ${freeLate}\n")
+}
+
+// Runs every `refDriver` to completion and prints the pinned ref-count
+// summary line. Split out of `main` to keep it under the complexity ceiling.
+fn runRefDrivers() {
+  let refCounters = []i64(refCounterCount)
+  let rcp = ptrOf(refCounters)
+  let refDone = chan<i64>(REF_FD_COUNT)
+  let rf = 0
+  while (rf < REF_FD_COUNT) {
+    spawn refDriver(REF_FD_BASE + rf, rcp, refDone)
+    rf = rf + 1
+  }
+  let rj = 0
+  while (rj < REF_FD_COUNT) {
+    let _ = <- refDone
+    rj = rj + 1
+  }
+
+  let refClosed = refCounters[rcClosed]
+  let refBad = refCounters[rcBadCycle]
+  let refLate = refCounters[rcLateAcquire]
+  let refExpectClosed = REF_FD_COUNT * REF_ROUNDS
+  let refOk = refBad == 0 && refClosed == refExpectClosed && refLate == 0
+
+  print("refok ${refOk} closed ${refClosed} bad ${refBad} late ${refLate}\n")
+}
+
 fn main() {
   let counters = []i64(counterCount)
   let cp = ptrOf(counters)
@@ -327,6 +625,9 @@ fn main() {
     let _ = <- wcDone
     wj = wj + 1
   }
+
+  runRefDrivers()
+  runFreeRefDrivers()
 
   let staleOk = staleGenCheck(FDS)
 
