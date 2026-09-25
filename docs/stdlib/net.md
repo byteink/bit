@@ -70,13 +70,28 @@ the first write - the failure is reported where it happened.
 
 ### `Conn.read(max: int): string`
 
-Reads up to `max` bytes, parking until some arrive. An empty result means the
-peer closed: an orderly end of stream, and the condition that ends a read loop.
+Reads up to `max` bytes, parking until some arrive or, once `setDeadline` has
+armed this connection, until the deadline elapses - bounded exactly like
+`readDeadline`. An empty result means either the peer closed (an orderly end
+of stream, the condition that ends a read loop) or the deadline elapsed
+first; `read`'s return type has no room for a distinct error the way
+`readDeadline`'s does, so the two collapse to the same `""`. Call
+`readTimedOut()` right after to tell them apart when it matters.
+
+### `Conn.readTimedOut(): bool`
+
+Whether the `read()` call just before this one returned `""` because this
+side's own deadline elapsed, rather than the peer closing cleanly. Every
+`read()` call overwrites it, so it is meaningful only right after one -
+meaningless before the first `read()` on this `Conn`.
 
 ### `Conn.write(s: string): ()!`
 
-Writes all of `s`. A short write is retried internally, so this either wrote every
-byte or failed.
+Writes all of `s`, parking until every byte is written or, once
+`setDeadline` has armed this connection, until the deadline elapses -
+bounded exactly like `writeDeadline`, and it fails with the same "write
+timed out" message. A short write is retried internally, so on success this
+wrote every byte.
 
 ### `Conn.readAll(): string`
 
@@ -142,9 +157,11 @@ it reuse the same value automatically.
 
 ### `Conn.setDeadline(deadlineNs: int)`
 
-Sets (or, with `0`, clears) the absolute deadline `readDeadline`/`writeDeadline`
-respect on this connection from now on. Does not reach back to bound a
-`dial`/`dialDeadline` connect already completed.
+Sets (or, with `0`, clears) the absolute deadline that bounds every read and
+write on this connection from now on - `read`, `write`, `readDeadline`,
+`readDeadlineInto` and `writeDeadline` alike, Go's `net.Conn.SetDeadline`
+contract. Does not reach back to bound a `dial`/`dialDeadline` connect
+already completed.
 
 ### `Conn.deadline(): int`
 
