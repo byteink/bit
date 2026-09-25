@@ -377,6 +377,22 @@ explainMismatch() {
         }
       }
 
+      # --- #5905, POST-OPT ONLY: the unread zero object of a comma-ok miss ---
+      #
+      # `nullCommaOkMisses` (compiler/optcommaok.bit) hands a comma-ok map
+      # read miss edge the null word instead of the zero object when every
+      # read of the value sits behind an ok-true edge, and `deadAllocs` then
+      # deletes that `gc_alloc` (its `field_set`s score as nothing). Reaches
+      # two corpus files, both its own fixtures (this tree vs 0ddd85504,
+      # `iropt` only): `gc_alloc` falls by N >= 1 and nothing else moves.
+      # Every such miss belongs to a comma-ok read, so the file must still
+      # hold at least N `map_val_at` calls.
+      if (kind == "iropt" && ("gc_alloc" in moved) && delta["gc_alloc"] < 0) {
+        okMiss = (b["rt_call:map_val_at"] >= -delta["gc_alloc"])
+        for (op in moved) { if (op != "gc_alloc") okMiss = 0 }
+        if (okMiss) { print "5905-commaok-miss-zero-drop"; exit 0 }
+      }
+
       # #3107 (inline slice element READ), #3108 (its STORE half), #3898
       # (pointer-scale/shift fold) and #3862 (inline slice elements, packed
       # class) were declared here and RETIRED by #5509 -- see the header
@@ -679,7 +695,8 @@ explainMismatch() {
 # `checked` disappearing, only on `eight`'s divergence from the pinned
 # stage0 closing (a repin past #5870, same as any other entry here).
 # `5895-bce-trivial-param` is gated `kind == "iropt"` (bounds-check
-# elimination is an optimizer pass) and is listed only there. `ast`
+# elimination is an optimizer pass) and is listed only there, as is
+# `5905-commaok-miss-zero-drop` (an optimizer pass too). `ast`
 # and `fmt` are
 # a different, disjoint kind space entirely -- #5474's two signatures never
 # fire under `ir`/`iropt` and vice versa, so they are returned only for their
@@ -690,11 +707,11 @@ declaredSignatureNames() {
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
     ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
-    iropt) printf '%s\n' "5895-bce-trivial-param" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
+    iropt) printf '%s\n' "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
-    "5895-bce-trivial-param" \
+    "5895-bce-trivial-param" "5905-commaok-miss-zero-drop" \
     "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
     "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" \
     "5870-multiword-return-rebox"
