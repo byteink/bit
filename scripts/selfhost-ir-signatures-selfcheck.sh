@@ -520,6 +520,70 @@ bb2(%10: i64):
     fail=1
   fi
 
+  # --- #5895: a bounds check the loop test proved, post-opt only ---
+  #
+  # Real dump text from `_tests_/cases/run_while_index_bce.bit`'s
+  # `nestedAndContinue` (this tree vs the pinned stage0): the check before
+  # the outer load and its panic block are gone, the `br` is a `jump`.
+  oracle_bce='  br %12, bb4(), bb3()
+bb3():
+  %11 = icmp_ult bool %9, %6
+  br %11, bb5(), bb4()
+bb4():
+  %13 = const_string "index out of range"
+  %14 = rt_call panic(%13) void
+  unreachable
+bb5():
+  %16 = index_get %5[%9] i64'
+  bit2_bce='  br %12, bb4(), bb3()
+bb3():
+  jump bb5()
+bb5():
+  %16 = index_get %5[%9] i64'
+  sigb1=$(explainMismatch "$oracle_bce" "$bit2_bce" iropt)
+  rcb1=$?
+  if [ "$rcb1" -ne 0 ] || [ "$sigb1" != "5895-bce-trivial-param" ]; then
+    echo "FAIL: the real #5895 dropped-check delta was not explained (rc=$rcb1 sig='$sigb1')"
+    fail=1
+  fi
+  # REJECTION: pre-opt IR never drops a check, so the same delta under `ir`.
+  sigb2=$(explainMismatch "$oracle_bce" "$bit2_bce" ir)
+  rcb2=$?
+  if [ "$rcb2" -eq 0 ] || [ -n "$sigb2" ]; then
+    echo "FAIL: a #5895 delta was wrongly explained pre-opt (rc=$rcb2 sig='$sigb2')"
+    fail=1
+  fi
+  # REJECTION: the compare is gone but the panic block survives -- not the
+  # shape of a proven check, so nothing may explain it.
+  bit2_bce_half='  br %12, bb4(), bb3()
+bb3():
+  jump bb5()
+bb4():
+  %13 = const_string "index out of range"
+  %14 = rt_call panic(%13) void
+  unreachable
+bb5():
+  %16 = index_get %5[%9] i64'
+  sigb3=$(explainMismatch "$oracle_bce" "$bit2_bce_half" iropt)
+  rcb3=$?
+  if [ "$rcb3" -eq 0 ] || [ -n "$sigb3" ]; then
+    echo "FAIL: a half-dropped #5895 check was wrongly explained (rc=$rcb3 sig='$sigb3')"
+    fail=1
+  fi
+  # COMPOSED: stdlib/smtp/header.bit carries a dropped check AND the #5871
+  # post-opt delta; the residual after the five opcodes goes on to #5871.
+  oracle_bce_tuple="${oracle_bce}
+%20 = gc_alloc size=16 ptrs=[%8] (bool, string)
+%21 = field_get %20[8] string"
+  bit2_bce_tuple="${bit2_bce}
+%22 = call_word %5[1] string"
+  sigb4=$(explainMismatch "$oracle_bce_tuple" "$bit2_bce_tuple" iropt)
+  rcb4=$?
+  if [ "$rcb4" -ne 0 ] || [ "$sigb4" != "5871-tuple-word-explode" ]; then
+    echo "FAIL: a #5895 check composed with a #5871 delta was not explained (rc=$rcb4 sig='$sigb4')"
+    fail=1
+  fi
+
   # --- #5870: a `ret` over the 5-integer-word budget boxes again, composed
   # with #5874 in the one file it hits (#5883) --- moved verbatim to
   # scripts/ir-signatures-selfcheck-multiword.sh by #5885 to stay under the
