@@ -26,6 +26,12 @@ import { sysRead, sysWrite, sysEventfd2 } from "../../syscalls"
 // reaches into this module the same way, and neither park module imports
 // `runtime/sched/`, so the dependency stays one-directional.
 import { parkLowerTimerSlack } from "../../park/linux"
+// pollDesc (#5864/#5866): the register-once model's per-fd table.
+// `pollDrainOne` below routes a register-once event (`./pollonce.bit`'s
+// `pollDrainDescEvent`) through `pdWake` to find whichever task is CURRENTLY
+// parked in that (fd, dir) slot, instead of the kernel event itself carrying
+// a task pointer — same shape as the darwin twin's identical import.
+import { pdWake, pdDirRead, pdDirWrite, pdEmpty } from "../../sched"
 
 // Syscall numbers are per-architecture and Bit has no arch-conditional
 // compilation, so the number is selected at run time (§11.8). `hostTarget()` is
@@ -732,15 +738,28 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
     let base = bytesOf()
     let i = 0
     while (i < n) {
-      let task = readU64(base, i * eventStride() + eventDataOff())
-      if (task == nestSentinel()) {
+      let off = i * eventStride()
+      let data = readU64(base, off + eventDataOff())
+      if (data == nestSentinel()) {
         // The nested write descriptor became readable (#5736) — which is the
         // whole job: this event ENDED the blocking wait. `pollDrain` drains
         // `scPollFdWrite` unconditionally on its very next line, so there is
         // nothing to do here, and nothing to decrement: this registration is
         // permanent and level-triggered, never counted by
         // `schedPollPendingInc`.
-      } else if (task != 0) {
+      } else if (data < 0) {
+        // Register-once event (#5866, `./pollonce.bit`): `data` is
+        // `0 - (1 + fd*2^pdcGenBits + genTag)`, never a task pointer — a
+        // permanent, edge-triggered registration means the kernel event
+        // names the (fd, dir) slot, and `pollDrainDescEvent` finds whoever is
+        // CURRENTLY parked there (or records the edge for the next waiter).
+        // The count this decrements tracks live PARKED WAITERS, not live
+        // kernel registrations (`netAwaitReady`/`netReadSockDeadline`
+        // increment it on a successful `pdWait`), so it drops only when a
+        // `pdWake` inside `pollDrainDescEvent` actually finds a task to
+        // remove.
+        woken = woken + pollDrainDescEvent(s, base, off, data)
+      } else if (data != 0) {
         // The kernel's one-shot edge is consumed here regardless of what
         // `schedPollUnpark` does with it below — the registration this
         // decrements was armed once and the kernel just reported it exactly
@@ -751,7 +770,7 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
         // this readiness edge is already consumed, so a task caught between
         // registering and parking must be handed the wake rather than have it
         // dropped. See ../task.bit's "arming a park" section.
-        if (schedPollUnpark(s, task)) {
+        if (schedPollUnpark(s, data)) {
           woken = woken + 1
         }
       } else {
