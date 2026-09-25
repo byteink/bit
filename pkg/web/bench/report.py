@@ -62,10 +62,10 @@ def rps(n):
     return "{:,}".format(int(round(n)))
 
 
-def table(rows, test, conns):
+def table(rows, test, conns, flagged):
     head = ["Framework"]
     for c in conns:
-        head += ["req/s c=%s" % c, "spread"]
+        head += ["req/s c=%s" % c, "spread", "CPU us/req c=%s" % c]
     head += ["p50 ms c=%s" % conns[-1], "p99 ms c=%s" % conns[-1], "vs pkg/web"]
     out = ["| " + " | ".join(head) + " |",
            "|---" + "|--:" * (len(head) - 1) + "|"]
@@ -75,9 +75,13 @@ def table(rows, test, conns):
         for c in conns:
             v = series(rows, fw, test, c, "rps")
             if not v:
-                cells += ["n/a", "n/a"]
+                cells += ["n/a", "n/a", "n/a"]
                 continue
-            cells += [rps(statistics.median(v)), spread(v)]
+            rps_cell = rps(statistics.median(v))
+            if (fw, test, c) in flagged:
+                rps_cell += " *"
+            cpu = series(rows, fw, test, c, "cpu_us_per_req")
+            cells += [rps_cell, spread(v), "%.1f" % statistics.median(cpu) if cpu else "n/a"]
         last = series(rows, fw, test, conns[-1], "rps")
         p50 = series(rows, fw, test, conns[-1], "p50_ms")
         p99 = series(rows, fw, test, conns[-1], "p99_ms")
@@ -102,6 +106,40 @@ def pinning(out_dir):
 
 def bad_reps(rows):
     return [r for r in rows if int(r["non200"]) != 0 or int(r["total"]) == 0]
+
+
+def cpu_count(spec):
+    """Number of cores in a taskset-style range ("6-7") or a single id ("7")."""
+    if not spec or spec == "?":
+        return 0
+    if "-" in spec:
+        lo, hi = spec.split("-", 1)
+        return int(hi) - int(lo) + 1
+    return 1
+
+
+def load_bound(rows, conns, n_load):
+    """(framework, test, conn) tuples whose load generator was itself close to
+    saturated: its req/s there is oha's own throughput, not a server ceiling."""
+    flagged = set()
+    if not n_load:
+        return flagged
+    for fw in ORDER:
+        for test, _ in TESTS:
+            for c in conns:
+                v = series(rows, fw, test, c, "load_cores")
+                if v and statistics.median(v) >= 0.9 * n_load:
+                    flagged.add((fw, test, c))
+    return flagged
+
+
+def load_bound_note(flagged, n_load):
+    if not flagged:
+        return ""
+    return ("> `*` marks a LOAD-BOUND row: the load generator's median busy"
+            " count on its %d pinned core(s) was at least 90%% of %d there, so"
+            " its req/s is oha's own throughput, not a server ceiling there."
+            " Compare those rows on `CPU us/req` instead." % (n_load, n_load))
 
 
 def versions_line(v):
@@ -171,6 +209,8 @@ def main():
     env_text = open(os.path.join(out_dir, "env.txt")).read()
     conns = sorted({r["conn"] for r in rows}, key=int)
     server_cpus, load_cpus = pinning(out_dir)
+    n_load = cpu_count(load_cpus)
+    flagged = load_bound(rows, conns, n_load)
     reps = len({r["rep"] for r in rows})
     p = print
 
@@ -184,7 +224,7 @@ def main():
     for test, title in TESTS:
         p("### %s" % title)
         p("")
-        for line in table(rows, test, conns):
+        for line in table(rows, test, conns, flagged):
             p(line)
         p("")
     bad = bad_reps(rows)
@@ -199,6 +239,9 @@ def main():
     note = scaling_note(rows, conns)
     if note:
         p(note)
+    lb_note = load_bound_note(flagged, n_load)
+    if lb_note:
+        p(lb_note)
     p("> The two concurrency columns are published together because they do not"
       " move together. c=1 is what one request costs with no queue in front of"
       " it; c=64 is the server under load. A framework can lead on one and trail"
