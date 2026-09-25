@@ -745,6 +745,14 @@ $va" iropt)
     fi
   done
 
+  # --- #5910: closed-channel recv / failed type assertion, composed with
+  # #5895/#5906 --- moved verbatim to
+  # scripts/ir-signatures-selfcheck-chanzero.sh to stay under the 800-line
+  # ceiling; sourced here so it still runs as part of this self-check, same
+  # `fail`/`explainMismatch` scope.
+  # shellcheck source=scripts/ir-signatures-selfcheck-chanzero.sh
+  . "${ROOT}/scripts/ir-signatures-selfcheck-chanzero.sh"
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
