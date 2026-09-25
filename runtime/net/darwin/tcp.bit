@@ -8,6 +8,13 @@
 import { schedSleepUntil } from "../../sched"
 import { parkMonoNs } from "../../park/darwin"
 import { netClampDeadline, netDeadlineMaxWaitNs } from "../../net"
+// `taskDeadline`/`schedTimerPush`/`schedTimerCancel` back
+// `netAwaitReadyOrDeadline` below, the readiness-vs-timer race (#5865). `pdCancel`
+// is the one polldesc primitive ../sock.bit does not already import for this
+// module (imports are per-module, not per-file, so its `pdWait`/`pdDirRead`/etc.
+// are already in scope here).
+import { taskDeadline, schedTimerPush, schedTimerCancel } from "../../sched"
+import { pdCancel } from "../../sched"
 
 // ---------------------------------------------------------------------------
 // TCP
@@ -86,6 +93,7 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
         netClose(fd)
         return 0 - 1
       }
+      netPollDescOpen(fd)
       return fd
     }
     let e = lastErr()
@@ -393,29 +401,16 @@ const netDeadlinePollNs: int = 2000000
 // to speak is answered within one short slice, a peer that is not reaches the
 // cheap steady state within ~4ms and pays exactly the old cost from there on.
 //
-// NOT WIRED IN AS A READINESS RACE EITHER, though the reason has changed
-// again. `runtime/sched/**` used to have no way to retract either side of a
-// registering-for-readiness-and-arming-a-timer race, so whichever did not
-// fire was left holding a `Task` the other side's worker could already have
-// run to completion and freed. That retraction pair now exists —
-// `pollUnregister` (#5430, `../../sched/{darwin,linux}/poll.bit`) on the
-// kernel side and `schedTimerCancel` (#5433, `../../sched/timer.bit`) on the
-// timer-queue side, proven together by `_tests_/stress/schedtimer`'s
-// retraction properties — and as of #5438 both ARE `@nosplit`: the
-// heap-allocated `[]i64(n)` kevent/epoll_event staging local each used to
-// build is now a per-worker slot in a fixed module-level buffer (the same
-// shape `runtime/net/sock.bit`'s `sockScratchSlot()`/`saBuf` already use for
-// this exact "many green tasks on many workers call concurrently, one shared
-// buffer is wrong" problem), proven by `bit check` on both providers under
-// their real `@nosplit` annotation — no more temporary marking needed to see
-// it. E0075 is no longer transitive through this boundary, so today's three
-// deadline entry points COULD call either primitive without giving up
-// `@nosplit` here. They still don't: wiring the actual retraction race
-// (arming both sides, calling `schedTimerCancel` from the winner) is real
-// design and correctness work on top of reachability, and is #5438's
-// deliberately-undone remainder, not a comment fix. The use-after-free this
-// block used to warn about is closed at the scheduler level; only wiring it
-// into these three entry points is outstanding.
+// NOW WIRED IN AS A READINESS RACE, for `netReadSockDeadline` only (#5865):
+// `netAwaitReadyOrDeadline` above races a register-once poll wait
+// (`pdWait`/`pdWake`, `../../sched/polldesc.bit`) against `schedTimerPush`,
+// with the loser retracted via `schedTimerCancel`'s return (`pdCancel` on the
+// poll side). `netWriteSockDeadline`/`netDialTcpDeadline` below still use the
+// ramp, per the ticket that wired this in — they are not blocked on anything,
+// just not yet done. This paragraph's history (`schedtimer`'s retraction
+// proof, #5430/#5433/#5438 landing `@nosplit` on both retraction primitives)
+// is why the wiring below was reachable without giving up `@nosplit`; it is
+// no longer the reason it is undone, since it is not undone.
 //
 // AND NOT BY SPINNING ON `schedYield`, which looks like the obvious way to
 // make the first retry free. A yielding task stays RUNNABLE, so
@@ -433,10 +428,10 @@ const netDeadlinePollNs: int = 2000000
 // the same runs. They are the same number. So what a miss COSTS is the
 // park/unpark round trip, not the nanoseconds slept — which is also why the
 // remaining ~8us per exchange against the control does not close by making
-// the slice smaller, and why the only thing that would close it is not
-// polling at all — a deadline-bound read parking on readiness the way
-// `netReadSock` does, which needs the retraction pair above wired in through
-// the `@nosplit` blocker that section now describes (#5430, #5433).
+// the slice smaller, and why the only thing that closes it is not polling at
+// all — a deadline-bound read parking on readiness the way `netReadSock`
+// does, which `netAwaitReadyOrDeadline` above now is (#5865); the ramp below
+// remains the fallback for an unscheduled caller or one with no poller bound.
 //
 // THE RAMP IS THE TIE-BREAK, not the win: among policies that measure the
 // same it is the one that needs no window constant fitted to one workload,
@@ -508,6 +503,65 @@ const netDeadlineTimedOut: int = 0 - 2
   return true
 }
 
+// Park until `fd` is ready for `interest` OR `deadlineNs` passes, whichever
+// comes first (#5865) — the register-once model's readiness-vs-timer race.
+// Same `false` contract as `netAwaitReady`: nobody to park on (unscheduled
+// caller, no poller bound, or the fd's generation moved / its slot is held
+// by another waiter) — the caller's own bounded fallback
+// (`netAwaitDeadlineTick` below) takes over exactly as it does when
+// `netAwaitReady` itself declines.
+//
+// EXACTLY-ONE-WAKEUP, told apart by `schedTimerCancel`'s return, same rule
+// as the pre-#5864 version of this function used: `true` means the timer
+// entry was still linked, so the POLL side woke this task — `pdWake`
+// (`../../sched/darwin/poll.bit`'s drain) already removed it from the slot,
+// nothing left to retract. `false` means the timer already fired
+// (`schedTimerExpire` unlinked it first), so the still-claimed poll slot is
+// retracted here, via `pdCancel`, before this task is touched again.
+@nosplit fn netAwaitReadyOrDeadline(fd: int, interest: int, deadlineNs: int): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return false
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  let pollFd = *(s + scPollFd)
+  if (pollFd == 0) {
+    return false
+  }
+  let dir = pdDirWrite
+  if (interest == pollRead) {
+    dir = pdDirRead
+  }
+  let gen = *netFdGenAddr(fd)
+  if (!schedParkArm()) {
+    return false
+  }
+  let r = pdWait(fd, dir, gen, taskAddr)
+  if (r == pdAlreadyReady) {
+    let _ = schedParkDisarm()
+    return true
+  }
+  if (r != pdClaimed) {
+    let _ = schedParkDisarm()
+    return false
+  }
+  schedPollPendingInc()
+  *(t + taskDeadline) = deadlineNs
+  schedTimerPush(s, taskAddr)
+  schedPark()
+  if (!schedTimerCancel(s, taskAddr)) {
+    if (pdCancel(fd, dir, taskAddr, gen)) {
+      schedPollPendingDec()
+    }
+  }
+  return true
+}
+
 // Read up to `bufCap` bytes into `buf`, bounded by `deadlineNs` (absolute
 // monotonic ns) rather than parking forever. Same three-way result shape as
 // `osForkExecWaitBounded`: `n >= 0` bytes read (`0` — the peer closed, an
@@ -533,8 +587,14 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
       if (netClockNowNs() >= deadline) {
         return netDeadlineTimedOut
       }
-      let _ = netAwaitDeadlineTick(deadline, slice)
-      slice = netDeadlineNextSliceNs(slice)
+      // Race readiness against the deadline (#5865) rather than the ramp;
+      // fall back to the tick only when there is no current task or no
+      // poller bound (`netAwaitReadyOrDeadline`'s own `false` contract) —
+      // the unscheduled/no-poller case the ramp was written for.
+      if (!netAwaitReadyOrDeadline(fd, pollRead, deadline)) {
+        let _ = netAwaitDeadlineTick(deadline, slice)
+        slice = netDeadlineNextSliceNs(slice)
+      }
     } else if (e == eIntr()) {
       // Interrupted; retry immediately, same as `netReadSock`.
     } else if (e == eConnReset()) {

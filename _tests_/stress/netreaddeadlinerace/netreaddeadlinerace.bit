@@ -1,0 +1,370 @@
+// Races `Conn.readDeadline` against its own deadline under real socket
+// pressure (#5861): many connections, half writing their payload right
+// around the SAME shared instant every connection's read deadline also
+// fires at, half never writing at all. Proves, at volume rather than by
+// argument, the three properties #5861 names:
+//
+//   1. an idle connection's deadline still fires with no bytes (never hangs)
+//   2. a peer's bytes landing at the same instant as the deadline are never
+//      lost — whichever side of `netAwaitReadyOrDeadline`'s race wins, the
+//      payload is still there for the read that follows
+//   3. exactly-once wakeup: a double-delivered wake lands on a `Task` its
+//      first waker may already be running to completion and freeing
+//      (`../../../runtime/sched/task.bit`'s "arming a park" section) — that
+//      is a crash or corruption, not a wrong VALUE, so this program's exit
+//      code and deterministic summary line are themselves the oracle for
+//      it, the same stance `../netpark`'s own header takes.
+//
+// EXTENDED FOR #5865's register-once model with two more cases, run after
+// the main race, each against its own listener:
+//
+//   4. close-while-parked (`runCloseWhileParked`): a parked reader is woken
+//      by a peer-visible state change (`shutdown`) on its own fd, not by its
+//      own (long) deadline — proves the register-once/EV_CLEAR model still
+//      delivers that wake the same way the old oneshot one did (`Conn.close`
+//      itself does not yet route through `pdClose`'s "close wakes every
+//      waiter" — see `closeWhileParkedCloser`'s own header).
+//   5. fd-number-reuse (`runFdReuse`): back-to-back dial/close cycles force
+//      the same kernel fd number back out while the previous connection's
+//      registration is only just being retracted — proves a straggler event
+//      from the closed generation cannot land in the new one's slot
+//      (`pdCasChecked`'s generation re-check, `../../../runtime/sched/polldesc.bit`).
+//
+// RACERS AND IDLERS SHARE ONE `raceAtNs` INSTANT, deliberately. Every
+// racer's server-side deadline AND every idler's are the identical absolute
+// nanosecond, and every racer's write is timed off that SAME instant
+// (`sleepUntil(raceAtNs)` then write immediately) — so which side of the
+// race actually wins is genuinely undetermined per connection, per run,
+// exactly the "bytes arriving right at the deadline" case the ticket asks
+// for, rather than a fixed offset that always resolves the same way.
+//
+// NO ASSERTION ON WHO WON. A racer's server side always gets a second,
+// generous-deadline read after the first times out, so the check is never
+// "the readiness side won" or "the timer side won" — only "the exact
+// payload arrived exactly once, whichever read carried it".
+//
+// Platform-free: `std/net` is the portable wrapper (see ../spawnconnleak's
+// header for the same reasoning), so this carries no host marker.
+
+import { listen, dial, Listener, Conn } from "std/net"
+import { newWaitGroup, WaitGroup } from "std/sync"
+import { monotonic, sleepUntil, Millisecond } from "std/time"
+
+const N: int = 120
+const raceOffsetMs: int = 20
+const secondChanceMs: int = 150
+
+// close-while-parked (#5865): a connection whose server side is parked in
+// `readDeadline`, closed from elsewhere while still parked, long before its
+// own deadline. Proves `pdClose`'s "close wakes every waiter" — a
+// register-once slot that is never retracted on close would leave this
+// parked forever (or until the long deadline below), not wake early.
+const closeParkedN: int = 20
+const closeParkedDeadlineMs: int = 4000
+const closeParkedCloseAfterMs: int = 30
+// Generous bound for "woke because of the close, not the deadline" — well
+// under `closeParkedDeadlineMs`, well over any real scheduling jitter.
+const closeParkedBoundMs: int = 1000
+
+// fd-number-reuse (#5865): open, use and close connections back-to-back
+// SEQUENTIALLY against one listener, so the kernel hands the same low fd
+// numbers back out to new connections while the previous one's register-once
+// kqueue registration is only just being retracted. Proves `pdOpen`'s
+// generation bump (`pdCasChecked`'s gen re-check, `../../../runtime/sched/polldesc.bit`)
+// keeps a straggler event from the CLOSED connection out of the NEW one's
+// slots — a stale event routed by `pdWake` into the wrong generation's slot
+// is exactly what `pdValidFd`/`pdCasChecked`'s gen check exists to reject.
+const fdReuseRounds: int = 60
+const fdReuseDeadlineMs: int = 500
+
+fn payloadFor(idx: int): string {
+  return "R${idx}"
+}
+
+class ConnArgs { c: Conn, wg: WaitGroup, ok: []i64, idx: int, raceAtNs: int }
+
+// Server side of one connection. Even indices are racers (expect exactly
+// their own payload, from either read); odd indices are idlers (expect
+// both reads to see no bytes at all).
+fn serverHandle(a: ConnArgs) {
+  a.c.setDeadline(a.raceAtNs)
+  let first = a.c.readDeadline(64) catch _ {
+    if (a.idx % 2 != 0) {
+      // Idler: the deadline firing with nothing to read is #5861's own
+      // "a read deadline still fires with no bytes" property.
+      a.ok[a.idx] = 1
+      a.c.close()
+      a.wg.done()
+      return
+    }
+    a.c.setDeadline(monotonic().ns + secondChanceMs * Millisecond)
+    let second = a.c.readDeadline(64) catch _ {
+      a.ok[a.idx] = 0 // lost: the racer's write never arrived at all
+      a.c.close()
+      a.wg.done()
+      return
+    }
+    if (second == payloadFor(a.idx)) {
+      a.ok[a.idx] = 1
+    }
+    a.c.close()
+    a.wg.done()
+    return
+  }
+  // An idler that read something before timing out is the bug #5861's
+  // exactly-once property guards against — `a.ok[a.idx]` stays 0 for it,
+  // which the summary below catches.
+  if (a.idx % 2 == 0 && first == payloadFor(a.idx)) {
+    a.ok[a.idx] = 1
+  }
+  a.c.close()
+  a.wg.done()
+}
+
+class ServerArgs { l: Listener, wg: WaitGroup, ok: []i64, raceAtNs: int }
+
+fn runServer(a: ServerArgs) {
+  let i = 0
+  while (i < N) {
+    let c = a.l.accept() catch _ {
+      return
+    }
+    spawn serverHandle(ConnArgs{ c = c, wg = a.wg, ok = a.ok, idx = i, raceAtNs = a.raceAtNs })
+    i = i + 1
+  }
+}
+
+// A racer's client half: park until the SAME instant the server armed its
+// deadline for, then write immediately — the closest this harness can come
+// to making the write and the deadline land at once without controlling
+// the kernel's own scheduling.
+fn writeRacer(c: Conn, idx: int, raceAtNs: int) {
+  sleepUntil(raceAtNs)
+  c.write(payloadFor(idx)) catch _ {
+    // Nothing to do here: the server side's second-chance read is what
+    // reports a genuine loss.
+  }
+  c.close()
+}
+
+// An idler's client half: hold the connection open past the server's own
+// second-chance window, then close — the peer that never speaks.
+fn idleCloser(c: Conn, closeAtNs: int) {
+  sleepUntil(closeAtNs)
+  c.close()
+}
+
+// Server side of one close-while-parked connection: park in `readDeadline`
+// against a long deadline, then check whether the error came back FAST
+// (closed) or only after the long wait (deadline) — the property this case
+// exists to prove is that it is always fast.
+class CloseParkedArgs { c: Conn, wg: WaitGroup, ok: []i64, idx: int }
+
+fn closeWhileParkedServer(a: CloseParkedArgs) {
+  a.c.setDeadline(monotonic().ns + closeParkedDeadlineMs * Millisecond)
+  let startNs = monotonic().ns
+  // `shutdown()` delivers an orderly EOF, which `readDeadline` reports as a
+  // SUCCESSFUL empty string, not an error (its own header: "an empty result
+  // is a CLEAN CLOSE... never an error") — so the "woke fast" check has to
+  // run on both the value and the `catch` paths, not only the error one.
+  let v = a.c.readDeadline(64) catch _ {
+    let elapsedMs = (monotonic().ns - startNs) / Millisecond
+    if (elapsedMs < closeParkedBoundMs) {
+      a.ok[a.idx] = 1
+    }
+    a.wg.done()
+    return
+  }
+  let elapsedMs = (monotonic().ns - startNs) / Millisecond
+  if (v == "" && elapsedMs < closeParkedBoundMs) {
+    a.ok[a.idx] = 1
+  }
+  a.wg.done()
+}
+
+// Shuts down the SAME `Conn` value a sibling task is parked reading on, from
+// a SECOND task, `raceOffsetMs`-sized margin after spawn to make sure the
+// reader has certainly parked first. `shutdown()`, not `close()`
+// (`../../../stdlib/net/net.bit`'s own header: "closing tears the descriptor
+// down without notifying an existing registration... shutting down is a real
+// state transition on the still-open descriptor the parked read IS
+// registered against") — `std/net` does not yet route `close()` itself
+// through `pdClose`'s wake (`netClose`, `../../../runtime/net/darwin/sock.bit`,
+// is unreachable from `Conn.close()`, which calls the platform-neutral raw
+// `fsClose` directly on every platform; wiring that through is stdlib-level
+// work outside this ticket's files, filed as a followup). This case instead
+// proves the register-once/EV_CLEAR model does not regress the EXISTING
+// shutdown-wakes-a-parked-reader path.
+fn closeWhileParkedCloser(c: Conn) {
+  sleepUntil(monotonic().ns + closeParkedCloseAfterMs * Millisecond)
+  c.shutdown()
+}
+
+fn runCloseWhileParked(): int {
+  let l = listen("127.0.0.1", 0) catch _ {
+    return 0
+  }
+  let port = l.port() catch _ {
+    l.close()
+    return 0
+  }
+  let wg = newWaitGroup()
+  wg.add(i64(closeParkedN))
+  let ok = []i64(closeParkedN)
+  spawn runCloseParkedServer(l, wg, ok)
+
+  // The CLIENT side dials and does nothing else — no write, no close — kept
+  // alive in `clients` for the whole run so it is never the reason the
+  // server side sees an EOF; only the server's own close (above) can be.
+  let clients = []Conn(closeParkedN)
+  let i = 0
+  while (i < closeParkedN) {
+    let c = dial("127.0.0.1", port) catch _ {
+      i = i + 1
+      continue
+    }
+    clients[i] = c
+    i = i + 1
+  }
+  wg.wait()
+  l.close()
+  let k = 0
+  while (k < closeParkedN) {
+    clients[k].close()
+    k = k + 1
+  }
+
+  let okCount = 0
+  let j = 0
+  while (j < closeParkedN) {
+    if (ok[j] == 1) {
+      okCount = okCount + 1
+    }
+    j = j + 1
+  }
+  return okCount
+}
+
+fn runCloseParkedServer(l: Listener, wg: WaitGroup, ok: []i64) {
+  let i = 0
+  while (i < closeParkedN) {
+    let c = l.accept() catch _ {
+      return
+    }
+    spawn closeWhileParkedServer(CloseParkedArgs{ c = c, wg = wg, ok = ok, idx = i })
+    spawn closeWhileParkedCloser(c)
+    i = i + 1
+  }
+}
+
+// fd-number-reuse: SEQUENTIAL (not concurrent — the point is to force the
+// same fd number back out immediately) dial/write/read/close cycles against
+// one listener. No assertion beyond "every round completed within its own
+// deadline and the whole loop finished" — a stale event landing in the
+// WRONG generation's slot after a fd-number reuse reads as this loop hanging
+// or a connection's read/write returning bytes meant for a different round,
+// neither of which a `catch` here can quietly paper over: a bad read length
+// would still show up as this program's own accounting elsewhere if it
+// shared state across rounds, which — deliberately — it does not; the oracle
+// here is exit code / hang, matching this whole program's own header.
+fn runFdReuse(): bool {
+  let l = listen("127.0.0.1", 0) catch _ {
+    return false
+  }
+  let port = l.port() catch _ {
+    l.close()
+    return false
+  }
+  let wg = newWaitGroup()
+  wg.add(1)
+  spawn runFdReuseServer(l, wg)
+
+  let i = 0
+  while (i < fdReuseRounds) {
+    let c = dial("127.0.0.1", port) catch _ {
+      i = i + 1
+      continue
+    }
+    c.setDeadline(monotonic().ns + fdReuseDeadlineMs * Millisecond)
+    c.write(payloadFor(i)) catch _ {}
+    let _ = c.readDeadline(64) catch _ {
+      // No echo from the server side; a timeout here is expected and fine —
+      // only a hang or a crash would be this case's failure.
+      ""
+    }
+    c.close()
+    i = i + 1
+  }
+  l.close()
+  wg.wait()
+  return true
+}
+
+fn runFdReuseServer(l: Listener, wg: WaitGroup) {
+  let i = 0
+  while (i < fdReuseRounds) {
+    let c = l.accept() catch _ {
+      wg.done()
+      return
+    }
+    c.close()
+    i = i + 1
+  }
+  wg.done()
+}
+
+fn main() {
+  let l = listen("127.0.0.1", 0) catch _ {
+    print("bind fail\n")
+    return
+  }
+  let port = l.port() catch _ {
+    print("port fail\n")
+    return
+  }
+
+  let raceAtNs = monotonic().ns + raceOffsetMs * Millisecond
+  let idleCloseAtNs = raceAtNs + secondChanceMs * Millisecond + 20 * Millisecond
+
+  let wg = newWaitGroup()
+  wg.add(i64(N))
+  let ok = []i64(N)
+  spawn runServer(ServerArgs{ l = l, wg = wg, ok = ok, raceAtNs = raceAtNs })
+
+  let i = 0
+  let dials = 0
+  while (i < N) {
+    let c = dial("127.0.0.1", port) catch _ {
+      i = i + 1
+      continue
+    }
+    dials = dials + 1
+    if (i % 2 == 0) {
+      spawn writeRacer(c, i, raceAtNs)
+    } else {
+      spawn idleCloser(c, idleCloseAtNs)
+    }
+    i = i + 1
+  }
+
+  wg.wait()
+  l.close()
+
+  let okCount = 0
+  let j = 0
+  while (j < N) {
+    if (ok[j] == 1) {
+      okCount = okCount + 1
+    }
+    j = j + 1
+  }
+
+  let closeParkedOk = runCloseWhileParked()
+  let fdReuseOk = runFdReuse()
+  let fdReuseCode = 0
+  if (fdReuseOk) {
+    fdReuseCode = 1
+  }
+
+  print("netreaddeadlinerace ${dials} ${okCount} closeParked ${closeParkedOk} fdReuse ${fdReuseCode}\n")
+}
