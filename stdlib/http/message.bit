@@ -227,20 +227,35 @@ const defaultMaxBodyBytes = 32 * 1024 * 1024
 // bytes are read (#4565). An empty method/path/headers/body `Request` (no failure)
 // means the peer closed before a complete header block arrived; the caller's
 // subsequent write will simply fail against the already-closed socket.
-// Reads through the blank line that ends a message's headers and returns the
-// whole accumulated buffer: the header block, its terminating CRLFCRLF, and
-// whatever body bytes already arrived with it. "" means the peer went away
-// before the headers were complete, and nothing else can return it — the loop
-// only exits once a four-byte terminator is already in `buf`. Split out of
-// `readMessage` (#2448); returns that raw buffer rather than a three-field
-// result class so the per-request read path does not allocate one (#3644).
-// The caller slices exactly the two strings the class used to carry, so the
-// object is removed and no copying is added.
-fn readThroughHeaderEnd(s: byteStream): string! {
+// Reads through the blank line that ends a message's headers. Returns the
+// buffer read so far — the header block, its terminating CRLFCRLF, and
+// whatever body or pipelined bytes already arrived with it — together with the
+// offset of that first CRLFCRLF, so `readMessage` slices at it without
+// searching the same bytes again (#5898). ("", -1) means the peer went away
+// before the headers were complete, and nothing else can return it — every
+// other return has a four-byte terminator in the buffer. Split out of
+// `readMessage` (#2448). The pair costs no allocation where the ABI returns a
+// fallible tuple in words (runtime/ABI.md §1.2.2: aarch64-macos,
+// aarch64-linux, x86_64-linux); x86_64-windows boxes it, as it boxes every
+// tuple.
+//
+// The common case is a block that arrives whole in the first read: that chunk
+// is returned as it is, searched once, with no Builder, no copy and no
+// concatenation. Only a block split across reads accumulates.
+fn readThroughHeaderEnd(s: byteStream): (string, int)! {
   let delim = "\r\n\r\n"
+  let first = s.readUp(4096)?
+  if (len(first) == 0) {
+    return "", -1
+  }
+  let at = indexOf(first, delim)
+  if (at >= 0) {
+    return first, at
+  }
   let acc = newBuilder()
-  let n = 0
-  let tail = ""
+  acc.write(first)
+  let n = len(first)
+  let tail = lastBytes(first, len(delim) - 1)
   // Same cap as before: the loop is left, and the message below raised, once
   // the accumulated block passes `maxHeaderBytes` with no terminator in it.
   // A terminator that arrives in the chunk which crosses the cap is still
@@ -248,13 +263,13 @@ fn readThroughHeaderEnd(s: byteStream): string! {
   while (n <= maxHeaderBytes) {
     let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
-      return ""
+      return "", -1
     }
     let hit = delimIndex(n, tail, chunk, delim)
     acc.write(chunk)
     n = n + len(chunk)
     if (hit >= 0) {
-      return acc.toString()
+      return acc.toString(), hit
     }
     tail = lastBytes(tail + chunk, len(delim) - 1)
   }
@@ -351,7 +366,7 @@ fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   // call and answer every later one from the stored field, so `getpeername`
   // itself still runs once per connection (#5893).
   let peer = s.peer()
-  let raw = readThroughHeaderEnd(s)?
+  let (raw, sep) = readThroughHeaderEnd(s)?
   if (len(raw) == 0) {
     // Peer closed mid-headers: return an empty request, the caller stops.
     return Request{ method = "", path = "", version = "", headers = "", body = "", peer = peer }
@@ -368,7 +383,6 @@ fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   // clear vs 10 661 req/s without, one reused connection, 2000 requests,
   // aarch64-macos).
   s.setIdleDeadline(0)
-  let sep = indexOf(raw, "\r\n\r\n")
   let headBlock = raw[0:sep]
   let bodyStart = raw[sep + 4:len(raw)]
   if (hasBareControlChar(headBlock)) {
