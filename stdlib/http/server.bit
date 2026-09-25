@@ -1,5 +1,13 @@
 // Bit standard library — http module: the HTTP/1.1 and HTTPS server.
 
+// `acceptLoop`'s backoff (below `wantsClose`, #5913) needs `sleep` (std/time),
+// new to this module as a PRODUCTION import — keepalive.test.bit used to
+// import it too, as a test-only import, now redundant (and removed) now that
+// a production file in the module binds it module-wide. `Millisecond`
+// (std/time) is already imported by shutdown.bit (same module); a second
+// import of it here would be E0042.
+import { sleep } from "std/time"
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -18,11 +26,26 @@ const defaultMaxRequestsPerConn = 1000
 // malicious peer's read blocks every accept behind it, same as
 // `listenAndServe` already avoids doing since #2170.
 export class Server {
-  listener: Listener
+  // `acceptor` (below `wantsClose`), not the concrete `Listener` (std/net):
+  // `listenAndServeOn`'s accept loop needs nothing else, and a test can then
+  // substitute one whose `accept()` fails on demand (#5913) — the harness has
+  // no way to lower the process's fd limit to reproduce EMFILE for real, and
+  // a new runtime extern to do that is off the table. `std/net`'s `Listener`
+  // satisfies this purely structurally (same pattern as `byteStream`,
+  // transport.bit); nothing there changes. Module-private field, so this is
+  // not a public API change.
+  listener: acceptor
   drain: drainState
   maxBody: int
   idleTimeoutNs: int
   maxRequests: int
+  // Set by `close()`, read by `listenAndServeOn`'s accept loop (#5913) to
+  // tell "this accept failed because `close()` closed the listener" — end the
+  // loop, same as today — from a transient failure such as the fd limit,
+  // which must not. `shutdown()`'s own close path is covered separately, by
+  // `drainStarted(this.drain)` (shutdown.bit): `shutdown()` never calls
+  // `close()` directly.
+  closed: bool
   // The port the server is bound to.
   export port(): int! {
     return this.listener.port()?
@@ -80,6 +103,7 @@ export class Server {
   }
 
   export close() {
+    this.closed = true
     this.listener.close()
   }
 
@@ -206,6 +230,65 @@ fn wantsClose(reqHeaders: string, version: string): bool {
   return indexOf(conn, "keep-alive") < 0
 }
 
+// `Server.listener`'s seam (#5913, above): exactly the `Listener` (std/net)
+// surface `listenAndServeOn`'s accept loop calls. `std/net`'s `Listener`
+// satisfies this purely structurally, the same way `netStream`/`tlsStream`
+// (transport.bit) satisfy `byteStream` — nothing in std/net changes.
+interface acceptor {
+  accept(): Conn!,
+  close(),
+  port(): int!,
+}
+
+// Backoff `listenAndServeOn` and `serveTlsOn` share for a failed accept
+// (#5913): Go's `net/http` `Server.Serve` gives a temporary accept error
+// (EMFILE, ENFILE — the process or system's fd limit — and anything else
+// `netAcceptTcpLoop`, runtime/net/{linux,darwin}/tcp.bit, does not already
+// retry on its own) a doubling sleep instead of ending the server, so hitting
+// the fd limit no longer takes down every connection already being served.
+const initialAcceptBackoffNs = 5 * Millisecond
+const maxAcceptBackoffNs = 1000 * Millisecond
+
+// Drives a serve loop, shared by `listenAndServeOn` and `serveTlsOn` (#5913)
+// so this decision is written once: calls `accept` for the next connection
+// and hands it to `onAccept` (spawn its own green thread), forever. On a
+// failed `accept`, `closed()` decides what happens. True ends the loop,
+// returning that accept's own error exactly as an unhandled one always has —
+// `listenAndServeOn` passes a `closed` that reports the listener itself was
+// closed out from under this loop (`Server.close()`/`drainServer`,
+// shutdown.bit:302/315). False means the failure is transient (most often
+// the fd limit): it is dropped, the current backoff is slept and doubled —
+// capped at `maxAcceptBackoffNs` — for the next consecutive failure, and the
+// loop retries. A successful accept resets the backoff to
+// `initialAcceptBackoffNs`. `serveTlsOn`'s bare `TlsListener` carries no
+// "was this closed" signal of its own (unlike `Server`), so it passes
+// `() => false` — every accept error there backs off and retries, never
+// ending the loop, the same "one bad connection can never take down the
+// server" contract `serveTlsOn`'s own doc comment already documents, now
+// without the fd-limit hot-spin. One backoff duration this covers is a
+// rejected TLS handshake (RFC 7301 §3.2 ALPN mismatch, etc.): `TlsListener.
+// accept()` (std/tls) runs the handshake inline, so this loop cannot tell
+// that apart from a transient accept failure without a std/tls change; it
+// gets the same brief backoff rather than an immediate retry.
+fn acceptLoop<C>(accept: () => C!, closed: () => bool, onAccept: (C) => ()): ()! {
+  let backoffNs = initialAcceptBackoffNs
+  while (true) {
+    let c = accept() catch e {
+      if (closed()) {
+        fail e
+      }
+      sleep(backoffNs)
+      backoffNs = backoffNs * 2
+      if (backoffNs > maxAcceptBackoffNs) {
+        backoffNs = maxAcceptBackoffNs
+      }
+      continue
+    }
+    backoffNs = initialAcceptBackoffNs
+    onAccept(c)
+  }
+}
+
 // Serve HTTP forever on an already-bound `s`, dispatching every request to
 // `handler` on its own green thread. This is the loop `listenAndServe` runs
 // after binding; call it directly to learn the bound port before serving
@@ -217,7 +300,10 @@ fn wantsClose(reqHeaders: string, version: string): bool {
 //   let boundPort = s.port()?   // hand this to a test's client
 //   listenAndServeOn(s, handler)?
 //
-// Returns only on an accept error.
+// Returns only once `s.close()`/`s.shutdown()` has closed the listener
+// (#5913) — any other accept failure (most often the fd limit, EMFILE/
+// ENFILE) is retried with a backoff (`acceptLoop`, above) instead of ending
+// the server.
 //
 // The accept loop only accepts — it does not read. `readMessage` (headers and
 // body both) runs inside the spawned `serveOne`, on that connection's own
@@ -234,10 +320,9 @@ export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
     altPort = 0, maxBody = s.maxBody,
     idleTimeoutNs = s.idleTimeoutNs, maxRequests = s.maxRequests,
   }
-  while (true) {
-    let c = s.listener.accept()?
+  acceptLoop(() => s.listener.accept(), () => s.closed || drainStarted(s.drain), (c) => {
     spawn serveOne(netStream{ conn = c }, handler, opts, s.drain)
-  }
+  })?
 }
 
 // Bind `host:port` and serve HTTP forever, dispatching every request to
@@ -371,7 +456,12 @@ fn answerOne(
 // Every response carries an `Alt-Svc: h3=":<port>"` header (RFC 7838)
 // advertising an HTTP/3 endpoint on `l`'s own bound port over UDP, so a client
 // can discover it and upgrade a later request — pair with `serveH3` on that
-// port. Returns only on an accept or handshake error.
+// port. Never returns on its own (#5913): a bare `TlsListener` carries no
+// "was this closed" signal `acceptLoop` (above `listenAndServeOn`) could act
+// on, so every accept failure — a rejected handshake, the fd limit, anything
+// else — backs off and retries forever, the same as before this loop had a
+// backoff, minus the fd-limit hot-spin. Use `tlsServe`/`serveTlsServerOn`/
+// `TlsServer.shutdown` for a server that can be told to stop.
 export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
   let altPort = l.port()?
   // A private drain tracker, never exposed outside this call: `serveOne`
@@ -391,19 +481,17 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
     altPort = altPort, maxBody = defaultMaxBodyBytes,
     idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
   }
-  while (true) {
-    // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
-    // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
-    // abort) must drop THAT connection, never the listener: propagating it would
-    // let one malformed client take down the whole server. This does not hot-spin
-    // — the next iteration blocks in the TCP accept until a real connection
-    // arrives. A genuinely dead listener socket is the one case this can't tell
-    // apart; that is a fatal, rare condition, tracked separately.
-    let conn = l.accept() catch _ {
-      continue
-    }
+  // A per-connection failure (a bad or rejected TLS handshake — e.g. a
+  // client whose ALPN offer shares nothing with ours, RFC 7301 §3.2 — or a
+  // transient accept failure such as the fd limit, #5913) must drop THAT
+  // attempt, never the listener: propagating it would let one malformed
+  // client, or a passing burst of EMFILE, take down the whole server.
+  // `acceptLoop`'s `closed` is `() => false` here — see this function's own
+  // doc comment for why — so this never returns; it only backs off between
+  // consecutive failures and retries.
+  acceptLoop(() => l.accept(), () => false, (conn) => {
     spawn serveTlsConn(conn, handler, opts, d)
-  }
+  })?
 }
 
 // Bind `host:port` and serve HTTPS forever with the certificate chain
@@ -411,9 +499,9 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
 // request to `handler` on its own green thread — the TLS mirror of
 // `listenAndServe`. ALPN offers `h2` then `http/1.1`, so a client that
 // negotiates HTTP/2 is served over the `std/http2` engine and any other over
-// HTTP/1.1; `handler` is the same either way. Returns only on a bind, accept,
-// or handshake error. For a kernel-chosen port, use `std/tls`'s `listen` and
-// `serveTlsOn` instead — see `serveTlsOn`'s doc comment.
+// HTTP/1.1; `handler` is the same either way. Returns only on a bind error —
+// `serveTlsOn` (#5913, see its own doc comment) never returns on its own.
+// For a kernel-chosen port, use `std/tls`'s `listen` and `serveTlsOn` instead.
 export fn serveTls(
   host: string,
   port: int,
