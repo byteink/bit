@@ -31,6 +31,7 @@
 // only caller (workerBody, below) rather than beside boot.bit's other sched
 // imports.
 import { schedGrowObserveBacklog, schedPollerArm, schedPollerDisarm } from "../../sched"
+import { worker0SpinTurns } from "../../sched"
 
 // The ceiling on worker 0's idle wait (#5722, epic #3913) — see its call
 // site in `workerBody` below for the full enumeration of what this bounds.
@@ -113,6 +114,51 @@ const worker0WaitCeilingNs: int = 1000000000
     }
   }
   return 0
+}
+
+// Worker 0's idle wait (#5722, epic #3913): ONE wait on the next known
+// deadline, or `worker0WaitCeilingNs` when none is armed — no ramp, no per-ms
+// recheck. `pollDrain` blocks in `kevent`, which is what makes this safe to do
+// at all: it watches every registered fd AND #5717's EVFILT_USER wake filter
+// in the SAME syscall this worker must keep making anyway (`sleep.bit`'s
+// "worker 0 is the only thread guaranteed to be looking").
+//
+// EVERY WAY THIS WAIT CAN END, enumerated because a wait this long turns a
+// missed wake into a hang, not a delay:
+//   - THE DEADLINE JUST COMPUTED needs no signal: the wait's own duration ends
+//     exactly then, same as the `parkSleepNs` this replaces.
+//   - NETPOLLER READINESS is delivered by the kernel straight into this
+//     `kevent` call.
+//   - SHUTDOWN is signalled: `./boot.bit`'s teardown triggers `pollWake` on
+//     this descriptor (#5735).
+//   - A NEWER, EARLIER DEADLINE armed after `workerBody`'s `schedFindWorkAt`
+//     read the old one, and WORK PUBLISHED to the global queue or a spawn,
+//     trigger it too since #5744: `armForWork` published this worker's intent
+//     to wait BEFORE that find-work pass, and `sleep.bit`'s `schedWakePoller`
+//     — reached from `schedTimerPush` and `schedWakeIdle` — claims the word
+//     and fires the filter. Left unwired by #5722, they rode the ceiling alone
+//     and cost a 200us sleep 15.4ms at the default worker count (measured on
+//     52703111c).
+//
+// `worker0WaitCeilingNs` stays the backstop for anything not yet wired: worst
+// case one more `schedFindWorkAt` a fixed 1s later.
+//
+// THE PRE-BLOCK POLL BURST (#5884) is the Linux twin's, line for line: on a
+// turn that followed work (`burst`), up to `worker0SpinTurns` probes of
+// `schedWorkPending` and a zero-timeout drain run first, and any hit ends the
+// wait unslept so the caller's next turn re-arms and looks again. See
+// ../linux/bootworker.bit's `worker0Wait` for why.
+//
+// DECLARED ABOVE ITS CALLER, same reason `spinForWork` above is.
+@nosplit fn worker0Wait(s: *i64, w: *i64, burst: bool) {
+  let k = 0
+  while (burst && k < worker0SpinTurns) {
+    k = k + 1
+    if (schedWorkPending(w) || pollDrain(int(s), 0) != 0) {
+      return
+    }
+  }
+  let _ = pollDrain(int(s), schedParkBoundNs(worker0WaitCeilingNs, parkMonoNs()))
 }
 
 // One grow-on-demand attempt (#2593/#3569) — the Linux twin, line for line;
@@ -260,11 +306,11 @@ fn tryGrowPool(sched: *i64) {
 // about what this worker was idle for, doubling from `parkMinBackoffNs` up
 // to a `parkMaxBackoffNs` floor of 1ms — so an idle process woke worker 0 at
 // up to 1000 Hz forever, whether or not anything was ever going to happen.
-// Worker 0's own wait below now passes a fixed `worker0WaitCeilingNs`
-// instead of the ramped `backoff`, through `pollDrain` (#5717's EVFILT_USER
-// wake channel, #5730's nanosecond unit) rather than `parkSleepNs` — see
-// that call site for what wakes it and why the fixed ceiling is still
-// needed. `backoff` itself is untouched and still ramps: `workers 1..N-1`
+// Worker 0's own wait, `worker0Wait` above, now passes a fixed
+// `worker0WaitCeilingNs` instead of the ramped `backoff`, through `pollDrain`
+// (#5717's EVFILT_USER wake channel, #5730's nanosecond unit) rather than
+// `parkSleepNs` — see that function for what wakes it and why the fixed
+// ceiling is still needed. `backoff` itself is untouched and still ramps: `workers 1..N-1`
 // never read it (they use `idleParkMaxNs`, `sleep.bit`), and it still feeds
 // `schedWorkerStepAt`'s race-loss retry below, unrelated to this change.
 // ../linux/bootworker.bit is NOT part of this ticket and still bounds its
@@ -352,36 +398,8 @@ fn workerBody(arg: *byte): *byte {
         if (parks) {
           schedIdlePark(s, w)
         } else {
-          // #5722 (epic #3913): ONE wait on the next known deadline, or the
-          // ceiling below when none is armed — no ramp, no per-ms recheck.
-          // `pollDrain` blocks in `kevent`, which is what makes this safe to
-          // do at all: it watches every registered fd AND #5717's
-          // EVFILT_USER wake filter in the SAME syscall this worker must
-          // keep making anyway (`sleep.bit`'s "worker 0 is the only thread
-          // guaranteed to be looking").
-          //
-          // EVERY WAY THIS WAIT CAN END, enumerated because a wait this long
-          // turns a missed wake into a hang, not a delay:
-          //   - THE DEADLINE JUST COMPUTED needs no signal: the wait's own
-          //     duration ends exactly then, same as the `parkSleepNs` this
-          //     replaces.
-          //   - NETPOLLER READINESS is delivered by the kernel straight into
-          //     this `kevent` call, unchanged from today.
-          //   - SHUTDOWN is signalled: `./boot.bit`'s teardown triggers
-          //     `pollWake` on this descriptor (#5735).
-          //   - A NEWER, EARLIER DEADLINE armed after `schedFindWorkAt` above
-          //     read the old one, and WORK PUBLISHED to the global queue or a
-          //     spawn, trigger it too since #5744: `armForWork` published this
-          //     worker's intent to wait BEFORE that find-work pass, and
-          //     `sleep.bit`'s `schedWakePoller` — reached from
-          //     `schedTimerPush` and `schedWakeIdle` — claims the word and
-          //     fires the filter. Left unwired by #5722, they rode the ceiling
-          //     alone and cost a 200us sleep 15.4ms at the default worker
-          //     count (measured on 52703111c).
-          //
-          // `worker0WaitCeilingNs` stays the backstop for anything not yet
-          // wired: worst case one more `schedFindWorkAt` a fixed 1s later.
-          let _ = pollDrain(int(s), schedParkBoundNs(worker0WaitCeilingNs, parkMonoNs()))
+          worker0Wait(s, w, spin)
+          spin = false
           // Awake, whichever way the wait ended — the arm is cleared on every
           // exit path, exactly as `schedIdlePark` clears `wkPark` on its own.
           schedPollerDisarm(s)
