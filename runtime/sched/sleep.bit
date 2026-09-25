@@ -249,6 +249,24 @@ export const idleParkMaxNs: int = 100000000
 // is dominated by memory probes, which both compilers lower alike.
 export const idleSpinTurns: int = 32
 
+// Worker 0's pre-block poll burst (#5884): how many non-blocking drains
+// `runtime/root/<os>`'s `worker0Wait` makes before it blocks, on a turn that
+// followed work. The #3260 spin above never ran for worker 0 (`parks` gates
+// it off), and once #5880 stopped the drain waking its own worker, W1 c=1 on
+// Linux slept and woke once per keep-alive request: 0.98-1.04 voluntary
+// context switches per request against main's 0.38-0.70, and 6.7% fewer
+// requests a second. One pass is a work-pending probe plus one zero-timeout
+// `epoll_pwait2`/`kevent`, well under a microsecond. The count was chosen by
+// measurement on hl-master and the M5; the figures are on #5884.
+export const worker0SpinTurns: int = 32
+
+// The burst above runs only while worker 0 went idle less than this long ago
+// (#5884). A burst that cannot catch the next event is a syscall per pass
+// for nothing: at 1000 requests a second, c=1, a fixed 32-pass burst made
+// every request pay 32 more `epoll_pwait2` calls. The gap is read off clock
+// values the loop already takes, so the gate itself costs no syscall.
+export const worker0SpinWindowNs: int = 100000
+
 // Upper bound on the wake scan, so the loop's termination is provable from its
 // own body (Power of 10) rather than from trusting `scNWorkers`. Must not be
 // BELOW the consumers' own ceiling — `runtime/root/<os>`'s `bootMaxWorkers`,
@@ -432,17 +450,22 @@ export @nosplit @symbol("bit_rt_port_sched_poller_wait_ns") fn schedPollerWaitNs
 // poller bound: there the wake has nowhere to go, and worker 0 is not waiting
 // in `pollDrain` anyway (its `pollFd == 0` guard returns at once).
 @nosplit fn schedWakePoller(s: *i64) {
-  let fd = *(s + scPollFd)
-  if (fd <= 0) {
+  if (!schedClaimPoller(s)) {
     return
+  }
+  let _ = bit_rt_port_sched_poll_wake(*(s + scPollFd))
+}
+
+// The claim half of `schedWakePoller`, without the kernel trigger. True when
+// this call made the claim.
+@nosplit fn schedClaimPoller(s: *i64): bool {
+  if (*(s + scPollFd) <= 0) {
+    return false
   }
   if (atomicLoad(s + scPollWait) != 1) {
-    return
+    return false
   }
-  if (!atomicCmpxchg(s + scPollWait, 1, pollWaitClaimed)) {
-    return
-  }
-  let _ = bit_rt_port_sched_poll_wake(fd)
+  return atomicCmpxchg(s + scPollWait, 1, pollWaitClaimed)
 }
 
 // Work is now reachable by another worker: wake exactly one parked worker.
@@ -487,6 +510,26 @@ export @nosplit @symbol("bit_rt_port_sched_wake_idle") fn schedWakeIdle(s: *i64)
   // until #5744 nothing could reach it there — `schedWakeParkedPeer`'s scan
   // skips worker 0 by construction, since worker 0 never arms `wkPark`.
   schedWakePoller(s)
+}
+
+// `schedWakeIdle` for a caller that HOLDS THE POLL LOCK: the drain, handing
+// out what its wait returned (#5880). It claims worker 0 but never fires the
+// kernel trigger, because the trigger exists only to end a wait already
+// inside `epoll_pwait2`/`kevent`, and only the lock holder can be in that
+// wait. This caller holds the lock and has left the wait. So the claim alone
+// reaches worker 0: either worker 0 is this caller, and it looks for work
+// again because the drain returns a count above 0, or `schedPollerWaitNs`
+// reads the claim under the lock before worker 0's next wait (#5843).
+//
+// Firing the trigger here was worker 0 waking ITSELF on every request it
+// drained: at `BIT_WORKERS=1` that was one eventfd write in this drain and
+// one eventfd read in the next, 1 of the 2 writes and 1 of the 3 reads per
+// keep-alive request on Linux (strace, #5880).
+@nosplit fn schedWakeIdleHeld(s: *i64) {
+  if (schedWakeParkedPeer(s)) {
+    return
+  }
+  let _ = schedClaimPoller(s)
 }
 
 // Shutdown's wake, and the one caller that genuinely wants the whole pool: every
