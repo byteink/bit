@@ -1,9 +1,10 @@
-// stdlib/http/server.test.bit — `Request.peer` (#4527, step 3 of #4524) and
-// `serializeResponse` (#5860).
+// stdlib/http/server.test.bit — `Request.peer` (#4527, step 3 of #4524),
+// `serializeResponse` (#5860), and the accept-failure backoff (#5913).
 //
-// `serve`, `listenAndServeOn`, `get`, `ok`, `respond`, `serializeResponse`,
-// `Request`, `Response` and `Server` are all siblings in this same module
-// (SPEC §19), so nothing is imported.
+// `serve`, `listenAndServeOn`, `get`, `getTimeout`, `ok`, `respond`,
+// `serializeResponse`, `Request`, `Response`, `Server`, `Listener`, `listen`
+// and `newDrainState` are all siblings in this same module (SPEC §19), so
+// nothing is imported.
 //
 // The address is asserted as an exact string rather than a shape: everything
 // here runs over loopback, so the only correct answer is "127.0.0.1". The
@@ -126,4 +127,112 @@ test "serializeResponse: 100000 calls on the plaintext response complete" {
     indexOf(last, "\r\n\r\nHello, World!") >= 0,
     "the last call's output was not the expected plaintext response:\n${last}",
   )
+}
+
+// #5913 — a failed accept (EMFILE/ENFILE, the process or system's fd limit)
+// must not end `listenAndServeOn`. The harness has no way to lower
+// RLIMIT_NOFILE to reproduce that for real (no rlimit support anywhere in
+// this repo, and a new runtime extern for it is off the table), so this is a
+// test double at the `acceptor` seam (server.bit) `Server.listener` now
+// accepts: its first `failures` calls to `accept()` fail without touching
+// the network; every call after that, and `close()`/`port()`, delegate to a
+// real `Listener` bound over loopback, so the connection this test dials is
+// genuinely accepted and answered.
+class fakeFailingListener {
+  real: Listener
+  failures: int
+  fails: int
+  export accept(): Conn! {
+    if (this.fails < this.failures) {
+      this.fails = this.fails + 1
+      fail newError("fake accept failure (simulated EMFILE)")
+    }
+    return this.real.accept()?
+  }
+  export close() {
+    this.real.close()
+  }
+  export port(): int! {
+    return this.real.port()?
+  }
+}
+
+fn backoffServe(s: Server, endedWithError: chan<bool>) {
+  listenAndServeOn(s, peerEcho) catch _ {
+    endedWithError <- true
+    return
+  }
+  endedWithError <- false
+}
+
+test "listenAndServeOn retries a failed accept instead of ending, and still returns an error after s.close()" {
+  let real = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let fake = fakeFailingListener{ real = real, failures = 3, fails = 0 }
+  let s = Server{
+    listener = fake, drain = newDrainState(), maxBody = defaultMaxBodyBytes,
+    idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
+    closed = false,
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let endedWithError = chan<bool>(1)
+  spawn backoffServe(s, endedWithError)
+
+  // The first `fake.failures` accepts fail (simulating EMFILE); the old
+  // `let c = s.listener.accept()?` loop returns on the very first one and
+  // never answers this dial, failing this assertion.
+  let res = getTimeout("http://127.0.0.1:${port}/", 2000) catch e {
+    s.close()
+    assert(false, "get after ${itoa(fake.failures)} simulated accept failures: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${itoa(res.status)}")
+  assert(res.body == "127.0.0.1", "the handler saw req.peer = '${res.body}'")
+  assert(
+    fake.fails == fake.failures,
+    "simulated accept failures seen = ${itoa(fake.fails)}, want ${itoa(fake.failures)}",
+  )
+
+  s.close()
+  let sawError = <- endedWithError
+  assert(sawError, "listenAndServeOn returned without an error after s.close()")
+}
+
+// The shared helper both `listenAndServeOn` and `serveTlsOn` (server.bit)
+// delegate their retry/backoff decision to — exercised directly, generic over
+// a plain `int` in place of `Conn`/`TlsConn`, since the decision itself does
+// not depend on which. This is `serveTlsOn`'s own test double: nothing about
+// `TlsListener` (std/tls) needs to be faked, because `acceptLoop` is the
+// exact code `serveTlsOn` runs on every accept.
+test "acceptLoop retries transient accept failures, keeps serving, and returns once closed" {
+  let fails = 0
+  let onAcceptCalls = 0
+  let closedNow = false
+  let accept: () => int! = () => {
+    if (closedNow) {
+      fail newError("listener closed")
+    }
+    if (fails < 3) {
+      fails = fails + 1
+      fail newError("fake transient accept failure")
+    }
+    return 0
+  }
+  let onAccept: (int) => () = (c) => {
+    onAcceptCalls = onAcceptCalls + 1
+    // Stop the loop after the first successful accept, the same way `s.close()`
+    // stops `listenAndServeOn` above — otherwise this loop runs forever.
+    closedNow = true
+  }
+  acceptLoop(accept, () => closedNow, maxAcceptBackoffNs, onAccept) catch _ {
+    assert(fails == 3, "transient failures retried = ${itoa(fails)}, want 3")
+    assert(onAcceptCalls == 1, "onAccept calls = ${itoa(onAcceptCalls)}, want 1")
+    return
+  }
+  assert(false, "acceptLoop returned without an error")
 }
