@@ -478,16 +478,17 @@ export @symbol("bit_rt_port_sched_polldesc_close") @nosplit fn pdClose(
 // per-platform wrappers that also run the actual `close(2)` on the last
 // release; everything below is the OS-neutral CAS protocol they share.
 
-// Every transition below is ONE atomic add or or, never a CAS retry loop: a
-// bounded CAS loop that runs out of retries under contention would turn a
-// busy fd into a spurious refusal (acquire), a leaked fd (release), or a close
-// that never runs (mark-closing). An add cannot lose a race, so none of the
-// three can fail for any reason but the fd's own state.
+// Every transition below is built from unconditional atomic adds and ors,
+// never a CAS retry loop: a bounded CAS loop that runs out of retries under
+// contention would turn a busy fd into a spurious refusal (acquire), a
+// leaked fd (release), or a close that never runs (mark-closing). An add
+// cannot lose a race, so none of the three can fail for any reason but the
+// fd's own state.
 
 // `pdFdMarkClosing`'s three outcomes.
-export const pdFdCloseNow: int = 0      // ref count was already 0: close(2) now.
-export const pdFdCloseDeferred: int = 1 // ops still in flight: the last release closes.
-export const pdFdCloseAlready: int = 2  // another caller is already closing this fd.
+export const pdFdCloseNow: int = 0      // a second, concurrent close(fd) found it was the last ref out: close(2) now, no unregister needed (the first caller already did it).
+export const pdFdCloseDeferred: int = 1 // you are the first closer: run unregister/pdClose, then release your own ref and close(2) only if that release says you were last.
+export const pdFdCloseAlready: int = 2  // another caller is already closing this fd and neither of you was last; nothing more to do.
 
 // `pdFdAcquire`'s three outcomes.
 export const pdFdAcquired: int = 0    // one ref taken; release it on every exit.
@@ -542,22 +543,39 @@ export @symbol("bit_rt_port_sched_polldesc_fd_release") @nosplit fn pdFdRelease(
 // The netClose half of the protocol: set `closing` on `fd` (idempotent --
 // a second close on an already-closing fd is `pdFdCloseAlready`, a no-op).
 // The caller still runs `pollDescUnregister`/`pdClose` to wake any parked
-// waiter exactly as before; this only decides whether `close(2)` runs now
-// (no op held a ref) or is deferred to the last `pdFdRelease`. The count the
-// `or` observes and the count every later release observes are the same
-// word, so exactly one party sees the final zero.
+// waiter exactly as before; the return value decides whether `close(2)` runs
+// now, is left for the caller's own later release, or is someone else's job.
+//
+// The closer takes its OWN ref (`atomicAdd`) BEFORE the `atomicOr` that makes
+// `closing` visible to anyone else, and only releases it (via `pdFdRelease`,
+// after the caller has run `pollDescUnregister`/`pdClose`) at the very end of
+// `netClose`. Ordering the add before the or matters: if `closing` became
+// visible first, a straggling `pdFdAcquire` could add its own transient ref,
+// see `closing`, and undo -- and because the closer had not yet added its
+// ref, that straggler's undo could be the decrement that finds the count at
+// zero, so the straggler (not the closer) would call `close(2)` immediately,
+// racing the closer's own still-in-flight `pollDescUnregister`/`pdClose` and
+// double-closing the fd. Holding the closer's own ref for the whole decision
+// window makes it impossible for the count to reach zero before the closer's
+// own release, so "last out" always has exactly one caller: either the
+// closer itself (the common case, `pdFdCloseDeferred` -> `pdFdRelease`), or,
+// for a truly concurrent second `netClose(fd)` (defensive only --
+// `Conn.close`/`Listener.close` already guard the real double-close one layer
+// up), that second caller's own add+release pair, reported as `pdFdCloseNow`
+// so it runs `close(2)` without repeating `pollDescUnregister`/`pdClose`.
 export @symbol("bit_rt_port_sched_polldesc_fd_mark_closing") @nosplit fn pdFdMarkClosing(
   fd: int,
 ): int {
   if (!pdValidFd(fd)) {
     return pdFdCloseAlready
   }
+  let _ = atomicAdd(pdRefAddr(fd), 1)
   let old = atomicOr(pdRefAddr(fd), pdRefClosingBit)
   if (pdRefClosingOf(old)) {
+    if (pdFdRelease(fd)) {
+      return pdFdCloseNow
+    }
     return pdFdCloseAlready
-  }
-  if (pdRefCountOf(old) == 0) {
-    return pdFdCloseNow
   }
   return pdFdCloseDeferred
 }
