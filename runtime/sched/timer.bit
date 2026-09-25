@@ -329,24 +329,15 @@ export @nosplit @symbol("bit_rt_port_sched_timer_still_pending") fn schedTimerSt
 // runaway backstop the registry walk uses, for the same reason: a corrupted link
 // must terminate the loop rather than hang the worker.
 //
-// THE RE-PUSH IS GUARDED BY `schedTimerStillPending`, NOT UNCONDITIONAL
-// (#5433). Before a caller could race a readiness registration against this
-// same timer entry, `taskRunning` (plain `schedSleepUntil`, unarmed),
-// `taskParking` (armed via `schedParkArm`) and `taskParked` itself (the CAS
-// above can fail against a genuinely parked task too — see
-// `schedTimerStillPending`'s own comment for the exact interleaving) were the
-// ONLY states this task could ever be in here — nothing else was able to
-// touch it between `timerPartition` pulling it into `due` and this loop
-// reaching it, so "CAS failed" and "still owed a wake from this list" were
-// the same fact. That stopped being true the moment a poll registration can
-// ALSO resolve this task (`schedPollUnpark`, `../net/*/sock.bit`'s
-// readiness-vs-timer race): if poll already won, the state here is
-// `taskRunnable`, `taskWakePending` or `taskDone` — none of which this task
-// ever returns to `taskParked` from — and blindly re-pushing would hand this
-// list a `task` address the winner's worker may already be running to
-// completion and freeing — exactly the use-after-free `schedTimerCancel`
-// above exists to prevent on the other side of the same race.
-// `schedTimerStillPending` is what tells the two cases apart.
+// THE RE-PUSH IS GUARDED BY `schedTimerStillPending` (#5433). A failed CAS
+// used to mean "still owed a wake": `taskRunning` (plain `schedSleepUntil`),
+// `taskParking` (`schedParkArm`) and `taskParked` (see
+// `schedTimerStillPending`) were the only states possible here. A poll
+// registration can now resolve the same task (`schedPollUnpark`,
+// `../net/*/sock.bit`'s readiness-vs-timer race), leaving it `taskRunnable`,
+// `taskWakePending` or `taskDone`; none returns to `taskParked`, and a re-push
+// would hand this list a task the winner may already have freed — the
+// use-after-free `schedTimerCancel` above prevents on the other side.
 export @nosplit @symbol("bit_rt_port_sched_timer_expire") fn schedTimerExpire(
   s: *i64,
   now: int,
@@ -377,10 +368,8 @@ export @nosplit @symbol("bit_rt_port_sched_timer_expire") fn schedTimerExpire(
   return woken
 }
 
-// How many tasks are asleep. A bounded walk, for tests and for a consumer that
-// wants to know whether an idle scheduler still has a wake pending — the
-// distinction between "nothing to do" and "nothing to do YET", which is what
-// makes a shutdown that drains timers expressible.
+// How many tasks are asleep: a bounded walk under the lock, for tests. Whether
+// an idle scheduler still has a wake pending is `schedTimerAny` below.
 export @nosplit @symbol("bit_rt_port_sched_timer_count") fn schedTimerCount(s: *i64): int {
   spinAcquire(lockOf(s, scTimerLock))
   let n = 0
@@ -391,6 +380,16 @@ export @nosplit @symbol("bit_rt_port_sched_timer_count") fn schedTimerCount(s: *
   }
   spinRelease(lockOf(s, scTimerLock))
   return n
+}
+
+// Whether any task is asleep, lock-free (#5907): `schedDeadlockBusy`'s question
+// on every idle turn. Each critical section above stores `scTimerHead` at most
+// once, its final value (`timerPartition` at its end, so a read during its walk
+// sees the old head: busy, the safe side), and an aligned word cannot tear. So
+// this is `schedTimerCount(s) != 0` for a lock taken at this load, and just as
+// stale once returned; seq-cst, so the caller's later loads stay after it.
+export @nosplit fn schedTimerAny(s: *i64): bool {
+  return atomicLoad(s + scTimerHead) != 0
 }
 
 // Park the calling task until `deadlineNs` on the same monotonic clock the
@@ -489,7 +488,7 @@ let chanTimerLockWord: [1]i64
 // How many slots are currently pending (state == 1). A dedicated counter
 // rather than a scan: `schedCheckDeadlock` (worker.bit) reads this on every
 // idle turn a single-worker program takes, the same frequency
-// `schedTimerCount`/`schedPollPendingCount` are already read at, so this
+// `schedTimerAny`/`schedPollPendingCount` are already read at, so this
 // answers in O(1) rather than re-deriving it from `chanTimerHigh` each time.
 let chanTimerPendingCount: [1]i64
 
@@ -507,9 +506,9 @@ let chanTimerArmSeq: [1]i64
 }
 
 // A program parked ONLY on a channel timer (no task on the sleeping-task
-// list `schedTimerCount` sees, since a channel timer has no task) must not
+// list `schedTimerAny` sees, since a channel timer has no task) must not
 // read as deadlocked. `schedCheckDeadlock` checks this exactly where it
-// checks `schedTimerCount`/`schedPollPendingCount` — see its own header.
+// checks `schedTimerAny`/`schedPollPendingCount` — see its own header.
 export @nosplit @symbol("bit_rt_port_sched_timer_chan_count") fn schedTimerChanCount(): int {
   return atomicLoad(chanTimerPendingAddr())
 }
