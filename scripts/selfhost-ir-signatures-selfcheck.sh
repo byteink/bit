@@ -704,6 +704,24 @@ bb25():
     fi
   done
 
+  # Composed with #5905 post-opt: the same site plus one dropped miss zero
+  # object is explained while a `map_val_at` backs each drop, not past that.
+  zo='  %140 = gc_alloc size=8 ptrs=[] (i64)'
+  va='  %132 = rt_call map_val_at(%105, %114) i64'
+  for ms in "0|$zo" "1|$zo
+$zo"; do
+    IFS='|' read -r -d '' msk msz <<<"$ms"
+    sigms=$(explainMismatch "$oracle_ms_opt
+${msz%$'\n'}
+$va" "$bit2_ms_opt
+$va" iropt)
+    rcms=$?
+    if [ "$rcms" != "$msk" ]; then
+      echo "FAIL: #5906 composed with #5905 scored rc=$rcms, want $msk (sig='$sigms')"
+      fail=1
+    fi
+  done
+
   # REJECTION: an unrelated single-opcode delta riding along a genuine
   # pre-opt site, and the same rename with the key a handle the oracle did
   # NOT box (the site count comes from the oracle, so it is zero).
