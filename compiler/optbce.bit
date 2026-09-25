@@ -54,9 +54,10 @@
 // path from entry to `p` — contradicting SSA dominance. So the value on the
 // edge is always the current iteration's `%i + 1`, never a stale one.
 //
-// MARKING. In any block `b != h` with `!viaF[b]`, an `icmp_ult(%i, %L)` on the
-// SAME two value ids is true whenever it executes: it reads `%i`, so `h`
-// dominates `b`, and `!viaF[b]` puts `T` on every path in. `known[b] = true`
+// MARKING. In any block `b != h` with `!viaF[b]`, an `icmp_ult(%i, %L)` whose
+// two operands resolve to the SAME two value ids is true whenever it executes:
+// it reads `%i`, so `h` dominates `b`, and `!viaF[b]` puts `T` on every path
+// in. `known[b] = true`
 // then makes `emitTranslated` turn the guarding `br` into a `jump` and
 // `computeReachable` drop the panic block — no lowering change at all.
 //
@@ -68,7 +69,26 @@
 // `bit_rt_slice_append` mutates a header in place. The first fold round leaves
 // the header's `slice_len` and the load's as distinct ids and this pass simply
 // does not fire; `cseAvailableValues` and optloop.bit's hoist unify them, so it
-// fires on the second round, which is the one before codegen.
+// fires on the second round, which is the one before codegen. `bceResolve`
+// only ever replaces a block PARAM by the one value it can hold; it never
+// equates two instructions, so a memory read is still matched by id alone.
+//
+// THE SELF EDGE. `lowerWhile` passes every live local as a header param and the
+// back edge passes an unchanged one back to itself, so `let n = len(w)` reaches
+// the test and the check as two params, each fed `%X` on entry and itself on
+// every back edge. `bceParamSource` skips such an edge: a param whose edges
+// pass only `%X` or itself holds `%X`. `%X` dominates the param's block, since
+// the first entry cannot take a self edge (the param is not yet defined), so it
+// takes an `%X` edge, and that needs `%X` to dominate its source. Nor can `%X`
+// be re-executed between an entry and a later use of the param: `%X`'s block
+// strictly dominates the param's, so a path from it to the use that avoided
+// the param's block would give a path from the entry avoiding it too, and the
+// next entry after a re-execution arrives on an `%X` edge, which reloads the
+// param. The same argument with `h` for the param's block shows the resolved
+// root of `%L` is not re-executed between `h`'s test and the check, so both
+// compares read the same two values. Block 0 is refused: its params arrive
+// from the caller along no edge, so its edges do not hold every source. The
+// self test itself uses the strict all-edges-agree rule and never recurses.
 //
 // WHICH REFUSALS ARE ACTUALLY EXERCISED, counted with a temporary probe over
 // `compiler` (243 files), `stdlib/regex`, the 13 bench cases and the fixture,
@@ -145,27 +165,87 @@ fn bceIsNonNegConst(known: []ConstVal, v: int): bool {
   return kv.known && !kv.isFloat && !kv.isBool && kv.ival >= 0
 }
 
-// The single value every predecessor edge passes to block param `v`, or -1 when
-// `v` is not a param, has no predecessors, or its sources disagree. Same rule
-// as `licmParamSource`, and same reason: it is an EQUALITY, so stopping early
-// is a true answer rather than a wrong one.
-fn bceParamSource(lp: BceLoop, v: int): int {
+// `v`'s index among its block's params, or -1 when it is not a param or its
+// block is block 0, whose params arrive from the caller along no edge at all.
+fn bceParamSlot(lp: BceLoop, v: int): int {
   let b = lp.owner[v]
-  let k = bceParamIndex(lp.f, b, v)
-  if (k < 0 || lp.pm.start[b] == lp.pm.start[b + 1]) {
+  if (b == 0) {
     return -1
   }
+  return bceParamIndex(lp.f, b, v)
+}
+
+// The value edge `e` of block `b` passes to param slot `k`, or -1 when the
+// edge's argument list does not match the block's params.
+fn bceEdgeArg(lp: BceLoop, b: int, e: int, k: int): int {
+  let args = licmEdgeArgs(lp.f, lp.pm.list[e], b)
+  if (len(args) != lp.f.blocks[b].paramCount) {
+    return -1
+  }
+  return args[k]
+}
+
+// The single value EVERY predecessor edge passes to block param `v`, or -1
+// when `v` is not a param, has no predecessors, or its sources disagree. It is
+// an EQUALITY, so stopping early is a true answer rather than a wrong one.
+fn bceSameSource(lp: BceLoop, v: int): int {
+  let k = bceParamSlot(lp, v)
+  if (k < 0) {
+    return -1
+  }
+  let b = lp.owner[v]
   let found = -1
   let e = lp.pm.start[b]
   while (e < lp.pm.start[b + 1]) {
-    let args = licmEdgeArgs(lp.f, lp.pm.list[e], b)
-    if (len(args) != lp.f.blocks[b].paramCount) {
+    let a = bceEdgeArg(lp, b, e, k)
+    if (a < 0 || (found >= 0 && a != found)) {
       return -1
     }
-    if (found >= 0 && args[k] != found) {
+    found = a
+    e = e + 1
+  }
+  return found
+}
+
+// True iff `a` is param `v` itself, or reaches it through params whose every
+// edge agrees: the join and increment blocks `lowerWhile` threads each local
+// through on the way back to the header. Uses the strict rule, never the
+// self-skipping one, so it cannot recurse into `bceParamSource`.
+fn bceIsSelf(lp: BceLoop, a: int, v: int): bool {
+  let x = a
+  let steps = 0
+  while (steps < 8 && x >= 0) {
+    if (x == v) {
+      return true
+    }
+    x = bceSameSource(lp, x)
+    steps = steps + 1
+  }
+  return false
+}
+
+// The single value block param `v` can hold, or -1. The trivial-phi rule: an
+// edge that passes `v` back to itself is skipped, and the param equals the one
+// value every OTHER edge passes. -1 when no edge passes anything but `v`.
+fn bceParamSource(lp: BceLoop, v: int): int {
+  let k = bceParamSlot(lp, v)
+  if (k < 0) {
+    return -1
+  }
+  let b = lp.owner[v]
+  let found = -1
+  let e = lp.pm.start[b]
+  while (e < lp.pm.start[b + 1]) {
+    let a = bceEdgeArg(lp, b, e, k)
+    if (a < 0) {
       return -1
     }
-    found = args[k]
+    if (!bceIsSelf(lp, a, v)) {
+      if (found >= 0 && a != found) {
+        return -1
+      }
+      found = a
+    }
     e = e + 1
   }
   return found
@@ -270,23 +350,28 @@ fn bceIndexNonNegative(lp: BceLoop): bool {
 // decided. `viaF` is the refusal: a block the FALSE arm can reach was not
 // tested by that branch at all.
 fn bceMarkProven(lp: BceLoop, lim: int) {
+  let iv = bceResolve(lp, lp.iv)
+  let rl = bceResolve(lp, lim)
   let b = 0
   while (b < len(lp.f.blocks)) {
     if (b != lp.h && !lp.viaF[b]) {
-      bceMarkBlock(lp, b, lim)
+      bceMarkBlock(lp, b, iv, rl)
     }
     b = b + 1
   }
 }
 
-fn bceMarkBlock(lp: BceLoop, b: int, lim: int) {
+// `iv` and `lim` arrive resolved; each compare's operands are resolved here.
+fn bceMarkBlock(lp: BceLoop, b: int, iv: int, lim: int) {
   let blk = lp.f.blocks[b]
   let idx = blk.instsStart + blk.paramCount
   let end = blk.instsStart + blk.instsLen
   while (idx < end) {
     let ins = lp.f.instrs[idx]
-    if (ins.op == Op.ICmpUlt && ins.lhs == lp.iv && ins.rhs == lim && !lp.known[idx].known) {
-      lp.known[idx] = boolConst(true)
+    if (ins.op == Op.ICmpUlt && !lp.known[idx].known && bceResolve(lp, ins.lhs) == iv) {
+      if (bceResolve(lp, ins.rhs) == lim) {
+        lp.known[idx] = boolConst(true)
+      }
     }
     idx = idx + 1
   }

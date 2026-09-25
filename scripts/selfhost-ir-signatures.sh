@@ -350,6 +350,33 @@ explainMismatch() {
         if (d != 0) { delta[op] = d; moved[op] = 1 }
       }
 
+      # --- #5895, POST-OPT ONLY: a bounds check the loop test already proved ---
+      #
+      # `bceParamSource` (compiler/optbce.bit) now resolves a loop param the
+      # back edge passes back to itself, so `proveInductionBounds` drops the
+      # bounds check on a hoisted `let n = len(w)` loop and on an outer index
+      # carried through an inner loop. Each dropped check is one `icmp_ult`,
+      # its `br` (now a `jump`, which scores as nothing), and the panic block:
+      # `const_string`, `rt_call panic`, `unreachable`. Reddened 13 files
+      # against the pinned stage0 (this tree vs 4c99e3d24, `iropt` only;
+      # pre-opt is untouched): all five opcodes fall by the same N >= 1 and
+      # nothing else moves, except stdlib/smtp/header.bit, which also carries
+      # the #5871 post-opt delta. So the five are subtracted first and the
+      # residual, if any, goes on to the signatures below.
+      if (kind == "iropt") {
+        nBce = -delta["icmp_ult"]
+        okBce = (nBce > 0)
+        split("br const_string unreachable rt_call:panic", bceOps, " ")
+        for (bi in bceOps) { if (delta[bceOps[bi]] != -nBce) okBce = 0 }
+        if (okBce) {
+          bceOps[0] = "icmp_ult"
+          for (bi in bceOps) { delete delta[bceOps[bi]]; delete moved[bceOps[bi]] }
+          bceRest = 0
+          for (op in moved) bceRest = 1
+          if (!bceRest) { print "5895-bce-trivial-param"; exit 0 }
+        }
+      }
+
       # #3107 (inline slice element READ), #3108 (its STORE half), #3898
       # (pointer-scale/shift fold) and #3862 (inline slice elements, packed
       # class) were declared here and RETIRED by #5509 -- see the header
@@ -650,7 +677,9 @@ explainMismatch() {
 # `5874-fallible-tuple-words` in the current corpus (that file's `checked`
 # also goes through #5874's own words convention), so it is not gated on
 # `checked` disappearing, only on `eight`'s divergence from the pinned
-# stage0 closing (a repin past #5870, same as any other entry here). `ast`
+# stage0 closing (a repin past #5870, same as any other entry here).
+# `5895-bce-trivial-param` is gated `kind == "iropt"` (bounds-check
+# elimination is an optimizer pass) and is listed only there. `ast`
 # and `fmt` are
 # a different, disjoint kind space entirely -- #5474's two signatures never
 # fire under `ir`/`iropt` and vice versa, so they are returned only for their
@@ -661,10 +690,11 @@ declaredSignatureNames() {
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
     ir) printf '%s\n' "5871-tuple-word-explode" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
-    iropt) printf '%s\n' "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
+    iropt) printf '%s\n' "5895-bce-trivial-param" "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" "5870-multiword-return-rebox"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
+    "5895-bce-trivial-param" \
     "5871-tuple-word-explode" "5871-tuple-word-explode-branch-fold" \
     "5876-field-store-declared-type-convert" "5874-fallible-tuple-words" \
     "5870-multiword-return-rebox"
