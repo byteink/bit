@@ -634,6 +634,96 @@ bb1():
   # shellcheck source=scripts/ir-signatures-selfcheck-multiword.sh
   . "${ROOT}/scripts/ir-signatures-selfcheck-multiword.sh"
 
+  # --- #5906: a map read keyed by a fresh `string` box passes its words ---
+  #
+  # Real dump text (this tree at 65e6265d4 vs the pinned stage0):
+  # `get` in _tests_/cases/run_map_str_key_words.bit pre-opt, and the
+  # #4628-diamond `map_slot` in run_map_string_key_align.bit's `growLost`
+  # post-opt.
+  oracle_ms_pre='func get(%0: map<string, i64>, %1: i64, %2: i64, %3: string) i64 {
+bb0(%0: map<string, i64>, %1: i64, %2: i64, %3: string):
+  %4 = gc_alloc size=24 ptrs=[%16] string
+  field_set %4[0] = %1
+  field_set %4[8] = %2
+  field_set %4[16] = %3
+  %8 = rt_call map_get(%0, %4) i64
+  ret %8
+}'
+  bit2_ms_pre='func get(%0: map<string, i64>, %1: i64, %2: i64, %3: string) i64 {
+bb0(%0: map<string, i64>, %1: i64, %2: i64, %3: string):
+  %4 = gc_alloc size=24 ptrs=[%16] string
+  field_set %4[0] = %1
+  field_set %4[8] = %2
+  field_set %4[16] = %3
+  %8 = field_get %4[0] i64
+  %9 = field_get %4[8] i64
+  %10 = field_get %4[16] string
+  %11 = rt_call map_get_str(%0, %8, %9) i64
+  ret %11
+}'
+  oracle_ms_opt='func growLost() i64 {
+bb25():
+  %111 = call @growKey(%106) i64
+  %112 = call_word %111[1] i64
+  %113 = call_word %111[2] string
+  %114 = const_nil
+  %115 = icmp_ne bool %113, %114
+  br %115, bb26(), bb28()
+bb26():
+  %117 = field_get %113[0] i64
+  %118 = icmp_eq bool %117, %111
+  br %118, bb27(), bb28()
+bb27():
+  %120 = field_get %113[8] i64
+  %121 = icmp_eq bool %120, %112
+  br %121, bb29(%113), bb28()
+bb28():
+  %123 = gc_alloc size=24 ptrs=[%16] string
+  field_set %123[0] = %111
+  field_set %123[8] = %112
+  field_set %123[16] = %113
+  jump bb29(%123)
+bb29(%128: string):
+  %129 = rt_call map_slot(%105, %128) i64
+}'
+  bit2_ms_opt='func growLost() i64 {
+bb25():
+  %111 = call @growKey(%106) i64
+  %112 = call_word %111[1] i64
+  %113 = call_word %111[2] string
+  %114 = rt_call map_slot_str(%105, %111, %112) i64
+}'
+  for ms in "ir|$oracle_ms_pre|$bit2_ms_pre" "iropt|$oracle_ms_opt|$bit2_ms_opt"; do
+    IFS='|' read -r -d '' msk mso msb <<<"$ms"
+    msb=${msb%$'\n'}
+    sigms=$(explainMismatch "$mso" "$msb" "$msk")
+    rcms=$?
+    if [ "$rcms" -ne 0 ] || [ "$sigms" != "5906-map-str-key-words" ]; then
+      echo "FAIL: the real #5906 $msk delta was not explained (rc=$rcms sig='$sigms')"
+      fail=1
+    fi
+  done
+
+  # REJECTION: an unrelated single-opcode delta riding along a genuine
+  # pre-opt site, and the same rename with the key a handle the oracle did
+  # NOT box (the site count comes from the oracle, so it is zero).
+  oracle_ms_handle='  %8 = rt_call map_get(%0, %3) i64'
+  bit2_ms_handle='  %8 = field_get %3[0] i64
+  %9 = field_get %3[8] i64
+  %10 = field_get %3[16] string
+  %11 = rt_call map_get_str(%0, %8, %9) i64'
+  for ms in "$oracle_ms_pre|$bit2_ms_pre
+%999 = xor i64 %1, %2" "$oracle_ms_handle|$bit2_ms_handle"; do
+    IFS='|' read -r -d '' mso msb <<<"$ms"
+    msb=${msb%$'\n'}
+    sigms=$(explainMismatch "$mso" "$msb" ir)
+    rcms=$?
+    if [ "$rcms" -eq 0 ] || [ -n "$sigms" ]; then
+      echo "FAIL: a #5906-shaped delta that is not #5906 was wrongly explained (rc=$rcms sig='$sigms')"
+      fail=1
+    fi
+  done
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
