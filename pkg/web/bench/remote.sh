@@ -14,9 +14,21 @@
 # then a statement about the frameworks.
 #
 # Outputs, all under out/:
-#   results.csv   rep,framework,test,conn,rps,p50_ms,p99_ms,total,non200
+#   results.csv   rep,framework,test,conn,rps,p50_ms,p99_ms,total,non200,
+#                 cpu_us_per_req,load_cores
 #   verify.txt    the byte-identical proof and the affinity read-back
 #   env.txt       the box as measured, at measurement time
+#
+# cpu_us_per_req and load_cores exist because oha's req/s alone conflates two
+# ceilings. At c=64, oha's own two pinned cores can be saturated BEFORE the
+# server is (#5897 comment 2: 44.8-79.6k req/s across frameworks while every
+# server still had headroom), which makes req/s partly a measurement of oha's
+# per-response cost rather than the server's capacity. cpu_us_per_req (server
+# CPU time / requests, from /proc/<pid>/stat of the container's main process)
+# is comparable across frameworks regardless of who was the bottleneck;
+# load_cores (busy cores on LOAD_CPUS, from /proc/stat) says when req/s itself
+# was not a server ceiling, so report.py can flag those rows instead of a
+# reader taking them on trust.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)   # .../web/bench
@@ -42,6 +54,8 @@ cpu_lo() { cpu_list | cut -d- -f1; }
 cpu_hi() { cpu_list | cut -d- -f2; }
 SERVER_CPUS=${BENCH_SERVER_CPUS:-$(cpu_lo)-$(( $(cpu_hi) - 2 ))}
 LOAD_CPUS=${BENCH_LOAD_CPUS:-$(( $(cpu_hi) - 1 ))-$(cpu_hi)}
+
+HZ=$(getconf CLK_TCK)   # /proc/*/stat and /proc/stat are both in clock ticks
 
 # No default. A benchmark whose toolchain version is implicit publishes whichever
 # version the script was last edited against; run.sh always passes this, and a
@@ -287,12 +301,60 @@ prove() {
 
 # ---------------------------------------------------------------- measure
 
+# utime+stime (ticks) of the container's main process, read via its host pid.
+# The kernel aggregates every thread in that process's thread group into the
+# /proc/<pid>/stat of the group leader, so this is already "all threads"
+# without walking /proc/<pid>/task; a pid that has disappeared (container
+# gone) reads as 0 rather than aborting a rep.
+server_cpu_ticks() {
+  local fw=$1 pid rest
+  pid=$(docker inspect -f '{{.State.Pid}}' "t5418-$fw" 2>/dev/null) || { echo 0; return; }
+  rest=$(sed -E 's/^[0-9]+[[:space:]]+\([^)]*\)[[:space:]]+//' "/proc/$pid/stat" 2>/dev/null) || { echo 0; return; }
+  set -- $rest
+  echo $(( ${12:-0} + ${13:-0} ))
+}
+
+# cpu id list from a taskset-style range or single id ("6-7" or "7").
+expand_cpus() {
+  case $1 in
+    *-*) seq "${1%-*}" "${1#*-}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# Sum of non-idle ticks (user+nice+system+irq+softirq+steal; idle and iowait
+# excluded) over every cpu in LOAD_CPUS, from /proc/stat's per-cpu lines.
+load_busy_ticks() {
+  local cpu sum=0 line
+  for cpu in $(expand_cpus "$LOAD_CPUS"); do
+    line=$(awk -v c="cpu$cpu" '$1==c{print $2,$3,$4,$7,$8,$9}' /proc/stat)
+    set -- $line
+    sum=$(( sum + ${1:-0} + ${2:-0} + ${3:-0} + ${4:-0} + ${5:-0} + ${6:-0} ))
+  done
+  echo "$sum"
+}
+
 one_rep() {
   local fw=$1 test=$2 rep=$3 dur=$4 conn=$5 port json
+  local cpu0 cpu1 load0 load1 t0 t1 elapsed cpu_us load_cores
   port=$(port_of "$fw")
+  # Bracketed tightly around the oha run: server CPU and load-core busy time
+  # are both measured over this exact window, not the rep's nominal -z value,
+  # so docker start/stop overhead on either side is not charged to either.
+  cpu0=$(server_cpu_ticks "$fw")
+  load0=$(load_busy_ticks)
+  t0=$(date +%s.%N)
   json=$(docker run --rm --network host --cpuset-cpus "$LOAD_CPUS" "$OHA_IMAGE" \
     -z "$dur" -c "$conn" --no-tui --output-format json "http://127.0.0.1:$port/$test") || return 1
-  printf '%s' "$json" | python3 "$ROOT/ohajson.py" "$rep" "$fw" "$test" "$conn" >> "$OUT/results.csv"
+  t1=$(date +%s.%N)
+  cpu1=$(server_cpu_ticks "$fw")
+  load1=$(load_busy_ticks)
+  elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.6f", b-a}')
+  cpu_us=$(awk -v u0="$cpu0" -v u1="$cpu1" -v hz="$HZ" 'BEGIN{printf "%.0f", (u1-u0)*1000000.0/hz}')
+  load_cores=$(awk -v l0="$load0" -v l1="$load1" -v hz="$HZ" -v el="$elapsed" \
+    'BEGIN{if (el>0) printf "%.3f", (l1-l0)/hz/el; else print "0.000"}')
+  printf '%s' "$json" | python3 "$ROOT/ohajson.py" "$rep" "$fw" "$test" "$conn" "$cpu_us" "$load_cores" \
+    >> "$OUT/results.csv"
 }
 
 # Rotated so no framework is always first in a rep: position in the rep is
@@ -314,7 +376,7 @@ rotated() {
 measure() {
   local rep fw test conn order n
   n=$(printf '%s' "$FRAMEWORKS" | wc -w)
-  printf 'rep,framework,test,conn,rps,p50_ms,p99_ms,total,non200\n' > "$OUT/results.csv"
+  printf 'rep,framework,test,conn,rps,p50_ms,p99_ms,total,non200,cpu_us_per_req,load_cores\n' > "$OUT/results.csv"
   for fw in $FRAMEWORKS; do
     for test in plaintext json; do
       one_rep "$fw" "$test" 0 "$WARMDUR" 64 || return 1
