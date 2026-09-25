@@ -20,12 +20,6 @@ import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
 import { sysClose, sysEpollCreate1, sysEpollCtl, sysEpollPwait } from "../../syscalls"
 import { sysEpollPwait2 } from "../../syscalls"
 import { sysRead, sysWrite, sysEventfd2 } from "../../syscalls"
-// `pollWaitEvents`'s timer-slack drop. Imported from the park provider rather
-// than re-issuing the prctl here, so `PR_SET_TIMERSLACK` and the slack this
-// runtime asks for have one definition; `runtime/net/linux/tcp.bit` already
-// reaches into this module the same way, and neither park module imports
-// `runtime/sched/`, so the dependency stays one-directional.
-import { parkLowerTimerSlack } from "../../park/linux"
 // pollDesc (#5864/#5866): the register-once model's per-fd table.
 // `pollDrainOne` below routes a register-once event (`./pollonce.bit`'s
 // `pollDrainDescEvent`) through `pdWake` to find whichever task is CURRENTLY
@@ -486,24 +480,28 @@ export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, time
     return 0
   }
 
-  // BOTH descriptors are drained (#1910): read interest lives in `scPollFd` and
-  // write interest in `scPollFdWrite`, because epoll keys a registration on the
-  // fd alone and `EPOLL_CTL_MOD` would otherwise have the two directions evict
-  // each other on a socket with a concurrent reader and writer.
+  // Read interest lives in `scPollFd` and write interest in `scPollFdWrite`
+  // (#1910), because epoll keys a registration on the fd alone and
+  // `EPOLL_CTL_MOD` would otherwise have the two directions evict each other.
   //
-  // The write descriptor is drained with timeout 0 regardless of `timeoutNs`.
-  // Only the first wait may block, or a caller asking for a 10ms poll would wait
-  // up to 20ms; and the caller's contract is "drain what is ready", which a
-  // non-blocking second pass satisfies. `scPollFdWrite` is 0 when unbound, which
-  // `pollDrainOne` reads as "nothing to do".
+  // THE WRITE DESCRIPTOR IS DRAINED ONLY WHEN OWED (#5884): it is nested
+  // inside `scPollFd` (#5736, boot refuses to run un-nested), so the read
+  // drain reports `nestSentinel()` exactly when it has something ready.
+  // Draining it unconditionally was half of every request's `epoll_pwait2`
+  // calls. A full read batch owes it too, since the sentinel may be the event
+  // that did not fit. It is drained with timeout 0: only the first wait blocks.
   //
   // THE TWO ANSWERS ARE COMBINED, NOT ADDED. Either may be
   // `pollDrainWakeOnly`, which is a signal and not a count, so adding it to the
   // other descriptor's count would both understate the count and lose the
   // signal. `pollDrainTasks` takes the count half of each and `pollDrainAnswer`
   // re-applies the signal once, for the pair.
+  nestOwedSet(false)
   let readAnswer = pollDrainOne(s, pollFd, schedPollerWaitNs(s, timeoutNs))
-  let writeAnswer = pollDrainOne(s, *(s + scPollFdWrite), 0)
+  let writeAnswer = 0
+  if (nestOwed()) {
+    writeAnswer = pollDrainOne(s, *(s + scPollFdWrite), 0)
+  }
   schedPollLeave(s)
   return pollDrainAnswer(
     pollDrainTasks(readAnswer) + pollDrainTasks(writeAnswer),
@@ -625,34 +623,12 @@ export @nosplit fn pollDisablePwait2() {
 // `timeoutNs` must still pass a real, zeroed `timespec` — `pollDrain` drains
 // the write descriptor with a literal 0 and must not be parked on it.
 //
-// THE THREAD'S TIMER SLACK IS DROPPED FIRST, AND THAT IS NOT A `nanosleep`
-// DETAIL LEAKING IN (#5749). `timer_slack_ns` is per-THREAD state that floors
-// `schedule_hrtimeout_range`'s range through `select_estimate_accuracy()`, so
-// it lengthens the deadline of THIS wait exactly as it lengthens
-// `parkSleepNs`'s. Worker 0 used to take its sub-millisecond waits through
-// `parkSleepNs`, which lowers the slack on every call, and inherited the drop
-// for free; sending every wait here instead (above) left its thread on the
-// kernel's 50000ns default and cost a flat ~50us on every wake — see
-// `parkLowerTimerSlack`'s header for the three-period measurement and for the
-// SCHED_FIFO control that isolates the slack from everything else.
-//
-// ON EVERY BLOCKING WAIT, NOT ONCE, for the reason `parkSleepNs` states and
-// one more this path adds. The state is per-thread and the kernel copies it at
-// clone time, so any "already lowered" flag would itself have to be per-thread
-// or it would skip the call on a worker thread created after the first wait —
-// and this function has no thread identity to hang one on, only the poller
-// try-lock, which admits a DIFFERENT worker each pass. The call is idempotent,
-// it is the same one the pre-#5737 path made per idle turn, and it is paid
-// only where the caller is about to block for real.
-//
-// NOT ON THE NON-BLOCKING DRAIN. `timeoutNs == 0` is `pollDrain`'s write-side
-// drain and `runtime/sched/`'s hot idle poll, which return without sleeping;
-// a syscall per turn there would be a new steady-state cost in place of the
-// one this removes, and a wait of zero has no deadline for slack to move.
+// THE THREAD'S TIMER SLACK IS NOT SET HERE ANY MORE (#5884). It floors this
+// wait's deadline exactly as it floors `parkSleepNs`'s (#5749, a flat ~50us per
+// wake at the kernel's default), but it is per-thread state, so
+// `runtime/root/linux/bootworker.bit`'s `workerBody` sets it once per worker
+// thread instead of this issuing a `prctl` before every blocking wait.
 @nosplit fn pollWaitEvents(pollFd: int, timeoutNs: int): int {
-  if (timeoutNs > 0) {
-    parkLowerTimerSlack()
-  }
   if (*ptrOf(pwait2Latch) == 0) {
     let ns = timeoutNs
     if (ns < 0) {
@@ -732,8 +708,9 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
     // Bounded by the batch, not by the kernel's answer, so a bogus oversized
     // `rc` cannot walk off the buffer (Power of 10).
     let n = rc
-    if (n > maxBatch) {
+    if (n >= maxBatch) {
       n = maxBatch
+      nestOwedSet(true)
     }
     let base = bytesOf()
     let i = 0
@@ -741,12 +718,10 @@ fn pollDrainOne(s: *i64, pollFd: int, timeoutNs: int): int {
       let off = i * eventStride()
       let data = readU64(base, off + eventDataOff())
       if (data == nestSentinel()) {
-        // The nested write descriptor became readable (#5736) — which is the
-        // whole job: this event ENDED the blocking wait. `pollDrain` drains
-        // `scPollFdWrite` unconditionally on its very next line, so there is
-        // nothing to do here, and nothing to decrement: this registration is
-        // permanent and level-triggered, never counted by
-        // `schedPollPendingInc`.
+        // The nested write descriptor became readable (#5736): it ended the
+        // wait, and `pollDrain` owes it a drain (#5884). Nothing to
+        // decrement: permanent, level-triggered, never counted.
+        nestOwedSet(true)
       } else if (data < 0) {
         // Register-once event (#5866, `./pollonce.bit`): `data` is
         // `0 - (1 + fd*2^pdcGenBits + genTag)`, never a task pointer — a
