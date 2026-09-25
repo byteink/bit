@@ -262,3 +262,102 @@ test "readDeadlineInto never reads past len(buf), whatever max says" {
   a.close()
   l.close()
 }
+
+// #5890 — `readDeadlineInto` hands `buf` itself to the kernel: the runtime
+// no longer reads into a scratch of its own and copies it across, and what
+// keeps `buf` live across the park is the caller's `keepAlive` (net.bit). So
+// 10,000 reads into ONE reused buffer must each return exactly the bytes sent
+// for that round — never a previous round's, never zeros. Lockstep, the
+// writer on its own green thread waiting for an ack, so each read finds an
+// empty socket and parks before its bytes arrive, and the writer allocates a
+// fresh message per round, which gives `BIT_GC=stress` a collection to run
+// while the reader is parked. The writer goes through `writeDeadline` and
+// `readDeadline`, the other two callers of the same no-scratch contract.
+fn intoMsg(i: int): string {
+  return "${i}:${i * 7919 % 100003};"
+}
+
+fn intoWriter(c: Conn, rounds: int) {
+  c.setDeadline(monotonic().ns + 120000000000)
+  let i = 0
+  while (i < rounds) {
+    c.writeDeadline(intoMsg(i)) catch _ {
+      return
+    }
+    let ack = c.readDeadline(1) catch _ {
+      return
+    }
+    if (ack != "A") {
+      return
+    }
+    i = i + 1
+  }
+}
+
+// One round: read `want` in as many `readDeadlineInto` calls as it takes,
+// never asking for more than is still owed, so a read cannot run into the
+// next round's bytes. Returns the calls made, or -1 with `why` set.
+fn intoRound(a: Conn, buf: []byte, want: string, why: []string): int {
+  let acc = ""
+  let calls = 0
+  while (len(acc) < len(want)) { // each pass grows `acc` by n > 0 or returns
+    let n = a.readDeadlineInto(buf, len(want) - len(acc)) catch e {
+      why[0] = e.message()
+      return 0 - 1
+    }
+    calls = calls + 1
+    if (n == 0) {
+      why[0] = "peer closed"
+      return 0 - 1
+    }
+    acc = acc + string(buf[0:n])
+  }
+  if (acc != want) {
+    why[0] = "read '${acc}', want '${want}'"
+    return 0 - 1
+  }
+  return calls
+}
+
+test "readDeadlineInto returns exactly the bytes sent across 10,000 parked reads into one buffer" {
+  let rounds = 10000
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let port = l.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let c = dial("127.0.0.1", port) catch e {
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let a = l.accept() catch e {
+    assert(false, "accept: ${e.message()}")
+    return
+  }
+  a.setDeadline(monotonic().ns + 120000000000)
+  spawn intoWriter(c, rounds)
+  let buf = []byte(64)
+  let why = [""]
+  let calls = 0
+  let i = 0
+  while (i < rounds) {
+    let k = intoRound(a, buf, intoMsg(i), why)
+    if (k < 0) {
+      break
+    }
+    calls = calls + k
+    a.write("A") catch e {
+      why[0] = "ack: ${e.message()}"
+      break
+    }
+    i = i + 1
+  }
+  assert(i == rounds, "round ${i} of ${rounds}: ${why[0]}")
+  assert(calls >= rounds, "${calls} readDeadlineInto calls for ${rounds} rounds")
+  c.close()
+  a.close()
+  l.close()
+}

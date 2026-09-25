@@ -79,6 +79,22 @@
 // no change: the caller's managed local is what keeps them alive, exactly the
 // contract `runtime/root/floats.bit`'s `packLowBytes` documents.
 //
+// THE DEADLINE READ AND WRITE HOLD NO SCRATCH AT ALL (#5890). Their buffer is
+// already a MANAGED `[]byte` in the compiled Bit caller — `std/net`'s
+// `readDeadline`, `readDeadlineInto` and `writeDeadline` — and that caller
+// calls `keepAlive` on it (SPEC §11.5, #5807) after the extern returns. So
+// the caller's own stack-map slot names the buffer across the whole call,
+// every poll and park included, and the non-moving collector never relocates
+// its backing: the caller's managed buffer is what pins the memory the kernel
+// reads and writes. `outWords`/`words` are raw here, but this frame returns
+// before the caller's does, so no raw address outlives the caller's frame. A
+// second managed copy in this frame pinned nothing the caller did not already
+// pin, and cost an allocation the size of the transfer, its zeroing and a
+// byte loop per call. With no allocation left both wrappers are `@nosplit`,
+// so E0075 proves they neither allocate nor reach a safepoint poll.
+// `netAbiDialDeadlineW` keeps its copy: `dialDeadline` does not `keepAlive`
+// its host bytes, and the copy is taken before the first poll.
+//
 // `[]i64` rather than `[]byte`: `[]i64(k)` is `k` contiguous 8-byte words,
 // i.e. `k * 8` bytes of scratch, sized independently of the transfer's own
 // element width. (`[]u8`/`[]byte` packs one byte per element too, as of
@@ -195,11 +211,11 @@ export @symbol("bit_rt_net_write") fn netAbiWrite(fd: int, s: int): int {
 // §11.7 admits only scalars and raw pointers), the same constraint `std/fs`'s
 // `bit_rt_fs_is_symlink_w` documents. `std/net` packs a `string` into a
 // caller-owned `[]byte` first and passes its address as `words`/length; a Bit
-// `[]byte` is byte-packed (ABI.md §2, #3121/#3226), so each entry point below
-// COPIES it into its own MANAGED `*u8` scratch (see "WHY THE BUFFERS HERE ARE
-// MANAGED" — the scratch is about a stable, GC-tracked pointer across a park,
-// not about a format conversion) before handing it to the packed-byte socket
-// engine in ../tcp.bit.
+// `[]byte` is byte-packed (ABI.md §2, #3121/#3226), the `*u8` shape the
+// socket engine in ../tcp.bit takes. `dial` copies its host into a MANAGED
+// scratch before the first poll; `read` and `write` hand the caller's own
+// buffer straight to the engine, pinned by the caller's `keepAlive` (see "WHY
+// THE BUFFERS HERE ARE MANAGED").
 
 // Bound on a packed host/body the entry points below will unpack, so the
 // copy loops are statically provable (Power of 10 rule 2). 255 matches the
@@ -209,7 +225,9 @@ const netAbiMaxHost: int = 255
 
 // Bound on a written body: generous rather than tight — this is a request's
 // wire bytes (line, headers, body), not a socket-buffer size — so an ordinary
-// POST is nowhere near it while the copy loop below still has a fixed ceiling.
+// POST is nowhere near it. It first bounded a copy loop #5890 removed; it
+// stays so a single deadline write keeps the same ceiling and the same `-1`
+// past it.
 const netAbiMaxBody: int = 67108864
 
 // `bit_rt_net_dial_deadline_w`: like `bit_rt_net_dial`, but bounded by an
@@ -247,7 +265,7 @@ export @symbol("bit_rt_net_dial_deadline_w") fn netAbiDialDeadlineW(
 // `extern fn` cannot return one either (SPEC §11.7). Returns the byte count
 // written (`0` — the peer closed, an orderly end of stream), or a negative
 // sentinel: -1 hard I/O error, -2 the deadline elapsed first.
-export @symbol("bit_rt_net_read_deadline_w") fn netAbiReadDeadlineW(
+export @symbol("bit_rt_net_read_deadline_w") @nosplit fn netAbiReadDeadlineW(
   fd: int,
   outWords: int,
   bufCap: int,
@@ -256,25 +274,14 @@ export @symbol("bit_rt_net_read_deadline_w") fn netAbiReadDeadlineW(
   if (bufCap <= 0 || outWords == 0) {
     return 0
   }
-  let scratch = []i64(scratchWords(bufCap))
-  let packed = int(ptrOf(scratch))
-  let n = netReadSockDeadline(fd, u8At(packed), bufCap, deadlineNs)
-  if (n <= 0) {
-    return n
-  }
-  let i = 0
-  while (i < n) { // bounded by `n`, itself bounded by `bufCap`
-    storeByte(outWords + i, loadByte(packed + i))
-    i = i + 1
-  }
-  return n
+  return netReadSockDeadline(fd, u8At(outWords), bufCap, deadlineNs)
 }
 
 // `bit_rt_net_write_deadline_w`: like `bit_rt_net_write`, but bounded — `s`
 // crosses as `words`/`n` for the same reason `dial`'s `host` does above.
 // Returns the byte count written, or a negative sentinel: -1 hard failure,
 // -2 the deadline elapsed first.
-export @symbol("bit_rt_net_write_deadline_w") fn netAbiWriteDeadlineW(
+export @symbol("bit_rt_net_write_deadline_w") @nosplit fn netAbiWriteDeadlineW(
   fd: int,
   words: int,
   n: int,
@@ -286,14 +293,7 @@ export @symbol("bit_rt_net_write_deadline_w") fn netAbiWriteDeadlineW(
   if (words == 0 || n > netAbiMaxBody) {
     return 0 - 1
   }
-  let scratch = []i64(scratchWords(n))
-  let packed = int(ptrOf(scratch))
-  let i = 0
-  while (i < n) { // bounded by `n`, itself bounded by `netAbiMaxBody`
-    storeByte(packed + i, loadByte(words + i))
-    i = i + 1
-  }
-  return netWriteSockDeadline(fd, u8At(packed), n, deadlineNs)
+  return netWriteSockDeadline(fd, u8At(words), n, deadlineNs)
 }
 
 // `bit_rt_net_shutdown_sock_w`: shut both directions of `fd` down without
