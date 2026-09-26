@@ -586,6 +586,94 @@ test "two requests down one keep-alive connection both carry the same non-empty 
   s.close()
 }
 
+// Polls `s.drain` (module-private, same module as `Server`/`shutdown.bit`)
+// until both its bookkeeping fields reach zero or the bound is hit: the
+// connection's own `serveOne` loop deregisters on a different green thread
+// than this test's `conn.close()`, so the drop is observed asynchronously,
+// never instantly. Bounded at 100 x 5ms (500ms) — generous next to the local
+// TCP round trip this waits on, same shape as this file's other
+// `while (n < 100)` polls.
+fn drainedToZero(s: Server): bool {
+  let maxWaits = 100
+  let n = 0
+  while (n < maxWaits) {
+    n = n + 1
+    s.drain.mu.lock()
+    let activeCount = s.drain.activeCount
+    let connCount = len(s.drain.conns)
+    s.drain.mu.unlock()
+    if (activeCount == 0 && connCount == 0) {
+      return true
+    }
+    sleep(5 * Millisecond)
+  }
+  return false
+}
+
+// #5940/#5941: `answerOne` used to call `drainMarkActive` on every request of
+// a persistent connection, even though it is a no-op past the first (nothing
+// ever resets a `connEntry.active` back to false). This proves the
+// user-visible contract that change must not touch: three requests down one
+// keep-alive connection all still get their 200, and once the client closes,
+// the server's drain tracker has forgotten the connection entirely —
+// `activeCount` back to 0 and no leftover `conns` entry — exactly as before
+// the call was made idempotent per-connection.
+test "three requests on one keep-alive connection all answer 200, and the drain tracker forgets the connection after close" {
+  let (s, port) = startServer() catch e {
+    assert(false, "startServer: ${e.message()}")
+    return
+  }
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  let reader = newRespReader(conn)
+
+  let n = 0
+  while (n < 3) {
+    n = n + 1
+    conn.write("GET /a HTTP/1.1\r\nHost: x\r\n\r\n") catch e {
+      s.close()
+      assert(false, "write ${n}: ${e.message()}")
+      return
+    }
+    let res = reader.next() catch e {
+      s.close()
+      assert(false, "response ${n}: ${e.message()}")
+      return
+    }
+    assert(indexOf(res, "200") >= 0, "response ${n} was not a 200:\n${res}")
+  }
+
+  // `drainMarkActive` (shutdown.bit) runs before `handler` on every request,
+  // so by the time this client has read a response the mark has already
+  // happened — no poll needed. This is the assertion that actually depends
+  // on `answerOne` calling `drainMarkActive` at all: the "forgotten after
+  // close" check below passes even with marking removed entirely, since
+  // `drainDeregister` clears the registry either way. Still connected, so
+  // exactly the one connection this test opened is registered and active.
+  s.drain.mu.lock()
+  let activeAfterRequests = s.drain.activeCount
+  let connsAfterRequests = len(s.drain.conns)
+  s.drain.mu.unlock()
+  assert(
+    activeAfterRequests == 1,
+    "activeCount was ${activeAfterRequests} after 3 requests on one connection, want 1",
+  )
+  assert(
+    connsAfterRequests == 1,
+    "conns had ${connsAfterRequests} entries after 3 requests on one connection, want 1",
+  )
+
+  conn.close()
+  assert(
+    drainedToZero(s),
+    "drain tracker did not return to activeCount == 0, len(conns) == 0 after close",
+  )
+  s.close()
+}
+
 test "two GET requests pipelined in one write are each answered with their own body, not the reused read buffer's next contents" {
   let s = serve("127.0.0.1", 0) catch e {
     assert(false, "serve: ${e.message()}")
