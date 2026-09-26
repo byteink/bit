@@ -1,0 +1,124 @@
+// stdlib/http/responsebuf.test.bit — `answerOne`'s reusable response buffer
+// (#5928): one write allocation per keep-alive connection instead of one per
+// request, and dropped back down after a response that grew it past
+// `maxReusableResponseBuf` (16 KiB).
+//
+// `drainSlot`, `connOpts`, `answerTurn`, `answerOne`, `newDrainState`,
+// `drainRegister`, `defaultMaxBodyBytes`, `defaultIdleTimeoutNs`,
+// `defaultMaxRequestsPerConn`, `maxReusableResponseBuf`, `ok`, `Request`,
+// `Response`, `indexOf` and `repeat` are all siblings in this same module
+// (SPEC §19; `repeat` already comes in through `multipart.test.bit`), so
+// nothing is imported.
+
+// A `byteStream` double that answers `readUp` from a fixed script, the same
+// shape `scriptedStream` (message.test.bit, a sibling in this module) reads
+// with, and records every `writeBytes` call as a `string` rather than
+// failing on one — what the buffer-reuse test below needs to read back and
+// `scriptedStream` has no reason to grow.
+class captureWriteStream {
+  data: string
+  pos: int
+  maxPerRead: int
+  pending: string
+  writes: []string
+
+  readUp(n: int): string! {
+    if (len(this.pending) > 0) {
+      if (len(this.pending) <= n) {
+        let out = this.pending
+        this.pending = ""
+        return out
+      }
+      let out = this.pending[0:n]
+      this.pending = this.pending[n:len(this.pending)]
+      return out
+    }
+    if (this.pos >= len(this.data)) {
+      return ""
+    }
+    let want = n
+    if (want > this.maxPerRead) {
+      want = this.maxPerRead
+    }
+    let end = this.pos + want
+    if (end > len(this.data)) {
+      end = len(this.data)
+    }
+    let out = this.data[this.pos:end]
+    this.pos = end
+    return out
+  }
+
+  writeStr(s: string): ()! {
+    fail newError("captureWriteStream: unexpected writeStr of ${len(s)} bytes")
+  }
+
+  writeBytes(b: []byte): ()! {
+    this.writes = append(this.writes, string(b))
+  }
+
+  shut() {}
+
+  forceClose() {}
+
+  peer(): string { return "" }
+
+  unread(extra: string) { this.pending = extra + this.pending }
+
+  setIdleDeadline(deadlineNs: int) {}
+}
+
+// Answers `/big` with a body past `maxReusableResponseBuf` and anything else
+// with a two-byte body — the two requests the test below drives down one
+// `drainSlot`, in that order.
+fn routeBigThenSmall(req: Request): Response {
+  if (req.path == "/big") {
+    return ok(repeat("a", maxReusableResponseBuf + 100))
+  }
+  return ok("hi")
+}
+
+// #5928: `answerOne` refills `drainSlot.buf` in place across requests on the
+// same connection instead of allocating a fresh response buffer every time,
+// and drops it back to empty once a response has grown it past
+// `maxReusableResponseBuf` (16 KiB) — an oversized body must not stay pinned
+// on a connection that goes on to idle between requests. Driven directly
+// against `answerOne` (a sibling in this module, server.bit) rather than
+// over a real socket: the buffer being freed is otherwise unobservable from
+// outside the connection.
+test "a response over 16 KiB does not leave the connection's write buffer retained for a later small response" {
+  let wire = "GET /big HTTP/1.1\r\nHost: x\r\n\r\nGET /small HTTP/1.1\r\nHost: x\r\n\r\n"
+  let s = captureWriteStream{
+    data = wire, pos = 0, maxPerRead = 65536, pending = "", writes = []string(0),
+  }
+  let opts = connOpts{
+    altPort = 0, maxBody = defaultMaxBodyBytes,
+    idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
+  }
+  let d = newDrainState()
+  let id = drainRegister(d, () => {}, () => {})
+  let slot = drainSlot{ d = d, id = id, marked = false, buf = []byte(0) }
+
+  let turn1 = answerTurn{ first = true, atLimit = false }
+  let more1 = answerOne(s, routeBigThenSmall, opts, slot, turn1)
+  assert(more1, "the oversized response should not have closed the connection")
+  assert(len(slot.buf) == 0, "the oversized write buffer was not dropped after the write")
+  assert(
+    cap(slot.buf) == 0,
+    "the oversized write buffer's backing array was retained after the write",
+  )
+
+  let turn2 = answerTurn{ first = false, atLimit = false }
+  let more2 = answerOne(s, routeBigThenSmall, opts, slot, turn2)
+  assert(more2, "the small response should not have closed the connection")
+
+  assert(len(s.writes) == 2, "expected exactly 2 writes, got ${len(s.writes)}")
+  assert(
+    indexOf(s.writes[0], "\r\n\r\n" + repeat("a", maxReusableResponseBuf + 100)) >= 0,
+    "response 1's body was not the oversized body",
+  )
+  assert(
+    indexOf(s.writes[1], "\r\n\r\nhi") >= 0,
+    "response 2's body was not 'hi':\n${s.writes[1]}",
+  )
+}

@@ -159,8 +159,9 @@ export class Exchange {
     defer this.conn.close()
     // Always `close: true`: this API is one request per connection (this
     // class's own doc comment), unlike `listenAndServeOn`'s persistent
-    // connections (#5419).
-    this.conn.write(serializeResponse(res, this.method, true))?
+    // connections (#5419). A fresh `[]byte(0)` buffer — this connection
+    // closes right after, so there is nothing to reuse it for (#5928).
+    this.conn.writeBytes(serializeResponseInto([]byte(0), res, this.method, true))?
   }
 
   // Take ownership of the exchange's underlying connection for a protocol
@@ -203,7 +204,9 @@ class connOpts {
 // connection. Best-effort: the peer may already be gone, in which case the
 // write fails and is swallowed — there is no one left to tell.
 fn answerBadRequest(s: byteStream) {
-  s.writeStr(serializeResponse(respond(400, ""), "", true)) catch _ {
+  // A fresh `[]byte(0)` buffer: this connection is closed right below
+  // regardless, so there is nothing to reuse it for (#5928).
+  s.writeBytes(serializeResponseInto([]byte(0), respond(400, ""), "", true)) catch _ {
     s.shut()
     return
   }
@@ -385,10 +388,18 @@ export fn listenAndServe(host: string, port: int, handler: (Request) => Response
 // mutex-guarded channel round trip and map lookup on every later
 // keep-alive request instead of paying for a call whose answer never
 // changes.
+// `buf` (#5928) is the same E0202-driven bundling: it is this connection's
+// reusable response-serialization buffer, refilled in place by
+// `serializeResponseInto` on every request instead of allocating a fresh
+// one, and it needs to live exactly as long as `d`/`id`/`marked` already do
+// — one instance per connection, mutated by reference across every
+// `answerOne` call on it (a class field, not a return value, for the same
+// reason `marked` is). `[]byte(0)` until the first response needs it.
 class drainSlot {
   d: drainState,
   id: int,
   marked: bool,
+  buf: []byte,
 }
 
 // Which request, of how many, this `answerOne` call is answering (#5419).
@@ -408,6 +419,13 @@ class answerTurn {
   atLimit: bool,
 }
 
+// Above this, `answerOne`'s reusable response buffer (`drainSlot.buf`,
+// #5928) is dropped back to `[]byte(0)` after a write that grew it past
+// this — a keep-alive connection idling between requests must not pin an
+// oversized body's backing array for the rest of its life, only pay for one
+// while actually serving one.
+const maxReusableResponseBuf = 16384
+
 fn serveOne(s: byteStream, handler: (Request) => Response, opts: connOpts, d: drainState) {
   let id = drainRegister(
     d,
@@ -417,7 +435,7 @@ fn serveOne(s: byteStream, handler: (Request) => Response, opts: connOpts, d: dr
     () => {},
   )
   defer drainDeregister(d, id)
-  let slot = drainSlot{ d = d, id = id, marked = false }
+  let slot = drainSlot{ d = d, id = id, marked = false, buf = []byte(0) }
   let n = 0
   while (n < opts.maxRequests) {
     n = n + 1
@@ -470,10 +488,18 @@ fn answerOne(
   // before its next request, so every exit path shuts explicitly instead — a
   // write failure ends the connection exactly as it always has (#4175), just
   // via `catch` rather than `?`-propagation now that this function no longer
-  // fails.
-  s.writeStr(serializeResponse(res, req.method, mustClose)) catch _ {
+  // fails. `slot.buf` (#5928) is refilled in place when the response still
+  // fits it, so a keep-alive connection answering many small requests
+  // allocates its response buffer once, not once per request.
+  slot.buf = serializeResponseInto(slot.buf, res, req.method, mustClose)
+  s.writeBytes(slot.buf) catch _ {
     s.shut()
     return false
+  }
+  // Drop the buffer back down rather than keep pinning an oversized body's
+  // backing array on a connection that may now sit idle a while (#5928).
+  if (len(slot.buf) > maxReusableResponseBuf) {
+    slot.buf = []byte(0)
   }
   if (mustClose) {
     s.shut()
