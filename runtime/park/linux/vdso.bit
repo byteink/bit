@@ -1,0 +1,630 @@
+// The Linux vDSO clock (#5959): `clock_gettime` without a kernel trap.
+//
+// WHY. `parkMonoNs` (./wait.bit) is the clock under `std/time.monotonic()`,
+// every net deadline and the scheduler's find-work loop. As a raw `syscall` it
+// cost 1483 ns per read on hl-master against 420 ns for glibc's vDSO call
+// (#5956), about 3 us of pkg/web's 47.7 us CPU per request. The kernel maps a
+// small ELF image into every process (the vDSO) whose `clock_gettime` reads the
+// timekeeper's shared page and the CPU counter in user mode, and falls back to
+// the real syscall itself whenever the counter is unusable, so its answer is the
+// syscall's answer.
+//
+// FINDING IT IN A STATIC BINARY. There is no dynamic loader to do it for us:
+// the kernel hands the image's address in the auxv (`AT_SYSINFO_EHDR`, ABI.md
+// §19), and `parkVdsoLookup` walks its ELF program headers, `PT_DYNAMIC`,
+// `DT_SYMTAB`/`DT_STRTAB`, the symbol count from `DT_HASH` or `DT_GNU_HASH`,
+// and `DT_VERSYM`/`DT_VERDEF` when present. The image is kernel-made, but the
+// walk still trusts none of it: every loop is bounded by the ELF's own count AND
+// a fixed ceiling below, every table address is checked against the image's own
+// extent (its first `PT_LOAD`) and for alignment before it is read, and any
+// failure answers 0, which leaves the raw syscall in place. The symbol is
+// `__vdso_clock_gettime`@LINUX_2.6 on x86_64 and `__kernel_clock_gettime`
+// @LINUX_2.6.39 on aarch64 (the kernel's vdso.lds.S for each arch).
+//
+// RESOLVED ONCE, AT BOOT, BEFORE ANY OTHER THREAD EXISTS. `parkVdsoInit` is
+// called from `../../root/linux/boottail.bit`'s `boot` before the first worker,
+// sysmon or collector thread is cloned, and `vdsoClockFn` is never written
+// again, so every later reader sees the final value through the clone's own
+// ordering and needs no atomic. A read before boot sees 0 and takes the
+// syscall. `BIT_VDSO=0` (or `off`) skips the lookup, which forces the syscall
+// for testing and debugging.
+//
+// THE CALL, AND WHY IT IS SAFE HERE. `vdsoCall` is the `taskInvoke` shape
+// (../../sched/task.bit): an `asm` `call rax` / `blr x9` with every C
+// caller-saved GPR declared clobbered, and x30 declared so the arm64 frame
+// keeps its return address (#3915). No compiler change: SPEC §10.3.1 admits
+// `asm` in `@nosplit`, and the payload neither allocates nor reaches a
+// safepoint. The vDSO's C ABI preserves a superset of what Bit's callers rely
+// on (x64: rbx, r12..r15, rbp against Bit's rbx, r13..r15; arm64: x19..x28 and
+// the low halves of v8..v15, exactly Bit's set), so the only registers it may
+// destroy are ones every Bit call already treats as dead. The stack question and
+// the signal question are ABI.md §18's.
+
+import { getauxval, atSysinfoEhdr } from "../../auxv"
+import { onX64 } from "../../syscalls"
+
+// ELF64 offsets and values from the System V gABI and `<elf.h>`, not memory.
+const elfMagic: int = 0x464C457F // "\x7fELF" read as a little-endian u32
+const eiClass: int = 4
+const eiData: int = 5
+const elfClass64: int = 2
+const elfDataLsb: int = 1
+const ehMachine: int = 18
+const ehPhoff: int = 32
+const ehPhentsize: int = 54
+const ehPhnum: int = 56
+const ehSize: int = 64
+const emX8664: int = 62
+const emAarch64: int = 183
+const phSize: int = 56
+const phOffset: int = 8
+const phVaddr: int = 16
+const phFilesz: int = 32
+const ptLoad: int = 1
+const ptDynamic: int = 2
+const dynSize: int = 16
+const dtNull: int = 0
+const dtHash: int = 4
+const dtStrtab: int = 5
+const dtSymtab: int = 6
+const dtStrsz: int = 10
+const dtSyment: int = 11
+const dtGnuHash: int = 0x6ffffef5
+const dtVersym: int = 0x6ffffff0
+const dtVerdef: int = 0x6ffffffc
+const dtVerdefnum: int = 0x6ffffffd
+const symSize: int = 24
+const sttFunc: int = 2
+const stbGlobal: int = 1
+const stbWeak: int = 2
+const verFlgBase: int = 1
+const verdefSize: int = 20
+
+// Ceilings on untrusted counts. A real vDSO is two pages with about twenty
+// symbols, four program headers and two version definitions; each bound is far
+// above that and still small enough that no arithmetic below can overflow.
+const minMapBytes: int = 4096
+const maxImageBytes: int = 1048576
+const maxPhnum: int = 16
+const maxDynEntries: int = 64
+const maxSyms: int = 4096
+const maxVerdefs: int = 64
+
+// Why the lookup answered what it did, readable by `parkVdsoState`. A test
+// prints it, so a lookup that silently stopped resolving is a red .expected
+// rather than a slower clock nobody notices.
+export const vdsoUnset: int = 0
+export const vdsoResolved: int = 1
+export const vdsoDisabled: int = 2
+export const vdsoNoImage: int = 3
+export const vdsoMalformed: int = 4
+export const vdsoNoSymbol: int = 5
+
+let vdsoClockFn: int = 0
+let vdsoState: int = 0
+
+// The walk's parsed image, one slot per fact. Module state because the runtime
+// cannot allocate a record here (--freestanding) and a tuple return allocates;
+// written only by the one boot-time lookup.
+const iBase: int = 0
+const iEnd: int = 1
+const iBias: int = 2
+const iDyn: int = 3
+const iDynN: int = 4
+const iSymtab: int = 5
+const iStrtab: int = 6
+const iStrsz: int = 7
+const iSyment: int = 8
+const iHash: int = 9
+const iGnuHash: int = 10
+const iVersym: int = 11
+const iVerdef: int = 12
+const iVerdefnum: int = 13
+const iNsyms: int = 14
+const infoSlots: int = 15
+let info: [15]i64
+
+fn rd8(a: int): int {
+  let z: *u8 = nil
+  return int(*(z + a))
+}
+
+fn rd16(a: int): int {
+  return rd8(a) | (rd8(a + 1) << 8)
+}
+
+// `a` is 4-aligned: every caller reads a table whose base passed `tableAt`.
+fn rd32(a: int): int {
+  let z: *u32 = nil
+  return int(*(z + (a >> 2)))
+}
+
+// `a` is 8-aligned, same argument as `rd32`.
+fn rd64(a: int): int {
+  let z: *i64 = nil
+  return int(*(z + (a >> 3)))
+}
+
+// Whether `[a, a + n)` lies inside the image. `n` is always a small product of
+// bounded counts, so the sum cannot overflow.
+fn inImage(a: int, n: int): bool {
+  return a >= info[iBase] && n >= 0 && n <= maxImageBytes && a + n <= info[iEnd]
+}
+
+fn identOk(base: int): bool {
+  if (rd32(base) != elfMagic || rd8(base + eiClass) != elfClass64) {
+    return false
+  }
+  let machine = emAarch64
+  if (onX64()) {
+    machine = emX8664
+  }
+  return rd8(base + eiData) == elfDataLsb && rd16(base + ehMachine) == machine
+}
+
+// The header and the program headers must sit in the first page, the least the
+// kernel can have mapped, since nothing larger is known before `PT_LOAD` is read.
+fn phdrsOk(base: int): bool {
+  if (rd16(base + ehPhentsize) != phSize) {
+    return false
+  }
+  let off = rd64(base + ehPhoff)
+  let n = rd16(base + ehPhnum)
+  if (off < ehSize || off > minMapBytes || off % 8 != 0) {
+    return false
+  }
+  return n >= 1 && n <= maxPhnum && off + n * phSize <= minMapBytes
+}
+
+// The first `PT_LOAD` fixes the image's extent and its load bias (the vDSO is
+// linked at 0 on every supported kernel; a stranger link address is refused
+// rather than trusted through wrapping arithmetic).
+fn loadSeg(base: int, p: int): bool {
+  let off = rd64(p + phOffset)
+  let va = rd64(p + phVaddr)
+  let sz = rd64(p + phFilesz)
+  if (off < 0 || va < 0 || sz <= 0 || va >= maxImageBytes || off + sz > maxImageBytes) {
+    return false
+  }
+  info[iEnd] = base + off + sz
+  info[iBias] = base + off - va
+  return true
+}
+
+fn dynSeg(base: int, p: int): bool {
+  let off = rd64(p + phOffset)
+  let sz = rd64(p + phFilesz)
+  if (off < 0 || off >= maxImageBytes || off % 8 != 0 || sz < dynSize) {
+    return false
+  }
+  let n = sz / dynSize
+  if (n > maxDynEntries) {
+    n = maxDynEntries
+  }
+  info[iDyn] = base + off
+  info[iDynN] = n
+  return inImage(info[iDyn], n * dynSize)
+}
+
+fn scanPhdrs(base: int): bool {
+  let ph = base + rd64(base + ehPhoff)
+  let n = rd16(base + ehPhnum)
+  let dyn = 0
+  let i = 0
+  while (i < n) {
+    let p = ph + i * phSize
+    let t = rd32(p)
+    if (t == ptLoad && info[iEnd] == 0 && !loadSeg(base, p)) {
+      return false
+    }
+    if (t == ptDynamic) {
+      dyn = p
+    }
+    i = i + 1
+  }
+  if (info[iEnd] == 0 || dyn == 0) {
+    return false
+  }
+  return dynSeg(base, dyn)
+}
+
+// The dynamic tags that carry an address, and the slot each lands in; -1 for
+// every other tag, which the walk skips.
+fn addrSlot(tag: int): int {
+  if (tag == dtHash) {
+    return iHash
+  }
+  if (tag == dtStrtab) {
+    return iStrtab
+  }
+  if (tag == dtSymtab) {
+    return iSymtab
+  }
+  if (tag == dtGnuHash) {
+    return iGnuHash
+  }
+  if (tag == dtVersym) {
+    return iVersym
+  }
+  if (tag == dtVerdef) {
+    return iVerdef
+  }
+  return 0 - 1
+}
+
+fn countSlot(tag: int): int {
+  if (tag == dtStrsz) {
+    return iStrsz
+  }
+  if (tag == dtSyment) {
+    return iSyment
+  }
+  if (tag == dtVerdefnum) {
+    return iVerdefnum
+  }
+  return 0 - 1
+}
+
+// A table's run-time address from its `d_ptr`, or 0 when it points outside the
+// image or is misaligned for its entries.
+fn tableAt(ptr: int, align: int): int {
+  if (ptr <= 0 || ptr >= maxImageBytes) {
+    return 0
+  }
+  let a = info[iBias] + ptr
+  if (!inImage(a, 1) || a % align != 0) {
+    return 0
+  }
+  return a
+}
+
+fn scanDynamic(): bool {
+  let d = info[iDyn]
+  let i = 0
+  while (i < info[iDynN]) {
+    let e = d + i * dynSize
+    let tag = rd64(e)
+    if (tag == dtNull) {
+      return true
+    }
+    let s = addrSlot(tag)
+    if (s < 0) {
+      s = countSlot(tag)
+    }
+    if (s >= 0 && s < infoSlots) {
+      info[s] = rd64(e + 8)
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Replace every `d_ptr` with its checked address; 0 marks it absent or bad.
+fn resolveTables() {
+  info[iSymtab] = tableAt(info[iSymtab], 8)
+  info[iStrtab] = tableAt(info[iStrtab], 1)
+  info[iHash] = tableAt(info[iHash], 4)
+  info[iGnuHash] = tableAt(info[iGnuHash], 8)
+  info[iVersym] = tableAt(info[iVersym], 2)
+  info[iVerdef] = tableAt(info[iVerdef], 4)
+}
+
+fn gnuMaxBucket(buckets: int, nb: int): int {
+  let hi = 0
+  let i = 0
+  while (i < nb) {
+    let b = rd32(buckets + i * 4)
+    if (b > hi) {
+      hi = b
+    }
+    i = i + 1
+  }
+  return hi
+}
+
+// Whether the `DT_GNU_HASH` header at `gh` and its bucket array are in range.
+fn gnuHeaderOk(gh: int): bool {
+  if (gh == 0 || !inImage(gh, 16)) {
+    return false
+  }
+  let nb = rd32(gh)
+  let bloom = rd32(gh + 8)
+  if (nb <= 0 || nb > maxSyms || bloom > maxSyms || rd32(gh + 4) > maxSyms) {
+    return false
+  }
+  return inImage(gh + 16 + bloom * 8, nb * 4)
+}
+
+// The symbol count `DT_GNU_HASH` implies: the chain that starts at the highest
+// bucket ends at the first entry with its low bit set, and that is the last
+// symbol.
+fn gnuSymCount(gh: int): int {
+  if (!gnuHeaderOk(gh)) {
+    return 0
+  }
+  let nb = rd32(gh)
+  let symoff = rd32(gh + 4)
+  let buckets = gh + 16 + rd32(gh + 8) * 8
+  let k = gnuMaxBucket(buckets, nb)
+  if (k < symoff) {
+    return symoff
+  }
+  let chain = buckets + nb * 4
+  while (k < maxSyms) {
+    let a = chain + (k - symoff) * 4
+    if (!inImage(a, 4)) {
+      return 0
+    }
+    if ((rd32(a) & 1) != 0) {
+      return k + 1
+    }
+    k = k + 1
+  }
+  return 0
+}
+
+fn symCount(): int {
+  let h = info[iHash]
+  if (h != 0 && inImage(h, 8)) {
+    return rd32(h + 4)
+  }
+  return gnuSymCount(info[iGnuHash])
+}
+
+// Every table the symbol walk reads must be present, inside the image, and
+// sized by a count that is itself in range.
+fn tablesOk(): bool {
+  resolveTables()
+  let syment = info[iSyment]
+  if (syment != 0 && syment != symSize) {
+    return false
+  }
+  let n = symCount()
+  let strsz = info[iStrsz]
+  if (info[iSymtab] == 0 || info[iStrtab] == 0 || n <= 0 || n > maxSyms) {
+    return false
+  }
+  info[iNsyms] = n
+  return strsz > 0 && inImage(info[iSymtab], n * symSize) && inImage(info[iStrtab], strsz)
+}
+
+// Whether the NUL-terminated string at string-table offset `off` is `want`,
+// reading no byte at or past the table's end.
+fn strIs(off: int, want: string): bool {
+  let n = len(want)
+  let strsz = info[iStrsz]
+  if (off < 0 || off + n >= strsz) {
+    return false
+  }
+  let base = info[iStrtab] + off
+  let i = 0
+  while (i < n) {
+    if (rd8(base + i) != int(want[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return rd8(base + n) == 0
+}
+
+fn verdefNamed(d: int, want: string): bool {
+  let aux = d + rd32(d + 12)
+  if (aux % 4 != 0 || !inImage(aux, 8)) {
+    return false
+  }
+  return strIs(rd32(aux), want)
+}
+
+// The version index of the non-base `DT_VERDEF` entry named `want`, -1 when
+// none is. Bounded by `DT_VERDEFNUM` and `maxVerdefs` both.
+fn verdefFind(want: string): int {
+  let d = info[iVerdef]
+  let n = info[iVerdefnum]
+  if (n <= 0 || n > maxVerdefs) {
+    n = maxVerdefs
+  }
+  let i = 0
+  while (i < n && d % 4 == 0 && inImage(d, verdefSize)) {
+    if ((rd16(d + 2) & verFlgBase) == 0 && verdefNamed(d, want)) {
+      return rd16(d + 4) & 0x7fff
+    }
+    let next = rd32(d + 16)
+    if (next == 0) {
+      return 0 - 1
+    }
+    d = d + next
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// The version index to require of the symbol: 0 (check nothing) when the image
+// carries no version tables, as glibc and Go both treat it, else `verdefFind`.
+fn versionIndex(want: string): int {
+  if (info[iVerdef] == 0 || info[iVersym] == 0) {
+    return 0
+  }
+  return verdefFind(want)
+}
+
+fn versionOk(i: int, ver: int): bool {
+  if (ver == 0) {
+    return true
+  }
+  let e = info[iVersym] + i * 2
+  return ver > 0 && inImage(e, 2) && (rd16(e) & 0x7fff) == ver
+}
+
+// Whether the symbol at `s` is a defined global or weak function.
+fn symIsFunc(s: int): bool {
+  let st = rd8(s + 4)
+  let bind = st >> 4
+  if ((st & 15) != sttFunc || rd16(s + 6) == 0) {
+    return false
+  }
+  return bind == stbGlobal || bind == stbWeak
+}
+
+// Symbol `i`'s run-time address when it is the defined function `name` at
+// version `ver`, else 0.
+fn symMatch(i: int, name: string, ver: int): int {
+  let s = info[iSymtab] + i * symSize
+  if (!symIsFunc(s)) {
+    return 0
+  }
+  let v = rd64(s + 8)
+  if (v <= 0 || v >= maxImageBytes || !strIs(rd32(s), name) || !versionOk(i, ver)) {
+    return 0
+  }
+  let a = info[iBias] + v
+  if (!inImage(a, 1)) {
+    return 0
+  }
+  return a
+}
+
+fn findSym(name: string, ver: int): int {
+  let n = info[iNsyms]
+  let i = 1
+  while (i < n) {
+    let a = symMatch(i, name, ver)
+    if (a != 0) {
+      return a
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn imageOk(base: int): bool {
+  let k = 0
+  while (k < infoSlots) {
+    info[k] = 0
+    k = k + 1
+  }
+  info[iBase] = base
+  if (!identOk(base) || !phdrsOk(base)) {
+    return false
+  }
+  return scanPhdrs(base) && scanDynamic() && tablesOk()
+}
+
+// The address of function `name` at version `version` in the vDSO image at
+// `base`, or 0, with the reason left in `parkVdsoState`. Exported for
+// `_tests_/stress/vdsolinux`, which asks for names that must not resolve.
+export fn parkVdsoLookup(base: int, name: string, version: string): int {
+  if (base == 0) {
+    vdsoState = vdsoNoImage
+    return 0
+  }
+  if (!imageOk(base)) {
+    vdsoState = vdsoMalformed
+    return 0
+  }
+  let ver = versionIndex(version)
+  let a = 0
+  if (ver >= 0) {
+    a = findSym(name, ver)
+  }
+  vdsoState = vdsoNoSymbol
+  if (a != 0) {
+    vdsoState = vdsoResolved
+  }
+  return a
+}
+
+// Whether the image's `DT_GNU_HASH` implies the same symbol count its
+// `DT_HASH` does, or it has no `DT_GNU_HASH` at all. Read after a lookup; the
+// x86_64 vDSO carries both tables, so this is what exercises `gnuSymCount` on a
+// real image. For `_tests_/stress/vdsolinux`.
+export fn parkVdsoGnuAgrees(): bool {
+  let gh = info[iGnuHash]
+  return gh == 0 || gnuSymCount(gh) == info[iNsyms]
+}
+
+// The vDSO image's address from the auxv, 0 when the kernel mapped none.
+export fn parkVdsoImage(): int {
+  return getauxval(atSysinfoEhdr)
+}
+
+export fn parkVdsoClockName(): string {
+  if (onX64()) {
+    return "__vdso_clock_gettime"
+  }
+  return "__kernel_clock_gettime"
+}
+
+export fn parkVdsoClockVersion(): string {
+  if (onX64()) {
+    return "LINUX_2.6"
+  }
+  return "LINUX_2.6.39"
+}
+
+// Resolve the clock once, from `boot`, before any other thread exists (see the
+// header). `enabled` is false under `BIT_VDSO=0`.
+export @symbol("bit_rt_port_park_vdso_init") fn parkVdsoInit(enabled: bool) {
+  vdsoClockFn = 0
+  if (!enabled) {
+    vdsoState = vdsoDisabled
+    return
+  }
+  vdsoClockFn = parkVdsoLookup(parkVdsoImage(), parkVdsoClockName(), parkVdsoClockVersion())
+}
+
+export @nosplit fn parkVdsoState(): int {
+  return vdsoState
+}
+
+export @nosplit fn parkVdsoClockFn(): int {
+  return vdsoClockFn
+}
+
+// `clock_gettime(clock, ts)` through the vDSO entry `fnp`. The `taskInvoke`
+// clobber set (../../sched/task.bit): every caller-saved GPR the C callee may
+// destroy, x30 so the arm64 frame saves the return address.
+export @nosplit fn parkVdsoCall(fnp: int, clock: int, ts: *i64): int {
+  return asm {
+    arm64 { 0xD63F0120 } // blr x9
+    x64 { 0xFF, 0xD0 }   // call rax
+    result arm64 x0 x64 rax : int
+    input arm64 x9 x64 rax = fnp
+    input arm64 x0 x64 rdi = clock
+    input arm64 x1 x64 rsi = ts
+    clobber arm64 {
+      x2,
+      x3,
+      x4,
+      x5,
+      x6,
+      x7,
+      x8,
+      x10,
+      x11,
+      x12,
+      x13,
+      x14,
+      x15,
+      x16,
+      x17,
+      x18,
+      x30,
+      memory,
+    }
+    clobber x64 { rcx, rdx, r8, r9, r10, r11, memory }
+  }
+}
+
+export @nosplit fn parkClockSyscall(clock: int, ts: *i64): int {
+  return int(syscall(sysClockGettime(), i64(clock), i64(int(ts))))
+}
+
+// `clock_gettime(clock, ts)`: the vDSO when boot resolved it, the raw syscall
+// otherwise. 0 on success, a negative errno on failure, from either path.
+export @nosplit @symbol("bit_rt_port_park_clock_read") fn parkClockRead(clock: int, ts: *i64): int {
+  let f = vdsoClockFn
+  if (f != 0) {
+    return parkVdsoCall(f, clock, ts)
+  }
+  return parkClockSyscall(clock, ts)
+}
