@@ -2158,8 +2158,9 @@ closes the table and drains its claim-loop count the same fatal-or-zero way,
 and applies every entry's class and heap accounting serially, in the serial
 walk's order, so the heap it leaves is the serial sweep's.
 
-**The mark phase (#5839).** Only when a slot is parked for the open epoch
-(`worldGangHasParked`); otherwise the serial mark runs unchanged. The roots
+**The mark phase (#5839).** Only when a slot is parked for the open epoch or
+an idle worker was woken into the gang (`worldGangHasHelpers`); otherwise the
+serial mark runs unchanged. The roots
 are still pushed serially. The coordinator cuts them into 256-entry segments
 on one global list (`runtime/gc/gcmarkpar.bit`), publishes the phase
 (`gcMkOpen = g`), kicks the gang, and marks alongside every helper that joins.
@@ -2179,6 +2180,18 @@ a helper leaves unconditionally on every path through `worldGangTryHelp`
 (including the raced-close case, which never called `gcGangHelp` at all), so
 the collector stays correct with zero helpers exactly as it did before this
 ticket — nothing about `stwCollect`'s own root scan changed.
+
+**Idle workers are recruited (#5842).** Right after opening the gang, at the
+top of `stwCollect` (`stwGangRecruit`, `runtime/stw/stwstats.bit`), the
+coordinator claims and wakes
+up to 7 parked scheduler workers, never more than `scIdleCount`
+(`schedWakeIdleGang`, `runtime/sched/sleep.bit`). Each leaves its park through
+`gcBlockingEnd` and joins from `worldResumeWhenClear` as a `blocked` slot. A
+`blocked` slot needs no epoch ack to join, because the rendezvous counts it
+stopped for every epoch. A `syscall` slot never joins. A recruit that leaves
+its wait while the gang it joined is still open ends the process
+(`worldGangCheckLeft`, "gc: a gang helper left an open stop"). At
+`BIT_WORKERS=1` nobody is parked, so nothing is woken.
 
 ---
 
