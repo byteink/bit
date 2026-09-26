@@ -105,16 +105,30 @@
 # composite-default disambiguation, so it still explains its own two corpus
 # files under `ast`/`fmt`.
 #
+# #5921-ptrof-string-type was retired by the stage0 0.28.0 repin (#5957):
+# 0.28.0 contains #5921 (`ptrOf(s: string): *u8`), so 0.28.0 is the first
+# oracle that agrees with the tree on the `--dump-types` sites it used to
+# explain. Confirmed by `bash scripts/selfhost-difftypes.sh` against the
+# 0.28.0 pin (this tree at 35599936e, aarch64-macos, the only host this
+# repin was built on): MATCH=1412 MISMATCH=0 EXPLAINED=0, and the script's
+# own RETIRED line named exactly this one signature. `selfhost-diffir.sh`
+# and `selfhost-diffiropt.sh` both report MATCH=963 MISMATCH=0 EXPLAINED=0
+# against the same pin — no `ir`/`iropt` signature was declared going in, so
+# neither RETIRED anything. Its opcode-free line-diff derivation (the
+# ptrofStringType/lastColonSpace functions) is preserved in git history at
+# this file's state before #5957. The `catchDisambigAst`/`catchDisambigFmt`
+# machinery (#5474, #5510) is unaffected: nothing in 0.28.0 touches `catch`
+# composite-default disambiguation.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
 # forks one fresh awk process, so all state below is per-call — no cross-file
 # leakage between corpus files. `ast`/`fmt` compare TEXT (an S-expression
-# dump / formatted source), not IR opcodes; `types` compares `--dump-types`
-# TEXT line-for-line (ptrofStringType, #5921). No signature is currently
-# declared for `ir`/`iropt` (see Retirement history above) — a future
-# lowering change that needs one restores the opcode-COUNT-delta machinery
-# this file carried before #5914, from git history.
+# dump / formatted source), not IR opcodes. No signature is currently
+# declared for `ir`/`iropt`/`types` (see Retirement history above) — a
+# future lowering or typing change that needs one restores the relevant
+# machinery this file carried before #5914/#5957, from git history.
 explainMismatch() {
   awk -v kind="$3" '
     # catchDisambigAst (#5510) -- works on the RAW joined text, string-search
@@ -158,53 +172,6 @@ explainMismatch() {
       plainA = substr(rawA, 1, ia - 1) "@@SLOT@@" substr(rawA, ia + length(blockA))
       plainB = substr(rawB, 1, ib - 1) "@@SLOT@@" substr(rawB, ib + length(blockB))
       return (plainA == plainB)
-    }
-    # ptrofStringType (#5921) -- the `types` row never called explainMismatch
-    # at all until now (selfhost-diffdump.sh only checked `ast`, #5510). The
-    # 0.27.0 pinned oracle still types `ptrOf(s: string)` as `*string` (the
-    # scalar-cell path); this tree made it `*u8` (runtime/ABI.md section 2.3,
-    # the `ptr` word). `--dump-types` output is `LINE:COL: <expr>: <type>` per
-    # line, one line per typed node, same LINE COUNT on both sides (it never
-    # reflows the way `fmt` does) -- so this compares line-for-line, not a raw
-    # substring search the way catchDisambigAst does. A line is accepted only
-    # when its prefix (everything before the LAST ": ") is byte-identical on
-    # both sides and its trailing type is exactly `*string`->`*u8` or
-    # `string`->`u8`; ANY other kind of difference on ANY line -- a changed
-    # prefix, a different type pair, an extra or missing line -- rejects the
-    # whole file, matching catchDisambigFmt: the whole delta must satisfy the
-    # identity. At least one accepted line prefix must literally contain a
-    # `ptrOf(` call (the col-13 line above): the other two lines (the `p`
-    # binding, the `got` dereferenced type) are what is TYPED FROM that call,
-    # never accepted alone with no `ptrOf(` line present.
-    function lastColonSpace(s,    i, n, found) {
-      found = 0
-      n = length(s) - 1
-      for (i = 1; i <= n; i++) {
-        if (substr(s, i, 2) == ": ") { found = i }
-      }
-      return found
-    }
-    function ptrofStringType(nA, linesA, nB, linesB,    i, la, lb, cutA, cutB, pfxA, pfxB, tyA, tyB, diffCount, sawPtrOf) {
-      if (nA != nB || nA == 0) { return 0 }
-      diffCount = 0
-      sawPtrOf = 0
-      for (i = 1; i <= nA; i++) {
-        la = linesA[i]; lb = linesB[i]
-        if (la == lb) { continue }
-        diffCount++
-        cutA = lastColonSpace(la)
-        cutB = lastColonSpace(lb)
-        if (cutA == 0 || cutB == 0) { return 0 }
-        pfxA = substr(la, 1, cutA - 1)
-        tyA = substr(la, cutA + 2)
-        pfxB = substr(lb, 1, cutB - 1)
-        tyB = substr(lb, cutB + 2)
-        if (pfxA != pfxB) { return 0 }
-        if (!((tyA == "*string" && tyB == "*u8") || (tyA == "string" && tyB == "u8"))) { return 0 }
-        if (index(pfxA, "ptrOf(") > 0) { sawPtrOf = 1 }
-      }
-      if (diffCount == 0 || sawPtrOf == 0) { return 0 }
-      return 1
     }
     # catchDisambigFmt (#5510) -- the fmt arm of the same #5474 shape, on
     # formatted SOURCE text instead of an AST dump. The pre-fix oracle formats
@@ -278,12 +245,8 @@ explainMismatch() {
         if (catchDisambigFmt(nA, linesA, nB, linesB)) { print "5474-catch-composite-default-fmt"; exit 0 }
         exit 1
       }
-      if (kind == "types") {
-        if (ptrofStringType(nA, linesA, nB, linesB)) { print "5921-ptrof-string-type"; exit 0 }
-        exit 1
-      }
-      # No `ir`/`iropt` signature is currently declared -- see Retirement
-      # history above.
+      # No `ir`/`iropt`/`types` signature is currently declared -- see
+      # Retirement history above.
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -307,10 +270,10 @@ declaredSignatureNames() {
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
     fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
-    types) printf '%s\n' "5921-ptrof-string-type"; return ;;
+    types) return ;;
     ir) return ;;
     iropt) return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
-    "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" "5921-ptrof-string-type"
+    "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt"
 }
