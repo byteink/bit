@@ -2375,8 +2375,8 @@ hands control to the task (`runtime/sched/workerrun.bit`) — the only call site
 for `preemptStamp` in the tree (`git grep -n preemptStamp -- '*.bit'`).
 
 **THE DISPATCH PATH READS NO CLOCK.** It used to stamp `monoNs()` here.
-On Linux that pins `parkMonoNs` (`runtime/park/linux/wait.bit`), a raw
-`clock_gettime` `svc` rather than a vDSO call, so every green-task dispatch —
+On Linux that pinned `parkMonoNs` (`runtime/park/linux/wait.bit`), then a raw
+`clock_gettime` `svc` (the vDSO read is §18.1, #5959), so every green-task dispatch —
 once per context switch — took a kernel trap: +147 ns/switch, 285 -> 423
 ns/switch on the arm64-linux `test-schedbench` gate. The stamp is now
 `preemptTickNow()`, one atomic load of a word `preempt.bit` owns. The monitor
@@ -3673,6 +3673,61 @@ task already starves its worker).
 `TimerQueue` is an unsorted intrusive list: O(1) insert, and `expire` is one
 bounded pass over the live sleepers. A thousand green threads sleeping 50ms
 finish together, in ~50ms, on one OS thread.
+
+### 18.1 Linux clocks read through the vDSO (#5959)
+
+On Linux both clocks (`bit_rt_time_mono_ns`, `bit_rt_time_unix_ns`, and the
+runtime's own `parkMonoNs`) call `parkClockRead`
+(`runtime/park/linux/vdso.bit`): the kernel vDSO's `clock_gettime` when boot
+resolved it, the raw syscall otherwise. Measured on hl-master (x86_64, kernel
+7.0.14): 1015-1030 ns per `std/time` clock read through the syscall,
+26-34 ns through the vDSO; the pkg/web bench server made 8087
+`clock_gettime` syscalls over 2001 requests before, and none after.
+
+**Resolution.** `boot` step 3b calls `parkVdsoInit` once, before any other
+thread is cloned, so its one write to `vdsoClockFn` is ordered before every
+reader by the clone itself. It reads `AT_SYSINFO_EHDR` (33) through
+`getauxval` (§19) and looks up `__vdso_clock_gettime`@`LINUX_2.6` (x86_64) or
+`__kernel_clock_gettime`@`LINUX_2.6.39` (aarch64) by walking the image's
+program headers, `PT_DYNAMIC`, `DT_SYMTAB`/`DT_STRTAB`, the symbol count from
+`DT_HASH` or `DT_GNU_HASH`, and `DT_VERSYM`/`DT_VERDEF` when both are present.
+Every loop is bounded by the ELF's own count and by a fixed ceiling, and every
+table address is checked against the image's extent (its first `PT_LOAD`) and
+for alignment before it is read. Any failure answers 0 and keeps the syscall.
+`BIT_VDSO=0` (or `off`) skips the lookup. `_tests_/stress/vdsolinux` prints the
+lookup's reason code, so a lookup that stops resolving turns the test red
+instead of making the clock quietly slower.
+
+**The call.** `parkVdsoCall` is an `asm` `call rax` / `blr x9` with every C
+caller-saved GPR declared clobbered, the `taskInvoke` shape, admitted in
+`@nosplit` code by SPEC §10.3.1's `asm` rule: it neither allocates nor reaches a
+safepoint. The vDSO's C ABI preserves a superset of the registers Bit's callers
+rely on (x64 SysV keeps rbx, rbp, r12..r15; Bit keeps rbx, r13..r15. AAPCS64
+keeps x19..x28 and the low halves of v8..v15, which is exactly Bit's set), so the
+call destroys only registers every Bit call already treats as dead. Every Bit
+prologue leaves rsp 16-byte aligned at the `call` (read back from the
+x86_64-linux archive), and the declared x30 clobber keeps the arm64 frame's
+return address (#3915).
+
+**Stack.** The vDSO runs on the caller's stack. Go switches to the system stack
+for this call because a goroutine stack can be 2 KiB and a hardened kernel's
+vDSO can probe about a page (golang/go#20427). Bit has no small stacks: a task
+stack is 256 KiB (`schedStackBytes`) and worker, sysmon and `main` stacks are
+larger. No Bit frame checks its depth either, so the vDSO frame is one more leaf
+frame, and it is small: 6 pushes and two leaf calls, at most 72 bytes, on the
+hl-master x86_64 kernel; none at all on the aarch64 linuxkit 7.0.12 kernel
+(both read from the running kernels' images).
+
+**Signals.** The Linux runtime has no preemption signal: preemption is a flag
+polled at safepoints (§9), and the collector's stop-the-world waits for each
+mutator to reach a safepoint too. A thread inside the vDSO is inside a
+`@nosplit` function, so it is "running" to both and returns within
+nanoseconds, exactly as it did from the syscall. The handlers that can land
+there are SIGSEGV/SIGBUS/SIGILL/SIGTRAP, which run on the alternate stack and do
+not return, and SIGTERM/SIGINT, which run below the interrupted frame and exit.
+None of them reads the vDSO's state or calls it. The vDSO itself is
+async-signal-safe: it reads the kernel's data page under a sequence count and
+retries on a torn read, with no lock to hold across an interruption.
 
 ---
 
