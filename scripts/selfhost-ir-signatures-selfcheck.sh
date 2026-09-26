@@ -23,10 +23,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # #5521-void-return-bare-ret and #5486-variant-payload-redundant-read-elim
   # were RETIRED by the stage0 0.20.0 repin (#5607). #5870, #5871 (both
   # arms), #5874, #5876, #5895, #5905, #5906 and #5910 were RETIRED by the
-  # stage0 0.27.0 repin (#5914). Their shaped-delta fixtures lived in this
+  # stage0 0.27.0 repin (#5914). #5921-ptrof-string-type was RETIRED by the
+  # stage0 0.28.0 repin (#5957). Their shaped-delta fixtures lived in this
   # self-check; removed with the arms they tested rather than kept as tests
   # for identities that no longer exist. Git history at this file's state
-  # before #5914 has them, and scripts/selfhost-ir-signatures.sh's own
+  # before #5914/#5957 has them, and scripts/selfhost-ir-signatures.sh's own
   # header records why each went dead.
 
   # An unrelated opcode-shaped delta must NOT be explained by anything
@@ -156,71 +157,15 @@ fn main() {
     fail=1
   fi
 
-  # --- #5921: ptrOf(string) type-dump signature ---
-  #
-  # Real `--dump-types` text (captured against the 0.27.0 pin and this tree,
-  # `_tests_/cases/run_ptrof_string.bit`): the oracle still types
-  # `ptrOf(s: string)` as `*string` (scalar-cell path); this tree types it
-  # `*u8` (runtime/ABI.md section 2.3's `ptr` word). Three lines differ: the
-  # `ptrOf(s)` call itself, the `p` binding it feeds, and `got`'s dereferenced
-  # type.
-  oracle_ptrof_types='15:7: i: i64
-16:14: len(s): i64
-17:9: want: u8
-18:9: p: *string
-18:13: ptrOf(s): *string
-19:9: got: string
-21:7: panic("boom"): ()'
-  bit2_ptrof_types='15:7: i: i64
-16:14: len(s): i64
-17:9: want: u8
-18:9: p: *u8
-18:13: ptrOf(s): *u8
-19:9: got: u8
-21:7: panic("boom"): ()'
-
-  sigpt=$(explainMismatch "$oracle_ptrof_types" "$bit2_ptrof_types" types)
-  rcpt=$?
-  if [ "$rcpt" -ne 0 ] || [ "$sigpt" != "5921-ptrof-string-type" ]; then
-    echo "FAIL: the real #5921 types delta was not explained (rc=$rcpt sig='$sigpt')"
-    fail=1
-  fi
-
-  # REJECTION: an unrelated type change (not *string->*u8 or string->u8) must
-  # not be explained by coincidence.
+  # REJECTION: no signature is currently declared for `types` (#5921 was
+  # retired by the stage0 0.28.0 repin, #5957) -- an unrelated type change
+  # must not be explained by coincidence, and neither must a real one.
   oracle_unrelated_type='10:5: x: int'
   bit2_unrelated_type='10:5: x: float'
   sigut=$(explainMismatch "$oracle_unrelated_type" "$bit2_unrelated_type" types)
   rcut=$?
   if [ "$rcut" -eq 0 ] || [ -n "$sigut" ]; then
     echo "FAIL: an unrelated types delta was wrongly explained (rc=$rcut sig='$sigut')"
-    fail=1
-  fi
-
-  # REJECTION: the real #5921 delta PLUS one extra, unrelated changed line
-  # (a mutation-test shape: a matcher loosened to ignore extra lines would
-  # wrongly explain this). A signature is an identity the WHOLE delta must
-  # satisfy, same rule catchDisambigFmt's rejection case above proves.
-  bit2_ptrof_types_plus='15:7: i: i32
-16:14: len(s): i64
-17:9: want: u8
-18:9: p: *u8
-18:13: ptrOf(s): *u8
-19:9: got: u8
-21:7: panic("boom"): ()'
-  sigptp=$(explainMismatch "$oracle_ptrof_types" "$bit2_ptrof_types_plus" types)
-  rcptp=$?
-  if [ "$rcptp" -eq 0 ] || [ -n "$sigptp" ]; then
-    echo "FAIL: a #5921 types delta carrying an unrelated line change was wrongly explained (rc=$rcptp sig='$sigptp')"
-    fail=1
-  fi
-
-  # REJECTION: the identical two texts scored under `ir` (the wrong kind)
-  # must not be explained -- ptrofStringType only ever runs when kind=="types".
-  sigptk=$(explainMismatch "$oracle_ptrof_types" "$bit2_ptrof_types" ir)
-  rcptk=$?
-  if [ "$rcptk" -eq 0 ] || [ -n "$sigptk" ]; then
-    echo "FAIL: a #5921 types delta was wrongly explained under kind=ir (rc=$rcptk sig='$sigptk')"
     fail=1
   fi
 
