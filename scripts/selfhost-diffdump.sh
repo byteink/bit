@@ -90,6 +90,13 @@ diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
+# #5962: only ir/iropt lower differently under `strReuseEnabled()`
+# (compiler/lowerexplodestr.bit). Tree default is on since 0.28.0; ORACLE
+# (0.28.0) still defaults off, so force "1" on both sides here -- the one
+# place they share an environment -- to compare ON against ON. Remove this
+# export, and the flag itself, at the 0.29.0 repin.
+[ "$KIND" = ir ] && export BIT_STR_REUSE=1
+
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.
 whydied() {

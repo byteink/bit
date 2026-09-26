@@ -28,6 +28,11 @@ set -uo pipefail
 # instead of two compilers.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
+# #5962: same reasoning as selfhost-diffdump.sh's identical export -- the
+# 0.28.0 ORACLE above defaults `strReuseEnabled()` off, the tree now defaults
+# it on, and this is the one place both invocations share their environment.
+# Remove this export, and the flag itself, at the 0.29.0 repin.
+export BIT_STR_REUSE=1
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
 # 21.86s on the oracle), so a busy box turned a clean run red with no divergence
