@@ -127,8 +127,8 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
 // (`worldWaitForStop` below, `./gcstopwait.bit`) and was accepted on cycles
 // rather than on instructions.
 // The helper-gang join attempt (#5837), one turn of `worldResumeWhenClear`'s
-// own wait loop, for the parked mutator in `slot`, which `gcGangHelp` gets so a
-// mark helper can keep its state per slot (#5839).
+// own wait loop, for the slot `slot` waiting as `waiting`, which `gcGangHelp`
+// gets so a mark helper can keep its state per slot (#5839).
 //
 // GATED ON THE EPOCH, NOT ON "OPEN" ALONE. A gang open for an epoch this slot
 // has not acknowledged is not one it may join — the same reason
@@ -136,6 +136,14 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
 // trusting a bare stop flag: a straggler still parked FOR an older stop must
 // not be counted into (or, here, do work for) a newer one it was never
 // admitted to.
+//
+// A `blocked` slot joins any open epoch (#5842). It has no ack because it
+// needs none: `worldStoppedFor` counts it stopped for every epoch, it holds no
+// Bit reference by contract, and it stays `blocked` for as long as this loop
+// runs, which is until the stop clears. That is how an idle worker woken by
+// the coordinator (`stwGangRecruit`, ../stw/stwstats.bit) helps: it never runs a
+// task while `worldStopWord != 0`. `syscall` never joins: its stack and saved
+// registers are a root the collection is scanning.
 //
 // THE RE-CHECK AFTER THE ADD IS WHAT #5837 MEANS BY "HANDLE A HELPER THAT
 // RACES THE CLOSE". `worldGangClose` stores 0 into `worldGangWord` BEFORE it
@@ -148,10 +156,12 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
 // coordinator's store-then-load in `worldGangClose` the same way every other
 // Dekker pair in this file does, so a helper that still sees the old epoch
 // here is guaranteed the coordinator's own wait has not yet returned.
-@nosplit fn worldGangTryHelp(world: *i64, slot: int) {
-  let m = wMut(world, slot)
+@nosplit fn worldGangTryHelp(world: *i64, slot: int, waiting: int) {
   let e = atomicLoad(world + worldGangWord)
-  if (e == 0 || e != atomicLoad(m + muAcked)) {
+  if (e == 0) {
+    return
+  }
+  if (waiting == mParked && e != atomicLoad(wMut(world, slot) + muAcked)) {
     return
   }
   let _ = atomicAdd(world + worldGangIn, 1)
@@ -161,6 +171,9 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
     // past. `gcGangHelp` never ran, so there is nothing else to unwind.
     let _ = atomicAdd(world + worldGangIn, 0 - 1)
     return
+  }
+  if (waiting == mBlocked) {
+    atomicStore(ptrOf(gcGangBlockedEpoch) + slot, e) // `worldGangCheckLeft`
   }
   // `g` is the collector block the coordinator published in `worldGangOpen`,
   // below, before it opened the gang for `e`. Bounded work (#5838).
@@ -203,14 +216,13 @@ export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") fn worldStopReque
       if (!worldMustStayPut(world, slot, waiting)) {
         break
       }
-      // #5837: only a `parked` slot has an ack to match a gang epoch against
-      // — `blocked`/`syscall` pass without one (see `worldMustStayPut`'s own
-      // header) and so can never legally join. Tried every turn, including
-      // during the busy-spin burst above the sleep, so a mutator that parks
-      // into an already-open gang helps at once rather than waiting out a
-      // full burst first.
-      if (waiting == mParked) {
-        worldGangTryHelp(world, slot)
+      // #5837/#5842: a `parked` or `blocked` slot joins an open gang; a
+      // `syscall` slot never does (`worldGangTryHelp`'s header). Tried every
+      // turn, including during the busy-spin burst above the sleep, so a
+      // thread that waits into an already-open gang helps at once rather
+      // than waiting out a full burst first.
+      if (waiting != mSyscall) {
+        worldGangTryHelp(world, slot, waiting)
       }
       spins = spins + 1
       if (spins >= stwSpinBurst) {
@@ -283,7 +295,46 @@ export @nosplit @symbol("bit_rt_port_gc_world_end_blocking") fn worldEndBlocking
   slot: int,
 ) {
   worldResumeWhenClear(world, slot, mBlocked)
+  worldGangCheckLeft(world, slot)
 }
+
+// The epoch of the last gang each slot joined while `blocked` (#5842),
+// indexed by slot (`maxMutators` words). Written by the slot's own thread in
+// `worldGangTryHelp`, read by it in `worldGangCheckLeft`.
+let gcGangBlockedEpoch: [256]i64
+
+// A slot that joined a gang while `blocked` has left its wait. That is legal
+// only once the stop cleared, and the gang closes before that
+// (`worldGangClose` runs before `worldRestart`), so the gang it joined can no
+// longer be open. Still open means this thread is about to run tasks while
+// the world is stopped: end the process (#5842).
+//
+// THE CHECK SITS OUTSIDE `worldResumeWhenClear` ON PURPOSE. A defect in that
+// loop that let a recruited worker out early changed no program's output:
+// measured, `maprace` and every `_tests_/stress/parallel` program passed
+// under it. A new gang cannot open before this load either, because this
+// slot now reads `running` and no rendezvous passes it.
+@nosplit fn worldGangCheckLeft(world: *i64, slot: int) {
+  let e = atomicLoad(world + worldGangWord)
+  if (e == 0 || atomicLoad(ptrOf(gcGangBlockedEpoch) + slot) != e) {
+    return
+  }
+  let msg = worldFatalHead(worldGangLeftMsgLen)
+  *(msg + 2) = worldGangLeftMsgWord0
+  *(msg + 3) = worldGangLeftMsgWord1
+  *(msg + 4) = worldGangLeftMsgWord2
+  *(msg + 5) = worldGangLeftMsgWord3
+  *(msg + 6) = worldGangLeftMsgWord4
+  bit_rt_fatal(int(msg))
+}
+
+// "gc: a gang helper left an open stop" (35), packed as `worldDrainMsg` is.
+const worldGangLeftMsgWord0: int = 7018614145804821351
+const worldGangLeftMsgWord1: int = 7309461378016765806
+const worldGangLeftMsgWord2: int = 6998721804070822002
+const worldGangLeftMsgWord3: int = 8295751895573536878
+const worldGangLeftMsgWord4: int = 7368564
+const worldGangLeftMsgLen: int = 35
 
 // ---------------------------------------------------------------------------
 // The `syscall` contract — `World.beginSyscall` / `endSyscall` (#1904)
@@ -576,16 +627,30 @@ let gcGangWorld: i64 = 0
   let _ = bit_rt_port_gc_world_stop_wake(world + worldStopWord)
 }
 
-// True when the gang is open on `g` and some slot is parked for its epoch,
-// so a helper can join (#5839: the parallel mark runs only then, and a
-// collection with nobody to help keeps the serial mark). A slot parked for
-// an older stop cannot join (`worldGangTryHelp`), so it does not count.
-@nosplit fn worldGangHasParked(g: *i64): bool {
+// How many idle workers the coordinator woke into the gang open now
+// (`stwGangRecruit`, ../stw/stwstats.bit, #5842). Written only by the
+// coordinator, under the world lock, and cleared by `worldGangClose`.
+let gcGangWoken: i64 = 0
+
+// Record that `n` idle workers were just woken into the open gang.
+export @nosplit @symbol("bit_rt_port_gc_world_gang_recruited") fn worldGangRecruited(n: int) {
+  atomicStore(ptrOf(gcGangWoken), n)
+}
+
+// True when the gang is open on `g` and a helper is on its way: some slot is
+// parked for its epoch (#5839), or an idle worker was woken into it (#5842).
+// The parallel mark runs only then; a collection with nobody to help keeps
+// the serial mark. A slot parked for an older stop cannot join
+// (`worldGangTryHelp`), so it does not count.
+@nosplit fn worldGangHasHelpers(g: *i64): bool {
   let world = wordAt(atomicLoad(ptrOf(gcGangWorld)))
   if (world == nil || atomicLoad(ptrOf(gcGangBlock)) != int(g)) {
     return false
   }
   let e = atomicLoad(world + worldGangWord)
+  if (e != 0 && atomicLoad(ptrOf(gcGangWoken)) > 0) {
+    return true
+  }
   let slot = 0
   while (e != 0 && slot < maxMutators) { // bounded: maxMutators slots
     let m = wMut(world, slot)
@@ -679,15 +744,23 @@ let worldDrainMsg: [7]i64
 // about to run past. NEVER RETURNS. Also the parallel sweep's own check that
 // every span it applies was swept (`gcSwApply`, ./gcsweeppar.bit).
 @nosplit fn worldHelperFatal() {
-  let msg: *i64 = ptrOf(worldDrainMsg)
-  *msg = int(msg) + 16
-  *(msg + 1) = worldDrainMsgLen
+  let msg = worldFatalHead(worldDrainMsgLen)
   *(msg + 2) = worldDrainMsgWord0
   *(msg + 3) = worldDrainMsgWord1
   *(msg + 4) = worldDrainMsgWord2
   *(msg + 5) = worldDrainMsgWord3
   *(msg + 6) = worldDrainMsgWord4
   bit_rt_fatal(int(msg))
+}
+
+// The string header of a fatal message `len` bytes long, in `worldDrainMsg`,
+// whose five remaining words the caller fills with the packed text. One
+// buffer serves every message: the process ends on the first.
+@nosplit fn worldFatalHead(len: int): *i64 {
+  let msg: *i64 = ptrOf(worldDrainMsg)
+  *msg = int(msg) + 16
+  *(msg + 1) = len
+  return msg
 }
 
 // Close the helper gang and wait for every joined helper to leave, before the
@@ -703,5 +776,6 @@ let worldDrainMsg: [7]i64
 // drain either reads 0 or ends the process (`worldDrainOrDie`).
 export @nosplit @symbol("bit_rt_port_gc_world_gang_close") fn worldGangClose(world: *i64) {
   atomicStore(world + worldGangWord, 0)
+  atomicStore(ptrOf(gcGangWoken), 0)
   worldDrainOrDie(world + worldGangIn)
 }
