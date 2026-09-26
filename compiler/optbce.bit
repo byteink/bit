@@ -64,6 +64,15 @@
 // `b == h` is excluded and the exclusion is load-bearing: an `icmp_ult` sitting
 // in the header runs BEFORE its own `br` tests anything.
 //
+// `T` ITSELF MUST HAVE ONE PREDECESSOR. "`!viaF[b]` puts `T` on every path in"
+// only holds if the ONLY way to reach `T` is `h`'s true edge: `bceReachAvoiding`
+// stops the walk AT `T` (it is `stopB`), so a second predecessor of `T` reached
+// from the false side is never explored past `T` and everything behind `T`
+// reads as `!viaF`, safe, even on the path that entered through that second
+// edge without the test ever holding. `lowerWhile` always gives `T` one
+// predecessor today; `bceProveHeader` checks it and refuses the header rather
+// than trusting the lowering to keep it that way (#5896).
+//
 // EXACT VALUE IDS, not equal expressions. Two `slice_len` reads of the same
 // base are the same value only if nothing between them can move `len`, and
 // `bit_rt_slice_append` mutates a header in place. The first fold round leaves
@@ -407,6 +416,11 @@ fn bceHeaderTest(ctx: TypeContext, f: IrFunc, h: int): int {
   return term.lhs
 }
 
+// The number of predecessor edges into block `b`.
+fn bcePredCount(pm: PredMap, b: int): int {
+  return pm.start[b + 1] - pm.start[b]
+}
+
 // One candidate header. Marks nothing unless every refusal above passes.
 fn bceProveHeader(fc: BceFn, h: int) {
   let ctx = fc.ctx
@@ -422,6 +436,13 @@ fn bceProveHeader(fc: BceFn, h: int) {
     return
   }
   let term = f.instrs[bceTerminator(f, h)]
+  // #5896: MARKING's soundness needs `T` reachable only through `h`'s true
+  // edge. `lowerWhile` always gives it one predecessor; refuse the header
+  // outright rather than trust that, so a future lowering change that ever
+  // gives `T` a second one loses precision here instead of a bounds check.
+  if (bcePredCount(fc.pm, term.ival) != 1) {
+    return
+  }
   let lp = BceLoop{
     f = f, known = known, pm = fc.pm, owner = fc.owner, h = h, k = k, iv = cmp.lhs,
     viaF = bceReachAvoiding(f, term.ival2, h, term.ival),
@@ -471,4 +492,110 @@ fn bceHasCandidate(ctx: TypeContext, f: IrFunc): bool {
     h = h + 1
   }
   return false
+}
+
+// #5896, in-Bit self-check (ircheck.bit's and x64dispatchcheck.bit's
+// pattern): `lowerWhile` never gives a true-entry block two predecessors, so
+// Bit source cannot produce this shape — the fixture is IR ints, built by
+// hand.
+//
+// One header `h` (block 1): `br icmp_slt(%iv, %lim), T, F`. `T` (block 2)
+// carries the guarded `icmp_ult(%iv, %lim)` and is also the back edge (it
+// loops to `h`), so it is a real loop body, not a dead block. `F` (block 3)
+// jumps to `P` (block 4), and `P` jumps into `T` too: `T`'s real
+// predecessors are `h`'s true edge AND `P`, entered from the FALSE side — a
+// path through `P` never made the test hold.
+fn bceMultiPredTrueEntryFunc(ctx: TypeContext, i64t: int, boolT: int): IrFunc {
+  let seed = mkInstr(Op.ConstInt, i64t) // 0: iv seed, 0
+  seed.ival = 0
+  let lim = mkInstr(Op.ConstInt, i64t) // 1: lim, 100
+  lim.ival = 100
+  let toHeader = mkInstr(Op.Jump, ctx.voidId) // 2: b0 -> h, passes iv=0
+  toHeader.ival = 1
+  toHeader.args = [0]
+
+  let iv = mkInstr(Op.BlockParam, i64t) // 3: h's only param
+  let test = mkInstr(Op.ICmpSlt, boolT) // 4: icmp_slt(iv, lim)
+  test.lhs = 3
+  test.rhs = 1
+  let br = mkInstr(Op.Br, ctx.voidId) // 5: br test, T=2, F=3
+  br.lhs = 4
+  br.ival = 2
+  br.ival2 = 3
+
+  let one = mkInstr(Op.ConstInt, i64t) // 6: step constant, 1
+  one.ival = 1
+  let check = mkInstr(Op.ICmpUlt, boolT) // 7: the guarded check
+  check.lhs = 3
+  check.rhs = 1
+  let step = mkInstr(Op.Add, i64t) // 8: iv + 1
+  step.lhs = 3
+  step.rhs = 6
+  let backEdge = mkInstr(Op.Jump, ctx.voidId) // 9: T -> h, passes iv+1
+  backEdge.ival = 1
+  backEdge.args = [8]
+
+  let toP = mkInstr(Op.Jump, ctx.voidId) // 10: F -> P
+  toP.ival = 4
+  let toT = mkInstr(Op.Jump, ctx.voidId) // 11: P -> T, T's SECOND predecessor
+  toT.ival = 2
+
+  return IrFunc{
+    name = "multiPredTrueEntry", paramTypes = []int(0), result = i64t,
+    blocks = [
+      IrBlock{ instsStart = 0, paramCount = 0, instsLen = 3 },
+      IrBlock{ instsStart = 3, paramCount = 1, instsLen = 3 },
+      IrBlock{ instsStart = 6, paramCount = 0, instsLen = 4 },
+      IrBlock{ instsStart = 10, paramCount = 0, instsLen = 1 },
+      IrBlock{ instsStart = 11, paramCount = 0, instsLen = 1 },
+    ],
+    instrs = [seed, lim, toHeader, iv, test, br, one, check, step, backEdge, toP, toT],
+    isFallible = false,
+  }
+}
+
+// Every value id unknown except the base-case seed (0, at id 0) and the
+// step's `+1` constant (at id 6) — the two `bceIsNonNegConst`/`bceIsOne`
+// need to accept the header's non-negativity proof at all. Fresh each call:
+// `proveInductionBounds` mutates its `known` argument in place.
+fn bceMultiPredTrueEntryKnown(): []ConstVal {
+  return [
+    intConst(0), noConst(), noConst(), noConst(), noConst(), noConst(),
+    intConst(1), noConst(), noConst(), noConst(), noConst(), noConst(),
+  ]
+}
+
+// The guard, wired in: through the real entry point, `T`'s second
+// predecessor (`P`, reached from `F`) refuses the header and the check at
+// block 2 (id 7) stays live.
+//
+// THE MUTATION, without a second selfhost build: `bceMarkProven` is exactly
+// what `bceProveHeader` calls the instruction after the guard above; calling
+// it directly on the same `lp`, skipping straight past where the guard would
+// sit, reproduces "the guard deleted" using the real function, not a
+// reimplementation. `bceIndexNonNegative(lp)` is asserted true first so the
+// only thing that can be suppressing the mark is the guard being bypassed,
+// not some other refusal.
+fn checkBceRefusesTrueEntryWithTwoPredecessors() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let boolT = primType(ctx, 10)
+  let f = bceMultiPredTrueEntryFunc(ctx, i64t, boolT)
+
+  let known = bceMultiPredTrueEntryKnown()
+  proveInductionBounds(ctx, f, known)
+  assert(!known[7].known, "T has two predecessors: the icmp_ult must stay")
+
+  let known2 = bceMultiPredTrueEntryKnown()
+  let term = f.instrs[bceTerminator(f, 1)]
+  let lp = BceLoop{
+    f = f, known = known2, pm = licmPredMap(f), owner = licmOwners(f),
+    h = 1, k = 0, iv = 3, viaF = bceReachAvoiding(f, term.ival2, 1, term.ival),
+  }
+  assert(bceIndexNonNegative(lp), "fixture must still admit the base+step induction proof")
+  bceMarkProven(lp, 1)
+  assert(
+    known2[7].known,
+    "without the guard, T's second predecessor is invisible and the check is lost",
+  )
 }
