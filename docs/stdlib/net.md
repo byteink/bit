@@ -93,6 +93,37 @@ bounded exactly like `writeDeadline`, and it fails with the same "write
 timed out" message. A short write is retried internally, so on success this
 wrote every byte.
 
+### `Conn.writeBytes(b: []byte): ()!`
+
+Like `write`, but takes bytes instead of a `string` - the pair `write` and
+`writeDeadline` already are for reads, this is the byte-taking sibling of
+both, bounded by the connection's deadline exactly like `writeDeadline`
+whether or not one is set. Use it when the bytes are already a `[]byte` -
+building a wire message straight into one, say - so writing them never
+allocates a `string` just to throw it away at the socket.
+
+```bit
+import { listen, Listener, Conn } from "std/net"
+
+// Frame `body` as "<n>\r\n<body>" and write it straight from the `[]byte`
+// that framing built, no `string(...)` in between.
+fn writeFramed(c: Conn, body: []byte): ()! {
+  let head = "${len(body)}\r\n"
+  let w = []byte(len(head) + len(body))
+  let i = 0
+  while (i < len(head)) {
+    w[i] = head[i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(body)) {
+    w[len(head) + j] = body[j]
+    j = j + 1
+  }
+  c.writeBytes(w)?
+}
+```
+
 ### `Conn.readAll(): string`
 
 Reads until the peer closes and returns everything. Only safe against a peer that
