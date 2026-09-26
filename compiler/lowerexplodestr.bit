@@ -73,6 +73,17 @@ fn stringExplodeEnabled(freestanding: bool): bool {
   return envOr("BIT_STRING_EXPLODE", "") != "0" && !freestanding
 }
 
+// Whether the #5946-#5948 string-reuse stack is on for this process: #5946's
+// `boxWordsAreParam` admission (optstrbox.bit), #5947's own-handle word 2 in
+// `callArgWords` below, and #5948's one-hop base in `strRecvBase`
+// (lowerreslice.bit). Default OFF (#5954) — the stack changes IR on ~400
+// corpus files against the pinned stage0 0.27.0, so it lands dark until the
+// 0.28.0 repin flips the default; this predicate and every site it gates is
+// deleted one release after that. TEMPORARY, unlike `stringExplodeEnabled`.
+fn strReuseEnabled(): bool {
+  return envOr("BIT_STR_REUSE", "") == "1"
+}
+
 // The three word types a boxed `string` explodes into: `ptr`/`len` at +0/+8
 // (untraced `i64`, ABI.md §2.3), `base` at +16 typed `string` itself — the
 // same IR type `emitInlineStringSlice`'s own `field_set` gives that offset,
@@ -364,12 +375,13 @@ fn isFreshBox(b: IrBuilder, v: int): bool {
 
 // Whether `v` is a word of a CALL's result (#4405's `Op.CallWord` run).
 //
-// This is the ONE provenance under which word 2 can be the callee's
-// originating handle rather than an owner base: `explodedRetWordValues` puts
-// the handle there, and only a `ret` produces it. Every other exploded
-// aggregate's word 2 — `emitInlineStringSlice`'s box for `s[lo:hi]`, an
-// exploded parameter's incoming base word, a block parameter threaded through
-// a loop — is a base, where the reuse test can never match.
+// This is the one provenance, inside a body, under which word 2 can be the
+// callee's originating handle rather than an owner base: `handleWordValues`
+// puts the handle there at a `ret`. `emitInlineStringSlice`'s box for
+// `s[lo:hi]` holds its receiver's base, where the reuse test can never match
+// a proper substring. An exploded parameter's word 2, and a block parameter
+// forwarding it, is the caller's handle whenever the caller held one (#5947);
+// `reuseStringBoxes` (optstrbox.bit) admits that case, not this predicate.
 //
 // Structural and bounds-guarded like `isFreshBox`, and it can only
 // UNDER-report: a false answer keeps today's IR exactly.
@@ -430,11 +442,12 @@ fn isCallResultWord(b: IrBuilder, v: int): bool {
 // a backend null-guards that load at all.
 // ===========================================================================
 
-// The values a `return` hands back for a result of type `ty` occupying
-// `words`, given the whole aggregate `v`.
+// The values a `return` hands back, or a call ARGUMENT hands over
+// (`callArgWords`), for a value of type `ty` occupying `words`, given the
+// whole aggregate `v`.
 //
-// For a `string` this is `{v.ptr, v.len, v}` — word 2 is the RETURNED HANDLE
-// itself rather than `field_get v[16]`. `v` is a legal `base`: `strInitView`
+// For a `string` this is `{v.ptr, v.len, v}` — word 2 is the HANDLE itself
+// rather than `field_get v[16]`. `v` is a legal `base`: `strInitView`
 // (runtime/root/root.bit) stores the IMMEDIATE SOURCE and never `base(src)`,
 // and `emitInlineStringSlice` (lowerreslice.bit) already stores the receiver
 // HANDLE when the receiver is one (`strRecvBase`). So this makes the exploded
@@ -455,12 +468,13 @@ fn isCallResultWord(b: IrBuilder, v: int): bool {
 // tuple `(i64, i64, string)` the SAME three word types a `string` gets, so a
 // rule keyed on `words[2] == string` would put the tuple's own handle in its
 // third word and hand callers a `string` that is really the tuple — #4412's
-// shape. `ty` is what `explodedRetWords` derived the words from.
-fn explodedRetWordValues(fc: FnCtx, ty: int, v: int, words: []int): []int {
-  if (ty != primType(fc.c.ctx, 11) || len(words) != 3 || isFreshBox(fc.b, v)) {
-    return emitWordReads(fc.c.ctx, fc.b, v, words)
+// shape. `ty` is what `explodedRetWords` and `explodedArgWords` derived the
+// words from.
+fn handleWordValues(ctx: TypeContext, b: IrBuilder, ty: int, v: int, words: []int): []int {
+  if (ty != primType(ctx, 11) || len(words) != 3 || isFreshBox(b, v)) {
+    return emitWordReads(ctx, b, v, words)
   }
-  let ids = emitWordReads(fc.c.ctx, fc.b, v, [words[0], words[1]])
+  let ids = emitWordReads(ctx, b, v, [words[0], words[1]])
   return [ids[0], ids[1], v]
 }
 
@@ -613,13 +627,37 @@ fn freshStringBoxWords(b: IrBuilder, v: int): []int {
 // values are defined before the box, so they dominate every use the box does.
 // Scoped to `string` by its type because `freshStringBoxWords` would also
 // accept a three-word tuple box, and a tuple is live with the gate off.
+//
+// #5947: ANY OTHER `string` ARGUMENT PASSES ITS OWN HANDLE AS WORD 2, through
+// `handleWordValues`, the rule a `return` already follows. `field_get v[16]`
+// was 0 for a literal and the source for a view, so the callee's reuse test
+// (#5946, optstrbox.bit) could match only a fresh heap string; `v` itself
+// matches whenever the callee stores the parameter unchanged. `v` is a legal
+// word 2 for the reasons `handleWordValues` gives: `v` is a base pointer or
+// null, as §3 requires of a traced word, and a literal's static header is one
+// `gcOwns` rejects, which is how a literal stored in a field is already
+// scanned; the GC reaches `v.base` through `v`, so `ptr`'s bytes stay rooted,
+// and `recordWordKeepAlive` holds `v` to the call. A callee that reslices the
+// parameter stores `v.base`, not `v` (`strRecvBase`, #5948), so the view
+// does not retain `v`'s 24-byte header.
+//
+// GATED BY `strReuseEnabled()` (#5954). Off, this falls back to
+// `emitWordReads` over the full `words` list — `field_get val[0]/[8]/[16]`,
+// the same three reads `explodeValueWords` (lowerkeepalive.bit) does, so main
+// 8e724862f's IR is reproduced exactly; `recordWordKeepAlive` below still
+// covers them, matching `explodeValueWords`' own pairing.
 fn callArgWords(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []int {
-  if (b.instrs[val].ty != primType(ctx, 11)) {
-    return explodeValueWords(ctx, b, val, words)
+  let ty = b.instrs[val].ty
+  let ws = []int(0)
+  if (ty == primType(ctx, 11)) {
+    ws = freshStringBoxWords(b, val)
   }
-  let ws = freshStringBoxWords(b, val)
   if (len(ws) != len(words)) {
-    return explodeValueWords(ctx, b, val, words)
+    if (strReuseEnabled()) {
+      ws = handleWordValues(ctx, b, ty, val, words)
+    } else {
+      ws = emitWordReads(ctx, b, val, words)
+    }
   }
   recordWordKeepAlive(ctx, b, words, ws)
   return ws

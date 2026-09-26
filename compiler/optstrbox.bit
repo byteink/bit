@@ -72,7 +72,7 @@
 // `w1` are `field_get v[0]` and `field_get v[8]` hands back a handle that
 // denotes its own bytes, so the caller's test succeeds — always, except on a
 // null handle, where the `!= nil` arm allocates as it does today.
-// `explodedRetWordValues`'s fresh-box guard is what makes the two shapes
+// `handleWordValues`'s fresh-box guard is what makes the two shapes
 // distinguishable at all: `return xs[i]` gives `ret field_get %v[0],
 // field_get %v[8], %v` and `return s[lo:hi]` gives `ret add %p, %lo, ...`.
 //
@@ -80,6 +80,17 @@
 // caller: once `inlineCalls` has substituted the callee's returned values
 // there is no `Op.Call` left to ask, only `field_get %a[0]`/`field_get %a[8]`
 // and the re-box — see `boxWordsAreOwnHandle` below.
+//
+// #5946 ADDED THE THIRD: the box's words are one exploded `string` parameter's
+// own incoming words, unchanged — `Res{bodyText = body}`, or `return target,
+// ""` over the return-register budget. Unlike the first two it is NOT
+// success-by-construction: `callArgWords` passes a caller's HANDLE as word 2
+// (#5947), so the test succeeds for a literal, a view or a heap string the
+// caller already held, and takes the allocate edge for a view the caller
+// built at the call (`s[lo:hi]` as the argument), whose box passes its stored
+// words and so its source as word 2. `paramfield`, `paramhandle` and
+// `paramsubfield` in _tests_/bit/stringexplode are the sides; the bench/
+// tables on #5946 and #5947 are what admitted it.
 //
 // ## Gated ON for every real build
 //
@@ -236,10 +247,68 @@ fn boxWordsAreOwnHandle(f: IrFunc, w0: int, w1: int, w2: int): bool {
   return loadsFieldOf(f, w0, w2, 0) && loadsFieldOf(f, w1, w2, 8)
 }
 
+// `fs.f`'s block-parameter representative map, built on first use. A function
+// with no candidate box whose word 0 is a block parameter never pays for it.
+fn strBoxRepOf(fs: StrBoxFn): []int {
+  if (len(fs.rep) != len(fs.f.instrs)) {
+    fs.rep = stripRepMap(fs.f, licmPredMap(fs.f))
+  }
+  return fs.rep
+}
+
+// Whether entry parameters `p`, `p+1`, `p+2` carry `stringWordTypes`'s three
+// word types, i.e. are one exploded `string` parameter's `ptr`, `len`, `base`.
+fn entryParamsAreStringWords(ctx: TypeContext, f: IrFunc, p: int): bool {
+  let want = stringWordTypes(ctx)
+  let k = 0
+  while (k < 3) {
+    if (f.instrs[f.blocks[0].instsStart + p + k].ty != want[k]) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// Whether the box's three words are ONE exploded `string` parameter's three
+// incoming words, none recomputed — #5946's admission, and the same PROFIT
+// question the two above ask: did the words come from a handle the caller
+// already holds?
+//
+// A parameter reaches a box inside a loop, or past an `if`, as a block
+// parameter the lowerer threads it through (`addJoinParams`), not as the entry
+// parameter itself. `stripRepMap` (optstriptrip.bit) folds every block
+// parameter whose edges all pass one value — skipping an edge that hands the
+// parameter back to itself — into that value, so a word the function
+// reassigned on any path keeps its own id and fails the entry-block range test.
+//
+// The IR cannot tell a `string` parameter from a `(i64, i64, string)` tuple
+// parameter: both are the same three word types. That costs nothing here,
+// because `isStringHeaderAlloc` already requires the box to be a `string` and
+// the dynamic test, not this admission, decides every reuse.
+fn boxWordsAreParam(ctx: TypeContext, fs: StrBoxFn, w0: int, w1: int, w2: int): bool {
+  if (fs.f.instrs[w0].op != Op.BlockParam) {
+    return false
+  }
+  let rep = strBoxRepOf(fs)
+  let entry = fs.f.blocks[0]
+  let p = stripFind(rep, w0) - entry.instsStart
+  if (p < 0 || p + 2 >= entry.paramCount) {
+    return false
+  }
+  let base = entry.instsStart + p
+  if (stripFind(rep, w1) != base + 1 || stripFind(rep, w2) != base + 2) {
+    return false
+  }
+  return entryParamsAreStringWords(ctx, fs.f, p)
+}
+
 // Whether the `gc_alloc` at `idx` is a re-box of a handle that is still live —
-// either one call's three result words with a target that puts its own handle
-// in word 2, or that same shape with the call already inlined away.
-fn reusableStringBox(x: StrBoxScan, f: IrFunc, idx: int, end: int): bool {
+// one call's three result words with a target that puts its own handle in
+// word 2, that same shape with the call already inlined away, or one string
+// parameter's own incoming words.
+fn reusableStringBox(x: StrBoxScan, fs: StrBoxFn, idx: int, end: int): bool {
+  let f = fs.f
   if (!isStringHeaderAlloc(x.ctx, f.instrs[idx]) || !stringBoxWordSets(f, idx, end)) {
     return false
   }
@@ -250,10 +319,17 @@ fn reusableStringBox(x: StrBoxScan, f: IrFunc, idx: int, end: int): bool {
     return true
   }
   let c = stringBoxCallOf(f, w0, w1, w2)
-  if (c < 0) {
+  if (c >= 0) {
+    return callReturnsOwnHandle(x.ctx, x.snap, f, c)
+  }
+  // GATED BY `strReuseEnabled()` (#5954). Off, a call-shaped box with no
+  // recognised call falls straight to `false`, main 8e724862f's answer —
+  // `boxWordsAreParam` is never reached, so `strBoxRepOf`'s `stripRepMap`
+  // walk is never built either.
+  if (!strReuseEnabled()) {
     return false
   }
-  return callReturnsOwnHandle(x.ctx, x.snap, f, c)
+  return boxWordsAreParam(x.ctx, fs, w0, w1, w2)
 }
 
 // The two module-wide facts the scan consults, bundled so the walk stays inside
@@ -263,13 +339,20 @@ class StrBoxScan {
   snap: []IrFunc,
 }
 
+// The function one scan walks, and its representative map once `strBoxRepOf`
+// has built it (empty until then).
+class StrBoxFn {
+  f: IrFunc,
+  rep: []int,
+}
+
 // Marks every reusable box in block `bi`.
-fn markReusableInBlock(x: StrBoxScan, f: IrFunc, mask: []bool, bi: int) {
-  let blk = f.blocks[bi]
+fn markReusableInBlock(x: StrBoxScan, fs: StrBoxFn, mask: []bool, bi: int) {
+  let blk = fs.f.blocks[bi]
   let end = blk.instsStart + blk.instsLen
   let idx = blk.instsStart + blk.paramCount
   while (idx < end) {
-    if (reusableStringBox(x, f, idx, end)) {
+    if (reusableStringBox(x, fs, idx, end)) {
       mask[idx] = true
       idx = idx + 4
     } else {
@@ -302,9 +385,10 @@ fn dropWrittenStringBoxes(f: IrFunc, mask: []bool) {
 // diamond. Two bounded walks: one over the blocks, one over the instructions.
 fn reusableStringBoxes(x: StrBoxScan, f: IrFunc): []bool {
   let mask = noDeadAllocs(len(f.instrs))
+  let fs = StrBoxFn{ f = f, rep = []int(0) }
   let bi = 0
   while (bi < len(f.blocks)) {
-    markReusableInBlock(x, f, mask, bi)
+    markReusableInBlock(x, fs, mask, bi)
     bi = bi + 1
   }
   dropWrittenStringBoxes(f, mask)
