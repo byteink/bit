@@ -32,8 +32,8 @@ same across all three protocols - only the socket underneath changes.
 
 ### `Request`
 
-A parsed request: `method`, `path`, the raw `headers` block, `body`, and `peer`.
-Read a named header with `header(req.headers, "...")`.
+A parsed request: `method`, `path`, the raw `headers` block, `body`, `peer`, and
+`headerLines`. Read a named header with `header(req.headers, "...")`.
 
 `peer` is the client's IPv4 address in dotted quad - the transport's own view of
 who connected, and the only address in a request that a client cannot choose.
@@ -50,6 +50,13 @@ address could be read. Reading the address never fails a request. Because `""` i
 of `string`, a literal that omits the field - `Request{ method = "GET", path =
 "/", headers = "", body = "" }` - is legal and means "no peer known".
 
+`headerLines` is the number of lines in `headers` - `1` for a request with one
+header, `0` when there are none - counted for free while the header block is
+already being scanned for a stray CR, LF or NUL byte. Like `peer`, `0` also
+means "not counted": a `Request` you build yourself leaves it at zero, so
+anything enforcing its own header-count cap must still count the bytes itself
+whenever it sees `0` on a non-empty block.
+
 ```bit
 import { Request, Response, ok, respond } from "std/http"
 
@@ -57,7 +64,7 @@ fn route(req: Request): Response {
   if (len(req.peer) == 0) {
     return respond(400, "no peer address")
   }
-  return ok("hello ${req.peer}")
+  return ok("hello ${req.peer}, ${req.headerLines} header line(s)")
 }
 ```
 
