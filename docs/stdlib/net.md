@@ -95,12 +95,12 @@ wrote every byte.
 
 ### `Conn.writeBytes(b: []byte): ()!`
 
-Like `write`, but takes bytes instead of a `string` - the pair `write` and
-`writeDeadline` already are for reads, this is the byte-taking sibling of
-both, bounded by the connection's deadline exactly like `writeDeadline`
-whether or not one is set. Use it when the bytes are already a `[]byte` -
-building a wire message straight into one, say - so writing them never
-allocates a `string` just to throw it away at the socket.
+Like `write`, but takes bytes instead of a `string`: the same no-deadline
+behavior (parks until every byte is written, however slowly the peer drains
+it) and the same deadline-bound behavior once `setDeadline` has armed this
+connection. Use it when the bytes are already a `[]byte` - building a wire
+message straight into one, say - so writing them never allocates a `string`
+just to throw it away at the socket.
 
 ```bit
 import { listen, Listener, Conn } from "std/net"
