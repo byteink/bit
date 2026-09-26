@@ -28,7 +28,9 @@
 // onto it. A full local goes onto the global list in exchange for a free one
 // (`gcMkSwap`); an empty one goes back to the free list in exchange for a
 // full one (`gcMkRefill`). The roots are seeded across up to `gcMkSeedSegs`
-// segments (#5853), so the members start on different roots at once.
+// segments (#5853), so the members start on different roots at once. A swap
+// that finds the free list empty carves the next segment out of the mapping
+// (`gcMkGrow`, #5955), the parallel form of `growMarkStack` (./gcmark.bit).
 //
 // AN IDLE HELPER SPINS BRIEFLY, THEN LEAVES (#5853). It polls for
 // `gcMkHelperIdleSpins` turns, leaves (`gcMkLeave`), and returns to its park
@@ -44,10 +46,10 @@
 // M1. Each object is queued at most once per collection. Only the thread
 //     whose `hdrTryMark` saw the mark clear pushes it (`gcMkMark`), so every
 //     object is scanned at most once and each member's loop is bounded.
-// M2. `gcMkJoined`, `gcMkIdle`, `gcMkFull`, `gcMkFree`, both lists and
-//     `gcMkDone` change only under `gcMkLock`. `gcMkFull` and `gcMkDone` are
-//     also read without it, as hints; every decision that acts on them is
-//     re-taken under the lock (`gcMkTakeIdle`).
+// M2. `gcMkJoined`, `gcMkIdle`, `gcMkFull`, `gcMkFree`, `gcMkSegs`, both
+//     lists and `gcMkDone` change only under `gcMkLock`. `gcMkFull` and
+//     `gcMkDone` are also read without it, as hints; every decision that acts
+//     on them is re-taken under the lock (`gcMkTakeIdle`).
 // M3. Termination is decided once, under the lock, on "every joined member is
 //     idle and the global list is empty" (`gcMkRefill`). An idle member holds
 //     no segment, and only a busy member publishes, so once `gcMkDone` is set
@@ -71,9 +73,11 @@
 //     that takes it.
 // M7. Nothing waits for a helper to START. With none, the coordinator is the
 //     only member, and `gcMkJoined == 1` terminates on its first empty local.
-// M8. The pool never holds more than `gcStackLen` entries rounded up to whole
-//     segments, and `gcStackLen <= gcMaxMarkStack` (./gc.bit). A push that
-//     finds no free segment drops the child it just marked and sets
+// M8. The pool starts each phase at `gcStackLen` entries rounded up to whole
+//     segments and grows one segment per exhausted swap (`gcMkGrow`) up to
+//     `gcMkSegMax`, which is `gcMaxMarkStack` (./gc.bit) entries: the ceiling
+//     the serial worklist grows to (#5620). Only a push that finds no free
+//     segment at that ceiling drops the child it just marked and sets
 //     `gcOverflow`: today's overflow contract, answered by today's rescan.
 //     Seeding takes min(`gcMkSeedSegs`, budget) segments, or whole ones when
 //     the roots need more (`gcMkSeedChunk`), so it stays within the budget.
@@ -124,6 +128,7 @@ let gcMkJoined: i64 = 0 // members in the phase, coordinator included (M2)
 let gcMkIdle: i64 = 0   // members with no work (M2)
 let gcMkFull: i64 = 0   // entries on the global list (M2)
 let gcMkFree: i64 = 0   // entries on the free list (M2)
+let gcMkSegs: i64 = 0   // segments carved from the mapping this phase (M2, M8)
 let gcMkDone: i64 = 0   // 1 once termination is decided (M3)
 let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
 let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
@@ -271,7 +276,7 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
   }
   let n = *(c + gcMkCtxN)
   if (n >= gcMkSegEntries) {
-    if (!gcMkSwap(c)) {
+    if (!gcMkSwapOrGrow(c)) {
       // Marked, so it survives; its children wait for the serial rescan.
       atomicStore(wordAt(*(c + gcMkCtxG)) + gcOverflow, 1)
       return
@@ -531,6 +536,8 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
     return false
   }
   gcMkSeed(g)
+  // Every seeded segment is on one list, and no helper is in the phase yet.
+  gcMkSegs = gcMkFull + gcMkFree
   let c = gcMkCtx(0)
   gcMkCtxReset(c, g)
   atomicStore(ptrOf(gcMkOpen), int(g))
@@ -541,4 +548,43 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
   *(g + gcStBadOffset) = *(g + gcStBadOffset) + *(c + gcMkCtxBad) + atomicLoad(ptrOf(gcMkBad))
   atomicStore(ptrOf(gcMkOwner), 0)
   return true
+}
+
+// No free segment: carve the next one of the mapping onto the free list,
+// unless a member returned one meanwhile. True when one is free now; false at
+// `gcMkSegMax` (M8). Takes the lock.
+//
+// WHY THE POOL GROWS (#5955). Sized to `gcStackLen` alone, the pool is the
+// serial worklist's STARTING size without #5620's growth. `bench/cases/json`
+// at `BIT_WORKERS=8` fanned its root array out faster than the members
+// drained it in 5 of 12 runs measured; the pool ran dry, `gcOverflow` was
+// set, and `recoverOverflow`'s serial full-heap rescan (./gcmark.bit) took
+// 21-22 ms of a 26-28 ms pause. The mapping already spans `gcMkSegMax`
+// segments, so growing is a bump.
+@nosplit fn gcMkGrow(): bool {
+  spinAcquire(ptrOf(gcMkLock))
+  if (gcMkFree == 0 && gcMkSegs < gcMkSegMax) {
+    *gcMkFreeAt(gcMkFree) = gcMkBase + gcMkSegs * gcMkSegBytes
+    gcMkFree = gcMkFree + 1
+    gcMkSegs = gcMkSegs + 1
+  }
+  let ok = gcMkFree > 0
+  spinRelease(ptrOf(gcMkLock))
+  return ok
+}
+
+// `gcMkSwap`, growing the pool when it is dry. Placed last, so every function
+// above keeps its address (#5955 measured a layout shift on allocpar).
+@nosplit fn gcMkSwapOrGrow(c: *i64): bool {
+  let tries = 0
+  while (tries <= gcMkSegMax) { // bounded: gcMkSegMax + 1 attempts
+    if (gcMkSwap(c)) {
+      return true
+    }
+    if (!gcMkGrow()) {
+      return false
+    }
+    tries = tries + 1
+  }
+  return false
 }
