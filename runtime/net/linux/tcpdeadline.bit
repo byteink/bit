@@ -16,11 +16,16 @@
 // A server that completes the handshake (or accepts) and then never writes
 // parks `netReadSock`/`netDialTcp` above forever — nothing bounds
 // `netAwaitReady`'s park. These siblings bound the wait instead, resolving
-// ONE absolute monotonic deadline before the first poll and never restarting
-// it — the same shape `runtime/root/*/os.bit`'s `osForkExecWaitBounded`
-// documents at ABI.md §19. Byte-for-byte mirror of ../darwin/tcpdeadline.bit's
-// section of the same name; see there for the full rationale, including why
-// this does not touch `runtime/sched/**` to add a poll/timer race primitive.
+// ONE absolute monotonic deadline and never restarting it — the same shape
+// `runtime/root/*/os.bit`'s `osForkExecWaitBounded` documents at ABI.md §19.
+// The read/write loops resolve it lazily, on the first EAGAIN rather than
+// before the first poll (`netDeadlineCheck`, #5958), so a read or write that
+// completes without ever blocking never reads the clock at all; the connect
+// loop below still resolves it up front, since a `connect` syscall itself
+// never returns EAGAIN to hang the clamp off. Byte-for-byte mirror of
+// ../darwin/tcpdeadline.bit's section of the same name for the connect path;
+// see there for the full rationale, including why this does not touch
+// `runtime/sched/**` to add a poll/timer race primitive.
 //
 // NO GC BRACKET, for the same reason as the Darwin twin: every syscall here
 // (`read`/`write`/`connect`) runs on the non-blocking sockets this provider
@@ -235,6 +240,55 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
   return n
 }
 
+// Lazily clamps `deadline` against `now` on its first call from each loop
+// below (`deadline == 0` means "not yet clamped"; #5958), then reports
+// whether it is already elapsed — one clock reading serves both, so a read
+// or write that returns data at once never pays the clock read the entry
+// clamp used to cost, and a first EAGAIN pays exactly one, not two.
+// `netClampDeadline` never returns `0` itself (`now` is a monotonic ns
+// reading, always positive, and its result is `now`, `deadlineNs`, or
+// `now + netDeadlineMaxWaitNs`, all positive), so the elapsed case is
+// reported by negating that always-positive result: unambiguous against `0`
+// and against a live (positive) deadline, with no second output needed. A
+// later call passes the already-clamped `deadline` back in and re-reads the
+// clock fresh, exactly as today's single check did.
+@nosplit fn netDeadlineCheck(deadline: int, deadlineNs: int): int {
+  if (deadline == 0) {
+    let now = netClockNowNs()
+    let clamped = netClampDeadline(deadlineNs, now)
+    if (now >= clamped) {
+      return 0 - clamped
+    }
+    return clamped
+  }
+  if (netClockNowNs() >= deadline) {
+    return 0 - deadline
+  }
+  return deadline
+}
+
+// Wait one step toward `d`, or report the elapsed/closed stop that ends the
+// loop: `d < 0` (from `netDeadlineCheck`, already elapsed) reports
+// `netDeadlineTimedOut` before touching the fd; otherwise this races
+// readiness against `d` (#5866), or falls back to the ramp tick when there
+// is no current task or no poller bound (`netAwaitReadyOrDeadline`'s own
+// `false` contract) — the unscheduled/no-poller case the ramp was written
+// for. `-1` reports a `netClose` that landed during the wait, never
+// confusable with a real slice, which is always a positive nanosecond count.
+@nosplit fn netReadSockDeadlineWait(fd: int, gen: int, d: int, slice: int): int {
+  if (d < 0) {
+    return netDeadlineTimedOut
+  }
+  if (netAwaitReadyOrDeadline(fd, pollRead, gen, d)) {
+    if (pdFdClosing(fd)) {
+      return 0 - 1
+    }
+    return slice
+  }
+  let _ = netAwaitDeadlineTick(d, slice)
+  return netDeadlineNextSliceNs(slice)
+}
+
 @nosplit fn netReadSockDeadlineLoop(
   fd: int,
   gen: int,
@@ -242,7 +296,7 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
   bufCap: int,
   deadlineNs: int,
 ): int {
-  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  let deadline = 0
   let polls = 0
   let slice = netDeadlineFastPollNs
   while (polls < netDeadlineMaxPolls) {
@@ -253,21 +307,13 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
     }
     let e = lastErr()
     if (e == eAgain()) {
-      if (netClockNowNs() >= deadline) {
-        return netDeadlineTimedOut
+      let d = netDeadlineCheck(deadline, deadlineNs)
+      let next = netReadSockDeadlineWait(fd, gen, d, slice)
+      if (next < 0) {
+        return next
       }
-      // Race readiness against the deadline (#5866) rather than the ramp;
-      // fall back to the tick only when there is no current task or no
-      // poller bound (`netAwaitReadyOrDeadline`'s own `false` contract) —
-      // the unscheduled/no-poller case the ramp was written for.
-      if (netAwaitReadyOrDeadline(fd, pollRead, gen, deadline)) {
-        if (pdFdClosing(fd)) {
-          return 0 - 1
-        }
-      } else {
-        let _ = netAwaitDeadlineTick(deadline, slice)
-        slice = netDeadlineNextSliceNs(slice)
-      }
+      deadline = d
+      slice = next
     } else if (e == eIntr()) {
       // Interrupted; retry immediately, same as `netReadSock`.
     } else if (e == eConnReset()) {
@@ -276,7 +322,8 @@ export @symbol("bit_rt_port_net_read_sock_deadline") @nosplit fn netReadSockDead
       return 0 - 1
     }
   }
-  if (netClockNowNs() >= deadline) {
+  let d = netDeadlineCheck(deadline, deadlineNs)
+  if (d < 0) {
     return netDeadlineTimedOut
   }
   return 0 - 1
@@ -300,15 +347,16 @@ export @symbol("bit_rt_port_net_write_sock_deadline") @nosplit fn netWriteSockDe
   return wrote
 }
 
-// Waits one ramp slice toward `deadline`, then reports what the caller's
-// next `slice` should be. Negative means stop: `netDeadlineTimedOut` (`-2`)
-// or `-1` for a `netClose` that landed during the wait (#5886) — never
-// confusable with a real slice, which is always a positive nanosecond count.
-@nosplit fn netWriteSockDeadlineWait(fd: int, deadline: int, slice: int): int {
-  if (netClockNowNs() >= deadline) {
+// Wait one ramp slice toward `d`, then report what the caller's next
+// `slice` should be — same shape and same `d < 0` early-out as
+// `netReadSockDeadlineWait`'s twin above, which see. `-1` reports a
+// `netClose` that landed during the wait (#5886), never confusable with a
+// real slice, which is always a positive nanosecond count.
+@nosplit fn netWriteSockDeadlineWait(fd: int, d: int, slice: int): int {
+  if (d < 0) {
     return netDeadlineTimedOut
   }
-  let _ = netAwaitDeadlineTick(deadline, slice)
+  let _ = netAwaitDeadlineTick(d, slice)
   if (pdFdClosing(fd)) {
     return 0 - 1
   }
@@ -316,7 +364,7 @@ export @symbol("bit_rt_port_net_write_sock_deadline") @nosplit fn netWriteSockDe
 }
 
 @nosplit fn netWriteSockDeadlineLoop(fd: int, buf: *u8, n: int, deadlineNs: int): int {
-  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  let deadline = 0
   let off = 0
   let polls = 0
   let slice = netDeadlineFastPollNs
@@ -328,17 +376,20 @@ export @symbol("bit_rt_port_net_write_sock_deadline") @nosplit fn netWriteSockDe
     } else if (wrote == 0) {
       return 0 - 1
     } else if (lastErr() == eAgain()) {
-      let next = netWriteSockDeadlineWait(fd, deadline, slice)
+      let d = netDeadlineCheck(deadline, deadlineNs)
+      let next = netWriteSockDeadlineWait(fd, d, slice)
       if (next < 0) {
         return next
       }
+      deadline = d
       slice = next
     } else if (lastErr() != eIntr()) {
       return 0 - 1
     }
   }
   if (off < n) {
-    if (netClockNowNs() >= deadline) {
+    let d = netDeadlineCheck(deadline, deadlineNs)
+    if (d < 0) {
       return netDeadlineTimedOut
     }
     return 0 - 1
