@@ -1,0 +1,150 @@
+// #5878: jump placement for the decoded-uop cache (DSB). Same module as
+// compiler/x64.bit; nothing here is imported.
+//
+// On Skylake through Cascade Lake with the JCC-erratum microcode, a jump, or
+// a cmp/test/add/sub/and macro-fused with the jcc after it, that crosses a
+// 32-byte boundary or ends on one is not cached in the DSB, and the loop
+// holding it decodes through the legacy pipeline instead. Whether that
+// happens depended on unrelated code size: #5824 measured x97 DSB misses on
+// matrix from a change that cut 6% of its instructions. So every jump is
+// padded with Intel's NOPs (xNopBytes) until it and its fused setter sit
+// inside one 32-byte chunk, which is gcc/llvm's
+// -mbranches-within-32B-boundaries. The offsets are function-relative and
+// mean the same as absolute ones because xFuncAlign puts every entry on a
+// 32-byte boundary.
+//
+// Every jump here is a fixed-size form (rel32, or the one rel8 in
+// xEmitHeaderWordOrZero), so its length is known when it is written and the
+// padding is decided then: nothing after it can change its size, and no
+// fixpoint over displacements exists to run. Only the fused setter can move,
+// forward by the pad, and xPadJumpCx fixes what points past its start.
+
+fn xBranchWindow(): int { return 32 }
+
+// A loop header is aligned only when that costs this few bytes; see
+// xAlignBlockStart.
+fn xLoopAlignMaxPad(): int { return 15 }
+
+// Does [start, end) cross a 32-byte boundary, or end on one?
+fn xSpansBoundary(start: int, end: int): bool {
+  return start / xBranchWindow() != end / xBranchWindow()
+}
+
+// The group-1 forms that macro-fuse with a following jcc on Intel cores.
+fn xArithFuses(op: XArith): bool {
+  return op == XArith.Cmp || op == XArith.Add || op == XArith.Sub || op == XArith.And
+}
+
+// Records a flag setter that started at `start` and ends here, for a jcc
+// written next to treat as its fused partner. Register forms only, so it
+// never carries a relocation.
+fn xNoteFusible(b: X64Buf, start: int) {
+  b.fuseStart = start
+  b.fuseEnd = len(b.code)
+}
+
+// A label bound at the current offset: whatever jumps here set its flags
+// elsewhere, so the setter before this point is no one's partner and must
+// not move.
+fn xFuseBarrier(b: X64Buf) {
+  b.fuseEnd = -1
+}
+
+// Pads before a jump of `n` bytes so that neither it nor, when `fused`, the
+// flag setter that ends where it starts crosses or ends on a 32-byte
+// boundary. The padding goes in before the setter, never between the two,
+// which would break the fusion. Returns the offset it went in at.
+fn xPadJump(b: X64Buf, n: int, fused: bool): int {
+  let here = len(b.code)
+  let at = here
+  if (b.align && fused && b.fuseEnd == here) {
+    at = b.fuseStart
+  }
+  b.fuseEnd = -1
+  if (b.align && xSpansBoundary(at, here + n)) {
+    xInsertNops(b, at, xBranchWindow() - at % xBranchWindow())
+  }
+  b.jumps = append(b.jumps, len(b.code))
+  return at
+}
+
+// Inserts `pad` bytes of NOPs at `at`, moving the bytes after it forward.
+// Only a fused setter (at most seven bytes) is ever moved.
+fn xInsertNops(b: X64Buf, at: int, pad: int) {
+  let old = len(b.code)
+  assert(at >= 0 && old - at <= 7 && pad > 0 && pad < xBranchWindow())
+  let nops = xNopBytes(pad)
+  for x of nops {
+    b.code = append(b.code, x)
+  }
+  let i = old - 1
+  while (i >= at) {
+    b.code[i + pad] = b.code[i]
+    i = i - 1
+  }
+  let k = 0
+  while (k < pad) {
+    b.code[at + k] = nops[k]
+    k = k + 1
+  }
+}
+
+// xPadJump for a function being compiled. A moved setter can only be a fused
+// icmp, whose `br` may have a debug row at its old end; that row moves with
+// it. Nothing else can point into it: it is one register-only instruction,
+// and a label bound after it would have been a barrier.
+fn xPadJumpCx(cx: XCtx, n: int, fused: bool) {
+  let here = len(cx.buf.code)
+  let at = xPadJump(cx.buf, n, fused)
+  let pad = len(cx.buf.code) - here
+  if (at == here || pad == 0) {
+    return
+  }
+  let last = len(cx.relocs) - 1
+  assert(last < 0 || cx.relocs[last].offset < at)
+  assert(cx.nextSafepointIdx == 0 || cx.safepointCodeOffsets[cx.nextSafepointIdx - 1] <= at)
+  let r = len(cx.dbgRows) - 1
+  while (r >= 0 && cx.dbgRows[r].pcOffset > at) {
+    cx.dbgRows[r].pcOffset = cx.dbgRows[r].pcOffset + pad
+    r = r - 1
+  }
+}
+
+// Block `bi` is a loop header when a block at or after it branches to it,
+// the same order argument isBackEdge (codegen.bit) makes for the poll.
+fn xLoopHeaders(f: IrFunc): []bool {
+  let heads = []bool(len(f.blocks))
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    if (b.instsLen > b.paramCount) {
+      xMarkBackTargets(heads, bi, f.instrs[b.instsStart + b.instsLen - 1])
+    }
+    bi = bi + 1
+  }
+  return heads
+}
+
+fn xMarkBackTargets(heads: []bool, bi: int, ins: IrInstr) {
+  if (ins.op != Op.Jump && ins.op != Op.Br) {
+    return
+  }
+  if (isBackEdge(bi, ins.ival)) {
+    heads[ins.ival] = true
+  }
+  if (ins.op == Op.Br && isBackEdge(bi, ins.ival2)) {
+    heads[ins.ival2] = true
+  }
+}
+
+// Every block start is a label (a barrier). A loop header also moves to the
+// next 32-byte boundary when that costs at most xLoopAlignMaxPad bytes, so
+// its body starts a DSB chunk; the NOPs run once per loop entry at most, on
+// the fall-through into it.
+fn xAlignBlockStart(b: X64Buf, isHeader: bool) {
+  xFuseBarrier(b)
+  let pad = (xBranchWindow() - len(b.code) % xBranchWindow()) % xBranchWindow()
+  if (b.align && isHeader && pad > 0 && pad <= xLoopAlignMaxPad()) {
+    xInsertNops(b, len(b.code), pad)
+  }
+}
