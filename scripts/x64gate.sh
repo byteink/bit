@@ -196,7 +196,24 @@ while IFS= read -r host; do
     # these two variables holds a single word, so splitting is never needed:
     # an unquoted empty expansion vanishes from the command line and a
     # non-empty one is exactly one argv entry, in every POSIX-ish shell.
+    # /tmp/benchlock is the box-wide measurement lock, a DIRECTORY: mkdir takes
+    # it, rmdir releases it. It is taken here rather than by callers so no run
+    # can skip it (#5998 ran unlocked through #6001's measurement window).
+    # X64GATE_LOCK_TRIES bounds the wait in 10 s tries; 360 is one hour.
     code=$(gate_stream | ssh "${host}" "
+      n=0
+      until mkdir /tmp/benchlock 2>/dev/null; do
+        n=\$((n + 1))
+        if [ \$n -ge ${X64GATE_LOCK_TRIES:-360} ]; then
+          echo \"x64gate: /tmp/benchlock on \$(hostname) still held after \$((n * 10))s: \$(ls -ld /tmp/benchlock 2>&1)\" >&2
+          cat >/dev/null
+          echo X64LINUX_EXIT=98
+          exit 0
+        fi
+        sleep 10
+      done
+      trap 'rmdir /tmp/benchlock' EXIT
+      trap 'exit 1' HUP INT TERM
       if [ \"${CACHE_MODE}\" = clean ]; then
         CACHE_FLAG=''
         CACHE_VOL=''
