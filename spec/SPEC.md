@@ -2568,6 +2568,15 @@ map<string,string>)` parameter both construct one); anywhere else - including
 with no expected type reachable at all - it is ill-typed, the same treatment an
 empty `[]` against a non-slice type gets (§15.2).
 
+The bare map form is gated behind the compiler flag `BIT_MAPLIT=1` (default
+off) until the release after it lands repins the toolchain's own pinned
+previous-release oracle past this compiler build; with the flag unset, `{`
+in expression position stays E0021 ("expected an expression"), unchanged from
+every earlier release. This is a rollout mechanism only, not part of the
+language's steady-state definition - the same shape `BIT_STATIC_CONST` used
+for #5990's link-time-constant closures - and this paragraph is removed once
+the flag defaults on.
+
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
 annotation, parameter, or result - `let a: [2]f32 = [4.5, 4.5]` is an error
