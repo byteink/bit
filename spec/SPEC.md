@@ -1184,6 +1184,80 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   not affect this order or count as a field itself.
 - Classes are reference types with reference semantics on assignment (§13.3).
 
+**`jsonSchema<T>` - a JSON Schema for a `@json` class.**
+
+- `std/json` declares
+
+  ```
+  jsonSchema<T>(): Json
+  ```
+
+  and the compiler **specialises it per instantiation**, exactly as
+  `jsonDecode<T>` is above: at `jsonSchema<User>()` it knows `User`
+  concretely and generates the schema fragment from the same field list and
+  the same key rules `@json` serializes by. It is a **free function, not a
+  member** - the same reasoning as `jsonDecode<T>`'s applies with one thing
+  removed: there is not even a `Json` argument here, since a schema
+  describes the TYPE and never reads a value at all.
+- `T` must be a class carrying `@json`; anything else is a compile error at
+  the call, never a runtime failure - the same shape as `jsonDecode<T>`'s
+  own **E0145**, under its own code (assigned where it is implemented).
+- **The dialect is JSON Schema 2020-12**
+  (<https://json-schema.org/draft/2020-12>), the exact dialect OpenAPI 3.1's
+  Schema Object uses - not an earlier draft, and not OpenAPI 3.0's own
+  restricted subset (which had no `$dynamicRef`/`$defs` and used a bespoke
+  `nullable: true` instead of a standard `type` array).
+- **Field shape to keyword, one entry per shape `@json` already accepts**
+  (this section's own list above):
+
+  | Field shape | Schema fragment |
+  | --- | --- |
+  | an integer type | `{"type": "integer"}` |
+  | a float type | `{"type": "number"}` |
+  | `bool` | `{"type": "boolean"}` |
+  | `string` | `{"type": "string"}` |
+  | `[]T` | `{"type": "array", "items": <T's fragment>}` - 2020-12's `items`
+    keyword applies to every element uniformly whenever no `prefixItems` is
+    present, which this synthesis never emits, so this is the same meaning
+    `items` had as a bare schema in every earlier draft |
+  | `map<string, T>` | `{"type": "object", "additionalProperties": <T's
+    fragment>}` |
+  | `Option<T>` | `T`'s own fragment with `"null"` folded into its `type` -
+    a scalar's `{"type": "string"}` becomes `{"type": ["string", "null"]}`
+    (2020-12's `type` keyword accepts a string or an array of strings, and
+    an instance matches if it matches any listed type; there is no separate
+    `nullable` keyword in this dialect). This is not optional: `@json`
+    itself emits an absent `Option<T>` as an explicit `null` (this
+    section's own `toJson` bullets), so a schema that did not admit null
+    for that field would reject the encoder's own correct output |
+  | a nested `@json` class | `{"$ref": "#/$defs/<ClassName>"}`, with one
+    `$defs` entry per DISTINCT class reachable from the root, deduplicated -
+    a self-referential class (`class Node { next: Option<Node> }`, already
+    legal input to `jsonDecode<T>` per this section) terminates as a finite
+    document with a cycle through `$ref` rather than an unbounded inline
+    expansion |
+
+  The whole class becomes `{"type": "object", "properties": {...},
+  "required": [...]}`. `required` names every field's key with no
+  exception: `@json` never omits a key (an absent `Option<T>` is an
+  explicit `null`, not a missing one), so the schema's `required` set is
+  exactly the class's declared field set. `@key("...")` overrides a
+  field's schema property key exactly as it overrides its `toJson()`/
+  `jsonDecode<T>` key.
+- **A field's validation attributes are recorded, not interpreted.**
+  `std/json` has no knowledge of what `@minLen`/`@max`/etc. (`pkg/web`'s
+  own rules, this file's "validate.bit" material) mean, and cannot depend
+  on `pkg/web` to find out. A field carrying attributes gets an
+  `"x-bit-attrs"` entry on its own fragment - JSON Schema and OpenAPI both
+  reserve the `x-` prefix for vendor extensions a validator that does not
+  recognise them ignores rather than rejects (OpenAPI 3.1's own
+  `specification-extensions` pattern is exactly `^x-`) - naming each
+  attribute and its constant arguments in the same source-spelling `@table`
+  above already records them in. `pkg/web` maps its own attributes out of
+  this into native schema keywords (`@minLen(3)` into `minLength: 3`) and
+  strips the rest before a document is served; the mapping itself is
+  `pkg/web`'s, not `std/json`'s, and is specified where it is implemented.
+
 **`@table` - synthesizing `tableDescriptor`.**
 
 - A class declaration may carry the attribute `@table` (§10.3.1), the other of
