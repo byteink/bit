@@ -11,9 +11,15 @@ Core on TechEmpower's test types 1 (plaintext) and 2 (JSON).
 ```
 
 `run.sh` runs on a developer machine and needs an x86-64 Linux host with
-docker, resolved by `scripts/x64host.sh`. `remote.sh` is the half that runs
-over there: it builds the six servers, proves they answer identical responses,
-reads back what cores each process actually got, and measures.
+docker, resolved by `scripts/x64host.sh`. It builds the pkg/web server itself,
+with this tree's compiler and a runtime built by that same compiler
+(`BIT_LIBBITRT_TREE=1 ./make selfhost`, then `bit build --target
+x86_64-linux`), refusing when the compiler, runtime, stdlib or pkg/web sources
+have uncommitted changes, so the table names the commit it measured.
+`remote.sh` is the half that runs over there: it takes the box's
+`/tmp/benchlock` directory lock for the whole run, builds the five peers,
+proves all six answer identical responses, reads back what cores each process
+actually got, and measures.
 
 ## What is compared, and what is not
 
@@ -33,12 +39,22 @@ the gap to be rediscovered.
 ## Reading the numbers
 
 Two concurrency levels are published, c=1 and c=64, because on this hardware
-they do not move together for every framework. Each figure is the median of
-five 5-second reps taken round-robin across all six servers, with the spread
-beside it. The box is an unquota'd LXC container sharing six cores with
-neighbours that are invisible from inside it, so the ranking is the result and
-the absolute rates are not comparable to bare-metal published figures.
+they do not move together for every framework. Every server runs on one
+physical core (both of its hardware threads) and the load generator on every
+other CPU the container has, so at c=64 the server, not oha, is the ceiling;
+a row where oha reached 90% of its CPUs in any counted rep is flagged. After
+one 10-second warmup per server, five 5-second reps are taken round-robin
+across all six servers, rotating which goes first, and each figure is the
+median of reps 2-4 with the spread beside it. Before every rep and after the
+last, the box must be quiet: no container the run did not start, CPU pressure
+(PSI) under 1 over 10 s, and under 1% of a 5-second window stalled; a check
+retries a bounded number of times and the run stops rather than time a noisy
+box. Every ratio is pkg/web divided by one peer. The box is an unquota'd
+container on a shared host, so the absolute rates are not comparable to
+bare-metal published figures.
 
 `out/` is generated and gitignored: `results.csv` is every rep, `verify.txt`
-the identical-response and affinity proof, `env.txt` the box as measured at
-run time, `versions.txt` what each framework resolved to.
+the identical-response and affinity proof, `quiet.txt` every quiet check,
+`env.txt` the box as measured at run time, `versions.txt` what each framework
+resolved to. `RESULTS.md` carries the published block with `verify.txt` and
+`quiet.txt` beneath it.
