@@ -1,0 +1,311 @@
+// pkg/redis/conn.bit — one physical connection: dialing (plain or TLS), the
+// `HELLO 3` handshake with its RESP2 fallback, `SELECT`, and the
+// `RedisError`-typed command round trip `client.bit`'s `Client` runs over a
+// `std/sync.Pool<redisConn>` lease (epic #6013, #6022).
+//
+// EVERYTHING IS BEHIND `redisStream`, same split as pkg/postgres/wire.bit's
+// `pgStream`: a connection is a plain socket, or a TLS connection after the
+// handshake, and the command round trip is identical either way.
+//
+// TWO FAILURE CONVERSIONS, NEVER MIXED. `classifyTransportError` (dial, TLS
+// handshake, write) only ever produces `Io`/`Timeout` — a transport never
+// reports a malformed reply. `classifyDecodeError` (`decodeReply`, which
+// `resp.bit`'s framing also reaches through a stalled/timed-out `readUp`)
+// only ever produces `Protocol`/`Timeout`. Both are within the
+// `Io`/`Timeout`/`Protocol` set `client.bit`'s `doCommand` checks to decide
+// whether the physical connection is still good — see `connectionBad` there.
+//
+// `HELLO`'S FALLBACK IS BY MESSAGE, NOT BY SERVER VERSION. A RESP2-only
+// server (an old Redis, some Valkey/KeyDB builds, or a Redis with `HELLO`
+// renamed away via `rename-command`) answers `HELLO` with
+// `-ERR unknown command 'HELLO'`. That message, and only that message, means
+// "fall back to plain `AUTH`/`CLIENT SETNAME`" (`trySendHello` below); any
+// other error — `WRONGPASS`, `NOAUTH` — means the server DOES speak `HELLO`
+// and the credentials are wrong, which must fail loudly, never silently
+// retry as if `HELLO` were unsupported.
+
+import { Conn as NetConn, dialDeadline, resolve } from "std/net"
+import { TlsConfig, TlsConn, TrustStore, client as tlsHandshake, newTrustStore, emptyTrustStore } from "std/tls"
+import { systemRoots } from "std/crypto"
+
+// A byte source and sink for one physical connection, over cleartext or TLS.
+interface redisStream {
+  readUp(n: int): string!,
+  write(s: string): ()!,
+  setDeadline(deadlineNs: int),
+  close(),
+}
+
+class plainRedisStream {
+  c: NetConn
+  readUp(n: int): string! {
+    return this.c.read(n)
+  }
+
+  write(s: string): ()! {
+    this.c.write(s)?
+  }
+
+  setDeadline(deadlineNs: int) {
+    this.c.setDeadline(deadlineNs)
+  }
+
+  close() {
+    this.c.close()
+  }
+}
+
+class tlsRedisStream {
+  c: TlsConn
+  readUp(n: int): string! {
+    return string(this.c.read(n)?)
+  }
+
+  write(s: string): ()! {
+    this.c.write([]byte(s))?
+  }
+
+  setDeadline(deadlineNs: int) {
+    this.c.setDeadline(deadlineNs)
+  }
+
+  close() {
+    this.c.close()
+  }
+}
+
+// One physical connection: the stream, its read buffer (`resp.bit`'s
+// `byteSource` contract, via `readUp` below) and the attributes the most
+// recent reply carried (`unwrapAttr`) — kept per connection because a
+// pooled `Client` has no single long-lived stream of its own to hang them
+// off.
+export class redisConn {
+  s: redisStream
+  buf: string
+  lastAttrs: []MapEntry
+  readUp(n: int): string! {
+    return this.s.readUp(n)?
+  }
+
+  setDeadline(deadlineNs: int) {
+    this.s.setDeadline(deadlineNs)
+  }
+
+  close() {
+    this.s.close()
+  }
+}
+
+// `RedisError` variants a transport failure (dial, TLS handshake, a stream
+// write) reports as: `Timeout` for anything `std/net`/`std/tls` phrased as
+// "... timed out", `Io` otherwise.
+fn classifyTransportError(e: error): RedisError {
+  if (contains(e.message(), "timed out")) {
+    return RedisError.Timeout
+  }
+  return RedisError.Io(e.message())
+}
+
+// The same split for a `decodeReply` failure — a stalled read (surfaced
+// through `readUp`, so still "timed out" text) is `Timeout`; a genuinely
+// malformed reply is `Protocol`, never `Io`.
+fn classifyDecodeError(e: error): RedisError {
+  if (contains(e.message(), "timed out")) {
+    return RedisError.Timeout
+  }
+  return RedisError.Protocol(e.message())
+}
+
+// `Reply`'s variant name, for `RedisError.Unexpected(command, shape)`.
+fn shapeName(r: Reply): string {
+  match (r) {
+    Simple(_) => return "Simple"
+    Err(_) => return "Err"
+    Int(_) => return "Int"
+    Bulk(_) => return "Bulk"
+    Array(_) => return "Array"
+    Null => return "Null"
+    Bool(_) => return "Bool"
+    Double(_) => return "Double"
+    BigNumber(_) => return "BigNumber"
+    Verbatim(_, _) => return "Verbatim"
+    Map(_) => return "Map"
+    Set(_) => return "Set"
+    Push(_) => return "Push"
+    Attribute(_, _) => return "Attribute"
+  }
+}
+
+// Unwraps every layer of `Reply.Attribute`, recording the last one's entries
+// on `conn` (#6018's RESP3 attribute note on this ticket) before returning
+// the reply it decorates.
+fn unwrapAttr(conn: redisConn, r: Reply): Reply {
+  match (r) {
+    Attribute(entries, inner) => {
+      conn.lastAttrs = entries
+      return unwrapAttr(conn, inner)
+    }
+    _ => return r
+  }
+}
+
+// One command, decoded and attribute-unwrapped, but with a `Reply.Err` left
+// as a normal value rather than converted to a failure — the one caller that
+// needs that, `trySendHello`, tells "HELLO unsupported" apart from "HELLO
+// supported, credentials wrong" by the error TEXT, which it cannot see once
+// this converts it to a `fail`.
+fn rawCommandRaw(conn: redisConn, args: []string, timeoutNs: int): Reply ! RedisError {
+  if (timeoutNs > 0) {
+    conn.setDeadline(monotonic().ns + timeoutNs)
+  }
+  conn.s.write(encodeCommand(args)) catch e { fail classifyTransportError(e) }
+  let (reply, rest) = decodeReply(conn, conn.buf) catch e { fail classifyDecodeError(e) }
+  conn.buf = rest
+  return unwrapAttr(conn, reply)
+}
+
+// `rawCommandRaw`, converting a server `-ERR ...`/`-WRONGTYPE ...` reply into
+// the matching `RedisError` (`errors.bit`'s `fromServer`) — what every
+// caller except `trySendHello` wants.
+fn rawCommand(conn: redisConn, args: []string, timeoutNs: int): Reply ! RedisError {
+  let r = rawCommandRaw(conn, args, timeoutNs)?
+  match (r) {
+    Err(msg) => fail fromServer(msg)
+    _ => return r
+  }
+}
+
+// A `Simple("OK")` reply, or a `RedisError` naming what came back instead —
+// `HELLO`'s RESP2 fallback and `SELECT` both expect exactly this shape.
+fn expectOk(conn: redisConn, args: []string, timeoutNs: int): () ! RedisError {
+  let r = rawCommand(conn, args, timeoutNs)?
+  match (r) {
+    Simple(s) => {
+      if (s != "OK") {
+        fail RedisError.Protocol("redis: ${args[0]}: expected +OK, got '${s}'")
+      }
+    }
+    _ => fail RedisError.Unexpected(args[0], shapeName(r))
+  }
+}
+
+// `HELLO <protocol> [AUTH user pass] [SETNAME name]`. `AUTH default pass` is
+// Redis's own convention for "a password, no explicit user" — the ACL user
+// named `default`.
+fn helloArgs(opts: Options): []string {
+  let args = ["HELLO", "${opts.protocol}"]
+  let user = opts.username
+  if (opts.password != "" && user == "") {
+    user = "default"
+  }
+  if (opts.password != "" || opts.username != "") {
+    args = append(args, "AUTH")
+    args = append(args, user)
+    args = append(args, opts.password)
+  }
+  if (opts.clientName != "") {
+    args = append(args, "SETNAME")
+    args = append(args, opts.clientName)
+  }
+  return args
+}
+
+// Sends `HELLO`. True if the server accepted it (RESP3 is live on this
+// connection); false only for the one message that means "this server does
+// not know the command at all" — see this file's header. Any other error
+// (wrong credentials, a malformed `HELLO`) fails loudly instead.
+fn trySendHello(conn: redisConn, opts: Options, timeoutNs: int): bool ! RedisError {
+  let r = rawCommandRaw(conn, helloArgs(opts), timeoutNs)?
+  match (r) {
+    Err(msg) => {
+      if (hasPrefix(msg, "ERR unknown command")) {
+        return false
+      }
+      fail fromServer(msg)
+    }
+    _ => return true
+  }
+}
+
+// The RESP2 path: plain `AUTH`, then `CLIENT SETNAME` — the two `HELLO`
+// would otherwise have folded into one round trip.
+fn legacyAuth(conn: redisConn, opts: Options, timeoutNs: int): () ! RedisError {
+  if (opts.password != "") {
+    if (opts.username != "") {
+      expectOk(conn, ["AUTH", opts.username, opts.password], timeoutNs)?
+    } else {
+      expectOk(conn, ["AUTH", opts.password], timeoutNs)?
+    }
+  }
+  if (opts.clientName != "") {
+    expectOk(conn, ["CLIENT", "SETNAME", opts.clientName], timeoutNs)?
+  }
+}
+
+// `HELLO` (falling back to `AUTH`/`CLIENT SETNAME` on RESP2), then `SELECT`
+// when a non-zero database was named. Bounded by `opts.connectTimeout` —
+// every message here runs before the connection is handed to a caller.
+fn handshake(conn: redisConn, opts: Options): () ! RedisError {
+  let ok = trySendHello(conn, opts, opts.connectTimeout)?
+  if (!ok) {
+    legacyAuth(conn, opts, opts.connectTimeout)?
+  }
+  if (opts.db != 0) {
+    expectOk(conn, ["SELECT", "${opts.db}"], opts.connectTimeout)?
+  }
+}
+
+// The OS trust store, unless `opts` names its own CA or turns verification
+// off. Only consulted for a TLS connection — `systemRoots()` parses the
+// whole CA bundle (~170ms, pkg/postgres/adapter.bit's own measurement), a
+// cost a plaintext connection must never pay.
+export fn tlsRootsFor(opts: Options): TrustStore ! RedisError {
+  if (!opts.tls || opts.insecureSkipVerify) {
+    return emptyTrustStore()
+  }
+  if (opts.tlsRootCa != "") {
+    return newTrustStore(opts.tlsRootCa) catch e { fail RedisError.Protocol(e.message()) }
+  }
+  let sys = systemRoots() catch e { fail RedisError.Io(e.message()) }
+  return TrustStore{ roots = sys.roots }
+}
+
+// The stream: a plain socket, or one with a TLS handshake run over it —
+// `opts.tlsServerName`, else `opts.host`, is both the SNI name offered and
+// the name the certificate must match. Bounded by `deadlineNs`
+// (`dialDeadline`'s own deadline covers the TLS handshake too, since the
+// underlying `Conn` carries it — see `std/net.dialDeadline`'s own doc).
+fn openStream(opts: Options, roots: TrustStore, deadlineNs: int): redisStream ! RedisError {
+  let ip = resolve(opts.host) catch e { fail classifyTransportError(e) }
+  let conn = dialDeadline(ip, opts.port, deadlineNs) catch e { fail classifyTransportError(e) }
+  if (!opts.tls) {
+    return plainRedisStream{ c = conn }
+  }
+  let serverName = opts.tlsServerName
+  if (serverName == "") {
+    serverName = opts.host
+  }
+  let cfg = TlsConfig{
+    roots = roots, insecureSkipVerify = opts.insecureSkipVerify,
+    alpn = []string(0), serverName = serverName, minVersion = 0, nowUnix = 0,
+    certPem = "", keyPem = "",
+  }
+  let tc = tlsHandshake(conn, serverName, cfg) catch e { fail classifyTransportError(e) }
+  return tlsRedisStream{ c = tc }
+}
+
+// Opens one physical connection: dial (plain or TLS), `HELLO`/`AUTH`,
+// `SELECT`. `roots` is computed once per `Client` (`client.bit`'s `connect`)
+// rather than per dial, so a pool reconnecting under load does not re-parse
+// the OS trust store on every physical connection.
+export fn dialConn(opts: Options, roots: TrustStore): redisConn ! RedisError {
+  let deadlineNs = monotonic().ns + opts.connectTimeout
+  let stream = openStream(opts, roots, deadlineNs)?
+  let conn = redisConn{ s = stream, buf = "", lastAttrs = []MapEntry(0) }
+  handshake(conn, opts) catch e {
+    stream.close()
+    fail e
+  }
+  stream.setDeadline(0)
+  return conn
+}
