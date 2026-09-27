@@ -305,7 +305,7 @@ touches `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
 
 | Interface | Changed by either driver | What actually happened |
 |---|---|---|
-| `Value` | No | Stayed `{Null, Int, Float, Text, Blob}`; the rule is to extend by accessor, not by enum variant - see below. |
+| `Value` | Once, later | Held `{Null, Int, Float, Text, Blob}` through both drivers' own build (below); gained `Bool` afterward, in #6154, when Postgres' native boolean turned out to have no `Value.Text` form the accessor rule could read - see below. |
 | `Driver` | No | Neither adapter implements it. `pkg/postgres/adapter.bit:86` and `pkg/mysql/adapter.bit:104` both export `fn adapter(): Adapter` (`config.bit`'s `Adapter`, which predates either driver), never a `Driver`. The only implementer anywhere in the tree is `stdlib/sql/sqlcheck.bit`'s `fakeDriver`, a self-test double. |
 | `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:33`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The gap the freeze found, and how it was closed," below, for `begin`'s history. |
 | `Rows` | No | `pgRows`/`myRows` implement `next`/`columns`/`value`/`close` verbatim. MySQL's `TINYINT(1)`-as-bool and JSON-as-the-field's-own-type ambiguities are resolved by which accessor the caller reaches for (`sqlReqBool` vs `sqlReqInt`, `sqlReqJson`), never by `Rows` itself. |
@@ -313,17 +313,25 @@ touches `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
 | `Tx` | No | Signature untouched. Both drivers stubbed `begin` until it was wired up - see below. |
 | `Registry` | No | Unused by both real drivers, same as `Driver`; exercised only by `sqlcheck.bit`'s fake. |
 
-**6 of 6 checked. 0 of 6 changed.** What MySQL actually needed - the session
-`time_zone='+00:00'` pin at connect, the reversed `TIMESTAMP`/`DATETIME`
-mapping, its own DECIMAL binary format - all landed *inside* `myConn`/its
-codecs, never at the `Conn`/`Rows`/`Stmt` boundary. The one place the design
-predicted an extension point and a driver actually used it is `Value`:
-The rule settled here is that a type a codec produces (`decimal`, later `Instant`,
-`UUID`, `Json`, arrays) gets a `sqlReqX`/`sqlOptX` pair in
-`stdlib/sql/row.bit`/`rowtypes.bit`, reading `Value.Text` and converting -
-exactly the shape `pkg/mysql`'s own `mysqlDecimal` had already shipped by
-hand before the decision was written down. `Value` itself never grew a
-variant.
+**Every other interface held while both drivers were built; `Value` changed
+once, afterward.** What MySQL actually needed - the session `time_zone='+00:00'`
+pin at connect, the reversed `TIMESTAMP`/`DATETIME` mapping, its own DECIMAL
+binary format - all landed *inside* `myConn`/its codecs, never at the
+`Conn`/`Rows`/`Stmt` boundary. The rule that held through both drivers: a
+type a codec produces (`decimal`, later `Instant`, `UUID`, `Json`, arrays)
+gets a `sqlReqX`/`sqlOptX` pair in `stdlib/sql/row.bit`/`rowtypes.bit`,
+reading `Value.Text` and converting - exactly the shape `pkg/mysql`'s own
+`mysqlDecimal` had already shipped by hand before the decision was written
+down.
+
+That rule has one precondition: the codec's own wire value has to be
+reachable as `Value.Text` in the first place. Postgres' `boolean` breaks it -
+the server sends exactly `t` or `f` on the wire, but MySQL and SQLite have no
+boolean wire type of their own and were already reading that column as
+`Value.Int` zero/nonzero, so a `sqlReqBool` built the same way as `sqlReqUuid`
+would have had nothing of its own to parse. `Value` grew a `Bool(bool)`
+variant instead (#6154) - the one case the accessor rule cannot absorb,
+made when it actually came up, not predicted here.
 
 ### The gap the freeze found, and how it was closed
 
@@ -390,15 +398,35 @@ assumes that. SQLite does not:
 
 ### The freeze itself
 
-From here on, `Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and
-`Registry` are frozen: a change to any of their exported shapes is a stdlib
-API change under
-[`docs/release/VERSIONING.md`](../release/VERSIONING.md)'s surface 3, which
-takes at minimum a MINOR bump (MAJOR is pinned at 0 pre-1.0) whether the
-change is additive or breaking. Two independent drivers built against these
-seven names without moving one of them; a third driver is expected to extend
-`Value`'s reach through a new `sqlReqX`/`sqlOptX` pair, the way the rule above
-settles, not by asking any of the seven to change shape.
+`Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and `Registry` are frozen in
+the sense [`docs/release/VERSIONING.md`](../release/VERSIONING.md) gives
+that word: changing any of their exported shapes is a stdlib API change
+under surface 3, at minimum a MINOR bump (MAJOR is pinned at 0 pre-1.0)
+whether the change is additive or breaking - never a change that ships
+quietly. It is not a promise that `Value` stops at six variants forever;
+#6154 is the proof it does not, on the one condition the section above
+names: the accessor rule cannot reach the wire type any other way.
+
+What keeps that from being a moving target every driver has to re-guess is
+`match`'s own exhaustiveness (SPEC §13.8): a `match (v)` over `Value` with no
+trailing `_` is a compile error, `E0071`, the moment a variant is added and
+that call site does not name it. `Value`'s decoders and every driver's own
+encoders fall into two shapes on purpose, and only one of them needed to
+change. A type-specific accessor - `asText`, `sqlReqDecimal`, `sqlReqUuid`,
+`asBool` itself - already ends in `_ => fail ...`: it wants exactly one
+variant and rejects every other one the same way, so a new variant needs
+nothing from it; it fails the identical `TypeMismatch` it always would have.
+The functions that describe `Value` itself - `sqlValueKind`, every driver's
+own encoder (`paramType`/`paramData`, `bindParam`) - name every variant with
+no trailing `_`, because there is no single right answer for a variant those
+functions do not yet know about. #6154 only had to touch the second shape:
+`git grep 'Value\.'` across `stdlib/sql`, `pkg/postgres`, `pkg/mysql` and
+`pkg/orm` found every candidate site, and `E0071` caught the one it missed -
+a build failure naming the exact file and line, not a silent gap discovered
+later. So the honest version of this freeze is not "these seven never change
+shape"; it is "a variant is added only when the rule above cannot reach it,
+and when that happens, the compiler - not a hunt through the tree - says
+exactly which code needs to know."
 
 ## The connection pool
 
