@@ -97,7 +97,8 @@
 // root of `%L` is not re-executed between `h`'s test and the check, so both
 // compares read the same two values. Block 0 is refused: its params arrive
 // from the caller along no edge, so its edges do not hold every source. The
-// self test itself uses the strict all-edges-agree rule and never recurses.
+// self test itself uses the strict all-edges-agree rule and never recurses
+// into `bceParamSource`.
 //
 // WHICH REFUSALS ARE ACTUALLY EXERCISED, counted with a temporary probe over
 // `compiler` (243 files), `stdlib/regex`, the 13 bench cases and the fixture,
@@ -194,19 +195,58 @@ fn bceEdgeArg(lp: BceLoop, b: int, e: int, k: int): int {
   return args[k]
 }
 
+// Whether #5971's resolved compare (`bceSameDepth`) is on for this process.
+// Default OFF: it changes post-opt IR against the pinned stage0 0.29.0, so it
+// lands dark until the next repin flips the default; this predicate, the
+// `join` field it sets and the depth-0 arm it selects are deleted one release
+// after that. TEMPORARY.
+fn bceJoinEnabled(): bool {
+  return envOr("BIT_BCE_JOIN", "") == "1"
+}
+
 // The single value EVERY predecessor edge passes to block param `v`, or -1
 // when `v` is not a param, has no predecessors, or its sources disagree. It is
 // an EQUALITY, so stopping early is a true answer rather than a wrong one.
+//
+// A nested `if` whose then-arm falls through feeds the loop's outer join the
+// same value under two ids: the continuation's own param and the enclosing
+// block's param (#5971). So each edge argument is compared after resolving it
+// through single-source params, by this same strict rule and never
+// `bceParamSource`'s self-skipping one, `bceSameDepth` levels deep. Every
+// level is itself an equality, so a resolved argument holds exactly what the
+// raw one does, and the depth bound is what ends a walk around a loop.
 fn bceSameSource(lp: BceLoop, v: int): int {
+  lp.visits[0] = bceSameBudget
+  return bceSameSourceAt(lp, v, bceSameDepth(lp))
+}
+
+// The params one lookup may visit. Two agreeing edges each recurse, so a chain
+// of joins fans out up to 2^8 visits at depth 8; running out answers -1, "no
+// single source", which is always true.
+const bceSameBudget: int = 64
+
+// How many levels `bceSameRoot` resolves: the 8 steps `bceIsSelf` walks, or 0,
+// which compares raw ids, while `BIT_BCE_JOIN` is off.
+fn bceSameDepth(lp: BceLoop): int {
+  if (lp.join) {
+    return 8
+  }
+  return 0
+}
+
+// `bceSameSource` with `depth` levels of argument resolution left; depth 0
+// compares raw ids.
+fn bceSameSourceAt(lp: BceLoop, v: int, depth: int): int {
   let k = bceParamSlot(lp, v)
-  if (k < 0) {
+  if (k < 0 || lp.visits[0] <= 0) {
     return -1
   }
+  lp.visits[0] = lp.visits[0] - 1
   let b = lp.owner[v]
   let found = -1
   let e = lp.pm.start[b]
   while (e < lp.pm.start[b + 1]) {
-    let a = bceEdgeArg(lp, b, e, k)
+    let a = bceSameRoot(lp, bceEdgeArg(lp, b, e, k), depth)
     if (a < 0 || (found >= 0 && a != found)) {
       return -1
     }
@@ -214,6 +254,19 @@ fn bceSameSource(lp: BceLoop, v: int): int {
     e = e + 1
   }
   return found
+}
+
+// The value `a` holds once single-source params are resolved `depth` levels
+// deep: `a` itself at depth 0 or when it has no single source, -1 for -1.
+fn bceSameRoot(lp: BceLoop, a: int, depth: int): int {
+  if (a < 0 || depth == 0) {
+    return a
+  }
+  let r = bceSameSourceAt(lp, a, depth - 1)
+  if (r < 0) {
+    return a
+  }
+  return r
 }
 
 // True iff `a` is param `v` itself, or reaches it through params whose every
@@ -236,6 +289,9 @@ fn bceIsSelf(lp: BceLoop, a: int, v: int): bool {
 // The single value block param `v` can hold, or -1. The trivial-phi rule: an
 // edge that passes `v` back to itself is skipped, and the param equals the one
 // value every OTHER edge passes. -1 when no edge passes anything but `v`.
+// The other edges are compared by `bceSameRoot`, like `bceSameSource`'s: the
+// loop's outer join also carries the index, and a nested `if` feeds it
+// through two ids (#5971).
 fn bceParamSource(lp: BceLoop, v: int): int {
   let k = bceParamSlot(lp, v)
   if (k < 0) {
@@ -250,10 +306,12 @@ fn bceParamSource(lp: BceLoop, v: int): int {
       return -1
     }
     if (!bceIsSelf(lp, a, v)) {
-      if (found >= 0 && a != found) {
+      lp.visits[0] = bceSameBudget
+      let r = bceSameRoot(lp, a, bceSameDepth(lp))
+      if (found >= 0 && r != found) {
         return -1
       }
-      found = a
+      found = r
     }
     e = e + 1
   }
@@ -312,6 +370,8 @@ class BceLoop {
   h: int,
   k: int,
   iv: int,
+  join: bool,
+  visits: []int,
 }
 
 // One predecessor edge into `h`: 0 refuses the header, 1 accepts the edge as a
@@ -445,7 +505,8 @@ fn bceProveHeader(fc: BceFn, h: int) {
   }
   let lp = BceLoop{
     f = f, known = known, pm = fc.pm, owner = fc.owner, h = h, k = k, iv = cmp.lhs,
-    viaF = bceReachAvoiding(f, term.ival2, h, term.ival),
+    viaF = bceReachAvoiding(f, term.ival2, h, term.ival), join = bceJoinEnabled(),
+    visits = [0],
   }
   if (!bceIndexNonNegative(lp)) {
     return
@@ -591,6 +652,7 @@ fn checkBceRefusesTrueEntryWithTwoPredecessors() {
   let lp = BceLoop{
     f = f, known = known2, pm = licmPredMap(f), owner = licmOwners(f),
     h = 1, k = 0, iv = 3, viaF = bceReachAvoiding(f, term.ival2, 1, term.ival),
+    join = bceJoinEnabled(), visits = [0],
   }
   assert(bceIndexNonNegative(lp), "fixture must still admit the base+step induction proof")
   bceMarkProven(lp, 1)
