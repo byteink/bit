@@ -81,6 +81,24 @@ the whole reason this ships: every component below the served root is
 checked with an `lstat`, not just a lexical string check, because a pure
 string function cannot see a symlink.
 
+A `Range: bytes=start-end` request comes back `206 Partial Content` with a
+`Content-Range` header and exactly the requested bytes, seeked and read
+straight off disk at that offset - the read stays proportional to the range,
+never to the whole file, which is what makes a browser's video scrub bar or
+a resumable download work against a multi-gigabyte file with no more memory
+than the chunk it asked for. A range past the end of the file is `416 Range
+Not Satisfiable` with `Content-Range: bytes */<size>`. `If-Range` is
+honoured - a stale `ETag` or `Last-Modified` falls back to the full `200`,
+the same rule a conditional GET already follows - and every response this
+middleware serves carries `Accept-Ranges: bytes`. A request naming more than
+one range falls back to a full `200`: `multipart/byteranges` (RFC 9110
+§14.6) is not implemented, since no mainstream client asks for more than one
+range at a time.
+
+`fileRes(path, c)` is the same Range/conditional-GET machinery for a single,
+already-authorized file a route handler decides to serve - see
+[The response](response.md) for it.
+
 ## Compression
 
 `compress()` gzips the response body when the client's `Accept-Encoding`
