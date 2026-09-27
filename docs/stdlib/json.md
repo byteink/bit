@@ -241,6 +241,72 @@ fn encodeExample(): string {
 }
 ```
 
+### Appending without a `Json` tree
+
+Each of these appends one JSON scalar, key, or raw run directly onto a
+`[]byte` accumulator, byte-identical to encoding the matching `Json` value
+with `jsonEncode` — for generated or hand-written code building a document
+without allocating a `JsonObject`/`JsonArray` tree first.
+
+### `jsonAppendRaw(out: []byte, s: string): []byte`
+
+Appends `s` onto `out` verbatim, with no escaping — for text that is already
+valid JSON, such as a nested value's own encoded bytes.
+
+### `jsonAppendKey(out: []byte, key: string, first: bool): []byte`
+
+Appends one object entry's separator and key onto `out`: `,` unless `first`
+is `true`, then `key` escaped and quoted, then `:`.
+
+### `jsonAppendString(out: []byte, s: string): []byte`
+
+Appends `s` as an escaped, quoted JSON string. Same bytes as encoding
+`Json.JsonString(s)`.
+
+### `jsonAppendInt(out: []byte, v: i64): []byte`
+
+Appends `v` as a JSON number. Same bytes as encoding `Json.JsonInt(v)`.
+
+### `jsonAppendFloat(out: []byte, v: f64): []byte`
+
+Appends `v` as a JSON number, reshaped the same way `jsonEncode` reshapes a
+`JsonFloat` (see above: non-finite values, integral values, extreme
+magnitudes). Same bytes as encoding `Json.JsonFloat(v)`.
+
+### `jsonAppendBool(out: []byte, v: bool): []byte`
+
+Appends `true` or `false`. Same bytes as encoding `Json.JsonBool(v)`.
+
+### `jsonAppendNull(out: []byte): []byte`
+
+Appends the literal `null`. Same bytes as encoding `Json.JsonNull`.
+
+```bit
+import {
+  jsonAppendRaw, jsonAppendKey, jsonAppendString, jsonAppendInt,
+  jsonAppendFloat, jsonAppendBool, jsonAppendNull,
+} from "std/json"
+
+fn appendExample(): string {
+  let out = []byte(0, 64)
+  out = append(out, '{')
+  out = jsonAppendKey(out, "name", true)
+  out = jsonAppendString(out, "bit")
+  out = jsonAppendKey(out, "count", false)
+  out = jsonAppendInt(out, 2)
+  out = jsonAppendKey(out, "ratio", false)
+  out = jsonAppendFloat(out, 0.5)
+  out = jsonAppendKey(out, "ok", false)
+  out = jsonAppendBool(out, true)
+  out = jsonAppendKey(out, "extra", false)
+  out = jsonAppendNull(out)
+  out = jsonAppendKey(out, "raw", false)
+  out = jsonAppendRaw(out, "[1,2,3]")
+  out = append(out, '}')
+  return string(out)
+}
+```
+
 ## Parsing
 
 A recursive-descent parser over the lexer's token stream, building a `Json`
