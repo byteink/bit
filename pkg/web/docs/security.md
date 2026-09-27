@@ -123,6 +123,45 @@ fn mount(app: App) {
 lets a cross-origin request carry cookies; it is only ever sent alongside an
 echoed origin, never alongside a wildcard.
 
+## Serving over TLS
+
+`app.listen()` serves plain HTTP - fine behind a proxy that terminates TLS
+for you, wrong for anything that answers the internet directly.
+`app.listenTls()` and `app.serveTls()` bind the same routes over TLS
+instead, given a certificate chain and matching private key (both PEM):
+
+```bit
+import { App, Config } from "web"
+import { readFile } from "std/fs"
+
+fn main(): ()! {
+  let app = App(
+    Config{
+      secret = "change-me",
+      certPem = readFile("cert.pem")?,
+      keyPem = readFile("key.pem")?,
+    },
+  )
+  app.get("/", (c) => c.text("ok"))
+  app.listenTls()?
+}
+```
+
+Both fail immediately, naming the missing field, if either `certPem` or
+`keyPem` is still empty - there is no placeholder certificate the framework
+falls back to. A client that speaks HTTP/2 is served over it automatically
+(negotiated by ALPN on the same TLS connection, no separate step), and
+HTTP/3 is served over QUIC on the same port number, on UDP - the response's
+`Alt-Svc` header advertises it, so a client that already speaks HTTP/3 can
+open that connection directly on a later request.
+
+`app.serveTls()` is the TLS mirror of [`app.serve()`](operations.md): it
+returns the running `TlsServer` immediately instead of blocking, so you can
+call `server.shutdown(timeoutMs)` on it later - see
+[Graceful shutdown](operations.md) for what that guarantees. Its shutdown
+drains the TLS connection's HTTP/1.1 and HTTP/2 traffic; an HTTP/3 request
+in flight at the moment `shutdown()` is called is not drained yet.
+
 ## The standard security headers
 
 `secureHeaders(o)` sets the eight headers that belong on every response -
@@ -130,10 +169,11 @@ echoed origin, never alongside a wildcard.
 `Content-Security-Policy` wholesale (no merging, no per-directive override);
 the empty string omits it entirely, the right setting for an API that never
 returns a document a browser renders. `https: true` is the app's own
-declaration that every request arrives over TLS (this package cannot detect
-it - `listenAndServe` serves plaintext TCP, and a deployment terminating TLS
-in a proxy is the only party that knows), and is what turns on
-`Strict-Transport-Security`.
+declaration that every request arrives over TLS - true whether that TLS
+connection is terminated by `app.listenTls()`/`app.serveTls()` themselves or
+by a proxy in front of a plain `app.listen()`, since either way this package
+has no way to tell the two apart from inside a handler - and is what turns
+on `Strict-Transport-Security`.
 
 ```bit
 import { App, Headers, secureHeaders } from "web"
