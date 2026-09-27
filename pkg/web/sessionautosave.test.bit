@@ -1,0 +1,240 @@
+// pkg/web/sessionautosave.test.bit — #6110's acceptance: a dirty session is
+// persisted once the handler returns with no explicit `save()`, an untouched
+// session makes zero store calls, `regenerate()` and `destroy()` both
+// compose correctly with autosave, a handler failure still autosaves a write
+// made before it failed, and a store failure while autosaving becomes a 500
+// through the normal error path rather than a swallowed write.
+//
+// Split out of adapter.test.bit (#4496's own session-close-out suite) purely
+// to stay under the 800-line file ceiling — same reason memorycounter.test.bit
+// is split out of ratelimit.bit's tests. `App`, `Config`, `Ctx`, `Request`,
+// `Res`, `MemoryStore`, `contains` and `newError` are already bound
+// module-wide; `req`, `sessionApp`, `freezeOrPanic`, `newSink` and `sinkText`
+// are adapter.test.bit's own fixtures, reused here as a same-module sibling
+// (an import binds per MODULE, SPEC §17.1) — not re-declared or re-imported
+// (E0042). This file imports nothing.
+
+fn reqWithCookie(method: string, target: string, cookie: string): Request {
+  if (len(cookie) == 0) {
+    return req(method, target)
+  }
+  return Request{ method = method, path = target, headers = "Cookie: " + cookie, body = "" }
+}
+
+fn touchNoSaveHandler(c: Ctx): Res! {
+  let s = c.session()?
+  s.set("k", "v")
+  return c.text("hi")
+}
+
+fn readKHandler(c: Ctx): Res! {
+  let s = c.session()?
+  return c.text(s.get("k"))
+}
+
+test "set() with no explicit save() still persists across requests" {
+  let app = sessionApp()
+  app.get("/touch", touchNoSaveHandler)
+  app.get("/read", readKHandler)
+  freezeOrPanic(app)
+
+  let first = app.handle(req("GET", "/touch"))
+  let cookie = first.getHeader("Set-Cookie")
+  assert(len(cookie) > 0, "precondition: a fresh session must issue a Set-Cookie")
+
+  let second = app.handle(reqWithCookie("GET", "/read", cookie))
+  assert(
+    second.body == "v",
+    "autosave must have written 'k'='v' with no explicit save(), got '${second.body}'",
+  )
+}
+
+// A `SessionStore` around a real `MemoryStore` that counts every call —
+// `MemoryStore.entries` alone cannot tell a `load` that found nothing from a
+// `load` that was never made, and this ticket's acceptance is specifically
+// that an untouched session makes ZERO store calls, not merely zero writes.
+class CountingStore {
+  inner: MemoryStore
+  loads: int
+  writes: int
+  export load(sid: string): Option<(map<string, string>, i64)>! {
+    this.loads = this.loads + 1
+    return this.inner.load(sid)?
+  }
+  export compareAndSet(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    this.writes = this.writes + 1
+    return this.inner.compareAndSet(sid, expectedVersion, data, ttl)?
+  }
+  export destroy(sid: string, tombstoneTtl: i64): ()! {
+    this.writes = this.writes + 1
+    return this.inner.destroy(sid, tombstoneTtl)?
+  }
+}
+
+fn newCountingStore(): CountingStore {
+  return CountingStore{ inner = MemoryStore(1000), loads = 0, writes = 0 }
+}
+
+test "a request that never touches the session makes zero store calls" {
+  let store = newCountingStore()
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  app.get("/plain", (c) => c.text("hi"))
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/plain"))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(
+    store.loads == 0,
+    "an untouched session must not read the store, got ${store.loads} load(s)",
+  )
+  assert(
+    store.writes == 0,
+    "an untouched session must not write the store, got ${store.writes} write(s)",
+  )
+}
+
+// regenerate() (session.test.bit's own suite covers the object directly;
+// this proves the request-lifecycle wiring around it — a SET made AFTER
+// regenerate(), with no explicit save(), must reach the store under the
+// NEW id.
+fn promoteHandler(c: Ctx): Res! {
+  let s = c.session()?
+  s.regenerate()?
+  s.set("role", "admin")
+  return c.text("hi")
+}
+
+test "regenerate() then set() with no explicit save() persists under the new id" {
+  let app = sessionApp()
+  app.get("/touch", touchNoSaveHandler)
+  app.get("/promote", promoteHandler)
+  app.get("/read-role", (c) => c.text(c.session()?.get("role")))
+  freezeOrPanic(app)
+
+  let pre = app.handle(req("GET", "/touch"))
+  let preCookie = pre.getHeader("Set-Cookie")
+  assert(len(preCookie) > 0, "precondition: /touch must mint a session")
+
+  let promoted = app.handle(reqWithCookie("GET", "/promote", preCookie))
+  let newCookie = promoted.getHeader("Set-Cookie")
+  assert(len(newCookie) > 0, "regenerate() must arm a new Set-Cookie")
+  assert(newCookie != preCookie, "regenerate() must rotate the id")
+
+  let after = app.handle(reqWithCookie("GET", "/read-role", newCookie))
+  assert(
+    after.body == "admin",
+    "autosave must have written 'role', set AFTER regenerate(), got '${after.body}'",
+  )
+}
+
+// destroy() (session.test.bit's own suite covers the object directly): a
+// handler that destroys and returns, with no explicit save(), must neither
+// error nor resurrect the session — `save()`'s dirty check already no-ops
+// after `destroy()` clears it (session.bit), autosave just has to not add a
+// special case on top.
+fn logoutHandler(c: Ctx): Res! {
+  let s = c.session()?
+  s.set("k", "v")
+  s.destroy()?
+  return c.text("bye")
+}
+
+test "destroy() with no explicit save() answers normally and does not resurrect the session" {
+  let app = sessionApp()
+  app.get("/touch", touchNoSaveHandler)
+  app.get("/logout", logoutHandler)
+  app.get("/read", readKHandler)
+  freezeOrPanic(app)
+
+  let logged = app.handle(req("GET", "/touch"))
+  let cookie = logged.getHeader("Set-Cookie")
+
+  let out = app.handle(reqWithCookie("GET", "/logout", cookie))
+  assert(out.status == 200, "destroy() must not turn into a failure, got ${out.status}")
+
+  let after = app.handle(reqWithCookie("GET", "/read", cookie))
+  assert(after.body == "", "autosave resurrected a destroyed session: '${after.body}'")
+}
+
+// A handler that fails after writing to the session (including a panic
+// recovered by `recover()`, recover.bit — both reach `chainResponse`'s same
+// `catch` branch, session.bit's own design note on `save()`'s reason for
+// existing) still gets its write autosaved. Most frameworks (Express's
+// express-session saves regardless of the final status code) treat a
+// session write as data the app meant to keep, independent of whether the
+// REQUEST that made it went on to succeed — an audit trail entry, a
+// half-completed wizard step. The alternative (skip the save on any
+// failure) would make whether a `set()` survives depend on an unrelated
+// later line of handler code, which is a worse surprise than this one.
+fn touchThenFailHandler(c: Ctx): Res! {
+  let s = c.session()?
+  s.set("k", "v")
+  fail newError("handler: deliberate failure")
+}
+
+test "a dirty session is still autosaved when the handler itself fails" {
+  let app = sessionApp()
+  app.get("/fail", touchThenFailHandler)
+  app.get("/read", readKHandler)
+  freezeOrPanic(app)
+
+  let failed = app.handle(req("GET", "/fail"))
+  assert(failed.status == 500, "want the handler's failure mapped to 500, got ${failed.status}")
+  let cookie = failed.getHeader("Set-Cookie")
+  assert(len(cookie) > 0, "a session minted before a failure must still get a Set-Cookie")
+
+  let after = app.handle(reqWithCookie("GET", "/read", cookie))
+  assert(
+    after.body == "v",
+    "a write made before a handler failure must still be autosaved, got '${after.body}'",
+  )
+}
+
+// A `SessionStore` whose write always fails — this ticket's acceptance that
+// a save failure becomes a 500 through the normal error path, never a 200
+// whose data the store never received.
+class FailingStore {
+  calls: int
+  export load(sid: string): Option<(map<string, string>, i64)>! {
+    return Option.None
+  }
+  export compareAndSet(
+    sid: string,
+    expectedVersion: i64,
+    data: map<string, string>,
+    ttl: i64,
+  ): i64! {
+    fail newError("web: test: FailingStore refuses every write")
+  }
+  export destroy(sid: string, tombstoneTtl: i64): ()! {
+    return
+  }
+}
+
+fn setKStatusHandler(c: Ctx): Res! {
+  let s = c.session()?
+  s.set("k", "v")
+  return c.text("hi").status(202)
+}
+
+test "a session store failure while autosaving becomes a 500, never the handler's own response" {
+  let sink = newSink()
+  let app = App(Config{ secret = "test-secret", sessions = FailingStore{ calls = 0 }, logs = sink })
+  app.get("/set", setKStatusHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/set"))
+
+  assert(res.status == 500, "want the framework's 500 on a save failure, got ${res.status}")
+  assert(res.body != "hi", "the handler's own 202 response must not reach the client")
+  assert(
+    contains(sinkText(sink), "FailingStore refuses"),
+    "the real save failure must be logged, got: '${sinkText(sink)}'",
+  )
+}
