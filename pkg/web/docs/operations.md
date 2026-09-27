@@ -165,4 +165,44 @@ already decides your process should stop.
 `app.listen()` is unchanged, and still the right call for a program that
 has nothing else to do once it starts serving.
 
+## Idempotency keys
+
+```bit
+import { App, IdempotencyPolicy, MemoryIdempotencyStore, idempotency } from "web"
+
+fn mount(app: App) {
+  let store = MemoryIdempotencyStore(10_000)
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 86400 }))
+}
+```
+
+A request carrying an `Idempotency-Key` header runs its handler once. A
+retry with the same key and the same method, path and body gets back the
+exact response the first attempt produced, handler unrun. A retry with the
+same key and a different body is `422` - never a silent replay of someone
+else's answer. A second request racing the first while it is still running
+is `409`: the key is reserved the instant the first request arrives, not
+once it finishes.
+
+A request with no `Idempotency-Key` header is untouched, so this is usually
+mounted on the write routes that need it rather than the whole app -
+`app.group("/api").use(idempotency(p))` - since a safe method has no reason
+to send the header at all.
+
+**You supply the store; there is no default**, the same rule `rateLimit`'s
+counter and `Config.sessions` both carry: an in-process store is invisible
+to a retry that lands on a different server behind a load balancer, and a
+duplicate request would run the handler again with nobody able to tell.
+`MemoryIdempotencyStore(maxKeys)` ships and is single-process only; a store
+shared across processes implements `IdempotencyStore`
+(`begin`/`finish`/`abandon` - `begin` is the one call that must be atomic,
+the same requirement `RateStore.incr` answers for a counter).
+
+`ttl` is how long a key is remembered, in seconds, from whichever of
+`begin()`/`finish()` last touched it - there is no default, because how long
+a client may safely retry is a fact about the endpoint. A handler that
+raises releases its reservation so a retry after a failed attempt is not
+stuck behind it; a handler that panics does not, and the reservation lives
+out its `ttl` before a retry can run again.
+
 Next: [Errors](errors.md).

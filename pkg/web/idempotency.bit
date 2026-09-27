@@ -1,0 +1,452 @@
+// pkg/web/idempotency.bit — the idempotency-key middleware (#6077): a
+// request carrying `Idempotency-Key` runs its handler once. A retry with the
+// same key and the same request replays the stored response instead of
+// running it again; a retry with the same key and a DIFFERENT request is
+// refused; two requests racing the same never-seen key are told apart.
+//
+//     app.use(idempotency(IdempotencyPolicy{
+//       store = MemoryIdempotencyStore(10_000),
+//       ttl = 86400,
+//     }))
+//
+// Usually mounted on the write routes that need it, not the whole app —
+// `app.group("/api").use(idempotency(p))` — since a safe method has no
+// reason to send the header at all and this file never looks at the method
+// to decide whether to apply.
+//
+// ## The store is the app's, and there is no default
+//
+// Same shape as `SessionStore` (session.bit) and `RateStore` (ratelimit.bit):
+// `IdempotencyPolicy.store` has no default and `idempotency()` panics at
+// REGISTRATION when it is absent — see ratelimit.bit's file header for why a
+// middleware can catch this at registration when a session store cannot. An
+// in-process store is correct on one process and silently wrong behind a
+// load balancer, where a retry that lands on a different server never sees
+// the first attempt at all — the exact duplicate this middleware exists to
+// prevent, reintroduced by the store that is supposed to prevent it.
+// `MemoryIdempotencyStore` below ships for development and tests and is
+// never the default.
+//
+// ## The fingerprint, and why it is not just the body
+//
+// A retry is recognised by `Idempotency-Key` PLUS a fingerprint of method,
+// path and body — SHA-256, hex (`requestFingerprint`). Method and path are
+// in it because a key is a value the CLIENT invents: nothing stops a client,
+// or a bug, from reusing the same key against two different endpoints, and
+// replaying endpoint A's cached response to a request aimed at endpoint B
+// would be a wrong answer no HTTP status could excuse. A key reused for the
+// SAME endpoint with a different body is the case the ticket names
+// explicitly — 422, never a silent replay of stale data.
+//
+// ## One atomic transition decides everything
+//
+// `IdempotencyStore.begin()` is the one operation that must be atomic: two
+// requests racing a never-seen key must not both be told to proceed, the
+// same requirement `RateStore.incr` answers for a counter. It reserves the
+// key `InFlight` and returns `Option.None` to the WINNER only; every other
+// caller — including one that raced it by a nanosecond — gets back the entry
+// the winner just wrote: `409` while `InFlight`, the cached response once
+// `finish()` moves it to `Done`, `422` if its own fingerprint disagrees with
+// what is stored.
+//
+// A handler that raises releases its reservation (`abandon()`) so a retry
+// after a failed attempt is not stuck behind a dead `InFlight` marker for the
+// full `ttl`. A PANIC cannot be caught here (SPEC §18.4: "There is no
+// `recover`"), so it leaves the reservation `InFlight` until `ttl` passes —
+// the same direction `RateStore`'s store-outage case is wrong in, and
+// bounded by the same mechanism: time.
+//
+// ## Two store failures, two different answers
+//
+// `begin()` failing means the middleware cannot tell whether a duplicate is
+// already in flight, and running the handler anyway would risk the exact
+// double-execution this file exists to prevent — so that failure is
+// PROPAGATED (`?`), the safe direction here unlike `RateStore`'s fail-open,
+// because the cost of failing open is a duplicate side effect rather than a
+// few extra requests. `finish()` failing means the real response was already
+// computed correctly and only the CACHE WRITE for a future retry failed —
+// discarding a correct response over that would be worse than serving it
+// uncached, so that failure is logged and the response goes out regardless
+// (`rateStoreOpen`'s reasoning, ratelimit.bit).
+//
+// `Header`, `Option`/`isSome`/`unwrap`, `logLine`, `newRes`, `textContentType`,
+// `Mutex`/`newMutex`, `now`, `nsPerSecond` are already bound module-wide
+// (res.bit, ctx.bit, adapter.bit, memorystore.bit) — an import binds per
+// MODULE (SPEC §17.1), so re-importing or redeclaring any of them here is
+// E0042. `newSha256` is already bound by csrf.bit; `digest` is not bound
+// anywhere yet, so it is the only new import this file needs. `statusConflict`
+// (409) and `statusUnprocessable` (422) are already declared module-private
+// by errors.bit — reused here, not redeclared.
+
+import { digest } from "std/crypto"
+
+const idempotencyKeyHeaderName = "Idempotency-Key"
+
+const conflictBody = "Conflict: a request with this Idempotency-Key is already in progress"
+const mismatchBody = "Unprocessable Entity: this Idempotency-Key was already used with a different request"
+
+// What one stored key is doing. `InFlight` is declared first so it is this
+// type's zero value (SPEC §13.4, an enum variant carrying no payload) —
+// never relied on: every `IdempotencyEntry` this file builds sets `state`
+// explicitly.
+export enum IdempotencyState {
+  InFlight,
+  Done,
+}
+
+// A captured response, in the shape a store can persist and `replay()` can
+// rebuild without a second, store-specific reconstruction rule. `headers`
+// mirrors `Res.headerList()` (res.bit) — `Content-Type`, when there is one,
+// first — so replaying is nothing but replaying each header through the same
+// public `header()` a handler itself would call.
+export class CachedResponse {
+  export status: int,
+  export body: string,
+  export headers: []Header,
+}
+
+// What `IdempotencyStore.begin()` reports when `key` is already claimed — by
+// this same request's own earlier attempt, by a request racing it right now,
+// or by a request that reused the key for a different body. Which of those
+// it is is exactly `state`, `fingerprint` and `response` together;
+// `idempotency()` never sees a store's internal representation, only this.
+export class IdempotencyEntry {
+  export state: IdempotencyState,
+  export fingerprint: string,
+  // Populated only when `state == IdempotencyState.Done`. Left at its zero
+  // value (`CachedResponse{}`) while `InFlight` — nothing here ever reads it
+  // in that case, so there is nothing to get wrong by leaving it empty.
+  export response: CachedResponse,
+}
+
+// A store of idempotency reservations and cached responses, keyed by the
+// client-supplied `Idempotency-Key`. Structural (SPEC §14.3): a type
+// satisfies this by having the three methods, with no declaration anywhere —
+// `MemoryIdempotencyStore` below, a future Redis- or PostgreSQL-backed store
+// and an app's own all satisfy it the same way.
+export interface IdempotencyStore {
+  // THE atomic step — see the file header. Absent or expired: creates the
+  // reservation `InFlight` under `fingerprint`, valid for `ttl` seconds from
+  // now, and returns `Option.None` — the CALLER is now the one request that
+  // gets to run the handler. Already claimed: returns the existing
+  // `IdempotencyEntry` UNCHANGED, whatever its state.
+  begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>!,
+  // Moves `key` from `InFlight` to `Done`, storing `resp` for exactly `ttl`
+  // seconds counted from THIS call — not extending whatever `begin()` set,
+  // so a slow handler's cached answer lives the full window a fast one's
+  // would (the same "does not extend on reuse" contract `RateStore.incr`'s
+  // `ttl` carries).
+  finish(key: string, resp: CachedResponse, ttl: i64): ()!,
+  // Releases `key`'s reservation with no response recorded, so a retry after
+  // a FAILED attempt is not stuck behind a dead `InFlight` marker. See the
+  // file header on when this runs and why it cannot be relied on to always
+  // run.
+  abandon(key: string): ()!,
+}
+
+// One idempotency policy, as the app writes it down.
+//
+//     IdempotencyPolicy{ store = myStore, ttl = 86400 }
+//
+// Both fields are required. `store` has no default because a default
+// idempotency store is exactly the footgun the file header describes;
+// `ttl` because how long a client may safely retry is a fact about the
+// endpoint, not a number the framework can guess. Omitting either is caught
+// by `checkPolicy` at registration, naming the field.
+export class IdempotencyPolicy {
+  // Where reservations and cached responses live. NO DEFAULT — see the file
+  // header.
+  export store: IdempotencyStore,
+  // Seconds a key is remembered. At least 1. NO DEFAULT — see above.
+  export ttl: i64,
+}
+
+// The middleware. Registered like any other (`app.use(idempotency(p))` or
+// scoped with `group.use(...)`), so it wraps everything registered after it
+// on the same scope.
+//
+// A misconfigured `IdempotencyPolicy` panics HERE, at the `use()` call,
+// before any request exists — `rateLimit`'s reason: `idempotency(p)` is
+// itself the registration, the whole policy is in hand at that moment, and a
+// misconfigured one must not become a middleware that silently runs every
+// handler twice.
+//
+// A request with NO `Idempotency-Key` header is untouched — this is not the
+// route's safety net, it is the opt-in the client makes by sending the
+// header at all.
+export fn idempotency(p: IdempotencyPolicy): Middleware {
+  checkPolicy(p)
+  return (c, next) => {
+    let key = c.header(idempotencyKeyHeaderName)
+    if (len(key) == 0) {
+      return next(c)?
+    }
+    let body = c.rawBody()?
+    let fp = requestFingerprint(c.method(), c.path(), body)
+    let found = p.store.begin(key, fp, p.ttl)?
+    if (isSome(found)) {
+      return replayOrRefuse(unwrap(found), fp)
+    }
+    return runOnce(p, c, next, key)
+  }
+}
+
+// Refuses an `IdempotencyPolicy` the framework cannot honour, naming the
+// field to fix. A panic and not a failure, for `checkLimit`'s reason
+// (ratelimit.bit): answering a deployment mistake with the same behaviour a
+// legitimate request gets would turn it into a middleware that is merely,
+// silently wrong.
+fn checkPolicy(p: IdempotencyPolicy) {
+  if (p.store == nil) {
+    panic(
+        "web: idempotency(): no store — set the `store` field on IdempotencyPolicy, for " +
+        "example `IdempotencyPolicy{ store: MemoryIdempotencyStore(10_000), ttl: 86400 }`. " +
+        "This framework ships no default idempotency store on purpose: an in-process " +
+        "store is invisible to a retry that lands on a different server behind a load balancer.",
+    )
+  }
+  if (p.ttl < 1) {
+    panic("web: idempotency(): `ttl` is ${p.ttl} second(s) — a key must be remembered for at least one second")
+  }
+}
+
+// This request WON the reservation `idempotency()` just created — it is the
+// one request that runs the handler. `key` was already returned by
+// `begin()`, so this never re-derives it.
+fn runOnce(p: IdempotencyPolicy, c: Ctx, next: Next, key: string): Res! {
+  let r = next(c) catch e {
+    p.store.abandon(key) catch ae {
+      logLine(
+        c.config.logs,
+        "web: idempotency(): abandon(${key}) failed after the handler itself failed: ${ae.message()}",
+      )
+    }
+    fail e
+  }
+  let cached = CachedResponse{ status = r.statusCode(), body = r.body(), headers = r.headerList() }
+  p.store.finish(key, cached, p.ttl) catch e {
+    logLine(
+      c.config.logs,
+      "web: idempotency(): finish(${key}) failed, this response was NOT cached: ${e.message()}",
+    )
+  }
+  return r
+}
+
+// What a request against an ALREADY-CLAIMED key gets back — a fingerprint
+// mismatch outranks the state, because a wrong body is a different request
+// regardless of whether the first one is still running or long finished.
+fn replayOrRefuse(e: IdempotencyEntry, fp: string): Res {
+  if (e.fingerprint != fp) {
+    return mismatchRes()
+  }
+  if (e.state == IdempotencyState.InFlight) {
+    return conflictRes()
+  }
+  return replay(e.response)
+}
+
+// Rebuilds a `Res` from a `CachedResponse`, through nothing but the public
+// `header()` any handler would call — so a header that meant something
+// special to `Res` (`Content-Type`) still lands in the same field a fresh
+// response would put it in, with no second copy of that rule here.
+fn replay(cached: CachedResponse): Res {
+  let r = newRes(cached.status, "", cached.body)
+  for h of cached.headers {
+    r.header(h.name, h.value)
+  }
+  return r
+}
+
+fn conflictRes(): Res {
+  return newRes(statusConflict, textContentType, conflictBody)
+}
+
+fn mismatchRes(): Res {
+  return newRes(statusUnprocessable, textContentType, mismatchBody)
+}
+
+// SHA-256 of method, path and body, hex — see the file header on why method
+// and path are in it and not just the body.
+fn requestFingerprint(method: string, path: string, body: string): string {
+  return encodeHex(digest(newSha256(), []byte(method + "\n" + path + "\n" + body)))
+}
+
+// --- the in-process store ----------------------------------------------------
+
+// How many `begin`/`finish` calls pass between sweeps of expired entries —
+// `memoryCounterSweepEvery`'s reasoning exactly (ratelimit.bit): a sweep is
+// O(n) over the map, so sweeping on every call would make every call O(n).
+const memoryIdempotencySweepEvery: int = 64
+
+const memoryIdempotencyCapMessage = "web: MemoryIdempotencyStore(maxKeys): the cap must be " +
+  "at least 1, for example `MemoryIdempotencyStore(10_000)`. It is the largest number " +
+  "of idempotency keys this store will hold; a begin() past it evicts the " +
+  "soonest-expiring key rather than failing."
+
+// One stored reservation or cached response. `expiresAtSec` is absolute
+// rather than a ttl plus a write time, so expiry is one comparison and no
+// arithmetic can drift between two fields.
+class MemoryIdempotencyRecord {
+  state: IdempotencyState,
+  fingerprint: string,
+  response: CachedResponse,
+  expiresAtSec: i64,
+}
+
+// The in-process `IdempotencyStore`. It ships, and it is never the default —
+// see the file header. SINGLE PROCESS ONLY, `MemoryCounter`'s reason: a
+// retry that lands on a different server behind a load balancer never sees
+// this process's reservation or cached response, so the two requests race
+// exactly as if there were no middleware at all.
+//
+// BOUNDED (`maxKeys`), swept every `memoryIdempotencySweepEvery` calls, and
+// evicts the soonest-expiring entry when full — the same three properties
+// `MemoryCounter` and `MemoryStore` both carry, for the same reason: the key
+// is client-supplied, so unbounded is a memory-growth vector reachable by
+// anyone who can send a header.
+export class MemoryIdempotencyStore {
+  entries: map<string, MemoryIdempotencyRecord>
+  // The ceiling on `len(entries)`, from the constructor. No default, for
+  // `MemoryCounter.maxKeys`'s reason.
+  maxKeys: int
+  // Calls to `beginAt`/`finishAt` since the last sweep of expired entries.
+  // Reset by it.
+  writesSinceSweep: int
+  // A store is shared by every request and requests are concurrent; the map
+  // is not safe for concurrent use, so every method takes the lock.
+  mu: Mutex
+
+  init(maxKeys: int) {
+    // A panic rather than a fallible `init`, `MemoryCounter.init`'s reason:
+    // a store built with a cap of 0 or a negative one is a programming error
+    // at startup, not a runtime condition the caller could answer.
+    if (maxKeys < 1) {
+      panic(memoryIdempotencyCapMessage)
+    }
+    this.entries = map<string, MemoryIdempotencyRecord>()
+    this.maxKeys = maxKeys
+    this.writesSinceSweep = 0
+    this.mu = newMutex()
+  }
+
+  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+    return this.beginAt(key, fingerprint, ttl, now().ns / nsPerSecond)
+  }
+
+  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+    this.finishAt(key, resp, ttl, now().ns / nsPerSecond)
+  }
+
+  export abandon(key: string): ()! {
+    this.abandonAt(key)
+  }
+
+  // `begin` against a caller-supplied clock — `MemoryCounter.incrAt`'s
+  // reason: a test can then prove a positive ttl really expires and the
+  // eviction order, deterministically, without sleeping.
+  //
+  // THE ATOMIC STEP. Everything from the lock to the write below runs under
+  // one `Mutex`, so two callers racing the same never-seen key cannot both
+  // read "absent" — the same property `MemoryCounter.incrAt`'s single atomic
+  // increment gives a counter, here for a whole reservation.
+  beginAt(key: string, fingerprint: string, ttl: i64, nowSec: i64): Option<IdempotencyEntry> {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.sweepIfDue(nowSec)
+    let (e, ok) = this.entries[key]
+    if (ok && e.expiresAtSec > nowSec) {
+      return Option.Some(
+        IdempotencyEntry{ state = e.state, fingerprint = e.fingerprint, response = e.response },
+      )
+    }
+    if (!ok && len(this.entries) >= this.maxKeys) {
+      this.evictSoonestExpiring()
+    }
+    this.entries[key] = MemoryIdempotencyRecord{
+      state = IdempotencyState.InFlight,
+      fingerprint = fingerprint,
+      response = CachedResponse{},
+      expiresAtSec = nowSec + ttl,
+    }
+    return Option.None
+  }
+
+  // `finish` against a caller-supplied clock. Unconditional: a handler whose
+  // reservation expired mid-flight still gets to cache its answer rather
+  // than losing it to a race with its own ttl — refusing a late finish would
+  // only lose a real, correctly computed response.
+  finishAt(key: string, resp: CachedResponse, ttl: i64, nowSec: i64) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (e, ok) = this.entries[key]
+    let fp = ""
+    if (ok) {
+      fp = e.fingerprint
+    }
+    if (!ok && len(this.entries) >= this.maxKeys) {
+      this.evictSoonestExpiring()
+    }
+    this.entries[key] = MemoryIdempotencyRecord{
+      state = IdempotencyState.Done,
+      fingerprint = fp,
+      response = resp,
+      expiresAtSec = nowSec + ttl,
+    }
+  }
+
+  // Drops the reservation outright rather than merely marking it — an
+  // abandoned key must be immediately retryable, not merely "not `InFlight`
+  // for a little while longer" the way ttl expiry is for every other case.
+  abandonAt(key: string) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    delete(this.entries, key)
+  }
+
+  sweepIfDue(nowSec: i64) {
+    this.writesSinceSweep = this.writesSinceSweep + 1
+    if (this.writesSinceSweep >= memoryIdempotencySweepEvery) {
+      this.writesSinceSweep = 0
+      this.sweepExpired(nowSec)
+    }
+  }
+
+  // Drops every entry whose ttl has passed at `nowSec`. Keys are collected
+  // first and deleted after: mutating a map while iterating it is not a
+  // thing to rely on.
+  //
+  // The LOCK IS ALREADY HELD by `beginAt`, the only caller. `Mutex` is not
+  // reentrant, so this must not take it.
+  sweepExpired(nowSec: i64) {
+    let dead = []string(0)
+    for (key, e) of this.entries {
+      if (e.expiresAtSec <= nowSec) {
+        dead = append(dead, key)
+      }
+    }
+    for key of dead {
+      delete(this.entries, key)
+    }
+  }
+
+  // Drops the entry that expires soonest — already-expired entries first,
+  // since an expired one has the smallest `expiresAtSec` of all.
+  //
+  // The LOCK IS ALREADY HELD by `beginAt` or `finishAt`, its only callers.
+  evictSoonestExpiring() {
+    let victim = ""
+    let victimSec: i64 = 0
+    let found = false
+    for (key, e) of this.entries {
+      if (!found || e.expiresAtSec < victimSec) {
+        victim = key
+        victimSec = e.expiresAtSec
+        found = true
+      }
+    }
+    if (found) {
+      delete(this.entries, victim)
+    }
+  }
+}

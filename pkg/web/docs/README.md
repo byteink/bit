@@ -12,7 +12,7 @@ instead of dropped, so keeping it current is part of writing a chapter.
 | [The response](response.md) | Building a `Res`, the `Node` HTML tree, and escaping. |
 | [Middleware](middleware.md) | `app.use`/`group.use`, how far each one's scope reaches, and error handlers. |
 | [Sessions, CSRF and security](security.md) | Server-side sessions, the CSRF token that binds to one, CORS, serving over TLS/HTTP/2/HTTP/3, and the standard security headers. |
-| [Operational middleware](operations.md) | Rate limiting, serving static files, gzip, request logging, tracing, panic recovery and graceful shutdown. |
+| [Operational middleware](operations.md) | Rate limiting, serving static files, gzip, request logging, tracing, panic recovery, graceful shutdown and idempotency keys. |
 | [Errors](errors.md) | The `HttpError` opt-in that decides what a client is allowed to read. |
 | [Envelope](envelope.md) | `envelope()`'s one shape for every success and failure, and the `page()` pagination convention. |
 | [Configuration](configuration.md) | Every `Config` field, what has no default, and why. |

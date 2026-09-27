@@ -1,0 +1,327 @@
+// pkg/web/idempotency.test.bit — #6077's acceptance: a retried request with
+// the same `Idempotency-Key` and the same body replays the first response
+// with the handler unrun; the same key with a different body is 422; a
+// concurrent duplicate while the first request is still in flight is 409;
+// keys expire; a store outage is refused (not run twice) at `begin()` and
+// logged-but-served at `finish()`; a missing store or an invalid `ttl` is
+// refused at registration.
+//
+// Everything against a real chain goes through `app.handle` (adapter.bit) —
+// `adapter.test.bit`'s own reason: the real router, the real composed
+// middleware, the real `Ctx`, so a route registered at the wrong path or
+// sitting behind the wrong middleware cannot pass by accident.
+//
+// The concurrent-duplicate case is proven by a handler that RE-ENTERS the
+// same `App` with the same key while its own request is still running —
+// the store's reservation really is `InFlight` at that moment, not a
+// sequential call dressed up as one.
+//
+// `Request`, `newSink`, `sinkText`, `RecordingSink`, `freezeOrPanic` are
+// already bound module-wide by sibling test files — reused here, not
+// re-imported or redeclared (E0042). This file imports nothing.
+
+fn idemApp(store: IdempotencyStore, ttl: i64, h: (Ctx) => Res!): App {
+  let app = App(Config{ secret = "test-secret" })
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = ttl }))
+  app.post("/charge", h)
+  freezeOrPanic(app)
+  return app
+}
+
+fn idemReq(key: string, body: string): Request {
+  let headers = ""
+  if (len(key) > 0) {
+    headers = "Idempotency-Key: " + key
+  }
+  return Request{ method = "POST", path = "/charge", headers = headers, body = body }
+}
+
+// --- the header is opt-in ----------------------------------------------------
+
+test "no Idempotency-Key header runs the handler every time, untouched" {
+  let calls = 0
+  let app = idemApp(MemoryIdempotencyStore(1000), 60, (c) => {
+    calls = calls + 1
+    return c.text("ran ${calls}")
+  })
+
+  let r1 = app.handle(Request{ method = "POST", path = "/charge", headers = "", body = "{}" })
+  let r2 = app.handle(Request{ method = "POST", path = "/charge", headers = "", body = "{}" })
+
+  assert(r1.body == "ran 1", "want the first run's body, got '${r1.body}'")
+  assert(
+    r2.body == "ran 2",
+    "want the second run's body — no header, no caching, got '${r2.body}'",
+  )
+  assert(calls == 2, "the handler must run once per request with no header, got ${calls}")
+}
+
+// --- replay -------------------------------------------------------------------
+
+test "a retry with the same key and the same body replays the first response, handler unrun" {
+  let calls = 0
+  let app = idemApp(MemoryIdempotencyStore(1000), 60, (c) => {
+    calls = calls + 1
+    return c.text("charged").status(201).header("X-Run", "${calls}")
+  })
+
+  let first = app.handle(idemReq("k1", "{\"amount\":10}"))
+  let second = app.handle(idemReq("k1", "{\"amount\":10}"))
+
+  assert(calls == 1, "the handler must run exactly once, got ${calls}")
+  assert(first.status == 201, "want 201 on the first response, got ${first.status}")
+  assert(
+    second.status == 201,
+    "the replay must carry the first response's status, got ${second.status}",
+  )
+  assert(
+    second.body == "charged",
+    "the replay must carry the first response's body, got '${second.body}'",
+  )
+  assert(
+    second.getHeader("X-Run") == "1",
+    "the replay must carry the first response's own headers, got '${second.getHeader("X-Run")}'",
+  )
+}
+
+// --- a different body under the same key --------------------------------------
+
+test "the same key with a different body is 422, and the handler does not run a second time" {
+  let calls = 0
+  let app = idemApp(MemoryIdempotencyStore(1000), 60, (c) => {
+    calls = calls + 1
+    return c.text("charged")
+  })
+
+  let first = app.handle(idemReq("k1", "{\"amount\":10}"))
+  let second = app.handle(idemReq("k1", "{\"amount\":99}"))
+
+  assert(first.status == 200, "precondition: the first request must succeed, got ${first.status}")
+  assert(second.status == 422, "want 422 for a body mismatch, got ${second.status}")
+  assert(calls == 1, "a fingerprint mismatch must not run the handler, got ${calls} call(s)")
+}
+
+// --- a concurrent duplicate -----------------------------------------------------
+
+test "a concurrent duplicate while the first is in flight is 409, and the original still completes and caches" {
+  let calls = 0
+  let nestedStatus = 0
+  let store = MemoryIdempotencyStore(1000)
+  let app = App(Config{ secret = "test-secret" })
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 60 }))
+  app.post("/charge", (c) => {
+    calls = calls + 1
+    if (calls == 1) {
+      // Re-enters the SAME app with the SAME key while this very request is
+      // still running — the reservation this proves against is real, not a
+      // second sequential call.
+      let inner = app.handle(idemReq("k1", "{\"amount\":10}"))
+      nestedStatus = inner.status
+    }
+    return c.text("charged")
+  })
+  freezeOrPanic(app)
+
+  let outer = app.handle(idemReq("k1", "{\"amount\":10}"))
+
+  assert(nestedStatus == 409, "want 409 for the concurrent duplicate, got ${nestedStatus}")
+  assert(outer.status == 200, "the original request must still complete, got ${outer.status}")
+  assert(calls == 1, "the handler must run exactly once despite the race, got ${calls}")
+
+  // Now that the original has finished, a THIRD request with the same key
+  // and body must replay rather than 409 or re-run.
+  let after = app.handle(idemReq("k1", "{\"amount\":10}"))
+  assert(after.status == 200, "a request after completion must replay, got ${after.status}")
+  assert(calls == 1, "replay after completion must not run the handler again, got ${calls}")
+}
+
+// --- store failures, and the asymmetry between them ----------------------------
+
+// Always refuses `begin`; the other two never run in these tests.
+class FailingBeginStore {
+  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+    fail newError("idempotency store is down")
+  }
+  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+    return
+  }
+  export abandon(key: string): ()! {
+    return
+  }
+}
+
+test "a begin() failure refuses the request rather than risk running the handler twice" {
+  let calls = 0
+  let app = idemApp(FailingBeginStore{}, 60, (c) => {
+    calls = calls + 1
+    return c.text("charged")
+  })
+
+  let res = app.handle(idemReq("k1", "{}"))
+
+  assert(res.status == 500, "a begin() failure must not run the handler, got ${res.status}")
+  assert(
+    calls == 0,
+    "the handler must not run when begin() cannot say whether a duplicate is in flight, got ${calls}",
+  )
+}
+
+// Succeeds at `begin`, always refuses `finish`.
+class FailingFinishStore {
+  inner: MemoryIdempotencyStore
+
+  export begin(key: string, fingerprint: string, ttl: i64): Option<IdempotencyEntry>! {
+    return this.inner.begin(key, fingerprint, ttl)?
+  }
+  export finish(key: string, resp: CachedResponse, ttl: i64): ()! {
+    fail newError("cache write is down")
+  }
+  export abandon(key: string): ()! {
+    this.inner.abandon(key)?
+  }
+}
+
+test "a finish() failure still serves the real response, logged, uncached" {
+  let calls = 0
+  let sink = newSink()
+  let store = FailingFinishStore{ inner = MemoryIdempotencyStore(1000) }
+  let app = App(Config{ secret = "test-secret", logs = sink })
+  app.use(idempotency(IdempotencyPolicy{ store = store, ttl = 60 }))
+  app.post("/charge", (c) => {
+    calls = calls + 1
+    return c.text("charged")
+  })
+  freezeOrPanic(app)
+
+  let res = app.handle(idemReq("k1", "{}"))
+
+  assert(
+    res.status == 200,
+    "a finish() failure must not fail the request itself, got ${res.status}",
+  )
+  assert(res.body == "charged", "the real response must still go out, got '${res.body}'")
+  assert(
+    contains(sinkText(sink), "finish(k1)"),
+    "the finish() failure must be logged, got '${sinkText(sink)}'",
+  )
+}
+
+// --- misconfiguration is refused at registration --------------------------------
+
+// `testpanic_` inverts the verdict (SPEC §18.4): these pass only if the
+// process really dies. Each one constructs a policy and serves nothing, so a
+// version that dropped the check would fail them rather than pass them.
+test "testpanic_idempotency_with_no_store_panics_at_registration" {
+  let _ = idempotency(IdempotencyPolicy{ ttl = 60 })
+  print("unreachable: idempotency() accepted a policy with no store\n")
+}
+
+test "testpanic_idempotency_with_a_zero_ttl_panics_at_registration" {
+  let _ = idempotency(IdempotencyPolicy{ store = MemoryIdempotencyStore(1000), ttl = 0 })
+  print("unreachable: idempotency() accepted a ttl of 0\n")
+}
+
+test "a complete IdempotencyPolicy registers without panicking and serves the request" {
+  let app = idemApp(MemoryIdempotencyStore(1000), 60, (c) => {
+    return c.text("ok")
+  })
+  let res = app.handle(idemReq("k1", "{}"))
+  assert(res.status == 200, "a well-formed IdempotencyPolicy must serve, got ${res.status}")
+}
+
+// --- MemoryIdempotencyStore's own contract, tested directly --------------------
+//
+// Every test below drives the module-private `beginAt`/`finishAt`, which
+// take the clock as a second-precision argument — `MemoryCounter`'s own
+// tests' reason: expiry and eviction order are either sleeping tests or no
+// tests at all against the wall clock.
+
+test "begin() reserves an absent key InFlight, and a same-fingerprint retry sees it InFlight" {
+  let s = MemoryIdempotencyStore(1000)
+
+  let first = s.beginAt("k", "fp-a", 10, 1000)
+  assert(!isSome(first), "the first begin() on an absent key must win — Option.None")
+
+  let second = s.beginAt("k", "fp-a", 10, 1001)
+  assert(isSome(second), "a retry against a claimed key must see the reservation")
+  let e = unwrap(second)
+  assert(
+    e.state == IdempotencyState.InFlight,
+    "the reservation must still read InFlight before finish()",
+  )
+  assert(e.fingerprint == "fp-a", "the stored fingerprint must be the one begin() reserved with")
+}
+
+test "a different fingerprint against a claimed key is reported regardless of state" {
+  let s = MemoryIdempotencyStore(1000)
+  let _ = s.beginAt("k", "fp-a", 10, 1000)
+
+  let found = s.beginAt("k", "fp-b", 10, 1001)
+  assert(isSome(found), "a claimed key must be reported even under a different fingerprint")
+  let e = unwrap(found)
+  assert(
+    e.fingerprint == "fp-a",
+    "the stored fingerprint must be the FIRST caller's, not the retry's own",
+  )
+}
+
+test "finish() moves a key to Done, and begin() then replays it with the cached response" {
+  let s = MemoryIdempotencyStore(1000)
+  let _ = s.beginAt("k", "fp-a", 10, 1000)
+  s.finishAt("k", CachedResponse{ status = 201, body = "done", headers = []Header(0) }, 10, 1001)
+
+  let found = s.beginAt("k", "fp-a", 10, 1002)
+  assert(isSome(found), "a finished key must still read as claimed")
+  let e = unwrap(found)
+  assert(e.state == IdempotencyState.Done, "want Done after finish(), got InFlight")
+  assert(e.response.status == 201, "want the cached status, got ${e.response.status}")
+  assert(e.response.body == "done", "want the cached body, got '${e.response.body}'")
+}
+
+test "a key's ttl expires, and a begin() after it starts a fresh reservation" {
+  let s = MemoryIdempotencyStore(1000)
+  let _ = s.beginAt("k", "fp-a", 10, 1000)
+  s.finishAt("k", CachedResponse{ status = 200, body = "x", headers = []Header(0) }, 10, 1000)
+
+  // Created (finished) at 1000 with a ttl of 10, so it dies at 1010.
+  let stillLive = s.beginAt("k", "fp-a", 10, 1009)
+  assert(isSome(stillLive), "the entry must still be readable one second before it expires")
+
+  let afterExpiry = s.beginAt("k", "fp-b", 10, 1010)
+  assert(
+    !isSome(afterExpiry),
+    "an expired key must be gone at its expiry second, letting a fresh begin() win",
+  )
+}
+
+test "abandon() frees a key immediately, before its ttl would otherwise expire it" {
+  let s = MemoryIdempotencyStore(1000)
+  let _ = s.beginAt("k", "fp-a", 3600, 1000)
+  s.abandonAt("k")
+
+  let found = s.beginAt("k", "fp-b", 10, 1000)
+  assert(
+    !isSome(found),
+    "abandon() must free the key for an immediate fresh begin(), regardless of ttl",
+  )
+}
+
+test "a begin() past the cap evicts the soonest-expiring key instead of failing" {
+  let s = MemoryIdempotencyStore(3)
+  // Ttls deliberately not in call order: "b" is written second and expires
+  // FIRST, so a store evicting by write order would agree only by accident.
+  let _ = s.beginAt("a", "fp", 7200, 1000)
+  let _ = s.beginAt("b", "fp", 60, 1000)
+  let _ = s.beginAt("c", "fp", 3600, 1000)
+  assert(len(s.entries) == 3, "precondition: the store must be full")
+
+  let d = s.beginAt("d", "fp", 5400, 1000)
+  assert(!isSome(d), "a begin() past the cap must still win the reservation")
+  assert(len(s.entries) == 3, "the cap was crossed: ${len(s.entries)} keys under a cap of 3")
+
+  let evicted = s.beginAt("b", "fp-new", 10, 1000)
+  assert(
+    !isSome(evicted),
+    "the soonest-expiring key must be the one evicted, freeing it for a fresh begin()",
+  )
+}

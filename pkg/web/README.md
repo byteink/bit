@@ -70,8 +70,8 @@ element with a dynamic tag name.
 Start at [`docs/README.md`](docs/README.md): getting started, routing, the
 request and response, middleware and its scope, sessions/CSRF/CORS/security
 headers, the operational middleware (rate limiting, static files, compress,
-logging, tracing, recovery), errors, the `envelope()`/`page()` response
-shape, and every `Config` field.
+logging, tracing, recovery, idempotency keys), errors, the
+`envelope()`/`page()` response shape, and every `Config` field.
 
 <!-- BENCH:START -->
 ## Benchmarks
