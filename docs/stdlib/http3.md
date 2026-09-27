@@ -391,6 +391,13 @@ Accept the next HTTP/3 connection, blocking until a client completes its handsha
 and set up its control and QPACK streams. Run each returned `H3Conn` on its own
 green thread.
 
+### `H3Listener.stopAccepting()`
+
+Stop admitting brand-new QUIC connections on the underlying socket, while
+connections already accepted keep being served (`quic.Listener.stopAccepting`'s
+own doc comment has the mechanism). `std/http`'s `H3Server.shutdown` calls this
+as the first step of draining an HTTP/3 server.
+
 ### `H3Conn.request(req: H3Request): H3Response!`
 
 Send `req` and read the response. Opens a client-initiated bidirectional stream,
@@ -441,6 +448,14 @@ Whether `goAway` has already run on this connection. `std/http`'s `serveH3Conn`
 (the loop behind `serveH3ServerOn`/`H3Server`) reads this to stop asking `accept`
 for more requests once the one it may already be handling finishes, instead of
 waiting for the peer to hang up or a shutdown timeout to pass.
+
+### `H3Conn.rawConn(): Conn`
+
+The underlying `quic.Conn` this connection runs over - an escape hatch for a
+caller that needs to drive a raw stream directly, rather than through
+`request`/`accept`/`respond`. Driving it directly does not update this
+connection's own QPACK state or stream bookkeeping (`goAway`'s cutoff among
+it), so ordinary HTTP/3 traffic should never need this.
 
 ### `H3Conn.close()`
 

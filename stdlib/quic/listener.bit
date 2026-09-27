@@ -76,6 +76,11 @@ class quicListenerState {
   // Connections currently mid-handshake (admitted, not yet resolved established
   // or failed) — the admission-control counter gated by `quicListenerMaxHandshakes`.
   handshaking: int,
+  // Set by `Listener.stopAccepting` (#6149): once true, `quicListenerDispatch`
+  // drops every datagram for a DCID not already in `conns`/`present` instead of
+  // admitting it as a new connection, while continuing to route datagrams for
+  // connections already there. Guarded by `mu`, same as every other field here.
+  stopped: bool,
 }
 
 // A QUIC server listener owning one bound UDP socket and demultiplexing all
@@ -83,10 +88,29 @@ class quicListenerState {
 export class Listener {
   acceptCh: chan<Conn>
   sock: UdpSocket
+  // The same `quicListenerState` `quicListenerLoop` (below) reads and writes —
+  // shared, not copied, so `stopAccepting` below is visible to it immediately.
+  state: quicListenerState
   // Accept the next established connection, blocking until a client completes its
   // handshake. Each `Conn` is independent, multiplexed over the shared socket.
   export accept(): Conn! {
     return <- this.acceptCh
+  }
+
+  // Stop admitting brand-new connections: every later datagram whose
+  // connection id is not already in the demux table is silently dropped
+  // (RFC 9000 §5.2.2 permits either a stateless drop or replying with a
+  // CONNECTION_CLOSE carrying CONNECTION_REFUSED; this build does the
+  // former — see this method's own doc in stdlib/quic.md for why). A
+  // connection already accepted, or still mid-handshake, keeps being fed its
+  // datagrams exactly as before: this stops ADMISSION, not the one shared
+  // demux loop every open connection depends on. Idempotent and safe to call
+  // from any green thread — the flag is guarded by the same `mu` every other
+  // field of the listener's state is.
+  export stopAccepting() {
+    this.state.mu.lock()
+    this.state.stopped = true
+    this.state.mu.unlock()
   }
 }
 
@@ -106,9 +130,10 @@ export fn listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Lis
     acceptCh = chan<Conn>(64),
     count = 0,
     handshaking = 0,
+    stopped = false,
   }
   spawn quicListenerLoop(lst)
-  return Listener{ acceptCh = lst.acceptCh, sock = sock }
+  return Listener{ acceptCh = lst.acceptCh, sock = sock, state = lst }
 }
 
 // The listener loop: the sole owner of the socket's recv. Park on each datagram
@@ -142,9 +167,17 @@ fn quicListenerDispatch(lst: quicListenerState, data: []byte, host: string, port
   lst.mu.lock()
   let known = lst.present[key] != 0
   let inCh = lst.conns[key]
+  let stopped = lst.stopped
   lst.mu.unlock()
   if (known) {
     quicListenerFeed(inCh, data, host, port)
+    return
+  }
+  // `stopAccepting` (#6149): a datagram for a DCID this listener has never
+  // seen is a brand-new connection attempt — drop it before it ever reaches
+  // the Initial/admission checks below. A known DCID is unaffected (handled
+  // above), so a connection already accepted keeps being fed regardless.
+  if (stopped) {
     return
   }
   // ponytail: unknown dcid falls through to the Initial/new-connection path.

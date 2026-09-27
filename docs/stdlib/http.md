@@ -1085,21 +1085,24 @@ listener stops handing back connections.
 
 ### `H3Server.shutdown(timeoutMs: int): ()!`
 
-Stops `hs` accepting new requests on connections already open and drains
-requests already in flight, then returns - the HTTP/3 mirror of
-`TlsServer.shutdown()`. A connection currently answering a request is sent
-`GOAWAY` (RFC 9114 §5.2) naming the highest request stream it has accepted,
-so its peer opens no further stream on it; once that request's response is
-sent, the connection closes right away rather than waiting for the peer to
-hang up or `timeoutMs` to pass. A connection with no request in flight yet is
-closed immediately, the same "nothing promised yet" rule
-`TlsServer.shutdown()`'s idle connections follow. Whatever is still running
-once `timeoutMs` elapses is force-closed; the error names how many.
+Stops `hs` accepting new connections and new requests on connections already
+open, and drains requests already in flight, then returns - the HTTP/3 mirror
+of `TlsServer.shutdown()`. First, `hs`'s listener stops admitting brand-new
+QUIC connections (`H3Listener.stopAccepting`) - a client attempting one gets
+no answer and its handshake times out, the same outcome a fresh dial against
+a closed TCP listener gets. A connection currently answering a request is
+sent `GOAWAY` (RFC 9114 §5.2) naming the highest request stream it has
+accepted, so its peer opens no further stream on it - one that arrives anyway
+is refused with `H3_REQUEST_REJECTED` (RFC 9114 §4.1.1) - and once that
+request's response is sent, the connection closes right away rather than
+waiting for the peer to hang up or `timeoutMs` to pass. A connection with no
+request in flight yet is closed immediately, the same "nothing promised yet"
+rule `TlsServer.shutdown()`'s idle connections follow. Whatever is still
+running once `timeoutMs` elapses is force-closed; the error names how many.
 
-Unlike `TlsServer.shutdown()`, this does not stop a brand-new QUIC connection
-from completing its handshake and being served during the wait - `std/quic`
-has no way yet to refuse a new connection while continuing to serve ones
-already open on the same UDP socket.
+A known, documented gap: refusing a new connection drops its Initial packet
+rather than replying with a CONNECTION_CLOSE (RFC 9000 §5.2.2's SHOULD) -
+`Listener.stopAccepting`'s own doc (`quic.md`) has why.
 
 ```bit
 import { h3Serve, serveH3ServerOn, ok, Request, Response, H3Server } from "std/http"
