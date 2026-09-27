@@ -1,0 +1,294 @@
+// pkg/auth/totp.bit — TOTP (RFC 6238) over HOTP (RFC 4226), the second
+// factor the course's part 37 (#6076) asks for.
+//
+// HOTP (RFC 4226 §5.3) turns an HMAC tag into a short decimal code by
+// dynamic truncation: the low nibble of the last tag byte picks a 4-byte
+// window, whose top bit is masked off and the rest reduced mod 10^digits.
+// TOTP (RFC 6238 §4) is HOTP with the counter replaced by a time step,
+// `floor((unixSeconds - T0) / period)` with T0 = 0. Both are generic over
+// the underlying hash (RFC 6238 §1.2 defines SHA-1/SHA-256/SHA-512
+// variants, and Appendix B's test vectors exercise all three) — `Algorithm`
+// bundles that choice with `digits`/`period` so `hotp`/`totp`/`verify`
+// (module-level, always SHA-1 at the RFC defaults) and a caller building
+// its own `Algorithm` share one implementation. SHA-1 is the only
+// algorithm Google Authenticator and most authenticator apps implement,
+// regardless of an `otpauth://` URI's `algorithm` parameter.
+//
+// PLACEMENT: this lives in `pkg/auth`, not `stdlib/crypto`, because the
+// public API is auth-flow shaped the way `password.bit`'s
+// `hashPassword`/`newPasswordStrategy` are: a `Secret` a caller generates
+// once and stores, a provisioning URI for a QR code, and a `verify` that
+// answers "did this code authenticate" rather than a bare cryptographic
+// primitive. `stdlib/crypto` gained a generic base32 codec instead
+// (`base32.bit`) — RFC 4648 §6 has nothing auth-specific about it — and
+// this file reuses it alongside `hmac`/`newSha1`/`randomBytes`, already
+// `stdlib/crypto` exports HOTP's HMAC step is built on.
+//
+// REPLAY PROTECTION (RFC 6238 §5.2): a code is a pure function of the
+// secret and a time step, so within `verify`'s skew window the SAME code
+// verifies more than once. This module holds no storage of its own — the
+// caller keeps the last accepted counter (a session field, a database
+// column) and passes it as `lastCounter`; `verify` never accepts a step
+// counter <= it, and returns the counter that DID succeed so the caller
+// persists it as the new `lastCounter`. A counter that only moves forward
+// is what stops a captured code being replayed inside the skew window or
+// against a stale login.
+//
+// `ctEq` (oidc_verify.bit), `percentEncode` (oidc_authorize.bit) and
+// `randomBytes` (password.bit) are already imported elsewhere in this
+// module (an import binds per MODULE, SPEC §17.1); re-importing any of
+// them here is E0042. `hmac` is imported by `oidc_verify.test.bit`, which
+// is test-only and so not visible to this file, yet the name is still
+// module-reserved (E0042 on a bare re-import) — aliased to `hmacTag` to
+// take a distinct binding without touching that file.
+import { Hash, decodeBase32, encodeBase32, hmac as hmacTag, newSha1 } from "std/crypto"
+import { padStart } from "std/strings"
+
+// The default code length (RFC 6238 §5.2 recommends 6) and time step
+// (RFC 6238 §5.2's own default, 30 seconds).
+const totpDefaultDigits = 6
+const totpDefaultPeriod = 30
+
+// 160 bits — RFC 4226 §4 R6's minimum shared-secret length, and the key
+// length RFC 6238 Appendix B's own SHA-1 test vectors use.
+const totpSecretLen = 20
+
+// 10^n, built with a loop rather than a literal table so any `digits` in
+// range works, not only 6 and 8.
+fn pow10(n: int): int {
+  let v = 1
+  let i = 0
+  while (i < n) {
+    v = v * 10
+    i = i + 1
+  }
+  return v
+}
+
+// A TOTP/HOTP shared secret: raw HMAC key bytes. `generateSecret` builds a
+// fresh one; `parseSecret` decodes one a user pasted back (from a manual
+// entry field, say); `base32()` is the text form to display, store, or
+// embed in a provisioning URI.
+export class Secret {
+  export key: []byte
+
+  export base32(): string {
+    return encodeBase32(this.key)
+  }
+}
+
+// A fresh, random 160-bit TOTP secret. Generate one per user when they
+// enroll in two-factor auth, store `secret.key` (or `secret.base32()`),
+// and never regenerate it — regenerating invalidates every authenticator
+// app already enrolled.
+export fn generateSecret(): Secret {
+  return Secret{ key = randomBytes(totpSecretLen) }
+}
+
+// Decode a base32 secret a user typed or pasted back, tolerant of the
+// spaces and lowercase letters authenticator apps commonly display it
+// with, and of missing `=` padding (most apps omit it). Fails on anything
+// that is not a valid base32 encoding once normalized.
+export fn parseSecret(base32Text: string): Secret! {
+  return Secret{ key = decodeBase32(normalizeBase32(base32Text))? }
+}
+
+fn normalizeBase32(s: string): string {
+  let out = []byte(0)
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c != ' ' && c != '-') {
+      out = append(out, base32Upper(c))
+    }
+    i = i + 1
+  }
+  let rem = len(out) % 8
+  if (rem != 0) {
+    let padCount = 8 - rem
+    let j = 0
+    while (j < padCount) {
+      out = append(out, '=')
+      j = j + 1
+    }
+  }
+  return string(out)
+}
+
+fn base32Upper(c: byte): byte {
+  if (c >= 'a' && c <= 'z') {
+    return c - 32
+  }
+  return c
+}
+
+// A hash choice plus the `digits`/`period` it generates codes at —
+// bundled so `hotp`/`totp`/`verify` (SHA-1, RFC-default `digits`/`period`)
+// and a caller who needs a different combination (RFC 6238 Appendix B's
+// SHA-256/SHA-512 rows, or a non-default digit count) share one
+// implementation instead of a `*With` sibling per function. `sha1` builds
+// the common case; SHA-256/SHA-512 are `Algorithm{ newHash = newSha256, ... }`
+// composite literals directly, since only the RFC vectors need them.
+export class Algorithm {
+  export newHash: () => Hash
+  export digits: int
+  export period: int
+
+  // The HOTP (RFC 4226 §5.3) code for `counter`, keyed by `secret.key`
+  // under this algorithm's hash, as a zero-padded `digits`-digit decimal
+  // string.
+  export hotp(secret: Secret, counter: uint): string {
+    // The counter as an 8-byte big-endian block (RFC 4226 §5.2).
+    let msg = []byte(8)
+    let c = counter
+    let i = 7
+    while (i >= 0) {
+      msg[i] = byte(c & 0xff)
+      c = c >> 8
+      i = i - 1
+    }
+
+    let mac = hmacTag(this.newHash, secret.key, msg)
+    let offset = int(mac[len(mac) - 1]) & 0x0f
+    let binCode = ((int(mac[offset]) & 0x7f) << 24) |
+      (int(mac[offset + 1]) << 16) |
+      (int(mac[offset + 2]) << 8) |
+      int(mac[offset + 3])
+    let code = binCode % pow10(this.digits)
+    return padStart("${code}", this.digits, "0")
+  }
+
+  // The TOTP (RFC 6238 §4) code for `unixSeconds` under this algorithm.
+  export totp(secret: Secret, unixSeconds: int): string {
+    return this.hotp(secret, totpCounter(unixSeconds, this.period))
+  }
+
+  // Verifies `code` against `secret` at `unixSeconds`, accepting a time
+  // step within `skew` periods before or after the current one (RFC 6238
+  // §5.2's clock-drift allowance — 1 is the RFC's own suggested default).
+  // Never accepts a step whose counter is <= `lastCounter`, so a code
+  // already used (or one from before the last accepted login) is rejected
+  // even if it is still inside the skew window. On success, returns the
+  // counter that matched — the caller persists it as the new
+  // `lastCounter` before the next `verify` call. Fails when no step in
+  // the window matches.
+  export verify(
+    secret: Secret,
+    code: string,
+    unixSeconds: int,
+    lastCounter: uint,
+    skew: int,
+  ): uint! {
+    let current = totpCounter(unixSeconds, this.period)
+    let codeBytes = []byte(code)
+    let step = 0 - skew
+    while (step <= skew) {
+      let counter = totpShift(current, step)
+      if (counter > lastCounter) {
+        if (ctEq([]byte(this.hotp(secret, counter)), codeBytes)) {
+          return counter
+        }
+      }
+      step = step + 1
+    }
+    fail newError("totp: code did not verify")
+  }
+}
+
+// The time step `unixSeconds` falls in, at `period`-second granularity
+// (RFC 6238 §4, T0 = 0). `unixSeconds` is always >= 0 for a real clock
+// reading, so truncating division is the same as the RFC's floor.
+fn totpCounter(unixSeconds: int, period: int): uint {
+  return uint(unixSeconds / period)
+}
+
+// `current` offset by `step` time steps, clamped to 0 rather than
+// underflowing when `step` is negative and larger in magnitude than
+// `current` — reachable near the Unix epoch, or with a large `skew`.
+fn totpShift(current: uint, step: int): uint {
+  if (step < 0) {
+    let back = uint(0 - step)
+    if (back > current) {
+      return 0
+    }
+    return current - back
+  }
+  return current + uint(step)
+}
+
+// SHA-1 at `digits` digits and `period`-second steps — the algorithm every
+// authenticator app expects. `hotp`/`totp`/`verify` below are this at the
+// RFC's own defaults (6 digits, 30 seconds); call `sha1` directly for a
+// different `digits`/`period` while staying on SHA-1.
+export fn sha1(digits: int, period: int): Algorithm {
+  return Algorithm{ newHash = newSha1, digits = digits, period = period }
+}
+
+// The HOTP code for `counter`, HMAC-SHA-1 keyed by `secret.key`.
+export fn hotp(secret: Secret, counter: uint, digits: int): string {
+  return sha1(digits, totpDefaultPeriod).hotp(secret, counter)
+}
+
+// The TOTP code for `unixSeconds`, HMAC-SHA-1 keyed by `secret.key`, at
+// the default 6 digits and 30-second period.
+export fn totp(secret: Secret, unixSeconds: int): string {
+  return sha1(totpDefaultDigits, totpDefaultPeriod).totp(secret, unixSeconds)
+}
+
+// `Algorithm.verify` at SHA-1 and the default 6 digits/30-second period —
+// see `Algorithm.verify`'s doc comment for the skew and replay-protection
+// contract.
+export fn verify(
+  secret: Secret,
+  code: string,
+  unixSeconds: int,
+  lastCounter: uint,
+  skew: int,
+): uint! {
+  return sha1(totpDefaultDigits, totpDefaultPeriod).verify(
+    secret,
+    code,
+    unixSeconds,
+    lastCounter,
+    skew,
+  )?
+}
+
+// The provisioning URI (the "Key Uri Format" Google Authenticator and
+// every compatible app read a QR code as) for `secret`, at the default 6
+// digits and 30-second period. `issuer` is your app or company name,
+// `accountName` the user's identifier (email, username) — both appear in
+// the authenticator app's list entry.
+export fn provisioningUri(secret: Secret, issuer: string, accountName: string): string {
+  return provisioningUriWith(secret, issuer, accountName, totpDefaultDigits, totpDefaultPeriod)
+}
+
+// `provisioningUri` with an explicit `digits`/`period` — only set these to
+// match a non-default `verify`/`totp` call, since some authenticator apps
+// ignore them and always use 6 digits/30 seconds.
+export fn provisioningUriWith(
+  secret: Secret,
+  issuer: string,
+  accountName: string,
+  digits: int,
+  period: int,
+): string {
+  let label = percentEncode(issuer) + ":" + percentEncode(accountName)
+  return "otpauth://totp/" +
+    label +
+    "?secret=" +
+    percentEncode(trimBase32Padding(secret.base32())) +
+    "&issuer=" +
+    percentEncode(issuer) +
+    "&algorithm=SHA1" +
+    "&digits=${digits}" +
+    "&period=${period}"
+}
+
+fn trimBase32Padding(s: string): string {
+  let n = len(s)
+  while (n > 0 && s[n - 1] == '=') {
+    n = n - 1
+  }
+  return s[0:n]
+}
