@@ -14,7 +14,7 @@ and is called through the class's own name:
 
 ```bit ignore
 class NotifyJob {
-  static fn label(): string {
+  static label(): string {
     return "notify"
   }
 }
@@ -24,7 +24,7 @@ fn main() {
 }
 ```
 
-`static fn label(): string { ... }` reads exactly like an ordinary method
+`static label(): string { ... }` reads exactly like an ordinary method
 ([Classes](classes.md#methods)) except for the one word in front, and
 `NotifyJob.label()` calls it through the type name instead of through a
 value's `.`.
@@ -45,13 +45,13 @@ interface Job {
 }
 
 class NotifyJob {
-  static fn label(): string {
+  static label(): string {
     return "notify"
   }
 }
 
 class DigestJob {
-  static fn label(): string {
+  static label(): string {
     return "digest"
   }
 }
@@ -83,7 +83,7 @@ A static method's body has no receiver to read:
 ```bit ignore
 class NotifyJob {
   tries: int,
-  static fn label(): string {
+  static label(): string {
     return this.tries // error[E0040]: undefined name 'this'
   }
 }

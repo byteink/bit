@@ -881,7 +881,7 @@ let a = Account(500)?
 ### 10.4.1 Static Methods
 
 ```
-static_method_decl = [ "export" ] "static" "fn" IDENT [ generic_params ] signature block .
+static_method_decl = [ "export" ] "static" IDENT [ generic_params ] signature block .
 ```
 
 A `static` method attaches a named function to the **type**, not to an
@@ -890,7 +890,7 @@ rather than through a value:
 
 ```
 class Box {
-  static fn zero(): int {
+  static zero(): int {
     return 0
   }
 }
@@ -901,14 +901,18 @@ fn main() {
 ```
 
 - `static` is a **contextual keyword** (§5.2), like `readonly` and `use`: it
-  parses as an ordinary identifier everywhere except immediately before `fn`
-  inside a class body, so a field or an in-body method may still be named
-  `static`.
+  parses as an ordinary identifier everywhere except immediately before a
+  second bare identifier inside a class body, so a field or an in-body
+  method may still be named `static`. Writing `static fn name(...)` (this
+  form's spelling before `BIT_STATIC_METHODS` ever defaulted on) is
+  rejected with `E0172` and a hint to drop `fn`; the class form takes no
+  `fn`, exactly like an in-body instance method (§10.4) and an interface's
+  static requirement below.
 - `this` is not bound inside a static method's body; referencing it is
   `E0040` ("undefined name"), the same diagnostic a top-level function's
   body gets for the same reason.
 - A static method follows the same `export` rule as an instance method
-  (§10.4): `export static fn name(...)` is visible outside the module.
+  (§10.4): `export static name(...)` is visible outside the module.
 - A static method may be called through a **generic type parameter** bound
   to an interface that declares it as a static requirement (§10.6):
 
@@ -918,7 +922,7 @@ fn main() {
   }
 
   class Box {
-    static fn label(): string {
+    static label(): string {
       return "box"
     }
   }
@@ -943,11 +947,11 @@ fn main() {
 Static methods are gated behind the compiler flag `BIT_STATIC_METHODS=1`
 (default off) until the release after they land repins the toolchain's own
 pinned previous-release oracle past this compiler build; with the flag
-unset, `static` before `fn` inside a class body stays an ordinary
-identifier and the declaration fails to parse, unchanged from every earlier
-release. This is a rollout mechanism only, not part of the language's
-steady-state definition - the same shape `BIT_MAPLIT` (§12.3) uses - and
-this paragraph is removed once the flag defaults on.
+unset, `static` before a second bare identifier inside a class body stays an
+ordinary identifier and the declaration fails to parse, unchanged from every
+earlier release. This is a rollout mechanism only, not part of the
+language's steady-state definition - the same shape `BIT_MAPLIT` (§12.3)
+uses - and this paragraph is removed once the flag defaults on.
 
 ### 10.5 Class Declarations
 
@@ -5777,7 +5781,7 @@ class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fs
 member        = field | method_decl | static_method_decl .
 field         = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
-static_method_decl = [ "export" ] "static" "fn" IDENT [ generic_params ] signature block .
+static_method_decl = [ "export" ] "static" IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ member_sig { fsep member_sig } [ fsep ] ] "}" .
 member_sig    = method_sig | static_method_sig .
 method_sig    = IDENT signature .
