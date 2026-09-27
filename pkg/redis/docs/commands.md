@@ -24,7 +24,12 @@ fn main(): ()! {
 
 - `get(key): Option<string> ! RedisError` - `Option.None` on a cache miss,
   never `Option.Some("")`.
-- `set(key, value): () ! RedisError`
+- `set(key, value, ttl = 0, ifAbsent = false, ifExists = false): bool !
+  RedisError` - `true` if the key was written; `ttl` is nanoseconds, sent
+  as `PX`; `ifAbsent`/`ifExists` are `NX`/`XX`. `setGet` takes the same
+  options and returns the key's previous value instead. See
+  [Strings and keys](strings-and-keys.md) for the full option set and
+  `r.str(key)`/`r.keys()`.
 - `del(keys): i64 ! RedisError` - the number of keys actually removed.
 - `exists(keys): i64 ! RedisError` - the number of the given keys that exist.
 - `expire(key, seconds): bool ! RedisError` - `true` if the key exists and

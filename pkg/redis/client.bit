@@ -110,8 +110,51 @@ export class Client {
     return this.runCmd(getCmd(key))?
   }
 
-  export set(key: string, value: string): ()!RedisError {
-    return this.runCmd(setCmd(key, value))?
+  // `ttl` is nanoseconds (`std/time.Second`/`Millisecond`), sent as `PX
+  // milliseconds` — the same "one field, converted to each wire command's
+  // own unit" convention `hash.bit`'s field-expiry methods already use.
+  // `ttl == -1` sends `KEEPTTL` instead: a numeric sentinel, not a fifth
+  // `keepTtl: bool` parameter, is what keeps this method at spec/LINT.md's
+  // five-parameter ceiling (E0202 — a method receiver does not count, but
+  // `key, value, ttl, ifAbsent, ifExists` alone is already five) while still
+  // landing epic #6013's own flagship call verbatim: `r.set("k", "v", ttl =
+  // 60 * Second, ifAbsent = true)?`. `ttl == 0` (the default) sends neither
+  // flag, matching plain `SET`'s own behavior of clearing any TTL the key
+  // already had. `ifAbsent`/`ifExists` are `NX`/`XX`; passing both `true` is
+  // a caller mistake the server itself rejects with a normal `RedisError`
+  // (Redis's own `ERR syntax error`), so there is nothing to validate
+  // client-side — the same reasoning `hash.bit`'s `when` condition flags
+  // already documented for the identical situation.
+  //
+  // Returns `true` when the key was actually written, `false` only when
+  // `ifAbsent`/`ifExists` refused it (the reply is a null bulk, not `+OK`,
+  // exactly when the condition failed) — never a silent no-op a caller
+  // could mistake for success. A plain `set(key, value)` call (no flags)
+  // always returns `true` or fails.
+  export set(
+    key: string,
+    value: string,
+    ttl: int = 0,
+    ifAbsent: bool = false,
+    ifExists: bool = false,
+  ): bool!RedisError {
+    return this.runCmd(setOptsCmd(key, value, ttl, ifAbsent, ifExists))?
+  }
+
+  // `SET ... GET` — atomically returns the key's PREVIOUS value
+  // (`Option.None` if it had none) instead of whether the write happened.
+  // A separate method from `set`, not an extra return value on it: the two
+  // calls' return types genuinely differ (`bool` vs `Option<string>`), and
+  // Bit has no overloading (#6014's probes) to let one method name cover
+  // both. Same option set as `set` (this method's header, above).
+  export setGet(
+    key: string,
+    value: string,
+    ttl: int = 0,
+    ifAbsent: bool = false,
+    ifExists: bool = false,
+  ): Option<string>!RedisError {
+    return this.runCmd(setGetCmd(key, value, ttl, ifAbsent, ifExists))?
   }
 
   export del(keys: []string): i64!RedisError {
@@ -191,9 +234,10 @@ fn getCmd(key: string): Cmd<Option<string>> {
   }
 }
 
-// `SET`'s reply is always `Simple("OK")` — `asOk` lives here rather than
-// among `cmd.bit`'s shared decode helpers because no other command shares
-// its "discard a bare OK" shape yet.
+// A bare `+OK` reply, discarded — `SET` (below), plus `RENAME`/`MSET`
+// (`keys.bit`, #6034), reuse this cross-file (same module, SPEC §17.1).
+// Lives here rather than among `cmd.bit`'s shared decode helpers simply
+// because `SET` was the first command that needed it.
 fn asOk(r: Reply, cmd: string): ()!RedisError {
   match (r) {
     Simple(_) => return
@@ -201,8 +245,77 @@ fn asOk(r: Reply, cmd: string): ()!RedisError {
   }
 }
 
+// `Batch.set` (`cmd.bit`) still queues the plain, flag-free `SET` through
+// this exact factory — kept as-is, not folded into `setOptsArgs` below,
+// since `cmd.bit` is a shared file this ticket does not touch and already
+// calls `setCmd(key, value)` expecting `Cmd<()>` back.
 fn setCmd(key: string, value: string): Cmd<()> {
   return Cmd<()>{ args = ["SET", key, value], decode = (r) => asOk(r, "SET"), readOnly = false }
+}
+
+// `Client.set`/`setGet`'s wire args — this method's own header explains the
+// `ttl` sentinel and why `ifAbsent`/`ifExists` are two plain bools.
+fn appendSetTtl(args: []string, ttl: int): []string {
+  if (ttl > 0) {
+    args = append(args, "PX", "${ttl / Millisecond}")
+    return args
+  }
+  if (ttl == -1) {
+    args = append(args, "KEEPTTL")
+  }
+  return args
+}
+
+fn appendSetCond(args: []string, ifAbsent: bool, ifExists: bool): []string {
+  if (ifAbsent) {
+    args = append(args, "NX")
+  }
+  if (ifExists) {
+    args = append(args, "XX")
+  }
+  return args
+}
+
+fn setOptsArgs(key: string, value: string, ttl: int, ifAbsent: bool, ifExists: bool): []string {
+  let args = ["SET", key, value]
+  args = appendSetTtl(args, ttl)
+  args = appendSetCond(args, ifAbsent, ifExists)
+  return args
+}
+
+// `true` on a bare `+OK`; `false` on the null bulk Redis sends when `NX`/
+// `XX` refused the write — `Client.set`'s own header explains why that is
+// a return value, not a failure.
+fn asSetOk(r: Reply, cmd: string): bool!RedisError {
+  match (r) {
+    Simple(_) => return true
+    Null => return false
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn setOptsCmd(key: string, value: string, ttl: int, ifAbsent: bool, ifExists: bool): Cmd<bool> {
+  return Cmd<bool>{
+    args = setOptsArgs(key, value, ttl, ifAbsent, ifExists),
+    decode = (r) => asSetOk(r, "SET"),
+    readOnly = false,
+  }
+}
+
+// `SET ... GET` always replies with the previous value (or a null bulk) —
+// the exact `Option<string>` shape `asOptString` already decodes for `GET`
+// itself, regardless of whether `ifAbsent`/`ifExists` ultimately blocked
+// the write.
+fn setGetCmd(
+  key: string,
+  value: string,
+  ttl: int,
+  ifAbsent: bool,
+  ifExists: bool,
+): Cmd<Option<string>> {
+  let args = setOptsArgs(key, value, ttl, ifAbsent, ifExists)
+  args = append(args, "GET")
+  return Cmd<Option<string>>{ args = args, decode = (r) => asOptString(r, "SET"), readOnly = false }
 }
 
 fn delCmd(keys: []string): Cmd<i64> {
