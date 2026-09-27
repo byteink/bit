@@ -147,10 +147,10 @@ fn main(): ()! {
 }
 ```
 
-`scan(match = "", count = 0)` returns an iterator whose `next(): Option<
+`scan(pattern = "", count = 0)` returns an iterator whose `next(): Option<
 (string, string)>` fetches a new page only when the current one runs out -
-pass `match` to filter field names server-side (`HSCAN`'s own `MATCH`), and
-`count` as a hint for how many entries to fetch per round trip. There is no
+pass `pattern` to filter field names server-side (`HSCAN`'s own `MATCH`),
+and `count` as a hint for how many entries to fetch per round trip. There is no
 queued/pipelined version of `scan()`: a cursor is several round trips, and a
 pipeline's `Future<T>` only ever resolves one.
 
