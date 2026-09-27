@@ -99,6 +99,122 @@ fn newLockPool(a: lockAdapter): Pool {
   return p
 }
 
+// #6108's own fixture needs what neither existing adapter has alone:
+// `relAdapter` (relation.test.bit) answers one result set PER STATEMENT but
+// has no `begin()`; `lockAdapter` above supports `begin()` but replays the
+// SAME canned rows for every statement. `with()` issues two different
+// statements (the parent query, then the relation's IN query) and
+// `forUpdate()` needs a live Tx, so this wraps `relAdapter`'s per-statement
+// replay with a working `begin()`. Reuses `relCall`/`relResult`/`relRows`
+// (relation.test.bit, same module, SPEC §17.1) rather than redeclaring them.
+class lockRelAdapter {
+  calls: []relCall
+  results: []relResult
+  connect(cfg: Datasource): Conn! {
+    return lockRelConn{ a = this }
+  }
+}
+
+class lockRelConn {
+  a: lockRelAdapter
+  query(sqlText: string, params: []Value): Rows! {
+    let idx = len(this.a.calls)
+    this.a.calls = append(this.a.calls, relCall{ sql = sqlText, args = params })
+    let rs = this.a.results[idx]
+    return relRows{ cols = rs.cols, data = rs.rows, i = -1 }
+  }
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec not supported")
+  }
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+  begin(): Tx! {
+    return lockRelTx{ a = this.a }
+  }
+  close() {}
+}
+
+class lockRelTx {
+  a: lockRelAdapter
+  query(sqlText: string, params: []Value): Rows! {
+    let idx = len(this.a.calls)
+    this.a.calls = append(this.a.calls, relCall{ sql = sqlText, args = params })
+    let rs = this.a.results[idx]
+    return relRows{ cols = rs.cols, data = rs.rows, i = -1 }
+  }
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("fake: exec not supported")
+  }
+  commit(): ()! {}
+  rollback(): ()! {}
+}
+
+fn newLockRelPool(a: lockRelAdapter): Pool {
+  let p = pool(a, Datasource{ host = "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+// The running schema for #6108's own fixture: `LockedJob` hasMany `JobNote`
+// (`jobId`) — a real `@hasMany`-attributed, `@table`-carrying pair, the same
+// "exercise the real compiler mechanism" reasoning relation.test.bit's own
+// header gives for its schema.
+@table class LockedJob {
+  @id
+  id: i64
+  @hasMany("jobId")
+  notes: []JobNote
+}
+
+@table class JobNote {
+  @id
+  id: i64
+  jobId: i64
+}
+
+fn lockedJobMapper(rows: Rows): LockedJob! {
+  let cols = rows.columns()
+  return LockedJob{ id = sqlReqInt(rows, cols, "id")? }
+}
+
+fn jobNoteMapper(rows: Rows): JobNote! {
+  let cols = rows.columns()
+  return JobNote{ id = sqlReqInt(rows, cols, "id")?, jobId = sqlReqInt(rows, cols, "job_id")? }
+}
+
+fn jobNotesLoader(): RelationLoader<LockedJob> {
+  return hasMany<LockedJob, JobNote>(
+    (j) => j.id,
+    (db) => find<JobNote>(db, "job_notes", [field("id"), field("jobId")], jobNoteMapper),
+    "jobId",
+    (n) => n.jobId,
+    (j, notes) => {
+      j.notes = notes
+    },
+  )
+}
+
+fn lockedJobs(db: Data): Query<LockedJob> {
+  return withRelations(
+    find<LockedJob>(db, "locked_jobs", [field("id")], lockedJobMapper),
+    map<string, RelationLoader<LockedJob>>{ "notes": jobNotesLoader() },
+  )
+}
+
+// One parent row with two child rows — replayed fresh per test below, since
+// `lockRelAdapter.results` is consumed by index and each test issues its own
+// two statements.
+fn lockRelResults(): []relResult {
+  return [
+    relResult{ cols = ["id"], rows = [[Value.Int(1)]] },
+    relResult{
+      cols = ["id", "job_id"], rows = [[Value.Int(1), Value.Int(1)], [Value.Int(2), Value.Int(1)]],
+    },
+  ]
+}
+
 fn lastLockCall(a: lockAdapter): lockCall {
   return a.calls[len(a.calls) - 1]
 }
@@ -330,6 +446,48 @@ test "forUpdate on exists() is refused" {
       return
     }
     assert(false, "must refuse forUpdate on exists()")
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+  }
+}
+
+// #6108: `LockedQuery<T>.all()`/`one()`/`oneOrFail()` used to call
+// `sqlFindMany`/`sqlFindOne`/`sqlFindOneOrFail` directly and never run
+// `this.inner.loadWith(...)`, so `with("notes")` compiled and ran but left
+// every `notes` unloaded — the mutation proof: drop any one of the three
+// `this.inner.loadWith(...)` calls in `LockedQuery`'s terminals (lock.bit)
+// and its own arm of this test goes red, since `notes` would stay at
+// #5271's unloaded sentinel length 0 instead of 2.
+test "with(\"notes\").forUpdate(...) populates the relation under all(), one() and oneOrFail() alike (#6108)" {
+  let aAll = lockRelAdapter{ calls = []relCall(0), results = lockRelResults() }
+  let pAll = newLockRelPool(aAll)
+  pAll.tx((db) => {
+    let jobs = lockedJobs(db).with("notes").forUpdate(LockOpts{}, ServerDialect.Postgres).all()?
+    assert(len(jobs) == 1, "want 1 job, got ${len(jobs)}")
+    assert(
+      len(jobs[0].notes) == 2,
+      "all() must populate with(\"notes\"), got ${len(jobs[0].notes)}",
+    )
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+  }
+
+  let aOne = lockRelAdapter{ calls = []relCall(0), results = lockRelResults() }
+  let pOne = newLockRelPool(aOne)
+  pOne.tx((db) => {
+    let opt = lockedJobs(db).with("notes").forUpdate(LockOpts{}, ServerDialect.Postgres).one()?
+    assert(isSome<LockedJob>(opt), "one() must return Some for a matching row")
+    let job = unwrap<LockedJob>(opt)
+    assert(len(job.notes) == 2, "one() must populate with(\"notes\"), got ${len(job.notes)}")
+  }) catch e {
+    assert(false, "must not error: ${e.message()}")
+  }
+
+  let aFail = lockRelAdapter{ calls = []relCall(0), results = lockRelResults() }
+  let pFail = newLockRelPool(aFail)
+  pFail.tx((db) => {
+    let job = lockedJobs(db).with("notes").forUpdate(LockOpts{}, ServerDialect.Postgres).oneOrFail()?
+    assert(len(job.notes) == 2, "oneOrFail() must populate with(\"notes\"), got ${len(job.notes)}")
   }) catch e {
     assert(false, "must not error: ${e.message()}")
   }

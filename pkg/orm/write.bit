@@ -60,9 +60,16 @@
 // `db.query(... RETURNING *)` instead, because filling a database-generated
 // key needs the row the database actually wrote back, not just a count.
 //
-// UPDATE WRITES EVERY COLUMN, INCLUDING THE PRIMARY KEY ITSELF (a harmless
-// `id = $1 ... where id = $1`) - the ticket's own wording, and simpler than
-// carving one column out of every `SET` list for no behavioural gain.
+// UPDATE WRITES EVERY COLUMN EXCEPT A SOLE DATABASE-GENERATED `@id`
+// (#6101). The ticket's own original wording called `id = $1 ... where id
+// = $1` "harmless" - it is not: Postgres refuses to `SET` a `GENERATED
+// ALWAYS AS IDENTITY` column to anything but `DEFAULT` (verified live,
+// SQLSTATE 428C9, same as the INSERT case below), so a plain `t.id(...)`
+// primary key (`generatedIdField`, below) is carved out of every `SET`
+// list this file builds - INSERT's column list, UPDATE's (both branches)
+// and upsert's `ON CONFLICT`/`ON DUPLICATE KEY UPDATE` `sets`. A composite
+// key's `@id` fields are never database-generated (`pkg/orm/generate.bit`'s
+// own header) and keep flowing through unchanged.
 //
 // MYSQL HAS NO `RETURNING`. `upsertMysql`'s branch runs `db.exec` and
 // always answers with an empty `generated` map - documented here rather
@@ -297,16 +304,21 @@ fn upsertMysql(
 // ---- SQL text -----------------------------------------------------------
 
 // Every column, its placeholder and its bound argument, in `desc.fields`
-// order - shared by `insertSql` and both upsert dialects, which all start
-// an INSERT the identical way.
+// order, EXCLUDING a sole database-generated `@id` field (`generatedIdField`,
+// below - #6101) - shared by `insertSql` and both upsert dialects, which all
+// start an INSERT the identical way.
 fn insertColumnsAndArgs(
   desc: TableDesc,
   values: map<string, Value>,
 ): ([]string, []string, []Value) {
+  let genId = generatedIdField(desc)
   let cols = []string(0)
   let marks = []string(0)
   let args = []Value(0)
   for f of desc.fields {
+    if (f.name == genId || isRelationField(f)) {
+      continue
+    }
     cols = append(cols, columnName(f))
     args = append(args, valueFor(values, f, desc.table))
     marks = append(marks, "$${len(args)}")
@@ -325,9 +337,13 @@ fn updateSql(
   values: map<string, Value>,
   keyFields: []FieldDesc,
 ): (string, []Value) {
+  let genId = generatedIdField(desc)
   let sets = []string(0)
   let args = []Value(0)
   for f of desc.fields {
+    if (f.name == genId || isRelationField(f)) {
+      continue
+    }
     args = append(args, valueFor(values, f, desc.table))
     sets = append(sets, "${columnName(f)} = $${len(args)}")
   }
@@ -350,9 +366,13 @@ fn updateVersionedSql(
   vf: FieldDesc,
   newVersion: int,
 ): (string, []Value) {
+  let genId = generatedIdField(desc)
   let sets = []string(0)
   let args = []Value(0)
   for f of desc.fields {
+    if (f.name == genId || isRelationField(f)) {
+      continue
+    }
     if (f.name == vf.name) {
       args = append(args, Value.Int(newVersion))
     } else {
@@ -378,17 +398,19 @@ fn deleteSql(
   return (sqlText, args)
 }
 
-// `col = excluded.col` for every column but the conflict target, which
-// needs no assignment against itself.
+// `col = excluded.col` for every column but the conflict target and a sole
+// database-generated `@id` (#6101 - Postgres refuses `SET` on one exactly
+// as it refuses INSERT, `excluded.id` included), which need no assignment.
 fn upsertPostgresSql(
   desc: TableDesc,
   values: map<string, Value>,
   onField: FieldDesc,
 ): (string, []Value) {
   let (cols, marks, args) = insertColumnsAndArgs(desc, values)
+  let genId = generatedIdField(desc)
   let sets = []string(0)
   for f of desc.fields {
-    if (f.name != onField.name) {
+    if (f.name != onField.name && f.name != genId && !isRelationField(f)) {
       let c = columnName(f)
       sets = append(sets, "${c} = excluded.${c}")
     }
@@ -401,16 +423,21 @@ fn upsertPostgresSql(
 }
 
 // `col = values(col)` - MySQL's own reference to the row that failed to
-// insert, the same idea `excluded.col` is on Postgres.
+// insert, the same idea `excluded.col` is on Postgres. A sole
+// database-generated `@id` (#6101) is skipped here too: it is already out
+// of `cols` (`insertColumnsAndArgs`), and MySQL's `values(col)` reads NULL
+// for a column not in the INSERT list, so leaving it in `sets` would null
+// the id out on conflict instead of leaving it untouched.
 fn upsertMysqlSql(
   desc: TableDesc,
   values: map<string, Value>,
   onField: FieldDesc,
 ): (string, []Value) {
   let (cols, marks, args) = insertColumnsAndArgs(desc, values)
+  let genId = generatedIdField(desc)
   let sets = []string(0)
   for f of desc.fields {
-    if (f.name != onField.name) {
+    if (f.name != onField.name && f.name != genId && !isRelationField(f)) {
       let c = columnName(f)
       sets = append(sets, "${c} = values(${c})")
     }
@@ -442,6 +469,63 @@ fn valueFor(values: map<string, Value>, field: FieldDesc, table: string): Value 
 fn hasIdAttr(f: FieldDesc): bool {
   for a of f.attrs {
     if (a.name == "id") {
+      return true
+    }
+  }
+  return false
+}
+
+// The sole `@id` field's own name, or `""` when the class carries zero (a
+// caller bug `keyFields`/`valueFor` elsewhere already panic for) or more
+// than one (a composite key, #5084) - #6101. A single `@id` field is this
+// package's only column ever built by `t.id()` (`pkg/orm/docs/schema.md`:
+// "an auto-incrementing primary key"; rendered `generated always as
+// identity` on Postgres, `auto_increment` on MySQL -
+// `pkg/orm/postgres.bit`/`pkg/orm/mysql.bit`), so it never takes a
+// client-supplied value: Postgres refuses both an explicit INSERT value
+// and any UPDATE `SET` other than `DEFAULT` for one (verified live,
+// SQLSTATE 428C9 both ways). A composite key's `@id` fields are never
+// database-generated (`pkg/orm/generate.bit`'s own header: they become
+// `t.addInt`, never `t.id()`), so this returns `""` for them and every
+// one keeps flowing into INSERT/UPDATE/upsert exactly as before.
+fn generatedIdField(desc: TableDesc): string {
+  let name = ""
+  let count = 0
+  for f of desc.fields {
+    if (hasIdAttr(f)) {
+      count = count + 1
+      name = f.name
+    }
+  }
+  if (count == 1) {
+    return name
+  }
+  return ""
+}
+
+// The four compiler-known/package-known relation marks a `FieldDesc.attrs`
+// entry can carry - `@belongsTo`/`@hasOne`/`@hasMany`
+// (`compiler/classrelationattr.bit`'s `attrNameIsRelation`) and `@manyToMany`
+// (recorded the same #5051 way as `@unique`/`@check`, that file's own header:
+// "NOT added to attrNameIsRelation"). Declared once so `isRelationField`
+// below and any future caller share one list rather than four repeated
+// string comparisons drifting apart.
+fn relationAttrName(name: string): bool {
+  return name == "belongsTo" || name == "hasOne" || name == "hasMany" || name == "manyToMany"
+}
+
+// Whether `f` is a relation field, not a column - #6115.
+// `compiler/classtabledesc.bit`'s `tableDescriptor()` synthesizes one
+// `FieldDesc` per DECLARED field with no special case for a relation, so a
+// `@belongsTo`/`@hasOne`/`@hasMany`/`@manyToMany` field lands in
+// `desc.fields` exactly like a real column. Every write path in this file
+// excludes it the same way `generatedIdField` excludes a sole
+// database-generated `@id` (#6101): reads are unaffected, `query.bit`'s
+// `find<T>` runs `select *` through a per-class mapper, never `desc.fields`
+// as a write column list.
+fn isRelationField(f: FieldDesc): bool {
+  for a of f.attrs {
+    if (relationAttrName(a.name)) {
       return true
     }
   }

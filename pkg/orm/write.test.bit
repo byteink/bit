@@ -44,6 +44,40 @@ fn accountValues(u: Account): map<string, Value> {
   }
 }
 
+// A relation `FieldDesc` — the shape `compiler/classtabledesc.bit`'s
+// `tableDescriptor()` synthesizes for a `@belongsTo`/`@hasOne`/`@hasMany`/
+// `@manyToMany` field: one `AttrDesc` recording the relation mark, exactly
+// like a real column's `FieldDesc` except for that attribute (#6115).
+fn fieldWithRelation(name: string, relAttr: string): FieldDesc {
+  return FieldDesc{
+    name = name,
+    typeName = "any",
+    attrs = [AttrDesc{ name = relAttr, args = []string(0) }],
+  }
+}
+
+// An `articles` table carrying two relation fields alongside its three real
+// columns — `author` (`@belongsTo`) and `tags` (`@manyToMany`), the two
+// shapes #6115's own repro names.
+fn articleDesc(): TableDesc {
+  return TableDesc{
+    table = "articles",
+    fields = [
+      fieldWithId("id"), field("title"), field("authorId"),
+      fieldWithRelation("author", "belongsTo"), fieldWithRelation("tags", "manyToMany"),
+    ],
+    classAttrs = []AttrDesc(0),
+  }
+}
+
+fn articleValues(): map<string, Value> {
+  return map<string, Value>{
+    "id": Value.Int(0),
+    "title": Value.Text("Hello"),
+    "authorId": Value.Int(1),
+  }
+}
+
 class wrCall { sql: string, args: []Value }
 
 // One canned RETURNING row, replayed by every `query()` call.
@@ -133,7 +167,10 @@ test "save on a new entity emits INSERT with every column as a placeholder, then
   }
   u.markPersisted(true)
 
-  let want = "insert into accounts (id, name, email) values ($1, $2, $3) returning *"
+  // `id` is excluded (#6101): Postgres's `generated always as identity`
+  // (what `t.id()` always builds - `docs/schema.md`) refuses an explicit
+  // INSERT value for it, verified live against real Postgres.
+  let want = "insert into accounts (name, email) values ($1, $2) returning *"
   assert(lastWrCall(a).sql == want, "got: ${lastWrCall(a).sql}")
   assert(result.inserted, "must report an insert")
   assert(u.isPersisted(), "the entity must read isPersisted() true after a successful INSERT")
@@ -150,7 +187,10 @@ test "save on a persisted entity emits UPDATE naming every column with a WHERE o
     return
   }
 
-  let want = "update accounts set id = $1, name = $2, email = $3 where id = $4"
+  // `id` is excluded from SET (#6101): Postgres refuses `SET` on a
+  // `generated always as identity` column to anything but `DEFAULT`,
+  // verified live against real Postgres. It still names the row via WHERE.
+  let want = "update accounts set name = $1, email = $2 where id = $3"
   assert(lastWrCall(a).sql == want, "got: ${lastWrCall(a).sql}")
   assert(!result.inserted, "must report an update, not an insert")
 }
@@ -218,12 +258,19 @@ test "upsert(on = email) emits ON CONFLICT (email) DO UPDATE on the postgres dia
   }
 
   let sql = lastWrCall(a).sql
+  assert(
+    contains(sql, "insert into accounts (name, email)"),
+    "id must not be in the INSERT column list (#6101): ${sql}",
+  )
   assert(contains(sql, "on conflict (email) do update set"), "got: ${sql}")
   assert(
     !contains(sql, "email = excluded.email"),
     "must not set the conflict target against itself: ${sql}",
   )
-  assert(contains(sql, "id = excluded.id"), "must set every other column: ${sql}")
+  // `id` is excluded too (#6101): Postgres refuses `SET id = excluded.id`
+  // on a `generated always as identity` column, verified live.
+  assert(!contains(sql, "id = excluded.id"), "must not set the generated key: ${sql}")
+  assert(contains(sql, "name = excluded.name"), "must still set every other column: ${sql}")
 }
 
 test "upsert emits ON DUPLICATE KEY UPDATE on the mysql dialect, with no RETURNING" {
@@ -243,8 +290,15 @@ test "upsert emits ON DUPLICATE KEY UPDATE on the mysql dialect, with no RETURNI
   }
 
   let sql = lastWrCall(a).sql
+  assert(
+    contains(sql, "insert into accounts (name, email)"),
+    "id must not be in the INSERT column list (#6101): ${sql}",
+  )
   assert(contains(sql, "on duplicate key update"), "got: ${sql}")
-  assert(contains(sql, "id = values(id)"), "must set every other column: ${sql}")
+  // `id` is excluded from SET too (#6101): it is not in the INSERT column
+  // list, so MySQL's `values(id)` would read NULL there, not skip it.
+  assert(!contains(sql, "id = values(id)"), "must not null the generated key: ${sql}")
+  assert(contains(sql, "name = values(name)"), "must still set every other column: ${sql}")
   assert(len(generated) == 0, "MySQL upsert has no RETURNING to fill from - see this file's header")
 }
 
@@ -276,4 +330,107 @@ test "an INSERT with a database-generated key fills that field from RETURNING" {
   u.markPersisted(true)
   assert(u.id == 42, "the caller applies RETURNING's id onto the concrete entity")
   assert(u.isPersisted(), "the caller marks it persisted after a successful INSERT")
+}
+
+test "save()/upsert() exclude relation fields from the INSERT/UPDATE/upsert column list, supplying only real columns (#6115)" {
+  let a = wrAdapter{
+    cols = ["id", "title", "author_id"], rows = [
+      [Value.Int(1), Value.Text("Hello"), Value.Int(1)],
+    ],
+    affected = 0,
+  }
+  let p = newWrPool(a)
+
+  // INSERT: a value for `author`/`tags` was never supplied - a class with a
+  // relation field could not reach `valueFor`'s panic before this fix.
+  save(p, articleDesc(), articleValues(), false) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  let insertSqlText = lastWrCall(a).sql
+  let wantInsert = "insert into articles (title, author_id) values ($1, $2) returning *"
+  assert(insertSqlText == wantInsert, "got: ${insertSqlText}")
+
+  // UPDATE (the full-row path, #6115's own title).
+  let a2 = wrAdapter{ cols = []string(0), rows = [][]Value(0), affected = 1 }
+  let p2 = newWrPool(a2)
+  save(p2, articleDesc(), articleValues(), true) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  let updateSqlText = lastWrCall(a2).sql
+  let wantUpdate = "update articles set title = $1, author_id = $2 where id = $3"
+  assert(updateSqlText == wantUpdate, "got: ${updateSqlText}")
+
+  // upsert().
+  let a3 = wrAdapter{
+    cols = ["id", "title", "author_id"], rows = [[Value.Int(1), Value.Text("Hello"), Value.Int(1)]],
+    affected = 0,
+  }
+  let p3 = newWrPool(a3)
+  upsert(p3, articleDesc(), articleValues(), ServerDialect.Postgres, on = "id") catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  let upsertSqlText = lastWrCall(a3).sql
+  let wantUpsert = "insert into articles (title, author_id) values ($1, $2) on conflict (id) do update set title = excluded.title, author_id = excluded.author_id returning *"
+  assert(upsertSqlText == wantUpsert, "got: ${upsertSqlText}")
+}
+
+// #6101/#6095, against a real Postgres server (this file's own header
+// pattern, `check.test.bit`'s "a test that skips when no server is
+// configured has never run"): `ORM_TEST_LIVE_PG_URI` supplies a connection
+// string; this test skips only when it is unset, and says so. Proves both
+// bugs' fixes at once - a table built through pkg/orm's OWN `t.id("id")`
+// schema builder and Postgres renderer (never a hand-typed DDL string)
+// round-trips through `save()`'s INSERT and UPDATE and through `upsert()`,
+// a composite-key table's two `@id` fields still flow through unchanged,
+// and `with("posts")` populates a `hasMany` relation identically under
+// `all()`, `one()` and `oneOrFail()`. `env`/`run` (std/os), `mkdir`/
+// `writeFile` (std/fs) and `findRepoRoot`/`scratchDir` are already
+// imported/declared package-wide by `generate.bit`/`generate.test.bit` -
+// see `check.test.bit`'s own header for why importing or redeclaring any
+// of them here would be E0042.
+const liveWriteProofSource: string = "import { args } from \"std/os\"\nimport { pool, Datasource, Value, FieldDesc, AttrDesc, Rows, sqlReqInt, sqlReqText } from \"std/sql\"\nimport { isSome, unwrap } from \"std/core\"\nimport { adapter } from \"postgres\"\nimport {\n  TableDesc, Data, save, upsert, delete as ormDelete, table, Postgres, ServerDialect, find, Query,\n  RelationLoader, withRelations, hasMany,\n} from \"orm\"\n\n@table(\"t6101_people\") class Person {\n  @id\n  id: i64\n  name: string\n  email: string\n  @hasMany(\"authorId\")\n  posts: []Post\n}\n\n@table(\"t6101_membership\") class Membership {\n  @id\n  userId: i64\n  @id\n  teamId: i64\n  role: string\n}\n\n@table(\"t6101_posts\") class Post {\n  @id\n  id: i64\n  authorId: i64\n  title: string\n}\n\nfn personZero(): Person {\n  return Person{ id = 0, name = \"\", email = \"\" }\n}\n\n// A hand-written column list, not `Person{}.tableDescriptor()` - `posts`\n// (`@hasMany`) is a relation field, not a column, and `save`/`upsert`\n// require a value for every field a `TableDesc` names (write.bit's own\n// `valueFor`); the write side of this package is exercised against its\n// three real columns only, same as docs/write.md's `personDesc()`.\nfn personDesc(): TableDesc {\n  return TableDesc{\n    table = \"t6101_people\",\n    fields = [\n      FieldDesc{ name = \"id\", typeName = \"i64\", attrs = [AttrDesc{ name = \"id\", args = []string(0) }] },\n      FieldDesc{ name = \"name\", typeName = \"string\", attrs = []AttrDesc(0) },\n      FieldDesc{ name = \"email\", typeName = \"string\", attrs = []AttrDesc(0) },\n    ],\n    classAttrs = []AttrDesc(0),\n  }\n}\n\nfn personValues(p: Person): map<string, Value> {\n  return map<string, Value>{ \"id\": Value.Int(p.id), \"name\": Value.Text(p.name), \"email\": Value.Text(p.email) }\n}\n\nfn membershipDesc(): TableDesc {\n  return TableDesc{\n    table = \"t6101_membership\",\n    fields = Membership{ userId = 0, teamId = 0, role = \"\" }.tableDescriptor(),\n    classAttrs = []AttrDesc(0),\n  }\n}\n\nfn membershipValues(m: Membership): map<string, Value> {\n  return map<string, Value>{\n    \"userId\": Value.Int(m.userId), \"teamId\": Value.Int(m.teamId), \"role\": Value.Text(m.role),\n  }\n}\n\nfn postMapper(rows: Rows): Post! {\n  let cols = rows.columns()\n  return Post{\n    id = sqlReqInt(rows, cols, \"id\")?, authorId = sqlReqInt(rows, cols, \"author_id\")?,\n    title = sqlReqText(rows, cols, \"title\")?,\n  }\n}\n\nfn personMapper(rows: Rows): Person! {\n  let cols = rows.columns()\n  return Person{\n    id = sqlReqInt(rows, cols, \"id\")?, name = sqlReqText(rows, cols, \"name\")?,\n    email = sqlReqText(rows, cols, \"email\")?,\n  }\n}\n\nfn postsLoader(): RelationLoader<Person> {\n  return hasMany<Person, Post>(\n    (p) => p.id,\n    (db) => find<Post>(\n      db,\n      \"t6101_posts\",\n      [\n        FieldDesc{ name = \"id\", typeName = \"i64\", attrs = []AttrDesc(0) },\n        FieldDesc{ name = \"authorId\", typeName = \"i64\", attrs = []AttrDesc(0) },\n        FieldDesc{ name = \"title\", typeName = \"string\", attrs = []AttrDesc(0) },\n      ],\n      postMapper,\n    ),\n    \"authorId\",\n    (post) => post.authorId,\n    (p, posts) => {\n      p.posts = posts\n    },\n  )\n}\n\nfn peopleWithPosts(db: Data): Query<Person> {\n  let fields = [\n    FieldDesc{ name = \"id\", typeName = \"i64\", attrs = [AttrDesc{ name = \"id\", args = []string(0) }] },\n    FieldDesc{ name = \"name\", typeName = \"string\", attrs = []AttrDesc(0) },\n    FieldDesc{ name = \"email\", typeName = \"string\", attrs = []AttrDesc(0) },\n  ]\n  return withRelations(\n    find<Person>(db, \"t6101_people\", fields, personMapper),\n    map<string, RelationLoader<Person>>{ \"posts\": postsLoader() },\n  )\n}\n\nfn main(): ()! {\n  let uri = args()[1]\n  let db = pool(adapter(), Datasource{ uri = uri }) catch e {\n    panic(\"pool: \${e.message()}\")\n  }\n\n  db.exec(\"drop table if exists t6101_posts\", []Value(0)) catch e { panic(\"drop posts: \${e.message()}\") }\n  db.exec(\"drop table if exists t6101_membership\", []Value(0)) catch e { panic(\"drop membership: \${e.message()}\") }\n  db.exec(\"drop table if exists t6101_people\", []Value(0)) catch e { panic(\"drop people: \${e.message()}\") }\n\n  // #6101: create the table through pkg/orm's OWN schema builder\n  // (`t.id(\"id\")`, docs/schema.md's \"auto-incrementing primary key\") and\n  // its own Postgres renderer - not a hand-typed DDL string - so this test\n  // proves the two sides of the package actually agree.\n  let op = table(\"t6101_people\", (t) => {\n    t.id(\"id\")\n    t.string(\"name\", 100)\n    t.string(\"email\", 255).unique()\n  })\n  let stmts = Postgres{}.render(op)\n  for st of stmts {\n    db.exec(st.sql, []Value(0)) catch e { panic(\"create people via schema builder: \${e.message()}\") }\n  }\n\n  db.exec(\n    \"create table t6101_membership (user_id bigint not null, team_id bigint not null, role text not null, primary key (user_id, team_id))\",\n    []Value(0),\n  ) catch e { panic(\"create membership: \${e.message()}\") }\n\n  db.exec(\n    \"create table t6101_posts (id bigint generated always as identity primary key, author_id bigint not null references t6101_people(id), title text not null)\",\n    []Value(0),\n  ) catch e { panic(\"create posts: \${e.message()}\") }\n\n  // #6101: save() INSERT against a t.id() (GENERATED ALWAYS AS IDENTITY) table\n  let p = personZero()\n  p.name = \"Ada\"\n  p.email = \"ada@x.com\"\n  let inserted = save(db, personDesc(), personValues(p), p.isPersisted()) catch e {\n    panic(\"LIVE PROOF FAILED (#6101): INSERT against a GENERATED ALWAYS AS IDENTITY table: \${e.message()}\")\n  }\n  if (!inserted.inserted) {\n    panic(\"LIVE PROOF FAILED: save() on a fresh entity did not report an insert\")\n  }\n  let (genId, genOk) = inserted.generated[\"id\"]\n  if (!genOk) {\n    panic(\"LIVE PROOF FAILED: RETURNING did not fill the generated id\")\n  }\n  match (genId) {\n    Int(n) => { p.id = n }\n    _ => { panic(\"LIVE PROOF FAILED: generated id was not an Int\") }\n  }\n  p.markPersisted(true)\n\n  // #6101: save() UPDATE against the same identity column\n  p.name = \"Ada Lovelace\"\n  save(db, personDesc(), personValues(p), p.isPersisted()) catch e {\n    panic(\"LIVE PROOF FAILED (#6101): UPDATE against a GENERATED ALWAYS AS IDENTITY table: \${e.message()}\")\n  }\n\n  // #6101: upsert() by a non-id unique column against the same table\n  upsert(db, personDesc(), personValues(p), ServerDialect.Postgres, on = \"email\") catch e {\n    panic(\"LIVE PROOF FAILED (#6101): upsert() against a GENERATED ALWAYS AS IDENTITY table: \${e.message()}\")\n  }\n\n  // #6101: a composite-key table's @id fields are never database-generated\n  // and must still round-trip unchanged.\n  let m = Membership{ userId = 1, teamId = 2, role = \"owner\" }\n  save(db, membershipDesc(), membershipValues(m), m.isPersisted()) catch e {\n    panic(\"LIVE PROOF FAILED: composite-key INSERT: \${e.message()}\")\n  }\n  m.markPersisted(true)\n  m.role = \"admin\"\n  save(db, membershipDesc(), membershipValues(m), m.isPersisted()) catch e {\n    panic(\"LIVE PROOF FAILED: composite-key UPDATE: \${e.message()}\")\n  }\n  ormDelete(db, membershipDesc(), membershipValues(m)) catch e {\n    panic(\"LIVE PROOF FAILED: composite-key DELETE: \${e.message()}\")\n  }\n\n  // #6095: with() under all(), one() and oneOrFail() alike.\n  db.exec(\n    \"insert into t6101_posts (author_id, title) values ($1, $2)\",\n    [Value.Int(p.id), Value.Text(\"First\")],\n  ) catch e { panic(\"insert post 1: \${e.message()}\") }\n  db.exec(\n    \"insert into t6101_posts (author_id, title) values ($1, $2)\",\n    [Value.Int(p.id), Value.Text(\"Second\")],\n  ) catch e { panic(\"insert post 2: \${e.message()}\") }\n\n  let allRows = peopleWithPosts(db).with(\"posts\").where(\"id\", Value.Int(p.id)).all() catch e {\n    panic(\"LIVE PROOF FAILED: all().with(): \${e.message()}\")\n  }\n  if (len(allRows) != 1 || len(allRows[0].posts) != 2) {\n    panic(\"LIVE PROOF FAILED: all().with(\\\"posts\\\") did not populate posts\")\n  }\n\n  let oneOpt = peopleWithPosts(db).with(\"posts\").where(\"id\", Value.Int(p.id)).one() catch e {\n    panic(\"LIVE PROOF FAILED (#6095): one().with(): \${e.message()}\")\n  }\n  if (!isSome<Person>(oneOpt)) {\n    panic(\"LIVE PROOF FAILED: one() did not return Some for a matching row\")\n  }\n  let onePerson = unwrap<Person>(oneOpt)\n  if (len(onePerson.posts) != 2) {\n    panic(\"LIVE PROOF FAILED (#6095): one().with(\\\"posts\\\") did not populate posts, got \${len(onePerson.posts)}\")\n  }\n\n  let failPerson = peopleWithPosts(db).with(\"posts\").where(\"id\", Value.Int(p.id)).oneOrFail() catch e {\n    panic(\"LIVE PROOF FAILED (#6095): oneOrFail().with(): \${e.message()}\")\n  }\n  if (len(failPerson.posts) != 2) {\n    panic(\"LIVE PROOF FAILED (#6095): oneOrFail().with(\\\"posts\\\") did not populate posts, got \${len(failPerson.posts)}\")\n  }\n\n  db.exec(\"drop table t6101_posts\", []Value(0)) catch e { panic(\"cleanup posts: \${e.message()}\") }\n  db.exec(\"drop table t6101_membership\", []Value(0)) catch e { panic(\"cleanup membership: \${e.message()}\") }\n  db.exec(\"drop table t6101_people\", []Value(0)) catch e { panic(\"cleanup people: \${e.message()}\") }\n  db.close()\n  print(\"LIVE_PROOF_OK\")\n}\n"
+
+test "live: save()/upsert() against a real GENERATED ALWAYS AS IDENTITY table, and with() under all()/one()/oneOrFail() (#6101, #6095)" {
+  let uri = env("ORM_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_PG_URI is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let proj = scratchDir("liveproof6101")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof6101\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", liveWriteProofSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(
+    rc == 0,
+    "live proof against a real Postgres server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}'",
+  )
+  resetDir(proj)
 }

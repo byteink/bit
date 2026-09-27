@@ -42,8 +42,9 @@ fn personValues(p: Person): map<string, Value> {
 }
 
 fn savePerson(db: Data, p: Person): Person! {
-  let desc = applyTimestamps(personDesc(), personValues(p), p.isPersisted(), p.tableAttrs(), now())?
-  let result = save(db, desc, personValues(p), p.isPersisted())?
+  let values = personValues(p)
+  let desc = applyTimestamps(personDesc(), values, p.isPersisted(), p.tableAttrs(), now())?
+  let result = save(db, desc, values, p.isPersisted())?
   p.markPersisted(true)
   return p
 }
