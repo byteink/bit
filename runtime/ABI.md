@@ -400,8 +400,8 @@ entry and marking it. That is the entire precision contract for the heap.
 
 ### 2.1 Method table (interface dispatch)
 
-`methods` lists every method the concrete type defines, for structural
-interface dispatch (SPEC §14). Each entry is:
+`methods` lists the type's methods some site can dispatch to (SPEC §14), no others
+(`dispatchedTables`, `compiler/lowermethodtable.bit`, #6114). Each entry is:
 
 ```
 Method {                         // extern class, 16 bytes, 8-aligned
