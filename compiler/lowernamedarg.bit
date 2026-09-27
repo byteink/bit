@@ -32,6 +32,14 @@ class NamedLowerDecl { owner: Checker, params: []int, want: int, paramTypes: []i
 // 5-parameter limit.
 class NamedLowerOut { vals: []int, filled: []bool }
 
+// The declared-index range `fillDefaultRange` (#6121) fills, plus
+// `willWrite[i]`: true when SOME entry in the call's own argument list
+// targets declared index `i`, whether or not that entry has been evaluated
+// yet. Bundled for the same E0202 reason as `NamedLowerDecl`/`NamedLowerOut`
+// above — `willWrite`, `lo` and `hi` are the one range-fill request, not
+// three separate parameters.
+class DefaultFillRange { willWrite: []bool, lo: int, hi: int }
+
 // One `args[i]` entry: evaluates it (materializing with its RESOLVED
 // parameter's type as the hint) and writes the result into `out.vals`/
 // `out.filled` at that parameter's DECLARED index — `i` itself for a plain
@@ -99,6 +107,64 @@ fn lowerNamedArgVariadicTail(fc: FnCtx, decl: NamedLowerDecl, out: NamedLowerOut
   out.vals[decl.want - 1] = lowerVariadicTail(fc, elemTy, []int(0))
 }
 
+// `args[j]`'s DECLARED target index — `j` itself for a plain `Tag.Arg`
+// (positional prefix, always index-aligned), the name-resolved index for a
+// `Tag.NamedArg`, computed once so the interleaved fill below
+// (`lowerArgsForNamed`) knows, before evaluating anything, exactly which
+// trailing-default slots this call will NEVER write itself. Mirrors
+// `lowerOneNamedArg`'s own resolution; an unresolvable name answers -1
+// there and reaches that function's own hard failure once evaluation
+// actually reaches it, so a bad index here only ever widens a range this
+// pass leaves untouched, never fills a slot by guess.
+fn namedArgTargets(fc: FnCtx, args: []int, owner: Checker, params: []int): []int {
+  let out = []int(len(args))
+  let j = 0
+  while (j < len(args)) {
+    let n = getNode(fc.c.tree, args[j])
+    if (n.tag == Tag.NamedArg) {
+      let nk = kidsOf(fc.c.tree, args[j])
+      let nameNode = getNode(fc.c.tree, nk[0])
+      out[j] = paramIndexByName(owner, params, fc.c.source[nameNode.span.start:nameNode.span.end])
+    } else {
+      out[j] = j
+    }
+    j = j + 1
+  }
+  return out
+}
+
+// Fills every UNWRITTEN default (SPEC §10.3, #6121) in `range`'s declared
+// index span — a slot `range.willWrite` marks is always filled by its own
+// written argument, further along the walk below, never here.
+// `vNamedArgArity` (namedargs.bit) has already proven every OTHER slot in
+// this span carries a default, so this only ever reads one that exists.
+fn fillDefaultRange(fc: FnCtx, decl: NamedLowerDecl, out: NamedLowerOut, range: DefaultFillRange) {
+  let i = range.lo
+  while (i < range.hi) {
+    if (!range.willWrite[i] && !out.filled[i]) {
+      let pk = kidsOf(decl.owner.tree, decl.params[i])
+      out.vals[i] = lowerDefaultLiteral(fc, decl.owner, pk[2], decl.paramTypes[i])
+      out.filled[i] = true
+    }
+    i = i + 1
+  }
+}
+
+// `willWrite[i]` for every declared index `i`, from each `targets[j]` —
+// split out of `lowerArgsForNamed` purely to keep ITS OWN complexity down
+// (spec/LINT.md E0204, tools/build/complexity-debt.txt).
+fn willWriteFromTargets(targets: []int, want: int): []bool {
+  let willWrite = []bool(want)
+  let j = 0
+  while (j < len(targets)) {
+    if (targets[j] >= 0 && targets[j] < want) {
+      willWrite[targets[j]] = true
+    }
+    j = j + 1
+  }
+  return willWrite
+}
+
 // `params` are the callee's declared parameter NODES, in `owner`'s tree —
 // supplied by the caller rather than derived here because the two callers
 // resolve a callee differently: a free function through `declParamListNode`
@@ -120,10 +186,51 @@ fn lowerArgsForNamed(
     paramTypes = paramTypes,
   }
   let out = NamedLowerOut{ vals = []int(decl.want), filled = []bool(decl.want) }
+  let fixed = decl.want
+  if (decl.want > 0 && getNode(owner.tree, decl.params[decl.want - 1]).tag == Tag.ParamRest) {
+    fixed = decl.want - 1
+  }
+  // INTERLEAVED, not a trailing batch (#6121): a default at declared index
+  // `i` is filled the moment the written-order walk passes `i`, so a call
+  // that skips an EARLIER default while naming a LATER one (`f(k, nx =
+  // true)` against `f(k, ttl = 0, nx = false)`) lowers `ttl`'s default at
+  // its declared position — between `k` and `nx` — rather than after every
+  // written argument, and is therefore byte-identical to the fully
+  // spelled-out positional call `f(k, 0, true)`. Safe at any point relative
+  // to the WRITTEN arguments: SPEC §10.3 restricts a default to a bare
+  // literal, so filling one early can never reorder an observable side
+  // effect the way evaluating a written argument early would — only
+  // `willWrite`, not evaluation itself, decides where a slot's value comes
+  // from, and every written arg still evaluates in exactly its own written
+  // order via the unchanged loop below.
+  let targets = namedArgTargets(fc, args, owner, params)
+  let willWrite = willWriteFromTargets(targets, decl.want)
+  let cursor = 0
   let i = 0
   while (i < len(args) && !fc.failed) {
+    let t = targets[i]
+    if (t >= 0 && t < fixed && t > cursor) {
+      fillDefaultRange(
+        fc,
+        decl,
+        out,
+        DefaultFillRange{ willWrite = willWrite, lo = cursor, hi = t },
+      )
+      cursor = t
+    }
     lowerOneNamedArg(fc, args[i], i, decl, out)
+    if (t >= cursor) {
+      cursor = t + 1
+    }
     i = i + 1
+  }
+  if (!fc.failed) {
+    fillDefaultRange(
+      fc,
+      decl,
+      out,
+      DefaultFillRange{ willWrite = willWrite, lo = cursor, hi = fixed },
+    )
   }
   lowerNamedArgVariadicTail(fc, decl, out)
   return out.vals
