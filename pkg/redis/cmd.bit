@@ -1,6 +1,6 @@
 // pkg/redis/cmd.bit — `Cmd<T>`: one command, defined once, shared by
-// `Client` (runs it now), `Pipeline` (queues it, hands back a `Future<T>`)
-// and `Tx` (queues it inside MULTI). Epic #6013, #6028.
+// `Client` (runs it now), `Pipeline` and `Tx` (both queue it into a shared
+// `Batch`, handing back a `Future<T>`). Epic #6013, #6028.
 //
 // HOW A FAMILY ADDS A COMMAND (read this before writing a family file):
 // write ONE factory function that builds a `Cmd<T>`, e.g.
@@ -18,24 +18,36 @@
 // `readOnly` picks the retry policy `Client.runCmd` uses — true only for a
 // command that is safe to run twice (a read; never `SET`, `INCR`, ...).
 //
-// Then give the family's handle class ONE method per command that calls
-// `client.runCmd(cmd)` (Client — immediate), and, once a family needs
-// pipeline/transaction support too, a matching method on a queued view that
-// calls `pipeline.queue(cmd)` (a `Future<T>`) or `tx.queue(cmd)` (queued
-// server-side, no typed result until `EXEC` commits — see `tx.bit`'s
-// header). The command definition — `args` and `decode` — is written
-// exactly once either way.
+// Then give the family TWO methods, immediate and queued, each ONE line:
+//
+//   // On the family's immediate handle (e.g. `Counter` in counter.bit):
+//   export incr(): i64!RedisError { return this.client.runCmd(incrCmd(this.key)) }
+//   // On the family's QUEUED view (e.g. `CounterBatch`, same file) — the
+//   // ONE view `Pipeline.counter(key)` AND `Tx.counter(key)` both return,
+//   // since both just hold a `Batch` (this file's `Batch` class):
+//   export incr(): Future<i64> { return this.batch.queue(incrCmd(this.key)) }
+//
+// The command definition — `args` and `decode` — is written exactly once;
+// only these two one-line calls differ, `client.runCmd` vs `batch.queue`.
+//
+// WHY PIPELINE AND TX SHARE ONE `Batch`, NOT TWO QUEUED VIEWS PER FAMILY:
+// `Pipeline.exec()` sends every queued command back-to-back then reads all
+// the replies (`pipeline.bit`); `Tx` sends WATCH/MULTI/each queued command/
+// EXEC instead (`tx.bit`) — the two differ ONLY in how the queued `Batch`
+// eventually reaches the wire, never in the client-side queuing itself
+// (`Batch.queue<T>`, append `args`, hand back a `Future<T>` over the SAME
+// shared `resultBox`). So a family's queued view holds a `Batch` field, not
+// a `Pipeline` or `Tx` one, and `Pipeline`/`Tx` both expose the identical
+// family accessor (`counter(key): CounterBatch`) over their own `batch`
+// field — one queued view per family, not two.
 //
 // WHY NOT ONE HANDLE CLASS GENERIC OVER "THE EXECUTOR": prototyped first
 // (recorded on #6013) and rejected — `Client.runCmd` must return `T`
-// directly (the spine's `r.counter("n").incr()?` is `i64` NOW), while
-// `Pipeline`/`Tx` must return `Future<T>`/`()` instead. Bit has no
-// higher-kinded types (#6014's probes, confirmed again here), so a single
-// generic method cannot flip its OWN return type between `T` and `Future<T>`
-// depending on which executor it closed over — the two shapes need two
-// methods. `Cmd<T>` is the piece that stays shared: only the thin call
-// (`runCmd`/`queue`) differs per executor, never the command's own
-// definition.
+// directly (the spine's `r.counter("n").incr()?` is `i64` NOW), while a
+// queued call must return `Future<T>` instead. Bit has no higher-kinded
+// types (#6014's probes, confirmed again here), so a single generic method
+// cannot flip its OWN return type between `T` and `Future<T>` depending on
+// which executor it closed over — the two shapes need two methods.
 
 // One command: the wire form and how to decode its reply. `T` is the
 // decoded result's type — never itself fallible; a decode failure is
@@ -56,12 +68,12 @@ class resultBox {
   ready: bool,
 }
 
-// The result of one command queued into a `Pipeline` — see `pipeline.bit`.
-// Worthless before `exec()` runs (`get()` fails `RedisError.Closed`, the
-// same variant a caller-error would if there were nothing better named for
-// it); reads `box.replies[index]` and decodes it afterward, exactly once
-// per call, never cached, since the replies slice itself is filled once and
-// then immutable.
+// The result of one command queued into a `Batch` — see `pipeline.bit`/
+// `tx.bit`. Worthless before the batch's owner fills its box (`get()` fails
+// `RedisError.Closed`, the same variant a caller-error would if there were
+// nothing better named for it); reads `box.replies[index]` and decodes it
+// afterward, exactly once per call, never cached, since the replies slice
+// itself is filled once and then immutable.
 export class Future<T> {
   box: resultBox
   index: int
@@ -72,6 +84,41 @@ export class Future<T> {
     }
     return this.decode(this.box.replies[this.index])?
   }
+}
+
+// The client-side queue `Pipeline` and `Tx` share (this file's header):
+// append `args`, hand back a `Future<T>` over one `resultBox` — nothing
+// here ever touches the network. `Pipeline.exec()`/`tx.bit`'s per-attempt
+// driver are what actually run `queued` and fill `box`; a fresh `Batch`
+// (`newBatch`) per transaction ATTEMPT is what makes a retry's futures
+// never alias a discarded attempt's (`tx.bit`'s header).
+export class Batch {
+  box: resultBox
+  queued: [][]string
+
+  export queue<T>(cmd: Cmd<T>): Future<T> {
+    let idx = len(this.queued)
+    this.queued = append(this.queued, cmd.args)
+    return Future<T>{ box = this.box, index = idx, decode = cmd.decode }
+  }
+
+  // The six commands every `Client` exposes directly (`client.bit`), moved
+  // onto the ONE queued shape `Pipeline`/`Tx` both forward to (this file's
+  // header, point 4) — so a pipelined or transacted `GET`/`SET`/... is one
+  // pattern, not two.
+  export get(key: string): Future<Option<string>> { return this.queue(getCmd(key)) }
+  export set(key: string, value: string): Future<()> { return this.queue(setCmd(key, value)) }
+  export del(keys: []string): Future<i64> { return this.queue(delCmd(keys)) }
+  export exists(keys: []string): Future<i64> { return this.queue(existsCmd(keys)) }
+  export expire(key: string, seconds: i64): Future<bool> {
+    return this.queue(expireCmd(key, seconds))
+  }
+  export ping(): Future<string> { return this.queue(pingCmd()) }
+}
+
+// An empty batch, ready to `queue` into.
+export fn newBatch(): Batch {
+  return Batch{ box = resultBox{ replies = []Reply(0), ready = false }, queued = [][]string(0) }
 }
 
 // One member/score pair — `ZRANGE ... WITHSCORES` and friends, decoded by

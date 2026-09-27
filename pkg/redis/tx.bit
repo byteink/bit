@@ -1,126 +1,169 @@
 // pkg/redis/tx.bit — `r.transaction(keys, (tx) => { ... })`: WATCH every
-// key, MULTI, run `body` to queue commands server-side, EXEC. Retried on a
-// nil EXEC (a WATCHed key changed between WATCH and EXEC — Redis's own
-// optimistic-lock conflict signal) up to a bounded count. Epic #6013,
-// #6028.
+// key, run `body` to queue commands into a `Batch` (`cmd.bit`) client-side,
+// MULTI, send every queued command, EXEC. Retried on a nil EXEC (a WATCHed
+// key changed between WATCH and EXEC — Redis's own optimistic-lock
+// conflict signal) up to a bounded count. Epic #6013, #6028.
 //
-// `Tx.queue` IS NOT `Pipeline.queue`: inside MULTI, Redis does not RUN a
-// queued command at all, only acknowledges it with `+QUEUED` — the real
-// result is only known once `EXEC` commits, as one reply per queued
-// command, in order. `Tx` has nothing typed to hand back mid-transaction,
-// so `queue<T>` returns `()!RedisError`, failing only if the server refused
-// to queue the command at all (a syntax error, `WRONGTYPE` is still
-// possible pre-EXEC for some commands). A family wanting its typed result
-// back reads it from `EXEC`'s own reply array after `transaction` returns —
-// out of scope for this ticket (#6028 ships the plain commands only: get,
-// set, del, exists, expire, ping, none of which a caller needs a value back
-// from INSIDE the transaction body for).
+// WHY `body` RUNS AFTER WATCH, NOT BEFORE: `Tx.queue`/every flat/family
+// method never touches the network itself (`this.batch.queue`, the exact
+// mechanism `Pipeline` also uses — `cmd.bit`'s header, point 2) — but
+// `body` is still invoked from INSIDE the leased connection's WATCH..EXEC
+// window (`runTxAttempt` below), after WATCH and before MULTI. That is
+// what makes a live conflict test deterministic rather than a network
+// race: `body` runs synchronous Bit code, so a caller that does its own
+// (separate-connection) conflicting write FROM WITHIN `body` is guaranteed
+// to have completed it before this attempt's MULTI/EXEC are ever sent —
+// no `spawn`, no timing window to land in.
+//
+// A FRESH `Batch` (AND A FRESH `Tx`) PER ATTEMPT is the whole answer to "a
+// retried attempt must not leak a stale Future": `runTxAttempt` calls
+// `body` again on every retry, over a brand-new `Batch`/`box`, and hands
+// back `(result, committed)` for THAT attempt only. `runTransaction` below
+// returns `result` to the caller ONLY from the iteration whose `committed`
+// came back `true` — never a cached result from an earlier, abandoned
+// attempt — so a discarded attempt's `Future`s are never reachable through
+// the public API at all, not merely "still there but stale".
+//
+// A `body` FAILURE SENDS `UNWATCH`, NEVER `MULTI`: `body` runs before
+// `MULTI`, so there is nothing queued server-side to `DISCARD` yet: only
+// the `WATCH` needs clearing before the connection goes back to the pool,
+// or the NEXT caller to lease it would silently inherit stale watched
+// keys.
 
 const maxTxRetries: int = 10
 
-// One command queued inside a transaction body. Every family's queued view
-// calls this with the SAME `Cmd<T>` its `Client`/`Pipeline` methods use
-// (`cmd.bit`'s header) — only the executor differs, never the command.
+// One command queued inside a transaction body, and the six commands every
+// `Client` exposes directly — both just forward to `this.batch`, the exact
+// methods `Pipeline` forwards to (`cmd.bit`'s header, point 4).
 export class Tx {
-  conn: redisConn
-  timeoutNs: int
+  batch: Batch
 
-  export queue<T>(cmd: Cmd<T>): ()!RedisError {
-    writeCommand(this.conn, cmd.args, this.timeoutNs)?
-    let r = readOneReply(this.conn, this.timeoutNs)?
-    match (r) {
-      Simple(s) => return expectQueued(s, cmd.args[0])?
-      _ => fail RedisError.Unexpected(cmd.args[0], shapeName(r))
-    }
-  }
+  export queue<T>(cmd: Cmd<T>): Future<T> { return this.batch.queue(cmd) }
 
-  export get(key: string): ()!RedisError {
-    return this.queue(getCmd(key))?
-  }
+  export get(key: string): Future<Option<string>> { return this.batch.get(key) }
+  export set(key: string, value: string): Future<()> { return this.batch.set(key, value) }
+  export del(keys: []string): Future<i64> { return this.batch.del(keys) }
+  export exists(keys: []string): Future<i64> { return this.batch.exists(keys) }
+  export expire(key: string, seconds: i64): Future<bool> { return this.batch.expire(key, seconds) }
+  export ping(): Future<string> { return this.batch.ping() }
 
-  export set(key: string, value: string): ()!RedisError {
-    return this.queue(setCmd(key, value))?
+  // The identical family accessors `Pipeline` exposes, over the identical
+  // queued-view classes — one view per family, shared by both executors.
+  export str(key: string): StrBatch { return StrBatch{ batch = this.batch, key = key } }
+  export counter(key: string): CounterBatch { return CounterBatch{ batch = this.batch, key = key } }
+  export keys(): KeysBatch { return KeysBatch{ batch = this.batch } }
+  export hash(key: string): HashBatch { return HashBatch{ batch = this.batch, key = key } }
+  export list(key: string): ListBatch { return ListBatch{ batch = this.batch, key = key } }
+  export sset(key: string): SetBatch { return SetBatch{ batch = this.batch, key = key } }
+  export zset(key: string): ZsetBatch { return ZsetBatch{ batch = this.batch, key = key } }
+  export stream(key: string): StreamBatch { return StreamBatch{ batch = this.batch, key = key } }
+  export geo(key: string): GeoBatch { return GeoBatch{ batch = this.batch, key = key } }
+  export hll(key: string): HllBatch { return HllBatch{ batch = this.batch, key = key } }
+  export bitmap(key: string): BitmapBatch { return BitmapBatch{ batch = this.batch, key = key } }
+  export json(key: string): JsonBatch { return JsonBatch{ batch = this.batch, key = key } }
+  export timeseries(key: string): TimeSeriesBatch {
+    return TimeSeriesBatch{ batch = this.batch, key = key }
   }
-
-  export del(keys: []string): ()!RedisError {
-    return this.queue(delCmd(keys))?
+  export bloom(key: string): BloomBatch { return BloomBatch{ batch = this.batch, key = key } }
+  export vset(key: string): VectorSetBatch {
+    return VectorSetBatch{ batch = this.batch, key = key }
   }
-
-  export exists(keys: []string): ()!RedisError {
-    return this.queue(existsCmd(keys))?
-  }
-
-  export expire(key: string, seconds: i64): ()!RedisError {
-    return this.queue(expireCmd(key, seconds))?
-  }
+  export array(key: string): ArrBatch { return ArrBatch{ batch = this.batch, key = key } }
 }
 
-fn expectQueued(s: string, cmdName: string): ()!RedisError {
-  if (s != "QUEUED") {
-    fail RedisError.Protocol("redis: ${cmdName}: expected +QUEUED, got '${s}'")
-  }
-}
-
-// `Client.transaction`'s body — retries a fresh WATCH/MULTI/body/EXEC
-// attempt up to `maxTxRetries` times, only when the conflict was a nil
-// EXEC. Any other failure (a transport error, a `body` failure) propagates
-// immediately, never retried — see `runTxAttempt`'s own DISCARD note.
-fn runTransaction(client: Client, keys: []string, body: (Tx) => ()!RedisError): ()!RedisError {
+// `Client.transaction`'s retry loop: a fresh attempt (fresh connection
+// lease, fresh `body` call, fresh `Batch`) each time, returning `result`
+// ONLY from the attempt whose EXEC actually committed.
+fn runTransaction<R>(client: Client, keys: []string, body: (Tx) => R!RedisError): R!RedisError {
   let attempt = 0
   while (attempt < maxTxRetries) {
-    let committed = client.withConn<bool>((conn) => {
-      return runTxAttempt(conn, client.opts.commandTimeout, keys, body)?
+    let (result, committed) = client.withConn<(R, bool)>((conn) => {
+      return runTxAttempt<R>(conn, client.opts.commandTimeout, keys, body)?
     })?
     if (committed) {
-      return
+      return result
     }
     attempt = attempt + 1
   }
   fail RedisError.ExecAbort("transaction: exceeded ${maxTxRetries} retries after WATCH conflicts")
 }
 
-// One WATCH/MULTI/body/EXEC attempt over `conn`. `true` when EXEC
-// committed; `false` only for a nil EXEC reply, so the caller retries with
-// a fresh WATCH. A `body` failure DISCARDs this attempt's queued MULTI
-// before propagating, so a half-queued transaction never leaks into a
-// retry.
-fn runTxAttempt(
+// One WATCH/body/MULTI/queued-commands/EXEC attempt over `conn`. `body`
+// runs between WATCH and MULTI (this file's header) — its own return value
+// is `result`; its queued commands are `batch.queued`. `committed` is
+// `true` only when EXEC actually ran them (and `batch.box` is now filled —
+// every `Future<T>` `result` carries is live); `false` only for a nil EXEC,
+// so the caller retries with a fresh WATCH and a fresh `Batch`.
+fn runTxAttempt<R>(
   conn: redisConn,
   timeoutNs: int,
   keys: []string,
-  body: (Tx) => ()!RedisError,
-): bool!RedisError {
+  body: (Tx) => R!RedisError,
+): (R, bool)!RedisError {
   writeCommand(conn, withKeys("WATCH", keys), timeoutNs)?
   readOneReply(conn, timeoutNs)?
-  writeCommand(conn, ["MULTI"], timeoutNs)?
-  readOneReply(conn, timeoutNs)?
-  let tx = Tx{ conn = conn, timeoutNs = timeoutNs }
-  body(tx) catch e {
-    writeCommand(conn, ["DISCARD"], timeoutNs)?
+  let batch = newBatch()
+  let tx = Tx{ batch = batch }
+  let result = body(tx) catch e {
+    writeCommand(conn, ["UNWATCH"], timeoutNs)?
     readOneReply(conn, timeoutNs)?
     fail e
   }
+  writeCommand(conn, ["MULTI"], timeoutNs)?
+  readOneReply(conn, timeoutNs)?
+  queueBatchOverWire(conn, timeoutNs, batch.queued)?
   writeCommand(conn, ["EXEC"], timeoutNs)?
   let r = readOneReply(conn, timeoutNs)?
-  return execCommitted(r)?
+  let committed = fillFromExec(batch, r)?
+  return result, committed
+}
+
+// Sends every already-queued command, expecting `+QUEUED` for each — the
+// server's own acknowledgment that a command landed inside this MULTI, not
+// the command's real result (that only exists once `EXEC` runs).
+fn queueBatchOverWire(conn: redisConn, timeoutNs: int, cmds: [][]string): ()!RedisError {
+  let i = 0
+  while (i < len(cmds)) {
+    writeCommand(conn, cmds[i], timeoutNs)?
+    let r = readOneReply(conn, timeoutNs)?
+    expectQueued(r, cmds[i][0])?
+    i = i + 1
+  }
+}
+
+fn expectQueued(r: Reply, cmdName: string): ()!RedisError {
+  match (r) {
+    Simple(s) => return checkQueued(s, cmdName)?
+    _ => fail RedisError.Unexpected(cmdName, shapeName(r))
+  }
+}
+
+fn checkQueued(s: string, cmdName: string): ()!RedisError {
+  if (s != "QUEUED") {
+    fail RedisError.Protocol("redis: ${cmdName}: expected +QUEUED, got '${s}'")
+  }
 }
 
 // A conflicting EXEC is `*-1\r\n` on RESP2 (`Reply.Array(Option.None)`) but
 // the unified `_\r\n` on RESP3 (`Reply.Null`) — the same RESP2/RESP3 split
 // `client.bit`'s `get()` already documents for a missing `GET`, proved live
-// here too (#6028's own live gate caught this: RESP3 is this package's
-// default protocol, so the RESP2 shape alone was never actually exercised).
-fn execCommitted(r: Reply): bool!RedisError {
+// here too (RESP3 is this package's default protocol, so the RESP2 shape
+// alone was never actually exercised).
+fn fillFromExec(batch: Batch, r: Reply): bool!RedisError {
   match (r) {
-    Array(items) => return committedOpt(items)
+    Array(items) => return fillFromArrayOpt(batch, items)
     Null => return false
     _ => fail RedisError.Unexpected("EXEC", shapeName(r))
   }
 }
 
-fn committedOpt(items: Option<[]Reply>): bool {
+fn fillFromArrayOpt(batch: Batch, items: Option<[]Reply>): bool {
   match (items) {
-    Some(_) => return true
+    Some(list) => {
+      batch.box.replies = list
+      batch.box.ready = true
+      return true
+    }
     None => return false
   }
 }
