@@ -38,6 +38,29 @@ at that call, so a change made to `v` between `c.json(v)` and the
 middleware's `.wrap` shows up in the wrapped body. A value you do not change
 after returning it is unaffected.
 
+## Serving a file
+
+`fileRes(path, c)` answers with `path`'s bytes as a `Res!` - the body
+helper for a route that decides which file to serve itself (an owner's own
+upload, a purchased download), rather than a whole directory `static()` owns.
+It honours the same `Range`/`If-Range` request a mount does: a single byte
+range comes back `206` with `Content-Range`, an out-of-range request comes
+back `416`, and every response it builds carries `Accept-Ranges: bytes`,
+`ETag` and `Last-Modified`.
+
+```bit
+import { fileRes } from "web"
+
+fn download(c: Ctx): Res! {
+  return fileRes("./downloads/report.pdf", c)?
+}
+```
+
+`fileRes` opens exactly `path` - it runs none of `static()`'s traversal
+checks, because `path` here is the caller's own decision, not raw request
+input. See [Operational middleware](operations.md) for `static()`, the mount
+that serves a whole directory instead.
+
 ## The Node tree
 
 There is no template engine - a component is a plain Bit function that

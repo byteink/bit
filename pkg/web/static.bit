@@ -102,10 +102,11 @@
 // WINDOWS: `openBeneath` is a fail-closed stub there until #5808
 // (runtime/root/windows/fsbeneath.bit returns -1), so static serving answers
 // 404 on Windows rather than ever opening a path unsafely.
-import { File } from "std/fs"
+import { File, open } from "std/fs"
 import { openBeneath, statOpen, OpenInfo } from "std/fs/secure"
 import { safePath, ext } from "std/path"
 import { Timestamp, parseDateTime, utc } from "std/time"
+import { parseInt } from "std/strings"
 
 const methodGet = "GET"
 const methodHead = "HEAD"
@@ -116,6 +117,31 @@ const ifNoneMatchName = "If-None-Match"
 const ifModifiedSinceName = "If-Modified-Since"
 const noSniffName = "X-Content-Type-Options"
 const noSniffValue = "nosniff"
+
+// RFC 9110 §14: range requests. `bytesPrefix` is the one range-unit this
+// server understands — anything else (or no `Range` header at all) is served
+// exactly like a plain request, per §14.2's "MUST ignore a Range header
+// field ... it does not understand".
+const rangeName = "Range"
+const ifRangeName = "If-Range"
+const acceptRangesName = "Accept-Ranges"
+const acceptRangesValue = "bytes"
+const contentRangeName = "Content-Range"
+const bytesPrefix = "bytes="
+
+const statusPartialContent = 206
+const statusRangeNotSatisfiable = 416
+
+// `parseRange`'s result kind. `rangeMulti` is the one case RFC 9110 §14.6
+// also allows answering with a `multipart/byteranges` body; this server
+// instead falls back to a full `200`, same as `rangeNone` — a second body
+// framing format for a request no mainstream client sends (every browser and
+// every resumable-download client asks for one range at a time) is not worth
+// the surface, and this is that decision, stated once.
+const rangeNone = 0
+const rangeSingle = 1
+const rangeMulti = 2
+const rangeUnsatisfiable = 3
 
 const octetStreamContentType = "application/octet-stream"
 
@@ -152,6 +178,29 @@ export fn static(prefix: string, root: string): Middleware {
     }
     return next(c)?
   }
+}
+
+// A single file, not a mount: `path` is the caller's own, typically decided
+// after an authorization check a directory mount cannot express — "is this
+// user allowed to download THIS invoice" (course part 20, serving and
+// streaming files). It shares everything a mounted file gets — conditional
+// GET, `Range`/206, `If-Range` and `Accept-Ranges` — through the same
+// `staticFileRes` `static()` itself calls, but runs NONE of `static()`'s
+// traversal checks: `path` is not raw request input, and keeping it that
+// way is the caller's job, the same contract `static(prefix, root)` states
+// for its own two arguments.
+//
+// GET (or HEAD) only, like the mount: register it on a route for the method
+// you want served — `staticFileRes` already answers a HEAD with no body
+// read.
+export fn fileRes(path: string, c: Ctx): Res! {
+  let f = open(path)?
+  defer f.close()
+  let info = statOpen(f)?
+  if (!info.isRegular) {
+    fail newError("web: fileRes(): '${path}' is not a regular file")
+  }
+  return staticFileRes(f, path, mimeTable(), c, info)?
 }
 
 // #4520 IS DEAD. A closure that is a function's RETURN VALUE used to be
@@ -289,6 +338,13 @@ fn staticFileRes(f: File, full: string, mimes: map<string, string>, c: Ctx, info
     head.declaredLen = info.size
     return head
   }
+  let (start, end, kind) = staticRangeKind(c, etag, info)
+  if (kind == rangeUnsatisfiable) {
+    return staticUnsatisfiableRange(info.size)
+  }
+  if (kind == rangeSingle) {
+    return staticPartialRes(f, mime, info, start, end)?
+  }
   // Read from `f`, the SAME handle `statOpen` above just read metadata
   // from — never a second, separately racy open by `full`'s path. That is
   // the whole point of routing this middleware through `openBeneath` in
@@ -297,6 +353,191 @@ fn staticFileRes(f: File, full: string, mimes: map<string, string>, c: Ctx, info
     return staticNotFound()
   }
   return staticHeaders(newRes(statusOK, mime, body), etag, info.mtime)
+}
+
+// Whether — and how — to answer with `Range`/206 instead of the full body.
+// No `Range` header, or an `If-Range` validator that does not match the
+// CURRENT representation, both come back `rangeNone`: RFC 9110 §13.1.5 says
+// a failed `If-Range` means "send the whole selected representation", the
+// same path a plain request with no `Range` header already takes.
+fn staticRangeKind(c: Ctx, etag: string, info: OpenInfo): (i64, i64, int) {
+  let rangeHeader = c.header(rangeName)
+  if (len(rangeHeader) == 0 || !staticRangeHonored(c, etag, info.mtime)) {
+    return (0, 0, rangeNone)
+  }
+  return parseRange(rangeHeader, info.size)
+}
+
+// `If-Range` (RFC 9110 §13.1.5): absent means "no condition, honour Range
+// unconditionally". Present, it names EITHER a strong entity tag or an
+// HTTP-date, and the two are told apart the way the RFC says a recipient
+// always can — an entity tag is always a quoted-string, and an HTTP-date
+// never starts with `"`. The entity-tag form is compared STRONG (byte
+// equality against `etag`, which this server never emits weak, so a
+// client-sent `W/"..."` correctly fails to match with no extra code), unlike
+// `If-None-Match`'s weak comparison in `etagMatches`.
+fn staticRangeHonored(c: Ctx, etag: string, mtime: i64): bool {
+  let ifRange = c.header(ifRangeName)
+  if (len(ifRange) == 0) {
+    return true
+  }
+  if (ifRange[0] == '"') {
+    return ifRange == etag
+  }
+  let (since, ok) = parseHttpDate(ifRange)
+  return ok && mtime <= since
+}
+
+// The 206 for a single satisfiable byte range `start..end` (inclusive),
+// already resolved and clamped against the file's size by `parseRange`.
+// `readRangeAt` seeks straight to `start` and reads only `end - start + 1`
+// bytes — the memory this response costs is proportional to the RANGE, not
+// to the file, which is the entire reason this exists instead of routing a
+// ranged request through `f.readAll()` and slicing the string afterward.
+// Recomputes the ETag from `info` (a pure string build off its size/mtime,
+// `staticEtag`) instead of taking it as a sixth parameter — the max-params
+// ceiling (spec/LINT.md §4), and `staticFileRes` already paid for `info`.
+fn staticPartialRes(f: File, mime: string, info: OpenInfo, start: i64, end: i64): Res! {
+  let body = readRangeAt(f, start, int(end - start + 1)) catch _ {
+    return staticNotFound()
+  }
+  let r = staticHeaders(newRes(statusPartialContent, mime, body), staticEtag(info), info.mtime)
+  return r.header(contentRangeName, "bytes ${start}-${end}/${info.size}")
+}
+
+// `n` bytes starting at `off`, via `File.readAt` (`pread`, no shared cursor
+// to race). A short result is a failure here — unlike `readAt`'s own
+// contract, where a short read is not automatically an error — because
+// `parseRange` derived `n` from this SAME `info.size` moments earlier, so
+// fewer bytes coming back means the file changed under us; `staticPartialRes`
+// answers that the same way every other read failure in this file does, a
+// 404, rather than silently sending a truncated range.
+fn readRangeAt(f: File, off: i64, n: int): string! {
+  let buf = []byte(n)
+  let got = f.readAt(buf, off)?
+  if (got != n) {
+    fail newError("web: static(): short read of a byte range")
+  }
+  return string(buf)
+}
+
+// 416, RFC 9110 §14.4: a `Range` that cannot be satisfied — past the end of
+// the file, a zero-length suffix, or a request against an empty file —
+// carries `Content-Range: bytes */<size>` so the client learns the file's
+// actual length without a second request, and `Accept-Ranges` so it knows
+// range requests are still worth retrying with a correct one.
+fn staticUnsatisfiableRange(size: i64): Res {
+  let r = newRes(statusRangeNotSatisfiable, "", "")
+  let stamped = r.header(contentRangeName, "bytes */${size}")
+  return stamped.header(acceptRangesName, acceptRangesValue)
+}
+
+// The `bytes=` value after the prefix, as `(start, end, kind)`. One
+// range-spec only: a comma means more than one, which is `rangeMulti` (see
+// the constant's own comment on why that falls back to a full response
+// rather than `multipart/byteranges`). Any syntax this does not recognise —
+// wrong prefix, no digits, a second `-` — is `rangeNone`, never a 416:
+// RFC 9110 §14.2 asks a server to ignore what it cannot parse, not to punish
+// the client for it.
+fn parseRange(raw: string, size: i64): (i64, i64, int) {
+  if (len(raw) <= len(bytesPrefix) || raw[0:len(bytesPrefix)] != bytesPrefix) {
+    return (0, 0, rangeNone)
+  }
+  let specs = split(raw[len(bytesPrefix):len(raw)], ",")
+  if (len(specs) != 1) {
+    return (0, 0, rangeMulti)
+  }
+  let spec = trimSpace(specs[0])
+  if (len(spec) > 0 && spec[0] == '-') {
+    return parseSuffixRange(spec[1:len(spec)], size)
+  }
+  return parseIntRange(spec, size)
+}
+
+// `-N`: the last `N` bytes. `N == 0` selects no bytes at all and is
+// unsatisfiable by RFC 9110 §14.1.2's own definition, as is any suffix range
+// against an empty file. A suffix longer than the file is clamped to the
+// whole file, per the same section ("the entire representation is used").
+fn parseSuffixRange(nStr: string, size: i64): (i64, i64, int) {
+  if (!isDigits(nStr)) {
+    return (0, 0, rangeNone)
+  }
+  let n = parseInt(nStr) catch _ {
+    return (0, 0, rangeNone)
+  }
+  if (size == 0 || n == 0) {
+    return (0, 0, rangeUnsatisfiable)
+  }
+  let start = size - i64(n)
+  if (start < 0) {
+    start = 0
+  }
+  return (start, size - 1, rangeSingle)
+}
+
+// `first-last` or `first-` (open-ended, to end of file). `first >= size` is
+// unsatisfiable outright; the `last-pos` half — absent, clamped, or invalid
+// against `first` — is `parseIntRangeEnd`'s job, split out to stay under the
+// complexity ceiling (spec/LINT.md §4).
+fn parseIntRange(spec: string, size: i64): (i64, i64, int) {
+  let dash = indexOf(spec, "-")
+  if (dash < 0) {
+    return (0, 0, rangeNone)
+  }
+  let firstStr = spec[0:dash]
+  if (!isDigits(firstStr)) {
+    return (0, 0, rangeNone)
+  }
+  let first = parseInt(firstStr) catch _ {
+    return (0, 0, rangeNone)
+  }
+  if (size == 0 || i64(first) >= size) {
+    return (0, 0, rangeUnsatisfiable)
+  }
+  return parseIntRangeEnd(spec[dash + 1:len(spec)], i64(first), size)
+}
+
+// `last-pos`, clamped against `size` and validated against `first`. An
+// absent `last-pos` (`"first-"`) means "to the end", the one place `first`
+// alone already decides the answer with no parsing needed.
+fn parseIntRangeEnd(lastStr: string, first: i64, size: i64): (i64, i64, int) {
+  if (len(lastStr) == 0) {
+    return (first, size - 1, rangeSingle)
+  }
+  if (!isDigits(lastStr)) {
+    return (0, 0, rangeNone)
+  }
+  let last = parseInt(lastStr) catch _ {
+    return (0, 0, rangeNone)
+  }
+  let end = i64(last)
+  if (end >= size) {
+    end = size - 1
+  }
+  if (end < first) {
+    return (0, 0, rangeUnsatisfiable)
+  }
+  return (first, end, rangeSingle)
+}
+
+// Non-empty and every byte an ASCII digit — the RFC 9110 §14.1.2 grammar for
+// `first-pos`/`last-pos`/`suffix-length`, none of which allow a sign. Kept
+// separate from `parseInt`'s own validation because `parseInt` accepts a
+// leading `-`/`+` (it parses signed integers generally), which would let
+// `"bytes=-5-10"`'s `firstStr` of `"-5"` silently parse as negative five
+// instead of being refused.
+fn isDigits(s: string): bool {
+  if (len(s) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] < '0' || s[i] > '9') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
 }
 
 fn staticNotFound(): Res {
@@ -308,10 +549,16 @@ fn staticNotFound(): Res {
 // cache that gets a 304 with no `ETag` cannot refresh what it stored.
 // `Res.body()` already forces a 304's body empty whatever was set
 // (res.bit), so nothing here has to remember to.
+//
+// `Accept-Ranges: bytes` goes on every one of these too — the 200, the 304
+// and the HEAD response all advertise it, since a client decides whether to
+// retry with a `Range` request from whatever response it got first, 304
+// included.
 fn staticHeaders(r: Res, etag: string, mtime: i64): Res {
   let stamped = r.header(etagName, etag)
   stamped = stamped.header(lastModifiedName, httpDate(mtime))
-  return stamped.header(noSniffName, noSniffValue)
+  stamped = stamped.header(noSniffName, noSniffValue)
+  return stamped.header(acceptRangesName, acceptRangesValue)
 }
 
 // Size and mtime, the construction nginx uses, emitted as a STRONG
