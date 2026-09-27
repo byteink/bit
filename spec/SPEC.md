@@ -1736,6 +1736,14 @@ API assumes, and is a program error the checker does not catch. As with the
 slice form, the string stays alive only while the caller keeps it live:
 `keepAlive(s)` after the last raw read.
 
+`loadU64(p: *u8): u64` reads the 8 bytes at `p..p+7` as a little-endian `u64`,
+with **no alignment requirement** - unlike a `*u64` field, `p` need not be
+8-aligned. Both targets are little-endian and allow unaligned ordinary loads
+(ARM64's plain `LDR`, x86-64's `MOVQ`), so this lowers to the same single
+inline load an aligned `*u64` read already uses, never a runtime call. As with
+the atomics and `ptrOf` above, the caller guarantees `p..p+7` is readable and
+keeps the pointee object alive: `keepAlive(x)` after the last raw read.
+
 ### 11.6 Inline Assembly (unmanaged subset)
 
 `asm` embeds machine instructions directly in a function. Like `*T` and the
