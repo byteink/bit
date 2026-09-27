@@ -28,6 +28,13 @@ set -uo pipefail
 # instead of two compilers.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
+# #5995: same reasoning as selfhost-diffdump.sh's identical export -- the
+# 0.30.0 ORACLE above still defaults BIT_IFACE_SIG (#5979) and BIT_BCE_JOIN
+# (#5971) off, the tree now defaults both on, and this is the one place both
+# invocations share their environment. Remove these exports, and the flags
+# themselves, at the next repin.
+export BIT_IFACE_SIG=1
+export BIT_BCE_JOIN=1
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
 # 21.86s on the oracle), so a busy box turned a clean run red with no divergence

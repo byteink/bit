@@ -90,6 +90,18 @@ diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
+# #5995: interface dispatch ids (`ifaceSigEnabled()`, compiler/lower.bit,
+# #5979) and bounds-check join resolution (`bceJoinEnabled()`,
+# compiler/optbce.bit, #5971) only change ir/iropt output. Tree default is on
+# since the 0.30.0 repin; the 0.30.0 ORACLE still defaults both off, so force
+# "1" on both sides here -- the one place they share an environment -- to
+# compare ON against ON. Remove these exports, and the flags themselves, at
+# the next repin.
+if [ "$KIND" = ir ]; then
+  export BIT_IFACE_SIG=1
+  export BIT_BCE_JOIN=1
+fi
+
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.
 whydied() {
