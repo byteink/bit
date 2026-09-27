@@ -1,17 +1,749 @@
-// pkg/redis/hash.bit — `r.hash(key)`: the hash handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`HSET, HGET, HGETALL, HDEL, HEXPIRE`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
+// pkg/redis/hash.bit — `r.hash(key)`: every hash command, `HSET` through
+// field expiry. Epic #6013, #6028, #6029. Follows `cmd.bit`'s HOW-TO header
+// and `counter.bit`'s reference shape: one `Cmd<T>` factory per command, an
+// immediate method on `Hash`, a queued method on `HashBatch`.
+//
+// `Hash` HOLDS `client: Client`, NOT `runner: Runner` — a deliberate
+// deviation from `counter.bit`'s reference shape and `cmd.bit`'s own HOW-TO
+// ("never a `client: Client` one"). `client.bit`'s `hash(key)` accessor
+// still builds `Hash{ client = this, key = key }` (#6028's scaffold), and
+// this ticket's own constraints name `client.bit`/`tx.bit` as files no
+// family ticket may touch. Switching to `runner: Runner` needs both: the
+// one-line accessor in `client.bit` (`runner = poolRunner(this)`) and a new
+// `TxRead.hash(key)` in `tx.bit` for `tx.read.hash(...)` — mechanical, but
+// still an edit to a shared file. `Client.runCmd<T>` (`client.bit`) is
+// already the identical "run one command now, retry read-onlys" behaviour
+// `Runner.runCmd`'s pool branch wraps, so every method below calls
+// `this.client.runCmd(cmd)` directly instead. Net effect: `r.hash(key)`
+// works exactly like the spine; `tx.read.hash(key)` does not exist yet.
+// Reported on #6030 for the integrator to hoist alongside #6033's own
+// findings, same as this file's local decode helpers below.
+//
+// FIELD-EXPIRY CONDITION FLAGS (`NX`/`XX`/`GT`/`LT` on `HEXPIRE`/
+// `HPEXPIRE`/`HEXPIREAT`; `FNX`/`FXX` on `HSETEX`) are a plain `when: string
+// = ""` parameter, not an enum — a `param`'s default value must be a bare
+// literal (int, float, string, bool, or `nil`; SPEC §10.3), and an enum
+// variant constructor (`ExpireWhen.None`) is not one. An empty string omits
+// the flag; the server rejects an unrecognised one with a normal
+// `RedisError`, so there is nothing to validate client-side.
+//
+// `HSCAN` HAS NO `HashBatch` METHOD — `Batch.queue` hands back one
+// `Future<T>` per queued command, but a SCAN cursor is inherently several
+// round trips; there is no single reply for a `Future` to resolve to.
+// `scan()` lives only on the immediate handle.
+
+import { Millisecond } from "std/time"
+
 export class Hash {
-  client: Client,
-  key: string,
+  client: Client
+  key: string
+
+  export set(fields: map<string, string>): i64!RedisError {
+    return this.client.runCmd(hashSetCmd(this.key, fields))?
+  }
+  export setField(field: string, value: string): bool!RedisError {
+    return this.client.runCmd(hashSetFieldCmd(this.key, field, value))?
+  }
+  export get(field: string): Option<string>!RedisError {
+    return this.client.runCmd(hashGetCmd(this.key, field))?
+  }
+  export getMany(...fields: string): []Option<string>!RedisError {
+    return this.client.runCmd(hashGetManyCmd(this.key, fields))?
+  }
+  export all(): map<string, string>!RedisError {
+    return this.client.runCmd(hashAllCmd(this.key))?
+  }
+  export del(...fields: string): i64!RedisError {
+    return this.client.runCmd(hashDelCmd(this.key, fields))?
+  }
+  export has(field: string): bool!RedisError {
+    return this.client.runCmd(hashHasCmd(this.key, field))?
+  }
+  export incrBy(field: string, delta: i64): i64!RedisError {
+    return this.client.runCmd(hashIncrByCmd(this.key, field, delta))?
+  }
+  export incrByFloat(field: string, delta: f64): f64!RedisError {
+    return this.client.runCmd(hashIncrByFloatCmd(this.key, field, delta))?
+  }
+  export keys(): []string!RedisError {
+    return this.client.runCmd(hashKeysCmd(this.key))?
+  }
+  export values(): []string!RedisError {
+    return this.client.runCmd(hashValuesCmd(this.key))?
+  }
+  export len(): i64!RedisError {
+    return this.client.runCmd(hashLenCmd(this.key))?
+  }
+  export setIfAbsent(field: string, value: string): bool!RedisError {
+    return this.client.runCmd(hashSetIfAbsentCmd(this.key, field, value))?
+  }
+  export strLen(field: string): i64!RedisError {
+    return this.client.runCmd(hashStrLenCmd(this.key, field))?
+  }
+  // `HRANDFIELD key count [WITHVALUES]` — the single-field, no-count form
+  // (a different reply shape, a bare bulk string) is not exposed here;
+  // `count` is always sent, matching this ticket's own wording.
+  export random(count: int, withValues: bool = false): []string!RedisError {
+    return this.client.runCmd(hashRandomCmd(this.key, count, withValues))?
+  }
+  // Lazily follows `HSCAN`'s cursor — see `HashScanIterator` below.
+  export scan(pattern: string = "", count: int = 0): HashScanIterator {
+    return HashScanIterator{
+      client = this.client,
+      key = this.key,
+      pattern = pattern,
+      count = count,
+      cursor = "0",
+      page = []string(0),
+      started = false,
+    }
+  }
+  // `ttl` is nanoseconds (`std/time`'s `Second`/`Millisecond`), converted to
+  // each wire command's own unit — this file's header.
+  export expire(fields: []string, ttl: int, when: string = ""): []i64!RedisError {
+    return this.client.runCmd(hashExpireCmd(this.key, fields, ttl, when))?
+  }
+  export pexpire(fields: []string, ttl: int, when: string = ""): []i64!RedisError {
+    return this.client.runCmd(hashPexpireCmd(this.key, fields, ttl, when))?
+  }
+  // `at` is nanoseconds since the Unix epoch (`std/time.now().ns`), not a
+  // relative TTL — `HEXPIREAT` wants an absolute unix-time-seconds.
+  export expireAt(fields: []string, at: int, when: string = ""): []i64!RedisError {
+    return this.client.runCmd(hashExpireAtCmd(this.key, fields, at, when))?
+  }
+  // Each field's TTL in seconds, or -1 (no TTL) / -2 (no such field) —
+  // Redis's own `HTTL` sentinels, passed through unconverted: turning -1/-2
+  // into nanoseconds would misrepresent a sentinel as a duration.
+  export ttl(fields: []string): []i64!RedisError {
+    return this.client.runCmd(hashTtlCmd(this.key, fields))?
+  }
+  export pttl(fields: []string): []i64!RedisError {
+    return this.client.runCmd(hashPttlCmd(this.key, fields))?
+  }
+  export persist(fields: []string): []i64!RedisError {
+    return this.client.runCmd(hashPersistCmd(this.key, fields))?
+  }
+  // `HGETEX` — `ttl > 0` sends `EX seconds`; `persist` sends `PERSIST`
+  // instead; neither reads the field values without changing their TTL.
+  export getEx(fields: []string, ttl: int = 0, persist: bool = false): []Option<string>!RedisError {
+    return this.client.runCmd(hashGetExCmd(this.key, fields, ttl, persist))?
+  }
+  // `HSETEX` — `keepTtl` sends `KEEPTTL` instead of `EX seconds`, keeping
+  // whatever TTL the fields already had.
+  export setEx(
+    fields: map<string, string>,
+    ttl: int,
+    when: string = "",
+    keepTtl: bool = false,
+  ): bool!RedisError {
+    return this.client.runCmd(hashSetExCmd(this.key, fields, ttl, when, keepTtl))?
+  }
+  export getDel(...fields: string): []Option<string>!RedisError {
+    return this.client.runCmd(hashGetDelCmd(this.key, fields))?
+  }
 }
 
 // The queued view `Pipeline.hash`/`Tx.hash` both return — `cmd.bit`'s
 // `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Hash needs (`cmd.bit`'s header, point 2).
+// is the ONLY queued view Hash needs (`cmd.bit`'s header, point 2). Every
+// method mirrors `Hash`'s own, one command definition shared both ways
+// (`cmd.bit`'s header) — except `scan`, this file's header explains why.
 export class HashBatch {
-  batch: Batch,
+  batch: Batch
+  key: string
+
+  export set(fields: map<string, string>): Future<i64> {
+    return this.batch.queue(hashSetCmd(this.key, fields))
+  }
+  export setField(field: string, value: string): Future<bool> {
+    return this.batch.queue(hashSetFieldCmd(this.key, field, value))
+  }
+  export get(field: string): Future<Option<string>> {
+    return this.batch.queue(hashGetCmd(this.key, field))
+  }
+  export getMany(...fields: string): Future<[]Option<string>> {
+    return this.batch.queue(hashGetManyCmd(this.key, fields))
+  }
+  export all(): Future<map<string, string>> {
+    return this.batch.queue(hashAllCmd(this.key))
+  }
+  export del(...fields: string): Future<i64> {
+    return this.batch.queue(hashDelCmd(this.key, fields))
+  }
+  export has(field: string): Future<bool> {
+    return this.batch.queue(hashHasCmd(this.key, field))
+  }
+  export incrBy(field: string, delta: i64): Future<i64> {
+    return this.batch.queue(hashIncrByCmd(this.key, field, delta))
+  }
+  export incrByFloat(field: string, delta: f64): Future<f64> {
+    return this.batch.queue(hashIncrByFloatCmd(this.key, field, delta))
+  }
+  export keys(): Future<[]string> {
+    return this.batch.queue(hashKeysCmd(this.key))
+  }
+  export values(): Future<[]string> {
+    return this.batch.queue(hashValuesCmd(this.key))
+  }
+  export len(): Future<i64> {
+    return this.batch.queue(hashLenCmd(this.key))
+  }
+  export setIfAbsent(field: string, value: string): Future<bool> {
+    return this.batch.queue(hashSetIfAbsentCmd(this.key, field, value))
+  }
+  export strLen(field: string): Future<i64> {
+    return this.batch.queue(hashStrLenCmd(this.key, field))
+  }
+  export random(count: int, withValues: bool = false): Future<[]string> {
+    return this.batch.queue(hashRandomCmd(this.key, count, withValues))
+  }
+  export expire(fields: []string, ttl: int, when: string = ""): Future<[]i64> {
+    return this.batch.queue(hashExpireCmd(this.key, fields, ttl, when))
+  }
+  export pexpire(fields: []string, ttl: int, when: string = ""): Future<[]i64> {
+    return this.batch.queue(hashPexpireCmd(this.key, fields, ttl, when))
+  }
+  export expireAt(fields: []string, at: int, when: string = ""): Future<[]i64> {
+    return this.batch.queue(hashExpireAtCmd(this.key, fields, at, when))
+  }
+  export ttl(fields: []string): Future<[]i64> {
+    return this.batch.queue(hashTtlCmd(this.key, fields))
+  }
+  export pttl(fields: []string): Future<[]i64> {
+    return this.batch.queue(hashPttlCmd(this.key, fields))
+  }
+  export persist(fields: []string): Future<[]i64> {
+    return this.batch.queue(hashPersistCmd(this.key, fields))
+  }
+  export getEx(fields: []string, ttl: int = 0, persist: bool = false): Future<[]Option<string>> {
+    return this.batch.queue(hashGetExCmd(this.key, fields, ttl, persist))
+  }
+  export setEx(
+    fields: map<string, string>,
+    ttl: int,
+    when: string = "",
+    keepTtl: bool = false,
+  ): Future<bool> {
+    return this.batch.queue(hashSetExCmd(this.key, fields, ttl, when, keepTtl))
+  }
+  export getDel(...fields: string): Future<[]Option<string>> {
+    return this.batch.queue(hashGetDelCmd(this.key, fields))
+  }
+}
+
+// Lazily follows `HSCAN`'s cursor, one page at a time, yielding (field,
+// value) pairs — `Hash.scan()` above. The iterator trait's `next(): Option
+// <T>` (docs/reference/iterator-trait.md) carries no failure channel, so a
+// page fetch that fails panics rather than silently ending the iteration —
+// the same tradeoff every other `next(): Option<T>` class in the language
+// accepts; a caller iterating a dead connection has a bigger problem than
+// this method's signature.
+export class HashScanIterator {
+  client: Client
+  key: string
+  pattern: string
+  count: int
+  cursor: string
+  page: []string
+  started: bool
+
+  export next(): Option<(string, string)> {
+    while (len(this.page) == 0 && (!this.started || this.cursor != "0")) {
+      this.fetch()
+    }
+    if (len(this.page) == 0) {
+      return Option.None
+    }
+    let field = this.page[0]
+    let value = this.page[1]
+    this.page = this.page[2:len(this.page)]
+    return Option.Some((field, value))
+  }
+
+  fetch() {
+    this.started = true
+    let (cursor, fields) = this.client.runCmd(
+      hashScanCmd(this.key, this.cursor, this.pattern, this.count),
+    ) catch e {
+      panic("redis: HSCAN ${this.key}: ${e.message()}")
+    }
+    this.cursor = cursor
+    this.page = fields
+  }
+}
+
+fn hashSetArgs(key: string, fields: map<string, string>): []string {
+  let args = ["HSET", key]
+  for (field, value) of fields {
+    args = append(args, field)
+    args = append(args, value)
+  }
+  return args
+}
+
+fn hashSetCmd(key: string, fields: map<string, string>): Cmd<i64> {
+  return Cmd<i64>{
+    args = hashSetArgs(key, fields),
+    decode = (r) => asInt(r, "HSET"),
+    readOnly = false,
+  }
+}
+
+fn hashSetFieldCmd(key: string, field: string, value: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["HSET", key, field, value],
+    decode = (r) => asBool(r, "HSET"),
+    readOnly = false,
+  }
+}
+
+fn hashGetCmd(key: string, field: string): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = ["HGET", key, field],
+    decode = (r) => asOptString(r, "HGET"),
+    readOnly = true,
+  }
+}
+
+// `args` followed by every element of `fields`, in order — the shared tail
+// every multi-field command below builds its wire form from. Copies into a
+// fresh backing array rather than appending onto `args` directly: `args` is
+// a caller's parameter, and `append` may grow in place when it has spare
+// capacity, silently mutating memory the caller still holds a reference to.
+fn hashAppendFields(args: []string, fields: []string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(args)) {
+    out = append(out, args[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < len(fields)) {
+    out = append(out, fields[i])
+    i = i + 1
+  }
+  return out
+}
+
+// `CMD key field [field ...]` — `HMGET`, `HDEL`: no `FIELDS`/count wrapper,
+// unlike the field-expiry family below.
+fn hashKeyFieldsArgs(cmd: string, key: string, fields: []string): []string {
+  let args = [cmd, key]
+  return hashAppendFields(args, fields)
+}
+
+fn hashGetManyCmd(key: string, fields: []string): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = hashKeyFieldsArgs("HMGET", key, fields),
+    decode = (r) => asHashOptStrings(r, "HMGET"),
+    readOnly = true,
+  }
+}
+
+fn hashAllCmd(key: string): Cmd<map<string, string>> {
+  return Cmd<map<string, string>>{
+    args = ["HGETALL", key],
+    decode = (r) => asMap(r, "HGETALL"),
+    readOnly = true,
+  }
+}
+
+fn hashDelCmd(key: string, fields: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = hashKeyFieldsArgs("HDEL", key, fields),
+    decode = (r) => asInt(r, "HDEL"),
+    readOnly = false,
+  }
+}
+
+fn hashHasCmd(key: string, field: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["HEXISTS", key, field],
+    decode = (r) => asBool(r, "HEXISTS"),
+    readOnly = true,
+  }
+}
+
+fn hashIncrByCmd(key: string, field: string, delta: i64): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["HINCRBY", key, field, "${delta}"],
+    decode = (r) => asInt(r, "HINCRBY"),
+    readOnly = false,
+  }
+}
+
+fn hashIncrByFloatCmd(key: string, field: string, delta: f64): Cmd<f64> {
+  return Cmd<f64>{
+    args = ["HINCRBYFLOAT", key, field, "${delta}"],
+    decode = (r) => asDouble(r, "HINCRBYFLOAT"),
+    readOnly = false,
+  }
+}
+
+fn hashKeysCmd(key: string): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["HKEYS", key],
+    decode = (r) => asStrings(r, "HKEYS"),
+    readOnly = true,
+  }
+}
+
+fn hashValuesCmd(key: string): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = ["HVALS", key],
+    decode = (r) => asStrings(r, "HVALS"),
+    readOnly = true,
+  }
+}
+
+fn hashLenCmd(key: string): Cmd<i64> {
+  return Cmd<i64>{ args = ["HLEN", key], decode = (r) => asInt(r, "HLEN"), readOnly = true }
+}
+
+fn hashSetIfAbsentCmd(key: string, field: string, value: string): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["HSETNX", key, field, value],
+    decode = (r) => asBool(r, "HSETNX"),
+    readOnly = false,
+  }
+}
+
+fn hashStrLenCmd(key: string, field: string): Cmd<i64> {
+  return Cmd<i64>{
+    args = ["HSTRLEN", key, field],
+    decode = (r) => asInt(r, "HSTRLEN"),
+    readOnly = true,
+  }
+}
+
+fn hashRandomArgs(key: string, count: int, withValues: bool): []string {
+  let args = ["HRANDFIELD", key, "${count}"]
+  if (withValues) {
+    args = append(args, "WITHVALUES")
+  }
+  return args
+}
+
+fn hashRandomCmd(key: string, count: int, withValues: bool): Cmd<[]string> {
+  return Cmd<[]string>{
+    args = hashRandomArgs(key, count, withValues),
+    decode = (r) => asHashRandomFields(r, "HRANDFIELD"),
+    readOnly = true,
+  }
+}
+
+// `CMD key FIELDS numfields field [field ...]` — `HTTL`, `HPTTL`,
+// `HPERSIST`, `HGETDEL`: no leading TTL/option argument, unlike
+// `hashExpireArgs` below.
+fn hashFieldsArgs(cmd: string, key: string, fields: []string): []string {
+  let args = [cmd, key, "FIELDS", "${len(fields)}"]
+  return hashAppendFields(args, fields)
+}
+
+// `CMD key ttlArg [when] FIELDS numfields field [field ...]` — `HEXPIRE`,
+// `HPEXPIRE`, `HEXPIREAT`.
+fn hashExpireArgs(
+  cmd: string,
   key: string,
+  ttlArg: string,
+  when: string,
+  fields: []string,
+): []string {
+  let args = [cmd, key, ttlArg]
+  if (when != "") {
+    args = append(args, when)
+  }
+  args = append(args, "FIELDS")
+  args = append(args, "${len(fields)}")
+  return hashAppendFields(args, fields)
+}
+
+fn hashExpireCmd(key: string, fields: []string, ttl: int, when: string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = hashExpireArgs("HEXPIRE", key, "${ttl / Second}", when, fields),
+    decode = (r) => asHashInts(r, "HEXPIRE"),
+    readOnly = false,
+  }
+}
+
+fn hashPexpireCmd(key: string, fields: []string, ttl: int, when: string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = hashExpireArgs("HPEXPIRE", key, "${ttl / Millisecond}", when, fields),
+    decode = (r) => asHashInts(r, "HPEXPIRE"),
+    readOnly = false,
+  }
+}
+
+fn hashExpireAtCmd(key: string, fields: []string, at: int, when: string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = hashExpireArgs("HEXPIREAT", key, "${at / Second}", when, fields),
+    decode = (r) => asHashInts(r, "HEXPIREAT"),
+    readOnly = false,
+  }
+}
+
+fn hashTtlCmd(key: string, fields: []string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = hashFieldsArgs("HTTL", key, fields),
+    decode = (r) => asHashInts(r, "HTTL"),
+    readOnly = true,
+  }
+}
+
+fn hashPttlCmd(key: string, fields: []string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = hashFieldsArgs("HPTTL", key, fields),
+    decode = (r) => asHashInts(r, "HPTTL"),
+    readOnly = true,
+  }
+}
+
+fn hashPersistCmd(key: string, fields: []string): Cmd<[]i64> {
+  return Cmd<[]i64>{
+    args = hashFieldsArgs("HPERSIST", key, fields),
+    decode = (r) => asHashInts(r, "HPERSIST"),
+    readOnly = false,
+  }
+}
+
+fn hashGetExArgs(key: string, fields: []string, ttl: int, persist: bool): []string {
+  let args = ["HGETEX", key]
+  if (persist) {
+    args = append(args, "PERSIST")
+  } else {
+    if (ttl > 0) {
+      args = append(args, "EX")
+      args = append(args, "${ttl / Second}")
+    }
+  }
+  args = append(args, "FIELDS")
+  args = append(args, "${len(fields)}")
+  return hashAppendFields(args, fields)
+}
+
+fn hashGetExCmd(key: string, fields: []string, ttl: int, persist: bool): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = hashGetExArgs(key, fields, ttl, persist),
+    decode = (r) => asHashOptStrings(r, "HGETEX"),
+    readOnly = false,
+  }
+}
+
+fn hashSetExArgs(
+  key: string,
+  fields: map<string, string>,
+  ttl: int,
+  when: string,
+  keepTtl: bool,
+): []string {
+  let args = ["HSETEX", key]
+  if (when != "") {
+    args = append(args, when)
+  }
+  if (keepTtl) {
+    args = append(args, "KEEPTTL")
+  } else {
+    args = append(args, "EX")
+    args = append(args, "${ttl / Second}")
+  }
+  args = append(args, "FIELDS")
+  args = append(args, "${len(fields)}")
+  for (field, value) of fields {
+    args = append(args, field)
+    args = append(args, value)
+  }
+  return args
+}
+
+fn hashSetExCmd(
+  key: string,
+  fields: map<string, string>,
+  ttl: int,
+  when: string,
+  keepTtl: bool,
+): Cmd<bool> {
+  return Cmd<bool>{
+    args = hashSetExArgs(key, fields, ttl, when, keepTtl),
+    decode = (r) => asBool(r, "HSETEX"),
+    readOnly = false,
+  }
+}
+
+fn hashGetDelCmd(key: string, fields: []string): Cmd<[]Option<string>> {
+  return Cmd<[]Option<string>>{
+    args = hashFieldsArgs("HGETDEL", key, fields),
+    decode = (r) => asHashOptStrings(r, "HGETDEL"),
+    readOnly = false,
+  }
+}
+
+fn hashScanArgs(key: string, cursor: string, pattern: string, count: int): []string {
+  let args = ["HSCAN", key, cursor]
+  if (pattern != "") {
+    args = append(args, "MATCH")
+    args = append(args, pattern)
+  }
+  if (count > 0) {
+    args = append(args, "COUNT")
+    args = append(args, "${count}")
+  }
+  return args
+}
+
+fn hashScanCmd(key: string, cursor: string, pattern: string, count: int): Cmd<(string, []string)> {
+  return Cmd<(string, []string)>{
+    args = hashScanArgs(key, cursor, pattern, count),
+    decode = (r) => asHashScanPage(r, "HSCAN"),
+    readOnly = true,
+  }
+}
+
+fn asHashScanPage(r: Reply, cmd: string): (string, []string)!RedisError {
+  match (r) {
+    Array(items) => return hashScanPageFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn hashScanPageFromOpt(items: Option<[]Reply>, cmd: string): (string, []string)!RedisError {
+  match (items) {
+    Some(list) => return hashScanPageFromList(list, cmd)?
+    None => fail RedisError.Unexpected(cmd, "Array")
+  }
+}
+
+fn hashScanPageFromList(list: []Reply, cmd: string): (string, []string)!RedisError {
+  if (len(list) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let cursor = replyToString(list[0], cmd)?
+  let fields = asStrings(list[1], cmd)?
+  return cursor, fields
+}
+
+// `[]Option<string>` decode — `HMGET`/`HGETEX`/`HGETDEL` all reply with one
+// bulk-or-nil per field. Kept LOCAL, not hoisted into `cmd.bit`: the same
+// shape another family's multi-value getter (a `ZMSCORE`, say) would also
+// want — reported on #6030 as a hoist candidate, named `asHashOptStrings`
+// here specifically to avoid a duplicate-declaration collision with
+// #6033's zset.bit if it independently adds an identically-named helper to
+// this same module before either lands.
+fn asHashOptStrings(r: Reply, cmd: string): []Option<string>!RedisError {
+  match (r) {
+    Array(items) => return hashOptStringsFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn hashOptStringsFromOpt(items: Option<[]Reply>, cmd: string): []Option<string>!RedisError {
+  match (items) {
+    Some(list) => return hashOptStringsFromList(list, cmd)?
+    None => return []Option<string>(0)
+  }
+}
+
+fn hashOptStringsFromList(list: []Reply, cmd: string): []Option<string>!RedisError {
+  let out = []Option<string>(0)
+  let i = 0
+  while (i < len(list)) {
+    let v = asOptString(list[i], cmd)?
+    out = append(out, v)
+    i = i + 1
+  }
+  return out
+}
+
+// `[]i64` decode — every field-expiry command below replies with one
+// integer sentinel per field. Same hoist note as `asHashOptStrings` above;
+// named `asHashInts` for the same collision-avoidance reason.
+fn asHashInts(r: Reply, cmd: string): []i64!RedisError {
+  match (r) {
+    Array(items) => return hashIntsFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn hashIntsFromOpt(items: Option<[]Reply>, cmd: string): []i64!RedisError {
+  match (items) {
+    Some(list) => return hashIntsFromList(list, cmd)?
+    None => return []i64(0)
+  }
+}
+
+fn hashIntsFromList(list: []Reply, cmd: string): []i64!RedisError {
+  let out = []i64(0)
+  let i = 0
+  while (i < len(list)) {
+    let n = asInt(list[i], cmd)?
+    out = append(out, n)
+    i = i + 1
+  }
+  return out
+}
+
+// `HRANDFIELD ... WITHVALUES` flattened to `[field, value, field, value,
+// ...]` regardless of protocol — RESP2 replies with that flat array
+// already; RESP3 nests each pair as its own 2-element `Array`, unwrapped
+// here so callers see one shape either way.
+fn asHashRandomFields(r: Reply, cmd: string): []string!RedisError {
+  match (r) {
+    Array(items) => return hashRandomFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn hashRandomFromOpt(items: Option<[]Reply>, cmd: string): []string!RedisError {
+  match (items) {
+    Some(list) => return hashRandomFromList(list, cmd)?
+    None => return []string(0)
+  }
+}
+
+// `out` is always a fresh `[]string(0)`-rooted backing array here, never a
+// parameter — `hashRandomEntryFields` below hands back a small, independent
+// slice (0-2 elements) for `out` to absorb, rather than appending onto a
+// caller-owned array itself (the aliasing hazard `hashAppendFields` above
+// avoids the same way).
+fn hashRandomFromList(list: []Reply, cmd: string): []string!RedisError {
+  let out = []string(0)
+  let i = 0
+  while (i < len(list)) {
+    let entry = hashRandomEntryFields(list[i], cmd)?
+    let j = 0
+    while (j < len(entry)) {
+      out = append(out, entry[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// One `HRANDFIELD ... WITHVALUES` reply element as its own fresh slice: a
+// bare field (`[field]`), a RESP3 field/value pair (`[field, value]`), or
+// nothing (a null pair, `[]string(0)`).
+fn hashRandomEntryFields(r: Reply, cmd: string): []string!RedisError {
+  match (r) {
+    Array(items) => return hashRandomPairFields(items, cmd)?
+    _ => {
+      let s = replyToString(r, cmd)?
+      return [s]
+    }
+  }
+}
+
+fn hashRandomPairFields(items: Option<[]Reply>, cmd: string): []string!RedisError {
+  match (items) {
+    Some(pair) => return hashRandomPairFieldsFrom(pair, cmd)?
+    None => return []string(0)
+  }
+}
+
+fn hashRandomPairFieldsFrom(pair: []Reply, cmd: string): []string!RedisError {
+  if (len(pair) != 2) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let field = replyToString(pair[0], cmd)?
+  let value = replyToString(pair[1], cmd)?
+  return [field, value]
 }
