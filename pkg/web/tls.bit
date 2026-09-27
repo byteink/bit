@@ -1,0 +1,98 @@
+// pkg/web/tls.bit — App.listenTls() and App.serveTls() (#6073): TLS, HTTP/2
+// and HTTP/3 for an App, using what stdlib/http, stdlib/tls, stdlib/http2 and
+// stdlib/http3 already provide. No new protocol code lives here — this file
+// is glue, the TLS mirror of `App.listen()`/`App.serve()` (app.bit, #6080).
+//
+// `stdlib/http` already does the hard part for HTTP/2: `tlsServe`/
+// `serveTlsServerOn` (server.bit) negotiate ALPN per connection and dispatch
+// a `h2` client to the `stdlib/http2` engine and everything else to the
+// plain HTTP/1.1 path — the SAME `(Request) => Response` handler either way
+// (`serveTlsConn`, server.bit). So `App.listenTls()`/`App.serveTls()` get
+// HTTP/2 for free the moment they bind TLS; there is no separate "enable
+// HTTP/2" step or method.
+//
+// HTTP/3 is different: it runs over QUIC (UDP), a second socket, not a
+// second protocol negotiated on the TLS one. `serveH3` (stdlib/http/h3.bit)
+// already binds it and dispatches to the same handler type; this file's job
+// is only to bind it on the SAME PORT NUMBER as the TLS listener (host and
+// port both, TCP for TLS and UDP for QUIC) so the `Alt-Svc` header
+// `serveTlsOn`/`serveTlsServerOn` already send on every response
+// (`altSvcHeader`, server.bit) actually names a live endpoint, and to run it
+// on its own green thread so it never blocks the TLS accept loop.
+//
+// `App`, `Config`, `Request`, `Response` are all module siblings (app.bit,
+// config.bit, ctx.bit, adapter.bit — SPEC §17.1); re-importing any of them
+// here would be E0042.
+import { TlsServer, tlsServe, serveTlsServerOn, serveH3 } from "std/http"
+
+// What `App.listenTls()`/`App.serveTls()` fail with when the app handed over
+// no certificate — the TLS mirror of `secretRequiredMessage` (app.bit,
+// #4474): a `const` rather than a literal at the fail site so a test can
+// assert what it names. A failure, not a panic like `Config.secret`'s: unlike
+// `secret`, which every app needs, most apps never call either TLS method at
+// all, so there is nothing wrong with a `Config` that leaves both fields at
+// their "" default — only calling one of these two methods without also
+// setting them is the mistake, and that is a call-time condition the caller
+// can catch, not a construction-time one.
+const tlsConfigRequiredMessage = "web: listenTls()/serveTls() require " +
+  "Config.certPem and Config.keyPem (both PEM) to be set — the framework " +
+  "reads no cert file itself, so App(Config{ certPem: ..., keyPem: ... }) " +
+  "is the only place either can come from."
+
+fn requireTlsConfig(config: Config): ()! {
+  if (len(config.certPem) == 0 || len(config.keyPem) == 0) {
+    fail newError(tlsConfigRequiredMessage)
+  }
+}
+
+// Binds `config.host:config.port` for TLS (HTTP/1.1 and HTTP/2 via ALPN,
+// `tlsServe`) and, on the SAME port number, a UDP socket for HTTP/3
+// (`serveH3`, spawned on its own green thread so a slow or absent QUIC
+// client can never delay the TLS accept loop this returns). Shared by
+// `listenTls()` and `serveTls()` so the pairing is written once.
+//
+// A known, documented gap rather than an oversight: the returned
+// `TlsServer.shutdown()` (stdlib/http/shutdown.bit) drains the TLS listener's
+// own HTTP/1.1 and HTTP/2 connections only — `serveH3` has no shutdown of
+// its own yet, so an HTTP/3 request in flight when `shutdown()` is called is
+// not drained, only the TCP-side protocols are. Closing that gap needs a
+// drain-capable HTTP/3 server in stdlib/http3, which is out of this ticket's
+// scope (#6073 is scoped to making App serve TLS, HTTP/2 and HTTP/3 at all).
+fn bindTls(config: Config, handler: (Request) => Response): TlsServer! {
+  requireTlsConfig(config)?
+  let ts = tlsServe(config.host, config.port, config.certPem, config.keyPem)?
+  let port = ts.port()?
+  spawn serveH3Background(config.host, port, config.certPem, config.keyPem, handler)
+  return ts
+}
+
+// `bindTls`'s spawned HTTP/3 accept loop. `serveH3` returns only on a bind
+// failure (the UDP port could not be reused — everything else it retries)
+// or when the socket is closed from elsewhere; either way there is no
+// caller left on this green thread to hand the failure to, the same
+// reasoning `app.bit`'s `serveBackground` documents for the TCP side.
+fn serveH3Background(
+  host: string,
+  port: int,
+  certPem: string,
+  keyPem: string,
+  handler: (Request) => Response,
+) {
+  serveH3(host, port, certPem, keyPem, handler) catch _ {
+    return
+  }
+}
+
+// `App.serveTls()`'s spawned TLS accept loop — the TLS mirror of
+// `serveBackground` (app.bit). Swallowed for the same reason: ending is
+// `TlsServer.shutdown()`'s intended outcome, not a defect to report.
+fn serveTlsBackground(ts: TlsServer, handler: (Request) => Response) {
+  serveTlsServerOn(ts, handler) catch _ {
+    return
+  }
+}
+
+// `App.listenTls()`/`App.serveTls()` themselves are declared in app.bit's
+// `App` body (SPEC §10.4: a method may only be declared inside its class's
+// own body — there is no cross-file partial-class form), and call `bindTls`
+// above.

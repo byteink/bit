@@ -20,15 +20,25 @@
 //
 // Then give the family TWO methods, immediate and queued, each ONE line:
 //
-//   // On the family's immediate handle (e.g. `Counter` in counter.bit):
-//   export incr(): i64!RedisError { return this.client.runCmd(incrCmd(this.key)) }
+//   // On the family's immediate handle (e.g. `Counter` in counter.bit) —
+//   // a `runner: Runner` field, never a `client: Client` one (#6029):
+//   export incr(): i64!RedisError { return this.runner.runCmd(incrCmd(this.key)) }
 //   // On the family's QUEUED view (e.g. `CounterBatch`, same file) — the
 //   // ONE view `Pipeline.counter(key)` AND `Tx.counter(key)` both return,
 //   // since both just hold a `Batch` (this file's `Batch` class):
 //   export incr(): Future<i64> { return this.batch.queue(incrCmd(this.key)) }
 //
 // The command definition — `args` and `decode` — is written exactly once;
-// only these two one-line calls differ, `client.runCmd` vs `batch.queue`.
+// only these two one-line calls differ, `runner.runCmd` vs `batch.queue`.
+//
+// WHY THE IMMEDIATE HANDLE HOLDS A `Runner`, NOT A `Client`, DIRECTLY
+// (#6029): `Client.counter(key)` and a transaction body's `tx.read.counter
+// (key)` must both hand back the exact same `Counter`, so a family's
+// commands are written once and run either way. `Runner` (below) is that
+// shared "run one command now" shape — pool-backed (`poolRunner`, every
+// `Client` accessor) or pinned to one connection already leased for a
+// transaction attempt (`pinnedRunner`, `tx.bit`'s `Tx.read`). A family's
+// immediate handle never knows which; it only calls `this.runner.runCmd`.
 //
 // WHY PIPELINE AND TX SHARE ONE `Batch`, NOT TWO QUEUED VIEWS PER FAMILY:
 // `Pipeline.exec()` sends every queued command back-to-back then reads all
@@ -119,6 +129,57 @@ export class Batch {
 // An empty batch, ready to `queue` into.
 export fn newBatch(): Batch {
   return Batch{ box = resultBox{ replies = []Reply(0), ready = false }, queued = [][]string(0) }
+}
+
+// The immediate half of the one-command-definition-per-family contract —
+// `Batch` above is the queued half. Runs `cmd` now, over either a
+// pool-backed `Client` or one connection already leased for a transaction
+// attempt (`tx.bit`'s `Tx.read`, #6029) — never both, exactly one of
+// `client`/`conn` is set, per the two factory functions below.
+//
+// A CONCRETE CLASS, NOT AN INTERFACE: SPEC §10.6's `method_sig = IDENT
+// signature` has no `[ generic_params ]` (unlike `method_decl`), so an
+// interface method cannot itself be generic — `interface Runner { runCmd<T>
+// (...): T!RedisError }` does not parse. The same "no higher-kinded types"
+// limit this file's header already names rules an interface out here too.
+export class Runner {
+  client: Option<Client>
+  conn: Option<redisConn>
+  timeoutNs: int
+
+  export runCmd<T>(cmd: Cmd<T>): T!RedisError {
+    match (this.client) {
+      Some(c) => return c.runCmd(cmd)?
+      None => return runPinnedCmd<T>(this, cmd)?
+    }
+  }
+}
+
+// A pool-backed runner — every `Client` family accessor (`Client.counter`,
+// ...) builds its handle over one of these.
+export fn poolRunner(client: Client): Runner {
+  return Runner{ client = Option.Some(client), conn = Option.None, timeoutNs = 0 }
+}
+
+// A runner pinned to `conn`, already leased for one transaction attempt —
+// `tx.bit`'s `Tx.read`. Never retried, unlike `Client.runCmd`: this
+// connection is checked out for the whole WATCH..EXEC window already, and a
+// command run twice mid-transaction could double a caller's side effect the
+// same way a retried write on `Client` could (`client.bit`'s header on why
+// writes never retry there).
+export fn pinnedRunner(conn: redisConn, timeoutNs: int): Runner {
+  return Runner{ client = Option.None, conn = Option.Some(conn), timeoutNs = timeoutNs }
+}
+
+fn runPinnedCmd<T>(runner: Runner, cmd: Cmd<T>): T!RedisError {
+  match (runner.conn) {
+    Some(conn) => {
+      writeCommand(conn, cmd.args, runner.timeoutNs)?
+      let r = readOneReply(conn, runner.timeoutNs)?
+      return cmd.decode(r)?
+    }
+    None => panic("redis: Runner has neither a pool-backed client nor a pinned connection")
+  }
 }
 
 // One member/score pair — `ZRANGE ... WITHSCORES` and friends, decoded by

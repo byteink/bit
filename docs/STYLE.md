@@ -89,6 +89,13 @@ puts each block through the test suite, and `_tests_/bit/docs.bit`
 typechecks them. A documentation example that rots is worse than none,
 because the reader trusts it.
 
+Under `pkg/<name>/docs/`, `pkg/<name>/guides/` and `pkg/<name>/README.md`,
+`_tests_/bit/pkgdocsgate.bit` (`./make test-package-docs`) typechecks every
+block the same way, against a scratch project whose only dependency is
+`pkg/<name>` itself. A page that needs another first-party package declares
+it with `<!-- doctest: deps a b c -->` (space-separated package names, one
+line) - naming an unknown package is a gate failure with a clear message.
+
 Blocks are complete unless the omission is the point. When a body is
 genuinely beside the point, `// ...` marks it, and nothing else does.
 

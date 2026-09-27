@@ -131,4 +131,38 @@ fn mount(app: App) {
 }
 ```
 
+## Graceful shutdown
+
+`app.listen()` blocks forever and never hands back the socket it bound -
+there is no way to stop it without cutting off every request already in
+flight. `app.serve()` binds the same way, but returns immediately with the
+running `Server` instead of blocking, so the rest of your program can hold
+onto it and stop it later:
+
+```bit
+import { App, Config } from "web"
+
+fn main(): ()! {
+  let app = App(Config{ secret = "change-me" })
+  app.get("/", (c) => c.text("ok"))
+  let server = app.serve()?
+  // ... the app is serving requests here ...
+  server.shutdown(5000)?
+}
+```
+
+`server.shutdown(timeoutMs)` stops accepting new connections immediately
+and gives every connection with a request already in the handler's hands
+up to `timeoutMs` milliseconds to finish, force-closing whatever is still
+running once that passes. Call it whenever your own process decides it is
+time to stop - a deploy script, a test, or an admin endpoint you build
+yourself. There is no way yet for a Bit program to catch the signal a
+deployment sends on shutdown (`SIGTERM` from Docker or Kubernetes), so
+wiring this into an automatic zero-downtime deploy needs that piece to
+land in the language first; until then, drive `shutdown()` from whatever
+already decides your process should stop.
+
+`app.listen()` is unchanged, and still the right call for a program that
+has nothing else to do once it starts serving.
+
 Next: [Errors](errors.md).

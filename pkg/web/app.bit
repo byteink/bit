@@ -20,6 +20,14 @@
 // `join` and `Handler` are already brought into this module by router.bit
 // (an import/type alias binds module-wide, not per file — SPEC's own name
 // resolution is per module) — reused here, not re-declared.
+//
+// `Server`/`serve` (#6080) are new to this module as a PRODUCTION import:
+// adapter.bit's `import { Response, respond, listenAndServe } from "std/http"`
+// binds different symbols, so this is not E0042. `pkg/web/adapterhead.test.bit`
+// imports the same two names, but an import bound only by a `.test.bit` file
+// is visible only to other `.test.bit` files (SPEC §17.2) — `App.serve()`
+// below is production code and needs its own binding.
+import { Server, serve, listenAndServeOn } from "std/http"
 
 // The one interface the package has (five granular ones were considered and
 // dropped as speculative, per #3875). `App` and `Group` both satisfy it
@@ -37,10 +45,17 @@ export interface Routes {
   group(prefix: string): Group,
 }
 
-// Returned by every registration method so `.name(...)` can chain onto it.
+// Returned by every registration method so `.name(...)`/`.hijackable()` can
+// chain onto it.
 export class Route {
   pattern: string
   registry: NameRegistry
+  // #6072: the SAME `PendingRoute` `Group.register` (below) appended to
+  // `pending.routes` — a reference, not a copy (classes are reference
+  // types, SPEC §13.3), so `.hijackable()` flips a field the app can still
+  // see at `freeze()` time, exactly the way `.name()` above writes straight
+  // into the shared `registry`.
+  pr: PendingRoute
 
   // Records `n` against this route's fully-prefixed pattern. A duplicate
   // name is not an error here — it is recorded and only surfaces at
@@ -50,6 +65,25 @@ export class Route {
   // first.
   export name(n: string): Route {
     this.registry.record(n, this.pattern)
+    return this
+  }
+
+  // #6072: marks this route as one that takes its connection over instead
+  // of ever answering through the ordinary `Res`/`Response` framing — a
+  // WebSocket upgrade, a server-sent-events stream, or a hand-framed large
+  // body (`c.hijack()`/`wsUpgrade`/`newSSE`/`newStream`, ctx.bit/
+  // realtime.bit). This is the ONLY thing it does: nothing here touches the
+  // route's dispatch, and a handler on an unmarked route that calls
+  // `c.hijack()` still runs (or fails, on an app with no marked route at
+  // all — see `Ctx.takeExchange`'s own comment). What it decides is
+  // read once, at `App.freeze()` (`anyHijackable`, middleware.bit): whether
+  // THIS APP's `listen()`/`serve()`/`listenTls()`/`serveTls()` need the
+  // Exchange-based accept loop instead of stdlib's own keep-alive one — see
+  // realtime.bit's file header for why that choice is app-wide, not
+  // per-connection, and app.bit's own comment on `hijackable` for what an
+  // app with no marked route pays for this feature (nothing).
+  export hijackable(): Route {
+    this.pr.hijack = true
     return this
   }
 }
@@ -236,11 +270,15 @@ export class Group {
     // `intoRes()` is `Res.intoRes()` (identity) or `Node.intoRes()` (200,
     // text/html), whichever `h` returns.
     let resolved: Handler = (c) => h(c)?.intoRes()
-    this.pending.routes = append(
-      this.pending.routes,
-      PendingRoute{ method = method, pattern = full, handler = resolved, chain = chain },
-    )
-    return Route{ pattern = full, registry = this.registry }
+    let pr = PendingRoute{
+      method = method,
+      pattern = full,
+      handler = resolved,
+      chain = chain,
+      hijack = false,
+    }
+    this.pending.routes = append(this.pending.routes, pr)
+    return Route{ pattern = full, registry = this.registry, pr = pr }
   }
 }
 
@@ -273,6 +311,26 @@ export class App {
   // calling a nil function, and the request path carries no "is it composed
   // yet" branch.
   missHandler: Handler
+
+  // #6072: true the instant ANY route anywhere in this app was registered
+  // with `.hijackable()` — computed once, in `freeze()` (`anyHijackable`,
+  // middleware.bit), never per request. `listen()`/`serve()`/`listenTls()`/
+  // `serveTls()` below all read it to choose their serving loop: false
+  // (every app that never calls `.hijackable()`, including every plaintext/
+  // JSON benchmark route) keeps stdlib's own keep-alive `listenAndServe`/
+  // `listenAndServeOn` path byte-for-byte unchanged — this field costs such
+  // an app exactly one read of a `bool` that is already `false`, never an
+  // Exchange, never a lost connection reuse. True switches the WHOLE app
+  // (not just its hijackable routes) onto realtime.bit's Exchange-based
+  // loop, which answers one request per connection — see realtime.bit's file
+  // header for why that trade is app-wide: stdlib's `Exchange` (std/http)
+  // is one-shot by design (its own doc comment: "one request per connection
+  // in v1"), so there is no connection-level way yet to keep some requests
+  // on the fast path and hijack only others on the SAME connection. Mixing
+  // a high-throughput ordinary route with a WebSocket/SSE/stream route on
+  // ONE app pays this for its ordinary traffic too; the fix needs a
+  // keep-alive-capable hijack primitive in stdlib/http, filed as #6102.
+  hijackable: bool
 
   init(config: Config) {
     // First thing, before any of the app's own registration runs: #3946 gave
@@ -358,6 +416,7 @@ export class App {
   // catches, which is all a plain 404/405 ever was).
   export freeze(): ()! {
     flushPending(this.root.router, this.root.pending)
+    this.hijackable = anyHijackable(this.root.pending)
     this.missHandler = missHandlerFor(this.root)
     this.root.router.freeze()?
     this.root.registry.freeze()?
@@ -384,24 +443,101 @@ export class App {
   // bind or accept error — or immediately, without binding anything, when
   // `freeze()` rejects the route table.
   //
-  // There is deliberately nothing else in this body: no second request path,
-  // no per-request work, no error mapping. Everything a request meets is
-  // behind `handle()`, and `serveHandler()` is the only thing passed here.
+  // #6072: `this.hijackable` (set by `freeze()` above) is the ONLY new thing
+  // here, and it costs an app that never calls `.hijackable()` nothing but
+  // reading a `bool` that is already `false` — everything below that branch
+  // is byte-for-byte what this method already was. True runs the SAME
+  // request through the SAME `handle()`/`serveHandler()` path
+  // (`dispatchHijackable`, realtime.bit, forwards into `chainResponse`'s
+  // exact composed-Handler call), only the connection framing around it
+  // changes: one request per connection instead of `listenAndServe`'s
+  // keep-alive, which is what makes a hijack reachable at all — see
+  // realtime.bit's file header for why.
   export listen(): ()! {
     this.freeze()?
+    if (this.hijackable) {
+      let s = serve(this.config.host, this.config.port)?
+      serveHijackableOn(s, this)?
+      return
+    }
     listenAndServe(this.config.host, this.config.port, this.serveHandler())?
   }
 
-  // #6072: `listen()`'s hijack-aware sibling — freeze, then serve
-  // `config.host:config.port` on the accept loop that keeps each
-  // connection's `Exchange` reachable from `Ctx` (`c.hijack()`/`wsUpgrade`,
-  // realtime.bit), so a route can take a connection over for a WebSocket
-  // upgrade, an SSE stream, or a hand-framed large body. See realtime.bit's
-  // file header for why this is a second serving path rather than a `listen()`
-  // option: the two share no code below this line by construction.
-  export listenHijackable(): ()! {
+  // Freeze, bind `config.host:config.port`, and serve `handle` on a green
+  // thread this method spawns — then return the `Server` immediately instead
+  // of blocking on it the way `listen()` does (#6080). The caller now holds
+  // the one thing `listen()` never surrenders: `server.shutdown(timeoutMs)`
+  // (stdlib/http/server.bit) stops accepting new connections and drains
+  // in-flight ones, the missing half of a zero-downtime deploy (part 73 of
+  // the guides course) — install it in a signal handler, or call it directly
+  // in a test, exactly as `stdlib/http`'s own `Server.shutdown` tests do.
+  //
+  // `listen()` itself is unchanged and still the right call for a program
+  // that has nothing else to do after serving starts. #6072: same
+  // `this.hijackable` branch as `listen()`, spawned instead of blocking —
+  // `s.shutdown(timeoutMs)` still drains it either way, since both branches
+  // hand `shutdown` the same kind of `Server`.
+  export serve(): Server! {
     this.freeze()?
-    serveHijackable(this)?
+    let s = serve(this.config.host, this.config.port)?
+    if (this.hijackable) {
+      spawn serveHijackableBackground(s, this)
+      return s
+    }
+    spawn serveBackground(s, this.serveHandler())
+    return s
+  }
+
+  // Freeze, bind TLS, and serve HTTP/1.1, HTTP/2 (both via ALPN) and HTTP/3
+  // (over QUIC, on the same port number) forever (#6073). Returns only on a
+  // bind error, or a failure naming a missing `Config.certPem`/`keyPem` — or
+  // immediately, without binding anything, when `freeze()` rejects the route
+  // table. The TLS mirror of `listen()`; `bindTls` (tls.bit) documents
+  // exactly what runs on which socket.
+  //
+  // #6072: NOT branched on `this.hijackable`. stdlib/http has no TLS
+  // equivalent of the plaintext `Server`/`Exchange` accept-and-hijack pair
+  // this ticket built on (`bindTls`/`serveTlsServerOn` only ever hand a
+  // connection to the fixed `(Request) => Response` shape, the same
+  // limitation `App.listen()` had before this ticket) — filed as #6103. A
+  // `.hijackable()` route served over TLS still registers and still runs;
+  // `c.hijack()`/`wsUpgrade` on it fails cleanly (`Ctx.takeExchange`,
+  // ctx.bit) naming `.hijackable()` and plain `listen()`/`serve()`: a `Ctx`
+  // built on this path simply never carries an `Exchange`, exactly as one
+  // built by `app.handle()` never has. `newSSE`/`newStream` fail the same
+  // way. HTTP/2's own upgrade path (RFC 8441) is a second, separate gap on
+  // top of that, also #6103.
+  export listenTls(): ()! {
+    this.freeze()?
+    let ts = bindTls(this.config, this.serveHandler())?
+    serveTlsServerOn(ts, this.serveHandler())?
+  }
+
+  // Freeze, bind TLS the same way `listenTls()` does, and serve on a green
+  // thread this method spawns — then return the `TlsServer` immediately
+  // instead of blocking on it, the TLS mirror of `serve()` (#6073). `
+  // server.shutdown(timeoutMs)` stops accepting new TLS connections and
+  // drains in-flight HTTP/1.1 and HTTP/2 ones — `bindTls` (tls.bit)
+  // documents what it does not cover (HTTP/3). #6072: see `listenTls()`'s
+  // own comment above — no TLS hijack path exists yet (#6103).
+  export serveTls(): TlsServer! {
+    this.freeze()?
+    let ts = bindTls(this.config, this.serveHandler())?
+    spawn serveTlsBackground(ts, this.serveHandler())
+    return ts
+  }
+}
+
+// `App.serve()`'s spawned accept loop. `listenAndServeOn` returns only once
+// something has closed `s`'s listener (`Server.close()`/`shutdown()`) or hit
+// an unrecoverable accept error — either way there is no caller left on this
+// green thread to hand the failure to, so it is swallowed here exactly as
+// `pkg/web/adapterhead.test.bit`'s own `wireServe` swallows the same return
+// for the same reason: ending is the intended outcome of a graceful
+// shutdown, not a defect to report.
+fn serveBackground(s: Server, handler: (Request) => Response) {
+  listenAndServeOn(s, handler) catch _ {
+    return
   }
 }
 

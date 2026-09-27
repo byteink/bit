@@ -1,0 +1,92 @@
+// pkg/web/serve.test.bit — App.serve() (#6080): does it hand back a
+// `Server` whose `shutdown(timeoutMs)` stops accepting new connections and
+// drains one already in flight? `stdlib/http`'s own
+// `_tests_/imports/httpgracefulshutdown` already proves `Server.shutdown`
+// itself — idempotency, the timeout race, idle connections — at the
+// `serve`/`listenAndServeOn` layer; this file's only job is `App.serve()`'s
+// wiring: the `Server` it returns is genuinely the one serving THIS app's
+// routes, on a green thread `serve()` itself spawned.
+//
+// `testApp` (app.test.bit) and `dial` (adapterhead.test.bit) are module-wide
+// already (SPEC §17.1); `get`, new to this module, is imported below.
+import { get } from "std/http"
+
+// Signals `startedCh` the instant the handler is invoked — proof the
+// request genuinely reached it — then blocks on `releaseCh` until the test
+// says to answer. This is what makes "started before shutdown, finishes
+// after" a controlled sequence rather than a sleep-based guess.
+fn slowHandler(startedCh: chan<bool>, releaseCh: chan<bool>): ReplyHandler {
+  return (c) => {
+    startedCh <- true
+    <- releaseCh
+    return c.text("slow-done")
+  }
+}
+
+// The outcome of the spawned client GET, handed back over a channel since it
+// runs on its own green thread while the test thread drives `shutdown()`.
+class getResult { status: int, body: string, err: string }
+
+fn doGet(port: int, path: string, out: chan<getResult>) {
+  let r = get("http://127.0.0.1:${port}${path}") catch e {
+    out <- getResult{ status = 0, body = "", err = e.message() }
+    return
+  }
+  out <- getResult{ status = r.status, body = r.body, err = "" }
+}
+
+// Runs `shutdown()` on its own green thread, so the test thread stays free to
+// dial a NEW connection (which must be refused) while the in-flight one is
+// still draining. `spawn` demands a call (SPEC §22, "postfix must be a
+// call"), so this cannot be an inline lambda.
+fn shutdownBackground(server: Server, timeoutMs: int) {
+  server.shutdown(timeoutMs) catch _ {
+    return
+  }
+}
+
+test "serve() returns a Server whose shutdown() drains an in-flight request and refuses a new connection" {
+  let app = testApp()
+  let startedCh = chan<bool>(1)
+  let releaseCh = chan<bool>(1)
+  app.get("/slow", slowHandler(startedCh, releaseCh))
+
+  let server = app.serve() catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = server.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+
+  let resultCh = chan<getResult>(1)
+  spawn doGet(port, "/slow", resultCh)
+  // Proves the request genuinely reached the handler before shutdown is
+  // called — not a race between the client's dial and shutdown's own.
+  <- startedCh
+
+  dial("127.0.0.1", port) catch e {
+    assert(false, "a connection before shutdown must still be accepted: ${e.message()}")
+    return
+  }
+
+  spawn shutdownBackground(server, 5000)
+  // Gives `shutdown()` a moment to close the listener before this dials
+  // again — it is the listener close, not the still-draining in-flight
+  // request, that this assertion is about.
+  sleep(50 * Millisecond)
+
+  dial("127.0.0.1", port) catch _ {
+    // Refused, as it must be: shutdown() has closed the listener even
+    // though the one in-flight request has not finished yet.
+    releaseCh <- true
+    let res = <- resultCh
+    assert(
+      res.status == 200 && res.body == "slow-done",
+      "the in-flight request must still complete: status ${res.status}, body '${res.body}', err '${res.err}'",
+    )
+    return
+  }
+  assert(false, "a new connection after shutdown() started must be refused")
+}

@@ -540,6 +540,38 @@ Decodes an unpadded URL-safe base64 string. Fails on a character outside the
 URL-safe alphabet - an `=` included, since URL-safe output is never padded - or a
 length that no valid encoding can produce.
 
+## Base32
+
+Base32 (RFC 4648 §6) encodes arbitrary bytes as a 33-character ASCII
+alphabet (`A`-`Z`, `2`-`7`), five input bytes per eight output characters.
+It needs no case-sensitive transcription and skips the digits easily
+confused with letters (`0`/`O`, `1`/`I`), which is why it is the encoding
+TOTP shared secrets are provisioned in (`pkg/auth`'s `totp.bit`) - a user
+can read or type one without ambiguity. Only the standard, `=`-padded
+alphabet is provided; RFC 4648 has no URL-safe base32 variant to mirror
+base64's pair. Decoding is validating: an out-of-alphabet character or an
+impossible length is an error, not silent garbage.
+
+```bit
+import { encodeBase32, decodeBase32 } from "std/crypto"
+
+// Round-trips any bytes through the standard, '='-padded alphabet.
+fn roundTrip(data: []byte): []byte! {
+  return decodeBase32(encodeBase32(data))?
+}
+```
+
+### `encodeBase32(b: []byte): string`
+
+Encodes `b` with the standard alphabet and `=` padding. The result length is
+always a multiple of 8; empty input yields the empty string.
+
+### `decodeBase32(s: string): []byte!`
+
+Decodes a standard, `=`-padded base32 string. Fails on a character outside
+the alphabet, a length that is not a multiple of 8, or a final group whose
+symbol count no valid RFC 4648 encoding produces.
+
 ## ChaCha20
 
 The ChaCha20 stream cipher (RFC 8439) and its HChaCha20 key-derivation core
