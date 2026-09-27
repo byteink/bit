@@ -1,0 +1,267 @@
+// pkg/redis/uri.bit — turning a connection URL into `Options`, and `Options`
+// itself: the connection core's tunables (epic #6013, #6022).
+//
+// `redis://[user[:pass]@]host[:port][/db][?timeout=5s&pool=16&name=app]`,
+// `rediss://` for TLS, per the IANA redis/rediss URI scheme draft
+// (draft-hows-redis-uri, re-verified current 2026-09-27). Follows the shape
+// of pkg/postgres/uri.bit (percent-decoded credentials, an unrecognised query
+// parameter is rejected rather than silently ignored, ONE `target`-shaped
+// class mutated field by field) with the postgres-specific SQL types swapped
+// for this package's own `Options`.
+//
+// `timeout=` SETS BOTH `connectTimeout` AND `commandTimeout`. The URL form
+// exposes one knob because that is what the scheme's own examples show;
+// `connect(Options)` is the escape hatch for a caller that wants the two
+// split.
+//
+// `Options{}` IS A COMPLETE, WORKING CONFIGURATION — every field below has a
+// default, the same contract `stdlib/sql/config.bit`'s `Datasource` and
+// `stdlib/sync/pool.bit`'s `PoolOptions` make. `parseUrl` starts from exactly
+// that and overrides only the fields the URL actually names.
+//
+// `indexOf`/`parseInt` (std/strings) are already imported module-wide by
+// `resp.bit` — an import binds per MODULE (SPEC §17.1), so reimporting either
+// here is E0042. `hasPrefix`/`lastIndexOf` move here from
+// `client.live.test.bit` for the same reason: a `.test.bit` file's imports do
+// not reach the module outside `bit test`, and this file (not a test) needs
+// both.
+
+import { hasPrefix, lastIndexOf, split, hasSuffix, contains } from "std/strings"
+import { monotonic, Second } from "std/time"
+
+// Redis's assigned port.
+const defaultPort: int = 6379
+
+// The connection core's tunables. `open(url)` builds one from a URL;
+// `connect(opts)` takes one directly. Every field has a default, so
+// `Options{}` connects to a local, unauthenticated, plaintext server — the
+// same "no config is a working config" contract every other constructor in
+// this codebase makes.
+export class Options {
+  export host: string = "127.0.0.1",
+  export port: int = 6379,
+  export username: string = "",
+  export password: string = "",
+  export db: int = 0,
+  export tls: bool = false,
+  // SNI name and the name the certificate must match. Empty defaults to
+  // `host` — see `conn.bit`'s `openStream`.
+  export tlsServerName: string = "",
+  // A PEM root bundle to verify the server against, instead of the OS trust
+  // store — a self-signed test server's own CA, typically.
+  export tlsRootCa: string = "",
+  // Turns certificate verification off entirely. Never the default: an
+  // explicit opt-in, named for exactly what it does (epic #6013's own
+  // constraint on this ticket).
+  export insecureSkipVerify: bool = false,
+  export clientName: string = "",
+  // Nanoseconds, `monotonic()`-scale — `std/net`/`std/tls`'s own deadline
+  // unit, so `dialConn` (conn.bit) never converts. 5 * Second.
+  export connectTimeout: int = 5000000000,
+  export commandTimeout: int = 5000000000,
+  export poolSize: int = 10,
+  // The RESP version `HELLO` asks for. Always 3 in practice — the field
+  // exists so a caller pinned to an old server can name RESP2 and skip the
+  // `HELLO` round trip entirely (`conn.bit`'s `trySendHello` still falls
+  // back on its own when a server refuses `HELLO`, this is a caller's own
+  // opt-out).
+  export protocol: int = 3,
+}
+
+// Parses a connection URL into `Options`, starting from `Options{}`'s
+// defaults and overriding only what the URL names. Fails naming the URL on
+// any malformed piece — a bad URL is a caller's config bug, never a partial
+// connection.
+export fn parseUrl(url: string): Options!RedisError {
+  let (rest, tls) = afterScheme(url)?
+  let (beforeQuery, query) = uriCut(rest, "?")
+  let (authority, path) = uriCut(beforeQuery, "/")
+  let (userinfo, hostport, _) = uriCutLast(authority, "@")
+  let opts = Options{ tls = tls }
+  applyUserinfo(opts, userinfo)?
+  applyHostPort(opts, hostport)?
+  applyDb(opts, path)?
+  applyQuery(opts, query)?
+  if (opts.host == "") {
+    fail RedisError.Protocol("redis: connection URL names no host: ${url}")
+  }
+  return opts
+}
+
+// Strips `redis://` or `rediss://`, reporting which. Anything else is not
+// this package's URL and is refused by scheme rather than misparsed as a
+// host.
+fn afterScheme(url: string): (string, bool)!RedisError {
+  if (hasPrefix(url, "rediss://")) {
+    return (url[9:len(url)], true)
+  }
+  if (hasPrefix(url, "redis://")) {
+    return (url[8:len(url)], false)
+  }
+  fail RedisError.Protocol("redis: connection URL must start with redis:// or rediss://, got: ${url}")
+}
+
+// `user`, `user:password`, or empty (an empty userinfo before `@`, as in
+// `redis://:secret@host` — Redis's own ACL-less "just a password" form).
+// Percent-decoded, since a password containing `@`, `/` or `?` can only
+// appear in a URL escaped.
+fn applyUserinfo(opts: Options, userinfo: string): ()!RedisError {
+  if (userinfo == "") {
+    return
+  }
+  let (user, password) = uriCut(userinfo, ":")
+  opts.username = pctDecode(user)?
+  opts.password = pctDecode(password)?
+}
+
+// `host` or `host:port`. An explicit port must be a number in range; an
+// omitted one leaves `Options.port` at its default (6379).
+fn applyHostPort(opts: Options, hostport: string): ()!RedisError {
+  let (host, port, hasPort) = uriCutLast(hostport, ":")
+  if (!hasPort) {
+    opts.host = pctDecode(hostport)?
+    return
+  }
+  opts.host = pctDecode(host)?
+  if (port == "") {
+    return
+  }
+  let n = parseInt(port) catch _ {
+    fail RedisError.Protocol("redis: connection URL port is not a number: ${port}")
+  }
+  if (n < 1 || n > 65535) {
+    fail RedisError.Protocol("redis: connection URL port is out of range: ${n}")
+  }
+  opts.port = n
+}
+
+// The path names a database index, e.g. `/2`. Empty leaves `Options.db` at
+// its default (0).
+fn applyDb(opts: Options, path: string): ()!RedisError {
+  if (path == "") {
+    return
+  }
+  let n = parseInt(path) catch _ {
+    fail RedisError.Protocol("redis: connection URL database '${path}' is not a number")
+  }
+  if (n < 0) {
+    fail RedisError.Protocol("redis: connection URL database ${n} is negative")
+  }
+  opts.db = n
+}
+
+fn applyQuery(opts: Options, query: string): ()!RedisError {
+  if (query == "") {
+    return
+  }
+  for part of split(query, "&") {
+    applyParam(opts, part)?
+  }
+}
+
+// One `key=value` pair. Every other key fails naming itself — silently
+// dropping a parameter the caller wrote is how a connection ends up not
+// doing what its URL says.
+fn applyParam(opts: Options, param: string): ()!RedisError {
+  if (param == "") {
+    return
+  }
+  let (key, value) = uriCut(param, "=")
+  if (key == "timeout") {
+    let ns = parseDurationParam(value)?
+    opts.connectTimeout = ns
+    opts.commandTimeout = ns
+    return
+  }
+  if (key == "pool") {
+    opts.poolSize = parseInt(value) catch _ {
+      fail RedisError.Protocol("redis: connection URL parameter 'pool' is not a number: ${value}")
+    }
+    return
+  }
+  if (key == "name") {
+    opts.clientName = pctDecode(value)?
+    return
+  }
+  fail RedisError.Protocol(
+      "redis: connection URL parameter '${key}' is not supported; this " +
+      "package reads timeout, pool and name only",
+  )
+}
+
+// `5s` or `500ms`, as nanoseconds (`Options.connectTimeout`/`commandTimeout`'s
+// own unit).
+fn parseDurationParam(value: string): int!RedisError {
+  if (hasSuffix(value, "ms")) {
+    let n = parseInt(value[0:len(value) - 2]) catch _ {
+      fail RedisError.Protocol("redis: connection URL timeout '${value}' is not a number of milliseconds")
+    }
+    return n * 1000000
+  }
+  if (hasSuffix(value, "s")) {
+    let n = parseInt(value[0:len(value) - 1]) catch _ {
+      fail RedisError.Protocol("redis: connection URL timeout '${value}' is not a number of seconds")
+    }
+    return n * Second
+  }
+  fail RedisError.Protocol("redis: connection URL timeout '${value}' must end in 's' or 'ms'")
+}
+
+// Split at the FIRST `sep`; an absent separator leaves the second half empty.
+fn uriCut(s: string, sep: string): (string, string) {
+  let at = indexOf(s, sep)
+  if (at < 0) {
+    return (s, "")
+  }
+  return (s[0:at], s[at + len(sep):len(s)])
+}
+
+// Split at the LAST `sep`, reporting whether there was one — `@` in a
+// userinfo binds rightmost, same reasoning as pkg/postgres/uri.bit's own
+// `cutLast`.
+fn uriCutLast(s: string, sep: string): (string, string, bool) {
+  let at = lastIndexOf(s, sep)
+  if (at < 0) {
+    return ("", s, false)
+  }
+  return (s[0:at], s[at + len(sep):len(s)], true)
+}
+
+// Percent-decoding (RFC 3986 §2.1). A truncated or non-hex escape fails
+// rather than being passed through: `%zz` in a password is a broken URL, and
+// treating it literally would send the wrong credential to the server.
+fn pctDecode(s: string): string!RedisError {
+  if (indexOf(s, "%") < 0) {
+    return s
+  }
+  let src = []byte(s)
+  let out = []byte(0)
+  let i = 0
+  while (i < len(src)) {
+    if (src[i] != 37) {
+      out = append(out, src[i])
+      i = i + 1
+      continue
+    }
+    if (i + 2 >= len(src)) {
+      fail RedisError.Protocol("redis: truncated percent-escape in connection URL")
+    }
+    out = append(out, byte(hexNibble(src[i + 1])? * 16 + hexNibble(src[i + 2])?))
+    i = i + 3
+  }
+  return string(out)
+}
+
+// One hex digit as 0..15.
+fn hexNibble(c: byte): int!RedisError {
+  if (c >= 48 && c <= 57) {
+    return int(c) - 48
+  }
+  if (c >= 97 && c <= 102) {
+    return int(c) - 97 + 10
+  }
+  if (c >= 65 && c <= 70) {
+    return int(c) - 65 + 10
+  }
+  fail RedisError.Protocol("redis: bad percent-escape in connection URL")
+}
