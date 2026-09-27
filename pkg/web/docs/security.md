@@ -45,6 +45,37 @@ type implementing `SessionStore` directly - a future `SqlStore` or
 tombstone bounded by the same session ttl, so a stale writer can never bring
 a destroyed id back once its tombstone exists.
 
+### Saving is automatic
+
+`session.set()`/`delete()`/`regenerate()` only change this request's own
+copy of the data; none of them writes to the store by themselves. The
+framework saves a session that changed once the handler returns, before the
+response goes out, so this is already enough:
+
+```bit
+import { Ctx } from "web"
+
+fn addToCart(c: Ctx, sku: string): ()! {
+  c.session()?.set("cart:" + sku, "1")
+}
+```
+
+No `save()` call, and the value is still there on the next request. A
+session nothing touched costs the store no write at all. `save()` is still
+there for a handler that wants to force a write before it returns - call it
+any number of times; once nothing is left to flush it is a no-op.
+
+A save failure - the store is down, or lost the race described above -
+becomes the same 500 an ordinary handler failure would, never a response
+that silently forgot the write.
+
+The one place autosave cannot reach is a hijacked connection: a WebSocket or
+an SSE stream (see [Realtime](realtime.md)) writes its own status line
+before the framework gets a say, so there is no response left to fail. A
+session written before or during one of those is still saved, best-effort;
+a failure there is logged rather than turned into a response nobody can
+send.
+
 ### Regenerating the id after login
 
 `Session.regenerate()` moves this session's data to a freshly minted id,
