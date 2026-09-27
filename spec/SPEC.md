@@ -878,11 +878,82 @@ let a = Account(500)?
 - **A class declaring `init` may not be built with a composite literal
   outside its defining module** - see §12.2.
 
+### 10.4.1 Static Methods
+
+```
+static_method_decl = [ "export" ] "static" "fn" IDENT [ generic_params ] signature block .
+```
+
+A `static` method attaches a named function to the **type**, not to an
+instance: it has no `this`, and is called through the class's own name
+rather than through a value:
+
+```
+class Box {
+  static fn zero(): int {
+    return 0
+  }
+}
+
+fn main() {
+  print("${Box.zero()}")
+}
+```
+
+- `static` is a **contextual keyword** (§5.2), like `readonly` and `use`: it
+  parses as an ordinary identifier everywhere except immediately before `fn`
+  inside a class body, so a field or an in-body method may still be named
+  `static`.
+- `this` is not bound inside a static method's body; referencing it is
+  `E0040` ("undefined name"), the same diagnostic a top-level function's
+  body gets for the same reason.
+- A static method follows the same `export` rule as an instance method
+  (§10.4): `export static fn name(...)` is visible outside the module.
+- A static method may be called through a **generic type parameter** bound
+  to an interface that declares it as a static requirement (§10.6):
+
+  ```
+  interface Named {
+    static label(): string
+  }
+
+  class Box {
+    static fn label(): string {
+      return "box"
+    }
+  }
+
+  fn describe<T: Named>(): string {
+    return T.label()
+  }
+
+  fn main() {
+    print(describe<Box>())
+  }
+  ```
+
+  Dispatch is resolved at **monomorphization**: each instantiation of
+  `describe` substitutes its own concrete `T`, so `T.label()` becomes a
+  direct call to that type's own static method. There is no vtable and no
+  runtime type information involved, unlike an interface VALUE's dynamic
+  dispatch (§14.3) - a static method cannot be called through one, since an
+  interface value carries no type to call a static method on, only an
+  instance's method table.
+
+Static methods are gated behind the compiler flag `BIT_STATIC_METHODS=1`
+(default off) until the release after they land repins the toolchain's own
+pinned previous-release oracle past this compiler build; with the flag
+unset, `static` before `fn` inside a class body stays an ordinary
+identifier and the declaration fails to parse, unchanged from every earlier
+release. This is a rollout mechanism only, not part of the language's
+steady-state definition - the same shape `BIT_MAPLIT` (§12.3) uses - and
+this paragraph is removed once the flag defaults on.
+
 ### 10.5 Class Declarations
 
 ```
 class_decl  = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
-member      = field | method_decl .    (* method_decl, §10.4 *)
+member      = field | method_decl | static_method_decl .    (* method_decl, §10.4; static_method_decl, §10.4.1 *)
 field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 ```
 
@@ -1364,8 +1435,10 @@ class SendWelcome { userId: i64 }
 ### 10.6 Interface Declarations
 
 ```
-interface_decl = "interface" IDENT [ generic_params ] "{" [ method_sig { ( ";" | "," ) method_sig } [ ";" | "," ] ] "}" .
+interface_decl = "interface" IDENT [ generic_params ] "{" [ member_sig { ( ";" | "," ) member_sig } [ ";" | "," ] ] "}" .
+member_sig     = method_sig | static_method_sig .
 method_sig     = IDENT signature .
+static_method_sig = "static" IDENT signature .           (* §10.4.1 *)
 enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_member { ( ";" | "," ) enum_member } [ ";" | "," ] ] "}" .
 enum_member    = enum_variant | method_decl .            (* method_decl, §10.4 *)
 enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* optional payload; §14.7 *)
@@ -1374,6 +1447,34 @@ enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* optional payload; §
 Interfaces are **structural** (§14.3): a type satisfies an interface if it has all
 the interface's methods with matching signatures. There is no `implements`
 clause. Interface values are references (§13.3); the zero value is `nil`.
+
+A `static_method_sig` (§10.4.1) is a **static requirement**: a class
+satisfies it structurally, the same way it satisfies an ordinary
+`method_sig`, but with a `static` method rather than an instance one - an
+instance method with a matching name and signature does not satisfy a
+static requirement, and a static method does not satisfy an ordinary one.
+
+An interface declaring a static requirement is reachable only through a
+**generic bound** (`T: Named`, §10.4.1); it may not be used as a value
+type - there is no instance to call a static method on, only a type. Every
+value-type position an ordinary interface may occupy - a `let`/`const`
+annotation, a parameter, a field, or a function's result type - is `E0170`
+for such an interface:
+
+```
+interface Named {
+  static label(): string
+}
+
+fn take(n: Named) {   // E0170: 'Named' declares a static requirement and
+}                      // cannot be used as a value type; use it only as
+                       // a generic bound ('T: Named')
+```
+
+The restriction is checked once the whole project's declarations are
+known (a static requirement declared in one module may be used as a value
+type in another), and does not apply to the `T: Named` bound itself, which
+is a different position entirely.
 
 The predeclared `error` interface is:
 
