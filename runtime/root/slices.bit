@@ -310,18 +310,37 @@ export @nosplit @symbol("bit_rt_slice_new") fn rtSliceNew(
 }
 
 // `bit_rt_slice_append`: appends one word, DOUBLING FROM 1 when full. A grow
-// reallocates from the current view and resets `off` to 0. Mutates the header in
-// place and returns it, so `s = append(s, x)` observes the new length and buffer
-// through the same value — which is also why `append` aliases its argument's
-// backing, a documented hazard for callers.
+// reallocates from the current view and resets `off` to 0.
+//
+// RETURNS AN INDEPENDENT HEADER WHEN `hIn` IS NON-NULL (#6092, fixed from the
+// mutate-in-place design this comment used to describe). `hIn`'s own header
+// fields (`len`, `buf`, `off`, `cap`) are NEVER written by this function any
+// more — only a freshly `gcAlloc`'d header carries the new state, and `hIn`
+// keeps whatever it already had. SPEC §12.6's builtin-`append` note ("only the
+// returned value is guaranteed to observe the growth") was already the
+// contract; this is what makes it true. Before this fix, `h == hIn` was
+// returned and mutated directly, so a SECOND `append(hIn, ...)` call — with
+// `hIn` never reassigned in between, an entirely ordinary "build several
+// derived slices off one shared prefix" pattern — silently changed `len()` of
+// the FIRST call's already-returned result, because both calls' "independent"
+// results were literally the same header object (#6092's repro).
+//
+// The backing BUFFER may still be shared when there is spare capacity — that
+// half of the aliasing is Go's own documented hazard (SPEC §12.6: "the result
+// may share dst's backing buffer") and is unchanged: two results built from
+// the same base can still clobber each other's newly written ELEMENT DATA in
+// unused capacity. What changed is that a LENGTH change on one result can
+// never again bleed into another's header.
 //
 // A NULL HEADER APPENDS INTO A FRESH SLICE rather than mutating through null
 // (#1564/#1570): a zeroed class's slice field is the null word (SPEC §13.4),
-// and `append` must treat it as the empty slice. It cannot reuse a shared empty
-// — `append` grows the header IN PLACE, so a process-wide empty would be
-// corrupted by the first append anywhere (#1557). `rtSliceNew` can no longer
-// return 0 on exhaustion (constraint 3, #1642/#3013): exhaustion through
-// `gcAlloc` is fatal, so its result here needs no OOM check either.
+// and `append` must treat it as the empty slice. That fresh header (from
+// `appendTarget`/`rtSliceNew`) is mutated in place below exactly as before —
+// safely, since nothing else can hold a reference to a header this same call
+// just allocated. `rtSliceNew` can no longer return 0 on exhaustion
+// (constraint 3, #1642/#3013): exhaustion through `gcAlloc` is fatal, so its
+// result here needs no OOM check either, and neither does the second
+// `gcAlloc` this function now performs when `hIn != 0`.
 //
 // `isRef` is UNRECOVERABLE from a null header — there is no header to read it
 // from, and the element type never made the wire — so it travels as a third
@@ -364,31 +383,34 @@ export @nosplit @symbol("bit_rt_slice_append") fn rtSliceAppend(
   let vlen = loadWord(h + slcLen)
   let vcap = loadWord(h + slcCap)
   let off = loadWord(h + slcOff)
-  let packed = elemSize != 8 && loadWord(h + slcIsRef) == 0
+  let bufIsRef = loadWord(h + slcIsRef)
+  let packed = elemSize != 8 && bufIsRef == 0
+  let buf = loadWord(h + slcBuf)
+  // Every field read above comes from `h` BEFORE any write below touches
+  // anything — `h` itself is never mutated past this point (#6092): the grow
+  // copy and the new element land in local `buf`/`off`/`vcap`, and only the
+  // header this function returns (`h` itself when `hIn == 0`, a fresh clone
+  // otherwise, below) ever observes them.
   if (vlen == vcap) {
     let newcap = vcap * 2
     if (vcap == 0) {
       newcap = 1
     }
-    let bufIsRef = loadWord(h + slcIsRef)
     let nb = allocBuf(newcap, bufIsRef != 0, elemSize)
-    let old = loadWord(h + slcBuf)
     if (packed) {
-      copyBytes(nb, old + off * elemSize, vlen * elemSize)
+      copyBytes(nb, buf + off * elemSize, vlen * elemSize)
     } else {
       let i = 0
       while (i < vlen) {
-        let w = loadWord(old + (off + i) * 8)
+        let w = loadWord(buf + (off + i) * 8)
         storeWord(nb + i * 8, w)
         i = i + 1
       }
     }
-    storeWord(h + slcBuf, nb)
-    storeWord(h + slcOff, 0)
-    storeWord(h + slcCap, newcap)
+    buf = nb
     off = 0
+    vcap = newcap
   }
-  let buf = loadWord(h + slcBuf)
   if (packed) {
     if (elemSize == 1) {
       storeByte(buf + off + vlen, word)
@@ -398,8 +420,25 @@ export @nosplit @symbol("bit_rt_slice_append") fn rtSliceAppend(
   } else {
     storeWord(buf + (off + vlen) * 8, word)
   }
-  storeWord(h + slcLen, vlen + 1)
-  return h
+  // `hIn == 0`: `h` is the header `appendTarget` just allocated for THIS call
+  // alone, unreachable from anywhere else — safe to finish filling in place.
+  // `hIn != 0`: `h` is the caller's own header, already reachable through
+  // whatever binding named it, so a second live result (another `append`
+  // call on the same `hIn`, never reassigned in between) must not observe
+  // this call's growth through it. Clone instead (`rtSliceNew`/`rtSliceSlice`
+  // allocate the identical way).
+  let nh = h
+  if (hIn != 0) {
+    let g = wordAt(gcAddr)
+    let base = infoAddr
+    nh = gcAlloc(g, base + riSlice * 8)
+    storeWord(nh + slcIsRef, bufIsRef)
+  }
+  storeWord(nh + slcBuf, buf)
+  storeWord(nh + slcOff, off)
+  storeWord(nh + slcCap, vcap)
+  storeWord(nh + slcLen, vlen + 1)
+  return nh
 }
 
 // `bit_rt_slice_append_str`: appends a STRING'S BYTES to a `[]u8` in ONE call
@@ -421,13 +460,17 @@ export @nosplit @symbol("bit_rt_slice_append") fn rtSliceAppend(
 // reimplement that guard, which is exactly the shape `root.bit`'s funnel
 // comment says must not be sprinkled.
 //
-// SAME ALIASING CONTRACT AS `rtSliceAppend` (spec/LINT.md E0214): the header
-// is mutated IN PLACE and returned, so `b = append(b, s)` is observed through
-// every name bound to the same header, and a grow reallocates from the current
-// view and resets `off` to 0 — which un-aliases the two exactly where
-// `rtSliceAppend` un-aliases them. A null `hIn` goes through `appendTarget`
-// and comes back as a FRESH header, never a shared empty (`rtSliceAppend`
-// above records why a process-wide empty would be unsafe).
+// SAME FIX AS `rtSliceAppend` (#6092): a non-null `hIn` never has its own
+// header fields written — only a freshly cloned header carries the grown
+// `buf`/`off`/`cap`/`len`, so `hIn` (and any earlier `append` result built
+// from it) keeps reading its own length. The backing buffer can still be
+// shared on a fit-in-capacity append (SPEC §12.6's documented hazard), and a
+// grow still reallocates from the current view and resets `off` to 0. A null
+// `hIn` goes through `appendTarget` and comes back as a FRESH header, never a
+// shared empty (`rtSliceAppend` above records why a process-wide empty would
+// be unsafe); `n == 0` returns that same header unmodified, which is sound
+// for the identical reason — nothing has appended anything for anyone to
+// alias.
 //
 // GROWS ONCE, TO `max(2 * cap, len + n)`. `rtSliceAppend`'s doubling is
 // per-element and cannot serve here: a 4096-byte string into an empty slice
@@ -450,25 +493,34 @@ export @nosplit @symbol("bit_rt_slice_append_str") fn rtSliceAppendStr(hIn: int,
   let vlen = loadWord(h + slcLen)
   let vcap = loadWord(h + slcCap)
   let off = loadWord(h + slcOff)
+  let bufIsRef = loadWord(h + slcIsRef)
+  let buf = loadWord(h + slcBuf)
   let want = vlen + n
   if (want > vcap) {
     let newcap = vcap * 2
     if (newcap < want) {
       newcap = want
     }
-    let bufIsRef = loadWord(h + slcIsRef)
     let nb = allocBuf(newcap, bufIsRef != 0, 1)
-    let old = loadWord(h + slcBuf)
-    copyBytes(nb, old + off, vlen)
-    storeWord(h + slcBuf, nb)
-    storeWord(h + slcOff, 0)
-    storeWord(h + slcCap, newcap)
+    copyBytes(nb, buf + off, vlen)
+    buf = nb
     off = 0
+    vcap = newcap
   }
-  let buf = loadWord(h + slcBuf)
   copyBytes(buf + off + vlen, strBytes(s), n)
-  storeWord(h + slcLen, want)
-  return h
+  // Same clone-when-shared rule as `rtSliceAppend` — see its comment.
+  let nh = h
+  if (hIn != 0) {
+    let g = wordAt(gcAddr)
+    let base = infoAddr
+    nh = gcAlloc(g, base + riSlice * 8)
+    storeWord(nh + slcIsRef, bufIsRef)
+  }
+  storeWord(nh + slcBuf, buf)
+  storeWord(nh + slcOff, off)
+  storeWord(nh + slcCap, vcap)
+  storeWord(nh + slcLen, want)
+  return nh
 }
 
 // `bit_rt_slice_get`: bounds-checked element read. OUT OF RANGE PANICS (SPEC
