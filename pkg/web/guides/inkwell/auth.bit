@@ -22,14 +22,27 @@
 // below read back exactly what `login` wrote, with no dependency on the
 // broken path.
 import { conflict, forbidden, minLen, unauthorized } from "web"
-import { Lookup, LookupResult, Strategy, hashPassword, newPasswordStrategy } from "auth"
+import {
+  Identity, Lookup, LookupResult, OidcStrategy, Strategy, beginAuthorization, currentIdentity,
+  googleStrategy, handleCallback, hashPassword, newPasswordStrategy, requireAuth,
+} from "auth"
 import { UniqueViolation, classify } from "orm"
 import { jsonDecString, jsonGet } from "std/json"
 import { isSome, unwrap } from "std/core"
+import { SigningKey, VerifyKey, defaultClaimsOptions, sign, verifyToken } from "std/jwt"
+import { digest, encodeHex, newSha256, randomBytes, systemRoots } from "std/crypto"
+import { TrustStore as TlsTrustStore, newTlsConfig } from "std/tls"
+import { hasPrefix } from "std/strings"
 
 const adminRole = "admin"
 const sessionUserIdKey = "inkwell:userId"
 const sessionRoleKey = "inkwell:role"
+
+// #6131: bearer JWT access tokens (`POST /auth/token`) and opaque refresh
+// tokens (`POST /auth/token/refresh`), plus Sign in with Google.
+const bearerPrefix = "Bearer "
+const accessTokenTtlSeconds = 900
+const refreshTokenTtlSeconds = 30 * 24 * 3600
 
 // `pkg/auth`'s `Lookup` — the seam `newPasswordStrategy` calls with the
 // POST body's `username`, per pkg/auth/docs/getting-started.md.
@@ -111,12 +124,264 @@ fn showMe(c: Ctx, db: Data): Res! {
   return c.json(toPublicUser(u))
 }
 
-export fn mountAuth(app: App, db: Data) {
+// ---- bearer JWT access tokens + opaque refresh tokens (part 34-35) --------
+
+// The access token's claims: `sub` (RFC 7519 §4.1.2) is the user id, `role`
+// is this app's own authorization claim (the same one `userClaims` puts on
+// a session-based `Identity`), `iat`/`exp` (§4.1.4/.6) are what
+// `defaultClaimsOptions` checks on verify.
+fn accessTokenPayload(u: User, iat: int, exp: int): Json {
+  return Json.JsonObject(
+    [
+      JsonEntry{ key = "sub", value = Json.JsonString("${u.id}") },
+      JsonEntry{ key = "role", value = Json.JsonString(u.role) },
+      JsonEntry{ key = "iat", value = Json.JsonInt(iat) },
+      JsonEntry{ key = "exp", value = Json.JsonInt(exp) },
+    ],
+  )
+}
+
+fn issueAccessToken(u: User, jwtSecret: string): string! {
+  let nowSec = now().ns / Second
+  let payload = accessTokenPayload(u, nowSec, nowSec + accessTokenTtlSeconds)
+  return sign(SigningKey.Hs256Key([]byte(jwtSecret)), payload)?
+}
+
+// The `Strategy` `/api/*` is protected by: reads `Authorization: Bearer
+// <jwt>`, verifies it under `jwtSecret` (HS256), and returns an `Identity`
+// carrying the token's own claims — never touches `c.session()` itself
+// beyond what `requireAuth` (middleware.bit) already does for every
+// strategy.
+class BearerStrategy {
+  jwtSecret: string
+
+  export name(): string {
+    return "bearer"
+  }
+
+  export authenticate(c: Ctx): Identity! {
+    let header = c.header("Authorization")
+    if (!hasPrefix(header, bearerPrefix)) {
+      fail unauthorized()
+    }
+    let token = header[len(bearerPrefix):len(header)]
+    let opts = defaultClaimsOptions(now().ns / Second)
+    let payload = verifyToken(token, VerifyKey.Hs256Key([]byte(this.jwtSecret)), opts) catch _ {
+      fail unauthorized()
+    }
+    let subField = jsonGet(payload, "sub")
+    if (!isSome(subField)) {
+      fail unauthorized()
+    }
+    let sub = jsonDecString(unwrap(subField), "sub") catch _ {
+      fail unauthorized()
+    }
+    return Identity{ id = sub, claims = payload }
+  }
+}
+
+fn newBearerStrategy(jwtSecret: string): Strategy {
+  return BearerStrategy{ jwtSecret = jwtSecret }
+}
+
+export @json class TokenResponse {
+  accessToken: string,
+  refreshToken: string,
+  tokenType: string,
+  expiresIn: int,
+}
+
+// SHA-256 hex of a raw opaque token — "hashed at rest", never the token
+// itself, the same discipline `users.password_hash` already carries.
+// Looked up by exact match (a unique index on `token_hash`), not a
+// constant-time compare: the attacker-controlled input here is a whole
+// 256-bit token an index lookup either has or does not have, not a
+// byte-by-byte secret comparison the way a password check is.
+fn hashToken(raw: string): string {
+  return encodeHex(digest(newSha256(), []byte(raw)))
+}
+
+// 256 bits of CSPRNG output, hex-encoded — the same "high-entropy random
+// string" `oidc_authorize.bit`'s own PKCE `code_verifier` draws, sized for
+// a token nothing ever asks a human to type.
+fn newOpaqueToken(): string {
+  return encodeHex(randomBytes(32))
+}
+
+fn insertRefreshToken(db: Data, userId: i64, tokenHash: string, expiresAt: i64): ()! {
+  let cols = ["user_id", "token_hash", "expires_at", "rotated", "created_at"]
+  let args = [
+    Value.Int(userId), Value.Text(tokenHash), Value.Int(expiresAt), Value.Int(0),
+    Value.Int(now().ns),
+  ]
+  insertGeneratedId(db, "refresh_tokens", cols, args)?
+}
+
+class RefreshTokenRow {
+  id: i64,
+  userId: i64,
+  expiresAt: i64,
+  rotated: bool,
+}
+
+fn findRefreshTokenByHash(db: Data, tokenHash: string): RefreshTokenRow! {
+  let rows = db.query(
+    "select id, user_id, expires_at, rotated from refresh_tokens where token_hash = $1",
+    [Value.Text(tokenHash)],
+  )?
+  defer rows.close()
+  if (!rows.next()?) {
+    fail newError("no refresh token with that hash")
+  }
+  let cols = rows.columns()
+  return RefreshTokenRow{
+    id = sqlReqInt(rows, cols, "id")?, userId = sqlReqInt(rows, cols, "user_id")?,
+    expiresAt = sqlReqInt(rows, cols, "expires_at")?, rotated = sqlReqBool(rows, cols, "rotated")?,
+  }
+}
+
+fn markRefreshTokenRotated(db: Data, id: i64): ()! {
+  db.exec("update refresh_tokens set rotated = 1 where id = $1", [Value.Int(id)])?
+}
+
+// Issues an access token plus a fresh refresh token for `u`, storing the
+// refresh token's hash — the one place both `issueTokens` (login) and
+// `refreshTokenRoute` (rotation) build a `TokenResponse` from, so the two
+// can never drift.
+fn issueTokenPair(db: Data, u: User, jwtSecret: string): TokenResponse! {
+  let access = issueAccessToken(u, jwtSecret)?
+  let raw = newOpaqueToken()
+  let expiresAt = now().ns / Second + refreshTokenTtlSeconds
+  insertRefreshToken(db, u.id, hashToken(raw), expiresAt)?
+  return TokenResponse{
+    accessToken = access, refreshToken = raw, tokenType = "Bearer",
+    expiresIn = accessTokenTtlSeconds,
+  }
+}
+
+// `POST /auth/token`: the same `Strategy.authenticate(c)` `login` uses —
+// same `Credentials` body, same Argon2id check — but issues a bearer token
+// pair instead of a cookie session.
+fn issueTokens(c: Ctx, db: Data, strategy: Strategy, jwtSecret: string): Res! {
+  let identity = strategy.authenticate(c)?
+  let uid = parseId(identity.id)?
+  let u = findUserById(db, uid)?
+  return c.json(issueTokenPair(db, u, jwtSecret)?)
+}
+
+export @json class RefreshInput {
+  refreshToken: string,
+}
+
+// `POST /auth/token/refresh` (part 35): single-use rotation — a refresh
+// token already marked `rotated` is refused outright, closing the replay
+// window a stolen-and-reused refresh token would otherwise open.
+fn refreshTokenRoute(c: Ctx, db: Data, jwtSecret: string): Res! {
+  let input = c.body<RefreshInput>()?
+  let row = findRefreshTokenByHash(db, hashToken(input.refreshToken)) catch _ {
+    fail unauthorized("invalid refresh token")
+  }
+  if (row.rotated) {
+    fail unauthorized("refresh token already used")
+  }
+  if (now().ns / Second > row.expiresAt) {
+    fail unauthorized("refresh token expired")
+  }
+  markRefreshTokenRotated(db, row.id)?
+  let u = findUserById(db, row.userId)?
+  return c.json(issueTokenPair(db, u, jwtSecret)?)
+}
+
+fn showApiMe(c: Ctx, db: Data): Res! {
+  let identity = currentIdentity(c)?
+  let u = findUserById(db, parseId(identity.id)?)?
+  return c.json(toPublicUser(u))
+}
+
+// ---- Sign in with Google (part 36) ----------------------------------------
+
+fn googleConfigured(cfg: AppConfig): bool {
+  return len(cfg.googleClientId) > 0 &&
+    len(cfg.googleClientSecret) > 0 &&
+    len(cfg.googleRedirectUrl) > 0
+}
+
+// Built per-request rather than once at boot: `googleStrategy` calls
+// `discover()` over the network (oidc_discovery.bit), and building it once
+// would mean a boot-time dependency on Google being reachable, breaking
+// every other route on a transient DNS/network hiccup for a feature most
+// deployments of this course app leave disabled. `systemRoots()` (the OS CA
+// bundle) is the same secure-by-default `TlsConfig` construction
+// `pkg/postgres/adapter.bit` already uses.
+fn buildGoogleStrategy(cfg: AppConfig): OidcStrategy! {
+  // `systemRoots()` (std/crypto) and `newTlsConfig` (std/tls) declare two
+  // independent `TrustStore` classes of the identical shape — nominally
+  // distinct types this module bridges by copying `.roots` across, the same
+  // way `pkg/postgres/adapter.bit`'s own `trustRoots()` already does.
+  let sys = systemRoots()?
+  let tls = newTlsConfig(TlsTrustStore{ roots = sys.roots })
+  return googleStrategy(cfg.googleClientId, cfg.googleClientSecret, cfg.googleRedirectUrl, tls)?
+}
+
+fn googleBegin(c: Ctx, cfg: AppConfig): Res! {
+  if (!googleConfigured(cfg)) {
+    fail notFound()
+  }
+  return beginAuthorization(buildGoogleStrategy(cfg)?, c)?
+}
+
+// A Google `sub` this app has never seen signs in under a User row keyed by
+// its verified email — `passwordHash = ""` (never a valid Argon2id PHC
+// string, so `POST /auth/login` can never authenticate this row) marks the
+// account as "created via Google", never a real local password.
+fn findOrCreateGoogleUser(db: Data, email: string): User! {
+  return findUserByUsername(db, email) catch _ {
+    let u = User{
+      id = 0, username = email, email = email, passwordHash = "", role = "author", createdAt = 0,
+      updatedAt = 0,
+    }
+    return insertUser(db, u)?
+  }
+}
+
+// `handleCallback` (oidc_callback.bit) already verifies the ID token,
+// regenerates the session id and stores the `Identity` under pkg/auth's own
+// session key — this bridges that into THIS APP's own session convention
+// (`sessionUserIdKey`/`sessionRoleKey`), the same one `login` writes, so
+// `currentUserId`/`requireOwnerOrAdmin` work identically after a Google
+// sign-in as after a password one.
+fn googleCallback(c: Ctx, db: Data, cfg: AppConfig): Res! {
+  if (!googleConfigured(cfg)) {
+    fail notFound()
+  }
+  let identity = handleCallback(buildGoogleStrategy(cfg)?, c)?
+  let emailField = jsonGet(identity.claims, "email")
+  if (!isSome(emailField)) {
+    fail unauthorized("Google identity carries no 'email' claim")
+  }
+  let email = jsonDecString(unwrap(emailField), "identity.claims.email")?
+  let u = findOrCreateGoogleUser(db, email)?
+  let session = c.session()?
+  session.set(sessionUserIdKey, "${u.id}")
+  session.set(sessionRoleKey, u.role)
+  session.save()?
+  return c.noContent()
+}
+
+export fn mountAuth(app: App, db: Data, cfg: AppConfig) {
   let strategy = newPasswordStrategy(userLookup(db))
+  let bearer = newBearerStrategy(cfg.jwtSecret)
   app.post("/auth/register", (c) => register(c, db))
   app.post("/auth/login", (c) => login(c, strategy))
   app.post("/auth/logout", (c) => logout(c))
+  app.post("/auth/token", (c) => issueTokens(c, db, strategy, cfg.jwtSecret))
+  app.post("/auth/token/refresh", (c) => refreshTokenRoute(c, db, cfg.jwtSecret))
+  app.get("/auth/google", (c) => googleBegin(c, cfg))
+  app.get("/auth/google/callback", (c) => googleCallback(c, db, cfg))
   app.get("/me", (c) => showMe(c, db))
+  let api = app.group("/api")
+  api.use(requireAuth([bearer]))
+  api.get("/me", (c) => showApiMe(c, db))
 }
 
 // ---- authorization: read back the role/id `login` (above) stored ----
