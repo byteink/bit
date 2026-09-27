@@ -1,17 +1,774 @@
-// pkg/redis/zset.bit — `r.zset(key)`: the sorted-set handle. Epic
-// #6013, #6028: SCAFFOLD ONLY, no commands wired yet (`ZADD, ZSCORE, ZRANGE, ZREM`, a
-// follow-up ticket) — this file exists so later family tickets touch only
-// their own file, never `client.bit`. `cmd.bit`'s header is the template:
-// one `Cmd<T>` factory per command, called from a method here.
+// pkg/redis/zset.bit — `r.zset(key)`: every sorted-set command. Epic
+// #6013, #6028, #6029, #6033. The leaderboard is this package's own running
+// doc example (`docs/sorted-sets.md`): `r.zset("board").add("ada", 42.0)?`,
+// `r.zset("board").top(10)?`.
+//
+// `zsetcmd.bit` (same module, sibling file) holds every command's `Cmd<T>`
+// factory and this family's decode helpers — sorted sets have the largest
+// command surface of any family in this epic (~40 commands), and keeping
+// both halves in one file would cross spec/LINT.md's 800-line ceiling
+// (E0200); this file keeps the two public classes (`Zset`, `ZsetBatch`),
+// the small supporting types (`ZaddOptions`, `Bound<T>`, `Limit`,
+// `Aggregate`) and `ZsetScan`.
+//
+// `Zset` HOLDS `client: Client`, NOT `runner: Runner` — the ONE deliberate
+// deviation from `cmd.bit`'s HOW-TO/`counter.bit`'s reference shape in this
+// file, and the one this dispatch scoped to (report, not a shared-file
+// edit): wiring `runner: Runner` onto this family needs `client.bit`'s
+// `zset()` accessor and a `TxRead.zset` on `tx.bit` to change too (exactly
+// the two files #6029's own commit touched for `counter.bit`,
+// `git show --stat e1321ab5d`), and this ticket's own dispatch said touch
+// only the zset family's files. `Client.runCmd<T>` already does exactly
+// what `Runner.runCmd` would for a pool-backed handle, so every non-
+// blocking command below still reads `this.client.runCmd(cmd)` — only
+// `tx.read.zset(key)` is the capability this family is missing until a
+// follow-up rewires the accessor, and that follow-up is a one-line change
+// per family (`client.bit`'s `zset()`, `tx.bit`'s `TxRead`), not a redesign
+// here.
+//
+// TWO-METHOD SPLIT ON `ZADD`: `add(member, score)` is the plain call the
+// epic's spine shows verbatim, so it stays exactly 2 params. `addIf(member,
+// score, opts)` carries NX/XX/GT/LT/CH (`ZaddOptions`) as one options value,
+// not five more parameters on `add` itself — `bit check` rejects a
+// parameter's default value unless it is a constant literal (E0159; a bare
+// class literal, a negative number and an enum variant were all tried and
+// all refused — a compiler-verified constraint, not a style choice), so a
+// class-typed `opts: ZaddOptions = ZaddOptions{}` default cannot exist, and
+// five individual `bool` parameters plus `member`/`score` would be seven,
+// past spec/LINT.md's five-parameter ceiling (E0202). Splitting the method
+// keeps the common call two params and the flagged call one options value,
+// with no default anywhere the checker would refuse.
+//
+// `Limit` (BYSCORE/BYLEX's `LIMIT offset count`) is the same story: the
+// ticket's own `byScore(min, max, limit)` shape needs a THIRD parameter
+// named `limit`, and a `Limit` value cannot default either (same E0159), so
+// it is a required argument — `noLimit()`/`limitTo(n)` are the two calls a
+// caller actually needs, so the common case still reads as one extra
+// argument, not a bag of individually-defaulted numbers.
+//
+// `union`/`inter`/their STORE forms take `weights`/`aggregate` as required
+// arguments for the identical reason (`[]f64(0)`/`Aggregate.Sum` cannot
+// default either) — a caller with no weighting passes `[]f64(0)` and
+// `Aggregate.Sum` explicitly; both are ordinary call-site expressions, only
+// a parameter's OWN default is restricted.
+//
+// SCORES ENCODE/DECODE THROUGH RESP3 `Double` IN PRACTICE. This package
+// negotiates `HELLO 3` by default (`tx.bit`'s header), so every score-
+// bearing reply this file decodes (`ZSCORE`, `ZRANGE ... WITHSCORES`, ...)
+// arrives as `Reply.Double`, which `cmd.bit`'s `asDouble`/`asScored` already
+// handle correctly for `+inf`/`-inf` (`resp3.bit`'s `decodeDouble` parses
+// RESP3's `inf`/`-inf` wire spelling directly into the two infinities
+// before this file ever sees a `Reply`). The RESP2 bulk-string fallback
+// path for an infinite score (`cmd.bit`'s `doubleFromBulk`, built on the
+// predeclared `parseFloat`, which does NOT understand "inf" text —
+// `resp3.bit`'s own header says so) is a real, separate gap, but only
+// reachable over the RESP2 fallback this package does not negotiate by
+// default (#6027, still open, is where that fallback itself is tested) —
+// not fixed here, since `doubleFromBulk` lives in `cmd.bit`, a shared file
+// this dispatch is scoped away from; reported on the ticket instead.
+// `scoreArg` below (the ENCODE direction, this file's own code) emits
+// `+inf`/`-inf` explicitly for outgoing command args regardless of
+// protocol, since Redis parses those unconditionally on the way in.
+//
+// BLOCKING COMMANDS NEED A DEADLINE THE SHARED `Runner`/`Cmd<T>` HAS NO
+// HOOK FOR (list ticket #6031's own note, repeated here since it applies
+// identically): `BZPOPMIN`/`BZPOPMAX`/`BZMPOP` must not trip the pooled
+// connection's fixed `commandTimeout` while genuinely waiting up to their
+// OWN `timeout` argument. `Client.withConn<T>` (already exported,
+// `client.bit`) hands a caller the raw leased connection, so the four
+// blocking methods below bypass `this.client.runCmd` and call
+// `writeCommand`/`readOneReply` (`conn.bit`, module-visible, unexported)
+// directly with `timeout + commandTimeout` as the wire deadline — no
+// shared-file edit needed, since the per-call override lives entirely in
+// THIS file. `timeoutNs <= 0` ("block forever") explicitly clears the
+// connection's deadline first (`conn.setDeadline(0)`, `stdlib/net`'s own
+// "the zero value blocks like read, at most one hour" convention) rather
+// than relying on `writeCommand`'s own `timeoutNs > 0` guard, which leaves
+// whatever deadline a PRIOR command set in place instead of clearing it.
+// Queuing a blocking command through `ZsetBatch` still shares one `Cmd<T>`
+// factory with its immediate method (`cmd.bit`'s header, point 2) — queuing
+// does no I/O, so it has no deadline problem of its own — but running that
+// queued command still means `Pipeline.exec()`/`tx.bit`'s per-attempt wire
+// loop, both fixed to `client.opts.commandTimeout` for every command in the
+// batch. A blocking command queued into either one is bounded by that FIXED
+// timeout, not its own `timeout` argument — a real, known gap in those two
+// shared files, reported on the ticket rather than fixed here.
+
+// One member's ZADD flags — `NX`, `XX`, `GT` (`onlyIfHigher`), `LT`
+// (`onlyIfLower`) and `CH`, as one required argument to `addIf` (this
+// file's header explains why it cannot default and so is not folded into
+// `add` itself). Every field defaults to `false` on its own declaration —
+// `bool` is a literal default (E0159 allows it), so `ZaddOptions{
+// onlyIfHigher = true }` only ever needs to name the flags actually wanted.
+export class ZaddOptions {
+  export nx: bool = false,
+  export xx: bool = false,
+  export onlyIfHigher: bool = false,
+  export onlyIfLower: bool = false,
+  export ch: bool = false,
+}
+
+// `BYSCORE`/`BYLEX`'s `LIMIT offset count` — required on `byScore`/`byLex`/
+// their STORE forms (this file's header: a class-typed default cannot
+// exist). `noLimit()`/`limitTo(count)` cover the two calls a caller
+// actually needs; `Limit{ offset = ..., count = ... }` is there for the
+// rest. `count <= 0` OMITS the `LIMIT` clause entirely (`appendLimit`
+// below) rather than sending a literal `0`, since Redis's own `LIMIT`
+// requires BOTH numbers together and there is no other way to spell "no
+// limit" through this type — a caller who genuinely wants zero results
+// back is better served by not calling `byScore` at all.
+export class Limit { export offset: i64, export count: i64 }
+
+export fn noLimit(): Limit { return Limit{ offset = 0, count = 0 } }
+
+export fn limitTo(count: i64): Limit { return Limit{ offset = 0, count = count } }
+
+// One score-range endpoint (`BYSCORE`'s `min`/`max`) or one lex-range
+// endpoint (`BYLEX`'s), shared by both `Bound<f64>` and `Bound<string>`
+// instantiations — `scoreBoundArg`/`lexBoundArg` below are what turn one
+// into wire text, each choosing the right infinity spelling for its own
+// syntax ("+inf"/"-inf" for a score, "+"/"-" for a lex bound) from the
+// SAME `Unbounded` variant, so a caller never picks the wrong one by hand.
+export enum Bound<T> {
+  Inclusive(T),
+  Exclusive(T),
+  Unbounded,
+}
+
+// `ZUNION`/`ZINTER`'s `AGGREGATE` clause — Redis defaults to `SUM` when the
+// clause is omitted, so `appendAggregate` below skips it exactly for this
+// variant (never emitting a redundant `AGGREGATE SUM`).
+export enum Aggregate { Sum, Min, Max }
+
+fn aggregateName(a: Aggregate): string {
+  match (a) {
+    Sum => return "SUM"
+    Min => return "MIN"
+    Max => return "MAX"
+  }
+}
+
+// A score, as ZADD/ZINCRBY/WEIGHTS wire text. `"${score}"` (string
+// interpolation) already round-trips every finite `f64` exactly
+// (`pkg/yaml/encode.bit`'s own header documents the same Dragon4 engine);
+// the only gap is the two infinities, which interpolation does not spell
+// the way Redis parses incoming command text (`resp3.bit`'s own note: `"${
+// x}"`'s lowercase "inf" is not what any wire format here relies on), so
+// both are matched directly against the largest finite `f64`
+// (`stdlib/strings/format.bit`'s `formatFloat`'s own `maxFinite` technique,
+// mirrored here rather than reused, since that constant is function-local
+// there, not exported).
+fn scoreArg(score: f64): string {
+  let maxFinite = 1.7976931348623157e308
+  if (score > maxFinite) {
+    return "+inf"
+  }
+  if (score < 0.0 - maxFinite) {
+    return "-inf"
+  }
+  return "${score}"
+}
+
+fn scoreBoundArg(b: Bound<f64>, isMin: bool): string {
+  match (b) {
+    Inclusive(v) => return scoreArg(v)
+    Exclusive(v) => return "(" + scoreArg(v)
+    Unbounded => return scoreInfArg(isMin)
+  }
+}
+
+fn scoreInfArg(isMin: bool): string {
+  if (isMin) {
+    return "-inf"
+  }
+  return "+inf"
+}
+
+fn lexBoundArg(b: Bound<string>, isMin: bool): string {
+  match (b) {
+    Inclusive(v) => return "[" + v
+    Exclusive(v) => return "(" + v
+    Unbounded => return lexInfArg(isMin)
+  }
+}
+
+fn lexInfArg(isMin: bool): string {
+  if (isMin) {
+    return "-"
+  }
+  return "+"
+}
+
+// EVERY HELPER BELOW REASSIGNS ITS OWN SLICE PARAMETER (`args = append(args,
+// ...)`) AND THEN RETURNS THAT SAME NAME BARE, ON ITS OWN LINE — the one
+// shape spec/LINT.md's `append-aliasing` (E0214) recognizes as safely
+// handing a parameter's growth back to the caller; `return append(args,
+// ...)` directly (skipping the self-reassignment) is flagged just the same
+// as growing an unrelated local a parameter was only ever aliased into
+// (proved empirically, both tried and reported on this ticket). Any list
+// built up conditionally (a loop, a variable number of flags) is assembled
+// into its OWN fresh slice first (seeded `[]string(0)`/a literal, never
+// aliased to a parameter, so its own internal appends carry no aliasing
+// risk at all) and merged in with one spread `append`.
+fn appendKeys(args: []string, keys: []string): []string {
+  args = append(args, ...keys)
+  return args
+}
+
+fn appendWeights(args: []string, weights: []f64): []string {
+  if (len(weights) == 0) {
+    return args
+  }
+  args = append(args, ...weightsClause(weights))
+  return args
+}
+
+fn weightsClause(weights: []f64): []string {
+  let out = ["WEIGHTS"]
+  let i = 0
+  while (i < len(weights)) {
+    out = append(out, scoreArg(weights[i]))
+    i = i + 1
+  }
+  return out
+}
+
+fn appendAggregate(args: []string, aggregate: Aggregate): []string {
+  if (aggregate == Aggregate.Sum) {
+    return args
+  }
+  args = append(args, "AGGREGATE", aggregateName(aggregate))
+  return args
+}
+
+fn appendLimit(args: []string, limit: Limit): []string {
+  if (limit.count <= 0) {
+    return args
+  }
+  args = append(args, "LIMIT", "${limit.offset}", "${limit.count}")
+  return args
+}
+
+// `CMD key item [item ...]` — `ZMSCORE`/`ZREM`'s shared shape (one key,
+// then a variadic tail), distinct from `client.bit`'s own `withKeys` (which
+// has no leading key, just a repeated one for `DEL`/`EXISTS`).
+fn withKeyMembers(cmd: string, key: string, members: []string): []string {
+  let args = [cmd, key]
+  args = append(args, ...members)
+  return args
+}
+
+// `0 (n-1)` (ascending) or `0 (n-1) REV` (descending) is EMPTY, not the
+// whole set, exactly when `n <= 0`: Redis's stop index `-1` means "the
+// last element", so a naive `n - 1` for `n == 0` would ask for "0 to -1"
+// and get everything back. `1 0` (start > stop) is unconditionally empty
+// under Redis's own rank-range rule regardless of the set's real size.
+fn rankRangeBounds(n: i64): (string, string) {
+  if (n <= 0) {
+    return "1", "0"
+  }
+  return "0", "${n - 1}"
+}
+
+// The wire timeout for a blocking call: `0` ("block forever", this file's
+// header) or `blockTimeoutNs + cmdTimeoutNs` — the block's own budget plus
+// the connection's normal per-command allowance, so the socket-level
+// deadline can never fire before Redis's own `timeout` argument would.
+fn blockWireTimeout(blockTimeoutNs: int, cmdTimeoutNs: int): int {
+  if (blockTimeoutNs <= 0) {
+    return 0
+  }
+  return blockTimeoutNs + cmdTimeoutNs
+}
+
+// The blocking-command timeout argument: Redis wants seconds, fractional
+// when sub-second, `"0"` for "forever" — the exact convention this file's
+// own `timeoutNs <= 0` already follows, so a caller's `0` means the same
+// thing on both sides of the wire.
+fn blockTimeoutArg(timeoutNs: int): string {
+  if (timeoutNs <= 0) {
+    return "0"
+  }
+  return "${f64(timeoutNs) / f64(Second)}"
+}
+
+// Runs one blocking `Cmd<T>` immediately, over a connection leased just for
+// this call (`Client.withConn`), with the extended deadline this file's
+// header describes — `blockTimeoutNs <= 0` clears any deadline a PRIOR
+// command left on this connection before writing, rather than trusting
+// `writeCommand`'s own `timeoutNs > 0` guard to do it (it does not: it
+// only ever SETS a deadline, never clears a stale one).
+fn runBlockingCmd<T>(
+  conn: redisConn,
+  cmd: Cmd<T>,
+  blockTimeoutNs: int,
+  cmdTimeoutNs: int,
+): T!RedisError {
+  let wireTimeout = blockWireTimeout(blockTimeoutNs, cmdTimeoutNs)
+  if (blockTimeoutNs <= 0) {
+    conn.setDeadline(0)
+  }
+  writeCommand(conn, cmd.args, wireTimeout)?
+  let r = readOneReply(conn, wireTimeout)?
+  return cmd.decode(r)?
+}
+
+// The immediate handle: `r.zset(key)` (pool-backed). This file's header
+// explains why it holds `client: Client` rather than `runner: Runner`.
 export class Zset {
-  client: Client,
-  key: string,
+  client: Client
+  key: string
+
+  export add(member: string, score: f64): i64!RedisError {
+    return this.client.runCmd(addCmd(this.key, member, score, ZaddOptions{}))?
+  }
+
+  export addIf(member: string, score: f64, opts: ZaddOptions): i64!RedisError {
+    return this.client.runCmd(addCmd(this.key, member, score, opts))?
+  }
+
+  export addMany(...pairs: Scored): i64!RedisError {
+    return this.client.runCmd(addManyCmd(this.key, pairs))?
+  }
+
+  export incr(member: string, by: f64): f64!RedisError {
+    return this.client.runCmd(zaddIncrCmd(this.key, member, by))?
+  }
+
+  export incrBy(member: string, by: f64): f64!RedisError {
+    return this.client.runCmd(zincrByCmd(this.key, member, by))?
+  }
+
+  export score(member: string): Option<f64>!RedisError {
+    return this.client.runCmd(scoreCmd(this.key, member))?
+  }
+
+  export scores(...members: string): []Option<f64>!RedisError {
+    return this.client.runCmd(scoresCmd(this.key, members))?
+  }
+
+  export rank(member: string, fromTop: bool = true): Option<(i64, f64)>!RedisError {
+    return this.client.runCmd(rankCmd(this.key, member, fromTop))?
+  }
+
+  export card(): i64!RedisError {
+    return this.client.runCmd(cardCmd(this.key))?
+  }
+
+  export countByScore(min: Bound<f64>, max: Bound<f64>): i64!RedisError {
+    return this.client.runCmd(countByScoreCmd(this.key, min, max))?
+  }
+
+  export countByLex(min: Bound<string>, max: Bound<string>): i64!RedisError {
+    return this.client.runCmd(countByLexCmd(this.key, min, max))?
+  }
+
+  export top(n: i64): []Scored!RedisError {
+    return this.client.runCmd(rangeRankCmd(this.key, n, true))?
+  }
+
+  export bottom(n: i64): []Scored!RedisError {
+    return this.client.runCmd(rangeRankCmd(this.key, n, false))?
+  }
+
+  export byScore(min: Bound<f64>, max: Bound<f64>, limit: Limit): []Scored!RedisError {
+    return this.client.runCmd(rangeByScoreCmd(this.key, min, max, limit))?
+  }
+
+  export byLex(min: Bound<string>, max: Bound<string>, limit: Limit): []string!RedisError {
+    return this.client.runCmd(rangeByLexCmd(this.key, min, max, limit))?
+  }
+
+  export storeTop(dst: string, n: i64): i64!RedisError {
+    return this.client.runCmd(rangeStoreRankCmd(dst, this.key, n, true))?
+  }
+
+  export storeBottom(dst: string, n: i64): i64!RedisError {
+    return this.client.runCmd(rangeStoreRankCmd(dst, this.key, n, false))?
+  }
+
+  export storeByScore(dst: string, min: Bound<f64>, max: Bound<f64>, limit: Limit): i64!RedisError {
+    return this.client.runCmd(rangeStoreByScoreCmd(dst, this.key, min, max, limit))?
+  }
+
+  export storeByLex(
+    dst: string,
+    min: Bound<string>,
+    max: Bound<string>,
+    limit: Limit,
+  ): i64!RedisError {
+    return this.client.runCmd(rangeStoreByLexCmd(dst, this.key, min, max, limit))?
+  }
+
+  export remove(...members: string): i64!RedisError {
+    return this.client.runCmd(removeCmd(this.key, members))?
+  }
+
+  export removeByRank(start: i64, stop: i64): i64!RedisError {
+    return this.client.runCmd(removeByRankCmd(this.key, start, stop))?
+  }
+
+  export removeByScore(min: Bound<f64>, max: Bound<f64>): i64!RedisError {
+    return this.client.runCmd(removeByScoreCmd(this.key, min, max))?
+  }
+
+  export removeByLex(min: Bound<string>, max: Bound<string>): i64!RedisError {
+    return this.client.runCmd(removeByLexCmd(this.key, min, max))?
+  }
+
+  export popMin(count: i64 = 1): []Scored!RedisError {
+    return this.client.runCmd(popMinCmd(this.key, count))?
+  }
+
+  export popMax(count: i64 = 1): []Scored!RedisError {
+    return this.client.runCmd(popMaxCmd(this.key, count))?
+  }
+
+  export popMinMany(count: i64 = 1): []Scored!RedisError {
+    return this.client.runCmd(popMinManyCmd(this.key, count))?
+  }
+
+  export popMaxMany(count: i64 = 1): []Scored!RedisError {
+    return this.client.runCmd(popMaxManyCmd(this.key, count))?
+  }
+
+  // This file's header: bypasses `runCmd` for the extended per-call
+  // deadline a blocking command needs.
+  export blockPopMin(timeoutNs: int): Option<Scored>!RedisError {
+    let cmd = blockPopMinCmd(this.key, timeoutNs)
+    return this.client.withConn<Option<Scored>>((conn) => {
+      return runBlockingCmd<Option<Scored>>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
+    })?
+  }
+
+  export blockPopMax(timeoutNs: int): Option<Scored>!RedisError {
+    let cmd = blockPopMaxCmd(this.key, timeoutNs)
+    return this.client.withConn<Option<Scored>>((conn) => {
+      return runBlockingCmd<Option<Scored>>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
+    })?
+  }
+
+  export blockPopMinMany(count: i64, timeoutNs: int): []Scored!RedisError {
+    let cmd = blockPopMinManyCmd(this.key, count, timeoutNs)
+    return this.client.withConn<[]Scored>((conn) => {
+      return runBlockingCmd<[]Scored>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
+    })?
+  }
+
+  export blockPopMaxMany(count: i64, timeoutNs: int): []Scored!RedisError {
+    let cmd = blockPopMaxManyCmd(this.key, count, timeoutNs)
+    return this.client.withConn<[]Scored>((conn) => {
+      return runBlockingCmd<[]Scored>(conn, cmd, timeoutNs, this.client.opts.commandTimeout)?
+    })?
+  }
+
+  export union(otherKeys: []string, weights: []f64, aggregate: Aggregate): []Scored!RedisError {
+    return this.client.runCmd(unionCmd(this.key, otherKeys, weights, aggregate))?
+  }
+
+  export inter(otherKeys: []string, weights: []f64, aggregate: Aggregate): []Scored!RedisError {
+    return this.client.runCmd(interCmd(this.key, otherKeys, weights, aggregate))?
+  }
+
+  export diff(otherKeys: []string): []Scored!RedisError {
+    return this.client.runCmd(diffCmd(this.key, otherKeys))?
+  }
+
+  export unionStore(
+    dst: string,
+    otherKeys: []string,
+    weights: []f64,
+    aggregate: Aggregate,
+  ): i64!RedisError {
+    return this.client.runCmd(unionStoreCmd(dst, this.key, otherKeys, weights, aggregate))?
+  }
+
+  export interStore(
+    dst: string,
+    otherKeys: []string,
+    weights: []f64,
+    aggregate: Aggregate,
+  ): i64!RedisError {
+    return this.client.runCmd(interStoreCmd(dst, this.key, otherKeys, weights, aggregate))?
+  }
+
+  export diffStore(dst: string, otherKeys: []string): i64!RedisError {
+    return this.client.runCmd(diffStoreCmd(dst, this.key, otherKeys))?
+  }
+
+  export randMember(): Option<string>!RedisError {
+    return this.client.runCmd(randMemberCmd(this.key))?
+  }
+
+  export randMembers(count: i64): []Scored!RedisError {
+    return this.client.runCmd(randMembersCmd(this.key, count))?
+  }
+
+  // `ZSCAN`, lazily — no queued counterpart on `ZsetBatch`: a cursor
+  // iterator holds state across several round trips of its own, which does
+  // not fit `Batch`'s "one queued command, one reply" shape at all
+  // (`keys.bit`'s own scaffold note makes the identical call for `SCAN`).
+  export scan(): ZsetScan {
+    return ZsetScan{
+      client = this.client,
+      key = this.key,
+      cursor = "0",
+      buf = []Scored(0),
+      idx = 0,
+      done = false,
+      lastErr = Option.None,
+    }
+  }
 }
 
 // The queued view `Pipeline.zset`/`Tx.zset` both return — `cmd.bit`'s
-// `Batch` is the ONE client-side queue the two executors share, so this
-// is the ONLY queued view Zset needs (`cmd.bit`'s header, point 2).
+// `Batch` is the ONE client-side queue the two executors share (`cmd.bit`'s
+// header, point 2). A queued blocking command still shares its `Cmd<T>`
+// factory with its immediate counterpart above; this file's header names
+// the real gap in running one through `Pipeline`/`Tx` later.
 export class ZsetBatch {
-  batch: Batch,
-  key: string,
+  batch: Batch
+  key: string
+
+  export add(member: string, score: f64): Future<i64> {
+    return this.batch.queue(addCmd(this.key, member, score, ZaddOptions{}))
+  }
+
+  export addIf(member: string, score: f64, opts: ZaddOptions): Future<i64> {
+    return this.batch.queue(addCmd(this.key, member, score, opts))
+  }
+
+  export addMany(...pairs: Scored): Future<i64> {
+    return this.batch.queue(addManyCmd(this.key, pairs))
+  }
+
+  export incr(member: string, by: f64): Future<f64> {
+    return this.batch.queue(zaddIncrCmd(this.key, member, by))
+  }
+
+  export incrBy(member: string, by: f64): Future<f64> {
+    return this.batch.queue(zincrByCmd(this.key, member, by))
+  }
+
+  export score(member: string): Future<Option<f64>> {
+    return this.batch.queue(scoreCmd(this.key, member))
+  }
+
+  export scores(...members: string): Future<[]Option<f64>> {
+    return this.batch.queue(scoresCmd(this.key, members))
+  }
+
+  export rank(member: string, fromTop: bool = true): Future<Option<(i64, f64)>> {
+    return this.batch.queue(rankCmd(this.key, member, fromTop))
+  }
+
+  export card(): Future<i64> { return this.batch.queue(cardCmd(this.key)) }
+
+  export countByScore(min: Bound<f64>, max: Bound<f64>): Future<i64> {
+    return this.batch.queue(countByScoreCmd(this.key, min, max))
+  }
+
+  export countByLex(min: Bound<string>, max: Bound<string>): Future<i64> {
+    return this.batch.queue(countByLexCmd(this.key, min, max))
+  }
+
+  export top(n: i64): Future<[]Scored> { return this.batch.queue(rangeRankCmd(this.key, n, true)) }
+
+  export bottom(n: i64): Future<[]Scored> {
+    return this.batch.queue(rangeRankCmd(this.key, n, false))
+  }
+
+  export byScore(min: Bound<f64>, max: Bound<f64>, limit: Limit): Future<[]Scored> {
+    return this.batch.queue(rangeByScoreCmd(this.key, min, max, limit))
+  }
+
+  export byLex(min: Bound<string>, max: Bound<string>, limit: Limit): Future<[]string> {
+    return this.batch.queue(rangeByLexCmd(this.key, min, max, limit))
+  }
+
+  export storeTop(dst: string, n: i64): Future<i64> {
+    return this.batch.queue(rangeStoreRankCmd(dst, this.key, n, true))
+  }
+
+  export storeBottom(dst: string, n: i64): Future<i64> {
+    return this.batch.queue(rangeStoreRankCmd(dst, this.key, n, false))
+  }
+
+  export storeByScore(dst: string, min: Bound<f64>, max: Bound<f64>, limit: Limit): Future<i64> {
+    return this.batch.queue(rangeStoreByScoreCmd(dst, this.key, min, max, limit))
+  }
+
+  export storeByLex(
+    dst: string,
+    min: Bound<string>,
+    max: Bound<string>,
+    limit: Limit,
+  ): Future<i64> {
+    return this.batch.queue(rangeStoreByLexCmd(dst, this.key, min, max, limit))
+  }
+
+  export remove(...members: string): Future<i64> {
+    return this.batch.queue(removeCmd(this.key, members))
+  }
+
+  export removeByRank(start: i64, stop: i64): Future<i64> {
+    return this.batch.queue(removeByRankCmd(this.key, start, stop))
+  }
+
+  export removeByScore(min: Bound<f64>, max: Bound<f64>): Future<i64> {
+    return this.batch.queue(removeByScoreCmd(this.key, min, max))
+  }
+
+  export removeByLex(min: Bound<string>, max: Bound<string>): Future<i64> {
+    return this.batch.queue(removeByLexCmd(this.key, min, max))
+  }
+
+  export popMin(count: i64 = 1): Future<[]Scored> {
+    return this.batch.queue(popMinCmd(this.key, count))
+  }
+
+  export popMax(count: i64 = 1): Future<[]Scored> {
+    return this.batch.queue(popMaxCmd(this.key, count))
+  }
+
+  export popMinMany(count: i64 = 1): Future<[]Scored> {
+    return this.batch.queue(popMinManyCmd(this.key, count))
+  }
+
+  export popMaxMany(count: i64 = 1): Future<[]Scored> {
+    return this.batch.queue(popMaxManyCmd(this.key, count))
+  }
+
+  export blockPopMin(timeoutNs: int): Future<Option<Scored>> {
+    return this.batch.queue(blockPopMinCmd(this.key, timeoutNs))
+  }
+
+  export blockPopMax(timeoutNs: int): Future<Option<Scored>> {
+    return this.batch.queue(blockPopMaxCmd(this.key, timeoutNs))
+  }
+
+  export blockPopMinMany(count: i64, timeoutNs: int): Future<[]Scored> {
+    return this.batch.queue(blockPopMinManyCmd(this.key, count, timeoutNs))
+  }
+
+  export blockPopMaxMany(count: i64, timeoutNs: int): Future<[]Scored> {
+    return this.batch.queue(blockPopMaxManyCmd(this.key, count, timeoutNs))
+  }
+
+  export union(otherKeys: []string, weights: []f64, aggregate: Aggregate): Future<[]Scored> {
+    return this.batch.queue(unionCmd(this.key, otherKeys, weights, aggregate))
+  }
+
+  export inter(otherKeys: []string, weights: []f64, aggregate: Aggregate): Future<[]Scored> {
+    return this.batch.queue(interCmd(this.key, otherKeys, weights, aggregate))
+  }
+
+  export diff(otherKeys: []string): Future<[]Scored> {
+    return this.batch.queue(diffCmd(this.key, otherKeys))
+  }
+
+  export unionStore(
+    dst: string,
+    otherKeys: []string,
+    weights: []f64,
+    aggregate: Aggregate,
+  ): Future<i64> {
+    return this.batch.queue(unionStoreCmd(dst, this.key, otherKeys, weights, aggregate))
+  }
+
+  export interStore(
+    dst: string,
+    otherKeys: []string,
+    weights: []f64,
+    aggregate: Aggregate,
+  ): Future<i64> {
+    return this.batch.queue(interStoreCmd(dst, this.key, otherKeys, weights, aggregate))
+  }
+
+  export diffStore(dst: string, otherKeys: []string): Future<i64> {
+    return this.batch.queue(diffStoreCmd(dst, this.key, otherKeys))
+  }
+
+  export randMember(): Future<Option<string>> { return this.batch.queue(randMemberCmd(this.key)) }
+
+  export randMembers(count: i64): Future<[]Scored> {
+    return this.batch.queue(randMembersCmd(this.key, count))
+  }
 }
+
+// One `ZSCAN` page — the cursor to ask for next, and this page's own
+// member/score pairs. Internal: `ZsetScan.fill` below is the only caller.
+export class ZscanPage { export cursor: string, export items: []Scored }
+
+// `r.zset(key).scan()`'s lazy cursor — `next(): Option<Scored>` satisfies
+// Bit's `for x of` iterator protocol (`docs/reference/iterator-trait.md`,
+// `_tests_/bit/forofiterator.bit`) with the shape that test file exercises:
+// UNFALLIBLE. A `ZSCAN` round trip CAN fail (`RedisError`), so a failure
+// stops the iteration (`next()` returns `Option.None`, same as a genuinely
+// exhausted cursor) and is kept on `lastErr` for `err()` to report after
+// the loop — the same "check the error after the loop" contract Go's own
+// `Rows`/`Scanner` use, rather than making `next()` itself fallible and
+// risking the untested `for x of` + fallible-`next()` combination this
+// package has no need to be the first caller of.
+export class ZsetScan {
+  client: Client
+  key: string
+  cursor: string
+  buf: []Scored
+  idx: int
+  done: bool
+  lastErr: Option<RedisError>
+
+  export next(): Option<Scored> {
+    while (true) {
+      if (this.idx < len(this.buf)) {
+        let v = this.buf[this.idx]
+        this.idx = this.idx + 1
+        return Option.Some(v)
+      }
+      if (this.done) {
+        return Option.None
+      }
+      if (!this.fill()) {
+        return Option.None
+      }
+    }
+  }
+
+  // The error the last failed `ZSCAN` round trip raised, or `Option.None`
+  // when the iteration simply ran out of elements.
+  export err(): Option<RedisError> {
+    return this.lastErr
+  }
+
+  // `runZscan` below, not `this.client.runCmd(...)` inline, is the real
+  // gap: a `catch e { ... }` binder on a METHOD call (`this.client.runCmd`)
+  // types `e` as the generic `error` interface, not the method's own
+  // declared `RedisError` — proved with a two-line repro (a non-generic,
+  // concrete-fallible method call, no `Cmd<T>`/`ZsetScan` involved at all)
+  // in the ticket's own report; the identical `catch e` on a FREE FUNCTION
+  // call infers the concrete type correctly. Not fixable here (it is the
+  // checker's method-call inference, not this file), so `fill` calls
+  // through a free function instead, which sidesteps it entirely.
+  fill(): bool {
+    let page = runZscan(this.client, this.key, this.cursor) catch e {
+      this.lastErr = Option.Some(e)
+      this.done = true
+      return false
+    }
+    this.cursor = page.cursor
+    this.buf = page.items
+    this.idx = 0
+    if (this.cursor == "0") {
+      this.done = true
+    }
+    return true
+  }
+}
+
+// `ZsetScan.fill`'s free-function workaround for the `catch e` method-call
+// inference gap this file's header/comment above describes.
+fn runZscan(client: Client, key: string, cursor: string): ZscanPage!RedisError {
+  return client.runCmd(zscanCmd(key, cursor))?
+}
+
