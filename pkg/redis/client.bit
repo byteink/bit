@@ -72,61 +72,168 @@ export class Client {
     return r
   }
 
+  // Runs `cmd` now (#6028's `Cmd<T>` — see `cmd.bit`'s header), picking the
+  // same retry policy `command()`/`readCommand()` always have from
+  // `cmd.readOnly`. The immediate half of the one-command-definition-per-
+  // family contract; `Pipeline.queue`/`Tx.queue` are the queued halves.
+  export runCmd<T>(cmd: Cmd<T>): T!RedisError {
+    if (cmd.readOnly) {
+      let r = this.readCommand(cmd.args)?
+      return cmd.decode(r)?
+    }
+    let r = this.command(cmd.args)?
+    return cmd.decode(r)?
+  }
+
+  // Runs `f` over one leased connection, releasing it exactly once `f`
+  // returns or fails — for a caller that needs more than one round trip on
+  // the SAME physical connection before releasing it (`pipeline.bit`'s
+  // batch, `tx.bit`'s WATCH/MULTI/.../EXEC). Never retried: with more than
+  // one command in flight there is no single command to safely replay.
+  export withConn<T>(f: (redisConn) => T!RedisError): T!RedisError {
+    let lease = this.pool.acquire() catch e {
+      fail RedisError.Io(e.message())
+    }
+    let v = f(lease.value) catch e {
+      this.pool.release(lease, !connectionBad(e))
+      fail e
+    }
+    this.lastAttrs = lease.value.lastAttrs
+    this.pool.release(lease, true)
+    return v
+  }
+
   // A cache miss decodes to `Option.None`, never `Option.Some("")` — the null
   // vs. empty distinction `resp.bit`'s `decodeBulk` exists to preserve, carried
   // all the way through to this package's own public API.
   export get(key: string): Option<string>!RedisError {
-    let r = this.readCommand(["GET", key])?
-    match (r) {
-      Bulk(v) => return v
-      // RESP3: a missing key's GET reply is the unified `_` null
-      // (`Reply.Null`), not RESP2's `$-1\r\n` (`Reply.Bulk(Option.None)`) —
-      // proved against a real Redis 8 server (#6022's live gate), not
-      // assumed. Both mean the same thing here: no value.
-      Null => return Option.None
-      _ => fail RedisError.Unexpected("GET", shapeName(r))
-    }
+    return this.runCmd(getCmd(key))?
   }
 
   export set(key: string, value: string): ()!RedisError {
-    let r = this.command(["SET", key, value])?
-    match (r) {
-      Simple(_) => return
-      _ => fail RedisError.Unexpected("SET", shapeName(r))
-    }
+    return this.runCmd(setCmd(key, value))?
   }
 
   export del(keys: []string): i64!RedisError {
-    let r = this.command(withKeys("DEL", keys))?
-    match (r) {
-      Int(n) => return n
-      _ => fail RedisError.Unexpected("DEL", shapeName(r))
-    }
+    return this.runCmd(delCmd(keys))?
   }
 
   export exists(keys: []string): i64!RedisError {
-    let r = this.readCommand(withKeys("EXISTS", keys))?
-    match (r) {
-      Int(n) => return n
-      _ => fail RedisError.Unexpected("EXISTS", shapeName(r))
-    }
+    return this.runCmd(existsCmd(keys))?
   }
 
   export expire(key: string, seconds: i64): bool!RedisError {
-    let r = this.command(["EXPIRE", key, "${seconds}"])?
-    match (r) {
-      Int(n) => return n != 0
-      _ => fail RedisError.Unexpected("EXPIRE", shapeName(r))
-    }
+    return this.runCmd(expireCmd(key, seconds))?
   }
 
   export ping(): string!RedisError {
-    let r = this.readCommand(["PING"])?
-    match (r) {
-      Simple(s) => return s
-      Bulk(v) => return unwrapOr(v, "")
-      _ => fail RedisError.Unexpected("PING", shapeName(r))
+    return this.runCmd(pingCmd())?
+  }
+
+  // `let p = r.pipeline(); let b = p.counter("n").incr(); p.exec()?;
+  // b.get()?` — an empty batch, ready to `queue` into (`pipeline.bit`).
+  export pipeline(): Pipeline {
+    return Pipeline{
+      client = this,
+      box = resultBox{ replies = []Reply(0), ready = false },
+      queued = [][]string(0),
     }
+  }
+
+  // `r.transaction(["balance"], (tx) => { tx.set(...)? })` — WATCH every
+  // key, MULTI, run `body` to queue commands server-side, EXEC; retried on
+  // a nil EXEC (a WATCHed key changed) up to a bounded count (`tx.bit`).
+  export transaction(keys: []string, body: (Tx) => ()!RedisError): ()!RedisError {
+    return runTransaction(this, keys, body)?
+  }
+
+  // One typed handle accessor per data-type family (epic #6013's SPINE),
+  // each a cheap value over `this` and the key — every family file is
+  // scaffold-only today (#6028); a follow-up ticket per family adds its
+  // commands, following `cmd.bit`'s header.
+  export str(key: string): Str { return Str{ client = this, key = key } }
+  export counter(key: string): Counter { return Counter{ client = this, key = key } }
+  export keys(): Keys { return Keys{ client = this } }
+  export hash(key: string): Hash { return Hash{ client = this, key = key } }
+  export list(key: string): List { return List{ client = this, key = key } }
+  // `sset`, not `set` — `Client.set` is already the plain string `SET`
+  // command (epic #6013's SPINE), and Bit has no overloading (#6014's
+  // probes) to let both share a name.
+  export sset(key: string): Set { return Set{ client = this, key = key } }
+  export zset(key: string): Zset { return Zset{ client = this, key = key } }
+  export stream(key: string): Stream { return Stream{ client = this, key = key } }
+  export geo(key: string): Geo { return Geo{ client = this, key = key } }
+  export hll(key: string): Hll { return Hll{ client = this, key = key } }
+  export bitmap(key: string): Bitmap { return Bitmap{ client = this, key = key } }
+  export json(key: string): Json { return Json{ client = this, key = key } }
+  export timeseries(key: string): TimeSeries { return TimeSeries{ client = this, key = key } }
+  export bloom(key: string): Bloom { return Bloom{ client = this, key = key } }
+  export vset(key: string): VectorSet { return VectorSet{ client = this, key = key } }
+  export array(key: string): Arr { return Arr{ client = this, key = key } }
+}
+
+// The six commands `Client` exposed before #6028, now each a `Cmd<T>`
+// factory — `cmd.bit`'s header is the template every data-type family
+// follows. `Pipeline`/`Tx` share these same factories (`pipeline.bit`,
+// `tx.bit`), so a pipelined/transacted `GET`/`SET`/... decodes identically
+// to Client's own.
+
+fn getCmd(key: string): Cmd<Option<string>> {
+  return Cmd<Option<string>>{
+    args = ["GET", key],
+    decode = (r) => asOptString(r, "GET"),
+    readOnly = true,
+  }
+}
+
+// `SET`'s reply is always `Simple("OK")` — `asOk` lives here rather than
+// among `cmd.bit`'s shared decode helpers because no other command shares
+// its "discard a bare OK" shape yet.
+fn asOk(r: Reply, cmd: string): ()!RedisError {
+  match (r) {
+    Simple(_) => return
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn setCmd(key: string, value: string): Cmd<()> {
+  return Cmd<()>{ args = ["SET", key, value], decode = (r) => asOk(r, "SET"), readOnly = false }
+}
+
+fn delCmd(keys: []string): Cmd<i64> {
+  return Cmd<i64>{ args = withKeys("DEL", keys), decode = (r) => asInt(r, "DEL"), readOnly = false }
+}
+
+fn existsCmd(keys: []string): Cmd<i64> {
+  return Cmd<i64>{
+    args = withKeys("EXISTS", keys),
+    decode = (r) => asInt(r, "EXISTS"),
+    readOnly = true,
+  }
+}
+
+fn expireCmd(key: string, seconds: i64): Cmd<bool> {
+  return Cmd<bool>{
+    args = ["EXPIRE", key, "${seconds}"],
+    decode = (r) => asBool(r, "EXPIRE"),
+    readOnly = false,
+  }
+}
+
+// `PING`'s reply is `Simple` normally, `Bulk` when it carries a message
+// argument (unused here) — a shape none of `cmd.bit`'s shared helpers
+// matches, so it stays a short inline closure per that file's own guidance.
+fn pingCmd(): Cmd<string> {
+  return Cmd<string>{
+    args = ["PING"],
+    decode = (r) => {
+      match (r) {
+        Simple(s) => return s
+        Bulk(v) => return unwrapOr(v, "")
+        _ => fail RedisError.Unexpected("PING", shapeName(r))
+      }
+    },
+    readOnly = true,
   }
 }
 

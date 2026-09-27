@@ -1,0 +1,246 @@
+// pkg/redis/cmd.bit — `Cmd<T>`: one command, defined once, shared by
+// `Client` (runs it now), `Pipeline` (queues it, hands back a `Future<T>`)
+// and `Tx` (queues it inside MULTI). Epic #6013, #6028.
+//
+// HOW A FAMILY ADDS A COMMAND (read this before writing a family file):
+// write ONE factory function that builds a `Cmd<T>`, e.g.
+//
+//   fn incrCmd(key: string): Cmd<i64> {
+//     return Cmd<i64>{ args = ["INCR", key], decode = (r) => asInt(r, "INCR"), readOnly = false }
+//   }
+//
+// `args` is the wire command; `decode` turns the raw `Reply` into the typed
+// result or fails `RedisError.Unexpected` — reuse one of this file's decode
+// helpers (`asInt`, `asOptString`, `asBool`, `asDouble`, `asStrings`,
+// `asMap`, `asScored`) when the reply shape fits, or write a short inline
+// closure when it does not (`client.bit`'s `pingCmd` is the example: PING's
+// reply is `Simple` OR `Bulk`, a shape none of the shared helpers matches).
+// `readOnly` picks the retry policy `Client.runCmd` uses — true only for a
+// command that is safe to run twice (a read; never `SET`, `INCR`, ...).
+//
+// Then give the family's handle class ONE method per command that calls
+// `client.runCmd(cmd)` (Client — immediate), and, once a family needs
+// pipeline/transaction support too, a matching method on a queued view that
+// calls `pipeline.queue(cmd)` (a `Future<T>`) or `tx.queue(cmd)` (queued
+// server-side, no typed result until `EXEC` commits — see `tx.bit`'s
+// header). The command definition — `args` and `decode` — is written
+// exactly once either way.
+//
+// WHY NOT ONE HANDLE CLASS GENERIC OVER "THE EXECUTOR": prototyped first
+// (recorded on #6013) and rejected — `Client.runCmd` must return `T`
+// directly (the spine's `r.counter("n").incr()?` is `i64` NOW), while
+// `Pipeline`/`Tx` must return `Future<T>`/`()` instead. Bit has no
+// higher-kinded types (#6014's probes, confirmed again here), so a single
+// generic method cannot flip its OWN return type between `T` and `Future<T>`
+// depending on which executor it closed over — the two shapes need two
+// methods. `Cmd<T>` is the piece that stays shared: only the thin call
+// (`runCmd`/`queue`) differs per executor, never the command's own
+// definition.
+
+// One command: the wire form and how to decode its reply. `T` is the
+// decoded result's type — never itself fallible; a decode failure is
+// reported through `RedisError`, same as every other command failure.
+export class Cmd<T> {
+  export args: []string,
+  export decode: (Reply) => T!RedisError,
+  export readOnly: bool,
+}
+
+// A batch's shared result slot: empty until `Pipeline.exec`/the owning
+// transaction attempt fills it, read by every `Future<T>` handed out before
+// that happened. A plain class (a reference type, SPEC §13.3) rather than a
+// mutable local a closure would capture — `Future<T>` instances created at
+// different `queue` calls all need to observe the SAME fill, after the fact.
+class resultBox {
+  replies: []Reply,
+  ready: bool,
+}
+
+// The result of one command queued into a `Pipeline` — see `pipeline.bit`.
+// Worthless before `exec()` runs (`get()` fails `RedisError.Closed`, the
+// same variant a caller-error would if there were nothing better named for
+// it); reads `box.replies[index]` and decodes it afterward, exactly once
+// per call, never cached, since the replies slice itself is filled once and
+// then immutable.
+export class Future<T> {
+  box: resultBox
+  index: int
+  decode: (Reply) => T!RedisError
+  export get(): T!RedisError {
+    if (!this.box.ready) {
+      fail RedisError.Closed
+    }
+    return this.decode(this.box.replies[this.index])?
+  }
+}
+
+// One member/score pair — `ZRANGE ... WITHSCORES` and friends, decoded by
+// `asScored` below. Field order matches the spine's `[]Scored{member,
+// score}` (epic #6013's API SPINE block).
+export class Scored { export member: string, export score: f64 }
+
+// A `Reply.Bulk`/`Reply.Simple` as a plain string — every decode helper
+// below that reads a string out of an aggregate goes through this, so
+// "what counts as a string reply" is answered in exactly one place. A null
+// bulk element (RESP2's sparse-array convention) becomes `""` rather than
+// failing — Redis returns those inside an array `RedisError.Unexpected`
+// would otherwise refuse to decode at all.
+fn replyToString(r: Reply, cmd: string): string!RedisError {
+  match (r) {
+    Bulk(v) => return unwrapOr(v, "")
+    Simple(s) => return s
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// `Reply.Int` as `i64` — `INCR`, `DEL`, `EXISTS`, and most other integer-
+// reply commands.
+export fn asInt(r: Reply, cmd: string): i64!RedisError {
+  match (r) {
+    Int(n) => return n
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// `Reply.Bulk`/`Reply.Null` as `Option<string>` — the null-vs-empty
+// distinction `resp.bit`'s header exists to preserve, carried through to
+// every command whose reply is "a string, or nothing" (`GET` and its kin).
+export fn asOptString(r: Reply, cmd: string): Option<string>!RedisError {
+  match (r) {
+    Bulk(v) => return v
+    Null => return Option.None
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// `Reply.Int` (RESP2's `0`/`1` convention) or `Reply.Bool` (RESP3) as a
+// `bool` — `EXPIRE`, `SISMEMBER`, and other predicate commands.
+export fn asBool(r: Reply, cmd: string): bool!RedisError {
+  match (r) {
+    Int(n) => return n != 0
+    Bool(b) => return b
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+// `Reply.Double` (RESP3) or a `Reply.Bulk` decimal string (RESP2's
+// convention for `ZSCORE` and friends) as `f64`.
+export fn asDouble(r: Reply, cmd: string): f64!RedisError {
+  match (r) {
+    Double(v) => return v
+    Bulk(v) => return doubleFromBulk(v, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn doubleFromBulk(v: Option<string>, cmd: string): f64!RedisError {
+  let s = unwrapOr(v, "")
+  let f = parseFloat(s)
+  if (f != f) {
+    fail RedisError.Unexpected(cmd, "Bulk")
+  }
+  return f
+}
+
+// `Reply.Array` of bulk/simple strings as `[]string` — `LRANGE`, `SMEMBERS`,
+// and other list-of-strings replies. A null array decodes to the empty
+// slice, same convention `resp.bit`'s own null-vs-empty note describes.
+export fn asStrings(r: Reply, cmd: string): []string!RedisError {
+  match (r) {
+    Array(items) => return stringsFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn stringsFromOpt(items: Option<[]Reply>, cmd: string): []string!RedisError {
+  match (items) {
+    Some(list) => return stringsFromReplies(list, cmd)?
+    None => return []string(0)
+  }
+}
+
+fn stringsFromReplies(list: []Reply, cmd: string): []string!RedisError {
+  let out = []string(0)
+  let i = 0
+  while (i < len(list)) {
+    let s = replyToString(list[i], cmd)?
+    out = append(out, s)
+    i = i + 1
+  }
+  return out
+}
+
+// `Reply.Map` (RESP3) or a flat `Reply.Array` of alternating key, value
+// (RESP2's `HGETALL` convention) as `map<string, string>`.
+export fn asMap(r: Reply, cmd: string): map<string, string>!RedisError {
+  match (r) {
+    Map(entries) => return mapFromEntries(entries, cmd)?
+    Array(items) => return mapFromFlatOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn mapFromEntries(entries: []MapEntry, cmd: string): map<string, string>!RedisError {
+  let out = map<string, string>()
+  let i = 0
+  while (i < len(entries)) {
+    let k = replyToString(entries[i].key, cmd)?
+    let v = replyToString(entries[i].value, cmd)?
+    out[k] = v
+    i = i + 1
+  }
+  return out
+}
+
+fn mapFromFlatOpt(items: Option<[]Reply>, cmd: string): map<string, string>!RedisError {
+  match (items) {
+    Some(list) => return mapFromFlatArray(list, cmd)?
+    None => return map<string, string>()
+  }
+}
+
+fn mapFromFlatArray(list: []Reply, cmd: string): map<string, string>!RedisError {
+  if (len(list) % 2 != 0) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let out = map<string, string>()
+  let i = 0
+  while (i < len(list)) {
+    let k = replyToString(list[i], cmd)?
+    let v = replyToString(list[i + 1], cmd)?
+    out[k] = v
+    i = i + 2
+  }
+  return out
+}
+
+// A flat `Reply.Array` of alternating member, score (`ZRANGE ...
+// WITHSCORES`'s RESP2 shape) as `[]Scored`.
+export fn asScored(r: Reply, cmd: string): []Scored!RedisError {
+  match (r) {
+    Array(items) => return scoredFromOpt(items, cmd)?
+    _ => fail RedisError.Unexpected(cmd, shapeName(r))
+  }
+}
+
+fn scoredFromOpt(items: Option<[]Reply>, cmd: string): []Scored!RedisError {
+  match (items) {
+    Some(list) => return scoredFromFlatArray(list, cmd)?
+    None => return []Scored(0)
+  }
+}
+
+fn scoredFromFlatArray(list: []Reply, cmd: string): []Scored!RedisError {
+  if (len(list) % 2 != 0) {
+    fail RedisError.Unexpected(cmd, "Array")
+  }
+  let out = []Scored(0)
+  let i = 0
+  while (i < len(list)) {
+    let member = replyToString(list[i], cmd)?
+    let score = asDouble(list[i + 1], cmd)?
+    out = append(out, Scored{ member = member, score = score })
+    i = i + 2
+  }
+  return out
+}
