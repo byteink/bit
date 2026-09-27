@@ -1,0 +1,295 @@
+// stdlib/sync/pool.test.bit — Pool<T>'s four rules, under real concurrency
+// (#6020). Shaped after stdlib/sql/pool.test.bit's own pool tests: `Pool`,
+// `Lease`, `PoolOptions`, `PoolStats`, `newPool` and the module-private
+// `waiter`/`Claim` are all siblings in this module (SPEC §17.1), so nothing
+// of std/sync is imported.
+//
+// EVERYTHING RUNS AGAINST `fakeTracker`, reached only through the
+// `open`/`closeFn`/`healthy` closures a real caller would supply — never a
+// pool internal directly. It counts every resource opened and closed, which
+// is what makes "an expired resource is retired, not reused" and "ok=false
+// discards" assertions about observed behaviour rather than the pool's own
+// bookkeeping.
+//
+// NO TEST ASSERTS AN UPPER BOUND ON WALL-CLOCK TIME (stdlib/sql/pool.test.bit's
+// own rule, unchanged): every wait here is either a bounded poll that exits
+// as soon as the condition holds (`awaitWaiters`), or a `sleep` used to make
+// time genuinely pass for an age-based check, never to synchronize with
+// another green thread.
+
+import { sleep } from "std/time"
+import { contains } from "std/strings"
+
+// The fake resource. `id` is assigned by `fakeTracker.open`, in open order —
+// tests use it to tell "the same resource" from "a freshly dialed one".
+class fakeConn {
+  id: i64,
+}
+
+// What `newFakePool`'s three closures close over. `mu` guards every field
+// below it, because a fairness test spawns several workers against the same
+// tracker.
+class fakeTracker {
+  mu: Mutex,
+  opens: i64 = 0,
+  closes: i64 = 0,
+  // One label per worker that reached the front of the queue and ran, in
+  // the order it ran — the FIFO test's own evidence.
+  log: []string,
+}
+
+fn newFakeTracker(): fakeTracker {
+  return fakeTracker{ mu = newMutex(), log = []string(0) }
+}
+
+// A `Pool<fakeConn>` wired to `tr`: `open` mints a fresh id, `closeFn` counts
+// it closed, `healthy` always accepts (no test here exercises a caller
+// rejecting a resource on liveness grounds — `release(lease, ok = false)`
+// already covers "discard on demand", rule 3's own other half).
+fn newFakePool(tr: fakeTracker, opts: PoolOptions): Pool<fakeConn> {
+  let open: () => fakeConn! = () => {
+    tr.mu.lock()
+    tr.opens = tr.opens + 1
+    let id = tr.opens
+    tr.mu.unlock()
+    return fakeConn{ id = id }
+  }
+  let closeIt: (fakeConn) => () = (c) => {
+    tr.mu.lock()
+    tr.closes = tr.closes + 1
+    tr.mu.unlock()
+  }
+  let healthy: (fakeConn) => bool = (c) => {
+    return true
+  }
+  return newPool<fakeConn>(open, closeIt, healthy, opts)
+}
+
+// Blocks until `p` has at least `n` callers queued, or gives up. Reading the
+// pool's own queue is the only sync point that says "the waiter is in the
+// queue" — a sleep would only say "some time passed". Bounded at ~2s of
+// polling (stdlib/sql/pool.test.bit's own `awaitWaiters`, unchanged in shape).
+fn awaitWaiters(p: Pool<fakeConn>, n: i64): bool {
+  let spins = 0
+  while (spins < 2000) {
+    spins = spins + 1
+    p.mu.lock()
+    let queued = len(p.waiters)
+    p.mu.unlock()
+    if (queued >= n) {
+      return true
+    }
+    sleep(1000000)
+  }
+  return false
+}
+
+// One green thread's whole job: acquire, record its label, release, report
+// success.
+fn fakeWorker(p: Pool<fakeConn>, tr: fakeTracker, label: string, done: chan<bool>) {
+  let lease = p.acquire() catch _ {
+    done <- false
+    return
+  }
+  tr.mu.lock()
+  tr.log = append(tr.log, label)
+  tr.mu.unlock()
+  p.release(lease, true)
+  done <- true
+}
+
+// A parked waiter that reports whether the failure it eventually saw was
+// the pool closing out from under it.
+fn fakeWaitThenReport(p: Pool<fakeConn>, done: chan<bool>) {
+  let _ = p.acquire() catch e {
+    done <- contains(e.message(), "the pool is closed")
+    return
+  }
+  done <- false
+}
+
+test "waiters are served in arrival order under contention" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 1, acquireTimeout = 30_000 })
+  let held = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let done = chan<bool>(3)
+  spawn fakeWorker(p, tr, "first", done)
+  assert(awaitWaiters(p, 1), "first never reached the queue")
+  spawn fakeWorker(p, tr, "second", done)
+  assert(awaitWaiters(p, 2), "second never reached the queue")
+  spawn fakeWorker(p, tr, "third", done)
+  assert(awaitWaiters(p, 3), "third never reached the queue")
+  p.release(held, true)
+  let got = 0
+  while (got < 3) {
+    got = got + 1
+    let ok = <- done
+    assert(ok, "a worker failed to acquire at all")
+  }
+  tr.mu.lock()
+  let log = tr.log
+  tr.mu.unlock()
+  assert(len(log) == 3, "${len(log)} workers ran")
+  assert(log[0] == "first", "served first: ${log[0]}")
+  assert(log[1] == "second", "served second: ${log[1]}")
+  assert(log[2] == "third", "served third: ${log[2]}")
+  p.close()
+}
+
+test "acquire fails after acquireTimeout when every resource is held" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 1, acquireTimeout = 50 })
+  let held = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let second = p.acquire() catch e {
+    assert(
+      contains(e.message(), "no resource available"),
+      "timeout message: ${e.message()}",
+    )
+    p.release(held, true)
+    p.close()
+    return
+  }
+  assert(false, "a second acquire got a resource anyway (id ${second.value.id})")
+  p.close()
+}
+
+test "release with ok=false discards the resource instead of reusing it" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 4 })
+  let lease1 = p.acquire() catch e {
+    assert(false, "first acquire: ${e.message()}")
+    return
+  }
+  let firstId = lease1.value.id
+  p.release(lease1, false)
+  tr.mu.lock()
+  let closes = tr.closes
+  tr.mu.unlock()
+  assert(closes == 1, "closes after an ok=false release = ${closes}")
+  let lease2 = p.acquire() catch e {
+    assert(false, "second acquire: ${e.message()}")
+    return
+  }
+  assert(lease2.value.id != firstId, "the discarded resource was handed out again")
+  p.release(lease2, true)
+  p.close()
+}
+
+test "a resource older than maxLifetime is retired on its next acquire" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 4, maxLifetime = 1 })
+  let lease1 = p.acquire() catch e {
+    assert(false, "first acquire: ${e.message()}")
+    return
+  }
+  let firstId = lease1.value.id
+  p.release(lease1, true)
+  // Older than a 1ms lifetime by any clock, on any load.
+  sleep(20000000)
+  let lease2 = p.acquire() catch e {
+    assert(false, "second acquire: ${e.message()}")
+    return
+  }
+  assert(lease2.value.id != firstId, "an expired resource was reused")
+  // `reap()` only runs from `release`/`close` (never under the pool's own
+  // mutex), so the expired resource's `closeFn` call lands here, not at the
+  // `acquire` that retired it.
+  p.release(lease2, true)
+  tr.mu.lock()
+  let closes = tr.closes
+  tr.mu.unlock()
+  assert(closes == 1, "closes after maxLifetime expiry = ${closes}")
+  p.close()
+}
+
+test "a resource idle past maxIdleTime is retired on its next acquire" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 4, maxIdleTime = 1, minIdle = 0 })
+  let lease1 = p.acquire() catch e {
+    assert(false, "first acquire: ${e.message()}")
+    return
+  }
+  let firstId = lease1.value.id
+  p.release(lease1, true)
+  sleep(20000000)
+  let lease2 = p.acquire() catch e {
+    assert(false, "second acquire: ${e.message()}")
+    return
+  }
+  assert(lease2.value.id != firstId, "an idle-expired resource was reused")
+  p.release(lease2, true)
+  p.close()
+}
+
+test "with releases the resource even when f fails" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 1, acquireTimeout = 200 })
+  let r = p.with<i64>((c) => {
+    fail newError("boom")
+  }) catch e {
+    assert(contains(e.message(), "boom"), "with's own error: ${e.message()}")
+    // Prove the resource actually came back: a follow-up acquire on this
+    // maxSize=1 pool must not time out waiting for it.
+    let lease = p.acquire() catch e2 {
+      assert(false, "acquire after a failing with(): ${e2.message()}")
+      return
+    }
+    p.release(lease, true)
+    p.close()
+    return
+  }
+  assert(false, "with() returned ${r} instead of failing")
+  p.close()
+}
+
+test "close fails every parked waiter and is idempotent" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 1, acquireTimeout = 30_000 })
+  let held = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let done = chan<bool>(1)
+  spawn fakeWaitThenReport(p, done)
+  assert(awaitWaiters(p, 1), "waiter never reached the queue")
+  p.close()
+  let sawClosed = <- done
+  assert(sawClosed, "the parked waiter did not see the pool close")
+  // A resource still checked out when close() ran is closed as it comes
+  // back, and close() itself is idempotent.
+  p.release(held, true)
+  p.close()
+  tr.mu.lock()
+  let closes = tr.closes
+  tr.mu.unlock()
+  assert(closes == 1, "closes after close()-with-waiters = ${closes}")
+}
+
+test "stats reports open, idle, checkedOut and waiting counts" {
+  let tr = newFakeTracker()
+  let p = newFakePool(tr, PoolOptions{ maxSize = 2, acquireTimeout = 30_000 })
+  let lease1 = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let s1 = p.stats()
+  assert(
+    s1.open == 1 && s1.checkedOut == 1 && s1.idle == 0 && s1.waiting == 0,
+      "stats after one acquire: open=${s1.open} checkedOut=${s1.checkedOut} " +
+      "idle=${s1.idle} waiting=${s1.waiting}",
+  )
+  p.release(lease1, true)
+  let s2 = p.stats()
+  assert(
+    s2.open == 1 && s2.idle == 1 && s2.checkedOut == 0 && s2.waiting == 0,
+      "stats after release: open=${s2.open} idle=${s2.idle} " +
+      "checkedOut=${s2.checkedOut} waiting=${s2.waiting}",
+  )
+  p.close()
+}
