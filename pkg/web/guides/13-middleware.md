@@ -152,7 +152,7 @@ rejection carries the same headers plus one more:
 
 ```
 $ curl -s -i http://127.0.0.1:8080/health
-HTTP/1.1 429 Status
+HTTP/1.1 429 Too Many Requests
 RateLimit-Limit: 120
 RateLimit-Remaining: 0
 RateLimit-Reset: 14

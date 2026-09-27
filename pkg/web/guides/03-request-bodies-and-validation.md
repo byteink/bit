@@ -164,7 +164,7 @@ right shape:
 $ curl -i -X POST http://127.0.0.1:8080/articles \
     -H "Content-Type: application/json" \
     -d '{"title":"","body":"x"}'
-HTTP/1.1 422 Status
+HTTP/1.1 422 Unprocessable Content
 Content-Length: 63
 Content-Type: application/json
 Connection: keep-alive

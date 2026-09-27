@@ -207,7 +207,7 @@ $ curl -si -X POST http://127.0.0.1:8089/auth/register \
 ```
 
 ```
-HTTP/1.1 409 Status
+HTTP/1.1 409 Conflict
 Content-Type: application/json
 
 {"error":{"code":"conflict","message":"Conflict","detail":"that username or email is already registered"}}
@@ -222,7 +222,7 @@ $ curl -si -X POST http://127.0.0.1:8089/auth/register \
 ```
 
 ```
-HTTP/1.1 422 Status
+HTTP/1.1 422 Unprocessable Content
 Content-Type: application/json
 
 {"error":{"code":"unprocessable_entity","message":"password: must be at least 8 character(s)"}}
