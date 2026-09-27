@@ -64,12 +64,17 @@ fn createPerson(db: Data, name: string, email: string): Person! {
 ```
 
 `Person{ id = 0, name = name, email = email }` is a composite literal, so
-`p.isPersisted()` reads `false` and `save` emits an `INSERT` naming every
-column, `id` included, as a `$n` placeholder - never the value pasted into
-the SQL text. Postgres hands the row it actually wrote back through
-`RETURNING`, and `result.generated["id"]` is how `createPerson` learns the
-real, database-assigned id: a brand-new `Person` starts with `id: 0`, and
-`0` is not what ends up in the `people` table.
+`p.isPersisted()` reads `false` and `save` emits `insert into people (name,
+email) values ($1, $2) returning *`. `id` is never in that column list:
+`t.id("id")` ([Schema](schema.md)) is an auto-incrementing primary key -
+`GENERATED ALWAYS AS IDENTITY` on Postgres, `AUTO_INCREMENT` on MySQL - and
+a generated-always column refuses a client-supplied INSERT value outright.
+Postgres hands the row it actually wrote back through `RETURNING`, and
+`result.generated["id"]` is how `createPerson` learns the real,
+database-assigned id: a brand-new `Person` starts with `id: 0`, and `0` is
+never what ends up in the `people` table. `personValues(p)` still supplies
+`"id"` in its map - `save` reads it back for `UPDATE`'s and `delete`'s own
+`WHERE`, just never for an `INSERT`'s column list.
 
 `personDesc()` and `personValues(p)` are the one place `Person`'s shape is
 spelled out - `save`/`delete`/`upsert` never read a field off `Person`
@@ -90,11 +95,15 @@ fn renamePerson(db: Data, p: Person, newName: string): Person! {
 A `Person` `find`/`findOneOrFail` (see [Query](query.md)) handed back reads
 `p.isPersisted() == true` already - the row mapper set that flag at
 hydration. `savePerson` doesn't ask which case it is: `save` reads
-`p.isPersisted()` itself and emits `UPDATE people set id = $1, name = $2,
-email = $3 where id = $4`, never inspecting `p.id`'s value to decide. That
-matters because an application-assigned key, or a UUID generated before
-the first save, is already non-zero on a row that has never touched the
-database - `id == 0` would be the wrong test.
+`p.isPersisted()` itself and emits `update people set name = $1, email =
+$2 where id = $3`, never inspecting `p.id`'s value to decide. `id` is
+excluded from `SET` the same way it is from `INSERT`'s column list - a
+generated-always identity column refuses an explicit `UPDATE` too - but it
+still names the row through `WHERE`. That `isPersisted()`, not `p.id`'s
+value, decides INSERT vs UPDATE also matters because an application-
+assigned key, or a UUID generated before the first save, is already
+non-zero on a row that has never touched the database - `id == 0` would be
+the wrong test.
 
 ## The sharp edge: an UPDATE matching no row is an error
 
