@@ -2547,12 +2547,26 @@ the one reason to declare a constructor at all.
 map<string, int>{ "a": 1, "b": 2 }
 [1, 2, 3]                      // bare element list: slice literal whose element
                                //   type is inferred from context (§15)
+{ "a": 1, "b": 2 }              // bare entry list: map literal, same inference
 ```
 
 A bare `[ ... ]` element list is a slice literal; its element type comes from the
-expected type or the join of element types (§15.2). Map and typed slice/array
-literals carry an explicit type prefix and are therefore unambiguous even in
-statement position.
+expected type or the join of element types (§15.2). A bare `{ k: v, ... }` entry
+list is likewise a map literal: its key and value types come from the expected
+type, or the join of the entries' key types and the join of their value types
+(§15.2), each independently. Unlike the bare slice form, the bare map form is
+legal only in **expression** position - a leading `{` in **statement** position
+is always a block (§13.1, and the class-literal rule above), never a map
+literal, so `{ "a": 1 }` as a statement's own first token opens (and then fails
+to close as) a block, not a map. Typed slice/array/map literals additionally
+carry an explicit type prefix and are therefore unambiguous in every position,
+including statement position.
+
+An empty `{}` in expression position is the empty map when the expected type is
+a map (`h.set(map<string,string>{})` and `h.set({})` for a `set(fields:
+map<string,string>)` parameter both construct one); anywhere else - including
+with no expected type reachable at all - it is ill-typed, the same treatment an
+empty `[]` against a non-slice type gets (§15.2).
 
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
@@ -4052,6 +4066,15 @@ For a bare `[e1, e2, ...]` slice literal with no expected type, the element type
 the common type of the elements: they must all be identical, or all be untyped
 constants sharing a default type. With an expected type `[]T`, each element is
 checked against `T`.
+
+A bare `{k1: v1, k2: v2, ...}` map literal (§12.3) infers the same way, one pair
+at a time: with no expected type, the key type is the common type of the keys
+and the value type is the common type of the values; with an expected type
+`map<K,V>`, each entry's key is checked against `K` and its value against `V`.
+An empty `{}` has no entries to infer a key or value type from, so it is legal
+only where an expected `map<K,V>` type reaches it - anywhere else (including
+with no expected type at all) it is ill-typed, the same treatment an empty `[]`
+gets against a non-slice type.
 
 ### 15.3 Call and Generic Inference
 
