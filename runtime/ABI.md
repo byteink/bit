@@ -412,7 +412,23 @@ Method {                         // extern class, 16 bytes, 8-aligned
   dense `u32` id, shared program-wide. Interfaces are structural and matched by
   the checker on name+signature, so a name uniquely identifies the method within
   any one type (a type can't declare two methods of the same name), which makes
-  the name id a sufficient dispatch key.
+  the name id a sufficient dispatch key for a `call_iface` site — the checker
+  verified name AND signature agreement between the interface and every
+  concrete type it can hold before that site's id was ever emitted.
+- **#5979: `v.(I)` for an INTERFACE target `I` (SPEC §14.4) is the one
+  dispatch id consumer the checker does NOT verify** — it narrows an
+  unrelated interface value's dynamic type against `I` at runtime, so a class
+  whose method merely SHARES A NAME with one of `I`'s, with a different
+  parameter or result type, used to pass the narrowing and then segfault the
+  first call through it. `methodId` (`compiler/lower.bit`) keys the id on
+  `name + "#" + signature` (the method's own `(params) => result` func type,
+  rendered structurally by `typeName`) instead of the bare name whenever
+  `BIT_IFACE_SIG=1`, so a signature mismatch misses every method-table lookup
+  it used to hit. Off by default (`BIT_BCE_JOIN` pattern, `compiler/optbce.bit`)
+  because it changes every method's id against the pinned stage0; every id
+  producer (this table's construction, `v.(I)`'s narrowing, and every ordinary
+  `call_iface`/`Op.CallValue` trampoline site) reads the same flag so the id
+  space stays self-consistent either way.
 - Each method's `fn` takes the receiver (the object body pointer) as its leading
   argument, then the call's own arguments — identical to a static method call.
 - Entries are unordered; `methods_len` may be 0 (a type with no methods).
@@ -561,6 +577,15 @@ bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has me
   sharpened: the result is typed `I`, so returning the un-narrowed receiver
   would let a caller that ignores `ok` dispatch a method the object does not
   have, and `bit_rt_iface_lookup` answers that with 0 — a call to address 0.
+- **#5979: `id` alone used to accept a same-named, differently-shaped method.**
+  `bit_rt_iface_has`'s `id` came from the method NAME only, and a class whose
+  method shared only the name with `I`'s — different parameter or result
+  types — landed in the same method-table slot the chain looked for, passed
+  the narrowing, and then segfaulted the first `call_iface` through it (the
+  checker never verifies this: `v.(I)` narrows an UNRELATED interface's
+  dynamic type, so there is no static agreement to lean on). See §2.1's id
+  bullet: under `BIT_IFACE_SIG=1`, `id` is signature-qualified, so this
+  chain's calls miss exactly when §2.1's table-building side does.
 
 ### 2.3 `string` value, and shared-backing views (`s[lo:hi]`)
 
