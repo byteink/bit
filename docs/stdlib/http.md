@@ -628,6 +628,85 @@ fn head(url: string): Response! {
 }
 ```
 
+### Streaming bodies
+
+`request` and `get` hold the whole body in one `string`. That is right for a
+JSON call and wrong for a multi-gigabyte upload or download, where the
+process would need the whole object in memory at once. The two calls below
+move a body in bounded chunks instead, so memory stays at one chunk whatever
+the object's size. Both speak `http://` and `https://` over HTTP/1.1;
+`https+h3://` is refused.
+
+```bit
+import { BodySink, BodySource, Header, getStreaming, requestWithStreamingBody } from "std/http"
+import { repeat } from "std/strings"
+
+// A body of `left` zero bytes, handed out one chunk at a time.
+class Zeros {
+  left: int
+
+  next(n: int): string! {
+    let k = n
+    if (this.left < k) {
+      k = this.left
+    }
+    this.left = this.left - k
+    return repeat("0", k)
+  }
+}
+
+// Counts the bytes it is handed and keeps none of them.
+class Counter {
+  total: int
+
+  take(chunk: string): ()! {
+    this.total = this.total + len(chunk)
+  }
+}
+
+fn roundTrip(url: string, size: int): int! {
+  let zeros = Zeros{ left = size }
+  let source: BodySource = zeros.next
+  requestWithStreamingBody("PUT", url, []Header(0), size, source)?
+  let counter = Counter{ total = 0 }
+  let sink: BodySink = counter.take
+  getStreaming(url, []Header(0), sink, size)?
+  return counter.total
+}
+```
+
+### `BodySource`
+
+`(int) => string!`: asked for up to `n` more bytes of a request body. It
+returns `""` only at the end of the body; any other return may be shorter
+than `n`.
+
+### `BodySink`
+
+`(string) => ()!`: handed each chunk of a response body in arrival order,
+until the body is exhausted. A `fail` from the sink stops the download and
+is returned by the call that owns it.
+
+### `requestWithStreamingBody(method: string, url: string, headers: []Header, contentLength: int, source: BodySource): Response!`
+
+Sends `method url` with a body of exactly `contentLength` bytes pulled from
+`source`, framed with a declared `Content-Length` (there is no chunked
+request body). The declared length is required up front because HTTP/1.1
+needs it to frame the body, and a signed request such as S3's SigV4 signs
+it. The response is read in full, as `request` reads it: the reply to an
+upload is a small document, not the payload.
+
+### `getStreaming(url: string, headers: []Header, sink: BodySink, maxBodyBytes: int): Response!`
+
+GETs `url` and hands the body to `sink` one chunk at a time. The returned
+`Response.body` is always `""`, because the body already went to `sink`.
+`maxBodyBytes` bounds the Content-Length the server declares, not what this
+call holds in memory. A caller downloading a large object passes a bound that
+covers it, since `defaultMaxBodyBytes` (32 MiB) is sized for the in-memory
+calls above and would refuse the response before its first chunk. A response
+framed by chunked encoding or read-to-close instead of Content-Length still
+succeeds under the same bound, but reaches `sink` as one chunk.
+
 ## TLS (HTTPS)
 
 An `https://` URL transparently runs the same request over TLS 1.3, verifying the
