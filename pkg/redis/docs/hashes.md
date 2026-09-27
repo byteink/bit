@@ -41,7 +41,7 @@ fn main(): ()! {
   profile.setField("region", "eu-west")?
   let region = profile.getMany("region", "country")?
   match (region[0]) {
-    Some(v) => println(v)     // "eu-west"
+    Some(v) => println(v) // "eu-west"
     None => println("(unset)")
   }
   match (region[1]) {
@@ -110,10 +110,10 @@ fn main(): ()! {
   let keys = profile.keys()?
   let values = profile.values()?
   let nameLen = profile.strLen("name")?
-  println("${count} fields, ${keys}, ${values}, 'name' is ${nameLen} bytes")
+  println("${count} fields, first key is ${keys[0]}, first value is ${values[0]}, 'name' is ${nameLen} bytes")
 
   let sample = profile.random(1)?
-  println("a random field: ${sample}")
+  println("a random field: ${sample[0]}")
   r.close()
   return
 }
