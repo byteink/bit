@@ -1,0 +1,221 @@
+// pkg/jobs/jobs.bit — register<T>/enqueue<T>, the worker pool, retries with
+// backoff and dead-letter (epic #4023's 2026-09-27 OWNER DECISION, #6082).
+//
+// DISPATCH GOES THROUGH THE CLASS, NEVER A TYPED STRING. A job class
+// carries `@job("name")` (compiler/classjobdesc.bit, #6081), which
+// synthesizes a `static __jobName(): string` and requires `@json` — so
+// every `@job` class already satisfies `Job` below (both members) with no
+// declaration anywhere. `register<T: Job>`/`enqueue<T: Job>` read the name
+// off `T` — `T.__jobName()` (SPEC's static-method-through-a-type-parameter
+// shape, §10.4.1) — with no compiler-generated cross-module table and no
+// reflection: the dispatch table below is built entirely at RUNTIME, one
+// entry per `register` call, closing over the concrete `T` it was called
+// with.
+//
+// `Job` REQUIRES `toJson(): Json` IN ADDITION TO `__jobName()`, beyond what
+// the compiler's own synthesis comment names, because `enqueue` has to turn
+// a `T` value into the JSON text a `Store` persists and there is no
+// generic, reflection-free `encode<T>(v: T): string` — the decode side
+// (`register` below) reaches `jsonDecode<T>` (composable from a generic,
+// #4563) via `jsonParse`, but nothing symmetric exists for encoding, so
+// `enqueue` goes through the instance method directly. `@job` already
+// requires `@json`, which synthesizes exactly this `toJson()`, so every
+// real job class satisfies the wider bound for free.
+
+import { Json, JsonEntry, jsonEncode, jsonParse, jsonDecode } from "std/json"
+import { now, sleep, Millisecond } from "std/time"
+import { newWaitGroup, WaitGroup, newAtomicI64, AtomicI64 } from "std/sync"
+import { runRecovering } from "std/runtime"
+
+// A background job class: `@job("name") @json class Foo { ... }` satisfies
+// this structurally, with no `implements` declaration (SPEC §14.3).
+//
+// `bit fmt` MUST NOT BE RUN ON THIS DECLARATION until #6173 lands: it
+// silently strips `static` from an interface method requirement (confirmed
+// minimal repro, filed 2026-09-28), which would turn this into an ordinary
+// instance-method requirement and break every `register`/`enqueue` call
+// site with a confusing E0051 ("does not satisfy the bound 'Job'").
+export interface Job {
+  static __jobName(): string,
+  toJson(): Json,
+}
+
+// How many workers to run and how they poll. `store` is passed to `open`
+// separately, not a field here, so `Options{...}` composite literals never
+// need to repeat it.
+export class Options {
+  export workers: int = 4,
+  export pollInterval: int = 500 * Millisecond,
+  export visibilityTimeout: int = 30 * Second,
+}
+
+fn requireOptions(opts: Options): Options! {
+  if (opts.workers <= 0) {
+    fail newError("jobs: Options.workers must be positive, got ${opts.workers}")
+  }
+  return opts
+}
+
+// One decoded-and-dispatch closure per registered job type, keyed by its
+// `@job` name — the runtime dispatch table the epic's OWNER DECISION calls
+// for. Building it is `register`'s whole job.
+export class Queue {
+  store: Store
+  opts: Options
+  handlers: map<string, (string) => ()!>
+  running: AtomicI64
+  wg: WaitGroup
+
+  // Decodes a claimed job's JSON payload as `T` and calls `handle` with it.
+  // A second `register<T>` for the same name replaces the first — callers
+  // that care ensure each `@job` name is registered exactly once, which
+  // `synthtext.bit`'s whole-program E0169 already guarantees for the NAME;
+  // registering twice is an application bug, not a language one, so this
+  // stays a plain overwrite rather than a second failure mode.
+  export register<T: Job>(handle: (T) => ()!) {
+    let name = T.__jobName()
+    // NOT `jsonDecodeText<T>`: it specializes by rewriting its own call
+    // site (stdlib/json/dectext.bit), which a type PARAMETER can never be
+    // written out as — E0145 names `jsonParse` + `jsonDecode<T>` as the
+    // generic-composable equivalent (already tracked, #4563). The explicit
+    // `dispatch` type gives the arrow literal its fallible result type — a
+    // map-index assignment target does not propagate one on its own.
+    let dispatch: (string) => ()! = (payload) => {
+      let parsed = jsonParse(payload)?
+      let job = jsonDecode<T>(parsed)?
+      handle(job)?
+    }
+    this.handlers[name] = dispatch
+  }
+
+  // Encodes `job` and persists it through `this.store`, claimable after
+  // `delay` nanoseconds, dead-lettered after `maxAttempts` failed tries.
+  // `maxAttempts`'s default, 5, is a literal rather than a named const: a
+  // parameter default must be a constant LITERAL (E0159), unlike a field
+  // default, which may name one (SPEC §10.5).
+  export enqueue<T: Job>(job: T, delay: int = 0, maxAttempts: int = 5): ()! {
+    let name = T.__jobName()
+    let payload = jsonEncode(job.toJson())
+    let availableAt = now().ns + delay
+    this.store.enqueue(name, payload, availableAt, maxAttempts)?
+  }
+
+  // Starts `opts.workers` worker green threads and returns immediately —
+  // for in-process workers running alongside other work (a web server, for
+  // example). Pair with `stop()` for a graceful drain.
+  export start() {
+    this.running.store(1)
+    this.wg.add(i64(this.opts.workers))
+    let i = 0
+    while (i < this.opts.workers) {
+      spawn workerLoop(this)
+      i = i + 1
+    }
+  }
+
+  // Signals every worker to stop taking NEW jobs, then blocks until each
+  // one finishes whatever job it already claimed — the graceful drain: a
+  // worker's loop (`workerLoop` below) only rechecks `running` between
+  // jobs, never mid-job.
+  export stop() {
+    this.running.store(0)
+    this.wg.wait()
+  }
+
+  // Runs the worker pool in the foreground — the shape a standalone worker
+  // process's `main()` wants: `q.run()` starts the pool and blocks until
+  // some other green thread (a signal handler the application installs)
+  // calls `q.stop()`.
+  export run(): ()! {
+    this.start()
+    this.wg.wait()
+  }
+}
+
+// A fresh Queue backed by store, ready for register/enqueue calls.
+export fn open(store: Store, opts: Options): Queue! {
+  let checked = requireOptions(opts)?
+  return Queue{
+    store = store,
+    opts = checked,
+    handlers = map<string, (string) => ()!>(),
+    running = newAtomicI64(0),
+    wg = newWaitGroup(),
+  }
+}
+
+// One worker's whole loop: while running, claim at most one job and
+// process it, or sleep `pollInterval` when the queue is empty. Runs until
+// `Queue.stop` clears `running`, then reports itself done to the drain.
+fn workerLoop(q: Queue) {
+  let rng = newWorkerRand()
+  while (q.running.load() == 1) {
+    let claimed = q.store.claim(q.opts.visibilityTimeout) catch e {
+      eprint("jobs: claim failed: ${e.message()}\n")
+      sleep(q.opts.pollInterval)
+      continue
+    }
+    match (claimed) {
+      None => sleep(q.opts.pollInterval)
+      Some(cj) => processOne(q, cj, rng)
+    }
+  }
+  q.wg.done()
+}
+
+// Runs the job's handler behind the runtime's panic boundary (same
+// mechanism pkg/web/recover.bit uses, `runRecovering`, std/runtime), so a
+// handler panic counts as a failure instead of taking the worker thread
+// down. Dispatches to complete/retry/deadLetter based on the outcome.
+fn processOne(q: Queue, cj: ClaimedJob, rng: Rand) {
+  let (handle, ok) = q.handlers[cj.name]
+  if (!ok) {
+    reportOutcome(
+      () => q.store.deadLetter(cj.id, "no handler registered for '${cj.name}'"),
+      cj.name,
+    )
+    return
+  }
+  let failed: error
+  let (panicked, msg) = runRecovering(() => {
+    handle(cj.payload) catch e {
+      failed = e
+      return
+    }
+  })
+  if (panicked) {
+    failJob(q, cj, msg, rng)
+    return
+  }
+  if (failed != nil) {
+    failJob(q, cj, failed.message(), rng)
+    return
+  }
+  reportOutcome(() => q.store.complete(cj.id), cj.name)
+}
+
+// Retries cj if it has attempts left, otherwise dead-letters it with reason.
+fn failJob(q: Queue, cj: ClaimedJob, reason: string, rng: Rand) {
+  if (cj.attempts >= cj.maxAttempts) {
+    reportOutcome(() => q.store.deadLetter(cj.id, reason), cj.name)
+    return
+  }
+  let availableAt = now().ns + backoffDelay(cj.attempts, rng)
+  reportOutcome(() => q.store.retry(cj.id, availableAt), cj.name)
+}
+
+// The worker loop's own acknowledgements (complete/retry/deadLetter) are
+// fallible I/O calls with nothing useful to return to — a failed
+// acknowledgement leaves the job claimed until its visibility timeout
+// lapses and another worker reclaims it (store.bit's header), so the only
+// right response here is to log loudly and move on, never to crash the
+// worker thread over it. `op` is a closure, not a raw fallible value —
+// `T!E` cannot be held in a variable or parameter (SPEC §18.2).
+fn reportOutcome(
+  op: () => ()!,
+  name: string,
+) {
+  op() catch e {
+    eprint("jobs: acknowledging '${name}' failed: ${e.message()}\n")
+  }
+}
