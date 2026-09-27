@@ -1,0 +1,324 @@
+// pkg/s3/client.live.test.bit — every call exercised against a real
+// S3-compatible server (SeaweedFS's `weed mini -s3`, provisioned by
+// _tests_/bit/s3live.bit, `./make test-package-s3-live`). Every test name
+// starts with `live: ` (or `live streaming: ` for the one that needs its
+// own process, run separately so the harness can wrap it in `/usr/bin/time
+// -l` and check peak RSS) so `bit test pkg/s3 --run "live: "` runs exactly
+// these and none of the fake-based tests the rest of this package already
+// covers.
+//
+// `Config`, `Client`, `newClient`, `list`, `listPaged`, `presignGet`,
+// `presignPut`, `UploadedPart`, `BodySource`, `BodySink`, `requestWith`,
+// `Header` are all siblings or module-wide imports (SPEC §19) already
+// declared elsewhere in this module — nothing is imported here except
+// `env`/`envOr` (std/os, not otherwise used in this package).
+
+import { env, envOr } from "std/os"
+
+fn requireEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("client.live.test: ${name} is not set — run this through ./make test-package-s3-live")
+  }
+  return v
+}
+
+fn liveConfig(): Config! {
+  return Config{
+    endpoint = requireEnv("S3_TEST_ENDPOINT")?,
+    region = envOr("S3_TEST_REGION", "us-east-1"),
+    bucket = requireEnv("S3_TEST_BUCKET")?,
+    accessKeyId = requireEnv("S3_TEST_ACCESS_KEY")?,
+    secretKey = requireEnv("S3_TEST_SECRET_KEY")?,
+  }
+}
+
+test "live: put/get/head/delete round-trip against a real server" {
+  let cfg = liveConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let client = newClient(cfg)
+  let key = "live/roundtrip.txt"
+  let body = "hello from pkg/s3's live gate"
+
+  client.put(key, body, "text/plain") catch e {
+    assert(false, "put: ${e.message()}")
+    return
+  }
+  let got = client.get(key) catch e {
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  assert(got == body, "get returned '${got}'")
+
+  let meta = client.head(key) catch e {
+    assert(false, "head: ${e.message()}")
+    return
+  }
+  assert(meta.contentLength == len(body), "contentLength = ${meta.contentLength}")
+
+  client.delete(key) catch e {
+    assert(false, "delete: ${e.message()}")
+    return
+  }
+  // Deleting an already-absent key is idempotent (client.bit's own doc
+  // comment on `delete`) — proven live, not just asserted in a comment.
+  client.delete(key) catch e {
+    assert(false, "second delete (idempotent) failed: ${e.message()}")
+    return
+  }
+}
+
+test "live: list paginates across more than one page" {
+  let cfg = liveConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let client = newClient(cfg)
+  let prefix = "live/list/"
+  let wantKeys = [
+    "${prefix}a.txt", "${prefix}b.txt", "${prefix}c.txt", "${prefix}d.txt", "${prefix}e.txt",
+  ]
+  let i = 0
+  while (i < len(wantKeys)) {
+    client.put(wantKeys[i], "x", "text/plain") catch e {
+      assert(false, "put ${wantKeys[i]}: ${e.message()}")
+      return
+    }
+    i = i + 1
+  }
+
+  // max-keys=2 against 5 objects forces at least 3 pages — `next()` itself
+  // does the paging; this only proves every object still comes back.
+  let it = listPaged(client, prefix, 2)
+  let seen = []string(0)
+  while (true) {
+    let entry = it.next() catch e {
+      assert(false, "next: ${e.message()}")
+      return
+    }
+    match (entry) {
+      Some(e) => seen = append(seen, e.key)
+      None => break
+    }
+  }
+  assert(len(seen) == len(wantKeys), "saw ${len(seen)} of ${len(wantKeys)} keys")
+  let j = 0
+  while (j < len(wantKeys)) {
+    assert(indexOf2(seen, wantKeys[j]) >= 0, "missing ${wantKeys[j]}")
+    j = j + 1
+  }
+
+  j = 0
+  while (j < len(wantKeys)) {
+    client.delete(wantKeys[j]) catch e {
+      assert(false, "cleanup delete ${wantKeys[j]}: ${e.message()}")
+      return
+    }
+    j = j + 1
+  }
+}
+
+fn indexOf2(xs: []string, want: string): int {
+  let i = 0
+  while (i < len(xs)) {
+    if (xs[i] == want) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+test "live: multipart upload assembles the final object from its parts" {
+  let cfg = liveConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let client = newClient(cfg)
+  let key = "live/multipart.bin"
+  // S3's own minimum part size (5 MiB) applies to every part but the last;
+  // two parts at the minimum plus a short final part exercises that rule
+  // for real rather than trusting it from documentation alone.
+  let partSize = 5 * 1024 * 1024
+  let part1 = repeat("a", partSize)
+  let part2 = repeat("b", partSize)
+  let part3 = "tail"
+
+  let uploadId = client.createMultipartUpload(key, "application/octet-stream") catch e {
+    assert(false, "createMultipartUpload: ${e.message()}")
+    return
+  }
+  let etag1 = client.uploadPart(key, uploadId, 1, part1) catch e {
+    assert(false, "uploadPart 1: ${e.message()}")
+    return
+  }
+  let etag2 = client.uploadPart(key, uploadId, 2, part2) catch e {
+    assert(false, "uploadPart 2: ${e.message()}")
+    return
+  }
+  let etag3 = client.uploadPart(key, uploadId, 3, part3) catch e {
+    assert(false, "uploadPart 3: ${e.message()}")
+    return
+  }
+  client.completeMultipartUpload(
+    key,
+    uploadId,
+    [
+      UploadedPart{ partNumber = 1, etag = etag1 },
+      UploadedPart{ partNumber = 2, etag = etag2 },
+      UploadedPart{ partNumber = 3, etag = etag3 },
+    ],
+  ) catch e {
+    assert(false, "completeMultipartUpload: ${e.message()}")
+    return
+  }
+
+  let meta = client.head(key) catch e {
+    assert(false, "head: ${e.message()}")
+    return
+  }
+  assert(meta.contentLength == 2 * partSize + len(part3), "assembled size = ${meta.contentLength}")
+
+  client.delete(key) catch e {
+    assert(false, "cleanup delete: ${e.message()}")
+    return
+  }
+}
+
+test "live: presigned GET is fetched with a plain, unsigned HTTP client" {
+  let cfg = liveConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let client = newClient(cfg)
+  let key = "live/presign-get.txt"
+  let body = "fetched through a presigned URL, no credential of its own"
+  client.put(key, body, "text/plain") catch e {
+    assert(false, "put: ${e.message()}")
+    return
+  }
+
+  let url = presignGet(cfg, key, 300) catch e {
+    assert(false, "presignGet: ${e.message()}")
+    return
+  }
+  // A PLAIN client: no Authorization header, no signing — the URL's own
+  // query string is the whole credential.
+  let res = requestWith("GET", url, []Header(0), "") catch e {
+    assert(false, "GET presigned url: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}")
+  assert(res.body == body, "body = ${res.body}")
+
+  client.delete(key) catch e {
+    assert(false, "cleanup delete: ${e.message()}")
+    return
+  }
+}
+
+test "live: presigned PUT is fetched with a plain, unsigned HTTP client" {
+  let cfg = liveConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let client = newClient(cfg)
+  let key = "live/presign-put.txt"
+  let body = "uploaded through a presigned URL, no credential of its own"
+
+  let url = presignPut(cfg, key, 300) catch e {
+    assert(false, "presignPut: ${e.message()}")
+    return
+  }
+  let res = requestWith("PUT", url, []Header(0), body) catch e {
+    assert(false, "PUT presigned url: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}")
+
+  let got = client.get(key) catch e {
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  assert(got == body, "get returned '${got}'")
+
+  client.delete(key) catch e {
+    assert(false, "cleanup delete: ${e.message()}")
+    return
+  }
+}
+
+// A deterministic, non-repeating byte at `index`: catches corruption or
+// reordering that an all-`'x'` payload would not (a byte moved to the
+// wrong offset still reads as a valid byte, just the wrong VALUE for that
+// offset).
+fn patternByte(index: int): byte {
+  return byte((index * 31 + 7) % 251)
+}
+
+fn patternChunk(startIndex: int, n: int): string {
+  let b = []byte(n)
+  let i = 0
+  while (i < n) {
+    b[i] = patternByte(startIndex + i)
+    i = i + 1
+  }
+  return string(b)
+}
+
+// Run separately from the rest ("live streaming: ", not "live: ") so
+// _tests_/bit/s3live.bit can wrap exactly this one process in `/usr/bin/time
+// -l` and assert peak RSS — none of the OTHER live tests' own memory use
+// should count toward that budget.
+test "live streaming: a 220 MiB object streams through put/get with content intact" {
+  let cfg = liveConfig() catch e {
+    assert(false, e.message())
+    return
+  }
+  let client = newClient(cfg)
+  let key = "live/streaming-220mib.bin"
+  let totalLen = 220 * 1024 * 1024
+
+  let sent = 0
+  let source: BodySource = (n) => {
+    if (sent >= totalLen) {
+      return ""
+    }
+    let want = n
+    if (sent + want > totalLen) {
+      want = totalLen - sent
+    }
+    let chunk = patternChunk(sent, want)
+    sent = sent + want
+    return chunk
+  }
+  client.putStream(key, totalLen, "application/octet-stream", source) catch e {
+    assert(false, "putStream: ${e.message()}")
+    return
+  }
+  assert(sent == totalLen, "source only produced ${sent} of ${totalLen} bytes")
+
+  let received = 0
+  let mismatchAt = -1
+  let sink: BodySink = (chunk) => {
+    let want = patternChunk(received, len(chunk))
+    if (mismatchAt < 0 && chunk != want) {
+      mismatchAt = received
+    }
+    received = received + len(chunk)
+  }
+  let meta = client.getStream(key, sink) catch e {
+    assert(false, "getStream: ${e.message()}")
+    return
+  }
+  assert(mismatchAt < 0, "content mismatch at byte offset ${mismatchAt}")
+  assert(received == totalLen, "received ${received} of ${totalLen} bytes")
+  assert(meta.contentLength == totalLen, "meta.contentLength = ${meta.contentLength}")
+
+  client.delete(key) catch e {
+    assert(false, "cleanup delete: ${e.message()}")
+    return
+  }
+}
