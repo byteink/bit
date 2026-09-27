@@ -1,0 +1,158 @@
+// pkg/web/guides/inkwell/auth.bit — registration, login, logout, and the
+// authorization helpers articles.bit/comments.bit call (#6062, epic #6061,
+// course parts 10 "Registering users", 11 "Sessions and logging in", 12
+// "Authorization"). `users.bit` owns the `User` entity; this file is the
+// one place `pkg/auth`'s password flow is wired to it.
+//
+// WORKAROUND for a confirmed pkg/auth bug (filed as #6093, epic #6061):
+// the documented `requireAuth([...newPasswordStrategy...])`-as-login-
+// middleware pattern (pkg/auth/README.md, docs/getting-started.md) loses
+// the session — `PasswordStrategy.authenticate()` (pkg/auth/password.bit)
+// already calls `c.session()?.regenerate()?` once, and `requireAuth`
+// (pkg/auth/middleware.bit) unconditionally calls it AGAIN, so whatever
+// `requireAuth`'s own `.set(identitySessionKey, ...)` writes lands on a
+// session a second `regenerate()` is about to replace. Reproduced
+// standalone (no packages beyond "web"/"auth") and recorded on #6093.
+// This file uses the OTHER documented shape instead — a route handler
+// calling `Strategy.authenticate(c)` directly, the pattern password.bit's
+// own comment and password.test.bit's harness already use — and stores
+// the result under this app's OWN session keys rather than pkg/auth's
+// `identitySessionKey` (module-private, and only `requireAuth`/
+// `currentIdentity` read or write it), so `currentUserId`/`currentRole`
+// below read back exactly what `login` wrote, with no dependency on the
+// broken path.
+import { conflict, forbidden, minLen, unauthorized } from "web"
+import { Lookup, LookupResult, Strategy, hashPassword, newPasswordStrategy } from "auth"
+import { UniqueViolation, classify } from "orm"
+import { jsonDecString, jsonGet } from "std/json"
+import { isSome, unwrap } from "std/core"
+
+const adminRole = "admin"
+const sessionUserIdKey = "inkwell:userId"
+const sessionRoleKey = "inkwell:role"
+
+// `pkg/auth`'s `Lookup` — the seam `newPasswordStrategy` calls with the
+// POST body's `username`, per pkg/auth/docs/getting-started.md.
+export fn userLookup(db: Data): Lookup {
+  return (username) => {
+    let u = findUserByUsername(db, username)?
+    return LookupResult{ hash = u.passwordHash, id = "${u.id}", claims = userClaims(u) }
+  }
+}
+
+export @json class RegisterInput {
+  @minLen(3)
+  username: string
+
+  email: string
+
+  @minLen(8)
+  password: string
+}
+
+// Uses `insertGeneratedId` (db.bit), not `save()` — see that helper's own
+// comment for why `save()` cannot insert into an `@id`-keyed table on
+// Postgres today (#6088).
+fn insertUser(db: Data, u: User): User! {
+  let cols = ["username", "email", "password_hash", "role", "created_at", "updated_at"]
+  let stamp = now().ns
+  let args = [
+    Value.Text(u.username), Value.Text(u.email), Value.Text(u.passwordHash), Value.Text(u.role),
+    Value.Int(stamp), Value.Int(stamp),
+  ]
+  let newId = insertGeneratedId(db, "users", cols, args) catch e {
+    let cause = classify(e, "users")
+    let (_, ok) = cause.(UniqueViolation)
+    if (ok) {
+      fail conflict("that username or email is already registered")
+    }
+    fail cause
+  }
+  u.id = newId
+  u.markPersisted(true)
+  return u
+}
+
+fn register(c: Ctx, db: Data): Res! {
+  let input = c.body<RegisterInput>()?
+  let u = User{
+    id = 0, username = input.username, email = input.email,
+    passwordHash = hashPassword(input.password), role = "author", createdAt = 0, updatedAt = 0,
+  }
+  let saved = insertUser(db, u)?
+  return c.created("${saved.id}").header("Location", "/users/${saved.id}")
+}
+
+// Verifies the POST body's credentials via `PasswordStrategy` directly
+// (never through `requireAuth` — see this file's header) and writes the
+// result onto the session itself: `regenerate()` closes session fixation
+// exactly once, then the role/id are stored under this app's own keys.
+fn login(c: Ctx, strategy: Strategy): Res! {
+  let identity = strategy.authenticate(c)?
+  let session = c.session()?
+  session.regenerate()?
+  session.set(sessionUserIdKey, identity.id)
+  let role = jsonGet(identity.claims, "role")
+  if (isSome(role)) {
+    session.set(sessionRoleKey, jsonDecString(unwrap(role), "identity.claims.role")?)
+  }
+  session.save()?
+  return c.noContent()
+}
+
+fn logout(c: Ctx): Res! {
+  c.session()?.destroy()?
+  return c.noContent()
+}
+
+fn showMe(c: Ctx, db: Data): Res! {
+  let id = currentUserId(c)?
+  let u = findUserById(db, id)?
+  return c.json(toPublicUser(u))
+}
+
+export fn mountAuth(app: App, db: Data) {
+  let strategy = newPasswordStrategy(userLookup(db))
+  app.post("/auth/register", (c) => register(c, db))
+  app.post("/auth/login", (c) => login(c, strategy))
+  app.post("/auth/logout", (c) => logout(c))
+  app.get("/me", (c) => showMe(c, db))
+}
+
+// ---- authorization: read back the role/id `login` (above) stored ----
+
+export fn currentUserId(c: Ctx): i64! {
+  let raw = c.session()?.get(sessionUserIdKey)
+  if (len(raw) == 0) {
+    fail unauthorized()
+  }
+  return parseId(raw)?
+}
+
+export fn currentRole(c: Ctx): string! {
+  return c.session()?.get(sessionRoleKey)
+}
+
+// Fails `forbidden()` unless the caller is `ownerId` or carries the admin
+// role — the rule articles.bit's edit/delete routes and comments.bit's
+// delete route both need: "an author edits only their own articles; an
+// admin role" (course part 12).
+export fn requireOwnerOrAdmin(c: Ctx, ownerId: i64): ()! {
+  let uid = currentUserId(c)?
+  if (uid == ownerId) {
+    return
+  }
+  let role = currentRole(c)?
+  if (role != adminRole) {
+    fail forbidden("you may only modify your own resource")
+  }
+}
+
+// Fails `forbidden()` unless the caller carries the admin role — tags.bit's
+// create route (tag taxonomy is shared, editorial, never per-author).
+export fn requireAdmin(c: Ctx): ()! {
+  let role = currentRole(c)?
+  if (role != adminRole) {
+    fail forbidden("admin role required")
+  }
+}
