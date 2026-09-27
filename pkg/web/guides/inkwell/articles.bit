@@ -5,14 +5,14 @@
 // asks for: insert the article, find-or-create each tag by name, and
 // attach them, all inside one `pool.tx(...)` block.
 import {
-  RelationLoader, attach, belongsTo, manyToManyLoader, update, withRelations,
-  delete as ormDelete,
+  RelationLoader, attach, belongsTo, findScopedQuery, manyToManyLoader, save, withRelations,
+  StaleWriteError, delete as ormDelete,
 } from "orm"
-import { page } from "web"
+import { httpError, page } from "web"
 import { newBuilder } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 
-@table @timestamps class Article {
+@table @timestamps @softDelete class Article {
   @id
   id: i64
   title: string
@@ -25,6 +25,9 @@ import { uuidV4, format as uuidFormat } from "std/uuid"
   tags: []Tag
   createdAt: i64
   updatedAt: i64
+  deletedAt: Option<Timestamp>
+  @version
+  version: i64
 }
 
 fn authorPlaceholder(): User {
@@ -36,13 +39,35 @@ fn authorPlaceholder(): User {
 fn articlePlaceholder(): Article {
   return Article{
     id = 0, title = "", slug = "", body = "", authorId = 0, author = authorPlaceholder(),
-    createdAt = 0, updatedAt = 0,
+    createdAt = 0, updatedAt = 0, deletedAt = Option<Timestamp>.None, version = 0,
   }
 }
 
 fn articleDesc(): TableDesc {
   return TableDesc{
-    table = "articles", fields = articlePlaceholder().tableDescriptor(), classAttrs = []AttrDesc(0),
+    table = "articles", fields = articlePlaceholder().tableDescriptor(),
+    classAttrs = articlePlaceholder().tableAttrs(),
+  }
+}
+
+// `save()`'s write path only — see `articleUpdateValues`'s own comment for
+// why `author`/`tags` cannot appear here.
+fn articleWriteFields(): []FieldDesc {
+  let out = []FieldDesc(0)
+  for f of articleDesc().fields {
+    if (f.name == "author" || f.name == "tags") {
+      continue
+    }
+    out = append(out, f)
+  }
+  return out
+}
+
+fn articleWriteDesc(): TableDesc {
+  return TableDesc{
+    table = "articles",
+    fields = articleWriteFields(),
+    classAttrs = articleDesc().classAttrs,
   }
 }
 
@@ -64,6 +89,8 @@ fn articleMapper(rows: Rows): Article! {
     author = authorPlaceholder(),
     createdAt = sqlReqInt(rows, cols, "created_at")?,
     updatedAt = sqlReqInt(rows, cols, "updated_at")?,
+    deletedAt = sqlOptTimestamp(rows, cols, "deleted_at")?,
+    version = sqlReqInt(rows, cols, "version")?,
   }
 }
 
@@ -85,9 +112,23 @@ fn tagsLoader(): RelationLoader<Article> {
   })
 }
 
+// `@softDelete` on `Article` (this file's header) means every read here
+// excludes a soft-deleted row by default — `deleteArticle` below never has
+// to filter by hand. Uses `findScopedQuery` (pkg/orm/softdelete.bit), not
+// `findScoped`'s `SoftQuery` wrapper: `SoftQuery.inner` is module-private to
+// pkg/orm, so a caller outside that package (this file) has no public way
+// to attach `withRelations`' loader map to one — `findScopedQuery` returns
+// the plain, already-filtered `Query<T>` `withRelations` composes with
+// directly, the same shape a relation's own child loader already uses.
 fn articles(db: Data): Query<Article> {
   return withRelations(
-    find<Article>(db, "articles", articleDesc().fields, articleMapper),
+    findScopedQuery<Article>(
+      db,
+      "articles",
+      articleDesc().fields,
+      articleDesc().classAttrs,
+      articleMapper,
+    ),
     map<string, RelationLoader<Article>>{ "author": authorLoader(), "tags": tagsLoader() },
   )
 }
@@ -103,6 +144,23 @@ fn findArticleById(db: Data, id: i64): Article! {
     fail newError("no article with id ${id}")
   }
   return rows[0]
+}
+
+// #6129: raw `to_tsquery` full-text search — see db.bit's
+// `ensureArticleSearchIndex` for why this is raw SQL rather than a
+// `Query<Article>` chain. Excludes a soft-deleted row the same way
+// `findScoped` does, ordered by rank (best match first).
+fn searchArticles(db: Data, q: string, limit: int): []Article! {
+  let sqlText = "select id, title, slug, body, author_id, created_at, updated_at, deleted_at, version " +
+    "from articles where deleted_at is null and search_vector @@ plainto_tsquery('english', $1) " +
+    "order by ts_rank(search_vector, plainto_tsquery('english', $1)) desc limit $2"
+  let rows = db.query(sqlText, [Value.Text(q), Value.Int(limit)])?
+  defer rows.close()
+  let out = []Article(0)
+  while (rows.next()?) {
+    out = append(out, articleMapper(rows)?)
+  }
+  return out
 }
 
 export @json class ArticleView {
@@ -216,7 +274,19 @@ fn filteredArticles(db: Data, c: Ctx): Query<Article> {
   return q.where("authorId", Value.Int(authorId))
 }
 
+// A `q` query runs the full-text search path instead of the paginated
+// listing (course scope per #6129 — search returns its matches directly,
+// ranked, with no separate page/limit contract of its own).
 fn listArticles(c: Ctx, db: Data): Res! {
+  let searchTerm = c.query("q")
+  if (len(searchTerm) > 0) {
+    let matches = searchArticles(db, searchTerm, defaultLimit)?
+    let out = []ArticleListItem(0)
+    for a of matches {
+      out = append(out, toListItem(a))
+    }
+    return page(out, len(out), defaultLimit, "")
+  }
   let limit = clampLimit(c.query("limit"))
   let pageNum = pageNumber(c.query("page"))
   let q = filteredArticles(db, c)
@@ -257,10 +327,10 @@ export @json class CreateArticleInput {
 fn insertArticle(db: Data, authorId: i64, input: CreateArticleInput): i64! {
   let stamp = now().ns
   let slug = "${slugify(input.title)}-${uuidFormat(uuidV4())[0:8]}"
-  let cols = ["title", "slug", "body", "author_id", "created_at", "updated_at"]
+  let cols = ["title", "slug", "body", "author_id", "created_at", "updated_at", "version"]
   let args = [
     Value.Text(input.title), Value.Text(slug), Value.Text(input.body), Value.Int(authorId),
-    Value.Int(stamp), Value.Int(stamp),
+    Value.Int(stamp), Value.Int(stamp), Value.Int(0),
   ]
   let newId = insertGeneratedId(db, "articles", cols, args)?
   attachTagNames(db, newId, input.tags)?
@@ -291,6 +361,47 @@ export @json class UpdateArticleInput {
   body: string,
 }
 
+// Every column `save` writes for `articleWriteDesc()`'s fields — every
+// real column of `Article` MINUS `author`/`tags` (this file's header on
+// `updateArticle`'s use of `save`, mirroring `pkg/orm/docs/version.md`'s
+// "every column, including the version column itself" convention).
+// `author`/`tags` cannot be included: `pkg/orm/write.bit`'s `isRelationField`
+// is supposed to skip a `@belongsTo`/`@manyToMany` field automatically, but
+// this module (like every relation-bearing caller in this package, e.g.
+// `pkg/orm/write.test.bit`'s own `postsLoader`) imports the relation-loader
+// builder under the SAME name as the field attribute (`belongsTo`, used
+// both as `@belongsTo("authorId")` and as this file's own `authorLoader()`
+// call) — `compiler/classtabledesc.bit`'s CALL/RECORD split then resolves
+// the attribute to that import and never records it, so `isRelationField`
+// never sees it and `valueFor` panics naming the field. Filed as a gap
+// under #6061 (pkg/orm's own `personDesc()`/`docs/write.md` already hand-
+// exclude relation fields from a write-side `TableDesc` for the identical
+// reason — `articleWriteFields` follows that same established pattern).
+// `deletedAt` is always `Value.Null` here because `existing` came from
+// `findArticleById`, which never returns a soft-deleted row.
+fn articleUpdateValues(
+  existing: Article,
+  input: UpdateArticleInput,
+  expectedVersion: int,
+): map<string, Value> {
+  return map<string, Value>{
+    "id": Value.Int(existing.id),
+    "title": Value.Text(input.title),
+    "slug": Value.Text(existing.slug),
+    "body": Value.Text(input.body),
+    "authorId": Value.Int(existing.authorId),
+    "createdAt": Value.Int(existing.createdAt),
+    "updatedAt": Value.Int(now().ns),
+    "deletedAt": Value.Null,
+    "version": Value.Int(expectedVersion),
+  }
+}
+
+// Optimistic locking (part 30, #6129): `If-Match` names the version the
+// caller last read. `save` (pkg/orm/version.bit) binds it as the UPDATE's
+// `WHERE version = ...` and raises `StaleWriteError` — never silence —
+// when someone else's write landed first; that maps to 412, the client's
+// signal to reload and retry.
 fn updateArticle(c: Ctx, db: Data): Res! {
   let id = parseId(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
@@ -300,10 +411,21 @@ fn updateArticle(c: Ctx, db: Data): Res! {
   }
   requireOwnerOrAdmin(c, existing.authorId)?
   let input = c.body<UpdateArticleInput>()?
-  update<Article>(db, "articles", articleDesc().fields).where("id", Value.Int(id)).set(
-    "title",
-    Value.Text(input.title),
-  ).set("body", Value.Text(input.body)).run()?
+  let ifMatch = c.header("If-Match")
+  if (len(ifMatch) == 0) {
+    fail badRequest("If-Match header is required")
+  }
+  let expectedVersion = parseInt(ifMatch) catch _ {
+    fail badRequest("If-Match must be an integer version")
+  }
+  let values = articleUpdateValues(existing, input, expectedVersion)
+  save(db, articleWriteDesc(), values, true) catch e {
+    let (_, stale) = e.(StaleWriteError)
+    if (stale) {
+      fail httpError(412, "the article changed since you last read it; reload and retry")
+    }
+    fail e
+  }
   let refreshed = findArticleById(db, id)?
   return c.json(toArticleView(refreshed))
 }
