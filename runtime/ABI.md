@@ -793,7 +793,7 @@ RootScanner {
 **Register file.** A live reference at a safepoint is in a register the walk can
 recover, or spilled to a frame slot — never one that is simply lost. Which
 registers those are depends on WHICH KIND of safepoint it is, and the two
-answers differ on AArch64:
+answers differ on both targets:
 
 - **An ordinary call.** Its stack map is consulted only for a frame the walk has
   already unwound INTO, and the register values it reads have been restored from
@@ -803,12 +803,25 @@ answers differ on AArch64:
   `rbx`/`r13`/`r14`/`r15` (plus `rsi`/`rdi` under Win64), AArch64 `x19`..`x28`.
 - **A back-edge poll.** Its stack map is only ever consulted as frame 0 of the
   snapshot `bit_rt_safepoint` itself published, with no restore in front of it,
-  so a reference there may occupy any register the shim stores. On x86-64 that
-  is still the callee-saved subset. On AArch64 it is the WHOLE allocatable
-  integer file — `x1`..`x8`, `x12`..`x15`, `x19`..`x28` — because the shim saves
-  and reloads all of them (below). `x0` is excluded: the compiler materializes
-  the shim's own `entryOf` operand into it ahead of the payload, so the caller's
-  value is already gone before the first store.
+  so a reference there may occupy any register the shim stores. That is the
+  WHOLE allocatable integer file but one, because the shim saves and reloads
+  all of them (below): on AArch64 `x1`..`x8`, `x12`..`x15`, `x19`..`x28`
+  (#4429); on x86-64 `rcx`, `rdx`, `rbx`, `rsi`, `rdi`, `r8`, `r9`, `r13`,
+  `r14`, `r15` (#5992). `x0`/`rax` is excluded: the compiler materializes the
+  shim's own `entryOf` operand into it ahead of the payload, so the caller's
+  value is already gone before the first store. The operand itself travels in
+  never-allocatable scratch (`x9`/`r11`), so no other register is lost.
+
+The snapshot is complete for that set because the walk is partitioned by
+frame, not by register: `bit_rt_safepoint` is the only publisher of a non-zero
+`SafepointFrame` (the allocation and thread-enter doors publish 0), so frame 0
+of every precise walk is a poll site read from the raw snapshot, and every
+later frame is a call site read after the restore, where only callee-saved
+registers can be named. Both backends assert this per stack-map entry
+(`arm64compile.bit`'s `assertStackMapsSnapshotSaved`, `x64compile.bit`'s
+`xAssertStackMapsSnapshotSaved`). The widened registers survive a park too:
+they sit in the shim's frame on the task's own stack, which a context switch
+preserves and the parked-task conservative scan covers.
 
 `compiler/regallocpoints.bit`'s `AllocPoints` carries the split — `polls` versus
 `calleeSafepoints` — and `RegFile.pollSaved` versus `RegFile.calleeSaved` carries
