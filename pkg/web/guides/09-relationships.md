@@ -249,7 +249,12 @@ fn toArticleView(a: Article): ArticleView {
   for t of a.tags {
     tagViews = append(tagViews, toTagView(t))
   }
-  return ArticleView{ id = a.id, title = a.title, authorUsername = a.author.username, tags = tagViews }
+  return ArticleView{
+    id = a.id,
+    title = a.title,
+    authorUsername = a.author.username,
+    tags = tagViews,
+  }
 }
 
 fn showArticle(c: Ctx, db: Data): Res! {

@@ -27,7 +27,15 @@ import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql
 }
 
 fn articlePlaceholder(): Article {
-  return Article{ id = 0, title = "", slug = "", body = "", authorId = 0, createdAt = 0, updatedAt = 0 }
+  return Article{
+    id = 0,
+    title = "",
+    slug = "",
+    body = "",
+    authorId = 0,
+    createdAt = 0,
+    updatedAt = 0,
+  }
 }
 
 fn articleDesc(): TableDesc {
@@ -90,7 +98,13 @@ fn parseId(s: string): i64! {
 }
 
 fn toArticleView(a: Article): ArticleView {
-  return ArticleView{ id = a.id, title = a.title, slug = a.slug, body = a.body, authorId = a.authorId }
+  return ArticleView{
+    id = a.id,
+    title = a.title,
+    slug = a.slug,
+    body = a.body,
+    authorId = a.authorId,
+  }
 }
 
 fn listArticles(c: Ctx, db: Data): Res! {
@@ -270,7 +284,13 @@ fn updateArticle(c: Ctx, db: Data): Res! {
   existing.title = input.title
   existing.body = input.body
   let values = articleValues(existing)
-  let desc = applyTimestamps(articleDesc(), values, existing.isPersisted(), existing.tableAttrs(), now())?
+  let desc = applyTimestamps(
+    articleDesc(),
+    values,
+    existing.isPersisted(),
+    existing.tableAttrs(),
+    now(),
+  )?
   save(db, desc, values, existing.isPersisted())?
   return c.json(toArticleView(existing))
 }
