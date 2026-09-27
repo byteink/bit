@@ -3009,15 +3009,33 @@ the variadic parameter (`...xs: T`, §10.3) is a compile error - it takes zero
 or more arguments, so `xs = v` names no single slot. A `...` spread argument
 may not be combined with a named argument in the same call.
 
+**A defaulted parameter (§10.3) left unfilled takes its default**, exactly
+as a plain positional call's trailing omission does - named arguments only
+change *how* a slot is filled, never *whether* an unfilled defaulted slot is
+an error. The skipped slot need not be trailing among the *arguments
+written*: `f(k, nx = true)` against `fn f(k: string, ttl: int = 0, nx: bool
+= false)` fills `ttl` from its default while `nx` is named, and prints the
+same thing `f(k, 0, true)` would. A parameter with **no** default that is
+still unfilled once positional and named arguments are resolved is a
+compile error naming it - `f(nx = true)` for the same `f` is `missing
+argument 'k'`.
+
 **Direct calls only.** A named argument is legal only where the callee's own
 declared parameter list is in scope for the call site to resolve `name`
 against. That is: a free function or `extern fn` (§11.7), written bare or
 through a namespace alias; a method, on a class receiver, on `this`, or
-through an interface value; and a class constructor (§10.4), which resolves
-against its `init` declaration. A method resolves against the declaration the
-call site can see: the class's own declaration for a call on a class value,
-and the *interface's* method signature for a call through an interface value,
-since dynamic dispatch is all that call site knows.
+through an interface value; a **static** method (§10.4.1), through its
+declaring class's own name; and a class constructor (§10.4), which resolves
+against its `init` declaration. A method resolves against the declaration
+the call site can see: the class's own declaration for a call on a class
+value or a static call through its class, and the *interface's* method
+signature for a call through an interface value, since dynamic dispatch is
+all that call site knows. A static call through a **bound generic type
+parameter** (`T.label()`, `T: Named`) is positional only, for the same
+reason a generic receiver is below - the checker can see only the
+constraint interface's declared names, while the call dispatches, after
+monomorphization, to the concrete implementation's, and the two may legally
+disagree.
 
 ```
 log.emit(count = 7, label = "hits")   // class receiver
@@ -3025,6 +3043,7 @@ sink.emit(count = 7, label = "hits")  // interface receiver, resolved
                                       // against the interface's signature
 geo.label(port = 3000, name = "web")  // namespace alias for a free function
 Acct(fee = 5, start = 100)            // constructor, against 'init'
+Box.make(nx = true)                   // static method, through its class
 ```
 
 A call through a function *value* is positional only:
@@ -3048,6 +3067,7 @@ generic class or interface, or when the receiver is a type parameter:
 pick(b = 1, a = 2)    // error: pick<T> is generic
 box.set(x = 1)        // error: box is a GBox<int>
 shape.area(w = 3)     // error inside fn f<T: Shape>(shape: T)
+T.label(x = 1)        // error inside fn describe<T: Named>(), a static call
 ```
 
 A generic declaration's parameter *types* still mention its open type

@@ -36,6 +36,11 @@ const ecNamedArgDuplicate = 125
 const ecPositionalAfterNamed = 126
 const ecNamedArgVariadic = 127
 const ecNamedArgNotDirect = 128
+// E0171 (#6121): a fixed parameter with NO default (SPEC §10.3) still
+// unfilled once positional and named arguments are resolved. Distinct from
+// `ecArgCount`'s bare-count message so the diagnostic names the actual
+// parameter, matching every other named-argument rejection's shape.
+const ecNamedArgMissing = 171
 
 // The resolved callee `vCall` (validatecall.bit) dispatches to: a free
 // function or `extern fn` declaration, fully known before any of its
@@ -282,19 +287,77 @@ fn vNsNamedArgs(c: Checker, node: int, callee: int, args: []int, namedStart: int
   return true
 }
 
+// A STATIC method call's named arguments, `Box.zero(a = 2)` (SPEC §10.4.1,
+// #6091/#6099, #6121) — through the class's own name only. `mk[0]` names a
+// TYPE, not a value, so plain `methodParamNodes` below — which types the
+// receiver through `checkExprType` — never resolves it and every static
+// named-argument call fell to `vRejectNamedArgs` (E0128) before this.
+// Answers false when `callee`'s base does not name a static receiver at all
+// (`staticReceiverType`, checkexprcall.bit) or names one with no static
+// method by this name, leaving the instance-method path below to try the
+// same node — mirrors `vNsNamedArgs`'s identical early-return shape.
+//
+// A BOUND GENERIC's `T.label(x = 1)` is refused (falls through to E0128),
+// same treatment SPEC §12.11 already gives a generic receiver: unlike a bare
+// class name, `staticReceiverType` resolves `T` straight to its CONSTRAINT
+// interface (`c.typeParamConstraints[ut]`) — `sst`'s kind is then
+// `TypeKind.Interface`, never reachable for a direct class name, since that
+// branch requires `TypeKind.Struct`. But `lowerStaticReceiverType`
+// (lowercall.bit) resolves the SAME node through `fc.genEnv` to the
+// MONOMORPHIZED CONCRETE class instead — `methodParamNodes`'s own header
+// names this exact hazard for the instance-method case: the checker would
+// validate a name against the interface's declared list while the lowerer
+// fills it against the implementing class's, and an implementation matches
+// an interface by TYPE, not by parameter spelling or default, so the two
+// may legally disagree. Refusing here keeps this call ungated by the same
+// rule the instance path already enforces, rather than resolving it against
+// a declaration the lowerer will not use.
+//
+// For a direct class receiver, `methodParamNodes` is reused unchanged:
+// `collectFuncDecl` (checkbindfunc.bit) records a `static fn` into the SAME
+// `methodDecls` table under the SAME "<typeId>.<name>" key an instance
+// method uses (only `staticMethods` distinguishes the two), so its ordinary
+// `fr.decl != 0` arm already reads the right declaration. The lowering side
+// reads the identical one: `lowerStaticMethodCall` (lowercall.bit) resolves
+// `mname` through `methodRefAt(fc.c, recvTy, mname)` on the SAME class id,
+// the same lookup this validates against.
+fn vStaticNamedArgs(c: Checker, node: int, callee: int, args: []int, namedStart: int): bool {
+  let mk = kidsOf(c.tree, callee)
+  let sst = staticReceiverType(c, mk[0])
+  if (sst == 0 || c.ctx.types[sst].kind == TypeKind.Interface) {
+    return false
+  }
+  let mn = getNode(c.tree, mk[1])
+  let mname = c.source[mn.span.start:mn.span.end]
+  if (!staticMethodLookup(c, "${sst}.${mname}")) {
+    return false
+  }
+  let mp = methodParamNodes(c, sst, mname)
+  if (!mp.ok) {
+    vRejectNamedArgs(c, args)
+    return true
+  }
+  vCallNamedArgs(c, node, mkCallDecl(mp.owner, 0, mname, false, mp.params), args, namedStart)
+  return true
+}
+
 // The named-argument branch of `vCallValue` (validatecall.bit) — the whole
 // of it, for every callee shape that function handles. A Member callee that
 // resolves to a declaration is validated exactly as a free call is, through
 // `vCallNamedArgs` below: a namespaced free function via `vNsNamedArgs`
-// above (#4686), otherwise a method via `methodParamNodes`. Everything else
-// (a function VALUE, a func-typed class field, an unresolved or generic
-// method) is E0128.
+// above (#4686), a static method via `vStaticNamedArgs` above (#6121),
+// otherwise an instance method via `methodParamNodes`. Everything else (a
+// function VALUE, a func-typed class field, an unresolved or generic method)
+// is E0128.
 fn vMemberNamedArgs(c: Checker, node: int, callee: int, args: []int, namedStart: int) {
   if (getNode(c.tree, callee).tag != Tag.Member) {
     vRejectNamedArgs(c, args)
     return
   }
   if (vNsNamedArgs(c, node, callee, args, namedStart)) {
+    return
+  }
+  if (vStaticNamedArgs(c, node, callee, args, namedStart)) {
     return
   }
   let mk = kidsOf(c.tree, callee)
@@ -449,36 +512,41 @@ fn vNamedArgResolveNames(
   return ok
 }
 
-// Every FIXED parameter must be filled exactly once — no default arguments
-// exist (SPEC §12 note) — checked in two parts: `namedStart` positional
-// arguments can never exceed `fixed` many on their own (or a fixed parameter
-// would need both a position and, per the same rule, a name), and once names
-// are resolved every index below `fixed` must be marked in `filled`. Split
-// out of `vCallNamedArgs` for the same complexity reason as `vNamedArgOrder`.
-fn vNamedArgArity(c: Checker, node: int, fixed: int, namedStart: int, filled: []bool): bool {
-  if (namedStart > fixed) {
+// Every FIXED parameter below `cd.minWant` (SPEC §10.3, #5244) — the ones
+// with NO default — must be filled exactly once; a fixed parameter AT or
+// past `cd.minWant` may stay unfilled, since it carries a `= const_expr`
+// default that `lowerArgsForNamed` (lowernamedarg.bit) then fills, exactly as
+// a plain positional call's own trailing omission already does (#6121: a
+// named or skipped-default call must lower to the same IR as the fully
+// spelled-out positional one, so the checker's arity rule and the lowerer's
+// fill rule read the identical `minWant` boundary). Checked in two parts:
+// `namedStart` positional arguments can never exceed `cd.fixed` many on
+// their own (or a fixed parameter would need both a position and, per the
+// same rule, a name), and once names are resolved every UN-defaulted index
+// must be marked in `filled`, named in the diagnostic (E0171) rather than
+// folded into a bare count. Split out of `vCallNamedArgs` for the same
+// complexity reason as `vNamedArgOrder`.
+fn vNamedArgArity(c: Checker, node: int, cd: CallDecl, namedStart: int, filled: []bool): bool {
+  if (namedStart > cd.fixed) {
     reportNoHint(
       c.diags, ecArgCount, vSpan(c, node),
-      "expected ${fixed} argument(s) before named arguments, found ${namedStart}",
+      "expected ${cd.fixed} argument(s) before named arguments, found ${namedStart}",
     )
     return false
   }
+  let ok = true
   let f = 0
-  let missing = 0
-  while (f < fixed) {
+  while (f < cd.minWant) {
     if (!filled[f]) {
-      missing = missing + 1
+      reportNoHint(
+        c.diags, ecNamedArgMissing, vSpan(c, node),
+        "missing argument '${paramNameOf(cd.owner.tree, cd.owner.source, cd.params[f])}'",
+      )
+      ok = false
     }
     f = f + 1
   }
-  if (missing > 0) {
-    reportNoHint(
-      c.diags, ecArgCount, vSpan(c, node),
-      "expected ${fixed} argument(s), found ${fixed - missing}",
-    )
-    return false
-  }
-  return true
+  return ok
 }
 
 // Argument TYPES (E0041) — the same rule `vCall`'s own positional loop
@@ -538,7 +606,7 @@ fn vCallNamedArgs(c: Checker, node: int, cd: CallDecl, args: []int, namedStart: 
   if (!vNamedArgResolveNames(c, cd, args, namedStart, res)) {
     return
   }
-  if (!vNamedArgArity(c, node, cd.fixed, namedStart, res.filled)) {
+  if (!vNamedArgArity(c, node, cd, namedStart, res.filled)) {
     return
   }
   vNamedArgTypeCheck(c, cd, args, namedStart, res)
