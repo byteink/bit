@@ -14,7 +14,7 @@ import { Second } from "std/time"
 
 fn main(): ()! {
   let r = open("redis://localhost:6379")?
-  let wrote = r.set("session:abc", "user:1", ttl = 60 * Second, ifAbsent = true)?
+  let wrote = r.set("session:abc", "user:1", ttl = 60 * Second, ifAbsent = true, ifExists = false)?
   if (!wrote) {
     println("session:abc already existed")
   }
@@ -73,7 +73,7 @@ fn main(): ()! {
   let sub = s.getRange(0, 4)? // "Hello"
   println(sub)
   let n = s.strLen()? // 12
-  println(n)
+  println("${n}")
 
   let read = s.getEx(30 * Second)?
   match (read) {
@@ -187,6 +187,11 @@ ever resolves one.
 - `getRange`/`strLen`/`lcs` never fail on a missing key; they return `""`,
   `0` and `""` respectively, matching Redis's own behavior for an absent
   string.
+- A named-argument call must still supply every parameter, defaulted ones
+  included (SPEC S12.11/S10.3's default-omission rule is described for a
+  purely positional call): `r.set(k, v, ttl = 60 * Second, ifAbsent =
+  true)` alone does not compile today - add `ifExists = false` too, or
+  drop to a fully positional call.
 
 ## Next
 
