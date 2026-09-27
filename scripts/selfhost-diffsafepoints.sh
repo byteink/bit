@@ -45,17 +45,17 @@ set -u
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 
-# #5976: dead block-param pruning (`dceParamsEnabled()`, compiler/opt.bit,
-# #5949) removes jumps and merges blocks, which moves safepoint placement,
-# and the `@json` `__jsonAppend` direct encoder (`jsonAppendEnabled()`,
+# #5976: the `@json` `__jsonAppend` direct encoder (`jsonAppendEnabled()`,
 # compiler/classjsonappend.bit, #5991) adds a whole new method with its own
-# loops to safepoint. Both changed this differential's count when the tree
-# flipped to default-on while the 0.30.0 ORACLE still defaults them off:
-# `_tests_/cases/run_json_attr.bit` etc. (the extra method), and every jsx_*
-# fixture (a shared runtime helper's dead param). BIT_IFACE_SIG/BIT_BCE_JOIN
-# do not move a safepoint count, so they stay unexported here. Remove these
-# two exports, and the flags themselves, at the next repin.
-export BIT_DCE_PARAMS=1
+# loops to safepoint, which changed this differential's count when the tree
+# flipped to default-on while the 0.30.0 ORACLE still defaults it off:
+# `_tests_/cases/run_json_attr.bit` etc. BIT_IFACE_SIG/BIT_BCE_JOIN do not
+# move a safepoint count, so they stay unexported here. BIT_DCE_PARAMS
+# (#5949) also moved this count (every jsx_* fixture, a shared runtime
+# helper's dead param) but its default-on flip was reverted -- #5976 found a
+# live segfault under BIT_GC=stress -- so it needs no export while both
+# sides default off. Remove the export below, and the flag itself, at the
+# next repin.
 export BIT_JSON_APPEND=1
 
 # 60s, not the 20s dump-call convention (diffdump.sh/diffcheck.sh/diffverdict.sh/

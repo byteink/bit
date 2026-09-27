@@ -30,13 +30,14 @@ ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 # #5995/#5976: same reasoning as selfhost-diffdump.sh's identical export --
 # the 0.30.0 ORACLE above still defaults BIT_IFACE_SIG (#5979), BIT_BCE_JOIN
-# (#5971), BIT_DCE_PARAMS (#5949) and BIT_JSON_APPEND (#5991) off, the tree
-# now defaults all four on, and this is the one place both invocations share
-# their environment. Remove these exports, and the flags themselves, at the
-# next repin.
+# (#5971) and BIT_JSON_APPEND (#5991) off, the tree now defaults all three
+# on, and this is the one place both invocations share their environment.
+# BIT_DCE_PARAMS (#5949) stays off on both sides -- #5976 found a live
+# segfault under BIT_GC=stress and reverted that default flip, so no export
+# is needed for it here. Remove the exports below, and the flags themselves,
+# at the next repin.
 export BIT_IFACE_SIG=1
 export BIT_BCE_JOIN=1
-export BIT_DCE_PARAMS=1
 export BIT_JSON_APPEND=1
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
