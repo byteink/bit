@@ -490,7 +490,15 @@ let termActBuf: [4]i64
 // context, and why `128 + sig` rather than resetting the disposition and
 // re-raising), including #4172's `osKillAllUnboundedChildren` (plain `bit
 // run`'s own child, tracked separately from a bounded child).
+// #6087: notify a Bit-level `waitForSignal` (std/os) waiter before deciding
+// whether to exit — see ../darwin/signal.bit's matching section for the
+// full reasoning (identical here: same flag, same fallback contract, same
+// self-pipe shape, raw `syscall`s instead of libSystem externs).
 @nosplit fn termHandler(sig: i32, info: *u8, ctx: *u8) {
+  osSignalNotify(int(sig))
+  if (atomicLoad(ptrOf(osSignalArmedFlag)) == osSignalArmed) {
+    return
+  }
   osKillAllOutstandingChildren()
   osKillAllUnboundedChildren()
   // #5765: the killed child leaves its own compiled test binary behind in
@@ -518,4 +526,161 @@ let termActBuf: [4]i64
   storeWord(base + 24, 0)
   syscall(sysRtSigaction(), i64(sigTerm), i64(base), i64(0), i64(sigSetSize))
   syscall(sysRtSigaction(), i64(sigInt), i64(base), i64(0), i64(sigSetSize))
+}
+
+// ---------------------------------------------------------------------------
+// #6087: std/os's `waitForSignal` — see ../darwin/signal.bit's matching
+// section for the full design reasoning (identical here: same three-state
+// arm flag, same fallback contract for a program that never calls
+// `waitForSignal`, same per-worker read scratch). The two real differences:
+// (1) `pipe2(fds, O_CLOEXEC|O_NONBLOCK)` in ONE syscall via the raw
+// `sysPipe2` trap, rather than Darwin's `pipe()` + two `fcntl` calls (no
+// `pipe2` on Darwin); (2) plain `sysRead`/`sysWrite` traps addressing a raw
+// int, rather than libSystem `read`/`write` externs needing a `*u8`.
+// ---------------------------------------------------------------------------
+
+import { pdOpen, pdWait, pdDirRead, pdClaimed, pdAlreadyReady, pdStaleGen } from "../../sched"
+import { schedParkArm, schedParkDisarm, schedPark, schedPollPendingInc } from "../../sched"
+import { taskWorker, wkSched, scPollFd } from "../../sched"
+import { pollDescRegister } from "../../sched/linux"
+
+const osSignalUnarmed: int = 0
+const osSignalArming: int = 1
+const osSignalArmed: int = 2
+
+let osSignalReadFd: [1]i64
+let osSignalWriteFd: [1]i64
+let osSignalGen: [1]i64
+let osSignalArmedFlag: [1]i64
+
+// `O_CLOEXEC` (0o2000000 = 524288) | `O_NONBLOCK` (0o4000 = 2048) — both are
+// valid `pipe2` flags (`include/uapi/asm-generic/fcntl.h`), the same two
+// values `../linux/osruncap.bit`'s `osCapCloexec`/`osCapNonBlock` already
+// use for the SAME two bits on this platform (redeclared here: that file is
+// a different module).
+const osSignalPipeFlags: int = 526336
+
+// `ptrOf` only addresses module-level state (E0053) — see ../darwin/
+// signal.bit's identical comment for the full reasoning on each buffer's
+// concurrency contract.
+let osSignalArmScratch: [1]i64
+let osSignalNotifyScratch: [1]i64
+let osSignalReadScratch: [33]i64 // 1 word/slot * (osScratchSlots + 1)
+
+@nosplit fn osSignalReadScratchAddr(): int {
+  return int(ptrOf(osSignalReadScratch)) + osScratchSlot() * 8
+}
+
+// Async-signal-safe: see ../darwin/signal.bit's `osSignalNotify` for the
+// full contract (the accepted two-threads-at-once race on
+// `osSignalNotifyScratch`, the EAGAIN-drops-a-duplicate reasoning).
+@nosplit fn osSignalNotify(sig: int) {
+  let wfd = atomicLoad(ptrOf(osSignalWriteFd))
+  if (wfd <= 0) {
+    return
+  }
+  storeWord(int(ptrOf(osSignalNotifyScratch)), sig)
+  syscall(sysWrite(), i64(wfd), i64(ptrOf(osSignalNotifyScratch)), i64(1))
+}
+
+// See ../darwin/signal.bit's `osSignalArm` for the full contract.
+fn osSignalArm() {
+  if (atomicLoad(ptrOf(osSignalArmedFlag)) == osSignalArmed) {
+    return
+  }
+  if (!atomicCmpxchg(ptrOf(osSignalArmedFlag), osSignalUnarmed, osSignalArming)) {
+    let spins = 0
+    while (atomicLoad(ptrOf(osSignalArmedFlag)) != osSignalArmed && spins < 100000000) {
+      spins = spins + 1
+    }
+    return
+  }
+  storeWord(int(ptrOf(osSignalArmScratch)), 0)
+  let rc = int(syscall(sysPipe2(), i64(ptrOf(osSignalArmScratch)), i64(osSignalPipeFlags)))
+  if (rc != 0) {
+    // Arming failed — see ../darwin/signal.bit's identical comment: both
+    // fds stay 0, `termHandler` keeps its original #3507/#4172 behavior.
+    return
+  }
+  let raw = loadWord(int(ptrOf(osSignalArmScratch)))
+  let rfd = raw & 4294967295
+  let wfd = raw >> 32
+
+  let gen = pdOpen(rfd)
+  let taskAddr = schedCurrentTask()
+  if (taskAddr != 0) {
+    let t = taskAt(taskAddr)
+    let wAddr = *(t + taskWorker)
+    if (wAddr != 0) {
+      let s = taskAt(*(taskAt(wAddr) + wkSched))
+      let pollFd = *(s + scPollFd)
+      if (pollFd != 0) {
+        let _ = pollDescRegister(pollFd, rfd, gen)
+      }
+    }
+  }
+
+  atomicStore(ptrOf(osSignalReadFd), rfd)
+  atomicStore(ptrOf(osSignalWriteFd), wfd)
+  atomicStore(ptrOf(osSignalGen), gen)
+  atomicStore(ptrOf(osSignalArmedFlag), osSignalArmed)
+}
+
+// See ../darwin/signal.bit's `osSignalAwaitReadable` for the full contract.
+fn osSignalAwaitReadable(fd: int, gen: int): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return false
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  if (*(s + scPollFd) == 0) {
+    return false
+  }
+  if (!schedParkArm()) {
+    return false
+  }
+  let r = pdWait(fd, pdDirRead, gen, taskAddr)
+  if (r == pdAlreadyReady) {
+    let _ = schedParkDisarm()
+    return true
+  }
+  if (r != pdClaimed) {
+    let _ = schedParkDisarm()
+    return r == pdStaleGen
+  }
+  // #6087: see ../darwin/signal.bit's identical comment — a server parked
+  // purely on `waitForSignal` needs `schedPollPendingInc` or the deadlock
+  // detector panics "all tasks are asleep" despite a real wakeup pending.
+  schedPollPendingInc()
+  schedPark()
+  return true
+}
+
+// `bit_rt_os_wait_for_signal` (ABI.md §19, #6087) — see ../darwin/
+// signal.bit's identical function for the full contract.
+export @symbol("bit_rt_os_wait_for_signal") fn rtOsWaitForSignal(): int {
+  osSignalArm()
+  let rfd = atomicLoad(ptrOf(osSignalReadFd))
+  if (rfd <= 0) {
+    return 0
+  }
+  let gen = atomicLoad(ptrOf(osSignalGen))
+  let spins = 0
+  while (spins < 100000000) {
+    let bufAddr = osSignalReadScratchAddr()
+    storeWord(bufAddr, 0)
+    let n = int(syscall(sysRead(), i64(rfd), i64(bufAddr), i64(1)))
+    if (n == 1) {
+      return loadWord(bufAddr) & 0xFF
+    }
+    if (!osSignalAwaitReadable(rfd, gen)) {
+      spins = spins + 1
+    }
+  }
+  return 0
 }

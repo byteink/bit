@@ -2713,6 +2713,7 @@ defined exactly once).
 | `bit_rt_os_run_bounded` | `(path: *const RtBytes, timeout_ms: i64) -> i64` (§19) |
 | `bit_rt_os_run_test_bounded` | `(path: *const RtBytes, idx: i64, timeout_ms: i64) -> i64` (§19) |
 | `bit_rt_host_target`  | `() -> i64` (§19)                                      |
+| `bit_rt_os_wait_for_signal` | `() -> i64` (§19, #6087): blocks until the process receives SIGTERM or SIGINT (Linux/Darwin) or a Ctrl-C/Ctrl-Break/close console event (Windows), returns the raw POSIX signal number (2 = SIGINT, 15 = SIGTERM — the same two numbers on every platform this runtime supports). A plain `extern fn` in `stdlib/os/signal.bit`, not a compiler primitive: `tools/build` imports `std/os`, so a new primitive here would need the pinned stage0 compiler to already know its name (#3538/#5901's bootstrap constraint) — an `extern fn` naming the runtime symbol directly has no such ordering requirement. |
 | `bit_rt_auxv`         | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |

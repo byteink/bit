@@ -98,6 +98,39 @@ fn assetDir(): string {
 
 Running a child process is [`std/process`](process.md), not here.
 
+## Shutting down cleanly
+
+A process only ever stops two ways: the OS kills it outright (no code runs
+after that, ever) or something inside the program calls `exit`. Neither lets
+an external `docker stop`, `kubectl delete pod` or a developer's Ctrl-C run
+any code first - `SIGTERM`/`SIGINT` just end the process. `waitForSignal`
+gives a program a third option: block a green thread until one of those
+signals arrives, and run your own shutdown logic before the process ends.
+
+### `waitForSignal(sigs: []Signal): Signal`
+
+Blocks the calling green thread until the process receives one of `sigs`,
+and returns which one arrived. Start every listener on its own green thread
+first, then wait for the signal, then shut down:
+
+```bit
+import { waitForSignal, Signal } from "std/os"
+
+fn main() {
+  // ... start listeners, background work, etc. on their own green threads ...
+
+  let _ = waitForSignal([Signal.Term, Signal.Int])
+  print("shutting down\n")
+  // ... close listeners, drain in-flight work, flush writers ...
+}
+```
+
+A signal not in `sigs` never returns from the call - it is silently
+re-waited. Windows delivers `Signal.Int` for Ctrl-C and `Signal.Term` for
+Ctrl-Break, a console close or a logoff/shutdown event
+(`SetConsoleCtrlHandler`); there is no narrower Windows equivalent of
+`SIGKILL` to worry about missing.
+
 ## Exiting
 
 ### `exit(code: int)`
