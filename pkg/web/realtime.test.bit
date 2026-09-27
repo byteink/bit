@@ -1,0 +1,278 @@
+// pkg/web/realtime.test.bit — #6072's acceptance beyond the hijack path
+// itself (ctx.test.bit): a WebSocket room that broadcasts across
+// connections, an SSE stream a client reads, and a streamed body over
+// 100 MB. Every test runs against a REAL socket served by `app.serve()`
+// (app.bit) itself, on a route registered `.hijackable()` — the real public
+// API, not a hand-rolled test harness.
+//
+// `App`, `Config`, `dial` (std/net, adapterhead.test.bit), `wsDial`/
+// `wsDefaultLimits`/`closeNormal` (std/websocket, ctx.test.bit), `contains`
+// (router.test.bit) and `repeat` (std/strings, ctx.test.bit) are already
+// bound module-wide — reused, not reimported (E0042). `Mutex`/`newMutex`
+// (std/sync) are already module-wide via memorystore.bit.
+import { MessageClose } from "std/websocket"
+
+// --- part 41: WebSocket broadcast (live comments) --------------------------
+
+// A room of connected sockets, broadcasting every text message it receives
+// from one to all of them (including the sender, so a client can confirm its
+// own message landed) — the shape a live-comments feed needs on top of the
+// bare `wsUpgrade` primitive. Test-only: nothing here is pkg/web's to own,
+// the same way session storage is the app's `SessionStore` to implement, not
+// the framework's.
+class Room {
+  mu: Mutex,
+  conns: []WsConn,
+}
+
+fn newRoom(): Room {
+  return Room{ mu = newMutex(), conns = []WsConn(0) }
+}
+
+// `joined` is a synchronization channel, not application state: a test
+// dialing a second client has no other signal for "the server finished
+// registering the first one", and sending on the room's connection list
+// before the server has appended to it would race the assertions below.
+fn roomJoin(r: Room, c: WsConn, joined: chan<int>) {
+  r.mu.lock()
+  r.conns = append(r.conns, c)
+  let n = len(r.conns)
+  r.mu.unlock()
+  joined <- n
+}
+
+fn roomBroadcast(r: Room, text: string) {
+  r.mu.lock()
+  let conns = r.conns
+  r.mu.unlock()
+  for conn of conns {
+    conn.sendText(text) catch _ {
+      // A dead peer's send failure is that peer's problem, never the
+      // broadcaster's: the loop still reaches every other connection.
+    }
+  }
+}
+
+test "a real WebSocket connection broadcasts to every peer in the room" {
+  let room = newRoom()
+  let joined = chan<int>(2)
+  let app = App(Config{ secret = "test-secret" })
+  app.get("/ws/room", (c) => {
+    let conn = wsUpgrade(c, wsDefaultLimits()) catch _ {
+      return c.status(400)
+    }
+    roomJoin(room, conn, joined)
+    while (true) {
+      let msg = conn.receive() catch _ {
+        return c.noContent()
+      }
+      if (msg.kind == MessageClose) {
+        return c.noContent()
+      }
+      roomBroadcast(room, msg.data)
+    }
+  }).hijackable()
+
+  let s = app.serve() catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+
+  let a = wsDial("127.0.0.1", port, "/ws/room", wsDefaultLimits()) catch e {
+    s.close()
+    assert(false, "dial a: ${e.message()}")
+    return
+  }
+  // Blocks until the server has actually appended `a` to the room — see
+  // `roomJoin`'s own comment for why this is not optional.
+  let _ = <- joined
+
+  let b = wsDial("127.0.0.1", port, "/ws/room", wsDefaultLimits()) catch e {
+    s.close()
+    assert(false, "dial b: ${e.message()}")
+    return
+  }
+  let _ = <- joined
+
+  a.sendText("hello from a") catch e {
+    s.close()
+    assert(false, "a.sendText: ${e.message()}")
+    return
+  }
+
+  let onB = b.receive() catch e {
+    s.close()
+    assert(false, "b.receive: ${e.message()}")
+    return
+  }
+  assert(onB.data == "hello from a", "want a's message broadcast to b, got '${onB.data}'")
+
+  let onA = a.receive() catch e {
+    s.close()
+    assert(false, "a.receive: ${e.message()}")
+    return
+  }
+  assert(
+    onA.data == "hello from a",
+    "want a's message broadcast back to a (echo), got '${onA.data}'",
+  )
+
+  a.close(closeNormal, "") catch _ {}
+  b.close(closeNormal, "") catch _ {}
+  s.close()
+}
+
+// --- part 42: server-sent events --------------------------------------------
+
+test "an SSE stream is delivered to a client as framed text/event-stream chunks" {
+  let app = App(Config{ secret = "test-secret" })
+  app.get("/events", (c) => {
+    let sse = newSSE(c) catch _ {
+      return c.status(500)
+    }
+    sse.send("greeting", "hello") catch _ {}
+    sse.sendData("second") catch _ {}
+    sse.close() catch _ {}
+    return c.noContent()
+  }).hijackable()
+
+  let s = app.serve() catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  conn.write("GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch e {
+    conn.close()
+    s.close()
+    assert(false, "write: ${e.message()}")
+    return
+  }
+  let wire = conn.readAll()
+  conn.close()
+  s.close()
+
+  assert(
+    contains(wire, "Content-Type: text/event-stream"),
+    "want the SSE Content-Type, got:\n${wire}",
+  )
+  assert(contains(wire, "Transfer-Encoding: chunked"), "want chunked framing, got:\n${wire}")
+  assert(
+    contains(wire, "event: greeting\ndata: hello\n\n"),
+    "want the named event framed as one event/data pair, got:\n${wire}",
+  )
+  assert(contains(wire, "data: second\n\n"), "want the anonymous event framed, got:\n${wire}")
+  assert(
+    wire[len(wire) - 5:len(wire)] == "0\r\n\r\n",
+    "want the terminating zero-length chunk at the end, got the last 5 bytes: '${wire[len(wire) - 5:len(wire)]}'",
+  )
+}
+
+// --- part 45: streaming large responses -------------------------------------
+
+// One fixed 256 KiB chunk, built ONCE and reused for every `write()` call
+// below — never re-built or concatenated onto a growing body — so sending
+// it `streamChunkCount` times costs this test exactly one allocation for the
+// chunk's own bytes, whatever `streamChunkCount` is.
+const streamChunkBytes = 262144
+const streamChunkCount = 420
+const streamTotalBytes = streamChunkBytes * streamChunkCount
+
+test "a streamed response over 100 MB is delivered in bounded, fixed-size chunks" {
+  assert(streamTotalBytes > 100_000_000, "fixture bug: streamTotalBytes must exceed 100 MB")
+
+  let app = App(Config{ secret = "test-secret" })
+  app.get("/big", (c) => {
+    let stream = newStream(c, 200, "application/octet-stream", []Header(0)) catch _ {
+      return c.status(500)
+    }
+    let chunk = repeat("x", streamChunkBytes)
+    let i = 0
+    while (i < streamChunkCount) {
+      stream.write(chunk) catch _ {
+        return c.noContent()
+      }
+      i = i + 1
+    }
+    stream.close() catch _ {}
+    return c.noContent()
+  }).hijackable()
+
+  let s = app.serve() catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  conn.write("GET /big HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch e {
+    conn.close()
+    s.close()
+    assert(false, "write: ${e.message()}")
+    return
+  }
+
+  // Reads with a small, FIXED buffer and tracks only a running total — never
+  // accumulates the body — so this loop's own memory stays flat whatever the
+  // server streamed. `dropped` counts the header bytes ahead of the body so
+  // the total asserted below is body-only.
+  let headerBytes = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+  let sawHeader = false
+  let buf = ""
+  let total = 0
+  let reading = true
+  while (reading) {
+    let piece = conn.read(65536)
+    if (len(piece) == 0) {
+      reading = false
+      continue
+    }
+    if (!sawHeader) {
+      buf = buf + piece
+      if (len(buf) < len(headerBytes)) {
+        continue
+      }
+      sawHeader = true
+      total = total + (len(buf) - len(headerBytes))
+      buf = ""
+      continue
+    }
+    total = total + len(piece)
+  }
+  conn.close()
+  s.close()
+
+  assert(sawHeader, "the response headers never arrived")
+  // `total` counts every wire byte after the headers, including the chunk
+  // hex-length prefixes/CRLFs and the terminating "0\r\n\r\n" — all of it
+  // bounded by `streamTotalBytes` plus a small, fixed per-chunk framing
+  // overhead, never by anything that scales with a buffered whole body.
+  let framingCeiling = streamTotalBytes + streamChunkCount * 16 + 16
+  assert(
+    total > streamTotalBytes,
+    "want over ${streamTotalBytes} wire bytes (>100 MB) after the headers, got ${total}",
+  )
+  assert(
+    total <= framingCeiling,
+    "want at most ${framingCeiling} wire bytes (body plus chunk framing), got ${total}",
+  )
+}

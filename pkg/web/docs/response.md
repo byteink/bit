@@ -154,4 +154,5 @@ JSON-encodes and additionally escapes every `<` byte, because an HTML parser
 looks for the literal sequence `</script` regardless of JS string-literal
 context.
 
-Next: [Middleware](middleware.md), for composing behavior around a request.
+Next: [WebSockets, SSE and streaming](realtime.md), for a connection that
+does not end after one response.
