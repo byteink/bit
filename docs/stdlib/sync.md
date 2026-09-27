@@ -312,30 +312,30 @@ Builds a pool that opens resources through `open`, closes them through
 `close`, and validates one before reuse through `healthy`. Nothing opens
 here - resources are created on demand, up to `opts.maxSize`.
 
-### `Pool<T>.acquire(): Lease<T>!`
+### `Pool.acquire(): Lease<T>!`
 
 Checks a resource out, opening one or waiting for one as `opts` allows.
 Waiters are served strictly in the order they arrived. Fails once
 `opts.acquireTimeout` passes rather than waiting forever.
 
-### `Pool<T>.release(lease: Lease<T>, ok: bool)`
+### `Pool.release(lease: Lease<T>, ok: bool)`
 
 Hands `lease` back. `ok = false` closes the resource instead of reusing it -
 the caller's way of saying "this one is bad", for a failure `healthy` cannot
 see on its own.
 
-### `Pool<T>.with<R>(f: (T) => R!): R!`
+### `Pool.with<R>(f: (T) => R!): R!`
 
 Acquires a resource, runs `f` on it, and releases it on every path,
 including a failing `f` - the usual way to use a pool, so a caller cannot
 forget to release.
 
-### `Pool<T>.close()`
+### `Pool.close()`
 
 Closes every idle resource and fails every waiting caller. A resource still
 checked out is closed as it comes back. Safe to call more than once.
 
-### `Pool<T>.stats(): PoolStats`
+### `Pool.stats(): PoolStats`
 
 A point-in-time snapshot of how the pool is doing.
 
