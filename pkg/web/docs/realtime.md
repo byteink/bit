@@ -17,24 +17,37 @@ otherwise write for you. You take over the wire, so you write the response
 line and headers yourself from here, or use `wsUpgrade`/`newSSE`/`newStream`
 below, which do it for you in the one shape each protocol needs.
 
-Hijacking only works on a server started with `App.listenHijackable()`
-instead of `App.listen()`:
+## One serving path
+
+`App.listen()` and `App.serve()` already support it - nothing extra to
+start. What a route needs is registering itself with `.hijackable()`, the
+same chained call `.name()` already is:
 
 ```bit
 import { App, Config } from "web"
 
 fn main(): ()! {
   let app = App(Config{ secret = "change-me-in-production" })
-  // ... register routes ...
-  app.listenHijackable()?
+  app.get("/ws/comments", (c) => {
+    let conn = c.hijack()?
+    // ... talk to conn directly, or wrap it with wsUpgrade/newSSE/newStream ...
+    return c.noContent()
+  }).hijackable()
+  app.listen()?
 }
 ```
 
-`listen()` keeps serving ordinary requests with the lower overhead of
-`std/http`'s keep-alive connections; `listenHijackable()` gives every
-connection up to one hijack instead. Run both, on different ports, if a
-service mixes plain JSON routes with realtime ones at scale - nothing about
-`wsUpgrade`/`newSSE`/`newStream` requires only routes on that app to use it.
+`.hijackable()` costs an app that never calls it nothing: `App.listen()`/
+`App.serve()` keep serving every OTHER route over `std/http`'s ordinary
+keep-alive connections exactly as before. The moment ANY route on the app
+is marked, though, the WHOLE app switches to answering one request per
+connection - a WebSocket, an SSE feed or a stream all keep their connection
+open for as long as the handler runs, so there is no way yet to keep
+reusing a connection for a plain request while also being ready to hand a
+later one on it over. A service mixing a high-throughput plain API with a
+realtime feature at real scale should put them on separate `App`s (and
+separate ports) for that reason, until that limitation closes (tracked
+internally, not a promise on any timeline).
 
 ## WebSockets: live comments
 
@@ -114,8 +127,11 @@ fn articleComments(c: Ctx, room: Room): Res! {
 
 Register one `Room` per article id (a `map<string, Room>` behind its own
 `Mutex`, or a row your database already has) and close over it the same way
-a database handle is closed over today: `app.get("/articles/:id/comments",
-(c) => articleComments(c, roomFor(c.param("id"))))`.
+a database handle is closed over today:
+`app.get("/articles/:id/comments", (c) => articleComments(c,
+roomFor(c.param("id")))).hijackable()` - the `.hijackable()` on the end is
+what tells `App.listen()`/`App.serve()` this app needs the accept loop that
+keeps a connection reachable for `wsUpgrade`; see "One serving path" above.
 
 ## Server-sent events: a live feed a browser subscribes to
 
@@ -189,13 +205,21 @@ noContent()` a hijacking handler returns exists only to satisfy `Res!`'s
 return type and is discarded.
 
 **Calling `hijack()` twice on one request fails.** So does calling it on a
-`Ctx` built by `app.handle()` (the in-process test seam) or served through
-plain `App.listen()` - both name what to do instead in the error message.
+`Ctx` built by `app.handle()` (the in-process test seam) or on a route that
+never called `.hijackable()` - both name what to do instead in the error
+message.
 
 **No middleware runs after a hijack**, including your own: CORS, CSRF,
 compression, request logging, all of it wraps the ordinary response path.
 A route that needs a check before it upgrades (an auth cookie, an
 `Origin` allowlist) makes that check itself, before calling `wsUpgrade`.
+
+**TLS, HTTP/2 and HTTP/3 do not support hijacking yet.** `App.listenTls()`/
+`App.serveTls()` serve every ordinary route the same way `listen()` does,
+but `c.hijack()`/`wsUpgrade`/`newSSE`/`newStream` all fail on a request that
+arrived over any of them - the error names why. A WebSocket, an SSE feed or
+a stream served today needs plain `App.listen()`/`App.serve()`, behind a
+TLS-terminating proxy if the deployment needs TLS at all.
 
 ## When not to use this
 
