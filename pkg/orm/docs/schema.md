@@ -142,11 +142,50 @@ rename is the only way to get it right every time.
 Dropping a table entirely is `drop("people")`, producing a `DropTable` node
 - there is no builder to open first.
 
+## Full-text search, other index methods, and generated columns
+
+`t.index` defaults to a B-tree, the one index every engine has. `.gin()`,
+`.gist()`, `.hash()` and `.brin()` ask for a different storage method by
+name - engine-neutral in the tree, the same way `ReferentialAction` is
+above; a dialect maps the name to its own keyword, or refuses if it has no
+equivalent (MySQL has no GiST or BRIN at all - see [Dialect](dialect.md)).
+`t.indexExpr` builds an index on an expression instead of a column list,
+and `.where(...)` on either kind adds a partial index's own predicate:
+
+```bit
+import { toTsvector } from "orm"
+
+fn articlesTable() {
+  table("articles", (t) => {
+    t.id("id")
+    t.string("title", 200)
+    t.text("body")
+    t.tsvector("search_vector").storedAs(
+      toTsvector("english", ["title", "body"], ["A", "B"]),
+    )
+    t.index("search_vector").gin()
+    t.indexExpr("lower(title)")
+    t.index("title").where("title is not null")
+  })
+}
+```
+
+`t.tsvector` declares a Postgres `tsvector` column - MySQL has no
+comparable type, so a migration naming one refuses on that dialect rather
+than picking a lossy substitute. `.storedAs(expr)` turns any column into a
+generated one (`GENERATED ALWAYS AS (expr) STORED`), computed from the
+row's own other columns and never written directly. `toTsvector` builds the
+recommended weighted expression - `setweight(to_tsvector('english',
+coalesce(title, '')), 'A') || ...` - from a list of columns and their
+weights (`'A'` through `'D'`), so a full-text search migration never hand-
+writes that expression itself. Querying the column it builds is an
+ordinary `whereRaw` call - see [Raw](raw.md).
+
 ## The escape hatch
 
-No builder here expresses a partial index, a trigger, a `CHECK`
-constraint, or `CREATE INDEX CONCURRENTLY`. `t.raw(...)` - on both `table`'s
-and `alter`'s builder - passes a statement through untouched, per dialect:
+No builder here expresses a trigger or `CREATE INDEX CONCURRENTLY`.
+`t.raw(...)` - on both `table`'s and `alter`'s builder - passes a
+statement through untouched, per dialect:
 
 ```bit
 fn addPartialIndex() {

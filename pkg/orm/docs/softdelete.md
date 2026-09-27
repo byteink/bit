@@ -272,7 +272,11 @@ at a plain, non-soft-delete `Author`:
 ```bit
 import { belongsTo, withRelationsScoped } from "orm"
 
-@table class Author { @id id: i64, name: string }
+@table class Author {
+  @id
+  id: i64
+  name: string
+}
 
 @table @softDelete class Article {
   @id
@@ -307,10 +311,17 @@ fn articleMapper(rows: Rows): Article! {
 fn authorLoader(): RelationLoader<Article> {
   return belongsTo<Article, Author>(
     (article) => article.authorId,
-    (db) => find<Author>(db, "authors", [FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }], authorMapper),
+    (db) => find<Author>(
+      db,
+      "authors",
+      [FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }],
+      authorMapper,
+    ),
     "id",
     (author) => author.id,
-    (article, author) => { article.author = author },
+    (article, author) => {
+      article.author = author
+    },
   )
 }
 
