@@ -385,6 +385,61 @@ like the upgrade you expect, then call this instead of `respond()` - never
 both on the same exchange, since the caller now owns the connection's
 lifetime, including closing it.
 
+### `Exchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
+
+`respond()`'s keep-alive-capable sibling, for a caller driving its own
+multi-request loop over one `Exchange` instead of `respond()`'s fixed
+one-request-per-connection framing (`serveHijackableOn`, below, is that
+loop). Writes `res` and reports whether the connection stays open for
+another `read()`. `mustCloseNow` forces `Connection: close` regardless of
+what `req` asked for; `req`'s own `Connection: close` still closes even when
+`mustCloseNow` is false. Unlike `respond()`, this never closes the
+connection on the "stays open" branch.
+
+### `HijackOutcome`
+
+What a `serveHijackableOn` handler returns for one request: `Answer(res)` to
+answer it normally, keeping the connection open for another request, or
+`Hijacked` to take the connection over (after calling `Exchange.hijack()`
+and writing whatever framing the upgrade needs) and stop serving it.
+
+### `serveHijackableOn(s: Server, handler: (Request, Exchange) => HijackOutcome): ()!`
+
+Serves HTTP forever on an already-bound `s`, dispatching every request to
+`handler` on its own green thread - the hijack-capable sibling of
+`listenAndServeOn`. Most requests answer through `HijackOutcome.Answer`, and
+the connection stays open for another one under `s`'s own idle-timeout/
+max-requests bounds, exactly like an ordinary keep-alive connection; one
+request returning `HijackOutcome.Hijacked` ends that connection's loop, and
+only that connection - every other connection this server serves keeps
+reusing itself across requests. Returns only once `s.close()`/`s.shutdown()`
+has closed the listener.
+
+```bit
+import { Server, Exchange, Request, HijackOutcome, ok, serve, serveHijackableOn } from "std/http"
+
+fn dispatch(req: Request, ex: Exchange): HijackOutcome {
+  if (req.path == "/upgrade") {
+    let conn = ex.hijack()
+    conn.write("HTTP/1.1 101 Switching Protocols\r\n\r\n") catch _ {}
+    return HijackOutcome.Hijacked
+  }
+  return HijackOutcome.Answer(ok("hi"))
+}
+
+fn main(): ()! {
+  let s = serve("127.0.0.1", 8080)?
+  serveHijackableOn(s, dispatch)?
+}
+```
+
+### `serveHijackableBackground(s: Server, handler: (Request, Exchange) => HijackOutcome)`
+
+`serveHijackableOn`'s spawn-and-forget sibling: swallows its return, since
+ending is the intended outcome of `Server.shutdown()`/`close()`, not a
+defect with no caller left to report it to. Use this from a green thread you
+`spawn` yourself when the caller needs to keep running after serving starts.
+
 ### `Server.close()`
 
 Stops listening.
