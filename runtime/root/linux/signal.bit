@@ -168,13 +168,17 @@ const saOnstack: int = 134217728
 // the second (fatal) SIGSEGV carried `si_code=SI_KERNEL si_addr=NULL` —
 // exactly `force_sigsegv`'s synthetic siginfo, not a real fault.
 //
-// The restorer this flag names is `sigReturnTrampoline` below. It is
+// The restorer this flag names is `sigReturnTrampoline` below. It is still
 // EFFECTIVELY DEAD CODE for `segvHandler`/`trapHandler`, which never return —
-// every path ends in `rootExit` — so the kernel never actually jumps to it.
-// The flag and a VALID pointer must still be present at REGISTRATION time
-// regardless: the check above is unconditional on `sa_flags`, checked once
-// when the signal is delivered, with no dependency on whether the handler
-// later returns.
+// every path ends in `rootExit` — so the kernel never actually jumps to it
+// FOR THOSE TWO. It is NOT dead for `termHandler` (#6087): that handler can
+// now return normally (a program that has called `waitForSignal` leaves the
+// process running instead of exiting), so the kernel genuinely invokes this
+// restorer on that path — see `sigReturnTrampoline`'s own header for the
+// `@naked` bug that path found. The flag and a VALID pointer must still be
+// present at REGISTRATION time regardless of which handler: the check above
+// is unconditional on `sa_flags`, checked once when the signal is
+// delivered, with no dependency on whether the handler later returns.
 const saRestorer: int = 67108864
 
 // `sigaltstack(2)`'s `stack_t` — `{ void *ss_sp; int ss_flags; size_t
@@ -426,13 +430,33 @@ const overflowSpawned: int = 2
 // memory: 15 on x86_64 (`arch/x86/entry/syscalls/syscall_64.tbl`), 139 on
 // aarch64 (`include/uapi/asm-generic/unistd.h`, `__NR_rt_sigreturn`).
 //
+// `@naked` (#6087): NOT OPTIONAL. `rt_sigreturn` requires `rsp` to point
+// EXACTLY at the kernel's own `struct rt_sigframe` the instant the syscall
+// runs; this function has never returned through it since #2988 landed it
+// ("EFFECTIVELY DEAD CODE for `segvHandler`/`trapHandler`, which never
+// return" — every path there still ends in `rootExit`), which is why an
+// ordinary (non-`@naked`) function body was never caught: `sigReturnTrampoline`
+// compiled with a plain prologue — `push %rbp; mov %rsp,%rbp` — that no one
+// ever executed. `termHandler` (#6087) is the FIRST caller of this restorer
+// that can genuinely return, and the plain prologue's `push %rbp` moves
+// `rsp` 8 bytes below the sigframe before `syscall` runs, so the kernel
+// reads a misaligned frame — confirmed by disassembling a real x86_64
+// binary (`objdump -d`, Docker `debian:bookworm-slim`, before this fix):
+// `push %rbp; mov %rsp,%rbp; mov $0xf,%eax; syscall; pop %rbp; ret`. `@naked`
+// (SPEC §10.3) emits neither prologue nor epilogue — exactly the bare two
+// instructions below, nothing else — which `objdump` after this fix
+// confirms. `startEntry`/`safepointEntry` (`../linux/boottail.bit`,
+// `runtime/stw/stwpoll.bit`) are the same `@naked fn ... { return asm
+// volatile { ... } }` shape for the identical reason: entered with a stack
+// pointer this function must not perturb before its own final instruction.
+//
 // Provided on BOTH architectures even though the mandatory check above is
 // documented only for x86_64: a valid restorer is always correct to supply,
 // and #2988's hardware reproduction is x86_64-only (`ssh hl-master`) — this
 // aarch64-linux arm is unverified on real hardware and should be confirmed
 // there before being relied on.
-@nosplit fn sigReturnTrampoline() {
-  asm {
+@naked fn sigReturnTrampoline() {
+  return asm volatile {
     arm64 { 0xD2801168, 0xD4000001 }                 // mov x8, #139; svc #0
     x64 { 0xB8, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05 } // mov eax, 15; syscall
   }
@@ -490,7 +514,15 @@ let termActBuf: [4]i64
 // context, and why `128 + sig` rather than resetting the disposition and
 // re-raising), including #4172's `osKillAllUnboundedChildren` (plain `bit
 // run`'s own child, tracked separately from a bounded child).
+// #6087: notify a Bit-level `waitForSignal` (std/os) waiter before deciding
+// whether to exit — see ../darwin/signal.bit's matching section for the
+// full reasoning (identical here: same flag, same fallback contract, same
+// self-pipe shape, raw `syscall`s instead of libSystem externs).
 @nosplit fn termHandler(sig: i32, info: *u8, ctx: *u8) {
+  osSignalNotify(int(sig))
+  if (atomicLoad(ptrOf(osSignalArmedFlag)) == osSignalArmed) {
+    return
+  }
   osKillAllOutstandingChildren()
   osKillAllUnboundedChildren()
   // #5765: the killed child leaves its own compiled test binary behind in
@@ -502,20 +534,200 @@ let termActBuf: [4]i64
 }
 
 // Register `termHandler` for SIGTERM and SIGINT, process-wide, SA_SIGINFO |
-// SA_RESTORER — SA_RESTORER is mandatory on x86_64 regardless of SA_SIGINFO
-// (#2988, see `saRestorer` above), so it is supplied on both architectures
-// like `installFatalSignalHandlers` already does. No SA_ONSTACK: unlike a
-// stack overflow, nothing about receiving SIGTERM implies this thread's own
-// stack is in trouble. Call from `boot` alongside `installFatalSignalHandlers`,
-// before any worker exists.
+// SA_RESTORER | SA_ONSTACK — SA_RESTORER is mandatory on x86_64 regardless
+// of SA_SIGINFO (#2988, see `saRestorer` above), so it is supplied on both
+// architectures like `installFatalSignalHandlers` already does. SA_ONSTACK
+// (#6087, added after shipping without it crashed x86_64-linux — see
+// `osSignalAwaitReadable`'s header for the root cause) is REQUIRED now that
+// `termHandler` can return instead of always ending in `rootExit`: the
+// interrupted thread may be a worker mid-`schedPark`, on a green task's own
+// small stack, and every worker already maps and installs an alternate
+// stack for exactly this class of hazard (`installAltStackForThisWorker`,
+// called from `workerBody` before any task runs on it) — SIGSEGV/SIGBUS/
+// SIGTRAP/SIGILL already use it below; this just asks the kernel to use the
+// SAME one for SIGTERM/SIGINT. Call from `boot` alongside
+// `installFatalSignalHandlers`, before any worker exists.
 @nosplit fn installTerminationHandlers() {
   let restorer = int(entryOf(sigReturnTrampoline))
 
   let base = int(ptrOf(termActBuf))
   storeWord(base, int(entryOf(termHandler)))
-  storeWord(base + 8, i64(saSiginfo | saRestorer))
+  storeWord(base + 8, i64(saSiginfo | saRestorer | saOnstack))
   storeWord(base + 16, restorer)
   storeWord(base + 24, 0)
   syscall(sysRtSigaction(), i64(sigTerm), i64(base), i64(0), i64(sigSetSize))
   syscall(sysRtSigaction(), i64(sigInt), i64(base), i64(0), i64(sigSetSize))
+}
+
+// ---------------------------------------------------------------------------
+// #6087: std/os's `waitForSignal` — see ../darwin/signal.bit's matching
+// section for the full design reasoning (identical here: same three-state
+// arm flag, same fallback contract for a program that never calls
+// `waitForSignal`, same per-worker read scratch). The two real differences:
+// (1) `pipe2(fds, O_CLOEXEC|O_NONBLOCK)` in ONE syscall via the raw
+// `sysPipe2` trap, rather than Darwin's `pipe()` + two `fcntl` calls (no
+// `pipe2` on Darwin); (2) plain `sysRead`/`sysWrite` traps addressing a raw
+// int, rather than libSystem `read`/`write` externs needing a `*u8`.
+//
+// x86_64-ONLY CRASH, FOUND AND FIXED (#6087). Two real causes, both fixed
+// below: (1) `sigReturnTrampoline` was an ordinary (non-`@naked`) function,
+// so it compiled with a `push %rbp` prologue that had never executed —
+// `termHandler` is the first handler using it that can actually return —
+// moving `rsp` 8 bytes off the kernel's `rt_sigreturn` frame the instant it
+// ran (confirmed by disassembly, see that function's own header); (2)
+// `installTerminationHandlers` registered SIGTERM/SIGINT without
+// SA_ONSTACK, so a signal arriving while a worker ran a green task on its
+// own small guarded stack built the kernel's (much larger on x86_64 than
+// aarch64 — XSAVE/AVX-512) signal frame on top of it instead of the
+// alternate stack every worker already maps. Neither mattered before
+// #6087: the original handler never returned and never ran this close to a
+// context switch.
+// ---------------------------------------------------------------------------
+
+import { pdOpen, pdWait, pdDirRead, pdClaimed, pdAlreadyReady, pdStaleGen } from "../../sched"
+import { schedParkArm, schedParkDisarm, schedPark, schedPollPendingInc } from "../../sched"
+import { taskWorker, wkSched, scPollFd } from "../../sched"
+import { pollDescRegister } from "../../sched/linux"
+
+const osSignalUnarmed: int = 0
+const osSignalArming: int = 1
+const osSignalArmed: int = 2
+
+let osSignalReadFd: [1]i64
+let osSignalWriteFd: [1]i64
+let osSignalGen: [1]i64
+let osSignalArmedFlag: [1]i64
+
+// `O_CLOEXEC` (0o2000000 = 524288) | `O_NONBLOCK` (0o4000 = 2048) — both are
+// valid `pipe2` flags (`include/uapi/asm-generic/fcntl.h`), the same two
+// values `../linux/osruncap.bit`'s `osCapCloexec`/`osCapNonBlock` already
+// use for the SAME two bits on this platform (redeclared here: that file is
+// a different module).
+const osSignalPipeFlags: int = 526336
+
+// `ptrOf` only addresses module-level state (E0053) — see ../darwin/
+// signal.bit's identical comment for the full reasoning on each buffer's
+// concurrency contract.
+let osSignalArmScratch: [1]i64
+let osSignalNotifyScratch: [1]i64
+let osSignalReadScratch: [33]i64 // 1 word/slot * (osScratchSlots + 1)
+
+@nosplit fn osSignalReadScratchAddr(): int {
+  return int(ptrOf(osSignalReadScratch)) + osScratchSlot() * 8
+}
+
+// Async-signal-safe: see ../darwin/signal.bit's `osSignalNotify` for the
+// full contract (the accepted two-threads-at-once race on
+// `osSignalNotifyScratch`, the EAGAIN-drops-a-duplicate reasoning).
+@nosplit fn osSignalNotify(sig: int) {
+  let wfd = atomicLoad(ptrOf(osSignalWriteFd))
+  if (wfd <= 0) {
+    return
+  }
+  let scratchAddr = int(ptrOf(osSignalNotifyScratch))
+  storeWord(scratchAddr, sig)
+  syscall(sysWrite(), i64(wfd), i64(scratchAddr), i64(1))
+}
+
+// See ../darwin/signal.bit's `osSignalArm` for the full contract.
+fn osSignalArm() {
+  if (atomicLoad(ptrOf(osSignalArmedFlag)) == osSignalArmed) {
+    return
+  }
+  if (!atomicCmpxchg(ptrOf(osSignalArmedFlag), osSignalUnarmed, osSignalArming)) {
+    let spins = 0
+    while (atomicLoad(ptrOf(osSignalArmedFlag)) != osSignalArmed && spins < 100000000) {
+      spins = spins + 1
+    }
+    return
+  }
+  let armScratchAddr = int(ptrOf(osSignalArmScratch))
+  storeWord(armScratchAddr, 0)
+  let rc = int(syscall(sysPipe2(), i64(armScratchAddr), i64(osSignalPipeFlags)))
+  if (rc != 0) {
+    // Arming failed — see ../darwin/signal.bit's identical comment: both
+    // fds stay 0, `termHandler` keeps its original #3507/#4172 behavior.
+    return
+  }
+  let raw = loadWord(int(ptrOf(osSignalArmScratch)))
+  let rfd = raw & 4294967295
+  let wfd = raw >> 32
+
+  let gen = pdOpen(rfd)
+  let taskAddr = schedCurrentTask()
+  if (taskAddr != 0) {
+    let t = taskAt(taskAddr)
+    let wAddr = *(t + taskWorker)
+    if (wAddr != 0) {
+      let s = taskAt(*(taskAt(wAddr) + wkSched))
+      let pollFd = *(s + scPollFd)
+      if (pollFd != 0) {
+        let _ = pollDescRegister(pollFd, rfd, gen)
+      }
+    }
+  }
+
+  atomicStore(ptrOf(osSignalReadFd), rfd)
+  atomicStore(ptrOf(osSignalWriteFd), wfd)
+  atomicStore(ptrOf(osSignalGen), gen)
+  atomicStore(ptrOf(osSignalArmedFlag), osSignalArmed)
+}
+
+// See ../darwin/signal.bit's `osSignalAwaitReadable` for the full contract.
+fn osSignalAwaitReadable(fd: int, gen: int): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return false
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  if (*(s + scPollFd) == 0) {
+    return false
+  }
+  if (!schedParkArm()) {
+    return false
+  }
+  let r = pdWait(fd, pdDirRead, gen, taskAddr)
+  if (r == pdAlreadyReady) {
+    let _ = schedParkDisarm()
+    return true
+  }
+  if (r != pdClaimed) {
+    let _ = schedParkDisarm()
+    return r == pdStaleGen
+  }
+  // #6087: see ../darwin/signal.bit's identical comment — a server parked
+  // purely on `waitForSignal` needs `schedPollPendingInc` or the deadlock
+  // detector panics "all tasks are asleep" despite a real wakeup pending.
+  schedPollPendingInc()
+  schedPark()
+  return true
+}
+
+// `bit_rt_os_wait_for_signal` (ABI.md §19, #6087) — see ../darwin/
+// signal.bit's identical function for the full contract.
+export @symbol("bit_rt_os_wait_for_signal") fn rtOsWaitForSignal(): int {
+  osSignalArm()
+  let rfd = atomicLoad(ptrOf(osSignalReadFd))
+  if (rfd <= 0) {
+    return 0
+  }
+  let gen = atomicLoad(ptrOf(osSignalGen))
+  let spins = 0
+  while (spins < 100000000) {
+    let bufAddr = osSignalReadScratchAddr()
+    storeWord(bufAddr, 0)
+    let n = int(syscall(sysRead(), i64(rfd), i64(bufAddr), i64(1)))
+    if (n == 1) {
+      return loadWord(bufAddr) & 0xFF
+    }
+    if (!osSignalAwaitReadable(rfd, gen)) {
+      spins = spins + 1
+    }
+  }
+  return 0
 }

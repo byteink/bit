@@ -174,11 +174,28 @@ and gives every connection with a request already in the handler's hands
 up to `timeoutMs` milliseconds to finish, force-closing whatever is still
 running once that passes. Call it whenever your own process decides it is
 time to stop - a deploy script, a test, or an admin endpoint you build
-yourself. There is no way yet for a Bit program to catch the signal a
-deployment sends on shutdown (`SIGTERM` from Docker or Kubernetes), so
-wiring this into an automatic zero-downtime deploy needs that piece to
-land in the language first; until then, drive `shutdown()` from whatever
-already decides your process should stop.
+yourself.
+
+The usual trigger is the signal a deployment sends on shutdown - `SIGTERM`
+from Docker or Kubernetes, `SIGINT` from a developer's Ctrl-C.
+[`std/signal`'s `waitForSignal`](../../../docs/stdlib/signal.md)
+blocks a green thread until one of those arrives, so the last line of
+`main` is the signal-to-shutdown wire itself:
+
+```bit
+import { App, Config } from "web"
+import { waitForSignal, Signal } from "std/signal"
+
+fn main(): ()! {
+  let app = App(Config{ secret = "change-me" })
+  app.get("/", (c) => c.text("ok"))
+  let server = app.serve()?
+
+  let _ = waitForSignal([Signal.Term, Signal.Int])
+  print("shutting down\n")
+  server.shutdown(10000)?
+}
+```
 
 `app.listen()` is unchanged, and still the right call for a program that
 has nothing else to do once it starts serving.

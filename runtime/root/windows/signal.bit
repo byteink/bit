@@ -207,21 +207,16 @@
 // (`mainStackBaseAddr` in ../boot.bit, `schedStackBytes` via
 // `alignUpStack`/`alignDownStack` in ../bootstack.bit).
 //
-// Ctrl+C (SIGINT's nearest analogue, `SetConsoleCtrlHandler`) is
-// DELIBERATELY NOT installed here. Matching "whatever the existing ports do
-// for interrupt" literally: neither ../linux/signal.bit nor
-// ../darwin/signal.bit installs ANY SIGINT disposition — both leave it at
-// the OS default (terminate the process), verified by `git grep -n
-// 'sigint\|SIGINT' runtime/root/{linux,darwin}` returning nothing. Windows'
-// own default Ctrl+C behaviour is the same shape (terminate the process via
-// `STATUS_CONTROL_C_EXIT`), so installing nothing here reproduces that
-// default rather than diverging from it. Separately, `SetConsoleCtrlHandler`
-// is NOT in `compiler/pesyms.bit`'s admitted Windows import surface (#3328) —
-// checked directly, it is absent from `windowsImports()` — so a custom
-// handler could not be added from this file alone without a shared compiler
-// change, which is out of this ticket's scope; filed as #3376 if a FUTURE
-// ticket wants graceful-shutdown-on-Ctrl+C rather than the current
-// terminate-by-default parity.
+// Ctrl+C/Ctrl-Break/console-close (SIGINT/SIGTERM's nearest analogues) ARE
+// now installed, below (#6087) — `SetConsoleCtrlHandler` was already in
+// `compiler/pesyms.bit`'s admitted Windows import surface as of #3376
+// ("admission-surface only, no runtime consumer yet"); this file is that
+// consumer. See "#6087: std/signal" below for the design and #3376's
+// reasoning for why this diverges from ../linux/../darwin's SIGINT default
+// (neither installs a SIGINT disposition, so both terminate on Ctrl-C by
+// default) — this ticket's whole point is to STOP being the OS default and
+// give a program the chance to shut down cleanly instead, on all three
+// platforms alike.
 
 import { schedTaskOnStack } from "../../sched"
 
@@ -465,4 +460,119 @@ const stackGuaranteeBytes: int = 65536
 @nosplit fn winInstallStackGuarantee() {
   winStackGuaranteeScratch = i32(stackGuaranteeBytes)
   let _ = SetThreadStackGuarantee(ptrOf(winStackGuaranteeScratch))
+}
+
+// ---------------------------------------------------------------------------
+// #6087: std/signal — SIGTERM/SIGINT's nearest Windows analogues
+// ---------------------------------------------------------------------------
+//
+// A GENUINE REDESIGN AGAIN, NOT A PORT OF ../linux/../darwin's SELF-PIPE.
+// `HandlerRoutine` runs on a DEDICATED SYSTEM THREAD Windows creates for it
+// (MSDN's own documented contract), never the faulting/interrupted thread
+// and never an interrupt context the way a POSIX signal handler is — so it
+// CAN safely touch ordinary memory. What it still cannot safely do is call
+// into this runtime's scheduler: it is not one of `boot`'s own worker OS
+// threads, has no Bit-visible task/worker state installed on it, and
+// Windows gives no IOCP-pollable handle for a console-control event the way
+// a socket or pipe would be, so there is nothing to register with the
+// existing netpoller (`../../sched/windows`) the way ../linux/../darwin
+// register their self-pipe's read end. The handler instead sets ONE atomic
+// word; `rtOsWaitForSignal` below polls it, parking the calling GREEN
+// thread between checks via `schedSleepUntil` — never the OS thread — the
+// SAME primitive `../windows/time.bit`'s `bit_rt_time_sleep_ns` already
+// parks on. THE ACCEPTED COST, STATED RATHER THAN HIDDEN: up to
+// `osSignalPollIntervalNs` (15ms) of added latency between the event firing
+// and `waitForSignal` returning, where Linux/Darwin's self-pipe wakes near-
+// instantly through the netpoller. Documented in docs/stdlib/signal.md.
+//
+// THE SECOND, SHARPER LIMIT: CTRL_CLOSE_EVENT/CTRL_LOGOFF_EVENT/
+// CTRL_SHUTDOWN_EVENT give a process roughly 5 SECONDS (MSDN, not
+// configurable from user code) to finish once `HandlerRoutine` returns,
+// after which Windows terminates it regardless of what the program is
+// doing — there is no way to ask for more, unlike a Kubernetes/Docker
+// `SIGTERM` grace period, which the deploying platform controls. A
+// `server.shutdown(timeoutMs)` timeout longer than that window can still be
+// cut off mid-drain on Windows even though it would run to completion on
+// Linux/Darwin under the identical call. CTRL_C_EVENT/CTRL_BREAK_EVENT
+// carry no such forced deadline.
+//
+// `HandlerRoutine`'s ABI: `BOOL WINAPI HandlerRoutine(DWORD dwCtrlType)`,
+// the Win64 ABI this whole compilation unit already targets (../boot.bit's
+// header). Returning TRUE (nonzero) tells Windows this handler fully
+// handled the event — no further handler runs and, critically, the OS's
+// own default action (which for every code below is "terminate the
+// process") does NOT run either. Returning FALSE (0) for any code this file
+// does not own hands it to the next handler / the OS default, the same
+// "not ours, hand it on" discipline `vehHandler` above already uses for an
+// exception code it does not recognize.
+extern fn SetConsoleCtrlHandler(handler: *byte, add: i32): i32
+
+// CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2,
+// CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6 (wincon.h, Microsoft's own API
+// reference — CTRL_LOGOFF/SHUTDOWN are 5/6, not 3/4: those two numbers are
+// reserved/unused in the real header, a gap this table preserves rather
+// than compacts, so a value read here always matches the real ABI).
+const ctrlCEvent: i32 = 0
+const ctrlBreakEvent: i32 = 1
+const ctrlCloseEvent: i32 = 2
+const ctrlLogoffEvent: i32 = 5
+const ctrlShutdownEvent: i32 = 6
+
+// The raw POSIX-style signal numbers `stdlib/signal/signal.bit` maps back
+// to `Signal.Int`/`Signal.Term` — the SAME two numbers ../linux/../darwin's
+// `termHandler` writes into their self-pipe (`sigInt`/`sigTerm` in each of
+// those files), so `std/signal` needs no platform-specific branch at all.
+const rawSigInt: int = 2
+const rawSigTerm: int = 15
+
+// `0` (the `.bss` zero value) means "nothing pending" — never a signal
+// `waitForSignal` can report, matching ../linux/../darwin's identical
+// sentinel-vs-real-value split on `osSignalReadFd`/the byte their pipe
+// carries.
+let osSignalFlag: [1]i64
+
+const osSignalPollIntervalNs: int = 15000000 // 15ms — see the header.
+
+// The handler itself: touches nothing but `osSignalFlag`, so no `@nosplit`
+// restriction is even load-bearing here (unlike ../linux/../darwin's async-
+// signal-safety requirement) — kept anyway, for the same reason
+// `vehHandler` is: nothing this runs needs allocation, and marking it so is
+// a promise a future edit cannot quietly break.
+@nosplit fn consoleCtrlHandler(ctrlType: i32): i32 {
+  if (ctrlType == ctrlCEvent) {
+    atomicStore(ptrOf(osSignalFlag), rawSigInt)
+    return i32(1)
+  }
+  if (ctrlType == ctrlBreakEvent ||
+    ctrlType == ctrlCloseEvent ||
+    ctrlType == ctrlLogoffEvent ||
+    ctrlType == ctrlShutdownEvent) {
+    atomicStore(ptrOf(osSignalFlag), rawSigTerm)
+    return i32(1)
+  }
+  return i32(0)
+}
+
+// Install `consoleCtrlHandler`, process-wide. Call once, from `boot`,
+// alongside `installFatalSignalHandlers` — before any worker exists, the
+// same ordering ../linux/../darwin install their termination handlers at.
+@nosplit fn installConsoleCtrlHandler() {
+  let _ = SetConsoleCtrlHandler(entryOf(consoleCtrlHandler), i32(1))
+}
+
+// `bit_rt_os_wait_for_signal` (ABI.md §19, #6087): block until the process
+// receives a console-control event `consoleCtrlHandler` owns, and return
+// the raw signal number it recorded. See the header for why this polls
+// (bounded, 15ms) rather than parking on a pollable handle the way
+// ../linux/../darwin do.
+export @symbol("bit_rt_os_wait_for_signal") fn rtOsWaitForSignal(): int {
+  while (true) {
+    let v = atomicLoad(ptrOf(osSignalFlag))
+    if (v != 0) {
+      atomicStore(ptrOf(osSignalFlag), 0)
+      return v
+    }
+    let now = parkMonoNs(timeScratch())
+    schedSleepUntil(now + osSignalPollIntervalNs)
+  }
 }

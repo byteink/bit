@@ -98,6 +98,9 @@ fn assetDir(): string {
 
 Running a child process is [`std/process`](process.md), not here.
 
+Catching the signal a deployment sends on shutdown (`SIGTERM`/`SIGINT`) is
+[`std/signal`](signal.md), a separate module - not here.
+
 ## Exiting
 
 ### `exit(code: int)`

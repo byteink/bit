@@ -1,0 +1,114 @@
+// std/signal — SIGTERM/SIGINT delivery to Bit code (#6087).
+//
+// A SEPARATE MODULE FROM std/os, DELIBERATELY (integrator, #6087): `std/os`
+// is imported by `tools/build` itself, so ANY new symbol there — even a
+// plain `extern fn`, not just a compiler primitive — needs the PINNED
+// STAGE0 compiler's own bundled runtime archive to already carry it before
+// `std/os` can typecheck at all, because `./make`'s own bootstrap step
+// builds the driver against that frozen archive before dispatching to any
+// other step (the #3538/#5901 constraint: "tools/build: stop importing
+// std/crypto so a cold ./make survives a pinned stage0"). `std/signal`
+// lives in its own directory and neither `compiler/**` nor `tools/**`
+// imports it (`git grep -n 'std/signal' compiler tools` returns nothing),
+// so it carries no such ordering requirement — a cold `./make` never has to
+// resolve `bit_rt_os_wait_for_signal` against stage0's archive at all.
+//
+// `bit_rt_os_wait_for_signal` (ABI.md §19) is a plain `extern fn`, not a
+// compiler primitive, for the same "no compiler change, no stage0
+// ordering requirement" reason — the same shape `stdlib/crypto`'s
+// `bit_rt_crypto_sha256_hw_available` etc. already use. The symbol itself
+// keeps its `os_`-prefixed ABI name: it is still conceptually one of
+// `std/os`'s process-level primitives (ABI.md §19's own table lists it
+// alongside `bit_rt_os_argc` etc.), only its Bit-visible home moved.
+extern fn bit_rt_os_wait_for_signal(): int
+
+// ---------------------------------------------------------------------------
+// THE DESIGN: ONE BLOCKING CALL, NOT A CALLBACK, NOT A SEPARATE CHANNEL TYPE
+// ---------------------------------------------------------------------------
+//
+// `waitForSignal` parks the calling green thread exactly the way any other
+// blocking std/os or std/net call already does. The runtime side
+// (`runtime/root/{linux,darwin}/signal.bit`'s self-pipe, kept live by the
+// SAME register-once netpoller every socket read uses) is what makes that
+// safe: the OS's own `sigaction` handler never runs a line of Bit code — it
+// cannot allocate, cannot take a lock this thread might already hold, and
+// is not a green thread the scheduler has any record of — it only writes
+// one byte to a pipe. Parking and waking happen entirely on an ordinary
+// green thread, in this call.
+//
+// A callback-shaped `onSignal(sig, handler)` was considered and rejected:
+// it would still have to defer the actual `handler` invocation to a normal
+// green thread for the same reason `waitForSignal` does (a signal handler
+// cannot run one directly), so it would only be this function wrapped in a
+// `spawn` the runtime does FOR the caller instead of the caller writing it
+// themselves — one primitive, not two, is the design that has no
+// unreachable branch to maintain:
+//
+//     fn watchForShutdown() {
+//       let sig = waitForSignal([Signal.Term, Signal.Int])
+//       onShutdown(sig)
+//     }
+//     spawn watchForShutdown()
+//
+// A `chan<Signal>` was considered too, for the same reason Go exposes
+// `signal.Notify(ch)`: Go has no bare blocking-receive-of-one-value
+// primitive as ergonomic as a channel already is there. Bit does — a direct
+// blocking function call IS that primitive here — so a channel would be a
+// second, less direct spelling of the exact same wait with none of a
+// channel's own reasons to exist (no buffering need, no multi-producer
+// fan-in: there is exactly one process-wide signal source).
+
+// A POSIX-terminating signal `waitForSignal` can report. Two variants only
+// — this is #6087's whole acceptance surface (SIGTERM, SIGINT); a program
+// that wants a broader signal set is not what this runtime's `termHandler`
+// delivers into the self-pipe today.
+export enum Signal { Term, Int }
+
+// The raw POSIX signal numbers `bit_rt_os_wait_for_signal` returns — the
+// same numbers on Linux and Darwin (`runtime/root/{linux,darwin}/signal.bit`'s
+// own `sigTerm`/`sigInt` constants), and the numbers Windows'
+// `SetConsoleCtrlHandler` provider maps its own console-control events onto
+// (`runtime/root/windows/signal.bit`).
+const rawSigInt: int = 2
+const rawSigTerm: int = 15
+
+fn signalOfRaw(raw: int): Signal {
+  if (raw == rawSigInt) {
+    return Signal.Int
+  }
+  return Signal.Term
+}
+
+fn containsSignal(sigs: []Signal, s: Signal): bool {
+  let i = 0
+  while (i < len(sigs)) {
+    if (sigs[i] == s) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Block the calling green thread until the process receives one of `sigs`,
+// returning the one that arrived. The standard shape is the last line of
+// `main`, after every listener has already started on its own green
+// thread:
+//
+//     let srv = app.serve()?
+//     let sig = waitForSignal([Signal.Term, Signal.Int])
+//     srv.shutdown(10_000)?
+//
+// A signal outside `sigs` never returns from this call — it is silently
+// re-waited, since nothing this program asked for happened.
+export fn waitForSignal(sigs: []Signal): Signal {
+  while (true) {
+    let raw = bit_rt_os_wait_for_signal()
+    if (raw == rawSigTerm || raw == rawSigInt) {
+      let s = signalOfRaw(raw)
+      if (containsSignal(sigs, s)) {
+        return s
+      }
+    }
+  }
+}

@@ -536,7 +536,21 @@ let termActBuf: [2]i64
 // would require returning through the interrupted context — machinery this
 // file does not build, the same trade `segvHandler`/`trapHandler` already
 // make.
+// #6087: notify a Bit-level `waitForSignal` (std/os) waiter before deciding
+// whether to exit. `osSignalNotify` is a plain async-signal-safe `write` —
+// see its own comment — so it is safe unconditionally, whether or not a
+// program ever called `waitForSignal`. The exit path below is UNCHANGED
+// unless `osSignalArmedFlag` is fully armed (2): a program that never calls
+// `waitForSignal` gets the exact #3507/#4172 behavior this handler always
+// had — kill every outstanding child, unlink outstanding test paths, exit
+// `128 + sig`. A program that DID call `waitForSignal` at least once instead
+// leaves the process running: it owns the shutdown decision from here, and
+// its own eventual `os.exit`/return from `main` is what ends the process.
 @nosplit fn termHandler(sig: i32, info: *u8, ctx: *u8) {
+  osSignalNotify(int(sig))
+  if (atomicLoad(ptrOf(osSignalArmedFlag)) == osSignalArmed) {
+    return
+  }
   osKillAllOutstandingChildren()
   osKillAllUnboundedChildren()
   // #5765: the killed child leaves its own compiled test binary behind in
@@ -547,17 +561,236 @@ let termActBuf: [2]i64
   rootExit(128 + int(sig))
 }
 
-// Register `termHandler` for SIGTERM and SIGINT, process-wide, SA_SIGINFO —
-// no SA_ONSTACK: unlike a stack overflow, nothing about receiving SIGTERM
-// implies this thread's own stack is in trouble, so running on it is fine
-// and avoids depending on `installAltStackForThisWorker` having already run
-// on whichever thread the kernel happens to deliver the signal to. Call from
-// `boot` alongside `installFatalSignalHandlers`, before any worker exists.
+// Register `termHandler` for SIGTERM and SIGINT, process-wide, SA_SIGINFO |
+// SA_ONSTACK (#6087, added after shipping without it crashed x86_64-linux —
+// see ../linux/signal.bit's matching comment and
+// `osSignalAwaitReadable`'s header for the root cause, identical on both
+// platforms even though only x86_64 has been caught by it: `termHandler`
+// can now return instead of always ending in `rootExit`, so the interrupted
+// thread may be a worker mid-`schedPark`, on a green task's own small
+// stack, and every worker already maps and installs an alternate stack for
+// exactly this class of hazard (`installAltStackForThisWorker`, called from
+// `workerBody` before any task runs on it) — SIGSEGV/SIGBUS/SIGTRAP/SIGILL
+// already use it below; this just asks the kernel to use the SAME one for
+// SIGTERM/SIGINT. Call from `boot` alongside `installFatalSignalHandlers`,
+// before any worker exists.
 @nosplit fn installTerminationHandlers() {
   let base = int(ptrOf(termActBuf))
   storeWord(base, int(entryOf(termHandler)))
-  storeWord(base + 8, saSiginfo << 32)
+  storeWord(base + 8, (saSiginfo | saOnstack) << 32)
   let nilp: *u8 = nil
   let _ = sigaction(i32(sigTerm), nilp + base, nilp)
   let _ = sigaction(i32(sigInt), nilp + base, nilp)
+}
+
+// ---------------------------------------------------------------------------
+// #6087: std/os's `waitForSignal` — a self-pipe registered with the
+// netpoller, exactly the standard shape (Go's `os/signal`, libuv), because
+// `termHandler` above cannot run arbitrary Bit code (SA_SIGINFO delivery is
+// not a green thread the scheduler knows about, and `segvHandler`'s own
+// header already argues why nothing here may allocate or take a lock). The
+// handler only ever does one `write(2)` of the raw signal number; the
+// PARKING and the Bit-visible `Signal` value both happen on an ordinary
+// green thread, in `rtOsWaitForSignal` below, which the kernel wakes through
+// the SAME register-once poller every socket read already uses
+// (`../../sched/darwin`'s `pollDescRegister`, `../../sched/polldesc.bit`'s
+// `pdOpen`/`pdWait`) — never a busy poll, never a second OS thread.
+// ---------------------------------------------------------------------------
+
+import { pdOpen, pdWait, pdDirRead, pdClaimed, pdAlreadyReady, pdStaleGen } from "../../sched"
+import { schedParkArm, schedParkDisarm, schedPark, schedPollPendingInc } from "../../sched"
+import { taskWorker, wkSched, scPollFd } from "../../sched"
+import { pollDescRegister } from "../../sched/darwin"
+
+// `osSignalArmedFlag`'s three states: not armed (no program has ever called
+// `waitForSignal`, `termHandler` keeps its original behavior), arming (one
+// task is inside `osSignalArm`, creating the pipe and registering it), armed
+// (the pipe is live and `termHandler` notifies it instead of exiting
+// directly). `osSignalArmed` is what `termHandler`'s async-signal-safe read
+// above compares against — reaching it is the one write that must happen
+// LAST in `osSignalArm`, after both fds are stored, so a handler that reads
+// it can trust `osSignalWriteFd` is already valid.
+const osSignalUnarmed: int = 0
+const osSignalArming: int = 1
+const osSignalArmed: int = 2
+
+let osSignalReadFd: [1]i64
+let osSignalWriteFd: [1]i64
+let osSignalArmedFlag: [1]i64
+// The generation `pdOpen` minted for `osSignalReadFd` at arm time (#6087).
+// CACHED, NEVER RE-DERIVED: `pdOpen` mints a NEW generation on every call
+// and sweeps the fd's poller slots to it, so a second call from
+// `rtOsWaitForSignal` would invalidate the very registration `osSignalArm`
+// just made — the identical "read once, never again inside a retry loop"
+// rule `../../net/darwin/sock.bit`'s `netFdGen` documents for a socket.
+let osSignalGen: [1]i64
+
+// `ptrOf` only addresses module-level state (E0053), never a function-local
+// array, so every raw-syscall buffer below is a module cell, exactly like
+// `sigActBuf`/`termActBuf` above. `osSignalArmScratch` is touched only by
+// the CAS winner inside `osSignalArm` (single-writer by construction).
+// `osSignalNotifyScratch` is the one cell in this file genuinely reachable
+// from TWO OS threads at once: SIGTERM delivered to one worker thread while
+// SIGINT lands on another, both inside `termHandler` concurrently — a real
+// but narrow window (`osSignalNotify`'s own comment). `osSignalReadScratch`
+// is PER-WORKER (`osScratchSlot()`, the same convention `osCapFdBuf` uses),
+// so two green threads calling `waitForSignal` on different workers never
+// share a read buffer.
+let osSignalArmScratch: [1]i64
+let osSignalNotifyScratch: [1]i64
+let osSignalReadScratch: [33]i64 // 1 word/slot * (osScratchSlots + 1)
+
+@nosplit fn osSignalReadScratchAddr(): int {
+  return int(ptrOf(osSignalReadScratch)) + osScratchSlot() * 8
+}
+
+// Async-signal-safe: write one byte (the raw signal number, 2 or 15 — always
+// fits) to the self-pipe's write end, non-blocking. A `<= 0` write fd (never
+// armed, or `osSignalArm` has not reached the store yet) makes this a
+// silent no-op — the same "no waiter, nothing to wake" case `pdWake`
+// documents for a socket. `EAGAIN` (the pipe's small kernel buffer is full)
+// is dropped rather than retried: `waitForSignal` drains every byte it
+// finds and only the MOST RECENT signal value changes what a caller does
+// next, so a coalesced duplicate is not a lost signal in any way a caller
+// can observe. TWO SIGNALS DELIVERED TO TWO THREADS AT ONCE (SIGTERM here,
+// SIGINT there) race on `osSignalNotifyScratch` — the accepted cost stated
+// above: the byte `waitForSignal` reads back may name either signal, never
+// a corrupted or out-of-range one (both writers store a valid, in-range
+// value, and `write` copies exactly one byte), so this can only misattribute
+// WHICH shutdown signal fired, never fail to wake the waiter at all.
+@nosplit fn osSignalNotify(sig: int) {
+  let wfd = atomicLoad(ptrOf(osSignalWriteFd))
+  if (wfd <= 0) {
+    return
+  }
+  storeWord(int(ptrOf(osSignalNotifyScratch)), sig)
+  let _ = write(i32(wfd), u8At(int(ptrOf(osSignalNotifyScratch))), i64(1))
+}
+
+// Create the self-pipe and register its read end with the netpoller, once.
+// A concurrent second caller loses the CAS and busy-waits (bounded: pipe
+// creation plus one `EV_ADD` is a handful of syscalls, never a park) rather
+// than racing a second pipe into existence. Never called from `termHandler`
+// (creating a pipe is not async-signal-safe) — only from `rtOsWaitForSignal`
+// below, an ordinary green-thread call.
+fn osSignalArm() {
+  if (atomicLoad(ptrOf(osSignalArmedFlag)) == osSignalArmed) {
+    return
+  }
+  if (!atomicCmpxchg(ptrOf(osSignalArmedFlag), osSignalUnarmed, osSignalArming)) {
+    let spins = 0
+    while (atomicLoad(ptrOf(osSignalArmedFlag)) != osSignalArmed && spins < 100000000) {
+      spins = spins + 1
+    }
+    return
+  }
+  storeWord(int(ptrOf(osSignalArmScratch)), 0)
+  if (int(pipe(u8At(int(ptrOf(osSignalArmScratch))))) != 0) {
+    // Arming failed — leave both fds at 0 so `osSignalNotify`/
+    // `rtOsWaitForSignal` treat it as permanently unarmed rather than
+    // retrying forever. `termHandler` still falls back correctly: the flag
+    // never reaches `osSignalArmed`, so it keeps killing children and
+    // exiting exactly as if `waitForSignal` had never been called.
+    return
+  }
+  let rfd = osCapFdLow(int(ptrOf(osSignalArmScratch)))
+  let wfd = osCapFdHigh(int(ptrOf(osSignalArmScratch)))
+  let _ = osCapSetCloexec(rfd)
+  let _ = osCapSetCloexec(wfd)
+  let _ = osCapSetNonBlock(rfd)
+  let _ = osCapSetNonBlock(wfd)
+
+  let gen = pdOpen(rfd)
+  let taskAddr = schedCurrentTask()
+  if (taskAddr != 0) {
+    let t = taskAt(taskAddr)
+    let wAddr = *(t + taskWorker)
+    if (wAddr != 0) {
+      let s = taskAt(*(taskAt(wAddr) + wkSched))
+      let pollFd = *(s + scPollFd)
+      if (pollFd != 0) {
+        let _ = pollDescRegister(pollFd, rfd, gen)
+      }
+    }
+  }
+
+  atomicStore(ptrOf(osSignalReadFd), rfd)
+  atomicStore(ptrOf(osSignalWriteFd), wfd)
+  atomicStore(ptrOf(osSignalGen), gen)
+  atomicStore(ptrOf(osSignalArmedFlag), osSignalArmed)
+}
+
+// Park the current task until `fd` (the self-pipe's read end) is readable,
+// via the SAME register-once poller protocol `../../net/darwin/sock.bit`'s
+// `netAwaitReady` uses for a socket — reproduced here rather than called
+// directly because that function lives in `runtime/net`, a different module
+// `runtime/root` does not depend on, and this read-only wait needs none of
+// its write-direction bookkeeping. Returns false when there is no current
+// task/worker/poller to park against (an unscheduled caller), matching
+// `netAwaitReady`'s own `false` path.
+fn osSignalAwaitReadable(fd: int, gen: int): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return false
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  if (*(s + scPollFd) == 0) {
+    return false
+  }
+  if (!schedParkArm()) {
+    return false
+  }
+  let r = pdWait(fd, pdDirRead, gen, taskAddr)
+  if (r == pdAlreadyReady) {
+    let _ = schedParkDisarm()
+    return true
+  }
+  if (r != pdClaimed) {
+    let _ = schedParkDisarm()
+    return r == pdStaleGen
+  }
+  // #6087: a server parked purely on `waitForSignal` (no listener, no other
+  // work) is the deadlock-detector's own "parked on accept()" case
+  // (`schedPollPendingInc`'s comment) — without this, `schedFindWorkAt` sees
+  // no runnable task, no timer and no counted registration and panics
+  // "all tasks are asleep" even though a real wakeup (the self-pipe) is
+  // coming. Caught live: a probe binary with nothing else to do deadlocked
+  // instantly without this call.
+  schedPollPendingInc()
+  schedPark()
+  return true
+}
+
+// `bit_rt_os_wait_for_signal` (ABI.md §19, #6087): block until the process
+// receives SIGTERM or SIGINT and return the raw signal number (std/os's
+// `waitForSignal` maps it to `Signal.Term`/`Signal.Int`). Arms the self-pipe
+// on first call, then loops a non-blocking read against it, parking between
+// attempts exactly as any socket read would. A `0` return means arming
+// itself failed (see `osSignalArm`) — std/os never sees 0 as a real signal
+// number, so it retries the whole call rather than misreporting a signal.
+export @symbol("bit_rt_os_wait_for_signal") fn rtOsWaitForSignal(): int {
+  osSignalArm()
+  let rfd = atomicLoad(ptrOf(osSignalReadFd))
+  if (rfd <= 0) {
+    return 0
+  }
+  let gen = atomicLoad(ptrOf(osSignalGen))
+  let spins = 0
+  while (spins < 100000000) {
+    let bufAddr = osSignalReadScratchAddr()
+    storeWord(bufAddr, 0)
+    let n = int(read(i32(rfd), u8At(bufAddr), i64(1)))
+    if (n == 1) {
+      return loadWord(bufAddr) & 0xFF
+    }
+    if (!osSignalAwaitReadable(rfd, gen)) {
+      spins = spins + 1
+    }
+  }
+  return 0
 }
