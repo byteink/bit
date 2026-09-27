@@ -359,7 +359,7 @@ The compiler emits one static `TypeInfo` per distinct (monomorphized) type and
 passes a pointer to it at each allocation site (`bit_rt_gc_alloc`, §6).
 
 ```
-TypeInfo {                       // extern class, 56 bytes, 8-aligned
+TypeInfo {                       // extern class, 64 bytes, 8-aligned
     size            : usize      // body size in bytes, excluding the header
     ptr_offsets_ptr : [*]const usize  // -\ byte offsets of GC-ref fields
     ptr_offsets_len : usize           // -/ (ptr_offsets_ptr[0..ptr_offsets_len])
@@ -367,6 +367,8 @@ TypeInfo {                       // extern class, 56 bytes, 8-aligned
     name_len        : usize           // -/ (may be empty: name_len == 0)
     methods_ptr     : [*]const Method // -\ this type's methods, for interface
     methods_len     : usize           // -/  dispatch (§2.1; may be empty)
+    type_id         : usize      // the compiler's TypeId (disc), unique across
+                                  // the whole compiled program (§2.2a, #6017)
 }
 ```
 
@@ -535,8 +537,9 @@ address codegen materializes from the `type_info` IR op (the same
 
 ```
 bit_rt_iface_as(recv: ref, want: usize) -> ref        // recv on match, else null
-bit_rt_iface_as_ok() -> bool                          // ok of the iface_as just before it
+bit_rt_iface_as_ok() -> bool                          // ok of the iface_as/iface_as_enum just before it
 bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
+bit_rt_iface_as_enum(recv: ref, want: usize) -> ref   // ENUM target: recv on a type_id match, else null (§2.2a)
 bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has method `id`, else null
 ```
 
@@ -584,6 +587,48 @@ bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has me
   dynamic type, so there is no static agreement to lean on). See §2.1's id
   bullet: `id` is signature-qualified, so this chain's calls miss exactly
   when §2.1's table-building side does.
+
+#### 2.2a `bit_rt_iface_as_enum`: the BOXED-ENUM target (#6017)
+
+`e.(EnumType)` (SPEC §14.4) where `EnumType` is a **boxed** enum (§14.7) cannot
+use §2.2's descriptor-pointer identity: a boxed enum's object size is
+`8 + 8*argc` bytes, ONE SHAPE PER VARIANT, so two objects of the same enum
+type can carry two *different* `TypeInfo` addresses — unlike a class, whose
+layout, and therefore whose descriptor, is fixed once at the declaration.
+`bit_rt_iface_as_enum` decides the match by the descriptors' `type_id` word
+(§2) instead of their address: every descriptor for the same enum carries
+the same `type_id` — the compiler's own TypeId (`disc`), unique across the
+WHOLE compiled program — regardless of which variant built it. `want` is
+therefore any valid descriptor address carrying the target's `type_id` —
+codegen does not need it to match a real allocation's exact shape, only its
+`type_id` (`lowerEnumTypeInfo`, `compiler/lowerexpr.bit`).
+
+**Not `name`.** An earlier version of this primitive compared the
+descriptors' NAME bytes instead, reasoning that every descriptor for one
+enum carries identical name bytes. That is true but insufficient: `name` is
+the bare DECLARED name with no module or package qualification (`typeName`,
+`compiler/types.bit`) and is documented "debug/stats only" (§2) for exactly
+this reason — two DISTINCT enum types, in different modules or different
+first-party packages, can share a declared name (`enum Err { ... }` is a
+natural, unremarkable choice in more than one package). A name-only compare
+would call them the same type and then read a payload word under the wrong
+variant's layout — a live type-confusion bug, caught in review before this
+primitive shipped (#6017). `type_id` cannot collide this way: it is an index
+into the one `TypeContext` the whole program's `bit check`/`bit build`
+shares, so two distinct declarations always get two distinct ids no matter
+how they are spelled or where they live.
+
+It writes the same per-task `ok` slot `bit_rt_iface_as` writes, so
+`bit_rt_iface_as_ok` reads either (same adjacency contract). There is no
+`bit_rt_iface_assert_enum`: the one-result panicking form
+(`let v = e.(EnumType)`) is built in the lowerer from `bit_rt_iface_as_enum` +
+`bit_rt_iface_as_ok` + an inline branch/panic, the same shape
+`lowerIfaceAssertOne` already uses for an INTERFACE target (§2.2 above),
+rather than a second runtime entry point.
+
+A non-boxed (bare-tag) enum can never be a type-assertion target at all —
+§14.4/§14.3 — so `bit_rt_iface_as_enum` is never called with one; `bit check`
+rejects it before lowering (E0041).
 
 ### 2.3 `string` value, and shared-backing views (`s[lo:hi]`)
 

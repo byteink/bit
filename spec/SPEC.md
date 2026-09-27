@@ -3862,9 +3862,23 @@ type_assert = "." "(" type ")" .
 The two-result form is valid only as the sole right-hand side of a declaration or
 assignment (like the map/channel two-result forms).
 
-- The target is a **class** type or another **interface** type.
-  - A class target asks whether the dynamic type IS that class - only a class
-    can be the dynamic type behind an interface value (§10.4, §14.3).
+- The target is a **class** type, a **boxed enum** type (§14.7), or another
+  **interface** type.
+  - A class or boxed-enum target asks whether the dynamic type IS that exact
+    type - only a class or a boxed enum can be the dynamic type behind an
+    interface value (§10.4, §14.3); a bare-tag (non-boxed) enum cannot, since
+    its value is a raw `i64` with no object for the interface value to point
+    to, and asserting to one is a compile-time error.
+  - A boxed enum's representation is not one fixed size - it is `8 + 8*argc`
+    bytes, one shape per variant (§14.7) - so a boxed-enum target is decided
+    by the target type's identity rather than by comparing one canonical
+    object shape; this is unobservable to a program either way (see
+    `runtime/ABI.md` §2.2a for the mechanism).
+  - A mismatch must yield a live zero value (below), so a boxed enum whose
+    tag-0 (declaration-order first) variant carries a payload - which has no
+    zero value (§13.4) - **cannot** be a type-assertion target at all: this is
+    a compile-time error, the same E0083 an uninitialized `let o: T` binding
+    of such a type already gets.
   - An interface target asks whether the dynamic type **satisfies** that
     interface, by the same structural rule as any other interface conversion
     (§14.3): `ok` is true when the concrete type's method set carries every
