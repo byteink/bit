@@ -1,9 +1,10 @@
-// pkg/redis/resp.bit — RESP2 (REdis Serialization Protocol) codec: encode a
-// command, decode a reply. No I/O of its own: `decodeReply` reads through a
-// caller-supplied `byteSource`, so the exact decoder `client.bit` runs over a
-// live `std/net.Conn` is exercised in `resp.test.bit` against a plain captured
-// byte string, with no socket at all — the split stdlib/http/http.bit makes
-// between its `byteStream` interface and a live `netStream`/`tlsStream`.
+// pkg/redis/resp.bit — RESP2/RESP3 (REdis Serialization Protocol) codec:
+// encode a command, decode a reply. No I/O of its own: `decodeReply` reads
+// through a caller-supplied `byteSource`, so the exact decoder `client.bit`
+// runs over a live `std/net.Conn` is exercised in `resp.test.bit` against a
+// plain captured byte string, with no socket at all — the split
+// stdlib/http/http.bit makes between its `byteStream` interface and a live
+// `netStream`/`tlsStream`.
 //
 // THE ONE BUG THIS FILE MUST NOT HAVE (#3466): a null bulk string (`$-1\r\n`)
 // and an empty bulk string (`$0\r\n\r\n`) both decode to `Reply.Bulk`, but to
@@ -11,19 +12,59 @@
 // for a null array (`*-1\r\n`, `Option.None`) vs an empty array (`*0\r\n`,
 // `Option.Some([]Reply(0))`). Conflating null with empty is the classic RESP
 // client defect this package exists to not repeat.
+//
+// RESP2's five tag bytes (`+-:$*`) are decoded right here in
+// `decodeReplyAt`. The ten RESP3 tag bytes (`_#,(!=%~>|`) are decoded by
+// `resp3.bit`, a sibling file in this same module (SPEC §17.1: no import
+// needed either direction) — split out purely to stay under
+// spec/LINT.md's 800-line file ceiling and its 10-per-function complexity
+// ceiling, which one dispatch naming all fifteen tags could not both hold at
+// once. A hostile server gets two defenses regardless of tag: every length
+// prefix is bound-checked before any read it would drive (`readBlob`,
+// `decodeReplies`, `resp3.bit`'s `decodeMapEntries`), and every recursive
+// decode is depth-capped (`decodeReplyAt`'s `depth` parameter) so nested
+// aggregates cannot exhaust the stack.
 
 import { indexOf, parseInt } from "std/strings"
 
 // A decoded RESP reply. `Bulk`/`Array` carry `Option` because RESP has a
 // distinct wire form for "no value" (a cache miss, a blocking pop that timed
 // out) that is not the same thing as an empty string or an empty array.
+//
+// The RESP3 additions below (`Null` through `Attribute`) are documented in
+// `resp3.bit`, which decodes them; `Reply` itself stays the one sum type both
+// files build on, RESP2 and RESP3 alike. RESP3 has no separate "blob error"
+// or "null bulk/array" variant: a blob error (`!`) decodes into the same
+// `Err(string)` a simple `-` error does (they differ only in wire framing,
+// not meaning), and a RESP3 `_` null is `Reply.Null` regardless of which
+// RESP2 type it replaces.
 export enum Reply {
   Simple(string),
   Err(string),
   Int(i64),
   Bulk(Option<string>),
   Array(Option<[]Reply>),
+  Null,
+  Bool(bool),
+  Double(f64),
+  BigNumber(string),
+  Verbatim(string, string),
+  Map([]MapEntry),
+  Set([]Reply),
+  Push([]Reply),
+  Attribute([]MapEntry, Reply),
 }
+
+// Bounds a hostile server cannot be allowed to exceed. Named constants,
+// checked before the read they would drive, not after: a length this large
+// is refused outright rather than attempted. `maxBulkLen` matches Redis's
+// own `proto-max-bulk-len` default (512 MiB); `maxAggregateLen` is a sane
+// ceiling for an aggregate's element/pair count; `maxDepth` caps how many
+// aggregate/attribute levels `decodeReplyAt` will recurse through, so
+// `*1\r\n*1\r\n*1\r\n...` cannot exhaust the stack.
+const maxBulkLen: int = 536870912
+const maxAggregateLen: int = 1000000
+const maxDepth: int = 64
 
 // A source of bytes for the decoder to read from. `client.bit`'s `Client`
 // implements this directly over its live connection; `resp.test.bit`'s
@@ -80,6 +121,19 @@ fn readN(s: byteSource, buf: string, n: int): (string, string)! {
 // more only as needed. Returns the reply and whatever bytes were read past
 // it — unconsumed leftover for the caller's next decode.
 export fn decodeReply(s: byteSource, buf: string): (Reply, string)! {
+  let (reply, rest) = decodeReplyAt(s, buf, 0)?
+  return reply, rest
+}
+
+// The depth-tracked decoder every recursive call — an array/set/map/push
+// element, an attribute's map entry or the reply it describes — goes
+// through instead of the public `decodeReply`, so `maxDepth` can cap how
+// many levels deep a reply may nest. The public entry point always starts
+// at depth 0.
+fn decodeReplyAt(s: byteSource, buf: string, depth: int): (Reply, string)! {
+  if (depth >= maxDepth) {
+    fail newError("resp: reply nesting exceeds max depth ${maxDepth}")
+  }
   let (line, rest) = readLine(s, buf)?
   if (len(line) == 0) {
     fail newError("resp: empty reply header")
@@ -101,10 +155,11 @@ export fn decodeReply(s: byteSource, buf: string): (Reply, string)! {
     return item, next
   }
   if (tag == '*') {
-    let (item, next) = decodeArray(s, body, rest)?
+    let (item, next) = decodeArray(s, body, rest, depth)?
     return item, next
   }
-  fail newError("resp: unknown reply type byte '${tag}'")
+  let (item, next) = decodeReplyExt(tag, body, s, rest, depth)?
+  return item, next
 }
 
 fn decodeInt(body: string): Reply! {
@@ -112,6 +167,18 @@ fn decodeInt(body: string): Reply! {
     fail newError("resp: bad integer '${body}'")
   }
   return Reply.Int(n)
+}
+
+// Reads exactly `n` data bytes plus their trailing CRLF off `s`, after
+// checking `n` against `maxBulkLen`. The one bound check every $-framed
+// type shares (bulk string here; blob error and verbatim string in
+// `resp3.bit`), since all three use the identical length-prefixed framing.
+fn readBlob(s: byteSource, buf: string, n: int): (string, string)! {
+  if (n > maxBulkLen) {
+    fail newError("resp: bulk length ${n} exceeds max ${maxBulkLen}")
+  }
+  let (data, rest) = readN(s, buf, n + 2)?
+  return data[0:n], rest
 }
 
 // `$-1\r\n` is a null bulk string (a cache miss) and carries no data bytes at
@@ -128,14 +195,34 @@ fn decodeBulk(s: byteSource, body: string, buf: string): (Reply, string)! {
   if (n < -1) {
     fail newError("resp: negative bulk length ${n}")
   }
-  let (data, rest) = readN(s, buf, n + 2)?
-  return Reply.Bulk(Option.Some(data[0:n])), rest
+  let (data, rest) = readBlob(s, buf, n)?
+  return Reply.Bulk(Option.Some(data)), rest
+}
+
+// Reads `n` replies in sequence, recursing one nesting level deeper for
+// each. Shared by RESP2 array and `resp3.bit`'s set/push — all three are
+// "N replies, no keys" aggregates, differing only in which `Reply` variant
+// wraps the result.
+fn decodeReplies(s: byteSource, n: int, buf: string, depth: int): ([]Reply, string)! {
+  if (n > maxAggregateLen) {
+    fail newError("resp: aggregate length ${n} exceeds max ${maxAggregateLen}")
+  }
+  let items = []Reply(0)
+  let rest = buf
+  let i = 0
+  while (i < n) {
+    let (item, next) = decodeReplyAt(s, rest, depth + 1)?
+    items = append(items, item)
+    rest = next
+    i = i + 1
+  }
+  return items, rest
 }
 
 // `*-1\r\n` is a null array (e.g. a blocking pop that timed out) —
 // `Option.None`, never an empty array. `*0\r\n` is a real, present, empty
 // array — `Option.Some([]Reply(0))`.
-fn decodeArray(s: byteSource, body: string, buf: string): (Reply, string)! {
+fn decodeArray(s: byteSource, body: string, buf: string, depth: int): (Reply, string)! {
   let n = parseInt(body) catch _ {
     fail newError("resp: bad array length '${body}'")
   }
@@ -145,14 +232,6 @@ fn decodeArray(s: byteSource, body: string, buf: string): (Reply, string)! {
   if (n < -1) {
     fail newError("resp: negative array length ${n}")
   }
-  let items = []Reply(0)
-  let rest = buf
-  let i = 0
-  while (i < n) {
-    let (item, next) = decodeReply(s, rest)?
-    items = append(items, item)
-    rest = next
-    i = i + 1
-  }
+  let (items, rest) = decodeReplies(s, n, buf, depth)?
   return Reply.Array(Option.Some(items)), rest
 }
