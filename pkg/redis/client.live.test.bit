@@ -267,6 +267,17 @@ test "live: a 3-command pipeline sends once and each Future decodes its own repl
 // not the closure's own capture, is what changes.
 class attemptCounter { n: i64 }
 
+// The transfer test's `body` result — a class, not a `(Future<i64>,
+// Future<i64>)` tuple: a tuple built by a multi-value `return` inside a
+// closure whose result type only exists via `transaction<R>`'s EXPLICIT
+// generic argument fails to lower (E0092, "cannot lower a multi-value
+// `return` whose function result is not a matching tuple") even though it
+// type-checks — `bit check` accepts it, `bit test` does not. A class-typed
+// `R` sidesteps it; not filed as a compiler ticket separately, same call as
+// #6013's own note on the sibling `withConn<T>`/`transaction<R>` explicit-
+// type-argument papercut (#6028's comment on #6013).
+class transferResult { debit: Future<i64>, credit: Future<i64> }
+
 // #6028's architecture acceptance: WATCH detects a real conflict (a second
 // client changing the watched key), EXEC comes back nil, `Client.transaction`
 // retries — succeeding and committing on the second attempt — and the
@@ -315,6 +326,151 @@ test "live: transaction retries once after a WATCH conflict, then its Future rea
     Some(v) => assert(v == "999", "committed transaction's Future read '${v}', want '999'")
     None => panic("committed transaction's Future read no value")
   }
+  admin.close()
+  c.close()
+}
+
+// A flag a `catch` block sets to prove control actually passed through it —
+// `attemptCounter`'s own shape, a class so the closure's write is visible
+// to the code that reads it after.
+class boolBox { hit: bool }
+
+// #6029's acceptance: a real check-and-set transfer. `tx.read.counter
+// (from).get()` reads the sender's balance NOW, on this attempt's own
+// pinned connection (never queued, unlike `tx.counter(...)`), while a
+// second connection's conflicting write forces this attempt's EXEC to come
+// back nil — same deterministic mechanism as the WATCH-conflict test
+// above (`tx.bit`'s header: `body` runs inside the WATCH..MULTI window).
+// The retried attempt re-reads the balance the conflicting write actually
+// left behind, so the committed transfer is computed off the CURRENT
+// balance, not the stale one the first attempt saw.
+test "live: a two-account transfer reads the balance via tx.read, retries once after a conflicting write, and commits the correct result" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let c = liveClient(u)
+  let admin = liveClient(u)
+  // `from` is a reserved word (SPEC's `import ... "from" STRING_LIT`) — the
+  // sender account key is spelled `fromKey`.
+  let fromKey = "bit:live:tx:transfer:from"
+  let to = "bit:live:tx:transfer:to"
+  let amount = i64(30)
+  c.set(fromKey, "100") catch e {
+    panic("set fromKey: ${e.message()}")
+  }
+  c.set(to, "50") catch e {
+    panic("set to: ${e.message()}")
+  }
+
+  let attempts = attemptCounter{ n = 0 }
+  let result = c.transaction<transferResult>([fromKey, to], (tx) => {
+    attempts.n = attempts.n + 1
+    let balance = tx.read.counter(fromKey).get()?
+    if (attempts.n == 1) {
+      // Forces THIS attempt's WATCH conflict on `fromKey`, from a second
+      // connection, synchronously, before this attempt's MULTI is ever
+      // sent — #6028's own WATCH-conflict test's exact mechanism.
+      admin.set(fromKey, "999") catch e {
+        panic("conflicting set: ${e.message()}")
+      }
+    }
+    if (balance < amount) {
+      fail RedisError.Unexpected("transfer", "insufficient funds")
+    }
+    let debit = tx.counter(fromKey).decrBy(amount)
+    let credit = tx.counter(to).incrBy(amount)
+    return transferResult{ debit = debit, credit = credit }
+  }) catch e {
+    panic("transaction: ${e.message()}")
+  }
+
+  assert(
+    attempts.n == 2,
+    "expected exactly one retry after the conflict, got ${attempts.n} attempts",
+  )
+  let debited = result.debit.get() catch e {
+    panic("debit future: ${e.message()}")
+  }
+  let credited = result.credit.get() catch e {
+    panic("credit future: ${e.message()}")
+  }
+  assert(debited == 969, "debited balance = ${debited}, want 969 (999 - 30)")
+  assert(credited == 80, "credited balance = ${credited}, want 80 (50 + 30)")
+  admin.close()
+  c.close()
+}
+
+// #6029's acceptance: a check-and-set read that makes `body` fail — the
+// exact error `body` raised surfaces from `transaction()` unchanged
+// (`tx.bit`'s catch-and-UNWATCH path re-`fail`s `e` as-is), and the failed
+// attempt's `WATCH` was cleared (`UNWATCH`), not left dangling on the
+// pooled connection. Proved by reusing the SAME connection (`poolSize = 1`)
+// for a second, unrelated transaction: if the first attempt's `WATCH` on
+// `watched` were still in effect, `admin`'s later write to `watched` would
+// spuriously conflict the second transaction's EXEC even though it never
+// touches `watched` itself (`tx.bit`'s header, "the NEXT caller to lease it
+// would silently inherit stale watched keys").
+test "live: a check-and-set read that fails body sends UNWATCH and surfaces the error unchanged" {
+  let u = liveUrl("REDIS_TEST_URL")
+  if (u == "") {
+    return
+  }
+  let opts = parseUrl(u) catch e {
+    panic("parseUrl(${u}): ${e.message()}")
+  }
+  opts.poolSize = 1
+  let c = connect(opts) catch e {
+    panic("connect: ${e.message()}")
+  }
+  let admin = liveClient(u)
+  let watched = "bit:live:tx:unwatch:watched"
+  let other = "bit:live:tx:unwatch:other"
+  c.set(watched, "5") catch e {
+    panic("set watched: ${e.message()}")
+  }
+  c.set(other, "0") catch e {
+    panic("set other: ${e.message()}")
+  }
+
+  let sawErr = boolBox{ hit = false }
+  c.transaction<bool>([watched], (tx) => {
+    let balance = tx.read.counter(watched).get()?
+    if (balance < 1000) {
+      fail RedisError.Unexpected("transfer", "insufficient funds")
+    }
+    return true
+  }) catch e {
+    sawErr.hit = true
+    match (e) {
+      Unexpected(cmd, detail) => {
+        assert(cmd == "transfer", "failed body's error command = '${cmd}', want 'transfer'")
+        assert(
+          detail == "insufficient funds",
+          "failed body's error detail = '${detail}', want 'insufficient funds'",
+        )
+      }
+      _ => panic("expected RedisError.Unexpected(\"transfer\", \"insufficient funds\"), got: ${e.message()}")
+    }
+    false
+  }
+  assert(sawErr.hit, "expected the check-and-set transaction to fail with insufficient funds")
+
+  admin.set(watched, "6") catch e {
+    panic("admin set watched: ${e.message()}")
+  }
+  let attempts = attemptCounter{ n = 0 }
+  c.transaction<bool>([other], (tx) => {
+    attempts.n = attempts.n + 1
+    tx.counter(other).incr()
+    return true
+  }) catch e {
+    panic("second transaction: ${e.message()}")
+  }
+  assert(
+    attempts.n == 1,
+    "second transaction retried ${attempts.n} time(s); a stale WATCH from the failed body's connection would force a retry",
+  )
   admin.close()
   c.close()
 }
