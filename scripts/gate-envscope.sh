@@ -41,7 +41,7 @@
 # already makes about this source's shape.
 envscoped_gate_trees() {
   local file line name m pair
-  for file in tools/build/gates.bit tools/build/gatestable2.bit; do
+  for file in tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit; do
     name=""
     while IFS= read -r line; do
       case "${line}" in
@@ -266,7 +266,7 @@ assert_envscope_deps() {
 # covered.
 argv_gate_paths() {
   sed -n 's/.*Gate{name = "\([^"]*\)".*runArgs("\([^"]*\)").*/\1 \2/p' \
-    tools/build/gates.bit tools/build/gatestable2.bit
+    tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit
 }
 
 # The scan-root spellings a harness uses to name the tree "$1", as an extended
@@ -596,7 +596,7 @@ assert_argvscoped_gates_current() {
 # 7 gates / 11 paths) — a false finding that fails loudly at an innocent gate.
 argvliteral_gate_paths() {
   local file line name m p
-  for file in tools/build/gates.bit tools/build/gatestable2.bit; do
+  for file in tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit; do
     name=""
     while IFS= read -r line; do
       case "${line}" in

@@ -5473,7 +5473,9 @@ test "concat" {
   mistaken for a test regardless of its own functions' shapes.
 - `bit test <file.bit|dir>` discovers every test in the module a file names,
   or in every module beneath a directory - never in a module reached only by
-  importing it from outside that directory. It runs each, prints `ok`/`FAIL`
+  importing it from outside that directory, and never beneath a subdirectory
+  holding its own `bit.json`, which is a separate project tested from its own
+  root. It runs each, prints `ok`/`FAIL`
   per test (by its string name) plus a summary, and exits:
 
   | code | meaning |

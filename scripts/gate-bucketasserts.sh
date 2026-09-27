@@ -190,7 +190,7 @@ echo "gate: assert_composite_is_superset: ${denom} composite bucket(s); each run
 # with its env on the fourth, and an env path is not a formatted tree.
 fmt_gate_trees() {
   local file line name m pair p inargv=0
-  for file in tools/build/gates.bit tools/build/gatestable2.bit; do
+  for file in tools/build/gates.bit tools/build/gatestable2.bit tools/build/gatestable3.bit; do
     name=""
     inargv=0
     while IFS= read -r line; do

@@ -106,7 +106,7 @@ is_additive_registration() {
   case "${file}" in
     tools/build/defs.bit) prefix="Step{name[ :=]" ;;
     tools/build/gates.bit) prefix="Gate{name[ :=]" ;;
-    tools/build/gatestable2.bit) prefix="Gate{name[ :=]" ;;
+    tools/build/gatestable2.bit|tools/build/gatestable3.bit) prefix="Gate{name[ :=]" ;;
     *) return 1 ;;
   esac
   diff="$(
