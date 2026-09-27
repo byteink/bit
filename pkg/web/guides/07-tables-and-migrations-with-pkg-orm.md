@@ -267,5 +267,5 @@ Specification: [Schema](../../orm/docs/schema.md), [Apply
 migrations](../../orm/docs/migrate.md), [Many-to-many
 relations](../../orm/docs/manytomany.md).
 
-Previous: Part 6, Connecting to PostgreSQL.
+Previous: [Connecting to PostgreSQL](06-connecting-to-postgresql.md).
 Next: [Querying and CRUD](08-querying-and-crud.md).

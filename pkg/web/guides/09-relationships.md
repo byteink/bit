@@ -411,4 +411,4 @@ Specification: [Relations](../../orm/docs/relation.md), [Many-to-many
 relations](../../orm/docs/manytomany.md), [Patch](../../orm/docs/patch.md).
 
 Previous: [Querying and CRUD](08-querying-and-crud.md).
-Next: Part 10, Registering users and hashing passwords.
+Next: [Registering users and hashing passwords](10-registering-users-and-hashing-passwords.md).
