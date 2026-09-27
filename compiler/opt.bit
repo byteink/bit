@@ -390,10 +390,10 @@ fn markListLive(live: []bool, ids: []int) {
 }
 
 // One backward sweep marks every value transitively reachable from a root
-// (side-effecting instruction, terminator, or block param) live. Correct in a
-// single descending pass because every operand's def index is always less than
-// its use's, so by the time the sweep reaches a definition every later
-// instruction that could mark it live has already run.
+// (side-effecting instruction or terminator) live. Every operand's def index is
+// below its use's, so by the time the sweep reaches a definition every later
+// instruction that could mark it live has already run; only a back edge's
+// argument and a keepalive base above its derived value need another round.
 //
 // `dead` (optalloc.bit) is the one input that can unseat a side-effecting root:
 // the instructions of an allocation proven unobservable. They are skipped
@@ -430,8 +430,13 @@ fn markKeepAliveLive(f: IrFunc, live: []bool, id: int): bool {
 }
 
 // One descending sweep. Returns whether a keepalive edge marked a value this
-// sweep had already passed, so `computeLive` knows to run another.
-fn liveSweep(f: IrFunc, live: []bool, dead: []bool, debug: bool): bool {
+// sweep had already passed, so `computeLive` knows to run another. Under
+// `prune` a block parameter is not a root (#5949): it is live once a live
+// instruction reads it or a live value names it as its keepalive base, and a
+// terminator needs only the arguments whose parameter is live
+// (`markReadsLive`). Without it every parameter is already live and roots no
+// keepalive base, which is main's DCE before #5949.
+fn liveSweep(f: IrFunc, live: []bool, dead: []bool, debug: bool, prune: bool): bool {
   let again = false
   let i = len(f.instrs)
   while (i > 0) {
@@ -440,20 +445,121 @@ fn liveSweep(f: IrFunc, live: []bool, dead: []bool, debug: bool): bool {
       continue
     }
     let op = f.instrs[i].op
-    if (op == Op.BlockParam) {
-      live[i] = true
+    if (op == Op.BlockParam && !prune) {
       continue
     }
     if (!live[i] && !isSideEffectingDebug(op, debug)) {
       continue
     }
     live[i] = true
-    markOperandsLive(f, live, i)
+    markReadsLive(f, live, i)
     if (markKeepAliveLive(f, live, i)) {
       again = true
     }
   }
   return again
+}
+
+// The values instruction `id` needs: its operands, except that an edge needs an
+// argument only while the parameter it binds is live.
+fn markReadsLive(f: IrFunc, live: []bool, id: int) {
+  let ins = f.instrs[id]
+  if (ins.op == Op.Jump) {
+    markLiveEdgeArgs(f, live, ins.ival, ins.args)
+    return
+  }
+  if (ins.op == Op.Br) {
+    live[ins.lhs] = true
+    markLiveEdgeArgs(f, live, ins.ival, ins.thenArgs)
+    markLiveEdgeArgs(f, live, ins.ival2, ins.elseArgs)
+    return
+  }
+  markOperandsLive(f, live, id)
+}
+
+fn markLiveEdgeArgs(f: IrFunc, live: []bool, target: int, args: []int) {
+  let k = 0
+  while (k < len(args)) {
+    if (edgeParamLive(f, live, target, k)) {
+      live[args[k]] = true
+    }
+    k = k + 1
+  }
+}
+
+// Whether the `k`th parameter of block `target` is live. An argument past the
+// parameter count binds nothing that could be dead, so it stays a use: a
+// malformed edge is kept as it is, never pruned into a different one.
+fn edgeParamLive(f: IrFunc, live: []bool, target: int, k: int): bool {
+  let blk = f.blocks[target]
+  return k >= blk.paramCount || live[blk.instsStart + k]
+}
+
+// Whether a live edge still passes a dead argument into a live parameter: the
+// back edge, whose terminator sits ABOVE the loop body that decides whether the
+// header's parameter is read, so one descending sweep cannot settle it.
+fn edgesPending(f: IrFunc, live: []bool): bool {
+  for blk of f.blocks {
+    if (blk.instsLen > 0 && terminatorPending(f, live, blk.instsStart + blk.instsLen - 1)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn terminatorPending(f: IrFunc, live: []bool, t: int): bool {
+  let ins = f.instrs[t]
+  if (!live[t]) {
+    return false
+  }
+  if (ins.op == Op.Jump) {
+    return edgePending(f, live, ins.ival, ins.args)
+  }
+  if (ins.op == Op.Br) {
+    return edgePending(f, live, ins.ival, ins.thenArgs) ||
+      edgePending(f, live, ins.ival2, ins.elseArgs)
+  }
+  return false
+}
+
+fn edgePending(f: IrFunc, live: []bool, target: int, args: []int): bool {
+  let k = 0
+  while (k < len(args)) {
+    if (!live[args[k]] && edgeParamLive(f, live, target, k)) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+// Whether #5949's dead block-parameter pruning is on for this process.
+// Default OFF: it changes post-opt IR against the pinned stage0 0.29.0, so it
+// lands dark until the next repin flips the default; this predicate and the
+// `prune` it threads through `computeLive` are deleted one release after that.
+// TEMPORARY.
+fn dceParamsEnabled(): bool {
+  return envOr("BIT_DCE_PARAMS", "") == "1"
+}
+
+// The parameters no sweep may drop: the entry block's, which are the
+// function's arguments (their count is the ABI), and, without `prune`, every
+// block's.
+fn markRootParamsLive(f: IrFunc, live: []bool, prune: bool) {
+  let n = len(f.blocks)
+  if (prune && n > 1) {
+    n = 1
+  }
+  let bi = 0
+  while (bi < n) {
+    let blk = f.blocks[bi]
+    let k = 0
+    while (k < blk.paramCount) {
+      live[blk.instsStart + k] = true
+      k = k + 1
+    }
+    bi = bi + 1
+  }
 }
 
 fn computeLive(f: IrFunc, dead: []bool, debug: bool): []bool {
@@ -463,13 +569,15 @@ fn computeLive(f: IrFunc, dead: []bool, debug: bool): []bool {
     live = append(live, false)
     i = i + 1
   }
-  // A function with no keepalive edges runs EXACTLY one sweep: `liveSweep`
-  // can only report `again` from `markKeepAliveLive`, which walks an empty
-  // list. So this costs the 99.9% case nothing, and each extra round resolves
-  // at least one edge, which bounds the walk.
+  let prune = dceParamsEnabled()
+  markRootParamsLive(f, live, prune)
+  // A function with no loop and no keepalive edge runs EXACTLY one sweep. Each
+  // extra round marks at least one more value — a keepalive base the sweep had
+  // passed, or a pending edge's argument — so the instruction count bounds it.
   let round = 0
-  while (round <= len(f.keepAlive)) {
-    if (!liveSweep(f, live, dead, debug)) {
+  while (round <= len(f.instrs)) {
+    let again = liveSweep(f, live, dead, debug, prune)
+    if (!again && !(prune && edgesPending(f, live))) {
       return live
     }
     round = round + 1
