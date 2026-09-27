@@ -1039,10 +1039,10 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   appends into one growable `[]JsonEntry` and `jsonEncode` renders it into one
   buffer.
 
-**`__jsonAppend` - the direct byte encoder (`BIT_JSON_APPEND`, off by
+**`__jsonAppend` - the direct byte encoder (`BIT_JSON_APPEND`, on by
 default).**
 
-- Behind the flag, a class carrying `@json` gains a second synthesized member
+- Unless `BIT_JSON_APPEND=0`, a class carrying `@json` gains a second synthesized member
 
   ```
   __jsonAppend(out: []byte): []byte
