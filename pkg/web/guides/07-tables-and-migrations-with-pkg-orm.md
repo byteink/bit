@@ -214,7 +214,7 @@ produces.
 route. Running it against a fresh database prints:
 
 ```text
-postgres: connected with sslmode=disable — credentials and query results cross the network in the clear.
+postgres: connected with sslmode=disable - credentials and query results cross the network in the clear.
 inkwell: applied 5 migration(s)
 ```
 
