@@ -1,0 +1,279 @@
+// compiler/classjobdesc.bit — `@job("name")` on a class (SPEC §10.3.1, §10.5,
+// #6081, epic #4023's 2026-09-27 OWNER DECISION).
+//
+//     @job("send-welcome")
+//     @json
+//     class SendWelcome { userId: i64 }
+//
+// synthesizes `__jobName(): string`, a stable, explicit name that survives
+// renaming the class — the escape from the dispatch problem the epic's
+// OWNER DECISION settled: `pkg/jobs`'s `register<T: Job>`/`enqueue<T: Job>`
+// read the name off a type parameter constrained by an interface THE
+// PACKAGE declares (`interface Job { __jobName(): string }`), so this file
+// only has to synthesize an ordinary method, the same shape `@json`'s
+// `toJson` is. No compiler-known interface, no reflection.
+//
+// A `@job` class must also carry `@json`, required rather than implied: a
+// queued job's payload needs `toJson`/`jsonDecode<T>` to cross the store,
+// and `@json`'s own header comment already settles the question — the mark
+// is the CONSENT, never a side effect of a different one.
+
+// E0165 (§10.5): `@job`'s own argument is not exactly one string constant.
+// The argument is REQUIRED here, unlike `@table`'s optional override
+// (E0149/E0156) — a job has no default dispatch name to fall back to.
+const ecJobArgs = 165
+// E0166 (§10.5): `@job`'s argument does not match `[a-z0-9._-]+`, 1-63
+// bytes. The name is a queue-store key and a dead-letter-list value, so it
+// is restricted to the same safe character set a slug is.
+const ecJobBadName = 166
+// E0167 (§10.5): a `@job` class does not also carry `@json`.
+const ecJobRequiresJson = 167
+// E0168 (§10.5): a class declares a method named `__jobName` — mirrors
+// E0164's reservation of `__jsonAppend` for the identical reason: reserved
+// on EVERY class, `@job` or not, because dispatch code constrained on
+// `interface Job { __jobName(): string }` matches by name alone, and a
+// same-named method on an unmarked class would satisfy that assertion.
+const ecJobNameDeclared = 168
+// E0169 (§10.5): two `@job` classes anywhere in the program share a name —
+// a whole-program check, naming both declarations, since the queue store is
+// keyed by this string across every module the compiler sees.
+const ecJobDuplicateName = 169
+
+const classAttrJob = "job"
+const synthJobNameName = "__jobName"
+const jobNameMaxLen = 63
+
+// True iff the class declaration carries `@job`.
+fn classHasJob(t: Tree, source: string, structDecl: int): bool {
+  return jobAttrOf(t, source, structDecl) != 0
+}
+
+// `@job`'s own attribute node, or 0 when the class carries no `@job`.
+fn jobAttrOf(t: Tree, source: string, structDecl: int): int {
+  let list = classAttrList(t, structDecl)
+  if (list == 0) {
+    return 0
+  }
+  for a of kidsOf(t, list) {
+    if (identText(t, source, kidsOf(t, a)[0]) == classAttrJob) {
+      return a
+    }
+  }
+  return 0
+}
+
+// One class carrying `@job`. `classNode`/`className`/`nameLit` are node
+// indices into THIS class's own module `Tree`, valid only while that module
+// is being synthesized. `classNameText`/`classSpan` are plain data — a
+// string copy and an already-remapped, per-file span — safe to carry into
+// the whole-program duplicate check that runs after every module has been
+// visited (`checkJobNameDuplicates`, called from `synthtext.bit`'s
+// `injectSynthMembers`, the one place the full module set is visible).
+class JobClass {
+  classNode: int,
+  className: int,
+  exported: bool,
+  nameLit: int,
+  name: string,
+  classNameText: string,
+  classSpan: Span,
+}
+
+// Every class in `m` carrying `@job`, already validated: a malformed
+// argument, a non-`@json` class or a bad name is reported and DROPPED here,
+// the same shape `collectJsonClasses` takes.
+fn collectJobClasses(p: Project, m: SrcModule): []JobClass {
+  let tree = m.tree
+  let source = m.source
+  let out = []JobClass(0)
+  for tc of topClassDecls(tree) {
+    let d = tc.decl
+    if (!classHasJob(tree, source, d)) {
+      continue
+    }
+    let jc = buildJobClass(p, m, d, tc.exported)
+    if (jc.classNode == 0) {
+      continue
+    }
+    out = append(out, jc)
+  }
+  return out
+}
+
+fn buildJobClass(p: Project, m: SrcModule, d: int, exported: bool): JobClass {
+  let tree = m.tree
+  let source = m.source
+  let bad = JobClass{
+    classNode = 0, className = 0, exported = false, nameLit = 0, name = "",
+    classNameText = "", classSpan = Span{ file = 0, start = 0, end = 0 },
+  }
+  let k = kidsOf(tree, d)
+  let cname = identText(tree, source, k[0])
+  if (!classHasJson(tree, source, d)) {
+    report(
+      p.diags, ecJobRequiresJson, getNode(tree, k[0]).span,
+      "class '${cname}' carries '@job' but not '@json'",
+      "add '@json' — a queued job's payload is encoded and decoded through it",
+    )
+    return bad
+  }
+  let attr = jobAttrOf(tree, source, d)
+  let attrKids = kidsOf(tree, attr)
+  if (len(attrKids) != 2) {
+    reportJobArgs(p, tree, attr, cname, "takes exactly one string, and has ${len(attrKids) - 1}")
+    return bad
+  }
+  let arg = getNode(tree, attrKids[1])
+  if (arg.tag != Tag.StringLit && arg.tag != Tag.RawStringLit) {
+    reportJobArgs(
+      p, tree, attr, cname,
+      "takes a string constant, and has '${source[arg.span.start:arg.span.end]}'",
+    )
+    return bad
+  }
+  let name = decodeStringContent(source, arg.span.start, arg.span.end)
+  if (!jobNameValid(name)) {
+    report(
+      p.diags, ecJobBadName, arg.span,
+      "class '${cname}' carries '@job(\"${name}\")', not a valid job name",
+      "a job name is 1-${jobNameMaxLen} bytes of lowercase letters, digits, '.', '_' or '-'",
+    )
+    return bad
+  }
+  return JobClass{
+    classNode = d, className = k[0], exported = exported, nameLit = attrKids[1],
+    name = name, classNameText = cname, classSpan = remapJobModuleSpan(m, getNode(tree, k[0]).span),
+  }
+}
+
+fn reportJobArgs(p: Project, tree: Tree, attr: int, cname: string, what: string) {
+  report(
+    p.diags, ecJobArgs, getNode(tree, attr).span,
+    "'@job' on class '${cname}' ${what}",
+    "write '@job(\"name\")' with the job's stable dispatch name",
+  )
+}
+
+// `[a-z0-9._-]{1,63}` — the same length ceiling a DNS label and most
+// queue/column identifiers share, so the name fits any store's key column
+// with no second length rule to keep in sync.
+fn jobNameValid(name: string): bool {
+  if (len(name) == 0 || len(name) > jobNameMaxLen) {
+    return false
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (!jobNameByteOk(name[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn jobNameByteOk(b: byte): bool {
+  return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '.' || b == '_' || b == '-'
+}
+
+// A module-global span (what every diagnostic in this per-module synthesis
+// pass carries before `synthtext.bit`'s `injectSynthMembers` remaps it)
+// turned into the per-file span `remapDiags` would produce — needed here
+// because `checkJobNameDuplicates` reports across modules AFTER each
+// module's own diagnostics have already been remapped, so a span computed
+// then must already be in the same, final, per-file form.
+fn remapJobModuleSpan(m: SrcModule, sp: Span): Span {
+  let loc = fileOf(m.fileStarts, sp.start)
+  if (loc.fileIdx >= len(m.files)) {
+    return sp
+  }
+  return Span{
+    file = m.files[loc.fileIdx], start = loc.offset, end = loc.offset + (sp.end - sp.start),
+  }
+}
+
+// `__jobName` reserved on EVERY class, `@job` or not — mirrors
+// `vReservedJsonAppend` (classjson.bit, E0164) for the identical reason.
+fn vReservedJobName(tree: Tree, source: string, diags: Diagnostics) {
+  for tc of topClassDecls(tree) {
+    let d = tc.decl
+    let own = declaredMember(tree, source, kidsOf(tree, d)[2], synthJobNameName)
+    if (own == 0) {
+      continue
+    }
+    let cname = identText(tree, source, kidsOf(tree, d)[0])
+    report(
+      diags, ecJobNameDeclared, getNode(tree, own).span,
+      "class '${cname}' declares '__jobName', a name '@job' reserves for its generated method",
+      "rename this method — '__jobName' is synthesized by '@job' and matched by name alone by dispatch code constrained on 'interface Job { __jobName(): string }'",
+    )
+  }
+}
+
+// Two `@job` classes sharing a name anywhere in the program, naming both —
+// the same "naming both sources" shape `checktraitfield.bit`'s trait/class
+// field conflict takes. Run once, after every module's own `@job` classes
+// have been collected (`synthtext.bit`'s `injectSynthMembers`), since the
+// queue store is keyed by this string across the whole program, not one
+// module.
+fn checkJobNameDuplicates(diags: Diagnostics, classes: []JobClass) {
+  let seen = map<string, JobClass>{}
+  for jc of classes {
+    let (prior, ok) = seen[jc.name]
+    if (!ok) {
+      seen[jc.name] = jc
+      continue
+    }
+    report(
+      diags, ecJobDuplicateName, jc.classSpan,
+      "class '${jc.classNameText}' carries '@job(\"${jc.name}\")', already used by class '${prior.classNameText}'",
+      "job names are looked up by this string across the whole program; give one of the two classes a different '@job' name",
+    )
+  }
+}
+
+// The words `injectJobNameDecls` needs in the module source: the method
+// name and its `string` result type. `jobNameLit`'s own text is CLONED from
+// the `@job(...)` argument already in source, so it needs no word of its
+// own — the same reuse `jbKeyExpr` (classjsonbuild.bit) makes of `@key`.
+fn jobDescSynthWords(classes: []JobClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  return [synthJobNameName, "string"]
+}
+
+// `[export] fn (this: C) __jobName(): string { return "<name>" }` — the
+// shape `synthTableMethod` (classtabledesc.bit) takes for a receiver method
+// with no parameters, specialised to a scalar `string` return instead of a
+// `[]elemType` one.
+fn synthJobNameMethod(tree: Tree, st: SynthText, jc: JobClass): int {
+  let classSpan = getNode(tree, jc.className).span
+  let litNode = getNode(tree, jc.nameLit)
+  let lit = addLeaf(tree, litNode.tag, litNode.span)
+  let stmts = [addNode(tree, Tag.ReturnStmt, classSpan, 0, [lit])]
+  let recv = addNode(
+    tree, Tag.Receiver, classSpan, 0, [0, traitClassTypeRef(tree, jc.className, 0)],
+  )
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [
+      recv, synthIdent(tree, st, synthJobNameName), 0,
+      addNode(tree, Tag.Params, classSpan, 0, []int(0)), synthIdent(tree, st, "string"),
+      addNode(tree, Tag.Block, classSpan, 0, stmts),
+    ],
+  )
+  if (!jc.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+// Every `@job` class's synthesized `__jobName`, for the caller to attach
+// alongside every other feature's in the same pass.
+fn injectJobNameDecls(tree: Tree, st: SynthText, classes: []JobClass): []int {
+  let out = []int(0)
+  for jc of classes {
+    out = append(out, synthJobNameMethod(tree, st, jc))
+  }
+  return out
+}

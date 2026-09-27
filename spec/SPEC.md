@@ -1322,6 +1322,45 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   takes it (§17's `std/sql` contract) - no value is ever concatenated into
   the SQL text this package builds.
 
+**`@job("name")` - a stable, explicit background-job dispatch name (#6081).**
+
+```
+@job("send-welcome")
+@json
+class SendWelcome { userId: i64 }
+```
+
+- `@job` takes exactly one argument, a string literal matching
+  `[a-z0-9._-]{1,63}` - anything else is **E0165** (wrong argument count or
+  not a string constant) or **E0166** (the string does not match that set).
+  The name is looked up by a background-job library as a queue-store key, so
+  it is restricted to the same safe character set a slug is.
+- A `@job` class must also carry `@json` - **E0167** otherwise - since a
+  queued job's payload has to be encoded onto the store and decoded back off
+  it, and `@json`'s `toJson`/`jsonDecode<T>` are what do that.
+- The class gains a synthesized member
+
+  ```
+  __jobName(): string
+  ```
+
+  returning the name exactly as written in `@job(...)`. This is what makes
+  the name **stable across a rename**: renaming the class changes nothing a
+  job already sitting in a queue depends on, only `@job`'s own argument does.
+- **`__jobName` is a reserved name on every class, `@job` or not.** A class
+  that declares a method by this name is **E0168** - the same rule, for the
+  same reason, `__jsonAppend`'s own reservation (E0164) above is: dispatch
+  code constrained on an interface naming `__jobName()` structurally
+  (§14.3) matches by name alone, so a same-named method on an unrelated
+  class would satisfy it and misbehave at the call, not at the assertion.
+- **Two `@job` classes anywhere in the program sharing a name is E0169**,
+  naming both declarations - checked across the whole program, not one
+  module, because a job dispatch table is keyed by this string across
+  every module the compiler sees.
+- `@job` introduces no reflection and no compiler-generated cross-module
+  table: it only synthesizes `__jobName`, an ordinary method a library reads
+  through a normal, structurally-satisfied interface constraint.
+
 ### 10.6 Interface Declarations
 
 ```
