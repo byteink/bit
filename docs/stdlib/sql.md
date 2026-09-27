@@ -24,7 +24,7 @@ own wire format from the ordered `params` list it is given.
 <!-- doctest: per-block -->
 
 ```bit ignore
-import { Value, isNull, asInt, asFloat, asText, asBlob } from "std/sql"
+import { Value, isNull, asInt, asFloat, asBool, asText, asBlob } from "std/sql"
 import { Driver, Conn, Rows, Stmt, Tx } from "std/sql"
 import { Registry, newRegistry } from "std/sql"
 ```
@@ -34,8 +34,10 @@ import { Registry, newRegistry } from "std/sql"
 ### `Value`
 
 A sum type over the wire types every driver must be able to carry: `Null` is
-SQL NULL, `Int`/`Float`/`Text`/`Blob` cover every scalar column type a driver
-maps its own types onto.
+SQL NULL, `Int`/`Float`/`Bool`/`Text`/`Blob` cover every scalar column type a
+driver maps its own types onto. `Bool` exists for a database with a native
+boolean wire type (Postgres); a database with none (MySQL's `TINYINT(1)`,
+SQLite) keeps mapping a boolean column to `Int` instead.
 
 ```bit
 import { Value } from "std/sql"
@@ -45,6 +47,7 @@ fn describe(v: Value): string {
     Null => return "null"
     Int(n) => return "int ${n}"
     Float(f) => return "float ${f}"
+    Bool(b) => return "bool ${b}"
     Text(s) => return "text ${s}"
     Blob(b) => return "blob of ${len(b)} byte(s)"
   }
@@ -63,6 +66,12 @@ The typed accessor for an `Int` value. Fails if `v` holds any other variant -
 ### `asFloat(v: Value): f64!`
 
 The typed accessor for a `Float` value. Fails on any other variant.
+
+### `asBool(v: Value): bool!`
+
+The typed accessor for a `Bool` value. Fails on any other variant - a driver
+that maps a boolean column to `Int` (MySQL's `TINYINT(1)`) is read with
+`asInt`/`sqlReqBool` instead, never this one.
 
 ### `asText(v: Value): string!`
 

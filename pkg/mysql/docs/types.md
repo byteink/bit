@@ -15,8 +15,11 @@ create table payments (
 ```
 
 Read straight off `rows.value(i)`, every one of those columns comes back as a
-`std/sql.Value` - a five-variant union that only knows `Null`, `Int`, `Float`,
-`Text` or `Blob`, never "this is money" or "this is an instant". Treat a
+`std/sql.Value` - a six-variant union that only knows `Null`, `Int`, `Float`,
+`Bool`, `Text` or `Blob`, never "this is money" or "this is an instant".
+MySQL has no boolean wire type of its own, so a MySQL column never actually
+produces `Bool` - `TINYINT(1)`, its conventional bool column, still decodes
+to `Int` (see below). Treat a
 DECIMAL column's text as a float and a comparison that should be exact starts
 drifting. Treat a `TIMESTAMP` as a bare string and you lose the fact that it
 is already UTC and can be compared and stored as one. `mysqlDecimal` and
