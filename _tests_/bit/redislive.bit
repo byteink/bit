@@ -1,0 +1,362 @@
+// _tests_/bit/redislive.bit — `./make test-package-redis-live` (#6021, epic
+// #6013). Provisions its OWN Redis server rather than depending on one
+// someone else started: a throwaway `docker run --rm -d` container per
+// scheme (plain, TLS), PING-polled ready, handed to
+// pkg/redis/client.live.test.bit as REDIS_TEST_URL / REDIS_TEST_TLS_URL,
+// then always removed — see `cleanup()` for exactly what "always" covers.
+//
+// IMAGE: `redis:8.10.2` (Redis Open Source, stable 2026-09-17 per its GitHub
+// release, `prerelease: false`), pinned BY DIGEST so a retag upstream cannot
+// silently change what this gate runs against:
+//
+//   redis@sha256:d5ac52db24d4e70566fe9944f22cf5bdc2bc739b05c0f426335161ea6c23f3b3
+//
+// That is 8.10's newest patch and 8.10 is the newest stable minor (8.2, 8.4,
+// 8.6, 8.8, 8.10 all published; no 9.x yet) as of 2026-09-27 — re-verify
+// before bumping:
+//   curl -s https://hub.docker.com/v2/repositories/library/redis/tags/8.10.2 | jq .digest
+//   curl -s https://api.github.com/repos/redis/redis/releases/tags/<version> | jq .prerelease
+//
+// THE IMAGE ITSELF IS KEPT, never deleted by this gate: `docker run`
+// auto-pulls it on first use (no explicit `docker pull` step below), and
+// deleting a ~55 MB pinned image after every green run only to re-pull it
+// next time makes a gate meant to run often slow for no safety benefit —
+// the local-machine-hygiene rule (bitlang-ws's top-level CLAUDE.md) is about
+// not leaving ONE-OFF, throwaway installs behind, and a pinned image this
+// gate itself depends on every run is neither. Only the two CONTAINERS are
+// throwaway and torn down every run — see CLEANUP below.
+//
+// WITHOUT DOCKER: no `docker` binary at any of `dockerCandidates()`, or
+// `docker info` failing (daemon down, or `DOCKER_HOST` pointed at a dead
+// socket) — prints "skipped: docker unavailable" and exits 0. This gate is
+// meant to run on every machine, most of which have no Docker.
+//
+// CLEANUP: every container this run starts is named with a run-local UUID
+// AND labelled `bit.redis.live=1`; `cleanup()` removes both by name on every
+// path this PROCESS controls — success, a failing live test, a docker/openssl
+// step failing partway through setup. It cannot clean up after a `kill -9`:
+// no Bit program can run code after that, in any language. The label is the
+// mitigation instead of a promise this process cannot keep: `sweepOrphans()`
+// runs FIRST, before this run starts anything, and force-removes every
+// `bit.redis.live=1` container left over from a run that was interrupted —
+// so an orphan outlives at most one invocation of this gate, never
+// accumulates.
+//
+// ENV vars this harness reads (`./make test-package-redis-live` sets the
+// first two, tools/build/gatestable2.bit):
+//   BIT_REPO   repo root, so pkg/redis resolves regardless of cwd (required)
+//   BIT_BIN    compiler under test    (default bit-out/bin/bit)
+//
+// `bit test` inherits no argv (`bit run` forwards none either) and this
+// package's live tests read their target off `REDIS_TEST_URL`/
+// `REDIS_TEST_TLS_URL`, not a CLI flag — `runLiveTests()` below sets both by
+// exec'ing `/usr/bin/env VAR=... <bit> test <file>` rather than the plain
+// `<bit> test <file>` every other gate uses: `std/process`'s `run`/`output`
+// exec directly with no shell and inherit only THIS process's own
+// environment (their own doc comments), so a child-only variable has no
+// route in except through a wrapper that sets it before exec'ing the real
+// target — the same `env(1)` trick any shell script uses for the same
+// reason, proved in isolation on #6021 (`bit run` a probe `.test.bit` that
+// asserts on an env var, launched through this exact `/usr/bin/env VAR=...
+// <bit> test <probe>` shape).
+
+import { output } from "std/process"
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, hasSuffix, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { sleep, Millisecond } from "std/time"
+
+const image: string = "redis@sha256:d5ac52db24d4e70566fe9944f22cf5bdc2bc739b05c0f426335161ea6c23f3b3"
+const runLabel: string = "bit.redis.live=1"
+// Bounded poll: 40 * 500ms = 20s per container, generous for a local
+// daemon-managed pull-and-boot that already completed before PING is tried.
+const readyAttempts: int = 40
+const readyDelayMs: int = 500
+const dockerQuickTimeoutMs: int = 10000
+const dockerRunTimeoutMs: int = 30000
+const testRunTimeoutMs: int = 120000
+
+// BIT_REPO IS REQUIRED, same reason as _tests_/bit/packagesgate.bit and
+// _tests_/bit/coldboot.bit: falling back to "." would silently test whatever
+// directory `bit` happened to be invoked from instead of refusing.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("redislive: BIT_REPO is not set — run this through `./make test-package-redis-live`")
+  }
+  return r
+}
+
+// `std/process` execs directly with no PATH search (its own doc comment), so
+// `docker`/`openssl` have to be found by hand — a fixed, bounded list of the
+// paths Docker Desktop and this repo's package managers actually install to,
+// not a filesystem search.
+fn findBin(candidates: []string): string {
+  let i = 0
+  while (i < len(candidates)) {
+    if (exists(candidates[i])) {
+      return candidates[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn dockerCandidates(): []string {
+  return ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/usr/bin/docker"]
+}
+
+fn opensslCandidates(): []string {
+  return [
+    "/usr/bin/openssl", "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl",
+    "/usr/local/opt/openssl/bin/openssl",
+  ]
+}
+
+fn dockerBin(): string {
+  return findBin(dockerCandidates())
+}
+
+fn opensslBin(): string {
+  return findBin(opensslCandidates())
+}
+
+fn dockerAvailable(bin: string): bool {
+  if (bin == "") {
+    return false
+  }
+  let r = output(bin, ["info"], dockerQuickTimeoutMs)
+  return r.exitCode == 0
+}
+
+// Force-removes every container this harness has ever labelled, before this
+// run starts its own — see the header's CLEANUP section for why this exists.
+fn sweepOrphans(bin: string) {
+  let r = output(bin, ["ps", "-aq", "--filter", "label=${runLabel}"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    return
+  }
+  for id of split(trimSpace(r.stdout), "\n") {
+    if (id == "") {
+      continue
+    }
+    output(bin, ["rm", "-f", id], dockerRunTimeoutMs)
+  }
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (hasSuffix(s, suffix)) {
+    return s[0:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn dockerRun(bin: string, args: []string): ()! {
+  let r = output(bin, args, dockerRunTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker ${args[0]}: ${trimSpace(r.stderr)}")
+  }
+}
+
+fn hostPort(bin: string, name: string): int! {
+  let r = output(bin, ["port", name, "6379/tcp"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker port ${name}: ${trimSpace(r.stderr)}")
+  }
+  let lines = split(trimSpace(r.stdout), "\n")
+  if (len(lines) == 0 || lines[0] == "") {
+    fail newError("docker port ${name}: no mapping printed")
+  }
+  let colon = lastIndexOf(lines[0], ":")
+  if (colon < 0) {
+    fail newError("docker port ${name}: unexpected output '${lines[0]}'")
+  }
+  return parseInt(lines[0][colon + 1:])?
+}
+
+fn pingReady(bin: string, args: []string): bool {
+  let i = 0
+  while (i < readyAttempts) {
+    let r = output(bin, args, dockerQuickTimeoutMs)
+    if (r.exitCode == 0 && contains(r.stdout, "PONG")) {
+      return true
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  return false
+}
+
+class liveContainer {
+  name: string,
+  port: int,
+}
+
+fn startPlain(bin: string, name: string, password: string): liveContainer! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel,
+      "-p", "127.0.0.1:0:6379", image, "redis-server", "--requirepass", password,
+    ],
+  )?
+  let port = hostPort(bin, name)?
+  let ready = pingReady(
+    bin,
+    [
+      "exec", name, "redis-cli", "-a", password, "--no-auth-warning", "ping",
+    ],
+  )
+  if (!ready) {
+    fail newError("${name}: PING never answered PONG within ${readyAttempts * readyDelayMs}ms")
+  }
+  return liveContainer{ name = name, port = port }
+}
+
+fn startTls(bin: string, name: string, password: string, tlsCertDir: string): liveContainer! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel,
+      "-p", "127.0.0.1:0:6379", "-v", "${tlsCertDir}:/tls:ro", image,
+      "redis-server", "--requirepass", password, "--port", "0", "--tls-port", "6379",
+      "--tls-cert-file", "/tls/server.crt", "--tls-key-file", "/tls/server.key",
+      "--tls-ca-cert-file", "/tls/ca.crt", "--tls-auth-clients", "no",
+    ],
+  )?
+  let port = hostPort(bin, name)?
+  let ready = pingReady(
+    bin,
+    [
+      "exec", name, "redis-cli", "--tls", "--cacert", "/tls/ca.crt",
+      "-a", password, "--no-auth-warning", "-p", "6379", "ping",
+    ],
+  )
+  if (!ready) {
+    fail newError("${name}: TLS PING never answered PONG within ${readyAttempts * readyDelayMs}ms")
+  }
+  return liveContainer{ name = name, port = port }
+}
+
+// A self-signed leaf certificate, generated fresh at gate time under
+// $TMPDIR — it is its own root, so the same file serves as both the server
+// certificate and the CA the client (and `pingReady`'s own `redis-cli
+// --cacert`) verifies against.
+fn generateCert(bin: string, dir: string): ()! {
+  mkdir(dir)?
+  let r = output(
+    bin,
+    [
+      "req", "-x509", "-newkey", "rsa:2048", "-days", "2", "-nodes",
+      "-keyout", "${dir}/server.key", "-out", "${dir}/server.crt",
+      "-subj", "/CN=bit-redis-live-test",
+    ],
+    dockerRunTimeoutMs,
+  )
+  if (r.exitCode != 0) {
+    fail newError("openssl: ${trimSpace(r.stderr)}")
+  }
+  let leaf = readFile("${dir}/server.crt")?
+  writeFile("${dir}/ca.crt", leaf)?
+}
+
+fn cleanupCertDir(dir: string) {
+  if (dir == "") {
+    return
+  }
+  remove("${dir}/server.key") catch _ {}
+  remove("${dir}/server.crt") catch _ {}
+  remove("${dir}/ca.crt") catch _ {}
+  remove(dir) catch _ {}
+}
+
+// Always removes both containers (by name, `--rm` already means a stopped
+// one vanishes, `rm -f` handles a still-running one too) and the generated
+// cert directory — called from every path through `main()` below, success
+// or failure alike, never only on the happy path.
+fn cleanup(bin: string, names: []string, certDir: string) {
+  for name of names {
+    output(bin, ["rm", "-f", name], dockerRunTimeoutMs)
+  }
+  cleanupCertDir(certDir)
+}
+
+// Targets the pkg/redis DIRECTORY, not client.live.test.bit alone: SPEC
+// §17.1, "a single .bit file named directly on the command line is a module
+// of exactly that one file — its siblings are not part of it", and
+// client.live.test.bit uses `Client`/`connect` from the sibling client.bit.
+// `--run "live: "` narrows to exactly the tests this file's `test` blocks
+// declare (every name starts with that prefix) without also re-running
+// client.test.bit/resp.test.bit/errors.test.bit's fakes — harmless either
+// way, but pointless work under a Docker container's own wall clock.
+//
+// Sets REDIS_TEST_URL/REDIS_TEST_TLS_URL for exactly the child this spawns —
+// see the file header's ENV section for why `/usr/bin/env` is the vehicle.
+fn runLiveTests(bitPath: string, repo: string, url: string, tlsUrl: string): int {
+  let r = output(
+    "/usr/bin/env",
+    [
+      "REDIS_TEST_URL=${url}", "REDIS_TEST_TLS_URL=${tlsUrl}",
+      bitPath, "test", "${repo}/pkg/redis", "--run", "live: ",
+    ],
+    testRunTimeoutMs,
+  )
+  print(r.stdout)
+  eprint(r.stderr)
+  return r.exitCode
+}
+
+fn main() {
+  let bin = dockerBin()
+  if (!dockerAvailable(bin)) {
+    print("skipped: docker unavailable\n")
+    exit(0)
+    return
+  }
+  sweepOrphans(bin)
+
+  let ssl = opensslBin()
+  if (ssl == "") {
+    eprint("redislive: docker is available but no openssl binary was found (checked ${len(opensslCandidates())} paths) — cannot generate the TLS test's certificate\n")
+    exit(1)
+    return
+  }
+
+  let repo = repoRoot()
+  let bitPath = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
+  let runId = uuidFormat(uuidV4())
+  let plainName = "bit-redis-live-${runId}"
+  let tlsName = "bit-redis-live-tls-${runId}"
+  let password = uuidFormat(uuidV4())
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let certDir = "${tmp}/bit-redis-live-tls-${runId}"
+  let names = [plainName, tlsName]
+
+  generateCert(ssl, certDir) catch e {
+    eprint("redislive: ${e.message()}\n")
+    cleanup(bin, names, certDir)
+    exit(1)
+    return
+  }
+
+  let plain = startPlain(bin, plainName, password) catch e {
+    eprint("redislive: ${e.message()}\n")
+    cleanup(bin, names, certDir)
+    exit(1)
+    return
+  }
+  let tls = startTls(bin, tlsName, password, certDir) catch e {
+    eprint("redislive: ${e.message()}\n")
+    cleanup(bin, names, certDir)
+    exit(1)
+    return
+  }
+
+  let url = "redis://:${password}@127.0.0.1:${plain.port}"
+  let tlsUrl = "rediss://:${password}@127.0.0.1:${tls.port}"
+  let rc = runLiveTests(bitPath, repo, url, tlsUrl)
+
+  cleanup(bin, names, certDir)
+  exit(rc)
+}
