@@ -1,0 +1,481 @@
+// Bit standard library — sync module: a generic, bounded resource pool.
+//
+// Hoisted out of stdlib/sql/pool.bit (#6020, epic #6013): that file already
+// keeps a pool's four rules correctly, but is typed to the SQL driver's own
+// `Conn` and knows about transactions. `Pool<T>` keeps the same four rules
+// for ANY expensive-to-create, bounded-lifetime resource — a Redis
+// connection (pkg/redis), an HTTP/2 stream, anything — with no knowledge of
+// what `T` is. A follow-up (filed with this ticket) moves std/sql onto this
+// type; it is NOT touched here.
+//
+// THE FOUR RULES (stdlib/sql/pool.bit's own header, restated with no SQL
+// left in them):
+//
+//   1. A resource stays pinned to the one caller holding it for its whole
+//      life. There is no transaction concept here to pin a SECOND value to
+//      — the rule collapses to "the pool never hands the same checked-out
+//      resource to two callers at once", which `checkedOut` (below) makes
+//      structural: a resource lives in `idle` XOR `checkedOut` XOR `dead`,
+//      never two of the three, and `acquire`/`release` are the only door
+//      between them.
+//   2. `release(lease, ok = false)` closes the resource instead of reusing
+//      it.
+//   3. A resource the caller-supplied `healthy` closure rejects is likewise
+//      discarded rather than handed out again — checked on every reuse from
+//      `idle` and on every `release`.
+//   4. Waiters are served strictly first-in (`claimLocked`/`grantLocked`,
+//      identical in shape to stdlib/sql/pool.bit's own, including WHY:
+//      "queue behind whoever is already queued" is what stops a
+//      newly-arrived caller from taking a resource out from under a parked
+//      one).
+//
+// CLOSURES, NOT AN INTERFACE BOUND. `T` could instead be written
+// `<T: Resource>` with `interface Resource { close(); healthy(): bool }`,
+// calling `t.close()`/`t.healthy()` straight from this class's own methods.
+// Not used here: `pkg/kv/collection.bit`'s `Collection<T>` already made the
+// opposite call, for a reason that still applies — a resource's own methods
+// are never called from a generic body in this file, only the three
+// caller-supplied closures (`open`/`close`/`healthy`) are. That keeps this
+// file immune to the whole #4495/#4523 family (a generic method calling a
+// method on its own type parameter, or transitively through a helper
+// function, failing to lower — pkg/web/res.bit's header has the live
+// citation for the still-open transitive case) regardless of which half of
+// it is fixed on a given compiler. It also means a resource type never has
+// to grow a `healthy()` method it would not otherwise have: a caller
+// supplies whatever check fits — a transport-error flag, a ping, always
+// `true` — as an ordinary closure.
+//
+// `acquire`/`release` TAKE A `Lease<T>`, NOT A BARE `T`. This is the one
+// place this file's API reads differently from the ticket's sketch, and it
+// is forced, not stylistic. `release` needs to find the bookkeeping (how
+// long ago this physical resource was opened) for the SPECIFIC value coming
+// back, and Bit gives no way to do that for a bare, unconstrained `T`:
+// equality on an unbounded type parameter is not permitted outside a
+// comparable-constrained site (SPEC §11.3), so `t == other` does not even
+// typecheck, and there is no reference-identity operator for a class value
+// at all (`ptrOf`, SPEC §11.5, is defined for slices and strings, not an
+// arbitrary class) — so the recovered "same one" would have to be matched
+// on FIELD equality, which is a documented trap: stdlib/sql/pool.bit's own
+// header explains why a waiter is found by `id`, "never by comparing the
+// objects", because two structurally-equal values are indistinguishable to
+// any Bit code. Resetting a resource's age every time it is released,
+// instead, would make `maxLifetime` silently never fire for a resource that
+// cycles through the pool quickly — exactly the "long-lived connection
+// keeps talking to the old [server]" failure `maxLifetime` exists to catch
+// (stdlib/sql/config.bit's own comment). `Lease<T>` is the fix: it is what
+// `acquire` hands out and `release` takes back, carries the bookkeeping
+// alongside `.value` for exactly as long as the caller holds it, and is
+// looked up by its own pool-assigned `id` (an `i64`, always comparable) —
+// O(1), no field-equality anywhere. `with` (below) never exposes `Lease<T>`
+// at all: it keeps the lease itself and only ever passes `.value` to `f`.
+
+import { Mono, monotonic, since, after, Millisecond } from "std/time"
+
+// One resource plus the bookkeeping needed to answer "may this be reused,
+// and how old is it". Handed out by `acquire`, taken back by `release` —
+// `id` is what `release` looks the lease up by, never `value` (see this
+// file's header for why). Only `value` is exported: everything else is this
+// pool's own accounting, invisible outside the module.
+export class Lease<T> {
+  export value: T,
+  id: i64,
+  // When this physical resource was opened — `maxLifetime` is measured from
+  // here, and survives however many times it cycles through the pool.
+  born: Mono,
+  // When it was last parked in `idle` — `maxIdleTime` from here.
+  idleAt: Mono,
+}
+
+// A caller parked waiting for a resource. `ch` has capacity 1 and exactly
+// one sender — whoever removes this waiter from the queue, while holding
+// the pool's mutex — so granting never blocks the pool.
+class waiter<T> {
+  id: i64,
+  ch: chan<Claim<T>>,
+}
+
+// What an attempt to get a resource resolved to (stdlib/sql/pool.bit's own
+// `Claim`, generified). `Dial` is a reservation rather than a resource
+// because `open` may talk to the network, which must not happen under the
+// pool's mutex.
+enum Claim<T> { Got(Lease<T>), Dial, Wait(waiter<T>), Closed }
+
+// The pool's tunables. Every field has a default, so `PoolOptions{}` is a
+// complete, working configuration. Durations are milliseconds, matching
+// stdlib/sql/config.bit's `Datasource`, whose defaults these copy — the
+// same reasoning (HikariCP's argued numbers) applies with no SQL-specific
+// content left to change it.
+export class PoolOptions {
+  // The ceiling on resources open at once: checked out, idle, or reserved
+  // by a caller mid-`open`. 0 or less is treated as 1 rather than rejected
+  // — a pool that admits nothing would park every `acquire` until its own
+  // `acquireTimeout`, which is a config mistake `acquire`'s own failure
+  // message already surfaces, not a reason to fail construction.
+  export maxSize: i64 = 10,
+  // How many idle resources `maxIdleTime` is not allowed to reap below —
+  // once popping the next idle candidate for reuse would drop the idle
+  // count under this floor, that candidate is exempt from the idle-time
+  // check (though never from `maxLifetime` or `healthy`).
+  export minIdle: i64 = 0,
+  // Retire a resource that has sat idle this long. 0 or less: no limit.
+  export maxIdleTime: i64 = 600_000,
+  // Retire a resource this many milliseconds after it was opened, however
+  // healthy it looks. 0 or less: no limit.
+  export maxLifetime: i64 = 1800_000,
+  // How long a caller waits for a resource before failing. 0 or less is
+  // treated as 1ms rather than rejected, for the same reason as `maxSize`.
+  export acquireTimeout: i64 = 5_000,
+}
+
+// A snapshot of `Pool.stats()`.
+export class PoolStats {
+  export open: i64,
+  export idle: i64,
+  export checkedOut: i64,
+  export waiting: i64,
+}
+
+// A bounded set of resources, safe to share across green threads. Built by
+// `newPool`.
+export class Pool<T> {
+  openFn: () => T!
+  closeFn: (T) => ()
+  healthyFn: (T) => bool
+  opts: PoolOptions
+  mu: Mutex
+  // Resources parked and ready. Guarded by `mu`.
+  idle: []Lease<T>
+  // Callers parked, longest-waiting first. Guarded by `mu`.
+  waiters: []waiter<T>
+  // Resources taken out of service, waiting to be closed by `reap` with the
+  // mutex NOT held. Guarded by `mu`.
+  dead: []Lease<T>
+  // Every lease currently held by a caller, keyed by its own `id` — the
+  // lookup `release` uses instead of matching on `T` (this file's header).
+  // Guarded by `mu`.
+  checkedOut: map<i64, Lease<T>>
+  // Physical resources in existence: checked out, idle, or reserved by a
+  // caller that holds a `Dial` claim. Guarded by `mu`.
+  numOpen: i64
+  // The id source for slots, waiters and leases. Guarded by `mu`.
+  seq: i64
+  closed: bool
+  export acquire(): Lease< // Checks a resource out, opening one or waiting for one as `opts` allows.
+    // Fails after `opts.acquireTimeout` milliseconds rather than parking the
+    // caller forever.
+    T,
+  >! {
+    let timeout = this.opts.acquireTimeout
+    if (timeout < 1) {
+      timeout = 1
+    }
+    let deadline = monotonic().ns + timeout * Millisecond
+    this.mu.lock()
+    let first = this.claimLocked()
+    this.mu.unlock()
+    let c = first
+    match (first) {
+      Wait(w) => c = this.park(w, deadline)?
+      _ => c = first
+    }
+    match (c) {
+      Got(lease) => {
+        this.mu.lock()
+        this.checkedOut[lease.id] = lease
+        this.mu.unlock()
+        return lease
+      }
+      Dial => return this.dial()?
+      Closed => fail newError("std/sync: pool: the pool is closed")
+      Wait(_) => fail newError("std/sync: pool: park returned a second Wait")
+    }
+  }
+  export release( // Hands `lease` back. `ok = false` retires it (rule 2); so does a failed
+    // `healthy` check or an expired `maxLifetime` (rule 3); otherwise it is
+    // parked for reuse. A `lease` this pool has no record of — already
+    // released once, or minted by a different pool — is closed defensively
+    // and otherwise ignored, the same "caller bug, not detected further"
+    // stance stdlib/sync/mutex.bit's own `unlock` takes.
+    lease: Lease<T>,
+    ok: bool,
+  ) {
+    this.mu.lock()
+    let (s, found) = this.checkedOut[lease.id]
+    if (found) {
+      delete(this.checkedOut, lease.id)
+    }
+    if (!found) {
+      this.mu.unlock()
+      this.closeFn(lease.value)
+      return
+    }
+    if (!ok || this.closed || expired(s.born, this.opts.maxLifetime) || !this.healthyFn(s.value)) {
+      this.retireLocked(s)
+    } else {
+      this.parkLocked(s)
+    }
+    this.mu.unlock()
+    this.reap()
+  }
+  export with< // Acquires, runs `f`, and releases on every path — including a failing
+    // `f`, which retires the resource (`ok = false`) rather than risk reusing
+    // one an unknown exception left mid-operation.
+    R,
+  >(f: (T) => R!): R! {
+    let lease = this.acquire()?
+    let r = f(lease.value) catch e {
+      this.release(lease, false)
+      fail e
+    }
+    this.release(lease, true)
+    return r
+  }
+  export close() { // Closes every idle resource and fails every parked caller. A resource
+    // still checked out is closed when it comes back (`release` consults
+    // `closed`). Idempotent.
+    this.mu.lock()
+    this.closed = true
+    let goneIdle = this.idle
+    this.idle = []Lease<T>(0)
+    this.numOpen = this.numOpen - len(goneIdle)
+    let parked = this.waiters
+    this.waiters = []waiter<T>(0)
+    this.mu.unlock()
+    for w of parked {
+      w.ch <- Claim<T>.Closed
+    }
+    for s of goneIdle {
+      this.closeFn(s.value)
+    }
+    this.reap()
+  }
+  export stats(): PoolStats {
+    this.mu.lock()
+    let st = PoolStats{
+      open = this.numOpen, idle = len(this.idle),
+      checkedOut = len(this.checkedOut), waiting = len(this.waiters),
+    }
+    this.mu.unlock()
+    return st
+  }
+  claimLocked(): Claim< // Decides what the caller gets, with `mu` held. A caller that arrives
+    // while anyone is queued joins the queue instead of taking an idle
+    // resource — barging would let a busy caller starve a parked one and
+    // makes rule 4 unenforceable (stdlib/sql/pool.bit's own comment, unchanged).
+    T,
+  > {
+    if (this.closed) {
+      return Claim<T>.Closed
+    }
+    if (len(this.waiters) > 0) {
+      return Claim<T>.Wait(this.enqueueLocked())
+    }
+    let limit = this.opts.maxSize
+    if (limit < 1) {
+      limit = 1
+    }
+    while (len(this.idle) > 0) {
+      let lease = this.popIdleLocked()
+      if (this.usableLocked(lease)) {
+        return Claim<T>.Got(lease)
+      }
+      this.retireLocked(lease)
+    }
+    if (this.numOpen < limit) {
+      this.numOpen = this.numOpen + 1
+      return Claim<T>.Dial
+    }
+    return Claim<T>.Wait(this.enqueueLocked())
+  }
+  usableLocked( // Whether `lease` may be reused: not past `maxLifetime`, not past
+    // `maxIdleTime` (unless `minIdle` protects it — `this.idle` here is the
+    // count AFTER `lease` was popped, i.e. what would remain if it were
+    // retired), and the caller's own `healthy` closure agrees. Called with
+    // `mu` held, same as the pure age checks either side of it — `healthy`
+    // is expected to be cheap (a flag, not a network round trip); a resource
+    // needing a real liveness probe should run it in a background task and
+    // report the result through `release(lease, ok = false)` instead.
+    lease: Lease<T>,
+  ): bool {
+    if (expired(lease.born, this.opts.maxLifetime)) {
+      return false
+    }
+    if (len(this.idle) >= this.opts.minIdle && expired(lease.idleAt, this.opts.maxIdleTime)) {
+      return false
+    }
+    return this.healthyFn(lease.value)
+  }
+  park(
+    w: waiter<T>,
+    deadline: i64,
+  ): Claim< // Parks until the queue grants something or the deadline passes. Returns
+    // `Got`, `Dial` or `Closed` — never `Wait`.
+    T,
+  >! {
+    let remaining = deadline - monotonic().ns
+    if (remaining < 0) {
+      remaining = 0
+    }
+    select {
+      case c = <- w.ch:
+        return c
+      case <- after(remaining):
+        return this.timedOut(w)?
+    }
+  }
+  timedOut(w: waiter<T>): Claim< // The deadline passed. Either this waiter is still queued, and the
+    // acquire fails, or a grant beat the timer — in which case the value is
+    // already in the channel (sent under `mu`, into a capacity-1 channel, by
+    // the one sender that removed this waiter) and taking it cannot block.
+    T,
+  >! {
+    this.mu.lock()
+    let stillQueued = this.dropWaiterLocked(w)
+    this.mu.unlock()
+    if (!stillQueued) {
+      let c = <- w.ch
+      return c
+    }
+    fail newError(
+        "std/sync: pool: no resource available after " +
+        "${this.opts.acquireTimeout}ms (maxSize ${this.opts.maxSize})",
+    )
+  }
+  dial(): Lease< // Opens one physical resource. The caller holds a reservation in
+    // `numOpen`; on failure that reservation goes to the next waiter rather
+    // than being lost, so a backend that is refusing connections does not
+    // shrink the pool one failed caller at a time.
+    T,
+  >! {
+    this.mu.lock()
+    this.seq = this.seq + 1
+    let id = this.seq
+    let shut = this.closed
+    if (shut) {
+      this.dropReservationLocked()
+    }
+    this.mu.unlock()
+    if (shut) {
+      fail newError("std/sync: pool: the pool is closed")
+    }
+    let t = this.openFn() catch e {
+      this.mu.lock()
+      this.dropReservationLocked()
+      this.mu.unlock()
+      fail e
+    }
+    let now = monotonic()
+    let lease = Lease<T>{ value = t, id = id, born = now, idleAt = now }
+    this.mu.lock()
+    this.checkedOut[id] = lease
+    this.mu.unlock()
+    return lease
+  }
+  parkLocked( // A healthy, unexpired resource: to the longest-waiting caller if there
+    // is one, else onto the idle list. There is no idle-list cap distinct
+    // from `maxSize` — `idle` can never exceed `numOpen`, which `maxSize`
+    // already bounds.
+    s: Lease<T>,
+  ) {
+    if (len(this.waiters) > 0) {
+      this.grantLocked(Claim<T>.Got(s))
+      return
+    }
+    s.idleAt = monotonic()
+    this.idle = append(this.idle, s)
+  }
+  retireLocked( // Takes `s` out of service: queued for closing outside the mutex, and its
+    // place in `numOpen` passed on.
+    s: Lease<T>,
+  ) {
+    this.dead = append(this.dead, s)
+    this.dropReservationLocked()
+  }
+  dropReservationLocked() { // Gives up one place in `numOpen`, handing it to the head waiter when
+    // there is one so the queue keeps its order.
+    if (len(this.waiters) > 0) {
+      this.grantLocked(Claim<T>.Dial)
+      return
+    }
+    this.numOpen = this.numOpen - 1
+  }
+  grantLocked( // Grants `c` to the longest-waiting caller and removes it from the queue.
+    // The caller must have checked that the queue is not empty.
+    c: Claim<T>,
+  ) {
+    let w = this.waiters[0]
+    this.waiters = this.waiters[1:]
+    w.ch <- c
+  }
+  enqueueLocked(): waiter< // Adds a waiter at the back of the queue and returns it.
+    T,
+  > {
+    this.seq = this.seq + 1
+    let w = waiter<T>{ id = this.seq, ch = chan<Claim<T>>(1) }
+    this.waiters = append(this.waiters, w)
+    return w
+  }
+  dropWaiterLocked( // Removes `w` from the queue. False means a grant already removed it.
+    w: waiter<T>,
+  ): bool {
+    let kept = []waiter<T>(0)
+    let found = false
+    for q of this.waiters {
+      if (q.id == w.id) {
+        found = true
+      } else {
+        kept = append(kept, q)
+      }
+    }
+    this.waiters = kept
+    return found
+  }
+  popIdleLocked(): Lease< // The most recently parked resource first: a hot resource stays hot and a
+    // surplus one ages out under `maxIdleTime` instead of being kept alive by
+    // round-robin use (stdlib/sql/pool.bit's own `popIdleLocked` comment). The
+    // caller must have checked that the list is not empty.
+    T,
+  > {
+    let s = this.idle[len(this.idle) - 1]
+    this.idle = this.idle[0:len(this.idle) - 1]
+    return s
+  }
+  reap() { // Closes everything retired since the last call, with `mu` NOT held: a
+    // resource's own `close` may block (a socket write), and no acquirer
+    // should wait behind that.
+    this.mu.lock()
+    let gone = this.dead
+    this.dead = []Lease<T>(0)
+    this.mu.unlock()
+    for s of gone {
+      this.closeFn(s.value)
+    }
+  }
+}
+
+// Whether `s` is still within `limitMs` of `start`. A limit of 0 or less is
+// no limit, so nothing expires under it.
+fn expired(start: Mono, limitMs: i64): bool {
+  if (limitMs <= 0) {
+    return false
+  }
+  return since(start) > limitMs * Millisecond
+}
+
+// A pool that opens resources through `open`, closes them through
+// `closeFn`, and validates a candidate before reuse through `healthy`.
+// Nothing is opened here: resources are created on demand, up to
+// `opts.maxSize`, the first time `acquire` needs one.
+export fn newPool<T>(
+  open: () => T!,
+  closeFn: (T) => (),
+  healthy: (T) => bool,
+  opts: PoolOptions,
+): Pool<T> {
+  return Pool<T>{
+    openFn = open, closeFn = closeFn, healthyFn = healthy, opts = opts,
+    mu = newMutex(), idle = []Lease<T>(0), waiters = []waiter<T>(0),
+    dead = []Lease<T>(0), checkedOut = map<i64, Lease<T>>(),
+    numOpen = 0, seq = 0, closed = false,
+  }
+}

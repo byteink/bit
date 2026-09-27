@@ -262,3 +262,141 @@ fn raceFreeCounter(n: i64): i64 {
   return counter.load()
 }
 ```
+
+## Pool
+
+Opening a database connection, a Redis link, or anything else expensive to
+create is fine once. Doing it on every request is not: each one pays a
+handshake, and a burst of requests can open more of them than the far end
+allows. `Pool<T>` keeps a bounded set of resources open, hands one out at a
+time, and returns it to the set when the caller is done - the same shape
+`std/sql`'s own connection pool has used for a while, generalized to any
+resource `T`.
+
+You tell the pool three things: how to open a resource, how to close one,
+and how to tell a live one from a dead one. The pool decides when to open a
+new one, when to reuse an idle one, and when a resource has gotten too old
+to trust.
+
+### `PoolOptions`
+
+The pool's tunables. Every field has a default, so `PoolOptions{}` is a
+complete, working configuration.
+
+- `maxSize` - the most resources open at once (default 10).
+- `minIdle` - how many idle resources `maxIdleTime` will not reap below
+  (default 0).
+- `maxIdleTime` - retire a resource idle this many milliseconds (default
+  600,000; 0 or less means no limit).
+- `maxLifetime` - retire a resource this many milliseconds after it was
+  opened, however healthy it looks (default 1,800,000; 0 or less means no
+  limit).
+- `acquireTimeout` - how long `acquire()` waits before failing (default
+  5,000).
+
+### `Lease<T>`
+
+What `acquire()` returns and `release()` takes back. `lease.value` is the
+resource itself; the rest is the pool's own bookkeeping, kept alongside it
+for as long as the caller holds it.
+
+### `PoolStats`
+
+A snapshot from `Pool.stats()`: `open` (resources that exist), `idle`
+(parked and ready), `checkedOut` (out with a caller) and `waiting` (callers
+queued for one).
+
+### `newPool<T>(open: () => T!, close: (T) => (), healthy: (T) => bool, opts: PoolOptions): Pool<T>`
+
+Builds a pool that opens resources through `open`, closes them through
+`close`, and validates one before reuse through `healthy`. Nothing opens
+here - resources are created on demand, up to `opts.maxSize`.
+
+### `Pool<T>.acquire(): Lease<T>!`
+
+Checks a resource out, opening one or waiting for one as `opts` allows.
+Waiters are served strictly in the order they arrived. Fails once
+`opts.acquireTimeout` passes rather than waiting forever.
+
+### `Pool<T>.release(lease: Lease<T>, ok: bool)`
+
+Hands `lease` back. `ok = false` closes the resource instead of reusing it -
+the caller's way of saying "this one is bad", for a failure `healthy` cannot
+see on its own.
+
+### `Pool<T>.with<R>(f: (T) => R!): R!`
+
+Acquires a resource, runs `f` on it, and releases it on every path,
+including a failing `f` - the usual way to use a pool, so a caller cannot
+forget to release.
+
+### `Pool<T>.close()`
+
+Closes every idle resource and fails every waiting caller. A resource still
+checked out is closed as it comes back. Safe to call more than once.
+
+### `Pool<T>.stats(): PoolStats`
+
+A point-in-time snapshot of how the pool is doing.
+
+```bit
+import { Pool, Lease, PoolOptions, PoolStats, newPool } from "std/sync"
+
+// A toy resource standing in for anything expensive to open - a database or
+// a Redis connection, in a real program.
+class widgetConn {
+  id: i64,
+}
+
+class widgetCounter {
+  next: i64 = 0,
+}
+
+fn openWidget(counter: widgetCounter): widgetConn! {
+  counter.next = counter.next + 1
+  return widgetConn{ id = counter.next }
+}
+
+fn closeWidget(c: widgetConn) {
+  // A real resource would close a socket or a file here.
+}
+
+fn widgetHealthy(c: widgetConn): bool {
+  return true
+}
+
+fn newWidgetPool(): Pool<widgetConn> {
+  let counter = widgetCounter{}
+  return newPool<widgetConn>(
+    () => openWidget(counter),
+    closeWidget,
+    widgetHealthy,
+    PoolOptions{ maxSize = 5, acquireTimeout = 2_000 },
+  )
+}
+
+// The usual way to use a pool: acquire, run, release on every path.
+fn widgetId(p: Pool<widgetConn>): i64! {
+  return p.with<i64>((c) => {
+    return c.id
+  })?
+}
+
+// The manual form, for a caller that needs to hold a resource across more
+// than one call.
+fn borrowWidget(p: Pool<widgetConn>): Lease<widgetConn>! {
+  return p.acquire()?
+}
+
+fn returnWidget(p: Pool<widgetConn>, lease: Lease<widgetConn>) {
+  p.release(lease, true)
+}
+
+fn widgetPoolLoad(p: Pool<widgetConn>): PoolStats {
+  return p.stats()
+}
+
+fn shutdownWidgets(p: Pool<widgetConn>) {
+  p.close()
+}
+```
