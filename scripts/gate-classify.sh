@@ -214,7 +214,7 @@ while IFS= read -r f; do
         fi
       fi
       ;;
-    tools/build/defs.bit|tools/build/gates.bit|tools/build/gatestable2.bit)
+    tools/build/defs.bit|tools/build/defssteps.bit|tools/build/gates.bit|tools/build/gatestable2.bit|tools/build/gatestable3.bit)
       if is_additive_registration "${f}"; then
         :
       else
