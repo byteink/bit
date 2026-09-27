@@ -1,0 +1,264 @@
+// pkg/web/realtime.bit — #6072: `App.listenHijackable()` (app.bit's one-line
+// forward onto `serveHijackable` below) plus what a route reaches through
+// `c.hijack()` once it is serving: `wsUpgrade` (stdlib/websocket, RFC 6455),
+// and `Stream`/`SSE`, a hand-framed HTTP/1.1 chunked writer for a body with
+// no fixed length and no upper bound. See ctx.bit's `hijack()`/
+// `takeExchange()` for the Ctx-side half and its security note.
+//
+// WHY A SEPARATE SERVE LOOP, NOT A NEW `App.listen()` OPTION. `App.listen()`
+// (app.bit) always ends at std/http's `listenAndServe`/`listenAndServeOn`,
+// whose handler is `(Request) => Response` (stdlib/http/server.bit) — a
+// fixed one-shot contract with no `Exchange` anywhere on it to hijack.
+// `listenAndServeOn`'s own accept loop (`serveOne`/`answerOne`) reads
+// requests and writes responses straight off a byte stream; it never builds
+// an `Exchange` at all, so there is nothing on that path to plumb a hijack
+// through. Taking a connection over needs std/http's OTHER server surface —
+// `serve()` + `Server.accept()`, which returns the `Exchange`
+// `Exchange.hijack()` is a method of — so `listenHijackable()` drives that
+// directly, on its own accept loop, parallel to `listen()`'s.
+//
+// ONE REQUEST PER CONNECTION, on purpose. `listenAndServeOn`'s keep-alive
+// machinery (idle timeout, max-requests-per-connection) exists to reuse a
+// connection across many short-lived requests — meaningless the moment ANY
+// request on it may hijack, since a WebSocket, an SSE stream or a hand-framed
+// body all keep the connection open for the exchange's own life, never for a
+// NEXT request. A route that returns an ordinary `Res` here still gets
+// exactly one response, then the connection closes; an app wanting
+// keep-alive across ordinary requests keeps using `App.listen()` for that
+// traffic (nothing stops running both on different ports).
+import { serve as httpServe } from "std/http"
+import { Conn as WsConn, upgrade, Limits } from "std/websocket"
+
+// Freeze, then serve `config.host:config.port` forever on the hijack-aware
+// loop. Returns only on a bind or accept error, or immediately when
+// `freeze()` rejects the route table — the exact shape `listen()` (app.bit)
+// already has, so a caller chooses between the two by name alone.
+fn serveHijackable(app: App): ()! {
+  let s = httpServe(app.config.host, app.config.port)?
+  while (true) {
+    let ex = s.accept()?
+    spawn serveHijackExchange(app, ex)
+  }
+}
+
+// One accepted connection, on its own green thread (the same reason
+// `listenAndServeOn`'s accept loop spawns one per connection, server.bit's
+// own comment: a stalled or malicious peer must only ever block itself). A
+// request this exchange could not even parse gets a bare `400` and the
+// connection is dropped — there is no route to have hijacked yet.
+fn serveHijackExchange(app: App, ex: Exchange) {
+  let req = ex.read() catch _ {
+    ex.respond(respond(400, "")) catch _ {}
+    return
+  }
+  let res = dispatchHijackable(app, ex, req)
+  if (isSome(res)) {
+    ex.respond(unwrap(res)) catch _ {}
+  }
+}
+
+// The router lookup and `Ctx` construction, mirroring `routed`/
+// `matchedResponse`/`missResponse` (adapter.bit) with one difference: this
+// `Ctx` carries the `Exchange` (`c.exchange`, ctx.bit), and the result is
+// `Option.None` — nothing to send — when the chain hijacked the connection
+// instead of returning an ordinary response. Not reused from adapter.bit
+// directly: every function there returns a `Response` unconditionally, with
+// no way to say "already answered on the wire, send nothing".
+fn dispatchHijackable(app: App, ex: Exchange, req: Request): Option<Response> {
+  let split = splitTarget(req.path)
+  let m = app.root.router.lookup(req.method, split.0) catch e {
+    let c = newCtx(req, nil, app.root.registry, app.config, "") catch ce {
+      return Option.Some(frame(app, failureRes(app, requestFailure(req, ce))))
+    }
+    c.exchange = Option.Some(ex)
+    c.routeMiss = e
+    return runHijackable(app, c, app.missHandler)
+  }
+  let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
+    return Option.Some(frame(app, failureRes(app, requestFailure(req, ce))))
+  }
+  c.exchange = Option.Some(ex)
+  return runHijackable(app, c, m.handler)
+}
+
+// Runs the composed chain and converts whatever comes back — `Option.None`
+// the instant `c.hijacked` is true, whether the chain returned normally
+// (its `Res` is discarded; the app already wrote its own response line) or
+// failed AFTER hijacking (nothing sane to frame onto a connection the app
+// already owns; the failure is the app's problem now, same posture
+// `chainResponse`, adapter.bit, takes for a failure BEFORE hijacking).
+fn runHijackable(app: App, c: Ctx, h: Handler): Option<Response> {
+  let r = h(c) catch e {
+    if (c.hijacked) {
+      return Option.None
+    }
+    return Option.Some(frame(app, c.sealSession(failureRes(app, ctxFailure(c, e)))))
+  }
+  if (c.hijacked) {
+    return Option.None
+  }
+  return Option.Some(frame(app, c.sealSession(r)))
+}
+
+// --- WebSocket (#6072, part 41) ------------------------------------------
+//
+// The route-handler DX this ticket was filed under:
+//
+//     app.get("/ws/articles/:id/comments", (c) => {
+//       let conn = wsUpgrade(c, defaultLimits())?
+//       while (true) {
+//         let msg = conn.receive()?
+//         broadcast(c.param("id"), msg.data)
+//       }
+//       return c.noContent()  // unreached once the loop above fails/returns
+//     })
+//
+// `req`/`ex` never appear in a route: `wsUpgrade` reaches `c.req` directly
+// (ctx.bit's field is module-private, not app-private — SPEC §17.3, same
+// seam `fillRoutePattern` already reaches through) rather than asking a
+// route to pass its own `Request` a second time, and takes the `Exchange`
+// through `c.takeExchange()` (ctx.bit) rather than `c.hijack()`, since
+// stdlib/websocket's `upgrade(ex, req, limits)` needs the `Exchange` itself
+// to write RFC 6455's `101` reply before framing begins — see ctx.bit's
+// `takeExchange` comment for why `hijack()`'s `Conn` is the wrong shape here.
+export fn wsUpgrade(c: Ctx, limits: Limits): WsConn! {
+  let ex = c.takeExchange()?
+  return upgrade(ex, c.req, limits)?
+}
+
+// --- server-sent events and streaming responses (#6072, parts 42 and 45) -
+//
+// `Stream` is the one hand-framed HTTP/1.1 writer both features need: SSE is
+// `text/event-stream` framing (`SSE` below) over the same chunked body a
+// streamed file or report writes directly. HTTP/1.1 chunked transfer
+// encoding (RFC 9112 §7.1) is used rather than a declared `Content-Length`
+// because neither caller knows the total size up front — SSE has no end,
+// and a streamed response's whole point is not holding the entire body in
+// memory to measure it first.
+//
+// Bounded memory is the constructor's job, not the caller's: `write` sends
+// exactly the bytes it is given, once, straight onto the connection — no
+// internal buffer grows with the number or size of calls, so a multi-GB
+// stream costs this object nothing beyond the one chunk in flight.
+export class Stream {
+  conn: Conn
+  closed: bool
+
+  // One chunk: its hex length prefix, the bytes, then the chunk's own
+  // trailing CRLF (RFC 9112 §7.1.1). Refuses an empty write — a zero-length
+  // chunk is the STREAM TERMINATOR (`close`, below); a caller meaning to
+  // send nothing has nothing to call this for.
+  export write(data: string): ()! {
+    if (this.closed) {
+      fail newError("web: Stream.write: this stream is already closed")
+    }
+    if (len(data) == 0) {
+      fail newError("web: Stream.write: data is empty — call close() to end the stream")
+    }
+    this.conn.write("${hexChunkSize(len(data))}\r\n${data}\r\n")?
+  }
+
+  // The zero-length terminating chunk (RFC 9112 §7.1) and no trailer
+  // section, then closes the connection. Idempotent: a handler that already
+  // closed (or never wrote a byte) can still call this on its way out
+  // without a second failure to catch.
+  export close(): ()! {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    this.conn.write("0\r\n\r\n")?
+    this.conn.close()
+  }
+}
+
+// Hijacks `c`'s connection and writes the status line and headers, with
+// `Transfer-Encoding: chunked` appended after whatever `headers` names — a
+// caller-supplied `Transfer-Encoding` would otherwise contradict the framing
+// this writer commits to using. `headers` carries no `Content-Length` for
+// the same reason `Stream`'s own doc comment gives: this call is exactly the
+// site that does not know one.
+// `status` is always 200 today — nothing in this file streams a failure —
+// so the reason phrase is the one word RFC 9110's registry gives 200,
+// spelled here rather than through a status->phrase table this file has no
+// second entry for yet.
+export fn newStream(c: Ctx, status: int, contentType: string, headers: []Header): Stream! {
+  let conn = c.hijack()?
+  let out = "HTTP/1.1 ${status} OK\r\n" + "Content-Type: ${contentType}\r\n"
+  for h of headers {
+    out = out + "${h.name}: ${h.value}\r\n"
+  }
+  conn.write(out + "Transfer-Encoding: chunked\r\n\r\n")?
+  return Stream{ conn = conn, closed = false }
+}
+
+// `n`'s hex digits, lowercase, no leading zeros, RFC 9112 §7.1.1's chunk
+// length prefix. `n` is always a chunk's byte count — never negative — so
+// the loop is bounded by `n`'s own digit count, at most 16 for a 64-bit
+// length (Power of 10 rule 2).
+const hexDigits: string = "0123456789abcdef"
+fn hexChunkSize(n: int): string {
+  if (n == 0) {
+    return "0"
+  }
+  let buf = []byte(16)
+  let i = 16
+  let v = n
+  while (v > 0) {
+    i = i - 1
+    buf[i] = hexDigits[v % 16]
+    v = v / 16
+  }
+  return string(buf[i:16])
+}
+
+// `text/event-stream` framing (WHATWG HTML §9.2.6) over a `Stream`: every
+// field ends in exactly one `\n`, and the blank line ending the event is
+// this writer's job, not the caller's — `send`/`sendData` never let a
+// handler forget it, which is the one mistake that hangs a browser's
+// `EventSource` waiting for an event that never completes.
+export class SSE {
+  s: Stream
+
+  // A named event: `event: <event>\ndata: <line>\n...\n\n`. A multi-line
+  // `data` is split on `\n` into one `data:` field per line (the spec's own
+  // multi-line rule), so a caller never has to know the framing to send a
+  // paragraph.
+  export send(event: string, data: string): ()! {
+    let out = "event: ${event}\n"
+    for line of split(data, "\n") {
+      out = out + "data: ${line}\n"
+    }
+    this.s.write(out + "\n")?
+  }
+
+  // The same framing with no `event:` field — an anonymous message, the
+  // common case for a plain live feed.
+  export sendData(data: string): ()! {
+    let out = ""
+    for line of split(data, "\n") {
+      out = out + "data: ${line}\n"
+    }
+    this.s.write(out + "\n")?
+  }
+
+  export close(): ()! {
+    return this.s.close()?
+  }
+}
+
+// Hijacks `c`'s connection and opens an SSE stream: `Content-Type:
+// text/event-stream`, `Cache-Control: no-cache` (RFC 9110 §5.2.2 — a
+// browser's `EventSource` reconnects and must never replay a cached event
+// stream), `Connection: keep-alive`. 200, always — an `EventSource` treats
+// anything else as a fatal connection error (WHATWG HTML §9.2.6) with no
+// retry, so there is no caller-supplied status to take here.
+const sseStatusOk = 200
+export fn newSSE(c: Ctx): SSE! {
+  let headers = []Header{
+    Header{ name = "Cache-Control", value = "no-cache" },
+    Header{ name = "Connection", value = "keep-alive" },
+  }
+  let s = newStream(c, sseStatusOk, "text/event-stream", headers)?
+  return SSE{ s = s }
+}

@@ -10,6 +10,7 @@ instead of dropped, so keeping it current is part of writing a chapter.
 | [Routing](routing.md) | Register routes on the trie, capture params and wildcards, and name a route to link to it. |
 | [The request](request.md) | The client address, reading `Ctx`, and binding and validating the body. |
 | [The response](response.md) | Building a `Res`, the `Node` HTML tree, and escaping. |
+| [WebSockets, SSE and streaming](realtime.md) | Hijacking a connection for a WebSocket, a server-sent-events feed, or a response too large to build as one string. |
 | [Middleware](middleware.md) | `app.use`/`group.use`, how far each one's scope reaches, and error handlers. |
 | [Sessions, CSRF and security](security.md) | Server-side sessions, the CSRF token that binds to one, CORS and the standard security headers. |
 | [Operational middleware](operations.md) | Rate limiting, serving static files, gzip, request logging, tracing and panic recovery. |
