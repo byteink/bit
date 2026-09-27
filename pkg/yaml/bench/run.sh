@@ -218,11 +218,28 @@ now()    { perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time()'; }
 trimmean() { sort -n | awk '{a[NR]=$1} END{k=int(NR/5); if(k<1)k=1; n=NR-k;
                             for(i=1;i<=n;i++)s+=a[i]; printf "%.6f", s/n}'; }
 
-# Runs $1 on fixture $2 once under /usr/bin/time -l, echoes
-# "<real_seconds> <max_rss_bytes>".
+# Runs $1 on fixture $2 once, echoes "<wall_seconds> <max_rss_bytes>".
+# The wall time is perl's microsecond clock around fork, exec and wait of
+# `/usr/bin/time -l`, NOT time's own "real" line: that line has 10 ms
+# resolution, which quantized every sub-20 ms peer to the same 120.52 MB/s
+# on a 1.2 MB fixture (#6049). time -l stays in the chain only for the peak
+# RSS; its own exec and wait cost the same on every side.
 time_run() {
-  /usr/bin/time -l "$1" "$2" >/dev/null 2>"$OUT/.time"
-  awk '/ real/{r=$1} /maximum resident set size/{m=$1} END{print r, m}' "$OUT/.time"
+  local wall
+  wall=$(perl -MTime::HiRes=time -e '
+    my ($bin, $data, $err) = @ARGV;
+    my $t0 = time;
+    my $pid = fork() // die "fork: $!";
+    if ($pid == 0) {
+      open(STDOUT, ">", "/dev/null") or die; open(STDERR, ">", $err) or die;
+      exec("/usr/bin/time", "-l", $bin, $data) or exit 127;
+    }
+    waitpid($pid, 0);
+    my $t1 = time;
+    exit 1 if $? != 0;
+    printf "%.6f\n", $t1 - $t0;' "$1" "$2" "$OUT/.time") || {
+    echo "pkg/yaml/bench: $1 failed on $2" >&2; exit 1; }
+  echo "$wall $(awk '/maximum resident set size/{print $1}' "$OUT/.time")"
 }
 
 measure() {
