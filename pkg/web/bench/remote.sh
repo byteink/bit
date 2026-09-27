@@ -18,6 +18,7 @@
 #                 cpu_us_per_req,load_cores
 #   verify.txt    the byte-identical proof and the affinity read-back
 #   env.txt       the box as measured, at measurement time
+#   quiet.txt     every quiet check: before each rep and after the last
 #
 # cpu_us_per_req and load_cores exist because oha's req/s alone conflates two
 # ceilings. At c=64, oha's own two pinned cores can be saturated BEFORE the
@@ -44,28 +45,70 @@ WARMDUR=${BENCH_WARMDUR:-10s}         # rep 0, long enough for a JIT to settle
 # apart for every framework here, so publishing only one of them would hide
 # which half of a gap is per-request work and which half is scheduling.
 CONNS=${BENCH_CONNS:-"1 64"}
+
+# cpu ids, one per line, from a Cpus_allowed_list-style spec ("2-5,7").
+expand_cpus() {
+  printf '%s\n' "$1" | tr ',' '\n' | while IFS=- read -r a b; do
+    [ -n "$a" ] && seq "$a" "${b:-$a}"
+  done
+}
+
+# cpu ids on stdin back to the kernel's own Cpus_allowed_list spelling, so the
+# affinity read-back can be compared as a string.
+cpu_ranges() {
+  sort -n | awk 'NR == 1 { s = p = $1; next }
+    $1 == p + 1 { p = $1; next }
+    { o = o (s == p ? s : s "-" p) ","; s = p = $1 }
+    END { if (NR) print o (s == p ? s : s "-" p) }'
+}
+
 # The cores this container ACTUALLY has, not cores 0..n-1: an LXC container is
-# handed a slice of the host's CPUs and ours is 2-7, so a hardcoded 0-3 is
-# refused outright by docker ("Requested CPUs are not available"). Servers take
-# all but the last two, the load generator takes those two, and the two sets
-# are proven disjoint from /proc before anything is timed.
+# handed a slice of the host's CPUs, so a hardcoded 0-3 is refused outright by
+# docker ("Requested CPUs are not available").
 cpu_list() { cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo 0-5; }
-cpu_lo() { cpu_list | cut -d- -f1; }
-cpu_hi() { cpu_list | cut -d- -f2; }
-SERVER_CPUS=${BENCH_SERVER_CPUS:-$(cpu_lo)-$(( $(cpu_hi) - 2 ))}
-LOAD_CPUS=${BENCH_LOAD_CPUS:-$(( $(cpu_hi) - 1 ))-$(cpu_hi)}
+
+# THE SERVER GETS FEWER CORES THAN THE LOAD GENERATOR. With the server on four
+# cores and oha on two, oha saturated at c=64 for every framework, so req/s
+# measured oha. Every server now gets ONE physical core: the first whose SMT
+# siblings all lie inside this container, so no sibling is shared with oha or
+# with a neighbour outside it. oha gets every other CPU the container has.
+server_core() {
+  local c sib s ok mine
+  mine=$(expand_cpus "$(cpu_list)")
+  for c in $mine; do
+    sib=$(cat "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list" 2>/dev/null) || continue
+    ok=1
+    for s in $(expand_cpus "$sib"); do
+      printf '%s\n' "$mine" | grep -qx "$s" || ok=0
+    done
+    if [ "$ok" = 1 ]; then expand_cpus "$sib" | cpu_ranges; return 0; fi
+  done
+  return 1
+}
+
+load_cpus() {
+  expand_cpus "$(cpu_list)" | { grep -vxF "$(expand_cpus "$SERVER_CPUS")" || true; } | cpu_ranges
+}
+
+SERVER_CPUS=${BENCH_SERVER_CPUS:-$(server_core || true)}
+LOAD_CPUS=${BENCH_LOAD_CPUS:-$(load_cpus)}
+[ -n "$SERVER_CPUS" ] && [ -n "$LOAD_CPUS" ] || {
+  echo "no disjoint server/load CPU sets in $(cpu_list)" >&2; exit 1; }
 
 HZ=$(getconf CLK_TCK)   # /proc/*/stat and /proc/stat are both in clock ticks
 
-# No default. A benchmark whose toolchain version is implicit publishes whichever
-# version the script was last edited against; run.sh always passes this, and a
-# run started by hand over here has to say which compiler it is measuring.
-BIT_IMAGE=${BENCH_BIT_IMAGE:?set BENCH_BIT_IMAGE, e.g. ghcr.io/byteink/bit:0.21.1}
+# The Bit server is NOT built here. run.sh builds it on the developer machine
+# with that tree's own compiler and runtime, and ships the binary to
+# out/bin/bitbench; a release image would measure a release, not the tree the
+# table is stamped with. No default for its label: a run started by hand over
+# here has to say which build it is measuring.
+BIT_LABEL=${BENCH_BIT_LABEL:?set BENCH_BIT_LABEL to the commit out/bin/bitbench was built from}
+BIT_RUN_IMAGE=debian:trixie
 OHA_IMAGE=ghcr.io/hatoo/oha:latest
 
 # name:port:image:workdir:command. Ports are distinct so all six stay up for
 # the whole run and a rep costs a request, not a process start.
-FRAMEWORKS="bit gin express bun spring aspnet"
+FRAMEWORKS=${BENCH_FRAMEWORKS:-"bit gin express bun spring aspnet"}
 port_of() {
   case $1 in
     bit) echo 8081 ;; gin) echo 8082 ;; express) echo 8083 ;;
@@ -79,15 +122,8 @@ say() { printf '%s\n' "$*"; }
 # ---------------------------------------------------------------- build
 
 build_bit() {
-  local d=$ROOT/apps/bit
-  # Written here and not committed: the path is this box's, not the repo's.
-  printf '{"name": "bitbench", "dependencies": {"web": "/w/web"}}\n' > "$d/bit.json"
-  printf '{"web": {"path": "/w/web", "requires": {}}}\n' > "$d/bit.lock"
-  # The image's ENTRYPOINT is already `bit`, so the subcommand starts here.
-  # --user root only for the BUILD: the image's default 65532 cannot write
-  # into the shipped tree. The server below runs as that default user.
-  docker run --rm --user root -v "$SHIP:/w" -w /w/web/bench/apps/bit "$BIT_IMAGE" \
-    build main.bit -o /w/web/bench/out/bin/bitbench
+  [ -x "$OUT/bin/bitbench" ] || { say "no out/bin/bitbench: run.sh ships it"; return 1; }
+  sha256sum "$OUT/bin/bitbench"
 }
 
 build_gin() {
@@ -142,7 +178,7 @@ start_one() {
   docker rm -f "$name" >/dev/null 2>&1 || true
   case $fw in
     bit) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
-           -v "$SHIP:/w" --entrypoint /w/web/bench/out/bin/bitbench "$BIT_IMAGE" ;;
+           -v "$SHIP:/w" "$BIT_RUN_IMAGE" /w/web/bench/out/bin/bitbench ;;
     gin) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
            -v "$SHIP:/w" -e GIN_MODE=release golang:1-alpine /w/web/bench/out/bin/ginbench ;;
     express) docker run -d --name "$name" --network host --cpuset-cpus "$SERVER_CPUS" \
@@ -314,14 +350,6 @@ server_cpu_ticks() {
   echo $(( ${12:-0} + ${13:-0} ))
 }
 
-# cpu id list from a taskset-style range or single id ("6-7" or "7").
-expand_cpus() {
-  case $1 in
-    *-*) seq "${1%-*}" "${1#*-}" ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-
 # Sum of non-idle ticks (user+nice+system+irq+softirq+steal; idle and iowait
 # excluded) over every cpu in LOAD_CPUS, from /proc/stat's per-cpu lines.
 load_busy_ticks() {
@@ -357,6 +385,35 @@ one_rep() {
     >> "$OUT/results.csv"
 }
 
+# QUIET BEFORE EVERY REP, AND AFTER THE LAST. The box is a container on a
+# shared host: another tenant's burst lands on these cores without any trace
+# in this container's own process list. Three conditions, each read from the
+# kernel rather than inferred: no container running that this script did not
+# start, the CPU pressure 10 s average under 1 after 20 s with nothing timed,
+# and under 1% of a fresh 5 s window stalled. A check right after the warmup
+# routinely fails once while our own load decays, so each check retries a
+# bounded number of times and the run stops rather than time a noisy box.
+QUIET_TRIES=${BENCH_QUIET_TRIES:-6}
+psi_some() { awk -v k="$1" '/^some/ { for (i = 2; i <= NF; i++) if (index($i, k "=") == 1) print substr($i, length(k) + 2) }' /proc/pressure/cpu; }
+
+quiet() {
+  local label=$1 try foreign avg t0 t1 stall
+  for try in $(seq 1 "$QUIET_TRIES"); do
+    sleep 20
+    foreign=$(docker ps --format '{{.Names}}' | grep -vc '^t5418-' || true)
+    avg=$(psi_some avg10)
+    t0=$(psi_some total); sleep 5; t1=$(psi_some total)
+    stall=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", (b - a) / 50000.0 }')
+    if [ "$foreign" = 0 ] && awk -v a="$avg" -v s="$stall" 'BEGIN { exit !(a < 1 && s < 1) }'; then
+      say "$label try $try: quiet (foreign containers 0, cpu some avg10 $avg, 5 s stall $stall%)" >> "$OUT/quiet.txt"
+      return 0
+    fi
+    say "$label try $try: NOT quiet (foreign containers $foreign, cpu some avg10 $avg, 5 s stall $stall%)" >> "$OUT/quiet.txt"
+  done
+  say "box never went quiet at $label after $QUIET_TRIES tries; see $OUT/quiet.txt"
+  return 1
+}
+
 # Rotated so no framework is always first in a rep: position in the rep is
 # itself a source of bias on a box whose neighbours drift.
 rotated() {
@@ -383,7 +440,9 @@ measure() {
     done
   done
   sed -i '/^0,/d' "$OUT/results.csv"       # rep 0 is warmup, never published
+  : > "$OUT/quiet.txt"
   for rep in $(seq 1 "$REPS"); do
+    quiet "rep$rep-pre" || return 1
     order=$(rotated $((rep % n)))
     for fw in $order; do
       for test in plaintext json; do
@@ -394,18 +453,20 @@ measure() {
     done
     say "rep $rep/$REPS done"
   done
+  quiet "rep$REPS-post"
 }
 
 # ---------------------------------------------------------------- box
 
 record_env() {
   {
-    say "host: $(hostname)"
     say "virt: $(systemd-detect-virt 2>/dev/null || echo unknown)"
     say "cores: $(nproc)"
     say "cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unknown)"
     say "kernel: $(uname -sr)"
     say "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+    say "cpu_cores: $(grep -m1 '^cpu cores' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"
+    say "cpu_threads: $(grep -m1 '^siblings' /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"
     say "mem_total_mb: $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
     say "loadavg: $(cut -d' ' -f1-3 /proc/loadavg)"
     say "docker: $(docker --version)"
@@ -417,7 +478,7 @@ record_env() {
 
 versions() {
   {
-    say "bit $BIT_IMAGE ($(docker run --rm "$BIT_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}'))"
+    say "bit $BIT_LABEL"
     say "gin $(grep -m1 'gin-gonic/gin' "$ROOT/apps/gin/go.mod" | awk '{print $NF}')"
     say "go $(docker run --rm golang:1-alpine go version | awk '{print $3}')"
     say "express $(docker run --rm -v "$SHIP:/w" -w /w/web/bench/apps/express node:22-alpine \
@@ -427,10 +488,30 @@ versions() {
     say "springboot $(grep -m1 -A2 spring-boot-starter-parent "$ROOT/apps/spring/pom.xml" | grep version | sed 's/.*<version>\(.*\)<\/version>.*/\1/')"
     say "jvm $(docker run --rm eclipse-temurin:21-jdk-alpine java -version 2>&1 | head -1 | cut -d'"' -f2)"
     say "dotnet $(docker run --rm mcr.microsoft.com/dotnet/sdk:9.0 dotnet --version)"
+    say "oha $(docker run --rm "$OHA_IMAGE" --version 2>&1 | head -1 | awk '{print $NF}')"
   } > "$OUT/versions.txt" 2>&1
 }
 
 # ---------------------------------------------------------------- main
+
+# /tmp/benchlock is the box-wide measurement lock, a DIRECTORY: mkdir takes it,
+# rmdir releases it, the same lock scripts/x64gate.sh takes for every gate run.
+# Held for the whole run, builds included, so no gate container lands on these
+# cores mid-rep. The wait is bounded in 10 s tries; 360 is one hour.
+LOCK=/tmp/benchlock
+take_lock() {
+  local n=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -ge "${BENCH_LOCK_TRIES:-360}" ]; then
+      say "$LOCK still held after $((n * 10))s: $(ls -ld "$LOCK" 2>&1)"
+      return 1
+    fi
+    sleep 10
+  done
+  trap 'stop_all; rmdir "$LOCK"' EXIT
+  trap 'exit 1' HUP INT TERM
+}
 
 # Stages, so a slow build is not repeated to re-run a fast measurement:
 #   build     compile the six servers, nothing else
@@ -439,6 +520,7 @@ versions() {
 main() {
   local stage=${1:-all}
   mkdir -p "$OUT" "$LOG"
+  take_lock
   if [ "$stage" = build ]; then
     build_all
     versions
@@ -448,7 +530,6 @@ main() {
     versions
     return 0
   fi
-  trap stop_all EXIT
   if [ "$stage" != run ]; then
     build_all
   fi
@@ -457,7 +538,7 @@ main() {
   start_all
   prove
   cat "$OUT/verify.txt"
-  if grep -q 'MISMATCH\|MISSING\|NOT REUSING\|NEVER ANSWERED' "$OUT/verify.txt"; then
+  if grep -q 'MISMATCH\|MISSING\|NOT REUSING\|NEVER ANSWERED\|PROOF FAILED' "$OUT/verify.txt"; then
     say "refusing to measure: the six servers are not serving the same responses"
     exit 1
   fi

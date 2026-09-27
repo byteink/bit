@@ -3,10 +3,13 @@
 
 The whole block is produced here, prose included, so that nothing between the
 BENCH markers can be typed by hand and quietly drift from the numbers beside
-it. Every figure is the MEDIAN of the reps, and every median is published with
-the rep count and the observed spread: on an unquota'd container sharing six
-cores with neighbours nobody here can see, a single number with no spread
+it. Every figure is the MEDIAN of the counted reps, and every median is
+published with the rep count and the observed spread: on an unquota'd
+container whose neighbours nobody here can see, a single number with no spread
 beside it is not a result a reader can judge.
+
+Every comparison is pkg/web divided by one peer, never one peer against
+another: the table exists to say where pkg/web stands.
 """
 import csv
 import os
@@ -37,9 +40,24 @@ def kv(path):
     return out
 
 
+def counted(rows):
+    """The first and the last measured rep are dropped when there are three or
+    more: the first follows the warmup while its load is still decaying, and
+    dropping the last as well keeps the counted window in the middle of the
+    run. Of five reps, the published medians are of reps 2-4."""
+    reps = sorted({int(r["rep"]) for r in rows})
+    keep = set(reps[1:-1]) if len(reps) >= 3 else set(reps)
+    return [r for r in rows if int(r["rep"]) in keep], sorted(keep)
+
+
 def series(rows, fw, test, conn, field):
     return [float(r[field]) for r in rows
             if r["framework"] == fw and r["test"] == test and r["conn"] == conn]
+
+
+def med(rows, fw, test, conn, field):
+    v = series(rows, fw, test, conn, field)
+    return statistics.median(v) if v else None
 
 
 def noise(vals):
@@ -62,32 +80,49 @@ def rps(n):
     return "{:,}".format(int(round(n)))
 
 
-def table(rows, test, conns, flagged):
-    head = ["Framework"]
-    for c in conns:
-        head += ["req/s c=%s" % c, "spread", "CPU us/req c=%s" % c]
-    head += ["p50 ms c=%s" % conns[-1], "p99 ms c=%s" % conns[-1], "vs pkg/web"]
+def ratio(bit, peer):
+    return "%.2fx" % (bit / peer) if bit is not None and peer else "n/a"
+
+
+def fmt(v, spec):
+    return spec % v if v is not None else "n/a"
+
+
+def headline(rows, conns):
+    """pkg/web's req/s divided by each peer's, one row per test and c."""
+    peers = [fw for fw in ORDER if fw != "bit"]
+    out = ["| pkg/web / peer, req/s | pkg/web req/s | " +
+           " | ".join(LABEL[fw] for fw in peers) + " |",
+           "|---" + "|--:" * (len(peers) + 1) + "|"]
+    for test, _ in TESTS:
+        for c in conns:
+            bit = med(rows, "bit", test, c, "rps")
+            cells = ["%s c=%s" % (test, c), rps(bit) if bit is not None else "n/a"]
+            cells += [ratio(bit, med(rows, fw, test, c, "rps")) for fw in peers]
+            out.append("| " + " | ".join(cells) + " |")
+    return out
+
+
+def table(rows, test, c, flagged):
+    head = ["Framework", "req/s", "req/min", "spread", "CPU us/req", "p50 ms",
+            "p99 ms", "oha cores, peak", "pkg/web / this: req/s", "CPU", "p50",
+            "p99"]
     out = ["| " + " | ".join(head) + " |",
            "|---" + "|--:" * (len(head) - 1) + "|"]
-    base = statistics.median(series(rows, "bit", test, conns[-1], "rps"))
+    bit = {f: med(rows, "bit", test, c, f)
+           for f in ("rps", "cpu_us_per_req", "p50_ms", "p99_ms")}
     for fw in ORDER:
-        cells = [LABEL[fw]]
-        for c in conns:
-            v = series(rows, fw, test, c, "rps")
-            if not v:
-                cells += ["n/a", "n/a", "n/a"]
-                continue
-            rps_cell = rps(statistics.median(v))
-            if (fw, test, c) in flagged:
-                rps_cell += " *"
-            cpu = series(rows, fw, test, c, "cpu_us_per_req")
-            cells += [rps_cell, spread(v), "%.1f" % statistics.median(cpu) if cpu else "n/a"]
-        last = series(rows, fw, test, conns[-1], "rps")
-        p50 = series(rows, fw, test, conns[-1], "p50_ms")
-        p99 = series(rows, fw, test, conns[-1], "p99_ms")
-        cells += ["%.2f" % statistics.median(p50) if p50 else "n/a",
-                  "%.1f" % statistics.median(p99) if p99 else "n/a",
-                  "%.2fx" % (statistics.median(last) / base) if last and base else "n/a"]
+        v = series(rows, fw, test, c, "rps")
+        if not v:
+            out.append("| %s |" % " | ".join([LABEL[fw]] + ["n/a"] * (len(head) - 1)))
+            continue
+        m = {f: med(rows, fw, test, c, f) for f in bit}
+        load = series(rows, fw, test, c, "load_cores")
+        cells = [LABEL[fw], rps(m["rps"]) + (" *" if (fw, test, c) in flagged else ""),
+                 rps(60.0 * m["rps"]), spread(v), fmt(m["cpu_us_per_req"], "%.1f"),
+                 fmt(m["p50_ms"], "%.2f"), fmt(m["p99_ms"], "%.2f"),
+                 "%.2f" % max(load) if load else "n/a"]
+        cells += [ratio(bit[f], m[f]) for f in ("rps", "cpu_us_per_req", "p50_ms", "p99_ms")]
         out.append("| " + " | ".join(cells) + " |")
     return out
 
@@ -109,18 +144,20 @@ def bad_reps(rows):
 
 
 def cpu_count(spec):
-    """Number of cores in a taskset-style range ("6-7") or a single id ("7")."""
+    """Number of CPUs in a Cpus_allowed_list spec ("3-5,7" is 4)."""
     if not spec or spec == "?":
         return 0
-    if "-" in spec:
-        lo, hi = spec.split("-", 1)
-        return int(hi) - int(lo) + 1
-    return 1
+    n = 0
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        n += int(hi or lo) - int(lo) + 1
+    return n
 
 
 def load_bound(rows, conns, n_load):
-    """(framework, test, conn) tuples whose load generator was itself close to
-    saturated: its req/s there is oha's own throughput, not a server ceiling."""
+    """(framework, test, conn) tuples where ANY counted rep had the load
+    generator at 90% or more of its CPUs: req/s there may be oha's own
+    throughput, not a server ceiling."""
     flagged = set()
     if not n_load:
         return flagged
@@ -128,26 +165,40 @@ def load_bound(rows, conns, n_load):
         for test, _ in TESTS:
             for c in conns:
                 v = series(rows, fw, test, c, "load_cores")
-                if v and statistics.median(v) >= 0.9 * n_load:
+                if v and max(v) >= 0.9 * n_load:
                     flagged.add((fw, test, c))
     return flagged
 
 
-def load_bound_note(flagged, n_load):
+def load_note(flagged, n_load):
     if not flagged:
-        return ""
-    return ("> `*` marks a LOAD-BOUND row: the load generator's median busy"
-            " count on its %d pinned core(s) was at least 90%% of %d there, so"
-            " its req/s is oha's own throughput, not a server ceiling there."
-            " Compare those rows on `CPU us/req` instead." % (n_load, n_load))
+        return ("> No row is load-bound: in every counted rep the load generator"
+                " stayed under %.1f of its %d CPUs (`oha cores, peak`), so each"
+                " req/s is the server's ceiling, not oha's." % (0.9 * n_load, n_load))
+    return ("> `*` marks a LOAD-BOUND row: in at least one counted rep the load"
+            " generator was busy on %.1f or more of its %d CPUs, so its req/s may"
+            " be oha's own throughput, not a server ceiling. Compare those rows"
+            " on `CPU us/req` instead." % (0.9 * n_load, n_load))
+
+
+def quiet_line(out_dir):
+    path = os.path.join(out_dir, "quiet.txt")
+    lines = open(path).read().splitlines() if os.path.exists(path) else []
+    if not lines:
+        return "no quiet checks were recorded"
+    checks = {l.split(" try ")[0] for l in lines}
+    retried = len(lines) - len(checks)
+    return "%d quiet checks (before every rep and after the last), %d retr%s" % (
+        len(checks), retried, "y" if retried == 1 else "ies")
 
 
 def versions_line(v):
-    parts = [("Bit toolchain", v.get("bit", "?")), ("gin", v.get("gin", "?")),
+    parts = [("Bit", v.get("bit", "?")), ("gin", v.get("gin", "?")),
              ("Go", v.get("go", "?")), ("express", v.get("express", "?")),
              ("Node", v.get("node", "?")), ("bun", v.get("bun", "?")),
              ("Spring Boot", v.get("springboot", "?")), ("JVM", v.get("jvm", "?")),
-             ("ASP.NET", v.get("dotnet", "?"))]
+             ("ASP.NET Core on .NET SDK", v.get("dotnet", "?")),
+             ("load generator oha", v.get("oha", "?"))]
     return ", ".join("%s %s" % (a, b) for a, b in parts)
 
 
@@ -199,8 +250,22 @@ def io_line(env_text):
         min(r[2] for r in rows), max(r[2] for r in rows))
 
 
+def hardware(env, server_cpus, load_cpus):
+    """The machine by what it IS, never by what it is called: CPU model and
+    topology, and how many hardware threads each side was given."""
+    return ("%s, %s cores / %s threads, Linux %s. Each server ran on ONE"
+            " physical core (%d hardware threads, CPUs %s); the load generator,"
+            " oha, on %d other hardware threads (CPUs %s) sharing no core with"
+            " it. Both sets were read back from `/proc/<pid>/status`"
+            " `Cpus_allowed_list` of the running processes, not taken on trust"
+            " from the flag"
+            % (env.get("cpu", "?"), env.get("cpu_cores", "?"), env.get("cpu_threads", "?"),
+               env.get("kernel", "?").replace("Linux ", ""), cpu_count(server_cpus),
+               server_cpus, cpu_count(load_cpus), load_cpus))
+
+
 def main():
-    out_dir, commit, stamp, host = sys.argv[1:5]
+    out_dir = sys.argv[1]
     rows = read_rows(os.path.join(out_dir, "results.csv"))
     if not rows:
         sys.exit("report.py: results.csv is empty")
@@ -208,10 +273,11 @@ def main():
     ver = kv(os.path.join(out_dir, "versions.txt"))
     env_text = open(os.path.join(out_dir, "env.txt")).read()
     conns = sorted({r["conn"] for r in rows}, key=int)
+    used, kept = counted(rows)
     server_cpus, load_cpus = pinning(out_dir)
     n_load = cpu_count(load_cpus)
-    flagged = load_bound(rows, conns, n_load)
-    reps = len({r["rep"] for r in rows})
+    flagged = load_bound(used, conns, n_load)
+    commit = ver.get("bit", "?").split(" ")[0]
     p = print
 
     p("## Benchmarks")
@@ -221,58 +287,60 @@ def main():
     p("endpoint, and none of the six apps under `bench/apps/` has one, so there")
     p("is no Bit side to compare yet.")
     p("")
+    p("pkg/web's requests per second divided by each peer's: above 1.00x,")
+    p("pkg/web serves more.")
+    p("")
+    for line in headline(used, conns):
+        p(line)
+    p("")
     for test, title in TESTS:
-        p("### %s" % title)
-        p("")
-        for line in table(rows, test, conns, flagged):
-            p(line)
-        p("")
+        for c in conns:
+            p("### %s, c=%s" % (title, c))
+            p("")
+            for line in table(used, test, c, flagged):
+                p(line)
+            p("")
     bad = bad_reps(rows)
     if bad:
-        p("> %d rep(s) answered a status other than 200 and are in the table above;"
+        p("> %d rep(s) answered a status other than 200 and are in the results;"
           " see bench/out/results.csv." % len(bad))
-    p("> Every figure is the median of %d reps of 5 seconds each, and `spread` is"
-      " half the min-to-max range as a percent of that median. `c` is the number"
-      " of concurrent keep-alive connections the load generator held open."
-      " `vs pkg/web` divides that framework's c=%s median by pkg/web's, so"
-      " 2.00x is twice the requests per second." % (reps, conns[-1]))
-    note = scaling_note(rows, conns)
+    p("> Every figure is the median of reps %s of %d measured reps of 5 seconds"
+      " each, after one 10-second warmup per server that is never counted. The"
+      " first and last reps are measured but not counted: the first follows the"
+      " warmup's decaying load, and dropping the last as well keeps the counted"
+      " window in the middle of the run. `spread` is half the min-to-max range of the counted reps as a"
+      " percent of their median. `c` is the number of concurrent keep-alive"
+      " connections the load generator held open. `CPU us/req` is the server's"
+      " own user plus system CPU time over the rep, divided by the requests it"
+      " answered."
+      % ("-".join(str(k) for k in (kept[0], kept[-1])) if len(kept) > 1 else kept[0],
+         len({r["rep"] for r in rows})))
+    p("> `pkg/web / this` divides pkg/web's median by that row's: above 1.00x is"
+      " better for pkg/web on req/s, below 1.00x is better for pkg/web on CPU,"
+      " p50 and p99.")
+    p(load_note(flagged, n_load))
+    note = scaling_note(used, conns)
     if note:
         p(note)
-    lb_note = load_bound_note(flagged, n_load)
-    if lb_note:
-        p(lb_note)
-    p("> The two concurrency columns are published together because they do not"
-      " move together. c=1 is what one request costs with no queue in front of"
-      " it; c=64 is the server under load. A framework can lead on one and trail"
-      " on the other, and one column alone would hide which.")
     p("> Identical responses were PROVEN before anything was timed, not assumed:"
       " all six servers answer the same body byte for byte (sha256 of each body"
       " compared against pkg/web's), the same Content-Type, a Content-Length"
-      " equal to that body, and no chunked framing. The proof is regenerated on"
-      " every run into `bench/out/verify.txt`. Keep-alive is on for all six and"
-      " is checked the same way: two requests, one TCP connection.")
+      " equal to that body, and no chunked framing. Keep-alive is on for all six"
+      " and is checked the same way: two requests, one TCP connection. The run"
+      " refuses to measure when either proof fails.")
     p("> Round-robin, not one framework at a time. Every rep visits all six"
       " servers, rotating which goes first, and all six stay up for the whole"
-      " run. The box drifts; interleaving spreads that drift over all six"
-      " instead of over whichever framework held the noisy window.")
-    p("> Load generator: oha, %s concurrent connections, HTTP/1.1 keep-alive,"
-      " pinned to cores %s. Servers pinned to cores %s. Disjoint, and read back"
-      " from `/proc/<pid>/status` `Cpus_allowed_list` of each running process"
-      " rather than taken on trust from the flag."
-      % (conns[-1], load_cpus, server_cpus))
-    p("> Box AS MEASURED, not as specified: %s, `systemd-detect-virt` says `%s`,"
-      " %s cores, `cpu.max` `%s`, %s MB RAM, %s, %s. It is a CONTAINER with no"
-      " CPU quota, so anything else on the physical host competes with this"
-      " benchmark and is invisible from inside it. During this run: %s. Read"
-      " these figures as a RANKING taken under one shared load, not as absolute"
-      " throughput; they are not comparable to bare-metal published numbers."
-      % (host, env.get("virt", "?"), env.get("cores", "?"), env.get("cpu.max", "?"),
-         env.get("mem_total_mb", "?"), env.get("cpu", "?"), env.get("kernel", "?"),
-         io_line(env_text)))
+      " run. The box was checked quiet before every rep and after the last: no"
+      " container running that the benchmark did not start, CPU pressure (PSI)"
+      " under 1 over 10 s, and under 1%% of a 5 s window stalled. This run: %s."
+      % quiet_line(out_dir))
+    p("> Hardware: %s. The machine is a container with no CPU quota on a shared"
+      " host, so read these figures as a comparison taken under one shared"
+      " load, not as absolute throughput. During this run: %s."
+      % (hardware(env, server_cpus, load_cpus), io_line(env_text)))
     p("> Versions: %s." % versions_line(ver))
     p("> Generated by `pkg/web/bench/run.sh` from Bit `%s` on %s. Do not edit by"
-      " hand." % (commit, stamp))
+      " hand." % (commit, env.get("date_utc", "?")))
 
 
 main()
