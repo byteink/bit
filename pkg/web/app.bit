@@ -27,7 +27,20 @@
 // imports the same two names, but an import bound only by a `.test.bit` file
 // is visible only to other `.test.bit` files (SPEC §17.2) — `App.serve()`
 // below is production code and needs its own binding.
-import { Server, serve, listenAndServeOn } from "std/http"
+// `HijackOutcome`/`serveHijackableOn`/`serveHijackableBackground` (#6102):
+// the keep-alive-capable hijack primitive that replaced this app's own
+// separate app-wide accept loop (`realtime.bit`'s former `serveHijackableOn`/
+// `serveHijackableBackground`, deleted with #6102) — see `App.hijackable`
+// below for why one primitive can now serve every request, ordinary and
+// hijackable alike, on the SAME connection loop.
+import {
+  Server,
+  serve,
+  listenAndServeOn,
+  HijackOutcome,
+  serveHijackableOn,
+  serveHijackableBackground,
+} from "std/http"
 
 // The one interface the package has (five granular ones were considered and
 // dropped as speculative, per #3875). `App` and `Group` both satisfy it
@@ -314,22 +327,29 @@ export class App {
 
   // #6072: true the instant ANY route anywhere in this app was registered
   // with `.hijackable()` — computed once, in `freeze()` (`anyHijackable`,
-  // middleware.bit), never per request. `listen()`/`serve()`/`listenTls()`/
-  // `serveTls()` below all read it to choose their serving loop: false
-  // (every app that never calls `.hijackable()`, including every plaintext/
-  // JSON benchmark route) keeps stdlib's own keep-alive `listenAndServe`/
-  // `listenAndServeOn` path byte-for-byte unchanged — this field costs such
-  // an app exactly one read of a `bool` that is already `false`, never an
-  // Exchange, never a lost connection reuse. True switches the WHOLE app
-  // (not just its hijackable routes) onto realtime.bit's Exchange-based
-  // loop, which answers one request per connection — see realtime.bit's file
-  // header for why that trade is app-wide: stdlib's `Exchange` (std/http)
-  // is one-shot by design (its own doc comment: "one request per connection
-  // in v1"), so there is no connection-level way yet to keep some requests
-  // on the fast path and hijack only others on the SAME connection. Mixing
-  // a high-throughput ordinary route with a WebSocket/SSE/stream route on
-  // ONE app pays this for its ordinary traffic too; the fix needs a
-  // keep-alive-capable hijack primitive in stdlib/http, filed as #6102.
+  // middleware.bit), never per request. `listen()`/`serve()` below read it to
+  // choose their serving loop: false (every app that never calls
+  // `.hijackable()`, including every plaintext/JSON benchmark route) keeps
+  // stdlib's own keep-alive `listenAndServe`/`listenAndServeOn` path
+  // byte-for-byte unchanged — this field costs such an app exactly one read
+  // of a `bool` that is already `false`, never an `Exchange`, never a lost
+  // connection reuse.
+  //
+  // #6102: true now switches the app onto `std/http`'s `serveHijackableOn` —
+  // still keep-alive, per CONNECTION rather than per app: an ordinary request
+  // is answered and the connection stays open for the next one under the
+  // same idle-timeout/max-requests bounds `listenAndServeOn` enforces, and
+  // ONLY the one connection whose request actually calls `c.hijack()`/
+  // `wsUpgrade`/`newSSE`/`newStream` stops looping and is handed over. Before
+  // #6102, `Exchange` (std/http) was one-shot by design (its own doc
+  // comment: "one request per connection in v1"), so this flag put the WHOLE
+  // app on a one-request-per-connection loop the instant any route was
+  // marked hijackable — a mixed app (a high-throughput ordinary route plus a
+  // WebSocket/SSE/stream route) paid that for its ordinary traffic too.
+  // `dispatchHijackable` (realtime.bit) still does the same router lookup
+  // and builds the same `Ctx` it always has — it now returns `std/http`'s
+  // `HijackOutcome` directly, since `serveHijackableOn` (below) is the one
+  // loop driving it.
   hijackable: bool
 
   init(config: Config) {
@@ -443,21 +463,20 @@ export class App {
   // bind or accept error — or immediately, without binding anything, when
   // `freeze()` rejects the route table.
   //
-  // #6072: `this.hijackable` (set by `freeze()` above) is the ONLY new thing
-  // here, and it costs an app that never calls `.hijackable()` nothing but
-  // reading a `bool` that is already `false` — everything below that branch
-  // is byte-for-byte what this method already was. True runs the SAME
-  // request through the SAME `handle()`/`serveHandler()` path
-  // (`dispatchHijackable`, realtime.bit, forwards into `chainResponse`'s
-  // exact composed-Handler call), only the connection framing around it
-  // changes: one request per connection instead of `listenAndServe`'s
-  // keep-alive, which is what makes a hijack reachable at all — see
-  // realtime.bit's file header for why.
+  // #6072/#6102: `this.hijackable` (set by `freeze()` above) is the ONLY new
+  // thing here, and it costs an app that never calls `.hijackable()` nothing
+  // but reading a `bool` that is already `false` — the `false` branch is
+  // byte-for-byte what this method already was. True runs the SAME request
+  // through the SAME `handle()`/`serveHandler()` path (`dispatchHijackable`,
+  // realtime.bit, forwards into `chainResponse`'s exact composed-Handler
+  // call) on `std/http`'s `serveHijackableOn` — keep-alive for every
+  // connection, same as the `false` branch, except the one connection whose
+  // request calls `c.hijack()`, which stops looping there instead.
   export listen(): ()! {
     this.freeze()?
     if (this.hijackable) {
       let s = serve(this.config.host, this.config.port)?
-      serveHijackableOn(s, this)?
+      serveHijackableOn(s, (req, ex) => dispatchHijackable(this, ex, req))?
       return
     }
     listenAndServe(this.config.host, this.config.port, this.serveHandler())?
@@ -473,7 +492,7 @@ export class App {
   // in a test, exactly as `stdlib/http`'s own `Server.shutdown` tests do.
   //
   // `listen()` itself is unchanged and still the right call for a program
-  // that has nothing else to do after serving starts. #6072: same
+  // that has nothing else to do after serving starts. #6072/#6102: same
   // `this.hijackable` branch as `listen()`, spawned instead of blocking —
   // `s.shutdown(timeoutMs)` still drains it either way, since both branches
   // hand `shutdown` the same kind of `Server`.
@@ -481,7 +500,7 @@ export class App {
     this.freeze()?
     let s = serve(this.config.host, this.config.port)?
     if (this.hijackable) {
-      spawn serveHijackableBackground(s, this)
+      spawn serveHijackableBackground(s, (req, ex) => dispatchHijackable(this, ex, req))
       return s
     }
     spawn serveBackground(s, this.serveHandler())
