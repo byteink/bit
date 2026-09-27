@@ -90,32 +90,15 @@ diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
-# #5995: interface dispatch ids (`ifaceSigEnabled()`, compiler/lower.bit,
-# #5979) and bounds-check join resolution (`bceJoinEnabled()`,
-# compiler/optbce.bit, #5971) only change ir/iropt output. Tree default is on
-# since the 0.30.0 repin; the 0.30.0 ORACLE still defaults both off, so force
-# "1" on both sides here -- the one place they share an environment -- to
-# compare ON against ON. Remove these exports, and the flags themselves, at
-# the next repin.
-#
-# BIT_DCE_PARAMS (#5949) stays OFF by default on both sides, unlike the two
-# above: #5976 found a live segfault under BIT_GC=stress when the tree
-# defaulted it on (gclarge/gcslotbitmap/gcspanblocks/gcspanfree), so the
-# default flip was reverted pending a fix. No export needed here while both
-# sides agree at off.
+# #5995/#5976: these flags default on in this tree and off in the 0.30.0
+# ORACLE, so force "1" on both sides to compare ON against ON. IFACE_SIG
+# (#5979) and BCE_JOIN (#5971) change only ir/iropt; JSON_APPEND (#5991)
+# adds a method before typecheck, so every kind sees it. Remove the
+# exports, and the flags, at the next repin.
 if [ "$KIND" = ir ]; then
   export BIT_IFACE_SIG=1
   export BIT_BCE_JOIN=1
 fi
-
-# The `@json` `__jsonAppend` direct encoder (`jsonAppendEnabled()`,
-# compiler/classjsonappend.bit, #5991), by contrast, DID flip on by default
-# at #5976 -- it splices a whole SYNTHESIZED METHOD, with its own typed body,
-# onto every `@json` class BEFORE typecheck, so it changes `--dump-types`
-# output too, not just ir/iropt (`types`'s KIND is its own value, not `ir` --
-# see the case table above). The 0.30.0 ORACLE still defaults it off, so
-# force it on both sides for every kind that runs the checker. Remove this
-# export, and the flag itself, at the next repin.
 export BIT_JSON_APPEND=1
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
