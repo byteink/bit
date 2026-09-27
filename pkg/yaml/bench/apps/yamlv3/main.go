@@ -1,4 +1,6 @@
-// gopkg.in/yaml.v3's side of pkg/yaml's parse-throughput comparison (#5501).
+// go.yaml.in/yaml/v3's side of pkg/yaml's parse-throughput comparison
+// (#5501). go.yaml.in/yaml/v3 is the YAML organization's maintained
+// continuation of gopkg.in/yaml.v3, same API (#6049).
 //
 // Reads the fixture path from argv[1], parses it once into yaml.Node (the
 // library's order-preserving AST — a plain interface{} decode loses key
@@ -17,7 +19,7 @@ import (
 	"strconv"
 	"strings"
 
-	yaml "gopkg.in/yaml.v3"
+	yaml "go.yaml.in/yaml/v3"
 )
 
 // canonicalWalk must stay byte-for-byte identical to bench/apps/bit/main.bit's
