@@ -924,7 +924,16 @@ on the next tick and applies to a connection from either side.
 Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
 socket if this connection owns it. A connection accepted from a `Listener` shares
 the listener's socket with the listener and every sibling connection, so closing
-it leaves that socket alone. Best-effort - there is no draining timeout.
+it leaves that socket alone. Best-effort - there is no draining timeout. Equivalent
+to `closeWithCode(0)`.
+
+### `Conn.closeWithCode(code: int)`
+
+As `close()`, but the CONNECTION_CLOSE's application error code is `code` instead
+of always 0 - the general form an application protocol layered on QUIC needs to
+close with ITS OWN code space instead of QUIC's own "no error" 0. `std/http3`'s
+`H3Conn.close()` uses this to close with HTTP/3's `H3_NO_ERROR` (0x0100, RFC 9114
+§8.1) rather than QUIC's 0.
 
 ### `Stream`
 

@@ -212,11 +212,29 @@ fn h3DeadlineRelabel(e: error, deadlineNs: int): error {
 // Serve one accepted HTTP/3 connection: accept each request, dispatch it through
 // the transport-agnostic `handler`, and answer on the same stream. Bounded so the
 // loop is provably finite; returns (closing the connection) when the peer stops.
-fn serveH3Conn(conn: H3Conn, handler: (Request) => Response) {
+// `d` is the owning server's drain tracker (`shutdown.bit`, #6094): registered
+// idle until this connection's first request starts, then active for the rest
+// of its life — a graceful shutdown force-closes it right away if idle, or
+// sends GOAWAY (`H3Conn.goAway`) and gives it up to its timeout to finish if
+// active, the h3-native shape of the same promise `h2glueServe` and `serveOne`
+// already make. `serveH3On`'s call site passes a private, never-drained `d`, so
+// this bookkeeping is a no-op cost there (same pattern h2.bit's header comment
+// documents for `serveTlsOn`).
+fn serveH3Conn(conn: H3Conn, handler: (Request) => Response, d: drainState) {
   // Read once, before the accept loop: the address belongs to the connection,
   // and every request served here shares it (`h2glueServe` reads it in the same
   // place for the same reason). Cannot fail — see `H3Conn.peerIp`.
   let peer = conn.peerIp()
+  let id = drainRegister(
+    d,
+    () => {
+      conn.close()
+    },
+    () => {
+      conn.goAway()
+    },
+  )
+  defer drainDeregister(d, id)
   let guard = 0
   while (guard < 1048576) {
     guard = guard + 1
@@ -224,7 +242,17 @@ fn serveH3Conn(conn: H3Conn, handler: (Request) => Response) {
       conn.close()
       return
     }
+    drainMarkActive(d, id)
     conn.respond(sr, h3glueResponseOut(handler(h3glueRequestIn(sr.req, peer)))) catch _ {
+      conn.close()
+      return
+    }
+    // A shutdown mid-request (`goAway` above) already told the peer this was
+    // the last one it would answer — closing right away, instead of looping
+    // back to `accept` and waiting for the peer to hang up on its own or a
+    // shutdown timeout to pass, is what makes `H3Server.shutdown` return
+    // promptly once its one in-flight request finishes.
+    if (conn.draining()) {
       conn.close()
       return
     }
@@ -277,6 +305,74 @@ export fn serveH3On(
     let conn = lst.accept() catch _ {
       return
     }
-    spawn serveH3Conn(conn, handler)
+    // A private, never-drained tracker per connection — this path has no
+    // shutdown handle to drain into (`h3Serve`/`H3Server` is that handle);
+    // see `serveH3Conn`'s doc comment.
+    spawn serveH3Conn(conn, handler, newDrainState())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// H3Server — the shutdown-capable HTTP/3 server (#6094)
+// ---------------------------------------------------------------------------
+
+// A drain-capable HTTP/3 server handle: the h3 mirror of `TlsServer`
+// (server.bit, #4314), bound with `h3Serve`, driven with `serveH3ServerOn`,
+// stopped with `shutdown()`.
+export class H3Server {
+  lst: H3Listener
+  sock: UdpSocket
+  drain: drainState
+
+  // The UDP port this server is bound to — the h3 mirror of
+  // `TlsServer.port()`, needed the same way: `h3Serve`'s caller may have
+  // asked for port 0 and let the kernel choose.
+  export port(): int! {
+    return this.sock.port()?
+  }
+
+  // Stop accepting new requests on connections already open (GOAWAY, RFC 9114
+  // §5.2, via each connection's `H3Conn.goAway`), give each one already
+  // handling a request up to `timeoutMs` to finish, then force-close whatever
+  // remains (`H3Conn.close`, H3_NO_ERROR). See shutdown.bit's header comment
+  // for the full sequence; this reuses the exact same `drainRun` engine
+  // `TlsServer.shutdown`/`Server.shutdown` do.
+  //
+  // A known, documented gap: unlike `TlsServer.shutdown()`, this does NOT stop
+  // a brand-new QUIC connection from completing its handshake and being
+  // served during the wait below. `std/quic`'s `Listener` (stdlib/quic/
+  // listener.bit) has no `close()`/stop-accepting primitive of its own, and
+  // the one demultiplexing loop that feeds every open connection its
+  // datagrams runs on the SAME shared UDP socket new connections arrive on —
+  // closing that socket here to refuse new ones would also cut off every
+  // in-flight connection this call exists to let finish. Closing this gap
+  // needs `std/quic` support for refusing a new connection while continuing
+  // to demux existing ones; out of this ticket's scope.
+  export shutdown(timeoutMs: int): ()! {
+    drainRun(() => {}, this.drain, timeoutMs)?
+  }
+}
+
+// Bind `host:port` (UDP) for HTTP/3 with the certificate chain `certPem` and
+// matching private key `keyPem` (both PEM) and return a shutdown-capable
+// handle — the h3 mirror of `tlsServe`. Drive it with `serveH3ServerOn`.
+export fn h3Serve(host: string, port: int, certPem: string, keyPem: string): H3Server! {
+  let sock = udpBind(host, port)?
+  let lst = h3Listen(sock, certPem, keyPem)?
+  return H3Server{ lst = lst, sock = sock, drain = newDrainState() }
+}
+
+// Serve HTTP/3 forever on `hs` (`h3Serve`'s handle) — the shutdown-capable
+// mirror of `serveH3On`. Every accepted connection registers in `hs.drain`
+// (`serveH3Conn`) so `hs.shutdown(timeoutMs)` can drain it. Run on its own
+// green thread; bounded so the loop is provably finite.
+export fn serveH3ServerOn(hs: H3Server, handler: (Request) => Response): ()! {
+  let guard = 0
+  while (guard < 1048576) {
+    guard = guard + 1
+    let conn = hs.lst.accept() catch _ {
+      return
+    }
+    spawn serveH3Conn(conn, handler, hs.drain)
   }
 }
