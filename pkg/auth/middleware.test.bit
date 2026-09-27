@@ -4,8 +4,21 @@
 // holds no `NameRegistry` constructor of its own and `pkg/web` exports
 // none either, so a `Ctx` is only reachable by asking a real `App` to
 // build one.
+//
+// The #6093 regression test below is the one exception: it runs the
+// documented `requireAuth([...newPasswordStrategy...])`-as-login pattern
+// (README.md, docs/getting-started.md) over a REAL socket rather than
+// `app.handle(req)`, because the bug it guards against — a double
+// `Session.regenerate()` discarding what `requireAuth` just wrote — is
+// specifically about what a SECOND real request, presenting the cookie the
+// FIRST response actually armed, can see. `pkg/auth`'s `bit.json` pins
+// `web@0.6.0` (bit.lock), which predates `App.serve()` (#6080), so this
+// drives `App.serveHandler()` (already public at that pin) over
+// `std/http`'s own `serve`/`listenAndServeOn` directly — the same wiring
+// `App.serve()` itself uses (`pkg/web/app.bit`) and the pattern
+// `pkg/web/tracing.test.bit`'s `startSpanCapture` already establishes.
 import { App, Config, MemoryStore } from "web"
-import { Request } from "std/http"
+import { Request, Server, listenAndServeOn, requestWith, serve } from "std/http"
 
 // A Strategy that always succeeds with a fixed Identity — the "no-op"
 // stub the ticket calls for, standing in for a real password/OIDC
@@ -91,4 +104,124 @@ test "currentIdentity fails when no identity was stored" {
   app.handle(req())
 
   assert(failed, "currentIdentity must fail when no identity was stored")
+}
+
+// The documented `requireAuth([...newPasswordStrategy...])`-as-login-middleware
+// pattern (README.md, docs/getting-started.md), verbatim: `requireAuth`
+// mounted on a `/login` group, a plain `/me` route reading `currentIdentity`
+// through `unauthorized()` on a miss. `knownUserLookup`/`hashPassword` are
+// already bound module-wide by `password.test.bit` (SPEC §17.1).
+fn documentedLoginApp(store: MemoryStore): App {
+  let app = App(Config{ secret = "test-secret", sessions = store })
+  let login = app.group("/login")
+  login.use(requireAuth([]Strategy{ newPasswordStrategy(knownUserLookup(hashPassword("s3cr3t"))) }))
+  login.post("/", (c) => c.text("welcome"))
+  app.get("/me", (c) => {
+    let identity: Identity = currentIdentity(c) catch _ {
+      fail unauthorized()
+    }
+    return c.text(identity.id)
+  })
+  return app
+}
+
+// The session id `Set-Cookie: sid=...` carries, the way a browser reads it
+// back: everything up to (not including) the first `;`. `split` is already
+// bound module-wide by `oidc_verify.bit`.
+fn cookiePairFromSetCookie(raw: string): string {
+  let parts = split(raw, ";")
+  assert(len(parts) > 0, "no cookie in Set-Cookie '${raw}'")
+  return parts[0]
+}
+
+// Freezes `app` and binds it to an OS-assigned port, the same two steps
+// `App.serve()` (pkg/web/app.bit, #6080 — not yet in the `web@0.6.0` this
+// package's `bit.lock` pins) performs, built here from the pieces that ARE
+// at that pin: `serve` (a `Server` over the listener) and `app.serveHandler()`
+// (the exact function value `App.listen()` already drives).
+fn serveApp(app: App): Server! {
+  app.freeze()?
+  let s = serve("127.0.0.1", 0)?
+  spawn driveApp(s, app)
+  return s
+}
+
+// Runs `s`'s accept loop against `app`'s handler until the listener closes.
+// `spawn` demands a call, never an inline lambda (SPEC §22) — the same
+// shape `pkg/web/tracing.test.bit`'s `runSpanCapture` uses.
+fn driveApp(s: Server, app: App) {
+  listenAndServeOn(s, app.serveHandler()) catch _ {
+    return
+  }
+}
+
+test "#6093: the documented requireAuth-as-login pattern round-trips a session over real HTTP, rotating the id exactly once" {
+  let store = MemoryStore(1000)
+  let app = documentedLoginApp(store)
+  let server = serveApp(app) catch e {
+    assert(false, "serveApp: ${e.message()}")
+    return
+  }
+  let port = server.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+
+  // The fixation shape (#5795): a session id already adopted before login
+  // runs — an earlier anonymous visit, or an attacker-set cookie — the same
+  // seeding `password.test.bit`'s own fixation test uses.
+  let preSid = newSessionId()
+  store.compareAndSet(preSid, 0, map<string, string>(), 86400) catch e {
+    assert(false, "compareAndSet: ${e.message()}")
+    return
+  }
+
+  let loginRes = requestWith(
+    "POST",
+    "http://127.0.0.1:${port}/login",
+    []Header{
+      Header{ name = "Content-Type", value = "application/json" },
+      Header{ name = "Cookie", value = "sid=" + preSid },
+    },
+    "{\"username\":\"alice\",\"password\":\"s3cr3t\"}",
+  ) catch e {
+    assert(false, "POST /login: ${e.message()}")
+    return
+  }
+  assert(loginRes.status == 200, "want 200 from /login, got ${loginRes.status}: ${loginRes.body}")
+  let setCookie = loginRes.getHeader("Set-Cookie")
+  assert(len(setCookie) > 0, "a successful login must issue a Set-Cookie")
+  assert(!contains(setCookie, preSid), "the session id did not change on login: '${setCookie}'")
+  let newCookiePair = cookiePairFromSetCookie(setCookie)
+
+  // A second, independent request presenting the cookie the login response
+  // actually armed must see the Identity `requireAuth` stored — the exact
+  // round trip #6093 found broken.
+  let meRes = requestWith(
+    "GET",
+    "http://127.0.0.1:${port}/me",
+    []Header{ Header{ name = "Cookie", value = newCookiePair } },
+    "",
+  ) catch e {
+    assert(false, "GET /me: ${e.message()}")
+    return
+  }
+  assert(meRes.status == 200, "want 200 from /me with the new session cookie, got ${meRes.status}")
+  assert(meRes.body == "u1", "want the identity requireAuth stored, got '${meRes.body}'")
+
+  // A request carrying the PRE-login id — the one login rotated away from —
+  // must not be authenticated: regenerate() tombstones it.
+  let staleRes = requestWith(
+    "GET",
+    "http://127.0.0.1:${port}/me",
+    []Header{ Header{ name = "Cookie", value = "sid=" + preSid } },
+    "",
+  ) catch e {
+    assert(false, "GET /me (stale id): ${e.message()}")
+    return
+  }
+  assert(
+    staleRes.status == 401,
+    "a request carrying the pre-login session id must not be authenticated, got ${staleRes.status}",
+  )
 }
