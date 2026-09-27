@@ -216,11 +216,18 @@ compression, request logging, all of it wraps the ordinary response path.
 A route that needs a check before it upgrades (an auth cookie, an
 `Origin` allowlist) makes that check itself, before calling `wsUpgrade`.
 
-**TLS, HTTP/2 and HTTP/3 do not support hijacking yet.** `App.listenTls()`/
-`App.serveTls()` serve every ordinary route the same way `listen()` does,
-but `c.hijack()`/`wsUpgrade`/`newSSE`/`newStream` all fail on a request that
-arrived over any of them - the error names why. A WebSocket, an SSE feed or
-a stream served today needs plain `App.listen()`/`App.serve()`, behind a
+**SSE and Stream work over TLS+HTTP/1.1; WebSocket, and HTTP/2 and HTTP/3
+entirely, do not yet.** `App.listenTls()`/`App.serveTls()` (ALPN "http/1.1")
+give `newSSE`/`newStream` the same keep-alive-or-hijack behavior `listen()`/
+`serve()` give them in plaintext - only the one connection that actually
+calls `newSSE`/`newStream` stops answering further requests; an ordinary
+route on the same app keeps its keep-alive connections either way.
+`wsUpgrade` still fails on a TLS-served request (`c.hijack()` does not -
+only `wsUpgrade` needs an update to `std/websocket`'s `Conn` this version
+does not yet have). A request negotiated over HTTP/2 or HTTP/3 still cannot
+hijack at all - `c.hijack()`/`wsUpgrade`/`newSSE`/`newStream` on one of
+those fail, naming why. A WebSocket over TLS, or anything over HTTP/2/
+HTTP/3, needs plain `App.listen()`/`App.serve()` today, behind a
 TLS-terminating proxy if the deployment needs TLS at all.
 
 ## When not to use this

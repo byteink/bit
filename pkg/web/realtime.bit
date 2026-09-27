@@ -24,6 +24,10 @@
 // `HijackOutcome` (std/http) is already bound module-wide by app.bit's own
 // import (SPEC §19) — importing it again here would be E0042.
 import { Conn as WsConn, upgrade, Limits } from "std/websocket"
+// `TlsConn` (#6152): `tlsWire`'s field type, below — `std/http`'s own
+// `TlsExchange.hijack()` returns it, but naming the type here needs its own
+// import (`TlsServer`, app.bit's import, does not re-export it).
+import { TlsConn } from "std/tls"
 
 // The router lookup and `Ctx` construction, mirroring `routed`/
 // `matchedResponse`/`missResponse` (adapter.bit) with one difference: this
@@ -71,6 +75,30 @@ fn runHijackable(app: App, c: Ctx, h: Handler): HijackOutcome {
   return HijackOutcome.Answer(frame(app, c.sealSession(r)))
 }
 
+// #6152: `dispatchHijackable`'s exact TLS mirror — the router lookup and
+// `Ctx` construction for a request `App.listenTls()`/`serveTls()` served
+// over TLS+HTTP/1.1, carrying a `TlsExchange` (`c.tlsExchange`) instead of
+// an `Exchange`. `App.listenTls()`/`serveTls()` pass this to `std/http`'s
+// `serveHijackableTlsOn`/`serveHijackableTlsBackground` as the hijack
+// handler, alongside `serveHandler()` (unchanged) for the h2 connections
+// that same server accepts.
+fn dispatchHijackableTls(app: App, ex: TlsExchange, req: Request): HijackOutcome {
+  let split = splitTarget(req.path)
+  let m = app.root.router.lookup(req.method, split.0) catch e {
+    let c = newCtx(req, nil, app.root.registry, app.config, "") catch ce {
+      return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
+    }
+    c.tlsExchange = Option.Some(ex)
+    c.routeMiss = e
+    return runHijackable(app, c, app.missHandler)
+  }
+  let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
+    return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
+  }
+  c.tlsExchange = Option.Some(ex)
+  return runHijackable(app, c, m.handler)
+}
+
 // --- WebSocket (#6072, part 41) ------------------------------------------
 //
 // The route-handler DX this ticket was filed under:
@@ -97,7 +125,8 @@ export fn wsUpgrade(c: Ctx, limits: Limits): WsConn! {
   return upgrade(ex, c.req, limits)?
 }
 
-// --- server-sent events and streaming responses (#6072, parts 42 and 45) -
+// --- server-sent events and streaming responses (#6072, parts 42 and 45;
+// #6152: TLS+HTTP/1.1) --------------------------------------------------
 //
 // `Stream` is the one hand-framed HTTP/1.1 writer both features need: SSE is
 // `text/event-stream` framing (`SSE` below) over the same chunked body a
@@ -107,12 +136,35 @@ export fn wsUpgrade(c: Ctx, limits: Limits): WsConn! {
 // and a streamed response's whole point is not holding the entire body in
 // memory to measure it first.
 //
+// `hijackWire` is the one difference a plain and a TLS-served connection
+// have here: `std/net`'s `Conn.write` takes a `string`, `std/tls`'s
+// `TlsConn.write` a `[]byte` — two genuinely different signatures, so
+// `Stream` holds this small interface instead of either concrete type, and
+// `plainWire`/`tlsWire` below are the one-line adapters. `Stream`'s own
+// public shape (`write`/`close`) is unaffected either way.
+interface hijackWire {
+  writeRaw(data: string): ()!,
+  closeWire(),
+}
+
+class plainWire {
+  c: Conn
+  writeRaw(data: string): ()! { this.c.write(data)? }
+  closeWire() { this.c.close() }
+}
+
+class tlsWire {
+  c: TlsConn
+  writeRaw(data: string): ()! { this.c.write([]byte(data))? }
+  closeWire() { this.c.close() }
+}
+
 // Bounded memory is the constructor's job, not the caller's: `write` sends
 // exactly the bytes it is given, once, straight onto the connection — no
 // internal buffer grows with the number or size of calls, so a multi-GB
 // stream costs this object nothing beyond the one chunk in flight.
 export class Stream {
-  conn: Conn
+  conn: hijackWire
   closed: bool
 
   // One chunk: its hex length prefix, the bytes, then the chunk's own
@@ -126,7 +178,7 @@ export class Stream {
     if (len(data) == 0) {
       fail newError("web: Stream.write: data is empty — call close() to end the stream")
     }
-    this.conn.write("${hexChunkSize(len(data))}\r\n${data}\r\n")?
+    this.conn.writeRaw("${hexChunkSize(len(data))}\r\n${data}\r\n")?
   }
 
   // The zero-length terminating chunk (RFC 9112 §7.1) and no trailer
@@ -138,29 +190,57 @@ export class Stream {
       return
     }
     this.closed = true
-    this.conn.write("0\r\n\r\n")?
-    this.conn.close()
+    this.conn.writeRaw("0\r\n\r\n")?
+    this.conn.closeWire()
   }
 }
 
-// Hijacks `c`'s connection and writes the status line and headers, with
-// `Transfer-Encoding: chunked` appended after whatever `headers` names — a
-// caller-supplied `Transfer-Encoding` would otherwise contradict the framing
-// this writer commits to using. `headers` carries no `Content-Length` for
-// the same reason `Stream`'s own doc comment gives: this call is exactly the
-// site that does not know one.
+// The guard `newStream` (below) needs for a TLS-served request, mirroring
+// `Ctx.takeExchange()`'s (ctx.bit) exact checks over `c.tlsExchange`
+// instead of `c.exchange` — module-private fields, not method-only (SPEC
+// §17.3), the same seam `dispatchHijackableTls` above already writes
+// through.
+fn takeTlsExchange(c: Ctx): TlsExchange! {
+  if (!isSome(c.tlsExchange)) {
+    fail newError(
+      "web: this request did not arrive on a connection that supports hijacking",
+    )
+  }
+  if (c.hijacked) {
+    fail newError("web: this request's connection was already hijacked")
+  }
+  c.hijacked = true
+  return unwrap(c.tlsExchange)
+}
+
+// Hijacks `c`'s connection — plain or TLS+HTTP/1.1 (#6152) — and writes the
+// status line and headers, with `Transfer-Encoding: chunked` appended after
+// whatever `headers` names — a caller-supplied `Transfer-Encoding` would
+// otherwise contradict the framing this writer commits to using. `headers`
+// carries no `Content-Length` for the same reason `Stream`'s own doc
+// comment gives: this call is exactly the site that does not know one.
 // `status` is always 200 today — nothing in this file streams a failure —
 // so the reason phrase is the one word RFC 9110's registry gives 200,
 // spelled here rather than through a status->phrase table this file has no
 // second entry for yet.
 export fn newStream(c: Ctx, status: int, contentType: string, headers: []Header): Stream! {
-  let conn = c.hijack()?
+  let wire = newStreamWire(c)?
   let out = "HTTP/1.1 ${status} OK\r\n" + "Content-Type: ${contentType}\r\n"
   for h of headers {
     out = out + "${h.name}: ${h.value}\r\n"
   }
-  conn.write(out + "Transfer-Encoding: chunked\r\n\r\n")?
-  return Stream{ conn = conn, closed = false }
+  wire.writeRaw(out + "Transfer-Encoding: chunked\r\n\r\n")?
+  return Stream{ conn = wire, closed = false }
+}
+
+// `newStream`'s own transport pick: a TLS-served request (`c.tlsExchange`)
+// takes `tlsWire`, everything else (including an app with no hijackable
+// route at all, whose `c.hijack()` fails naming why) `plainWire`.
+fn newStreamWire(c: Ctx): hijackWire! {
+  if (isSome(c.tlsExchange)) {
+    return tlsWire{ c = takeTlsExchange(c)?.hijack() }
+  }
+  return plainWire{ c = c.hijack()? }
 }
 
 // `n`'s hex digits, lowercase, no leading zeros, RFC 9112 §7.1.1's chunk

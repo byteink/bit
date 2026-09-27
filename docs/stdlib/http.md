@@ -935,6 +935,75 @@ fn serveTlsForeverOn(ts: TlsServer) {
     print("server failed: ${e.message()}\n")
   }
 }
+```
+
+### `TlsExchange`
+
+The TLS mirror of `Exchange`: one accepted TLS+HTTP/1.1 connection, and the
+connection to answer it on. Built by `TlsServer.accept()`, below.
+
+### `TlsServer.accept(): TlsExchange!`
+
+Accepts the next connection, runs its handshake, and returns a
+`TlsExchange` ready for `read()`/`hijack()` - the TLS mirror of
+`Server.accept()`. Fails when the connection negotiated ALPN "h2":
+hijacking over HTTP/2 needs RFC 8441, a different mechanism this method
+does not implement.
+
+### `TlsExchange.read(): Request!`
+
+The TLS mirror of `Exchange.read()`.
+
+### `TlsExchange.respond(res: Response): ()!`
+
+The TLS mirror of `Exchange.respond()`: writes `res` and closes the
+connection.
+
+### `TlsExchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
+
+The TLS mirror of `Exchange.respondKeepAlive()`.
+
+### `TlsExchange.hijack(): TlsConn`
+
+The TLS mirror of `Exchange.hijack()`: takes ownership of the exchange's
+underlying `TlsConn`.
+
+### `serveHijackableTlsOn(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()!`
+
+The TLS mirror of `serveHijackableOn`: serves TLS forever on an already-bound
+`ts`, keeping every TLS+HTTP/1.1 connection on keep-alive and hijacking only
+the one connection whose request returns `HijackOutcome.Hijacked`. `ts`
+still accepts HTTP/2 connections (ALPN "h2") - `plainHandler` answers those,
+unaffected, since HTTP/2 does not hijack through this function.
+
+```bit
+import {
+  TlsServer, TlsExchange, Request, Response, HijackOutcome, ok, tlsServe, serveHijackableTlsOn,
+} from "std/http"
+
+fn dispatch(req: Request, ex: TlsExchange): HijackOutcome {
+  if (req.path == "/upgrade") {
+    let conn = ex.hijack()
+    conn.write([]byte("HTTP/1.1 101 Switching Protocols\r\n\r\n")) catch _ {}
+    return HijackOutcome.Hijacked
+  }
+  return HijackOutcome.Answer(ok("hi"))
+}
+
+fn plain(req: Request): Response {
+  return ok("h2 ok")
+}
+
+fn runHijackableTls(certPem: string, keyPem: string): ()! {
+  let ts = tlsServe("127.0.0.1", 8443, certPem, keyPem)?
+  serveHijackableTlsOn(ts, dispatch, plain)?
+}
+```
+
+### `serveHijackableTlsBackground(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response)`
+
+`serveHijackableTlsOn`'s spawn-and-forget sibling, mirroring
+`serveHijackableBackground`.
 
 // Elsewhere, e.g. a signal handler: stop within 5s, force-closing anything
 // still running past that.
