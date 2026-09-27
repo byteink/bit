@@ -103,9 +103,9 @@ class LiveInterval {
   // #4503. How many times this value is READ — one per operand slot, so `x + x`
   // counts two. Under the single-location model that is exactly the number of
   // reloads spilling it would cost, and it is what `preferSpill` breaks an
-  // end-point TIE with. A STATIC count, with no execution frequency in it: see
-  // `preferSpill` for the measurement that says why it is trusted only where
-  // the two candidates' register time is equal by construction.
+  // end-point TIE with. A STATIC count, with no execution frequency in it:
+  // `weight` below is the same count weighted by loop depth, and `preferSpill`
+  // ranks by that; see it for why the static count alone was not trusted.
   //
   // Zero is the honest default for a caller that does not track uses: the tie
   // then resolves to `false` and `preferSpill` degenerates, term for term, to
@@ -136,6 +136,14 @@ class LiveInterval {
   // slice or string data word, `*T`, or arithmetic on one (`markHeapDerived`,
   // codegenlivereach.bit). Never set with `isRef`. Only regallocclear.bit reads it.
   heapDerived: bool,
+  // #5950. `uses` with each read weighted by its block's loop nesting,
+  // 8^depth (`loopFreqs`, codegenlive.bit): the reloads spilling this value
+  // costs per RUN rather than per program text, and the numerator of
+  // `preferSpill`'s ranking. Zero, like `uses`, for a caller that tracks nothing.
+  weight: int,
+  // #5950. The loop weight of the block defining this value. `extendOne` adds
+  // the READER's `freq` to the operand's `weight`; nothing else reads it.
+  freq: int,
 }
 
 // Where a vreg lives. Bit has no tagged union: `isSpill` selects whether `index`
@@ -271,61 +279,43 @@ fn firstFreeReg(s: ClassState, allowed: int): int {
 // #4503. Of two intervals with a register a spill has to come out of, which one
 // goes to the stack.
 //
-// FURTHEST END FIRST, exactly as before — this is Poletto & Sarkar's rule and
-// the general case is untouched. What changes is the case where that rule has
-// NO INFORMATION: two intervals with the SAME end point. It is not a rare
-// corner. `forceParamInterference` (codegenlive.bit) gives every parameter of
-// one block an identical range so they land in distinct registers, and
-// `block_param` is 84.65% of arm64 reload sites and 73.18% of x86-64's. Eleven
-// parameters of one block, all `[31, 115]`, is an ordinary shape in
-// `bench/cases/sort`; the end-point rule cannot tell them apart at all and
-// spills whichever the scan happened to reach.
+// #5950: LOOP-WEIGHTED READS PER UNIT OF REGISTER TIME FREED, lowest first.
+// Spilling costs `weight` (every read reloads, each weighted 8^depth by its
+// loop nesting) and frees the register from the scan `frontier` to `end`, so
+// the cheaper victim is the one with the smaller weight / (end - frontier + 1),
+// compared cross-multiplied. #4503 measured this ratio with a STATIC read
+// count and rejected it: it traded a value carried by an inner loop for one
+// with more textual reads in cold code (`bench/cases/json` +1.30% cycles,
+// `matrix` +0.86%, x86-64 `sort` +3.14% wall), and named loop depth as the
+// missing term. Without the ratio, furthest-end-first alone spilled
+// `bench/cases/strings`' Builder handle, read on every inner-loop lap, to keep
+// an outer-loop counter whose range merely ended sooner (#5949 dropped the
+// counter's dead block params): +2.02% instructions.
 //
-// So on a tie, spill the one READ FEWEST TIMES. Under the single-location model
-// `uses` is exactly the number of reloads spilling it costs, and the register
-// time freed is `end - frontier`, which is EQUAL for the two by construction —
-// that is what the tie is. So on this subset, and only on this subset, the use
-// count is the whole of the cost difference.
-//
-// IT DELIBERATELY STOPS THERE. The obvious generalisation — rank every
-// candidate by (1 + uses) / (end - frontier + 1) — was implemented and
-// measured, and it is NOT safe: `uses` is a STATIC count with no execution
-// frequency in it, so it will trade a value carried by an inner loop for one
-// with more textual reads in cold code. Measured on this branch against `main`,
-// interleaved with a byte-identical null control under `boxlock solo`: it cut
-// arm64 reload sites 11117 -> 6201 and still cost `bench/cases/json` +1.30% to
-// +1.41% cycles over three sweeps and `matrix` +0.86% to +1.05%, with x86-64
-// `sort` +3.14% to +4.91% wall clock. `matrix`'s own disassembly names the
-// mechanism: the value it newly spilled is carried by the MIDDLE loop, so its
-// one "store at the definition" is a store per iteration. Weighing a use by
-// loop depth is the missing term, and until it exists the wider rule is a
-// regression wearing a better static number.
-//
-// WITH `uses` UNIFORMLY ZERO THIS IS THE OLD RULE, TERM FOR TERM — the tie
-// resolves to `false` and every caller that does not track uses
-// (ircheckregalloc.bit's `mkIv`) keeps exactly the documented behaviour.
-// Verified, not asserted: with the second clause reduced to `false`, all 28
-// bench objects across both targets are byte-identical to `main`.
+// FURTHEST END, THEN FEWEST READS, break a ratio tie. That is Poletto &
+// Sarkar's rule and #4503's tie-break, and with `weight` uniformly zero
+// (ircheckregalloc.bit's `mkIv`) every ratio ties, so it is the old rule term
+// for term. `forceParamInterference` (codegenlive.bit) gives every parameter
+// of one block an identical range, which is where equal ends come from.
 //
 // #4666 puts ONE clause ahead of all of it, and it is a different kind of
-// statement from the two below. Those rank two costs against each other; this
-// one says a `remat` interval HAS no cost — evicting it emits no store and no
-// reload, so its register is free to take whatever its end point or read count.
-// Without it a constant with a function-long range is the interval the
-// furthest-end rule protects hardest, which is how `_m10$hpackHuffCode` reached
-// 303 spill/reload sites and a 0x160 frame under #4281's CSE: 662 constants
-// held the register file and the real values went to the stack. With `remat`
-// uniformly false this is the #4503 rule term for term.
-//
-// It is also the one ranking here that needs NO execution frequency, which is
-// what the paragraph above says the wider (1 + uses) / register-time rule
-// lacked. Per USE, a rematerialized read is one `mov` and a reloaded read is
-// one `ldr`; the spill of a real value additionally costs a store. So evicting
-// the constant instead is no worse at every single use site, at every loop
-// depth. There is no weighting that reverses it.
-fn preferSpill(a: LiveInterval, b: LiveInterval): bool {
+// statement: a `remat` interval HAS no cost — evicting it emits no store and
+// no reload, so its register is free to take whatever its ratio. Without it a
+// constant with a function-long range is the interval the furthest-end rule
+// protects hardest, which is how `_m10$hpackHuffCode` reached 303 spill/reload
+// sites and a 0x160 frame under #4281's CSE: 662 constants held the register
+// file and the real values went to the stack. Per USE, a rematerialized read
+// is one `mov` and a reloaded read is one `ldr`; the spill of a real value
+// additionally costs a store. No weighting reverses it.
+fn preferSpill(a: LiveInterval, b: LiveInterval, frontier: int): bool {
   if (a.remat != b.remat) {
     return a.remat
+  }
+  assert(a.end >= frontier && b.end >= frontier) // active intervals are unexpired
+  let costA = a.weight * (b.end - frontier + 1)
+  let costB = b.weight * (a.end - frontier + 1)
+  if (costA != costB) {
+    return costA < costB
   }
   if (a.end != b.end) {
     return a.end > b.end
@@ -351,7 +341,7 @@ fn preferSpill(a: LiveInterval, b: LiveInterval): bool {
 // evicting was already in the allowed set, and keeping the scan general is what
 // stops a future clobber model (a per-register clobber, say) turning that into
 // a miscompile.
-fn cheapestActiveIn(s: ClassState, scan: []LiveInterval, allowed: int): int {
+fn cheapestActiveIn(s: ClassState, scan: []LiveInterval, allowed: int, frontier: int): int {
   let best = -1
   let k = s.len
   while (k > 0) {
@@ -359,7 +349,7 @@ fn cheapestActiveIn(s: ClassState, scan: []LiveInterval, allowed: int): int {
     if (((allowed >> s.active[k].reg) & 1) != 1) {
       continue
     }
-    if (best < 0 || preferSpill(scan[s.active[k].idx], scan[s.active[best].idx])) {
+    if (best < 0 || preferSpill(scan[s.active[k].idx], scan[s.active[best].idx], frontier)) {
       best = k
     }
   }
@@ -434,7 +424,7 @@ fn copyIntervals(intervals: []LiveInterval): []LiveInterval {
       LiveInterval{
         vreg = iv.vreg, regClass = iv.regClass, start = iv.start,
         end = iv.end, isRef = iv.isRef, uses = iv.uses, remat = iv.remat,
-        heapDerived = iv.heapDerived,
+        heapDerived = iv.heapDerived, weight = iv.weight, freq = iv.freq,
       },
     )
     i = i + 1
@@ -477,6 +467,7 @@ fn mergeAliases(scan: []LiveInterval, posOf: []int, roots: []int): []bool {
       // spilling the root reloads at the alias's use sites too. Leaving them
       // behind would price a coalesced interval below what it costs.
       scan[rp].uses = scan[rp].uses + scan[i].uses
+      scan[rp].weight = scan[rp].weight + scan[i].weight
       // #4666: and the root loses `remat`. Rematerialization is per-USE and
       // reads the DEFINITION of the vreg being read — `getInt` asks
       // `rematSpilledConst(cx, vreg, ...)` about `f.instrs[vreg]`. An alias
@@ -681,8 +672,8 @@ fn allocateCoalesced(
       oi = oi + 1
       continue
     }
-    let victim = cheapestActiveIn(state, scan, allowed)
-    if (victim < 0 || !preferSpill(scan[state.active[victim].idx], iv)) {
+    let victim = cheapestActiveIn(state, scan, allowed, iv.start)
+    if (victim < 0 || !preferSpill(scan[state.active[victim].idx], iv, iv.start)) {
       // Nothing active is worth evicting — the allowed subset is empty, or `iv`
       // is itself the cheapest thing here to put on the stack. SpillAtInterval's
       // "else" branch, reached through the same predicate that ranked the
