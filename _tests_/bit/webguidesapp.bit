@@ -1,0 +1,226 @@
+// _tests_/bit/webguidesapp.bit — `./make test-web-guides-app` (#6062, epic
+// #6061). Provisions its OWN PostgreSQL server, the same shape
+// `_tests_/bit/redislive.bit` already established for pkg/redis: a
+// throwaway `docker run --rm -d` container, PING-polled ready (here,
+// `pg_isready`), handed to pkg/web/guides/inkwell/app.test.bit as
+// `DATABASE_URL`, then always removed — see `cleanup()` for exactly what
+// "always" covers.
+//
+// IMAGE: `postgres:18.6` (PostgreSQL 18, the newest stable major per
+// https://www.postgresql.org/ as of 2026-09-27 — 18, 17, 16, 15, 14 are all
+// still published on Docker Hub, no 19 yet), pinned BY DIGEST so a retag
+// upstream cannot silently change what this gate runs against:
+//
+//   postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+//
+// That digest is the MANIFEST-LIST digest (verified against Docker Hub's
+// `/tags/18.6` response: `images[]` carries amd64/arm64/386/ppc64le/s390x/
+// arm/riscv64 entries under one top-level `digest`), not one architecture's
+// image, so it resolves on any host `docker run` does. Re-verify before
+// bumping:
+//   curl -s https://hub.docker.com/v2/repositories/library/postgres/tags/<version> | jq .digest
+//
+// THE IMAGE ITSELF IS KEPT, never deleted by this gate — same reasoning as
+// redislive.bit's own header: only the ONE container this run starts is
+// throwaway.
+//
+// WITHOUT DOCKER: no `docker` binary at any of `dockerCandidates()`, or
+// `docker info` failing — prints "skipped: docker unavailable" and exits 0.
+//
+// CLEANUP: the container this run starts is named with a run-local UUID AND
+// labelled `bit.inkwell.live=1`; `cleanup()` removes it on every path this
+// PROCESS controls. `sweepOrphans()` runs FIRST, force-removing every
+// `bit.inkwell.live=1` container left over from an interrupted prior run —
+// see redislive.bit's own header for why this is the honest mitigation
+// rather than a promise a `kill -9` could break.
+//
+// ENV vars (`./make test-web-guides-app` sets the first two,
+// tools/build/gatestable2.bit):
+//   BIT_REPO   repo root, so pkg/web/guides/inkwell resolves regardless of cwd (required)
+//   BIT_BIN    compiler under test    (default bit-out/bin/bit)
+//
+// Runs the test suite the same way redislive.bit runs pkg/redis's:
+// `/usr/bin/env DATABASE_URL=... <bit> test <repo>/pkg/web/guides/inkwell`
+// — `bit test` inherits no argv, so the child needs its own env set by
+// `env(1)`, not a CLI flag (proved in isolation on #6021, redislive.bit's
+// own header).
+
+import { output } from "std/process"
+import { env, envOr, exit } from "std/os"
+import { exists } from "std/fs"
+import { lastIndexOf, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { sleep, Millisecond } from "std/time"
+
+const image: string = "postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"
+const runLabel: string = "bit.inkwell.live=1"
+// Bounded poll: 40 * 500ms = 20s, generous for a local daemon-managed
+// pull-and-boot that already completed before pg_isready is tried.
+const readyAttempts: int = 40
+const readyDelayMs: int = 500
+const dockerQuickTimeoutMs: int = 10000
+const dockerRunTimeoutMs: int = 30000
+const testRunTimeoutMs: int = 180000
+
+const pgUser: string = "inkwell"
+const pgDb: string = "inkwell"
+
+// BIT_REPO IS REQUIRED, same reason as _tests_/bit/redislive.bit and
+// _tests_/bit/packagesgate.bit: falling back to "." would silently test
+// whatever directory `bit` happened to be invoked from instead of refusing.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("webguidesapp: BIT_REPO is not set — run this through `./make test-web-guides-app`")
+  }
+  return r
+}
+
+fn findBin(candidates: []string): string {
+  let i = 0
+  while (i < len(candidates)) {
+    if (exists(candidates[i])) {
+      return candidates[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn dockerCandidates(): []string {
+  return ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/usr/bin/docker"]
+}
+
+fn dockerBin(): string {
+  return findBin(dockerCandidates())
+}
+
+fn dockerAvailable(bin: string): bool {
+  if (bin == "") {
+    return false
+  }
+  let r = output(bin, ["info"], dockerQuickTimeoutMs)
+  return r.exitCode == 0
+}
+
+// Force-removes every container this harness has ever labelled, before this
+// run starts its own — see the header's CLEANUP section.
+fn sweepOrphans(bin: string) {
+  let r = output(bin, ["ps", "-aq", "--filter", "label=${runLabel}"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    return
+  }
+  for id of split(trimSpace(r.stdout), "\n") {
+    if (id == "") {
+      continue
+    }
+    output(bin, ["rm", "-f", id], dockerRunTimeoutMs)
+  }
+}
+
+fn dockerRun(bin: string, args: []string): ()! {
+  let r = output(bin, args, dockerRunTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker ${args[0]}: ${trimSpace(r.stderr)}")
+  }
+}
+
+fn hostPort(bin: string, name: string): int! {
+  let r = output(bin, ["port", name, "5432/tcp"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker port ${name}: ${trimSpace(r.stderr)}")
+  }
+  let lines = split(trimSpace(r.stdout), "\n")
+  if (len(lines) == 0 || lines[0] == "") {
+    fail newError("docker port ${name}: no mapping printed")
+  }
+  let colon = lastIndexOf(lines[0], ":")
+  if (colon < 0) {
+    fail newError("docker port ${name}: unexpected output '${lines[0]}'")
+  }
+  return parseInt(lines[0][colon + 1:])?
+}
+
+fn pingReady(bin: string, name: string): bool {
+  let i = 0
+  while (i < readyAttempts) {
+    let r = output(bin, ["exec", name, "pg_isready", "-U", pgUser, "-d", pgDb], dockerQuickTimeoutMs)
+    if (r.exitCode == 0) {
+      return true
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  return false
+}
+
+fn startPostgres(bin: string, name: string, password: string): int! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel,
+      "-p", "127.0.0.1:0:5432", "-e", "POSTGRES_PASSWORD=${password}", "-e", "POSTGRES_USER=${pgUser}",
+      "-e", "POSTGRES_DB=${pgDb}", image,
+    ],
+  )?
+  let port = hostPort(bin, name)?
+  let ready = pingReady(bin, name)
+  if (!ready) {
+    fail newError("${name}: pg_isready never succeeded within ${readyAttempts * readyDelayMs}ms")
+  }
+  return port
+}
+
+// Always removes the container — `--rm` already means a stopped one
+// vanishes, `rm -f` handles a still-running one too. Called from every path
+// through `main()`, success or failure alike.
+fn cleanup(bin: string, name: string) {
+  output(bin, ["rm", "-f", name], dockerRunTimeoutMs)
+}
+
+// `bit test` on the DIRECTORY (SPEC §17.1): pkg/web/guides/inkwell's own
+// *.bit files (config.bit, db.bit, users.bit, ...) are siblings of
+// app.test.bit and part of the same module. Sets DATABASE_URL for exactly
+// the child this spawns (the file header's ENV section, and
+// redislive.bit's identical reasoning for REDIS_TEST_URL).
+fn runTests(bitPath: string, repo: string, databaseUrl: string): int {
+  let r = output(
+    "/usr/bin/env",
+    [
+      "DATABASE_URL=${databaseUrl}", bitPath, "test", "${repo}/pkg/web/guides/inkwell",
+    ],
+    testRunTimeoutMs,
+  )
+  print(r.stdout)
+  eprint(r.stderr)
+  return r.exitCode
+}
+
+fn main() {
+  let bin = dockerBin()
+  if (!dockerAvailable(bin)) {
+    print("skipped: docker unavailable\n")
+    exit(0)
+    return
+  }
+  sweepOrphans(bin)
+
+  let repo = repoRoot()
+  let bitPath = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
+  let runId = uuidFormat(uuidV4())
+  let name = "bit-inkwell-live-${runId}"
+  let password = uuidFormat(uuidV4())
+
+  let port = startPostgres(bin, name, password) catch e {
+    eprint("webguidesapp: ${e.message()}\n")
+    cleanup(bin, name)
+    exit(1)
+    return
+  }
+
+  let databaseUrl = "postgres://${pgUser}:${password}@127.0.0.1:${port}/${pgDb}?sslmode=disable"
+  let rc = runTests(bitPath, repo, databaseUrl)
+
+  cleanup(bin, name)
+  exit(rc)
+}
