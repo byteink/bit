@@ -1,0 +1,252 @@
+// pkg/redis/resp3.bit — the ten RESP3 reply types `resp.bit`'s RESP2 decoder
+// does not know: null, boolean, double, big number, blob error, verbatim
+// string, map, set, push and attribute (RESP3.md: `_ # , ( ! = % ~ > |`).
+// Split out of `resp.bit` purely for spec/LINT.md's 800-line file ceiling and
+// 10-per-function complexity ceiling (#6018) — this is the same module as
+// `resp.bit` (SPEC §17.1), so `Reply`, `byteSource`, `decodeReplyAt`,
+// `readBlob`, `decodeReplies` and the three bound constants are all already
+// in scope here with no import.
+//
+// `indexOf`/`parseInt` (std/strings) are already imported module-wide by
+// `resp.bit` — an import binds per MODULE (SPEC §17.1), so re-importing
+// either here is E0042. `decodeDouble` below uses the PREDECLARED
+// `parseFloat` builtin (SPEC §5.3), not std/strings' own export of the same
+// name, so no import is needed for it at all — importing std/strings'
+// version would shadow the builtin (E0048) for no benefit, since the
+// builtin already does exactly what a double body needs: parse decimal
+// float text, unfallibly, with `v != v` marking a failed parse.
+
+// One key/value pair of a RESP3 map (`%`), in wire order. RESP3 map keys can
+// be any `Reply`, not just a string, so this cannot be a `map<K,V>` — `Reply`
+// is not even a valid map key type, since its `Array`/`Set`/`Map`/`Push`
+// variants carry slices, and a payload-carrying enum with a non-comparable
+// payload is itself non-comparable (SPEC §14.6) — and order must survive a
+// round trip regardless, the same reason `stdlib/json`'s `JsonEntry` is a
+// class rather than a `map<string, Json>`.
+export class MapEntry { export key: Reply, export value: Reply }
+
+// The three tag-membership tests below are their own functions, not inlined
+// as `||`-chained conditions in `decodeReplyExt`, purely so their `||`s
+// count against THEIR complexity budget instead of stacking onto the
+// dispatcher's (spec/LINT.md's `max-complexity` counts every `||`).
+fn isScalarTag(tag: byte): bool {
+  return tag == '_' || tag == '#' || tag == ',' || tag == '('
+}
+
+fn isBlobTag(tag: byte): bool {
+  return tag == '!' || tag == '='
+}
+
+fn isAggregateTag(tag: byte): bool {
+  return tag == '%' || tag == '~' || tag == '>' || tag == '|'
+}
+
+// Dispatches every RESP3 tag byte `decodeReplyAt` doesn't already handle
+// itself (RESP2's five). Split into three groups purely to keep each
+// function's cyclomatic complexity low: `decodeExtScalar` (no I/O beyond the
+// header line already read), `decodeExtBlob` ($-framed: blob error,
+// verbatim string), `decodeExtAggregate` (nested: map, set, push,
+// attribute).
+fn decodeReplyExt(
+  tag: byte,
+  body: string,
+  s: byteSource,
+  buf: string,
+  depth: int,
+): (Reply, string)! {
+  if (isScalarTag(tag)) {
+    let r = decodeExtScalar(tag, body)?
+    return r, buf
+  }
+  if (isBlobTag(tag)) {
+    let (item, next) = decodeExtBlob(tag, body, s, buf)?
+    return item, next
+  }
+  if (isAggregateTag(tag)) {
+    let (item, next) = decodeExtAggregate(tag, body, s, buf, depth)?
+    return item, next
+  }
+  fail newError("resp: unknown reply type byte '${tag}'")
+}
+
+fn decodeExtScalar(tag: byte, body: string): Reply! {
+  if (tag == '_') {
+    return Reply.Null
+  }
+  if (tag == '#') {
+    let r = decodeBool(body)?
+    return r
+  }
+  if (tag == ',') {
+    let r = decodeDouble(body)?
+    return r
+  }
+  let r = decodeBigNumber(body)?
+  return r
+}
+
+// `#t\r\n` / `#f\r\n` — a boolean carries no length prefix, just its one
+// body byte.
+fn decodeBool(body: string): Reply! {
+  if (body == "t") {
+    return Reply.Bool(true)
+  }
+  if (body == "f") {
+    return Reply.Bool(false)
+  }
+  fail newError("resp: bad boolean '${body}'")
+}
+
+// `,3.14\r\n`; `inf`/`-inf`/`nan` are RESP3's literal spellings for the two
+// infinities and NaN, so they are matched before falling through to the
+// predeclared `parseFloat`, which does not understand them (it parses
+// decimal/hex float TEXT, §5.3, not these three special words). `parseFloat`
+// is not fallible — a failed parse is a quiet NaN, distinguished with
+// `v != v` — so an actually-NaN double body (`nan`, handled above) never
+// reaches this branch to be misread as a parse failure.
+fn decodeDouble(body: string): Reply! {
+  if (body == "inf") {
+    return Reply.Double(1.0 / 0.0)
+  }
+  if (body == "-inf") {
+    return Reply.Double(0.0 - 1.0 / 0.0)
+  }
+  if (body == "nan") {
+    return Reply.Double(0.0 / 0.0)
+  }
+  let v = parseFloat(body)
+  if (v != v) {
+    fail newError("resp: bad double '${body}'")
+  }
+  return Reply.Double(v)
+}
+
+// `(3492890328409238509324850943850943825024385\r\n` — kept as a decimal
+// string, never parsed into an integer: the whole point of RESP3's big
+// number is that it does not fit in any fixed-width type this codec has.
+// Still validated as an actual (optionally signed) decimal so a malformed
+// body fails loudly instead of a caller trusting garbage.
+fn decodeBigNumber(body: string): Reply! {
+  if (len(body) == 0) {
+    fail newError("resp: empty big number")
+  }
+  let start = 0
+  if (body[0] == '-') {
+    start = 1
+  }
+  if (start >= len(body)) {
+    fail newError("resp: big number missing digits")
+  }
+  let i = start
+  while (i < len(body)) {
+    if (body[i] < '0' || body[i] > '9') {
+      fail newError("resp: bad big number '${body}'")
+    }
+    i = i + 1
+  }
+  return Reply.BigNumber(body)
+}
+
+fn decodeExtBlob(tag: byte, body: string, s: byteSource, buf: string): (Reply, string)! {
+  if (tag == '!') {
+    let (item, next) = decodeBlobError(s, body, buf)?
+    return item, next
+  }
+  let (item, next) = decodeVerbatim(s, body, buf)?
+  return item, next
+}
+
+// `!21\r\nSYNTAX invalid syntax\r\n` — a blob error is framed exactly like a
+// bulk string (length-prefixed, CRLF-safe body) but is semantically an
+// error, so it decodes into the same `Reply.Err` a simple `-` error does;
+// a caller already handles one error shape, not two.
+fn decodeBlobError(s: byteSource, body: string, buf: string): (Reply, string)! {
+  let n = parseInt(body) catch _ {
+    fail newError("resp: bad blob error length '${body}'")
+  }
+  if (n < 0) {
+    fail newError("resp: negative blob error length ${n}")
+  }
+  let (data, rest) = readBlob(s, buf, n)?
+  return Reply.Err(data), rest
+}
+
+// `=15\r\ntxt:Some string\r\n` — the first 3 bytes are a fixed-width type tag
+// (`txt`, `mkd`, ...), then `:`, then the actual text. Both halves are kept:
+// `Verbatim(kind, text)`.
+fn decodeVerbatim(s: byteSource, body: string, buf: string): (Reply, string)! {
+  let n = parseInt(body) catch _ {
+    fail newError("resp: bad verbatim length '${body}'")
+  }
+  if (n < 4) {
+    fail newError("resp: verbatim string too short for its type prefix (${n})")
+  }
+  let (data, rest) = readBlob(s, buf, n)?
+  if (data[3] != ':') {
+    fail newError("resp: verbatim string missing ':' after its type prefix")
+  }
+  return Reply.Verbatim(data[0:3], data[4:n]), rest
+}
+
+fn decodeExtAggregate(
+  tag: byte,
+  body: string,
+  s: byteSource,
+  buf: string,
+  depth: int,
+): (Reply, string)! {
+  let n = parseInt(body) catch _ {
+    fail newError("resp: bad aggregate length '${body}'")
+  }
+  if (n < 0) {
+    fail newError("resp: negative aggregate length ${n}")
+  }
+  if (tag == '%') {
+    let (item, next) = decodeMap(s, n, buf, depth)?
+    return item, next
+  }
+  if (tag == '|') {
+    let (item, next) = decodeAttribute(s, n, buf, depth)?
+    return item, next
+  }
+  let (items, next) = decodeReplies(s, n, buf, depth)?
+  if (tag == '~') {
+    return Reply.Set(items), next
+  }
+  return Reply.Push(items), next
+}
+
+// Reads `n` key/value pairs — shared by a RESP3 map (`%`) and the metadata
+// half of an attribute (`|`), which is framed identically.
+fn decodeMapEntries(s: byteSource, n: int, buf: string, depth: int): ([]MapEntry, string)! {
+  if (n > maxAggregateLen) {
+    fail newError("resp: map length ${n} exceeds max ${maxAggregateLen}")
+  }
+  let entries = []MapEntry(0)
+  let rest = buf
+  let i = 0
+  while (i < n) {
+    let (key, afterKey) = decodeReplyAt(s, rest, depth + 1)?
+    let (value, afterValue) = decodeReplyAt(s, afterKey, depth + 1)?
+    entries = append(entries, MapEntry{ key = key, value = value })
+    rest = afterValue
+    i = i + 1
+  }
+  return entries, rest
+}
+
+fn decodeMap(s: byteSource, n: int, buf: string, depth: int): (Reply, string)! {
+  let (entries, rest) = decodeMapEntries(s, n, buf, depth)?
+  return Reply.Map(entries), rest
+}
+
+// `|` prefixes the reply it describes: decode the attribute's own map, then
+// decode the reply that follows it, and hand both back wrapped in one
+// `Reply.Attribute` — so a caller can never mistake the attribute map for
+// the actual reply it decorates, and the attribute is never silently
+// dropped on the floor.
+fn decodeAttribute(s: byteSource, n: int, buf: string, depth: int): (Reply, string)! {
+  let (entries, afterMap) = decodeMapEntries(s, n, buf, depth)?
+  let (inner, rest) = decodeReplyAt(s, afterMap, depth + 1)?
+  return Reply.Attribute(entries, inner), rest
+}
