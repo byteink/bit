@@ -1,0 +1,319 @@
+// pkg/web/guides/inkwell/articles.bit — the `Article` entity and its five
+// routes (#6062, epic #6061, course parts 8 "Querying and CRUD", 9
+// "Relationships", 14 "Pagination, filtering and sorting" and 15
+// "Transactions"). `POST /articles` is the one transaction the course
+// asks for: insert the article, find-or-create each tag by name, and
+// attach them, all inside one `pool.tx(...)` block.
+import {
+  RelationLoader, attach, belongsTo, manyToManyLoader, update, withRelations,
+  delete as ormDelete,
+} from "orm"
+import { page } from "web"
+import { asInt } from "std/sql"
+import { newBuilder } from "std/strings"
+
+@table @timestamps class Article {
+  @id
+  id: i64
+  title: string
+  slug: string
+  body: string
+  authorId: i64
+  @belongsTo("authorId")
+  author: User
+  @manyToMany("article_tags")
+  tags: []Tag
+  createdAt: i64
+  updatedAt: i64
+}
+
+fn authorPlaceholder(): User {
+  return User{
+    id = 0, username = "", email = "", passwordHash = "", role = "", createdAt = 0, updatedAt = 0,
+  }
+}
+
+fn articlePlaceholder(): Article {
+  return Article{
+    id = 0, title = "", slug = "", body = "", authorId = 0, author = authorPlaceholder(),
+    createdAt = 0, updatedAt = 0,
+  }
+}
+
+fn articleDesc(): TableDesc {
+  return TableDesc{
+    table = "articles", fields = articlePlaceholder().tableDescriptor(), classAttrs = []AttrDesc(0),
+  }
+}
+
+fn articleValues(a: Article): map<string, Value> {
+  return map<string, Value>{
+    "id": Value.Int(a.id), "title": Value.Text(a.title), "slug": Value.Text(a.slug),
+    "body": Value.Text(a.body), "authorId": Value.Int(a.authorId),
+  }
+}
+
+fn articleMapper(rows: Rows): Article! {
+  let cols = rows.columns()
+  return Article{
+    id = sqlReqInt(rows, cols, "id")?,
+    title = sqlReqText(rows, cols, "title")?,
+    slug = sqlReqText(rows, cols, "slug")?,
+    body = sqlReqText(rows, cols, "body")?,
+    authorId = sqlReqInt(rows, cols, "author_id")?,
+    author = authorPlaceholder(),
+    createdAt = sqlReqInt(rows, cols, "created_at")?,
+    updatedAt = sqlReqInt(rows, cols, "updated_at")?,
+  }
+}
+
+fn authorLoader(): RelationLoader<Article> {
+  return belongsTo<Article, User>(
+    (a) => a.authorId, (db) => users(db), "id", (u) => u.id, (a, u) => { a.author = u },
+  )
+}
+
+fn tagsLoader(): RelationLoader<Article> {
+  return manyToManyLoader<Article, Tag>(
+    (a) => a.id, articleTagsDesc(), tagMapper, (a, ts) => { a.tags = ts },
+  )
+}
+
+fn articles(db: Data): Query<Article> {
+  return withRelations(
+    find<Article>(db, "articles", articleDesc().fields, articleMapper),
+    map<string, RelationLoader<Article>>{ "author": authorLoader(), "tags": tagsLoader() },
+  )
+}
+
+fn findArticleById(db: Data, id: i64): Article! {
+  return articles(db).with("author").with("tags").where("id", Value.Int(id)).oneOrFail()?
+}
+
+export @json class ArticleView {
+  id: i64,
+  title: string,
+  slug: string,
+  body: string,
+  authorId: i64,
+  authorUsername: string,
+  tags: []TagView,
+}
+
+fn toArticleView(a: Article): ArticleView {
+  let tagViews = []TagView(0)
+  for t of a.tags {
+    tagViews = append(tagViews, toTagView(t))
+  }
+  return ArticleView{
+    id = a.id, title = a.title, slug = a.slug, body = a.body, authorId = a.authorId,
+    authorUsername = a.author.username, tags = tagViews,
+  }
+}
+
+// A stable, lowercase, hyphenated slug: only `a`-`z`, `0`-`9` survive; every
+// other byte becomes one `-`, and runs collapse to one. The `id` suffix
+// (appended after insert, by `createArticle`) is what actually guarantees
+// uniqueness; this alone is cosmetic.
+fn slugify(title: string): string {
+  let b = newBuilder()
+  let lastDash = false
+  let i = 0
+  while (i < len(title)) {
+    let ch = title[i]
+    let lower = ch
+    if (ch >= 'A' && ch <= 'Z') {
+      lower = ch + 32
+    }
+    if ((lower >= 'a' && lower <= 'z') || (lower >= '0' && lower <= '9')) {
+      b.writeByte(lower)
+      lastDash = false
+    } else if (!lastDash) {
+      b.writeByte('-')
+      lastDash = true
+    }
+    i = i + 1
+  }
+  return b.toString()
+}
+
+@json class ArticleListItem {
+  id: i64,
+  title: string,
+  slug: string,
+  authorId: i64,
+  createdAt: i64,
+}
+
+fn toListItem(a: Article): ArticleListItem {
+  return ArticleListItem{
+    id = a.id, title = a.title, slug = a.slug, authorId = a.authorId, createdAt = a.createdAt,
+  }
+}
+
+const defaultLimit = 20
+const maxLimit = 100
+
+fn clampLimit(raw: string): int {
+  let n = parseInt(raw) catch _ { return defaultLimit }
+  if (n < 1) {
+    return defaultLimit
+  }
+  if (n > maxLimit) {
+    return maxLimit
+  }
+  return n
+}
+
+fn pageNumber(raw: string): int {
+  let n = parseInt(raw) catch _ { return 1 }
+  if (n < 1) {
+    return 1
+  }
+  return n
+}
+
+fn sortDir(raw: string): Dir {
+  if (raw == "oldest") {
+    return Dir.Asc
+  }
+  return Dir.Desc
+}
+
+// Filters, sorts and paginates in one pass: `author` narrows to one
+// writer's articles, `sort` picks `newest` (the default) or `oldest`, and
+// `page`/`limit` (capped at `maxLimit`) drive a plain offset window — see
+// pkg/orm/docs/query.md for why a fresh, unfiltered `articles(db)` value is
+// safe to reuse for both the `count()` and the `all()` below.
+fn filteredArticles(db: Data, c: Ctx): Query<Article> {
+  let q = articles(db).orderBy("createdAt", sortDir(c.query("sort")))
+  let authorRaw = c.query("author")
+  if (len(authorRaw) == 0) {
+    return q
+  }
+  let authorId = parseInt(authorRaw) catch _ { return q }
+  return q.where("authorId", Value.Int(authorId))
+}
+
+fn listArticles(c: Ctx, db: Data): Res! {
+  let limit = clampLimit(c.query("limit"))
+  let pageNum = pageNumber(c.query("page"))
+  let q = filteredArticles(db, c)
+  let total = q.count()?
+  let rows = q.limit(limit).offset((pageNum - 1) * limit).all()?
+  let out = []ArticleListItem(0)
+  for a of rows {
+    out = append(out, toListItem(a))
+  }
+  return page(out, total, limit, "${pageNum + 1}")
+}
+
+fn showArticle(c: Ctx, db: Data): Res! {
+  let id = parseId(c.param("id")) catch _ {
+    fail badRequest("id must be an integer")
+  }
+  let a = findArticleById(db, id) catch _ {
+    fail notFound("no article with that id")
+  }
+  return c.json(toArticleView(a))
+}
+
+export @json class CreateArticleInput {
+  @minLen(1)
+  title: string
+
+  body: string
+
+  tags: []string
+}
+
+fn intOf(v: Value): i64! {
+  return asInt(v)?
+}
+
+// The one transaction the course asks for (part 15): the article row, its
+// generated id, the slug that embeds it, and every tag it names all commit
+// together or not at all.
+fn insertArticle(db: Data, authorId: i64, input: CreateArticleInput): i64! {
+  let a = Article{
+    id = 0, title = input.title, slug = "pending", body = input.body, authorId = authorId,
+    author = authorPlaceholder(), createdAt = 0, updatedAt = 0,
+  }
+  let desc = articleDesc()
+  let values = articleValues(a)
+  let withStamps = applyTimestamps(desc, values, false, a.tableAttrs(), now())?
+  let result = save(db, withStamps, values, false)?
+  let (idVal, ok) = result.generated["id"]
+  let newId = 0
+  if (ok) {
+    newId = intOf(idVal)?
+  }
+  update<Article>(db, "articles", desc.fields).where("id", Value.Int(newId)).set(
+    "slug",
+    Value.Text("${slugify(input.title)}-${newId}"),
+  ).run()?
+  attachTagNames(db, newId, input.tags)?
+  return newId
+}
+
+fn attachTagNames(db: Data, articleId: i64, names: []string): ()! {
+  let ids = []i64(0)
+  for name of names {
+    let t = findOrCreateTag(db, name)?
+    ids = append(ids, t.id)
+  }
+  if (len(ids) == 0) {
+    return
+  }
+  attach(db, articleTagsDesc(), articleId, ids, ServerDialect.Postgres)?
+}
+
+fn createArticle(c: Ctx, pool: Pool): Res! {
+  let uid = currentUserId(c)?
+  let input = c.body<CreateArticleInput>()?
+  let newId = pool.txValue<i64>((db) => insertArticle(db, uid, input))?
+  return c.createdUrl("/articles/${newId}")
+}
+
+export @json class UpdateArticleInput {
+  title: string,
+  body: string,
+}
+
+fn updateArticle(c: Ctx, db: Data): Res! {
+  let id = parseId(c.param("id")) catch _ {
+    fail badRequest("id must be an integer")
+  }
+  let existing = findArticleById(db, id) catch _ {
+    fail notFound("no article with that id")
+  }
+  requireOwnerOrAdmin(c, existing.authorId)?
+  let input = c.body<UpdateArticleInput>()?
+  update<Article>(db, "articles", articleDesc().fields).where("id", Value.Int(id)).set(
+    "title",
+    Value.Text(input.title),
+  ).set("body", Value.Text(input.body)).run()?
+  let refreshed = findArticleById(db, id)?
+  return c.json(toArticleView(refreshed))
+}
+
+fn deleteArticle(c: Ctx, db: Data): Res! {
+  let id = parseId(c.param("id")) catch _ {
+    fail badRequest("id must be an integer")
+  }
+  let existing = findArticleById(db, id) catch _ {
+    fail notFound("no article with that id")
+  }
+  requireOwnerOrAdmin(c, existing.authorId)?
+  ormDelete(db, articleDesc(), articleValues(existing))?
+  return c.noContent()
+}
+
+export fn mountArticles(app: App, db: Data, pool: Pool) {
+  let group = app.group("/articles")
+  group.get("/", (c) => listArticles(c, db))
+  group.get("/:id", (c) => showArticle(c, db))
+  group.post("/", (c) => createArticle(c, pool))
+  group.put("/:id", (c) => updateArticle(c, db))
+  group.delete("/:id", (c) => deleteArticle(c, db))
+}
