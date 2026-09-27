@@ -654,7 +654,12 @@ case "${BUCKET}" in
     # this wiring alone did not close the gap for that direction; #5606
     # closed it by adding `test-package-tags` to the `selfhost`, `runtime`
     # and `stdlib` buckets too (see each bucket's own comment above).
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags)
+    #
+    # test-web-jsonappend (#5994) is the eighth: pkg/web's tests again with
+    # BIT_JSON_APPEND=1, the only run of `c.json`'s direct path until that
+    # flag defaults on. Its argv is packagesgate.bit, like test-packages, so
+    # no pkg/ path names it and it is added here by hand.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-web-jsonappend)
     ;;
   spec)
     # test-fmt-citations (#5615) is spec's second gate. test-spec alone is a
