@@ -82,6 +82,11 @@ protected route that is not itself doing the authenticating just reads
   discovery document and key set `OidcStrategy` is built from, and the ID
   token verifier, for a client that already holds a token and skips the
   redirect flow.
+- `Secret`, `generateSecret`, `parseSecret`, `provisioningUri`,
+  `provisioningUriWith`, `hotp`, `totp`, `verify`, `Algorithm`, `sha1` - TOTP
+  (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
+  verifying a submitted code with a skew window and caller-owned replay
+  protection.
 
 Every one of these is used in a full example in [`docs/`](docs/README.md),
 along with the security properties this package enforces (PKCE, constant-time
