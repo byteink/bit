@@ -14,20 +14,30 @@ already lives on the app. `openApi()` reads that table directly, so this
 much of the document needs nothing from you:
 
 ```bit
-import { App, Config, Ctx, Res, OpenApiInfo } from "web"
+import { App, Config, Ctx, Res, ReplyHandler, OpenApiInfo } from "web"
 import { env } from "std/os"
+import { jsonEncode } from "std/json"
 
 fn showArticle(c: Ctx): Res! {
   return c.text("article ${c.param("id")}")
 }
 
+fn serveOpenApi(app: App): ReplyHandler {
+  return (c) => {
+    let doc = app.openApi(
+      OpenApiInfo{
+        title = "Inkwell",
+        version = "1.0.0",
+        description = "A blogging API",
+      },
+    )?
+    return c.bytes(jsonEncode(doc), "application/json")
+  }
+}
+
 fn mount(app: App) {
   app.get("/articles/:id", showArticle)
-  app.get("/openapi.json", (c) => c.json(app.openApi(OpenApiInfo{
-    title = "Inkwell",
-    version = "1.0.0",
-    description = "A blogging API",
-  })?))
+  app.get("/openapi.json", serveOpenApi(app))
 }
 
 fn main(): ()! {
@@ -39,9 +49,9 @@ fn main(): ()! {
 
 `GET /articles/:id` becomes the path `/articles/{id}` with one required
 `path` parameter named `id`. `openApi()` fails if the router is not frozen
-yet, so the `/openapi.json` handler above calls it lazily, inside the
-closure: by the time a request reaches it, `listen()` has already frozen the
-route table - calling it eagerly, before `listen()`, would panic instead.
+yet, so `serveOpenApi`'s closure calls it lazily, inside the handler: by the
+time a request reaches it, `listen()` has already frozen the route table -
+calling it eagerly, before `listen()`, would panic instead.
 
 ## Request and response bodies, from a real instance
 
@@ -56,6 +66,7 @@ to the class changes what the document says the next time you build:
 ```bit
 import { App, Config, Ctx, Res, notFound } from "web"
 import { env } from "std/os"
+import { Json, JsonEntry } from "std/json"
 
 @json class Article {
   id: string,
@@ -104,9 +115,10 @@ an uninformative one.
 ## Serving it
 
 The example above mounts the document at `/openapi.json`, but the path is
-yours - `openApi()` returns a `Json` value, and `c.json(doc)` serves it like
-any other response. Point Swagger UI, Redoc, or any OpenAPI 3.1 client at
-that URL.
+yours - `openApi()` returns a `Json` value, not a `Jsonable`, so it goes out
+through `c.bytes(jsonEncode(doc), "application/json")` rather than
+`c.json(...)`. Point Swagger UI, Redoc, or any OpenAPI 3.1 client at that
+URL.
 
 ## Sharp edges
 
