@@ -3642,7 +3642,10 @@ fn truststoreBundledCount(): int {
 ### `TrustStore`
 
 A set of trust-anchor certificates. The `roots` field is exported so a caller can
-hand the anchors to a lower-level verifier or inspect them.
+hand the anchors to a lower-level verifier or inspect them. This is the one
+`TrustStore` type in the standard library (#6155): [`std/tls`](tls.md#-truststore-)
+imports it rather than declaring its own, so `newTlsConfig(systemRoots())`
+typechecks directly, with no conversion between two classes of the same name.
 
 ### `fromPem(pem: string): TrustStore!`
 
