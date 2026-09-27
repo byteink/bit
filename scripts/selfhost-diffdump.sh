@@ -90,17 +90,29 @@ diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
-# #5995: interface dispatch ids (`ifaceSigEnabled()`, compiler/lower.bit,
-# #5979) and bounds-check join resolution (`bceJoinEnabled()`,
-# compiler/optbce.bit, #5971) only change ir/iropt output. Tree default is on
-# since the 0.30.0 repin; the 0.30.0 ORACLE still defaults both off, so force
-# "1" on both sides here -- the one place they share an environment -- to
-# compare ON against ON. Remove these exports, and the flags themselves, at
-# the next repin.
+# #5995/#5976: interface dispatch ids (`ifaceSigEnabled()`,
+# compiler/lower.bit, #5979), bounds-check join resolution
+# (`bceJoinEnabled()`, compiler/optbce.bit, #5971) and dead block-param
+# pruning (`dceParamsEnabled()`, compiler/opt.bit, #5949) are all
+# post-typecheck passes (lowering/optimizer), so they only change ir/iropt
+# output. Tree default is on for all three since the 0.30.0 repin; the
+# 0.30.0 ORACLE still defaults them off, so force "1" on both sides here --
+# the one place they share an environment -- to compare ON against ON.
 if [ "$KIND" = ir ]; then
   export BIT_IFACE_SIG=1
   export BIT_BCE_JOIN=1
+  export BIT_DCE_PARAMS=1
 fi
+
+# The `@json` `__jsonAppend` direct encoder (`jsonAppendEnabled()`,
+# compiler/classjsonappend.bit, #5991) is different: it splices a whole
+# SYNTHESIZED METHOD, with its own typed body, onto every `@json` class
+# BEFORE typecheck, so it changes `--dump-types` output too, not just
+# ir/iropt (`types`'s KIND is its own value, not `ir` -- see the case table
+# above). Tree default is on since the 0.30.0 repin; force it on both sides
+# for every kind that runs the checker.
+export BIT_JSON_APPEND=1
+# Remove every export above, and the flags themselves, at the next repin.
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.

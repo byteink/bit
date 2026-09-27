@@ -656,9 +656,11 @@ case "${BUCKET}" in
     # and `stdlib` buckets too (see each bucket's own comment above).
     #
     # test-web-jsonappend (#5994) is the eighth: pkg/web's tests again with
-    # BIT_JSON_APPEND=1, the only run of `c.json`'s direct path until that
-    # flag defaults on. Its argv is packagesgate.bit, like test-packages, so
-    # no pkg/ path names it and it is added here by hand.
+    # BIT_JSON_APPEND=0, since #5976 flipped the default to on and
+    # test-packages/test-package-web now run at that default, covering
+    # `c.json`'s direct path but not its tree-path fallback. Its argv is
+    # packagesgate.bit, like test-packages, so no pkg/ path names it and it
+    # is added here by hand.
     BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-web-jsonappend)
     ;;
   spec)
