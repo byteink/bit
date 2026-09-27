@@ -3818,8 +3818,10 @@ assignment (like the map/channel two-result forms).
   - An interface target asks whether the dynamic type **satisfies** that
     interface, by the same structural rule as any other interface conversion
     (§14.3): `ok` is true when the concrete type's method set carries every
-    method the target declares. An interface declaring no methods is satisfied
-    by every non-nil value.
+    method the target declares, matched by **name AND signature** (parameter
+    and result types) - a method that only shares a name with the target's is
+    not a match, and `ok` is `false`. An interface declaring no methods is
+    satisfied by every non-nil value.
 - A target that cannot satisfy the receiver's interface is a **compile-time
   error**: the assertion could never succeed, so it is rejected rather than left
   to report `false` forever.
