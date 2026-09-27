@@ -5754,11 +5754,14 @@ param         = [ "..." ] IDENT ( ":" type [ "=" const_expr ] | "=" const_expr )
 extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
-member        = field | method_decl .
+member        = field | method_decl | static_method_decl .
 field         = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
-interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
+static_method_decl = [ "export" ] "static" "fn" IDENT [ generic_params ] signature block .
+interface_decl= "interface" IDENT [ generic_params ] "{" [ member_sig { fsep member_sig } [ fsep ] ] "}" .
+member_sig    = method_sig | static_method_sig .
 method_sig    = IDENT signature .
+static_method_sig = "static" IDENT signature .
 fsep          = ";" | "," .
 trait_decl    = "trait" IDENT "{" { trait_member } "}" .
 trait_member  = use_stmt | trait_method | trait_field .
