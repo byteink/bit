@@ -5,10 +5,10 @@ The full set of named methods on `Client`, each a thin wrapper over
 returns a plain Bit value instead of a raw `Reply`.
 
 ```bit
-import { connect } from "redis"
+import { open } from "redis"
 
 fn main(): ()! {
-  let c = connect("127.0.0.1", 6379)?
+  let c = open("redis://127.0.0.1:6379")?
   c.set("greeting", "hello")?
   let v = c.get("greeting")?
   match (v) {
@@ -22,17 +22,19 @@ fn main(): ()! {
 }
 ```
 
-- `get(key): Option<string>!` - `Option.None` on a cache miss, never
-  `Option.Some("")`.
-- `set(key, value): ()!`
-- `del(keys): i64!` - the number of keys actually removed.
-- `exists(keys): i64!` - the number of the given keys that exist.
-- `expire(key, seconds): bool!` - `true` if the key exists and the timeout
-  was set.
-- `ping(): string!` - the server's reply text (normally `"PONG"`).
-- `command(args): Reply!` - the generic escape hatch described in
-  [Connecting](connecting.md); every method above is built on it.
+- `get(key): Option<string> ! RedisError` - `Option.None` on a cache miss,
+  never `Option.Some("")`.
+- `set(key, value): () ! RedisError`
+- `del(keys): i64 ! RedisError` - the number of keys actually removed.
+- `exists(keys): i64 ! RedisError` - the number of the given keys that exist.
+- `expire(key, seconds): bool ! RedisError` - `true` if the key exists and
+  the timeout was set.
+- `ping(): string ! RedisError` - the server's reply text (normally
+  `"PONG"`).
+- `command(args): Reply ! RedisError` - the generic escape hatch described
+  in [Connecting](connecting.md); every method above is built on it.
 
-A `-ERR ...` reply raises a `fail` from whichever method produced it, same as
-any other failure. See [RESP2](resp.md) for the reply shapes these methods
-match against and what nil means on the wire.
+A server error (`-ERR ...`, `-WRONGTYPE ...`) raises a typed `RedisError`
+from whichever method produced it, matchable by variant
+(`RedisError.WrongType`, `.Timeout`, ...). See [RESP2](resp.md) for the
+reply shapes these methods match against and what nil means on the wire.
