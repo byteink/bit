@@ -1453,12 +1453,28 @@ satisfies it structurally, the same way it satisfies an ordinary
 `method_sig`, but with a `static` method rather than an instance one - an
 instance method with a matching name and signature does not satisfy a
 static requirement, and a static method does not satisfy an ordinary one.
-A static requirement is meant to be reached only through a generic bound
-(`T: Named`, §10.4.1), never through an interface value - there is no
-instance to call a static method on - but this compiler does not yet
-reject declaring a value of such an interface's type; that restriction is
-tracked separately and this paragraph will name its own diagnostic once it
-lands.
+
+An interface declaring a static requirement is reachable only through a
+**generic bound** (`T: Named`, §10.4.1); it may not be used as a value
+type - there is no instance to call a static method on, only a type. Every
+value-type position an ordinary interface may occupy - a `let`/`const`
+annotation, a parameter, a field, or a function's result type - is `E0170`
+for such an interface:
+
+```
+interface Named {
+  static label(): string
+}
+
+fn take(n: Named) {   // E0170: 'Named' declares a static requirement and
+}                      // cannot be used as a value type; use it only as
+                       // a generic bound ('T: Named')
+```
+
+The restriction is checked once the whole project's declarations are
+known (a static requirement declared in one module may be used as a value
+type in another), and does not apply to the `T: Named` bound itself, which
+is a different position entirely.
 
 The predeclared `error` interface is:
 

@@ -16,6 +16,7 @@ single static native binary. The guiding goal is **easy to write**.
 | [Variables](variables.md) | `let`/`const`, mutability, zero values, destructuring, assignment, comments, semicolons |
 | [Types](types.md) | primitives, literals, slices, arrays, maps, tuples, aliases, conversions, operators, value vs reference semantics, comparability |
 | [Classes](classes.md) | declaring a class, fields and zero values, composite literals, reference semantics, methods, comparability |
+| [Static Methods](static-methods.md) | `static` methods, dispatch through a type name, static interface requirements, generic-bound dispatch |
 | [Functions](functions.md) | functions, parameters, variadics, arrow functions, control flow |
 | [Interfaces](interfaces.md) | structural interfaces, satisfaction, `error`, type assertions |
 | [Traits](traits.md) | `trait`, `use` injection, required vs. provided methods, `Self` |
@@ -54,6 +55,7 @@ left without a reference page:
 | §10.2 type aliases | Types |
 | §10.3 functions | Functions |
 | §10.4–§10.5 methods, classes | Classes |
+| §10.4.1 static methods | Static Methods |
 | §10.6 interfaces | Interfaces |
 | §10.7 traits | Traits |
 | §11 types | Types |
