@@ -75,13 +75,14 @@
 // section — sound because `allocClassify` is pure: it reads no heap word, takes
 // no lock and mutates nothing (`runtime/alloc/classify.bit`).
 //
-// EVERY FRAME ON THE UNARMED PATH IS THE SAME ONE IT ALWAYS WAS, and that is
-// why the #5436 cache is written into this function rather than in front of it.
-// A first draft put the small path in its own `gcHeapAllocSmall` and the span
-// refill in a third function; the two extra call frames cost `bench/cases/alloc`
-// 0.224s -> 0.241s (+7.6%) and `bench/cases/strings` +6.7% on a workload that
-// never takes the cache at all. The take below is therefore INLINE here, as it
-// was before, and only the cold span-refill path is a call.
+// THE CACHE HIT IS THE WHOLE OF THIS FUNCTION (#5998); every other path is
+// `gcHeapAllocUncached`. While they were one function, x86-64 stored all five
+// arguments to the frame on entry and reloaded them on the hit, because the
+// locked arms keep them live across calls; now nothing here is live across a
+// call. The trade is one extra call frame on the unarmed path. The #5436 draft
+// that added TWO frames there (small path and refill each split out) cost
+// `bench/cases/alloc` +7.6% and `bench/cases/strings` +6.7%; #5998's ticket
+// carries this split's own figures.
 //
 // `entry` is THIS THREAD's cache entry, or 0 when it has none — resolved by the
 // caller (`allocCacheArm`, #5472) rather than here, because `allocObject` needs
@@ -123,29 +124,20 @@ export @nosplit fn gcFaultArmNextHeapAlloc() {
 // ticket) to inline into this call site and then fold to nothing at all under
 // `gcFaultInjectEnabled == false`: no compare, no branch, no read of
 // `gcFaultArmed`, and no call — a release build's `gcHeapAlloc` is therefore
-// the same bytes this function has always compiled to, not merely functionally
+// the same bytes it compiles to without the check, not merely functionally
 // unaffected by the flag's value.
 @nosplit fn gcHeapAlloc(g: *i64, size: int, alignment: int, idx: int, entry: int): int {
   if (gcFaultShouldTrigger()) {
     gcFaultArmed = 0
     return 0
   }
+  // Its own test, not a third `&&` term below: a lone compare branches
+  // directly, where each `&&` term materialises a flag first.
   if (idx < 0) {
-    spinAcquire(heapLock(g))
-    let big = gcHeapAllocLargeLocked(g, size)
-    spinRelease(heapLock(g))
-    return big
+    return gcHeapAllocUncached(g, size, idx, entry)
   }
-  // The cache is skipped outright for a request that could not hold two slots
-  // under the cap: a class that large is allocated rarely enough that its lock
-  // traffic does not appear in a profile, and caching it would spend the whole
-  // per-thread budget on one slot. The entry is resolved BEFORE the lock —
-  // nothing it reads is under the heap lock, and resolving it inside would put
-  // a cross-object call in the critical section this exists to shorten.
-  let cache = 0
-  if (entry != 0 && size * 2 <= acMaxBytes) {
-    cache = entry
-    let e = wordAt(cache)
+  if (gcHeapCacheServes(entry, size)) {
+    let e = wordAt(entry)
     let hit = allocCachePop(e, idx)
     if (hit != 0) {
       // The live-byte charge, in the one place that knows the cache served the
@@ -155,6 +147,32 @@ export @nosplit fn gcFaultArmNextHeapAlloc() {
       *(e + acLive) = *(e + acLive) + size
       return hit
     }
+  }
+  return gcHeapAllocUncached(g, size, idx, entry)
+}
+
+// Whether `entry`'s cache serves a request of `size` bytes: never without an
+// entry, and never for a request that could not hold two slots under the cap —
+// a class that large is allocated rarely enough that its lock traffic does not
+// appear in a profile, and caching it would spend the whole per-thread budget
+// on one slot. The entry is resolved BEFORE the lock — nothing it reads is
+// under the heap lock, and resolving it inside would put a cross-object call
+// in the critical section this exists to shorten. A LEAF, so both callers
+// inline it.
+@nosplit fn gcHeapCacheServes(entry: int, size: int): bool {
+  return entry != 0 && size * 2 <= acMaxBytes
+}
+
+// Every allocation the thread cache did not serve: a large one, a class the
+// cache skips, or one whose chain `allocCachePop` found empty, which this
+// refills under the lock. Takes `gcHeapAlloc`'s own arguments so each of its
+// calls here passes them through unchanged.
+@nosplit fn gcHeapAllocUncached(g: *i64, size: int, idx: int, entry: int): int {
+  if (idx < 0) {
+    spinAcquire(heapLock(g))
+    let big = gcHeapAllocLargeLocked(g, size)
+    spinRelease(heapLock(g))
+    return big
   }
   // `spinAcquire`'s own first step, open-coded so a failed exchange — the exact
   // event this cache removes — is what arms it. An uncontended acquire costs
@@ -168,8 +186,8 @@ export @nosplit fn gcFaultArmNextHeapAlloc() {
   if (got == 0) {
     got = gcHeapRefillSmallLocked(g, size, idx)
   }
-  if (got != 0 && cache != 0) {
-    allocCacheFillLocked(g, wordAt(cache), idx)
+  if (got != 0 && gcHeapCacheServes(entry, size)) {
+    allocCacheFillLocked(g, wordAt(entry), idx)
   }
   spinRelease(lk)
   return got
@@ -177,10 +195,10 @@ export @nosplit fn gcFaultArmNextHeapAlloc() {
 
 // The class is empty: refill it from the span cache, the span free list or the
 // reserve, and take one slot out of the refilled class. CALLER MUST HOLD
-// `heapLock(g)`, and still holds it on return. Split out of `gcHeapAlloc` so
-// the take above stays inline in the caller (see its header) and so both stay
-// under E0201's 80-line limit; every comment below is the one it carried when
-// this was the tail of that one function.
+// `heapLock(g)`, and still holds it on return. Split out of what is now
+// `gcHeapAllocUncached` so the take above stays inline in the caller and so
+// both stay under E0201's 80-line limit; every comment below is the one it
+// carried when this was the tail of that one function.
 @nosplit fn gcHeapRefillSmallLocked(g: *i64, size: int, idx: int): int {
   // Class empty: try the #3045 span cache before the reserve. A reclaimed
   // span sitting there is address space that is already ours — resident,
