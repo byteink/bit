@@ -248,10 +248,12 @@ load always respects the child's default scope, the same way every other
 read on this page does when a caller doesn't ask for trashed rows on
 purpose.
 
-`SoftQuery<T>` (what `findScoped` returns) carries `with()`/`after()`
-too, delegating straight to the wrapped `Query<T>` - a `@softDelete`
-PARENT paginating with [keyset pagination](keyset.md) or eager-loading a
-relation works exactly like `accounts(db)` above, no different spelling:
+`SoftQuery<T>` (what `findScoped` returns) exposes the same chainable
+reads `Query<T>` does - `with()`, `where`, `orderBy`, `limit`, `offset`,
+`after()`, `count`, `all`, `one`, `oneOrFail` - each delegating straight to
+the wrapped `Query<T>`, so a `@softDelete` PARENT paginating with
+[keyset pagination](keyset.md) or eager-loading a relation works exactly
+like `accounts(db)` above, no different spelling:
 
 ```bit
 fn nextAccountsPage(db: Data, lastId: i64): []Account! {
@@ -262,6 +264,74 @@ fn nextAccountsPage(db: Data, lastId: i64): []Account! {
 `after()`'s own keyset predicate and the automatic `deleted_at is null`
 are both ordinary entries in the same `where` list - order never matters,
 both are `AND`ed.
+
+`with()` on `findScoped`'s own result works the identical way, `@belongsTo`
+or `@hasMany` alike. `Article` is the soft-delete side this time, pointing
+at a plain, non-soft-delete `Author`:
+
+```bit
+import { belongsTo, withRelationsScoped } from "orm"
+
+@table class Author { @id id: i64, name: string }
+
+@table @softDelete class Article {
+  @id
+  id: i64
+  authorId: i64
+  deletedAt: Option<i64>
+  @belongsTo("authorId")
+  author: Author
+}
+
+fn authorEntity(): Author {
+  return Author{ id = 0, name = "" }
+}
+
+fn authorMapper(rows: Rows): Author! {
+  let cols = rows.columns()
+  return Author{ id = sqlReqInt(rows, cols, "id")?, name = sqlReqText(rows, cols, "name")? }
+}
+
+fn articleEntity(): Article {
+  return Article{ id = 0, authorId = 0, deletedAt = Option.None, author = authorEntity() }
+}
+
+fn articleMapper(rows: Rows): Article! {
+  let cols = rows.columns()
+  return Article{
+    id = sqlReqInt(rows, cols, "id")?, authorId = sqlReqInt(rows, cols, "author_id")?,
+    deletedAt = Option.None, author = authorEntity(),
+  }
+}
+
+fn authorLoader(): RelationLoader<Article> {
+  return belongsTo<Article, Author>(
+    (article) => article.authorId,
+    (db) => find<Author>(db, "authors", [FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }], authorMapper),
+    "id",
+    (author) => author.id,
+    (article, author) => { article.author = author },
+  )
+}
+
+fn articles(db: Data): SoftQuery<Article>! {
+  let sq = findScoped<Article>(
+    db, "articles", articleEntity().tableDescriptor(), articleEntity().tableAttrs(), articleMapper,
+  )?
+  return withRelationsScoped(sq, map<string, RelationLoader<Article>>{ "author": authorLoader() })
+}
+
+fn articleWithAuthor(db: Data, id: i64): Article! {
+  return articles(db)?.where("id", Value.Int(id)).with("author").oneOrFail()?
+}
+```
+
+This runs two statements - the article (excluding a trashed one), then the
+author lookup - the same two-statement shape `teamWithLiveAccounts` above
+uses for its own `with("accounts")`. `withRelationsScoped` is the
+`SoftQuery<T>` counterpart to [Relations](relation.md)'s own
+`withRelations` - that one only takes a plain `Query<T>`, so it cannot
+reach a `SoftQuery<T>`'s wrapped query from outside this package.
 
 ## When not to use this
 
