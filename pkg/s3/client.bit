@@ -1,0 +1,265 @@
+// pkg/s3/client.bit — Config/Client and the request signing every call in
+// this package shares: PUT/GET/HEAD/DELETE (this file), LIST (list.bit),
+// multipart upload (multipart.bit) and presigned URLs (presign.bit) are all
+// siblings in this module (SPEC §19) and call `signedRequest`/`objectPath`
+// below rather than each re-deriving SigV4 headers.
+//
+// Addressing is PATH-STYLE ONLY (`${endpoint}/${bucket}/${key}`), never
+// virtual-hosted (`${bucket}.${host}/${key}`): every target this package is
+// built for (MinIO, a self-hosted deployment, a private Cloudflare
+// R2/B2/Spaces bucket) accepts path-style, and it is what this package's
+// own live gate's throwaway MinIO container uses. Virtual-hosted addressing
+// is a follow-up, not implemented here.
+//
+// Only `host`, `x-amz-content-sha256` and `x-amz-date` are ever SIGNED
+// (SigV4 requires no more than that, per AWS's own examples): a caller's
+// `Content-Type` or other extra header rides along on the wire unsigned,
+// which every S3-compatible server accepts, exactly as it accepts a request
+// that never sent that header at all.
+
+import { atoi, Header, header as httpHeader, Response, requestWith } from "std/http"
+import { hasPrefix, indexOf, lastIndexOf, repeat } from "std/strings"
+import { now, utc } from "std/time"
+
+// `Payload` values `put`/`putStream` accept for `x-amz-content-sha256`.
+// `unsignedPayload` (RFC — AWS's own documented value for a body whose hash
+// the caller does not want to compute up front, e.g. a streamed upload
+// whose length is known but whose bytes have not all been read yet) trades
+// payload integrity checking for not having to buffer the body twice.
+export const unsignedPayload: string = "UNSIGNED-PAYLOAD"
+
+// Everything a `Client` needs to reach and sign against one bucket.
+export class Config {
+  export endpoint: string,
+  export region: string,
+  export bucket: string,
+  export accessKeyId: string,
+  export secretKey: string,
+}
+
+export class Client {
+  export cfg: Config
+  // Injects createMultipartUpload/uploadPart/completeMultipartUpload/
+  // abortMultipartUpload (multipart.bit, SPEC §10.7 trait injection).
+  use ClientMultipart
+  // Injects putStream/getStream (streaming.bit, same mechanism).
+  use ClientStreaming
+
+  // Uploads `body` as `key`, replacing any existing object of that name.
+  export put(key: string, body: string, contentType: string): ()! {
+    let path = objectPath(this.cfg.bucket, key)
+    let (url, headers) = signedRequest(
+      this.cfg,
+      "PUT",
+      path,
+      [](string, string)(0),
+      sha256Hex(body),
+    )?
+    let sendHeaders = headers
+    if (contentType != "") {
+      sendHeaders = append(headers, Header{ name = "Content-Type", value = contentType })
+    }
+    let res = requestWith("PUT", url, sendHeaders, body)?
+    checkOk(res)?
+  }
+
+  // Downloads `key` whole, into memory — bounded by std/http's default
+  // response budget (32 MiB, `defaultMaxBodyBytes`, stdlib/http/message.bit).
+  // A larger object needs streaming through std/http's own
+  // `getStreaming`/`requestWithStreamingBody` (stdlib/http/streambody.bit)
+  // directly — this package does not wrap them yet (#6078 follow-up).
+  export get(key: string): string! {
+    let path = objectPath(this.cfg.bucket, key)
+    let (url, headers) = signedRequest(this.cfg, "GET", path, [](string, string)(0), sha256Hex(""))?
+    let res = requestWith("GET", url, headers, "")?
+    checkOk(res)?
+    return res.body
+  }
+
+  // Metadata for `key`: `Content-Length`, `Content-Type`, `ETag`, off a HEAD
+  // response (RFC 9110 §9.3.2 — the header section a GET would have sent,
+  // with no body).
+  export head(key: string): ObjectMeta! {
+    let path = objectPath(this.cfg.bucket, key)
+    let (url, headers) = signedRequest(this.cfg, "HEAD", path, [](string, string)(0), sha256Hex(""))?
+    let res = requestWith("HEAD", url, headers, "")?
+    checkOk(res)?
+    let cl = atoi(httpHeader(res.headers, "content-length"))
+    return ObjectMeta{
+      contentLength = cl,
+      contentType = httpHeader(res.headers, "content-type"),
+      etag = httpHeader(res.headers, "etag"),
+    }
+  }
+
+  // Deletes `key`. S3-compatible DELETE is idempotent: deleting an
+  // already-absent key still answers 204 (verified against MinIO's own
+  // behavior, client.live.test.bit), so this never fails on a missing object.
+  export delete(key: string): ()! {
+    let path = objectPath(this.cfg.bucket, key)
+    let (url, headers) = signedRequest(
+      this.cfg,
+      "DELETE",
+      path,
+      [](string, string)(0),
+      sha256Hex(""),
+    )?
+    let res = requestWith("DELETE", url, headers, "")?
+    checkOk(res)?
+  }
+}
+
+export fn newClient(cfg: Config): Client {
+  return Client{ cfg = cfg }
+}
+
+// scheme/host/port parsed out of `Config.endpoint` — this package's own
+// tiny parser: std/http's `Url`/`parseUrl` are not `export`ed (SPEC §17.1,
+// invisible outside their own module).
+class endpointParts {
+  https: bool,
+  host: string,
+  port: int,
+}
+
+fn parseEndpoint(endpoint: string): endpointParts! {
+  let https = hasPrefix(endpoint, "https://")
+  let rest = ""
+  if (https) {
+    rest = endpoint[8:len(endpoint)]
+  } else if (hasPrefix(endpoint, "http://")) {
+    rest = endpoint[7:len(endpoint)]
+  } else {
+    fail newError("s3: endpoint must start with http:// or https://, got '${endpoint}'")
+  }
+  let slash = indexOf(rest, "/")
+  if (slash >= 0) {
+    rest = rest[0:slash]
+  }
+  let colon = lastIndexOf(rest, ":")
+  if (colon < 0) {
+    let defaultPort = 80
+    if (https) {
+      defaultPort = 443
+    }
+    return endpointParts{ https = https, host = rest, port = defaultPort }
+  }
+  let port = atoi(rest[colon + 1:len(rest)])
+  if (port <= 0) {
+    fail newError("s3: endpoint has an invalid port: '${endpoint}'")
+  }
+  return endpointParts{ https = https, host = rest[0:colon], port = port }
+}
+
+// The `Host` header value std/http's own client sends for this endpoint —
+// port omitted only at the scheme's default, the same rule
+// `hostHeaderValue` (stdlib/http/client.bit) applies. SigV4 signs the exact
+// Host header the wire carries, so this has to match it byte for byte.
+fn signedHostValue(parts: endpointParts): string {
+  let defaultPort = 80
+  if (parts.https) {
+    defaultPort = 443
+  }
+  if (parts.port == defaultPort) {
+    return parts.host
+  }
+  return "${parts.host}:${parts.port}"
+}
+
+fn schemeOf(parts: endpointParts): string {
+  if (parts.https) {
+    return "https"
+  }
+  return "http"
+}
+
+fn pad2(n: int): string {
+  if (n < 10) {
+    return "0${n}"
+  }
+  return "${n}"
+}
+
+// `(dateStamp, amzDate)`: `yyyymmdd` and `yyyymmddThhmmssZ`, both UTC — the
+// two timestamp spellings SigV4 needs (`credentialScope`'s date,
+// `stringToSign`/the `x-amz-date` header's full timestamp).
+fn amzTimestamps(): (string, string) {
+  let t = now().inZone(utc())
+  let dateStamp = "${t.year()}${pad2(t.month())}${pad2(t.day())}"
+  let amzDate = "${dateStamp}T${pad2(t.hour())}${pad2(t.minute())}${pad2(t.second())}Z"
+  return (dateStamp, amzDate)
+}
+
+// `/bucket/key` — the path both the request URL and the canonical request
+// are built from (`sigv4.bit`'s `canonicalUri` percent-encodes it,
+// preserving `/`).
+export fn objectPath(bucket: string, key: string): string {
+  return "/${bucket}/${key}"
+}
+
+fn requestUrl(parts: endpointParts, path: string, queryString: string): string {
+  let url = "${schemeOf(parts)}://${signedHostValue(parts)}${canonicalUri(path)}"
+  if (queryString != "") {
+    return url + "?" + queryString
+  }
+  return url
+}
+
+// Builds the URL and the `Authorization`/`x-amz-date`/`x-amz-content-sha256`
+// headers for one SigV4-signed request. `path` is already the canonical S3
+// path (`objectPath`); `queryParams` are raw key/value pairs (encoded by
+// `canonicalQueryString`); `payloadHashHex` is `sha256Hex(body)` or
+// `unsignedPayload`.
+export fn signedRequest(
+  cfg: Config,
+  method: string,
+  path: string,
+  queryParams: [](string, string),
+  payloadHashHex: string,
+): (string, []Header)! {
+  let parts = parseEndpoint(cfg.endpoint)?
+  let (dateStamp, amzDate) = amzTimestamps()
+  let host = signedHostValue(parts)
+  let sigHeaders = [
+    SigHeader{ name = "host", value = host },
+    SigHeader{ name = "x-amz-content-sha256", value = payloadHashHex },
+    SigHeader{ name = "x-amz-date", value = amzDate },
+  ]
+  let creq = canonicalRequest(method, path, queryParams, sigHeaders, payloadHashHex)
+  let scope = credentialScope(dateStamp, cfg.region, "s3")
+  let sts = stringToSign(amzDate, scope, creq)
+  let key = signingKey(cfg.secretKey, dateStamp, cfg.region, "s3")
+  let sig = signature(key, sts)
+  let authz = authorizationHeader(cfg.accessKeyId, scope, signedHeaders(sigHeaders), sig)
+
+  let headers = [
+    Header{ name = "x-amz-content-sha256", value = payloadHashHex },
+    Header{ name = "x-amz-date", value = amzDate },
+    Header{ name = "Authorization", value = authz },
+  ]
+  return (requestUrl(parts, path, canonicalQueryString(queryParams)), headers)
+}
+
+// Fails with the response's status and a snippet of its body unless `res`
+// is a 2xx. S3-compatible errors are an `<Error><Code>.../<Message>...`
+// XML body; a full `<Error>` parse is a follow-up (see xml.bit's header) —
+// the raw snippet is enough to diagnose a failing call today.
+fn checkOk(res: Response): ()! {
+  if (res.status >= 200 && res.status < 300) {
+    return
+  }
+  let snippet = res.body
+  if (len(snippet) > 500) {
+    snippet = snippet[0:500]
+  }
+  fail newError("s3: request failed, status ${res.status}: ${snippet}")
+}
+
+// Metadata for `key`: `Content-Length`, `Content-Type`, `ETag`, off a HEAD
+// response (RFC 9110 §9.3.2 — the header section a GET would have sent,
+// with no body).
+export class ObjectMeta {
+  export contentLength: int,
+  export contentType: string,
+  export etag: string,
+}

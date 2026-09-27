@@ -1,0 +1,194 @@
+// stdlib/http/streambody.test.bit — streambody.bit's request/response body
+// streaming, proven at the unit level: a fake `byteStream` on each side, no
+// socket. `newScript`, `chunk`, `header`, `itoa`, `newError` are siblings or
+// module-wide imports (SPEC §19) already declared by message.test.bit /
+// http.bit; nothing is imported here.
+
+// A write-only fake: captures every `writeStr` call as a separate chunk
+// rather than concatenating them, so a test can assert on HOW MANY writes
+// happened (proving `writeStreamingBody` never builds one big string) as
+// well as on the bytes themselves.
+class capturingStream {
+  chunks: []string
+
+  writeStr(data: string): ()! {
+    this.chunks = append(this.chunks, data)
+  }
+
+  writeBytes(b: []byte): ()! {
+    fail newError("capturingStream: unexpected writeBytes of ${itoa(len(b))} bytes")
+  }
+
+  readUp(n: int): string! {
+    fail newError("capturingStream: unexpected read")
+  }
+
+  shut() {}
+  forceClose() {}
+  peer(): string { return "" }
+  unread(extra: string) {}
+  setIdleDeadline(deadlineNs: int) {}
+}
+
+fn newCapture(): capturingStream {
+  return capturingStream{ chunks = []string(0) }
+}
+
+fn joinChunks(c: capturingStream): string {
+  let out = ""
+  for part of c.chunks {
+    out = out + part
+  }
+  return out
+}
+
+// A `BodySource` that hands back `data` in order, never more than `n` bytes
+// at once — the well-behaved case every real caller (e.g. reading a file)
+// looks like.
+fn sourceOver(data: string): BodySource {
+  let pos = 0
+  return (n) => {
+    if (pos >= len(data)) {
+      return ""
+    }
+    let end = pos + n
+    if (end > len(data)) {
+      end = len(data)
+    }
+    let out = data[pos:end]
+    pos = end
+    return out
+  }
+}
+
+test "writeStreamingBody moves a 10000-byte body in bounded chunks, never one write" {
+  let body = repeat("x", 10000)
+  let capture = newCapture()
+  writeStreamingBody(capture, len(body), sourceOver(body)) catch e {
+    assert(false, "writeStreamingBody: ${e.message()}")
+    return
+  }
+  // 10000 / 4096 rounds up to 3 writes, and no single write exceeds the
+  // chunk size — the bounded-memory property under direct test.
+  assert(len(capture.chunks) == 3, "writes = ${itoa(len(capture.chunks))}")
+  for part of capture.chunks {
+    assert(len(part) <= 4096, "a chunk was ${itoa(len(part))} bytes")
+  }
+  assert(joinChunks(capture) == body, "reassembled body did not match")
+}
+
+test "writeStreamingBody fails when the source exhausts before the declared length" {
+  let capture = newCapture()
+  let source: BodySource = (n) => {
+    return ""
+  }
+  writeStreamingBody(capture, 10, source) catch e {
+    assert(
+      indexOf(e.message(), "source exhausted after 0 of 10") >= 0,
+      "message = '${e.message()}'",
+    )
+    return
+  }
+  assert(false, "writeStreamingBody accepted an exhausted source")
+}
+
+test "writeStreamingBody fails when the source overshoots what was asked" {
+  let capture = newCapture()
+  let source: BodySource = (n) => {
+    return repeat("y", n + 1)
+  }
+  writeStreamingBody(capture, 10, source) catch e {
+    assert(indexOf(e.message(), "requested") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "writeStreamingBody accepted a source that overshot")
+}
+
+// A read-only sink: accumulates every chunk it was handed, and how many
+// calls it took, so a test can assert the body arrived in more than one
+// piece (bounded memory) as well as reassembling correctly.
+class capturingSink {
+  parts: []string,
+}
+
+fn sinkInto(c: capturingSink): BodySink {
+  return (s) => {
+    c.parts = append(c.parts, s)
+  }
+}
+
+fn joinParts(c: capturingSink): string {
+  let out = ""
+  for part of c.parts {
+    out = out + part
+  }
+  return out
+}
+
+test "readContentLengthBodyStreaming delivers a body across several bounded chunks" {
+  let body = repeat("z", 10000)
+  let st = newScript(body, 4096)
+  let sink = capturingSink{ parts = []string(0) }
+  readContentLengthBodyStreaming(st, "", len(body), sinkInto(sink)) catch e {
+    assert(false, "readContentLengthBodyStreaming: ${e.message()}")
+    return
+  }
+  assert(len(sink.parts) > 1, "delivered in a single chunk, not streamed")
+  assert(joinParts(sink) == body, "reassembled body did not match")
+}
+
+test "readContentLengthBodyStreaming truncates an overshooting final chunk" {
+  let st = newScript("abcdefghij", 64)
+  let sink = capturingSink{ parts = []string(0) }
+  readContentLengthBodyStreaming(st, "", 5, sinkInto(sink)) catch e {
+    assert(false, "readContentLengthBodyStreaming: ${e.message()}")
+    return
+  }
+  assert(joinParts(sink) == "abcde", "body = '${joinParts(sink)}'")
+}
+
+test "readResponseBodyStreaming delivers nothing to sink for a HEAD response" {
+  let sink = capturingSink{ parts = []string(0) }
+  let st = newScript("", 64)
+  let framing = responseFraming{
+    headers = "content-length: 100\r\n",
+    method = "HEAD",
+    maxBodyBytes = 1024,
+  }
+  readResponseBodyStreaming(st, "", framing, sinkInto(sink)) catch e {
+    assert(false, "readResponseBodyStreaming: ${e.message()}")
+    return
+  }
+  assert(len(sink.parts) == 0, "HEAD delivered a body to sink")
+}
+
+test "readResponseBodyStreaming refuses an over-budget Content-Length before reading" {
+  let sink = capturingSink{ parts = []string(0) }
+  let st = newScript(repeat("a", 100), 64)
+  let framing = responseFraming{
+    headers = "content-length: 4294967296\r\n",
+    method = "GET",
+    maxBodyBytes = 1024,
+  }
+  readResponseBodyStreaming(st, "", framing, sinkInto(sink)) catch e {
+    assert(indexOf(e.message(), "exceeds 1024 bytes") >= 0, "message = '${e.message()}'")
+    assert(len(sink.parts) == 0, "sink was called before the refusal")
+    return
+  }
+  assert(false, "readResponseBodyStreaming accepted an over-budget Content-Length")
+}
+
+test "readResponseStreaming returns an empty Response.body and delivers the body via sink" {
+  let body = repeat("q", 8000)
+  let data = "HTTP/1.1 200 OK\r\nContent-Length: ${itoa(len(body))}\r\n\r\n${body}"
+  let st = newScript(data, 4096)
+  let sink = capturingSink{ parts = []string(0) }
+  let res = readResponseStreaming(st, "GET", 1000000, sinkInto(sink)) catch e {
+    assert(false, "readResponseStreaming: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${itoa(res.status)}")
+  assert(res.body == "", "Response.body was ${itoa(len(res.body))} bytes, not streamed")
+  assert(joinParts(sink) == body, "sink did not receive the full body")
+  assert(len(sink.parts) > 1, "delivered in a single chunk, not streamed")
+}

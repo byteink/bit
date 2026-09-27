@@ -1,0 +1,307 @@
+// stdlib/http/streambody.bit — bounded-memory request and response bodies
+// for the http/https client, split into its own file rather than grown into
+// client.bit (703 lines already; spec/LINT.md's 800-line ceiling is never
+// raised) — the same precedent transport.bit's split from http.bit (#5860)
+// set. `readResponse`, `buildRequest`, `hostHeaderValue`, `exchangeOn`,
+// `readContentLengthBody`, `decodeChunkedBody`, `readAllStream`, `header`,
+// `RequestExtras`, `defaultRoots`, `defaultMaxBodyBytes`, `Url`, `parseUrl`,
+// `Header`, `serializeHeaders`, `netStream`, `tlsStream`, `tlsDial`, `dial`,
+// `newTlsConfig`, `atoi`, `itoa` and `newError` are all siblings or
+// module-wide imports (SPEC §19) already brought in by client.bit/http.bit —
+// nothing is imported here.
+//
+// #4027/#6078 (pkg/s3): `requestWith`'s `body: string` parameter and
+// `Response.body: string` field both require the WHOLE payload resident at
+// once — fine for a JSON API call, wrong for a multi-hundred-MB object
+// PUT/GET (pkg/s3's own `put`/`get` are its callers). The two entry points
+// below move a body in bounded chunks instead: memory use is O(chunk size),
+// never O(body size), on either side of the wire.
+//
+// PUT (`requestWithStreamingBody`): the caller supplies the declared byte
+// count up front — SigV4 needs it to sign the request anyway, and HTTP/1.1
+// needs either a declared Content-Length or chunked transfer coding to frame
+// a request body at all — plus a `BodySource` pulled repeatedly until it is
+// exhausted. There is no chunked-transfer REQUEST body here: a declared
+// Content-Length is what every S3-compatible PUT already sends, and
+// `aws-chunked` per-chunk signing (a separate protocol extension AWS layers
+// on top of ordinary chunked transfer coding) is not implemented.
+//
+// GET (`getStreaming`): delivers the response body to a `BodySink` one
+// bounded chunk at a time instead of accumulating a `string`, for the
+// Content-Length framing every S3-compatible GET response actually uses
+// (verified: AWS S3, MinIO, Cloudflare R2 and Google Cloud Storage's XML API
+// all answer a GET with a Content-Length header, never chunked
+// Transfer-Encoding — the object's byte count is always known before the
+// response starts). A response framed by chunked encoding or read-to-EOF
+// instead (never observed from a real S3-compatible server, but a
+// spec-legal HTTP/1.1 response) still succeeds, bounded by `maxBodyBytes`
+// exactly as `readResponse` already bounds it, but is handed to `sink` as
+// one whole chunk rather than streamed piece by piece.
+//
+// Both entry points force TLS ALPN to `http/1.1` only, never negotiating
+// `h2` (`defaultClientConfig`'s `["h2", "http/1.1"]` list is not reused
+// here): the HTTP/2 engine (`std/http2`) has its own DATA-frame body
+// mechanism, and building a second streaming path through it is out of
+// scope for this ticket — every S3-compatible endpoint serves HTTP/1.1 (or
+// negotiates it when a client offers only that), so this is a real
+// restriction with no observed cost.
+
+// Pulls up to `n` bytes of a request body; "" only at true end of input, and
+// any other return may be shorter than `n`. `writeStreamingBody` below calls
+// this repeatedly until it returns "".
+export type BodySource = (int) => string!
+
+// Receives one chunk of a response body, in arrival order, called repeatedly
+// until the body is exhausted.
+export type BodySink = (string) => ()!
+
+// How many bytes `writeStreamingBody`/`readContentLengthBodyStreaming` move
+// per call to `source`/`sink` — matches `readChunkSize` (stdlib/io/io.bit)
+// and the 4096 `readContentLengthBody`/`decodeChunkedBody` (message.bit)
+// already use, so a streaming body advances the same amount of work per step
+// as every other body reader in this module.
+const streamChunkSize: int = 4096
+
+// Writes `contentLength` bytes pulled from `source` directly onto `s`, one
+// bounded chunk at a time — never concatenated into one `string` first.
+// Fails if `source` runs out before `contentLength` bytes are written, or
+// hands back more than it was asked for (a caller whose source disagrees
+// with its own declared length is a caller bug, not a framing the peer
+// should ever see on the wire).
+fn writeStreamingBody(s: byteStream, contentLength: int, source: BodySource): ()! {
+  let written = 0
+  while (written < contentLength) {
+    let want = contentLength - written
+    if (want > streamChunkSize) {
+      want = streamChunkSize
+    }
+    let chunk = source(want)?
+    if (len(chunk) == 0) {
+      fail newError("writeStreamingBody: source exhausted after ${itoa(written)} of ${itoa(contentLength)} bytes")
+    }
+    if (len(chunk) > want) {
+      fail newError("writeStreamingBody: source returned ${itoa(len(chunk))} bytes, ${itoa(want)} requested")
+    }
+    s.writeStr(chunk)?
+    written = written + len(chunk)
+  }
+}
+
+// As `buildRequest` (client.bit), but ending after the header block — no
+// body appended — with `Content-Length` set to the DECLARED length rather
+// than derived from a body already in hand.
+fn buildStreamingRequestHead(
+  method: string,
+  u: Url,
+  headerBlock: string,
+  contentLength: int,
+): string {
+  let req = "${method} ${u.path} HTTP/1.1\r\n"
+  req = req + "Host: ${hostHeaderValue(u)}\r\n"
+  req = req + "Connection: close\r\n"
+  req = req + headerBlock
+  req = req + "Content-Length: ${itoa(contentLength)}\r\n"
+  return req + "\r\n"
+}
+
+// The http/1.1-only TLS config every function in this file dials with — see
+// the file header for why `h2` is never offered here.
+fn streamingTlsConfig(): TlsConfig {
+  let cfg = newTlsConfig(defaultRoots())
+  cfg.alpn = ["http/1.1"]
+  return cfg
+}
+
+// Runs `method url` with a request body of `contentLength` bytes streamed
+// from `source`, and returns the response exactly as `request` (client.bit)
+// does — the RESPONSE is still read in full, which is correct for an
+// S3-compatible PUT/POST: the reply is a small XML document or an empty
+// body, never the multi-GB payload the REQUEST side is streaming out.
+// http:// and https:// are both supported, same as `requestWith`;
+// `https+h3://` is not (see the file header).
+export fn requestWithStreamingBody(
+  method: string,
+  url: string,
+  headers: []Header,
+  contentLength: int,
+  source: BodySource,
+): Response! {
+  let block = serializeHeaders(headers)?
+  let u = parseUrl(url)?
+  if (u.h3) {
+    fail newError("requestWithStreamingBody: https+h3:// is not supported")
+  }
+  let head = buildStreamingRequestHead(method, u, block, contentLength)
+  if (u.https) {
+    let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
+    defer s.shut()
+    s.writeStr(head)?
+    writeStreamingBody(s, contentLength, source)?
+    return readResponse(s, method, defaultMaxBodyBytes)?
+  }
+  let s = netStream{ conn = dial(u.host, u.port)? }
+  defer s.shut()
+  s.writeStr(head)?
+  writeStreamingBody(s, contentLength, source)?
+  return readResponse(s, method, defaultMaxBodyBytes)?
+}
+
+// Reads the remaining `cl - len(initial)` bytes of a Content-Length-framed
+// body off `s`, delivering each bounded chunk to `sink` instead of
+// accumulating one `string` — the streaming twin of `readContentLengthBody`
+// (client.bit), same framing, same overshoot truncation.
+fn readContentLengthBodyStreaming(s: byteStream, initial: string, cl: int, sink: BodySink): ()! {
+  let have = 0
+  if (len(initial) > 0) {
+    let first = initial
+    if (len(first) > cl) {
+      first = first[0:cl]
+    }
+    sink(first)?
+    have = len(first)
+  }
+  while (have < cl) {
+    let want = cl - have
+    if (want > streamChunkSize) {
+      want = streamChunkSize
+    }
+    let chunk = s.readUp(want)?
+    if (len(chunk) == 0) {
+      fail newError("response: connection closed before Content-Length bytes arrived")
+    }
+    if (have + len(chunk) > cl) {
+      chunk = chunk[0:cl - have]
+    }
+    sink(chunk)?
+    have = have + len(chunk)
+  }
+}
+
+// Bundles the response-framing facts `readResponseBodyStreaming` needs
+// alongside the stream and sink, keeping it under `spec/LINT.md`'s
+// 5-parameter ceiling — the same reason `RequestExtras` (client.bit) bundles
+// the request side's per-call facts instead of taking them as separate
+// parameters.
+class responseFraming {
+  headers: string,
+  method: string,
+  maxBodyBytes: int,
+}
+
+// Delivers `s` to `sink` unless it is empty — shared by the two framings
+// below that read their whole body in one call (chunked, read-to-EOF) but
+// still only want to invoke `sink` when there is something to deliver.
+// Split out so the two call sites don't each add their own branch to
+// `readResponseBodyStreaming`'s complexity.
+fn sinkIfNonEmpty(sink: BodySink, s: string): ()! {
+  if (len(s) > 0) {
+    sink(s)?
+  }
+}
+
+// As `readResponseBody` (client.bit), but the Content-Length framing streams
+// to `sink` in bounded chunks — see the file header for why chunked and
+// read-to-EOF instead hand `sink` one whole (still `maxBodyBytes`-bounded)
+// chunk.
+fn readResponseBodyStreaming(
+  s: byteStream,
+  bodyStart: string,
+  framing: responseFraming,
+  sink: BodySink,
+): ()! {
+  if (framing.method == "HEAD") {
+    return
+  }
+  let clText = header(framing.headers, "content-length")
+  let teText = toLower(header(framing.headers, "transfer-encoding"))
+  let hasCl = len(clText) > 0
+  let hasTe = len(teText) > 0
+  if (hasCl && hasTe) {
+    fail newError("response: Content-Length and Transfer-Encoding both present")
+  }
+  if (hasTe) {
+    if (teText != "chunked") {
+      fail newError("response: unsupported Transfer-Encoding")
+    }
+    sinkIfNonEmpty(sink, decodeChunkedBody(s, bodyStart, framing.maxBodyBytes)?)?
+    return
+  }
+  if (hasCl) {
+    let cl = atoi(clText)
+    if (cl < 0) {
+      fail newError("response: invalid Content-Length")
+    }
+    if (cl > framing.maxBodyBytes) {
+      fail newError("readResponse: Content-Length ${itoa(cl)} exceeds ${itoa(framing.maxBodyBytes)} bytes")
+    }
+    readContentLengthBodyStreaming(s, bodyStart, cl, sink)?
+    return
+  }
+  sinkIfNonEmpty(sink, readAllStream(s, bodyStart, framing.maxBodyBytes)?)?
+}
+
+// As `readResponse` (client.bit), but the body is delivered to `sink`
+// instead of returned — the returned `Response.body` is always "".
+fn readResponseStreaming(
+  s: byteStream,
+  method: string,
+  maxBodyBytes: int,
+  sink: BodySink,
+): Response! {
+  let (headBlock, bodyStart) = readUntil(s, "", "\r\n\r\n")?
+  let eol = indexOf(headBlock, "\r\n")
+  let statusLine = headBlock
+  let headers = ""
+  if (eol >= 0) {
+    statusLine = headBlock[0:eol]
+    headers = headBlock[eol + 2:len(headBlock)]
+  }
+  let code = parseStatusCode(statusLine)?
+  let framing = responseFraming{ headers = headers, method = method, maxBodyBytes = maxBodyBytes }
+  readResponseBodyStreaming(s, bodyStart, framing, sink)?
+  return Response{
+    status = code,
+    contentType = header(headers, "content-type"),
+    headers = headers,
+    body = "",
+  }
+}
+
+// GET `url` over http or https, delivering the response body to `sink` in
+// bounded chunks instead of returning it whole. The returned
+// `Response.body` is always "" — everything the body carried already went
+// to `sink`. `https+h3://` is not supported (see the file header).
+//
+// `maxBodyBytes` is the DECLARED Content-Length ceiling `readResponseBodyStreaming`
+// still refuses up front (a malformed or hostile response's own number, not
+// what this call actually holds in memory — streaming never accumulates
+// more than one chunk regardless of how large the object is). A caller
+// downloading a multi-GB object passes a bound that actually covers it;
+// `defaultMaxBodyBytes` (32 MiB, sized for `request`/`requestWith`'s
+// whole-body-in-memory case) would refuse it before a single chunk reached
+// `sink` (#6078/#6104: caught live against a 220 MiB object, not found by
+// any unit test — nothing before this exercised a Content-Length anywhere
+// near that boundary).
+export fn getStreaming(
+  url: string,
+  headers: []Header,
+  sink: BodySink,
+  maxBodyBytes: int,
+): Response! {
+  let block = serializeHeaders(headers)?
+  let u = parseUrl(url)?
+  if (u.h3) {
+    fail newError("getStreaming: https+h3:// is not supported")
+  }
+  let req = buildRequest("GET", u, block, "")
+  if (u.https) {
+    let s = tlsStream{ conn = tlsDial(u.host, u.port, streamingTlsConfig())? }
+    defer s.shut()
+    s.writeStr(req)?
+    return readResponseStreaming(s, "GET", maxBodyBytes, sink)?
+  }
+  let s = netStream{ conn = dial(u.host, u.port)? }
+  defer s.shut()
+  s.writeStr(req)?
+  return readResponseStreaming(s, "GET", maxBodyBytes, sink)?
+}

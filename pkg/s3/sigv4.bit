@@ -1,0 +1,245 @@
+// pkg/s3/sigv4.bit — AWS Signature Version 4 request signing, the auth every
+// S3-compatible endpoint (AWS S3, Cloudflare R2, MinIO, Backblaze B2,
+// DigitalOcean Spaces, Google Cloud Storage's XML API) accepts.
+//
+// Checked in sigv4.test.bit against AWS's own published test suite (the
+// `aws-sig-v4-test-suite`, Apache-2.0, Amazon-authored — a request, its
+// canonical form, its string-to-sign and its final Authorization header,
+// for a fixed test credential/region/service/date), not against numbers
+// re-derived from this same code.
+//
+// The four steps (AWS's own naming):
+//   1. canonicalRequest  — method, URI, sorted+encoded query, sorted+
+//      lowercased headers, signed-header list, hex SHA-256 of the payload
+//   2. stringToSign       — algorithm, timestamp, scope, hex SHA-256 of #1
+//   3. signingKey          — HMAC-SHA256 chained through date/region/
+//      service/"aws4_request", keyed from "AWS4" + the secret key
+//   4. signature            — HMAC-SHA256(signingKey, stringToSign), hex
+
+import { digest, encodeHex, hmac, newSha256 } from "std/crypto"
+import { newBuilder } from "std/strings"
+
+// One request header, already lowercased and trimmed — the shape both
+// `canonicalHeaders` and `signedHeaders` consume.
+export class SigHeader {
+  export name: string,
+  export value: string,
+}
+
+fn sha256Hex(s: string): string {
+  return encodeHex(digest(newSha256(), []byte(s)))
+}
+
+// True for the RFC 3986 unreserved set — the only bytes SigV4 leaves
+// unescaped in a URI path segment or query key/value: `A-Za-z0-9-_.~`.
+fn isUnreserved(c: byte): bool {
+  if (c >= 'A' && c <= 'Z') {
+    return true
+  }
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  return c == '-' || c == '_' || c == '.' || c == '~'
+}
+
+const hexDigits: string = "0123456789ABCDEF"
+
+// Percent-encodes every byte outside the unreserved set, uppercase hex, one
+// byte at a time (so a multi-byte UTF-8 character comes out as one %XX per
+// byte, exactly what SigV4 wants). `preserveSlash` keeps `/` literal — used
+// for a URI path, never for a query key or value.
+fn sigv4Encode(s: string, preserveSlash: bool): string {
+  let b = []byte(s)
+  let out = newBuilder()
+  let i = 0
+  while (i < len(b)) {
+    let c = b[i]
+    if (isUnreserved(c) || (preserveSlash && c == '/')) {
+      out.write(string([c]))
+    } else {
+      let hi = (c >> 4) & 0x0f
+      let lo = c & 0x0f
+      out.write("%" + hexDigits[hi:hi + 1] + hexDigits[lo:lo + 1])
+    }
+    i = i + 1
+  }
+  return out.toString()
+}
+
+// The canonical URI: `path`, percent-encoded per segment with `/` preserved.
+// An empty path canonicalizes to "/" (AWS's own rule for the bucket-root
+// request).
+export fn canonicalUri(path: string): string {
+  if (path == "") {
+    return "/"
+  }
+  return sigv4Encode(path, true)
+}
+
+// One "key=value" pair, both percent-encoded, with `=` inserted literally.
+fn encodedQueryPair(key: string, value: string): string {
+  return sigv4Encode(key, false) + "=" + sigv4Encode(value, false)
+}
+
+// The canonical query string: every pair percent-encoded, then sorted by
+// the ENCODED key, and by the encoded value when two pairs share a key
+// (RFC 3986's byte ordering agrees with encoded ASCII sort order, which is
+// why AWS's own algorithm sorts after encoding, not before). `params` is
+// already split into pairs by the caller (`query.bit`'s `parseQuery`
+// collapses repeated keys, which SigV4's own multi-value tests need to
+// survive, so this file does its own splitting rather than reusing it).
+export fn canonicalQueryString(params: [](string, string)): string {
+  let encoded = []string(0)
+  let i = 0
+  while (i < len(params)) {
+    encoded = append(encoded, encodedQueryPair(params[i].0, params[i].1))
+    i = i + 1
+  }
+  encoded = sortStrings(encoded)
+  let out = ""
+  let j = 0
+  while (j < len(encoded)) {
+    if (j > 0) {
+      out = out + "&"
+    }
+    out = out + encoded[j]
+    j = j + 1
+  }
+  return out
+}
+
+// Insertion sort: `params`/headers lists in this file are a handful of
+// entries (S3 requests carry a handful of query params and headers, never
+// hundreds), so O(n^2) here is simpler than pulling in a general sort and
+// costs nothing measurable at this size.
+fn sortStrings(xs: []string): []string {
+  let out = xs
+  let i = 1
+  while (i < len(out)) {
+    let key = out[i]
+    let j = i - 1
+    while (j >= 0 && out[j] > key) {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  return out
+}
+
+fn sortHeaders(headers: []SigHeader): []SigHeader {
+  let out = headers
+  let i = 1
+  while (i < len(out)) {
+    let key = out[i]
+    let j = i - 1
+    while (j >= 0 && out[j].name > key.name) {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  return out
+}
+
+// `name:value\n` for every header, sorted by lowercase name — `headers`
+// must already be lowercased and value-trimmed by the caller (`SigHeader`'s
+// own doc comment).
+export fn canonicalHeaders(headers: []SigHeader): string {
+  let sorted = sortHeaders(headers)
+  let out = ""
+  let i = 0
+  while (i < len(sorted)) {
+    out = out + "${sorted[i].name}:${sorted[i].value}\n"
+    i = i + 1
+  }
+  return out
+}
+
+// `name;name;name`, sorted, semicolon-joined — the SignedHeaders list both
+// the canonical request and the final Authorization header carry.
+export fn signedHeaders(headers: []SigHeader): string {
+  let sorted = sortHeaders(headers)
+  let out = ""
+  let i = 0
+  while (i < len(sorted)) {
+    if (i > 0) {
+      out = out + ";"
+    }
+    out = out + sorted[i].name
+    i = i + 1
+  }
+  return out
+}
+
+// AWS's step 1: method, canonical URI, canonical query string, canonical
+// headers, signed-header list, and the hex SHA-256 of the payload — one
+// per line, per the algorithm's own layout.
+export fn canonicalRequest(
+  method: string,
+  path: string,
+  queryParams: [](string, string),
+  headers: []SigHeader,
+  payloadHashHex: string,
+): string {
+  return method +
+    "\n" +
+    canonicalUri(path) +
+    "\n" +
+    canonicalQueryString(queryParams) +
+    "\n" +
+    canonicalHeaders(headers) +
+    "\n" +
+    signedHeaders(headers) +
+    "\n" +
+    payloadHashHex
+}
+
+// `yyyymmdd/region/service/aws4_request` — the credential scope both the
+// string-to-sign and the final Authorization header's Credential carry.
+export fn credentialScope(dateStamp: string, region: string, service: string): string {
+  return "${dateStamp}/${region}/${service}/aws4_request"
+}
+
+// AWS's step 2: algorithm, ISO8601 timestamp, credential scope, hex SHA-256
+// of the canonical request.
+export fn stringToSign(amzDate: string, scope: string, canonicalReq: string): string {
+  return "AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${sha256Hex(canonicalReq)}"
+}
+
+// AWS's step 3: the derived signing key, chained HMAC-SHA256 through the
+// date, region, service and the literal "aws4_request", keyed from
+// "AWS4" + the secret access key.
+export fn signingKey(
+  secretKey: string,
+  dateStamp: string,
+  region: string,
+  service: string,
+): []byte {
+  let kDate = hmac(newSha256, []byte("AWS4" + secretKey), []byte(dateStamp))
+  let kRegion = hmac(newSha256, kDate, []byte(region))
+  let kService = hmac(newSha256, kRegion, []byte(service))
+  return hmac(newSha256, kService, []byte("aws4_request"))
+}
+
+// AWS's step 4: hex HMAC-SHA256(signingKey, stringToSign).
+export fn signature(key: []byte, sts: string): string {
+  return encodeHex(hmac(newSha256, key, []byte(sts)))
+}
+
+// The full `Authorization` header value for `SignedHeaders`/`Signature`
+// already computed by the four steps above.
+export fn authorizationHeader(
+  accessKeyId: string,
+  scope: string,
+  signedHeaderNames: string,
+  sig: string,
+): string {
+  return "AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, " +
+    "SignedHeaders=${signedHeaderNames}, Signature=${sig}"
+}

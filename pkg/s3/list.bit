@@ -1,0 +1,150 @@
+// pkg/s3/list.bit — ListObjectsV2, paginated as an iterator: `next():
+// Option<ObjectEntry>!` pulls one object at a time, fetching another page
+// from the server only when the current page is exhausted. `list(client,
+// prefix)` builds the iterator; nothing is fetched until the first `next()`
+// call — a caller that never calls `next()` sends no request at all.
+//
+// `Client`, `Config`, `signedRequest`, `checkOk`, `sha256Hex`, `requestWith`,
+// `Header`, `Response`, `atoi` are all siblings or module-wide imports
+// (SPEC §19, client.bit's own `import` block) — nothing is imported here.
+
+// One object a ListObjectsV2 page described: its key, byte size, quoted
+// ETag, and `LastModified` exactly as the server sent it (RFC 3339 —
+// parsing it into a `Timestamp` is left to the caller, `std/time`'s own
+// job, not this package's).
+export class ObjectEntry {
+  export key: string,
+  export size: int,
+  export etag: string,
+  export lastModified: string,
+}
+
+// AWS caps a single ListObjectsV2 page at 1000 keys; this is a defensive
+// ceiling on how many `<Contents>` blocks one response body is scanned for,
+// well above that, so a malformed or hostile response cannot loop forever.
+const maxEntriesPerPage: int = 10000
+
+// One `<Contents>...</Contents>` block, read into an `ObjectEntry`, plus the
+// byte offset just past it — `("", -1)`'s ObjectEntry sentinel (empty key)
+// signals "no more blocks" to `parseListObjectsV2`'s caller.
+fn parseContentsBlock(body: string, startAt: int): (ObjectEntry, int) {
+  let (block, blockEnd) = xmlFindTag(body, "Contents", startAt)
+  if (blockEnd < 0) {
+    return (ObjectEntry{ key = "", size = 0, etag = "", lastModified = "" }, -1)
+  }
+  let entry = ObjectEntry{
+    key = xmlTagOr(block, "Key", 0, ""),
+    size = atoi(xmlTagOr(block, "Size", 0, "0")),
+    etag = xmlTagOr(block, "ETag", 0, ""),
+    lastModified = xmlTagOr(block, "LastModified", 0, ""),
+  }
+  return (entry, blockEnd)
+}
+
+// Every `<Contents>` entry in one ListObjectsV2 response body, plus whether
+// the server says there is another page (`IsTruncated`) and the token to
+// ask for it with (`NextContinuationToken`, "" when there is none).
+fn parseListObjectsV2(body: string): ([]ObjectEntry, bool, string) {
+  let entries = []ObjectEntry(0)
+  let pos = 0
+  let i = 0
+  while (i < maxEntriesPerPage) {
+    let (entry, next) = parseContentsBlock(body, pos)
+    if (next < 0) {
+      break
+    }
+    entries = append(entries, entry)
+    pos = next
+    i = i + 1
+  }
+  let truncated = xmlTagOr(body, "IsTruncated", 0, "false") == "true"
+  let nextToken = xmlTagOr(body, "NextContinuationToken", 0, "")
+  return (entries, truncated, nextToken)
+}
+
+// Pulls one ListObjectsV2 page at a time; `next()` is the only way this
+// fetches anything.
+export class ObjectIterator {
+  cfg: Config
+  prefix: string
+  // 0 means "server default" (S3's own cap is 1000); a positive value asks
+  // for a smaller page via the `max-keys` query parameter — mainly useful
+  // for exercising pagination without uploading a thousand objects.
+  maxKeys: int
+  entries: []ObjectEntry
+  pos: int
+  continuationToken: string
+  fetchedFirstPage: bool
+  morePages: bool
+
+  // Fetches the next page's `<Contents>` entries into `this.entries`,
+  // resetting `this.pos` to 0 and recording whether another page remains.
+  fetchPage(): ()! {
+    let params = [("list-type", "2"), ("prefix", this.prefix)]
+    if (this.maxKeys > 0) {
+      params = append(params, ("max-keys", "${this.maxKeys}"))
+    }
+    if (this.continuationToken != "") {
+      params = append(params, ("continuation-token", this.continuationToken))
+    }
+    let (url, headers) = signedRequest(
+      this.cfg,
+      "GET",
+      "/${this.cfg.bucket}",
+      params,
+      sha256Hex(""),
+    )?
+    let res = requestWith("GET", url, headers, "")?
+    checkOk(res)?
+    let (entries, truncated, nextToken) = parseListObjectsV2(res.body)
+    this.entries = entries
+    this.pos = 0
+    this.continuationToken = nextToken
+    this.morePages = truncated
+    this.fetchedFirstPage = true
+  }
+
+  // The next object, or `Option.None` once every page is exhausted. Bounded
+  // by `maxEntriesPerPage` pages fetched with zero new entries each — a
+  // server that keeps claiming `IsTruncated` while sending nothing new
+  // would otherwise loop forever.
+  export next(): Option<ObjectEntry>! {
+    let emptyPages = 0
+    while (emptyPages < maxEntriesPerPage) {
+      if (this.pos < len(this.entries)) {
+        let e = this.entries[this.pos]
+        this.pos = this.pos + 1
+        return Option.Some(e)
+      }
+      if (this.fetchedFirstPage && !this.morePages) {
+        return Option<ObjectEntry>.None
+      }
+      this.fetchPage()?
+      if (len(this.entries) == 0) {
+        emptyPages = emptyPages + 1
+      }
+    }
+    fail newError("s3: list: ${maxEntriesPerPage} consecutive empty pages, still truncated")
+  }
+}
+
+// Lists every object under `prefix` (""  for the whole bucket), lazily —
+// see the file header.
+export fn list(c: Client, prefix: string): ObjectIterator {
+  return listPaged(c, prefix, 0)
+}
+
+// As `list`, but asks the server for `maxKeys` entries per page rather than
+// its own default (0 for that default) — see `ObjectIterator.maxKeys`.
+export fn listPaged(c: Client, prefix: string, maxKeys: int): ObjectIterator {
+  return ObjectIterator{
+    cfg = c.cfg,
+    prefix = prefix,
+    maxKeys = maxKeys,
+    entries = []ObjectEntry(0),
+    pos = 0,
+    continuationToken = "",
+    fetchedFirstPage = false,
+    morePages = false,
+  }
+}
