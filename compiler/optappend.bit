@@ -1,36 +1,46 @@
-// compiler/optappend.bit — #4039: expands `rt_call slice_append`'s
-// SPARE-CAPACITY case inline, after the inliner ran, into a fast store that
-// mutates the header IN PLACE. #6092 found that in-place mutation unsound in
-// general — `x := append(base, 1); y := append(base, 1)` made `x` and `y`
-// alias the identical header object, so `y`'s growth silently changed
-// `len(x)` — and fixed the general case in the runtime by cloning a fresh
-// header whenever the input header could still be reachable elsewhere.
+// compiler/optappend.bit — #4039: expands a spare-capacity `append`'s runtime
+// call inline, after the inliner ran, into a fast store that mutates the
+// header IN PLACE. #6092 found that in-place mutation unsound in general —
+// `x := append(base, 1); y := append(base, 1)` made `x` and `y` alias the
+// identical header object, so `y`'s growth silently changed `len(x)`.
 //
-// THIS PASS NOW EMITS THE FAST (mutate-in-place) STORE ONLY WHEN THAT
-// RISK IS PROVEN ABSENT: `appendExpandable` additionally requires the
-// header value fed into the call (`args[0]`) to have EXACTLY ONE USE in
-// the whole function — this very call — via `useCounts` (compiler/optcommaok.bit,
-// already the DCE/verifier's own operand table, `compiler/opt.bit`'s
-// `instrOperands`). One use means no OTHER instruction anywhere in this
-// function reads that header value: not a second `append`, not a `let y =
-// base` alias (which resolves to the SAME SSA id via `lowerNamedValue`'s
-// `localRead`, so a later read of `y` is a second use of the identical id),
-// not a field store, not a return, not a call argument. When that holds,
-// mutating the header and handing the same one back is unobservable by
-// anyone but the call that produced it — the general soundness argument
-// #6092's runtime fix relies on ("only the returned value observes the
-// growth") is trivially true when the returned value and the input value are
-// the same object AND nothing else can ever read the input value. When the
-// proof fails, `appendExpandable` returns `false` for that call site and it
-// falls through to the general (now-cloning) runtime entry point, exactly as
-// every call does today.
+// BEHIND `BIT_APPEND_FRESH` (compiler/lowerappend.bit's `appendFreshEnabled`,
+// epic #6160), because the fix changes the emitted IR shape and the pinned
+// 0.31.0 stage0 oracle does not have it: `lowerAppend` emits a call named
+// `slice_append`/`slice_append_str` when the flag is off, and
+// `slice_append_fresh`/`slice_append_str_fresh` when it is on
+// (runtime/root/slices.bit has both pairs of entry points; the unchanged
+// pair is untouched by #6092, the `_fresh` pair clones). `appendExpandable`
+// below applies a DIFFERENT eligibility rule per name:
 //
-// THE GROW ARM IS UNCHANGED AND STILL CLONES (`emitExpandedAppend`'s `grow`
-// block calls the runtime `rt_call slice_append` unconditionally): a grow
-// already pays a buffer copy, so one more small header allocation is
-// proportionally cheap there, and the single-use proof buys nothing extra on
-// that arm — the runtime clone is already correct and the dominant cost is
-// the copy, not the header.
+//   "slice_append"       — UNCHANGED from before #6092: expand whenever the
+//                           element width matches the stride, unconditionally.
+//                           This is what keeps `BIT_APPEND_FRESH` unset
+//                           byte-identical to main (task-6092's report).
+//   "slice_append_fresh" — expand ONLY when the header value fed into the
+//                           call (`args[0]`) has EXACTLY ONE USE in the whole
+//                           function — this very call — via `useCounts`
+//                           (compiler/optcommaok.bit, already the DCE/
+//                           verifier's own operand table, `compiler/opt.bit`'s
+//                           `instrOperands`). One use means no OTHER
+//                           instruction anywhere in this function reads that
+//                           header value: not a second `append`, not a
+//                           `let y = base` alias (which resolves to the SAME
+//                           SSA id via `lowerNamedValue`'s `localRead`, so a
+//                           later read of `y` is a second use of the
+//                           identical id), not a field store, not a return,
+//                           not a call argument. When that holds, mutating
+//                           the header and handing the same one back is
+//                           unobservable by anyone but the call that produced
+//                           it. When the proof fails, `appendExpandable`
+//                           returns `false` and the call falls through to the
+//                           general (cloning) `_fresh` runtime entry point.
+//
+// THE GROW ARM IS UNCHANGED EITHER WAY (`emitExpandedAppend`'s `grow` block
+// calls the runtime unconditionally, under whichever name the call already
+// carries): a grow already pays a buffer copy, so one more small header
+// allocation is proportionally cheap there, and the single-use proof buys
+// nothing extra on that arm.
 //
 // Sibling of opt.bit: same module, so this needs no imports and no call-site
 // changes — `blockEmissionOrder`, `emitTranslated`, `noConst`, `useCounts`
@@ -98,9 +108,11 @@
 // `uses` is `useCounts(f)` (compiler/optcommaok.bit), computed ONCE per
 // function by this pass's caller and passed down rather than recomputed per
 // call site — the same shape `MissFacts.uses` is threaded through in that
-// file. `uses[h] == 1` is the #6092 single-use proof this file's header
-// comment describes: this call is the ONLY operand slot anywhere in `f` that
-// names the header value being appended to, so mutating it in place cannot be
+// file, and read only on the `slice_append_fresh` path (below); the
+// unchanged `slice_append` path ignores it entirely, matching main.
+// `uses[h] == 1` is the #6092 single-use proof this file's header comment
+// describes: this call is the ONLY operand slot anywhere in `f` that names
+// the header value being appended to, so mutating it in place cannot be
 // observed by anything else. `useCounts` walks `instrOperands` — the DCE and
 // verifier's own table (opt.bit) — so this reuses the one place the compiler
 // already answers "what does this instruction read", rather than a second,
@@ -131,20 +143,43 @@
 // binding, like `snap`, that survives across iterations while the loop
 // keeps mutating the object underneath it. Soundly recovering the loop
 // case needs an escape analysis over the RESULT, not just a use-count of
-// the input, so it is left as a follow-up rather than shipped half-right.
-fn appendExpandable(ctx: TypeContext, f: IrFunc, uses: []int, idx: int): bool {
+// the input, so it is left as a follow-up rather than shipped half-right
+// (#6164).
+// The width/shape half of `appendExpandable`'s eligibility test, split out
+// to keep `appendExpandable` itself under E0204's complexity ceiling once
+// `BIT_APPEND_FRESH`'s two-name dispatch landed beside it. `(false, _)`
+// when `idx` is not an eligible `slice_append`/`slice_append_fresh` call;
+// otherwise `(true, fresh)`, `fresh` telling the caller which of the two
+// names matched.
+fn appendShapeEligible(ctx: TypeContext, f: IrFunc, idx: int): (bool, bool) {
   let ins = f.instrs[idx]
-  if (ins.op != Op.RtCall || ins.name != "slice_append" || len(ins.args) != 4) {
-    return false
+  if (ins.op != Op.RtCall || len(ins.args) != 4) {
+    return false, false
+  }
+  let fresh = ins.name == "slice_append_fresh"
+  if (!fresh && ins.name != "slice_append") {
+    return false, false
   }
   let es = f.instrs[ins.args[3]]
   if (es.op != Op.ConstInt) {
-    return false
+    return false, false
   }
   let w = widthOf(ctx, f.instrs[ins.args[1]].ty).bytes
   if (!((es.ival == 8 && w == 8) || (es.ival == 1 && w == 1))) {
+    return false, false
+  }
+  return true, fresh
+}
+
+fn appendExpandable(ctx: TypeContext, f: IrFunc, uses: []int, idx: int): bool {
+  let (eligible, fresh) = appendShapeEligible(ctx, f, idx)
+  if (!eligible) {
     return false
   }
+  if (!fresh) {
+    return true
+  }
+  let ins = f.instrs[idx]
   return uses[ins.args[0]] == 1
 }
 
@@ -215,16 +250,23 @@ fn emitAppendFastStore(b: IrBuilder, ctx: TypeContext, h: int, v: int, lenV: int
 // remap to. LEAVES `join` OPEN: the rest of the block being rewritten continues
 // into it.
 //
-// THE SEMANTICS, on the FAST arm only (`appendExpandable` already proved
-// `args[0]` has exactly one use, this call — #6092):
+// THE SEMANTICS, on the FAST arm only:
 //
 //   store the element at buf + (off + vlen) * stride
 //   h.len = vlen + 1 ; RETURN h — the same header, mutated in place
 //
-// which is sound here specifically because nothing else in `f` can read `h`'s
-// pre-call state. The GROW arm below does NOT get this treatment — it calls
-// the general runtime entry point unconditionally, which clones a fresh
-// header whenever `h` was non-null (`rtSliceAppend`, runtime/root/slices.bit)
+// `slice_append` (`BIT_APPEND_FRESH` off, matching main): always sound to
+// emit here, unconditionally, exactly as before #6092 — the runtime's own
+// `rtSliceAppend` does the identical in-place mutation on this arm, so the
+// fast path only moves WHERE it happens, not WHAT happens.
+// `slice_append_fresh` (`BIT_APPEND_FRESH` on): sound here specifically
+// because `appendExpandable` already proved `args[0]` has exactly one use,
+// this call — nothing else in `f` can read `h`'s pre-call state (#6092).
+//
+// The GROW arm below does NOT get this treatment either way — it calls the
+// general runtime entry point unconditionally (under whichever name this
+// call already carries), which the `_fresh` pair clones a fresh header for
+// whenever `h` was non-null (`rtSliceAppendFresh`, runtime/root/slices.bit)
 // regardless of how many uses `h` has, since that path is shared with every
 // call site this pass does not touch. It fires on `len < cap` — the
 // complement of the runtime's own `vlen == vcap` grow test, so a
