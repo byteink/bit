@@ -19,6 +19,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [time](time.md) | `"std/time"` | Clocks, durations, sleeping |
 | [os](os.md) | `"std/os"` | Arguments, environment, exit |
 | [process](process.md) | `"std/process"` | Run a child process and capture its stdout/stderr |
+| [signal](signal.md) | `"std/signal"` | Block until the process receives SIGTERM or SIGINT, for a clean shutdown |
 | [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
 | [http](http.md) | `"std/http"` | HTTP/1.1 server and client |
 | [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract |

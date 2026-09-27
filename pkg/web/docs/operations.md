@@ -160,13 +160,13 @@ yourself.
 
 The usual trigger is the signal a deployment sends on shutdown - `SIGTERM`
 from Docker or Kubernetes, `SIGINT` from a developer's Ctrl-C.
-[`std/os`'s `waitForSignal`](../../../docs/stdlib/os.md#shutting-down-cleanly)
+[`std/signal`'s `waitForSignal`](../../../docs/stdlib/signal.md)
 blocks a green thread until one of those arrives, so the last line of
 `main` is the signal-to-shutdown wire itself:
 
 ```bit
 import { App, Config } from "web"
-import { waitForSignal, Signal } from "std/os"
+import { waitForSignal, Signal } from "std/signal"
 
 fn main(): ()! {
   let app = App(Config{ secret = "change-me" })
