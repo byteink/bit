@@ -422,13 +422,11 @@ Method {                         // extern class, 16 bytes, 8-aligned
   parameter or result type, used to pass the narrowing and then segfault the
   first call through it. `methodId` (`compiler/lower.bit`) keys the id on
   `name + "#" + signature` (the method's own `(params) => result` func type,
-  rendered structurally by `typeName`) instead of the bare name whenever
-  `BIT_IFACE_SIG=1`, so a signature mismatch misses every method-table lookup
-  it used to hit. Off by default (`BIT_BCE_JOIN` pattern, `compiler/optbce.bit`)
-  because it changes every method's id against the pinned stage0; every id
-  producer (this table's construction, `v.(I)`'s narrowing, and every ordinary
-  `call_iface`/`Op.CallValue` trampoline site) reads the same flag so the id
-  space stays self-consistent either way.
+  rendered structurally by `typeName`) instead of the bare name, so a
+  signature mismatch misses every method-table lookup it used to hit. Every
+  id producer (this table's construction, `v.(I)`'s narrowing, and every
+  ordinary `call_iface`/`Op.CallValue` trampoline site) reads the same key
+  so the id space stays self-consistent.
 - Each method's `fn` takes the receiver (the object body pointer) as its leading
   argument, then the call's own arguments — identical to a static method call.
 - Entries are unordered; `methods_len` may be 0 (a type with no methods).
@@ -584,8 +582,8 @@ bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has me
   the narrowing, and then segfaulted the first `call_iface` through it (the
   checker never verifies this: `v.(I)` narrows an UNRELATED interface's
   dynamic type, so there is no static agreement to lean on). See §2.1's id
-  bullet: under `BIT_IFACE_SIG=1`, `id` is signature-qualified, so this
-  chain's calls miss exactly when §2.1's table-building side does.
+  bullet: `id` is signature-qualified, so this chain's calls miss exactly
+  when §2.1's table-building side does.
 
 ### 2.3 `string` value, and shared-backing views (`s[lo:hi]`)
 

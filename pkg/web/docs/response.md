@@ -31,12 +31,12 @@ Content-Type is a MIME-sniffing vector), `c.status(n)` for an empty body,
 middleware that wants to reshape a value response on the way out.
 
 `c.json(v)` takes the value as it is at the call: changing `v` afterwards
-does not change the body. With one exception. In a program built with
-`BIT_JSON_APPEND=1`, a `@json` value is encoded straight into the body at
-`c.json` time, and its `Json` tree is only built if a middleware calls
-`.wrap` or `.mapValue`. That tree is built at that call, so a change made to
-`v` between `c.json(v)` and the middleware's `.wrap` shows up in the wrapped
-body. A value you do not change after returning it is unaffected.
+does not change the body. With one exception. For a `@json` value, the body
+is encoded straight from its fields at `c.json` time, and its `Json` tree is
+only built if a middleware calls `.wrap` or `.mapValue`. That tree is built
+at that call, so a change made to `v` between `c.json(v)` and the
+middleware's `.wrap` shows up in the wrapped body. A value you do not change
+after returning it is unaffected.
 
 ## The Node tree
 
