@@ -1,0 +1,229 @@
+// _tests_/bit/genericexplode.bit — #6058: a call to a generic instance whose
+// SUBSTITUTED parameter type is explodable passes the words instead of a heap
+// box, gated behind `BIT_GENERIC_EXPLODE` (compiler/lowerexplodegates.bit's
+// `genericExplodeEnabled`, default OFF until the stage0 repin carries it).
+//
+// NOT placed in _tests_/cases/: that corpus's golden/stage0 harnesses run
+// with a fixed environment and no per-fixture env var (the reason
+// _tests_/bit/staticconst.bit gives), so a golden there could not force the
+// flag. Drives the CLI directly; BIT_BIN/BIT_STDLIB/BIT_LIBBITRT, no oracle.
+//
+// The fixture's hot loop calls `isNone`/`isSome` on an exploded
+// `Option<string>` and a user generic on an `(int, int)` tuple; its second
+// loop hands a freshly built `Some("v${j}")` to a generic that allocates
+// before it reads the payload back, so under `BIT_GC=stress` a collection
+// runs while the payload word is live only as an exploded argument.
+//
+// Built twice: flag ON (run under the default collector and `BIT_GC=stress`)
+// and flag OFF, the control. Both must print `wantOut`, and the ON build must
+// allocate at least `boxesPerIter` fewer objects per hot iteration than the
+// control (`BIT_GC_STATS=1`, swept + live), so the flag-on path is proven
+// taken rather than assumed.
+//
+// WIRED INTO `./make test` as `test-genericexplode` (tools/build/gatestable2.bit,
+// tools/build/defs.bit).
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { indexOf } from "std/strings"
+
+const gateTimeoutMs: int = 120000
+const hotIters: int = 100000
+const boxesPerIter: int = 3
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("genericexplode: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn fixtureSrc(): string {
+  return "import { isNone, isSome, unwrap } from \"std/core\"\n\n" +
+    "fn both(a: Option<string>, b: Option<string>): bool {\n  return isNone(a) && isNone(b)\n}\n\n" +
+    "fn pick<T>(p: (T, T), first: bool): T {\n  let (a, b) = p\n  if (first) {\n    return a\n  }\n  return b\n}\n\n" +
+    "fn keep<T>(o: Option<T>, pad: int, out: []T): []T {\n" +
+    "  let junk = []int(pad)\n" +
+    "  if (isSome(o) && len(junk) == pad) {\n    return append(out, unwrap(o))\n  }\n" +
+    "  return out\n}\n\n" +
+    "fn main() {\n" +
+    "  let n = 0\n  let sum = 0\n  let i = 0\n" +
+    "  while (i < ${hotIters}) {\n" +
+    "    let none = Option<string>.None\n" +
+    "    if (both(none, none)) {\n      n = n + 1\n    }\n" +
+    "    if (isSome(none)) {\n      n = n - 1\n    }\n" +
+    "    sum = sum + pick<int>((i, 1), i % 2 == 0)\n" +
+    "    i = i + 1\n  }\n" +
+    "  let kept = []string(0)\n  let j = 0\n" +
+    "  while (j < 300) {\n" +
+    "    kept = keep(Option<string>.Some(\"v\${j}\"), 64, kept)\n" +
+    "    kept = keep(Option<string>.None, 8, kept)\n" +
+    "    j = j + 1\n  }\n" +
+    "  let total = 0\n  for s of kept {\n    total = total + len(s)\n  }\n" +
+    "  print(\"n=\${n} sum=\${sum} kept=\${len(kept)} total=\${total} last=\${kept[len(kept) - 1]}\\n\")\n" +
+    "}\n"
+}
+
+const wantOut: string = "n=100000 sum=2500000000 kept=300 total=1090 last=v299\n"
+
+class CompilerEnv {
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+}
+
+// Writes `body` as an executable `/bin/sh` script at `path` and runs it,
+// bounded. Returns the script's exit code, or 2 when it cannot be written.
+fn runScript(path: string, body: string): int {
+  writeFile(path, "#!/bin/sh\n" + body) catch e {
+    eprint("genericexplode: cannot write ${path}: ${e.message()}\n")
+    return 2
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700
+    eprint("genericexplode: cannot chmod ${path}\n")
+    return 2
+  }
+  return osRunBounded(path, gateTimeoutMs)
+}
+
+// The compiler's environment with `BIT_GENERIC_EXPLODE` set to `flag`.
+fn compilerEnv(cc: CompilerEnv, flag: string): string {
+  return "BIT_STDLIB=" +
+    shQuote(cc.stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" +
+    shQuote(cc.libbitrt) +
+    "\nexport BIT_LIBBITRT\n" +
+    "BIT_GENERIC_EXPLODE=${flag}\nexport BIT_GENERIC_EXPLODE\n"
+}
+
+// Runs `bin` with `gcEnv` prefixed to the program alone and returns its exit
+// code and combined output.
+fn runFixture(dir: string, bin: string, gcEnv: string): (int, string) {
+  let outPath = dir + "/run.out"
+  let code = runScript(
+    dir + "/run.sh",
+    gcEnv + " exec " + shQuote(bin) + " > " + shQuote(outPath) + " 2>&1\n",
+  )
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  return code, out
+}
+
+fn teardown(scratch: string) {
+  let _ = runScript(scratch + "/rm.sh", "rm -rf " + shQuote(scratch) + "\n")
+}
+
+fn die(scratch: string, msg: string) {
+  eprint("genericexplode: FAIL — ${msg}\n")
+  teardown(scratch)
+  exit(1)
+}
+
+// Builds the fixture with the flag at `flag` into `out`, dying on failure.
+fn buildFixture(cc: CompilerEnv, scratch: string, flag: string, out: string) {
+  let build = compilerEnv(cc, flag) +
+    "exec " +
+    shQuote(cc.bin) +
+    " build " +
+    shQuote(scratch + "/fixture.bit") +
+    " -o " +
+    shQuote(out) +
+    " > /dev/null 2> " +
+    shQuote(scratch + "/build.err") +
+    "\n"
+  if (runScript(scratch + "/build.sh", build) != 0) {
+    let err = readFile(scratch + "/build.err") catch _ {
+      ""
+    }
+    die(scratch, "fixture failed to build with BIT_GENERIC_EXPLODE=${flag}:\n${err}")
+  }
+}
+
+// The unsigned decimal that follows `key` in `s`, or -1 when `key` is absent.
+fn statField(s: string, key: string): int {
+  let at = indexOf(s, key)
+  if (at < 0) {
+    return -1
+  }
+  let i = at + len(key)
+  let v = 0
+  while (i < len(s) && s[i] >= 48 && s[i] <= 57) {
+    v = v * 10 + (int(s[i]) - 48)
+    i = i + 1
+  }
+  return v
+}
+
+// Objects `bin` allocated over one run: `BIT_GC_STATS=1`'s swept + live.
+fn objectCount(scratch: string, bin: string): int {
+  let (code, out) = runFixture(scratch, bin, "BIT_GC_STATS=1")
+  let swept = statField(out, " swept=")
+  let live = statField(out, " live=")
+  if (code != 0 || swept < 0 || live < 0) {
+    die(scratch, "no BIT_GC_STATS line from ${bin}: exit=${code}\n${out}")
+  }
+  return swept + live
+}
+
+fn checkRuns(scratch: string, bin: string, gcEnvs: []string) {
+  for gcEnv of gcEnvs {
+    let (code, out) = runFixture(scratch, bin, gcEnv)
+    if (code != 0 || out != wantOut) {
+      die(
+        scratch,
+        "${bin} ran wrong under '${gcEnv}': exit=${code}\n  want: ${wantOut}\n  got:  ${out}",
+      )
+    }
+  }
+}
+
+fn main() {
+  let cc = CompilerEnv{
+    bin = requiredEnv("BIT_BIN"),
+    stdlib = requiredEnv("BIT_STDLIB"),
+    libbitrt = requiredEnv("BIT_LIBBITRT"),
+  }
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-genericexplode-${timeUnixNs()}"
+  mkdir(scratch) catch e {
+    eprint("genericexplode: cannot create scratch directory ${scratch}: ${e.message()}\n")
+    exit(2)
+  }
+  writeFile(scratch + "/fixture.bit", fixtureSrc()) catch e {
+    die(scratch, "cannot write the fixture: ${e.message()}")
+  }
+  let on = scratch + "/fixture_on"
+  let off = scratch + "/fixture_off"
+  buildFixture(cc, scratch, "1", on)
+  buildFixture(cc, scratch, "0", off)
+  checkRuns(scratch, on, ["", "BIT_GC=stress"])
+  checkRuns(scratch, off, [""])
+  let onObjs = objectCount(scratch, on)
+  let offObjs = objectCount(scratch, off)
+  if (offObjs - onObjs < boxesPerIter * hotIters) {
+    die(
+      scratch,
+        "flag ON allocated ${onObjs} objects against ${offObjs} OFF; want at least " +
+        "${boxesPerIter * hotIters} fewer, so the generic calls still box their arguments",
+    )
+  }
+  teardown(scratch)
+  print("PASS genericexplode: Option<string> and (int, int) arguments to generic instances pass as words (${onObjs} objects against ${offObjs} flag-off), identically under the default collector and BIT_GC=stress\n")
+}
