@@ -1,0 +1,331 @@
+// pkg/web/guides/inkwell/app.test.bit — integration tests against a real
+// PostgreSQL (#6062, epic #6061). Every test calls `app.handle(req)`, the
+// exact seam pkg/web/docs/getting-started.md documents as running "the
+// same dispatch listen() serves" — real routing, real middleware, real
+// `Ctx`, real HTTP status/header/body semantics, with nothing bound to a
+// socket. `_tests_/bit/webguidesapp.bit` is what provisions the real
+// server this file's `DATABASE_URL` points at.
+//
+// Every test opens its own pool and builds its own `App` — an `App`
+// freezes its route table exactly once (pkg/web/app.bit), so two tests
+// sharing one `App` value would collide.
+import { Request } from "std/http"
+import { contains, indexOf, lastIndexOf } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+fn testConfig(): AppConfig! {
+  let url = env("DATABASE_URL")
+  if (len(url) == 0) {
+    panic("app.test: DATABASE_URL is not set — run this through ./make test-web-guides-app")
+  }
+  return AppConfig{ databaseUrl = url, secret = "test-secret", host = "127.0.0.1", port = 0 }
+}
+
+fn testPool(): Pool! {
+  let cfg = testConfig()?
+  return openPool(cfg)?
+}
+
+fn testApp(p: Pool): App {
+  let cfg = testConfig() catch e {
+    panic("testApp: ${e.message()}")
+  }
+  return buildApp(cfg, p)
+}
+
+fn uniqueName(prefix: string): string {
+  return "${prefix}-${uuidFormat(uuidV4())}"
+}
+
+fn jsonReq(method: string, path: string, cookie: string, body: string): Request {
+  let headers = "Content-Type: application/json"
+  if (len(cookie) > 0) {
+    headers = headers + "\r\nCookie: " + cookie
+  }
+  return Request{ method = method, path = path, headers = headers, body = body }
+}
+
+// "sid=<value>; HttpOnly; ..." -> "sid=<value>" — everything up to the
+// first attribute separator, exactly what a browser sends back as the
+// `Cookie` header.
+fn cookiePair(setCookie: string): string {
+  let semi = indexOf(setCookie, ";")
+  if (semi < 0) {
+    return setCookie
+  }
+  return setCookie[0:semi]
+}
+
+fn registerAndLogin(app: App, username: string, password: string): string! {
+  let registerBody = "{\"username\":\"${username}\",\"email\":\"${username}@example.test\",\"password\":\"${password}\"}"
+  let regRes = app.handle(jsonReq("POST", "/auth/register", "", registerBody))
+  if (regRes.status != 201) {
+    fail newError("register: want 201, got ${regRes.status}: ${regRes.body}")
+  }
+  let loginBody = "{\"username\":\"${username}\",\"password\":\"${password}\"}"
+  let loginRes = app.handle(jsonReq("POST", "/auth/login/", "", loginBody))
+  if (loginRes.status != 200) {
+    fail newError("login: want 200, got ${loginRes.status}: ${loginRes.body}")
+  }
+  let setCookie = loginRes.getHeader("Set-Cookie")
+  if (len(setCookie) == 0) {
+    fail newError("login: no Set-Cookie in response")
+  }
+  return cookiePair(setCookie)
+}
+
+test "health and readiness answer without authentication" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let health = app.handle(Request{ method = "GET", path = "/health", headers = "", body = "" })
+  assert(health.status == 200, "want 200 from /health, got ${health.status}")
+  let ready = app.handle(Request{ method = "GET", path = "/ready", headers = "", body = "" })
+  assert(ready.status == 200, "want 200 from /ready, got ${ready.status}")
+}
+
+test "register, login, and read back the caller's own profile with /me" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let username = uniqueName("alice")
+  let cookie = registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let me = app.handle(jsonReq("GET", "/me", cookie, ""))
+  assert(me.status == 200, "want 200 from /me, got ${me.status}")
+  assert(contains(me.body, username), "/me did not name the caller: ${me.body}")
+}
+
+test "a duplicate username registers 409, and a wrong password logs in 401" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  let app = testApp(p)
+  let username = uniqueName("dup")
+  registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let again = app.handle(
+    jsonReq(
+      "POST", "/auth/register", "",
+      "{\"username\":\"${username}\",\"email\":\"${username}@example.test\",\"password\":\"another password\"}",
+    ),
+  )
+  assert(again.status == 409, "want 409 for a duplicate username, got ${again.status}")
+  let badLogin = app.handle(
+    jsonReq("POST", "/auth/login/", "", "{\"username\":\"${username}\",\"password\":\"wrong\"}"),
+  )
+  assert(badLogin.status == 401, "want 401 for a wrong password, got ${badLogin.status}")
+}
+
+// Reads the JSON body's top-level "data.id" as a bare int by string search —
+// this file has no `@json` decoder target for the envelope shape, and a
+// full JSON round trip through `jsonGet`/`jsonDecInt` for one field in a
+// test is more machinery than the assertion needs.
+fn idFromLocation(location: string): string {
+  let slash = lastIndexOf(location, "/")
+  if (slash < 0) {
+    return ""
+  }
+  return location[slash + 1:len(location)]
+}
+
+fn postArticle(app: App, cookie: string, title: string, tags: string): string! {
+  let body = "{\"title\":\"${title}\",\"body\":\"body text\",\"tags\":${tags}}"
+  let res = app.handle(jsonReq("POST", "/articles/", cookie, body))
+  if (res.status != 201) {
+    fail newError("create article: want 201, got ${res.status}: ${res.body}")
+  }
+  return idFromLocation(res.getHeader("Location"))
+}
+
+test "creating an article attaches its tags atomically, and the detail route shows both" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let username = uniqueName("writer")
+  let cookie = registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, cookie, "Hello Inkwell", "[\"bit\",\"web\"]") catch e {
+    panic(e.message())
+  }
+  let show = app.handle(Request{ method = "GET", path = "/articles/${id}", headers = "", body = "" })
+  assert(show.status == 200, "want 200 from GET /articles/:id, got ${show.status}")
+  assert(contains(show.body, "\"bit\""), "tags missing from article detail: ${show.body}")
+  assert(contains(show.body, username), "author username missing from article detail: ${show.body}")
+}
+
+test "only the article's own author (or an admin) may update or delete it" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let owner = uniqueName("owner")
+  let ownerCookie = registerAndLogin(app, owner, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let intruder = uniqueName("intruder")
+  let intruderCookie = registerAndLogin(app, intruder, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let id = postArticle(app, ownerCookie, "Owned Article", "[]") catch e {
+    panic(e.message())
+  }
+
+  let forbiddenUpdate = app.handle(
+    jsonReq(
+      "PUT", "/articles/${id}", intruderCookie, "{\"title\":\"hijacked\",\"body\":\"x\"}",
+    ),
+  )
+  assert(forbiddenUpdate.status == 403, "want 403 for a non-owner update, got ${forbiddenUpdate.status}")
+
+  let allowedUpdate = app.handle(
+    jsonReq(
+      "PUT", "/articles/${id}", ownerCookie, "{\"title\":\"edited\",\"body\":\"y\"}",
+    ),
+  )
+  assert(allowedUpdate.status == 200, "want 200 for the owner's own update, got ${allowedUpdate.status}")
+  assert(contains(allowedUpdate.body, "edited"), "update did not take: ${allowedUpdate.body}")
+
+  let forbiddenDelete = app.handle(
+    Request{ method = "DELETE", path = "/articles/${id}", headers = "Cookie: " + intruderCookie, body = "" },
+  )
+  assert(forbiddenDelete.status == 403, "want 403 for a non-owner delete, got ${forbiddenDelete.status}")
+
+  let allowedDelete = app.handle(
+    Request{ method = "DELETE", path = "/articles/${id}", headers = "Cookie: " + ownerCookie, body = "" },
+  )
+  assert(allowedDelete.status == 204, "want 204 for the owner's own delete, got ${allowedDelete.status}")
+}
+
+test "comments: any logged-in reader may post, only the comment's own author may delete" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let author = uniqueName("author")
+  let authorCookie = registerAndLogin(app, author, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let reader = uniqueName("reader")
+  let readerCookie = registerAndLogin(app, reader, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let articleId = postArticle(app, authorCookie, "Comment Target", "[]") catch e {
+    panic(e.message())
+  }
+
+  let posted = app.handle(
+    jsonReq(
+      "POST", "/articles/${articleId}/comments/", readerCookie, "{\"body\":\"nice post\"}",
+    ),
+  )
+  assert(posted.status == 201, "want 201 posting a comment, got ${posted.status}")
+  let commentId = idFromLocation(posted.getHeader("Location"))
+
+  let list = app.handle(
+    Request{ method = "GET", path = "/articles/${articleId}/comments/", headers = "", body = "" },
+  )
+  assert(list.status == 200, "want 200 listing comments, got ${list.status}")
+  assert(contains(list.body, "nice post"), "posted comment missing from the list: ${list.body}")
+
+  let forbidden = app.handle(
+    Request{ method = "DELETE", path = "/comments/${commentId}", headers = "Cookie: " + authorCookie, body = "" },
+  )
+  assert(forbidden.status == 403, "want 403 for the article author deleting someone else's comment, got ${forbidden.status}")
+
+  let allowed = app.handle(
+    Request{ method = "DELETE", path = "/comments/${commentId}", headers = "Cookie: " + readerCookie, body = "" },
+  )
+  assert(allowed.status == 204, "want 204 for the comment's own author deleting it, got ${allowed.status}")
+}
+
+test "tag creation is admin-only, and the tag list is public" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let username = uniqueName("plain")
+  let cookie = registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let forbidden = app.handle(
+    jsonReq("POST", "/tags/", cookie, "{\"name\":\"${uniqueName("tag")}\"}"),
+  )
+  assert(forbidden.status == 403, "want 403 for a non-admin tag creation, got ${forbidden.status}")
+
+  let list = app.handle(Request{ method = "GET", path = "/tags/", headers = "", body = "" })
+  assert(list.status == 200, "want 200 listing tags, got ${list.status}")
+}
+
+test "the article list paginates: a 1-item page reports the real total and a next cursor" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let username = uniqueName("pager")
+  let cookie = registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  postArticle(app, cookie, "Pager One", "[]") catch e {
+    panic(e.message())
+  }
+  postArticle(app, cookie, "Pager Two", "[]") catch e {
+    panic(e.message())
+  }
+
+  let res = app.handle(
+    Request{
+      method = "GET", path = "/articles/?limit=1&page=1&sort=newest", headers = "", body = "",
+    },
+  )
+  assert(res.status == 200, "want 200 listing articles, got ${res.status}")
+  assert(contains(res.body, "\"meta\""), "paginated list must carry a meta block: ${res.body}")
+  assert(contains(res.body, "\"limit\":1"), "meta.limit did not reflect the requested limit: ${res.body}")
+}
+
+test "logging out invalidates the session for a subsequent request" {
+  let p = testPool() catch e {
+    panic("testPool: ${e.message()}")
+  }
+  runMigrations(p) catch e {
+    panic("runMigrations: ${e.message()}")
+  }
+  let app = testApp(p)
+  let username = uniqueName("logout")
+  let cookie = registerAndLogin(app, username, "correct horse battery") catch e {
+    panic(e.message())
+  }
+  let logoutRes = app.handle(
+    Request{ method = "POST", path = "/auth/logout", headers = "Cookie: " + cookie, body = "" },
+  )
+  assert(logoutRes.status == 204, "want 204 from logout, got ${logoutRes.status}")
+  let me = app.handle(jsonReq("GET", "/me", cookie, ""))
+  assert(me.status == 401, "want 401 from /me after logout, got ${me.status}")
+}
