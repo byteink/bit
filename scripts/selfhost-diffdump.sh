@@ -90,16 +90,16 @@ diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
-# #5995/#5976: these flags default on in this tree and off in the 0.30.0
-# ORACLE, so force "1" on both sides to compare ON against ON. IFACE_SIG
-# (#5979) and BCE_JOIN (#5971) change only ir/iropt; JSON_APPEND (#5991)
-# adds a method before typecheck, so every kind sees it. Remove the
-# exports, and the flags, at the next repin.
+# #6000: IFACE_SIG, BCE_JOIN, JSON_APPEND are gone -- the 0.31.0 ORACLE
+# carries all three unconditionally. BIT_STATIC_CONST (#5990) defaults ON in
+# this tree but off in the ORACLE (cut before the flip), so force "1" on
+# both to compare ON-ON -- mutation-proven: without this, every
+# fnvalue-trampoline fixture mismatches (`make_closure @fnvalue$trampoline$N`
+# vs `global_addr @__bitfnv_N`) in BOTH ir and iropt (KIND=ir), since it
+# changes IR at emission time, before any opt pass runs.
 if [ "$KIND" = ir ]; then
-  export BIT_IFACE_SIG=1
-  export BIT_BCE_JOIN=1
+  export BIT_STATIC_CONST=1
 fi
-export BIT_JSON_APPEND=1
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.

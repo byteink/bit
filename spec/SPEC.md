@@ -1039,10 +1039,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   appends into one growable `[]JsonEntry` and `jsonEncode` renders it into one
   buffer.
 
-**`__jsonAppend` - the direct byte encoder (`BIT_JSON_APPEND`, on by
-default).**
+**`__jsonAppend` - the direct byte encoder.**
 
-- Unless `BIT_JSON_APPEND=0`, a class carrying `@json` gains a second synthesized member
+- A class carrying `@json` gains a second synthesized member
 
   ```
   __jsonAppend(out: []byte): []byte
@@ -1058,13 +1057,14 @@ default).**
   which self-delimits with its own `{`/`}`.
 - **`__jsonAppend` is a reserved name on every class, `@json` or not.** A
   class that declares a method by this name is **E0164**, whether or not it
-  carries `@json` and whether or not `BIT_JSON_APPEND` is set for this
-  process: name-only interface assertions (§14.4) match by name alone, so a
-  same-named method of the wrong shape on an unrelated class would still
-  satisfy one and misbehave at the call, not at the assertion.
-- Default OFF; a module with no `@json` class, or a process running with the
-  flag unset, synthesizes nothing beyond what this section already
-  describes for `toJson`.
+  carries `@json`: name-only interface assertions (§14.4) match by name
+  alone, so a same-named method of the wrong shape on an unrelated class
+  would still satisfy one and misbehave at the call, not at the assertion.
+- A module with no `@json` class synthesizes nothing beyond what this
+  section already describes for `toJson`.
+- **Unconditional.** Earlier releases generated `__jsonAppend` only under a
+  build-time flag; every class carrying `@json` now gets it, with no way to
+  opt out and no separate code path to keep in sync with `toJson`'s own.
 
 **`jsonDecode<T>` - the reading half.**
 
