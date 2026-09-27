@@ -245,12 +245,12 @@ fn encodeExample(): string {
 
 Each of these appends one JSON scalar, key, or raw run directly onto a
 `[]byte` accumulator, byte-identical to encoding the matching `Json` value
-with `jsonEncode` — for generated or hand-written code building a document
+with `jsonEncode`, for generated or hand-written code building a document
 without allocating a `JsonObject`/`JsonArray` tree first.
 
 ### `jsonAppendRaw(out: []byte, s: string): []byte`
 
-Appends `s` onto `out` verbatim, with no escaping — for text that is already
+Appends `s` onto `out` verbatim, with no escaping, for text that is already
 valid JSON, such as a nested value's own encoded bytes.
 
 ### `jsonAppendKey(out: []byte, key: string, first: bool): []byte`
