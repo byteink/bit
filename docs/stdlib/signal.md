@@ -15,6 +15,14 @@ stop accepting new work, let what is already running finish, then exit.
 
 ## Waiting for the signal
 
+### `Signal`
+
+The signal `waitForSignal` can report:
+
+- `Term` - `SIGTERM` on Linux/Darwin; a Ctrl-Break, console-close or
+  logoff/shutdown event on Windows.
+- `Int` - `SIGINT` on Linux/Darwin; Ctrl-C on Windows.
+
 ### `waitForSignal(sigs: []Signal): Signal`
 
 ```bit
@@ -72,21 +80,11 @@ to shut down cleanly usually wants to for either reason.
 
 [`pkg/web`](../../pkg/web/docs/operations.md)'s `App.serve()` returns a
 `Server` you can stop on your own terms with `server.shutdown(timeoutMs)` -
-but nothing calls `shutdown` for you. `waitForSignal` is the missing wire:
-
-```bit
-import { App, Config } from "web"
-import { waitForSignal, Signal } from "std/signal"
-
-fn main(): ()! {
-  let app = App(Config{ secret = "change-me" })
-  app.get("/", (c) => c.text("ok"))
-  let server = app.serve()?
-
-  let _ = waitForSignal([Signal.Term, Signal.Int])
-  server.shutdown(10000)?
-}
-```
+but nothing calls `shutdown` for you. `waitForSignal` is the missing wire,
+exactly the shape the section above already builds: start the server,
+`waitForSignal`, then `server.shutdown(timeoutMs)` - see
+[pkg/web's own worked example](../../pkg/web/docs/operations.md#graceful-shutdown)
+for the full, runnable version.
 
 Docker and Kubernetes both send `SIGTERM` first and wait before sending
 `SIGKILL` - `server.shutdown`'s own timeout should stay under however long
