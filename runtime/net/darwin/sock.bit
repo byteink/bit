@@ -32,7 +32,7 @@ import { pollDescRegister, pollDescRegisterWrite, pollDescUnregister } from "../
 // are the two waiters.
 import {
   pdOpen, pdWait, pdClose, pdDirRead, pdDirWrite,
-  pdClaimed, pdAlreadyReady, pdStaleGen, pdEmpty,
+  pdClaimed, pdAlreadyReady, pdStaleGen, pdEmpty, pdEofSeen,
 } from "../../sched"
 // Per-fd in-flight reference counting (#5886): the Go-style `fdMutex` that
 // defers a real `close(2)` until the last acquired op releases, so a task
@@ -391,6 +391,48 @@ let netFdWriteArmed: [65536]i64
   return ptrOf(netFdWriteArmed) + fd
 }
 
+// Whether `fd`'s last read proved the socket drained (#5993): 0 when `fd`
+// has no poller registration (never skip, nothing would wake the wait), 1
+// when it has one, 2 when its last read also came back short. Reset by
+// `netPollDescOpen` for every new socket. Written only by the reading task:
+// one reader per fd at a time, which is how every `net.Conn` is used (a
+// second concurrent waiter already gets `pdBusy`).
+let netFdReadHint: [65536]i64
+
+const netReadUnarmed: int = 0
+const netReadArmed: int = 1
+const netReadShort: int = 2
+
+@nosplit fn netFdReadHintAddr(fd: int): *i64 {
+  return ptrOf(netFdReadHint) + fd
+}
+
+// Record what a read that returned `n >= 0` of `bufCap` proved.
+@nosplit fn netReadNote(fd: int, n: int, bufCap: int) {
+  let a = netFdReadHintAddr(fd)
+  if (*a == netReadUnarmed) {
+    return
+  }
+  if (n > 0 && n < bufCap) {
+    *a = netReadShort
+  } else {
+    *a = netReadArmed
+  }
+}
+
+// Whether the next read on `fd` would return EAGAIN, so a reader may wait for
+// readiness first instead of issuing it (#5993). A short non-blocking stream
+// read leaves the receive buffer empty, so every later byte, FIN or reset
+// runs sorwakeup, which re-activates the EV_CLEAR read filter; the event
+// lands in the read slot as `pdReady` or wakes the parked reader. The short
+// reads that still owe a delivery (stopped at the urgent mark, took the FIN
+// with the data, error pending) are the ones `pdEofMark` records from the
+// drain (`../../sched/darwin/pollonce.bit`'s `pollDescReadOwed`) before the
+// wake that preceded this read, so they fall back to reading.
+@nosplit fn netReadDrained(fd: int, gen: int): bool {
+  return *netFdReadHintAddr(fd) == netReadShort && !pdEofSeen(fd, gen)
+}
+
 // Register `fd`'s READ filter with the kernel poller ONCE, for its whole
 // life (#5865) — called right after the runtime makes a socket non-blocking
 // (accept, connect, listen; `netAcceptTcp`/`netSysSocket` are the two call
@@ -425,6 +467,7 @@ let netFdWriteArmed: [65536]i64
   let gen = pdOpen(fd)
   *netFdGenAddr(fd) = gen
   *netFdWriteArmedAddr(fd) = 0
+  *netFdReadHintAddr(fd) = netReadUnarmed
   let taskAddr = schedCurrentTask()
   if (taskAddr == 0) {
     return
@@ -439,7 +482,9 @@ let netFdWriteArmed: [65536]i64
   if (pollFd == 0) {
     return
   }
-  let _ = pollDescRegister(pollFd, fd, gen)
+  if (pollDescRegister(pollFd, fd, gen)) {
+    *netFdReadHintAddr(fd) = netReadArmed
+  }
 }
 
 // Retract `fd`'s kernel registration and wake anything still parked on it
