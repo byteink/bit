@@ -155,25 +155,40 @@ fn decodeChunkedBody(s: byteStream, buffered: string, maxBodyBytes: int): string
   fail newError("readMessage: too many chunks")
 }
 
-// -1 if `headBlock` (the request line plus header lines, before splitting)
-// carries a bare CR, a bare LF, or a NUL; otherwise the number of `\n` bytes
-// in it, each one a CRLF once those three conditions are ruled out. RFC 9110
-// §5.5 forbids all three in a field value; letting one survive lets a single
-// header line on the wire masquerade as several once something reflects it —
-// e.g. a bare LF inside a header value is not a line terminator to this
-// parser, so it stays embedded in that header's value, and anything after it
-// (`Set-Cookie: admin=1`, say) rides along as attacker-controlled text inside
-// what the application sees as one ordinary value. Scanning the whole block,
-// not just header values, also catches an attempt to smuggle one through the
-// request line.
+// `breaks` is -1 if `headBlock` (the request line plus header lines, before
+// splitting) carries a bare CR, a bare LF, or a NUL; otherwise the number of
+// `\n` bytes in it, each one a CRLF once those three conditions are ruled out.
+// RFC 9110 §5.5 forbids all three in a field value; letting one survive lets a
+// single header line on the wire masquerade as several once something
+// reflects it — e.g. a bare LF inside a header value is not a line terminator
+// to this parser, so it stays embedded in that header's value, and anything
+// after it (`Set-Cookie: admin=1`, say) rides along as attacker-controlled
+// text inside what the application sees as one ordinary value. Scanning the
+// whole block, not just header values, also catches an attempt to smuggle one
+// through the request line.
 //
 // The count doubles as `Request.headerLines` (http.bit, #5964): with a
 // request line present (`readMessage`'s `eol >= 0`), the request line's own
 // CRLF plays the same role as the "+1" in `pkg/web`'s `checkHeaderCaps`
 // formula (`1 + CRLF pairs in headers`), so this return value equals that
 // count exactly, off the one walk `readMessage` already had to make.
-fn headerBlockBreaks(headBlock: string): int {
+//
+// `clAt`, `teAt` and `connAt` are where the first Content-Length,
+// Transfer-Encoding and Connection field lines begin in `headBlock`, -1 when
+// absent, and all -1 when `breaks` is. Every HTTP/1 request needs all three
+// before its handler runs. Once the block is accepted, every `\n` closes a
+// CRLF, so the byte after each one is exactly a line start `headerLineStart`
+// (http.bit) would test; testing it here, on the walk that already visits
+// every `\n`, replaced a second walk that found each line end again with
+// `indexOfFrom` (#5970). The request line itself is never tested: no `\n`
+// precedes it, and `headerLineStart` runs on `headers`, which starts after it.
+// Ints rather than values because a multi-value return of strings boxes each
+// one on the heap, which four ints do not.
+fn headerBlockScan(headBlock: string): (int, int, int, int) {
   let breaks = 0
+  let clAt = 0 - 1
+  let teAt = 0 - 1
+  let connAt = 0 - 1
   let i = 0
   while (i < len(headBlock)) {
     let c = headBlock[i]
@@ -185,14 +200,41 @@ fn headerBlockBreaks(headBlock: string): int {
       continue
     }
     if (bareControlAt(headBlock, i, c)) {
-      return -1
-    }
-    if (c == '\n') {
-      breaks = breaks + 1
+      return 0 - 1, 0 - 1, 0 - 1, 0 - 1
     }
     i = i + 1
+    if (c == '\n') {
+      breaks = breaks + 1
+      let (cl, te, conn) = framingLinesAt(headBlock, i, clAt, teAt, connAt)
+      clAt = cl
+      teAt = te
+      connAt = conn
+    }
   }
-  return breaks
+  return breaks, clAt, teAt, connAt
+}
+
+// `clAt`, `teAt` and `connAt` with the line starting at `at` tested for each
+// field name that has not matched yet. A separate function so
+// `headerBlockScan`'s loop body stays flat: an `if` nested in its LF test
+// gives the loop's back edge a join the bounds-check pass (compiler/optbce.bit)
+// cannot see through (#5969, #5971). One call, not three inlined tests, also
+// keeps the name constants out of the byte loop, so on x86_64 the byte `c`
+// stays in a register across it instead of a stack slot.
+fn framingLinesAt(headBlock: string, at: int, clAt: int, teAt: int, connAt: int): (int, int, int) {
+  let cl = firstLineAt(headBlock, at, clAt, "content-length")
+  let te = firstLineAt(headBlock, at, teAt, "transfer-encoding")
+  return cl, te, firstLineAt(headBlock, at, connAt, "connection")
+}
+
+// `found` when a `name` line was already seen (>= 0), else `at` when a `name`
+// field line begins there, else -1: the first line wins, as in
+// `headerLineStart` (http.bit).
+fn firstLineAt(headBlock: string, at: int, found: int, name: string): int {
+  if (found >= 0 || !fieldLineAt(headBlock, at, name)) {
+    return found
+  }
+  return at
 }
 
 // True when `c`, the byte at `i`, is a NUL, an LF with no CR before it, or a
@@ -347,7 +389,7 @@ fn readRequestContentLengthBody(s: byteStream, initial: string, cl: int): string
 // than pick one. Chunked is decoded, never handed through as raw framing.
 // Neither header present means no body, regardless of what already arrived.
 // `clText`/`teText` are the two fields' values as `header()` returns them
-// (`framingLines`, #5919). Split out of `readMessage` (#2448).
+// (`headerBlockScan`, #5970). Split out of `readMessage` (#2448).
 fn readRequestBody(
   s: byteStream,
   bodyStart: string,
@@ -407,7 +449,7 @@ fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   }
   let headBlock = raw[0:sep]
   let bodyStart = raw[sep + 4:len(raw)]
-  let headerLines = headerBlockBreaks(headBlock)
+  let (headerLines, clAt, teAt, connAt) = headerBlockScan(headBlock)
   if (headerLines < 0) {
     fail newError("readMessage: control character in header block")
   }
@@ -454,9 +496,11 @@ fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   // reused connection, 2000 requests, aarch64-macos). A request with no body,
   // or whose body already arrived with the headers, makes no further
   // `readUp` call, so this costs it nothing.
-  let (clAt, teAt, connAt) = framingLines(headers)
-  let clText = fieldValue(headers, clAt, "content-length")
-  let teText = fieldValue(headers, teAt, "transfer-encoding")
+  //
+  // The three offsets index `headBlock`, and `headers` is its suffix, so
+  // `fieldValue` reads the same bytes off `headBlock` directly.
+  let clText = fieldValue(headBlock, clAt, "content-length")
+  let teText = fieldValue(headBlock, teAt, "transfer-encoding")
   let body = readRequestBody(s, bodyStart, clText, teText, maxBodyBytes) catch e {
     s.setIdleDeadline(0)
     fail e
@@ -465,6 +509,6 @@ fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   return Request{
     method = method, path = path, version = version, headers = headers, body = body, peer = peer,
     headerLines = headerLines,
-    closeAsked = wantsClose(fieldValue(headers, connAt, "connection"), version),
+    closeAsked = wantsClose(fieldValue(headBlock, connAt, "connection"), version),
   }
 }
