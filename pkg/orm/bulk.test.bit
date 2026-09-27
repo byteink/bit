@@ -50,10 +50,16 @@ class bkRows {
 class bkAdapter {
   calls: []bkCall
   nextId: i64
-  // The columns each `RETURNING *` row carries, `id` always first — the
-  // width `query()` below steps `params` by, since a test's entity has a
-  // fixed number of columns per row.
+  // The columns each `RETURNING *` row carries, `id` always first.
   cols: []string
+  // The number of BOUND placeholders per VALUES group `query()` steps
+  // `params` by — one less than `len(cols)` when the entity carries a sole
+  // database-generated `@id` (#6107: `insertAllSql`/`rowMarksAndArgs` exclude
+  // it from both the column list and the bound arguments, the same way
+  // `write.bit`'s `insertColumnsAndArgs` already does for a single-row
+  // INSERT, #6101). Set explicitly per test rather than derived from `cols`,
+  // since the two counts now legitimately differ.
+  paramsPerRow: int
 
   connect(cfg: Datasource): Conn! {
     return bkConn{ a = this }
@@ -64,24 +70,24 @@ class bkConn {
   a: bkAdapter
 
   // Computes its RETURNING rows from `params` itself: `len(params) /
-  // len(this.a.cols)` groups, each answering with a fresh generated `id`
-  // (column 0) and every other column echoed back exactly as sent.
+  // paramsPerRow` groups, each answering with a fresh generated `id` (column
+  // 0) and every bound column echoed back exactly as sent, in order.
   query(sqlText: string, params: []Value): Rows! {
     this.a.calls = append(this.a.calls, bkCall{ sql = sqlText, args = params })
-    let ncols = len(this.a.cols)
+    let width = this.a.paramsPerRow
     let data = [][]Value(0)
     let i = 0
     while (i < len(params)) {
       this.a.nextId = this.a.nextId + 1
       let row = []Value(0)
       row = append(row, Value.Int(this.a.nextId))
-      let j = 1
-      while (j < ncols) {
+      let j = 0
+      while (j < width) {
         row = append(row, params[i + j])
         j = j + 1
       }
       data = append(data, row)
-      i = i + ncols
+      i = i + width
     }
     return bkRows{ cols = this.a.cols, data = data, i = -1 }
   }
@@ -123,7 +129,12 @@ fn bulkItemValues(seq: int): map<string, Value> {
 }
 
 test "insertAll with 3 rows issues exactly 1 statement carrying 3 value groups" {
-  let a = bkAdapter{ calls = []bkCall(0), nextId = 0, cols = ["id", "name", "email"] }
+  let a = bkAdapter{
+    calls = []bkCall(0),
+    nextId = 0,
+    cols = ["id", "name", "email"],
+    paramsPerRow = 2,
+  }
   let p = newBkPool(a)
   let u0 = Account{ id = 0, name = "Ada", email = "a@x.com" }
   let u1 = Account{ id = 0, name = "Bea", email = "b@x.com" }
@@ -136,13 +147,21 @@ test "insertAll with 3 rows issues exactly 1 statement carrying 3 value groups" 
   }
 
   assert(len(a.calls) == 1, "must issue exactly 1 statement, got ${len(a.calls)}")
-  let want = "insert into accounts (id, name, email) values ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) returning *"
+  // `id` is excluded (#6107, same reasoning #6101 already gave write.bit's
+  // single-row INSERT): Postgres's `generated always as identity` refuses an
+  // explicit INSERT value for it.
+  let want = "insert into accounts (name, email) values ($1, $2), ($3, $4), ($5, $6) returning *"
   assert(a.calls[0].sql == want, "got: ${a.calls[0].sql}")
   assert(len(generated) == 3, "must return one row per input row, got ${len(generated)}")
 }
 
 test "an INSERT with database-generated keys fills every entity's key and marks it persisted" {
-  let a = bkAdapter{ calls = []bkCall(0), nextId = 100, cols = ["id", "name", "email"] }
+  let a = bkAdapter{
+    calls = []bkCall(0),
+    nextId = 100,
+    cols = ["id", "name", "email"],
+    paramsPerRow = 2,
+  }
   let p = newBkPool(a)
   let u0 = Account{ id = 0, name = "Ada", email = "a@x.com" }
   let u1 = Account{ id = 0, name = "Bea", email = "b@x.com" }
@@ -175,7 +194,9 @@ test "an INSERT with database-generated keys fills every entity's key and marks 
 // is deliberately NOT a multiple of `65535 / 4`, so the last chunk is
 // short, and the test proves the boundary neither drops nor repeats a row.
 test "30000 rows of a 4-column entity chunk at 65535/4 placeholders, every row exactly once" {
-  let a = bkAdapter{ calls = []bkCall(0), nextId = 0, cols = ["id", "seq", "note", "extra"] }
+  let a = bkAdapter{
+    calls = []bkCall(0), nextId = 0, cols = ["id", "seq", "note", "extra"], paramsPerRow = 3,
+  }
   let p = newBkPool(a)
   let total = 30000
   let rows = []map<string, Value>(0)
@@ -231,4 +252,59 @@ test "30000 rows of a 4-column entity chunk at 65535/4 placeholders, every row e
     j = j + 1
   }
   assert(missing == 0, "every seq 0..${total - 1} must be present, got ${missing} missing")
+}
+
+// #6107, against a real Postgres server (`write.test.bit`'s own header
+// pattern): `ORM_TEST_LIVE_PG_URI` supplies a connection string; this test
+// skips only when it is unset, and says so. Builds the table through
+// pkg/orm's OWN `t.id("id")` schema builder and Postgres renderer, never a
+// hand-typed DDL string, then round-trips two rows through `insertAll()` —
+// pre-fix this hit SQLSTATE 428C9 the identical way #6101's single-row
+// `save()` did. `env`/`run` (std/os), `envOr` (std/os) and
+// `findRepoRoot`/`scratchDir`/`resetDir` are already imported/declared
+// package-wide by `generate.bit`/`generate.test.bit` — see `write.test.bit`'s
+// own header for why importing or redeclaring any of them here would be
+// E0042.
+const liveBulkProofSource: string = "import { args } from \"std/os\"\nimport { pool, Datasource, Value, FieldDesc, AttrDesc } from \"std/sql\"\nimport { adapter } from \"postgres\"\nimport { TableDesc, Data, insertAll, table, Postgres } from \"orm\"\n\nfn itemDesc(): TableDesc {\n  return TableDesc{\n    table = \"t6107_items\",\n    fields = [\n      FieldDesc{ name = \"id\", typeName = \"i64\", attrs = [AttrDesc{ name = \"id\", args = []string(0) }] },\n      FieldDesc{ name = \"name\", typeName = \"string\", attrs = []AttrDesc(0) },\n    ],\n    classAttrs = []AttrDesc(0),\n  }\n}\n\nfn main(): ()! {\n  let uri = args()[1]\n  let db = pool(adapter(), Datasource{ uri = uri }) catch e {\n    panic(\"pool: \${e.message()}\")\n  }\n\n  db.exec(\"drop table if exists t6107_items\", []Value(0)) catch e { panic(\"drop: \${e.message()}\") }\n\n  let op = table(\"t6107_items\", (t) => {\n    t.id(\"id\")\n    t.string(\"name\", 100)\n  })\n  let stmts = Postgres{}.render(op)\n  for st of stmts {\n    db.exec(st.sql, []Value(0)) catch e { panic(\"create via schema builder: \${e.message()}\") }\n  }\n\n  let rows = [\n    map<string, Value>{ \"id\": Value.Int(0), \"name\": Value.Text(\"a\") },\n    map<string, Value>{ \"id\": Value.Int(0), \"name\": Value.Text(\"b\") },\n  ]\n  let generated = insertAll(db, itemDesc(), rows) catch e {\n    panic(\"LIVE PROOF FAILED (#6107): insertAll against a GENERATED ALWAYS AS IDENTITY table: \${e.message()}\")\n  }\n  if (len(generated) != 2) {\n    panic(\"LIVE PROOF FAILED: expected 2 generated rows, got \${len(generated)}\")\n  }\n  for g of generated {\n    let (idVal, ok) = g[\"id\"]\n    if (!ok) {\n      panic(\"LIVE PROOF FAILED: RETURNING did not fill the generated id\")\n    }\n    match (idVal) {\n      Int(n) => {\n        if (n <= i64(0)) {\n          panic(\"LIVE PROOF FAILED: generated id must be positive, got \${n}\")\n        }\n      }\n      _ => panic(\"LIVE PROOF FAILED: generated id was not an Int\")\n    }\n  }\n\n  db.exec(\"drop table t6107_items\", []Value(0)) catch e { panic(\"cleanup: \${e.message()}\") }\n  db.close()\n  print(\"LIVE_PROOF_OK\")\n}\n"
+
+test "live: insertAll() against a real GENERATED ALWAYS AS IDENTITY table (#6107)" {
+  let uri = env("ORM_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_PG_URI is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let proj = scratchDir("liveproof6107")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof6107\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", liveBulkProofSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(
+    rc == 0,
+    "live proof against a real Postgres server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}'",
+  )
+  resetDir(proj)
 }
