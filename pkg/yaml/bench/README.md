@@ -22,7 +22,7 @@ cross-compiled for this host's OS/arch inside a throwaway
 `${BENCH_GO_IMAGE:-golang:1.25}` docker container (`CGO_ENABLED=0`, both are
 pure Go, so no cgo toolchain is needed) and then also run natively - Go is
 never installed on the machine itself. The C, C++ and Rust competitors are
-built the same way inside one throwaway `${BENCH_NATIVE_IMAGE:-ghcr.io/rust-cross/cargo-zigbuild:0.23.4}` container
+built the same way inside one throwaway `${BENCH_ZB_IMAGE:-ghcr.io/rust-cross/cargo-zigbuild:0.23.4}` container
 (cargo-zigbuild: `zig cc`/`zig c++` at `-O3 -DNDEBUG`, and `cargo zigbuild`
 with fat LTO and one codegen unit), so no C, C++ or Rust toolchain is
 installed either. `BENCH_RUNS` overrides the run count (default 15).
@@ -96,11 +96,13 @@ plain scalar as `""`, where the core schema and every other side read null).
 ## Reading the numbers
 
 Each figure is a trimmed mean over `BENCH_RUNS` (default 15) single-process
-runs, timed end to end with `/usr/bin/time -l` (macOS) - the same technique
-[`bench/run.sh`](../../../bench/run.sh) uses for the top-level language
-benchmarks, including the interleaved run order and the reasoning in that
-file's `trimmean` comment for why a trimmed mean beats a bare minimum or
-median here. MB/s is the fixture's byte size divided by that trimmed wall
+runs, timed end to end by `run.sh`'s `time_run`: a microsecond wall clock
+around fork, exec and wait, with `/usr/bin/time -l` (macOS) in the chain for
+the peak RSS (its own `real` line has 10 ms resolution, too coarse for the
+C and C++ peers). The interleaved run order and the estimator are
+[`bench/run.sh`](../../../bench/run.sh)'s, with the reasoning in that file's
+`trimmean` comment for why a trimmed mean beats a bare minimum or median
+here. MB/s is the fixture's byte size divided by that trimmed wall
 time; peak RSS is the trimmed mean of `/usr/bin/time -l`'s own maximum
 resident set size. The checksum computation runs inside the timed region on
 every side (not just the untimed `--verify` proof), so every side is timed on
