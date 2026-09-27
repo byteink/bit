@@ -91,9 +91,9 @@ BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
 # #6000: IFACE_SIG, BCE_JOIN, JSON_APPEND are gone -- the 0.31.0 ORACLE
-# carries all three unconditionally. BIT_STATIC_CONST (#5990) defaults ON in
-# this tree but off in the ORACLE (cut before the flip), so force "1" on
-# both to compare ON-ON -- mutation-proven: without this, every
+# carries all three unconditionally. BIT_STATIC_CONST (#5990) is default off
+# until #6012 (ELF fixup); "1" on both sides keeps the ON path compared, and
+# is load-bearing once it flips -- mutation-proven: without this, every
 # fnvalue-trampoline fixture mismatches (`make_closure @fnvalue$trampoline$N`
 # vs `global_addr @__bitfnv_N`) in BOTH ir and iropt (KIND=ir), since it
 # changes IR at emission time, before any opt pass runs.
