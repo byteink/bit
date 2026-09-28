@@ -82,7 +82,7 @@ already dispositioned before this snapshot (E0214 among them: see below) and
 are not sitting in the 708.
 
 `E0212 unreachable-code` reads 0 in both scopes because the underlying dead
-code was fixed rather than the rule suppressed - see `docs/lint/policy.md`'s
+code was fixed rather than the rule suppressed - see `docs/development/lint-remediation-policy.md`'s
 E0212 section, which documents that E0212 catches real dead code, not a
 checker gap. It is not a gap in this measurement.
 

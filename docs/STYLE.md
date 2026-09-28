@@ -41,17 +41,53 @@ Every page, reference or guide, in this order:
 A page that is a list of features in declaration order has failed this,
 however accurate it is.
 
-## The running example
+## The running example: Inkwell, everywhere
 
-A section shares ONE example program, carried page to page and growing.
+One universe, fixed, not picked per page: **Inkwell**, a notes tool that
+grows into a small blogging API over the course of the Book (`docs/book/`).
+Drafts, articles, tags, authors - never `Circle`/`Rect`/`Foo`, never a
+different domain invented for one page.
 
-The reader should be able to read a whole section top to bottom and end with
-a program they built. Not twelve unrelated `Circle`/`Rect` snippets that
-exist only to have a shape with an `area()`.
+- The Book *builds* Inkwell, chapter by chapter, and is the only place a
+  concept is taught with a story.
+- A Language or Standard library reference page draws its small examples
+  from the same domain (a `Draft`, not a `Shape`) but never re-tells the
+  story - see "No duplicates" below.
+- A package's docs use Inkwell too where a realistic example helps, since
+  the Book itself is built on the first-party packages.
 
-Pick an example with a reason to exist. A link shortener, a log parser, a
-small HTTP service. Something whose requirements can legitimately demand the
-next feature, so the next page is motivated rather than merely next.
+The reader should be able to read the Book top to bottom and end with a
+program they built. A reference page's example is smaller - enough to show
+the one construct on its own - but it still speaks Inkwell's vocabulary, so
+nothing on the site ever asks the reader to hold two unrelated example
+programs in their head at once.
+
+## No duplicates: who owns what
+
+- A concept is **taught** once, in the Book, at the moment the app needs it.
+- A concept is **defined** once, on its Language or Standard library page.
+- The Book links to the definition instead of repeating it ("the full rules
+  are on [Errors](/language/errors)"). A reference page never tells a story
+  and never re-teaches; it may link back to the Book chapter that uses it.
+- A package's docs explain the package. They do not re-explain the language
+  or the standard library, and they do not have their own "install Bit"
+  page - they link to Get started.
+- Install instructions exist ONLY on Get started
+  (`docs/get-started.md`).
+
+## Banned words
+
+Never in public text, with no exception: **monomorphize, lowering, boxing,
+IR, stage0, oracle, differential, spec section numbers (`§10.5`), ticket
+numbers (`#6161`), rollout flags (internal `BIT_*` feature switches),
+internal file paths of the compiler, commit hashes, private repo or host
+names**. A user-facing environment variable such as `BIT_GC_STATS` is fine
+where the reader actually sets it.
+
+A term from this list that is genuinely load-bearing for the reader (say,
+what a generic call specializes to) gets a one-line plain-English definition
+at first use instead of the jargon word - "the compiler generates one copy
+of the function per type you use it with" rather than "monomorphizes".
 
 ## Voice
 
@@ -65,9 +101,10 @@ next feature, so the next page is motivated rather than merely next.
   interface value carrying its dynamic type and method table" is an ABI
   sentence in a beginner's page. Say what the reader observes; put the
   mechanism in a note at the bottom if it matters.
-- **No spec citations in the body.** A parenthetical list of section numbers
-  in the third sentence tells a reader this page was written for the
-  compiler team. One "Specification" line at the foot of the page is enough.
+- **No spec citations anywhere, not even a section number at the foot of the
+  page.** A parenthetical list of section numbers in the third sentence
+  tells a reader this page was written for the compiler team, and a bare
+  `§10.5` means nothing to them either way.
 - No filler openings. Not "In this section we will explore". Start.
 - No em dashes anywhere. `test-no-emdash` scans `docs/**/*.md`, every
   package README and every `pkg/<name>/docs/` tree, and it is right to.

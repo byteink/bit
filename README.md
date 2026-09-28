@@ -26,42 +26,12 @@ Windows target.
 ## Install
 
 ```
-brew install byteink/tap/bit           # macOS
-curl -fsSL bitlang.org/install.sh | sh # Linux
-irm bitlang.org/install.ps1 | iex      # Windows
+brew install byteink/tap/bit           # macOS; see Get started for Linux, Windows and Docker
 ```
 
-Any of them gives you a single static binary with nothing else to install - no
-runtime, no VM, no libc dependency. Check it:
-
-```
-bit --version
-```
-
-Later, move an `install.sh` install to the newest release in place - `--check`
-reports what it would do and changes nothing. A Homebrew install is upgraded
-with `brew upgrade byteink/tap/bit`, and `bit upgrade` says so rather than
-overwriting what brew owns:
-
-```
-bit upgrade --check
-bit upgrade
-```
-
-Or run the toolchain as a container, no install at all:
-
-```
-docker run --rm -v "$PWD:/work" ghcr.io/byteink/bit run hello.bit
-
-# to BUILD into your project, pass your own uid so the output belongs to you:
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/byteink/bit build hello.bit
-```
-
-The image runs as an unprivileged user, so without `--user` it can read your
-sources but not write a binary back into them.
-
-New here? [Get started](docs/tutorial.md) takes about fifteen minutes and ends
-with a real concurrent program.
+A single static binary with nothing else to install - no runtime, no VM, no
+libc dependency. [Get started](docs/get-started.md) covers every platform,
+verifies the install, and runs your first program.
 
 ## Build from source
 
