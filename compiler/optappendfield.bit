@@ -1,0 +1,316 @@
+// compiler/optappendfield.bit — #6179: which slice-typed class fields hold a
+// header nothing else can reach, so optappendown.bit's rule 2 may count a
+// read of one as a fresh source.
+//
+// THE QUESTION. `this.buf = append(this.buf, c)` reads a header out of a
+// field. That header is unshared at the append only if no other holder can
+// exist: no SSA value in this frame or a suspended caller, no other heap
+// slot. No local proof exists — any function may have copied the header out
+// of the field earlier (`let before = h.items` before a call that appends,
+// row `fieldrmw` of _tests_/bit/appendfresh.bit). So the fact is proved for a
+// FIELD, (class type, byte offset), over every function of the module after
+// inlining: the whole program, since `writeModuleExe` optimizes one module.
+//
+// THE INVARIANT: at every in-place append on a header read from field K, the
+// field is the header's only holder. It holds when, module-wide:
+//
+// 1. Every store to K stores `const_nil`, a `slice_new` whose only use is
+//    the store, or the result of rule 2's append. Nothing else holds any of
+//    them afterwards.
+// 2. A read of K either feeds only a `_fresh` append as its input, whose only
+//    use is a store back to K of the same object, with nothing but constants
+//    between the append and the store; or
+// 3. is used only as a header read (`slice_len`, `field_get`, `keep_alive`,
+//    the receiver of `slice_get`/`slice_set`/`string_from_bytes`).
+//
+// and no read of K is SEPARATED from its uses: on every path from the read to
+// them (the read's live range), no instruction may run another in-place
+// append on K. That is an append whose input is a K read, a store to K, or
+// anything that can run code this walk does not see: a call, an atomic, a
+// syscall, a safepoint poll, or a runtime call off the short list below
+// (anything else may synchronize with another thread or run a closure). So
+// no frame, suspended or not, holds a K header across the only instructions
+// that can mutate one, and rule 1 keeps every heap slot but K itself empty.
+//
+// A class value reaches `field_get`/`field_set` typed as its class: both are
+// emitted only off a receiver the checker typed `TypeKind.Struct`
+// (loweraccess.bit's `lowerFieldAccess`, lowerflow.bit's `lowerFieldStore`),
+// and a class with a reference field is never packed into a slice
+// (lowersliceinline.bit's `inlineStructCandidate`), so no untyped address
+// reaches one. Any read or store of K this file cannot place poisons K, and
+// a poisoned field keeps every append on it cloning.
+
+// A field key is `classType * fieldKeyShift + offset`.
+const fieldKeyShift: int = 4294967296
+
+// The module's answer. `live` is false when the module has no `_fresh`
+// append, which is every build with `BIT_APPEND_FRESH` unset: nothing asks,
+// so nothing is scanned and no field is owned. `poison[key]` is 1 when some
+// access to that field breaks the rules above.
+class FieldOwn {
+  ctx: TypeContext,
+  live: bool,
+  poison: map<int, int>,
+}
+
+fn ownedFieldsOf(m: IrModule): FieldOwn {
+  let fo = FieldOwn{ ctx = m.ctx, live = false, poison = map<int, int>() }
+  for f of m.funcs {
+    if (len(ownCandidates(f)) > 0) {
+      fo.live = true
+    }
+  }
+  if (!fo.live) {
+    return fo
+  }
+  for f of m.funcs {
+    fieldScanFunc(fo, f)
+  }
+  return fo
+}
+
+// Whether `ins`, a `field_get` in `f`, reads a field the module proved owned.
+fn fieldOwned(fo: FieldOwn, f: IrFunc, ins: IrInstr): bool {
+  let k = fieldKey(fo.ctx, f, ins)
+  return fo.live && k >= 0 && fo.poison[k] == 0
+}
+
+// `ins`'s field key, or -1 when its base is not typed as a class.
+fn fieldKey(ctx: TypeContext, f: IrFunc, ins: IrInstr): int {
+  let ty = f.instrs[ins.lhs].ty
+  if (ty <= 0 || ty >= len(ctx.types) || ctx.types[ty].kind != TypeKind.Struct) {
+    return -1
+  }
+  if (ins.ival < 0 || ins.ival >= fieldKeyShift) {
+    return -1
+  }
+  return ty * fieldKeyShift + ins.ival
+}
+
+// Whether a field of type `ty` can hold a slice header: a slice, or a type
+// parameter a generic read left unsubstituted.
+fn fieldMayHoldSlice(ctx: TypeContext, ty: int): bool {
+  if (ty <= 0 || ty >= len(ctx.types)) {
+    return true
+  }
+  let k = ctx.types[ty].kind
+  return k == TypeKind.Slice || k == TypeKind.TypeParam
+}
+
+fn fieldSliceAccess(fo: FieldOwn, f: IrFunc, ins: IrInstr): bool {
+  if (ins.op == Op.FieldGet) {
+    return fieldMayHoldSlice(fo.ctx, ins.ty)
+  }
+  return fieldMayHoldSlice(fo.ctx, ins.ival2) || fieldMayHoldSlice(fo.ctx, f.instrs[ins.rhs].ty)
+}
+
+fn fieldScanFunc(fo: FieldOwn, f: IrFunc) {
+  let o = newOwnFn(f, fo)
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if ((ins.op == Op.FieldGet || ins.op == Op.FieldSet) && fieldSliceAccess(fo, f, ins)) {
+      let k = fieldKey(fo.ctx, f, ins)
+      if (k >= 0 && !fieldAccessOk(o, i, k)) {
+        fo.poison[k] = 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn fieldAccessOk(o: OwnFn, i: int, k: int): bool {
+  if (o.f.instrs[i].op == Op.FieldSet) {
+    return fieldStoreOk(o, i, k)
+  }
+  return fieldRmwStore(o, i, k) >= 0 || fieldHeaderRead(o, i, k)
+}
+
+fn ownUseCount(o: OwnFn, v: int): int {
+  return o.useStart[v + 1] - o.useStart[v]
+}
+
+// Rule 1 for store `s` to field `k`.
+fn fieldStoreOk(o: OwnFn, s: int, k: int): bool {
+  let v = o.f.instrs[s].rhs
+  let d = o.f.instrs[v]
+  if (d.op == Op.ConstNil) {
+    return true
+  }
+  if (d.op == Op.RtCall && d.name == "slice_new") {
+    return ownUseCount(o, v) == 1
+  }
+  if (!isFreshAppend(d) || o.f.instrs[d.args[0]].op != Op.FieldGet) {
+    return false
+  }
+  return fieldKey(o.fields.ctx, o.f, o.f.instrs[d.args[0]]) == k &&
+    fieldRmwStore(o, d.args[0], k) == s
+}
+
+// Rule 2 for read `g` of field `k`: the store that closes its
+// read-modify-write, or -1 when `g` is not one.
+fn fieldRmwStore(o: OwnFn, g: int, k: int): int {
+  let r = fieldRmwAppend(o, g)
+  if (r < 0) {
+    return -1
+  }
+  let s = o.useList[o.useStart[r]]
+  let st = o.f.instrs[s]
+  if (st.op != Op.FieldSet ||
+    st.lhs != o.f.instrs[g].lhs ||
+    st.ival != o.f.instrs[g].ival ||
+    st.rhs != r) {
+    return -1
+  }
+  if (o.blockOf[s] != o.blockOf[r] || !fieldOnlyConsts(o.f, r + 1, s) || fieldSeparated(o, g, k)) {
+    return -1
+  }
+  return s
+}
+
+// The `_fresh` append read `g` is the only input of and nothing else reads,
+// when its result has one use; else -1.
+fn fieldRmwAppend(o: OwnFn, g: int): int {
+  if (ownUseCount(o, g) != 1) {
+    return -1
+  }
+  let r = o.useList[o.useStart[g]]
+  if (!isFreshAppend(o.f.instrs[r]) || !ownOnlyReceiver(o.f.instrs[r].args, g)) {
+    return -1
+  }
+  if (ownUseCount(o, r) != 1) {
+    return -1
+  }
+  return r
+}
+
+// Whether every instruction in `[lo, hi)` is a constant.
+fn fieldOnlyConsts(f: IrFunc, lo: int, hi: int): bool {
+  let i = lo
+  while (i < hi) {
+    let op = f.instrs[i].op
+    if (op != Op.ConstInt && op != Op.ConstBool && op != Op.ConstFloat && op != Op.ConstNil) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Rule 3 for read `g` of field `k`.
+fn fieldHeaderRead(o: OwnFn, g: int, k: int): bool {
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    if (!fieldHeaderUse(o.f.instrs[o.useList[u]], g)) {
+      return false
+    }
+    u = u + 1
+  }
+  return !fieldSeparated(o, g, k)
+}
+
+fn fieldHeaderUse(ins: IrInstr, g: int): bool {
+  if (ins.op == Op.SliceLen || ins.op == Op.FieldGet || ins.op == Op.KeepAlive) {
+    return true
+  }
+  if (ins.op != Op.RtCall) {
+    return false
+  }
+  let reader = ins.name == "slice_get" || ins.name == "slice_set" || ins.name == "string_from_bytes"
+  return reader && ownOnlyReceiver(ins.args, g)
+}
+
+// Whether any instruction on a path from read `g` to one of its uses may
+// run an in-place append on field `k`. The span is `g`'s live range: the
+// rest of its own block and every block it is live into, each cut at its
+// last use unless `g` is live out of it. A use itself is not in the span.
+fn fieldSeparated(o: OwnFn, g: int, k: int): bool {
+  ownMarkLive(o, g)
+  let def = o.blockOf[g]
+  if (fieldSpanSeparates(o, k, g + 1, fieldSpanEnd(o, g, def))) {
+    return true
+  }
+  let h = 0
+  while (h < o.nhit) {
+    let b = o.hit[h]
+    if (fieldSpanSeparates(o, k, o.f.blocks[b].instsStart, fieldSpanEnd(o, g, b))) {
+      return true
+    }
+    h = h + 1
+  }
+  return false
+}
+
+// Where `g`'s span in block `b` ends: the block's end when `g` is live out
+// of it, else its last use there.
+fn fieldSpanEnd(o: OwnFn, g: int, b: int): int {
+  for s of licmTargets(o.f, b) {
+    if (o.stamp[s] == o.epoch) {
+      return o.f.blocks[b].instsStart + o.f.blocks[b].instsLen
+    }
+  }
+  let end = o.f.blocks[b].instsStart
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let at = o.useList[u]
+    if (o.blockOf[at] == b && at > end) {
+      end = at
+    }
+    u = u + 1
+  }
+  return end
+}
+
+fn fieldSpanSeparates(o: OwnFn, k: int, lo: int, hi: int): bool {
+  let i = lo
+  while (i < hi) {
+    if (fieldSeparates(o, k, o.f.instrs[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `ins` may run an in-place append on field `k`, directly or in code
+// this walk cannot see.
+fn fieldSeparates(o: OwnFn, k: int, ins: IrInstr): bool {
+  let op = ins.op
+  if (fieldRunsUnseen(op)) {
+    return true
+  }
+  if (op == Op.FieldSet) {
+    return fieldKey(o.fields.ctx, o.f, ins) == k
+  }
+  if (op != Op.RtCall) {
+    return false
+  }
+  if (isAppendRt(ins) && len(ins.args) > 0) {
+    let src = o.f.instrs[ins.args[0]]
+    return src.op == Op.FieldGet && fieldKey(o.fields.ctx, o.f, src) == k
+  }
+  return !fieldLocalRtCall(ins.name)
+}
+
+// Whether `op` can run code, or hand control to a thread, this walk cannot
+// see.
+fn fieldRunsUnseen(op: Op): bool {
+  return op == Op.Call ||
+    op == Op.CallValue ||
+    op == Op.CallIface ||
+    op == Op.Asm ||
+    op == Op.Syscall ||
+    op == Op.PollAttention ||
+    opIsAtomic(op)
+}
+
+// Runtime calls that neither run a closure nor synchronize: allocation and
+// element access only. Every other runtime call separates.
+fn fieldLocalRtCall(name: string): bool {
+  return name == "slice_get" ||
+    name == "slice_set" ||
+    name == "slice_new" ||
+    name == "string_from_bytes" ||
+    name == "string_from_int" ||
+    name == "string_concat"
+}
