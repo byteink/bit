@@ -384,5 +384,3 @@ Reach for `remove` when you know the target is a single file or an already-
 empty directory; reach for `removeAll` the moment you are deleting a tree
 whose shape you have not verified yourself, such as anything under a path a
 caller or another process could also be writing to.
-
-Specification: `spec/SPEC.md` §11 (I/O), ABI.md §14 (`bit_rt_fs_*`).

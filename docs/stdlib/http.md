@@ -8,7 +8,7 @@ Fallible calls return `T!` - propagate with `?` or handle with `catch`.
 
 Scope: HTTP/1.1 over cleartext or TLS, one request per connection
 (`Connection: close`), no redirects. Headers are carried as a raw block and
-read with `header()`. Request framing follows RFC 9112 §6: a body is read only
+read with `header()`. Request framing follows RFC 9112 section 6: a body is read only
 when `Content-Length` or `Transfer-Encoding: chunked` says so (chunked is
 decoded, never passed through raw); a request declaring both, or a
 Content-Length or chunk stream this parser cannot make sense of, is rejected
@@ -590,7 +590,7 @@ ever reaches the wire.
 Validates every entry of `headers` and serializes them into one raw
 `"Name: value\r\n"`-per-line block - the exact wire form `header()` reads.
 Fails on the first invalid header - an empty name, a name with a byte outside
-RFC 9110 §5.6.2's `token` set, a value containing a raw CR, LF or NUL (the
+RFC 9110 section 5.6.2's `token` set, a value containing a raw CR, LF or NUL (the
 request-side twin of the response-header-injection check `header()`'s own
 callers already need), or a name this module manages itself and never lets a
 caller set: `Host`, `Connection`, `Content-Length`, `Transfer-Encoding`,
@@ -838,7 +838,7 @@ HTTP/2. There is no `serveH2` because there is nothing for it to do. See
 [HTTP/2](#http2) below and `examples/http2server`.
 
 A client that offers ALPN but shares no protocol with the server has its
-handshake **aborted** (RFC 7301 §3.2 `no_application_protocol`), not silently
+handshake **aborted** (RFC 7301 section 3.2 `no_application_protocol`), not silently
 downgraded to HTTP/1.1 - so a client that offers only `h2` is either served over
 HTTP/2 or refused, never quietly served over something it did not ask for.
 
@@ -1246,9 +1246,9 @@ of `TlsServer.shutdown()`. First, `hs`'s listener stops admitting brand-new
 QUIC connections (`H3Listener.stopAccepting`) - a client attempting one gets
 no answer and its handshake times out, the same outcome a fresh dial against
 a closed TCP listener gets. A connection currently answering a request is
-sent `GOAWAY` (RFC 9114 §5.2) naming the highest request stream it has
+sent `GOAWAY` (RFC 9114 section 5.2) naming the highest request stream it has
 accepted, so its peer opens no further stream on it - one that arrives anyway
-is refused with `H3_REQUEST_REJECTED` (RFC 9114 §4.1.1) - and once that
+is refused with `H3_REQUEST_REJECTED` (RFC 9114 section 4.1.1) - and once that
 request's response is sent, the connection closes right away rather than
 waiting for the peer to hang up or `timeoutMs` to pass. A connection with no
 request in flight yet is closed immediately, the same "nothing promised yet"
@@ -1256,7 +1256,7 @@ rule `TlsServer.shutdown()`'s idle connections follow. Whatever is still
 running once `timeoutMs` elapses is force-closed; the error names how many.
 
 A known, documented gap: refusing a new connection drops its Initial packet
-rather than replying with a CONNECTION_CLOSE (RFC 9000 §5.2.2's SHOULD) -
+rather than replying with a CONNECTION_CLOSE (RFC 9000 section 5.2.2's SHOULD) -
 `Listener.stopAccepting`'s own doc (`quic.md`) has why.
 
 ```bit
