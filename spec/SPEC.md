@@ -2717,9 +2717,9 @@ off) until the release after it lands repins the toolchain's own pinned
 previous-release oracle past this compiler build; with the flag unset, `{`
 in expression position stays E0021 ("expected an expression"), unchanged from
 every earlier release. This is a rollout mechanism only, not part of the
-language's steady-state definition - the same shape `BIT_STATIC_CONST` used
-for #5990's link-time-constant closures - and this paragraph is removed once
-the flag defaults on.
+language's steady-state definition - the same shape #5990's link-time-constant
+closures used, until #6192 made that lowering unconditional - and this
+paragraph is removed once the flag defaults on.
 
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
