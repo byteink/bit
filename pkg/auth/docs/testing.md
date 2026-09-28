@@ -2,38 +2,49 @@
 
 <!-- doctest: per-block -->
 
-[Sign in with Google](oidc.md) wired `/auth/google/callback` to
-`handleCallback`, which POSTs to Google's real token endpoint and fetches
-Google's real JWKS. That is exactly what you want in production and exactly
-what you cannot have in a test: CI has no business reaching
-`accounts.google.com`, and a real provider gives you no way to force an
-expired token or a wrong nonce on demand.
+[Sign in with Google](oidc.md) wired two routes:
 
-`discover`, `newJwksCache` and `handleCallback` each have an injectable
-sibling - `discoverFetch`, `newJwksCacheFetch` and `handleCallbackFetch` -
-taking one extra parameter, a fetch function, that the production entry
-points always pass as `nil` ("make the real call"). Pass your own instead,
-and the same route handler runs end to end against a provider you control,
-with zero network access.
+```text
+app.get("/auth/google", (c) => beginAuthorization(oidc, c))
+app.get("/auth/google/callback", (c) => {
+  let identity: Identity = handleCallback(oidc, c)?
+  return c.redirect("/me")
+})
+```
 
-## A fake provider in one test file
+`handleCallback` POSTs to Google's real token endpoint and reads Google's
+real JWKS. That is exactly what you want in production and exactly what you
+cannot have in a test: CI has no business reaching `accounts.google.com`,
+and a real provider gives you no way to force an expired token or a wrong
+nonce on demand.
 
-The three canned documents below - a discovery document, a JWKS, and a
-signed ID token - are all a fake OIDC provider is: no server, no port, just
-the strings `discoverFetch`/`newJwksCacheFetch`/`handleCallbackFetch` would
-otherwise have fetched over HTTPS.
+The route above does not change for a test. `OidcStrategy` carries an
+optional `tokenFetch` field - `nil` means the real network call, the same
+way every constructor in this package defaults it - and `handleCallback`
+reads it off the strategy value instead of taking it as a parameter. Build
+`oidc` with a fake `tokenFetch` and a JWKS cache that already knows its
+keys, and the identical route code runs end to end against a provider you
+control, with zero network access.
+
+## A fake provider, the same route
+
+The pieces below - a config literal, an already-parsed JWKS, a fake token
+endpoint - are all a fake OIDC provider is. Nothing here is a special test
+function: `beginAuthorization` and `handleCallback` are the two calls
+`oidc.md`'s route registration already makes.
 
 <!-- doctest: test-file -->
 ```bit
 import { App, Config, MemoryStore } from "web"
 import {
-  HttpFetch, OidcStrategy, TokenFetch,
-  beginAuthorization, discoverFetch, handleCallbackFetch, newJwksCacheFetch,
+  OidcConfig, OidcStrategy, TokenFetch,
+  beginAuthorization, handleCallback, newJwksCacheFromJwks,
 } from "auth"
 import { Request } from "std/http"
 import { emptyTrustStore, newTlsConfig } from "std/tls"
 import { encodeBase64Url, hmac, newSha256 } from "std/crypto"
 import { Json, JsonEntry, jsonEncode } from "std/json"
+import { parseJwks } from "std/jwt"
 import { now, Second } from "std/time"
 import { split } from "std/strings"
 
@@ -43,47 +54,43 @@ const fakeKid = "test-key"
 
 fn fakeSecret(): []byte { return []byte("test-hmac-secret-do-not-use-in-prod") }
 
-// The fake provider's two GET endpoints: `discoverFetch` calls this once for
-// the discovery document, `newJwksCacheFetch` once for the JWKS - neither
-// ever reaches a real network.
-fn buildFakeStrategy(): OidcStrategy! {
-  let tls = newTlsConfig(emptyTrustStore())
+class TokenBox { idToken: string }
 
-  let discoveryDoc = "{\"issuer\":\"" +
-    fakeIssuer +
-    "\"," +
-    "\"authorization_endpoint\":\"" +
-    fakeIssuer +
-    "/authorize\"," +
-    "\"token_endpoint\":\"" +
-    fakeIssuer +
-    "/token\"," +
-    "\"jwks_uri\":\"" +
-    fakeIssuer +
-    "/jwks\"}"
-  let discoverOnce: HttpFetch = (url) => {
-    return discoveryDoc
+fn fakeTokenFetch(box: TokenBox): TokenFetch {
+  let f: TokenFetch = (url, headers, body) => {
+    return "{\"id_token\":\"" + box.idToken + "\"}"
   }
-  let config = discoverFetch(fakeIssuer, tls, discoverOnce)?
+  return f
+}
 
+// Everything a real `discover()`/`newJwksCache()` would have fetched over
+// HTTPS, written by hand instead: `OidcConfig`'s fields are already public
+// data, and `newJwksCacheFromJwks` wraps an already-parsed `Jwks` - built
+// with `std/jwt`'s own `parseJwks` - with no HTTP call at all, not even to
+// a local server. `tokenFetch` is the one field production code always
+// leaves `nil`.
+fn buildFakeStrategy(box: TokenBox): OidcStrategy! {
+  let tls = newTlsConfig(emptyTrustStore())
+  let config = OidcConfig{
+    issuer = fakeIssuer,
+    authorizationEndpoint = fakeIssuer + "/authorize",
+    tokenEndpoint = fakeIssuer + "/token",
+    jwksUri = fakeIssuer + "/jwks",
+  }
   let jwksDoc = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"" +
     fakeKid +
-    "\"," +
-    "\"k\":\"" +
+    "\",\"k\":\"" +
     encodeBase64Url(fakeSecret()) +
     "\"}]}"
-  let jwksOnce: HttpFetch = (url) => {
-    return jwksDoc
-  }
-  let jwks = newJwksCacheFetch(config.jwksUri, tls, jwksOnce)?
-
+  let jwks = parseJwks(jwksDoc)?
   return OidcStrategy{
     config = config,
     clientId = fakeClientId,
     clientSecret = "test-client-secret",
     redirectUri = "https://app.example.com/auth/google/callback",
-    jwks = jwks,
+    jwks = newJwksCacheFromJwks(config.jwksUri, tls, jwks, nil),
     scopes = ["openid"],
+    tokenFetch = fakeTokenFetch(box),
   }
 }
 
@@ -118,22 +125,14 @@ fn fakeIdToken(nonce: string): string {
   return signingInput + "." + encodeBase64Url(sig)
 }
 
-class TokenBox { idToken: string }
-
-fn fakeTokenFetch(box: TokenBox): TokenFetch {
-  let f: TokenFetch = (url, headers, body) => {
-    return "{\"id_token\":\"" + box.idToken + "\"}"
-  }
-  return f
-}
-
-// Your real route handlers, unchanged from production - only the
-// `OidcStrategy` and the token fetch passed in are fakes.
-fn testApp(s: OidcStrategy, box: TokenBox): App {
+// Your real route handlers, unchanged from production - `oidc.md`'s own
+// `app.get("/auth/google", ...)`/`app.get("/auth/google/callback", ...)`
+// lines, verbatim. Only `s`, built above, is a fake.
+fn testApp(s: OidcStrategy): App {
   let app = App(Config{ secret = "test-secret", sessions = MemoryStore(1000) })
   app.get("/auth/google", (c) => beginAuthorization(s, c))
   app.get("/auth/google/callback", (c) => {
-    let identity = handleCallbackFetch(s, c, fakeTokenFetch(box))?
+    let identity = handleCallback(s, c)?
     return c.text(identity.id)
   })
   app.freeze() catch e {
@@ -156,12 +155,12 @@ fn paramFrom(query: string, name: string): string {
   return split(split(query, "${name}=")[1], "&")[0]
 }
 
-test "the callback route returns the verified fake identity, no network" {
-  let strategy = buildFakeStrategy() catch e {
+test "the unmodified callback route returns the verified fake identity, no network" {
+  let box = TokenBox{ idToken = "" }
+  let strategy = buildFakeStrategy(box) catch e {
     panic("buildFakeStrategy: ${e.message()}")
   }
-  let box = TokenBox{ idToken = "" }
-  let app = testApp(strategy, box)
+  let app = testApp(strategy)
 
   let begin = app.handle(testReq("/auth/google", ""))
   assert(begin.status == 302, "want a redirect, got ${begin.status}")
@@ -186,15 +185,19 @@ signature against the JWKS key named by `kid`, the issuer against the
 discovered `config.issuer`, the audience against your client id, the nonce
 against the session's, and expiry against the clock - a fake token built
 with the wrong issuer or an expired `exp` fails exactly as a real one would.
-Nothing about `discoverFetch`/`newJwksCacheFetch`/`handleCallbackFetch` skips
-or weakens those checks; they only decide where the bytes come from.
+Setting `tokenFetch` or building a `JwksCache` from a hand-parsed `Jwks`
+skips no check; it only decides where the bytes came from.
 
-Passing a fetch through in production code is the one way to misuse this
-seam: `discoverFetch(issuer, tls, myFetch)` with a real `myFetch` still
-means "trust `myFetch` instead of TLS to a real provider". Production code
-should call `discover`/`newJwksCache`/`handleCallback` (or a provider preset
-like `googleStrategy`), which always pass `nil` - never wire a fetch
-parameter through your own app's configuration.
+`newJwksCacheFromJwks` still enforces the rate-limited refetch-on-miss that
+`newJwksCache` does (a `kid` your fake JWKS never listed refetches through
+whatever `fetch` you pass it, `nil` included) - a fake key set is not
+exempt from the cooldown that protects a real JWKS endpoint.
+
+Setting `tokenFetch` on a strategy your production code builds is the one
+way to misuse this seam: a strategy is configuration your app builds once
+at startup, so a non-`nil` `tokenFetch` reaching a real deployment means
+some code path constructed the strategy wrong, not that `handleCallback`
+itself needs different production and test versions.
 
 Next: [Security model](security.md), for the full list of checks this
 package runs on your behalf.
