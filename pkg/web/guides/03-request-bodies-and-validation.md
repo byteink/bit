@@ -1,4 +1,4 @@
-# Part 3: Request bodies and validation
+# Request bodies and validation
 
 <!-- doctest: per-block -->
 
@@ -130,7 +130,7 @@ that type; the type argument is never optional, since it is the only thing
 the compiler has to build the value from.
 
 This example's `ArticleStore` is a single in-process list, useful for
-seeing validation work end to end before the course has a database - it is
+seeing validation work end to end before this part has a database - it is
 not safe for two requests writing at once, which is exactly the gap [part
 6](06-connecting-to-postgresql.md) closes with a real connection pool.
 
@@ -209,5 +209,5 @@ shaped wrong, a `422` for a value that fails a rule, and a `201` with a
 `Location` header on success. You used `c.body<T>()`, `@minLen`, and
 `c.createdUrl`.
 
-Next: [Part 4, errors and consistent responses](04-errors-and-consistent-responses.md),
+Next: [Chapter 17, errors and consistent responses](04-errors-and-consistent-responses.md),
 where every route's failures, not only validation's, get one shape.

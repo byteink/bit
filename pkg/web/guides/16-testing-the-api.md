@@ -35,8 +35,8 @@ compiles a page's blocks into one scratch `main.bit`, never a
 `<name>.test.bit`, so a `test` block is out of its reach today. The block below is marked
 `ignore` for that reason; every name and call in it is the same ones proven
 above,
-and the shape is exactly `math.test.bit`'s from [Test your
-code](../../../docs/guides/test-your-code.md):
+and the shape is exactly `math.test.bit`'s from
+[`bit test`](../../../docs/tools/test.md):
 
 ```bit ignore
 import { eq } from "std/testing"
@@ -58,8 +58,8 @@ ok   GET / answers hello
 discovered 1 test, ran 1: 1 passed, 0 failed
 ```
 
-[Test your code](../../../docs/guides/test-your-code.md) covers the
-assertions themselves (`eq`, `ok`, the `check` twins for a table of cases).
+[`bit test`](../../../docs/tools/test.md) covers the assertions themselves
+(`eq`, `ok`, the `check` twins for a table of cases).
 This part is about what an API-shaped test needs on top of them: building a
 request, reading back a status and a body, and - for anything that touches
 the database - a real one to touch.
@@ -197,4 +197,5 @@ and real database-backed tests for the SQL underneath it. The same
 `app.handle()` seam serves both - a test never needs a socket, only a real
 `Pool` when the question is one only a real database can answer.
 
-Previous: Transactions (part 15). Next: [Operations](17-operations.md).
+Previous: [Transactions](15-transactions.md) (chapter 28). Next:
+[Operations](17-operations.md).
