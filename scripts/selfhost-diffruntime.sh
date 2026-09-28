@@ -30,9 +30,17 @@ ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 # #6000: IFACE_SIG (#5979), BCE_JOIN (#5971) and JSON_APPEND (#5991) are
 # gone -- the 0.31.0 ORACLE above carries all three unconditionally, same as
-# this tree. BIT_DCE_PARAMS (#5949) stays off on both sides -- #5976 found a
-# live segfault under BIT_GC=stress and reverted that default flip, so no
-# export is needed for it here.
+# this tree.
+#
+# #6191: BIT_DCE_PARAMS (#5949) and BIT_DCE_METHODS (#6114) both default ON
+# in this tree as of the 0.32.0 repin -- the segfault #5976 found under
+# BIT_GC=stress was fixed by task-5999's keepalive-base fix, which #6191
+# confirmed is an ancestor of v0.32.0 before flipping the default. The
+# pinned 0.32.0 ORACLE above still defaults both off, and this differential
+# compares emitted OBJECT BYTES, which both flags change, so force "1" on
+# both sides to compare ON-ON. Deleted at the 0.33.0 repin.
+export BIT_DCE_PARAMS=1
+export BIT_DCE_METHODS=1
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
 # 21.86s on the oracle), so a busy box turned a clean run red with no divergence

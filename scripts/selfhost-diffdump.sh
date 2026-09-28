@@ -94,6 +94,19 @@ export BIT_STDLIB
 # static-const closure-cell lowering are all gone as flags -- the pinned
 # ORACLE (>= 0.31.0, which carries #6000) already emits every one of them
 # unconditionally, same as this tree.
+#
+# #6191: BIT_DCE_PARAMS and BIT_DCE_METHODS both default ON in this tree as
+# of the 0.32.0 repin, but the pinned 0.32.0 ORACLE (cut before the flip)
+# still defaults both off, so force "1" on both sides to compare ON-ON.
+# DCE_PARAMS changes post-opt IR directly (dead block params dropped), so it
+# belongs in this `KIND = ir` block; DCE_METHODS changes emitted method
+# tables, invisible to a plain `--dump-ir`/`--dump-ir-pre` text diff, but
+# forcing it here too keeps both sides' method-table shape in lockstep.
+# Deleted at the 0.33.0 repin, once the oracle carries the default too.
+if [ "$KIND" = ir ]; then
+  export BIT_DCE_PARAMS=1
+  export BIT_DCE_METHODS=1
+fi
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.
