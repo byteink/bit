@@ -3,7 +3,7 @@
 The **panic boundary**: run a call so that a panic inside it ends the call
 instead of the program.
 
-A panic is for a programmer error or a broken invariant (SPEC §18.4), and by
+A panic is for a programmer error or a broken invariant, and by
 default it aborts the process. This module is how one failing unit of work - a
 connection task, a test case, a plugin - is contained instead of taking
 everything with it. It is not an error-handling mechanism: an expected failure
@@ -61,7 +61,7 @@ wins. A panic raised inside a handler - after `runRecovering` has resumed and
 before it returns - reaches the next boundary out, never the one already
 unwound.
 
-**Deferred calls do not run** (SPEC §18.5). There is no unwinding of any kind,
+**Deferred calls do not run.** There is no unwinding of any kind,
 so nothing in the discarded frames gets to clean up. Anything a panic path must
 release has to be released explicitly, before the call that may panic.
 
@@ -79,7 +79,7 @@ the program exactly as it would without this call.
 ## Task-local storage
 
 **One opaque word per task**, inherited by copy at `spawn` and never shared
-afterward. This is a raw primitive, not a `Context` type: it carries one word
+afterward. This is a raw building block, not a `Context` type: it carries one word
 of whatever a caller puts in it, and any typed request-scoped mechanism (a
 trace id, a deadline, an identity) is built on top of it by the caller, not
 provided here.
@@ -122,4 +122,4 @@ same parent - each task's word is its own from the moment it is copied.
 a `WaitGroup` parks and resumes the same task (the same task identity), so
 task-local storage is unaffected by blocking - it is lost only if code runs
 outside any task, which ordinary Bit code cannot do (`spawn` is the only
-task-creation primitive in the language).
+way to create a task in the language).

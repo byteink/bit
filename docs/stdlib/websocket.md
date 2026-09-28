@@ -18,7 +18,7 @@ symmetric: `dial` opens a plain TCP connection and performs the client
 handshake itself, given a bare host/port/path the same way `std/net`'s own
 `dial` takes a bare host/port - no URL parsing here.
 
-Origin policy is the caller's decision, not this module's (RFC 6455 §4.2.1
+Origin policy is the caller's decision, not this module's (RFC 6455 section 4.2.1
 makes checking it optional and application-specific): call `upgrade` only
 after checking `header(req.headers, "Origin")` (`std/http`) yourself. A caller
 that does not care can call `upgrade` unconditionally.
@@ -108,7 +108,7 @@ fn connect(host: string, port: int): Conn! {
 ### `acceptKey(clientKey: string): string`
 
 The value that must appear as `Sec-WebSocket-Accept`, derived from the
-client's `Sec-WebSocket-Key` (RFC 6455 §1.3, §4.2.2 item 5.4): SHA-1 of the
+client's `Sec-WebSocket-Key` (RFC 6455 section 1.3, section 4.2.2 item 5.4): SHA-1 of the
 key concatenated with the fixed GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`,
 base64-encoded. `upgrade` and `dial` both call this internally; a caller
 verifying a handshake by hand is the only reason to call it directly.
@@ -180,14 +180,14 @@ the close status and reason.
 
 The live connection. `sendText`/`sendBinary`/`ping` write one frame each;
 `receive` reads the next complete message, reassembling fragments and
-answering ping/close frames transparently (§5.5.2, §5.5.3) - a caller never
+answering ping/close frames transparently (section 5.5.2, section 5.5.3) - a caller never
 sees a ping or an in-progress fragment, only a finished `Message`.
 
 ### `Conn.sendText(text: string): ()!`
 
 Sends `text` as one complete, unfragmented text frame. Fails rather than
 sending invalid UTF-8 - the same rule this module enforces on the way in
-(§8.1 applies symmetrically to both directions).
+(section 8.1 applies symmetrically to both directions).
 
 ### `Conn.sendBinary(data: []byte): ()!`
 
@@ -196,7 +196,7 @@ Sends `data` as one complete, unfragmented binary frame.
 ### `Conn.ping(payload: string): ()!`
 
 Sends a ping carrying `payload`, answered by the peer with a pong carrying
-the same bytes (§5.5.2). Fails if `payload` exceeds the 125-byte
+the same bytes (section 5.5.2). Fails if `payload` exceeds the 125-byte
 control-frame limit.
 
 ### `Conn.receive(): Message!`
@@ -232,7 +232,7 @@ fn echo(c: Conn): ()! {
 
 ## Close codes
 
-RFC 6455 §7.4.1 status codes this module can send or report. Only the ones
+RFC 6455 section 7.4.1 status codes this module can send or report. Only the ones
 this implementation actually uses; the registry has more.
 
 ### `closeNormal: int`
@@ -257,7 +257,7 @@ The endpoint received a data type it cannot accept.
 
 Reserved: never sent on the wire. `receive` reports it in `Message.code`
 when the peer's close frame carried no status code at all (an empty payload
-is legal - RFC 6455 §7.1.5).
+is legal - RFC 6455 section 7.1.5).
 
 ### `closeInvalidPayload: int`
 

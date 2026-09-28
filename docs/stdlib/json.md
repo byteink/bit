@@ -1,1160 +1,407 @@
 # std/json
 
-The `Json` value: a sum type over the seven shapes RFC 8259 §3 defines, plus
-`JsonEntry`, one object key/value pair. This is the primitive the rest of the
-json module - parser, encoder - builds on. Nothing here parses or
-encodes JSON text; these are pure constructors and accessors over an
-already-built `Json` value.
+Inkwell needs JSON in three places: a settings file, a backup that exports
+drafts and imports them again, and the body of an HTTP request or response
+once Inkwell goes online. `std/json` covers all three - a value type you can
+inspect by hand, a typed decoder for when you already know the shape, and a
+schema generator for documenting or validating it.
 
-`JsonObject` is `[]JsonEntry`, not `map<string, Json>`: it keeps entries in
-source order and allows duplicate keys, both of which a `map` would erase.
-`jsonGet` resolves a duplicate key by returning the **last** matching entry -
-the same policy most JSON decoders apply.
+The core type is `Json`, one value: a null, a bool, a number, a string, an
+array, or an object. `JsonObject` is `[]JsonEntry`, not `map<string, Json>` -
+it keeps entries in source order and allows duplicate keys, which a `map`
+would erase. Looking up a duplicate key (`jsonGet`, `cstGet`) always returns
+the **last** matching entry, the policy every JSON decoder converges on.
 
 <!-- doctest: per-block -->
 
-## The value type
+## The simplest thing: read a value, write it back
 
-### `JsonEntry`
-
-One `key`/`value` pair of a `JsonObject`, in source order.
-
-### `Json`
-
-A JSON value: `JsonNull`, `JsonBool(bool)`, `JsonInt(i64)`, `JsonFloat(f64)`,
-`JsonString(string)`, `JsonArray([]Json)`, or `JsonObject([]JsonEntry)`.
-
-## Variant checks
-
-### `jsonIsNull(j: Json): bool`
-
-Whether `j` is `JsonNull`.
-
-### `jsonIsBool(j: Json): bool`
-
-Whether `j` is a `JsonBool`.
-
-### `jsonIsInt(j: Json): bool`
-
-Whether `j` is a `JsonInt`.
-
-### `jsonIsFloat(j: Json): bool`
-
-Whether `j` is a `JsonFloat`.
-
-### `jsonIsNumber(j: Json): bool`
-
-Whether `j` is a `JsonInt` or a `JsonFloat` - JSON has one number type, so this
-is true for either spelling.
-
-### `jsonIsString(j: Json): bool`
-
-Whether `j` is a `JsonString`.
-
-### `jsonIsArray(j: Json): bool`
-
-Whether `j` is a `JsonArray`.
-
-### `jsonIsObject(j: Json): bool`
-
-Whether `j` is a `JsonObject`.
-
-## Accessors
-
-Each of these unwraps the matching variant's payload, or reports `None` on any
-other shape - a caller decoding untrusted JSON handles a shape mismatch as
-data, never a crash.
-
-### `jsonAsBool(j: Json): Option<bool>`
-
-`Some` of the payload when `j` is a `JsonBool`, else `None`.
-
-### `jsonAsInt(j: Json): Option<i64>`
-
-`Some` of the payload when `j` is a `JsonInt`, else `None`.
-
-### `jsonAsFloat(j: Json): Option<f64>`
-
-`Some` of the payload when `j` is a `JsonFloat`, else `None`.
-
-### `jsonAsNumber(j: Json): Option<f64>`
-
-`Some` of the payload widened to `f64` when `j` is a `JsonInt` or a
-`JsonFloat`, else `None`. JSON has one number type - `3` and `3.0` are the
-same document to every producer on the wire - so this is the accessor to use
-when decoding an `f64` field; `jsonAsFloat` alone rejects the integral
-spelling.
-
-### `jsonAsString(j: Json): Option<string>`
-
-`Some` of the payload when `j` is a `JsonString`, else `None`.
-
-### `jsonAsArray(j: Json): Option<[]Json>`
-
-`Some` of the payload when `j` is a `JsonArray`, else `None`.
-
-### `jsonAsObject(j: Json): Option<[]JsonEntry>`
-
-`Some` of the payload when `j` is a `JsonObject`, else `None`. The returned
-slice is the object's own entries, in source order, with duplicate keys kept
-- the same shape `JsonObject` stores internally, not a copy. Use this to
-enumerate an object's keys; `jsonGet` only answers one known key at a time.
+`jsonParse` turns text into a `Json` tree; `jsonEncode` turns it back into
+text. Reading one field out of a small settings document needs nothing more:
 
 ```bit
-import { Json, JsonEntry, jsonAsObject } from "std/json"
+import { jsonParse, jsonGet, jsonAsString } from "std/json"
 
-// Two entries named "a": jsonAsObject keeps both, in source order.
-fn countKeys(): int {
-  let obj = Json.JsonObject(
-    []JsonEntry{
-      JsonEntry{ key = "a", value = Json.JsonInt(1) },
-      JsonEntry{ key = "a", value = Json.JsonInt(2) },
-    },
-  )
-  match (jsonAsObject(obj)) {
-    Some(entries) => return len(entries)
-    None => return -1
-  }
-}
-```
-
-### `jsonGet(o: Json, key: string): Option<Json>`
-
-Looks up `key` in `o`. `None` when `o` is not a `JsonObject` or `key` is
-absent. On a duplicate key, returns the **last** matching entry.
-
-## Lexer
-
-A hand-written flat lexer over JSON text (strict RFC 8259, no comments - that
-is JSONC, a separate layer). No regex, no generated tables, no recursion:
-`{`/`[` nesting is tracked with a push/pop counter, not a call stack, so a
-pathologically deep input yields `Invalid` instead of a stack overflow.
-
-Tokens carry raw byte spans, not decoded values: a `StringTok` spans the
-source including its quotes with escapes left raw, and a `NumberTok` spans
-the literal exactly as written. Decoding and numeric-grammar validation are
-the parser task's job, not this layer's - so a later CST layer can echo an
-untouched literal back byte-for-byte.
-
-### `TokenKind`
-
-The lexical categories a token can be: `LBrace`, `RBrace`, `LBracket`,
-`RBracket`, `Colon`, `Comma`, `StringTok`, `NumberTok`, `TrueTok`, `FalseTok`,
-`NullTok`, `Eof`, `Invalid`, `Comment`. `Comment` is only ever produced by
-`lexCst`; `lex` and the JSONC-strict-value scan both skip comments as
-whitespace instead of tokenizing them.
-
-### `Token`
-
-One token: `kind`, and its `[start, end)` byte span in the source.
-
-### `jsonMaxDepth`
-
-The combined `{`/`[` nesting limit: 128 levels. Opening a 129th level
-yields an `Invalid` token instead of tracking it. Raised from 64, which was
-too low in practice, but deliberately not raised to 1000 (tried and reverted:
-a green thread's smaller stack overflowed inside `spawn` around depth 250,
-so a higher cap gave a false sense of headroom that crashed the process
-instead of erroring cleanly).
-
-### `lex(source: string): []Token`
-
-The full token stream for `source`, ending with one `Eof`.
-
-### `lexCst(source: string): []Token`
-
-Same scanner and grammar as `lex`, JSONC mode, except a `//`/`/* */` comment
-comes back as a `Comment` token (verbatim span, delimiters included) instead
-of being skipped as whitespace. The CST parser (`cstParse`, below) uses this
-to collect comments into `Trivia` without a second implementation of
-string/number/word scanning.
-
-```bit
-import { Json, JsonEntry, jsonGet, jsonAsInt } from "std/json"
-
-// Last-key-wins: two entries named "a", jsonGet returns the second (2).
-fn lastWins(): i64 {
-  let obj = Json.JsonObject(
-    []JsonEntry{
-      JsonEntry{ key = "a", value = Json.JsonInt(1) },
-      JsonEntry{ key = "a", value = Json.JsonInt(2) },
-    },
-  )
-  match (jsonGet(obj, "a")) {
+fn readTheme(source: string): string! {
+  let doc = jsonParse(source)?
+  match (jsonGet(doc, "theme")) {
     Some(v) => {
-      match (jsonAsInt(v)) {
-        Some(i) => return i
-        None => return -1
+      match (jsonAsString(v)) {
+        Some(s) => return s
+        None => fail newError("theme is not a string")
       }
     }
-    None => return -1
+    None => fail newError("missing key 'theme'")
   }
 }
 ```
 
-## Encoding
-
-The plain-value encoder: serializes a `Json` tree to text. No trivia, no
-comments - the CST printer the edit layer needs is a separate, later task.
-
-### `jsonEncode(j: Json): string`
-
-Compact form: no whitespace, `,`/`:` with no padding. Keys and strings are
-JSON-escaped per RFC 8259 §7 (`"`, `\`, and control bytes < 0x20 - `\n`, `\t`,
-`\r`, `\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes
-`>= 0x20` pass through as-is, since JSON strings are UTF-8.
-
-A `JsonFloat` is formatted so that `jsonParse(jsonEncode(j))` always
-reproduces `j`, or - for the one shape JSON cannot represent - still
-produces text `jsonParse` accepts:
-
-- A non-finite value (`inf`, `-inf`, `nan`) encodes as `null`, matching
-  `JSON.stringify`/serde_json. JSON has no non-finite literal, and the
-  runtime's own `inf`/`-inf`/`nan` spelling is not valid JSON.
-- An integral value (`3.0`) keeps its `.0` (`"3.0"`, not `"3"`), and `-0.0`
-  keeps its sign (`"-0.0"`, not `"-0"`) - both are what distinguish a
-  `JsonFloat` from a `JsonInt` on the way back in, since a literal with no
-  `.`/`e`/`E` decodes to `JsonInt` (see Parsing, below).
-- A value outside roughly `1e-6 .. 1e21` in magnitude is written in
-  exponent form (`5e-324`, `1.7976931348623157e+308`) rather than a
-  positional expansion, matching where JS `Number#toString` and Go's
-  `strconv` switch. The digits are unchanged either way - this only
-  reshapes how they're written.
-
-### `jsonEncodePretty(j: Json, indent: string): string`
-
-Pretty form: each object/array element on its own line, `indent` repeated
-once per nesting depth, `": "` after each key. No trailing newline - matches
-the shape of `JSON.stringify(v, null, 2)`.
+`jsonGet`/`jsonAsX` return `Option`, never panic, so a document that does not
+match what you expected is an ordinary value to handle, not a crash. Writing
+a document back out is the same shape in reverse:
 
 ```bit
 import { Json, JsonEntry, jsonEncode, jsonEncodePretty } from "std/json"
 
-fn encodeExample(): string {
-  let obj = Json.JsonObject(
+fn settingsDoc(theme: string, retries: i64): string {
+  let doc = Json.JsonObject(
     []JsonEntry{
-      JsonEntry{ key = "name", value = Json.JsonString("bit\n") },
-      JsonEntry{ key = "count", value = Json.JsonInt(2) },
+      JsonEntry{ key = "theme", value = Json.JsonString(theme) },
+      JsonEntry{ key = "retries", value = Json.JsonInt(retries) },
     },
   )
-  return jsonEncode(obj) + "\n" + jsonEncodePretty(obj, "  ")
+  return jsonEncodePretty(doc, "  ")
 }
 ```
 
-### Appending without a `Json` tree
+`jsonEncode` writes the compact form; `jsonEncodePretty` adds one indent per
+nesting level and a `": "` after each key, the shape `JSON.stringify(v, null,
+2)` produces. Building a tree by hand like this works for a handful of
+fields. For anything with more than a few, or for data you want to move in
+and out of a class, keep reading.
 
-Each of these appends one JSON scalar, key, or raw run directly onto a
-`[]byte` accumulator, byte-identical to encoding the matching `Json` value
-with `jsonEncode`, for generated or hand-written code building a document
-without allocating a `JsonObject`/`JsonArray` tree first.
+## Inspecting a document you did not shape
 
-### `jsonAppendRaw(out: []byte, s: string): []byte`
-
-Appends `s` onto `out` verbatim, with no escaping, for text that is already
-valid JSON, such as a nested value's own encoded bytes.
-
-### `jsonAppendKey(out: []byte, key: string, first: bool): []byte`
-
-Appends one object entry's separator and key onto `out`: `,` unless `first`
-is `true`, then `key` escaped and quoted, then `:`.
-
-### `jsonAppendString(out: []byte, s: string): []byte`
-
-Appends `s` as an escaped, quoted JSON string. Same bytes as encoding
-`Json.JsonString(s)`.
-
-### `jsonAppendInt(out: []byte, v: i64): []byte`
-
-Appends `v` as a JSON number. Same bytes as encoding `Json.JsonInt(v)`.
-
-### `jsonAppendFloat(out: []byte, v: f64): []byte`
-
-Appends `v` as a JSON number, reshaped the same way `jsonEncode` reshapes a
-`JsonFloat` (see above: non-finite values, integral values, extreme
-magnitudes). Same bytes as encoding `Json.JsonFloat(v)`.
-
-### `jsonAppendBool(out: []byte, v: bool): []byte`
-
-Appends `true` or `false`. Same bytes as encoding `Json.JsonBool(v)`.
-
-### `jsonAppendNull(out: []byte): []byte`
-
-Appends the literal `null`. Same bytes as encoding `Json.JsonNull`.
+A webhook payload or a third-party API response often has a shape you only
+partly control. `jsonIsX`/`jsonAsX` check and unwrap one variant at a time,
+and `jsonAsObject` walks every key when you do not know them ahead of time:
 
 ```bit
-import {
-  jsonAppendRaw, jsonAppendKey, jsonAppendString, jsonAppendInt,
-  jsonAppendFloat, jsonAppendBool, jsonAppendNull,
-} from "std/json"
-
-fn appendExample(): string {
-  let out = []byte(0, 64)
-  out = append(out, '{')
-  out = jsonAppendKey(out, "name", true)
-  out = jsonAppendString(out, "bit")
-  out = jsonAppendKey(out, "count", false)
-  out = jsonAppendInt(out, 2)
-  out = jsonAppendKey(out, "ratio", false)
-  out = jsonAppendFloat(out, 0.5)
-  out = jsonAppendKey(out, "ok", false)
-  out = jsonAppendBool(out, true)
-  out = jsonAppendKey(out, "extra", false)
-  out = jsonAppendNull(out)
-  out = jsonAppendKey(out, "raw", false)
-  out = jsonAppendRaw(out, "[1,2,3]")
-  out = append(out, '}')
-  return string(out)
-}
-```
-
-## Parsing
-
-A recursive-descent parser over the lexer's token stream, building a `Json`
-tree. Strict RFC 8259 only - no comments, no trailing commas; JSONC is a
-separate layer on top. Malformed input (bad token sequence, an invalid
-escape, a number that doesn't match the grammar, or exceeding the lexer's
-`jsonMaxDepth` nesting cap) is a parse error via the fallible return, never a
-panic. An integral literal that fits `i64` - including `i64` MIN,
-`-9223372036854775808` - decodes to `JsonInt`; anything wider, or with a
-`.`/`e`/`E`, decodes to `JsonFloat` via the runtime's own `parseFloat`. A
-duplicate object key keeps every entry - `jsonGet`'s last-key-wins policy is
-what resolves it.
-
-Every parse error's `message()` carries where it happened, not just what went
-wrong: `"json: expected ',' or '}' in object at byte 7 (line 1, column 8)"`.
-The byte offset is what a program slices or seeks with; line:column is what a
-human reads - 1-based, matching the compiler's own `--> file:LINE:COL`
-numbering. Both count bytes, not Unicode runes, so a column after a
-multi-byte UTF-8 character counts each of its bytes; a `\r\n` line ending
-counts as one line break. An error at end-of-input reports the position just
-past the last byte (never an out-of-range value or a silent zero) - the
-correct place to point at when there's no next character to blame.
-
-### `jsonParse(source: string): Json!`
-
-Parses `source` as one JSON value, optionally surrounded by whitespace and
-nothing else.
-
-```bit
-import { jsonParse, jsonGet, jsonAsInt } from "std/json"
-
-fn parseExample(): i64 {
-  let v = jsonParse("{\"a\": 1, \"a\": 2}") catch e {
-    return -1
-  }
-  match (jsonGet(v, "a")) {
-    Some(inner) => {
-      match (jsonAsInt(inner)) {
-        Some(i) => return i
-        None => return -1
-      }
-    }
-    None => return -1
-  }
-}
-```
-
-## JSONC
-
-A narrow, explicit extension over strict JSON - deliberately **not** JSON5.
-The grammar (also documented as the authoritative source in
-stdlib/json/parse.bit's header comment):
-
-- `//` line comments: from `//` to end of line, anywhere whitespace is
-  currently allowed.
-- `/* */` block comments: non-nesting, anywhere whitespace is currently
-  allowed. An unterminated `/*` is a parse error.
-- Trailing commas: a single trailing `,` is allowed before `}` or `]`
-  (`[1, 2,]` and `{"a": 1,}` are valid). More than one trailing comma, or a
-  leading comma, is still a parse error.
-
-Explicitly out of scope: unquoted object keys, single-quoted strings, hex
-numbers, `NaN`/`Infinity`, or any other JSON5 leniency.
-
-### `jsoncParse(source: string): Json!`
-
-Parses `source` as JSONC: everything `jsonParse` accepts, plus comments and
-one trailing comma. `jsonParse` stays strict RFC 8259 so a caller that wants
-to reject comments still can.
-
-```bit
-import { jsoncParse, jsonGet, jsonAsInt } from "std/json"
-
-fn jsoncExample(): i64 {
-  let v = jsoncParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
-    return -1
-  }
-  match (jsonGet(v, "a")) {
-    Some(inner) => {
-      match (jsonAsInt(inner)) {
-        Some(i) => return i
-        None => return -1
-      }
-    }
-    None => return -1
-  }
-}
-```
-
-## The CST types
-
-A concrete syntax tree shaped like `Json`, but every node also carries the
-comments/blank lines around it, so the edit layer can mutate
-one value and re-serialize the rest of the document byte-identical modulo the
-edit. Types only - no parser, no printer, no mutation yet.
-
-Bit enum variants take positional payloads only (no named payload fields), so
-`CstNode`'s multi-field variants are documented by argument order below.
-
-`Trivia.leading`/`.trailing` are only ever populated on the root node
-returned by `cstParse` (a comment or blank line before the document's first
-token, or after its last) - every other node's own `Trivia` is empty,
-because its surrounding formatting is owned by its parent container's `gaps`
-or by its `CstEntry.midGap` instead. The CST printer found that a
-comment-only `Trivia` couldn't reproduce a document's plain whitespace
-(indentation, blank lines) or comma placement - this shape closes that gap by
-making every boundary between structural tokens a single verbatim raw-text
-field.
-
-### `Trivia`
-
-`leading`/`trailing`: verbatim source text (comments and whitespace
-together, exactly as written) before/after the root node's own text. Empty
-on every non-root node.
-
-### `CstEntry`
-
-One key/value pair of a `CstObject`, in source order: `keyText` is the raw
-source text of the key, including quotes, exactly as written; `key` is the
-decoded key string, for lookups; `midGap` is the verbatim text between the
-key's closing quote and the value's first token (the `:` plus any
-surrounding whitespace or comments).
-
-### `CstNode`
-
-A `Json` value together with the `Trivia` around it: `CstNull(Trivia)`,
-`CstBool(bool, Trivia)`, `CstNumber(rawText: string, Trivia)` (exact source
-span, e.g. `"1.50000"`), `CstString(rawText: string, Trivia)` (exact source
-span, including quotes), `CstArray([]CstNode, gaps: []Option<string>,
-Trivia)`, or `CstObject([]CstEntry, gaps: []Option<string>, Trivia)`.
-
-A container's `gaps` holds one verbatim raw-text boundary per child plus one:
-`gaps[i]` is the text before child `i` (comments, indentation, and - for
-`i > 0` - the comma that ended child `i - 1`); `gaps[len(children)]` is the
-text after the last child, before the closing `}`/`]` (including an optional
-trailing comma). `gaps[i]` is `Option<string>.None` only for an entry
-appended by `cstSetString` after the original parse - there is no original
-formatting to echo; `cstPrint` (below) synthesizes it from the preceding
-sibling's own indentation instead of guessing a hardcoded style. Every gap
-`cstParse` produces is `Some`.
-
-## CST parsing
-
-`cstParse` parses JSONC into the CST above, losslessly: every byte of
-formatting - comments, indentation, blank lines, and comma placement -
-survives, unlike `jsonParse`/`jsoncParse` above, which discard all of it.
-This is the parser a later edit-layer task mutates the output of.
-
-No `hadTrailingComma` flag is stored on `CstArray`/`CstObject`: a trailing
-comma, if present, is simply part of the container's own `gaps` raw text,
-recovered the same way as any other gap.
-
-### `cstParse(source: string): CstNode!`
-
-Parses `source` as JSONC (same grammar as `jsoncParse`) into a trivia-carrying
-CST rather than a plain `Json` value. Malformed input is a parse error via the
-fallible return, never a panic.
-
-Like `jsonParse`/`jsoncParse` above, every `cstParse` error's `message()`
-carries where it happened: `"json: expected ',' or '}' in object at byte 7
-(line 1, column 8)"`. Same convention, same helper (`posError`/`jsonLocate`,
-shared across this module) - see `jsonParse` above for the full rules on byte
-vs. rune columns, `\r\n`, and end-of-input.
-
-```bit
-import { cstParse, CstNode } from "std/json"
-
-fn cstExample(): string {
-  let root = cstParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
-    return "error"
-  }
-  match (root) {
-    CstObject(entries, gaps, trivia) => return entries[0].midGap
-    CstNull(t) => return "null"
-    CstBool(b, t) => return "bool"
-    CstNumber(r, t) => return "number"
-    CstString(s, t) => return "string"
-    CstArray(a, g, t) => return "array"
-  }
-}
-```
-
-## Editing the CST
-
-The path-based edit layer `bit add` (the package manager) calls
-to change `bit.json` without disturbing anything it didn't touch. A path is
-`[]string` of object keys only
-(array-index paths are out of scope; `bit.json`'s dependency map is
-object-keyed). Every function mutates and returns its `root` - class and
-slice writes along the path are visible in place, but an append or a
-deletion changes a slice's length, and a `CstNode`'s payload can't be
-reassigned in place, so that one node is rebuilt and returned; always use
-the return value rather than assuming the original `root` already reflects
-the edit.
-
-On a duplicate key, all three functions below resolve the **last** matching
-entry, the same policy `jsonGet` documents above.
-
-### `cstGet(root: CstNode, path: []string): Option<CstNode>`
-
-Read-only lookup of `path` under `root`, mirroring `jsonGet` but over the
-CST. `None` as soon as an intermediate segment isn't a `CstObject` or a key
-is missing - never a panic on an absent path.
-
-```bit
-import { cstParse, cstGet, CstNode } from "std/json"
-
-fn cstGetExample(): string {
-  let root = cstParse("{\"a\": {\"b\": \"c\"}}") catch e {
-    return "error"
-  }
-  match (cstGet(root, []string{ "a", "b" })) {
-    Some(node) => {
-      match (node) {
-        CstString(raw, t) => return raw
-        CstNull(t) => return "null"
-        CstBool(b, t) => return "bool"
-        CstNumber(r, t) => return "number"
-        CstArray(a, g, t) => return "array"
-        CstObject(es, g, t) => return "object"
-      }
-    }
-    None => return "missing"
-  }
-}
-```
-
-### `cstSetString(root: CstNode, path: []string, value: string): CstNode!`
-
-Sets the string value at `path` to `value` (JSON-quoted and escaped). If
-`path` resolves to an existing `CstString` entry, only its `rawText` is
-replaced - that entry's `keyText` and the value's own `Trivia` are untouched.
-If the final key is absent but its parent object exists, a new `CstEntry` is
-appended with no comment invented; the gap immediately before it is `None`,
-so `cstPrint` synthesizes formatting for it from the preceding sibling's own
-indentation rather than a hardcoded style. Fails if the existing value at the
-final key isn't a `CstString`, or any intermediate segment doesn't resolve
-to a `CstObject` - this function never creates an intermediate object.
-
-```bit
-import { cstParse, cstSetString, cstGet, CstNode } from "std/json"
-
-fn cstSetStringExample(): string {
-  let root = cstParse("{\"a\": \"old\"}") catch e {
-    return "error"
-  }
-  let updated = cstSetString(root, []string{ "a" }, "new") catch e {
-    return "error"
-  }
-  match (cstGet(updated, []string{ "a" })) {
-    Some(node) => {
-      match (node) {
-        CstString(raw, t) => return raw
-        CstNull(t) => return "null"
-        CstBool(b, t) => return "bool"
-        CstNumber(r, t) => return "number"
-        CstArray(a, g, t) => return "array"
-        CstObject(es, g, t) => return "object"
-      }
-    }
-    None => return "missing"
-  }
-}
-```
-
-### `cstSetStringPath(root: CstNode, path: []string, value: string): CstNode!`
-
-Same contract as `cstSetString`, except a missing INTERMEDIATE object along
-`path` is created (recursively, empty except for the one path being set)
-rather than failing - `bit add`'s own need: a project's first-ever
-dependency add when `bit.json` has no `"dependencies"` object yet at all.
-
-```bit
-import { cstParse, cstSetStringPath, cstGet, CstNode } from "std/json"
-
-fn cstSetStringPathExample(): string {
-  let root = cstParse("{}") catch e {
-    return "error"
-  }
-  let updated = cstSetStringPath(
-    root,
-    []string{ "dependencies", "quicwire" },
-    "github.com/byteink/quicwire@v1.4.2",
-  ) catch e {
-    return "error"
-  }
-  match (cstGet(updated, []string{ "dependencies", "quicwire" })) {
-    Some(node) => {
-      match (node) {
-        CstString(raw, t) => return raw
-        CstNull(t) => return "null"
-        CstBool(b, t) => return "bool"
-        CstNumber(r, t) => return "number"
-        CstArray(a, g, t) => return "array"
-        CstObject(es, g, t) => return "object"
-      }
-    }
-    None => return "missing"
-  }
-}
-```
-
-### `cstDeleteKey(root: CstNode, path: []string): CstNode!`
-
-Removes the `CstEntry` at `path` from its parent's entries. Every sibling
-entry keeps its own value and relative order unchanged. The deleted entry's
-own leading gap (its comments/indentation) is dropped with it - the one case
-where a comment can legitimately disappear, and only that entry's own
-leading gap, never a sibling's. Fails if any path segment doesn't exist, or
-an intermediate segment doesn't resolve to a `CstObject`.
-
-```bit
-import { cstParse, cstDeleteKey, cstGet } from "std/json"
-
-fn cstDeleteKeyExample(): string {
-  let root = cstParse("{\"a\": 1, \"b\": 2}") catch e {
-    return "error"
-  }
-  let updated = cstDeleteKey(root, []string{ "a" }) catch e {
-    return "error"
-  }
-  match (cstGet(updated, []string{ "a" })) {
-    Some(node) => return "still-present"
-    None => return "deleted"
-  }
-}
-```
-
-## Printing the CST
-
-`cstPrint` is the other side of `cstParse`: it turns a CST back into JSONC
-source text. For any node an edit function (above) did not touch, it
-reproduces `cstParse`'s original input byte-for-byte - every `rawText`
-verbatim, every comment in its original form, and the surrounding structural
-whitespace, indentation, and comma placement - because `cstParse` already
-captured all of that as opaque raw text instead of decoding it; printing an
-untouched subtree is concatenation, never re-encoding. For a value
-`cstSetString` replaced, the fresh `rawText` takes the old one's place with
-everything else around it unchanged. For an entry `cstSetString` appended,
-`cstPrint` synthesizes its one new line (`,` + a newline + indentation) by
-reading the indentation off the immediately preceding sibling's own gap,
-rather than a hardcoded style.
-
-### `cstPrint(n: CstNode): string`
-
-Serializes `n` to JSONC source text.
-
-```bit
-import { cstParse, cstSetString, cstPrint } from "std/json"
-
-fn cstPrintRoundTrip(): string {
-  let source = "{\n  // keep\n  \"a\": 1\n}"
-  let root = cstParse(source) catch e {
-    return "parse-error"
-  }
-  return cstPrint(root)
-}
-
-fn cstPrintAfterEdit(): string {
-  let root = cstParse("{\"a\": \"old\"}") catch e {
-    return "parse-error"
-  }
-  let updated = cstSetString(root, []string{ "a" }, "new") catch e {
-    return "edit-error"
-  }
-  return cstPrint(updated)
-}
-```
-
-## CST-to-Json projection
-
-A read-only consumer that only wants a JSONC document's values (e.g. `bit lsp`
-inspecting a config) does not need to know the CST shape at all: parse with
-`cstParse`, project with `cstToJson`, then read the result with the same
-`jsonGet`/`jsonAsX` accessors a plain-JSON caller uses.
-
-### `cstToJson(n: CstNode): Json`
-
-Strips every `Trivia` and decodes each `CstNumber`/`CstString`'s raw source
-span, turning a CST into a plain `Json` tree. Pure and total - unlike
-`cstParse`, it cannot fail, since every span it decodes was already validated
-once when `cstParse` built the CST. Comments make no difference to the result:
-projecting `cstParse(source)` and calling `jsoncParse(source)` directly always
-agree, for any JSONC `source`.
-
-```bit
-import { cstParse, cstToJson, jsonGet, jsonAsInt } from "std/json"
-
-fn cstToJsonExample(): i64 {
-  let root = cstParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
-    return -1
-  }
-  match (jsonGet(cstToJson(root), "a")) {
+import { Json, jsonAsArray, jsonGet } from "std/json"
+
+// Counts the tags on an imported draft, however the sender ordered its keys.
+fn tagCount(entry: Json): i64! {
+  match (jsonGet(entry, "tags")) {
     Some(v) => {
-      match (jsonAsInt(v)) {
-        Some(i) => return i
-        None => return -1
+      match (jsonAsArray(v)) {
+        Some(items) => return len(items)
+        None => fail newError("tags is not an array")
       }
     }
-    None => return -1
+    None => return 0
   }
 }
 ```
 
-## Typed decoding
+`jsonAsObject` is the same shape for walking every key of an object whose
+key set is not known ahead of time; `jsonAsArray`/`jsonAsString`/`jsonAsBool`
+follow the same pattern for the other variants.
 
-`jsonDecode<T>` turns a `Json` into a class carrying `@json` (SPEC §10.5) --
-the reading half of the `toJson()` that mark synthesises. The compiler
-specialises it per call from the same field list and the same key rules, so
-the two halves agree by construction rather than by review.
+That is enough for a one-off read. A program that imports drafts by the
+thousand wants the next section instead: decode straight into a class.
 
-There are two entry points and the difference between them is measured, not
-stylistic. `jsonDecode<T>` takes a `Json`, so the DOM is built and the class
-objects are added on top of it; `jsonDecodeText<T>` takes the TEXT and drives
-the parser's cursor straight into the fields, so no `Json` exists at any
-point. On 50,000 records of `{"id":N,"name":"userN","active":true,"tags":
-[1,2,3]}`, objects allocated per record: `jsonParse` alone 25.0, `jsonParse` +
-`jsonDecode` 45.0, `jsonDecodeText` **6.0**.
+## The shape you actually want: typed decode
 
-Reach for `jsonDecode` when you already hold a `Json` - something inspected or
-routed the document first. Reach for `jsonDecodeText` when you hold the bytes,
-which is what a request handler holds.
+Mark a class `@json` and it gains a `toJson()` method; pass a parsed
+document to `jsonDecode<T>` and you get the class back, with every field
+checked against the document. The two are generated from the same field
+list, so they can never drift apart.
 
 ```bit
-import { jsonParse, jsonDecode, Json, JsonEntry } from "std/json"
+import { jsonParse, jsonDecode, jsonEncode, Json, JsonEntry } from "std/json"
 
-@json class Addr {
-  city: string,
-}
+enum Status { Draft, Published, Archived }
 
-@json class Profile {
-  id: i64
+@json class ExportedDraft {
+  id: string
+  title: string
   tags: []string
-  nick: Option<string>
-  @key("created_at")
-  createdAt: string
-  addr: Addr
+  status: Status
+  @key("word_count")
+  wordCount: Option<i64>
 }
 
-fn loadProfile(body: string): Profile! {
-  return jsonDecode<Profile>(jsonParse(body)?)?
+fn importDraft(body: string): ExportedDraft! {
+  return jsonDecode<ExportedDraft>(jsonParse(body)?)?
+}
+
+fn exportDraft(d: ExportedDraft): string {
+  return jsonEncode(d.toJson())
 }
 ```
 
-### `jsonDecode<T>(j: Json): T!`
+A payload-free `enum` field like `status` round-trips as its variant's own
+name (`"Published"`), validated against the declared list either way. `@key`
+overrides the JSON name for one field, for a payload written by something
+else. An absent `Option<T>` field decodes to `None` whether the key is
+missing or explicitly `null` - `toJson()` always writes the explicit form, so
+what Inkwell exports always decodes back the same way it went out.
 
-Decodes `j` into `T`, which must be a class carrying `@json`. Anything else is
-a compile error (`E0145`) naming the type and the mark, never a runtime
-failure.
-
-Every failure names the field by its **full dotted path** from the decoded
-root -- `addr.city`, `tags[3]`, `meta.k` -- and carries one of four causes: a
-missing key for a field that is not an `Option`, a type mismatch naming what
-was expected and what was found, an **unknown key** present in the input, or
-nesting past `jsonMaxDecodeDepth`.
-
-A key that is absent and a key present as `null` both decode an `Option<T>` to
-`None`, and both are a missing key for a field that is not one. `@json` writes
-an absent `Option` as an explicit `null`, so what it emits decodes back, and a
-producer that omits the key instead is just as well-formed.
-
-### `jsonSchema<T>(): Json`
-
-A JSON Schema 2020-12 document describing `T`, specialised per instantiation
-exactly as `jsonDecode<T>` is above. `T` must carry `@json`; anything else is
-a compile error (`E0173`) naming the type and the mark, never a runtime
-failure.
+Every decode failure names the field by its full path from the root -
+`addr.city`, `tags[3]` - through one of four causes: a required key is
+missing, a value is the wrong JSON kind, the document has a key no field
+claims, or it nests past the depth limit. Catch it and branch when you need
+to:
 
 ```bit
-import { Json, JsonEntry, jsonSchema, jsonEncode } from "std/json"
+import { jsonParse, jsonDecode, JsonDecodeError, Json, JsonEntry } from "std/json"
 
-@json class Settings {
-  theme: string,
-  retries: Option<i32>,
+@json class ExportedDraft2 {
+  id: string,
 }
 
-// {"type":"object","properties":{"theme":{"type":"string"},
-//  "retries":{"type":["integer","null"]}},"required":["theme","retries"],
-//  "$defs":{"Settings":{"type":"object","properties":{"theme":
-//  {"type":"string"},"retries":{"type":["integer","null"]}},
-//  "required":["theme","retries"]}}}
-fn settingsSchema(): string {
-  return jsonEncode(jsonSchema<Settings>())
-}
-```
-
-Every field shape `@json` accepts maps to one 2020-12 keyword: a scalar to its
-`type`, `[]T` to `items`, `map<string, T>` to `additionalProperties`, a
-payload-free `enum` to `type: "string"` plus its declared names under `enum`,
-and a nested `@json` class to a `$ref`. `Option<T>` folds `"null"` into `T`'s
-own fragment (`anyOf` when `T` is a nested class, which has no `type` keyword
-of its own to widen). `required` names every field with no exception, since
-`@json` never omits a key.
-
-The document also carries a top-level `"$defs"`: one entry per `@json` class
-reachable from `T` through a chain of nested-class fields, `T` itself
-included, deduplicated: a diamond (two fields reaching the same nested
-class) or a cycle (`class Node { next: Option<Node> }`) each contribute
-exactly one entry. A caller can `$ref` the root from elsewhere (an OpenAPI
-document's own `components/schemas`, for instance) the same way any nested
-class already is.
-
-### `jsonDecodeLenient<T>(j: Json): T!`
-
-The same decode, ignoring keys no field of `T` claims -- at every level of the
-document, in the single pass `jsonDecode` already makes. Nothing else changes:
-a missing key, a value of the wrong kind and a document past
-`jsonMaxDecodeDepth` all still fail, with the same message and the same path.
-The only cause it cannot produce is `UnknownKey`.
-
-```bit
-import { jsonDecodeLenient, Json, JsonEntry } from "std/json"
-
-@json class Settings {
-  theme: string,
-}
-
-// `{"theme":"dark","futureOption":true}` binds; the extra key is dropped.
-fn loadSettings(j: Json): Settings! {
-  return jsonDecodeLenient<Settings>(j)?
+fn importOrExplain(body: string): string {
+  let doc = jsonParse(body) catch e {
+    return "invalid JSON: ${e.message()}"
+  }
+  let d = jsonDecode<ExportedDraft2>(doc) catch e {
+    let de = e.(JsonDecodeError)
+    return "rejected '${de.path}': ${de.message()}"
+  }
+  return "imported ${d.id}"
 }
 ```
 
-Reach for it when the sender is not under your control and a field added by a
-newer client must not become a 400 -- a public API accepting a document written
-against a later version of itself. **Do not make it the default.** A dropped
-field and an accepted one are indistinguishable to whoever sent the document,
-which is why `jsonDecode` is the one you get by writing the shorter name.
-
-It is one decode, not a retry: the key set lives inside the specialised
-decoder, so skipping a key costs a branch rather than a second pass over the
-document. `pkg/web`'s `Unknown.Ignore` policy routes through it.
-
-### `jsonDecodeText<T>(src: string): T!`
-
-Decodes the JSON text `src` into `T`, which must be a class carrying `@json`,
-**without building a `Json`**. Specialised per call exactly as `jsonDecode<T>`
-is, from the same field list and the same key rules, and refusing a `T` that
-does not carry `@json` at compile time (`E0145`).
+**Reading an HTTP request body** is the same decode with no `Json` step in
+between. `jsonDecodeText<T>` reads the class's fields straight off the raw
+text - on 50,000 one-record decodes it costs 6 objects against 45 for
+`jsonParse` then `jsonDecode`, because no `Json` tree is ever built:
 
 ```bit
 import { jsonDecodeText, Json, JsonEntry } from "std/json"
 
-@json class Profile {
-  id: i64,
-  tags: []string,
+@json class NewDraft {
+  title: string,
+  body: string,
 }
 
-fn loadProfile(body: string): Profile! {
-  return jsonDecodeText<Profile>(body)?
+fn createDraft(requestBody: string): NewDraft! {
+  return jsonDecodeText<NewDraft>(requestBody)?
 }
 ```
 
-The errors are the same errors: the same `JsonDecodeError`, the same four
-causes, the same full dotted path. A document that is not well-formed JSON
-fails with the positional parse error `jsonParse` would have produced, and
-anything after the decoded value is `trailing garbage after value`.
-
-**One difference, and it is inherent to reading forward.** A single pass
-reports the first fault in DOCUMENT order. `jsonDecode` reads a whole object
-before it decodes anything, so it reports an unknown key ahead of a type error
-in an earlier field, and a missing key ahead of both. Given a document with two
-faults the two entry points can name different ones - each a real fault, with
-the same message and the same path.
-
-`jsonDecodeText` is strict RFC 8259, like `jsonParse`: no comments and no
-trailing commas. There is no JSONC form of it.
-
-### `JsonDecodeCause`
-
-Which of the four things went wrong: `MissingKey`, `TypeMismatch`,
-`UnknownKey` or `MaxDepth`. An enum a caller can branch on, rather than a
-string it has to scrape out of a message.
-
-### `JsonDecodeError`
-
-The error every `jsonDecode<T>` failure produces: `cause`, `path` (`""` for
-the root value itself), and `expected`/`found`, which are filled for
-`TypeMismatch` and empty otherwise. Its `message()` renders one sentence per
-cause, so a caller that only logs still gets the field. Reach the fields with
-a type assertion on the caught `error`: `e.(JsonDecodeError)`.
-
-### `JsonDecodeError.message`
-
-The same sentence the `error` interface reports, callable on the narrowed
-value too, so a handler that has already asserted `e.(JsonDecodeError)` to
-branch on `cause` can still log the full text without keeping `e` around:
-`"json: missing key 'id'"`, or `the root value` in place of the quoted path
-when `path` is `""`.
-
-### `jsonMaxDecodeDepth`
-
-How deep a decode may recurse -- 128 -- before it fails with `MaxDepth`
-instead of exhausting the stack. A `@json` class may be self-referential, so
-the depth a decode reaches is decided by the input, not by the class. This
-bound is on the `Json` **value** and is independent of any limit a parser
-applied to a document: `jsonDecode` takes a value, and one built in code never
-went through a parser. It matters most off the main thread, where a spawned
-stack is far smaller.
-
-## Decoding primitives
-
-The named functions the compiler's synthesised decoder is written in terms of.
-They are exported because the generated code lives in the caller's module and
-calls them by name -- and they are a usable API in their own right for a
-hand-written decoder over a shape `@json` does not cover. Each takes the
-`path` of the value it is looking at, so the error it raises names the field
-rather than the shape.
-
-Each of the four value extractors has **three forms**. `jsonDecString(j,
-path)` takes a path that is already built; `jsonDecStringKey(j, path, key)`
-and `jsonDecStringIndex(j, path, i)` take the CONTAINING value's path plus the
-one step to this one, and join them with `jsonDecPath`/`jsonDecIndex` only
-inside the failure. The join allocates and only an error message reads it, so
-the synthesised decoder calls the two-part forms everywhere and a document
-with no errors builds no path strings at all. Use whichever form matches what
-you are holding; they raise the identical error.
-
-### `jsonDecPath(path: string, key: string): string`
-
-`path` extended by object key `key`. The root has no name, so its own fields
-are bare: `jsonDecPath("", "id")` is `id`, `jsonDecPath("addr", "city")` is
-`addr.city`.
-
-### `jsonDecIndex(path: string, i: i64): string`
-
-`path` extended by array index `i` -- `tags[3]`, never `tags.3`, so the path
-reads back as the accessor a caller would write.
-
-### `jsonDecObject(j: Json, path: string, depth: i64): []JsonEntry!`
-
-The entries of the object at `path`, failing with `TypeMismatch` when `j` is
-not an object and with `MaxDepth` when `depth` has reached
-`jsonMaxDecodeDepth`. `depth` is the number of levels already entered.
-
-### `jsonDecUnknown(entries: []JsonEntry, path: string, known: []string): ()!`
-
-Fails with `UnknownKey` on the first key of `entries` that is not in `known`.
-`known` is the key set on the wire -- `@key` renames already applied -- not
-the field names.
-
-### `jsonDecMember(entries: []JsonEntry, path: string, key: string): Json!`
-
-The value a non-`Option` field's key must carry, failing with `MissingKey`
-when the key is absent or explicitly `null`.
-
-### `jsonDecOptMember(entries: []JsonEntry, key: string): Option<Json>`
-
-The value an `Option` field's key carries, or `None` when the key is absent
-**or** present as `null`. Cannot fail: both of those are legal input for an
-`Option`.
-
-### `jsonDecInt(j: Json, path: string): i64!`
-
-The integer at `path`. Accepts only `JsonInt`: a field declared as an integer
-that silently truncated `1.5` would be a wrong answer rather than a rejected
-document.
-
-### `jsonDecIntKey(j: Json, path: string, key: string): i64!`
-
-The same, for the value at `key` of the object at `path`. Builds
-`jsonDecPath(path, key)` only when it fails.
-
-### `jsonDecIntIndex(j: Json, path: string, i: i64): i64!`
-
-The same, for element `i` of the array at `path`. Builds
-`jsonDecIndex(path, i)` only when it fails.
-
-### `jsonDecFloat(j: Json, path: string): f64!`
-
-The number at `path`. Accepts **both** numeric variants, because `3` and `3.0`
-are the same document to every producer on the wire -- the same asymmetry
-`jsonAsNumber` documents.
-
-### `jsonDecFloatKey(j: Json, path: string, key: string): f64!`
-
-The same, for the value at `key` of the object at `path`. Builds
-`jsonDecPath(path, key)` only when it fails.
-
-### `jsonDecFloatIndex(j: Json, path: string, i: i64): f64!`
-
-The same, for element `i` of the array at `path`. Builds
-`jsonDecIndex(path, i)` only when it fails.
-
-### `jsonDecBool(j: Json, path: string): bool!`
-
-The boolean at `path`.
-
-### `jsonDecBoolKey(j: Json, path: string, key: string): bool!`
-
-The same, for the value at `key` of the object at `path`. Builds
-`jsonDecPath(path, key)` only when it fails.
-
-### `jsonDecBoolIndex(j: Json, path: string, i: i64): bool!`
-
-The same, for element `i` of the array at `path`. Builds
-`jsonDecIndex(path, i)` only when it fails.
-
-### `jsonDecString(j: Json, path: string): string!`
-
-The string at `path`.
-
-### `jsonDecStringKey(j: Json, path: string, key: string): string!`
-
-The same, for the value at `key` of the object at `path`. Builds
-`jsonDecPath(path, key)` only when it fails.
-
-### `jsonDecStringIndex(j: Json, path: string, i: i64): string!`
-
-The same, for element `i` of the array at `path`. Builds
-`jsonDecIndex(path, i)` only when it fails.
-
-### `jsonDecEnumKey(j: Json, path: string, key: string, allowed: []string): string!`
-
-The variant name string at `key` of the object at `path`, for a payload-free
-`enum` field the compiler's synthesised `jsonDecode<T>` reaches. Decodes
-through `jsonDecStringKey`, then rejects any value not in `allowed` (the
-class's own declared variant names) with the same `TypeMismatch` shape every
-other mismatch takes -- `expected` names every allowed variant, `found` the
-wire value. `@json`'s `toJson()` is what guarantees a well-formed document
-only ever writes one of them (`docs/stdlib/json.md`'s "`toJson`" section).
-
-### `jsonDecEnumIndex(j: Json, path: string, i: i64, allowed: []string): string!`
-
-The same, for element `i` of the array at `path`.
-
-### `jsonDecArray(j: Json, path: string, depth: i64): []Json!`
-
-The items of the array at `path`, with the same depth bound the object walk
-has: a `[]T` is a level of nesting whether or not `T` is a class.
-
-### `jsonDecEntries(j: Json, path: string, depth: i64): []JsonEntry!`
-
-The entries of a `map<string, T>` field's object. Distinct from
-`jsonDecObject` only in the caller's intent -- a map has no known key set, so
-nothing checks its keys against one.
-
-## Text-decoding primitives
-
-The named functions the compiler's synthesised **text** decoder is written in
-terms of, exported for the same reason the DOM ones are: the generated code
-lives in the caller's module and calls them by name. They are also a usable API
-for a hand-written streaming decoder over a shape `@json` does not cover.
-
-They form a protocol with a position in it, and calling them out of order is a
-programming error rather than a document error: enter a container, then step
-through its members or elements, reading exactly one value per step.
-
-### `JsonReader`
-
-The forward cursor over one document. Opaque: it carries the lexer, the
-member-step budget, and the span of the object key under the cursor. Build one
-with `jsonTextReader` and pass it down; nothing else constructs it.
-
-### `jsonTextReader(src: string): JsonReader`
-
-A reader positioned on `src`'s first token.
-
-### `jsonTextFinish(r: JsonReader): ()!`
-
-Refuses anything but whitespace after the decoded value, with `jsonParse`'s own
-`trailing garbage after value`.
-
-### `jsonTextObject(r: JsonReader, path: string, depth: i64): ()!`
-
-Enters the object under the cursor, failing with `TypeMismatch` when the value
-is not an object and with `MaxDepth` when `depth` has reached
-`jsonMaxDecodeDepth`. `depth` is the number of levels already entered.
-
-### `jsonTextArray(r: JsonReader, path: string, depth: i64): ()!`
-
-The same for an array: a `[]T` is a level of nesting whether or not `T` is a
-class.
-
-### `jsonTextKey(r: JsonReader, n: i64): bool!`
-
-Advances to the `n`th member's value, recording its key on the reader, and
-answers whether there was one - false when the object closed instead. `n` is
-the member's ordinal within this object, which is what distinguishes the first
-member from one that must be preceded by a `,`.
-
-### `jsonTextItem(r: JsonReader, i: i64): bool!`
-
-The array twin: true when an element follows, false when the array closed.
-
-### `jsonTextKeyIs(r: JsonReader, key: string): bool`
-
-Whether the current member's key is `key`. Compares the source bytes in place
-for an escape-free key, so trying each of a class's keys in turn allocates
-nothing.
-
-### `jsonTextKeyText(r: JsonReader): string`
-
-The current member's key as a string. This is the one call that materialises a
-key, so use it where the key is data - a `map<string, T>`'s key - or where a
-failure is already being built.
-
-### `jsonTextUnknown(r: JsonReader, path: string): ()!`
-
-Fails with `UnknownKey` naming the current member's key. A dropped field and an
-accepted field are indistinguishable to whoever sent the document, so an
-unclaimed key is reported rather than skipped.
-
-### `jsonTextNull(r: JsonReader): bool`
-
-Consumes an explicit `null` under the cursor and answers whether it did. A
-non-`Option` field left unset by one is a missing key; an `Option` left unset is
-`None` - the same pair `jsonDecMember` and `jsonDecOptMember` fold together.
-
-### `jsonTextNeed(seen: bool, path: string, key: string): ()!`
-
-Fails with `MissingKey` at `path`.`key` when `seen` is false. The check a
-non-`Option` field owes after its object has been walked, since a forward pass
-cannot know a key is absent until the object closes.
-
-### `jsonTextIntKey(r: JsonReader, path: string, key: string): i64!`
-
-The integer under the cursor, consumed. Accepts only an integer literal: a
-field declared as an integer that silently truncated `1.5` would be a wrong
-answer rather than a rejected document. Builds `jsonDecPath(path, key)` only
-when it fails.
-
-### `jsonTextIntIndex(r: JsonReader, path: string, i: i64): i64!`
-
-The same for an array element, reporting `jsonDecIndex(path, i)`.
-
-### `jsonTextFloatKey(r: JsonReader, path: string, key: string): f64!`
-
-The number under the cursor, consumed. Accepts an integer literal too: `3` and
-`3.0` are the same document to every producer on the wire.
-
-### `jsonTextFloatIndex(r: JsonReader, path: string, i: i64): f64!`
-
-The same for an array element.
-
-### `jsonTextBoolKey(r: JsonReader, path: string, key: string): bool!`
-
-The boolean under the cursor, consumed.
-
-### `jsonTextBoolIndex(r: JsonReader, path: string, i: i64): bool!`
-
-The same for an array element.
-
-### `jsonTextStringKey(r: JsonReader, path: string, key: string): string!`
-
-The string under the cursor, consumed, with every RFC 8259 escape decoded. An
-escape-free string is a direct slice of the source rather than a copy.
-
-### `jsonTextStringIndex(r: JsonReader, path: string, i: i64): string!`
-
-The same for an array element.
+It reports the same errors, with one difference: reading forward, it stops
+at the first fault it reaches in document order, where `jsonDecode` reads
+the whole object first and always reports missing keys before type
+mismatches. Given a document with two faults, either path names a real one -
+they can just name a different one.
+
+## Documenting and validating: `jsonSchema<T>()`
+
+Every `@json` class already carries its own shape. `jsonSchema<T>()` turns
+that into a JSON Schema 2020-12 document - the same dialect OpenAPI 3.1 uses
+for a request or response body - with no second description to keep in
+sync:
+
+```bit
+import { Json, JsonEntry, jsonSchema, jsonEncode } from "std/json"
+
+@json class DraftSettings {
+  autosaveSeconds: i64,
+  spellcheck: Option<bool>,
+}
+
+fn openApiSchema(): string {
+  return jsonEncode(jsonSchema<DraftSettings>())
+}
+```
+
+A scalar field maps to its `type`; `[]T` to `items`; `map<string, T>` to
+`additionalProperties`; a payload-free `enum` to `type: "string"` plus its
+declared names; a nested `@json` class to a `$ref` into a top-level
+`"$defs"` (one entry per reachable class, deduplicated, so a shared or
+self-referential class is not duplicated). `Option<T>` folds `"null"` into
+`T`'s own fragment. `required` always lists every field, because `toJson()`
+never omits a key.
+
+## Sharp edges
+
+- **Unknown keys are rejected by default.** `jsonDecode<T>` fails
+  `UnknownKey` on a document field no class field claims - a silently
+  dropped field is invisible to whoever sent it. `jsonDecodeLenient<T>`
+  drops the check instead of failing, for one case only: a public endpoint
+  that must keep accepting documents a newer client already sends. Do not
+  reach for it by default; a caller that wants the strict form gets it by
+  writing the shorter name, `jsonDecode`.
+- **JSON has one number type.** `jsonAsFloat` only matches a literal that
+  was written with a `.`/`e`/`E`; `jsonAsNumber` widens either spelling to
+  `f64` and is almost always the one you want when decoding into an `f64`
+  field by hand.
+- **Nesting past 128 levels fails, not crashes.** `jsonMaxDecodeDepth` bounds
+  `jsonDecode<T>`/`jsonDecodeText<T>` independently of whatever limit a
+  parser applied, because a `@json` class can be self-referential and a
+  `Json` value built in code never went through a parser at all.
+- **A non-finite float encodes as `null`.** JSON has no literal for
+  infinity or NaN, so `jsonEncode`/`jsonEncodePretty` write `null` for one,
+  matching `JSON.stringify`.
+- **Comments need JSONC, on purpose.** `jsonParse` is strict RFC 8259 and
+  rejects `//`/`/* */` comments and trailing commas outright.
+  `jsoncParse` accepts both, plus one trailing comma before `}`/`]` - and
+  nothing else JSON5 allows (no unquoted keys, no hex numbers).
+
+## Editing a JSON file without losing its comments
+
+`bit.json` is the one JSON document in this repo people hand-edit and expect
+tooling to leave alone: comments, indentation, even a trailing comma should
+survive a machine-made change untouched. `jsonParse` cannot help here - it
+throws formatting away - so the edit layer parses into a **CST** (concrete
+syntax tree) with `cstParse`, edits by path, and prints back with `cstPrint`:
+
+```bit
+import { cstParse, cstSetStringPath, cstPrint } from "std/json"
+
+fn addDependency(configText: string, name: string, version: string): string! {
+  let root = cstParse(configText)?
+  let updated = cstSetStringPath(root, []string{ "dependencies", name }, version)?
+  return cstPrint(updated)
+}
+```
+
+`cstSetStringPath` creates a missing intermediate object (a project's first
+dependency, when `"dependencies"` does not exist yet); `cstSetString` is the
+stricter sibling that never does. `cstDeleteKey` removes one entry.
+Everything an edit function did not touch reproduces the original bytes
+exactly - `cstParse` keeps every comment and blank line as raw text instead
+of decoding it, so printing an untouched subtree is concatenation, not
+re-encoding. A read-only consumer that just wants the values can skip the
+CST shape with `cstToJson`, then read the result with `jsonGet`/`jsonAsX`
+like any other document.
+
+## When not to use std/json
+
+- **A document larger than memory, or streamed over a slow connection.**
+  Every entry point here reads a complete `string` or a complete `Json`
+  tree first; there is no incremental parser that returns partial results
+  as bytes arrive.
+- **Hand-building JSON text with string concatenation.** Every quote,
+  backslash and control byte in a string field has to be escaped or the
+  output is not valid JSON - build a `Json` tree and call `jsonEncode`, or
+  use the `jsonAppend*` functions (reference below) if you are already
+  writing into a `[]byte` and want to skip the tree.
+
+## Where to go next
+
+- [std/sql](/std/sql) - to store what you decoded.
+- [Attributes](/language/attributes) - the full rules for `@json`, `@key`
+  and `@table`.
+- [The Book, chapter 8](/book/08-import-and-export) - Inkwell's own
+  import/export walkthrough.
+
+## Reference
+
+### The value type
+
+| Symbol | What it is |
+| --- | --- |
+| `JsonEntry` | One `key`/`value` pair of a `JsonObject`, in source order. |
+| `Json` | `JsonNull \| JsonBool(bool) \| JsonInt(i64) \| JsonFloat(f64) \| JsonString(string) \| JsonArray([]Json) \| JsonObject([]JsonEntry)`. |
+
+### Inspecting a `Json` value
+
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `jsonIsNull` .. `jsonIsObject` | `(j: Json): bool` | One check per variant (`jsonIsNull`, `jsonIsBool`, `jsonIsInt`, `jsonIsFloat`, `jsonIsNumber` - int or float, `jsonIsString`, `jsonIsArray`, `jsonIsObject`). |
+| `jsonAsBool` .. `jsonAsObject` | `(j: Json): Option<T>` | One unwrap per variant (`jsonAsBool`, `jsonAsInt`, `jsonAsFloat`, `jsonAsNumber` - int or float widened to `f64`, `jsonAsString`, `jsonAsArray`, `jsonAsObject`), `None` on any other shape. |
+| `jsonGet` | `(o: Json, key: string): Option<Json>` | Looks up `key`; `None` if `o` is not an object or `key` is absent; last-key-wins on a duplicate. |
+
+### Parsing
+
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `jsonParse` | `(source: string): Json!` | Strict RFC 8259: no comments, no trailing commas. |
+| `jsoncParse` | `(source: string): Json!` | `jsonParse` plus `//`/`/* */` comments and one trailing comma. |
+
+Every parse error's `message()` names where it happened: byte offset and
+1-based line:column, both counted in bytes.
+
+### Encoding
+
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `jsonEncode` | `(j: Json): string` | Compact form, no whitespace. |
+| `jsonEncodePretty` | `(j: Json, indent: string): string` | One element per line, `indent` per nesting level. |
+| `jsonAppendRaw` | `(out: []byte, s: string): []byte` | Appends `s` verbatim, no escaping. |
+| `jsonAppendKey` | `(out: []byte, key: string, first: bool): []byte` | Appends `,` (unless `first`) then the quoted key then `:`. |
+| `jsonAppendString` | `(out: []byte, s: string): []byte` | Appends `s` as an escaped, quoted string. |
+| `jsonAppendInt` | `(out: []byte, v: i64): []byte` | Appends `v` as a JSON number. |
+| `jsonAppendFloat` | `(out: []byte, v: f64): []byte` | Appends `v` as a JSON number, reshaped like `jsonEncode` does. |
+| `jsonAppendBool` | `(out: []byte, v: bool): []byte` | Appends `true`/`false`. |
+| `jsonAppendNull` | `(out: []byte): []byte` | Appends `null`. |
+
+### Typed decode
+
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `jsonDecode<T>` | `(j: Json): T!` | Decodes `j` into `@json` class `T`. |
+| `jsonDecodeText<T>` | `(src: string): T!` | Same decode, straight off JSON text, no `Json` built. |
+| `jsonDecodeLenient<T>` | `(j: Json): T!` | Same decode, dropping unclaimed keys instead of failing. |
+| `jsonSchema<T>` | `(): Json` | A JSON Schema 2020-12 document describing `T`. |
+| `JsonDecodeCause` | enum | `MissingKey \| TypeMismatch \| UnknownKey \| MaxDepth`. |
+| `JsonDecodeError` | class | `cause`, `path`, `expected`, `found`, `message()`. Reach it with `e.(JsonDecodeError)`. |
+| `jsonMaxDecodeDepth` | `const = 128` | The recursion limit `MaxDepth` fires past. |
+
+### Decode building blocks
+
+What the compiler's generated decoder calls, and a usable API for a
+hand-written one over a shape `@json` does not cover. Each of the four
+scalar extractors comes in three forms: the base form takes an already-built
+`path`; `...Key`/`...Index` take the containing value's path plus one step,
+joining them only inside the failure message.
+
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `jsonDecPath` | `(path: string, key: string): string` | `path` plus object key `key` (`addr.city`). |
+| `jsonDecIndex` | `(path: string, i: i64): string` | `path` plus array index `i` (`tags[3]`). |
+| `jsonDecObject` | `(j: Json, path: string, depth: i64): []JsonEntry!` | The object's entries at `path`, or `TypeMismatch`/`MaxDepth`. |
+| `jsonDecEntries` | `(j: Json, path: string, depth: i64): []JsonEntry!` | Same as `jsonDecObject`, named separately for a `map<string, T>` field. |
+| `jsonDecUnknown` | `(entries: []JsonEntry, path: string, known: []string): ()!` | Fails `UnknownKey` on the first entry not in `known`. |
+| `jsonDecMember` | `(entries: []JsonEntry, path: string, key: string): Json!` | The required member `key`, or `MissingKey`. |
+| `jsonDecOptMember` | `(entries: []JsonEntry, key: string): Option<Json>` | The member `key`, or `None`. |
+| `jsonDecInt`/`jsonDecIntKey`/`jsonDecIntIndex` | `(...): i64!` | The int at `path`/`key`/`i`. |
+| `jsonDecFloat`/`jsonDecFloatKey`/`jsonDecFloatIndex` | `(...): f64!` | The float at `path`/`key`/`i`. |
+| `jsonDecBool`/`jsonDecBoolKey`/`jsonDecBoolIndex` | `(...): bool!` | The bool at `path`/`key`/`i`. |
+| `jsonDecString`/`jsonDecStringKey`/`jsonDecStringIndex` | `(...): string!` | The string at `path`/`key`/`i`. |
+| `jsonDecEnumKey`/`jsonDecEnumIndex` | `(..., allowed: []string): string!` | A payload-free enum's variant name, validated against `allowed`. |
+| `jsonDecArray` | `(j: Json, path: string, depth: i64): []Json!` | The array's elements at `path`. |
+
+### Text-decode building blocks
+
+What `jsonDecodeText<T>`'s generated decoder calls: a forward cursor
+(`JsonReader`) over the source text, so a key with no escape is never
+materialised as its own string.
+
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `JsonReader` | class | The cursor `jsonTextReader` builds and every function below drives. |
+| `jsonTextReader` | `(src: string): JsonReader` | Starts a cursor over `src`. |
+| `jsonTextFinish` | `(r: JsonReader): ()!` | Confirms nothing but whitespace follows the decoded value. |
+| `jsonTextObject`/`jsonTextArray` | `(r, path: string, depth: i64): ()!` | Enters an object/array, checking the depth limit. |
+| `jsonTextKey` | `(r: JsonReader, n: i64): bool!` | Advances to the next object key; `false` at `}`. |
+| `jsonTextItem` | `(r: JsonReader, i: i64): bool!` | Advances to the next array element; `false` at `]`. |
+| `jsonTextKeyIs` | `(r: JsonReader, key: string): bool` | Whether the current key's source bytes equal `key`. |
+| `jsonTextKeyText` | `(r: JsonReader): string` | The current key, decoded. |
+| `jsonTextUnknown` | `(r: JsonReader, path: string): ()!` | Fails `UnknownKey` for the current key. |
+| `jsonTextNull` | `(r: JsonReader): bool` | Whether the current value is `null`. |
+| `jsonTextNeed` | `(seen: bool, path: string, key: string): ()!` | Fails `MissingKey` if `seen` is `false`. |
+| `jsonTextIntKey`/`jsonTextIntIndex` | `(...): i64!` | The int at the current key/index. |
+| `jsonTextFloatKey`/`jsonTextFloatIndex` | `(...): f64!` | The float at the current key/index. |
+| `jsonTextBoolKey`/`jsonTextBoolIndex` | `(...): bool!` | The bool at the current key/index. |
+| `jsonTextStringKey`/`jsonTextStringIndex` | `(...): string!` | The string at the current key/index. |
+
+### Lexer
+
+A hand-written flat lexer over JSON text, used by the parser and the CST
+layer below it.
+
+| Symbol | What it is |
+| --- | --- |
+| `TokenKind` | `LBrace \| RBrace \| LBracket \| RBracket \| Colon \| Comma \| StringTok \| NumberTok \| TrueTok \| FalseTok \| NullTok \| Eof \| Invalid \| Comment`. |
+| `Token` | One token: `kind` and its `[start, end)` byte span. |
+| `jsonMaxDepth` | `const = 128` - the lexer's own `{`/`[` nesting limit. |
+| `lex(source: string): []Token` | The full strict-JSON token stream, ending with `Eof`. |
+| `lexCst(source: string): []Token` | Same scan, JSONC mode, with comments returned as `Comment` tokens instead of skipped. |
+
+### The CST (concrete syntax tree)
+
+| Symbol | What it is |
+| --- | --- |
+| `Trivia` | `leading`/`trailing`: verbatim text around the root node only. |
+| `CstEntry` | One object entry: `keyText` (raw), `key` (decoded), `value`, `midGap` (the text between the key and the value). |
+| `CstNode` | `Json` shaped, with formatting attached: `CstNull(Trivia) \| CstBool(bool, Trivia) \| CstNumber(rawText: string, Trivia) \| CstString(rawText: string, Trivia) \| CstArray([]CstNode, gaps: []Option<string>, Trivia) \| CstObject([]CstEntry, gaps: []Option<string>, Trivia)`. |
+| `cstParse(source: string): CstNode!` | Parses JSONC into a `CstNode`, keeping every byte of formatting. |
+| `cstGet(root: CstNode, path: []string): Option<CstNode>` | Read-only lookup, mirroring `jsonGet`. |
+| `cstSetString(root, path: []string, value: string): CstNode!` | Sets a string leaf; fails if any path segment is missing or not an object. |
+| `cstSetStringPath(root, path: []string, value: string): CstNode!` | Same, creating missing intermediate objects instead of failing. |
+| `cstDeleteKey(root: CstNode, path: []string): CstNode!` | Removes one entry; every sibling is unchanged. |
+| `cstPrint(n: CstNode): string` | Serializes back to JSONC text, byte-identical where nothing was edited. |
+| `cstToJson(n: CstNode): Json` | Drops all `Trivia`, producing a plain `Json` tree. Total, never fails. |

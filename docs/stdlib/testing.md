@@ -1,8 +1,8 @@
 # std/testing
 
 Assertions for `bit test`. A test is a `test "name" { }` declaration in a file
-named `<name>.test.bit`, and that is the only discovery shape (SPEC section 19);
-`bit test` finds them, runs each in its own process, and reports what failed.
+named `<name>.test.bit`, and that is the only way `bit test` finds one -
+it runs each in its own process, and reports what failed.
 The name is the declaration's string, so it may contain spaces and punctuation,
 and it is what `ok`/`FAIL` lines print and what `--run` matches. A bare
 top-level function with no parameters and no return type inside a `.test.bit`
@@ -89,7 +89,7 @@ arguments alone: `eq<i64>(got, 42, "...")`.
 
 `eq`, `neq` and `eqSlice` build their failure message by interpolating `got`
 and `want` (`"${label}: got ${got}, want ${want}"`), so `T` needs a way to
-render as text: every primitive and `string` has one built in, but a `class`
+render as text: every basic type and `string` has one built in, but a `class`
 type needs its own `show(): string` method. Without one, the call is a
 compile error at the `eq`/`neq`/`eqSlice` call site, naming the missing
 method and the type:
@@ -208,10 +208,10 @@ with a `check` prefix, that prints the failure and *returns* instead of
 panicking, so a loop can keep going and report every bad row in one run.
 
 A non-fatal check does not fail the test by itself: `bit test` does not wrap
-a test function in a panic boundary (SPEC.md §18.4 - `std/runtime`'s
-`runRecovering` exists, but the runner does not call it; each test gets its
-own process instead, and the runner reads its exit status), and running a
-test function only returns, with no automatic "did anything fail" step
+a test function in a panic boundary. `std/runtime`'s `runRecovering` exists,
+but the runner does not call it; each test gets its own process instead, and
+the runner reads its exit status. Running a test function only returns, with
+no automatic "did anything fail" step
 afterward. Call `checkDone()` to turn any
 failures the `checkX` calls recorded into a real test failure - normally
 `defer checkDone()` at the top of the function, so it runs on every return
