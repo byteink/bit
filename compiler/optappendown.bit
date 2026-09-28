@@ -23,9 +23,10 @@
 //    of memory is rule 2's non-fresh source.
 // 2. Fresh sources. Every member that is neither a bound parameter nor an
 //    append result must be `const_nil` or `rt_call slice_new`: a header no one
-//    else was ever given. A function parameter, a field or element load, or a
-//    call result may already be held elsewhere (the caller, the heap), so the
-//    whole class keeps cloning.
+//    else was ever given, or a read of a field whose header only the field
+//    holds (`fieldOwned`, optappendfield.bit, #6179). A function parameter,
+//    any other field or element load, or a call result may already be held
+//    elsewhere (the caller, the heap), so the whole class keeps cloning.
 // 3. Liveness, the snapshot rule. At a candidate call no member except its
 //    own result may be live after it. The input live after it is a later read
 //    of the old header; any other member live after it is a second name for
@@ -33,13 +34,15 @@
 //    block parameter.
 // 4. Escapes. A member read by anything except a header read (`slice_len`,
 //    `field_get`, `keep_alive`, the receiver of `slice_get`/`slice_set`), a
-//    block argument, or a `_fresh` append's own input escapes: a call or
-//    closure argument, a `ret`, a store into a field, element or map, a
-//    `defer`'s capture. After an escape the object is readable from outside
-//    the class, so no candidate the escaped object can still reach may mutate
-//    it. "Can reach" walks from each escaping block along edges that carry a
-//    member (one live into the successor, or passed as its argument), so a
-//    `ret` or a store after the loop's last append blocks nothing.
+//    block argument, a `_fresh` append's own input, or an argument to a
+//    parameter that only borrows it (optappendborrow.bit, #6209) escapes:
+//    any other call or closure argument, a `ret`, a store into a field,
+//    element or map, a `defer`'s capture. After an escape the object is
+//    readable from outside the class, so no candidate the escaped object can
+//    still reach may mutate it. "Can reach" walks from each escaping block
+//    along edges that carry a member (one live into the successor, or passed
+//    as its argument), so a `ret` or a store after the loop's last append
+//    blocks nothing.
 //
 // Everything this file does not recognise is an escape or a non-fresh source,
 // and every failure leaves the call on its cloning `_fresh` entry point.
@@ -64,6 +67,7 @@ class OwnFn {
   hit: []int,
   nhit: int,
   epoch: int,
+  fields: FieldOwn,
 }
 
 // Whether `ins` is any of the four append entry points.
@@ -81,13 +85,14 @@ fn isFreshAppend(ins: IrInstr): bool {
 
 // For every instruction of `f`: true when it is a `_fresh` append whose input
 // header provably has no other reader, so the in-place path is unobservable.
-fn appendOwnedCalls(f: IrFunc): []bool {
+// `fo` is the module's field-ownership fact (optappendfield.bit, #6179).
+fn appendOwnedCalls(f: IrFunc, fo: FieldOwn): []bool {
   let out = []bool(len(f.instrs))
   let cands = ownCandidates(f)
   if (len(cands) == 0) {
     return out
   }
-  let o = newOwnFn(f)
+  let o = newOwnFn(f, fo)
   ownLinkEdges(o)
   let classOf = []int(len(f.instrs))
   let roots = []int(0)
@@ -120,7 +125,7 @@ fn ownCandidates(f: IrFunc): []int {
   return out
 }
 
-fn newOwnFn(f: IrFunc): OwnFn {
+fn newOwnFn(f: IrFunc, fo: FieldOwn): OwnFn {
   let n = len(f.instrs)
   let parent = []int(n)
   let i = 0
@@ -132,7 +137,7 @@ fn newOwnFn(f: IrFunc): OwnFn {
     f = f, pm = licmPredMap(f), blockOf = computeBlockOfInstr(f),
     useStart = []int(n + 1), useList = []int(0), parent = parent,
     stamp = []int(len(f.blocks)), stack = []int(len(f.blocks)),
-    hit = []int(len(f.blocks)), nhit = 0, epoch = 0,
+    hit = []int(len(f.blocks)), nhit = 0, epoch = 0, fields = fo,
   }
   ownIndexUses(o)
   return o
@@ -338,6 +343,9 @@ fn ownFreshSource(o: OwnFn, m: int): bool {
   if (ins.op == Op.ConstNil || isAppendRt(ins)) {
     return true
   }
+  if (ins.op == Op.FieldGet) {
+    return fieldOwned(o.fields, o.f, ins)
+  }
   return ins.op == Op.RtCall && ins.name == "slice_new"
 }
 
@@ -355,7 +363,7 @@ fn ownEscapes(o: OwnFn, members: []int): []int {
     let k = o.useStart[m]
     while (k < o.useStart[m + 1]) {
       let u = o.useList[k]
-      if (ownUseEscapes(o.f, u, m) && u < minEsc[o.blockOf[u]]) {
+      if (ownUseEscapes(o, u, m) && u < minEsc[o.blockOf[u]]) {
         minEsc[o.blockOf[u]] = u
       }
       k = k + 1
@@ -365,22 +373,30 @@ fn ownEscapes(o: OwnFn, members: []int): []int {
 }
 
 // Whether instruction `u` reading member `m` lets the header out of the class.
-fn ownUseEscapes(f: IrFunc, u: int, m: int): bool {
-  let ins = f.instrs[u]
+// A call whose every position `m` fills only borrows it (optappendborrow.bit,
+// #6209) keeps it in.
+fn ownUseEscapes(o: OwnFn, u: int, m: int): bool {
+  let ins = o.f.instrs[u]
   if (ins.op == Op.Jump) {
     return false
   }
   if (ins.op == Op.Br) {
     return ins.lhs == m
   }
+  if (ins.op == Op.Call) {
+    return !borrowedArg(o.fields.borrow, ins, m)
+  }
+  return !ownHeaderUse(ins, m)
+}
+
+// Whether `ins` only reads header `m`, or appends to it as its input.
+fn ownHeaderUse(ins: IrInstr, m: int): bool {
   if (ins.op == Op.SliceLen || ins.op == Op.FieldGet || ins.op == Op.KeepAlive) {
-    return false
+    return true
   }
-  if (isFreshAppend(ins) ||
-    (ins.op == Op.RtCall && (ins.name == "slice_get" || ins.name == "slice_set"))) {
-    return !ownOnlyReceiver(ins.args, m)
-  }
-  return true
+  let reader = isFreshAppend(ins) ||
+    (ins.op == Op.RtCall && (ins.name == "slice_get" || ins.name == "slice_set"))
+  return reader && ownOnlyReceiver(ins.args, m)
 }
 
 // Whether `m` is `args[0]` and appears in no other slot: the header is only
