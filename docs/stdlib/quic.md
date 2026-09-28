@@ -90,75 +90,343 @@ If you are building an HTTP service, use [`pkg/web`](/packages/web) or
 plain request/handler API. Reach for `std/quic` only when your protocol is not
 HTTP.
 
-## Reference
+## Connections and streams
 
-### Transport / connection
+### `dialQuic(host: string, port: int, serverName: string): Conn!`
 
-| | |
-|---|---|
-| `dialQuic(host, port, serverName): Conn!` | open a connection and complete the handshake |
-| `acceptQuic(sock, certChainPem, keyPem): Conn!` | accept one connection on a bound socket |
-| `listenQuic(sock, certChainPem, keyPem): Listener!` | bind a listener for many concurrent connections |
-| `Listener.accept(): Conn!` | accept the next established connection |
-| `Listener.stopAccepting()` | stop admitting new connections; existing ones are unaffected |
-| `Conn.peerIp(): string` | the peer address the handshake established (frozen for the connection's life; `""` if unknown) |
-| `Conn.openStream(): Stream!` | open a client-initiated bidirectional stream |
-| `Conn.acceptStream(): Stream!` | accept the next peer-initiated stream |
-| `Conn.setIdleTimeout(ns: int)` | how long to tolerate silence before giving up (default 30s) |
-| `Conn.close()` | send CONNECTION_CLOSE (code 0) and stop |
-| `Conn.closeWithCode(code: int)` | as `close`, with an application error code |
-| `Stream.write(data: []byte): ()!` | queue outbound data |
-| `Stream.finish(): ()!` | mark the send side done, block until acknowledged |
-| `Stream.reset(code: int): ()!` | abandon the send side (RESET_STREAM); fire-and-forget |
-| `Stream.stopSending(code: int): ()!` | ask the peer to stop sending on this stream |
-| `Stream.read(): StreamChunk!` | read the next reassembled inbound chunk |
-| `Stream.id(): int` | the stream's id |
-| `StreamChunk { data, fin, reset, resetCode }` | one inbound take; `reset` set on a peer RESET_STREAM |
+Opens a connection to `host:port` and completes the handshake before
+returning.
 
-### Frames
+### `acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Conn!`
 
-The frame codec (RFC 9000): `Frame` covers every QUIC v1 frame kind, and every
-protocol number is a variable-length integer.
+Accepts one connection on the already-bound socket `sock`, using the given
+certificate chain and private key, and completes the handshake. Serves
+exactly one connection; use `listenQuic` for a socket that serves many
+clients.
 
-| | |
-|---|---|
-| `encodeVarint(v): []byte`, `decodeVarint(data): u64!`, `varintSize(v): int` | the variable-length integer codec |
-| `AckRange { gap, rangeLength }`, `AckFrame { largest, delay, firstRange, ranges, ecn, ect0, ect1, ce }` | an ACK frame and its ranges |
-| `StreamFrame { id, offset, data, hasOffset, hasLength, fin }` | a STREAM frame |
-| `Frame` | every v1 frame kind as one sum type (`Padding(n)`, `Ping`, `Crypto(offset, data)`, `ConnectionClose`, `ApplicationClose`, ...) |
-| `encodeFrame(f): []byte`, `encodeFrames(frames): []byte` | encode one or many frames |
-| `parseFrames(data): []Frame!` | parse every frame in a payload |
+### `listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Listener!`
 
-### Packet protection
+Binds a listener on the already-bound socket `sock` that can accept many
+concurrent connections, each identified by its own connection id. Returns
+immediately; connections arrive through `Listener.accept`.
 
-Key derivation, AEAD sealing, and header protection (RFC 9001) for the packets
-that carry the frames above.
+### `Listener`
 
-| | |
-|---|---|
-| `quicVersion1`, `longInitial` `longZeroRtt` `longHandshake` `longRetry` | QUIC v1 and the long-header packet types |
-| `PacketKeys { key, iv, hp }` | one direction's AEAD key, IV, and header-protection key |
-| `initialSalt(): []byte` | the fixed QUIC v1 Initial salt |
-| `expandLabel(secret, label, length): []byte` | TLS 1.3 HKDF-Expand-Label as QUIC uses it |
-| `deriveInitialSecret(dcid)`, `clientInitialSecret(dcid)`, `serverInitialSecret(dcid)` | the Initial secret ladder |
-| `deriveKeys(secret): PacketKeys` | key/iv/hp from a traffic secret |
-| `clientInitialKeys(dcid): PacketKeys`, `serverInitialKeys(dcid): PacketKeys` | Initial keys derived end to end from a connection id |
-| `packetNumberLength(pn, largestAcked): int`, `encodePacketNumber(pn, pnLength): []byte` | packet-number encoding |
-| `packetNonce(iv, pn): []byte` | the AEAD nonce for a packet number |
-| `protectPayload(keys, pn, header, payload): []byte!`, `unprotectPayload(keys, pn, header, ciphertext): []byte!` | seal/open a packet payload |
-| `headerSample(protectedPayload, pnLength): []byte!` | the header-protection sample |
-| `aesHeaderMask(hpKey, sample): []byte!`, `chachaHeaderMask(hpKey, sample): []byte!` | the AES-ECB and ChaCha20 header-protection masks |
-| `applyHeaderProtection(packet, pnOffset, mask): ()!`, `removeHeaderProtection(packet, pnOffset, mask): int!` | apply/remove header protection in place |
-| `LongHeader { ... }`, `parseLongHeader(packet): LongHeader!` | the invariant long-header fields |
-| `encodeInitialHeader(...)` | the unprotected Initial header (the AEAD additional data) |
-| `ShortHeader { ... }`, `encodeShortHeader(...)`, `parseShortHeader(packet, dcidLen): ShortHeader!` | the 1-RTT short header |
-| `retryIntegrityTag(odcid, retryWithoutTag): []byte!`, `verifyRetry(odcid, fullRetry): bool!` | the Retry integrity tag |
-| `encodeVersionNegotiation(dcid, scid, versions): []byte`, `isVersionNegotiation(packet): bool` | Version Negotiation packets |
+A QUIC server listener owning one bound UDP socket, sorting incoming packets
+to the right connection.
 
-### QUIC-TLS
+### `Listener.accept(): Conn!`
 
-The seam between QUIC and [`std/tls`](tls.md)'s record-bypass handshake: transport
-parameters, per-level key derivation, and CRYPTO-frame carriage.
+Blocks until the next connection finishes its handshake, then returns it.
+
+### `Listener.stopAccepting()`
+
+Stops admitting new connections. Connections already accepted are
+unaffected.
+
+### `Conn`
+
+An established QUIC connection. Safe to use from many green threads at once.
+
+### `Conn.peerIp(): string`
+
+The peer's address, fixed for the life of the connection, or `""` if
+unknown.
+
+### `Conn.openStream(): Stream!`
+
+Opens a new bidirectional stream from this side.
+
+### `Conn.acceptStream(): Stream!`
+
+Blocks until the peer opens a new stream, then returns it.
+
+### `Conn.setIdleTimeout(ns: int)`
+
+Sets how long, in nanoseconds, the connection tolerates silence from the
+peer before giving up. The default is 30 seconds; lower it to detect a
+vanished peer sooner.
+
+### `Conn.close()`
+
+Closes the connection with no application error code.
+
+### `Conn.closeWithCode(code: int)`
+
+Closes the connection, telling the peer the application error code `code`.
+
+### `Stream`
+
+One bidirectional stream on a `Conn`. Write and read independently in each
+direction.
+
+### `Stream.write(data: []byte): ()!`
+
+Queues `data` to send on this stream.
+
+### `Stream.finish(): ()!`
+
+Marks this stream's send side done and blocks until the peer has
+acknowledged every byte. A finished send side cannot be reused.
+
+### `Stream.reset(code: int): ()!`
+
+Abandons this stream's send side immediately, discarding any unsent data and
+telling the peer to stop expecting the rest. Does not wait for
+acknowledgment. Do not call this after `finish` on the same stream is
+already in flight.
+
+### `Stream.stopSending(code: int): ()!`
+
+Asks the peer to stop sending on this stream, carrying `code` as the reason.
+
+### `Stream.read(): StreamChunk!`
+
+Blocks until the next reassembled chunk of inbound data is available, then
+returns it.
+
+### `Stream.id(): int`
+
+This stream's id.
+
+### `StreamChunk`
+
+One inbound take from a stream: `data` is the bytes received, `fin` marks
+the end of the stream, and `reset` (with `resetCode`) is set instead when
+the peer abandoned its send side rather than finishing normally.
+
+## Frames
+
+A QUIC packet payload is a sequence of frames, and every number in the
+protocol (a length, offset, stream id, or error code) is a variable-length
+integer: the encoded length is 1, 2, 4, or 8 bytes depending on the value's
+size.
+
+### `encodeVarint(v: u64): []byte`
+
+The shortest variable-length integer encoding of `v`. `v` must fit in 62
+bits.
+
+### `decodeVarint(data: []byte): u64!`
+
+Decodes the variable-length integer at the start of `data`, ignoring any
+trailing bytes. Fails on an empty slice or a length that runs past the end.
+
+### `varintSize(v: u64): int`
+
+The number of bytes `encodeVarint` will use for `v`, for sizing a buffer up
+front.
+
+### `AckRange`
+
+One acknowledgment range: a `gap` of unacknowledged packets and a
+`rangeLength` of acknowledged ones.
+
+### `AckFrame`
+
+An ACK frame: the largest acknowledged packet number in `largest`, the ack
+delay, the first range, any additional gap/range pairs, and, when `ecn` is
+set, the three ECN congestion counters.
+
+### `StreamFrame`
+
+A STREAM frame carrying part of a stream's data: `id`, `offset`, `data`, and
+the `hasOffset`/`hasLength`/`fin` flags that say which fields are present on
+the wire.
+
+### `Frame`
+
+One QUIC frame, covering every frame kind this module supports: padding, a
+ping, an ack, resetting or stopping a stream, a piece of the handshake
+(`Crypto`), a piece of a stream (`Stream`), flow-control updates, connection
+management, and connection close.
+
+### `encodeFrame(f: Frame): []byte`
+
+The wire encoding of one frame.
+
+### `encodeFrames(frames: []Frame): []byte`
+
+The concatenated wire encoding of `frames`, in order.
+
+### `parseFrames(data: []byte): []Frame!`
+
+Parses every frame in `data`, in order, until the buffer is exactly
+consumed. Fails on an unknown frame type or a field that runs past the end.
+
+## Packet protection
+
+Every QUIC packet is encrypted and its header partly hidden. This part of
+the module derives the keys, encrypts and decrypts packet payloads, and
+applies or removes header protection.
+
+### `quicVersion1: int`
+
+QUIC version 1.
+
+### `longInitial: int`
+
+The long-header packet type for an Initial packet, the first packet of a
+connection.
+
+### `longZeroRtt: int`
+
+The long-header packet type for a 0-RTT packet.
+
+### `longHandshake: int`
+
+The long-header packet type for a Handshake packet.
+
+### `longRetry: int`
+
+The long-header packet type for a Retry packet.
+
+### `PacketKeys`
+
+One direction's packet-protection keys for one encryption level: the AEAD
+`key`, the `iv`, and the header-protection key `hp`.
+
+### `initialSalt(): []byte`
+
+The fixed salt used to derive Initial packet keys, the same for every QUIC
+v1 connection.
+
+### `expandLabel(secret: []byte, label: string, length: int): []byte`
+
+Expands `secret` to `length` bytes bound to `label`, the key-derivation
+function every other key in this module builds on.
+
+### `deriveInitialSecret(dcid: []byte): []byte`
+
+The secret both directions' Initial keys descend from, derived from the
+client's chosen destination connection id `dcid`.
+
+### `clientInitialSecret(dcid: []byte): []byte`
+
+The client's Initial traffic secret, derived from `dcid`.
+
+### `serverInitialSecret(dcid: []byte): []byte`
+
+The server's Initial traffic secret, derived from `dcid`.
+
+### `deriveKeys(secret: []byte): PacketKeys`
+
+The key, iv, and header-protection key derived from a traffic `secret`.
+
+### `clientInitialKeys(dcid: []byte): PacketKeys`
+
+The keys that protect the client's Initial packets, derived end to end from
+`dcid`.
+
+### `serverInitialKeys(dcid: []byte): PacketKeys`
+
+The keys that protect the server's Initial packets, derived end to end from
+`dcid`.
+
+### `packetNumberLength(pn: u64, largestAcked: int): int`
+
+The smallest number of bytes (1 to 4) needed to encode packet number `pn`
+given the highest packet number the peer has acknowledged so far. Pass a
+negative `largestAcked` when nothing has been acknowledged yet.
+
+### `encodePacketNumber(pn: u64, pnLength: int): []byte`
+
+The `pnLength`-byte encoding of packet number `pn`.
+
+### `packetNonce(iv: []byte, pn: u64): []byte`
+
+The AEAD nonce for packet number `pn`, combining it with `iv`.
+
+### `protectPayload(keys: PacketKeys, pn: u64, header: []byte, payload: []byte): []byte!`
+
+Encrypts `payload` under `keys` for packet number `pn`, authenticating
+`header` alongside it. Returns the protected payload with its tag.
+
+### `unprotectPayload(keys: PacketKeys, pn: u64, header: []byte, ciphertext: []byte): []byte!`
+
+Decrypts `ciphertext` under `keys` for packet number `pn`, checking it
+against `header`. Fails if the data was tampered with.
+
+### `headerSample(protectedPayload: []byte, pnLength: int): []byte!`
+
+The bytes sampled from an encrypted payload to compute the header-protection
+mask. Fails if the payload is too short.
+
+### `aesHeaderMask(hpKey: []byte, sample: []byte): []byte!`
+
+The header-protection mask for an AES-based cipher suite, computed from
+`hpKey` and `sample`.
+
+### `chachaHeaderMask(hpKey: []byte, sample: []byte): []byte!`
+
+The header-protection mask for the ChaCha20-Poly1305 cipher suite, computed
+from `hpKey` and `sample`.
+
+### `applyHeaderProtection(packet: []byte, pnOffset: int, mask: []byte): ()!`
+
+Hides the packet number and header bits of `packet` in place using `mask`,
+before sending.
+
+### `removeHeaderProtection(packet: []byte, pnOffset: int, mask: []byte): int!`
+
+Reveals the packet number and header bits of `packet` in place using
+`mask`, on receipt, and returns the recovered packet-number length.
+
+### `LongHeader`
+
+The fields common to every long-header packet: the packet `typ`, the
+`version`, and the source and destination connection ids.
+
+### `parseLongHeader(packet: []byte): LongHeader!`
+
+The long-header fields of `packet`. Fails if `packet` does not have a long
+header or is truncated.
+
+### `encodeInitialHeader(version: int, dcid: []byte, scid: []byte, token: []byte, length: u64, pn: u64, pnLength: int): []byte`
+
+The unprotected bytes of an Initial packet's header, used as the
+authenticated data when protecting its payload.
+
+### `ShortHeader`
+
+The fields of a short (1-RTT) header recovered after header protection is
+removed: the spin and key-phase bits, the destination connection id, and the
+packet-number length.
+
+### `encodeShortHeader(dcid: []byte, pn: u64, pnLength: int, spinBit: bool, keyPhase: bool): []byte`
+
+The unprotected bytes of a short header for packet number `pn` on
+connection id `dcid`.
+
+### `parseShortHeader(packet: []byte, dcidLen: int): ShortHeader!`
+
+The short-header fields of `packet`, given the connection's known
+destination-connection-id length `dcidLen`. Call this after
+`removeHeaderProtection`.
+
+### `retryIntegrityTag(odcid: []byte, retryWithoutTag: []byte): []byte!`
+
+The integrity tag for a Retry packet, authenticating it against the original
+destination connection id `odcid`.
+
+### `verifyRetry(odcid: []byte, fullRetry: []byte): bool!`
+
+Whether the trailing integrity tag of `fullRetry` is valid for `odcid`.
+
+### `encodeVersionNegotiation(dcid: []byte, scid: []byte, versions: []int): []byte`
+
+A Version Negotiation packet listing the server's supported `versions`, in
+reply to a client request for a version this server does not support.
+
+### `isVersionNegotiation(packet: []byte): bool`
+
+Whether `packet` is a Version Negotiation packet.
+
+## QUIC-TLS
+
+The seam between QUIC and [`std/tls`](tls.md)'s handshake: transport
+parameters, per-level key derivation, and carrying handshake bytes in CRYPTO
+frames.
 
 ```bit
 import {
@@ -193,21 +461,91 @@ fn carry(handshake: []byte): []byte! {
 }
 ```
 
-| | |
-|---|---|
-| `quicTransportParametersExtension` | the TLS extension codepoint (0x0039) carrying the parameters below |
-| `TransportParameters { ... }`, `defaultTransportParameters(): TransportParameters` | the parameters an endpoint sends its peer, seeded with RFC defaults |
-| `encodeTransportParameters(tp): []byte`, `decodeTransportParameters(data): TransportParameters!` | codec for the extension body |
-| `EncryptionLevel` (`Initial`, `Handshake`, `OneRtt`) | the three packet-protection levels |
-| `levelPacketType(level): int` | the long-header type for a level (-1 for `OneRtt`) |
-| `levelKeys(newHash, secret, keyLen): PacketKeys` | Handshake/1-RTT keys from a TLS traffic secret |
-| `LevelKeyPair { client, server }`, `levelKeyPair(newHash, clientSecret, serverSecret, keyLen): LevelKeyPair` | both directions' keys for one level |
-| `updateSecret(newHash, secret): []byte` | the next-generation 1-RTT secret for a key update |
-| `nextKeyPhase(keyPhase): bool` | the key-phase bit after a key update |
-| `cryptoFrames(data, startOffset, maxChunk): []Frame` | chunk a handshake byte stream into CRYPTO frames |
-| `CryptoAssembler`, `newCryptoAssembler(maxLen): CryptoAssembler` | reassembler for out-of-order CRYPTO fragments |
-| `CryptoAssembler.insert(offset, fragment): ()!` | record one received fragment |
-| `CryptoAssembler.contiguous(): []byte`, `.contiguousLen(): int` | the contiguous reassembled prefix |
-| `reassembleCryptoFrames(frames, maxLen): []byte!` | reassemble a set of CRYPTO frames directly |
+### `quicTransportParametersExtension: int`
 
-Specification: RFC 9000 (transport), RFC 9001 (TLS/packet protection).
+The TLS extension codepoint that carries the transport parameters below.
+
+### `TransportParameters`
+
+The transport parameters an endpoint sends its peer during the handshake,
+such as how much data and how many streams it will accept.
+
+### `defaultTransportParameters(): TransportParameters`
+
+Transport parameters filled with their default values. Start here and set
+only the ones that differ.
+
+### `encodeTransportParameters(tp: TransportParameters): []byte`
+
+The extension body encoding of `tp`, omitting every parameter still at its
+default.
+
+### `decodeTransportParameters(data: []byte): TransportParameters!`
+
+The transport parameters `data` encodes, starting from the defaults for
+anything the peer omitted.
+
+### `EncryptionLevel`
+
+The three packet-protection levels a connection passes through: `Initial`,
+`Handshake`, and `OneRtt`.
+
+### `levelPacketType(level: EncryptionLevel): int`
+
+The long-header packet type that carries `level`. Returns -1 for `OneRtt`,
+which uses a short header instead.
+
+### `levelKeys(newHash: () => Hash, secret: []byte, keyLen: int): PacketKeys`
+
+The packet-protection keys for a non-Initial level, derived from a TLS
+traffic `secret`.
+
+### `LevelKeyPair`
+
+Both directions' keys for one non-Initial encryption level: `client` and
+`server`.
+
+### `levelKeyPair(newHash: () => Hash, clientSecret: []byte, serverSecret: []byte, keyLen: int): LevelKeyPair`
+
+Both directions' keys for one level, derived from the client and server TLS
+traffic secrets.
+
+### `updateSecret(newHash: () => Hash, secret: []byte): []byte`
+
+The next-generation 1-RTT secret for a key update. The header-protection key
+is not updated; re-derive only the AEAD key and iv from the result.
+
+### `nextKeyPhase(keyPhase: bool): bool`
+
+The key-phase bit after a key update.
+
+### `cryptoFrames(data: []byte, startOffset: u64, maxChunk: int): []Frame`
+
+Splits the handshake bytes `data` into CRYPTO frames of at most `maxChunk`
+bytes each, ready to place in a packet.
+
+### `CryptoAssembler`
+
+A reassembler for CRYPTO frames that may arrive out of order or overlap.
+Build one with `newCryptoAssembler`.
+
+### `newCryptoAssembler(maxLen: int): CryptoAssembler`
+
+A fresh assembler that accepts data up to `maxLen` bytes total.
+
+### `CryptoAssembler.insert(offset: u64, fragment: []byte): ()!`
+
+Records one received fragment at `offset`.
+
+### `CryptoAssembler.contiguous(): []byte`
+
+The contiguous reassembled prefix received so far, starting from offset 0.
+
+### `CryptoAssembler.contiguousLen(): int`
+
+The length of the contiguous reassembled prefix.
+
+### `reassembleCryptoFrames(frames: []Frame, maxLen: int): []byte!`
+
+Reassembles a set of CRYPTO frames directly into the contiguous handshake
+byte stream, without building a `CryptoAssembler` yourself.
