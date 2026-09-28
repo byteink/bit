@@ -41,3 +41,10 @@ anything opens a socket.
 query parameter read; any other fails naming itself rather than being
 dropped. An unrecognised `sslmode` value is rejected, never defaulted; see
 [TLS](tls.md) for what each accepted value does.
+
+## Where to go next
+
+[Authentication](authentication.md) covers what happens right after the
+socket opens. [Queries](queries.md) covers running statements once the
+pool is open, and [Errors](errors.md) covers what a failed one gives you
+back.

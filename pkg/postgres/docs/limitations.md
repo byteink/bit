@@ -19,3 +19,8 @@ the end of a chapter.
 - **`SCRAM-SHA-256-PLUS` (channel binding) is not offered.**
 - **TLS client certificates are not sent.** `std/tls` does not request or
   present them.
+
+## Where to go next
+
+[TLS](tls.md) and [Authentication](authentication.md) cover the mechanisms
+these gaps sit in.

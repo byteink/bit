@@ -51,3 +51,8 @@ certificate: generate `server.crt`/`server.key` into the data directory
 (`openssl req -new -x509 -nodes -subj /CN=localhost`), `chmod 600` the key,
 `chown postgres`, then `ALTER SYSTEM SET ssl='on'` and `SELECT
 pg_reload_conf()`.
+
+## Where to go next
+
+[Limitations](limitations.md) lists what the test suite above does not
+cover yet.

@@ -32,3 +32,9 @@ Every exchange is drained to `ReadyForQuery`, so a statement that failed -
 including one that failed halfway through a result set - leaves the
 connection usable, and the next borrower from the pool never inherits a
 half-read stream.
+
+## Where to go next
+
+[Queries](queries.md) covers the statements and transactions these errors
+come from. [Limitations](limitations.md) lists what this driver does not
+do yet.

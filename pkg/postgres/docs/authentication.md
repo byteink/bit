@@ -23,3 +23,9 @@ identity" (`n,,`).
 
 Both are read from the connection the same way regardless: neither weakens
 a `trust`/`password`/`md5` connection, since those never run SCRAM at all.
+
+## Where to go next
+
+[TLS](tls.md) covers the handshake that runs before authentication.
+[Limitations](limitations.md) lists both gaps above alongside the driver's
+other open ones.
