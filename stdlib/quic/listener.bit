@@ -98,15 +98,17 @@ export class Listener {
   }
 
   // Stop admitting brand-new connections: every later datagram whose
-  // connection id is not already in the demux table is silently dropped
-  // (RFC 9000 §5.2.2 permits either a stateless drop or replying with a
-  // CONNECTION_CLOSE carrying CONNECTION_REFUSED; this build does the
-  // former — see this method's own doc in stdlib/quic.md for why). A
-  // connection already accepted, or still mid-handshake, keeps being fed its
-  // datagrams exactly as before: this stops ADMISSION, not the one shared
-  // demux loop every open connection depends on. Idempotent and safe to call
-  // from any green thread — the flag is guarded by the same `mu` every other
-  // field of the listener's state is.
+  // connection id is not already in the demux table is refused instead of
+  // admitted. A well-formed client Initial gets the RFC 9000 §5.2.2 SHOULD —
+  // a stateless Initial packet carrying CONNECTION_CLOSE(CONNECTION_REFUSED)
+  // (`quicListenerSendRefusal`, below); anything too malformed to carry a
+  // parseable DCID, or not an Initial at all, still falls back to a silent
+  // drop (see this method's own doc in stdlib/quic.md). A connection already
+  // accepted, or still mid-handshake, keeps being fed its datagrams exactly
+  // as before: this stops ADMISSION, not the one shared demux loop every
+  // open connection depends on. Idempotent and safe to call from any green
+  // thread — the flag is guarded by the same `mu` every other field of the
+  // listener's state is.
   export stopAccepting() {
     this.state.mu.lock()
     this.state.stopped = true
@@ -174,10 +176,18 @@ fn quicListenerDispatch(lst: quicListenerState, data: []byte, host: string, port
     return
   }
   // `stopAccepting` (#6149): a datagram for a DCID this listener has never
-  // seen is a brand-new connection attempt — drop it before it ever reaches
-  // the Initial/admission checks below. A known DCID is unaffected (handled
-  // above), so a connection already accepted keeps being fed regardless.
+  // seen is a brand-new connection attempt — refuse it before it ever
+  // reaches the Initial/admission checks below. A known DCID is unaffected
+  // (handled above), so a connection already accepted keeps being fed
+  // regardless. Only a client Initial gets the stateless CONNECTION_CLOSE
+  // reply (RFC 9000 §5.2.2 only speaks to refusing a *new connection*
+  // attempt, which is what a client Initial is); anything else addressed to
+  // an unknown DCID is the ordinary stray-packet case §5.2 already covers
+  // with a silent drop.
   if (stopped) {
+    if (quicDemuxIsInitial(data)) {
+      quicListenerSendRefusal(lst, data, host, port)
+    }
     return
   }
   // ponytail: unknown dcid falls through to the Initial/new-connection path.
@@ -214,6 +224,58 @@ fn quicListenerDispatch(lst: quicListenerState, data: []byte, host: string, port
   }
   lst.mu.unlock()
   quicListenerFeed(st.inCh, data, host, port)
+}
+
+// Answer a refused connection attempt with a stateless Initial packet
+// carrying CONNECTION_CLOSE(CONNECTION_REFUSED) (RFC 9000 §5.2.2, §20.1),
+// instead of `quicListenerDispatch`'s plain drop. Built entirely outside any
+// connection's state — no `quicconnState`, no packet-number history kept
+// past this one call — using the same Initial-key derivation and packet
+// protection every real connection uses (`serverInitialKeys`, `protectPayload`,
+// `applyHeaderProtection`; packet.bit, RFC 9001 §5.1/§5.2), keyed by the
+// client's own Destination Connection ID off its Initial (`hdr.dcid` below),
+// exactly as `quicconnServerInitKeys` (recv.bit) would for a connection this
+// listener was still admitting.
+//
+// Best-effort and fails closed to a silent drop at every step — a malformed
+// header, a sealing failure, or a reply that would exceed the RFC 9000 §8.1
+// anti-amplification limit (an address not yet validated by a completed
+// handshake must never be sent more than 3x what it sent us) all just
+// return without writing to the socket. The caller is the shared demux
+// loop, so a write failure here must not propagate either.
+fn quicListenerSendRefusal(lst: quicListenerState, data: []byte, host: string, port: int) {
+  let hdr = parseLongHeader(data) catch _ {
+    return
+  }
+  let keys = serverInitialKeys(hdr.dcid)
+  let frames = [Frame.ConnectionClose(u64(quicconnErrConnectionRefused), u64(0), []byte(0))]
+  let payload = encodeFrames(frames)
+  let length = quicconnPnLen + len(payload) + 16
+  // DCID echoes the client's own SCID (what it expects a reply to be
+  // addressed to); SCID is freshly chosen, same as a real accepted
+  // connection would (`quicListenerNewConn`) — there is no follow-up packet
+  // for the client to match it against either way.
+  let header = encodeInitialHeader(
+    quicVersion1, hdr.scid, quicconnMakeCid(), []byte(0), u64(length), u64(0), quicconnPnLen,
+  )
+  let pnOffset = len(header) - quicconnPnLen
+  let sealed = protectPayload(keys, u64(0), header, payload) catch _ {
+    return
+  }
+  let packet = quicpktPutBytes(header, sealed)
+  let sample = headerSample(sealed, quicconnPnLen) catch _ {
+    return
+  }
+  let mask = aesHeaderMask(keys.hp, sample) catch _ {
+    return
+  }
+  applyHeaderProtection(packet, pnOffset, mask) catch _ {
+    return
+  }
+  if (len(packet) > 3 * len(data)) {
+    return
+  }
+  lst.sock.send(host, port, string(packet)) catch _ {}
 }
 
 // Hand a datagram to a connection's inbound channel without blocking: if the
