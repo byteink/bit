@@ -317,6 +317,25 @@ A listening HTTP server.
 One accepted connection, and the connection to answer it on. Call `read()` to
 get the request.
 
+### `byteStream`
+
+The interface a message is read from and written to, over either transport
+this module serves: `readUp`/`writeStr`/`writeBytes`/`shut`/`setIdleDeadline`
+and a few more. `Exchange.hijackStream()`/`TlsExchange.hijackStream()` return
+one; a caller that wants to frame its own protocol on top of a hijacked
+connection without caring whether it ran over plain TCP or TLS (`std/
+websocket`'s `Conn` does exactly this) holds one of these instead of a
+concrete `Conn`/`TlsConn`.
+
+### `newByteStream(c: Conn): byteStream`
+
+Wraps a `std/net` connection a caller already holds (not one reached through
+`Exchange.hijackStream()`, which returns one directly) as a `byteStream`.
+
+### `newTlsByteStream(c: TlsConn): byteStream`
+
+The TLS mirror of `newByteStream`.
+
 ### `serve(host: string, port: int): Server!`
 
 Binds and starts listening on `host:port`. Port `0` lets the kernel choose one;
@@ -377,13 +396,20 @@ Writes `res` to the connection and closes it.
 ### `Exchange.hijack(): Conn`
 
 Takes ownership of the exchange's underlying `std/net` connection for a
-protocol upgrade (e.g. WebSocket, RFC 6455 §4.1 - see `std/websocket`'s
-`upgrade`) that continues past the framing `respond()` assumes: `respond()`
-always writes exactly one HTTP response and closes the connection, which an
-upgraded connection must not do. Call `read()` first, check the request looks
-like the upgrade you expect, then call this instead of `respond()` - never
-both on the same exchange, since the caller now owns the connection's
-lifetime, including closing it.
+protocol upgrade or a hand-framed body that continues past the framing
+`respond()` assumes: `respond()` always writes exactly one HTTP response and
+closes the connection, which an upgraded connection must not do. Call
+`read()` first, check the request looks like the upgrade you expect, then
+call this instead of `respond()` - never both on the same exchange, since the
+caller now owns the connection's lifetime, including closing it.
+
+### `Exchange.hijackStream(): byteStream`
+
+`hijack()`'s transport-agnostic sibling, for a caller that wants to
+read/write frames through the same interface `readMessage`/
+`serializeResponseInto` already speak rather than a concrete `Conn`
+(`std/websocket`'s `upgrade` uses this) - returns the exchange's own
+underlying stream, the same instance `read()` already built.
 
 ### `Exchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
 
@@ -967,6 +993,11 @@ The TLS mirror of `Exchange.respondKeepAlive()`.
 
 The TLS mirror of `Exchange.hijack()`: takes ownership of the exchange's
 underlying `TlsConn`.
+
+### `TlsExchange.hijackStream(): byteStream`
+
+The TLS mirror of `Exchange.hijackStream()` (`std/websocket`'s `upgradeTls`
+uses this).
 
 ### `serveHijackableTlsOn(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()!`
 

@@ -1,18 +1,22 @@
 # std/websocket
 
-The RFC 6455 WebSocket handshake, frame codec, and close protocol, over a
-plain-TCP `std/net` connection.
+The RFC 6455 WebSocket handshake, frame codec, and close protocol, over
+either transport `std/http` serves: plain TCP or TLS+HTTP/1.1. `Conn` reads
+and writes through `std/http`'s transport-agnostic `byteStream` (`Exchange.
+hijackStream()`/`TlsExchange.hijackStream()`), not a concrete connection
+type, so framing is identical on both.
 
-A WebSocket connection begins life as an ordinary `std/http` request: accept it
-and read it the normal way, then hand the exchange and the parsed request to
-`upgrade` once it looks like a WebSocket handshake (`Upgrade: websocket`) - this
-module never parses a request line itself. `upgrade` takes ownership of the
-exchange's connection (`Exchange.hijack`, `std/http`) and returns a `Conn` for
-framing from then on; `Exchange.respond` must not be called on the same
-exchange afterward. The client side is symmetric: `dial` opens a plain TCP
-connection and performs the client handshake itself, given a bare
-host/port/path the same way `std/net`'s own `dial` takes a bare host/port - no
-URL parsing here.
+A WebSocket connection begins life as an ordinary `std/http` request: accept
+it and read it the normal way, then hand the exchange and the parsed request
+to `upgrade` (plain) or `upgradeTls` (TLS+HTTP/1.1) once it looks like a
+WebSocket handshake (`Upgrade: websocket`) - this module never parses a
+request line itself. Either takes ownership of the exchange's connection
+(`Exchange.hijackStream`/`TlsExchange.hijackStream`, `std/http`) and returns
+a `Conn` for framing from then on; `Exchange.respond`/`TlsExchange.respond`
+must not be called on the same exchange afterward. The client side is
+symmetric: `dial` opens a plain TCP connection and performs the client
+handshake itself, given a bare host/port/path the same way `std/net`'s own
+`dial` takes a bare host/port - no URL parsing here.
 
 Origin policy is the caller's decision, not this module's (RFC 6455 §4.2.1
 makes checking it optional and application-specific): call `upgrade` only
@@ -25,9 +29,9 @@ way across fragments (`Limits.maxMessageBytes`, `Limits.maxFragments`) - the
 length in a frame header is attacker controlled and, unmasked, unbounded up to
 2^63.
 
-Per-message compression (permessage-deflate, RFC 7692) is out of scope. TLS
-(`wss://`) is not supported in this version - the same intentional limit
-`std/net` documents for itself.
+Per-message compression (permessage-deflate, RFC 7692) is out of scope. The
+server side supports TLS (`upgradeTls`); the client side's `dial` is
+plain-TCP only - a `wss://` client dial is not supported in this version.
 
 Outgoing messages are never fragmented by this module - every
 `sendText`/`sendBinary` call is a single, unfragmented frame, which is a fully
@@ -58,6 +62,25 @@ import { upgrade, defaultLimits, Conn } from "std/websocket"
 
 fn accept(ex: Exchange, req: Request): Conn! {
   return upgrade(ex, req, defaultLimits())?
+}
+```
+
+### `upgradeTls(ex: TlsExchange, req: Request, limits: Limits): Conn!`
+
+`upgrade`'s exact TLS mirror: completes the server-side handshake on a
+request that arrived over TLS+HTTP/1.1 (ALPN "http/1.1"), taking ownership of
+`ex`'s connection (`TlsExchange.hijackStream`, `std/http`) instead of
+`Exchange`'s. The same `Conn` either way - `sendText`/`sendBinary`/`receive`
+work identically once the handshake completes, since `Conn` reads and writes
+through `std/http`'s transport-agnostic `byteStream`, not a concrete `Conn`/
+`TlsConn`.
+
+```bit
+import { TlsExchange, Request } from "std/http"
+import { upgradeTls, defaultLimits, Conn } from "std/websocket"
+
+fn acceptTls(ex: TlsExchange, req: Request): Conn! {
+  return upgradeTls(ex, req, defaultLimits())?
 }
 ```
 
