@@ -9,8 +9,9 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/selfhost-ir-signatures.sh
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
 
-# Self-check: run directly (not sourced) to assert explainMismatch still
-# accepts the #5474 shape and still rejects unrelated text.
+# Self-check: run directly (not sourced) to assert explainMismatch rejects
+# unrelated text on every kind -- no signature is currently declared for any
+# of them (see scripts/selfhost-ir-signatures.sh's Retirement history).
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -24,11 +25,19 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # were RETIRED by the stage0 0.20.0 repin (#5607). #5870, #5871 (both
   # arms), #5874, #5876, #5895, #5905, #5906 and #5910 were RETIRED by the
   # stage0 0.27.0 repin (#5914). #5921-ptrof-string-type was RETIRED by the
-  # stage0 0.28.0 repin (#5957). Their shaped-delta fixtures lived in this
+  # stage0 0.28.0 repin (#5957). #5474-catch-composite-default-ast,
+  # #5474-catch-composite-default-fmt and #6051-generic-member-comment-fmt
+  # were all RETIRED by the stage0 0.32.0 repin (#6187): 0.32.0's own
+  # oracle already parses and formats every shape they used to explain the
+  # way the tree does, confirmed by `bash scripts/selfhost-diffast.sh`
+  # (MATCH=1410 MISMATCH=0 EXPLAINED=0) and `bash scripts/selfhost-
+  # difffmt.sh` (MATCH=2036 MISMATCH=0 EXPLAINED=0) against the 0.32.0 pin
+  # -- `ast`/`fmt` have no automated RETIRED audit, so this pair was
+  # confirmed dead by hand. Their shaped-delta fixtures lived in this
   # self-check; removed with the arms they tested rather than kept as tests
   # for identities that no longer exist. Git history at this file's state
-  # before #5914/#5957 has them, and scripts/selfhost-ir-signatures.sh's own
-  # header records why each went dead.
+  # before #5914/#5957/#6187 has them, and scripts/selfhost-ir-
+  # signatures.sh's own header records why each went dead.
 
   # An unrelated opcode-shaped delta must NOT be explained by anything
   # declared under `ir`/`iropt` -- no signature is currently declared for
@@ -51,149 +60,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
-  # --- #5474: catch composite-default disambiguation, ast + fmt kinds (#5510) ---
-  #
-  # Real dump/format text (#5510), from `_tests_/cases/catch_composite_default_single_field.bit`:
-  # `bit-oracle --dump-ast` (pre-#5474 parse) vs `bit-out/bin/bit --dump-ast`
-  # (post-#5474 parse) on the identical source.
-  oracle_catch_ast='(program (struct_decl Circle _ (field_list (field r int _ _))) (func_decl _ f _ (params) (fallible Circle _) (block (fail_stmt (call newError _ (args (arg "boom")))))) (func_decl _ main _ (params) _ (block (let_decl (binding x _ (catch_bind (call f _ (args)) Circle (block (assign = (lhs_list r) (expr_list 1)))))) (expr_stmt (call println _ (args (arg (str_interp "r=" (member x r) ""))))))))'
-  bit2_catch_ast='(program (struct_decl Circle _ (field_list (field r int _ _))) (func_decl _ f _ (params) (fallible Circle _) (block (fail_stmt (call newError _ (args (arg "boom")))))) (func_decl _ main _ (params) _ (block (let_decl (binding x _ (catch_default (call f _ (args)) (composite_lit Circle (field_inits (field_init r 1)))))) (expr_stmt (call println _ (args (arg (str_interp "r=" (member x r) ""))))))))'
-
-  sigca=$(explainMismatch "$oracle_catch_ast" "$bit2_catch_ast" ast)
-  rcca=$?
-  if [ "$rcca" -ne 0 ] || [ "$sigca" != "5474-catch-composite-default-ast" ]; then
-    echo "FAIL: the real #5474 ast delta was not explained (rc=$rcca sig='$sigca')"
+  # An unrelated ast/fmt divergence must NOT be explained by anything --
+  # no signature is currently declared for either kind (see scripts/
+  # selfhost-ir-signatures.sh's Retirement history), so both must always
+  # return 1 regardless of what the text looks like.
+  sigau=$(explainMismatch '(program (call foo))' '(program (call bar))' ast)
+  rcau=$?
+  if [ "$rcau" -eq 0 ] || [ -n "$sigau" ]; then
+    echo "FAIL: an unrelated ast delta was wrongly explained (rc=$rcau sig='$sigau')"
     fail=1
   fi
-
-  # REJECTION: the identical two texts scored under `ir` (the wrong kind)
-  # must not be explained -- catchDisambigAst only ever runs when kind=="ast".
-  sigcak=$(explainMismatch "$oracle_catch_ast" "$bit2_catch_ast" ir)
-  rccak=$?
-  if [ "$rccak" -eq 0 ] || [ -n "$sigcak" ]; then
-    echo "FAIL: a #5474 ast delta was wrongly explained under kind=ir (rc=$rccak sig='$sigcak')"
-    fail=1
-  fi
-
-  # REJECTION: an unrelated ast divergence (no catch_bind at all) must not
-  # be explained by coincidence.
-  sigcau=$(explainMismatch '(program (call foo))' '(program (call bar))' ast)
-  rccau=$?
-  if [ "$rccau" -eq 0 ] || [ -n "$sigcau" ]; then
-    echo "FAIL: an unrelated ast delta was wrongly explained (rc=$rccau sig='$sigcau')"
-    fail=1
-  fi
-
-  # REJECTION: a field value containing a paren is not this shape (the
-  # identity is for a single SCALAR field_init, nothing deeper).
-  bit2_catch_ast_paren='(program (let_decl (binding x _ (catch_default (call f _ (args)) (composite_lit Circle (field_inits (field_init r (call g _ (args)))))))))'
-  oracle_catch_ast_paren='(program (let_decl (binding x _ (catch_bind (call f _ (args)) Circle (block (assign = (lhs_list r) (expr_list (call g _ (args))))))))))'
-  sigcap=$(explainMismatch "$oracle_catch_ast_paren" "$bit2_catch_ast_paren" ast)
-  rccap=$?
-  if [ "$rccap" -eq 0 ] || [ -n "$sigcap" ]; then
-    echo "FAIL: a #5474 ast delta with a non-scalar field value was wrongly explained (rc=$rccap sig='$sigcap')"
-    fail=1
-  fi
-
-  # The fmt arm, real formatted-file text (#5510) from the same fixture:
-  # `bit-oracle fmt` (multi-line bind-block rendering) vs `bit-out/bin/bit fmt`
-  # (single-line composite-default rendering, `=` separator).
-  oracle_catch_fmt='// run
-class Circle {
-  r: int
-}
-fn f(): Circle! { fail newError("boom") }
-
-fn main() {
-  let x = f() catch Circle {
-    r = 1
-  }
-  println("r=${x.r}")
-}'
-  bit2_catch_fmt='// run
-class Circle {
-  r: int
-}
-fn f(): Circle! { fail newError("boom") }
-
-fn main() {
-  let x = f() catch Circle{ r = 1 }
-  println("r=${x.r}")
-}'
-
-  sigcf=$(explainMismatch "$oracle_catch_fmt" "$bit2_catch_fmt" fmt)
-  rccf=$?
-  if [ "$rccf" -ne 0 ] || [ "$sigcf" != "5474-catch-composite-default-fmt" ]; then
-    echo "FAIL: the real #5474 fmt delta was not explained (rc=$rccf sig='$sigcf')"
-    fail=1
-  fi
-
-  # REJECTION: an unrelated line changed elsewhere in the file, alongside an
-  # otherwise-genuine #5474 fmt delta, must still fail -- a signature is an
-  # identity the WHOLE delta must satisfy.
-  bit2_catch_fmt_plus='// run
-class Circle {
-  r: int
-}
-fn f(): Circle! { fail newError("boom") }
-
-fn main() {
-  let x = f() catch Circle{ r = 1 }
-  println("changed")
-}'
-  sigcfp=$(explainMismatch "$oracle_catch_fmt" "$bit2_catch_fmt_plus" fmt)
-  rccfp=$?
-  if [ "$rccfp" -eq 0 ] || [ -n "$sigcfp" ]; then
-    echo "FAIL: a #5474 fmt delta carrying an unrelated line change was wrongly explained (rc=$rccfp sig='$sigcfp')"
-    fail=1
-  fi
-
-  # REJECTION: the identical two texts scored under `ast` (the wrong kind)
-  # must not be explained -- catchDisambigFmt only ever runs when kind=="fmt".
-  sigcfk=$(explainMismatch "$oracle_catch_fmt" "$bit2_catch_fmt" ast)
-  rccfk=$?
-  if [ "$rccfk" -eq 0 ] || [ -n "$sigcfk" ]; then
-    echo "FAIL: a #5474 fmt delta was wrongly explained under kind=ast (rc=$rccfk sig='$sigcfk')"
-    fail=1
-  fi
-
-  # #6051: the pinned formatter pulls a generic-class member's leading
-  # comment into its signature; the fixed one keeps it above the member.
-  oracle_gmc='class Box<T> {
-  v: T
-  get(): Option< // Returns the value.
-    T,
-  > {
-    return this.v
-  }
-}'
-  bit2_gmc='class Box<T> {
-  v: T
-
-  // Returns the value.
-  get(): Option<T> {
-    return this.v
-  }
-}'
-  siggm=$(explainMismatch "$oracle_gmc" "$bit2_gmc" fmt)
-  if [ "$siggm" != "6051-generic-member-comment-fmt" ]; then
-    echo "FAIL: the #6051 comment-placement delta was not explained (sig='$siggm')"
-    fail=1
-  fi
-
-  # REJECTION: the same delta carrying one changed code token.
-  bit2_gmc_tok=$(printf '%s' "$bit2_gmc" | sed 's/return this.v/return this.w/')
-  siggmt=$(explainMismatch "$oracle_gmc" "$bit2_gmc_tok" fmt)
-  if [ -n "$siggmt" ]; then
-    echo "FAIL: a #6051 delta with a changed code token was wrongly explained (sig='$siggmt')"
-    fail=1
-  fi
-
-  # REJECTION: a comment move with no mangled oracle line is not #6051.
-  oracle_gmc_plain=$(printf '%s' "$bit2_gmc" | sed 's|  // Returns the value.||')
-  siggmp=$(explainMismatch "$oracle_gmc_plain" "$bit2_gmc" fmt)
-  if [ -n "$siggmp" ]; then
-    echo "FAIL: a comment delta without the #6051 mangled shape was wrongly explained (sig='$siggmp')"
+  sigfu=$(explainMismatch 'fn main() { println("a") }' 'fn main() { println("b") }' fmt)
+  rcfu=$?
+  if [ "$rcfu" -eq 0 ] || [ -n "$sigfu" ]; then
+    echo "FAIL: an unrelated fmt delta was wrongly explained (rc=$rcfu sig='$sigfu')"
     fail=1
   fi
 
