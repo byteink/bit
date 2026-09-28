@@ -89,52 +89,59 @@ class PlLinkState {
   importOrder: []string,
 }
 
-// The reachability walk's read-only inputs: the whole-link object set, the
-// resolved global table, and the DLL-import admission policy
-// (`programModules` distinguishes the compiled PROGRAM object, whose every
-// name must resolve, from an archive member, whose undefined names are
-// legitimately the Windows import surface). Bundled so plCloseKeptOverRelocs
-// stays under E0202's parameter limit — mirrors linkobj.bit's own
-// LoAtomizeCtx.
-class PlWalkCtx {
-  modules: []LoModule,
-  globals: map<string, int>,
-  programModules: int,
-  allowedImports: []string,
+// Marks every `.data`/`.bss` atom kept and returns them as walk roots. A split
+// mutable global (-fdata-sections-style adjacent pieces) must stay contiguous
+// in its original layout even if some pieces are otherwise unreferenced, same
+// rule as elflink.bit's. They are ROOTS, not just kept, because a kept atom's
+// own relocations must be followed too: a `BIT_STATIC_CONST` closure cell is
+// `.data` whose Abs64 names its trampoline, often the trampoline's only
+// reference once devirtualization removes every `call_value` (#6183, the PE
+// twin of elflink.bit's #6012).
+fn plForceKeptRoots(modules: []LoModule, kept: map<int, bool>): []int {
+  let roots = []int(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let k = atoms[ai].kind
+      if (k == LoSectionKind.Data || k == LoSectionKind.Bss) {
+        kept[atomKey(mi, ai)] = true
+        roots = append(roots, atomKey(mi, ai))
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return roots
 }
 
-// The walk's DLL-import accumulator: `seen` dedupes, `order` is the stable
-// first-seen order stub placement and the IAT index both key off. A class
-// (reference type), so plCloseKeptOverRelocs appending to `order` is visible
-// to every caller with no return value to thread.
-class PlImportAccum {
-  seen: map<string, bool>,
-  order: []string,
-}
-
-// Drains `stack` into `kept`, following every relocation from each newly-kept
-// atom until nothing new is reachable. An undefined global is not
+// Walks the reachability graph from `_start` and the force-kept data roots.
+// An undefined global is not
 // automatically an error — it may be a DLL import (plUndefinedIsImport
-// decides), and then it is a leaf, appended to `imports.order` (deduped via
-// `imports.seen`). Only a Pc32 (call/lea rel32) reference may target an
-// import: this compiler never takes an extern function's address as data,
-// only ever calls it, so an Abs64 pointed at an import is refused rather
-// than guessed at (mirrors the reference linker's `isBranch` gate).
-//
-// Shared by `plDeadStripWithImports`'s own walk from `_start` and by
-// `linkPeExecutable`'s second pass over the atoms `LoSectionKind.Data`/`Bss`
-// forces kept regardless of reachability (#6012's fix for elflink.bit's own
-// `closeKeptOverRelocs` second pass, never ported here): without this, a
-// trampoline reachable only from a force-kept `BIT_STATIC_CONST` closure
-// cell is DEFINED but never KEPT, so the relocation-patch loop later reports
-// it "undefined" even though the atom exists.
-fn plCloseKeptOverRelocs(
-  wctx: PlWalkCtx, kept: map<int, bool>, imports: PlImportAccum, stack: []int,
-): ()! {
+// decides), and then it is a leaf. Only a Pc32 (call/lea rel32) reference may
+// target an import: this compiler never takes an extern function's address as
+// data, only ever calls it, so an Abs64 pointed at an import is refused
+// rather than guessed at (mirrors the reference linker's `isBranch` gate).
+fn plDeadStripWithImports(
+  modules: []LoModule, globals: map<string, int>,
+  programModules: int, allowedImports: []string,
+): PlLinkState! {
+  let kept = map<int, bool>{}
+  let importOrder = []string(0)
+  let importSeen = map<string, bool>{}
+
+  let (entry, hasEntry) = globals[plEntrySymbol()]
+  if (!hasEntry) {
+    fail newError("pe: missing entry symbol ${plEntrySymbol()}")
+  }
+  let stack = plForceKeptRoots(modules, kept)
+  kept[entry] = true
+  stack = append(stack, entry)
   while (len(stack) > 0) {
     let id = stack[len(stack) - 1]
     stack = stack[0:len(stack) - 1]
-    let atom = wctx.modules[atomKeyModule(id)].atoms[atomKeyAtom(id)]
+    let atom = modules[atomKeyModule(id)].atoms[atomKeyAtom(id)]
     let r = 0
     while (r < len(atom.relocs)) {
       let rel = atom.relocs[r]
@@ -146,61 +153,37 @@ fn plCloseKeptOverRelocs(
         let (_, seen) = kept[tid]
         if (!seen) {
           kept[tid] = true
-          // bit:lint allow E0214 -- stack is plCloseKeptOverRelocs's own work queue; the outer `while (len(stack) > 0)` drains it to empty before the function returns, and neither caller (plDeadStripWithImports, linkPeExecutable's force-kept-data pass) reads its own stack local again after this call, so no caller observes whether this append grew the header in place or not
           stack = append(stack, tid)
         }
       } else {
-        let (tid, defined) = wctx.globals[rel.target.name]
+        let (tid, defined) = globals[rel.target.name]
         if (defined) {
           let (_, seen) = kept[tid]
           if (!seen) {
             kept[tid] = true
-            // bit:lint allow E0214 -- stack is plCloseKeptOverRelocs's own work queue; the outer `while (len(stack) > 0)` drains it to empty before the function returns, and neither caller (plDeadStripWithImports, linkPeExecutable's force-kept-data pass) reads its own stack local again after this call, so no caller observes whether this append grew the header in place or not
             stack = append(stack, tid)
           }
         } else {
           if (!plUndefinedIsImport(
             atomKeyModule(id),
             rel.target.name,
-            wctx.programModules,
-            wctx.allowedImports,
+            programModules,
+            allowedImports,
           )) {
-            fail newError("undefined symbol '${rel.target.name}', referenced from ${wctx.modules[atomKeyModule(id)].name}")
+            fail newError("undefined symbol '${rel.target.name}', referenced from ${modules[atomKeyModule(id)].name}")
           }
           if (rel.kind != LoRelocKind.Pc32) {
             fail newError("pe: unsupported non-call reference to import '${rel.target.name}'")
           }
-          let (_, known) = imports.seen[rel.target.name]
+          let (_, known) = importSeen[rel.target.name]
           if (!known) {
-            imports.seen[rel.target.name] = true
-            imports.order = append(imports.order, rel.target.name)
+            importSeen[rel.target.name] = true
+            importOrder = append(importOrder, rel.target.name)
           }
         }
       }
       r = r + 1
     }
   }
-}
-
-// Walks the reachability graph from `_start`. See plCloseKeptOverRelocs for
-// the walk itself; this seeds it with the one root every PE program has.
-fn plDeadStripWithImports(
-  modules: []LoModule, globals: map<string, int>,
-  programModules: int, allowedImports: []string,
-): PlLinkState! {
-  let kept = map<int, bool>{}
-  let (entry, hasEntry) = globals[plEntrySymbol()]
-  if (!hasEntry) {
-    fail newError("pe: missing entry symbol ${plEntrySymbol()}")
-  }
-  kept[entry] = true
-  let imports = PlImportAccum{ seen = map<string, bool>{}, order = []string(0) }
-  plCloseKeptOverRelocs(
-    PlWalkCtx{
-      modules = modules, globals = globals,
-      programModules = programModules, allowedImports = allowedImports,
-    },
-    kept, imports, [entry],
-  )?
-  return PlLinkState{ kept = kept, importOrder = imports.order }
+  return PlLinkState{ kept = kept, importOrder = importOrder }
 }
