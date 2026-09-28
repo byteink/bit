@@ -10,8 +10,10 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
 
 # Self-check: run directly (not sourced) to assert explainMismatch rejects
-# unrelated text on every kind -- no signature is currently declared for any
-# of them (see scripts/selfhost-ir-signatures.sh's Retirement history).
+# unrelated text on every kind, and correctly explains/rejects the one
+# currently declared signature (#6194, `types`/`ir`/`iropt` -- see
+# scripts/selfhost-ir-signatures.sh's header). `ast`/`fmt` still have no
+# signature declared at all (see that file's Retirement history).
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -77,15 +79,130 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
-  # REJECTION: no signature is currently declared for `types` (#5921 was
-  # retired by the stage0 0.28.0 repin, #5957) -- an unrelated type change
-  # must not be explained by coincidence, and neither must a real one.
+  # REJECTION: an unrelated type change (no `Option` involved at all) must
+  # not be explained by coincidence, and neither must a real one.
   oracle_unrelated_type='10:5: x: int'
   bit2_unrelated_type='10:5: x: float'
   sigut=$(explainMismatch "$oracle_unrelated_type" "$bit2_unrelated_type" types)
   rcut=$?
   if [ "$rcut" -eq 0 ] || [ -n "$sigut" ]; then
     echo "FAIL: an unrelated types delta was wrongly explained (rc=$rcut sig='$sigut')"
+    fail=1
+  fi
+
+  # --- #6194 POSITIVE: real captured `--dump-types`/`--dump-ir-pre`/
+  # `--dump-ir` output for _tests_/cases/run_generic_method_receiver_explode.bit,
+  # this tree vs the pinned 0.32.0 stage0 (captured 2026-09-28, ticket #6199) ---
+  oracle_6194_types='48:12: Option<T>.Some(this.v): Option
+57:7: opt: Option
+57:13: mkBox(id): Box<Person>
+57:13: mkBox(id).get(): Option
+58:8: isSome<Person>(opt): bool
+61:10: unwrap<Person>(opt): Person
+65:7: f: () => i64
+66:9: opt: Option
+66:15: mkBox(id): Box<Person>
+66:15: mkBox(id).get(): Option
+67:10: isSome<Person>(opt): bool
+70:12: unwrap<Person>(opt): Person
+72:10: f(): i64
+76:3: print("direct ${readDirect(7)}\n"): ()
+76:19: readDirect(7): i64
+77:3: print("closure ${readViaClosure(9)}\n"): ()
+77:20: readViaClosure(9): i64'
+  bit2_6194_types='48:12: Option<T>.Some(this.v): Option<T>
+57:7: opt: Option<Person>
+57:13: mkBox(id): Box<Person>
+57:13: mkBox(id).get(): Option<Person>
+58:8: isSome<Person>(opt): bool
+61:10: unwrap<Person>(opt): Person
+65:7: f: () => i64
+66:9: opt: Option<Person>
+66:15: mkBox(id): Box<Person>
+66:15: mkBox(id).get(): Option<Person>
+67:10: isSome<Person>(opt): bool
+70:12: unwrap<Person>(opt): Person
+72:10: f(): i64
+76:3: print("direct ${readDirect(7)}\n"): ()
+76:19: readDirect(7): i64
+77:3: print("closure ${readViaClosure(9)}\n"): ()
+77:20: readViaClosure(9): i64'
+  sig6194t=$(explainMismatch "$oracle_6194_types" "$bit2_6194_types" types)
+  rc6194t=$?
+  if [ "$rc6194t" -ne 0 ] || [ "$sig6194t" != "6194-generic-method-receiver-unsubstituted-type" ]; then
+    echo "FAIL: the real #6194 types divergence was not explained (rc=$rc6194t sig='$sig6194t')"
+    fail=1
+  fi
+
+  # --- #6194 MUTATION (types): the SAME two lines differing, but with no
+  # `Option<T>.` call anywhere in the file -- must be rejected. Proves the
+  # signature does not swallow an ordinary Option->Option<X> substitution
+  # outside the unsubstituted-generic-receiver shape it names. ---
+  oracle_6194_types_mut='10:5: opt: Option'
+  bit2_6194_types_mut='10:5: opt: Option<Person>'
+  sig6194tm=$(explainMismatch "$oracle_6194_types_mut" "$bit2_6194_types_mut" types)
+  rc6194tm=$?
+  if [ "$rc6194tm" -eq 0 ] || [ -n "$sig6194tm" ]; then
+    echo "FAIL: a types divergence with no Option<T>. call was wrongly explained (rc=$rc6194tm sig='$sig6194tm')"
+    fail=1
+  fi
+
+  # --- #6194 POSITIVE (ir/iropt): minimal synthetic dumps matching the
+  # measured shape -- pre-opt gains field_get/gc_alloc in a [2x,4x] ratio,
+  # post-opt loses ONLY gc_alloc. ---
+  oracle_6194_ir='%1 = call @get(%0) Option'
+  bit2_6194_ir='%1 = call @get(%0) Option
+%2 = field_get %1[0] i64
+%3 = field_get %1[8] i64
+%4 = gc_alloc size=16 ptrs=[] Option'
+  sig6194i=$(explainMismatch "$oracle_6194_ir" "$bit2_6194_ir" ir)
+  rc6194i=$?
+  if [ "$rc6194i" -ne 0 ] || [ "$sig6194i" != "6194-generic-method-receiver-explode" ]; then
+    echo "FAIL: the synthetic #6194 ir divergence was not explained (rc=$rc6194i sig='$sig6194i')"
+    fail=1
+  fi
+  oracle_6194_iropt='%1 = gc_alloc size=16 ptrs=[] Option
+%2 = gc_alloc size=16 ptrs=[] Option'
+  bit2_6194_iropt='%1 = gc_alloc size=16 ptrs=[] Option'
+  sig6194o=$(explainMismatch "$oracle_6194_iropt" "$bit2_6194_iropt" iropt)
+  rc6194o=$?
+  if [ "$rc6194o" -ne 0 ] || [ "$sig6194o" != "6194-generic-method-receiver-explode" ]; then
+    echo "FAIL: the synthetic #6194 iropt divergence was not explained (rc=$rc6194o sig='$sig6194o')"
+    fail=1
+  fi
+
+  # --- #6194 MUTATION (ir/iropt): a DIFFERENT divergence using the same two
+  # opcodes must NOT be swallowed. ir: field_get/gc_alloc both +1 (ratio 1,
+  # below the measured floor of 2). iropt: gc_alloc INCREASES instead of
+  # decreasing (the direction a real regression would take), and separately,
+  # gc_alloc decreases but field_get also moves (not gc_alloc-only). ---
+  oracle_6194_ir_mut='%1 = call @get(%0) Option'
+  bit2_6194_ir_mut='%1 = call @get(%0) Option
+%2 = field_get %1[0] i64
+%3 = gc_alloc size=16 ptrs=[] Option'
+  sig6194im=$(explainMismatch "$oracle_6194_ir_mut" "$bit2_6194_ir_mut" ir)
+  rc6194im=$?
+  if [ "$rc6194im" -eq 0 ] || [ -n "$sig6194im" ]; then
+    echo "FAIL: an ir delta below the 2x ratio floor was wrongly explained (rc=$rc6194im sig='$sig6194im')"
+    fail=1
+  fi
+  oracle_6194_iropt_mut1='%1 = call @get(%0) Option'
+  bit2_6194_iropt_mut1='%1 = call @get(%0) Option
+%2 = gc_alloc size=16 ptrs=[] Option'
+  sig6194iom1=$(explainMismatch "$oracle_6194_iropt_mut1" "$bit2_6194_iropt_mut1" iropt)
+  rc6194iom1=$?
+  if [ "$rc6194iom1" -eq 0 ] || [ -n "$sig6194iom1" ]; then
+    echo "FAIL: an iropt gc_alloc INCREASE was wrongly explained (rc=$rc6194iom1 sig='$sig6194iom1')"
+    fail=1
+  fi
+  oracle_6194_iropt_mut2='%1 = gc_alloc size=16 ptrs=[] Option
+%2 = gc_alloc size=16 ptrs=[] Option
+%3 = field_get %1[0] i64'
+  bit2_6194_iropt_mut2='%1 = gc_alloc size=16 ptrs=[] Option'
+  sig6194iom2=$(explainMismatch "$oracle_6194_iropt_mut2" "$bit2_6194_iropt_mut2" iropt)
+  rc6194iom2=$?
+  if [ "$rc6194iom2" -eq 0 ] || [ -n "$sig6194iom2" ]; then
+    echo "FAIL: an iropt delta that also moved field_get was wrongly explained (rc=$rc6194iom2 sig='$sig6194iom2')"
     fail=1
   fi
 

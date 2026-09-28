@@ -132,42 +132,189 @@
 # git history and in scripts/selfhost-ir-signatures-selfcheck.sh's
 # retirement note, at this file's state before that repin.
 #
+# #6194 (46b6d13eb, "Fix foreignTypeDeclParam to scan every module, not just
+# the caller's own") landed AFTER the 0.32.0 pin above, so the pinned oracle
+# still carries the pre-fix bug on the one corpus file it touches
+# (_tests_/cases/run_generic_method_receiver_explode.bit, added by #6194
+# itself to pin the corrected shape): a generic method's `Option<T>` result
+# read through its receiver stays unsubstituted in the oracle (`--dump-types`
+# reports the bare `Option`; `--dump-ir-pre`/`--dump-ir` keep it boxed, one
+# heap object read by `field_get`), while this tree substitutes it to
+# `Option<Person>` and explodes the payload to words at every call/return
+# site that consumes it. Two signatures declared below:
+# `6194-generic-method-receiver-unsubstituted-type` (`types`, the
+# `optionUnsubstitutedType` line-for-line identity, same shape as #5921's
+# `ptrofStringType`) and `6194-generic-method-receiver-explode` (`ir`/
+# `iropt`, an opcode-count-delta identity on `field_get`/`gc_alloc` only,
+# same shape as #5871). EXPECTED TO RETIRE AT THE 0.33.0 REPIN: 0.33.0 will
+# contain #6194, so it will be the first oracle that agrees with the tree on
+# this file, and both signatures will explain zero files that run — the
+# automated RETIRED check below (declaredSignatureNames) is what catches
+# that, the same way it caught #5921/the eight 0.27.0-era signatures.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
 # forks one fresh awk process, so all state below is per-call — no cross-file
 # leakage between corpus files. `ast`/`fmt` compare TEXT (an S-expression
-# dump / formatted source), not IR opcodes. No signature is currently
-# declared for any kind (see Retirement history above) — a future parsing,
-# formatting, lowering or typing change that needs one restores the relevant
-# machinery this file carried before #5914/#5957/the 0.32.0 repin, from git
-# history.
+# dump / formatted source), not IR opcodes; `types` compares `--dump-types`
+# TEXT line-for-line (optionUnsubstitutedType, #6194); `ir`/`iropt` compare
+# opcode COUNT deltas (the same #6194 identity, kind-gated). No signature is
+# currently declared for `ast`/`fmt` (see Retirement history above).
 explainMismatch() {
   awk -v kind="$3" '
+    function opcode(line,    s) {
+      if (match(line, /= rt_call [A-Za-z_][A-Za-z0-9_]*\(/)) {
+        s = substr(line, RSTART, RLENGTH)
+        sub(/^= rt_call /, "", s)
+        sub(/\($/, "", s)
+        return "rt_call:" s
+      }
+      if (match(line, /= [a-zA-Z_][a-zA-Z0-9_]*/)) {
+        return substr(line, RSTART + 2, RLENGTH - 2)
+      }
+      if (line ~ /^[[:space:]]*br /) { return "br" }
+      if (line ~ /^[[:space:]]*unreachable/) { return "unreachable" }
+      if (line ~ /^[[:space:]]*index_set /) { return "index_set" }
+      return ""
+    }
+    function lastColonSpace(s,    i, n, found) {
+      found = 0
+      n = length(s) - 1
+      for (i = 1; i <= n; i++) {
+        if (substr(s, i, 2) == ": ") { found = i }
+      }
+      return found
+    }
+    # optionUnsubstitutedType (#6194) -- same shape as #5921s ptrofStringType:
+    # `--dump-types` output is `LINE:COL: <expr>: <type>` per line, one line
+    # per typed node, same LINE COUNT on both sides (never reflows). A line is
+    # accepted only when its prefix (everything before the LAST ": ") is
+    # byte-identical on both sides and the oracles trailing type is exactly
+    # the bare `Option` while the trees is `Option<X>` for a single bare
+    # identifier X -- ANY other kind of difference on ANY line rejects the
+    # whole file. At least one accepted lines prefix must contain the literal
+    # `Option<T>.` substring (the unsubstituted generic-method-receiver call
+    # syntax #6194 fixed) -- gates this to the exact defect shape, not any
+    # `Option`-typed expression that happens to gain a type argument.
+    function optionUnsubstitutedType(nA, linesA, nB, linesB,    i, la, lb, cutA, cutB, pfxA, pfxB, tyA, tyB, diffCount, sawCall) {
+      if (nA != nB || nA == 0) { return 0 }
+      diffCount = 0
+      sawCall = 0
+      for (i = 1; i <= nA; i++) {
+        la = linesA[i]; lb = linesB[i]
+        if (la == lb) { continue }
+        diffCount++
+        cutA = lastColonSpace(la)
+        cutB = lastColonSpace(lb)
+        if (cutA == 0 || cutB == 0) { return 0 }
+        pfxA = substr(la, 1, cutA - 1)
+        tyA = substr(la, cutA + 2)
+        pfxB = substr(lb, 1, cutB - 1)
+        tyB = substr(lb, cutB + 2)
+        if (pfxA != pfxB) { return 0 }
+        if (tyA != "Option") { return 0 }
+        if (tyB !~ /^Option<[A-Za-z_][A-Za-z0-9_]*>$/) { return 0 }
+        if (index(pfxA, "Option<T>.") > 0) { sawCall = 1 }
+      }
+      if (diffCount == 0 || sawCall == 0) { return 0 }
+      return 1
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
       rawA = (nA == 1 ? $0 : rawA "\n" $0)
+      op = opcode($0); if (op != "") a[op]++
       next
     }
     {
       nB++; linesB[nB] = $0
       rawB = (nB == 1 ? $0 : rawB "\n" $0)
+      op = opcode($0); if (op != "") b[op]++
     }
     END {
-      # No signature is currently declared for any kind -- see Retirement
-      # history above.
+      # `ast`/`fmt` never reach the opcode-delta machinery below -- meaningless
+      # for both (no IR opcodes in either text).
+      if (kind == "ast") { exit 1 }
+      if (kind == "fmt") { exit 1 }
+      if (kind == "types") {
+        if (optionUnsubstitutedType(nA, linesA, nB, linesB)) {
+          print "6194-generic-method-receiver-unsubstituted-type"; exit 0
+        }
+        exit 1
+      }
+
+      for (op in a) allop[op] = 1
+      for (op in b) allop[op] = 1
+      # `moved` is the set of opcodes that ACTUALLY changed. `delta` cannot
+      # serve that purpose on its own: merely READING delta["x"] creates the
+      # element in awk, which is why the identity below checks `moved`
+      # membership before ever reading `delta`.
+      for (op in allop) {
+        d = b[op] - a[op]
+        if (d != 0) { delta[op] = d; moved[op] = 1 }
+      }
+
+      # --- #6194: generic method receiver Option<T> result stays boxed in
+      # the oracle, explodes to words in this tree ---
+      #
+      # PRE-OPT (kind=ir): every consuming site unpacks the oracles single
+      # boxed Option with 2 `field_get`s, then REBOXES those 2 words into a
+      # fresh same-shape Option (1 `gc_alloc`, its `field_set`s unscored) so
+      # the exploded ABI can read it back with 2 more `field_get`s before the
+      # call/return -- net +4 `field_get`/+1 `gc_alloc` per isSome-shaped
+      # site, +2 `field_get`/+1 `gc_alloc` per unwrap-shaped site (the
+      # existing single-field unpack of the Person payload is unchanged on
+      # both sides). Measured on the real #6194 fixture (this tree vs the
+      # 0.32.0 pin, 2 call sites of each shape across its 2 functions):
+      # field_get +12, gc_alloc +4, nothing else moves. Checked as an
+      # identity, not the exact fixture counts: only field_get/gc_alloc may
+      # move, both strictly positive, and field_get must fall in
+      # [2x, 4x] of gc_alloc -- the structural floor (every rebox needs at
+      # least 2 field_gets to read back) and ceiling (never more than the
+      # isSome-shaped sites 4 measured here) a different, unrelated
+      # field_get/gc_alloc-only delta is not expected to satisfy by
+      # coincidence.
+      if (kind == "ir") {
+        ok6194 = 1
+        for (op in moved) { if (op != "field_get" && op != "gc_alloc") ok6194 = 0 }
+        Nfg6194 = delta["field_get"] + 0
+        Nga6194 = delta["gc_alloc"] + 0
+        if (Nga6194 <= 0 || Nfg6194 <= 0) ok6194 = 0
+        if (Nfg6194 < 2 * Nga6194 || Nfg6194 > 4 * Nga6194) ok6194 = 0
+        if (ok6194) { print "6194-generic-method-receiver-explode"; exit 0 }
+      }
+
+      # POST-OPT (kind=iropt): opt.bit CSE/DCE forwards the unpacked words
+      # directly to their consumers, so every rebox `field_get` pair is dead
+      # on arrival and removed along with it -- field_get nets to NO delta
+      # (both sides end up reading the payload exactly once), while the
+      # rebox `gc_alloc` itself becomes dead code and is dropped, a pure
+      # DECREASE. Measured on the same fixture: gc_alloc -2 (2 functions x 1
+      # net dead box each, once isSome/unwraps own reboxes both fold away),
+      # field_get identical on both sides (no entry in `moved` at all).
+      # Checked as an identity: gc_alloc must be the ONLY opcode that moved,
+      # strictly negative -- an unrelated field_get delta, or a gc_alloc
+      # INCREASE, is never explained here.
+      if (kind == "iropt") {
+        ok6194o = 1
+        for (op in moved) { if (op != "gc_alloc") ok6194o = 0 }
+        Nga6194o = delta["gc_alloc"] + 0
+        if (Nga6194o >= 0) ok6194o = 0
+        if (ok6194o) { print "6194-generic-method-receiver-explode"; exit 0 }
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
-# declaredSignatureNames [ir|iropt|ast|fmt] -- every name explainMismatch CAN
-# print for the given dump kind, one per line, in the same order as the
+# declaredSignatureNames [ir|iropt|ast|fmt|types] -- every name explainMismatch
+# CAN print for the given dump kind, one per line, in the same order as the
 # `print "…"` statements above (#5509, extended by #5510). The single source
 # of truth for the retirement check in scripts/selfhost-diffdump.sh's
-# run_ir(): a signature this function does not list for a kind can never be
-# checked for going dead under that kind, and one it lists that
+# run_ir()/run_types(): a signature this function does not list for a kind can
+# never be checked for going dead under that kind, and one it lists that
 # explainMismatch no longer prints would make that check fail on every run
 # for a signature that does not exist. Kept in sync by hand -- there is no
 # safe way to grep `print "…"` lines back out of the awk script above and
@@ -180,9 +327,11 @@ declaredSignatureNames() {
   case "$kind" in
     ast) return ;;
     fmt) return ;;
-    types) return ;;
-    ir) return ;;
-    iropt) return ;;
+    types) printf '%s\n' "6194-generic-method-receiver-unsubstituted-type"; return ;;
+    ir) printf '%s\n' "6194-generic-method-receiver-explode"; return ;;
+    iropt) printf '%s\n' "6194-generic-method-receiver-explode"; return ;;
   esac
-  [ -n "$kind" ] || return 0
+  [ -n "$kind" ] || printf '%s\n' \
+    "6194-generic-method-receiver-unsubstituted-type" \
+    "6194-generic-method-receiver-explode"
 }
