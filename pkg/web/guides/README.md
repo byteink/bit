@@ -12,7 +12,7 @@ Seventeen chapters, in the same shape as the rest of the Book: each one
 starts from a problem, adds one idea to solve it, and ends with a `curl`
 command you can run against your own copy. By the end you have a tested,
 configured service that starts from a single binary and talks to a real
-PostgreSQL database - covered in [Shipping](../../../docs/book/34-shipping.md),
+PostgreSQL database - covered in [Shipping](../../../docs/book/33-shipping.md),
 which closes out Part 5.
 
 Each chapter links to the next, and you can always jump back to this index.
@@ -40,7 +40,7 @@ whenever you want to see where a chapter's trimmed example is headed.
 29. [Testing the API](16-testing-the-api.md)
 30. [Operations: health, graceful shutdown](17-operations.md)
 
-Part 4 ends there; [Shipping](../../../docs/book/34-shipping.md) covers
+Part 4 ends there; [Shipping](../../../docs/book/33-shipping.md) covers
 building and running the finished binary, for the ink CLI and this server
 alike, as Part 5's close.
 

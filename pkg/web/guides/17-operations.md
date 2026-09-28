@@ -152,5 +152,5 @@ whatever is in flight instead of cutting it off.
 
 Previous: [Testing the API](16-testing-the-api.md). Part 4 ends here; the
 Book picks the thread back up at
-[Shipping](../../../docs/book/34-shipping.md), which builds this server
+[Shipping](../../../docs/book/33-shipping.md), which builds this server
 (and the `ink` CLI from Parts 1-3) into a single binary.
