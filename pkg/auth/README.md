@@ -82,6 +82,11 @@ protected route that is not itself doing the authenticating just reads
   discovery document and key set `OidcStrategy` is built from, and the ID
   token verifier, for a client that already holds a token and skips the
   redirect flow.
+- `HttpFetch`, `TokenFetch`, `discoverFetch`, `newJwksCacheFetch`,
+  `handleCallbackFetch` - the injectable siblings of `discover`/
+  `newJwksCache`/`handleCallback`, so your own test can drive a full
+  authorize+callback round trip against a fake provider with zero real
+  network calls; see [Testing your sign-in routes](docs/testing.md).
 - `Secret`, `generateSecret`, `parseSecret`, `provisioningUri`,
   `provisioningUriWith`, `hotp`, `totp`, `verify`, `Algorithm`, `sha1` - TOTP
   (RFC 6238) two-factor codes: enrollment, the `otpauth://` QR-code URI, and
