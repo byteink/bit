@@ -906,9 +906,14 @@ fn handshake(config: TlsClientConfig, send: ([]byte) => ()!, recv: () => []byte!
 ### `TrustStore`
 
 The set of trusted root certificates a server chain is verified up to (RFC 8446
-§4.4.2). Its `roots` are parsed X.509 certificates (`std/crypto`'s `Certificate`);
-build one from a PEM bundle with `newTrustStore`, or from already-parsed roots via
-the class literal.
+§4.4.2), a `std/crypto` type: `std/tls` already imports `std/crypto` for X.509
+parsing, so the module lower in the import graph owns the one declaration
+(#6155), and [`std/crypto.systemRoots()`](crypto.md#-truststore-) hands a
+`TrustStore` straight to `newTlsConfig` with no bridging. Its `roots` are
+parsed X.509 certificates (`std/crypto`'s `Certificate`); build one from a PEM
+bundle with `newTrustStore` below, from the operating system's own roots with
+`std/crypto.systemRoots()`, or from already-parsed roots via the class
+literal.
 
 ### `newTrustStore(rootsPem: string): TrustStore!`
 
@@ -917,7 +922,8 @@ system-roots format. Fails on malformed PEM, a certificate the X.509 parser
 rejects, or a bundle with no `CERTIFICATE` block.
 
 ```bit
-import { newTrustStore, TrustStore } from "std/tls"
+import { newTrustStore } from "std/tls"
+import { TrustStore } from "std/crypto"
 
 // Parse a PEM roots bundle into a trust store for a client config.
 fn roots(pem: string): TrustStore! {
@@ -1545,6 +1551,21 @@ A `TlsConfig` that verifies servers against `roots`, secure by default:
 constructor - a raw class literal is just as safe now, since every omitted
 field defaults to its zero value and the zero value of `insecureSkipVerify` is
 "verify".
+
+`roots` is `std/crypto`'s `TrustStore`, so the operating system's own trust
+anchors go straight in with no conversion:
+
+```bit
+import { newTlsConfig, TlsConfig } from "std/tls"
+import { systemRoots } from "std/crypto"
+
+// The default, secure client config: the operating system's trust anchors.
+fn defaultConfig(host: string): TlsConfig! {
+  let cfg = newTlsConfig(systemRoots()?)
+  cfg.serverName = host
+  return cfg
+}
+```
 
 ### `emptyTrustStore(): TrustStore`
 
