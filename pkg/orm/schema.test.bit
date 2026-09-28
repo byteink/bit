@@ -303,3 +303,145 @@ test "alter(): addJson appends a Json AddColumn node" {
     _ => panic("alter() did not produce an AlterTable op")
   }
 }
+
+// #6146: t.index().gin()/.gist()/.hash()/.brin() each set IndexMethod,
+// leaving a plain t.index() at its Btree zero value.
+test "table(): an index defaults to Btree; gin()/gist()/hash()/brin() each set their own method" {
+  let op = table("articles", (t) => {
+    t.index("created_at")
+    t.index("search_vector").gin()
+    t.index("path").gist()
+    t.index("slug").hash()
+    t.index("logged_at").brin()
+  })
+  match (op) {
+    CreateTable(created) => {
+      assert(len(created.indexes) == 5, "index count: ${len(created.indexes)}")
+      assert(created.indexes[0].method == IndexMethod.Btree, "default method is not Btree")
+      assert(created.indexes[1].method == IndexMethod.Gin, "gin() did not set Gin")
+      assert(created.indexes[2].method == IndexMethod.Gist, "gist() did not set Gist")
+      assert(created.indexes[3].method == IndexMethod.Hash, "hash() did not set Hash")
+      assert(created.indexes[4].method == IndexMethod.Brin, "brin() did not set Brin")
+    }
+    _ => panic("table() did not produce a CreateTable op")
+  }
+}
+
+// #6146: t.indexExpr() carries an expression instead of a column list;
+// .where() adds a partial index's own predicate to either kind.
+test "table(): indexExpr carries an expression; where() adds a partial index's predicate" {
+  let op = table("accounts", (t) => {
+    t.indexExpr("lower(email)")
+    t.index("email").where("deleted_at is null")
+  })
+  match (op) {
+    CreateTable(created) => {
+      assert(len(created.indexes) == 2, "index count: ${len(created.indexes)}")
+      let exprIx = created.indexes[0]
+      assert(exprIx.expr == "lower(email)", "expression index expr: ${exprIx.expr}")
+      assert(
+        len(exprIx.columns) == 0,
+        "expression index must carry no columns: ${len(exprIx.columns)}",
+      )
+      assert(exprIx.whereClause == "", "expression index must have no predicate by default")
+
+      let partial = created.indexes[1]
+      assert(len(partial.columns) == 1, "partial index column count: ${len(partial.columns)}")
+      assert(partial.columns[0] == "email", "partial index column: ${partial.columns[0]}")
+      assert(
+        partial.whereClause == "deleted_at is null", "partial index predicate: ${partial.whereClause}",
+      )
+    }
+    _ => panic("table() did not produce a CreateTable op")
+  }
+}
+
+// #6146: t.tsvector() carries the Tsvector column type; .storedAs() records
+// a generated column's own expression, empty for every ordinary column.
+test "table(): a tsvector column, and storedAs() records a generated column's expression" {
+  let op = table("articles", (t) => {
+    t.string("title", 200)
+    t.tsvector("search_vector").storedAs(toTsvector("english", ["title"], ["A"]))
+  })
+  match (op) {
+    CreateTable(created) => {
+      assert(len(created.columns) == 2, "column count: ${len(created.columns)}")
+      assert(
+        created.columns[0].generatedExpr == "",
+        "an ordinary column must have no generated expression",
+      )
+
+      let sv = created.columns[1]
+      assert(sv.name == "search_vector", "tsvector column name: ${sv.name}")
+      assert(sv.colType == ColumnType.Tsvector, "tsvector column type is not Tsvector")
+      assert(
+        sv.generatedExpr == "setweight(to_tsvector('english', coalesce(title, '')), 'A')",
+        "generated expression: ${sv.generatedExpr}",
+      )
+    }
+    _ => panic("table() did not produce a CreateTable op")
+  }
+}
+
+// #6146: toTsvector() weights and joins every named column, in order.
+test "toTsvector(): weights and joins every column with the recommended setweight/coalesce shape" {
+  let expr = toTsvector("english", ["title", "body"], ["A", "B"])
+  let want = "setweight(to_tsvector('english', coalesce(title, '')), 'A') || " +
+    "setweight(to_tsvector('english', coalesce(body, '')), 'B')"
+  assert(expr == want, "toTsvector expression: ${expr}")
+}
+
+// #6146, against a real Postgres server (`bulk.test.bit`'s own header
+// pattern): `ORM_TEST_LIVE_PG_URI` supplies a connection string; this test
+// skips only when it is unset, and says so. Builds the table through
+// pkg/orm's OWN `t.tsvector(...).storedAs(toTsvector(...))` and
+// `t.index(...).gin()`, never a hand-typed DDL string, then proves the
+// generated column and its GIN index actually work together: a ranked
+// `@@ to_tsquery(...)` search against two rows returns only the matching
+// one, ordered by `ts_rank`. `env`/`run`/`envOr` (std/os) and
+// `findRepoRoot`/`scratchDir`/`resetDir` are already declared package-wide
+// by `generate.test.bit` (`bulk.test.bit`'s own header on why re-importing
+// or redeclaring any of them here would be E0042).
+const liveTsvectorProofSource: string = "import { args } from \"std/os\"\nimport { pool, Datasource, Value, Rows, sqlReqText } from \"std/sql\"\nimport { adapter } from \"postgres\"\nimport { Data, table, Postgres, toTsvector } from \"orm\"\n\nfn main(): ()! {\n  let uri = args()[1]\n  let db = pool(adapter(), Datasource{ uri = uri }) catch e {\n    panic(\"pool: \${e.message()}\")\n  }\n\n  db.exec(\"drop table if exists t6146_articles\", []Value(0)) catch e {\n    panic(\"drop: \${e.message()}\")\n  }\n\n  let op = table(\"t6146_articles\", (t) => {\n    t.id(\"id\")\n    t.string(\"title\", 200)\n    t.text(\"body\")\n    t.tsvector(\"search_vector\").storedAs(toTsvector(\"english\", [\"title\", \"body\"], [\"A\", \"B\"]))\n    t.index(\"search_vector\").gin()\n  })\n  let stmts = Postgres{}.render(op)\n  for st of stmts {\n    db.exec(st.sql, []Value(0)) catch e {\n      panic(\"LIVE PROOF FAILED (#6146): create via schema builder: \${e.message()}\")\n    }\n  }\n\n  db.exec(\n    \"insert into t6146_articles (title, body) values (\$1, \$2)\",\n    [Value.Text(\"Fast rockets\"), Value.Text(\"The launch was extremely fast and loud\")],\n  ) catch e {\n    panic(\"insert 1: \${e.message()}\")\n  }\n  db.exec(\n    \"insert into t6146_articles (title, body) values (\$1, \$2)\",\n    [Value.Text(\"Slow turtles\"), Value.Text(\"A calm and unhurried afternoon\")],\n  ) catch e {\n    panic(\"insert 2: \${e.message()}\")\n  }\n\n  let rows = db.query(\n    \"select title from t6146_articles where search_vector @@ to_tsquery('english', 'fast') \" +\n      \"order by ts_rank(search_vector, to_tsquery('english', 'fast')) desc\",\n    []Value(0),\n  ) catch e {\n    panic(\"LIVE PROOF FAILED (#6146): ranked @@ query against the generated tsvector column: \${e.message()}\")\n  }\n  if (!rows.next()) {\n    panic(\"LIVE PROOF FAILED (#6146): ranked @@ query returned no rows\")\n  }\n  let title = sqlReqText(rows, rows.columns(), \"title\") catch e {\n    panic(\"read title: \${e.message()}\")\n  }\n  if (title != \"Fast rockets\") {\n    panic(\"LIVE PROOF FAILED (#6146): expected 'Fast rockets' first, got '\${title}'\")\n  }\n  if (rows.next()) {\n    panic(\"LIVE PROOF FAILED (#6146): expected exactly one match, got a second row\")\n  }\n\n  db.exec(\"drop table t6146_articles\", []Value(0)) catch e {\n    panic(\"cleanup: \${e.message()}\")\n  }\n  db.close()\n  print(\"LIVE_PROOF_OK\")\n}\n"
+
+test "live: a generated tsvector column and its GIN index rank a real @@ search correctly (#6146)" {
+  let uri = env("ORM_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_PG_URI is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let proj = scratchDir("liveproof6146")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof6146\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", liveTsvectorProofSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(
+    rc == 0,
+    "live proof against a real Postgres server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}'",
+  )
+  resetDir(proj)
+}
