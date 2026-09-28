@@ -326,16 +326,16 @@ fn sumCsv(line: string): int! {
 
 The `f64` decimal or hexadecimal float text `s` denotes, correctly rounded.
 Fails on an empty string, a bare sign, leading or trailing whitespace, and any
-text the predeclared `parseFloat` builtin (SPEC §5.3) cannot parse - a bad
-parse never returns a valid-looking float. `parseFloat("0")` succeeds with
-value `0`, distinguishable from every failure.
+text the predeclared `parseFloat` builtin cannot parse - a bad parse never
+returns a valid-looking float. `parseFloat("0")` succeeds with value `0`,
+distinguishable from every failure.
 
 `1e400` and `1e-400` still succeed, rounding to `+Inf` / `0` under IEEE 754 -
 overflow and underflow are correctly-rounded conversion results, not parse
 failures.
 
 A named `import { parseFloat }` warns with `E0048`, since `parseFloat` is also
-a predeclared identifier (SPEC §5.3); use the namespace form to avoid it.
+a predeclared identifier; use the namespace form to avoid it.
 
 ```bit
 import * as strings from "std/strings"

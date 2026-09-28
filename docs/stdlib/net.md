@@ -6,9 +6,9 @@ green thread per connection" server costs one `Task` per connection, not one OS
 thread. Every operation that can fail returns `T!` - propagate with `?` or handle
 with `catch`.
 
-Addresses are dotted-quad IPv4 literals (`"127.0.0.1"`), not hostnames: there is
-no name resolution yet. There is also no TLS - put a terminating proxy in front
-before exposing a public port.
+Addresses are dotted-quad IPv4 literals (`"127.0.0.1"`), not hostnames: this
+module does not resolve hostnames. It also has no TLS - put a terminating
+proxy in front before exposing a public port.
 
 <!-- doctest: per-block -->
 

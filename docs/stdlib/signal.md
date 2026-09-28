@@ -111,5 +111,3 @@ handler either.
   wiring this into a running server's `shutdown`.
 - [`std/os`](os.md) for the process's arguments, its environment, and
   `exit`.
-
-Specification: `runtime/ABI.md` §19.

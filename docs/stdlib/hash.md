@@ -1,9 +1,9 @@
 # std/hash
 
 CRC-32C (Castagnoli) - a fast checksum for detecting accidental corruption: a
-torn write, a flipped bit on the wire. **Not an integrity or security
-primitive** - CRC is linear, so anyone able to modify the data can trivially
-recompute a matching checksum. For anything that must resist a tamperer, use
+torn write, a flipped bit on the wire. **Not a tool for detecting tampering**
+- CRC is linear, so anyone able to modify the data can trivially recompute a
+matching checksum. For anything that must resist a tamperer, use
 `std/crypto`'s HMAC or a signature instead; that split is why this lives in
 its own module rather than beside SHA-256 in `std/crypto`.
 

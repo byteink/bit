@@ -7,7 +7,7 @@ customer a total. Do that with `f64` and `19.99 + 0.01` can come out as
 answer for money, because 0.01 has no exact binary representation. A customer
 who notices their receipt is a fraction of a cent off does not care why.
 
-`decimal` is Bit's exact base-10 number type (SPEC §11.1): a sign, a scale,
+`decimal` is Bit's exact base-10 number type: a sign, a scale,
 and a 96-bit mantissa, two `i64` words wide with no allocation. `19.99 + 0.01`
 is exactly `20.00`, every time, because the value is stored in base 10 to
 begin with. `std/decimal` is the text and rounding surface around it: turning
@@ -62,8 +62,7 @@ The `decimal` that text `s` denotes: an optional sign, digits, an optional
 trailing whitespace, no thousands separator, no currency symbol: a parser
 that tolerates `"1,234"` is how an invoice becomes wrong by three orders of
 magnitude, so this one refuses instead of guessing - the same fallible
-`T!` idiom `std/strings.parseInt` uses, handled with `?`/`catch` (SPEC
-§12.11).
+`T!` idiom `std/strings.parseInt` uses, handled with `?`/`catch`.
 
 Now the cart total can come from text - the shape a web form or a
 database's `numeric` column actually hands you, which is `parseDecimal`'s own
@@ -191,7 +190,7 @@ fn rejectsMessyInput(): bool {
 
 `round`'s own signature is not fallible - it panics rather than returning an
 error, the same "panics rather than wrapping" contract every other decimal
-overflow already has (SPEC §11.1) - so a `scale` so extreme that
+overflow already has - so a `scale` so extreme that
 reconstructing the rounded value would exceed 96-bit precision panics
 instead. In practice this only happens at scales far outside anything a real
 currency or unit uses.
@@ -202,12 +201,8 @@ currency or unit uses.
 base-10 arithmetic for money and counted quantities, not a general numeric
 type. Reach for `f64` and `std/math` for scientific or geometric
 computation, where an exact decimal representation buys nothing and the
-`decimal`/`f64` conversion is deliberately not provided (SPEC §12.9).
+`decimal`/`f64` conversion is deliberately not provided.
 
 `toString` never adds a thousands separator or a currency symbol, and never
 will - that is locale-aware formatting, an `i18n` concern, not this module's.
 Format the string `toString` gives you at the display layer.
-
-## Specification
-
-SPEC §11.1 (the type), §12.9 (conversions).

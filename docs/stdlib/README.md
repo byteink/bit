@@ -5,41 +5,91 @@ step compares these pages against what the compiler reports as exported
 (`bit doc <module>`), and fails if one is missing. Every ```` ```bit ```` example
 below is compiled by the test suite, so none of it can quietly rot.
 
+Modules are grouped by what you reach for them to do.
+
+### Prelude and collections
+
 | Module | Import | What it is for |
 |---|---|---|
 | [core](core.md) | *(none - the prelude)* | `println`, `Option`, `Result`, `newError` |
+| [seq](seq.md) | `"std/seq"` | `mapped`, `filter`, `reduce` over slices |
+| [sort](sort.md) | `"std/sort"` | Stable comparator-based sorting over slices |
+
+### Text
+
+| Module | Import | What it is for |
+|---|---|---|
+| [strings](strings.md) | `"std/strings"` | Searching, building, UTF-8 runes |
+| [regex](regex.md) | `"std/regex"` | Linear-time pattern matching, RE2 syntax |
+
+### Files and OS
+
+| Module | Import | What it is for |
+|---|---|---|
 | [io](io.md) | `"std/io"` | Buffered readers and writers |
 | [fs](fs.md) | `"std/fs"` | Files and directories |
 | [path](path.md) | `"std/path"` | Lexical path handling |
-| [strings](strings.md) | `"std/strings"` | Searching, building, UTF-8 runes |
-| [seq](seq.md) | `"std/seq"` | `mapped`, `filter`, `reduce` over slices |
-| [sort](sort.md) | `"std/sort"` | Stable comparator-based sorting over slices |
-| [math](math.md) | `"std/math"` | `f64` maths and integer helpers |
-| [decimal](decimal.md) | `"std/decimal"` | Exact base-10 text and rounding for the `decimal` type - money |
-| [time](time.md) | `"std/time"` | Clocks, durations, sleeping |
 | [os](os.md) | `"std/os"` | Arguments, environment, exit |
 | [process](process.md) | `"std/process"` | Run a child process and capture its stdout/stderr |
 | [signal](signal.md) | `"std/signal"` | Block until the process receives SIGTERM or SIGINT, for a clean shutdown |
+
+### Time
+
+| Module | Import | What it is for |
+|---|---|---|
+| [time](time.md) | `"std/time"` | Clocks, durations, sleeping |
+
+### Math
+
+| Module | Import | What it is for |
+|---|---|---|
+| [math](math.md) | `"std/math"` | `f64` maths and integer helpers |
+| [decimal](decimal.md) | `"std/decimal"` | Exact base-10 text and rounding for the `decimal` type - money |
+
+### Networking
+
+| Module | Import | What it is for |
+|---|---|---|
 | [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
 | [http](http.md) | `"std/http"` | HTTP/1.1 server and client |
-| [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract |
-| [hash](hash.md) | `"std/hash"` | CRC-32C - error detection, NOT an integrity or security primitive |
-| [rand](rand.md) | `"std/rand"` | Seedable pseudo-random generation - NOT cryptographically secure |
-| [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake, record |
-| [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
-| [json](json.md) | `"std/json"` | JSON and JSONC parsing, encoding, and comment-preserving editing |
-| [csv](csv.md) | `"std/csv"` | RFC 4180 CSV parsing and formatting |
-| [regex](regex.md) | `"std/regex"` | Linear-time pattern matching, RE2 syntax |
 | [http2](http2.md) | `"std/http2"` | HPACK + HTTP/2 frame layer |
 | [quic](quic.md) | `"std/quic"` | QUIC v1 packet protection + frames |
 | [http3](http3.md) | `"std/http3"` | QPACK field compression |
-| [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
-| [sync](sync.md) | `"std/sync"` | `Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics |
-| [prof](prof.md) | `"std/prof"` | In-process CPU sampling profiler (aarch64-macos only) |
-| [sql](sql.md) | `"std/sql"` | The database driver contract - interface, registry, no driver |
-| [jwt](jwt.md) | `"std/jwt"` | JWS sign/verify, RFC 7519 claim validation, JWKS key selection |
 | [smtp](smtp.md) | `"std/smtp"` | ESMTP submission client - STARTTLS, AUTH, MIME messages |
+| [websocket](websocket.md) | `"std/websocket"` | WebSocket framing and handshake over `std/http` |
+
+### Security
+
+| Module | Import | What it is for |
+|---|---|---|
+| [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract, ciphers, signatures |
+| [hash](hash.md) | `"std/hash"` | CRC-32C - error detection, NOT an integrity or security primitive |
+| [rand](rand.md) | `"std/rand"` | Seedable pseudo-random generation - NOT cryptographically secure |
+| [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake, record |
+| [jwt](jwt.md) | `"std/jwt"` | JWS sign/verify, RFC 7519 claim validation, JWKS key selection |
+
+### Data formats
+
+| Module | Import | What it is for |
+|---|---|---|
+| [json](json.md) | `"std/json"` | JSON and JSONC parsing, encoding, and comment-preserving editing |
+| [csv](csv.md) | `"std/csv"` | RFC 4180 CSV parsing and formatting |
+| [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
+| [sql](sql.md) | `"std/sql"` | The database driver contract - interface, registry, no driver |
+
+### Concurrency
+
+| Module | Import | What it is for |
+|---|---|---|
+| [sync](sync.md) | `"std/sync"` | `Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics |
 | [runtime](runtime.md) | `"std/runtime"` | `runRecovering` - the per-task panic boundary |
+
+### Testing and observability
+
+| Module | Import | What it is for |
+|---|---|---|
+| [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
+| [prof](prof.md) | `"std/prof"` | In-process CPU sampling profiler (aarch64-macos only) |
 | [trace](trace.md) | `"std/trace"` | Distributed tracing - spans, W3C `traceparent` propagation, an OTLP/HTTP exporter |
 
 ## Conventions
@@ -79,6 +129,5 @@ function dir (string) => string
 ## Publishing
 
 Editing a page under `docs/` here publishes nothing by itself. bitlang.org is
-generated from a separate `bit-website` repo that vendors this one as a
-submodule - someone still has to bump the submodule pointer, regenerate the
-site, and commit the pointer and the generated pages together.
+generated from this repo's content separately - someone still has to
+regenerate the site and publish the result.

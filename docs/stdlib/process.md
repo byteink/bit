@@ -177,5 +177,3 @@ exit code.
 
 - [`std/os`](os.md) for the process's arguments, its environment, and how it
   exits.
-
-Specification: `runtime/ABI.md` §19.
