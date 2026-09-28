@@ -63,8 +63,9 @@ schema to keep in sync yourself. A field added to the class changes what the
 document says the next time you build:
 
 ```bit
-import { App, Config, Ctx, Res, notFound } from "web"
+import { App, Config, Ctx, Res, notFound, minLen } from "web"
 import { env } from "std/os"
+import { Json, JsonEntry } from "std/json"
 
 @json class Article {
   id: string,
@@ -73,7 +74,7 @@ import { env } from "std/os"
 
 @json class NewArticle {
   @minLen(1)
-  title: string,
+  title: string
 }
 
 @json class ErrorBody {
