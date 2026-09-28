@@ -261,6 +261,16 @@ carry field-validation attributes, and satisfy an interface automatically by
 having its methods. These are covered on their own pages once the shortener
 needs them: [Interfaces](interfaces.md) and the stdlib `json` reference.
 
+### `@job`, a stable background-job name
+
+A background-job library needs to call a class's logic from a name alone,
+before any instance of the class exists - see
+[Static Methods](static-methods.md) for why an ordinary method can't answer
+that. `@job("send-welcome")` on a class that also carries `@json` gives it
+exactly that: a name that survives renaming the class, read with no
+instance in hand. The pkg/jobs package is the worked example: a queue, a
+worker pool and the `@job` classes it dispatches by this name.
+
 ### Specification
 
 Class declarations, fields, zero values and composite literals are defined

@@ -1277,6 +1277,48 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   rest before a document is served; the mapping itself is `pkg/web`'s, not
   `std/json`'s, and is specified where it is implemented.
 
+**`jsonSchema<T>` inside a generic - the forwarding path (#6201).**
+
+- A free function or a method may call `jsonSchema<T>()` with `T` its OWN
+  unbound type parameter - the same generic-forwarding `jsonDecode<T>` (above)
+  has. The compiler specialises the wrapper's call once per **instantiation**,
+  resolved from the caller's concrete type argument, regardless of which
+  module declares the wrapper and which declares the concrete `@json` class:
+
+  ```bit
+  import { Json, JsonEntry, jsonSchema, jsonEncode } from "std/json"
+
+  // A free-function wrapper: T is its own type parameter, not named here.
+  fn describe<T>(): Json {
+    return jsonSchema<T>()
+  }
+
+  @json class Widget {
+    id: i64,
+    name: string,
+  }
+
+  fn main() {
+    print("${jsonEncode(describe<Widget>())}\n")
+  }
+  ```
+
+  `describe<T>` never imports `Widget`; nothing about this changes if
+  `describe` and `Widget` are declared in different modules, which is the
+  whole point - a library exporting `describe<T>()` can be called against a
+  `@json` class it has never seen, the exact shape `pkg/web`'s
+  `Route.requestBody<T>()` needs.
+- **`T` must be the wrapper's OWN type parameter.** A type parameter
+  belonging to an enclosing GENERIC CLASS instead - `class Box<T> {
+  describe(): Json { return jsonSchema<T>() } }` - is refused, under
+  `jsonSchema<T>`'s own **E0173**: a method of a generic class is
+  monomorphized once per nominal instantiation of the RECEIVER (`Box<int>`,
+  `Box<string>`), not through the per-call instantiation ledger this
+  specialisation is resolved by, so there is no ledger entry to retarget.
+- A call through the wrapper with no explicit type argument is the same
+  **E0068** (§15.3) every uninferable generic call is - `T` sits in the
+  wrapper's RESULT alone, so nothing infers it from the call's arguments.
+
 **`@table` - synthesizing `tableDescriptor`.**
 
 - A class declaration may carry the attribute `@table` (§10.3.1), the other of
@@ -1506,28 +1548,34 @@ class SendWelcome { userId: i64 }
 - A `@job` class must also carry `@json` - **E0167** otherwise - since a
   queued job's payload has to be encoded onto the store and decoded back off
   it, and `@json`'s `toJson`/`jsonDecode<T>` are what do that.
-- The class gains a synthesized member
+- The class gains a synthesized **static** member (§10.4.1)
 
   ```
-  __jobName(): string
+  static __jobName(): string
   ```
 
-  returning the name exactly as written in `@job(...)`. This is what makes
-  the name **stable across a rename**: renaming the class changes nothing a
-  job already sitting in a queue depends on, only `@job`'s own argument does.
+  returning the name exactly as written in `@job(...)`, read with no
+  instance in hand - `T.__jobName()` for a `T` bound by
+  `interface Job { static __jobName(): string }` - which is what lets
+  `register<T: Job>` dispatch by type alone. This is also what makes the
+  name **stable across a rename**: renaming the class changes nothing a
+  job already sitting in a queue depends on, only `@job`'s own argument
+  does.
 - **`__jobName` is a reserved name on every class, `@job` or not.** A class
   that declares a method by this name is **E0168** - the same rule, for the
   same reason, `__jsonAppend`'s own reservation (E0164) above is: dispatch
-  code constrained on an interface naming `__jobName()` structurally
-  (§14.3) matches by name alone, so a same-named method on an unrelated
-  class would satisfy it and misbehave at the call, not at the assertion.
+  code constrained on a static interface requirement naming
+  `__jobName()` (§10.4.1, §14.3) matches by name alone, so a same-named
+  member on an unrelated class would satisfy it and misbehave at the
+  call, not at the assertion.
 - **Two `@job` classes anywhere in the program sharing a name is E0169**,
   naming both declarations - checked across the whole program, not one
   module, because a job dispatch table is keyed by this string across
   every module the compiler sees.
 - `@job` introduces no reflection and no compiler-generated cross-module
-  table: it only synthesizes `__jobName`, an ordinary method a library reads
-  through a normal, structurally-satisfied interface constraint.
+  table: it only synthesizes `static __jobName`, an ordinary static method a
+  library reads through a normal, structurally-satisfied static interface
+  requirement.
 
 ### 10.6 Interface Declarations
 

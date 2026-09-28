@@ -17,24 +17,17 @@
 //                           element width matches the stride, unconditionally.
 //                           This is what keeps `BIT_APPEND_FRESH` unset
 //                           byte-identical to main (task-6092's report).
-//   "slice_append_fresh" — expand ONLY when the header value fed into the
-//                           call (`args[0]`) has EXACTLY ONE USE in the whole
-//                           function — this very call — via `useCounts`
-//                           (compiler/optcommaok.bit, already the DCE/
-//                           verifier's own operand table, `compiler/opt.bit`'s
-//                           `instrOperands`). One use means no OTHER
-//                           instruction anywhere in this function reads that
-//                           header value: not a second `append`, not a
-//                           `let y = base` alias (which resolves to the SAME
-//                           SSA id via `lowerNamedValue`'s `localRead`, so a
-//                           later read of `y` is a second use of the
-//                           identical id), not a field store, not a return,
-//                           not a call argument. When that holds, mutating
-//                           the header and handing the same one back is
-//                           unobservable by anyone but the call that produced
-//                           it. When the proof fails, `appendExpandable`
-//                           returns `false` and the call falls through to the
-//                           general (cloning) `_fresh` runtime entry point.
+//   "slice_append_fresh" — expand ONLY when `appendOwnedCalls`
+//                           (compiler/optappendown.bit, #6164) proved that
+//                           nothing but the call's input can reach the input
+//                           header once the call returns: mutating it and
+//                           handing the same one back is then unobservable.
+//                           A proven call the fast path cannot take (a
+//                           narrow stride, or `slice_append_str_fresh`) is
+//                           renamed to its in-place twin instead, and so is
+//                           the grow arm of a proven expansion. When the
+//                           proof fails the call keeps the general (cloning)
+//                           `_fresh` runtime entry point.
 //
 // THE GROW ARM IS UNCHANGED EITHER WAY (`emitExpandedAppend`'s `grow` block
 // calls the runtime unconditionally, under whichever name the call already
@@ -105,46 +98,17 @@
 // always emits it as a `const_int` and the inliner copies it as one, so this
 // fails closed on a shape that does not occur, never silently on one that does.
 //
-// `uses` is `useCounts(f)` (compiler/optcommaok.bit), computed ONCE per
-// function by this pass's caller and passed down rather than recomputed per
-// call site — the same shape `MissFacts.uses` is threaded through in that
-// file, and read only on the `slice_append_fresh` path (below); the
-// unchanged `slice_append` path ignores it entirely, matching main.
-// `uses[h] == 1` is the #6092 single-use proof this file's header comment
-// describes: this call is the ONLY operand slot anywhere in `f` that names
-// the header value being appended to, so mutating it in place cannot be
-// observed by anything else. `useCounts` walks `instrOperands` — the DCE and
-// verifier's own table (opt.bit) — so this reuses the one place the compiler
-// already answers "what does this instruction read", rather than a second,
-// possibly-diverging alias analysis.
-//
-// DOES NOT EXTEND TO A LOOP ACCUMULATOR (`while (cond) { xs = append(xs, v)
-// } `, `bench/cases/alloc`'s own shape), even though that call site's `h`
-// textually has only 2 uses (this call, and the loop's own exit branch
-// threading `h` onward unchanged) — a stronger draft of this check accepted
-// exactly that shape and MISCOMPILED:
-//
-//   let base = []int(0, 10)
-//   let snap: []int = []
-//   let k = 0
-//   while (k < 10) {
-//     base = append(base, k)
-//     if (k == 4) { snap = base }
-//     k = k + 1
-//   }
-//   // snap read len 10, not 5: WRONG.
-//
-// The loop body is ONE static call site reused across ALL iterations; the
-// fast path's own "return `h` itself, mutated" means every later iteration
-// keeps mutating the SAME physical header `snap` captured on iteration 4.
-// `uses[h] == 1/2` only proves `h` itself has no other reader for THAT
-// iteration — it says nothing about whether the call's OWN RESULT (a
-// different id, reused as `h` on the NEXT iteration) later escapes to a
-// binding, like `snap`, that survives across iterations while the loop
-// keeps mutating the object underneath it. Soundly recovering the loop
-// case needs an escape analysis over the RESULT, not just a use-count of
-// the input, so it is left as a follow-up rather than shipped half-right
-// (#6164).
+// `owned` is `appendOwnedCalls(f)` (compiler/optappendown.bit), computed ONCE
+// per function by this pass's caller and read only on the
+// `slice_append_fresh` path; the unchanged `slice_append` path ignores it,
+// matching main. `owned[idx]` is #6164's proof that no reference to the
+// call's input header other than the input itself can exist once the call
+// returns: no other SSA value in its alias class is live after it, the class
+// starts from a header no one else was given, and no escape of it can reach
+// the call. #6092's `useCounts(f)[h] == 1` rule it replaces was a use count
+// of the input only: it missed the loop-carried `snap = acc` that a stronger
+// `== 2` draft miscompiled, and it accepted a parameter or a field load with
+// one use, whose header the caller or the heap still holds.
 // The width/shape half of `appendExpandable`'s eligibility test, split out
 // to keep `appendExpandable` itself under E0204's complexity ceiling once
 // `BIT_APPEND_FRESH`'s two-name dispatch landed beside it. `(false, _)`
@@ -171,31 +135,50 @@ fn appendShapeEligible(ctx: TypeContext, f: IrFunc, idx: int): (bool, bool) {
   return true, fresh
 }
 
-fn appendExpandable(ctx: TypeContext, f: IrFunc, uses: []int, idx: int): bool {
+fn appendExpandable(ctx: TypeContext, f: IrFunc, owned: []bool, idx: int): bool {
   let (eligible, fresh) = appendShapeEligible(ctx, f, idx)
   if (!eligible) {
     return false
   }
-  if (!fresh) {
-    return true
-  }
-  let ins = f.instrs[idx]
-  return uses[ins.args[0]] == 1
+  return !fresh || owned[idx]
 }
 
-// Whether `f` contains any expandable append at all. The pass rebuilds nothing
+// Whether `f` contains any append this pass rewrites at all: an expandable
+// one, or a proven `_fresh` call renamed in place. The pass rebuilds nothing
 // when this is false, so every function without one comes out of
 // `optimizeModule` byte-identical to before — which is what keeps this change's
 // blast radius the append sites and nothing else.
-fn hasExpandableAppend(ctx: TypeContext, f: IrFunc, uses: []int): bool {
+fn hasAppendRewrite(ctx: TypeContext, f: IrFunc, owned: []bool, copies: []int): bool {
   let i = 0
   while (i < len(f.instrs)) {
-    if (appendExpandable(ctx, f, uses, i)) {
+    if (owned[i] || copies[i] > 0 || appendExpandable(ctx, f, owned, i)) {
       return true
     }
     i = i + 1
   }
   return false
+}
+
+// The in-place twin of a `_fresh` append name: what a call `appendOwnedCalls`
+// proved may mutate its input is renamed to. Any other name is returned as is.
+fn appendInPlaceName(name: string): string {
+  if (name == "slice_append_fresh") {
+    return "slice_append"
+  }
+  if (name == "slice_append_str_fresh") {
+    return "slice_append_str"
+  }
+  return name
+}
+
+// `call` re-emitted under `name` with its operands translated: a proven
+// `_fresh` call the fast path does not expand keeps its call, in place.
+fn emitRenamedAppend(b: IrBuilder, call: IrInstr, args: []int, name: string): int {
+  let ins = mkInstr(Op.RtCall, call.ty)
+  ins.name = name
+  ins.args = args
+  ins.span = call.span
+  return builderEmit(b, ins)
 }
 
 // The spare-capacity arm's body: store `v` at element `off + len` of `h`'s
@@ -260,15 +243,14 @@ fn emitAppendFastStore(b: IrBuilder, ctx: TypeContext, h: int, v: int, lenV: int
 // `rtSliceAppend` does the identical in-place mutation on this arm, so the
 // fast path only moves WHERE it happens, not WHAT happens.
 // `slice_append_fresh` (`BIT_APPEND_FRESH` on): sound here specifically
-// because `appendExpandable` already proved `args[0]` has exactly one use,
-// this call — nothing else in `f` can read `h`'s pre-call state (#6092).
+// because `appendOwnedCalls` (optappendown.bit) proved nothing but `h` can
+// reach `h`'s header once the call returns (#6092, #6164).
 //
-// The GROW arm below does NOT get this treatment either way — it calls the
-// general runtime entry point unconditionally (under whichever name this
-// call already carries), which the `_fresh` pair clones a fresh header for
-// whenever `h` was non-null (`rtSliceAppendFresh`, runtime/root/slicesappendfresh.bit)
-// regardless of how many uses `h` has, since that path is shared with every
-// call site this pass does not touch. It fires on `len < cap` — the
+// The GROW arm below calls the general runtime entry point, under
+// `growName`: the call's own name when it is `slice_append`, and the
+// in-place `slice_append` for a proven `slice_append_fresh` (the cloning
+// `rtSliceAppendFresh` would buy an independent header nobody can observe).
+// It fires on `len < cap` — the
 // complement of the runtime's own `vlen == vcap` grow test, so a
 // reallocation happens on exactly the same appends as before. `len <= cap`
 // is an invariant of every header this compiler can produce (`rtSliceNew`
@@ -308,7 +290,13 @@ fn emitAppendFastStore(b: IrBuilder, ctx: TypeContext, h: int, v: int, lenV: int
 // stop-the-world mark-sweep, non-moving, and `rtSliceAppend` itself stores with
 // a bare `storeWord`. When it goes incremental the barrier is owed here, at
 // `emitInlineSliceSet`, and at both backends' `field_set` together.
-fn emitExpandedAppend(b: IrBuilder, ctx: TypeContext, call: IrInstr, args: []int): int {
+//
+// `growName` is the grow arm's runtime entry: the call's own name, or its
+// in-place twin when `appendOwnedCalls` proved the input unshared (#6164) —
+// the same proof that licenses the fast arm licenses a mutating grow.
+fn emitExpandedAppend(
+  b: IrBuilder, ctx: TypeContext, call: IrInstr, args: []int, growName: string,
+): int {
   let i64ty = primType(ctx, 3)
   let h = args[0]
   let lenIns = mkInstr(Op.SliceLen, i64ty)
@@ -345,11 +333,7 @@ fn emitExpandedAppend(b: IrBuilder, ctx: TypeContext, call: IrInstr, args: []int
   builderEndBlock(b)
 
   builderBeginBlock(b, grow)
-  let slow = mkInstr(Op.RtCall, call.ty)
-  slow.name = call.name
-  slow.args = args
-  slow.span = call.span
-  emitAppendJump(b, join, builderEmit(b, slow), call.span)
+  emitAppendJump(b, join, emitRenamedAppend(b, call, args, growName), call.span)
   builderEndBlock(b)
 
   builderBeginBlock(b, join)
@@ -380,10 +364,14 @@ fn expandAppendBlock(x: AppendCtx, bi: int) {
   }
   let end = blk.instsStart + blk.instsLen
   while (idx < end) {
-    if (appendExpandable(x.ctx, x.f, x.uses, idx)) {
-      x.remap[idx] = emitExpandedAppend(
-        x.b, x.ctx, x.f.instrs[idx], trList(x.remap, x.f.instrs[idx].args),
-      )
+    let ins = x.f.instrs[idx]
+    let name = x.owned[idx] ? appendInPlaceName(ins.name) : ins.name
+    if (x.copies[idx] > 0) {
+      emitEscapeCopy(x, idx, x.copies[idx] - 1)
+    } else if (appendExpandable(x.ctx, x.f, x.owned, idx)) {
+      x.remap[idx] = emitExpandedAppend(x.b, x.ctx, ins, trList(x.remap, ins.args), name)
+    } else if (x.owned[idx]) {
+      x.remap[idx] = emitRenamedAppend(x.b, ins, trList(x.remap, ins.args), name)
     } else {
       emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
     }
@@ -392,12 +380,35 @@ fn expandAppendBlock(x: AppendCtx, bi: int) {
   builderEndBlock(x.b)
 }
 
+// Emits escape `idx` handed a new header in place of field read `g`
+// (optappendfield.bit's rule 4, #6210): `rt_call slice_slice(g, 0,
+// slice_len g)`, which `rtSliceSlice` allocates over the same buffer, so
+// the field stays the only holder of the header its appends mutate.
+fn emitEscapeCopy(x: AppendCtx, idx: int, g: int) {
+  let i64ty = primType(x.ctx, 3)
+  let span = x.f.instrs[idx].span
+  let h = x.remap[g]
+  let zero = mkInstr(Op.ConstInt, i64ty)
+  zero.ival = 0
+  zero.span = span
+  let n = mkInstr(Op.SliceLen, i64ty)
+  n.lhs = h
+  n.span = span
+  let cp = mkInstr(Op.RtCall, x.f.instrs[g].ty)
+  cp.name = "slice_slice"
+  cp.args = [h, builderEmit(x.b, zero), builderEmit(x.b, n)]
+  cp.span = span
+  x.remap[g] = builderEmit(x.b, cp)
+  emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+  x.remap[g] = h
+}
+
 // The rewrite state shared across one function's blocks — bundled so
 // `expandAppendBlock` stays under E0202's max-params (spec/LINT.md), the same
-// shape `RebuildCtx` uses in opt.bit. `uses` is `useCounts(f)` over the
-// ORIGINAL (pre-rewrite) `f` — computed once in `expandAppends` and read by
+// shape `RebuildCtx` uses in opt.bit. `owned` is `appendOwnedCalls(f)` over
+// the ORIGINAL (pre-rewrite) `f` — computed once in `expandAppends` and read by
 // every `appendExpandable` call this pass makes, never recomputed against the
-// builder `b` being written.
+// builder `b` being written. `copies` is `fieldEscapeCopies` for `f`.
 class AppendCtx {
   b: IrBuilder,
   f: IrFunc,
@@ -405,15 +416,32 @@ class AppendCtx {
   remap: []int,
   blockMap: []int,
   known: []ConstVal,
-  uses: []int,
+  owned: []bool,
+  copies: []int,
 }
 
-// Pass 4 of `optimizeModule`: expand every expandable `slice_append` in `f`.
-// Returns `f` untouched when there is none, so the pass cannot perturb a
-// function it has no work in.
-fn expandAppends(ctx: TypeContext, f: IrFunc): IrFunc {
-  let uses = useCounts(f)
-  if (!hasExpandableAppend(ctx, f, uses)) {
+// Pass 4 of `optimizeModule` over every function. The field-ownership fact
+// (optappendfield.bit, #6179) is proved over the whole module first, before
+// any function is rewritten, so every function is judged against the same
+// post-inlining program.
+fn expandAppendsInModule(m: IrModule) {
+  let fields = ownedFieldsOf(m)
+  let i = 0
+  while (i < len(m.funcs)) {
+    m.funcs[i] = expandAppends(m.ctx, m.funcs[i], fields, i)
+    i = i + 1
+  }
+}
+
+// One function, `m.funcs[fi]`: expand every expandable `slice_append` in
+// `f`, rename every proven `_fresh` call it cannot expand to its in-place
+// twin, and copy the header each owned field's escape takes. Returns `f`
+// untouched when there is none, so the pass cannot perturb a function it
+// has no work in.
+fn expandAppends(ctx: TypeContext, f: IrFunc, fo: FieldOwn, fi: int): IrFunc {
+  let owned = appendOwnedCalls(f, fo)
+  let copies = fieldEscapeCopies(fo, fi, len(f.instrs))
+  if (!hasAppendRewrite(ctx, f, owned, copies)) {
     return f
   }
   let n = len(f.blocks)
@@ -445,7 +473,7 @@ fn expandAppends(ctx: TypeContext, f: IrFunc): IrFunc {
   }
   let x = AppendCtx{
     b = b, f = f, ctx = ctx, remap = remap, blockMap = blockMap, known = known,
-    uses = uses,
+    owned = owned, copies = copies,
   }
   i = 0
   while (i < n) {

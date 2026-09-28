@@ -1,0 +1,737 @@
+// compiler/optappendfield.bit — #6179: which slice-typed class fields hold a
+// header nothing else can reach, so optappendown.bit's rule 2 may count a
+// read of one as a fresh source.
+//
+// THE QUESTION. `this.buf = append(this.buf, c)` reads a header out of a
+// field. That header is unshared at the append only if no other holder can
+// exist: no SSA value in this frame or a suspended caller, no other heap
+// slot. No local proof exists — any function may have copied the header out
+// of the field earlier (`let before = h.items` before a call that appends,
+// row `fieldrmw` of _tests_/bit/appendfresh.bit). So the fact is proved for a
+// FIELD, (class type, byte offset), over every function of the module after
+// inlining: the whole program, since `writeModuleExe` optimizes one module.
+//
+// THE INVARIANT: at every in-place append on a header read from field K, the
+// field is the header's only holder. It holds when, module-wide:
+//
+// 1. Every store to K stores `const_nil`, a `slice_new` nothing reads after
+//    the store (`fieldNewOnlyStored`: a literal fills it first), a pop (a
+//    reslice of a K read whose only use is the store, `fieldPopOf`), or the
+//    result of rule 2's append. Nothing else holds any of them afterwards.
+// 2. A read of K feeds one `_fresh` append as its input, whose only use is a
+//    store back to K of the same object, with nothing but constants between
+//    the append and the store, and every other use of the read is a rule 3
+//    header read no path from the append reaches; or
+// 3. is used only as a header read (`slice_len`, `field_get`, `keep_alive`,
+//    the receiver of `slice_get`/`slice_set`/`string_from_bytes`, a pop); or
+// 4. is used as header reads and ONE escape (#6210: pkg/toml's
+//    `Toml.TomlArray(top.items)`), which optappend.bit's `emitEscapeCopy`
+//    hands `rt_call slice_slice(g, 0, slice_len g)` instead: a header
+//    `rtSliceSlice` allocates, sharing the buffer exactly as the cloning
+//    `rtSliceAppendFresh` would (SPEC §12.6's buffer hazard unchanged). No
+//    block argument or append (their operand joins an alias class
+//    optappendown.bit judges on the uncopied read), and nothing that writes
+//    through the header's address: only the append entry points write a
+//    header's words (runtime/root/slices.bit), and optappend.bit's own
+//    expansion runs after this scan. A field no rule 2 read appends to
+//    needs no proof and gets no copy (`fieldEscapeCopies`). THE TRADE: an
+//    escape that runs more often than the field's appends now allocates a
+//    header where it allocated none.
+//
+// and no read of K is SEPARATED from its uses: on every path from the read to
+// them (the read's live range), no instruction may run another in-place
+// append on K. That is an append whose input is a K read, a store to K, or
+// anything that can run code this walk does not see: a call to any but a
+// calm function (below), an atomic, a syscall, or a runtime call off the
+// short list below (anything else may synchronize with another thread or
+// run a closure). So no frame, suspended or not, holds a K header across
+// the only instructions that can mutate one, and rule 1 keeps every heap
+// slot but K itself empty.
+//
+// A CALM FUNCTION (#6210, `calmNew`) runs nothing that separates any field:
+// no store to a field that may hold a slice, no append whose input is a
+// field read, no `call_value`/`call_iface`/`asm`/syscall/atomic, only
+// `fieldLocalRtCall` runtime calls, and direct calls to calm functions of
+// this module only. The last clause is recursive, so the answer is the
+// greatest fixpoint (`borrowSolve`, optappendborrow.bit). pkg/toml's
+// `path.rest = append(path.rest, KeySeg{ name = readKeyName(p)? })` reads
+// the field before the call that lexes the key.
+//
+// A SAFEPOINT POLL DOES NOT SEPARATE (#6210). A poll may park this green
+// thread for the collector or hand its worker to another green thread, but
+// it is no happens-before edge (SPEC §13.7 lists every edge; a poll is not
+// one), so an append to K that another thread runs during it races with
+// this thread's read of K, exactly as it would running on another worker at
+// the same instant with no poll at all. The collector is non-moving and
+// writes no header. Atomics and the channel, mutex and spawn runtime calls
+// ARE edges, and stay separators.
+//
+// A class value reaches `field_get`/`field_set` typed as its class: both are
+// emitted only off a receiver the checker typed `TypeKind.Struct`
+// (loweraccess.bit's `lowerFieldAccess`, lowerflow.bit's `lowerFieldStore`),
+// and a class with a reference field is never packed into a slice
+// (lowersliceinline.bit's `inlineStructCandidate`), so no untyped address
+// reaches one. Any read or store of K this file cannot place poisons K, and
+// a poisoned field keeps every append on it cloning.
+
+// A field key is `classType * fieldKeyShift + offset`.
+const fieldKeyShift: int = 4294967296
+
+// The module's answer. `live` is false when the module has no `_fresh`
+// append, which is every build with `BIT_APPEND_FRESH` unset: nothing asks,
+// so nothing is scanned and no field is owned. `poison[key]` is 1 when some
+// access to that field breaks the rules above. `borrow` is the module's
+// borrowed-parameter summary (optappendborrow.bit, #6209), proved in the
+// same walk. `appended[key]` is 1 when a rule 2 read of the field exists;
+// `esc[escStart[i] .. escStart[i + 1])` are function `i`'s rule 4 sites.
+// `calm` is `calmNew`'s summary, proved before the scan that reads it.
+class FieldOwn {
+  ctx: TypeContext,
+  live: bool,
+  poison: map<int, int>,
+  borrow: Borrow,
+  calm: Calm,
+  appended: map<int, int>,
+  esc: []FieldEsc,
+  escStart: []int,
+}
+
+// A rule 4 site: instruction `at` of function `fi` is the one escape of
+// read `g` of field `k`.
+class FieldEsc { fi: int, at: int, g: int, k: int }
+
+fn ownedFieldsOf(m: IrModule): FieldOwn {
+  let fo = FieldOwn{
+    ctx = m.ctx,
+    live = false,
+    poison = map<int, int>(),
+    borrow = borrowNew([]IrFunc(0)),
+    calm = calmEmpty(0),
+    appended = map<int, int>(),
+    esc = []FieldEsc(0),
+    escStart = []int(0),
+  }
+  for f of m.funcs {
+    if (len(ownCandidates(f)) > 0) {
+      fo.live = true
+    }
+  }
+  if (!fo.live) {
+    return fo
+  }
+  fo.borrow = borrowNew(m.funcs)
+  fo.calm = calmNew(fo, m.funcs)
+  let i = 0
+  while (i < len(m.funcs)) {
+    fo.escStart = append(fo.escStart, len(fo.esc))
+    let o = newOwnFn(m.funcs[i], fo)
+    fieldScanFunc(fo, o, i)
+    borrowScanFunc(fo.borrow, o)
+    i = i + 1
+  }
+  fo.escStart = append(fo.escStart, len(fo.esc))
+  borrowSolve(fo.borrow)
+  return fo
+}
+
+// For function `fi` of `n` instructions: `out[at]` is one plus the field
+// read whose escape `at` takes a copy of, for every rule 4 site of an
+// owned field some append rewrites in place.
+fn fieldEscapeCopies(fo: FieldOwn, fi: int, n: int): []int {
+  let out = []int(n)
+  if (!fo.live || fi + 1 >= len(fo.escStart)) {
+    return out
+  }
+  let i = fo.escStart[fi]
+  while (i < fo.escStart[fi + 1]) {
+    let e = fo.esc[i]
+    if (fo.poison[e.k] == 0 && fo.appended[e.k] == 1) {
+      out[e.at] = e.g + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Whether `ins`, a `field_get` in `f`, reads a field the module proved owned.
+fn fieldOwned(fo: FieldOwn, f: IrFunc, ins: IrInstr): bool {
+  let k = fieldKey(fo.ctx, f, ins)
+  return fo.live && k >= 0 && fo.poison[k] == 0
+}
+
+// `ins`'s field key, or -1 when its base is not typed as a class.
+fn fieldKey(ctx: TypeContext, f: IrFunc, ins: IrInstr): int {
+  let ty = f.instrs[ins.lhs].ty
+  if (ty <= 0 || ty >= len(ctx.types) || ctx.types[ty].kind != TypeKind.Struct) {
+    return -1
+  }
+  if (ins.ival < 0 || ins.ival >= fieldKeyShift) {
+    return -1
+  }
+  return ty * fieldKeyShift + ins.ival
+}
+
+// Whether a field of type `ty` can hold a slice header: a slice, or a type
+// parameter a generic read left unsubstituted.
+fn fieldMayHoldSlice(ctx: TypeContext, ty: int): bool {
+  if (ty <= 0 || ty >= len(ctx.types)) {
+    return true
+  }
+  let k = ctx.types[ty].kind
+  return k == TypeKind.Slice || k == TypeKind.TypeParam
+}
+
+fn fieldSliceAccess(fo: FieldOwn, f: IrFunc, ins: IrInstr): bool {
+  if (ins.op == Op.FieldGet) {
+    return fieldMayHoldSlice(fo.ctx, ins.ty)
+  }
+  return fieldMayHoldSlice(fo.ctx, ins.ival2) || fieldMayHoldSlice(fo.ctx, f.instrs[ins.rhs].ty)
+}
+
+fn fieldScanFunc(fo: FieldOwn, o: OwnFn, fi: int) {
+  let f = o.f
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if ((ins.op == Op.FieldGet || ins.op == Op.FieldSet) && fieldSliceAccess(fo, f, ins)) {
+      let k = fieldKey(fo.ctx, f, ins)
+      if (k >= 0 && !fieldAccessOk(o, fi, i, k)) {
+        fo.poison[k] = 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn fieldAccessOk(o: OwnFn, fi: int, i: int, k: int): bool {
+  if (o.f.instrs[i].op == Op.FieldSet) {
+    return fieldStoreOk(o, i, k)
+  }
+  if (fieldRmwStore(o, i, k) >= 0) {
+    o.fields.appended[k] = 1
+    return true
+  }
+  if (fieldHeaderRead(o, i, k)) {
+    return true
+  }
+  let at = fieldEscapeAt(o, i, k)
+  if (at < 0) {
+    return false
+  }
+  o.fields.esc = append(o.fields.esc, FieldEsc{ fi = fi, at = at, g = i, k = k })
+  return true
+}
+
+// Rule 4 for read `g` of field `k`: its one use that is not a header read,
+// or -1 when there is none, more than one, or it cannot take a copy.
+fn fieldEscapeAt(o: OwnFn, g: int, k: int): int {
+  let at = -1
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let x = o.useList[u]
+    if (!fieldHeaderUse(o, x, g, k)) {
+      if (at >= 0) {
+        return -1
+      }
+      at = x
+    }
+    u = u + 1
+  }
+  if (at < 0 || !fieldCopyable(o, o.f.instrs[at], g) || fieldSeparated(o, g, k)) {
+    return -1
+  }
+  return at
+}
+
+// Whether escape `ins` of read `g` behaves the same handed a copy of `g`'s
+// header: `g` is typed a slice (not a type parameter `slice_slice` cannot
+// take), and `ins` is none of rule 4's exclusions.
+fn fieldCopyable(o: OwnFn, ins: IrInstr, g: int): bool {
+  let ty = o.f.instrs[g].ty
+  let ctx = o.fields.ctx
+  if (ty <= 0 || ty >= len(ctx.types) || ctx.types[ty].kind != TypeKind.Slice) {
+    return false
+  }
+  return fieldCopyableOp(ins, g)
+}
+
+fn fieldCopyableOp(ins: IrInstr, g: int): bool {
+  let op = ins.op
+  if (op == Op.Call || op == Op.CallValue || op == Op.CallIface) {
+    return true
+  }
+  if (op == Op.Jump || op == Op.Br || isAppendRt(ins) || fieldRunsUnseen(op)) {
+    return false
+  }
+  return !((op == Op.FieldSet || op == Op.IndexSet) && ins.lhs == g)
+}
+
+fn ownUseCount(o: OwnFn, v: int): int {
+  return o.useStart[v + 1] - o.useStart[v]
+}
+
+// Rule 1 for store `s` to field `k`.
+fn fieldStoreOk(o: OwnFn, s: int, k: int): bool {
+  let v = o.f.instrs[s].rhs
+  let d = o.f.instrs[v]
+  if (d.op == Op.ConstNil) {
+    return true
+  }
+  if (d.op == Op.RtCall && d.name == "slice_new") {
+    return fieldNewOnlyStored(o, v, s)
+  }
+  if (fieldPopOf(o, v, k)) {
+    return true
+  }
+  if (!isFreshAppend(d)) {
+    return false
+  }
+  if (o.f.instrs[d.args[0]].op != Op.FieldGet) {
+    return fieldChainStore(o, v, s, k)
+  }
+  return fieldKey(o.fields.ctx, o.f, o.f.instrs[d.args[0]]) == k &&
+    fieldRmwStore(o, d.args[0], k) == s
+}
+
+// Rule 2's chain (#6210): `path.rest = append(path.rest, a)` then
+// `path.rest = append(path.rest, b)`, whose second read the optimizer
+// forwards from the first store. Append `r`, closed by store `s`, takes
+// the first append's result `p` as its input, and `fieldRmwResultOk`
+// accepted `r` as `p`'s second use, unseparated from `p`'s own store.
+fn fieldChainStore(o: OwnFn, r: int, s: int, k: int): bool {
+  let pd = o.f.instrs[o.f.instrs[r].args[0]]
+  if (!isFreshAppend(pd) || ownUseCount(o, r) != 1) {
+    return false
+  }
+  let g = pd.args[0]
+  let src = o.f.instrs[g]
+  if (src.op != Op.FieldGet ||
+    fieldKey(o.fields.ctx, o.f, src) != k ||
+    fieldRmwStore(o, g, k) < 0) {
+    return false
+  }
+  return o.f.instrs[s].lhs == src.lhs &&
+    o.blockOf[s] == o.blockOf[r] &&
+    fieldOnlyConsts(o.f, r + 1, s)
+}
+
+// Whether store `s` is the only holder of `slice_new` `v` from `s` on: every
+// other use reads a header word (its length, or the buffer a literal such as
+// `indentStack = [0]` fills) or an element, earlier in the same block, so
+// nothing that could see an in-place append's growth reads `v` after it.
+fn fieldNewOnlyStored(o: OwnFn, v: int, s: int): bool {
+  let u = o.useStart[v]
+  while (u < o.useStart[v + 1]) {
+    let at = o.useList[u]
+    if (at != s && !fieldNewFill(o, at, v, s)) {
+      return false
+    }
+    u = u + 1
+  }
+  return o.f.instrs[s].rhs == v && o.f.instrs[s].lhs != v
+}
+
+fn fieldNewFill(o: OwnFn, at: int, v: int, s: int): bool {
+  if (o.blockOf[at] != o.blockOf[s] || at > s) {
+    return false
+  }
+  let ins = o.f.instrs[at]
+  if (ins.op == Op.SliceLen || ins.op == Op.FieldGet) {
+    return true
+  }
+  let elem = ins.op == Op.RtCall && (ins.name == "slice_set" || ins.name == "slice_get")
+  return elem && ownOnlyReceiver(ins.args, v)
+}
+
+// Rule 2 for read `g` of field `k`: the store that closes its
+// read-modify-write, or -1 when `g` is not one.
+fn fieldRmwStore(o: OwnFn, g: int, k: int): int {
+  let r = fieldRmwAppend(o, g, k)
+  if (r < 0) {
+    return -1
+  }
+  let s = o.useList[o.useStart[r]]
+  let st = o.f.instrs[s]
+  if (st.op != Op.FieldSet ||
+    st.lhs != o.f.instrs[g].lhs ||
+    st.ival != o.f.instrs[g].ival ||
+    st.rhs != r) {
+    return -1
+  }
+  if (o.blockOf[s] != o.blockOf[r] || !fieldOnlyConsts(o.f, r + 1, s) || fieldSeparated(o, g, k)) {
+    return -1
+  }
+  return s
+}
+
+// The one `_fresh` append read `g` is the only input of, when its result has
+// one use and every other use of `g` is a header read (`pushFrame`'s
+// `len(f.items)` guarding the same field's append); else -1. No header read
+// can follow the append: the store closing it sits right after it and is a
+// separator (`fieldSeparated`) for any read of `g` it precedes.
+fn fieldRmwAppend(o: OwnFn, g: int, k: int): int {
+  let r = -1
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let at = o.useList[u]
+    if (isFreshAppend(o.f.instrs[at]) && r < 0) {
+      r = at
+    } else if (!fieldHeaderUse(o, at, g, k)) {
+      return -1
+    }
+    u = u + 1
+  }
+  if (r < 0 || !ownOnlyReceiver(o.f.instrs[r].args, g) || !fieldRmwResultOk(o, r, k)) {
+    return -1
+  }
+  return r
+}
+
+// Whether append result `r`'s uses are its store back to field `k`, first,
+// and at most one more: a `_fresh` append taking `r` as its input only
+// (`fieldChainStore`), no separator between the store and it.
+fn fieldRmwResultOk(o: OwnFn, r: int, k: int): bool {
+  let n = ownUseCount(o, r)
+  if (n != 2) {
+    return n == 1
+  }
+  let s = o.useList[o.useStart[r]]
+  let c = o.f.instrs[o.useList[o.useStart[r] + 1]]
+  return isFreshAppend(c) && ownOnlyReceiver(c.args, r) && !fieldSeparatedFrom(o, r, k, s + 1)
+}
+
+// Whether every instruction in `[lo, hi)` is a constant.
+fn fieldOnlyConsts(f: IrFunc, lo: int, hi: int): bool {
+  let i = lo
+  while (i < hi) {
+    let op = f.instrs[i].op
+    if (op != Op.ConstInt && op != Op.ConstBool && op != Op.ConstFloat && op != Op.ConstNil) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Rule 3 for read `g` of field `k`.
+fn fieldHeaderRead(o: OwnFn, g: int, k: int): bool {
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    if (!fieldHeaderUse(o, o.useList[u], g, k)) {
+      return false
+    }
+    u = u + 1
+  }
+  return !fieldSeparated(o, g, k)
+}
+
+// Whether instruction `at` only reads the header `g` holds. A reslice whose
+// sole use is a store back to field `k` counts (`fieldPopOf`): it copies
+// the header's words into a new header and hands that to the field alone.
+fn fieldHeaderUse(o: OwnFn, at: int, g: int, k: int): bool {
+  let ins = o.f.instrs[at]
+  if (ins.op == Op.SliceLen || ins.op == Op.FieldGet || ins.op == Op.KeepAlive) {
+    return true
+  }
+  if (ins.op != Op.RtCall) {
+    return false
+  }
+  if (ins.name == "slice_slice") {
+    return fieldPopOf(o, at, k)
+  }
+  let reader = ins.name == "slice_get" || ins.name == "slice_set" || ins.name == "string_from_bytes"
+  return reader && ownOnlyReceiver(ins.args, g)
+}
+
+// Whether `v` is a pop of field `k`: `rt_call slice_slice` of a read of `k`
+// as its receiver only, whose one use is a store to `k`
+// (`s.indentStack = s.indentStack[0:n]`). `rtSliceSlice` allocates the
+// header it returns, so the field is its only holder; a second use (a
+// local that keeps the popped header) is a holder an in-place push would
+// grow, and poisons `k`.
+fn fieldPopOf(o: OwnFn, v: int, k: int): bool {
+  let d = o.f.instrs[v]
+  if (d.op != Op.RtCall || d.name != "slice_slice" || len(d.args) == 0 || ownUseCount(o, v) != 1) {
+    return false
+  }
+  let src = o.f.instrs[d.args[0]]
+  let st = o.f.instrs[o.useList[o.useStart[v]]]
+  return src.op == Op.FieldGet &&
+    fieldKey(o.fields.ctx, o.f, src) == k &&
+    ownOnlyReceiver(d.args, d.args[0]) &&
+    st.op == Op.FieldSet &&
+    st.rhs == v &&
+    fieldKey(o.fields.ctx, o.f, st) == k
+}
+
+// Whether any instruction on a path from read `g` to one of its uses may
+// run an in-place append on field `k`. The span is `g`'s live range: the
+// rest of its own block and every block it is live into, each cut at its
+// last use unless `g` is live out of it. A use itself is not in the span.
+fn fieldSeparated(o: OwnFn, g: int, k: int): bool {
+  return fieldSeparatedFrom(o, g, k, g + 1)
+}
+
+// `fieldSeparated` with `g`'s own block's span starting at `start`.
+fn fieldSeparatedFrom(o: OwnFn, g: int, k: int, start: int): bool {
+  ownMarkLive(o, g)
+  let def = o.blockOf[g]
+  if (fieldSpanSeparates(o, k, start, fieldSpanEnd(o, g, def))) {
+    return true
+  }
+  let h = 0
+  while (h < o.nhit) {
+    let b = o.hit[h]
+    if (fieldSpanSeparates(o, k, o.f.blocks[b].instsStart, fieldSpanEnd(o, g, b))) {
+      return true
+    }
+    h = h + 1
+  }
+  return false
+}
+
+// Where `g`'s span in block `b` ends: the block's end when `g` is live out
+// of it, else its last use there.
+fn fieldSpanEnd(o: OwnFn, g: int, b: int): int {
+  for s of licmTargets(o.f, b) {
+    if (o.stamp[s] == o.epoch) {
+      return o.f.blocks[b].instsStart + o.f.blocks[b].instsLen
+    }
+  }
+  let end = o.f.blocks[b].instsStart
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let at = o.useList[u]
+    if (o.blockOf[at] == b && at > end) {
+      end = at
+    }
+    u = u + 1
+  }
+  return end
+}
+
+fn fieldSpanSeparates(o: OwnFn, k: int, lo: int, hi: int): bool {
+  let i = lo
+  while (i < hi) {
+    if (fieldSeparates(o, k, o.f.instrs[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `ins` may run an in-place append on field `k`, directly or in code
+// this walk cannot see.
+fn fieldSeparates(o: OwnFn, k: int, ins: IrInstr): bool {
+  let op = ins.op
+  if (op == Op.Call) {
+    return !calmCall(o.fields.calm, ins, k)
+  }
+  if (fieldRunsUnseen(op)) {
+    return true
+  }
+  if (op == Op.FieldSet) {
+    return fieldKey(o.fields.ctx, o.f, ins) == k
+  }
+  if (op != Op.RtCall) {
+    return false
+  }
+  if (isAppendRt(ins) && len(ins.args) > 0) {
+    let src = o.f.instrs[ins.args[0]]
+    return src.op == Op.FieldGet && fieldKey(o.fields.ctx, o.f, src) == k
+  }
+  return !fieldLocalRtCall(ins.name)
+}
+
+// Whether `op` can run code, or hand control to a thread, this walk cannot
+// see.
+fn fieldRunsUnseen(op: Op): bool {
+  return op == Op.Call ||
+    op == Op.CallValue ||
+    op == Op.CallIface ||
+    op == Op.Asm ||
+    op == Op.Syscall ||
+    opIsAtomic(op)
+}
+
+// The calm summary: `base[name]` is one plus the function's index, -1 when
+// two functions share the name; `ok[i]` whether function `i` is calm and
+// `keys[i]` the fields it, or a calm callee, stores to or appends to. Slot
+// `depFrom[d]` is calm only if slot `depTo[d]` is, and takes its keys.
+class Calm {
+  base: map<string, int>,
+  ok: []bool,
+  keys: [][]int,
+  depFrom: []int,
+  depTo: []int,
+}
+
+// Past this many fields a function is not calm: the summary stays small.
+const calmMaxKeys: int = 4
+
+fn calmEmpty(n: int): Calm {
+  return Calm{
+    base = map<string, int>(), ok = []bool(n), keys = [][]int(n), depFrom = []int(0),
+    depTo = []int(0),
+  }
+}
+
+fn calmNew(fo: FieldOwn, funcs: []IrFunc): Calm {
+  let c = calmEmpty(len(funcs))
+  let i = 0
+  while (i < len(funcs)) {
+    let prior = c.base[funcs[i].name]
+    c.base[funcs[i].name] = prior == 0 ? i + 1 : -1
+    i = i + 1
+  }
+  i = 0
+  while (i < len(funcs)) {
+    c.ok[i] = calmScan(fo, c, funcs[i], i)
+    i = i + 1
+  }
+  calmSolve(c)
+  return c
+}
+
+// Whether `f`, slot `slot`, is calm apart from its callees, recording each
+// direct call's dependency and each field it touches.
+fn calmScan(fo: FieldOwn, c: Calm, f: IrFunc, slot: int): bool {
+  for ins of f.instrs {
+    if (ins.op == Op.Call) {
+      let j = c.base[ins.name]
+      if (j <= 0) {
+        return false
+      }
+      c.depFrom = append(c.depFrom, slot)
+      c.depTo = append(c.depTo, j - 1)
+    } else if (!calmInstr(fo, c, f, ins, slot)) {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether `ins`, not a direct call, keeps `f` calm: a store to a field that
+// may hold a slice, or an append to a field read, adds that field's key.
+fn calmInstr(fo: FieldOwn, c: Calm, f: IrFunc, ins: IrInstr, slot: int): bool {
+  let op = ins.op
+  if (op == Op.FieldSet) {
+    return !fieldSliceAccess(fo, f, ins) || calmAddKey(c, slot, fieldKey(fo.ctx, f, ins))
+  }
+  if (op != Op.RtCall) {
+    return !fieldRunsUnseen(op)
+  }
+  if (!isAppendRt(ins)) {
+    return fieldLocalRtCall(ins.name)
+  }
+  if (len(ins.args) == 0) {
+    return false
+  }
+  let src = f.instrs[ins.args[0]]
+  return src.op != Op.FieldGet || calmAddKey(c, slot, fieldKey(fo.ctx, f, src))
+}
+
+// Adds field `k` to slot `slot`'s keys; false when `k` is unknown or the
+// slot already holds `calmMaxKeys`.
+fn calmAddKey(c: Calm, slot: int, k: int): bool {
+  if (k < 0) {
+    return false
+  }
+  for x of c.keys[slot] {
+    if (x == k) {
+      return true
+    }
+  }
+  if (len(c.keys[slot]) >= calmMaxKeys) {
+    return false
+  }
+  c.keys[slot] = append(c.keys[slot], k)
+  return true
+}
+
+// The greatest fixpoint, `borrowSolve`'s shape (optappendborrow.bit): each
+// round that changes anything knocks out a slot or adds one of at most
+// `calmMaxKeys` keys to one, so the bound is always reached by a round that
+// changes nothing. Past it every slot is knocked out rather than trusted.
+fn calmSolve(c: Calm) {
+  let changed = true
+  let round = 0
+  while (changed && round <= len(c.ok) * (calmMaxKeys + 1)) {
+    changed = false
+    let d = 0
+    while (d < len(c.depFrom)) {
+      if (calmPull(c, c.depFrom[d], c.depTo[d])) {
+        changed = true
+      }
+      d = d + 1
+    }
+    round = round + 1
+  }
+  if (!changed) {
+    return
+  }
+  let s = 0
+  while (s < len(c.ok)) {
+    c.ok[s] = false
+    s = s + 1
+  }
+}
+
+// Slot `a` takes slot `b`'s verdict and keys; true when it changed.
+fn calmPull(c: Calm, a: int, b: int): bool {
+  if (!c.ok[a]) {
+    return false
+  }
+  if (!c.ok[b]) {
+    c.ok[a] = false
+    return true
+  }
+  let n = len(c.keys[a])
+  for k of c.keys[b] {
+    if (!calmAddKey(c, a, k)) {
+      c.ok[a] = false
+      return true
+    }
+  }
+  return len(c.keys[a]) != n
+}
+
+// Whether call `ins` runs a calm function of this module that touches no
+// store to, and no append on, field `k`.
+fn calmCall(c: Calm, ins: IrInstr, k: int): bool {
+  let j = c.base[ins.name]
+  if (j <= 0 || !c.ok[j - 1]) {
+    return false
+  }
+  for x of c.keys[j - 1] {
+    if (x == k) {
+      return false
+    }
+  }
+  return true
+}
+
+// Runtime calls that neither run a closure nor synchronize: allocation,
+// element access, the thread's own error slot, and `panic`, which runs no
+// Bit code and never returns into the frame that called it (SPEC §18.5: no
+// deferred call runs on a panic path). Every other runtime call separates.
+fn fieldLocalRtCall(name: string): bool {
+  return fieldAllocRtCall(name) ||
+    name == "slice_get" ||
+    name == "slice_set" ||
+    name == "err_get" ||
+    name == "err_set" ||
+    name == "panic"
+}
+
+fn fieldAllocRtCall(name: string): bool {
+  return name == "slice_new" ||
+    name == "slice_slice" ||
+    name == "string_from_bytes" ||
+    name == "string_from_int" ||
+    name == "string_concat" ||
+    name == "string_concat5" ||
+    name == "string_eq_words" ||
+    name == "bytes_from_string"
+}

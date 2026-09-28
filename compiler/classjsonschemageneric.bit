@@ -1,0 +1,413 @@
+// compiler/classjsonschemageneric.bit — `jsonSchema<T>()` where `T` is the
+// enclosing generic's OWN type parameter (#6201), mirroring #4563's
+// `classjsondecodegeneric.bit` for `jsonDecode<T>`.
+//
+// classjsonschemacall.bit rewrites `jsonSchema<User>()` into
+// `__json_schema_User()` during `resolveProject`, resolving the type
+// argument BY NAME. A type parameter is not a name it can resolve, so every
+// generic wrapper around `jsonSchema` was E0173 and no library could compose
+// it — `pkg/web`'s `Route.requestBody<T>()`/`.responds<T>(status)` need
+// exactly this shape.
+//
+// WHY THIS MIRRORS #4563 RATHER THAN INVENTING SOMETHING NEW. A source-level
+// rewrite cannot express the case at all: the wrapper and the described class
+// routinely live in different modules with the dependency running the wrong
+// way, the same reason `classjsondecodegeneric.bit`'s own header gives.
+// Rewriting after substitution in the monomorphizer fails differently:
+// `lowerInstance` lowers ONE SHARED template body per instantiation, so there
+// is no per-instantiation AST to rewrite.
+//
+// What IS per-instantiation is the ledger ENTRY, so this file changes the
+// ledger and nothing else — the identical strategy #4563 used, and the
+// SAME ledger field (`Instantiation.declModule`, compiler/check.bit): that
+// field and the passes that read it (`recordInstantiation`,
+// `closeInstantiations`, `lowerInstance`, `lowerProject`) are already generic
+// infrastructure since #4563 and need no change here. At `jsonSchema<C>` the
+// entry keeps its name and argument list, and its `decl`/`declModule` are
+// retargeted at a specialisation synthesized in `C`'s OWN module — validated
+// and retargeted by a sibling file this ticket's own follow-up adds (#6201):
+//
+//     fn __json_schema_inst_C<__json_T>(): Json {
+//       return __json_schema_C()
+//     }
+//
+// Simpler than `jsonDecode<T>`'s own generic path: `jsonSchema<T>()` has
+// exactly ONE entry point (no lenient/text variants) and takes no runtime
+// argument and is not fallible, so the specialisation takes no parameters
+// and returns a plain `Json`.
+//
+// THE SPECIALISATION IS DECLARED GENERIC, and the unused `__json_T` is
+// load-bearing rather than decoration, for the identical reason
+// `classjsondecodegeneric.bit`'s own `jsonDecInstTypeParam` is:
+// `resolveCallTarget` lowers the call from `jsonSchema`'s OWN declaration, and
+// `explodedRetWords` answers empty for any declaration carrying generic
+// params — a non-generic specialisation would not, so the definition would
+// explode a return the caller does not.
+
+const jsonSchemaInstTypeParam = "__json_T"
+
+// How many propagation rounds `closeJsonSchemaGenerics` may take — mirrors
+// `jsonDecodeGenericRounds`. A round that adds nothing stops it; running out
+// leaves the set exactly as incomplete as it was, which means a REFUSAL from
+// `validateJsonSchemaGenerics` rather than a wrong program.
+const jsonSchemaGenericRounds = 64
+
+fn jsonSchemaInstName(name: string): string {
+  return "__json_schema_inst_${name}"
+}
+
+// One generic declaration that describes one of its own type parameters,
+// directly or by handing that parameter to another such generic. Mirrors
+// `JsonDecodeGeneric`.
+class JsonSchemaGeneric {
+  mod: int,
+  decl: int,
+  name: string,
+  tpIndex: int,
+  nrecv: int,
+}
+
+// One "this generic hands its own type parameter to that generic" edge, found
+// syntactically. Mirrors `JsonDecodeGenericEdge`.
+class JsonSchemaGenericEdge {
+  mod: int,
+  decl: int,
+  name: string,
+  tpIndex: int,
+  nrecv: int,
+  callee: string,
+  calleeIndex: int,
+}
+
+// ---- the set of generics that describe their own type parameter -----------
+
+// Whether this (declaration, type parameter) is already in the set. Mirrors
+// `hasJsonDecodeGeneric`.
+fn hasJsonSchemaGeneric(gens: []JsonSchemaGeneric, g: JsonSchemaGeneric): bool {
+  for x of gens {
+    if (x.mod == g.mod && x.decl == g.decl && x.tpIndex == g.tpIndex) {
+      return true
+    }
+  }
+  return false
+}
+
+// Every generic in the project whose body calls `jsonSchema<P>()` with `P`
+// one of its own type parameters, plus every generic that reaches one of
+// those by handing its own type parameter along. Mirrors
+// `collectJsonDecodeGenerics`, reusing its declaration-walking helpers
+// (`jsonGenericFuncDecls`, `jsonDeclTypeParamNames`, `jsonRecvGenericCount`,
+// `jsonDeclName`, `jsonCalleeName`, `jsonCallTypeArgs`,
+// `jsonTypeParamArgAt`) directly — they read the AST generically and are not
+// jsonDecode-specific, only the callee-name match below differs.
+fn collectJsonSchemaGenerics(p: Project): []JsonSchemaGeneric {
+  let gens = []JsonSchemaGeneric(0)
+  let mid = 0
+  while (mid < len(p.mods)) {
+    gens = moduleJsonSchemaGenerics(p.mods[mid], mid, gens)
+    mid = mid + 1
+  }
+  // Skipped outright when nothing describes: the edge sweep walks every
+  // generic body in the project, and the closure SEEDS from the direct set,
+  // so with no seed no edge can ever fire (mirrors `collectJsonDecodeGenerics`).
+  if (len(gens) == 0) {
+    return gens
+  }
+  let edges = []JsonSchemaGenericEdge(0)
+  let ei = 0
+  while (ei < len(p.mods)) {
+    edges = moduleJsonSchemaEdges(p.mods[ei], ei, edges)
+    ei = ei + 1
+  }
+  return closeJsonSchemaGenerics(gens, edges)
+}
+
+// The direct half: `jsonSchema<P>()` standing in a generic body, with `P` one
+// of that declaration's own type parameters. A `P` the RECEIVER declared is
+// deliberately not one of these — see `jsonSchemaTypeParamCalls`.
+fn moduleJsonSchemaGenerics(
+  m: SrcModule, mid: int, gens: []JsonSchemaGeneric,
+): []JsonSchemaGeneric {
+  let names = jsonSchemaNamesOf(m.tree, m.source)
+  if (!bindsJsonSchema(names)) {
+    return gens
+  }
+  for decl of jsonGenericFuncDecls(m.tree) {
+    let tps = jsonDeclTypeParamNames(m.tree, m.source, decl)
+    let nrecv = jsonRecvGenericCount(m.tree, decl)
+    for call of subtreeCallNodes(m.tree, kidsOf(m.tree, decl)[5]) {
+      let k = jsonTypeParamArgAt(m.tree, m.source, call, tps, 0)
+      if (k < nrecv || !isJsonSchemaCallee(m.tree, m.source, kidsOf(m.tree, call)[0], names)) {
+        continue
+      }
+      let g = JsonSchemaGeneric{
+        mod = mid, decl = decl, name = jsonDeclName(m.tree, m.source, decl),
+        tpIndex = k, nrecv = nrecv,
+      }
+      if (!hasJsonSchemaGeneric(gens, g)) {
+        gens = append(gens, g)
+      }
+    }
+  }
+  return gens
+}
+
+// The indirect half, as edges rather than as an answer. Mirrors
+// `moduleJsonDecodeEdges`.
+fn moduleJsonSchemaEdges(
+  m: SrcModule, mid: int, edges: []JsonSchemaGenericEdge,
+): []JsonSchemaGenericEdge {
+  for decl of jsonGenericFuncDecls(m.tree) {
+    let tps = jsonDeclTypeParamNames(m.tree, m.source, decl)
+    let nrecv = jsonRecvGenericCount(m.tree, decl)
+    let dname = jsonDeclName(m.tree, m.source, decl)
+    for call of subtreeCallNodes(m.tree, kidsOf(m.tree, decl)[5]) {
+      let callee = jsonCalleeName(m.tree, m.source, kidsOf(m.tree, call)[0])
+      let nargs = len(jsonCallTypeArgs(m.tree, call))
+      let ai = 0
+      while (callee != "" && ai < nargs) {
+        let k = jsonTypeParamArgAt(m.tree, m.source, call, tps, ai)
+        if (k >= nrecv) {
+          edges = append(
+            edges,
+            JsonSchemaGenericEdge{
+              mod = mid, decl = decl, name = dname, tpIndex = k, nrecv = nrecv,
+              callee = callee, calleeIndex = ai,
+            },
+          )
+        }
+        ai = ai + 1
+      }
+    }
+  }
+  return edges
+}
+
+// Propagates "describes this type parameter" backwards along the edges until
+// a round adds nothing. Mirrors `closeJsonDecodeGenerics`.
+fn closeJsonSchemaGenerics(
+  gens: []JsonSchemaGeneric, edges: []JsonSchemaGenericEdge,
+): []JsonSchemaGeneric {
+  let round = 0
+  let before = -1
+  while (len(gens) != before && round < jsonSchemaGenericRounds) {
+    before = len(gens)
+    for e of edges {
+      let g = JsonSchemaGeneric{
+        mod = e.mod, decl = e.decl, name = e.name, tpIndex = e.tpIndex,
+        nrecv = e.nrecv,
+      }
+      if (jsonSchemaEdgeFires(gens, e) && !hasJsonSchemaGeneric(gens, g)) {
+        gens = append(gens, g)
+      }
+    }
+    round = round + 1
+  }
+  return gens
+}
+
+// Whether the generic this edge calls is already known to describe the
+// parameter this edge hands it. Mirrors `jsonDecodeEdgeFires`.
+fn jsonSchemaEdgeFires(gens: []JsonSchemaGeneric, e: JsonSchemaGenericEdge): bool {
+  for g of gens {
+    if (g.name == e.callee && g.tpIndex - g.nrecv == e.calleeIndex) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---- what the pre-check rewrite must leave alone ---------------------------
+
+// Every `jsonSchema<P>()` call node in this module whose type argument is a
+// type parameter, and which kind: `jstpOwn` for one the declaration itself
+// declares (resolved per instantiation by the ledger retarget a sibling file
+// adds, #6201), `jstpRecv` for one a generic RECEIVER
+// declared, which stays a refusal — mirrors `jsonDecodeTypeParamCalls` and
+// `jdtpOwn`/`jdtpRecv`, narrowed to `jsonSchema`'s one entry point.
+//
+// A method on a generic receiver is not a ledger entry at all — the same
+// #4569 reason `classjsondecodegeneric.bit`'s own header gives: Pass A2 never
+// sees it, and nothing records the generic calls in the body
+// `lowerMethodInstances` emits once per nominal instantiation of the
+// receiver.
+const jstpOwn = 1
+const jstpRecv = 2
+
+fn jsonSchemaTypeParamCalls(m: SrcModule): map<int, int> {
+  let out = map<int, int>{}
+  let names = jsonSchemaNamesOf(m.tree, m.source)
+  if (!bindsJsonSchema(names)) {
+    return out
+  }
+  for decl of jsonGenericFuncDecls(m.tree) {
+    let tps = jsonDeclTypeParamNames(m.tree, m.source, decl)
+    let nrecv = jsonRecvGenericCount(m.tree, decl)
+    for call of subtreeCallNodes(m.tree, kidsOf(m.tree, decl)[5]) {
+      let k = jsonTypeParamArgAt(m.tree, m.source, call, tps, 0)
+      if (k < 0 || !isJsonSchemaCallee(m.tree, m.source, kidsOf(m.tree, call)[0], names)) {
+        continue
+      }
+      out[call] = jstpRecv
+      if (k >= nrecv) {
+        out[call] = jstpOwn
+      }
+    }
+  }
+  return out
+}
+
+// The refusal that stays a refusal, stated as what it is — mirrors
+// `reportJsonDecodeRecvTypeParam`, worded for `jsonSchema`.
+fn reportJsonSchemaRecvTypeParam(jx: JsonCtx, targ: int) {
+  let tname = jsonNodeText(jx, targ)
+  report(
+    jx.diags, ecJsonSchemaType, getNode(jx.tree, targ).span,
+    "'jsonSchema' cannot describe '${tname}': it is a type parameter of the enclosing CLASS, and a method of a generic class is not monomorphized through the instantiation ledger this specialisation is resolved by",
+    "move the call into a method or free function that declares '${tname}' itself — `describe<${tname}>(): Json` is resolved per instantiation (#6201)",
+  )
+}
+
+// ---- the classes the generic path demands ----------------------------------
+
+// Every `@json` class handed to a describing generic as a written-out type
+// argument anywhere in the project. Mirrors `collectJsonDecodeGenericNeeds`:
+// NEVER REPORTS, since a callee is matched by NAME and so over-approximates —
+// the authoritative refusal is `validateJsonSchemaGenerics`, added by a
+// sibling file (#6201), which matches ledger entries by declaration identity.
+fn collectJsonSchemaGenericNeeds(
+  p: Project, gens: []JsonSchemaGeneric, d: JsonSchemaDemand,
+) {
+  if (len(gens) == 0) {
+    return
+  }
+  let mid = 0
+  while (mid < len(p.mods)) {
+    let m = p.mods[mid]
+    let jx = newJsonCtx(p, m)
+    let i = 1
+    while (i < len(m.tree.nodes)) {
+      if (getNode(m.tree, i).tag == Tag.Call) {
+        addJsonSchemaGenericCallNeeds(jx, mid, i, gens, d)
+      }
+      i = i + 1
+    }
+    mid = mid + 1
+  }
+}
+
+fn addJsonSchemaGenericCallNeeds(
+  jx: JsonCtx, mid: int, call: int, gens: []JsonSchemaGeneric, d: JsonSchemaDemand,
+) {
+  let callee = jsonCalleeName(jx.tree, jx.source, kidsOf(jx.tree, call)[0])
+  if (callee == "") {
+    return
+  }
+  let targs = jsonCallTypeArgs(jx.tree, call)
+  for g of gens {
+    let ei = g.tpIndex - g.nrecv
+    if (g.name != callee || ei < 0 || ei >= len(targs)) {
+      continue
+    }
+    if (getNode(jx.tree, targs[ei]).tag != Tag.Ident) {
+      continue
+    }
+    let site = jsonClassSiteOf(jx, mid, identText(jx.tree, jx.source, targs[ei]))
+    if (site.found && site.mark == jmJsonClass && !hasJsonSchemaInstNeed(d, site)) {
+      addJsonSchemaNeed(d, site.mod, site)
+      d.instNeeds = append(
+        d.instNeeds,
+        JsonSchemaNeed{
+          needMod = site.mod, classMod = site.mod, className = site.name, path = "",
+        },
+      )
+    }
+  }
+}
+
+fn hasJsonSchemaInstNeed(d: JsonSchemaDemand, site: JsonClassSite): bool {
+  for n of d.instNeeds {
+    if (n.classMod == site.mod && n.className == site.name) {
+      return true
+    }
+  }
+  return false
+}
+
+// The classes THIS module owes a specialisation for: the ones demanded of it
+// that it also declares. Mirrors `moduleDecodeInstClasses`.
+fn moduleSchemaInstClasses(
+  d: JsonSchemaDemand, mid: int, classes: []JsonClass, jx: JsonCtx,
+): []JsonClass {
+  let out = []JsonClass(0)
+  for jc of classes {
+    let name = identText(jx.tree, jx.source, jc.className)
+    for n of d.instNeeds {
+      if (n.classMod == mid && n.className == name) {
+        out = append(out, jc)
+        break
+      }
+    }
+  }
+  return out
+}
+
+// ---- synthesizing the specialisation ---------------------------------------
+
+fn jsonSchemaInstWords(jx: JsonCtx, classes: []JsonClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  let out = [jsonSchemaInstTypeParam]
+  for jc of classes {
+    let name = identText(jx.tree, jx.source, jc.className)
+    out = append(out, jsonSchemaInstName(name))
+    out = append(out, jsonSchemaFuncName(name))
+  }
+  return out
+}
+
+// `fn __json_schema_inst_C<__json_T>(): Json { return __json_schema_C() }` —
+// mirrors `synthJsonDecodeInst`, minus the parameter list and the `Fallible`
+// return: `jsonSchema<T>()` takes no argument and cannot fail.
+//
+// Never exported: nothing names this in source. The one thing that reaches it
+// is Pass A2, through the retargeted ledger entry, by mangled symbol.
+fn synthJsonSchemaInst(jb: JsonBuild, jx: JsonCtx, jc: JsonClass): int {
+  let tree = jb.tree
+  jb.span = getNode(tree, jc.className).span
+  let name = identText(tree, jx.source, jc.className)
+  let body = jbNode(
+    jb, Tag.Block,
+    [
+      jbNode(
+        jb, Tag.ReturnStmt,
+        [jbCall(jb, jbIdent(jb, jsonSchemaFuncName(name)), []int(0))],
+      ),
+    ],
+  )
+  return addNode(
+    tree, Tag.FuncDecl, jb.span, 0,
+    [
+      0, synthIdent(tree, jb.st, jsonSchemaInstName(name)),
+      jbNode(
+        jb, Tag.GenericParams,
+        [jbNode(jb, Tag.GenericParam, [jbIdent(jb, jsonSchemaInstTypeParam), 0])],
+      ),
+      jbNode(jb, Tag.Params, []int(0)),
+      synthIdent(tree, jb.st, "Json"),
+      body,
+    ],
+  )
+}
+
+fn injectJsonSchemaInstDecls(
+  jx: JsonCtx, st: SynthText, classes: []JsonClass,
+): []int {
+  let out = []int(0)
+  let jb = JsonBuild{ tree = jx.tree, st = st, span = pointSpan(0, 0) }
+  for jc of classes {
+    out = append(out, synthJsonSchemaInst(jb, jx, jc))
+  }
+  return out
+}

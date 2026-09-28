@@ -1,0 +1,533 @@
+// compiler/optappendown.bit — #6164: which `slice_append_fresh` and
+// `slice_append_str_fresh` calls may mutate their input header in place.
+//
+// THE QUESTION. Under `BIT_APPEND_FRESH` (#6092) an `append` on a non-null
+// header must return a header independent of its input, because something
+// else may still read the input. Mutating the input in place and returning it
+// is unobservable exactly when, right after the call, nothing but the result
+// can reach that header object: no SSA value, no heap slot, no other frame.
+//
+// A use count of the input cannot answer that (#6092's rejected `uses == 2`
+// draft). In a loop the call's RESULT is the next iteration's input, and a
+// binding that captured it on an earlier iteration (`if (k == 4) { snap =
+// acc }`) is a second, loop-carried name for the same object that the input's
+// use count never sees. So the analysis follows the object, not the value.
+//
+// THE ANALYSIS, per function, on the IR `expandAppends` (optappend.bit) sees:
+//
+// 1. Alias classes. Union-find over value ids, joined by two edges: a block
+//    argument and the parameter it binds, and an append's result and its
+//    input (the in-place path makes them one object). Every SSA value that
+//    can hold a class's header object is in that class: those edges are the
+//    only way one value hands a header to another, and reading one back out
+//    of memory is rule 2's non-fresh source.
+// 2. Fresh sources. Every member that is neither a bound parameter nor an
+//    append result must be `const_nil` or `rt_call slice_new`: a header no one
+//    else was ever given, or a read of a field whose header only the field
+//    holds (`fieldOwned`, optappendfield.bit, #6179). A function parameter,
+//    any other field or element load, or a call result may already be held
+//    elsewhere (the caller, the heap), so the whole class keeps cloning.
+// 3. Liveness, the snapshot rule. At a candidate call no member except its
+//    own result may be live after it. The input live after it is a later read
+//    of the old header; any other member live after it is a second name for
+//    the same object: the `snap` above, carried round the loop by its own
+//    block parameter.
+// 4. Escapes. A member read by anything except a header read (`slice_len`,
+//    `field_get`, `keep_alive`, the receiver of `slice_get`/`slice_set`), a
+//    block argument, a `_fresh` append's own input, or an argument to a
+//    parameter that only borrows it (optappendborrow.bit, #6209) escapes:
+//    any other call or closure argument, a `ret`, a store into a field,
+//    element or map, a `defer`'s capture. After an escape the object is
+//    readable from outside the class, so no candidate the escaped object can
+//    still reach may mutate it. "Can reach" walks from each escaping block
+//    along edges that carry a member (one live into the successor, or passed
+//    as its argument), so a `ret` or a store after the loop's last append
+//    blocks nothing.
+//
+// Everything this file does not recognise is an escape or a non-fresh source,
+// and every failure leaves the call on its cloning `_fresh` entry point.
+
+// Members times blocks, per class. Past it the class keeps cloning rather
+// than spend compile time proving it need not.
+const ownBudget: int = 4000000
+
+// One function's analysis state. `stamp` against `epoch` marks the blocks one
+// member's liveness walk reached, so no array is cleared per member; `stack`
+// and `hit` are sized to the block count because each walk visits a block at
+// most once.
+class OwnFn {
+  f: IrFunc,
+  pm: PredMap,
+  blockOf: []int,
+  useStart: []int,
+  useList: []int,
+  parent: []int,
+  stamp: []int,
+  stack: []int,
+  hit: []int,
+  nhit: int,
+  epoch: int,
+  fields: FieldOwn,
+}
+
+// Whether `ins` is any of the four append entry points.
+fn isAppendRt(ins: IrInstr): bool {
+  return ins.op == Op.RtCall &&
+    (ins.name == "slice_append" || ins.name == "slice_append_str" || isFreshAppend(ins))
+}
+
+// Whether `ins` is a cloning `_fresh` append: the only calls this file decides.
+fn isFreshAppend(ins: IrInstr): bool {
+  return ins.op == Op.RtCall &&
+    len(ins.args) > 0 &&
+    (ins.name == "slice_append_fresh" || ins.name == "slice_append_str_fresh")
+}
+
+// For every instruction of `f`: true when it is a `_fresh` append whose input
+// header provably has no other reader, so the in-place path is unobservable.
+// `fo` is the module's field-ownership fact (optappendfield.bit, #6179).
+fn appendOwnedCalls(f: IrFunc, fo: FieldOwn): []bool {
+  let out = []bool(len(f.instrs))
+  let cands = ownCandidates(f)
+  if (len(cands) == 0) {
+    return out
+  }
+  let o = newOwnFn(f, fo)
+  ownLinkEdges(o)
+  let classOf = []int(len(f.instrs))
+  let roots = []int(0)
+  for c of cands {
+    let r = ownFind(o.parent, c)
+    if (classOf[r] == 0) {
+      roots = append(roots, r)
+      classOf[r] = len(roots)
+    }
+  }
+  let members = ownBuckets(o, classOf, len(roots), -1)
+  let byClass = ownBuckets(o, classOf, len(roots), 1)
+  let k = 0
+  while (k < len(roots)) {
+    ownClass(o, roots[k], ownRun(members, k), ownRun(byClass, k), out)
+    k = k + 1
+  }
+  return out
+}
+
+fn ownCandidates(f: IrFunc): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (isFreshAppend(f.instrs[i])) {
+      out = append(out, i)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn newOwnFn(f: IrFunc, fo: FieldOwn): OwnFn {
+  let n = len(f.instrs)
+  let parent = []int(n)
+  let i = 0
+  while (i < n) {
+    parent[i] = i
+    i = i + 1
+  }
+  let o = OwnFn{
+    f = f, pm = licmPredMap(f), blockOf = computeBlockOfInstr(f),
+    useStart = []int(n + 1), useList = []int(0), parent = parent,
+    stamp = []int(len(f.blocks)), stack = []int(len(f.blocks)),
+    hit = []int(len(f.blocks)), nhit = 0, epoch = 0, fields = fo,
+  }
+  ownIndexUses(o)
+  return o
+}
+
+// `useList[useStart[v] .. useStart[v + 1])` is every instruction reading `v`,
+// once per operand slot, from `instrOperands` (opt.bit): the same table DCE
+// and the verifier trust, so no read is missed here that they would see.
+fn ownIndexUses(o: OwnFn) {
+  let n = len(o.f.instrs)
+  let vals = []int(0)
+  let users = []int(0)
+  let i = 0
+  while (i < n) {
+    for v of instrOperands(o.f, i) {
+      vals = append(vals, v)
+      users = append(users, i)
+      o.useStart[v + 1] = o.useStart[v + 1] + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    o.useStart[i + 1] = o.useStart[i + 1] + o.useStart[i]
+    i = i + 1
+  }
+  let fill = []int(n)
+  let list = []int(len(vals))
+  i = 0
+  while (i < len(vals)) {
+    list[o.useStart[vals[i]] + fill[vals[i]]] = users[i]
+    fill[vals[i]] = fill[vals[i]] + 1
+    i = i + 1
+  }
+  o.useList = list
+}
+
+// Rule 1's edges: every block argument to the parameter it binds, and every
+// append's result to its input.
+fn ownLinkEdges(o: OwnFn) {
+  let b = 0
+  while (b < len(o.f.blocks)) {
+    let t = blockTerm(o.f, b)
+    if (t >= 0 && o.f.instrs[t].op == Op.Jump) {
+      ownLinkArgs(o, o.f.instrs[t].args, o.f.instrs[t].ival)
+    }
+    if (t >= 0 && o.f.instrs[t].op == Op.Br) {
+      ownLinkArgs(o, o.f.instrs[t].thenArgs, o.f.instrs[t].ival)
+      ownLinkArgs(o, o.f.instrs[t].elseArgs, o.f.instrs[t].ival2)
+    }
+    b = b + 1
+  }
+  let i = 0
+  while (i < len(o.f.instrs)) {
+    if (isAppendRt(o.f.instrs[i]) && len(o.f.instrs[i].args) > 0) {
+      ownUnion(o.parent, i, o.f.instrs[i].args[0])
+    }
+    i = i + 1
+  }
+}
+
+fn ownLinkArgs(o: OwnFn, args: []int, target: int) {
+  let blk = o.f.blocks[target]
+  let k = 0
+  while (k < len(args) && k < blk.paramCount) {
+    ownUnion(o.parent, args[k], blk.instsStart + k)
+    k = k + 1
+  }
+}
+
+// Roots only ever link to roots, so a chain is at most `len(parent)` long.
+fn ownFind(parent: []int, v: int): int {
+  let r = v
+  let steps = 0
+  while (parent[r] != r && steps < len(parent)) {
+    r = parent[r]
+    steps = steps + 1
+  }
+  let x = v
+  while (parent[x] != r) {
+    let next = parent[x]
+    parent[x] = r
+    x = next
+  }
+  return r
+}
+
+fn ownUnion(parent: []int, a: int, b: int) {
+  let ra = ownFind(parent, a)
+  let rb = ownFind(parent, b)
+  if (ra < rb) {
+    parent[rb] = ra
+  } else if (rb < ra) {
+    parent[ra] = rb
+  }
+}
+
+// Groups value ids by class (`classOf[root]` is the class index plus one) as
+// a flat run list: entry `k` spans `out[out[k] .. out[k + 1])`, the runs
+// starting after the `nclass + 1` offsets. `which` < 0 buckets every member;
+// otherwise only the `_fresh` append candidates.
+fn ownBuckets(o: OwnFn, classOf: []int, nclass: int, which: int): []int {
+  let n = len(o.f.instrs)
+  let counts = []int(nclass + 1)
+  let v = 0
+  while (v < n) {
+    let k = ownClassIndex(o, classOf, v, which)
+    if (k >= 0) {
+      counts[k + 1] = counts[k + 1] + 1
+    }
+    v = v + 1
+  }
+  let out = []int(nclass + 1)
+  let k = 0
+  while (k < nclass) {
+    out[k + 1] = out[k] + counts[k + 1]
+    k = k + 1
+  }
+  let base = nclass + 1
+  k = 0
+  while (k <= nclass) {
+    out[k] = out[k] + base
+    k = k + 1
+  }
+  let fill = []int(nclass)
+  let all = []int(out[nclass])
+  k = 0
+  while (k < base) {
+    all[k] = out[k]
+    k = k + 1
+  }
+  v = 0
+  while (v < n) {
+    let c = ownClassIndex(o, classOf, v, which)
+    if (c >= 0) {
+      all[out[c] + fill[c]] = v
+      fill[c] = fill[c] + 1
+    }
+    v = v + 1
+  }
+  return all
+}
+
+fn ownClassIndex(o: OwnFn, classOf: []int, v: int, which: int): int {
+  if (which > 0 && !isFreshAppend(o.f.instrs[v])) {
+    return -1
+  }
+  return classOf[ownFind(o.parent, v)] - 1
+}
+
+// Run `k` of an `ownBuckets` list, copied out.
+fn ownRun(runs: []int, k: int): []int {
+  let out = []int(0)
+  let i = runs[k]
+  while (i < runs[k + 1]) {
+    out = append(out, runs[i])
+    i = i + 1
+  }
+  return out
+}
+
+// Rules 2-4 for one class, setting `out[c]` for each candidate `c` it proves.
+fn ownClass(o: OwnFn, root: int, members: []int, cands: []int, out: []bool) {
+  if (len(members) * (len(o.f.blocks) + len(cands)) > ownBudget) {
+    return
+  }
+  for m of members {
+    if (!ownFreshSource(o, m)) {
+      return
+    }
+  }
+  let minEsc = ownEscapes(o, members)
+  let anyLive = []bool(len(o.f.blocks))
+  let bad = []bool(len(cands))
+  for m of members {
+    ownMarkLive(o, m)
+    let h = 0
+    while (h < o.nhit) {
+      anyLive[o.hit[h]] = true
+      h = h + 1
+    }
+    ownCheckLive(o, m, cands, bad)
+  }
+  let reached = ownEscapeReach(o, root, anyLive, minEsc)
+  let i = 0
+  while (i < len(cands)) {
+    let b = o.blockOf[cands[i]]
+    out[cands[i]] = !bad[i] && !reached[b] && minEsc[b] > cands[i]
+    i = i + 1
+  }
+}
+
+// Rule 2. A parameter is fed by its block's incoming arguments, which rule 1
+// made members too; the entry block's parameters are the function's own, and
+// a block with no predecessor has nothing feeding it that this file can see.
+fn ownFreshSource(o: OwnFn, m: int): bool {
+  let b = o.blockOf[m]
+  let blk = o.f.blocks[b]
+  if (m < blk.instsStart + blk.paramCount) {
+    return b != 0 && predCount(o.pm, b) > 0
+  }
+  let ins = o.f.instrs[m]
+  if (ins.op == Op.ConstNil || isAppendRt(ins)) {
+    return true
+  }
+  if (ins.op == Op.FieldGet) {
+    return fieldOwned(o.fields, o.f, ins)
+  }
+  return ins.op == Op.RtCall && ins.name == "slice_new"
+}
+
+// Rule 4's escape sites: per block, the smallest escaping instruction id, or
+// `len(f.instrs)` when the block has none.
+fn ownEscapes(o: OwnFn, members: []int): []int {
+  let n = len(o.f.instrs)
+  let minEsc = []int(len(o.f.blocks))
+  let b = 0
+  while (b < len(minEsc)) {
+    minEsc[b] = n
+    b = b + 1
+  }
+  for m of members {
+    let k = o.useStart[m]
+    while (k < o.useStart[m + 1]) {
+      let u = o.useList[k]
+      if (ownUseEscapes(o, u, m) && u < minEsc[o.blockOf[u]]) {
+        minEsc[o.blockOf[u]] = u
+      }
+      k = k + 1
+    }
+  }
+  return minEsc
+}
+
+// Whether instruction `u` reading member `m` lets the header out of the class.
+// A call whose every position `m` fills only borrows it (optappendborrow.bit,
+// #6209) keeps it in.
+fn ownUseEscapes(o: OwnFn, u: int, m: int): bool {
+  let ins = o.f.instrs[u]
+  if (ins.op == Op.Jump) {
+    return false
+  }
+  if (ins.op == Op.Br) {
+    return ins.lhs == m
+  }
+  if (ins.op == Op.Call) {
+    return !borrowedArg(o.fields.borrow, ins, m)
+  }
+  return !ownHeaderUse(ins, m)
+}
+
+// Whether `ins` only reads header `m`, or appends to it as its input.
+fn ownHeaderUse(ins: IrInstr, m: int): bool {
+  if (ins.op == Op.SliceLen || ins.op == Op.FieldGet || ins.op == Op.KeepAlive) {
+    return true
+  }
+  let reader = isFreshAppend(ins) ||
+    (ins.op == Op.RtCall && (ins.name == "slice_get" || ins.name == "slice_set"))
+  return reader && ownOnlyReceiver(ins.args, m)
+}
+
+// Whether `m` is `args[0]` and appears in no other slot: the header is only
+// read or appended to, never passed along as a value.
+fn ownOnlyReceiver(args: []int, m: int): bool {
+  if (len(args) == 0 || args[0] != m) {
+    return false
+  }
+  let i = 1
+  while (i < len(args)) {
+    if (args[i] == m) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Stamps every block `m` is live into with a fresh epoch and lists them in
+// `hit[0 .. nhit)`: the backward walk from each use to `m`'s defining block.
+fn ownMarkLive(o: OwnFn, m: int) {
+  o.epoch = o.epoch + 1
+  o.nhit = 0
+  let def = o.blockOf[m]
+  let top = 0
+  let k = o.useStart[m]
+  while (k < o.useStart[m + 1]) {
+    top = ownVisit(o, def, o.blockOf[o.useList[k]], top)
+    k = k + 1
+  }
+  while (top > 0) {
+    top = top - 1
+    let b = o.stack[top]
+    let p = o.pm.start[b]
+    while (p < o.pm.start[b + 1]) {
+      top = ownVisit(o, def, o.pm.list[p], top)
+      p = p + 1
+    }
+  }
+}
+
+fn ownVisit(o: OwnFn, def: int, b: int, top: int): int {
+  if (b == def || o.stamp[b] == o.epoch) {
+    return top
+  }
+  o.stamp[b] = o.epoch
+  o.hit[o.nhit] = b
+  o.nhit = o.nhit + 1
+  o.stack[top] = b
+  return top + 1
+}
+
+// Rule 3 for member `m`, just walked by `ownMarkLive`: marks every candidate
+// that `m` outlives, other than the one `m` is the result of.
+fn ownCheckLive(o: OwnFn, m: int, cands: []int, bad: []bool) {
+  let i = 0
+  while (i < len(cands)) {
+    if (cands[i] != m && ownLiveAfter(o, cands[i], m)) {
+      bad[i] = true
+    }
+    i = i + 1
+  }
+}
+
+// Whether `m` is live immediately after instruction `c`: read later in `c`'s
+// block (its terminator's arguments included), or live into a successor.
+fn ownLiveAfter(o: OwnFn, c: int, m: int): bool {
+  let b = o.blockOf[c]
+  if (o.blockOf[m] == b && m > c) {
+    return false
+  }
+  let k = o.useStart[m]
+  while (k < o.useStart[m + 1]) {
+    let u = o.useList[k]
+    if (u > c && o.blockOf[u] == b) {
+      return true
+    }
+    k = k + 1
+  }
+  for s of licmTargets(o.f, b) {
+    if (o.stamp[s] == o.epoch) {
+      return true
+    }
+  }
+  return false
+}
+
+// Rule 4's reach: every block the escaped object can still be carried into
+// from an escaping block. Each block is queued at most once past the seeds.
+fn ownEscapeReach(o: OwnFn, root: int, anyLive: []bool, minEsc: []int): []bool {
+  let reached = []bool(len(o.f.blocks))
+  let work = []int(0)
+  let b = 0
+  while (b < len(minEsc)) {
+    if (minEsc[b] < len(o.f.instrs)) {
+      work = append(work, b)
+    }
+    b = b + 1
+  }
+  let i = 0
+  while (i < len(work)) {
+    for s of licmTargets(o.f, work[i]) {
+      if (!reached[s] && ownCarries(o, root, anyLive, work[i], s)) {
+        reached[s] = true
+        work = append(work, s)
+      }
+    }
+    i = i + 1
+  }
+  return reached
+}
+
+// Whether the edge `b -> s` can carry a member: one is live into `s`, or
+// `b`'s terminator hands one to `s`'s parameters.
+fn ownCarries(o: OwnFn, root: int, anyLive: []bool, b: int, s: int): bool {
+  if (anyLive[s]) {
+    return true
+  }
+  let t = o.f.instrs[blockTerm(o.f, b)]
+  if (t.op == Op.Jump) {
+    return ownAnyMember(o, root, t.args)
+  }
+  return (t.ival == s && ownAnyMember(o, root, t.thenArgs)) ||
+    (t.ival2 == s && ownAnyMember(o, root, t.elseArgs))
+}
+
+fn ownAnyMember(o: OwnFn, root: int, ids: []int): bool {
+  for v of ids {
+    if (ownFind(o.parent, v) == root) {
+      return true
+    }
+  }
+  return false
+}

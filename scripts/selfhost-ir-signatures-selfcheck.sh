@@ -147,6 +147,243 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
+  # --- #6161 POSITIVE (types, column-shift): real --dump-types excerpt,
+  # _tests_/cases/run_json_decode_lenient.bit lines 110-117, this tree vs the
+  # pinned 0.32.0 stage0 (captured 2026-09-28, ticket #6208). Every line
+  # shares its line number (102) and its `<name>: <type>` suffix; every
+  # column shifts by the same +32. ---
+  oracle_6161_colshift='102:707: __json_x0: string
+102:707: __json_x0: string
+102:707: __json_x0: i64
+102:815: __json_x1: Addr
+102:891: __json_x2: []Item
+102:901: __json_dp2: string
+102:912: __json_di2: i64
+102:956: __json_da2: []Json'
+  bit2_6161_colshift='102:739: __json_x0: string
+102:739: __json_x0: string
+102:739: __json_x0: i64
+102:847: __json_x1: Addr
+102:923: __json_x2: []Item
+102:933: __json_dp2: string
+102:944: __json_di2: i64
+102:988: __json_da2: []Json'
+  sig6161cs=$(explainMismatch "$oracle_6161_colshift" "$bit2_6161_colshift" types)
+  rc6161cs=$?
+  if [ "$rc6161cs" -ne 0 ] || [ "$sig6161cs" != "6161-json-decode-column-shift" ]; then
+    echo "FAIL: the real #6161 column-shift types divergence was not explained (rc=$rc6161cs sig='$sig6161cs')"
+    fail=1
+  fi
+
+  # --- #6161 MUTATION (types, column-shift): same shape, but the LAST line
+  # shifts by +40 instead of +32 -- a non-constant delta must be rejected. ---
+  bit2_6161_colshift_mut='102:739: __json_x0: string
+102:739: __json_x0: string
+102:739: __json_x0: i64
+102:847: __json_x1: Addr
+102:923: __json_x2: []Item
+102:933: __json_dp2: string
+102:944: __json_di2: i64
+102:996: __json_da2: []Json'
+  sig6161csm=$(explainMismatch "$oracle_6161_colshift" "$bit2_6161_colshift_mut" types)
+  rc6161csm=$?
+  if [ "$rc6161csm" -eq 0 ] || [ -n "$sig6161csm" ]; then
+    echo "FAIL: a non-constant column delta was wrongly explained (rc=$rc6161csm sig='$sig6161csm')"
+    fail=1
+  fi
+
+  # --- #6161 POSITIVE (types, synthesized-insert): real --dump-types
+  # excerpt, _tests_/cases/run_json_schema_attrs.bit lines 1-8/1-16 (captured
+  # 2026-09-28, ticket #6208): the tree types the same 3 class-declaration
+  # nodes 3 extra times each (the specialized schema builder re-walking the
+  # class), oracle is an exact ordered subsequence. ---
+  oracle_6161_insert='13:7: len(s): i64
+14:5: panic("empty"): ()
+19:7: len(s): i64
+20:5: panic("empty"): ()
+24:13: Widget: Json
+24:13: Widget: []u8
+24:13: Widget: []u8
+25:3: @pattern("^[a-z]+$"): ()!'
+  bit2_6161_insert='13:7: len(s): i64
+14:5: panic("empty"): ()
+19:7: len(s): i64
+20:5: panic("empty"): ()
+24:13: Widget: Json
+24:13: Widget: []u8
+24:13: Widget: []u8
+24:13: Widget: Json
+24:13: Widget: Json
+24:13: Widget: Json
+24:13: Widget: Json
+24:13: Widget: Json
+24:13: Widget: Json
+24:13: Widget: Json
+24:13: Widget: Json
+25:3: @pattern("^[a-z]+$"): ()!'
+  sig6161ins=$(explainMismatch "$oracle_6161_insert" "$bit2_6161_insert" types)
+  rc6161ins=$?
+  if [ "$rc6161ins" -ne 0 ] || [ "$sig6161ins" != "6161-json-schema-synthesized-insert" ]; then
+    echo "FAIL: the real #6161 synthesized-insert types divergence was not explained (rc=$rc6161ins sig='$sig6161ins')"
+    fail=1
+  fi
+
+  # --- #6161 MUTATION (types, synthesized-insert): the SAME insertions, but
+  # one oracle line (`19:7: len(s): i64`) is altered instead of merely
+  # missing from the ordered match -- oracle is no longer a subsequence of
+  # the tree, so this must be rejected, not silently treated as another
+  # insertion. ---
+  bit2_6161_insert_mut='13:7: len(s): i64
+14:5: panic("empty"): ()
+19:7: len(s): string
+20:5: panic("empty"): ()
+24:13: Widget: Json
+24:13: Widget: []u8
+24:13: Widget: []u8
+24:13: Widget: Json
+25:3: @pattern("^[a-z]+$"): ()!'
+  sig6161insm=$(explainMismatch "$oracle_6161_insert" "$bit2_6161_insert_mut" types)
+  rc6161insm=$?
+  if [ "$rc6161insm" -eq 0 ] || [ -n "$sig6161insm" ]; then
+    echo "FAIL: an altered (not just missing) oracle line was wrongly explained as an insert (rc=$rc6161insm sig='$sig6161insm')"
+    fail=1
+  fi
+
+  # --- #6161 POSITIVE (types, decode-enum-error-resolved): real
+  # --dump-types excerpt, _tests_/cases/run_json_decode_enum.bit (captured
+  # 2026-09-28, ticket #6208): the oracle cannot type `jsonDecode<Item>(j)`
+  # at all (payload-free enum-field decode postdates it), so every
+  # downstream use of the result is `<error>`; the tree resolves all of
+  # them to real types, with every OTHER line byte-identical. ---
+  oracle_6161_errres='55:28: it.toJson(): <error>
+56:7: j: Json
+56:11: jsonParse(encoded): Json!
+57:5: print("parse: ${e.message()}\n"): ()
+57:21: e.message(): string
+60:7: back: <error>
+60:14: jsonDecode<Item>(j): <error>
+61:5: print("decode: ${e.message()}\n"): ()
+61:22: e.message(): string'
+  bit2_6161_errres='55:28: it.toJson(): Json
+56:7: j: Json
+56:11: jsonParse(encoded): Json!
+57:5: print("parse: ${e.message()}\n"): ()
+57:21: e.message(): string
+60:7: back: Item
+60:14: jsonDecode<Item>(j): Item!
+61:5: print("decode: ${e.message()}\n"): ()
+61:22: e.message(): string'
+  sig6161er=$(explainMismatch "$oracle_6161_errres" "$bit2_6161_errres" types)
+  rc6161er=$?
+  if [ "$rc6161er" -ne 0 ] || [ "$sig6161er" != "6161-json-decode-enum-error-resolved" ]; then
+    echo "FAIL: the real #6161 error-resolved types divergence was not explained (rc=$rc6161er sig='$sig6161er')"
+    fail=1
+  fi
+
+  # --- #6161 MUTATION (types, decode-enum-error-resolved): a well-typed
+  # oracle expression (not `<error>`) changing to a DIFFERENT concrete type
+  # -- a real regression shape -- must never be accepted as a resolution. ---
+  oracle_6161_errres_mut='60:7: back: Widget'
+  bit2_6161_errres_mut='60:7: back: Item'
+  sig6161erm=$(explainMismatch "$oracle_6161_errres_mut" "$bit2_6161_errres_mut" types)
+  rc6161erm=$?
+  if [ "$rc6161erm" -eq 0 ] || [ -n "$sig6161erm" ]; then
+    echo "FAIL: a real type-to-type regression was wrongly explained as an error-resolution (rc=$rc6161erm sig='$sig6161erm')"
+    fail=1
+  fi
+
+  # --- #6161 POSITIVE (ir/iropt, specialize-call, insLen=0): real
+  # --dump-ir-pre for _tests_/imports/jsonschemacrossmod/main.bit (captured
+  # 2026-09-28, ticket #6208): the specialization is DEFINED in another
+  # module, so this file only renames the call, same line count both sides. ---
+  oracle_6161_call='  %0 = call @m3$jsonSchema$14() Json'
+  bit2_6161_call='  %0 = call @m4$__json_schema_Widget() Json'
+  sig6161c=$(explainMismatch "$oracle_6161_call" "$bit2_6161_call" ir)
+  rc6161c=$?
+  if [ "$rc6161c" -ne 0 ] || [ "$sig6161c" != "6161-json-schema-specialize-call" ]; then
+    echo "FAIL: the real #6161 cross-module call rename was not explained (rc=$rc6161c sig='$sig6161c')"
+    fail=1
+  fi
+
+  # --- #6161 MUTATION (ir/iropt, specialize-call): TWO call sites renamed
+  # in the same file -- must be rejected, not swallowed as two independent
+  # instances of the same signature. ---
+  oracle_6161_call_mut2='  %0 = call @m3$jsonSchema$14() Json
+  %1 = call @m3$jsonSchema$15() Json'
+  bit2_6161_call_mut2='  %0 = call @m4$__json_schema_Widget() Json
+  %1 = call @m4$__json_schema_Other() Json'
+  sig6161c2=$(explainMismatch "$oracle_6161_call_mut2" "$bit2_6161_call_mut2" ir)
+  rc6161c2=$?
+  if [ "$rc6161c2" -eq 0 ] || [ -n "$sig6161c2" ]; then
+    echo "FAIL: two renamed call sites in one file were wrongly explained (rc=$rc6161c2 sig='$sig6161c2')"
+    fail=1
+  fi
+
+  # --- #6161 POSITIVE (ir, specialize-call, insLen>0): a small synthetic
+  # function matching the real shape captured from
+  # _tests_/cases/run_json_schema_attrs.bit -- the call renames, and the
+  # tree inserts exactly one well-formed __json_schema_Widget function
+  # directly after the shared blank separator that already existed between
+  # the two original functions. ---
+  oracle_6161_callins='func main() void {
+bb0():
+  %0 = call @jsonSchema$14() Json
+  ret
+}
+
+func helper() void {
+bb0():
+  ret
+}'
+  bit2_6161_callins='func main() void {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret
+}
+
+func __json_schema_Widget() Json {
+bb0():
+  %0 = const_string "type"
+  ret %0
+}
+
+func helper() void {
+bb0():
+  ret
+}'
+  sig6161ci=$(explainMismatch "$oracle_6161_callins" "$bit2_6161_callins" ir)
+  rc6161ci=$?
+  if [ "$rc6161ci" -ne 0 ] || [ "$sig6161ci" != "6161-json-schema-specialize-call" ]; then
+    echo "FAIL: the synthetic call-rename-plus-insert was not explained (rc=$rc6161ci sig='$sig6161ci')"
+    fail=1
+  fi
+
+  # --- #6161 MUTATION (ir, specialize-call, insLen>0): the SAME insertion,
+  # but the inserted function is named for a DIFFERENT type than the one the
+  # call was renamed to -- must be rejected. ---
+  bit2_6161_callins_mut='func main() void {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret
+}
+
+func __json_schema_Other() Json {
+bb0():
+  %0 = const_string "type"
+  ret %0
+}
+
+func helper() void {
+bb0():
+  ret
+}'
+  sig6161cim=$(explainMismatch "$oracle_6161_callins" "$bit2_6161_callins_mut" ir)
+  rc6161cim=$?
+  if [ "$rc6161cim" -eq 0 ] || [ -n "$sig6161cim" ]; then
+    echo "FAIL: an inserted function named for the WRONG type was wrongly explained (rc=$rc6161cim sig='$sig6161cim')"
+    fail=1
+  fi
+
   # --- #6194 POSITIVE (ir/iropt): minimal synthetic dumps matching the
   # measured shape -- pre-opt gains field_get/gc_alloc in a [2x,4x] ratio,
   # post-opt loses ONLY gc_alloc. ---

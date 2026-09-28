@@ -130,3 +130,7 @@ restriction are defined in [SPEC §10.4.1](../../spec/SPEC.md) and
 Static requirements are declared the same place ordinary ones are: read
 [Interfaces](interfaces.md) for structural satisfaction, `error`, and type
 assertions.
+
+`NotifyJob.label()` above is hand-written. [Classes](classes.md)' `@job`
+attribute synthesizes exactly this static method for you, from one string,
+for a real background-job queue.
