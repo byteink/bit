@@ -48,3 +48,8 @@ closed socket, a short read, a protocol desync - is reported through
 `std/sql`'s `FatalError` marker instead, and the pool discards that connection
 rather than reusing it. This package never has to name `FatalError` at a call
 site: `transportError`, from `std/sql`, already implements it.
+
+## Where to go next
+
+[Limitations](limitations.md) for what this driver does not do yet, and
+[Queries](queries.md) for `query`, `exec` and `prepare`.

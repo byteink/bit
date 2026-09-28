@@ -38,3 +38,8 @@ every query call still succeed. A program that wants to enforce a floor pins
 `ssl-mode` (for TLS) or moves the account to `caching_sha2_password` or
 `client_ed25519` (for authentication); this driver has no code path to refuse
 a connection on plugin strength alone.
+
+## Where to go next
+
+[TLS](tls.md) covers the matching `ssl-mode` warning, and the connection
+URI both warnings apply to.

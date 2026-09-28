@@ -51,3 +51,9 @@ rejects setting both, or neither. `port` left at 0, the `Datasource` default,
 means 3306. `ssl-mode` is the only query parameter this driver reads; any other
 name fails naming itself rather than being silently dropped. Its values are
 covered in full in [TLS](tls.md).
+
+## Where to go next
+
+[MySQL and MariaDB](servers.md) for what differs between the two servers,
+[TLS](tls.md) for `ssl-mode`, and [Authentication](authentication.md) for
+the four plugins this driver connects with.
