@@ -141,24 +141,22 @@ fn login(c: Ctx, strategy: Strategy): Res! {
   if (isSome(role)) {
     session.set(sessionRoleKey, jsonDecString(unwrap(role), "identity.claims.role")?)
   }
-  session.save()?
   return c.noContent()
 }
 ```
 
-Two things about this route matter more than they look:
+One thing about this route matters more than it looks:
 
 `session.regenerate()` runs **before** anything is written into the
 session, for the reason above: the write has to land on the new id, not on
 the one that might have been planted.
 
-`session.save()` is not optional today. `Session.set()` only changes the
-copy of the session held in memory for this one request; nothing is sent to
-the store until `save()` runs. Forget it, and the login looks like it
-worked (you get a `Set-Cookie` and a `204`), but the very next request finds
-an empty session and answers `401` as if you had never logged in. Every
-route in Inkwell that changes the session calls `save()` explicitly, right
-after the last `set()`, for exactly this reason.
+Nothing here calls `session.save()`. `pkg/web` autosaves a modified session
+once the handler returns: if any `set()`/`delete()`/`regenerate()` marked
+the session dirty, the framework writes it to the store for you, whether
+the handler succeeded or failed. `Session.set()` still only changes the
+copy of the session held in memory for the rest of *this* request — the
+store write itself happens automatically at the end, not inside `login`.
 
 `c.noContent()` answers `204 No Content`. There is nothing to return besides
 the cookie: the caller already knows who they are, because they sent the
@@ -301,8 +299,9 @@ headers, part 13's subject; they are trimmed here to keep the point visible.)
 ## What we built
 
 `POST /auth/login` that verifies a password, closes session fixation with
-`regenerate()`, and persists the result with an explicit `save()`.
-`POST /auth/logout` that destroys the session outright, and `GET /me` that
+`regenerate()`, and persists the result via `pkg/web`'s autosave, with no
+explicit `save()` call. `POST /auth/logout` that destroys the session
+outright, and `GET /me` that
 reads the logged-in caller back. Every route in Inkwell can now ask "who is
 calling", but not yet "are they allowed to do this": that is part 12.
 
