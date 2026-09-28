@@ -1257,31 +1257,35 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   rendered the same way (no further `$defs` nested inside one of its own
   entries) - so a caller can `$ref` the root from elsewhere (an OpenAPI
   document's own `components/schemas`) exactly as any nested class already
-  is. The walk only follows a field into a class declared in the SAME
-  module as the one holding the field; a nested class reached through a
-  named import from another module keeps its `$ref` string but has no
-  matching `$defs` entry yet. `required` names every field's key with no
+  is. A nested class declared in the SAME module as the one holding the
+  field is inlined directly; one reached through a named import from
+  another module gets its `$defs` entry from a bare-fragment function
+  (`__json_schema_frag_<Name>()`) that module exports, one hop from the
+  document root's own module (#6182, `compiler/classjsonschemafrag.bit`) -
+  a class reached only through a SECOND cross-module hop still keeps a
+  dangling `$ref`. `required` names every field's key with no
   exception: `@json` never omits a key (an absent `Option<T>` is an
   explicit `null`, not a missing one), so the schema's `required` set is
   exactly the class's declared field set. `@key("...")` overrides a
   field's schema property key exactly as it overrides its `toJson()`/
   `jsonDecode<T>` key.
-- **A field's validation attributes are DESIGNED to be recorded, not
-  interpreted, but this part is NOT YET IMPLEMENTED** (#6181 - none of
-  #6161's own children owned it, and it is not exercised by any fragment
-  `jsonSchema<T>()` emits today). `std/json` has
-  no knowledge of what `@minLen`/`@max`/etc. (`pkg/web`'s own rules, this
-  file's "validate.bit" material) mean, and cannot depend on `pkg/web` to
-  find out. The design a field carrying attributes should get is an
-  `"x-bit-attrs"` entry on its own fragment - JSON Schema and OpenAPI both
-  reserve the `x-` prefix for vendor extensions a validator that does not
-  recognise them ignores rather than rejects (OpenAPI 3.1's own
-  `specification-extensions` pattern is exactly `^x-`) - naming each
-  attribute and its constant arguments in the same source-spelling `@table`
-  above already records them in. `pkg/web` would map its own attributes out
-  of this into native schema keywords (`@minLen(3)` into `minLength: 3`)
-  and strip the rest before a document is served; the mapping itself is
-  `pkg/web`'s, not `std/json`'s, and is specified where it is implemented.
+- **A field's validation attributes are recorded, not interpreted** (#6181,
+  `jsPropertyEntry`/`jsXBitAttrsEntry`, `compiler/classjsonschema.bit`).
+  `std/json` has no knowledge of what `@minLen`/`@max`/etc. (`pkg/web`'s own
+  rules, this file's "validate.bit" material) mean, and cannot depend on
+  `pkg/web` to find out. A field carrying at least one attribute (every
+  attribute but `@key`, which names no function) gets an `"x-bit-attrs"`
+  entry on its own fragment - JSON Schema and OpenAPI both reserve the `x-`
+  prefix for vendor extensions a validator that does not recognise them
+  ignores rather than rejects (OpenAPI 3.1's own `specification-extensions`
+  pattern is exactly `^x-`) - `[{"name": "<attrName>", "args": ["<arg
+  spelling>", ...]}, ...]`, naming each attribute and its constant
+  arguments in the same source-spelling `@table` above already records them
+  in. A field with no attributes at all gets no `"x-bit-attrs"` key, not an
+  empty array. `pkg/web` would map its own attributes out of this into
+  native schema keywords (`@minLen(3)` into `minLength: 3`) and strip the
+  rest before a document is served; the mapping itself is `pkg/web`'s, not
+  `std/json`'s, and is specified where it is implemented.
 
 **`@table` - synthesizing `tableDescriptor`.**
 
