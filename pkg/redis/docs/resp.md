@@ -50,9 +50,9 @@ fn main(): ()! {
 An `Err` reply (`-ERR ...\r\n` on the wire) decodes to `Reply.Err(string)`
 like any other reply - `decodeReply` itself never fails on it. `Client`
 raises it: every method checks its `Reply` and turns an `Err` into a `fail`
-carrying the server's message, prefixed `"redis: "` (`client.bit`'s
-`checkError`), so a caller sees a command failure the same way it sees a
-connection failure - as an `error` from `?` or `catch`.
+carrying the server's message, prefixed `"redis: "`, so a caller sees a
+command failure the same way it sees a connection failure - as an `error`
+from `?` or `catch`.
 
 ## Not implemented
 
