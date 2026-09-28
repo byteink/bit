@@ -1205,7 +1205,7 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   describes the TYPE and never reads a value at all.
 - `T` must be a class carrying `@json`; anything else is a compile error at
   the call, never a runtime failure - the same shape as `jsonDecode<T>`'s
-  own **E0145**, under its own code, **E0172**
+  own **E0145**, under its own code, **E0173**
   (`compiler/classjsonschemacall.bit`).
 - **The dialect is JSON Schema 2020-12**
   (<https://json-schema.org/draft/2020-12>), the exact dialect OpenAPI 3.1's

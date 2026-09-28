@@ -772,7 +772,7 @@ producer that omits the key instead is just as well-formed.
 
 A JSON Schema 2020-12 document describing `T`, specialised per instantiation
 exactly as `jsonDecode<T>` is above. `T` must carry `@json`; anything else is
-a compile error (`E0172`) naming the type and the mark, never a runtime
+a compile error (`E0173`) naming the type and the mark, never a runtime
 failure.
 
 ```bit
