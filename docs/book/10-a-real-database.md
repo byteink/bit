@@ -254,8 +254,28 @@ fn openStore(databaseUrl: string): Store! {
 Every `ink` command that used to call `saveDraft`/`loadDraft`/`listDrafts`
 directly now takes a `Store` and calls `store.save`/`store.load`/
 `store.list` instead - the same three lines run against a laptop's files or
-a shared Postgres, decided once, at startup, by whether `DATABASE_URL` is
-set.
+a shared Postgres.
+
+## Wiring it into main.bit
+
+`Settings` ([chapter 7](/book/07-settings-file)) grows a `databaseUrl`
+field, read from the `DATABASE_URL` environment variable rather than
+`ink.toml` - a database to connect to is a deployment detail, not something
+you hand-edit into a settings file you might commit. `main` opens the store
+once and passes it to every command:
+
+```text
+fn main(): ()! {
+  let settings = currentSettings()
+  let store = openStore(settings.databaseUrl)?
+  // dispatch to cmdNew(store, ...), cmdList(store, ...), and so on
+}
+```
+
+so which store `ink` uses is decided once, at startup, by whether
+`DATABASE_URL` is set - every command after this point just calls
+`store.save`/`store.load`/`store.list`, with no `if` of its own to tell
+files and Postgres apart.
 
 ## Sharp edges
 

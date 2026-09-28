@@ -255,6 +255,22 @@ fn main() {
 }
 ```
 
+## Wiring it into main.bit
+
+`ink index` is one more command in `main.bit`'s dispatch:
+
+```text
+fn cmdIndex(store: Store): ()! {
+  let drafts = store.list()?
+  let idx = buildIndex(drafts, 4)
+  println("indexed ${len(drafts)} draft(s) into ${len(idx)} distinct word(s)")
+}
+```
+
+Four workers is a fixed, reasonable default for a laptop; `buildIndex`
+itself does not care how many drafts there are, so this line never needs to
+change as Inkwell's library grows.
+
 ## Sharp edges
 
 - A green thread's stack is fixed at 64 KiB and does not grow. `indexWorker`

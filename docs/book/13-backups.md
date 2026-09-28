@@ -268,6 +268,81 @@ fn main() {
 }
 ```
 
+## A backup key from a passphrase, not the command line
+
+`backupDrafts`/`restoreDrafts` above take a raw 32-byte key - fine for
+showing the encryption itself, wrong for a real command: a key long enough
+to type would be short enough to guess, and a key on the command line ends
+up in your shell's history. `ink backup`/`ink restore` take a passphrase
+instead, and derive the key from it with `argon2id` - the same
+memory-hard, deliberately slow hash [std/crypto's password-hashing
+guide](/std/crypto#hash-a-password) uses, so guessing a passphrase costs as
+much as guessing a login password:
+
+```text
+import { argon2id, randomBytes } from "std/crypto"
+
+const kdfSaltLen: int = 16
+
+fn deriveKey(passphrase: string, salt: []byte): []byte {
+  return argon2id([]byte(passphrase), salt, []byte(0), []byte(0), 3, 65536, 1, 32)
+}
+
+// Backs up under a passphrase: a fresh, random salt goes in front of
+// `backupDrafts`'s own blob, so `restoreWithPassphrase` can re-derive the
+// exact same key from the passphrase alone - the salt is not a secret, it
+// only has to be different every time.
+export fn backupWithPassphrase(drafts: []Draft, passphrase: string): []byte! {
+  let salt = randomBytes(kdfSaltLen)
+  let key = deriveKey(passphrase, salt)
+  let nonce = randomBytes(12)
+  let out = []byte(0)
+  out = append(out, ...salt)
+  out = append(out, ...backupDrafts(drafts, key, nonce)?)
+  return out
+}
+
+export fn restoreWithPassphrase(blob: []byte, passphrase: string): []Draft! {
+  if (len(blob) < kdfSaltLen) {
+    fail newError("backup: too short to contain a salt")
+  }
+  let salt = blob[0:kdfSaltLen]
+  let key = deriveKey(passphrase, salt)
+  return restoreDrafts(blob[kdfSaltLen:len(blob)], key)?
+}
+```
+
+A wrong passphrase derives a different key, which `restoreDrafts` rejects
+the same way it rejects any other wrong key - through the AEAD tag, not a
+separate check this code has to get right.
+
+## Wiring it into main.bit
+
+`ink backup <passphrase> <path>` and `ink restore <passphrase> <path>` are
+the last two commands in `main.bit`'s dispatch:
+
+```text
+fn cmdBackup(store: Store, passphrase: string, path: string): ()! {
+  let blob = backupWithPassphrase(store.list()?, passphrase)?
+  writeFile(path, string(blob))?
+  println("backed up to ${path}")
+}
+
+fn cmdRestore(store: Store, passphrase: string, path: string): ()! {
+  let drafts = restoreWithPassphrase([]byte(readFile(path)?), passphrase)?
+  for d of drafts {
+    store.save(d)?
+  }
+  println("restored ${len(drafts)} draft(s) from ${path}")
+}
+```
+
+Both take the passphrase as an argument here for one command to smoke-test
+end to end; typing it directly still lands in your shell's history, exactly
+the problem the passphrase-over-raw-key choice does not solve by itself -
+prompting for it without echoing is a real deployment's job, outside what
+this book covers.
+
 ## Sharp edges
 
 - `newGcm` accepts a 16- or 32-byte key only, and `seal`/`open` need a
@@ -293,10 +368,12 @@ a backup has already left your hands unencrypted.
 ## What you built
 
 Inkwell now backs up every draft into one encrypted file, checks it for
-corruption before decrypting, and restores it back into `Draft` values. You
-used `crc32c` for a cheap integrity check, AES-256-GCM for confidentiality
-and authenticity together, and `gzip` for a separate, compressed cold
-export.
+corruption before decrypting, and restores it back into `Draft` values -
+under a passphrase, never a raw key on the command line. You used `crc32c`
+for a cheap integrity check, AES-256-GCM for confidentiality and
+authenticity together, `argon2id` to turn a passphrase into a key, and
+`gzip` for a separate, compressed cold export. Part 1 through Part 3 is
+done: `ink` now has every command this book set out to give it.
 
 Next: [Part 4, Inkwell goes online](../../pkg/web/guides/01-first-endpoint.md),
 where Inkwell's drafts become articles served over HTTP.

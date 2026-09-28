@@ -167,19 +167,32 @@ export fn importCsv(text: string): []Draft! {
 has no notion of a header row, so skipping it is `importCsv`'s job, not the
 parser's.
 
-## Using it
+## Wiring it into main.bit
 
-```bit
-fn roundTrip(drafts: []Draft): []Draft! {
-  let json = exportJson(drafts)
-  return importJson(json)?
+`ink export <path>` and `ink import <path>` are two more cases in
+`main.bit`'s dispatch, next to `new`/`list`/`search`:
+
+```text
+fn cmdExport(path: string): ()! {
+  let drafts = listDrafts()?
+  writeFile(path, exportJson(drafts))?
+  println("exported ${len(drafts)} draft(s) to ${path}")
+}
+
+fn cmdImport(path: string): ()! {
+  let drafts = importJson(readFile(path)?)?
+  for d of drafts {
+    saveDraft(d)?
+  }
+  println("imported ${len(drafts)} draft(s) from ${path}")
 }
 ```
 
-A real `ink export drafts.json` command runs `exportJson` over
-`listDrafts()` and writes the result with `std/fs`'s `writeFile`; `ink
-import drafts.json` reads the file and calls `saveDraft` for each row
-`importJson`/`importCsv` hands back.
+`cmdExport` runs `exportJson` over `listDrafts()` and writes the result with
+`std/fs`'s `writeFile`; `cmdImport` reads the file and calls `saveDraft` for
+each row `importJson` hands back - the same `listDrafts`/`saveDraft` chapter
+2 wrote. [Chapter 10](/book/10-a-real-database) replaces both calls with a
+`Store`, once drafts can also live in a database.
 
 ## Sharp edges
 

@@ -97,18 +97,40 @@ converts the stored unix seconds into the nanoseconds-since-epoch
 and `format` renders the LDML pattern `"d MMMM yyyy 'at' HH:mm"` against the
 result.
 
-## Using it
+## Wiring it into main.bit
 
-```bit
-fn describe(d: Draft, wordsPerMinute: int, z: Zone): string! {
-  let minutes = readingMinutes(d.body, wordsPerMinute)
-  return "${minutes} min read, updated ${updatedAt(d, z)?}"
+`cmdList` (chapter 2) grows one line, calling both functions above with
+`settings.wordsPerMinute` from [chapter 7](/book/07-settings-file) and
+`localZone()`:
+
+```text
+fn cmdList(): ()! {
+  let drafts = listDrafts()?
+  let z = localZone()
+  for d of drafts {
+    let minutes = readingMinutes(d.body, settings.wordsPerMinute)
+    let when = updatedAt(d, z)?
+    println("${d.id}  ${d.statusLabel()}  ${d.title}  (${minutes} min read, updated ${when})")
+  }
 }
 ```
 
-`ink list` calls this once per draft, with `settings.wordsPerMinute` from
-[chapter 7](/book/07-settings-file) and `localZone()`, so the listing reads "4 min read, updated 1
-September 2026 at 09:30" instead of a raw integer.
+so the listing reads "4 min read, updated 1 September 2026 at 09:30"
+instead of a raw integer. A new command, `ink stats`, reports the same two
+numbers summed over every draft instead of one at a time:
+
+```text
+fn cmdStats(): ()! {
+  let drafts = listDrafts()?
+  let words = 0
+  let minutes = 0
+  for d of drafts {
+    words = words + wordCount(d.body)
+    minutes = minutes + readingMinutes(d.body, settings.wordsPerMinute)
+  }
+  println("${len(drafts)} draft(s), ${words} word(s), ${minutes} minute(s) total reading time")
+}
+```
 
 ## Sharp edges
 

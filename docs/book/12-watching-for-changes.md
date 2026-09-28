@@ -197,6 +197,39 @@ fn main() {
 }
 ```
 
+## Wiring it into main.bit
+
+`ink watch` starts `watchLoop` on a green thread, hands `stopOnSignal` the
+`stop` channel so Ctrl-C reaches it, then blocks reading `changes` until
+`watchLoop` closes it:
+
+```text
+fn stopOnSignal(stop: chan<bool>) {
+  waitForSignal([Signal.Term, Signal.Int])
+  stop <- true
+}
+
+fn cmdWatch(store: Store): ()! {
+  let stop = chan<bool>(1)
+  let changes = chan<string>(8)
+  let loadAll = () => {
+    return store.list() catch []Draft(0)
+  }
+  spawn watchLoop(loadAll, 2_000_000_000, stop, changes)
+  spawn stopOnSignal(stop)
+  for id of changes {
+    println("changed: ${id}")
+  }
+}
+```
+
+`stopOnSignal` is its own named function - `spawn` needs a call expression,
+not a closure. `loadAll` is a closure over `store`, an arrow function whose
+body reads the variable from the enclosing `cmdWatch` (see
+[Functions](/language/functions) for arrow function syntax); `catch
+[]Draft(0)` turns `store.list()`'s failure into "nothing changed" for this
+one poll, since `watchLoop`'s `loadAll` parameter cannot itself fail.
+
 ## Sharp edges
 
 - `select` picks uniformly at random among every case that is ready, not the

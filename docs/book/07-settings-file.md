@@ -128,20 +128,24 @@ A settings file with no `[ink]` table at all is not an error - a brand new
 `ink` install has no `ink.toml`, and Inkwell should still run with sane
 defaults rather than refuse to start.
 
-## Using it
+## Wiring it into main.bit
+
+`main.bit` loads `Settings` once, at startup, before it does anything else -
+this is the real `docs/book/ink/main.bit`'s `currentSettings`:
 
 ```bit
-fn main(): ()! {
-  let settings = loadSettings("ink.toml") catch _ {
-    Settings{ draftsDir = "~/.ink/drafts", wordsPerMinute = 200 }
+fn currentSettings(): Settings {
+  return loadSettings("ink.toml") catch _ {
+    Settings{ draftsDir = "~/.ink/drafts", wordsPerMinute = 200, databaseUrl = "" }
   }
-  print("drafts live in ${settings.draftsDir}\n")
 }
 ```
 
 A missing `ink.toml` file itself is `readFile`'s own error, not one this
-chapter adds - `main` treats "no file" the same as "file with no `[ink]`
-table": fall back to the built-in defaults.
+chapter adds - `currentSettings` treats "no file" the same as "file with no
+`[ink]` table": fall back to the built-in defaults. `databaseUrl` is not an
+`ink.toml` key; [chapter 10](/book/10-a-real-database) explains where it
+comes from and what it selects.
 
 ## Sharp edges
 
