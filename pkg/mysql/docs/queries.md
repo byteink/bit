@@ -83,3 +83,9 @@ send `COMMIT`/`ROLLBACK` on that same connection. Isolation levels are
 A bound statement that would exceed 16,777,215 bytes on the wire - the
 protocol's multi-packet payload form - fails naming its size rather than being
 split across packets or silently truncated.
+
+## Where to go next
+
+[Types](types.md) for reading a result's columns as money, timestamps and
+MariaDB's own types, and [Errors](errors.md) for matching a server error
+by code.

@@ -59,9 +59,8 @@ times, is nine levels of nine-way nesting - the last level alone stands for
 9^9, or 387,420,489, materialized nodes from well under a kilobyte of
 source. That shape is the "billion laughs" attack: a tiny YAML document
 that expands to gigabytes in memory the instant something reads it. This
-package bounds every parse against a fixed budget (`pkg/yaml/value.bit`)
-rather than trusting the document to be small just because it looks small
-on disk:
+package bounds every parse against a fixed budget rather than trusting the
+document to be small just because it looks small on disk:
 
 * `maxDepth: 128` - nesting levels a document's mappings and sequences may
   reach, combined. Real documents rarely exceed 20-30 levels.

@@ -47,3 +47,8 @@ A connection to either, with no `ssl-mode` set, is encrypted and unverified -
 the one-rung-down case. Pinning `ssl-mode=VERIFY_CA` or `VERIFY_IDENTITY`
 against a stock image fails; that failure is the ladder working as designed,
 not a bug in either server or this driver.
+
+## Where to go next
+
+[TLS](tls.md) for the full `ssl-mode` ladder, and [Authentication](authentication.md)
+for the plugin MariaDB adds over MySQL.

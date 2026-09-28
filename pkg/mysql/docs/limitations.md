@@ -21,3 +21,9 @@ What this driver does not do yet, and where each gap is tracked.
   `VERIFY_CA` and `VERIFY_IDENTITY` need a certificate chain your trust store
   can build, which is a server you configured yourself. See
   [MySQL and MariaDB](servers.md).
+
+## Where to go next
+
+[Connecting](connecting.md) is where this driver starts; each limitation
+above is covered in full on its own chapter ([TLS](tls.md),
+[Queries](queries.md)).

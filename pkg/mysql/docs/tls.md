@@ -53,3 +53,9 @@ Every rung below `VERIFY_IDENTITY` prints one line to stderr, **once per
 pool**, never once per connection - naming the rung and what it does not
 check. Two pools in one program each warn once independently; `adapter()`
 returns a fresh value per call for exactly this reason.
+
+## Where to go next
+
+[Authentication](authentication.md) covers the other once-per-pool
+warning, for a weak authentication plugin. [MySQL and MariaDB](servers.md)
+names which stock images verify against this ladder.

@@ -99,8 +99,8 @@ fn main(): ()! {
   common subsequence of two keys' values (or just its length).
 
 `r.counter(key).incrByFloat(delta): f64` (`INCRBYFLOAT`) lives on the
-counter handle, not here - see the counter reference in `commands.md`'s
-neighbouring pages; it reads as "grow this counter" on the same key
+counter handle, not here - see [Commands](commands.md) for the rest of the
+counter surface; it reads as "grow this counter" on the same key
 `incr`/`incrBy` already use.
 
 ## `r.keys()`: operating across many keys
@@ -181,17 +181,16 @@ ever resolves one.
   seconds. `ttl == -1` means `KEEPTTL`, `ttl == 0` (the default) sends
   neither flag, clearing any TTL the key already had, matching plain
   `SET`'s own behavior.
-- `copy`'s `db` has no default (SPEC S10.3 restricts a parameter default to
-  a literal token, and `-1` is a unary-minus expression, not one) - pass
-  `-1` explicitly for "same database".
+- `copy`'s `db` has no default (a parameter default must be a literal
+  token, and `-1` is a unary-minus expression, not one) - pass `-1`
+  explicitly for "same database".
 - `getRange`/`strLen`/`lcs` never fail on a missing key; they return `""`,
   `0` and `""` respectively, matching Redis's own behavior for an absent
   string.
 - A named-argument call must still supply every parameter, defaulted ones
-  included (SPEC S12.11/S10.3's default-omission rule is described for a
-  purely positional call): `r.set(k, v, ttl = 60 * Second, ifAbsent =
-  true)` alone does not compile today - add `ifExists = false` too, or
-  drop to a fully positional call.
+  included - defaults only apply to a purely positional call: `r.set(k, v,
+  ttl = 60 * Second, ifAbsent = true)` alone does not compile today - add
+  `ifExists = false` too, or drop to a fully positional call.
 
 ## Next
 

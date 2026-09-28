@@ -18,12 +18,11 @@ rather than silently accepting or silently dropping part of the document.
 ## The corpus
 
 Conformance is measured against the upstream
-[yaml-test-suite](https://github.com/yaml/yaml-test-suite), vendored at
-`_tests_/corpus/yaml-test-suite/` and pinned to one commit (recorded, with
-the retrieval date, in that directory's own `README.md`). It is not
-hand-written: a hand-rolled set of "YAML I thought of" cases proves
-nothing about the spec's actual edge cases, which is the entire reason an
-independent, third-party corpus exists.
+[yaml-test-suite](https://github.com/yaml/yaml-test-suite), vendored in
+this package and pinned to one commit. It is not hand-written: a
+hand-rolled set of "YAML I thought of" cases proves nothing about the
+spec's actual edge cases, which is the entire reason an independent,
+third-party corpus exists.
 
 Each case is a directory holding `in.yaml` plus either `in.json` (the
 expected value, for a case that must parse) or an `error` marker file (a
@@ -35,9 +34,9 @@ a parser that accepts too much, and it is the more valuable half.
 
 ## How it runs
 
-`pkg/yaml/corpus.test.bit` is a normal package test, picked up by
-`./make test-package-yaml` like any other `*.test.bit` file in this
-module. Nothing about it needs separate registration. It reports one line:
+The corpus is run by this package's own test suite, picked up by
+`./make test-package-yaml` like any other test in this module. Nothing
+about it needs separate registration. It reports one line:
 
 ```text
 yaml-test-suite: parse 293/308, error 86/94, excluded 23/402
@@ -81,7 +80,7 @@ are the same YAML value. The `RR7F` fixture proves upstream's own `in.json`
 does not preserve source order either - its YAML writes `a` before the
 explicit `? d` / `: 23` pair, and its `in.json` lists `d` before `a`. A
 comparison that required the parsed order to match `in.json`'s order would
-fail a case that is actually correct, so `pkg/yaml/corpus.test.bit`
+fail a case that is actually correct, so this package's own test suite
 compares a mapping by key lookup rather than position, and a sequence
 positionally - sequence order IS significant in YAML, mapping order is
 not. [Parsing](parsing.md) covers why `YamlEntry` still preserves the

@@ -199,12 +199,12 @@ budget is [Anchors](anchors.md)'s subject) is checked before a single byte
 is scanned, so an oversized input fails here rather than returning a token
 stream part way through.
 
-Flow parsing (`yamlParseFlow` in `flow.bit`) is internal, not a second entry
-point: it takes a `Scanner`, and `Scanner` is deliberately unexported (only
-this package's own `scan` and parser drive it, mirroring
-`stdlib/json/lex.bit`'s unexported `Lexer`). Flow collections (`[a, b]`,
-`{a: b}`) work correctly through `yamlParse` itself, which is the only
-documented entry point for a caller outside this package.
+Flow parsing (`yamlParseFlow`) is internal, not a second entry point: it
+takes a `Scanner`, and `Scanner` is deliberately unexported (only this
+package's own `scan` and parser drive it, the same way `std/json` keeps
+its own lexer unexported). Flow collections (`[a, b]`, `{a: b}`) work
+correctly through `yamlParse` itself, which is the only documented entry
+point for a caller outside this package.
 
 Next: [Types](types.md), for the implicit typing rules this package pins
 and the Norway problem they exist to fix.

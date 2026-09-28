@@ -69,8 +69,7 @@ changed:
   ```
 
 Every one of these is a real rejection this package's own test suite
-exercises with the exact source text and the exact expected offset - see
-`pkg/toml/parse.test.bit` if you want the precise inputs.
+exercises with the exact source text and the exact expected offset.
 
 Next: [Conformance](conformance.md), for how "TOML 1.0.0" is actually
 verified rather than just claimed.
