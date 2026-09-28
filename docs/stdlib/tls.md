@@ -141,161 +141,860 @@ just against a smaller trust set.
 - [pkg/web](/packages/web) to build a full web application; it configures TLS
   for you.
 
-## Reference
+## Connecting and serving
 
-Every exported name in `std/tls`, grouped by area. `dial`, `listen`,
-`client`, `TlsConfig`, `TlsConn`, and `TlsListener` are the path almost every
-program needs; the rest is the TLS 1.3 engine underneath them, exported for
-building custom tooling (a test harness, a protocol embedding TLS
-differently, like QUIC) directly against the handshake.
+`dial`, `listen`, `client`, `TlsConfig`, `TlsConn`, and `TlsListener` are the
+path almost every program needs; the rest of this reference is the TLS 1.3
+engine underneath them, exported for building custom tooling directly against
+the handshake.
 
-### Connecting and serving
+### `TlsConfig`
 
-| Symbol | What it is |
-| --- | --- |
-| `TlsConfig` | `roots`, `insecureSkipVerify`, `alpn`, `serverName`, `minVersion`, `nowUnix`, `certPem`, `keyPem`: shared by `dial` and `listen`. |
-| `newTlsConfig(roots: TrustStore): TlsConfig` | A secure-by-default client config: verification on, TLS 1.3. |
-| `emptyTrustStore(): TrustStore` | A trust store with no roots, for a server config (which never verifies a peer). |
-| `dial(host: string, port: int, config: TlsConfig): TlsConn!` | Open a TCP connection to `host:port` and run the client handshake. |
-| `dialDeadline(host: string, port: int, config: TlsConfig, deadlineNs: int): TlsConn!` | `dial` with a deadline on the whole connect-plus-handshake. |
-| `client(conn: NetConn, host: string, config: TlsConfig): TlsConn!` | Run the client handshake over an already-open `std/net` connection. |
-| `TlsConn` | An established connection. |
-| `TlsConn.read(n: int): []byte!`, `TlsConn.write(b: []byte): ()!` | Read up to `n` plaintext bytes; write plaintext that leaves encrypted. |
-| `TlsConn.close()`, `TlsConn.shutdown()` | Close the connection; `shutdown` also sends a TLS close-notify alert. |
-| `TlsConn.handshake(): ()!` | Run the handshake now if it has not run yet (a no-op after `dial`, needed after `accept`). |
-| `TlsConn.alpnProtocol(): string`, `TlsConn.cipherSuiteId(): int` | The negotiated ALPN protocol and cipher-suite code point. |
-| `TlsConn.peerCertificates(): [][]byte` | The peer's certificate chain as raw DER, end-entity first. |
-| `TlsConn.peerIp(): string!` | The peer's IPv4 address, forwarded from the underlying socket. |
-| `TlsConn.setDeadline(deadlineNs: int)`, `TlsConn.deadlineNs(): int`, `TlsConn.readTimedOut(): bool` | Per-connection read/write deadline. |
-| `TlsListener`, `listen(host: string, port: int, config: TlsConfig): TlsListener!` | A listening socket; `config.certPem`/`keyPem` are required. |
-| `TlsListener.accept(): TlsConn!` | Accept the next TCP connection. The handshake runs lazily; see [Sharp edges](#sharp-edges). |
-| `TlsListener.port(): int!`, `TlsListener.isClosed(): bool`, `TlsListener.close()` | Inspect and close the listener. |
-| `tlsVersion13: int` | The TLS 1.3 wire version code point, the only version this module speaks. |
+`roots`, `insecureSkipVerify`, `alpn`, `serverName`, `minVersion`, `nowUnix`, `certPem`, `keyPem`: shared by `dial` and `listen`.
 
-### Cipher suites
+### `newTlsConfig(roots: TrustStore): TlsConfig`
 
-| Symbol | What it is |
-| --- | --- |
-| `CipherSuite` | A suite descriptor: id, name, key/IV/tag/hash lengths. |
-| `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256` | The three mandatory TLS 1.3 suite code points. |
-| `tlsSuiteById(id: int): CipherSuite!` | Look up a suite by its wire code point. |
-| `tlsSuitePreference(): []CipherSuite` | The suites this module offers, strongest first. |
-| `tlsSuiteNewAead(suite: CipherSuite, key: []byte): Aead!`, `tlsSuiteNewHash(suite: CipherSuite): Hash` | Build the live cipher or hash for a suite. |
+A secure-by-default client config: verification on, TLS 1.3.
 
-### Key exchange groups
+### `emptyTrustStore(): TrustStore`
 
-| Symbol | What it is |
-| --- | --- |
-| `TlsGroup` | `X25519`, `Secp256r1`, `Secp384r1`, `X25519MLKEM768` (the post-quantum hybrid, offered first by default). |
-| `GroupKeypair`, `GroupResponse` | An initiator's key-exchange state and a responder's answer to it. |
-| `tlsGroupGenerate(g: TlsGroup): GroupKeypair` | Generate an initiator's ephemeral key share for `g`. |
-| `tlsGroupComputeShared(g: TlsGroup, priv: []byte, peerKeyShare: []byte): []byte!` | An initiator's shared secret once the peer's share arrives. |
-| `tlsGroupResponder(g: TlsGroup, peerKeyShare: []byte): GroupResponse!` | A responder's key share and shared secret in one call. |
-| `tlsGroupCodepoint(g: TlsGroup): u64`, `tlsGroupFromCodepoint(cp: u64): TlsGroup!` | Convert to and from the IANA wire code point. |
+A trust store with no roots, for a server config, which never verifies a peer.
 
-### Key schedule (RFC 8446, key schedule section)
+### `dial(host: string, port: int, config: TlsConfig): TlsConn!`
 
-The HKDF-based secret derivation the handshake runs internally, exported for
-building a compatible implementation of your own. A normal client or server
-never calls these.
+Opens a TCP connection to `host:port` and runs the client handshake.
 
-| Symbol | What it is |
-| --- | --- |
-| `TranscriptHash`, `newTranscript(newHash: () => Hash): TranscriptHash` | A running hash over every handshake message seen so far. |
-| `TranscriptHash.update(data: []byte)`, `TranscriptHash.sum(): []byte` | Absorb a message; read the transcript hash so far. |
-| `hkdfExpandLabel`, `deriveSecret` | The two HKDF-Expand-Label building blocks every secret below is derived with. |
-| `earlySecret`, `handshakeSecret`, `masterSecret` | The three key-schedule stages, in order. |
-| `clientHandshakeTrafficSecret`, `serverHandshakeTrafficSecret`, `clientApplicationTrafficSecret`, `serverApplicationTrafficSecret`, `exporterMasterSecret`, `resumptionMasterSecret` | The traffic and exporter secrets derived from the handshake and master secrets. |
-| `trafficKey`, `trafficIV` | The AEAD key and IV derived from a traffic secret. |
-| `finishedKey`, `finishedMac` | The Finished message MAC. |
-| `binderKey`, `clientEarlyTrafficSecret`, `earlyExporterMasterSecret`, `resumptionPsk` | The 0-RTT / PSK resumption secrets. |
+### `dialDeadline(host: string, port: int, config: TlsConfig, deadlineNs: int): TlsConn!`
 
-### Handshake messages
+Like `dial`, with a deadline on the whole connect-plus-handshake.
 
-The wire types and codecs for every TLS 1.3 handshake message, and the
-extensions carried inside them. Exported for tooling that parses or
-generates raw handshake traffic; `dial`/`listen` already speak this wire
-format for you.
+### `client(conn: Conn, host: string, config: TlsConfig): TlsConn!`
 
-| Symbol | What it is |
-| --- | --- |
-| `handshakeType(msg: []byte): int!` | The handshake message type byte of an encoded message. |
-| `ClientHello`, `encodeClientHello`, `parseClientHello` | The ClientHello message and its codec. |
-| `ServerHello`, `encodeServerHello`, `parseServerHello`, `isHelloRetryRequest` | The ServerHello message, its codec, and whether it is a HelloRetryRequest. |
-| `EncryptedExtensions`, `encodeEncryptedExtensions`, `parseEncryptedExtensions` | The EncryptedExtensions message and its codec. |
-| `CertificateEntry`, `Certificate`, `encodeCertificate`, `parseCertificate` | The Certificate message (a chain of DER entries) and its codec. |
-| `CertificateRequest`, `encodeCertificateRequest`, `parseCertificateRequest` | The (unused by this module's client) CertificateRequest message and its codec. |
-| `CertificateVerify`, `encodeCertificateVerify`, `parseCertificateVerify` | The CertificateVerify message and its codec. |
-| `Finished`, `encodeFinished`, `parseFinished` | The Finished message and its codec. |
-| `NewSessionTicket`, `encodeNewSessionTicket`, `parseNewSessionTicket` | The session-resumption ticket message and its codec. |
-| `Extension`, `KeyShareEntry` | A generic extension, and one entry of a key_share extension. |
-| `extServerName`, `parseServerName` | The SNI extension. |
-| `extALPN`, `parseALPN` | The ALPN extension. |
-| `extSupportedGroups`, `parseSupportedGroups` | The supported_groups extension. |
-| `extSignatureAlgorithms`, `parseSignatureAlgorithms` | The signature_algorithms extension. |
-| `extSupportedVersionsClient`, `parseSupportedVersionsClient`, `extSupportedVersionsServer`, `parseSupportedVersionsServer` | The supported_versions extension, client and server shapes. |
-| `extKeyShareClient`, `parseKeyShareClient`, `extKeyShareServer`, `parseKeyShareServer` | The key_share extension, client and server shapes. |
+Runs the client handshake over an already-open `std/net` connection.
 
-### Record layer
+### `TlsConn`
 
-| Symbol | What it is |
-| --- | --- |
-| `recordAlert`, `recordHandshake`, `recordApplicationData` | The three TLS record content-type codes. |
-| `RecordKeys`, `newRecordKeys(suite: CipherSuite, secret: []byte): RecordKeys!` | The AEAD, key, and IV for one direction of record protection. |
-| `RecordKeys.seal(plaintext: []byte, contentType: int): []byte!`, `RecordKeys.open(record: []byte): RecordPlaintext!` | Protect and recover one record, advancing the sequence number. |
-| `RecordKeys.keyUpdate(): ()!` | Advance to the next traffic key (RFC 8446's key update). |
-| `RecordKeys.sequence(): int`, `RecordKeys.nonce(): []byte` | The current sequence number and the AEAD nonce it produces. |
-| `RecordPlaintext` | One decrypted record: `content` and its `contentType`. |
+An established connection.
 
-### Session resumption (0-RTT, RFC 8446)
+### `TlsConn.read(n: int): []byte!`
 
-| Symbol | What it is |
-| --- | --- |
-| `PskIdentity` | One pre_shared_key entry offered by a resuming client. |
-| `TlsTicketStore`, `newTicketStore(): TlsTicketStore` | A server-side store of issued tickets, keyed by ticket bytes. |
-| `SessionTicket`, `newSessionTicket(nst: NewSessionTicket, conn: TlsClientConn): SessionTicket` | A client-side ticket saved after a connection closes. |
-| `tlsClientStartResume(...)` | Start a client handshake offering a saved `SessionTicket`. |
+Reads up to `n` plaintext bytes.
 
-### Low-level handshake drivers
+### `TlsConn.write(b: []byte): ()!`
 
-The sans-I/O state machines `dial`/`listen`/`TlsConn` are built on: they
-consume and produce handshake bytes without touching a socket. Reach for
-these directly only when embedding the handshake in a transport this module
-does not already drive (for example over QUIC).
+Writes plaintext; it leaves the connection encrypted.
 
-| Symbol | What it is |
-| --- | --- |
-| `TlsClientHandshake`, `tlsClientStart(config: TlsClientConfig): TlsClientHandshake!`, `tlsClientStartExts` | The client-side state machine and its starting points. |
-| `TlsClientHandshake.clientHelloMessage(): []byte` | The encoded ClientHello to send first. |
-| `TlsClientHandshake.processServerFlight(flight: []byte): TlsClientStep!` | Feed the server's response flight; returns a retry step or the completed connection. |
-| `TlsClientHandshake.processServerHelloMessage`, `.clientReadHandshake`, `.peerEncryptedExtensions()` | Lower-level steps `processServerFlight` composes, for driving the handshake message by message. |
-| `TlsClientHandshake.clientHandshakeSecret()`, `.serverHandshakeSecret()`, `.clientApplicationSecret()`, `.serverApplicationSecret()`, `.exporterSecret()`, `.pskWasAccepted(): bool` | The handshake's derived secrets, once it has completed. |
-| `TlsClientConfig`, `newTrustStore(rootsPem: string): TrustStore!` | The lower-level client configuration and a PEM-to-trust-store helper. |
-| `TlsClientStep`, `TlsClientConn` | One step of the client handshake, and the completed connection state. |
-| `TlsClientConn.sealApp(plaintext: []byte): []byte!`, `.openApp(record: []byte): RecordPlaintext!` | Protect and recover one application-data record. |
-| `TlsClientConn.resumptionSecret()`, `.exporterSecret()` | The connection's resumption and exporter secrets, for issuing a `SessionTicket` or deriving external key material. |
-| `TlsServerHandshake`, `tlsServerStart(config: TlsServerConfig): TlsServerHandshake!`, `tlsServerStartExts` | The server-side state machine and its starting points. |
-| `TlsServerHandshake.processClientHello(flight: []byte): TlsServerStep!` | Feed the ClientHello flight; returns a HelloRetryRequest step or the ServerHello-plus-auth flight to send. |
-| `TlsServerHandshake.processClientFinished(flight: []byte): TlsServerConn!` | Feed the client's Finished flight, completing the handshake. |
-| `TlsServerHandshake.processClientHelloMessage`, `.processClientFinishedMessage` | Lower-level, message-at-a-time equivalents of the two calls above, used for QUIC. |
-| `TlsServerHandshake.pskWasAccepted()`, `.earlyDataWasAccepted()`, `.earlyDataReceived(): []byte` | Whether resumption or 0-RTT early data was accepted, and the early data itself. |
-| `TlsServerHandshake.clientHandshakeSecret()`, `.serverHandshakeSecret()`, `.clientApplicationSecret()`, `.serverApplicationSecret()`, `.exporterSecret()` | The handshake's derived secrets, once it has completed. |
-| `TlsServerConfig`, `newTlsServerConfig(certChainPem: string, keyPem: string, alpn: []string): TlsServerConfig!` | The lower-level server configuration and its PEM-loading constructor. |
-| `TlsServerStep`, `TlsServerConn` | One step of the server handshake, and the completed connection state. |
-| `TlsServerConn.sealApp(plaintext: []byte): []byte!`, `.openApp(record: []byte): RecordPlaintext!` | Protect and recover one application-data record. |
-| `TlsServerConn.issueTicket(): []byte!` | Issue a new session ticket for resumption on a later connection. |
-| `TlsServerConn.resumptionSecret()`, `.exporterSecret()` | The connection's resumption and exporter secrets. |
-| `TlsServerQuicFlight` | A server handshake flight shaped for delivery over QUIC rather than TLS records. |
+### `TlsConn.close()`
 
-### Constants
+Closes the connection.
 
-| Symbol | What it is |
-| --- | --- |
-| `versionTls12`, `versionTls13` | The TLS 1.2 and 1.3 wire version code points (1.2 is recognized only to reject it). |
-| `hsClientHello`, `hsServerHello`, `hsNewSessionTicket`, `hsEncryptedExtensions`, `hsCertificate`, `hsCertificateRequest`, `hsCertificateVerify`, `hsFinished` | The handshake message type bytes. |
-| `extTypeServerName`, `extTypeSupportedGroups`, `extTypeSignatureAlgorithms`, `extTypeALPN`, `extTypeSupportedVersions`, `extTypeKeyShare` | The extension type codes the `ext*`/`parse*` functions above encode and read. |
-| `sigEcdsaSecp256r1Sha256`, `sigEcdsaSecp384r1Sha384`, `sigRsaPssRsaeSha256`, `sigRsaPssRsaeSha384`, `sigRsaPssRsaeSha512`, `sigEd25519` | The signature_algorithms code points this module offers and accepts. |
-| `groupSecp256r1`, `groupSecp384r1`, `groupX25519`, `groupX448` | The supported_groups wire code points for the classical curves. |
+### `TlsConn.shutdown()`
+
+Closes the connection and also sends a TLS close-notify alert first.
+
+### `TlsConn.handshake(): ()!`
+
+Runs the handshake now if it has not run yet. A no-op after `dial`; needed after `accept` if you want `alpnProtocol`/`peerCertificates` before the first read or write.
+
+### `TlsConn.alpnProtocol(): string`
+
+The ALPN protocol the two sides negotiated.
+
+### `TlsConn.cipherSuiteId(): int`
+
+The negotiated cipher-suite code point.
+
+### `TlsConn.peerCertificates(): [][]byte`
+
+The peer's certificate chain as raw DER, end-entity certificate first.
+
+### `TlsConn.peerIp(): string!`
+
+The peer's IPv4 address, forwarded from the underlying socket.
+
+### `TlsConn.setDeadline(deadlineNs: int)`
+
+Sets a read/write deadline on this connection.
+
+### `TlsConn.deadlineNs(): int`
+
+The current read/write deadline.
+
+### `TlsConn.readTimedOut(): bool`
+
+Whether the last read stopped because the deadline passed.
+
+### `TlsListener`
+
+A listening socket. `config.certPem`/`keyPem` are required to create one.
+
+### `listen(host: string, port: int, config: TlsConfig): TlsListener!`
+
+Binds a listening socket on `host:port` that runs the server handshake on every connection it accepts.
+
+### `TlsListener.accept(): TlsConn!`
+
+Accepts the next TCP connection. The handshake runs lazily; see [Sharp edges](#sharp-edges).
+
+### `TlsListener.port(): int!`
+
+The port this listener is bound to.
+
+### `TlsListener.isClosed(): bool`
+
+Whether `close` has already run on this listener.
+
+### `TlsListener.close()`
+
+Closes the listener.
+
+### `tlsVersion13: int`
+
+The TLS 1.3 wire version code point, the only version this module speaks.
+
+## Cipher suites
+
+### `CipherSuite`
+
+A suite descriptor: id, name, key/IV/tag/hash lengths.
+
+### `TLS_AES_128_GCM_SHA256: int`
+
+The three mandatory TLS 1.3 suite code points.
+
+### `TLS_AES_256_GCM_SHA384: int`
+
+The three mandatory TLS 1.3 suite code points.
+
+### `TLS_CHACHA20_POLY1305_SHA256: int`
+
+The three mandatory TLS 1.3 suite code points.
+
+### `tlsSuiteById(id: int): CipherSuite!`
+
+Look up a suite by its wire code point.
+
+### `tlsSuitePreference(): []CipherSuite`
+
+The suites this module offers, strongest first.
+
+### `tlsSuiteNewAead(suite: CipherSuite, key: []byte): Aead!`
+
+Build the live cipher or hash for a suite.
+
+### `tlsSuiteNewHash(suite: CipherSuite): Hash`
+
+Build the live cipher or hash for a suite.
+
+## Key exchange groups
+
+### `TlsGroup`
+
+`X25519`, `Secp256r1`, `Secp384r1`, `X25519MLKEM768` (the post-quantum hybrid, offered first by default).
+
+### `GroupKeypair`
+
+An initiator's key-exchange state and a responder's answer to it.
+
+### `GroupResponse`
+
+An initiator's key-exchange state and a responder's answer to it.
+
+### `tlsGroupGenerate(g: TlsGroup): GroupKeypair`
+
+Generate an initiator's ephemeral key share for `g`.
+
+### `tlsGroupComputeShared(g: TlsGroup, priv: []byte, peerKeyShare: []byte): []byte!`
+
+An initiator's shared secret once the peer's share arrives.
+
+### `tlsGroupResponder(g: TlsGroup, peerKeyShare: []byte): GroupResponse!`
+
+A responder's key share and shared secret in one call.
+
+### `tlsGroupCodepoint(g: TlsGroup): u64`
+
+Convert to and from the IANA wire code point.
+
+### `tlsGroupFromCodepoint(cp: u64): TlsGroup!`
+
+Convert to and from the IANA wire code point.
+
+## Key schedule
+
+### `TranscriptHash`
+
+A running hash over every handshake message seen so far.
+
+### `newTranscript(newHash: () => Hash): TranscriptHash`
+
+A running hash over every handshake message seen so far.
+
+### `TranscriptHash.update(data: []byte)`
+
+Absorb a message; read the transcript hash so far.
+
+### `TranscriptHash.sum(): []byte`
+
+Absorb a message; read the transcript hash so far.
+
+### `hkdfExpandLabel(newHash: () => Hash, secret: []byte, label: string, context: []byte, len: int): []byte`
+
+The two HKDF-Expand-Label building blocks every secret below is derived with.
+
+### `deriveSecret(newHash: () => Hash, secret: []byte, label: string, transcriptHash: []byte): []byte`
+
+The two HKDF-Expand-Label building blocks every secret below is derived with.
+
+### `earlySecret(newHash: () => Hash, psk: []byte): []byte`
+
+The three key-schedule stages, in order.
+
+### `handshakeSecret(newHash: () => Hash, early: []byte, ecdhe: []byte): []byte`
+
+The three key-schedule stages, in order.
+
+### `masterSecret(newHash: () => Hash, handshake: []byte): []byte`
+
+The three key-schedule stages, in order.
+
+### `clientHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte`
+
+The traffic and exporter secrets derived from the handshake and master secrets.
+
+### `serverHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte`
+
+The traffic and exporter secrets derived from the handshake and master secrets.
+
+### `clientApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+
+The traffic and exporter secrets derived from the handshake and master secrets.
+
+### `serverApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+
+The traffic and exporter secrets derived from the handshake and master secrets.
+
+### `exporterMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+
+The traffic and exporter secrets derived from the handshake and master secrets.
+
+### `resumptionMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+
+The traffic and exporter secrets derived from the handshake and master secrets.
+
+### `trafficKey(newHash: () => Hash, secret: []byte, keyLen: int): []byte`
+
+The AEAD key and IV derived from a traffic secret.
+
+### `trafficIV(newHash: () => Hash, secret: []byte, ivLen: int): []byte`
+
+The AEAD key and IV derived from a traffic secret.
+
+### `finishedKey(newHash: () => Hash, baseKey: []byte): []byte`
+
+The Finished message MAC.
+
+### `finishedMac(newHash: () => Hash, baseKey: []byte, transcriptHash: []byte): []byte`
+
+The Finished message MAC.
+
+### `binderKey(newHash: () => Hash, early: []byte): []byte`
+
+The 0-RTT / PSK resumption secrets.
+
+### `clientEarlyTrafficSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
+
+The 0-RTT / PSK resumption secrets.
+
+### `earlyExporterMasterSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
+
+The 0-RTT / PSK resumption secrets.
+
+### `resumptionPsk(newHash: () => Hash, resumptionMasterSecret: []byte, ticketNonce: []byte): []byte`
+
+The 0-RTT / PSK resumption secrets.
+
+## Handshake messages
+
+### `handshakeType(msg: []byte): int!`
+
+The handshake message type byte of an encoded message.
+
+### `ClientHello`
+
+The ClientHello message and its codec.
+
+### `encodeClientHello(ch: ClientHello): []byte`
+
+The ClientHello message and its codec.
+
+### `parseClientHello(msg: []byte): ClientHello!`
+
+The ClientHello message and its codec.
+
+### `ServerHello`
+
+The ServerHello message, its codec, and whether it is a HelloRetryRequest.
+
+### `encodeServerHello(sh: ServerHello): []byte`
+
+The ServerHello message, its codec, and whether it is a HelloRetryRequest.
+
+### `parseServerHello(msg: []byte): ServerHello!`
+
+The ServerHello message, its codec, and whether it is a HelloRetryRequest.
+
+### `isHelloRetryRequest(sh: ServerHello): bool`
+
+The ServerHello message, its codec, and whether it is a HelloRetryRequest.
+
+### `EncryptedExtensions`
+
+The EncryptedExtensions message and its codec.
+
+### `encodeEncryptedExtensions(ee: EncryptedExtensions): []byte`
+
+The EncryptedExtensions message and its codec.
+
+### `parseEncryptedExtensions(msg: []byte): EncryptedExtensions!`
+
+The EncryptedExtensions message and its codec.
+
+### `CertificateEntry`
+
+The Certificate message (a chain of DER entries) and its codec.
+
+### `Certificate`
+
+The Certificate message (a chain of DER entries) and its codec.
+
+### `encodeCertificate(c: Certificate): []byte`
+
+The Certificate message (a chain of DER entries) and its codec.
+
+### `parseCertificate(msg: []byte): Certificate!`
+
+The Certificate message (a chain of DER entries) and its codec.
+
+### `CertificateRequest`
+
+The (unused by this module's client) CertificateRequest message and its codec.
+
+### `encodeCertificateRequest(cr: CertificateRequest): []byte`
+
+The (unused by this module's client) CertificateRequest message and its codec.
+
+### `parseCertificateRequest(msg: []byte): CertificateRequest!`
+
+The (unused by this module's client) CertificateRequest message and its codec.
+
+### `CertificateVerify`
+
+The CertificateVerify message and its codec.
+
+### `encodeCertificateVerify(cv: CertificateVerify): []byte`
+
+The CertificateVerify message and its codec.
+
+### `parseCertificateVerify(msg: []byte): CertificateVerify!`
+
+The CertificateVerify message and its codec.
+
+### `Finished`
+
+The Finished message and its codec.
+
+### `encodeFinished(f: Finished): []byte`
+
+The Finished message and its codec.
+
+### `parseFinished(msg: []byte): Finished!`
+
+The Finished message and its codec.
+
+### `NewSessionTicket`
+
+The session-resumption ticket message and its codec.
+
+### `encodeNewSessionTicket(t: NewSessionTicket): []byte`
+
+The session-resumption ticket message and its codec.
+
+### `parseNewSessionTicket(msg: []byte): NewSessionTicket!`
+
+The session-resumption ticket message and its codec.
+
+### `Extension`
+
+A generic extension, and one entry of a key_share extension.
+
+### `KeyShareEntry`
+
+A generic extension, and one entry of a key_share extension.
+
+### `extServerName(host: string): Extension`
+
+The SNI extension.
+
+### `parseServerName(e: Extension): string!`
+
+The SNI extension.
+
+### `extALPN(protocols: []string): Extension`
+
+The ALPN extension.
+
+### `parseALPN(e: Extension): []string!`
+
+The ALPN extension.
+
+### `extSupportedGroups(groups: []int): Extension`
+
+The supported_groups extension.
+
+### `parseSupportedGroups(e: Extension): []int!`
+
+The supported_groups extension.
+
+### `extSignatureAlgorithms(schemes: []int): Extension`
+
+The signature_algorithms extension.
+
+### `parseSignatureAlgorithms(e: Extension): []int!`
+
+The signature_algorithms extension.
+
+### `extSupportedVersionsClient(versions: []int): Extension`
+
+The supported_versions extension, client and server shapes.
+
+### `parseSupportedVersionsClient(e: Extension): []int!`
+
+The supported_versions extension, client and server shapes.
+
+### `extSupportedVersionsServer(version: int): Extension`
+
+The supported_versions extension, client and server shapes.
+
+### `parseSupportedVersionsServer(e: Extension): int!`
+
+The supported_versions extension, client and server shapes.
+
+### `extKeyShareClient(entries: []KeyShareEntry): Extension`
+
+The key_share extension, client and server shapes.
+
+### `parseKeyShareClient(e: Extension): []KeyShareEntry!`
+
+The key_share extension, client and server shapes.
+
+### `extKeyShareServer(entry: KeyShareEntry): Extension`
+
+The key_share extension, client and server shapes.
+
+### `parseKeyShareServer(e: Extension): KeyShareEntry!`
+
+The key_share extension, client and server shapes.
+
+## Record layer
+
+### `recordAlert: int`
+
+The three TLS record content-type codes.
+
+### `recordHandshake: int`
+
+The three TLS record content-type codes.
+
+### `recordApplicationData: int`
+
+The three TLS record content-type codes.
+
+### `RecordKeys`
+
+The AEAD, key, and IV for one direction of record protection.
+
+### `newRecordKeys(suite: CipherSuite, secret: []byte): RecordKeys!`
+
+The AEAD, key, and IV for one direction of record protection.
+
+### `RecordKeys.seal(plaintext: []byte, contentType: int): []byte!`
+
+Protect and recover one record, advancing the sequence number.
+
+### `RecordKeys.open(record: []byte): RecordPlaintext!`
+
+Protect and recover one record, advancing the sequence number.
+
+### `RecordKeys.keyUpdate(): ()!`
+
+Advance to the next traffic key (RFC 8446's key update).
+
+### `RecordKeys.sequence(): int`
+
+The current sequence number and the AEAD nonce it produces.
+
+### `RecordKeys.nonce(): []byte`
+
+The current sequence number and the AEAD nonce it produces.
+
+### `RecordPlaintext`
+
+One decrypted record: `content` and its `contentType`.
+
+## Session resumption
+
+### `PskIdentity`
+
+One pre_shared_key entry offered by a resuming client.
+
+### `TlsTicketStore`
+
+A server-side store of issued tickets, keyed by ticket bytes.
+
+### `newTicketStore(): TlsTicketStore`
+
+A server-side store of issued tickets, keyed by ticket bytes.
+
+### `SessionTicket`
+
+A client-side ticket saved after a connection closes.
+
+### `newSessionTicket(nst: NewSessionTicket, conn: TlsClientConn): SessionTicket`
+
+A client-side ticket saved after a connection closes.
+
+### `tlsClientStartResume(config: TlsClientConfig, session: SessionTicket, earlyData: []byte): TlsClientHandshake!`
+
+Start a client handshake offering a saved `SessionTicket`.
+
+## Low-level handshake drivers
+
+### `TlsClientHandshake`
+
+The client-side state machine and its starting points.
+
+### `tlsClientStart(config: TlsClientConfig): TlsClientHandshake!`
+
+The client-side state machine and its starting points.
+
+### `tlsClientStartExts(config: TlsClientConfig, extraExts: []Extension): TlsClientHandshake!`
+
+The client-side state machine and its starting points.
+
+### `TlsClientHandshake.clientHelloMessage(): []byte`
+
+The encoded ClientHello to send first.
+
+### `TlsClientHandshake.processServerFlight(flight: []byte): TlsClientStep!`
+
+Feed the server's response flight; returns a retry step or the completed connection.
+
+### `TlsClientHandshake.processServerHelloMessage(shMsg: []byte): []byte!`
+
+Lower-level steps `processServerFlight` composes, for driving the handshake message by message.
+
+### `TlsClientHandshake.clientReadHandshake(stream: []byte): []byte!`
+
+Lower-level steps `processServerFlight` composes, for driving the handshake message by message.
+
+### `TlsClientHandshake.peerEncryptedExtensions(): []Extension`
+
+Lower-level steps `processServerFlight` composes, for driving the handshake message by message.
+
+### `TlsClientHandshake.clientHandshakeSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsClientHandshake.serverHandshakeSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsClientHandshake.clientApplicationSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsClientHandshake.serverApplicationSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsClientHandshake.exporterSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsClientHandshake.pskWasAccepted(): bool`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsClientConfig`
+
+The lower-level client configuration and a PEM-to-trust-store helper.
+
+### `newTrustStore(rootsPem: string): TrustStore!`
+
+The lower-level client configuration and a PEM-to-trust-store helper.
+
+### `TlsClientStep`
+
+One step of the client handshake, and the completed connection state.
+
+### `TlsClientConn`
+
+One step of the client handshake, and the completed connection state.
+
+### `TlsClientConn.sealApp(plaintext: []byte): []byte!`
+
+Protect and recover one application-data record.
+
+### `TlsClientConn.openApp(record: []byte): RecordPlaintext!`
+
+Protect and recover one application-data record.
+
+### `TlsClientConn.resumptionSecret(): []byte`
+
+The connection's resumption and exporter secrets, for issuing a `SessionTicket` or deriving external key material.
+
+### `TlsClientConn.exporterSecret(): []byte`
+
+The connection's resumption and exporter secrets, for issuing a `SessionTicket` or deriving external key material.
+
+### `TlsServerHandshake`
+
+The server-side state machine and its starting points.
+
+### `tlsServerStart(config: TlsServerConfig): TlsServerHandshake!`
+
+The server-side state machine and its starting points.
+
+### `tlsServerStartExts(config: TlsServerConfig, extraExts: []Extension): TlsServerHandshake!`
+
+The server-side state machine and its starting points.
+
+### `TlsServerHandshake.processClientHello(flight: []byte): TlsServerStep!`
+
+Feed the ClientHello flight; returns a HelloRetryRequest step or the ServerHello-plus-auth flight to send.
+
+### `TlsServerHandshake.processClientFinished(flight: []byte): TlsServerConn!`
+
+Feed the client's Finished flight, completing the handshake.
+
+### `TlsServerHandshake.processClientHelloMessage(chMsg: []byte): TlsServerQuicFlight!`
+
+Lower-level, message-at-a-time equivalents of the two calls above, used for QUIC.
+
+### `TlsServerHandshake.processClientFinishedMessage(finMsg: []byte): TlsServerConn!`
+
+Lower-level, message-at-a-time equivalents of the two calls above, used for QUIC.
+
+### `TlsServerHandshake.pskWasAccepted(): bool`
+
+Whether resumption or 0-RTT early data was accepted, and the early data itself.
+
+### `TlsServerHandshake.earlyDataWasAccepted(): bool`
+
+Whether resumption or 0-RTT early data was accepted, and the early data itself.
+
+### `TlsServerHandshake.earlyDataReceived(): []byte`
+
+Whether resumption or 0-RTT early data was accepted, and the early data itself.
+
+### `TlsServerHandshake.clientHandshakeSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsServerHandshake.serverHandshakeSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsServerHandshake.clientApplicationSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsServerHandshake.serverApplicationSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsServerHandshake.exporterSecret(): []byte`
+
+The handshake's derived secrets, once it has completed.
+
+### `TlsServerConfig`
+
+The lower-level server configuration and its PEM-loading constructor.
+
+### `newTlsServerConfig(certChainPem: string, keyPem: string, alpn: []string): TlsServerConfig!`
+
+The lower-level server configuration and its PEM-loading constructor.
+
+### `TlsServerStep`
+
+One step of the server handshake, and the completed connection state.
+
+### `TlsServerConn`
+
+One step of the server handshake, and the completed connection state.
+
+### `TlsServerConn.sealApp(plaintext: []byte): []byte!`
+
+Protect and recover one application-data record.
+
+### `TlsServerConn.openApp(record: []byte): RecordPlaintext!`
+
+Protect and recover one application-data record.
+
+### `TlsServerConn.issueTicket(): []byte!`
+
+Issue a new session ticket for resumption on a later connection.
+
+### `TlsServerConn.resumptionSecret(): []byte`
+
+The connection's resumption and exporter secrets.
+
+### `TlsServerConn.exporterSecret(): []byte`
+
+The connection's resumption and exporter secrets.
+
+### `TlsServerQuicFlight`
+
+A server handshake flight shaped for delivery over QUIC rather than TLS records.
+
+### `TlsClientHandshake.connection(): TlsClientConn!`
+
+The completed connection, once `processServerFlight` reports the handshake is done.
+
+### `TlsClientHandshake.cipherSuiteId(): int`
+
+The negotiated cipher-suite code point, once the handshake has reached that point.
+
+### `TlsClientConn.cipherSuiteId(): int`
+
+The negotiated cipher-suite code point.
+
+### `TlsClientConn.alpnProtocol(): string`
+
+The ALPN protocol the two sides agreed on.
+
+### `TlsClientConn.peerCertificates(): [][]byte`
+
+The peer's certificate chain as raw DER, end-entity certificate first.
+
+### `TlsServerHandshake.cipherSuiteId(): int`
+
+The negotiated cipher-suite code point, once the handshake has reached that point.
+
+### `TlsServerConn.cipherSuiteId(): int`
+
+The negotiated cipher-suite code point.
+
+### `TlsServerConn.alpnProtocol(): string`
+
+The ALPN protocol the two sides agreed on.
+
+## Constants
+
+### `versionTls12: int`
+
+The TLS 1.2 and 1.3 wire version code points (1.2 is recognized only to reject it).
+
+### `versionTls13: int`
+
+The TLS 1.2 and 1.3 wire version code points (1.2 is recognized only to reject it).
+
+### `hsClientHello: int`
+
+The handshake message type bytes.
+
+### `hsServerHello: int`
+
+The handshake message type bytes.
+
+### `hsNewSessionTicket: int`
+
+The handshake message type bytes.
+
+### `hsEncryptedExtensions: int`
+
+The handshake message type bytes.
+
+### `hsCertificate: int`
+
+The handshake message type bytes.
+
+### `hsCertificateRequest: int`
+
+The handshake message type bytes.
+
+### `hsCertificateVerify: int`
+
+The handshake message type bytes.
+
+### `hsFinished: int`
+
+The handshake message type bytes.
+
+### `extTypeServerName: int`
+
+The extension type codes the `ext*`/`parse*` functions above encode and read.
+
+### `extTypeSupportedGroups: int`
+
+The extension type codes the `ext*`/`parse*` functions above encode and read.
+
+### `extTypeSignatureAlgorithms: int`
+
+The extension type codes the `ext*`/`parse*` functions above encode and read.
+
+### `extTypeALPN: int`
+
+The extension type codes the `ext*`/`parse*` functions above encode and read.
+
+### `extTypeSupportedVersions: int`
+
+The extension type codes the `ext*`/`parse*` functions above encode and read.
+
+### `extTypeKeyShare: int`
+
+The extension type codes the `ext*`/`parse*` functions above encode and read.
+
+### `sigEcdsaSecp256r1Sha256: int`
+
+The signature_algorithms code points this module offers and accepts.
+
+### `sigEcdsaSecp384r1Sha384: int`
+
+The signature_algorithms code points this module offers and accepts.
+
+### `sigRsaPssRsaeSha256: int`
+
+The signature_algorithms code points this module offers and accepts.
+
+### `sigRsaPssRsaeSha384: int`
+
+The signature_algorithms code points this module offers and accepts.
+
+### `sigRsaPssRsaeSha512: int`
+
+The signature_algorithms code points this module offers and accepts.
+
+### `sigEd25519: int`
+
+The signature_algorithms code points this module offers and accepts.
+
+### `groupSecp256r1: int`
+
+The supported_groups wire code points for the classical curves.
+
+### `groupSecp384r1: int`
+
+The supported_groups wire code points for the classical curves.
+
+### `groupX25519: int`
+
+The supported_groups wire code points for the classical curves.
+
+### `groupX448: int`
+
+The supported_groups wire code points for the classical curves.
 
 ## Specification
 
