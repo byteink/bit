@@ -152,6 +152,101 @@
 # automated RETIRED check below (declaredSignatureNames) is what catches
 # that, the same way it caught #5921/the eight 0.27.0-era signatures.
 #
+# #6161 (668088908, "jsonSchema<T>() for classes, enums, optionals, nested
+# and generic types") landed on the same tree, AFTER the 0.32.0 pin, and
+# reddened `types`/`ir`/`iropt` on 8 corpus files the pinned oracle predates
+# (#6208). ROOT CAUSE (compiler/synthtext.bit): a synthesized member's
+# identifier text is never spelled by any real source span, so it is
+# APPENDED to the module's own source once and given a span pointing into
+# that appended tail (`appendSynthText`) — every earlier synthesis in the
+# SAME module pushes every later one's tail position further out. #6161
+# added a new synthesis (the schema/decode-enum machinery) that runs ahead
+# of the pre-existing `Json.decode<T>()` helper-name synthesis in 4 files,
+# so those files' `__json_x*`/`__json_d*` helper spans all land at a
+# CONSTANT +32 columns versus the pinned oracle — same line, same name, same
+# inferred type, only the column moved. Three signatures declared below:
+#
+# `6161-json-decode-column-shift` (`types`) — the constant-column-delta
+# identity: every mismatched line pair shares its line number and its
+# `<name>: <type>` suffix, and `bit2's column - oracle's column` is the SAME
+# nonzero constant for every mismatched line in the file. Derived from and
+# checked against the real dumps of _tests_/cases/run_json_decode.bit,
+# run_json_decode_errors.bit, run_json_decode_generic.bit and
+# run_json_decode_lenient.bit (captured 2026-09-28, ticket #6208): all four
+# shift by exactly +32 columns, every other field byte-identical.
+#
+# `6161-json-schema-synthesized-insert` (`types`) — #6161's SECOND `types`
+# shape, on run_json_schema.bit and run_json_schema_attrs.bit: the new
+# schema synthesis type-checks real, NEW AST nodes (a monomorphized schema
+# builder, anchored at the class's own field declarations) that the
+# pre-#6161 oracle never visited at all, so there is no shared column to
+# shift — the oracle's dump is instead an exact ORDERED SUBSEQUENCE of the
+# tree's (every line the oracle prints still appears, in the same order,
+# byte-for-byte, in the tree's dump; the tree only ever ADDS lines, never
+# alters or drops one). That is checked as an exact identity, not eyeballed:
+# a single greedy subsequence match, which is correct here because we only
+# need EXISTENCE of oracle-as-subsequence, not an alignment. WHY THIS IS NOT
+# A MASK: any regression that corrupts, reorders or drops so much as one
+# line the oracle already reports fails the
+# subsequence check immediately and is scored a real MISMATCH — only a
+# divergence whose ENTIRE effect is new lines, disturbing nothing the oracle
+# already agrees on, is ever explained, which is the tightest bound
+# available for content the oracle has no opinion on at all (the class
+# fields/schema body #6161 newly synthesizes did not exist for oracle
+# purposes before this feature). Same posture as `6194-generic-method-
+# receiver-explode`'s opcode-count bound below: the NEW content's shape is
+# bounded structurally, not validated byte-for-byte, because there is
+# nothing on the oracle side to validate it against.
+#
+# `6161-json-decode-enum-error-resolved` (`types`) — #6161's THIRD `types`
+# shape, on run_json_decode_enum.bit alone: this fixture exercises #6177's
+# payload-free `enum` field decode (`jsonDecode<Item>(j)` where `Item` has a
+# `Status` enum field), which the pre-#6161 oracle cannot type-check at all
+# — every downstream use of that decode result is `<error>` in the oracle
+# and a real type in the tree — PLUS the same leading/trailing pure-insert
+# shape `6161-json-schema-synthesized-insert` explains elsewhere. Checked as
+# a two-pointer walk over both dumps: a byte-identical line advances both
+# sides; a line pair sharing the same `LINE:COL: <expr>` prefix where the
+# oracle's type is literally `<error>` and the tree's is a real, non-empty
+# type advances both sides and counts as a resolution; anything else is
+# treated as a pure insertion on the tree side only. Explained only when
+# EVERY oracle line is eventually consumed this way AND at least one real
+# `<error>`-resolution occurred — a REAL regression (an already-well-typed
+# oracle expression changing to a DIFFERENT concrete type, or degrading to
+# `<error>`) can never satisfy the resolution shape and fails the walk
+# (the oracle pointer never catches up), same fail-closed posture as
+# `6161-json-schema-synthesized-insert` above.
+#
+# `6161-json-schema-specialize-call` (`ir`/`iropt`) — on
+# run_json_schema_attrs.bit, jsonschemacrossmod/main.bit and
+# jsonschemanested/main.bit: the oracle still lowers `jsonSchema<Widget>()`
+# to a generic call (`@m3$jsonSchema$14()`), while this tree specializes it
+# per type argument (`@__json_schema_Widget()`, `@m4$__json_schema_Widget()`
+# depending which module owns it). Checked as an identity: EXACTLY one
+# `  %N = call @<callee>() <Type>` line may change, and only by renaming an
+# oracle callee matching `(m<N>$)?jsonSchema$<N>` to a tree callee matching
+# `(m<N>$)?__json_schema_<Ident>` with the same `<Type>`; when the
+# specialization is DEFINED in the dumped file (run_json_schema_attrs.bit),
+# the tree may ALSO insert exactly one new function directly — `func
+# __json_schema_<Ident>(...) ... {` through a matching top-level `}`, naming
+# the SAME `<Ident>` the call was renamed to, with no second `func ` line or
+# premature `}` inside it — with every other line on both sides identical
+# before and after that insertion point. Not opcode-content-validated for
+# the same reason `6161-json-schema-synthesized-insert` above is not: the
+# oracle has no opinion on a function it never lowers. Derived from and
+# checked against the real dumps of all three files (captured 2026-09-28,
+# ticket #6208; jsonschemacrossmod/main.bit and jsonschemanested/main.bit
+# have no insertion at all, run_json_schema_attrs.bit inserts the full
+# specialized function body). Declared once for both `ir` and `iropt`, same
+# convention as `6194-generic-method-receiver-explode`: the inserted
+# function's exact opcode count differs pre/post-opt, but its boundary shape
+# does not.
+#
+# EXPECTED TO RETIRE AT THE 0.33.0 REPIN, same reasoning as #6194 above:
+# 0.33.0 will contain #6161, so it will be the first oracle that agrees with
+# the tree on all 8 of these files, and all three signatures will explain
+# zero files that run.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
@@ -220,6 +315,187 @@ explainMismatch() {
       if (diffCount == 0 || sawCall == 0) { return 0 }
       return 1
     }
+    # splitLineCol -- parses a `--dump-types` line `LINE:COL: <rest>` into
+    # out[1]=LINE out[2]=COL out[3]=<rest>. Returns 0 (out left untouched) if
+    # the line is not in that shape.
+    function splitLineCol(line, out,    p, parts) {
+      if (!match(line, /^[0-9]+:[0-9]+: /)) { return 0 }
+      p = substr(line, 1, RLENGTH - 2)
+      split(p, parts, ":")
+      out[1] = parts[1] + 0
+      out[2] = parts[2] + 0
+      out[3] = substr(line, RLENGTH + 1)
+      return 1
+    }
+    # columnShiftType (#6161) -- see this files header for the derivation
+    # (constant appended-synth-text offset, compiler/synthtext.bit). Same
+    # LINE COUNT both sides; every mismatched line pair shares its line
+    # number and its `<name>: <type>` suffix, and `colB - colA` is the same
+    # nonzero constant across every mismatched line in the file.
+    function columnShiftType(nA, linesA, nB, linesB,    i, la, lb, oa, ob, delta, d, diffCount, hasDelta) {
+      if (nA != nB || nA == 0) { return 0 }
+      diffCount = 0
+      hasDelta = 0
+      delta = 0
+      for (i = 1; i <= nA; i++) {
+        la = linesA[i]; lb = linesB[i]
+        if (la == lb) { continue }
+        diffCount++
+        if (!splitLineCol(la, oa)) { return 0 }
+        if (!splitLineCol(lb, ob)) { return 0 }
+        if (oa[1] != ob[1]) { return 0 }
+        if (oa[3] != ob[3]) { return 0 }
+        d = ob[2] - oa[2]
+        if (d == 0) { return 0 }
+        if (!hasDelta) { delta = d; hasDelta = 1 } else if (d != delta) { return 0 }
+      }
+      if (diffCount == 0) { return 0 }
+      return 1
+    }
+    # orderedSubsequenceInsert (#6161) -- see this files header above for the
+    # derivation and the WHY THIS IS NOT A MASK note. True only when every
+    # oracle line still appears, in order, byte-for-byte, somewhere in the
+    # trees dump (a pure insertion, never an alteration or a drop) and the
+    # trees dump is strictly longer. A single greedy left-to-right scan is
+    # a correct subsequence test here -- we only need EXISTENCE, not the
+    # cheapest alignment.
+    function orderedSubsequenceInsert(nA, linesA, nB, linesB,    i, j) {
+      if (nA == 0 || nB <= nA) { return 0 }
+      i = 1
+      for (j = 1; j <= nB; j++) {
+        if (i > nA) { break }
+        if (linesB[j] == linesA[i]) { i++ }
+      }
+      return (i > nA) ? 1 : 0
+    }
+    # errorResolvedPair -- true when `a` (oracle) and `b` (tree) share the
+    # same `LINE:COL: <expr>` prefix (everything before the LAST `: `), the
+    # oracles trailing type is literally `<error>`, and the trees is a
+    # non-empty, non-`<error>` type. A REAL regression -- a well-typed oracle
+    # expression turning into a DIFFERENT concrete type, or into `<error>` --
+    # is never accepted here, only the one direction #6161 legitimately
+    # produces (the oracle could not type this expression at all; the tree
+    # now can).
+    function errorResolvedPair(a, b,    cutA, cutB, pfxA, pfxB, tyA, tyB) {
+      cutA = lastColonSpace(a); cutB = lastColonSpace(b)
+      if (cutA == 0 || cutB == 0) { return 0 }
+      pfxA = substr(a, 1, cutA - 1); tyA = substr(a, cutA + 2)
+      pfxB = substr(b, 1, cutB - 1); tyB = substr(b, cutB + 2)
+      if (pfxA != pfxB) { return 0 }
+      if (tyA != "<error>") { return 0 }
+      if (tyB == "" || tyB == "<error>") { return 0 }
+      return 1
+    }
+    # errorResolvedInsert (#6161) -- run_json_decode_enum.bit shape: the
+    # oracle predates #6161/#6177s payload-free enum decode entirely, so it
+    # cannot type `jsonDecode<Item>(j)` at all (every use of the result is
+    # `<error>`), while the tree resolves it and every downstream use. A
+    # left-to-right two-pointer walk: a matching line advances both sides; an
+    # errorResolvedPair advances both sides and counts as a resolution; any
+    # other tree line is treated as a pure insertion (advances only the tree
+    # side). Explained only when EVERY oracle line is eventually consumed
+    # this way (a real drop or reorder of an oracle line fails closed, since
+    # the oracle pointer never catches up) and at least one real
+    # `<error>`-resolution occurred (a pure insertion with zero resolutions
+    # is `6161-json-schema-synthesized-insert`s shape, not this ones).
+    function errorResolvedInsert(nA, linesA, nB, linesB,    i, j, subCount) {
+      i = 1; j = 1; subCount = 0
+      while (i <= nA && j <= nB) {
+        if (linesA[i] == linesB[j]) { i++; j++; continue }
+        if (errorResolvedPair(linesA[i], linesB[j])) { subCount++; i++; j++; continue }
+        j++
+      }
+      if (i <= nA) { return 0 }
+      if (subCount == 0) { return 0 }
+      return 1
+    }
+    # isSchemaCallRename (#6161) -- true when `a` (oracle) is
+    # `  %N = call @(m<N>$)?jsonSchema$<N>() <Type>` and `b` (tree) is the
+    # SAME `%N = call @` prefix and the SAME trailing `<Type>`, renaming only
+    # the callee to `(m<N>$)?__json_schema_<Ident>`. Sets the global
+    # `jsonSchemaRenameIdent` to `<Ident>` on success.
+    function isSchemaCallRename(a, b,    pa, pb, ra, rb, ca, cb, calleeA, calleeB, tyA, tyB, idx) {
+      if (a !~ /^  %[0-9]+ = call @/) { return 0 }
+      if (b !~ /^  %[0-9]+ = call @/) { return 0 }
+      pa = index(a, "@"); pb = index(b, "@")
+      if (substr(a, 1, pa) != substr(b, 1, pb)) { return 0 }
+      ra = substr(a, pa + 1)
+      rb = substr(b, pb + 1)
+      ca = index(ra, "("); cb = index(rb, "(")
+      if (ca == 0 || cb == 0) { return 0 }
+      calleeA = substr(ra, 1, ca - 1)
+      calleeB = substr(rb, 1, cb - 1)
+      tyA = substr(ra, ca + 3)
+      tyB = substr(rb, cb + 3)
+      if (tyA != tyB) { return 0 }
+      if (calleeA !~ /^(m[0-9]+\$)?jsonSchema\$[0-9]+$/) { return 0 }
+      if (calleeB !~ /^(m[0-9]+\$)?__json_schema_[A-Za-z_][A-Za-z0-9_]*$/) { return 0 }
+      idx = index(calleeB, "__json_schema_")
+      jsonSchemaRenameIdent = substr(calleeB, idx + length("__json_schema_"))
+      return 1
+    }
+    # schemaForwardWalk -- walks linesA/linesB INDEX-ALIGNED (position i on
+    # both sides) for as long as that alignment can possibly still be valid:
+    # a byte-identical line, or the one call-rename isSchemaCallRename
+    # accepts, both keep walking; anything else means index alignment has
+    # broken -- either the tree has started inserting new lines here, or
+    # this is a real, unexplained divergence -- so the walk stops and
+    # records the split point (global jsonSchemaSplitK = i-1). A BACKWARD
+    # (tail-first) search for this boundary was tried and rejected: IR text
+    # is full of short, generic lines (`}`, a blank separator) that recur
+    # throughout a function body, so matching from the end can align on the
+    # WRONG occurrence of one and misplace the split by exactly the inserted
+    # functions own length -- reproduced on the real run_json_schema_attrs.bit
+    # fixture, where a backward scan lands 2 lines short because the
+    # inserted functions own closing `}` coincidentally matches the ORIGINAL
+    # functions `}` two lines earlier. A forward, index-aligned walk has no
+    # such ambiguity: index i can only mean one specific position.
+    function schemaForwardWalk(nA, linesA, nB, linesB,    i, subCount) {
+      subCount = 0
+      jsonSchemaSplitK = nA
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        if (isSchemaCallRename(linesA[i], linesB[i])) {
+          subCount++
+          if (subCount > 1) { return 0 }
+          continue
+        }
+        jsonSchemaSplitK = i - 1
+        break
+      }
+      return (subCount == 1) ? 1 : 0
+    }
+    # schemaInsertBlockOk -- true when linesB[k+1 .. k+insLen] is exactly one
+    # well-formed appended function named __json_schema_<ident>: its header
+    # (`func __json_schema_<ident>(...) ... {`) is the FIRST inserted line
+    # (the blank line before it, if any, already existed in the shared
+    # prefix as the ordinary inter-function separator, so it is never part
+    # of the insertion itself); its closing `}` is either the LAST inserted
+    # line, or the second-to-last when the dump format also needs a fresh
+    # blank separator before the next, unmoved function; and no second
+    # `func ` or premature `}` appears anywhere between header and closer.
+    function schemaInsertBlockOk(linesB, k, insLen, ident,    i, hdr, closeIdx) {
+      hdr = "^func __json_schema_" ident "\\(\\) [A-Za-z_][A-Za-z0-9_<>]* \\{$"
+      if (linesB[k + 1] !~ hdr) { return 0 }
+      closeIdx = (linesB[k + insLen] == "") ? (k + insLen - 1) : (k + insLen)
+      if (linesB[closeIdx] != "}") { return 0 }
+      for (i = k + 2; i < closeIdx; i++) {
+        if (linesB[i] == "}") { return 0 }
+        if (linesB[i] ~ /^func /) { return 0 }
+      }
+      return 1
+    }
+    # jsonSchemaSpecializeCall (#6161) -- orchestrates the helpers above; see
+    # this files header above for the derivation.
+    function jsonSchemaSpecializeCall(nA, linesA, nB, linesB,    insLen, k) {
+      insLen = nB - nA
+      if (insLen < 0) { return 0 }
+      if (!schemaForwardWalk(nA, linesA, nB, linesB)) { return 0 }
+      k = jsonSchemaSplitK
+      if (insLen == 0) { return (k == nA) ? 1 : 0 }
+      if (k == nA) { return 0 }
+      return schemaInsertBlockOk(linesB, k, insLen, jsonSchemaRenameIdent)
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -240,6 +516,15 @@ explainMismatch() {
       if (kind == "types") {
         if (optionUnsubstitutedType(nA, linesA, nB, linesB)) {
           print "6194-generic-method-receiver-unsubstituted-type"; exit 0
+        }
+        if (columnShiftType(nA, linesA, nB, linesB)) {
+          print "6161-json-decode-column-shift"; exit 0
+        }
+        if (orderedSubsequenceInsert(nA, linesA, nB, linesB)) {
+          print "6161-json-schema-synthesized-insert"; exit 0
+        }
+        if (errorResolvedInsert(nA, linesA, nB, linesB)) {
+          print "6161-json-decode-enum-error-resolved"; exit 0
         }
         exit 1
       }
@@ -304,6 +589,18 @@ explainMismatch() {
         if (ok6194o) { print "6194-generic-method-receiver-explode"; exit 0 }
       }
 
+      # #6161: generic jsonSchema<T>() call specialized to a synthesized
+      # per-type function -- see this files header above for the derivation.
+      # Declared once for both `ir` and `iropt`, same convention as #6194
+      # above: the boundary shape (one renamed call, at most one inserted
+      # function) does not differ pre/post-opt even though the inserted
+      # functions own opcode count does.
+      if (kind == "ir" || kind == "iropt") {
+        if (jsonSchemaSpecializeCall(nA, linesA, nB, linesB)) {
+          print "6161-json-schema-specialize-call"; exit 0
+        }
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -327,11 +624,22 @@ declaredSignatureNames() {
   case "$kind" in
     ast) return ;;
     fmt) return ;;
-    types) printf '%s\n' "6194-generic-method-receiver-unsubstituted-type"; return ;;
-    ir) printf '%s\n' "6194-generic-method-receiver-explode"; return ;;
-    iropt) printf '%s\n' "6194-generic-method-receiver-explode"; return ;;
+    types)
+      printf '%s\n' \
+        "6194-generic-method-receiver-unsubstituted-type" \
+        "6161-json-decode-column-shift" \
+        "6161-json-schema-synthesized-insert" \
+        "6161-json-decode-enum-error-resolved"
+      return
+      ;;
+    ir) printf '%s\n' "6194-generic-method-receiver-explode" "6161-json-schema-specialize-call"; return ;;
+    iropt) printf '%s\n' "6194-generic-method-receiver-explode" "6161-json-schema-specialize-call"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "6194-generic-method-receiver-unsubstituted-type" \
-    "6194-generic-method-receiver-explode"
+    "6194-generic-method-receiver-explode" \
+    "6161-json-decode-column-shift" \
+    "6161-json-schema-synthesized-insert" \
+    "6161-json-decode-enum-error-resolved" \
+    "6161-json-schema-specialize-call"
 }
