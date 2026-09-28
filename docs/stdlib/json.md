@@ -768,6 +768,47 @@ A key that is absent and a key present as `null` both decode an `Option<T>` to
 an absent `Option` as an explicit `null`, so what it emits decodes back, and a
 producer that omits the key instead is just as well-formed.
 
+### `jsonSchema<T>(): Json`
+
+A JSON Schema 2020-12 document describing `T`, specialised per instantiation
+exactly as `jsonDecode<T>` is above. `T` must carry `@json`; anything else is
+a compile error (`E0173`) naming the type and the mark, never a runtime
+failure.
+
+```bit
+import { Json, JsonEntry, jsonSchema, jsonEncode } from "std/json"
+
+@json class Settings {
+  theme: string,
+  retries: Option<i32>,
+}
+
+// {"type":"object","properties":{"theme":{"type":"string"},
+//  "retries":{"type":["integer","null"]}},"required":["theme","retries"],
+//  "$defs":{"Settings":{"type":"object","properties":{"theme":
+//  {"type":"string"},"retries":{"type":["integer","null"]}},
+//  "required":["theme","retries"]}}}
+fn settingsSchema(): string {
+  return jsonEncode(jsonSchema<Settings>())
+}
+```
+
+Every field shape `@json` accepts maps to one 2020-12 keyword: a scalar to its
+`type`, `[]T` to `items`, `map<string, T>` to `additionalProperties`, a
+payload-free `enum` to `type: "string"` plus its declared names under `enum`,
+and a nested `@json` class to a `$ref`. `Option<T>` folds `"null"` into `T`'s
+own fragment (`anyOf` when `T` is a nested class, which has no `type` keyword
+of its own to widen). `required` names every field with no exception, since
+`@json` never omits a key.
+
+The document also carries a top-level `"$defs"`: one entry per `@json` class
+reachable from `T` through a chain of nested-class fields, `T` itself
+included — deduplicated, so a diamond (two fields reaching the same nested
+class) or a cycle (`class Node { next: Option<Node> }`) each contribute
+exactly one entry. A caller can `$ref` the root from elsewhere (an OpenAPI
+document's own `components/schemas`, for instance) the same way any nested
+class already is.
+
 ### `jsonDecodeLenient<T>(j: Json): T!`
 
 The same decode, ignoring keys no field of `T` claims -- at every level of the
@@ -977,6 +1018,20 @@ The same, for the value at `key` of the object at `path`. Builds
 
 The same, for element `i` of the array at `path`. Builds
 `jsonDecIndex(path, i)` only when it fails.
+
+### `jsonDecEnumKey(j: Json, path: string, key: string, allowed: []string): string!`
+
+The variant name string at `key` of the object at `path`, for a payload-free
+`enum` field the compiler's synthesised `jsonDecode<T>` reaches. Decodes
+through `jsonDecStringKey`, then rejects any value not in `allowed` (the
+class's own declared variant names) with the same `TypeMismatch` shape every
+other mismatch takes -- `expected` names every allowed variant, `found` the
+wire value. `@json`'s `toJson()` is what guarantees a well-formed document
+only ever writes one of them (`docs/stdlib/json.md`'s "`toJson`" section).
+
+### `jsonDecEnumIndex(j: Json, path: string, i: i64, allowed: []string): string!`
+
+The same, for element `i` of the array at `path`.
 
 ### `jsonDecArray(j: Json, path: string, depth: i64): []Json!`
 

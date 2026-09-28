@@ -1081,9 +1081,13 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   a field of a class that does not carry `@json` is **E0139**.
 - Entries are emitted in **declaration order**, one per field.
 - A field's type must be a scalar, `string`, `bool`, `[]T`, `map<string, T>`,
-  `Option<T>` or a nested class that itself carries `@json`; in the three
-  container forms `T` must itself be one of the first four shapes or a nested
-  `@json` class, never another container. Anything else is **E0141**, naming
+  `Option<T>`, a payload-free `enum` (every variant carries no payload) or a
+  nested class that itself carries `@json`; in the three container forms `T`
+  must itself be one of those shapes, never another container. A payload-free
+  `enum` field's value is its variant's own NAME, as a JSON string (`toJson`)
+  or accepted back from one of the declared names (`jsonDecode<T>`) - an
+  unknown name fails naming the field and every declared variant. Anything
+  else is **E0141**, naming
   the field and the type - including a class that did not opt in, since
   recursing into one would defeat the mark. One rejected field rejects the
   whole class: a `toJson` that silently omitted a field would be invisible in
@@ -1173,6 +1177,105 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
 - Classes are reference types with reference semantics on assignment (§13.3).
+
+**`jsonSchema<T>` - a JSON Schema for a `@json` class.**
+
+- `std/json` declares
+
+  ```
+  jsonSchema<T>(): Json
+  ```
+
+  and the compiler **specialises it per instantiation**, exactly as
+  `jsonDecode<T>` is above: at `jsonSchema<User>()` it knows `User`
+  concretely and generates the schema fragment from the same field list and
+  the same key rules `@json` serializes by. It is a **free function, not a
+  member** - the same reasoning as `jsonDecode<T>`'s applies with one thing
+  removed: there is not even a `Json` argument here, since a schema
+  describes the TYPE and never reads a value at all.
+- `T` must be a class carrying `@json`; anything else is a compile error at
+  the call, never a runtime failure - the same shape as `jsonDecode<T>`'s
+  own **E0145**, under its own code, **E0173**
+  (`compiler/classjsonschemacall.bit`).
+- **The dialect is JSON Schema 2020-12**
+  (<https://json-schema.org/draft/2020-12>), the exact dialect OpenAPI 3.1's
+  Schema Object uses - not an earlier draft, and not OpenAPI 3.0's own
+  restricted subset (which had no `$dynamicRef`/`$defs` and used a bespoke
+  `nullable: true` instead of a standard `type` array).
+- **Field shape to keyword, one entry per shape `@json` already accepts**
+  (this section's own list above):
+
+  | Field shape | Schema fragment |
+  | --- | --- |
+  | an integer type | `{"type": "integer"}` |
+  | a float type | `{"type": "number"}` |
+  | `bool` | `{"type": "boolean"}` |
+  | `string` | `{"type": "string"}` |
+  | a payload-free `enum` | `{"type": "string", "enum": [<every declared
+    variant name>]}` - 2020-12's `enum` keyword (§6.1.2) restricts an
+    instance to one of a fixed list, matching what `toJson`/`jsonDecode<T>`
+    already accept |
+  | `[]T` | `{"type": "array", "items": <T's fragment>}` - 2020-12's `items`
+    keyword applies to every element uniformly whenever no `prefixItems` is
+    present, which this synthesis never emits, so this is the same meaning
+    `items` had as a bare schema in every earlier draft |
+  | `map<string, T>` | `{"type": "object", "additionalProperties": <T's
+    fragment>}` |
+  | `Option<T>` | `T`'s own fragment with `"null"` folded into its `type` -
+    a scalar's `{"type": "string"}` becomes `{"type": ["string", "null"]}`
+    (2020-12's `type` keyword accepts a string or an array of strings, and
+    an instance matches if it matches any listed type; there is no separate
+    `nullable` keyword in this dialect). This is not optional: `@json`
+    itself emits an absent `Option<T>` as an explicit `null` (this
+    section's own `toJson` bullets), so a schema that did not admit null
+    for that field would reject the encoder's own correct output. A nested
+    `@json` class has no `type` keyword of its own to fold null into (its
+    fragment is a bare `$ref`), so `Option<NestedClass>` takes 2020-12's
+    `anyOf` instead: `{"anyOf": [{"$ref": "#/$defs/<Name>"}, {"type":
+    "null"}]}` |
+  | a nested `@json` class | `{"$ref": "#/$defs/<ClassName>"}`, with one
+    `$defs` entry per DISTINCT class reachable from the root, deduplicated -
+    a self-referential class (`class Node { next: Option<Node> }`, already
+    legal input to `jsonDecode<T>` per this section) terminates as a finite
+    document with a cycle through `$ref` rather than an unbounded inline
+    expansion |
+
+  The whole class becomes `{"type": "object", "properties": {...},
+  "required": [...], "$defs": {...}}`. `$defs` is always present, even for a
+  root with no nested field: it holds every class REACHABLE FROM the root
+  through a chain of nested-class fields, the root itself included, each
+  rendered the same way (no further `$defs` nested inside one of its own
+  entries) - so a caller can `$ref` the root from elsewhere (an OpenAPI
+  document's own `components/schemas`) exactly as any nested class already
+  is. A nested class declared in the SAME module as the one holding the
+  field is inlined directly; one reached through a named import from
+  another module gets its `$defs` entry from a bare-fragment function
+  (`__json_schema_frag_<Name>()`) that module exports, one hop from the
+  document root's own module (#6182, `compiler/classjsonschemafrag.bit`) -
+  a class reached only through a SECOND cross-module hop still keeps a
+  dangling `$ref`. `required` names every field's key with no
+  exception: `@json` never omits a key (an absent `Option<T>` is an
+  explicit `null`, not a missing one), so the schema's `required` set is
+  exactly the class's declared field set. `@key("...")` overrides a
+  field's schema property key exactly as it overrides its `toJson()`/
+  `jsonDecode<T>` key.
+- **A field's validation attributes are recorded, not interpreted** (#6181,
+  `jsPropertyEntry`/`jsXBitAttrsEntry`, `compiler/classjsonschema.bit`).
+  `std/json` has no knowledge of what `@minLen`/`@max`/etc. (`pkg/web`'s own
+  rules, this file's "validate.bit" material) mean, and cannot depend on
+  `pkg/web` to find out. A field carrying at least one attribute (every
+  attribute but `@key`, which names no function) gets an `"x-bit-attrs"`
+  entry on its own fragment - JSON Schema and OpenAPI both reserve the `x-`
+  prefix for vendor extensions a validator that does not recognise them
+  ignores rather than rejects (OpenAPI 3.1's own `specification-extensions`
+  pattern is exactly `^x-`) - `[{"name": "<attrName>", "args": ["<arg
+  spelling>", ...]}, ...]`, naming each attribute and its constant
+  arguments in the same source-spelling `@table` above already records them
+  in. A field with no attributes at all gets no `"x-bit-attrs"` key, not an
+  empty array. `pkg/web` would map its own attributes out of this into
+  native schema keywords (`@minLen(3)` into `minLength: 3`) and strip the
+  rest before a document is served; the mapping itself is `pkg/web`'s, not
+  `std/json`'s, and is specified where it is implemented.
 
 **`@table` - synthesizing `tableDescriptor`.**
 
