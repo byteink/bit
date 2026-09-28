@@ -1,0 +1,516 @@
+// pkg/web/openapi.bit — #6075/#6200: render a frozen App's real routes as
+// an OpenAPI document.
+//
+// VERSION: OpenAPI 3.1.0. Checked 2026-09-28: the newest release overall is
+// 3.2.1 (2026-09-10) and the newest 3.1.x patch is 3.1.2 (OAI/
+// OpenAPI-Specification tags), but the JSON Schema that defines a valid
+// document (spec.openapis.org/oas/3.1/schema/2022-10-07) has not changed
+// since 3.1.0 — 3.1.1/3.1.2 are wording-only errata releases — while
+// widely-used tooling (`@apidevtools/swagger-parser`, as of this check)
+// still allowlists only 3.1.0/3.1.1. "3.1.0" is therefore the newest
+// version string that is both schema-correct and universally accepted;
+// `openApiVersion` below is the one place this is spelled.
+//
+// WHERE THE DOCUMENT COMES FROM. Two different guarantees, and neither one
+// can substitute for the other:
+//
+//   - Paths, methods and path parameters come from `App.root.pending.routes`
+//     — the SAME list `flushPending` (middleware.bit) reads to build the
+//     router at `freeze()`. There is no second copy of the route table here:
+//     a route this app does not actually have cannot appear in the document,
+//     and a route it does have cannot be missing from it.
+//   - Request/response schemas come from `Route.requestBody<T>()`/
+//     `.responds<T>(status)` (app.bit), each calling `jsonSchema<T>()`
+//     (std/json, #6161) — the compiler-specialized schema for `T` itself,
+//     no instance to construct by hand and no hand-duplicated schema that
+//     could drift from the class. A route that calls neither documents no
+//     body.
+//
+// ATTRIBUTE MAPPING. `jsonSchema<T>()` records a field's validation
+// attributes verbatim as `"x-bit-attrs"` (SPEC "jsonSchema<T>") — `std/json`
+// has no knowledge of what `@minLen`/`@min`/etc. (pkg/web's own
+// `validate.bit`) mean. `mapSchemaAttrs` below is where that meaning lives:
+// it walks the whole document (the root schema and every `$defs` entry a
+// nested `@json` class contributes) and rewrites each field's recorded
+// attributes into the matching native OpenAPI/JSON Schema keyword —
+// `minLength`, `maxLength`, `minimum`, `maximum`, `format` — dropping any
+// attribute with no OpenAPI equivalent (`@nonEmpty`, or an application's own
+// hand-written rule) rather than leaving `x-bit-attrs` in a document served
+// to a real client.
+//
+// `Json`, `JsonEntry`, `jsonEncode` are imported module-wide by escape.bit
+// and res.bit; `join`, `split`, `sorted` by router.bit; `toLower` by
+// escape.bit; `parseInt` by static.bit — importing any of them again here is
+// E0042 (SPEC §17.1). `newError` is `std/core`'s prelude binding, used
+// unqualified elsewhere in this module (app.bit, router.bit) the same way.
+
+// What an application hands `App.openApi()`: the OpenAPI Info Object's two
+// mandatory fields plus the one optional one this package renders.
+// `description` is "" when the app has none to give — the document then
+// omits the key entirely (`infoJson` below) rather than emitting an empty
+// string, matching `Res`'s own "no claim" convention (res.bit's
+// `declaredLen`) for a field nobody set.
+export class OpenApiInfo {
+  export title: string,
+  export version: string,
+  export description: string,
+}
+
+const openApiVersion = "3.1.0"
+
+// One route's documented request/response shapes (#6075). Built once per
+// route in `Group.register()` (app.bit) and shared by reference between
+// that route's `Route` (mutated by `.requestBody()`/`.responds()`) and its
+// `PendingRoute` (middleware.bit, read here) — see `Route.docs`'s comment.
+class RouteDocs {
+  hasRequestBody: bool,
+  requestBodySchema: Json,
+  responses: []ResponseDoc,
+}
+
+class ResponseDoc {
+  status: int,
+  schema: Json,
+}
+
+// --- building the document --------------------------------------------
+
+// One row of the table this file actually renders: a route's OpenAPI path
+// template, HTTP method, original Bit pattern (path params are parsed back
+// out of it) and documented shapes. Built fresh from `pending.routes` on
+// every call — nothing here is cached, so a document requested twice after
+// two different registration states (impossible once frozen, but nothing
+// relies on that) never returns a stale one.
+class RouteRow {
+  path: string,
+  method: string,
+  pattern: string,
+  docs: RouteDocs,
+}
+
+// Walks `root`'s real, frozen route table and renders it as an OpenAPI
+// document. Fails if the router is not frozen yet — the same closed-table
+// contract `Router.lookup()` (router.bit) itself enforces, so this can
+// never render a table a later `app.get(...)` could still add to.
+fn openApiDocument(root: Group, info: OpenApiInfo): Json! {
+  if (!root.router.frozen) {
+    fail newError("web: openApi(): the router is not frozen yet — call freeze() or listen() first")
+  }
+  let rows = []RouteRow(0)
+  for pr of root.pending.routes {
+    rows = append(
+      rows,
+      RouteRow{
+        path = openApiPath(pr.pattern),
+        method = pr.method,
+        pattern = pr.pattern,
+        docs = pr.docs,
+      },
+    )
+  }
+  sortRows(rows)
+  let fields = [
+    JsonEntry{ key = "openapi", value = Json.JsonString(openApiVersion) },
+    JsonEntry{ key = "info", value = infoJson(info) },
+    JsonEntry{ key = "paths", value = pathsJson(rows) },
+  ]
+  return Json.JsonObject(fields)
+}
+
+// Deterministic output order: by rendered path, then by method, so two
+// builds of the same app produce byte-identical JSON (`openapi.test.bit`
+// pins this) regardless of `map` iteration order anywhere upstream.
+fn routeRowLess(a: RouteRow, b: RouteRow): bool {
+  if (a.path != b.path) {
+    return a.path < b.path
+  }
+  return a.method < b.method
+}
+
+// An in-place insertion sort by `routeRowLess`, not `std/sort`'s
+// `sorted`/`sortInPlace`: both pre-allocate a `[]RouteRow` scratch buffer
+// (`[]T(n)`), and `RouteRow` has no zero value (SPEC §13.4 — a class-typed
+// field, `docs` here, has none, so neither does the class holding it). This
+// never materializes one: every write moves an already-live `RouteRow`
+// reference, never a fresh default. `rows` is typically a handful to a few
+// hundred routes, built once per `openApi()` call, so O(n^2) costs nothing
+// that matters here.
+fn sortRows(rows: []RouteRow) {
+  let i = 1
+  while (i < len(rows)) {
+    let key = rows[i]
+    let j = i - 1
+    while (j >= 0 && routeRowLess(key, rows[j])) {
+      rows[j + 1] = rows[j]
+      j = j - 1
+    }
+    rows[j + 1] = key
+    i = i + 1
+  }
+}
+
+fn infoJson(info: OpenApiInfo): Json {
+  let fields = [
+    JsonEntry{ key = "title", value = Json.JsonString(info.title) },
+    JsonEntry{ key = "version", value = Json.JsonString(info.version) },
+  ]
+  if (len(info.description) > 0) {
+    fields = append(
+      fields,
+      JsonEntry{ key = "description", value = Json.JsonString(info.description) },
+    )
+  }
+  return Json.JsonObject(fields)
+}
+
+// Groups `rows` (already sorted by path, then method) into one Path Item
+// per distinct path — `rows` never repeats a (path, method) pair, since
+// `Router.add()` already refuses a duplicate method+pattern at `freeze()`
+// (router.bit's `registerHandler`), so this never needs to merge two
+// operations under the same key.
+fn pathsJson(rows: []RouteRow): Json {
+  let entries = []JsonEntry(0)
+  let i = 0
+  while (i < len(rows)) {
+    let path = rows[i].path
+    let ops = []JsonEntry(0)
+    while (i < len(rows) && rows[i].path == path) {
+      ops = append(ops, JsonEntry{ key = toLower(rows[i].method), value = operationJson(rows[i]) })
+      i = i + 1
+    }
+    entries = append(entries, JsonEntry{ key = path, value = Json.JsonObject(ops) })
+  }
+  return Json.JsonObject(entries)
+}
+
+fn operationJson(row: RouteRow): Json {
+  let fields = [
+    JsonEntry{ key = "operationId", value = Json.JsonString(operationId(row.method, row.pattern)) },
+  ]
+  let params = pathParameters(row.pattern)
+  if (len(params) > 0) {
+    fields = append(fields, JsonEntry{ key = "parameters", value = Json.JsonArray(params) })
+  }
+  if (row.docs.hasRequestBody) {
+    fields = append(
+      fields,
+      JsonEntry{ key = "requestBody", value = requestBodyJson(row.docs.requestBodySchema) },
+    )
+  }
+  fields = append(fields, JsonEntry{ key = "responses", value = responsesJson(row.docs.responses) })
+  return Json.JsonObject(fields)
+}
+
+// A stable, unique id per operation: lowercase method plus the pattern's
+// own segments underscore-joined ("GET /articles/:id" -> "get_articles_id").
+// Built from the PATTERN, not the OpenAPI path template, so a `:id` and a
+// `*rest` segment are distinguished by name even though both would render
+// as a `{...}` path template segment.
+fn operationId(method: string, pattern: string): string {
+  let segs = splitSegments(pattern)
+  let parts = [toLower(method)]
+  for seg of segs {
+    if (isParamSeg(seg) || isWildcardSeg(seg)) {
+      parts = append(parts, segName(seg))
+    } else if (len(seg) > 0) {
+      parts = append(parts, seg)
+    }
+  }
+  return join(parts, "_")
+}
+
+fn requestBodyJson(schema: Json): Json {
+  return Json.JsonObject(
+    [
+      JsonEntry{ key = "required", value = Json.JsonBool(true) },
+      JsonEntry{ key = "content", value = jsonContentJson(schema) },
+    ],
+  )
+}
+
+// Every documented response, or a bare 200 with no schema for a route that
+// never called `.responds()` — the OpenAPI Operation Object's `responses`
+// field is mandatory and non-empty, so a route that documented nothing
+// still gets a valid, honestly generic entry rather than an omitted field
+// that would make the whole document invalid.
+fn responsesJson(responses: []ResponseDoc): Json {
+  if (len(responses) == 0) {
+    return Json.JsonObject(
+      [
+        JsonEntry{
+          key = "200",
+          value = Json.JsonObject([JsonEntry{ key = "description", value = Json.JsonString("OK") }]),
+        },
+      ],
+    )
+  }
+  let entries = []JsonEntry(0)
+  for r of responses {
+    entries = append(entries, JsonEntry{ key = "${r.status}", value = responseEntryJson(r) })
+  }
+  return Json.JsonObject(entries)
+}
+
+fn responseEntryJson(r: ResponseDoc): Json {
+  return Json.JsonObject(
+    [
+      JsonEntry{ key = "description", value = Json.JsonString(statusDescription(r.status)) },
+      JsonEntry{ key = "content", value = jsonContentJson(r.schema) },
+    ],
+  )
+}
+
+fn jsonContentJson(schema: Json): Json {
+  return Json.JsonObject(
+    [
+      JsonEntry{
+        key = "application/json",
+        value = Json.JsonObject([JsonEntry{ key = "schema", value = schema }]),
+      },
+    ],
+  )
+}
+
+// A short, human label for a status code — the OpenAPI Response Object's
+// `description` is mandatory, and this is the one place that fills it in
+// for the statuses this framework's own `errors.bit` names. Anything else
+// gets a generic label rather than a blank: an unlabeled response is still
+// a schema-invalid document (`description` must be a non-empty string).
+// Split across two switches, each well under the complexity ceiling
+// (`spec/LINT.md`) — a single 12-case switch measured at 13.
+fn statusDescription(status: int): string {
+  let success = successStatusDescription(status)
+  if (len(success) > 0) {
+    return success
+  }
+  return errorStatusDescription(status)
+}
+
+fn successStatusDescription(status: int): string {
+  switch (status) {
+    case 200:
+      return "OK"
+    case 201:
+      return "Created"
+    case 204:
+      return "No Content"
+    default:
+      return ""
+  }
+}
+
+// "" is never returned to a caller here: this is `statusDescription`'s
+// fallback after `successStatusDescription` already found nothing, so its
+// own `default` is the document's generic label, not another "try the next
+// one" signal.
+fn errorStatusDescription(status: int): string {
+  switch (status) {
+    case 400:
+      return "Bad Request"
+    case 401:
+      return "Unauthorized"
+    case 403:
+      return "Forbidden"
+    case 404:
+      return "Not Found"
+    case 409:
+      return "Conflict"
+    case 422:
+      return "Unprocessable Content"
+    case 429:
+      return "Too Many Requests"
+    case 500:
+      return "Internal Server Error"
+    case 503:
+      return "Service Unavailable"
+    default:
+      return "Response"
+  }
+}
+
+// `pattern`'s own segments, with every `:name`/`*name` rendered as an
+// OpenAPI path template segment `{name}` — reuses router.bit's own
+// `splitSegments`/`isParamSeg`/`isWildcardSeg`/`segName` rather than
+// parsing pattern syntax a second way (the same reuse `res.bit`'s
+// `routeLocation` already makes).
+fn openApiPath(pattern: string): string {
+  let segs = splitSegments(pattern)
+  if (len(segs) == 0) {
+    return "/"
+  }
+  let out = []string(0)
+  for seg of segs {
+    if (isParamSeg(seg) || isWildcardSeg(seg)) {
+      out = append(out, "{" + segName(seg) + "}")
+    } else {
+      out = append(out, seg)
+    }
+  }
+  return "/" + join(out, "/")
+}
+
+// One Parameter Object per dynamic segment in `pattern`. Every one of them
+// is `in: path, required: true` — the router matched this request only
+// because a value was bound there (router.bit's `matchNode`), so an
+// OpenAPI client is never told a path parameter is optional. `schema` is
+// always `{"type": "string"}`: the router captures a path segment as a raw
+// string (router.bit's `ParamBinding`) and never parses it, so a narrower
+// type here would claim a guarantee the framework does not make.
+fn pathParameters(pattern: string): []Json {
+  let out = []Json(0)
+  for seg of splitSegments(pattern) {
+    if (isParamSeg(seg) || isWildcardSeg(seg)) {
+      out = append(
+        out,
+        Json.JsonObject(
+          [
+            JsonEntry{ key = "name", value = Json.JsonString(segName(seg)) },
+            JsonEntry{ key = "in", value = Json.JsonString("path") },
+            JsonEntry{ key = "required", value = Json.JsonBool(true) },
+            JsonEntry{
+              key = "schema",
+              value = Json.JsonObject([JsonEntry{ key = "type", value = Json.JsonString("string") }]),
+            },
+          ],
+        ),
+      )
+    }
+  }
+  return out
+}
+
+// --- mapping x-bit-attrs into native OpenAPI/JSON Schema keywords ------
+//
+// `mapSchemaAttrs` walks the WHOLE document `jsonSchema<T>()` returned —
+// the root schema and every `$defs` entry a nested `@json` class
+// contributed — because a nested class's own properties carry their own
+// `"x-bit-attrs"` exactly like the root's do, at whatever depth they occur.
+fn mapSchemaAttrs(j: Json): Json {
+  return match (j) {
+    JsonNull => j
+    JsonBool(_) => j
+    JsonInt(_) => j
+    JsonFloat(_) => j
+    JsonString(_) => j
+    JsonArray(items) => Json.JsonArray(mapSchemaAttrsEach(items))
+    JsonObject(entries) => mapSchemaAttrsObject(entries)
+  }
+}
+
+fn mapSchemaAttrsEach(items: []Json): []Json {
+  let out = []Json(0)
+  for it of items {
+    out = append(out, mapSchemaAttrs(it))
+  }
+  return out
+}
+
+// Rewrites one object's own entries: every value is mapped recursively
+// first (so a nested `$defs`/`properties` object is handled the same way),
+// then this object's own `"x-bit-attrs"` entry — if it has one — is
+// replaced with the keyword entries `attrKeywordEntries` derives from it.
+// An object with no `"x-bit-attrs"` key is otherwise unchanged.
+fn mapSchemaAttrsObject(entries: []JsonEntry): Json {
+  let out = []JsonEntry(0)
+  let attrs = []Json(0)
+  let hasAttrs = false
+  for e of entries {
+    if (e.key == "x-bit-attrs") {
+      hasAttrs = true
+      attrs = jsonArrayItems(e.value)
+      continue
+    }
+    out = append(out, JsonEntry{ key = e.key, value = mapSchemaAttrs(e.value) })
+  }
+  if (hasAttrs) {
+    for a of attrs {
+      out = append(out, ...attrEntriesFor(a))
+    }
+  }
+  return Json.JsonObject(out)
+}
+
+// One `x-bit-attrs` element (`{"name": "...", "args": [...]}`) into zero or
+// more OpenAPI keyword entries.
+fn attrEntriesFor(a: Json): []JsonEntry {
+  let name = ""
+  let args = []Json(0)
+  for e of jsonObjectEntries(a) {
+    if (e.key == "name") {
+      name = jsonStringValue(e.value)
+    }
+    if (e.key == "args") {
+      args = jsonArrayItems(e.value)
+    }
+  }
+  return attrKeywordEntries(name, args)
+}
+
+// pkg/web's own validator attributes (validate.bit) that have a matching
+// OpenAPI/JSON Schema keyword: `minLen`/`maxLen` (string length, in
+// characters) into `minLength`/`maxLength`, `min`/`max` (`i64` range) into
+// `minimum`/`maximum`, and `email`/`url`/`uuid` into the matching `format`
+// value. `nonEmpty` has no keyword of its own (`minLength: 1` would claim a
+// stricter guarantee than the blank-string check it actually runs) and an
+// application's own hand-written rule (validate.bit's own `@iban` example)
+// names no OpenAPI concept at all — both are dropped here, never left in
+// the document as `x-bit-attrs`.
+fn attrKeywordEntries(name: string, args: []Json): []JsonEntry {
+  switch (name) {
+    case "minLen":
+      return [JsonEntry{ key = "minLength", value = attrIntArg(args) }]
+    case "maxLen":
+      return [JsonEntry{ key = "maxLength", value = attrIntArg(args) }]
+    case "min":
+      return [JsonEntry{ key = "minimum", value = attrIntArg(args) }]
+    case "max":
+      return [JsonEntry{ key = "maximum", value = attrIntArg(args) }]
+    case "email":
+      return [JsonEntry{ key = "format", value = Json.JsonString("email") }]
+    case "url":
+      return [JsonEntry{ key = "format", value = Json.JsonString("uri") }]
+    case "uuid":
+      return [JsonEntry{ key = "format", value = Json.JsonString("uuid") }]
+    default:
+      return []JsonEntry(0)
+  }
+}
+
+// `args[0]`'s own source spelling (`classjsonschema.bit`'s
+// `jsonSchemaAttrArgWord`) parsed back into the `i64` the keyword needs.
+// The compiler already required this argument to typecheck as `int`/`i64`
+// at the attribute's own call site (`minLen`/`maxLen`/`min`/`max` in
+// validate.bit), so `parseInt` failing here would mean the compiler emitted
+// a spelling it did not itself accept — defended the same way
+// `static.bit`'s own `parseInt` calls are, not because it is expected to
+// fire.
+fn attrIntArg(args: []Json): Json {
+  if (len(args) == 0) {
+    return Json.JsonInt(0)
+  }
+  let n = parseInt(jsonStringValue(args[0])) catch _ {
+    0
+  }
+  return Json.JsonInt(i64(n))
+}
+
+fn jsonArrayItems(j: Json): []Json {
+  return match (j) {
+    JsonArray(items) => items
+    _ => []Json(0)
+  }
+}
+
+fn jsonObjectEntries(j: Json): []JsonEntry {
+  return match (j) {
+    JsonObject(entries) => entries
+    _ => []JsonEntry(0)
+  }
+}
+
+fn jsonStringValue(j: Json): string {
+  return match (j) {
+    JsonString(s) => s
+    _ => ""
+  }
+}
