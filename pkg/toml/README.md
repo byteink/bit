@@ -6,12 +6,12 @@ standard library. Reads a document into one `Toml` value, and writes a
 
 ## Install
 
-`bit add bitlang.org/pkg/toml@^0.1.2` writes:
+`bit add bitlang.org/pkg/toml@^0.1.3` writes:
 
 ```json
 {
   "dependencies": {
-    "toml": "bitlang.org/pkg/toml@^0.1.2"
+    "toml": "bitlang.org/pkg/toml@^0.1.3"
   }
 }
 ```

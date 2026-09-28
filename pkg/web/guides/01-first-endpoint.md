@@ -21,8 +21,8 @@ bit init: wrote bit.json
 Add `pkg/web`, the framework this part of the Book is built on:
 
 ```text
-$ bit add bitlang.org/pkg/web@v0.7.0
-bit add: web -> bitlang.org/pkg/web@0.7.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
+$ bit add bitlang.org/pkg/web@v0.8.0
+bit add: web -> bitlang.org/pkg/web@0.8.0 (945fa57bcecbb5446737669d43fd8eae3b0f7caa)
 ```
 
 `bit add` writes the dependency into `bit.json` and pins the exact commit it

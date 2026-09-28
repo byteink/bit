@@ -8,14 +8,14 @@ needs to know which one ran.
 
 ## Install
 
-`bit add bitlang.org/pkg/auth@^0.2.0` (and `bitlang.org/pkg/web@^0.7.0`, which
+`bit add bitlang.org/pkg/auth@^0.3.0` (and `bitlang.org/pkg/web@^0.8.0`, which
 it runs on) writes:
 
 ```json
 {
   "dependencies": {
-    "auth": "bitlang.org/pkg/auth@^0.2.0",
-    "web": "bitlang.org/pkg/web@^0.7.0"
+    "auth": "bitlang.org/pkg/auth@^0.3.0",
+    "web": "bitlang.org/pkg/web@^0.8.0"
   }
 }
 ```

@@ -14,12 +14,12 @@ page under [Docs](#docs) below.
 
 ## Install
 
-`bit add bitlang.org/pkg/orm@v0.1.0` writes:
+`bit add bitlang.org/pkg/orm@v0.1.1` writes:
 
 ```json
 {
   "dependencies": {
-    "orm": "bitlang.org/pkg/orm@v0.1.0"
+    "orm": "bitlang.org/pkg/orm@v0.1.1"
   }
 }
 ```
