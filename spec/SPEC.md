@@ -1091,9 +1091,13 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   a field of a class that does not carry `@json` is **E0139**.
 - Entries are emitted in **declaration order**, one per field.
 - A field's type must be a scalar, `string`, `bool`, `[]T`, `map<string, T>`,
-  `Option<T>` or a nested class that itself carries `@json`; in the three
-  container forms `T` must itself be one of the first four shapes or a nested
-  `@json` class, never another container. Anything else is **E0141**, naming
+  `Option<T>`, a payload-free `enum` (every variant carries no payload) or a
+  nested class that itself carries `@json`; in the three container forms `T`
+  must itself be one of those shapes, never another container. A payload-free
+  `enum` field's value is its variant's own NAME, as a JSON string (`toJson`)
+  or accepted back from one of the declared names (`jsonDecode<T>`) - an
+  unknown name fails naming the field and every declared variant. Anything
+  else is **E0141**, naming
   the field and the type - including a class that did not opt in, since
   recursing into one would defeat the mark. One rejected field rejects the
   whole class: a `toJson` that silently omitted a field would be invisible in
@@ -1201,7 +1205,8 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   describes the TYPE and never reads a value at all.
 - `T` must be a class carrying `@json`; anything else is a compile error at
   the call, never a runtime failure - the same shape as `jsonDecode<T>`'s
-  own **E0145**, under its own code (assigned where it is implemented).
+  own **E0145**, under its own code, **E0172**
+  (`compiler/classjsonschemacall.bit`).
 - **The dialect is JSON Schema 2020-12**
   (<https://json-schema.org/draft/2020-12>), the exact dialect OpenAPI 3.1's
   Schema Object uses - not an earlier draft, and not OpenAPI 3.0's own
@@ -1216,6 +1221,10 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   | a float type | `{"type": "number"}` |
   | `bool` | `{"type": "boolean"}` |
   | `string` | `{"type": "string"}` |
+  | a payload-free `enum` | `{"type": "string", "enum": [<every declared
+    variant name>]}` - 2020-12's `enum` keyword (§6.1.2) restricts an
+    instance to one of a fixed list, matching what `toJson`/`jsonDecode<T>`
+    already accept |
   | `[]T` | `{"type": "array", "items": <T's fragment>}` - 2020-12's `items`
     keyword applies to every element uniformly whenever no `prefixItems` is
     present, which this synthesis never emits, so this is the same meaning
@@ -1229,7 +1238,11 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
     `nullable` keyword in this dialect). This is not optional: `@json`
     itself emits an absent `Option<T>` as an explicit `null` (this
     section's own `toJson` bullets), so a schema that did not admit null
-    for that field would reject the encoder's own correct output |
+    for that field would reject the encoder's own correct output. A nested
+    `@json` class has no `type` keyword of its own to fold null into (its
+    fragment is a bare `$ref`), so `Option<NestedClass>` takes 2020-12's
+    `anyOf` instead: `{"anyOf": [{"$ref": "#/$defs/<Name>"}, {"type":
+    "null"}]}` |
   | a nested `@json` class | `{"$ref": "#/$defs/<ClassName>"}`, with one
     `$defs` entry per DISTINCT class reachable from the root, deduplicated -
     a self-referential class (`class Node { next: Option<Node> }`, already
