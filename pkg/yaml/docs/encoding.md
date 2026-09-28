@@ -40,9 +40,9 @@ version: "1.4.2"
 encoder has to protect the same fact in the other direction: if
 `YamlString("no")` were written out bare, re-reading it would produce a
 `YamlBool`, and the round trip would have silently changed the data's type.
-Before emitting any string scalar, `yamlEncode` runs it through
-`schema.bit`'s real resolver - `yamlResolveScalar` - and quotes it whenever
-the result is not the same string back:
+Before emitting any string scalar, `yamlEncode` runs it through the same
+resolver a parse uses - `yamlResolveScalar` - and quotes it whenever the
+result is not the same string back:
 
 ```bit
 import { Yaml, yamlAsString, yamlEncode, yamlIsString, yamlParse } from "yaml"
