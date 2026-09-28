@@ -9,7 +9,7 @@ not know `HELLO`.
 ```json
 {
   "dependencies": {
-    "redis": "bitlang.org/pkg/redis@v0.1.0"
+    "redis": "bitlang.org/pkg/redis@^0.2.0"
   }
 }
 ```

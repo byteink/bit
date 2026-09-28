@@ -15,7 +15,7 @@ that means. The two things it deliberately does not accept are YAML 1.1's
 ```json
 {
   "dependencies": {
-    "yaml": "bitlang.org/pkg/yaml@v0.1.0"
+    "yaml": "bitlang.org/pkg/yaml@^0.1.3"
   }
 }
 ```

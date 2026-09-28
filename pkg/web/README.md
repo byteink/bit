@@ -21,7 +21,7 @@ this is stated here rather than enforced.
 ```json
 {
   "dependencies": {
-    "web": "bitlang.org/pkg/web@v0.1.0"
+    "web": "bitlang.org/pkg/web@^0.7.0"
   }
 }
 ```
