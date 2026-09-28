@@ -1072,9 +1072,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   building the `Json` value (`std/json`) that `jsonEncode` renders. It is an
   ordinary member: callable, testable, callable across modules, listed by
   `bit doc`, and exported exactly when the class is.
-- The module declaring the class must import `Json` and `JsonEntry` from
-  `"std/json"` under those names; the member is written in terms of both.
-  Without them the class is **E0142** and nothing is synthesized.
+- The module declaring the class must import *something* from `"std/json"` -
+  the compiler resolves `Json`/`JsonEntry`, the names the member is written
+  in terms of, itself. No import from `"std/json"` at all is **E0142**.
 - **The mark is opt-in and it is the consent.** A class without `@json` has no
   `toJson` at all. Synthesizing for every class would expose a field the moment
   someone adds one to a type nobody meant to serialize.
@@ -1398,9 +1398,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - A class carrying `@table` that also declares `tableAttrs` itself is
   **E0157**, naming both - the same rule as `tableDescriptor`'s own E0148.
 - The module declaring the class must import `FieldDesc` and `AttrDesc` from
-  `"std/sql"` under those names; the member is written in terms of both.
-  Without them the class is **E0150** and nothing is synthesized - the same
-  rule, for the same reason, `@json`'s **E0142** is.
+  `"std/sql"` under those names; the member is written in terms of both,
+  by name, unlike `@json`'s own **E0142** (#6232). Without them the class is
+  **E0150** and nothing is synthesized.
 - Fields are ordered; that order is the memory layout order, exactly as
   `@json`'s is.
 - **`@hasMany`/`@hasOne`/`@belongsTo` are compiler-known relation marks**,
@@ -1492,9 +1492,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   composite literal, bypassing whatever invariant a hand-written `init`
   enforces (`balance >= 0`), so a row could come back in a state the class
   refuses to construct through its own `init`.
-- The module declaring `T` must import `Rows` from `"std/sql"`; the mapper's
-  signature is written in terms of it. Without it the class is **E0153** and
-  nothing is synthesized - the same rule `@table`'s **E0150** is.
+- The module declaring `T` must import *something* from `"std/sql"` - the
+  compiler resolves `Rows`, the name the mapper's signature is written in
+  terms of, itself. No import from `"std/sql"` at all is **E0153** (#6232).
 - **A field's column is its own name in snake_case**, unless the field
   carries `@column("...")`: `createdAt` claims `created_at`,
   `@column("e_mail")` claims `e_mail`. `@column` is compiler-known, matched
