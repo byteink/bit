@@ -106,7 +106,11 @@ encrypts that buffer with AES-256-GCM and stores a CRC-32C of the
 more expensive authenticated decrypt, so a truncated or bit-flipped file
 fails with a clear "corrupted" message rather than the AEAD's generic
 authentication error. `exportCompressed` is the separate, gzip-compressed
-cold copy for archiving outside Inkwell.
+cold copy for archiving outside Inkwell. `append(out, ...nonce)` uses the
+spread form of `append`: it appends every byte of `nonce` as its own
+element, rather than `nonce` itself as a single element - the form to reach
+for whenever you are appending one slice onto another (see
+[Functions](/language/functions) for the same `...` on a parameter list).
 
 ```bit
 export enum Status { Draft, Published, Archived }
@@ -205,8 +209,8 @@ export fn backupDrafts(drafts: []Draft, key: []byte, nonce: []byte): []byte! {
   out = append(out, byte((sum >> 16) & 0xff))
   out = append(out, byte((sum >> 8) & 0xff))
   out = append(out, byte(sum & 0xff))
-  out = append(out, string(nonce))
-  out = append(out, string(ciphertext))
+  out = append(out, ...nonce)
+  out = append(out, ...ciphertext)
   return out
 }
 
@@ -286,7 +290,7 @@ plain file copy; encryption matters most once the backup can leave your
 machine (a USB drive, a cloud upload). Add it before you need it, not after
 a backup has already left your hands unencrypted.
 
-## What we built
+## What you built
 
 Inkwell now backs up every draft into one encrypted file, checks it for
 corruption before decrypting, and restores it back into `Draft` values. You

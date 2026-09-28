@@ -68,7 +68,7 @@ fn listDrafts(): []Draft! {
 Two stores now need to be interchangeable: whatever `ink`'s commands call
 has to work whether drafts live in files or in Postgres. `Store` names the
 three operations both need - no `implements` clause required, since Bit's
-interfaces are structural (SPEC §14.3):
+interfaces are structural: any type with the right methods satisfies one:
 
 ```bit
 // What `ink` needs from wherever drafts live. `FileStore` and `SqlStore`
@@ -141,7 +141,7 @@ that would mean something different if the enum were ever reordered.
 ## `SqlStore`
 
 `std/sql`'s `find`/`findOne` auto-map a query into a class, but only when
-every field is one of five scalar types (SPEC §15) - `Draft.tags` is
+every field is one of a handful of scalar types - `Draft.tags` is
 `[]string`, which is not one of them. `sqlFindMany`/`sqlFindOne` take a
 hand-written mapper instead, for exactly this shape:
 
@@ -265,7 +265,7 @@ a caller matching on `Store.load`'s failure does not need to know which
 store it is talking to. `sqlFindOne`'s own "more than one row" case cannot
 happen here, since `id` is the table's primary key.
 
-## What we built
+## What you built
 
 Inkwell now has two stores behind one `Store` interface, and a real
 database it can move drafts into without touching a single call site that

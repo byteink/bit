@@ -69,16 +69,15 @@ up.
 28. [Transactions](../../pkg/web/guides/15-transactions.md)
 29. [Testing the API](../../pkg/web/guides/16-testing-the-api.md)
 30. [Operations](../../pkg/web/guides/17-operations.md)
-31. Shipping a single binary - continued in Part 5, chapter 34, below.
 
 ## Part 5: Running it for real
 
 Inkwell is a real program now. The last part makes it fast, observable, and
 easy to ship.
 
-32. Background jobs - `pkg/jobs`: `@job`, `register<T>`, `enqueue<T>`, retries.
-33. Making it fast - measure first, `BIT_GC_STATS`, `std/prof`, fixing one real hot spot.
-34. Shipping - one binary, cross-compiling for Linux, macOS and Windows.
+31. Background jobs - `pkg/jobs`: `@job`, `register<T>`, `enqueue<T>`, retries.
+32. Making it fast - measure first, `BIT_GC_STATS`, `std/prof`, fixing one real hot spot.
+33. Shipping - one binary, cross-compiling for Linux, macOS and Windows.
 
 ## Where things are defined
 

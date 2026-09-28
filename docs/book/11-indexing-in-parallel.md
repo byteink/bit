@@ -276,7 +276,7 @@ Reach for `buildIndex`'s shape only once indexing shows up as real, measured
 time - a worker pool adds channels and a merge step that a `for` loop over
 `indexChunk` does not need.
 
-## What we built
+## What you built
 
 Inkwell now builds a word index across a fixed pool of green threads, splitting
 the work into chunks and merging the partial results back into one map. You

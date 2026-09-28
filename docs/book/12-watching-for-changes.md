@@ -218,7 +218,7 @@ earlier is simpler and needs no channel, timer, or spawned green thread at
 all. Reach for `watchLoop`'s shape when the checking itself needs to keep
 happening on its own schedule, independent of any single request.
 
-## What we built
+## What you built
 
 Inkwell now runs a background loop that polls for changed drafts, stops on
 either an explicit signal or Ctrl-C, and never leaves a stray channel or

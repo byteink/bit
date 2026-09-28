@@ -118,7 +118,7 @@ quote literal text like `'at'` above) fails with a pattern error. Reach for
 [Standard library: time](/std/time) when a pattern does not render what you
 expect.
 
-## What we built
+## What you built
 
 Every draft can now report how long it takes to read and when it was last
 touched, in a person's own words - built entirely on `Settings`

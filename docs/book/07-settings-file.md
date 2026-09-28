@@ -151,7 +151,7 @@ That is deliberate - silently parsing a string as a number would also accept
 `"18o"` and hand the rest of the program garbage. Fix the file, not the
 loader.
 
-## What we built
+## What you built
 
 `ink.toml` now controls where drafts live and how fast Inkwell assumes you
 read, decoded once into a `Settings` that the rest of the program uses

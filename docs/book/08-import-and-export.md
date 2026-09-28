@@ -61,7 +61,7 @@ fn fromDraftJson(j: DraftJson): Draft {
 ```
 
 A class carrying `@json` gains a `toJson(): Json` method the compiler writes
-for it (SPEC §10.5), so exporting a whole list is a fold over that:
+for it, so exporting a whole list is a fold over that:
 
 ```bit
 export fn exportJson(drafts: []Draft): string {
@@ -89,8 +89,8 @@ export fn importJson(text: string): []Draft! {
 }
 ```
 
-`jsonDecode<T>` only works on a single `@json` class (SPEC §10.5, `T` must
-carry the mark) - there is no version that decodes straight into `[]T`, so
+`jsonDecode<T>` only works on a single `@json` class (`T` must carry the
+mark) - there is no version that decodes straight into `[]T`, so
 `importJson` unwraps the outer array itself and decodes one `DraftJson` per
 element.
 
@@ -184,13 +184,13 @@ import drafts.json` reads the file and calls `saveDraft` for each row
 ## Sharp edges
 
 `importJson` rejects an unknown key in the input (`@json`'s decoder never
-silently drops a field, SPEC §10.5) and a `status` that is not one of the
+silently drops a field) and a `status` that is not one of the
 three names `Draft`/`Published`/`Archived` - both fail loudly, by field
 path, rather than importing a half-understood draft. `importCsv` fails the
 same way on a `status` column it does not recognise, through
 `statusFromText`.
 
-## What we built
+## What you built
 
 Inkwell can now move a whole set of drafts out to JSON or CSV and back,
 without ever losing a tag or a status - `status` round-trips through both
