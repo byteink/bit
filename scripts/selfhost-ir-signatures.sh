@@ -247,6 +247,51 @@
 # the tree on all 8 of these files, and all three signatures will explain
 # zero files that run.
 #
+# #6201 (jsonSchema<T>() resolved once per instantiation inside a GENERIC
+# free function/method, #6202-#6206) reddens `ir`/`iropt` on the two fixtures
+# that shape actually needs (#6212):
+# _tests_/cases/run_json_schema_generic.bit and
+# _tests_/cases/run_json_schema_generic_method.bit. Both call `jsonSchema<T>()`
+# TWICE: once directly (renamed exactly like `6161-json-schema-specialize-call`
+# above) and once INDIRECTLY, from inside a separately-instantiated generic
+# (`wrap<T>()`/`Box.describe<T>()`, declared in a different module,
+# specialized here for this file's own `@json` class) — that second call site
+# is never rewritten in place, so the tree still emits a thin PER-INSTANTIATION
+# forwarder function reproducing the untouched generic dispatch, one line of
+# real work: `func (m<N>$)?jsonSchema$<N>() <Type> { bb0(): %N = call
+# @__json_schema_<Ident>() <Type>; ret %N }`. That is why
+# `6161-json-schema-specialize-call` does not explain these two files even
+# though the call-rename half is identical: its insertion check
+# (`schemaInsertBlockOk`) requires EXACTLY one inserted function with no
+# second `func ` or bare `}` inside the insertion, and this shape inserts
+# TWO (the specialized body, then the forwarder) — the forwarder's own `}`
+# is exactly the extra line that check is built to reject.
+#
+# `6201-json-schema-generic-wrapper-specialize` (`ir`/`iropt`) — declared as
+# its own signature rather than widening `6161-json-schema-specialize-call`
+# above, so a shape as tightly scoped as this one names the reason it swallows
+# a mismatch instead of `6161`'s check silently growing a second accepted
+# form. Checked as an identity: the call-rename half reuses the same
+# `isSchemaCallRename`/`schemaForwardWalk` machinery as `6161-json-schema-
+# specialize-call` (still exactly one renamed call site), then the entire
+# insertion after the walk's split point must be TWO well-formed functions,
+# contiguous and in order: `func __json_schema_<Ident>(...) <Type> { ... }`
+# (the same specialized body `6161-json-schema-specialize-call` validates),
+# immediately followed by the ordinary inter-function blank separator and the
+# forwarder above — its callee name is the EXACT `(m<N>$)?jsonSchema$<N>` text
+# the call rename renamed FROM, its return type the SAME `<Type>` the rename
+# shares on both sides, and its own call target the SAME `__json_schema_
+# <Ident>` the specialized body declares — nothing else between or after is
+# tolerated. Derived from and checked against the real `--dump-ir-pre`/
+# `--dump-ir` dumps of both fixtures (captured 2026-09-28, ticket #6212):
+# both insert `__json_schema_Widget`/`__json_schema_Gadget` directly after
+# `main()`, then `m3$jsonSchema$15` (the forwarder) directly after that,
+# before the file's pre-existing `toJson$t295`/`__jsonAppend$t295` resume
+# byte-identical to the oracle. EXPECTED TO RETIRE AT THE 0.33.0 REPIN, same
+# reasoning as `6161-json-schema-specialize-call` above: 0.33.0 will contain
+# #6201, so it will be the first oracle that agrees with the tree on both
+# these files, and this signature will explain zero files that run.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
@@ -412,8 +457,10 @@ explainMismatch() {
     # isSchemaCallRename (#6161) -- true when `a` (oracle) is
     # `  %N = call @(m<N>$)?jsonSchema$<N>() <Type>` and `b` (tree) is the
     # SAME `%N = call @` prefix and the SAME trailing `<Type>`, renaming only
-    # the callee to `(m<N>$)?__json_schema_<Ident>`. Sets the global
-    # `jsonSchemaRenameIdent` to `<Ident>` on success.
+    # the callee to `(m<N>$)?__json_schema_<Ident>`. Sets the globals
+    # `jsonSchemaRenameIdent` to `<Ident>`, `jsonSchemaCalleeA` to the full
+    # oracle callee text (e.g. `m3$jsonSchema$15`, the #6201 forwarder-name
+    # source) and `jsonSchemaType` to `<Type>` on success.
     function isSchemaCallRename(a, b,    pa, pb, ra, rb, ca, cb, calleeA, calleeB, tyA, tyB, idx) {
       if (a !~ /^  %[0-9]+ = call @/) { return 0 }
       if (b !~ /^  %[0-9]+ = call @/) { return 0 }
@@ -432,6 +479,8 @@ explainMismatch() {
       if (calleeB !~ /^(m[0-9]+\$)?__json_schema_[A-Za-z_][A-Za-z0-9_]*$/) { return 0 }
       idx = index(calleeB, "__json_schema_")
       jsonSchemaRenameIdent = substr(calleeB, idx + length("__json_schema_"))
+      jsonSchemaCalleeA = calleeA
+      jsonSchemaType = tyA
       return 1
     }
     # schemaForwardWalk -- walks linesA/linesB INDEX-ALIGNED (position i on
@@ -495,6 +544,52 @@ explainMismatch() {
       if (insLen == 0) { return (k == nA) ? 1 : 0 }
       if (k == nA) { return 0 }
       return schemaInsertBlockOk(linesB, k, insLen, jsonSchemaRenameIdent)
+    }
+    # schemaGenericWrapperInsertOk (#6201) -- see this files header above for
+    # the derivation. True when linesB[k+1 .. k+insLen] is exactly TWO
+    # well-formed appended functions, contiguous and in order: the
+    # specialized body (`schemaInsertBlockOk`s single-function shape, named
+    # `__json_schema_<ident>`), then the ordinary inter-function blank
+    # separator, then a ONE-LINE forwarder reproducing the untouched generic
+    # dispatch: `func <calleeA>() <ty> { bb0(): %N = call
+    # @__json_schema_<ident>() <ty>; ret %N }`, using the SAME SSA id on its
+    # call and ret. No other line is tolerated inside either block.
+    function schemaGenericWrapperInsertOk(linesB, k, insLen, ident, calleeA, ty,
+        i, hdr1, close1, fwdHdr, fwdCallPfx, ssa, tailIdx) {
+      hdr1 = "^func __json_schema_" ident "\\(\\) [A-Za-z_][A-Za-z0-9_<>]* \\{$"
+      if (linesB[k + 1] !~ hdr1) { return 0 }
+      close1 = 0
+      for (i = k + 2; i <= k + insLen; i++) {
+        if (linesB[i] == "}") { close1 = i; break }
+        if (linesB[i] ~ /^func /) { return 0 }
+      }
+      if (close1 == 0) { return 0 }
+      if (linesB[close1 + 1] != "") { return 0 }
+      fwdHdr = "func " calleeA "() " ty " {"
+      if (linesB[close1 + 2] != fwdHdr) { return 0 }
+      if (linesB[close1 + 3] != "bb0():") { return 0 }
+      fwdCallPfx = linesB[close1 + 4]
+      if (fwdCallPfx !~ /^  %[0-9]+ = call @__json_schema_/) { return 0 }
+      ssa = fwdCallPfx
+      sub(/^  %/, "", ssa); sub(/ =.*/, "", ssa)
+      if (linesB[close1 + 4] != "  %" ssa " = call @__json_schema_" ident "() " ty) { return 0 }
+      if (linesB[close1 + 5] != "  ret %" ssa) { return 0 }
+      if (linesB[close1 + 6] != "}") { return 0 }
+      tailIdx = close1 + 6
+      if (tailIdx == k + insLen) { return 1 }
+      if (tailIdx == k + insLen - 1 && linesB[k + insLen] == "") { return 1 }
+      return 0
+    }
+    # jsonSchemaGenericWrapperCall (#6201) -- orchestrates the helpers above;
+    # reuses schemaForwardWalk for the call-rename half exactly like
+    # jsonSchemaSpecializeCall does, then validates the two-function
+    # insertion with schemaGenericWrapperInsertOk.
+    function jsonSchemaGenericWrapperCall(nA, linesA, nB, linesB,    insLen, k) {
+      insLen = nB - nA
+      if (insLen <= 0) { return 0 }
+      if (!schemaForwardWalk(nA, linesA, nB, linesB)) { return 0 }
+      k = jsonSchemaSplitK
+      return schemaGenericWrapperInsertOk(linesB, k, insLen, jsonSchemaRenameIdent, jsonSchemaCalleeA, jsonSchemaType)
     }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
@@ -601,6 +696,19 @@ explainMismatch() {
         }
       }
 
+      # #6201: jsonSchema<T>() resolved once per instantiation inside a
+      # GENERIC free function/method -- see this files header above for the
+      # derivation. Tried after `6161-json-schema-specialize-call` above:
+      # that checks single-inserted-function shape does not match here (it
+      # correctly rejects the forwarders own closing brace as a premature
+      # `}`), so trying this second, narrower shape next never steals a file
+      # `6161-json-schema-specialize-call` already explains.
+      if (kind == "ir" || kind == "iropt") {
+        if (jsonSchemaGenericWrapperCall(nA, linesA, nB, linesB)) {
+          print "6201-json-schema-generic-wrapper-specialize"; exit 0
+        }
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -632,8 +740,8 @@ declaredSignatureNames() {
         "6161-json-decode-enum-error-resolved"
       return
       ;;
-    ir) printf '%s\n' "6194-generic-method-receiver-explode" "6161-json-schema-specialize-call"; return ;;
-    iropt) printf '%s\n' "6194-generic-method-receiver-explode" "6161-json-schema-specialize-call"; return ;;
+    ir) printf '%s\n' "6194-generic-method-receiver-explode" "6161-json-schema-specialize-call" "6201-json-schema-generic-wrapper-specialize"; return ;;
+    iropt) printf '%s\n' "6194-generic-method-receiver-explode" "6161-json-schema-specialize-call" "6201-json-schema-generic-wrapper-specialize"; return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
     "6194-generic-method-receiver-unsubstituted-type" \
@@ -641,5 +749,6 @@ declaredSignatureNames() {
     "6161-json-decode-column-shift" \
     "6161-json-schema-synthesized-insert" \
     "6161-json-decode-enum-error-resolved" \
-    "6161-json-schema-specialize-call"
+    "6161-json-schema-specialize-call" \
+    "6201-json-schema-generic-wrapper-specialize"
 }

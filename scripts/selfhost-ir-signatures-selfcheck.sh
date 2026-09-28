@@ -384,6 +384,117 @@ bb0():
     fail=1
   fi
 
+  # --- #6201 POSITIVE (ir, generic-wrapper-specialize): a small synthetic
+  # function matching the real shape captured from
+  # _tests_/cases/run_json_schema_generic.bit and
+  # run_json_schema_generic_method.bit (ticket #6212): the call renames
+  # exactly like `6161-json-schema-specialize-call`, but the tree ALSO
+  # inserts a second function -- a one-line forwarder reproducing the
+  # untouched generic dispatch used by a separately-instantiated generic
+  # (wrap<T>()/Box.describe<T>()) -- directly after the specialized body,
+  # before the pre-existing helper() resumes. ---
+  oracle_6201_callins="$oracle_6161_callins"
+  bit2_6201_callins='func main() void {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret
+}
+
+func __json_schema_Widget() Json {
+bb0():
+  %0 = const_string "type"
+  ret %0
+}
+
+func jsonSchema$14() Json {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret %0
+}
+
+func helper() void {
+bb0():
+  ret
+}'
+  sig6201ci=$(explainMismatch "$oracle_6201_callins" "$bit2_6201_callins" ir)
+  rc6201ci=$?
+  if [ "$rc6201ci" -ne 0 ] || [ "$sig6201ci" != "6201-json-schema-generic-wrapper-specialize" ]; then
+    echo "FAIL: the real #6201 generic-wrapper call-rename-plus-two-inserts was not explained (rc=$rc6201ci sig='$sig6201ci')"
+    fail=1
+  fi
+
+  # --- #6201 MUTATION (ir): the forwarder exists but calls a DIFFERENT
+  # ident than the one the direct call was renamed to -- must be rejected. ---
+  bit2_6201_wrongident='func main() void {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret
+}
+
+func __json_schema_Widget() Json {
+bb0():
+  %0 = const_string "type"
+  ret %0
+}
+
+func jsonSchema$14() Json {
+bb0():
+  %0 = call @__json_schema_Other() Json
+  ret %0
+}
+
+func helper() void {
+bb0():
+  ret
+}'
+  sig6201wi=$(explainMismatch "$oracle_6201_callins" "$bit2_6201_wrongident" ir)
+  rc6201wi=$?
+  if [ "$rc6201wi" -eq 0 ] || [ -n "$sig6201wi" ]; then
+    echo "FAIL: a forwarder calling the WRONG ident was wrongly explained (rc=$rc6201wi sig='$sig6201wi')"
+    fail=1
+  fi
+
+  # --- #6201 MUTATION (ir): the forwarder's own ret references a DIFFERENT
+  # SSA id than its own call result -- must be rejected. ---
+  bit2_6201_retmismatch='func main() void {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret
+}
+
+func __json_schema_Widget() Json {
+bb0():
+  %0 = const_string "type"
+  ret %0
+}
+
+func jsonSchema$14() Json {
+bb0():
+  %0 = call @__json_schema_Widget() Json
+  ret %1
+}
+
+func helper() void {
+bb0():
+  ret
+}'
+  sig6201rm=$(explainMismatch "$oracle_6201_callins" "$bit2_6201_retmismatch" ir)
+  rc6201rm=$?
+  if [ "$rc6201rm" -eq 0 ] || [ -n "$sig6201rm" ]; then
+    echo "FAIL: a forwarder ret referencing the WRONG SSA id was wrongly explained (rc=$rc6201rm sig='$sig6201rm')"
+    fail=1
+  fi
+
+  # --- #6201 MUTATION (ir): only the specialized body is inserted, no
+  # forwarder at all -- this is `6161-json-schema-specialize-call`s shape,
+  # not this ones, and must not ALSO satisfy this signature. ---
+  sig6201single=$(explainMismatch "$oracle_6201_callins" "$bit2_6161_callins" ir)
+  rc6201single=$?
+  if [ "$sig6201single" = "6201-json-schema-generic-wrapper-specialize" ]; then
+    echo "FAIL: a single-function insert (6161s shape) was wrongly explained as 6201 (rc=$rc6201single sig='$sig6201single')"
+    fail=1
+  fi
+
   # --- #6194 POSITIVE (ir/iropt): minimal synthetic dumps matching the
   # measured shape -- pre-opt gains field_get/gc_alloc in a [2x,4x] ratio,
   # post-opt loses ONLY gc_alloc. ---
