@@ -100,10 +100,7 @@
 # above — `--dump-ir`/`--dump-ir-pre` do not vary by ISA at all). Their
 # per-opcode derivations are preserved in git history at this file's state
 # before #5914 — a dead identity's math is not load-bearing for anything
-# still declared. The `catchDisambigAst`/`catchDisambigFmt` machinery below
-# (#5474, #5510) is unaffected: nothing in 0.27.0 touches `catch`
-# composite-default disambiguation, so it still explains its own two corpus
-# files under `ast`/`fmt`.
+# still declared.
 #
 # #5921-ptrof-string-type was retired by the stage0 0.28.0 repin (#5957):
 # 0.28.0 contains #5921 (`ptrOf(s: string): *u8`), so 0.28.0 is the first
@@ -116,9 +113,24 @@
 # against the same pin — no `ir`/`iropt` signature was declared going in, so
 # neither RETIRED anything. Its opcode-free line-diff derivation (the
 # ptrofStringType/lastColonSpace functions) is preserved in git history at
-# this file's state before #5957. The `catchDisambigAst`/`catchDisambigFmt`
-# machinery (#5474, #5510) is unaffected: nothing in 0.28.0 touches `catch`
-# composite-default disambiguation.
+# this file's state before #5957.
+#
+# The `catch`-composite-default `ast`/`fmt` disambiguation pair (#5474,
+# #5510) and the generic-class-member leading-comment `fmt` signature were
+# both retired by the stage0 0.32.0 repin: 0.32.0's own oracle already
+# parses and formats both shapes the way the tree does, so neither explains
+# anything anymore. Confirmed by `bash scripts/selfhost-diffast.sh` (MATCH=
+# 1410 MISMATCH=0 EXPLAINED=0) and `bash scripts/selfhost-difffmt.sh`
+# (MATCH=2036 MISMATCH=0 EXPLAINED=0) against the 0.32.0 pin (this tree,
+# aarch64-macos, the only host this repin was built on) -- no divergence
+# remains for either kind, so there is nothing left for any signature to
+# explain. `ast`/`fmt` had no automated RETIRED audit (unlike `ir`/`iropt`/
+# `types`, checked by scripts/selfhost-diffdump.sh's run_ir()/run_types()),
+# so this pair was confirmed dead by hand rather than by that mechanism
+# failing. Their `catchDisambigAst`/`catchDisambigFmt`/`fmtCodeOnly`/
+# `genericMemberCommentFmt` derivations and ticket numbers are preserved in
+# git history and in scripts/selfhost-ir-signatures-selfcheck.sh's
+# retirement note, at this file's state before that repin.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
@@ -126,129 +138,12 @@
 # forks one fresh awk process, so all state below is per-call — no cross-file
 # leakage between corpus files. `ast`/`fmt` compare TEXT (an S-expression
 # dump / formatted source), not IR opcodes. No signature is currently
-# declared for `ir`/`iropt`/`types` (see Retirement history above) — a
-# future lowering or typing change that needs one restores the relevant
-# machinery this file carried before #5914/#5957, from git history.
+# declared for any kind (see Retirement history above) — a future parsing,
+# formatting, lowering or typing change that needs one restores the relevant
+# machinery this file carried before #5914/#5957/the 0.32.0 repin, from git
+# history.
 explainMismatch() {
   awk -v kind="$3" '
-    # catchDisambigAst (#5510) -- works on the RAW joined text, string-search
-    # only (no regex over rawA/rawB: parens are not metacharacters here).
-    # #5474 made `catch IDENT{ singleField = v }` parse as a composite
-    # default instead of a catch-bind block, so the pinned (pre-fix) oracle
-    # still dumps the old `catch_bind` shape and this tree dumps
-    # `catch_default` for the exact same source. NARROW ON PURPOSE, stated
-    # plainly: this accepts ANY value for the single field (not just the
-    # literal `1` the fixture uses), so it cannot tell a composite default
-    # the fix built CORRECTLY from one that got the wrong value in the same
-    # shape -- the fixtures own `.expected` file is what catches that, not
-    # this signature. A value containing a paren is rejected outright.
-    function catchDisambigAst(rawA, rawB,    ia, afterOpen, sep1, fn, afterFn, sep2, ty, afterTy, sep3, fld, afterFld, sep4, val, blockA, blockB, ib, plainA, plainB) {
-      ia = index(rawA, "(catch_bind (call ")
-      if (ia == 0) { return 0 }
-      afterOpen = substr(rawA, ia + length("(catch_bind (call "))
-      sep1 = index(afterOpen, " _ (args)) ")
-      if (sep1 == 0) { return 0 }
-      fn = substr(afterOpen, 1, sep1 - 1)
-      afterFn = substr(afterOpen, sep1 + length(" _ (args)) "))
-      sep2 = index(afterFn, " (block (assign = (lhs_list ")
-      if (sep2 == 0) { return 0 }
-      ty = substr(afterFn, 1, sep2 - 1)
-      afterTy = substr(afterFn, sep2 + length(" (block (assign = (lhs_list "))
-      sep3 = index(afterTy, ") (expr_list ")
-      if (sep3 == 0) { return 0 }
-      fld = substr(afterTy, 1, sep3 - 1)
-      afterFld = substr(afterTy, sep3 + length(") (expr_list "))
-      sep4 = index(afterFld, "))))")
-      if (sep4 == 0) { return 0 }
-      val = substr(afterFld, 1, sep4 - 1)
-      if (fn == "" || ty == "" || fld == "" || val == "" || val ~ /[()]/) { return 0 }
-
-      blockA = "(catch_bind (call " fn " _ (args)) " ty " (block (assign = (lhs_list " fld ") (expr_list " val "))))"
-      blockB = "(catch_default (call " fn " _ (args)) (composite_lit " ty " (field_inits (field_init " fld " " val "))))"
-      if (index(rawA, blockA) != ia) { return 0 }
-      ib = index(rawB, blockB)
-      if (ib == 0) { return 0 }
-
-      plainA = substr(rawA, 1, ia - 1) "@@SLOT@@" substr(rawA, ia + length(blockA))
-      plainB = substr(rawB, 1, ib - 1) "@@SLOT@@" substr(rawB, ib + length(blockB))
-      return (plainA == plainB)
-    }
-    # catchDisambigFmt (#5510) -- the fmt arm of the same #5474 shape, on
-    # formatted SOURCE text instead of an AST dump. The pre-fix oracle formats
-    # `catch Circle{ r = 1 }` as a multi-line bind block (`catch Circle {` /
-    # `  r = 1` / `}`, each additionally indented by the enclosing scope);
-    # this tree, parsing it as a composite default, formats it glued and
-    # single-line (`catch Circle{ r = 1 }` -- the formatter canonical
-    # field_init separator has been `=` since #3842 step A). Line-array
-    # based, not raw-text index(): the multi-line-vs-one-line shape means the
-    # surrounding line COUNT changes (3 oracle lines collapse to 1), so what
-    # must match is "every line before/after the block is identical, and the
-    # block reduces to exactly the reconstructed bit2 line". Same narrowness
-    # as catchDisambigAst: any scalar field value, no parens/braces/`&`/
-    # backslash in it (the last two only because reconstruction goes through
-    # sub()`s replacement text, which treats them specially).
-    function catchDisambigFmt(nA, linesA, nB, linesB,    k, sep, indent, rest, ty, innerPrefix, assignPart, esep, fld, val, wantB, i, ok) {
-      for (k = 1; k <= nA; k++) {
-        sep = index(linesA[k], " catch ")
-        if (sep == 0) { continue }
-        if (substr(linesA[k], length(linesA[k]) - 1) != " {") { continue }
-        match(linesA[k], /^ */)
-        indent = substr(linesA[k], RSTART, RLENGTH)
-        rest = substr(linesA[k], sep + length(" catch "))
-        ty = substr(rest, 1, length(rest) - 2)
-        if (ty !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { continue }
-        if (k + 2 > nA) { continue }
-        innerPrefix = indent "  "
-        if (substr(linesA[k + 1], 1, length(innerPrefix)) != innerPrefix) { continue }
-        assignPart = substr(linesA[k + 1], length(innerPrefix) + 1)
-        esep = index(assignPart, " = ")
-        if (esep == 0) { continue }
-        fld = substr(assignPart, 1, esep - 1)
-        if (fld !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { continue }
-        val = substr(assignPart, esep + length(" = "))
-        if (val == "" || val ~ /[(){}&\\]/) { continue }
-        if (linesA[k + 2] != indent "}") { continue }
-
-        wantB = linesA[k]
-        sub(/ catch .*$/, " catch " ty "{ " fld " = " val " }", wantB)
-
-        if (nA - 2 != nB) { continue }
-        if (k > nB) { continue }
-        if (linesB[k] != wantB) { continue }
-        ok = 1
-        for (i = 1; i < k; i++) { if (linesA[i] != linesB[i]) { ok = 0; break } }
-        if (ok) {
-          for (i = k + 3; i <= nA; i++) {
-            if (linesA[i] != linesB[i - 2]) { ok = 0; break }
-          }
-        }
-        if (ok) { return 1 }
-      }
-      return 0
-    }
-    # genericMemberCommentFmt (#6051) -- the pinned 0.31.0 formatter moved a
-    # leading comment of a generic-class member INTO its signature
-    # (`acquire(): Lease< // comment`); the fixed one keeps it above the
-    # member. Explained only when the oracle shows that mangled shape AND the
-    # two texts are identical once comments, whitespace and a trailing comma
-    # before a closer are removed -- so any code-token change still fails.
-    function fmtCodeOnly(n, lines,    k, t, out) {
-      out = ""
-      for (k = 1; k <= n; k++) {
-        t = lines[k]
-        sub(/\/\/.*$/, "", t)
-        gsub(/[ \t]/, "", t)
-        out = out t
-      }
-      gsub(/,\)/, ")", out); gsub(/,>/, ">", out); gsub(/,]/, "]", out)
-      return out
-    }
-    function genericMemberCommentFmt(nA, linesA, nB, linesB,    k, mangled) {
-      mangled = 0
-      for (k = 1; k <= nA; k++) { if (linesA[k] ~ /[(<] \/\/ /) { mangled = 1; break } }
-      if (!mangled) { return 0 }
-      return fmtCodeOnly(nA, linesA) == fmtCodeOnly(nB, linesB)
-    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -260,17 +155,8 @@ explainMismatch() {
       rawB = (nB == 1 ? $0 : rawB "\n" $0)
     }
     END {
-      if (kind == "ast") {
-        if (catchDisambigAst(rawA, rawB)) { print "5474-catch-composite-default-ast"; exit 0 }
-        exit 1
-      }
-      if (kind == "fmt") {
-        if (catchDisambigFmt(nA, linesA, nB, linesB)) { print "5474-catch-composite-default-fmt"; exit 0 }
-        if (genericMemberCommentFmt(nA, linesA, nB, linesB)) { print "6051-generic-member-comment-fmt"; exit 0 }
-        exit 1
-      }
-      # No `ir`/`iropt`/`types` signature is currently declared -- see
-      # Retirement history above.
+      # No signature is currently declared for any kind -- see Retirement
+      # history above.
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -292,13 +178,11 @@ explainMismatch() {
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
-    ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
-    fmt) printf '%s\n' "5474-catch-composite-default-fmt" "6051-generic-member-comment-fmt"; return ;;
+    ast) return ;;
+    fmt) return ;;
     types) return ;;
     ir) return ;;
     iropt) return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' \
-    "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
-    "6051-generic-member-comment-fmt"
+  [ -n "$kind" ] || return 0
 }
