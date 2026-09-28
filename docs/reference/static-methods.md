@@ -29,9 +29,9 @@ fn main() {
 `NotifyJob.label()` calls it through the type name instead of through a
 value's `.`.
 
-This page's examples are marked `ignore` rather than run automatically: as
-of this release, `static` is a rollout flag, `BIT_STATIC_METHODS=1` (off by
-default) - see [Specification](#specification).
+This page's examples are marked `ignore` rather than run automatically:
+several are fragments or deliberately show a diagnostic, not a complete
+program - see [Specification](#specification).
 
 ## Dispatching by name, not by instance
 
@@ -123,10 +123,7 @@ configuration, a constant derived purely from which class it is.
 
 `static` methods, static interface requirements, and the value-type
 restriction are defined in [SPEC §10.4.1](../../spec/SPEC.md) and
-[§10.6](../../spec/SPEC.md). The syntax lands behind the compiler flag
-`BIT_STATIC_METHODS=1` (default off) until the release after it lands
-repins the toolchain's pinned previous-release oracle past this compiler
-build.
+[§10.6](../../spec/SPEC.md).
 
 ## Next
 
