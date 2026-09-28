@@ -97,8 +97,20 @@ export BIT_STDLIB
 # fnvalue-trampoline fixture mismatches (`make_closure @fnvalue$trampoline$N`
 # vs `global_addr @__bitfnv_N`) in BOTH ir and iropt (KIND=ir), since it
 # changes IR at emission time, before any opt pass runs.
+#
+# #6191: BIT_DCE_PARAMS and BIT_DCE_METHODS both default ON in this tree as
+# of the 0.32.0 repin, but the pinned 0.32.0 ORACLE (cut before the flip)
+# still defaults both off, so force "1" on both sides here too -- same shape
+# as BIT_STATIC_CONST above. DCE_PARAMS changes post-opt IR directly (dead
+# block params dropped), so it belongs in this `KIND = ir` block same as
+# STATIC_CONST; DCE_METHODS changes emitted method tables, invisible to a
+# plain `--dump-ir`/`--dump-ir-pre` text diff, but forcing it here too keeps
+# both sides' method-table shape in lockstep for whichever row later reads
+# it. Deleted at the 0.33.0 repin, once the oracle carries the default too.
 if [ "$KIND" = ir ]; then
   export BIT_STATIC_CONST=1
+  export BIT_DCE_PARAMS=1
+  export BIT_DCE_METHODS=1
 fi
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
