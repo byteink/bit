@@ -41,11 +41,30 @@
 // and no read of K is SEPARATED from its uses: on every path from the read to
 // them (the read's live range), no instruction may run another in-place
 // append on K. That is an append whose input is a K read, a store to K, or
-// anything that can run code this walk does not see: a call, an atomic, a
-// syscall, a safepoint poll, or a runtime call off the short list below
-// (anything else may synchronize with another thread or run a closure). So
-// no frame, suspended or not, holds a K header across the only instructions
-// that can mutate one, and rule 1 keeps every heap slot but K itself empty.
+// anything that can run code this walk does not see: a call to any but a
+// calm function (below), an atomic, a syscall, or a runtime call off the
+// short list below (anything else may synchronize with another thread or
+// run a closure). So no frame, suspended or not, holds a K header across
+// the only instructions that can mutate one, and rule 1 keeps every heap
+// slot but K itself empty.
+//
+// A CALM FUNCTION (#6210, `calmNew`) runs nothing that separates any field:
+// no store to a field that may hold a slice, no append whose input is a
+// field read, no `call_value`/`call_iface`/`asm`/syscall/atomic, only
+// `fieldLocalRtCall` runtime calls, and direct calls to calm functions of
+// this module only. The last clause is recursive, so the answer is the
+// greatest fixpoint (`borrowSolve`, optappendborrow.bit). pkg/toml's
+// `path.rest = append(path.rest, KeySeg{ name = readKeyName(p)? })` reads
+// the field before the call that lexes the key.
+//
+// A SAFEPOINT POLL DOES NOT SEPARATE (#6210). A poll may park this green
+// thread for the collector or hand its worker to another green thread, but
+// it is no happens-before edge (SPEC §13.7 lists every edge; a poll is not
+// one), so an append to K that another thread runs during it races with
+// this thread's read of K, exactly as it would running on another worker at
+// the same instant with no poll at all. The collector is non-moving and
+// writes no header. Atomics and the channel, mutex and spawn runtime calls
+// ARE edges, and stay separators.
 //
 // A class value reaches `field_get`/`field_set` typed as its class: both are
 // emitted only off a receiver the checker typed `TypeKind.Struct`
@@ -65,11 +84,13 @@ const fieldKeyShift: int = 4294967296
 // borrowed-parameter summary (optappendborrow.bit, #6209), proved in the
 // same walk. `appended[key]` is 1 when a rule 2 read of the field exists;
 // `esc[escStart[i] .. escStart[i + 1])` are function `i`'s rule 4 sites.
+// `calm` is `calmNew`'s summary, proved before the scan that reads it.
 class FieldOwn {
   ctx: TypeContext,
   live: bool,
   poison: map<int, int>,
   borrow: Borrow,
+  calm: Calm,
   appended: map<int, int>,
   esc: []FieldEsc,
   escStart: []int,
@@ -85,6 +106,7 @@ fn ownedFieldsOf(m: IrModule): FieldOwn {
     live = false,
     poison = map<int, int>(),
     borrow = borrowNew([]IrFunc(0)),
+    calm = calmEmpty(0),
     appended = map<int, int>(),
     esc = []FieldEsc(0),
     escStart = []int(0),
@@ -98,6 +120,7 @@ fn ownedFieldsOf(m: IrModule): FieldOwn {
     return fo
   }
   fo.borrow = borrowNew(m.funcs)
+  fo.calm = calmNew(fo, m.funcs)
   let i = 0
   while (i < len(m.funcs)) {
     fo.escStart = append(fo.escStart, len(fo.esc))
@@ -260,11 +283,36 @@ fn fieldStoreOk(o: OwnFn, s: int, k: int): bool {
   if (fieldPopOf(o, v, k)) {
     return true
   }
-  if (!isFreshAppend(d) || o.f.instrs[d.args[0]].op != Op.FieldGet) {
+  if (!isFreshAppend(d)) {
     return false
+  }
+  if (o.f.instrs[d.args[0]].op != Op.FieldGet) {
+    return fieldChainStore(o, v, s, k)
   }
   return fieldKey(o.fields.ctx, o.f, o.f.instrs[d.args[0]]) == k &&
     fieldRmwStore(o, d.args[0], k) == s
+}
+
+// Rule 2's chain (#6210): `path.rest = append(path.rest, a)` then
+// `path.rest = append(path.rest, b)`, whose second read the optimizer
+// forwards from the first store. Append `r`, closed by store `s`, takes
+// the first append's result `p` as its input, and `fieldRmwResultOk`
+// accepted `r` as `p`'s second use, unseparated from `p`'s own store.
+fn fieldChainStore(o: OwnFn, r: int, s: int, k: int): bool {
+  let pd = o.f.instrs[o.f.instrs[r].args[0]]
+  if (!isFreshAppend(pd) || ownUseCount(o, r) != 1) {
+    return false
+  }
+  let g = pd.args[0]
+  let src = o.f.instrs[g]
+  if (src.op != Op.FieldGet ||
+    fieldKey(o.fields.ctx, o.f, src) != k ||
+    fieldRmwStore(o, g, k) < 0) {
+    return false
+  }
+  return o.f.instrs[s].lhs == src.lhs &&
+    o.blockOf[s] == o.blockOf[r] &&
+    fieldOnlyConsts(o.f, r + 1, s)
 }
 
 // Whether store `s` is the only holder of `slice_new` `v` from `s` on: every
@@ -333,10 +381,23 @@ fn fieldRmwAppend(o: OwnFn, g: int, k: int): int {
     }
     u = u + 1
   }
-  if (r < 0 || !ownOnlyReceiver(o.f.instrs[r].args, g) || ownUseCount(o, r) != 1) {
+  if (r < 0 || !ownOnlyReceiver(o.f.instrs[r].args, g) || !fieldRmwResultOk(o, r, k)) {
     return -1
   }
   return r
+}
+
+// Whether append result `r`'s uses are its store back to field `k`, first,
+// and at most one more: a `_fresh` append taking `r` as its input only
+// (`fieldChainStore`), no separator between the store and it.
+fn fieldRmwResultOk(o: OwnFn, r: int, k: int): bool {
+  let n = ownUseCount(o, r)
+  if (n != 2) {
+    return n == 1
+  }
+  let s = o.useList[o.useStart[r]]
+  let c = o.f.instrs[o.useList[o.useStart[r] + 1]]
+  return isFreshAppend(c) && ownOnlyReceiver(c.args, r) && !fieldSeparatedFrom(o, r, k, s + 1)
 }
 
 // Whether every instruction in `[lo, hi)` is a constant.
@@ -408,9 +469,14 @@ fn fieldPopOf(o: OwnFn, v: int, k: int): bool {
 // rest of its own block and every block it is live into, each cut at its
 // last use unless `g` is live out of it. A use itself is not in the span.
 fn fieldSeparated(o: OwnFn, g: int, k: int): bool {
+  return fieldSeparatedFrom(o, g, k, g + 1)
+}
+
+// `fieldSeparated` with `g`'s own block's span starting at `start`.
+fn fieldSeparatedFrom(o: OwnFn, g: int, k: int, start: int): bool {
   ownMarkLive(o, g)
   let def = o.blockOf[g]
-  if (fieldSpanSeparates(o, k, g + 1, fieldSpanEnd(o, g, def))) {
+  if (fieldSpanSeparates(o, k, start, fieldSpanEnd(o, g, def))) {
     return true
   }
   let h = 0
@@ -459,6 +525,9 @@ fn fieldSpanSeparates(o: OwnFn, k: int, lo: int, hi: int): bool {
 // this walk cannot see.
 fn fieldSeparates(o: OwnFn, k: int, ins: IrInstr): bool {
   let op = ins.op
+  if (op == Op.Call) {
+    return !calmCall(o.fields.calm, ins, k)
+  }
   if (fieldRunsUnseen(op)) {
     return true
   }
@@ -483,17 +552,186 @@ fn fieldRunsUnseen(op: Op): bool {
     op == Op.CallIface ||
     op == Op.Asm ||
     op == Op.Syscall ||
-    op == Op.PollAttention ||
     opIsAtomic(op)
 }
 
-// Runtime calls that neither run a closure nor synchronize: allocation and
-// element access only. Every other runtime call separates.
+// The calm summary: `base[name]` is one plus the function's index, -1 when
+// two functions share the name; `ok[i]` whether function `i` is calm and
+// `keys[i]` the fields it, or a calm callee, stores to or appends to. Slot
+// `depFrom[d]` is calm only if slot `depTo[d]` is, and takes its keys.
+class Calm {
+  base: map<string, int>,
+  ok: []bool,
+  keys: [][]int,
+  depFrom: []int,
+  depTo: []int,
+}
+
+// Past this many fields a function is not calm: the summary stays small.
+const calmMaxKeys: int = 4
+
+fn calmEmpty(n: int): Calm {
+  return Calm{
+    base = map<string, int>(), ok = []bool(n), keys = [][]int(n), depFrom = []int(0),
+    depTo = []int(0),
+  }
+}
+
+fn calmNew(fo: FieldOwn, funcs: []IrFunc): Calm {
+  let c = calmEmpty(len(funcs))
+  let i = 0
+  while (i < len(funcs)) {
+    let prior = c.base[funcs[i].name]
+    c.base[funcs[i].name] = prior == 0 ? i + 1 : -1
+    i = i + 1
+  }
+  i = 0
+  while (i < len(funcs)) {
+    c.ok[i] = calmScan(fo, c, funcs[i], i)
+    i = i + 1
+  }
+  calmSolve(c)
+  return c
+}
+
+// Whether `f`, slot `slot`, is calm apart from its callees, recording each
+// direct call's dependency and each field it touches.
+fn calmScan(fo: FieldOwn, c: Calm, f: IrFunc, slot: int): bool {
+  for ins of f.instrs {
+    if (ins.op == Op.Call) {
+      let j = c.base[ins.name]
+      if (j <= 0) {
+        return false
+      }
+      c.depFrom = append(c.depFrom, slot)
+      c.depTo = append(c.depTo, j - 1)
+    } else if (!calmInstr(fo, c, f, ins, slot)) {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether `ins`, not a direct call, keeps `f` calm: a store to a field that
+// may hold a slice, or an append to a field read, adds that field's key.
+fn calmInstr(fo: FieldOwn, c: Calm, f: IrFunc, ins: IrInstr, slot: int): bool {
+  let op = ins.op
+  if (op == Op.FieldSet) {
+    return !fieldSliceAccess(fo, f, ins) || calmAddKey(c, slot, fieldKey(fo.ctx, f, ins))
+  }
+  if (op != Op.RtCall) {
+    return !fieldRunsUnseen(op)
+  }
+  if (!isAppendRt(ins)) {
+    return fieldLocalRtCall(ins.name)
+  }
+  if (len(ins.args) == 0) {
+    return false
+  }
+  let src = f.instrs[ins.args[0]]
+  return src.op != Op.FieldGet || calmAddKey(c, slot, fieldKey(fo.ctx, f, src))
+}
+
+// Adds field `k` to slot `slot`'s keys; false when `k` is unknown or the
+// slot already holds `calmMaxKeys`.
+fn calmAddKey(c: Calm, slot: int, k: int): bool {
+  if (k < 0) {
+    return false
+  }
+  for x of c.keys[slot] {
+    if (x == k) {
+      return true
+    }
+  }
+  if (len(c.keys[slot]) >= calmMaxKeys) {
+    return false
+  }
+  c.keys[slot] = append(c.keys[slot], k)
+  return true
+}
+
+// The greatest fixpoint, `borrowSolve`'s shape (optappendborrow.bit): each
+// round that changes anything knocks out a slot or adds one of at most
+// `calmMaxKeys` keys to one, so the bound is always reached by a round that
+// changes nothing. Past it every slot is knocked out rather than trusted.
+fn calmSolve(c: Calm) {
+  let changed = true
+  let round = 0
+  while (changed && round <= len(c.ok) * (calmMaxKeys + 1)) {
+    changed = false
+    let d = 0
+    while (d < len(c.depFrom)) {
+      if (calmPull(c, c.depFrom[d], c.depTo[d])) {
+        changed = true
+      }
+      d = d + 1
+    }
+    round = round + 1
+  }
+  if (!changed) {
+    return
+  }
+  let s = 0
+  while (s < len(c.ok)) {
+    c.ok[s] = false
+    s = s + 1
+  }
+}
+
+// Slot `a` takes slot `b`'s verdict and keys; true when it changed.
+fn calmPull(c: Calm, a: int, b: int): bool {
+  if (!c.ok[a]) {
+    return false
+  }
+  if (!c.ok[b]) {
+    c.ok[a] = false
+    return true
+  }
+  let n = len(c.keys[a])
+  for k of c.keys[b] {
+    if (!calmAddKey(c, a, k)) {
+      c.ok[a] = false
+      return true
+    }
+  }
+  return len(c.keys[a]) != n
+}
+
+// Whether call `ins` runs a calm function of this module that touches no
+// store to, and no append on, field `k`.
+fn calmCall(c: Calm, ins: IrInstr, k: int): bool {
+  let j = c.base[ins.name]
+  if (j <= 0 || !c.ok[j - 1]) {
+    return false
+  }
+  for x of c.keys[j - 1] {
+    if (x == k) {
+      return false
+    }
+  }
+  return true
+}
+
+// Runtime calls that neither run a closure nor synchronize: allocation,
+// element access, the thread's own error slot, and `panic`, which runs no
+// Bit code and never returns into the frame that called it (SPEC §18.5: no
+// deferred call runs on a panic path). Every other runtime call separates.
 fn fieldLocalRtCall(name: string): bool {
-  return name == "slice_get" ||
+  return fieldAllocRtCall(name) ||
+    name == "slice_get" ||
     name == "slice_set" ||
-    name == "slice_new" ||
+    name == "err_get" ||
+    name == "err_set" ||
+    name == "panic"
+}
+
+fn fieldAllocRtCall(name: string): bool {
+  return name == "slice_new" ||
+    name == "slice_slice" ||
     name == "string_from_bytes" ||
     name == "string_from_int" ||
-    name == "string_concat"
+    name == "string_concat" ||
+    name == "string_concat5" ||
+    name == "string_eq_words" ||
+    name == "bytes_from_string"
 }
