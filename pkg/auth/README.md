@@ -11,8 +11,8 @@ needs to know which one ran.
 ```json
 {
   "dependencies": {
-    "auth": "bitlang.org/pkg/auth@v0.1.0",
-    "web": "bitlang.org/pkg/web@v0.1.0"
+    "auth": "bitlang.org/pkg/auth@^0.2.0",
+    "web": "bitlang.org/pkg/web@^0.7.0"
   }
 }
 ```

@@ -9,7 +9,7 @@ standard library. Reads a document into one `Toml` value, and writes a
 ```json
 {
   "dependencies": {
-    "toml": "bitlang.org/pkg/toml@v0.1.0"
+    "toml": "bitlang.org/pkg/toml@^0.1.2"
   }
 }
 ```
