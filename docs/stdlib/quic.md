@@ -5,12 +5,12 @@ on top of [`std/crypto`](crypto.md). This module is the cryptographic and wire-f
 core of QUIC - it derives the Initial keys, protects and unprotects packets, and
 serializes frames - but it is deliberately *not* a transport: there is no connection
 state machine, no flow control, no loss recovery, and no congestion control here.
-Those layers sit above and drive these primitives.
+Those layers sit above and drive these building blocks.
 
 The module has two halves. **Packet protection** (`packet.bit`) derives keys with the
 TLS 1.3 HKDF ladder, seals payloads with AES-128-GCM under a packet-number-derived
 nonce, and masks headers with an AES-ECB or raw-ChaCha20 key stream - the same
-verified `std/crypto` primitives, never a second copy of the cryptography. **Frames**
+verified `std/crypto` building blocks, never a second copy of the cryptography. **Frames**
 (`frames.bit`) encode and decode QUIC's variable-length integers and every v1 frame.
 
 Everything composes cleanly: `std/quic` reproduces the RFC 9001 Appendix A sample
@@ -23,9 +23,9 @@ packets byte-for-byte and round-trips every frame through its own decoder.
 A QUIC packet payload is a sequence of frames, and every number in the protocol - a
 length, offset, stream id, or error code - is a variable-length integer (RFC 9000
 section 16): the top two bits of the first byte give the encoded length (1, 2, 4, or 8
-bytes) and the rest is the value, big-endian. `Frame` is a sum type over every frame
-RFC 9000 section 19 defines; the codec is pure and strict - malformed input is rejected with
-a fallible `!`, never guessed at.
+bytes) and the rest is the value, big-endian. `Frame` covers every frame
+kind RFC 9000 section 19 defines; the codec is pure and strict - malformed
+input is rejected with a fallible `!`, never guessed at.
 
 ### `encodeVarint(v: u64): []byte`
 

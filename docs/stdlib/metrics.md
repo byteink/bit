@@ -2,13 +2,13 @@
 
 Counters, gauges and histograms, exposed as Prometheus text-format
 exposition (`# HELP`/`# TYPE` plus one line per series). This is a
-production-observability primitive, not a profiler: for CPU sampling see
+production observability tool, not a profiler: for CPU sampling see
 `std/prof` instead.
 
 Metrics are held in an explicit `Registry` rather than a hidden global one:
-Bit's module-level `let` may hold only untraced scalars, fixed arrays of
-them, or raw pointers, never a class, slice or map (SPEC section 11.11), so
-there is no cell a default registry could live in. Construct one, keep it,
+a module-level `let` in Bit may hold only plain scalars, fixed arrays of
+them, or raw pointers - never a class, slice or map - so there is no cell a
+default registry could live in. Construct one, keep it,
 and call its methods - the same shape `std/sync`'s `Mutex`, `WaitGroup` and
 `std/rand`'s `Rand` already use.
 

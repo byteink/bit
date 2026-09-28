@@ -896,7 +896,7 @@ with `e.(SqlRowError)`, so a handler that branches on `cause` can still log
 the full text: `"sql: column 'age' is NULL, and the field is not Option"`,
 or `"sql: no rows"` for a cause that names no column.
 
-## Row-mapping primitives
+## Row-mapping building blocks
 
 The named functions the compiler's generated mapper is written in terms
 of. They are exported because the generated code lives in the CLASS's own

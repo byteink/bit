@@ -7,8 +7,8 @@ specific request took 4 seconds, span by span, across every service it
 crossed.
 
 A `Tracer` is held explicitly by whatever code creates spans - the same
-shape `std/metrics`' `Registry` uses (Bit's module-level `let` cannot hold a
-class, SPEC section 11.11, so there is no hidden default tracer). What is
+shape `std/metrics`' `Registry` uses (a module-level `let` cannot hold a
+class in Bit, so there is no hidden default tracer). What is
 **implicit** is the parent/child link between spans on the same task: it is
 carried through `std/runtime`'s task-local storage slot (`taskLocalGet`/
 `taskLocalSet`, see [runtime](runtime.md) and
@@ -172,7 +172,7 @@ dropped.
 ## Low-level pieces
 
 These are exported for `pkg/web`'s tracing middleware and similar callers
-that need the raw primitives; most code only needs `Tracer` and `Span`
+that need the raw pieces; most code only needs `Tracer` and `Span`
 above.
 
 ### `SpanContext`

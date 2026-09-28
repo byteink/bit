@@ -1,10 +1,10 @@
 # std/jwt
 
 JSON Web Signatures (RFC 7515), registered claim validation (RFC 7519), and
-JWKS key selection (RFC 7517). Every cryptographic primitive is `std/crypto`'s
-own (HMAC-SHA256, RSA PKCS#1 v1.5, ECDSA P-256, Ed25519) - this module is the
-JOSE format and validation layer on top, not a second implementation of any
-primitive.
+JWKS key selection (RFC 7517). Every cryptographic operation this module
+uses - HMAC-SHA256, RSA PKCS#1 v1.5, ECDSA P-256, Ed25519 - is `std/crypto`'s
+own; this module is the JOSE format and validation layer on top, not a
+second implementation of any of them.
 
 Four algorithms: `HS256`, `RS256`, `ES256`, `EdDSA`. `alg: none` has no
 representation anywhere in this module and cannot be reached by
