@@ -16,6 +16,7 @@ names its `authorId` directly.
 ```bit
 import { Data, Query, TableDesc, find } from "orm"
 import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
+import { Json } from "std/json"
 
 @table @timestamps class Article {
   @id
@@ -80,7 +81,6 @@ from a query is, as far as `save()` is concerned, already in the database.
 ```bit
 import { App, Ctx, Res, badRequest, notFound } from "web"
 import { Dir } from "orm"
-import { Json, JsonEntry } from "std/json"
 import { parseInt } from "std/strings"
 
 fn findArticleById(db: Data, id: i64): Article! {

@@ -21,8 +21,8 @@ own:
 import { Data, Query, TableDesc, find } from "orm"
 import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
 import { App, Ctx, Res, badRequest, notFound } from "web"
-import { Json, JsonEntry } from "std/json"
 import { parseInt } from "std/strings"
+import { Json } from "std/json"
 
 @table @timestamps class User {
   @id

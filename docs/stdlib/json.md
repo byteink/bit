@@ -98,7 +98,7 @@ checked against the document. The two are generated from the same field
 list, so they can never drift apart.
 
 ```bit
-import { jsonParse, jsonDecode, jsonEncode, Json, JsonEntry } from "std/json"
+import { jsonParse, jsonDecode, jsonEncode } from "std/json"
 
 enum Status { Draft, Published, Archived }
 
@@ -134,7 +134,7 @@ claims, or it nests past the depth limit. Catch it and branch when you need
 to:
 
 ```bit
-import { jsonParse, jsonDecode, JsonDecodeError, Json, JsonEntry } from "std/json"
+import { jsonParse, jsonDecode, JsonDecodeError } from "std/json"
 
 @json class ExportedDraft2 {
   id: string,
@@ -158,7 +158,7 @@ text - on 50,000 one-record decodes it costs 6 objects against 45 for
 `jsonParse` then `jsonDecode`, because no `Json` tree is ever built:
 
 ```bit
-import { jsonDecodeText, Json, JsonEntry } from "std/json"
+import { jsonDecodeText } from "std/json"
 
 @json class NewDraft {
   title: string,
@@ -184,7 +184,7 @@ for a request or response body - with no second description to keep in
 sync:
 
 ```bit
-import { Json, JsonEntry, jsonSchema, jsonEncode } from "std/json"
+import { jsonSchema, jsonEncode } from "std/json"
 
 @json class DraftSettings {
   autosaveSeconds: i64,

@@ -19,7 +19,7 @@ itself, so the two can never be observed out of sync.
 
 ```bit
 import { Collection, createDb, declareIndex, encodeInt, newCollection } from "kv"
-import { Json, JsonEntry, jsonDecode, jsonEncode, jsonParse } from "std/json"
+import { jsonDecode, jsonEncode, jsonParse } from "std/json"
 
 @json class Task {
   title: string,
@@ -78,7 +78,7 @@ records and their index entries are) and carry on:
 
 ```bit
 import { Collection, createDb, declareIndex, encodeInt, newCollection, openDb } from "kv"
-import { Json, JsonEntry, jsonDecode, jsonEncode, jsonParse } from "std/json"
+import { jsonDecode, jsonEncode, jsonParse } from "std/json"
 
 @json class Task {
   title: string,

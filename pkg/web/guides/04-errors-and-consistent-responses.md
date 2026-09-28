@@ -23,7 +23,7 @@ part 6). Here is a route that looks one up by id:
 ```bit
 import { App, Config, Ctx, Res, notFound } from "web"
 import { parseInt } from "std/strings"
-import { Json, JsonEntry } from "std/json"
+import { Json } from "std/json"
 
 @json class Article {
   id: int,
@@ -90,7 +90,7 @@ when it failed.
 ```bit
 import { App, Config, Ctx, Res, envelope, notFound } from "web"
 import { parseInt } from "std/strings"
-import { Json, JsonEntry } from "std/json"
+import { Json } from "std/json"
 
 @json class Article {
   id: int,

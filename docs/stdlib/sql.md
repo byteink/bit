@@ -65,7 +65,7 @@ one query. For a whole table, `find`/`findOne`/`findOneOrFail` map every row
 straight into a plain class - no separate mapper to write or keep in sync:
 
 ```bit
-import { Executor, Rows, find, findOne, findOneOrFail, Value } from "std/sql"
+import { Executor, find, findOne, findOneOrFail, Value } from "std/sql"
 
 class Draft {
   id: string,
@@ -195,7 +195,7 @@ import {
 } from "std/sql"
 import { Timestamp } from "std/time"
 import { UUID } from "std/uuid"
-import { Json, JsonEntry } from "std/json"
+import { Json } from "std/json"
 
 @json class DraftMeta {
   editor: string,

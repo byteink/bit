@@ -17,8 +17,8 @@ separate type carrying only what a client is allowed to set:
 
 ```bit
 import { App, Config, Ctx, Res, minLen, notFound } from "web"
-import { Json, JsonEntry } from "std/json"
 import { newBuilder, parseInt } from "std/strings"
+import { Json } from "std/json"
 
 @json class Article {
   id: i64,
