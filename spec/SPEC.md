@@ -1506,28 +1506,34 @@ class SendWelcome { userId: i64 }
 - A `@job` class must also carry `@json` - **E0167** otherwise - since a
   queued job's payload has to be encoded onto the store and decoded back off
   it, and `@json`'s `toJson`/`jsonDecode<T>` are what do that.
-- The class gains a synthesized member
+- The class gains a synthesized **static** member (§10.4.1)
 
   ```
-  __jobName(): string
+  static __jobName(): string
   ```
 
-  returning the name exactly as written in `@job(...)`. This is what makes
-  the name **stable across a rename**: renaming the class changes nothing a
-  job already sitting in a queue depends on, only `@job`'s own argument does.
+  returning the name exactly as written in `@job(...)`, read with no
+  instance in hand - `T.__jobName()` for a `T` bound by
+  `interface Job { static __jobName(): string }` - which is what lets
+  `register<T: Job>` dispatch by type alone. This is also what makes the
+  name **stable across a rename**: renaming the class changes nothing a
+  job already sitting in a queue depends on, only `@job`'s own argument
+  does.
 - **`__jobName` is a reserved name on every class, `@job` or not.** A class
   that declares a method by this name is **E0168** - the same rule, for the
   same reason, `__jsonAppend`'s own reservation (E0164) above is: dispatch
-  code constrained on an interface naming `__jobName()` structurally
-  (§14.3) matches by name alone, so a same-named method on an unrelated
-  class would satisfy it and misbehave at the call, not at the assertion.
+  code constrained on a static interface requirement naming
+  `__jobName()` (§10.4.1, §14.3) matches by name alone, so a same-named
+  member on an unrelated class would satisfy it and misbehave at the
+  call, not at the assertion.
 - **Two `@job` classes anywhere in the program sharing a name is E0169**,
   naming both declarations - checked across the whole program, not one
   module, because a job dispatch table is keyed by this string across
   every module the compiler sees.
 - `@job` introduces no reflection and no compiler-generated cross-module
-  table: it only synthesizes `__jobName`, an ordinary method a library reads
-  through a normal, structurally-satisfied interface constraint.
+  table: it only synthesizes `static __jobName`, an ordinary static method a
+  library reads through a normal, structurally-satisfied static interface
+  requirement.
 
 ### 10.6 Interface Declarations
 
