@@ -1,0 +1,338 @@
+// pkg/jobs/jobs.test.bit — unit coverage for register/enqueue, retry with
+// backoff, dead-letter, an unknown name, a panicking handler, and a
+// worker-pool drain, all against `fakeStore` (no real server — the live
+// gate, `_tests_/bit/jobslive.bit`, covers the same shapes against real
+// PostgreSQL).
+
+import { newMutex, Mutex } from "std/sync"
+import { contains } from "std/strings"
+import { jsonAsObject } from "std/json"
+
+@job("test-echo") @json class EchoJob {
+  message: string,
+}
+
+@job("test-boom") @json class BoomJob {
+  reason: string,
+}
+
+class fakeRow {
+  id: int,
+  name: string,
+  payload: string,
+  attempts: int,
+  maxAttempts: int,
+  availableAt: int,
+  done: bool,
+  deadLettered: bool,
+  deadReason: string,
+}
+
+// A minimal in-memory Store: linear scan, one Mutex, no persistence — fine
+// for these unit tests, never a production store (store.bit's header: no
+// default).
+class fakeStore {
+  rows: []fakeRow
+  mu: Mutex
+  nextId: int
+
+  enqueue(name: string, payload: string, availableAt: int, maxAttempts: int): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.nextId = this.nextId + 1
+    this.rows = append(
+      this.rows,
+      fakeRow{
+        id = this.nextId, name = name, payload = payload, attempts = 0,
+        maxAttempts = maxAttempts, availableAt = availableAt, done = false,
+        deadLettered = false, deadReason = "",
+      },
+    )
+  }
+
+  claim(visibilityTimeout: int): Option<ClaimedJob>! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let nowNs = now().ns
+    let i = 0
+    while (i < len(this.rows)) {
+      let r = this.rows[i]
+      if (!r.done && !r.deadLettered && r.availableAt <= nowNs) {
+        r.attempts = r.attempts + 1
+        this.rows[i] = r
+        return Option.Some(
+          ClaimedJob{
+            id = r.id,
+            name = r.name,
+            payload = r.payload,
+            attempts = r.attempts,
+            maxAttempts = r.maxAttempts,
+          },
+        )
+      }
+      i = i + 1
+    }
+    return Option.None
+  }
+
+  complete(id: int): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let i = this.indexOf(id)
+    if (i < 0) {
+      fail newError("fakeStore: complete: no row ${id}")
+    }
+    let r = this.rows[i]
+    r.done = true
+    this.rows[i] = r
+  }
+
+  retry(id: int, availableAt: int): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let i = this.indexOf(id)
+    if (i < 0) {
+      fail newError("fakeStore: retry: no row ${id}")
+    }
+    let r = this.rows[i]
+    r.availableAt = availableAt
+    this.rows[i] = r
+  }
+
+  deadLetter(id: int, reason: string): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let i = this.indexOf(id)
+    if (i < 0) {
+      fail newError("fakeStore: deadLetter: no row ${id}")
+    }
+    let r = this.rows[i]
+    r.deadLettered = true
+    r.deadReason = reason
+    this.rows[i] = r
+  }
+
+  // Unlocked: every caller above already holds this.mu.
+  indexOf(id: int): int {
+    let i = 0
+    while (i < len(this.rows)) {
+      if (this.rows[i].id == id) {
+        return i
+      }
+      i = i + 1
+    }
+    return -1
+  }
+
+  byId(id: int): fakeRow {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.rows[this.indexOf(id)]
+  }
+}
+
+fn newFakeStore(): fakeStore {
+  return fakeStore{ rows = []fakeRow(0), mu = newMutex(), nextId = 0 }
+}
+
+fn newTestQueue(store: Store): Queue {
+  return open(store, Options{ workers = 1 }) catch e {
+    panic("open: ${e.message()}")
+  }
+}
+
+// Also the reason this module imports `Json`/`JsonEntry` (E0142, required
+// by `@job`'s own `@json` requirement) is a genuine one, not just to
+// satisfy the checker: `enqueue`'s payload is asserted here to be the
+// `{"message": "hi"}` object `toJson()` produced, entry by entry.
+test "enqueue then a successful handler completes the row" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  let seen: []string = []string(0)
+  q.register<EchoJob>((job: EchoJob) => {
+    seen = append(seen, job.message)
+  })
+  q.enqueue(EchoJob{ message = "hi" }) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  let entries: Option<[]JsonEntry> = jsonAsObject(
+    jsonParse(store.byId(1).payload) catch e {
+      panic("parse payload: ${e.message()}")
+    },
+  )
+  match (entries) {
+    None => panic("payload is not a JSON object")
+    Some(fields) => {
+      assert(len(fields) == 1, "expected 1 field, got ${len(fields)}")
+      assert(fields[0].key == "message", "field key '${fields[0].key}'")
+      match (fields[0].value) {
+        JsonString(s) => assert(s == "hi", "field value '${s}'")
+        _ => panic("message field is not a JsonString")
+      }
+    }
+  }
+  let claimed = store.claim(30000000000) catch e {
+    panic("claim: ${e.message()}")
+  }
+  match (claimed) {
+    None => panic("expected a claimable row")
+    Some(cj) => processOne(q, cj, newWorkerRand())
+  }
+  assert(len(seen) == 1 && seen[0] == "hi", "handler did not observe the payload")
+  assert(store.byId(1).done, "row was not marked complete")
+}
+
+test "a failed handler with attempts remaining is retried, not dead-lettered" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  q.register<BoomJob>((job: BoomJob) => {
+    fail newError(job.reason)
+  })
+  q.enqueue(BoomJob{ reason = "boom" }, 0, 3) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  let claimed = store.claim(30000000000) catch e {
+    panic("claim: ${e.message()}")
+  }
+  match (claimed) {
+    None => panic("expected a claimable row")
+    Some(cj) => processOne(q, cj, newWorkerRand())
+  }
+  let row = store.byId(1)
+  assert(!row.deadLettered, "row was dead-lettered with attempts remaining")
+  assert(!row.done, "a failed job must not be marked complete")
+  assert(row.availableAt > 0, "retry did not set a new availableAt")
+}
+
+test "a failed handler out of attempts is dead-lettered with the failure reason" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  q.register<BoomJob>((job: BoomJob) => {
+    fail newError(job.reason)
+  })
+  q.enqueue(BoomJob{ reason = "last try" }, 0, 1) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  let claimed = store.claim(30000000000) catch e {
+    panic("claim: ${e.message()}")
+  }
+  match (claimed) {
+    None => panic("expected a claimable row")
+    Some(cj) => processOne(q, cj, newWorkerRand())
+  }
+  let row = store.byId(1)
+  assert(row.deadLettered, "row was not dead-lettered after its only attempt")
+  assert(row.deadReason == "last try", "dead-letter reason was '${row.deadReason}'")
+}
+
+test "a panicking handler is caught and counted as a failure" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  q.register<BoomJob>((job: BoomJob) => {
+    panic(job.reason)
+  })
+  q.enqueue(BoomJob{ reason = "panic-reason" }, 0, 1) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  let claimed = store.claim(30000000000) catch e {
+    panic("claim: ${e.message()}")
+  }
+  match (claimed) {
+    None => panic("expected a claimable row")
+    Some(cj) => processOne(q, cj, newWorkerRand())
+  }
+  let row = store.byId(1)
+  assert(row.deadLettered, "a panicking handler's job was not dead-lettered")
+  assert(row.deadReason == "panic-reason", "dead-letter reason was '${row.deadReason}'")
+}
+
+test "a job whose name has no registered handler is dead-lettered loudly" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  q.enqueue(EchoJob{ message = "orphan" }) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  let claimed = store.claim(30000000000) catch e {
+    panic("claim: ${e.message()}")
+  }
+  match (claimed) {
+    None => panic("expected a claimable row")
+    Some(cj) => processOne(q, cj, newWorkerRand())
+  }
+  let row = store.byId(1)
+  assert(row.deadLettered, "an unregistered job name was not dead-lettered")
+}
+
+test "Options.workers must be positive" {
+  let store = newFakeStore()
+  let _ = open(store, Options{ workers = 0 }) catch e {
+    assert(contains(e.message(), "workers"), "wrong error: ${e.message()}")
+    return
+  }
+  panic("open succeeded with workers = 0")
+}
+
+// Two workers against ten jobs: every job completes exactly once, and no
+// job is ever claimed by both workers at once — `fakeStore.claim`'s Mutex
+// is the same exclusion `postgres.bit`'s `FOR UPDATE SKIP LOCKED` gives a
+// real database.
+test "concurrency: N workers process every job exactly once" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  let processed = newAtomicI64(0)
+  q.register<EchoJob>((job: EchoJob) => {
+    processed.add(1)
+  })
+  let n = 10
+  let i = 0
+  while (i < n) {
+    q.enqueue(EchoJob{ message = "job-${i}" }) catch e {
+      panic("enqueue: ${e.message()}")
+    }
+    i = i + 1
+  }
+  let pool = open(store, Options{ workers = 3, pollInterval = 5 * Millisecond }) catch e {
+    panic("open: ${e.message()}")
+  }
+  pool.register<EchoJob>((job: EchoJob) => {
+    processed.add(1)
+  })
+  pool.start()
+  let waited = 0
+  while (processed.load() < n && waited < 2000) {
+    sleep(5 * Millisecond)
+    waited = waited + 5
+  }
+  pool.stop()
+  assert(processed.load() == n, "expected exactly ${n} completions, got ${processed.load()}")
+  let i2 = 0
+  while (i2 < n) {
+    assert(store.byId(i2 + 1).done, "row ${i2 + 1} was never marked complete")
+    i2 = i2 + 1
+  }
+}
+
+// stop() must not return while a claimed job is still running.
+test "stop() drains: an in-flight job finishes before stop returns" {
+  let store = newFakeStore()
+  let q = newTestQueue(store)
+  let started = newAtomicI64(0)
+  let finished = newAtomicI64(0)
+  q.register<EchoJob>((job: EchoJob) => {
+    started.store(1)
+    sleep(50 * Millisecond)
+    finished.store(1)
+  })
+  q.enqueue(EchoJob{ message = "slow" }) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  q.start()
+  let waited = 0
+  while (started.load() == 0 && waited < 2000) {
+    sleep(2 * Millisecond)
+    waited = waited + 2
+  }
+  assert(started.load() == 1, "handler never started")
+  q.stop()
+  assert(finished.load() == 1, "stop() returned before the in-flight job finished")
+}
