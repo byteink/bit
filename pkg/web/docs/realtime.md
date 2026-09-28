@@ -216,17 +216,18 @@ compression, request logging, all of it wraps the ordinary response path.
 A route that needs a check before it upgrades (an auth cookie, an
 `Origin` allowlist) makes that check itself, before calling `wsUpgrade`.
 
-**WebSocket, SSE and Stream all work over TLS+HTTP/1.1; HTTP/2 and HTTP/3 do
-not yet.** `App.listenTls()`/`App.serveTls()` (ALPN "http/1.1") give
-`wsUpgrade`/`newSSE`/`newStream` the same keep-alive-or-hijack behavior
-`listen()`/`serve()` give them in plaintext - only the one connection that
-actually hijacks stops answering further requests; an ordinary route on the
-same app keeps its keep-alive connections either way. A request negotiated
-over HTTP/2 or HTTP/3 still cannot hijack at all - `c.hijack()`/`wsUpgrade`/
-`newSSE`/`newStream` on one of those fail, naming why (a WebSocket over
-HTTP/2 needs RFC 8441, a separate mechanism; SSE and Stream over HTTP/2 and
-HTTP/3 need no hijack at all, being stream-multiplexed protocols, but
-neither is wired up yet). Either needs plain `App.listen()`/`App.serve()` or
+**WebSocket, SSE and Stream all work over TLS+HTTP/1.1, and none of the
+three work over HTTP/2 or HTTP/3.** `App.listenTls()`/`App.serveTls()` (ALPN
+"http/1.1") give `wsUpgrade`/`newSSE`/`newStream` the same
+keep-alive-or-hijack behavior `listen()`/`serve()` give them in plaintext -
+only the one connection that actually hijacks stops answering further
+requests; an ordinary route on the same app keeps its keep-alive connections
+either way. A request negotiated over HTTP/2 or HTTP/3 still cannot hijack at
+all - `c.hijack()`/`wsUpgrade`/`newSSE`/`newStream` on one of those fail,
+naming why (a WebSocket over HTTP/2 needs RFC 8441, a separate mechanism; SSE
+and Stream over HTTP/2 and HTTP/3 need no hijack at all, being
+stream-multiplexed protocols, but this package does not implement either).
+Either needs plain `App.listen()`/`App.serve()` or
 TLS+HTTP/1.1 today, behind a TLS-terminating proxy if HTTP/2 or HTTP/3
 specifically is what the deployment needs.
 
