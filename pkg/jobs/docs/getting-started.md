@@ -6,6 +6,7 @@ A user signs up and your handler needs to send them a welcome email. Doing
 it inline is the obvious thing:
 
 ```bit
+import { Json } from "std/json"
 fn createUserSync(email: string): ()! {
   // insert into your database
   return
@@ -44,7 +45,6 @@ see [PostgreSQL](postgres.md) for what `migrate` and `newPostgresStore` do.
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
 import { newPostgresStore, migrate, open, Options, Store } from "jobs"
-import { Json, JsonEntry } from "std/json"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,

@@ -65,7 +65,7 @@ document says the next time you build:
 ```bit
 import { App, Config, Ctx, Res, notFound, minLen } from "web"
 import { env } from "std/os"
-import { Json, JsonEntry } from "std/json"
+import { Json } from "std/json"
 
 @json class Article {
   id: string,

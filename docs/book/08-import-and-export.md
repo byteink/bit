@@ -31,7 +31,7 @@ else on the way back in. `Draft` itself does not carry `@json` -
 coming - so this chapter gives it a wire twin instead of changing it:
 
 ```bit
-import { Json, JsonEntry, jsonAsArray, jsonDecode, jsonEncode, jsonParse } from "std/json"
+import { Json, jsonAsArray, jsonDecode, jsonEncode, jsonParse } from "std/json"
 
 // The wire shape of a `Draft`: `@json` writes an enum field as its variant's
 // own name, so `status` needs no manual conversion here.

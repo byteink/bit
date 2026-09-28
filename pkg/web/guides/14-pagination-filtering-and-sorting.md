@@ -18,6 +18,7 @@ clamps whatever arrives before it reaches the database:
 
 ```bit
 import { parseInt } from "std/strings"
+import { Json } from "std/json"
 
 const defaultLimit = 20
 const maxLimit = 100
@@ -62,7 +63,6 @@ rather than sending the full entity:
 import { Ctx, Res, page } from "web"
 import { Data, Dir, Query, TableDesc, find } from "orm"
 import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
-import { Json, JsonEntry } from "std/json"
 
 // The fields a listing needs. The real `Article` also carries its author
 // and tags relations (part 9, "Relationships") - this page only needs

@@ -28,6 +28,7 @@ itself returns.
 
 ```bit
 import { Ctx, Res } from "web"
+import { Json } from "std/json"
 
 fn showUser(c: Ctx): Res! {
   let id = c.param("id")
@@ -50,8 +51,6 @@ the handler looks wrong. So declare a type for the input, carrying only the
 fields a client is allowed to set, and map across explicitly:
 
 ```bit
-import { Json, JsonEntry } from "std/json"
-
 @json class NewUser {
   name: string,
   email: string,

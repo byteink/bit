@@ -37,6 +37,7 @@ ships it as one function:
 
 ```bit
 import { hashPassword } from "auth"
+import { Json } from "std/json"
 
 fn onRegister(password: string): string {
   return hashPassword(password)
@@ -75,8 +76,6 @@ no `passwordHash` field, so there is nothing to forget to strip before a
 response goes out:
 
 ```bit
-import { Json, JsonEntry } from "std/json"
-
 export @json class PublicUser {
   id: i64,
   username: string,
