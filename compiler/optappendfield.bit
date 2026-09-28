@@ -14,14 +14,16 @@
 // THE INVARIANT: at every in-place append on a header read from field K, the
 // field is the header's only holder. It holds when, module-wide:
 //
-// 1. Every store to K stores `const_nil`, a `slice_new` whose only use is
-//    the store, or the result of rule 2's append. Nothing else holds any of
-//    them afterwards.
-// 2. A read of K either feeds only a `_fresh` append as its input, whose only
-//    use is a store back to K of the same object, with nothing but constants
-//    between the append and the store; or
+// 1. Every store to K stores `const_nil`, a `slice_new` nothing reads after
+//    the store (`fieldNewOnlyStored`: a literal fills it first), a pop (a
+//    reslice of a K read whose only use is the store, `fieldPopOf`), or the
+//    result of rule 2's append. Nothing else holds any of them afterwards.
+// 2. A read of K feeds one `_fresh` append as its input, whose only use is a
+//    store back to K of the same object, with nothing but constants between
+//    the append and the store, and every other use of the read is a rule 3
+//    header read no path from the append reaches; or
 // 3. is used only as a header read (`slice_len`, `field_get`, `keep_alive`,
-//    the receiver of `slice_get`/`slice_set`/`string_from_bytes`).
+//    the receiver of `slice_get`/`slice_set`/`string_from_bytes`, a pop).
 //
 // and no read of K is SEPARATED from its uses: on every path from the read to
 // them (the read's live range), no instruction may run another in-place
@@ -138,7 +140,10 @@ fn fieldStoreOk(o: OwnFn, s: int, k: int): bool {
     return true
   }
   if (d.op == Op.RtCall && d.name == "slice_new") {
-    return ownUseCount(o, v) == 1
+    return fieldNewOnlyStored(o, v, s)
+  }
+  if (fieldPopOf(o, v, k)) {
+    return true
   }
   if (!isFreshAppend(d) || o.f.instrs[d.args[0]].op != Op.FieldGet) {
     return false
@@ -147,10 +152,38 @@ fn fieldStoreOk(o: OwnFn, s: int, k: int): bool {
     fieldRmwStore(o, d.args[0], k) == s
 }
 
+// Whether store `s` is the only holder of `slice_new` `v` from `s` on: every
+// other use reads a header word (its length, or the buffer a literal such as
+// `indentStack = [0]` fills) or an element, earlier in the same block, so
+// nothing that could see an in-place append's growth reads `v` after it.
+fn fieldNewOnlyStored(o: OwnFn, v: int, s: int): bool {
+  let u = o.useStart[v]
+  while (u < o.useStart[v + 1]) {
+    let at = o.useList[u]
+    if (at != s && !fieldNewFill(o, at, v, s)) {
+      return false
+    }
+    u = u + 1
+  }
+  return o.f.instrs[s].rhs == v && o.f.instrs[s].lhs != v
+}
+
+fn fieldNewFill(o: OwnFn, at: int, v: int, s: int): bool {
+  if (o.blockOf[at] != o.blockOf[s] || at > s) {
+    return false
+  }
+  let ins = o.f.instrs[at]
+  if (ins.op == Op.SliceLen || ins.op == Op.FieldGet) {
+    return true
+  }
+  let elem = ins.op == Op.RtCall && (ins.name == "slice_set" || ins.name == "slice_get")
+  return elem && ownOnlyReceiver(ins.args, v)
+}
+
 // Rule 2 for read `g` of field `k`: the store that closes its
 // read-modify-write, or -1 when `g` is not one.
 fn fieldRmwStore(o: OwnFn, g: int, k: int): int {
-  let r = fieldRmwAppend(o, g)
+  let r = fieldRmwAppend(o, g, k)
   if (r < 0) {
     return -1
   }
@@ -168,17 +201,24 @@ fn fieldRmwStore(o: OwnFn, g: int, k: int): int {
   return s
 }
 
-// The `_fresh` append read `g` is the only input of and nothing else reads,
-// when its result has one use; else -1.
-fn fieldRmwAppend(o: OwnFn, g: int): int {
-  if (ownUseCount(o, g) != 1) {
-    return -1
+// The one `_fresh` append read `g` is the only input of, when its result has
+// one use and every other use of `g` is a header read (`pushFrame`'s
+// `len(f.items)` guarding the same field's append); else -1. No header read
+// can follow the append: the store closing it sits right after it and is a
+// separator (`fieldSeparated`) for any read of `g` it precedes.
+fn fieldRmwAppend(o: OwnFn, g: int, k: int): int {
+  let r = -1
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let at = o.useList[u]
+    if (isFreshAppend(o.f.instrs[at]) && r < 0) {
+      r = at
+    } else if (!fieldHeaderUse(o, at, g, k)) {
+      return -1
+    }
+    u = u + 1
   }
-  let r = o.useList[o.useStart[g]]
-  if (!isFreshAppend(o.f.instrs[r]) || !ownOnlyReceiver(o.f.instrs[r].args, g)) {
-    return -1
-  }
-  if (ownUseCount(o, r) != 1) {
+  if (r < 0 || !ownOnlyReceiver(o.f.instrs[r].args, g) || ownUseCount(o, r) != 1) {
     return -1
   }
   return r
@@ -201,7 +241,7 @@ fn fieldOnlyConsts(f: IrFunc, lo: int, hi: int): bool {
 fn fieldHeaderRead(o: OwnFn, g: int, k: int): bool {
   let u = o.useStart[g]
   while (u < o.useStart[g + 1]) {
-    if (!fieldHeaderUse(o.f.instrs[o.useList[u]], g)) {
+    if (!fieldHeaderUse(o, o.useList[u], g, k)) {
       return false
     }
     u = u + 1
@@ -209,15 +249,43 @@ fn fieldHeaderRead(o: OwnFn, g: int, k: int): bool {
   return !fieldSeparated(o, g, k)
 }
 
-fn fieldHeaderUse(ins: IrInstr, g: int): bool {
+// Whether instruction `at` only reads the header `g` holds. A reslice whose
+// sole use is a store back to field `k` counts (`fieldPopOf`): it copies
+// the header's words into a new header and hands that to the field alone.
+fn fieldHeaderUse(o: OwnFn, at: int, g: int, k: int): bool {
+  let ins = o.f.instrs[at]
   if (ins.op == Op.SliceLen || ins.op == Op.FieldGet || ins.op == Op.KeepAlive) {
     return true
   }
   if (ins.op != Op.RtCall) {
     return false
   }
+  if (ins.name == "slice_slice") {
+    return fieldPopOf(o, at, k)
+  }
   let reader = ins.name == "slice_get" || ins.name == "slice_set" || ins.name == "string_from_bytes"
   return reader && ownOnlyReceiver(ins.args, g)
+}
+
+// Whether `v` is a pop of field `k`: `rt_call slice_slice` of a read of `k`
+// as its receiver only, whose one use is a store to `k`
+// (`s.indentStack = s.indentStack[0:n]`). `rtSliceSlice` allocates the
+// header it returns, so the field is its only holder; a second use (a
+// local that keeps the popped header) is a holder an in-place push would
+// grow, and poisons `k`.
+fn fieldPopOf(o: OwnFn, v: int, k: int): bool {
+  let d = o.f.instrs[v]
+  if (d.op != Op.RtCall || d.name != "slice_slice" || len(d.args) == 0 || ownUseCount(o, v) != 1) {
+    return false
+  }
+  let src = o.f.instrs[d.args[0]]
+  let st = o.f.instrs[o.useList[o.useStart[v]]]
+  return src.op == Op.FieldGet &&
+    fieldKey(o.fields.ctx, o.f, src) == k &&
+    ownOnlyReceiver(d.args, d.args[0]) &&
+    st.op == Op.FieldSet &&
+    st.rhs == v &&
+    fieldKey(o.fields.ctx, o.f, st) == k
 }
 
 // Whether any instruction on a path from read `g` to one of its uses may
