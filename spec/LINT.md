@@ -459,7 +459,7 @@ Both rules are deliberately syntactic, trusting a call's own name and shape
 rather than resolving it to a real declaration - neither rule's target
 package needs to exist yet for the rule itself to fire correctly, since
 `bit lint` never resolves a callee (§1, and `compiler/linttx.bit`'s own
-header). Both are documented further in `docs/lint/policy.md`, which is
+header). Both are documented further in `docs/development/lint-remediation-policy.md`, which is
 where their exact message text and severity live; this table exists so a
 reader scanning "every E02xx code" (§3) finds them without already knowing
 to look there.

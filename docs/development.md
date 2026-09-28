@@ -969,7 +969,7 @@ Old notes and tickets will mislead you:
 
 **bitlang.org lives in a separate repository: `byteink/bit-website`.** It used to
 be `website/` here. That repo consumes this one as a git submodule, because most
-of the site is generated *from* this tree - `docs/tutorial.md`, `docs/reference`,
+of the site is generated *from* this tree - `docs/get-started.md`, `docs/book`, `docs/reference`, `docs/tools`,
 `docs/stdlib`, `docs/release/SUPPORT.md`, `stdlib/`, `examples/` and
 `dist/install.sh`.
 
@@ -977,7 +977,7 @@ Two consequences for work done **here**:
 
 - **The doc gates still carry the site.** `_tests_/bit/docs.bit` typechecks every
   Bit-tagged block under `docs/`, and the site publishes those same files -
-  "Get started" *is* `docs/tutorial.md`, not a copy. A docs change that passes
+  "Get started" *is* `docs/get-started.md`, not a copy. A docs change that passes
   the gate here is publishable there; one that fails is not.
 - **`examples/staticserver` is the only GATED copy of the website's serving
   logic.** It holds the same `fileResponse`/`safePath`/`mimeFor` as that repo's
