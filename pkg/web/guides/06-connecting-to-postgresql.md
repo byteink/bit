@@ -29,21 +29,12 @@ postgres://inkwell:inkwell@127.0.0.1:5432/inkwell?sslmode=disable
 
 `std/sql` defines `Pool` and `Datasource`; the PostgreSQL wire protocol
 itself lives in `bitlang.org/pkg/postgres`, which exports one function:
-`adapter()`. Inkwell's own `bit.json` points at it with a local path rather
-than `bit add bitlang.org/pkg/postgres@v...` - the package has not been
-tagged yet (tracked as #6085), so a same-repo companion app depends on the
-source directly:
+`adapter()`:
 
-```json
-{
-  "dependencies": {
-    "web": "../..",
-    "postgres": "../../../postgres"
-  }
-}
+```text
+$ bit add bitlang.org/pkg/postgres@v0.1.0
+bit add: postgres -> bitlang.org/pkg/postgres@0.1.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
 ```
-
-Once #6085 lands, this becomes a normal `bit add bitlang.org/pkg/postgres@v...`.
 
 ## Step 3: open the pool
 

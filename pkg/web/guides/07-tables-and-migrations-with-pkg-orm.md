@@ -9,6 +9,13 @@ to change those tables later without hand-writing `CREATE TABLE` and
 teammate's checkout has drifted into. `pkg/orm`'s schema builder and
 migration runner are how Inkwell does both.
 
+## Install pkg/orm
+
+```text
+$ bit add bitlang.org/pkg/orm@v0.1.0
+bit add: orm -> bitlang.org/pkg/orm@0.1.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
+```
+
 ## Describe a table instead of writing SQL
 
 `table(name, build)` builds a tree, not a SQL string. A dialect (Postgres,
