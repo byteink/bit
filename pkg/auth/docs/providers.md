@@ -36,8 +36,8 @@ fn microsoft(tenantId: string, rootsPem: string): OidcStrategy! {
 If your app genuinely needs to accept sign-ins from any Microsoft account
 across tenants, that needs validating the token's tenant against an
 allow-list at verification time rather than one fixed issuer, which this
-package does not do yet - configure one real tenant per `microsoftStrategy`
-call today.
+package does not do - configure one real tenant per `microsoftStrategy`
+call.
 
 ## Any other conformant provider
 
