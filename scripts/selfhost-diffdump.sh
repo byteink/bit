@@ -97,8 +97,18 @@ export BIT_STDLIB
 # fnvalue-trampoline fixture mismatches (`make_closure @fnvalue$trampoline$N`
 # vs `global_addr @__bitfnv_N`) in BOTH ir and iropt (KIND=ir), since it
 # changes IR at emission time, before any opt pass runs.
+#
+# #6058: BIT_GENERIC_EXPLODE (#6190) defaults ON in this tree too, but the
+# 0.32.0 ORACLE carries the code and still defaults it off, so force "1" on
+# both the same way, until the 0.33.0 repin retires this line the way
+# IFACE_SIG/BCE_JOIN/JSON_APPEND were retired above -- mutation-proven:
+# without this every generic declaration with an explodable parameter
+# (_tests_/cases/run_generic_arg_ok.bit and 40 others) mismatches in both ir
+# and iropt (KIND=ir), since explosion happens at lowering time, before any
+# opt pass runs.
 if [ "$KIND" = ir ]; then
   export BIT_STATIC_CONST=1
+  export BIT_GENERIC_EXPLODE=1
 fi
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
