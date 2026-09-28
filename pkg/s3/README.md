@@ -7,6 +7,8 @@ Cloud Storage's XML API.
 
 ## Install
 
+`bit add bitlang.org/pkg/s3@v0.1.0` writes:
+
 ```json
 {
   "dependencies": {

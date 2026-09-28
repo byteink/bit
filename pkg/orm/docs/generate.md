@@ -36,9 +36,8 @@ fn regenerate(db: Data): string! {
 
 `Widget{}` needs no `implements TableEntity` clause - `@table` synthesizes
 exactly the two members `TableEntity` asks for (`tableDescriptor()` and
-`tableAttrs()`), and Bit's structural typing (SPEC section 12.3's
-bare-literal rule) is what lets a plain `[Widget{}]` literal convert to
-`[]TableEntity` at the call site.
+`tableAttrs()`), and Bit's structural typing is what lets a plain
+`[Widget{}]` literal convert to `[]TableEntity` at the call site.
 
 `ServerDialect.Postgres` names which server `db` is - `generate` never
 asks the live connection what it is (see [Dialect](dialect.md) for why),

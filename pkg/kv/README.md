@@ -15,6 +15,8 @@ stated here rather than enforced.
 
 ## Install
 
+`bit add bitlang.org/pkg/kv@v0.1.0` writes:
+
 ```json
 {
   "dependencies": {

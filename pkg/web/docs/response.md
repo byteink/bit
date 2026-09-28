@@ -89,14 +89,12 @@ fn homePage(c: Ctx): Res! {
 }
 ```
 
-A lowercase tag (`<div>`, `<a>`) desugars to a call to `elem`; an attribute
-(`class="card"`) desugars to a call to `attr`; a fragment (`<>...</>`)
-desugars to a call to `frag`. None of the three is compiler magic - they are
-ordinary functions this package exports, resolved by the same scope rules
-as any other call, so the import line above must name all three even
-though your own source never spells `elem`, `attr` or `frag`. Leave one out
-and every tag in the file becomes an "undefined name" error naming a word
-you never wrote.
+A lowercase tag (`<div>`, `<a>`) is a call to `elem`; an attribute
+(`class="card"`) is a call to `attr`; a fragment (`<>...</>`) is a call to
+`frag`. They are ordinary functions this package exports, so the import
+line above must name all three even though your own source never spells
+`elem`, `attr` or `frag`. Leave one out and every tag in the file becomes
+an "undefined name" error naming a word you never wrote.
 
 A tag whose name starts uppercase, like `<Page title="Users" />` above,
 calls a function instead of building an element - its attributes become

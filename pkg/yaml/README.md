@@ -12,6 +12,8 @@ that means. The two things it deliberately does not accept are YAML 1.1's
 
 ## Install
 
+`bit add bitlang.org/pkg/yaml@^0.1.3` writes:
+
 ```json
 {
   "dependencies": {

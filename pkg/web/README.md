@@ -18,6 +18,8 @@ this is stated here rather than enforced.
 
 ## Install
 
+`bit add bitlang.org/pkg/web@^0.7.0` writes:
+
 ```json
 {
   "dependencies": {
@@ -41,10 +43,9 @@ fn main(): ()! {
 
 ## Views (JSX)
 
-`<div id="x">hi</div>` needs nothing beyond the ordinary install above: JSX
-(SPEC §12.12) desugars a lowercase tag to calls to `elem`, `attr`, `frag` and
-`text`, resolved by ordinary scope rules like any other call, so importing
-those four alongside the constructors they wrap is all a view needs.
+`<div id="x">hi</div>` needs nothing beyond the ordinary install above:
+each tag is a call to `elem`, `attr`, `frag` or `text`, so importing those
+four alongside the constructors they wrap is all a view needs.
 
 ```bit
 import { Node, elem, attr, frag, text } from "web"
