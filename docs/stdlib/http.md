@@ -220,7 +220,7 @@ starting from exactly the handler shown above.
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
 | `Server.setMaxBodyBytes(0)` or a zero `Limits` field to `parseMultipart` | refuses every body - `0` never means unlimited |
 | a client offering ALPN `h2` against a server that shares no protocol | the handshake is aborted, never silently downgraded |
-| an `https+h3://` request today | unauthenticated - QUIC certificate verification has not landed; treat it as experimental |
+| an `https+h3://` request | unauthenticated - it does not verify the server's certificate; treat it as experimental |
 | `req.peer` on a hand-built `Request`, or one whose connection died early | `""`, never a placeholder address |
 
 ## Reference
@@ -236,53 +236,403 @@ handler serve all three protocols - only the socket underneath changes.
 | HTTP/2 | automatic over `https://` when the server offers ALPN `h2` | `serveTls` (no separate entry point - it is what TLS already speaks) | TCP + TLS 1.3 |
 | HTTP/3 | explicit `https+h3://`, or after an Alt-Svc upgrade on a `Client` | `serveH3` / `h3Serve`, opt-in, paired with a `serveTls` for discovery | QUIC (UDP) + TLS 1.3 |
 
-### Messages
+## Messages
 
-| Symbol | Meaning |
-|---|---|
-| `Request` | `method`, `path`, raw `headers`, `body`, `peer`, `headerLines` |
-| `Response` | `status`, `contentType`, raw `headers`, `body` |
-| `header(block, name): string` | a named header's value from a raw block, or `""` |
-| `atoi(s): int` | the non-negative integer `s` names, or `-1` on anything else (no silent overflow) |
-| `ok(body): Response` | `200` with a UTF-8 text body |
-| `respond(status, body): Response` | an explicit status and text body |
-| `Response.setHeader(name, value)!` / `addHeader(name, value)!` | replace / append a header on the way out; fails on an invalid name or a CR/LF/NUL in `value` |
-| `Response.getHeader(name): string` | a header already set on this response |
+### `Request`
 
-### TLS (HTTPS) server
+A parsed HTTP request: `method`, `path`, the raw `headers` block, `body`, and
+`peer` (the client's address, `""` when none is known). Read an individual
+header with `header(req.headers, name)`.
 
-| Symbol | Meaning |
-|---|---|
-| `serveTls(host, port, certPem, keyPem, handler)!` | the TLS mirror of `listenAndServe`; also the HTTP/2 server via ALPN |
-| `serveTlsOn(listener, handler)!` | serve on an already-bound `std/tls` `Listener` |
-| `TlsServer` / `tlsServe(host, port, certPem, keyPem): TlsServer!` | shutdown-capable TLS listener, mirroring `Server` |
-| `serveTlsServerOn(ts, handler)!` | serve on a `TlsServer` |
-| `TlsServer.setMaxBodyBytes(n)` / `.shutdown(timeoutMs)!` / `.attachH3(hs)` | mirror `Server`'s, plus pairing an `H3Server` so one `shutdown()` drains both |
+### `Response`
 
-### HTTP/3
+An HTTP response: `status`, `contentType`, the raw `headers` block, and
+`body`. The server fills in `Content-Length` and `Connection` for you.
+
+### `header(block: string, name: string): string`
+
+The value of header `name` in a raw header block, or `""` if it is absent.
+
+### `atoi(s: string): int`
+
+The non-negative integer `s` names, or `-1` if `s` is not a valid one
+(including a value too large to fit).
+
+### `ok(body: string): Response`
+
+A `200 OK` response carrying `body` as UTF-8 text.
+
+### `respond(status: int, body: string): Response`
+
+A response with an explicit status and a text body.
+
+### `Response.setHeader(name: string, value: string): ()!`
+
+Replaces header `name` with `value` on the way out. Fails on an invalid
+name or a CR/LF/NUL in `value`.
+
+### `Response.addHeader(name: string, value: string): ()!`
+
+Appends another header `name: value` without removing an existing one of
+the same name. Fails the same way `setHeader` does.
+
+### `Response.getHeader(name: string): string`
+
+The value already set for header `name` on this response, or `""` if none.
+
+## Clients
+
+### `get(url: string): Response!`
+
+Fetches `url` over `http://` or `https://`.
+
+### `post(url: string, body: string): Response!`
+
+Sends `body` to `url` over `http://` or `https://`.
+
+### `request(method: string, url: string, body: string): Response!`
+
+Sends `method url` with an optional `body` and returns the response. An
+`https://` URL runs over TLS 1.3; the server's certificate is verified
+against the system trust store.
+
+### `requestWith(method: string, url: string, headers: []Header, body: string): Response!`
+
+As `request`, with extra `headers` attached: authentication, content type,
+or anything custom. Fails before sending if a header is invalid or names one
+this module manages itself.
+
+### `getTimeout(url: string, timeoutMs: int): Response!`
+
+As `get`, bounded by one deadline covering connect, send and read.
+
+### `postTimeout(url: string, body: string, timeoutMs: int): Response!`
+
+As `post`, bounded by one deadline covering connect, send and read.
+
+### `requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
+
+As `request`, bounded by one deadline covering connect, send and read.
+
+### `getTls(url: string, config: TlsConfig): Response!`
+
+As `get`, with an explicit [`std/tls`](tls.md) configuration: pin a CA, set a
+`serverName`, or skip verification in a test.
+
+### `postTls(url: string, body: string, config: TlsConfig): Response!`
+
+As `post`, with an explicit TLS configuration.
+
+### `requestTls(method: string, url: string, body: string, config: TlsConfig): Response!`
+
+As `request`, with an explicit TLS configuration. Fails if `url` is not
+`https`.
+
+### `getStreaming(url: string, headers: []Header, sink: BodySink, maxBodyBytes: int): Response!`
+
+Fetches `url`, delivering the response body to `sink` in bounded chunks
+instead of returning it whole. `Response.body` is always `""`.
+
+### `requestWithStreamingBody(method: string, url: string, headers: []Header, contentLength: int, source: BodySource): Response!`
+
+Sends a request body of exactly `contentLength` bytes pulled from `source`,
+one chunk at a time, and returns the response.
+
+### `BodySource`
+
+A function `(int) => string!` that pulls up to `n` bytes of a request body
+for `requestWithStreamingBody`; `""` marks the end.
+
+### `BodySink`
+
+A function `(string) => ()!` that receives one chunk of a response body at a
+time for `getStreaming`, called repeatedly until the body is exhausted.
+
+### `Client`
+
+An HTTP client that reuses its configuration and connections across calls,
+and remembers which servers have advertised HTTP/3.
+
+### `newClient(): Client`
+
+A `Client` that is secure by default: TLS verification on, system trust
+roots, HTTP/2 offered.
+
+### `newClientTls(config: TlsConfig): Client`
+
+A `Client` with an explicit TLS configuration for its `https://` calls.
+
+### `Client.get(url: string): Response!`
+
+As the package-level `get`, using this client's configuration and
+connections.
+
+### `Client.post(url: string, body: string): Response!`
+
+As the package-level `post`, using this client's configuration.
+
+### `Client.request(method: string, url: string, body: string): Response!`
+
+As the package-level `request`, using this client's configuration.
+
+### `Client.requestWith(method: string, url: string, headers: []Header, body: string): Response!`
+
+As the package-level `requestWith`, using this client's configuration and
+default headers.
+
+### `Client.getTimeout(url: string, timeoutMs: int): Response!`
+
+As `Client.get`, bounded by one deadline.
+
+### `Client.postTimeout(url: string, body: string, timeoutMs: int): Response!`
+
+As `Client.post`, bounded by one deadline.
+
+### `Client.requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
+
+As `Client.request`, bounded by one deadline.
+
+### `Client.setHeader(name: string, value: string): ()!`
+
+Sets a default header sent with every call this client makes from now on.
+
+### `Client.setMaxBodyBytes(n: int): ()`
+
+Raises or lowers the response-size cap for this client, in bytes. There is
+no value meaning unlimited; `0` refuses every body.
+
+## Serving requests
+
+### `Server`
+
+A listening HTTP server, accepting connections without reading them. Spawn
+a green thread per connection and call `Exchange.read()` there.
+
+### `serve(host: string, port: int): Server!`
+
+Binds `host:port` and starts listening. Pass `0` for `port` to let the
+kernel choose one, then read it back with `Server.port()`.
+
+### `Server.port(): int!`
+
+The port this server is actually bound to.
+
+### `Server.accept(): Exchange!`
+
+Blocks until the next connection arrives and returns it, without reading
+anything off it yet.
+
+### `Server.close()`
+
+Stops the server immediately.
+
+### `Server.shutdown(timeoutMs: int): ()!`
+
+Stops the server gracefully: drains requests already in flight, then
+force-closes whatever is still running once `timeoutMs` elapses.
+
+### `Server.setIdleTimeoutMs(ms: int)`
+
+How long, in milliseconds, an idle keep-alive connection is kept open. The
+default is 60 seconds.
+
+### `Server.setMaxRequestsPerConn(n: int)`
+
+The most requests one keep-alive connection may serve before it is closed.
+The default is 1000.
+
+### `Server.setMaxBodyBytes(n: int)`
+
+The largest request body this server accepts, in bytes. The default is 32
+MiB; there is no value meaning unlimited, so `0` refuses every body with
+`400` before it is read.
+
+### `Exchange`
+
+One accepted connection, before its request is read. Call `Exchange.read()`
+on its own spawned green thread to get the request.
+
+### `Exchange.read(): Request!`
+
+Reads and parses the next request on this connection.
+
+### `Exchange.respond(res: Response): ()!`
+
+Sends `res` as the answer to the request this exchange read.
+
+### `listenAndServe(host: string, port: int, handler: (Request) => Response): ()!`
+
+Binds `host:port` and serves HTTP forever, dispatching every request to
+`handler` on its own green thread. Returns only on a bind error.
+
+### `listenAndServeOn(s: Server, handler: (Request) => Response): ()!`
+
+As `listenAndServe`, on a `Server` you already bound with `serve`. Use this
+when you need to know the bound port, such as a kernel-chosen one, before
+serving starts.
+
+## TLS (HTTPS) server
+
+### `serveTls(host: string, port: int, certPem: string, keyPem: string, handler: (Request) => Response): ()!`
+
+The TLS mirror of `listenAndServe`, using certificate chain `certPem` and
+private key `keyPem` (both PEM). Also the HTTP/2 server: a client that
+negotiates ALPN `h2` is served over HTTP/2 automatically.
+
+### `serveTlsOn(listener: TlsListener, handler: (Request) => Response): ()!`
+
+As `serveTls`, on an already-bound [`std/tls`](tls.md) `Listener`.
+
+### `TlsServer`
+
+A shutdown-capable TLS listener, the TLS mirror of `Server`.
+
+### `tlsServe(host: string, port: int, certPem: string, keyPem: string): TlsServer!`
+
+Binds `host:port` for TLS and returns a `TlsServer`. Drive it with
+`serveTlsServerOn`.
+
+### `serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()!`
+
+Serves HTTPS forever on `ts`, dispatching every request to `handler`.
+
+### `TlsServer.port(): int!`
+
+The port this TLS server is actually bound to.
+
+### `TlsServer.setMaxBodyBytes(n: int)`
+
+As `Server.setMaxBodyBytes`, for this TLS server.
+
+### `TlsServer.shutdown(timeoutMs: int): ()!`
+
+As `Server.shutdown`, for this TLS server.
+
+### `TlsServer.attachH3(hs: H3Server)`
+
+Pairs this TLS server with an `H3Server` so one `shutdown()` call drains
+both.
+
+## HTTP/3
 
 Opt-in because QUIC needs UDP and a heavier handshake than plain TLS-over-TCP.
 
-| Symbol | Meaning |
-|---|---|
-| `serveH3(host, port, certPem, keyPem, handler)!` | serves HTTP/3 forever; run on its own green thread, paired with `serveTls` on the same port |
-| `serveH3On(sock, certPem, keyPem, handler)!` | serve on an already-bound UDP socket |
-| `H3Server` / `h3Serve(host, port, certPem, keyPem): H3Server!` | shutdown-capable mirror |
-| `serveH3ServerOn(hs, handler)!` / `H3Server.port()!` / `.shutdown(timeoutMs)!` | drive and stop it |
+### `H3Server`
 
-### Hijacking a connection (protocol upgrades)
+A shutdown-capable HTTP/3 server handle, bound with `h3Serve`.
+
+### `h3Serve(host: string, port: int, certPem: string, keyPem: string): H3Server!`
+
+Binds `host:port` (UDP) for HTTP/3 and returns a shutdown-capable handle.
+Drive it with `serveH3ServerOn`.
+
+### `serveH3ServerOn(hs: H3Server, handler: (Request) => Response): ()!`
+
+Serves HTTP/3 forever on `hs`, dispatching every request to `handler`. Run
+this on its own green thread.
+
+### `serveH3(host: string, port: int, certPem: string, keyPem: string, handler: (Request) => Response): ()!`
+
+Binds `host:port` (UDP) and serves HTTP/3 forever. Run on its own green
+thread, paired with a `serveTls` server on the same port so `https://`
+clients can discover and upgrade to it.
+
+### `serveH3On(sock: UdpSocket, certPem: string, keyPem: string, handler: (Request) => Response): ()!`
+
+As `serveH3`, on an already-bound UDP socket. Use this to learn the bound
+port before serving starts.
+
+## Hijacking a connection (protocol upgrades)
 
 For a handler that must take over the raw connection - a WebSocket upgrade,
 for instance ([`std/websocket`](websocket.md) is built on this).
 
-| Symbol | Meaning |
-|---|---|
-| `HijackOutcome` | `Answer(res)` to answer normally, or `Hijacked` after calling `hijack()` |
-| `serveHijackableOn(s, handler)!` / `serveHijackableBackground(s, handler)` | the hijack-capable sibling of `listenAndServeOn` |
-| `Exchange.hijack(): Conn` / `.hijackStream(): byteStream` | take ownership of the connection, raw or transport-agnostic |
-| `Exchange.respondKeepAlive(req, res, mustCloseNow): bool!` | answer while driving your own multi-request loop |
-| `serveHijackableTlsOn` / `serveHijackableTlsBackground` / `TlsExchange` / `TlsServer.accept()!` | the TLS mirrors of the five above |
-| `byteStream` / `newByteStream(c)` / `newTlsByteStream(c)` | the transport-agnostic read/write interface a hijacked connection speaks |
+### `HijackOutcome`
+
+What a hijackable handler decided: `Answer(res)` to answer the request
+normally, or `Hijacked` after it has already called `hijack()` and taken
+the connection over.
+
+### `serveHijackableOn(s: Server, handler: (Request, Exchange) => HijackOutcome): ()!`
+
+The hijack-capable sibling of `listenAndServeOn`: `handler` answers most
+requests normally and keeps the connection open, or takes it over by
+returning `Hijacked`.
+
+### `serveHijackableBackground(s: Server, handler: (Request, Exchange) => HijackOutcome): ()`
+
+As `serveHijackableOn`, run in the background: its return is not reported
+anywhere, since a server stopping is the expected outcome, not a failure.
+
+### `Exchange.hijack(): Conn`
+
+Takes ownership of the raw connection this exchange is serving. Nothing else
+reads from or writes to it afterward except the caller.
+
+### `Exchange.hijackStream(): byteStream`
+
+As `Exchange.hijack`, returning a transport-agnostic `byteStream` instead of
+the raw connection type.
+
+### `Exchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
+
+Answers `req` with `res` while driving your own multi-request loop over one
+connection, returning whether the connection stays open for another
+request.
+
+### `TlsExchange`
+
+The TLS mirror of `Exchange`: one accepted TLS connection, before its
+request is read.
+
+### `TlsExchange.read(): Request!`
+
+As `Exchange.read`, for a TLS connection.
+
+### `TlsExchange.respond(res: Response): ()!`
+
+As `Exchange.respond`, for a TLS connection.
+
+### `TlsExchange.hijack(): TlsConn`
+
+As `Exchange.hijack`, for a TLS connection.
+
+### `TlsExchange.hijackStream(): byteStream`
+
+As `Exchange.hijackStream`, for a TLS connection.
+
+### `TlsExchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
+
+As `Exchange.respondKeepAlive`, for a TLS connection.
+
+### `TlsServer.accept(): TlsExchange!`
+
+Blocks until the next TLS connection arrives and returns it, without
+reading anything off it yet.
+
+### `serveHijackableTlsOn(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()!`
+
+The hijack-capable sibling of `serveTlsServerOn`. `hijackHandler` serves
+HTTP/1.1 connections and may take one over; `plainHandler` serves every
+HTTP/2 connection, which cannot be hijacked.
+
+### `serveHijackableTlsBackground(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()`
+
+As `serveHijackableTlsOn`, run in the background.
+
+### `byteStream`
+
+The transport-agnostic read/write interface a hijacked connection speaks,
+whether it came from a plain or a TLS connection.
+
+### `newByteStream(c: Conn): byteStream`
+
+Wraps a plain [`std/net`](net.md) connection you already hold as a
+`byteStream`.
+
+### `newTlsByteStream(c: TlsConn): byteStream`
+
+As `newByteStream`, for a TLS connection.
 
 ```bit
 import { Server, Exchange, Request, HijackOutcome, ok, serve, serveHijackableOn } from "std/http"
@@ -302,24 +652,49 @@ fn runHijackable(): ()! {
 }
 ```
 
-### Request headers you build
+## Request headers you build
 
-| Symbol | Meaning |
-|---|---|
-| `Header{ name, value }` | one outgoing header |
-| `serializeHeaders(headers): string!` | validates and joins them into the raw wire block |
-| `validateHeaderName(name)!` / `validateHeaderValue(value)!` | the checks `serializeHeaders` and `Response.setHeader` both run |
+### `Header`
 
-### Query strings
+One outgoing header: a `name` and a `value`, validated before it reaches the
+wire.
+
+### `serializeHeaders(headers: []Header): string!`
+
+Validates `headers` and joins them into the raw wire block. Fails on the
+first invalid header, with no partial result.
+
+### `validateHeaderName(name: string): ()!`
+
+Fails unless `name` is a legal header name.
+
+### `validateHeaderValue(value: string): ()!`
+
+Fails if `value` contains a raw CR, LF or NUL.
+
+## Query strings
 
 `Request.path` is the raw, still percent-encoded request target.
 
-| Symbol | Meaning |
-|---|---|
-| `splitTarget(target): (path, rawQuery)` | split at the first `?` |
-| `parseQuery(raw): map<string, string>` | decoded key to decoded value; a duplicate key is last-wins |
-| `percentDecode(s): string` | `%XX` to a byte, `+` to a space; a malformed escape passes through unchanged |
-| `percentEncode(s): string` | the inverse, for a value you are about to put in a URL |
+### `splitTarget(target: string): (string, string)`
+
+Splits a request target at its first `?` into `(path, rawQuery)`. A target
+with no `?` returns the whole target as the path and `""` as the query.
+
+### `parseQuery(raw: string): map<string, string>`
+
+Parses a raw query string, as returned by `splitTarget`, into decoded keys
+and values. A duplicate key keeps the last value.
+
+### `percentDecode(s: string): string`
+
+Percent-decodes `s`: `%XX` becomes a byte, `+` becomes a space. A malformed
+escape passes through unchanged rather than failing.
+
+### `percentEncode(s: string): string`
+
+Percent-encodes every byte of `s` that is not safe to put directly in a URL.
+The inverse of `percentDecode` for building a query value.
 
 ```bit
 import { splitTarget, parseQuery } from "std/http"
@@ -330,7 +705,7 @@ fn queryFor(target: string): map<string, string> {
 }
 ```
 
-### Multipart form uploads
+## Multipart form uploads
 
 `parseMultipart` turns a `Request.body` into named fields and named file
 parts. Every `Limits` field is required, and a zero limit rejects everything
@@ -339,12 +714,43 @@ attacker-controlled. A file's declared `filename` and `contentType` are
 returned exactly as received and are never sanitised: joining `filename` to
 a path is the caller's decision to make deliberately.
 
-| Symbol | Meaning |
-|---|---|
-| `Limits` / `defaultLimits(): Limits` | `maxBodyBytes`, `maxFileBytes`, `maxParts`, `maxHeaderLineBytes`, `maxPartHeaderBytes` |
-| `Form` / `parseMultipart(body, boundary, limits): Form!` | `.fields`, `.files`, `.value(name)`, `.file(name)!` |
-| `FormField` / `FormFile` | a text field (`name`, `value`); a file part (`name`, `filename`, `contentType`, `content`) |
-| `multipartField(body, boundary, name, limits): (string, bool)!` | one field's value without building a whole `Form` - cheap for reading a hidden token out of a large upload |
+### `Limits`
+
+The size and count bounds `parseMultipart` enforces: `maxBodyBytes`,
+`maxFileBytes`, `maxParts`, `maxHeaderLineBytes`, and `maxPartHeaderBytes`.
+
+### `defaultLimits(): Limits`
+
+Reasonable defaults for an ordinary web upload form.
+
+### `Form`
+
+The result of a successful `parseMultipart`: every text field and file part,
+in the order they appeared.
+
+### `Form.value(name: string): string`
+
+The value of the first text field named `name`, or `""` if absent.
+
+### `Form.file(name: string): FormFile!`
+
+The first file part named `name`. Fails if there is none.
+
+### `FormField`
+
+One text field: its form `name` and `value`, exactly as sent.
+
+### `FormFile`
+
+One file part: its form `name`, the sender's declared `filename` and
+`contentType`, and the raw file `content`. `filename` and `contentType` are
+untrusted input, returned exactly as received.
+
+### `multipartField(body: []byte, boundary: string, name: string, limits: Limits): (string, bool)!`
+
+The value of the first text field named `name` in `body`, and whether such a
+field was present at all, without building a whole `Form`. Cheaper than
+`parseMultipart` when you only need one field out of a large upload.
 
 ```bit
 import { Form, parseMultipart, defaultLimits } from "std/http"
@@ -361,7 +767,3 @@ fn handleUpload(body: []byte, boundary: string): Form! {
 - Building routes, JSON bodies and middleware on top of this: [pkg/web](/packages/web) and [the Book's web course](/book/14-first-endpoint).
 - Certificates, trust stores and dialing TLS directly: [std/tls](tls.md).
 - Framing your own protocol over a hijacked connection: [std/websocket](websocket.md).
-
----
-
-Specification: `spec/SPEC.md`.
