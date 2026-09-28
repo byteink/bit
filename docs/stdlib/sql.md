@@ -1,643 +1,139 @@
 # std/sql
 
-The database driver contract: the types a SQL driver and the code that uses
-it both build on, so swapping one database for another costs one import
-line, not a rewrite. It lives in the standard library rather than a package
-on purpose - a contract shipped as a package invites a competing one, and
-every driver ends up picking a side. Reach for this module through a driver
-package like `pkg/postgres` or `pkg/mysql`, not directly - see
-[Writing a driver](#writing-a-driver) below for how those fit together.
+When Inkwell outgrows a folder of files, it needs a real database - and it
+needs the storage swap to cost one import line, not a rewrite of every
+handler. `std/sql` is why that works: a driver contract every database
+package builds on, plus a connection pool, typed row reading, and closures
+for transactions. Reach for it through a driver package like `pkg/postgres`
+or `pkg/mysql`, not directly - see [Writing a driver](#writing-a-driver) for
+how those fit together.
 
 **The only way to supply a value is `params []Value`.** `query`/`exec` take
-the literal SQL text and an ordered list of typed `Value`s as two separate
-arguments; nothing in this module ever builds SQL text by concatenating a
-value into it. There is no function anywhere in `std/sql` that accepts a
-pre-interpolated string with values already substituted in.
-
-**Placeholder syntax is not specified here.** Postgres numbers its
-placeholders (`$1`, `$2`, ...); MySQL and SQLite use a positional `?`. This
-module picks neither - `sqlText` carries whatever placeholder marker the
-caller and the target driver agree on, and each driver renders it into its
-own wire format from the ordered `params` list it is given.
+the SQL text you wrote and an ordered list of typed `Value`s as two separate
+arguments. Nothing in this module ever builds SQL text by pasting a value
+into it - that is the whole defense against SQL injection, and it is
+structural: there is no function here that accepts a string with values
+already substituted in, so there is nothing to misuse into one.
 
 <!-- doctest: per-block -->
 
-```bit ignore
-import { Value, isNull, asInt, asFloat, asBool, asText, asBlob } from "std/sql"
-import { Driver, Conn, Rows, Stmt, Tx } from "std/sql"
-import { Registry, newRegistry } from "std/sql"
-```
-
-## `Value` - the wire type every driver carries
-
-### `Value`
-
-One of six wire values every driver must be able to carry: `Null` is
-SQL NULL, `Int`/`Float`/`Bool`/`Text`/`Blob` cover every scalar column type a
-driver maps its own types onto. `Bool` exists for a database with a native
-boolean wire type (Postgres); a database with none (MySQL's `TINYINT(1)`,
-SQLite) keeps mapping a boolean column to `Int` instead.
-
-```bit
-import { Value } from "std/sql"
-
-fn describe(v: Value): string {
-  match (v) {
-    Null => return "null"
-    Int(n) => return "int ${n}"
-    Float(f) => return "float ${f}"
-    Bool(b) => return "bool ${b}"
-    Text(s) => return "text ${s}"
-    Blob(b) => return "blob of ${len(b)} byte(s)"
-  }
-}
-```
-
-### `isNull(v: Value): bool`
-
-True if `v` is SQL NULL.
-
-### `asInt(v: Value): int!`
-
-The typed accessor for an `Int` value. Fails if `v` holds any other variant -
-`match (v)` directly when the column's type is not known ahead of time.
-
-### `asFloat(v: Value): f64!`
-
-The typed accessor for a `Float` value. Fails on any other variant.
-
-### `asBool(v: Value): bool!`
-
-The typed accessor for a `Bool` value. Fails on any other variant - a driver
-that maps a boolean column to `Int` (MySQL's `TINYINT(1)`) is read with
-`asInt`/`sqlReqBool` instead, never this one.
-
-### `asText(v: Value): string!`
-
-The typed accessor for a `Text` value. Fails on any other variant.
-
-### `asBlob(v: Value): []byte!`
-
-The typed accessor for a `Blob` value. Fails on any other variant.
-
-## The driver contract
-
-### `Driver`
-
-`open(dsn: string): Conn!` - the one thing every concrete driver package
-implements. `dsn` is a driver-specific connection string; its format is
-entirely the driver's own.
-
-### `Conn`
-
-A single logical database connection, as handed back by `Registry.open`.
-Several green threads may hold and use the same `Conn` at once - see
-`newRegistry`'s entry below for how that is made safe.
-
-```
-query(sqlText: string, params: []Value): Rows!
-exec(sqlText: string, params: []Value): int!
-prepare(sqlText: string): Stmt!
-begin(): Tx!
-close()
-```
-
-`query` runs SQL expected to produce a row set (`SELECT` and friends);
-`exec` runs SQL expected only to change rows and reports how many were
-affected - never a row set. Postgres's `RETURNING` clause can turn an
-insert into a query with rows and MySQL has no equivalent, so nothing in
-this module may assume an `exec` can return rows: a driver that wants to
-expose `RETURNING` does so through `query`, the same call any `SELECT` uses.
-
-### `Rows`
-
-A cursor over a result set.
-
-```
-next(): bool!
-columns(): []string
-value(col: int): Value
-close()
-```
-
-`next` advances to the next row, returning `false` (not an error) once the
-set is exhausted; a driver-side read failure mid-iteration is reported
-through the fallible result instead. `columns` is the result set's column
-names in order; `value` reads column `col` (0-based) of the current row -
-match it, or pass it to `asInt`/`asText`/... above.
-
-### `Stmt`
-
-A prepared statement, from `Conn.prepare`.
-
-```
-query(params: []Value): Rows!
-exec(params: []Value): int!
-close()
-```
-
-`params` is positional, in the same order as the placeholders in the
-`sqlText` the statement was prepared from.
-
-### `Tx`
-
-An open transaction, from `Conn.begin`.
-
-```
-query(sqlText: string, params: []Value): Rows!
-exec(sqlText: string, params: []Value): int!
-commit(): ()!
-rollback(): ()!
-```
-
-`query`/`exec` behave exactly as `Conn`'s do, scoped to this transaction.
-`commit`/`rollback` are the **driver's** side of the contract: a driver
-implements them, and `tx` (below) is the only thing that calls them. Application
-code never ends a transaction by hand - the handle `tx` gives a block fails both
-calls, and fails every call once that block has returned.
-
-## The registry
-
-### `Registry`
-
-The driver registry a program builds once and shares. Bit has no import-time
-init hook and a module-level variable cannot hold a `map` or an interface
-value, so a hidden process-wide registry the way some other languages do it
-is not possible here. `Registry` is the explicit alternative already used
-elsewhere in stdlib for
-shared, mutable, driver-style state (see `TlsTicketStore` in
-[tls](tls.md)): build one with `newRegistry()`, have every driver's setup
-code call `register` on it, and pass it to `open` wherever a connection is
-needed.
-
-### `newRegistry(): Registry`
-
-An empty `Registry`, ready for `register` calls.
-
-### `Registry.register(name: string, d: Driver): ()!`
-
-Adds `d` under `name`. Fails if `name` is already registered.
-
-### `Registry.open(driverName: string, dsn: string): Conn!`
-
-Looks up the driver registered as `driverName` and opens `dsn` with it.
-Fails if `driverName` was never registered, or if the driver's own `open`
-fails. The returned `Conn` is wrapped so that several green threads sharing
-it never interleave calls on the one underlying socket it represents - a
-single-slot connection pool, sized at exactly one physical connection per
-`open()` call, the minimum that satisfies "must not let two green threads
-interleave on one socket". A driver that wants true N-way concurrency pools
-several physical connections internally and hands one out per `open`; the
-registry still serializes access to whichever one it gets.
-
-```bit
-import { Registry, Driver, Conn, Value, asText } from "std/sql"
-
-// A program wires up a driver package's setup once, naming it by string -
-// the only two places anything needs to import a concrete driver package
-// are the call that constructs `d` and this one, never the call sites that
-// go on to use the resulting Conn.
-fn wireUp(reg: Registry, d: Driver): Conn! {
-  reg.register("mydb", d)?
-  return reg.open("mydb", "host=localhost dbname=app")?
-}
-
-fn firstName(conn: Conn, id: string): string! {
-  let rows = conn.query("SELECT name FROM users WHERE id = ?", [Value.Text(id)])?
-  let has = rows.next()?
-  if (!has) {
-    fail newError("no such user: ${id}")
-  }
-  return asText(rows.value(0))?
-}
-```
-
-## Writing a driver
-
-Two drivers exist today: `pkg/postgres` and `pkg/mysql`. Neither implements
-`Driver`/`Registry` directly - both plug into the pool through their own
-`Adapter` (documented under [The connection pool](#the-connection-pool)
-below); `Driver` and `Registry` are for a driver that registers itself by
-name instead.
-
-Switching the database a program talks to costs one import line: the same
-handler compiles against `pkg/postgres` and `pkg/mysql` with nothing changed
-except which adapter it imports.
-
-```bit ignore
-import { pool, Datasource, sqlReqText, Value, Pool } from "std/sql"
-import { adapter } from "postgres" // swap for "mysql" and nothing else changes
-import { App, Config, Ctx, Res } from "web"
-import { env } from "std/os"
-
-fn userName(c: Ctx, db: Pool): Res! {
-  let rows = db.query("select name from users where id = $1", []Value{ Value.Text(c.param("id")) })?
-  defer rows.close()
-  rows.next()?
-  return c.text(sqlReqText(rows, rows.columns(), "name")?)
-}
-
-fn main(): ()! {
-  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL") })?
-  let app = App(Config{ secret = env("APP_SECRET") })
-  app.get("/users/:id", (c) => userName(c, db))
-  app.listen()?
-}
-```
-
-`Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and `Registry` are frozen: per
-[`docs/release/VERSIONING.md`](../release/VERSIONING.md), changing any of
-their exported shapes is at minimum a MINOR release, whether the change is
-additive or breaking. `Value` can still grow a new variant when a database
-needs one none of the others do - that is how `Bool` was added, for a
-database with a native boolean wire type - but every other type keeps its
-shape.
-
-A `match` over `Value` with no catch-all case is a compile error, `E0071`,
-the moment a new variant is added and that call site does not handle it -
-so code that handles all six variants today gets a build failure naming the
-exact line, not a silent gap, if a seventh is ever added.
-
-### Writing a driver for a file-based database
-
-Postgres and MySQL are both network servers with users, passwords and a TLS
-handshake, so the contract carries some assumptions that only show up once
-you target a database without a network in front of it, like SQLite:
-
-- **`Datasource.host`/`port`/`connectTimeout`** describe a network
-  connection. A file-based adapter's `connect` ignores them rather than
-  reading them.
-- **`SslMode`** describes a TLS negotiation against a server socket. A
-  file-based adapter has nothing to negotiate, so it should refuse any
-  `sslmode` other than the default rather than silently accept one.
-- **`Pool`'s concurrency model** assumes a server arbitrates many physical
-  connections at once (`Datasource.maxOpen` defaults to 10 for that reason).
-  A database that locks at the file level, not per connection, needs its own
-  policy - a single writer, or retrying on a busy file - instead of just a
-  smaller pool.
-- **`FatalError`** marks a dead network transport so `Pool` can discard the
-  connection. A file-based database's failure modes - a corrupted file, a
-  lock that never clears - are a different class this marker was not shaped
-  to name; a file-based driver should raise its own error for them instead.
-
-## The connection pool
-
-A server has two wrong ways to reach a database and one right one. Open a
-connection per request and every request pays a TCP handshake plus
-authentication, and a burst exhausts the database's own connection limit.
-Share one connection between requests and the application serialises on it -
-and a transaction started by one request becomes visible to every other
-request using that connection. `pool` is the third way: a bounded set of
-physical connections, handed out one at a time, returned when the caller is
-done, and closed when they are too old or have gone bad.
-
-Four rules hold, and the tests in `stdlib/sql/pool.test.bit` assert each one
-against a fake driver that counts every connection ever opened:
-
-1. **A transaction pins its connection** for its whole life, returned on
-   `commit` or `rollback`. The `Tx` holds the driver's own transaction, made
-   on one connection, and has no way to reach another.
-2. **A connection handed back with an open transaction is closed**, never
-   reused - including after a `commit` that failed, since the pool cannot
-   know what the server did with it.
-3. **A connection a driver reported a transport failure on is discarded**
-   (see `FatalError` below).
-4. **Waiters are served in arrival order.** LIFO would starve a request
-   under sustained load, so a caller that arrives while anyone is queued
-   joins the queue rather than taking an idle connection out from under it.
-
-### `pool(a: Adapter, cfg: Datasource): Pool!`
-
-A pool of connections to the database `cfg` names, opened through `a`.
-Nothing connects here: `cfg` is checked (`Datasource.validate`) and
-connections are opened on demand, up to `cfg.maxOpen`. This fails only on a
-configuration that cannot describe a pool - an unset `DATABASE_URL` surfaces
-here, not as a DNS error from inside a driver later.
-
-```bit
-import { Adapter, Datasource, Pool, pool, SslMode } from "std/sql"
-
-// The whole target in one string, as DATABASE_URL supplies it.
-fn fromUrl(a: Adapter, url: string): Pool! {
-  return pool(a, Datasource{ uri = url })?
-}
-
-// Or field by field, with a bigger pool.
-fn fromFields(a: Adapter, password: string): Pool! {
-  return pool(
-    a,
-    Datasource{
-      host = "db.internal", user = "app", password = password,
-      database = "erp", sslmode = SslMode.VerifyFull, maxOpen = 20,
-    },
-  )?
-}
-```
-
-### `Datasource`
-
-Everything a pool needs: one database to reach, and the shape of the pool
-that reaches it. One class, not two - splitting connection settings from
-pool settings puts a nested value and a second `?` at every call site.
-
-| field | default | meaning |
-| ----- | ------- | ------- |
-| `uri` | `""` | the whole target in one string, `postgres://app:pw@host:5432/db?sslmode=...` |
-| `host` | `""` | the individual form; exclusive with `uri` |
-| `port` | `0` | 0 means the adapter's own default (5432, 3306) |
-| `user` | `""` | |
-| `password` | `""` | |
-| `database` | `""` | |
-| `sslmode` | `SslMode.Negotiate` | |
-| `connectTimeout` | `10_000` | ms for one connect attempt, applied by the adapter |
-| `maxOpen` | `10` | ceiling on physical connections, in use plus idle |
-| `maxIdle` | `10` | how many may sit idle rather than being closed |
-| `maxLifetime` | `1800_000` | ms after opening before a connection is retired; 0 or less, never |
-| `maxIdleTime` | `600_000` | ms a connection may sit idle before it is retired; 0 or less, never |
-| `acquireTimeout` | `5_000` | ms a caller waits for a connection before failing |
-| `statementCache` | `0` | prepared statements kept per connection; 0 is off |
-| `replicas` | `[]` | read replica URIs (see "Read replicas" below); empty means every statement runs on the writer |
-| `replicaBackoff` | `2_000` | ms a replica that failed a statement stays out of rotation |
-
-**`uri` and the individual fields are mutually exclusive.** Setting both is
-an error naming both, not one silently winning. Parsing `uri` is the
-adapter's job, not this module's: Postgres spells the TLS setting
-`sslmode=verify-full` and MySQL spells it `ssl-mode=VERIFY_IDENTITY`, so
-there is deliberately no `parseUrl` here.
-
-**`maxOpen` is 10, argued not guessed.** Postgres ships
-`max_connections = 100`, so one instance defaulting to 100 takes the
-server's whole budget and the second container - or the operator's `psql` -
-cannot connect at all. A large pool is also slower: past a small pool,
-throughput drops as the database thrashes between processes competing for
-the same cores and disks (HikariCP's benchmarks are the citation; 10 is its
-default and node-postgres's). The rough optimum is `cores * 2 + spindles` on
-the *database* box, never a count taken from the application host.
-
-**`acquireTimeout` is never 0.** Zero would mean wait forever, so a database
-outage would park every worker with no error and no log line; `validate`
-rejects it, as it rejects a `maxOpen` below 1.
-
-### `Datasource.validate(): ()!`
-
-Rejects a `Datasource` that cannot describe a pool, before anything opens a
-socket: neither `uri` nor `host` set (nothing to connect to - the unset
-`DATABASE_URL` case, which must not surface as a DNS or parse failure), both
-set (mutually exclusive), a `maxOpen` below 1, a negative `maxIdle`, or an
-`acquireTimeout` below 1. `pool` calls it, so a program that builds its pool
-through `pool` never has to.
-
-### `SslMode`
-
-```
-enum SslMode { Negotiate, VerifyFull, VerifyCa, Require, Disable }
-```
-
-How the driver should negotiate TLS. The names are Bit's; each adapter
-renders them into whatever its own wire protocol spells.
-
-`Negotiate` is the first variant deliberately. A class field of enum type
-cannot carry an explicit default (`E0064`), so an omitted `sslmode` takes
-the enum's *first declared variant*. Ordering the connect-to-anything mode
-first is the only
-way that default survives, and reordering this enum silently changes what an
-omitted `sslmode` means.
-
-### `Adapter`
-
-```
-connect(cfg: Datasource): Conn!
-```
-
-What turns a `Datasource` into a live connection: the one thing a driver
-package implements for `pool`, as `Driver`/`Conn` is what it implements for
-everything else. `connect` reads whichever form of `cfg` the caller filled
-in, applies its own default port when `cfg.port` is 0, and renders
-`cfg.sslmode` into its own protocol's spelling. `pool` calls
-`cfg.validate()` before it ever calls `connect`, so an adapter never sees a
-`Datasource` with both forms set or with neither.
-
-### `Pool`
-
-A bounded set of connections to one database, safe to share across green
-threads. Built by `pool`; closed by `Pool.close`.
-
-### `Pool.query(sqlText: string, params: []Value): Rows!`
-
-Runs `sqlText` and returns its rows. **The connection stays checked out
-until the returned `Rows` is closed** - a cursor lives on the connection
-that produced it - so a caller that never closes its `Rows` leaks a
-connection exactly as one that never closes a file leaks a descriptor.
-
-```bit
-import { Pool, Value, asText } from "std/sql"
-
-fn firstName(db: Pool, id: string): string! {
-  let rows = db.query("SELECT name FROM users WHERE id = ?", [Value.Text(id)])?
-  defer rows.close()
-  let has = rows.next()?
-  if (!has) {
-    fail newError("no such user: ${id}")
-  }
-  return asText(rows.value(0))?
-}
-```
-
-### `Pool.exec(sqlText: string, params: []Value): int!`
-
-Runs `sqlText` for its effect and returns the number of rows it changed. The
-connection is back in the pool before this returns.
-
-### `Pool.close()`
-
-Closes every idle connection and fails every parked caller. Connections
-still checked out are closed as they are returned. Idempotent.
-
-### `Pool.tx(f: (Tx) => ()!): ()!`
-
-`tx` as a method: runs `f` in a transaction at the database's own isolation
-level. `db.tx(f)` and `tx(db, f)` (see "Transactions" below) run the same
-code - this is a call shape, not a second implementation.
-
-### `Pool.txAt(level: Isolation, f: (Tx) => ()!): ()!`
-
-`Pool.tx` at the isolation level `level` instead of the database's own.
-
-### `Pool.txValue<T>(f: (Tx) => T!): T!`
-
-`txValue` as a method: runs `f` in a transaction and returns what `f`
-returned, once the commit has succeeded. Nothing is returned on a failure,
-because the value is only a result if the work behind it is durable.
-`db.txValue(f)` and `txValue(db, f)` run the same code.
-
-### `Pool.txValueAt<T>(level: Isolation, f: (Tx) => T!): T!`
-
-`Pool.txValue` at the isolation level `level` instead of the database's own.
-This is the one implementation; the other three are spellings of it.
-
-### `Pool.session(): Session`
-
-Opens a per-request read-your-own-writes handle. See "Read replicas" below
-for what it is for and what it costs to forget.
-
-### `FatalError`
-
-```
-message(): string
-transportFatal(): bool
-```
-
-The marker a driver failure carries when the failure has poisoned the
-*connection* rather than merely failing the statement: a closed socket, a
-short read, a protocol desync. The pool never hands such a connection out
-again (rule 3). A failure that does not implement `FatalError` - a
-constraint violation, a syntax error - leaves the connection usable, which
-is the common case and needs no cooperation from the driver at all.
-
-### `transportError(detail: string): error`
-
-A ready-made `FatalError`, for a driver with no error type of its own to
-extend.
-
-## Read replicas
-
-Reads go to a replica, writes to the writer, and **everything inside a
-transaction goes to the writer** - a read inside a transaction that landed on
-a replica would not see the transaction's own uncommitted writes. This needs
-no code at the call site: set `Datasource.replicas`, and `pool` opens one
-connection pool per replica URI alongside the writer's own.
+## Opening a pool and running a query
+
+A pool is a bounded set of physical connections, handed out one at a time
+and returned when the caller is done - the third way to reach a database,
+after "one connection per request" (a burst exhausts the server) and "one
+shared connection" (requests serialize on it, and a transaction on it leaks
+into every other request). `pool` builds one from a `Datasource` (what to
+connect to) and an `Adapter` (how - supplied by a driver package):
 
 ```bit
 import { Adapter, Datasource, Pool, pool } from "std/sql"
 
-fn withReplicas(a: Adapter, writerUrl: string, replicaUrls: []string): Pool! {
-  return pool(a, Datasource{ uri = writerUrl, replicas = replicaUrls })?
+fn openInkwellDb(a: Adapter, databaseUrl: string): Pool! {
+  return pool(a, Datasource{ uri = databaseUrl })?
 }
 ```
 
-**Read-your-own-writes** is the hard part: a read issued right after a write
-in the same request must not land on a replica that has not caught up, or the
-caller is shown stale data it just changed. `Pool` cannot hold that flag
-itself - a `Pool` is shared by every green thread using it, so a pool-level
-"has written" would answer with some other task's write.
+`Pool.query` runs SQL and returns `Rows`; `Pool.exec` runs SQL for its
+effect and returns the number of rows it changed. **A query's connection
+stays checked out until its `Rows` is closed** - a cursor lives on the
+connection that produced it, so an unclosed `Rows` leaks a connection the
+same way an unclosed file leaks a descriptor.
 
-### `Session`
+```bit
+import { Pool, Value, sqlReqText } from "std/sql"
 
-A per-request handle, from `Pool.session`. `written` starts false; once
-`Session.exec` has committed a write, every later `Session.query` on the
-SAME handle goes to the writer, never a replica, until the caller takes a
-fresh `Session`. A `query` on a `Session` that has not written may still land
-on a replica.
+fn draftTitle(db: Pool, id: string): string! {
+  let rows = db.query("SELECT title FROM drafts WHERE id = ?", [Value.Text(id)])?
+  defer rows.close()
+  let has = rows.next()?
+  if (!has) {
+    fail newError("no such draft: ${id}")
+  }
+  return sqlReqText(rows, rows.columns(), "title")?
+}
 
-**What it costs when it is wrong.** A handler that keeps calling
-`pool.query`/`pool.exec` directly instead of routing every statement through
-one `Session` gets no read-your-own-writes protection, silently - there is
-nothing to forget out loud. The next read then runs on a replica that may not
-have caught up, the caller sees data older than the write it just made, and
-nothing errors.
+fn renameDraft(db: Pool, id: string, title: string): ()! {
+  db.exec("UPDATE drafts SET title = ? WHERE id = ?", [Value.Text(title), Value.Text(id)])?
+}
+```
 
-### `Session.query(sqlText: string, params: []Value): Rows!`
+## Mapping rows into a class
 
-Routes to the writer once this handle has written; otherwise the same
-routing `Pool.query` itself uses.
+Reading columns one at a time with `sqlReqText`/`sqlReqInt`/... works for
+one query. For a whole table, `find`/`findOne`/`findOneOrFail` map every row
+straight into a plain class - no separate mapper to write or keep in sync:
 
-### `Session.exec(sqlText: string, params: []Value): int!`
+```bit
+import { Executor, Rows, find, findOne, findOneOrFail, Value } from "std/sql"
 
-Always the writer. Marks this handle sticky only once the write has actually
-committed - a failed write leaves nothing to be stale about.
+class Draft {
+  id: string,
+  title: string,
+  wordCount: i64,
+}
 
-**Replica health.** A replica that fails a statement is dropped from
-rotation for `Datasource.replicaBackoff` milliseconds and the statement is
-retried on the writer, so one dead replica degrades throughput rather than
-erroring the caller. A write is never retried on a replica: `Pool.exec`
-always runs on the writer and never consults the replica set at all.
+fn publishedDrafts(db: Executor): []Draft! {
+  return find<Draft>(
+    db,
+    "SELECT id, title, word_count FROM drafts WHERE status = ?",
+    Value.Text("published"),
+  )?
+}
 
-## Transactions
+fn draftById(db: Executor, id: string): Option<Draft>! {
+  return findOne<Draft>(db, "SELECT id, title, word_count FROM drafts WHERE id = ?", Value.Text(id))?
+}
+```
 
-**The only transaction API is a closure.** `tx` takes a block, runs it on one
-pinned connection and ends the transaction itself: COMMIT when the block
-returns, ROLLBACK on a failure or a panic, and the connection back in the pool
-on every path. There is no `begin` for a caller to pair with a `commit`.
+A field's column is its own name in **snake_case** (`wordCount` claims
+`word_count`) unless the field carries `@column("...")`. A result column no
+field claims is ignored, so `SELECT *` against a class that only wants three
+columns works fine. `findOne` returns `Option.None` for zero rows - a `GET
+/:id` miss is ordinary traffic, not a failure - and fails with a
+`SqlRowError` if the query matched more than one; `findOneOrFail` also fails
+on zero.
 
-The reason is `?`. In the hand-written form every `?` between the begin and the
-commit is an early return that skips the rollback, so the transaction stays open
-and the pooled connection is never returned; under load the pool exhausts and
-the service stops, with nothing in the logs naming the function that did it.
-`defer` can guard it, but a correctness property that depends on every caller
-remembering a line is not a property. The closure form makes that failure
-unreachable rather than unlikely.
+`db` above is typed `Executor`, not `Pool`: an interface both `Pool` and a
+running transaction satisfy, so `publishedDrafts` runs standalone or inside
+a caller's transaction with no second entry point.
 
-`stdlib/sql/tx.test.bit` asserts each promise below against a fake driver that
-logs every statement tagged with the connection that ran it.
+## Transactions are a closure, not a begin/commit pair
 
-### `tx(db: Executor, f: (Tx) => ()!): ()!`
-
-Runs `f` in a transaction at the database's own isolation level and returns
-nothing. `db` is the `Pool`, or the handle of a transaction already running - in
-which case this is a savepoint inside it, not a second transaction.
+There is no `Tx` for a caller to `begin` and `commit` by hand. `tx` runs a
+block on one pinned connection: COMMIT when the block returns, ROLLBACK on a
+failure or a panic, connection back in the pool either way.
 
 ```bit
 import { Pool, Value, tx } from "std/sql"
 
-fn transfer(db: Pool, payer: string, payee: string, cents: int): ()! {
+fn moveDraftToArchive(db: Pool, id: string): ()! {
   tx(db, (t) => {
-    t.exec(
-      "UPDATE accounts SET balance = balance - ? WHERE id = ?",
-      [Value.Int(cents), Value.Text(payer)],
-    )?
-    t.exec(
-      "UPDATE accounts SET balance = balance + ? WHERE id = ?",
-      [Value.Int(cents), Value.Text(payee)],
-    )?
+    t.exec("UPDATE drafts SET status = 'archived' WHERE id = ?", [Value.Text(id)])?
+    t.exec("INSERT INTO archive_log (draft_id) VALUES (?)", [Value.Text(id)])?
   })?
 }
 ```
 
-The handle `t` works only inside the block. Every method on it fails once the
-block has returned - a handle that still worked would run statements outside the
-transaction, on a connection the pool has since given to somebody else - and
-`t.commit()`/`t.rollback()` fail whenever they are called, because ending the
-transaction is `tx`'s job.
+The reason is `?`. In a hand-written `let t = db.begin()?` / `t.exec(...)?` /
+`t.commit()?` form, every `?` between begin and commit is an early return
+that skips the rollback - the transaction stays open and the connection
+never comes back, and under load the pool exhausts with nothing in the logs
+naming why. The closure makes that failure unreachable instead of merely
+unlikely; the handle `t` stops working the moment the block returns, so
+nothing can hold on to it and run statements on a connection the pool has
+since handed to someone else.
 
-A failure inside the block propagates **unchanged**: the caller gets the
-driver's own error, never a transaction error wrapped around it. A panic rolls
-back too, and is then re-raised; `tx` installs the panic boundary itself
-(`std/runtime`), because a recovered panic runs no deferred call.
-
-### `txAt(db: Executor, level: Isolation, f: (Tx) => ()!): ()!`
-
-`tx`, at `level` instead of the database's own isolation level.
-
-```bit
-import { Pool, Isolation, Value, txAt } from "std/sql"
-
-fn post(db: Pool, batch: string): ()! {
-  txAt(db, Isolation.Serializable, (t) => {
-    t.exec("UPDATE ledger SET posted = 1 WHERE batch = ?", [Value.Text(batch)])?
-  })?
-}
-```
-
-### `txValue<T>(db: Executor, f: (Tx) => T!): T!`
-
-`tx`, returning what the block returned once the transaction has committed - so
-a transaction can produce an inserted id without a mutable captured outside it.
-Nothing is returned on a failure: a value is a result only if the work behind it
-is durable.
-
-The type argument is written out because a block's result type is not inferred
-through a generic parameter, and it cannot be `()` - a block that returns
-nothing goes through `tx`.
+`txValue<T>` is the same shape, returning what the block computed once the
+commit has succeeded - useful for an inserted id, since nothing is returned
+on a failed transaction:
 
 ```bit
 import { Pool, Value, asInt, txValue } from "std/sql"
 
-fn placeOrder(db: Pool, sku: string): int! {
-  return txValue<int>(db, (t) => {
-    let rows = t.query(
-      "INSERT INTO orders (sku) VALUES (?) RETURNING id",
-      [Value.Text(sku)],
-    )?
+fn createDraft(db: Pool, title: string): i64! {
+  return txValue<i64>(db, (t) => {
+    let rows = t.query("INSERT INTO drafts (title) VALUES (?) RETURNING id", [Value.Text(title)])?
     defer rows.close()
     let has = rows.next()?
     if (!has) {
@@ -648,551 +144,282 @@ fn placeOrder(db: Pool, sku: string): int! {
 }
 ```
 
-### `txValueAt<T>(db: Executor, level: Isolation, f: (Tx) => T!): T!`
+`txAt`/`txValueAt` take an `Isolation` level instead of the database's own
+default. **A `tx` nested inside another is a SAVEPOINT**, not a second
+transaction - naming which one by passing the handle, since Bit has no
+ambient "current transaction" a shared `Pool` could answer for the wrong
+caller. An inner failure rolls back only the inner block; the outer one
+commits normally.
 
-`txValue`, at `level` instead of the database's own isolation level. The other
-three entry points are spellings of this one.
+## Read replicas and read-your-own-writes
 
-### `Executor`
+Set `Datasource.replicas` and `pool` opens one connection pool per replica
+URI alongside the writer. `Pool.query` then reads from a replica when one is
+in rotation; every write, and everything inside a transaction, always goes
+to the writer.
 
-```
-query(sqlText: string, params: []Value): Rows!
-exec(sqlText: string, params: []Value): int!
-```
-
-Anything statements can run on: a `Pool`, or a transaction already running on
-one. A function that takes an `Executor` rather than a `Pool` composes - the
-caller decides whether it runs on its own or inside a transaction:
-
-```bit
-import { Executor, Value, tx } from "std/sql"
-
-// Runs standalone when it is given the pool, and as a savepoint of the
-// caller's transaction when it is given that transaction's handle.
-fn archive(db: Executor, id: string): ()! {
-  tx(db, (t) => {
-    t.exec(
-      "INSERT INTO archive SELECT * FROM orders WHERE id = ?",
-      [Value.Text(id)],
-    )?
-    t.exec("DELETE FROM orders WHERE id = ?", [Value.Text(id)])?
-  })?
-}
-```
-
-**A nested `tx` is a savepoint, never a second transaction.** It issues
-`SAVEPOINT bit_sp_N` on the same connection, `RELEASE SAVEPOINT bit_sp_N` when
-its block returns, and `ROLLBACK TO SAVEPOINT bit_sp_N` when its block fails -
-so an inner failure undoes exactly the inner block and the outer one goes on to
-commit. Joining the outer transaction silently would let an inner rollback take
-the outer work with it.
-
-Which transaction a nested `tx` belongs to is named by **passing the handle**,
-because there is no ambient "current transaction" to consult: Bit has no
-task-local storage, and one `Pool` is shared by every green thread using it, so
-pool-level state would answer with some other task's transaction. If a savepoint
-rollback itself fails, the transaction is marked: the outer block cannot commit
-over it and is rolled back instead.
-
-### `Isolation`
-
-```
-Default | ReadUncommitted | ReadCommitted | RepeatableRead | Serializable
-```
-
-How much of other transactions' work a transaction may see. `Default` issues no
-statement at all, leaving whatever the database and its driver are configured
-for in force - `std/sql` picks no level for you, because an ERP has both
-read-committed reporting and serializable posting and either one chosen
-invisibly is wrong for the other.
-
-Any other level is issued as SQL-92's `SET TRANSACTION ISOLATION LEVEL x`, as
-the first statement after the BEGIN: the driver contract's `Conn.begin()` takes
-no argument, and this module knows no dialect. That is what Postgres wants.
-MySQL refuses the statement once a transaction is open, so a MySQL driver that
-means to support levels honours it in its own `Tx.exec` - the driver's job, the
-same way placeholder syntax already is.
-
-## `@table` descriptors - what the compiler hands a mapper
-
-A class carrying the `@table` attribute gains a generated
-`tableDescriptor(): []FieldDesc`, one entry per field in declaration order. The
-compiler fills these in; nothing here is written by hand.
-
-The compiler attaches no meaning to any of it. `unique` is a word it copied off
-a field and passed along. What an attribute name means, if anything at all, is
-decided by whatever reads the descriptor - `bitlang.org/pkg/orm` treats `@id` as
-a primary key, and a different mapper is free to treat it as nothing. That split
-is the point: a mapper can add `@check(...)` or `@collation(...)` without a
-compiler release, because the compiler never learned the first set of names
-either.
-
-### `FieldDesc`
-
-One field of a `@table` class: its name and declared type exactly as written,
-and the attributes the compiler recorded rather than called.
-
-An attribute is RECORDED when its name resolves to no function at all, which is
-what a marker like `@id` looks like. An attribute whose name does resolve is
-CALLED from the class's `validateFields()` instead, unchanged, and never appears
-in `attrs`. So a field carrying `@unique` and `@maxLen(255)` records the first
-and calls the second.
+The catch: right after a write, a read on the same request must not land on
+a replica that has not caught up yet, or the caller sees its own change as
+if it never happened. `Pool.session()` is the fix - a per-request handle
+that switches to the writer for every read once it has written:
 
 ```bit
-import { FieldDesc, AttrDesc } from "std/sql"
+import { Pool, Value, sqlReqText } from "std/sql"
 
-@table class User {
-  @id
-  id: i64
-  @unique
-  email: string
-}
-
-fn columns(u: User): []string {
-  let out = []string(0)
-  for f of u.tableDescriptor() {
-    out = append(out, "${f.name} ${f.typeName}")
-  }
-  return out
+fn createThenReadBack(db: Pool, title: string): string! {
+  let s = db.session()
+  s.exec("INSERT INTO drafts (title) VALUES (?)", [Value.Text(title)])?
+  let rows = s.query("SELECT title FROM drafts WHERE title = ?", [Value.Text(title)])?
+  defer rows.close()
+  rows.next()?
+  return sqlReqText(rows, rows.columns(), "title")?
 }
 ```
 
-A module that declares a `@table` class without importing `FieldDesc` and
-`AttrDesc` is **E0150**, and a class that declares `tableDescriptor` itself is
-**E0148**, naming both.
-
-### `AttrDesc`
-
-One recorded attribute: its name, and its arguments as text.
-
-Arguments must be constant expressions - a non-constant one is **E0149**. Each
-is rendered to its source spelling and never interpreted here: a string
-literal's own decoded content, any other literal's raw text unchanged. So
-`@check("age > 0")` arrives as the nine characters `age > 0`, without the
-quotes, and `@scale(2, 3)` arrives as `"2"` and `"3"` in that order. Parsing
-them is the mapper's job, which is why they are `[]string` and not a value type
-this module would have to define.
-
-## Mapping a query result into a typed `T`
-
-`find`/`findOne`/`findOneOrFail` map every row a query returns into `T`: a
-plain class, or one of `i64`/`f64`/`bool`/`string`/`[]byte` for a
-single-column result. **No mark is required** - unlike `@json`/`@table`,
-generation is demand-driven by the call site itself, so a class nobody
-passes to one of these three gets no mapper.
-
-```bit
-import { Executor, Rows, Value, find, findOne, findOneOrFail } from "std/sql"
-
-class User {
-  id: i64,
-  email: string,
-}
-
-fn activeUsers(db: Executor): []User! {
-  return find<User>(db, "SELECT id, email FROM users WHERE active = ?", Value.Int(1))?
-}
-
-fn userById(db: Executor, id: i64): Option<User>! {
-  return findOne<User>(db, "SELECT id, email FROM users WHERE id = ?", Value.Int(id))?
-}
-
-fn mustUserById(db: Executor, id: i64): User! {
-  return findOneOrFail<User>(db, "SELECT id, email FROM users WHERE id = ?", Value.Int(id))?
-}
-```
-
-A field's column is its own name in **snake_case** - `createdAt` claims
-`created_at` - unless the field carries `@column("...")`, which overrides it
-exactly: `@column("e_mail")` claims `e_mail`. `@column` is compiler-known,
-excluded from field-attribute call-desugaring the same way `@key`
-is, so a plain class needs no import to use it.
-
-A result column no field claims is **ignored**: `select *` is ordinary SQL,
-and a class is often a projection. A field whose type is not one of the five
-scalars, or `Option<>` of one, is a compile error (`E0154`) naming the field
-and its type.
-
-### A `@table` class is marked persisted at hydration
-
-When `T` also carries `@table`, the generated mapper calls
-`markPersisted(true)` on the value it built, right before handing it back - so anything `find`/`findOne`/`findOneOrFail` returns reads
-`isPersisted() == true`. A composite literal never does this: `User{ id = 1,
-email = "a@b.com" }` reads `isPersisted() == false` until something calls
-`markPersisted(true)` on it by hand. That distinction is what `db.save` (in
-`bitlang.org/pkg/orm`) needs to choose an UPDATE over an INSERT without
-inspecting the primary key, which a UUID or application-assigned key rules
-out.
-
-```bit
-import { Executor, Rows, Value, findOneOrFail, FieldDesc, AttrDesc } from "std/sql"
-
-@table class User {
-  @id
-  id: i64
-  email: string
-}
-
-fn firstActiveUser(db: Executor): User! {
-  return findOneOrFail<User>(db, "SELECT id, email FROM users WHERE active = ?", Value.Int(1))?
-}
-```
-
-`firstActiveUser`'s result has `isPersisted() == true`. A class with no
-`@table` has neither accessor at all - the mapper only ever calls a member
-the class actually declares.
-
-### `find<T>(db: Executor, sqlText: string, ...args: Value): []T!`
-
-Maps every row into `T`. `T` must be a plain class - refusing one that
-declares `init` (`E0152`, naming the class and the `init`: the mapper
-assigns fields directly through a composite literal, bypassing whatever
-invariant a hand-written `init` enforces) - or one of the five scalar types
-for a single-column result. Anything else, or a call with no explicit type
-argument, is `E0151`.
-
-### `findOne<T>(db: Executor, sqlText: string, ...args: Value): Option<T>!`
-
-`find`, for a query expected to match at most one row. The absent row is
-`Option.None`, never an error - a `GET /:id` miss is ordinary traffic, not a
-failure. More than one row is a `SqlRowError` (`TooManyRows`).
-
-### `findOneOrFail<T>(db: Executor, sqlText: string, ...args: Value): T!`
-
-`findOne`, requiring exactly one row: zero rows fails distinguishably
-(`SqlRowCause.NoRows`) from every mapping error, and more than one row fails
-with `TooManyRows`.
-
-### `SqlRowCause`
-
-```
-MissingColumn | TypeMismatch | NullField | ColumnCount | NoRows | TooManyRows
-```
-
-Why one row failed to become a `T`: a claimed column absent from the result,
-a type mismatch, a `NULL` landing in a field that is not `Option`, a plain
-scalar `T` against a result that is not exactly one column, and
-`findOne`/`findOneOrFail`'s own row-count contract.
-
-### `SqlRowError`
-
-```
-cause: SqlRowCause
-column: string
-expected: string
-found: string
-```
-
-The error every row-mapping failure produces, satisfying the predeclared
-`error` interface through `message()`. `column` is the claimed column name -
-empty for `NoRows`/`TooManyRows`, which name no column. `expected`/`found`
-are filled for `TypeMismatch` (the two type names) and `ColumnCount` (the
-wanted and the actual column count).
-
-### `SqlRowError.message`
-
-The sentence the `error` interface reports, also callable after narrowing
-with `e.(SqlRowError)`, so a handler that branches on `cause` can still log
-the full text: `"sql: column 'age' is NULL, and the field is not Option"`,
-or `"sql: no rows"` for a cause that names no column.
-
-## Row-mapping building blocks
-
-The named functions the compiler's generated mapper is written in terms
-of. They are exported because the generated code lives in the CLASS's own
-module and calls them by name, and they are a usable API in their own
-right for a hand-written mapper over a shape `find<T>` does not cover: pass
-one as the `mapper` argument of `sqlFindMany`/`sqlFindOne`/
-`sqlFindOneOrFail` below in place of a generated one.
-
-Each scalar type has a **required** and an **Option** form, taking the
-result's columns (`Rows.columns()`, read once) and the column name to
-claim. The required form fails with `NullField` on `NULL`; the `Option` form
-decodes `NULL` to `None` instead. Both fail with `MissingColumn` when `col`
-is not in `cols`, and `TypeMismatch` when the column holds neither the
-wanted variant nor (for `sqlReqBool`/`sqlOptBool`) an `Int`. SQL has no
-boolean wire type (`Value`, ./sql.bit), so a `bool` field reads an `Int`
-column as zero/nonzero.
-
-### `sqlReqInt(rows: Rows, cols: []string, col: string): i64!`
-
-The integer claimed by column `col`.
-
-### `sqlReqFloat(rows: Rows, cols: []string, col: string): f64!`
-
-The float claimed by column `col`.
-
-### `sqlReqBool(rows: Rows, cols: []string, col: string): bool!`
-
-The boolean claimed by column `col`, read from an `Int` column as
-zero/nonzero.
-
-### `sqlReqText(rows: Rows, cols: []string, col: string): string!`
-
-The string claimed by column `col`.
-
-### `sqlReqBlob(rows: Rows, cols: []string, col: string): []byte!`
-
-The bytes claimed by column `col`.
-
-### `sqlOptInt(rows: Rows, cols: []string, col: string): Option<i64>!`
-
-The integer claimed by column `col`, or `None` on `NULL`.
-
-### `sqlOptFloat(rows: Rows, cols: []string, col: string): Option<f64>!`
-
-The float claimed by column `col`, or `None` on `NULL`.
-
-### `sqlOptBool(rows: Rows, cols: []string, col: string): Option<bool>!`
-
-The boolean claimed by column `col`, or `None` on `NULL`.
-
-### `sqlOptText(rows: Rows, cols: []string, col: string): Option<string>!`
-
-The string claimed by column `col`, or `None` on `NULL`.
-
-### `sqlOptBlob(rows: Rows, cols: []string, col: string): Option<[]byte>!`
-
-The bytes claimed by column `col`, or `None` on `NULL`.
-
-### `decimal` columns: `sqlReqDecimal`/`sqlOptDecimal`
-
-`decimal` is not a `Value` variant - `Value` stays the five wire types above,
-and every driver sends a `DECIMAL`/`NUMERIC` column as `Value.Text` (the
-literal a database renders it as, `"1234.5678"`). `sqlReqDecimal` and
-`sqlOptDecimal` are the accessor: the same conversion every driver's own
-codec already does (`pkg/mysql`'s `mysqlDecimal` is `asText` then
-`parseDecimal`), so one accessor serves every driver with no per-driver
-mechanism. `find<T>` cannot map a `decimal` field itself - it is not one of
-the five scalar types - so a class with one is mapped by hand:
-
-```bit
-import { Rows, sqlReqInt, sqlReqDecimal, sqlOptDecimal } from "std/sql"
-
-class Order {
-  id: i64,
-  price: decimal,
-  refunded: Option<decimal>,
-}
-
-fn orderMapper(rows: Rows): Order! {
-  let cols = rows.columns()
-  return Order{
-    id = sqlReqInt(rows, cols, "id")?,
-    price = sqlReqDecimal(rows, cols, "price")?,
-    refunded = sqlOptDecimal(rows, cols, "refunded")?,
-  }
-}
-```
-
-### `sqlReqDecimal(rows: Rows, cols: []string, col: string): decimal!`
-
-The decimal literal claimed by column `col`, parsed with `std/decimal`'s
-`parseDecimal`. Fails naming the column if the text is not a valid decimal,
-or if the column overflows `decimal`'s 96-bit magnitude / scale-28 range
-(`std/decimal`'s own limit, never a silent round).
-
-### `sqlOptDecimal(rows: Rows, cols: []string, col: string): Option<decimal>!`
-
-The decimal literal claimed by column `col`, or `None` on `NULL`.
-
-### Temporal, uuid, json and array columns
-
-A date, a time, a timestamp, a uuid, a JSON document and an array are the
-rest of the standard SQL type surface, and until now `find<T>` and a
-hand-written mapper both had no way to read one: `Value` stops at
-`Null`/`Int`/`Float`/`Text`/`Blob`, so a `timestamptz` or a `uuid` column
-arrived as a `Text` a caller had to parse by hand, per driver. These
-accessors are that parse, written once here rather than in every caller -
-and, like `decimal` above, every one of these types stays `Value.Text` on
-the wire on both drivers, because a database renders a date or a uuid as
-text even when it renders an integer as one.
-
-One accessor covers `timestamp` and `timestamptz` together:
-`sqlReqTimestamp` reads a trailing UTC offset when the text carries one
-(`timestamptz`) and treats an offset-less reading as already UTC
-(`timestamp`), returning a true instant either way - a `Value` carries no
-record of which SQL type produced it, so there is nothing to switch on.
-
-Arrays are **one generic accessor over an element decoder**, the same
-generic-plus-closure shape `sqlFindMany<T>` already uses for a whole row:
-`sqlReqArray<T>(rows, cols, col, elem)` splits a Postgres `{...}` array
-literal into its elements and applies `elem: (Value) => T!` to each.
-`sqlElemInt`/`sqlElemFloat`/`sqlElemBool`/`sqlElemText`/`sqlElemBlob`/
-`sqlElemDecimal` are the six built-in decoders, one per scalar type,
-mirroring `sqlReqInt`/`sqlReqFloat`/... above; pass the matching one, or
-write a closure for anything else.
-
-A shipment row exercises every one of them - required and optional forms,
-a `Json` tree, a `Json`-backed class, and an array of each scalar:
+A handler that calls `pool.query`/`pool.exec` directly instead of routing
+every statement through one `Session` gets no protection, silently - there
+is nothing to forget out loud, just a stale read that never errors.
+
+## Columns beyond the wire's five types
+
+`Value` carries `Null`/`Int`/`Float`/`Bool`/`Text`/`Blob` - what every
+driver can put on the wire. A `decimal`, a timestamp, a date, a uuid, a JSON
+document and a Postgres array all still arrive as `Value.Text`, so
+`std/sql` ships one parsing accessor per type instead of making every
+caller write it by hand:
 
 ```bit
 import {
-  Rows, sqlReqInt, sqlReqTimestamp, sqlOptTimestamp, sqlReqDate, sqlOptDate,
-  sqlReqTime, sqlOptTime, sqlReqUuid, sqlOptUuid, sqlReqJson, sqlOptJson,
-  sqlReqJsonAs, sqlOptJsonAs, sqlReqArray, sqlOptArray,
-  sqlElemInt, sqlElemFloat, sqlElemBool, sqlElemText, sqlElemBlob, sqlElemDecimal,
+  Rows, sqlReqInt, sqlReqTimestamp, sqlOptTimestamp, sqlReqUuid,
+  sqlReqJsonAs, sqlReqArray, sqlElemText, sqlReqDecimal,
 } from "std/sql"
-import { Timestamp, Date, Time } from "std/time"
+import { Timestamp } from "std/time"
 import { UUID } from "std/uuid"
 import { Json, JsonEntry } from "std/json"
 
-@json class ShipmentSettings {
-  carrier: string,
-  insured: bool,
+@json class DraftMeta {
+  editor: string,
 }
 
-class Shipment {
+class DraftRow {
   id: i64,
-  trackingId: UUID,
-  externalId: Option<UUID>,
-  placedAt: Timestamp,
+  externalId: UUID,
+  publishedAt: Timestamp,
   cancelledAt: Option<Timestamp>,
-  shipDate: Date,
-  deliveredDate: Option<Date>,
-  cutoff: Time,
-  pickupTime: Option<Time>,
-  manifest: Json,
-  extra: Option<Json>,
-  settings: ShipmentSettings,
-  backorderSettings: Option<ShipmentSettings>,
-  itemIds: []i64,
-  weights: []f64,
-  flags: []bool,
-  notes: []string,
-  photos: [][]byte,
-  totals: []decimal,
-  backorderIds: Option<[]i64>,
+  meta: DraftMeta,
+  tags: []string,
+  price: decimal,
 }
 
-fn shipmentMapper(rows: Rows): Shipment! {
+fn draftRowMapper(rows: Rows): DraftRow! {
   let cols = rows.columns()
-  return Shipment{
+  return DraftRow{
     id = sqlReqInt(rows, cols, "id")?,
-    trackingId = sqlReqUuid(rows, cols, "tracking_id")?,
-    externalId = sqlOptUuid(rows, cols, "external_id")?,
-    placedAt = sqlReqTimestamp(rows, cols, "placed_at")?,
+    externalId = sqlReqUuid(rows, cols, "external_id")?,
+    publishedAt = sqlReqTimestamp(rows, cols, "published_at")?,
     cancelledAt = sqlOptTimestamp(rows, cols, "cancelled_at")?,
-    shipDate = sqlReqDate(rows, cols, "ship_date")?,
-    deliveredDate = sqlOptDate(rows, cols, "delivered_date")?,
-    cutoff = sqlReqTime(rows, cols, "cutoff")?,
-    pickupTime = sqlOptTime(rows, cols, "pickup_time")?,
-    manifest = sqlReqJson(rows, cols, "manifest")?,
-    extra = sqlOptJson(rows, cols, "extra")?,
-    settings = sqlReqJsonAs<ShipmentSettings>(rows, cols, "settings")?,
-    backorderSettings = sqlOptJsonAs<ShipmentSettings>(rows, cols, "backorder_settings")?,
-    itemIds = sqlReqArray<i64>(rows, cols, "item_ids", sqlElemInt)?,
-    weights = sqlReqArray<f64>(rows, cols, "weights", sqlElemFloat)?,
-    flags = sqlReqArray<bool>(rows, cols, "flags", sqlElemBool)?,
-    notes = sqlReqArray<string>(rows, cols, "notes", sqlElemText)?,
-    photos = sqlReqArray<[]byte>(rows, cols, "photos", sqlElemBlob)?,
-    totals = sqlReqArray<decimal>(rows, cols, "totals", sqlElemDecimal)?,
-    backorderIds = sqlOptArray<i64>(rows, cols, "backorder_ids", sqlElemInt)?,
+    meta = sqlReqJsonAs<DraftMeta>(rows, cols, "meta")?,
+    tags = sqlReqArray<string>(rows, cols, "tags", sqlElemText)?,
+    price = sqlReqDecimal(rows, cols, "price")?,
   }
 }
 ```
 
-`sqlReqJson`/`sqlOptJson` return a `Json` tree for a caller that does not
-know the column's shape ahead of time - `manifest` above. `sqlReqJsonAs<T>`/
-`sqlOptJsonAs<T>` decode straight into a class instead, the shape most
-callers actually want - `settings` above. Both pairs keep a SQL NULL and a
-stored JSON `null` distinct, matching `pkg/orm/docs/json.md`: a SQL NULL
-fails `NullField` (`Req`) or decodes to `None` (`Opt`); a stored JSON `null`
-document decodes successfully, to `Json.JsonNull` or a class's own
-`null`-shaped field, because it is data the row actually holds.
+Every type has a required (`sqlReq...`) and optional (`sqlOpt...`) form; the
+required form fails naming the column on `NULL`, the optional form decodes
+`NULL` to `None`. Pass a hand-written mapper like `draftRowMapper` above to
+`sqlFindMany`/`sqlFindOne`/`sqlFindOneOrFail` in place of the generated one
+whenever a class has a field `find<T>` cannot map on its own - a `decimal`,
+a nested `@json` class, or an array.
 
-### `sqlReqTimestamp(rows: Rows, cols: []string, col: string): Timestamp!`
+## Writing a driver
 
-### `sqlOptTimestamp(rows: Rows, cols: []string, col: string): Option<Timestamp>!`
+Two drivers exist today, `pkg/postgres` and `pkg/mysql`. Neither implements
+`Driver`/`Registry` directly - both plug into the pool through their own
+`Adapter`, the one thing a driver implements for `pool`:
 
-The instant claimed by column `col`, reading `timestamp` or `timestamptz`
-text alike.
+```bit
+import { Datasource, Conn } from "std/sql"
 
-### `sqlReqDate(rows: Rows, cols: []string, col: string): Date!`
+interface DemoAdapter { connect(cfg: Datasource): Conn! }
+```
 
-### `sqlOptDate(rows: Rows, cols: []string, col: string): Option<Date>!`
+Switching databases costs one import line: the same handler compiles
+against `pkg/postgres` and `pkg/mysql` with nothing else changed. `connect`
+reads whichever form of `cfg` the caller filled in, applies the driver's
+own default port when `cfg.port` is 0, and renders `cfg.sslmode` into its
+own wire spelling.
 
-The calendar date claimed by column `col`.
+`Driver`/`Conn`/`Rows`/`Stmt`/`Tx`/`Registry` are the lower-level path -
+what a driver that registers itself **by name** implements instead
+(`reg.register("postgres", d)`, `reg.open("postgres", dsn)`), and what a
+program reaches for directly when it wants one connection with no pool at
+all, including `Stmt` for a query prepared once and run many times:
 
-### `sqlReqTime(rows: Rows, cols: []string, col: string): Time!`
+```bit
+import { Registry, newRegistry, Driver, Conn, Value } from "std/sql"
 
-### `sqlOptTime(rows: Rows, cols: []string, col: string): Option<Time>!`
+fn queryOnce(reg: Registry, driverName: string, dsn: string, id: string): ()! {
+  let conn = reg.open(driverName, dsn)?
+  defer conn.close()
+  let stmt = conn.prepare("SELECT title FROM drafts WHERE id = ?")?
+  defer stmt.close()
+  let rows = stmt.query([Value.Text(id)])?
+  defer rows.close()
+}
+```
 
-The time-of-day claimed by column `col`, with 0..6 fractional-second digits.
+`Value`/`Driver`/`Conn`/`Rows`/`Stmt`/`Tx`/`Registry` are frozen: changing
+any of their exported shapes is at minimum a minor release. `Value` can
+still grow a new variant when a database needs one none of the others do -
+that is how `Bool` was added, for Postgres's native boolean wire type - but
+every other type keeps its shape, and a `match` over `Value` with no
+catch-all is a compile error the day a new variant needs handling, naming
+the exact call site.
 
-### `sqlReqUuid(rows: Rows, cols: []string, col: string): UUID!`
+A file-based database like SQLite has no host, port or TLS to negotiate,
+and no server arbitrating many physical connections - a file-based adapter
+ignores `host`/`port`/`sslmode`, and needs its own policy (a single writer,
+or retrying on a busy file) instead of the pool's concurrency model.
 
-### `sqlOptUuid(rows: Rows, cols: []string, col: string): Option<UUID>!`
+## Sharp edges
 
-The uuid claimed by column `col`, parsed with `std/uuid`'s `parse`.
+- **`sslmode` defaults to `Negotiate`**, not to a verified TLS connection -
+  a field of enum type takes its first declared variant when unset, and
+  that variant was chosen to be the least surprising default, not the most
+  secure one. Set `sslmode = SslMode.VerifyFull` explicitly for anything
+  that leaves your own network.
+- **`acquireTimeout` can never be 0.** Zero would mean "wait forever", so an
+  outage would park every caller with no error and no log line;
+  `Datasource.validate` (which `pool` always calls first) rejects it.
+- **A bool column often is not one.** SQL has no boolean wire type of its
+  own on most drivers - a MySQL `TINYINT(1)` and SQLite both arrive as
+  `Value.Int`, so `sqlReqBool`/`sqlOptBool` read zero/nonzero from an `Int`
+  column as well as a native `Bool`.
+- **`decimal` is never a `Value` variant.** Every driver sends
+  `DECIMAL`/`NUMERIC` as `Value.Text`; `sqlReqDecimal`/`sqlOptDecimal` parse
+  it, so `find<T>` cannot map a `decimal` field on its own - use a
+  hand-written mapper as shown above.
+- **`sqlReqArray<T>` is one dimension.** A Postgres array-of-arrays fails by
+  name rather than silently flattening.
 
-### `sqlReqJson(rows: Rows, cols: []string, col: string): Json!`
+## When not to use std/sql
 
-### `sqlOptJson(rows: Rows, cols: []string, col: string): Option<Json>!`
+- **A single script with no concurrent callers.** `Registry.open` gives you
+  one `Conn`, serialized automatically, with none of `Pool`'s bookkeeping -
+  reach for `pool` once more than one goroutine touches the database at
+  once.
+- **Building SQL text from user input.** Every value goes through `params`,
+  never through string interpolation into `sqlText` - there is no supported
+  way around this, by design.
 
-The `Json` tree claimed by column `col`, parsed with `std/json`'s
-`jsonParse`.
+## Where to go next
 
-### `sqlReqJsonAs<T>(rows: Rows, cols: []string, col: string): T!`
+- [std/json](/std/json) - for the `meta`-style JSON columns above.
+- [The Book, chapter 10](/book/10-a-real-database) - Inkwell's file store
+  becomes a SQL-backed one.
+- [Errors](/language/errors) - the `!`/`catch`/`fail` shapes every fallible
+  call here uses.
 
-### `sqlOptJsonAs<T>(rows: Rows, cols: []string, col: string): Option<T>!`
+## Reference
 
-Column `col`'s JSON, decoded straight into `T` with `std/json`'s
-`jsonDecode<T>` - `T` must carry `@json`, the same mark `jsonDecode<T>`
-itself requires.
+### The wire value
 
-### `sqlReqArray<T>(rows: Rows, cols: []string, col: string, elem: (Value) => T!): []T!`
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `Value` | enum | `Null \| Int(int) \| Float(f64) \| Bool(bool) \| Text(string) \| Blob([]byte)`. |
+| `isNull` | `(v: Value): bool` | Whether `v` is `Null`. |
+| `asInt`/`asFloat`/`asBool`/`asText`/`asBlob` | `(v: Value): T!` | The typed payload, or fails naming the mismatch. |
 
-### `sqlOptArray<T>(rows: Rows, cols: []string, col: string, elem: (Value) => T!): Option<[]T>!`
+### The driver contract
 
-Column `col`'s Postgres `{...}` array literal, decoded to `[]T` by applying
-`elem` to each element. `{}` is an empty slice; a nested `{{1,2},{3,4}}`
-fails by name rather than silently flattening - Postgres arrays may be
-multi-dimensional, this accessor is one dimension only. An embedded `NULL`
-element fails naming the column, unless `elem` itself tolerates
-`Value.Null`.
+| Symbol | What it is |
+| --- | --- |
+| `Driver` | `interface { open(dsn: string): Conn! }` - what a named driver implements. |
+| `Conn` | `query`, `exec`, `prepare(sqlText): Stmt!`, `begin(): Tx!`, `close()` - one logical connection. |
+| `Rows` | `next(): bool!`, `columns(): []string`, `value(col: int): Value`, `close()` - a cursor. |
+| `Stmt` | `query(params): Rows!`, `exec(params): int!`, `close()` - from `Conn.prepare`. |
+| `Tx` | `query`, `exec`, `commit(): ()!`, `rollback(): ()!` - from `Conn.begin`. |
+| `Registry` | `register(name, d: Driver): ()!`, `open(name, dsn): Conn!` - a program's own driver-name map. |
+| `newRegistry(): Registry` | An empty `Registry`. |
 
-### `sqlElemInt(v: Value): i64!`
+### The pool
 
-### `sqlElemFloat(v: Value): f64!`
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `pool` | `(a: Adapter, cfg: Datasource): Pool!` | Builds a pool; validates `cfg` first, connects lazily. |
+| `Adapter` | `interface { connect(cfg: Datasource): Conn! }` | What a driver implements for `pool`. |
+| `Datasource` | class | See the field table below. |
+| `Datasource.validate` | `(): ()!` | Rejects a config that cannot describe a pool. |
+| `SslMode` | enum | `Negotiate \| VerifyFull \| VerifyCa \| Require \| Disable`. |
+| `Pool.query`/`Pool.exec` | `(sqlText, params): Rows!` / `int!` | Run SQL; `query`'s connection stays checked out until `Rows.close()`. |
+| `Pool.close` | `()` | Closes idle connections; idempotent. |
+| `Pool.tx`/`Pool.txAt`/`Pool.txValue`/`Pool.txValueAt` | see [Transactions](#transactions-are-a-closure-not-a-begincommit-pair) | Method form of the free functions below. |
+| `Pool.session` | `(): Session` | A read-your-own-writes handle. |
+| `FatalError` | `interface { message(): string, transportFatal(): bool }` | Marks a driver failure that poisoned the connection. |
+| `transportError` | `(detail: string): error` | A ready-made `FatalError` for a driver with no error type of its own. |
+| `Session.query`/`Session.exec` | `(sqlText, params): Rows!` / `int!` | Sticky-to-writer reads once this handle has written. |
 
-### `sqlElemBool(v: Value): bool!`
+### `Datasource` fields
 
-### `sqlElemText(v: Value): string!`
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `uri` | `""` | Whole target in one string; exclusive with the fields below. |
+| `host`/`port`/`user`/`password`/`database` | `""`/`0`/... | The individual form. `port = 0` means the adapter's own default. |
+| `sslmode` | `SslMode.Negotiate` | TLS negotiation; see [Sharp edges](#sharp-edges). |
+| `connectTimeout` | `10_000` | ms for one connect attempt. |
+| `maxOpen` | `10` | Ceiling on physical connections, in use plus idle. |
+| `maxIdle` | `10` | How many may sit idle before a returned connection is closed instead. |
+| `maxLifetime` | `1_800_000` | ms after opening before retiring a connection; `<= 0` is no limit. |
+| `maxIdleTime` | `600_000` | ms idle before retiring; `<= 0` is no limit. |
+| `acquireTimeout` | `5_000` | ms a caller waits for a connection; never 0. |
+| `statementCache` | `0` | Server-side prepared statements kept per connection; 0 is off. |
+| `replicas` | `[]` | Read replica URIs; empty means every statement runs on the writer. |
+| `replicaBackoff` | `2_000` | ms a replica that failed a statement stays out of rotation. |
 
-### `sqlElemBlob(v: Value): []byte!`
+### Transactions
 
-### `sqlElemDecimal(v: Value): decimal!`
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `tx` | `(db: Executor, f: (Tx) => ()!): ()!` | Runs `f` at the database's default isolation. |
+| `txAt` | `(db: Executor, level: Isolation, f: (Tx) => ()!): ()!` | `tx` at `level`. |
+| `txValue<T>` | `(db: Executor, f: (Tx) => T!): T!` | `tx`, returning `f`'s result once committed. |
+| `txValueAt<T>` | `(db, level, f: (Tx) => T!): T!` | The one implementation the other three spell. |
+| `Executor` | `interface { query, exec }` | Anything statements can run on: `Pool`, or a running `Tx`. |
+| `Isolation` | enum | `Default \| ReadUncommitted \| ReadCommitted \| RepeatableRead \| Serializable`. `Default` issues no statement. |
 
-The six built-in element decoders for `sqlReqArray<T>`/`sqlOptArray<T>`,
-one per scalar type above. Each matches `Value.Text` - an array element is
-its own substring on the wire, never a typed sub-`Value` - and fails on a
-`NULL` element or text that does not parse as its type.
+### Mapping a query into a typed `T`
 
-Five more functions serve `find<T>`/`findOne<T>`/`findOneOrFail<T>` for a
-**plain scalar `T`** (no class declared): each requires the result to carry
-**exactly one** column, failing with `ColumnCount` otherwise, then applies
-the matching required accessor above to column `0`.
+| Symbol | Signature | What it does |
+| --- | --- | --- |
+| `find<T>` | `(db: Executor, sqlText, ...args: Value): []T!` | Maps every row into `T`. |
+| `findOne<T>` | `(db, sqlText, ...args: Value): Option<T>!` | At most one row; more is `SqlRowError`. |
+| `findOneOrFail<T>` | `(db, sqlText, ...args: Value): T!` | Exactly one row required. |
+| `SqlRowCause` | enum | `MissingColumn \| TypeMismatch \| NullField \| ColumnCount \| NoRows \| TooManyRows`. |
+| `SqlRowError` | class | `cause`, `column`, `expected`, `found`, `message()`. |
+| `FieldDesc`/`AttrDesc` | classes | What a `@table` class's generated `tableDescriptor()` returns: one `FieldDesc` (`name`, `typeName`, `attrs: []AttrDesc`) per field. |
 
-### `sqlRowScalarInt(rows: Rows): i64!`
+### Row-mapping building blocks
 
-### `sqlRowScalarFloat(rows: Rows): f64!`
+Required (`sqlReq...`, fails on `NULL`) and optional (`sqlOpt...`, `NULL` to
+`None`) accessors, all `(rows: Rows, cols: []string, col: string): T!` /
+`Option<T>!` unless noted.
 
-### `sqlRowScalarBool(rows: Rows): bool!`
-
-### `sqlRowScalarText(rows: Rows): string!`
-
-### `sqlRowScalarBlob(rows: Rows): []byte!`
-
-### `sqlFindMany<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): []T!`
-
-`find<T>`'s own implementation: runs `sqlText`/`args` and maps every row
-through `mapper`.
-
-### `sqlFindOne<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): Option<T>!`
-
-`findOne<T>`'s own implementation.
-
-### `sqlFindOneOrFail<T>(db: Executor, sqlText: string, args: []Value, mapper: (Rows) => T!): T!`
-
-`findOneOrFail<T>`'s own implementation.
+| Symbols | Reads |
+| --- | --- |
+| `sqlReqInt`/`sqlOptInt` | `i64` |
+| `sqlReqFloat`/`sqlOptFloat` | `f64` |
+| `sqlReqBool`/`sqlOptBool` | `bool` (from `Bool` or `Int` zero/nonzero) |
+| `sqlReqText`/`sqlOptText` | `string` |
+| `sqlReqBlob`/`sqlOptBlob` | `[]byte` |
+| `sqlReqDecimal`/`sqlOptDecimal` | `decimal`, parsed from `Value.Text` |
+| `sqlReqTimestamp`/`sqlOptTimestamp` | `std/time` `Timestamp`, from `timestamp` or `timestamptz` text |
+| `sqlReqDate`/`sqlOptDate` | `std/time` `Date` |
+| `sqlReqTime`/`sqlOptTime` | `std/time` `Time` |
+| `sqlReqUuid`/`sqlOptUuid` | `std/uuid` `UUID` |
+| `sqlReqJson`/`sqlOptJson` | `std/json` `Json` tree |
+| `sqlReqJsonAs<T>`/`sqlOptJsonAs<T>` | `T` (a `@json` class), via `std/json`'s `jsonDecode<T>` |
+| `sqlReqArray<T>`/`sqlOptArray<T>` | `(rows, cols, col, elem: (Value) => T!): []T!` / `Option<[]T>!` - one Postgres `{...}` dimension |
+| `sqlElemInt`/`sqlElemFloat`/`sqlElemBool`/`sqlElemText`/`sqlElemBlob`/`sqlElemDecimal` | `(v: Value): T!` - the built-in `elem` decoders for the array accessors above |
+| `sqlRowScalarInt`/`sqlRowScalarFloat`/`sqlRowScalarBool`/`sqlRowScalarText`/`sqlRowScalarBlob` | `(rows: Rows): T!` - a one-column result's single value, for `find<T>` against a scalar `T` |
+| `sqlFindMany<T>`/`sqlFindOne<T>`/`sqlFindOneOrFail<T>` | `(db: Executor, sqlText, args: []Value, mapper: (Rows) => T!): ...` | `find`/`findOne`/`findOneOrFail`'s own implementation - pass a hand-written `mapper` for a shape `find<T>` cannot generate. |
