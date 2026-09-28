@@ -28,7 +28,10 @@
 # ## The family is DISCOVERED, not listed
 #
 # `scripts/selfhost-*.sh`, minus `*-x64.sh` (the cross-arch variants belong to
-# x64gate.sh and need an emulator) and minus `selfhost-diffdump.sh` (the shared
+# x64gate.sh and need an emulator), minus `selfhost-diffdump-setup.sh` (#6196:
+# the sourced-only setup helper behind selfhost-diffdump.sh, defines
+# `diffdump_setup` and does nothing when merely executed -- a vacuous pass,
+# not a differential) and minus `selfhost-diffdump.sh` (the shared
 # table-driven driver behind six of the wrappers below, not itself a
 # differential -- it takes a required mode argument and exits 1 on a bare
 # usage error that used to be tallied as a real divergence, #2847). A
@@ -158,6 +161,9 @@ for s in "$DIR"/selfhost-*.sh; do
   case "$s" in
     *-x64.sh) continue ;;          # cross-arch variant; x64gate.sh owns it
     */selfhost-diffall.sh) continue ;;  # never recurse into itself
+    */selfhost-diffdump-setup.sh) continue ;;  # sourced-only setup helper
+                                          # behind selfhost-diffdump.sh (#6196);
+                                          # not itself a differential
     */selfhost-diffdump.sh) continue ;;  # shared driver behind diffast/difftokens/
                                           # diffdiags/difftypes/diffir/diffiropt
                                           # (#2743); takes a REQUIRED mode selector,
