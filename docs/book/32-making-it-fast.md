@@ -131,33 +131,33 @@ rebuild. The profile it writes is plain text; render it with `bit prof`:
 
 ```text
 $ bit prof stats.prof
-profile: 1804 sample(s) of 8192 ring capacity, 55 distinct function(s)
-1147	63.6%	_bit_rt_port_thread_stack_base
-49	2.7%	_zeroBytes
-38	2.1%	_gcHeapAllocUncached
-38	2.1%	_bit_rt_alloc_classify
-37	2.1%	_allocObject
-37	2.1%	_bit_rt_heap_take_small_locked
-31	1.7%	_bit_rt_alloc_slot_index
-29	1.6%	_m6$addThread
-28	1.6%	_noteBody
-27	1.5%	_setSlotBit
-23	1.3%	_bit_rt_port_gc_should_collect
-23	1.3%	_gcVisitWord
-22	1.2%	_m6$runPikeAll
+profile: 1588 sample(s) of 8192 ring capacity, 49 distinct function(s)
+1279	80.5%	(outside the binary)
+48	3.0%	_bit_rt_heap_take_small_locked
+28	1.8%	_gcHeapAllocUncached
+21	1.3%	_m6$addThread
+20	1.3%	_setSlotBit
+17	1.1%	_m6$runPikeAll
+14	0.9%	_allocObject
+12	0.8%	_noteBody
+11	0.7%	_zeroBytes
+11	0.7%	_bit_rt_alloc_classify
+10	0.6%	_m6$firstMatchIndex
+8	0.5%	_m2$decodeRune
 ...
 ```
 
-Each line is a function and its share of the samples. Read the top line
-with care: the renderer files every sample it cannot match to one of your
-program's own functions under the last function in the binary, which here
-is `_bit_rt_port_thread_stack_base`. All 1,147 of those samples were taken
-inside the operating system's own libraries, not in `wb`. Below it, almost
-every name belongs to the runtime: `alloc`, `heap`, `gc` and `zeroBytes`
-are handing out memory, clearing it and collecting it again. The regular
-expression matcher itself (`addThread`, `runPikeAll`) is under 2% a line.
-The profile agrees with `BIT_GC_STATS`: the cost is not the matching, it is
-the memory.
+Each line is a function and its share of the samples. The top line is not
+a function in `wb` at all: 1,279 samples' addresses fell outside every
+function the binary defines, so the renderer reports them on their own
+row, `(outside the binary)`, instead of charging them to whichever
+function happens to come last. Those samples were taken inside the
+operating system's own libraries, not in `wb`. Below it, almost every name
+belongs to the runtime: `alloc`, `heap`, `gc` and `zeroBytes` are handing
+out memory, clearing it and collecting it again. The regular expression
+matcher itself (`addThread`, `runPikeAll`) is under 2% a line. The profile
+agrees with `BIT_GC_STATS`: the cost is not the matching, it is the
+memory.
 
 Now read `wordCount` again with that in mind. `split` builds a new string
 for every word and a list to hold them, and the only thing the code wants

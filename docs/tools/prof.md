@@ -45,7 +45,7 @@ Build and run that program, pass its output path to `bit prof`, and you get:
 $ bit prof hotloop.prof
 profile: 227 sample(s) of 8192 ring capacity, 2 distinct function(s)
 225	99.1%	_hotLoop
-2	0.9%	_bit_rt_port_thread_stack_base
+2	0.9%	(outside the binary)
 ```
 
 | Exit code | Meaning |
@@ -61,11 +61,11 @@ returned when the profiled process called `stopCpu` - if you moved or
 deleted that binary since, `bit prof` cannot symbolize the addresses and
 reports it cannot read it.
 
-A sample whose address falls after every symbol `bit prof` can see - most
-often, one taken inside the operating system's own libraries rather than
-your program - is charged to the last function in the binary rather than
-dropped. A large top line is worth checking against that before concluding
-your own code is the hot spot.
+A sample whose address falls outside every function the binary defines -
+most often, one taken inside the operating system's own libraries rather
+than your program - is reported on its own row, `(outside the binary)`,
+never charged to one of your own functions. A large `(outside the binary)`
+line is worth checking before concluding your own code is the hot spot.
 
 ## Where next
 
