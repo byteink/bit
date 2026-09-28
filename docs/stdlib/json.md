@@ -1,6 +1,6 @@
 # std/json
 
-The `Json` value: a sum type over the seven shapes RFC 8259 §3 defines, plus
+The `Json` value: a sum type over the seven shapes RFC 8259 section 3 defines, plus
 `JsonEntry`, one object key/value pair. This is the primitive the rest of the
 json module - parser, encoder - builds on. Nothing here parses or
 encodes JSON text; these are pure constructors and accessors over an
@@ -200,7 +200,7 @@ comments - the CST printer the edit layer needs is a separate, later task.
 ### `jsonEncode(j: Json): string`
 
 Compact form: no whitespace, `,`/`:` with no padding. Keys and strings are
-JSON-escaped per RFC 8259 §7 (`"`, `\`, and control bytes < 0x20 - `\n`, `\t`,
+JSON-escaped per RFC 8259 section 7 (`"`, `\`, and control bytes < 0x20 - `\n`, `\t`,
 `\r`, `\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes
 `>= 0x20` pass through as-is, since JSON strings are UTF-8.
 
@@ -713,7 +713,7 @@ fn cstToJsonExample(): i64 {
 
 ## Typed decoding
 
-`jsonDecode<T>` turns a `Json` into a class carrying `@json` (SPEC §10.5) --
+`jsonDecode<T>` turns a `Json` into a class carrying `@json` (SPEC section 10.5) --
 the reading half of the `toJson()` that mark synthesises. The compiler
 specialises it per call from the same field list and the same key rules, so
 the two halves agree by construction rather than by review.

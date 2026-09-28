@@ -208,7 +208,7 @@ with a `check` prefix, that prints the failure and *returns* instead of
 panicking, so a loop can keep going and report every bad row in one run.
 
 A non-fatal check does not fail the test by itself: `bit test` does not wrap
-a test function in a panic boundary (SPEC.md §18.4 - `std/runtime`'s
+a test function in a panic boundary (SPEC.md section 18.4 - `std/runtime`'s
 `runRecovering` exists, but the runner does not call it; each test gets its
 own process instead, and the runner reads its exit status), and running a
 test function only returns, with no automatic "did anything fail" step

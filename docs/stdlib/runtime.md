@@ -3,7 +3,7 @@
 The **panic boundary**: run a call so that a panic inside it ends the call
 instead of the program.
 
-A panic is for a programmer error or a broken invariant (SPEC §18.4), and by
+A panic is for a programmer error or a broken invariant (SPEC section 18.4), and by
 default it aborts the process. This module is how one failing unit of work - a
 connection task, a test case, a plugin - is contained instead of taking
 everything with it. It is not an error-handling mechanism: an expected failure
@@ -61,7 +61,7 @@ wins. A panic raised inside a handler - after `runRecovering` has resumed and
 before it returns - reaches the next boundary out, never the one already
 unwound.
 
-**Deferred calls do not run** (SPEC §18.5). There is no unwinding of any kind,
+**Deferred calls do not run** (SPEC section 18.5). There is no unwinding of any kind,
 so nothing in the discarded frames gets to clean up. Anything a panic path must
 release has to be released explicitly, before the call that may panic.
 

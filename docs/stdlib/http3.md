@@ -140,31 +140,31 @@ table tracks the peer decoder.
 
 ### `Encoder.setCapacity(capacity: int): []byte`
 
-Emit a Set Dynamic Table Capacity instruction (RFC 9204 §4.3.1) and resize the
+Emit a Set Dynamic Table Capacity instruction (RFC 9204 section 4.3.1) and resize the
 table, evicting entries that no longer fit. Returns the encoder-stream bytes.
 
 ### `Encoder.insertNameRef(isStatic: bool, index: int, value: string): []byte!`
 
-Emit an Insert With Name Reference instruction (§4.3.2) and add the entry. When
+Emit an Insert With Name Reference instruction (section 4.3.2) and add the entry. When
 `isStatic`, `index` is a static absolute index; otherwise it is a dynamic index
 relative to the current insert count. Fails on a bad index or an entry too large
 for the table.
 
 ### `Encoder.insertLiteral(name: string, value: string): []byte!`
 
-Emit an Insert With Literal Name instruction (§4.3.3) and add the entry. Fails if
+Emit an Insert With Literal Name instruction (section 4.3.3) and add the entry. Fails if
 the entry is too large for the table.
 
 ### `Encoder.duplicate(relIndex: int): []byte!`
 
-Emit a Duplicate instruction (§4.3.4) and re-insert an existing entry, given as a
+Emit a Duplicate instruction (section 4.3.4) and re-insert an existing entry, given as a
 dynamic index relative to the current insert count. Duplicating an about-to-be-
 evicted entry keeps a still-referenced header alive. Fails on a bad index.
 
 ### `Encoder.encodeFieldSection(streamId: int, base: int, fields: []HeaderField): []byte`
 
 Encode `fields` into one field section on `streamId` against the given `base`
-(§4.5). Each field is emitted as, in preference order: an indexed static line, an
+(section 4.5). Each field is emitted as, in preference order: an indexed static line, an
 indexed dynamic line (relative or post-base per `base`), a literal with a
 static/dynamic name reference, or a literal with a literal name; a `sensitive`
 field is always a never-index literal. No new dynamic entries are inserted here -
@@ -174,7 +174,7 @@ is recorded as outstanding until acknowledged.
 
 ### `Encoder.applyDecoderStream(data: []byte): ()!`
 
-Process decoder-stream bytes (§4.4): a Section Acknowledgment raises the Known
+Process decoder-stream bytes (section 4.4): a Section Acknowledgment raises the Known
 Received Count to the acked section's Required Insert Count and retires it; a
 Stream Cancellation retires an outstanding section; an Insert Count Increment
 advances the Known Received Count. Fails on a malformed instruction, an ack for an
@@ -218,28 +218,28 @@ peer encoder.
 
 ### `Decoder.applyEncoderStream(data: []byte): int!`
 
-Apply the encoder-stream instructions in `data` (§4.3), mutating the dynamic
+Apply the encoder-stream instructions in `data` (section 4.3), mutating the dynamic
 table, and return the resulting insert count. Fails on a malformed instruction, a
 bad index, or a capacity over the decoder's limit.
 
 ### `Decoder.decodeFieldSection(data: []byte): []HeaderField!`
 
-Decode one encoded field section (§4.5) into its header fields. Reads the prefix
+Decode one encoded field section (section 4.5) into its header fields. Reads the prefix
 to recover the Required Insert Count and Base, fails ("blocked") if the section
 needs insertions not yet applied, then decodes each field line. Fails on any
 malformed representation or out-of-range index.
 
 ### `Decoder.sectionAck(streamId: int): []byte`
 
-Emit a Section Acknowledgment for `streamId` (§4.4.1).
+Emit a Section Acknowledgment for `streamId` (section 4.4.1).
 
 ### `Decoder.streamCancel(streamId: int): []byte`
 
-Emit a Stream Cancellation for `streamId` (§4.4.2).
+Emit a Stream Cancellation for `streamId` (section 4.4.2).
 
 ### `Decoder.insertCountIncrement(n: int): []byte`
 
-Emit an Insert Count Increment of `n` (§4.4.3).
+Emit an Insert Count Increment of `n` (section 4.4.3).
 
 ### `Decoder.insertCount(): int`
 
@@ -360,7 +360,7 @@ As `h3Dial`, bounded by `deadlineNs` - an absolute monotonic nanosecond deadline
 `dialDeadline`. The QUIC handshake itself is not shortened by `deadlineNs`: a
 stalled handshake still gives up after a fixed 5s regardless of the deadline
 passed here. Once the handshake succeeds, the connection's own idle timeout
-(RFC 9000 §10.1) is lowered to whatever budget remains, so a peer that
+(RFC 9000 section 10.1) is lowered to whatever budget remains, so a peer that
 completes the handshake and then never answers is torn down within
 `deadlineNs` instead of the default 30s. Fails immediately if `deadlineNs` has
 already elapsed by the time the handshake completes.
@@ -422,7 +422,7 @@ transport error.
 The peer's IPv4 address in dotted quad, or `""` when it is not known. Forwards
 `quic.Conn.peerIp` unchanged, including its ruling on a connection that may
 migrate: the source of the datagram that established the QUIC connection, frozen
-there (RFC 9000 §9). Never fails and never blocks - a peer address is metadata and
+there (RFC 9000 section 9). Never fails and never blocks - a peer address is metadata and
 must not be able to fail a request. On the client side of a connection this names
 the server.
 
@@ -433,12 +433,12 @@ filled.
 
 ### `H3Conn.goAway()`
 
-Begin a graceful shutdown of just this connection (RFC 9114 §5.2): send a GOAWAY
+Begin a graceful shutdown of just this connection (RFC 9114 section 5.2): send a GOAWAY
 naming the stream id one past the highest request stream `accept` has handed to a
 caller so far. Every request already accepted is left alone - its id is below the
 cutoff - and a request opened after this point is refused (reset with
-`H3_REQUEST_REJECTED`, RFC 9114 §4.1.1) instead of being read and returned. A
-no-op past the first call on a connection - RFC 9114 §5.2 forbids a later GOAWAY
+`H3_REQUEST_REJECTED`, RFC 9114 section 4.1.1) instead of being read and returned. A
+no-op past the first call on a connection - RFC 9114 section 5.2 forbids a later GOAWAY
 naming a larger identifier than an earlier one. `std/http`'s `H3Server.shutdown`
 calls this on every connection with a request in flight when it starts draining.
 
@@ -462,4 +462,4 @@ it), so ordinary HTTP/3 traffic should never need this.
 Close the connection: send this connection's GOAWAY (`goAway`, a no-op if one was
 already sent), then close the underlying QUIC connection with `H3_NO_ERROR` -
 "an endpoint that completes a graceful shutdown SHOULD use the H3_NO_ERROR error
-code when closing the connection" (RFC 9114 §5.2).
+code when closing the connection" (RFC 9114 section 5.2).

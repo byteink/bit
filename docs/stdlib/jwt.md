@@ -78,7 +78,7 @@ The ES256 public key built from raw JWK `x`/`y` coordinates (32 bytes each).
 
 ### `ecdsaSigToRaw(sig: EcdsaSignature): []byte!`
 
-An ECDSA signature as the JWS raw `R || S` encoding (RFC 7518 §3.4) - never
+An ECDSA signature as the JWS raw `R || S` encoding (RFC 7518 section 3.4) - never
 the ASN.1/DER form.
 
 ### `ecdsaSigFromRaw(raw: []byte): EcdsaSignature!`

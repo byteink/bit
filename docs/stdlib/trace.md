@@ -8,7 +8,7 @@ crossed.
 
 A `Tracer` is held explicitly by whatever code creates spans - the same
 shape `std/metrics`' `Registry` uses (Bit's module-level `let` cannot hold a
-class, SPEC §11.11, so there is no hidden default tracer). What is
+class, SPEC section 11.11, so there is no hidden default tracer). What is
 **implicit** is the parent/child link between spans on the same task: it is
 carried through `std/runtime`'s task-local storage slot (`taskLocalGet`/
 `taskLocalSet`, see [runtime](runtime.md) and

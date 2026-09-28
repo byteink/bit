@@ -53,7 +53,7 @@ A `sensitive` field (a cookie, an authorization token) is always sent
 ```bit
 import { newEncoder, HeaderField } from "std/http2"
 
-// A sensitive field is encoded never-indexed (RFC 7541 §6.2.3).
+// A sensitive field is encoded never-indexed (RFC 7541 section 6.2.3).
 fn encodeSecret(): []byte {
   let enc = newEncoder()
   let fields = []HeaderField{
@@ -95,13 +95,13 @@ pending size update from `changeTableSize` is emitted first.
 
 ### `Encoder.changeTableSize(maxTableSize: int)`
 
-Change the encoder's dynamic-table maximum size (RFC 7541 §4.2, §6.3). The table
+Change the encoder's dynamic-table maximum size (RFC 7541 section 4.2, section 6.3). The table
 is resized (evicting as needed) immediately, and the next `encode` prepends the
 required dynamic-table size-update instruction(s).
 
 ### `Encoder.tableSize(): int`
 
-The current byte size of the encoder's dynamic table (RFC 7541 §4.1: the sum of
+The current byte size of the encoder's dynamic table (RFC 7541 section 4.1: the sum of
 each entry's name + value + 32).
 
 ### `Encoder.tableCount(): int`
@@ -167,13 +167,13 @@ fn huffRoundTrip(s: string): []byte! {
 
 Huffman-decode `data`. Fails on a code that never resolves within 30 bits, on the
 EOS symbol appearing in the stream, or on final padding that is longer than 7 bits
-or not all 1-bits (RFC 7541 §5.2).
+or not all 1-bits (RFC 7541 section 5.2).
 
 ## Frames
 
 Every HTTP/2 message is a stream of frames: a fixed 9-byte header - a 24-bit
 payload length, an 8-bit type, an 8-bit flags field, a reserved bit, and a 31-bit
-stream id (RFC 7540 §4.1) - followed by a type-specific payload. `readFrame`
+stream id (RFC 7540 section 4.1) - followed by a type-specific payload. `readFrame`
 splits one frame off a buffer, enforcing the negotiated `SETTINGS_MAX_FRAME_SIZE`;
 the typed `decode*` helpers then interpret the payload.
 
@@ -263,7 +263,7 @@ the next frame.
 
 ### Frame types
 
-The `FrameType` code points (RFC 7540 §6), for `FrameHeader.ftype` and dispatch.
+The `FrameType` code points (RFC 7540 section 6), for `FrameHeader.ftype` and dispatch.
 
 ### `frameData: int`
 
@@ -307,7 +307,7 @@ CONTINUATION (0x9): a continued header block fragment.
 
 ### Frame flags
 
-The frame flag bits (RFC 7540 §6). `flagAck` shares the bit value of
+The frame flag bits (RFC 7540 section 6). `flagAck` shares the bit value of
 `flagEndStream` on the frame types where END_STREAM does not apply.
 
 ### `flagEndStream: int`
@@ -333,7 +333,7 @@ ACK (0x1) on SETTINGS/PING: acknowledges the peer's frame.
 
 ### SETTINGS parameters
 
-The `SettingsParameter` identifiers (RFC 7540 §6.5.2), for `Setting.id`.
+The `SettingsParameter` identifiers (RFC 7540 section 6.5.2), for `Setting.id`.
 
 ### `settingsHeaderTableSize: int`
 
@@ -372,7 +372,7 @@ field can express.
 
 ### Error codes
 
-The `ErrorCode` values (RFC 7540 §7), for `RstStreamFrame.errorCode` and
+The `ErrorCode` values (RFC 7540 section 7), for `RstStreamFrame.errorCode` and
 `GoawayFrame.errorCode`.
 
 ### `errorNoError: int`
@@ -431,7 +431,7 @@ INADEQUATE_SECURITY (0xc): the transport is not secure enough.
 
 HTTP_1_1_REQUIRED (0xd): the peer requires HTTP/1.1.
 
-### DATA (§6.1)
+### DATA (section 6.1)
 
 ### `DataFrame`
 
@@ -448,7 +448,7 @@ length.
 The DATA frame `f` carries. Fails on a wrong type, a zero stream id, or padding at
 least the payload size.
 
-### HEADERS (§6.2)
+### HEADERS (section 6.2)
 
 ### `HeadersFrame`
 
@@ -466,7 +466,7 @@ pad length.
 The HEADERS frame `f` carries. Fails on a wrong type, a zero stream id, padding at
 least the payload size, or a priority section that does not fit.
 
-### PRIORITY (§6.3)
+### PRIORITY (section 6.3)
 
 ### `PriorityFrame`
 
@@ -482,7 +482,7 @@ The wire bytes of a PRIORITY frame. Fails on a zero stream id.
 The PRIORITY frame `f` carries. Fails on a wrong type, a zero stream id, or a
 payload that is not exactly 5 bytes.
 
-### RST_STREAM (§6.4)
+### RST_STREAM (section 6.4)
 
 ### `RstStreamFrame`
 
@@ -498,7 +498,7 @@ The wire bytes of a RST_STREAM frame. Fails on a zero stream id.
 The RST_STREAM frame `f` carries. Fails on a wrong type, a zero stream id, or a
 payload that is not exactly 4 bytes.
 
-### SETTINGS (§6.5)
+### SETTINGS (section 6.5)
 
 ### `Setting`
 
@@ -520,7 +520,7 @@ together with a non-empty `settings` list.
 The SETTINGS frame `f` carries. Fails on a wrong type, a non-zero stream id, a
 payload length that is not a multiple of 6, or an ACK with a non-empty payload.
 
-### PUSH_PROMISE (§6.6)
+### PUSH_PROMISE (section 6.6)
 
 ### `PushPromiseFrame`
 
@@ -538,7 +538,7 @@ The PUSH_PROMISE frame `f` carries. Fails on a wrong type, a zero carrying strea
 id, padding at least the payload size, or a payload too short for the promised
 stream field.
 
-### PING (§6.7)
+### PING (section 6.7)
 
 ### `PingFrame`
 
@@ -554,7 +554,7 @@ The wire bytes of a PING frame. Fails unless `data` is exactly 8 bytes.
 The PING frame `f` carries. Fails on a wrong type, a non-zero stream id, or a
 payload that is not exactly 8 bytes.
 
-### GOAWAY (§6.8)
+### GOAWAY (section 6.8)
 
 ### `GoawayFrame`
 
@@ -570,7 +570,7 @@ The wire bytes of a GOAWAY frame.
 The GOAWAY frame `f` carries. Fails on a wrong type, a non-zero stream id, or a
 payload shorter than the fixed 8-byte header.
 
-### WINDOW_UPDATE (§6.9)
+### WINDOW_UPDATE (section 6.9)
 
 ### `WindowUpdateFrame`
 
@@ -586,7 +586,7 @@ The wire bytes of a WINDOW_UPDATE frame.
 The WINDOW_UPDATE frame `f` carries. Fails on a wrong type or a payload that is not
 exactly 4 bytes.
 
-### CONTINUATION (§6.10)
+### CONTINUATION (section 6.10)
 
 ### `ContinuationFrame`
 
@@ -605,7 +605,7 @@ The CONTINUATION frame `f` carries. Fails on a wrong type or a zero stream id.
 HPACK and the frame codec are pure - no I/O, no state machine. `conn.bit` puts
 them to work over a live connection. A `Conn` runs the client preface and the
 SETTINGS exchange, tracks each stream through the idle → open → half-closed →
-closed lifecycle (RFC 9113 §5.1), reassembles HEADERS + CONTINUATION blocks into
+closed lifecycle (RFC 9113 section 5.1), reassembles HEADERS + CONTINUATION blocks into
 header lists, paces DATA against the per-stream and connection flow-control
 windows, and multiplexes many concurrent request/response exchanges over the one
 byte stream. It is transport-agnostic and TLS-free: a `Transport` is any
@@ -622,7 +622,7 @@ SETTINGS is in effect, so the peer's window and frame-size limits are known
 before the first request goes out.
 
 A stream leaves the loop's stream table as soon as it closes. A late
-RST_STREAM, WINDOW_UPDATE or PRIORITY arriving after that - which RFC 9113 §5.1
+RST_STREAM, WINDOW_UPDATE or PRIORITY arriving after that - which RFC 9113 section 5.1
 allows, since the peer's frames were already in flight when the stream ended -
 is answered without a table entry: it is ignored, exactly as it was when the
 entry was still there. DATA on such a stream is still refused with
@@ -703,7 +703,7 @@ connection's own window starts at the RFC's fixed 65535 and is not configurable.
 Both are accounted rather than merely advertised: a DATA frame spends the credit
 it uses when the frame is counted, and the credit comes back on the
 WINDOW_UPDATE that renews it, so a peer sending past the credit it holds fails
-the connection with GOAWAY carrying `errorFlowControlError` (RFC 9113 §6.9.1).
+the connection with GOAWAY carrying `errorFlowControlError` (RFC 9113 section 6.9.1).
 The credit for a body follows the application: it is held from the moment the
 DATA lands until the thread reading that body takes those bytes, and the
 WINDOW_UPDATE goes out with the take. A peer sending faster than its body is
@@ -711,7 +711,7 @@ read therefore runs the window down and stops at it, which is what makes flow
 control backpressure rather than bookkeeping.
 
 What a DATA frame spends is its whole payload - the Pad Length octet and the
-padding included, as RFC 9113 §6.9 defines it - and not the body left after the
+padding included, as RFC 9113 section 6.9 defines it - and not the body left after the
 padding is stripped, so a peer that pads its frames is granted back every byte
 of credit it spent. The body budget below is the other number: it counts only
 the body, because padding is discarded and never resident.
@@ -719,7 +719,7 @@ the body, because padding is discarded and never resident.
 The connection window is renewed for every DATA frame the connection counts,
 including the two whose bytes it drops: a body refused by `maxBodyBytes` below,
 and a frame for a stream that is already closed or has been released. Those
-bytes are counted (RFC 9113 §5.1 puts DATA for a closed stream under the
+bytes are counted (RFC 9113 section 5.1 puts DATA for a closed stream under the
 connection window like any other) and granted straight back, because the peer's
 own send window stays down until our WINDOW_UPDATE arrives - so a discard that
 kept the credit would stall every stream on the connection, four refused bodies
@@ -740,7 +740,7 @@ bounds each *frame* and says nothing about their sum, so without this a peer
 could send HEADERS without END_HEADERS and then CONTINUATION frames forever. A
 fragment that would take the block past the budget is refused before it is
 accumulated, and the connection fails with GOAWAY carrying
-`errorEnhanceYourCalm` (RFC 9113 §7).
+`errorEnhanceYourCalm` (RFC 9113 section 7).
 
 The failure is at the *connection* level, not the stream level, because the
 HPACK decoder's dynamic table is shared by every stream on the connection and is
@@ -776,7 +776,7 @@ zero, meaning it will accept no header list at all.
 
 `maxBodyBytes` is the most DATA one stream may accumulate. A frame that would
 take a stream's buffered body past it is refused before those bytes are
-appended, and the stream is reset with `errorEnhanceYourCalm` (RFC 9113 §7); the
+appended, and the stream is reset with `errorEnhanceYourCalm` (RFC 9113 section 7); the
 rest of the connection's streams carry on. It has no wire representation on
 purpose: flow control bounds bytes *in flight*, and the two windows bound only
 what has arrived unread, so a body the reader is keeping up with can grow past
@@ -796,9 +796,9 @@ conforming peer stops on its own side, and it is also enforced - a peer-initiate
 HEADERS that would open one stream too many is answered with RST_STREAM carrying
 `errorRefusedStream` and no stream is created, so the refused request costs no
 stream state, no body buffer and no handler thread. That is a *stream* error, not
-a connection one (RFC 9113 §5.1.2): the peer's framing is legal and the streams
+a connection one (RFC 9113 section 5.1.2): the peer's framing is legal and the streams
 already running are unaffected. REFUSED_STREAM rather than PROTOCOL_ERROR because
-§8.7 makes it the positive statement that the request was not processed, so the
+section 8.7 makes it the positive statement that the request was not processed, so the
 peer may safely retry it on another connection.
 
 The limit runs in both directions. The peer's own advertised
@@ -817,7 +817,7 @@ and a 32 MiB per-stream body budget - the last the same number `std/http`'s
 `setMaxBodyBytes` setters default to, so an HTTP/2 exchange and an HTTP/1.1 one
 are bounded alike.
 
-250 concurrent streams matches what Go's `http2` server allows; RFC 9113 §6.5.2
+250 concurrent streams matches what Go's `http2` server allows; RFC 9113 section 6.5.2
 asks implementations not to advertise fewer than 100.
 
 128 KiB is twice `std/http`'s own `maxHeaderBytes` (65536), which bounds a
@@ -888,7 +888,7 @@ connection is closing.
 
 It also fails when the peer sends GOAWAY naming a `lastStreamId` below this
 stream's id: the peer is stating that the stream was not processed and never
-will be (RFC 9113 §6.8), so the request is safe to retry on a new connection.
+will be (RFC 9113 section 6.8), so the request is safe to retry on a new connection.
 The message names the GOAWAY's error code. Streams at or below `lastStreamId`
 are unaffected - the peer may still answer those - so a graceful shutdown lets
 in-flight requests finish.
@@ -958,7 +958,7 @@ error* against a misbehaving peer - a malformed frame, an illegal stream id, a
 header block past `maxHeaderListBytes`, and so on. In both cases the engine
 stops its loop and releases this call, so the caller that owns the transport is
 the one that closes it. A connection error queues its GOAWAY before it stops
-the writer, so the peer is always told why (RFC 9113 §5.4.1).
+the writer, so the peer is always told why (RFC 9113 section 5.4.1).
 
 ### `Stream`
 
@@ -983,7 +983,7 @@ peer receives exactly one RST_STREAM and no HEADERS behind it.
 
 Resetting after the handler has returned is legal and does nothing beyond
 sending the RST_STREAM: identifiers are never reused, so it can only name the
-stream this handler served, which has already finished (RFC 9113 §6.4).
+stream this handler served, which has already finished (RFC 9113 section 6.4).
 
 ### `Stream.read(): BodyChunk!`
 
@@ -1089,7 +1089,7 @@ Abort stream `streamId` by sending RST_STREAM with `errorCode` (an `error*`
 constant). A `roundTrip` parked on that stream is released with
 `http2: stream reset locally (code N)`; a stream that has already finished, or
 that never existed, sends the RST_STREAM and changes nothing else (RFC 9113
-§6.4 permits both).
+section 6.4 permits both).
 
 **You must track the stream id yourself.** Nothing in this API hands one out:
 `roundTrip` returns a `Response` and `serve` hands its handler a `Request` and a

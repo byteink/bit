@@ -1,17 +1,17 @@
 # std/sync
 
-Shared-memory synchronization for truly-parallel Bit code (SPEC §16.1, §13.7).
+Shared-memory synchronization for truly-parallel Bit code (SPEC section 16.1, section 13.7).
 **Channels remain the preferred concurrency primitive** - *do not communicate by
 sharing memory; share memory by communicating*. Reach for `std/sync` only on a
 shared-memory hot path, or to coordinate a fixed group of parallel workers,
 where routing every access through a channel costs more than the data
 warrants.
 
-Every primitive here is built entirely from SPEC §11.5's atomic builtins and
-§16.2's channels - no new runtime or grammar support. A blocking call
+Every primitive here is built entirely from SPEC section 11.5's atomic builtins and
+section 16.2's channels - no new runtime or grammar support. A blocking call
 (`Mutex.lock`, `WaitGroup.wait`) parks the caller on the scheduler rather than
 spinning, because it is implemented as a channel operation, and channel
-operations already do that under M:N (SPEC §16.1).
+operations already do that under M:N (SPEC section 16.1).
 
 ```bit ignore
 import { newMutex, newWaitGroup, newRWMutex, newOnce, newAtomicI64 } from "std/sync"
@@ -125,7 +125,7 @@ A fresh `WaitGroup` with a zero counter.
 
 Adds `delta` (may be negative) to the counter. Call before spawning the
 workers that will call `done()` - `spawn`'s own happens-before edge (SPEC
-§16.1) makes this safe with no further synchronization.
+section 16.1) makes this safe with no further synchronization.
 
 ### `WaitGroup.done()`
 
@@ -187,8 +187,8 @@ fn initOnce(o: Once, ready: []i64) {
 ### `AtomicI64`
 
 A single `i64` accessed only through sequentially-consistent atomic
-operations (SPEC §11.5 - the strongest ordering, and the only one v0.1
-exposes). Generic constraints (SPEC §11.3) are interface bounds only, so
+operations (SPEC section 11.5 - the strongest ordering, and the only one v0.1
+exposes). Generic constraints (SPEC section 11.3) are interface bounds only, so
 there is no single `Atomic<T>` to write against an "integer prim" bound -
 this offers one concrete class per width in common use, the same shape as
 Go's `sync/atomic.Int64`.

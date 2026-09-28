@@ -8,9 +8,8 @@ Nothing here runs unless a program calls `startCpu`: no environment variable,
 no boot-time hook, no background cost when unused.
 
 Only a leaf program counter is recorded per tick, not a full call stack, and
-only one OS thread is sampled (whichever one happens to receive `SIGPROF` -
-validated with `BIT_WORKERS=1`). Both are deliberate scope cuts for this first
-version, not silent gaps.
+only one OS thread is sampled: whichever one happens to receive `SIGPROF`.
+Both are deliberate scope cuts for this first version, not silent gaps.
 
 The written profile is a small, self-describing text format (`BITPROF1`), not
 the `pprof` protobuf format. Render it with `bit run tools/prof <file>`, which

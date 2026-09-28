@@ -6,7 +6,7 @@ LZ77 matching over a 32KB window; no dynamic Huffman tree construction.
 
 Incompressible input is never expanded by a percentage of its size: each
 32KB block is written as either fixed-Huffman or stored (raw, RFC 1951
-§3.2.4), whichever is smaller, so the worst case is a stored block's fixed
+section 3.2.4), whichever is smaller, so the worst case is a stored block's fixed
 per-block overhead - a handful of bytes - never a multiplier on the input.
 
 ### `deflate(src: []u8, level: int): []u8!`
