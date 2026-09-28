@@ -1266,18 +1266,21 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   exactly the class's declared field set. `@key("...")` overrides a
   field's schema property key exactly as it overrides its `toJson()`/
   `jsonDecode<T>` key.
-- **A field's validation attributes are recorded, not interpreted.**
-  `std/json` has no knowledge of what `@minLen`/`@max`/etc. (`pkg/web`'s
-  own rules, this file's "validate.bit" material) mean, and cannot depend
-  on `pkg/web` to find out. A field carrying attributes gets an
+- **A field's validation attributes are DESIGNED to be recorded, not
+  interpreted, but this part is NOT YET IMPLEMENTED** (#6181 - none of
+  #6161's own children owned it, and it is not exercised by any fragment
+  `jsonSchema<T>()` emits today). `std/json` has
+  no knowledge of what `@minLen`/`@max`/etc. (`pkg/web`'s own rules, this
+  file's "validate.bit" material) mean, and cannot depend on `pkg/web` to
+  find out. The design a field carrying attributes should get is an
   `"x-bit-attrs"` entry on its own fragment - JSON Schema and OpenAPI both
   reserve the `x-` prefix for vendor extensions a validator that does not
   recognise them ignores rather than rejects (OpenAPI 3.1's own
   `specification-extensions` pattern is exactly `^x-`) - naming each
   attribute and its constant arguments in the same source-spelling `@table`
-  above already records them in. `pkg/web` maps its own attributes out of
-  this into native schema keywords (`@minLen(3)` into `minLength: 3`) and
-  strips the rest before a document is served; the mapping itself is
+  above already records them in. `pkg/web` would map its own attributes out
+  of this into native schema keywords (`@minLen(3)` into `minLength: 3`)
+  and strip the rest before a document is served; the mapping itself is
   `pkg/web`'s, not `std/json`'s, and is specified where it is implemented.
 
 **`@table` - synthesizing `tableDescriptor`.**
