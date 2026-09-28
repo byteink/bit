@@ -1,0 +1,218 @@
+// compiler/optappendborrow.bit — #6209: which function parameters only
+// BORROW the slice header a caller passes, so optappendown.bit's rule 4 may
+// count a call handing a member to one as a header read, not an escape.
+//
+// THE QUESTION. `if (flowKeyPresent(entries, key))` before `entries =
+// append(entries, e)` hands the accumulator's header to a callee. After the
+// call returns, the header has a second holder only if the callee left one
+// behind: stored it (a field, element, map, global), returned it, captured
+// it in a closure or `defer`, handed it to a thread, or passed it to code
+// that did. The callee's frame, and every SSA value in it, is gone before
+// the caller's next append runs.
+//
+// THE RULE. A parameter borrows when every use of it, and of every block
+// parameter it is passed into through `jump`/`br` arguments, is a header
+// read (`slice_len`, `field_get`, `keep_alive`, the receiver of
+// `slice_get`/`slice_set`) or a direct `call` argument in a position that
+// itself borrows. The last clause is recursive, so the answer is the
+// greatest fixpoint: every parameter starts borrowed and one that reaches a
+// non-borrowing position is knocked out, until a round knocks out nothing.
+// An append on the parameter, a `call_value`/`call_iface` argument, a
+// store, a `ret`, a `br` condition, anything unlisted: not borrowed. A call
+// whose callee is not one of the module's functions, whose name two
+// functions share, or whose argument count is not the callee's parameter
+// count borrows nothing.
+
+// `base[name]` is one plus the first slot of `name`'s parameters in `ok`,
+// -1 when two functions share the name; `arity[name]` their count. Slot
+// `depFrom[i]` borrows only if slot `depTo[i]` does.
+class Borrow {
+  base: map<string, int>,
+  arity: map<string, int>,
+  ok: []bool,
+  depFrom: []int,
+  depTo: []int,
+}
+
+// Slots for every function's parameters, each borrowed until a scan or the
+// fixpoint knocks it out.
+fn borrowNew(funcs: []IrFunc): Borrow {
+  let b = Borrow{
+    base = map<string, int>(), arity = map<string, int>(), ok = []bool(0),
+    depFrom = []int(0), depTo = []int(0),
+  }
+  for f of funcs {
+    borrowSlots(b, f)
+  }
+  return b
+}
+
+fn borrowSlots(b: Borrow, f: IrFunc) {
+  if (b.base[f.name] != 0) {
+    b.base[f.name] = -1
+    return
+  }
+  let n = 0
+  if (len(f.blocks) > 0) {
+    n = f.blocks[0].paramCount
+  }
+  b.base[f.name] = len(b.ok) + 1
+  b.arity[f.name] = n
+  let k = 0
+  while (k < n) {
+    b.ok = append(b.ok, true)
+    k = k + 1
+  }
+}
+
+// Whether every position `m` fills in call `ins` borrows.
+fn borrowedArg(b: Borrow, ins: IrInstr, m: int): bool {
+  let base = b.base[ins.name]
+  if (ins.op != Op.Call || base <= 0 || b.arity[ins.name] != len(ins.args)) {
+    return false
+  }
+  let k = 0
+  while (k < len(ins.args)) {
+    if (ins.args[k] == m && !b.ok[base - 1 + k]) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// One parameter's walk: `seen[v]` is `slot + 1` once `v` is queued for
+// slot `slot`, so each value enters `work` at most once per parameter.
+class BorrowWalk {
+  o: OwnFn,
+  seen: []int,
+  work: []int,
+  slot: int,
+}
+
+// Scans `o.f`'s own parameters, knocking out each that fails the rule
+// locally and recording the call positions each one depends on.
+fn borrowScanFunc(b: Borrow, o: OwnFn) {
+  let base = b.base[o.f.name]
+  if (base <= 0 || len(o.f.blocks) == 0) {
+    return
+  }
+  let w = BorrowWalk{ o = o, seen = []int(len(o.f.instrs)), work = []int(0), slot = 0 }
+  let k = 0
+  while (k < o.f.blocks[0].paramCount) {
+    w.slot = base - 1 + k
+    if (!borrowParam(b, w, o.f.blocks[0].instsStart + k)) {
+      b.ok[w.slot] = false
+    }
+    k = k + 1
+  }
+}
+
+// Walks parameter `p` and every block parameter it flows into.
+fn borrowParam(b: Borrow, w: BorrowWalk, p: int): bool {
+  w.work = [p]
+  w.seen[p] = w.slot + 1
+  let i = 0
+  while (i < len(w.work)) {
+    let v = w.work[i]
+    let u = w.o.useStart[v]
+    while (u < w.o.useStart[v + 1]) {
+      let at = w.o.useList[u]
+      if (!borrowUse(b, w.o.f.instrs[at], v, w.slot)) {
+        return false
+      }
+      borrowFlow(w, w.o.f.instrs[at], v)
+      u = u + 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether use `ins` of `v` keeps slot `slot` borrowed. A call records its
+// dependency; a `jump`/`br` argument is followed by `borrowFlow`.
+fn borrowUse(b: Borrow, ins: IrInstr, v: int, slot: int): bool {
+  if (ins.op == Op.Jump) {
+    return true
+  }
+  if (ins.op == Op.Br) {
+    return ins.lhs != v
+  }
+  if (ins.op == Op.Call) {
+    return borrowDep(b, ins, v, slot)
+  }
+  if (ins.op == Op.SliceLen || ins.op == Op.FieldGet || ins.op == Op.KeepAlive) {
+    return true
+  }
+  let elem = ins.op == Op.RtCall && (ins.name == "slice_get" || ins.name == "slice_set")
+  return elem && ownOnlyReceiver(ins.args, v)
+}
+
+// Records that `slot` borrows only if every callee position `v` fills does.
+fn borrowDep(b: Borrow, ins: IrInstr, v: int, slot: int): bool {
+  let base = b.base[ins.name]
+  if (base <= 0 || b.arity[ins.name] != len(ins.args)) {
+    return false
+  }
+  let k = 0
+  while (k < len(ins.args)) {
+    if (ins.args[k] == v) {
+      b.depFrom = append(b.depFrom, slot)
+      b.depTo = append(b.depTo, base - 1 + k)
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// Queues every block parameter a `jump`/`br` binds `v` to.
+fn borrowFlow(w: BorrowWalk, ins: IrInstr, v: int) {
+  if (ins.op == Op.Jump) {
+    borrowBind(w, ins.args, ins.ival, v)
+  }
+  if (ins.op == Op.Br) {
+    borrowBind(w, ins.thenArgs, ins.ival, v)
+    borrowBind(w, ins.elseArgs, ins.ival2, v)
+  }
+}
+
+fn borrowBind(w: BorrowWalk, args: []int, target: int, v: int) {
+  let blk = w.o.f.blocks[target]
+  let k = 0
+  while (k < len(args) && k < blk.paramCount) {
+    let q = blk.instsStart + k
+    if (args[k] == v && w.seen[q] != w.slot + 1) {
+      w.seen[q] = w.slot + 1
+      w.work = append(w.work, q)
+    }
+    k = k + 1
+  }
+}
+
+// The greatest fixpoint: each round that changes anything knocks out at
+// least one slot, so `len(ok) + 1` rounds always reach a round that
+// changes nothing. Past it every slot is knocked out rather than trusted.
+fn borrowSolve(b: Borrow) {
+  let changed = true
+  let round = 0
+  while (changed && round <= len(b.ok)) {
+    changed = false
+    let i = 0
+    while (i < len(b.depFrom)) {
+      if (b.ok[b.depFrom[i]] && !b.ok[b.depTo[i]]) {
+        b.ok[b.depFrom[i]] = false
+        changed = true
+      }
+      i = i + 1
+    }
+    round = round + 1
+  }
+  if (!changed) {
+    return
+  }
+  let s = 0
+  while (s < len(b.ok)) {
+    b.ok[s] = false
+    s = s + 1
+  }
+}
