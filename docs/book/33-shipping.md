@@ -127,5 +127,5 @@ tool from Parts 1 through 3, and the web server from Part 4, cross-compiled
 for whatever machine runs them and, for the server, wrapped in an image with
 nothing in it beyond that one file.
 
-Previous: [Making it fast](33-making-it-fast.md). This closes [the Bit
+Previous: [Making it fast](32-making-it-fast.md). This closes [the Bit
 Book](README.md).

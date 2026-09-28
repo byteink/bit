@@ -75,9 +75,9 @@ up.
 Inkwell is a real program now. The last part makes it fast, observable, and
 easy to ship.
 
-31. Background jobs - `pkg/jobs`: `@job`, `register<T>`, `enqueue<T>`, retries.
-32. Making it fast - measure first, `BIT_GC_STATS`, `std/prof`, fixing one real hot spot.
-33. Shipping - one binary, cross-compiling for Linux, macOS and Windows.
+31. [Background jobs](31-background-jobs.md)
+32. [Making it fast](32-making-it-fast.md)
+33. [Shipping](33-shipping.md)
 
 ## Where things are defined
 
