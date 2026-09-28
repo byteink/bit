@@ -1,0 +1,160 @@
+// backup.bit — an encrypted, integrity-checked backup of every draft's id
+// and body, plus a compressed cold-storage export (docs/book/13-backups.md).
+
+import { crc32c } from "std/hash"
+import { argon2id, newGcm, randomBytes } from "std/crypto"
+import { gzip } from "std/compress"
+
+// The salt Argon2id needs, in bytes - 16 is comfortably above its own
+// 8-byte minimum.
+const kdfSaltLen: int = 16
+
+// Argon2id parameters for turning a backup passphrase into an AES-256 key:
+// the same time/memory cost `std/crypto`'s own password-hashing guide uses,
+// since a backup key deserves the same resistance to guessing as a login.
+fn deriveKey(passphrase: string, salt: []byte): []byte {
+  return argon2id([]byte(passphrase), salt, []byte(0), []byte(0), 3, 65536, 1, 32)
+}
+
+// Appends `s` as a 4-byte big-endian length followed by its bytes.
+fn appendLenPrefixed(dst: []byte, s: string): []byte {
+  let n = len(s)
+  dst = append(dst, byte((n >> 24) & 0xff))
+  dst = append(dst, byte((n >> 16) & 0xff))
+  dst = append(dst, byte((n >> 8) & 0xff))
+  dst = append(dst, byte(n & 0xff))
+  dst = append(dst, s)
+  return dst
+}
+
+// Reads one length-prefixed string starting at `pos`, returning it and the
+// position just past it. Every length is checked against `len(data)` before
+// it is trusted, the same discipline `std/tz`'s own blob reader uses.
+fn readLenPrefixed(data: []byte, pos: int): (string, int)! {
+  if (pos + 4 > len(data)) {
+    fail newError("backup: truncated length")
+  }
+  let n = (int(data[pos]) << 24) |
+    (int(data[pos + 1]) << 16) |
+    (int(data[pos + 2]) << 8) |
+    int(data[pos + 3])
+  let start = pos + 4
+  if (n < 0 || start + n > len(data)) {
+    fail newError("backup: truncated field")
+  }
+  return (string(data[start:start + n]), start + n)
+}
+
+// Serializes every draft's id and body into one buffer: each as a pair of
+// length-prefixed strings, in order. Extending this to title, tags and
+// status is the same pattern, one more `appendLenPrefixed` call.
+export fn serializeDrafts(drafts: []Draft): []byte {
+  let out = []byte(0)
+  for d of drafts {
+    out = appendLenPrefixed(out, d.id)
+    out = appendLenPrefixed(out, d.body)
+  }
+  return out
+}
+
+// The inverse of `serializeDrafts`. Each recovered draft has only its id and
+// body set; the fields `serializeDrafts` did not back up come back zeroed.
+export fn deserializeDrafts(data: []byte): []Draft! {
+  let out = []Draft(0)
+  let pos = 0
+  while (pos < len(data)) {
+    let (id, afterId) = readLenPrefixed(data, pos)?
+    let (body, afterBody) = readLenPrefixed(data, afterId)?
+    out = append(
+      out,
+      Draft{
+        id = id,
+        title = "",
+        body = body,
+        tags = []string(0),
+        status = Status.Draft,
+        created = 0,
+        updated = 0,
+      },
+    )
+    pos = afterBody
+  }
+  return out
+}
+
+// Encrypts every draft into a backup blob: a 4-byte big-endian CRC-32C of
+// the ciphertext (a cheap corruption check `restoreDrafts` runs before the
+// more expensive authenticated decrypt), the 12-byte nonce `seal` needs,
+// then the ciphertext itself. `key` is 16 or 32 bytes (AES-128/256-GCM) and
+// `nonce` must never repeat under the same key - see std/crypto's AES-GCM
+// section for why.
+export fn backupDrafts(drafts: []Draft, key: []byte, nonce: []byte): []byte! {
+  let cipher = newGcm(key)?
+  let ciphertext = cipher.seal(nonce, serializeDrafts(drafts), []byte(0))
+  let sum = crc32c(ciphertext)
+  let out = []byte(0)
+  out = append(out, byte((sum >> 24) & 0xff))
+  out = append(out, byte((sum >> 16) & 0xff))
+  out = append(out, byte((sum >> 8) & 0xff))
+  out = append(out, byte(sum & 0xff))
+  out = append(out, ...nonce)
+  out = append(out, ...ciphertext)
+  return out
+}
+
+// The inverse of `backupDrafts`: checks the CRC-32C first, so an obviously
+// corrupted (truncated or bit-flipped) backup fails with a clear "corrupted"
+// message rather than the AEAD's generic authentication error - then
+// verifies and decrypts with `key`, which fails on a wrong key or a
+// tampered ciphertext the checksum did not happen to catch.
+export fn restoreDrafts(blob: []byte, key: []byte): []Draft! {
+  if (len(blob) < 4 + 12) {
+    fail newError("backup: too short to be a backup")
+  }
+  let want = u32((int(blob[0]) << 24) | (int(blob[1]) << 16) | (int(blob[2]) << 8) | int(blob[3]))
+  let nonce = blob[4:16]
+  let ciphertext = blob[16:len(blob)]
+  if (crc32c(ciphertext) != want) {
+    fail newError("backup: corrupted (checksum mismatch)")
+  }
+  let cipher = newGcm(key)?
+  let plaintext = cipher.open(nonce, ciphertext, []byte(0))?
+  return deserializeDrafts(plaintext)?
+}
+
+// Backs up `drafts` under a passphrase instead of a raw key: derives a
+// fresh-salted AES-256 key with `deriveKey` and prepends that salt to
+// `backupDrafts`'s own blob, so `restoreWithPassphrase` can re-derive the
+// exact same key from the passphrase alone. This is what `ink backup` calls
+// - a raw key never appears on the command line.
+export fn backupWithPassphrase(drafts: []Draft, passphrase: string): []byte! {
+  let salt = randomBytes(kdfSaltLen)
+  let key = deriveKey(passphrase, salt)
+  let nonce = randomBytes(12)
+  let out = []byte(0)
+  out = append(out, ...salt)
+  out = append(out, ...backupDrafts(drafts, key, nonce)?)
+  return out
+}
+
+// The inverse of `backupWithPassphrase`: reads the salt back off the front
+// of `blob`, re-derives the same key from `passphrase`, and hands the rest
+// to `restoreDrafts`.
+export fn restoreWithPassphrase(blob: []byte, passphrase: string): []Draft! {
+  if (len(blob) < kdfSaltLen) {
+    fail newError("backup: too short to contain a salt")
+  }
+  let salt = blob[0:kdfSaltLen]
+  let key = deriveKey(passphrase, salt)
+  return restoreDrafts(blob[kdfSaltLen:len(blob)], key)?
+}
+
+// A compressed cold-storage export of every draft's id and body - not
+// something `restoreDrafts` reads back. `std/compress` only encodes
+// (docs/stdlib/compress.md), so getting this back to bytes needs a standard
+// gzip tool (`gzip -d`) outside Inkwell, the same way `std/compress`'s own docs
+// describe it. Use it to archive a copy outside the encrypted backup, not
+// as a second way to restore.
+export fn exportCompressed(drafts: []Draft): []byte! {
+  return gzip(serializeDrafts(drafts), 6)?
+}
