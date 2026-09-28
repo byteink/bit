@@ -1,0 +1,145 @@
+// pkg/auth/oidc_public_seam.test.bit — #6150's acceptance: a downstream
+// application's own test file (a different module, importing "auth") can
+// drive its REAL callback route — the exact `handleCallback(s, c)` call
+// production code makes, no separate test-only function — against a fake,
+// in-process provider, with zero real network calls.
+//
+// INKWELL-SHAPED (#6150, revised): the route below is written the way
+// `pkg/auth/docs/oidc.md`'s "Sign in with Google" chapter documents one -
+// `app.get("/auth/google", (c) => beginAuthorization(s, c))` and
+// `app.get("/auth/google/callback", (c) => handleCallback(s, c)?)` - and
+// this file registers that SAME code both here and in the (hypothetical)
+// production app; only how `s` is built differs. The seam lives on the
+// value: `s.tokenFetch` (`OidcStrategy`, oidc_authorize.bit) is the fake
+// token-exchange POST, and `s.jwks` is built by `newJwksCacheFromJwks`
+// (oidc_discovery.bit) from an already-parsed `Jwks` - no HTTP call, real
+// or local, needed to stand up the fake provider's key set.
+//
+// `verifyIdToken`'s checks are NOT bypassed: the fake ID token below is a
+// real HMAC-signed JWT (`signIdToken`, oidc_verify.test.bit) that must
+// carry the right `iss`/`aud`/`nonce`/`exp` or the round trip fails exactly
+// as a live provider's malformed token would.
+//
+// `App`, `Config`, `MemoryStore` (middleware.test.bit's import of "web");
+// `authReq` (oidc_authorize.test.bit); `tlsStub` (oidc_discovery.test.bit);
+// `parseJwks` (std/jwt, bound by oidc_discovery.bit); `testKid`,
+// `testJwksBody`, `signIdToken` (oidc_verify.test.bit); `stateSessionKey`,
+// `nonceSessionKey` (oidc_authorize.bit); `split` (std/strings, bound by
+// oidc_verify.bit); `now`, `Second` (std/time, bound by oidc_callback.bit)
+// are all already bound module-wide (an import binds per MODULE, SPEC
+// §17.1); nothing here is new to the module.
+
+const seamIssuer = "https://seam-fake-provider.example.com"
+const seamClientId = "seam-downstream-client"
+const seamRedirectUri = "https://app.example.com/auth/seam/callback"
+
+// Builds the strategy the way a downstream app's own test builds a fake
+// stand-in for `googleStrategy(...)`: `OidcConfig` is a plain data literal
+// (every field already exported, no discovery round trip needed once the
+// values are known), `newJwksCacheFromJwks` wraps an already-parsed `Jwks`
+// with NO network call, and `tokenFetch` carries the fake token-exchange
+// POST. Everything downstream of this - `beginAuthorization`, `handleCallback`
+// - is the unmodified production function.
+fn seamStrategy(box: SeamTokenBox): OidcStrategy! {
+  let tls = tlsStub()
+  let config = OidcConfig{
+    issuer = seamIssuer,
+    authorizationEndpoint = seamIssuer + "/authorize",
+    tokenEndpoint = seamIssuer + "/token",
+    jwksUri = seamIssuer + "/jwks",
+  }
+  let jwks = parseJwks(testJwksBody())?
+  let cache = newJwksCacheFromJwks(config.jwksUri, tls, jwks, nil)
+  return OidcStrategy{
+    config = config,
+    clientId = seamClientId,
+    clientSecret = "seam-client-secret",
+    redirectUri = seamRedirectUri,
+    jwks = cache,
+    scopes = ["openid"],
+    tokenFetch = seamTokenFetch(box),
+  }
+}
+
+// The token endpoint double a downstream test writes itself: answers
+// `box.token` as the `id_token`, counting calls so a test can prove the
+// state-mismatch/missing-verifier paths never reach it, same as
+// `oidc_callback.test.bit`'s own `TokenCallBox`.
+class SeamTokenBox {
+  calls: int,
+  token: string,
+}
+
+fn seamTokenFetch(box: SeamTokenBox): TokenFetch {
+  let f: TokenFetch = (url, headers, body) => {
+    box.calls = box.calls + 1
+    return "{\"id_token\":\"" + box.token + "\"}"
+  }
+  return f
+}
+
+fn seamIdTokenPayload(nonce: string): Json {
+  let nowSeconds = now().ns / Second
+  return Json.JsonObject(
+    [
+      JsonEntry{ key = "iss", value = Json.JsonString(seamIssuer) },
+      JsonEntry{ key = "aud", value = Json.JsonString(seamClientId) },
+      JsonEntry{ key = "sub", value = Json.JsonString("seam-user-1") },
+      JsonEntry{ key = "exp", value = Json.JsonInt(i64(nowSeconds + 3600)) },
+      JsonEntry{ key = "iat", value = Json.JsonInt(i64(nowSeconds - 10)) },
+      JsonEntry{ key = "nonce", value = Json.JsonString(nonce) },
+    ],
+  )
+}
+
+fn seamIdToken(nonce: string): string {
+  return signIdToken(testKid, seamIdTokenPayload(nonce))
+}
+
+// The downstream app's real routes, byte-for-byte what it would register in
+// production: `beginAuthorization(s, c)` and `handleCallback(s, c)`, no
+// test-only variant of either. `/session` exists only so this test can read
+// back the nonce the real browser round trip would carry.
+fn seamApp(s: OidcStrategy): App {
+  let app = App(Config{ secret = "seam-secret", sessions = MemoryStore(1000) })
+  app.get("/begin", (c) => {
+    return beginAuthorization(s, c)
+  })
+  app.get("/session", (c) => {
+    let session = c.session() catch e {
+      panic("session: ${e.message()}")
+    }
+    return c.text(session.get(stateSessionKey) + "|" + session.get(nonceSessionKey))
+  })
+  app.get("/callback", (c) => {
+    let identity = handleCallback(s, c)?
+    return c.text(identity.id)
+  })
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+test "a downstream app's real route (handleCallback, unmodified) authenticates against a fake provider, no real network" {
+  let box = SeamTokenBox{ calls = 0, token = "" }
+  let s = seamStrategy(box) catch e {
+    panic("seamStrategy: ${e.message()}")
+  }
+  let app = seamApp(s)
+
+  let begin = app.handle(authReq("/begin", ""))
+  assert(begin.status == 302, "want a 302 redirect from beginAuthorization, got ${begin.status}")
+  let cookie = begin.getHeader("Set-Cookie")
+
+  let stored = split(app.handle(authReq("/session", cookie)).body, "|")
+  let state = stored[0]
+  let nonce = stored[1]
+  box.token = seamIdToken(nonce)
+
+  let query = "code=seam-auth-code&state=" + state
+  let res = app.handle(authReq("/callback?" + query, cookie))
+  assert(res.status == 200, "want 200 from the callback, got ${res.status}: ${res.body}")
+  assert(res.body == "seam-user-1", "want the verified token's sub, got '${res.body}'")
+  assert(box.calls == 1, "want exactly one fake token-endpoint call, got ${box.calls}")
+}
