@@ -1,10 +1,9 @@
 # std/json
 
-The `Json` value: a sum type over the seven shapes RFC 8259 section 3 defines, plus
-`JsonEntry`, one object key/value pair. This is the primitive the rest of the
-json module - parser, encoder - builds on. Nothing here parses or
-encodes JSON text; these are pure constructors and accessors over an
-already-built `Json` value.
+`Json` holds one JSON value - a null, a bool, a number, a string, an array, or
+an object - and `JsonEntry` holds one object key/value pair. Reach for these
+two types whenever you build or inspect JSON data by hand; the parser and
+encoder further down turn them into and out of text.
 
 `JsonObject` is `[]JsonEntry`, not `map<string, Json>`: it keeps entries in
 source order and allows duplicate keys, both of which a `map` would erase.
@@ -133,8 +132,10 @@ pathologically deep input yields `Invalid` instead of a stack overflow.
 Tokens carry raw byte spans, not decoded values: a `StringTok` spans the
 source including its quotes with escapes left raw, and a `NumberTok` spans
 the literal exactly as written. Decoding and numeric-grammar validation are
-the parser task's job, not this layer's - so a later CST layer can echo an
-untouched literal back byte-for-byte.
+the parser's job, not the lexer's - so the comment-preserving editor below
+(the "CST", short for concrete syntax tree - the parsed document with every
+byte, including comments and spacing, still attached) can echo an untouched
+literal back byte-for-byte.
 
 ### `TokenKind`
 
@@ -194,15 +195,16 @@ fn lastWins(): i64 {
 
 ## Encoding
 
-The plain-value encoder: serializes a `Json` tree to text. No trivia, no
-comments - the CST printer the edit layer needs is a separate, later task.
+The plain-value encoder: serializes a `Json` tree to text. It writes only
+the value, never a comment - for that, see [Printing the CST](#printing-the-cst)
+below.
 
 ### `jsonEncode(j: Json): string`
 
 Compact form: no whitespace, `,`/`:` with no padding. Keys and strings are
-JSON-escaped per RFC 8259 section 7 (`"`, `\`, and control bytes < 0x20 - `\n`, `\t`,
-`\r`, `\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes
-`>= 0x20` pass through as-is, since JSON strings are UTF-8.
+JSON-escaped (`"`, `\`, and control bytes below `0x20` - `\n`, `\t`, `\r`,
+`\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes `>=
+0x20` pass through as-is, since JSON strings are UTF-8.
 
 A `JsonFloat` is formatted so that `jsonParse(jsonEncode(j))` always
 reproduces `j`, or - for the one shape JSON cannot represent - still
@@ -444,7 +446,7 @@ A container's `gaps` holds one verbatim raw-text boundary per child plus one:
 text after the last child, before the closing `}`/`]` (including an optional
 trailing comma). `gaps[i]` is `Option<string>.None` only for an entry
 appended by `cstSetString` after the original parse - there is no original
-formatting to echo; `cstPrint` (below) synthesizes it from the preceding
+formatting to echo; `cstPrint` (below) builds it from the preceding
 sibling's own indentation instead of guessing a hardcoded style. Every gap
 `cstParse` produces is `Some`.
 
@@ -541,7 +543,7 @@ Sets the string value at `path` to `value` (JSON-quoted and escaped). If
 replaced - that entry's `keyText` and the value's own `Trivia` are untouched.
 If the final key is absent but its parent object exists, a new `CstEntry` is
 appended with no comment invented; the gap immediately before it is `None`,
-so `cstPrint` synthesizes formatting for it from the preceding sibling's own
+so `cstPrint` builds formatting for it from the preceding sibling's own
 indentation rather than a hardcoded style. Fails if the existing value at the
 final key isn't a `CstString`, or any intermediate segment doesn't resolve
 to a `CstObject` - this function never creates an intermediate object.
@@ -646,7 +648,7 @@ captured all of that as opaque raw text instead of decoding it; printing an
 untouched subtree is concatenation, never re-encoding. For a value
 `cstSetString` replaced, the fresh `rawText` takes the old one's place with
 everything else around it unchanged. For an entry `cstSetString` appended,
-`cstPrint` synthesizes its one new line (`,` + a newline + indentation) by
+`cstPrint` builds its one new line (`,` + a newline + indentation) by
 reading the indentation off the immediately preceding sibling's own gap,
 rather than a hardcoded style.
 
@@ -713,16 +715,15 @@ fn cstToJsonExample(): i64 {
 
 ## Typed decoding
 
-`jsonDecode<T>` turns a `Json` into a class carrying `@json` (SPEC section 10.5) --
-the reading half of the `toJson()` that mark synthesises. The compiler
-specialises it per call from the same field list and the same key rules, so
-the two halves agree by construction rather than by review.
+`jsonDecode<T>` turns a `Json` into a class marked `@json` - the same mark
+that gives the class its `toJson()` method. The compiler generates matching
+decode and encode code from the same field list, so the two always agree;
+there is no separate encoder to keep in sync by hand.
 
-There are two entry points and the difference between them is measured, not
-stylistic. `jsonDecode<T>` takes a `Json`, so the DOM is built and the class
-objects are added on top of it; `jsonDecodeText<T>` takes the TEXT and drives
-the parser's cursor straight into the fields, so no `Json` exists at any
-point. On 50,000 records of `{"id":N,"name":"userN","active":true,"tags":
+There are two entry points, and the difference is speed, not style.
+`jsonDecode<T>` takes an already-parsed `Json` value and builds the class on
+top of it. `jsonDecodeText<T>` takes raw JSON text and reads the fields
+straight off it, with no `Json` value built at any point. On 50,000 records of `{"id":N,"name":"userN","active":true,"tags":
 [1,2,3]}`, objects allocated per record: `jsonParse` alone 25.0, `jsonParse` +
 `jsonDecode` 45.0, `jsonDecodeText` **6.0**.
 
@@ -770,8 +771,8 @@ producer that omits the key instead is just as well-formed.
 
 ### `jsonSchema<T>(): Json`
 
-A JSON Schema 2020-12 document describing `T`, specialised per instantiation
-exactly as `jsonDecode<T>` is above. `T` must carry `@json`; anything else is
+A JSON Schema 2020-12 document describing `T`, generated fresh for each `T`
+you call it with, the same way `jsonDecode<T>` above is. `T` must carry `@json`; anything else is
 a compile error (`E0173`) naming the type and the mark, never a runtime
 failure.
 
@@ -836,14 +837,14 @@ against a later version of itself. **Do not make it the default.** A dropped
 field and an accepted one are indistinguishable to whoever sent the document,
 which is why `jsonDecode` is the one you get by writing the shorter name.
 
-It is one decode, not a retry: the key set lives inside the specialised
-decoder, so skipping a key costs a branch rather than a second pass over the
-document. `pkg/web`'s `Unknown.Ignore` policy routes through it.
+It is one decode, not a retry: the key set is built into the generated
+decoder, so skipping an unknown key costs one branch, not a second pass over
+the document. `pkg/web`'s `Unknown.Ignore` policy routes through it.
 
 ### `jsonDecodeText<T>(src: string): T!`
 
 Decodes the JSON text `src` into `T`, which must be a class carrying `@json`,
-**without building a `Json`**. Specialised per call exactly as `jsonDecode<T>`
+**without building a `Json`**. Generated per call exactly as `jsonDecode<T>`
 is, from the same field list and the same key rules, and refusing a `T` that
 does not carry `@json` at compile time (`E0145`).
 
@@ -907,11 +908,11 @@ applied to a document: `jsonDecode` takes a value, and one built in code never
 went through a parser. It matters most off the main thread, where a spawned
 stack is far smaller.
 
-## Decoding primitives
+## Decoding building blocks
 
-The named functions the compiler's synthesised decoder is written in terms of.
+The named functions the compiler's generated decoder is written in terms of.
 They are exported because the generated code lives in the caller's module and
-calls them by name -- and they are a usable API in their own right for a
+calls them by name - and they are a usable API in their own right for a
 hand-written decoder over a shape `@json` does not cover. Each takes the
 `path` of the value it is looking at, so the error it raises names the field
 rather than the shape.
@@ -921,7 +922,7 @@ path)` takes a path that is already built; `jsonDecStringKey(j, path, key)`
 and `jsonDecStringIndex(j, path, i)` take the CONTAINING value's path plus the
 one step to this one, and join them with `jsonDecPath`/`jsonDecIndex` only
 inside the failure. The join allocates and only an error message reads it, so
-the synthesised decoder calls the two-part forms everywhere and a document
+the generated decoder calls the two-part forms everywhere and a document
 with no errors builds no path strings at all. Use whichever form matches what
 you are holding; they raise the identical error.
 
@@ -1022,7 +1023,7 @@ The same, for element `i` of the array at `path`. Builds
 ### `jsonDecEnumKey(j: Json, path: string, key: string, allowed: []string): string!`
 
 The variant name string at `key` of the object at `path`, for a payload-free
-`enum` field the compiler's synthesised `jsonDecode<T>` reaches. Decodes
+`enum` field the compiler's generated `jsonDecode<T>` reaches. Decodes
 through `jsonDecStringKey`, then rejects any value not in `allowed` (the
 class's own declared variant names) with the same `TypeMismatch` shape every
 other mismatch takes -- `expected` names every allowed variant, `found` the
@@ -1044,10 +1045,10 @@ The entries of a `map<string, T>` field's object. Distinct from
 `jsonDecObject` only in the caller's intent -- a map has no known key set, so
 nothing checks its keys against one.
 
-## Text-decoding primitives
+## Text-decoding building blocks
 
-The named functions the compiler's synthesised **text** decoder is written in
-terms of, exported for the same reason the DOM ones are: the generated code
+The named functions the compiler's generated **text** decoder is written in
+terms of, exported for the same reason as the ones above: the generated code
 lives in the caller's module and calls them by name. They are also a usable API
 for a hand-written streaming decoder over a shape `@json` does not cover.
 

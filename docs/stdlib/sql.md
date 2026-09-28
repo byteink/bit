@@ -1,13 +1,12 @@
 # std/sql
 
-The database driver contract. Two drivers exist today, `bit/pkg/postgres` and
-`bit/pkg/mysql` - see "The freeze" below for what building both proved.
-Neither talks to `std/sql` through the `Driver`/`Registry` pair this page
-opens with; both ship their own `Adapter` instead (`Datasource` and `Adapter`
-are documented under "The connection pool"). Shipping the contract from
-stdlib rather than as a package is still deliberate: a contract shipped as a
-package invites a second, competing one, and every driver ends up picking a
-side. Go's `database/sql` is the shape this follows.
+The database driver contract: the types a SQL driver and the code that uses
+it both build on, so swapping one database for another costs one import
+line, not a rewrite. It lives in the standard library rather than a package
+on purpose - a contract shipped as a package invites a competing one, and
+every driver ends up picking a side. Reach for this module through a driver
+package like `pkg/postgres` or `pkg/mysql`, not directly - see
+[Writing a driver](#writing-a-driver) below for how those fit together.
 
 **The only way to supply a value is `params []Value`.** `query`/`exec` take
 the literal SQL text and an ordered list of typed `Value`s as two separate
@@ -33,7 +32,7 @@ import { Registry, newRegistry } from "std/sql"
 
 ### `Value`
 
-A sum type over the wire types every driver must be able to carry: `Null` is
+One of six wire values every driver must be able to carry: `Null` is
 SQL NULL, `Int`/`Float`/`Bool`/`Text`/`Blob` cover every scalar column type a
 driver maps its own types onto. `Bool` exists for a database with a native
 boolean wire type (Postgres); a database with none (MySQL's `TINYINT(1)`,
@@ -161,12 +160,11 @@ calls, and fails every call once that block has returned.
 
 ### `Registry`
 
-The driver registry a program builds once and shares. Go's
-`sql.Register`/`sql.Open` write into one process-wide map, relying on an
-import-time init hook to run the registration side effect; Bit has neither
-that hook nor (SPEC section 11.11) a way for module-level state to hold a `map` or
-an `interface` value, so a real package-level singleton is not expressible.
-`Registry` is the explicit alternative already used elsewhere in stdlib for
+The driver registry a program builds once and shares. Bit has no import-time
+init hook and a module-level variable cannot hold a `map` or an interface
+value, so a hidden process-wide registry the way some other languages do it
+is not possible here. `Registry` is the explicit alternative already used
+elsewhere in stdlib for
 shared, mutable, driver-style state (see `TlsTicketStore` in
 [tls](tls.md)): build one with `newRegistry()`, have every driver's setup
 code call `register` on it, and pass it to `open` wherever a connection is
@@ -214,27 +212,21 @@ fn firstName(conn: Conn, id: string): string! {
 }
 ```
 
-## The freeze
+## Writing a driver
 
-`bit/pkg/postgres` and `bit/pkg/mysql` were built
-together, deliberately, to answer one question: is `std/sql`'s contract
-actually driver-agnostic, or does building the first driver quietly bend it
-to fit? Postgres landed first. MySQL was explicitly free to change `Value`,
-`Driver`, `Conn`, `Rows`, `Stmt`, `Tx` or `Registry` if it needed to. This is
-the record of what it actually needed, checked against the real history
-rather than against what either driver was expected to need - and, now that
-both have shipped, the point at which these seven names stop moving.
+Two drivers exist today: `pkg/postgres` and `pkg/mysql`. Neither implements
+`Driver`/`Registry` directly - both plug into the pool through their own
+`Adapter` (documented under [The connection pool](#the-connection-pool)
+below); `Driver` and `Registry` are for a driver that registers itself by
+name instead.
 
-### Proving the swap is one line
-
-The design's whole claim is that switching database costs one import line.
-Here it is checked directly rather than asserted: the same tiny handler,
-built once against each driver.
+Switching the database a program talks to costs one import line: the same
+handler compiles against `pkg/postgres` and `pkg/mysql` with nothing changed
+except which adapter it imports.
 
 ```bit ignore
-// pkg/postgres version
 import { pool, Datasource, sqlReqText, Value, Pool } from "std/sql"
-import { adapter } from "postgres"
+import { adapter } from "postgres" // swap for "mysql" and nothing else changes
 import { App, Config, Ctx, Res } from "web"
 import { env } from "std/os"
 
@@ -253,179 +245,40 @@ fn main(): ()! {
 }
 ```
 
-```bit ignore
-// pkg/mysql version
-import { pool, Datasource, sqlReqText, Value, Pool } from "std/sql"
-import { adapter } from "mysql"
-import { App, Config, Ctx, Res } from "web"
-import { env } from "std/os"
+`Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and `Registry` are frozen: per
+[`docs/release/VERSIONING.md`](../release/VERSIONING.md), changing any of
+their exported shapes is at minimum a MINOR release, whether the change is
+additive or breaking. `Value` can still grow a new variant when a database
+needs one none of the others do - that is how `Bool` was added, for a
+database with a native boolean wire type - but every other type keeps its
+shape.
 
-fn userName(c: Ctx, db: Pool): Res! {
-  let rows = db.query("select name from users where id = $1", []Value{ Value.Text(c.param("id")) })?
-  defer rows.close()
-  rows.next()?
-  return c.text(sqlReqText(rows, rows.columns(), "name")?)
-}
+A `match` over `Value` with no catch-all case is a compile error, `E0071`,
+the moment a new variant is added and that call site does not handle it -
+so code that handles all six variants today gets a build failure naming the
+exact line, not a silent gap, if a seventh is ever added.
 
-fn main(): ()! {
-  let db = pool(adapter(), Datasource{ uri = env("DATABASE_URL") })?
-  let app = App(Config{ secret = env("APP_SECRET") })
-  app.get("/users/:id", (c) => userName(c, db))
-  app.listen()?
-}
-```
+### Writing a driver for a file-based database
 
-Both are fenced `ignore` here because a page checked by `test-docs` only ever
-resolves `std/*` (`_tests_/bit/docs.bit`'s own header: "against the real
-prelude and the real `std/*`"), and no gate anywhere typechecks a page that
-imports two `pkg/` packages at once - `test-package-docs` wires exactly one
-package (the one whose own `docs/` tree it is scanning) as a local
-dependency per page (`_tests_/bit/pkgdocsgate.bit`'s header). So this pair
-was checked by hand instead of by a standing gate: a scratch project per
-variant, each declaring `postgres`/`web` or `mysql`/`web` as a local-path
-dependency on this checkout's own `pkg/`, `bit check` on both (clean, exit
-0), and a mutation control - breaking the import name - failing loudly (exit
-1, `E0045`) to confirm the check was live rather than vacuous. `diff` on the
-two source files shows exactly one changed line, the import naming the
-driver package; nothing else in the handler, the route or `main` moves. This
-is a one-time hand verification, not a gate; a future change to either
-adapter's public shape is not re-checked by it automatically.
+Postgres and MySQL are both network servers with users, passwords and a TLS
+handshake, so the contract carries some assumptions that only show up once
+you target a database without a network in front of it, like SQLite:
 
-### What each interface actually did, six of six
-
-`stdlib/sql/sql.bit` - the file declaring `Value`, `Driver`, `Conn`, `Rows`,
-`Stmt`, `Tx` and `Registry` - has exactly four commits since it was created
-(`9b720102`): the creation itself, and three purely mechanical, repo-wide
-formatter sweeps (`13017a3e`'s receiver-form-to-class-body move, and
-`1e15ec44` plus its own revert `143f9e02` for the `=` `field_init` spelling).
-**No commit from either driver's own work touches this file at all.**
-Checked directly: no commit matching `mysql` or either driver's build
-touches `stdlib/sql/sql.bit`, `stdlib/sql/config.bit`
-(`Adapter`/`Datasource`) or `stdlib/sql/tx.bit` (`Executor`).
-
-| Interface | Changed by either driver | What actually happened |
-|---|---|---|
-| `Value` | Once, later | Held `{Null, Int, Float, Text, Blob}` through both drivers' own build (below); gained `Bool` afterward, when Postgres' native boolean turned out to have no `Value.Text` form the accessor rule could read - see below. |
-| `Driver` | No | Neither adapter implements it. `pkg/postgres/adapter.bit:86` and `pkg/mysql/adapter.bit:104` both export `fn adapter(): Adapter` (`config.bit`'s `Adapter`, which predates either driver), never a `Driver`. The only implementer anywhere in the tree is `stdlib/sql/sqlcheck.bit`'s `fakeDriver`, a self-test double. |
-| `Conn` | No | `pgConn` (`pkg/postgres/conn.bit:33`) and `myConn` (`pkg/mysql/conn.bit:34`) implement `query`/`exec`/`prepare`/`begin`/`close` with the exact signatures declared in 2026-08 - see "The gap the freeze found, and how it was closed," below, for `begin`'s history. |
-| `Rows` | No | `pgRows`/`myRows` implement `next`/`columns`/`value`/`close` verbatim. MySQL's `TINYINT(1)`-as-bool and JSON-as-the-field's-own-type ambiguities are resolved by which accessor the caller reaches for (`sqlReqBool` vs `sqlReqInt`, `sqlReqJson`), never by `Rows` itself. |
-| `Stmt` | No | `pgStmt`/`myStmt` implement `query`/`exec`/`close` verbatim. MySQL's `$1`-to-`?` placeholder rewrite (`pkg/mysql/rewrite.bit`) and its statement cache both run *inside* `prepare`, invisible at the `Stmt` boundary. |
-| `Tx` | No | Signature untouched. Both drivers stubbed `begin` until it was wired up - see below. |
-| `Registry` | No | Unused by both real drivers, same as `Driver`; exercised only by `sqlcheck.bit`'s fake. |
-
-**Every other interface held while both drivers were built; `Value` changed
-once, afterward.** What MySQL actually needed - the session `time_zone='+00:00'`
-pin at connect, the reversed `TIMESTAMP`/`DATETIME` mapping, its own DECIMAL
-binary format - all landed *inside* `myConn`/its codecs, never at the
-`Conn`/`Rows`/`Stmt` boundary. The rule that held through both drivers: a
-type a codec produces (`decimal`, later `Instant`, `UUID`, `Json`, arrays)
-gets a `sqlReqX`/`sqlOptX` pair in `stdlib/sql/row.bit`/`rowtypes.bit`,
-reading `Value.Text` and converting - exactly the shape `pkg/mysql`'s own
-`mysqlDecimal` had already shipped by hand before the decision was written
-down.
-
-That rule has one precondition: the codec's own wire value has to be
-reachable as `Value.Text` in the first place. Postgres' `boolean` breaks it -
-the server sends exactly `t` or `f` on the wire, but MySQL and SQLite have no
-boolean wire type of their own and were already reading that column as
-`Value.Int` zero/nonzero, so a `sqlReqBool` built the same way as `sqlReqUuid`
-would have had nothing of its own to parse. `Value` grew a `Bool(bool)`
-variant instead - the one case the accessor rule cannot absorb, added when
-it actually came up, not predicted in advance.
-
-### The gap the freeze found, and how it was closed
-
-`Conn.begin(): Tx!` was declared and implemented by both drivers when this
-freeze was written, but both bodies were an unconditional failure - the
-freeze proved the other six interfaces against real traffic while leaving
-`begin` itself unwired. That stub predated closure-scoped
-transactions, the *only* public transaction API - see
-[Transactions](#transactions)), which built `tx`/`txAt`/`txValue`/`txValueAt`
-on top of `Pool`'s own (unexported) `begin`, which in turn calls straight
-through to `Conn.begin`. So `pool.tx((db) => { ... })` could not run against
-either shipped driver at all - not a gap in the interface, a gap in both
-implementations of it. This is exactly what an interface freeze is for: it
-caught the hole and named it rather than shipping it silently.
-
-The fix (merged `f2b32c86`) closed it without moving the interface.
-`pgConn.begin()` (`pkg/postgres/conn.bit:73`) sends `BEGIN`; `myConn.begin()`
-(`pkg/mysql/conn.bit:224`) sends `START TRANSACTION`. Both return a `Tx`
-(`pgTx`/`myTx`) whose `commit` and `rollback` send `COMMIT`/`ROLLBACK` on the
-same connection (`pkg/postgres/conn.bit:113,117`;
-`pkg/mysql/conn.bit:265,269`), and both `begin` methods fail closed - a
-`transportError` naming the closed connection - before sending anything
-(`pkg/postgres/conn.bit:75`, `pkg/mysql/conn.bit:226`).
-
-Three live-container tests per driver are the acceptance for this: `pool.tx`
-commits a row that a second, independent connection can then see
-(`pkg/postgres/live.test.bit:521`, `pkg/mysql/live.test.bit:503`); `pool.tx`
-rolls back on a failure and leaves the connection usable for the next call
-(`pkg/postgres/live.test.bit:550`, `pkg/mysql/live.test.bit:532`); and
-`pool.txValue` returns the block's value once the commit has succeeded
-(`pkg/postgres/live.test.bit:584`, `pkg/mysql/live.test.bit:564`).
-
-### What a third driver breaks
-
-Postgres and MySQL are both networked servers with users, passwords and a
-TLS handshake, so building only these two hid every place the contract
-assumes that. SQLite does not:
-
-- **`Datasource.host`/`port`/`connectTimeout`.** `config.bit`'s own comment
-  on the class already flags it: *"`host`/
-  `port`/`sslmode` bake a network database assumption into the generic
-  layer. SQLite has no host and no port and would leave all three at their
-  defaults."* A SQLite adapter's `connect` would ignore three of
-  `Datasource`'s fields outright rather than reading them, which is a
-  silent gap the type system cannot flag.
-- **`SslMode`.** All five variants (`Negotiate`, `VerifyFull`, `VerifyCa`,
-  `Require`, `Disable`) describe a TLS negotiation against a server socket.
-  SQLite opens a local file; there is no handshake to negotiate, so a
-  SQLite `Adapter.connect` has no correct answer for a caller who sets
-  `sslmode=verify-full` beyond refusing it outright.
-- **`Pool`'s concurrency model.** `Datasource.maxOpen` defaults to 10
-  because a *server* arbitrates many physical connections concurrently
-  (`config.bit`'s own HikariCP citation). SQLite locks at the database
-  file, not per-connection, so a pool of ten connections against one
-  SQLite file mostly serializes on `SQLITE_BUSY` rather than gaining the
-  concurrency the default was sized for - the pool would need a
-  fundamentally different policy (a single writer, or busy-retry with
-  backoff), not just a smaller number.
-- **`FatalError`.** The marker exists so `Pool` can tell a dead *transport*
-  (a dropped socket, a short read) from an ordinary statement failure and
-  discard only the former. SQLite has no transport to drop; its
-  connection-poisoning failure modes - a corrupted file, a lock that never
-  clears - are a different class this interface was never shaped to name.
-
-### The freeze itself
-
-`Value`, `Driver`, `Conn`, `Rows`, `Stmt`, `Tx` and `Registry` are frozen in
-the sense [`docs/release/VERSIONING.md`](../release/VERSIONING.md) gives
-that word: changing any of their exported shapes is a stdlib API change
-under surface 3, at minimum a MINOR bump (MAJOR is pinned at 0 pre-1.0)
-whether the change is additive or breaking - never a change that ships
-quietly. It is not a promise that `Value` stops at six variants forever - the
-`Bool` variant above is proof it does not, on the one condition the section
-above names: the accessor rule cannot reach the wire type any other way.
-
-What keeps that from being a moving target every driver has to re-guess is
-`match`'s own exhaustiveness (SPEC section 13.8): a `match (v)` over `Value` with no
-trailing `_` is a compile error, `E0071`, the moment a variant is added and
-that call site does not name it. `Value`'s decoders and every driver's own
-encoders fall into two shapes on purpose, and only one of them needed to
-change. A type-specific accessor - `asText`, `sqlReqDecimal`, `sqlReqUuid`,
-`asBool` itself - already ends in `_ => fail ...`: it wants exactly one
-variant and rejects every other one the same way, so a new variant needs
-nothing from it; it fails the identical `TypeMismatch` it always would have.
-The functions that describe `Value` itself - `sqlValueKind`, every driver's
-own encoder (`paramType`/`paramData`, `bindParam`) - name every variant with
-no trailing `_`, because there is no single right answer for a variant those
-functions do not yet know about. Adding `Bool` only had to touch the second
-shape: a search for every place that read a `Value` found every candidate
-site, and `E0071` caught the one it missed - a build failure naming the
-exact spot, not a silent gap discovered later. So the honest version of this freeze is not "these seven never change
-shape"; it is "a variant is added only when the rule above cannot reach it,
-and when that happens, the compiler - not a hunt through the tree - says
-exactly which code needs to know."
+- **`Datasource.host`/`port`/`connectTimeout`** describe a network
+  connection. A file-based adapter's `connect` ignores them rather than
+  reading them.
+- **`SslMode`** describes a TLS negotiation against a server socket. A
+  file-based adapter has nothing to negotiate, so it should refuse any
+  `sslmode` other than the default rather than silently accept one.
+- **`Pool`'s concurrency model** assumes a server arbitrates many physical
+  connections at once (`Datasource.maxOpen` defaults to 10 for that reason).
+  A database that locks at the file level, not per connection, needs its own
+  policy - a single writer, or retrying on a busy file - instead of just a
+  smaller pool.
+- **`FatalError`** marks a dead network transport so `Pool` can discard the
+  connection. A file-based database's failure modes - a corrupted file, a
+  lock that never clears - are a different class this marker was not shaped
+  to name; a file-based driver should raise its own error for them instead.
 
 ## The connection pool
 
@@ -544,9 +397,9 @@ How the driver should negotiate TLS. The names are Bit's; each adapter
 renders them into whatever its own wire protocol spells.
 
 `Negotiate` is the first variant deliberately. A class field of enum type
-cannot carry an explicit default - a variant is not a constant expression
-(SPEC section 10.5, `E0064`) - so an omitted `sslmode` takes the enum's *first
-declared variant*. Ordering the connect-to-anything mode first is the only
+cannot carry an explicit default (`E0064`), so an omitted `sslmode` takes
+the enum's *first declared variant*. Ordering the connect-to-anything mode
+first is the only
 way that default survives, and reordering this enum silently changes what an
 omitted `sslmode` means.
 
@@ -862,7 +715,7 @@ same way placeholder syntax already is.
 
 ## `@table` descriptors - what the compiler hands a mapper
 
-A class carrying the `@table` attribute (SPEC section 10.5) gains a synthesized
+A class carrying the `@table` attribute gains a generated
 `tableDescriptor(): []FieldDesc`, one entry per field in declaration order. The
 compiler fills these in; nothing here is written by hand.
 
@@ -963,8 +816,7 @@ and its type.
 ### A `@table` class is marked persisted at hydration
 
 When `T` also carries `@table`, the generated mapper calls
-`markPersisted(true)` (SPEC section 10.5) on the value it built, right before
-handing it back - so anything `find`/`findOne`/`findOneOrFail` returns reads
+`markPersisted(true)` on the value it built, right before handing it back - so anything `find`/`findOne`/`findOneOrFail` returns reads
 `isPersisted() == true`. A composite literal never does this: `User{ id = 1,
 email = "a@b.com" }` reads `isPersisted() == false` until something calls
 `markPersisted(true)` on it by hand. That distinction is what `db.save` (in
@@ -1046,12 +898,12 @@ or `"sql: no rows"` for a cause that names no column.
 
 ## Row-mapping primitives
 
-The named functions the compiler's synthesised mapper is written in terms
+The named functions the compiler's generated mapper is written in terms
 of. They are exported because the generated code lives in the CLASS's own
 module and calls them by name, and they are a usable API in their own
 right for a hand-written mapper over a shape `find<T>` does not cover: pass
 one as the `mapper` argument of `sqlFindMany`/`sqlFindOne`/
-`sqlFindOneOrFail` below in place of a synthesised one.
+`sqlFindOneOrFail` below in place of a generated one.
 
 Each scalar type has a **required** and an **Option** form, taking the
 result's columns (`Rows.columns()`, read once) and the column name to
