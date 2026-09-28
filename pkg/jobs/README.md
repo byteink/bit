@@ -1,8 +1,9 @@
 # bitlang.org/pkg/jobs
 
 Background jobs: a worker pool, retries with exponential backoff and full
-jitter, a dead-letter list, and no default queue backend — you supply a
-`Store` (a PostgreSQL one is planned; see Status below).
+jitter, a dead-letter list, and a `PostgresStore`. No default queue
+backend, the same call as pkg/web's session and rate-limit stores: an
+in-memory queue silently loses every pending job on deploy.
 
 **Status: not yet released.** `@job`'s dispatch name is a `static` method
 (#6081/#6091), and `static` methods are behind the compiler flag
@@ -33,16 +34,16 @@ generic bound, built entirely at runtime with no reflection and no
 compiler-generated cross-module table (epic #4023's 2026-09-27 owner
 decision).
 
-## Left for follow-up tickets (epic #4023)
-
-- A PostgreSQL `Store` (`SELECT ... FOR UPDATE SKIP LOCKED`) and its live
-  Docker gate — #6082's Store trait and its two in-tree test doubles
-  (`jobs.test.bit`) are done; the concrete driver is not yet in this
-  package.
-- Cron scheduling (#6083).
-- A Redis `Store`, once pkg/redis 0.2 ships (#6013).
-
 ## Docs
 
-See `jobs.bit` for `Queue`/`Options`, `store.bit` for the `Store` trait a
-backend implements, and `backoff.bit` for the retry delay.
+- [Getting started](docs/getting-started.md): the problem, `open`,
+  `register`, `enqueue`, starting workers, retries and the dead-letter
+  list, one running example (a welcome-email job).
+- [PostgreSQL](docs/postgres.md): `PostgresStore`, running the migration,
+  writing your own `Store`, at-least-once delivery and idempotent
+  handlers.
+
+## Left for follow-up tickets (epic #4023)
+
+- Cron scheduling (#6083).
+- A Redis `Store`, once pkg/redis 0.2 ships (#6013).
