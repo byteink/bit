@@ -12,9 +12,9 @@ only one OS thread is sampled: whichever one happens to receive `SIGPROF`.
 Both are deliberate scope cuts for this first version, not silent gaps.
 
 The written profile is a small, self-describing text format (`BITPROF1`), not
-the `pprof` protobuf format. Render it with `bit run tools/prof <file>`, which
-symbolizes each recorded address against the profiled binary's own linked
-Mach-O symbol table and prints each function's share of samples.
+the `pprof` protobuf format. Render it with [`bit prof <file>`](/tools/prof),
+which symbolizes each recorded address against the profiled binary's own
+linked Mach-O symbol table and prints each function's share of samples.
 
 ### `startCpu(hz: int)`
 
