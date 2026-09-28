@@ -732,6 +732,1184 @@ run so a daylight saving transition is absorbed.
 | `zone("Asia/Dubai")` with no host zone data | fails - see [Zones](#zones) |
 | `hijri()` outside 1300-1500 AH | fails, tables do not cover it |
 
+## Date reference
+
+### `Date`
+
+A calendar day with no time of day and no zone: an invoice value date, a due date, a date of birth. Immutable, like every type in this module.
+
+### `Date.addBusinessDays(c: Calendar, n: i64): Date`
+
+Skips `n` business days under calendar `c`, forward or backward; `n` may be negative and `0` returns this date unchanged. See [Business days](#business-days).
+
+### `Date.addDays(n: i64): Date`
+
+Returns a copy of this `Date` with `n` days added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.addMonths(n: i64): Date`
+
+Returns a copy of this `Date` with `n` months added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.addWeeks(n: i64): Date`
+
+Returns a copy of this `Date` with `n` weeks added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.addYears(n: i64): Date`
+
+Returns a copy of this `Date` with `n` years added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.atStartOfDay(z: Zone): DateTime`
+
+This date at midnight in zone `z`, as a `DateTime`. See [Converting between types](#converting-between-types).
+
+### `Date.atTime(h: i64, m: i64, s: i64): NaiveDateTime!`
+
+This date combined with a time of day, as a `NaiveDateTime`; fails exactly when `time(h, m, s)` fails.
+
+### `Date.compare(other: Date): i64`
+
+Returns `-1`, `0` or `1` for sorting against another value of the same type. See [Comparing](#comparing).
+
+### `Date.day(): i64`
+
+Returns the day of the month, `1` to `31`. See [Fields](#fields).
+
+### `Date.dayOfWeek(): i64`
+
+Returns the day of the week, `1` Monday through `7` Sunday (ISO 8601). See [Fields](#fields).
+
+### `Date.dayOfYear(): i64`
+
+Returns the day of the year, `1` to `366`. See [Fields](#fields).
+
+### `Date.daysInMonth(): i64`
+
+Returns the number of days in this month, `28` to `31`. See [Fields](#fields).
+
+### `Date.differenceInBusinessDays(c: Calendar, other: Date): i64`
+
+The complete business days from this date to `other` under calendar `c`, excluding this date and including `other`. See [Business days](#business-days).
+
+### `Date.differenceInDays(other: Date): i64`
+
+The whole days from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Date.differenceInMonths(other: Date): i64`
+
+The whole months from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Date.differenceInWeeks(other: Date): i64`
+
+The whole weeks from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Date.differenceInYears(other: Date): i64`
+
+The whole years from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Date.endOfDay(): Date`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.endOfMonth(): Date`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.endOfQuarter(): Date`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.endOfWeek(): Date`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.endOfWeekOn(day: i64): Date`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.endOfYear(): Date`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.format(pattern: string): string!`
+
+Renders this value using the LDML pattern `pattern`. See [Formatting and parsing](#formatting-and-parsing).
+
+### `Date.hijri(): HijriDate!`
+
+This day rendered as a `HijriDate` in the Umm al-Qura calendar; fails outside the tabulated span. See [Hijri dates](#hijri-dates).
+
+### `Date.isAfter(other: Date): bool`
+
+Whether this value is strictly after `other`. See [Comparing](#comparing).
+
+### `Date.isBefore(other: Date): bool`
+
+Whether this value is strictly before `other`. See [Comparing](#comparing).
+
+### `Date.isBetween(lo: Date, hi: Date): bool`
+
+Whether this value falls within `lo` and `hi`, inclusive. See [Comparing](#comparing).
+
+### `Date.isBusinessDay(c: Calendar): bool`
+
+Whether this date is a business day under calendar `c`: not a weekend day and not a holiday. See [Business days](#business-days).
+
+### `Date.isLeapYear(): bool`
+
+Whether this value's year is a Gregorian leap year.
+
+### `Date.isSame(other: Date): bool`
+
+Whether this value is equal to `other`. See [Comparing](#comparing).
+
+### `Date.isSameDay(other: Date): bool`
+
+Whether this value and `other` fall on the same calendar day.
+
+### `Date.isSameMonth(other: Date): bool`
+
+Whether this value and `other` fall on the same month.
+
+### `Date.isSameYear(other: Date): bool`
+
+Whether this value and `other` fall on the same year.
+
+### `Date.isWeekday(w: Weekend): bool`
+
+Whether this date is a working day under `w`. See [Business days](#business-days).
+
+### `Date.isWeekend(w: Weekend): bool`
+
+Whether this date is a weekend day under `w`. See [Business days](#business-days).
+
+### `Date.month(): i64`
+
+Returns the month, `1` to `12`. See [Fields](#fields).
+
+### `Date.nextBusinessDay(c: Calendar): Date`
+
+The next business day under calendar `c`, strictly after this date; never returns this date, even when it is itself a business day. See [Business days](#business-days).
+
+### `Date.previousBusinessDay(c: Calendar): Date`
+
+The previous business day under calendar `c`, strictly before this date; never returns this date, even when it is itself a business day. See [Business days](#business-days).
+
+### `Date.quarter(): i64`
+
+Returns the quarter, `1` to `4`. See [Fields](#fields).
+
+### `Date.startOfDay(): Date`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.startOfMonth(): Date`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.startOfQuarter(): Date`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.startOfWeek(): Date`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.startOfWeekOn(day: i64): Date`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.startOfYear(): Date`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `Date.toString(): string`
+
+This value's canonical text form, the same text its matching `parse*` function reads back.
+
+### `Date.weekOfYear(): i64`
+
+Returns the ISO 8601 week number, `1` to `53`. See [Fields](#fields).
+
+### `Date.withDay(d: i64): Date`
+
+Returns a copy of this `Date` with its day replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.withMonth(mo: i64): Date`
+
+Returns a copy of this `Date` with its month replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.withYear(y: i64): Date`
+
+Returns a copy of this `Date` with its year replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Date.year(): i64`
+
+Returns the year, `1` to `9999`. See [Fields](#fields).
+
+
+## DateTime reference
+
+### `DateTime`
+
+A wall-clock reading, a zone, and the resolved offset: an appointment a person will keep in a named place. Immutable.
+
+### `DateTime.addBusinessDays(c: Calendar, n: i64): Date`
+
+Skips `n` business days under calendar `c`, forward or backward; `n` may be negative and `0` returns this date unchanged. See [Business days](#business-days).
+
+### `DateTime.addDays(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` days added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addHours(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` hours added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addMinutes(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` minutes added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addMonths(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` months added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addNanoseconds(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` nanoseconds added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addSeconds(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` seconds added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addWeeks(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` weeks added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.addYears(n: i64): DateTime`
+
+Returns a copy of this `DateTime` with `n` years added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.compare(other: DateTime): i64`
+
+Returns `-1`, `0` or `1` for sorting against another value of the same type. See [Comparing](#comparing).
+
+### `DateTime.date(): Date`
+
+The calendar date half of this value, dropping the time of day.
+
+### `DateTime.day(): i64`
+
+Returns the day of the month, `1` to `31`. See [Fields](#fields).
+
+### `DateTime.dayOfWeek(): i64`
+
+Returns the day of the week, `1` Monday through `7` Sunday (ISO 8601). See [Fields](#fields).
+
+### `DateTime.dayOfYear(): i64`
+
+Returns the day of the year, `1` to `366`. See [Fields](#fields).
+
+### `DateTime.daysInMonth(): i64`
+
+Returns the number of days in this month, `28` to `31`. See [Fields](#fields).
+
+### `DateTime.differenceInBusinessDays(c: Calendar, other: Date): i64`
+
+The complete business days from this date to `other` under calendar `c`, excluding this date and including `other`. See [Business days](#business-days).
+
+### `DateTime.differenceInDays(other: DateTime): i64`
+
+The whole days from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.differenceInHours(other: DateTime): i64`
+
+The whole hours from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.differenceInMinutes(other: DateTime): i64`
+
+The whole minutes from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.differenceInMonths(other: DateTime): i64`
+
+The whole months from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.differenceInSeconds(other: DateTime): i64`
+
+The whole seconds from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.differenceInWeeks(other: DateTime): i64`
+
+The whole weeks from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.differenceInYears(other: DateTime): i64`
+
+The whole years from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `DateTime.endOfDay(): DateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.endOfMonth(): DateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.endOfQuarter(): DateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.endOfWeek(): DateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.endOfWeekOn(day: i64): DateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.endOfYear(): DateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.format(pattern: string): string!`
+
+Renders this value using the LDML pattern `pattern`. See [Formatting and parsing](#formatting-and-parsing).
+
+### `DateTime.hour(): i64`
+
+Returns the hour, `0` to `23`. See [Fields](#fields).
+
+### `DateTime.isAfter(other: DateTime): bool`
+
+Whether this value is strictly after `other`. See [Comparing](#comparing).
+
+### `DateTime.isBefore(other: DateTime): bool`
+
+Whether this value is strictly before `other`. See [Comparing](#comparing).
+
+### `DateTime.isBetween(lo: DateTime, hi: DateTime): bool`
+
+Whether this value falls within `lo` and `hi`, inclusive. See [Comparing](#comparing).
+
+### `DateTime.isBusinessDay(c: Calendar): bool`
+
+Whether this date is a business day under calendar `c`: not a weekend day and not a holiday. See [Business days](#business-days).
+
+### `DateTime.isDst(): bool`
+
+Returns whether daylight saving is in effect at this instant. See [Fields](#fields).
+
+### `DateTime.isFuture(): bool`
+
+Whether this value is after `now()`, checked at the moment this is called.
+
+### `DateTime.isLeapYear(): bool`
+
+Whether this value's year is a Gregorian leap year.
+
+### `DateTime.isPast(): bool`
+
+Whether this value is before `now()`, checked at the moment this is called.
+
+### `DateTime.isSame(other: DateTime): bool`
+
+Whether this value is equal to `other`. See [Comparing](#comparing).
+
+### `DateTime.isSameDay(other: DateTime): bool`
+
+Whether this value and `other` fall on the same calendar day.
+
+### `DateTime.isSameMonth(other: DateTime): bool`
+
+Whether this value and `other` fall on the same month.
+
+### `DateTime.isSameYear(other: DateTime): bool`
+
+Whether this value and `other` fall on the same year.
+
+### `DateTime.isWeekday(w: Weekend): bool`
+
+Whether this date is a working day under `w`. See [Business days](#business-days).
+
+### `DateTime.isWeekend(w: Weekend): bool`
+
+Whether this date is a weekend day under `w`. See [Business days](#business-days).
+
+### `DateTime.minute(): i64`
+
+Returns the minute, `0` to `59`. See [Fields](#fields).
+
+### `DateTime.month(): i64`
+
+Returns the month, `1` to `12`. See [Fields](#fields).
+
+### `DateTime.naive(): NaiveDateTime`
+
+This value with its zone dropped, as a `NaiveDateTime`.
+
+### `DateTime.nanosecond(): i64`
+
+Returns the nanosecond, `0` to `999999999`. See [Fields](#fields).
+
+### `DateTime.nextBusinessDay(c: Calendar): Date`
+
+The next business day under calendar `c`, strictly after this date; never returns this date, even when it is itself a business day. See [Business days](#business-days).
+
+### `DateTime.offset(): i64`
+
+Returns this value's offset from UTC, in seconds east. See [Fields](#fields).
+
+### `DateTime.previousBusinessDay(c: Calendar): Date`
+
+The previous business day under calendar `c`, strictly before this date; never returns this date, even when it is itself a business day. See [Business days](#business-days).
+
+### `DateTime.quarter(): i64`
+
+Returns the quarter, `1` to `4`. See [Fields](#fields).
+
+### `DateTime.second(): i64`
+
+Returns the second, `0` to `59`, never `60`. See [Fields](#fields).
+
+### `DateTime.startOfDay(): DateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.startOfMonth(): DateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.startOfQuarter(): DateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.startOfWeek(): DateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.startOfWeekOn(day: i64): DateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.startOfYear(): DateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `DateTime.time(): Time`
+
+The time-of-day half of this value, dropping the date.
+
+### `DateTime.toString(): string`
+
+This value's canonical text form, the same text its matching `parse*` function reads back.
+
+### `DateTime.toTimestamp(): Timestamp!`
+
+This value converted to an instant, dropping the zone; fails when the result falls outside `Timestamp`'s range.
+
+### `DateTime.weekOfYear(): i64`
+
+Returns the ISO 8601 week number, `1` to `53`. See [Fields](#fields).
+
+### `DateTime.withDay(d: i64): DateTime`
+
+Returns a copy of this `DateTime` with its day replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withHour(h: i64): DateTime`
+
+Returns a copy of this `DateTime` with its hour replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withMinute(mi: i64): DateTime`
+
+Returns a copy of this `DateTime` with its minute replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withMonth(mo: i64): DateTime`
+
+Returns a copy of this `DateTime` with its month replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withNanosecond(ns: i64): DateTime`
+
+Returns a copy of this `DateTime` with its nanosecond replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withSecond(s: i64): DateTime`
+
+Returns a copy of this `DateTime` with its second replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withTime(h: i64, m: i64, s: i64): DateTime`
+
+Returns a copy of this value with a new time of day, keeping the date. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withYear(y: i64): DateTime`
+
+Returns a copy of this `DateTime` with its year replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `DateTime.withZone(z: Zone): DateTime`
+
+Returns the same instant shown in a different zone: the wall clock changes, the instant does not. See [Converting between types](#converting-between-types).
+
+### `DateTime.year(): i64`
+
+Returns the year, `1` to `9999`. See [Fields](#fields).
+
+### `DateTime.zone(): Zone`
+
+Returns this value's zone. See [Fields](#fields).
+
+
+## NaiveDateTime reference
+
+### `NaiveDateTime`
+
+A calendar date and a time of day, with no zone: "9am on the 1st", somewhere unspecified. Immutable.
+
+### `NaiveDateTime.addBusinessDays(c: Calendar, n: i64): Date`
+
+Skips `n` business days under calendar `c`, forward or backward; `n` may be negative and `0` returns this date unchanged. See [Business days](#business-days).
+
+### `NaiveDateTime.addDays(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` days added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addHours(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` hours added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addMinutes(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` minutes added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addMonths(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` months added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addNanoseconds(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` nanoseconds added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addSeconds(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` seconds added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addWeeks(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` weeks added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.addYears(n: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with `n` years added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.compare(other: NaiveDateTime): i64`
+
+Returns `-1`, `0` or `1` for sorting against another value of the same type. See [Comparing](#comparing).
+
+### `NaiveDateTime.date(): Date`
+
+The calendar date half of this value, dropping the time of day.
+
+### `NaiveDateTime.day(): i64`
+
+Returns the day of the month, `1` to `31`. See [Fields](#fields).
+
+### `NaiveDateTime.dayOfWeek(): i64`
+
+Returns the day of the week, `1` Monday through `7` Sunday (ISO 8601). See [Fields](#fields).
+
+### `NaiveDateTime.dayOfYear(): i64`
+
+Returns the day of the year, `1` to `366`. See [Fields](#fields).
+
+### `NaiveDateTime.daysInMonth(): i64`
+
+Returns the number of days in this month, `28` to `31`. See [Fields](#fields).
+
+### `NaiveDateTime.differenceInBusinessDays(c: Calendar, other: Date): i64`
+
+The complete business days from this date to `other` under calendar `c`, excluding this date and including `other`. See [Business days](#business-days).
+
+### `NaiveDateTime.differenceInDays(other: NaiveDateTime): i64`
+
+The whole days from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.differenceInHours(other: NaiveDateTime): i64`
+
+The whole hours from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.differenceInMinutes(other: NaiveDateTime): i64`
+
+The whole minutes from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.differenceInMonths(other: NaiveDateTime): i64`
+
+The whole months from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.differenceInSeconds(other: NaiveDateTime): i64`
+
+The whole seconds from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.differenceInWeeks(other: NaiveDateTime): i64`
+
+The whole weeks from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.differenceInYears(other: NaiveDateTime): i64`
+
+The whole years from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `NaiveDateTime.endOfDay(): NaiveDateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.endOfMonth(): NaiveDateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.endOfQuarter(): NaiveDateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.endOfWeek(): NaiveDateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.endOfWeekOn(day: i64): NaiveDateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.endOfYear(): NaiveDateTime`
+
+The last representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.format(pattern: string): string!`
+
+Renders this value using the LDML pattern `pattern`. See [Formatting and parsing](#formatting-and-parsing).
+
+### `NaiveDateTime.hour(): i64`
+
+Returns the hour, `0` to `23`. See [Fields](#fields).
+
+### `NaiveDateTime.inZone(z: Zone): DateTime`
+
+Reads this wall clock, or this instant, as a `DateTime` in zone `z`. See [Converting between types](#converting-between-types).
+
+### `NaiveDateTime.isAfter(other: NaiveDateTime): bool`
+
+Whether this value is strictly after `other`. See [Comparing](#comparing).
+
+### `NaiveDateTime.isBefore(other: NaiveDateTime): bool`
+
+Whether this value is strictly before `other`. See [Comparing](#comparing).
+
+### `NaiveDateTime.isBetween(lo: NaiveDateTime, hi: NaiveDateTime): bool`
+
+Whether this value falls within `lo` and `hi`, inclusive. See [Comparing](#comparing).
+
+### `NaiveDateTime.isBusinessDay(c: Calendar): bool`
+
+Whether this date is a business day under calendar `c`: not a weekend day and not a holiday. See [Business days](#business-days).
+
+### `NaiveDateTime.isLeapYear(): bool`
+
+Whether this value's year is a Gregorian leap year.
+
+### `NaiveDateTime.isSame(other: NaiveDateTime): bool`
+
+Whether this value is equal to `other`. See [Comparing](#comparing).
+
+### `NaiveDateTime.isSameDay(other: NaiveDateTime): bool`
+
+Whether this value and `other` fall on the same calendar day.
+
+### `NaiveDateTime.isSameMonth(other: NaiveDateTime): bool`
+
+Whether this value and `other` fall on the same month.
+
+### `NaiveDateTime.isSameYear(other: NaiveDateTime): bool`
+
+Whether this value and `other` fall on the same year.
+
+### `NaiveDateTime.isWeekday(w: Weekend): bool`
+
+Whether this date is a working day under `w`. See [Business days](#business-days).
+
+### `NaiveDateTime.isWeekend(w: Weekend): bool`
+
+Whether this date is a weekend day under `w`. See [Business days](#business-days).
+
+### `NaiveDateTime.minute(): i64`
+
+Returns the minute, `0` to `59`. See [Fields](#fields).
+
+### `NaiveDateTime.month(): i64`
+
+Returns the month, `1` to `12`. See [Fields](#fields).
+
+### `NaiveDateTime.nanosecond(): i64`
+
+Returns the nanosecond, `0` to `999999999`. See [Fields](#fields).
+
+### `NaiveDateTime.nextBusinessDay(c: Calendar): Date`
+
+The next business day under calendar `c`, strictly after this date; never returns this date, even when it is itself a business day. See [Business days](#business-days).
+
+### `NaiveDateTime.previousBusinessDay(c: Calendar): Date`
+
+The previous business day under calendar `c`, strictly before this date; never returns this date, even when it is itself a business day. See [Business days](#business-days).
+
+### `NaiveDateTime.quarter(): i64`
+
+Returns the quarter, `1` to `4`. See [Fields](#fields).
+
+### `NaiveDateTime.second(): i64`
+
+Returns the second, `0` to `59`, never `60`. See [Fields](#fields).
+
+### `NaiveDateTime.startOfDay(): NaiveDateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.startOfMonth(): NaiveDateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.startOfQuarter(): NaiveDateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.startOfWeek(): NaiveDateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.startOfWeekOn(day: i64): NaiveDateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.startOfYear(): NaiveDateTime`
+
+The first representable instant of the named period. See [Boundaries](#boundaries).
+
+### `NaiveDateTime.time(): Time`
+
+The time-of-day half of this value, dropping the date.
+
+### `NaiveDateTime.toString(): string`
+
+This value's canonical text form, the same text its matching `parse*` function reads back.
+
+### `NaiveDateTime.weekOfYear(): i64`
+
+Returns the ISO 8601 week number, `1` to `53`. See [Fields](#fields).
+
+### `NaiveDateTime.withDay(d: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its day replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withHour(h: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its hour replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withMinute(mi: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its minute replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withMonth(mo: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its month replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withNanosecond(ns: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its nanosecond replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withSecond(s: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its second replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withTime(h: i64, m: i64, s: i64): NaiveDateTime`
+
+Returns a copy of this value with a new time of day, keeping the date. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.withYear(y: i64): NaiveDateTime`
+
+Returns a copy of this `NaiveDateTime` with its year replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `NaiveDateTime.year(): i64`
+
+Returns the year, `1` to `9999`. See [Fields](#fields).
+
+
+## Time reference
+
+### `Time`
+
+A time of day with no date and no zone: a shop opening at `09:00`. Immutable.
+
+### `Time.addHours(n: i64): Time`
+
+Returns a copy of this `Time` with `n` hours added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.addMinutes(n: i64): Time`
+
+Returns a copy of this `Time` with `n` minutes added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.addNanoseconds(n: i64): Time`
+
+Returns a copy of this `Time` with `n` nanoseconds added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.addSeconds(n: i64): Time`
+
+Returns a copy of this `Time` with `n` seconds added; `n` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.compare(other: Time): i64`
+
+Returns `-1`, `0` or `1` for sorting against another value of the same type. See [Comparing](#comparing).
+
+### `Time.format(pattern: string): string!`
+
+Renders this value using the LDML pattern `pattern`. See [Formatting and parsing](#formatting-and-parsing).
+
+### `Time.hour(): i64`
+
+Returns the hour, `0` to `23`. See [Fields](#fields).
+
+### `Time.isAfter(other: Time): bool`
+
+Whether this value is strictly after `other`. See [Comparing](#comparing).
+
+### `Time.isBefore(other: Time): bool`
+
+Whether this value is strictly before `other`. See [Comparing](#comparing).
+
+### `Time.isBetween(lo: Time, hi: Time): bool`
+
+Whether this value falls within `lo` and `hi`, inclusive. See [Comparing](#comparing).
+
+### `Time.isSame(other: Time): bool`
+
+Whether this value is equal to `other`. See [Comparing](#comparing).
+
+### `Time.minute(): i64`
+
+Returns the minute, `0` to `59`. See [Fields](#fields).
+
+### `Time.nanosecond(): i64`
+
+Returns the nanosecond, `0` to `999999999`. See [Fields](#fields).
+
+### `Time.second(): i64`
+
+Returns the second, `0` to `59`, never `60`. See [Fields](#fields).
+
+### `Time.toString(): string`
+
+This value's canonical text form, the same text its matching `parse*` function reads back.
+
+### `Time.withHour(h: i64): Time`
+
+Returns a copy of this `Time` with its hour replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.withMinute(mi: i64): Time`
+
+Returns a copy of this `Time` with its minute replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.withNanosecond(ns: i64): Time`
+
+Returns a copy of this `Time` with its nanosecond replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Time.withSecond(s: i64): Time`
+
+Returns a copy of this `Time` with its second replaced. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+
+## Timestamp reference
+
+### `Timestamp`
+
+Nanoseconds since the Unix epoch, with no zone: what a database column holds. Returned by `now()`. Immutable.
+
+### `Timestamp.add(ns: i64): Timestamp`
+
+Returns a copy of this `Timestamp` with `ns`  added; `ns` may be negative. See [Arithmetic](#arithmetic-and-setting-a-field).
+
+### `Timestamp.compare(other: Timestamp): i64`
+
+Returns `-1`, `0` or `1` for sorting against another value of the same type. See [Comparing](#comparing).
+
+### `Timestamp.differenceInHours(other: Timestamp): i64`
+
+The whole hours from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Timestamp.differenceInMinutes(other: Timestamp): i64`
+
+The whole minutes from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Timestamp.differenceInNanoseconds(other: Timestamp): i64`
+
+The whole nanoseconds from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Timestamp.differenceInSeconds(other: Timestamp): i64`
+
+The whole seconds from this value to `other`, truncated toward zero. See [Differences](#differences).
+
+### `Timestamp.inZone(z: Zone): DateTime`
+
+Reads this wall clock, or this instant, as a `DateTime` in zone `z`. See [Converting between types](#converting-between-types).
+
+### `Timestamp.isAfter(other: Timestamp): bool`
+
+Whether this value is strictly after `other`. See [Comparing](#comparing).
+
+### `Timestamp.isBefore(other: Timestamp): bool`
+
+Whether this value is strictly before `other`. See [Comparing](#comparing).
+
+### `Timestamp.isBetween(lo: Timestamp, hi: Timestamp): bool`
+
+Whether this value falls within `lo` and `hi`, inclusive. See [Comparing](#comparing).
+
+### `Timestamp.isFuture(): bool`
+
+Whether this value is after `now()`, checked at the moment this is called.
+
+### `Timestamp.isPast(): bool`
+
+Whether this value is before `now()`, checked at the moment this is called.
+
+### `Timestamp.isSame(other: Timestamp): bool`
+
+Whether this value is equal to `other`. See [Comparing](#comparing).
+
+### `Timestamp.toString(): string`
+
+This value's canonical text form, the same text its matching `parse*` function reads back.
+
+
+## HijriDate reference
+
+### `HijriDate`
+
+A Hijri calendar date in the Umm al-Qura variant, produced by rendering a Gregorian `Date`. See [Hijri dates](#hijri-dates).
+
+### `HijriDate.day(): i64`
+
+Returns the day of the month, `1` to `31`. See [Fields](#fields).
+
+### `HijriDate.format(pattern: string): string!`
+
+Renders this value using the LDML pattern `pattern`. See [Formatting and parsing](#formatting-and-parsing).
+
+### `HijriDate.gregorian(): Date`
+
+The Gregorian `Date` this Hijri date renders; never fails.
+
+### `HijriDate.month(): i64`
+
+Returns the month, `1` to `12`. See [Fields](#fields).
+
+### `HijriDate.toString(): string`
+
+This value's canonical text form, the same text its matching `parse*` function reads back.
+
+### `HijriDate.year(): i64`
+
+Returns the year, `1` to `9999`. See [Fields](#fields).
+
+
+## Ticker reference
+
+### `Ticker`
+
+A repeating timer; `.c` receives `true` every interval until stopped. See [Timer channels](#timer-channels).
+
+### `Ticker.stop(): bool`
+
+Cancels this timer; returns whether it was still pending.
+
+
+## Timer reference
+
+### `Timer`
+
+A one-shot timer; `.c` receives `true` once when it fires. See [Timer channels](#timer-channels).
+
+### `Timer.reset(d: i64): bool`
+
+Re-arms this timer to fire `d` nanoseconds from now; returns `false`, with no effect, if it had already fired.
+
+### `Timer.stop(): bool`
+
+Cancels this timer; returns whether it was still pending.
+
+
+## Zones, calendars and clocks reference
+
+### `Zone`
+
+An IANA time zone, identified by its canonical name, such as `Asia/Dubai`. Immutable and safe to share across green threads. See [Zones](#zones).
+
+### `zone(name: string): Zone!`
+
+Loads the zone named `name` from the host's zone database. Fails when the name is not a real zone, or when neither the host nor an installed extension has it. See [Zones](#zones).
+
+### `localZone(): Zone`
+
+The host's own zone, read from its local time settings. Falls back to `utc()` on any failure, so this never fails.
+
+### `utc(): Zone`
+
+The UTC zone: no transitions, offset always `0`. Never touches the filesystem and never fails.
+
+### `extend(data: string): bool`
+
+Installs a zone database extension for hosts with no zone data of their own, such as a minimal container image. Returns whether it was accepted; a current host database always wins over the extension, and a second call always returns `false`. See [Zones](#zones).
+
+### `Calendar`
+
+A `Weekend` plus a set of holiday dates: everything `isBusinessDay` needs. Built by `calendar`. See [Business days](#business-days).
+
+### `Weekend`
+
+Which days of the week are not worked, as day numbers `1` Monday through `7` Sunday. See [Business days](#business-days).
+
+### `calendar(w: Weekend, holidays: []Date): Calendar`
+
+Builds a business calendar from a `Weekend` and a set of holiday dates. This module ships no holiday list for any country. See [Business days](#business-days).
+
+### `weekendSatSun(): Weekend`
+
+Saturday and Sunday off. The common default: Europe, the Americas, and the UAE since 2022.
+
+### `weekendFriSat(): Weekend`
+
+Friday and Saturday off: Saudi Arabia, Egypt, and much of the region.
+
+### `weekendOn(days: []i64): Weekend!`
+
+A weekend on exactly the given day numbers, each `1` Monday through `7` Sunday, for any pattern the two named constructors above do not cover. Fails on a number outside `1..7`, or on a set covering all seven days.
+
+### `date(year: i64, month: i64, day: i64): Date!`
+
+Builds a calendar date. Fails when `month` is outside `1..12`, `day` is outside that month's range, or `year` is outside `1..9999`. See [Constructing](#constructing).
+
+### `time(hour: i64, minute: i64, second: i64): Time!`
+
+Builds a time of day with zero nanoseconds. Fails when any field is out of range; a `second` of `60` fails, since this module has no leap seconds. See [Constructing](#constructing).
+
+### `timeNs(hour: i64, minute: i64, second: i64, nanosecond: i64): Time!`
+
+As `time`, with an explicit nanosecond field. Fails on the same three fields, plus when `nanosecond` is outside `0..999999999`.
+
+### `today(z: Zone): Date`
+
+The calendar date it is right now in zone `z`. Never fails: every instant has exactly one calendar date in every zone. See [Constructing](#constructing).
+
+### `now(): Timestamp`
+
+The current instant, as nanoseconds since the Unix epoch. Follows the system clock, so it can jump backwards on an NTP correction; use it to stamp an event, never to measure an interval. See [Clocks](#clocks).
+
+### `Mono`
+
+A monotonic clock reading, returned by `monotonic()`. Only differences between two readings from this clock are meaningful, and they never go backwards. See [Clocks](#clocks).
+
+### `monotonic(): Mono`
+
+The current reading of the monotonic clock, meaningful only when compared with another reading from this same clock. See [Clocks](#clocks).
+
+### `since(start: Mono): i64`
+
+Nanoseconds elapsed since the `monotonic()` reading `start`.
+
+### `sleep(d: i64): ()`
+
+Parks the calling green thread for at least `d` nanoseconds without blocking an OS thread. `d <= 0` yields once and returns at once. See [Sleeping](#sleeping).
+
+### `sleepUntil(deadlineNs: i64): ()`
+
+Parks the calling green thread until `deadlineNs` on the `monotonic()` clock, an absolute instant rather than a duration. Useful when several callers must wake at the exact same moment. See [Sleeping](#sleeping).
+
+### `newTimer(d: i64): Timer`
+
+Starts a one-shot `Timer` that fires `d` nanoseconds from now.
+
+### `newTicker(d: i64): Ticker`
+
+Starts a `Ticker` that ticks every `d` nanoseconds.
+
+### `after(d: i64): chan<bool>`
+
+A channel that receives `true` once, `d` nanoseconds from now: the idiomatic `select` timeout arm. Its slot self-frees once it fires, even if the timeout arm is never taken. See [Timer channels](#timer-channels).
+
+### `tick(d: i64): chan<bool>`
+
+A channel that receives `true` every `d` nanoseconds, forever. There is no way to stop it, so prefer `newTicker` when the ticker must ever be stopped.
+
+## Formatting, parsing and Hijri dates reference
+
+### `parseDate(s: string): Date!`
+
+Reads back a `Date.toString()` result, `YYYY-MM-DD`. Fails on any other shape, or on a date no calendar has.
+
+### `parseTime(s: string): Time!`
+
+Reads back a `Time.toString()` result, `HH:MM:SS` with an optional fractional part. Fails on a `:60` leap second or a fraction of ten or more digits.
+
+### `parseNaiveDateTime(s: string): NaiveDateTime!`
+
+Reads back a `NaiveDateTime.toString()` result, `YYYY-MM-DDTHH:MM:SS` with an optional fraction. The `T` must be uppercase.
+
+### `parseDateTime(s: string): DateTime!`
+
+Reads back a `DateTime.toString()` result: a wall clock plus `Z` or a `+HH:MM`/`-HH:MM` offset. The result's zone is a fixed offset, not a named zone, since an offset does not say which zone produced it; call `.withZone(z)` once the real zone is known.
+
+### `parseWith(pattern: string, s: string): NaiveDateTime!`
+
+Reads `s` against the LDML pattern `pattern`, the same pattern language `format` writes. A field the pattern does not name keeps its default. See [Formatting and parsing](#formatting-and-parsing).
+
+### `hijriDate(year: i64, month: i64, day: i64): HijriDate!`
+
+Builds a Hijri date directly, for reading one off a document. Fails when any field is outside its tabulated range. See [Hijri dates](#hijri-dates).
+
+## Durations reference
+
+### `Nanosecond: i64`
+
+One nanosecond, the base unit every duration is built from.
+
+### `Microsecond: i64`
+
+`1000` nanoseconds.
+
+### `Millisecond: i64`
+
+`1000000` nanoseconds.
+
+### `Second: i64`
+
+`1000000000` nanoseconds.
+
+### `Minute: i64`
+
+`60000000000` nanoseconds.
+
+### `Hour: i64`
+
+`3600000000000` nanoseconds.
+
+### `millis(d: i64): i64`
+
+Whole milliseconds in `d`, truncated.
+
+### `secs(d: i64): i64`
+
+Whole seconds in `d`, truncated.
+
+### `toMillis(d: i64): f64`
+
+`d` as fractional milliseconds.
+
+### `toSeconds(d: i64): f64`
+
+`d` as fractional seconds.
+
+### `formatDuration(d: i64): string`
+
+Renders a duration the way a person reads it: `340ns`, `340ms`, `45s`, `1h23m4s`. Below one second it prints a single truncated unit; at or above one second it prints hours, minutes and seconds, each truncated to a whole second.
+
 ## Where to go next
 
 - Installing zone data in a container with no `/usr/share/zoneinfo`: `std/tz`.
