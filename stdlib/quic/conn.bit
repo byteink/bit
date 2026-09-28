@@ -282,6 +282,23 @@ class quicconnDgram { data: []byte, host: string, port: int, eof: bool }
 // data is delivered on.
 class quicconnOpenReply { id: int, recvCh: chan<StreamChunk> }
 
+// Wait for `reply` (open/accept's answer), racing it against `doneCh` (closed
+// by `quicconnLoop`, loop.bit, the instant it exits) so a caller whose command
+// was sent after the loop already drained `cmdCh` for the last time gets the
+// same "connection closed" sentinel (`id = -1`) immediately, rather than
+// waiting on a reply nobody is left to send (#6243). Shared by `Conn.openStream`
+// and `Conn.acceptStream`, the two callers of this reply shape.
+fn quicconnAwaitOpen(reply: chan<quicconnOpenReply>, doneCh: chan<int>): quicconnOpenReply {
+  let r = quicconnOpenReply{ id = -1, recvCh = chan<StreamChunk>(1) }
+  select {
+    case v = <- reply:
+      r = v
+    case _ = <- doneCh:
+      {}
+  }
+  return r
+}
+
 // One command from the public API to the loop. `replyOpen` answers open/accept;
 // `replyInt` answers finish (delivery complete) and unblocks the caller.
 class quicconnCmd {
@@ -313,6 +330,11 @@ export class StreamChunk {
 export class Conn {
   cmdCh: chan<quicconnCmd>
   sock: UdpSocket
+  // Closed (never sent) by the loop the instant it exits (`quicconnLoop`,
+  // loop.bit) — `openStream`/`acceptStream` race it against their reply so a
+  // command sent after the loop is already gone fails immediately instead of
+  // waiting on a reply nobody is left to send.
+  doneCh: chan<int>
   // The peer's IPv4 address as of the handshake, dotted quad, or "" — see
   // `peerIp`. A plain field rather than a command round-trip to the loop: it is
   // written once, before the handshake is published, and never again.
@@ -357,14 +379,14 @@ export class Conn {
       replyOpen = reply,
       replyInt = chan<int>(1),
     }
-    let r = <- reply
+    let r = quicconnAwaitOpen(reply, this.doneCh)
     if (r.id == -2) {
       fail newError("quic: peer stream limit reached")
     }
     if (r.id < 0) {
       fail newError("quic: connection closed")
     }
-    return Stream{ streamId = r.id, cmdCh = this.cmdCh, recvCh = r.recvCh }
+    return Stream{ streamId = r.id, cmdCh = this.cmdCh, recvCh = r.recvCh, doneCh = this.doneCh }
   }
 
   // Accept the next peer-initiated bidirectional stream, blocking until one opens.
@@ -378,11 +400,11 @@ export class Conn {
       replyOpen = reply,
       replyInt = chan<int>(1),
     }
-    let r = <- reply
+    let r = quicconnAwaitOpen(reply, this.doneCh)
     if (r.id < 0) {
       fail newError("quic: connection closed")
     }
-    return Stream{ streamId = r.id, cmdCh = this.cmdCh, recvCh = r.recvCh }
+    return Stream{ streamId = r.id, cmdCh = this.cmdCh, recvCh = r.recvCh, doneCh = this.doneCh }
   }
 
   // Set how long this connection tolerates hearing nothing from its peer before it
@@ -430,6 +452,9 @@ export class Stream {
   export streamId: int
   cmdCh: chan<quicconnCmd>
   recvCh: chan<StreamChunk>
+  // Closed by the loop the instant it exits — see `Conn.doneCh`'s doc comment;
+  // `finish` races it the same way `openStream`/`acceptStream` do.
+  doneCh: chan<int>
   // Queue `data` on the stream. Returns once buffered; the loop delivers it under
   // flow control and congestion control, retransmitting any losses.
   export write(data: []byte): ()! {
@@ -455,7 +480,13 @@ export class Stream {
       replyOpen = chan<quicconnOpenReply>(1),
       replyInt = done,
     }
-    let r = <- done
+    let r = -1
+    select {
+      case v = <- done:
+        r = v
+      case _ = <- this.doneCh:
+        {}
+    }
     if (r < 0) {
       fail newError("quic: connection closed before the stream drained")
     }
