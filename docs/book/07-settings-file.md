@@ -136,16 +136,14 @@ this is the real `docs/book/ink/main.bit`'s `currentSettings`:
 ```bit
 fn currentSettings(): Settings {
   return loadSettings("ink.toml") catch _ {
-    Settings{ draftsDir = "~/.ink/drafts", wordsPerMinute = 200, databaseUrl = "" }
+    defaultSettings()
   }
 }
 ```
 
 A missing `ink.toml` file itself is `readFile`'s own error, not one this
 chapter adds - `currentSettings` treats "no file" the same as "file with no
-`[ink]` table": fall back to the built-in defaults. `databaseUrl` is not an
-`ink.toml` key; [chapter 10](/book/10-a-real-database) explains where it
-comes from and what it selects.
+`[ink]` table": fall back to the built-in defaults.
 
 ## Sharp edges
 
