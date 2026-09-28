@@ -188,6 +188,12 @@ appended to any other slice is a compile error (**E0130**) naming both shapes.
 Both shapes share `append`'s aliasing rule - the result may share `dst`'s
 backing buffer, so only the returned value is guaranteed to observe the growth.
 
+There is no third, slice-concatenation shape: `x` itself being a slice of
+`dst`'s element type is judged by the element shape above like any other `x`,
+so `append(dst, src)` with `src: []T` requires `[]T` to be assignable to `T`,
+which is never true. To append every element of `src` into `dst`, spread it
+into the variadic trailing parameter instead (§12.4): `append(dst, ...src)`.
+
 **`parseFloat(s: string) -> f64`** converts decimal or hexadecimal float text to
 the nearest `f64`. The accepted text is an optional leading `+` or `-` followed
 by either `FLOAT_LIT` (§5.5) or a bare `DIGITS` sequence (§5.5) with no `.` and
