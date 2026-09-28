@@ -8,6 +8,16 @@ calling" at all. This part adds a `users` table and a `POST /auth/register`
 route. The hard rule for the whole chapter: a password is never stored as
 text you could read back.
 
+## Install pkg/auth
+
+`pkg/auth` requires `pkg/web` `^0.7.0`, already satisfied since
+[part 1](01-first-endpoint.md):
+
+```text
+$ bit add bitlang.org/pkg/auth@v0.2.0
+bit add: auth -> bitlang.org/pkg/auth@0.2.0 (907c8fce4a4573408766286fcae3f722df27c6ee)
+```
+
 ## Why you never store the plain password
 
 If Inkwell's database ever leaks, and one day some database somewhere does,
