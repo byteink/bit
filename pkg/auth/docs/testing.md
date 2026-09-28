@@ -49,16 +49,32 @@ fn fakeSecret(): []byte { return []byte("test-hmac-secret-do-not-use-in-prod") }
 fn buildFakeStrategy(): OidcStrategy! {
   let tls = newTlsConfig(emptyTrustStore())
 
-  let discoveryDoc = "{\"issuer\":\"" + fakeIssuer + "\"," +
-    "\"authorization_endpoint\":\"" + fakeIssuer + "/authorize\"," +
-    "\"token_endpoint\":\"" + fakeIssuer + "/token\"," +
-    "\"jwks_uri\":\"" + fakeIssuer + "/jwks\"}"
-  let discoverOnce: HttpFetch = (url) => { return discoveryDoc }
+  let discoveryDoc = "{\"issuer\":\"" +
+    fakeIssuer +
+    "\"," +
+    "\"authorization_endpoint\":\"" +
+    fakeIssuer +
+    "/authorize\"," +
+    "\"token_endpoint\":\"" +
+    fakeIssuer +
+    "/token\"," +
+    "\"jwks_uri\":\"" +
+    fakeIssuer +
+    "/jwks\"}"
+  let discoverOnce: HttpFetch = (url) => {
+    return discoveryDoc
+  }
   let config = discoverFetch(fakeIssuer, tls, discoverOnce)?
 
-  let jwksDoc = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"" + fakeKid + "\"," +
-    "\"k\":\"" + encodeBase64Url(fakeSecret()) + "\"}]}"
-  let jwksOnce: HttpFetch = (url) => { return jwksDoc }
+  let jwksDoc = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"" +
+    fakeKid +
+    "\"," +
+    "\"k\":\"" +
+    encodeBase64Url(fakeSecret()) +
+    "\"}]}"
+  let jwksOnce: HttpFetch = (url) => {
+    return jwksDoc
+  }
   let jwks = newJwksCacheFetch(config.jwksUri, tls, jwksOnce)?
 
   return OidcStrategy{
