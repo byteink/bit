@@ -784,7 +784,10 @@ import { Json, JsonEntry, jsonSchema, jsonEncode } from "std/json"
 }
 
 // {"type":"object","properties":{"theme":{"type":"string"},
-//  "retries":{"type":["integer","null"]}},"required":["theme","retries"]}
+//  "retries":{"type":["integer","null"]}},"required":["theme","retries"],
+//  "$defs":{"Settings":{"type":"object","properties":{"theme":
+//  {"type":"string"},"retries":{"type":["integer","null"]}},
+//  "required":["theme","retries"]}}}
 fn settingsSchema(): string {
   return jsonEncode(jsonSchema<Settings>())
 }
@@ -797,6 +800,14 @@ and a nested `@json` class to a `$ref`. `Option<T>` folds `"null"` into `T`'s
 own fragment (`anyOf` when `T` is a nested class, which has no `type` keyword
 of its own to widen). `required` names every field with no exception, since
 `@json` never omits a key.
+
+The document also carries a top-level `"$defs"`: one entry per `@json` class
+reachable from `T` through a chain of nested-class fields, `T` itself
+included — deduplicated, so a diamond (two fields reaching the same nested
+class) or a cycle (`class Node { next: Option<Node> }`) each contribute
+exactly one entry. A caller can `$ref` the root from elsewhere (an OpenAPI
+document's own `components/schemas`, for instance) the same way any nested
+class already is.
 
 ### `jsonDecodeLenient<T>(j: Json): T!`
 

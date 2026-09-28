@@ -1251,7 +1251,16 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
     expansion |
 
   The whole class becomes `{"type": "object", "properties": {...},
-  "required": [...]}`. `required` names every field's key with no
+  "required": [...], "$defs": {...}}`. `$defs` is always present, even for a
+  root with no nested field: it holds every class REACHABLE FROM the root
+  through a chain of nested-class fields, the root itself included, each
+  rendered the same way (no further `$defs` nested inside one of its own
+  entries) - so a caller can `$ref` the root from elsewhere (an OpenAPI
+  document's own `components/schemas`) exactly as any nested class already
+  is. The walk only follows a field into a class declared in the SAME
+  module as the one holding the field; a nested class reached through a
+  named import from another module keeps its `$ref` string but has no
+  matching `$defs` entry yet. `required` names every field's key with no
   exception: `@json` never omits a key (an absent `Option<T>` is an
   explicit `null`, not a missing one), so the schema's `required` set is
   exactly the class's declared field set. `@key("...")` overrides a
