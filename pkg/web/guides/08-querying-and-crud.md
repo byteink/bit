@@ -2,12 +2,14 @@
 
 <!-- doctest: deps postgres orm -->
 
-The `articles` table exists (part 7), but nothing in Inkwell can read or
+The `articles` table exists ([chapter
+20](07-tables-and-migrations-with-pkg-orm.md)), but nothing in Inkwell can read or
 write a row yet. This part gives `GET /articles`, `GET /articles/:id`,
 `POST /articles`, `PUT /articles/:id` and `DELETE /articles/:id` real
 behaviour, backed by `pkg/orm`'s query builder and `save()`. Articles don't
-have an author you can log in as yet - that arrives in part 10 - so for
-now a request names its `authorId` directly.
+have an author you can log in as yet - that arrives in [chapter
+23](10-registering-users-and-hashing-passwords.md) - so for now a request
+names its `authorId` directly.
 
 ## The class, and the two functions every other one calls
 
@@ -133,7 +135,8 @@ export fn mountArticles(app: App, db: Data) {
 }
 ```
 
-`app.use(envelope())` is already mounted from part 4, so every response
+`app.use(envelope())` is already mounted from [chapter
+17](04-errors-and-consistent-responses.md), so every response
 here carries `{"data": ...}`. Run Inkwell and try it against an empty
 database:
 
@@ -311,10 +314,9 @@ fn deleteArticle(c: Ctx, db: Data): Res! {
 
 `delete` is imported under another name on purpose: `delete` is also a
 built-in name (for removing a map key), and a bare, unimported `delete(...)`
-call silently resolves to the wrong one with no diagnostic
-([tracked](https://github.com/byteink/bit) as a compiler bug - #6084).
-Importing it explicitly, under a name that can't collide, is the way every
-file in this course that calls `orm`'s `delete` writes it.
+call silently resolves to the wrong one with no diagnostic - a known
+compiler gap. Importing it explicitly, under a name that can't collide, is
+the way every file in this part that calls `orm`'s `delete` writes it.
 
 `existing` came back from `findArticleById`, whose mapper already called
 `markPersisted(true)`, so `save` here builds an `UPDATE`, not a second

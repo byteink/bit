@@ -39,7 +39,7 @@ fn buildApp(secret: string): App {
 }
 ```
 
-`MemoryStore(10_000)` is fine for one process and for this course. A second
+`MemoryStore(10_000)` is fine for one process and for this part. A second
 Inkwell process would not share it; swapping in a `SessionStore` backed by
 Redis or Postgres later is a one-line change, because every route that reads
 or writes a session goes through the same `c.session()` call.
@@ -94,7 +94,7 @@ fn userLookup(db: Data): Lookup {
 `newPasswordStrategy(userLookup(db))` wraps that into a `Strategy`: given a
 request, it reads a `{"username": ..., "password": ...}` JSON body, calls
 your lookup, and verifies the password against the stored Argon2id hash with
-the same algorithm [part 10](10-registering-users-and-hashing-passwords.md)
+the same algorithm [chapter 23](10-registering-users-and-hashing-passwords.md)
 hashed it with. A wrong password and an unknown username answer with the
 identical `401 Unauthorized`, in the identical amount of time: if the two
 cases looked or felt different from the outside, an attacker could use that
@@ -235,7 +235,8 @@ session store would mount `csrf()` on that form's routes, and only those.
 
 ## Try it
 
-Register a user first (part 10), then log in, keeping the cookie jar:
+Register a user first ([chapter 23](10-registering-users-and-hashing-passwords.md)),
+then log in, keeping the cookie jar:
 
 ```
 $ curl -si -c cookies.txt -X POST http://127.0.0.1:8089/auth/login \
@@ -294,7 +295,8 @@ Content-Type: application/json
 ```
 
 (Every response above also carries Inkwell's own security and rate-limit
-headers, part 13's subject; they are trimmed here to keep the point visible.)
+headers, [chapter 26](13-middleware.md)'s subject; they are trimmed here to
+keep the point visible.)
 
 ## What we built
 
@@ -303,7 +305,8 @@ headers, part 13's subject; they are trimmed here to keep the point visible.)
 explicit `save()` call. `POST /auth/logout` that destroys the session
 outright, and `GET /me` that
 reads the logged-in caller back. Every route in Inkwell can now ask "who is
-calling", but not yet "are they allowed to do this": that is part 12.
+calling", but not yet "are they allowed to do this": that is [chapter
+25](12-authorization.md).
 
 Previous: [Registering users and hashing passwords](10-registering-users-and-hashing-passwords.md).
 Next: [Authorization](12-authorization.md).

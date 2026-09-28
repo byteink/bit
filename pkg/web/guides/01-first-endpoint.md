@@ -1,4 +1,4 @@
-# Part 1: First endpoint
+# First endpoint
 
 <!-- doctest: per-block -->
 
@@ -9,7 +9,8 @@ write here: Inkwell, a blogging API you will grow part by part.
 
 ## Install pkg/web
 
-Make a directory for the project and turn it into a Bit project:
+[Get started](../../../docs/get-started.md) covers installing Bit and `bit init` in full;
+this part picks up from an empty project directory:
 
 ```text
 $ mkdir inkwell && cd inkwell
@@ -17,7 +18,7 @@ $ bit init inkwell
 bit init: wrote bit.json
 ```
 
-Add `pkg/web`, the framework this whole course is built on:
+Add `pkg/web`, the framework this part of the Book is built on:
 
 ```text
 $ bit add bitlang.org/pkg/web@v0.7.0
@@ -32,8 +33,9 @@ language pins what you actually got.
 
 An `App` is where every request starts. You build one with a `Config`, then
 register a route on it before serving. `Config.secret` has no default
-because it signs cookies later in the course - for now, a literal string is
-enough to get running; part 5 loads it from the environment properly.
+because it signs cookies later in this part - for now, a literal string is
+enough to get running; [chapter 18](05-configuration.md) loads it from the
+environment properly.
 
 Create `main.bit`:
 
@@ -81,6 +83,6 @@ ok
 A running server with one route, `GET /health`, that answers `200 ok`. You
 installed `pkg/web`, wrote an `App`, and served your first request.
 
-Next: [Part 2, routing and route groups](02-routing-and-route-groups.md),
+Next: [Chapter 15, routing and route groups](02-routing-and-route-groups.md),
 where Inkwell gets its first real resource: articles, with a path parameter
 and routes grouped under one prefix.

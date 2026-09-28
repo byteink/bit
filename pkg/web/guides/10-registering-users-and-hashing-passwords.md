@@ -11,7 +11,7 @@ text you could read back.
 ## Install pkg/auth
 
 `pkg/auth` requires `pkg/web` `^0.7.0`, already satisfied since
-[part 1](01-first-endpoint.md):
+[chapter 14](01-first-endpoint.md):
 
 ```text
 $ bit add bitlang.org/pkg/auth@v0.2.0
@@ -63,7 +63,7 @@ import { AttrDesc, FieldDesc } from "std/sql"
   username: string
   email: string
   passwordHash: string
-  // "author" or "admin" - see part 12, Authorization.
+  // "author" or "admin" - see chapter 25, Authorization.
   role: string
   createdAt: i64
   updatedAt: i64
@@ -117,7 +117,7 @@ database.
 Every `POST` route in Inkwell that creates a row goes through one small
 helper, `insertGeneratedId` (`db.bit`): it builds the `INSERT ... RETURNING
 id` itself and hands back the id Postgres generated. This is the first place
-the course needs it, so it is shown once here; every later part reuses it
+this part of the Book needs it, so it is shown once here; every later part reuses it
 without repeating it.
 
 ```bit
@@ -239,7 +239,8 @@ Content-Type: application/json
 ```
 
 (Every response above also carries Inkwell's own security and rate-limit
-headers, part 13's subject; they are trimmed here to keep the point visible.)
+headers, [chapter 26](13-middleware.md)'s subject; they are trimmed here to
+keep the point visible.)
 
 ## What we built
 
@@ -247,7 +248,7 @@ A `users` table, a `PublicUser` shape that can never leak a password hash,
 and a `POST /auth/register` route that hashes with Argon2id, validates the
 body before touching the database, and turns a duplicate username or email
 into a `409` a client can show to the user. Nobody can log in yet: that is
-part 11.
+[chapter 24](11-sessions-and-logging-in.md).
 
 Previous: [Relationships](09-relationships.md).
 Next: [Sessions and logging in](11-sessions-and-logging-in.md).

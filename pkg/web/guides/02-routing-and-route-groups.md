@@ -1,4 +1,4 @@
-# Part 2: Routing and route groups
+# Routing and route groups
 
 <!-- doctest: per-block -->
 
@@ -10,7 +10,8 @@ fast. This part adds a second route with a path parameter, then groups both
 article routes under one prefix.
 
 The examples below use an in-memory list of articles, seeded with one entry,
-so you can see routing work before Inkwell has a database. [Part 6](06-connecting-to-postgresql.md) replaces it with a real PostgreSQL
+so you can see routing work before Inkwell has a database. [Chapter
+19](06-connecting-to-postgresql.md) replaces it with a real PostgreSQL
 connection; the shape of the code (a store you query and pass into your
 routes) stays the same.
 
@@ -164,9 +165,9 @@ Connection: keep-alive
 ```
 
 `mountArticles(app)` keeps every article route in one function, which is
-where Inkwell's real layout is headed: by the time the course adds users,
-tags and comments, each resource gets its own `mount` function and its own
-file.
+where Inkwell's real layout is headed: by the time this part of the Book
+adds users, tags and comments, each resource gets its own `mount` function
+and its own file.
 
 ## What we built
 
@@ -174,6 +175,6 @@ Inkwell now answers `GET /articles` with a list and `GET /articles/:id`
 with one article, both grouped under `/articles`, backed by an in-memory
 seed list. You used a route parameter, `app.group`, and `c.jsonList`.
 
-Next: [Part 3, request bodies and validation](03-request-bodies-and-validation.md),
+Next: [Chapter 16, request bodies and validation](03-request-bodies-and-validation.md),
 where you add `POST /articles` and reject a bad request before it reaches
 your code.

@@ -150,5 +150,7 @@ check depend on the database going down turning into a restart storm. And
 it stops the way a real deployment stops it: `SIGTERM` or `SIGINT` drains
 whatever is in flight instead of cutting it off.
 
-Previous: [Testing the API](16-testing-the-api.md). Next: [Shipping a
-single binary](18-shipping-a-single-binary.md).
+Previous: [Testing the API](16-testing-the-api.md). Part 4 ends here; the
+Book picks the thread back up at
+[Shipping](../../../docs/book/33-shipping.md), which builds this server
+(and the `ink` CLI from Parts 1-3) into a single binary.

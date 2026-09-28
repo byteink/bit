@@ -11,8 +11,9 @@ no matter how many tags an article has.
 
 ## The other two tables: User and Tag
 
-`users.bit` already declares `User`/`users(db)`/`findUserById` (part 8's own
-pattern, one level up), and `tags.bit` needs the same shape for `Tag`. This
+`users.bit` already declares `User`/`users(db)`/`findUserById` ([chapter
+21](08-querying-and-crud.md)'s own pattern, one level up), and `tags.bit`
+needs the same shape for `Tag`. This
 page repeats the minimum of both so every block below is complete on its
 own:
 
@@ -186,8 +187,9 @@ fn findArticleById(db: Data, id: i64): Article! {
 ```
 
 `@belongsTo("authorId")` names the foreign key already on `Article` - the
-owning side. `@manyToMany("article_tags")` names the join table part 7
-already migrated - both attributes are metadata the compiler keeps; Bit has
+owning side. `@manyToMany("article_tags")` names the join table [chapter
+20](07-tables-and-migrations-with-pkg-orm.md) already migrated - both
+attributes are metadata the compiler keeps; Bit has
 no reflection to read them back at runtime, which is why `articleTagsDesc()`
 hand-writes the same table and column names for `tagsLoader` to use.
 
@@ -273,8 +275,8 @@ fn showArticle(c: Ctx, db: Data): Res! {
 Add a relation field to a class, and `save()` breaks. Its generic `INSERT`
 writes every field `tableDescriptor()` knows about, `author` and `tags`
 included, and neither is a real column - there is nothing to bind a `User`
-or a `[]Tag` to. This is a real `pkg/orm` gap (filed as #6115), not
-something to work around quietly. Inkwell writes an article and its tags
+or a `[]Tag` to. This is a real `pkg/orm` gap, not something to work around
+quietly. Inkwell writes an article and its tags
 through one explicit `INSERT` naming only the real columns, then attaches
 the tags:
 
@@ -299,7 +301,7 @@ fn findTagByName(db: Data, name: string): Tag! {
   return tags(db).where("name", Value.Text(name)).oneOrFail()?
 }
 
-// `db.bit`'s own helper for the id-column issue #6101 fixes: name the real
+// `db.bit`'s own helper for the id-column gap above: name the real
 // columns by hand, read the generated `id` back through `returning id`,
 // never touch `tableDescriptor()`'s full field list.
 fn insertGeneratedId(db: Data, targetTable: string, cols: []string, args: []Value): i64! {
@@ -393,7 +395,7 @@ insert into article_tags (article_id, tag_id) values ($1, $2), ($3, $4)
   on conflict (article_id, tag_id) do nothing
 ```
 
-`insertGeneratedId` sidesteps #6115 the same way `update<Article>(db,
+`insertGeneratedId` sidesteps the same gap the same way `update<Article>(db,
 "articles", articleDesc().fields).where(...).set("title",
 ...).set("body", ...).run()` does for an edit - the query-builder path
 [Patch](../../orm/docs/patch.md) covers: both name each column by hand and
@@ -404,8 +406,9 @@ never try to write `author`/`tags`.
 `GET /articles/:id` eager-loads an article's author and tags in three
 queries through `with("author").with("tags")`, and `POST /articles` creates
 an article and attaches its tags - one statement each, not yet wrapped in a
-single transaction, which part 15 adds. `ArticleView` now carries
-`authorUsername` and `tags` alongside what part 8 built.
+single transaction, which [chapter 28](15-transactions.md) adds.
+`ArticleView` now carries `authorUsername` and `tags` alongside what
+[chapter 21](08-querying-and-crud.md) built.
 
 Specification: [Relations](../../orm/docs/relation.md), [Many-to-many
 relations](../../orm/docs/manytomany.md), [Patch](../../orm/docs/patch.md).

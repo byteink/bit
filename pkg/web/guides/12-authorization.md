@@ -9,13 +9,13 @@ change their own articles, and creating a tag is admin-only.
 
 Authentication answers "who is this". Authorization answers "what may they
 do", and it is a different question: `currentUserId` from
-[part 11](11-sessions-and-logging-in.md) already answers the first one on
-every request. This part is only ever about the second.
+[chapter 24](11-sessions-and-logging-in.md) already answers the first one on
+every request. This chapter is only ever about the second.
 
 ## The role a user carries
 
-[Part 10](10-registering-users-and-hashing-passwords.md)'s `User` has a
-`role` column, `"author"` or `"admin"`. Login (part 11) puts that role on
+[Chapter 23](10-registering-users-and-hashing-passwords.md)'s `User` has a
+`role` column, `"author"` or `"admin"`. Login (chapter 24) puts that role on
 the session as a claim, right alongside the user's id, so a protected route
 can read it back with no second database query:
 
@@ -159,7 +159,7 @@ allowed, before spending any work on what they sent.
 
 ## Try it
 
-Register two users (part 10) and log each in (part 11) into its own cookie
+Register two users (chapter 23) and log each in (chapter 24) into its own cookie
 jar. `owner` posts an article; `intruder` tries to edit it:
 
 ```
@@ -230,15 +230,16 @@ Location: /tags/1
 ```
 
 (Every response above also carries Inkwell's own security and rate-limit
-headers, part 13's subject; they are trimmed here to keep the point visible.)
+headers, [chapter 26](13-middleware.md)'s subject; they are trimmed here to
+keep the point visible.)
 
 ## What we built
 
 Two small, reusable checks, `requireOwnerOrAdmin` and `requireAdmin`, both
-reading the role part 11's login already put on the session, both failing
+reading the role chapter 24's login already put on the session, both failing
 `403` before a handler does any work it should not have done. Every route
 that changes an article, a comment, or the tag list in Inkwell now calls one
-of them. Next, the course turns to the middleware every route in the app
+of them. Next, this part turns to the middleware every route in the app
 shares: logging, CORS, security headers, and rate limits.
 
 Previous: [Sessions and logging in](11-sessions-and-logging-in.md).
