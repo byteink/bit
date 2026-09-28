@@ -55,6 +55,11 @@ fn withDeadline(url: string): Response! {
 | `getTimeout` / `postTimeout` / `requestTimeout(..., timeoutMs)` | bound the whole call - connect, send and read share one deadline |
 | `getTls` / `postTls` / `requestTls(..., config: TlsConfig)` | pin a CA, a `serverName`, or skip verification in a test - see [`std/tls`](tls.md) |
 
+Certificate verification is on by default for every https leg, including
+`https+h3://` (system roots, `insecureSkipVerify` false) - `getTls`/
+`postTls`/`requestTls` and a `Client`'s own config carry through to the HTTP/3
+leg exactly as they do to `https://`.
+
 There is no default timeout on `get`/`post`/`request`: a server that accepts
 a connection and never answers parks the caller forever. Use the `*Timeout`
 functions for anything talking to a service outside your own control.
@@ -220,7 +225,6 @@ starting from exactly the handler shown above.
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
 | `Server.setMaxBodyBytes(0)` or a zero `Limits` field to `parseMultipart` | refuses every body - `0` never means unlimited |
 | a client offering ALPN `h2` against a server that shares no protocol | the handshake is aborted, never silently downgraded |
-| an `https+h3://` request | unauthenticated - it does not verify the server's certificate; treat it as experimental |
 | `req.peer` on a hand-built `Request`, or one whose connection died early | `""`, never a placeholder address |
 
 ## Reference

@@ -35,6 +35,31 @@ fn getIndex(): H3Response! {
 }
 ```
 
+`h3Dial` verifies the server's certificate against the system trust roots -
+secure by default, like [`std/quic`](quic.md)'s own `dialQuic`. For a pinned
+CA or another custom TLS config, use `h3DialTls`:
+
+```bit
+import { h3DialTls, H3Request, H3Response, HeaderField } from "std/http3"
+import { TlsConfig, newTlsConfig } from "std/tls"
+import { TrustStore } from "std/crypto"
+
+// Dial an HTTP/3 server, pinning a specific CA instead of the system roots -
+// the shape std/http's `getTls`/`requestTls` use for the same reason.
+fn getIndexPinned(trust: TrustStore): H3Response! {
+  let conn = h3DialTls("127.0.0.1", 443, "example.com", newTlsConfig(trust))?
+  let req = H3Request{
+    method = "GET",
+    scheme = "https",
+    authority = "example.com",
+    path = "/",
+    headers = []HeaderField(0),
+    body = []byte(0),
+  }
+  return conn.request(req)?
+}
+```
+
 `h3Accept` is the server side of one connection on a bound UDP socket;
 `H3Conn.accept` reads the next request and `H3Conn.respond` answers it:
 
@@ -218,11 +243,19 @@ A received request paired with the stream it arrived on. `req` is the decoded `H
 
 ### `h3Dial(host: string, port: int, serverName: string): H3Conn!`
 
-Dials an HTTP/3 server at `host:port`, checking its certificate against `serverName`, completes the QUIC handshake, and sets up the control and QPACK streams. Fails if the connection or handshake fails.
+Dials an HTTP/3 server at `host:port`, verifying its certificate against `serverName` and the system trust roots (secure by default, like `std/quic`'s `dialQuic`), completes the QUIC handshake, and sets up the control and QPACK streams. Fails if the connection, verification, or handshake fails.
+
+### `h3DialTls(host: string, port: int, serverName: string, config: TlsConfig): H3Conn!`
+
+Like `h3Dial`, with an explicit `std/tls` `TlsConfig` - a pinned CA, `insecureSkipVerify` for tests, or another custom config, the same shape `std/http`'s `getTls`/`requestTls` use.
 
 ### `h3DialDeadline(host: string, port: int, serverName: string, deadlineNs: int): H3Conn!`
 
 Like `h3Dial`, bounded by an absolute deadline in nanoseconds. Once the handshake succeeds, the connection's idle timeout is lowered to whatever budget remains, so a peer that never answers is torn down within the deadline instead of the default.
+
+### `h3DialTlsDeadline(host: string, port: int, serverName: string, config: TlsConfig, deadlineNs: int): H3Conn!`
+
+`h3DialTls` bounded by an absolute deadline, exactly as `h3DialDeadline` bounds `h3Dial`.
 
 ### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
 

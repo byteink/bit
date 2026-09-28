@@ -14,10 +14,12 @@ streams instead of TCP.
 
 ## Dialing, serving, and streams
 
-`dialQuic` opens a connection and completes the handshake; `acceptQuic` does the
-server side on an already-bound socket, for one connection. A connection carries
-any number of bidirectional streams: `openStream`/`acceptStream` open one, `write`
-queues bytes, `finish` marks the send side done, `read` pulls reassembled bytes
+`dialQuic` opens a connection, verifying the server's certificate against the
+system trust roots (secure by default, like [`std/tls`](tls.md)'s own
+`dial`), and completes the handshake; `acceptQuic` does the server side on an
+already-bound socket, for one connection. A connection carries any number of
+bidirectional streams: `openStream`/`acceptStream` open one, `write` queues
+bytes, `finish` marks the send side done, `read` pulls reassembled bytes
 until `fin`.
 
 ```bit
@@ -61,6 +63,21 @@ fn serve(sock: UdpSocket, chainPem: string, keyPem: string): []byte! {
 }
 ```
 
+For a pinned CA, `insecureSkipVerify` in a test, or another custom TLS
+config, use `dialQuicTls` - the same `getTls`/`requestTls` shape
+[`std/http`](http.md) uses:
+
+```bit
+import { dialQuicTls, Conn } from "std/quic"
+import { TlsConfig, newTlsConfig } from "std/tls"
+import { TrustStore } from "std/crypto"
+
+// Dial, pinning a specific CA instead of the system roots.
+fn dialPinned(host: string, port: int, trust: TrustStore): Conn! {
+  return dialQuicTls(host, port, host, newTlsConfig(trust))?
+}
+```
+
 A server that expects more than one client uses `listenQuic` instead of
 `acceptQuic`: it owns the socket, demultiplexes every datagram to the right
 connection by id, and hands back each established connection through
@@ -94,8 +111,15 @@ HTTP.
 
 ### `dialQuic(host: string, port: int, serverName: string): Conn!`
 
-Opens a connection to `host:port` and completes the handshake before
-returning.
+Opens a connection to `host:port`, verifying the server's certificate
+against the system trust roots (or the small bundled set if those are
+unavailable) - secure by default, like `std/tls`'s own `dial` - and
+completes the handshake before returning.
+
+### `dialQuicTls(host: string, port: int, serverName: string, config: TlsConfig): Conn!`
+
+Like `dialQuic`, with an explicit `std/tls` `TlsConfig` - a pinned CA,
+`insecureSkipVerify` for tests, or another custom config.
 
 ### `acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Conn!`
 
