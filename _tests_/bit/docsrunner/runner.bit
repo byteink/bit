@@ -16,6 +16,7 @@
 import { readFile, writeFile, exists, isDir, mkdir, remove } from "std/fs"
 import { contains, parseInt } from "std/strings"
 import { env, envOr } from "std/os"
+import { DepEntry, projectManifest } from "../pkgdocs"
 
 // Everything a batch of checks needs. Resolved once, asserted once.
 export class Cfg {
@@ -26,6 +27,12 @@ export class Cfg {
   // normative spec, not reference docs — checked the same way and merged into
   // one page list by `docs.bit`'s `main`.
   export specDir: string,
+  // #6231: the repo's `pkg/` root, so a page's own `<!-- doctest: deps a b c
+  // -->` line (`docs.bit`'s own `pageDeps`, `pkgdocs/deps.bit`'s
+  // `resolveDeclaredDeps`) can resolve a first-party package the same way
+  // `pkgdocsgate.bit` already does — a local-path dependency onto this
+  // repo's own `pkg/<name>`, nothing fetched.
+  export pkgDir: string,
   // `export`: `docs.bit` calls `teardown(cfg.dir)` and names it in two
   // failure messages, across the module edge (SPEC 10.5, #4631).
   export dir: string, // scratch root, and the runner's cwd
@@ -52,6 +59,10 @@ export class CheckResult {
 export class Snippet {
   export src: string,
   export testFile: bool,
+  // #6231: the page's own resolved `<!-- doctest: deps a b c -->` entries, or
+  // empty for a page with no such line — `docs.bit`'s `pageDeps` decides
+  // this, since what a page declares is its business, not the runner's.
+  export deps: []DepEntry,
 }
 
 // The `main.bit` of a slot whose snippet went to `snippet.test.bit`. A module
@@ -233,6 +244,12 @@ fn slotMain(dir: string, i: int): string { return "${dir}/w${i}/main.bit" }
 // files are in the module `bit check "w$id"` reads — the snippet is checked,
 // not merely written.
 fn slotTest(dir: string, i: int): string { return "${dir}/w${i}/${testFileName}" }
+// #6231: a slot whose snippet declares `deps` gets its own `bit.json`/
+// `bit.lock`, directly in the slot's own directory — the same layout
+// `pkgdocsgate.bit`'s own scratch project uses, since `bit check "w$id"`
+// already treats `w$id` as the project root.
+fn slotBitJson(dir: string, i: int): string { return "${dir}/w${i}/bit.json" }
+fn slotBitLock(dir: string, i: int): string { return "${dir}/w${i}/bit.lock" }
 fn slotOut(dir: string, i: int): string { return "${dir}/o${i}" }
 fn slotStatus(dir: string, i: int): string { return "${dir}/s${i}" }
 fn slotClaim(dir: string, i: int): string { return "${dir}/c${i}" }
@@ -329,10 +346,22 @@ fn stageSlot(cfg: Cfg, i: int, s: Snippet) {
   if (s.testFile) {
     spill(slotMain(cfg.dir, i), stubMain, "scratch module stub")
     spill(slotTest(cfg.dir, i), s.src, "scratch test module")
-    return
+  } else {
+    spill(slotMain(cfg.dir, i), s.src, "scratch module")
+    scrub(slotTest(cfg.dir, i))
   }
-  spill(slotMain(cfg.dir, i), s.src, "scratch module")
-  scrub(slotTest(cfg.dir, i))
+  // #6231: a slot is reused by every batch, so a `bit.json`/`bit.lock` left
+  // by an earlier snippet's `deps` must not silently widen a later,
+  // dep-free snippet's own scratch project — the same stale-input trap
+  // `scrub(slotTest(...))` above already covers for the test-file slot.
+  if (len(s.deps) > 0) {
+    let (bitJson, bitLock) = projectManifest("docsgate-check", s.deps)
+    spill(slotBitJson(cfg.dir, i), bitJson, "scratch bit.json")
+    spill(slotBitLock(cfg.dir, i), bitLock, "scratch bit.lock")
+  } else {
+    scrub(slotBitJson(cfg.dir, i))
+    scrub(slotBitLock(cfg.dir, i))
+  }
 }
 
 // One module per source, plus the count the runner reads, plus a clean slate.
@@ -500,11 +529,47 @@ export fn plumbingTestFileSelfTest(cfg: Cfg) {
   }
 }
 
+// #6231's own plumbing proof, same shape and same reason as the three
+// self-tests above: the deps mechanism runs through a generated script too,
+// so it needs its own "the undeclared one must not come back clean" check.
+// Both snippets are byte-identical — only the declared `deps` differ —
+// which is what proves the DIRECTORY'S bit.json/bit.lock is what is doing
+// the work, not something about the snippet itself.
+export fn plumbingDepsSelfTest(cfg: Cfg) {
+  assert(cfg.jobs >= 2)
+  let toml = [DepEntry{ name = "toml", path = "${cfg.pkgDir}/toml" }]
+  let src = "import { tomlParse } from \"toml\"\n\nfn docsPlumbingDeps(s: string): ()! {\n  tomlParse(s)?\n  return\n}\n"
+  let rs = runBatch(
+    cfg,
+    [
+      Snippet{ src = src, testFile = false, deps = toml },
+      Snippet{ src = src, testFile = false, deps = []DepEntry(0) },
+    ],
+  )
+  assert(len(rs) == 2)
+  let good = rs[0]
+  let bad = rs[1]
+
+  if (good.code != 0) {
+    die("deps plumbing: a snippet with a declared 'toml' dependency did not check (status ${good.code}):\n${good.report}")
+  }
+  if (bad.code == 0) {
+    die("deps plumbing: the identical snippet with NO declared dependency checked clean — a slot's bit.json/bit.lock is not scoped per snippet, so a page importing an undeclared package would silently pass")
+  }
+  if (!contains(bad.report, "E0045")) {
+    die("deps plumbing: the snippet with no declared dependency failed (status ${bad.code}) but not with E0045:\n${bad.report}")
+  }
+}
+
 // The two snippet shapes, named rather than spelled out at each call site: a
 // bare string literal beside a `true`/`false` reads as neither at a glance.
-fn plain(src: string): Snippet { return Snippet{ src = src, testFile = false } }
+fn plain(src: string): Snippet {
+  return Snippet{ src = src, testFile = false, deps = []DepEntry(0) }
+}
 
-fn asTestFile(src: string): Snippet { return Snippet{ src = src, testFile = true } }
+fn asTestFile(src: string): Snippet {
+  return Snippet{ src = src, testFile = true, deps = []DepEntry(0) }
+}
 
 // A one-line, newline-escaped rendering, so a diff of captured text stays on one
 // line and an empty value is visibly empty rather than invisible.
@@ -544,6 +609,11 @@ export fn setup(root: string): Cfg {
     die("stdlib is not a directory: ${stdlibDir} (set BIT_STDLIB)")
   }
 
+  let pkgDir = "${root}/pkg"
+  if (!isDir(pkgDir)) {
+    die("not a directory: ${pkgDir}")
+  }
+
   // The compiler under test is the one built in this tree, never PATH's `bit`
   // — that is brew's release build, a different compiler entirely.
   let src = envOr("BIT", "${root}/bit-out/bin/bit")
@@ -571,6 +641,7 @@ export fn setup(root: string): Cfg {
     stdlibDir = stdlibDir,
     docsDir = docsDir,
     specDir = specDir,
+    pkgDir = pkgDir,
     dir = dir,
     jobs = fanout(),
     script = scriptFile(dir),
@@ -688,6 +759,8 @@ export fn teardown(dir: string) {
   while (i < maxJobs) {
     drop(slotMain(dir, i))
     drop(slotTest(dir, i))
+    drop(slotBitJson(dir, i))
+    drop(slotBitLock(dir, i))
     drop(slotOut(dir, i))
     drop(slotStatus(dir, i))
     drop(slotFmtOut(dir, i))

@@ -133,6 +133,11 @@ block the same way, against a scratch project whose only dependency is
 it with `<!-- doctest: deps a b c -->` (space-separated package names, one
 line) - naming an unknown package is a gate failure with a clear message.
 
+A page under `docs/` or `spec/` needing a first-party package (not just
+`std/*`) declares it the same way. `_tests_/bit/docs.bit` (`./make
+test-docs`) resolves each name against `pkg/<name>` and gives the page's
+scratch project that dependency, nothing else borrowed.
+
 Blocks are complete unless the omission is the point. When a body is
 genuinely beside the point, `// ...` marks it, and nothing else does.
 
