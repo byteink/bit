@@ -69,6 +69,15 @@ const h3FrameMaxPushId: int = 0x0d
 const h3SettingQpackMaxTableCapacity: int = 0x01
 const h3SettingQpackBlockedStreams: int = 0x07
 
+// HTTP/3 error codes we use (RFC 9114 §8.1). `h3ErrNoError` closes a
+// connection that has drained cleanly; `h3ErrRequestRejected` abandons a
+// request stream the server never handed to application code at all (a
+// request opened after this connection's own GOAWAY, §4.1.1 — distinct from
+// `H3_REQUEST_CANCELLED`, which is for a request abandoned mid-processing,
+// not this module's case today).
+const h3ErrNoError: int = 0x0100
+const h3ErrRequestRejected: int = 0x010b
+
 // The bound on how many peer streams `accept` will classify before it must have
 // found a request stream — the three uni streams plus a generous margin.
 const h3AcceptScan: int = 64
@@ -104,6 +113,32 @@ export class H3Conn {
   control: Stream
   qpackEnc: Stream
   qpackDec: Stream
+  // The highest client-initiated request stream id `accept` has handed to a
+  // caller so far, or -1 before the first one. The cutoff `goAway` sends is
+  // derived from this — see `goAway`'s doc comment.
+  highWater: int
+  // Whether `goAway` has already run — a graceful shutdown (RFC 9114 §5.2:
+  // "the identifier in each frame MUST NOT be greater than the identifier in
+  // any previous frame") calls it at most once per connection, so this also
+  // guards against a second call re-deriving (and possibly growing) the
+  // cutoff.
+  goawaySent: bool
+  // The cutoff `goAway` last sent: request streams at or above this id are
+  // refused by `accept` instead of being handed to a caller (RFC 9114 §5.2 /
+  // §4.1.1). Meaningless while `goawaySent` is false.
+  goawayId: int
+
+  // The underlying QUIC connection this `H3Conn` runs over — an escape hatch
+  // for a caller that needs to drive a raw stream directly (a test proving
+  // the frame-level shape of a protocol response, or a future protocol
+  // layered under HTTP/3 on the same connection, e.g. RFC 9220 WebTransport).
+  // Ordinary HTTP/3 traffic never needs this — use `request`/`accept`/
+  // `respond` instead, which keep this connection's QPACK state and stream
+  // bookkeeping (`highWater`, `goawaySent`) consistent; driving `rawConn()`
+  // directly does not update either.
+  export rawConn(): Conn {
+    return this.conn
+  }
 
   // The client's IPv4 address in dotted quad, or "" when it is not known.
   // Forwards `quic.Conn.peerIp` unchanged, including its ruling on which
@@ -136,8 +171,11 @@ export class H3Conn {
   // Accept the next request. Peer-initiated streams are classified by their leading
   // byte: a control stream (0x00), qpack-encoder stream (0x02) and qpack-decoder
   // stream (0x03) are consumed into the QPACK state and skipped; the first stream
-  // that is none of these is a request stream (its HEADERS frame type, 0x01), which
-  // is read to completion, decoded, and returned. Blocks until such a stream opens.
+  // that is none of these is a request stream (its HEADERS frame type, 0x01).
+  // A request stream at or above a cutoff this connection has already sent in a
+  // GOAWAY (`goAway`) is refused (`h3refuse`, RFC 9114 §5.2/§4.1.1) instead of
+  // being read and returned — the scan continues past it. Otherwise it is read
+  // to completion, decoded, and returned. Blocks until such a stream opens.
   export accept(): H3ServerRequest! {
     let guard = 0
     while (guard < h3AcceptScan) {
@@ -153,8 +191,16 @@ export class H3Conn {
         } else if (t == h3StreamQpackDecoder) {
           this.enc.applyDecoderStream(h3tail(first.data))?
         } else {
+          let sid = s.id()
+          if (this.goawaySent && sid >= this.goawayId) {
+            h3refuse(s)
+            continue
+          }
+          if (sid > this.highWater) {
+            this.highWater = sid
+          }
           let buf = h3readRest(s, first)?
-          let req = h3parseRequest(this, s.id(), buf)?
+          let req = h3parseRequest(this, sid, buf)?
           return H3ServerRequest{ req = req, stream = s }
         }
       }
@@ -175,11 +221,42 @@ export class H3Conn {
     sr.stream.finish()?
   }
 
-  // Close the connection: send a GOAWAY, then tear down the underlying QUIC
-  // connection and its socket.
+  // Begin a graceful shutdown of just this connection (RFC 9114 §5.2): send a
+  // GOAWAY naming the stream id one past `highWater` — the highest request
+  // stream `accept` has handed to a caller so far — so every request already
+  // accepted is left alone (its id is below the cutoff) and `accept` refuses
+  // anything opened after this point (`h3refuse`, this connection's own
+  // `accept` doc comment). "MAY be zero if no requests were processed" (RFC
+  // 9114 §5.2) falls out of the same formula: `highWater` starts at -1, so an
+  // untouched connection's cutoff is 0. A no-op past the first call — see
+  // `goawaySent`'s doc comment for why a second, possibly-larger cutoff must
+  // never be sent.
+  export goAway() {
+    if (this.goawaySent) {
+      return
+    }
+    let cutoff = this.highWater + 1
+    h3sendGoaway(this, cutoff)
+    this.goawaySent = true
+    this.goawayId = cutoff
+  }
+
+  // Whether `goAway` has already run on this connection — a caller serving
+  // it (`serveH3Conn`, stdlib/http/h3.bit) reads this to stop asking `accept`
+  // for more requests once the one it may already be handling finishes,
+  // instead of waiting for the peer to hang up or a shutdown timeout to pass.
+  export draining(): bool {
+    return this.goawaySent
+  }
+
+  // Close the connection: send this connection's GOAWAY (`goAway`, a no-op if
+  // one was already sent) naming exactly what was and was not processed, then
+  // close the underlying QUIC connection with H3_NO_ERROR — "an endpoint that
+  // completes a graceful shutdown SHOULD use the H3_NO_ERROR error code when
+  // closing the connection" (RFC 9114 §5.2).
   export close() {
-    h3sendGoaway(this)
-    this.conn.close()
+    this.goAway()
+    this.conn.closeWithCode(h3ErrNoError)
   }
 }
 
@@ -493,6 +570,9 @@ fn h3newConn(conn: Conn, isClient: bool): H3Conn! {
     control = control,
     qpackEnc = qpackEnc,
     qpackDec = qpackDec,
+    highWater = -1,
+    goawaySent = false,
+    goawayId = -1,
   }
 }
 
@@ -555,6 +635,15 @@ export class H3Listener {
     let conn = this.lst.accept()?
     return h3newConn(conn, false)?
   }
+
+  // Stop admitting brand-new QUIC connections on the underlying socket, while
+  // continuing to demultiplex datagrams for connections already accepted
+  // (`quic.Listener.stopAccepting`'s own doc comment has the mechanism).
+  // `std/http`'s `H3Server.shutdown` calls this as its drain's `closeListener`
+  // step.
+  export stopAccepting() {
+    this.lst.stopAccepting()
+  }
 }
 
 // Start an HTTP/3 listener on the bound UDP socket `sock` with the PEM
@@ -573,11 +662,21 @@ export fn h3Listen(sock: UdpSocket, certChainPem: string, keyPem: string): H3Lis
 // Server accept / respond
 // ---------------------------------------------------------------------------
 
-// Best-effort GOAWAY on the control stream (RFC 9114 §5.2), ignoring a write error
-// on an already-closing connection.
-fn h3sendGoaway(c: H3Conn) {
-  c.control.write(h3frame(h3FrameGoaway, encodeVarint(u64(0)))) catch _ {
+// Best-effort GOAWAY on the control stream (RFC 9114 §5.2) naming `streamId` as
+// the cutoff, ignoring a write error on an already-closing connection.
+fn h3sendGoaway(c: H3Conn, streamId: int) {
+  c.control.write(h3frame(h3FrameGoaway, encodeVarint(u64(streamId)))) catch _ {
     return
   }
+}
+
+// Refuse a request stream this connection's own GOAWAY already covers
+// (`H3Conn.accept`): reset both directions with H3_REQUEST_REJECTED — no
+// application processing was ever done, so RFC 9114 §4.1.1 calls for
+// H3_REQUEST_REJECTED, not H3_REQUEST_CANCELLED. Best-effort: the stream may
+// already be gone by the time this runs.
+fn h3refuse(s: Stream) {
+  s.reset(h3ErrRequestRejected) catch _ {}
+  s.stopSending(h3ErrRequestRejected) catch _ {}
 }
 

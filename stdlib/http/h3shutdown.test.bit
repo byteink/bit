@@ -1,0 +1,385 @@
+// stdlib/http/h3shutdown.test.bit — `H3Server.shutdown` (h3.bit, #6094): the
+// HTTP/3 mirror of `TlsServer.shutdown`'s own graceful drain
+// (`_tests_/imports/httpgracefultls`'s scenarios), proven the same way — real
+// QUIC connections, a handler that blocks until told to answer, and a raw
+// `H3Conn` client kept open across the `shutdown` call so a second request on
+// the SAME connection proves the GOAWAY refusal, not just a fresh dial
+// failing.
+//
+// `H3Server`, `h3Serve`, `serveH3ServerOn`, `H3Conn`, `h3Dial`, `H3Request`,
+// `ok`, `sleep`, `Millisecond`, `monotonic` are all module siblings
+// (server.bit, h3.bit, http.bit, client.bit — SPEC §19: `http.bit` already
+// imports the `std/http3` names module-wide); `tls5916Pem`, `tls5916LeafHex`,
+// `tls5916KeyHex` (tls.test.bit, same module) are the shared throwaway test
+// PKI every h3 loopback fixture in this repo already uses. `since` (std/time)
+// is new to this module.
+import { since } from "std/time"
+
+fn h3sdCertPem(): string {
+  return tls5916Pem("CERTIFICATE", tls5916LeafHex)
+}
+fn h3sdKeyPem(): string {
+  return tls5916Pem("PRIVATE KEY", tls5916KeyHex)
+}
+
+fn h3sdServe(hs: H3Server, handler: (Request) => Response) {
+  serveH3ServerOn(hs, handler) catch _ {
+    return
+  }
+}
+
+// A handler that signals `startedCh` the instant it is invoked (proof the
+// request genuinely reached it), then blocks on `releaseCh` before
+// answering — the in-flight work `shutdown` must protect, released by the
+// test once `shutdown` is under way.
+fn h3sdSlowHandler(startedCh: chan<bool>, releaseCh: chan<bool>): (Request) => Response {
+  return (req) => {
+    startedCh <- true
+    <- releaseCh
+    return ok("slow-done")
+  }
+}
+
+fn h3sdQuickHandler(req: Request): Response {
+  return ok("quick")
+}
+
+class h3sdRequestResult { status: int, body: string, errMsg: string }
+
+fn h3sdDoRequest(conn: H3Conn, path: string, resultCh: chan<h3sdRequestResult>) {
+  let res = conn.request(
+    H3Request{
+      method = "GET", scheme = "https", authority = "localhost", path = path,
+      headers = []HeaderField(0), body = []byte(0),
+    },
+  ) catch e {
+    resultCh <- h3sdRequestResult{ status = 0, body = "", errMsg = e.message() }
+    return
+  }
+  resultCh <- h3sdRequestResult{ status = res.status, body = string(res.body), errMsg = "" }
+}
+
+class h3sdShutdownResult { errMsg: string, elapsedMs: int }
+
+fn h3sdDoShutdown(hs: H3Server, timeoutMs: int): h3sdShutdownResult {
+  let t0 = monotonic()
+  let msg = ""
+  hs.shutdown(timeoutMs) catch e {
+    msg = e.message()
+  }
+  return h3sdShutdownResult{ errMsg = msg, elapsedMs = since(t0) / Millisecond }
+}
+
+// `h3sdDoShutdown` run on its own green thread, for a scenario that needs
+// `shutdown` running WHILE the test does something else on the connection it
+// is draining.
+fn h3sdBackgroundShutdown(hs: H3Server, timeoutMs: int, resultCh: chan<h3sdShutdownResult>) {
+  resultCh <- h3sdDoShutdown(hs, timeoutMs)
+}
+
+// An in-flight request started before `shutdown` still gets its real
+// response, and `shutdown` itself returns without error well inside its
+// timeout budget once that response lands.
+test "an in-flight HTTP/3 request completes during shutdown" {
+  let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
+    assert(false, "h3Serve: ${e.message()}")
+    return
+  }
+  let port = hs.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let startedCh = chan<bool>(1)
+  let releaseCh = chan<bool>(1)
+  spawn h3sdServe(hs, h3sdSlowHandler(startedCh, releaseCh))
+
+  let conn = h3Dial("127.0.0.1", port, "localhost") catch e {
+    assert(false, "h3Dial: ${e.message()}")
+    return
+  }
+  let resultCh = chan<h3sdRequestResult>(1)
+  spawn h3sdDoRequest(conn, "/", resultCh)
+  <- startedCh
+
+  // `shutdown` is now blocked waiting for the handler above; release it once
+  // shutdown is genuinely mid-drain, not before.
+  spawn h3sdRelease(releaseCh)
+  let out = h3sdDoShutdown(hs, 5000)
+  assert(len(out.errMsg) == 0, "shutdown reported an error: ${out.errMsg}")
+
+  let res = <- resultCh
+  assert(
+    res.status == 200 && res.body == "slow-done",
+    "in-flight request did not complete: status=${res.status} body='${res.body}' err='${res.errMsg}'",
+  )
+  assert(out.elapsedMs < 5000, "shutdown took ${out.elapsedMs}ms, want under its 5000ms timeout")
+  conn.close()
+}
+
+// `h3sdRelease` runs on its own green thread so the handler is released only
+// once `shutdown` has had a moment to register as mid-drain — a fixed short
+// delay, matching the idle-registration wait `httpgracefultls`'s own TCP
+// scenarios use for the same "not a race with the caller itself" reason.
+fn h3sdRelease(releaseCh: chan<bool>) {
+  sleep(50 * Millisecond)
+  releaseCh <- true
+}
+
+// A second request on a connection that closed right after finishing its
+// one in-flight request (RFC 9114 §5.2: "once all accepted requests... have
+// been processed, the endpoint... MAY initiate an immediate closure") fails
+// locally — proving the server never answered it — and does not extend how
+// long `shutdown` waits.
+test "a second request on a connection shutdown already finished draining fails" {
+  let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
+    assert(false, "h3Serve: ${e.message()}")
+    return
+  }
+  let port = hs.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let startedCh = chan<bool>(1)
+  let releaseCh = chan<bool>(1)
+  spawn h3sdServe(hs, h3sdSlowHandler(startedCh, releaseCh))
+
+  let conn = h3Dial("127.0.0.1", port, "localhost") catch e {
+    assert(false, "h3Dial: ${e.message()}")
+    return
+  }
+  let firstCh = chan<h3sdRequestResult>(1)
+  spawn h3sdDoRequest(conn, "/first", firstCh)
+  <- startedCh
+
+  spawn h3sdRelease(releaseCh)
+  let out = h3sdDoShutdown(hs, 5000)
+  assert(len(out.errMsg) == 0, "shutdown reported an error: ${out.errMsg}")
+
+  let first = <- firstCh
+  assert(first.status == 200, "the in-flight request did not complete: status=${first.status}")
+
+  // The connection itself is force-closed once shutdown finishes draining
+  // it (`H3Conn.close`), so a second request now fails locally — proving the
+  // server never answered it, which is what "refused" means here.
+  let secondCh = chan<h3sdRequestResult>(1)
+  spawn h3sdDoRequest(conn, "/second", secondCh)
+  let second = <- secondCh
+  assert(
+    second.status == 0 && len(second.errMsg) > 0,
+    "a request after GOAWAY was answered: status=${second.status} body='${second.body}'",
+  )
+  conn.close()
+}
+
+// A connection whose in-flight request never finishes is force-closed once
+// `timeoutMs` elapses — `shutdown` returns close to that bound, reporting how
+// many connections it cut, not stuck waiting forever.
+test "a request that never finishes is force-closed at the shutdown deadline" {
+  let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
+    assert(false, "h3Serve: ${e.message()}")
+    return
+  }
+  let port = hs.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let startedCh = chan<bool>(1)
+  // Never released within the test — the deadline, not a release signal,
+  // must be what ends this request.
+  let releaseCh = chan<bool>(1)
+  spawn h3sdServe(hs, h3sdSlowHandler(startedCh, releaseCh))
+
+  let conn = h3Dial("127.0.0.1", port, "localhost") catch e {
+    assert(false, "h3Dial: ${e.message()}")
+    return
+  }
+  let resultCh = chan<h3sdRequestResult>(1)
+  spawn h3sdDoRequest(conn, "/", resultCh)
+  <- startedCh
+
+  let out = h3sdDoShutdown(hs, 300)
+  assert(len(out.errMsg) > 0, "shutdown reported no error for a connection it had to force-close")
+  assert(
+    out.elapsedMs < 3000,
+    "shutdown took ${out.elapsedMs}ms, want close to its 300ms timeout, not unbounded",
+  )
+  conn.close()
+}
+
+// A connection accepted but idle (handshake done, no request sent yet) is
+// force-closed immediately at shutdown, not held for the timeout — the same
+// "nothing promised yet" rule `TlsServer.shutdown`'s idle scenario proves for
+// TCP (`drainSweepIdle`, shutdown.bit).
+test "an idle HTTP/3 connection is closed immediately, not held for the timeout" {
+  let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
+    assert(false, "h3Serve: ${e.message()}")
+    return
+  }
+  let port = hs.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn h3sdServe(hs, h3sdQuickHandler)
+
+  let conn = h3Dial("127.0.0.1", port, "localhost") catch e {
+    assert(false, "h3Dial: ${e.message()}")
+    return
+  }
+  // Give the accept loop a moment to register the connection before
+  // shutdown runs, so this tests "idle and already registered", not a race
+  // with `accept()` itself (matches `httpgracefultls`'s own idle scenario).
+  sleep(50 * Millisecond)
+
+  let out = h3sdDoShutdown(hs, 60000)
+  assert(len(out.errMsg) == 0, "shutdown reported an error for an idle connection: ${out.errMsg}")
+  assert(
+    out.elapsedMs < 5000,
+    "shutdown of an idle connection took ${out.elapsedMs}ms, want well under its 60000ms timeout",
+  )
+  conn.close()
+}
+
+// A connection that has already answered one request, and is back inside
+// `accept` waiting for a second when `shutdown` starts, still gets its
+// `goAway` (RFC 9114 §5.2) — `drainSweepIdle` only force-closes a connection
+// that has never served a request; one that has stays "active" and gets
+// signalled instead (shutdown.bit's own `connEntry` doc comment). A raw
+// stream opened on it afterward, at or above the cutoff `goAway` sent, is
+// what `accept` refuses: reset with H3_REQUEST_REJECTED (0x010b, RFC 9114
+// §4.1.1 — 267 decimal), not answered. This is `H3Conn.accept`'s explicit
+// per-stream refusal, distinct from `h3shutdown.test.bit`'s other refusal
+// scenario (a connection closing right after its ONE in-flight request).
+test "a raw stream opened at or above the GOAWAY cutoff is reset with H3_REQUEST_REJECTED" {
+  let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
+    assert(false, "h3Serve: ${e.message()}")
+    return
+  }
+  let port = hs.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn h3sdServe(hs, h3sdQuickHandler)
+
+  let conn = h3Dial("127.0.0.1", port, "localhost") catch e {
+    assert(false, "h3Dial: ${e.message()}")
+    return
+  }
+  let firstCh = chan<h3sdRequestResult>(1)
+  spawn h3sdDoRequest(conn, "/first", firstCh)
+  let first = <- firstCh
+  assert(first.status == 200, "the first request did not complete: status=${first.status}")
+
+  // The connection is now idle between requests, blocked inside `accept`.
+  // Give the server a moment to be back there before shutdown runs.
+  sleep(50 * Millisecond)
+
+  let shutdownCh = chan<h3sdShutdownResult>(1)
+  spawn h3sdBackgroundShutdown(hs, 2000, shutdownCh)
+  // `goAway` is the first thing `shutdown` does to an active connection,
+  // well before its timeout — give it a moment to run before opening the
+  // stream this test refuses.
+  sleep(50 * Millisecond)
+
+  // A raw stream, not a real HTTP/3 request: `accept`'s refusal check runs
+  // BEFORE any frame is parsed, on the leading byte's classification alone
+  // (h3.bit's `H3Conn.accept` doc comment), so one arbitrary byte — matching
+  // none of the control(0x00)/qpack-encoder(0x02)/qpack-decoder(0x03) stream
+  // types — is enough to land in that check.
+  let s = conn.rawConn().openStream() catch e {
+    assert(false, "openStream: ${e.message()}")
+    return
+  }
+  s.write([]byte{ 1 }) catch e {
+    assert(false, "write: ${e.message()}")
+    return
+  }
+  s.finish() catch _ {}
+  let chunk = s.read() catch e {
+    assert(false, "read: ${e.message()}")
+    return
+  }
+  assert(
+    chunk.reset,
+    "expected the refused stream to be reset, got fin=${chunk.fin} data-len=${len(chunk.data)}",
+  )
+  assert(
+    chunk.resetCode == 267,
+    "reset code = ${chunk.resetCode}, want 267 (H3_REQUEST_REJECTED, RFC 9114 §8.1)",
+  )
+
+  // Nothing will ever make this now-permanently-idle connection deregister
+  // on its own, so `shutdown` waits out its full timeout and force-closes it.
+  let out = <- shutdownCh
+  assert(len(out.errMsg) > 0, "shutdown reported no error for a connection it had to force-close")
+  conn.close()
+}
+
+// #6149: a brand-new QUIC connection attempted while `shutdown` is draining
+// is refused (its handshake never completes — `Listener.stopAccepting`,
+// stdlib/quic/listener.bit), while the connection already in flight when
+// `shutdown` started still gets its real response.
+test "a new QUIC connection attempted mid-drain is refused while an in-flight one completes" {
+  let hs = h3Serve("127.0.0.1", 0, h3sdCertPem(), h3sdKeyPem()) catch e {
+    assert(false, "h3Serve: ${e.message()}")
+    return
+  }
+  let port = hs.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  let startedCh = chan<bool>(1)
+  let releaseCh = chan<bool>(1)
+  spawn h3sdServe(hs, h3sdSlowHandler(startedCh, releaseCh))
+
+  let conn = h3Dial("127.0.0.1", port, "localhost") catch e {
+    assert(false, "h3Dial: ${e.message()}")
+    return
+  }
+  let firstCh = chan<h3sdRequestResult>(1)
+  spawn h3sdDoRequest(conn, "/", firstCh)
+  <- startedCh
+
+  let shutdownCh = chan<h3sdShutdownResult>(1)
+  spawn h3sdBackgroundShutdown(hs, 5000, shutdownCh)
+  // `stopAccepting` is `shutdown`'s very first step (its `closeListener`),
+  // well before the wait for the in-flight request below — give it a moment
+  // to run before dialing.
+  sleep(50 * Millisecond)
+
+  // A fresh dial against a listener that is dropping every new connection's
+  // Initial: the handshake never completes, so this fails at its own fixed
+  // 5s ceiling (`quicconnHandshakeTimeout`, stdlib/quic/conn.bit) rather than
+  // hanging — spawned so it runs alongside the in-flight request below
+  // instead of serializing after it.
+  let newConnCh = chan<h3sdRequestResult>(1)
+  spawn h3sdFailedDial(port, newConnCh)
+
+  spawn h3sdRelease(releaseCh)
+  let first = <- firstCh
+  assert(
+    first.status == 200 && first.body == "slow-done",
+    "the in-flight request did not complete: status=${first.status} body='${first.body}'",
+  )
+
+  let out = <- shutdownCh
+  assert(len(out.errMsg) == 0, "shutdown reported an error: ${out.errMsg}")
+
+  let newConn = <- newConnCh
+  assert(
+    newConn.status == 0 && len(newConn.errMsg) > 0,
+    "a connection attempted mid-drain was admitted: status=${newConn.status}",
+  )
+  conn.close()
+}
+
+// Dial a fresh HTTP/3 connection on `port`, reporting failure through the
+// same `h3sdRequestResult` shape the request helpers use (status 0, the
+// dial error's message) so every scenario in this file shares one result
+// type.
+fn h3sdFailedDial(port: int, resultCh: chan<h3sdRequestResult>) {
+  h3Dial("127.0.0.1", port, "localhost") catch e {
+    resultCh <- h3sdRequestResult{ status = 0, body = "", errMsg = e.message() }
+    return
+  }
+  resultCh <- h3sdRequestResult{ status = 200, body = "", errMsg = "" }
+}

@@ -391,6 +391,13 @@ Accept the next HTTP/3 connection, blocking until a client completes its handsha
 and set up its control and QPACK streams. Run each returned `H3Conn` on its own
 green thread.
 
+### `H3Listener.stopAccepting()`
+
+Stop admitting brand-new QUIC connections on the underlying socket, while
+connections already accepted keep being served (`quic.Listener.stopAccepting`'s
+own doc comment has the mechanism). `std/http`'s `H3Server.shutdown` calls this
+as the first step of draining an HTTP/3 server.
+
 ### `H3Conn.request(req: H3Request): H3Response!`
 
 Send `req` and read the response. Opens a client-initiated bidirectional stream,
@@ -424,7 +431,35 @@ over one connection and the address belongs to the connection. `std/http`'s
 `serveH3` does exactly that, which is how an HTTP/3 handler's `Request.peer` gets
 filled.
 
+### `H3Conn.goAway()`
+
+Begin a graceful shutdown of just this connection (RFC 9114 §5.2): send a GOAWAY
+naming the stream id one past the highest request stream `accept` has handed to a
+caller so far. Every request already accepted is left alone - its id is below the
+cutoff - and a request opened after this point is refused (reset with
+`H3_REQUEST_REJECTED`, RFC 9114 §4.1.1) instead of being read and returned. A
+no-op past the first call on a connection - RFC 9114 §5.2 forbids a later GOAWAY
+naming a larger identifier than an earlier one. `std/http`'s `H3Server.shutdown`
+calls this on every connection with a request in flight when it starts draining.
+
+### `H3Conn.draining(): bool`
+
+Whether `goAway` has already run on this connection. `std/http`'s `serveH3Conn`
+(the loop behind `serveH3ServerOn`/`H3Server`) reads this to stop asking `accept`
+for more requests once the one it may already be handling finishes, instead of
+waiting for the peer to hang up or a shutdown timeout to pass.
+
+### `H3Conn.rawConn(): Conn`
+
+The underlying `quic.Conn` this connection runs over - an escape hatch for a
+caller that needs to drive a raw stream directly, rather than through
+`request`/`accept`/`respond`. Driving it directly does not update this
+connection's own QPACK state or stream bookkeeping (`goAway`'s cutoff among
+it), so ordinary HTTP/3 traffic should never need this.
+
 ### `H3Conn.close()`
 
-Close the connection: send a GOAWAY on the control stream (best effort), then tear
-down the underlying QUIC connection and its socket.
+Close the connection: send this connection's GOAWAY (`goAway`, a no-op if one was
+already sent), then close the underlying QUIC connection with `H3_NO_ERROR` -
+"an endpoint that completes a graceful shutdown SHOULD use the H3_NO_ERROR error
+code when closing the connection" (RFC 9114 §5.2).

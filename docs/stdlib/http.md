@@ -850,6 +850,15 @@ thread, including over HTTP/2 for a client that negotiates `h2` - exactly as
 `ts.drain` so `ts.shutdown(timeoutMs)` can stop it. Returns only on an accept
 error.
 
+### `TlsServer.attachH3(hs: H3Server)`
+
+Pair `hs` (an `H3Server`, [HTTP/3](#http3) below) with this TLS listener so
+`shutdown()` also drains it. `tlsServe` never sets one - only this call does.
+`pkg/web`'s `bindTls` (the glue behind `App.listenTls()`/`App.serveTls()`) is the
+intended caller: it binds `hs` on the same port number right after `tlsServe` and
+attaches it so a caller driving only the returned `TlsServer` still gets HTTP/3
+drained by the one `shutdown()` call.
+
 ### `TlsServer.shutdown(timeoutMs: int): ()!`
 
 Stops `ts` accepting new TLS connections and drains requests already in
@@ -861,6 +870,12 @@ in-flight stream is sent `GOAWAY` first, so its peer opens no further stream
 on it while the current one finishes; a connection with no stream yet is
 force-closed immediately, same as an idle HTTP/1.1 connection. Safe to call
 from a signal handler and safe to call twice (or concurrently).
+
+If `ts` was paired with an HTTP/3 server (`TlsServer.attachH3`, used by
+`pkg/web`'s `App.listenTls()`/`serveTls()` to pair `tlsServe` with `h3Serve`,
+see [HTTP/3](#http3) below), `shutdown` drains that too, over the same
+`timeoutMs` budget - see `H3Server.shutdown` below for its own GOAWAY
+sequence.
 
 ```bit
 import { tlsServe, serveTlsServerOn, ok, Request, Response, TlsServer } from "std/http"
@@ -1042,6 +1057,80 @@ one side on port 0, read the number back, and bind the other side on it - retryi
 the pair if that number is already taken on the other protocol. Everything else is
 exactly `serveH3`: one green thread per accepted QUIC connection, a bounded accept
 loop, and a return when the socket closes.
+
+### `H3Server`
+
+`serveH3`/`serveH3On` have no way to stop other than killing the process - the
+same gap `Server`/`TlsServer` had before `shutdown()`. `H3Server` is the
+shutdown-capable mirror: bind one with `h3Serve`, drive it with
+`serveH3ServerOn`, and stop it with `shutdown()`.
+
+### `h3Serve(host, port, certPem, keyPem): H3Server!`
+
+Binds `host:port` (UDP) for HTTP/3 the same way `serveH3` does, and returns a
+handle instead of serving immediately - the h3 mirror of `tlsServe`. `port` 0
+lets the kernel choose one; read it back with `H3Server.port()`.
+
+### `H3Server.port(): int!`
+
+The UDP port this server is bound to.
+
+### `serveH3ServerOn(hs: H3Server, handler: (Request) => Response): ()!`
+
+The shutdown-capable mirror of `serveH3On`: serves HTTP/3 forever on an
+already-bound `hs`, dispatching each request to `handler` on its own green
+thread. Every accepted connection registers with `hs.drain` so
+`hs.shutdown(timeoutMs)` can stop it. Returns only once the underlying
+listener stops handing back connections.
+
+### `H3Server.shutdown(timeoutMs: int): ()!`
+
+Stops `hs` accepting new connections and new requests on connections already
+open, and drains requests already in flight, then returns - the HTTP/3 mirror
+of `TlsServer.shutdown()`. First, `hs`'s listener stops admitting brand-new
+QUIC connections (`H3Listener.stopAccepting`) - a client attempting one gets
+no answer and its handshake times out, the same outcome a fresh dial against
+a closed TCP listener gets. A connection currently answering a request is
+sent `GOAWAY` (RFC 9114 §5.2) naming the highest request stream it has
+accepted, so its peer opens no further stream on it - one that arrives anyway
+is refused with `H3_REQUEST_REJECTED` (RFC 9114 §4.1.1) - and once that
+request's response is sent, the connection closes right away rather than
+waiting for the peer to hang up or `timeoutMs` to pass. A connection with no
+request in flight yet is closed immediately, the same "nothing promised yet"
+rule `TlsServer.shutdown()`'s idle connections follow. Whatever is still
+running once `timeoutMs` elapses is force-closed; the error names how many.
+
+A known, documented gap: refusing a new connection drops its Initial packet
+rather than replying with a CONNECTION_CLOSE (RFC 9000 §5.2.2's SHOULD) -
+`Listener.stopAccepting`'s own doc (`quic.md`) has why.
+
+```bit
+import { h3Serve, serveH3ServerOn, ok, Request, Response, H3Server } from "std/http"
+
+fn route(req: Request): Response {
+  return ok("ok")
+}
+
+fn runH3WithShutdown(certPem: string, keyPem: string): H3Server! {
+  let hs = h3Serve("127.0.0.1", 0, certPem, keyPem)?
+  spawn serveH3Forever(hs)
+  return hs
+}
+
+fn serveH3Forever(hs: H3Server) {
+  serveH3ServerOn(hs, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
+}
+
+// Elsewhere, e.g. a signal handler: stop within 5s, force-closing anything
+// still running past that.
+fn stop(hs: H3Server) {
+  hs.shutdown(5000) catch e {
+    print("shutdown: ${e.message()}\n")
+  }
+}
+```
 
 ### `Client`
 

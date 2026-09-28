@@ -867,6 +867,29 @@ connection id (up to an internal cap). Obtain one from `listenQuic`.
 Accept the next established connection, blocking until a client completes its
 handshake. Each returned `Conn` is independent, multiplexed over the shared socket.
 
+### `Listener.stopAccepting()`
+
+Stop admitting brand-new connections: a datagram whose connection id is not
+already in the demux table is silently dropped from then on, instead of being
+checked for a client Initial and possibly starting a new connection. A
+connection already accepted, or still mid-handshake, is unaffected - it keeps
+being fed its datagrams over the one shared socket exactly as before. This
+stops admission, not the demux loop every open connection depends on, so it is
+safe to call while other connections are still in flight. Idempotent, and safe
+to call from any green thread.
+
+RFC 9000 §5.2.2 lists two options for refusing a new connection: drop the
+packet, or reply with an Initial packet carrying a CONNECTION_CLOSE frame
+(error code CONNECTION_REFUSED) - the latter "SHOULD" when a server can. This
+implementation does the former: a stateless, Initial-protected reply has to be
+built outside any established connection's key schedule, which this listener
+does not do yet. A dropped Initial still ends the attempt - the client's own
+retransmission, and failing that its handshake-timeout-driven redial, gives up
+once nothing ever answers.
+
+`std/http`'s `H3Server.shutdown` (stdlib/http/h3.bit) calls this as the first
+step of draining an HTTP/3 server.
+
 ### `Conn`
 
 An established QUIC connection. Its methods marshal to the owning loop thread over
@@ -924,7 +947,16 @@ on the next tick and applies to a connection from either side.
 Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
 socket if this connection owns it. A connection accepted from a `Listener` shares
 the listener's socket with the listener and every sibling connection, so closing
-it leaves that socket alone. Best-effort - there is no draining timeout.
+it leaves that socket alone. Best-effort - there is no draining timeout. Equivalent
+to `closeWithCode(0)`.
+
+### `Conn.closeWithCode(code: int)`
+
+As `close()`, but the CONNECTION_CLOSE's application error code is `code` instead
+of always 0 - the general form an application protocol layered on QUIC needs to
+close with ITS OWN code space instead of QUIC's own "no error" 0. `std/http3`'s
+`H3Conn.close()` uses this to close with HTTP/3's `H3_NO_ERROR` (0x0100, RFC 9114
+§8.1) rather than QUIC's 0.
 
 ### `Stream`
 
