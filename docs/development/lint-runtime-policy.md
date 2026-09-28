@@ -8,7 +8,7 @@ triage elsewhere in this repo, out of scope for a readability-policy
 document).
 
 **`runtime/` is not `compiler/`/`stdlib/`, and this policy is not a copy of
-[docs/lint/policy.md](policy.md).** That document's defaults are "fix, or
+[docs/development/lint-remediation-policy.md](lint-remediation-policy.md).** That document's defaults are "fix, or
 raise per-function for a proven-flat function." Here the population is
 structurally different: the overwhelming majority of findings sit on
 `@nosplit` functions, `@symbol("bit_rt_port_...")` C-ABI boundary shims,
@@ -115,7 +115,7 @@ syscall or Win32 API wrapper (`nanosleep`,
 `SetThreadStackGuarantee`, `bit_rt_port_park_wait`,
 `bit_rt_port_park_wake`, `bit_rt_port_chan_try_send_drop`), and every one
 returns a plain `i32`/`int`/`bool` - none is `T!`, `Option`, or `Result`,
-so `docs/lint/policy.md`'s fallible-result carve-out never applies here and
+so `docs/development/lint-remediation-policy.md`'s fallible-result carve-out never applies here and
 there is no correctness question to route.
 
 **Read every call site before applying the mechanical fix, not just its
@@ -181,7 +181,7 @@ gate. Nothing to add.
 
 ## E0212 `unreachable-code` - NO FINDINGS TODAY; POLICY FOR IF ONE APPEARS: FIX, NO OVERRIDE
 
-Zero in `runtime/` today. `docs/lint/policy.md`'s own E0212 section
+Zero in `runtime/` today. `docs/development/lint-remediation-policy.md`'s own E0212 section
 established, empirically rather than by argument, that this rule's
 findings in this codebase are always real dead code, never a checker-gap
 false positive, because `lintUnreachableCode` reuses the exact same
@@ -194,7 +194,7 @@ containing module (exit 0, no new diagnostics). No `allow` path - same as
 
 ## E0210 `unused-import` - FIX (done this session)
 
-**Decision: fix**, same reasoning as `docs/lint/policy.md`'s E0210 section -
+**Decision: fix**, same reasoning as `docs/development/lint-remediation-policy.md`'s E0210 section -
 a dead import misleads the next reader about a module's dependencies, and
 the rule has no raise/override path at all (it is boolean, and the
 convention this codebase uses for "keep an import for a side effect only" is

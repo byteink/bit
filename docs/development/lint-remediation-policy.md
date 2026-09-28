@@ -7,7 +7,7 @@ Do not use this document to disposition an E0214 finding.
 
 **This is not a second rulebook.** [spec/LINT.md](../../spec/LINT.md) is the
 authority for every rule's definition, default limit, and override grammar;
-[docs/reference/lint.md](../reference/lint.md) is the user-facing companion
+[docs/tools/lint.md](../tools/lint.md) is the user-facing companion
 that explains the same mechanics in prose. Neither states what THIS codebase
 should do with the findings it currently has - that decision is this
 document's only job. Where this document quotes a message or a default, it is
@@ -58,7 +58,7 @@ same-day baseline (E0201 compiler 77→79; every other cell matched exactly):
 | E0210 `unused-import` | 0 | 1 | fix |
 
 `compiler/ 712 findings, stdlib/ 680 findings` including E0214 (8 compiler, 22
-stdlib - out of scope here, already dispositioned; see docs/lint/baseline.md's
+stdlib - out of scope here, already dispositioned; see docs/development/lint-baseline.md's
 E0214 section). Excluding E0214: compiler 704, stdlib 658.
 
 ## The constraint this whole document is answerable to
@@ -79,7 +79,7 @@ supposed to be obvious on sight.
 
 **Decision: fix. No raise path exists** - `max-fn-lines`/`max-params`/etc. are
 threshold rules with a numeric override; `unused-local` is boolean and has
-none. `docs/reference/lint.md` already states the house rule directly: *"Prefer
+none. `docs/tools/lint.md` already states the house rule directly: *"Prefer
 fixing over stamping for `unused-import`/`unused-local`: a dead import or a
 leftover binding should be deleted, not excused with a comment."* This
 document adopts that rule for the current 680 combined findings without
@@ -130,7 +130,7 @@ grep -c '^warning\[E0211\]' "$LOG"   # must be 0
 > `'${name}' is imported but never used`
 > hint: `remove the import, or bind it to '_' if it is needed only for a side effect`
 
-**Decision: fix.** Same rule and same reasoning as E0211 - `docs/reference/lint.md`
+**Decision: fix.** Same rule and same reasoning as E0211 - `docs/tools/lint.md`
 names both together. A prior pass dropped the three unused `std/http3`
 imports in `stdlib/http/http.bit` that this rule's findings traced to; the
 single remaining `stdlib/` finding is either new debt from a later commit or
