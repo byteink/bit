@@ -521,6 +521,15 @@ Opt-in because QUIC needs UDP and a heavier handshake than plain TLS-over-TCP.
 
 A shutdown-capable HTTP/3 server handle, bound with `h3Serve`.
 
+### `H3Server.port(): int!`
+
+The port this HTTP/3 server is actually bound to.
+
+### `H3Server.shutdown(timeoutMs: int): ()!`
+
+Stops this HTTP/3 server gracefully: drains requests already in flight,
+then force-closes whatever is still running once `timeoutMs` elapses.
+
 ### `h3Serve(host: string, port: int, certPem: string, keyPem: string): H3Server!`
 
 Binds `host:port` (UDP) for HTTP/3 and returns a shutdown-capable handle.
@@ -727,6 +736,13 @@ Reasonable defaults for an ordinary web upload form.
 
 The result of a successful `parseMultipart`: every text field and file part,
 in the order they appeared.
+
+### `parseMultipart(body: []byte, boundary: string, limits: Limits): Form!`
+
+Parses `body` as a multipart form message delimited by `boundary`, the value
+of the request's `Content-Type: multipart/form-data; boundary=...`
+parameter without the leading `--`. Fails with no partial `Form` on the
+first problem, such as an over-limit body, file, or part count.
 
 ### `Form.value(name: string): string`
 
