@@ -1,116 +1,66 @@
-// pkg/web/realtime.bit — #6072: the accept loop `App.listen()`/`serve()`
-// (app.bit) switch to once `App.hijackable` is true, plus what a route
-// reaches through `c.hijack()` once it is serving: `wsUpgrade` (stdlib/
-// websocket, RFC 6455), and `Stream`/`SSE`, a hand-framed HTTP/1.1 chunked
-// writer for a body with no fixed length and no upper bound. See ctx.bit's
-// `hijack()`/`takeExchange()` for the Ctx-side half and its security note,
-// and app.bit's `Route.hijackable()`/`App.hijackable` for how a route opts
-// in and how that choice reaches here.
+// pkg/web/realtime.bit — #6072: what a route reaches through `c.hijack()`
+// once it is serving: `wsUpgrade` (stdlib/websocket, RFC 6455), and
+// `Stream`/`SSE`, a hand-framed HTTP/1.1 chunked writer for a body with no
+// fixed length and no upper bound. See ctx.bit's `hijack()`/`takeExchange()`
+// for the Ctx-side half and its security note, and app.bit's
+// `Route.hijackable()`/`App.hijackable` for how a route opts in.
 //
-// WHY A SEPARATE ACCEPT LOOP, NOT A CHANGE TO `listenAndServeOn`. Ordinary
-// traffic runs through std/http's `listenAndServe`/`listenAndServeOn`,
-// whose handler is `(Request) => Response` (stdlib/http/server.bit) — a
-// fixed one-shot contract with no `Exchange` anywhere on it to hijack.
-// `listenAndServeOn`'s own accept loop (`serveOne`/`answerOne`) reads
-// requests and writes responses straight off a byte stream; it never builds
-// an `Exchange` at all, so there is nothing on that path to plumb a hijack
-// through, and it is PRIVATE to std/http besides. Taking a connection over
-// needs std/http's OTHER server surface — `serve()` + `Server.accept()`,
-// which returns the `Exchange` `Exchange.hijack()` is a method of — so
-// `serveHijackableOn`/`serveHijackableBackground` below drive that directly,
-// on their own accept loop, and `App.listen()`/`serve()` choose between the
-// two loops once, at freeze() time (`App.hijackable`), never per request.
-//
-// ONE REQUEST PER CONNECTION ON THIS LOOP, on purpose, and APP-WIDE once
-// `App.hijackable` is true — not per connection. `listenAndServeOn`'s
-// keep-alive machinery (idle timeout, max-requests-per-connection) exists to
-// reuse a connection across many short-lived requests, which is meaningless
-// the moment a request on it may hijack: a WebSocket, an SSE stream or a
-// hand-framed body all keep the connection open for the exchange's own
-// life, never for a NEXT request. This loop cannot mix the two PER
-// CONNECTION either, because stdlib/http's `Exchange` is one-shot by design
-// (its own doc comment: "one request per connection in v1") — there is no
-// primitive yet that reads a request, keeps the connection open for another
-// one when it was ordinary, AND can still hand the connection over when one
-// of them is not. So an app that registers even one `.hijackable()` route
-// pays this for ALL its traffic, not only that route's — a real cost for a
-// mixed app, filed as #6102 rather than solved here, since closing it needs
-// a keep-alive-capable hijack primitive in stdlib/http, not a pkg/web
-// change (#6103 is the separate TLS/HTTP2/HTTP3 gap, app.bit's
-// `listenTls()` comment).
-import { Conn as WsConn, upgrade, Limits } from "std/websocket"
-
-// `App.listen()`'s hijack-aware branch: accept forever on the already-bound
-// `s`, dispatching every connection through `serveHijackExchange` on its own
-// green thread. Returns only on an accept error — including the one
-// `s.close()`/`s.shutdown()` (stdlib/http) produces, which `listen()`
-// propagates exactly as it always has for the ordinary path.
-fn serveHijackableOn(s: Server, app: App): ()! {
-  while (true) {
-    let ex = s.accept()?
-    spawn serveHijackExchange(app, ex)
-  }
-}
-
-// `App.serve()`'s hijack-aware branch, the exact mirror of app.bit's own
-// `serveBackground`: swallows `serveHijackableOn`'s return, since ending is
-// the intended outcome of `Server.shutdown()`/`close()`, not a defect with
-// no caller left to report it to.
-fn serveHijackableBackground(s: Server, app: App) {
-  serveHijackableOn(s, app) catch _ {
-    return
-  }
-}
-
-// One accepted connection, on its own green thread (the same reason
-// `listenAndServeOn`'s accept loop spawns one per connection, server.bit's
-// own comment: a stalled or malicious peer must only ever block itself). A
-// request this exchange could not even parse gets a bare `400` and the
-// connection is dropped — there is no route to have hijacked yet.
-fn serveHijackExchange(app: App, ex: Exchange) {
-  let req = ex.read() catch _ {
-    ex.respond(respond(400, "")) catch e {
-      logLine(app.config.logs, "web: hijack: answering a malformed request: ${e.message()}")
-    }
-    return
-  }
-  let res = dispatchHijackable(app, ex, req)
-  if (isSome(res)) {
-    ex.respond(unwrap(res)) catch e {
-      logLine(app.config.logs, "web: hijack: writing the response: ${e.message()}")
-    }
-  }
-}
+// #6102: this file no longer drives its own accept loop. Before #6102,
+// `std/http`'s `Exchange` was one-shot by design ("one request per
+// connection in v1"), so an app with even one `.hijackable()` route had to
+// run EVERY connection through a loop that answered exactly one request and
+// closed — `serveHijackableOn`/`serveHijackableBackground`/
+// `serveHijackExchange`, formerly here, duplicating `listenAndServeOn`'s
+// accept loop (server.bit) with none of its keep-alive. `std/http` now
+// exports that primitive itself (`HijackOutcome`/`serveHijackableOn`/
+// `serveHijackableBackground`, stdlib/http/hijack.bit): keep-alive for every
+// connection, and only the one whose request returns `HijackOutcome.
+// Hijacked` stops looping — `App.listen()`/`serve()` (app.bit) call it
+// directly, passing `dispatchHijackable` below as the handler. What is left
+// here is exactly the router lookup and `Ctx` construction a hijack-capable
+// request needs — the same work `dispatchHijackable` always did — now
+// returning `std/http`'s own `HijackOutcome` instead of an `Option<Response>`
+// this file used to translate back into one itself.
+// `HijackOutcome` (std/http) is already bound module-wide by app.bit's own
+// import (SPEC §19) — importing it again here would be E0042.
+import { Conn as WsConn, upgrade, upgradeTls, Limits } from "std/websocket"
+// `TlsConn` (#6152): `tlsWire`'s field type, below — `std/http`'s own
+// `TlsExchange.hijack()` returns it, but naming the type here needs its own
+// import (`TlsServer`, app.bit's import, does not re-export it).
+import { TlsConn } from "std/tls"
 
 // The router lookup and `Ctx` construction, mirroring `routed`/
 // `matchedResponse`/`missResponse` (adapter.bit) with one difference: this
 // `Ctx` carries the `Exchange` (`c.exchange`, ctx.bit), and the result is
-// `Option.None` — nothing to send — when the chain hijacked the connection
-// instead of returning an ordinary response. Not reused from adapter.bit
-// directly: every function there returns a `Response` unconditionally, with
-// no way to say "already answered on the wire, send nothing".
-fn dispatchHijackable(app: App, ex: Exchange, req: Request): Option<Response> {
+// `HijackOutcome.Hijacked` — nothing to send — when the chain hijacked the
+// connection instead of returning an ordinary response. Not reused from
+// adapter.bit directly: every function there returns a `Response`
+// unconditionally, with no way to say "already answered on the wire, send
+// nothing". `App.listen()`/`serve()` (app.bit) pass this directly to
+// `std/http`'s `serveHijackableOn`/`serveHijackableBackground` as the
+// per-request handler.
+fn dispatchHijackable(app: App, ex: Exchange, req: Request): HijackOutcome {
   let split = splitTarget(req.path)
   let m = app.root.router.lookup(req.method, split.0) catch e {
     let c = newCtx(req, nil, app.root.registry, app.config, "") catch ce {
-      return Option.Some(frame(app, failureRes(app, requestFailure(req, ce))))
+      return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
     }
     c.exchange = Option.Some(ex)
     c.routeMiss = e
     return runHijackable(app, c, app.missHandler)
   }
   let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
-    return Option.Some(frame(app, failureRes(app, requestFailure(req, ce))))
+    return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
   }
   c.exchange = Option.Some(ex)
   return runHijackable(app, c, m.handler)
 }
 
-// Runs the composed chain and converts whatever comes back — `Option.None`
-// the instant `c.hijacked` is true, whether the chain returned normally
-// (its `Res` is discarded; the app already wrote its own response line) or
-// failed AFTER hijacking (nothing sane to frame onto a connection the app
-// already owns; the failure is the app's problem now, same posture
+// Runs the composed chain and converts whatever comes back — `HijackOutcome.
+// Hijacked` the instant `c.hijacked` is true, whether the chain returned
+// normally (its `Res` is discarded; the app already wrote its own response
+// line) or failed AFTER hijacking (nothing sane to frame onto a connection
+// the app already owns; the failure is the app's problem now, same posture
 // `chainResponse`, adapter.bit, takes for a failure BEFORE hijacking).
 //
 // The hijacked branches still autosave (#6110): a handler can legitimately
@@ -123,19 +73,19 @@ fn dispatchHijackable(app: App, ex: Exchange, req: Request): Option<Response> {
 // `sealSession` call for the cookie either — `frame`'s own framing-failure
 // path already downgrades an unanswerable failure to a log line, this is
 // the same posture one step earlier.
-fn runHijackable(app: App, c: Ctx, h: Handler): Option<Response> {
+fn runHijackable(app: App, c: Ctx, h: Handler): HijackOutcome {
   let r = h(c) catch e {
     if (c.hijacked) {
       saveSessionBestEffort(app, c)
-      return Option.None
+      return HijackOutcome.Hijacked
     }
-    return Option.Some(frame(app, sealedResponse(app, c, failureRes(app, ctxFailure(c, e)))))
+    return HijackOutcome.Answer(frame(app, sealedResponse(app, c, failureRes(app, ctxFailure(c, e)))))
   }
   if (c.hijacked) {
     saveSessionBestEffort(app, c)
-    return Option.None
+    return HijackOutcome.Hijacked
   }
-  return Option.Some(frame(app, sealedResponse(app, c, r)))
+  return HijackOutcome.Answer(frame(app, sealedResponse(app, c, r)))
 }
 
 // `c.saveSession()`, swallowed and logged rather than propagated — the
@@ -144,6 +94,30 @@ fn saveSessionBestEffort(app: App, c: Ctx) {
   c.saveSession() catch e {
     logLine(app.config.logs, "web: hijack: saving the session: ${e.message()}")
   }
+}
+
+// #6152: `dispatchHijackable`'s exact TLS mirror — the router lookup and
+// `Ctx` construction for a request `App.listenTls()`/`serveTls()` served
+// over TLS+HTTP/1.1, carrying a `TlsExchange` (`c.tlsExchange`) instead of
+// an `Exchange`. `App.listenTls()`/`serveTls()` pass this to `std/http`'s
+// `serveHijackableTlsOn`/`serveHijackableTlsBackground` as the hijack
+// handler, alongside `serveHandler()` (unchanged) for the h2 connections
+// that same server accepts.
+fn dispatchHijackableTls(app: App, ex: TlsExchange, req: Request): HijackOutcome {
+  let split = splitTarget(req.path)
+  let m = app.root.router.lookup(req.method, split.0) catch e {
+    let c = newCtx(req, nil, app.root.registry, app.config, "") catch ce {
+      return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
+    }
+    c.tlsExchange = Option.Some(ex)
+    c.routeMiss = e
+    return runHijackable(app, c, app.missHandler)
+  }
+  let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
+    return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
+  }
+  c.tlsExchange = Option.Some(ex)
+  return runHijackable(app, c, m.handler)
 }
 
 // --- WebSocket (#6072, part 41) ------------------------------------------
@@ -167,12 +141,22 @@ fn saveSessionBestEffort(app: App, c: Ctx) {
 // stdlib/websocket's `upgrade(ex, req, limits)` needs the `Exchange` itself
 // to write RFC 6455's `101` reply before framing begins — see ctx.bit's
 // `takeExchange` comment for why `hijack()`'s `Conn` is the wrong shape here.
+//
+// #6172: a TLS-served request (`c.tlsExchange`) takes `upgradeTls` instead,
+// mirroring `newStreamWire`'s (below) own transport pick — `std/websocket`'s
+// `Conn` no longer cares which one ran, since both hand it the same
+// `byteStream` (`Exchange.hijackStream`/`TlsExchange.hijackStream`,
+// std/http).
 export fn wsUpgrade(c: Ctx, limits: Limits): WsConn! {
+  if (isSome(c.tlsExchange)) {
+    return upgradeTls(takeTlsExchange(c)?, c.req, limits)?
+  }
   let ex = c.takeExchange()?
   return upgrade(ex, c.req, limits)?
 }
 
-// --- server-sent events and streaming responses (#6072, parts 42 and 45) -
+// --- server-sent events and streaming responses (#6072, parts 42 and 45;
+// #6152: TLS+HTTP/1.1) --------------------------------------------------
 //
 // `Stream` is the one hand-framed HTTP/1.1 writer both features need: SSE is
 // `text/event-stream` framing (`SSE` below) over the same chunked body a
@@ -182,12 +166,35 @@ export fn wsUpgrade(c: Ctx, limits: Limits): WsConn! {
 // and a streamed response's whole point is not holding the entire body in
 // memory to measure it first.
 //
+// `hijackWire` is the one difference a plain and a TLS-served connection
+// have here: `std/net`'s `Conn.write` takes a `string`, `std/tls`'s
+// `TlsConn.write` a `[]byte` — two genuinely different signatures, so
+// `Stream` holds this small interface instead of either concrete type, and
+// `plainWire`/`tlsWire` below are the one-line adapters. `Stream`'s own
+// public shape (`write`/`close`) is unaffected either way.
+interface hijackWire {
+  writeRaw(data: string): ()!,
+  closeWire(),
+}
+
+class plainWire {
+  c: Conn
+  writeRaw(data: string): ()! { this.c.write(data)? }
+  closeWire() { this.c.close() }
+}
+
+class tlsWire {
+  c: TlsConn
+  writeRaw(data: string): ()! { this.c.write([]byte(data))? }
+  closeWire() { this.c.close() }
+}
+
 // Bounded memory is the constructor's job, not the caller's: `write` sends
 // exactly the bytes it is given, once, straight onto the connection — no
 // internal buffer grows with the number or size of calls, so a multi-GB
 // stream costs this object nothing beyond the one chunk in flight.
 export class Stream {
-  conn: Conn
+  conn: hijackWire
   closed: bool
 
   // One chunk: its hex length prefix, the bytes, then the chunk's own
@@ -201,7 +208,7 @@ export class Stream {
     if (len(data) == 0) {
       fail newError("web: Stream.write: data is empty — call close() to end the stream")
     }
-    this.conn.write("${hexChunkSize(len(data))}\r\n${data}\r\n")?
+    this.conn.writeRaw("${hexChunkSize(len(data))}\r\n${data}\r\n")?
   }
 
   // The zero-length terminating chunk (RFC 9112 §7.1) and no trailer
@@ -213,29 +220,57 @@ export class Stream {
       return
     }
     this.closed = true
-    this.conn.write("0\r\n\r\n")?
-    this.conn.close()
+    this.conn.writeRaw("0\r\n\r\n")?
+    this.conn.closeWire()
   }
 }
 
-// Hijacks `c`'s connection and writes the status line and headers, with
-// `Transfer-Encoding: chunked` appended after whatever `headers` names — a
-// caller-supplied `Transfer-Encoding` would otherwise contradict the framing
-// this writer commits to using. `headers` carries no `Content-Length` for
-// the same reason `Stream`'s own doc comment gives: this call is exactly the
-// site that does not know one.
+// The guard `newStream` (below) needs for a TLS-served request, mirroring
+// `Ctx.takeExchange()`'s (ctx.bit) exact checks over `c.tlsExchange`
+// instead of `c.exchange` — module-private fields, not method-only (SPEC
+// §17.3), the same seam `dispatchHijackableTls` above already writes
+// through.
+fn takeTlsExchange(c: Ctx): TlsExchange! {
+  if (!isSome(c.tlsExchange)) {
+    fail newError(
+      "web: this request did not arrive on a connection that supports hijacking",
+    )
+  }
+  if (c.hijacked) {
+    fail newError("web: this request's connection was already hijacked")
+  }
+  c.hijacked = true
+  return unwrap(c.tlsExchange)
+}
+
+// Hijacks `c`'s connection — plain or TLS+HTTP/1.1 (#6152) — and writes the
+// status line and headers, with `Transfer-Encoding: chunked` appended after
+// whatever `headers` names — a caller-supplied `Transfer-Encoding` would
+// otherwise contradict the framing this writer commits to using. `headers`
+// carries no `Content-Length` for the same reason `Stream`'s own doc
+// comment gives: this call is exactly the site that does not know one.
 // `status` is always 200 today — nothing in this file streams a failure —
 // so the reason phrase is the one word RFC 9110's registry gives 200,
 // spelled here rather than through a status->phrase table this file has no
 // second entry for yet.
 export fn newStream(c: Ctx, status: int, contentType: string, headers: []Header): Stream! {
-  let conn = c.hijack()?
+  let wire = newStreamWire(c)?
   let out = "HTTP/1.1 ${status} OK\r\n" + "Content-Type: ${contentType}\r\n"
   for h of headers {
     out = out + "${h.name}: ${h.value}\r\n"
   }
-  conn.write(out + "Transfer-Encoding: chunked\r\n\r\n")?
-  return Stream{ conn = conn, closed = false }
+  wire.writeRaw(out + "Transfer-Encoding: chunked\r\n\r\n")?
+  return Stream{ conn = wire, closed = false }
+}
+
+// `newStream`'s own transport pick: a TLS-served request (`c.tlsExchange`)
+// takes `tlsWire`, everything else (including an app with no hijackable
+// route at all, whose `c.hijack()` fails naming why) `plainWire`.
+fn newStreamWire(c: Ctx): hijackWire! {
+  if (isSome(c.tlsExchange)) {
+    return tlsWire{ c = takeTlsExchange(c)?.hijack() }
+  }
+  return plainWire{ c = c.hijack()? }
 }
 
 // `n`'s hex digits, lowercase, no leading zeros, RFC 9112 §7.1.1's chunk

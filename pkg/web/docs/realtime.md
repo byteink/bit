@@ -38,16 +38,17 @@ fn main(): ()! {
 ```
 
 `.hijackable()` costs an app that never calls it nothing: `App.listen()`/
-`App.serve()` keep serving every OTHER route over `std/http`'s ordinary
-keep-alive connections exactly as before. The moment ANY route on the app
-is marked, though, the WHOLE app switches to answering one request per
-connection - a WebSocket, an SSE feed or a stream all keep their connection
-open for as long as the handler runs, so there is no way yet to keep
-reusing a connection for a plain request while also being ready to hand a
-later one on it over. A service mixing a high-throughput plain API with a
-realtime feature at real scale should put them on separate `App`s (and
-separate ports) for that reason, until that limitation closes (tracked
-internally, not a promise on any timeline).
+`App.serve()` keep serving every route over `std/http`'s ordinary keep-alive
+connections exactly as before. The moment ANY route on the app is marked,
+`App.listen()`/`App.serve()` switch to `std/http`'s keep-alive-capable
+hijack primitive - still keep-alive for every connection, one request at a
+time, the same as an app with no hijackable route at all. Only the ONE
+connection whose request actually calls `c.hijack()`/`wsUpgrade`/`newSSE`/
+`newStream` stops serving further requests and is handed over for the rest
+of its life; every other connection, on the same app and the same route
+table, keeps reusing itself across requests exactly as it always has. A
+mixed app - a high-throughput plain API next to a WebSocket/SSE/stream
+route - pays the one-request-per-connection cost only where it hijacks.
 
 ## WebSockets: live comments
 
@@ -130,8 +131,9 @@ Register one `Room` per article id (a `map<string, Room>` behind its own
 a database handle is closed over today:
 `app.get("/articles/:id/comments", (c) => articleComments(c,
 roomFor(c.param("id")))).hijackable()` - the `.hijackable()` on the end is
-what tells `App.listen()`/`App.serve()` this app needs the accept loop that
-keeps a connection reachable for `wsUpgrade`; see "One serving path" above.
+what tells `App.listen()`/`App.serve()` this app needs a connection reachable
+for `wsUpgrade`; see "One serving path" above for what that costs the app's
+other routes (nothing).
 
 ## Server-sent events: a live feed a browser subscribes to
 
@@ -214,12 +216,19 @@ compression, request logging, all of it wraps the ordinary response path.
 A route that needs a check before it upgrades (an auth cookie, an
 `Origin` allowlist) makes that check itself, before calling `wsUpgrade`.
 
-**TLS, HTTP/2 and HTTP/3 do not support hijacking yet.** `App.listenTls()`/
-`App.serveTls()` serve every ordinary route the same way `listen()` does,
-but `c.hijack()`/`wsUpgrade`/`newSSE`/`newStream` all fail on a request that
-arrived over any of them - the error names why. A WebSocket, an SSE feed or
-a stream served today needs plain `App.listen()`/`App.serve()`, behind a
-TLS-terminating proxy if the deployment needs TLS at all.
+**WebSocket, SSE and Stream all work over TLS+HTTP/1.1; HTTP/2 and HTTP/3 do
+not yet.** `App.listenTls()`/`App.serveTls()` (ALPN "http/1.1") give
+`wsUpgrade`/`newSSE`/`newStream` the same keep-alive-or-hijack behavior
+`listen()`/`serve()` give them in plaintext - only the one connection that
+actually hijacks stops answering further requests; an ordinary route on the
+same app keeps its keep-alive connections either way. A request negotiated
+over HTTP/2 or HTTP/3 still cannot hijack at all - `c.hijack()`/`wsUpgrade`/
+`newSSE`/`newStream` on one of those fail, naming why (a WebSocket over
+HTTP/2 needs RFC 8441, a separate mechanism; SSE and Stream over HTTP/2 and
+HTTP/3 need no hijack at all, being stream-multiplexed protocols, but
+neither is wired up yet). Either needs plain `App.listen()`/`App.serve()` or
+TLS+HTTP/1.1 today, behind a TLS-terminating proxy if HTTP/2 or HTTP/3
+specifically is what the deployment needs.
 
 ## When not to use this
 

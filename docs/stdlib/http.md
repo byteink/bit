@@ -317,6 +317,25 @@ A listening HTTP server.
 One accepted connection, and the connection to answer it on. Call `read()` to
 get the request.
 
+### `byteStream`
+
+The interface a message is read from and written to, over either transport
+this module serves: `readUp`/`writeStr`/`writeBytes`/`shut`/`setIdleDeadline`
+and a few more. `Exchange.hijackStream()`/`TlsExchange.hijackStream()` return
+one; a caller that wants to frame its own protocol on top of a hijacked
+connection without caring whether it ran over plain TCP or TLS (`std/
+websocket`'s `Conn` does exactly this) holds one of these instead of a
+concrete `Conn`/`TlsConn`.
+
+### `newByteStream(c: Conn): byteStream`
+
+Wraps a `std/net` connection a caller already holds (not one reached through
+`Exchange.hijackStream()`, which returns one directly) as a `byteStream`.
+
+### `newTlsByteStream(c: TlsConn): byteStream`
+
+The TLS mirror of `newByteStream`.
+
 ### `serve(host: string, port: int): Server!`
 
 Binds and starts listening on `host:port`. Port `0` lets the kernel choose one;
@@ -377,13 +396,75 @@ Writes `res` to the connection and closes it.
 ### `Exchange.hijack(): Conn`
 
 Takes ownership of the exchange's underlying `std/net` connection for a
-protocol upgrade (e.g. WebSocket, RFC 6455 §4.1 - see `std/websocket`'s
-`upgrade`) that continues past the framing `respond()` assumes: `respond()`
-always writes exactly one HTTP response and closes the connection, which an
-upgraded connection must not do. Call `read()` first, check the request looks
-like the upgrade you expect, then call this instead of `respond()` - never
-both on the same exchange, since the caller now owns the connection's
-lifetime, including closing it.
+protocol upgrade or a hand-framed body that continues past the framing
+`respond()` assumes: `respond()` always writes exactly one HTTP response and
+closes the connection, which an upgraded connection must not do. Call
+`read()` first, check the request looks like the upgrade you expect, then
+call this instead of `respond()` - never both on the same exchange, since the
+caller now owns the connection's lifetime, including closing it.
+
+### `Exchange.hijackStream(): byteStream`
+
+`hijack()`'s transport-agnostic sibling, for a caller that wants to
+read/write frames through the same interface `readMessage`/
+`serializeResponseInto` already speak rather than a concrete `Conn`
+(`std/websocket`'s `upgrade` uses this) - returns the exchange's own
+underlying stream, the same instance `read()` already built.
+
+### `Exchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
+
+`respond()`'s keep-alive-capable sibling, for a caller driving its own
+multi-request loop over one `Exchange` instead of `respond()`'s fixed
+one-request-per-connection framing (`serveHijackableOn`, below, is that
+loop). Writes `res` and reports whether the connection stays open for
+another `read()`. `mustCloseNow` forces `Connection: close` regardless of
+what `req` asked for; `req`'s own `Connection: close` still closes even when
+`mustCloseNow` is false. Unlike `respond()`, this never closes the
+connection on the "stays open" branch.
+
+### `HijackOutcome`
+
+What a `serveHijackableOn` handler returns for one request: `Answer(res)` to
+answer it normally, keeping the connection open for another request, or
+`Hijacked` to take the connection over (after calling `Exchange.hijack()`
+and writing whatever framing the upgrade needs) and stop serving it.
+
+### `serveHijackableOn(s: Server, handler: (Request, Exchange) => HijackOutcome): ()!`
+
+Serves HTTP forever on an already-bound `s`, dispatching every request to
+`handler` on its own green thread - the hijack-capable sibling of
+`listenAndServeOn`. Most requests answer through `HijackOutcome.Answer`, and
+the connection stays open for another one under `s`'s own idle-timeout/
+max-requests bounds, exactly like an ordinary keep-alive connection; one
+request returning `HijackOutcome.Hijacked` ends that connection's loop, and
+only that connection - every other connection this server serves keeps
+reusing itself across requests. Returns only once `s.close()`/`s.shutdown()`
+has closed the listener.
+
+```bit
+import { Server, Exchange, Request, HijackOutcome, ok, serve, serveHijackableOn } from "std/http"
+
+fn dispatch(req: Request, ex: Exchange): HijackOutcome {
+  if (req.path == "/upgrade") {
+    let conn = ex.hijack()
+    conn.write("HTTP/1.1 101 Switching Protocols\r\n\r\n") catch _ {}
+    return HijackOutcome.Hijacked
+  }
+  return HijackOutcome.Answer(ok("hi"))
+}
+
+fn main(): ()! {
+  let s = serve("127.0.0.1", 8080)?
+  serveHijackableOn(s, dispatch)?
+}
+```
+
+### `serveHijackableBackground(s: Server, handler: (Request, Exchange) => HijackOutcome)`
+
+`serveHijackableOn`'s spawn-and-forget sibling: swallows its return, since
+ending is the intended outcome of `Server.shutdown()`/`close()`, not a
+defect with no caller left to report it to. Use this from a green thread you
+`spawn` yourself when the caller needs to keep running after serving starts.
 
 ### `Server.close()`
 
@@ -895,6 +976,80 @@ fn serveTlsForeverOn(ts: TlsServer) {
     print("server failed: ${e.message()}\n")
   }
 }
+```
+
+### `TlsExchange`
+
+The TLS mirror of `Exchange`: one accepted TLS+HTTP/1.1 connection, and the
+connection to answer it on. Built by `TlsServer.accept()`, below.
+
+### `TlsServer.accept(): TlsExchange!`
+
+Accepts the next connection, runs its handshake, and returns a
+`TlsExchange` ready for `read()`/`hijack()` - the TLS mirror of
+`Server.accept()`. Fails when the connection negotiated ALPN "h2":
+hijacking over HTTP/2 needs RFC 8441, a different mechanism this method
+does not implement.
+
+### `TlsExchange.read(): Request!`
+
+The TLS mirror of `Exchange.read()`.
+
+### `TlsExchange.respond(res: Response): ()!`
+
+The TLS mirror of `Exchange.respond()`: writes `res` and closes the
+connection.
+
+### `TlsExchange.respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool!`
+
+The TLS mirror of `Exchange.respondKeepAlive()`.
+
+### `TlsExchange.hijack(): TlsConn`
+
+The TLS mirror of `Exchange.hijack()`: takes ownership of the exchange's
+underlying `TlsConn`.
+
+### `TlsExchange.hijackStream(): byteStream`
+
+The TLS mirror of `Exchange.hijackStream()` (`std/websocket`'s `upgradeTls`
+uses this).
+
+### `serveHijackableTlsOn(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response): ()!`
+
+The TLS mirror of `serveHijackableOn`: serves TLS forever on an already-bound
+`ts`, keeping every TLS+HTTP/1.1 connection on keep-alive and hijacking only
+the one connection whose request returns `HijackOutcome.Hijacked`. `ts`
+still accepts HTTP/2 connections (ALPN "h2") - `plainHandler` answers those,
+unaffected, since HTTP/2 does not hijack through this function.
+
+```bit
+import {
+  TlsServer, TlsExchange, Request, Response, HijackOutcome, ok, tlsServe, serveHijackableTlsOn,
+} from "std/http"
+
+fn dispatch(req: Request, ex: TlsExchange): HijackOutcome {
+  if (req.path == "/upgrade") {
+    let conn = ex.hijack()
+    conn.write([]byte("HTTP/1.1 101 Switching Protocols\r\n\r\n")) catch _ {}
+    return HijackOutcome.Hijacked
+  }
+  return HijackOutcome.Answer(ok("hi"))
+}
+
+fn plain(req: Request): Response {
+  return ok("h2 ok")
+}
+
+fn runHijackableTls(certPem: string, keyPem: string): ()! {
+  let ts = tlsServe("127.0.0.1", 8443, certPem, keyPem)?
+  serveHijackableTlsOn(ts, dispatch, plain)?
+}
+```
+
+### `serveHijackableTlsBackground(ts: TlsServer, hijackHandler: (Request, TlsExchange) => HijackOutcome, plainHandler: (Request) => Response)`
+
+`serveHijackableTlsOn`'s spawn-and-forget sibling, mirroring
+`serveHijackableBackground`.
 
 // Elsewhere, e.g. a signal handler: stop within 5s, force-closing anything
 // still running past that.

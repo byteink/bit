@@ -1,0 +1,135 @@
+// stdlib/http/hijack.bit — the keep-alive-capable hijack primitive (#6102).
+//
+// `listenAndServeOn`'s handler is a fixed `(Request) => Response` contract
+// with no way to take a connection over mid-loop, and `Server.accept()` +
+// `Exchange` (server.bit) is one-shot by design (its own doc comment: "one
+// request per connection in v1") — so before this file, a caller that wanted
+// SOME requests on a connection answered normally, kept the connection open
+// for the next one (keep-alive), AND wanted to be able to hand a LATER
+// request's connection over to a WebSocket/SSE/stream upgrade had no single
+// primitive to drive: it had to choose one loop for the whole server. A
+// mixed app — pkg/web's `App`, `realtime.bit` — paid the one-shot cost on
+// every connection just for registering one hijackable route.
+//
+// `serveHijackableOn` below is that primitive: the same accept loop shape as
+// `listenAndServeOn` (`acceptLoop`, server.bit), but the spawned per-
+// connection loop (`serveHijackConn`) reads and answers requests exactly like
+// `answerOne` until `handler` returns `HijackOutcome.Hijacked` for one of
+// them — at which point this loop stops touching the connection at all,
+// leaving it exactly as `handler` left it (already framed, still open).
+export enum HijackOutcome {
+  Answer(Response),
+  Hijacked,
+}
+
+// Serve HTTP forever on an already-bound `s`, dispatching every request to
+// `handler` on its own green thread — the hijack-capable sibling of
+// `listenAndServeOn` (server.bit). `handler` answers most requests the same
+// way an ordinary `(Request) => Response` handler would (`HijackOutcome.
+// Answer`), keeping the connection open for another request under `s`'s own
+// idle-timeout/max-requests bounds (`Server.setIdleTimeoutMs`/
+// `setMaxRequestsPerConn`) — or takes the connection over
+// (`HijackOutcome.Hijacked`, after calling `ex.hijack()`/writing whatever
+// framing the upgrade needs directly on it), which ends this connection's
+// loop. Returns only once `s.close()`/`s.shutdown()` has closed the
+// listener, same as `listenAndServeOn` — see its own doc comment for the
+// accept-failure backoff both share.
+export fn serveHijackableOn(s: Server, handler: (Request, Exchange) => HijackOutcome): ()! {
+  acceptLoop(
+    () => s.listener.accept(),
+    () => s.closed || drainStarted(s.drain),
+    maxAcceptBackoffNs,
+    (c) => {
+      spawn serveHijackConn(Exchange{ conn = c, maxBody = s.maxBody }, handler, s)
+    },
+  )?
+}
+
+// `serveHijackableOn`'s spawned accept-loop caller: swallows the return the
+// same way `serveBackground` (pkg/web/app.bit) already swallows
+// `listenAndServeOn`'s, since ending is the intended outcome of
+// `Server.shutdown()`/`close()`, not a defect with no caller left to report
+// it to.
+export fn serveHijackableBackground(s: Server, handler: (Request, Exchange) => HijackOutcome) {
+  serveHijackableOn(s, handler) catch _ {
+    return
+  }
+}
+
+// Reads one request off `ex`, the `serveHijackConn` loop's own read step
+// split out to keep that function under the complexity ceiling. Fails —
+// after already answering whatever the connection's ordinary end needed —
+// the instant this connection is done: a malformed FIRST request gets a
+// bare `400` (mirrors `answerBadRequest`, server.bit); a later read failure
+// or the peer closing before sending another request just closes the
+// connection, the ordinary end of a persistent one, not a fresh error to
+// report. The caller's `catch` is what stops the loop either way.
+fn readHijackRequest(ex: Exchange, first: bool): Request! {
+  let req = ex.read() catch _ {
+    if (first) {
+      ex.respond(respond(400, "")) catch _ {}
+    } else {
+      ex.conn.close()
+    }
+    fail newError("http: hijack: this connection is done")
+  }
+  if (len(req.method) == 0) {
+    ex.conn.close()
+    fail newError("http: hijack: this connection is done")
+  }
+  return req
+}
+
+// Applies `outcome` for one request: writes an ordinary answer and reports
+// whether the connection stays open for another, or ends it the instant
+// `outcome` is `Hijacked` — `serveHijackConn`'s own per-request step, split
+// out for the same complexity reason as `readHijackRequest`.
+fn applyHijackOutcome(ex: Exchange, req: Request, outcome: HijackOutcome, atLimit: bool): bool {
+  match (outcome) {
+    Hijacked => return false
+    Answer(res) => {
+      let more = ex.respondKeepAlive(req, res, atLimit) catch _ {
+        return false
+      }
+      return more
+    }
+  }
+}
+
+// One accepted connection's keep-alive loop (#6102), the `Exchange`-based
+// mirror of `serveOne`/`answerOne` (server.bit): reads and dispatches
+// requests, in order, until `handler` hijacks, the client or `s`'s own
+// idle-timeout/max-requests bound ends the connection, or a read/write
+// fails. Registers with `s.drain` exactly like `serveOne` does, so
+// `Server.shutdown()` drains a hijack-capable server the same way it drains
+// a plain one for every connection that has not hijacked yet — a hijacked
+// connection is no longer this server's to drain, the same posture
+// `Exchange.hijack()` already has for the direct `accept()` API.
+fn serveHijackConn(ex: Exchange, handler: (Request, Exchange) => HijackOutcome, s: Server) {
+  let id = drainRegister(
+    s.drain,
+    () => {
+      ex.conn.shutdown()
+    },
+    () => {},
+  )
+  defer drainDeregister(s.drain, id)
+  let marked = false
+  let n = 0
+  while (n < s.maxRequests) {
+    n = n + 1
+    ex.conn.setDeadline(monotonic().ns + s.idleTimeoutNs)
+    let req = readHijackRequest(ex, n == 1) catch _ {
+      return
+    }
+    if (!marked) {
+      drainMarkActive(s.drain, id)
+      marked = true
+    }
+    let outcome = handler(req, ex)
+    let more = applyHijackOutcome(ex, req, outcome, n == s.maxRequests)
+    if (!more) {
+      return
+    }
+  }
+}

@@ -1,0 +1,234 @@
+// stdlib/http/tlshijack.bit — the TLS mirror of hijack.bit's keep-alive
+// hijack primitive (#6152, split from #6103 gap 1). `HijackOutcome`
+// (hijack.bit) is reused unchanged: an ordinary TLS+HTTP/1.1 connection gets
+// the same keep-alive `serveTlsServerOn` already gives it, and one request
+// on it may hijack — take the raw `TlsConn` over — without affecting any
+// other connection this server serves, TLS or plaintext.
+//
+// WHY THIS FILE, NOT A GENERIC ONE OVER `byteStream`. `hijack.bit`'s loop
+// drives `Exchange`, whose `hijack()` returns a `Conn` (std/net) — the exact
+// type `stdlib/websocket`'s `upgrade`/pkg/web's `Stream` already assume.
+// `TlsExchange.hijack()` below returns a `TlsConn` (std/tls) instead: a
+// different concrete type with a different `write`/`read` shape ([]byte, not
+// string), so the two loops cannot share one generic implementation without
+// either type losing the shape its own callers need. The accept-loop
+// SHAPE is still the same (`readHijackTlsRequest`/`applyHijackTlsOutcome`
+// mirror `readHijackRequest`/`applyHijackOutcome` line for line); only the
+// connection type differs.
+//
+// h2 SHARES THIS SERVER'S PORT. `TlsServer.accept()` (server.bit) refuses a
+// connection that negotiated ALPN "h2" — hijacking over HTTP/2 needs RFC
+// 8441 (a CONNECT-based mechanism, not this file's kind of hijack; tracked
+// separately). `serveHijackableTlsOn` below still has to SERVE an h2
+// connection on the same port, so it takes a second, ordinary
+// `(Request) => Response` handler for exactly that ALPN branch — the same
+// one `App.serveHandler()` already is — and dispatches by ALPN itself,
+// mirroring `serveTlsConn` (server.bit).
+
+// One accepted TLS connection, and the connection to answer it on — the TLS
+// mirror of `Exchange` (server.bit). `TlsServer.accept()` (server.bit)
+// builds one after running the handshake, so `alpnProtocol()`/`hijack()`'s
+// caller never has to. `stream`/`hasStream` carry the same reuse-across-
+// `read()`-calls contract `Exchange` gained in #6102: built once, lazily,
+// and reused by every `read()` this exchange makes, so a keep-alive loop
+// (`serveHijackTlsConn`, below) never drops a byte `readMessage` over-read
+// into the next request.
+export class TlsExchange {
+  conn: TlsConn
+  maxBody: int
+  method: string
+  stream: byteStream
+  hasStream: bool
+
+  export read(): Request! {
+    if (!this.hasStream) {
+      this.stream = tlsStream{ conn = this.conn }
+      this.hasStream = true
+    }
+    let req = readMessage(this.stream, this.maxBody)?
+    this.method = req.method
+    return req
+  }
+
+  // One-shot: writes `res` and closes the connection — the TLS mirror of
+  // `Exchange.respond()`.
+  export respond(res: Response): ()! {
+    defer this.conn.close()
+    this.conn.write(serializeResponseInto([]byte(0), res, this.method, true))?
+  }
+
+  // `Exchange.respondKeepAlive`'s (server.bit) exact TLS mirror.
+  export respondKeepAlive(req: Request, res: Response, mustCloseNow: bool): bool! {
+    if (!this.hasStream) {
+      this.stream = tlsStream{ conn = this.conn }
+      this.hasStream = true
+    }
+    let mustClose = mustCloseNow || req.closeAsked
+    this.stream.writeBytes(serializeResponseInto([]byte(0), res, this.method, mustClose))?
+    if (mustClose) {
+      this.stream.shut()
+      return false
+    }
+    return true
+  }
+
+  // Takes ownership of the exchange's underlying `TlsConn` for a protocol
+  // upgrade or a hand-framed body — the TLS mirror of `Exchange.hijack()`.
+  export hijack(): TlsConn {
+    return this.conn
+  }
+
+  // #6172: `Exchange.hijackStream()`'s exact TLS mirror — the same
+  // `byteStream` `std/websocket`'s `upgradeTls` reads/writes through, no
+  // different from the plain `upgrade`'s own `hijackStream()` call.
+  export hijackStream(): byteStream {
+    if (!this.hasStream) {
+      this.stream = tlsStream{ conn = this.conn }
+      this.hasStream = true
+    }
+    return this.stream
+  }
+}
+
+// Reads one request off `ex`, exactly like `readHijackRequest` (hijack.bit)
+// but over TLS. See that function's own comment for the exact contract.
+fn readHijackTlsRequest(ex: TlsExchange, first: bool): Request! {
+  let req = ex.read() catch _ {
+    if (first) {
+      ex.respond(respond(400, "")) catch _ {}
+    } else {
+      ex.conn.close()
+    }
+    fail newError("http: hijack: this connection is done")
+  }
+  if (len(req.method) == 0) {
+    ex.conn.close()
+    fail newError("http: hijack: this connection is done")
+  }
+  return req
+}
+
+// `applyHijackOutcome`'s (hijack.bit) exact TLS mirror.
+fn applyHijackTlsOutcome(
+  ex: TlsExchange,
+  req: Request,
+  outcome: HijackOutcome,
+  atLimit: bool,
+): bool {
+  match (outcome) {
+    Hijacked => return false
+    Answer(res) => {
+      let more = ex.respondKeepAlive(req, res, atLimit) catch _ {
+        return false
+      }
+      return more
+    }
+  }
+}
+
+// `serveHijackConn`'s (hijack.bit) exact TLS mirror: one accepted
+// TLS+HTTP/1.1 connection's keep-alive loop. `opts`/`d` come from the
+// accept loop below, the same `connOpts`/`drainState` `serveHijackableTlsOn`
+// shares with `serveTlsServerOn` — a hijacked connection stops registering
+// with `d` the moment it hijacks, same posture `TlsExchange.hijack()`
+// already has for the direct API.
+fn serveHijackTlsConn(
+  ex: TlsExchange,
+  handler: (Request, TlsExchange) => HijackOutcome,
+  opts: connOpts,
+  d: drainState,
+) {
+  let id = drainRegister(
+    d,
+    () => {
+      ex.conn.shutdown()
+    },
+    () => {},
+  )
+  defer drainDeregister(d, id)
+  let marked = false
+  let n = 0
+  while (n < opts.maxRequests) {
+    n = n + 1
+    ex.conn.setDeadline(monotonic().ns + opts.idleTimeoutNs)
+    let req = readHijackTlsRequest(ex, n == 1) catch _ {
+      return
+    }
+    if (!marked) {
+      drainMarkActive(d, id)
+      marked = true
+    }
+    let outcome = handler(req, ex)
+    let more = applyHijackTlsOutcome(ex, req, outcome, n == opts.maxRequests)
+    if (!more) {
+      return
+    }
+  }
+}
+
+// One accepted TLS connection's ALPN dispatch (#6152), the hijack-aware
+// mirror of `serveTlsConn` (server.bit): h2 goes through the SAME
+// `h2glueServe` an ordinary TLS server already uses (`plainHandler` — h2
+// hijacking is a separate gap, RFC 8441, not this file's), and HTTP/1.1
+// through the keep-alive hijack loop above.
+fn serveHijackableTlsConn(
+  conn: TlsConn,
+  hijackHandler: (Request, TlsExchange) => HijackOutcome,
+  plainHandler: (Request) => Response,
+  opts: connOpts,
+  d: drainState,
+) {
+  conn.handshake() catch _ {
+    conn.close()
+    return
+  }
+  if (conn.alpnProtocol() == "h2") {
+    h2glueServe(conn, plainHandler, opts, d)
+    return
+  }
+  serveHijackTlsConn(TlsExchange{ conn = conn, maxBody = opts.maxBody }, hijackHandler, opts, d)
+}
+
+// Serve TLS forever on an already-bound `ts` — the hijack-capable sibling of
+// `serveTlsServerOn` (server.bit). `hijackHandler` answers most HTTP/1.1
+// requests through `HijackOutcome.Answer`, keeping the connection open for
+// another one under the same idle-timeout/max-requests bounds
+// `serveTlsServerOn` enforces; one returning `HijackOutcome.Hijacked` ends
+// that connection's loop only. `plainHandler` serves every h2 connection
+// this server accepts, unaffected — see this file's header for why h2
+// cannot hijack here. Returns only once `ts.shutdown()` has closed the
+// listener, same as `serveTlsServerOn`.
+export fn serveHijackableTlsOn(
+  ts: TlsServer,
+  hijackHandler: (Request, TlsExchange) => HijackOutcome,
+  plainHandler: (Request) => Response,
+): ()! {
+  let altPort = ts.listener.port()?
+  let opts = connOpts{
+    altPort = altPort, maxBody = ts.maxBody,
+    idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
+  }
+  while (true) {
+    let conn = ts.listener.accept() catch _ {
+      if (drainStarted(ts.drain)) {
+        return
+      }
+      continue
+    }
+    spawn serveHijackableTlsConn(conn, hijackHandler, plainHandler, opts, ts.drain)
+  }
+}
+
+// `serveHijackableTlsOn`'s spawn-and-forget sibling — the exact mirror of
+// `serveHijackableBackground` (hijack.bit) and `serveTlsBackground`
+// (pkg/web/tls.bit): swallows the return, since ending is
+// `TlsServer.shutdown()`'s intended outcome, not a defect to report.
+export fn serveHijackableTlsBackground(
+  ts: TlsServer,
+  hijackHandler: (Request, TlsExchange) => HijackOutcome,
+  plainHandler: (Request) => Response,
+) {
+  serveHijackableTlsOn(ts, hijackHandler, plainHandler) catch _ {
+    return
+  }
+}
