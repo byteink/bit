@@ -904,10 +904,9 @@ fn main() {
   parses as an ordinary identifier everywhere except immediately before a
   second bare identifier inside a class body, so a field or an in-body
   method may still be named `static`. Writing `static fn name(...)` (this
-  form's spelling before `BIT_STATIC_METHODS` ever defaulted on) is
-  rejected with `E0172` and a hint to drop `fn`; the class form takes no
-  `fn`, exactly like an in-body instance method (§10.4) and an interface's
-  static requirement below.
+  form's original, retired spelling) is rejected with `E0172` and a hint to
+  drop `fn`; the class form takes no `fn`, exactly like an in-body instance
+  method (§10.4) and an interface's static requirement below.
 - `this` is not bound inside a static method's body; referencing it is
   `E0040` ("undefined name"), the same diagnostic a top-level function's
   body gets for the same reason.
@@ -943,15 +942,6 @@ fn main() {
   dispatch (§14.3) - a static method cannot be called through one, since an
   interface value carries no type to call a static method on, only an
   instance's method table.
-
-Static methods are gated behind the compiler flag `BIT_STATIC_METHODS=1`
-(default off) until the release after they land repins the toolchain's own
-pinned previous-release oracle past this compiler build; with the flag
-unset, `static` before a second bare identifier inside a class body stays an
-ordinary identifier and the declaration fails to parse, unchanged from every
-earlier release. This is a rollout mechanism only, not part of the
-language's steady-state definition - the same shape `BIT_MAPLIT` (§12.3)
-uses - and this paragraph is removed once the flag defaults on.
 
 ### 10.5 Class Declarations
 
@@ -2711,15 +2701,6 @@ a map (`h.set(map<string,string>{})` and `h.set({})` for a `set(fields:
 map<string,string>)` parameter both construct one); anywhere else - including
 with no expected type reachable at all - it is ill-typed, the same treatment an
 empty `[]` against a non-slice type gets (§15.2).
-
-The bare map form is gated behind the compiler flag `BIT_MAPLIT=1` (default
-off) until the release after it lands repins the toolchain's own pinned
-previous-release oracle past this compiler build; with the flag unset, `{`
-in expression position stays E0021 ("expected an expression"), unchanged from
-every earlier release. This is a rollout mechanism only, not part of the
-language's steady-state definition - the same shape #5990's link-time-constant
-closures used, until #6192 made that lowering unconditional - and this
-paragraph is removed once the flag defaults on.
 
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
