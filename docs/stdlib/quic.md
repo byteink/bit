@@ -1,1026 +1,30 @@
 # std/quic
 
-QUIC v1 packet protection (RFC 9001) and the frame codec (RFC 9000), built in Bit
-on top of [`std/crypto`](crypto.md). This module is the cryptographic and wire-format
-core of QUIC - it derives the Initial keys, protects and unprotects packets, and
-serializes frames - but it is deliberately *not* a transport: there is no connection
-state machine, no flow control, no loss recovery, and no congestion control here.
-Those layers sit above and drive these building blocks.
+Most programs never import `std/quic` directly. [`std/http3`](http3.md) and
+[`pkg/web`](/packages/web) run their HTTP/3 traffic over it and speak QUIC for
+you. This module is the transport underneath: it turns an unreliable UDP flow into
+reliable, ordered, encrypted streams, built on [`std/crypto`](crypto.md) and
+[`std/tls`](tls.md).
 
-The module has two halves. **Packet protection** (`packet.bit`) derives keys with the
-TLS 1.3 HKDF ladder, seals payloads with AES-128-GCM under a packet-number-derived
-nonce, and masks headers with an AES-ECB or raw-ChaCha20 key stream - the same
-verified `std/crypto` building blocks, never a second copy of the cryptography. **Frames**
-(`frames.bit`) encode and decode QUIC's variable-length integers and every v1 frame.
-
-Everything composes cleanly: `std/quic` reproduces the RFC 9001 Appendix A sample
-packets byte-for-byte and round-trips every frame through its own decoder.
+Reach for `std/quic` yourself when you want a QUIC-based protocol that is not
+HTTP/3 - your own request/response or streaming protocol running over QUIC's
+streams instead of TCP.
 
 <!-- doctest: per-block -->
 
-## Frames
-
-A QUIC packet payload is a sequence of frames, and every number in the protocol - a
-length, offset, stream id, or error code - is a variable-length integer (RFC 9000
-section 16): the top two bits of the first byte give the encoded length (1, 2, 4, or 8
-bytes) and the rest is the value, big-endian. `Frame` covers every frame
-kind RFC 9000 section 19 defines; the codec is pure and strict - malformed
-input is rejected with a fallible `!`, never guessed at.
-
-### `encodeVarint(v: u64): []byte`
-
-The shortest QUIC variable-length integer encoding of `v` (RFC 9000 section 16). `v` must fit
-in 62 bits. For example, 494,878,333 encodes to the four-byte `9d7f3e7d`.
-
-```bit
-import { encodeVarint } from "std/quic"
-
-fn example(): []byte {
-  return encodeVarint(494878333)
-}
-```
-
-### `decodeVarint(data: []byte): u64!`
-
-Decode the variable-length integer at the start of `data`, ignoring any trailing
-bytes. Accepts non-minimal encodings, so both `25` and `4025` decode to 37. Fails on
-an empty slice or a length that runs past the end.
-
-```bit
-import { decodeVarint } from "std/quic"
-
-fn example(data: []byte): u64! {
-  return decodeVarint(data)?
-}
-```
-
-### `varintSize(v: u64): int`
-
-The number of bytes `encodeVarint` will use for `v` (1, 2, 4, or 8) - for sizing a
-buffer up front without encoding twice.
-
-```bit
-import { varintSize } from "std/quic"
-
-fn example(): int {
-  return varintSize(15293)
-}
-```
-
-### `AckRange`
-
-One ACK Range (RFC 9000 section 19.3.1): a `gap` of unacknowledged packets and a
-`rangeLength` of acknowledged ones, both relative varints in descending order.
-
-```bit
-import { AckRange } from "std/quic"
-
-fn example(): AckRange {
-  return AckRange{ gap = 1, rangeLength = 4 }
-}
-```
-
-### `AckFrame`
-
-An ACK frame (RFC 9000 section 19.3): the largest acknowledged packet number, the ack delay,
-the first range, the additional gap/range pairs, and - when `ecn` is set - the three
-ECN counters.
-
-```bit
-import { AckFrame, AckRange } from "std/quic"
-
-fn example(): AckFrame {
-  return AckFrame{
-    largest = 10,
-    delay = 3,
-    firstRange = 2,
-    ranges = [AckRange{ gap = 1, rangeLength = 4 }],
-    ecn = false,
-    ect0 = 0,
-    ect1 = 0,
-    ce = 0,
-  }
-}
-```
-
-### `StreamFrame`
-
-A STREAM frame (RFC 9000 section 19.8). The `hasOffset`, `hasLength`, and `fin` flags select
-the OFF/LEN/FIN bits of the type: with `hasLength` clear, the data runs to the end of
-the packet.
-
-```bit
-import { StreamFrame } from "std/quic"
-
-fn example(data: []byte): StreamFrame {
-  return StreamFrame{
-    id = 4,
-    offset = 8,
-    data = data,
-    hasOffset = true,
-    hasLength = true,
-    fin = true,
-  }
-}
-```
-
-### `Frame`
-
-One QUIC v1 frame (RFC 9000 section 19), a sum over every frame type. `Padding(n)` is a run
-of `n` PADDING bytes; `ConnectionClose` is the transport variant (type 0x1c) and
-`ApplicationClose` the application variant (type 0x1d).
-
-```bit
-import { Frame } from "std/quic"
-
-fn example(data: []byte): Frame {
-  return Frame.Crypto(0, data)
-}
-```
-
-### `encodeFrame(f: Frame): []byte`
-
-The wire encoding of a single frame (RFC 9000 section 19).
-
-```bit
-import { Frame, encodeFrame } from "std/quic"
-
-fn example(): []byte {
-  return encodeFrame(Frame.Ping)
-}
-```
-
-### `encodeFrames(frames: []Frame): []byte`
-
-The concatenated wire encoding of `frames`, in order.
-
-```bit
-import { Frame, encodeFrames } from "std/quic"
-
-fn example(): []byte {
-  return encodeFrames([Frame.Ping, Frame.HandshakeDone])
-}
-```
-
-### `parseFrames(data: []byte): []Frame!`
-
-Parse every frame in `data`, in order, until the buffer is exactly consumed. Fails on
-an unknown frame type or any field that runs past the end.
-
-```bit
-import { Frame, parseFrames } from "std/quic"
-
-fn example(data: []byte): []Frame! {
-  return parseFrames(data)?
-}
-```
-
-## Packet protection
-
-Packet protection has three stages, mirroring RFC 9001 section 5. Key derivation turns the
-client's Destination Connection ID into the Initial key, IV, and header-protection
-key. Payload protection seals the frames with AES-128-GCM under a nonce formed from
-the IV and packet number. Header protection masks the first byte's low bits and the
-packet number with a key stream sampled from the ciphertext. The Retry integrity tag
-and Version Negotiation packet round out what an endpoint needs before the transport
-layer takes over.
-
-### `quicVersion1`
-
-QUIC version 1 (RFC 9000 section 15), `0x00000001`.
-
-```bit
-import { quicVersion1 } from "std/quic"
-
-fn example(): int {
-  return quicVersion1
-}
-```
-
-### `longInitial`
-
-The long-header type value for an Initial packet (RFC 9000 section 17.2.2), `0`.
-
-```bit
-import { longInitial } from "std/quic"
-
-fn example(): int {
-  return longInitial
-}
-```
-
-### `longZeroRtt`
-
-The long-header type value for a 0-RTT packet (RFC 9000 section 17.2.3), `1`.
-
-```bit
-import { longZeroRtt } from "std/quic"
-
-fn example(): int {
-  return longZeroRtt
-}
-```
-
-### `longHandshake`
-
-The long-header type value for a Handshake packet (RFC 9000 section 17.2.4), `2`.
-
-```bit
-import { longHandshake } from "std/quic"
-
-fn example(): int {
-  return longHandshake
-}
-```
-
-### `longRetry`
-
-The long-header type value for a Retry packet (RFC 9000 section 17.2.5), `3`.
-
-```bit
-import { longRetry } from "std/quic"
-
-fn example(): int {
-  return longRetry
-}
-```
-
-### `PacketKeys`
-
-The AES-128-GCM key (16 bytes), IV (12 bytes), and header-protection key (16 bytes)
-for one direction of one encryption level.
-
-```bit
-import { PacketKeys, deriveKeys } from "std/quic"
-
-fn example(secret: []byte): PacketKeys {
-  return deriveKeys(secret)
-}
-```
-
-### `initialSalt(): []byte`
-
-The QUIC v1 Initial salt (RFC 9001 section 5.2), the fixed non-secret value mixed into the
-Initial-secret extraction.
-
-```bit
-import { initialSalt } from "std/quic"
-
-fn example(): []byte {
-  return initialSalt()
-}
-```
-
-### `expandLabel(secret: []byte, label: string, length: int): []byte`
-
-TLS 1.3 HKDF-Expand-Label over SHA-256, as QUIC uses it (RFC 9001 section 5.1): expand
-`secret` to `length` bytes bound to `"tls13 " + label`. Use it to derive keys for a
-non-Initial suite, such as the 32-byte ChaCha20-Poly1305 key.
-
-```bit
-import { expandLabel } from "std/quic"
-
-fn example(secret: []byte): []byte {
-  return expandLabel(secret, "quic key", 16)
-}
-```
-
-### `deriveInitialSecret(dcid: []byte): []byte`
-
-The Initial secret common to both directions (RFC 9001 section 5.2): `HKDF-Extract(
-initial_salt, dcid)` over the client's Destination Connection ID.
-
-```bit
-import { deriveInitialSecret } from "std/quic"
-
-fn example(dcid: []byte): []byte {
-  return deriveInitialSecret(dcid)
-}
-```
-
-### `clientInitialSecret(dcid: []byte): []byte`
-
-The client Initial traffic secret (RFC 9001 section 5.2): `HKDF-Expand-Label(initial,
-"client in", "", 32)`.
-
-```bit
-import { clientInitialSecret } from "std/quic"
-
-fn example(dcid: []byte): []byte {
-  return clientInitialSecret(dcid)
-}
-```
-
-### `serverInitialSecret(dcid: []byte): []byte`
-
-The server Initial traffic secret (RFC 9001 section 5.2): `HKDF-Expand-Label(initial,
-"server in", "", 32)`.
-
-```bit
-import { serverInitialSecret } from "std/quic"
-
-fn example(dcid: []byte): []byte {
-  return serverInitialSecret(dcid)
-}
-```
-
-### `deriveKeys(secret: []byte): PacketKeys`
-
-The AES-128-GCM key/iv/hp derived from a traffic `secret` (RFC 9001 section 5.1): "quic key"
-(16 bytes), "quic iv" (12), and "quic hp" (16).
-
-```bit
-import { PacketKeys, deriveKeys } from "std/quic"
-
-fn example(secret: []byte): PacketKeys {
-  return deriveKeys(secret)
-}
-```
-
-### `clientInitialKeys(dcid: []byte): PacketKeys`
-
-The keys that protect the client's Initial packets, derived end to end from the
-client-chosen `dcid`.
-
-```bit
-import { PacketKeys, clientInitialKeys } from "std/quic"
-
-fn example(dcid: []byte): PacketKeys {
-  return clientInitialKeys(dcid)
-}
-```
-
-### `serverInitialKeys(dcid: []byte): PacketKeys`
-
-The keys that protect the server's Initial packets, derived from the same client
-`dcid`.
-
-```bit
-import { PacketKeys, serverInitialKeys } from "std/quic"
-
-fn example(dcid: []byte): PacketKeys {
-  return serverInitialKeys(dcid)
-}
-```
-
-### `packetNumberLength(pn: u64, largestAcked: int): int`
-
-The smallest packet-number encoding length (1..4 bytes) for `pn` given the peer's
-`largestAcked` (RFC 9000 section 17.1). Pass a negative `largestAcked` when nothing has been
-acknowledged yet.
-
-```bit
-import { packetNumberLength } from "std/quic"
-
-fn example(): int {
-  return packetNumberLength(42, -1)
-}
-```
-
-### `encodePacketNumber(pn: u64, pnLength: int): []byte`
-
-The `pnLength`-byte big-endian truncation of packet number `pn` (RFC 9000 section 17.1).
-
-```bit
-import { encodePacketNumber } from "std/quic"
-
-fn example(): []byte {
-  return encodePacketNumber(42, 2)
-}
-```
-
-### `packetNonce(iv: []byte, pn: u64): []byte`
-
-The AEAD nonce for packet number `pn` (RFC 9001 section 5.3): the IV with `pn` (big-endian,
-right-aligned) XOR'd into its low bytes.
-
-```bit
-import { packetNonce } from "std/quic"
-
-fn example(iv: []byte): []byte {
-  return packetNonce(iv, 42)
-}
-```
-
-### `protectPayload(keys: PacketKeys, pn: u64, header: []byte, payload: []byte): []byte!`
-
-Seal `payload` under `keys` for packet number `pn` (RFC 9001 section 5.3): AES-128-GCM with
-nonce `IV ^ pn` and `header` as additional data, returning the ciphertext with the
-16-byte tag appended.
-
-```bit
-import { PacketKeys, protectPayload } from "std/quic"
-
-fn example(keys: PacketKeys, header: []byte, payload: []byte): []byte! {
-  return protectPayload(keys, 0, header, payload)?
-}
-```
-
-### `unprotectPayload(keys: PacketKeys, pn: u64, header: []byte, ciphertext: []byte): []byte!`
-
-Open the protected `ciphertext` (payload ‖ tag) under `keys` for packet number `pn`,
-authenticating `header`. Fails without returning plaintext if the tag does not verify.
-
-```bit
-import { PacketKeys, unprotectPayload } from "std/quic"
-
-fn example(keys: PacketKeys, header: []byte, ciphertext: []byte): []byte! {
-  return unprotectPayload(keys, 0, header, ciphertext)?
-}
-```
-
-### `headerSample(protectedPayload: []byte, pnLength: int): []byte!`
-
-The 16-byte header-protection sample from a protected payload (RFC 9001 section 5.4.2), taken
-4 bytes past the packet-number field. Fails if the payload is too short.
-
-```bit
-import { headerSample } from "std/quic"
-
-fn example(protectedPayload: []byte): []byte! {
-  return headerSample(protectedPayload, 4)?
-}
-```
-
-### `aesHeaderMask(hpKey: []byte, sample: []byte): []byte!`
-
-The 5-byte AES header-protection mask (RFC 9001 section 5.4.3): AES-ECB of the 16-byte
-`sample` under `hpKey`, truncated to 5 bytes. For the AES-GCM suites.
-
-```bit
-import { aesHeaderMask } from "std/quic"
-
-fn example(hpKey: []byte, sample: []byte): []byte! {
-  return aesHeaderMask(hpKey, sample)?
-}
-```
-
-### `chachaHeaderMask(hpKey: []byte, sample: []byte): []byte!`
-
-The 5-byte ChaCha20 header-protection mask (RFC 9001 section 5.4.4): the counter is
-`sample[0..4]` (little-endian) and the nonce `sample[4..16]`. For ChaCha20-Poly1305.
-
-```bit
-import { chachaHeaderMask } from "std/quic"
-
-fn example(hpKey: []byte, sample: []byte): []byte! {
-  return chachaHeaderMask(hpKey, sample)?
-}
-```
-
-### `applyHeaderProtection(packet: []byte, pnOffset: int, mask: []byte): ()!`
-
-Apply header protection to a full packet buffer in place, for sending (RFC 9001
-section 5.4.1). `pnOffset` is the start of the packet number; `mask` is the 5-byte mask.
-
-```bit
-import { applyHeaderProtection } from "std/quic"
-
-fn example(packet: []byte, pnOffset: int, mask: []byte): ()! {
-  applyHeaderProtection(packet, pnOffset, mask)?
-}
-```
-
-### `removeHeaderProtection(packet: []byte, pnOffset: int, mask: []byte): int!`
-
-Remove header protection from a full packet buffer in place, for receiving, and return
-the recovered packet-number length (RFC 9001 section 5.4.1).
-
-```bit
-import { removeHeaderProtection } from "std/quic"
-
-fn example(packet: []byte, pnOffset: int, mask: []byte): int! {
-  return removeHeaderProtection(packet, pnOffset, mask)?
-}
-```
-
-### `LongHeader`
-
-The invariant long-header fields (RFC 9000 section 17.2): the packet type, version, and the
-Destination and Source Connection IDs.
-
-```bit
-import { LongHeader, parseLongHeader } from "std/quic"
-
-fn example(packet: []byte): LongHeader! {
-  return parseLongHeader(packet)?
-}
-```
-
-### `encodeInitialHeader(version: int, dcid: []byte, scid: []byte, token: []byte, length: u64, pn: u64, pnLength: int): []byte`
-
-The unprotected Initial-packet header through the packet number (RFC 9000 section 17.2.2),
-which is exactly the AEAD additional data for `protectPayload`.
-
-```bit
-import { encodeInitialHeader } from "std/quic"
-
-fn example(dcid: []byte, scid: []byte): []byte {
-  return encodeInitialHeader(1, dcid, scid, []byte(0), 1200, 0, 4)
-}
-```
-
-### `parseLongHeader(packet: []byte): LongHeader!`
-
-The invariant long-header fields of `packet` (RFC 9000 section 17.2). Reads byte 0, the
-version, and the two connection IDs, stopping before the type-specific fields.
-
-```bit
-import { LongHeader, parseLongHeader } from "std/quic"
-
-fn example(packet: []byte): LongHeader! {
-  return parseLongHeader(packet)?
-}
-```
-
-### `ShortHeader`
-
-The short-header (1-RTT) fields recovered after header protection is removed (RFC 9000
-section 17.3): the spin and key-phase bits, the connection ID, and the packet-number length.
-
-```bit
-import { ShortHeader, parseShortHeader } from "std/quic"
-
-fn example(packet: []byte): ShortHeader! {
-  return parseShortHeader(packet, 8)?
-}
-```
-
-### `encodeShortHeader(dcid: []byte, pn: u64, pnLength: int, spinBit: bool, keyPhase: bool): []byte`
-
-The unprotected short-header (1-RTT) bytes through the packet number (RFC 9000 section 17.3),
-the AEAD additional data for a 1-RTT packet.
-
-```bit
-import { encodeShortHeader } from "std/quic"
-
-fn example(dcid: []byte): []byte {
-  return encodeShortHeader(dcid, 42, 2, false, false)
-}
-```
-
-### `parseShortHeader(packet: []byte, dcidLen: int): ShortHeader!`
-
-The short-header fields of `packet` given the connection's `dcidLen` (RFC 9000 section 17.3),
-which a short header does not carry on the wire. Call after `removeHeaderProtection`.
-
-```bit
-import { ShortHeader, parseShortHeader } from "std/quic"
-
-fn example(packet: []byte): ShortHeader! {
-  return parseShortHeader(packet, 8)?
-}
-```
-
-### `retryIntegrityTag(odcid: []byte, retryWithoutTag: []byte): []byte!`
-
-The 16-byte Retry integrity tag (RFC 9001 section 5.8): AES-128-GCM over the Retry Pseudo-
-Packet built from `odcid` (the Original Destination Connection ID) and the Retry packet
-with its trailing tag removed.
-
-```bit
-import { retryIntegrityTag } from "std/quic"
-
-fn example(odcid: []byte, retryWithoutTag: []byte): []byte! {
-  return retryIntegrityTag(odcid, retryWithoutTag)?
-}
-```
-
-### `verifyRetry(odcid: []byte, fullRetry: []byte): bool!`
-
-Whether the trailing integrity tag of `fullRetry` is valid for `odcid` (RFC 9001
-section 5.8), compared in constant time.
-
-```bit
-import { verifyRetry } from "std/quic"
-
-fn example(odcid: []byte, fullRetry: []byte): bool! {
-  return verifyRetry(odcid, fullRetry)?
-}
-```
-
-### `encodeVersionNegotiation(dcid: []byte, scid: []byte, versions: []int): []byte`
-
-A Version Negotiation packet (RFC 9000 section 17.2.1): a long header with version 0 that
-lists the server's supported `versions`, echoing the client's connection IDs.
-
-```bit
-import { encodeVersionNegotiation } from "std/quic"
-
-fn example(dcid: []byte, scid: []byte): []byte {
-  return encodeVersionNegotiation(dcid, scid, [1])
-}
-```
-
-### `isVersionNegotiation(packet: []byte): bool`
-
-Whether `packet` is a Version Negotiation packet (RFC 9000 section 17.2.1): a long header
-whose 32-bit version field is zero.
-
-```bit
-import { isVersionNegotiation } from "std/quic"
-
-fn example(packet: []byte): bool {
-  return isVersionNegotiation(packet)
-}
-```
-## QUIC-TLS
-
-QUIC does not run TLS 1.3 over a TLS record layer (RFC 9001). Instead it carries
-the raw handshake *messages* inside CRYPTO frames and derives its own packet-
-protection keys from the TLS traffic secrets under QUIC-specific HKDF labels. This
-section is that seam: the `quic_transport_parameters` TLS extension codec, the
-per-encryption-level key derivation and key update, and CRYPTO-frame carriage. It
-builds on the [key schedule](tls.md) in `std/tls` (it reuses that module's
-`hkdfExpandLabel`) but touches no TLS record.
-
-A full client↔server handshake runs on `std/tls`'s record-bypass handshake mode
-(its `tlsClientStartExts` / `tlsServerStartExts` entrypoints and message-level
-drivers, in [std/tls › QUIC handshake mode](tls.md#quic-handshake-mode)): carry
-each handshake message in CRYPTO frames across the Initial and Handshake levels,
-key each level from the exposed traffic secrets with `levelKeys` (or `levelKeyPair`
-for both directions at once), and reach 1-RTT on both sides - with the TLS
-certificate, CertificateVerify, and Finished verification all still enforced.
-
-```bit
-import {
-  defaultTransportParameters,
-  encodeTransportParameters,
-  levelKeys,
-  updateSecret,
-  cryptoFrames,
-  reassembleCryptoFrames,
-  PacketKeys,
-} from "std/quic"
-import { Hash, newSha256 } from "std/crypto"
-
-// The negotiated suite's hash as a `() => Hash`.
-fn sha256(): Hash { return newSha256() }
-
-// Our transport parameters, as the quic_transport_parameters extension body.
-fn myParameters(): []byte {
-  let tp = defaultTransportParameters()
-  tp.initialMaxData = 1048576
-  tp.initialMaxStreamsBidi = 100
-  return encodeTransportParameters(tp)
-}
-
-// The 1-RTT packet keys for one direction from its application traffic secret,
-// and the next secret after a key update (re-derive the key/iv, keep the hp).
-fn oneRttKeys(secret: []byte): PacketKeys {
-  return levelKeys(sha256, secret, 16)
-}
-
-fn rollForward(secret: []byte): []byte {
-  return updateSecret(sha256, secret)
-}
-
-// Carry a handshake message in CRYPTO frames and reassemble it in order.
-fn carry(handshake: []byte): []byte! {
-  let frames = cryptoFrames(handshake, 0, 1000)
-  return reassembleCryptoFrames(frames, 65536)?
-}
-```
-
-### `quicTransportParametersExtension: int`
-
-The TLS 1.3 extension codepoint (0x0039) carrying the QUIC transport parameters
-(RFC 9001 section 8.2). Its extension_data is exactly what `encodeTransportParameters`
-produces.
-
-### `TransportParameters`
-
-The QUIC transport parameters an endpoint sends its peer (RFC 9000 section 18.2): the
-flow-control limits, timeouts, and connection ids. Integer parameters hold their
-RFC default (see `defaultTransportParameters`); the byte-string parameters are
-empty when absent, and `disableActiveMigration` is a present-means-true flag.
-
-### `defaultTransportParameters(): TransportParameters`
-
-A `TransportParameters` filled with the RFC 9000 section 18.2 defaults (the non-zero
-defaults for `maxUdpPayloadSize`, `ackDelayExponent`, `maxAckDelay`, and
-`activeConnectionIdLimit`, everything else zero or empty). Start here, set the
-parameters that differ, and encode: the codec omits anything left at its default.
-
-### `encodeTransportParameters(tp: TransportParameters): []byte`
-
-Encode `tp` as the `quic_transport_parameters` extension body (RFC 9000 section 18.2):
-the id/len/value list in ascending-id order, omitting every parameter equal to
-its default so the wire form is minimal and canonical.
-
-### `decodeTransportParameters(data: []byte): TransportParameters!`
-
-Decode a `quic_transport_parameters` extension body (RFC 9000 section 18.2) into a
-`TransportParameters` seeded with the RFC defaults, so an omitted parameter keeps
-its default. Unknown parameter ids are skipped. Fails on a length past the buffer,
-a malformed integer value, or trailing bytes.
-
-### `EncryptionLevel`
-
-The three packet-protection encryption levels of a QUIC connection (RFC 9001 section 2):
-`Initial`, `Handshake`, and `OneRtt` - the last being the only level subject to
-key update.
-
-### `levelPacketType(level: EncryptionLevel): int`
-
-The long-header packet type that carries `level` (RFC 9000 section 17.2): 0 for Initial,
-2 for Handshake. `OneRtt` is carried in a short-header packet, which has no
-long-header type, so it returns -1.
-
-### `levelKeys(newHash: () => Hash, secret: []byte, keyLen: int): PacketKeys`
-
-The packet-protection key/iv/hp for a Handshake or 1-RTT level, derived from a TLS
-traffic `secret` (RFC 9001 section 5.1) with the QUIC labels "quic key", "quic iv" (12
-bytes), and "quic hp". `keyLen` is the AEAD key length (16 for AES-128-GCM, 32 for
-AES-256-GCM and ChaCha20-Poly1305), and the hp key is the same length. `newHash`
-is the negotiated suite's hash. Initial keys instead come from `clientInitialKeys`.
-
-### `LevelKeyPair`
-
-Both directions' packet-protection keys for one non-Initial encryption level (RFC
-9001 section 5.1) - the unit an endpoint installs for the Handshake or 1-RTT level.
-`client` protects the client's packets, `server` the server's.
-
-### `levelKeyPair(newHash: () => Hash, clientSecret: []byte, serverSecret: []byte, keyLen: int): LevelKeyPair`
-
-Derive both directions' keys for a non-Initial level from the endpoint TLS traffic
-secrets (RFC 9001 section 5.1): `clientSecret` is the client's handshake- or
-application-traffic secret and `serverSecret` the server's, as exposed by the
-`std/tls` record-bypass handshake. Both peers, deriving from the same pair of
-secrets, obtain byte-identical keys - the check that a QUIC-TLS handshake reached
-a level.
-
-```bit
-import { levelKeyPair, LevelKeyPair } from "std/quic"
-import { Hash, newSha256 } from "std/crypto"
-
-// The negotiated suite's hash as a `() => Hash`.
-fn suite(): Hash { return newSha256() }
-
-// Both directions' 1-RTT keys from the client and server application secrets that
-// the std/tls record-bypass handshake exposed.
-fn oneRtt(clientSecret: []byte, serverSecret: []byte): LevelKeyPair {
-  return levelKeyPair(suite, clientSecret, serverSecret, 16)
-}
-```
-
-### `updateSecret(newHash: () => Hash, secret: []byte): []byte`
-
-The next-generation 1-RTT secret for a key update (RFC 9001 section 6.1):
-`HKDF-Expand-Label(secret, "quic ku", "", Hash.length)`. Re-derive the AEAD key
-and iv from the result with `levelKeys`; the header-protection key is not updated.
-
-### `nextKeyPhase(keyPhase: bool): bool`
-
-The key-phase bit after a key update (RFC 9001 section 6.3) - it toggles, so a peer can
-tell which key generation protected a packet. The bit itself is carried in the
-short header (`encodeShortHeader`).
-
-### `cryptoFrames(data: []byte, startOffset: u64, maxChunk: int): []Frame`
-
-Chunk a handshake byte stream into CRYPTO frames (RFC 9000 section 19.6), each at most
-`maxChunk` bytes, the first at `startOffset` and each subsequent one at the
-running offset. Ready to place in a packet payload with `encodeFrame`.
-
-### `CryptoAssembler`
-
-A reassembler for the CRYPTO stream (RFC 9000 section 19.6): it accepts received CRYPTO
-fragments in any order, with gaps and overlapping retransmits, and yields the
-contiguous ordered byte stream. Build one with `newCryptoAssembler`.
-
-### `newCryptoAssembler(maxLen: int): CryptoAssembler`
-
-A fresh `CryptoAssembler` that accepts data up to `maxLen` bytes total - a bound
-on offset + length across all fragments, so a hostile offset cannot force an
-unbounded allocation.
-
-### `CryptoAssembler.insert(offset: u64, fragment: []byte): ()!`
-
-Insert one CRYPTO fragment: `fragment` bytes at stream `offset` (RFC 9000 section 19.6).
-Records the bytes and extends the readable prefix. Overlapping retransmits are
-allowed only if they carry identical bytes; a mismatch, or a fragment past
-`maxLen`, fails.
-
-### `CryptoAssembler.contiguous(): []byte`
-
-The contiguous handshake bytes reassembled so far - the ordered stream from offset
-0 up to the first gap. Grows as later `insert`s fill earlier gaps.
-
-### `CryptoAssembler.contiguousLen(): int`
-
-The length of the contiguous reassembled prefix - `len(contiguous())` without
-materializing the slice.
-
-### `reassembleCryptoFrames(frames: []Frame, maxLen: int): []byte!`
-
-Reassemble the CRYPTO frames in `frames` into the contiguous handshake byte stream
-(RFC 9000 section 19.6), ignoring non-CRYPTO frames. Frames may be in any order and may
-overlap; the result is the ordered prefix up to the first gap. `maxLen` bounds the
-buffer. Fails on an over-limit offset or a conflicting overlap.
-
-## Transport / connection
-
-The connection layer (`conn.bit`, RFC 9000 transport + RFC 9002 recovery) turns
-the unreliable UDP datagram flow into reliable, ordered, flow-controlled byte
-streams. It drives the [`std/tls`](tls.md) record-bypass handshake to 1-RTT over
-CRYPTO frames, then carries application data on bidirectional streams with
-per-stream and connection flow control (MAX_DATA / MAX_STREAM_DATA), ACK-based and
-PTO loss recovery, and NewReno congestion control. Each connection is owned by one
-green thread (the loop) that folds in datagrams, application commands, and timer
-ticks one at a time - no shared mutable state, no locks.
-
-ponytail: NewReno only (no CUBIC/BBR); connection migration is connection-id
-basics only (fixed 8-byte ids, no path validation); one connection per socket (no
-server-side demultiplexing across peers); AES-128-GCM + X25519 only, matching
-`packet.bit`'s AEAD.
-
-### `dialQuic(host: string, port: int, serverName: string): Conn!`
-
-Open a QUIC connection to `host:port` and complete the handshake to 1-RTT. Binds
-an ephemeral loopback UDP socket, spawns the reader/timer/loop threads, and blocks
-until the connection is established. `serverName` is the TLS SNI. Fails if the
-handshake does not complete.
-
-### `acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Conn!`
-
-Accept a QUIC connection on the already-bound UDP socket `sock`, using the PEM
-certificate chain (end-entity first) and private key, and complete the handshake.
-Serves exactly one connection. Fails if the handshake does not complete.
-
-### `listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Listener!`
-
-Bind a server listener to the already-bound UDP socket `sock`, using the PEM
-certificate chain (end-entity first) and private key. Unlike `acceptQuic`, the
-listener owns the socket and demultiplexes every incoming datagram to the matching
-connection by Destination Connection ID (RFC 9000 section 5.1), so one socket serves many
-concurrent clients. Returns immediately; established connections arrive via
-`accept`.
-
-### `Listener`
-
-A QUIC server listener owning one bound UDP socket. It routes each datagram to the
-right connection and opens a new one on an Initial packet with an unknown
-connection id (up to an internal cap). Obtain one from `listenQuic`.
-
-### `Listener.accept(): Conn!`
-
-Accept the next established connection, blocking until a client completes its
-handshake. Each returned `Conn` is independent, multiplexed over the shared socket.
-
-### `Listener.stopAccepting()`
-
-Stop admitting brand-new connections: a datagram whose connection id is not
-already in the demux table is refused from then on, instead of being checked
-for a client Initial and possibly starting a new connection. A connection
-already accepted, or still mid-handshake, is unaffected - it keeps being fed
-its datagrams over the one shared socket exactly as before. This stops
-admission, not the demux loop every open connection depends on, so it is safe
-to call while other connections are still in flight. Idempotent, and safe to
-call from any green thread.
-
-RFC 9000 section 5.2.2 lists two options for refusing a new connection: drop the
-packet, or reply with an Initial packet carrying a CONNECTION_CLOSE frame
-(error code CONNECTION_REFUSED) - the latter "SHOULD" when a server can. A
-well-formed client Initial gets the reply: a stateless, Initial-protected
-packet built outside any established connection's key schedule, keyed off
-the client's own Destination Connection ID the same way a real connection's
-Initial keys are (RFC 9001 section 5.2), so the client's dial fails immediately with
-CONNECTION_REFUSED instead of running out its full handshake timeout. The
-reply is capped by the RFC 9000 section 8.1 anti-amplification limit like any other
-response to an address not yet validated by a completed handshake. Anything
-too malformed to carry a parseable Destination Connection ID, or not a
-client Initial at all, still falls back to a silent drop - the client's own
-retransmission, and failing that its handshake-timeout-driven redial, gives
-up once nothing ever answers.
-
-`std/http`'s `H3Server.shutdown` (stdlib/http/h3.bit) calls this as the first
-step of draining an HTTP/3 server.
-
-### `Conn`
-
-An established QUIC connection. Its methods marshal to the owning loop thread over
-a channel, so the connection has no directly-shared mutable state. Obtain one from
-`dialQuic` or `acceptQuic`.
-
-### `Conn.peerIp(): string`
-
-The peer's IPv4 address in dotted quad (`"203.0.113.7"`), or `""` when it is not
-known. Never fails and never blocks: a peer address is metadata, so it must not be
-able to fail an operation, and the value is already in hand rather than read back
-from the connection's loop.
-
-Which address, since a QUIC connection is not pinned to one: the source address of
-the datagram that ESTABLISHED THIS CONNECTION, captured at that instant and frozen
-for the connection's life. On a server that is the client's Initial carrying the
-ClientHello; on a client it is the server's flight that finished the handshake.
-Either way it is fixed before the connection is handed to the application, so no
-later packet can move it. A peer may migrate to a new address mid-connection (RFC 9000
-section 9) and this endpoint keeps replying to wherever its latest datagram came from, so
-the reported address can go stale - deliberately. The handshake address is the one
-any authorization or audit decision was implicitly made against, it is stable, and
-a caller reading it twice cannot get two answers. Migrated addresses are not path
-validated here (section 9.3), so a later address is not one this endpoint has verified in
-any case.
-
-On the client side of a connection this names the server. `""` means unknown, never
-a placeholder: treat it as "no peer known" - never as an address.
-
-This is what puts a client address on `http.Request.peer` for HTTP/3, where the
-socket cannot supply one: an HTTP/3 server's UDP socket is bound and shared by
-every client, not connected, so `net.Conn.peerIp` has no peer to report on it.
-
-### `Conn.openStream(): Stream!`
-
-Open a new client-initiated bidirectional stream (RFC 9000 section 2.1). Fails with a
-distinct message when the peer's advertised stream limit
-(initial_max_streams_bidi / MAX_STREAMS) is already reached.
-
-### `Conn.acceptStream(): Stream!`
-
-Accept the next peer-initiated bidirectional stream, blocking until one opens.
-
-### `Conn.setIdleTimeout(ns: int)`
-
-Set how long this connection tolerates hearing nothing from its peer before it
-gives up (RFC 9000 section 10.1), in nanoseconds. The default is 30s. Lower it when the
-application wants a vanished peer detected sooner than a PTO series would ever
-reveal it - without an idle timeout a thread parked in `read`, `finish`, or
-`acceptStream` waits forever. Values at or below zero are ignored. Takes effect
-on the next tick and applies to a connection from either side.
-
-### `Conn.close()`
-
-Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
-socket if this connection owns it. A connection accepted from a `Listener` shares
-the listener's socket with the listener and every sibling connection, so closing
-it leaves that socket alone. Best-effort - there is no draining timeout. Equivalent
-to `closeWithCode(0)`.
-
-### `Conn.closeWithCode(code: int)`
-
-As `close()`, but the CONNECTION_CLOSE's application error code is `code` instead
-of always 0 - the general form an application protocol layered on QUIC needs to
-close with ITS OWN code space instead of QUIC's own "no error" 0. `std/http3`'s
-`H3Conn.close()` uses this to close with HTTP/3's `H3_NO_ERROR` (0x0100, RFC 9114
-section 8.1) rather than QUIC's 0.
-
-### `Stream`
-
-One bidirectional stream on a `Conn`. `write`/`finish` queue outbound data; `read`
-pulls the next reassembled inbound chunk. Obtain one from `openStream` or
-`acceptStream`.
-
-### `Stream.write(data: []byte): ()!`
-
-Queue `data` on the stream. Returns once buffered; the loop delivers it under flow
-control and congestion control, retransmitting any losses.
-
-### `Stream.finish(): ()!`
-
-Mark the send half finished (FIN) and block until every queued byte has been
-acknowledged by the peer.
-
-### `Stream.reset(code: int): ()!`
-
-Abruptly terminate this stream's send side with RESET_STREAM (RFC 9000 section 19.4):
-abandon any buffered-but-unsent data and tell the peer not to expect the rest,
-instead of `finish`'s clean FIN. Fire-and-forget, like `write` - there is nothing
-to wait for, since a reset send stream never drains. Do not call this after a
-`finish` on the same stream is already in flight.
-
-### `Stream.stopSending(code: int): ()!`
-
-Ask the peer to stop sending on this stream (RFC 9000 section 19.5): data already in
-flight from them may still arrive until they process the request, and a
-well-behaved peer answers by resetting their send side, which then surfaces here
-as `read`'s `StreamChunk.reset`. Does not affect this endpoint's own send side -
-pair with `reset` if this side is also done sending.
-
-### `Stream.read(): StreamChunk!`
-
-Read the next reassembled inbound chunk, blocking until data, the FIN, or a peer
-RESET_STREAM arrives. The final chunk carries `fin = true`; read until then to
-consume the whole stream, or check `reset` to tell an abrupt peer abort apart
-from a clean end.
-
-### `Stream.id(): int`
-
-The stream's id (RFC 9000 section 2.1).
-
-### `StreamChunk`
-
-One contiguous run of received stream bytes delivered to the application, with
-`fin` set on the final run. Its fields are `data: []byte` and `fin: bool`. `reset`
-is set instead of a normal end when the peer abruptly aborted with RESET_STREAM
-(RFC 9000 section 19.4); `data` is then always empty and `resetCode` carries the peer's
-application error code.
+## Dialing, serving, and streams
+
+`dialQuic` opens a connection and completes the handshake; `acceptQuic` does the
+server side on an already-bound socket, for one connection. A connection carries
+any number of bidirectional streams: `openStream`/`acceptStream` open one, `write`
+queues bytes, `finish` marks the send side done, `read` pulls reassembled bytes
+until `fin`.
 
 ```bit
 import { dialQuic, acceptQuic, Conn, Stream, StreamChunk } from "std/quic"
 import { UdpSocket } from "std/net"
 
-// Client: open a bidirectional stream, send a request, and read the reply to the
-// end of stream.
+// Client: open a stream, send a request, read the reply to the end of stream.
 fn request(host: string, port: int, req: []byte): []byte! {
   let conn = dialQuic(host, port, "example.com")?
   let s = conn.openStream()?
@@ -1056,3 +60,154 @@ fn serve(sock: UdpSocket, chainPem: string, keyPem: string): []byte! {
   return body
 }
 ```
+
+A server that expects more than one client uses `listenQuic` instead of
+`acceptQuic`: it owns the socket, demultiplexes every datagram to the right
+connection by id, and hands back each established connection through
+`Listener.accept()`.
+
+## Sharp edges
+
+**One connection idles out by default after 30s of silence.** Lower it with
+`Conn.setIdleTimeout` if your protocol needs a vanished peer detected sooner - a
+thread parked in `read`, `finish`, or `acceptStream` otherwise waits until the
+timeout, or forever if you never set one and the peer never speaks again.
+
+**A `finish`ed or `reset` send side cannot be reused.** `finish` blocks until every
+byte is acknowledged; `reset` abandons unsent data and tells the peer to stop
+expecting the rest. Do not call `reset` after a `finish` on the same stream is
+already in flight - the two are mutually exclusive endings for the same send side.
+
+**This implementation is deliberately narrow.** NewReno congestion control only (no
+CUBIC/BBR); connection migration is connection-id basics only, with no path
+validation; one connection per socket from `acceptQuic` (use `listenQuic` for many
+clients on one socket); AES-128-GCM + X25519 only.
+
+## When not to use it directly
+
+If you are building an HTTP service, use [`pkg/web`](/packages/web) or
+[`std/http3`](http3.md): they run HTTP/3 over this transport and give you the
+plain request/handler API. Reach for `std/quic` only when your protocol is not
+HTTP.
+
+## Reference
+
+### Transport / connection
+
+| | |
+|---|---|
+| `dialQuic(host, port, serverName): Conn!` | open a connection and complete the handshake |
+| `acceptQuic(sock, certChainPem, keyPem): Conn!` | accept one connection on a bound socket |
+| `listenQuic(sock, certChainPem, keyPem): Listener!` | bind a listener for many concurrent connections |
+| `Listener.accept(): Conn!` | accept the next established connection |
+| `Listener.stopAccepting()` | stop admitting new connections; existing ones are unaffected |
+| `Conn.peerIp(): string` | the peer address the handshake established (frozen for the connection's life; `""` if unknown) |
+| `Conn.openStream(): Stream!` | open a client-initiated bidirectional stream |
+| `Conn.acceptStream(): Stream!` | accept the next peer-initiated stream |
+| `Conn.setIdleTimeout(ns: int)` | how long to tolerate silence before giving up (default 30s) |
+| `Conn.close()` | send CONNECTION_CLOSE (code 0) and stop |
+| `Conn.closeWithCode(code: int)` | as `close`, with an application error code |
+| `Stream.write(data: []byte): ()!` | queue outbound data |
+| `Stream.finish(): ()!` | mark the send side done, block until acknowledged |
+| `Stream.reset(code: int): ()!` | abandon the send side (RESET_STREAM); fire-and-forget |
+| `Stream.stopSending(code: int): ()!` | ask the peer to stop sending on this stream |
+| `Stream.read(): StreamChunk!` | read the next reassembled inbound chunk |
+| `Stream.id(): int` | the stream's id |
+| `StreamChunk { data, fin, reset, resetCode }` | one inbound take; `reset` set on a peer RESET_STREAM |
+
+### Frames
+
+The frame codec (RFC 9000): `Frame` covers every QUIC v1 frame kind, and every
+protocol number is a variable-length integer.
+
+| | |
+|---|---|
+| `encodeVarint(v): []byte`, `decodeVarint(data): u64!`, `varintSize(v): int` | the variable-length integer codec |
+| `AckRange { gap, rangeLength }`, `AckFrame { largest, delay, firstRange, ranges, ecn, ect0, ect1, ce }` | an ACK frame and its ranges |
+| `StreamFrame { id, offset, data, hasOffset, hasLength, fin }` | a STREAM frame |
+| `Frame` | every v1 frame kind as one sum type (`Padding(n)`, `Ping`, `Crypto(offset, data)`, `ConnectionClose`, `ApplicationClose`, ...) |
+| `encodeFrame(f): []byte`, `encodeFrames(frames): []byte` | encode one or many frames |
+| `parseFrames(data): []Frame!` | parse every frame in a payload |
+
+### Packet protection
+
+Key derivation, AEAD sealing, and header protection (RFC 9001) for the packets
+that carry the frames above.
+
+| | |
+|---|---|
+| `quicVersion1`, `longInitial` `longZeroRtt` `longHandshake` `longRetry` | QUIC v1 and the long-header packet types |
+| `PacketKeys { key, iv, hp }` | one direction's AEAD key, IV, and header-protection key |
+| `initialSalt(): []byte` | the fixed QUIC v1 Initial salt |
+| `expandLabel(secret, label, length): []byte` | TLS 1.3 HKDF-Expand-Label as QUIC uses it |
+| `deriveInitialSecret(dcid)`, `clientInitialSecret(dcid)`, `serverInitialSecret(dcid)` | the Initial secret ladder |
+| `deriveKeys(secret): PacketKeys` | key/iv/hp from a traffic secret |
+| `clientInitialKeys(dcid): PacketKeys`, `serverInitialKeys(dcid): PacketKeys` | Initial keys derived end to end from a connection id |
+| `packetNumberLength(pn, largestAcked): int`, `encodePacketNumber(pn, pnLength): []byte` | packet-number encoding |
+| `packetNonce(iv, pn): []byte` | the AEAD nonce for a packet number |
+| `protectPayload(keys, pn, header, payload): []byte!`, `unprotectPayload(keys, pn, header, ciphertext): []byte!` | seal/open a packet payload |
+| `headerSample(protectedPayload, pnLength): []byte!` | the header-protection sample |
+| `aesHeaderMask(hpKey, sample): []byte!`, `chachaHeaderMask(hpKey, sample): []byte!` | the AES-ECB and ChaCha20 header-protection masks |
+| `applyHeaderProtection(packet, pnOffset, mask): ()!`, `removeHeaderProtection(packet, pnOffset, mask): int!` | apply/remove header protection in place |
+| `LongHeader { ... }`, `parseLongHeader(packet): LongHeader!` | the invariant long-header fields |
+| `encodeInitialHeader(...)` | the unprotected Initial header (the AEAD additional data) |
+| `ShortHeader { ... }`, `encodeShortHeader(...)`, `parseShortHeader(packet, dcidLen): ShortHeader!` | the 1-RTT short header |
+| `retryIntegrityTag(odcid, retryWithoutTag): []byte!`, `verifyRetry(odcid, fullRetry): bool!` | the Retry integrity tag |
+| `encodeVersionNegotiation(dcid, scid, versions): []byte`, `isVersionNegotiation(packet): bool` | Version Negotiation packets |
+
+### QUIC-TLS
+
+The seam between QUIC and [`std/tls`](tls.md)'s record-bypass handshake: transport
+parameters, per-level key derivation, and CRYPTO-frame carriage.
+
+```bit
+import {
+  defaultTransportParameters, encodeTransportParameters, levelKeys, updateSecret,
+  cryptoFrames, reassembleCryptoFrames, PacketKeys,
+} from "std/quic"
+import { Hash, newSha256 } from "std/crypto"
+
+fn sha256(): Hash { return newSha256() }
+
+// Our transport parameters, as the quic_transport_parameters extension body.
+fn myParameters(): []byte {
+  let tp = defaultTransportParameters()
+  tp.initialMaxData = 1048576
+  tp.initialMaxStreamsBidi = 100
+  return encodeTransportParameters(tp)
+}
+
+// The 1-RTT packet keys for one direction, and the next secret after a key update.
+fn oneRttKeys(secret: []byte): PacketKeys {
+  return levelKeys(sha256, secret, 16)
+}
+
+fn rollForward(secret: []byte): []byte {
+  return updateSecret(sha256, secret)
+}
+
+// Carry a handshake message in CRYPTO frames and reassemble it in order.
+fn carry(handshake: []byte): []byte! {
+  let frames = cryptoFrames(handshake, 0, 1000)
+  return reassembleCryptoFrames(frames, 65536)?
+}
+```
+
+| | |
+|---|---|
+| `quicTransportParametersExtension` | the TLS extension codepoint (0x0039) carrying the parameters below |
+| `TransportParameters { ... }`, `defaultTransportParameters(): TransportParameters` | the parameters an endpoint sends its peer, seeded with RFC defaults |
+| `encodeTransportParameters(tp): []byte`, `decodeTransportParameters(data): TransportParameters!` | codec for the extension body |
+| `EncryptionLevel` (`Initial`, `Handshake`, `OneRtt`) | the three packet-protection levels |
+| `levelPacketType(level): int` | the long-header type for a level (-1 for `OneRtt`) |
+| `levelKeys(newHash, secret, keyLen): PacketKeys` | Handshake/1-RTT keys from a TLS traffic secret |
+| `LevelKeyPair { client, server }`, `levelKeyPair(newHash, clientSecret, serverSecret, keyLen): LevelKeyPair` | both directions' keys for one level |
+| `updateSecret(newHash, secret): []byte` | the next-generation 1-RTT secret for a key update |
+| `nextKeyPhase(keyPhase): bool` | the key-phase bit after a key update |
+| `cryptoFrames(data, startOffset, maxChunk): []Frame` | chunk a handshake byte stream into CRYPTO frames |
+| `CryptoAssembler`, `newCryptoAssembler(maxLen): CryptoAssembler` | reassembler for out-of-order CRYPTO fragments |
+| `CryptoAssembler.insert(offset, fragment): ()!` | record one received fragment |
+| `CryptoAssembler.contiguous(): []byte`, `.contiguousLen(): int` | the contiguous reassembled prefix |
+| `reassembleCryptoFrames(frames, maxLen): []byte!` | reassemble a set of CRYPTO frames directly |
+
+Specification: RFC 9000 (transport), RFC 9001 (TLS/packet protection).

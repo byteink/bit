@@ -1,290 +1,26 @@
 # std/http3
 
-The HTTP/3 wire layer, built from scratch in Bit. Its first piece is **QPACK**
-header compression (RFC 9204): the format HTTP/3 carries its headers in, playing
-HPACK's role but redesigned for QUIC's out-of-order delivery. QPACK is a pure
-byte codec - it turns header fields and control instructions into wire bytes and
-back, with no QUIC, no streams, and no flow control - so it composes under a real
-HTTP/3 connection without carrying any transport of its own.
+Most programs never import `std/http3` directly. [`pkg/web`](/packages/web) and
+[`std/http`](http.md) negotiate HTTP/3 automatically and speak it for you - this
+module is the wire layer underneath: QPACK header compression (RFC 9204, HPACK's
+role redesigned for QUIC's out-of-order delivery) and the request/response layer
+(RFC 9114) running over [`std/quic`](quic.md).
 
-QPACK shares the RFC 7541 Huffman code and prefix-integer encoding with HPACK, so
-`std/http3` reuses `huffmanEncode`/`huffmanDecode` from `std/http2` rather than
-duplicating the 257-symbol table. Everything else - the 99-entry static table, the
-dynamic-table accounting, the encoder/decoder instruction streams, and the field-
-line representations - is specific to QPACK and lives here. Import it all from
-`"std/http3"`.
+Reach for `std/http3` yourself when you are embedding an HTTP/3 client or server
+over a transport `std/http` does not manage for you.
 
 <!-- doctest: per-block -->
 
-## QPACK
-
-QPACK compresses a list of `(name, value)` header fields against two tables: a
-fixed 99-entry **static table** (distinct from HPACK's - index 0 is `:authority`,
-index 1 is `:path=/`) and a per-connection **dynamic table** both peers grow in
-lock-step. Because QUIC can deliver streams out of order, QPACK cannot let a field
-section depend on the exact position of a dynamic-table insertion the way HPACK
-does. It splits the work over three streams:
-
-- The **encoder stream** carries table mutations: set capacity, insert with a
-  static or dynamic name reference, insert with a literal name, and duplicate.
-- The **decoder stream** carries acknowledgements back: section acknowledgment,
-  stream cancellation, and insert count increment.
-- Each request/response stream carries an **encoded field section**: a prefix
-  (Required Insert Count + Base) followed by field-line representations that index
-  the static table, index the dynamic table relative to or after the Base, or
-  spell a name/value out literally.
-
-The dynamic table is addressed by a monotonic **absolute index** (0 for the first
-entry ever inserted); eviction drops the oldest entries but never renumbers the
-survivors. A section's prefix names the Required Insert Count - the number of
-insertions the decoder must have processed before the section can be decoded -
-which is how a section stays correct under reordering: one that arrives early
-blocks until the encoder stream catches up.
-
-An `Encoder` and a `Decoder` are the two halves; reuse one of each per connection
-so their dynamic tables track each other. This example round-trips a field section
-that references only the static table, so its prefix is Required Insert Count 0,
-Base 0 and no dynamic-table state is involved:
-
-```bit
-import { newEncoder, newDecoder, HeaderField } from "std/http3"
-
-// Encode a static-table-only field section, then decode it back to the same
-// fields. `:method: GET` is a full static match (one index byte); `:path` reuses
-// the static name with a literal value.
-fn roundTrip(): []HeaderField! {
-  let enc = newEncoder()
-  let fields = []HeaderField{
-    HeaderField{ name = ":method", value = "GET", sensitive = false },
-    HeaderField{ name = ":path", value = "/index.html", sensitive = false },
-  }
-  let block = enc.encodeFieldSection(0, enc.insertCount(), fields)
-
-  let dec = newDecoder()
-  return dec.decodeFieldSection(block)?
-}
-```
-
-To reference a header not in the static table, insert it into the dynamic table
-on the encoder stream first. The decoder must apply that instruction before it can
-decode a section that indexes the new entry:
-
-```bit
-import { newEncoder, newDecoder, HeaderField } from "std/http3"
-
-// Grow the dynamic table on the encoder stream, mirror it on the decoder, then
-// encode a section that indexes the freshly inserted entry by a single byte.
-fn dynamic(): []HeaderField! {
-  let enc = newEncoder()
-  let dec = newDecoder()
-
-  dec.applyEncoderStream(enc.setCapacity(4096))?
-  dec.applyEncoderStream(enc.insertLiteral("x-trace-id", "abc123")?)?
-
-  let fields = []HeaderField{
-    HeaderField{ name = "x-trace-id", value = "abc123", sensitive = false },
-  }
-  let block = enc.encodeFieldSection(0, enc.insertCount(), fields)
-  return dec.decodeFieldSection(block)?
-}
-```
-
-After a decoder processes a section it acknowledges it, and the encoder folds that
-into its Known Received Count - the high-water mark of insertions it may safely
-reference without risking a blocked stream:
-
-```bit
-import { newEncoder, newDecoder, HeaderField } from "std/http3"
-
-// Encode a section on stream 4, then apply the decoder's acknowledgment.
-fn acknowledge(): int! {
-  let enc = newEncoder()
-  let dec = newDecoder()
-
-  dec.applyEncoderStream(enc.setCapacity(4096))?
-  dec.applyEncoderStream(enc.insertLiteral("x-trace-id", "abc123")?)?
-
-  let fields = []HeaderField{
-    HeaderField{ name = "x-trace-id", value = "abc123", sensitive = false },
-  }
-  let block = enc.encodeFieldSection(4, enc.insertCount(), fields)
-  dec.decodeFieldSection(block)?
-  enc.applyDecoderStream(dec.sectionAck(4))?
-  return enc.knownReceivedCount()
-}
-```
-
-### `HeaderField`
-
-One header field: a `name`, its `value`, and a `sensitive` flag. All three fields
-are exported. Set `sensitive` to force a never-index literal representation (an
-authorization token or cookie is never copied into the dynamic table, where a
-compression side channel could recover it); a decoder sets it on any field it
-received that way.
-
-### `newEncoder(): Encoder`
-
-A fresh encoder: a 4096-byte dynamic table and Huffman string literals enabled.
-
-### `newEncoderConfig(capacity: int, huffman: bool): Encoder`
-
-An encoder with an explicit initial table `capacity` and `huffman` choice. Pass
-`capacity` 0 to start with no dynamic table (then raise it with `setCapacity`),
-and `huffman` false to emit raw (non-Huffman) string literals.
-
-### `Encoder`
-
-A stateful QPACK encoder. It owns its dynamic table and tracks its Known Received
-Count and its outstanding field sections. Reuse one encoder per connection so its
-table tracks the peer decoder.
-
-### `Encoder.setCapacity(capacity: int): []byte`
-
-Emit a Set Dynamic Table Capacity instruction (RFC 9204 section 4.3.1) and resize the
-table, evicting entries that no longer fit. Returns the encoder-stream bytes.
-
-### `Encoder.insertNameRef(isStatic: bool, index: int, value: string): []byte!`
-
-Emit an Insert With Name Reference instruction (section 4.3.2) and add the entry. When
-`isStatic`, `index` is a static absolute index; otherwise it is a dynamic index
-relative to the current insert count. Fails on a bad index or an entry too large
-for the table.
-
-### `Encoder.insertLiteral(name: string, value: string): []byte!`
-
-Emit an Insert With Literal Name instruction (section 4.3.3) and add the entry. Fails if
-the entry is too large for the table.
-
-### `Encoder.duplicate(relIndex: int): []byte!`
-
-Emit a Duplicate instruction (section 4.3.4) and re-insert an existing entry, given as a
-dynamic index relative to the current insert count. Duplicating an about-to-be-
-evicted entry keeps a still-referenced header alive. Fails on a bad index.
-
-### `Encoder.encodeFieldSection(streamId: int, base: int, fields: []HeaderField): []byte`
-
-Encode `fields` into one field section on `streamId` against the given `base`
-(section 4.5). Each field is emitted as, in preference order: an indexed static line, an
-indexed dynamic line (relative or post-base per `base`), a literal with a
-static/dynamic name reference, or a literal with a literal name; a `sensitive`
-field is always a never-index literal. No new dynamic entries are inserted here -
-pre-populate the table with the encoder-stream methods. `base` is typically the
-current `insertCount()` but may be lower to force post-base indexing. The section
-is recorded as outstanding until acknowledged.
-
-### `Encoder.applyDecoderStream(data: []byte): ()!`
-
-Process decoder-stream bytes (section 4.4): a Section Acknowledgment raises the Known
-Received Count to the acked section's Required Insert Count and retires it; a
-Stream Cancellation retires an outstanding section; an Insert Count Increment
-advances the Known Received Count. Fails on a malformed instruction, an ack for an
-unknown stream, or an increment past the insert count.
-
-### `Encoder.insertCount(): int`
-
-The number of insertions the encoder has made (also the next absolute index).
-
-### `Encoder.tableSize(): int`
-
-The current byte size of the encoder's dynamic table.
-
-### `Encoder.tableCount(): int`
-
-The number of live entries in the encoder's dynamic table.
-
-### `Encoder.capacity(): int`
-
-The current dynamic-table capacity in bytes.
-
-### `Encoder.knownReceivedCount(): int`
-
-How many insertions the decoder has acknowledged (the Known Received Count).
-
-### `newDecoder(): Decoder`
-
-A fresh decoder: no dynamic table yet, willing to accept a capacity up to the
-4096-byte default.
-
-### `newDecoderConfig(limit: int): Decoder`
-
-A decoder with an explicit capacity `limit`. A Set Dynamic Table Capacity above
-this is rejected.
-
-### `Decoder`
-
-A stateful QPACK decoder. It owns its dynamic table and enforces the capacity
-`limit` it advertised. Reuse one decoder per connection so its table tracks the
-peer encoder.
-
-### `Decoder.applyEncoderStream(data: []byte): int!`
-
-Apply the encoder-stream instructions in `data` (section 4.3), mutating the dynamic
-table, and return the resulting insert count. Fails on a malformed instruction, a
-bad index, or a capacity over the decoder's limit.
-
-### `Decoder.decodeFieldSection(data: []byte): []HeaderField!`
-
-Decode one encoded field section (section 4.5) into its header fields. Reads the prefix
-to recover the Required Insert Count and Base, fails ("blocked") if the section
-needs insertions not yet applied, then decodes each field line. Fails on any
-malformed representation or out-of-range index.
-
-### `Decoder.sectionAck(streamId: int): []byte`
-
-Emit a Section Acknowledgment for `streamId` (section 4.4.1).
-
-### `Decoder.streamCancel(streamId: int): []byte`
-
-Emit a Stream Cancellation for `streamId` (section 4.4.2).
-
-### `Decoder.insertCountIncrement(n: int): []byte`
-
-Emit an Insert Count Increment of `n` (section 4.4.3).
-
-### `Decoder.insertCount(): int`
-
-The number of insertions the decoder has processed (also the next absolute index).
-
-### `Decoder.tableSize(): int`
-
-The current byte size of the decoder's dynamic table.
-
-### `Decoder.tableCount(): int`
-
-The number of live entries in the decoder's dynamic table.
-
-### `Decoder.capacity(): int`
-
-The current dynamic-table capacity in bytes.
-
-## HTTP/3 core
-
-The request/response layer (RFC 9114), built on the QPACK compressor above and the
-`std/quic` transport. It maps HTTP semantics onto QUIC streams: each peer opens a
-**control** stream and the two **QPACK** streams (encoder and decoder) and sends
-SETTINGS first; a **request** is one client-initiated bidirectional stream carrying
-a HEADERS frame (a QPACK field section of the `:method` / `:scheme` / `:authority`
-/ `:path` pseudo-headers plus regular headers) and DATA frame(s) for the body; a
-**response** is symmetric, with a `:status` pseudo-header. Frames are length-
-prefixed (a type varint, a length varint, then the payload), so unknown and
-reserved (grease) types are skipped rather than rejected.
-
-Because `std/quic` exposes only bidirectional streams, an HTTP/3 unidirectional
-stream is modeled as a bidi stream the opener only writes to; the peer tells a uni
-stream from a request stream by the stream-type byte a uni stream sends first. This
-core runs a **zero-capacity** QPACK dynamic table, so every field line is literal
-or a static-table reference, no field section ever blocks, and the QPACK streams
-carry only their type byte - while the encoder/decoder stream plumbing stays wired
-for a future nonzero capacity.
-
-A client dials, then issues requests, each a single call that returns the response:
+## Dialing and serving
+
+`h3Dial` completes the QUIC handshake and opens the control and QPACK streams;
+`H3Conn.request` sends one request and reads the response back on the same
+stream:
 
 ```bit
 import { h3Dial, H3Request, H3Response, HeaderField } from "std/http3"
 
-// Dial an HTTP/3 server and GET "/". h3Dial completes the QUIC handshake and opens
-// the control + QPACK streams; `request` sends a HEADERS frame (QPACK-encoded
-// pseudo-headers) then reads the response HEADERS + DATA off the same stream.
+// Dial an HTTP/3 server and GET "/".
 fn getIndex(): H3Response! {
   let conn = h3Dial("127.0.0.1", 443, "example.com")?
   let req = H3Request{
@@ -299,16 +35,14 @@ fn getIndex(): H3Response! {
 }
 ```
 
-A server accepts a connection on a bound UDP socket, reads the next request, and
-answers it on the same stream:
+`h3Accept` is the server side of one connection on a bound UDP socket;
+`H3Conn.accept` reads the next request and `H3Conn.respond` answers it:
 
 ```bit
 import { h3Accept, H3Response, HeaderField } from "std/http3"
 import { udpBind } from "std/net"
 
 // Accept one HTTP/3 connection, read a request, and reply 200 with a short body.
-// `accept` skips the peer's control and QPACK streams and returns the first
-// request; `respond` writes the response HEADERS + DATA back on that stream.
 fn serve(certChainPem: string, keyPem: string): ()! {
   let sock = udpBind("127.0.0.1", 8443)?
   let conn = h3Accept(sock, certChainPem, keyPem)?
@@ -323,143 +57,81 @@ fn serve(certChainPem: string, keyPem: string): ()! {
 }
 ```
 
-### `H3Request`
+A server expecting more than one client uses `h3Listen` instead of `h3Accept`: it
+demultiplexes many clients on one socket, and each established connection arrives
+through `H3Listener.accept()`.
 
-An HTTP/3 request. `method`, `scheme`, `authority`, and `path` become the four
-pseudo-headers; `headers` are the regular (lower-case) header fields; `body` is the
-entity carried in DATA frames. All six fields are exported.
+## Sharp edges
 
-### `H3Response`
+**This connection's dynamic table has zero capacity.** Every field line is a
+literal or a static-table reference, so no request ever blocks waiting on the
+QPACK encoder stream - but it also means the encoder/decoder table-mutation API
+below (`Encoder.insertLiteral` and friends) is exercised only if you drive it
+yourself; `H3Conn` never grows the table on its own.
 
-An HTTP/3 response. `status` is the `:status` pseudo-header as an integer; `headers`
-are the regular header fields; `body` is the DATA payload. All three fields are
-exported.
+**Read `H3Conn.peerIp()` once per connection, not once per request.** HTTP/3
+multiplexes many requests over one connection, and the address is a property of
+the connection, frozen at the handshake - a later call returns the same value.
 
-### `H3Conn`
+## When not to use it directly
 
-An established HTTP/3 connection over one QUIC connection. It owns the per-
-connection QPACK `Encoder`/`Decoder` and the local control and QPACK unidirectional
-streams. Issue every request and response through the one `H3Conn` so the QPACK
-tables track the peer.
+If you are building an HTTP service, use [`pkg/web`](/packages/web) or
+[`std/http`](http.md): they negotiate HTTP/3 for you and give you the plain
+request/handler API over HTTP/1.1, HTTP/2, and HTTP/3 alike.
 
-### `H3ServerRequest`
+## Reference
 
-A received request paired with the stream it arrived on. The exported `req` is the
-decoded `H3Request`; `respond` answers on the stream it carries.
+### QPACK
 
-### `h3Dial(host: string, port: int, serverName: string): H3Conn!`
+`newEncoder`/`Encoder` and `newDecoder`/`Decoder` each own a dynamic table. Unlike
+HPACK, table growth is explicit: the encoder emits instructions on a separate
+encoder stream, and the decoder must apply them (`applyEncoderStream`) before it
+can decode a section that references the new entries.
 
-Dial an HTTP/3 server at `host:port` (validating its certificate for `serverName`),
-complete the QUIC handshake, and set up the control and QPACK streams. The returned
-`H3Conn` is ready for `request`. Fails if the connection or handshake fails.
+| | |
+|---|---|
+| `HeaderField { name, value, sensitive }` | one header field (`sensitive` forces a never-index literal) |
+| `newEncoder(): Encoder` | encoder with the 4096-byte default table, Huffman on |
+| `newEncoderConfig(capacity: int, huffman: bool): Encoder` | encoder with an explicit initial capacity and Huffman choice |
+| `Encoder.setCapacity(capacity: int): []byte` | resize the dynamic table |
+| `Encoder.insertNameRef(isStatic, index, value): []byte!` | insert an entry by name reference |
+| `Encoder.insertLiteral(name, value): []byte!` | insert an entry with a literal name |
+| `Encoder.duplicate(relIndex): []byte!` | re-insert an existing entry to keep it alive |
+| `Encoder.encodeFieldSection(streamId, base, fields): []byte` | encode one field section for a stream |
+| `Encoder.applyDecoderStream(data): ()!` | process the peer's acknowledgments |
+| `Encoder.insertCount(): int`, `.knownReceivedCount(): int` | insertions made / acknowledged so far |
+| `Encoder.tableSize(): int`, `.tableCount(): int`, `.capacity(): int` | inspect the dynamic table |
+| `newDecoder(): Decoder` | decoder willing to accept up to the 4096-byte default capacity |
+| `newDecoderConfig(limit: int): Decoder` | decoder with an explicit capacity limit |
+| `Decoder.applyEncoderStream(data): int!` | apply the encoder's table mutations, return the new insert count |
+| `Decoder.decodeFieldSection(data): []HeaderField!` | decode one field section |
+| `Decoder.sectionAck(streamId): []byte` | acknowledge a decoded section |
+| `Decoder.streamCancel(streamId): []byte` | cancel an outstanding section |
+| `Decoder.insertCountIncrement(n): []byte` | advance the encoder's Known Received Count without a section ack |
+| `Decoder.insertCount(): int` | insertions processed so far |
+| `Decoder.tableSize(): int`, `.tableCount(): int`, `.capacity(): int` | inspect the dynamic table |
 
-### `h3DialDeadline(host: string, port: int, serverName: string, deadlineNs: int): H3Conn!`
+### HTTP/3 core
 
-As `h3Dial`, bounded by `deadlineNs` - an absolute monotonic nanosecond deadline
-(`monotonic().ns + budget`, not a duration), matching `std/net`'s and `std/tls`'s
-`dialDeadline`. The QUIC handshake itself is not shortened by `deadlineNs`: a
-stalled handshake still gives up after a fixed 5s regardless of the deadline
-passed here. Once the handshake succeeds, the connection's own idle timeout
-(RFC 9000 section 10.1) is lowered to whatever budget remains, so a peer that
-completes the handshake and then never answers is torn down within
-`deadlineNs` instead of the default 30s. Fails immediately if `deadlineNs` has
-already elapsed by the time the handshake completes.
+| | |
+|---|---|
+| `H3Request { method, scheme, authority, path, headers, body }` | a request |
+| `H3Response { status, headers, body }` | a response |
+| `H3Conn` | one HTTP/3 connection; owns the connection's QPACK state |
+| `H3ServerRequest { req, ... }` | a received request paired with the stream it arrived on |
+| `h3Dial(host, port, serverName): H3Conn!` | dial and complete the handshake |
+| `h3DialDeadline(host, port, serverName, deadlineNs): H3Conn!` | as `h3Dial`, bounded by a deadline |
+| `h3Accept(sock, certChainPem, keyPem): H3Conn!` | accept one connection on a bound socket |
+| `h3Listen(sock, certChainPem, keyPem): H3Listener!` | bind a listener for many concurrent connections |
+| `H3Listener.accept(): H3Conn!` | accept the next connection |
+| `H3Listener.stopAccepting()` | stop admitting new connections; existing ones are unaffected |
+| `H3Conn.request(req): H3Response!` | send a request, read the response |
+| `H3Conn.accept(): H3ServerRequest!` | accept the next request |
+| `H3Conn.respond(sr, resp): ()!` | answer a received request |
+| `H3Conn.peerIp(): string` | the peer address the handshake established (see Sharp edges) |
+| `H3Conn.goAway()` | begin a graceful shutdown of this connection |
+| `H3Conn.draining(): bool` | whether `goAway` has already run |
+| `H3Conn.rawConn(): Conn` | the underlying `quic.Conn`, for driving a raw stream directly |
+| `H3Conn.close()` | send GOAWAY (if not already sent), then close the QUIC connection |
 
-### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
-
-Accept one HTTP/3 connection on the bound UDP socket `sock`, using the PEM
-certificate chain and private key for the QUIC-TLS handshake, and set up the
-control and QPACK streams. The returned `H3Conn` is ready for `accept`. Fails if the
-handshake fails. Serves a single connection; use `h3Listen` for a multi-connection
-server.
-
-### `h3Listen(sock: UdpSocket, certChainPem: string, keyPem: string): H3Listener!`
-
-Start an HTTP/3 listener on the bound UDP socket `sock`, using the PEM certificate
-chain and private key. The underlying QUIC listener demultiplexes many client
-connections on the one socket by connection id. Returns immediately; each
-established connection is handed back by `accept`.
-
-### `H3Listener`
-
-An HTTP/3 server listener over a QUIC `Listener`: many client connections on one
-bound UDP socket. Obtain one from `h3Listen`.
-
-### `H3Listener.accept(): H3Conn!`
-
-Accept the next HTTP/3 connection, blocking until a client completes its handshake,
-and set up its control and QPACK streams. Run each returned `H3Conn` on its own
-green thread.
-
-### `H3Listener.stopAccepting()`
-
-Stop admitting brand-new QUIC connections on the underlying socket, while
-connections already accepted keep being served (`quic.Listener.stopAccepting`'s
-own doc comment has the mechanism). `std/http`'s `H3Server.shutdown` calls this
-as the first step of draining an HTTP/3 server.
-
-### `H3Conn.request(req: H3Request): H3Response!`
-
-Send `req` and read the response. Opens a client-initiated bidirectional stream,
-writes a HEADERS frame then a DATA frame for the body if any, finishes the send
-half, and reads the response back off the same stream. Fails on a transport or
-decode error.
-
-### `H3Conn.accept(): H3ServerRequest!`
-
-Accept the next request, blocking until one opens. Peer control and QPACK streams
-are consumed into the QPACK state and skipped; the first stream that is a request
-stream is read to completion and decoded. Fails on a transport or decode error.
-
-### `H3Conn.respond(sr: H3ServerRequest, resp: H3Response): ()!`
-
-Answer the request in `sr` with `resp` on its stream: a HEADERS frame carrying the
-`:status` field section, then a DATA frame for the body if any, then FIN. Fails on a
-transport error.
-
-### `H3Conn.peerIp(): string`
-
-The peer's IPv4 address in dotted quad, or `""` when it is not known. Forwards
-`quic.Conn.peerIp` unchanged, including its ruling on a connection that may
-migrate: the source of the datagram that established the QUIC connection, frozen
-there (RFC 9000 section 9). Never fails and never blocks - a peer address is metadata and
-must not be able to fail a request. On the client side of a connection this names
-the server.
-
-Read it once per connection, not once per request: HTTP/3 multiplexes many requests
-over one connection and the address belongs to the connection. `std/http`'s
-`serveH3` does exactly that, which is how an HTTP/3 handler's `Request.peer` gets
-filled.
-
-### `H3Conn.goAway()`
-
-Begin a graceful shutdown of just this connection (RFC 9114 section 5.2): send a GOAWAY
-naming the stream id one past the highest request stream `accept` has handed to a
-caller so far. Every request already accepted is left alone - its id is below the
-cutoff - and a request opened after this point is refused (reset with
-`H3_REQUEST_REJECTED`, RFC 9114 section 4.1.1) instead of being read and returned. A
-no-op past the first call on a connection - RFC 9114 section 5.2 forbids a later GOAWAY
-naming a larger identifier than an earlier one. `std/http`'s `H3Server.shutdown`
-calls this on every connection with a request in flight when it starts draining.
-
-### `H3Conn.draining(): bool`
-
-Whether `goAway` has already run on this connection. `std/http`'s `serveH3Conn`
-(the loop behind `serveH3ServerOn`/`H3Server`) reads this to stop asking `accept`
-for more requests once the one it may already be handling finishes, instead of
-waiting for the peer to hang up or a shutdown timeout to pass.
-
-### `H3Conn.rawConn(): Conn`
-
-The underlying `quic.Conn` this connection runs over - an escape hatch for a
-caller that needs to drive a raw stream directly, rather than through
-`request`/`accept`/`respond`. Driving it directly does not update this
-connection's own QPACK state or stream bookkeeping (`goAway`'s cutoff among
-it), so ordinary HTTP/3 traffic should never need this.
-
-### `H3Conn.close()`
-
-Close the connection: send this connection's GOAWAY (`goAway`, a no-op if one was
-already sent), then close the underlying QUIC connection with `H3_NO_ERROR` -
-"an endpoint that completes a graceful shutdown SHOULD use the H3_NO_ERROR error
-code when closing the connection" (RFC 9114 section 5.2).
+Specification: RFC 9114 (HTTP/3), RFC 9204 (QPACK).
