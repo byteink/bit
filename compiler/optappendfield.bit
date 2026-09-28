@@ -23,7 +23,20 @@
 //    the append and the store, and every other use of the read is a rule 3
 //    header read no path from the append reaches; or
 // 3. is used only as a header read (`slice_len`, `field_get`, `keep_alive`,
-//    the receiver of `slice_get`/`slice_set`/`string_from_bytes`, a pop).
+//    the receiver of `slice_get`/`slice_set`/`string_from_bytes`, a pop); or
+// 4. is used as header reads and ONE escape (#6210: pkg/toml's
+//    `Toml.TomlArray(top.items)`), which optappend.bit's `emitEscapeCopy`
+//    hands `rt_call slice_slice(g, 0, slice_len g)` instead: a header
+//    `rtSliceSlice` allocates, sharing the buffer exactly as the cloning
+//    `rtSliceAppendFresh` would (SPEC §12.6's buffer hazard unchanged). No
+//    block argument or append (their operand joins an alias class
+//    optappendown.bit judges on the uncopied read), and nothing that writes
+//    through the header's address: only the append entry points write a
+//    header's words (runtime/root/slices.bit), and optappend.bit's own
+//    expansion runs after this scan. A field no rule 2 read appends to
+//    needs no proof and gets no copy (`fieldEscapeCopies`). THE TRADE: an
+//    escape that runs more often than the field's appends now allocates a
+//    header where it allocated none.
 //
 // and no read of K is SEPARATED from its uses: on every path from the read to
 // them (the read's live range), no instruction may run another in-place
@@ -50,13 +63,21 @@ const fieldKeyShift: int = 4294967296
 // so nothing is scanned and no field is owned. `poison[key]` is 1 when some
 // access to that field breaks the rules above. `borrow` is the module's
 // borrowed-parameter summary (optappendborrow.bit, #6209), proved in the
-// same walk.
+// same walk. `appended[key]` is 1 when a rule 2 read of the field exists;
+// `esc[escStart[i] .. escStart[i + 1])` are function `i`'s rule 4 sites.
 class FieldOwn {
   ctx: TypeContext,
   live: bool,
   poison: map<int, int>,
   borrow: Borrow,
+  appended: map<int, int>,
+  esc: []FieldEsc,
+  escStart: []int,
 }
+
+// A rule 4 site: instruction `at` of function `fi` is the one escape of
+// read `g` of field `k`.
+class FieldEsc { fi: int, at: int, g: int, k: int }
 
 fn ownedFieldsOf(m: IrModule): FieldOwn {
   let fo = FieldOwn{
@@ -64,6 +85,9 @@ fn ownedFieldsOf(m: IrModule): FieldOwn {
     live = false,
     poison = map<int, int>(),
     borrow = borrowNew([]IrFunc(0)),
+    appended = map<int, int>(),
+    esc = []FieldEsc(0),
+    escStart = []int(0),
   }
   for f of m.funcs {
     if (len(ownCandidates(f)) > 0) {
@@ -74,13 +98,36 @@ fn ownedFieldsOf(m: IrModule): FieldOwn {
     return fo
   }
   fo.borrow = borrowNew(m.funcs)
-  for f of m.funcs {
-    let o = newOwnFn(f, fo)
-    fieldScanFunc(fo, o)
+  let i = 0
+  while (i < len(m.funcs)) {
+    fo.escStart = append(fo.escStart, len(fo.esc))
+    let o = newOwnFn(m.funcs[i], fo)
+    fieldScanFunc(fo, o, i)
     borrowScanFunc(fo.borrow, o)
+    i = i + 1
   }
+  fo.escStart = append(fo.escStart, len(fo.esc))
   borrowSolve(fo.borrow)
   return fo
+}
+
+// For function `fi` of `n` instructions: `out[at]` is one plus the field
+// read whose escape `at` takes a copy of, for every rule 4 site of an
+// owned field some append rewrites in place.
+fn fieldEscapeCopies(fo: FieldOwn, fi: int, n: int): []int {
+  let out = []int(n)
+  if (!fo.live || fi + 1 >= len(fo.escStart)) {
+    return out
+  }
+  let i = fo.escStart[fi]
+  while (i < fo.escStart[fi + 1]) {
+    let e = fo.esc[i]
+    if (fo.poison[e.k] == 0 && fo.appended[e.k] == 1) {
+      out[e.at] = e.g + 1
+    }
+    i = i + 1
+  }
+  return out
 }
 
 // Whether `ins`, a `field_get` in `f`, reads a field the module proved owned.
@@ -118,14 +165,14 @@ fn fieldSliceAccess(fo: FieldOwn, f: IrFunc, ins: IrInstr): bool {
   return fieldMayHoldSlice(fo.ctx, ins.ival2) || fieldMayHoldSlice(fo.ctx, f.instrs[ins.rhs].ty)
 }
 
-fn fieldScanFunc(fo: FieldOwn, o: OwnFn) {
+fn fieldScanFunc(fo: FieldOwn, o: OwnFn, fi: int) {
   let f = o.f
   let i = 0
   while (i < len(f.instrs)) {
     let ins = f.instrs[i]
     if ((ins.op == Op.FieldGet || ins.op == Op.FieldSet) && fieldSliceAccess(fo, f, ins)) {
       let k = fieldKey(fo.ctx, f, ins)
-      if (k >= 0 && !fieldAccessOk(o, i, k)) {
+      if (k >= 0 && !fieldAccessOk(o, fi, i, k)) {
         fo.poison[k] = 1
       }
     }
@@ -133,11 +180,67 @@ fn fieldScanFunc(fo: FieldOwn, o: OwnFn) {
   }
 }
 
-fn fieldAccessOk(o: OwnFn, i: int, k: int): bool {
+fn fieldAccessOk(o: OwnFn, fi: int, i: int, k: int): bool {
   if (o.f.instrs[i].op == Op.FieldSet) {
     return fieldStoreOk(o, i, k)
   }
-  return fieldRmwStore(o, i, k) >= 0 || fieldHeaderRead(o, i, k)
+  if (fieldRmwStore(o, i, k) >= 0) {
+    o.fields.appended[k] = 1
+    return true
+  }
+  if (fieldHeaderRead(o, i, k)) {
+    return true
+  }
+  let at = fieldEscapeAt(o, i, k)
+  if (at < 0) {
+    return false
+  }
+  o.fields.esc = append(o.fields.esc, FieldEsc{ fi = fi, at = at, g = i, k = k })
+  return true
+}
+
+// Rule 4 for read `g` of field `k`: its one use that is not a header read,
+// or -1 when there is none, more than one, or it cannot take a copy.
+fn fieldEscapeAt(o: OwnFn, g: int, k: int): int {
+  let at = -1
+  let u = o.useStart[g]
+  while (u < o.useStart[g + 1]) {
+    let x = o.useList[u]
+    if (!fieldHeaderUse(o, x, g, k)) {
+      if (at >= 0) {
+        return -1
+      }
+      at = x
+    }
+    u = u + 1
+  }
+  if (at < 0 || !fieldCopyable(o, o.f.instrs[at], g) || fieldSeparated(o, g, k)) {
+    return -1
+  }
+  return at
+}
+
+// Whether escape `ins` of read `g` behaves the same handed a copy of `g`'s
+// header: `g` is typed a slice (not a type parameter `slice_slice` cannot
+// take), and `ins` is none of rule 4's exclusions.
+fn fieldCopyable(o: OwnFn, ins: IrInstr, g: int): bool {
+  let ty = o.f.instrs[g].ty
+  let ctx = o.fields.ctx
+  if (ty <= 0 || ty >= len(ctx.types) || ctx.types[ty].kind != TypeKind.Slice) {
+    return false
+  }
+  return fieldCopyableOp(ins, g)
+}
+
+fn fieldCopyableOp(ins: IrInstr, g: int): bool {
+  let op = ins.op
+  if (op == Op.Call || op == Op.CallValue || op == Op.CallIface) {
+    return true
+  }
+  if (op == Op.Jump || op == Op.Br || isAppendRt(ins) || fieldRunsUnseen(op)) {
+    return false
+  }
+  return !((op == Op.FieldSet || op == Op.IndexSet) && ins.lhs == g)
 }
 
 fn ownUseCount(o: OwnFn, v: int): int {
