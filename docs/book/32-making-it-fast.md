@@ -127,11 +127,10 @@ fn profileCountAll(bodies: []string, path: string): int! {
 `std/prof` runs on Apple Silicon Macs (`aarch64-macos`) only. Call
 `profileCountAll(bodies, "stats.prof")?` in place of `countAll(bodies)` in
 `main`, make `main` return `()!` so the `?` has somewhere to go, and
-rebuild. The profile it writes is plain text. To read it, run the
-renderer that ships in the Bit source tree, from a checkout of it:
+rebuild. The profile it writes is plain text; render it with `bit prof`:
 
 ```text
-$ bit run tools/prof stats.prof
+$ bit prof stats.prof
 profile: 1804 sample(s) of 8192 ring capacity, 55 distinct function(s)
 1147	63.6%	_bit_rt_port_thread_stack_base
 49	2.7%	_zeroBytes

@@ -4841,6 +4841,6 @@ context's `pc` is a runtime (slid) address; `bit_rt_prof_start` captures
 subtracted, so recorded addresses are file-relative — directly comparable to
 the binary's own Mach-O local symbol table (`compiler/machoreloc.bit`: "one
 LOCAL entry per surviving `__text` function") with no further correction at
-render time. `std/prof` (userland API) and `tools/prof/render.bit`
-(symbolizing reader) are the two halves built on top of these three symbols;
-see their own file headers.
+render time. `std/prof` (userland API) and `compiler/profrender.bit`
+(symbolizing reader, behind `bit prof`) are the two halves built on top of
+these three symbols; see their own file headers.

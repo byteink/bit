@@ -11,6 +11,7 @@ separate package manager, no separate formatter to install.
 | [Format](fmt.md) | `bit fmt` rewrites every file to the one canonical layout |
 | [Lint](lint.md) | `bit lint` finds dead code, oversized functions, and a handful of footguns |
 | [Packages](packages.md) | `bit init`/`add`/`up`/`remove`, `bit.json` and `bit.lock` |
+| [Profile](prof.md) | `bit prof` renders a `std/prof` CPU profile into a table |
 
 New to Bit? [Get started](../get-started.md) installs it and runs your first
 program before you need any of these.
