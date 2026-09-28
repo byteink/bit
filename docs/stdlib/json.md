@@ -978,6 +978,20 @@ The same, for the value at `key` of the object at `path`. Builds
 The same, for element `i` of the array at `path`. Builds
 `jsonDecIndex(path, i)` only when it fails.
 
+### `jsonDecEnumKey(j: Json, path: string, key: string, allowed: []string): string!`
+
+The variant name string at `key` of the object at `path`, for a payload-free
+`enum` field the compiler's synthesised `jsonDecode<T>` reaches. Decodes
+through `jsonDecStringKey`, then rejects any value not in `allowed` (the
+class's own declared variant names) with the same `TypeMismatch` shape every
+other mismatch takes -- `expected` names every allowed variant, `found` the
+wire value. `@json`'s `toJson()` is what guarantees a well-formed document
+only ever writes one of them (`docs/stdlib/json.md`'s "`toJson`" section).
+
+### `jsonDecEnumIndex(j: Json, path: string, i: i64, allowed: []string): string!`
+
+The same, for element `i` of the array at `path`.
+
 ### `jsonDecArray(j: Json, path: string, depth: i64): []Json!`
 
 The items of the array at `path`, with the same depth bound the object walk
