@@ -32,8 +32,9 @@ reason that has nothing to do with creating their account, and a crash
 between the two calls above silently drops the email. What you want is to
 write down "send this email" and let something else run it, retrying if
 the provider hiccups and giving up loudly if it never comes back. That is
-`pkg/jobs`: a worker pool with retries and a dead-letter list, in front of
-a database table instead of a request handler. See
+`pkg/jobs`: a worker pool with retries and a dead-letter list (the jobs
+that kept failing, kept for you to look at), in front of a database table
+instead of a request handler. See
 [Background jobs](/packages/jobs) for the full reference; this chapter
 wires it into Inkwell.
 
@@ -189,8 +190,8 @@ fn enqueueWelcome(q: Queue, userId: i64): ()! {
 
 `enqueue(job, delay, maxAttempts)` - `delay` is nanoseconds before the job
 is first claimable, `maxAttempts` is 5 here. When a handler fails, the job
-retries with exponential backoff and full jitter, roughly 0-1s after the
-first failure and doubling up to a 5-minute ceiling, so a mail provider
+waits a random time before each retry, roughly 0-1s after the first
+failure and doubling each time up to 5 minutes, so a mail provider
 outage does not turn into every worker hammering it back to life the
 instant it recovers. After the 5th failed attempt the job moves to the
 dead-letter list instead of being retried again, for you to inspect and
