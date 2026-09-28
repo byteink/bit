@@ -97,3 +97,9 @@ fn transferCents(db: Pool, fromId: string, toId: string, cents: int): ()! {
 `Conn.begin` sends plain `BEGIN`; `commit`/`rollback` send `COMMIT`/
 `ROLLBACK` on that same connection. Isolation levels are `std/sql`'s own
 job (`db.txAt`), not a statement this driver builds itself.
+
+## Where to go next
+
+[Errors](errors.md) covers telling a retryable failure from a permanent
+one by its SQLSTATE. [Connecting](connecting.md) covers opening the pool
+these examples take as `db`.

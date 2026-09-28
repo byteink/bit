@@ -35,3 +35,9 @@ argument, so the driver hands it the leaf certificate's own first
 itself, which makes the name test vacuous by construction, not an omission.
 `verify-full` is the rung that actually compares the certificate's name
 against the host you dialed.
+
+## Where to go next
+
+[Authentication](authentication.md) covers what runs right after the TLS
+handshake finishes. [Connecting](connecting.md) covers setting `sslmode`
+in the URI or the individual-field form.

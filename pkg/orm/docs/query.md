@@ -146,7 +146,7 @@ fn typo(db: Data): []Person! {
 error[E0163]: 'emial' is not a field of 'Person'
 ```
 
-`compiler/checkormquery.bit` checks a string-literal column directly
+The compiler checks a string-literal column directly
 chained off `find<T>(...)` against `T`'s own declared fields, at compile
 time - the mistake people actually make, caught before the program runs at
 all. A column built from something other than a literal (read from a

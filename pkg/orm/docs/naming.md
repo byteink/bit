@@ -68,3 +68,9 @@ descriptor (`fieldForColumn`), not by un-converting the column name: collapsing
 `userID` to `user_id` loses whether it was `userID` or `userId`, so only the
 actual field list - the thing the descriptor already has - can answer it
 correctly.
+
+## Where to go next
+
+[Schema](schema.md) declares the tables and columns whose names come from
+these rules. [Query](query.md) matches a Bit field name against the same
+rules when it builds a `where` or `orderBy` clause.

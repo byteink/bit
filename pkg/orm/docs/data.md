@@ -43,5 +43,11 @@ writes outside the transaction it looks like it is inside; `pool.tx((db) =>
 separately. Each commits on a normal return from `f`, rolls back on a
 failure or a panic inside it, and hands the connection back either way.
 `std/sql`'s own `tx`/`txAt`/`txValue`/`txValueAt` free functions
-(`stdlib/sql/tx.bit`) are unchanged underneath; the methods are one line
-each, delegating to them.
+are unchanged underneath; the methods are one line each, delegating to
+them.
+
+## Where to go next
+
+[Query](query.md) and [Write](write.md) are the two places every function
+takes `Data` as its first argument, standalone or inside a `pool.tx(...)`
+block.
