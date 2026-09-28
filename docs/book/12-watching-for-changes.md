@@ -1,9 +1,9 @@
-# Part 12: Watching for changes
+# Watching for changes
 
 <!-- doctest: per-block -->
 
-Ink can index and search your drafts, but only when you ask it to. This part
-adds a loop that runs in the background for as long as Ink is up, checking
+Inkwell can index and search your drafts, but only when you ask it to. This part
+adds a loop that runs in the background for as long as Inkwell is up, checking
 for changed drafts on its own schedule, and stopping cleanly - on request,
 or when you press Ctrl-C - instead of leaving work half done.
 
@@ -106,7 +106,7 @@ fn main() {
 never returns from the call, so this line only ever runs once you actually
 want to stop.
 
-## Wired into Ink
+## Wired into Inkwell
 
 `ink/watch.bit` combines all three: `watchLoop` polls `loadAll` on a
 `Timer`, reports every draft whose `updated` moved forward since the last
@@ -220,10 +220,10 @@ happening on its own schedule, independent of any single request.
 
 ## What we built
 
-Ink now runs a background loop that polls for changed drafts, stops on
+Inkwell now runs a background loop that polls for changed drafts, stops on
 either an explicit signal or Ctrl-C, and never leaves a stray channel or
 timer behind. You used `select`, a `Timer`, a `stop` channel, and
 `waitForSignal`.
 
-Next: [Part 13, backups](13-backups.md), where Ink protects your drafts
+Next: [Chapter 13, backups](13-backups.md), where Inkwell protects your drafts
 against data loss and corruption.

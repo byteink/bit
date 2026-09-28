@@ -1,8 +1,8 @@
-# Part 13: Backups
+# Backups
 
 <!-- doctest: per-block -->
 
-Ink's drafts live as files on your disk. A failing drive, a bad `rm`, or a
+Inkwell's drafts live as files on your disk. A failing drive, a bad `rm`, or a
 stolen laptop loses them for good unless there is a backup somewhere else -
 and a backup you cannot trust is barely better than no backup: it should
 resist a bit of corruption in storage or transit, and it should not be
@@ -73,8 +73,8 @@ same key - see std/crypto's AES-GCM section for what goes wrong if it does.
 
 `std/compress`'s `gzip` shrinks a backup before it leaves the machine. It is
 **encoding only** - there is no decoder in `std/compress` - so a compressed
-export is for archiving outside Ink, decoded later with a standard tool
-(`gzip -d`), not for Ink to read back itself:
+export is for archiving outside Inkwell, decoded later with a standard tool
+(`gzip -d`), not for Inkwell to read back itself:
 
 ```bit
 import { gzip } from "std/compress"
@@ -92,11 +92,11 @@ fn main() {
 }
 ```
 
-Because of that one-way limit, the backup Ink itself restores from is
+Because of that one-way limit, the backup Inkwell itself restores from is
 encrypted but *not* compressed - compressing after encryption would not
 help anyway, since ciphertext looks like noise and does not compress.
 
-## Wired into Ink
+## Wired into Inkwell
 
 `ink/backup.bit` puts the three together. `serializeDrafts` packs every
 draft's id and body into one buffer with a length prefix on each field, so
@@ -106,7 +106,7 @@ encrypts that buffer with AES-256-GCM and stores a CRC-32C of the
 more expensive authenticated decrypt, so a truncated or bit-flipped file
 fails with a clear "corrupted" message rather than the AEAD's generic
 authentication error. `exportCompressed` is the separate, gzip-compressed
-cold copy for archiving outside Ink.
+cold copy for archiving outside Inkwell.
 
 ```bit
 export enum Status { Draft, Published, Archived }
@@ -233,7 +233,7 @@ export fn restoreDrafts(blob: []byte, key: []byte): []Draft! {
 // A compressed cold-storage export of every draft's id and body - not
 // something `restoreDrafts` reads back. `std/compress` only encodes, so
 // getting this back to bytes needs a standard gzip tool (`gzip -d`) outside
-// Ink. Use it to archive a copy outside the encrypted backup, not as a
+// Inkwell. Use it to archive a copy outside the encrypted backup, not as a
 // second way to restore.
 export fn exportCompressed(drafts: []Draft): []byte! {
   return gzip(serializeDrafts(drafts), 6)?
@@ -288,11 +288,11 @@ a backup has already left your hands unencrypted.
 
 ## What we built
 
-Ink now backs up every draft into one encrypted file, checks it for
+Inkwell now backs up every draft into one encrypted file, checks it for
 corruption before decrypting, and restores it back into `Draft` values. You
 used `crc32c` for a cheap integrity check, AES-256-GCM for confidentiality
 and authenticity together, and `gzip` for a separate, compressed cold
 export.
 
 Next: [Part 4, Inkwell goes online](../../pkg/web/guides/01-first-endpoint.md),
-where Ink's drafts become articles served over HTTP.
+where Inkwell's drafts become articles served over HTTP.

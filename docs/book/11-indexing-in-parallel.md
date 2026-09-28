@@ -1,13 +1,16 @@
-# Part 11: Indexing in parallel
+# Indexing in parallel
 
 <!-- doctest: per-block -->
 
-[Part 5](05-searching-drafts.md) searches Ink's drafts by scanning every one,
-every time. That is fine for a few dozen notes. Once there are thousands, you
-want a word index built once, ahead of time, so a search is a map lookup
-instead of a scan. Building that index means reading every draft's title and
-body and is exactly the kind of work that splits cleanly across your
-machine's cores - so build it with several green threads instead of one.
+[Chapter 5](05-searching-drafts.md) searches Inkwell's drafts by scanning
+every one, every time. That is fine for a few dozen notes. Once there are
+thousands, you want a word index built once, ahead of time, so a search is a
+map lookup instead of a scan. Building that index means reading every
+draft's title and body and is exactly the kind of work that splits cleanly
+across your machine's cores - so build it with several green threads
+instead of one. A green thread is a lightweight task Bit itself schedules
+over a handful of real OS threads: starting thousands of them is cheap, far
+cheaper than thousands of OS threads would be.
 
 ## One task, one channel
 
@@ -95,7 +98,7 @@ Every worker reads off the *same* `jobs` channel, so the pool self-balances:
 a worker that finishes its chunk early just picks up the next one, rather
 than sitting idle while a slower worker is still on its first.
 
-## Wired into Ink
+## Wired into Inkwell
 
 `ink/index.bit` builds a word index the same way: split the drafts into
 chunks, spawn one worker per chunk, and merge the partial indexes each
@@ -275,10 +278,10 @@ time - a worker pool adds channels and a merge step that a `for` loop over
 
 ## What we built
 
-Ink now builds a word index across a fixed pool of green threads, splitting
+Inkwell now builds a word index across a fixed pool of green threads, splitting
 the work into chunks and merging the partial results back into one map. You
 used `spawn`, a shared `jobs` channel closed to signal "no more work", and a
 `results` channel to collect the answers.
 
-Next: [Part 12, watching for changes](12-watching-for-changes.md), where Ink
-runs a loop in the background for as long as the program is up.
+Next: [Chapter 12, watching for changes](12-watching-for-changes.md), where
+Inkwell runs a loop in the background for as long as the program is up.
