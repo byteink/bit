@@ -24,7 +24,11 @@ by then.
 
 ### `writeFile(path: string, content: string): ()!`
 
-Writes `content` to `path`, creating it or truncating what was there.
+Writes `content` to `path`, creating it or truncating what was there. A
+missing parent directory fails the same way a missing file does -
+`writeFile("no/such/dir/out.txt", "x")` fails with `cannot create file:
+no/such/dir/out.txt`, because this does not create directories for you. Call
+`mkdir` first.
 
 ### `appendFile(path: string, content: string): ()!`
 
@@ -77,8 +81,11 @@ Opens `path` for writing at the end, creating it if absent.
 
 ### `File.read(max: int): string`
 
-Up to `max` bytes. A shorter result than `max` - including `""` - means end of
-file.
+Up to `max` bytes. A result shorter than `max` can still happen before end of
+file - this works on pipes and stdin too, and a read there returns whatever
+is available right now, not a full `max`. Only an empty result means end of
+file. `File.readAll()` loops for you when you want everything regardless of
+source.
 
 ### `File.readAll(): string!`
 
@@ -300,6 +307,30 @@ A failed `syncDir` must not be retried, for the same reason `File.sync()` must
 not be - see that section.
 
 Fails if `path` is not a directory, naming it.
+
+A reader must never see a half-written file if the writer dies partway
+through. Write to a temporary name in the same directory, sync it, then
+rename it over the real name - a rename that replaces an existing file is
+atomic on the same filesystem, so any reader sees either the whole old file
+or the whole new one:
+
+```bit
+import { create, rename, syncDir } from "std/fs"
+
+fn atomicWrite(path: string, content: string): ()! {
+  let tmp = path + ".tmp"
+  let f = create(tmp)?
+  f.write(content)?
+  f.sync()?
+  f.close()
+  rename(tmp, path)?
+  syncDir(".")?
+  return
+}
+```
+
+Skip `f.sync()`/`syncDir` and the rename is still an atomic *swap* - just not
+one guaranteed to survive a crash right after it happens.
 
 ### `walk(root: string): []string!`
 

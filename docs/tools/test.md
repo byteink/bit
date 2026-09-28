@@ -118,7 +118,8 @@ test "testpanic_latest_on_empty" {
 
 - `bit test <file|dir> --run <pattern>` runs only tests whose name contains
   `<pattern>` as a literal substring - not a glob, not a regular expression,
-  and case sensitive. `--run` matching nothing is an error, exit 1.
+  and case sensitive. `--run` matching nothing is an error:
+  `bit test: no test matched --run <pattern>`, exit 1.
 - `--timeout <seconds>` kills and fails a single test that outlives that
   many seconds (default 30); the rest of the run continues.
 - `bit test` exits `3`, not `1`, for a path that discovers zero tests at
@@ -126,7 +127,7 @@ test "testpanic_latest_on_empty" {
   failed". A project-wide `bit test` with no path is fine on a project with
   no tests yet, and exits `0`.
 - A bare top-level function in a `.test.bit` file with no parameters and no
-  return type is not a discovered test - only a `test "name" { }`
+  return type is `E0117`, not a discovered test - only a `test "name" { }`
   declaration counts.
 
 ## Where next
