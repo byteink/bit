@@ -142,8 +142,8 @@ to cancel and discard the parts already sent.
 
 - `put`/`get` hold the whole object in memory and are bounded by `std/http`'s
   default response budget (32 MiB). A larger single object needs multipart
-  upload on the way in; a large download needs `std/http`'s streaming
-  primitives (`stdlib/http/streambody.bit`) directly.
+  upload on the way in; a large download needs `std/http`'s own streaming
+  primitives directly.
 - Addressing is path-style only. A public AWS bucket that requires
   virtual-hosted addressing is not supported yet.
 - Only `host`, `x-amz-content-sha256` and `x-amz-date` are signed - a
@@ -160,5 +160,4 @@ for an interface of your own with this package behind one implementation -
 ## Specification
 
 SigV4 signing follows AWS's "Signature Version 4 signing process"; this
-package's own conformance is checked against AWS's published test suite in
-`sigv4.test.bit`.
+package's own conformance is checked against AWS's published test suite.
