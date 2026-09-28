@@ -1,0 +1,151 @@
+// pkg/jobs/postgres.bit — a `Store` (store.bit) backed by a `std/sql.Pool`,
+// using PostgreSQL's `SELECT ... FOR UPDATE SKIP LOCKED` so N workers
+// polling concurrently never claim the same row (#6082, epic #4023).
+//
+// `Pool`, NOT `pkg/postgres` DIRECTLY. `PostgresStore` is Postgres-specific
+// SQL (`FOR UPDATE SKIP LOCKED`, `BIGSERIAL`), but it takes a `std/sql.Pool`
+// — the application builds one with `pool(adapter(), Datasource{...})`
+// (pkg/postgres's own README) and hands it in. `_tests_/bit/jobslive.bit`'s
+// live tests are what actually pull in `pkg/postgres` to build a real one.
+//
+// TRANSACTIONS GO THROUGH `txValue`, NEVER `Pool.begin` DIRECTLY —
+// `Pool.begin` is unexported by design (#3979, stdlib/sql/tx.bit's own
+// header): every `?` between a hand-written `begin` and `commit` is an
+// early return that skips the rollback and leaks the pooled connection.
+// `txValue<T>(db, f)` commits on a normal return and rolls back on failure
+// OR a panic, with no way to forget either.
+//
+// ONE QUERY FOR BOTH "ready" AND "abandoned" (store.bit's header): `claim`'s
+// `WHERE` clause accepts a row that is either newly available
+// (`claimed_until <= now`, true for a never-claimed row whose default is 0)
+// or a stale claim whose visibility window elapsed — a worker-crash
+// re-claim needs no separate method or schedule, just the same predicate
+// evaluated on the next poll.
+
+import { Pool, Tx, Rows, Value, asInt, asText, txValue } from "std/sql"
+import { split, trimSpace } from "std/strings"
+
+// Run once against a fresh database before a `PostgresStore` is used.
+// Exposed as text, not run by this package itself, so the application
+// controls its own migration tooling and ordering.
+export const migrationSQL: string = "CREATE TABLE IF NOT EXISTS bit_jobs (\n" +
+  "  id BIGSERIAL PRIMARY KEY,\n" +
+  "  name TEXT NOT NULL,\n" +
+  "  payload TEXT NOT NULL,\n" +
+  "  attempts BIGINT NOT NULL DEFAULT 0,\n" +
+  "  max_attempts BIGINT NOT NULL,\n" +
+  "  available_at BIGINT NOT NULL,\n" +
+  "  claimed_until BIGINT NOT NULL DEFAULT 0,\n" +
+  "  done BOOLEAN NOT NULL DEFAULT FALSE,\n" +
+  "  dead_lettered BOOLEAN NOT NULL DEFAULT FALSE,\n" +
+  "  dead_reason TEXT NOT NULL DEFAULT ''\n" +
+  ");\n" +
+  "CREATE INDEX IF NOT EXISTS bit_jobs_claimable ON bit_jobs (available_at)\n" +
+  "  WHERE NOT done AND NOT dead_lettered;\n"
+
+// A `Store` (store.bit) over one `Pool`. `Pool` is already safe for
+// concurrent callers (its own header: a checkout-and-return pool), so one
+// `PostgresStore` may back every worker in a `Queue`.
+export class PostgresStore {
+  db: Pool
+
+  export enqueue(name: string, payload: string, availableAt: int, maxAttempts: int): ()! {
+    this.db.exec(
+      "INSERT INTO bit_jobs (name, payload, max_attempts, available_at) VALUES ($1, $2, $3, $4)",
+      [Value.Text(name), Value.Text(payload), Value.Int(maxAttempts), Value.Int(availableAt)],
+    )?
+  }
+
+  export claim(visibilityTimeout: int): Option<ClaimedJob>! {
+    return txValue<Option<ClaimedJob>>(this.db, (t) => {
+      return claimOneLocked(t, visibilityTimeout)?
+    })?
+  }
+
+  export complete(id: int): ()! {
+    this.db.exec("UPDATE bit_jobs SET done = true WHERE id = $1", [Value.Int(id)])?
+  }
+
+  export retry(id: int, availableAt: int): ()! {
+    this.db.exec(
+      "UPDATE bit_jobs SET available_at = $1, claimed_until = 0 WHERE id = $2",
+      [Value.Int(availableAt), Value.Int(id)],
+    )?
+  }
+
+  export deadLetter(id: int, reason: string): ()! {
+    this.db.exec(
+      "UPDATE bit_jobs SET dead_lettered = true, dead_reason = $1 WHERE id = $2",
+      [Value.Text(reason), Value.Int(id)],
+    )?
+  }
+}
+
+// A fresh store over an already-open pool.
+export fn newPostgresStore(db: Pool): PostgresStore {
+  return PostgresStore{ db = db }
+}
+
+// Runs `migrationSQL` — a convenience for tests and small apps; anything
+// with its own migration tool can just run the SQL text itself instead.
+// Split on `;`, not sent as one multi-statement `exec`: Postgres's extended
+// protocol (what every `std/sql` driver call goes through, `Conn.exec`'s
+// own contract) refuses more than one command in a single prepared
+// statement ("cannot insert multiple commands into a prepared statement"),
+// unlike a plain `psql -f` run of the same file.
+export fn migrate(db: Pool): ()! {
+  for stmt of split(migrationSQL, ";") {
+    let text = trimSpace(stmt)
+    if (text == "") {
+      continue
+    }
+    db.exec(text, []Value(0))?
+  }
+}
+
+// The whole SELECT-then-UPDATE, inside `txValue`'s transaction: split out of
+// `claim` to stay under spec/LINT.md's complexity ceiling.
+fn claimOneLocked(t: Tx, visibilityTimeout: int): Option<ClaimedJob>! {
+  let nowNs = now().ns
+  let rows = t.query(
+      "SELECT id, name, payload, attempts, max_attempts FROM bit_jobs " +
+      "WHERE NOT done AND NOT dead_lettered AND available_at <= $1 AND claimed_until <= $1 " +
+      "ORDER BY available_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+    [Value.Int(nowNs)],
+  )?
+  let has = rows.next()?
+  if (!has) {
+    rows.close()
+    return Option.None
+  }
+  let row = readClaimRow(rows)?
+  rows.close()
+  t.exec(
+    "UPDATE bit_jobs SET attempts = $1, claimed_until = $2 WHERE id = $3",
+    [Value.Int(row.attempts + 1), Value.Int(nowNs + visibilityTimeout), Value.Int(row.id)],
+  )?
+  return Option.Some(
+    ClaimedJob{
+      id = row.id,
+      name = row.name,
+      payload = row.payload,
+      attempts = row.attempts + 1,
+      maxAttempts = row.maxAttempts,
+    },
+  )
+}
+
+fn readClaimRow(rows: Rows): ClaimedJob! {
+  let id = asInt(rows.value(0))?
+  let name = asText(rows.value(1))?
+  let payload = asText(rows.value(2))?
+  let attempts = asInt(rows.value(3))?
+  let maxAttempts = asInt(rows.value(4))?
+  return ClaimedJob{
+    id = id,
+    name = name,
+    payload = payload,
+    attempts = attempts,
+    maxAttempts = maxAttempts,
+  }
+}

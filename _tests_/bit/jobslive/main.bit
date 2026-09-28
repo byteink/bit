@@ -1,0 +1,136 @@
+// _tests_/bit/jobslive/main.bit — the live proof `_tests_/bit/jobslive.bit`
+// runs against a throwaway PostgreSQL container (#6082, epic #4023). Not a
+// `*.test.bit` file: it needs a real "postgres" dependency resolvable by
+// `bit run`, which `jobslive.bit` supplies by copying this file into a
+// scratch project with a path-based `bit.lock` (pkg/orm/bulk.test.bit's own
+// `liveBulkProofSource` pattern, generated instead of a giant escaped
+// string so this stays a normal, lintable, `bit check`-able file). The
+// database URL arrives as `args()[1]` (`bit run` forwards argv; a plain
+// import from pkg/jobs cannot read an env var meant for a different
+// process's config).
+//
+// Proves, against a REAL server: N workers process every job exactly once
+// (no double-processing), a crashed worker's claim is reclaimed once its
+// visibility timeout elapses, and `stop()` drains an in-flight job before
+// returning. Prints `LIVE_PROOF_OK` and exits 0 only if every check passed.
+
+import { args } from "std/os"
+import { pool, Datasource } from "std/sql"
+import { adapter } from "postgres"
+import { sleep, Millisecond } from "std/time"
+import { newAtomicI64 } from "std/sync"
+import { Json, JsonEntry } from "std/json"
+import { PostgresStore, newPostgresStore, migrate, open, Options, ClaimedJob } from "jobs"
+
+@job("live-echo") @json class LiveEchoJob {
+  tag: string,
+}
+
+fn requireStore(uri: string): PostgresStore {
+  let db = pool(adapter(), Datasource{ uri = uri }) catch e {
+    panic("pool(${uri}): ${e.message()}")
+  }
+  migrate(db) catch e {
+    panic("migrate: ${e.message()}")
+  }
+  return newPostgresStore(db)
+}
+
+fn proveConcurrency(store: PostgresStore) {
+  let q = open(store, Options{ workers = 4, pollInterval = 20 * Millisecond }) catch e {
+    panic("open: ${e.message()}")
+  }
+  let processed = newAtomicI64(0)
+  q.register<LiveEchoJob>((job: LiveEchoJob) => {
+    processed.add(1)
+  })
+  let n = 8
+  let i = 0
+  while (i < n) {
+    q.enqueue(LiveEchoJob{ tag = "concurrency" }) catch e {
+      panic("enqueue: ${e.message()}")
+    }
+    i = i + 1
+  }
+  q.start()
+  let waited = 0
+  while (processed.load() < n && waited < 15000) {
+    sleep(50 * Millisecond)
+    waited = waited + 50
+  }
+  q.stop()
+  if (processed.load() != n) {
+    panic("LIVE PROOF FAILED: expected exactly ${n} completions, got ${processed.load()}")
+  }
+}
+
+fn claimOrPanic(store: PostgresStore, label: string): Option<ClaimedJob> {
+  return store.claim(200 * Millisecond) catch e {
+    panic("${label}: ${e.message()}")
+  }
+}
+
+fn expectAttempts(claimed: Option<ClaimedJob>, want: int, label: string) {
+  match (claimed) {
+    None => panic("LIVE PROOF FAILED: ${label}: expected a claimable row")
+    Some(cj) => {
+      if (cj.attempts != want) {
+        panic("LIVE PROOF FAILED: ${label}: attempts = ${cj.attempts}, expected ${want}")
+      }
+    }
+  }
+}
+
+fn expectNotClaimable(claimed: Option<ClaimedJob>, label: string) {
+  match (claimed) {
+    None => {}
+    Some(_) => panic("LIVE PROOF FAILED: ${label}: reclaimed before its visibility timeout elapsed")
+  }
+}
+
+fn proveCrashReclaim(store: PostgresStore) {
+  store.enqueue("live-echo", "{\"tag\":\"reclaim\"}", 0, 5) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  expectAttempts(claimOrPanic(store, "claim 1"), 1, "first claim")
+  expectNotClaimable(claimOrPanic(store, "claim 2"), "immediate re-claim")
+  sleep(300 * Millisecond)
+  expectAttempts(claimOrPanic(store, "claim 3"), 2, "reclaim after timeout")
+}
+
+fn proveGracefulDrain(store: PostgresStore) {
+  let q = open(store, Options{ workers = 1, pollInterval = 20 * Millisecond }) catch e {
+    panic("open: ${e.message()}")
+  }
+  let started = newAtomicI64(0)
+  let finished = newAtomicI64(0)
+  q.register<LiveEchoJob>((job: LiveEchoJob) => {
+    started.store(1)
+    sleep(300 * Millisecond)
+    finished.store(1)
+  })
+  q.enqueue(LiveEchoJob{ tag = "drain" }) catch e {
+    panic("enqueue: ${e.message()}")
+  }
+  q.start()
+  let waited = 0
+  while (started.load() == 0 && waited < 10000) {
+    sleep(20 * Millisecond)
+    waited = waited + 20
+  }
+  if (started.load() != 1) {
+    panic("LIVE PROOF FAILED: handler never started")
+  }
+  q.stop()
+  if (finished.load() != 1) {
+    panic("LIVE PROOF FAILED: stop() returned before the in-flight job finished")
+  }
+}
+
+fn main() {
+  let uri = args()[1]
+  proveConcurrency(requireStore(uri))
+  proveCrashReclaim(requireStore(uri))
+  proveGracefulDrain(requireStore(uri))
+  print("LIVE_PROOF_OK")
+}
