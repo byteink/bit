@@ -157,6 +157,46 @@ fn main() {
     fail=1
   fi
 
+  # #6051: the pinned formatter pulls a generic-class member's leading
+  # comment into its signature; the fixed one keeps it above the member.
+  oracle_gmc='class Box<T> {
+  v: T
+  get(): Option< // Returns the value.
+    T,
+  > {
+    return this.v
+  }
+}'
+  bit2_gmc='class Box<T> {
+  v: T
+
+  // Returns the value.
+  get(): Option<T> {
+    return this.v
+  }
+}'
+  siggm=$(explainMismatch "$oracle_gmc" "$bit2_gmc" fmt)
+  if [ "$siggm" != "6051-generic-member-comment-fmt" ]; then
+    echo "FAIL: the #6051 comment-placement delta was not explained (sig='$siggm')"
+    fail=1
+  fi
+
+  # REJECTION: the same delta carrying one changed code token.
+  bit2_gmc_tok=$(printf '%s' "$bit2_gmc" | sed 's/return this.v/return this.w/')
+  siggmt=$(explainMismatch "$oracle_gmc" "$bit2_gmc_tok" fmt)
+  if [ -n "$siggmt" ]; then
+    echo "FAIL: a #6051 delta with a changed code token was wrongly explained (sig='$siggmt')"
+    fail=1
+  fi
+
+  # REJECTION: a comment move with no mangled oracle line is not #6051.
+  oracle_gmc_plain=$(printf '%s' "$bit2_gmc" | sed 's|  // Returns the value.||')
+  siggmp=$(explainMismatch "$oracle_gmc_plain" "$bit2_gmc" fmt)
+  if [ -n "$siggmp" ]; then
+    echo "FAIL: a comment delta without the #6051 mangled shape was wrongly explained (sig='$siggmp')"
+    fail=1
+  fi
+
   # REJECTION: no signature is currently declared for `types` (#5921 was
   # retired by the stage0 0.28.0 repin, #5957) -- an unrelated type change
   # must not be explained by coincidence, and neither must a real one.
