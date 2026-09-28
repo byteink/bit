@@ -32,8 +32,8 @@ itself lives in `bitlang.org/pkg/postgres`, which exports one function:
 `adapter()`:
 
 ```text
-$ bit add bitlang.org/pkg/postgres@v0.1.0
-bit add: postgres -> bitlang.org/pkg/postgres@0.1.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
+$ bit add bitlang.org/pkg/postgres@v0.1.1
+bit add: postgres -> bitlang.org/pkg/postgres@0.1.1 (945fa57bcecbb5446737669d43fd8eae3b0f7caa)
 ```
 
 ## Step 3: open the pool

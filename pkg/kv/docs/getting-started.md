@@ -13,7 +13,7 @@ ordered key-value store inside it, no server to install or run.
 ```json
 {
   "dependencies": {
-    "kv": "bitlang.org/pkg/kv@v0.1.0"
+    "kv": "bitlang.org/pkg/kv@v0.1.1"
   }
 }
 ```

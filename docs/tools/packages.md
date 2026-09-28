@@ -37,7 +37,7 @@ is optional.
 {
   "name": "inkwell",
   "dependencies": {
-    "web": "bitlang.org/pkg/web@^0.7.0"
+    "web": "bitlang.org/pkg/web@^0.8.0"
   }
 }
 ```
@@ -63,14 +63,14 @@ Adds or updates one dependency.
 
 ```
 $ bit add bitlang.org/pkg/web
-bit add: web -> bitlang.org/pkg/web@^0.7.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
-$ bit add bitlang.org/pkg/web@0.7.0
-bit add: web -> bitlang.org/pkg/web@0.7.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
+bit add: web -> bitlang.org/pkg/web@^0.8.0 (945fa57bcecbb5446737669d43fd8eae3b0f7caa)
+$ bit add bitlang.org/pkg/web@0.8.0
+bit add: web -> bitlang.org/pkg/web@0.8.0 (945fa57bcecbb5446737669d43fd8eae3b0f7caa)
 ```
 
 Naming no version resolves the newest tag and writes a caret constraint;
 naming an exact version writes an exact pin instead, since asking for
-`0.7.0` by name means you meant exactly that. Every transitive dependency
+`0.8.0` by name means you meant exactly that. Every transitive dependency
 reachable from what you just added is fetched and locked too, not only the
 one you named directly.
 
@@ -161,8 +161,12 @@ it from scratch.
 ```json
 {
   "web": {
-    "url": "https://github.com/byteink/web.git",
-    "commit": "d13a8daf9505f438586c7ee82eb5e2220a294c40",
+    "vanity": "bitlang.org/pkg/web",
+    "dir": "pkg/web",
+    "url": "https://github.com/byteink/bit.git",
+    "commit": "945fa57bcecbb5446737669d43fd8eae3b0f7caa",
+    "version": "0.8.0",
+    "tag": "web/v0.8.0",
     "requires": {}
   }
 }
