@@ -20,8 +20,8 @@ bit init: wrote bit.json
 Add `pkg/web`, the framework this whole course is built on:
 
 ```text
-$ bit add bitlang.org/pkg/web@v0.6.5
-bit add: web -> bitlang.org/pkg/web@0.6.5 (a4a7d44bb9bc9d643ae4a65299ae0af26d8654ed)
+$ bit add bitlang.org/pkg/web@v0.7.0
+bit add: web -> bitlang.org/pkg/web@0.7.0 (d13a8daf9505f438586c7ee82eb5e2220a294c40)
 ```
 
 `bit add` writes the dependency into `bit.json` and pins the exact commit it

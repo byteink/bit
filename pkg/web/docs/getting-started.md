@@ -9,7 +9,7 @@ This chapter is the shortest path from `bit add` to a response.
 ```json
 {
   "dependencies": {
-    "web": "bitlang.org/pkg/web@v0.1.0"
+    "web": "bitlang.org/pkg/web@^0.7.0"
   }
 }
 ```
