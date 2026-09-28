@@ -226,6 +226,29 @@ explainMismatch() {
       }
       return 0
     }
+    # genericMemberCommentFmt (#6051) -- the pinned 0.31.0 formatter moved a
+    # leading comment of a generic-class member INTO its signature
+    # (`acquire(): Lease< // comment`); the fixed one keeps it above the
+    # member. Explained only when the oracle shows that mangled shape AND the
+    # two texts are identical once comments, whitespace and a trailing comma
+    # before a closer are removed -- so any code-token change still fails.
+    function fmtCodeOnly(n, lines,    k, t, out) {
+      out = ""
+      for (k = 1; k <= n; k++) {
+        t = lines[k]
+        sub(/\/\/.*$/, "", t)
+        gsub(/[ \t]/, "", t)
+        out = out t
+      }
+      gsub(/,\)/, ")", out); gsub(/,>/, ">", out); gsub(/,]/, "]", out)
+      return out
+    }
+    function genericMemberCommentFmt(nA, linesA, nB, linesB,    k, mangled) {
+      mangled = 0
+      for (k = 1; k <= nA; k++) { if (linesA[k] ~ /[(<] \/\/ /) { mangled = 1; break } }
+      if (!mangled) { return 0 }
+      return fmtCodeOnly(nA, linesA) == fmtCodeOnly(nB, linesB)
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -243,6 +266,7 @@ explainMismatch() {
       }
       if (kind == "fmt") {
         if (catchDisambigFmt(nA, linesA, nB, linesB)) { print "5474-catch-composite-default-fmt"; exit 0 }
+        if (genericMemberCommentFmt(nA, linesA, nB, linesB)) { print "6051-generic-member-comment-fmt"; exit 0 }
         exit 1
       }
       # No `ir`/`iropt`/`types` signature is currently declared -- see
@@ -269,11 +293,12 @@ declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
     ast) printf '%s\n' "5474-catch-composite-default-ast"; return ;;
-    fmt) printf '%s\n' "5474-catch-composite-default-fmt"; return ;;
+    fmt) printf '%s\n' "5474-catch-composite-default-fmt" "6051-generic-member-comment-fmt"; return ;;
     types) return ;;
     ir) return ;;
     iropt) return ;;
   esac
   [ -n "$kind" ] || printf '%s\n' \
-    "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt"
+    "5474-catch-composite-default-ast" "5474-catch-composite-default-fmt" \
+    "6051-generic-member-comment-fmt"
 }
