@@ -803,7 +803,7 @@ of its own to widen). `required` names every field with no exception, since
 
 The document also carries a top-level `"$defs"`: one entry per `@json` class
 reachable from `T` through a chain of nested-class fields, `T` itself
-included — deduplicated, so a diamond (two fields reaching the same nested
+included, deduplicated: a diamond (two fields reaching the same nested
 class) or a cycle (`class Node { next: Option<Node> }`) each contribute
 exactly one entry. A caller can `$ref` the root from elsewhere (an OpenAPI
 document's own `components/schemas`, for instance) the same way any nested

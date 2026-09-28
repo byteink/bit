@@ -155,7 +155,7 @@ Nothing here calls `session.save()`. `pkg/web` autosaves a modified session
 once the handler returns: if any `set()`/`delete()`/`regenerate()` marked
 the session dirty, the framework writes it to the store for you, whether
 the handler succeeded or failed. `Session.set()` still only changes the
-copy of the session held in memory for the rest of *this* request — the
+copy of the session held in memory for the rest of *this* request; the
 store write itself happens automatically at the end, not inside `login`.
 
 `c.noContent()` answers `204 No Content`. There is nothing to return besides
