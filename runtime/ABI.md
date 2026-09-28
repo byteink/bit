@@ -400,8 +400,8 @@ entry and marking it. That is the entire precision contract for the heap.
 
 ### 2.1 Method table (interface dispatch)
 
-`methods` lists every method the type defines (SPEC §14); `BIT_DCE_METHODS=1` keeps only
-those some site dispatches to (`dispatchedTables`, `compiler/lowermethodtable.bit`, #6114). Each entry is:
+`methods` lists only the methods some site dispatches to (`dispatchedTables`,
+`compiler/lowermethodtable.bit`, #6114), not every method the type defines (SPEC §14). Each entry is:
 
 ```
 Method {                         // extern class, 16 bytes, 8-aligned
