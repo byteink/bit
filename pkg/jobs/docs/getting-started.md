@@ -128,10 +128,9 @@ of being retried again - visible in your store's `bit_jobs` table
 you to inspect and requeue by hand.
 
 `enqueue`'s named-argument form (`delay = 0, maxAttempts = 5`) is not
-available yet - it is generic in the job's type, and a named argument on a
-generic call is a compile error (SPEC §12.11) until that restriction is
-relaxed for an inferred type parameter. Positional works today, and is
-what every example on this page uses.
+available: it is generic in the job's type, and a named argument on a
+generic call is a compile error for an inferred type parameter. Positional
+works, and is what every example on this page uses.
 
 ## Sharp edge: an unregistered job name is dead-lettered, loudly
 

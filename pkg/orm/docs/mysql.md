@@ -126,25 +126,13 @@ be a lie about what actually happens. `Mysql.render` flags all of them
 detect: MySQL has no non-blocking index keyword to scan a `raw()` statement's
 text for at all.
 
-That honesty had a real consequence in [the migration runner](migrate.md),
-and fixing it there rather than here was the point. The runner used to put a
-migration's `schema_history` row inside the same transaction as its
-*transactional* statements - and since `Mysql` renders none, that left the
-ledger row alone in an otherwise empty transaction, committing before the
-first line of the migration's actual DDL ran. A migration failing partway
-left `schema_history` recording it as applied.
-
-The runner no longer does that: when a migration renders no transactional
-statements at all, `up` runs every statement first and writes the ledger row
-only once they have all succeeded. A statement failing anywhere in a
-MySQL migration leaves no `schema_history` row for it, so the next `up` still
-sees it as pending. The trade-off is stated in
-[Migrate](migrate.md)'s own section on it: a crash between the last statement
-and the ledger write re-runs the migration.
-
-The fix belongs in the runner because the flag here is not the thing that is
-wrong - `false` is what MySQL actually does, and making this renderer lie to
-restore the old ordering would have traded a visible bug for an invisible one.
+[The migration runner](migrate.md) accounts for this: when a migration
+renders no transactional statements at all, `up` runs every statement first
+and writes the `schema_history` ledger row only once they have all
+succeeded. A statement failing anywhere in a MySQL migration leaves no
+`schema_history` row for it, so the next `up` still sees it as pending. The
+trade-off is stated in [Migrate](migrate.md)'s own section on it: a crash
+between the last statement and the ledger write re-runs the migration.
 
 ## The migration runner has no lock on MySQL
 

@@ -12,10 +12,10 @@ Core on TechEmpower's test types 1 (plaintext) and 2 (JSON).
 
 `run.sh` runs on a developer machine and needs an x86-64 Linux host with
 docker, resolved by `scripts/x64host.sh`. It builds the pkg/web server itself,
-with this tree's compiler and a runtime built by that same compiler
-(`BIT_LIBBITRT_TREE=1 ./make selfhost`, then `bit build --target
-x86_64-linux`), refusing when the compiler, runtime, stdlib or pkg/web sources
-have uncommitted changes, so the table names the commit it measured.
+with this tree's compiler and a runtime built by that same compiler, then
+`bit build --target x86_64-linux`, refusing when the compiler, runtime,
+stdlib or pkg/web sources have uncommitted changes, so the table names the
+commit it measured.
 `remote.sh` is the half that runs over there: it takes the box's
 `/tmp/benchlock` directory lock for the whole run, builds the five peers,
 proves all six answer identical responses, reads back what cores each process

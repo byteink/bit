@@ -6,6 +6,8 @@ not know `HELLO`.
 
 ## Install
 
+`bit add bitlang.org/pkg/redis@^0.2.0` writes:
+
 ```json
 {
   "dependencies": {

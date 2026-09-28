@@ -37,9 +37,7 @@ a parser that accepts too much, and it is the more valuable half.
 
 `pkg/yaml/corpus.test.bit` is a normal package test, picked up by
 `./make test-package-yaml` like any other `*.test.bit` file in this
-module. Nothing about it needs separate registration. It reports one
-line, re-derived here by running
-`BIT_REPO="$PWD" ./bit-out/bin/bit test pkg/yaml` on commit `cab1d7e2`:
+module. Nothing about it needs separate registration. It reports one line:
 
 ```text
 yaml-test-suite: parse 293/308, error 86/94, excluded 23/402
@@ -48,54 +46,27 @@ yaml-test-suite: parse 293/308, error 86/94, excluded 23/402
 Read plainly: of 402 fixtures on disk, this package correctly parses or
 correctly rejects 379 (94%). The denominator is every fixture present on
 disk, so an excluded case stays visible in the ratio rather than quietly
-leaving it. The other 23 (6%) are excluded, each named below with the
-file that owes it.
+leaving it. The other 23 (6%) are excluded, grouped by reason below.
 
 ## What the 23 exclusions are
 
-Every excluded fixture is named individually, with its own reason, in
-`corpusExclusionList()` in `pkg/yaml/corpusexclusions.test.bit`. That
-list is what the harness actually reads; this section groups it for a
-reader. Fixing any of these means deleting its entry there, which moves
-the counts above - re-derive them from a run rather than quoting this
-page.
-
-* **8 are pending implementation, not excluded by design.** Each is a
+* **8 need tag or alias identity this package does not track.** Each is a
   valid document whose expected value depends on an anchor's name, an
   alias's identity, or an explicit tag's text - a `&name`, a `*name`
-  referencing one, or a `<tag:...>`. `Yaml` (`value.bit`) does not carry
-  any of that today. Whether it should was an open question; it is
-  settled now - YAML 1.2.2 makes a tag part of what a node is (3.2.1.1)
-  and an alias the same node, not merely an equal one (3.2.2, 7.1), so
-  `Yaml`'s value model will carry anchor identity and tag text. These 8
-  close once that change lands, the same way any other open gap here
-  does. See [Anchors](anchors.md) for what this package's anchor support
-  covers today.
-* **3 are permanent: tag-driven typing.** `S4JQ` needs the bare `!` tag
-  to force implicit typing off; `74H7` needs an explicit `!!str` to force
-  a mapping key to a string over its own implicit int resolution; `LE5A`
-  needs the same for an untagged-looking empty scalar. All three need
-  this package to choose a value's type from its tag rather than from its
-  own spelling, which this package rules out by design. These do not move;
-  nothing here is pending.
-* **12 are open gaps spread across six files.** `parse.bit` owns four,
-  each its own mechanism: a bare `:` starting a block-context line as an
-  implicit empty key; an anchored empty node followed by a same-column
-  sibling key; a `%TAG` handle's scope not tracked past its own document;
-  a flow collection's own multi-line minimum indentation not threaded
-  through block context. `flow.bit` owns four: a flow sequence's own
-  indentation floor, a flow mapping's key or entries split across lines,
-  and `---`/`...` used as flow content. `scan.bit` owns one: `&`/`*` need
-  the same fold-sensitive dispatch `!`/`%` already got. `scalar.bit` owns one
-  jointly with `parse.bit` and `flow.bit`: a multi-line quoted value's
-  own minimum indentation, which none of the three currently threads
-  through. `block.bit` owns one: a block scalar header's own trailing
-  comment. The last is not a parser gap at all - the harness's own
-  float-equality check in `corpus.test.bit`/`value.bit` never coerces an
-  expected int to compare against a parsed float. Two of the twelve (the
-  sibling-key one and the flow-indentation one) already record one
-  attempt tried and reverted after it regressed other, previously-passing
-  fixtures - not unattempted, just not yet solved.
+  referencing one, or a `<tag:...>`. See [Anchors](anchors.md) for what
+  this package's anchor support covers today.
+* **3 need tag-driven typing, which this package rules out by design.**
+  Each needs a value's type chosen from its tag rather than from its own
+  spelling - forcing implicit typing off, or forcing a mapping key to a
+  string over its own implicit int resolution.
+* **12 are gaps in less common syntax**: a bare `:` starting a
+  block-context line as an implicit empty key, an anchored empty node
+  followed by a same-column sibling key, a `%TAG` handle's scope past its
+  own document, a flow collection's own multi-line indentation, `&`/`*`
+  needing the same line-fold handling `!`/`%` already have, a block
+  scalar header's own trailing comment, and one case where the test
+  harness itself does not treat an expected int and a parsed float as
+  equal.
 
 None of the 23 is unexplained, and none is close to a majority: this
 package correctly handles 94% of the corpus today, and rejects anything

@@ -89,9 +89,8 @@ class loggingStore {
 ```
 
 `ClaimedJob` is what `claim` hands back: `id`, `name`, `payload` and
-`attempts`/`maxAttempts` so a store's caller (`jobs.bit`'s worker loop)
-can decide retry versus dead-letter without asking the store again. A
-Redis store follows the same shape once pkg/redis 0.2 ships (#6013).
+`attempts`/`maxAttempts` so a store's caller (the worker loop) can decide
+retry versus dead-letter without asking the store again.
 
 ## At-least-once delivery, and why your handler must be idempotent
 

@@ -91,8 +91,8 @@ Not Satisfiable` with `Content-Range: bytes */<size>`. `If-Range` is
 honoured - a stale `ETag` or `Last-Modified` falls back to the full `200`,
 the same rule a conditional GET already follows - and every response this
 middleware serves carries `Accept-Ranges: bytes`. A request naming more than
-one range falls back to a full `200`: `multipart/byteranges` (RFC 9110
-§14.6) is not implemented, since no mainstream client asks for more than one
+one range falls back to a full `200` instead of the multi-range reply the
+HTTP standard allows, since no mainstream client asks for more than one
 range at a time.
 
 `fileRes(path, c)` is the same Range/conditional-GET machinery for a single,

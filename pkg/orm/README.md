@@ -1,61 +1,20 @@
 # bitlang.org/pkg/orm
 
-An ORM for `std/sql`, built on `@table` (SPEC section 10.5's class attribute)
-and the descriptor it synthesizes. This package is under active development
-today it exports `Data`, the interface every ORM function is
-written against instead of a concrete `Pool`, the name mapping from a Bit
-field to its SQL table and column, the schema builder that declares tables,
-columns, indexes and foreign keys as an intent tree for a dialect to
-render, `t.json`/`AlterTable.addJson`, a `jsonb`/`json` column for a raw
-`Json` tree or a `@json` class field, with `jsonColumnValue`/
-`jsonColumnRead`/`jsonColumnDecode<T>` as its write and read halves and a
-SQL NULL always kept distinct from a stored JSON `null`, `Query<T>`, the
-find chain (`where`/`whereIn`/`whereNull`/
-`whereLike`/`orderBy`/`limit`/`offset`) whose string-literal column names
-are checked against `T`'s fields at compile time, `save`/`delete`/
-`upsert`, the three write verbs: one `save` for a new or already-persisted
-entity, decided by a hidden flag rather than the primary key, and 0 rows
-matched by an UPDATE is an error rather than a silent no-op, and
-`update`/`deleteMany`, the patch builder for writing or removing rows by a
-`where` clause with no instance loaded - a bare call touching every row is
-refused unless `.all()` says so on purpose, `insertAll`, many rows in one
-statement, chunked at a computed placeholder limit rather than one
-statement per row, `Query<T>.after`, keyset pagination - `WHERE id >
-$n` instead of a growing `OFFSET`, so a deep page costs what page 1 does,
-`@timestamps`, filling `createdAt` on INSERT and `updatedAt` on every
-write, single or bulk, `hasMany`/`hasOne`/`belongsTo` relations with eager
-loading via `with()`, batched so loading N parent rows never issues more
-than one extra query per relation, never one per row, `manyToManyTable`,
-`manyToManyLoader` and `attach`/`detach`/`sync`, the join-table primitives
-behind `@manyToMany` - the join table is always named explicitly, never
-inferred, `attach`/`sync` are idempotent on both Postgres and MySQL, and
-`detach` refuses to become an unfiltered `DELETE`, `@softDelete`,
-which makes `delete` mark a row instead of removing it and excludes a
-marked row from every ordinary read until
-`withTrashed`/`onlyTrashed`/`restore`/`forceDelete` says otherwise, and
-`@version`, optimistic locking: `save` on a table carrying it adds the old
-version to its UPDATE's WHERE and raises `StaleWriteError`, distinct from a
-row-not-found, when another write landed first, `forUpdate`, pessimistic
-row locking on the find chain - `FOR UPDATE` blocks until a row is free,
-`FOR UPDATE SKIP LOCKED` never blocks and returns fewer rows than the query
-matched, and both are refused outside a transaction and on `count()`/
-`exists()`, and `Query<T>.whereRaw`/
-`orderByField`, the one escape hatch for SQL text or a dynamic column
-name the rest of the builder cannot express - values still bind through
-placeholders and a dynamic column is checked against an allowlist, never
-escaped or quoted, `generate`, which diffs your `@table` entities against
-the live schema and writes a reviewed migration file - never applying
-anything and never inferring a rename from a drop next to an add, and
-`up`/`status`/`sql`/`down`, applying a checked-in migration registry
-against a live database with an advisory lock around the run and one
-transaction per migration, the ledger row inside it, `Mysql`, the second
-`Dialect` implementation - the same intent tree rendered to MySQL's own DDL,
-with every place it diverges from Postgres named on one page, and
-`withRollback`/`make`/`create`/`Seq`, running your own test suite inside a
-transaction that always rolls back, even on success, so nothing a test
-writes is ever there to clean up.
+An ORM for `std/sql`: define your tables as classes, then query, write and
+migrate against them without hand-writing SQL for the common cases - while
+still being able to drop to raw SQL when you need to.
+
+It gives you a schema builder for declaring tables and columns, a find
+chain (`where`, `orderBy`, `limit`, and more) with column names checked
+against your class at compile time, `save`/`delete`/`upsert` for single
+rows, `hasMany`/`hasOne`/`belongsTo` relations with eager loading,
+migrations generated from your entities, soft deletes, optimistic locking,
+and row locking for concurrent writers. Every one of these has its own
+page under [Docs](#docs) below.
 
 ## Install
+
+`bit add bitlang.org/pkg/orm@v0.1.0` writes:
 
 ```json
 {
@@ -79,6 +38,8 @@ fn transfer(db: Data, fromId: i64, toId: i64, amt: i64): ()! {
   db.exec("update accounts set balance = balance + ${amt} where id = ${toId}", []Value(0))?
 }
 ```
+
+## Docs
 
 See [`docs/data.md`](docs/data.md) for `Data` and the call sites (`pool`
 alone, `pool.tx(...)`, `pool.txValue<T>(...)`). Table and column names are
@@ -134,12 +95,6 @@ They stay separate types because folding the value into the
 interface would make every `upsert` caller hand it a full `Dialect`
 implementation to express a syntax choice, and because a `Dialect` renders
 DDL while a `ServerDialect` renders nothing at all.
-
-`ServerDialect` replaced two narrower types: `UpsertDialect`, a
-bare engine tag, and `LockDialect`, which carried a version. The richer
-shape won because a tag cannot answer a version question - and with it went
-`LockDialect.Neutral`, whose meaning was "trust me, this MySQL is 8.0 or
-later". A MySQL caller now supplies a real version.
 
 For how first-party packages in this repository are laid out, gated,
 versioned and released, see [`pkg/README.md`](../README.md).

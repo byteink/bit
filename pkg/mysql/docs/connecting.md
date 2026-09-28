@@ -5,9 +5,9 @@
 bitlang.org/pkg/mysql@v0.1.0` records it in `bit.lock` under the key `mysql` -
 the vanity path's last segment - so every import below reads `from "mysql"`,
 not the full vanity path. `adapter` is a function and not
-`export let adapter: Adapter` because a module-level `let` may only hold an
-untraced scalar (SPEC §11.11) - an interface value there is a compile error,
-not a style preference. Each call returns a fresh value, which is also the
+`export let adapter: Adapter` because `Adapter` is an interface, and a
+module-level `let` cannot hold one - that is a compile error, not a style
+preference. Each call returns a fresh value, which is also the
 correct shape for the once-per-pool warnings covered in [TLS](tls.md) and
 [Authentication](authentication.md): a process-wide singleton would turn "once
 per pool" into "once per process", so a second pool in the same program would
