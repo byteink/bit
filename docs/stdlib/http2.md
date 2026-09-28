@@ -123,76 +123,567 @@ If you are serving HTTP to browsers or ordinary clients over TLS, use
 ALPN, run this engine underneath, and give you the plain request/handler API
 either way. Reach for `std/http2` only when you own the transport yourself.
 
-## Reference
+## HPACK: header compression
 
-### HPACK
+HPACK (RFC 7541) compresses request and response headers against two tables:
+a fixed static table and a per-connection dynamic table that grows as headers
+are sent. An `Encoder` and a `Decoder` each hold their own copy of the
+dynamic table; run one of each per connection so the two stay in step.
 
-`newEncoder`/`Encoder` and `newDecoder`/`Decoder` each own a dynamic table; a
-matched pair walked over the same header sequence evolve identical tables. A
-`sensitive` field (a cookie, a bearer token) is always sent never-indexed, so it
-never enters the table.
+### `HeaderField`
 
-| | |
-|---|---|
-| `HeaderField { name, value, sensitive }` | one header field |
-| `newEncoder(): Encoder` | encoder with the 4096-byte default table, Huffman on |
-| `newEncoderConfig(maxTableSize: int, huffman: bool): Encoder` | encoder with an explicit table size and Huffman choice |
-| `Encoder.encode(fields: []HeaderField): []byte` | encode one header block |
-| `Encoder.changeTableSize(maxTableSize: int)` | resize the dynamic table |
-| `Encoder.tableSize(): int`, `.tableCount(): int`, `.tableEntry(i: int): HeaderField!` | inspect the dynamic table |
-| `newDecoder(): Decoder` | decoder with the 4096-byte default table limit |
-| `newDecoderConfig(maxTableSize: int): Decoder` | decoder with an explicit table limit |
-| `Decoder.decode(block: []byte): []HeaderField!` | decode one header block |
-| `Decoder.tableSize(): int`, `.tableCount(): int`, `.tableEntry(i: int): HeaderField!` | inspect the dynamic table |
-| `huffmanEncode(data: []byte): []byte` | RFC 7541 Huffman code (`Encoder` uses it for string literals) |
-| `huffmanDecode(data: []byte): []byte!` | the inverse |
+One header field: a `name`, a `value`, and a `sensitive` flag. Set `sensitive`
+on a field such as a cookie or a bearer token to force it to be sent without
+ever entering the dynamic table.
 
-### Frames
+### `newEncoder(): Encoder`
 
-Every frame is a fixed 9-byte header (`FrameHeader`) followed by a type-specific
-payload. `readFrame` splits one off a buffer, enforcing `SETTINGS_MAX_FRAME_SIZE`;
-each `decode*` interprets the payload, and each `encode*` builds it.
+An encoder with the default 4096-byte dynamic table and Huffman coding on.
 
-| | |
-|---|---|
-| `FrameHeader { length, ftype, flags, streamId }`, `Frame { header, payload }` | the parsed header and a whole frame |
-| `encodeFrameHeader(h): []byte!`, `decodeFrameHeader(b): FrameHeader!` | codec for the header alone |
-| `readFrame(buf, maxFrameSize): Frame!` | split one frame off `buf` |
-| `frameData` `frameHeaders` `framePriority` `frameRstStream` `frameSettings` `framePushPromise` `framePing` `frameGoaway` `frameWindowUpdate` `frameContinuation` | the ten `FrameType` codes, for `FrameHeader.ftype` |
-| `flagEndStream` `flagEndHeaders` `flagPadded` `flagPriority` `flagAck` | the frame flag bits |
-| `settingsHeaderTableSize` `settingsEnablePush` `settingsMaxConcurrentStreams` `settingsInitialWindowSize` `settingsMaxFrameSize` `settingsMaxHeaderListSize` | the six `SettingsParameter` ids, for `Setting.id` |
-| `defaultMaxFrameSize` (16384), `maxMaxFrameSize` (2^24-1) | `SETTINGS_MAX_FRAME_SIZE` bounds |
-| `errorNoError` `errorProtocolError` `errorInternalError` `errorFlowControlError` `errorSettingsTimeout` `errorStreamClosed` `errorFrameSizeError` `errorRefusedStream` `errorCancel` `errorCompressionError` `errorConnectError` `errorEnhanceYourCalm` `errorInadequateSecurity` `errorHttp11Required` | the fourteen `ErrorCode` values, for `RstStreamFrame.errorCode`/`GoawayFrame.errorCode` |
-| `DataFrame { streamId, data, endStream, padLength }`, `encodeData`, `decodeData` | DATA |
-| `HeadersFrame { streamId, blockFragment, endStream, endHeaders, padLength, hasPriority, exclusive, streamDependency, weight }`, `encodeHeaders`, `decodeHeaders` | HEADERS |
-| `PriorityFrame { streamId, exclusive, streamDependency, weight }`, `encodePriority`, `decodePriority` | PRIORITY |
-| `RstStreamFrame { streamId, errorCode }`, `encodeRstStream`, `decodeRstStream` | RST_STREAM |
-| `Setting { id, value }`, `SettingsFrame { ack, settings }`, `encodeSettings`, `decodeSettings` | SETTINGS |
-| `PushPromiseFrame { streamId, promisedStreamId, blockFragment, endHeaders, padLength }`, `encodePushPromise`, `decodePushPromise` | PUSH_PROMISE |
-| `PingFrame { ack, data }`, `encodePing`, `decodePing` | PING |
-| `GoawayFrame { lastStreamId, errorCode, debugData }`, `encodeGoaway`, `decodeGoaway` | GOAWAY |
-| `WindowUpdateFrame { streamId, increment }`, `encodeWindowUpdate`, `decodeWindowUpdate` | WINDOW_UPDATE |
-| `ContinuationFrame { streamId, blockFragment, endHeaders }`, `encodeContinuation`, `decodeContinuation` | CONTINUATION |
+### `newEncoderConfig(maxTableSize: int, huffman: bool): Encoder`
 
-### Connection engine
+An encoder with an explicit table size and Huffman on/off, for matching a
+table size the peer negotiated.
 
-| | |
-|---|---|
-| `Transport { read, write, shutdown }`, `newTransport(read, write, shutdown): Transport` | wrap your own byte stream |
-| `Config { initialWindowSize, maxFrameSize, headerTableSize, maxHeaderListBytes, maxConcurrentStreams, maxBodyBytes, streamBodies }`, `defaultConfig(): Config` | connection limits |
-| `Request { method, scheme, authority, path, headers, body }`, `newRequest(method, authority, path): Request` | a request |
-| `Response { status, headers, body }`, `newResponse(status, body): Response` | a response (`status` 0 from a `serve` handler aborts the stream instead of answering) |
-| `getHeader(headers: []HeaderField, name: string): string` | first header value by name, or `""` |
-| `connect(t, cfg, deadlineNs): Conn!` | client handshake over `t` |
-| `accept(t, cfg, deadlineNs): Conn!` | server handshake over `t` |
-| `Conn.roundTrip(req: Request): Response!` | send one request, wait for the full response |
-| `Conn.roundTripStream(req: Request): (Response, Stream)!` | send one request, stream the response body |
-| `Conn.serve(handler: (Request, Stream) => Response): ()!` | dispatch inbound requests to `handler`, one green thread each |
-| `Conn.close()` | graceful shutdown: send GOAWAY, let in-flight streams finish |
-| `Conn.resetStream(streamId: int, errorCode: int)` | abort a stream you started, by id (see Sharp edges) |
-| `Conn.waitReaderDone()`, `Conn.waitWriterDone()` | block for the reader/writer thread to stop, before closing the transport (see Sharp edges) |
-| `Stream.reset(errorCode: int)` | abort the stream a `serve` handler is answering |
-| `Stream.read(): BodyChunk!` | take the next chunk of a streamed body (request or response) |
-| `BodyChunk { data, eof }` | one body take |
+### `Encoder`
 
-Specification: RFC 7540/9113 (HTTP/2), RFC 7541 (HPACK).
+The stateful HPACK encoder. It picks the smallest representation for each
+field and keeps its dynamic table current as it encodes. Reuse one across a
+connection.
+
+### `Encoder.encode(fields: []HeaderField): []byte`
+
+Encodes `fields` into one header block, updating the dynamic table as it
+goes.
+
+### `Encoder.changeTableSize(maxTableSize: int)`
+
+Resizes the encoder's dynamic table, evicting entries if it shrinks.
+
+### `Encoder.tableSize(): int`
+
+The current size in bytes of the encoder's dynamic table.
+
+### `Encoder.tableCount(): int`
+
+The number of entries currently in the encoder's dynamic table.
+
+### `Encoder.tableEntry(i: int): HeaderField!`
+
+The dynamic-table entry at index `i`, newest first. Fails if `i` is out of
+range.
+
+### `newDecoder(): Decoder`
+
+A decoder with the default 4096-byte table limit.
+
+### `newDecoderConfig(maxTableSize: int): Decoder`
+
+A decoder with an explicit table-size limit, matching what was advertised to
+the peer.
+
+### `Decoder`
+
+The stateful HPACK decoder. It keeps its dynamic table current as it decodes
+and rejects a peer size update above its limit. Reuse one across a
+connection.
+
+### `Decoder.decode(block: []byte): []HeaderField!`
+
+Decodes one header block into its fields. Fails on any malformed input.
+
+### `Decoder.tableSize(): int`
+
+The current size in bytes of the decoder's dynamic table.
+
+### `Decoder.tableCount(): int`
+
+The number of entries currently in the decoder's dynamic table.
+
+### `Decoder.tableEntry(i: int): HeaderField!`
+
+The dynamic-table entry at index `i`, newest first. Fails if `i` is out of
+range.
+
+### `huffmanEncode(data: []byte): []byte`
+
+Huffman-codes `data`. `Encoder` calls this for its string literals; it is
+exported for direct use too.
+
+### `huffmanDecode(data: []byte): []byte!`
+
+The inverse of `huffmanEncode`. Fails on invalid Huffman-coded input.
+
+## The frame header
+
+Every HTTP/2 message is a stream of frames: a fixed 9-byte header followed by
+a type-specific payload.
+
+### `FrameHeader`
+
+A parsed frame header: the payload `length`, the frame type `ftype`, the
+`flags`, and the `streamId` it belongs to.
+
+### `Frame`
+
+A whole frame: its `header` and the raw `payload` bytes. `readFrame` produces
+one; a `decode*` function turns it into a typed frame such as `DataFrame`.
+
+### `encodeFrameHeader(h: FrameHeader): []byte!`
+
+The 9 wire bytes of a frame header.
+
+### `decodeFrameHeader(b: []byte): FrameHeader!`
+
+The frame header the first 9 bytes of `b` spell out. Fails on fewer than 9
+bytes.
+
+### `readFrame(buf: []byte, maxFrameSize: int): Frame!`
+
+Reads one whole frame off the front of `buf`, rejecting a frame larger than
+`maxFrameSize`. Advance past `9 + frame.header.length` bytes to read the next
+one.
+
+## Frame types
+
+The ten frame type codes, used on `FrameHeader.ftype` to tell frames apart.
+
+### `frameData: int`
+
+DATA: a piece of a stream's message body.
+
+### `frameHeaders: int`
+
+HEADERS: opens a stream and carries a header block.
+
+### `framePriority: int`
+
+PRIORITY: a stream's priority dependency and weight.
+
+### `frameRstStream: int`
+
+RST_STREAM: abrupt termination of a stream.
+
+### `frameSettings: int`
+
+SETTINGS: connection configuration parameters.
+
+### `framePushPromise: int`
+
+PUSH_PROMISE: a server's promise to push a stream.
+
+### `framePing: int`
+
+PING: a connection liveness probe.
+
+### `frameGoaway: int`
+
+GOAWAY: connection shutdown, naming the last stream processed.
+
+### `frameWindowUpdate: int`
+
+WINDOW_UPDATE: a flow-control window increment.
+
+### `frameContinuation: int`
+
+CONTINUATION: a continued header block.
+
+## Frame flags
+
+The frame flag bits, read from `FrameHeader.flags`.
+
+### `flagEndStream: int`
+
+END_STREAM on DATA/HEADERS: this is the last frame for the stream.
+
+### `flagEndHeaders: int`
+
+END_HEADERS on HEADERS/PUSH_PROMISE/CONTINUATION: the header block is
+complete.
+
+### `flagPadded: int`
+
+PADDED on DATA/HEADERS/PUSH_PROMISE: the payload carries padding.
+
+### `flagPriority: int`
+
+PRIORITY on HEADERS: a priority section precedes the header block.
+
+### `flagAck: int`
+
+ACK on SETTINGS/PING: this frame acknowledges the peer's frame.
+
+## Settings parameter ids
+
+The six SETTINGS parameter ids, used on `Setting.id`.
+
+### `settingsHeaderTableSize: int`
+
+The HPACK dynamic-table size limit the sender advertises.
+
+### `settingsEnablePush: int`
+
+Whether server push is permitted.
+
+### `settingsMaxConcurrentStreams: int`
+
+The most streams the sender will allow open at once.
+
+### `settingsInitialWindowSize: int`
+
+The initial per-stream flow-control window the sender grants.
+
+### `settingsMaxFrameSize: int`
+
+The largest frame payload the sender accepts.
+
+### `settingsMaxHeaderListSize: int`
+
+The largest header list the sender accepts.
+
+## Frame-size bounds
+
+### `defaultMaxFrameSize: int`
+
+The default and minimum allowed max frame size, 16384 bytes.
+
+### `maxMaxFrameSize: int`
+
+The largest allowed max frame size, the widest value the 24-bit length field
+can hold.
+
+## Error codes
+
+The error codes a stream or connection can be closed with, used on
+`RstStreamFrame.errorCode` and `GoawayFrame.errorCode`.
+
+### `errorNoError: int`
+
+Graceful shutdown, no problem occurred.
+
+### `errorProtocolError: int`
+
+An unspecified protocol violation.
+
+### `errorInternalError: int`
+
+An internal fault on the sender's side.
+
+### `errorFlowControlError: int`
+
+A flow-control window was exceeded.
+
+### `errorSettingsTimeout: int`
+
+A SETTINGS frame was not acknowledged in time.
+
+### `errorStreamClosed: int`
+
+A frame arrived on a stream that was already closed.
+
+### `errorFrameSizeError: int`
+
+A frame's size was invalid for its type.
+
+### `errorRefusedStream: int`
+
+The stream was refused before any processing, safe to retry elsewhere.
+
+### `errorCancel: int`
+
+The stream is no longer needed.
+
+### `errorCompressionError: int`
+
+The HPACK decoder state could not be recovered.
+
+### `errorConnectError: int`
+
+A CONNECT tunnel failed.
+
+### `errorEnhanceYourCalm: int`
+
+The peer is generating more load than will be processed.
+
+### `errorInadequateSecurity: int`
+
+The transport is not secure enough for this request.
+
+### `errorHttp11Required: int`
+
+The peer requires HTTP/1.1 for this request.
+
+## DATA frames
+
+### `DataFrame`
+
+A DATA frame: `streamId`, the body `data`, `endStream`, and `padLength`.
+
+### `encodeData(f: DataFrame): []byte!`
+
+The wire bytes of a DATA frame.
+
+### `decodeData(f: Frame): DataFrame!`
+
+The DATA frame `f` carries. Fails if `f` is not a DATA frame.
+
+## HEADERS frames
+
+### `HeadersFrame`
+
+A HEADERS frame: `streamId`, the header block `blockFragment`, `endStream`,
+`endHeaders`, `padLength`, and an optional priority section.
+
+### `encodeHeaders(f: HeadersFrame): []byte!`
+
+The wire bytes of a HEADERS frame.
+
+### `decodeHeaders(f: Frame): HeadersFrame!`
+
+The HEADERS frame `f` carries. Fails if `f` is not a HEADERS frame.
+
+## PRIORITY frames
+
+### `PriorityFrame`
+
+A PRIORITY frame: `streamId`, `exclusive`, `streamDependency`, and `weight`.
+
+### `encodePriority(f: PriorityFrame): []byte!`
+
+The wire bytes of a PRIORITY frame.
+
+### `decodePriority(f: Frame): PriorityFrame!`
+
+The PRIORITY frame `f` carries. Fails if `f` is not a PRIORITY frame.
+
+## RST_STREAM frames
+
+### `RstStreamFrame`
+
+A RST_STREAM frame: `streamId` and the `errorCode` it is reset with.
+
+### `encodeRstStream(f: RstStreamFrame): []byte!`
+
+The wire bytes of a RST_STREAM frame.
+
+### `decodeRstStream(f: Frame): RstStreamFrame!`
+
+The RST_STREAM frame `f` carries. Fails if `f` is not a RST_STREAM frame.
+
+## SETTINGS frames
+
+### `Setting`
+
+One SETTINGS parameter: an `id` (a `settings*` constant) and its `value`.
+
+### `SettingsFrame`
+
+A SETTINGS frame: either `ack` set, or a list of `settings`.
+
+### `encodeSettings(f: SettingsFrame): []byte!`
+
+The wire bytes of a SETTINGS frame.
+
+### `decodeSettings(f: Frame): SettingsFrame!`
+
+The SETTINGS frame `f` carries. Fails if `f` is not a SETTINGS frame.
+
+## PUSH_PROMISE frames
+
+### `PushPromiseFrame`
+
+A PUSH_PROMISE frame: the carrying `streamId`, the `promisedStreamId`, the
+request headers in `blockFragment`, `endHeaders`, and `padLength`.
+
+### `encodePushPromise(f: PushPromiseFrame): []byte!`
+
+The wire bytes of a PUSH_PROMISE frame.
+
+### `decodePushPromise(f: Frame): PushPromiseFrame!`
+
+The PUSH_PROMISE frame `f` carries. Fails if `f` is not a PUSH_PROMISE frame.
+
+## PING frames
+
+### `PingFrame`
+
+A PING frame: 8 opaque `data` bytes, echoed back with `ack` set.
+
+### `encodePing(f: PingFrame): []byte!`
+
+The wire bytes of a PING frame.
+
+### `decodePing(f: Frame): PingFrame!`
+
+The PING frame `f` carries. Fails if `f` is not a PING frame.
+
+## GOAWAY frames
+
+### `GoawayFrame`
+
+A GOAWAY frame: the `lastStreamId` processed, an `errorCode`, and optional
+`debugData`.
+
+### `encodeGoaway(f: GoawayFrame): []byte!`
+
+The wire bytes of a GOAWAY frame.
+
+### `decodeGoaway(f: Frame): GoawayFrame!`
+
+The GOAWAY frame `f` carries. Fails if `f` is not a GOAWAY frame.
+
+## WINDOW_UPDATE frames
+
+### `WindowUpdateFrame`
+
+A WINDOW_UPDATE frame: a flow-control `increment`. `streamId` 0 targets the
+whole connection; a non-zero id targets that stream.
+
+### `encodeWindowUpdate(f: WindowUpdateFrame): []byte!`
+
+The wire bytes of a WINDOW_UPDATE frame.
+
+### `decodeWindowUpdate(f: Frame): WindowUpdateFrame!`
+
+The WINDOW_UPDATE frame `f` carries. Fails if `f` is not a WINDOW_UPDATE
+frame.
+
+## CONTINUATION frames
+
+### `ContinuationFrame`
+
+A CONTINUATION frame: `streamId`, a continued `blockFragment`, and
+`endHeaders`.
+
+### `encodeContinuation(f: ContinuationFrame): []byte!`
+
+The wire bytes of a CONTINUATION frame.
+
+### `decodeContinuation(f: Frame): ContinuationFrame!`
+
+The CONTINUATION frame `f` carries. Fails if `f` is not a CONTINUATION frame.
+
+## The connection engine
+
+HPACK and the frame codec are pure byte codecs. This part of the module puts
+them to work over a live connection: it runs the handshake, tracks streams,
+paces bodies against flow control, and multiplexes many requests over one
+transport.
+
+### `Transport`
+
+A bidirectional byte stream: `read`, `write`, and `shutdown` function values.
+Any stream, such as a `std/net` connection or an in-memory pipe, can satisfy
+this by supplying the three functions.
+
+### `newTransport(read: (int) => []byte, write: ([]byte) => ()!, shutdown: () => ()): Transport`
+
+Bundles the three functions into a `Transport`.
+
+### `Config`
+
+The connection limits a `Conn` advertises: `initialWindowSize`,
+`maxFrameSize`, `headerTableSize`, `maxHeaderListBytes`,
+`maxConcurrentStreams`, `maxBodyBytes`, and `streamBodies`. See "Tuning
+limits" above.
+
+### `defaultConfig(): Config`
+
+A `Config` with the RFC default limits: see "Tuning limits" above for the
+exact numbers.
+
+### `Request`
+
+An HTTP/2 request: `method`, `scheme`, `authority`, `path`, `headers`, and
+`body`.
+
+### `Response`
+
+An HTTP/2 response: `status`, `headers`, and `body`. A `status` of 0 returned
+from a `serve` handler aborts the stream instead of sending a response.
+
+### `newRequest(method: string, authority: string, path: string): Request`
+
+A request with the `https` scheme, no extra headers, and no body.
+
+### `newResponse(status: int, body: []byte): Response`
+
+A response with a status and a body and no extra headers.
+
+### `getHeader(headers: []HeaderField, name: string): string`
+
+The value of the first header named `name`, or `""` if it is absent.
+
+### `connect(t: Transport, cfg: Config, deadlineNs: int): Conn!`
+
+Runs the client side of the handshake over `t` and returns a `Conn` once the
+peer's settings are in effect. `deadlineNs` bounds the wait; `0` means no
+bound.
+
+### `accept(t: Transport, cfg: Config, deadlineNs: int): Conn!`
+
+Runs the server side of the handshake over `t` and returns a `Conn`. Fails on
+a malformed client preface.
+
+### `Conn`
+
+A live HTTP/2 connection. Safe to use from many green threads at once; every
+operation is a method that talks to its own background threads.
+
+### `Conn.roundTrip(req: Request): Response!`
+
+Sends `req` on a fresh stream and blocks for the full response. Fails if the
+stream is reset, the connection is closing, or `Config.streamBodies` is set
+(use `roundTripStream` instead).
+
+### `Conn.roundTripStream(req: Request): (Response, Stream)!`
+
+Sends `req` and returns as soon as the response headers arrive, with the body
+still to come on the returned `Stream`. Use this for a large response you
+want to read a chunk at a time instead of holding whole.
+
+### `Conn.serve(handler: (Request, Stream) => Response): ()!`
+
+Accepts inbound requests and dispatches each to `handler` on its own green
+thread, until the connection closes.
+
+### `Conn.close()`
+
+Begins a graceful shutdown: sends GOAWAY, refuses new requests, and lets
+streams already in flight finish.
+
+### `Conn.resetStream(streamId: int, errorCode: int)`
+
+Aborts the stream `streamId` by sending RST_STREAM with `errorCode`. See
+"Sharp edges" above for how to know which id to pass.
+
+### `Conn.waitReaderDone()`
+
+Blocks until the connection's background reader has noticed the transport is
+gone and stopped. Part of the required shutdown order, see "Sharp edges"
+above.
+
+### `Conn.waitWriterDone()`
+
+Blocks until the connection's background writer has stopped. Call this after
+`waitReaderDone()`, see "Sharp edges" above.
+
+### `Stream`
+
+One inbound stream, handed to a `serve` handler as its second argument. Used
+to read a streamed request body or to abort the stream.
+
+### `Stream.reset(errorCode: int)`
+
+Aborts this stream by sending RST_STREAM with `errorCode`.
+
+### `Stream.read(): BodyChunk!`
+
+Takes the next chunk of this stream's body as it arrives, without waiting for
+the whole body. Blocks until at least one byte has arrived or the body has
+ended.
+
+### `BodyChunk`
+
+One take from a stream's body: `data` is the bytes taken, `eof` says the peer
+has ended the stream.
