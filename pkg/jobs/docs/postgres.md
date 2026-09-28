@@ -9,19 +9,13 @@ queue silently loses every pending job on deploy and behaves differently
 on one instance than on three, so you always pick one. `PostgresStore` is
 the one this package ships.
 
-Every block on this page is marked `ignore`, same reason as
-[Getting started](getting-started.md): importing anything at all from
-`"jobs"` compiles the whole module, including `interface Job`'s `static`
-requirement (SPEC §10.4.1), which needs `BIT_STATIC_METHODS=1` until epic
-#6160 flips its default - not only the blocks that use `@job` directly.
-
 ## The simplest thing that works
 
 `PostgresStore` takes a `std/sql.Pool` - the same one you would use for
 anything else in your app - and needs one table, created by
 `migrate` before the first `open`:
 
-```bit ignore
+```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
 import { newPostgresStore, migrate, open, Options } from "jobs"
@@ -39,7 +33,7 @@ fn main(): ()! {
 `migrate` runs `migrationStatements()` - a plain `[]string`, one entry per
 statement, in order:
 
-```bit ignore
+```bit
 import { migrationStatements } from "jobs"
 
 fn printMigration() {
@@ -64,11 +58,11 @@ elapses, letting another worker pick the job back up.
 `Store` is a structural interface (`store.bit`) - anything with these five
 methods works with `open`, no declaration needed:
 
-```bit ignore
+```bit
 import { Store, ClaimedJob } from "jobs"
 
 class loggingStore {
-  inner: Store,
+  inner: Store
 
   export enqueue(name: string, payload: string, availableAt: int, maxAttempts: int): ()! {
     println("enqueue: ${name}")

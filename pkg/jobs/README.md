@@ -5,26 +5,34 @@ jitter, a dead-letter list, and a `PostgresStore`. No default queue
 backend, the same call as pkg/web's session and rate-limit stores: an
 in-memory queue silently loses every pending job on deploy.
 
-**Status: not yet released.** `@job`'s dispatch name is a `static` method
-(#6081/#6091), and `static` methods are behind the compiler flag
-`BIT_STATIC_METHODS=1` (default off) until epic #6160 flips it. Building or
-testing this package needs that flag exported; it is not tagged as a
-release until the flag is gone.
+<!-- doctest: deps postgres -->
 
-```bit ignore
-@job("send-welcome")
-@json
-class SendWelcome {
+```bit
+import { pool, Datasource } from "std/sql"
+import { adapter } from "postgres"
+import { newPostgresStore, migrate, open, Options } from "jobs"
+import { Json, JsonEntry } from "std/json"
+
+@job("send-welcome") @json class SendWelcome {
   userId: i64,
 }
 
 fn main(): ()! {
+  let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
+  migrate(db)?
+  let store = newPostgresStore(db)
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
-    // send the email
+    sendWelcomeEmail(job.userId)?
   })
   q.enqueue(SendWelcome{ userId = 1 })?
   q.run()?
+  return
+}
+
+fn sendWelcomeEmail(userId: i64): ()! {
+  // call your mail provider
+  return
 }
 ```
 

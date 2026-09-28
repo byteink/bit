@@ -1,14 +1,24 @@
 # Getting started with background jobs
 
-<!-- doctest: per-block -->
+<!-- doctest: deps postgres -->
 
 A user signs up and your handler needs to send them a welcome email. Doing
 it inline is the obvious thing:
 
-```bit ignore
+```bit
+fn createUserSync(email: string): ()! {
+  // insert into your database
+  return
+}
+
+fn sendWelcomeEmailSync(email: string): ()! {
+  // call your mail provider
+  return
+}
+
 fn signUp(email: string): ()! {
-  createUser(email)?
-  sendWelcomeEmail(email)?
+  createUserSync(email)?
+  sendWelcomeEmailSync(email)?
   return
 }
 ```
@@ -25,32 +35,36 @@ workers that pick them up, run them, and retry the ones that fail.
 ## The simplest thing that works
 
 A job is a class with a stable name and a JSON-shaped payload. `open`
-builds a queue over a `Store` (see [PostgreSQL](postgres.md) for a real
-one); `register` tells it what to do with a job type; `enqueue` adds one.
+builds a queue over a `Store`; `register` tells it what to do with a job
+type; `enqueue` adds one. `jobs` ships no default store (this package's own
+README), so every runnable example on this page opens a `PostgresStore` -
+see [PostgreSQL](postgres.md) for what `migrate` and `newPostgresStore` do.
 
-This page's examples are marked `ignore` rather than typechecked
-automatically: `@job`'s dispatch name is a `static` method (SPEC
-§10.4.1), which lands behind the compiler flag `BIT_STATIC_METHODS=1`
-(off by default) until epic #6160 flips it - see the package README's
-Status line.
+```bit
+import { pool, Datasource } from "std/sql"
+import { adapter } from "postgres"
+import { newPostgresStore, migrate, open, Options, Store } from "jobs"
+import { Json, JsonEntry } from "std/json"
 
-```bit ignore
-import { open, Options } from "jobs"
-
-@job("send-welcome")
-@json
-class SendWelcome {
+@job("send-welcome") @json class SendWelcome {
   userId: i64,
 }
 
 fn main(): ()! {
-  // store: a jobs.Store - see PostgreSQL for how to build one.
+  let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
+  migrate(db)?
+  let store = newPostgresStore(db)
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
   })
   q.enqueue(SendWelcome{ userId = 1 })?
   q.run()?
+  return
+}
+
+fn sendWelcomeEmail(userId: i64): ()! {
+  // call your mail provider
   return
 }
 ```
@@ -64,25 +78,17 @@ because the payload has to cross the store as text.
 ## Building on it: workers alongside other work
 
 A worker process is one shape. Often you want jobs running inside the same
-process as your web server instead - `start`/`stop` do that:
+process as your web server instead - `start`/`stop` do that. `store` here
+is the same `PostgresStore` `main` above already opened:
 
-```bit ignore
-import { open, Options } from "jobs"
-
-@job("send-welcome")
-@json
-class SendWelcome {
-  userId: i64,
-}
-
-fn main(): ()! {
-  // store: a jobs.Store - see PostgreSQL for how to build one.
+```bit
+fn runAlongsideWebServer(store: Store): ()! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
   })
   q.start()
-  runWebServer()?
+  // ... serve requests, run migrations, whatever this process does ...
   q.stop()
   return
 }
@@ -98,17 +104,8 @@ drain, never an abandoned half-sent email.
 The mail provider fails sometimes. `enqueue`'s third argument is how many
 times to try before giving up:
 
-```bit ignore
-import { open, Options } from "jobs"
-
-@job("send-welcome")
-@json
-class SendWelcome {
-  userId: i64,
-}
-
-fn main(): ()! {
-  // store: a jobs.Store - see PostgreSQL for how to build one.
+```bit
+fn runWithRetries(store: Store): ()! {
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
