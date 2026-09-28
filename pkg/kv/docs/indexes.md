@@ -133,3 +133,18 @@ fn main(): ()! {
 `Collection.delete` removes the record and every index entry it had in one
 step - a completed task disappears from both `all()` and any `by()` lookup
 that used to match it.
+
+## Sharp edges
+
+`declareIndex` has to be called again on every open, on every `Collection`
+value - nothing about an index is stored on disk, only the records and the
+index entries `save` wrote for them. Reopen a database and forget to
+redeclare an index and `by()` on it returns nothing, silently: there is no
+entry to find, not because none match, but because the index was never
+rebuilt this run.
+
+## Where to go next
+
+[Getting started](getting-started.md) for `createDb`/`openDb` and the raw
+`Tx` this chapter builds on, and [Transactions](transactions.md) for what
+happens to `save`/`delete` when the surrounding block fails.
