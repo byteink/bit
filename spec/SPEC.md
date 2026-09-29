@@ -1583,6 +1583,49 @@ class SendWelcome { userId: i64 }
   library reads through a normal, structurally-satisfied static interface
   requirement.
 
+**`@collection("name")` - a kv collection's name (#6254).**
+
+```bit
+@json class User { name: string }                           // named "user"
+@json @collection("sessions") class Session { userId: i64 } // your own name
+```
+
+- Every class carrying `@json` gains a synthesized **static** member
+  (§10.4.1)
+
+  ```
+  static __collectionName(): string
+  ```
+
+  read with no instance in hand - `T.__collectionName()` for a `T` bound by
+  `interface Stored { static __collectionName(): string }` - which is what
+  lets `store.collection<T: Stored>()` (kv) dispatch by type alone, the same
+  zero-instance shape `@job`'s `static __jobName` (above) takes. Unlike
+  `@job`, this is **unconditional on every `@json` class**, not only the ones
+  that also carry `@collection`: kv needs a name for any `@json` class handed
+  to it, not only the ones that bothered to override one.
+- `@collection` itself is **optional and takes at most one argument**, a
+  non-empty string literal overriding the name: anything else that argument
+  could be - an empty string, a non-literal expression, a second argument -
+  is **E0174**, naming the class; a second argument is **E0137** at the
+  position that defines the legal set (§10.3.1), before this check ever
+  runs. `@collection` on a class that does not also carry `@json` is
+  **E0175** - the method it names is never synthesized without `@json`.
+- **The default name is snake_case of the class name, never pluralized**:
+  `User -> user`, `OrderLine -> order_line` (`.claude/kb/data-packages-dx.md`
+  rule 3) - the same conversion `pkg/orm`'s own table-name default uses,
+  minus that package's pluralization, which kv's target API drops.
+- **`__collectionName` is a reserved name on every class, `@json` or not.** A
+  class that declares a method by this name is **E0176** - the same rule,
+  for the same reason, `__jobName`'s own reservation (E0168) above is: a
+  static interface requirement naming `__collectionName()` matches by name
+  alone, so a same-named member on an unrelated class would satisfy it and
+  misbehave at the call, not at the assertion.
+- `@collection` introduces no reflection and no compiler-generated
+  cross-module table: it only synthesizes `static __collectionName`, an
+  ordinary static method a library reads through a normal,
+  structurally-satisfied static interface requirement.
+
 ### 10.6 Interface Declarations
 
 ```
