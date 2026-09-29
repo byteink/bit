@@ -34,6 +34,7 @@ import { Db } from "orm"
 
 ```bit
 import { Dir } from "orm"
+import { isSome, unwrap } from "std/core"
 
 @table("articles") class Article {
   id: i64
@@ -50,9 +51,19 @@ import { Dir } from "orm"
 }
 
 fn findArticleById(db: Db, id: i64): Article! {
-  return db.table<Article>().with("author").with("tags").find(id)?
+  let found = db.table<Article>().where("id", id).with("author").with("tags").first()?
+  if (!isSome(found)) {
+    fail newError("no article with id ${id}")
+  }
+  return unwrap(found)
 }
 ```
+
+`with()` is only eager-loaded by `all()`/`first()`, not by `find()` (a
+`Repo<T>` gap, filed separately) - so this goes through `where("id",
+id).first()` instead of the shorter `find(id)`, `first()`'s own default
+2-row bound giving the identical "more than one match would be a bug"
+guard.
 
 `@belongsTo("authorId")` names the foreign key already on `Article` - the
 owning side. `@manyToMany("article_tags")` names the join table [chapter

@@ -46,7 +46,7 @@ const refreshTokenTtlSeconds = 30 * 24 * 3600
 
 // `pkg/auth`'s `Lookup` — the seam `newPasswordStrategy` calls with the
 // POST body's `username`, per pkg/auth/docs/getting-started.md.
-export fn userLookup(db: Data): Lookup {
+export fn userLookup(db: Db): Lookup {
   return (username) => {
     let u = findUserByUsername(db, username)?
     return LookupResult{ hash = u.passwordHash, id = "${u.id}", claims = userClaims(u) }
@@ -63,17 +63,14 @@ export @json class RegisterInput {
   password: string
 }
 
-// Uses `insertGeneratedId` (db.bit), not `save()` — see that helper's own
-// comment for why `save()` cannot insert into an `@id`-keyed table on
-// Postgres today (#6088).
-fn insertUser(db: Data, u: User): User! {
-  let cols = ["username", "email", "password_hash", "role", "created_at", "updated_at"]
+fn insertUser(db: Db, username: string, email: string, passwordHash: string, role: string): User! {
   let stamp = now().ns
-  let args = [
-    Value.Text(u.username), Value.Text(u.email), Value.Text(u.passwordHash), Value.Text(u.role),
-    Value.Int(stamp), Value.Int(stamp),
-  ]
-  let newId = insertGeneratedId(db, "users", cols, args) catch e {
+  return db.table<User>().insert(
+    User{
+      id = 0, username = username, email = email, passwordHash = passwordHash, role = role,
+      createdAt = stamp, updatedAt = stamp,
+    },
+  ) catch e {
     let cause = classify(e, "users")
     let (_, ok) = cause.(UniqueViolation)
     if (ok) {
@@ -81,18 +78,11 @@ fn insertUser(db: Data, u: User): User! {
     }
     fail cause
   }
-  u.id = newId
-  u.markPersisted(true)
-  return u
 }
 
-fn register(c: Ctx, db: Data): Res! {
+fn register(c: Ctx, db: Db): Res! {
   let input = c.body<RegisterInput>()?
-  let u = User{
-    id = 0, username = input.username, email = input.email,
-    passwordHash = hashPassword(input.password), role = "author", createdAt = 0, updatedAt = 0,
-  }
-  let saved = insertUser(db, u)?
+  let saved = insertUser(db, input.username, input.email, hashPassword(input.password), "author")?
   return c.created("${saved.id}").header("Location", "/users/${saved.id}")
 }
 
@@ -117,7 +107,7 @@ fn logout(c: Ctx): Res! {
   return c.noContent()
 }
 
-fn showMe(c: Ctx, db: Data): Res! {
+fn showMe(c: Ctx, db: Db): Res! {
   let id = currentUserId(c)?
   let u = findUserById(db, id)?
   return c.json(toPublicUser(u))
@@ -207,47 +197,43 @@ fn newOpaqueToken(): string {
   return encodeHex(randomBytes(32))
 }
 
-fn insertRefreshToken(db: Data, userId: i64, tokenHash: string, expiresAt: i64): ()! {
-  let cols = ["user_id", "token_hash", "expires_at", "rotated", "created_at"]
-  let args = [
-    Value.Int(userId), Value.Text(tokenHash), Value.Int(expiresAt), Value.Int(0),
-    Value.Int(now().ns),
-  ]
-  insertGeneratedId(db, "refresh_tokens", cols, args)?
-}
-
-class RefreshTokenRow {
+// `refresh_tokens` — `rotated` is `0`/`1` (an `i64`), matching
+// `db.bit`'s `t.int("rotated")` column, not a native `boolean` one.
+@table("refresh_tokens") class RefreshToken {
   id: i64,
   userId: i64,
+  tokenHash: string,
   expiresAt: i64,
-  rotated: bool,
+  rotated: i64,
+  createdAt: i64,
 }
 
-fn findRefreshTokenByHash(db: Data, tokenHash: string): RefreshTokenRow! {
-  let rows = db.query(
-    "select id, user_id, expires_at, rotated from refresh_tokens where token_hash = $1",
-    [Value.Text(tokenHash)],
+fn insertRefreshToken(db: Db, userId: i64, tokenHash: string, expiresAt: i64): ()! {
+  db.table<RefreshToken>().insert(
+    RefreshToken{
+      id = 0, userId = userId, tokenHash = tokenHash, expiresAt = expiresAt, rotated = 0,
+      createdAt = now().ns,
+    },
   )?
-  defer rows.close()
-  if (!rows.next()?) {
+}
+
+fn findRefreshTokenByHash(db: Db, tokenHash: string): RefreshToken! {
+  let found = db.table<RefreshToken>().where("tokenHash", tokenHash).first()?
+  if (!isSome(found)) {
     fail newError("no refresh token with that hash")
   }
-  let cols = rows.columns()
-  return RefreshTokenRow{
-    id = sqlReqInt(rows, cols, "id")?, userId = sqlReqInt(rows, cols, "user_id")?,
-    expiresAt = sqlReqInt(rows, cols, "expires_at")?, rotated = sqlReqBool(rows, cols, "rotated")?,
-  }
+  return unwrap(found)
 }
 
-fn markRefreshTokenRotated(db: Data, id: i64): ()! {
-  db.exec("update refresh_tokens set rotated = 1 where id = $1", [Value.Int(id)])?
+fn markRefreshTokenRotated(db: Db, id: i64): ()! {
+  db.table<RefreshToken>().where("id", id).set("rotated", 1).updateAll()?
 }
 
 // Issues an access token plus a fresh refresh token for `u`, storing the
 // refresh token's hash — the one place both `issueTokens` (login) and
 // `refreshTokenRoute` (rotation) build a `TokenResponse` from, so the two
 // can never drift.
-fn issueTokenPair(db: Data, u: User, jwtSecret: string): TokenResponse! {
+fn issueTokenPair(db: Db, u: User, jwtSecret: string): TokenResponse! {
   let access = issueAccessToken(u, jwtSecret)?
   let raw = newOpaqueToken()
   let expiresAt = now().ns / Second + refreshTokenTtlSeconds
@@ -261,7 +247,7 @@ fn issueTokenPair(db: Data, u: User, jwtSecret: string): TokenResponse! {
 // `POST /auth/token`: the same `Strategy.authenticate(c)` `login` uses —
 // same `Credentials` body, same Argon2id check — but issues a bearer token
 // pair instead of a cookie session.
-fn issueTokens(c: Ctx, db: Data, strategy: Strategy, jwtSecret: string): Res! {
+fn issueTokens(c: Ctx, db: Db, strategy: Strategy, jwtSecret: string): Res! {
   let identity = strategy.authenticate(c)?
   let uid = parseId(identity.id)?
   let u = findUserById(db, uid)?
@@ -275,12 +261,12 @@ export @json class RefreshInput {
 // `POST /auth/token/refresh` (part 35): single-use rotation — a refresh
 // token already marked `rotated` is refused outright, closing the replay
 // window a stolen-and-reused refresh token would otherwise open.
-fn refreshTokenRoute(c: Ctx, db: Data, jwtSecret: string): Res! {
+fn refreshTokenRoute(c: Ctx, db: Db, jwtSecret: string): Res! {
   let input = c.body<RefreshInput>()?
   let row = findRefreshTokenByHash(db, hashToken(input.refreshToken)) catch _ {
     fail unauthorized("invalid refresh token")
   }
-  if (row.rotated) {
+  if (row.rotated != 0) {
     fail unauthorized("refresh token already used")
   }
   if (now().ns / Second > row.expiresAt) {
@@ -291,7 +277,7 @@ fn refreshTokenRoute(c: Ctx, db: Data, jwtSecret: string): Res! {
   return c.json(issueTokenPair(db, u, jwtSecret)?)
 }
 
-fn showApiMe(c: Ctx, db: Data): Res! {
+fn showApiMe(c: Ctx, db: Db): Res! {
   let identity = currentIdentity(c)?
   let u = findUserById(db, parseId(identity.id)?)?
   return c.json(toPublicUser(u))
@@ -332,14 +318,12 @@ fn googleBegin(c: Ctx, cfg: AppConfig): Res! {
 // its verified email — `passwordHash = ""` (never a valid Argon2id PHC
 // string, so `POST /auth/login` can never authenticate this row) marks the
 // account as "created via Google", never a real local password.
-fn findOrCreateGoogleUser(db: Data, email: string): User! {
-  return findUserByUsername(db, email) catch _ {
-    let u = User{
-      id = 0, username = email, email = email, passwordHash = "", role = "author", createdAt = 0,
-      updatedAt = 0,
-    }
-    return insertUser(db, u)?
+fn findOrCreateGoogleUser(db: Db, email: string): User! {
+  let found = db.table<User>().where("username", email).first()?
+  if (isSome(found)) {
+    return unwrap(found)
   }
+  return insertUser(db, email, email, "", "author")?
 }
 
 // `handleCallback` (oidc_callback.bit) already verifies the ID token,
@@ -348,7 +332,7 @@ fn findOrCreateGoogleUser(db: Data, email: string): User! {
 // (`sessionUserIdKey`/`sessionRoleKey`), the same one `login` writes, so
 // `currentUserId`/`requireOwnerOrAdmin` work identically after a Google
 // sign-in as after a password one.
-fn googleCallback(c: Ctx, db: Data, cfg: AppConfig): Res! {
+fn googleCallback(c: Ctx, db: Db, cfg: AppConfig): Res! {
   if (!googleConfigured(cfg)) {
     fail notFound()
   }
@@ -365,7 +349,7 @@ fn googleCallback(c: Ctx, db: Data, cfg: AppConfig): Res! {
   return c.noContent()
 }
 
-export fn mountAuth(app: App, db: Data, cfg: AppConfig) {
+export fn mountAuth(app: App, db: Db, cfg: AppConfig) {
   let strategy = newPasswordStrategy(userLookup(db))
   let bearer = newBearerStrategy(cfg.jwtSecret)
   app.post("/auth/register", (c) => register(c, db))
