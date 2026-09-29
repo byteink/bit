@@ -14,9 +14,10 @@ land as one unit, or not at all.
 import { Db } from "orm"
 
 @table class Post {
-  @id id: i64,
-  title: string,
-  views: i64,
+  @id
+  id: i64
+  title: string
+  views: i64
 }
 
 fn bumpViews(db: Db, id: i64): ()! {
