@@ -358,6 +358,16 @@ The typed accessor for a `Text` value. Fails on any other variant.
 
 The typed accessor for a `Blob` value. Fails on any other variant.
 
+### `sqlValue<V>(v: V): Value`
+
+Turns a plain value into the `Value` a query binds, so calling code never
+writes a `Value` variant by hand. `sqlValue(draft.title)` is `Value.Text`,
+`sqlValue(draft.id)` is `Value.Int`, `sqlValue(draft.summary)` (an
+`Option<string>` field) is `Value.Null` when unset. `V` must be
+`string`, `int`/`i64`, `bool`, `f64`, `[]byte`, or `Option<>` of one of
+those — any other type is a compile error naming it, not a runtime
+surprise.
+
 ## The driver contract
 
 ### `Driver`
