@@ -158,7 +158,7 @@ fn probe(db: Data): ()! {
 
 ## Bulk writes respect the mark too
 
-[Patch](patch.md)'s `update`/`deleteMany` have their own soft-delete-aware
+[Write](write.md)'s `update`/`deleteMany` have their own soft-delete-aware
 entry points, `updateScoped`/`deleteManyScoped`, so a bulk job never
 touches a row the single-instance path already protects:
 
@@ -252,7 +252,7 @@ purpose.
 reads `Query<T>` does - `with()`, `where`, `orderBy`, `limit`, `offset`,
 `after()`, `count`, `all`, `one`, `oneOrFail` - each delegating straight to
 the wrapped `Query<T>`, so a `@softDelete` PARENT paginating with
-[keyset pagination](keyset.md) or eager-loading a relation works exactly
+[keyset pagination](query.md#paging-through-a-large-table-with-after) or eager-loading a relation works exactly
 like `accounts(db)` above, no different spelling:
 
 ```bit
@@ -366,8 +366,8 @@ this page is built to protect the row it just marked.
 ## Where to go next
 
 [Query](query.md) covers the plain `find` chain this page's `findScoped`
-extends, and [keyset pagination](keyset.md)'s own `after()`. [Relations](relation.md)
+extends, and [keyset pagination](query.md#paging-through-a-large-table-with-after)'s own `after()`. [Relations](relation.md)
 covers `hasMany`/`hasOne`/`belongsTo` and `with()` before `findScopedQuery`
-here. [Patch](patch.md) covers `update`/`deleteMany` before the
+here. [Write](write.md) covers `update`/`deleteMany` before the
 soft-delete-aware wrappers here. [Write](write.md) covers `save`/`delete`/
 `upsert` and `TableDesc`, the shape `classAttrs` was added to for this page.

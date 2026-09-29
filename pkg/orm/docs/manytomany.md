@@ -172,7 +172,8 @@ duplicate key update post_id = post_id`, a self-assignment that changes no
 column and only ever fires on the pair's own key conflict. Both take
 `dialect: ServerDialect` explicitly because nothing reaching `Data` carries
 a server dialect (it never will) - the same package-wide
-type `write.bit`'s `upsert` and `lock.bit`'s `forUpdate` also take. Neither
+type `write.bit`'s `upsert` and `txrepo.bit`'s `TxRepo<T>.lock()` also
+take. Neither
 `attach` nor `sync` reads the `MysqlVersion` that `ServerDialect.Mysql`
 carries - `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` is a syntax choice, not
 a version-gated one, so a MySQL call here supplies a version this file never

@@ -1,277 +1,127 @@
-# Lock rows so two workers can't grab the same one
+# Lock a row so two writers can't both change it
 
-A `jobs` table holds pending work, and two worker processes both poll it:
-`find<Job>(db, "jobs", fields, jobMapper).where("state", Value.Text("pending")).limit(1).one()`.
-Nothing about a plain `SELECT` holds the row it read for the caller that read
-it - if both workers run that query in the same instant, both get job 42
-back. Both start processing it. Whichever one writes its result back last
-wins, silently; the other one did the same work for nothing, or worse, wrote
-an outcome that assumed nothing else had touched the row since. `forUpdate`
-is what turns "read a row" into "read a row and hold it until you decide
-what happens to it."
+Two moderators open the same reported article at the same time, both edit
+`status`, and both save. A plain `find`/`update` has no idea either of them
+is happening: whichever `update` runs last wins, silently, and the first
+moderator's change is gone with no error to explain why. `tx.table<T>().
+lock()` is what turns "read a row" into "read a row and hold it until this
+transaction decides what happens to it" - the second `find` inside a
+locking transaction simply waits until the first one commits or rolls back.
 
-## The simplest thing that works: FOR UPDATE blocks
+## The simplest thing that works
 
 ```bit
-import {
-  Data,
-  LockCause,
-  LockError,
-  LockOpts,
-  LockedQuery,
-  MysqlVersion,
-  Query,
-  ServerDialect,
-  find,
-  forUpdate,
-} from "orm"
-import { AttrDesc, FieldDesc, Pool, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
+import { Db, open } from "orm"
 
-@table class Job {
+@table class Article {
   id: i64,
-  state: string,
+  title: string,
+  status: string,
 }
 
-fn jobMapper(rows: Rows): Job! {
-  let cols = rows.columns()
-  return Job{ id = sqlReqInt(rows, cols, "id")?, state = sqlReqText(rows, cols, "state")? }
-}
-
-fn pendingJobs(db: Data): Query<Job> {
-  let fields = Job{ id = 0, state = "" }.tableDescriptor()
-  return find<Job>(db, "jobs", fields, jobMapper).where("state", Value.Text("pending"))
-}
-
-fn claimOneJob(db: Data): Option<Job>! {
-  let job = pendingJobs(db).limit(1).forUpdate(LockOpts{}, ServerDialect.Postgres).one()?
-  match (job) {
-    Some(j) => {
-      db.exec(
-        "update jobs set state = $1 where id = $2",
-        [Value.Text("processing"), Value.Int(j.id)],
-      )?
-      return Option.Some(j)
-    }
-    None => return Option.None
-  }
-}
-
-fn runClaimOneJob(p: Pool): Option<Job>! {
-  return p.txValue<Option<Job>>((db) => {
-    return claimOneJob(db)?
+fn approve(db: Db, id: i64): ()! {
+  db.tx((tx) => {
+    let articles = tx.table<Article>()
+    let a = articles.lock().find(id)? // held until this closure returns
+    a.status = "approved"
+    articles.update(a)?
   })?
 }
 ```
 
-`Query<T>.forUpdate(opts, dialect)` continues the chain you're already
-building with `find`/`where`/`limit` - `pendingJobs(db).limit(1)` above -
-and returns a `LockedQuery<T>` whose terminals (`all`/`one`/`oneOrFail`)
-run the same SQL with a lock clause appended. `dialect` is required and
-explicit - see "SKIP LOCKED and NOWAIT need MySQL 8.0" below for what it is
-for. `LockOpts{}` is plain `FOR UPDATE`: it **blocks** until whichever
-transaction currently holds the row commits or rolls back. Two workers both
-calling `claimOneJob` at once do not both get job 42 - the second one's
-`forUpdate(...).one()` simply waits its turn.
+`lock()` only exists on `tx.table<T>()` - the repository a `db.tx((tx) =>
+{ ... })?` closure hands you, never on `db.table<T>()` itself. Try it on
+the plain one and it doesn't compile:
 
-The free function `forUpdate<T>(q, opts, dialect)` (`pkg/orm/lock.bit`)
-does the identical work - `.forUpdate(opts, dialect)` is one line
-delegating straight into it, the same way `Pool.txValue<T>` delegates into
-its own free-function twin. Reach for the free function when you already
-hold a built `Query<T>` value - passed in as a parameter, or returned by
-another function - rather than writing the chain inline: `claimUpTo` below
-wraps `pendingJobs(db).limit(n)` with the free function for exactly that
-reason.
-
-Holding the lock is not the same as claiming the job. `claimOneJob` also
-writes `state = 'processing'` before it commits, inside the same
-transaction the lock is held in (`runClaimOneJob`'s `p.txValue`) - that
-write is what stops the second worker from matching the row again once its
-own `SELECT ... FOR UPDATE` finally runs. `forUpdate` alone, with nothing
-written back before commit, only delays the second worker; it does not
-prevent it from claiming the same row a moment later.
-
-## Never block: SKIP LOCKED for a queue
-
-A worker that wants to claim several jobs at once does not want to sit
-behind whatever another worker is already holding - it wants everything
-free, right now:
-
-```bit
-fn claimUpTo(db: Data, n: int): LockedQuery<Job> {
-  return forUpdate<Job>(
-    pendingJobs(db).limit(n), LockOpts{ skipLocked = true }, ServerDialect.Postgres,
-  )
-}
-
-fn claimBatch(db: Data, n: int): []Job! {
-  let jobs = claimUpTo(db, n).all()?
-  for j of jobs {
-    db.exec(
-      "update jobs set state = $1 where id = $2",
-      [Value.Text("processing"), Value.Int(j.id)],
-    )?
-  }
-  return jobs
-}
-
-fn runClaimBatch(p: Pool, n: int): []Job! {
-  return p.txValue<[]Job>((db) => {
-    return claimBatch(db, n)?
-  })?
-}
+```text
+error: 'Repo<Article>' has no method 'lock'
 ```
 
-`LockOpts{ skipLocked = true }` **never blocks**. It quietly leaves out any
-row another transaction already has locked and returns the rest
-immediately. Call `runClaimBatch(p, 10)` while other workers together hold
-seven of the ten matching rows, and it returns three `Job` records - not
-ten, and not an error. That is correct, not a bug: `SKIP LOCKED` answers
-"give me whatever is free right now," and three free rows is a true answer
-to that question. A worker's poll loop calls `runClaimBatch(p, 10)` on a
-timer and processes however many jobs come back, including zero.
+That's on purpose: `SELECT ... FOR UPDATE` run outside a transaction takes
+its lock and releases it at the end of that one statement, protecting
+nothing - the mistake is caught before your program runs, not after a
+customer reports two conflicting edits both "succeeded."
 
-That same behavior is exactly wrong for code that needs to see every
-matching row - a report counting pending jobs, say. `SKIP LOCKED` would
-make it silently undercount, omitting whatever another transaction happens
-to be holding at that instant with no indication anything was left out.
-Reach for `LockOpts{}` (blocks) or no lock at all when you need every row;
-reach for `skipLocked: true` only when "whatever is currently free" is the
-right answer to your question, the way it is for a queue worker claiming
-work.
+## Claiming a row without waiting for it
 
-## The sharp edges
-
-### Refused outside a transaction
+`lock()` takes a `LockMode`. The default, `LockMode.Update`, is what
+`approve` above used - it blocks until the row is free. Sometimes blocking
+is the wrong answer: a deploy restarts every instance of a scheduled job at
+once, and each one calls the same function at the same moment. Only one
+should actually run it; the rest should back off immediately, not queue up
+behind a lock that's about to be held for a while. `LockMode.SkipLocked`
+does that - `find` simply fails, right away, if the row is already locked:
 
 ```bit
-fn claimOneJobFromPool(p: Pool): Option<Job>! {
-  return claimOneJob(p) catch e {
-    let (le, ok) = e.(LockError)
-    if (ok && le.cause == LockCause.NotInTransaction) {
-      fail newError("claimOneJob must run inside p.tx(...) or p.txValue<T>(...), never called with the pool directly")
+import { LockMode } from "orm"
+
+@table class DigestRun {
+  id: i64,
+  runDate: string,
+  status: string,
+}
+
+fn tryClaimDigest(db: Db, id: i64): bool! {
+  let claimed = false
+  db.tx((tx) => {
+    let runs = tx.table<DigestRun>()
+    let row = runs.lock(LockMode.SkipLocked).find(id) catch _ {
+      return
     }
-    fail e
-  }
+    row.status = "running"
+    runs.update(row)?
+    claimed = true
+  })?
+  return claimed
 }
 ```
 
-`claimOneJob(p)` above - `p` a `Pool`, not a `Tx` - fails before any SQL
-reaches the driver:
+`LockedRepo<T>` (what `lock()` returns) only has `find(id)` - a locked read
+is always "the one row I'm about to change," never an unbounded scan, so
+there is no `all()` to reach for by mistake; you still need the row's id
+from somewhere (a known constant here, a foreign key, an earlier unlocked
+read elsewhere).
 
-```text
-pkg/orm: forUpdate requires a live transaction (Tx), not a Pool - SELECT ... FOR UPDATE issued on a Pool takes the lock and releases it at the end of that one statement, protecting nothing; wrap the call in db.tx((db) => { ... })
-```
+`LockMode.NoWait` behaves the same way as `SkipLocked` from the caller's
+side - `find` fails instead of blocking - but tells you *why* through the
+error rather than silently treating "locked" the same as "missing."
 
-The reason is not a rule for its own sake. `SELECT ... FOR UPDATE` issued
-straight against a `Pool` takes its lock and releases it again at the end
-of that one statement - the query still returns the right row, so it looks
-like it worked. Two workers doing exactly that at the same moment both
-"win" the same job, and nothing about the value either of them gets back
-says so. `forUpdate` checks this before building any SQL at all: the
-`LockError` above carries `cause: LockCause.NotInTransaction`, and zero
-statements are sent to the database, so there is nothing to undo.
-
-### count() and exists() refuse
+## The real use case: exactly-once on a deploy that restarts everything
 
 ```bit
-fn pendingCountLocked(db: Data): i64! {
-  return forUpdate<Job>(pendingJobs(db), LockOpts{}, ServerDialect.Postgres).count()?
-}
-
-fn pendingCount(db: Data): i64! {
-  return pendingJobs(db).count()?
-}
-```
-
-`pendingCountLocked` always fails:
-
-```text
-pkg/orm: forUpdate cannot be combined with 'count()' - a row lock is meaningless without a row to lock
-```
-
-`exists()` refuses the same way, naming itself instead of `count()`. A row
-lock has nothing to hold when the result is a number or a boolean, not a
-row - there is no row identity to keep another transaction away from.
-Count or check existence on the plain, unlocked query instead, the way
-`pendingCount` above does; reach for `forUpdate` only on the terminals that
-actually return rows (`all`/`one`/`oneOrFail`).
-
-`LockOpts{ skipLocked = true, nowait = true }` together are refused too
-(`LockCause.ConflictingOptions`) - `skipLocked` returns fewer rows without
-waiting, `nowait` fails immediately instead of waiting, and a caller has to
-pick one answer to "what happens when the row is already locked," not both.
-
-### SKIP LOCKED and NOWAIT need MySQL 8.0
-
-Nothing reaching `Data` carries a server version, by design (`Data`
-stays a bare alias to `Executor`, never a wrapper this package would have to
-populate), so `forUpdate`'s third argument, `dialect: ServerDialect`, is how
-you supply it - `ServerDialect.Postgres` (every example above uses this;
-`lockClause` alone is already correct for Postgres), `ServerDialect.
-Mysql(version)` for anything targeting MySQL. There is no third option that
-skips stating a MySQL version: an earlier shape had a `Neutral` tag that also
-covered MySQL 8.0+ with no version check, and it is gone, not renamed - a
-caller targeting MySQL states its real version on every call, every time,
-and `LockedQuery`'s own `guard()` checks `version` before building any SQL,
-the same "zero statements issued on a refusal" guarantee the transaction
-check above gives:
-
-```bit
-fn claimBatchOnMysql(db: Data, n: int, version: MysqlVersion): []Job! {
-  let jobs = forUpdate<Job>(
-    pendingJobs(db).limit(n),
-    LockOpts{ skipLocked = true },
-    ServerDialect.Mysql(version),
-  ).all()?
-  for j of jobs {
-    db.exec(
-      "update jobs set state = $1 where id = $2",
-      [Value.Text("processing"), Value.Int(j.id)],
-    )?
+fn runDigestOnce(db: Db, id: i64): ()! {
+  if (tryClaimDigest(db, id)?) {
+    // this instance won the claim - send the digest here
   }
-  return jobs
+  // every other instance's tryClaimDigest returned false, immediately
 }
 ```
 
-Called with `MysqlVersion{ major = 5, minor = 7 }`, this fails before any SQL
-reaches the driver:
+Every worker calls `runDigestOnce` with the same `id` within the same
+window after a deploy. The first one to reach `lock()` gets `true` and
+sends the digest; every other one gets `false` back in milliseconds
+instead of blocking for however long the winner's transaction takes -
+`SkipLocked` is what makes "false" come back fast rather than eventually.
 
-```text
-pkg/orm: MySQL 5.7 does not support FOR UPDATE SKIP LOCKED (added in MySQL 8.0); omit skipLocked or upgrade the server
-```
+## Sharp edge: a lock outlives the row it was taken for
 
-This is a behavior change from an earlier version of `forUpdate`:
-that version let a MySQL caller pass a dialect tag that meant "trust me,
-this server is 8.0 or newer" and skipped the check entirely - asserting a
-fact about the server with no evidence behind it. That tag is gone.
-Every MySQL call states its real version now, checked on every `forUpdate`,
-not just remembered once and trusted forever - a caller who was relying on
-the old bypass now supplies a `MysqlVersion` (typically read from the
-driver's own connection info at startup, not hand-typed per call) instead
-of asserting one. Postgres has no version gate to check either way, so it
-always passes the plain `ServerDialect.Postgres` tag, with nothing to get
-wrong.
+If the transaction rolls back (the closure returns an error, or panics),
+the lock releases and nothing was written - the next reader sees the row
+exactly as it was, never a half-applied change. There is no explicit
+"unlock": committing or failing the transaction is the only way a
+`lock()`'d row's hold ends.
 
-## When not to use this
+## When not to reach for this
 
-Not for a query that has to see every matching row - a report, an
-export, anything counting or listing without intending to change what it
-reads. `skipLocked: true` is silently wrong there: it would leave out rows
-another transaction is holding with no sign anything was skipped. Use a
-plain, unlocked `Query<T>` for those, or `LockOpts{}` if you genuinely need
-to block until the data is stable.
-
-Not for `count()`/`exists()` - they refuse outright; see "The sharp edges"
-above for what to call instead.
-
-Not outside a transaction. `forUpdate` refuses rather than running a
-statement that would look like it worked while protecting nothing - see
-"Refused outside a transaction" above.
+A row two people might both edit, but rarely at the exact same moment,
+often reads better with the optimistic `@version` check in
+[Write](write.md) instead: no transaction held open while a user is
+thinking, just a write that fails if someone else got there first. Reach
+for `lock()` when the wait itself is correct - a queue worker, a balance
+transfer, a batch job - not as the default for every update.
 
 ## Where to go next
 
-[Query](query.md) covers the `find`/`where`/`limit` chain `forUpdate` wraps.
-[Data](data.md) covers `Pool.tx`/`Pool.txValue<T>` and why the closure
-parameter should shadow the outer handle. [MySQL](mysql.md) covers the
-other places Postgres and MySQL diverge, including the version gate
-`ServerDialect.Mysql(version)` closes here.
+[Query](query.md) covers the `where`/`orderBy`/`limit` chain `lock()`
+builds on. [Write](write.md) covers `@version`, the optimistic alternative
+to locking a row at all.

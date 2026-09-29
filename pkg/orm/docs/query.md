@@ -1,181 +1,118 @@
 # Query
 
-A page's list view runs a `SELECT` with a `WHERE` on user input, an
-`ORDER BY` the request picked, and a `LIMIT`/`OFFSET` for pagination -
-five moving parts, and every one of them is a place a hand-built SQL
-string can go wrong. `find` builds that same query as a chain instead: the
-column names are checked against the class you are mapping into, and every
+A page's article list runs a `SELECT` with a `WHERE` on user input, an
+`ORDER BY` the request picked, and a `LIMIT`/`OFFSET` for pagination - five
+moving parts, and every one of them is a place a hand-built SQL string can
+go wrong. `db.table<T>()` builds that same query as a chain instead: the
+column names are checked against your class at compile time, and every
 value you pass reaches the database as a bound argument, never pasted into
 the SQL text.
 
-## Build and run a query
+## The simplest query
 
 ```bit
-import { Data, Dir, Query, find } from "orm"
-import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
+import { Db, open } from "orm"
 
-@table class Person {
+@table class Article {
   id: i64,
-  name: string,
-  email: string,
-  joinedAt: i64,
+  title: string,
+  authorId: i64,
 }
 
-fn personMapper(rows: Rows): Person! {
-  let cols = rows.columns()
-  return Person{
-    id = sqlReqInt(rows, cols, "id")?,
-    name = sqlReqText(rows, cols, "name")?,
-    email = sqlReqText(rows, cols, "email")?,
-    joinedAt = sqlReqInt(rows, cols, "joined_at")?,
-  }
-}
-
-fn people(db: Data): Query<Person> {
-  let fields = Person{ id = 0, name = "", email = "", joinedAt = 0 }.tableDescriptor()
-  return find<Person>(db, "people", fields, personMapper)
-}
-
-fn byEmail(db: Data, email: string): []Person! {
-  return people(db).where("email", Value.Text(email)).all()?
+fn byId(db: Db, id: i64): Article! {
+  return db.table<Article>().find(id)?
 }
 ```
 
-`people(db)` is the one place `Person`'s shape is spelled out: its
-`tableDescriptor()` (the class's own synthesized field list, [Naming](naming.md))
-and `personMapper` (an ordinary `(Rows) => Person!` closure - see "Why
-`find` takes four arguments", below). Every other function in this file
-calls `people(db)` and chains onto it.
-
-`where("email", Value.Text(email))` takes the Bit FIELD name, `email`, not
-a SQL column - `find`'s own class knows how to turn one into the other.
-`byEmail`'s only email-shaped input, the `Value.Text(email)` argument,
-never touches the SQL text: `all()` runs `select * from people where
-email = $1`, with `email` bound as the query's own first parameter.
+`db.table<Article>()` returns a repository over the `article` table - no
+table name, field list or row mapper to write; `@table` supplies all three.
+Every method below hangs off that one repository.
 
 ## Growing the chain
 
-`where`/`whereIn`/`whereNull`/`whereLike`/`orderBy` all take a Bit field
-name first. `limit`/`offset` take a plain count. Every one but the
-terminals returns the same builder, so they chain:
-
 ```bit
-fn recentJoiners(db: Data, minId: i64): []Person! {
-  let q = people(db).where("id", Value.Int(minId))
-  q = q.orderBy("joinedAt", Dir.Desc)
-  q = q.limit(20)
-  q = q.offset(0)
-  return q.all()?
+import { Dir } from "orm"
+
+fn byAuthor(db: Db, authorId: i64): []Article! {
+  return db.table<Article>().where("authorId", authorId).orderBy("title").all()?
 }
 
-fn byEmails(db: Data, emails: []string): []Person! {
-  let vals = []Value(0)
-  for e of emails {
-    vals = append(vals, Value.Text(e))
+fn recent(db: Db, authorId: i64): []Article! {
+  return db.table<Article>().where("authorId", authorId).orderBy("id", Dir.Desc).limit(20).all()?
+}
+```
+
+`where`/`orderBy` take the Bit FIELD name (`authorId`), not the SQL column
+(`author_id`) - the class itself knows how to turn one into the other (see
+[Naming](naming.md)). `orderBy`'s second argument is optional and defaults
+to `Dir.Asc`; pass `Dir.Desc` for the other direction. `where`, `orderBy`,
+`limit` and `offset` all return the same builder, so they chain, and each
+one is a plain value: an optional filter is an `if`, not string surgery.
+
+```bit
+fn filtered(db: Db, authorId: i64, term: Option<string>): []Article! {
+  let q = db.table<Article>().where("authorId", authorId)
+  match (term) {
+    Some(t) => return q.where("title", t).all()?
+    None => return q.all()?
   }
-  return people(db).whereIn("email", vals).all()?
-}
-
-fn withoutName(db: Data): []Person! {
-  return people(db).whereNull("name").all()?
 }
 ```
 
-`whereIn` binds one placeholder per value (`in ($1, $2, $3)`, never a
-single string built from `join`), and an empty list matches nothing rather
-than emitting `in ()`, which several dialects refuse to parse at all.
+## Paging through a large table with `after`
 
-A `Query<T>` is a normal value, so an optional filter is an `if`, not
-string surgery:
+`limit`/`offset` gets slower the deeper you page, because the database
+still has to count past every skipped row. `after` pages by the last key
+you saw instead - a `WHERE id > $1` under the hood, the same cost on page 1
+and page 1,000:
 
 ```bit
-fn optionalFilter(db: Data, term: string): []Person! {
-  let q = people(db).where("id", Value.Int(1))
-  if (len(term) > 0) {
-    q = q.whereLike("name", Value.Text("%${term}%"))
-  }
-  return q.limit(50).all()?
+fn nextPage(db: Db, lastId: i64): []Article! {
+  return db.table<Article>().orderBy("id").after(lastId)?.limit(20).all()?
 }
 ```
 
-`q` still names the same builder after the `if`; whichever branch ran, the
-predicate it added is in the SQL the final `.all()` sends.
+Call it with the id of the last row from the previous page (or skip it for
+page one). `after` needs `orderBy` on the same column somewhere in the
+chain, which is why it returns a failure (`?`) instead of a plain value -
+it fails naming the mistake if the two disagree.
 
-## The five terminals
+## The terminals
 
-`all`/`one`/`oneOrFail`/`count`/`exists` are the only calls that actually
-run a query - everything before them only builds SQL text and a bound
-argument list in memory.
+`all`/`first`/`find` are what actually run a query - everything before
+them only builds SQL text and a bound argument list in memory.
 
 ```bit
-fn firstOrNone(db: Data, email: string): Option<Person>! {
-  return people(db).where("email", Value.Text(email)).one()?
-}
-
-fn exactlyOne(db: Data, email: string): Person! {
-  return people(db).where("email", Value.Text(email)).oneOrFail()?
-}
-
-fn howMany(db: Data): i64! {
-  return people(db).where("name", Value.Text("")).count()?
-}
-
-fn anyAt(db: Data, email: string): bool! {
-  return people(db).where("email", Value.Text(email)).exists()?
+fn newest(db: Db, authorId: i64): Option<Article>! {
+  return db.table<Article>().where("authorId", authorId).orderBy("id", Dir.Desc).first()?
 }
 ```
 
-`one`/`oneOrFail` always carry a `LIMIT` - at least 2, even when you never
-called `.limit(...)` yourself - so a query that unexpectedly matches two
-rows is caught and reported, never silently answered with whichever row
-came back first. `one` returns `Option<Person>` (`None` for zero rows,
-never an error); `oneOrFail` errors on zero rows too, for the call sites
-where an absent row is a bug, not a normal outcome. `count` runs `select
-count(*)`; `exists` runs `select 1 ... limit 1`, the cheapest query that
-can answer yes or no.
+`all` returns every matching row. `first` returns `Option<Article>` - `None`
+for zero rows, never an error. `find(id)` is the shortest path to exactly
+one row by its primary key, and fails naming the table if no row (or more
+than one, which should never happen on a primary key) matches.
 
 ## The column check runs before your program does
 
-```bit
-fn typo(db: Data): []Person! {
-  return people(db).where("emial", Value.Text("x")).all()?
-}
+```text
+db.table<Article>().where("titel", "x")
 ```
 
+```text
+error[E0163]: 'titel' is not a field of 'Article'
 ```
-error[E0163]: 'emial' is not a field of 'Person'
-```
 
-The compiler checks a string-literal column directly
-chained off `find<T>(...)` against `T`'s own declared fields, at compile
-time - the mistake people actually make, caught before the program runs at
-all. A column built from something other than a literal (read from a
-config file, chosen by a caller) still compiles; `Query`'s own runtime
-`columnFor` checks it the same way, one step later, and panics naming the
-field and the class if it is wrong. Either way, no column name - checked
-here or not - reaches SQL text unless it named a real field first.
-
-## Why `find` takes four arguments
-
-`db.find<Person>()` - no `table`, `fields` or mapper - is the shape you
-would expect, and it is not what this package can do today. `find<T>`'s
-generic sibling in `std/sql` (`stdlib/sql/row.bit`) gets its own per-class
-mapper from a COMPILER REWRITE that only fires when `<T>` is written
-literally at the exact call it rewrites; `Query<T>.all()`/`.one()`/
-`.oneOrFail()` are ordinary methods, so by the time they run, `T` is
-`Query`'s own type parameter, not a class name any such rewrite can see.
-Reusing that machinery for this package's own `find<T>` needs a second
-compiler pass shaped the same way, which is real, buildable work not
-attempted yet - `pkg/orm/query.bit`'s own header names the exact functions
-it would reuse. Until then, `people(db)` above is the pattern: write the
-`table`/`fields`/`mapper` once per entity, and every other function in
-your program calls that one function instead of `find` directly.
+The compiler checks a string-literal column passed to `where`/`orderBy`
+against `Article`'s own declared fields, at compile time - the typo is
+caught before the program runs at all, not after it ships a broken filter.
 
 ## Where to go next
 
-[Naming](naming.md) covers `tableDescriptor()` and how a field name becomes
-the column text `where`/`orderBy` bind against. [Data](data.md) covers the
-`Data` interface every function on this page takes, and why it is not
-`Pool` directly. [Raw SQL and dynamic columns](raw.md) covers `whereRaw`,
-`orderByRaw` and `orderByField` - a SQL fragment this file's builder has
-no shape for, and a column name from outside your own source.
+[Write](write.md) covers `insert`/`update`/`delete` and bulk writes on the
+same repository. [Relations](relation.md) covers `with`, `@hasMany`,
+`@belongsTo` and many-to-many `link`/`unlink`. [Soft delete](softdelete.md)
+covers what `all`/`find` hide by default on a `@softDelete` class.
+[Locking](locking.md) covers `tx.table<T>().lock()` for a row you're about
+to change inside a transaction. [Naming](naming.md) covers how a field name
+becomes the column text `where`/`orderBy` bind against.

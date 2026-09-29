@@ -1,213 +1,151 @@
 # Write
 
-"If I have a `Person` instance, whether I just built it or it came back
-from a query, saving it should just work" - that's the whole shape of this
-page. No `create` for a new row and a different `update` for an existing
-one. One `save`, and it picks the right SQL statement on its own.
+"If I have an `Article`, whether I just built it or it came back from a
+query, saving it should just work" - that's the whole shape of this page.
+`insert` for a new row, `update` for one you already have, and no manual
+row mapper or `map<string, Value>` in between.
 
-## The simplest save
-
-`save` needs to know one thing about your class that [Query](query.md)
-never did: which column is the primary key, so an `UPDATE` can find the
-row again. Mark it with `@id`.
+## Insert and update
 
 ```bit
-import { Data, TableDesc, save } from "orm"
-import { AttrDesc, FieldDesc, Value } from "std/sql"
+import { Db, open } from "orm"
 
-@table class Person {
-  @id
-  id: i64
-  name: string
-  email: string
+@table class Article {
+  id: i64,
+  title: string,
+  body: string,
+  authorId: i64,
 }
 
-fn personDesc(): TableDesc {
-  return TableDesc{
-    table = "people",
-    fields = Person{ id = 0, name = "", email = "" }.tableDescriptor(),
-    classAttrs = []AttrDesc(0),
-  }
+fn publish(db: Db, authorId: i64, title: string, body: string): Article! {
+  return db.table<Article>().insert(
+    Article{ id = 0, title = title, body = body, authorId = authorId },
+  )?
 }
 
-fn personValues(p: Person): map<string, Value> {
-  return map<string, Value>{
-    "id": Value.Int(p.id),
-    "name": Value.Text(p.name),
-    "email": Value.Text(p.email),
-  }
-}
-
-fn savePerson(db: Data, p: Person): Person! {
-  let result = save(db, personDesc(), personValues(p), p.isPersisted())?
-  if (result.inserted) {
-    let (id, ok) = result.generated["id"]
-    if (ok) {
-      p.id = intValue(id)
-    }
-  }
-  p.markPersisted(true)
-  return p
-}
-
-fn intValue(v: Value): i64 {
-  match (v) {
-    Int(n) => return n
-    _ => return 0
-  }
-}
-
-fn createPerson(db: Data, name: string, email: string): Person! {
-  let p = Person{ id = 0, name = name, email = email }
-  return savePerson(db, p)?
+fn rename(db: Db, article: Article, newTitle: string): Article! {
+  article.title = newTitle
+  db.table<Article>().update(article)?
+  return article
 }
 ```
 
-`Person{ id = 0, name = name, email = email }` is a composite literal, so
-`p.isPersisted()` reads `false` and `save` emits `insert into people (name,
-email) values ($1, $2) returning *`. `id` is never in that column list:
-`t.id("id")` ([Schema](schema.md)) is an auto-incrementing primary key -
-`GENERATED ALWAYS AS IDENTITY` on Postgres, `AUTO_INCREMENT` on MySQL - and
-a generated-always column refuses a client-supplied INSERT value outright.
-Postgres hands the row it actually wrote back through `RETURNING`, and
-`result.generated["id"]` is how `createPerson` learns the real,
-database-assigned id: a brand-new `Person` starts with `id: 0`, and `0` is
-never what ends up in the `people` table. `personValues(p)` still supplies
-`"id"` in its map - `save` reads it back for `UPDATE`'s and `delete`'s own
-`WHERE`, just never for an `INSERT`'s column list.
+`insert` returns the row the database actually wrote, `id` filled in - the
+value you passed for `id` is never sent; `@table` excludes the primary key
+from the `INSERT` column list and reads it back from what the database
+generated. `update` takes the whole row and writes every column back by
+its primary key; there is no separate "patch just this field" call - build
+the value you want, then `update` it.
 
-`personDesc()` and `personValues(p)` are the one place `Person`'s shape is
-spelled out - `save`/`delete`/`upsert` never read a field off `Person`
-themselves, because `isPersisted`/`markPersisted`/`tableDescriptor` only
-resolve on a concrete class, not on a type parameter (see "Why this isn't
-generic", below). Every other function on this page calls `personDesc()`
-and `personValues()` instead of rebuilding them.
-
-## Saving a loaded row updates it
+## Deleting
 
 ```bit
-fn renamePerson(db: Data, p: Person, newName: string): Person! {
-  p.name = newName
-  return savePerson(db, p)?
+fn unpublish(db: Db, id: i64): ()! {
+  db.table<Article>().delete(id)?
 }
 ```
 
-A `Person` `find`/`findOneOrFail` (see [Query](query.md)) handed back reads
-`p.isPersisted() == true` already - the row mapper set that flag at
-hydration. `savePerson` doesn't ask which case it is: `save` reads
-`p.isPersisted()` itself and emits `update people set name = $1, email =
-$2 where id = $3`, never inspecting `p.id`'s value to decide. `id` is
-excluded from `SET` the same way it is from `INSERT`'s column list - a
-generated-always identity column refuses an explicit `UPDATE` too - but it
-still names the row through `WHERE`. That `isPersisted()`, not `p.id`'s
-value, decides INSERT vs UPDATE also matters because an application-
-assigned key, or a UUID generated before the first save, is already
-non-zero on a row that has never touched the database - `id == 0` would be
-the wrong test.
+`delete` takes the id, not the row. On a plain `@table` class this is a
+real `DELETE`; add `@softDelete` and it hides the row instead, without
+changing a single call site - see [Soft delete](softdelete.md).
 
 ## The sharp edge: an UPDATE matching no row is an error
 
-If another request already deleted `p`'s row, `renamePerson`'s `UPDATE`
-matches zero rows - and `save` does not treat that as success:
-
-```text
-pkg/orm: update matched 0 rows in the class mapped to 'people' with key 42
+```bit
+fn renameSafely(db: Db, article: Article, newTitle: string): Article! {
+  article.title = newTitle
+  db.table<Article>().update(article) catch e {
+    fail newError("could not rename: ${e.message()}")
+  }
+  return article
+}
 ```
 
-A silent no-op here is the actual bug this catches: your process is still
-holding a `Person` that no longer exists in the database, and without this
-error the row would simply, invisibly, not update. Catch it the way any
-other `error` is caught:
+If another request already deleted `article`'s row, the `UPDATE` matches
+zero rows, and `update` treats that as failure rather than a silent no-op -
+your process was holding a row that no longer exists, and without this
+error the rename would simply, invisibly, not happen.
+
+## Bulk writes: many rows in one round trip
 
 ```bit
-fn renameSafely(db: Data, p: Person, newName: string): Person! {
-  p.name = newName
-  return savePerson(db, p) catch e {
-    fail newError("could not rename: ${e.message()}")
+fn publishAll(db: Db, drafts: []Article): []Article! {
+  return db.table<Article>().insertAll(drafts)?
+}
+
+fn renameDraftsBy(db: Db, authorId: i64, prefix: string): int! {
+  return db.table<Article>().where("authorId", authorId).set("title", prefix).updateAll()?
+}
+
+fn deleteDraftsBy(db: Db, authorId: i64): int! {
+  return db.table<Article>().where("authorId", authorId).deleteAll()?
+}
+```
+
+`insertAll` inserts every row in `drafts` and hands back the same rows with
+their generated ids filled in, the same way `insert` does for one.
+`updateAll`/`deleteAll` run one `UPDATE`/`DELETE` over every row the chain
+in front of them matches - `where(...)` narrows which rows, `set(column,
+value)` (repeatable, one call per column) says what `updateAll` writes, and
+both return the number of rows affected. Neither loads a row into memory
+first: an unfiltered `db.table<Article>().deleteAll()` matches, and
+deletes, the whole table - `where` is what keeps a bulk write scoped to the
+rows you mean.
+
+## A `@version` column catches a lost update without locking anything
+
+Two editors load the same article, both change different fields, and both
+save a few seconds apart - the second `update` silently overwrites the
+first editor's change, because neither one knew the other existed. Add
+`@version`, and the second save fails instead:
+
+```bit
+@table class Draft {
+  id: i64
+  title: string
+  @version
+  version: i64
+}
+
+fn editDraft(db: Db, draft: Draft, newTitle: string): ()! {
+  draft.title = newTitle
+  db.table<Draft>().update(draft)?
+}
+```
+
+Every `update` on a `@version` class adds `and version = <the value you
+read>` to the `WHERE` and bumps the column by one. If someone else already
+saved (and so already bumped the version), that `WHERE` matches zero rows,
+and `update` fails with a `StaleWriteError` instead of the generic
+zero-rows error above - carrying `oldVersion` (the version you read) and
+`newVersion` (the version you tried to write, `oldVersion + 1`), so the
+caller can tell "someone deleted this row" and "someone edited it since I
+read it" apart:
+
+```bit
+import { StaleWriteError } from "orm"
+
+fn editSafely(db: Db, draft: Draft, newTitle: string): ()! {
+  draft.title = newTitle
+  db.table<Draft>().update(draft) catch e {
+    let (stale, ok) = e.(StaleWriteError)
+    if (ok) {
+      fail newError("this article changed since you loaded it (had version ${stale.oldVersion})")
+    }
+    fail e
   }
 }
 ```
 
-## Deleting, and re-saving a deleted entity
-
-```bit
-import { delete } from "orm"
-
-fn removePerson(db: Data, p: Person): ()! {
-  delete(db, personDesc(), personValues(p))?
-  p.markPersisted(false)
-}
-```
-
-`delete` runs `DELETE FROM people WHERE id = $1` by the same primary key
-`save`'s `UPDATE` uses. `p.markPersisted(false)` afterward is what makes
-`savePerson(db, p)` on the same, now-deleted `p` emit an `INSERT` instead
-of an `UPDATE` that would match nothing - the exact case the section above
-catches, avoided here on purpose.
-
-## upsert - insert or update in one statement, with two real limits
-
-```bit
-import { ServerDialect, upsert } from "orm"
-
-fn upsertPersonByEmail(db: Data, p: Person): ()! {
-  upsert(db, personDesc(), personValues(p), ServerDialect.Postgres, on = "email")?
-}
-```
-
-This is `INSERT INTO people (...) VALUES (...) ON CONFLICT (email) DO
-UPDATE SET ...` on Postgres, `ON DUPLICATE KEY UPDATE` on MySQL
-(`ServerDialect.Mysql(version)`) - the statement CSV imports and sync jobs
-actually want: one round trip, no "does this email already exist" query
-first. `on` names a unique or primary-key column; the Bit field name,
-translated the same way `where`'s column names are, never a raw SQL
-identifier. Omit it and `upsert` uses the primary key.
-
-A MySQL call here has to supply a `MysqlVersion` on `ServerDialect.Mysql`
-that `upsert` never reads - `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE` is a
-syntax choice, not a version-gated one. `ServerDialect` is the one
-type every dialect-sensitive function in this package takes now, replacing
-an earlier, narrower `UpsertDialect` that existed only for `upsert`; the
-version-carrying shape came from [Locking](locking.md)'s `forUpdate`, which
-does need a real MySQL version to gate `SKIP LOCKED`/`NOWAIT`. `Dialect`
-(the schema-rendering interface, [Dialect](dialect.md)) is a different type
-for a different question - "how do I render a migration's DDL," not "which
-server am I talking to."
-
-**`upsert` is never what `save` does by default, for two reasons that
-matter in production:**
-
-- **It cannot version-check.** There is no "which statement ran" for an
-  optimistic-locking compare to gate on, because Postgres and MySQL both
-  decide insert-or-update *inside* the one statement.
-- **It can resurrect a row `delete` removed.** Insert-or-update means
-  exactly that - a deleted row's email arriving again brings the row back,
-  silently. `save` never does this; `upsert` always can.
-
-Reach for it when you mean "this row should exist with these values,
-whether or not it already did" - not as a faster `save`.
-
-## Why this isn't generic
-
-`save`/`delete`/`upsert` take a `TableDesc` (table name plus field list)
-and a `map<string, Value>` of the entity's current column values, rather
-than a `Person` directly the way you might expect from a language with
-generics. `isPersisted()`/`markPersisted()`/`tableDescriptor()` only
-resolve on a concrete `@table` class - inside a function generic over an
-unconstrained `T`, the compiler cannot yet tell whether `T` carries them,
-so the call is rejected as an unknown member. Until that changes,
-`personDesc()`/`personValues()`/`savePerson()` above are the pattern:
-write them once per entity, the same way [Query](query.md)'s `people(db)`
-wraps `find<T>`.
-
-`values` is keyed by Bit field name on purpose, not a positional list -
-`save`/`delete`/`upsert` look up each column by name and panic naming the
-field and the table if one is missing, so a field added to `Person` without
-a matching entry in `personValues` fails loudly the first time it runs,
-rather than quietly inserting the wrong value into the wrong column.
+No transaction, no row lock held while an editor is thinking - `@version`
+only checks at the moment of the write. When the wait itself needs to be
+correct instead (a queue worker claiming a row, a balance transfer), reach
+for [Locking](locking.md) instead.
 
 ## Where to go next
 
-[Query](query.md) covers reading rows back with `find`. [Naming](naming.md)
-covers how `Person`'s field names become `people`'s column names.
-[Schema](schema.md) covers declaring the `people` table itself.
+[Query](query.md) covers reading rows back with `find`/`where`/`all`.
+[Relations](relation.md) covers `link`/`unlink` for many-to-many columns.
+[Soft delete](softdelete.md) covers `@softDelete`, `withDeleted`, `restore`
+and `forceDelete`. [Locking](locking.md) covers `tx.table<T>().lock()` for
+a row you're about to change inside a transaction.

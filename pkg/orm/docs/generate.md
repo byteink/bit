@@ -41,7 +41,7 @@ exactly the two members `TableEntity` asks for (`tableDescriptor()` and
 
 `ServerDialect.Postgres` names which server `db` is - `generate` never
 asks the live connection what it is (see [Dialect](dialect.md) for why),
-so you supply it explicitly the same way `upsert` and `forUpdate` already
+so you supply it explicitly the same way `upsert` and `lock()` already
 ask. Most of what `generate` writes doesn't care, but one finding does: an
 enum column's drifted CHECK constraint (below) renders one engine's own
 SQL keyword, and `generate` has to know which.

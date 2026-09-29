@@ -197,5 +197,5 @@ do not expect `migrate up`.
 
 [Schema](schema.md) is where `SchemaOp` and its builders (`table`, `alter`,
 `drop`) come from. [Naming](naming.md) covers how a `@table` class's field
-names become the identifiers this page quotes. [Data](data.md) and
+names become the identifiers this page quotes. [Write](write.md) and
 [Write](write.md) cover running queries and writes once a table exists.

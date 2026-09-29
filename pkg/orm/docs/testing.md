@@ -118,7 +118,7 @@ the one of the two that does.
 
 ## Why `withRollback` always rolls back, even when the body succeeds
 
-[`pool.tx`](data.md) commits the moment its block returns normally, and has
+[`db.tx`](raw.md) commits the moment its block returns normally, and has
 no rollback-only mode - correct for `pool.tx`, which exists to make a write
 durable. `withRollback` needs the opposite guarantee, so it never lets the
 block return normally at all. When the body succeeds, `withRollback` ends
@@ -133,7 +133,7 @@ you find yourself wanting one, `pool.tx` is the function you actually want.
 ## The mistake `withRollback` cannot catch for you
 
 `withRollback`'s closure parameter is `db`, never `pool` - the same rule
-[Data](data.md#the-closure-parameter-shadows-the-outer-handle) states for
+[Write](write.md) states for
 `pool.tx`, and for the same reason. Nothing stops you from reaching for the
 outer `pool` inside the block instead of the `db` you were handed:
 
@@ -186,13 +186,13 @@ test again" mean something.
 
 `withRollback` is for tests, not for request handling or a background job -
 every write inside it is thrown away on purpose, which is exactly wrong for
-code that needs its writes to survive. Use [`pool.tx`](data.md) for that.
+code that needs its writes to survive. Use [`db.tx`](raw.md) for that.
 `make`/`create` are for building an entity's fields inside a test; they do
 not replace [`save`](write.md) as the real insert/update decision your
 application code makes outside a test.
 
 ## Where to go next
 
-[Data](data.md) covers `Data`, `Pool.tx` and why the closure parameter rule
+[Raw SQL and transactions](raw.md) covers `Data`, `Pool.tx` and why the closure parameter rule
 this page repeats exists in the first place. [Write](write.md) covers
 `save`, the real insert-or-update `create`'s `persist` closure usually calls.
