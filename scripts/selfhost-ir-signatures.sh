@@ -182,6 +182,27 @@
 # #6244, so it will be the first oracle that agrees with the tree on this
 # file (and any other `@json`-with-no-import file landing before then).
 #
+# #6254 (`types`, NO SEPARATE SIGNATURE — covered by jsonAttrImplicitInsert
+# above). Every `@json` class now also gains a synthesized `static
+# __collectionName(): string` (compiler/classcollectiondesc.bit),
+# unconditionally, the same "one more synthesized member on every `@json`
+# class" shape #6244's own toJson-adjacent synthesis is. Unlike #6244, #6254
+# introduces no NEW name resolution (nothing that was `<error>` before
+# resolves now), so its divergence against the 0.33.0 oracle on any EXISTING
+# `@json` corpus file is a PURE insertion — a strict subset of what
+# `jsonAttrImplicitInsert` already accepts for `kind == "types"` — and
+# `explainMismatch` tries that signature first, so it prints
+# `6244-json-attr-implicit-insert` for a #6254-caused divergence too. A
+# dedicated `6254-*` entry duplicating the identical predicate would never
+# fire (6244 always wins first) and could never be exercised by its own
+# selfcheck, so none is declared; this note is the record instead. A NEW
+# `_tests_/cases`/checkercases fixture using `@collection` itself (unknown
+# syntax to 0.33.0) declines outright on the oracle side (a checker error,
+# non-zero exit) and is counted as a legitimate SKIP by every kind's own
+# decline path (scripts/selfhost-diffdump.sh's classify_rc) — never a
+# MISMATCH, so it needs no signature either. Both retire together at the
+# 0.34.0 repin, same as #6244.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call

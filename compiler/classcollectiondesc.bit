@@ -1,0 +1,295 @@
+// compiler/classcollectiondesc.bit — `@collection("name")` on a class (SPEC
+// §10.3.1, §10.5, #6254, .claude/kb/data-packages-dx.md rule 3).
+//
+//     @json class User { name: string }               // named "user"
+//     @json @collection("sessions") class Session { userId: i64 }  // your own name
+//
+// synthesizes `static __collectionName(): string` on EVERY `@json` class,
+// unlike `@job`'s `__jobName` (only on a `@job` class) — kv's
+// `store.collection<T: Stored>()` needs a name for any `@json` class handed
+// to it, not only the ones that bothered to override one, so the default has
+// to exist for all of them. `@collection`'s own argument is OPTIONAL, unlike
+// `@job`'s required one: a job has no default dispatch name to fall back to,
+// but a collection has one — snake_case of the class name, never pluralized
+// (data-packages-dx.md rule 3: `Person -> person`, `OrderLine ->
+// order_line`, matching `pkg/orm`'s own `toSnake`, `pkg/orm/naming.bit`,
+// minus that file's pluralization, which kv's target API explicitly drops).
+
+// E0174 (§10.5): `@collection`'s own argument, when present, is not a
+// non-empty string literal — mirrors `@table`'s E0156
+// (compiler/classtabledesc.bit): a collection name is text, never a number,
+// a bool, or an empty override.
+const ecCollectionNameArgNotString = 174
+// E0175 (§10.5): a class carries `@collection` but not `@json` — mirrors
+// `@job`'s E0167 (compiler/classjobdesc.bit): `store.collection<T>()` reads
+// the name off `T.__collectionName()`, synthesized only for `@json`
+// classes, so a bare `@collection` would name a method that never exists.
+const ecCollectionRequiresJson = 175
+// E0176 (§10.5): a class declares a method named `__collectionName` —
+// mirrors `@job`'s E0168: reserved on EVERY class, `@json` or not, because
+// `store.collection<T: Stored>()` matches `interface Stored { static
+// __collectionName(): string }` by name alone.
+const ecCollectionNameDeclared = 176
+
+const classAttrCollection = "collection"
+const synthCollectionNameName = "__collectionName"
+
+// True iff the class declaration carries `@collection`. The parser has
+// already rejected every class attribute but the ones `checkClassAttrs`
+// (parserdecl.bit) names, so this only has to match by name.
+fn classHasCollection(t: Tree, source: string, structDecl: int): bool {
+  return collectionAttrOf(t, source, structDecl) != 0
+}
+
+// `@collection`'s own attribute node, or 0 when the class carries no
+// `@collection`.
+fn collectionAttrOf(t: Tree, source: string, structDecl: int): int {
+  let list = classAttrList(t, structDecl)
+  if (list == 0) {
+    return 0
+  }
+  for a of kidsOf(t, list) {
+    if (identText(t, source, kidsOf(t, a)[0]) == classAttrCollection) {
+      return a
+    }
+  }
+  return 0
+}
+
+// One `@json` class's collection name: `nameLit` is the `@collection("...")`
+// argument node to CLONE when the class wrote its own name (0 when it did
+// not); `name` is the resolved name either way — the argument's decoded
+// content, or the snake_case default computed here — since a defaulted name
+// exists nowhere in the source and has to be spliced in as a fresh word
+// (`collectionDescSynthWords`, below).
+class CollectionClass {
+  classNode: int,
+  className: int,
+  exported: bool,
+  nameLit: int,
+  name: string,
+}
+
+// Every `@json` class in the module, whether or not it also carries
+// `@collection`, already validated: a `@collection` class attribute on a
+// class without `@json`, a non-string/empty override, or a declared
+// `__collectionName` are reported and DROP that class here, the same shape
+// `collectJobClasses` takes.
+fn collectCollectionClasses(p: Project, m: SrcModule): []CollectionClass {
+  let tree = m.tree
+  let source = m.source
+  let out = []CollectionClass(0)
+  for tc of topClassDecls(tree) {
+    let d = tc.decl
+    let hasJson = classHasJson(tree, source, d)
+    if (classHasCollection(tree, source, d) && !hasJson) {
+      reportCollectionRequiresJson(p, tree, source, d)
+      continue
+    }
+    if (!hasJson) {
+      continue
+    }
+    let cc = buildCollectionClass(p, tree, source, d, tc.exported)
+    if (cc.classNode == 0) {
+      continue
+    }
+    out = append(out, cc)
+  }
+  return out
+}
+
+fn reportCollectionRequiresJson(p: Project, tree: Tree, source: string, d: int) {
+  let cname = identText(tree, source, kidsOf(tree, d)[0])
+  report(
+    p.diags, ecCollectionRequiresJson, getNode(tree, kidsOf(tree, d)[0]).span,
+    "class '${cname}' carries '@collection' but not '@json'",
+    "add '@json' — '@collection' names the method 'store.collection<T>()' reads, synthesized only for a '@json' class",
+  )
+}
+
+fn buildCollectionClass(
+  p: Project, tree: Tree, source: string, d: int, exported: bool,
+): CollectionClass {
+  let bad = CollectionClass{
+    classNode = 0,
+    className = 0,
+    exported = false,
+    nameLit = 0,
+    name = "",
+  }
+  let k = kidsOf(tree, d)
+  let cname = identText(tree, source, k[0])
+  let attr = collectionAttrOf(tree, source, d)
+  if (attr == 0) {
+    return CollectionClass{
+      classNode = d, className = k[0], exported = exported, nameLit = 0, name = snakeCase(cname),
+    }
+  }
+  let attrKids = kidsOf(tree, attr)
+  if (len(attrKids) == 1) {
+    // A bare `@collection` with no argument: an explicit mark, the same
+    // default name as carrying no `@collection` at all.
+    return CollectionClass{
+      classNode = d, className = k[0], exported = exported, nameLit = 0, name = snakeCase(cname),
+    }
+  }
+  let arg = getNode(tree, attrKids[1])
+  if (arg.tag != Tag.StringLit && arg.tag != Tag.RawStringLit) {
+    reportCollectionNameArgNotString(p, tree, source, attrKids[1], cname)
+    return bad
+  }
+  let name = decodeStringContent(source, arg.span.start, arg.span.end)
+  if (name == "") {
+    reportCollectionNameArgNotString(p, tree, source, attrKids[1], cname)
+    return bad
+  }
+  return CollectionClass{
+    classNode = d, className = k[0], exported = exported, nameLit = attrKids[1], name = name,
+  }
+}
+
+fn reportCollectionNameArgNotString(
+  p: Project, tree: Tree, source: string, argNode: int, cname: string,
+) {
+  let sp = getNode(tree, argNode).span
+  report(
+    p.diags, ecCollectionNameArgNotString, sp,
+    "class '${cname}' carries '@collection(${source[sp.start:sp.end]})', but the argument is not a non-empty string literal",
+    "write '@collection(\"name\")' with a collection-name override, or '@collection' with no argument to use the default",
+  )
+}
+
+// `__collectionName` reserved on EVERY class, `@json` or not — mirrors
+// `vReservedJobName` (classjobdesc.bit, E0168) for the identical reason.
+fn vReservedCollectionName(tree: Tree, source: string, diags: Diagnostics) {
+  for tc of topClassDecls(tree) {
+    let d = tc.decl
+    let own = declaredMember(tree, source, kidsOf(tree, d)[2], synthCollectionNameName)
+    if (own == 0) {
+      continue
+    }
+    let cname = identText(tree, source, kidsOf(tree, d)[0])
+    report(
+      diags, ecCollectionNameDeclared, getNode(tree, own).span,
+      "class '${cname}' declares '__collectionName', a name '@json' reserves for its generated method",
+      "rename this method — '__collectionName' is synthesized on every '@json' class and matched by name alone by 'store.collection<T>()'",
+    )
+  }
+}
+
+// `Person -> person`, `OrderLine -> order_line`, `User -> user`
+// (data-packages-dx.md rule 3) — never pluralized, unlike `pkg/orm`'s own
+// `toSnake(pluralize(className))` (`pkg/orm/naming.bit`), which this
+// function otherwise matches byte for byte: a boundary goes before a capital
+// that follows a lowercase or a digit, or before the LAST capital of a run
+// followed by a lowercase, so an acronym stays one word (`HTTPStatus ->
+// http_status`, never `h_t_t_p_status`). Built byte-at-a-time over ASCII,
+// the only alphabet a Bit identifier can use (SPEC §5).
+fn snakeCase(s: string): string {
+  let buf = []byte(0)
+  let n = len(s)
+  let i = 0
+  while (i < n) {
+    let c = s[i]
+    if (i > 0 && collectionIsUpper(c) && collectionSnakeBoundary(s, i, n)) {
+      buf = append(buf, '_')
+    }
+    buf = append(buf, collectionToLower(c))
+    i = i + 1
+  }
+  return string(buf)
+}
+
+fn collectionSnakeBoundary(s: string, i: int, n: int): bool {
+  let prev = s[i - 1]
+  if (collectionIsLower(prev) || collectionIsDigit(prev)) {
+    return true
+  }
+  return collectionIsUpper(prev) && i + 1 < n && collectionIsLower(s[i + 1])
+}
+
+fn collectionIsUpper(c: byte): bool {
+  return c >= 'A' && c <= 'Z'
+}
+
+fn collectionIsLower(c: byte): bool {
+  return c >= 'a' && c <= 'z'
+}
+
+fn collectionIsDigit(c: byte): bool {
+  return c >= '0' && c <= '9'
+}
+
+fn collectionToLower(c: byte): byte {
+  if (collectionIsUpper(c)) {
+    return c + 32
+  }
+  return c
+}
+
+// The quoted, escaped word a defaulted collection name renders to in the
+// module's synthesized source — mirrors `tableArgWord`
+// (classtabledescwords.bit): the name is ASCII (snake_case of an
+// identifier), but escaped anyway so an explicit `@collection("it's")`-shaped
+// string reaching here through no path today still renders safely tomorrow.
+fn collectionNameWord(name: string): string {
+  return "\"" + jsonEscapeChars(name) + "\""
+}
+
+// Every distinct word `injectCollectionNameDecls` needs in the module
+// source: the method name, its `string` result type, and one quoted name
+// word per class whose name was DEFAULTED (an explicit `@collection("...")`
+// clones its literal straight from source, exactly as `@job`'s
+// `jobDescSynthWords` does, and needs no word of its own).
+fn collectionDescSynthWords(classes: []CollectionClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  let out = [synthCollectionNameName, "string"]
+  for cc of classes {
+    if (cc.nameLit == 0) {
+      out = append(out, collectionNameWord(cc.name))
+    }
+  }
+  return out
+}
+
+// `[export] static __collectionName(): string { return "<name>" }` (SPEC
+// §10.4.1) — the same shape `synthJobNameMethod` (classjobdesc.bit) takes;
+// `main = 1` on the `Receiver` node is what makes it static.
+fn synthCollectionNameMethod(tree: Tree, st: SynthText, cc: CollectionClass): int {
+  let classSpan = getNode(tree, cc.className).span
+  let lit = 0
+  if (cc.nameLit != 0) {
+    let litNode = getNode(tree, cc.nameLit)
+    lit = addLeaf(tree, litNode.tag, litNode.span)
+  } else {
+    lit = addLeaf(tree, Tag.StringLit, synthSpan(st, collectionNameWord(cc.name)))
+  }
+  let stmts = [addNode(tree, Tag.ReturnStmt, classSpan, 0, [lit])]
+  let recv = addNode(
+    tree, Tag.Receiver, classSpan, 1, [0, traitClassTypeRef(tree, cc.className, 0)],
+  )
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [
+      recv, synthIdent(tree, st, synthCollectionNameName), 0,
+      addNode(tree, Tag.Params, classSpan, 0, []int(0)), synthIdent(tree, st, "string"),
+      addNode(tree, Tag.Block, classSpan, 0, stmts),
+    ],
+  )
+  if (!cc.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+// Every `@json` class's synthesized `__collectionName`, for the caller to
+// attach alongside every other feature's in the same pass.
+fn injectCollectionNameDecls(tree: Tree, st: SynthText, classes: []CollectionClass): []int {
+  let out = []int(0)
+  for cc of classes {
+    out = append(out, synthCollectionNameMethod(tree, st, cc))
+  }
+  return out
+}
