@@ -1,16 +1,11 @@
 # bitlang.org/pkg/orm
 
-An ORM for `std/sql`: define your tables as classes, then query, write and
-migrate against them without hand-writing SQL for the common cases - while
-still being able to drop to raw SQL when you need to.
-
-It gives you a schema builder for declaring tables and columns, a find
-chain (`where`, `orderBy`, `limit`, and more) with column names checked
-against your class at compile time, `save`/`delete`/`upsert` for single
-rows, `hasMany`/`hasOne`/`belongsTo` relations with eager loading,
-migrations generated from your entities, soft deletes, optimistic locking,
-and row locking for concurrent writers. Every one of these has its own
-page under [Docs](#docs) below.
+Writing SQL by hand for a table's ordinary reads and writes means the same
+five statements over and over, and a typo in a column name that only shows
+up when that code path finally runs. `orm` maps a `@table` class to its
+table for you - one `open(url)` per process, `db.table<T>()` for a
+repository over one class, and a find/write chain with every column name
+checked against the class at compile time.
 
 ## Install
 
@@ -27,50 +22,59 @@ page under [Docs](#docs) below.
 ## Usage
 
 ```bit
-import { Data } from "orm"
-import { Value } from "std/sql"
+import { open } from "orm"
 
-// Written once, against Data instead of a concrete Pool: runs standalone
-// (its own transaction per statement) or inside a caller's `pool.tx(...)`
-// block (one transaction for the whole call), with no second version.
-fn transfer(db: Data, fromId: i64, toId: i64, amt: i64): ()! {
-  db.exec("update accounts set balance = balance - ${amt} where id = ${fromId}", []Value(0))?
-  db.exec("update accounts set balance = balance + ${amt} where id = ${toId}", []Value(0))?
+@table class Article {
+  id: i64,
+  title: string,
+  body: string,
+}
+
+fn main(): ()! {
+  let db = open("postgres://localhost/inkwell")?
+  let articles = db.table<Article>()
+
+  let a = articles.insert(Article{ id = 0, title = "Hello", body = "First post." })?
+  let same = articles.find(a.id)?
+  let recent = articles.where("title", "Hello").orderBy("id").limit(10).all()?
+
+  a.title = "Hello, Inkwell"
+  articles.update(a)?
+  articles.delete(a.id)?
 }
 ```
 
+`open` picks the driver from the URL's own scheme (`postgres://`,
+`mysql://`) - nothing else in your program names one. `db.table<Article>()`
+already holds the connection, so no function in this package takes `db` as
+an argument the way an older version of this package's `find`/`save` did.
+
 ## Docs
 
-See [`docs/data.md`](docs/data.md) for `Data` and the call sites (`pool`
-alone, `pool.tx(...)`, `pool.txValue<T>(...)`). Table and column names are
-mapped from a `@table` class's field names - see
+Reading rows through the find chain (`where`, `orderBy`, `limit`, `offset`,
+`after`, `with`) is [`docs/query.md`](docs/query.md). Inserting, updating,
+deleting and bulk writes (`insertAll`, `set().updateAll()`, `deleteAll`)
+and optimistic locking with `@version` is
+[`docs/write.md`](docs/write.md). `hasMany`/`belongsTo` and eager loading
+with `with()` is [`docs/relation.md`](docs/relation.md). Many-to-many
+relations - the join table's DDL, eager loading, and `link`/`unlink` - is
+[`docs/manytomany.md`](docs/manytomany.md). Marking a row deleted instead
+of removing it is [`docs/softdelete.md`](docs/softdelete.md). Locking a row
+against a concurrent writer with `tx.table<T>().lock(mode)` is
+[`docs/locking.md`](docs/locking.md). Escaping to raw SQL with
+`db.exec`/`db.query<T>` and running inside a transaction with `db.tx(...)`
+is [`docs/raw.md`](docs/raw.md).
+
+Table and column names are mapped from a `@table` class's field names - see
 [`docs/naming.md`](docs/naming.md). Declaring and altering tables is
-[`docs/schema.md`](docs/schema.md), rendered to real DDL by a
-`Dialect` - [`docs/dialect.md`](docs/dialect.md), `Postgres` first,
-[`docs/mysql.md`](docs/mysql.md) for `Mysql` and where its DDL diverges.
-A `jsonb`/`json` column for a `Json` tree or a `@json` class field, and
-why a SQL NULL is never the same value as a stored JSON `null`, is
-[`docs/json.md`](docs/json.md).
-An enum field mapped to a `text` column with a CHECK constraint listing
-its variants by name, never a native database enum type, is
-[`docs/enum.md`](docs/enum.md).
-Querying rows through the find chain is [`docs/query.md`](docs/query.md).
-Saving, deleting and upserting a row is [`docs/write.md`](docs/write.md).
-Writing or removing rows with no instance loaded is
-[`docs/patch.md`](docs/patch.md). Filling `createdAt`/`updatedAt`
-automatically is [`docs/timestamps.md`](docs/timestamps.md). Turning a
-driver's constraint-violation error into a typed, catchable cause is
-[`docs/errors.md`](docs/errors.md). Inserting many rows in one statement is
-[`docs/bulk.md`](docs/bulk.md). Paginating a large table without `OFFSET`'s
-cost growing with depth is [`docs/keyset.md`](docs/keyset.md).
-`hasMany`/`hasOne`/`belongsTo` and eager loading with `with()` is
-[`docs/relation.md`](docs/relation.md). Many-to-many relations - the join
-table's DDL, eager loading and `attach`/`detach`/`sync` - is
-[`docs/manytomany.md`](docs/manytomany.md). Marking a row deleted instead of
-removing it is [`docs/softdelete.md`](docs/softdelete.md). Optimistic
-locking against a lost update is [`docs/version.md`](docs/version.md).
-Locking a row against a concurrent writer with `forUpdate` is
-[`docs/locking.md`](docs/locking.md).
+[`docs/schema.md`](docs/schema.md), rendered to real DDL by a `Dialect` -
+[`docs/dialect.md`](docs/dialect.md), `Postgres` first,
+[`docs/mysql.md`](docs/mysql.md) for `Mysql` and where its DDL diverges. A
+`jsonb`/`json` column for a `Json` tree or a `@json` class field is
+[`docs/json.md`](docs/json.md). An enum field mapped to a `text` column
+with a CHECK constraint listing its variants by name is
+[`docs/enum.md`](docs/enum.md). Turning a driver's constraint-violation
+error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
 Writing a reviewed migration file from your entities is
 [`docs/generate.md`](docs/generate.md). Applying that file against a live
 database is [`docs/migrate.md`](docs/migrate.md). Running your own test
@@ -84,12 +88,13 @@ questions. [`Dialect`](docs/dialect.md) is an interface with one method,
 `render(op: SchemaOp): []Statement` - it turns a schema migration into the
 DDL one engine understands, and gains a new implementation per engine
 (`Postgres`, then `Mysql` - see [`docs/mysql.md`](docs/mysql.md)).
-`ServerDialect` (`pkg/orm/data.bit`) is a value - `Postgres` or
-`Mysql(MysqlVersion)` - that every dialect-sensitive function takes to
-decide a syntax or a capability: `upsert`'s `ON CONFLICT` vs `ON DUPLICATE
-KEY UPDATE`, `attach`/`sync`'s idempotent insert, `forUpdate`'s
-`SKIP LOCKED` (which needs the real MySQL version, not just the engine),
-and the migration runner's advisory lock.
+`ServerDialect` (`pkg/orm/db.bit`) is a value - `Postgres` or
+`Mysql(MysqlVersion)` - that `open` derives once from the URL and carries
+onto every repository it hands out, deciding a syntax or a capability:
+`upsert`'s `ON CONFLICT` vs `ON DUPLICATE KEY UPDATE`, many-to-many
+`link`'s idempotent insert, `lock`'s `SKIP LOCKED` (which needs the real
+MySQL version, not just the engine), and the migration runner's advisory
+lock.
 
 They stay separate types because folding the value into the
 interface would make every `upsert` caller hand it a full `Dialect`

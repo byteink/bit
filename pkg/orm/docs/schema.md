@@ -76,7 +76,7 @@ dialect this package ever gets a renderer for.
 else that cannot round. Bit's own `decimal` is a first-class 128-bit type,
 not `f64` with extra steps, so the schema builder needed a way to declare
 one: before this existed, a class documented with a `decimal` field (see
-[Version](version.md)'s `Account`) had no column type to give it. On
+[Write](write.md)'s `Account`) had no column type to give it. On
 Postgres, `Dialect` renders it as bare `numeric` - no precision, no scale.
 A hand-picked `numeric(38,9)` would silently round away any value needing
 more digits than that after the decimal point, which is exactly the kind
@@ -233,5 +233,5 @@ DDL it renders to; do not expect `migrate up` yet.
 [Dialect](dialect.md) turns the tree this chapter builds into real
 Postgres DDL. [Naming](naming.md) covers how a `@table` class's field
 names become the table and column names you write here by hand.
-[Data](data.md) covers the interface an ORM function takes to actually run
+[Write](write.md) covers the interface an ORM function takes to actually run
 something against a database, once there is something here to run.

@@ -80,7 +80,7 @@ statement.
 
 ## The patch-builder path
 
-[Patch](patch.md)'s `update<T>` writes only the columns you `.set()`
+[Write](write.md)'s `update<T>` writes only the columns you `.set()`
 explicitly, so nothing here happens automatically - name it your `Patch`
 build:
 
@@ -171,5 +171,5 @@ does for every other column, and skip `@timestamps` for that class.
 ## Where to go next
 
 [Write](write.md) covers `save`'s own `INSERT`/`UPDATE` decision that
-`applyTimestamps` reuses. [Patch](patch.md) covers `update`/`deleteMany`
+`applyTimestamps` reuses. [Write](write.md) covers `update`/`deleteMany`
 for writes with no instance loaded, extended here by `withUpdatedAt`.
