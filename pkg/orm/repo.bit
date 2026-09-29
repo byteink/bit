@@ -1,0 +1,280 @@
+// pkg/orm/repo.bit — Repo<T>, the repository `Db.table<T>()`/`Tx.table<T>()`
+// (`pkg/orm/db.bit`) hand back (#6258, epic #6253,
+// .claude/kb/data-packages-dx.md rules 2, 5, 7): `insert`/`find`/`where`/
+// `orderBy`/`limit`/`offset`/`all`/`first`/`update`/`delete`, the query
+// chain and the write path in one type, both reached off the connection the
+// repository already holds — no `find<T>(db, table, fields, mapper)`, no
+// `Value.Text(...)` at a call site (rule 5: `sqlValue<V>`, #6256, turns a
+// caller's plain value into one).
+//
+// SCOPE OF THIS DELIVERY. `where`/`find`/`delete` support a single-column
+// primary key only — a composite `@id` (`pkg/orm/compositekey.bit`) panics
+// naming every key field, the same category `onFieldOrPrimary`
+// (`pkg/orm/write.bit`) already panics for. `insert`/`update` cover every
+// field `T.__values()` covers, which is `string`/`int`/`i64`/`bool`/`f64`/
+// `[]byte` (or `Option<>` of one) and no relation mark
+// (compiler/classtablerow.bit's own header) — a `decimal`, `Timestamp`,
+// `UUID`, `Json` or array column is silently absent from `__values()` with
+// no compiler diagnostic (confirmed live: a two-field `@table` class with
+// one `i64` and one `decimal` field reports `__columns()` length 2,
+// `__values()` length 1), so `columnsForValues` below asserts the two lists
+// are the same length and panics naming the class rather than writing a
+// value to the wrong column — filed as a compiler ticket (`__values()`
+// silently drops a scalar column type with no E-code`), not worked around
+// here. Relations, soft delete, optimistic locking, keyset pagination,
+// pessimistic locking, bulk insert, the patch builder, JSON/enum columns
+// and the raw escape hatches stay on their own files
+// (`relation.bit`/`softdelete.bit`/`version.bit`/`keyset.bit`/`lock.bit`/
+// `bulk.bit`/`patch.bit`/`jsoncol.bit`/`enumcol.bit`/`raw.bit`) — porting
+// each onto `Repo<T>` is follow-up work, not attempted here.
+import { sqlValue } from "std/sql"
+
+// The find chain and the write path over `T`'s table, holding the
+// connection it was built from — `db.table<T>()`/`tx.table<T>()` are the
+// only constructors (`pkg/orm/db.bit`).
+export class Repo<T: Tabled> {
+  db: Data
+  wheres: []string
+  args: []Value
+  orderBys: []string
+  limitN: int
+  hasLimit: bool
+  offsetN: int
+  hasOffset: bool
+
+  // INSERT, RETURNING the row the database wrote back — rule 7: the
+  // returned `T` carries a database-generated id, `v` itself is never
+  // mutated. A sole database-generated `@id` field is left out of the
+  // column list, the same `generatedIdField` exclusion
+  // `pkg/orm/write.bit`'s own `insertSql` makes, reused here unchanged.
+  export insert(v: T): T! {
+    let cols = this.columnsForValues(v)
+    let genId = generatedIdField(this.desc())
+    let vals = v.__values()
+    let colNames = []string(0)
+    let marks = []string(0)
+    let args = []Value(0)
+    let i = 0
+    while (i < len(cols)) {
+      let f = cols[i]
+      if (f.name != genId) {
+        colNames = append(colNames, columnName(f))
+        args = append(args, vals[i])
+        marks = append(marks, "$${len(args)}")
+      }
+      i = i + 1
+    }
+    let sqlText = "insert into ${T.__tableName()} (${join(colNames, ", ")}) values (${join(
+      marks,
+      ", ",
+    )}) returning *"
+    let rows = this.db.query(sqlText, args)?
+    defer rows.close()
+    if (!rows.next()?) {
+      fail newError("orm: insert into '${T.__tableName()}' returned no row from RETURNING")
+    }
+    return T.__fromRow(rows)?
+  }
+
+  // Exactly one row matching the primary key, or an error naming zero or
+  // more than one — never a bare unbounded SELECT, the same `LIMIT 2` bound
+  // `pkg/orm/query.bit`'s own `oneOrFail()` enforces. Reads the row itself
+  // rather than going through `sqlFindOneOrFail<T>` (std/sql/row.bit): a
+  // GENERIC function taking a closure that calls a STATIC method through
+  // `Repo<T>`'s own `T` fails to lower on this branch's compiler
+  // (`E0092 cannot lower a call whose target could not be resolved`,
+  // confirmed live, minimal repro kept on #6258) — `insert`, above, which
+  // calls `T.__fromRow` directly rather than handing it to another generic
+  // function, does not hit it.
+  export find<V>(id: V): T! {
+    let col = this.singleKeyColumn()
+    let sqlText = "select * from ${T.__tableName()} where ${col} = $1 limit 2"
+    let rows = this.db.query(sqlText, [sqlValue(id)])?
+    defer rows.close()
+    if (!rows.next()?) {
+      fail newError("orm: no row in '${T.__tableName()}' matches the given id")
+    }
+    let row = T.__fromRow(rows)?
+    if (rows.next()?) {
+      fail newError("orm: more than one row in '${T.__tableName()}' matches the given id")
+    }
+    return row
+  }
+
+  // `column = $n`, `val` turned into a bound `Value` via `sqlValue<V>`
+  // (rule 5) — a caller never spells `Value.Text(...)`.
+  export where<V>(column: string, val: V): Repo<T> {
+    let col = this.columnFor(column)
+    this.args = append(this.args, sqlValue(val))
+    this.wheres = append(this.wheres, "${col} = $${len(this.args)}")
+    return this
+  }
+
+  // Ascending — the target's own `.orderBy("name")` passes one argument.
+  // NOT a defaulted second parameter (`dir: string = "asc"`): a defaulted
+  // parameter on a method of a GENERIC class is not honored by this
+  // branch's compiler — `b.tag(5)` against `class Box<T> { tag(n: int,
+  // word: string = "asc"): Box<T> }` reports `E0050 expected 2, found 1`
+  // live, while the identical method on a non-generic class compiles
+  // (minimal repro kept on #6258) — so this stays two methods rather than
+  // one with a default.
+  export orderBy(column: string): Repo<T> {
+    let col = this.columnFor(column)
+    this.orderBys = append(this.orderBys, "${col} asc")
+    return this
+  }
+
+  export orderByDesc(column: string): Repo<T> {
+    let col = this.columnFor(column)
+    this.orderBys = append(this.orderBys, "${col} desc")
+    return this
+  }
+
+  export limit(n: int): Repo<T> {
+    this.limitN = n
+    this.hasLimit = true
+    return this
+  }
+
+  export offset(n: int): Repo<T> {
+    this.offsetN = n
+    this.hasOffset = true
+    return this
+  }
+
+  // Never `sqlFindMany<T>` (std/sql/row.bit) — see `find`'s own comment for
+  // why a generic function taking a closure over `T.__fromRow` fails to
+  // lower here.
+  export all(): []T! {
+    let rows = this.db.query(this.selectSql(), this.args)?
+    defer rows.close()
+    let out = []T(0)
+    while (rows.next()?) {
+      out = append(out, T.__fromRow(rows)?)
+    }
+    return out
+  }
+
+  // Never `sqlFindOne<T>` — same reason as `all`, above.
+  export first(): Option<T>! {
+    let rows = this.db.query(this.boundedSql(), this.args)?
+    defer rows.close()
+    if (!rows.next()?) {
+      return Option<T>.None
+    }
+    let row = T.__fromRow(rows)?
+    return Option<T>.Some(row)
+  }
+
+  // UPDATE every column but the primary key itself, by that key — the
+  // single-column counterpart of the "every column" convention
+  // `pkg/orm/write.bit`'s own `updateSql` follows. Never RETURNING: MySQL
+  // has none, and the caller already holds `v`.
+  export update(v: T): ()! {
+    let cols = this.columnsForValues(v)
+    let vals = v.__values()
+    let sets = []string(0)
+    let args = []Value(0)
+    let keyCol = ""
+    let keyVal = Value.Null
+    let i = 0
+    while (i < len(cols)) {
+      let f = cols[i]
+      if (hasIdAttr(f)) {
+        keyCol = columnName(f)
+        keyVal = vals[i]
+        i = i + 1
+        continue
+      }
+      args = append(args, vals[i])
+      sets = append(sets, "${columnName(f)} = $${len(args)}")
+      i = i + 1
+    }
+    if (keyCol == "") {
+      panic("orm: '${T.__tableName()}' has no single '@id' field for update")
+    }
+    args = append(args, keyVal)
+    let sqlText = "update ${T.__tableName()} set ${join(sets, ", ")} where ${keyCol} = $${len(args)}"
+    let n = this.db.exec(sqlText, args)?
+    if (n == 0) {
+      fail WriteError{ cause = WriteCause.NoRowsAffected, table = T.__tableName(), keys = [keyVal] }
+    }
+  }
+
+  export delete<V>(id: V): ()! {
+    let col = this.singleKeyColumn()
+    this.db.exec("delete from ${T.__tableName()} where ${col} = $1", [sqlValue(id)])?
+  }
+
+  // ---- internals -----------------------------------------------------------
+
+  desc(): TableDesc {
+    return TableDesc{ table = T.__tableName(), fields = T.__columns(), classAttrs = []AttrDesc(0) }
+  }
+
+  // `T.__columns()` filtered to the row-mappable, non-relation subset
+  // `T.__values()` also covers — see this file's header for why the two
+  // lists must come out the same length.
+  columnsForValues(v: T): []FieldDesc {
+    let out = []FieldDesc(0)
+    for f of T.__columns() {
+      if (!isRelationField(f)) {
+        out = append(out, f)
+      }
+    }
+    let vals = v.__values()
+    if (len(out) != len(vals)) {
+      panic("orm: '${T.__tableName()}' has a field type '__values()' cannot map (a 'decimal'/'Timestamp'/'UUID'/'Json'/array column) — Repo<T> needs every non-relation field to be a plain scalar")
+    }
+    return out
+  }
+
+  singleKeyColumn(): string {
+    let kf = keyFields(this.desc())
+    if (len(kf) != 1) {
+      panic("orm: '${T.__tableName()}' carries a composite key (${keyFieldNames(kf)}) — Repo<T>.find/delete need a single-column '@id'")
+    }
+    return columnName(kf[0])
+  }
+
+  columnFor(field: string): string {
+    for f of T.__columns() {
+      if (f.name == field) {
+        return columnName(f)
+      }
+    }
+    panic("orm: '${field}' is not a field of the class mapped to '${T.__tableName()}'")
+  }
+
+  whereSql(): string {
+    if (len(this.wheres) == 0) {
+      return ""
+    }
+    return " where " + join(this.wheres, " and ")
+  }
+
+  selectSql(): string {
+    return this.buildSql(this.hasLimit, this.limitN)
+  }
+
+  boundedSql(): string {
+    if (this.hasLimit && this.limitN <= 2) {
+      return this.buildSql(this.hasLimit, this.limitN)
+    }
+    return this.buildSql(true, 2)
+  }
+
+  buildSql(hasLimit: bool, limitN: int): string {
+    let sql = "select * from ${T.__tableName()}" + this.whereSql()
+    if (len(this.orderBys) != 0) {
+      sql = sql + " order by " + join(this.orderBys, ", ")
+    }
+    if (hasLimit) {
+      sql = sql + " limit ${limitN}"
+    }
+    if (this.hasOffset) {
+      sql = sql + " offset ${this.offsetN}"
+    }
+    return sql
+  }
+}
