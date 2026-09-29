@@ -1,0 +1,280 @@
+// _tests_/bit/ormlive.bit — `./make test-package-orm-live` (#6281). Provisions
+// its OWN throwaway PostgreSQL and MySQL containers (the same pattern as
+// `redislive.bit`, #6021): `docker run --rm -d` for each, readiness polled
+// (`pg_isready` / `mysqladmin ping`), the two URLs exported as
+// ORM_TEST_LIVE_PG_URI / ORM_TEST_LIVE_MYSQL_URI for a `bit test pkg/orm`
+// child process, then both containers always removed.
+//
+// pkg/orm's live proofs (repo.test.bit, bulk.test.bit, rawsql.test.bit,
+// schema.test.bit, sync.test.bit, write.test.bit, check.test.bit,
+// generate.test.bit — `grep -l 'ORM_TEST_LIVE' pkg/orm/*.test.bit`) are
+// skipped, one `print("  skipped: ...")` line each, whenever their env var is
+// unset — which is every gate today (the ticket this harness closes). A
+// skipped live test inside THIS gate is a failure, not a pass: `runLiveTests`
+// below scans the child's stdout for "  skipped: " and fails the gate if it
+// finds one, on top of the child's own exit code.
+//
+// IMAGES, pinned BY DIGEST so a retag upstream cannot silently change what
+// this gate runs against:
+//
+//   postgres:18.6  postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+//     (same pin as _tests_/bit/jobslive.bit/webguidesapp.bit; re-verify
+//     before bumping: curl -s
+//     https://hub.docker.com/v2/repositories/library/postgres/tags/18.6 |
+//     jq .digest)
+//   mysql:8.4      the image pkg/mysql/docs/servers.md already pins for its
+//     own live acceptance ("Which stock images verify"): re-verify before
+//     bumping: curl -s
+//     https://hub.docker.com/v2/repositories/library/mysql/tags/8.4 | jq .digest
+//
+// THE IMAGES THEMSELVES ARE KEPT, never deleted by this gate — same reasoning
+// as redislive.bit's header: a pinned image this gate depends on every run is
+// not a one-off throwaway install. Only the two CONTAINERS are throwaway.
+//
+// WITHOUT DOCKER: no `docker` binary at any of `dockerCandidates()`, or
+// `docker info` failing — prints "skipped: docker unavailable" and exits 0.
+//
+// CLEANUP: both containers are named with a run-local UUID and labelled
+// `bit.orm.live=1`; `cleanup()` removes them by name on every path this
+// process controls. `sweepOrphans()` runs FIRST, force-removing any
+// `bit.orm.live=1` container an interrupted previous run left behind.
+//
+// ENV this harness reads (`./make test-package-orm-live` sets both,
+// tools/build/gatestable2.bit):
+//   BIT_REPO   repo root, so pkg/orm resolves regardless of cwd (required)
+//   BIT_BIN    compiler under test    (default bit-out/bin/bit)
+//
+// `bit test` inherits no argv and pkg/orm's live tests read their targets
+// off ORM_TEST_LIVE_PG_URI / ORM_TEST_LIVE_MYSQL_URI, not a CLI flag —
+// `runLiveTests()` below sets both (plus BIT_REPO/BIT_BIN, so
+// `findRepoRoot()`/`envOr("BIT_BIN", ...)` in pkg/orm's own test helpers
+// resolve deterministically) by exec'ing `/usr/bin/env VAR=... <bit> test
+// pkg/orm` rather than the plain `<bit> test pkg/orm` every other gate
+// uses — the same trick redislive.bit's own header documents and proved
+// on #6021.
+
+import { output } from "std/process"
+import { env, envOr, exit } from "std/os"
+import { exists } from "std/fs"
+import { contains, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { sleep, Millisecond } from "std/time"
+
+const pgImage: string = "postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"
+const myImage: string = "mysql:8.4"
+const runLabel: string = "bit.orm.live=1"
+const readyAttempts: int = 60
+const readyDelayMs: int = 1000
+const dockerQuickTimeoutMs: int = 10000
+const dockerRunTimeoutMs: int = 30000
+const testRunTimeoutMs: int = 300000
+const myRootPassword: string = "bit-orm-live-pw"
+const myDatabase: string = "orm_live"
+
+// BIT_REPO IS REQUIRED, same reason as _tests_/bit/redislive.bit and
+// _tests_/bit/jobslive.bit: falling back to "." would silently test whatever
+// directory `bit` happened to be invoked from instead of refusing.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("ormlive: BIT_REPO is not set — run this through `./make test-package-orm-live`")
+  }
+  return r
+}
+
+fn findBin(candidates: []string): string {
+  let i = 0
+  while (i < len(candidates)) {
+    if (exists(candidates[i])) {
+      return candidates[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn dockerCandidates(): []string {
+  return ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/usr/bin/docker"]
+}
+
+fn dockerBin(): string {
+  return findBin(dockerCandidates())
+}
+
+fn dockerAvailable(bin: string): bool {
+  if (bin == "") {
+    return false
+  }
+  let r = output(bin, ["info"], dockerQuickTimeoutMs)
+  return r.exitCode == 0
+}
+
+// Force-removes every container this harness has ever labelled, before this
+// run starts its own — see the header's CLEANUP section for why this exists.
+fn sweepOrphans(bin: string) {
+  let r = output(bin, ["ps", "-aq", "--filter", "label=${runLabel}"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    return
+  }
+  for id of split(trimSpace(r.stdout), "\n") {
+    if (id == "") {
+      continue
+    }
+    output(bin, ["rm", "-f", id], dockerRunTimeoutMs)
+  }
+}
+
+fn dockerRun(bin: string, args: []string): ()! {
+  let r = output(bin, args, dockerRunTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker ${args[0]}: ${trimSpace(r.stderr)}")
+  }
+}
+
+fn hostPort(bin: string, name: string, containerPort: string): int! {
+  let r = output(bin, ["port", name, containerPort], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker port ${name}: ${trimSpace(r.stderr)}")
+  }
+  let lines = split(trimSpace(r.stdout), "\n")
+  if (len(lines) == 0 || lines[0] == "") {
+    fail newError("docker port ${name}: no mapping printed")
+  }
+  let colon = lastIndexOf(lines[0], ":")
+  if (colon < 0) {
+    fail newError("docker port ${name}: unexpected output '${lines[0]}'")
+  }
+  return parseInt(lines[0][colon + 1:])?
+}
+
+fn startPostgres(bin: string, name: string): int! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel,
+      "-p", "127.0.0.1:0:5432", "-e", "POSTGRES_HOST_AUTH_METHOD=trust", pgImage,
+    ],
+  )?
+  let port = hostPort(bin, name, "5432/tcp")?
+  let i = 0
+  let ready = false
+  while (i < readyAttempts) {
+    let r = output(bin, ["exec", name, "pg_isready", "-U", "postgres"], dockerQuickTimeoutMs)
+    if (r.exitCode == 0 && contains(r.stdout, "accepting connections")) {
+      ready = true
+      break
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  if (!ready) {
+    fail newError("${name}: pg_isready never reported ready within ${readyAttempts * readyDelayMs}ms")
+  }
+  return port
+}
+
+fn startMysql(bin: string, name: string): int! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel,
+      "-p", "127.0.0.1:0:3306", "-e", "MYSQL_ROOT_PASSWORD=${myRootPassword}",
+      "-e", "MYSQL_DATABASE=${myDatabase}", myImage,
+    ],
+  )?
+  let port = hostPort(bin, name, "3306/tcp")?
+  let i = 0
+  let ready = false
+  while (i < readyAttempts) {
+    let r = output(
+      bin,
+      ["exec", name, "mysqladmin", "ping", "-uroot", "-p${myRootPassword}", "--silent"],
+      dockerQuickTimeoutMs,
+    )
+    if (r.exitCode == 0) {
+      ready = true
+      break
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  if (!ready) {
+    fail newError("${name}: mysqladmin ping never succeeded within ${readyAttempts * readyDelayMs}ms")
+  }
+  return port
+}
+
+// Always removes both containers (by name, `--rm` already means a stopped
+// one vanishes, `rm -f` handles a still-running one too) — called from every
+// path through `main()` below, success or failure alike, never only on the
+// happy path.
+fn cleanup(bin: string, names: []string) {
+  for name of names {
+    output(bin, ["rm", "-f", name], dockerRunTimeoutMs)
+  }
+}
+
+// Runs `bit test pkg/orm` with ORM_TEST_LIVE_PG_URI/ORM_TEST_LIVE_MYSQL_URI
+// (plus BIT_REPO/BIT_BIN, so pkg/orm's own `findRepoRoot()`/`envOr("BIT_BIN",
+// ...)` resolve deterministically regardless of this process's cwd) set for
+// exactly the child this spawns — see the file header's ENV section for why
+// `/usr/bin/env` is the vehicle. A skip line anywhere in the child's stdout
+// is a failure: the whole point of this gate is that no live proof may fall
+// back to skipping.
+fn runLiveTests(bitPath: string, repo: string, pgUrl: string, myUrl: string): int {
+  let r = output(
+    "/usr/bin/env",
+    [
+      "ORM_TEST_LIVE_PG_URI=${pgUrl}", "ORM_TEST_LIVE_MYSQL_URI=${myUrl}",
+      "BIT_REPO=${repo}", "BIT_BIN=${bitPath}",
+      bitPath, "test", "${repo}/pkg/orm",
+    ],
+    testRunTimeoutMs,
+  )
+  print(r.stdout)
+  eprint(r.stderr)
+  if (contains(r.stdout, "  skipped: ")) {
+    eprint("ormlive: a live test skipped inside test-package-orm-live — every ORM_TEST_LIVE_* var was set, so a skip means the harness or a live test is not reading it\n")
+    if (r.exitCode == 0) {
+      return 1
+    }
+  }
+  return r.exitCode
+}
+
+fn main() {
+  let bin = dockerBin()
+  if (!dockerAvailable(bin)) {
+    print("skipped: docker unavailable\n")
+    exit(0)
+    return
+  }
+  sweepOrphans(bin)
+
+  let repo = repoRoot()
+  let bitPath = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
+  let runId = uuidFormat(uuidV4())
+  let pgName = "bit-orm-live-pg-${runId}"
+  let myName = "bit-orm-live-mysql-${runId}"
+  let names = [pgName, myName]
+
+  let pgPort = startPostgres(bin, pgName) catch e {
+    eprint("ormlive: ${e.message()}\n")
+    cleanup(bin, names)
+    exit(1)
+    return
+  }
+  let myPort = startMysql(bin, myName) catch e {
+    eprint("ormlive: ${e.message()}\n")
+    cleanup(bin, names)
+    exit(1)
+    return
+  }
+
+  let pgUrl = "postgres://postgres@127.0.0.1:${pgPort}/postgres"
+  let myUrl = "mysql://root:${myRootPassword}@127.0.0.1:${myPort}/${myDatabase}"
+  let rc = runLiveTests(bitPath, repo, pgUrl, myUrl)
+
+  cleanup(bin, names)
+  exit(rc)
+}
