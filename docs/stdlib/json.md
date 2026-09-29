@@ -96,7 +96,7 @@ Mark a class `@json` and it gains a `toJson()` method; pass a parsed
 document to `jsonDecode<T>` and you get the class back, with every field
 checked against the document. The two are generated from the same field
 list, so they can never drift apart. `@json` alone needs no import from
-`"std/json"` at all — the class below imports only what its own code calls.
+`"std/json"` at all: the class below imports only what its own code calls.
 
 ```bit
 import { jsonParse, jsonDecode, jsonEncode } from "std/json"
