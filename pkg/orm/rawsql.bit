@@ -1,0 +1,216 @@
+// pkg/orm/rawsql.bit — the real logic behind `Db.exec`/`TxHandle.exec` and
+// `Db.query<T>`/`TxHandle.query<T>` (`pkg/orm/db.bit`, #6273,
+// .claude/kb/data-packages-dx.md "Approved 2026-09-29"): one line on each
+// class delegating here, the same split `pkg/orm/query.bit`'s own
+// `whereRaw`/`orderByRaw` header documents for `pkg/orm/raw.bit`.
+//
+//     db.exec("update post set views = views + 1 where id = ?", id)?
+//     let rows = db.query<Post>("select * from post where title like ?", "%bit%")?
+//
+// VALUES ARE ALWAYS BOUND, NEVER INTERPOLATED. `sqlText` (the literal a
+// caller wrote) and the values it binds travel to `Data.exec`/`Data.query`
+// (`pkg/orm/data.bit`) as two separate arguments — `boundArgs` below turns
+// each plain value into a `Value` with `sqlValue<V>` (std/sql, #6256), the
+// same conversion `Repo<T>.where<V>` (`pkg/orm/repo.bit`) already uses —
+// nothing in this file ever builds `sqlText` by pasting a value into it.
+//
+// `?` IS THE ONE SPELLING A CALLER WRITES, WHATEVER `sqlText` IS HEADED FOR.
+// std/sql's own wire form numbers placeholders (`$1`, `$2`, ...;
+// stdlib/sql/sql.bit's header — Postgres receives that form unrewritten,
+// pkg/postgres/query.bit's header) and MySQL's own driver rewrites `$N`
+// back to its native `?` (pkg/mysql/rewrite.bit) — so a caller of THIS file
+// never spells `$1`, `rewritePlaceholders` below turns each unquoted `?`
+// into `$1`, `$2`, ... in order, and the rest of the pipeline is unchanged
+// from how `Repo<T>` already talks to `Data`.
+//
+// A `?` INSIDE A QUOTED STRING OR IDENTIFIER, OR A COMMENT, IS NOT A
+// PLACEHOLDER — `note = 'why?'` must reach the server with its `?` intact,
+// not consume a bound value. `rewritePlaceholders` skips every quoted run
+// (`'...'`, `"..."`, `` `...` ``, doubled-quote escaped — the one escaping
+// convention standard SQL and MySQL's default mode agree on) and every
+// comment (`-- `, `#`, `/* */`), the same categories `pkg/mysql/rewrite.bit`'s
+// own scanner skips for the opposite direction; see that file's header for
+// why a scanner and not a `replace` call. BACKSLASH IS NOT TREATED AS AN
+// ESCAPE HERE — this file's output is std/sql's own `$N` form, which
+// Postgres receives unrewritten and does not itself treat backslash
+// specially inside a standard string literal (`standard_conforming_strings`,
+// on by default); a caller who needs a literal quote already doubles it
+// (`''`), the one convention that works everywhere in this package.
+//
+// A PLACEHOLDER COUNT THAT DISAGREES WITH THE SUPPLIED VALUES IS A
+// CATCHABLE ERROR, NEVER A PANIC (#6273's own constraint) — unlike
+// `pkg/orm/raw.bit`'s `whereRaw`, whose fragment and arguments are always
+// individual literal arguments, `exec`/`query` accept a `...values`
+// spread (SPEC §12.4) whose LENGTH is runtime data, so a caller can reach
+// a mismatch with no typo in the source at all.
+//
+// A CALL WITH ZERO VALUES DOES NOT COMPILE TODAY — reported on #6273
+// rather than worked around. `exec<V>(sqlText, ...values: V)` called with
+// no arguments binds `V` to `()` (SPEC §15.3's own empty-variadic-generic
+// rule); `sqlValue<V>` (`std/sql`, #6256) has no specialisation for `()`
+// and IS supposed to refuse it with a checked **E0177** — but `V`'s own
+// binding, once it flows through a SECOND generic layer (`boundArgs<V>`
+// below), reaches `retargetSqlValueInstances` (compiler/checksqlvalue.bit)
+// with no ledger entry for `bit check` to have validated, so the refusal
+// surfaces as an unconditional **E0092** ("cannot lower... no matching
+// specialisation") at LOWERING instead — confirmed live: a two-line
+// standalone probe (`fn boundArgs<V>(values: []V): []Value` calling
+// `sqlValue(v)`, called from a second `...values: V` variadic) reproduces
+// it with no `pkg/orm` code involved, and a `len(values) == 0` guard
+// around the loop does NOT fix it — the branch is still part of the one
+// compiled body `V = ()` monomorphizes, panic or not. A caller who needs
+// to run a statement with no placeholders at all (DDL, most commonly)
+// still reaches the driver directly (`pkg/orm/repo.test.bit`'s own setup
+// DDL already does this) until that compiler gap is fixed.
+
+// The values `...values` (`pkg/orm/db.bit`) collected, each turned into a
+// bound `Value` via `sqlValue<V>` — see this file's header.
+fn boundArgs<V>(values: []V): []Value {
+  let out = []Value(0)
+  for v of values {
+    out = append(out, sqlValue(v))
+  }
+  return out
+}
+
+// `sqlText` has exactly `want` `?` placeholders — see this file's header
+// for why a mismatch is a catchable error, not a panic.
+fn checkPlaceholderCount(sqlText: string, want: int, got: int): ()! {
+  if (want != got) {
+    fail newError("orm: '${sqlText}' has ${want} '?' placeholder(s) but ${got} value(s) were supplied")
+  }
+}
+
+// `Db.exec`/`TxHandle.exec`'s real body.
+fn execOn<V>(db: Data, sqlText: string, values: []V): int! {
+  let (rewritten, want) = rewritePlaceholders(sqlText)
+  checkPlaceholderCount(sqlText, want, len(values))?
+  return db.exec(rewritten, boundArgs(values))?
+}
+
+// `Db.query<T>`/`TxHandle.query<T>`'s real body. `T: Tabled`'s own
+// `__fromRow` (`pkg/orm/db.bit`'s header) decodes each row — the same call
+// `Repo<T>.all()` (`pkg/orm/repo.bit`) makes, reused here rather than a
+// second row mapper.
+fn queryOn<T: Tabled, V>(db: Data, sqlText: string, values: []V): []T! {
+  let (rewritten, want) = rewritePlaceholders(sqlText)
+  checkPlaceholderCount(sqlText, want, len(values))?
+  let rows = db.query(rewritten, boundArgs(values))?
+  defer rows.close()
+  let out = []T(0)
+  while (rows.next()?) {
+    out = append(out, T.__fromRow(rows)?)
+  }
+  return out
+}
+
+// `sqlText` with every unquoted `?` replaced by `$1`, `$2`, ... in order,
+// and the count of placeholders found — see this file's header for what
+// counts as "unquoted". Whole spans of ordinary text are copied at once
+// (`mark`..`i`) rather than byte by byte, so a statement with no
+// placeholders and no quoting does one slice, not `len(sqlText)` of them.
+//
+// Bounded: every branch advances `i` by at least one byte, so at most
+// `len(sqlText)` iterations.
+fn rewritePlaceholders(sqlText: string): (string, int) {
+  let n = len(sqlText)
+  let b = newBuilder()
+  let mark = 0
+  let i = 0
+  let count = 0
+  while (i < n) {
+    let skipTo = skipSpecial(sqlText, i, n)
+    if (skipTo >= 0) {
+      i = skipTo
+      continue
+    }
+    if (sqlText[i] == '?') {
+      b.write(sqlText[mark:i])
+      count = count + 1
+      b.write("$${count}")
+      i = i + 1
+      mark = i
+      continue
+    }
+    i = i + 1
+  }
+  b.write(sqlText[mark:n])
+  return (b.toString(), count)
+}
+
+// The index just past the quoted run or comment starting at `s[i]`, or -1
+// when `s[i]` is ordinary text `rewritePlaceholders`'s own loop copies
+// through unchanged — split into `skipIfQuoted`/`skipIfComment` to keep
+// every one of these under `spec/LINT.md`'s complexity ceiling (E0204).
+fn skipSpecial(s: string, i: int, n: int): int {
+  let q = skipIfQuoted(s, i, n)
+  if (q >= 0) {
+    return q
+  }
+  return skipIfComment(s, i, n)
+}
+
+fn skipIfQuoted(s: string, i: int, n: int): int {
+  let c = s[i]
+  if (c == '\'' || c == '"' || c == '`') {
+    return skipQuotedRun(s, i, n, c)
+  }
+  return 0 - 1
+}
+
+fn skipIfComment(s: string, i: int, n: int): int {
+  let c = s[i]
+  if (c == '-' && i + 1 < n && s[i + 1] == '-') {
+    return skipLineComment(s, i, n)
+  }
+  if (c == '#') {
+    return skipLineComment(s, i, n)
+  }
+  if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+    return skipBlockComment(s, i, n)
+  }
+  return 0 - 1
+}
+
+// Everything up to and including the run's closing `q` — a doubled quote
+// (`'it''s'`, `` `a``b` ``) is an escaped quote, not the end of the run.
+// An unterminated run reaches `n` rather than looping forever; no server
+// would run such a statement either, and the caller's own driver call
+// reports it, not this scanner.
+fn skipQuotedRun(s: string, at: int, n: int, q: u8): int {
+  let i = at + 1
+  while (i < n) {
+    if (s[i] == q) {
+      if (i + 1 < n && s[i + 1] == q) {
+        i = i + 2
+        continue
+      }
+      return i + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// To the end of the line (the newline, if any, left for the outer scan to
+// copy through unchanged), for `--` and `#` comments.
+fn skipLineComment(s: string, at: int, n: int): int {
+  let i = at
+  while (i < n && s[i] != '\n') {
+    i = i + 1
+  }
+  return i
+}
+
+// To the closing `*/`. An unterminated comment reaches `n`, same reasoning
+// as `skipQuotedRun`.
+fn skipBlockComment(s: string, at: int, n: int): int {
+  let i = at + 2
+  while (i < n) {
+    if (s[i] == '*' && i + 1 < n && s[i + 1] == '/') {
+      return i + 2
+    }
+    i = i + 1
+  }
+  return n
+}
