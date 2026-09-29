@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `from` is no longer highlighted as a hard keyword (SPEC §5.2, #6264): it is
+  contextual, like `static`/`readonly`/`use`, so `let from = ...` and a
+  field/param/method literally named `from` read as ordinary code again.
+
 ## 0.1.2
 
 - `bit.json` is now associated with the `jsonc` language (it allows `//` and

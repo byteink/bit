@@ -122,13 +122,12 @@ assigned to but never read; it discards a value (e.g. `let (_, ok) = <-c`).
 Reserved; may not be used as identifiers:
 
 ```
-as     asm     break     case     catch      chan
-class  const   continue  default  defer      else
-enum   export  fail      false    fn         for
-from   if      import    in       interface  let
-map    match   nil       of       return     select
-spawn  switch  this      trait    true       type
-while
+as      asm     break     case       catch   chan
+class   const   continue  default    defer   else
+enum    export  fail      false      fn      for
+if      import  in        interface  let     map
+match   nil     of        return     select  spawn
+switch  this    trait     true       type    while
 ```
 
 `struct` is not a keyword. Pre-0.1.24 code that declared types with `struct` is
@@ -153,6 +152,14 @@ field or method literally named `use` is always followed by `:`, `(`, or `<`
 instead, so there is no ambiguity. `Self` is likewise an ordinary identifier,
 predeclared as a type name only inside a trait or interface body (§10.7,
 §11.3); anywhere else it is simply undefined.
+
+`from` is also **not** a keyword: it lexes as an ordinary identifier and
+parses as one everywhere - `let from = ...`, and a field, parameter, or
+method literally named `from` - except immediately after an `import_decl`'s
+`import_body` (§17.2), the one grammar position that names it. That position
+is unambiguous without reserving the word: an `import_decl` always reaches it
+right after its body, and the only legal next token there is the
+path-introducing `from`.
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
@@ -4640,6 +4647,11 @@ import_body = IDENT                              (* namespace binding *)
             | "{" import_item { "," import_item } [ "," ] "}" .
 import_item = IDENT [ "as" IDENT ] .
 ```
+
+The `"from"` above is the one place the word is meaningful; it is not
+reserved elsewhere (§5.2) - `let from = ...` and a field, parameter, or
+method named `from` all parse as ordinary code, including in a module that
+also has a real `import ... from "..."`.
 
 The string is a **module path**: `"std/io"`, `"std/net/http"` for standard-library
 modules, or a relative path `"./util"`, `"../shared"` for project-local modules.
