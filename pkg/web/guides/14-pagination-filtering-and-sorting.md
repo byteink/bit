@@ -54,51 +54,24 @@ bounded query, not one that reads the whole table.
 
 ## The listing itself
 
-Inkwell's `Article` table backs a `Query<Article>` (see part 8, "Querying and
-CRUD", for how `find<Article>` builds one). The list route only needs a
-handful of columns, so it maps each row to a smaller `ArticleListItem` view
-rather than sending the full entity:
+Inkwell's `Article` table backs a `Repo<Article>` (see part 8, "Querying and
+CRUD", for how `db.table<Article>()` builds one). The list route only needs
+a handful of columns, so it maps each row to a smaller `ArticleListItem`
+view rather than sending the full entity:
 
 ```bit
 import { Ctx, Res, page } from "web"
-import { Data, Dir, Query, TableDesc, find } from "orm"
-import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
+import { Db, Dir, Repo } from "orm"
 
 // The fields a listing needs. The real `Article` also carries its author
 // and tags relations (part 9, "Relationships") - this page only needs
 // what `toListItem` reads below.
-@table class Article {
-  @id
-  id: i64
-  title: string
-  slug: string
-  authorId: i64
-  createdAt: i64
-}
-
-fn articlePlaceholder(): Article {
-  return Article{ id = 0, title = "", slug = "", authorId = 0, createdAt = 0 }
-}
-
-fn articleDesc(): TableDesc {
-  return TableDesc{
-    table = "articles", fields = articlePlaceholder().tableDescriptor(), classAttrs = []AttrDesc(0),
-  }
-}
-
-fn articleMapper(rows: Rows): Article! {
-  let cols = rows.columns()
-  return Article{
-    id = sqlReqInt(rows, cols, "id")?,
-    title = sqlReqText(rows, cols, "title")?,
-    slug = sqlReqText(rows, cols, "slug")?,
-    authorId = sqlReqInt(rows, cols, "author_id")?,
-    createdAt = sqlReqInt(rows, cols, "created_at")?,
-  }
-}
-
-fn articles(db: Data): Query<Article> {
-  return find<Article>(db, "articles", articleDesc().fields, articleMapper)
+@table("articles") class Article {
+  id: i64,
+  title: string,
+  slug: string,
+  authorId: i64,
+  createdAt: i64,
 }
 
 @json class ArticleListItem {
@@ -118,7 +91,7 @@ fn toListItem(a: Article): ArticleListItem {
 
 ## Filtering by author, sorting by date
 
-`Query.where` narrows the rows; `Query.orderBy` picks the direction. Both
+`Repo.where` narrows the rows; `Repo.orderBy` picks the direction. Both
 are applied before the count and the page window, so `total` reflects the
 filtered set, not the whole table:
 
@@ -130,8 +103,8 @@ fn sortDir(raw: string): Dir {
   return Dir.Desc
 }
 
-fn filteredArticles(db: Data, c: Ctx): Query<Article> {
-  let q = articles(db).orderBy("createdAt", sortDir(c.query("sort")))
+fn filteredArticles(db: Db, c: Ctx): Repo<Article> {
+  let q = db.table<Article>().orderBy("createdAt", sortDir(c.query("sort")))
   let authorRaw = c.query("author")
   if (len(authorRaw) == 0) {
     return q
@@ -139,10 +112,10 @@ fn filteredArticles(db: Data, c: Ctx): Query<Article> {
   let authorId = parseInt(authorRaw) catch _ {
     return q
   }
-  return q.where("authorId", Value.Int(authorId))
+  return q.where("authorId", authorId)
 }
 
-fn listArticles(c: Ctx, db: Data): Res! {
+fn listArticles(c: Ctx, db: Db): Res! {
   let limit = clampLimit(c.query("limit"))
   let pageNum = pageNumber(c.query("page"))
   let q = filteredArticles(db, c)
@@ -155,6 +128,10 @@ fn listArticles(c: Ctx, db: Data): Res! {
   return page(out, total, limit, "${pageNum + 1}")
 }
 ```
+
+`Repo<T>.count()` runs `select count(*)` over the same `where()` the chain
+built, ignoring `orderBy`/`limit`/`offset` - exactly the number `total`
+needs, from the filtered set rather than the whole table.
 
 `sort=newest` (the default) and `sort=oldest` are the only two directions
 Inkwell exposes; there is no free-form `sort=title` because an unindexed
