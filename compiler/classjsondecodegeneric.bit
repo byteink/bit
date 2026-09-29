@@ -54,6 +54,34 @@
 // definition would explode a return the caller does not, across a signature
 // the two sides never compare. The ARGUMENT side agrees either way: both
 // declarations are generic, and `explodesParams` answers them alike (#6058).
+//
+// #6259 EXTENDS ALL OF THE ABOVE TO A GENERIC CLASS'S OWN TYPE PARAMETER —
+// `class Box<T> { load(s): T! { return jsonDecode<T>(...) } }` — which used
+// to stay a hard refusal (see the old `jdtpRecv` comment below, now retired).
+// The DIRECT half is symmetric: `JsonDecodeClassGeneric` is the class-keyed
+// twin of `JsonDecodeGeneric`, found the same way (a `jsonDecode<P>` call
+// inside a declaration whose MERGED generic list carries `P`), just reading
+// the OTHER half of that list — `k < nrecv` instead of `k >= nrecv`, i.e. a
+// type parameter the RECEIVER contributed rather than the method's own. What
+// differs is how it resolves: a function/method's own instantiation is
+// discovered through `ctx.instantiations`, keyed by an EXPLICIT call
+// (`get<NewUser>(j)`); a class has no such call to key by, so
+// `validateJsonDecodeClassGenerics`/`retargetJsonDecodeInstances`
+// (classjsondecodegenericretarget.bit) instead walk `ctx.typeInsts` — the
+// nominal instantiation ledger every concrete use of the class already
+// populates, written OR inferred.
+//
+// The INDIRECT half needs its own edge kind, `JsonDecodeClassEdge`: a class
+// is never CALLED with explicit type arguments the way a function is, so a
+// generic function/method `G<T>` that merely constructs or returns
+// `Collection<T>` (`pkg/kv`'s `Db.collection<T>`, collection.bit's own
+// header) has to be discovered from a WRITTEN type reference — a result
+// type, a parameter type, a composite literal's type — not from a call's
+// type-argument list the way `JsonDecodeGenericEdge` is. Firing one adds `G`
+// to the ORDINARY function `gens` set, exactly as if `G` had called
+// `jsonDecode<T>` directly: an outer `db.collection<Widget>(...)` then
+// demands `Widget` through the SAME (unmodified) `collectJsonDecodeGenericNeeds`
+// that already demands one from a direct call.
 
 // The type parameter of a synthesized specialisation. It is never mentioned by
 // the body; it exists so the declaration has the same SHAPE as `jsonDecode<T>`
@@ -116,6 +144,11 @@ class JsonDecodeGenericEdge {
   callee: string,
   calleeIndex: int,
 }
+
+// `JsonDecodeClassGeneric`, `JsonDecodeClassEdge` and the whole class-keyed
+// half of this mechanism (#6259) live in the sibling
+// `classjsondecodeclassgeneric.bit`, split out at E0200's 800-line ceiling;
+// same module, so every function below is visible here unchanged.
 
 // ---- reading declarations syntactically ------------------------------------
 
@@ -237,21 +270,29 @@ fn collectJsonDecodeGenerics(p: Project): []JsonDecodeGeneric {
     gens = moduleJsonDecodeGenerics(p.mods[mid], mid, gens)
     mid = mid + 1
   }
+  // #6259: a generic CLASS's own direct needs, seeded the same way — a class
+  // itself never joins `gens` (nothing CALLS a class), but reaching one
+  // through `JsonDecodeClassEdge` below adds the FUNCTION/METHOD that
+  // reached it, exactly as if that declaration had called `jsonDecode<T>`
+  // itself.
+  let cgens = collectJsonDecodeClassGenerics(p)
   // The edge sweep walks every generic body in the project, so it is skipped
   // outright when nothing decodes: the closure SEEDS from the direct set, so
   // with no seed no edge can ever fire. That is what keeps a project that never
   // calls `jsonDecode` — the compiler's own build among them — paying only the
   // per-module `bindsJsonDecode` test above.
-  if (len(gens) == 0) {
+  if (len(gens) == 0 && len(cgens) == 0) {
     return gens
   }
   let edges = []JsonDecodeGenericEdge(0)
+  let classEdges = []JsonDecodeClassEdge(0)
   let ei = 0
   while (ei < len(p.mods)) {
     edges = moduleJsonDecodeEdges(p.mods[ei], ei, edges)
+    classEdges = moduleJsonDecodeClassEdges(p.mods[ei], ei, classEdges)
     ei = ei + 1
   }
-  return closeJsonDecodeGenerics(gens, edges)
+  return closeJsonDecodeGenerics(gens, cgens, edges, classEdges)
 }
 
 // The direct half: `jsonDecode<P>(j)` standing in a generic body, with `P` one
@@ -337,8 +378,15 @@ fn moduleJsonDecodeEdges(
 // a round adds nothing. Bounded by `jsonDecodeGenericRounds` as well: a cycle of
 // mutually generic calls must terminate, and running out of rounds leaves a
 // refusal rather than a wrong program.
+//
+// #6259: `classEdges` feeds the SAME `gens` set `edges` does — reaching a
+// class that decodes into its own type parameter makes the reaching
+// declaration decode into ITS own type parameter, exactly as reaching another
+// decoding generic does. `cgens` is static (a class's own direct needs never
+// grow), so it only needs checking, never itself growing across rounds.
 fn closeJsonDecodeGenerics(
-  gens: []JsonDecodeGeneric, edges: []JsonDecodeGenericEdge,
+  gens: []JsonDecodeGeneric, cgens: []JsonDecodeClassGeneric,
+  edges: []JsonDecodeGenericEdge, classEdges: []JsonDecodeClassEdge,
 ): []JsonDecodeGeneric {
   let round = 0
   let before = -1
@@ -350,6 +398,15 @@ fn closeJsonDecodeGenerics(
         nrecv = e.nrecv,
       }
       if (jsonDecodeEdgeFires(gens, e) && !hasJsonDecodeGeneric(gens, g)) {
+        gens = append(gens, g)
+      }
+    }
+    for ce of classEdges {
+      let g = JsonDecodeGeneric{
+        mod = ce.mod, decl = ce.decl, name = ce.name, tpIndex = ce.tpIndex,
+        nrecv = ce.nrecv,
+      }
+      if (jsonDecodeClassEdgeFires(cgens, ce) && !hasJsonDecodeGeneric(gens, g)) {
         gens = append(gens, g)
       }
     }
@@ -373,14 +430,17 @@ fn jsonDecodeEdgeFires(gens: []JsonDecodeGeneric, e: JsonDecodeGenericEdge): boo
 
 // Every `<exported><P>` call node in this module whose type argument is a type
 // parameter, and which kind: `jdtpOwn` for one the declaration itself declares
-// (resolved per instantiation by the ledger retarget below), `jdtpRecv` for one
-// a generic RECEIVER declared, which stays a refusal.
+// (resolved per instantiation by the ledger retarget below), `jdtpRecv` for
+// one a generic RECEIVER declared.
 //
-// A method on a generic receiver is not a ledger entry at all — Pass A2 never
-// sees it, `lowerMethodInstances` emits it once per nominal instantiation of
-// the receiver, and nothing records the generic calls in the body it emits
-// (#4569). There is therefore no entry to retarget, so this shape is refused in
-// words rather than accepted and left to fail somewhere later.
+// #6259: NEITHER stays a refusal any more. `jdtpRecv` used to — a method on a
+// generic receiver has no ledger entry of its own to retarget the way a
+// function/method's own instantiation does — but it now resolves through
+// `ctx.typeInsts` instead (`JsonDecodeClassGeneric`,
+// `validateJsonDecodeClassGenerics` in classjsondecodegenericretarget.bit).
+// The classification is kept, even though `collectDecodeSitesFor` (below)
+// no longer branches on it, because it is still what a reader asks first:
+// which half of the merged generic list did `P` come from.
 const jdtpOwn = 1
 const jdtpRecv = 2
 
@@ -405,18 +465,6 @@ fn jsonDecodeTypeParamCalls(m: SrcModule, exported: string): map<int, int> {
     }
   }
   return out
-}
-
-// The refusal that stays a refusal, stated as what it is. #3977's message reads
-// as if the reader misspelled a class name, which is exactly wrong here: the
-// spelling is fine and the shape is unsupported.
-fn reportJsonDecodeRecvTypeParam(jx: JsonCtx, targ: int, entry: string) {
-  let tname = jsonNodeText(jx, targ)
-  report(
-    jx.diags, ecJsonDecodeType, getNode(jx.tree, targ).span,
-    "'${entry}' cannot decode into '${tname}': it is a type parameter of the enclosing CLASS, and a method of a generic class is not monomorphized through the instantiation ledger this specialisation is resolved by",
-    "move the decode into a method or free function that declares '${tname}' itself — `get<${tname}>(j: Json): ${tname}!` is resolved per instantiation (#4563)",
-  )
 }
 
 // ---- the decoders the generic path demands ---------------------------------
