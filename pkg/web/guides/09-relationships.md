@@ -36,17 +36,17 @@ import { Db } from "orm"
 import { Dir } from "orm"
 
 @table("articles") class Article {
-  id: i64,
-  title: string,
-  slug: string,
-  body: string,
-  authorId: i64,
+  id: i64
+  title: string
+  slug: string
+  body: string
+  authorId: i64
   @belongsTo("authorId")
-  author: User,
+  author: User
   @manyToMany("article_tags")
-  tags: []Tag,
-  createdAt: i64,
-  updatedAt: i64,
+  tags: []Tag
+  createdAt: i64
+  updatedAt: i64
 }
 
 fn findArticleById(db: Db, id: i64): Article! {
