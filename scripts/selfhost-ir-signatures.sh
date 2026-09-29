@@ -203,7 +203,18 @@
 # MISMATCH, so it needs no signature either. Both retire together at the
 # 0.34.0 repin, same as #6244.
 #
-# explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
+# #6255-table-row-synth-reposition (`types`) and #6254-collection-attr-presyntax
+# (`diags`, also consulted by selfhost-fuzzdiff.sh) -- declared 2026-09-29
+# for epic #6253 (orm/kv redesign). 6255: @table classes gain synthesized
+# statics that share find<T>'s synthesized text, so the oracle's mapper lines
+# move to another column of the same synthesized line (seen on
+# _tests_/cases/run_sql_row_persisted.bit). 6254: the 0.33.0 oracle predates
+# the `@collection` class attribute and reports E0136 on any file using it
+# (_tests_/cases/run_collection_name_static_dispatch.bit and its fuzz
+# truncations). Both retire at the 0.34.0 repin; `diags` has no automated
+# RETIRED audit (like ast/fmt), so 6254 is confirmed dead by hand there.
+#
+# explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
 # forks one fresh awk process, so all state below is per-call — no cross-file
@@ -269,6 +280,55 @@ explainMismatch() {
       }
       return (i > nA) ? 1 : 0
     }
+    # synthReposition (#6255) -- the 0.33.0 oracle types find<T>'s
+    # synthesized row mapper at one column of the synthesized text; #6255
+    # re-plans that text (the @table statics share it), so the SAME
+    # `name: type` lands at another column of the SAME synthesized line,
+    # sometimes twice. `a`/`b` match when they share the line number and
+    # everything after the column, and differ only in the column.
+    function synthReposition(a, b,    ra, rb, la, lb) {
+      if (a !~ /^[0-9]+:[0-9]+: / || b !~ /^[0-9]+:[0-9]+: /) { return 0 }
+      la = a; sub(/:.*/, "", la)
+      lb = b; sub(/:.*/, "", lb)
+      if (la != lb) { return 0 }
+      ra = a; sub(/^[0-9]+:[0-9]+: /, "", ra)
+      rb = b; sub(/^[0-9]+:[0-9]+: /, "", rb)
+      return (ra == rb) ? 1 : 0
+    }
+    # tableRowSynthInsert (#6255) -- jsonAttrImplicitInsert's walk plus
+    # synthReposition pairs. Fails closed the same way: every oracle line
+    # must be consumed by an identical line, a type-resolved pair or a
+    # repositioned synthesized line; tree-only lines are insertions.
+    function tableRowSynthInsert(nA, linesA, nB, linesB,    i, j) {
+      i = 1; j = 1
+      while (i <= nA && j <= nB) {
+        if (linesA[i] == linesB[j]) { i++; j++; continue }
+        if (jsonAttrTypeResolved(linesA[i], linesB[j])) { i++; j++; continue }
+        if (synthReposition(linesA[i], linesB[j])) { i++; j++; continue }
+        j++
+      }
+      return (i > nA) ? 1 : 0
+    }
+    # collectionAttrPresyntax (#6254) -- `--dump-diags` of a file using the
+    # new `@collection` class attribute: the 0.33.0 oracle predates it and
+    # reports E0136 ("'@collection' is not an attribute a class accepts")
+    # where the tree reports nothing. Every tree line must appear in the
+    # oracle in order; the only oracle-only lines allowed are whole E0136
+    # blocks naming '@collection' (the header plus its indented context
+    # lines). Any other oracle-only line fails closed.
+    function collectionAttrPresyntax(nA, linesA, nB, linesB,    i, j, skipped) {
+      i = 1; j = 1; skipped = 0
+      while (i <= nA) {
+        if (j <= nB && linesA[i] == linesB[j]) { i++; j++; continue }
+        if (linesA[i] ~ /^error\[E0136\]: .@collection. is not an attribute a class accepts/) {
+          skipped = 1; i++
+          while (i <= nA && (linesA[i] == "" || (linesA[i] ~ /^[ 0-9]/ && linesA[i] !~ /^[0-9]+:[0-9]+: /))) { i++ }
+          continue
+        }
+        return 0
+      }
+      return (j > nB && skipped) ? 1 : 0
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -286,6 +346,15 @@ explainMismatch() {
         if (jsonAttrImplicitInsert(nA, linesA, nB, linesB)) {
           print "6244-json-attr-implicit-insert"; exit 0
         }
+        if (tableRowSynthInsert(nA, linesA, nB, linesB)) {
+          print "6255-table-row-synth-reposition"; exit 0
+        }
+        exit 1
+      }
+      if (kind == "diags") {
+        if (collectionAttrPresyntax(nA, linesA, nB, linesB)) {
+          print "6254-collection-attr-presyntax"; exit 0
+        }
         exit 1
       }
       # No signature is currently declared for `ir`/`iropt`/`ast`/`fmt` (see
@@ -296,7 +365,7 @@ explainMismatch() {
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
-# declaredSignatureNames [ir|iropt|ast|fmt|types] -- every name explainMismatch
+# declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
 # CAN print for the given dump kind, one per line, in the same order as the
 # `print "…"` statements above (#5509, extended by #5510). The single source
 # of truth for the retirement check in scripts/selfhost-diffdump.sh's
@@ -316,7 +385,8 @@ declaredSignatureNames() {
     fmt) return ;;
     ir) return ;;
     iropt) return ;;
-    types) printf '%s\n' "6244-json-attr-implicit-insert"; return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition"; return ;;
+    diags) printf '%s\n' "6254-collection-attr-presyntax"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6254-collection-attr-presyntax"
 }

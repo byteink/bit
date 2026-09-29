@@ -125,6 +125,52 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
+  # #6255-table-row-synth-reposition: POSITIVE, the run_sql_row_persisted.bit
+  # shape -- inserted @table static lines plus find<T>'s mapper lines moved
+  # to another column of the same synthesized line (once duplicated).
+  oracle_6255=$(printf '2:1: a: int\n76:110: cols: []string\n76:248: __row: User\n')
+  bit2_6255=$(printf '2:1: a: int\n9:14: User: ()\n76:203: cols: []string\n76:203: cols: []string\n76:226: __row: User\n')
+  sig6255=$(explainMismatch "$oracle_6255" "$bit2_6255" types)
+  rc6255=$?
+  if [ "$rc6255" -ne 0 ] || [ "$sig6255" != "6255-table-row-synth-reposition" ]; then
+    echo "FAIL: the #6255 synthesized-mapper reposition shape was not explained (rc=$rc6255 sig='$sig6255')"
+    fail=1
+  fi
+  # #6255: REJECTION -- same line, same column shift, but a DIFFERENT type.
+  oracle_6255r=$(printf '76:110: cols: []string\n')
+  bit2_6255r=$(printf '76:203: cols: []int\n')
+  sig6255r=$(explainMismatch "$oracle_6255r" "$bit2_6255r" types)
+  rc6255r=$?
+  if [ "$rc6255r" -eq 0 ] || [ -n "$sig6255r" ]; then
+    echo "FAIL: a #6255-shaped column shift with a changed type was wrongly explained (rc=$rc6255r sig='$sig6255r')"
+    fail=1
+  fi
+
+  # #6254-collection-attr-presyntax: POSITIVE, the 0.33.0 oracle's E0136
+  # block for `@collection` is its ONLY extra output; the tree says nothing.
+  oracle_6254=$(printf "error[E0136]: '@collection' is not an attribute a class accepts\n  --> m.bit:20:7\n   |\n20 | @json @collection(\"sessions\") class Session {\n   |       ^^^^^^^^^^^^^^^^^^^^^^^ '@json', '@table' are the class attributes\n")
+  sig6254=$(explainMismatch "$oracle_6254" "" diags)
+  rc6254=$?
+  if [ "$rc6254" -ne 0 ] || [ "$sig6254" != "6254-collection-attr-presyntax" ]; then
+    echo "FAIL: the #6254 @collection presyntax shape was not explained (rc=$rc6254 sig='$sig6254')"
+    fail=1
+  fi
+  # #6254: REJECTION -- the same E0136 block plus any other oracle-only
+  # diagnostic, or a tree-only diagnostic, fails closed.
+  oracle_6254r=$(printf "error[E0136]: '@collection' is not an attribute a class accepts\n  --> m.bit:20:7\nerror[E0040]: undefined name 'x'\n  --> m.bit:30:1\n")
+  sig6254r=$(explainMismatch "$oracle_6254r" "" diags)
+  rc6254r=$?
+  if [ "$rc6254r" -eq 0 ] || [ -n "$sig6254r" ]; then
+    echo "FAIL: an extra oracle-only diagnostic beside the #6254 block was wrongly explained (rc=$rc6254r sig='$sig6254r')"
+    fail=1
+  fi
+  sig6254t=$(explainMismatch "" "error[E0040]: undefined name 'x'" diags)
+  rc6254t=$?
+  if [ "$rc6254t" -eq 0 ] || [ -n "$sig6254t" ]; then
+    echo "FAIL: a tree-only diagnostic was wrongly explained as #6254 (rc=$rc6254t sig='$sig6254t')"
+    fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever

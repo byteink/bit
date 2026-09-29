@@ -22,6 +22,8 @@ set -u
 . "$(dirname -- "$0")/alarmrun.sh"
 # shellcheck source=scripts/diffexit.sh
 . "$(dirname -- "$0")/diffexit.sh"
+# shellcheck source=scripts/selfhost-ir-signatures.sh
+. "$(dirname -- "$0")/selfhost-ir-signatures.sh"
 
 # The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
 # OF THIS SAME COMPILER — which is exactly what limits the claim below.
@@ -74,7 +76,7 @@ run() {
   return "$rc"
 }
 
-match=0 mismatch=0 timeout=0 crash=0 firstbad="" firsthang=""
+match=0 mismatch=0 explained=0 timeout=0 crash=0 firstbad="" firsthang=""
 for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | sort); do
   lines=$(wc -l < "$f")
   # Cap truncation points per file (Power-of-10: bounded work per input).
@@ -99,6 +101,10 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
       [ -z "$firstbad" ] && firstbad="$f@$n(crash seed=$src bit2=$brc)"
     elif [ "$seed" = "$b2" ]; then
       match=$((match + 1))
+    elif [ -n "$(explainMismatch "$seed" "$b2" diags)" ]; then
+      # A declared `diags` signature (scripts/selfhost-ir-signatures.sh):
+      # the oracle predates syntax this truncation still contains.
+      explained=$((explained + 1))
     else
       mismatch=$((mismatch + 1))
       [ -z "$firstbad" ] && firstbad="$f@$n"
@@ -106,7 +112,7 @@ for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | so
     n=$((n + step))
   done
 done
-echo "fuzz differential: MATCH=$match MISMATCH=$mismatch CRASH=$crash TIMEOUT=$timeout"
+echo "fuzz differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained CRASH=$crash TIMEOUT=$timeout"
 if [ -n "$firstbad" ]; then
   file=${firstbad%@*}; rest=${firstbad#*@}; nn=${rest%%(*}
   echo "first divergence: $firstbad"
