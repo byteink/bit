@@ -1,0 +1,302 @@
+// pkg/orm/rawsql.test.bit — #6273's acceptance for `pkg/orm/rawsql.bit` /
+// `pkg/orm/db.bit`'s `Db.exec`/`Db.query<T>`/`TxHandle.exec`/
+// `TxHandle.query<T>`.
+//
+// `Conn`/`Stmt`/`Tx`/`Isolation` are imported by ./data.test.bit,
+// `Datasource`/`Adapter`/`pool` by ./db.bit, `Value`/`Rows` by ./write.bit,
+// `sqlValue` by ./repo.bit, `newBuilder` by ./naming.bit, `contains` by
+// ./postgres.bit — all this file's siblings in the same module (SPEC
+// §17.1); a second import of any of them here would be E0042.
+//
+// THE FAKE DRIVER IS ITS OWN, NOT ./query.test.bit's `qryAdapter`/`qryConn`
+// — that fake's `exec` unconditionally fails ("fake: exec not supported"),
+// since #5057 never needed it. `rawAdapter`/`rawConn` below records BOTH
+// `query` and `exec` calls, which is the one thing this ticket's own
+// acceptance needs.
+//
+// `Db{ pool = p }`/`TxHandle{ db = p }` ARE CONSTRUCTED DIRECTLY, never
+// through `open(url)` — `pool`/`db` are module-private fields
+// (`pkg/orm/repo.test.bit`'s own header: "a caller never reaches the
+// connection directly"), reachable from here because this file is IN the
+// module, and it is what lets every test below run in-process against a
+// canned driver with no live server, matching `pkg/orm/query.test.bit`'s
+// own `newQryPool` pattern.
+//
+// THE LIVE PROOFS AT THE BOTTOM (`ORM_TEST_LIVE_PG_URI`/
+// `ORM_TEST_LIVE_MYSQL_URI`) are the acceptance's own words: "round-trips a
+// row on Postgres and MySQL" — skipped, and saying so, when no server is
+// configured, the same convention `pkg/orm/repo.test.bit`/
+// `pkg/orm/write.test.bit`/`pkg/orm/bulk.test.bit` already use.
+//
+// A CALL MIXING TWO VALUE TYPES IN ONE `...values` SPREAD DOES NOT COMPILE
+// — `exec<V>`/`query<T, V>` (`pkg/orm/db.bit`) bind ONE `V` per call (SPEC
+// §10.3: "a variadic parameter... must be last; inside the body it has
+// type `[]T`" — one `T`, not one per argument), the same way
+// `pkg/orm/repo.bit`'s own `where<V>` takes one `V` per call. Every test
+// below binds either a single value or several of the SAME Bit type
+// (`id in (?, ?)`, both `i64`) — never `db.exec(sql, 1, "x")` in one call.
+// Reported on #6273 rather than worked around: a caller needing several
+// DIFFERENTLY-typed bound values in one statement has no host-language
+// syntax to spread them into a single `...values: V` slot today.
+
+@table class RawNote {
+  id: i64,
+  body: string,
+}
+
+class rawCall { sql: string, args: []Value }
+
+class rawRows {
+  cols: []string
+  data: [][]Value
+  i: int
+
+  next(): bool! {
+    this.i = this.i + 1
+    return this.i < len(this.data)
+  }
+
+  columns(): []string {
+    return this.cols
+  }
+
+  value(col: int): Value {
+    return this.data[this.i][col]
+  }
+
+  close() {}
+}
+
+class rawAdapter {
+  queries: []rawCall
+  execs: []rawCall
+  cols: []string
+  rows: [][]Value
+  affected: int
+
+  connect(cfg: Datasource): Conn! {
+    return rawConn{ a = this }
+  }
+}
+
+class rawConn {
+  a: rawAdapter
+
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.queries = append(this.a.queries, rawCall{ sql = sqlText, args = params })
+    return rawRows{ cols = this.a.cols, data = this.a.rows, i = -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.execs = append(this.a.execs, rawCall{ sql = sqlText, args = params })
+    return this.a.affected
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("fake: prepare not supported")
+  }
+
+  begin(): Tx! {
+    fail newError("fake: begin not supported")
+  }
+
+  close() {}
+}
+
+fn newRawPool(a: rawAdapter): Pool {
+  let p = pool(a, Datasource{ host = "fake" }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  return p
+}
+
+fn newRawAdapter(): rawAdapter {
+  return rawAdapter{
+    queries = []rawCall(0), execs = []rawCall(0), cols = []string(0), rows = [][]Value(0), affected = 0,
+  }
+}
+
+fn lastExec(a: rawAdapter): rawCall {
+  return a.execs[len(a.execs) - 1]
+}
+
+fn lastQuery(a: rawAdapter): rawCall {
+  return a.queries[len(a.queries) - 1]
+}
+
+test "Db.exec rewrites ? to $1, $2, ... in order and binds same-typed values, none in the SQL text" {
+  let a = newRawAdapter()
+  a.affected = 2
+  let db = Db{ pool = newRawPool(a) }
+
+  db.exec("delete from note where id = ? or id = ?", i64(1), i64(2)) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let call = lastExec(a)
+  assert(call.sql == "delete from note where id = $1 or id = $2", "got: ${call.sql}")
+  assert(argsEq(call.args, [Value.Int(1), Value.Int(2)]), "bound args did not match")
+}
+
+test "Db.exec: a value containing a quote is bound as a parameter, never interpolated into the SQL text" {
+  let a = newRawAdapter()
+  a.affected = 1
+  let db = Db{ pool = newRawPool(a) }
+  let evil = "'; drop table note; --"
+
+  db.exec("delete from note where body = ?", evil) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let call = lastExec(a)
+  assert(call.sql == "delete from note where body = $1", "got: ${call.sql}")
+  assert(!contains(call.sql, "drop table"), "the value leaked into the SQL text: ${call.sql}")
+  assert(argsEq(call.args, [Value.Text(evil)]), "bound args did not match")
+}
+
+test "Db.exec: a literal ? inside a quoted string is not a placeholder and is not counted" {
+  let a = newRawAdapter()
+  a.affected = 1
+  let db = Db{ pool = newRawPool(a) }
+
+  db.exec("update note set body = 'why?' where id = ?", i64(1)) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let call = lastExec(a)
+  assert(call.sql == "update note set body = 'why?' where id = $1", "got: ${call.sql}")
+  assert(argsEq(call.args, [Value.Int(1)]), "bound args did not match")
+}
+
+test "Db.exec fails, naming the count, rather than panicking, when ? count disagrees with the values supplied" {
+  let a = newRawAdapter()
+  let db = Db{ pool = newRawPool(a) }
+
+  db.exec("delete from note where id = ?", i64(1), i64(2)) catch e {
+    assert(contains(e.message(), "1"), "must name the expected count: ${e.message()}")
+    assert(len(a.execs) == 0, "must issue zero statements")
+    return
+  }
+  assert(false, "a placeholder/value count mismatch must fail")
+}
+
+test "Db.query<T> rewrites ?, binds the value, and decodes the row with T's own __fromRow" {
+  let a = newRawAdapter()
+  a.cols = ["id", "body"]
+  a.rows = [[Value.Int(1), Value.Text("it's a raw sql test")]]
+  let db = Db{ pool = newRawPool(a) }
+
+  let rows = db.query<RawNote>("select * from note where body = ?", "it's a raw sql test") catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  assert(len(rows) == 1, "got ${len(rows)} row(s)")
+  assert(rows[0].id == i64(1), "got id=${rows[0].id}")
+  assert(rows[0].body == "it's a raw sql test", "got body=${rows[0].body}")
+
+  let call = lastQuery(a)
+  assert(call.sql == "select * from note where body = $1", "got: ${call.sql}")
+  assert(!contains(call.sql, "test'"), "the value leaked into the SQL text: ${call.sql}")
+  assert(argsEq(call.args, [Value.Text("it's a raw sql test")]), "bound args did not match")
+}
+
+test "TxHandle.exec/TxHandle.query<T> use the same rewrite and bind rules as Db, on the transaction's own connection" {
+  let a = newRawAdapter()
+  a.affected = 1
+  a.cols = ["id", "body"]
+  a.rows = [[Value.Int(2), Value.Text("tx row")]]
+  let tx = TxHandle{ db = newRawPool(a) }
+
+  tx.exec("update note set body = 'tx row' where id = ?", i64(2)) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  assert(
+    lastExec(a).sql == "update note set body = 'tx row' where id = $1",
+    "got: ${lastExec(a).sql}",
+  )
+
+  let rows = tx.query<RawNote>("select * from note where id = ?", i64(2)) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+  assert(len(rows) == 1 && rows[0].body == "tx row", "got ${len(rows)} row(s)")
+}
+
+// --- live proofs: Postgres and MySQL --------------------------------------
+//
+// #6258's `open(url)` picks the driver from the URL scheme, so ONE scratch
+// project (`import { open } from "orm"` only — never `postgres`/`mysql`
+// directly, rule 1) proves both engines; `driverPkg`/`createNote` are the
+// two things that differ between them.
+//
+// SETUP/TEARDOWN DDL OPENS ITS OWN RAW POOL, the same way
+// `pkg/orm/repo.test.bit`'s own live proof does, and for the same reason
+// stated in `pkg/orm/rawsql.bit`'s header: `exec`/`query`'s `...values: V`
+// cannot be called with ZERO values (a real, filed compiler gap, not this
+// package's choice) — DDL with no placeholders cannot go through
+// `db.exec` today, so it goes through the raw driver pool instead, exactly
+// as `pkg/orm/repo.test.bit`'s setup already does for its own DDL.
+fn rawSqlProofSource(driverPkg: string, createNote: string): string {
+  return "import { args } from \"std/os\"\nimport { pool, Datasource, Value } from \"std/sql\"\nimport { adapter } from \"${driverPkg}\"\nimport { open } from \"orm\"\n\n@table class Note {\n  id: i64,\n  body: string,\n}\n\nfn main(): ()! {\n  let uri = args()[1]\n  let setup = pool(adapter(), Datasource{ uri = uri })?\n  setup.exec(\"drop table if exists note\", []Value(0))?\n  setup.exec(\"${createNote}\", []Value(0))?\n  setup.close()\n\n  let db = open(uri)?\n  let quoted = \"it's a raw sql test\"\n  db.exec(\"insert into note (body) values (?)\", quoted)?\n  let rows = db.query<Note>(\"select * from note where body = ?\", quoted)?\n  if (len(rows) != 1 || rows[0].body != quoted) {\n    panic(\"LIVE PROOF FAILED: exec/query did not round-trip a quoted value\")\n  }\n\n  db.tx((tx) => {\n    tx.exec(\"update note set body = ? where body = ?\", \"updated\", quoted)?\n    let inTx = tx.query<Note>(\"select * from note where body = ?\", \"updated\")?\n    if (len(inTx) != 1) {\n      panic(\"LIVE PROOF FAILED: tx.exec/tx.query did not see the update inside its own transaction\")\n    }\n  })?\n\n  let after = db.query<Note>(\"select * from note where body = ?\", \"updated\")?\n  if (len(after) != 1) {\n    panic(\"LIVE PROOF FAILED: db.tx did not commit\")\n  }\n\n  let mismatched = false\n  db.exec(\"delete from note where id = ?\", i64(1), i64(2)) catch err {\n    mismatched = true\n  }\n  if (!mismatched) {\n    panic(\"LIVE PROOF FAILED: a placeholder count mismatch must fail, not panic or silently run\")\n  }\n\n  print(\"LIVE_PROOF_OK\")\n}\n"
+}
+
+fn runRawSqlLiveProof(envVar: string, name: string, driverPkg: string, createNote: string) {
+  let uri = env(envVar)
+  if (uri == "") {
+    print("  skipped: ${envVar} is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let mysqlAbs = "${repoRoot}/pkg/mysql"
+  let proj = scratchDir("liveproof6273${name}")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof6273${name}\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", rawSqlProofSource(driverPkg, createNote)) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(
+    rc == 0,
+    "live proof against a real ${name} server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}'",
+  )
+  resetDir(proj)
+}
+
+test "live: Db.exec/Db.query<T>/TxHandle.exec/TxHandle.query<T> round-trip a quoted value on Postgres (#6273)" {
+  runRawSqlLiveProof(
+    "ORM_TEST_LIVE_PG_URI", "pg", "postgres",
+    "create table note (id bigint generated always as identity primary key, body text not null)",
+  )
+}
+
+test "live: Db.exec/Db.query<T>/TxHandle.exec/TxHandle.query<T> round-trip a quoted value on MySQL (#6273)" {
+  runRawSqlLiveProof(
+    "ORM_TEST_LIVE_MYSQL_URI", "mysql", "mysql",
+    "create table note (id bigint auto_increment primary key, body text not null)",
+  )
+}
