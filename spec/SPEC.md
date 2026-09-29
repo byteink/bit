@@ -1072,9 +1072,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   building the `Json` value (`std/json`) that `jsonEncode` renders. It is an
   ordinary member: callable, testable, callable across modules, listed by
   `bit doc`, and exported exactly when the class is.
-- The module declaring the class must import *something* from `"std/json"` -
-  the compiler resolves `Json`/`JsonEntry`, the names the member is written
-  in terms of, itself. No import from `"std/json"` at all is **E0142**.
+- The compiler resolves `Json`/`JsonEntry`, the names the member is written
+  in terms of, itself, loading `"std/json"` as an implicit dependency - no
+  import is required (#6244); **E0142** needs `BIT_IMPLICIT_SYNTH_IMPORTS=0`.
 - **The mark is opt-in and it is the consent.** A class without `@json` has no
   `toJson` at all. Synthesizing for every class would expose a field the moment
   someone adds one to a type nobody meant to serialize.
