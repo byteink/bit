@@ -215,7 +215,10 @@
 # contextual keyword, so the tree lexes it as an ident where the oracle lexes
 # kw_from (every file with an import, tokens), names the token differently in
 # a diagnostic, and accepts `from` as a name the oracle rejects
-# (_tests_/cases/run_from_identifier.bit). All retire at the 0.34.0 repin; `diags` has no automated
+# (_tests_/cases/run_from_identifier.bit). #6269-default-id-attr (`ir`/`iropt`):
+# a field named id is the key by default, recorded as an implicit id
+# attribute (_tests_/cases/run_table_name_override.bit). All retire at the
+# 0.34.0 repin; `diags` has no automated
 # RETIRED audit (like ast/fmt), so 6254 is confirmed dead by hand there.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags>
@@ -225,8 +228,8 @@
 # leakage between corpus files. `ast`/`fmt` compare TEXT (an S-expression
 # dump / formatted source), not IR opcodes; `types` compares `--dump-types`
 # TEXT line-for-line (jsonAttrImplicitInsert, #6244); `ir`/`iropt` compare
-# opcode COUNT deltas. No signature is currently declared for `ir`/`iropt`/
-# `ast`/`fmt` (see Retirement history above).
+# opcode COUNT deltas (6269-default-id-attr is the one `ir`/`iropt` signature;
+# none is declared for `ast`/`fmt`, see Retirement history above).
 explainMismatch() {
   awk -v kind="$3" '
     function opcode(line,    s) {
@@ -396,6 +399,28 @@ explainMismatch() {
       }
       return hit
     }
+    # defaultIdAttr (#6269) -- a @table field named id with no @id now
+    # records an implicit id attribute in tableDescriptor(): per such class
+    # the tree builds a one-entry []AttrDesc holding "id" where the oracle
+    # stored nil. Opcode deltas are exactly k times that block (k >= 1):
+    # pre-opt one each of slice_new/gc_alloc/const_string/index_set/field_get
+    # plus 4 const_int; post-opt the same without the const_int. The tree
+    # dump must also contain the "id" string constant.
+    function defaultIdAttr(kind,    k, op, want, seen) {
+      if (index(rawB, "const_string \"id\"") == 0) { return 0 }
+      k = b["rt_call:slice_new"] - a["rt_call:slice_new"]
+      if (k < 1) { return 0 }
+      want["rt_call:slice_new"] = k; want["gc_alloc"] = k; want["const_string"] = k
+      want["index_set"] = k; want["field_get"] = k
+      if (kind == "ir") { want["const_int"] = 4 * k }
+      for (op in a) { seen[op] = 1 }
+      for (op in b) { seen[op] = 1 }
+      for (op in want) { seen[op] = 1 }
+      for (op in seen) {
+        if (b[op] - a[op] != want[op]) { return 0 }
+      }
+      return 1
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -436,9 +461,11 @@ explainMismatch() {
         }
         exit 1
       }
-      # No signature is currently declared for `ir`/`iropt`/`ast`/`fmt` (see
-      # Retirement history above): every divergence under those kinds is
-      # unexplained.
+      if (kind == "ir" || kind == "iropt") {
+        if (defaultIdAttr(kind)) {
+          print "6269-default-id-attr"; exit 0
+        }
+      }
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -462,11 +489,11 @@ declaredSignatureNames() {
   case "$kind" in
     ast) return ;;
     fmt) return ;;
-    ir) return ;;
-    iropt) return ;;
+    ir) printf '%s\n' "6269-default-id-attr"; return ;;
+    iropt) printf '%s\n' "6269-default-id-attr"; return ;;
     types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types"; return ;;
     diags) printf '%s\n' "6254-collection-attr-presyntax" "6264-from-contextual-diags"; return ;;
     tokens) printf '%s\n' "6264-from-contextual-token"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr"
 }
