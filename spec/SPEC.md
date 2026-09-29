@@ -1383,6 +1383,14 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   `toJson` (E0138) and `validateFields` (E0132): letting the hand-written one
   win silently would make `@table` appear to work while `pkg/orm` never sees a
   field it does not already know about.
+- **A field named `id` is the primary key by default.** When no field of the
+  class carries `@id` explicitly, a field literally named `id` gets the
+  identical recorded `AttrDesc{name = "id"}` entry a hand-written `@id` on
+  that field would have produced - so `@table class Person { id: i64, name:
+  string }` needs no `@id` at all. `@id` written explicitly on any field
+  still overrides: once any field carries one, no default is added, and a
+  composite key (`@id` on more than one field) is unaffected either way -
+  this is a presence check, never a count.
 - **`@table("...")` - a table-name override.** `@table` takes at most one
   argument, a non-empty string literal: `@table("people")`. Anything
   else that argument could be - an empty string, a non-literal expression, a
@@ -1605,6 +1613,25 @@ columns, or to construct or serialize one row.
   `Value`, bound as a numbered `$n` argument exactly as `Executor.query`
   takes it (§17's `std/sql` contract) - no value is ever concatenated into
   the SQL text this package builds.
+
+**`pkg/orm`'s `Repo<T>` - a compile-time check on the primary key.**
+
+- `pkg/orm/db.bit` declares `db.table<T: Tabled>(): Repo<T>` -
+  `Repo<T>.find`/`update`/`delete` (`pkg/orm/repo.bit`) each need exactly one
+  primary-key column: `T`'s own `@id` field, or its default (this section's
+  own "a field named `id` is the primary key by default" rule) - the same
+  key `find`/`delete` bind their argument against and `update` writes its
+  `WHERE` by.
+- **A `T` with no single primary key - zero, or a composite key of more than
+  one `@id` field - at a `Repo<T>.find`/`update`/`delete` call site is
+  E0180**, naming `T`, whenever `T` is concrete at that call - reached
+  through `db.table<T>()`'s own resolved instantiation, never a syntactic
+  type argument at the `find`/`update`/`delete` call itself (unlike E0163
+  above, this check follows the receiver's own type through a local
+  variable: `let people = db.table<Person>(); people.find(id)` is checked
+  exactly as `db.table<Person>().find(id)` is). A `T` still generic at its
+  own call site is not checked here; `Repo<T>`'s own methods still refuse
+  the same condition at runtime, naming the class and its key columns.
 
 **`@job("name")` - a stable, explicit background-job dispatch name (#6081).**
 
