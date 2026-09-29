@@ -83,22 +83,6 @@ diffdump_setup() {
   # #6000: IFACE_SIG, BCE_JOIN, JSON_APPEND, and (since #6192) the #5990
   # static-const closure-cell lowering are all gone as flags -- the pinned
   # ORACLE (>= 0.31.0, which carries #6000) already emits every one of them
-  # unconditionally, same as this tree.
-  #
-  # #6190/#6191: BIT_GENERIC_EXPLODE, BIT_DCE_PARAMS and BIT_DCE_METHODS default
-  # ON in this tree as of the 0.32.0 repin, but the pinned 0.32.0 ORACLE (cut
-  # before the flip) carries their code and still defaults them off, so force
-  # "1" on both sides to compare ON-ON. GENERIC_EXPLODE acts at lowering time
-  # and DCE_PARAMS on post-opt IR, so both need this `KIND = ir` block
-  # (mutation-proven for GENERIC_EXPLODE: without it every generic declaration
-  # with an explodable parameter, _tests_/cases/run_generic_arg_ok.bit and 40
-  # others, mismatches in ir and iropt). DCE_METHODS changes emitted method
-  # tables, invisible to a plain `--dump-ir` text diff; forcing it keeps both
-  # sides' method-table shape in lockstep. All three lines are deleted at the
-  # 0.33.0 repin, once the oracle carries the defaults too.
-  if [ "$KIND" = ir ]; then
-    export BIT_GENERIC_EXPLODE=1
-    export BIT_DCE_PARAMS=1
-    export BIT_DCE_METHODS=1
-  fi
+  # unconditionally, same as this tree. So are MAPLIT, STATIC_METHODS,
+  # GENERIC_EXPLODE, DCE_PARAMS and DCE_METHODS since the 0.33.0 repin (#6245).
 }

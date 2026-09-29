@@ -50,13 +50,12 @@ BIT2=bit-out/bin/bit
 # to safepoint -- but it is gone now, and the 0.31.0 ORACLE above carries it
 # unconditionally, same as this tree, so no export is needed.
 #
-# #6191: BIT_DCE_PARAMS (#5949) also moves this count (every jsx_* fixture, a
-# shared runtime helper's dead param) and now defaults ON in this tree as of
-# the 0.32.0 repin -- the segfault #5976 found under BIT_GC=stress was fixed
-# by task-5999's keepalive-base fix, confirmed an ancestor of v0.32.0 before
-# the flip. The pinned 0.32.0 ORACLE still defaults it off, so force "1" on
-# both sides to compare ON-ON. Deleted at the 0.33.0 repin.
-export BIT_DCE_PARAMS=1
+# #6191: the dead-block-param rollout flag (#5949) also moved this count
+# (every jsx_* fixture, a shared runtime helper's dead param) and defaulted ON
+# in this tree as of the 0.32.0 repin -- the segfault #5976 found under
+# BIT_GC=stress was fixed by task-5999's keepalive-base fix, confirmed an
+# ancestor of v0.32.0 before the flip. #6245 deleted the flag once the pinned
+# oracle carried the default too, so no override is needed here any more.
 
 # 60s, not the 20s dump-call convention (diffdump.sh/diffcheck.sh/diffverdict.sh/
 # diffdoc.sh) this used to follow (#3689): this script's calls are a full

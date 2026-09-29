@@ -32,15 +32,12 @@ BIT2=bit-out/bin/bit
 # gone -- the 0.31.0 ORACLE above carries all three unconditionally, same as
 # this tree.
 #
-# #6191: BIT_DCE_PARAMS (#5949) and BIT_DCE_METHODS (#6114) both default ON
-# in this tree as of the 0.32.0 repin -- the segfault #5976 found under
-# BIT_GC=stress was fixed by task-5999's keepalive-base fix, which #6191
-# confirmed is an ancestor of v0.32.0 before flipping the default. The
-# pinned 0.32.0 ORACLE above still defaults both off, and this differential
-# compares emitted OBJECT BYTES, which both flags change, so force "1" on
-# both sides to compare ON-ON. Deleted at the 0.33.0 repin.
-export BIT_DCE_PARAMS=1
-export BIT_DCE_METHODS=1
+# #6191: the dead-block-param (#5949) and dead-method-table (#6114) rollout
+# flags both defaulted ON in this tree as of the 0.32.0 repin -- the segfault
+# #5976 found under BIT_GC=stress was fixed by task-5999's keepalive-base fix,
+# which #6191 confirmed is an ancestor of v0.32.0 before flipping the default.
+# #6245 deleted both flags once the pinned oracle carried the defaults too, so
+# no override is needed here any more.
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
 # corpus's slowest file measured on the IR differentials (25.20s on this tree,
 # 21.86s on the oracle), so a busy box turned a clean run red with no divergence
