@@ -327,6 +327,8 @@ explainMismatch() {
         }
         return 0
       }
+      # An empty tree dump arrives as one empty line.
+      while (j <= nB && linesB[j] == "") { j++ }
       return (j > nB && skipped) ? 1 : 0
     }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
