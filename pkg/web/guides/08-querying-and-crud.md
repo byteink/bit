@@ -6,85 +6,48 @@ The `articles` table exists ([chapter
 20](07-tables-and-migrations-with-pkg-orm.md)), but nothing in Inkwell can read or
 write a row yet. This part gives `GET /articles`, `GET /articles/:id`,
 `POST /articles`, `PUT /articles/:id` and `DELETE /articles/:id` real
-behaviour, backed by `pkg/orm`'s query builder and `save()`. Articles don't
+behaviour, backed by `pkg/orm`'s `db.table<T>()` repository. Articles don't
 have an author you can log in as yet - that arrives in [chapter
 23](10-registering-users-and-hashing-passwords.md) - so for now a request
 names its `authorId` directly.
 
-## The class, and the two functions every other one calls
+## The class
 
 ```bit
-import { Data, Query, TableDesc, find } from "orm"
-import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
-import { Json } from "std/json"
+import { Db } from "orm"
+import { AttrDesc, FieldDesc } from "std/sql"
 
-@table @timestamps class Article {
-  @id
-  id: i64
-  title: string
-  slug: string
-  body: string
-  authorId: i64
-  createdAt: i64
-  updatedAt: i64
-}
-
-fn articlePlaceholder(): Article {
-  return Article{
-    id = 0,
-    title = "",
-    slug = "",
-    body = "",
-    authorId = 0,
-    createdAt = 0,
-    updatedAt = 0,
-  }
-}
-
-fn articleDesc(): TableDesc {
-  return TableDesc{
-    table = "articles", fields = articlePlaceholder().tableDescriptor(),
-    classAttrs = articlePlaceholder().tableAttrs(),
-  }
-}
-
-fn articleMapper(rows: Rows): Article! {
-  let cols = rows.columns()
-  let a = Article{
-    id = sqlReqInt(rows, cols, "id")?,
-    title = sqlReqText(rows, cols, "title")?,
-    slug = sqlReqText(rows, cols, "slug")?,
-    body = sqlReqText(rows, cols, "body")?,
-    authorId = sqlReqInt(rows, cols, "author_id")?,
-    createdAt = sqlReqInt(rows, cols, "created_at")?,
-    updatedAt = sqlReqInt(rows, cols, "updated_at")?,
-  }
-  a.markPersisted(true)
-  return a
-}
-
-fn articles(db: Data): Query<Article> {
-  return find<Article>(db, "articles", articleDesc().fields, articleMapper)
+// `articles`, not the snake_case default `article`, because chapter 7's
+// migration already created the table under that name - `@table("articles")`
+// overrides the default the same way `@table("accounts")` does in the orm
+// package's own docs.
+@table("articles") class Article {
+  id: i64,
+  title: string,
+  slug: string,
+  body: string,
+  authorId: i64,
+  createdAt: i64,
+  updatedAt: i64,
 }
 ```
 
-`articleDesc()` and `articles(db)` are the one place `Article`'s shape is
-spelled out - [Query](../../orm/docs/query.md) covers why `find<T>` takes an
-explicit table name, field list and mapper instead of inferring them.
-`articleMapper` calls `a.markPersisted(true)` before returning: that flag is
-what `save()` reads to decide `INSERT` versus `UPDATE` later in this page,
-and nothing sets it for you on a hand-written mapper - a row that came back
-from a query is, as far as `save()` is concerned, already in the database.
+That is the whole model: no hand-written mapper, no `TableDesc`, no table
+name spelled out a second time anywhere. `id` is the key because it is a
+field literally named `id` - no `@id` attribute needed for a single-column
+key. `db.table<Article>()` (below) hands back a repository that already
+knows how to read a `Rows` into an `Article` and an `Article` back into a
+row, because `@table` generates that mapping for every class that carries
+it.
 
 ## Reading: list and show
 
 ```bit
 import { App, Ctx, Res, badRequest, notFound } from "web"
-import { Dir } from "orm"
 import { parseInt } from "std/strings"
 
-fn findArticleById(db: Data, id: i64): Article! {
-  return articles(db).where("id", Value.Int(id)).oneOrFail()?
+fn findArticleById(db: Db, id: i64): Article! {
+  return db.table<Article>().find(id)?
 }
 
 fn parseId(s: string): i64! {
@@ -109,8 +72,8 @@ fn toArticleView(a: Article): ArticleView {
   }
 }
 
-fn listArticles(c: Ctx, db: Data): Res! {
-  let rows = articles(db).orderBy("createdAt", Dir.Desc).all()?
+fn listArticles(c: Ctx, db: Db): Res! {
+  let rows = db.table<Article>().orderByDesc("createdAt").all()?
   let out = []ArticleView(0)
   for a of rows {
     out = append(out, toArticleView(a))
@@ -118,7 +81,7 @@ fn listArticles(c: Ctx, db: Data): Res! {
   return c.jsonList(out)
 }
 
-fn showArticle(c: Ctx, db: Data): Res! {
+fn showArticle(c: Ctx, db: Db): Res! {
   let id = parseId(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
   }
@@ -128,7 +91,7 @@ fn showArticle(c: Ctx, db: Data): Res! {
   return c.json(toArticleView(a))
 }
 
-export fn mountArticles(app: App, db: Data) {
+export fn mountArticles(app: App, db: Db) {
   let group = app.group("/articles")
   group.get("/", (c) => listArticles(c, db))
   group.get("/:id", (c) => showArticle(c, db))
@@ -151,8 +114,6 @@ Content-Type: application/json
 ## Writing: create, update, delete
 
 ```bit
-import { save } from "orm"
-import { applyTimestamps } from "orm"
 import { minLen } from "web"
 import { now } from "std/time"
 import { newBuilder } from "std/strings"
@@ -188,47 +149,23 @@ export @json class CreateArticleInput {
   authorId: i64
 }
 
-fn articleValues(a: Article): map<string, Value> {
-  return map<string, Value>{
-    "id": Value.Int(a.id), "title": Value.Text(a.title), "slug": Value.Text(a.slug),
-    "body": Value.Text(a.body), "authorId": Value.Int(a.authorId),
-  }
-}
-
-fn createArticle(c: Ctx, db: Data): Res! {
+fn createArticle(c: Ctx, db: Db): Res! {
   let input = c.body<CreateArticleInput>()?
+  let stamp = now().ns
   let a = Article{
     id = 0, title = input.title, slug = slugify(input.title), body = input.body,
-    authorId = input.authorId, createdAt = 0, updatedAt = 0,
+    authorId = input.authorId, createdAt = stamp, updatedAt = stamp,
   }
-  let values = articleValues(a)
-  let desc = applyTimestamps(articleDesc(), values, a.isPersisted(), a.tableAttrs(), now())?
-  let result = save(db, desc, values, a.isPersisted())?
-  let (idv, ok) = result.generated["id"]
-  if (!ok) {
-    fail newError("createArticle: no id returned")
-  }
-  return c.created("${intValue(idv)}")
-}
-
-fn intValue(v: Value): i64 {
-  match (v) {
-    Int(n) => return n
-    _ => return 0
-  }
+  let saved = db.table<Article>().insert(a)?
+  return c.created("${saved.id}")
 }
 ```
 
-`a.isPersisted()` is `false` for the fresh `Article{...}` composite literal
-above, so `save` builds an `INSERT`. `articleValues` never supplies `"id"`
-in a way that reaches the statement: `id` is `t.id("id")`, database-generated
-on Postgres, and `save` excludes a generated identity column from the
-column list it writes and reads the real one back through
-`result.generated["id"]` instead. `applyTimestamps` fills `createdAt` and
-`updatedAt` on the SAME `values` map `save` goes on to read - call
-`articleValues(a)` once and hold onto it, not twice, or the second call
-builds a fresh map that never saw the timestamps ([Write](../../orm/docs/write.md),
-[Timestamps](../../orm/docs/timestamps.md)).
+`db.table<Article>().insert(a)` writes every field but `id` - a database-
+generated identity column, the same `t.id("id")` chapter 7's migration
+declared - and hands back the row the database wrote, `id` filled in. There
+is no separate "read the generated id back" step to remember: `saved.id` is
+already the real one.
 
 Create one, for real:
 
@@ -240,7 +177,7 @@ HTTP/1.1 201 Created
 Location: /articles/1
 ```
 
-The SQL `save` sends, from Postgres's own statement log:
+The SQL `insert` sends, from Postgres's own statement log:
 
 ```text
 insert into articles (title, slug, body, author_id, created_at, updated_at)
@@ -276,7 +213,7 @@ export @json class UpdateArticleInput {
   body: string,
 }
 
-fn updateArticle(c: Ctx, db: Data): Res! {
+fn updateArticle(c: Ctx, db: Db): Res! {
   let id = parseId(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
   }
@@ -286,41 +223,27 @@ fn updateArticle(c: Ctx, db: Data): Res! {
   let input = c.body<UpdateArticleInput>()?
   existing.title = input.title
   existing.body = input.body
-  let values = articleValues(existing)
-  let desc = applyTimestamps(
-    articleDesc(),
-    values,
-    existing.isPersisted(),
-    existing.tableAttrs(),
-    now(),
-  )?
-  save(db, desc, values, existing.isPersisted())?
+  existing.updatedAt = now().ns
+  db.table<Article>().update(existing)?
   return c.json(toArticleView(existing))
 }
 
-import { delete as ormDelete } from "orm"
-
-fn deleteArticle(c: Ctx, db: Data): Res! {
+fn deleteArticle(c: Ctx, db: Db): Res! {
   let id = parseId(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
   }
-  let existing = findArticleById(db, id) catch _ {
+  findArticleById(db, id) catch _ {
     fail notFound("no article with that id")
   }
-  ormDelete(db, articleDesc(), articleValues(existing))?
+  db.table<Article>().delete(id)?
   return c.noContent()
 }
 ```
 
-`delete` is imported under another name on purpose: `delete` is also a
-built-in name (for removing a map key), and a bare, unimported `delete(...)`
-call silently resolves to the wrong one with no diagnostic - a known
-compiler gap. Importing it explicitly, under a name that can't collide, is
-the way every file in this part that calls `orm`'s `delete` writes it.
-
-`existing` came back from `findArticleById`, whose mapper already called
-`markPersisted(true)`, so `save` here builds an `UPDATE`, not a second
-`INSERT`:
+`update` writes every column but `id` itself, by `id` - there is no
+`isPersisted()` flag to check first: `update` is always an `UPDATE`,
+`insert` is always an `INSERT`, and a caller never has to ask a row which
+one it means.
 
 ```
 $ curl -i -X PUT http://127.0.0.1:8080/articles/1 \
@@ -332,12 +255,8 @@ HTTP/1.1 200 OK
 ```
 
 ```text
-update articles set title = $1, slug = $2, body = $3, author_id = $4, updated_at = $5 where id = $6
+update articles set title = $1, slug = $2, body = $3, author_id = $4, created_at = $5, updated_at = $6 where id = $7
 ```
-
-`updated_at` is the only timestamp column in that `SET` list - `applyTimestamps`
-drops `created_at` from the statement entirely on the `UPDATE` branch, so a
-row's real creation time can never be overwritten by editing it later.
 
 ```
 $ curl -i -X DELETE http://127.0.0.1:8080/articles/1
@@ -349,31 +268,27 @@ HTTP/1.1 404 Not Found
 {"error":{"code":"not_found","message":"Not Found","detail":"no article with that id"}}
 ```
 
-## The sharp edge: `one`/`oneOrFail` always carry a limit
+## The sharp edge: `find` always carries a limit
 
-`findArticleById` above ends in `.oneOrFail()`, not `.where(...).all()[0]`.
-Postgres's own log for it reads:
+`findArticleById` above ends in `db.table<Article>().find(id)`, not
+`.where("id", id).all()[0]`. Postgres's own log for it reads:
 
 ```text
 select * from articles where id = $1 limit 2
 ```
 
-`limit 2`, not `limit 1`: `oneOrFail` wants to know if the query matched
-MORE than one row, which a `limit 1` could never tell it. `id` is unique
-here so that never happens, but the same method on a non-unique column
-catches the mistake instead of quietly returning whichever row Postgres
-happened to return first. See [Query](../../orm/docs/query.md)'s "the five
-terminals" for the rest of `all`/`one`/`oneOrFail`/`count`/`exists`.
+`limit 2`, not `limit 1`: `find` wants to know if the key matched MORE than
+one row, which a `limit 1` could never tell it. `id` is unique here so that
+never happens, but the same guard against a broken key column catches the
+mistake instead of quietly returning whichever row Postgres happened to
+return first.
 
 ## What we built
 
 Full CRUD for `articles`: list, show, create, update and delete, all going
-through `pkg/orm`'s `find<T>`/`Query<T>`/`save`/`delete`, with validation on
+through `pkg/orm`'s `db.table<Article>()` repository, with validation on
 the way in and a consistent `{"data": ...}` / `{"error": ...}` envelope on
 the way out.
-
-Specification: [Query](../../orm/docs/query.md), [Write](../../orm/docs/write.md),
-[Timestamps](../../orm/docs/timestamps.md).
 
 Previous: [Tables and migrations with pkg/orm](07-tables-and-migrations-with-pkg-orm.md).
 Next: [Relationships](09-relationships.md).
