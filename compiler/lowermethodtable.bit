@@ -27,9 +27,25 @@
 // lowered, so `typeInsts` here is a prefix of what Pass A3 later walks: every
 // entry named below has a body emitted for it, which is the dangling-reference
 // rule the caller states.
-fn collectMethodEntry(c: Checker, lw: Lowerer, recvName: string, mname: string) {
+// `sinceTypeInst` is 0 for the first, project-wide pass and `lowerProject`'s
+// baseline `typeInsts` length for the #6248 delta pass that closes over
+// instances minted while a generic FUNCTION body was lowered (see
+// `lowerProject`, lowerglobal.bit) — the non-generic branch does not depend
+// on `typeInsts` at all, so it runs once, on the first pass only, and the
+// generic branch resumes scanning where the previous pass left off instead
+// of re-adding entries for instances it already collected.
+fn collectMethodEntry(
+  c: Checker,
+  lw: Lowerer,
+  recvName: string,
+  mname: string,
+  sinceTypeInst: int,
+) {
   let params = declTypeParamIds(c, recvName)
   if (len(params) == 0) {
+    if (sinceTypeInst > 0) {
+      return
+    }
     let recvTy = userTypeLookup(c, recvName)
     lw.methodEntries = append(
       lw.methodEntries,
@@ -40,7 +56,7 @@ fn collectMethodEntry(c: Checker, lw: Lowerer, recvName: string, mname: string) 
     )
     return
   }
-  let i = 0
+  let i = sinceTypeInst
   while (i < len(c.ctx.typeInsts)) {
     let inst = c.ctx.typeInsts[i]
     if (inst.module == c.moduleId && inst.name == recvName && len(inst.args) == len(params)) {
@@ -62,7 +78,7 @@ fn collectMethodEntry(c: Checker, lw: Lowerer, recvName: string, mname: string) 
 // exist before the first body is lowered (#1471). Everything an entry holds is
 // derivable from the decl alone, so this needs no lowering state beyond the
 // module prefix.
-fn collectMethodEntries(mods: []Checker, root: int, lw: Lowerer) {
+fn collectMethodEntries(mods: []Checker, root: int, lw: Lowerer, sinceTypeInst: int) {
   let mi = 0
   while (mi < len(mods)) {
     let c = mods[mi]
@@ -83,7 +99,7 @@ fn collectMethodEntries(mods: []Checker, root: int, lw: Lowerer) {
         let nm = getNode(c.tree, kids[1])
         collectMethodEntry(
           c, lw, typeNodeName(c, kidsOf(c.tree, kids[0])[1]),
-          c.source[nm.span.start:nm.span.end],
+          c.source[nm.span.start:nm.span.end], sinceTypeInst,
         )
       }
       m = m + 1
@@ -152,4 +168,115 @@ fn dispatchedTables(tables: []MethodTable, dispatched: map<int, bool>): []Method
     out = append(out, MethodTable{ typeDisc = t.typeDisc, methods = methods })
   }
   return out
+}
+
+// #6248: whether `c`'s own tree declares at least one method (a `FuncDecl`
+// with a receiver, own type params excluded — same filter as
+// `collectMethodEntries`) on `recvName`. Independent of `collectMethodEntry`'s
+// bookkeeping so it can serve as this ticket's ircheck's oracle rather than
+// restating the same state it is meant to catch a regression in.
+fn declaresAnyMethod(c: Checker, recvName: string): bool {
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let n = getNode(c.tree, m)
+    if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0 && methodOwnGenericCount(c, m) == 0) {
+      let rn = typeNodeName(c, kidsOf(c.tree, kidsOf(c.tree, m)[0])[1])
+      if (rn == recvName) {
+        return true
+      }
+    }
+    m = m + 1
+  }
+  return false
+}
+
+// Memoizes `declaresAnyMethod` across `typeInsts` entries that share a
+// receiver — `Sq<bool>`, `Sq<i64>`, ... all ask the identical AST question,
+// and re-walking the tree once per instance would turn a linear ircheck into
+// a quadratic one on a program with many instantiations of a few generics.
+fn declaresAnyMethodMemo(c: Checker, recvName: string, memo: map<string, bool>): bool {
+  let key = "${c.moduleId}:${recvName}"
+  let (has, present) = memo[key]
+  if (present) {
+    return has
+  }
+  let answer = declaresAnyMethod(c, recvName)
+  memo[key] = answer
+  return answer
+}
+
+fn hasMethodTableFor(tables: []MethodTable, disc: int): bool {
+  let i = 0
+  while (i < len(tables)) {
+    if (tables[i].typeDisc == disc) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// #6248 ircheck: every nominal instantiation of a generic receiver that
+// declares at least one method has a MethodTable entry — existence, not
+// non-emptiness (#6114 may still drop every slot if nothing dispatches to
+// it; that is legal, see `dispatchedTables` above). Independent of
+// `collectMethodEntries`'s own bookkeeping: this walks the CLOSED
+// `ctx.typeInsts` and the declaring module's tree fresh, so a regression
+// that lets an instantiation escape the fixpoint in `lowerProject`
+// (lowerglobal.bit) — the exact shape of #6248, a `Sq<bool>` minted while
+// lowering a generic FUNCTION's body and never folded into `methodTables` —
+// fails HERE, at compile time, instead of shipping a TypeInfo whose method
+// table `bit_rt_iface_lookup` (runtime/root/iface.bit) answers with a null
+// slot and a call site jumps to address 0.
+fn assertMethodTablesCoverInstantiations(mods: []Checker, ctx: TypeContext, tables: []MethodTable) {
+  let memo = map<string, bool>{}
+  let i = 0
+  while (i < len(ctx.typeInsts)) {
+    let inst = ctx.typeInsts[i]
+    if (inst.module >= 0 &&
+      inst.module < len(mods) &&
+      declaresAnyMethodMemo(mods[inst.module], inst.name, memo) &&
+      !hasMethodTableFor(tables, inst.result)) {
+      panic(
+          "#6248: ${inst.name} (type ${inst.result}) declares a method but " +
+          "lowering built no MethodTable for it -- a receiver a table slot " +
+          "would name is missing, which is exactly the runtime jump-to-0 " +
+          "this assertion exists to refuse at compile time",
+      )
+    }
+    i = i + 1
+  }
+}
+
+// `lowerProject`'s (lowerglobal.bit) #6248 fixpoint. `baseline` is the
+// `typeInsts` length Pass A3' closed over before any body lowered. If
+// lowering the project's bodies minted more instances since — a nominal
+// instantiation of a generic receiver reached only from inside a generic
+// FUNCTION's own body, like `Sq<bool>` in `fn make<U>(x: U): Shape { return
+// Sq<U>{...} }` — this re-collects just the delta (`mintMethodId` dedups by
+// (name, sig), so an id an earlier instance already claimed never changes)
+// and rebuilds `tables` from the closed set. Either way, the ircheck above
+// has the final say: it fails loudly if the closure still missed something,
+// rather than shipping a table `bit_rt_iface_lookup` answers with a null slot.
+fn closeLateMethodTables(
+  mods: []Checker, root: int, lowerer: Lowerer, baseline: int, tables: []MethodTable,
+): []MethodTable {
+  let out = tables
+  if (len(mods[root].ctx.typeInsts) > baseline) {
+    collectMethodEntries(mods, root, lowerer, baseline)
+    out = buildMethodTables(lowerer, mods[root].ctx)
+  }
+  assertMethodTablesCoverInstantiations(mods, mods[root].ctx, out)
+  return out
+}
+
+// `lowerProject`'s Pass A3' entry point: collects every method decl into
+// `lowerer.methodEntries` and builds the per-type tables from them, before
+// any body is lowered. Returns the `typeInsts` length observed at that
+// moment too — `closeMethodTablesOverLateInstantiations` above needs it as
+// the baseline for what counts as "minted while a body lowered" (#6248).
+fn collectAndBuildMethodTables(mods: []Checker, root: int, lowerer: Lowerer): (int, []MethodTable) {
+  collectMethodEntries(mods, root, lowerer, 0)
+  let baseline = len(mods[root].ctx.typeInsts)
+  return (baseline, buildMethodTables(lowerer, mods[root].ctx))
 }
