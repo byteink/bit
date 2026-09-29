@@ -280,7 +280,7 @@ explainMismatch() {
       }
       return (i > nA) ? 1 : 0
     }
-    # synthReposition (#6255) -- the 0.33.0 oracle types find<T>'s
+    # synthReposition (#6255) -- the 0.33.0 oracle types the find<T>
     # synthesized row mapper at one column of the synthesized text; #6255
     # re-plans that text (the @table statics share it), so the SAME
     # `name: type` lands at another column of the SAME synthesized line,
@@ -295,7 +295,7 @@ explainMismatch() {
       rb = b; sub(/^[0-9]+:[0-9]+: /, "", rb)
       return (ra == rb) ? 1 : 0
     }
-    # tableRowSynthInsert (#6255) -- jsonAttrImplicitInsert's walk plus
+    # tableRowSynthInsert (#6255) -- the jsonAttrImplicitInsert walk plus
     # synthReposition pairs. Fails closed the same way: every oracle line
     # must be consumed by an identical line, a type-resolved pair or a
     # repositioned synthesized line; tree-only lines are insertions.
@@ -311,10 +311,10 @@ explainMismatch() {
     }
     # collectionAttrPresyntax (#6254) -- `--dump-diags` of a file using the
     # new `@collection` class attribute: the 0.33.0 oracle predates it and
-    # reports E0136 ("'@collection' is not an attribute a class accepts")
+    # reports E0136 (@collection is not an attribute a class accepts)
     # where the tree reports nothing. Every tree line must appear in the
     # oracle in order; the only oracle-only lines allowed are whole E0136
-    # blocks naming '@collection' (the header plus its indented context
+    # blocks naming @collection (the header plus its indented context
     # lines). Any other oracle-only line fails closed.
     function collectionAttrPresyntax(nA, linesA, nB, linesB,    i, j, skipped) {
       i = 1; j = 1; skipped = 0
