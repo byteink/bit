@@ -1590,6 +1590,27 @@ columns, or to construct or serialize one row.
   type, and a scalar has no method set and no object for an interface value
   to point at. Not overloading either - Bit has none (§10.3).
 
+**A `Value`-typed parameter - the same conversion at an ordinary call
+argument (#6280).**
+
+- A parameter declared exactly `std/sql` `Value` - plain, or the element
+  type of a variadic `...values: Value` - accepts any argument `sqlValue`
+  accepts, converted at the call site exactly as `sqlValue(arg)` would
+  convert it: `db.exec("update post set title = ? where id = ?", "x", 5)`
+  and a zero-value call, `db.exec("drop table if exists t")`, both compile.
+  A `Value` argument passes through unchanged.
+- One call may mix several DIFFERENT Bit types in one `...values: Value`
+  spread - `f(1, "x", true, Option.None)` - unlike a single generic `V`
+  (`...values: V` above), which binds one Bit type per call.
+- An argument outside `sqlValue`'s closed set is **E0177**, naming the type
+  - the identical diagnostic an explicit `sqlValue(arg)` call gives, since
+  this rule is defined as exactly that call having been written.
+- `Option.None`, alone, needs no type argument here either (unlike
+  `sqlValue<Option<string>>(Option.None)`, which does: there is no
+  explicit-type-argument spelling at a plain call argument) - `None`
+  converts to `Value.Null` regardless of which `Option<T>` it would have
+  been, so nothing about it needs resolving.
+
 **`pkg/orm`'s find chain - a compile-time check on a literal column name.**
 
 - `pkg/orm/query.bit` declares `find<T>(db, table, fields, mapper):
