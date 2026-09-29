@@ -60,6 +60,23 @@ import { Ctx, Res } from "web"
 import { Db, TxHandle } from "orm"
 import { isSome, unwrap } from "std/core"
 
+// The `author`/`with("author")` side (part 9, "Relationships") is left out
+// here - this page's own transaction never reads it back, and a plain
+// `@manyToMany` field is all `Article` needs to be a full `Tabled` class.
+@table class Tag {
+  id: i64,
+  name: string,
+}
+
+@table class Article {
+  id: i64
+  title: string
+  body: string
+  authorId: i64
+  @manyToMany("article_tags")
+  tags: []Tag
+}
+
 fn findOrCreateTag(tx: TxHandle, name: string): Tag! {
   let tags = tx.table<Tag>()
   let found = tags.where("name", name).first()?
@@ -81,11 +98,7 @@ fn insertArticle(
 ): Article! {
   let articles = tx.table<Article>()
   let a = articles.insert(
-    Article{
-      id = 0, title = title, slug = title, body = body, authorId = authorId,
-      author = User{ id = 0, username = "", email = "", passwordHash = "", role = "" },
-      tags = []Tag(0), createdAt = 0, updatedAt = 0,
-    },
+    Article{ id = 0, title = title, body = body, authorId = authorId, tags = []Tag(0) },
   )?
   let ids = []i64(0)
   for name of tagNames {
