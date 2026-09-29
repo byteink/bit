@@ -1514,6 +1514,24 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   missing row. `findOneOrFail<T>` is, distinguishably from every mapping
   failure.
 
+**`sqlValue<V>` - a plain value as a `std/sql` `Value` (#6256).**
+
+- `std/sql` declares `sqlValue<V>(v: V): Value`, and the compiler
+  **specialises each call** at the concrete type `V` is inferred to, exactly
+  as `find<T>` is - so a package can write a generic `where<V>(col: string,
+  v: V) { ...sqlValue(v)... }` and a caller writes `where("email", email)`,
+  never `Value.Text(email)`.
+- `V` must be `string`, `int`/`i64` (an alias, §11.1 - one type, one kind),
+  `bool`, `f64`, `[]byte`, or `Option<>` of one of those - `Option.None`
+  maps to `Value.Null`. Anything else is **E0177**, naming the type.
+- No class-level mark, no explicit type argument required: `V` is inferred
+  from the argument the ordinary way (§15.3) - unlike `jsonDecode<T>`, `V`
+  appears in `sqlValue`'s own parameter, so nothing about this call can leave
+  it unbound.
+- Not an interface the primitives satisfy: §14.3 admits only a class or enum
+  type, and a scalar has no method set and no object for an interface value
+  to point at. Not overloading either - Bit has none (§10.3).
+
 **`pkg/orm`'s find chain - a compile-time check on a literal column name.**
 
 - `pkg/orm/query.bit` declares `find<T>(db, table, fields, mapper):

@@ -1,0 +1,249 @@
+// compiler/checksqlvalue.bit — `sqlValue<V>` (std/sql, #6256): turning a
+// plain Bit value into `std/sql`'s `Value` at compile time, so a package can
+// write `where<V>(col: string, v: V) { ...sqlValue(v)... }` and a caller
+// writes `where("email", email)` — never `Value.Text(email)`.
+//
+// WHY THIS IS NOT `jsonDecode<T>`'s OWN MECHANISM, despite the same "generic
+// expanded per instantiation" phrasing. `jsonDecode<T>`
+// (classjsondecodecall.bit) resolves `T` SYNTACTICALLY, before any Checker
+// exists, by matching the type argument's literal identifier text — which
+// only works because `T` is always WRITTEN at the call (`jsonDecode<User>(j)`).
+// `sqlValue(v)` never writes `V`; it is inferred from `v`'s own type the same
+// way any ordinary generic call infers a parameter-position type argument
+// (SPEC §15.3) — a purely syntactic pass cannot know a variable's type. So
+// this hooks the pipeline LATER: after ordinary checking has already computed
+// and recorded each call's concrete type argument in the instantiation
+// ledger (`TypeContext.instantiations`, the same bookkeeping every generic
+// call gets), classifies that concrete type, and retargets the ledger
+// entry's `decl` at a hand-written specialisation — the same RETARGET half
+// `jsonDecode<T>`'s own generic-composability extension uses
+// (classjsondecodegeneric.bit/classjsondecodegenericretarget.bit), minus
+// that extension's own complexity, for two reasons:
+//
+//   - every target here (`Value.Text`, `Value.Int`, ...) already lives in
+//     `std/sql` itself — unlike a `@json` class, which can be declared in any
+//     module, there is no cross-module symbol to synthesize or retarget
+//     into, so the ten specialisations below are plain, hand-written,
+//     ordinary Bit functions, never AST-synthesized;
+//   - because the retarget classifies each ledger entry's OWN resolved
+//     `args` (concrete by construction — the ledger only ever records a
+//     concrete instantiation) rather than matching written syntax, a call to
+//     `sqlValue(v)` INSIDE ANOTHER GENERIC (`where<V>` calling `sqlValue(v)`
+//     with `v: V`) composes for free: monomorphizing the outer generic
+//     substitutes `V` throughout its body, including in the nested call,
+//     before this retarget ever runs — there is no "type parameter is not a
+//     name" problem to work around, because nothing here ever resolves by
+//     name. This is deliberately NOT exercised by pkg/orm in this ticket
+//     (out of scope, #6256's own text) but is the reason this file does not
+//     need classjsondecodegenericretarget.bit's ledger-propagation closure.
+//
+// WHY NOT AN INTERFACE THE PRIMITIVES SATISFY. SPEC §14.3: only a class or
+// enum type can satisfy an interface — an interface value IS the receiver's
+// object pointer, and a scalar has no method set and no object to point at.
+// `string`/`int`/`bool`/`f64`/`[]byte` can never implement one, so this
+// candidate is not merely worse, it does not typecheck.
+//
+// WHY NOT OVERLOADING. Bit has none (SPEC §10.3: "One `init` per class; a
+// second is a compile error" generalizes — there is no per-signature
+// dispatch anywhere in the language), so `sqlValue(v: string)` and
+// `sqlValue(v: int)` cannot coexist as two declarations of the same name.
+//
+// THE CLOSED SET. `V` is `string`, `int`/`i64` (an alias, SPEC §11.1 — one
+// type, one kind), `bool`, `f64`, `[]byte`, or `Option<>` of one of those
+// (`Option.None` maps to `Value.Null`). Anything else is a compile error
+// naming the type — **E0177**. An enum stored as text is NOT part of this
+// slice: it needs its own design question (which representation of a
+// variant counts as "text"?) the ticket's acceptance never exercises: left
+// for a follow-up.
+
+// E0177 (#6256): `sqlValue<V>` instantiated with a `V` outside the closed
+// set string/int/i64/bool/f64/[]byte/Option<> of one of those.
+const ecSqlValueBadType = 177
+
+const sqlValueModulePath = "std/sql"
+const sqlValueFuncName = "sqlValue"
+
+// The module id `std/sql` was loaded as, found off any OTHER module's own
+// import map — mirrors `jsonStdModuleId` (classjsondecodegenericretarget.bit)
+// exactly, for the identical reason: `std/sql` cannot import itself (E0044),
+// so its own id is read off an importer instead.
+fn sqlValueStdModuleId(mods: []Checker): int {
+  let i = 0
+  while (i < len(mods)) {
+    let (id, ok) = mods[i].importPaths[sqlValueModulePath]
+    if (ok && id >= 0 && id < len(mods)) {
+      return id
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The five non-Option base kinds `sqlValue` accepts, by concrete TypeId —
+// `""` for anything else. Prim numbers are the seed's own order
+// (`compiler/types.bit`'s `primName`): i64=3, u8=4, f64=9, bool=10,
+// string=11 — the same bare integers roughly ninety other call sites already
+// match against (types.bit's own comment on why they are never named consts).
+// The kind of one of the four accepted PRIM numbers, `""` for any other —
+// split out of `sqlValueBaseKindOfType` to keep its own complexity under
+// `spec/LINT.md`'s ceiling (E0204).
+fn sqlValuePrimKind(prim: int): string {
+  if (prim == 3) {
+    return "int"
+  }
+  if (prim == 9) {
+    return "float"
+  }
+  if (prim == 10) {
+    return "bool"
+  }
+  if (prim == 11) {
+    return "text"
+  }
+  return ""
+}
+
+fn sqlValueBaseKindOfType(ctx: TypeContext, arg: int): string {
+  if (arg <= 0 || arg >= len(ctx.types)) {
+    return ""
+  }
+  let t = ctx.types[arg]
+  if (t.kind == TypeKind.Prim) {
+    return sqlValuePrimKind(t.prim)
+  }
+  if (t.kind == TypeKind.Slice &&
+    ctx.types[t.elem].kind == TypeKind.Prim &&
+    ctx.types[t.elem].prim == 4) {
+    return "blob"
+  }
+  return ""
+}
+
+// The full closed set: a base kind, or `"opt_" + base` for `Option<>` of one
+// (`Option.None` included — its own type is still `Option<base>`, resolved by
+// ordinary inference same as `Some`'s payload). `""` for anything else,
+// which is what makes E0177 fire.
+fn sqlValueKindOfType(ctx: TypeContext, arg: int): string {
+  let base = sqlValueBaseKindOfType(ctx, arg)
+  if (base != "") {
+    return base
+  }
+  if (arg <= 0 || arg >= len(ctx.types)) {
+    return ""
+  }
+  let t = ctx.types[arg]
+  if (t.kind != TypeKind.Enum || !t.hasName || t.name != "Option") {
+    return ""
+  }
+  let (payloads, ok) = ctx.variantPayloads["${arg}.Some"]
+  if (!ok || len(payloads) != 1) {
+    return ""
+  }
+  let inner = sqlValueBaseKindOfType(ctx, payloads[0])
+  if (inner == "") {
+    return ""
+  }
+  return "opt_" + inner
+}
+
+// The hand-written specialisation's name for one kind — shared by the
+// retarget (which looks it up) and `stdlib/sql/sql.bit` (which declares it),
+// so the two can never spell it differently.
+fn sqlValueSpecName(kind: string): string {
+  return "__sql_value_${kind}"
+}
+
+// The one authoritative check that a `sqlValue<V>` instantiation can be
+// resolved. Runs after every module is checked (checkproject.bit), so the
+// ledger already holds every instantiation the check pass recorded — what
+// makes `bit check` and `bit build` agree; the retarget below runs during
+// lowering, which `bit check` never reaches.
+fn validateSqlValueGenerics(mods: []Checker) {
+  let sm = sqlValueStdModuleId(mods)
+  if (sm < 0) {
+    return
+  }
+  let ctx = mods[0].ctx
+  let d = mods[0].diags
+  let i = 0
+  while (i < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[i]
+    if (inst.module == sm && inst.name == sqlValueFuncName) {
+      validateSqlValueInstance(d, ctx, inst)
+    }
+    i = i + 1
+  }
+}
+
+fn validateSqlValueInstance(d: Diagnostics, ctx: TypeContext, inst: Instantiation) {
+  let arg = 0
+  if (len(inst.args) == 1) {
+    arg = inst.args[0]
+  }
+  if (sqlValueKindOfType(ctx, arg) != "") {
+    return
+  }
+  report(
+    d, ecSqlValueBadType, inst.site,
+    "'sqlValue' cannot turn '${typeName(ctx, arg)}' into a 'std/sql' 'Value'",
+    "'sqlValue<V>' accepts 'string', 'int'/'i64', 'bool', 'f64', '[]byte', or 'Option<>' of one of those — wrap '${typeName(
+      ctx,
+      arg,
+    )}' yourself with the matching 'Value' variant instead",
+  )
+}
+
+// Points every `sqlValue<V>` ledger entry at the hand-written specialisation
+// for `V`'s kind, so Pass A2 (lowerinstemit.bit's `lowerInstance`) emits it
+// under the instance symbol the call already names — `retargetJsonDecodeInstances`'s
+// own shape, minus the cross-module lookup: every specialisation lives in
+// `std/sql` itself.
+fn retargetSqlValueInstances(mods: []Checker, root: int, lo: Lowerer) {
+  let sm = sqlValueStdModuleId(mods)
+  if (sm < 0) {
+    return
+  }
+  let ctx = mods[root].ctx
+  let g = 0
+  while (g < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[g]
+    if (inst.module == sm && inst.name == sqlValueFuncName) {
+      retargetOneSqlValueInstance(mods, sm, inst, lo)
+    }
+    g = g + 1
+  }
+}
+
+fn retargetOneSqlValueInstance(mods: []Checker, sm: int, inst: Instantiation, lo: Lowerer) {
+  let ctx = mods[0].ctx
+  let arg = 0
+  if (len(inst.args) == 1) {
+    arg = inst.args[0]
+  }
+  let kind = sqlValueKindOfType(ctx, arg)
+  let decl = 0
+  if (kind != "") {
+    let (dn, ok) = mods[sm].funcDecls[sqlValueSpecName(kind)]
+    if (ok) {
+      decl = dn
+    }
+  }
+  if (decl == 0) {
+    // Unreachable through `bit build`, which checks first (`validateSqlValueGenerics`
+    // already refused any kind this cannot classify) — but the template's own
+    // stub body computes nothing, so falling through would ship a program
+    // that fails at RUN TIME. Refuse instead, the same defensive fallback
+    // `retargetOneJsonDecodeInstance` takes.
+    lo.stubbed = append(
+      lo.stubbed,
+      StubbedFn{
+        name = inst.name, span = inst.site,
+        reason = "a 'sqlValue<V>' call whose type argument has no matching specialisation",
+        note = "", noteSite = pointSpan(0, 0),
+      },
+    )
+    return
+  }
+  inst.declModule = sm
+  inst.decl = decl
+}
