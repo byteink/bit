@@ -1,150 +1,148 @@
 # Indexes
 
-`tx.scan` reads tasks back in id order, but the task tracker also needs to
-ask "which tasks are urgent" without walking every task and checking its
+`tasks.all()` reads tasks back in id order, but the task tracker also needs
+to ask "which tasks are urgent" without walking every task and checking its
 priority by hand. That is what a secondary index is for: a lookup by some
 field other than the id, kept up to date automatically as tasks are saved
 and removed.
 
 <!-- doctest: per-block -->
 
-## A typed collection with a declared index
+## Declaring an index
 
-Working in raw `[]byte` for every task gets old fast, and a hand-written
-index has to be kept in sync with the records it indexes by hand too.
-`Collection<T>` does both: it takes a `marshal`/`unmarshal` pair for `T`, and
 `declareIndex` registers a closure that computes an index key from a `T` -
-`save` then maintains that index in the same transaction as the record
-itself, so the two can never be observed out of sync.
+every `set` on that collection from then on keeps the index in the same
+transaction as the record itself, so the two can never be observed out of
+sync. The closure's return value is a key built with `encodeInt`,
+`encodeFloat` or `encodeString` - whichever matches the field's type, so the
+index sorts (and matches ranges) the way the field's own values compare, not
+the way their raw bytes happen to:
 
 ```bit
-import { Collection, createDb, declareIndex, encodeInt, newCollection } from "kv"
-import { jsonDecode, jsonEncode, jsonParse } from "std/json"
+import { Collection, declareIndex, encodeString, open } from "kv"
+
+@json class Task {
+  title: string,
+  status: string,
+}
+
+fn taskStatusKey(t: Task): []byte {
+  return encodeString(t.status)
+}
+
+fn declareStatusIndex(tasks: Collection<Task>): ()! {
+  declareIndex<Task>(tasks, "status", taskStatusKey)?
+}
+
+fn main(): ()! {
+  let store = open("tasks.kv")?
+  let tasks = store.collection<Task>()
+  declareStatusIndex(tasks)?
+
+  tasks.set(1, Task{ title = "Pack for the trip", status = "urgent" })?
+  tasks.set(2, Task{ title = "Buy plane tickets", status = "done" })?
+  tasks.set(3, Task{ title = "Water the plants", status = "urgent" })?
+
+  let urgent = tasks.by("status", encodeString("urgent"))?
+  for t of urgent {
+    println("urgent: ${t.title}")
+  }
+  let all = tasks.all()?
+  println("${len(all)} task(s) total")
+}
+```
+
+`tasks.by("status", encodeString("urgent"))` returns every task whose
+`taskStatusKey` encodes to `"urgent"` - "Pack for the trip" and "Water the
+plants" here, in the order they were saved. `all()` ignores every index and
+returns every saved task, in id order.
+
+## A numeric index
+
+`encodeInt`/`decodeInt` and `encodeFloat`/`decodeFloat` do the same job for
+number-valued fields - the raw bytes of a negative number do not sort before
+a positive one, so an index keyed by a plain cast would silently return
+tasks in the wrong order. Index by priority instead of status:
+
+```bit
+import { Collection, declareIndex, decodeInt, encodeInt, open } from "kv"
 
 @json class Task {
   title: string,
   priority: i64,
 }
 
-fn marshalTask(t: Task): []byte {
-  return []byte(jsonEncode(t.toJson()))
-}
-
-fn unmarshalTask(b: []byte): Task! {
-  let j = jsonParse(string(b))?
-  return jsonDecode<Task>(j)?
-}
-
 fn taskPriorityKey(t: Task): []byte {
   return encodeInt(t.priority)
 }
 
-fn main(): ()! {
-  let db = createDb("tasks.kv")?
-  let tasks = newCollection<Task>("tasks", marshalTask, unmarshalTask)
+fn declarePriorityIndex(tasks: Collection<Task>): ()! {
   declareIndex<Task>(tasks, "priority", taskPriorityKey)?
+}
 
-  db.write((tx) => {
-    tasks.save(tx, encodeInt(1), Task{ title = "Pack for the trip", priority = 2 })?
-    tasks.save(tx, encodeInt(2), Task{ title = "Buy plane tickets", priority = 1 })?
-    tasks.save(tx, encodeInt(3), Task{ title = "Water the plants", priority = 2 })?
-  })?
+fn main(): ()! {
+  let store = open("tasks.kv")?
+  let tasks = store.collection<Task>()
+  declarePriorityIndex(tasks)?
 
-  db.write((tx) => {
-    let urgent = tasks.by(tx, "priority", encodeInt(1))?
-    for t of urgent {
-      println("urgent: ${t.title}")
-    }
-    let all = tasks.all(tx)?
-    println("${len(all)} task(s) total")
-  })?
+  tasks.set(1, Task{ title = "Pack for the trip", priority = 2 })?
+  tasks.set(2, Task{ title = "Buy plane tickets", priority = 1 })?
 
-  db.close()
+  let top = tasks.by("priority", encodeInt(1))?
+  println(top[0].title)
+  println("${decodeInt(encodeInt(1))}")
 }
 ```
-
-`tasks.by(tx, "priority", encodeInt(1))` returns every task whose
-`taskPriorityKey` encodes to `1` - just "Buy plane tickets" here. `all(tx)`
-ignores the index entirely and returns every saved task, the same way
-`tx.scan` did in the previous chapter, just already unmarshaled back into
-`Task` values.
 
 ## The database survives a restart
 
 The task tracker's whole point is that a task saved today is still there
-tomorrow. `openDb` reopens an existing file - declare the same collection and
-the same index again (nothing about either is stored on disk, only the
+tomorrow. `open` reopens an existing file the same way it creates a new one
+- declare the same index again (nothing about it is stored on disk, only the
 records and their index entries are) and carry on:
 
 ```bit
-import { Collection, createDb, declareIndex, encodeInt, newCollection, openDb } from "kv"
-import { jsonDecode, jsonEncode, jsonParse } from "std/json"
+import { Collection, declareIndex, encodeString, open } from "kv"
 
 @json class Task {
   title: string,
-  priority: i64,
+  status: string,
 }
 
-fn marshalTask(t: Task): []byte {
-  return []byte(jsonEncode(t.toJson()))
+fn taskStatusKey(t: Task): []byte {
+  return encodeString(t.status)
 }
 
-fn unmarshalTask(b: []byte): Task! {
-  let j = jsonParse(string(b))?
-  return jsonDecode<Task>(j)?
-}
-
-fn taskPriorityKey(t: Task): []byte {
-  return encodeInt(t.priority)
-}
-
-fn openTasks(): Collection<Task> {
-  let tasks = newCollection<Task>("tasks", marshalTask, unmarshalTask)
+fn openTasks(): Collection<Task>! {
+  let store = open("tasks.kv")?
+  let tasks = store.collection<Task>()
+  declareIndex<Task>(tasks, "status", taskStatusKey)?
   return tasks
 }
 
 fn main(): ()! {
-  let db = createDb("tasks.kv")?
-  let tasks = openTasks()
-  declareIndex<Task>(tasks, "priority", taskPriorityKey)?
-  db.write((tx) => {
-    tasks.save(tx, encodeInt(1), Task{ title = "Pack for the trip", priority = 2 })?
-  })?
-  db.close()
+  let tasks = openTasks()?
+  tasks.set(1, Task{ title = "Pack for the trip", status = "urgent" })?
 
   // The app restarts; nothing above is held in memory anymore.
-  let reopened = openDb("tasks.kv")?
-  let reopenedTasks = openTasks()
-  declareIndex<Task>(reopenedTasks, "priority", taskPriorityKey)?
-  reopened.write((tx) => {
-    let t = reopenedTasks.get(tx, encodeInt(1))?
-    println(t.title)
-    reopenedTasks.delete(tx, encodeInt(1))?
-  })?
-  reopened.write((tx) => {
-    let remaining = reopenedTasks.all(tx)?
-    println("${len(remaining)} task(s) left")
-  })?
-  reopened.close()
+  let reopened = openTasks()?
+  let t = reopened.get(1)?
+  println(t.title)
+  reopened.delete(1)?
 }
 ```
-
-`Collection.get` fails the same way `Tx.get` does when the id has no record.
-`Collection.delete` removes the record and every index entry it had in one
-step - a completed task disappears from both `all()` and any `by()` lookup
-that used to match it.
 
 ## Sharp edges
 
 `declareIndex` has to be called again on every open, on every `Collection`
 value - nothing about an index is stored on disk, only the records and the
-index entries `save` wrote for them. Reopen a database and forget to
+index entries `set` wrote for them. Reopen a database and forget to
 redeclare an index and `by()` on it returns nothing, silently: there is no
 entry to find, not because none match, but because the index was never
 rebuilt this run.
 
 ## Where to go next
 
-[Getting started](getting-started.md) for `createDb`/`openDb` and the raw
-`Tx` this chapter builds on, and [Transactions](transactions.md) for what
-happens to `save`/`delete` when the surrounding block fails.
+[Getting started](getting-started.md) for `open` and `store.collection<T>()`
+this chapter builds on, and [Transactions](transactions.md) for what happens
+to `set`/`delete` when the surrounding `store.tx` block fails.

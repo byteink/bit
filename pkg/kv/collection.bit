@@ -1,5 +1,5 @@
-// pkg/kv/collection.bit — the typed collection layer (#3467, #5724): `save`/
-// `get`/`delete`/`all`/`by` over #5721's `Tx`, with declared secondary
+// pkg/kv/collection.bit — the typed collection layer (#3467, #5724, #6257):
+// `set`/`get`/`delete`/`all`/`by` over #5721's `Tx`, with declared secondary
 // indexes maintained inside the same transaction as the record they index.
 //
 // USES ONLY THE ENGINE'S PUBLIC API — `Tx.get`/`put`/`delete`/`scan`, never a
@@ -29,39 +29,85 @@
 //
 // THE PROPERTY THIS FILE EXISTS FOR: an index entry and the record it
 // indexes are never observable apart, even transiently within one `tx`.
-// `save()` on an id that already has a record reads the OLD value first (the
-// only way to know which index entries are now stale), deletes every stale
-// index entry, writes the new record, then writes every new index entry —
-// all before returning, all in the caller's own `tx`. Saving a brand-new id
-// only ever adds entries, which is why a test that never re-saves cannot
-// exercise this: see collection.test.bit's re-save test for the property
-// the ticket's acceptance names by name.
+// `kvCollSave` on an id that already has a record reads the OLD value first
+// (the only way to know which index entries are now stale), deletes every
+// stale index entry, writes the new record, then writes every new index
+// entry — all before returning, all in the caller's own `tx`. Saving a
+// brand-new id only ever adds entries, which is why a test that never
+// re-saves cannot exercise this: see collection.test.bit's re-save test for
+// the property the ticket's acceptance names by name.
 //
-// T MARSHALING IS THE CALLER'S, NOT THIS FILE'S. `Collection<T>` never
-// inspects a `T` value's shape — it calls two caller-supplied closures,
-// `marshal`/`unmarshal` (`newCollection`), the same way `declareIndex`'s
-// `keyOf` is caller-supplied. This sidesteps #4495 (a generic METHOD calling
-// a method on its own class's type parameter does not lower: `E0092`) by
-// never calling a method ON a `T` value from inside a generic method here —
-// only closure values are invoked. `pkg/web/res.bit`'s own `Jsonable`
-// header documents the same bug from the other side. The existing
-// marshaling convention this codebase already has — verified before writing
-// any of this — is `@json` (SPEC §10.5): a class carrying it gets a
-// synthesized `toJson(): Json`, paired with `stdlib/json`'s `jsonEncode`/
-// `jsonParse`/`jsonDecode<T>`. `collection.test.bit`'s `Widget` fixture
-// builds its `marshal`/`unmarshal` closures out of exactly that pair, rather
-// than this file inventing a second, competing marshaling contract.
+// #6257: THE ID IS `i64`, ENCODED AT THE BOUNDARY. `Collection<T>`'s own
+// surface (`set`/`get`/`delete`) takes `id: i64`, converted to the sortable
+// `encodeInt(id)` bytes right here before touching `kvRecordKey`/
+// `kvIndexKey` — every byte-level helper below is unchanged from before this
+// ticket, still keyed on `[]byte`, so `declareIndex`'s `keyOf` and `by`'s
+// `value` still take pre-encoded bytes exactly as they always have.
 //
-// SIGN OF ZERO: NOT THIS FILE'S TO CANONICALIZE (epic #3467 comment 9's own
-// hazard, decided here). `-0.0 == 0.0` in the language, but #5715's
-// `encodeFloat` keeps them byte-distinct by design (its own contract, not
-// to be collapsed). This file never calls `encodeFloat` itself — only a
-// caller's `keyOf` does, when indexing a float field — so it cannot
-// canonicalize a value it never sees. Documented decision, per the epic
-// comment's own two options: `-0.0` and `0.0` are DISTINCT index keys here,
-// exactly as `encodeFloat` already treats them; a caller wanting them to
-// collide must normalize the sign itself before calling `encodeFloat` in
-// its own `keyOf`.
+// #6257: T IS `@json`, DECODED VIA A CLOSURE BUILT WHERE T IS CONCRETE, NOT
+// A CALLER-SUPPLIED MARSHAL PAIR. Encoding is a direct `v.toJson()` call —
+// an ordinary interface-bound generic call, and it lowers fine from any of
+// this file's own generic functions (`kvCollSave` below, bound `T:
+// KvJsonable`). Decoding is different: `jsonDecode<T>(j)` refused to lower
+// (`E0092: cannot lower a 'jsonDecode<T>' inside a generic body whose type
+// argument has no synthesized decoder`) every time `T` was a GENERIC CLASS's
+// own type parameter, reached either directly inside a `Collection<T>`
+// method (a checker-time refusal, E0145: "a method of a generic class is not
+// monomorphized through the instantiation ledger this specialisation is
+// resolved by") or through a free-function wrapper called from one (a
+// lowering-time refusal — both measured on this branch with `bit check`/
+// `bit run`, `T = Dog` via `@json class Dog { n: string }`). Filed as a
+// compiler ticket rather than worked around with a caller-supplied
+// `unmarshal` closure: `jsonDecode<T>`'s own generic-retarget mechanism
+// (#4563, compiler/classjsondecodegeneric.bit) synthesizes a decoder "where
+// `T` is the enclosing generic's OWN type parameter" and explicitly
+// documents that path as a FUNCTION's or METHOD's own `generic_params` —
+// #4569 later taught the lowerer to re-walk a generic class's method bodies
+// per receiver instantiation for an ORDINARY generic call, but #4563's own
+// retarget lookup does not consult that second walk, so `jsonDecode<T>`
+// specifically still fails exactly where `v.toJson()` and every other
+// generic call already succeed.
+//
+// THE WORKAROUND, MEASURED TO WORK: build the decode closure at the one
+// point `T` is concrete through a mechanism that already lowers — a METHOD
+// declaring `T` AS ITS OWN generic parameter (`Db.collection<T>`,
+// `Tx.collection<T>` in db.bit), matching #4563's own "declares T itself"
+// requirement. `(j) => jsonDecode<T>(j)?` closes over that method's `T` at
+// its point of instantiation and is stored once on the `Collection<T>`
+// value; every later `get`/`all`/`by` call just invokes the closure field,
+// which is ordinary closure dispatch with no generic-decode call in it.
+// `decodeFn: (Json) => T!` is therefore NOT a caller-supplied marshal
+// closure (nothing outside this module ever builds or sees one) — it is
+// this file's own answer to a lowering gap, built once per `collection<T>()`
+// call and invisible to every consumer of the public API.
+//
+// #6254 (a sibling ticket) adds `T.__collectionName()`, at which point
+// `Db.collection<T>()`/`Tx.collection<T>()` gain a second, no-argument
+// overload that reads it instead of taking `name` — this file's own
+// `Collection<T>` value and every helper below are unaffected either way,
+// since `name` is only ever consumed as a plain string once the collection
+// is built.
+
+import { Json, jsonDecode, jsonEncode, jsonParse } from "std/json"
+
+// A value a `Collection<T>` can store: whatever `@json` (SPEC §10.5)
+// synthesizes. Structural (SPEC §14.3), so any `@json class` satisfies it
+// with no declaration of its own.
+export interface KvJsonable {
+  toJson(): Json,
+}
+
+// `T`'s own collection name, read with no instance in hand — SPEC §10.5's
+// own naming for exactly this bound: "`T.__collectionName()` for a `T`
+// bound by `interface Stored { static __collectionName(): string }`". Every
+// `@json` class synthesizes this unconditionally (#6254), so any `T:
+// KvJsonable` already satisfies it too; kept as its own interface, matching
+// the spec's own name, rather than folded into `KvJsonable` — nothing here
+// needs the two bounds joined except `Db.collection<T>`/`Tx.collection<T>`'s
+// no-argument form.
+export interface Stored {
+  static __collectionName(): string,
+}
 
 // One caller-declared secondary index: a name plus the closure that turns a
 // `T` into the bytes it is indexed under. Module-private — reached only
@@ -71,132 +117,123 @@ class kvIndexDef<T> {
   keyOf: (T) => []byte,
 }
 
-// One name-prefixed collection over a `Db`'s shared key/value space. Built
-// by `newCollection`, never by a bare `Collection<T>{...}` literal (its
-// fields are module-private, matching `Tx`/`Db` in `pkg/kv/db.bit`).
-export class Collection<T> {
-  name: string
-  marshal: (T) => []byte
-  unmarshal: ([]byte) => T!
-  indexes: []kvIndexDef<T>
-  // Reads the current record at `id` (if any), removes every stale index
-  // entry it implies, writes the new record, then writes every new index
-  // entry — all inside the caller's own `tx`. See this file's header for
-  // why the read-before-write is load-bearing, not optional.
-  export save(
-    tx: Tx,
-    id: []byte,
-    value: T,
-  ): ()! {
-    let recKey = kvRecordKey(this.name, id)
-    let existing = kvTxGetOrNone(tx, recKey)
-    if (isSome(existing)) {
-      let oldValue = this.unmarshal(unwrap(existing))?
-      let i = 0
-      while (i < len(this.indexes)) {
-        let idx = this.indexes[i]
-        tx.delete(kvIndexKey(this.name, idx.name, idx.keyOf(oldValue), id))?
-        i = i + 1
-      }
-    }
-    tx.put(recKey, this.marshal(value))?
-    let j = 0
-    while (j < len(this.indexes)) {
-      let idx = this.indexes[j]
-      tx.put(kvIndexKey(this.name, idx.name, idx.keyOf(value), id), id)?
-      j = j + 1
-    }
+// `Db.collection<T>`/`Tx.collection<T>`'s own name argument, resolved: at
+// most one override (`...name: string`, the same "optional single value via
+// variadic" idiom `pkg/web/errors.bit`'s `oneDetail` uses — Bit has no
+// default arguments and no overloading, SPEC §10.3/§10.4), defaulting to
+// `T.__collectionName()` when none was given.
+fn kvCollectionName<T: Stored>(name: []string): string {
+  if (len(name) > 1) {
+    panic("kv: collection<T>() takes at most one name override, got ${len(name)}")
   }
-  // The record at `id`, or a failure naming it absent (`Tx.get`'s own
-  // "key not found").
-  export get(
-    tx: Tx,
-    id: []byte,
-  ): T! {
-    let raw = tx.get(kvRecordKey(this.name, id))?
-    return this.unmarshal(raw)?
+  if (len(name) == 1) {
+    return name[0]
   }
-  // Removes the record at `id` and every index entry it had — a no-op, not
-  // a failure, if `id` has no record (matches `Tx.delete`'s own semantics).
-  export delete(
-    tx: Tx,
-    id: []byte,
-  ): ()! {
-    let recKey = kvRecordKey(this.name, id)
-    let existing = kvTxGetOrNone(tx, recKey)
-    if (isNone(existing)) {
-      return
-    }
-    let oldValue = this.unmarshal(unwrap(existing))?
-    tx.delete(recKey)?
-    let i = 0
-    while (i < len(this.indexes)) {
-      let idx = this.indexes[i]
-      tx.delete(kvIndexKey(this.name, idx.name, idx.keyOf(oldValue), id))?
-      i = i + 1
-    }
-  }
-  // Every saved record in this collection, regardless of any index — a
-  // prefix scan over the collection's own record key space.
-  export all(
-    tx: Tx,
-  ): []T! {
-    let (lo, hi) = kvPrefixRange(kvRecordPrefix(this.name))
-    let raws = tx.scan(lo, hi)?
-    let out: []T = []T(0)
-    let i = 0
-    while (i < len(raws)) {
-      out = append(out, this.unmarshal(raws[i])?)
-      i = i + 1
-    }
-    return out
-  }
-  // Every record whose `index`-declared field equals `value` (already
-  // encoded, e.g. via #5715's `encodeInt`/`encodeFloat`/`encodeString`) — a
-  // prefix scan over that index's value range, then one record read per
-  // match. A `value` that matches no declared index's entries simply
-  // returns empty; `index` naming a never-declared index does too, the same
-  // way an empty prefix scan reads no differently from one that never had
-  // entries — no query language or planner here (this ticket's own scope).
-  export by(
-    tx: Tx,
-    index: string,
-    value: []byte,
-  ): []T! {
-    let (lo, hi) = kvPrefixRange(kvIndexValuePrefix(this.name, index, value))
-    let ids = tx.scan(lo, hi)?
-    let out: []T = []T(0)
-    let i = 0
-    while (i < len(ids)) {
-      let raw = tx.get(kvRecordKey(this.name, ids[i]))?
-      out = append(out, this.unmarshal(raw)?)
-      i = i + 1
-    }
-    return out
-  }
+  return T.__collectionName()
 }
 
-// Builds a `Collection<T>` named `name`, storing records via `marshal`/
-// `unmarshal`. A generic FUNCTION returning `Collection<T>{...}`, the same
-// shape `pkg/orm/query.bit`'s `find<T>` uses (and the one #5320 fixed: a
-// literal `Collection<Widget>{...}` written outside a generic body is a
-// second, working way to reach the same construction, but this file offers
-// only the generic-function form since it needs no caller-visible fields).
-export fn newCollection<T>(
-  name: string, marshal: (T) => []byte, unmarshal: ([]byte) => T!,
-): Collection<T> {
-  return Collection<T>{
-    name = name, marshal = marshal, unmarshal = unmarshal, indexes = []kvIndexDef<T>(0),
+// A single mutable slot, used only to carry a value back out of the
+// `Db.tx()` closure `kvRunValue` runs it in — `db.tx`'s own signature is
+// `(Tx) => ()!`, so a caller that needs a VALUE back (`get`/`all`/`by`,
+// outside an explicit `store.tx` block) has nothing else to capture it into.
+// A one-element slice rather than `Option<R>`: it is already the zero value
+// with no generic constructor call needed, and every write path here always
+// appends exactly once before the slice is read.
+fn kvRunValue<R>(db: Db, f: (Tx) => R!): R! {
+  let out: []R = []R(0)
+  db.tx((tx) => {
+    let v = f(tx)?
+    out = append(out, v)
+  })?
+  return out[0]
+}
+
+// One name-prefixed collection over a `Db`'s shared key/value space. Built
+// only by `Db.collection<T>`/`Tx.collection<T>` (db.bit) — never by a bare
+// `Collection<T>{...}` literal outside this module, matching `Tx`/`Db`'s own
+// convention (module-private fields).
+export class Collection<T: KvJsonable> {
+  name: string
+  db: Db
+  activeTx: Option<Tx>
+  decodeFn: (Json) => T!
+  indexes: []kvIndexDef<T>
+
+  // Runs `f` against whichever `Tx` this collection already belongs to (a
+  // `Tx.collection<T>()` handle, inside a `store.tx()` block), else opens a
+  // fresh `db.tx()` for exactly this one call — the "outside a tx, every
+  // call runs in its own transaction" rule the ticket asks for.
+  runWrite(f: (Tx) => ()!): ()! {
+    if (isSome(this.activeTx)) {
+      f(unwrap(this.activeTx))?
+      return
+    }
+    this.db.tx(f)?
+  }
+
+  // `runWrite`, returning what `f` returned.
+  runRead<R>(f: (Tx) => R!): R! {
+    if (isSome(this.activeTx)) {
+      return f(unwrap(this.activeTx))?
+    }
+    return kvRunValue<R>(this.db, f)?
+  }
+
+  export set(id: i64, v: T): ()! {
+    let key = encodeInt(id)
+    this.runWrite((tx) => {
+      kvCollSave(this, tx, key, v)?
+    })?
+  }
+
+  // The record at `id`, or a failure naming it absent (`Tx.get`'s own
+  // "key not found").
+  export get(id: i64): T! {
+    let key = encodeInt(id)
+    return this.runRead<T>((tx) => {
+      return kvCollGet(this, tx, key)?
+    })?
+  }
+
+  // Removes the record at `id` and every index entry it had — a no-op, not
+  // a failure, if `id` has no record (matches `Tx.delete`'s own semantics).
+  export delete(id: i64): ()! {
+    let key = encodeInt(id)
+    this.runWrite((tx) => {
+      kvCollDelete(this, tx, key)?
+    })?
+  }
+
+  // Every saved record in this collection, regardless of any index, in id
+  // order — `encodeInt` preserves numeric order under plain byte comparison
+  // (keyencoding.bit), and this is a prefix scan over the collection's own
+  // record key space, which the B+tree already returns key-ordered.
+  export all(): []T! {
+    return this.runRead<[]T>((tx) => {
+      return kvCollAll(this, tx)?
+    })?
+  }
+
+  // Every record whose `index`-declared field equals `value` (already
+  // encoded, e.g. via `encodeInt`/`encodeFloat`/`encodeString`) — a prefix
+  // scan over that index's value range, then one record read per match. A
+  // `value` that matches no declared index's entries simply returns empty;
+  // `index` naming a never-declared index does too, the same way an empty
+  // prefix scan reads no differently from one that never had entries — no
+  // query language or planner here.
+  export by(index: string, value: []byte): []T! {
+    return this.runRead<[]T>((tx) => {
+      return kvCollBy(this, tx, index, value)?
+    })?
   }
 }
 
 // Declares a secondary index named `name` on `c`, keyed by `keyOf(v)` for
 // every `v` saved from here on. `c`'s own fields are mutated in place
-// (classes are reference types, SPEC §13.3), so every later `save`/
-// `delete`/`by` on this same `Collection` sees it. Does NOT backfill: only
-// records saved AFTER this call are indexed, matching every acceptance
-// scenario (`collection.test.bit`), which always declares before saving.
-export fn declareIndex<T>(c: Collection<T>, name: string, keyOf: (T) => []byte): ()! {
+// (classes are reference types, SPEC §13.3), so every later `set`/`delete`/
+// `by` on this same `Collection` sees it. Does NOT backfill: only records
+// saved AFTER this call are indexed.
+export fn declareIndex<T: KvJsonable>(c: Collection<T>, name: string, keyOf: (T) => []byte): ()! {
   let i = 0
   while (i < len(c.indexes)) {
     if (c.indexes[i].name == name) {
@@ -207,11 +244,90 @@ export fn declareIndex<T>(c: Collection<T>, name: string, keyOf: (T) => []byte):
   c.indexes = append(c.indexes, kvIndexDef<T>{ name = name, keyOf = keyOf })
 }
 
+// `raw`, decoded via `c`'s own closure — see this file's header for why that
+// closure exists instead of a direct `jsonDecode<T>(j)` call here.
+fn kvCollDecode<T: KvJsonable>(c: Collection<T>, raw: []byte): T! {
+  let j = jsonParse(string(raw))?
+  return c.decodeFn(j)?
+}
+
+// The read-before-write behind `Collection.set`: reads the current record at
+// `id` (if any), removes every stale index entry it implies, writes the new
+// record, then writes every new index entry — all inside the caller's own
+// `tx`. See this file's header for why the read-before-write is load-
+// bearing, not optional.
+fn kvCollSave<T: KvJsonable>(c: Collection<T>, tx: Tx, id: []byte, v: T): ()! {
+  let recKey = kvRecordKey(c.name, id)
+  let existing = kvTxGetOrNone(tx, recKey)
+  if (isSome(existing)) {
+    let oldValue = kvCollDecode(c, unwrap(existing))?
+    let i = 0
+    while (i < len(c.indexes)) {
+      let idx = c.indexes[i]
+      tx.delete(kvIndexKey(c.name, idx.name, idx.keyOf(oldValue), id))?
+      i = i + 1
+    }
+  }
+  tx.put(recKey, []byte(jsonEncode(v.toJson())))?
+  let j = 0
+  while (j < len(c.indexes)) {
+    let idx = c.indexes[j]
+    tx.put(kvIndexKey(c.name, idx.name, idx.keyOf(v), id), id)?
+    j = j + 1
+  }
+}
+
+fn kvCollGet<T: KvJsonable>(c: Collection<T>, tx: Tx, id: []byte): T! {
+  let raw = tx.get(kvRecordKey(c.name, id))?
+  return kvCollDecode(c, raw)?
+}
+
+fn kvCollDelete<T: KvJsonable>(c: Collection<T>, tx: Tx, id: []byte): ()! {
+  let recKey = kvRecordKey(c.name, id)
+  let existing = kvTxGetOrNone(tx, recKey)
+  if (isNone(existing)) {
+    return
+  }
+  let oldValue = kvCollDecode(c, unwrap(existing))?
+  tx.delete(recKey)?
+  let i = 0
+  while (i < len(c.indexes)) {
+    let idx = c.indexes[i]
+    tx.delete(kvIndexKey(c.name, idx.name, idx.keyOf(oldValue), id))?
+    i = i + 1
+  }
+}
+
+fn kvCollAll<T: KvJsonable>(c: Collection<T>, tx: Tx): []T! {
+  let (lo, hi) = kvPrefixRange(kvRecordPrefix(c.name))
+  let raws = tx.scan(lo, hi)?
+  let out: []T = []T(0)
+  let i = 0
+  while (i < len(raws)) {
+    out = append(out, kvCollDecode(c, raws[i])?)
+    i = i + 1
+  }
+  return out
+}
+
+fn kvCollBy<T: KvJsonable>(c: Collection<T>, tx: Tx, index: string, value: []byte): []T! {
+  let (lo, hi) = kvPrefixRange(kvIndexValuePrefix(c.name, index, value))
+  let ids = tx.scan(lo, hi)?
+  let out: []T = []T(0)
+  let i = 0
+  while (i < len(ids)) {
+    let raw = tx.get(kvRecordKey(c.name, ids[i]))?
+    out = append(out, kvCollDecode(c, raw)?)
+    i = i + 1
+  }
+  return out
+}
+
 // `Tx.get`, with "not found" (or any other read failure) turned into
-// `Option<[]byte>.None` instead of propagated — `save`/`delete` both need
-// "does this id already have a record", never the distinction between
-// absent and erroring: a genuinely broken `tx` still fails loudly on the
-// unconditional `put`/`delete` call that follows either of them.
+// `Option<[]byte>.None` instead of propagated — `kvCollSave`/`kvCollDelete`
+// both need "does this id already have a record", never the distinction
+// between absent and erroring: a genuinely broken `tx` still fails loudly on
+// the unconditional `put`/`delete` call that follows either of them.
 fn kvTxGetOrNone(tx: Tx, key: []byte): Option<[]byte> {
   let v = tx.get(key) catch _ {
     return Option<[]byte>.None
@@ -244,8 +360,8 @@ fn kvRecordKey(name: string, id: []byte): []byte {
 // The fixed prefix for every index entry of collection `name`'s index
 // `indexName` whose indexed value is exactly `value` — ends in `kvSep`, as
 // `kvPrefixRange` requires, regardless of what `value`'s own trailing byte
-// is (fixed-width int/float or self-terminating string, per #5715, or
-// anything else a caller's `keyOf` returns).
+// is (fixed-width int/float or self-terminating string, per keyencoding.bit,
+// or anything else a caller's `keyOf` returns).
 fn kvIndexValuePrefix(name: string, indexName: string, value: []byte): []byte {
   let out = []byte(kvIdxTag)
   out = append(out, kvSep)

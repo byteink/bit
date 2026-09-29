@@ -1,6 +1,7 @@
-// pkg/kv/db.bit — the closure-scoped `db.write((tx) => {...})` transaction API
-// (#3467, #5721), plus the two things #5719 deliberately left for this
-// ticket: cross-process writer exclusivity and free-list page reuse.
+// pkg/kv/db.bit — the closure-scoped `db.tx((tx) => {...})` transaction API
+// (#3467, #5721, renamed from `write` by #6257), plus the two things #5719
+// deliberately left for this ticket: cross-process writer exclusivity and
+// free-list page reuse.
 //
 // CLOSURE-ONLY, per the epic's OWNER RULING (#3467 comment 7, matching
 // `std/sql`'s #3979 shape, `stdlib/sql/tx.bit`): no `begin`/`commit`/
@@ -10,7 +11,7 @@
 // blocks every subsequent writer forever — worse than #3979's pooled
 // connections, where a leak costs one connection out of many.
 //
-// THE LOCK, STATED PRECISELY. `Db.write` takes `stdlib/fs/fs.bit`'s
+// THE LOCK, STATED PRECISELY. `Db.tx` takes `stdlib/fs/fs.bit`'s
 // `File.lock()` (#4014) on the database file before running the closure and
 // releases it (`unlock()`) once the closure returns, panics, or fails — that
 // is the actual cross-process guarantee, not merely an in-process mutex.
@@ -19,13 +20,13 @@
 // dies for any reason, including `kill -9`, the kernel releases the lock when
 // the last descriptor referencing it closes — no second writer is ever
 // blocked forever by a dead holder, and no lock file is left to clean up by
-// hand. A SECOND writer's `db.write` call observes this by blocking inside
+// hand. A SECOND writer's `db.tx` call observes this by blocking inside
 // `File.lock()` until the first one's closure returns and its meta commit
 // finishes; `pkg/kv/db.test.bit`'s cross-process test proves this by timing
 // it, not by inspecting `flock`'s internal state, which nothing here exposes.
 //
 // flock is reentrant for the SAME open file description, so it does nothing
-// to stop a task from calling `db.write` again from inside its own closure —
+// to stop a task from calling `db.tx` again from inside its own closure —
 // `Db.writing` below is the actual guard for that, and it is what makes a
 // nested call fail loudly instead of quietly running unguarded against a
 // transaction still in flight.
@@ -51,7 +52,7 @@
 // A partial write is NEVER observable: every page a `put`/`delete` call
 // writes during the closure is reachable only from `tx.root`, which reaches
 // disk in exactly one write — the new meta page — that happens only after
-// the whole closure has returned normally. A reader (any fresh `openDb`, or
+// the whole closure has returned normally. A reader (any fresh `open`, or
 // `get`/`scan` called directly against `db.root` between transactions) can
 // only ever see the LAST fully committed root, never one mid-construction.
 //
@@ -69,13 +70,14 @@
 // own constraint) is why the difference is left standing rather than closed.
 
 import { runRecovering } from "std/runtime"
+import { exists } from "std/fs"
 
 // Re-reads whichever meta page is now current, using the ALREADY-OPEN (and,
-// by the time `Db.write` calls this, already LOCKED) file handle — picking
+// by the time `Db.tx` calls this, already LOCKED) file handle — picking
 // up any commit another writer made since this `Engine` was last read, the
-// same newer-valid-wins rule `open` itself uses (engine.bit), just without
-// opening a second file handle, and so a second flock, to do it. Without
-// this, a `Db` handle reused across two `write()` calls would silently
+// same newer-valid-wins rule `openEngine` itself uses (engine.bit), just
+// without opening a second file handle, and so a second flock, to do it.
+// Without this, a `Db` handle reused across two `tx()` calls would silently
 // overwrite whatever the FIRST writer committed with a tree built from the
 // stale root this handle was opened (or last committed) with — the
 // lost-update bug `pkg/kv/db.test.bit`'s cross-process test caught: the
@@ -320,7 +322,7 @@ fn kvRemoveId(ids: []i64, x: i64): ([]i64, bool) {
 // `get`/`scan` directly — reads allocate nothing, so there is no policy for
 // this ticket to own there.
 
-// Free-list-aware page allocator for one `write()` transaction: pops the
+// Free-list-aware page allocator for one `tx()` transaction: pops the
 // free list's last entry if one is available (no ordering promise needed —
 // see `kvTruncateFreePages`), else grows the file exactly like #5719's own
 // `kvAllocatePage`.
@@ -465,15 +467,15 @@ fn kvTxDeleteFrom(a: kvAllocator, freed: kvIdSet, nodeId: i64, key: []byte): kvD
 
 // --- the public API ---------------------------------------------------------
 
-// One transaction, live only for the duration of the `write()` block that
+// One transaction, live only for the duration of the `tx()` block that
 // owns it. `tx.root` starts at the Db's last committed root and is updated
-// after every `put`/`delete`; `write()` reads it back at commit time.
+// after every `put`/`delete`; `tx()` reads it back at commit time.
 // THE EXPORT BOUNDARY IS PER MEMBER, not per class (#5739). `export class`
 // makes the TYPE nameable across the module edge and nothing else, so the
-// four methods a consumer actually calls carry their own `export` below.
-// The fields and `usable()` deliberately do not: a consumer never builds a
-// `Tx` (only `Db.write` hands one out) and never needs its internal state,
-// so leaving them module-private keeps the surface to what the docs promise.
+// methods a consumer actually calls carry their own `export` below. The
+// fields and `usable()` deliberately do not: a consumer never builds a `Tx`
+// (only `Db.tx` hands one out) and never needs its internal state, so
+// leaving them module-private keeps the surface to what the docs promise.
 //
 // This was missed when the class landed and went unnoticed because the
 // checker does not enforce it on METHODS today -- an unexported method is
@@ -495,7 +497,7 @@ export class Tx {
     if (!this.live) {
       fail newError(
           "kv: tx: this transaction handle is dead; it works only inside the " +
-          "block db.write() gave it to",
+          "block db.tx() gave it to",
       )
     }
   }
@@ -536,6 +538,24 @@ export class Tx {
       Removed(id) => { this.root = id }
     }
   }
+
+  // `Collection<T>` bound to THIS transaction (#6257): every `set`/`get`/
+  // `delete`/`all`/`by` call on it runs directly against `this`, never
+  // opening a transaction of its own — the "`store.tx` closure's
+  // repositories come from `t`" rule (data-packages-dx.md). `t.collection<
+  // User>()` names `T`'s own `__collectionName()` (#6254); `t.collection<
+  // User>("admins")` overrides it — see collection.bit's own header for why
+  // this method, declaring `T` as its OWN generic parameter, is also what
+  // makes `jsonDecode<T>` resolvable at all inside `decodeFn` below.
+  export collection<T: KvJsonable & Stored>(...name: string): Collection<T> {
+    return Collection<T>{
+      name = kvCollectionName<T>(name),
+      db = this.db,
+      activeTx = Option.Some(this),
+      decodeFn = (j) => jsonDecode<T>(j)?,
+      indexes = []kvIndexDef<T>(0),
+    }
+  }
 }
 
 // A single database file: one writer at a time (in-process AND
@@ -566,12 +586,14 @@ export class Db {
 
   // Runs `f` against a fresh `Tx`: commit on normal return, rollback (never
   // write the new meta page) on failure or panic. See this file's header for
-  // the full commit/rollback/lock contract.
-  export write(f: (Tx) => ()!): ()! {
+  // the full commit/rollback/lock contract. All-or-nothing (#6257's own
+  // acceptance): a failure anywhere inside `f` rolls back every write `f`
+  // made, not just the one that failed.
+  export tx(f: (Tx) => ()!): ()! {
     if (this.writing) {
       fail newError(
-          "kv: db.write: a write is already running on this Db handle; a " +
-          "nested db.write is an error, not a savepoint — a single-writer " +
+          "kv: db.tx: a transaction is already running on this Db handle; a " +
+          "nested db.tx is an error, not a savepoint — a single-writer " +
           "engine has no second writer to grant, and joining the outer one " +
           "would let an inner rollback discard outer work (epic #3467)",
       )
@@ -593,7 +615,7 @@ export class Db {
       freed = kvIdSet{ ids = []i64(0) },
     }
     let failed = false
-    let cause = newError("kv: db.write: the block failed without reporting an error")
+    let cause = newError("kv: db.tx: the block failed without reporting an error")
     // The panic boundary, same shape `stdlib/sql/tx.bit`'s `txValueAt` uses:
     // nothing here relies on `defer` to roll back, since a recovered panic
     // runs no deferred call (SPEC §18.5) — "rollback" on this path is simply
@@ -613,6 +635,20 @@ export class Db {
       fail cause
     }
     this.commit(tx, oldChain)?
+  }
+
+  // `Collection<T>` bound to THIS `Db`: every `set`/`get`/`delete`/`all`/
+  // `by` call on it runs in its own `db.tx()` (#6257's implicit per-call
+  // transaction). See `Tx.collection` above for why `T` is the METHOD's own
+  // generic parameter, and collection.bit's header for what that buys.
+  export collection<T: KvJsonable & Stored>(...name: string): Collection<T> {
+    return Collection<T>{
+      name = kvCollectionName<T>(name),
+      db = this,
+      activeTx = Option<Tx>.None,
+      decodeFn = (j) => jsonDecode<T>(j)?,
+      indexes = []kvIndexDef<T>(0),
+    }
   }
 
   // Free-list maintenance, then the COW-then-flip meta commit (data synced
@@ -635,7 +671,7 @@ export class Db {
     // kill -9 required): a crash in this window would leave the still-active
     // meta as the only recovery target, pointing at a page already cut off
     // the file. Both are still safe to WRITE into the free list this commit
-    // builds -- nothing may pop them back out until a LATER `db.write()`
+    // builds -- nothing may pop them back out until a LATER `db.tx()`
     // reads that list, and the single-writer lock means that can only happen
     // after this commit's meta flip has already made the pages they
     // reference unreachable from any meta a reopen could ever choose.
@@ -657,17 +693,17 @@ export class Db {
   }
 }
 
-// Creates a brand-new database at `path` (delegates to #5716's own `create`
-// for the file/meta-page format) with an empty tree and an empty free list.
-export fn createDb(path: string): Db! {
-  let eng = create(path)?
-  return Db{ eng = eng, root = noRoot }
-}
-
-// Opens an existing database, reading the committed root out of whichever
-// meta page #5716's own `open` picked as current.
-export fn openDb(path: string): Db! {
-  let eng = open(path)?
+// The only entry point (#6257, superseding the previous create-vs-open
+// split): creates `path` if it does not already exist (delegates to #5716's
+// own `create` for the file/meta-page format, an empty tree and an empty
+// free list), else opens it, reading the committed root out of whichever
+// meta page #5716's own `openEngine` picked as current.
+export fn open(path: string): Db! {
+  if (!exists(path)) {
+    let eng = create(path)?
+    return Db{ eng = eng, root = noRoot }
+  }
+  let eng = openEngine(path)?
   let buf = eng.readPage(i64(eng.activeMeta))?
   return Db{ eng = eng, root = kvReadRoot(buf) }
 }
