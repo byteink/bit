@@ -1464,6 +1464,49 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   - A class without `@table` has no `isPersisted`/`markPersisted` member -
     the ordinary E0057 every other unknown member gets.
 
+**`@table`'s generic-bound members - `__tableName`, `__fromRow`,
+`__columns`, `__values`.** A class carrying `@table` also gains, reachable
+through a type parameter bound the same way `@job`'s `__jobName`
+(below) is:
+
+```
+static __tableName(): string
+static __fromRow(rows: Rows): T!
+static __columns(): []FieldDesc
+(this: T) __values(): []Value
+```
+
+so a generic repository needs no hand-written mapper and no
+dummy-instance `tableDescriptor()` call to reach a table's name, its
+columns, or to construct or serialize one row.
+
+- `__tableName()` returns `@table`'s own name override when it carries one,
+  else the class name in **snake_case, never pluralized**: `Person` ->
+  `person`, `OrderLine` -> `order_line`.
+- `__fromRow(rows)` is `find<T>`'s own synthesized mapper (above),
+  unconditionally, for every `@table` class rather than only one passed to
+  `find`/`findOne`/`findOneOrFail`. `__columns()` is `tableDescriptor()`
+  (above), as a static method.
+- `__values()` returns every field as a `Value`, in declaration order:
+  `Value.Int`/`Value.Float`/`Value.Bool`/`Value.Text`/`Value.Blob` by the
+  field's scalar kind, or `Value.Null` for an absent `Option<>` field.
+- **`__fromRow`/`__values` cover only a class's row-mappable fields**: one of
+  the five scalars `find<T>` maps a column with (or `Option<>` of one), never
+  a relation field (`@hasMany`/`@hasOne`/`@belongsTo`, loaded separately, not
+  through a column) or any other field type - excluded silently, never
+  `find<T>`'s own **E0154**, since this fires on every `@table` class rather
+  than one opted in by a call site.
+- **`__fromRow` alone is dropped, per class, when a field it excludes has no
+  zero value of its own** to leave out of the composite literal it
+  constructs - a `@hasOne`/`@belongsTo` field is not always `[]T`, and only a
+  slice/map/channel/`Option<>` has one. `__tableName`/`__columns`/`__values`
+  are unaffected: `__values()` never has to represent an excluded field.
+- **All four are skipped together when the class declares `init`** - the same
+  restriction `find<T>`'s own **E0152** places on a hand-mapped class,
+  reported here as **E0175** since there is no `find<T>` call site to name.
+- A class already declaring `__tableName`, `__fromRow`, `__columns` or
+  `__values`, as a field or a method, is **E0174**, naming which.
+
 **`find<T>`/`findOne<T>`/`findOneOrFail<T>` - mapping a query result.**
 
 - `std/sql` declares
