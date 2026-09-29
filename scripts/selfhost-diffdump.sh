@@ -205,13 +205,12 @@ run_basic() {
     if [ "$seed" = "$b2" ]; then
       match=$((match + 1))
     else
-      # #5510: only the `ast` and (since #6254) `diags` rows have declared
-      # signatures to check -- `tokens` never calls explainMismatch at all, so a divergence
-      # there is scored exactly as before. Checked only once seed/b2 are
+      # #5510: the `ast`, `diags` (#6254) and `tokens` (#6264) rows have
+      # declared signatures to check. Checked only once seed/b2 are
       # already known to differ: the overwhelming majority of files match,
       # so this never forks awk for them.
       sig=""
-      if [ "$NAME" = ast ] || [ "$NAME" = diags ]; then
+      if [ "$NAME" = ast ] || [ "$NAME" = diags ] || [ "$NAME" = tokens ]; then
         sig=$(explainMismatch "$seed" "$b2" "$NAME")
       fi
       if [ -n "$sig" ]; then

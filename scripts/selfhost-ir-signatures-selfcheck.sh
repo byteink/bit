@@ -171,6 +171,38 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
+  # #6264-from-contextual-token: POSITIVE and REJECTION.
+  s64t=$(explainMismatch "$(printf 'kw_import 0..6\nkw_from 20..24\n')" "$(printf 'kw_import 0..6\nident 20..24\n')" tokens)
+  if [ "$s64t" != "6264-from-contextual-token" ]; then
+    echo "FAIL: the #6264 kw_from/ident token shape was not explained (sig='$s64t')"; fail=1
+  fi
+  s64tr=$(explainMismatch "$(printf 'kw_from 20..24\n')" "$(printf 'ident 20..25\n')" tokens)
+  if [ -n "$s64tr" ]; then
+    echo "FAIL: a kw_from/ident pair with a different span was wrongly explained (sig='$s64tr')"; fail=1
+  fi
+  # #6264-from-contextual-diags: the renamed token, and a reserved-word block.
+  s64d=$(explainMismatch "error[E0021]: expected a top-level declaration, found kw_from" "error[E0021]: expected a top-level declaration, found an identifier" diags)
+  if [ "$s64d" != "6264-from-contextual-diags" ]; then
+    echo "FAIL: the #6264 renamed-token diagnostic was not explained (sig='$s64d')"; fail=1
+  fi
+  s64b=$(explainMismatch "$(printf "error[E0021]: 'from' is a reserved keyword\n  --> m.bit:10:3\n   |\n10 |   from: int,\n")" "" diags)
+  if [ "$s64b" != "6264-from-contextual-diags" ]; then
+    echo "FAIL: the #6264 reserved-from block was not explained (sig='$s64b')"; fail=1
+  fi
+  s64dr=$(explainMismatch "error[E0021]: expected a top-level declaration, found kw_from" "error[E0021]: expected an expression, found an identifier" diags)
+  if [ -n "$s64dr" ]; then
+    echo "FAIL: a #6264-shaped diagnostic with a changed message was wrongly explained (sig='$s64dr')"; fail=1
+  fi
+  # #6264-from-contextual-types: nameless oracle entry vs a typed `from`.
+  s64y=$(explainMismatch "1:1: : i64" "23:7: from: i64" types)
+  if [ "$s64y" != "6264-from-contextual-types" ]; then
+    echo "FAIL: the #6264 from binding types shape was not explained (sig='$s64y')"; fail=1
+  fi
+  s64yr=$(explainMismatch "1:1: : i64" "23:7: from: string" types)
+  if [ -n "$s64yr" ]; then
+    echo "FAIL: a #6264 from binding with a different type was wrongly explained (sig='$s64yr')"; fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
