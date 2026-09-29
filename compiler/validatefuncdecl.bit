@@ -80,67 +80,94 @@ fn vFallibleTy(c: Checker, declared: int): int {
 // signature itself — not any one call site — is what is rejected.
 const ecParamDefaultOrder = 158
 
-// E0159 (SPEC §10.3, #5244): a default value that is not a constant literal.
-// #2905 rejected call-site-evaluated defaults (Swift's `#file`/`#line`
-// shape); this is that ruling enforced at the one place a default is
-// written, ahead of `vAssignableNode`'s type check so a non-constant default
-// never reaches it holding some arbitrary expression's type.
+// E0159 (SPEC §10.3, #5244, widened by #6112): a default value whose type
+// does not match its parameter's declared type, or — with no declared type
+// written — whose own type cannot be inferred at all. The old gate here (the
+// default had to be a bare literal, read straight from source text) is gone:
+// a default is now a call-site-evaluated expression, exactly like a class
+// field default (`lowerDeclaredDefault`, lowerslicefill.bit), so it is
+// checked exactly like any other expression assigned into that type
+// (`vAssignableNode` below).
 const ecParamDefaultNotConst = 159
 
-// A directly-written literal — the narrow "constant expression" this ticket
-// allows (#4471 records the language has no constant CLASS value at all, so
-// nothing wider is at stake yet) — or a payload-free enum variant reference
-// (`Dir.Asc`, #6271: like a literal, its value is fixed by its spelling alone,
-// with nothing to evaluate). Exactly the tag set `lowerDefaultLiteral`
-// (lowercall.bit) lowers straight from source text without evaluating an
-// expression tree; the two lists must agree, or a default the checker
-// accepts has nothing to lower it. No signed-literal form (`x: int = -1`)
-// yet — a leading unary is not a literal tag itself and would need its own
-// lowering arm.
-fn vDefaultIsLiteral(c: Checker, node: int): bool {
-  let tag = getNode(c.tree, node).tag
-  return tag == Tag.IntLit ||
-    tag == Tag.FloatLit ||
-    tag == Tag.StringLit ||
-    tag == Tag.RawStringLit ||
-    tag == Tag.BoolLit ||
-    tag == Tag.NilLit ||
-    vDefaultIsEnumVariant(c, node)
+// E0183 (SPEC §10.3, #6112): a default expression that reads another
+// parameter of the same declaration, or `this`. Neither is bound yet at the
+// one moment a default is ever evaluated — a call that omits the argument —
+// so a reference to either can only ever be a mistake. `resolvebody.bit`'s
+// `rResolveFuncDecl` resolves a default in the SAME function scope its own
+// params and receiver are activated in (so a genuine module-level name —
+// SPEC §10.3's `1024 * KB` shape, same as a class field default — still
+// resolves normally); `vDefaultRefsParamOrThis` below is what turns a
+// resolved Param/Receiver reference back into this diagnostic.
+const ecParamDefaultRefsParam = 183
+
+// Bounds `vDefaultRefsParamOrThis`'s walk the same way `vNosplitWalk`
+// (validateattr.bit) bounds its own AST walk: adversarial nesting depth, not
+// ordinary expression size.
+const vDefaultRefMaxDepth = 256
+
+// True when `node` ITSELF (never its children — that is the walk's job, not
+// this leaf test's) is an identifier that RESOLVED to this declaration's own
+// parameter list or its receiver (SymbolKind.Param / SymbolKind.Receiver,
+// `c.nodeSymbols` — the same resolved-symbol source `shadowedByValue`,
+// checkexpr.bit, reads). A name that resolved to anything else — a
+// let/const inside a nested closure, a module-level function or const, a
+// type — is exactly the case that must keep resolving normally, so it
+// answers false. Split out of `vDefaultRefsParamOrThis` purely to keep that
+// function's own McCabe complexity (E0204) under the walk's recursion.
+fn vIdentIsParamOrThis(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Ident || node >= len(c.nodeSymbols)) {
+    return false
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return false
+  }
+  let k = c.symbols[sid].kind
+  return k == SymbolKind.Param || k == SymbolKind.Receiver
 }
 
-// `node`'s `Enum.Variant` reference names a payload-free variant of an enum
-// type in scope (#6271). Resolved the same way `lowerFieldAccess`
-// (loweraccess.bit) resolves an `Enum.Variant` expression: the receiver's
-// bare name against `userTypeLookup`, the member against that enum's own
-// variant list. A variant WITH a payload is a `Call` node (`Some(1)`), never
-// a `Member`, so it can never reach here; nothing else needs to be excluded.
-fn vDefaultIsEnumVariant(c: Checker, node: int): bool {
-  if (getNode(c.tree, node).tag != Tag.Member) {
+// True when any node in `node`'s subtree is one `vIdentIsParamOrThis` above
+// admits.
+fn vDefaultRefsParamOrThis(c: Checker, node: int, depth: int): bool {
+  if (node == 0 || depth >= vDefaultRefMaxDepth) {
     return false
+  }
+  if (vIdentIsParamOrThis(c, node)) {
+    return true
   }
   let kids = kidsOf(c.tree, node)
-  let enumName = typeNodeName(c, kids[0])
-  if (enumName == "") {
-    return false
+  let i = 0
+  while (i < len(kids)) {
+    if (vDefaultRefsParamOrThis(c, kids[i], depth + 1)) {
+      return true
+    }
+    i = i + 1
   }
-  let ut = userTypeLookup(c, enumName)
-  if (ut == 0 || c.ctx.types[ut].kind != TypeKind.Enum) {
-    return false
-  }
-  let mn = getNode(c.tree, kids[1])
-  let vname = c.source[mn.span.start:mn.span.end]
-  if (vIndexOfName(vEnumVariantNames(c, ut), vname) < 0) {
-    return false
-  }
-  return len(variantPayloadTypes(c, ut, vname)) == 0
+  return false
 }
 
-// Validates every `= const_expr` default in one `Params` list (SPEC §10.3,
-// #5244): each default must be a literal assignable to its parameter's
-// declared type, and once one parameter carries a default every parameter
-// after it must too (E0158). `...rest` is skipped — it never carries a
-// default kid (parseParam) and sits only at the END of a param list, so it
-// cannot itself violate the ordering rule.
+// `node`'s inferred-spelling default type is still invalid once resolved —
+// covers both an untyped constant with no default concrete type (bare
+// `nil`) and a genuinely UNRESOLVED type (`x = []`'s empty `SliceLit`:
+// `checkSliceLit` has no element to infer E from, so it answers invalid (0)
+// rather than one of the untyped-constant ids). `isUntyped` alone misses the
+// second case (#6112) — 0 is not among the ids it checks — so `x = []` used
+// to fall through to `vAssignableNode(c, pk[2], 0, 0)` and silently pass with
+// an invalid parameter type.
+fn vDefaultInferredTypeInvalid(c: Checker, node: int): bool {
+  let dty = defaultLitType(c, node, checkExprType(c, node))
+  return dty == 0 || isUntyped(c, dty)
+}
+
+// Validates every `= expr` default in one `Params` list (SPEC §10.3,
+// #6112): a default may not reference another parameter or `this` (E0183),
+// must type-check against its parameter's declared type (or, with no
+// declared type, infer a concrete one of its own — E0159), and once one
+// parameter carries a default every parameter after it must too (E0158).
+// `...rest` is skipped — it never carries a default kid (parseParam) and
+// sits only at the END of a param list, so it cannot itself violate the
+// ordering rule.
 fn vParamDefaults(c: Checker, paramsNode: int) {
   if (paramsNode == 0) {
     return
@@ -156,17 +183,16 @@ fn vParamDefaults(c: Checker, paramsNode: int) {
     }
     let pk = kidsOf(c.tree, pn)
     if (len(pk) == 3) {
-      if (!vDefaultIsLiteral(c, pk[2])) {
+      if (vDefaultRefsParamOrThis(c, pk[2], 0)) {
         reportNoHint(
-          c.diags, ecParamDefaultNotConst, vSpan(c, pk[2]),
-          "a parameter's default value must be a constant literal",
+          c.diags, ecParamDefaultRefsParam, vSpan(c, pk[2]),
+          "a parameter's default value may not reference another parameter or 'this'",
         )
-      } else if (pk[1] == 0 && isUntyped(c, defaultLitType(c, pk[2], checkExprType(c, pk[2])))) {
-        // The inferred spelling (§10.3, #5258): `nil` passes the literal check
-        // above (an ANNOTATED default may assign it to any nil-accepting
-        // type) but infers no concrete type of its own to give the parameter
-        // — E0159 again, this time for "no type to infer", not "not a
-        // literal".
+      } else if (pk[1] == 0 && vDefaultInferredTypeInvalid(c, pk[2])) {
+        // The inferred spelling (§10.3, #5258): a default with no declared
+        // type to check against still needs a concrete type of its OWN to
+        // give the parameter — E0159 again, this time for "no type to
+        // infer", not "not assignable".
         let nm = getNode(c.tree, pk[0])
         let pname = c.source[nm.span.start:nm.span.end]
         reportNoHint(

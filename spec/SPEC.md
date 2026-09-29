@@ -571,7 +571,7 @@ are no nominal newtypes in v0.1.
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
-param         = [ "..." ] IDENT ( ":" type [ "=" const_expr ] | "=" const_expr ) .
+param         = [ "..." ] IDENT ( ":" type [ "=" expression ] | "=" expression ) .
 result_type   = type .            (* may carry the fallible marker, §18 *)
 ```
 
@@ -587,18 +587,27 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
   `[]T` with `...` (§12.4).
 - A parameter may carry a default value, either with the type written, `x: int = 1`,
   or read off the default, `x = 1`: a call may omit it and every parameter after it
-  that also has one, and the default is used instead. `const_expr` is a bare literal
-  (int, float, string, bool, or `nil`) or a payload-free enum variant
-  (`Enum.Variant`); not a compound expression, a call, or an allocation - defaults
-  evaluated at the call site (Swift's `#file`/`#line` shape) were considered and
-  rejected. A defaulted parameter may not precede one with no default (**E0158**): a
-  call supplying only its own positional prefix could never reach a later required
-  parameter otherwise. A default whose value is not a literal is **E0159**. When the
-  type is written, the default need only be assignable to it (so `x: T = nil` is legal
-  for any nil-accepting `T`).
+  that also has one, and the default is used instead. The default is a full
+  expression - a literal, a negative literal, a payload-free enum variant
+  (`Enum.Variant`), a class literal, a zero-argument function call, or any other
+  expression that type-checks against the parameter's type - **evaluated at the
+  call site, fresh on every call that omits the argument**, never once and
+  shared: a default that allocates (a class literal, a call that returns one)
+  builds its own object at each omitted call, so mutating one call's result
+  can never be observed through another's. A default may not reference
+  another parameter of the same declaration, or `this` (**E0183**): neither
+  is bound at the one point a default is ever evaluated. A defaulted
+  parameter may not precede one with no default (**E0158**): a call
+  supplying only its own positional prefix could never reach a later
+  required parameter otherwise. A default whose type does not match its
+  parameter's declared type is **E0159**; when the type is written, the
+  default need only be assignable to it (so `x: T = nil` is legal for any
+  nil-accepting `T`).
   When the type is inferred, the parameter takes the default's own **default
   type** (§15.4: int → `i64`, float → `f64`, string → `string`, bool →
-  `bool`) - `nil` has none, so `x = nil` is **E0159** in this spelling only.
+  `bool`) - a default with no concrete type of its own to give the parameter
+  (`nil`, or an empty composite literal with no element to infer one from) is
+  **E0159** in this spelling only.
 
 #### 10.3.1 Function and Class Attributes
 
@@ -6094,7 +6103,7 @@ attr_list     = attr { attr } .
 attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
-param         = [ "..." ] IDENT ( ":" type [ "=" const_expr ] | "=" const_expr ) .
+param         = [ "..." ] IDENT ( ":" type [ "=" expression ] | "=" expression ) .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
