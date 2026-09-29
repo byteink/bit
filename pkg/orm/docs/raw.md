@@ -11,7 +11,7 @@ land as one unit, or not at all.
 ## exec and query: SQL you write, values you bind
 
 ```bit
-import { Data } from "orm"
+import { Db } from "orm"
 
 @table class Post {
   @id id: i64,
@@ -19,11 +19,11 @@ import { Data } from "orm"
   views: i64,
 }
 
-fn bumpViews(db: Data, id: i64): ()! {
+fn bumpViews(db: Db, id: i64): ()! {
   db.exec("update post set views = views + 1 where id = ?", id)?
 }
 
-fn popular(db: Data, prefix: string): []Post! {
+fn popular(db: Db, prefix: string): []Post! {
   return db.query<Post>("select * from post where title like ?", "${prefix}%")?
 }
 ```
@@ -39,7 +39,7 @@ list of real entities, not a driver-shaped row set.
 ## tx: an all-or-nothing block
 
 ```bit
-fn transferViews(db: Data, fromId: i64, toId: i64, n: i64): ()! {
+fn transferViews(db: Db, fromId: i64, toId: i64, n: i64): ()! {
   db.tx((tx) => {
     tx.exec("update post set views = views - ? where id = ?", n, fromId)?
     tx.exec("update post set views = views + ? where id = ?", n, toId)?
