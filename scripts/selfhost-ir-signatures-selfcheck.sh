@@ -217,6 +217,31 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo "FAIL: a #6269-shaped block with an extra call was wrongly explained (sig='$s69r')"; fail=1
   fi
 
+  # #6265-closure-bound-static-self (types) and -insert (ir, one file only).
+  s65=$(explainMismatch "46:12: apply(x, f): Self!" "46:12: apply(x, f): T!" types)
+  if [ "$s65" != "6265-closure-bound-static-self" ]; then
+    echo "FAIL: the #6265 Self-to-T shape was not explained (sig='$s65')"; fail=1
+  fi
+  s65r=$(explainMismatch "46:12: apply(x, f): Self!" "46:12: apply(x, f): U!" types)
+  if [ -n "$s65r" ]; then
+    echo "FAIL: a Self rebound to the wrong parameter was wrongly explained (sig='$s65r')"; fail=1
+  fi
+  o65=$(printf 'func main() void {\n  ret\n}\n')
+  b65=$(printf 'func main() void {\n  ret\n}\n\nfunc apply$0(%%0: i64) i64 {\n  ret %%0\n}\n')
+  s65i=$(explainMismatch "$o65" "$b65" ir "_tests_/cases/run_generic_closure_over_bound_self_static.bit")
+  if [ "$s65i" != "6265-closure-bound-static-insert" ]; then
+    echo "FAIL: the #6265 inserted-function shape was not explained (sig='$s65i')"; fail=1
+  fi
+  s65o=$(explainMismatch "$o65" "$b65" ir "_tests_/cases/some_other_file.bit")
+  if [ -n "$s65o" ]; then
+    echo "FAIL: the #6265 inserted-function shape was explained for a file it is not declared for (sig='$s65o')"; fail=1
+  fi
+  b65c=$(printf 'func main() void {\n  %%1 = const_int i64 1\n  ret\n}\n\nfunc apply$0(%%0: i64) i64 {\n  ret %%0\n}\n')
+  s65c=$(explainMismatch "$o65" "$b65c" ir "_tests_/cases/run_generic_closure_over_bound_self_static.bit")
+  if [ -n "$s65c" ]; then
+    echo "FAIL: a changed existing function beside an inserted one was wrongly explained (sig='$s65c')"; fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
