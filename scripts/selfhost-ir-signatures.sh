@@ -145,14 +145,52 @@
 # `schemaGenericWrapperInsertOk`/`jsonSchemaGenericWrapperCall` derivations
 # are preserved in git history at this file's state before this repin.
 #
+# #6244-json-attr-implicit-insert (`types`) — `@json class` no longer needs
+# any import from "std/json" to synthesize (compiler/project.bit's
+# injectImplicitJsonImport, BIT_IMPLICIT_SYNTH_IMPORTS default ON): a module
+# whose ONLY std/json need is `@json` now type-checks toJson's/
+# __jsonAppend's synthesized body, which the pinned 0.33.0 oracle (no such
+# feature) cannot — it declines to synthesize at all and simply omits those
+# lines. Two shapes, both in ONE file: (1) a pure INSERTION of the
+# synthesized member's own type-checked lines (everything else in the file
+# typed identically, in the same order — the `6161-json-schema-synthesized-
+# insert` shape retired by the 0.33.0 repin), and (2) any expression
+# elsewhere in the SAME module whose type depended on the class now
+# resolving flips from a container of `<error>` on the oracle side (it could
+# not resolve `JsonEntry` either, having declined the whole class) to a real
+# type on the tree side (the `6161-json-decode-enum-error-resolved` shape,
+# same repin) — `jsonAttrTypeResolved` below generalizes that pair's exact-
+# `<error>` match to a CONTAINING one (`[]<error>`, `[]<error>!`, ...) since
+# nothing in `--dump-types` output marks a container boundary for this
+# check to anchor on instead. `jsonAttrImplicitInsert` combines both as one
+# two-pointer walk (mirrors `errorResolvedInsert`'s shape): a byte-identical
+# line or a `jsonAttrTypeResolved` pair advances both sides, anything else
+# on the tree side alone is a pure insertion (advances only the tree), and
+# it explains only when every oracle line is eventually consumed this way —
+# a real regression (a well-typed oracle line changing to a DIFFERENT
+# concrete type, or an unrelated `<error>` that widens) can never satisfy
+# either branch and fails the walk closed, the oracle pointer never
+# catching up. Derived from and checked against the real `--dump-types`
+# dumps of stdlib/sql/rowtypes.test.bit (captured 2026-09-29, ticket #6244):
+# 365 oracle lines vs 379 tree lines, 13 lines inserted before line 17
+# (`RowtypesSettings`'/`theme`'s/`retries`' synthesized-member type checks),
+# one `jsonAttrTypeResolved` pair at oracle line 199-200 (`entries`/
+# `jsonObjectEntries(j)`: `[]<error>`/`[]<error>!` -> `[]JsonEntry`/
+# `[]JsonEntry!`), one line inserted at the end (`__json_entries`) — full
+# `diff` gives exactly these 18 changed lines, nothing else in the file
+# differs. EXPECTED TO RETIRE AT THE 0.34.0 REPIN: 0.34.0 will contain
+# #6244, so it will be the first oracle that agrees with the tree on this
+# file (and any other `@json`-with-no-import file landing before then).
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
 # forks one fresh awk process, so all state below is per-call — no cross-file
 # leakage between corpus files. `ast`/`fmt` compare TEXT (an S-expression
 # dump / formatted source), not IR opcodes; `types` compares `--dump-types`
-# TEXT line-for-line; `ir`/`iropt` compare opcode COUNT deltas. No signature
-# is currently declared for any kind (see Retirement history above).
+# TEXT line-for-line (jsonAttrImplicitInsert, #6244); `ir`/`iropt` compare
+# opcode COUNT deltas. No signature is currently declared for `ir`/`iropt`/
+# `ast`/`fmt` (see Retirement history above).
 explainMismatch() {
   awk -v kind="$3" '
     function opcode(line,    s) {
@@ -170,6 +208,46 @@ explainMismatch() {
       if (line ~ /^[[:space:]]*index_set /) { return "index_set" }
       return ""
     }
+    function lastColonSpace(s,    i, n, found) {
+      found = 0
+      n = length(s) - 1
+      for (i = 1; i <= n; i++) {
+        if (substr(s, i, 2) == ": ") { found = i }
+      }
+      return found
+    }
+    # jsonAttrTypeResolved (#6244) -- `a` (oracle)/`b` (tree) share the same
+    # `LINE:COL: <expr>` prefix (everything before the LAST ": "), the
+    # oracle side CONTAINS the literal substring "<error>" somewhere in its
+    # type (bare or inside a container: `<error>`, `[]<error>`,
+    # `[]<error>!`, ...) and the tree side is non-empty and contains no
+    # "<error>" at all.
+    function jsonAttrTypeResolved(a, b,    cutA, cutB, pfxA, pfxB, tyA, tyB) {
+      cutA = lastColonSpace(a); cutB = lastColonSpace(b)
+      if (cutA == 0 || cutB == 0) { return 0 }
+      pfxA = substr(a, 1, cutA - 1); tyA = substr(a, cutA + 2)
+      pfxB = substr(b, 1, cutB - 1); tyB = substr(b, cutB + 2)
+      if (pfxA != pfxB) { return 0 }
+      if (index(tyA, "<error>") == 0) { return 0 }
+      if (tyB == "" || index(tyB, "<error>") > 0) { return 0 }
+      return 1
+    }
+    # jsonAttrImplicitInsert (#6244) -- see the header above this function
+    # for the derivation. A two-pointer walk: a byte-identical line advances
+    # both sides, and so does a jsonAttrTypeResolved pair; any other tree
+    # line is a pure insertion (advances only the tree side). Explains only
+    # when every oracle line is eventually consumed this way -- a dropped,
+    # reordered or wrongly-changed oracle line leaves the oracle pointer
+    # short at the end and fails closed.
+    function jsonAttrImplicitInsert(nA, linesA, nB, linesB,    i, j) {
+      i = 1; j = 1
+      while (i <= nA && j <= nB) {
+        if (linesA[i] == linesB[j]) { i++; j++; continue }
+        if (jsonAttrTypeResolved(linesA[i], linesB[j])) { i++; j++; continue }
+        j++
+      }
+      return (i > nA) ? 1 : 0
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -182,9 +260,18 @@ explainMismatch() {
       rawB = (nB == 1 ? $0 : rawB "\n" $0)
       op = opcode($0); if (op != "") b[op]++
     }
-    # No signature is currently declared for any kind (see Retirement
-    # history above): every divergence is unexplained.
-    END { exit 1 }
+    END {
+      if (kind == "types") {
+        if (jsonAttrImplicitInsert(nA, linesA, nB, linesB)) {
+          print "6244-json-attr-implicit-insert"; exit 0
+        }
+        exit 1
+      }
+      # No signature is currently declared for `ir`/`iropt`/`ast`/`fmt` (see
+      # Retirement history above): every divergence under those kinds is
+      # unexplained.
+      exit 1
+    }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
@@ -202,5 +289,13 @@ explainMismatch() {
 # kind argument omitted there, since that check is "does this name exist at
 # all", not "under which kind").
 declaredSignatureNames() {
-  return
+  local kind=${1:-}
+  case "$kind" in
+    ast) return ;;
+    fmt) return ;;
+    ir) return ;;
+    iropt) return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert"; return ;;
+  esac
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert"
 }

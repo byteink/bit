@@ -10,9 +10,11 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
 
 # Self-check: run directly (not sourced) to assert explainMismatch rejects
-# unrelated text on every kind. No signature is currently declared for any
-# kind (see scripts/selfhost-ir-signatures.sh's Retirement history), so
-# every arm below must always return 1.
+# unrelated text on every kind. `types` alone currently carries a declared
+# signature, `6244-json-attr-implicit-insert` (see scripts/selfhost-ir-
+# signatures.sh's header); `ir`/`iropt`/`ast`/`fmt` carry none (see that
+# file's Retirement history), so every arm below under those four kinds
+# must always return 1.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -92,6 +94,34 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   rcut=$?
   if [ "$rcut" -eq 0 ] || [ -n "$sigut" ]; then
     echo "FAIL: an unrelated types delta was wrongly explained (rc=$rcut sig='$sigut')"
+    fail=1
+  fi
+
+  # #6244-json-attr-implicit-insert: POSITIVE case, the exact shape
+  # scripts/selfhost-ir-signatures.sh's header derives from the real
+  # stdlib/sql/rowtypes.test.bit dumps -- a pure insertion (an unrelated
+  # line before and after, untouched) plus one `<error>`-containing pair
+  # resolving to a real type at the SAME `LINE:COL: <expr>` prefix.
+  oracle_6244=$(printf '1:1: before: int\n5:1: entries: []<error>\n9:1: after: string\n')
+  bit2_6244=$(printf '1:1: before: int\n2:1: RowtypesSettings: Json\n5:1: entries: []JsonEntry\n9:1: after: string\n')
+  sig6244=$(explainMismatch "$oracle_6244" "$bit2_6244" types)
+  rc6244=$?
+  if [ "$rc6244" -ne 0 ] || [ "$sig6244" != "6244-json-attr-implicit-insert" ]; then
+    echo "FAIL: the #6244 json-attr-implicit-insert shape was not explained (rc=$rc6244 sig='$sig6244')"
+    fail=1
+  fi
+
+  # #6244: REJECTION, a real regression riding along with an otherwise
+  # #6244-shaped insertion -- an oracle line that is neither reproduced
+  # byte-for-byte nor a jsonAttrTypeResolved pair (here: a well-typed oracle
+  # line changing to a DIFFERENT concrete type, not through `<error>`) must
+  # still fail closed, never masked by the insertion elsewhere in the file.
+  oracle_6244_regress=$(printf '1:1: before: int\n5:1: entries: []<error>\n9:1: after: string\n')
+  bit2_6244_regress=$(printf '1:1: before: int\n2:1: RowtypesSettings: Json\n5:1: entries: []JsonEntry\n9:1: after: float\n')
+  sig6244r=$(explainMismatch "$oracle_6244_regress" "$bit2_6244_regress" types)
+  rc6244r=$?
+  if [ "$rc6244r" -eq 0 ] || [ -n "$sig6244r" ]; then
+    echo "FAIL: a real regression alongside a #6244-shaped insertion was wrongly explained (rc=$rc6244r sig='$sig6244r')"
     fail=1
   fi
 
