@@ -50,12 +50,21 @@
 //
 // A CALM FUNCTION (#6210, `calmNew`) runs nothing that separates any field:
 // no store to a field that may hold a slice, no append whose input is a
-// field read, no `call_value`/`call_iface`/`asm`/syscall/atomic, only
-// `fieldLocalRtCall` runtime calls, and direct calls to calm functions of
-// this module only. The last clause is recursive, so the answer is the
-// greatest fixpoint (`borrowSolve`, optappendborrow.bit). pkg/toml's
+// field read, no `call_value`/`asm`/syscall/atomic, only `fieldLocalRtCall`
+// runtime calls, and calls to calm functions of this module only. The last
+// clause is recursive, so the answer is the greatest fixpoint
+// (`borrowSolve`, optappendborrow.bit). pkg/toml's
 // `path.rest = append(path.rest, KeySeg{ name = readKeyName(p)? })` reads
 // the field before the call that lexes the key.
+//
+// A `call_iface` is such a call when every function it can reach is calm
+// (#6211, `calmIfaceTargets`). It reaches exactly the methods whose slot in
+// `m.methodTables` carries its id: `bit_rt_iface_lookup` resolves an id
+// only through a receiver's TypeInfo, every TypeInfo with methods is one of
+// those tables (the runtime builds its own with none, runtime/root/root.bit),
+// and the module is the whole program. pkg/toml's `tomlDtError` calls
+// `e.message()` on a `std/time` failure; every `message` in the program is
+// calm, so `readScalar` is.
 //
 // A SAFEPOINT POLL DOES NOT SEPARATE (#6210). A poll may park this green
 // thread for the collector or hand its worker to another green thread, but
@@ -120,7 +129,7 @@ fn ownedFieldsOf(m: IrModule): FieldOwn {
     return fo
   }
   fo.borrow = borrowNew(m.funcs)
-  fo.calm = calmNew(fo, m.funcs)
+  fo.calm = calmNew(fo, m)
   let i = 0
   while (i < len(m.funcs)) {
     fo.escStart = append(fo.escStart, len(fo.esc))
@@ -525,7 +534,7 @@ fn fieldSpanSeparates(o: OwnFn, k: int, lo: int, hi: int): bool {
 // this walk cannot see.
 fn fieldSeparates(o: OwnFn, k: int, ins: IrInstr): bool {
   let op = ins.op
-  if (op == Op.Call) {
+  if (op == Op.Call || op == Op.CallIface) {
     return !calmCall(o.fields.calm, ins, k)
   }
   if (fieldRunsUnseen(op)) {
@@ -556,11 +565,14 @@ fn fieldRunsUnseen(op: Op): bool {
 }
 
 // The calm summary: `base[name]` is one plus the function's index, -1 when
-// two functions share the name; `ok[i]` whether function `i` is calm and
-// `keys[i]` the fields it, or a calm callee, stores to or appends to. Slot
-// `depFrom[d]` is calm only if slot `depTo[d]` is, and takes its keys.
+// two functions share the name; `iface[id]` the same for every method a
+// `call_iface` on method id `id` can reach; `ok[i]` whether function `i` is
+// calm and `keys[i]` the fields it, or a calm callee, stores to or appends
+// to. Slot `depFrom[d]` is calm only if slot `depTo[d]` is, and takes its
+// keys.
 class Calm {
   base: map<string, int>,
+  iface: map<int, []int>,
   ok: []bool,
   keys: [][]int,
   depFrom: []int,
@@ -572,12 +584,13 @@ const calmMaxKeys: int = 4
 
 fn calmEmpty(n: int): Calm {
   return Calm{
-    base = map<string, int>(), ok = []bool(n), keys = [][]int(n), depFrom = []int(0),
-    depTo = []int(0),
+    base = map<string, int>(), iface = map<int, []int>(), ok = []bool(n), keys = [][]int(n),
+    depFrom = []int(0), depTo = []int(0),
   }
 }
 
-fn calmNew(fo: FieldOwn, funcs: []IrFunc): Calm {
+fn calmNew(fo: FieldOwn, m: IrModule): Calm {
+  let funcs = m.funcs
   let c = calmEmpty(len(funcs))
   let i = 0
   while (i < len(funcs)) {
@@ -585,6 +598,7 @@ fn calmNew(fo: FieldOwn, funcs: []IrFunc): Calm {
     c.base[funcs[i].name] = prior == 0 ? i + 1 : -1
     i = i + 1
   }
+  calmIfaceTargets(c, m.methodTables)
   i = 0
   while (i < len(funcs)) {
     c.ok[i] = calmScan(fo, c, funcs[i], i)
@@ -594,20 +608,52 @@ fn calmNew(fo: FieldOwn, funcs: []IrFunc): Calm {
   return c
 }
 
+// Fills `c.iface`: for each method id, `c.base` of every method a table
+// slot carrying it names.
+fn calmIfaceTargets(c: Calm, tables: []MethodTable) {
+  for t of tables {
+    for s of t.methods {
+      c.iface[s.id] = append(c.iface[s.id], c.base[s.func])
+    }
+  }
+}
+
+// `c.base` of each function call `ins` can run: one for a direct call, the
+// method id's targets for a `call_iface`. Empty when none is known.
+fn calmCallees(c: Calm, ins: IrInstr): []int {
+  if (ins.op == Op.CallIface) {
+    return c.iface[ins.ival]
+  }
+  return [c.base[ins.name]]
+}
+
 // Whether `f`, slot `slot`, is calm apart from its callees, recording each
-// direct call's dependency and each field it touches.
+// call's dependencies and each field it touches.
 fn calmScan(fo: FieldOwn, c: Calm, f: IrFunc, slot: int): bool {
   for ins of f.instrs {
-    if (ins.op == Op.Call) {
-      let j = c.base[ins.name]
-      if (j <= 0) {
+    if (ins.op == Op.Call || ins.op == Op.CallIface) {
+      if (!calmAddDeps(c, slot, calmCallees(c, ins))) {
         return false
       }
-      c.depFrom = append(c.depFrom, slot)
-      c.depTo = append(c.depTo, j - 1)
     } else if (!calmInstr(fo, c, f, ins, slot)) {
       return false
     }
+  }
+  return true
+}
+
+// Records slot `slot`'s dependency on each of `callees`; false when there is
+// none or one names no unique function of this module.
+fn calmAddDeps(c: Calm, slot: int, callees: []int): bool {
+  if (len(callees) == 0) {
+    return false
+  }
+  for j of callees {
+    if (j <= 0) {
+      return false
+    }
+    c.depFrom = append(c.depFrom, slot)
+    c.depTo = append(c.depTo, j - 1)
   }
   return true
 }
@@ -697,10 +743,23 @@ fn calmPull(c: Calm, a: int, b: int): bool {
   return len(c.keys[a]) != n
 }
 
-// Whether call `ins` runs a calm function of this module that touches no
+// Whether call `ins` runs only calm functions of this module that touch no
 // store to, and no append on, field `k`.
 fn calmCall(c: Calm, ins: IrInstr, k: int): bool {
-  let j = c.base[ins.name]
+  let callees = calmCallees(c, ins)
+  if (len(callees) == 0) {
+    return false
+  }
+  for j of callees {
+    if (!calmFnSpares(c, j, k)) {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether `c.base` value `j` is a calm function touching no field `k`.
+fn calmFnSpares(c: Calm, j: int, k: int): bool {
   if (j <= 0 || !c.ok[j - 1]) {
     return false
   }
@@ -713,11 +772,13 @@ fn calmCall(c: Calm, ins: IrInstr, k: int): bool {
 }
 
 // Runtime calls that neither run a closure nor synchronize: allocation,
-// element access, the thread's own error slot, and `panic`, which runs no
-// Bit code and never returns into the frame that called it (SPEC §18.5: no
-// deferred call runs on a panic path). Every other runtime call separates.
+// element access, the thread's own error slot, `pow` (float arithmetic,
+// runtime/root/floatspow.bit), and `panic`, which runs no Bit code and never
+// returns into the frame that called it (SPEC §18.5: no deferred call runs
+// on a panic path). Every other runtime call separates.
 fn fieldLocalRtCall(name: string): bool {
   return fieldAllocRtCall(name) ||
+    name == "pow" ||
     name == "slice_get" ||
     name == "slice_set" ||
     name == "err_get" ||
