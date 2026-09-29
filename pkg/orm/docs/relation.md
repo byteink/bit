@@ -27,9 +27,11 @@ import { Db, open } from "orm"
 }
 
 @table class Article {
-  id: i64,
-  authorId: i64,
-  title: string,
+  id: i64
+  authorId: i64
+  title: string
+  @belongsTo("authorId")
+  author: Author
 }
 
 fn authorsWithArticles(db: Db): []Author! {
@@ -91,6 +93,31 @@ fn printHomepage(db: Db): ()! {
 `printHomepage` never issues a query inside its own loop - every `a.articles`
 it reads was already filled in by the single `with("articles")` call in
 `homepage`, whether `a` has three articles or none.
+
+## The other direction: `@belongsTo`
+
+A single article's own author is the opposite shape - one `Article` points
+at exactly one `Author`, never a list:
+
+```bit
+fn articleByline(db: Db, id: i64): Option<Article>! {
+  return db.table<Article>().where("id", id).with("author").first()?
+}
+
+fn printByline(db: Db, id: i64): ()! {
+  match (articleByline(db, id)?) {
+    Some(article) => println("${article.title} by ${article.author.name}")
+    None => println("not found")
+  }
+}
+```
+
+`@belongsTo("authorId")` names the same foreign key `@hasMany("authorId")`
+does, read from the other side: `articleByline` still runs two statements,
+the article's own row plus one `select * from author where id in (...)` for
+the (at most one, here) author id it saw. `with("author")` is checked and
+loaded the same way `with("articles")` is above - it's the direction of the
+foreign key, not a different mechanism.
 
 ## The sharp edge: a relation you never asked for panics on read
 
