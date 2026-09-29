@@ -224,6 +224,23 @@
 # 0.34.0 repin; `diags` has no automated
 # RETIRED audit (like ast/fmt), so 6254 is confirmed dead by hand there.
 #
+# #6284 (`types`, NO SEPARATE SIGNATURE — same non-fire reason #6254's note
+# above gives). `@table class` now needs no import from "std/sql" at all
+# (compiler/project.bit's `injectImplicitTableImport`, mirroring #6244's
+# `injectImplicitJsonImport`): a zero-import module's `tableDescriptor`/
+# `tableAttrs`/`__tableName`/`__columns`/`__values`/`__fromRow` type-check
+# where 0.33.0 (predates both #6244's implicit-import mechanism and #6255's
+# synthesis) declines. Every line this produces is either a pure insertion
+# or a `jsonAttrTypeResolved` pair, a strict subset of what
+# `tableRowSynthInsert` (#6255, tried before this could ever be reached)
+# already walks — a dedicated `6284-*` entry would never fire and could
+# never be exercised by its own selfcheck, so none is declared; this note
+# is the record (_tests_/cases/table_attr_zero_import.bit). Not run against
+# the pinned oracle from this worktree; the integrator's differential pass
+# confirms which of `6244-json-attr-implicit-insert`/
+# `6255-table-row-synth-reposition` explains it. Retires at the 0.34.0 repin
+# with the other two.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call

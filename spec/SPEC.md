@@ -1412,10 +1412,10 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   reads a field's `@column("...")` override off `FieldDesc.attrs`.
 - A class carrying `@table` that also declares `tableAttrs` itself is
   **E0157**, naming both - the same rule as `tableDescriptor`'s own E0148.
-- The module declaring the class must import `FieldDesc` and `AttrDesc` from
-  `"std/sql"` under those names; the member is written in terms of both,
-  by name, unlike `@json`'s own **E0142** (#6232). Without them the class is
-  **E0150** and nothing is synthesized.
+- The compiler resolves `FieldDesc`/`AttrDesc`, the names the synthesized
+  members are written in terms of, itself, loading `"std/sql"` as an implicit
+  dependency - no import is required, the same mechanism `@json`'s own
+  **E0142** takes (#6244, #6284); **E0150** needs `BIT_IMPLICIT_SYNTH_IMPORTS=0`.
 - Fields are ordered; that order is the memory layout order, exactly as
   `@json`'s is.
 - **`@hasMany`/`@hasOne`/`@belongsTo` are compiler-known relation marks**,
