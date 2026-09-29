@@ -203,6 +203,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo "FAIL: a #6264 from binding with a different type was wrongly explained (sig='$s64yr')"; fail=1
   fi
 
+  # #6269-default-id-attr: POSITIVE (post-opt shape, one class) and REJECTION
+  # (the same block without the "id" string, and with an extra call).
+  o69='%1 = const_nil'
+  b69=$(printf '%%1 = rt_call slice_new(%%2, %%2, %%2, %%3) []AttrDesc\n%%4 = gc_alloc size=16 ptrs=[%%0] AttrDesc\n%%5 = const_string "id"\n%%6 = field_get %%1[0] i64\nindex_set %%6[%%7] = %%4\n%%8 = const_nil\n')
+  s69=$(explainMismatch "$o69" "$b69" iropt)
+  if [ "$s69" != "6269-default-id-attr" ]; then
+    echo "FAIL: the #6269 default-id attribute block was not explained (sig='$s69')"; fail=1
+  fi
+  b69r=$(printf '%%1 = rt_call slice_new(%%2, %%2, %%2, %%3) []AttrDesc\n%%4 = gc_alloc size=16 ptrs=[%%0] AttrDesc\n%%5 = const_string "id"\n%%6 = field_get %%1[0] i64\nindex_set %%6[%%7] = %%4\n%%8 = const_nil\n%%9 = rt_call print(%%5)\n')
+  s69r=$(explainMismatch "$o69" "$b69r" iropt)
+  if [ -n "$s69r" ]; then
+    echo "FAIL: a #6269-shaped block with an extra call was wrongly explained (sig='$s69r')"; fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
