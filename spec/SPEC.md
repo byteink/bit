@@ -1611,29 +1611,28 @@ argument (#6280).**
   converts to `Value.Null` regardless of which `Option<T>` it would have
   been, so nothing about it needs resolving.
 
-**`pkg/orm`'s find chain - a compile-time check on a literal column name.**
+**`pkg/orm`'s `Repo<T>` chain - a compile-time check on a literal column name.**
 
-- `pkg/orm/query.bit` declares `find<T>(db, table, fields, mapper):
-  Query<T>`, a chain builder over `where`/`whereIn`/`whereNull`/
-  `whereLike`/`orderBy`/`limit`/`offset`, terminated by `all`/`one`/
-  `oneOrFail`/`count`/`exists`. `where`/`whereIn`/`whereNull`/`whereLike`/
-  `orderBy` take a Bit **field** name, never a SQL column - the same
+- `pkg/orm/db.bit` declares `db.table<T: Tabled>(): Repo<T>`
+  (`tx.table<T>()`: `TxRepo<T>`), a chain builder over
+  `where`/`orderBy`/`limit`/`offset`/`set`/`with`, terminated by
+  `all`/`first`/`find`/`count`/`insert`/`update`/`delete`. `where`/`orderBy`/
+  `set`/`with` take a Bit **field** name, never a SQL column - the same
   three-namings split §10.5's `@column` already draws.
-- When a `where`/`whereIn`/`whereNull`/`whereLike`/`orderBy` call
-  syntactically chained off a `find<T>(...)` call names a **string
-  literal** column that is not one of `T`'s declared fields, that is
-  **E0163**, naming the field and the class - catching a misspelled column
-  before the program runs, at no runtime cost, is the whole point of the
-  check. A column reached any other
-  way (held in a variable, chained off a `Query<T>` this syntactic walk
-  cannot trace back to its own `find<T>(...)` root) is not flagged here; it
-  is never silently accepted either - `Query.columnFor` performs the
-  identical existence check at runtime, panicking naming the field and the
-  class.
-- Every value passed to `where`/`whereIn`/`whereLike` is `std/sql`'s own
-  `Value`, bound as a numbered `$n` argument exactly as `Executor.query`
-  takes it (§17's `std/sql` contract) - no value is ever concatenated into
-  the SQL text this package builds.
+- When a `where`/`orderBy`/`set`/`with` call syntactically chained off a
+  `db.table<T>()`/`tx.table<T>()` call names a **string literal** column
+  that is not one of `T`'s declared fields, that is **E0163**, naming the
+  field and the class - catching a misspelled column before the program
+  runs, at no runtime cost, is the whole point of the check. A column
+  reached any other way (held in a variable, chained off a `Repo<T>` this
+  syntactic walk cannot trace back to its own `db.table<T>()` root) is not
+  flagged here; it is never silently accepted either - `Repo<T>.columnFor`
+  performs the identical existence check at runtime, deferred onto the
+  chain's own error and reported by the next terminal call.
+- Every value passed to `where`/`set` is `std/sql`'s own `Value`, bound as a
+  numbered `$n` argument exactly as `Executor.query` takes it (§17's
+  `std/sql` contract) - no value is ever concatenated into the SQL text this
+  package builds.
 
 **`pkg/orm`'s `Repo<T>` - a compile-time check on the primary key.**
 
@@ -1664,7 +1663,7 @@ walk as E0163.**
   `orderBy` yet, or ordering by a column that carries neither `@id` nor
   `@unique` (the page boundary would then be ambiguous).
 - When an `.after(...)` call is syntactically chained off a
-  `db.table<T>()`/`find<T>(...)` root (E0163's own walk), a chain with no
+  `db.table<T>()`/`tx.table<T>()` root (E0163's own walk), a chain with no
   `.orderBy(...)` anywhere earlier in it is **E0181**, naming `T`. When the
   chain's FIRST `.orderBy(...)` call names its column as a string literal
   and that column is not `@id`/`@unique` (nor the bare `id` default), that

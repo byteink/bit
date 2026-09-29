@@ -1,105 +1,61 @@
-// pkg/orm/lock.bit — pessimistic locking on the find chain (#5083, owner
-// decision 2026-09-12): `FOR UPDATE`, `FOR UPDATE SKIP LOCKED` and
+// pkg/orm/lock.bit — pessimistic locking on the `Repo<T>` chain (#5083,
+// owner decision 2026-09-12; #6296 retired the old hand-built-chain-based
+// locked-query wrapper and its free-function entry point this file used to
+// also declare): `FOR UPDATE`, `FOR UPDATE SKIP LOCKED` and
 // `FOR UPDATE NOWAIT`, legal only inside a transaction.
 //
-//     db.tx((db) => {
-//       let q = find<Account>(db, "accounts", fields, mapper).where("id", 1)
-//       let a = forUpdate<Account>(q, LockOpts{}, ServerDialect.Postgres).oneOrFail()?
+//     db.tx((tx) => {
+//       let repo = tx.table<Account>()
+//       let a = repo.lock().find(1)?
 //       a.balance = a.balance - amt
-//       db.save(a)?
+//       repo.update(a)?
 //     })?
 //
-//     db.tx((db) => {
-//       let q = find<Job>(db, "jobs", fields, mapper).where("state", "pending").limit(1)
-//       let job = forUpdate<Job>(q, LockOpts{ skipLocked = true }, ServerDialect.Postgres).one()?
+//     db.tx((tx) => {
+//       let job = tx.table<Job>().lock(LockMode.SkipLocked).find(id)?
 //     })?
 //
-// ON THE CHAIN TOO, AS OF #5383: `Query<T>.forUpdate(opts, dialect)`
-// (`pkg/orm/query.bit`) is one line delegating into `forUpdate<T>` below —
-//
-//     db.tx((db) => {
-//       let a = find<Account>(db, "accounts", fields, mapper).where("id", 1)
-//         .forUpdate(LockOpts{}, ServerDialect.Postgres).oneOrFail()?
-//     })?
-//
-// — the same way `after()` (declared in query.bit) calls into
-// `keysetPredicate` (keyset.bit) for its logic. A method named `forUpdate`
-// and a free function named `forUpdate` in the same package do NOT collide
-// (E0042 is a flat-namespace check; SPEC §10.4 declares a method inside its
-// class body as its own grammar production, and
-// `compiler/resolvecollect.bit`'s `rCollectTopDecl` states outright that a
-// receiver method "do[es] not join the flat namespace... reached via
-// `recv.name(...)`, never a bare scope lookup") — see query.bit's own header
-// for the precedent (`stdlib/sql/pool.bit`'s `Pool.txValue<T>` already does
-// this exact same-name delegation). `forUpdate<T>` below is unchanged and
-// stays the one place the logic lives; the method is pure wiring.
-// `LockedQuery<T>` reads `Query<T>`'s own fields and private
-// `selectSql`/`boundedSql` builders directly — legal because a Bit module is
-// a whole directory sharing one declaration namespace (SPEC §17.1), the
-// identical access `softdelete.bit`'s `SoftQuery<T>` already uses on
-// `this.inner.wheres`.
-//
-// NAMED FIELDS, NOT `forUpdate(skipLocked = true)` — SPEC §12.11 forbids a
-// named argument on a generic receiver or callee outright ("a named argument
-// is a compile error when the callee is a generic function, when the
-// receiver is a generic class"), and `Query<T>`/`forUpdate<T>` are both
-// generic. `LockOpts{ skipLocked = true }` is an ordinary composite literal —
-// always legal, generic receiver or not — and doubles as the "make the
-// difference visible" naming the ticket asks for: `skipLocked`/`nowait` are
-// two independent fields, not one flag a caller has to remember the meaning
-// of positionally.
+// `TxRepo<T>.lock(mode)` (pkg/orm/txrepo.bit, #6278) is the one entry
+// point — see that file's header for why `Repo<T>` itself never declares
+// `lock()`.
 //
 // THE GUARD IS THE POINT. `SELECT ... FOR UPDATE` issued on a `Pool` (no
 // open transaction) takes its row lock and releases it at the end of that
 // one statement — the query still returns the right rows, so it LOOKS like
 // it worked. Two workers racing the same queue row both "win". `requireTx`
-// below is what every terminal (`all`/`one`/`oneOrFail`) runs before issuing
-// any SQL, by asking Data's own runtime type the same way
-// `stdlib/sql/tx.bit`'s `enter()` already does (`db.(Pool)`) — `Data` (this
-// module's `data.bit`) is `Pool` or a live transaction handle, and the
-// concrete type is the only thing this file has to ask, since `Executor`
-// itself carries no "am I inside a transaction" flag (data.bit's own header:
-// there is deliberately no ambient one).
+// below is what `LockedRepo<T>.find` runs before issuing any SQL, by asking
+// Data's own runtime type the same way `stdlib/sql/tx.bit`'s `enter()`
+// already does (`db.(Pool)`) — `Data` (this module's `data.bit`) is `Pool`
+// or a live transaction handle, and the concrete type is the only thing
+// this file has to ask, since `Executor` itself carries no "am I inside a
+// transaction" flag (data.bit's own header: there is deliberately no
+// ambient one).
 //
-// `count()`/`exists()` REFUSE RATHER THAN BEING LEFT UNDEFINED. A row lock on
-// a `count(*)` or an existence probe is meaningless (the ticket's own
-// constraint) — refusing with a typed, catchable error is the same choice
-// `keyset.bit`'s `after()` makes for its own invalid states, not a panic,
-// since a caller building a query dynamically can reasonably reach this path
-// and needs to recover from it.
-//
-// MYSQL'S VERSION GATE IS AN EXPLICIT, REQUIRED PARAMETER ON `forUpdate`
+// MYSQL'S VERSION GATE IS AN EXPLICIT, REQUIRED FIELD ON `ServerDialect`
 // ITSELF (#5391, fixed) — NOT A SEPARATE FUNCTION A CALLER MUST REMEMBER TO
 // RUN FIRST. `mysqlLockClause` (below) used to be exactly that: a public
 // function nothing in this file's own `guard()` ever called, so a caller who
 // forgot the separate pre-check got `SKIP LOCKED`/`NOWAIT` sent straight to
 // a MySQL 5.7 server and a syntax error back, with the guard built to
-// prevent exactly that never consulted. `forUpdate<T>`/`Query<T>.forUpdate`
-// take `dialect: ServerDialect` (`pkg/orm/data.bit`, #5384) explicitly, the
-// same "nothing on `Data` carries a server version, so the caller supplies
-// it" reasoning every dialect-sensitive site in this package now shares —
-// see `data.bit`'s header for the full decision: this file's own former
-// `LockDialect` (the richer of two prior shapes: tag-plus-version, not a
-// bare tag) is what the package settled on package-wide, renamed
-// `ServerDialect` and moved to `data.bit`, `Mysql` variant still carrying
-// `MysqlVersion`, checked at `version` by
-// `LockedQuery<T>.guard()` before any SQL is built — the same "zero
-// statements issued on a refusal" guarantee `requireTx` already gives.
-// `mysqlLockClause` stays exported (a caller who wants the version-only
-// check without building a `LockedQuery` can still call it directly, the
-// same shape `pkg/orm/manytomany.bit`'s header cites this file's version
-// parameter for) — `guard()` below is now that same real caller.
+// prevent exactly that never consulted. `LockedRepo<T>`'s own `dialect`
+// field (`pkg/orm/data.bit`, #5384) carries it, the same "nothing on `Data`
+// carries a server version, so the caller supplies it" reasoning every
+// dialect-sensitive site in this package now shares — see `data.bit`'s
+// header for the full decision. `Mysql` variant still carrying
+// `MysqlVersion`, checked at `LockedRepo<T>.guard()` before any SQL is
+// built — the same "zero statements issued on a refusal" guarantee
+// `requireTx` already gives. `mysqlLockClause` stays exported (a caller who
+// wants the version-only check directly can still call it, the same shape
+// `pkg/orm/manytomany.bit`'s header cites this file's version parameter
+// for).
 
-// `Query<T>`/`find<T>`/`Rows`/`Value` (query.bit), `sqlFindMany`/
-// `sqlFindOne`/`sqlFindOneOrFail` (imported by query.bit from "std/sql")
-// need no import here — a second import of any of them would be E0042;
-// see this file's header and SPEC §17.1. `Pool` IS imported below: this
-// file is now its canonical import site in the module (#5589) - the type
-// assertion in `requireTx` below is the one production use.
+// `Pool` is imported below: this file is its canonical import site in the
+// module (#5589) - the type assertion in `requireTx` below is the one
+// production use.
 import { Pool } from "std/sql"
 
-// Why `forUpdate<T>` on the class mapped to a table was refused — see this
-// file's header for each.
+// Why `TxRepo<T>.lock(mode)` on the class mapped to a table was refused —
+// see this file's header for each.
 export enum LockCause {
   NotInTransaction,
   ConflictingOptions,
@@ -117,9 +73,9 @@ export class LockError {
 
   export message(): string {
     match (this.cause) {
-      NotInTransaction => return "pkg/orm: forUpdate requires a live transaction (Tx), not a Pool - SELECT ... FOR UPDATE issued on a Pool takes the lock and releases it at the end of that one statement, protecting nothing; wrap the call in db.tx((db) => { ... })"
-      ConflictingOptions => return "pkg/orm: forUpdate cannot take skipLocked and nowait together - SKIP LOCKED returns fewer rows without blocking, NOWAIT fails immediately instead of blocking; they answer different questions"
-      TerminalNotLockable => return "pkg/orm: forUpdate cannot be combined with '${this.detail}' - a row lock is meaningless without a row to lock"
+      NotInTransaction => return "pkg/orm: lock() requires a live transaction (Tx), not a Pool - SELECT ... FOR UPDATE issued on a Pool takes the lock and releases it at the end of that one statement, protecting nothing; wrap the call in db.tx((tx) => { ... })"
+      ConflictingOptions => return "pkg/orm: lock() cannot take skipLocked and nowait together - SKIP LOCKED returns fewer rows without blocking, NOWAIT fails immediately instead of blocking; they answer different questions"
+      TerminalNotLockable => return "pkg/orm: lock() cannot be combined with '${this.detail}' - a row lock is meaningless without a row to lock"
       UnsupportedByDialect => return "pkg/orm: ${this.detail}"
     }
   }
@@ -209,104 +165,15 @@ export fn mysqlLockClause(opts: LockOpts, version: MysqlVersion): string! {
   return lockClause(opts)?
 }
 
-// The one entry point: wraps `q` with `opts` and `dialect`, never failing
-// itself - every refusal in this file is deferred to the terminal that
-// already carries a `?` in every one of this file's own examples, the same
-// convention every other fallible `Query<T>` terminal
-// (`count`/`exists`/`one`/`oneOrFail`) already follows.
-export fn forUpdate<T>(q: Query<T>, opts: LockOpts, dialect: ServerDialect): LockedQuery<T> {
-  return LockedQuery<T>{ inner = q, opts = opts, dialect = dialect }
-}
-
-// Wraps an already-built `Query<T>` with a lock clause, applied by every
-// terminal (`all`/`one`/`oneOrFail`) after `requireTx` passes. `count`/
-// `exists` refuse instead of running — a row lock on either is meaningless
-// (this file's header). `Query<T>`'s own fields and private `selectSql`/
-// `boundedSql` builders are read directly here — legal cross-file access
-// within one module (§17.1), the identical access `softdelete.bit`'s
-// `SoftQuery<T>` already uses on `this.inner.wheres`.
-export class LockedQuery<T> {
-  inner: Query<T>
-  opts: LockOpts
-  dialect: ServerDialect
-  export all(): []T! { // Every matching row, locked — the unbounded terminal, same as
-    // `Query<T>.all()`. Runs every `with()`-requested relation through
-    // `this.inner.loadWith` before returning (#6108, the identical fix #6095
-    // gave `Query<T>.all()` — this file's own header explains why this
-    // terminal calls `sqlFindMany` directly rather than delegating to
-    // `this.inner.all()`).
-    let clause = this.guard()?
-    let out = sqlFindMany(
-      this.inner.db,
-      this.inner.selectSql() + clause,
-      this.inner.args,
-      this.inner.mapper,
-    )?
-    return this.inner.loadWith(out)?
-  }
-  export one(): Option<T>! { // At most one row, locked — `Query<T>.boundedSql()` still forces the
-    // LIMIT 2 that catches an unexpectedly wide match (this file's header).
-    // Runs every `with()` relation over the one matched row through
-    // `this.inner.loadWith`, same as `all()` above (#6108).
-    let clause = this.guard()?
-    let opt = sqlFindOne(
-      this.inner.db,
-      this.inner.boundedSql() + clause,
-      this.inner.args,
-      this.inner.mapper,
-    )?
-    match (opt) {
-      Some(row) => {
-        let loaded = this.inner.loadWith([row])?
-        return Option<T>.Some(loaded[0])
-      }
-      None => return Option<T>.None
-    }
-  }
-  export oneOrFail(): T! { // Exactly one row, locked, or the same `SqlRowError` `Query<T>.oneOrFail()`
-    // raises for zero or several. Runs every `with()` relation over the one
-    // matched row through `this.inner.loadWith`, same as `all()`/`one()`
-    // above (#6108).
-    let clause = this.guard()?
-    let row = sqlFindOneOrFail(
-      this.inner.db,
-      this.inner.boundedSql() + clause,
-      this.inner.args,
-      this.inner.mapper,
-    )?
-    let loaded = this.inner.loadWith([row])?
-    return loaded[0]
-  }
-  export count(): i64! { // Refused - see this file's header.
-    fail LockError{ cause = LockCause.TerminalNotLockable, detail = "count()" }
-  }
-  export exists(): bool! { // Refused - see this file's header.
-    fail LockError{ cause = LockCause.TerminalNotLockable, detail = "exists()" }
-  }
-  guard(): string! { // `requireTx` then the dialect-appropriate clause, in that order, so a
-    // caller on a `Pool` never reaches SQL assembly at all - the "zero
-    // statements issued" the #5083 acceptance names. `Postgres` is
-    // `lockClause` alone; `Mysql(version)` is `mysqlLockClause`, which
-    // refuses `skipLocked`/`nowait` below MySQL 8.0 (#5391) - this is the
-    // one place either function actually runs against a real query.
-    requireTx(this.inner.db)?
-    match (this.dialect) {
-      Postgres => return lockClause(this.opts)?
-      Mysql(version) => return mysqlLockClause(this.opts, version)?
-    }
-  }
-}
-
 // `TxRepo<T>.lock(mode)` (`pkg/orm/txrepo.bit`, #6278; `Repo<T>.lock()`
-// before it, #6276) wraps `Repo<T>` the same way `forUpdate<T>` above wraps
-// `Query<T>` — a second wrapper, not a new method on `Repo<T>` returning
-// `Repo<T>!` itself, because a Bit class may declare `find` exactly once
-// (SPEC §14): `Repo<T>`'s OWN `find`/`checkErr`/`singleKeyColumn` (this
-// file's own cross-file access to them is the identical "one module, one
-// declaration namespace" reach `LockedQuery<T>` above already takes on
-// `Query<T>`) stay exactly as `repo.bit` already declares them, never
-// touched by this file. `requireTx`/`lockClause`/`mysqlLockClause` are
-// reused unchanged from the wrapper above — the only new logic here is
+// before it, #6276) wraps `Repo<T>` in a second, dedicated class — never a
+// new method on `Repo<T>` returning `Repo<T>!` itself, because a Bit class
+// may declare `find` exactly once (SPEC §14): `Repo<T>`'s OWN `find`/
+// `checkErr`/`singleKeyColumn` (this file's own cross-file access to them
+// is legal because a Bit module is a whole directory sharing one
+// declaration namespace, SPEC §17.1) stay exactly as `repo.bit` already
+// declares them, never touched by this file. `requireTx`/`lockClause`/
+// `mysqlLockClause` are reused unchanged — the only new logic here is
 // `find`'s own row fetch, the one thing `Repo<T>.find` cannot hand this
 // file a hook into.
 export class LockedRepo<T: Tabled> {
@@ -331,7 +198,8 @@ export class LockedRepo<T: Tabled> {
     return row
   }
 
-  guard(): string! { // Identical order and reasoning to `LockedQuery<T>.guard()` above.
+  guard(): string! { // `requireTx` then the dialect-appropriate clause, in that order, so a
+    // caller on a `Pool` never reaches SQL assembly at all.
     requireTx(this.inner.db)?
     match (this.dialect) {
       Postgres => return lockClause(this.opts)?

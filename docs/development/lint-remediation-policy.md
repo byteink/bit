@@ -406,12 +406,12 @@ Added alongside `compiler/lintrelation.bit`, this is the compile-time half
 of the unloaded-relation runtime panic on the same misuse - the two are meant
 to be recognisable as the same mistake, so their wording agrees on naming the
 class, the field, and the exact `.with("field")` call that is missing.
-Scoped narrowly, on purpose: it only sees a local bound straight from
-`find<T>(db, table, fields, mapper)` (pkg/orm's real chain builder - `T`
-written as an explicit type argument, needing no type inference the
-resolver cannot give it - see the file's own header), optionally chained
-through `Query<T>`'s other non-failable builder methods and `.with("field")`
-links, terminated by `.oneOrFail()`. It flags a read of that local's
+Scoped narrowly, on purpose: it only sees a local bound straight from a
+function literally named `find`, called with `<T>` written as an explicit
+type argument (needing no type inference the resolver cannot give it - see
+the file's own header), optionally chained through that value's other
+non-failable builder methods and `.with("field")` links, terminated by
+`.oneOrFail()`. It flags a read of that local's
 relation field, per `compiler/classrelationattr.bit`'s compiler-known
 predicate, later in the SAME function and not among the fields a
 `.with("field")` link already chained onto that same binding.

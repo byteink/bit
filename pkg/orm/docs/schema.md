@@ -179,7 +179,7 @@ recommended weighted expression - `setweight(to_tsvector('english',
 coalesce(title, '')), 'A') || ...` - from a list of columns and their
 weights (`'A'` through `'D'`), so a full-text search migration never hand-
 writes that expression itself. Querying the column it builds is an
-ordinary `whereRaw` call - see [Raw](raw.md).
+ordinary `db.query<T>` call - see [Raw SQL and transactions](raw.md).
 
 ## The escape hatch
 

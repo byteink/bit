@@ -244,7 +244,7 @@ a `JsonColumnError`, catchable as one type regardless of which one hit.
 
 Querying *inside* a stored document - `payload->>'event' = 'paid'` - is
 not this file's job; no builder here adds a JSON path operator.
-[`whereRaw`](raw.md) is the escape hatch for exactly that, the same as
+[`db.query<T>`](raw.md) is the escape hatch for exactly that, the same as
 for any other expression the rest of this package's builders do not
 express.
 
@@ -253,6 +253,7 @@ express.
 [Schema](schema.md) covers `.nullable()` and every other `ColumnType`
 `t.json` sits beside. [Dialect](dialect.md) and [MySQL](mysql.md) cover
 the `Dialect` interface `Postgres{}.render`/`Mysql{}.render` implement.
-[Raw SQL and dynamic columns](raw.md) covers `whereRaw` for querying
-inside a document. [Write](write.md) covers `save`, which is where a
-`map<string, Value>` built with `jsonColumnValue` usually ends up.
+[Raw SQL and transactions](raw.md) covers `db.query<T>` for querying
+inside a document. [Write](write.md) covers `Repo<T>.insert`/`.update`,
+which is where a `Json`-typed field built with `jsonColumnValue` usually
+ends up.
