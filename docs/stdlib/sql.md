@@ -365,7 +365,7 @@ writes a `Value` variant by hand. `sqlValue(draft.title)` is `Value.Text`,
 `sqlValue(draft.id)` is `Value.Int`, `sqlValue(draft.summary)` (an
 `Option<string>` field) is `Value.Null` when unset. `V` must be
 `string`, `int`/`i64`, `bool`, `f64`, `[]byte`, or `Option<>` of one of
-those — any other type is a compile error naming it, not a runtime
+those. Any other type is a compile error naming it, not a runtime
 surprise.
 
 ## The driver contract
