@@ -401,8 +401,7 @@ entry and marking it. That is the entire precision contract for the heap.
 ### 2.1 Method table (interface dispatch)
 
 `methods` lists only the methods some site dispatches to, not every method the
-type defines (SPEC §14) — `BIT_DCE_METHODS=0` still reproduces the old,
-every-method list (`dispatchedTables`, `compiler/lowermethodtable.bit`,
+type defines (SPEC §14; `dispatchedTables`, `compiler/lowermethodtable.bit`,
 #6114). Each entry is:
 
 ```

@@ -32,20 +32,6 @@ set -u
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 
-# #6189: BIT_MAPLIT (#6016) and BIT_STATIC_METHODS (#6091/#6099) default ON
-# in this tree since the 0.32.0 repin, but the ORACLE is that same v0.32.0
-# release, cut BEFORE the flip -- its own copy of compiler/parser.bit still
-# carries both flags, still defaulting OFF. A random truncation over
-# _tests_/cases can land mid a composite/map literal and leave a bare `{`
-# in expression position behind, which BIT2 now recovers from differently
-# than the ORACLE's flag-off "expected an expression" fallback -- force "1"
-# on both to compare ON-ON, mutation-proven: without this,
-# run_generic_field_composite.bit@40 (a truncated `Shapes<i64>{`) MISMATCHes
-# (measured on this branch: MATCH=22503 MISMATCH=3 without the export).
-# Deleted at the 0.33.0 repin alongside the flags themselves.
-export BIT_MAPLIT=1
-export BIT_STATIC_METHODS=1
-
 # A missing compiler must ABORT, never score a vacuous green (#1514). `run` execs
 # through perl, and a FAILED exec still exits 0 — so an absent compiler yields
 # rc=0 with seed == b2 == "", and every truncation scores MATCH. Measured: 6642
