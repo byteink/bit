@@ -5424,7 +5424,13 @@ catch_expr = binary [ "catch" ( expression | IDENT block ) ] .
     position), so the block need not end in a value expression - falling off
     the end, including an empty block, already yields `()`, the same way a
     `=> block` arrow body with no value-returning `return` defaults to `()`
-    (§12.8). A non-void `T` still requires a value or diverted control.
+    (§12.8). **Second exception: `expr catch e { ... }` at statement position**
+    (`expr_stmt`, §13.1) - its ok value is intentionally discarded regardless
+    of `T` (§13.1 already states this for the operand as a whole), so the same
+    "block need not end in a value expression" rule applies whatever `T` is,
+    not only when it is `()`. A `catch e { ... }` whose value IS used - bound
+    by a `let`, returned, passed as an argument, or any other non-statement
+    position - still requires a value or diverted control for a non-void `T`.
 
 Example:
 
