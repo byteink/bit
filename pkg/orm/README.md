@@ -54,13 +54,15 @@ an argument the way an older version of this package's `find`/`save` did.
 Reading rows through the find chain (`where`, `orderBy`, `limit`, `offset`,
 `after`, `with`) is [`docs/query.md`](docs/query.md). Inserting, updating,
 deleting and bulk writes (`insertAll`, `set().updateAll()`, `deleteAll`)
-and optimistic locking with `@version` is
-[`docs/write.md`](docs/write.md). `hasMany`/`belongsTo` and eager loading
-with `with()` is [`docs/relation.md`](docs/relation.md). Many-to-many
-relations - the join table's DDL, eager loading, and `link`/`unlink` - is
+and optimistic locking with `@version` is [`docs/write.md`](docs/write.md).
+`@hasMany`/`@belongsTo` and eager loading with `with()` is
+[`docs/relation.md`](docs/relation.md). Many-to-many relations - the join
+table's DDL, eager loading, and `link`/`unlink` - is
 [`docs/manytomany.md`](docs/manytomany.md). Marking a row deleted instead
-of removing it is [`docs/softdelete.md`](docs/softdelete.md). Locking a row
-against a concurrent writer with `tx.table<T>().lock(mode)` is
+of removing it is [`docs/softdelete.md`](docs/softdelete.md). Filling
+`createdAt`/`updatedAt` automatically is
+[`docs/timestamps.md`](docs/timestamps.md). Locking a row against a
+concurrent writer with `tx.table<T>().lock(mode)` is
 [`docs/locking.md`](docs/locking.md). Escaping to raw SQL with
 `db.exec`/`db.query<T>` and running inside a transaction with `db.tx(...)`
 is [`docs/raw.md`](docs/raw.md).
@@ -77,8 +79,11 @@ with a CHECK constraint listing its variants by name is
 error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
 Writing a reviewed migration file from your entities is
 [`docs/generate.md`](docs/generate.md). Applying that file against a live
-database is [`docs/migrate.md`](docs/migrate.md). Running your own test
-suite inside a transaction that always rolls back is
+database is [`docs/migrate.md`](docs/migrate.md). Failing CI when your
+entities and the live schema disagree is [`docs/check.md`](docs/check.md).
+Synchronizing a dev database straight from your entities, no migration
+file, is [`docs/sync.md`](docs/sync.md). Running your own test suite inside
+a transaction that always rolls back is
 [`docs/testing.md`](docs/testing.md).
 
 ## `Dialect` vs `ServerDialect`

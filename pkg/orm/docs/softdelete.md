@@ -12,341 +12,136 @@ every ordinary read stops seeing a marked row at all.
 ## Marking a class
 
 ```bit
-import { Data, SoftQuery, TableDesc, delete, findScoped, restore, forceDelete } from "orm"
-import { AttrDesc, FieldDesc, Rows, Value, sqlReqInt, sqlReqText } from "std/sql"
+import { Db, open } from "orm"
 
 @table @softDelete class Account {
-  @id
-  id: i64
-  email: string
-  deletedAt: Option<i64>
+  id: i64,
+  email: string,
+  deletedAt: Option<i64>,
 }
 
-fn accountEntity(): Account {
-  return Account{ id = 0, email = "", deletedAt = Option.None }
-}
-
-fn accountFields(): []FieldDesc {
-  return accountEntity().tableDescriptor()
-}
-
-fn accountAttrs(): []AttrDesc {
-  return accountEntity().tableAttrs()
-}
-
-fn accountDesc(): TableDesc {
-  return TableDesc{ table = "accounts", fields = accountFields(), classAttrs = accountAttrs() }
-}
-
-fn accountValues(a: Account): map<string, Value> {
-  return map<string, Value>{ "id": Value.Int(a.id) }
-}
-
-fn banAccount(db: Data, a: Account): ()! {
-  delete(db, accountDesc(), accountValues(a))?
+fn banAccount(db: Db, id: i64): ()! {
+  db.table<Account>().delete(id)?
 }
 ```
 
 `@softDelete` requires a declared `deletedAt` field - that is the column
-every entry point on this page reads and writes, the same way `@id` marks
-the primary key `pkg/orm/write.bit`'s own `delete` uses. `banAccount`'s
-`delete(...)` no longer runs `DELETE FROM accounts`: it runs `UPDATE
-accounts SET deleted_at = now() WHERE id = $1`, and the row is still there,
-just marked.
+every method on this page reads and writes. `banAccount`'s `delete(id)` no
+longer runs `DELETE FROM account`: it runs `UPDATE account SET deleted_at =
+now() WHERE id = $1`, and the row is still there, just marked.
 
-## Every ordinary query stops seeing it
-
-`accountDesc()`'s `classAttrs` is what tells this package the class is
-soft-delete at all - it is the same `tableAttrs()` [Naming](naming.md)
-already reads for `@table("...")`. `findScoped` reads it too, and adds the
-filter to every terminal automatically:
+## Every ordinary read stops seeing it
 
 ```bit
-fn accountMapper(rows: Rows): Account! {
-  let cols = rows.columns()
-  return Account{
-    id = sqlReqInt(rows, cols, "id")?,
-    email = sqlReqText(rows, cols, "email")?,
-    deletedAt = Option.None,
-  }
+fn byEmail(db: Db, email: string): []Account! {
+  return db.table<Account>().where("email", email).all()?
 }
 
-fn accounts(db: Data): SoftQuery<Account>! {
-  return findScoped<Account>(db, "accounts", accountFields(), accountAttrs(), accountMapper)?
-}
-
-fn byEmail(db: Data, email: string): []Account! {
-  return accounts(db)?.where("email", Value.Text(email)).all()?
+fn lookUp(db: Db, id: i64): Account! {
+  return db.table<Account>().find(id)?
 }
 ```
 
-`byEmail` runs `select * from accounts where email = $1 and deleted_at is
-null` - the exclusion is ANDed onto whatever `where`/`whereIn`/`whereLike`
-you already chained, never pasted after the fact onto assembled SQL text,
-so it composes correctly no matter how many predicates came before it.
-`one`/`oneOrFail`/`count`/`exists` all carry the identical filter; there is
-no fifth terminal that forgets it.
+`byEmail` runs `select * from account where email = $1 and deleted_at is
+null` - the exclusion is ANDed onto whatever `where`/`orderBy` you already
+chained, never pasted after the fact onto assembled SQL text, so it composes
+correctly no matter how many predicates came before it. `find`, `all`,
+`first` and `count` all carry the identical filter - `lookUp(db, id)` fails
+naming the row once `banAccount` has marked it, the same way it would if the
+row were really gone.
 
 ## Seeing a trashed row on purpose
 
 ```bit
-fn anyAccountEver(db: Data, email: string): bool! {
-  return accounts(db)?.where("email", Value.Text(email)).withTrashed().exists()?
-}
-
-fn bannedAccounts(db: Data): []Account! {
-  return accounts(db)?.onlyTrashed().all()?
+fn anyAccountEver(db: Db, email: string): int! {
+  return db.table<Account>().where("email", email).withDeleted().count()?
 }
 ```
 
-`withTrashed()` drops the filter entirely - `anyAccountEver` sees a banned
-row too, the check a signup form needs before it can say "that address is
-already registered, banned or not." `onlyTrashed()` inverts it to `deleted_at
-is not null` instead: `bannedAccounts` is a moderation queue's own query,
-the trashed rows and nothing else.
+`withDeleted()` drops the filter entirely for the rest of the chain -
+`anyAccountEver` sees a banned row too, the check a signup form needs before
+it can say "that address is already registered, banned or not."
 
 ## Undoing a ban, and the escape hatch that actually removes a row
 
 ```bit
-fn unbanAccount(db: Data, a: Account): ()! {
-  restore(db, accountDesc(), accountValues(a))?
+fn unbanAccount(db: Db, id: i64): ()! {
+  db.table<Account>().restore(id)?
 }
 
-fn eraseAccount(db: Data, a: Account): ()! {
-  forceDelete(db, accountDesc(), accountValues(a))?
+fn eraseAccount(db: Db, id: i64): ()! {
+  db.table<Account>().forceDelete(id)?
 }
 ```
 
-`restore` runs `UPDATE accounts SET deleted_at = NULL WHERE id = $1` - the
-same row `banAccount` marked, now visible to `accounts(db)` again with no
-other code path aware anything happened. `forceDelete` is the one function
-on this page that still runs a real `DELETE`, on a soft-delete table or
-not - reach for it only when a row must actually be gone, GDPR erasure
-being the case that actually requires it.
+`restore` runs `UPDATE account SET deleted_at = NULL WHERE id = $1` - the
+same row `banAccount` marked, now visible to `byEmail`/`lookUp` again with
+no other code path aware anything happened. `forceDelete` is the one method
+on this page that still runs a real `DELETE`, marked or not - reach for it
+only when a row must actually be gone, GDPR erasure being the case that
+actually requires it.
+
+## Bulk writes respect the mark too
+
+```bit
+fn closeStaleAccounts(db: Db, cutoffId: i64): int! {
+  return db.table<Account>().where("id", cutoffId).deleteAll()?
+}
+```
+
+`deleteAll` on a `@softDelete` class never runs a real `DELETE` - it emits
+the identical `UPDATE ... SET deleted_at = now()` `banAccount` does, scoped
+by whatever `where(...)` narrowed to, so a bulk removal can never
+hard-delete what the single-row path only marks. On a class with no
+`@softDelete` at all, `deleteAll` behaves exactly like an ordinary bulk
+delete - unchanged.
 
 ## The sharp edge: marking a class without the field it needs
 
 ```bit ignore
 @table @softDelete class Broken {
-  @id
-  id: i64
+  id: i64,
+}
+
+fn probe(db: Db): ()! {
+  db.table<Broken>().delete(1)?
 }
 ```
 
 ```text
-pkg/orm: '@softDelete' on the class mapped to 'brokens' requires a declared 'deletedAt' field
+pkg/orm: '@softDelete' on the class mapped to 'broken' requires a declared 'deletedAt' field
 ```
 
-This is a caught `error`, not a panic - a class shaped wrong is a program
-bug your own code can report, same as any other `catch`:
+This surfaces as an ordinary error at the first call that needs the column -
+`delete`, `all`, `find`, anything routed through the chain's own soft-delete
+check - never a panic and never a silent no-op: a class shaped wrong is a
+program bug your own code can report, same as any other failed `?`.
 
-```bit ignore
-fn brokenDesc(): TableDesc {
-  return TableDesc{ table = "brokens", fields = [], classAttrs = [AttrDesc{ name = "softDelete", args = []string(0) }] }
-}
-
-fn probe(db: Data): ()! {
-  delete(db, brokenDesc(), map<string, Value>{}) catch e {
-    let (se, ok) = e.(SoftDeleteError)
-    if (ok) {
-      fail newError("class misconfigured: ${se.cause}")
-    }
-    fail e
-  }
-}
-```
-
-## Bulk writes respect the mark too
-
-[Write](write.md)'s `update`/`deleteMany` have their own soft-delete-aware
-entry points, `updateScoped`/`deleteManyScoped`, so a bulk job never
-touches a row the single-instance path already protects:
+## The sharp edge: a relation's own child query does not know about the mark
 
 ```bit
-import { SoftDeletePatch, deleteManyScoped, updateScoped } from "orm"
-
-fn closeStaleAccounts(db: Data, cutoffId: i64): int! {
-  let patch = updateScoped<Account>(db, "accounts", accountFields(), accountAttrs())?
-  return patch.where("id", Value.Int(cutoffId)).set("email", Value.Text("")).run()?
-}
-
-fn staleAccounts(db: Data): SoftDeletePatch<Account>! {
-  return deleteManyScoped<Account>(db, "accounts", accountFields(), accountAttrs())?
-}
-
-fn purgeBanned(db: Data, id: i64): int! {
-  return staleAccounts(db)?.where("id", Value.Int(id)).run()?
-}
-```
-
-`patch` already excludes an already-trashed row from its own default
-`where`, the same way `accounts(db)` does. `purgeBanned`'s `run()` never
-runs a real `DELETE` on this table - it emits the identical `UPDATE ... SET
-deleted_at = now()` `banAccount` does, so a bulk removal can never
-hard-delete what the single-row path only marks. On a class with no
-`@softDelete` at all, both functions behave exactly like the plain
-`update`/`deleteMany` they wrap - unchanged.
-
-## A relation's own child query respects the mark too
-
-The classic version of this bug: a banned account's orders reappear under
-`account.orders` because the relation loader forgot the filter. [Relations](relation.md)'s
-`hasMany`/`hasOne`/`belongsTo` take an ordinary `childQuery: (Data) =>
-Query<TChild>` closure, the same per-entity wrapper shape every function on
-this page already uses - so a `@softDelete` child table is just a choice of
-which function goes in that closure: `findScopedQuery`, not `find`.
-
-```bit
-import { Dir, Query, RelationLoader, find, findScopedQuery, hasMany, withRelations } from "orm"
-
 @table class Team {
-  @id
   id: i64
   @hasMany("teamId")
   accounts: []Account
 }
 
-fn teamAccountsLoader(): RelationLoader<Team> {
-  return hasMany<Team, Account>(
-    (t) => t.id,
-    (db) => findScopedQuery<Account>(db, "accounts", accountFields(), accountAttrs(), accountMapper),
-    "teamId",
-    (a) => a.id,
-    (t, accts) => {
-      t.accounts = accts
-    },
-  )
-}
-
-fn teamMapper(rows: Rows): Team! {
-  return Team{ id = sqlReqInt(rows, rows.columns(), "id")? }
-}
-
-fn teams(db: Data): Query<Team> {
-  return withRelations(
-    find<Team>(
-      db,
-      "teams",
-      [FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }],
-      teamMapper,
-    ),
-    map<string, RelationLoader<Team>>{ "accounts": teamAccountsLoader() },
-  )
-}
-
-fn teamWithLiveAccounts(db: Data, id: i64): Team! {
-  return teams(db).where("id", Value.Int(id)).with("accounts").oneOrFail()?
+fn teamWithAccounts(db: Db, id: i64): Option<Team>! {
+  return db.table<Team>().where("id", id).with("accounts").first()?
 }
 ```
 
-`teamWithLiveAccounts` runs two statements - the team, then `select *
-from accounts where team_id in ($1) and deleted_at is null` - never a
-banned account slipping back in under a team it still belongs to on
-paper. `findScopedQuery` returns a plain `Query<T>`, not the
-`withTrashed`/`onlyTrashed`-carrying wrapper `findScoped` does: a relation
-load always respects the child's default scope, the same way every other
-read on this page does when a caller doesn't ask for trashed rows on
-purpose.
-
-`SoftQuery<T>` (what `findScoped` returns) exposes the same chainable
-reads `Query<T>` does - `with()`, `where`, `orderBy`, `limit`, `offset`,
-`after()`, `count`, `all`, `one`, `oneOrFail` - each delegating straight to
-the wrapped `Query<T>`, so a `@softDelete` PARENT paginating with
-[keyset pagination](query.md#paging-through-a-large-table-with-after) or eager-loading a relation works exactly
-like `accounts(db)` above, no different spelling:
-
-```bit
-fn nextAccountsPage(db: Data, lastId: i64): []Account! {
-  return accounts(db)?.orderBy("id", Dir.Asc).after(Value.Int(lastId))?.limit(50).all()?
-}
-```
-
-`after()`'s own keyset predicate and the automatic `deleted_at is null`
-are both ordinary entries in the same `where` list - order never matters,
-both are `AND`ed.
-
-`with()` on `findScoped`'s own result works the identical way, `@belongsTo`
-or `@hasMany` alike. `Article` is the soft-delete side this time, pointing
-at a plain, non-soft-delete `Author`:
-
-```bit
-import { belongsTo, withRelationsScoped } from "orm"
-
-@table class Author {
-  @id
-  id: i64
-  name: string
-}
-
-@table @softDelete class Article {
-  @id
-  id: i64
-  authorId: i64
-  deletedAt: Option<i64>
-  @belongsTo("authorId")
-  author: Author
-}
-
-fn authorEntity(): Author {
-  return Author{ id = 0, name = "" }
-}
-
-fn authorMapper(rows: Rows): Author! {
-  let cols = rows.columns()
-  return Author{ id = sqlReqInt(rows, cols, "id")?, name = sqlReqText(rows, cols, "name")? }
-}
-
-fn articleEntity(): Article {
-  return Article{ id = 0, authorId = 0, deletedAt = Option.None, author = authorEntity() }
-}
-
-fn articleMapper(rows: Rows): Article! {
-  let cols = rows.columns()
-  return Article{
-    id = sqlReqInt(rows, cols, "id")?, authorId = sqlReqInt(rows, cols, "author_id")?,
-    deletedAt = Option.None, author = authorEntity(),
-  }
-}
-
-fn authorLoader(): RelationLoader<Article> {
-  return belongsTo<Article, Author>(
-    (article) => article.authorId,
-    (db) => find<Author>(
-      db,
-      "authors",
-      [FieldDesc{ name = "id", typeName = "i64", attrs = []AttrDesc(0) }],
-      authorMapper,
-    ),
-    "id",
-    (author) => author.id,
-    (article, author) => {
-      article.author = author
-    },
-  )
-}
-
-fn articles(db: Data): SoftQuery<Article>! {
-  let sq = findScoped<Article>(
-    db, "articles", articleEntity().tableDescriptor(), articleEntity().tableAttrs(), articleMapper,
-  )?
-  return withRelationsScoped(sq, map<string, RelationLoader<Article>>{ "author": authorLoader() })
-}
-
-fn articleWithAuthor(db: Data, id: i64): Article! {
-  return articles(db)?.where("id", Value.Int(id)).with("author").oneOrFail()?
-}
-```
-
-This runs two statements - the article (excluding a trashed one), then the
-author lookup - the same two-statement shape `teamWithLiveAccounts` above
-uses for its own `with("accounts")`. `withRelationsScoped` is the
-`SoftQuery<T>` counterpart to [Relations](relation.md)'s own
-`withRelations` - that one only takes a plain `Query<T>`, so it cannot
-reach a `SoftQuery<T>`'s wrapped query from outside this package.
+`with("accounts")` loads every `Account` row whose `team_id` matches, by a
+plain `SELECT` that does not go through `Repo<Account>` at all - a banned
+account still turns up under `team.accounts`. [Relations](relation.md)'s
+`with()` and this page's own exclusion are two separate mechanisms today; if
+a team roster must never show a banned member, filter `deletedAt` out of
+`team.accounts` yourself after loading, rather than assume `with()` already
+did it.
 
 ## When not to use this
 
-**A unique column blocks re-registration.** `accounts.email unique` plus a
+**A unique column blocks re-registration.** `account.email unique` plus a
 soft-deleted row still holding that email means a new signup with the same
 address fails at the database, not at your application - that is the
 database doing exactly what `unique` asked it to do, not a bug this page
@@ -360,14 +155,12 @@ which is usually the wrong trade for a table that size.
 
 **Some data legally has to go.** A "right to erasure" request needs the row
 gone, not flagged - `forceDelete` is that path, and it is worth grepping for
-on purpose rather than reached for by habit, because every other function on
+on purpose rather than reached for by habit, because every other method on
 this page is built to protect the row it just marked.
 
 ## Where to go next
 
-[Query](query.md) covers the plain `find` chain this page's `findScoped`
-extends, and [keyset pagination](query.md#paging-through-a-large-table-with-after)'s own `after()`. [Relations](relation.md)
-covers `hasMany`/`hasOne`/`belongsTo` and `with()` before `findScopedQuery`
-here. [Write](write.md) covers `update`/`deleteMany` before the
-soft-delete-aware wrappers here. [Write](write.md) covers `save`/`delete`/
-`upsert` and `TableDesc`, the shape `classAttrs` was added to for this page.
+[Query](query.md) covers the plain `find`/`where`/`all` chain this page's
+exclusion sits on top of. [Relations](relation.md) covers `with()` and the
+sharp edge above in full. [Write](write.md) covers `insert`/`update`, which
+`@softDelete` never changes.
