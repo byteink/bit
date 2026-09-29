@@ -153,3 +153,156 @@ test "a stale-version update fails with StaleWriteError, never a plain WriteErro
   }
   assert(false, "a 0-row UPDATE on a @version table must fail")
 }
+
+// #6274: soft delete (delete hides/withDeleted/restore/forceDelete) and
+// bulk writes (insertAll/where().set().updateAll()/deleteAll), with
+// `@timestamps` filled on insert/update/updateAll — the locked target's own
+// `@softDelete`/`@timestamps` example (`.claude/kb/data-packages-dx.md`,
+// "Approved 2026-09-29"). `deletedAt`/`createdAt`/`updatedAt` are plain
+// `i64`/`Option<i64>` epoch-nanosecond columns, never `DateTime`/
+// `Timestamp` — `pkg/orm/repo.bit`'s own header: `__values()` cannot map
+// either type, so a `@table` class using one could not `insert`/`update` at
+// all through `Repo<T>`. A RAW STRING (backtick, SPEC §on strings — no
+// escapes) rather than `liveDbProofSource`'s escaped one, above: this
+// source is new, so nothing forces it to match that file's own convention.
+const liveSoftDeleteBulkProofSource: string = `import { args } from "std/os"
+import { pool, Datasource, Value, FieldDesc, AttrDesc } from "std/sql"
+import { adapter } from "postgres"
+import { open } from "orm"
+
+@table @softDelete @timestamps class Post {
+  id: i64,
+  title: string,
+  deletedAt: Option<i64>,
+  createdAt: i64,
+  updatedAt: i64,
+}
+
+fn newPost(title: string): Post {
+  return Post{ id = 0, title = title, deletedAt = Option<i64>.None, createdAt = 0, updatedAt = 0 }
+}
+
+fn main(): ()! {
+  let uri = args()[1]
+  let setup = pool(adapter(), Datasource{ uri = uri })?
+  setup.exec("drop table if exists post", []Value(0))?
+  setup.exec("create table post (id bigint generated always as identity primary key, title text not null, deleted_at bigint, created_at bigint not null, updated_at bigint not null)", []Value(0))?
+  setup.close()
+
+  let db = open(uri)?
+  let posts = db.table<Post>()
+
+  let p1 = posts.insert(newPost("one"))?
+  if (p1.createdAt <= i64(0) || p1.updatedAt <= i64(0)) {
+    panic("LIVE PROOF FAILED: @timestamps did not fill createdAt/updatedAt on insert")
+  }
+
+  let beforeUpdatedAt = p1.updatedAt
+  p1.title = "one edited"
+  posts.update(p1)?
+  let afterUpdate = posts.find(p1.id)?
+  if (afterUpdate.updatedAt < beforeUpdatedAt) {
+    panic("LIVE PROOF FAILED: @timestamps did not bump updatedAt on update")
+  }
+  if (afterUpdate.createdAt != p1.createdAt) {
+    panic("LIVE PROOF FAILED: update rewrote createdAt")
+  }
+
+  posts.delete(p1.id)?
+  let hidden = posts.where("id", p1.id).all()?
+  if (len(hidden) != 0) {
+    panic("LIVE PROOF FAILED: delete on a @softDelete class did not hide the row")
+  }
+  let withTrashed = posts.withDeleted().where("id", p1.id).all()?
+  if (len(withTrashed) != 1) {
+    panic("LIVE PROOF FAILED: withDeleted did not include the soft-deleted row")
+  }
+
+  posts.restore(p1.id)?
+  let restored = posts.where("id", p1.id).all()?
+  if (len(restored) != 1) {
+    panic("LIVE PROOF FAILED: restore did not un-hide the row")
+  }
+
+  posts.forceDelete(p1.id)?
+  let afterForce = posts.withDeleted().where("id", p1.id).all()?
+  if (len(afterForce) != 0) {
+    panic("LIVE PROOF FAILED: forceDelete left a row behind")
+  }
+
+  let inserted = posts.insertAll([newPost("bulk1"), newPost("bulk2")])?
+  if (len(inserted) != 2 || inserted[0].id <= i64(0) || inserted[1].id <= i64(0)) {
+    panic("LIVE PROOF FAILED: insertAll did not return rows with generated ids")
+  }
+  if (inserted[0].createdAt <= i64(0) || inserted[1].createdAt <= i64(0)) {
+    panic("LIVE PROOF FAILED: insertAll did not fill @timestamps")
+  }
+
+  let updatedCount = posts.where("title", "bulk1").set("title", "Draft").updateAll()?
+  if (updatedCount != 1) {
+    panic("LIVE PROOF FAILED: updateAll returned the wrong count")
+  }
+  let afterBulkUpdate = posts.find(inserted[0].id)?
+  if (afterBulkUpdate.title != "Draft") {
+    panic("LIVE PROOF FAILED: updateAll did not write the set() column")
+  }
+
+  let deletedCount = posts.where("title", "bulk2").deleteAll()?
+  if (deletedCount != 1) {
+    panic("LIVE PROOF FAILED: deleteAll returned the wrong count")
+  }
+  let afterBulkDelete = posts.where("id", inserted[1].id).all()?
+  if (len(afterBulkDelete) != 0) {
+    panic("LIVE PROOF FAILED: deleteAll (soft) did not hide the row")
+  }
+  let afterBulkDeleteTrashed = posts.withDeleted().where("id", inserted[1].id).all()?
+  if (len(afterBulkDeleteTrashed) != 1) {
+    panic("LIVE PROOF FAILED: deleteAll on a @softDelete class hard-deleted instead of hiding")
+  }
+
+  print("LIVE_PROOF_OK")
+}
+`
+
+test "live: Repo<T> soft delete (delete/withDeleted/restore/forceDelete) and bulk writes (insertAll/updateAll/deleteAll), @timestamps filled (#6274)" {
+  let uri = env("ORM_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_PG_URI is unset, no live server to talk to")
+    return
+  }
+  let repoRoot = findRepoRoot()
+  if (repoRoot == "") {
+    print("  skipped: cannot locate the repo root; set BIT_REPO")
+    return
+  }
+  let ormAbs = "${repoRoot}/pkg/orm"
+  let postgresAbs = "${repoRoot}/pkg/postgres"
+  let mysqlAbs = "${repoRoot}/pkg/mysql"
+  let proj = scratchDir("liveproof6274")
+  mkdir(proj) catch e {
+    panic("mkdir: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.json",
+    "{\"name\": \"liveproof6274\", \"dependencies\": {\"orm\": \"${ormAbs}\", \"postgres\": \"${postgresAbs}\", \"mysql\": \"${mysqlAbs}\"}}\n",
+  ) catch e {
+    panic("writeFile bit.json: ${e.message()}")
+  }
+  writeFile(
+    "${proj}/bit.lock",
+    "{\"orm\": {\"path\": \"${ormAbs}\", \"requires\": {}}, \"postgres\": {\"path\": \"${postgresAbs}\", \"requires\": {}}, \"mysql\": {\"path\": \"${mysqlAbs}\", \"requires\": {}}}\n",
+  ) catch e {
+    panic("writeFile bit.lock: ${e.message()}")
+  }
+  writeFile("${proj}/main.bit", liveSoftDeleteBulkProofSource) catch e {
+    panic("writeFile main.bit: ${e.message()}")
+  }
+
+  let bin = envOr("BIT_BIN", "${repoRoot}/bit-out/bin/bit")
+  let rc = run(bin, ["run", "${proj}/main.bit", uri])
+  assert(
+    rc == 0,
+    "live proof against a real Postgres server failed, rc=${rc}; run manually to see its output: ${bin} run ${proj}/main.bit '${uri}'",
+  )
+  resetDir(proj)
+}
