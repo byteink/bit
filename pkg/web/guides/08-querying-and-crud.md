@@ -44,6 +44,7 @@ it.
 
 ```bit
 import { App, Ctx, Res, badRequest, notFound } from "web"
+import { Dir } from "orm"
 import { parseInt } from "std/strings"
 
 fn findArticleById(db: Db, id: i64): Article! {
@@ -73,7 +74,7 @@ fn toArticleView(a: Article): ArticleView {
 }
 
 fn listArticles(c: Ctx, db: Db): Res! {
-  let rows = db.table<Article>().orderByDesc("createdAt").all()?
+  let rows = db.table<Article>().orderBy("createdAt", Dir.Desc).all()?
   let out = []ArticleView(0)
   for a of rows {
     out = append(out, toArticleView(a))

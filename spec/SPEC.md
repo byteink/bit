@@ -585,17 +585,17 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
 - A variadic parameter (`...name: T`) must be last; inside the body it has type
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
-- A parameter may carry a default value, either with the type written,
-  `x: int = 1`, or read off the default, `x = 1`: a call may
-  omit it and every parameter after it that also has one, and the default is
-  used instead. `const_expr` is a bare literal (int, float, string, bool, or
-  `nil`; not a compound expression, a call, or an allocation) - defaults
-  evaluated at the call site (Swift's `#file`/`#line` shape) were considered
-  and rejected. A defaulted parameter may not precede one with no
-  default (**E0158**): a call supplying only its own positional prefix could
-  never reach a later required parameter otherwise. A default whose value is
-  not a literal is **E0159**. When the type is written, the default need only
-  be assignable to it (so `x: T = nil` is legal for any nil-accepting `T`).
+- A parameter may carry a default value, either with the type written, `x: int = 1`,
+  or read off the default, `x = 1`: a call may omit it and every parameter after it
+  that also has one, and the default is used instead. `const_expr` is a bare literal
+  (int, float, string, bool, or `nil`) or a payload-free enum variant
+  (`Enum.Variant`); not a compound expression, a call, or an allocation - defaults
+  evaluated at the call site (Swift's `#file`/`#line` shape) were considered and
+  rejected. A defaulted parameter may not precede one with no default (**E0158**): a
+  call supplying only its own positional prefix could never reach a later required
+  parameter otherwise. A default whose value is not a literal is **E0159**. When the
+  type is written, the default need only be assignable to it (so `x: T = nil` is legal
+  for any nil-accepting `T`).
   When the type is inferred, the parameter takes the default's own **default
   type** (§15.4: int → `i64`, float → `f64`, string → `string`, bool →
   `bool`) - `nil` has none, so `x = nil` is **E0159** in this spelling only.
