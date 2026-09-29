@@ -48,7 +48,6 @@ queue over a store, `register` tells it what to do with a job type, and
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
 import { newPostgresStore, migrate, open, Options, Queue } from "jobs"
-import { Json, JsonEntry } from "std/json"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,
