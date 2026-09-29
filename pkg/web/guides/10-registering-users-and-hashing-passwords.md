@@ -51,23 +51,25 @@ passwords and their hashes once and reusing it against every account.
 
 ## The users table
 
-A `User` is a `pkg/orm` table like the ones from
-[Tables and migrations with pkg/orm](07-tables-and-migrations-with-pkg-orm.md),
-with one column that never leaves the server: `passwordHash`.
+A `User` is a `pkg/orm` table like `Article` from
+[Querying and CRUD](08-querying-and-crud.md). `id` is the key because it is
+a field literally named `id`; `@table("users")` overrides the snake_case
+default (`user`) because chapter 7's migration already created the table
+under that name. `passwordHash` is the one column that never leaves the
+server.
 
 ```bit
-import { AttrDesc, FieldDesc } from "std/sql"
+import { Db } from "orm"
 
-@table @timestamps class User {
-  @id
-  id: i64
-  username: string
-  email: string
-  passwordHash: string
+@table("users") @timestamps class User {
+  id: i64,
+  username: string,
+  email: string,
+  passwordHash: string,
   // "author" or "admin" - see chapter 25, Authorization.
-  role: string
-  createdAt: i64
-  updatedAt: i64
+  role: string,
+  createdAt: i64,
+  updatedAt: i64,
 }
 ```
 
@@ -111,44 +113,19 @@ A request whose `username` or `password` is too short gets a `422
 Unprocessable Entity` naming the field, before a single byte reaches the
 database.
 
-## Inserting a row and reading its generated id
-
-Every `POST` route in Inkwell that creates a row goes through one small
-helper, `insertGeneratedId` (`db.bit`): it builds the `INSERT ... RETURNING
-id` itself and hands back the id Postgres generated. This is the first place
-this part of the Book needs it, so it is shown once here; every later part reuses it
-without repeating it.
-
-```bit
-import { Data } from "orm"
-import { Value, sqlReqInt } from "std/sql"
-import { join } from "std/strings"
-
-fn insertGeneratedId(db: Data, targetTable: string, cols: []string, args: []Value): i64! {
-  let marks = []string(0)
-  let i = 0
-  while (i < len(args)) {
-    marks = append(marks, "$${i + 1}")
-    i = i + 1
-  }
-  let sqlText = "insert into ${targetTable} (${join(cols, ", ")}) values (${join(marks, ", ")}) returning id"
-  let rows = db.query(sqlText, args)?
-  defer rows.close()
-  if (!rows.next()?) {
-    fail newError("insertGeneratedId: insert into '${targetTable}' returned no row")
-  }
-  return sqlReqInt(rows, rows.columns(), "id")?
-}
-```
-
 ## The register route
+
+Every `POST` route in Inkwell that creates a row goes through
+`db.table<T>().insert(...)` ([Querying and CRUD](08-querying-and-crud.md)):
+it writes every column but `id` and hands back the row with the database's
+own generated id filled in, so there is no separate "read the generated id
+back" step to write by hand.
 
 ```bit
 import { App, Ctx, Res, conflict } from "web"
 import { UniqueViolation, classify } from "orm"
-import { now } from "std/time"
 
-fn register(c: Ctx, db: Data): Res! {
+fn register(c: Ctx, db: Db): Res! {
   let input = c.body<RegisterInput>()?
   let u = User{
     id = 0, username = input.username, email = input.email,
@@ -158,14 +135,8 @@ fn register(c: Ctx, db: Data): Res! {
   return c.created("${saved.id}").header("Location", "/users/${saved.id}")
 }
 
-fn insertUser(db: Data, u: User): User! {
-  let cols = ["username", "email", "password_hash", "role", "created_at", "updated_at"]
-  let stamp = now().ns
-  let args = [
-    Value.Text(u.username), Value.Text(u.email), Value.Text(u.passwordHash), Value.Text(u.role),
-    Value.Int(stamp), Value.Int(stamp),
-  ]
-  let newId = insertGeneratedId(db, "users", cols, args) catch e {
+fn insertUser(db: Db, u: User): User! {
+  return db.table<User>().insert(u) catch e {
     let cause = classify(e, "users")
     let (_, ok) = cause.(UniqueViolation)
     if (ok) {
@@ -173,12 +144,9 @@ fn insertUser(db: Data, u: User): User! {
     }
     fail cause
   }
-  u.id = newId
-  u.markPersisted(true)
-  return u
 }
 
-export fn mountAuth(app: App, db: Data) {
+export fn mountAuth(app: App, db: Db) {
   app.post("/auth/register", (c) => register(c, db))
 }
 ```
