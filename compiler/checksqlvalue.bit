@@ -183,14 +183,105 @@ fn validateSqlValueInstance(d: Diagnostics, ctx: TypeContext, inst: Instantiatio
   if (sqlValueKindOfType(ctx, arg) != "") {
     return
   }
+  reportSqlValueBadType(d, ctx, inst.site, arg)
+}
+
+// The E0177 diagnostic itself, shared by an explicit `sqlValue(v)` call
+// (`validateSqlValueInstance` above) and a `Value`-typed CALL ARGUMENT
+// outside the closed set (`vSqlValueArgCoerced` below, #6280) — the two
+// spellings a program can trigger this from must read identically, since
+// `db.exec(sql, badValue)` is defined (SPEC, next to `sqlValue<V>`) as
+// exactly `db.exec(sql, sqlValue(badValue))` would have been.
+fn reportSqlValueBadType(d: Diagnostics, ctx: TypeContext, site: Span, arg: int) {
   report(
-    d, ecSqlValueBadType, inst.site,
+    d, ecSqlValueBadType, site,
     "'sqlValue' cannot turn '${typeName(ctx, arg)}' into a 'std/sql' 'Value'",
     "'sqlValue<V>' accepts 'string', 'int'/'i64', 'bool', 'f64', '[]byte', or 'Option<>' of one of those — wrap '${typeName(
       ctx,
       arg,
     )}' yourself with the matching 'Value' variant instead",
   )
+}
+
+// `std/sql`'s own `Value` enum TypeId, or 0 when `std/sql` is not imported
+// anywhere in this build (`sqlValueStdModuleId`'s own guard) — the
+// parameter-type identity `vSqlValueArgCoerced`/`sqlValueCoerceIfNeeded`
+// below compare a declared parameter type against, exactly as
+// `sqlValueSpecName`'s lookup key is shared between the checker and the
+// lowerer. Read off `std/sql`'s own `userTypes`, the same table
+// `userTypeLookup` reads for a name declared IN the current module — `Value`
+// is declared in `std/sql` itself, so this is that same table on the
+// resolved importer's checker instead of `c`'s own.
+fn sqlValueTypeId(mods: []Checker): int {
+  let sm = sqlValueStdModuleId(mods)
+  if (sm < 0) {
+    return 0
+  }
+  let (v, ok) = mods[sm].userTypes["Value"]
+  if (!ok) {
+    return 0
+  }
+  return v
+}
+
+// A bare, payload-less `Option.None` (or `Option<T>.None`) reference — the
+// one `sqlValue` argument shape `checkExprType` cannot classify by TYPE at
+// all: with no `Some(x)` payload to infer from and no explicit `<T>`, `T`
+// is unresolved (SPEC §15.3 has nothing to infer it from), which is exactly
+// what makes `f(1, "x", true, Option.None)` — this ticket's own acceptance
+// — otherwise unreachable at a non-generic `Value` parameter (unlike
+// `sqlValue<Option<string>>(Option.None)`, there is no explicit-type-argument
+// spelling available at a plain call argument). None NEEDS no such
+// resolution: every `Option<T>.None` is `Value.Null` regardless of `T`, so
+// this is judged on the NODE's syntax (mirrors `vVariantConstructionName`'s
+// own syntactic recognition of `Enum.Variant`, one step short of it: a
+// payload-less variant reference is a bare `Tag.Member`, never a `Tag.Call`).
+fn sqlValueIsOptionNone(c: Checker, a: int): bool {
+  if (getNode(c.tree, a).tag != Tag.Member) {
+    return false
+  }
+  let mk = kidsOf(c.tree, a)
+  let recvTy = enumReceiverType(c, mk[0])
+  if (recvTy == 0 || !c.ctx.types[recvTy].hasName || c.ctx.types[recvTy].name != "Option") {
+    return false
+  }
+  let mn = getNode(c.tree, mk[1])
+  return c.source[mn.span.start:mn.span.end] == "None"
+}
+
+// #6280: a parameter declared exactly `std/sql` `Value` — plain, or the
+// element type of a variadic `...values: Value` (both already resolve to
+// this same per-argument judgement, since `vCallArgWant`/`vFuncSigArgWant`
+// read a rest parameter's declared type as its bare element type, never
+// widened to `[]Value`, before this runs) — accepts any argument `sqlValue`
+// accepts, AS THOUGH the caller had written `sqlValue(arg)`: string,
+// int/i64, bool, f64, []byte, or `Option<>` of one of those. True when this
+// judged the call (accepted the coercion, or reported E0177 for it) and the
+// caller must not ALSO run the ordinary `vExpectExpr` on `a`; false leaves
+// `pty`'s normal judgement as the whole answer, which covers both "not a
+// `Value` parameter" and "the argument is already a `Value`" (`sqlValue`'s
+// own `Value` passes through unchanged, SPEC).
+fn vSqlValueArgCoerced(c: Checker, a: int, pty: int): bool {
+  let vt = sqlValueTypeId(c.mods)
+  if (vt == 0 || pty != vt) {
+    return false
+  }
+  if (sqlValueIsOptionNone(c, a)) {
+    return true
+  }
+  let argTy = checkExprType(c, a)
+  if (argTy == 0 || vMentionsInvalid(c, argTy, 0) || vHasTypeParam(c, argTy, 0)) {
+    return false
+  }
+  let dty = defaultType(c, argTy)
+  if (dty == vt) {
+    return false
+  }
+  if (sqlValueKindOfType(c.ctx, dty) != "") {
+    return true
+  }
+  reportSqlValueBadType(c.diags, c.ctx, vSpan(c, a), dty)
+  return true
 }
 
 // Points every `sqlValue<V>` ledger entry at the hand-written specialisation
@@ -246,4 +337,80 @@ fn retargetOneSqlValueInstance(mods: []Checker, sm: int, inst: Instantiation, lo
   }
   inst.declModule = sm
   inst.decl = decl
+}
+
+// #6280's lowering half of `vSqlValueArgCoerced` — the ONE place a call
+// argument at a `Value`-hinted parameter is lowered, replacing a bare
+// `lowerExprH(fc, a, hint)` at both call sites (`lowerArgsRest`'s fixed
+// argument loop, `fillSliceLitElems`'s variadic-tail element loop). A no-op
+// (`lowerExprH(fc, a, hint)` unchanged) the instant `hint` is not `std/sql`'s
+// `Value` — recomputed here from the checked types exactly as
+// `retargetSqlValueInstances` recomputes its own answer from the
+// instantiation ledger independently of `validateSqlValueGenerics`'s
+// check-time pass, rather than threading a mark through from the checker.
+//
+// `Option.None` is judged BEFORE `a` is ever lowered at all, never after:
+// `sqlValueIsOptionNone` needs no resolved type (see its own header) but
+// ordinary lowering does — `lowerExprH` on a bare `Option.None` resolves its
+// enum type from `nodeType`/`hint` (`variantConstructionObjTy`,
+// lowerlayout.bit), and `hint` here is `Value`, a different nominal base, so
+// that resolution would fall through to the unsubstituted TEMPLATE `Option`
+// and build garbage. `Value.Null` is built directly instead — the same
+// `buildEnumObj` a source-level `Value.Null` literal lowers through
+// (`lowerVariantConstruction`), never `__sql_value_opt_*`: which of those
+// five to call cannot be decided without `T`, and `None` never needs one to
+// answer `Value.Null`.
+fn sqlValueLowerArg(fc: FnCtx, a: int, hint: int): int {
+  let vt = sqlValueTypeId(fc.c.mods)
+  if (vt == 0 || hint != vt) {
+    return lowerExprH(fc, a, hint)
+  }
+  if (sqlValueIsOptionNone(fc.c, a)) {
+    return buildEnumObj(fc, vt, variantOrdinal(fc.c, vt, "Null"), -1)
+  }
+  let v = lowerExprH(fc, a, hint)
+  if (fc.failed) {
+    return v
+  }
+  let argTy = defaultType(fc.c, nodeType(fc, a))
+  if (argTy == vt) {
+    return v
+  }
+  let kind = sqlValueKindOfType(fc.c.ctx, argTy)
+  if (kind == "") {
+    return v
+  }
+  return sqlValueWrapCall(fc, kind, v)
+}
+
+// Emits `__sql_value_<kind>(v)` — a plain, direct call to the hand-written
+// specialisation `retargetOneSqlValueInstance` above already resolves for an
+// explicit `sqlValue(x)` — as the ordinary resolved-callee tail
+// (`emitResolvedCall`, lowerprim.bit) any other statically known callee
+// takes. `v` is left unchanged if `std/sql` was somehow not importable or
+// the specialisation is missing (both already impossible by the time this
+// runs: `sqlValueLowerArg` only calls this once `kind` classified, and
+// `vSqlValueArgCoerced` already proved the call reachable at `bit check`
+// time) — the same defensive no-op every lookup in this file takes rather
+// than trust an invariant it cannot re-verify here.
+fn sqlValueWrapCall(fc: FnCtx, kind: string, v: int): int {
+  let sm = sqlValueStdModuleId(fc.c.mods)
+  if (sm < 0) {
+    return v
+  }
+  let owner = fc.c.mods[sm]
+  let name = sqlValueSpecName(kind)
+  let (decl, ok) = owner.funcDecls[name]
+  if (!ok) {
+    return v
+  }
+  let fr = FuncRef{ owner = owner, decl = decl, declName = name }
+  let t = CallTarget{
+    ok = true,
+    symbol = callQualifiedRef(fc.lowerer.root, fr),
+    paramTypes = lowerParamTypes(owner, decl),
+    result = funcResultLookup(owner, name),
+    owner = owner, decl = decl,
+  }
+  return emitResolvedCall(fc, t, [v])
 }

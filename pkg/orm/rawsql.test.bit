@@ -28,16 +28,15 @@
 // configured, the same convention `pkg/orm/repo.test.bit`/
 // `pkg/orm/write.test.bit`/`pkg/orm/bulk.test.bit` already use.
 //
-// A CALL MIXING TWO VALUE TYPES IN ONE `...values` SPREAD DOES NOT COMPILE
-// — `exec<V>`/`query<T, V>` (`pkg/orm/db.bit`) bind ONE `V` per call (SPEC
-// §10.3: "a variadic parameter... must be last; inside the body it has
-// type `[]T`" — one `T`, not one per argument), the same way
-// `pkg/orm/repo.bit`'s own `where<V>` takes one `V` per call. Every test
-// below binds either a single value or several of the SAME Bit type
-// (`id in (?, ?)`, both `i64`) — never `db.exec(sql, 1, "x")` in one call.
-// Reported on #6273 rather than worked around: a caller needing several
-// DIFFERENTLY-typed bound values in one statement has no host-language
-// syntax to spread them into a single `...values: V` slot today.
+// A CALL MIXING VALUE TYPES IN ONE `...values` SPREAD COMPILES (#6280, was
+// #6273's own reported gap): `exec`/`query<T>` (`pkg/orm/db.bit`) declare
+// `...values: Value` directly, no generic `V` of this package's own to bind
+// to one Bit type per call — the language's own `Value` coercion converts
+// each argument at the call site (SPEC, next to `sqlValue<V>`), so
+// `db.exec("update note set title = ? where id = ?", "x", i64(5))` binds a
+// `string` and an `i64` in the same call. A CALL WITH ZERO VALUES ALSO
+// COMPILES AND RUNS (#6280, was #6279) — the live proof below now issues
+// its own setup DDL through `db.exec(sql)` directly, no raw driver pool.
 
 @table class RawNote {
   id: i64,
@@ -183,6 +182,36 @@ test "Db.exec fails, naming the count, rather than panicking, when ? count disag
   assert(false, "a placeholder/value count mismatch must fail")
 }
 
+test "Db.exec binds a mix of value types in one call (#6280)" {
+  let a = newRawAdapter()
+  a.affected = 1
+  let db = Db{ pool = newRawPool(a) }
+
+  db.exec("update note set title = ? where id = ?", "x", i64(5)) catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let call = lastExec(a)
+  assert(call.sql == "update note set title = $1 where id = $2", "got: ${call.sql}")
+  assert(argsEq(call.args, [Value.Text("x"), Value.Int(5)]), "bound args did not match")
+}
+
+test "Db.exec with zero values compiles and runs (#6280, was #6279)" {
+  let a = newRawAdapter()
+  a.affected = 0
+  let db = Db{ pool = newRawPool(a) }
+
+  db.exec("drop table if exists t") catch e {
+    assert(false, "must not error: ${e.message()}")
+    return
+  }
+
+  let call = lastExec(a)
+  assert(call.sql == "drop table if exists t", "got: ${call.sql}")
+  assert(len(call.args) == 0, "got ${len(call.args)} bound arg(s)")
+}
+
 test "Db.query<T> rewrites ?, binds the value, and decodes the row with T's own __fromRow" {
   let a = newRawAdapter()
   a.cols = ["id", "body"]
@@ -233,15 +262,16 @@ test "TxHandle.exec/TxHandle.query<T> use the same rewrite and bind rules as Db,
 // directly, rule 1) proves both engines; `driverPkg`/`createNote` are the
 // two things that differ between them.
 //
-// SETUP/TEARDOWN DDL OPENS ITS OWN RAW POOL, the same way
-// `pkg/orm/repo.test.bit`'s own live proof does, and for the same reason
-// stated in `pkg/orm/rawsql.bit`'s header: `exec`/`query`'s `...values: V`
-// cannot be called with ZERO values (a real, filed compiler gap, not this
-// package's choice) — DDL with no placeholders cannot go through
-// `db.exec` today, so it goes through the raw driver pool instead, exactly
-// as `pkg/orm/repo.test.bit`'s setup already does for its own DDL.
+// SETUP/TEARDOWN DDL GOES THROUGH `db.exec(sql)` DIRECTLY, ZERO VALUES
+// (#6280, was #6279: `pkg/orm/repo.test.bit`'s own live proof still opens
+// its own raw pool for its DDL, filed before this fix landed) — no more raw
+// driver pool, no more `[]Value(0)`, proving this ticket's own acceptance
+// (`db.exec("drop table if exists t")` compiles and runs) against a real
+// server, not just the canned driver above. The update below also binds a
+// `string` and an `i64` in the SAME call — this ticket's other acceptance
+// (`db.exec("... ? ... ?", "x", 5)`) — against the same real server.
 fn rawSqlProofSource(driverPkg: string, createNote: string): string {
-  return "import { args } from \"std/os\"\nimport { pool, Datasource, Value } from \"std/sql\"\nimport { adapter } from \"${driverPkg}\"\nimport { open } from \"orm\"\n\n@table class Note {\n  id: i64,\n  body: string,\n}\n\nfn main(): ()! {\n  let uri = args()[1]\n  let setup = pool(adapter(), Datasource{ uri = uri })?\n  setup.exec(\"drop table if exists note\", []Value(0))?\n  setup.exec(\"${createNote}\", []Value(0))?\n  setup.close()\n\n  let db = open(uri)?\n  let quoted = \"it's a raw sql test\"\n  db.exec(\"insert into note (body) values (?)\", quoted)?\n  let rows = db.query<Note>(\"select * from note where body = ?\", quoted)?\n  if (len(rows) != 1 || rows[0].body != quoted) {\n    panic(\"LIVE PROOF FAILED: exec/query did not round-trip a quoted value\")\n  }\n\n  db.tx((tx) => {\n    tx.exec(\"update note set body = ? where body = ?\", \"updated\", quoted)?\n    let inTx = tx.query<Note>(\"select * from note where body = ?\", \"updated\")?\n    if (len(inTx) != 1) {\n      panic(\"LIVE PROOF FAILED: tx.exec/tx.query did not see the update inside its own transaction\")\n    }\n  })?\n\n  let after = db.query<Note>(\"select * from note where body = ?\", \"updated\")?\n  if (len(after) != 1) {\n    panic(\"LIVE PROOF FAILED: db.tx did not commit\")\n  }\n\n  let mismatched = false\n  db.exec(\"delete from note where id = ?\", i64(1), i64(2)) catch err {\n    mismatched = true\n  }\n  if (!mismatched) {\n    panic(\"LIVE PROOF FAILED: a placeholder count mismatch must fail, not panic or silently run\")\n  }\n\n  print(\"LIVE_PROOF_OK\")\n}\n"
+  return "import { args } from \"std/os\"\nimport { open } from \"orm\"\n\n@table class Note {\n  id: i64,\n  body: string,\n}\n\nfn main(): ()! {\n  let uri = args()[1]\n  let db = open(uri)?\n  db.exec(\"drop table if exists note\")?\n  db.exec(\"${createNote}\")?\n\n  let quoted = \"it's a raw sql test\"\n  db.exec(\"insert into note (body) values (?)\", quoted)?\n  let rows = db.query<Note>(\"select * from note where body = ?\", quoted)?\n  if (len(rows) != 1 || rows[0].body != quoted) {\n    panic(\"LIVE PROOF FAILED: exec/query did not round-trip a quoted value\")\n  }\n\n  db.exec(\"update note set body = ? where id = ?\", \"mixed\", rows[0].id)?\n  let mixedRows = db.query<Note>(\"select * from note where body = ?\", \"mixed\")?\n  if (len(mixedRows) != 1) {\n    panic(\"LIVE PROOF FAILED: exec/query did not round-trip a mixed string+i64 call\")\n  }\n\n  db.tx((tx) => {\n    tx.exec(\"update note set body = ? where body = ?\", \"updated\", \"mixed\")?\n    let inTx = tx.query<Note>(\"select * from note where body = ?\", \"updated\")?\n    if (len(inTx) != 1) {\n      panic(\"LIVE PROOF FAILED: tx.exec/tx.query did not see the update inside its own transaction\")\n    }\n  })?\n\n  let after = db.query<Note>(\"select * from note where body = ?\", \"updated\")?\n  if (len(after) != 1) {\n    panic(\"LIVE PROOF FAILED: db.tx did not commit\")\n  }\n\n  let mismatched = false\n  db.exec(\"delete from note where id = ?\", i64(1), i64(2)) catch err {\n    mismatched = true\n  }\n  if (!mismatched) {\n    panic(\"LIVE PROOF FAILED: a placeholder count mismatch must fail, not panic or silently run\")\n  }\n\n  db.exec(\"drop table if exists t\")?\n\n  print(\"LIVE_PROOF_OK\")\n}\n"
 }
 
 fn runRawSqlLiveProof(envVar: string, name: string, driverPkg: string, createNote: string) {
