@@ -211,7 +211,11 @@
 # _tests_/cases/run_sql_row_persisted.bit). 6254: the 0.33.0 oracle predates
 # the `@collection` class attribute and reports E0136 on any file using it
 # (_tests_/cases/run_collection_name_static_dispatch.bit and its fuzz
-# truncations). Both retire at the 0.34.0 repin; `diags` has no automated
+# truncations). #6264-from-contextual-token/-diags/-types: `from` became a
+# contextual keyword, so the tree lexes it as an ident where the oracle lexes
+# kw_from (every file with an import, tokens), names the token differently in
+# a diagnostic, and accepts `from` as a name the oracle rejects
+# (_tests_/cases/run_from_identifier.bit). All retire at the 0.34.0 repin; `diags` has no automated
 # RETIRED audit (like ast/fmt), so 6254 is confirmed dead by hand there.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags>
@@ -331,6 +335,67 @@ explainMismatch() {
       while (j <= nB && linesB[j] == "") { j++ }
       return (j > nB && skipped) ? 1 : 0
     }
+    # fromContextualToken (#6264) -- `from` is contextual now, so the tree
+    # lexes it as an ident where the 0.33.0 oracle lexed kw_from, at the SAME
+    # span. Every line equal except such pairs; same line count.
+    function fromContextualToken(nA, linesA, nB, linesB,    i, a, b, hit) {
+      if (nA != nB) { return 0 }
+      hit = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        a = linesA[i]; b = linesB[i]
+        if (a !~ /^kw_from / || b !~ /^ident /) { return 0 }
+        sub(/^kw_from /, "", a); sub(/^ident /, "", b)
+        if (a != b) { return 0 }
+        hit = 1
+      }
+      return hit
+    }
+    # fromDiagEqual (#6264) -- the same diagnostic, naming the token the way
+    # each compiler lexes it: "found kw_from" (oracle) / "found an
+    # identifier" (tree).
+    function fromDiagEqual(a, b,    t) {
+      t = a
+      if (sub(/found kw_from/, "found an identifier", t) == 0) { return 0 }
+      return (t == b) ? 1 : 0
+    }
+    # fromContextualDiags (#6264) -- tree lines appear in the oracle in
+    # order (equal, or a fromDiagEqual pair); the only oracle-only lines
+    # allowed are whole E0021 blocks the oracle raises because it still
+    # reserves `from` (a header naming from as a reserved keyword or a
+    # found kw_from token, plus its indented context lines).
+    function fromContextualDiags(nA, linesA, nB, linesB,    i, j, hit) {
+      i = 1; j = 1; hit = 0
+      while (i <= nA) {
+        if (j <= nB && linesA[i] == linesB[j]) { i++; j++; continue }
+        if (j <= nB && fromDiagEqual(linesA[i], linesB[j])) { i++; j++; hit = 1; continue }
+        if (linesA[i] ~ /^error\[E0021\]: .from. is a reserved keyword/ || linesA[i] ~ /^error\[E0021\]: .*found kw_from/) {
+          hit = 1; i++
+          while (i <= nA && (linesA[i] == "" || (linesA[i] ~ /^[ 0-9]/ && linesA[i] !~ /^[0-9]+:[0-9]+: /))) { i++ }
+          continue
+        }
+        return 0
+      }
+      while (j <= nB && linesB[j] == "") { j++ }
+      return (j > nB && hit) ? 1 : 0
+    }
+    # fromContextualTypes (#6264) -- where the oracle could not parse a
+    # `from` binding it records a nameless entry (`1:1: : T`); the tree
+    # records the binding (`L:C: from: T`) with the same type T. Same line
+    # count; every other line equal.
+    function fromContextualTypes(nA, linesA, nB, linesB,    i, a, b, hit) {
+      if (nA != nB) { return 0 }
+      hit = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        a = linesA[i]; b = linesB[i]
+        if (a !~ /^[0-9]+:[0-9]+: : / || b !~ /^[0-9]+:[0-9]+: from: /) { return 0 }
+        sub(/^[0-9]+:[0-9]+: : /, "", a); sub(/^[0-9]+:[0-9]+: from: /, "", b)
+        if (a != b) { return 0 }
+        hit = 1
+      }
+      return hit
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -351,11 +416,23 @@ explainMismatch() {
         if (tableRowSynthInsert(nA, linesA, nB, linesB)) {
           print "6255-table-row-synth-reposition"; exit 0
         }
+        if (fromContextualTypes(nA, linesA, nB, linesB)) {
+          print "6264-from-contextual-types"; exit 0
+        }
+        exit 1
+      }
+      if (kind == "tokens") {
+        if (fromContextualToken(nA, linesA, nB, linesB)) {
+          print "6264-from-contextual-token"; exit 0
+        }
         exit 1
       }
       if (kind == "diags") {
         if (collectionAttrPresyntax(nA, linesA, nB, linesB)) {
           print "6254-collection-attr-presyntax"; exit 0
+        }
+        if (fromContextualDiags(nA, linesA, nB, linesB)) {
+          print "6264-from-contextual-diags"; exit 0
         }
         exit 1
       }
@@ -387,8 +464,9 @@ declaredSignatureNames() {
     fmt) return ;;
     ir) return ;;
     iropt) return ;;
-    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition"; return ;;
-    diags) printf '%s\n' "6254-collection-attr-presyntax"; return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types"; return ;;
+    diags) printf '%s\n' "6254-collection-attr-presyntax" "6264-from-contextual-diags"; return ;;
+    tokens) printf '%s\n' "6264-from-contextual-token"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6254-collection-attr-presyntax"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token"
 }
