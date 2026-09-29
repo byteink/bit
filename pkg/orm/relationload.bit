@@ -1,0 +1,240 @@
+// pkg/orm/relationload.bit — generic, reflection-free relation loading for
+// the compiler-synthesized `__loadRelation`/`__linkRelation` (#6277,
+// compiler/classtablerelation.bit, epic #6261, `.claude/kb/data-packages-dx.md`
+// "Approved 2026-09-29"). Bit has no reflection — no way to read or write a
+// NAMED field of a generic type parameter `T` (`pkg/orm/relation.bit`'s own
+// header states the identical limitation) — but every function below is
+// generic over `T: Tabled` and touches only what `Tabled` already gives
+// generically: `T.__tableName()`/`T.__fromRow()`/`T.__columns()`/
+// `r.__values()`. Reading a "named" column through `__columns()`/
+// `__values()`'s own parallel pairing is not reflection, it is the exact
+// mechanism `Tabled` exists to provide — the same one `pkg/orm/repo.bit`'s
+// own `columnsForValues`/`insert`/`update` already read/write a named
+// column through. The compiler only ever supplies what genuinely differs
+// PER CONCRETE relation field (which of the class's OWN fields to read a
+// key from, which to assign a result to) — both direct field accesses on
+// the concrete class the method is synthesized on, never through a type
+// parameter.
+//
+// ONE QUERY PER RELATION, CHUNKED. `loadRelationTargets` mirrors
+// `pkg/orm/relation.bit`'s own `fetchByForeignKey` chunking
+// (`relationLoadChunk` = the same 1000-row bound `maxRelationChunk` uses)
+// rather than importing it: `relation.bit`'s version is typed over the
+// retired `Query<T>` chain (`childQuery: (Data) => Query<TChild>`), which
+// `Repo<T>`/`Tabled` do not have.
+//
+// `Data`/`Value`/`FieldDesc`, `columnName` (naming.bit), `hasIdAttr`
+// (write.bit), `concat` (already imported by `relation.bit`, this
+// package's own sibling) are all in scope without a local import — one
+// here would be E0042 (SPEC §17.1).
+
+const relationLoadChunk: int = 1000
+
+// One query per `relationLoadChunk`-sized chunk of `ids`, against `TChild`'s
+// own table, filtered by `TChild`'s Bit field named `keyField` (resolved to
+// its SQL column through `columnName`, never assumed to equal the Bit
+// name), decoded through `TChild.__fromRow`.
+export fn loadRelationTargets<TChild: Tabled>(db: Data, keyField: string, ids: []i64): []TChild! {
+  let column = relationColumnName<TChild>(keyField)?
+  let out = []TChild(0)
+  let i = 0
+  while (i < len(ids)) {
+    let end = i + relationLoadChunk
+    if (end > len(ids)) {
+      end = len(ids)
+    }
+    let got = loadRelationChunk<TChild>(db, column, ids[i:end])?
+    out = concat(out, got)
+    i = end
+  }
+  return out
+}
+
+fn loadRelationChunk<TChild: Tabled>(db: Data, column: string, ids: []i64): []TChild! {
+  let marks = []string(0)
+  let args = []Value(0)
+  for id of ids {
+    args = append(args, Value.Int(id))
+    marks = append(marks, "$${len(args)}")
+  }
+  let sqlText = "select * from ${TChild.__tableName()} where ${column} in (${join(marks, ", ")})"
+  let rows = db.query(sqlText, args)?
+  defer rows.close()
+  let out = []TChild(0)
+  while (rows.next()?) {
+    out = append(out, TChild.__fromRow(rows)?)
+  }
+  return out
+}
+
+// `rows` grouped by the i64 value of the Bit field named `keyField`, read
+// generically off `T.__columns()`/`r.__values()`'s own parallel pairing —
+// never a per-field access. A key that never appears reads as the map's
+// zero value (an empty slice), the same "loaded-empty" shape
+// `pkg/orm/manytomany.bit`'s own `groupManyToMany` relies on.
+export fn groupRelationRows<T: Tabled>(rows: []T, keyField: string): map<i64, []T>! {
+  let out = map<i64, []T>(0)
+  for r of rows {
+    let v = relationFieldInt<T>(r, keyField)?
+    let (existing, ok) = out[v]
+    if (ok) {
+      out[v] = append(existing, r)
+    } else {
+      out[v] = [r]
+    }
+  }
+  return out
+}
+
+// The Bit FIELD name of `T`'s single `@id` field — the belongsTo direction's
+// own target key, read generically the same way `pkg/orm/repo.bit`'s
+// `singleKeyColumn` reads it for `find`/`update`/`delete`, but returning
+// the Bit name (for `groupRelationRows`/`loadRelationTargets`, both keyed by
+// Bit name) rather than the SQL column.
+export fn relationIdField<T: Tabled>(): string! {
+  for f of T.__columns() {
+    if (hasIdAttr(f)) {
+      return f.name
+    }
+  }
+  fail newError("orm: '${T.__tableName()}' has no single '@id' field to load a relation by")
+}
+
+// The SQL COLUMN of `T`'s single `@id` field — `ManyToManyDesc`'s own
+// `ownerIdColumn`/`targetIdColumn` need the real column, not the Bit name.
+export fn relationIdColumn<T: Tabled>(): string! {
+  for f of T.__columns() {
+    if (hasIdAttr(f)) {
+      return columnName(f)
+    }
+  }
+  fail newError("orm: '${T.__tableName()}' has no single '@id' field to link a relation by")
+}
+
+fn relationColumnName<T: Tabled>(fieldName: string): string! {
+  for f of T.__columns() {
+    if (f.name == fieldName) {
+      return columnName(f)
+    }
+  }
+  fail newError("orm: '${fieldName}' is not a mapped column of '${T.__tableName()}'")
+}
+
+fn relationFieldInt<T: Tabled>(r: T, fieldName: string): i64! {
+  let cols = T.__columns()
+  let vals = r.__values()
+  let i = 0
+  while (i < len(cols)) {
+    if (cols[i].name == fieldName) {
+      match (vals[i]) {
+        Int(n) => return n
+        _ => fail newError("orm: '${fieldName}' on '${T.__tableName()}' is not an integer column")
+      }
+    }
+    i = i + 1
+  }
+  fail newError("orm: '${fieldName}' is not a mapped column of '${T.__tableName()}'")
+}
+
+// ---- the three RelationLoader constructors --------------------------------
+//
+// Each takes only the tiny per-field closures that genuinely differ between
+// two relation fields (`pkg/orm/relation.bit`'s own retired `hasMany`/
+// `hasOne`/`belongsTo` took the identical three-closure shape, for the
+// identical reason) — `compiler/classtablerelation.bit` builds ONE call to
+// one of these per `@hasMany`/`@hasOne`/`@belongsTo` field, so nothing here
+// or in the synthesized caller ever loops over `T`'s fields generically.
+
+// The `hasMany` side: `TParent`'s relation field is `[]TChild`.
+export fn hasManyRelation<TParent: Tabled, TChild: Tabled>(
+  parentKeyOf: (TParent) => i64,
+  childForeignKey: string,
+  assign: (TParent, []TChild) => (),
+): RelationLoader<TParent> {
+  let loader: RelationLoader<TParent> = (db, parents) => {
+    if (len(parents) == 0) {
+      return
+    }
+    let ids = []i64(0)
+    for p of parents {
+      ids = append(ids, parentKeyOf(p))
+    }
+    let children = loadRelationTargets<TChild>(db, childForeignKey, ids)?
+    let grouped = groupRelationRows<TChild>(children, childForeignKey)?
+    for p of parents {
+      assign(p, grouped[parentKeyOf(p)])
+    }
+  }
+  return loader
+}
+
+// The `hasOne` side: `TParent`'s relation field is a single `TChild`.
+export fn hasOneRelation<TParent: Tabled, TChild: Tabled>(
+  parentKeyOf: (TParent) => i64,
+  childForeignKey: string,
+  assign: (TParent, TChild) => (),
+): RelationLoader<TParent> {
+  let loader: RelationLoader<TParent> = (db, parents) => {
+    if (len(parents) == 0) {
+      return
+    }
+    let ids = []i64(0)
+    for p of parents {
+      ids = append(ids, parentKeyOf(p))
+    }
+    let children = loadRelationTargets<TChild>(db, childForeignKey, ids)?
+    let grouped = groupRelationRows<TChild>(children, childForeignKey)?
+    for p of parents {
+      let vs = grouped[parentKeyOf(p)]
+      if (len(vs) > 0) {
+        assign(p, vs[0])
+      }
+    }
+  }
+  return loader
+}
+
+// The `belongsTo` side: `TChild`'s relation field is the single `TParent` it
+// points at. Queries the TARGET's own `@id` field generically
+// (`relationIdField`) — never assumed to be named "id".
+export fn belongsToRelation<TChild: Tabled, TParent: Tabled>(
+  childForeignKeyOf: (TChild) => i64,
+  assign: (TChild, TParent) => (),
+): RelationLoader<TChild> {
+  let loader: RelationLoader<TChild> = (db, children) => {
+    if (len(children) == 0) {
+      return
+    }
+    let ids = []i64(0)
+    for c of children {
+      ids = append(ids, childForeignKeyOf(c))
+    }
+    let idField = relationIdField<TParent>()?
+    let parents = loadRelationTargets<TParent>(db, idField, ids)?
+    let grouped = groupRelationRows<TParent>(parents, idField)?
+    for c of children {
+      let vs = grouped[childForeignKeyOf(c)]
+      if (len(vs) > 0) {
+        assign(c, vs[0])
+      }
+    }
+  }
+  return loader
+}
+
+// The compiler-synthesized `__loadRelation`'s own tail: looks `name` up in
+// the class's own relation table (one `RelationLoader<T>` per
+// `@hasMany`/`@hasOne`/`@belongsTo` field, built with the three constructors
+// above) and runs it — an unknown name fails naming the class, the same
+// backstop `compiler/checkormquery.bit`'s literal check (#6271's `with`
+// rule) sits in front of at compile time.
+export fn dispatchLoadRelation<T: Tabled>(
+  db: Data, name: string, rows: []T, specs: map<string, RelationLoader<T>>,
+): []T! {
+  let (loader, ok) = specs[name]
+  if (!ok) {
+    fail newError("orm: '${T.__tableName()}' has no relation named '${name}'")
+  }
+  loader(db, rows)?
+  return rows
+}
