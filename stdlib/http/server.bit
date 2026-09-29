@@ -46,6 +46,9 @@ export class Server {
   // `drainStarted(this.drain)` (shutdown.bit): `shutdown()` never calls
   // `close()` directly.
   closed: bool
+  // How long (#6023) a single response write may take before the server
+  // gives up on it — set alongside `idleTimeoutNs`, see `setWriteTimeoutMs`.
+  writeTimeoutNs: int
   // The port the server is bound to.
   export port(): int! {
     return this.listener.port()?
@@ -90,6 +93,23 @@ export class Server {
   // `setMaxBodyBytes`.
   export setIdleTimeoutMs(ms: int) {
     this.idleTimeoutNs = ms * 1000000
+  }
+
+  // How long (#6023) `answerOne` may take writing one response before the
+  // server closes the connection and releases the green thread parked in
+  // that write — a peer that reads a large response slowly, or not at all,
+  // otherwise holds both without bound (`writeBytes`, std/net, has no bound
+  // of its own). Defaults to `defaultIdleTimeoutNs` (60s), same as
+  // `idleTimeoutNs`, and applies to that one write only: it is armed right
+  // before `s.writeBytes(slot.buf)` in `answerOne` and cleared right after,
+  // so it never reaches the following request's read wait (`serveOne`
+  // re-arms that separately) — the same non-overlapping-deadlines shape
+  // `idleTimeoutNs`/the body-read deadline already has (#5912). A handler
+  // whose response legitimately takes longer than the default to deliver
+  // must raise this. Set before serving starts, same caveat as
+  // `setIdleTimeoutMs`.
+  export setWriteTimeoutMs(ms: int) {
+    this.writeTimeoutNs = ms * 1000000
   }
 
   // How many requests (#5419) a single connection served through
@@ -239,6 +259,7 @@ export fn serve(host: string, port: int): Server! {
   return Server{
     listener = l, drain = newDrainState(), maxBody = defaultMaxBodyBytes,
     idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
+    writeTimeoutNs = defaultIdleTimeoutNs,
   }
 }
 
@@ -254,6 +275,7 @@ class connOpts {
   maxBody: int,
   idleTimeoutNs: int,
   maxRequests: int,
+  writeTimeoutNs: int,
 }
 
 // Answers a malformed request with `400 Bad Request` and closes the
@@ -400,6 +422,7 @@ export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
   let opts = connOpts{
     altPort = 0, maxBody = s.maxBody,
     idleTimeoutNs = s.idleTimeoutNs, maxRequests = s.maxRequests,
+    writeTimeoutNs = s.writeTimeoutNs,
   }
   acceptLoop(
     () => s.listener.accept(),
@@ -547,10 +570,17 @@ fn answerOne(
   // fits it, so a keep-alive connection answering many small requests
   // allocates its response buffer once, not once per request.
   slot.buf = serializeResponseInto(slot.buf, res, req.method, mustClose)
+  // #6023: the write gets its own deadline, separate from the idle wait
+  // `serveOne` arms for the NEXT request — never left armed across it (that
+  // would re-add #5419's cost to every already-fast write that never sees
+  // EAGAIN), and never reused as the read deadline (`message.bit`'s clear at
+  // the top of this request's read is unaffected).
+  s.setIdleDeadline(monotonic().ns + opts.writeTimeoutNs)
   s.writeBytes(slot.buf) catch _ {
     s.shut()
     return false
   }
+  s.setIdleDeadline(0)
   // Drop the buffer back down rather than keep pinning an oversized body's
   // backing array on a connection that may now sit idle a while (#5928).
   if (len(slot.buf) > maxReusableResponseBuf) {
@@ -606,6 +636,7 @@ fn serveTlsLoop(l: tlsAcceptor, handler: (Request) => Response): ()! {
   let opts = connOpts{
     altPort = altPort, maxBody = defaultMaxBodyBytes,
     idleTimeoutNs = defaultIdleTimeoutNs, maxRequests = defaultMaxRequestsPerConn,
+    writeTimeoutNs = defaultIdleTimeoutNs,
   }
   // A transient accept failure (most often the fd limit) must drop THAT
   // attempt, never the listener: propagating it would let a passing burst of
