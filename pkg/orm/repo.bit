@@ -152,6 +152,65 @@ export class Repo<T: Tabled> {
     return this
   }
 
+  // ---- locking, paging, versions --------------------------------------------
+  // #6276: `lock()`/`after()`, reusing `pkg/orm/lock.bit`/`pkg/orm/keyset.bit`'s
+  // own logic rather than copying it — see those two files for what each
+  // reuses. `@version` conflict checking is wired directly into `update()`
+  // above, the one place it can be transparent the way the approved shape
+  // (.claude/kb/data-packages-dx.md) needs (`people.update(sara)?`, no
+  // separate call) — see `update()`'s own comment for why that one small
+  // edit to an existing method could not be avoided.
+  //
+  // `lock()` CANNOT BE A COMPILE ERROR ON A NON-TX `Db`. `Db.table<T>()` and
+  // `TxHandle.table<T>()` (`pkg/orm/db.bit`) both hand back the identical
+  // `Repo<T>` — nothing on the type distinguishes "built from a `Pool`" from
+  // "built from a live transaction", so the compiler cannot reject this at
+  // the call site the way #6269 rejects a composite `@id` at `find`/`update`/
+  // `delete`. This stays the runtime refusal `lock.bit`'s own header already
+  // settled for the identical shape on `Query<T>.forUpdate` — an ERROR
+  // VALUE, `LockError{ cause = LockCause.NotInTransaction }`, raised the
+  // first time `LockedRepo<T>.find` actually runs, never a panic (a `Pool`
+  // reaching here is an ordinary caller mistake, not a corrupted
+  // invariant).
+  //
+  // NO `LockOpts`/`ServerDialect` PARAMETERS, UNLIKE `Query<T>.forUpdate`.
+  // `E0159` (`compiler/validatefuncdecl.bit`) allows a parameter default
+  // only for a literal or a payload-free enum variant — `LockOpts{}` is a
+  // composite class literal, categorically not one of those, so it cannot
+  // be defaulted the way `orderBy`'s own `dir: Dir = Dir.Asc` is (#6271's
+  // ruling), and the approved shape's own example
+  // (`tx.table<Post>().lock().find(id)?`) takes no arguments at all. Rather
+  // than force every caller to spell `LockOpts{}` just to reach the
+  // zero-arg shape the target locks in, `lock()` here always means plain
+  // `FOR UPDATE` against Postgres — `lockClause(LockOpts{...})`'s own
+  // dialect-neutral text, reused unchanged, is identical on MySQL for that
+  // case (only `SKIP LOCKED`/`NOWAIT` are version-gated). `SKIP LOCKED`,
+  // `NOWAIT` and a non-Postgres `ServerDialect` stay reachable exactly the
+  // way they already were, through `Query<T>.forUpdate(opts, dialect)`
+  // (`pkg/orm/query.bit`) — this method does not replace that one.
+  export lock(): LockedRepo<T> {
+    return LockedRepo<T>{
+      inner = this,
+      opts = LockOpts{ skipLocked = false, nowait = false },
+      dialect = ServerDialect.Postgres,
+    }
+  }
+
+  // Keyset pagination (#5072's `keyset.bit`, reused unchanged): carries the
+  // previous page's last row on the column the first `orderBy()` call
+  // named, and adds `WHERE <col> > $n` (`<` for a descending order) instead
+  // of an `OFFSET` — see `keyset.bit`'s header for why this always beats a
+  // deep `offset()`. Fails, never panics, on no `orderBy()` yet or a
+  // non-unique sort column (`keysetPredicateForRepo`, `keyset.bit`) — a
+  // legitimate caller mistake, the same as `Query<T>.after()`'s identical
+  // refusal.
+  export after<V>(key: V): Repo<T>! {
+    let (col, op) = keysetPredicateForRepo(T.__tableName(), T.__columns(), this.orderBys)?
+    this.args = append(this.args, sqlValue(key))
+    this.wheres = append(this.wheres, "${col} ${op} $${len(this.args)}")
+    return this
+  }
+
   // Never `sqlFindMany<T>` (std/sql/row.bit) — see `find`'s own comment:
   // #6265 fixed the compiler bug this once worked around, but routing
   // through it is a separate change, not done here.
@@ -182,10 +241,26 @@ export class Repo<T: Tabled> {
   // single-column counterpart of the "every column" convention
   // `pkg/orm/write.bit`'s own `updateSql` follows. Never RETURNING: MySQL
   // has none, and the caller already holds `v`.
+  //
+  // #6276: A `@version` FIELD (`pkg/orm/version.bit`, reused unchanged:
+  // `versionField`/`StaleWriteError`) MAKES THE WHERE CARRY THE OLD VALUE
+  // AND THE SET BUMP IT BY ONE, TRANSPARENTLY — no second method, matching
+  // the approved shape's own `people.update(sara)?`. This is the one place
+  // in this file the "locking, paging, versions" block above (this ticket's
+  // own scope) could not stay a pure addition: `update()` is a single
+  // method a class may declare exactly once (SPEC §14), so a `@version`
+  // caller cannot be told apart from an ordinary one anywhere else. The
+  // edit is the smallest one that closes it: extract the version field
+  // once, special-case its own SET, and add its own WHERE clause and
+  // `StaleWriteError` (never `WriteError`, since the row is still there —
+  // see `version.bit`'s header for why the two must stay distinguishable).
   export update(v: T): ()! {
     this.checkErr()?
     let cols = this.columnsForValues(v)?
     let vals = v.__values()
+    let (vf, hasVersion) = versionField(cols, T.__tableName())?
+    let oldVersion = 0
+    let newVersion = 0
     let sets = []string(0)
     let args = []Value(0)
     let keyCol = ""
@@ -199,6 +274,14 @@ export class Repo<T: Tabled> {
         i = i + 1
         continue
       }
+      if (hasVersion && f.name == vf.name) {
+        oldVersion = versionIntOf(vals[i], f, T.__tableName())
+        newVersion = oldVersion + 1
+        args = append(args, Value.Int(newVersion))
+        sets = append(sets, "${columnName(f)} = $${len(args)}")
+        i = i + 1
+        continue
+      }
       args = append(args, vals[i])
       sets = append(sets, "${columnName(f)} = $${len(args)}")
       i = i + 1
@@ -208,9 +291,25 @@ export class Repo<T: Tabled> {
     }
     args = append(args, keyVal)
     let sqlText = "update ${T.__tableName()} set ${join(sets, ", ")} where ${keyCol} = $${len(args)}"
+    if (hasVersion) {
+      args = append(args, Value.Int(oldVersion))
+      sqlText = sqlText + " and ${columnName(vf)} = $${len(args)}"
+    }
     let n = this.db.exec(sqlText, args)?
     if (n == 0) {
-      fail WriteError{ cause = WriteCause.NoRowsAffected, table = T.__tableName(), keys = [keyVal] }
+      if (hasVersion) {
+        fail StaleWriteError{
+          table = T.__tableName(),
+          keys = [keyVal],
+          oldVersion = oldVersion,
+          newVersion = newVersion,
+        }
+      }
+      fail WriteError{
+        cause = WriteCause.NoRowsAffected,
+        table = T.__tableName(),
+        keys = [keyVal],
+      }
     }
   }
 
