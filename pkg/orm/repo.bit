@@ -106,10 +106,29 @@ export class Repo<T: Tabled> {
   // fail to lower when handed to another generic function; routing this
   // through `sqlFindOneOrFail` is now possible but not done here (filed
   // separately, not a workaround left over from the bug).
+  //
+  // #6282: hides a `@softDelete` row like every other read — the locked
+  // target's own example calls `find`/`where`/`all` off the SAME `Repo<T>`
+  // (`.claude/kb/data-packages-dx.md`: `db.table<T>()` runs once, every
+  // statement after reuses that one variable), so `find` staying unaware of
+  // `withDeleted()` would make `posts.withDeleted().find(id)` silently keep
+  // hiding the row it exists to un-hide. `this.includeDeleted` is read here
+  // exactly the way `whereSql` already reads it for `all`/`first`.
   export find<V>(id: V): T! {
     this.checkErr()?
     let col = this.singleKeyColumn()?
-    let sqlText = "select * from ${T.__tableName()} where ${col} = $1 limit 2"
+    let softCol = this.trashColumn()
+    this.checkErr()?
+    let sqlText = "select * from ${T.__tableName()} where ${col} = $1"
+    if (softCol != "" && !this.includeDeleted) {
+      sqlText = sqlText + " and ${softCol} is null"
+    }
+    sqlText = sqlText + " limit 2"
+    // #6283: `find` is a terminal — it must leave `this` fresh for the
+    // NEXT statement off the same `Repo<T>`, the same reset every other
+    // terminal below now performs, so a prior `withDeleted()` never leaks
+    // into an unrelated later call.
+    this.resetChain()
     let rows = this.db.query(sqlText, [sqlValue(id)])?
     defer rows.close()
     if (!rows.next()?) {
@@ -233,7 +252,14 @@ export class Repo<T: Tabled> {
     // checked again before running anything, the same deferred-error shape
     // `checkErr`'s own header already documents for `where`/`orderBy`.
     this.checkErr()?
-    let rows = this.db.query(sqlText, this.args)?
+    // #6283: capture `this.args` before `resetChain()` REPLACES the field
+    // with a fresh empty slice — a plain read-then-reassign, never an
+    // in-place mutation of the array this local still points at, so this
+    // stays the query's own argument list regardless of the two sharing a
+    // backing array.
+    let args = this.args
+    this.resetChain()
+    let rows = this.db.query(sqlText, args)?
     defer rows.close()
     let out = []T(0)
     while (rows.next()?) {
@@ -246,8 +272,10 @@ export class Repo<T: Tabled> {
   export first(): Option<T>! {
     this.checkErr()?
     let sqlText = this.boundedSql()
-    this.checkErr()? // #6274: see `all`'s own comment, above.
-    let rows = this.db.query(sqlText, this.args)?
+    this.checkErr()?     // #6274: see `all`'s own comment, above.
+    let args = this.args // #6283: see `all`'s own comment, above.
+    this.resetChain()
+    let rows = this.db.query(sqlText, args)?
     defer rows.close()
     if (!rows.next()?) {
       return Option<T>.None
@@ -374,6 +402,37 @@ export class Repo<T: Tabled> {
     if (this.errText != "") {
       fail newError(this.errText)
     }
+  }
+
+  // #6283: every TERMINAL (`find`/`all`/`first`/`updateAll`/`deleteAll`)
+  // calls this once it has read whatever chain state it needs, so `Repo<T>`
+  // is fresh again for the NEXT statement — the locked target's own example
+  // (`.claude/kb/data-packages-dx.md`) calls `db.table<T>()` exactly once
+  // and reuses that one `Repo<T>` for every following statement
+  // (`posts.where(...).all()?`, then later `posts.withDeleted().all()?`,
+  // then `posts.orderBy(...).first()?`, ...). Confirmed live against real
+  // Postgres (#6281): without this, `this.wheres`/`this.orderBys` kept
+  // accumulating across statements, so a second `orderBy("balance")`
+  // (wanting ascending) still sorted by the FIRST call's `orderBy("balance",
+  // Dir.Desc)` as its primary key, and a second `where("id", x)` kept the
+  // first statement's now-`checkErr`-passed but semantically stale
+  // predicate alongside `includeDeleted` from whichever chain call ran
+  // last. Every fake-driver test above builds a brand new `Repo<T>{...}`
+  // literal per scenario (never reusing one across two top-level
+  // statements) and the fake driver replays canned rows regardless of the
+  // WHERE/ORDER BY text it is handed, so neither shape of test could see
+  // either bug — only asserting the SQL TEXT of a SECOND call on the SAME
+  // instance can.
+  resetChain() {
+    this.wheres = []string(0)
+    this.args = []Value(0)
+    this.orderBys = []string(0)
+    this.limitN = 0
+    this.hasLimit = false
+    this.offsetN = 0
+    this.hasOffset = false
+    this.includeDeleted = false
+    this.sets = []string(0)
   }
 
   // `T.__columns()` filtered to the row-mappable, non-relation subset
@@ -678,7 +737,9 @@ export class Repo<T: Tabled> {
       fail newError("orm: updateAll on the class mapped to '${T.__tableName()}' called with no set() - nothing to write")
     }
     let sqlText = "update ${T.__tableName()} set ${join(this.sets, ", ")}" + this.whereSql()
-    return this.db.exec(sqlText, this.args)?
+    let args = this.args // #6283: see `all`'s own comment, above.
+    this.resetChain()
+    return this.db.exec(sqlText, args)?
   }
 
   // Runs `DELETE ... WHERE <wheres>`, or - on a `@softDelete` class - the
@@ -704,9 +765,13 @@ export class Repo<T: Tabled> {
       let whereText = this.whereSql()
       this.args = append(this.args, sqlValue(now().ns))
       let sqlText = "update ${T.__tableName()} set ${softCol} = $${len(this.args)}" + whereText
-      return this.db.exec(sqlText, this.args)?
+      let args = this.args // #6283: see `all`'s own comment, above.
+      this.resetChain()
+      return this.db.exec(sqlText, args)?
     }
     let sqlText = "delete from ${T.__tableName()}" + this.whereSql()
-    return this.db.exec(sqlText, this.args)?
+    let args = this.args // #6283: see `all`'s own comment, above.
+    this.resetChain()
+    return this.db.exec(sqlText, args)?
   }
 }
