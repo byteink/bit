@@ -101,15 +101,4 @@ diffdump_setup() {
     export BIT_DCE_PARAMS=1
     export BIT_DCE_METHODS=1
   fi
-
-  # #6189: BIT_MAPLIT (#6016) and BIT_STATIC_METHODS (#6091/#6099) default ON
-  # in this tree since the 0.32.0 repin, but the ORACLE is that same v0.32.0
-  # release, cut BEFORE the flip -- its own copy of compiler/parser.bit still
-  # carries both flags, still defaulting OFF. Unlike BIT_STATIC_CONST above
-  # this is a PARSE-level difference, so it matters to every KIND here
-  # (ast/tokens/diags/types/ir/iropt), not just ir -- force "1" on both,
-  # unconditionally, to compare ON-ON. Deleted at the 0.33.0 repin alongside
-  # the flags themselves.
-  export BIT_MAPLIT=1
-  export BIT_STATIC_METHODS=1
 }
