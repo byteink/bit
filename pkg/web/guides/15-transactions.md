@@ -3,10 +3,10 @@
 
 Creating an article in Inkwell is not one write, it is several: insert the
 article row, then for each tag name the client sent, find or create that
-tag, then attach it to the article. If the process crashes, the database
+tag, then link it to the article. If the process crashes, the database
 connection drops, or one of those tag inserts fails halfway through, a
 naive implementation leaves an article in the table with only some of its
-tags attached, or worse, an article with none. Nothing about the request
+tags linked, or worse, an article with none. Nothing about the request
 told the client that happened, because from the client's side the request
 either succeeded or it did not.
 
@@ -15,7 +15,8 @@ none of them do.
 
 ## The only way to run one
 
-`std/sql` gives you exactly one way to run a transaction: a closure.
+`std/sql` gives you exactly one way to run a transaction that hands a value
+back: a closure.
 
 ```bit
 import { Pool, Value, sqlReqInt } from "std/sql"
@@ -37,102 +38,105 @@ with a `commit()` you have to remember to call, and that is deliberate: a
 `?` between a `begin()` and a `commit()` returns early and skips the
 rollback, leaving the transaction open and the connection never given back
 to the pool. The closure form makes that mistake impossible to write rather
-than merely easy to avoid. `tx(pool, f)` is the same thing for a block that
-returns nothing; `txValue` is for a block whose result you want, like a new
-row's id.
+than merely easy to avoid.
+
+`pkg/orm`'s own `db.tx((tx) => { ... })?` is the same closure shape, over
+`TxHandle` instead of a raw `Data` handle: every `tx.table<T>()` inside the
+block runs on that one pinned connection, so ordinary repository calls -
+`insert`, `link`, `find` - compose into a transaction with no extra
+plumbing. Unlike `std/sql`'s `txValue<T>`, `db.tx` never hands a value back
+out of the closure (rule 6: all or nothing, nothing more) - Inkwell's own
+transaction below reads the value it needs out of a slice it declared
+before the closure and wrote into from inside it.
 
 ## Inkwell's transaction
 
 `POST /articles` is Inkwell's one transactional endpoint: insert the
-article, then find-or-create and attach every tag the client named, all
-inside one `pool.txValue` call.
+article, then find-or-create and link every tag the client named, all
+inside one `db.tx` call.
 
 ```bit
 import { Ctx, Res } from "web"
-import { Data, attach, ManyToManyDesc, ServerDialect } from "orm"
-import { join } from "std/strings"
+import { Db, TxHandle } from "orm"
+import { isSome, unwrap } from "std/core"
 
-// The `article_tags` join table's shape, shared with the tags helper below.
-fn articleTagsDesc(): ManyToManyDesc {
-  return ManyToManyDesc{
-    joinTable = "article_tags", ownerColumn = "article_id", ownerTable = "articles",
-    ownerIdColumn = "id", targetColumn = "tag_id", targetTable = "tags", targetIdColumn = "id",
-  }
+// The `author`/`with("author")` side (part 9, "Relationships") is left out
+// here - this page's own transaction never reads it back, and a plain
+// `@manyToMany` field is all `Article` needs to be a full `Tabled` class.
+@table class Tag {
+  id: i64,
+  name: string,
 }
 
-// Inserts a row and reads its generated id back with `returning id`, in
-// one statement. See part 7, "Tables and migrations with pkg/orm", for the
-// migration that makes `id` a generated identity column.
-fn insertGeneratedId(db: Data, table: string, cols: []string, args: []Value): i64! {
-  let marks = []string(0)
-  let i = 0
-  while (i < len(args)) {
-    marks = append(marks, "$${i + 1}")
-    i = i + 1
-  }
-  let sqlText = "insert into ${table} (${join(cols, ", ")}) values (${join(marks, ", ")}) returning id"
-  let rows = db.query(sqlText, args)?
-  defer rows.close()
-  if (!rows.next()?) {
-    fail newError("insertGeneratedId: insert into '${table}' returned no row")
-  }
-  return sqlReqInt(rows, rows.columns(), "id")?
+@table class Article {
+  id: i64
+  title: string
+  body: string
+  authorId: i64
+  @manyToMany("article_tags")
+  tags: []Tag
 }
 
-fn findOrCreateTag(db: Data, name: string): i64! {
-  let rows = db.query("select id from tags where name = $1", [Value.Text(name)])?
-  defer rows.close()
-  if (rows.next()?) {
-    return sqlReqInt(rows, rows.columns(), "id")?
+fn findOrCreateTag(tx: TxHandle, name: string): Tag! {
+  let tags = tx.table<Tag>()
+  let found = tags.where("name", name).first()?
+  if (isSome(found)) {
+    return unwrap(found)
   }
-  return insertGeneratedId(db, "tags", ["name"], [Value.Text(name)])?
-}
-
-fn attachTagNames(db: Data, articleId: i64, names: []string): ()! {
-  let ids = []i64(0)
-  for name of names {
-    let id = findOrCreateTag(db, name)?
-    ids = append(ids, id)
-  }
-  if (len(ids) == 0) {
-    return
-  }
-  attach(db, articleTagsDesc(), articleId, ids, ServerDialect.Postgres)?
+  return tags.insert(Tag{ id = 0, name = name })?
 }
 
 // The real `insertArticle` (articles.bit) also derives a unique slug from
 // the title (part 8, "Querying and CRUD") - omitted here since it has
 // nothing to do with the transaction.
-fn insertArticle(db: Data, authorId: i64, title: string, body: string, tags: []string): i64! {
-  let cols = ["title", "body", "author_id"]
-  let args = [Value.Text(title), Value.Text(body), Value.Int(authorId)]
-  let newId = insertGeneratedId(db, "articles", cols, args)?
-  attachTagNames(db, newId, tags)?
-  return newId
+fn insertArticle(
+  tx: TxHandle,
+  authorId: i64,
+  title: string,
+  body: string,
+  tagNames: []string,
+): Article! {
+  let articles = tx.table<Article>()
+  let a = articles.insert(
+    Article{ id = 0, title = title, body = body, authorId = authorId, tags = []Tag(0) },
+  )?
+  let ids = []i64(0)
+  for name of tagNames {
+    let t = findOrCreateTag(tx, name)?
+    ids = append(ids, t.id)
+  }
+  if (len(ids) > 0) {
+    articles.link(a, "tags", ids)?
+  }
+  return a
 }
 
 fn createArticle(
   c: Ctx,
-  pool: Pool,
+  db: Db,
   authorId: i64,
   title: string,
   body: string,
-  tags: []string,
+  tagNames: []string,
 ): Res! {
-  let newId = pool.txValue<i64>((db) => insertArticle(db, authorId, title, body, tags))?
-  return c.createdUrl("/articles/${newId}")
+  let newId = []i64{ 0 }
+  db.tx((tx) => {
+    let a = insertArticle(tx, authorId, title, body, tagNames)?
+    newId[0] = a.id
+  })?
+  return c.createdUrl("/articles/${newId[0]}")
 }
 ```
 
-`db: Data` is the transaction handle, not the pool: `insertArticle` and
-everything it calls run on the one connection `txValue` opened, so the
-article insert and every tag insert and attach are part of the same
+`tx: TxHandle` is the transaction handle, not `db`: `insertArticle` and
+everything it calls run on the one connection `db.tx` opened, so the
+article insert and every tag insert and link are part of the same
 transaction with no extra plumbing to wire them together.
 
 ## Proving it
 
 Four articles already exist. Send one more, naming a tag name over 60
-characters, which is longer than the `tags.name` column allows:
+characters, which is longer than the `tag.name` column allows:
 
 ```
 $ curl -s "http://127.0.0.1:8080/articles?limit=1" | grep -o '"total":[0-9]*'
