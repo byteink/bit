@@ -33,7 +33,7 @@ import { Db } from "orm"
 ## belongsTo and manyToMany, declared on Article together
 
 ```bit
-import { Db, Dir } from "orm"
+import { Dir } from "orm"
 
 @table("articles") class Article {
   id: i64,
