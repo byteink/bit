@@ -52,38 +52,34 @@ the user afterward. That is a `Lookup`:
 
 ```bit
 import { Lookup, LookupResult, Strategy, newPasswordStrategy } from "auth"
-import { Data } from "orm"
-import { Value, sqlReqInt, sqlReqText } from "std/sql"
+import { Db } from "orm"
 import { Json, JsonEntry } from "std/json"
 
-class StoredUser {
+// `users`, not the snake_case default `user` - see [Registering users and
+// hashing passwords](10-registering-users-and-hashing-passwords.md).
+@table("users") @timestamps class User {
   id: i64,
   username: string,
+  email: string,
   passwordHash: string,
   role: string,
+  createdAt: i64,
+  updatedAt: i64,
 }
 
-fn findUserByUsername(db: Data, username: string): StoredUser! {
-  let rows = db.query(
-    "select id, username, password_hash, role from users where username = $1",
-    [Value.Text(username)],
-  )?
-  defer rows.close()
-  if (!rows.next()?) {
+fn findUserByUsername(db: Db, username: string): User! {
+  let found = db.table<User>().where("username", username).first()?
+  if (!isSome(found)) {
     fail newError("no user named '${username}'")
   }
-  let cols = rows.columns()
-  return StoredUser{
-    id = sqlReqInt(rows, cols, "id")?, username = sqlReqText(rows, cols, "username")?,
-    passwordHash = sqlReqText(rows, cols, "password_hash")?, role = sqlReqText(rows, cols, "role")?,
-  }
+  return unwrap(found)
 }
 
-fn userClaims(u: StoredUser): Json {
+fn userClaims(u: User): Json {
   return Json.JsonObject([JsonEntry{ key = "role", value = Json.JsonString(u.role) }])
 }
 
-fn userLookup(db: Data): Lookup {
+fn userLookup(db: Db): Lookup {
   return (username) => {
     let u = findUserByUsername(db, username)?
     return LookupResult{ hash = u.passwordHash, id = "${u.id}", claims = userClaims(u) }
@@ -180,19 +176,8 @@ fn currentUserId(c: Ctx): i64! {
   return parseInt(raw)?
 }
 
-fn findUserById(db: Data, id: i64): StoredUser! {
-  let rows = db.query(
-    "select id, username, password_hash, role from users where id = $1", [Value.Int(id)],
-  )?
-  defer rows.close()
-  if (!rows.next()?) {
-    fail newError("no user with id ${id}")
-  }
-  let cols = rows.columns()
-  return StoredUser{
-    id = sqlReqInt(rows, cols, "id")?, username = sqlReqText(rows, cols, "username")?,
-    passwordHash = "", role = sqlReqText(rows, cols, "role")?,
-  }
+fn findUserById(db: Db, id: i64): User! {
+  return db.table<User>().find(id)?
 }
 
 @json class MeView {
@@ -201,13 +186,13 @@ fn findUserById(db: Data, id: i64): StoredUser! {
   role: string,
 }
 
-fn showMe(c: Ctx, db: Data): Res! {
+fn showMe(c: Ctx, db: Db): Res! {
   let id = currentUserId(c)?
   let u = findUserById(db, id)?
   return c.json(MeView{ id = u.id, username = u.username, role = u.role })
 }
 
-export fn mountAuth(app: App, db: Data) {
+export fn mountAuth(app: App, db: Db) {
   let strategy = newPasswordStrategy(userLookup(db))
   app.post("/auth/login", (c) => login(c, strategy))
   app.post("/auth/logout", (c) => logout(c))
