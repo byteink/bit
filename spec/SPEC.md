@@ -1654,6 +1654,25 @@ argument (#6280).**
   own call site is not checked here; `Repo<T>`'s own methods still refuse
   the same condition at runtime, naming the class and its key columns.
 
+**`Repo<T>.after` - a compile-time check on keyset paging, same syntactic
+walk as E0163.**
+
+- `Repo<T>.after(key)` chains like every other builder method - no `?` of
+  its own, a mistake deferred onto the receiver's own `errText` and
+  reported by the next terminal call, exactly as a bad `where`/`orderBy`
+  column already is. Two mistakes are legitimate: calling `after` with no
+  `orderBy` yet, or ordering by a column that carries neither `@id` nor
+  `@unique` (the page boundary would then be ambiguous).
+- When an `.after(...)` call is syntactically chained off a
+  `db.table<T>()`/`find<T>(...)` root (E0163's own walk), a chain with no
+  `.orderBy(...)` anywhere earlier in it is **E0181**, naming `T`. When the
+  chain's FIRST `.orderBy(...)` call names its column as a string literal
+  and that column is not `@id`/`@unique` (nor the bare `id` default), that
+  is **E0182**, naming the field and `T`. A chain this walk cannot trace
+  back to its own root, or whose first `orderBy` names a non-literal
+  column, is not flagged here; `Repo<T>.after` still refuses both
+  conditions through the receiver's own deferred error either way.
+
 **`@job("name")` - a stable, explicit background-job dispatch name (#6081).**
 
 ```

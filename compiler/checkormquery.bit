@@ -62,6 +62,21 @@
 // a `find<T>(...)` call, names no field `T` declares.
 const ecOrmBadColumn = 163
 
+// E0181 (#6293): a `.after(...)` call chained off a `db.table<T>()`/
+// `find<T>(...)` root with no `.orderBy(...)` call anywhere earlier in the
+// same syntactic chain — the compile-time half of `keysetPredicateForRepo`'s
+// (pkg/orm/keyset.bit) `KeysetCause.NoOrderBy` refusal, deferred onto
+// `Repo<T>.errText` at runtime (`pkg/orm/repo.bit`'s own `after()`) for a
+// chain this syntactic walk cannot see through.
+const ecOrmAfterNoOrderBy = 181
+
+// E0182 (#6293): the FIRST `.orderBy(...)` call in an `.after(...)`
+// chain names its column as a string literal, and that column carries
+// neither `@id` nor `@unique` (nor is it the bare `id` default,
+// `classtabledefaultid.bit`) — the compile-time half of
+// `keysetPredicateForRepo`'s `KeysetCause.NotUnique` refusal.
+const ecOrmAfterNotUnique = 182
+
 const ormModulePath = "orm"
 const ormFindFuncName = "find"
 const ormUpdateFuncName = "update"
@@ -355,6 +370,140 @@ fn ormSecondArgExpr(tree: Tree, callNode: int): int {
   return kidsOf(tree, args[1])[0]
 }
 
+// The FIRST `.orderBy(...)` call's own column, walking from `expr` (an
+// `.after(...)` call's own receiver) back to `root` (its chain's own
+// `find<T>(...)`/`db.table<T>()` call, already proven reachable by
+// `ormChainRoot`) — `present` is false when no `.orderBy` appears in the
+// chain at all; `literal` is false when the nearest-root `.orderBy`'s own
+// first argument is not a string literal (a dynamic column, deferred to
+// the runtime check the same way `checkOrmColumnCall` already defers one).
+// Walks the identical path `ormChainRoot` already validated, so every
+// step's callee is `Tag.Member` until `cur` reaches `root`.
+class OrmOrderByInfo { present: bool, literal: bool, col: string }
+
+fn ormFirstOrderByBeforeCall(tree: Tree, source: string, expr: int, root: int): OrmOrderByInfo {
+  let cur = expr
+  let present = false
+  let literal = false
+  let col = ""
+  let guard = 0
+  while (cur != root && guard < 64) {
+    guard = guard + 1
+    let mk = kidsOf(tree, kidsOf(tree, cur)[0])
+    if (identText(tree, source, mk[1]) == "orderBy") {
+      present = true
+      let argNode = ormFirstArgExpr(tree, cur)
+      literal = argNode != 0 && getNode(tree, argNode).tag == Tag.StringLit
+      col = ""
+      if (literal) {
+        col = stringLitText(source, getNode(tree, argNode).span)
+      }
+    }
+    cur = mk[0]
+  }
+  return OrmOrderByInfo{ present = present, literal = literal, col = col }
+}
+
+// Whether field `f` carries `@id` or `@unique` explicitly — split out of
+// `ormUniqueFieldNames` to keep its loop body a single call (LINT.md
+// max-complexity), the same shape `ormManyToManyFieldNames`'s own inner
+// loop already is.
+fn ormFieldIsMarkedUnique(tree: Tree, source: string, f: int): bool {
+  for a of fieldAttrs(tree, f) {
+    let an = identText(tree, source, kidsOf(tree, a)[0])
+    if (an == "id" || an == "unique") {
+      return true
+    }
+  }
+  return false
+}
+
+// `decl`'s own field names that make an `after()` sort column unambiguous
+// — every field carrying `@id`/`@unique` explicitly, plus (only when NO
+// field carries `@id` explicitly) the bare field literally named `id`,
+// mirroring `classtabledefaultid.bit`'s own default exactly — the
+// identical answer `keysetIsUnique` (pkg/orm/keyset.bit) gives at runtime.
+// `ormRepoExplicitIdCount` (checkormrepokey.bit, this module's own
+// sibling, SPEC §17.1) is reused rather than re-derived.
+fn ormUniqueFieldNames(target: SrcModule, decl: int): []string {
+  let members = kidsOf(target.tree, kidsOf(target.tree, decl)[2])
+  let hasExplicitId = ormRepoExplicitIdCount(target.tree, target.source, decl) > 0
+  let out = []string(0)
+  for m0 of members {
+    let f = memberField(target.tree, m0)
+    if (f == 0) {
+      continue
+    }
+    let name = identText(target.tree, target.source, kidsOf(target.tree, f)[0])
+    let isDefaultId = !hasExplicitId && name == "id"
+    if (ormFieldIsMarkedUnique(target.tree, target.source, f) || isDefaultId) {
+      out = append(out, name)
+    }
+  }
+  return out
+}
+
+fn reportOrmAfterNoOrderBy(p: Project, m: SrcModule, nameNode: int, className: string) {
+  report(
+    p.diags, ecOrmAfterNoOrderBy, getNode(m.tree, nameNode).span,
+    "after() on '${className}' has no orderBy() earlier in the chain",
+    "keyset pagination needs a deterministic order to compare the cursor against — call orderBy(...) before after(...) in this chain, or build the column from a non-literal expression to fall back to the runtime check",
+  )
+}
+
+fn reportOrmAfterNotUnique(
+  p: Project,
+  m: SrcModule,
+  nameNode: int,
+  column: string,
+  className: string,
+) {
+  report(
+    p.diags, ecOrmAfterNotUnique, getNode(m.tree, nameNode).span,
+    "after() on '${className}' orders by '${column}', which is neither @id nor @unique",
+    "the page boundary would be ambiguous, silently skipping or repeating rows — order by a unique column instead",
+  )
+}
+
+// One candidate call: `.after(key)`, chained off a `db.table<T>()`/
+// `find<T>(...)` this module binds (#6293) — the compile-time backstop for
+// `keysetPredicateForRepo`'s (pkg/orm/keyset.bit) two runtime refusals: no
+// `.orderBy(...)` anywhere earlier in the chain, or the FIRST one's own
+// literal column carrying neither `@id` nor `@unique`. Mirrors
+// `checkOrmColumnCall`'s own receiver walk; only flags what the walk can
+// see — a dynamic `.orderBy(colVar)`, or a chain this syntactic walk
+// cannot trace back to its own root, defers to the runtime check.
+fn checkOrmAfterCall(p: Project, mid: int, b: OrmFindBinding, callNode: int) {
+  let m = p.mods[mid]
+  let callee = kidsOf(m.tree, callNode)[0]
+  if (getNode(m.tree, callee).tag != Tag.Member) {
+    return
+  }
+  let mk = kidsOf(m.tree, callee)
+  if (identText(m.tree, m.source, mk[1]) != "after") {
+    return
+  }
+  let root = ormChainRoot(m.tree, m.source, b, mk[0])
+  if (root == 0) {
+    return
+  }
+  let site = ormFindCallClassSite(p, mid, m, root)
+  if (!site.found) {
+    return
+  }
+  let ob = ormFirstOrderByBeforeCall(m.tree, m.source, mk[0], root)
+  if (!ob.present) {
+    reportOrmAfterNoOrderBy(p, m, mk[1], site.name)
+    return
+  }
+  if (!ob.literal) {
+    return
+  }
+  if (!ormNameIn(ob.col, ormUniqueFieldNames(p.mods[site.mod], site.decl))) {
+    reportOrmAfterNotUnique(p, m, mk[1], ob.col, site.name)
+  }
+}
+
 fn reportOrmBadColumn(p: Project, m: SrcModule, argNode: int, field: string, className: string) {
   report(
     p.diags, ecOrmBadColumn, getNode(m.tree, argNode).span,
@@ -438,6 +587,7 @@ fn checkOrmFindColumnsInModule(p: Project, mid: int) {
     if (getNode(m.tree, i).tag == Tag.Call) {
       checkOrmColumnCall(p, mid, b, i)
       checkOrmLinkCall(p, mid, b, i)
+      checkOrmAfterCall(p, mid, b, i)
     }
     i = i + 1
   }

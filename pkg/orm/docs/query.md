@@ -68,14 +68,17 @@ and page 1,000:
 
 ```bit
 fn nextPage(db: Db, lastId: i64): []Article! {
-  return db.table<Article>().orderBy("id").after(lastId)?.limit(20).all()?
+  return db.table<Article>().orderBy("id").after(lastId).limit(20).all()?
 }
 ```
 
 Call it with the id of the last row from the previous page (or skip it for
-page one). `after` needs `orderBy` on the same column somewhere in the
-chain, which is why it returns a failure (`?`) instead of a plain value -
-it fails naming the mistake if the two disagree.
+page one). `after` chains like every other builder method - no `?` of its
+own. It needs `orderBy` on a unique column (`@id`/`@unique`) somewhere
+earlier in the chain; get that wrong and the mistake surfaces at the
+terminal call (`all`/`first`/`find`) instead, the same way a bad `where`
+column does. When the column is a literal, the checker catches it before
+the program runs at all.
 
 ## The terminals
 
