@@ -85,8 +85,18 @@ do, not who they are.
 
 ```bit
 import { Res, badRequest, notFound } from "web"
-import { Data } from "orm"
-import { Value, sqlReqInt } from "std/sql"
+import { Db } from "orm"
+
+// `articles`, not the snake_case default `article` - see [Querying and
+// CRUD](08-querying-and-crud.md). Only the columns this chapter touches;
+// `db.table<Article>()` reads and writes by name, so leaving out `slug`/
+// `createdAt`/`updatedAt` here just means this update never sets them.
+@table("articles") class Article {
+  id: i64,
+  title: string,
+  body: string,
+  authorId: i64,
+}
 
 @json class UpdateArticleInput {
   title: string,
@@ -100,27 +110,26 @@ import { Value, sqlReqInt } from "std/sql"
   authorId: i64,
 }
 
-fn findArticleAuthorId(db: Data, id: i64): i64! {
-  let rows = db.query("select author_id from articles where id = $1", [Value.Int(id)])?
-  defer rows.close()
-  if (!rows.next()?) {
-    fail notFound("no article with that id")
-  }
-  return sqlReqInt(rows, rows.columns(), "author_id")?
-}
-
-fn updateArticle(c: Ctx, db: Data): Res! {
+fn updateArticle(c: Ctx, db: Db): Res! {
   let id = parseInt(c.param("id")) catch _ {
     fail badRequest("id must be an integer")
   }
-  let authorId = findArticleAuthorId(db, id)?
-  requireOwnerOrAdmin(c, authorId)?
+  let existing = db.table<Article>().find(id) catch _ {
+    fail notFound("no article with that id")
+  }
+  requireOwnerOrAdmin(c, existing.authorId)?
   let input = c.body<UpdateArticleInput>()?
-  db.exec(
-    "update articles set title = $1, body = $2 where id = $3",
-    [Value.Text(input.title), Value.Text(input.body), Value.Int(id)],
-  )?
-  return c.json(ArticleView{ id = id, title = input.title, body = input.body, authorId = authorId })
+  existing.title = input.title
+  existing.body = input.body
+  db.table<Article>().update(existing)?
+  return c.json(
+    ArticleView{
+      id = existing.id,
+      title = existing.title,
+      body = existing.body,
+      authorId = existing.authorId,
+    },
+  )
 }
 ```
 
@@ -134,21 +143,23 @@ after the write is not a check, it is an audit log.
 ```bit
 import { App } from "web"
 
+@table("tags") class Tag {
+  id: i64,
+  name: string,
+}
+
 @json class CreateTagInput {
   name: string,
 }
 
-fn createTag(c: Ctx, db: Data): Res! {
+fn createTag(c: Ctx, db: Db): Res! {
   requireAdmin(c)?
   let input = c.body<CreateTagInput>()?
-  let rows = db.query("insert into tags (name) values ($1) returning id", [Value.Text(input.name)])?
-  defer rows.close()
-  rows.next()?
-  let newId = sqlReqInt(rows, rows.columns(), "id")?
-  return c.created("${newId}")
+  let saved = db.table<Tag>().insert(Tag{ id = 0, name = input.name })?
+  return c.created("${saved.id}")
 }
 
-export fn mountTags(app: App, db: Data) {
+export fn mountTags(app: App, db: Db) {
   app.post("/tags", (c) => createTag(c, db))
 }
 ```
