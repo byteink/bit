@@ -217,7 +217,10 @@
 # a diagnostic, and accepts `from` as a name the oracle rejects
 # (_tests_/cases/run_from_identifier.bit). #6269-default-id-attr (`ir`/`iropt`):
 # a field named id is the key by default, recorded as an implicit id
-# attribute (_tests_/cases/run_table_name_override.bit). All retire at the
+# attribute (_tests_/cases/run_table_name_override.bit). #6265-closure-bound-
+# static-self/-insert: the oracle types a static reached through a bound
+# inside a closure as Self and drops its instantiations
+# (_tests_/cases/run_generic_closure_over_bound_self_static.bit). All retire at the
 # 0.34.0 repin; `diags` has no automated
 # RETIRED audit (like ast/fmt), so 6254 is confirmed dead by hand there.
 #
@@ -231,7 +234,7 @@
 # opcode COUNT deltas (6269-default-id-attr is the one `ir`/`iropt` signature;
 # none is declared for `ast`/`fmt`, see Retirement history above).
 explainMismatch() {
-  awk -v kind="$3" '
+  awk -v kind="$3" -v file="${4:-}" '
     function opcode(line,    s) {
       if (match(line, /= rt_call [A-Za-z_][A-Za-z0-9_]*\(/)) {
         s = substr(line, RSTART, RLENGTH)
@@ -421,6 +424,41 @@ explainMismatch() {
       }
       return 1
     }
+    # selfRebound (#6265) -- a static called through a bound type parameter
+    # inside a closure: the 0.33.0 oracle leaves the interface Self in the
+    # checked type (`: Self!`), the tree resolves it to the parameter (`: T!`).
+    # Same line count; each differing pair differs only in that type.
+    function selfRebound(nA, linesA, nB, linesB,    i, a, b, hit) {
+      if (nA != nB) { return 0 }
+      hit = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        a = linesA[i]; b = linesB[i]
+        if (sub(/: Self!$/, ": T!", a) == 0) { return 0 }
+        if (a != b) { return 0 }
+        hit = 1
+      }
+      return hit
+    }
+    # pureFuncInsert (#6265) -- the oracle miscompiles a generic reached only
+    # through a closure by dropping its instantiations; the tree emits them.
+    # Every oracle line appears in the tree in order, and every tree-only
+    # line belongs to an inserted `func` block. Only declared for the one
+    # corpus file that exercises it.
+    function pureFuncInsert(nA, linesA, nB, linesB,    i, j, infn, inserted) {
+      i = 1; j = 1; infn = 0; inserted = 0
+      while (j <= nB) {
+        if (i <= nA && linesA[i] == linesB[j] && !infn) { i++; j++; continue }
+        if (linesB[j] ~ /^func /) { infn = 1; inserted = 1; j++; continue }
+        if (linesB[j] == "" && !infn) { j++; continue }
+        if (infn) {
+          if (linesB[j] == "") { infn = 0 }
+          j++; continue
+        }
+        return 0
+      }
+      return (i > nA && inserted) ? 1 : 0
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 {
       nA++; linesA[nA] = $0
@@ -444,6 +482,9 @@ explainMismatch() {
         if (fromContextualTypes(nA, linesA, nB, linesB)) {
           print "6264-from-contextual-types"; exit 0
         }
+        if (selfRebound(nA, linesA, nB, linesB)) {
+          print "6265-closure-bound-static-self"; exit 0
+        }
         exit 1
       }
       if (kind == "tokens") {
@@ -464,6 +505,9 @@ explainMismatch() {
       if (kind == "ir" || kind == "iropt") {
         if (defaultIdAttr(kind)) {
           print "6269-default-id-attr"; exit 0
+        }
+        if (file ~ /run_generic_closure_over_bound_self_static[.]bit$/ && pureFuncInsert(nA, linesA, nB, linesB)) {
+          print "6265-closure-bound-static-insert"; exit 0
         }
       }
       exit 1
@@ -489,11 +533,11 @@ declaredSignatureNames() {
   case "$kind" in
     ast) return ;;
     fmt) return ;;
-    ir) printf '%s\n' "6269-default-id-attr"; return ;;
-    iropt) printf '%s\n' "6269-default-id-attr"; return ;;
-    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types"; return ;;
+    ir) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert"; return ;;
+    iropt) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert"; return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6265-closure-bound-static-self"; return ;;
     diags) printf '%s\n' "6254-collection-attr-presyntax" "6264-from-contextual-diags"; return ;;
     tokens) printf '%s\n' "6264-from-contextual-token"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr" "6265-closure-bound-static-self" "6265-closure-bound-static-insert"
 }

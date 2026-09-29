@@ -346,7 +346,7 @@ run_types() {
       # row — a `types` divergence that matches a registered identity
       # (ptrofStringType, selfhost-ir-signatures.sh) is oracle lag, not a
       # regression.
-      sig=$(explainMismatch "$seed" "$b2" types)
+      sig=$(explainMismatch "$seed" "$b2" types "$f")
       if [ -n "$sig" ]; then
         echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
       else
@@ -571,7 +571,7 @@ run_ir() {
       # above explainMismatch). Only an UNEXPLAINED divergence is a
       # regression — this is the #3125 fix, so a real lowering improvement
       # like #3107's no longer fails this gate by construction.
-      sig=$(explainMismatch "$want" "$b2" "$NAME")
+      sig=$(explainMismatch "$want" "$b2" "$NAME" "$f")
       if [ -n "$sig" ]; then
         echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
       else
