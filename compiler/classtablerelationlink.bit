@@ -1,0 +1,295 @@
+// compiler/classtablerelationlink.bit — the `@manyToMany` half of
+// classtablerelation.bit's synthesis (#6275/#6277, epic #6261,
+// `.claude/kb/data-packages-dx.md` "Approved 2026-09-29"), split out to
+// stay under LINT.md's 800-line ceiling (`.claude/kb/file-splits.md`: a
+// pure move, name resolution is order-independent within one package,
+// SPEC §17.1). `TableManyToManyField`/`tableManyToManyFieldsOf` are read by
+// `classtablerelation.bit`'s own `collectTableRelationClasses` (into
+// `TableRelationClass.linkFields`); `rbManyToManyDescLit`/`rbFromRowArrow`
+// build the `with()` arm (`synthLoadRelation`'s own `rbLoadRelationBody`,
+// through `rbManyToManyLoadFieldEntry`) AND `link`/`unlink`'s
+// `synthLinkRelation`; `TableBuild`/`RelSynthCtx`/`rbGenericCall`/etc. are
+// classtablerelation.bit's own building blocks, reused unchanged (same
+// package, no import).
+//
+// `@manyToMany` is NOT in `classrelationattr.bit`'s `attrNameIsRelation`
+// (manytomany.bit's own header — matched by attribute NAME on
+// `TableField.attrs` instead), so this file reads it directly. The join
+// table name is the attribute's own string argument, baked in as a
+// literal; both join COLUMNS are `toSnakeCase(rawClassName) + "_id"`
+// (`pkg/orm/generate.bit`'s `manyToManyDescsFor` convention — the very
+// `toSnakeCase` `classtablerow.bit`'s own `buildTableRowClass` already uses
+// for a class's default table name) computed from the RAW class names at
+// COMPILE time — never guessed from a possibly-`@table`-overridden
+// `__tableName()`, exactly the gap #6277's own investigation named. The two
+// TABLE names (`ownerTable`/`targetTable`) and both `@id` columns
+// (`ownerIdColumn`/`targetIdColumn`) DO go through each side's own
+// `__tableName()`/`relationIdColumn<T>()` at RUN time instead, so an
+// override on either side is still honored. `pkg/orm/relationload.bit`'s
+// `dispatchLinkRelation` (the identical map-dispatch shape
+// `dispatchLoadRelation` already gives `__loadRelation`) is the one place
+// `attach`/`detach` (`pkg/orm/manytomany.bit`) are actually called,
+// including the one `if (op.add)` branch between them — this file only
+// ever builds a `map<string, ManyToManyDesc>` literal, never a statement
+// of control flow. `with()`'s own arm reuses `manytomany.bit`'s
+// `manyToManyLoader` the identical way, one extra JOIN query, never N+1.
+
+const synthLinkRelationName = "__linkRelation"
+
+// `@manyToMany`'s own compiler-known mark — NOT in `classrelationattr.bit`'s
+// `attrNameIsRelation` (manytomany.bit's own header explains why), so
+// recognized here by name off `TableField.attrs` directly instead.
+const classAttrManyToMany = "manyToMany"
+
+// One `@manyToMany` field ready for BOTH `__loadRelation`'s dispatch map
+// (`with()`, one extra JOIN query via `manytomany.bit`'s own
+// `manyToManyLoader`) and `__linkRelation`'s (`link`/`unlink`): its own
+// name/type node and the join table name its attribute argument names.
+class TableManyToManyField {
+  nameNode: int,
+  typeNode: int,
+  joinTable: string,
+}
+
+// Every `@manyToMany` field of `tc` whose own target class ALSO satisfies
+// `Tabled` (`tableRowClassFromRowByName`, the identical guard
+// `tableRelationFieldsOf` applies to `@hasMany`/`@hasOne`/`@belongsTo`) —
+// `__linkRelation`'s own `relationIdColumn<Target>()` call needs `Target:
+// Tabled` to type-check regardless of whether anything ever calls it.
+fn tableManyToManyFieldsOf(
+  tree: Tree,
+  source: string,
+  tc: TableClass,
+  all: []TableRowClass,
+): []TableManyToManyField {
+  let out = []TableManyToManyField(0)
+  for f of tc.fields {
+    for a of f.attrs {
+      if (identText(tree, source, a.nameNode) != classAttrManyToMany) {
+        continue
+      }
+      if (getNode(tree, f.typeNode).tag != Tag.SliceType) {
+        continue
+      }
+      let targetNode = kidsOf(tree, f.typeNode)[0]
+      let targetWord = identText(tree, source, targetNode)
+      if (!tableRowClassFromRowByName(tree, source, all, targetWord)) {
+        continue
+      }
+      out = append(
+        out,
+        TableManyToManyField{
+          nameNode = f.nameNode, typeNode = f.typeNode,
+          joinTable = tableManyToManyArgWord(tree, source, a),
+        },
+      )
+    }
+  }
+  return out
+}
+
+// The `@manyToMany("...")` join table name, decoded — "" for a bare
+// `@manyToMany` with no argument (a caller mistake `pkg/orm` itself already
+// refuses at parse time, `manytomany.bit`'s own header; not this file's to
+// re-validate).
+fn tableManyToManyArgWord(tree: Tree, source: string, a: RecordedAttr): string {
+  if (len(a.args) == 0) {
+    return ""
+  }
+  let sp = getNode(tree, a.args[0]).span
+  return decodeStringContent(source, sp.start, sp.end)
+}
+
+// `(rows) => Target.__fromRow(rows)` — the generic child mapper every
+// `manyToManyLoader<Own,Target>` call below needs (that function's own
+// `childMapper: (Rows) => TChild!` parameter, manytomany.bit): `Target`'s
+// OWN synthesized `__fromRow`, never a hand-written per-entity one.
+fn rbFromRowArrow(b: TableBuild, targetNode: int): int {
+  let callee = tbNode(b, Tag.Member, [rbCloneIdent(b.tree, targetNode), tbIdent(b, "__fromRow")])
+  return rbArrow1(b, "rows", tbCall(b, callee, [tbIdent(b, "rows")]))
+}
+
+// One `"name": manyToManyLoader<Own,Target>(readOwnId, desc, fromRowArrow,
+// assignField)` map entry for a single `@manyToMany` field — `rbLoadFieldEntry`'s
+// (classtablerelation.bit) own counterpart, reusing `rbManyToManyDescLit`
+// (`__linkRelation`'s own builder, below) for the identical `ManyToManyDesc`
+// literal. Called from `classtablerelation.bit`'s own `rbLoadRelationBody`.
+fn rbManyToManyLoadFieldEntry(b: TableBuild, ctx: RelSynthCtx, f: TableManyToManyField): int {
+  let fieldWord = identText(ctx.tree, ctx.source, f.nameNode)
+  let key = addLeaf(ctx.tree, Tag.StringLit, synthSpan(b.st, "\"" + fieldWord + "\""))
+  let targetNode = kidsOf(ctx.tree, f.typeNode)[0]
+  let typeArgs = [rbCloneIdent(ctx.tree, ctx.tc.className), rbCloneIdent(ctx.tree, targetNode)]
+  let readOwnId = rbArrow1(b, "r", rbMember(b, "r", ctx.ownIdField))
+  let assignArrow = rbArrow2(b, "r", "v", [rbAssignField(b, "r", f.nameNode, "v")])
+  let call = rbGenericCall(
+    b, "manyToManyLoader", typeArgs,
+    [readOwnId, rbManyToManyDescLit(b, ctx, f), rbFromRowArrow(b, targetNode), assignArrow],
+  )
+  return tbNode(b, Tag.MapEntry, [key, call])
+}
+
+// ---- `__linkRelation` (many-to-many) ------------------------------------
+
+// `ClassName.method()` — a static call on an EXISTING class name node
+// (cloned by span, `rbCloneIdent`), never a synthesized word: `Self.__tableName()`/
+// `Target.__tableName()`, the run-time half of `rbManyToManyDescLit`'s own
+// table names (this file's header: an override on either side must still be
+// honored, unlike the two join COLUMNS baked in as literals below).
+fn rbStaticCall(b: TableBuild, classNameNode: int): int {
+  let callee = tbNode(
+    b,
+    Tag.Member,
+    [rbCloneIdent(b.tree, classNameNode), tbIdent(b, "__tableName")],
+  )
+  return tbCall(b, callee, []int(0))
+}
+
+// `expr?` on `b`'s own current class span — `rbLoadRelationBody`'s own
+// inline `TryExpr` construction, pulled out since `rbManyToManyDescLit`
+// needs it twice (`ownerIdColumn`/`targetIdColumn`).
+fn rbTry(b: TableBuild, node: int): int {
+  return addNode(b.tree, Tag.TryExpr, b.span, 0, [node])
+}
+
+// `ManyToManyDesc{ joinTable = "...", ownerColumn = "..._id", ownerTable =
+// Self.__tableName(), ownerIdColumn = relationIdColumn<Self>()?, targetColumn
+// = "..._id", targetTable = Target.__tableName(), targetIdColumn =
+// relationIdColumn<Target>()? }` — every field named, in `ManyToManyDesc`'s
+// own declaration order (`pkg/orm/manytomany.bit`). See this file's header
+// for why the two join COLUMNS are compile-time literals off the RAW class
+// names while the two TABLE names and `@id` columns are run-time calls.
+fn rbManyToManyDescLit(b: TableBuild, ctx: RelSynthCtx, f: TableManyToManyField): int {
+  let targetNode = kidsOf(ctx.tree, f.typeNode)[0]
+  let ownWord = identText(ctx.tree, ctx.source, ctx.tc.className)
+  let targetWord = identText(ctx.tree, ctx.source, targetNode)
+  let inits = [
+    tbFieldInit(b, "joinTable", tbStrLit(b, "\"" + f.joinTable + "\"")),
+    tbFieldInit(b, "ownerColumn", tbStrLit(b, "\"" + toSnakeCase(ownWord) + "_id\"")),
+    tbFieldInit(b, "ownerTable", rbStaticCall(b, ctx.tc.className)),
+    tbFieldInit(
+      b, "ownerIdColumn",
+      rbTry(
+        b,
+        rbGenericCall(b, "relationIdColumn", [rbCloneIdent(ctx.tree, ctx.tc.className)], []int(0)),
+      ),
+    ),
+    tbFieldInit(b, "targetColumn", tbStrLit(b, "\"" + toSnakeCase(targetWord) + "_id\"")),
+    tbFieldInit(b, "targetTable", rbStaticCall(b, targetNode)),
+    tbFieldInit(
+      b, "targetIdColumn",
+      rbTry(
+        b,
+        rbGenericCall(b, "relationIdColumn", [rbCloneIdent(ctx.tree, targetNode)], []int(0)),
+      ),
+    ),
+  ]
+  return tbNode(
+    b,
+    Tag.CompositeLit,
+    [tbIdent(b, "ManyToManyDesc"), tbNode(b, Tag.FieldInits, inits)],
+  )
+}
+
+// One `"name": ManyToManyDesc{...}` map entry for a single `@manyToMany`
+// field — `rbLoadFieldEntry`'s own counterpart.
+fn rbLinkFieldEntry(b: TableBuild, ctx: RelSynthCtx, f: TableManyToManyField): int {
+  let fieldWord = identText(ctx.tree, ctx.source, f.nameNode)
+  let key = addLeaf(ctx.tree, Tag.StringLit, synthSpan(b.st, "\"" + fieldWord + "\""))
+  return tbNode(b, Tag.MapEntry, [key, rbManyToManyDescLit(b, ctx, f)])
+}
+
+// `__linkRelation`'s own single body statement — `rbLoadRelationBody`'s
+// (classtablerelation.bit) counterpart: the real dispatch when
+// `trc.canFromRow`, else `fail newError(...)`, for the identical reason.
+fn rbLinkRelationBody(
+  b: TableBuild,
+  tree: Tree,
+  st: SynthText,
+  trc: TableRelationClass,
+  ctx: RelSynthCtx,
+): int {
+  let classSpan = getNode(tree, trc.tc.className).span
+  if (!trc.canFromRow) {
+    let msg = addLeaf(
+      tree, Tag.StringLit, synthSpan(
+        st,
+        "\"orm: this class does not satisfy Tabled, so no relation can be linked on it\"",
+      ),
+    )
+    return addNode(tree, Tag.FailStmt, classSpan, 0, [tbCall(b, tbIdent(b, "newError"), [msg])])
+  }
+  let entries = []int(0)
+  for f of trc.linkFields {
+    entries = append(entries, rbLinkFieldEntry(b, ctx, f))
+  }
+  let mapType = rbStringMapType(b, tbIdent(b, "ManyToManyDesc"))
+  let mapLit = tbNode(b, Tag.CompositeLit, [mapType, tbNode(b, Tag.MapEntries, entries)])
+  let dispatchArgs = [tbIdent(b, "db"), tbIdent(b, "name"), tbIdent(b, "op"), mapLit]
+  let call = rbGenericCall(
+    b,
+    "dispatchLinkRelation",
+    [rbCloneIdent(tree, trc.tc.className)],
+    dispatchArgs,
+  )
+  let tryCall = addNode(tree, Tag.TryExpr, classSpan, 0, [call])
+  return addNode(tree, Tag.ReturnStmt, classSpan, 0, [tryCall])
+}
+
+// `[export] static __linkRelation(db: Data, name: string, op: LinkOp): ()! { return dispatchLinkRelation<Own>(db, name, op, map<string, ManyToManyDesc>{...})? }`
+fn synthLinkRelation(tree: Tree, source: string, st: SynthText, trc: TableRelationClass): int {
+  let classSpan = getNode(tree, trc.tc.className).span
+  let b = TableBuild{ tree = tree, st = st, span = classSpan }
+  let ctx = RelSynthCtx{
+    tree = tree, source = source, tc = trc.tc,
+    ownIdField = tableClassIdFieldNameNode(tree, source, trc.tc),
+  }
+  let stmts = [rbLinkRelationBody(b, tree, st, trc, ctx)]
+  let params = tbNode(
+    b, Tag.Params,
+    [
+      tbNode(b, Tag.Param, [tbIdent(b, "db"), tbIdent(b, "Data")]),
+      tbNode(b, Tag.Param, [tbIdent(b, "name"), tbIdent(b, "string")]),
+      tbNode(b, Tag.Param, [tbIdent(b, "op"), tbIdent(b, "LinkOp")]),
+    ],
+  )
+  let resultTy = addNode(
+    tree, Tag.Fallible, classSpan, 0,
+    [addNode(tree, Tag.VoidType, classSpan, 0, []int(0)), 0],
+  )
+  let recv = addNode(
+    tree,
+    Tag.Receiver,
+    classSpan,
+    1,
+    [0, traitClassTypeRef(tree, trc.tc.className, 0)],
+  )
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [
+      recv, synthIdent(tree, st, synthLinkRelationName), 0, params, resultTy,
+      addNode(tree, Tag.Block, classSpan, 0, stmts),
+    ],
+  )
+  if (!trc.tc.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+// Per-`@manyToMany`-field words `rbManyToManyDescLit` needs: the field's own
+// name (the map key), the join table (its attribute argument), and both
+// join columns (`toSnakeCase(rawClassName) + "_id"`, this file's header) —
+// split out of `classtablerelation.bit`'s own `tableRelationSynthWords`
+// loop to stay inside LINT.md's max-complexity.
+fn tableManyToManyWords(tree: Tree, source: string, c: TableRelationClass): []string {
+  let out = []string(0)
+  let ownWord = identText(tree, source, c.tc.className)
+  for f of c.linkFields {
+    out = append(out, "\"" + identText(tree, source, f.nameNode) + "\"")
+    out = append(out, "\"" + f.joinTable + "\"")
+    let targetWord = identText(tree, source, kidsOf(tree, f.typeNode)[0])
+    out = append(out, "\"" + toSnakeCase(ownWord) + "_id\"")
+    out = append(out, "\"" + toSnakeCase(targetWord) + "_id\"")
+  }
+  return out
+}
