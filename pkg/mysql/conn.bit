@@ -1,13 +1,18 @@
 // pkg/mysql/conn.bit — the `std/sql.Conn` an authenticated session becomes.
 //
-// TWO PROTOCOLS, ONE RULE FOR CHOOSING. A statement with no parameters goes out
-// as COM_QUERY, one round trip, and its values come back in the TEXT format —
-// every non-NULL column is `Value.Text` whatever its column type. A statement
-// with parameters goes through COM_STMT_PREPARE/COM_STMT_EXECUTE (query.bit),
-// which binds the values server-side and answers in the BINARY format, so its
-// columns come back as the types they are. `query.bit`'s header argues the
-// trade; what matters here is that the choice is made from the rewritten
-// statement's placeholder count and nothing else.
+// TWO PROTOCOLS, ONE RULE FOR CHOOSING, ONE RULE FOR DECODING. A statement with
+// no parameters goes out as COM_QUERY, one round trip, and its values come back
+// as length-encoded TEXT on the wire. A statement with parameters goes through
+// COM_STMT_PREPARE/COM_STMT_EXECUTE (query.bit), which binds the values
+// server-side and answers in BINARY. Either way, the column-definition packet's
+// own type decides the `Value` variant a non-NULL column decodes to —
+// `decodeRow` below and `binaryRow` (binary.bit) share that rule through
+// `textValue`/`binaryValue`, the same `fixedWidth`/`blobKind`/DATETIME checks,
+// so a caller's `asInt`/`asFloat`/`sqlReqBool` sees the same type from an
+// integer or float column whichever protocol answered it. `query.bit`'s header
+// argues the round-trip trade; what matters here is that the choice of
+// PROTOCOL is made from the rewritten statement's placeholder count and
+// nothing else — the choice of VALUE TYPE never depends on it.
 //
 // NOTHING ON THIS PATH CONCATENATES A VALUE INTO SQL. `std/sql` hands over the
 // caller's text and the caller's values as two arguments and they stay two
@@ -92,8 +97,9 @@ class myConn {
     let count = readLenEnc(cursor{ s = head, at = 0 }) catch e {
       fail transportError(e.message())
     }
-    let out = myRows{ cols = this.columns(count)?, rows = [][]Value(0), at = 0 - 1 }
-    this.rows(out)?
+    let cols = this.columns(count)?
+    let out = myRows{ cols = columnNames(cols), rows = [][]Value(0), at = 0 - 1 }
+    this.rows(out, cols)?
     return out
   }
 
@@ -142,20 +148,20 @@ class myConn {
     }
   }
 
-  // `count` column definition packets, then the EOF that closes them. Only the
-  // column NAME is read; the type, length and flags belong to the typed-decoding
-  // ticket.
+  // `count` column definition packets, then the EOF that closes them, kept in
+  // full — `decodeRow` needs a column's wire type, not just its name, to
+  // decode a text-protocol row typed (`parseColumn`, binary.bit).
   //
   // Bounded by `count`, which the server declared.
-  columns(count: int): []string! {
-    let out = []string(0)
+  columns(count: int): []column! {
+    let out = []column(0)
     let i = 0
     while (i < count) {
-      let name = columnName(this.recv()?) catch e {
+      let col = parseColumn(this.recv()?) catch e {
         this.drainResponse(count - i - 1)
         fail e
       }
-      out = append(out, name)
+      out = append(out, col)
       i = i + 1
     }
     let eof = this.recv()?
@@ -169,7 +175,7 @@ class myConn {
   // Row packets until the closing EOF or OK.
   //
   // Bounded by `queryPacketBudget`.
-  rows(out: myRows): ()! {
+  rows(out: myRows, cols: []column): ()! {
     let seen = 0
     while (seen < queryPacketBudget) {
       seen = seen + 1
@@ -180,7 +186,7 @@ class myConn {
       if (isEof(p)) {
         return
       }
-      let row = decodeRow(p) catch e {
+      let row = decodeRow(p, cols) catch e {
         this.drainResponse(0)
         fail e
       }
@@ -278,19 +284,6 @@ fn isEof(payload: string): bool {
   return packetKind(payload) == 254 && len(payload) < 9
 }
 
-// A column definition: six length-encoded strings, of which the fifth is the
-// name the caller sees. The fixed-width tail after them is not read.
-fn columnName(payload: string): string! {
-  let c = cursor{ s = payload, at = 0 }
-  let i = 0
-  let name = ""
-  while (i < 5) {
-    name = lenEncString(c)?
-    i = i + 1
-  }
-  return name
-}
-
 // A length-encoded string: a length, then that many bytes.
 fn lenEncString(c: cursor): string! {
   let n = readLenEnc(c)?
@@ -302,19 +295,24 @@ fn lenEncString(c: cursor): string! {
 
 // A text-protocol row: one length-encoded string per column, with 0xFB meaning
 // SQL NULL — the distinction `Value.Null` exists to keep, and the one an empty
-// string would erase.
+// string would erase. A non-NULL column decodes through `textValue`
+// (binary.bit) by `cols[i]`'s own wire type, the same rule `binaryRow`
+// (binary.bit) uses for the binary protocol.
 //
-// Bounded: every iteration consumes at least one byte of the packet.
-fn decodeRow(payload: string): []Value! {
+// Bounded by `len(cols)`, which the server declared in the column-definition
+// packets this row's columns already matched.
+fn decodeRow(payload: string, cols: []column): []Value! {
   let c = cursor{ s = payload, at = 0 }
   let out = []Value(0)
-  while (c.rest() > 0) {
+  let i = 0
+  while (i < len(cols)) {
     let n = readLenEnc(c)?
     if (n < 0) {
       out = append(out, Value.Null)
-      continue
+    } else {
+      out = append(out, textValue(c.take(n)?, cols[i])?)
     }
-    out = append(out, Value.Text(c.take(n)?))
+    i = i + 1
   }
   return out
 }
