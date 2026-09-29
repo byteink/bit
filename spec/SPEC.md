@@ -1503,9 +1503,9 @@ columns, or to construct or serialize one row.
   are unaffected: `__values()` never has to represent an excluded field.
 - **All four are skipped together when the class declares `init`** - the same
   restriction `find<T>`'s own **E0152** places on a hand-mapped class,
-  reported here as **E0175** since there is no `find<T>` call site to name.
+  reported here as **E0179** since there is no `find<T>` call site to name.
 - A class already declaring `__tableName`, `__fromRow`, `__columns` or
-  `__values`, as a field or a method, is **E0174**, naming which.
+  `__values`, as a field or a method, is **E0178**, naming which.
 
 **`find<T>`/`findOne<T>`/`findOneOrFail<T>` - mapping a query result.**
 
