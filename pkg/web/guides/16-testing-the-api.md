@@ -161,11 +161,10 @@ already running on the machine. Wired that way, the suite skips cleanly on
 a machine with no Docker instead of failing - the same rule any live-service
 gate in this repo follows.
 
-Every test that touches the database calls `runMigrations(pool)` itself,
-first - a fresh `Pool` from `testPool()` knows nothing about the schema
-until something applies it, and doing that once per test (not once for the
-whole run) means one test's half-finished transaction can never leave the
-next one looking at tables in a state no test asked for.
+No test applies the schema itself: the `Gate{}` runs `bit migrate` once,
+against the same throwaway Postgres, before the suite starts - a fresh
+`Pool`/`Db` a test opens already sees every table, the same way a deployed
+Inkwell does after its own `bit migrate` step and nothing else at boot.
 
 The real thing runs, at [`inkwell/app.test.bit`](inkwell/app.test.bit): nine
 tests, one per behavior (health and readiness, register plus login plus

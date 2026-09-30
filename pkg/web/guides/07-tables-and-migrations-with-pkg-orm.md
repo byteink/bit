@@ -108,9 +108,8 @@ inkwell: applied 5 migration(s)
 
 Run it again and nothing pending is left - the report's `applied` list
 comes back empty, because `0001_create_users` is already in the ledger.
-(That transcript is from Inkwell's real registry below, all five
-migrations at once; a database with only `CreateUsers` registered reports
-one.)
+(That transcript is from the fuller registry below, all five migrations at
+once; a database with only `CreateUsers` registered reports one.)
 
 ## Grow the registry: articles, tags, comments, and the tags join table
 
@@ -206,7 +205,7 @@ export fn migrations(): []MigrationFile {
   ]
 }
 
-export fn runMigrations(db: Data): ()! {
+export fn applyMigrations(db: Data): ()! {
   migrate(db, postgresDialect(), migrations(), now())?
 }
 ```
@@ -219,8 +218,11 @@ across both foreign keys and an index on the target column; [Many-to-many
 relations](../../orm/docs/manytomany.md) covers exactly what DDL that
 produces.
 
-`runMigrations` is what `main.bit` calls once, at boot, before mounting any
-route. Running it against a fresh database prints:
+`applyMigrations` is the same call `bit migrate` makes for you once each
+migration lives in its own file under `migrations/` - Inkwell runs it that
+way, one file per step named `YYYY_MM_DD_HHMMSS_<name>.bit`, before the app
+ever starts, rather than reopening a second connection to apply its schema
+at boot. Running the registry above against a fresh database prints:
 
 ```text
 postgres: connected with sslmode=disable - credentials and query results cross the network in the clear.
@@ -260,10 +262,11 @@ ago.
 
 ## What we built
 
-`db.bit`'s migration registry: five migrations covering `users`,
-`articles`, `tags`, `comments` and the `article_tags` join table, and
-`runMigrations`, the function `main.bit` calls once at boot before mounting
-any route.
+A migration registry covering `users`, `articles`, `tags`, `comments` and
+the `article_tags` join table, and the `migrate` call that applies it.
+Inkwell keeps one migration per file under `migrations/` and runs `bit
+migrate` before the app starts, rather than calling `migrate` from its own
+code at boot.
 
 Specification: [Schema](../../orm/docs/schema.md), [Apply
 migrations](../../orm/docs/migrate.md), [Many-to-many
