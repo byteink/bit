@@ -47,6 +47,10 @@ export class Zone {
   export readonly name: string,
   readonly transitions: []Transition,
   readonly fallback: int,
+  // The TZif footer rule (RFC 8536 §3.3) governing every instant after the
+  // last transition: a slice of zero or one `TzRule` (Bit has no optional
+  // type), empty for UTC, fixed offsets and files with no footer (#6375).
+  readonly rule: []TzRule,
 }
 
 // The transition table of a zone that has none: UTC and every fixed
@@ -122,8 +126,8 @@ export fn zone(name: string): Zone! {
   let content = readFile(zoneInfoDir + name) catch _ {
     return zoneFromExtend(name)?
   }
-  let parsed = tzifParse([]byte(content)) catch _ {
-    fail newError("zone: malformed zone data for '${name}'")
+  let parsed = tzifParse([]byte(content)) catch e {
+    fail newError("zone: malformed zone data for '${name}': ${e.message()}")
   }
   return zoneFromData(name, parsed)
 }
@@ -136,8 +140,8 @@ fn zoneFromExtend(name: string): Zone! {
   let ext = tzExtendLookup(name) catch _ {
     fail newError("zone: unknown zone '${name}'")
   }
-  let parsed = tzifParse(ext) catch _ {
-    fail newError("zone: malformed zone data for '${name}'")
+  let parsed = tzifParse(ext) catch e {
+    fail newError("zone: malformed zone data for '${name}': ${e.message()}")
   }
   return zoneFromData(name, parsed)
 }
@@ -146,13 +150,13 @@ fn zoneFromExtend(name: string): Zone! {
 // the one place a `ZoneData` is flattened into a `Zone`, so the three
 // filesystem-fed constructors above and below cannot drift apart.
 fn zoneFromData(name: string, d: ZoneData): Zone {
-  return Zone{ name = name, transitions = d.transitions, fallback = d.fallback }
+  return Zone{ name = name, transitions = d.transitions, fallback = d.fallback, rule = d.rule }
 }
 
 // The UTC zone: no transitions, offset always 0. Never touches the
 // filesystem and never fails (docs/stdlib/time.md, "`utc()`").
 export fn utc(): Zone {
-  return Zone{ name = "UTC", transitions = zoneNoTransitions(), fallback = 0 }
+  return Zone{ name = "UTC", transitions = zoneNoTransitions(), fallback = 0, rule = zoneNoRule() }
 }
 
 // The host's own zone, read from /etc/localtime. Returns `utc()` on any
@@ -169,21 +173,41 @@ export fn localZone(): Zone {
   return zoneFromData("Local", parsed)
 }
 
-// Whether `z` has no transition table at all: UTC, every fixed `+HH:MM`
-// offset (./ldmlparse.bit's `ldmlpFixedZone`), and so every zone
-// `parseDateTime` builds. Both lookups below then answer `z.fallback` for
-// every argument, which is what lets ./zoned.bit's `zonedFromWall` skip
-// rebuilding a wall clock it was already handed (#5591). Module-internal,
-// like the lookups themselves.
+// Whether `z` has no transition table and no daylight saving rule: UTC,
+// every fixed `+HH:MM` offset (./ldmlparse.bit's `ldmlpFixedZone`), and so
+// every zone `parseDateTime` builds. Both lookups below then answer
+// `z.fallback` for every argument, which is what lets ./zoned.bit's
+// `zonedFromWall` skip rebuilding a wall clock it was already handed
+// (#5591). A footer rule with daylight saving makes a zone non-fixed even
+// with an empty table (#6375). Module-internal, like the lookups themselves.
 fn zoneIsFixed(z: Zone): bool {
-  return len(z.transitions) == 0
+  if (len(z.transitions) > 0) {
+    return false
+  }
+  return len(z.rule) == 0 || !z.rule[0].hasDst
+}
+
+// Whether the footer rule, not the table, governs `utcSeconds` (RFC 8536
+// §3.3: the footer is the rule "after the last transition time"): `z` has a
+// rule and `utcSeconds` is at or after its last transition, or it has no
+// transitions at all.
+fn zoneRuleApplies(z: Zone, utcSeconds: int): bool {
+  if (len(z.rule) == 0) {
+    return false
+  }
+  let n = len(z.transitions)
+  return n == 0 || utcSeconds >= z.transitions[n - 1].at
 }
 
 // The offset in effect in `z` at the UTC instant `utcSeconds` (seconds
-// since the Unix epoch): the offset of the last transition at or before
-// `utcSeconds`, or `z.fallback` before the first transition. Module-
-// internal; `DateTime` (#4075) is the public route.
+// since the Unix epoch): past the last transition the footer rule
+// (`zoneRuleApplies`; POSIX TZ, RFC 8536 §3.3), else the offset of the last
+// transition at or before `utcSeconds`, or `z.fallback` before the first
+// transition. Module-internal; `DateTime` (#4075) is the public route.
 fn zoneOffsetAt(z: Zone, utcSeconds: int): int {
+  if (zoneRuleApplies(z, utcSeconds)) {
+    return tzrOffsetAt(z.rule[0], utcSeconds)
+  }
   let transitions = z.transitions
   let n = len(transitions)
   let offset = z.fallback
@@ -196,13 +220,17 @@ fn zoneOffsetAt(z: Zone, utcSeconds: int): int {
 }
 
 // Whether daylight saving is in effect in `z` at the UTC instant
-// `utcSeconds`: the `isDst` flag of the last transition at or before
-// `utcSeconds`, or `false` before the first transition — `ZoneData` carries
-// no fallback DST flag (only a fallback offset), and a zone's state before
-// its earliest recorded transition is not daylight saving in any TZif file
-// this reader has parsed. Same scan as `zoneOffsetAt`, one field over;
-// `DateTime.isDst` (#4075) is the public route.
+// `utcSeconds`: past the last transition the footer rule, else the `isDst`
+// flag of the last transition at or before `utcSeconds`, or `false` before
+// the first transition — `ZoneData` carries no fallback DST flag (only a
+// fallback offset), and a zone's state before its earliest recorded
+// transition is not daylight saving in any TZif file this reader has
+// parsed. Same scan as `zoneOffsetAt`, one field over; `DateTime.isDst`
+// (#4075) is the public route.
 fn zoneIsDstAt(z: Zone, utcSeconds: int): bool {
+  if (zoneRuleApplies(z, utcSeconds)) {
+    return tzrIsDstAt(z.rule[0], utcSeconds)
+  }
   let transitions = z.transitions
   let n = len(transitions)
   let dst = false
@@ -214,46 +242,139 @@ fn zoneIsDstAt(z: Zone, utcSeconds: int): bool {
   return dst
 }
 
-// The offset to resolve the wall-clock reading `wallSeconds` (a naive local
-// time expressed as seconds since the Unix epoch, ignoring any zone) to an
-// instant. Total (docs/stdlib/time.md, "Daylight saving"): every wall
-// reading maps to exactly one offset.
-//
-// Segment `i` (for `i` in `0..len(transitions)` inclusive) is the span
-// between transition `i-1` and transition `i` — segment 0 runs from
-// `-infinity` to the first transition at `z.fallback`, the last
-// segment runs from the final transition to `+infinity`. Segment `i`'s
-// WALL range is its UTC range shifted by its own offset. Scanning segments
-// in chronological order and returning the first whose wall range contains
-// `wallSeconds` resolves an autumn overlap for free: the pre-transition
-// segment is always checked first, so its (larger, earlier-occurrence)
-// offset wins over the post-transition segment's. A spring gap falls
-// between two segments' wall ranges and matches neither; the offset of the
-// first segment whose wall range starts after `wallSeconds` — necessarily
-// the segment immediately following the gap — is remembered as the scan
-// passes it, and is what the gap case returns once the scan proves no
-// segment actually matched.
-fn zoneOffsetForWall(z: Zone, wallSeconds: int): int {
+// "No segment matched", below any wall reading this module can be asked about.
+const zoneWallNone: int = -4611686018427387904
+
+// The offset in effect in segment `i` of the table (see `zoneWallScan`).
+fn zoneSegmentOffset(z: Zone, i: int): int {
+  if (i == 0) {
+    return z.fallback
+  }
+  return z.transitions[i - 1].offset
+}
+
+// The wall-clock scan over the table's segments, `0..segs-1`. Segment `i`
+// (for `i` in `0..len(transitions)` inclusive) is the span between
+// transition `i-1` and transition `i` — segment 0 runs from `-infinity` to
+// the first transition at `z.fallback`, segment `len(transitions)` runs from
+// the final transition to `+infinity`. Its WALL range is its UTC range
+// shifted by its own offset. Returns the offset of the first segment whose
+// wall range contains `wallSeconds`, or `zoneWallNone`. Scanning in
+// chronological order resolves an autumn overlap for free: the pre-
+// transition segment is always checked first, so its (larger, earlier-
+// occurrence) offset wins over the post-transition segment's.
+fn zoneWallScan(z: Zone, wallSeconds: int, segs: int): int {
   let transitions = z.transitions
   let n = len(transitions)
-  let afterGap = z.fallback
-  let haveAfterGap = false
   let i = 0
-  while (i <= n) {
-    let offset = z.fallback
-    if (i > 0) {
-      offset = transitions[i - 1].offset
-    }
+  while (i < segs) {
+    let offset = zoneSegmentOffset(z, i)
     let startOk = i == 0 || wallSeconds >= transitions[i - 1].at + offset
     let endOk = i == n || wallSeconds < transitions[i].at + offset
     if (startOk && endOk) {
       return offset
     }
-    if (!startOk && !haveAfterGap) {
-      afterGap = offset
-      haveAfterGap = true
+    i = i + 1
+  }
+  return zoneWallNone
+}
+
+// The offset of the segment right after a spring-forward gap holding
+// `wallSeconds`: the first of segments `0..segs-1` whose wall range starts
+// after it, or `zoneWallNone` if there is none. Only meaningful once
+// `zoneWallScan` has found no segment containing the reading.
+fn zoneWallAfterGap(z: Zone, wallSeconds: int, segs: int): int {
+  let transitions = z.transitions
+  let i = 1
+  while (i < segs) {
+    let offset = zoneSegmentOffset(z, i)
+    if (wallSeconds < transitions[i - 1].at + offset) {
+      return offset
     }
     i = i + 1
   }
-  return afterGap
+  return zoneWallNone
+}
+
+// The footer-rule side of the wall-clock lookup: the offset `r` gives the
+// reading `wallSeconds` at an instant past the table, or `zoneWallNone`.
+// The rule has only two offsets, so there are two candidate instants,
+// `wallSeconds - off`; the LARGER offset is the earlier instant and is tried
+// first, which is the same "earlier occurrence wins" policy the table scan
+// applies to an autumn overlap.
+fn zoneRuleWall(z: Zone, wallSeconds: int): int {
+  let r = z.rule[0]
+  let big = r.stdOff
+  let small = r.stdOff
+  if (r.hasDst) {
+    big = r.dstOff
+    if (r.stdOff > r.dstOff) {
+      big = r.stdOff
+      small = r.dstOff
+    }
+  }
+  if (zoneRuleHolds(z, wallSeconds, big)) {
+    return big
+  }
+  if (zoneRuleHolds(z, wallSeconds, small)) {
+    return small
+  }
+  return zoneWallNone
+}
+
+// Whether the rule governs the instant `wallSeconds - off` and gives `off`
+// there: the wall reading really occurs at that offset.
+fn zoneRuleHolds(z: Zone, wallSeconds: int, off: int): bool {
+  let t = wallSeconds - off
+  return zoneRuleApplies(z, t) && tzrOffsetAt(z.rule[0], t) == off
+}
+
+// The offset to resolve the wall-clock reading `wallSeconds` (a naive local
+// time expressed as seconds since the Unix epoch, ignoring any zone) to an
+// instant. Total (docs/stdlib/time.md, "Daylight saving"): every wall
+// reading maps to exactly one offset.
+//
+// The table's segments are scanned first (`zoneWallScan`); with a footer
+// rule the last segment, which would run to `+infinity`, is the rule's
+// instead (`zoneRuleWall`), so gaps and overlaps after the last transition
+// resolve by the same policy as before it. A spring gap falls between two
+// segments' wall ranges and matches neither; the offset of the segment
+// immediately following the gap is what the gap case returns once nothing
+// matched — `zoneWallAfterGap` inside the table, and, past it, the larger of
+// the rule's two offsets (an offset only ever grows across a gap).
+fn zoneOffsetForWall(z: Zone, wallSeconds: int): int {
+  let withRule = len(z.rule) > 0
+  let segs = len(z.transitions) + 1
+  if (withRule) {
+    segs = len(z.transitions)
+  }
+  let hit = zoneWallScan(z, wallSeconds, segs)
+  if (hit != zoneWallNone) {
+    return hit
+  }
+  if (withRule) {
+    hit = zoneRuleWall(z, wallSeconds)
+    if (hit != zoneWallNone) {
+      return hit
+    }
+  }
+  let gap = zoneWallAfterGap(z, wallSeconds, segs)
+  if (gap != zoneWallNone) {
+    return gap
+  }
+  return zoneGapFallback(z)
+}
+
+// The offset a gap reading gets when no table segment follows it: the
+// rule's larger offset past the table, `z.fallback` for a table-only zone
+// (unreachable: its last segment has no end, so every reading matches).
+fn zoneGapFallback(z: Zone): int {
+  if (len(z.rule) == 0) {
+    return z.fallback
+  }
+  let r = z.rule[0]
+  if (r.hasDst && r.dstOff > r.stdOff) {
+    return r.dstOff
+  }
+  return r.stdOff
 }
