@@ -2,17 +2,21 @@
 // load themselves feature: `.claude/kb/data-packages-dx.md` "Relations load
 // themselves", `.claude/kb/orm-impl-plan-2026-09-30.md` Feature 3).
 //
-// SAME FUNCTION ONLY. This pass finds every read of a relation field
-// (`@hasMany`/`@hasOne`/`@belongsTo`) on a row that came from a
-// `Repo<T>`/`TxRepo<T>` query (`.all()`/`.find()`/`.first()`), tracked
-// through `let`, a trailing `?`, a `for-of` loop variable, indexing and
-// `.unwrap()` — but only within the ONE function the query call itself
-// appears in. Rows reaching a closure, a field, a map, a channel or another
-// function are simply not tracked here: R1 never reports a new error, so an
-// unprovable read keeps today's runtime panic (`classrelationattr.bit`'s
-// `relationUnloadedSentinel`) exactly as it does now. R2 (#TBD) extends this
-// across function boundaries; R3 turns an unprovable read the whole-program
-// version cannot resolve into a build error.
+// SAME FUNCTION ONLY, when a row never crosses a call. This pass finds every
+// read of a relation field (`@hasMany`/`@hasOne`/`@belongsTo`) on a row that
+// came from a `Repo<T>`/`TxRepo<T>` query (`.all()`/`.find()`/`.first()`),
+// tracked through `let`, a trailing `?`, a `for-of` loop variable, indexing
+// and `.unwrap()`. `compiler/relationautocalls.bit` (R2, #6305) extends the
+// SAME walk defined here across a function's own parameters and return
+// value, resolved to a whole-module fixed point over the call graph — see
+// that file's own header for the mechanism. Rows reaching a closure, a
+// field, a map, a channel, a DIFFERENT MODULE's function, or a generic
+// function are still not tracked (kept ready as dotted-path-friendly data
+// for #6318's nested reads, not implemented here): neither R1 nor R2 ever
+// reports a new error, so an unprovable read keeps today's runtime panic
+// (`classrelationattr.bit`'s `relationUnloadedSentinel`) exactly as it does
+// now. R3 turns an unprovable read the whole-program version cannot resolve
+// into a build error.
 //
 // OUTPUT: a side table on `Checker` (`relationAutoWith`, compiler/check.bit),
 // mapping a query CALL node to the relation names it needs — read by
@@ -52,13 +56,26 @@ class RelationAutoClass {
 }
 
 fn relationAutoClassOf(c: Checker, recvType: int): RelationAutoClass {
-  let none = RelationAutoClass{ found = false, oc = c, decl = 0 }
   let (argTy, ok) = relationAutoRepoTypeArg(c, recvType)
-  if (!ok || c.ctx.types[argTy].kind != TypeKind.Struct) {
+  if (!ok) {
+    return RelationAutoClass{ found = false, oc = c, decl = 0 }
+  }
+  return relationAutoClassFromStructType(c, argTy)
+}
+
+// The `@table` class a TYPE ID names, directly — no `Repo<T>` unwrap — for
+// anything else 0/`found=false`. Shared by `relationAutoClassOf` (a query's
+// row type, unwrapped from `Repo<T>`/`TxRepo<T>` first) and
+// `compiler/relationautocalls.bit`'s own parameter classification (a plain
+// declared parameter type, already unwrapped by its own slice check), so a
+// `@table` class is recognised by exactly one piece of code either way.
+fn relationAutoClassFromStructType(c: Checker, ty: int): RelationAutoClass {
+  let none = RelationAutoClass{ found = false, oc = c, decl = 0 }
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Struct) {
     return none
   }
-  let oc = typeOwner(c, argTy)
-  let decl = structDeclOf(c, argTy)
+  let oc = typeOwner(c, ty)
+  let decl = structDeclOf(c, ty)
   if (decl == 0 || !classHasTable(oc.tree, oc.source, decl)) {
     return none
   }
@@ -128,29 +145,55 @@ fn relationAutoSourceCall(c: Checker, callNode: int): RelationAutoSource {
 // `RelationBinding`: a read only counts past the binding's own source
 // position, so a `let`'s initializer expression is never mistaken for a
 // later read of itself.
+//
+// `queryCall`/`paramName` are mutually exclusive origins (R2, #6305): a
+// REAL query call node (`queryCall > 0`, `paramName == ""`) as R1 always
+// had, or the CURRENT function's own parameter of that name (`queryCall ==
+// 0`, `paramName != ""`) — synthesized by
+// `compiler/relationautocalls.bit`'s `relationAutoSeedParamBindings` before
+// a function's body is walked, with `afterOffset = -1` since a parameter is
+// in scope for the whole body. Every read this walk finds through a
+// parameter-origin binding is recorded against the PARAMETER's own name
+// (`relationAutoRecordRead`), not a call node — resolved back to whichever
+// real query reaches it only at that parameter's own call sites.
 class RelationAutoBinding {
   varName: string,
   cls: RelationAutoClass,
   queryCall: int,
+  paramName: string,
   isSlice: bool,
   afterOffset: int,
 }
 
+// `summaries` (R2): the current module's per-function call-graph summaries
+// (`compiler/relationautocalls.bit`'s `RelationAutoFuncSummaries`), read by
+// `relationAutoResolveCall`'s named-call branch and
+// `relationAutoCheckCallArgs` — one shared table per module, since a
+// module's functions can call each other, never mutated by this file
+// (`relationautocalls.bit`'s own round loop owns the write side).
+// `paramReads`/`returnSeen`/`returnCandidate` accumulate THIS ONE walk's own
+// function's parameter-read and return-source findings, merged into
+// `summaries` by the caller once the walk finishes.
 class RelationAutoState {
   bindings: []RelationAutoBinding,
+  summaries: RelationAutoFuncSummaries,
+  paramReads: map<string, []string>,
+  returnSeen: bool,
+  returnCandidate: RelationAutoFlow,
 }
 
 class RelationAutoFlow {
   found: bool,
   cls: RelationAutoClass,
   queryCall: int,
+  paramName: string,
   isSlice: bool,
 }
 
 fn relationAutoNoFlow(c: Checker): RelationAutoFlow {
   return RelationAutoFlow{
     found = false, cls = RelationAutoClass{ found = false, oc = c, decl = 0 }, queryCall = 0,
-    isSlice = false,
+    paramName = "", isSlice = false,
   }
 }
 
@@ -188,6 +231,7 @@ fn relationAutoLookupBinding(
         found = true,
         cls = b.cls,
         queryCall = b.queryCall,
+        paramName = b.paramName,
         isSlice = b.isSlice,
       }
     }
@@ -226,6 +270,7 @@ fn relationAutoResolve(c: Checker, node: int, st: RelationAutoState): RelationAu
         found = true,
         cls = inner.cls,
         queryCall = inner.queryCall,
+        paramName = inner.paramName,
         isSlice = false,
       }
     }
@@ -234,11 +279,18 @@ fn relationAutoResolve(c: Checker, node: int, st: RelationAutoState): RelationAu
   return relationAutoNoFlow(c)
 }
 
+// `n`'s own `Call` shape: a real query source, a `.unwrap()` on an
+// already-resolved row (both R1), or — R2, #6305 — a call to a NAMED,
+// non-generic, same-module free function whose own return value the call
+// graph has already resolved (`relationAutoResolveNamedCall`,
+// `compiler/relationautocalls.bit`).
 fn relationAutoResolveCall(c: Checker, n: int, st: RelationAutoState): RelationAutoFlow {
   let src = relationAutoSourceCall(c, n)
   if (src.found) {
     let mname = identText(c.tree, c.source, kidsOf(c.tree, kidsOf(c.tree, n)[0])[1])
-    return RelationAutoFlow{ found = true, cls = src.cls, queryCall = n, isSlice = mname == "all" }
+    return RelationAutoFlow{
+      found = true, cls = src.cls, queryCall = n, paramName = "", isSlice = mname == "all",
+    }
   }
   let callee = kidsOf(c.tree, n)[0]
   if (getNode(c.tree, callee).tag == Tag.Member) {
@@ -250,18 +302,48 @@ fn relationAutoResolveCall(c: Checker, n: int, st: RelationAutoState): RelationA
       }
     }
   }
+  if (getNode(c.tree, callee).tag == Tag.Ident) {
+    return relationAutoResolveNamedCall(c, n, callee, st)
+  }
   return relationAutoNoFlow(c)
 }
 
-fn relationAutoRecordRead(c: Checker, queryCall: int, fieldName: string) {
-  let (names, ok) = c.relationAutoWith[queryCall]
+// Records that `flow`'s own row(s) need `fieldName` loaded — either against
+// the REAL query call node that produced them (`flow.queryCall > 0`, R1's
+// original sink, read by `relationautosplice.bit`), or, when `flow` is
+// still only known relative to the CURRENT function's own parameter
+// (`flow.paramName != ""`, R2), against that parameter's own accumulating
+// summary in `st.paramReads` — resolved to a real query only once
+// `relationAutoCheckCallArgs` (compiler/relationautocalls.bit) sees a call
+// site that passes a concretely-sourced row into that parameter.
+fn relationAutoRecordRead(
+  c: Checker,
+  st: RelationAutoState,
+  flow: RelationAutoFlow,
+  fieldName: string,
+) {
+  if (flow.queryCall > 0) {
+    let (names, ok) = c.relationAutoWith[flow.queryCall]
+    if (!ok) {
+      names = []string(0)
+    }
+    if (!lintContainsString(names, fieldName)) {
+      names = append(names, fieldName)
+    }
+    c.relationAutoWith[flow.queryCall] = names
+    return
+  }
+  if (flow.paramName == "") {
+    return
+  }
+  let (names, ok) = st.paramReads[flow.paramName]
   if (!ok) {
     names = []string(0)
   }
   if (!lintContainsString(names, fieldName)) {
     names = append(names, fieldName)
   }
-  c.relationAutoWith[queryCall] = names
+  st.paramReads[flow.paramName] = names
 }
 
 // `node`'s own `Member` shape (`[recv, nameIdent]`): records a read when
@@ -283,7 +365,7 @@ fn relationAutoCheckMemberRead(c: Checker, node: int, st: RelationAutoState) {
   if (!lintFieldIsRelation(flow.cls.oc.tree, flow.cls.oc.source, flow.cls.decl, fieldName)) {
     return
   }
-  relationAutoRecordRead(c, flow.queryCall, fieldName)
+  relationAutoRecordRead(c, st, flow, fieldName)
 }
 
 // One `let`'s own bindings — `bindingKids = [pattern, type_or_none,
@@ -310,7 +392,8 @@ fn relationAutoWalkLet(c: Checker, node: int, st: RelationAutoState) {
       st.bindings,
       RelationAutoBinding{
         varName = identText(c.tree, c.source, pattern), cls = flow.cls, queryCall = flow.queryCall,
-        isSlice = flow.isSlice, afterOffset = getNode(c.tree, node).span.end,
+        paramName = flow.paramName, isSlice = flow.isSlice,
+        afterOffset = getNode(c.tree, node).span.end,
       },
     )
   }
@@ -330,7 +413,7 @@ fn relationAutoWalkForOf(c: Checker, node: int, st: RelationAutoState) {
       st.bindings,
       RelationAutoBinding{
         varName = identText(c.tree, c.source, k[0]), cls = flow.cls, queryCall = flow.queryCall,
-        isSlice = false, afterOffset = getNode(c.tree, k[0]).span.start,
+        paramName = flow.paramName, isSlice = false, afterOffset = getNode(c.tree, k[0]).span.start,
       },
     )
   }
@@ -352,10 +435,57 @@ fn relationAutoWalkBlock(c: Checker, node: int, st: RelationAutoState) {
   st.bindings = st.bindings[0:save]
 }
 
+// Merges one `return`'s resolved flow into this function's own single
+// return-source candidate (R2): the first `return` seen sets it, any LATER
+// `return` that disagrees (a different query/parameter, a different
+// slice-ness, or simply unresolved where the first was) collapses the
+// candidate to "not found" — a function whose returns disagree forwards
+// nothing, the same conservative "leave it to the runtime panic" choice R1
+// makes for every other unprovable shape. `relationAutoFinalizeReturn`
+// (compiler/relationautocalls.bit) reads the result once the whole body has
+// been walked.
+fn relationAutoFlowsAgree(a: RelationAutoFlow, b: RelationAutoFlow): bool {
+  if (a.found != b.found) {
+    return false
+  }
+  if (!a.found) {
+    return true
+  }
+  return a.queryCall == b.queryCall && a.paramName == b.paramName && a.isSlice == b.isSlice
+}
+
+fn relationAutoMergeReturn(c: Checker, st: RelationAutoState, flow: RelationAutoFlow) {
+  if (!st.returnSeen) {
+    st.returnSeen = true
+    st.returnCandidate = flow
+    return
+  }
+  if (!relationAutoFlowsAgree(st.returnCandidate, flow)) {
+    st.returnCandidate = relationAutoNoFlow(c)
+  }
+}
+
+// `ReturnStmt`'s own kids (parserstmt.bit's `parseReturn`) are its returned
+// expressions, grouped-return included; only the single-value shape this
+// pass's flow tracking can reason about at all (`len(kids) == 1`) ever
+// contributes a real candidate — a bare `return` or a grouped return merges
+// as "not found", same as any other unresolved shape.
+fn relationAutoWalkReturn(c: Checker, node: int, st: RelationAutoState) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) != 1) {
+    relationAutoMergeReturn(c, st, relationAutoNoFlow(c))
+    return
+  }
+  relationAutoMergeReturn(c, st, relationAutoResolve(c, kids[0], st))
+}
+
 // The generic recursive walk: a nested `FuncDecl`/`ArrowFn` is its own
 // scope (`lintIsNestedFuncBoundary`, compiler/lintrelation.bit) — never
-// descended into from here, since `relationAutoAnalyzeModule` below already
-// visits it as its own separate entry with its own fresh `RelationAutoState`.
+// descended into from here, since `relationautocalls.bit`'s round loop
+// already visits it as its own separate entry with its own fresh
+// `RelationAutoState`. `Tag.Call`'s own check (R2) never short-circuits the
+// child walk below it: an argument expression can itself contain a member
+// read (`show(post.author)`) that still needs recording on its own account.
 fn relationAutoWalk(c: Checker, node: int, st: RelationAutoState) {
   if (node == 0) {
     return
@@ -379,21 +509,14 @@ fn relationAutoWalk(c: Checker, node: int, st: RelationAutoState) {
   if (tag == Tag.Member) {
     relationAutoCheckMemberRead(c, node, st)
   }
+  if (tag == Tag.Call) {
+    relationAutoCheckCallArgs(c, node, st)
+  }
+  if (tag == Tag.ReturnStmt) {
+    relationAutoWalkReturn(c, node, st)
+  }
   for k of kidsOf(c.tree, node) {
     relationAutoWalk(c, k, st)
-  }
-}
-
-// Every `FuncDecl`/`ArrowFn` in the module, each its own independent
-// same-function scope — `lintCollectFuncs` (compiler/lintapply.bit) already
-// gives every one, nested closures included as their own entries, and
-// `lintFuncInfo` gives each one's own body node, so this file redeclares
-// neither.
-fn relationAutoAnalyzeModule(c: Checker) {
-  let fds = lintCollectFuncs(c.tree, c.tree.root, []int(0))
-  for fd of fds {
-    let st = RelationAutoState{ bindings = []RelationAutoBinding(0) }
-    relationAutoWalk(c, lintFuncInfo(c.tree, fd).body, st)
   }
 }
 
@@ -401,9 +524,12 @@ fn relationAutoAnalyzeModule(c: Checker) {
 // every module's `nodeTypes` is populated — a query's receiver type and a
 // relation field's own attribute are both needed before any read can be
 // judged, and both are only available after the ordinary per-module check
-// loop has finished.
+// loop has finished. Delegates to `compiler/relationautocalls.bit`'s
+// per-module fixed point (R2, #6305), which subsumes R1's original
+// single-pass-per-function walk (a function with no trackable parameters
+// and no calls into the call graph behaves identically to it).
 fn relationAutoAnalyzeProject(mods: []Checker) {
   for c of mods {
-    relationAutoAnalyzeModule(c)
+    relationAutoAnalyzeModuleWithCalls(c)
   }
 }
