@@ -15,7 +15,11 @@
 // returning, and three schedulers (three Queues, three pools, one
 // PostgresLocker each) enqueue every tick of one schedule exactly once
 // while a stall they all suffer is caught up once between them. The
-// schedulers read a hand-moved clock, so the proof takes seconds. Prints `LIVE_PROOF_OK` and exits 0 only if every check passed.
+// schedulers read a hand-moved clock, so the proof takes seconds. It also proves that
+// a whole fleet down across five ticks is caught up by each `Missed` policy
+// when a NEW queue starts on the same database, and that the lease rows per
+// schedule stay bounded. Prints `LIVE_PROOF_OK` and exits 0 only if every
+// check passed.
 
 import { args } from "std/os"
 import { pool, Pool, Datasource, Value, asInt } from "std/sql"
@@ -240,6 +244,85 @@ fn proveScheduledOnce(uri: string) {
   }
 }
 
+const downtimeKeep: int = 3
+
+// A queue on its own pool with a cron schedule every minute, over a locker
+// that keeps only `downtimeKeep` lease rows per schedule.
+fn cronQueue(uri: string, clock: handClock, id: string, missed: Missed): Queue {
+  let db = requirePool(uri)
+  let q = open(
+    newPostgresStore(db),
+    Options{
+      workers = 1, pollInterval = 10 * Millisecond,
+      locker = newPostgresLocker(db, keep = downtimeKeep), clock = clock, instanceId = id,
+    },
+  ) catch e {
+    panic("open: ${e.message()}")
+  }
+  q.schedule("* * * * *", LiveTickJob{ tag = "cron" }, missed = missed) catch e {
+    panic("schedule: ${e.message()}")
+  }
+  return q
+}
+
+fn leaseRows(db: Pool): int {
+  let rows = db.query("SELECT count(*) FROM bit_schedule_leases", []Value(0)) catch e {
+    panic("lease count: ${e.message()}")
+  }
+  let has = rows.next() catch e {
+    panic("lease count next: ${e.message()}")
+  }
+  if (!has) {
+    panic("lease count: no row")
+  }
+  let n = asInt(rows.value(0)) catch e {
+    panic("lease count value: ${e.message()}")
+  }
+  rows.close()
+  return n
+}
+
+fn resetTicks(db: Pool) {
+  db.exec("DELETE FROM bit_jobs WHERE name = 'live-tick'", []Value(0)) catch e {
+    panic("reset jobs: ${e.message()}")
+  }
+  db.exec("DELETE FROM bit_schedule_leases", []Value(0)) catch e {
+    panic("reset leases: ${e.message()}")
+  }
+}
+
+// One tick fires, the queue stops, the clock moves five ticks, and a NEW
+// queue starts on the same database: it must enqueue `want` catch-up jobs.
+fn proveDowntime(uri: string, missed: Missed, want: int, label: string) {
+  let db = requirePool(uri)
+  resetTicks(db)
+  let clock = handClock{ ns = newAtomicI64(i64(now().ns)) }
+  let first = cronQueue(uri, clock, "down-a", missed)
+  first.start()
+  clock.advance(Minute)
+  expectTickRows(db, 1, "${label}: the on-time tick")
+  first.stop()
+  clock.advance(5 * Minute)
+  let second = cronQueue(uri, clock, "down-b", missed)
+  second.start()
+  expectTickRows(db, 1 + want, "${label}: catch-up after downtime")
+  second.stop()
+  let rows = leaseRows(db)
+  if (rows > downtimeKeep) {
+    panic("LIVE PROOF FAILED: ${label}: ${rows} lease rows, expected at most ${downtimeKeep}")
+  }
+}
+
+fn proveDowntimeCatchUp(uri: string) {
+  proveDowntime(uri, Missed.RunOnce, 1, "RunOnce")
+  proveDowntime(uri, Missed.Skip, 0, "Skip")
+  proveDowntime(uri, Missed.RunAll(3), 3, "RunAll(3)")
+  let rows = leaseRows(requirePool(uri))
+  if (rows != downtimeKeep) {
+    panic("LIVE PROOF FAILED: RunAll(3): expected exactly ${downtimeKeep} lease rows kept, got ${rows}")
+  }
+}
+
 fn requirePool(uri: string): Pool {
   return pool(adapter(), Datasource{ uri = uri }) catch e {
     panic("pool(${uri}): ${e.message()}")
@@ -252,5 +335,6 @@ fn main() {
   proveCrashReclaim(requireStore(uri))
   proveGracefulDrain(requireStore(uri))
   proveScheduledOnce(uri)
+  proveDowntimeCatchUp(uri)
   print("LIVE_PROOF_OK")
 }

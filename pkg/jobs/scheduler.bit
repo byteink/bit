@@ -14,11 +14,12 @@
 // names the tick itself. With no `Locker` (a single instance) every tick
 // is ours.
 //
-// NO PERSISTED LAST-TICK. A process that restarts begins each schedule at
-// the first tick after "now", so the downtime the `Missed` policy covers is
-// THIS scheduler's own: a stalled loop, a paused process, a clock jump. A
-// fleet that was down as a whole across a tick does not replay it, because
-// nothing durable says the tick was never enqueued.
+// LAST TICK COMES BACK FROM THE LOCKER. A process that starts asks its
+// `Locker` for the newest tick of each schedule (`syncEntry`) and begins at
+// the first tick after it, so the ticks that came due while the whole fleet
+// was down are handled by the same `Missed` policy as a stalled loop. With
+// no `Locker` nothing durable exists: a schedule then starts at the first
+// tick after "now" and `Missed` covers only this scheduler's own stalls.
 //
 // NO BUSY-WAIT: the loop sleeps until the earliest due tick, at most one
 // `pollInterval` at a time so `stop()` is never delayed longer than that.
@@ -28,7 +29,8 @@ import { now, sleep, Hour } from "std/time"
 
 // How long a per-tick lease outlives the moment it was taken. Only needs to
 // exceed the skew between the fleet's clocks and the time an instance takes
-// to enqueue; an hour keeps the lease table small and is far beyond both.
+// to enqueue; an hour is far beyond both. Expiry only lets another holder
+// take the key over: it does not delete the row (`Locker.lastTick`).
 const scheduleLeaseTtl: int = Hour
 
 // The time source the scheduler reads and sleeps on. The default is the
@@ -59,12 +61,14 @@ class entry {
   missed: Missed,
   next: int,
   fire: (int) => ()!,
+  // True once `next` has been reconciled with the Locker's last tick.
+  synced: bool,
 }
 
 // A schedule whose first tick is the first one strictly after "now".
 fn newEntry(id: string, trig: trigger, missed: Missed, fire: (int) => ()!, clock: Clock): entry! {
   let first = trig.nextAfterNs(clock.nowNs())?
-  return entry{ id = id, trig = trig, missed = missed, next = first, fire = fire }
+  return entry{ id = id, trig = trig, missed = missed, next = first, fire = fire, synced = false }
 }
 
 // Registers `e`, refusing a duplicate: two identical schedules share one
@@ -122,6 +126,23 @@ fn fireTick(q: Queue, e: entry, tick: int, nowNs: int): ()! {
   e.fire(tick)?
 }
 
+// Moves `e.next` to the first tick after the newest one the fleet has
+// already enqueued, once per process. Ticks between that and "now" are then
+// due like any stall's. A failure leaves `synced` false, so the next pass
+// retries before `e` fires anything on a stale `next`.
+fn syncEntry(q: Queue, e: entry): ()! {
+  if (e.synced) {
+    return
+  }
+  if (q.locker != nil) {
+    let last = q.locker.lastTick(e.id)?
+    if (last > 0) {
+      e.next = e.trig.nextAfterNs(last)?
+    }
+  }
+  e.synced = true
+}
+
 // Handles every tick of `e` due at `nowNs`. `e.next` advances tick by tick
 // as each is handled, so a failure part-way leaves `e.next` at the first
 // tick not yet handled and the retry cannot re-enqueue one that already ran.
@@ -136,16 +157,21 @@ fn handleDue(q: Queue, e: entry, nowNs: int): ()! {
   e.next = next
 }
 
+fn runEntry(q: Queue, e: entry, nowNs: int): ()! {
+  syncEntry(q, e)?
+  if (e.next <= nowNs) {
+    handleDue(q, e, nowNs)?
+  }
+}
+
 // One pass over every schedule at `nowNs`; returns the earliest tick still
 // pending (0 when there are no schedules). A failing schedule is logged
 // and retried on the next pass, never allowed to stop the others.
 fn runDue(q: Queue, nowNs: int): int {
   let wake = 0
   for e of q.entries {
-    if (e.next <= nowNs) {
-      handleDue(q, e, nowNs) catch err {
-        eprint("jobs: schedule '${e.id}' failed: ${err.message()}\n")
-      }
+    runEntry(q, e, nowNs) catch err {
+      eprint("jobs: schedule '${e.id}' failed: ${err.message()}\n")
     }
     if (wake == 0 || e.next < wake) {
       wake = e.next

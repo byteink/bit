@@ -7,6 +7,7 @@
 
 import { newMutex, Mutex, newAtomicI64, AtomicI64 } from "std/sync"
 import { sleep, Minute, Millisecond } from "std/time"
+import { lastIndexOf, parseInt } from "std/strings"
 
 @job("test-tick") @json class TickJob {
   tag: string,
@@ -33,10 +34,14 @@ fn newFakeClock(startNs: int): fakeClock {
 }
 
 // An in-memory Locker with the same contract as PostgresLocker: a key is
-// held until its expiry, and the holder itself always re-acquires.
+// held until its expiry, the holder itself always re-acquires, and the
+// newest tick won per schedule is remembered for `lastTick`. `lastFails`
+// makes `lastTick` fail, a database that is down at start.
 class fakeLocker {
   holder: map<string, string>
   expires: map<string, int>
+  newest: map<string, int>
+  lastFails: bool
   mu: Mutex
 
   tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
@@ -49,12 +54,40 @@ class fakeLocker {
     }
     this.holder[key] = holder
     this.expires[key] = expiresAt
+    this.remember(key)?
     return true
+  }
+
+  // Records the tick of a `<schedule id>@<tick>` key when it is the newest.
+  remember(key: string): ()! {
+    let at = lastIndexOf(key, "@")
+    let tick = parseInt(key[at + 1:len(key)])?
+    let id = key[0:at]
+    let (best, _) = this.newest[id]
+    if (tick > best) {
+      this.newest[id] = tick
+    }
+  }
+
+  lastTick(key: string): int! {
+    if (this.lastFails) {
+      fail newError("database down")
+    }
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (best, _) = this.newest[key]
+    return best
   }
 }
 
 fn newFakeLocker(): fakeLocker {
-  return fakeLocker{ holder = map<string, string>(), expires = map<string, int>(), mu = newMutex() }
+  return fakeLocker{
+    holder = map<string, string>(),
+    expires = map<string, int>(),
+    newest = map<string, int>(),
+    lastFails = false,
+    mu = newMutex(),
+  }
 }
 
 fn queueOn(store: fakeStore, clock: fakeClock, locker: Locker, id: string): Queue {
@@ -204,4 +237,69 @@ test "start() runs the scheduler loop and stop() ends it" {
     dueCount(store) == 1,
     "the loop must enqueue the tick exactly once, got ${dueCount(store)}",
   )
+}
+
+// The fleet fires one tick, goes down for five more, and a brand new
+// instance (a new Queue, the same store and locker) starts: what it enqueues
+// is what `missed` says about those five ticks.
+fn enqueuedAfterDowntime(policy: Missed, locker: Locker): int {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let before = queueOn(store, clock, locker, "before")
+  mustEvery(before, policy)
+  clock.advance(Minute)
+  runDue(before, clock.nowNs())
+  assert(dueCount(store) == 1, "the on-time tick must fire, got ${dueCount(store)}")
+  clock.advance(5 * Minute)
+  let after = queueOn(store, clock, locker, "after")
+  mustEvery(after, policy)
+  runDue(after, clock.nowNs())
+  return dueCount(store) - 1
+}
+
+test "a restart after downtime catches up by policy: Skip 0, RunOnce 1, RunAll(3) 3" {
+  let want = [0, 1, 3]
+  let policies = [Missed.Skip, Missed.RunOnce, Missed.RunAll(3)]
+  let i = 0
+  while (i < 3) {
+    let got = enqueuedAfterDowntime(policies[i], newFakeLocker())
+    assert(got == want[i], "policy ${i}: want ${want[i]} catch-up enqueues, got ${got}")
+    i = i + 1
+  }
+}
+
+test "without a locker a restart starts at the next tick and catches nothing up" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let q = queueOn(store, clock, nil, "a")
+  mustEvery(q, Missed.RunAll(10))
+  clock.advance(5 * Minute)
+  let restarted = queueOn(store, clock, nil, "b")
+  mustEvery(restarted, Missed.RunAll(10))
+  runDue(restarted, clock.nowNs())
+  assert(dueCount(store) == 0, "want 0 enqueues, got ${dueCount(store)}")
+}
+
+test "a schedule that never fired starts at the next tick, not in the past" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let q = queueOn(store, clock, newFakeLocker(), "a")
+  mustEvery(q, Missed.RunAll(10))
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 0, "want 0 enqueues before the first tick, got ${dueCount(store)}")
+}
+
+test "a failing lastTick holds the schedule back until it succeeds" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let locker = newFakeLocker()
+  let q = queueOn(store, clock, locker, "a")
+  mustEvery(q, Missed.RunOnce)
+  locker.lastFails = true
+  clock.advance(Minute)
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 0, "a schedule that cannot read its last tick fired ${dueCount(store)}")
+  locker.lastFails = false
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 1, "want 1 enqueue once lastTick works, got ${dueCount(store)}")
 }
