@@ -266,6 +266,53 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo "FAIL: a changed existing function beside an inserted one was wrongly explained (sig='$s65c')"; fail=1
   fi
 
+  # #6363-generic-ctor-type-args (types) and -oracle-declines (ir), both
+  # declared only for the two run_generic_class_init_* corpus files.
+  f63="_tests_/cases/run_generic_class_init_written_args.bit"
+  o63=$(printf '63:7: p: Pair\n63:11: Pair<i64, string>(7, "s"): Pair\n64:3: print(p.a): void\n')
+  b63=$(printf '63:7: p: Pair<i64, string>\n63:11: Pair<i64, string>(7, "s"): Pair<i64, string>\n64:3: print(p.a): void\n')
+  s63=$(explainMismatch "$o63" "$b63" types "$f63")
+  if [ "$s63" != "6363-generic-ctor-type-args" ]; then
+    echo "FAIL: the #6363 template-to-instantiation type shape was not explained (sig='$s63')"; fail=1
+  fi
+  s63o=$(explainMismatch "$o63" "$b63" types "_tests_/cases/some_other_file.bit")
+  if [ -n "$s63o" ]; then
+    echo "FAIL: the #6363 type shape was explained for a file it is not declared for (sig='$s63o')"; fail=1
+  fi
+  b63r=$(printf '63:7: p: Pair<i64, string>\n63:11: Pair<i64, string>(7, "s"): Pair<i64, string>\n64:3: print(p.a): i64\n')
+  s63r=$(explainMismatch "$o63" "$b63r" types "$f63")
+  if [ -n "$s63r" ]; then
+    echo "FAIL: a #6363-shaped diff with another type change was wrongly explained (sig='$s63r')"; fail=1
+  fi
+  b63n=$(printf '63:7: p: Other<i64, string>\n63:11: Pair<i64, string>(7, "s"): Pair<i64, string>\n64:3: print(p.a): void\n')
+  s63n=$(explainMismatch "$o63" "$b63n" types "$f63")
+  if [ -n "$s63n" ]; then
+    echo "FAIL: a template typed as a different class was wrongly explained as #6363 (sig='$s63n')"; fail=1
+  fi
+  b63t=$(printf '63:7: s: Pair<string, i64>\n63:11: mk(): Checked<string>!Bad\n')
+  s63t=$(explainMismatch "$(printf '63:7: s: Pair<B, A>\n63:11: mk(): Checked!Bad\n')" "$b63t" types "$f63")
+  if [ "$s63t" != "6363-generic-ctor-type-args" ]; then
+    echo "FAIL: the #6363 template-parameter and fallible shapes were not explained (sig='$s63t')"; fail=1
+  fi
+  s63e=$(explainMismatch "$(printf '63:11: mk(): Checked!Bad\n')" "$(printf '63:11: mk(): Checked<string>!Other\n')" types "$f63")
+  if [ -n "$s63e" ]; then
+    echo "FAIL: a #6363-shaped type with a changed error type was wrongly explained (sig='$s63e')"; fail=1
+  fi
+  o63i=$(printf 'func init$t93(%%0: Pair, %%1: i64) void {\n  ret\n}\n')
+  b63i=$(printf 'func main$fallible() void {\n  ret\n}\n\nfunc init$t108(%%0: Pair, %%1: i64) void {\n  ret\n}\n')
+  s63i=$(explainMismatch "$o63i" "$b63i" ir "$f63")
+  if [ "$s63i" != "6363-generic-ctor-oracle-declines" ]; then
+    echo "FAIL: the #6363 oracle-declines shape (renumbered instantiation) was not explained (sig='$s63i')"; fail=1
+  fi
+  s63m=$(explainMismatch "$(printf 'func init$t93(%%0: Pair, %%1: bool) void {\n  ret\n}\n')" "$b63i" ir "$f63")
+  if [ -n "$s63m" ]; then
+    echo "FAIL: an oracle instantiation missing from the tree was wrongly explained as #6363 (sig='$s63m')"; fail=1
+  fi
+  s63x=$(explainMismatch "$o63i" "$b63i" ir "_tests_/cases/some_other_file.bit")
+  if [ -n "$s63x" ]; then
+    echo "FAIL: the #6363 oracle-declines shape was explained for a file it is not declared for (sig='$s63x')"; fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever

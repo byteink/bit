@@ -475,6 +475,58 @@ explainMismatch() {
       }
       return hit
     }
+    # lastTypeColon -- index of the last ": " in a types-dump line, the one
+    # separating the expression from its type (a type never contains ": ").
+    function lastTypeColon(s,    i, p) {
+      p = 0
+      for (i = 1; i < length(s); i++) { if (substr(s, i, 2) == ": ") { p = i } }
+      return p
+    }
+    # genericCtorTypeArgs (#6363/#6364) -- constructing a generic class: the
+    # 0.33.0 oracle types the call as the bare template (`: Pair`), the tree
+    # as its instantiation (`: Pair<i64, string>`). Same line count; each
+    # differing pair has the same expression text and a type that is the
+    # oracle name followed by a type-argument list. Declared per corpus file.
+    function genericCtorTypeArgs(nA, linesA, nB, linesB,    i, pa, pb, ta, tb, ea, eb, hit) {
+      if (nA != nB) { return 0 }
+      hit = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        pa = lastTypeColon(linesA[i]); pb = lastTypeColon(linesB[i])
+        if (pa == 0 || pa != pb) { return 0 }
+        if (substr(linesA[i], 1, pa) != substr(linesB[i], 1, pb)) { return 0 }
+        ta = substr(linesA[i], pa + 2); tb = substr(linesB[i], pb + 2)
+        ea = ""; eb = ""
+        if (match(ta, /![A-Za-z_][A-Za-z0-9_]*$/)) { ea = substr(ta, RSTART); ta = substr(ta, 1, RSTART - 1) }
+        if (match(tb, /![A-Za-z_][A-Za-z0-9_]*$/)) { eb = substr(tb, RSTART); tb = substr(tb, 1, RSTART - 1) }
+        if (ea != eb) { return 0 }
+        # A method result the oracle left in the own parameters of the template
+        # (`Pair<B, A>`) is the same lag as a bare template name.
+        if (ta ~ /^[A-Za-z_][A-Za-z0-9_]*<[A-Z](, [A-Z])*>$/) { sub(/<.*$/, "", ta) }
+        if (ta !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { return 0 }
+        if (index(tb, ta "<") != 1 || tb !~ />$/) { return 0 }
+        hit = 1
+      }
+      return hit
+    }
+    # funcHeadersKeptModIds (#6363/#6364) -- funcHeadersKept with every
+    # instantiation id (`$t<n>`, or `$c<n>` once canonicalized) erased, as a
+    # multiset: the oracle types the construction as the template, so it
+    # emits fewer instantiations and numbers them differently.
+    function funcHeadersKeptModIds(nA, linesA, nB, linesB,    i, h, have, na, nb) {
+      na = 0; nb = 0
+      for (i = 1; i <= nB; i++) {
+        if (linesB[i] !~ /^func /) { continue }
+        h = linesB[i]; gsub(/\$[tc][0-9]+/, "$t", h); have[h]++; nb++
+      }
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] !~ /^func /) { continue }
+        h = linesA[i]; gsub(/\$[tc][0-9]+/, "$t", h)
+        if (have[h] < 1) { return 0 }
+        have[h]--; na++
+      }
+      return (na > 0 && nb > na) ? 1 : 0
+    }
     # pureFuncInsert (#6265) -- the oracle miscompiles a generic reached only
     # through a closure by dropping its instantiations; the tree emits them.
     # Every oracle line appears in the tree in order, and every tree-only
@@ -533,6 +585,9 @@ explainMismatch() {
         if (selfRebound(nA, linesA, nB, linesB)) {
           print "6265-closure-bound-static-self"; exit 0
         }
+        if (file ~ /run_generic_class_init_(written_args|inferred)[.]bit$/ && genericCtorTypeArgs(nA, linesA, nB, linesB)) {
+          print "6363-generic-ctor-type-args"; exit 0
+        }
         exit 1
       }
       if (kind == "tokens") {
@@ -560,6 +615,11 @@ explainMismatch() {
         if (file ~ /run_closure_multival_return_generic_call[.]bit$/ && funcHeadersKept(nA, linesA, nB, linesB)) {
           print "6045-closure-tuple-oracle-declines"; exit 0
         }
+        # #6363/#6364: the oracle cannot lower a generic class constructed
+        # through its instantiation and emits only the functions before it.
+        if (file ~ /run_generic_class_init_(written_args|inferred)[.]bit$/ && funcHeadersKeptModIds(nA, linesA, nB, linesB)) {
+          print "6363-generic-ctor-oracle-declines"; exit 0
+        }
       }
       exit 1
     }
@@ -584,11 +644,11 @@ declaredSignatureNames() {
   case "$kind" in
     ast) return ;;
     fmt) return ;;
-    ir) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines"; return ;;
-    iropt) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines"; return ;;
-    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6265-closure-bound-static-self"; return ;;
+    ir) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines" "6363-generic-ctor-oracle-declines"; return ;;
+    iropt) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines" "6363-generic-ctor-oracle-declines"; return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6265-closure-bound-static-self" "6363-generic-ctor-type-args"; return ;;
     diags) printf '%s\n' "6254-collection-attr-presyntax" "6264-from-contextual-diags"; return ;;
     tokens) printf '%s\n' "6264-from-contextual-token"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr" "6265-closure-bound-static-self" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr" "6265-closure-bound-static-self" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines" "6363-generic-ctor-type-args" "6363-generic-ctor-oracle-declines"
 }
