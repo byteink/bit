@@ -59,7 +59,7 @@ fn migrations(): []Migration {
       checksum = "a1b2c3",
       apply = () => [
         alter("widgets", (t) => {
-          t.addString("phone", 255)
+          t.string("phone", 255)
         }),
       ],
       revert = () => [

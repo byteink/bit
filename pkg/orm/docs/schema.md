@@ -15,20 +15,22 @@ import { table } from "orm"
 
 fn peopleTable() {
   let op = table("people", (t) => {
-    t.id("id")
+    t.id()
     t.string("name", 100)
   })
 }
 ```
 
-`t.id("id")` is an auto-incrementing primary key; the exact mechanism
-(`BIGSERIAL`, `IDENTITY`, `AUTO_INCREMENT`) is a dialect's to pick, not
-this package's. `op` is a `SchemaOp` - read it back with `match`:
+`t.id()` is an auto-incrementing primary key, defaulting its own column
+name to `"id"` (`t.id("id")` names it explicitly, the same column either
+way) - the exact mechanism (`BIGSERIAL`, `IDENTITY`, `AUTO_INCREMENT`) is
+a dialect's to pick, not this package's. `op` is a `SchemaOp` - read it
+back with `match`:
 
 ```bit
 fn describe() {
   let op = table("people", (t) => {
-    t.id("id")
+    t.id()
     t.string("name", 100)
   })
   match (op) {
@@ -46,22 +48,28 @@ reading to produce DDL.
 
 `t.string(name, length)` returns the `Column` it just added, so a call
 chained onto it - `.unique()`, `.nullable()` - mutates that same column,
-not a copy:
+not a copy. `length` defaults to 255, so `t.string("email")` and
+`t.string("email", 255)` declare the identical column:
 
 ```bit
 import { ReferentialAction } from "orm"
 
 fn peopleWithConstraints() {
   table("people", (t) => {
-    t.id("id")
-    t.string("email", 255).unique()
+    t.id()
+    t.string("email").unique()
     t.decimal("salary").nullable()
     t.timestamp("joined_at").nullable()
+    t.timestamps()
     t.index("joined_at")
     t.foreign("team_id").references("teams", "id").onDelete(ReferentialAction.Cascade)
   })
 }
 ```
+
+`t.timestamps()` above adds `created_at` and `updated_at` in one call,
+both nullable - Laravel's own `$table->timestamps()` shape; `joined_at`
+stays a separate, explicitly-named column since it means something else.
 
 `t.index` is variadic - `t.index("teamId", "joinedAt")` is one composite
 index, not two calls. `ReferentialAction` (`Cascade`, `Restrict`,
@@ -83,15 +91,16 @@ more digits than that after the decimal point, which is exactly the kind
 of silent money error a `decimal` type exists to rule out; unconstrained
 `numeric` is the only mapping that cannot truncate a legal value.
 
-`AlterTable` carries the same column: adding `salary` to a table that
-already exists is `addDecimal`, chainable like every other `addX`:
+`AlterTable` carries the same column, under the same name `Table` uses -
+adding `salary` to a table that already exists is `decimal`, one method
+per concept (#6304), chainable like every other column method:
 
 ```bit
 import { alter } from "orm"
 
 fn addSalaryToPeople() {
   alter("people", (t) => {
-    t.addDecimal("salary").nullable()
+    t.decimal("salary").nullable()
   })
 }
 ```
@@ -126,7 +135,7 @@ uses above.
 ```bit
 fn evolvePeople() {
   alter("people", (t) => {
-    t.addString("phone", 20).nullable()
+    t.string("phone", 20).nullable()
     t.dropColumn("legacy_flag")
     t.renameColumn("email", "email_address")
   })
@@ -200,18 +209,6 @@ the same reason Laravel keeps `DB::statement` around. `raw` never parses
 its argument; the tree carries it exactly as written.
 
 ## Sharp edges
-
-**`string`/`addString` always take a length**, with no default -
-`t.addString("phone")` does not compile:
-
-```
-error[E0050]: expected 2 argument(s), found 1
-```
-
-A defaulted trailing parameter (`length: int = 255`) works on an ordinary
-function but is rejected at the call site on a class method today, even
-though the same signature checks on the method declaration itself. Write
-the length: `t.addString("phone", 20)`.
 
 **A foreign key with no `.references(...)` is silent, not rejected.**
 `t.foreign("team_id")` alone produces a `ForeignKey` node whose `refTable`
