@@ -16,12 +16,29 @@
 // AMORTIZED O(1) PER KEY. Comparing every new key against every earlier one
 // made a mapping of N keys cost O(N²), and a document of one wide mapping
 // stayed inside every `YamlLimits` budget while costing minutes. So the
-// classes above are kept apart and the common ones are hashed: undecorated
-// strings, ints and floats by value, aliases by anchor name. Only undecorated
-// null, bool, sequence and mapping keys keep a `yamlEqual` scan, and null and
-// bool have three distinct values between them. Each map is allocated only
-// when its class first needs one, so a mapping of string keys pays for one
-// map at most, never four.
+// classes above are kept apart and every one is hashed: undecorated strings,
+// ints and floats by value, aliases by anchor name, and every other
+// undecorated key (null, bool, sequence, mapping) by `keyEncode`'s encoding
+// below. Each map is allocated only when its class first needs one, so a
+// mapping of string keys pays for one map at most.
+//
+// OTHER KEYS ARE ENCODED, NOT COMPARED (#6346). A null, bool, sequence or
+// mapping key is written as bytes that two keys share exactly when
+// `yamlEqual` calls them equal, and those bytes are the map key. Every node
+// is a tag byte and a LEB128 word (a bool's 0 or 1, an int's bits, a
+// float's `floatKeyBits`, a collection's length, a string's length followed
+// by its bytes or, past `keyInlineMax`, its id in `ids`), then a
+// collection's children in order: the encoding is prefix-free, so it reads
+// back as exactly one structure. Decorations are read through at every
+// level, as `yamlEqual` reads them. A NaN anywhere makes a key equal to no
+// key, itself included, so such a key is accepted and never stored. A long
+// string enters by id, not by its bytes, because an alias repeats a node
+// without repeating its text: a key of 100,000 aliases to one long string
+// would otherwise hold 100,000 copies of it. Exact bytes, not a 64-bit hash
+// confirmed by `yamlEqual`: a document chooses its own ints, and an unkeyed
+// hash can be steered to put every key in one bucket, which is the O(N²)
+// scan again. The only hash here is the runtime map's, the one every plain
+// string key already goes through.
 //
 // SMALL MAPPINGS ARE SCANNED, NOT HASHED. Nearly every real mapping has a
 // handful of string keys, where building a map and hashing each key costs
@@ -37,11 +54,21 @@ class MapKeys {
   ints: map<i64, bool>,
   floats: map<u64, bool>,
   aliases: map<string, bool>,
-  others: []Yaml,
+  others: map<string, bool>,
+  ids: map<string, i64>,
+  enc: []byte,
 }
 
 fn newMapKeys(): MapKeys {
-  return MapKeys{ strs = nil, ints = nil, floats = nil, aliases = nil, others = []Yaml(0) }
+  return MapKeys{
+    strs = nil,
+    ints = nil,
+    floats = nil,
+    aliases = nil,
+    others = nil,
+    ids = nil,
+    enc = []byte(0),
+  }
 }
 
 // Records `key` in `ks`, returning false when an earlier key of the same
@@ -117,7 +144,7 @@ fn mapKeysFloat(ks: MapKeys, f: f64): bool {
   if (f != f) {
     return true
   }
-  let bits = f == 0.0 ? u64(0) : floatBits(f)
+  let bits = floatKeyBits(f)
   if (ks.floats[bits]) {
     return false
   }
@@ -149,14 +176,120 @@ fn mapKeysAlias(ks: MapKeys, alias: Option<string>): bool {
   }
 }
 
+// The bits of a non-NaN `f` that `==` agrees with: `-0.0` folds onto `0.0`.
+fn floatKeyBits(f: f64): u64 {
+  return f == 0.0 ? u64(0) : floatBits(f)
+}
+
 fn mapKeysOther(ks: MapKeys, key: Yaml): bool {
-  let i = 0
-  while (i < len(ks.others)) {
-    if (yamlEqual(ks.others[i], key)) {
+  if (cap(ks.enc) == 0) {
+    ks.enc = []byte(0, 64)
+  }
+  ks.enc = ks.enc[0:0]
+  if (!keyEncode(ks, key)) {
+    return true
+  }
+  let enc = string(ks.enc)
+  if (ks.others[enc]) {
+    return false
+  }
+  if (ks.others == nil) {
+    ks.others = map<string, bool>()
+  }
+  ks.others[enc] = true
+  return true
+}
+
+// `keyEncode`'s tag bytes, one per undecorated `Yaml` arm.
+const keyTagNull: u8 = 0
+const keyTagBool: u8 = 1
+const keyTagInt: u8 = 2
+const keyTagFloat: u8 = 3
+const keyTagString: u8 = 4
+const keyTagStringId: u8 = 5
+const keyTagSequence: u8 = 6
+const keyTagMapping: u8 = 7
+
+// The longest string `keyEncodeString` writes out rather than naming by id.
+const keyInlineMax: i64 = 32
+
+// Appends `y`'s encoding (this file's header) to `ks.enc`. False when `y`
+// holds a NaN, which makes it equal to no key; `ks.enc` is then partial.
+fn keyEncode(ks: MapKeys, y: Yaml): bool {
+  match (yamlUndecorated(y)) {
+    YamlNull => keyWord(ks, keyTagNull, 0)
+    YamlBool(b) => keyWord(ks, keyTagBool, b ? u64(1) : u64(0))
+    YamlInt(i) => keyWord(ks, keyTagInt, u64(i))
+    YamlFloat(f) => return keyEncodeFloat(ks, f)
+    YamlString(s) => keyEncodeString(ks, s)
+    YamlSequence(items) => return keyEncodeItems(ks, items)
+    YamlMapping(entries) => return keyEncodeEntries(ks, entries)
+    YamlDecorated(_, _) => panic("yaml: internal: yamlUndecorated leaked a YamlDecorated")
+  }
+  return true
+}
+
+fn keyEncodeFloat(ks: MapKeys, f: f64): bool {
+  if (f != f) {
+    return false
+  }
+  keyWord(ks, keyTagFloat, floatKeyBits(f))
+  return true
+}
+
+fn keyEncodeItems(ks: MapKeys, items: []Yaml): bool {
+  keyWord(ks, keyTagSequence, u64(len(items)))
+  for it of items {
+    if (!keyEncode(ks, it)) {
       return false
     }
-    i = i + 1
   }
-  ks.others = append(ks.others, key)
   return true
+}
+
+fn keyEncodeEntries(ks: MapKeys, entries: []YamlEntry): bool {
+  keyWord(ks, keyTagMapping, u64(len(entries)))
+  for e of entries {
+    if (!keyEncode(ks, e.key) || !keyEncode(ks, e.value)) {
+      return false
+    }
+  }
+  return true
+}
+
+fn keyEncodeString(ks: MapKeys, s: string) {
+  if (len(s) > keyInlineMax) {
+    keyWord(ks, keyTagStringId, keyStringId(ks, s))
+    return
+  }
+  keyWord(ks, keyTagString, u64(len(s)))
+  ks.enc = append(ks.enc, s)
+}
+
+// `s`'s id: the number of distinct strings this mapping's other keys had
+// already named when `s` first appeared, so equal strings share one id.
+fn keyStringId(ks: MapKeys, s: string): u64 {
+  let (id, found) = ks.ids[s]
+  if (found) {
+    return u64(id)
+  }
+  if (ks.ids == nil) {
+    ks.ids = map<string, i64>()
+  }
+  let next = len(ks.ids)
+  ks.ids[s] = next
+  return u64(next)
+}
+
+// `tag`, then `w` as LEB128: seven bits a byte, low first, the high bit set
+// on every byte but the last, so a word is at most ten bytes and marks its
+// own end.
+fn keyWord(ks: MapKeys, tag: u8, w: u64) {
+  let buf = append(ks.enc, tag)
+  let v = w
+  while (v >= 0x80) {
+    buf = append(buf, u8(v & 0x7f) | 0x80)
+    v = v >> 7
+  }
+  ks.enc = append(buf, u8(v))
 }
