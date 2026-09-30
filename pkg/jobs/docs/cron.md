@@ -150,6 +150,17 @@ schedule, the window of missed ticks and how many were enqueued.
   one. The cap is a promise that a long outage produces a bounded burst of
   jobs, not thousands.
 
+The work of catching up is bounded by the policy, not by the outage. A device
+with no battery clock boots at 1970 and learns the real time a minute later:
+it is 1.7 billion ticks behind an `every(1 * Second)` schedule. The scheduler
+does not list those ticks. It finds the newest tick at or before now, walks
+back from the newest missed one by at most as many ticks as the policy keeps,
+and enqueues them oldest first, then the tick that is on time, all in one
+pass. `Missed.RunOnce` there enqueues two jobs, never one per chunk of
+the outage. The log line gives the exact number of missed ticks for `every`,
+and `more than 3 tick(s)` for a cron expression, whose ticks are not counted
+when the policy keeps three.
+
 The nightly digest runs at 02:00, and the app is down across that run:
 
 ```text
