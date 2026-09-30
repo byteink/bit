@@ -26,7 +26,9 @@ concurrency, an actual program run - never claimed here without one).
 
 ## How to read this document
 
-Same mechanics as `policy.md` - restated because they are easy to get wrong:
+Same mechanics as [the compiler/stdlib remediation
+policy](lint-remediation-policy.md) - restated because they are easy to get
+wrong:
 
 1. `bit lint` writes every finding to **stderr**. Always `2>&1`.
 2. The denominator is `bit lint`'s own printed `lint: N findings, M overrides
@@ -79,11 +81,10 @@ callee-saved-register fix to the safepoint snapshot, stack-size changes,
 quote.** Two rule codes the original count included (E0200: 3, E0212: 1) are
 now **zero** - already cleared by unrelated work (E0200 is also
 independently gated: `test-lint-filelines` covers `runtime/` as one of its
-seven scanned trees per the corrected note in this workspace's `CLAUDE.md`,
-so a regression there is already caught without this document adding
-anything). One new rule code, **E0215 `unused-result`, did not exist when
-the original count was taken** and now accounts for 30 findings - see "Out
-of scope" below for why it is not dispositioned here.
+seven scanned trees, so a regression there is already caught without this
+document adding anything). One new rule code, **E0215 `unused-result`, did
+not exist when the original count was taken** and now accounts for 30
+findings - see "Out of scope" below for why it is not dispositioned here.
 
 ## Out of scope: E0215 `unused-result` - deliberately excluded from THIS
 document, dispositioned separately below
