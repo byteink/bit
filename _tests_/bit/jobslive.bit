@@ -41,6 +41,12 @@ import { sleep, Millisecond } from "std/time"
 
 const image: string = "postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"
 const runLabel: string = "bit.jobs.live=1"
+// Pairs with `runLabel` on the container this run starts (see
+// `startPostgres` below): the owning process's own pid, learned via
+// `selfPid`'s `$PPID` trick. `sweepOrphans` removes a labelled container
+// only when that pid is no longer alive, so a concurrent peer's still-running
+// container is left alone (#6327).
+const ownerLabelKey: string = "bit.live.owner"
 const readyAttempts: int = 40
 const readyDelayMs: int = 500
 const dockerQuickTimeoutMs: int = 10000
@@ -82,6 +88,47 @@ fn dockerAvailable(bin: string): bool {
   return r.exitCode == 0
 }
 
+// This process's own pid, read off `/bin/sh -c 'echo $PPID'`: `std/process`
+// execs every child directly with no shell (its own doc comment), so a
+// freshly spawned `/bin/sh`'s parent is always this process itself.
+fn selfPid(): int! {
+  let r = output("/bin/sh", ["-c", "echo $PPID"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("selfPid: /bin/sh exited ${r.exitCode}: ${trimSpace(r.stderr)}")
+  }
+  return parseInt(trimSpace(r.stdout))?
+}
+
+// Whether `pid` still names a live process — `kill -0` sends no signal, only
+// checks existence (the same idiom tools/build/gatesexec.bit's watchdogs use).
+fn pidAlive(pid: int): bool {
+  let r = output("/bin/sh", ["-c", "kill -0 ${pid} 2>/dev/null"], dockerQuickTimeoutMs)
+  return r.exitCode == 0
+}
+
+// The pid `id` recorded in its own `${ownerLabelKey}` label, or 0 if the
+// label is missing or unparseable (a container from before this label
+// existed, or a `docker inspect` hiccup) — `sweepOrphans` treats 0 as "no
+// owner to protect", so such a container is always removed.
+fn containerOwnerPid(bin: string, id: string): int {
+  let r = output(
+    bin,
+    ["inspect", "-f", "{{index .Config.Labels \"${ownerLabelKey}\"}}", id],
+    dockerQuickTimeoutMs,
+  )
+  if (r.exitCode != 0) {
+    return 0
+  }
+  let pid = parseInt(trimSpace(r.stdout)) catch _ {
+    return 0
+  }
+  return pid
+}
+
+// Force-removes every container this harness has ever labelled whose owner
+// process is no longer alive, before this run starts its own. A concurrent
+// peer's own still-running container carries a live owner pid and is left
+// alone (#6327).
 fn sweepOrphans(bin: string) {
   let r = output(bin, ["ps", "-aq", "--filter", "label=${runLabel}"], dockerQuickTimeoutMs)
   if (r.exitCode != 0) {
@@ -89,6 +136,10 @@ fn sweepOrphans(bin: string) {
   }
   for id of split(trimSpace(r.stdout), "\n") {
     if (id == "") {
+      continue
+    }
+    let ownerPid = containerOwnerPid(bin, id)
+    if (ownerPid > 0 && pidAlive(ownerPid)) {
       continue
     }
     output(bin, ["rm", "-f", id], dockerRunTimeoutMs)
@@ -131,11 +182,11 @@ fn readyPoll(bin: string, name: string): bool {
   return false
 }
 
-fn startPostgres(bin: string, name: string): int! {
+fn startPostgres(bin: string, name: string, ownerLabel: string): int! {
   dockerRun(
     bin,
     [
-      "run", "--rm", "-d", "--name", name, "--label", runLabel,
+      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
       "-p", "127.0.0.1:0:5432", "-e", "POSTGRES_HOST_AUTH_METHOD=trust", image,
     ],
   )?
@@ -207,7 +258,14 @@ fn main() {
   let bitPath = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
   let name = "bit-jobs-live-${uuidFormat(uuidV4())}"
 
-  let port = startPostgres(bin, name) catch e {
+  let pid = selfPid() catch e {
+    eprint("jobslive: ${e.message()}\n")
+    exit(1)
+    return
+  }
+  let ownerLabel = "${ownerLabelKey}=${pid}"
+
+  let port = startPostgres(bin, name, ownerLabel) catch e {
     eprint("jobslive: ${e.message()}\n")
     cleanup(bin, name)
     exit(1)
