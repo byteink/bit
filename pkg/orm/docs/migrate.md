@@ -1,28 +1,27 @@
 # Apply migrations
 
-[Generate](generate.md) writes a reviewed `.bit` file describing a schema
-change. Nothing about writing that file runs it. You still need something that
-applies each migration exactly once, in order, safely when two instances
-of your app deploy at the same moment and both try to run it, and records
-what actually happened so the next deploy knows where it left off. That is
-what `up`, `status`, `sql` and `down` do.
+You hand-write a `.bit` file describing a schema change. Writing that file
+does not run it. You still need something that applies each migration
+exactly once, in order, safely when two instances of your app deploy at
+the same moment and both try to run it, and records what actually
+happened so the next deploy knows where it left off. That is what `up`,
+`status`, `sql` and `down` do.
 
 ## Known gap, stated up front
 
-[Generate](generate.md) does not yet write or update a checked-in registry
-file, and the `up()` its output declares takes no arguments and returns
-nothing, while a `Migration`'s own `apply` is `() => []SchemaOp`. The two
-pieces don't wire together yet - that's follow-up work, not something this
-page can paper over. Everything below hand-writes the registry, which is
-exactly what you have to do today.
+The `up()` a hand-written migration file declares takes no arguments and
+returns nothing, while a `Migration`'s own `apply` is
+`() => []SchemaOp`. The two shapes don't wire together yet - that's
+follow-up work, not something this page can paper over. Everything below
+hand-writes the registry, which is exactly what you have to do today.
 
 ## The registry: an explicit list, never a directory scan
 
 Bit has no reflection, so nothing in this package can open `migrations/`
-and discover what's in it - the same reason [Generate](generate.md)'s
-`generate` takes its entities as an explicit list rather than scanning for
-`@table` classes. A checked-in file (conventionally `migrations/all.bit`)
-builds the list once and hands it to every function on this page:
+and discover what's in it - the same reason every entity list this
+package takes is explicit rather than a directory scan for `@table`
+classes. A checked-in file (conventionally `migrations/all.bit`) builds
+the list once and hands it to every function on this page:
 
 ```bit
 import {
@@ -77,10 +76,10 @@ fn postgresDialect(): RunnerDialect {
 }
 ```
 
-This entry mirrors [Generate](generate.md)'s `0007_add_widget_phone.bit`
-by hand: `apply` is what that file's `up()` would build if its signature
-matched `Migration`'s, and `revert` is its own reverse, which you write
-yourself - nothing derives one from the other.
+This entry is what a hand-written `0007_add_widget_phone.bit` migration
+file's `up()` would build if its signature matched `Migration`'s, and
+`revert` is its own reverse, which you write yourself - nothing derives
+one from the other.
 
 `postgresDialect()` builds the second argument every `up`/`down` call below
 needs: a `RunnerDialect`, two facts about the target server bundled into one
@@ -158,8 +157,8 @@ pkg/orm: migrate: down: 0007_add_widget_phone.bit was applied 7200000ms ago, old
 That refusal is the point, not a rough edge: once a migration has been
 live long enough for real writes to depend on the schema it changed,
 `down` cannot know what those writes would need reverted along with it. A
-production rollback is a new, forward migration you write with
-[Generate](generate.md) or by hand - never this.
+production rollback is a new, forward migration you write by hand - never
+this.
 
 ## Reading the ledger directly
 
@@ -267,8 +266,8 @@ undone with a new migration, not by reverting the old one.
 
 ## Where to go next
 
-[Generate](generate.md) covers writing the migration file this page
-applies. [Check the schema in CI](check.md) covers failing the build
-before a deploy ever reaches this page, when an entity and the live schema
+[Check the schema in CI](check.md) covers failing the build before a
+deploy ever reaches this page, when an entity and the live schema
 disagree. [Schema](schema.md) and [Dialect](dialect.md) cover the
-`alter()`/`SchemaOp` vocabulary and the DDL it renders to.
+`alter()`/`SchemaOp` vocabulary a migration's `up`/`down` write with, and
+the DDL it renders to.

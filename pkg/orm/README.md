@@ -77,9 +77,8 @@ Table and column names are mapped from a `@table` class's field names - see
 with a CHECK constraint listing its variants by name is
 [`docs/enum.md`](docs/enum.md). Turning a driver's constraint-violation
 error into a typed, catchable cause is [`docs/errors.md`](docs/errors.md).
-Writing a reviewed migration file from your entities is
-[`docs/generate.md`](docs/generate.md). Applying that file against a live
-database is [`docs/migrate.md`](docs/migrate.md). Failing CI when your
+Applying a hand-written migration file against a live database is
+[`docs/migrate.md`](docs/migrate.md). Failing CI when your
 entities and the live schema disagree is [`docs/check.md`](docs/check.md).
 Synchronizing a dev database straight from your entities, no migration
 file, is [`docs/sync.md`](docs/sync.md). Running your own test suite inside

@@ -1,0 +1,201 @@
+// pkg/orm/livediff.bit — the presence/type diff `check.bit` reports and
+// `sync.bit` applies, against a live database read through
+// `information_schema` (#5067/#5069). Was `generate.bit`, the migration
+// FILE GENERATOR (owner ruling 2026-09-30, `.claude/kb/data-packages-dx.md`
+// "Migrations" section: "no migration generator: migrations are
+// hand-written, Laravel style") — #6300 deleted the two exported entry
+// points and everything that only served them (the string-literal renderer, the
+// `@manyToMany` join-table finder, the numbered-file writer) and kept only
+// the read side below, which `check`/`sync` still call directly (same
+// module, SPEC §17.1).
+//
+// A RENAME IS NEVER INFERRED. `fieldsNotIn`/`colsNotInFields` always
+// report an added and a removed column as two independent findings, never
+// a rename — there is no way to tell a rename from a delete-and-create
+// from a diff alone, and guessing would destroy the dropped column's data.
+// `check` reports both lines; `sync` adds and drops both columns directly.
+//
+// EVERY ENTITY PASSED HERE MUST CARRY AN EXPLICIT `@table("name")`.
+// `tableNameOf` fails loudly rather than guessing a pluralized name: a
+// `TableEntity` exposes only `tableDescriptor()`/`tableAttrs()` (#5051,
+// #5189, Bit has no reflection), neither of which carries the class's own
+// name as data.
+//
+// A COMPOSITE-KEY ENTITY (#5084, more than one `@id` field) NEVER GETS TWO
+// AUTO-INCREMENT COLUMNS (#5395, #5397). `hasCompositeKey` decides whether
+// a caller maps an `@id` `i64` field to an auto-increment id column or a
+// plain int, and whether the full primary key (`idColumnNames`, every
+// `@id` field's own column name) needs restating.
+import { asText } from "std/sql"
+
+// Anything a live diff can read a descriptor off: exactly the two members
+// `@table` synthesizes (#5051, #5189). A concrete `@table` class satisfies
+// this structurally (SPEC §14.3) with no declared `implements` — the same
+// way `Executor` (`data.bit`) is satisfied by a `Pool` or a transaction
+// handle — which is what lets `[User{}, Order{}]` convert to `[]TableEntity`
+// element-by-element at the call site (SPEC §12.3's bare-literal rule).
+export interface TableEntity {
+  tableDescriptor(): []FieldDesc,
+  tableAttrs(): []AttrDesc,
+}
+
+// The table name `e` was declared with — its own `@table("name")`
+// override, and only that; see this file's header for why a default
+// pluralized name is never guessed here.
+fn tableNameOf(e: TableEntity): string! {
+  let (v, found) = attrArg(e.tableAttrs(), "table")
+  if (!found) {
+    fail newError(
+        "pkg/orm: this entity has no explicit @table(\"name\") — a live " +
+        "diff cannot derive a default table name without the class's own " +
+        "name, which @table's synthesized members do not carry (Bit has " +
+        "no reflection); add an explicit @table(\"...\") to the entity",
+    )
+  }
+  return v
+}
+
+// The live column names of `table`, in ordinal order, read from
+// information_schema.columns — LIVE, never cached, because diffing
+// against a stale snapshot could re-drop a column another process already
+// added.
+fn liveColumns(db: Data, table: string): []string! {
+  let rows = db.query(
+    "select column_name from information_schema.columns where table_name = $1 order by ordinal_position",
+    [Value.Text(table)],
+  )?
+  defer rows.close()
+  let out = []string(0)
+  while (rows.next()?) {
+    out = append(out, asText(rows.value(0))?)
+  }
+  return out
+}
+
+// Whether `table` already carries a primary key live, read once — the
+// caller's own assertion `mysql.bit`'s renderer needs to pick a safe
+// spelling (#5400), because `SchemaOp` itself carries no live-schema state
+// (schema.bit's own header). Read through the ANSI-standard
+// `information_schema.table_constraints` view, same portability as
+// `liveColumns`' own `information_schema.columns` — no dialect-specific
+// query is needed here.
+fn hasLivePrimaryKey(db: Data, table: string): bool! {
+  let rows = db.query(
+    "select constraint_name from information_schema.table_constraints where table_name = $1 and constraint_type = 'PRIMARY KEY'",
+    [Value.Text(table)],
+  )?
+  defer rows.close()
+  return rows.next()?
+}
+
+// `fields`, excluding any carrying `@manyToMany` (#5390) — that field names
+// a relation through a join table, never a column of THIS table, and
+// nothing in this file maps a `[]T` typeName to a column (nor should it):
+// a `@manyToMany` field is never an ordinary column diff's job.
+fn withoutManyToMany(fields: []FieldDesc): []FieldDesc {
+  let out = []FieldDesc(0)
+  for f of fields {
+    let (_, found) = attrArg(f.attrs, "manyToMany")
+    if (!found) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// The fields of `fields` whose own column name (naming.bit's `columnName`
+// — `@column("...")` if given, else snake_case) is absent from `liveCols`.
+fn fieldsNotIn(fields: []FieldDesc, liveCols: []string): []FieldDesc {
+  let out = []FieldDesc(0)
+  for f of fields {
+    if (!hasColumn(liveCols, columnName(f))) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// True iff two or more of `fields` carry `@id` - a composite primary key
+// (this file's header). Its own count rather than
+// `pkg/orm/compositekey.bit`'s `keyFields`: that one panics naming the
+// table for a class with zero `@id` fields at all, a case this file has
+// never required an entity to avoid.
+fn hasCompositeKey(fields: []FieldDesc): bool {
+  let n = 0
+  for f of fields {
+    if (hasIdAttr(f)) {
+      n = n + 1
+      if (n >= 2) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// True iff any of `fields` carries `@id` - whether this diff's own `added`
+// list needs an auto-increment id column mapped for a key column.
+fn hasIdField(fields: []FieldDesc): bool {
+  for f of fields {
+    if (hasIdAttr(f)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Every `@id` field's own column name, in declaration order - the FULL
+// primary key `AlterTable.primaryKey` (schema.bit, #5397) needs, whether or
+// not each of those columns is one this diff is adding (this file's
+// header).
+fn idColumnNames(fields: []FieldDesc): []string {
+  let out = []string(0)
+  for f of fields {
+    if (hasIdAttr(f)) {
+      out = append(out, columnName(f))
+    }
+  }
+  return out
+}
+
+// Plain membership on a column-name list. Not `std/strings`' `contains`
+// (substring on one `string`, already imported module-wide by
+// `postgres.bit` and the wrong shape for a `[]string`) or `std/seq`'s
+// `contains<T>` (a second import of the same name, E0042) — a five-line
+// loop is cheaper than aliasing either import.
+fn hasColumn(cols: []string, name: string): bool {
+  for c of cols {
+    if (c == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// The live columns with no field in `fields` mapping to them —
+// `naming.bit`'s own `fieldForColumn`, read the other direction.
+fn colsNotInFields(liveCols: []string, fields: []FieldDesc): []string {
+  let out = []string(0)
+  for c of liveCols {
+    if (fieldForColumn(fields, c) == "") {
+      out = append(out, c)
+    }
+  }
+  return out
+}
+
+fn columnNamesOf(fields: []FieldDesc): []string {
+  let out = []string(0)
+  for f of fields {
+    out = append(out, columnName(f))
+  }
+  return out
+}
+
+// The default length a `string` column gets when this package creates or
+// alters one — there is nowhere else to read one from: `@maxLen(...)`
+// resolves to a callable validator (#5051) and is never recorded in the
+// descriptor, so no length reaches this file at all. Documented here
+// rather than hidden, the same way `schema.bit`'s own header flags its
+// `t.string` gap.
+const defaultStringLength: int = 255

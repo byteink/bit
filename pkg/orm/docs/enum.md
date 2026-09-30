@@ -203,10 +203,10 @@ declaration position.
 **You don't have to call `enumCheckAlter` yourself.** Declare the field's
 variant list on the entity with `@enumVariants("Draft", "Active",
 "Archived", "Retired")` instead of a free-floating list, and
-[Generate](generate.md) reads the live CHECK back and renders this exact
-drop-and-recreate for you the next time you run it - the same SET
-comparison shown above, wired into the live diff rather than something
-you call by hand.
+[Check the schema in CI](check.md)/[Sync the dev database](sync.md) read
+the live CHECK back and apply this exact drop-and-recreate for you - the
+same SET comparison shown above, wired into the live diff rather than
+something you call by hand.
 
 ## Sharp edges
 
@@ -234,5 +234,5 @@ can carry. [Dialect](dialect.md) and [MySQL](mysql.md) cover the
 [Errors](errors.md) covers `classify` and every typed constraint-violation
 cause, `CheckViolation` among them. [Write](write.md) covers `save`, where
 a `map<string, Value>` built with `enumColumnValue` usually ends up.
-[Generate](generate.md) covers `@enumVariants` and the live CHECK diff in
-full.
+[Sync the dev database](sync.md) covers `@enumVariants` and the live
+CHECK diff in full.
