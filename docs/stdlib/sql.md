@@ -641,18 +641,26 @@ One recorded attribute: its name, and its arguments rendered to their
 source text. A string literal's argument arrives as its own decoded
 content; any other literal arrives as its raw text unchanged.
 
+### `JoinDesc`
+
+One `@manyToMany` relation field's join table: its name, both its foreign-key
+columns, and the two related tables and their id columns. Built by the exact
+same field computation `link`/`unlink`/`with()` use at run time, so it can
+never name a different join table or column than they do.
+
 ### `TableSchema`
 
 One `@table` class as the registry below reports it: its table name, its
-columns (the same `FieldDesc` list the class's mapper uses) and its
-class-level attributes.
+columns (the same `FieldDesc` list the class's mapper uses), its class-level
+attributes, and one `JoinDesc` per `@manyToMany` field.
 
 ### `__tables(): []TableSchema`
 
 Every `@table` class in the program, one `TableSchema` each, in module order
-then source order. `pkg/orm` calls it to create or update tables without a
-hand-written list of classes. The compiler fills in its body only when
-something calls it, so a program that never asks pays nothing.
+then source order. `pkg/orm` calls it to create or update tables — and any
+`@manyToMany` join table — without a hand-written list of classes. The
+compiler fills in its body only when something calls it, so a program that
+never asks pays nothing.
 
 ## Row-mapping building blocks
 
