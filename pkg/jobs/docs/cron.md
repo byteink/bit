@@ -197,24 +197,39 @@ lease is already taken. A lease expires after an hour, which only lets
 another instance take that tick over. The rows are also how a restarted app
 learns its last tick, so they are never deleted by age: each schedule keeps
 its newest 1024 lease rows and the older ones are dropped as new ticks are
-won. Keep that above the biggest `Missed.RunAll` cap you use; `keep` changes it:
+won. That count is the locker's lease window, and `schedule` and `every`
+refuse a `Missed.RunAll` cap above it, because a catch-up that long would drop
+lease rows another instance still races for. With `keep = 200`, this fails when
+the schedule is registered:
 
 ```bit
 fn smallLeaseWindow(db: Pool): Locker {
   return newPostgresLocker(db, keep = 200)
 }
+
+fn ledgerTooWide(q: Queue) {
+  q.every(Minute, NightlyDigest{ list = "readers" }, missed = Missed.RunAll(500)) catch e {
+    eprint("${e.message()}\n")
+  }
+}
+```
+
+```text
+jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise newPostgresLocker(keep = ...)
 ```
 
 Without a `locker`, every instance enqueues every tick. That is right for a
 single instance and wrong for two. To use another lock service, write a
-`Locker`: two methods.
+`Locker`: three methods.
 `tryAcquire(key, holder, nowNs, expiresAt)` returns true when `holder` owns
 `key` after the call and false when someone else's lease has not expired;
 compare `expiresAt` against the `nowNs` you are given, not your own clock.
 `lastTick(key)` returns the newest tick number won for the schedule `key`
-(a lease key is `key` then `@` then the tick), or 0 when there is none. A
-locker that forgets its ticks, like the one below, only loses the catch-up
-after downtime.
+(a lease key is `key` then `@` then the tick), or 0 when there is none. `window()` returns
+how many of the newest ticks of one schedule the locker still remembers, the
+cap `schedule` and `every` hold `Missed.RunAll` to. A locker that forgets its
+ticks, like the one below, only loses the catch-up after downtime, and it has
+no lease rows to prune, so its window is as large as you will allow.
 
 ```bit
 import { Locker, Store } from "jobs"
@@ -226,6 +241,10 @@ class singleHost {
 
   export lastTick(key: string): int! {
     return 0
+  }
+
+  export window(): int {
+    return 1000000
   }
 }
 
@@ -262,10 +281,26 @@ fn openForTest(store: Store, clock: Clock): Queue! {
 }
 ```
 
+## Mistakes it refuses at startup
+
+`open`, `schedule` and `every` fail at once, with the wrong value in the
+message, for what would otherwise misbehave hours later:
+
+```text
+jobs: Options.pollInterval must be positive, got 0
+jobs: Options.visibilityTimeout must be positive, got -1
+jobs: Missed.RunAll cap must be at least 1, got 0
+jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise newPostgresLocker(keep = ...)
+jobs: schedule 'nightly-digest|0 2 * * *|UTC' registered after start(); register schedules before start() or run()
+```
+
+A zero `pollInterval` would spin the workers and the scheduler; a `RunAll` cap
+below 1 would drop ticks that are on time; a schedule registered after
+`start()` or `run()` would never be seen by the scheduler already running.
+Register every schedule right after `open`, before either call.
+
 ## Sharp edges
 
-- Register schedules before `start()` or `run()`. A schedule added later
-  is not seen by a scheduler that is already running.
 - Scheduling the same job with the same expression and zone twice fails:
   the two would share a lease and fire twice.
 - A scheduled job is an ordinary job, delivered at least once. A handler
