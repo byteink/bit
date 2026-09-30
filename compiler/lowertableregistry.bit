@@ -1,0 +1,221 @@
+// compiler/lowertableregistry.bit — #6301 (S1, epic #6298, Feature 2 of
+// .claude/kb/orm-impl-plan-2026-09-30.md): synthesizes std/sql's
+// `__tables()` stub body at the IR level, listing every `@table` class in
+// the project.
+//
+// std/sql cannot import the modules a `@table` class lives in (there is no
+// source-level way to write "every class anywhere carrying `@table`"), so
+// this has to happen after the whole project is checked, at the IR level —
+// `testgen.bit`'s `buildDispatch` is the precedent for building an `IrFunc`
+// body straight from IR instructions, with no AST behind it.
+//
+// Runs from `lowerProjectFuncs` (lowerglobal.bit) BEFORE `lowerProjectMethods`
+// (lowerinstemit.bit) calls #6260's `lowerReachableSynthStatics`
+// (lowermethodtable.bit) — the unused-static pruning that decides whether
+// each `@table` class's `__tableName`/`__columns`/`__tableAttrs` gets
+// lowered at all. `__tables`'s stub body (`return []TableSchema(0)`, always
+// lowered in Pass A since it is an ordinary top-level function) is REPLACED
+// here with one call per `@table` class to those three statics, so the
+// calls exist in `funcs` before the pruning sweep looks for them.
+//
+// If nothing in the project calls `__tables`, its body is left exactly as
+// written in `stdlib/sql/desc.bit` — no class is even walked.
+
+const tableRegistryFuncName = "__tables"
+const tableRegistryAppendName = "__tableAppend"
+const tableRegistryEmptyName = "__tableRegistryEmpty"
+
+// Everything the builder functions below need, gathered once by
+// `synthTableRegistry` and threaded through as one value — E0202's own
+// suggestion ("the arguments want to be a class") for the alternative,
+// which was a 7-8 parameter list repeated across every helper.
+class TableRegistryCtx {
+  mods: []Checker,
+  root: int,
+  sm: int,
+  lowerer: Lowerer,
+  appendDecl: int,
+  appendSymbol: string,
+  emptyDecl: int,
+  emptySymbol: string,
+}
+
+// The module id `std/sql` was loaded as, found off any OTHER module's own
+// import map — `std/sql` cannot import itself (E0044), so its own id is
+// read off an importer instead. Mirrors `sqlValueStdModuleId`
+// (checksqlvalue.bit) and `jsonStdModuleId`
+// (classjsondecodegenericretarget.bit) exactly, against `tableSqlModulePath`
+// (classtableimports.bit) instead of their own module paths.
+fn tableRegistryStdModuleId(mods: []Checker): int {
+  let i = 0
+  while (i < len(mods)) {
+    let (id, ok) = mods[i].importPaths[tableSqlModulePath]
+    if (ok && id >= 0 && id < len(mods)) {
+      return id
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The `funcs` index of the `IrFunc` named `name`, or -1.
+fn tableRegistryFuncIndex(funcs: []IrFunc, name: string): int {
+  let i = 0
+  while (i < len(funcs)) {
+    if (funcs[i].name == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// One `@table` class the registry lists: its own resolved TypeId, which
+// `methodSymbol`/`methodRefAt` key `__tableName`/`__columns`/`__tableAttrs`
+// on — `methodDecls` is shared project-wide (`Checker.ctx`), so no owning
+// Checker needs to travel with it.
+class TableRegistryEntry {
+  recvTy: int,
+}
+
+// Every top-level class across the whole project carrying `@table` (SPEC
+// §10.5), module order then declaration order — the same walk
+// `collectTableClasses` (classtabledesc.bit) does per module, project-wide.
+// Every class found here already passed the checker (a rejected `@table`
+// class stops the build before lowering runs), so no re-validation is
+// needed: `classHasTable` alone is the whole filter.
+fn collectTableRegistryEntries(mods: []Checker): []TableRegistryEntry {
+  let out = []TableRegistryEntry(0)
+  let mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    for tc of topClassDecls(c.tree) {
+      if (classHasTable(c.tree, c.source, tc.decl)) {
+        let cname = identText(c.tree, c.source, kidsOf(c.tree, tc.decl)[0])
+        out = append(out, TableRegistryEntry{ recvTy = userTypeLookup(c, cname) })
+      }
+    }
+    mi = mi + 1
+  }
+  return out
+}
+
+// A minimal `FnCtx` for a body with no locals, no loops and no defers —
+// everything `emitStaticMethodCall`/`emitResolvedCall` touch besides `b`
+// and `lowerer` is `fc.c.ctx`, shared project-wide, so any project Checker
+// serves as `c`. Mirrors `lowerTestDeclNamed`'s own literal
+// (testgen.bit), which is the same "no AST behind this body" shape.
+fn newTableRegistryFnCtx(rc: TableRegistryCtx): FnCtx {
+  let root = rc.mods[rc.root]
+  return FnCtx{
+    c = root, b = newBuilder(), env = []LocalBind(0), failed = false,
+    failSpan = pointSpan(0, 0), failReason = "", terminated = false,
+    loops = []LoopFrame(0), moduleConsts = map<string, int>{}, lowerer = rc.lowerer,
+    defers = []DeferCall(0), fallibleOk = 0, fallibleErr = 0, genEnv = emptyTypeEnv(),
+    resultTy = root.ctx.voidId, boxedNames = []string(0),
+  }
+}
+
+// A plain free-function call, built and emitted through `emitResolvedCall`
+// (lowerprim.bit) rather than a hand-rolled `Op.Call`: that is the one place
+// that already knows whether `decl`'s arguments or its result cross in
+// exploded words (`explodedRetWords`/`explodeCallArgs`), the same question
+// every OTHER call to a std/sql function goes through — a hand-rolled call
+// here could not silently disagree with it.
+fn emitTableRegistryCall(fc: FnCtx, owner: Checker, decl: int, symbol: string, args: []int): int {
+  let t = CallTarget{
+    ok = true, symbol = symbol, paramTypes = lowerParamTypes(owner, decl),
+    result = declPlainResultType(owner, decl), owner = owner, decl = decl,
+  }
+  return emitResolvedCall(fc, t, args)
+}
+
+// `entry.recvTy`'s `mname()` call, via `emitStaticMethodCall`
+// (lowerexplodemethod.bit) — the helper every OTHER caller of a synthesized
+// static already goes through, so this cannot silently pick the wrong
+// argument/return convention. `fr.decl` is always bound: classtablerow.bit
+// synthesizes `__tableName`/`__columns`/`__tableAttrs` unconditionally on
+// every `@table` class, subject only to E0178/E0179, both of which stop the
+// build before lowering runs — the same "the checker already refused any
+// other shape" posture `retargetOneSqlValueInstance` (checksqlvalue.bit)
+// takes for its own generic-instance lookup.
+fn emitTableRegistryStatic(fc: FnCtx, lowerer: Lowerer, recvTy: int, mname: string): int {
+  let fr = methodRefAt(fc.c, recvTy, mname)
+  return emitStaticMethodCall(
+    fc, fr, methodSymbol(lowerer, mname, recvTy), declPlainResultType(fr.owner, fr.decl), []int(0),
+  )
+}
+
+// One `@table` class's contribution to `__tables`'s synthesized body: calls
+// its `__tableName()`/`__columns()`/`__tableAttrs()` (classtablerow.bit's
+// three deferred statics, #6260) and chains them into `out` through
+// `__tableAppend`.
+fn emitTableRegistryEntry(
+  fc: FnCtx,
+  rc: TableRegistryCtx,
+  entry: TableRegistryEntry,
+  out: int,
+): int {
+  let nameV = emitTableRegistryStatic(fc, rc.lowerer, entry.recvTy, synthTableNameName)
+  let colsV = emitTableRegistryStatic(fc, rc.lowerer, entry.recvTy, synthColumnsName)
+  let attrsV = emitTableRegistryStatic(fc, rc.lowerer, entry.recvTy, synthTableAttrsRowName)
+  return emitTableRegistryCall(
+    fc, rc.mods[rc.sm], rc.appendDecl, rc.appendSymbol, [out, nameV, colsV, attrsV],
+  )
+}
+
+// Builds `__tables`'s real body in one straight-line block: seed `out` from
+// `__tableRegistryEmpty()`, chain one `__tableAppend` per `@table` class,
+// then return it — mirroring `testgen.bit`'s `buildDispatchEmpty` shape
+// (one block, no branches) since this body never needs more than one.
+fn buildTableRegistryFunc(rc: TableRegistryCtx, sym: string, sliceTy: int): IrFunc {
+  let fc = newTableRegistryFnCtx(rc)
+  let entry = builderNewBlock(fc.b)
+  builderBeginBlock(fc.b, entry)
+  let out = emitTableRegistryCall(fc, rc.mods[rc.sm], rc.emptyDecl, rc.emptySymbol, []int(0))
+  for e of collectTableRegistryEntries(rc.mods) {
+    out = emitTableRegistryEntry(fc, rc, e, out)
+  }
+  let r = mkInstr(Op.Ret, rc.mods[rc.sm].ctx.voidId)
+  r.args = [out]
+  builderEmit(fc.b, r)
+  builderEndBlock(fc.b)
+  return IrFunc{
+    name = sym, paramTypes = []int(0), result = sliceTy,
+    blocks = fc.b.blocks, instrs = fc.b.instrs, isFallible = false,
+    inRootModule = rc.sm == rc.root, keepAlive = fc.b.keepAlive,
+  }
+}
+
+// `lowerProject`'s (lowerglobal.bit) entry point for #6301: replaces
+// `__tables`'s stub `IrFunc` in `funcs` with its real body, but ONLY when
+// the project already calls it directly — the same reachability question
+// #6260 asks of `__tableName`/`__columns`/`__tableAttrs` themselves, asked
+// one level up so an existing program that never references the registry
+// gets byte-for-byte the same IR it got before this ticket: nothing here
+// runs, `funcs` is returned unchanged, and `__tables` keeps the trivial
+// stub body Pass A already lowered from source.
+fn synthTableRegistry(mods: []Checker, root: int, lowerer: Lowerer, funcs: []IrFunc): []IrFunc {
+  let sm = tableRegistryStdModuleId(mods)
+  if (sm < 0) {
+    return funcs
+  }
+  let sym = modulePrefix(sm, root) + tableRegistryFuncName
+  let (_, called) = referencedCalleeNames(funcs)[sym]
+  if (!called) {
+    return funcs
+  }
+  let idx = tableRegistryFuncIndex(funcs, sym)
+  let (appendDecl, appendOk) = mods[sm].funcDecls[tableRegistryAppendName]
+  let (emptyDecl, emptyOk) = mods[sm].funcDecls[tableRegistryEmptyName]
+  if (idx < 0 || !appendOk || !emptyOk) {
+    return funcs
+  }
+  let rc = TableRegistryCtx{
+    mods = mods, root = root, sm = sm, lowerer = lowerer,
+    appendDecl = appendDecl, appendSymbol = modulePrefix(sm, root) + tableRegistryAppendName,
+    emptyDecl = emptyDecl, emptySymbol = modulePrefix(sm, root) + tableRegistryEmptyName,
+  }
+  funcs[idx] = buildTableRegistryFunc(rc, sym, funcs[idx].result)
+  return funcs
+}
