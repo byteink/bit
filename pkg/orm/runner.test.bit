@@ -1,11 +1,25 @@
-// pkg/orm/runner.test.bit — #5068's acceptance, against a FAKE driver
-// (`rnExecutor` below) that keeps its own in-memory `schema_history` and
+// pkg/orm/runner.test.bit — #6309's own acceptance, against a FAKE driver
+// (`rnExecutor` below) that keeps its own in-memory `migrations` ledger and
 // records every statement it is asked to run, in order — the same shape
 // `check.test.bit`'s `ckExecutor` uses for `information_schema`, applied
-// here to `schema_history` instead. `Postgres{}` (`postgres.bit`, already
+// here to `migrations` instead. `Postgres{}` (`postgres.bit`, already
 // covered by `postgres.test.bit`) renders every migration's DDL; nothing
 // here fakes a `Dialect`, since this file's own acceptance is about the
-// RUNNER's statement sequencing, not about DDL correctness.
+// RUNNER's statement sequencing and batching, not about DDL correctness.
+//
+// THE LAST TEST IN THIS FILE runs against a real Postgres server
+// (`ORM_TEST_LIVE_PG_URI`) directly — no spawned subprocess, unlike
+// `repo.test.bit`'s own live proofs: `migrate`/`rollback` are declared IN
+// this module (`runner.bit`), so nothing here proves an external package
+// boundary the way `import { open } from "orm"` needs to (`repo.test.bit`'s
+// own header explains that distinction). `relationauto.test.bit`'s own live
+// test is the precedent for connecting directly rather than spawning.
+//
+// `adapter` (bare, unaliased) is already bound package-wide by
+// `relationauto.test.bit`'s own `import { adapter } from "postgres"` — a
+// second import here would be E0042. `pool`/`Datasource`/`Value`/`Data`/
+// `Timestamp`/`asInt`/`asText` are already bound package-wide too and are
+// not reimported here either.
 
 class rnExecutor {
   history: []HistoryEntry
@@ -17,7 +31,7 @@ class rnExecutor {
   query(sqlText: string, params: []Value): Rows! {
     this.log = append(this.log, sqlText)
     this.failIfMatched(sqlText)?
-    if (hasPrefix(sqlText, "select version, name, checksum")) {
+    if (hasPrefix(sqlText, "select migration, batch, applied_at")) {
       return rnRows{ entries = this.history, i = -1 }
     }
     fail newError("rnExecutor: query not supported: ${sqlText}")
@@ -26,21 +40,19 @@ class rnExecutor {
   exec(sqlText: string, params: []Value): int! {
     this.log = append(this.log, sqlText)
     this.failIfMatched(sqlText)?
-    if (hasPrefix(sqlText, "insert into schema_history")) {
+    if (hasPrefix(sqlText, "insert into migrations")) {
       this.history = append(
         this.history,
         HistoryEntry{
-          version = asInt(params[0])?,
-          name = asText(params[1])?,
-          checksum = asText(params[2])?,
-          appliedAt = asInt(params[3])?,
-          durationMs = asInt(params[4])?,
+          migration = asText(params[0])?,
+          batch = asInt(params[1])?,
+          appliedAt = asInt(params[2])?,
         },
       )
       return 1
     }
-    if (hasPrefix(sqlText, "delete from schema_history")) {
-      this.history = withoutVersion(this.history, asInt(params[0])?)
+    if (hasPrefix(sqlText, "delete from migrations")) {
+      this.history = withoutName(this.history, asText(params[0])?)
       return 1
     }
     return 0
@@ -63,33 +75,27 @@ class rnRows {
   }
 
   columns(): []string {
-    return ["version", "name", "checksum", "applied_at", "duration_ms"]
+    return ["migration", "batch", "applied_at"]
   }
 
   value(col: int): Value {
     let e = this.entries[this.i]
     if (col == 0) {
-      return Value.Int(e.version)
+      return Value.Text(e.migration)
     }
     if (col == 1) {
-      return Value.Text(e.name)
+      return Value.Int(e.batch)
     }
-    if (col == 2) {
-      return Value.Text(e.checksum)
-    }
-    if (col == 3) {
-      return Value.Int(e.appliedAt)
-    }
-    return Value.Int(e.durationMs)
+    return Value.Int(e.appliedAt)
   }
 
   close() {}
 }
 
-fn withoutVersion(history: []HistoryEntry, version: int): []HistoryEntry {
+fn withoutName(history: []HistoryEntry, migration: string): []HistoryEntry {
   let out = []HistoryEntry(0)
   for h of history {
-    if (h.version != version) {
+    if (h.migration != migration) {
       out = append(out, h)
     }
   }
@@ -97,79 +103,84 @@ fn withoutVersion(history: []HistoryEntry, version: int): []HistoryEntry {
 }
 
 // The ordinary `RunnerDialect` every test in this file that does not
-// specifically target MySQL uses (#5384): Postgres both renders DDL and
-// locks. See the #5378 test below for the one deliberate exception.
+// specifically target MySQL uses: Postgres both renders DDL and locks. See
+// the MySQL test below for the one deliberate exception.
 fn pgDialect(): RunnerDialect {
   return RunnerDialect{ render = Postgres{}, server = ServerDialect.Postgres }
 }
 
-// A migration that adds one nullable-free string column on `table` — one
-// transactional `Statement`, nothing else.
-fn migPlain(version: int, name: string, table: string, checksum: string): Migration {
-  return Migration{
-    version = version,
-    name = name,
-    checksum = checksum,
-    apply = () => [
-      alter(table, (t) => {
-        t.string("note", 50)
-      }),
-    ],
-    revert = () => [
-      alter(table, (t) => {
-        t.dropColumn("note")
-      }),
-    ],
+// Adds one nullable-free string column on `table` — one transactional
+// `Statement`, nothing else, either direction.
+class rnAddNote {
+  table: string
+
+  up(s: Schema): ()! {
+    s.table(this.table, (t) => {
+      t.string("note", 50)
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.table(this.table, (t) => {
+      t.dropColumn("note")
+    })?
   }
 }
 
-// A migration carrying both a transactional add and a non-transactional
-// `CREATE INDEX CONCURRENTLY` raw — see `postgres.bit`'s own
-// `rawStatement`, which is what flags the second op non-transactional.
-fn migMixed(version: int, name: string, table: string, checksum: string): Migration {
-  return Migration{
-    version = version,
-    name = name,
-    checksum = checksum,
-    apply = () => [
-      alter(table, (t) => {
-        t.string("note", 50)
-      }),
-      alter(table, (t) => {
-        t.raw("CREATE INDEX CONCURRENTLY idx_${table}_note ON ${table} (note)")
-      }),
-    ],
-    revert = () => [
-      alter(table, (t) => {
-        t.dropColumn("note")
-      }),
-    ],
+fn migPlain(table: string): Migration {
+  return rnAddNote{ table = table }
+}
+
+// Carries both a transactional add and a non-transactional `CREATE INDEX
+// CONCURRENTLY` raw — see `postgres.bit`'s own `rawStatement`, which is
+// what flags the second op non-transactional.
+class rnAddNoteAndIndex {
+  table: string
+
+  up(s: Schema): ()! {
+    s.table(this.table, (t) => {
+      t.string("note", 50)
+    })?
+    s.table(this.table, (t) => {
+      t.raw("CREATE INDEX CONCURRENTLY idx_${this.table}_note ON ${this.table} (note)")
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.table(this.table, (t) => {
+      t.dropColumn("note")
+    })?
   }
 }
 
-// A migration whose `apply()` renders two statements on MySQL — one
-// `alter(...)` call declaring two `string` columns, so
-// `mysql.bit`'s `mysqlRenderAlterTable` emits one `ALTER TABLE` per column
-// — so a test can force the second to fail and see whether the first's
-// effect (and the ledger) survives it.
-fn migMysqlTwoStatements(version: int, name: string, table: string, checksum: string): Migration {
-  return Migration{
-    version = version,
-    name = name,
-    checksum = checksum,
-    apply = () => [
-      alter(table, (t) => {
-        t.string("a", 50)
-        t.string("b", 50)
-      }),
-    ],
-    revert = () => [
-      alter(table, (t) => {
-        t.dropColumn("a")
-        t.dropColumn("b")
-      }),
-    ],
+fn migMixed(table: string): Migration {
+  return rnAddNoteAndIndex{ table = table }
+}
+
+// Renders two statements on MySQL — one `s.table(...)` call declaring two
+// `string` columns, so `mysql.bit`'s `mysqlRenderAlterTable` emits one
+// `ALTER TABLE` per column — so a test can force the second to fail and see
+// whether the first's effect (and the ledger) survives it.
+class rnAddAB {
+  table: string
+
+  up(s: Schema): ()! {
+    s.table(this.table, (t) => {
+      t.string("a", 50)
+      t.string("b", 50)
+    })?
   }
+
+  down(s: Schema): ()! {
+    s.table(this.table, (t) => {
+      t.dropColumn("a")
+      t.dropColumn("b")
+    })?
+  }
+}
+
+fn migMysqlTwoStatements(table: string): Migration {
+  return rnAddAB{ table = table }
 }
 
 fn indexOf(log: []string, needle: string): int {
@@ -193,81 +204,66 @@ fn countPrefixed(log: []string, prefix: string): int {
   return n
 }
 
-test "up applies pending migrations in ascending numeric order and records one schema_history row each" {
+test "migrate applies pending files in ascending name order, one migrations row each, all in the same batch" {
   let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = "" }
   let migrations = [
-    migPlain(3, "third", "widgets", "chk3"),
-    migPlain(1, "first", "widgets", "chk1"),
-    migPlain(2, "second", "widgets", "chk2"),
+    MigrationFile{ name = "0003_third", m = migPlain("widgets") },
+    MigrationFile{ name = "0001_first", m = migPlain("widgets") },
+    MigrationFile{ name = "0002_second", m = migPlain("widgets") },
   ]
-  let report = up(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch e {
-    panic("up: ${e.message()}")
+  let report = migrate(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch e {
+    panic("migrate: ${e.message()}")
   }
   assert(len(report.applied) == 3, "expected 3 applied migrations, got ${len(report.applied)}")
   assert(
-    report.applied[0].version == 1,
-    "expected version 1 first, got ${report.applied[0].version}",
+    report.applied[0].name == "0001_first",
+    "expected 0001_first first, got ${report.applied[0].name}",
   )
   assert(
-    report.applied[1].version == 2,
-    "expected version 2 second, got ${report.applied[1].version}",
+    report.applied[1].name == "0002_second",
+    "expected 0002_second second, got ${report.applied[1].name}",
   )
   assert(
-    report.applied[2].version == 3,
-    "expected version 3 third, got ${report.applied[2].version}",
+    report.applied[2].name == "0003_third",
+    "expected 0003_third third, got ${report.applied[2].name}",
   )
   for a of report.applied {
+    assert(a.batch == 1, "expected batch 1 for a first migrate call, got ${a.batch}")
     assert(a.appliedAt == 5000, "expected appliedAt 5000, got ${a.appliedAt}")
     assert(a.durationMs >= 0, "expected a non-negative duration, got ${a.durationMs}")
   }
-  assert(len(db.history) == 3, "expected 3 schema_history rows, got ${len(db.history)}")
+  assert(len(db.history) == 3, "expected 3 migrations rows, got ${len(db.history)}")
   assert(
-    db.history[0].version == 1 && db.history[0].checksum == "chk1",
-    "row 0 wrong: ${db.history[0].version}/${db.history[0].checksum}",
-  )
-  assert(
-    db.history[2].version == 3 && db.history[2].checksum == "chk3",
-    "row 2 wrong: ${db.history[2].version}/${db.history[2].checksum}",
+    db.history[0].migration == "0001_first" && db.history[0].batch == 1,
+    "row 0 wrong: ${db.history[0].migration}/${db.history[0].batch}",
   )
 }
 
-test "an already-applied migration whose file changed errors naming the file and both checksums, and applies nothing" {
-  let db = rnExecutor{
-    history = [
-      HistoryEntry{
-        version = 1,
-        name = "init",
-        checksum = "OLD_SUM",
-        appliedAt = 100,
-        durationMs = 3,
-      },
-    ],
-    log = []string(0),
-    failOn = "",
+test "a second migrate call applies nothing already recorded, and issues no statement" {
+  let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = "" }
+  let migrations = [MigrationFile{ name = "0001_init", m = migPlain("widgets") }]
+  migrate(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch e {
+    panic("migrate (first): ${e.message()}")
   }
-  let migrations = [migPlain(1, "init", "widgets", "NEW_SUM")]
-  up(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch e {
-    assert(contains(e.message(), "0001_init.bit"), "error does not name the file: ${e.message()}")
-    assert(
-      contains(e.message(), "OLD_SUM"),
-      "error does not carry the recorded checksum: ${e.message()}",
-    )
-    assert(
-      contains(e.message(), "NEW_SUM"),
-      "error does not carry the current checksum: ${e.message()}",
-    )
-    assert(indexOf(db.log, "BEGIN") == -1, "a BEGIN was issued; nothing should have been applied")
-    assert(len(db.history) == 1, "schema_history changed; nothing should have been applied")
-    return
+  db.log = []string(0)
+  let second = migrate(db, pgDialect(), migrations, Timestamp{ ns = 6000 }) catch e {
+    panic("migrate (second): ${e.message()}")
   }
-  panic("up: expected a checksum-mismatch error, got success")
+  assert(
+    len(second.applied) == 0,
+    "expected zero applied on the second run, got ${len(second.applied)}",
+  )
+  assert(
+    indexOf(db.log, "BEGIN") == -1,
+    "a BEGIN was issued on the second run; nothing pending should have run",
+  )
 }
 
 test "the advisory lock is the first statement issued and is released at the end, including on the failure path" {
   let failingSql = "alter table \"widgets\" add column \"note\" varchar(50) not null;"
   let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = failingSql }
-  let migrations = [migPlain(1, "init", "widgets", "chk1")]
-  up(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch _ {
+  let migrations = [MigrationFile{ name = "0001_init", m = migPlain("widgets") }]
+  migrate(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch _ {
     assert(len(db.log) >= 2, "expected at least a lock and an unlock, got ${len(db.log)}")
     assert(
       db.log[0] == "select pg_advisory_lock($1)",
@@ -279,20 +275,20 @@ test "the advisory lock is the first statement issued and is released at the end
     )
     return
   }
-  panic("up: expected the forced statement failure to propagate")
+  panic("migrate: expected the forced statement failure to propagate")
 }
 
 test "each migration's statements are bracketed by BEGIN and COMMIT while a non-transactional statement runs outside" {
   let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = "" }
-  let migrations = [migMixed(1, "add_note_and_index", "widgets", "chk1")]
-  up(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch e {
-    panic("up: ${e.message()}")
+  let migrations = [MigrationFile{ name = "0001_add_note_and_index", m = migMixed("widgets") }]
+  migrate(db, pgDialect(), migrations, Timestamp{ ns = 5000 }) catch e {
+    panic("migrate: ${e.message()}")
   }
   let beginAt = indexOf(db.log, "BEGIN")
   let commitAt = indexOf(db.log, "COMMIT")
   let insertAt = indexOf(
     db.log,
-    "insert into schema_history (version, name, checksum, applied_at, duration_ms) values ($1, $2, $3, $4, $5)",
+    "insert into migrations (migration, batch, applied_at) values ($1, $2, $3)",
   )
   let concurrentAt = -1
   let i = 0
@@ -309,7 +305,7 @@ test "each migration's statements are bracketed by BEGIN and COMMIT while a non-
   )
   assert(
     beginAt < insertAt && insertAt < commitAt,
-    "schema_history was not written inside the transaction",
+    "the migrations row was not written inside the transaction",
   )
   assert(commitAt < concurrentAt, "the non-transactional statement ran before COMMIT")
   assert(
@@ -318,111 +314,243 @@ test "each migration's statements are bracketed by BEGIN and COMMIT while a non-
   )
 }
 
-test "#5384: up refuses immediately on ServerDialect.Mysql, issuing zero statements - no MySQL advisory lock exists yet" {
+test "migrate refuses immediately on ServerDialect.Mysql, issuing zero statements - no MySQL advisory lock exists yet" {
   let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = "" }
-  let migrations = [migPlain(1, "init", "widgets", "chk1")]
+  let migrations = [MigrationFile{ name = "0001_init", m = migPlain("widgets") }]
   let dialect = RunnerDialect{
     render = Mysql{},
     server = ServerDialect.Mysql(MysqlVersion{ major = 8, minor = 0 }),
   }
-  up(db, dialect, migrations, Timestamp{ ns = 5000 }) catch e {
+  migrate(db, dialect, migrations, Timestamp{ ns = 5000 }) catch e {
     assert(contains(e.message(), "MySQL advisory lock"), "unexpected error: ${e.message()}")
     let logDump = join(db.log, " | ")
     assert(len(db.log) == 0, "expected zero statements issued, got ${len(db.log)}: ${logDump}")
     return
   }
-  panic("up: expected the MySQL advisory-lock refusal, got success")
+  panic("migrate: expected the MySQL advisory-lock refusal, got success")
 }
 
-test "#5378: on MySQL, a migration failing on its second statement leaves no schema_history row, naming the migration" {
+test "on MySQL, a migration failing on its second statement leaves no migrations row, naming the migration" {
   // `render: Mysql{}` exercises this test's real subject - mysql.bit's
   // all-non-transactional statement sequencing (this file's header, piece
-  // 3). `server: ServerDialect.Postgres` is deliberate, not a copy-paste
-  // slip: `acquireLock` reads only `dialect.server` (#5384's own
-  // "answers a different question than `render`" reasoning, this file's
-  // header piece 2) and a real MySQL run refuses before reaching this
-  // code path at all (the test directly above this one) - so a fake
-  // Postgres lock is what lets this test exercise the sequencing logic
-  // without a real MySQL advisory-lock implementation to call.
+  // 2, in `runner.bit`). `server: ServerDialect.Postgres` is deliberate,
+  // not a copy-paste slip: `acquireLock` reads only `dialect.server` and a
+  // real MySQL run refuses before reaching this code path at all (the test
+  // directly above this one) - so a fake Postgres lock is what lets this
+  // test exercise the sequencing logic without a real MySQL advisory-lock
+  // implementation to call.
   let failingSql = "alter table `widgets` add column `b` varchar(50) not null;"
   let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = failingSql }
-  let migrations = [migMysqlTwoStatements(1, "add_a_and_b", "widgets", "chk1")]
+  let migrations = [MigrationFile{ name = "0001_add_a_and_b", m = migMysqlTwoStatements("widgets") }]
   let dialect = RunnerDialect{ render = Mysql{}, server = ServerDialect.Postgres }
-  up(db, dialect, migrations, Timestamp{ ns = 5000 }) catch e {
+  migrate(db, dialect, migrations, Timestamp{ ns = 5000 }) catch e {
     assert(
-      contains(e.message(), "0001_add_a_and_b.bit"),
+      contains(e.message(), "0001_add_a_and_b"),
       "error does not name the migration: ${e.message()}",
     )
-    assert(len(db.history) == 0, "expected no schema_history row, got ${len(db.history)}")
+    assert(len(db.history) == 0, "expected no migrations row, got ${len(db.history)}")
     assert(
         indexOf(
           db.log,
-          "insert into schema_history (version, name, checksum, applied_at, duration_ms) values ($1, $2, $3, $4, $5)",
+          "insert into migrations (migration, batch, applied_at) values ($1, $2, $3)",
         ) ==
         -1,
       "the ledger was written despite the forced failure, log has ${len(db.log)} entries",
     )
     return
   }
-  panic("up: expected the forced second-statement failure to propagate")
+  panic("migrate: expected the forced second-statement failure to propagate")
 }
 
-test "sql n prints the DDL and issues zero statements to the driver" {
-  // `sql` takes no `db` parameter at all — this is a compile-time guarantee,
-  // not a runtime check, that it cannot issue anything to any driver.
-  let migrations = [migPlain(7, "seventh", "widgets", "chk7")]
-  let text = sql(Postgres{}, migrations, 7) catch e {
-    panic("sql: ${e.message()}")
+test "rollback is a no-op when nothing has ever been applied" {
+  let db = rnExecutor{ history = []HistoryEntry(0), log = []string(0), failOn = "" }
+  let migrations = [MigrationFile{ name = "0001_init", m = migPlain("widgets") }]
+  let report = rollback(db, pgDialect(), migrations) catch e {
+    panic("rollback: ${e.message()}")
   }
-  assert(contains(text, "add column"), "expected DDL text, got: ${text}")
-  assert(contains(text, "\"note\""), "expected the column name in the DDL: ${text}")
+  assert(len(report.reverted) == 0, "expected zero reverted, got ${len(report.reverted)}")
+  assert(
+    indexOf(db.log, "delete from migrations where migration = $1") == -1,
+    "rollback with nothing applied issued a delete",
+  )
 }
 
-test "down refuses a migration whose recorded applied_at is older than the configured window" {
+test "rollback reverts only the highest batch, newest file first, leaving earlier batches untouched" {
   let db = rnExecutor{
     history = [
-      HistoryEntry{
-        version = 1,
-        name = "init",
-        checksum = "chk1",
-        appliedAt = 1000,
-        durationMs = 2,
-      },
+      HistoryEntry{ migration = "0001_a", batch = 1, appliedAt = 1000 },
+      HistoryEntry{ migration = "0002_b", batch = 1, appliedAt = 1000 },
+      HistoryEntry{ migration = "0003_c", batch = 2, appliedAt = 2000 },
+      HistoryEntry{ migration = "0004_d", batch = 2, appliedAt = 2000 },
     ],
     log = []string(0),
     failOn = "",
   }
-  let migrations = [migPlain(1, "init", "widgets", "chk1")]
-  let tenSeconds = 10000000000
-  let oneSecond = 1000000000
-  down(db, pgDialect(), migrations, Timestamp{ ns = 1000 + tenSeconds }, oneSecond) catch e {
-    assert(contains(e.message(), "older than"), "unexpected error: ${e.message()}")
-    assert(len(db.history) == 1, "down must not have reverted anything")
+  let migrations = [
+    MigrationFile{ name = "0001_a", m = migPlain("widgets") },
+    MigrationFile{ name = "0002_b", m = migPlain("widgets") },
+    MigrationFile{ name = "0003_c", m = migPlain("widgets") },
+    MigrationFile{ name = "0004_d", m = migPlain("widgets") },
+  ]
+  let report = rollback(db, pgDialect(), migrations) catch e {
+    panic("rollback: ${e.message()}")
+  }
+  assert(
+    len(report.reverted) == 2,
+    "expected 2 reverted (batch 2 only), got ${len(report.reverted)}",
+  )
+  assert(
+    report.reverted[0].name == "0004_d" && report.reverted[1].name == "0003_c",
+    "expected newest-file-first order within the batch, got ${report.reverted[0].name}/${report.reverted[1].name}",
+  )
+  assert(len(db.history) == 2, "expected 2 rows left (batch 1), got ${len(db.history)}")
+  assert(
+    db.history[0].migration == "0001_a" && db.history[1].migration == "0002_b",
+    "batch 1 rows were touched: ${db.history[0].migration}/${db.history[1].migration}",
+  )
+}
+
+// #6309's own live proof (.claude/kb/data-packages-dx.md "Migrations,
+// approved 2026-09-30"): two files migrate as batch 1, a third migrates
+// later as batch 2, and rollback undoes ONLY the third — never the whole
+// history. See `runner.bit`'s own `newestFirstInBatch` for the one-line
+// mutation (filter the WHOLE of `history` instead of just the highest
+// `batch`) this test exists to catch.
+class rn6309CreateA {
+  up(s: Schema): ()! {
+    s.create("rn6309_a", (t) => {
+      t.id()
+      t.string("name")
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("rn6309_a")?
+  }
+}
+
+class rn6309CreateB {
+  up(s: Schema): ()! {
+    s.create("rn6309_b", (t) => {
+      t.id()
+      t.string("name")
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("rn6309_b")?
+  }
+}
+
+class rn6309CreateC {
+  up(s: Schema): ()! {
+    s.create("rn6309_c", (t) => {
+      t.id()
+      t.string("name")
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("rn6309_c")?
+  }
+}
+
+fn rn6309TableExists(db: Data, name: string): bool! {
+  let rows = db.query(
+    "select count(*) from information_schema.tables where table_name = $1", [Value.Text(name)],
+  )?
+  defer rows.close()
+  if (!rows.next()?) {
+    return false
+  }
+  return asInt(rows.value(0))? > 0
+}
+
+test "live: two migrations apply as batch 1, a third applies later as batch 2, rollback undoes only the third (#6309)" {
+  let uri = env("ORM_TEST_LIVE_PG_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_PG_URI is unset, no live server to talk to")
     return
   }
-  panic("down: expected the age-window refusal, got success")
-}
+  let db = pool(adapter(), Datasource{ uri = uri }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  db.exec("drop table if exists rn6309_a", []Value(0)) catch e {
+    panic("drop rn6309_a: ${e.message()}")
+  }
+  db.exec("drop table if exists rn6309_b", []Value(0)) catch e {
+    panic("drop rn6309_b: ${e.message()}")
+  }
+  db.exec("drop table if exists rn6309_c", []Value(0)) catch e {
+    panic("drop rn6309_c: ${e.message()}")
+  }
+  db.exec("drop table if exists migrations", []Value(0)) catch e {
+    panic("drop migrations: ${e.message()}")
+  }
 
-test "down reverts the last migration when within the configured window" {
-  let db = rnExecutor{
-    history = [
-      HistoryEntry{
-        version = 1,
-        name = "init",
-        checksum = "chk1",
-        appliedAt = 1000,
-        durationMs = 2,
-      },
-    ],
-    log = []string(0),
-    failOn = "",
+  let dialect = pgDialect()
+  let a = MigrationFile{ name = "0001_create_a", m = rn6309CreateA{} }
+  let b = MigrationFile{ name = "0002_create_b", m = rn6309CreateB{} }
+  let c = MigrationFile{ name = "0003_create_c", m = rn6309CreateC{} }
+
+  let firstReport = migrate(db, dialect, [a, b], Timestamp{ ns = 1000 }) catch e {
+    panic("LIVE PROOF FAILED: migrate (batch 1): ${e.message()}")
   }
-  let migrations = [migPlain(1, "init", "widgets", "chk1")]
-  let oneSecond = 1000000000
-  let tenSeconds = 10000000000
-  let reverted = down(db, pgDialect(), migrations, Timestamp{ ns = 1000 + oneSecond }, tenSeconds) catch e {
-    panic("down: ${e.message()}")
+  if (len(firstReport.applied) != 2) {
+    panic("LIVE PROOF FAILED: expected 2 applied in batch 1, got ${len(firstReport.applied)}")
   }
-  assert(reverted.version == 1, "expected version 1 reverted, got ${reverted.version}")
-  assert(len(db.history) == 0, "expected schema_history emptied, got ${len(db.history)} rows")
+  if (firstReport.applied[0].batch != 1 || firstReport.applied[1].batch != 1) {
+    panic("LIVE PROOF FAILED: expected batch 1 for both first-run migrations")
+  }
+
+  let secondReport = migrate(db, dialect, [a, b, c], Timestamp{ ns = 2000 }) catch e {
+    panic("LIVE PROOF FAILED: migrate (batch 2): ${e.message()}")
+  }
+  if (len(secondReport.applied) != 1 || secondReport.applied[0].name != "0003_create_c") {
+    panic("LIVE PROOF FAILED: expected exactly 0003_create_c applied second, got ${len(secondReport.applied)} row(s)")
+  }
+  if (secondReport.applied[0].batch != 2) {
+    panic("LIVE PROOF FAILED: expected batch 2, got ${secondReport.applied[0].batch}")
+  }
+
+  let rolled = rollback(db, dialect, [a, b, c]) catch e {
+    panic("LIVE PROOF FAILED: rollback: ${e.message()}")
+  }
+  if (len(rolled.reverted) != 1 || rolled.reverted[0].name != "0003_create_c") {
+    panic("LIVE PROOF FAILED: rollback must undo only the newest batch (0003_create_c), got ${len(rolled.reverted)} row(s)")
+  }
+
+  let aExists = rn6309TableExists(db, "rn6309_a") catch e {
+    panic("check rn6309_a: ${e.message()}")
+  }
+  let bExists = rn6309TableExists(db, "rn6309_b") catch e {
+    panic("check rn6309_b: ${e.message()}")
+  }
+  let cExists = rn6309TableExists(db, "rn6309_c") catch e {
+    panic("check rn6309_c: ${e.message()}")
+  }
+  if (!aExists || !bExists) {
+    panic("LIVE PROOF FAILED: rollback must not have touched batch 1's tables")
+  }
+  if (cExists) {
+    panic("LIVE PROOF FAILED: rollback's down() must have dropped rn6309_c")
+  }
+
+  let historyAfter = loadHistory(db) catch e {
+    panic("loadHistory: ${e.message()}")
+  }
+  if (len(historyAfter) != 2) {
+    panic("LIVE PROOF FAILED: expected 2 migrations rows left, got ${len(historyAfter)}")
+  }
+
+  db.exec("drop table if exists rn6309_a", []Value(0)) catch e {
+    panic("cleanup rn6309_a: ${e.message()}")
+  }
+  db.exec("drop table if exists rn6309_b", []Value(0)) catch e {
+    panic("cleanup rn6309_b: ${e.message()}")
+  }
+  db.exec("drop table if exists migrations", []Value(0)) catch e {
+    panic("cleanup migrations: ${e.message()}")
+  }
+  db.close()
 }
