@@ -972,6 +972,41 @@ fn main() {
   dispatch (§14.3) - a static method cannot be called through one, since an
   interface value carries no type to call a static method on, only an
   instance's method table.
+- A static method of a **generic class** called through the class's bare name
+  infers the class's type arguments from its arguments as a generic call does
+  (§15.3), positional or named (§12.11); a static method's own type
+  parameters (`static own<U>(u: U)`) are inferred the same way:
+
+  ```
+  class Pair<A, B> {
+    a: A
+    b: B
+
+    init(first: A, second: B) {
+      this.a = first
+      this.b = second
+    }
+
+    static make(first: A, second: B): Pair<A, B> {
+      return Pair<A, B>(first, second)
+    }
+
+    static tag(n: int): string {
+      return "#${n}"
+    }
+  }
+
+  fn main() {
+    let p = Pair.make(second = "s", first = 7)
+    print("${p.a} ${p.b} ${Pair.tag(1)}")
+  }
+  ```
+
+  `Pair.make(...)` is `Pair<i64, string>.make(...)`. A method that mentions
+  none of the class's type parameters, like `tag`, needs none. A class type
+  parameter the method mentions that no argument binds cannot be inferred and
+  is `E0068`, "cannot infer type parameter 'B' of 'Pair'; write
+  Pair<A, B>.blank(...)", where `Pair<i64, bool>.blank(...)` names it.
 
 ### 10.5 Class Declarations
 
