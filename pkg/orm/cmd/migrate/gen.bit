@@ -1,0 +1,264 @@
+// pkg/orm/cmd/migrate/gen.bit — `bit migrate` (O4, #6313). This directory
+// ships ONLY `gen.bit` — no static `main.bit` — because `bit migrate`'s own
+// entry point is entirely generated: `compiler/pkgcmd.bit`'s `runPkgCmd`
+// builds and runs whatever `gen.bit` writes to
+// `.bit/cmd/migrate/main.bit` (SPEC §17.7 "Package commands", "a command
+// whose main.bit is entirely generated ships only gen.bit").
+//
+// STDLIB ONLY — this file is built and run BEFORE the generated `main.bit`
+// even exists, so it cannot import "orm" itself (`migrateMain`/
+// `MigrationFile` are only reachable from the file it writes).
+//
+// CONTRACT (settled by #6306's own comment on this ticket): invoked as
+// `<genBin> <projectRoot>` with `projectRoot` ALSO this process's own cwd
+// (a `/bin/sh` wrapper does the `cd`, `runGenWithCwd`, pkgcmd.bit). Reads
+// `<projectRoot>/migrations/`, requires each `*.bit` file there to be named
+// `YYYY_MM_DD_HHMMSS_<snake_name>.bit` and declare exactly one
+// `export class <Name>`, sorts by file name (lexical order == chronological
+// order, by construction), and writes `<projectRoot>/.bit/cmd/migrate/
+// main.bit` importing those classes from `"../../../migrations"` and
+// calling `orm.migrateMain([MigrationFile{ name = "...", m = X{} }, ...],
+// args())`. The cache directory itself (`.bit/cmd/migrate/`) already
+// exists by the time this runs — `runPkgCmd` creates it before invoking
+// `gen.bit` at all (`ensurePkgCmdCacheDir`).
+//
+// ZERO MIGRATION FILES IS NOT AN ERROR: the generated `main.bit` prints
+// "no migrations pending" and exits 0 for every subcommand, without ever
+// opening a database connection — there is nothing a migrate/rollback/
+// status call against zero migrations could usefully report that isn't
+// already this one line.
+//
+// A BAD FILE NAME, or a file with zero or more than one `export class`,
+// stops here (nonzero exit) BEFORE any `main.bit` is written — `runPkgCmd`
+// then reports "gen.bit exited N" and the whole `bit migrate` invocation
+// fails, exactly like a bad migration should. TWO FILES DECLARING THE SAME
+// CLASS NAME fail the same way, naming both files, rather than relying on
+// the redeclaration error the generated `main.bit`'s own build would
+// otherwise raise once it tried to import both — this file's message is
+// the one a user actually sees.
+import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, join, split, trimSpace } from "std/strings"
+import { sorted } from "std/sort"
+import { args } from "std/os"
+
+// The fixed `YYYY_MM_DD_HHMMSS_` prefix, spelled as one character per
+// position: `D` means "any digit", anything else is matched literally.
+// Data-driven on purpose — a chain of one `if` per digit group blew past
+// spec/LINT.md's complexity ceiling for a single function; this collapses
+// every position into the same loop (`matchesPrefix`, below).
+const migrationPrefixSpec: string = "DDDD_DD_DD_DDDDDD_"
+const migrationPrefixLen: int = 18 // len(migrationPrefixSpec)
+
+const exportClassPrefix: string = "export class "
+
+// One migration file gen.bit accepted: its own name, the name `migrate`/
+// `rollback`/`status` record it under (the file name minus `.bit`, matching
+// `pkg/orm/docs/migrate.md`'s own registry example), and the exported class
+// implementing it.
+class MigrationEntry {
+  fileName: string,
+  migrationName: string,
+  className: string,
+}
+
+fn isDigitChar(c: byte): bool {
+  return c >= '0' && c <= '9'
+}
+
+// `[a-z0-9_]` — the ticket's own filename regex restricts the name segment
+// to lowercase, never uppercase, unlike a class name.
+fn isNameChar(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn isIdentChar(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn matchesPrefix(stem: string): bool {
+  let i = 0
+  while (i < migrationPrefixLen) {
+    let want = migrationPrefixSpec[i]
+    let got = stem[i]
+    if (want == 'D') {
+      if (!isDigitChar(got)) {
+        return false
+      }
+    } else {
+      if (got != want) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn allNameChars(s: string, start: int): bool {
+  let i = start
+  while (i < len(s)) {
+    if (!isNameChar(s[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `^\d{4}_\d{2}_\d{2}_\d{6}_[a-z0-9_]+$` against `stem` (the file name with
+// `.bit` already stripped by the caller) — the prefix is fixed-width
+// (`matchesPrefix`), the name segment is `allNameChars`, one or more chars.
+fn matchesMigrationStem(stem: string): bool {
+  if (len(stem) <= migrationPrefixLen) {
+    return false
+  }
+  if (!matchesPrefix(stem)) {
+    return false
+  }
+  return allNameChars(stem, migrationPrefixLen)
+}
+
+fn isMigrationFilename(name: string): bool {
+  if (!hasSuffix(name, ".bit")) {
+    return false
+  }
+  return matchesMigrationStem(name[0:len(name) - 4])
+}
+
+// The identifier starting at `rest[0]` (already past `"export class "`),
+// stopping at the first character that cannot appear in a Bit identifier —
+// whitespace before `{`, a generic `<`, a trailing comment, etc.
+fn className(rest: string): string {
+  let i = 0
+  while (i < len(rest) && isIdentChar(rest[i])) {
+    i = i + 1
+  }
+  return rest[0:i]
+}
+
+// Every `export class <Name>` line in `content`, in file order — a plain
+// line scan, not a parse: this is a small code generator, not a second Bit
+// front end. A commented-out line (`//` after trimming) never counts.
+fn exportedClassNames(content: string): []string {
+  let names = []string(0)
+  for line of split(content, "\n") {
+    let t = trimSpace(line)
+    if (hasPrefix(t, "//")) {
+      continue
+    }
+    if (!hasPrefix(t, exportClassPrefix)) {
+      continue
+    }
+    names = append(names, className(t[len(exportClassPrefix):]))
+  }
+  return names
+}
+
+fn oneExportedClass(migDir: string, fileName: string): string! {
+  let content = readFile("${migDir}/${fileName}")?
+  let names = exportedClassNames(content)
+  if (len(names) != 1) {
+    fail newError("pkg/orm: migrate: ${fileName}: must declare exactly one \"export class <Name>\" (found ${len(names)})")
+  }
+  return names[0]
+}
+
+fn bitFileNames(names: []string): []string {
+  let out = []string(0)
+  for n of names {
+    if (hasSuffix(n, ".bit")) {
+      out = append(out, n)
+    }
+  }
+  return out
+}
+
+// `fileNames`, already sorted, validated and paired with the one exported
+// class each declares — fails naming the file on a bad name, and naming
+// BOTH files on a class name two of them share.
+fn buildEntries(migDir: string, fileNames: []string): []MigrationEntry! {
+  let entries = []MigrationEntry(0)
+  let seen = map<string, string>{}
+  for n of fileNames {
+    if (!isMigrationFilename(n)) {
+      fail newError("pkg/orm: migrate: ${n}: migration file names must match YYYY_MM_DD_HHMMSS_name.bit")
+    }
+    let cls = oneExportedClass(migDir, n)?
+    let (other, dup) = seen[cls]
+    if (dup) {
+      fail newError("pkg/orm: migrate: duplicate migration class ${cls} in ${other} and ${n}")
+    }
+    seen[cls] = n
+    entries = append(
+      entries,
+      MigrationEntry{ fileName = n, migrationName = n[0:len(n) - 4], className = cls },
+    )
+  }
+  return entries
+}
+
+// `<projectRoot>/migrations/`'s own `.bit` files, sorted by name (chronological
+// order, by construction) and validated. A missing or non-directory
+// `migrations/` is zero entries, never an error — a fresh project has run no
+// `bit make migration` yet.
+fn collectMigrations(migDir: string): []MigrationEntry! {
+  if (!exists(migDir) || !isDir(migDir)) {
+    return []MigrationEntry(0)
+  }
+  let names = readDir(migDir)?
+  let sortedNames = sorted(bitFileNames(names), (a, b) => a < b)
+  return buildEntries(migDir, sortedNames)?
+}
+
+fn renderEmptyMain(): string {
+  return "// generated by pkg/orm/cmd/migrate/gen.bit — do not edit\n" +
+    "fn main(): int {\n" +
+    "  println(\"no migrations pending\")\n" +
+    "  return 0\n" +
+    "}\n"
+}
+
+fn renderPopulatedMain(entries: []MigrationEntry): string {
+  let classNames = []string(0)
+  for e of entries {
+    classNames = append(classNames, e.className)
+  }
+  let out = "// generated by pkg/orm/cmd/migrate/gen.bit — do not edit\n" +
+    "import { migrateMain, MigrationFile } from \"orm\"\n" +
+    "import { ${join(classNames, ", ")} } from \"../../../migrations\"\n" +
+    "import { args } from \"std/os\"\n\n" +
+    "fn main(): int {\n" +
+    "  return migrateMain(\n" +
+    "    [\n"
+  for e of entries {
+    out = out + "      MigrationFile{ name = \"${e.migrationName}\", m = ${e.className}{} },\n"
+  }
+  out = out + "    ],\n" + "    args(),\n" + "  )\n" + "}\n"
+  return out
+}
+
+fn renderMain(entries: []MigrationEntry): string {
+  if (len(entries) == 0) {
+    return renderEmptyMain()
+  }
+  return renderPopulatedMain(entries)
+}
+
+fn main(): int {
+  let a = args()
+  if (len(a) < 2) {
+    eprint("pkg/orm: migrate: gen: missing project root argument\n")
+    return 1
+  }
+  let root = a[1]
+  let entries = collectMigrations("${root}/migrations") catch e {
+    eprint("${e.message()}\n")
+    return 1
+  }
+  let outPath = "${root}/.bit/cmd/migrate/main.bit"
+  writeFile(outPath, renderMain(entries)) catch e {
+    eprint("pkg/orm: migrate: gen: cannot write ${outPath}: ${e.message()}\n")
+    return 1
+  }
+  return 0
+}
