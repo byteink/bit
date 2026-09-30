@@ -111,7 +111,11 @@ of the app agrees on them without talking to each other.
 
 The scheduler's loop can fall behind: the process is paused, the machine
 sleeps, the database was unreachable for ten minutes. When it catches up,
-several ticks are due at once, and `missed` says what to do about them:
+ticks are due that the scheduler did not reach on time, and `missed` says
+what to do about them. A tick is on time when the scheduler reaches it within
+one `pollInterval` of its due time, which is how a healthy loop wakes up; it
+is always enqueued, whatever `missed` says. A tick reached later than that is
+missed, even when it is the only one:
 
 - `Missed.Skip` drops every missed tick. Use it when only the freshest
   answer matters, like a cache warm-up.
@@ -124,9 +128,19 @@ several ticks are due at once, and `missed` says what to do about them:
   one. The cap is a promise that a long outage produces a bounded burst of
   jobs, not thousands.
 
-A single due tick is the schedule running on time, never a miss, so `Skip`
-does not suppress it. `missedEnqueueCount` is the arithmetic the scheduler
-uses, exposed so you can check a policy against your own numbers:
+The nightly digest runs at 02:00, and the app is down across that run:
+
+```text
+02:00  the digest is due; nothing is running
+02:30  the app starts: the 02:00 tick is 30 minutes late, so it is missed
+       Skip enqueues nothing and waits for 02:00 tomorrow
+       RunOnce and RunAll(cap) enqueue the digest once
+```
+
+Had the scheduler reached that tick 1 ms after 02:00, it would be on time and
+every policy, `Skip` included, would enqueue it. `missedEnqueueCount` is the
+arithmetic the scheduler uses, exposed so you can check a policy against your
+own numbers:
 
 ```bit
 import { missedEnqueueCount } from "jobs"
@@ -153,9 +167,7 @@ Mon 09:00  the app starts: the last enqueued tick is Thu 02:00
 Tue 02:00  the next tick, on time
 ```
 
-One missed tick is still "the schedule running on time": an app down across
-a single 02:00 and started at 02:30 runs that digest under every policy. A
-schedule that never fired starts at its first tick after the app starts, and
+A schedule that never fired starts at its first tick after the app starts, and
 without a `Locker` there is nothing to read, so a restart starts each
 schedule at its first tick after it starts.
 
