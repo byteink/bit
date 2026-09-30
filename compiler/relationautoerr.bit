@@ -56,15 +56,12 @@
 //      question than "does some call's ARGUMENT resolve" (R2/R2b's own
 //      per-parameter fixed point already answers that, correctly, for
 //      every read this pass lets through) — a function called only with
-//      untraceable arguments (through a closure value, say) still counts
-//      as "known caller" here, but its own reads on that parameter are
-//      STILL caught: the untraceable argument was never resolvable at the
-//      call site either, so `relationAutoCheckCallArgs`
-//      (relationautocalls.bit) never records it, and `relationAutoResolve`
-//      still answers `found = false` at the read site for that reason.
-//      Gap 2's own caller-existence check only ever WIDENS what this pass
-//      accepts past what R2/R2b's own fixed point grounds — it can only
-//      turn a report into a pass, never introduce one.
+//      untraceable arguments still counts as "known caller" here, so its
+//      own read on the parameter passes. Those calls are caught AT THE CALL
+//      instead (#6344, `relationAutoErrCheckCall`): the argument of a
+//      parameter the callee's summary reads must reach a real query, a
+//      proven holder (relationautoholder.bit), or an earlier assignment, or
+//      it is E0300 on the argument.
 //
 // SCOPE. Five bullets, matching the plan file's own list exactly:
 //   - rows stored in a field/map/list/channel: never reach any binding this
@@ -117,18 +114,28 @@ class RelationAutoErrState {
   loaded: []RelationAutoErrLoaded,
 }
 
+// What one whole-project pass over every function shares (#6344): the
+// project-wide `calledSet`, the `holders` (relationautoholder.bit) pass one
+// FILLS and pass two READS, and `collect` — true on pass one, which reports
+// nothing and only records every store into a holder.
+class RelationAutoErrPass {
+  calledSet: map<string, bool>,
+  holders: RelationAutoHolders,
+  collect: bool,
+}
+
 // Bundles every value the walk threads through unchanged, one param instead
 // of four everywhere below (`spec/LINT.md`'s own max-params ceiling) — `st`
 // is relationauto.bit's own flow-resolution state (bindings + the converged
 // summaries), `errSt` this file's own loaded-fields accumulator, `fd` the
 // CURRENT function's own decl node (0 for a closure/generic function, never
-// seeded — this file's own header, gap 2), `calledSet`
-// `relationAutoBuildCalledSet`'s own one-shot project-wide answer.
+// seeded — this file's own header, gap 2), `pass` the project-wide state
+// above.
 class RelationAutoErrCtx {
   st: RelationAutoState,
   errSt: RelationAutoErrState,
   fd: int,
-  calledSet: map<string, bool>,
+  pass: RelationAutoErrPass,
 }
 
 // Every non-generic named free function at least one `Tag.Call` anywhere in
@@ -234,7 +241,7 @@ fn relationAutoErrReportRead(
   let fieldName = identText(c.tree, c.source, kidsOf(c.tree, node)[1])
   let className = relationAutoClassName(staticCls)
   if (flow.found && flow.paramName != "" && ctx.fd != 0) {
-    let (known, ok) = ctx.calledSet["${c.moduleId}:${ctx.fd}"]
+    let (known, ok) = ctx.pass.calledSet["${c.moduleId}:${ctx.fd}"]
     if (ok && known) {
       return // this function has a known caller somewhere in the project
     }
@@ -257,6 +264,9 @@ fn relationAutoErrReportRead(
 // STATIC type (never by `flow`, this file's own header) and reports unless
 // an earlier assignment or a provable `flow` already proves the read safe.
 fn relationAutoErrCheckRead(c: Checker, node: int, ctx: RelationAutoErrCtx) {
+  if (ctx.pass.collect) {
+    return
+  }
   let k = kidsOf(c.tree, node)
   let recv = k[0]
   let nameIdx = k[1]
@@ -274,11 +284,48 @@ fn relationAutoErrCheckRead(c: Checker, node: int, ctx: RelationAutoErrCtx) {
   if (relationAutoErrLoadedByAssignment(c, recv, fieldName, node, ctx.errSt.loaded)) {
     return
   }
-  let flow = relationAutoResolve(c, recv, ctx.st)
+  relationAutoErrJudgeFlow(c, node, staticCls, relationAutoResolve(c, recv, ctx.st), ctx)
+}
+
+// What the receiver's own resolved `flow` says about a relation read at
+// `node`: a real query is proof (the splice loads it), a holder is proven by
+// its stores, anything else is reported.
+fn relationAutoErrJudgeFlow(
+  c: Checker,
+  node: int,
+  staticCls: RelationAutoClass,
+  flow: RelationAutoFlow,
+  ctx: RelationAutoErrCtx,
+) {
   if (flow.found && flow.queryCall > 0) {
     return // reaches a real query -- relationautosplice.bit already/will handle this
   }
+  if (flow.found && relationAutoIsHolderName(flow.paramName)) {
+    relationAutoErrCheckHolderRead(c, node, staticCls, flow, ctx)
+    return
+  }
   relationAutoErrReportRead(c, node, staticCls, flow, ctx)
+}
+
+// A read on a holder (relationautoholder.bit): proven iff every store into it
+// loaded the read's full path; otherwise E0300, naming the query that stored
+// the rows when one is known.
+fn relationAutoErrCheckHolderRead(
+  c: Checker,
+  node: int,
+  staticCls: RelationAutoClass,
+  flow: RelationAutoFlow,
+  ctx: RelationAutoErrCtx,
+) {
+  let fieldName = identText(c.tree, c.source, kidsOf(c.tree, node)[1])
+  let need = relationAutoJoinPath(flow.path, fieldName)
+  let (proved, line) = relationAutoHolderProves(ctx.pass.holders, flow.paramName, need, 0)
+  if (proved) {
+    return
+  }
+  relationAutoReportUnprovable(
+    c, node, fieldName, relationAutoClassName(staticCls), relationAutoHolderHint(need, line),
+  )
 }
 
 // A simple-Ident `let` pattern bound straight to a composite literal that
@@ -336,6 +383,9 @@ fn relationAutoErrWalkLet(c: Checker, node: int, ctx: RelationAutoErrCtx) {
       letEnd,
       ctx.errSt,
     )
+    if (ctx.pass.collect) {
+      relationAutoHolderNoteLet(c, pattern, init, ctx)
+    }
     let flow = relationAutoResolve(c, init, ctx.st)
     if (!flow.found) {
       continue
@@ -356,6 +406,9 @@ fn relationAutoErrWalkForOf(c: Checker, node: int, ctx: RelationAutoErrCtx) {
   let k = kidsOf(c.tree, node)
   relationAutoErrWalk(c, k[1], ctx)
   let flow = relationAutoResolve(c, k[1], ctx.st)
+  if (ctx.pass.collect) {
+    relationAutoHolderNoteForOf(c, k[0], flow, ctx)
+  }
   let pushed = k[0] != 0 && getNode(c.tree, k[0]).tag == Tag.Ident && flow.found && flow.isSlice
   if (pushed) {
     ctx.st.bindings = append(
@@ -433,6 +486,9 @@ fn relationAutoErrWalkAssign(c: Checker, node: int, ctx: RelationAutoErrCtx) {
   for v of kidsOf(c.tree, k[1]) {
     relationAutoErrWalk(c, v, ctx)
   }
+  if (ctx.pass.collect) {
+    relationAutoHolderNoteAssign(c, node, ctx)
+  }
   if (getNode(c.tree, node).main != int(Kind.Eq)) {
     return
   }
@@ -495,8 +551,114 @@ fn relationAutoErrWalk(c: Checker, node: int, ctx: RelationAutoErrCtx) {
   if (tag == Tag.Member) {
     relationAutoErrCheckRead(c, node, ctx)
   }
+  if (tag == Tag.Call) {
+    relationAutoErrCheckCall(c, node, ctx)
+  }
+  if (ctx.pass.collect && (tag == Tag.CompositeLit || tag == Tag.MapLit)) {
+    relationAutoHolderNoteLiteral(c, node, ctx)
+  }
   for k of kidsOf(c.tree, node) {
     relationAutoErrWalk(c, k, ctx)
+  }
+}
+
+// ---- gap 3 (#6344): a row passed to a function that reads its relation ----
+//
+// `view(a)` reads `a.author` off its PARAMETER. Every read there resolves
+// (relationautocalls.bit seeds the parameter), and the function has a known
+// caller, so the read itself always passed — even when the caller's argument
+// came from raw SQL. The proof therefore belongs at the CALL: for each
+// parameter the callee's converged summary says is read, the argument must
+// reach a real query, or a holder whose every store loaded the read, or be
+// (by an earlier assignment / literal in this function) already loaded, or
+// itself be a parameter of the enclosing function (whose own callers are
+// checked the same way). Anything else is E0300 at the argument.
+
+// True when `lit` is a composite literal that sets field `name` itself.
+fn relationAutoErrLiteralSets(c: Checker, lit: int, name: string): bool {
+  if (getNode(c.tree, lit).tag != Tag.CompositeLit) {
+    return false
+  }
+  let body = kidsOf(c.tree, lit)[1]
+  if (body == 0 || getNode(c.tree, body).tag != Tag.FieldInits) {
+    return false
+  }
+  for f of kidsOf(c.tree, body) {
+    if (identText(c.tree, c.source, kidsOf(c.tree, f)[0]) == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether argument `arg`, resolving to `flow`, provably has relation `r`
+// (a path relative to the parameter's row) loaded. Only a plain name or a
+// literal can be proven loaded by assignment, and only for a flat `r`.
+fn relationAutoErrArgProvesRead(
+  c: Checker, arg: int, flow: RelationAutoFlow, r: string, ctx: RelationAutoErrCtx,
+): bool {
+  if (flow.found && flow.queryCall > 0) {
+    return true // recorded on the query: relationautosplice.bit splices it
+  }
+  if (flow.found && relationAutoIsHolderName(flow.paramName)) {
+    let (proved, _) = relationAutoHolderProves(
+      ctx.pass.holders, flow.paramName, relationAutoJoinPath(flow.path, r), 0,
+    )
+    return proved
+  }
+  if (flow.found) {
+    return true // the enclosing function's own parameter: its callers are checked
+  }
+  if (relationAutoErrLiteralSets(c, arg, r)) {
+    return true
+  }
+  return relationAutoErrLoadedByAssignment(c, arg, r, arg, ctx.errSt.loaded)
+}
+
+// One argument against one parameter's recorded reads: reports the first
+// read it cannot prove, once.
+fn relationAutoErrCheckArg(
+  c: Checker, fname: string, p: RelationAutoParamSummary, arg: int, ctx: RelationAutoErrCtx,
+) {
+  if (arg == 0 || !p.trackable) {
+    return
+  }
+  let flow = relationAutoResolve(c, arg, ctx.st)
+  for r of p.reads {
+    if (relationAutoErrArgProvesRead(c, arg, flow, r, ctx)) {
+      continue
+    }
+    report(
+      c.diags, ecRelationAutoUnprovableRead, vSpan(c, arg),
+        "relation field '${r}' on '${relationAutoClassName(p.cls)}' is read through parameter " +
+        "'${p.name}' of '${fname}', but the row passed here was not proven loaded",
+      relationAutoUnknownOriginHint(r),
+    )
+    return
+  }
+}
+
+// `node` is a `Tag.Call`. A call to a named, non-generic free function whose
+// summary records reads on a parameter is checked argument by argument
+// (`relationAutoArgExprs`, the same argument-to-parameter matching R2/R2b use).
+fn relationAutoErrCheckCall(c: Checker, node: int, ctx: RelationAutoErrCtx) {
+  if (ctx.pass.collect) {
+    return
+  }
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let name = identText(c.tree, c.source, callee)
+  let (summary, ok) = relationAutoLookupSummary(c, name, callee, ctx.st)
+  if (!ok) {
+    return
+  }
+  let args = relationAutoArgExprs(c, node, summary.params)
+  let i = 0
+  while (i < len(args) && i < len(summary.params)) {
+    relationAutoErrCheckArg(c, name, summary.params[i], args[i], ctx)
+    i = i + 1
   }
 }
 
@@ -508,7 +670,7 @@ fn relationAutoErrCheckOneFunc(
   c: Checker,
   fd: int,
   sums: RelationAutoFuncSummaries,
-  calledSet: map<string, bool>,
+  pass: RelationAutoErrPass,
 ) {
   let (idx, hasIdx) = sums.declToIndex["${c.moduleId}:${fd}"]
   let bindings = []RelationAutoBinding(0)
@@ -522,19 +684,56 @@ fn relationAutoErrCheckOneFunc(
     returnCandidate = relationAutoNoFlow(c),
   }
   let ctx = RelationAutoErrCtx{
-    st = st, errSt = RelationAutoErrState{ loaded = []RelationAutoErrLoaded(0) }, fd = namedFd, calledSet = calledSet,
+    st = st, errSt = RelationAutoErrState{ loaded = []RelationAutoErrLoaded(0) }, fd = namedFd, pass = pass,
   }
   relationAutoErrWalk(c, lintFuncInfo(c.tree, fd).body, ctx)
 }
 
-// Entry point — called once from `relationAutoAnalyzeProject`
-// (relationauto.bit), after the whole-project fixed point (R2b,
-// relationautocalls.bit) has converged.
-fn relationAutoCheckErrors(mods: []Checker, sums: RelationAutoFuncSummaries) {
-  let calledSet = relationAutoBuildCalledSet(mods)
+// One whole-project sweep over every function; pass one (`pass.collect`) also
+// sweeps each module's top level, where a module-level `let`/literal can
+// store a row into a holder outside any function.
+fn relationAutoErrSweep(
+  mods: []Checker,
+  sums: RelationAutoFuncSummaries,
+  pass: RelationAutoErrPass,
+) {
   for c of mods {
     for fd of lintCollectFuncs(c.tree, c.tree.root, []int(0)) {
-      relationAutoErrCheckOneFunc(c, fd, sums, calledSet)
+      relationAutoErrCheckOneFunc(c, fd, sums, pass)
+    }
+    if (pass.collect) {
+      relationAutoErrCollectTopLevel(c, sums, pass)
     }
   }
+}
+
+fn relationAutoErrCollectTopLevel(
+  c: Checker,
+  sums: RelationAutoFuncSummaries,
+  pass: RelationAutoErrPass,
+) {
+  let st = RelationAutoState{
+    bindings = []RelationAutoBinding(0), summaries = sums, paramReads = map<string, []string>{},
+    returnSeen = false, returnCandidate = relationAutoNoFlow(c),
+  }
+  let ctx = RelationAutoErrCtx{
+    st = st, errSt = RelationAutoErrState{ loaded = []RelationAutoErrLoaded(0) }, fd = 0, pass = pass,
+  }
+  relationAutoErrWalk(c, c.tree.root, ctx)
+}
+
+// Entry point — called once from `relationAutoAnalyzeProject`
+// (relationauto.bit), after the whole-project fixed point (R2b,
+// relationautocalls.bit) has converged. Two sweeps (#6344): the first only
+// collects every store into a holder (relationautoholder.bit), the second
+// reports.
+fn relationAutoCheckErrors(mods: []Checker, sums: RelationAutoFuncSummaries) {
+  let calledSet = relationAutoBuildCalledSet(mods)
+  let holders = relationAutoNewHolders()
+  relationAutoErrSweep(
+    mods, sums, RelationAutoErrPass{ calledSet = calledSet, holders = holders, collect = true },
+  )
+  relationAutoErrSweep(
+    mods, sums, RelationAutoErrPass{ calledSet = calledSet, holders = holders, collect = false },
+  )
 }
