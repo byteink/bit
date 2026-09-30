@@ -1,0 +1,162 @@
+// _tests_/bit/dockerlive/dockerlive.bit — the Docker plumbing every live
+// harness shares (redislive, s3live, ormlive, webguidesapp, jobslive; #6353).
+//
+// THE DEFECT THIS CLOSES. Each harness used to probe `docker info` once with a
+// 10 s budget and, when that failed or was slow, print "skipped: docker
+// unavailable" and exit 0. A live gate exists only to run against a real
+// server, so a gate that skips is green having run nothing: it happened twice
+// on 2026-09-30, once hiding a mutated package, both times with Docker Desktop
+// up but loaded by another session.
+//
+// THE RULE NOW. `requireDocker` is the only way a harness gets a docker
+// binary. It probes up to `probeAttempts` times (a slow-but-alive daemon is
+// waited for, budget `probeAttempts * dockerQuickTimeoutMs` plus the gaps)
+// and, if every attempt fails, exits 1 naming the last probe error and how
+// long the whole probe took. The one remaining skip is an explicit opt-out,
+// `BIT_LIVE_OPTIONAL=1`, which nothing in this repo sets.
+//
+// `failureText` is the one place a failed child's message is built, so a
+// timed-out docker call says "timed out after Nms" instead of printing an
+// empty stderr (s3live's `docker run: ` on 2026-09-30).
+
+import { output, RunResult } from "std/process"
+import { envOr, exit } from "std/os"
+import { exists } from "std/fs"
+import { join, lastIndexOf, parseInt, split, trimSpace } from "std/strings"
+import { sleep, monotonic, since, Millisecond } from "std/time"
+
+// A `docker` call that returns at once (info, port, ps, exec): 10 s.
+export const dockerQuickTimeoutMs: int = 10000
+// A `docker` call that may pull an image or boot a container: 30 s.
+export const dockerRunTimeoutMs: int = 30000
+
+const probeAttempts: int = 3
+const probeGapMs: int = 2000
+const optionalEnv: string = "BIT_LIVE_OPTIONAL"
+// `std/process`'s `output` reports a child killed at its deadline as -2.
+const timedOutCode: int = -2
+
+// `std/process` execs directly with no PATH search (its own doc comment), so
+// `docker`/`openssl` have to be found by hand — a fixed, bounded list of the
+// paths Docker Desktop and this repo's package managers actually install to,
+// not a filesystem search.
+export fn findBin(candidates: []string): string {
+  let i = 0
+  while (i < len(candidates)) {
+    if (exists(candidates[i])) {
+      return candidates[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn dockerCandidates(): []string {
+  return ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/usr/bin/docker"]
+}
+
+// Why a finished child failed, for an error message: "timed out after Nms"
+// when it was killed at its deadline (its stderr is empty then), else its
+// trimmed stderr, else its exit code when it said nothing.
+export fn failureText(r: RunResult, timeoutMs: int): string {
+  if (r.exitCode == timedOutCode) {
+    return "timed out after ${timeoutMs}ms"
+  }
+  let msg = trimSpace(r.stderr)
+  if (msg == "") {
+    return "exited ${r.exitCode} with no stderr"
+  }
+  return msg
+}
+
+// One `docker info`; "" when the daemon answered, else why it did not.
+fn probeOnce(bin: string): string {
+  let r = output(bin, ["info"], dockerQuickTimeoutMs)
+  if (r.exitCode == 0) {
+    return ""
+  }
+  return failureText(r, dockerQuickTimeoutMs)
+}
+
+// Up to `probeAttempts` probes with a short gap; "" on the first success,
+// else the last attempt's failure.
+fn probe(bin: string): string {
+  let why = ""
+  let i = 0
+  while (i < probeAttempts) {
+    why = probeOnce(bin)
+    if (why == "") {
+      return ""
+    }
+    i = i + 1
+    if (i < probeAttempts) {
+      sleep(probeGapMs * Millisecond)
+    }
+  }
+  return "`docker info` failed ${probeAttempts} times, last: ${why}"
+}
+
+// Why no docker is usable: "" when it is.
+fn unavailableReason(bin: string): string {
+  if (bin == "") {
+    return "no docker binary at ${join(dockerCandidates(), ", ")}"
+  }
+  return probe(bin)
+}
+
+// The docker binary, or the process exits: 1 naming the probe error and how
+// long probing took, or 0 with "skipped: ..." only under BIT_LIVE_OPTIONAL=1.
+// `who` prefixes the message (the harness's own name).
+export fn requireDocker(who: string): string {
+  let bin = findBin(dockerCandidates())
+  let start = monotonic()
+  let why = unavailableReason(bin)
+  if (why == "") {
+    return bin
+  }
+  let took = since(start) / Millisecond
+  if (envOr(optionalEnv, "") == "1") {
+    print("skipped: docker unavailable (${optionalEnv}=1): ${why} (${took}ms)\n")
+    exit(0)
+    return ""
+  }
+  eprint("${who}: docker unavailable after ${took}ms: ${why}\n")
+  eprint("${who}: a live gate that skips is green having run nothing; set ${optionalEnv}=1 to skip on purpose\n")
+  exit(1)
+  return ""
+}
+
+export fn dockerRun(bin: string, args: []string): ()! {
+  let r = output(bin, args, dockerRunTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker ${args[0]}: ${failureText(r, dockerRunTimeoutMs)}")
+  }
+}
+
+// The host port docker published for `name`'s `containerPort` ("5432/tcp").
+export fn hostPort(bin: string, name: string, containerPort: string): int! {
+  let r = output(bin, ["port", name, containerPort], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("docker port ${name}: ${failureText(r, dockerQuickTimeoutMs)}")
+  }
+  let lines = split(trimSpace(r.stdout), "\n")
+  if (len(lines) == 0 || lines[0] == "") {
+    fail newError("docker port ${name}: no mapping printed")
+  }
+  let colon = lastIndexOf(lines[0], ":")
+  if (colon < 0) {
+    fail newError("docker port ${name}: unexpected output '${lines[0]}'")
+  }
+  return parseInt(lines[0][colon + 1:])?
+}
+
+// Relays a `bit test` child's streams and returns its exit code, saying so
+// when the deadline killed it: `who` names the harness.
+export fn relay(r: RunResult, who: string, timeoutMs: int): int {
+  print(r.stdout)
+  eprint(r.stderr)
+  if (r.exitCode == timedOutCode) {
+    eprint("${who}: timed out after ${timeoutMs}ms\n")
+  }
+  return r.exitCode
+}
