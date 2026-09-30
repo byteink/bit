@@ -2182,6 +2182,12 @@ constraint     = type_name { "&" type_name } .   (* one or more interface bounds
   no runtime type erasure and no boxing of type parameters.
 - Call-site type arguments are usually inferred (§15.3); explicit arguments use
   `f<T>(...)` and are disambiguated per §12.7.
+- A type argument list must have exactly the declaration's own length, wherever
+  it is written: a type position (`let x: Pair<i64>` against `Pair<A, B>`), a
+  composite literal, a construction, or the explicit arguments of a call. A type
+  that takes none (a non-generic class, a predeclared type, a type parameter)
+  takes no list, and a generic type written with none where a type is required
+  (`let x: Pair`) is refused. Each is **E0058**.
 
 Example:
 
