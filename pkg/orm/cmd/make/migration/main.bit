@@ -1,0 +1,338 @@
+// pkg/orm/cmd/make/migration/main.bit — `bit make migration <name>` (O5,
+// #6314, SPEC §17.7's "Package commands": "`pkg/orm/cmd/make/migration/
+// main.bit` provides `bit make migration`"). Writes
+// `migrations/YYYY_MM_DD_HHMMSS_<name>.bit` (UTC) with an empty
+// `export class <PascalName>` satisfying `pkg/orm`'s structural `Migration`
+// interface (`pkg/orm/migration.bit`: "Interfaces are structural ... there
+// is no `implements`/base-type clause") — `bit migrate` (`pkg/orm/cmd/
+// migrate/gen.bit`, #6313) later discovers it by scanning `migrations/`
+// itself, so this only ever needs to produce a file that gen.bit's own
+// rules already accept: `^\d{4}_\d{2}_\d{2}_\d{6}_[a-z0-9_]+\.bit$`, exactly
+// one `export class <Name>` per file, and no class name shared with an
+// existing migration.
+//
+// A plain `main.bit`, no `gen.bit` beside it (SPEC §17.7: "a command whose
+// main.bit is entirely generated ships only gen.bit" — this one is not:
+// it is static code that runs once per invocation, writes a file and
+// exits). It is run with the invoking `bit` process's own inherited
+// working directory (`compiler/pkgcmd.bit`'s `runBuiltExe` — no chdir
+// wrapper, unlike `gen.bit`), which need not be the project root, so this
+// walks up to find `bit.json` itself, the same bounded walk `compiler/
+// pkgcmd.bit`'s own `findProjectRoot` uses (SPEC §17.7: "The project root
+// is the nearest ancestor of the current directory containing a
+// bit.json").
+//
+// A BAD NAME (anything but `[a-z0-9_]+`, non-empty) or a NAME WHOSE CLASS
+// ALREADY EXISTS in `migrations/` refuses with one stderr line and a
+// nonzero exit, before any file is written. `import { Schema } from "orm"`
+// is safe to write in every migration file: sibling files in one directory
+// module share one declaration namespace (SPEC §17.1), and identical
+// imports across them are allowed (#6326) rather than an `E0042` clash.
+//
+// TIMESTAMP MONOTONICITY: two migrations created within the same UTC
+// second (fast successive `bit make migration` calls, exactly what this
+// package's own live test does) must still sort in creation order, since
+// `bit migrate` applies `migrations/` in lexical filename order
+// (`pkg/orm/cmd/migrate/gen.bit`: "sorts by filename"). `nextStamp` bumps
+// the candidate second-by-second past the newest existing migration's own
+// timestamp prefix whenever `now()` would not already sort after it —
+// never past a fixed, small, statically bounded number of seconds
+// (`maxStampBumpSeconds`), so this can never spin.
+import { cwd, exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, toUpper, trimSpace } from "std/strings"
+import { dir as pathDir } from "std/path"
+import { args } from "std/os"
+import { now, utc } from "std/time"
+
+const migrationPrefixSpec: string = "DDDD_DD_DD_DDDDDD_"
+const migrationPrefixLen: int = 18 // len(migrationPrefixSpec)
+const exportClassPrefix: string = "export class "
+const stampPattern: string = "yyyy_MM_dd_HHmmss"
+const maxStampBumpSeconds: int = 3600 // one hour ceiling — bounds nextStamp's loop
+const maxProjectRootDepth: int = 64   // filesystem depth ceiling — bounds findRoot's walk
+
+fn isDigitChar(c: byte): bool {
+  return c >= '0' && c <= '9'
+}
+
+// `[a-z0-9_]` — the name segment of a migration file's own filename.
+fn isNameChar(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn isIdentChar(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// `^[a-z0-9_]+$` — the CLI argument itself, before any file is touched.
+fn isValidMigrationName(name: string): bool {
+  if (len(name) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (!isNameChar(name[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `add_phone_to_person` -> `AddPhoneToPerson`. `name` is already validated
+// by `isValidMigrationName`, so every part is `[a-z0-9_]*`.
+fn pascalCase(name: string): string {
+  let out = ""
+  let start = 0
+  let i = 0
+  while (i <= len(name)) {
+    if (i == len(name) || name[i] == '_') {
+      if (i > start) {
+        out = out + toUpper(name[start:start + 1]) + name[start + 1:i]
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn matchesPrefix(stem: string): bool {
+  let i = 0
+  while (i < migrationPrefixLen) {
+    let want = migrationPrefixSpec[i]
+    let got = stem[i]
+    if (want == 'D') {
+      if (!isDigitChar(got)) {
+        return false
+      }
+    } else {
+      if (got != want) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn allNameChars(s: string, start: int): bool {
+  let i = start
+  while (i < len(s)) {
+    if (!isNameChar(s[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `^\d{4}_\d{2}_\d{2}_\d{6}_[a-z0-9_]+$` against a file name with `.bit`
+// already stripped — mirrors `pkg/orm/cmd/migrate/gen.bit`'s own
+// `matchesMigrationStem`, so a name this file accepts is a name `gen.bit`
+// accepts too.
+fn matchesMigrationStem(stem: string): bool {
+  if (len(stem) <= migrationPrefixLen) {
+    return false
+  }
+  if (!matchesPrefix(stem)) {
+    return false
+  }
+  return allNameChars(stem, migrationPrefixLen)
+}
+
+fn isMigrationFilename(name: string): bool {
+  if (!hasSuffix(name, ".bit")) {
+    return false
+  }
+  return matchesMigrationStem(name[0:len(name) - 4])
+}
+
+// The identifier starting at `rest[0]` (already past `"export class "`).
+fn className(rest: string): string {
+  let i = 0
+  while (i < len(rest) && isIdentChar(rest[i])) {
+    i = i + 1
+  }
+  return rest[0:i]
+}
+
+// Every `export class <Name>` line in `content`, in file order — a line
+// scan, not a parse, matching `gen.bit`'s own `exportedClassNames`.
+fn exportedClassNames(content: string): []string {
+  let names = []string(0)
+  let lineStart = 0
+  let i = 0
+  while (i <= len(content)) {
+    if (i == len(content) || content[i] == '\n') {
+      let t = trimSpace(content[lineStart:i])
+      if (!hasPrefix(t, "//") && hasPrefix(t, exportClassPrefix)) {
+        names = append(names, className(t[len(exportClassPrefix):]))
+      }
+      lineStart = i + 1
+    }
+    i = i + 1
+  }
+  return names
+}
+
+// The existing migration file already declaring `wantClass`, or `""` when
+// none does. Scans every `.bit` file in `migDir` (not just ones matching
+// the timestamp naming pattern — a malformed existing file can still
+// collide on class name).
+fn findClassOwner(migDir: string, fileNames: []string, wantClass: string): string! {
+  for n of fileNames {
+    if (!hasSuffix(n, ".bit")) {
+      continue
+    }
+    let content = readFile("${migDir}/${n}")?
+    for cls of exportedClassNames(content) {
+      if (cls == wantClass) {
+        return n
+      }
+    }
+  }
+  return ""
+}
+
+// The newest existing migration's own timestamp prefix (18 chars), or `""`
+// when `migrations/` has no validly-named file yet. `fileNames` is already
+// sorted (`std/fs`'s own `readDir` contract), so the last match is the
+// newest.
+fn newestStampPrefix(fileNames: []string): string {
+  let latest = ""
+  for n of fileNames {
+    if (isMigrationFilename(n)) {
+      latest = n[0:migrationPrefixLen]
+    }
+  }
+  return latest
+}
+
+// `now()` in UTC, formatted `yyyy_MM_dd_HHmmss` — always succeeds (the
+// pattern is a fixed, valid literal), so a failure here is a stdlib defect,
+// never a caller mistake.
+fn currentStamp(): string {
+  return now().inZone(utc()).naive().format(stampPattern) catch e {
+    panic("pkg/orm: make migration: BUG: fixed stamp pattern failed: ${e.message()}")
+  }
+}
+
+fn nextStampAfter(stamp: string): string {
+  let bumped = now().inZone(utc()).naive()
+  let secs = 0
+  while (secs < maxStampBumpSeconds) {
+    let candidate = bumped.format(stampPattern) catch e {
+      panic("pkg/orm: make migration: BUG: fixed stamp pattern failed: ${e.message()}")
+    }
+    if (candidate > stamp) {
+      return candidate
+    }
+    bumped = bumped.addSeconds(1)
+    secs = secs + 1
+  }
+  panic("pkg/orm: make migration: BUG: could not advance past an existing timestamp within ${maxStampBumpSeconds}s")
+}
+
+// The timestamp this new migration gets: `now()`, bumped forward second by
+// second past `newest` when `now()` would not already sort strictly after
+// it — the case two `bit make migration` calls land in the same UTC
+// second.
+fn nextStamp(newest: string): string {
+  let candidate = currentStamp()
+  if (newest == "" || candidate > newest) {
+    return candidate
+  }
+  return nextStampAfter(newest)
+}
+
+// The nearest ancestor of the current directory holding a `bit.json`
+// (SPEC §17.7), mirroring `compiler/pkgcmd.bit`'s own `findProjectRoot` —
+// this file's own process is never chdir'd to the project root the way
+// `gen.bit` is (this directory ships no `gen.bit`), so it must find it
+// itself.
+fn findProjectRoot(): string! {
+  let d = cwd()?
+  let depth = 0
+  while (depth < maxProjectRootDepth) {
+    if (exists("${d}/bit.json")) {
+      return d
+    }
+    let parent = pathDir(d)
+    if (parent == d) {
+      break
+    }
+    d = parent
+    depth = depth + 1
+  }
+  fail newError("pkg/orm: make migration: no bit.json found in the current directory or its ancestors")
+}
+
+// Existing `migrations/` file names, sorted, or an empty list when the
+// directory does not exist yet — a fresh project has run no `bit make
+// migration` before.
+fn existingMigrationNames(migDir: string): []string! {
+  if (!exists(migDir) || !isDir(migDir)) {
+    return []string(0)
+  }
+  return readDir(migDir)?
+}
+
+fn renderMigration(className: string): string {
+  return "import { Schema } from \"orm\"\n\n" +
+    "export class ${className} {\n" +
+    "  up(s: Schema): ()! {\n" +
+    "  }\n\n" +
+    "  down(s: Schema): ()! {\n" +
+    "  }\n" +
+    "}\n"
+}
+
+fn writeMigrationFile(migDir: string, fileName: string, className: string): ()! {
+  if (!exists(migDir)) {
+    mkdir(migDir)?
+  }
+  writeFile("${migDir}/${fileName}", renderMigration(className))?
+}
+
+fn runMakeMigration(name: string): int {
+  if (!isValidMigrationName(name)) {
+    eprint("pkg/orm: make migration: ${name}: migration name must match [a-z0-9_]+\n")
+    return 1
+  }
+  let root = findProjectRoot() catch e {
+    eprint("${e.message()}\n")
+    return 1
+  }
+  let migDir = "${root}/migrations"
+  let fileNames = existingMigrationNames(migDir) catch e {
+    eprint("pkg/orm: make migration: ${e.message()}\n")
+    return 1
+  }
+  let cls = pascalCase(name)
+  let owner = findClassOwner(migDir, fileNames, cls) catch e {
+    eprint("pkg/orm: make migration: ${e.message()}\n")
+    return 1
+  }
+  if (owner != "") {
+    eprint("pkg/orm: make migration: ${name}: a migration class ${cls} already exists in ${owner}\n")
+    return 1
+  }
+  let stamp = nextStamp(newestStampPrefix(fileNames))
+  let fileName = "${stamp}_${name}.bit"
+  writeMigrationFile(migDir, fileName, cls) catch e {
+    eprint("pkg/orm: make migration: ${e.message()}\n")
+    return 1
+  }
+  print("created migrations/${fileName}\n")
+  return 0
+}
+
+fn main(): int {
+  let a = args()
+  if (len(a) < 2) {
+    eprint("pkg/orm: make migration: missing migration name argument\n")
+    return 1
+  }
+  return runMakeMigration(a[1])
+}

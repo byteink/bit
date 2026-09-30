@@ -55,9 +55,9 @@
 
 import { output, RunResult } from "std/process"
 import { env, envOr, exit } from "std/os"
-import { exists, mkdir, remove, writeFile } from "std/fs"
+import { exists, mkdir, readDir, remove, writeFile } from "std/fs"
 import {
-  contains, hasSuffix, indexOf, lastIndexOf, parseInt, split, trimSpace,
+  contains, hasSuffix, indexOf, join, lastIndexOf, parseInt, split, trimSpace,
 } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 import { sleep, Millisecond } from "std/time"
@@ -510,6 +510,115 @@ fn runMigrateE2E(bin: string, pgName: string, bitPath: string, repo: string, pgU
   assertMigrateE2eTablesDropped(bin, pgName)?
 }
 
+// ---- O5 (#6314): `bit make migration <name>` end-to-end, through the
+// real `bit` binary and package-command dispatch, against a SECOND fresh
+// fixture project (never the one `runMigrateE2E` already applied/rolled
+// back — a project's migration history is per-project, but sharing one
+// project would still couple the two sections' file counts together).
+// Proves the full chain `bit make migration` -> real `bit migrate`: the
+// generated file's `up`/`down` are empty (this ticket's own contract), so
+// no table is asserted here — `runMigrateE2E`, above, already proves
+// `bit migrate` executes real `Schema` ops; this proves `bit make
+// migration`'s OWN output is what gets discovered and applied.
+
+// Runs `bit make migration <name>` with `projDir` as the child process's
+// own cwd (this section's own header) — no `--url`, `bit make migration`
+// never touches a database.
+fn runMakeMigrationE2eCmd(projDir: string, bitPath: string, name: string): RunResult! {
+  let scriptPath = "${projDir}.make.cmd.sh"
+  let script = "#!/bin/sh\n" +
+    "cd '${projDir}' || exit 1\n" +
+    "exec '${bitPath}' make migration ${name}\n"
+  writeFile(scriptPath, script)?
+  return output("/bin/sh", [scriptPath], migrateE2eTimeoutMs)
+}
+
+fn writeMakeMigrationE2eFixture(repo: string, projDir: string): ()! {
+  mkdir(projDir)?
+  writeFile("${projDir}/bit.json", "{\"dependencies\": {\"orm\": \"${repo}/pkg/orm\"}}\n")?
+  writeFile("${projDir}/bit.lock", migrateE2eFixtureBitLock(repo))?
+}
+
+fn assertMakeMigrationCreated(r: RunResult, where: string): ()! {
+  requireMigrateE2eExitZero("bit make migration ${where}", r)?
+  requireMigrateE2eContains("bit make migration ${where}", r.stdout, "created migrations/")?
+}
+
+fn assertMakeMigrationRefused(r: RunResult, where: string, want: string): ()! {
+  if (r.exitCode == 0) {
+    fail newError("ormlive: make migration e2e: ${where}: exited 0, want nonzero (out=${r.stdout})")
+  }
+  if (!contains(r.stderr, want)) {
+    fail newError("ormlive: make migration e2e: ${where}: stderr missing '${want}': ${r.stderr}")
+  }
+}
+
+// `migrations/`'s own file names, sorted (`std/fs`'s own `readDir`
+// contract) — empty when the directory was never created (no successful
+// `bit make migration` call yet).
+fn listMakeMigrationFiles(projDir: string): []string! {
+  let migDir = "${projDir}/migrations"
+  if (!exists(migDir)) {
+    return []string(0)
+  }
+  return readDir(migDir)?
+}
+
+// Both files created above, minus the trailing `bit make migration`
+// itself never writes — the ledger name `bit migrate` reports for each.
+fn requireMakeMigrationTwoFilesOrdered(projDir: string): (string, string)! {
+  let sep = ", "
+  let names = listMakeMigrationFiles(projDir)?
+  if (len(names) != 2) {
+    fail newError(
+      "ormlive: make migration e2e: want 2 migration files, got ${len(names)}: ${join(names, sep)}",
+    )
+  }
+  if (!(names[0] < names[1])) {
+    fail newError("ormlive: make migration e2e: files not correctly ordered: ${join(names, sep)}")
+  }
+  return (names[0][0:len(names[0]) - 4], names[1][0:len(names[1]) - 4])
+}
+
+// `bit make migration create_make_e2e_widgets`, a duplicate of the same
+// name (refused), an invalid name (refused), then a second distinct
+// migration — each through the real package-command dispatch — followed
+// by `bit migrate` proving BOTH generated files were discovered and
+// applied, in the correct (creation) order.
+fn runMakeMigrationE2E(bitPath: string, repo: string, pgUrl: string): ()! {
+  let projDir = "${stripTrailingSlash(envOr("TMPDIR", "/tmp"))}/bit-orm-make-migration-e2e-${uuidFormat(uuidV4())}"
+  writeMakeMigrationE2eFixture(repo, projDir)?
+  defer removeMigrateE2eFixtureBestEffort(projDir)
+
+  assertMakeMigrationCreated(
+    runMakeMigrationE2eCmd(projDir, bitPath, "create_make_e2e_widgets")?, "create_make_e2e_widgets",
+  )?
+  assertMakeMigrationRefused(
+    runMakeMigrationE2eCmd(projDir, bitPath, "create_make_e2e_widgets")?,
+    "duplicate name", "already exists",
+  )?
+  assertMakeMigrationRefused(
+    runMakeMigrationE2eCmd(projDir, bitPath, "Bad-Name")?, "invalid name", "must match",
+  )?
+  assertMakeMigrationCreated(
+    runMakeMigrationE2eCmd(projDir, bitPath, "create_make_e2e_gadgets")?, "create_make_e2e_gadgets",
+  )?
+
+  let (name1, name2) = requireMakeMigrationTwoFilesOrdered(projDir)?
+  let applied = runMigrateE2eCmd(projDir, bitPath, "", pgUrl)?
+  requireMigrateE2eExitZero("bit migrate (make-migration e2e)", applied)?
+  requireMigrateE2eContains(
+    "bit migrate (make-migration e2e)",
+    applied.stdout,
+    "applied ${name1}\n",
+  )?
+  requireMigrateE2eContains(
+    "bit migrate (make-migration e2e)",
+    applied.stdout,
+    "applied ${name2}\n",
+  )?
+}
+
 fn main() {
   let bin = dockerBin()
   if (!dockerAvailable(bin)) {
@@ -554,6 +663,12 @@ fn main() {
   }
   if (rc == 0) {
     runMigrateE2E(bin, pgName, bitPath, repo, pgUrl) catch e {
+      eprint("${e.message()}\n")
+      rc = 1
+    }
+  }
+  if (rc == 0) {
+    runMakeMigrationE2E(bitPath, repo, pgUrl) catch e {
       eprint("${e.message()}\n")
       rc = 1
     }
