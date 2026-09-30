@@ -1,0 +1,427 @@
+// compiler/relationautocalls.bit — R2 (#6305, epic #6298): extends
+// `compiler/relationauto.bit`'s SAME-FUNCTION walk across a function's own
+// parameters and return value, solved to a fixed point over the call graph.
+//
+// SCOPE, restricted deliberately (a same-module call graph, exactly as R1
+// restricted itself to one function): only calls to a NAMED, non-generic,
+// SAME-MODULE free function are ever resolved — `c.funcDecls` is a flat,
+// per-module name table (compiler/check.bit), so a call through an import,
+// a method, a closure value, or a generic function's own type parameter
+// stays exactly as unprovable as it was before this file existed, same as
+// every other gap `relationauto.bit`'s own header lists. Cross-module
+// propagation and nested reads (`post.author.posts`, #6318) are left for
+// later tickets; `RelationAutoBinding`'s `paramName` tag and this file's own
+// per-parameter summary shape are already dotted-path-ready — a further
+// ticket only needs to widen "one relation name" to "one dotted path".
+//
+// THE FIXED POINT. Per non-generic function, a summary: for each parameter,
+// the relation names read on it (directly, or transitively through a
+// further call this function makes, passing that parameter along); and for
+// the return value, either a fixed real query call inside this function's
+// own body, or "forwards parameter i" untouched. A function's own summary
+// only ever GROWS (a read-name set gaining a name, a return going from
+// unresolved to resolved) as OTHER functions' summaries improve, never
+// shrinks — so recomputing every function's summary from scratch each round,
+// against the current (possibly still-incomplete) snapshot of every other
+// function's summary, is safe: anything true in an earlier round stays true.
+// Bounded (Power of 10) at `#non-generic-functions + 1` rounds — a call
+// graph with N nodes cannot need more hops than that for information to
+// reach every node — with an explicit assert on top of the loop condition.
+
+// One parameter's own summary: its declared shape (`cls`/`isSlice`,
+// `trackable` when the declared type isn't a `@table` class or a slice of
+// one) and the relation names this function's own body — or a further call
+// it makes, passing this same parameter along — reads on it.
+class RelationAutoParamSummary {
+  name: string,
+  cls: RelationAutoClass,
+  isSlice: bool,
+  trackable: bool,
+  reads: []string,
+}
+
+// This function's own return value, in terms of what PRODUCED it: a fixed
+// query call node inside this function's own body (`queryCall > 0`), or
+// this function's own parameter of that name, forwarded untouched
+// (`viaParamName != ""`) — never both. `found = false` for every other
+// shape (no return, disagreeing returns, a return this walk cannot resolve
+// at all).
+class RelationAutoReturnSummary {
+  found: bool,
+  queryCall: int,
+  viaParamName: string,
+  cls: RelationAutoClass,
+  isSlice: bool,
+}
+
+class RelationAutoFuncSummary {
+  decl: int,
+  params: []RelationAutoParamSummary,
+  ret: RelationAutoReturnSummary,
+}
+
+// One module's whole call-graph table: `declToIndex` lets a call site
+// (`c.funcDecls[name]` gives the decl node) find its callee's summary in
+// `list` — shared, mutable state one `RelationAutoState` (relationauto.bit)
+// points at for the whole of one module's round.
+class RelationAutoFuncSummaries {
+  declToIndex: map<int, int>,
+  list: []RelationAutoFuncSummary,
+}
+
+fn relationAutoNoReturnSummary(c: Checker): RelationAutoReturnSummary {
+  return RelationAutoReturnSummary{
+    found = false, queryCall = 0, viaParamName = "",
+    cls = RelationAutoClass{ found = false, oc = c, decl = 0 }, isSlice = false,
+  }
+}
+
+// `FuncDecl` is `[recv, name, generics, params, result, body, attrs?]`
+// (`lintFuncInfo`'s own header, compiler/lintapply.bit) — a generic
+// declaration's own parameter CLASS varies per instantiation, which this
+// pass's one per-declaration summary cannot represent, so it is walked
+// (same-function analysis still applies to it) but never entered into the
+// call graph.
+fn relationAutoIsNonGeneric(tree: Tree, decl: int): bool {
+  return len(kidsOf(tree, kidsOf(tree, decl)[2])) == 0
+}
+
+// `c.funcDecls` is NOT exclusively `Tag.FuncDecl` nodes: `collectExternFnDecl`
+// (compiler/checkbindfunc.bit) writes an `extern function`'s own
+// `Tag.ExternFnDecl` node into the SAME table, under the SAME flat name key,
+// with a completely different kid shape (`[name, params, result_or_none]` —
+// no generics kid at index 2, no body). Reading it as a `FuncDecl` panicked
+// index-out-of-range on `kidsOf(tree, decl)[3]` the first time this pass ran
+// over a module declaring one; an extern function has no body for
+// `relationAutoWalk` to look inside anyway, so it is simply excluded from
+// the call graph, same as any other shape this pass cannot reason about.
+fn relationAutoCollectFuncDecls(c: Checker): []int {
+  let out = []int(0)
+  for (_, decl) of c.funcDecls {
+    if (getNode(c.tree, decl).tag == Tag.FuncDecl && relationAutoIsNonGeneric(c.tree, decl)) {
+      out = append(out, decl)
+    }
+  }
+  return out
+}
+
+// Whether `ptype` is trackable as a query row: a `@table` class directly
+// (a scalar parameter) or `[]T` for one (a slice parameter) — `elementType`
+// unwraps the slice via the SAME `TypeKind.Slice`/`.elem` shape
+// `compiler/checkmatch.bit`'s own `elementType` reads, reused here directly
+// since a parameter's declared type never needs its map/iterator cases.
+fn relationAutoParamTrackable(c: Checker, ptype: int): (RelationAutoClass, bool) {
+  if (ptype != 0 && c.ctx.types[ptype].kind == TypeKind.Slice) {
+    return (relationAutoClassFromStructType(c, c.ctx.types[ptype].elem), true)
+  }
+  return (relationAutoClassFromStructType(c, ptype), false)
+}
+
+// One `Param` node's own declared type is `c.declTypes[nameNode]`
+// (compiler/checkmodule.bit's `bindParamOrReceiver`, which keys it on the
+// SAME name node this reads) — populated for every parameter by the
+// ordinary check pre-pass, well before this whole-program pass ever runs.
+fn relationAutoBuildParamSummaries(c: Checker, decl: int): []RelationAutoParamSummary {
+  let paramsNode = kidsOf(c.tree, decl)[3]
+  let out = []RelationAutoParamSummary(0)
+  for p of kidsOf(c.tree, paramsNode) {
+    if (getNode(c.tree, p).tag != Tag.Param) {
+      continue // ParamRest (variadic) — never a tracked row source
+    }
+    let nameNode = kidsOf(c.tree, p)[0]
+    let ptype = 0
+    if (nameNode >= 0 && nameNode < len(c.declTypes)) {
+      ptype = c.declTypes[nameNode]
+    }
+    let (cls, isSlice) = relationAutoParamTrackable(c, ptype)
+    out = append(
+      out,
+      RelationAutoParamSummary{
+        name = identText(c.tree, c.source, nameNode), cls = cls, isSlice = isSlice,
+        trackable = cls.found, reads = []string(0),
+      },
+    )
+  }
+  return out
+}
+
+// One trackable parameter becomes a synthetic `RelationAutoBinding` — see
+// that class's own header (relationauto.bit) for why `queryCall = 0` /
+// `paramName = p.name` and `afterOffset = -1` (in scope for the whole body).
+fn relationAutoSeedParamBindings(params: []RelationAutoParamSummary): []RelationAutoBinding {
+  let out = []RelationAutoBinding(0)
+  for p of params {
+    if (!p.trackable) {
+      continue
+    }
+    out = append(
+      out,
+      RelationAutoBinding{
+        varName = p.name, cls = p.cls, queryCall = 0, paramName = p.name, isSlice = p.isSlice,
+        afterOffset = -1,
+      },
+    )
+  }
+  return out
+}
+
+fn relationAutoInitSummaries(c: Checker, decls: []int): RelationAutoFuncSummaries {
+  let sums = RelationAutoFuncSummaries{
+    declToIndex = map<int, int>{},
+    list = []RelationAutoFuncSummary(0),
+  }
+  for decl of decls {
+    sums.declToIndex[decl] = len(sums.list)
+    sums.list = append(
+      sums.list,
+      RelationAutoFuncSummary{
+        decl = decl, params = relationAutoBuildParamSummaries(c, decl), ret = relationAutoNoReturnSummary(c),
+      },
+    )
+  }
+  return sums
+}
+
+// `params` with `fresh` (one round's own `st.paramReads`, keyed by
+// parameter name) unioned into each parameter's own `reads`, deduped —
+// `lintContainsString` is `relationauto.bit`'s own dedup, reused so a name
+// appended by TWO different call sites in the same round is still recorded
+// once.
+fn relationAutoMergedParams(
+  params: []RelationAutoParamSummary,
+  fresh: map<string, []string>,
+): []RelationAutoParamSummary {
+  let out = []RelationAutoParamSummary(0)
+  for p of params {
+    let merged = p.reads
+    let (newNames, ok) = fresh[p.name]
+    if (ok) {
+      for n of newNames {
+        if (!lintContainsString(merged, n)) {
+          merged = append(merged, n)
+        }
+      }
+    }
+    out = append(
+      out,
+      RelationAutoParamSummary{
+        name = p.name,
+        cls = p.cls,
+        isSlice = p.isSlice,
+        trackable = p.trackable,
+        reads = merged,
+      },
+    )
+  }
+  return out
+}
+
+fn relationAutoFinalizeReturn(c: Checker, st: RelationAutoState): RelationAutoReturnSummary {
+  if (!st.returnSeen || !st.returnCandidate.found) {
+    return relationAutoNoReturnSummary(c)
+  }
+  let flow = st.returnCandidate
+  return RelationAutoReturnSummary{
+    found = true, queryCall = flow.queryCall, viaParamName = flow.paramName, cls = flow.cls, isSlice = flow.isSlice,
+  }
+}
+
+// One round's own progress measure: the total relation-name count across
+// every parameter plus how many functions have a resolved return — both
+// monotonically non-decreasing round over round (this file's own header),
+// so equality before/after a round IS the fixed point.
+fn relationAutoSummariesMeasure(sums: RelationAutoFuncSummaries): int {
+  let total = 0
+  for f of sums.list {
+    for p of f.params {
+      total = total + len(p.reads)
+    }
+    if (f.ret.found) {
+      total = total + 1
+    }
+  }
+  return total
+}
+
+// Walks one function's body once, seeded with its own parameter bindings
+// (if it has a call-graph summary at all — `hasIdx` is false for a
+// generic function or an `ArrowFn`, which still get the plain same-function
+// walk via `relationAutoWalk`'s own recording into `c.relationAutoWith`,
+// just no parameter/return summary of their own), then folds what this one
+// walk found back into `sums`.
+fn relationAutoWalkOneFunc(c: Checker, fd: int, sums: RelationAutoFuncSummaries) {
+  let (idx, hasIdx) = sums.declToIndex[fd]
+  let bindings = []RelationAutoBinding(0)
+  if (hasIdx) {
+    bindings = relationAutoSeedParamBindings(sums.list[idx].params)
+  }
+  let st = RelationAutoState{
+    bindings = bindings, summaries = sums, paramReads = map<string, []string>{}, returnSeen = false,
+    returnCandidate = relationAutoNoFlow(c),
+  }
+  relationAutoWalk(c, lintFuncInfo(c.tree, fd).body, st)
+  if (!hasIdx) {
+    return
+  }
+  sums.list[idx] = RelationAutoFuncSummary{
+    decl = fd, params = relationAutoMergedParams(sums.list[idx].params, st.paramReads),
+    ret = relationAutoFinalizeReturn(c, st),
+  }
+}
+
+// Entry point for one module (`relationAutoAnalyzeProject`,
+// relationauto.bit): re-walks every function in the module once per round —
+// `lintCollectFuncs` gives ALL of them (generic functions and `ArrowFn`s
+// included, so their own same-function recording still runs), while only
+// the non-generic named ones in `sums` grow a parameter/return summary
+// other functions can consult.
+fn relationAutoAnalyzeModuleWithCalls(c: Checker) {
+  let fds = lintCollectFuncs(c.tree, c.tree.root, []int(0))
+  let sums = relationAutoInitSummaries(c, relationAutoCollectFuncDecls(c))
+  let bound = len(sums.list) + 1
+  let round = 0
+  let changed = true
+  while (changed && round < bound) {
+    let before = relationAutoSummariesMeasure(sums)
+    for fd of fds {
+      relationAutoWalkOneFunc(c, fd, sums)
+    }
+    changed = relationAutoSummariesMeasure(sums) != before
+    round = round + 1
+  }
+  assert(round <= bound, "relationautocalls: fixed point exceeded its own bound of ${bound} rounds")
+}
+
+// `callNode`'s own argument EXPRESSIONS, in order — `Args`'s kids are `Arg`
+// nodes, each wrapping one expression (`ormFirstArgExpr`'s identical shape,
+// compiler/checkormquery.bit), generalized here to every position rather
+// than just the first.
+// A `Tag.NamedArg` (`name = expr`, SPEC §12.11) reorders arguments against
+// the callee's OWN parameter names, and a `Tag.ArgSpread` (`...xs`) expands
+// ONE argument node into an unknown number of real parameters — either way
+// this call's Nth argument node no longer lines up with the callee
+// summary's Nth PARAMETER, so a call with either shape returns no
+// expressions at all rather than mis-attributing a read to the wrong
+// parameter: the same conservative "cannot resolve" this whole file falls
+// back to for every other shape it does not reason about positionally.
+fn relationAutoArgExprs(tree: Tree, callNode: int): []int {
+  let argKids = kidsOf(tree, kidsOf(tree, callNode)[2])
+  for a of argKids {
+    let t = getNode(tree, a).tag
+    if (t == Tag.NamedArg || t == Tag.ArgSpread) {
+      return []int(0)
+    }
+  }
+  let out = []int(0)
+  for a of argKids {
+    out = append(out, kidsOf(tree, a)[0])
+  }
+  return out
+}
+
+fn relationAutoParamIndex(params: []RelationAutoParamSummary, name: string): int {
+  let i = 0
+  while (i < len(params)) {
+    if (params[i].name == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// A call `f(a0, a1, ...)` to a named, resolved, same-module free function:
+// for every parameter position `f`'s own summary has recorded relation
+// reads against, resolve the matching ARGUMENT expression in the CALLER's
+// own state and record those same names against whatever it flows from —
+// a real query call, or (when this walk is itself building an ENCLOSING
+// function's own parameter summary) that enclosing function's own
+// parameter, letting a chain of wrapper calls propagate for free. Guarded
+// by `shadowedByValue` (compiler/checkexpr.bit) — its own header names this
+// exact "does a local shadow this callee?" use, since `c.funcDecls` is a
+// flat, unscoped name table `relationauto.bit`'s own #2947 comment already
+// warns is unsafe to trust without it.
+fn relationAutoCheckCallArgs(c: Checker, node: int, st: RelationAutoState) {
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let name = identText(c.tree, c.source, callee)
+  if (shadowedByValue(c, callee, name)) {
+    return
+  }
+  let (decl, hasDecl) = c.funcDecls[name]
+  if (!hasDecl) {
+    return
+  }
+  let (idx, hasIdx) = st.summaries.declToIndex[decl]
+  if (!hasIdx) {
+    return
+  }
+  let summary = st.summaries.list[idx]
+  let args = relationAutoArgExprs(c.tree, node)
+  let n = len(summary.params)
+  if (len(args) < n) {
+    n = len(args)
+  }
+  let i = 0
+  while (i < n) {
+    let reads = summary.params[i].reads
+    if (len(reads) != 0) {
+      let argFlow = relationAutoResolve(c, args[i], st)
+      if (argFlow.found) {
+        for name2 of reads {
+          relationAutoRecordRead(c, st, argFlow, name2)
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The VALUE a call to a named, resolved, same-module free function
+// produces, from its own return summary: a fixed query call directly
+// (`ret.queryCall > 0`), or — `ret.viaParamName != ""` — whatever the
+// matching ARGUMENT expression at THIS call site resolves to in the
+// caller's own state, recursed through `relationAutoResolve` exactly once
+// per call site (the recursion is on the ARGUMENT node, syntactically
+// smaller than `callNode`, so a call cycle in the source cannot loop this
+// call). `relationauto.bit`'s `relationAutoResolveCall` is this function's
+// only caller, already past the `shadowedByValue` guard's own reasoning —
+// see this file's `relationAutoCheckCallArgs` header — because the SAME
+// check would just repeat it: a bare `Ident` callee resolved through
+// `c.funcDecls` here is exactly the shape that guard exists for.
+fn relationAutoResolveNamedCall(
+  c: Checker,
+  callNode: int,
+  callee: int,
+  st: RelationAutoState,
+): RelationAutoFlow {
+  let name = identText(c.tree, c.source, callee)
+  if (shadowedByValue(c, callee, name)) {
+    return relationAutoNoFlow(c)
+  }
+  let (decl, hasDecl) = c.funcDecls[name]
+  if (!hasDecl) {
+    return relationAutoNoFlow(c)
+  }
+  let (idx, hasIdx) = st.summaries.declToIndex[decl]
+  if (!hasIdx) {
+    return relationAutoNoFlow(c)
+  }
+  let ret = st.summaries.list[idx].ret
+  if (!ret.found) {
+    return relationAutoNoFlow(c)
+  }
+  if (ret.queryCall > 0) {
+    return RelationAutoFlow{
+      found = true, cls = ret.cls, queryCall = ret.queryCall, paramName = "", isSlice = ret.isSlice,
+    }
+  }
+  let paramIdx = relationAutoParamIndex(st.summaries.list[idx].params, ret.viaParamName)
+  let args = relationAutoArgExprs(c.tree, callNode)
+  if (paramIdx < 0 || paramIdx >= len(args)) {
+    return relationAutoNoFlow(c)
+  }
+  return relationAutoResolve(c, args[paramIdx], st)
+}
