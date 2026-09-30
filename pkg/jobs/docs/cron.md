@@ -22,7 +22,7 @@ Both go on the same `Queue` as `register`, before `run`:
 ```bit
 import { pool, Pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { newPostgresStore, migrate, open, Options, Missed } from "jobs"
+import { newPostgresStore, migrate, open, Options, Missed, Queue } from "jobs"
 import { Json } from "std/json"
 import { Minute } from "std/time"
 
