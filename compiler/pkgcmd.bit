@@ -1,0 +1,507 @@
+// compiler/pkgcmd.bit — #6306 (M1b): a direct dependency's `cmd/<w1>/<w2>/.../
+// main.bit` directory IS `bit <w1> <w2> ...`, by convention (SPEC §17.7's
+// "Package commands" — no `bit.json` key names it; see
+// .claude/kb/data-packages-dx.md, which superseded the earlier
+// `bit.json` "commands" design this ticket's plan file (orm-impl-plan-
+// 2026-09-30.md) sketched). Same module as main.bit/build.bit/project.bit
+// (sibling .bit files, no import needed): `Loader`, `LockEntry`,
+// `resolvePackageImport`, `projectDeps`, `buildIr`, `BuildOpts`,
+// `writeModuleExe`, `hostBuildTarget`, `libbitrtPath`, `readRtArchive`,
+// `pathDir`/`pathBase`/`pathJoinResolve`, `signalName` and `shQuote` are all
+// already declared elsewhere in this directory.
+//
+// Import needed: `stat` (mtime, for the binary cache below) is not yet
+// imported anywhere in this module; every other symbol this file reads
+// (`cwd`, `exists`→`fsExists` builtin, `mkdir`, `readDir`, `hasSuffix`,
+// `writeFile`, `readFile`) already is.
+import { stat } from "std/fs"
+
+// The bound on how many leading argv words a package command name can take
+// (Power of 10 rule 2: every loop here is bounded by this constant, not by
+// argv's own length). `bit make migration` is 2; this leaves room to grow
+// without turning the longest-match scan into an unbounded one.
+const pkgCmdMaxWords: int = 4
+
+// One direct dependency, resolved to the directory its `cmd/` tree (if any)
+// lives in.
+class PkgCmdDep { name: string, dir: string }
+
+// The result of matching argv against every direct dependency's `cmd/` tree:
+// either `ok` (exactly one dependency has `cmd/<words>/main.bit`), a
+// `conflict` (more than one does, for the SAME `words` — reported and never
+// silently resolved), or neither (nothing matched at any word count).
+class PkgCmdFound {
+  ok: bool,
+  words: []string,
+  depName: string,
+  cmdDir: string, // `<depDir>/cmd/<w1>/<w2>/...` — holds main.bit, optionally gen.bit
+  conflict: []string,
+}
+
+// A package-command word is restricted to `[a-z0-9-]+` — this is what stops
+// a crafted argv from walking a dependency's `cmd/` tree out of it (no `.`,
+// no `/`, no `..`): every candidate path below is built by string-joining
+// argv words directly, and this is the one gate between them and the
+// filesystem.
+fn isSafePkgCmdWord(w: string): bool {
+  if (len(w) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(w)) {
+    let c = w[i]
+    let isLower = c >= 'a' && c <= 'z'
+    let isDigit = c >= '0' && c <= '9'
+    let isDash = c == '-'
+    if (!isLower && !isDigit && !isDash) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn joinWords(words: []string): string {
+  let out = words[0]
+  let i = 1
+  while (i < len(words)) {
+    out = out + " " + words[i]
+    i = i + 1
+  }
+  return out
+}
+
+fn joinSlashWords(words: []string): string {
+  let out = words[0]
+  let i = 1
+  while (i < len(words)) {
+    out = out + "/" + words[i]
+    i = i + 1
+  }
+  return out
+}
+
+fn joinNames(names: []string): string {
+  let out = names[0]
+  let i = 1
+  while (i < len(names)) {
+    out = out + ", " + names[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Every direct dependency of `rootDir`'s `bit.json` (the keys of its own
+// `"dependencies"` map — NOT `bit.lock`'s full transitive set, so a
+// transitive dependency's `cmd/` tree is never consulted, per the ticket),
+// resolved to a directory through the SAME warm-cache-only resolver a real
+// build uses (`resolvePackageImport`, projectpkg.bit) — never a live fetch,
+// and never a directory for a name `bit.lock` does not actually list. A
+// dependency `bit up`/`bit add` never locked, or whose lock entry cannot be
+// resolved right now (cold cache, deleted local path, ...), is silently
+// skipped: package-command lookup must not turn an unrelated `bit <x>`
+// typo into a bit.lock error about a dependency the command never needed.
+//
+// Builds a throwaway `Loader` purely to reuse `resolvePackageImport` — no
+// module is ever parsed through it, so this is cheap even with many
+// dependencies.
+fn directDependencyDirs(rootDir: string): []PkgCmdDep {
+  let deps = projectDeps(rootDir) catch _ {
+    return []PkgCmdDep(0)
+  }
+  let sm = newSourceManager()
+  let (lockEntries, lockErr) = loadLockEntries(rootDir)
+  let (cacheRoot, cacheRootErr) = loadCacheRoot()
+  let lw = Loader{
+    mods = []SrcModule(0), rootDir = rootDir, lockRoot = rootDir,
+    resolved = map<string, int>{}, loading = map<string, bool>{},
+    stdRoot = "", prelude = -1, sm = sm, diags = newDiagnostics(sm),
+    overlays = map<string, string>{}, lockEntries = lockEntries, lockErr = lockErr,
+    cacheRoot = cacheRoot, cacheRootErr = cacheRootErr,
+    pkgDirCache = map<string, string>{}, pkgDetailCache = map<string, string>{},
+    parseCache = map<string, SrcModule>{},
+  }
+  let out = []PkgCmdDep(0)
+  for d of deps {
+    let (dir, _) = resolvePackageImport(lw, d.name)
+    if (dir != "") {
+      out = append(out, PkgCmdDep{ name = d.name, dir = dir })
+    }
+  }
+  return out
+}
+
+// The nearest ancestor of the current directory holding a `bit.json`, or ""
+// if none does within the walk bound below — every project-relative command
+// already assumes a project's own root is where its manifest lives (§17.1);
+// this is the one place that walk is actually performed, since every other
+// CLI entry point is handed its root directly as an operand.
+fn findProjectRoot(): string {
+  let start = cwd() catch _ {
+    return ""
+  }
+  let d = start
+  let depth = 0
+  let maxDepth = 64 // filesystem depth ceiling — bounds the walk (Power of 10 rule 2)
+  while (depth < maxDepth) {
+    if (fsExists("${d}/bit.json")) {
+      return d
+    }
+    let parent = pathDir(d)
+    if (parent == d) {
+      return ""
+    }
+    d = parent
+    depth = depth + 1
+  }
+  return ""
+}
+
+// Matches `argWords` (argv after the program name) against every direct
+// dependency's `cmd/` tree: the LONGEST run of leading words that names an
+// existing `cmd/<...>/main.bit` in exactly one dependency wins; the same
+// words matching in more than one dependency is `conflict`, checked BEFORE
+// falling back to a shorter run (an ambiguous longer match is never quietly
+// downgraded to an unambiguous shorter one).
+fn findPkgCmd(rootDir: string, argWords: []string): PkgCmdFound {
+  let none = PkgCmdFound{
+    ok = false, words = []string(0), depName = "", cmdDir = "", conflict = []string(0),
+  }
+  let deps = directDependencyDirs(rootDir)
+  if (len(deps) == 0) {
+    return none
+  }
+  let maxK = len(argWords)
+  if (maxK > pkgCmdMaxWords) {
+    maxK = pkgCmdMaxWords
+  }
+  let k = maxK
+  while (k >= 1) {
+    let words = argWords[0:k]
+    let found = matchPkgCmdWords(deps, words)
+    if (found.ok || len(found.conflict) > 0) {
+      return found
+    }
+    k = k - 1
+  }
+  return none
+}
+
+// One `k`-word candidate, checked against every direct dependency. Split out
+// of `findPkgCmd` to keep that function's own branching under spec/LINT.md's
+// complexity ceiling.
+fn matchPkgCmdWords(deps: []PkgCmdDep, words: []string): PkgCmdFound {
+  let none = PkgCmdFound{
+    ok = false, words = words, depName = "", cmdDir = "", conflict = []string(0),
+  }
+  let i = 0
+  while (i < len(words)) {
+    if (!isSafePkgCmdWord(words[i])) {
+      return none
+    }
+    i = i + 1
+  }
+  let matchNames = []string(0)
+  let matchDirs = []string(0)
+  for d of deps {
+    let cmdDir = pathJoinResolve(d.dir, "cmd/${joinSlashWords(words)}")
+    // `gen.bit` alone is enough — a command whose `main.bit` is entirely
+    // generated (`bit migrate`'s own shape: `gen.bit` writes it fresh every
+    // invocation, so the dependency ships no static one at all) still
+    // counts as provided.
+    if (fsExists("${cmdDir}/main.bit") || fsExists("${cmdDir}/gen.bit")) {
+      matchNames = append(matchNames, d.name)
+      matchDirs = append(matchDirs, cmdDir)
+    }
+  }
+  if (len(matchNames) == 1) {
+    return PkgCmdFound{
+      ok = true, words = words, depName = matchNames[0], cmdDir = matchDirs[0],
+      conflict = []string(0),
+    }
+  }
+  if (len(matchNames) > 1) {
+    return PkgCmdFound{ ok = false, words = words, depName = "", cmdDir = "", conflict = matchNames }
+  }
+  return none
+}
+
+// Where this project caches a package command's built binary (and, for a
+// `gen.bit`-backed command, its freshly generated `main.bit`): under the
+// project's OWN `.bit/` directory, never the dependency's — a dependency's
+// directory may be `~/.bit/pkg`'s read-only, content-addressed cache,
+// shared by every project that locks the same commit, while the built
+// binary here is specific to THIS project's own `bit.lock` (`buildLocked`'s
+// `lockRoot`). A project adds `.bit/` to its own `.gitignore`, like any
+// other build output.
+fn pkgCmdCacheDir(rootDir: string, words: []string): string {
+  return pathJoinResolve(rootDir, ".bit/cmd/${joinSlashWords(words)}")
+}
+
+// Creates `pkgCmdCacheDir(rootDir, words)`, one path segment at a time
+// (`mkdir` fails if its parent does not exist yet). Bounded by
+// `pkgCmdMaxWords` + 2 (`.bit`, `cmd`).
+fn ensurePkgCmdCacheDir(rootDir: string, words: []string): bool {
+  let cur = rootDir
+  let segs = [".bit", "cmd"]
+  let i = 0
+  while (i < len(segs)) {
+    cur = pathJoinResolve(cur, segs[i])
+    if (!fsIsDir(cur)) {
+      mkdir(cur) catch e {
+        eprint("bit: cannot create ${cur}: ${e.message()}\n")
+        return false
+      }
+    }
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(words)) {
+    cur = pathJoinResolve(cur, words[j])
+    if (!fsIsDir(cur)) {
+      mkdir(cur) catch e {
+        eprint("bit: cannot create ${cur}: ${e.message()}\n")
+        return false
+      }
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Whether the cached binary at `binOut` is still good for `mainSrc` — `true`
+// only when it exists and every `.bit` file in `mainSrc`'s own directory
+// (its whole module, §17.1) has an mtime no newer than the binary's. A
+// `gen.bit`-backed command rewrites its generated `main.bit` on every
+// invocation (`runPkgCmd`, below), so this always misses for one — that
+// command's own `gen.bit` is expected to skip the write when its output
+// would be byte-identical, which is what makes the cache effective there
+// too; this function has no way to know that and does not need to.
+fn pkgCmdBinaryFresh(mainSrc: string, binOut: string): bool {
+  if (!fsExists(binOut)) {
+    return false
+  }
+  let binInfo = stat(binOut) catch _ {
+    return false
+  }
+  let srcDir = pathDir(mainSrc)
+  let names = readDir(srcDir) catch _ {
+    return false
+  }
+  let i = 0
+  while (i < len(names)) {
+    if (hasSuffix(names[i], ".bit")) {
+      let info = stat(pathJoinResolve(srcDir, names[i])) catch _ {
+        return false
+      }
+      if (info.mtime > binInfo.mtime) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Builds `src` against `lockRoot`'s `bit.lock`/`bit.json` (M1a, #6299) to a
+// native executable at `out` — `buildCmd`'s own body (build.bit), inlined
+// rather than given a 7th parameter: `buildCmd` is already at spec/LINT.md's
+// E0202 ceiling (6, grandfathered) and this is the one caller in the whole
+// compiler that needs a non-default `lockRoot`.
+fn buildLocked(src: string, lockRoot: string, out: string): bool {
+  let target = hostBuildTarget()
+  let rtPath = libbitrtPath(target)
+  let rt = readRtArchive(rtPath) catch e {
+    eprint("bit: runtime archive ${rtPath}: ${e.message()}\n")
+    return false
+  }
+  let module = buildIr(src, target, rt, BuildOpts{ linking = true, lockRoot = lockRoot }) catch e {
+    eprint("bit: ${src}: ${e.message()}\n")
+    return false
+  }
+  return writeModuleExe(module, src, out, target, rt, false, false, false)
+}
+
+// `osRun`'s three outcomes (ABI.md §19), rendered exactly like `runCmd`
+// (buildrun.bit) does for `bit run` — package-command execution owes the
+// same signal-death/launch-failure reporting `bit run` already gives a
+// dependency's own program.
+fn interpretRunCode(code: int, src: string): int {
+  if (code <= 0 - 100) {
+    let sig = 0 - code - 100
+    eprint("bit: ${pathBase(src)} was killed by ${signalName(sig)}\n")
+    return 128 + sig
+  }
+  if (code < 0) {
+    eprint("bit: could not launch the program built from ${pathBase(src)}\n")
+    return 1
+  }
+  return code
+}
+
+// Runs the already-built `path` with `argv` forwarded — stdin/stdout/stderr
+// are `osRun`'s own (inherited from this process, exactly like `bit run`),
+// and the child's exit code becomes this call's return value.
+fn runBuiltExe(path: string, src: string, argv: []string): int {
+  return interpretRunCode(osRun(path, argv), src)
+}
+
+// Runs `genBin` with `projectRoot` as its OWN process working directory —
+// this is what a `gen.bit` needs to read/write project-relative paths
+// (§17.7's `bit migrate` reads `migrations/`) — via a throwaway `/bin/sh`
+// wrapper, the same "no chdir primitive, so the shell does it" pattern
+// `compiler/pmfetchtail.bit`'s `runGit` and `compiler/selfcheck.bit`'s
+// `runSelfcheckOnlyPanics` already use. `projectRoot` is also passed as
+// `genBin`'s sole argv element (`args()[1]` in `gen.bit`), so a `gen.bit`
+// that only reads `args()` and never calls `cwd()` still gets it. The
+// wrapper is read by `/bin/sh`, never exec'd directly (same reason `runGit`
+// gives: a freshly written executable's first exec is expensive on macOS —
+// moot for the wrapper script itself, since a script is only ever read).
+fn runGenWithCwd(genBin: string, projectRoot: string): int {
+  let scriptPath = "${genBin}.cd.sh"
+  let script = "#!/bin/sh\n" +
+    "cd " + shQuote(projectRoot) + " || exit 1\n" +
+    "exec " + shQuote(genBin) + " " + shQuote(projectRoot) + "\n"
+  writeFile(scriptPath, script) catch e {
+    eprint("bit: cannot write ${scriptPath}: ${e.message()}\n")
+    return 1
+  }
+  let code = interpretRunCode(osRun("/bin/sh", [scriptPath]), genBin)
+  fsRemove(scriptPath)
+  return code
+}
+
+// Builds (if needed) and runs `found`'s command: `gen.bit` first when the
+// dependency ships one (cwd = project root, exactly one argument — the
+// project root — a nonzero exit stops here before `main` is even built),
+// then `main.bit` — either the dependency's own static one, or the one
+// `gen.bit` just wrote to the project's own cache directory — with
+// `remaining` forwarded. The built `main` binary is cached under
+// `pkgCmdCacheDir` and only rebuilt when its source changed
+// (`pkgCmdBinaryFresh`); `gen.bit` itself is never cached — it must see the
+// project's CURRENT state (e.g. `migrations/`) on every invocation.
+fn runPkgCmd(rootDir: string, found: PkgCmdFound, remaining: []string): int {
+  if (!ensurePkgCmdCacheDir(rootDir, found.words)) {
+    return 1
+  }
+  let cacheDir = pkgCmdCacheDir(rootDir, found.words)
+  let mainSrc = "${found.cmdDir}/main.bit"
+  let genSrc = "${found.cmdDir}/gen.bit"
+  if (fsExists(genSrc)) {
+    let genBin = "${cacheDir}/gen"
+    if (!buildLocked(genSrc, rootDir, genBin)) {
+      return 1
+    }
+    let genCode = runGenWithCwd(genBin, rootDir)
+    fsRemove(genBin)
+    if (genCode != 0) {
+      eprint("bit: ${found.depName}: cmd/${joinSlashWords(found.words)}/gen.bit exited ${genCode}\n")
+      return 1
+    }
+    mainSrc = "${cacheDir}/main.bit"
+    if (!fsExists(mainSrc)) {
+      eprint("bit: ${found.depName}: gen.bit did not write ${mainSrc}\n")
+      return 1
+    }
+  }
+  let binOut = "${cacheDir}/bin"
+  if (!pkgCmdBinaryFresh(mainSrc, binOut)) {
+    if (!buildLocked(mainSrc, rootDir, binOut)) {
+      return 1
+    }
+  }
+  return runBuiltExe(binOut, mainSrc, remaining)
+}
+
+// Attempted from `main()` (main.bit) right after the built-in dispatch table
+// has already failed to match `a[1]`, and before `reportUnhandledSubcommand`
+// — built-ins always win, by construction: this is only ever reached once
+// none matched. Returns `false` (never having exited) when nothing in any
+// direct dependency's `cmd/` tree matches, so the caller's own "unknown
+// subcommand" message still fires; every match or conflict ends in
+// `exit(...)`, with a trailing `return true` only to satisfy the checker —
+// `exit` does not itself tell the type checker a branch never returns
+// (`applyBuildTargetFlag`, maindispatch.bit, is the existing precedent).
+fn tryPkgCmdDispatch(a: []string): bool {
+  let rootDir = findProjectRoot()
+  if (rootDir == "") {
+    return false
+  }
+  let argWords = a[1:len(a)]
+  let found = findPkgCmd(rootDir, argWords)
+  if (len(found.conflict) > 0) {
+    eprint(
+      "bit: \"${joinWords(found.words)}\" is provided by more than one dependency: ${joinNames(found.conflict)}\n",
+    )
+    exit(1)
+    return true
+  }
+  if (!found.ok) {
+    return false
+  }
+  let remaining = argWords[len(found.words):len(argWords)]
+  exit(runPkgCmd(rootDir, found, remaining))
+  return true
+}
+
+// Every package command available to the CURRENT project (cwd walked up to
+// the nearest `bit.json`), one "w1 w2 ..." string per `cmd/<...>/main.bit`
+// found under a direct dependency — printed by `reportUnhandledSubcommand`
+// (main.bit) alongside its "unknown subcommand" message. Empty (no project
+// root found, or no direct dependency ships any) is not an error: this is a
+// courtesy listing, never a build.
+fn listPkgCmds(): []string {
+  let rootDir = findProjectRoot()
+  if (rootDir == "") {
+    return []string(0)
+  }
+  let deps = directDependencyDirs(rootDir)
+  let out = []string(0)
+  for d of deps {
+    let cmdRoot = pathJoinResolve(d.dir, "cmd")
+    if (fsIsDir(cmdRoot)) {
+      out = walkPkgCmdWords(cmdRoot, []string(0), pkgCmdMaxWords, out)
+    }
+  }
+  return sortStrings(out)
+}
+
+// Bounded (by `depthLeft`, decremented every call — never by directory
+// depth on disk) walk of one dependency's `cmd/` tree, collecting the
+// space-joined words of every directory that holds a `main.bit`.
+fn walkPkgCmdWords(dir: string, prefix: []string, depthLeft: int, out: []string): []string {
+  if (depthLeft <= 0) {
+    return out
+  }
+  if (len(prefix) > 0 && (fsExists("${dir}/main.bit") || fsExists("${dir}/gen.bit"))) {
+    out = append(out, joinWords(prefix))
+  }
+  let names = readDir(dir) catch _ {
+    return out
+  }
+  let i = 0
+  while (i < len(names)) {
+    let child = pathJoinResolve(dir, names[i])
+    if (fsIsDir(child)) {
+      out = walkPkgCmdWords(child, appendWord(prefix, names[i]), depthLeft - 1, out)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// A fresh copy, never `prefix`'s own backing array (E0214: `append` on a
+// slice PARAMETER aliases the caller's buffer) — `prefix` here is shared by
+// every sibling in the `while` loop above, each starting the SAME base
+// length, so appending onto it directly would let one sibling's word
+// silently overwrite another's before either directory it named the word
+// for has finished being walked.
+fn appendWord(prefix: []string, word: string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(prefix)) {
+    out = append(out, prefix[i])
+    i = i + 1
+  }
+  return append(out, word)
+}
