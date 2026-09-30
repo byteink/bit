@@ -700,8 +700,8 @@ attributes, and one `JoinDesc` per `@manyToMany` field.
 ### `__tables(): []TableSchema`
 
 Every `@table` class in the program, one `TableSchema` each, in module order
-then source order. `pkg/orm` calls it to create or update tables — and any
-`@manyToMany` join table — without a hand-written list of classes. The
+then source order. `pkg/orm` calls it to create or update tables, including
+any `@manyToMany` join table, without a hand-written list of classes. The
 compiler fills in its body only when something calls it, so a program that
 never asks pays nothing.
 
