@@ -1,0 +1,260 @@
+// IPv6 literal parsing and multi-nameserver resolv.conf iteration (#6338),
+// split out of ./net.bit to hold that file under its 800-line ceiling. Same
+// module (`runtime/net/`), so ./net.bit's `byteAt`/`putByte`/`netIsSpace`/
+// `netNameserverByte`/`netParseIpv4` are in scope unchanged, no import
+// needed — see that file's own header for the core/provider split this
+// module follows.
+//
+// `netAbiResolve` (../{darwin,linux}/netabi.bit) needs every nameserver in
+// the file, IPv4 and IPv6, in order — the single-nameserver resolver
+// (`net.bit`'s `netFirstNameserver`/`netResolveHost`) only ever tried the
+// first line, and a MagicDNS-style resolv.conf with `nameserver
+// 100.100.100.100` (IPv4, reachable) followed by `nameserver
+// fd7a:115c:a1e0::53` (IPv6) never got past whichever line was first even
+// when it failed. `netFirstNameserver` stays exactly as it is: it is
+// directly unit-tested (`_tests_/stress/netcore`) and callers that only
+// want "the first usable IPv4 one" still have it.
+
+// Parses a literal IPv6 address (RFC 4291 text form, "::" compression
+// included) from `host[0..hostLen]`, writing its sixteen bytes to `out`.
+// Returns false — writing nothing meaningful — for anything else.
+//
+// No zone id ("%eth0") and no embedded IPv4 suffix ("::ffff:1.2.3.4"):
+// neither appears in a resolv.conf `nameserver` line, and admitting them
+// here would be scope this parser's one caller (`netNextNameserver`, below)
+// has no use for. `hostLen` alone bounds every loop below (Power of 10):
+// `i` strictly increases each step, by 1 or 2, and the outer loop stops the
+// moment it reaches `hostLen`, so no explicit upper-length guard is needed
+// for boundedness — an oversized or malformed literal simply fails the
+// final `i != hostLen` check below rather than being rejected up front.
+export @symbol("bit_rt_port_net_parse_ipv6") @nosplit fn netParseIpv6(
+  host: *u8,
+  hostLen: int,
+  out: *u8,
+): bool {
+  netIpv6ZeroOut(out)
+  let groups = 0
+  let i = 0
+  let doubleColonAt = 0 - 1
+  while (i < hostLen && groups < 8) {
+    if (netIpv6IsDoubleColon(host, hostLen, i)) {
+      if (doubleColonAt >= 0) {
+        return false
+      }
+      doubleColonAt = groups
+      i = i + 2
+    } else {
+      i = netIpv6Group(host, hostLen, i, out, groups)
+      if (i < 0) {
+        return false
+      }
+      groups = groups + 1
+      i = netIpv6SkipSeparator(host, hostLen, i)
+      if (i < 0) {
+        return false
+      }
+    }
+  }
+  if (i != hostLen) {
+    return false
+  }
+  return netIpv6Finish(out, groups, doubleColonAt)
+}
+
+@nosplit fn netIpv6ZeroOut(out: *u8) {
+  let z = 0
+  while (z < 16) {
+    putByte(out, z, 0)
+    z = z + 1
+  }
+}
+
+// True when `host[i]` starts a "::" compression marker.
+@nosplit fn netIpv6IsDoubleColon(host: *u8, hostLen: int, i: int): bool {
+  if (byteAt(host, i) != 58) {
+    return false
+  }
+  return i + 1 < hostLen && byteAt(host, i + 1) == 58
+}
+
+// Parses one 1-4 hex-digit group at `host[i]` into `out[groupIdx*2 ..
+// groupIdx*2+2)`. Returns the cursor position just past the digits -- at a
+// ':' or at `hostLen` -- WITHOUT consuming a separator (`netIpv6SkipSeparator`
+// does that, once the caller knows this is not the start of "::"), or -1 on
+// a malformed group or a run of more than four hex digits.
+@nosplit fn netIpv6Group(host: *u8, hostLen: int, i: int, out: *u8, groupIdx: int): int {
+  let v = 0
+  let digits = 0
+  let p = i
+  while (p < hostLen && byteAt(host, p) != 58) {
+    let d = netHexDigit(byteAt(host, p))
+    if (d < 0 || digits >= 4) {
+      return 0 - 1
+    }
+    v = v * 16 + d
+    digits = digits + 1
+    p = p + 1
+  }
+  if (digits == 0) {
+    return 0 - 1
+  }
+  putByte(out, groupIdx * 2, v / 256 % 256)
+  putByte(out, groupIdx * 2 + 1, v % 256)
+  return p
+}
+
+// After a group, `host[i]` is either `hostLen` (done), a lone ':' separating
+// two groups (consumed here), or the FIRST ':' of a "::" marker -- which
+// must be left in place for the next loop step's `netIpv6IsDoubleColon`
+// check to consume both of, or a group-parse that started there would see a
+// leading ':' and report "malformed" (`netIpv6Group`'s own `digits == 0`
+// case). Anything other than ':' at this position is rejected.
+@nosplit fn netIpv6SkipSeparator(host: *u8, hostLen: int, i: int): int {
+  if (i >= hostLen) {
+    return i
+  }
+  if (byteAt(host, i) != 58) {
+    return 0 - 1
+  }
+  if (netIpv6IsDoubleColon(host, hostLen, i)) {
+    return i
+  }
+  return i + 1
+}
+
+@nosplit fn netHexDigit(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55
+  }
+  return 0 - 1
+}
+
+// Applies a "::" seen at group index `doubleColonAt` (or does nothing when
+// there was none): shifts the `groups - doubleColonAt` groups written AFTER
+// it out to the end of the 16-byte result, zeroing the gap `netIpv6ZeroOut`
+// left in place. `groups` reaching 8 with a "::" pending is malformed (RFC
+// 4291 forbids a full address from also carrying a compression marker).
+@nosplit fn netIpv6Finish(out: *u8, groups: int, doubleColonAt: int): bool {
+  if (doubleColonAt < 0) {
+    return groups == 8
+  }
+  if (groups >= 8) {
+    return false
+  }
+  let tailGroups = groups - doubleColonAt
+  let g = tailGroups - 1
+  while (g >= 0) {
+    netIpv6ShiftGroup(out, doubleColonAt + g, 8 - tailGroups + g)
+    g = g - 1
+  }
+  return true
+}
+
+// Moves the two bytes of group `src` to group `dst` and zeroes `src`'s old
+// slot, unless the two are already the same slot (the last group before a
+// trailing "::" needs no move).
+@nosplit fn netIpv6ShiftGroup(out: *u8, src: int, dst: int) {
+  let hi = byteAt(out, src * 2)
+  let lo = byteAt(out, src * 2 + 1)
+  putByte(out, dst * 2, hi)
+  putByte(out, dst * 2 + 1, lo)
+  if (src != dst) {
+    putByte(out, src * 2, 0)
+    putByte(out, src * 2 + 1, 0)
+  }
+}
+
+@nosplit fn netSkipSpaceFwd(buf: *u8, s: int, e: int): int {
+  let p = s
+  while (p < e && netIsSpace(byteAt(buf, p))) {
+    p = p + 1
+  }
+  return p
+}
+
+@nosplit fn netSkipSpaceBack(buf: *u8, s: int, e: int): int {
+  let p = e
+  while (p > s && netIsSpace(byteAt(buf, p - 1))) {
+    p = p - 1
+  }
+  return p
+}
+
+// The start of `buf[lo..hi]`'s value, once it is confirmed to be a
+// `nameserver` directive (trimmed, keyword, separator) -- the same checks
+// `netNameserverLine` (./net.bit) makes, factored out so
+// `netNameserverAddrLine` below can share them. Returns -1 when the line is
+// not a nameserver directive.
+@nosplit fn netNameserverValueStart(buf: *u8, lo: int, hi: int): int {
+  let s = netSkipSpaceFwd(buf, lo, hi)
+  let e = netSkipSpaceBack(buf, s, hi)
+  if (e - s < 11) {
+    return 0 - 1
+  }
+  let key = 0
+  while (key < 10) {
+    if (byteAt(buf, s + key) != netNameserverByte(key)) {
+      return 0 - 1
+    }
+    key = key + 1
+  }
+  let v = s + 10
+  if (!netIsSpace(byteAt(buf, v))) {
+    return 0 - 1
+  }
+  return netSkipSpaceFwd(buf, v, e)
+}
+
+// Like `netNameserverLine` (./net.bit) but tries BOTH address families --
+// IPv4 first (the common case), then IPv6 -- writing the family's byte
+// count (4 or 16) to `*addrLen` on a match.
+@nosplit fn netNameserverAddrLine(buf: *u8, lo: int, hi: int, out: *u8, addrLen: *i64): bool {
+  let v = netNameserverValueStart(buf, lo, hi)
+  if (v < 0) {
+    return false
+  }
+  let e = netSkipSpaceBack(buf, lo, hi)
+  if (netParseIpv4(buf + v, e - v, out)) {
+    *addrLen = 4
+    return true
+  }
+  if (netParseIpv6(buf + v, e - v, out)) {
+    *addrLen = 16
+    return true
+  }
+  return false
+}
+
+// Finds the next `nameserver <address>` line at or after byte offset
+// `startAt` in a resolv.conf held in `buf[0..bufLen)`, IPv4 or IPv6, writing
+// its address to `out` (4 bytes for IPv4, 16 for IPv6) and that byte count
+// to `*addrLen`. Returns the offset to resume scanning from on a FOLLOW-UP
+// call (just past this line), so a caller can walk every nameserver in file
+// order; or -1 once no further line matches, ending the walk.
+export @symbol("bit_rt_port_net_next_nameserver") @nosplit fn netNextNameserver(
+  buf: *u8,
+  bufLen: int,
+  startAt: int,
+  out: *u8,
+  addrLen: *i64,
+): int {
+  let lineStart = startAt
+  let i = startAt
+  // One pass from `startAt`; `i` strictly increases (Power of 10).
+  while (i <= bufLen) {
+    if (i == bufLen || byteAt(buf, i) == 10) {
+      if (netNameserverAddrLine(buf, lineStart, i, out, addrLen)) {
+        return i + 1
+      }
+      lineStart = i + 1
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
