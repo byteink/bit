@@ -5215,10 +5215,13 @@ requires removing the dependency and re-adding it.
   hard failure.
 - The response body is capped at 4096 bytes; a document exceeding the cap
   before the single line completes is a hard failure, not a truncation.
-- The request carries a 5000 ms wall-clock deadline, separate from the
-  30000 ms budget used for the subsequent git fetch of the resolved
-  `<gitURL>` - a static single-line GET has no reason to share a git
-  clone's budget.
+- The request carries a 5000 ms wall-clock deadline for connecting, the TLS
+  handshake and the HTTP exchange, plus the worst-case name-resolution time
+  (`std/net`'s `resolveBudgetMs`: every nameserver in `/etc/resolv.conf`,
+  each for its full retry budget), so a slow DNS lookup is not charged to the
+  5000 ms. It is separate from the 30000 ms budget used for the subsequent
+  git fetch of the resolved `<gitURL>` - a static single-line GET has no
+  reason to share a git clone's budget.
 
 **Resolution: one version per package per build.** Bit links with a flat
 symbol namespace, so a build resolves each package named anywhere in the
