@@ -294,6 +294,15 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   if [ "$s63t" != "6363-generic-ctor-type-args" ]; then
     echo "FAIL: the #6363 template-parameter and fallible shapes were not explained (sig='$s63t')"; fail=1
   fi
+  fs65="_tests_/cases/run_generic_class_static_own.bit"
+  s65u=$(explainMismatch "$(printf '36:28: Plain.own(u = "a"): U\n38:12: Box<bool>.own(3): <error>\n')" "$(printf '36:28: Plain.own(u = "a"): string\n38:12: Box<bool>.own(3): i64\n')" types "$fs65")
+  if [ "$s65u" != "6363-generic-ctor-type-args" ]; then
+    echo "FAIL: the #6365 unsubstituted-parameter and oracle-error shapes were not explained (sig='$s65u')"; fail=1
+  fi
+  s65v=$(explainMismatch "$(printf '36:28: Plain.own(u = "a"): string\n')" "$(printf '36:28: Plain.own(u = "a"): i64\n')" types "$fs65")
+  if [ -n "$s65v" ]; then
+    echo "FAIL: a concrete oracle type changed to another was wrongly explained as #6363 (sig='$s65v')"; fail=1
+  fi
   s63e=$(explainMismatch "$(printf '63:11: mk(): Checked!Bad\n')" "$(printf '63:11: mk(): Checked<string>!Other\n')" types "$f63")
   if [ -n "$s63e" ]; then
     echo "FAIL: a #6363-shaped type with a changed error type was wrongly explained (sig='$s63e')"; fail=1
