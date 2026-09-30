@@ -200,8 +200,9 @@ or to inspect the connection before reading, drive `serve`/`Server.accept()`/
 `Exchange.read()`/`Exchange.respond()` yourself, and stop a running server
 with `Server.shutdown(timeoutMs)` (drains in-flight requests, force-closes
 whatever is still running once `timeoutMs` elapses) or `Server.close()`
-(stops immediately). `Server.setIdleTimeoutMs(ms)` (default 60s) and
-`Server.setMaxRequestsPerConn(n)` (default 1000) bound what an idle or
+(stops immediately). `Server.setIdleTimeoutMs(ms)` (default 60s),
+`Server.setWriteTimeoutMs(ms)` (default 60s) and
+`Server.setMaxRequestsPerConn(n)` (default 1000) bound what an idle, slow or
 long-lived keep-alive connection can hold onto; `Server.setMaxBodyBytes(n)`
 (default 32 MiB, no "unlimited" value) refuses an over-limit body with `400`
 before it is read.
@@ -439,6 +440,14 @@ force-closes whatever is still running once `timeoutMs` elapses.
 
 How long, in milliseconds, an idle keep-alive connection is kept open. The
 default is 60 seconds.
+
+### `Server.setWriteTimeoutMs(ms: int)`
+
+How long, in milliseconds, writing one response may take before the server
+closes the connection. A client that reads a large response slowly, or not
+at all, otherwise holds the connection open without limit. The default is
+60 seconds; raise it for a handler whose response legitimately takes longer
+to deliver.
 
 ### `Server.setMaxRequestsPerConn(n: int)`
 

@@ -327,6 +327,15 @@ explainMismatch() {
     # must be consumed by an identical line, a type-resolved pair or a
     # repositioned synthesized line; tree-only lines are insertions.
     function tableRowSynthInsert(nA, linesA, nB, linesB,    i, j) {
+      # An empty oracle dump arrives as one empty line: a module holding only
+      # a @table class types nothing under 0.33.0, so every tree line is an
+      # insertion (#6301, _tests_/cases/table_registry_lib/account.bit).
+      # Only when the tree shows the synthesized row mapper (__row:), so an
+      # oracle that typed nothing for any other reason still fails closed.
+      if (nA == 1 && linesA[1] == "") {
+        for (j = 1; j <= nB; j++) { if (linesB[j] ~ /: __row: /) { return 1 } }
+        return 0
+      }
       i = 1; j = 1
       while (i <= nA && j <= nB) {
         if (linesA[i] == linesB[j]) { i++; j++; continue }

@@ -136,6 +136,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo "FAIL: the #6255 synthesized-mapper reposition shape was not explained (rc=$rc6255 sig='$sig6255')"
     fail=1
   fi
+  # #6255: POSITIVE, an empty oracle dump (one empty line) against a module
+  # holding only a @table class (_tests_/cases/table_registry_lib/account.bit).
+  oracle_6255e=""
+  bit2_6255e=$(printf '4:21: Account: []string\n5:10: id: i64!\n9:242: __row: Account\n')
+  sig6255e=$(explainMismatch "$oracle_6255e" "$bit2_6255e" types)
+  rc6255e=$?
+  if [ "$rc6255e" -ne 0 ] || [ "$sig6255e" != "6255-table-row-synth-reposition" ]; then
+    echo "FAIL: the #6255 empty-oracle insertion shape was not explained (rc=$rc6255e sig='$sig6255e')"
+    fail=1
+  fi
   # #6255: REJECTION -- same line, same column shift, but a DIFFERENT type.
   oracle_6255r=$(printf '76:110: cols: []string\n')
   bit2_6255r=$(printf '76:203: cols: []int\n')

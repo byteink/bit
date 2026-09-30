@@ -641,6 +641,19 @@ One recorded attribute: its name, and its arguments rendered to their
 source text. A string literal's argument arrives as its own decoded
 content; any other literal arrives as its raw text unchanged.
 
+### `TableSchema`
+
+One `@table` class as the registry below reports it: its table name, its
+columns (the same `FieldDesc` list the class's mapper uses) and its
+class-level attributes.
+
+### `__tables(): []TableSchema`
+
+Every `@table` class in the program, one `TableSchema` each, in module order
+then source order. `pkg/orm` calls it to create or update tables without a
+hand-written list of classes. The compiler fills in its body only when
+something calls it, so a program that never asks pays nothing.
+
 ## Row-mapping building blocks
 
 Required (`sqlReq...`, fails on `NULL`) and optional (`sqlOpt...`, `NULL` to
