@@ -46,69 +46,71 @@ each get their own constraint.
 
 ## Wrap it in a migration you can actually run
 
-A bare `table(...)` call only builds a tree in memory. `Migration` is what
-turns it into something you run once, safely, and record having run:
+A bare `table(...)` call only builds a tree in memory. A class implementing
+`Migration` - `up`/`down`, each taking a `Schema` - is what turns it into
+something you run once, safely, and record having run. `Schema.create`
+wraps the identical `table(...)` builder above:
 
 ```bit
-import { Migration, drop } from "orm"
+import { Migration, Schema } from "orm"
 
-fn usersMigration(): Migration {
-  return Migration{
-    version = 1,
-    name = "create_users",
-    checksum = "inkwell-users-1",
-    apply = () => [
-      table("users", (t) => {
-        t.id("id")
-        t.string("username", 60).unique()
-        t.string("email", 255).unique()
-        t.string("password_hash", 255)
-        t.string("role", 20)
-        t.int("created_at")
-        t.int("updated_at")
-      }),
-    ],
-    revert = () => [drop("users")],
+class CreateUsers {
+  up(s: Schema): ()! {
+    s.create("users", (t) => {
+      t.id("id")
+      t.string("username", 60).unique()
+      t.string("email", 255).unique()
+      t.string("password_hash", 255)
+      t.string("role", 20)
+      t.int("created_at")
+      t.int("updated_at")
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("users")?
   }
 }
 ```
 
-`version` orders migrations; `checksum` is a stable identifier you pick by
-hand today (`pkg/orm` has no reflection to compute one for you from the
-file's contents). `apply` and `revert` are each a function returning the
-list of schema operations that statement runs - here, one `CREATE TABLE`
-forward and one `DROP TABLE` back.
+Interfaces are structural: `CreateUsers` satisfies `Migration` simply by
+declaring both methods, no `implements` clause needed. `up` describes the
+change forward, `down` describes its exact reverse - here, one
+`CREATE TABLE` and one `DROP TABLE`.
 
 Bit has no reflection, so nothing can scan a `migrations/` folder and
-discover what is in it. The registry is a plain list you write by hand:
+discover what is in it. The registry is a plain list you write by hand,
+pairing each class with a file name - the string the ledger records, and
+the order migrations apply in:
 
 ```bit
-import { Data, Postgres, RunnerDialect, ServerDialect, UpReport, up } from "orm"
+import { Data, MigrationFile, Postgres, RunnerDialect, ServerDialect, migrate } from "orm"
 import { now } from "std/time"
 
 fn postgresDialect(): RunnerDialect {
   return RunnerDialect{ render = Postgres{}, server = ServerDialect.Postgres }
 }
 
-fn deployUsersOnly(db: Data): UpReport! {
-  return up(db, postgresDialect(), []Migration{ usersMigration() }, now())?
+fn deployUsersOnly(db: Data): ()! {
+  let files = [MigrationFile{ name = "0001_create_users", m = CreateUsers{} }]
+  migrate(db, postgresDialect(), files, now())?
 }
 ```
 
-`up` takes an advisory lock (so two instances deploying at the same moment
-never race each other), checks every already-applied migration's checksum
-against what it recorded last time, then applies whatever is still
-pending, in order. Run `deployUsersOnly` against a fresh database and you
-get:
+`migrate` takes an advisory lock (so two instances deploying at the same
+moment never race each other), then applies every migration not yet
+recorded in the ledger, in ascending file-name order, all as one new
+batch. Run `deployUsersOnly` against a fresh database and you get:
 
 ```text
 inkwell: applied 5 migration(s)
 ```
 
-Run it again and nothing pending is left - `UpReport.applied` comes back
-empty, because version 1 is already in the ledger. (That transcript is
-from Inkwell's real registry below, all five migrations at once; a
-database with only `usersMigration()` registered reports one.)
+Run it again and nothing pending is left - the report's `applied` list
+comes back empty, because `0001_create_users` is already in the ledger.
+(That transcript is from Inkwell's real registry below, all five
+migrations at once; a database with only `CreateUsers` registered reports
+one.)
 
 ## Grow the registry: articles, tags, comments, and the tags join table
 
@@ -128,84 +130,84 @@ fn articleTagsDesc(): ManyToManyDesc {
   }
 }
 
-fn articlesMigration(): Migration {
-  return Migration{
-    version = 2,
-    name = "create_articles",
-    checksum = "inkwell-articles-1",
-    apply = () => [
-      table("articles", (t) => {
-        t.id("id")
-        t.string("title", 200)
-        t.string("slug", 220).unique()
-        t.text("body")
-        t.int("author_id")
-        t.int("created_at")
-        t.int("updated_at")
-        t.index("author_id")
-        t.foreign("author_id").references("users", "id").onDelete(ReferentialAction.Cascade)
-      }),
-    ],
-    revert = () => [drop("articles")],
+class CreateArticles {
+  up(s: Schema): ()! {
+    s.create("articles", (t) => {
+      t.id("id")
+      t.string("title", 200)
+      t.string("slug", 220).unique()
+      t.text("body")
+      t.int("author_id")
+      t.int("created_at")
+      t.int("updated_at")
+      t.index("author_id")
+      t.foreign("author_id").references("users", "id").onDelete(ReferentialAction.Cascade)
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("articles")?
   }
 }
 
-fn tagsMigration(): Migration {
-  return Migration{
-    version = 3,
-    name = "create_tags",
-    checksum = "inkwell-tags-1",
-    apply = () => [
-      table("tags", (t) => {
-        t.id("id")
-        t.string("name", 60).unique()
-      }),
-    ],
-    revert = () => [drop("tags")],
+class CreateTags {
+  up(s: Schema): ()! {
+    s.create("tags", (t) => {
+      t.id("id")
+      t.string("name", 60).unique()
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("tags")?
   }
 }
 
-fn commentsMigration(): Migration {
-  return Migration{
-    version = 4,
-    name = "create_comments",
-    checksum = "inkwell-comments-1",
-    apply = () => [
-      table("comments", (t) => {
-        t.id("id")
-        t.int("article_id")
-        t.int("author_id")
-        t.text("body")
-        t.int("created_at")
-        t.int("updated_at")
-        t.index("article_id")
-        t.foreign("article_id").references("articles", "id").onDelete(ReferentialAction.Cascade)
-        t.foreign("author_id").references("users", "id").onDelete(ReferentialAction.Cascade)
-      }),
-    ],
-    revert = () => [drop("comments")],
+class CreateComments {
+  up(s: Schema): ()! {
+    s.create("comments", (t) => {
+      t.id("id")
+      t.int("article_id")
+      t.int("author_id")
+      t.text("body")
+      t.int("created_at")
+      t.int("updated_at")
+      t.index("article_id")
+      t.foreign("article_id").references("articles", "id").onDelete(ReferentialAction.Cascade)
+      t.foreign("author_id").references("users", "id").onDelete(ReferentialAction.Cascade)
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("comments")?
   }
 }
 
-fn articleTagsMigration(): Migration {
-  return Migration{
-    version = 5,
-    name = "create_article_tags",
-    checksum = "inkwell-article-tags-1",
-    apply = () => [manyToManyTable(articleTagsDesc())],
-    revert = () => [drop("article_tags")],
+// No `Schema` method builds a join table directly - `manyToManyTable`
+// already returns a full `SchemaOp`, so `up` appends it to `s.ops` (`export`
+// exactly so a prebuilt op can be added this way).
+class CreateArticleTags {
+  up(s: Schema): ()! {
+    s.ops = append(s.ops, manyToManyTable(articleTagsDesc()))
+  }
+
+  down(s: Schema): ()! {
+    s.drop("article_tags")?
   }
 }
 
-export fn migrations(): []Migration {
+export fn migrations(): []MigrationFile {
   return [
-    usersMigration(), articlesMigration(), tagsMigration(), commentsMigration(),
-    articleTagsMigration(),
+    MigrationFile{ name = "0001_create_users", m = CreateUsers{} },
+    MigrationFile{ name = "0002_create_articles", m = CreateArticles{} },
+    MigrationFile{ name = "0003_create_tags", m = CreateTags{} },
+    MigrationFile{ name = "0004_create_comments", m = CreateComments{} },
+    MigrationFile{ name = "0005_create_article_tags", m = CreateArticleTags{} },
   ]
 }
 
-export fn runMigrations(db: Data): UpReport! {
-  return up(db, postgresDialect(), migrations(), now())?
+export fn runMigrations(db: Data): ()! {
+  migrate(db, postgresDialect(), migrations(), now())?
 }
 ```
 
@@ -238,30 +240,23 @@ create table "article_tags" ( ... )
 create index "article_tags_tag_id_idx" on "article_tags" ("tag_id")
 ```
 
-## Checking what's pending before you deploy
+## The sharp edge: rolling back only ever undoes the last batch
 
 ```bit
-import { MigrationStatus, status } from "orm"
+import { rollback } from "orm"
 
-fn pendingMigrations(db: Data): []MigrationStatus! {
-  return status(db, migrations())?
+fn undoLastDeploy(db: Data): ()! {
+  rollback(db, postgresDialect(), migrations())?
 }
 ```
 
-`status` reads the ledger without taking the advisory lock `up` takes, so a
-health check or a deploy script can ask "is this database caught up"
-without blocking a real migration that might be running at the same
-moment.
-
-## The sharp edge: rolling back only ever undoes the last one
-
-`down(db, postgresDialect(), migrations(), now(), windowNs)` reverts the
-single most recently applied migration, and only if it ran within
-`windowNs` of now - a rollback attempted long after the fact refuses,
-naming how old the migration actually is. [Apply
-migrations](../../orm/docs/migrate.md) covers why: once real writes depend
-on a schema change, undoing it isn't safe to automate. A production
-rollback is a new, forward migration, not `down`.
+`rollback(db, postgresDialect(), migrations())` undoes every migration
+applied by the MOST RECENT `migrate` call - the highest recorded batch,
+newest file first - and nothing older. [Apply
+migrations](../../orm/docs/migrate.md) covers the batch rule in full. A
+schema change that real writes now depend on is undone with a new,
+forward migration, never by rolling back an old one that shipped batches
+ago.
 
 ## What we built
 
