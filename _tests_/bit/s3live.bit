@@ -67,6 +67,12 @@ import { get as httpGet } from "std/http"
 
 const image: string = "chrislusf/seaweedfs@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882"
 const runLabel: string = "bit.s3.live=1"
+// Pairs with `runLabel` on the container this run starts (see `main` below):
+// the owning process's own pid, learned via `selfPid`'s `$PPID` trick.
+// `sweepOrphans` removes a labelled container only when that pid is no
+// longer alive, so a concurrent peer's still-running container is left
+// alone (#6327).
+const ownerLabelKey: string = "bit.live.owner"
 // Bounded poll: 40 * 500ms = 20s, generous for a local pull-and-boot that
 // already completed before the first HTTP probe is tried.
 const readyAttempts: int = 40
@@ -85,6 +91,7 @@ const streamingRunTimeoutMs: int = 180000
 // under the object size — a regression to "hold the whole object" would
 // blow well past it, not brush against it.
 const maxStreamingRssBytes: int = 60 * 1024 * 1024
+const bucket: string = "bit-s3-live"
 
 // BIT_REPO IS REQUIRED, same reason as _tests_/bit/redislive.bit.
 fn repoRoot(): string {
@@ -122,6 +129,47 @@ fn dockerAvailable(bin: string): bool {
   return r.exitCode == 0
 }
 
+// This process's own pid, read off `/bin/sh -c 'echo $PPID'`: `std/process`
+// execs every child directly with no shell (its own doc comment), so a
+// freshly spawned `/bin/sh`'s parent is always this process itself.
+fn selfPid(): int! {
+  let r = output("/bin/sh", ["-c", "echo $PPID"], dockerQuickTimeoutMs)
+  if (r.exitCode != 0) {
+    fail newError("selfPid: /bin/sh exited ${r.exitCode}: ${trimSpace(r.stderr)}")
+  }
+  return parseInt(trimSpace(r.stdout))?
+}
+
+// Whether `pid` still names a live process — `kill -0` sends no signal, only
+// checks existence (the same idiom tools/build/gatesexec.bit's watchdogs use).
+fn pidAlive(pid: int): bool {
+  let r = output("/bin/sh", ["-c", "kill -0 ${pid} 2>/dev/null"], dockerQuickTimeoutMs)
+  return r.exitCode == 0
+}
+
+// The pid `id` recorded in its own `${ownerLabelKey}` label, or 0 if the
+// label is missing or unparseable (a container from before this label
+// existed, or a `docker inspect` hiccup) — `sweepOrphans` treats 0 as "no
+// owner to protect", so such a container is always removed.
+fn containerOwnerPid(bin: string, id: string): int {
+  let r = output(
+    bin,
+    ["inspect", "-f", "{{index .Config.Labels \"${ownerLabelKey}\"}}", id],
+    dockerQuickTimeoutMs,
+  )
+  if (r.exitCode != 0) {
+    return 0
+  }
+  let pid = parseInt(trimSpace(r.stdout)) catch _ {
+    return 0
+  }
+  return pid
+}
+
+// Force-removes every container this harness has ever labelled whose owner
+// process is no longer alive, before this run starts its own. A concurrent
+// peer's own still-running container carries a live owner pid and is left
+// alone (#6327).
 fn sweepOrphans(bin: string) {
   let r = output(bin, ["ps", "-aq", "--filter", "label=${runLabel}"], dockerQuickTimeoutMs)
   if (r.exitCode != 0) {
@@ -129,6 +177,10 @@ fn sweepOrphans(bin: string) {
   }
   for id of split(trimSpace(r.stdout), "\n") {
     if (id == "") {
+      continue
+    }
+    let ownerPid = containerOwnerPid(bin, id)
+    if (ownerPid > 0 && pidAlive(ownerPid)) {
       continue
     }
     output(bin, ["rm", "-f", id], dockerRunTimeoutMs)
@@ -176,6 +228,28 @@ fn s3Ready(endpoint: string): bool {
 
 fn cleanup(bin: string, name: string) {
   output(bin, ["rm", "-f", name], dockerRunTimeoutMs)
+}
+
+// Starts the SeaweedFS container and waits for its S3 gateway to answer —
+// mirrors redislive.bit/jobslive.bit's own startX helpers. `bucket` is the
+// package-level const, not a parameter, to stay within the 5-param ceiling.
+fn startSeaweed(
+  bin: string, name: string, accessKey: string, secretKey: string, ownerLabel: string,
+): string! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
+      "-p", "127.0.0.1:0:8333", "-e", "AWS_ACCESS_KEY_ID=${accessKey}",
+      "-e", "AWS_SECRET_ACCESS_KEY=${secretKey}", "-e", "S3_BUCKET=${bucket}", image,
+    ],
+  )?
+  let port = hostPort(bin, name, "8333/tcp")?
+  let endpoint = "http://127.0.0.1:${port}"
+  if (!s3Ready(endpoint)) {
+    fail newError("${name}: S3 gateway never answered within ${readyAttempts * readyDelayMs}ms")
+  }
+  return endpoint
 }
 
 // Targets the pkg/s3 DIRECTORY (SPEC §17.1), same reasoning as
@@ -390,32 +464,16 @@ fn main() {
   let name = "bit-s3-live-${runId}"
   let accessKey = "s3live-${runId}"
   let secretKey = uuidFormat(uuidV4())
-  let bucket = "bit-s3-live"
 
-  dockerRun(
-    bin,
-    [
-      "run", "--rm", "-d", "--name", name, "--label", runLabel,
-      "-p", "127.0.0.1:0:8333", "-e", "AWS_ACCESS_KEY_ID=${accessKey}",
-      "-e", "AWS_SECRET_ACCESS_KEY=${secretKey}", "-e", "S3_BUCKET=${bucket}", image,
-    ],
-  ) catch e {
+  let pid = selfPid() catch e {
     eprint("s3live: ${e.message()}\n")
-    cleanup(bin, name)
     exit(1)
     return
   }
+  let ownerLabel = "${ownerLabelKey}=${pid}"
 
-  let port = hostPort(bin, name, "8333/tcp") catch e {
+  let endpoint = startSeaweed(bin, name, accessKey, secretKey, ownerLabel) catch e {
     eprint("s3live: ${e.message()}\n")
-    cleanup(bin, name)
-    exit(1)
-    return
-  }
-  let endpoint = "http://127.0.0.1:${port}"
-
-  if (!s3Ready(endpoint)) {
-    eprint("s3live: S3 gateway never answered within ${readyAttempts * readyDelayMs}ms\n")
     cleanup(bin, name)
     exit(1)
     return
