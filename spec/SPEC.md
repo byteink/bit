@@ -1752,8 +1752,9 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   field, a map, a list or a channel; a row captured by a closure; a row
   reached through an interface or a generic type parameter; a row from
   `Db.query<T>`/`TxHandle.query<T>` (raw SQL, above - it has no `.with()`);
-  a composite literal that never sets the relation; a parameter no call
-  anywhere in the project resolves to; and a row passed to a named function
+  a composite literal that never sets the relation; a parameter of a
+  function no function in the project calls (a `test` block is not a caller);
+  and a row passed to a named function
   that reads the relation off its parameter when the argument cannot be
   traced to a query that loads it (the error lands on the argument at the
   call); a parameter the call omits is its default expression, judged the same
@@ -1786,7 +1787,13 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   rows come from raw SQL and names what works - read the relation through
   `db.table<T>().with("rel")`, or select its columns in the SQL and read them as
   fields of the row class - and, when the rows were stored, the line of the
-  store.
+  store. A function whose `return`s name different sources (a raw-SQL row in
+  one, a query row in another, or two queries) returns a holder with one writer
+  per `return`: its callers' reads are proven only when every `return` loads the
+  relation, and the error names the `return` (or its query) that does not. A
+  parameter nothing calls has no query to add `.with(...)` to, so its error says
+  to call the function, from a function body, with rows from a query. A place
+  the error names in another file is written `<file>:<line>`.
 - There is no runtime lazy loading: every database access, and every error
   it can raise, happens at the query call's own `?`. Reading a relation
   field the compiler proved loaded is a plain memory read that cannot
