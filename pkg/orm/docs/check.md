@@ -1,14 +1,13 @@
 # Fail CI when entities and the live schema disagree
 
-Someone adds a `phone` field to `Widget`, ships the code, and forgets to run
-[Generate](generate.md). Nothing catches it - the tests pass locally
-because the developer's own database happens to be in sync. The first
-request against production that touches `phone` fails, because the column
-was never there. `generate` closes the gap between "the entity changed" and
-"there is a migration to review" - but nothing stops a deploy that skipped
-that step entirely. `check` is that stop: it runs the identical diff
-`generate` runs, and instead of writing a file, it fails loudly the moment
-the entities and the live schema disagree.
+Someone adds a `phone` field to `Widget`, ships the code, and forgets to
+write the migration. Nothing catches it - the tests pass locally because
+the developer's own database happens to be in sync. The first request
+against production that touches `phone` fails, because the column was
+never there. A migration closes the gap between "the entity changed" and
+"there is a reviewed change to apply" - but nothing stops a deploy that
+skipped writing one entirely. `check` is that stop: it diffs your entities
+against the live schema, and fails loudly the moment they disagree.
 
 ## The simplest thing that works
 
@@ -30,11 +29,10 @@ fn verifySchema(db: Data): ()! {
 }
 ```
 
-`Widget{}` needs no `implements TableEntity` clause, the same structural
-fit [Generate](generate.md) already relies on - `@table` synthesizes
-exactly the two members `TableEntity` asks for. `ServerDialect.Postgres`
-is the same explicit "which server" argument `generate` takes, for the
-same reason: `check` never asks the live connection what it is.
+`Widget{}` needs no `implements TableEntity` clause - `@table` synthesizes
+exactly the two members `TableEntity` asks for. `ServerDialect.Postgres` is
+an explicit "which server" argument: `check` never asks the live
+connection what it is.
 
 If the live `widgets` table has every column `Widget` declares, with a
 matching type and a CHECK listing the same four status variants,
@@ -47,8 +45,8 @@ widgets.phone: in entity, not in database
 ```
 
 Run `verifySchema` as a step in CI against a scratch database with the
-committed migrations applied, and a deploy that forgot to run `generate`
-turns into a red build instead of a production incident.
+committed migrations applied, and a deploy that forgot to write one turns
+into a red build instead of a production incident.
 
 ## Growing it: every kind of disagreement it catches
 
@@ -85,15 +83,14 @@ mismatch" naming both sides - because the whole value of this output is
 that someone reads it at 2am and knows immediately what to fix, not that
 it dumped two schemas for them to diff by eye.
 
-## The disagreement generate.bit's own presence diff cannot see
+## The disagreement column presence and type cannot see
 
 An enum's variant list can drift with the column staying present, same
-name, same type - [Generate](generate.md)'s own "An enum's variant list
-drifts too" section walks through why: the live CHECK constraint still
-lists the old three variants while `Widget` above declares four, and a
-diff that only checks column presence and type sees nothing wrong at all.
-`check` runs the identical `enumVariantsChanged` comparison `generate`
-does, so the same drift that would emit a migration also fails the gate:
+name, same type: the live CHECK constraint still lists the old three
+variants while `Widget` above declares four, and a diff that only checks
+column presence and type sees nothing wrong at all. `check` also runs
+`enumVariantsChanged`, the same SET comparison [Enum columns](enum.md)
+uses, so this drift fails the gate too:
 
 ```text
 pkg/orm: check: entities and the live schema disagree:
@@ -116,24 +113,21 @@ fn wrong(db: Data): ()! {
 
 `check` issues exactly the `information_schema` queries the diff needs and
 nothing else - no `db.exec` call exists in this file. When it fails, the
-fix is the same one a forgotten `generate` step always needed: run
-[Generate](generate.md), review the file it writes, and apply it with
-[Migrate](migrate.md). `check` only ever tells you that step is missing;
-it never takes it for you.
+fix is the same one a forgotten migration always needed: write it by hand
+and apply it with [Migrate](migrate.md). `check` only ever tells you that
+step is missing; it never takes it for you.
 
 ## When not to use this
 
-`check` does not cover a `@manyToMany` join table's own existence -
-[Generate](generate.md)'s `manyToManyDescsFor` diffs that separately, and
-today `check` only compares an entity's own columns, their types and an
-enum column's CHECK. Run it as a CI gate against a scratch database first;
+`check` does not cover a `@manyToMany` join table's own existence - today
+it only compares an entity's own columns, their types and an enum
+column's CHECK. Run it as a CI gate against a scratch database first;
 wiring it into application start behind a config flag, so a deploy that
 slipped through still fails fast at boot, is worth adding once CI is
 already covered - never the only place it runs.
 
 ## Where to go next
 
-[Generate](generate.md) covers turning the identical diff into a reviewed
-migration file instead of a pass/fail. [Migrate](migrate.md) covers
-applying that file. [Enum columns](enum.md) covers `@enumVariants`'s own
-column shape and why reordering is always free.
+[Migrate](migrate.md) covers applying a migration. [Enum columns](enum.md)
+covers `@enumVariants`'s own column shape and why reordering is always
+free.

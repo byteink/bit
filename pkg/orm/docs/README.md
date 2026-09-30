@@ -17,7 +17,6 @@
 | [Many-to-many](manytomany.md) | `@manyToMany` and `Repo<T>.link`/`unlink` on the join table |
 | [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withDeleted`/`restore`/`forceDelete` opt in |
 | [Row locking](locking.md) | `tx.table<T>().lock(mode)`/`LockMode`: `Update` blocks until a row is free, `SkipLocked`/`NoWait` return or fail immediately instead of waiting, only reachable from inside a transaction |
-| [Generate migrations](generate.md) | `generate`: diffs your `@table` entities against the live schema and writes a reviewed migration file, never applying anything and never inferring a rename |
 | [Apply migrations](migrate.md) | `up`/`status`/`sql`/`down`: applies a checked-in migration registry against a live database, one transaction per migration with the ledger row inside it, an advisory lock around the whole run |
 | [Check the schema in CI](check.md) | `check`: runs the identical diff `generate` runs and fails naming every disagreement, one line per line, instead of writing a file - column presence, type, and an enum column's CHECK drift |
 | [Sync the dev database](sync.md) | `syncSchema`: applies the identical diff directly against a scratch database, no file, no review - drops included - and refuses outright against any database whose `schema_history` carries a row |
