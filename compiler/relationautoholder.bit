@@ -1,0 +1,500 @@
+// compiler/relationautoholder.bit — #6344 (epic #6298): where a row lives
+// after it ESCAPES a query's own flow, and what proves its relation loaded
+// there.
+//
+// THE GAP. `relationAutoResolve` (relationauto.bit) follows a row from the
+// query that produced it through a `let`, a `for-of`, an index, a call. A row
+// stored into a struct field, a map value, or captured by a closure leaves
+// that flow, so a later read used to be E0300 with the hint "add
+// '.with(\"rel\")' where the rows are queried" — advice that did not help,
+// because nothing linked the read back to that query. Following the
+// compiler's own advice must always make the build pass.
+//
+// THE MODEL. An untraceable location is a HOLDER, named by a key built from
+// static facts only (never a name a caller could shadow):
+//   `holder:F:<struct type id>.<field>`  every value stored in that field of
+//                                        any instance of that struct;
+//   `holder:M:<row class id>:<slice?>`   every value stored in any map whose
+//                                        values are that row class (or slices
+//                                        of it);
+//   `holder:C:<module>:<symbol id>`      a local `let`/`for-of` variable, read
+//                                        where the walk has no binding for it
+//                                        (a closure's own fresh walk).
+// `relationAutoResolve` answers a holder as a `RelationAutoFlow` whose
+// `paramName` is the key (`relationAutoIsHolderName`; a real parameter is an
+// identifier, so the `holder:` prefix never collides) with `queryCall = 0`.
+// Every consumer that already treats a parameter-origin flow as "not a query"
+// therefore treats a holder the same, with no new state on the flow.
+//
+// WRITERS. The err pass (relationautoerr.bit) runs twice. Pass one only
+// COLLECTS, into `RelationAutoHolders`, every store into a holder: a field
+// assignment, an element assignment, a composite-literal field init, a map
+// literal entry, a `let`, a `for-of` binder, a plain `=` to a variable. Each
+// store is a `RelationAutoWriter`: the value's own flow reduced to either the
+// relation names its query provably loads (`relationAutoQueryNames`: the
+// explicit `.with(...)` chain on the query plus whatever the auto-loader
+// splices) or "copied from another holder", or POISONED (`ok = false`) when
+// the stored value is not traceable at all. Pass two checks reads. A read on
+// a holder is proven iff the holder has at least one writer and EVERY writer
+// proves the read's full dotted path: one poisoned or unloading writer
+// refuses it, so a holder can never be proven by the writers that happen to
+// be visible. A holder nothing was recorded for is unproven.
+//
+// SOUNDNESS LIMITS, all in the refusing direction except the last: an
+// unresolvable store poisons; a chain of copies deeper than
+// `relationAutoHolderMaxDepth` (or a cycle) is unproven; a `for-of` over a
+// non-slice poisons. NOT tracked, so not poisoned either: an element write
+// through an alias of a query's own traced rows (`rows[0] = other`), which
+// the existing same-function flow never followed.
+
+const relationAutoHolderPrefix = "holder:"
+const relationAutoHolderMaxDepth = 8
+
+fn relationAutoIsHolderName(name: string): bool {
+  let n = len(relationAutoHolderPrefix)
+  return len(name) > n && name[0:n] == relationAutoHolderPrefix
+}
+
+// One store into a holder. `ok = false`: an untraceable value. Otherwise
+// either `via == ""` (a real query, `names` are the relations it loads) or
+// `via` names another holder the value was copied from. `path` is the
+// relation path already walked from that query's / holder's row to the
+// stored value (`cache.author = post.author` stores `path = "author"`).
+// `line` is the query's source line, for the hint.
+class RelationAutoWriter {
+  ok: bool,
+  names: []string,
+  via: string,
+  path: string,
+  line: int,
+}
+
+class RelationAutoHolders {
+  writers: map<string, []RelationAutoWriter>,
+}
+
+fn relationAutoNewHolders(): RelationAutoHolders {
+  return RelationAutoHolders{ writers = map<string, []RelationAutoWriter>{} }
+}
+
+fn relationAutoWriterBad(): RelationAutoWriter {
+  return RelationAutoWriter{ ok = false, names = []string(0), via = "", path = "", line = 0 }
+}
+
+// The 1-based source line of byte offset `off`.
+fn relationAutoLineOf(source: string, off: int): int {
+  let line = 1
+  let i = 0
+  while (i < off && i < len(source)) {
+    if (source[i] == '\n') {
+      line = line + 1
+    }
+    i = i + 1
+  }
+  return line
+}
+
+// Every relation name `queryCall` is known to load: the explicit `.with(...)`
+// chain on the query's own receiver (the same walk the splice trusts,
+// `relationAutoExistingWithNames`) plus every name the auto-loader records
+// for it (`Checker.relationAutoWith`) and will splice at build time.
+fn relationAutoQueryNames(owner: Checker, queryCall: int): []string {
+  let callee = kidsOf(owner.tree, queryCall)[0]
+  let out = relationAutoExistingWithNames(owner.tree, owner.source, kidsOf(owner.tree, callee)[0])
+  let (auto, ok) = owner.relationAutoWith[queryCall]
+  if (ok) {
+    for n of auto {
+      out = append(out, n)
+    }
+  }
+  return out
+}
+
+// `flow` (a stored value's own resolved flow) reduced to a writer.
+fn relationAutoWriterOf(c: Checker, flow: RelationAutoFlow): RelationAutoWriter {
+  if (!flow.found) {
+    return relationAutoWriterBad()
+  }
+  if (relationAutoIsHolderName(flow.paramName)) {
+    return RelationAutoWriter{
+      ok = true, names = []string(0), via = flow.paramName, path = flow.path, line = 0,
+    }
+  }
+  if (flow.queryCall <= 0) {
+    return relationAutoWriterBad() // a parameter's row: no query to point at
+  }
+  let owner = c.mods[flow.ownerModule]
+  return RelationAutoWriter{
+    ok = true, names = relationAutoQueryNames(owner, flow.queryCall), via = "", path = flow.path,
+    line = relationAutoLineOf(owner.source, getNode(owner.tree, flow.queryCall).span.start),
+  }
+}
+
+fn relationAutoHolderNote(h: RelationAutoHolders, key: string, w: RelationAutoWriter) {
+  if (key == "") {
+    return
+  }
+  let (old, ok) = h.writers[key]
+  if (!ok) {
+    old = []RelationAutoWriter(0)
+  }
+  h.writers[key] = append(old, w)
+}
+
+// True when some name in `names` is `path` or nests under it — a query that
+// loads "author.posts" has loaded "author" on the way.
+fn relationAutoNamesCover(names: []string, path: string): bool {
+  for n of names {
+    if (relationAutoPathIsPrefixOf(path, n)) {
+      return true
+    }
+  }
+  return false
+}
+
+// (proved, line): whether `w` proves `need` (a path relative to the holder's
+// rows), and the source line of a query that failed to, when there is one.
+fn relationAutoWriterProves(
+  h: RelationAutoHolders, w: RelationAutoWriter, need: string, depth: int,
+): (bool, int) {
+  if (!w.ok) {
+    return (false, 0)
+  }
+  let full = relationAutoJoinPath(w.path, need)
+  if (w.via == "") {
+    return (relationAutoNamesCover(w.names, full), w.line)
+  }
+  return relationAutoHolderProves(h, w.via, full, depth + 1)
+}
+
+fn relationAutoHolderProves(
+  h: RelationAutoHolders, key: string, need: string, depth: int,
+): (bool, int) {
+  if (depth > relationAutoHolderMaxDepth) {
+    return (false, 0)
+  }
+  let (ws, ok) = h.writers[key]
+  if (!ok || len(ws) == 0) {
+    return (false, 0)
+  }
+  let all = true
+  let blame = 0
+  for w of ws {
+    let (proved, line) = relationAutoWriterProves(h, w, need, depth)
+    if (!proved) {
+      all = false
+      if (blame == 0) {
+        blame = line
+      }
+    }
+  }
+  return (all, blame)
+}
+
+// The flow of a holder whose value at `node` is a `@table` row (or a slice of
+// them) and whose key is `key`; not-found for every other type — a holder only
+// matters for rows.
+fn relationAutoHolderFlow(c: Checker, node: int, key: string): RelationAutoFlow {
+  let (cls, isSlice) = relationAutoParamTrackable(c, checkExprType(c, node))
+  if (!cls.found) {
+    return relationAutoNoFlow(c)
+  }
+  return RelationAutoFlow{
+    found = true, cls = cls, queryCall = 0, paramName = key, isSlice = isSlice,
+    ownerModule = c.moduleId, path = "",
+  }
+}
+
+// A plain local `let` (or `for-of` binder) only: a parameter's value is
+// unrecorded by any writer, so it is never a holder.
+fn relationAutoHolderIdent(c: Checker, n: int): RelationAutoFlow {
+  if (n <= 0 || n >= len(c.nodeSymbols)) {
+    return relationAutoNoFlow(c)
+  }
+  let sid = c.nodeSymbols[n]
+  if (sid <= 0 || sid >= len(c.symbols) || c.symbols[sid].kind != SymbolKind.LetBinding) {
+    return relationAutoNoFlow(c)
+  }
+  return relationAutoHolderFlow(c, n, "${relationAutoHolderPrefix}C:${c.moduleId}:${sid}")
+}
+
+fn relationAutoHolderMember(c: Checker, n: int): RelationAutoFlow {
+  let k = kidsOf(c.tree, n)
+  if (len(k) < 2 || k[0] == 0 || k[1] == 0) {
+    return relationAutoNoFlow(c)
+  }
+  let sty = checkExprType(c, k[0])
+  if (sty == 0 || c.ctx.types[sty].kind != TypeKind.Struct) {
+    return relationAutoNoFlow(c)
+  }
+  let key = "${relationAutoHolderPrefix}F:${sty}.${identText(c.tree, c.source, k[1])}"
+  return relationAutoHolderFlow(c, n, key)
+}
+
+// `m[k]` on a map whose VALUE type is a row (or slice of rows).
+fn relationAutoHolderIndex(c: Checker, n: int): RelationAutoFlow {
+  let bt = checkExprType(c, kidsOf(c.tree, n)[0])
+  if (bt == 0 || c.ctx.types[bt].kind != TypeKind.Map) {
+    return relationAutoNoFlow(c)
+  }
+  let (cls, isSlice) = relationAutoParamTrackable(c, c.ctx.types[bt].mapVal)
+  if (!cls.found) {
+    return relationAutoNoFlow(c)
+  }
+  return RelationAutoFlow{
+    found = true, cls = cls, queryCall = 0,
+    paramName = "${relationAutoHolderPrefix}M:${cls.ty}:${isSlice}", isSlice = isSlice,
+    ownerModule = c.moduleId, path = "",
+  }
+}
+
+// The holder flow `n` is, by its own shape, or not-found.
+fn relationAutoHolderOf(c: Checker, n: int): RelationAutoFlow {
+  let tag = getNode(c.tree, n).tag
+  if (tag == Tag.Ident) {
+    return relationAutoHolderIdent(c, n)
+  }
+  if (tag == Tag.Member) {
+    return relationAutoHolderMember(c, n)
+  }
+  if (tag == Tag.Index) {
+    return relationAutoHolderIndex(c, n)
+  }
+  return relationAutoNoFlow(c)
+}
+
+// The hint for a read on a holder that failed to prove `need`.
+fn relationAutoHolderHint(need: string, line: int): string {
+  if (line <= 0) {
+    return relationAutoUnknownOriginHint(need)
+  }
+  return "these rows were stored from the query on line ${line}, which does not load '${need}' " +
+    "-- add '.with(\"${need}\")' to that query"
+}
+
+// ---- writer collection (pass one of relationautoerr.bit) -----------------
+
+fn relationAutoHolderNoteBad(ctx: RelationAutoErrCtx, key: string) {
+  relationAutoHolderNote(ctx.pass.holders, key, relationAutoWriterBad())
+}
+
+// Strips what wraps a value without changing WHICH rows it is — a trailing
+// `?` (`db.table<Post>().all()?`'s own shape), a `catch e { ... }` whose
+// handler cannot fall through (returns, fails, panics: the value is then the
+// operand's own, #6344), or a `catch <empty rows>` default — so the call
+// underneath can be matched directly. Bounded: neither wrapper can nest
+// forever in valid source, but the guard mirrors `ormChainRoot`'s own
+// defensive bound anyway.
+fn relationAutoStripTry(c: Checker, node: int): int {
+  let n = node
+  let guard = 0
+  while (n != 0 && guard < 64) {
+    let tag = getNode(c.tree, n).tag
+    let k = kidsOf(c.tree, n)
+    let wrapper = tag == Tag.TryExpr ||
+      (tag == Tag.CatchBind && vBlockDiverges(c, k[2], true)) ||
+      (tag == Tag.CatchDefault && relationAutoIsEmptyRows(c, k[1]))
+    if (!wrapper) {
+      return n
+    }
+    n = k[0]
+    guard = guard + 1
+  }
+  return n
+}
+
+// True for a value that holds no rows at all: `[]T(0)` or `[]T{}`. Storing
+// one is not a store of unloaded rows — it is how a holder is initialised —
+// so it records no writer. `[]T(n)` for `n > 0` is NOT empty: it allocates `n`
+// zero-valued rows.
+fn relationAutoIsEmptyRows(c: Checker, v: int): bool {
+  let s = relationAutoStripTry(c, v)
+  if (s == 0) {
+    return false
+  }
+  let k = kidsOf(c.tree, s)
+  let tag = getNode(c.tree, s).tag
+  if (tag == Tag.CompositeLit) {
+    return getNode(c.tree, k[0]).tag == Tag.SliceType && len(kidsOf(c.tree, k[1])) == 0
+  }
+  if (tag != Tag.Call || getNode(c.tree, k[0]).tag != Tag.SliceType) {
+    return false
+  }
+  let args = kidsOf(c.tree, k[2])
+  if (len(args) != 1) {
+    return false
+  }
+  let sp = getNode(c.tree, args[0]).span
+  return c.source[sp.start:sp.end] == "0"
+}
+
+// `let x = init`: the variable's own holder gets `init`'s flow as a writer.
+fn relationAutoHolderNoteLet(
+  c: Checker, pattern: int, init: int, ctx: RelationAutoErrCtx,
+) {
+  if (relationAutoIsEmptyRows(c, init)) {
+    return
+  }
+  let key = relationAutoHolderIdent(c, pattern).paramName
+  let flow = relationAutoResolve(c, init, ctx.st)
+  relationAutoHolderNote(ctx.pass.holders, key, relationAutoWriterOf(c, flow))
+}
+
+// `for x of iter`: the binder is one row of `iter`'s rows. A binder over
+// anything but a tracked slice poisons its holder.
+fn relationAutoHolderNoteForOf(
+  c: Checker, binder: int, iter: RelationAutoFlow, ctx: RelationAutoErrCtx,
+) {
+  if (binder == 0 || getNode(c.tree, binder).tag != Tag.Ident) {
+    return
+  }
+  let key = relationAutoHolderIdent(c, binder).paramName
+  if (iter.found && iter.isSlice) {
+    relationAutoHolderNote(ctx.pass.holders, key, relationAutoWriterOf(c, iter))
+    return
+  }
+  relationAutoHolderNoteBad(ctx, key)
+}
+
+fn relationAutoIsAppendCall(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Call) {
+    return false
+  }
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return false
+  }
+  let name = identText(c.tree, c.source, callee)
+  return name == "append" && !shadowedByValue(c, callee, name)
+}
+
+// One argument of `append(...)` stored into `key`. The first argument that is
+// `key` itself is the accumulator, not a new writer; a spread or named
+// argument poisons.
+fn relationAutoHolderNoteArg(
+  c: Checker, key: string, a: int, first: bool, ctx: RelationAutoErrCtx,
+) {
+  if (getNode(c.tree, a).tag != Tag.Arg) {
+    relationAutoHolderNoteBad(ctx, key)
+    return
+  }
+  let flow = relationAutoResolve(c, kidsOf(c.tree, a)[0], ctx.st)
+  if (first && flow.found && flow.paramName == key) {
+    return
+  }
+  relationAutoHolderNote(ctx.pass.holders, key, relationAutoWriterOf(c, flow))
+}
+
+// `v` stored into holder `key`. `append(xs, row...)` stores its arguments.
+fn relationAutoHolderNoteValue(c: Checker, key: string, v: int, ctx: RelationAutoErrCtx) {
+  if (v == 0) {
+    relationAutoHolderNoteBad(ctx, key)
+    return
+  }
+  if (relationAutoIsEmptyRows(c, v)) {
+    return
+  }
+  let s = relationAutoStripTry(c, v)
+  if (!relationAutoIsAppendCall(c, s)) {
+    relationAutoHolderNote(
+      ctx.pass.holders,
+      key,
+      relationAutoWriterOf(c, relationAutoResolve(c, v, ctx.st)),
+    )
+    return
+  }
+  let args = kidsOf(c.tree, kidsOf(c.tree, s)[2])
+  let i = 0
+  while (i < len(args)) {
+    relationAutoHolderNoteArg(c, key, args[i], i == 0, ctx)
+    i = i + 1
+  }
+}
+
+// The holder key an assignment TARGET writes into, or "": a variable, a
+// struct field, a map value, or an element of a holder slice.
+fn relationAutoHolderTargetKey(c: Checker, t: int, ctx: RelationAutoErrCtx): string {
+  if (t == 0) {
+    return ""
+  }
+  if (getNode(c.tree, t).tag == Tag.Index) {
+    let base = relationAutoResolve(c, kidsOf(c.tree, t)[0], ctx.st)
+    if (base.found && relationAutoIsHolderName(base.paramName)) {
+      return base.paramName
+    }
+  }
+  return relationAutoHolderOf(c, t).paramName
+}
+
+// `a, b = x, y` (plain `=`): each target that is a holder gets its matching
+// value; a tuple-destructuring assignment poisons every holder target.
+fn relationAutoHolderNoteAssign(c: Checker, node: int, ctx: RelationAutoErrCtx) {
+  if (getNode(c.tree, node).main != int(Kind.Eq)) {
+    return
+  }
+  let k = kidsOf(c.tree, node)
+  let targets = kidsOf(c.tree, k[0])
+  let values = kidsOf(c.tree, k[1])
+  let i = 0
+  while (i < len(targets)) {
+    let key = relationAutoHolderTargetKey(c, targets[i], ctx)
+    if (key != "" && len(values) == len(targets)) {
+      relationAutoHolderNoteValue(c, key, values[i], ctx)
+    } else if (key != "") {
+      relationAutoHolderNoteBad(ctx, key)
+    }
+    i = i + 1
+  }
+}
+
+// `S{ f = v }`: a struct field init stores `v` into `S.f`, when `f` is a row
+// (or slice of rows) field.
+fn relationAutoHolderNoteStructLit(c: Checker, node: int, ty: int, ctx: RelationAutoErrCtx) {
+  let body = kidsOf(c.tree, node)[1]
+  if (body == 0 || getNode(c.tree, body).tag != Tag.FieldInits) {
+    return
+  }
+  for f of kidsOf(c.tree, body) {
+    let fk = kidsOf(c.tree, f)
+    let fname = identText(c.tree, c.source, fk[0])
+    let (fty, ok) = c.ctx.structFields["${ty}.${fname}"]
+    let (fcls, _) = relationAutoParamTrackable(c, fty)
+    if (ok && fcls.found) {
+      let key = "${relationAutoHolderPrefix}F:${ty}.${fname}"
+      relationAutoHolderNoteValue(c, key, fk[1], ctx)
+    }
+  }
+}
+
+// `map<K, Row>{ k: v }` (typed or bare): each entry stores `v` into the
+// row-valued-map holder.
+fn relationAutoHolderNoteMapLit(c: Checker, node: int, ty: int, ctx: RelationAutoErrCtx) {
+  let (cls, isSlice) = relationAutoParamTrackable(c, c.ctx.types[ty].mapVal)
+  if (!cls.found) {
+    return
+  }
+  let entries = kidsOf(c.tree, node)
+  if (getNode(c.tree, node).tag == Tag.CompositeLit) {
+    entries = kidsOf(c.tree, entries[1])
+  }
+  let key = "${relationAutoHolderPrefix}M:${cls.ty}:${isSlice}"
+  for e of entries {
+    relationAutoHolderNoteValue(c, key, kidsOf(c.tree, e)[1], ctx)
+  }
+}
+
+// A composite or map literal: every field/entry it initialises is a store.
+fn relationAutoHolderNoteLiteral(c: Checker, node: int, ctx: RelationAutoErrCtx) {
+  let ty = checkExprType(c, node)
+  if (ty == 0) {
+    return
+  }
+  let kind = c.ctx.types[ty].kind
+  if (kind == TypeKind.Struct && getNode(c.tree, node).tag == Tag.CompositeLit) {
+    relationAutoHolderNoteStructLit(c, node, ty, ctx)
+    return
+  }
+  if (kind == TypeKind.Map) {
+    relationAutoHolderNoteMapLit(c, node, ty, ctx)
+  }
+}

@@ -1684,8 +1684,8 @@ walk as E0163.**
 **A relation field loads itself; an unprovable read is a build error, not a
 runtime one (#6302, #6305, #6318, #6322, #6308).**
 
-- The compiler sees every read of a `@hasMany`/`@hasOne`/`@belongsTo` field
-  on a row that came from `Repo<T>`/`TxRepo<T>`'s `all`/`find`/`first`
+- The compiler sees every read of a `@hasMany`/`@hasOne`/`@belongsTo`/
+  `@manyToMany` field on a row that came from `Repo<T>`/`TxRepo<T>`'s `all`/`find`/`first`
   (`db.table<T>()`/`tx.table<T>()`, above), tracked through a `let`, a
   trailing `?`, a `for-of` loop variable, indexing, `.unwrap()`, and across
   a non-generic named function's own parameters and return value, WHOLE
@@ -1707,11 +1707,24 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   field, a map, a list or a channel; a row captured by a closure; a row
   reached through an interface or a generic type parameter; a row from
   `Db.query<T>`/`TxHandle.query<T>` (raw SQL, above - it has no `.with()`);
-  a composite literal that never sets the relation; and a parameter no call
-  anywhere in the project resolves to. Assigning `x.f = ...` - directly, or
-  as a composite-literal field init a `let` binds straight to - earlier in
-  the same function counts as loaded, source-order only (no branch-exact
-  control-flow tracking).
+  a composite literal that never sets the relation; a parameter no call
+  anywhere in the project resolves to; and a row passed to a named function
+  that reads the relation off its parameter when the argument cannot be
+  traced to a query that loads it (the error lands on the argument at the
+  call). Assigning `x.f = ...` - directly, or as a composite-literal field
+  init a `let` binds straight to - earlier in the same function counts as
+  loaded, source-order only (no branch-exact control-flow tracking).
+- **Following the error's advice always fixes it.** A row held in a struct
+  field, a map value, or a local variable a closure captures is proven
+  loaded when EVERY store into that field (any instance of that struct), that
+  kind of map, or that variable is a row from a query whose own `.with(...)`
+  chain names the relation, or a dotted path through it
+  (`.with("author.posts")` covers `author`), or a relation the compiler
+  already loads for that query. The error then names the query that stored
+  the rows. One store of a row this analysis cannot trace (raw SQL, a value
+  from a parameter, a composite literal) leaves the holder unproven: a proof
+  never rests on the stores that happen to be visible. Empty initialisers
+  (`[]T(0)`, `[]T{}`) store no rows.
 - There is no runtime lazy loading: every database access, and every error
   it can raise, happens at the query call's own `?`. Reading a relation
   field the compiler proved loaded is a plain memory read that cannot
