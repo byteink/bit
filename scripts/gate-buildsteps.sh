@@ -337,7 +337,7 @@ case "${BUCKET}" in
     # can break how every published package resolves even though no package
     # imports compiler/ directly. Measured `./make test-package-tags` 0m24s
     # (4 of 4 published packages build) on this branch's own tip.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword)
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -424,7 +424,7 @@ case "${BUCKET}" in
     # #5606 comment: runtime/** can break how a published package resolves
     # just as much as compiler/** can, and #5597 wired it only into `pkg`.
     # Measured `./make test-package-tags` 0m24s on this branch's own tip.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing)
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention test-gc-decimalstress test-fmt-citations test-taskwords-sizing test-no-warnings)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
@@ -448,7 +448,7 @@ case "${BUCKET}" in
     # test-lint-aux (#4149) declares examples/ as one of its three trees in its
     # own harness (_tests_/bit/lintaux.bit's `trees` list), the same shape: a
     # gate whose scope is inside the harness, not in this bucket's name.
-    BUILD_STEPS=(test-examples test-fmt test-lint-filelines test-lint-aux)
+    BUILD_STEPS=(test-examples test-fmt test-lint-filelines test-lint-aux test-no-warnings)
     ;;
   stdlib)
     # test-fmt's argv literally includes "${repoRoot()}/stdlib" (#2962, the
@@ -503,7 +503,7 @@ case "${BUCKET}" in
     # package resolves just as much as compiler/** can (every package
     # builds against stdlib/), and #5597 wired it only into `pkg`. Measured
     # `./make test-package-tags` 0m24s on this branch's own tip.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-package-tags test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface)
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-package-tags test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface test-no-warnings)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
@@ -515,7 +515,7 @@ case "${BUCKET}" in
     # files) is a real `.bit` source tree like any other — assert_fmt_gate_
     # per_bucket() (scripts/gate-bucketasserts.sh) refuses gate.sh --full
     # outright when a tree holding `.bit` sources runs no fmt gate at all.
-    BUILD_STEPS=(test-docs test-stdlib-docs test-fmt-docs)
+    BUILD_STEPS=(test-docs test-stdlib-docs test-fmt-docs test-no-warnings)
     ;;
   stdlibdocs)
     # THE UNION OF `stdlib` AND `docs` (#3055) — a stdlib export's page can be
@@ -655,7 +655,7 @@ case "${BUCKET}" in
     # closed it by adding `test-package-tags` to the `selfhost`, `runtime`
     # and `stdlib` buckets too (see each bucket's own comment above).
     #
-    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags)
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt test-lint-complexity test-package-release-drift test-package-docs test-fmt-citations test-package-tags test-no-warnings)
     ;;
   spec)
     # test-fmt-citations (#5615) is spec's second gate. test-spec alone is a
