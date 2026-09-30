@@ -441,8 +441,8 @@ times, 18m13s-18m36s, most recently on `8f5e49e8`; the driver prints its own
 `make: test - total` line, which is the number to trust over anything
 reconstructed afterward) to actually verify a change like that, or as the
 final pre-merge gate. In this repo's own workflow that full run is batched
-once per push by whoever integrates (see `CLAUDE.md`'s verify-loop rule) -
-that batching is a convention for this repo's own contributors, not this
+once per push by whoever integrates -
+that batching is this repo's own contributors' convention, not this
 script's answer for someone with no integrator to hand it to. Every harness
 also has its own named step
 (`./make test-golden|test-examples|test-stress|test-selfcheck|…`) for running one
