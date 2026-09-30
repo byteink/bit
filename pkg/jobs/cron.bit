@@ -58,6 +58,14 @@
 // EARLIER offset) returned an instant 59 minutes before `after` from the
 // second 01:30 of a fall-back day; `nextAfter` now fails rather than return
 // an instant that is not after `after`.
+//
+// `prevAtOrBefore` is the same search run backwards, for a scheduler that
+// woke far behind (schedule.bit, `planCatchUp`): it finds the newest tick at
+// or before an instant in work bounded by the gap between two ticks, never by
+// how long ago the last one fired. It asks the same per-day question, through
+// the same `cronWalkDay`/`cronWalkTick`, so the two agree on every tick by
+// construction: `nextAfter(prevAtOrBefore(t)) > t` and
+// `prevAtOrBefore(nextAfter(t)) == nextAfter(t)`.
 
 import { DateTime, NaiveDateTime, Timestamp, Zone, Second } from "std/time"
 import { split, trimSpace, toUpper, parseInt, hasPrefix } from "std/strings"
@@ -127,6 +135,35 @@ export class CronSchedule {
     }
     fail newError("cron: search exceeded ${cronMaxSearchSteps} steps")
   }
+
+  // The newest tick at or before `at`, in `at`'s own zone, under the same
+  // daylight-saving rule as `nextAfter`. Fails when nothing matches within
+  // `cronMaxYearsAhead` years before `at`, when the search exceeds its step
+  // bound, or when the answer would be after `at` (a defect, never returned).
+  export prevAtOrBefore(at: DateTime): DateTime! {
+    let atSec = cronSecs(at)?
+    let cand = at.withTime(0, 0, 0)
+    let limitYear = at.year() - cronMaxYearsAhead
+    let steps = 0
+    while (steps < cronMaxSearchSteps) {
+      steps = steps + 1
+      if (cand.year() < limitYear) {
+        fail newError("cron: no matching time within ${cronMaxYearsAhead} years before ${at.toString()}")
+      }
+      if ((this.months & bitAt(cand.month())) == 0) {
+        cand = cand.withDay(1).addDays(-1).withTime(0, 0, 0)
+        continue
+      }
+      if (cronDomDowMatches(this, cand.day(), isoToCronDow(cand.dayOfWeek()))) {
+        let (hit, found) = cronSearchDayLast(this, cand, atSec)?
+        if (found) {
+          return cronEnsureAtOrBefore(hit, at)?
+        }
+      }
+      cand = cand.addDays(-1).withTime(0, 0, 0)
+    }
+    fail newError("cron: search exceeded ${cronMaxSearchSteps} steps")
+  }
 }
 
 // `sec` seconds since the Unix epoch, read in `z`.
@@ -166,6 +203,17 @@ fn cronEnsureAfter(got: DateTime, after: DateTime): DateTime! {
   return got
 }
 
+// The mirror invariant for `prevAtOrBefore`: a tick is never after the
+// instant it was asked for.
+fn cronEnsureAtOrBefore(got: DateTime, at: DateTime): DateTime! {
+  let g = got.toTimestamp()?
+  let a = at.toTimestamp()?
+  if (g.ns > a.ns) {
+    fail newError("cron: previous tick ${got.toString()} is after ${at.toString()}")
+  }
+  return got
+}
+
 // The first tick on the calendar day that starts at wall midnight and ends
 // at `end` (the next wall midnight), at or after `cand` (a minute on that
 // day); `found` is false when the day has none. `cand`'s date already
@@ -176,7 +224,25 @@ fn cronSearchDay(cs: CronSchedule, cand: DateTime, end: DateTime): (DateTime, bo
   if (cronOffsetBefore(start)? == cronOffsetBefore(end)?) {
     return cronFastDay(cs, cand)
   }
-  return cronWalkDay(cs, cand, start, end)?
+  let win = cronWindow{ lo = cronSecs(cand)?, hi = cronSecs(end)? - 1, last = false }
+  return cronWalkDay(cs, start, win)?
+}
+
+// The last tick on the calendar day of `day` at or before `atSec`; `found`
+// is false when the day has none. `day`'s date already matches. The day ends
+// at the next wall midnight, or at `atSec` when that comes first.
+fn cronSearchDayLast(cs: CronSchedule, day: DateTime, atSec: int): (DateTime, bool)! {
+  let start = day.withTime(0, 0, 0)
+  let end = start.addDays(1).withTime(0, 0, 0)
+  let hiSec = cronSecs(end)? - 1
+  if (atSec < hiSec) {
+    hiSec = atSec
+  }
+  if (cronOffsetBefore(start)? == cronOffsetBefore(end)?) {
+    return cronFastDayLast(cs, cronAt(day.zone(), hiSec))
+  }
+  let win = cronWindow{ lo = cronSecs(start)?, hi = hiSec, last = true }
+  return cronWalkDay(cs, start, win)?
 }
 
 // The first matching hour/minute at or after `cand` on its own day, for a
@@ -196,6 +262,36 @@ fn cronFastDay(cs: CronSchedule, cand: DateTime): (DateTime, bool) {
     m0 = 0
   }
   return (cand, false)
+}
+
+// The last matching hour/minute at or before `hi` on its own day, for a day
+// with no offset change.
+fn cronFastDayLast(cs: CronSchedule, hi: DateTime): (DateTime, bool) {
+  let h = hi.hour()
+  let m0 = hi.minute()
+  while (h >= 0) {
+    if ((cs.hours & bitAt(h)) != 0) {
+      let m = cronPrevBit(cs.minutes, m0)
+      if (m >= 0) {
+        return (hi.withTime(h, m, 0), true)
+      }
+    }
+    h = h - 1
+    m0 = 59
+  }
+  return (hi, false)
+}
+
+// The highest set bit of `mask` in `[0, upto]`, or -1.
+fn cronPrevBit(mask: int, upto: int): int {
+  let v = upto
+  while (v >= 0) {
+    if ((mask & bitAt(v)) != 0) {
+      return v
+    }
+    v = v - 1
+  }
+  return -1
 }
 
 // The lowest set bit of `mask` in `[from, 59]`, or -1.
@@ -218,34 +314,42 @@ class cronWalk {
   quietUntil: int,
 }
 
-// Walks the instants of one calendar day, `start` to `end` exclusive, a wall
-// minute at a time, from the day's start so the walk always knows whether it
-// is inside a repeated stretch; returns the first tick at or after `cand`.
-fn cronWalkDay(
-  cs: CronSchedule,
-  cand: DateTime,
-  start: DateTime,
-  end: DateTime,
-): (DateTime, bool)! {
-  let z = cand.zone()
-  let candSec = cronSecs(cand)?
-  let endSec = cronSecs(end)?
+// The instants of one calendar day the walk reports: ticks in `[lo, hi]`
+// seconds, the first of them, or (`last`) the last.
+class cronWindow {
+  lo: int,
+  hi: int,
+  last: bool,
+}
+
+// Walks the instants of one calendar day from `start`, a wall minute at a
+// time, from the day's start so the walk always knows whether it is inside a
+// repeated stretch; returns the first tick in `win`, or the last when
+// `win.last`. `win.hi` is before the day's end.
+fn cronWalkDay(cs: CronSchedule, start: DateTime, win: cronWindow): (DateTime, bool)! {
+  let z = start.zone()
   let tSec = cronSecs(start)?
   let t = start
   let w = cronWalk{ prevOff = cronOffsetBefore(start)?, quietUntil = 0 }
+  let hit = start
+  let found = false
   let steps = 0
-  while (tSec < endSec && steps < cronMaxWalkSteps) {
+  while (tSec <= win.hi && steps < cronMaxWalkSteps) {
     steps = steps + 1
-    if (cronWalkTick(cs, t, tSec, w) && tSec >= candSec) {
-      return (t, true)
+    if (cronWalkTick(cs, t, tSec, w) && tSec >= win.lo) {
+      hit = t
+      found = true
+      if (!win.last) {
+        return (hit, true)
+      }
     }
     tSec = tSec + 60 - t.second()
     t = cronAt(z, tSec)
   }
-  if (tSec < endSec) {
-    fail newError("cron: a day of ${cand.zone().name} did not end within ${cronMaxWalkSteps} minutes")
+  if (tSec <= win.hi) {
+    fail newError("cron: a day of ${z.name} did not end within ${cronMaxWalkSteps} minutes")
   }
-  return (cand, false)
+  return (hit, found)
 }
 
 // Whether the instant `t` (`tSec`) is a tick, updating `w` for the offset

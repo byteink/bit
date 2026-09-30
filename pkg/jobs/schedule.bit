@@ -22,11 +22,17 @@
 // header) and nil means "always leader" — correct for a single instance,
 // documented as wrong for more than one.
 //
-// MISSED TICKS ARE COUNTED PURELY, NO CLOCK INVOLVED
-// (`dueTicks`/`firstFiredTick`/`missedEnqueueCount` below take plain
-// nanosecond ints and a `trigger`) so a test drives them with fixed numbers
-// instead of a real clock or `sleep` — this is the injectable-clock shape
-// the ticket's own tests need.
+// CATCH-UP IS PLANNED PURELY, NO CLOCK INVOLVED (`planCatchUp`/
+// `missedEnqueueCount` below take plain nanosecond ints and a `trigger`) so a
+// test drives them with fixed numbers instead of a real clock or `sleep` —
+// this is the injectable-clock shape the ticket's own tests need.
+//
+// CATCH-UP WORK IS BOUNDED BY THE POLICY, NEVER BY THE DISTANCE BEHIND
+// (#6361). A device that boots at 1970 and gets NTP time in 2026 is
+// 1.7 billion one-second ticks behind an `every(1 * Second)` schedule. The
+// plan never enumerates them: it asks the trigger for the newest tick at or
+// before now (`prevAtOrBeforeNs`), and walks BACK from there, at most the
+// policy's cap of ticks, stopping at the first tick not yet handled.
 //
 // A TICK IS MISSED ONLY WHEN IT IS REACHED TOO LATE TO BE ON TIME (#6358,
 // after #6354). Tick `T`, whose next tick is `T2`, is missed iff
@@ -88,6 +94,13 @@ export interface Locker {
 // loop (jobs.bit) never branches on which kind it has.
 interface trigger {
   nextAfterNs(afterNs: int): int!,
+  // The newest tick at or before `atNs`, never after it. The mirror of
+  // `nextAfterNs`: `nextAfterNs(prevAtOrBeforeNs(t)) > t` and
+  // `prevAtOrBeforeNs(nextAfterNs(t)) == nextAfterNs(t)`.
+  prevAtOrBeforeNs(atNs: int): int!,
+  // How many ticks lie in `[firstNs, lastNs]` (both ticks), when the trigger
+  // knows without walking them; `false` otherwise.
+  tickCountNs(firstNs: int, lastNs: int): (int, bool),
 }
 
 // Wraps a parsed cron expression and the zone its fields are read in.
@@ -101,6 +114,18 @@ class cronTrigger {
     let ts = next.toTimestamp()?
     return ts.ns
   }
+
+  prevAtOrBeforeNs(atNs: int): int! {
+    let at = Timestamp{ ns = atNs }.inZone(this.tz)
+    let prev = this.cron.prevAtOrBefore(at)?
+    let ts = prev.toTimestamp()?
+    return ts.ns
+  }
+
+  // Cron ticks are not evenly spaced, so they are never counted in closed form.
+  tickCountNs(firstNs: int, lastNs: int): (int, bool) {
+    return (0, false)
+  }
 }
 
 // A fixed period, epoch-anchored: the next multiple of `periodNs` strictly
@@ -112,6 +137,20 @@ class intervalTrigger {
   nextAfterNs(afterNs: int): int! {
     return (afterNs / this.periodNs + 1) * this.periodNs
   }
+
+  // Floor division: plain `/` truncates toward zero, which would round an
+  // instant before 1970 up to a tick after it.
+  prevAtOrBeforeNs(atNs: int): int! {
+    let q = atNs / this.periodNs
+    if (q * this.periodNs > atNs) {
+      q = q - 1
+    }
+    return q * this.periodNs
+  }
+
+  tickCountNs(firstNs: int, lastNs: int): (int, bool) {
+    return ((lastNs - firstNs) / this.periodNs + 1, true)
+  }
 }
 
 // Builds the `cronTrigger` for `schedule(expr, ...)` — split out of
@@ -121,35 +160,11 @@ fn newCronTrigger(expr: string, tz: Zone): trigger! {
   return cronTrigger{ cron = cs, tz = tz }
 }
 
-// The widest lookahead `dueTicks` will scan before giving up on
-// finding the first still-future tick — bounded per Power of 10: a
-// schedule catching up after real downtime is at most a few thousand
-// ticks behind even at one-second resolution over a day, so this bound is
-// generous, not tight, and only a `trigger` that can never advance (a
-// bug, not a real schedule) would ever reach it.
-const scheduleCatchUpScanCap: int = 100000
-
 // How late the scheduler may reach a tick and still have it on time, at
 // most: a minute, the slack a failed store pass or a restart needs to
 // recover. A schedule with a shorter period is capped by that period instead
 // (`tickMissed`).
 const scheduleMissedAfter: int = Minute
-
-// Every tick from `fromNs` (inclusive) up to and including `nowNs`, in
-// order, plus the first tick still in the future (bounded scan, constraint:
-// bounded catch-up — a schedule that somehow stays due after
-// `scheduleCatchUpScanCap` ticks is picked up again by the next call).
-// Pure integer arithmetic over `t` — no clock, no store, nothing to inject
-// for a test beyond the two ints.
-fn dueTicks(t: trigger, fromNs: int, nowNs: int): ([]int, int)! {
-  let ticks = []int(0)
-  let next = fromNs
-  while (next <= nowNs && len(ticks) < scheduleCatchUpScanCap) {
-    ticks = append(ticks, next)
-    next = t.nextAfterNs(next)?
-  }
-  return (ticks, next)
-}
 
 // Whether tick `tick` is missed at `nowNs` when the tick after it is due at
 // `following`: later than `scheduleMissedAfter`, or than the period when that
@@ -162,31 +177,150 @@ fn tickMissed(tick: int, following: int, nowNs: int): bool {
   return nowNs - tick > window
 }
 
-// How many of `ticks` (ascending, as `dueTicks` returns them, with `next`
-// the tick after the last) are missed at `nowNs`. The missed ones form a
-// prefix: `min(tick + scheduleMissedAfter, following)` grows with the tick.
-fn missedTickCount(ticks: []int, next: int, nowNs: int): int {
-  let late = 0
-  while (late < len(ticks) && tickMissed(ticks[late], followingTick(ticks, next, late), nowNs)) {
-    late = late + 1
-  }
-  return late
+// Most ticks that can be on time at once: a tick other than the newest is on
+// time only while its following tick is still not after now, and that tick is
+// at most the newest, which is at most now, so it must equal now exactly.
+const scheduleOnTimeMax: int = 2
+
+// What one scheduler pass does for one schedule (`planCatchUp`).
+class catchUp {
+  // The ticks to enqueue, oldest first: the `kept` missed ones the policy
+  // keeps, then the ones on time.
+  fire: []int,
+  kept: int,
+  // True when the policy drops missed ticks; then `first` to `last` is the
+  // window of missed ticks and `count` says how many, worded for the log.
+  dropped: bool,
+  first: int,
+  last: int,
+  count: string,
+  // `next` once every due tick is handled: the tick after the newest due one,
+  // or the unchanged `next` when nothing is due.
+  after: int,
 }
 
-// The tick after `ticks[i]`: `ticks[i + 1]`, or `next` for the last one.
-fn followingTick(ticks: []int, next: int, i: int): int {
-  if (i + 1 < len(ticks)) {
-    return ticks[i + 1]
+// The newest tick of `t` at or before `atNs`, failing loudly on a trigger that
+// returns a later one: every walk below relies on each step going back.
+fn tickAtOrBefore(t: trigger, atNs: int): int! {
+  let tick = t.prevAtOrBeforeNs(atNs)?
+  if (tick > atNs) {
+    fail newError("jobs: trigger returned tick ${tick}, after ${atNs}")
   }
-  return next
+  return tick
 }
 
-// The index in `ticks` of the first tick to enqueue at `nowNs`: the missed
-// prefix keeps its newest `missedEnqueueCount` ticks under `policy`, every
-// tick after the prefix is kept whatever the policy.
-fn firstFiredTick(ticks: []int, next: int, nowNs: int, policy: Missed): int {
-  let late = missedTickCount(ticks, next, nowNs)
-  return late - missedEnqueueCount(late, policy)
+// `rev` reversed, oldest first.
+fn oldestFirst(rev: []int): []int {
+  let out = []int(0)
+  let i = len(rev) - 1
+  while (i >= 0) {
+    out = append(out, rev[i])
+    i = i - 1
+  }
+  return out
+}
+
+// The ticks from `next` up to `newest` that are on time at `nowNs`, oldest
+// first. `after` is the tick following `newest`. Walks back from `newest`, at
+// most `scheduleOnTimeMax` steps.
+fn onTimeTicks(t: trigger, next: int, newest: int, after: int, nowNs: int): []int! {
+  let rev = []int(0)
+  let tick = newest
+  let following = after
+  while (len(rev) < scheduleOnTimeMax && !tickMissed(tick, following, nowNs)) {
+    rev = append(rev, tick)
+    if (tick <= next) {
+      break
+    }
+    following = tick
+    tick = tickAtOrBefore(t, tick - 1)?
+  }
+  return oldestFirst(rev)
+}
+
+// The missed ticks `policy` keeps: the newest of those from `next` to `last`
+// (both ticks), oldest first. Walks back from `last` one tick at a time while
+// the policy would keep one more, so the work is the policy's cap, not the
+// number of missed ticks.
+fn keptMissed(t: trigger, next: int, last: int, policy: Missed): []int! {
+  let rev = []int(0)
+  let tick = last
+  while (missedEnqueueCount(len(rev) + 1, policy) > len(rev)) {
+    rev = append(rev, tick)
+    if (tick <= next) {
+      break
+    }
+    tick = tickAtOrBefore(t, tick - 1)?
+  }
+  return oldestFirst(rev)
+}
+
+// How many ticks lie in `first` to `last`, worded for the log: the exact
+// count when `t` knows it, else "more than <k>" with `k` what the pass has
+// seen to be a lower bound (the `kept` ticks it kept, at least one).
+fn missedCountText(t: trigger, first: int, last: int, kept: int): string {
+  if (first == last) {
+    return "1"
+  }
+  let (n, exact) = t.tickCountNs(first, last)
+  if (exact) {
+    return "${n}"
+  }
+  if (kept < 1) {
+    return "more than 1"
+  }
+  return "more than ${kept}"
+}
+
+// Fills the missed part of `plan`: the ticks from `plan.first` up to the one
+// before `edge` (the oldest tick on time, or the tick after the newest).
+fn planMissed(t: trigger, plan: catchUp, edge: int, policy: Missed): ()! {
+  let last = tickAtOrBefore(t, edge - 1)?
+  if (last < plan.first) {
+    fail newError("jobs: ${plan.first} is not a tick of its schedule")
+  }
+  let kept = keptMissed(t, plan.first, last, policy)?
+  plan.fire = kept
+  plan.kept = len(kept)
+  plan.last = last
+  plan.dropped = len(kept) == 0 || kept[0] != plan.first
+  if (plan.dropped) {
+    plan.count = missedCountText(t, plan.first, last, len(kept))
+  }
+}
+
+// What to do for a schedule whose first unhandled tick is `next`, at `nowNs`.
+// Only the newest due tick can be on time (the second newest only when now is
+// exactly the newest: `tickMissed`); every older one is missed. The work is
+// one `prevAtOrBeforeNs` per tick walked, at most the policy's cap, whatever
+// the distance between `next` and now.
+fn planCatchUp(t: trigger, next: int, nowNs: int, policy: Missed): catchUp! {
+  let newest = tickAtOrBefore(t, nowNs)?
+  let plan = catchUp{
+    fire = []int(0),
+    kept = 0,
+    dropped = false,
+    first = next,
+    last = next,
+    count = "",
+    after = next,
+  }
+  if (newest < next) {
+    return plan
+  }
+  plan.after = t.nextAfterNs(newest)?
+  let onTime = onTimeTicks(t, next, newest, plan.after, nowNs)?
+  let edge = plan.after
+  if (len(onTime) > 0) {
+    edge = onTime[0]
+  }
+  if (edge > next) {
+    planMissed(t, plan, edge, policy)?
+  }
+  for tick of onTime {
+    plan.fire = append(plan.fire, tick)
+  }
+  return plan
 }
 
 // The `Missed.<Policy>` spelling used in the drop log.
@@ -198,12 +332,12 @@ fn missedName(policy: Missed): string {
   }
 }
 
-// The line logged when `policy` drops missed ticks: `late` ticks were missed,
-// from `ticks[0]` to `ticks[late - 1]`, and `kept` of them were enqueued.
-fn missedMessage(id: string, ticks: []int, late: int, kept: int, policy: Missed): string {
-  let first = Timestamp{ ns = ticks[0] }.toString()
-  let last = Timestamp{ ns = ticks[late - 1] }.toString()
-  return "jobs: schedule '${id}' missed ${late} tick(s) from ${first} to ${last}; Missed.${missedName(policy)} enqueued ${kept}\n"
+// The line logged when `policy` drops missed ticks of schedule `id`: the
+// window `plan.first` to `plan.last` and how many of it were enqueued.
+fn missedMessage(id: string, plan: catchUp, policy: Missed): string {
+  let first = Timestamp{ ns = plan.first }.toString()
+  let last = Timestamp{ ns = plan.last }.toString()
+  return "jobs: schedule '${id}' missed ${plan.count} tick(s) from ${first} to ${last}; Missed.${missedName(policy)} enqueued ${plan.kept}\n"
 }
 
 // How many catch-up jobs to enqueue for `missed` ticks that all came due

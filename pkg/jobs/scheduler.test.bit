@@ -6,7 +6,7 @@
 // nothing depends on machine load.
 
 import { newMutex, Mutex, newAtomicI64, AtomicI64 } from "std/sync"
-import { sleep, Second, Minute, Hour, Millisecond, Timestamp } from "std/time"
+import { sleep, Second, Minute, Hour, Millisecond, Timestamp, utc } from "std/time"
 import { lastIndexOf, parseInt } from "std/strings"
 
 @job("test-tick") @json class TickJob {
@@ -37,13 +37,16 @@ fn newFakeClock(startNs: int): fakeClock {
 // held until its expiry, the holder itself always re-acquires, and the
 // newest tick won per schedule is remembered for `lastTick`. `lastFails`
 // makes `lastTick` fail, a database that is down at start; `acquireFails`
-// makes `tryAcquire` fail, a database that is down when a tick fires.
+// makes `tryAcquire` fail, a database that is down when a tick fires;
+// `failAfter` (-1: never) lets that many `tryAcquire` calls succeed and then
+// fails the rest, a database that goes down part-way through a burst.
 class fakeLocker {
   holder: map<string, string>
   expires: map<string, int>
   newest: map<string, int>
   lastFails: bool
   acquireFails: bool
+  failAfter: int
   keep: int
   mu: Mutex
 
@@ -53,6 +56,12 @@ class fakeLocker {
     }
     this.mu.lock()
     defer this.mu.unlock()
+    if (this.failAfter == 0) {
+      fail newError("database down")
+    }
+    if (this.failAfter > 0) {
+      this.failAfter = this.failAfter - 1
+    }
     let (cur, has) = this.holder[key]
     let (exp, _) = this.expires[key]
     if (has && cur != holder && exp > nowNs) {
@@ -97,6 +106,7 @@ fn newFakeLocker(): fakeLocker {
     newest = map<string, int>(),
     lastFails = false,
     acquireFails = false,
+    failAfter = -1,
     keep = 1024,
     mu = newMutex(),
   }
@@ -363,35 +373,76 @@ test "the threshold is a minute, not pollInterval: a tick 10 polls late fires" {
   assert(enqueuedWhenLate(30 * Second, Missed.Skip) == 1, "30 s late must fire")
 }
 
+// The plan for an every-minute schedule whose first unhandled tick is
+// minute `next`, at `now`, under `policy`.
+fn minutePlan(next: int, now: int, policy: Missed): catchUp {
+  let t: trigger = intervalTrigger{ periodNs = Minute }
+  let plan = planCatchUp(t, next, now, policy) catch e {
+    panic("planCatchUp: ${e.message()}")
+  }
+  return plan
+}
+
+// `xs` as "[a, b, c]" for an assertion message.
+fn showInts(xs: []int): string {
+  let out = "["
+  let i = 0
+  while (i < len(xs)) {
+    if (i > 0) {
+      out = out + ", "
+    }
+    out = out + "${xs[i]}"
+    i = i + 1
+  }
+  return out + "]"
+}
+
+fn wantInts(got: []int, want: []int, what: string) {
+  assert(showInts(got) == showInts(want), "${what}: want ${showInts(want)}, got ${showInts(got)}")
+}
+
+fn wantFire(plan: catchUp, want: []int, what: string) {
+  wantInts(plan.fire, want, what)
+}
+
 test "on-time ticks after a missed prefix always fire: RunOnce keeps one of the missed" {
-  let ticks = [1 * Minute, 2 * Minute, 3 * Minute, 4 * Minute]
-  let next = 5 * Minute
+  let next = 1 * Minute
   // One second past tick 4 (on time); tick 3 is a minute and a second late
   // with tick 4 already due, so it is missed.
   let now = 4 * Minute + Second
-  assert(missedTickCount(ticks, next, now) == 3, "ticks 1 to 3 are missed")
-  assert(
-    firstFiredTick(ticks, next, now, Missed.Skip) == 3,
-    "Skip keeps only the on-time tick",
-  )
-  assert(
-    firstFiredTick(ticks, next, now, Missed.RunOnce) == 2,
+  wantFire(minutePlan(next, now, Missed.Skip), [4 * Minute], "Skip keeps only the on-time tick")
+  wantFire(
+    minutePlan(next, now, Missed.RunOnce),
+    [3 * Minute, 4 * Minute],
     "RunOnce adds one missed tick",
   )
-  assert(
-    firstFiredTick(ticks, next, now, Missed.RunAll(2)) == 1,
+  wantFire(
+    minutePlan(next, now, Missed.RunAll(2)),
+    [2 * Minute, 3 * Minute, 4 * Minute],
     "RunAll(2) adds two missed ticks",
   )
-  assert(
-    firstFiredTick(ticks, next, now, Missed.RunAll(9)) == 0,
-    "RunAll(9) keeps all four",
-  )
+  let all = minutePlan(next, now, Missed.RunAll(9))
+  wantFire(all, [Minute, 2 * Minute, 3 * Minute, 4 * Minute], "RunAll(9) keeps all four")
+  assert(!all.dropped, "RunAll(9) drops nothing")
+  let skip = minutePlan(next, now, Missed.Skip)
+  assert(skip.dropped && skip.count == "3", "Skip drops 3 of 3, got ${skip.count}")
+  assert(skip.first == Minute && skip.last == 3 * Minute, "the window is minutes 1 to 3")
+  assert(skip.after == 5 * Minute, "the next tick is minute 5, got ${skip.after}")
 }
 
 test "a tick is not missed until the next one is overdue, exactly" {
-  let ticks = [1 * Minute, 2 * Minute]
-  assert(missedTickCount(ticks, 3 * Minute, 2 * Minute) == 0, "now == next tick: not missed")
-  assert(missedTickCount(ticks, 3 * Minute, 2 * Minute + 1) == 1, "one ns past: missed")
+  let on = minutePlan(1 * Minute, 2 * Minute, Missed.Skip)
+  wantFire(on, [Minute, 2 * Minute], "now == next tick: the one before it is not missed")
+  assert(!on.dropped, "nothing is dropped when now is the next tick")
+  let late = minutePlan(1 * Minute, 2 * Minute + 1, Missed.Skip)
+  wantFire(late, [2 * Minute], "one ns past: the older tick is missed")
+  assert(late.dropped && late.count == "1", "one tick dropped, got ${late.count}")
+}
+
+test "nothing is due before the first tick: the plan changes nothing" {
+  let plan = minutePlan(5 * Minute, Minute, Missed.RunAll(3))
+  wantFire(plan, []int(0), "no ticks due")
+  assert(!plan.dropped && plan.after == 5 * Minute, "next stays minute 5, got ${plan.after}")
 }
 
 test "every second, stalled 3 s: two ticks missed, one on time" {
@@ -402,13 +453,13 @@ test "every second, stalled 3 s: two ticks missed, one on time" {
     panic("every: ${e.message()}")
   }
   clock.advance(3 * Second)
+  let t: trigger = intervalTrigger{ periodNs = Second }
+  let plan = planCatchUp(t, 1000 * Minute + Second, clock.nowNs(), Missed.Skip) catch e {
+    panic("planCatchUp: ${e.message()}")
+  }
+  assert(plan.dropped && plan.count == "2", "want 2 missed of 3 due, got ${plan.count}")
   runDue(q, clock.nowNs())
   assert(dueCount(store) == 1, "Skip: want the one on-time tick, got ${dueCount(store)}")
-  let ticks = [1000 * Minute + Second, 1000 * Minute + 2 * Second, 1000 * Minute + 3 * Second]
-  assert(
-    missedTickCount(ticks, 1000 * Minute + 4 * Second, clock.nowNs()) == 2,
-    "want 2 missed of 3 due",
-  )
 }
 
 // A nightly 02:00 UTC schedule over a fleet that already fired the night
@@ -536,14 +587,117 @@ test "the loop sleeps from the end of the pass, not from its start" {
 }
 
 test "missedMessage names the schedule, the window, the policy and what was enqueued" {
-  let ticks = [1 * Minute, 2 * Minute, 3 * Minute]
-  let first = Timestamp{ ns = ticks[0] }.toString()
-  let last = Timestamp{ ns = ticks[2] }.toString()
+  let plan = minutePlan(1 * Minute, 4 * Minute + Second, Missed.RunAll(2))
+  let first = Timestamp{ ns = 1 * Minute }.toString()
+  let last = Timestamp{ ns = 3 * Minute }.toString()
   let want = "jobs: schedule 'x' missed 3 tick(s) from ${first} to ${last}; Missed.RunAll(2) enqueued 2\n"
-  assert(
-    missedMessage("x", ticks, 3, 2, Missed.RunAll(2)) == want,
-    "got ${missedMessage("x", ticks, 3, 2, Missed.RunAll(2))}",
-  )
+  let got = missedMessage("x", plan, Missed.RunAll(2))
+  assert(got == want, "got ${got}")
   assert(missedName(Missed.Skip) == "Skip", "Skip")
   assert(missedName(Missed.RunOnce) == "RunOnce", "RunOnce")
 }
+
+test "a count the trigger cannot know is worded as a lower bound" {
+  let cs = parseCron("*/5 * * * *") catch e {
+    panic("parse: ${e.message()}")
+  }
+  let t: trigger = cronTrigger{ cron = cs, tz = utc() }
+  let next = 1000 * Minute
+  let plan = planCatchUp(t, next, next + 100 * Minute + Second, Missed.RunAll(3)) catch e {
+    panic("planCatchUp: ${e.message()}")
+  }
+  assert(plan.count == "more than 3", "want 'more than 3', got '${plan.count}'")
+  let skip = planCatchUp(t, next, next + 100 * Minute + Second, Missed.Skip) catch e {
+    panic("planCatchUp: ${e.message()}")
+  }
+  assert(skip.count == "more than 1", "want 'more than 1', got '${skip.count}'")
+}
+
+// The availableAt of every enqueued row, in enqueue order.
+fn enqueuedTicks(store: fakeStore): []int {
+  let out = []int(0)
+  for r of store.rows {
+    out = append(out, r.availableAt)
+  }
+  return out
+}
+
+fn wantEnqueued(store: fakeStore, want: []int, what: string) {
+  wantInts(enqueuedTicks(store), want, what)
+}
+
+// A device with no RTC registers `every(1 * Second)` at 1970 (`newEntry`
+// reads the clock), then NTP moves the clock to 2026-01-01T00:00:00.5Z: 1.77
+// billion ticks behind, the last of them on time.
+fn bootedAt1970(policy: Missed, locker: Locker): (Queue, fakeStore, fakeClock) {
+  let store = newFakeStore()
+  let clock = newFakeClock(0)
+  let q = queueOn(store, clock, locker, "a")
+  q.every(Second, TickJob{ tag = "s" }, missed = policy) catch e {
+    panic("every: ${e.message()}")
+  }
+  clock.advance(day0 + 500 * Millisecond)
+  return (q, store, clock)
+}
+
+test "1970 to 2026, every second, RunOnce: one catch-up and the on-time tick, in one pass" {
+  let (q, store, clock) = bootedAt1970(Missed.RunOnce, nil)
+  runDue(q, clock.nowNs())
+  wantEnqueued(store, [day0 - Second, day0], "RunOnce")
+  assert(
+    q.entries[0].next == day0 + Second,
+    "next must be the tick after now, got ${q.entries[0].next}",
+  )
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 2, "a second pass must add nothing, got ${dueCount(store)}")
+}
+
+test "1970 to 2026, every second, RunAll(3): the newest three missed ticks and the on-time tick" {
+  let (q, store, clock) = bootedAt1970(Missed.RunAll(3), nil)
+  runDue(q, clock.nowNs())
+  wantEnqueued(store, [day0 - 3 * Second, day0 - 2 * Second, day0 - Second, day0], "RunAll(3)")
+}
+
+test "1970 to 2026, every second, Skip: only the on-time tick" {
+  let (q, store, clock) = bootedAt1970(Missed.Skip, nil)
+  runDue(q, clock.nowNs())
+  wantEnqueued(store, [day0], "Skip")
+}
+
+test "a cron schedule three years behind: the newest three missed ticks and the on-time tick" {
+  let store = newFakeStore()
+  let clock = newFakeClock(day0)
+  let q = queueOn(store, clock, nil, "a")
+  q.schedule("*/5 * * * *", TickJob{ tag = "c" }, tz = "UTC", missed = Missed.RunAll(3)) catch e {
+    panic("schedule: ${e.message()}")
+  }
+  let newest = day0 + 1096 * 24 * Hour
+  clock.advance(1096 * 24 * Hour + 30 * Second)
+  runDue(q, clock.nowNs())
+  wantEnqueued(
+    store,
+    [newest - 15 * Minute, newest - 10 * Minute, newest - 5 * Minute, newest],
+    "cron RunAll(3)",
+  )
+  assert(
+    q.entries[0].next == newest + 5 * Minute,
+    "next is 5 minutes on, got ${q.entries[0].next}",
+  )
+}
+
+test "a burst cut short by a failing store resumes at the first tick not enqueued" {
+  let locker = newFakeLocker()
+  let (q, store, clock) = bootedAt1970(Missed.RunAll(3), locker)
+  locker.failAfter = 2
+  runDue(q, clock.nowNs())
+  wantEnqueued(store, [day0 - 3 * Second, day0 - 2 * Second], "before the failure")
+  assert(q.entries[0].next == day0 - Second, "resume at the third tick, got ${q.entries[0].next}")
+  locker.failAfter = -1
+  runDue(q, clock.nowNs())
+  wantEnqueued(
+    store,
+    [day0 - 3 * Second, day0 - 2 * Second, day0 - Second, day0],
+    "after the retry",
+  )
+}
+
