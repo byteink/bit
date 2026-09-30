@@ -567,6 +567,12 @@ testsbit_steps_for() {
           *" test-lint-tests "*) ;;
           *) out="${out:+${out} }test-lint-tests" ;;
         esac
+        # test-no-warnings (#6372) checks every tracked module in all three
+        # trees (and the rest of the repo), so any _tests_/ .bit edit owes it.
+        case " ${out} " in
+          *" test-no-warnings "*) ;;
+          *) out="${out:+${out} }test-no-warnings" ;;
+        esac
         ;;
     esac
   done

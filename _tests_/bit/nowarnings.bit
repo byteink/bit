@@ -1,0 +1,432 @@
+// #6372. Every compiler warning in a `.bit` file this repository compiles
+// itself is a build break. `warning[E0098]` ('${' in a raw string) sat in
+// three files on main and `warning[E0048]` (a name that shadows a predeclared
+// one: `len`, `cap`, `keepAlive`, `parseFloat`, `osEnv`) in thirteen more,
+// because no gate read warnings: `bit check` exits 0 on a warning, so every
+// harness that asked only for the exit code passed over them. The lint gates
+// do not see them either; E0098 and E0048 are compiler diagnostics, not
+// spec/LINT.md rules.
+//
+// THE CHECK: `bit check <unit>` for every module unit below, and a failure on
+// any output line that starts `warning[`, or on a non-zero exit. A unit is what
+// the compiler loads as ONE module:
+//   - a directory, when it holds at most one non-test file with a top-level
+//     `fn main` (compiler/, every stdlib/ and runtime/ module, pkg/<name>/,
+//     examples/<name>/, a _tests_/stress/ program). `bit check <dir>` covers
+//     its `.test.bit` files too;
+//   - otherwise each file on its own: a directory with two or more programs
+//     (_tests_/bit/, _tests_/imports/ trees of single-file harnesses) cannot be
+//     one module, and `bit check <file>` refuses a file whose siblings it needs.
+//
+// THE FILE SET is `git ls-files '*.bit'`, never a filesystem walk (a walk reads
+// gitignored output: dist/out/, bit-out/stage0 and other agents' worktrees),
+// minus three named exclusions, each printed with its count:
+//   - _tests_/cases/: the golden corpus. `test-golden` compiles it and several
+//     cases are warning fixtures on purpose (run_raw_string_dollar_brace_literal
+//     exists to draw E0098), so a warning there is the expected answer.
+//   - _tests_/fuzz/: crash inputs, malformed by construction.
+//   - a directory under _tests_/bit/ holding an `.expected` file: the
+//     checker/parser fixture corpora, each file an asserted diagnostic
+//     (_tests_/bit/linttests.bit's isFixtureCorpus draws the same line; only
+//     under _tests_/bit/, because an `.expected` beside a _tests_/stress/
+//     program is that program's stdout oracle, not a fixture corpus).
+// Everything else that is tracked is checked: compiler/, runtime/, stdlib/,
+// tools/, pkg/, examples/, bench/, editors/, docs/ and the rest of _tests_/.
+//
+// EIGHT NAMED EXEMPTIONS (`exemptUnits()`), units `bit check` cannot pass on its
+// own, each asserted BOTH WAYS: it must still fail `bit check`, and a listed
+// unit that is no longer a unit of the tracked tree, or now checks clean, is a
+// hard failure, so the list cannot rot into a permanent excuse. An exempt unit
+// that draws a warning still fails.
+//   - Seven import a package only a generated or enclosing project provides
+//     (E0045 'not declared in bit.lock'): the three pkg/*/bench/apps/bit
+//     benchmark apps, the inkwell guide's migrations/, and the probe programs
+//     _tests_/bit/jobslive, ormrelauto/relautod and ormrelauto/relautox, each
+//     run by its own gate from a scratch project that declares the packages.
+//   - _tests_/bit/fieldattrcollision/fixture is an error fixture by design:
+//     test-fieldattrcollision asserts the compiler rejects it.
+//
+// ANTI-VACUITY: a probe module with a raw string holding `${x}` is checked
+// through the very same script; it must report a warning or this gate panics.
+// The denominator (units, tracked files, skips) is printed.
+//
+// BIT_SELF_EXE and BIT_REPO are required, like every sibling in this
+// directory. Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/nowarnings.bit
+import { env, envOr, exit } from "std/os"
+import { mkdir, readDir, readFile, writeFile } from "std/fs"
+import { contains, hasPrefix, hasSuffix, lastIndexOf, parseInt, replace, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+const defaultTimeoutS: int = 1500
+const minTracked: int = 1000
+const parallelism: int = 6
+const logLines: int = 12
+const maxDepth: int = 16
+
+// Dependency-resolving projects `bit check` cannot load alone; see the header.
+fn exemptUnits(): []string {
+  return [
+    "pkg/toml/bench/apps/bit",
+    "pkg/web/bench/apps/bit",
+    "pkg/yaml/bench/apps/bit",
+    "pkg/web/guides/inkwell/migrations",
+    "_tests_/bit/jobslive",
+    "_tests_/bit/ormrelauto/relautod",
+    "_tests_/bit/ormrelauto/relautox",
+    "_tests_/bit/fieldattrcollision/fixture",
+  ]
+}
+
+class Plan {
+  units: []string,
+  tracked: int,
+  skipCases: int,
+  skipFuzz: int,
+  skipFixture: int,
+}
+
+class Result {
+  unit: string,
+  rc: int,
+  warnings: int,
+}
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (len(v) == 0) {
+    panic("nowarnings: ${name} is required and was not set")
+  }
+  if (contains(v, "'")) {
+    panic("nowarnings: ${name} holds a single quote, which the generated shell cannot carry")
+  }
+  return v
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status.
+fn shell(scriptPath: string, script: string, ms: int): int {
+  writeFile(scriptPath, script) catch e {
+    panic("nowarnings: cannot write ${scriptPath}: ${e.message()}")
+  }
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    panic("nowarnings: cannot make ${scriptPath} executable")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("nowarnings: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("nowarnings: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("nowarnings: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn dirOf(path: string): string {
+  let i = lastIndexOf(path, "/")
+  if (i < 0) {
+    return ""
+  }
+  return path[0:int(i)]
+}
+
+fn containsStr(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+fn dirHasExpected(repo: string, dir: string): bool {
+  let names = readDir("${repo}/${dir}") catch e {
+    panic("nowarnings: cannot list ${repo}/${dir}: ${e.message()}")
+  }
+  for n of names {
+    if (hasSuffix(n, ".expected")) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether `dir` or an ancestor below _tests_/bit/ is a fixture corpus.
+fn underFixtureCorpus(repo: string, dir: string): bool {
+  let d = dir
+  let depth = 0
+  while (depth < maxDepth) {
+    if (!hasPrefix(d, "_tests_/bit/")) {
+      return false
+    }
+    if (dirHasExpected(repo, d)) {
+      return true
+    }
+    d = dirOf(d)
+    depth = depth + 1
+  }
+  panic("nowarnings: ${dir} nests deeper than ${maxDepth} levels")
+}
+
+fn isProgram(repo: string, file: string): bool {
+  if (hasSuffix(file, ".test.bit")) {
+    return false
+  }
+  let src = readFile("${repo}/${file}") catch e {
+    panic("nowarnings: cannot read ${file}: ${e.message()}")
+  }
+  return hasPrefix(src, "fn main") || contains(src, "\nfn main")
+}
+
+// The modules of one directory's files: the directory itself unless two or more
+// non-test files each hold a top-level `fn main`, else each file alone.
+fn unitsOfDir(repo: string, dir: string, files: []string): []string {
+  let programs = 0
+  for f of files {
+    if (isProgram(repo, f)) {
+      programs = programs + 1
+    }
+  }
+  if (programs < 2) {
+    return [dir]
+  }
+  return files
+}
+
+fn listTracked(repo: string, work: string, ms: int): []string {
+  let out = "${work}/tracked.txt"
+  let rc = shell(
+    "${work}/ls.sh",
+    "#!/bin/sh\ncd '${repo}' || exit 97\nexec git ls-files -- '*.bit' > '${out}'\n",
+    ms,
+  )
+  if (rc != 0) {
+    panic("nowarnings: `git ls-files` exited ${rc}")
+  }
+  let text = readFile(out) catch e {
+    panic("nowarnings: cannot read ${out}: ${e.message()}")
+  }
+  let files = []string(0)
+  for line of split(text, "\n") {
+    if (len(line) == 0) {
+      continue
+    }
+    if (contains(line, " ")) {
+      panic("nowarnings: tracked path with a space, which the unit list cannot carry: ${line}")
+    }
+    files = append(files, line)
+  }
+  if (len(files) < minTracked) {
+    panic("nowarnings: only ${len(files)} tracked .bit files, under the ${minTracked} floor; the listing is broken, not the tree")
+  }
+  return files
+}
+
+fn buildPlan(repo: string, tracked: []string): Plan {
+  let p = Plan{
+    units = []string(0),
+    tracked = len(tracked),
+    skipCases = 0,
+    skipFuzz = 0,
+    skipFixture = 0,
+  }
+  let dirs = []string(0)
+  let kept = []string(0)
+  for f of tracked {
+    if (hasPrefix(f, "_tests_/cases/")) {
+      p.skipCases = p.skipCases + 1
+    } else if (hasPrefix(f, "_tests_/fuzz/")) {
+      p.skipFuzz = p.skipFuzz + 1
+    } else if (underFixtureCorpus(repo, dirOf(f))) {
+      p.skipFixture = p.skipFixture + 1
+    } else {
+      kept = append(kept, f)
+      if (!containsStr(dirs, dirOf(f))) {
+        dirs = append(dirs, dirOf(f))
+      }
+    }
+  }
+  for d of dirs {
+    let inDir = []string(0)
+    for f of kept {
+      if (dirOf(f) == d) {
+        inDir = append(inDir, f)
+      }
+    }
+    p.units = concat(p.units, unitsOfDir(repo, d, inDir))
+  }
+  return p
+}
+
+fn concat(a: []string, b: []string): []string {
+  let out = []string(0)
+  for x of a {
+    out = append(out, x)
+  }
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+// `probe/main.bit`: a raw string holding `${x}`, spelled here with `\$` because
+// this very file must not carry the pattern it hunts.
+fn writeProbe(work: string): string {
+  let dir = "${work}/probe"
+  mkdir(dir) catch e {
+    panic("nowarnings: cannot create ${dir}: ${e.message()}")
+  }
+  writeFile("${dir}/main.bit", "fn main() {\n  let s = `a \${x} b`\n  println(s)\n}\n") catch e {
+    panic("nowarnings: cannot write the probe: ${e.message()}")
+  }
+  return dir
+}
+
+// One script checks one unit and appends `<rc> <warnings> <unit>` to results;
+// xargs fans it out. Output goes to a per-unit log named by the unit path.
+fn runChecks(bit: string, repo: string, work: string, units: []string, ms: int) {
+  let body = ""
+  for u of units {
+    body = body + u + "\n"
+  }
+  writeFile("${work}/units.txt", body) catch e {
+    panic("nowarnings: cannot write the unit list: ${e.message()}")
+  }
+  let one = "#!/bin/sh\nu=\"$1\"\nlog='${work}/logs/'$(printf '%s' \"$u\" | tr '/' '_')\n'${bit}' check \"$u\" > \"$log\" 2>&1\nrc=$?\nw=$(grep -c '^warning\\[' \"$log\")\nprintf '%s %s %s\\n' \"$rc\" \"$w\" \"$u\" >> '${work}/results.txt'\n"
+  mkdir("${work}/logs") catch e {
+    panic("nowarnings: cannot create the log dir: ${e.message()}")
+  }
+  writeFile("${work}/one.sh", one) catch e {
+    panic("nowarnings: cannot write one.sh: ${e.message()}")
+  }
+  let all = "#!/bin/sh\ncd '${repo}' || exit 97\nxargs -n1 -P${parallelism} sh '${work}/one.sh' < '${work}/units.txt'\n"
+  let rc = shell("${work}/run.sh", all, ms)
+  if (rc != 0) {
+    panic("nowarnings: the check fan-out exited ${rc}")
+  }
+}
+
+fn readResults(work: string): []Result {
+  let text = readFile("${work}/results.txt") catch e {
+    panic("nowarnings: no results were written: ${e.message()}")
+  }
+  let out = []Result(0)
+  for line of split(text, "\n") {
+    let parts = split(line, " ")
+    if (len(parts) != 3) {
+      continue
+    }
+    let rc = parseInt(parts[0]) catch _ {
+      -1
+    }
+    let w = parseInt(parts[1]) catch _ {
+      -1
+    }
+    out = append(out, Result{ unit = parts[2], rc = rc, warnings = w })
+  }
+  return out
+}
+
+fn findResult(rs: []Result, unit: string): Result {
+  for r of rs {
+    if (r.unit == unit) {
+      return r
+    }
+  }
+  panic("nowarnings: unit ${unit} produced no result line")
+}
+
+fn showLog(work: string, unit: string) {
+  let text = readFile("${work}/logs/${replace(unit, "/", "_")}") catch _ {
+    ""
+  }
+  let lines = split(text, "\n")
+  let n = len(lines)
+  if (n > logLines) {
+    n = logLines
+  }
+  let i = 0
+  while (i < n) {
+    eprint("    ${lines[i]}\n")
+    i = i + 1
+  }
+}
+
+// A unit is clean when it exits 0 with no warning line. An exempt unit must
+// instead still fail (its reason to be exempt), with no warning line.
+fn judge(work: string, r: Result, exempt: bool): bool {
+  let ok = r.warnings == 0 && ((exempt && r.rc != 0) || (!exempt && r.rc == 0))
+  if (ok) {
+    return true
+  }
+  let why = "rc=${r.rc} warnings=${r.warnings}"
+  if (exempt && r.rc == 0 && r.warnings == 0) {
+    why = "exempt but now checks clean: delete it from exemptUnits()"
+  }
+  eprint("nowarnings: FAIL ${r.unit}: ${why}\n")
+  showLog(work, r.unit)
+  return false
+}
+
+fn exemptsAreUnits(units: []string) {
+  for e of exemptUnits() {
+    if (!containsStr(units, e)) {
+      panic("nowarnings: exempt unit ${e} is not a unit of the tracked tree; delete it from exemptUnits()")
+    }
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let bit = requiredEnv("BIT_SELF_EXE")
+  let repo = requiredEnv("BIT_REPO")
+  let work = "${requiredTmp()}/nowarnings-${uuidFormat(uuidV4())}"
+  mkdir(work) catch e {
+    panic("nowarnings: cannot create ${work}: ${e.message()}")
+  }
+  let plan = buildPlan(repo, listTracked(repo, work, ms))
+  exemptsAreUnits(plan.units)
+  let probe = writeProbe(work)
+  runChecks(bit, repo, work, concat(plan.units, [probe]), ms)
+  let results = readResults(work)
+  if (len(results) != len(plan.units) + 1) {
+    panic("nowarnings: ${len(results)} result lines for ${len(plan.units) + 1} units")
+  }
+  if (findResult(results, probe).warnings < 1) {
+    panic("nowarnings: the probe raw string drew no warning; this gate cannot see warnings")
+  }
+  let failed = 0
+  for u of plan.units {
+    if (!judge(work, findResult(results, u), containsStr(exemptUnits(), u))) {
+      failed = failed + 1
+    }
+  }
+  let skipped = plan.skipCases + plan.skipFuzz + plan.skipFixture
+  let scope = "${len(plan.units)} module units over ${plan.tracked - skipped} of ${plan.tracked} tracked .bit files (skipped ${skipped}: ${plan.skipCases} golden corpus, ${plan.skipFuzz} fuzz crashes, ${plan.skipFixture} checker/parser fixtures; ${len(exemptUnits())} units exempt, each asserted to still fail)"
+  if (failed > 0) {
+    eprint("nowarnings: FAIL -- ${failed} of ${len(plan.units)} units warn or fail to check; fix the source, there is no suppression. Scope: ${scope}\n")
+    exit(1)
+  }
+  println("nowarnings: PASS -- 0 warnings in ${scope}")
+}
+
+fn requiredTmp(): string {
+  let t = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(t, "/")) {
+    return t[0:len(t) - 1]
+  }
+  return t
+}
