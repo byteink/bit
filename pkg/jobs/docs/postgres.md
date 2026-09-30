@@ -47,6 +47,13 @@ fn printMigration() {
 If your app has its own migration tool, run those same statements through
 it instead of calling `migrate` - `migrationStatements()` is exposed
 exactly so you are not stuck writing the table definition by hand.
+The statements also create `bit_schedule_leases`, the table `PostgresLocker`
+(see [Cron](cron.md)) keeps its per-tick leases in. Its `seq` column numbers
+the leases in the order they were won, and that order, not the tick value and
+not the expiry, decides which old rows are dropped: both of those come from
+the clock of the instance that wrote the row, and one instance with a clock
+years ahead must not be able to push a correct instance's lease out of the
+table.
 `PostgresStore.claim` uses `SELECT ... FOR UPDATE SKIP LOCKED`, so several
 workers - even across several instances of your app - can poll the same
 table at once and never claim the same row twice, and a worker that

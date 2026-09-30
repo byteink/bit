@@ -264,8 +264,11 @@ tick 02:00 dies a second later, the others do not fire it again: the tick's
 lease is already taken. A lease expires after an hour, which only lets
 another instance take that tick over. The rows are also how a restarted app
 learns its last tick, so they are never deleted by age: each schedule keeps
-its newest 1024 lease rows and the older ones are dropped as new ticks are
-won. That count is the locker's lease window, and `schedule` and `every`
+the 1024 lease rows won most recently, plus the row of its newest tick, and
+the older ones are dropped as new ticks are won. "Most recently" is the order
+the leases were won in the table, not the tick value or the expiry, so an
+instance whose clock ran years ahead cannot push a correct instance's lease
+out of the table and get a tick fired twice. That count is the locker's lease window, and `schedule` and `every`
 refuse a `Missed.RunAll` cap above it, because a catch-up that long would drop
 lease rows another instance still races for. With `keep = 200`, this fails when
 the schedule is registered:
