@@ -1681,6 +1681,45 @@ walk as E0163.**
   column, is not flagged here; `Repo<T>.after` still refuses both
   conditions through the receiver's own deferred error either way.
 
+**A relation field loads itself; an unprovable read is a build error, not a
+runtime one (#6302, #6305, #6318, #6322, #6308).**
+
+- The compiler sees every read of a `@hasMany`/`@hasOne`/`@belongsTo` field
+  on a row that came from `Repo<T>`/`TxRepo<T>`'s `all`/`find`/`first`
+  (`db.table<T>()`/`tx.table<T>()`, above), tracked through a `let`, a
+  trailing `?`, a `for-of` loop variable, indexing, `.unwrap()`, and across
+  a non-generic named function's own parameters and return value, WHOLE
+  PROJECT, resolved to a fixed point over the call graph - a call reached
+  only through a value, a closure, an interface, a generic type parameter,
+  or a `...` spread argument is not followed. A nested read
+  (`post.author.posts`) is tracked as one dotted path, loading every level
+  read. When a query's own rows are proven to reach a read this way, the
+  compiler adds that relation to the query itself - `for post in
+  db.table<Post>().all()? { post.author.name }` issues exactly two
+  round trips, as if `.with("author")` had been written by hand.
+  `.with(...)` stays the explicit form for a chain this whole-program
+  reasoning cannot trace back to its own root.
+- **When the compiler cannot prove a relation read's rows were loaded, that
+  is `E0300`**, naming the field, the class, and where to add `.with(...)`
+  when a specific query is nameable, or that the read's rows could not be
+  traced back to one at all. This is not a lint: `bit check` and `bit
+  build` refuse the same programs. Covered by construction: a row held in a
+  field, a map, a list or a channel; a row captured by a closure; a row
+  reached through an interface or a generic type parameter; a row from
+  `Db.query<T>`/`TxHandle.query<T>` (raw SQL, above - it has no `.with()`);
+  a composite literal that never sets the relation; and a parameter no call
+  anywhere in the project resolves to. Assigning `x.f = ...` - directly, or
+  as a composite-literal field init a `let` binds straight to - earlier in
+  the same function counts as loaded, source-order only (no branch-exact
+  control-flow tracking).
+- There is no runtime lazy loading: every database access, and every error
+  it can raise, happens at the query call's own `?`. Reading a relation
+  field the compiler proved loaded is a plain memory read that cannot
+  fail. A read this section's own `E0300` cannot reach at all - the
+  receiver's own static type is not a resolved `@table` class, as through
+  an interface value - still falls back to the run-time check this
+  section's own earlier paragraph describes.
+
 **`@job("name")` - a stable, explicit background-job dispatch name (#6081).**
 
 ```
