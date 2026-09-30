@@ -2,7 +2,9 @@
 // (cron.bit, #6083), including the two DST edges (spring gap, fall-back
 // overlap) `zonedFromWall` (stdlib/time/zoned.bit) documents.
 
-import { DateTime, Zone, Minute, utc, zone, date } from "std/time"
+import { DateTime, Zone, Minute, Second, Timestamp, utc, zone, date } from "std/time"
+import { join } from "std/strings"
+import { data } from "std/tz"
 
 // A wall-clock fixture: `y-mo-d h:mi:00`, grouped into one class so
 // `mkDt` below stays under spec/LINT.md's parameter ceiling.
@@ -528,4 +530,232 @@ test "prevAtOrBefore, a transition at midnight: Havana" {
   wantPrev("30 0 * * *", "America/Havana", spring, "2026-03-08T01:00:00-04:00")
   let fall = wallSpec{ y = 2026, mo = 11, d = 1, h = 12, mi = 0 }
   wantPrev("30 0 * * *", "America/Havana", fall, "2026-11-01T00:30:00-04:00")
+}
+
+// CRON'S PER-DAY OFFSET TEST IS A CHECKED INVARIANT (#6367). `cronSearchDay`
+// and `cronSearchDayLast` (cron.bit) take the wall-clock search on a day
+// whose offset is the same one second before its first and its next midnight,
+// which is exact only while the day holds at most ONE offset change: two
+// that cancel would look like no change at all. `std/time` exposes no
+// transition list to ask at run time, so the bundled database (`std/tz`) is
+// read here instead, straight from its TZif images, and every zone is checked
+// over the next thirty years (2026-01-01 .. 2056-01-01, fixed so the test is
+// deterministic). A tzdata update that puts two changes in one local day
+// fails this test naming the zone and the date. The TZif tables end in 2037;
+// later years are the footer rule, which std/time does not read either, so
+// no offset change exists to check after it.
+const cronDayChangeLimit: int = 1
+const cronZoneWindowLo: int = 1767225600
+const cronZoneWindowHi: int = 2713910400
+const cronDaySecs: int = 86400
+
+// One offset change of a zone: at UTC second `at` the offset went from
+// `before` to `after` seconds.
+class zoneChange {
+  at: int,
+  before: int,
+  after: int,
+}
+
+fn tzBe32(b: []byte, p: int): int {
+  return (int(b[p]) << 24) | (int(b[p + 1]) << 16) | (int(b[p + 2]) << 8) | int(b[p + 3])
+}
+
+fn tzBe32s(b: []byte, p: int): int {
+  let v = tzBe32(b, p)
+  if (v >= 2147483648) {
+    return v - 4294967296
+  }
+  return v
+}
+
+// A big-endian two's complement int64.
+fn tzBe64s(b: []byte, p: int): int {
+  return (tzBe32s(b, p) << 32) | tzBe32(b, p + 4)
+}
+
+// `floor(a / b)` for positive `b`; plain `/` truncates toward zero.
+fn tzFloorDiv(a: int, b: int): int {
+  let q = a / b
+  if (q * b > a) {
+    return q - 1
+  }
+  return q
+}
+
+// The six counts of the TZif header at `base` (RFC 8536 section 3.1), in file
+// order: isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt.
+fn tzCounts(b: []byte, base: int): []int {
+  let out = []int(6)
+  let i = 0
+  while (i < 6) {
+    out[i] = tzBe32(b, base + 20 + 4 * i)
+    i = i + 1
+  }
+  return out
+}
+
+// Where the version 2 header starts: past the 44-byte version 1 header and
+// the version 1 block, whose times are 4 bytes wide.
+fn tzV2Base(b: []byte): int {
+  let c = tzCounts(b, 0)
+  return 44 + c[3] * 5 + c[4] * 6 + c[5] + c[2] * 8 + c[1] + c[0]
+}
+
+// The offset changes of the TZif image `img` (version 2 or later), in time
+// order. A transition between two types of the same offset (an abbreviation
+// change) is not an offset change and is left out.
+fn tzChanges(img: []byte): []zoneChange {
+  assert(len(img) > 44 && string(img[0:4]) == "TZif" && img[4] >= '2', "not a version 2 TZif image")
+  let base = tzV2Base(img)
+  let c = tzCounts(img, base)
+  let timeAt = base + 44
+  let typeAt = timeAt + c[3] * 8
+  let infoAt = typeAt + c[3]
+  assert(infoAt + c[4] * 6 <= len(img), "TZif image shorter than its own counts")
+  let out = []zoneChange(0)
+  let prev = tzBe32s(img, infoAt)
+  let i = 0
+  while (i < c[3]) {
+    let ty = int(img[typeAt + i])
+    assert(ty < c[4], "TZif transition type out of range")
+    let now = tzBe32s(img, infoAt + ty * 6)
+    if (now != prev) {
+      out = append(out, zoneChange{ at = tzBe64s(img, timeAt + i * 8), before = prev, after = now })
+    }
+    prev = now
+    i = i + 1
+  }
+  return out
+}
+
+// The local calendar day, as a day number, that the wall clock reads one
+// second before change `c` and at it (two different days when the change
+// crosses midnight).
+fn tzDaysOf(c: zoneChange): []int {
+  return [
+    tzFloorDiv(c.at - 1 + c.before, cronDaySecs),
+    tzFloorDiv(c.at + c.after, cronDaySecs),
+  ]
+}
+
+// The first local day inside the window holding more than `limit` of
+// `changes`, as `(day number, count)`; `(0, 0)` when none does.
+fn tzCrowdedDay(changes: []zoneChange, limit: int): (int, int) {
+  let per = map<int, int>()
+  for c of changes {
+    if (c.at < cronZoneWindowLo || c.at >= cronZoneWindowHi) {
+      continue
+    }
+    let days = tzDaysOf(c)
+    let n = 0
+    while (n < 2) {
+      if (n == 0 || days[1] != days[0]) {
+        per[days[n]] = per[days[n]] + 1
+        if (per[days[n]] > limit) {
+          return (days[n], per[days[n]])
+        }
+      }
+      n = n + 1
+    }
+  }
+  return (0, 0)
+}
+
+// `name`'s TZif image in the `std/tz` blob, whose layout stdlib/time/extend.bit
+// documents: an 8-byte magic, a u32 zone count, then per zone a u16 name
+// length, the name, and a u32 offset and length into the blob.
+class tzEntry {
+  name: string,
+  img: []byte,
+}
+
+fn tzEntries(blob: []byte): []tzEntry {
+  assert(len(blob) > 12 && blob[0] == 'B' && blob[7] == 1, "std/tz data: bad magic or version")
+  let count = tzBe32(blob, 8)
+  let out = []tzEntry(0)
+  let pos = 12
+  let i = 0
+  while (i < count) {
+    let nameLen = (int(blob[pos]) << 8) | int(blob[pos + 1])
+    let name = string(blob[pos + 2:pos + 2 + nameLen])
+    let at = pos + 2 + nameLen
+    let off = tzBe32(blob, at)
+    let length = tzBe32(blob, at + 4)
+    out = append(out, tzEntry{ name = name, img = blob[off:off + length] })
+    pos = at + 8
+    i = i + 1
+  }
+  return out
+}
+
+// `dayNo` read as a date: the UTC reading of its first instant.
+fn tzDayName(dayNo: int): string {
+  return Timestamp{ ns = dayNo * cronDaySecs * Second }.inZone(utc()).toString()
+}
+
+// The zones of `std/tz` with a crowded day, each as a finding naming the zone
+// and the date.
+fn tzFindings(limit: int): []string {
+  let out = []string(0)
+  for e of tzEntries([]byte(data)) {
+    let (day, n) = tzCrowdedDay(tzChanges(e.img), limit)
+    if (n > 0) {
+      out = append(out, "${e.name}: ${n} offset changes on local day ${tzDayName(day)}")
+    }
+  }
+  return out
+}
+
+test "no zone in the bundled tz data changes offset twice in one local day, 2026 to 2056" {
+  let found = tzFindings(cronDayChangeLimit)
+  assert(len(found) == 0, "cron's per-day offset test is unsound for: ${join(found, "; ")}")
+}
+
+test "the per-day scan sees the zones and their changes: limit 0 reports them" {
+  // The check above passing means nothing unless the same scan can fail: with
+  // no change allowed per day, every zone that has one in the window is named.
+  let found = tzFindings(0)
+  assert(len(tzEntries([]byte(data))) > 500, "std/tz lists fewer than 500 zones")
+  assert(
+    len(found) > 100,
+    "limit 0 named only ${len(found)} zones, want the zones that change offset",
+  )
+  let want = "America/New_York: 1 offset changes on local day 2026-03-08T00:00:00+00:00"
+  let seen = false
+  for f of found {
+    if (f == want) {
+      seen = true
+    }
+  }
+  assert(seen, "limit 0 did not report [${want}]")
+}
+
+test "two changes that cancel within one local day are found, and so are two across midnight" {
+  let day = 1800000000
+  let cancel = [
+    zoneChange{ at = day, before = 0, after = 3600 },
+    zoneChange{ at = day + 1800, before = 3600, after = 0 },
+  ]
+  let (d, n) = tzCrowdedDay(cancel, 1)
+  assert(
+    n == 2 && d == tzFloorDiv(day + 3600, cronDaySecs),
+    "cancelling pair: got day ${d} count ${n}",
+  )
+  let apart = [
+    zoneChange{ at = day, before = 0, after = 3600 },
+    zoneChange{ at = day + 3 * cronDaySecs, before = 3600, after = 0 },
+  ]
+  let (_, m) = tzCrowdedDay(apart, 1)
+  assert(m == 0, "changes three days apart were reported as one day")
+  // Havana-style: the first change carries the wall clock from 23:59:59 over
+  // midnight to 01:00, so it touches two days, and the change an hour later
+  // lands on the second of them. `mid` is a local midnight (a multiple of a day).
+  let mid = 1796083200
+  let across = [
+    zoneChange{ at = mid + 18000, before = -18000, after = -14400 },
+    zoneChange{ at = mid + 21600, before = -14400, after = -18000 },
+  ]
+  let (_, k) = tzCrowdedDay(across, 1)
+  assert(k == 2, "two changes an hour apart were not found on one day: ${k}")
 }
