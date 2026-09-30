@@ -246,6 +246,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   if [ -n "$s65o" ]; then
     echo "FAIL: the #6265 inserted-function shape was explained for a file it is not declared for (sig='$s65o')"; fail=1
   fi
+  o45=""
+  b45=$(printf 'func main$fallible() void {\n  ret\n}\n')
+  s45=$(explainMismatch "$o45" "$b45" ir "_tests_/cases/run_closure_multival_return_generic_call.bit")
+  if [ "$s45" != "6045-closure-tuple-oracle-declines" ]; then
+    echo "FAIL: the #6045 empty-oracle shape was not explained (sig='$s45')"; fail=1
+  fi
+  s45o=$(explainMismatch "$o45" "$b45" ir "_tests_/cases/some_other_file.bit")
+  if [ -n "$s45o" ]; then
+    echo "FAIL: the #6045 empty-oracle shape was explained for a file it is not declared for (sig='$s45o')"; fail=1
+  fi
+  s45n=$(explainMismatch "func main() void {" "$b45" ir "_tests_/cases/run_closure_multival_return_generic_call.bit")
+  if [ -n "$s45n" ]; then
+    echo "FAIL: a non-empty oracle dump was wrongly explained as #6045 (sig='$s45n')"; fail=1
+  fi
   b65c=$(printf 'func main() void {\n  %%1 = const_int i64 1\n  ret\n}\n\nfunc apply$0(%%0: i64) i64 {\n  ret %%0\n}\n')
   s65c=$(explainMismatch "$o65" "$b65c" ir "_tests_/cases/run_generic_closure_over_bound_self_static.bit")
   if [ -n "$s65c" ]; then

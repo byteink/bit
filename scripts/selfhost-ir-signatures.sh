@@ -241,6 +241,13 @@
 # `6255-table-row-synth-reposition` explains it. Retires at the 0.34.0 repin
 # with the other two.
 #
+# #6045-closure-tuple-oracle-declines (`ir`/`iropt`, ONE file): the 0.33.0
+# oracle has #6045's bug (a closure returning two values into a generic call
+# fails to lower, E0092), so it emits no IR at all for
+# _tests_/cases/run_closure_multival_return_generic_call.bit, the fixture
+# proving the fix. Explained only for that file, only when the oracle dump is
+# empty and the tree's is not. Retires at the 0.34.0 repin.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
@@ -535,6 +542,9 @@ explainMismatch() {
         if (file ~ /run_generic_closure_over_bound_self_static[.]bit$/ && pureFuncInsert(nA, linesA, nB, linesB)) {
           print "6265-closure-bound-static-insert"; exit 0
         }
+        if (file ~ /run_closure_multival_return_generic_call[.]bit$/ && (nA == 0 || (nA == 1 && linesA[1] == "")) && nB > 1) {
+          print "6045-closure-tuple-oracle-declines"; exit 0
+        }
       }
       exit 1
     }
@@ -559,11 +569,11 @@ declaredSignatureNames() {
   case "$kind" in
     ast) return ;;
     fmt) return ;;
-    ir) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert"; return ;;
-    iropt) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert"; return ;;
+    ir) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines"; return ;;
+    iropt) printf '%s\n' "6269-default-id-attr" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines"; return ;;
     types) printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6265-closure-bound-static-self"; return ;;
     diags) printf '%s\n' "6254-collection-attr-presyntax" "6264-from-contextual-diags"; return ;;
     tokens) printf '%s\n' "6264-from-contextual-token"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr" "6265-closure-bound-static-self" "6265-closure-bound-static-insert"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6255-table-row-synth-reposition" "6264-from-contextual-types" "6254-collection-attr-presyntax" "6264-from-contextual-diags" "6264-from-contextual-token" "6269-default-id-attr" "6265-closure-bound-static-self" "6265-closure-bound-static-insert" "6045-closure-tuple-oracle-declines"
 }

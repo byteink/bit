@@ -7,11 +7,7 @@ the same moment and both try to run it, and records what actually
 happened so the next deploy knows where it left off. That is what
 `migrate` and `rollback` do.
 
-> Laravel shape (`.claude/kb/data-packages-dx.md` "Migrations, approved
-> 2026-09-30"): this page is a placeholder until #6317 rewrites it end to
-> end with `bit migrate`/`bit make migration` — the CLI those commands
-> drive does not exist yet (O3b/O4). Everything below is the library API
-> those commands will call.
+This page covers the library API that applies migrations.
 
 ## One class per migration file
 
