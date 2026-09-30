@@ -130,10 +130,14 @@ of the app agrees on them without talking to each other.
 The scheduler's loop can fall behind: the process is paused, the machine
 sleeps, the database was unreachable for ten minutes. When it catches up,
 ticks are due that the scheduler did not reach on time, and `missed` says
-what to do about them. A tick is on time when the scheduler reaches it within
-one `pollInterval` of its due time, which is how a healthy loop wakes up; it
-is always enqueued, whatever `missed` says. A tick reached later than that is
-missed, even when it is the only one:
+what to do about them. A tick is missed when the scheduler reaches it more
+than a minute after its due time, or after the next tick is already due,
+whichever comes first. Every other tick is on time and is always enqueued,
+whatever `missed` says. So the newest due tick is missed only when it is over
+a minute late, and an older one is missed as soon as the tick after it is
+due: `every(1 * Second)` after a three second stall has two missed ticks and
+one on time. Each tick the policy drops is logged to stderr, once, with the
+schedule, the window of missed ticks and how many were enqueued.
 
 - `Missed.Skip` drops every missed tick. Use it when only the freshest
   answer matters, like a cache warm-up.
@@ -155,10 +159,19 @@ The nightly digest runs at 02:00, and the app is down across that run:
        RunOnce and RunAll(cap) enqueue the digest once
 ```
 
-Had the scheduler reached that tick 1 ms after 02:00, it would be on time and
-every policy, `Skip` included, would enqueue it. `missedEnqueueCount` is the
-arithmetic the scheduler uses, exposed so you can check a policy against your
-own numbers:
+A short outage is not downtime. The database fails at 02:00:00 and comes back
+at 02:00:40, or a deploy restarts the app at 02:00:30:
+
+```text
+02:00:00  the digest is due; the store is down, the pass fails and retries
+02:00:40  the store is back: the tick is 40 seconds late, so it is on time
+          Skip, RunOnce and RunAll(cap) all enqueue the digest once
+```
+
+Had the store stayed down until 02:01:01, the tick would be missed and `Skip`
+would drop it, and log it. `missedEnqueueCount` is the arithmetic the
+scheduler uses for the policy, exposed so you can check it against your own
+numbers:
 
 ```bit
 import { missedEnqueueCount } from "jobs"

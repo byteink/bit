@@ -6,7 +6,7 @@
 // nothing depends on machine load.
 
 import { newMutex, Mutex, newAtomicI64, AtomicI64 } from "std/sync"
-import { sleep, Minute, Hour, Millisecond } from "std/time"
+import { sleep, Second, Minute, Hour, Millisecond, Timestamp } from "std/time"
 import { lastIndexOf, parseInt } from "std/strings"
 
 @job("test-tick") @json class TickJob {
@@ -36,15 +36,20 @@ fn newFakeClock(startNs: int): fakeClock {
 // An in-memory Locker with the same contract as PostgresLocker: a key is
 // held until its expiry, the holder itself always re-acquires, and the
 // newest tick won per schedule is remembered for `lastTick`. `lastFails`
-// makes `lastTick` fail, a database that is down at start.
+// makes `lastTick` fail, a database that is down at start; `acquireFails`
+// makes `tryAcquire` fail, a database that is down when a tick fires.
 class fakeLocker {
   holder: map<string, string>
   expires: map<string, int>
   newest: map<string, int>
   lastFails: bool
+  acquireFails: bool
   mu: Mutex
 
   tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
+    if (this.acquireFails) {
+      fail newError("database down")
+    }
     this.mu.lock()
     defer this.mu.unlock()
     let (cur, has) = this.holder[key]
@@ -86,11 +91,12 @@ fn newFakeLocker(): fakeLocker {
     expires = map<string, int>(),
     newest = map<string, int>(),
     lastFails = false,
+    acquireFails = false,
     mu = newMutex(),
   }
 }
 
-fn queueOn(store: fakeStore, clock: fakeClock, locker: Locker, id: string): Queue {
+fn queueOn(store: fakeStore, clock: Clock, locker: Locker, id: string): Queue {
   let q = open(
     store,
     Options{
@@ -123,8 +129,11 @@ const t0: int = 1000 * Minute + 30 * Second
 // no lateness at all.
 const onTick: int = 1200 * Minute
 
-test "a stall of five ticks: Skip enqueues none, RunOnce one, RunAll(3) three" {
-  let want = [0, 1, 3]
+// t0 is 30 s past a tick, so after five periods the newest tick is 30 s late
+// (on time: under a minute and before the next is due) and the four before it
+// are missed.
+test "a stall of five ticks: four are missed, the newest is on time" {
+  let want = [1, 2, 4]
   let policies = [Missed.Skip, Missed.RunOnce, Missed.RunAll(3)]
   let i = 0
   while (i < 3) {
@@ -261,8 +270,8 @@ fn enqueuedAfterDowntime(policy: Missed, locker: Locker): int {
   return dueCount(store) - 1
 }
 
-test "a restart after downtime catches up by policy: Skip 0, RunOnce 1, RunAll(3) 3" {
-  let want = [0, 1, 3]
+test "a restart after downtime catches up by policy: the newest tick fires, the missed four go by policy" {
+  let want = [1, 2, 4]
   let policies = [Missed.Skip, Missed.RunOnce, Missed.RunAll(3)]
   let i = 0
   while (i < 3) {
@@ -338,29 +347,197 @@ test "a tick reached 1 ms late is on time: Skip enqueues it" {
   assert(got == 1, "want 1 enqueue 1 ms late, got ${got}")
 }
 
-test "the grace window is one pollInterval, inclusive" {
-  let poll = 5 * Millisecond
-  assert(enqueuedWhenLate(poll, Missed.Skip) == 1, "a tick exactly one poll late must fire")
-  assert(enqueuedWhenLate(poll + 1, Missed.Skip) == 0, "a tick past one poll late is missed")
+test "an hourly tick is missed only past a minute, inclusive" {
+  assert(enqueuedWhenLate(Minute, Missed.Skip) == 1, "a tick exactly a minute late must fire")
+  assert(enqueuedWhenLate(Minute + 1, Missed.Skip) == 0, "a tick past a minute late is missed")
 }
 
-test "on-time ticks after a late prefix always fire: RunOnce keeps one of the late" {
+test "the threshold is a minute, not pollInterval: a tick 10 polls late fires" {
+  assert(enqueuedWhenLate(50 * Millisecond, Missed.Skip) == 1, "10 polls late must fire")
+  assert(enqueuedWhenLate(30 * Second, Missed.Skip) == 1, "30 s late must fire")
+}
+
+test "on-time ticks after a missed prefix always fire: RunOnce keeps one of the missed" {
   let ticks = [1 * Minute, 2 * Minute, 3 * Minute, 4 * Minute]
-  let now = 4 * Minute
+  let next = 5 * Minute
+  // One second past tick 4 (on time); tick 3 is a minute and a second late
+  // with tick 4 already due, so it is missed.
+  let now = 4 * Minute + Second
+  assert(missedTickCount(ticks, next, now) == 3, "ticks 1 to 3 are missed")
   assert(
-    firstFiredTick(ticks, now, Millisecond, Missed.Skip) == 3,
+    firstFiredTick(ticks, next, now, Missed.Skip) == 3,
     "Skip keeps only the on-time tick",
   )
   assert(
-    firstFiredTick(ticks, now, Millisecond, Missed.RunOnce) == 2,
-    "RunOnce adds one late tick",
+    firstFiredTick(ticks, next, now, Missed.RunOnce) == 2,
+    "RunOnce adds one missed tick",
   )
   assert(
-    firstFiredTick(ticks, now, Millisecond, Missed.RunAll(2)) == 1,
-    "RunAll(2) adds two late ticks",
+    firstFiredTick(ticks, next, now, Missed.RunAll(2)) == 1,
+    "RunAll(2) adds two missed ticks",
   )
   assert(
-    firstFiredTick(ticks, now, Millisecond, Missed.RunAll(9)) == 0,
+    firstFiredTick(ticks, next, now, Missed.RunAll(9)) == 0,
     "RunAll(9) keeps all four",
   )
+}
+
+test "a tick is not missed until the next one is overdue, exactly" {
+  let ticks = [1 * Minute, 2 * Minute]
+  assert(missedTickCount(ticks, 3 * Minute, 2 * Minute) == 0, "now == next tick: not missed")
+  assert(missedTickCount(ticks, 3 * Minute, 2 * Minute + 1) == 1, "one ns past: missed")
+}
+
+test "every second, stalled 3 s: two ticks missed, one on time" {
+  let store = newFakeStore()
+  let clock = newFakeClock(1000 * Minute + 500 * Millisecond)
+  let q = queueOn(store, clock, nil, "a")
+  q.every(Second, TickJob{ tag = "s" }, missed = Missed.Skip) catch e {
+    panic("every: ${e.message()}")
+  }
+  clock.advance(3 * Second)
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 1, "Skip: want the one on-time tick, got ${dueCount(store)}")
+  let ticks = [1000 * Minute + Second, 1000 * Minute + 2 * Second, 1000 * Minute + 3 * Second]
+  assert(
+    missedTickCount(ticks, 1000 * Minute + 4 * Second, clock.nowNs()) == 2,
+    "want 2 missed of 3 due",
+  )
+}
+
+// A nightly 02:00 UTC schedule over a fleet that already fired the night
+// before: a fresh instance (a restart, or the same one after a failed pass)
+// reaches the new night's tick `lateNs` after 02:00. Returns the enqueues
+// for that night.
+const day0: int = 1767225600 * Second
+
+fn nightlyAfter(lateNs: int, policy: Missed): int {
+  let store = newFakeStore()
+  let locker = newFakeLocker()
+  let clock = newFakeClock(day0 + 2 * Hour - Minute)
+  let before = queueOn(store, clock, locker, "before")
+  before.schedule("0 2 * * *", TickJob{ tag = "n" }, tz = "UTC", missed = policy) catch e {
+    panic("schedule: ${e.message()}")
+  }
+  clock.advance(Minute)
+  runDue(before, clock.nowNs())
+  assert(dueCount(store) == 1, "the first night must fire, got ${dueCount(store)}")
+  clock.advance(24 * Hour + lateNs)
+  let after = queueOn(store, clock, locker, "after")
+  after.schedule("0 2 * * *", TickJob{ tag = "n" }, tz = "UTC", missed = policy) catch e {
+    panic("schedule: ${e.message()}")
+  }
+  runDue(after, clock.nowNs())
+  return dueCount(store) - 1
+}
+
+test "a deploy that restarts the app 30 s after 02:00 still enqueues the nightly tick under Skip" {
+  assert(nightlyAfter(30 * Second, Missed.Skip) == 1, "want the nightly tick enqueued")
+}
+
+test "a restart over a minute after 02:00 drops the nightly tick under Skip, enqueues it otherwise" {
+  assert(nightlyAfter(Minute + Second, Missed.Skip) == 0, "Skip: want it dropped")
+  assert(nightlyAfter(Minute + Second, Missed.RunOnce) == 1, "RunOnce: want it enqueued")
+}
+
+test "a store failure at 02:00:00 that recovers at 02:00:40 still enqueues the nightly tick under Skip" {
+  let store = newFakeStore()
+  let locker = newFakeLocker()
+  let clock = newFakeClock(day0 + 2 * Hour - Minute)
+  let q = queueOn(store, clock, locker, "a")
+  q.schedule("0 2 * * *", TickJob{ tag = "n" }, tz = "UTC", missed = Missed.Skip) catch e {
+    panic("schedule: ${e.message()}")
+  }
+  locker.acquireFails = true
+  clock.advance(Minute)
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 0, "the store is down: nothing can be enqueued yet")
+  // Many failed retries, one per poll, then the store comes back.
+  let retry = 0
+  while (retry < 10) {
+    clock.advance(4 * Second)
+    runDue(q, clock.nowNs())
+    retry = retry + 1
+  }
+  locker.acquireFails = false
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 1, "want the nightly tick enqueued at 02:00:40, got ${dueCount(store)}")
+}
+
+test "a store failure that outlasts a minute drops the nightly tick under Skip" {
+  let store = newFakeStore()
+  let locker = newFakeLocker()
+  let clock = newFakeClock(day0 + 2 * Hour - Minute)
+  let q = queueOn(store, clock, locker, "a")
+  q.schedule("0 2 * * *", TickJob{ tag = "n" }, tz = "UTC", missed = Missed.Skip) catch e {
+    panic("schedule: ${e.message()}")
+  }
+  locker.acquireFails = true
+  clock.advance(Minute)
+  runDue(q, clock.nowNs())
+  clock.advance(Minute + Second)
+  locker.acquireFails = false
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 0, "a minute past the tick, Skip drops it, got ${dueCount(store)}")
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 0, "a dropped tick stays dropped, got ${dueCount(store)}")
+}
+
+// A clock that moves `step` on every read, the way a slow pass moves real
+// time, and remembers the first `pause` the loop asked for.
+class stepClock {
+  ns: AtomicI64
+  step: AtomicI64
+  firstPause: AtomicI64
+
+  nowNs(): int {
+    return int(this.ns.add(this.step.load()))
+  }
+
+  pause(d: int) {
+    this.firstPause.compareAndSwap(i64(0), i64(d))
+    sleep(Millisecond)
+  }
+}
+
+test "the loop sleeps from the end of the pass, not from its start" {
+  let store = newFakeStore()
+  let clock = stepClock{
+    ns = newAtomicI64(i64(onTick)),
+    step = newAtomicI64(i64(0)),
+    firstPause = newAtomicI64(i64(0)),
+  }
+  let q = queueOn(store, clock, nil, "a")
+  q.every(Hour, TickJob{ tag = "h" }, missed = Missed.Skip) catch e {
+    panic("every: ${e.message()}")
+  }
+  // 7 ms before the tick; each read moves 2 ms, so the pass reads 5 ms
+  // before it and the sleep is computed from a clock 3 ms before it. Measured
+  // from the pass start the sleep would be the full 5 ms pollInterval.
+  clock.ns.store(i64(onTick + Hour - 7 * Millisecond))
+  clock.step.store(i64(2 * Millisecond))
+  q.start()
+  let waited = 0
+  while (clock.firstPause.load() == i64(0) && waited < 5000) {
+    sleep(Millisecond)
+    waited = waited + 1
+  }
+  q.stop()
+  assert(
+    clock.firstPause.load() == i64(3 * Millisecond),
+    "want a 3 ms sleep, got ${clock.firstPause.load()} ns",
+  )
+}
+
+test "missedMessage names the schedule, the window, the policy and what was enqueued" {
+  let ticks = [1 * Minute, 2 * Minute, 3 * Minute]
+  let first = Timestamp{ ns = ticks[0] }.toString()
+  let last = Timestamp{ ns = ticks[2] }.toString()
+  let want = "jobs: schedule 'x' missed 3 tick(s) from ${first} to ${last}; Missed.RunAll(2) enqueued 2\n"
+  assert(
+    missedMessage("x", ticks, 3, 2, Missed.RunAll(2)) == want,
+    "got ${missedMessage("x", ticks, 3, 2, Missed.RunAll(2))}",
+  )
+  assert(missedName(Missed.Skip) == "Skip", "Skip")
+  assert(missedName(Missed.RunOnce) == "RunOnce", "RunOnce")
 }
