@@ -3456,7 +3456,16 @@ box.set(y = 1, x = 2)   // method of a generic class: box is a GBox<i64>
 shape.area(h = 4, w = 3)  // inside fn f<T: Shape>(shape: T): w and h are
                           // Shape.area's names, whatever Rect calls its own
 T.label(n = 7)          // static call inside fn describe<T: Named>()
+Pair<i64, bool>.tag(p = "y", n = 2)  // static method through a written
+                                     // instantiation of a generic class
+store.put(value = v, key = k)  // store: Store<T>, a generic interface value:
+                               // names are Store.put's, as for any interface
 ```
+
+An arrow literal written as a named argument is seeded with its expected type
+from the parameter its name binds, exactly as the positional form is (§15.3):
+`apply(v = 4, f = (x) => x + 1)` infers `T` from `v`, checks the arrow against
+`(i64) => U`, and binds `U` from its result.
 
 **Evaluation order.** Arguments evaluate left to right in the order they are
 *written*, exactly like any other argument list; only their *placement* into
