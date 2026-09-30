@@ -151,6 +151,40 @@ ambient "current transaction" a shared `Pool` could answer for the wrong
 caller. An inner failure rolls back only the inner block; the outer one
 commits normally.
 
+## Pinning a connection without a transaction
+
+`tx`/`txValue` pin one connection for a block AND wrap it in
+BEGIN/COMMIT. Some things need the pin without the transaction: a
+session-scoped server lock (`SELECT pg_advisory_lock(...)`, `SELECT
+GET_LOCK(...)`) is tied to the connection that took it, not to any SQL
+transaction, and MySQL DDL cannot run inside one at all. Calling `Pool.exec`
+per statement does not pin anything - each call checks a connection out and
+back, so the lock can end up on a connection the pool has since handed to
+someone else, and the lock then protects nothing. `Pool.pinned<T>` is the
+fix: one connection, for the whole block, with no BEGIN/COMMIT of its own.
+
+```bit
+import { Pool, Value, Executor } from "std/sql"
+
+fn archiveWithLock(db: Pool, id: string): int! {
+  return db.pinned<int>((conn) => {
+    conn.exec("SELECT GET_LOCK('archive', -1)", []Value(0))?
+    defer releaseArchiveLock(conn)
+    return conn.exec("UPDATE drafts SET status = 'archived' WHERE id = ?", [Value.Text(id)])?
+  })?
+}
+
+fn releaseArchiveLock(conn: Executor) {
+  conn.exec("SELECT RELEASE_LOCK('archive')", []Value(0)) catch _ {
+    return
+  }
+}
+```
+
+`defer` inside the block runs when the block returns (SPEC §18.5) - on the
+ordinary path and on a failure inside `f` alike - so the lock releases and
+the connection goes back to the pool together, whatever `f` did.
+
 ## Read replicas and read-your-own-writes
 
 Set `Datasource.replicas` and `pool` opens one connection pool per replica
@@ -525,6 +559,15 @@ returned, once the commit has succeeded.
 
 Opens a per-request read-your-own-writes handle. See the read replicas
 section above for what it protects against.
+
+### `Pool.pinned<T>(f: (Executor) => T!): T!`
+
+Checks one connection out, hands it to `f` as an `Executor` for the whole
+call, and returns it when `f` returns - on the ordinary path and on a
+failure inside `f` alike. Unlike `tx`/`txValue`, opens no transaction: `f`
+may run any mix of statements, including ones a transaction cannot carry,
+while still never sharing the connection with another caller. See "Pinning
+a connection without a transaction" above.
 
 ### `FatalError`
 

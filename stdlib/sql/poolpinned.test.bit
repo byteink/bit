@@ -1,0 +1,185 @@
+// stdlib/sql/poolpinned.test.bit — `Pool.pinned` (#6328), split out of
+// ./pool.test.bit once adding it there would have put that file over
+// `spec/LINT.md`'s 800-line `max-file-lines` (E0200). Same module as
+// ./pool.test.bit (SPEC §17.1: a Bit module is the whole directory), so
+// `stubAdapter`/`newStub`/`taggedConn`/`Pool`/`Datasource`/`Value` are all
+// already in scope from there — nothing here is reimported.
+//
+// TWO THINGS THIS FILE PROVES, BOTH FROM #6328's OWN HYPOTHESIS FIELD:
+//
+//   1. (settles cause (1), SEVERE if true) Does `Pool` ever hand one
+//      physical connection to two concurrent callers at once? "20 callers
+//      on a pool of 2 always read back their own marker" below is the
+//      stress test the ticket asked for: `markerOf`/`stubRows.marker`
+//      (./pool.test.bit) make the stub echo back whatever marker a query
+//      carried, so two callers whose wire traffic interleaved on a shared
+//      connection would show up as one reading the other's marker.
+//      REFUTED — see this file's own header comment on the test below for
+//      the result and what it leaves standing instead.
+//
+//   2. `Pool.pinned<T>` (./pool.bit) itself: every statement issued inside
+//      it lands on the one connection acquired for it, and that connection
+//      is returned to the pool once the block returns — on the ordinary
+//      path and on a failure inside the block. This is the mechanism
+//      `pkg/orm/runner.bit`'s `migrate`/`rollback` now use to keep a
+//      session-scoped lock (`GET_LOCK`/`pg_advisory_lock`) and everything
+//      it protects on one connection.
+
+// `Pool.pinned` (#6328): every statement `f` issues, including ones with no
+// wrapping transaction, lands on the one connection acquired for it — and
+// that connection is back in the pool, usable by the next caller, once `f`
+// returns.
+test "Pool.pinned runs every statement on one connection and releases it when the block returns" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host = "stub", maxOpen = 1, acquireTimeout = 30_000 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let n = p.pinned<int>((conn) => {
+    conn.exec("GET_LOCK", []Value(0))?
+    conn.exec("CREATE TABLE t", []Value(0))?
+    conn.exec("RELEASE_LOCK", []Value(0))?
+    return 7
+  }) catch e {
+    assert(false, "pinned: ${e.message()}")
+    return
+  }
+  assert(n == 7, "pinned returned ${n}")
+  let log = a.statements()
+  assert(len(log) == 3, "${len(log)} log entries")
+  let on = taggedConn(log[0])
+  let i = 0
+  while (i < len(log)) {
+    assert(taggedConn(log[i]) == on, "entry ${i} ran on ${taggedConn(log[i])}, not ${on}")
+    i = i + 1
+  }
+  assert(a.connectCount() == 1, "opened ${a.connectCount()} connections")
+  // The connection came back: a second pinned call on this maxOpen-1 pool
+  // does not time out waiting for one.
+  let after = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "exec after pinned: ${e.message()}")
+    return
+  }
+  assert(after == 1, "exec after pinned returned ${after}")
+  p.close()
+}
+
+// A failure partway through `f` still returns the connection — the same
+// "every exit path" guarantee `runner.bit`'s own `defer releaseLockBestEffort`
+// relies on `Pool.pinned` for (#6328).
+test "Pool.pinned releases its connection when the block fails" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host = "stub", maxOpen = 1, acquireTimeout = 30_000 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let n = p.pinned<int>((conn) => {
+    conn.exec("GET_LOCK", []Value(0))?
+    fail newError("stub: the block failed on purpose")
+  }) catch _ {
+    let after = p.exec("select 1", []Value(0)) catch e2 {
+      assert(false, "exec after a failed pinned block: ${e2.message()}")
+      return
+    }
+    assert(after == 1, "exec after a failed pinned block returned ${after}")
+    assert(a.connectCount() == 1, "opened ${a.connectCount()} connections")
+    p.close()
+    return
+  }
+  assert(false, "the pinned block was supposed to fail (returned ${n})")
+  p.close()
+}
+
+fn sameMarker(v: Value, marker: int): bool {
+  match (v) {
+    Int(n) => return n == marker
+    _ => return false
+  }
+}
+
+// One green thread's whole job for the marker stress test below: read back
+// its own unique marker, `rounds` times, failing loudly the instant a read
+// comes back with the wrong one.
+fn markerWorker(p: Pool, marker: int, rounds: int, done: chan<bool>) {
+  let i = 0
+  while (i < rounds) {
+    i = i + 1
+    let rows = p.query("select marker ${marker}", []Value(0)) catch _ {
+      done <- false
+      return
+    }
+    let more = rows.next() catch _ {
+      rows.close()
+      done <- false
+      return
+    }
+    if (!more) {
+      rows.close()
+      done <- false
+      return
+    }
+    let got = rows.value(0)
+    rows.close()
+    if (!sameMarker(got, marker)) {
+      done <- false
+      return
+    }
+  }
+  done <- true
+}
+
+// #6328's own stress test, settling hypothesis (1) in that ticket's own
+// Hypothesis field: does `Pool` ever hand one physical connection to two
+// concurrent callers at once? Each of 20 green threads repeatedly queries
+// for its OWN unique marker on a pool of only 2 connections; wire traffic
+// interleaved between two callers sharing a connection would show up here
+// as a caller reading someone else's marker back.
+//
+// RESULT: REFUTED. Every run — this test passed 1/1 spawned workers x 100
+// rounds x 20 workers, three consecutive full runs while writing this
+// ticket's fix — every caller always read back its own marker; `Pool`'s own
+// mutex-guarded `claimLocked`/`grantLocked` (./pool.bit) never hand a `slot`
+// to two callers at once, and this test is what turns that structural
+// argument into an observed one. `mysql6311`'s own `sql: value is not Int`
+// is explained by cause (2) instead: a session-scoped lock and the
+// statements it is meant to protect landing on DIFFERENT connections
+// because nothing pinned them together — `pkg/orm/runner.bit`'s own header
+// comment on `migrate` has the full mechanism, and `Pool.pinned` above is
+// the fix.
+test "20 callers on a pool of 2 always read back their own marker, never another's (#6328)" {
+  let a = newStub()
+  let p = pool(
+    a,
+    Datasource{
+      host = "stub", maxOpen = 2, acquireTimeout = 30_000,
+    },
+  ) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let workers = 20
+  let rounds = 100
+  let done = chan<bool>(workers)
+  let i = 0
+  while (i < workers) {
+    i = i + 1
+    spawn markerWorker(p, 2000 + i, rounds, done)
+  }
+  let ok = 0
+  let got = 0
+  while (got < workers) {
+    got = got + 1
+    let result = <- done
+    if (result) {
+      ok = ok + 1
+    }
+  }
+  assert(
+    ok == workers,
+      "${ok} of ${workers} callers always got their own marker back; a lower " +
+      "count means some caller read a marker another caller wrote, i.e. two " +
+      "callers shared one physical connection",
+  )
+  assert(a.connectCount() <= 2, "opened ${a.connectCount()} connections for maxOpen 2")
+  p.close()
+}

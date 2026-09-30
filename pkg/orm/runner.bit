@@ -115,7 +115,47 @@ const mysqlAdvisoryLockName: string = "bit_migrate"
 // Applies every migration in `migrations` not yet recorded in `migrations`
 // (the ledger table), in ascending name order, as one new batch. See this
 // file's header for the lock, the transaction shape and the batch rule.
+//
+// THE WHOLE LOCKED REGION RUNS ON ONE RESERVED CONNECTION (#6328). A
+// session-scoped lock (`GET_LOCK`/`pg_advisory_lock`) protects nothing if
+// the statements it is meant to serialize can land on a different
+// connection than the one that took it — `Data.exec`/`Data.query` alone
+// check a connection out and back per call, so between `acquireLock` and
+// the next statement the pool is free to hand that same physical
+// connection, lock and all, to a second concurrent caller (MySQL's
+// `GET_LOCK` is reentrant on the connection that already holds it, so that
+// second caller's own `acquireLock` would succeed immediately instead of
+// blocking). `Pool.pinned` (`stdlib/sql/pool.bit`) is what pins one
+// connection for the whole block without opening a SQL transaction of its
+// own — needed here because `runOneMigration`/`runOneRevert` open and close
+// their OWN transactions per migration, and MySQL's non-transactional DDL
+// runs outside any transaction at all. `db` is only ever NOT a `Pool` when
+// a caller is already running `migrate`/`rollback` inside its own
+// transaction (`Data`'s own header: `Pool` or a live transaction handle) —
+// in that case the connection is already pinned by that outer transaction
+// (rule 1, `stdlib/sql/pool.bit`), so nothing more is needed here.
 export fn migrate(
+  db: Data,
+  dialect: RunnerDialect,
+  migrations: []MigrationFile,
+  at: Timestamp,
+): MigrateReport! {
+  let (asPool, isPool) = db.(Pool)
+  if (isPool) {
+    // Rebound with an explicit `Pool` type: calling a generic method
+    // straight off a type-assertion tuple loses the concrete type the
+    // closure argument below needs inferred (`p.pinned<T>(f)` expects
+    // `f: (Executor) => T!`); the explicit annotation here is what recovers
+    // it.
+    let p: Pool = asPool
+    return p.pinned<MigrateReport>((conn) => {
+      return migrateLocked(conn, dialect, migrations, at)?
+    })?
+  }
+  return migrateLocked(db, dialect, migrations, at)?
+}
+
+fn migrateLocked(
   db: Data,
   dialect: RunnerDialect,
   migrations: []MigrationFile,
@@ -136,8 +176,22 @@ export fn migrate(
 
 // Reverts every migration in the HIGHEST recorded batch, newest file first
 // — see this file's header, piece 3. A no-op, returning an empty report,
-// when nothing has ever been applied.
+// when nothing has ever been applied. See `migrate`'s own header for why
+// the locked region runs on one reserved connection (#6328).
 export fn rollback(db: Data, dialect: RunnerDialect, migrations: []MigrationFile): RollbackReport! {
+  let (asPool, isPool) = db.(Pool)
+  if (isPool) {
+    // See `migrate`'s own comment above: the explicit `Pool` type is what
+    // recovers the closure's expected-type inference here.
+    let p: Pool = asPool
+    return p.pinned<RollbackReport>((conn) => {
+      return rollbackLocked(conn, dialect, migrations)?
+    })?
+  }
+  return rollbackLocked(db, dialect, migrations)?
+}
+
+fn rollbackLocked(db: Data, dialect: RunnerDialect, migrations: []MigrationFile): RollbackReport! {
   acquireLock(db, dialect.server)?
   defer releaseLockBestEffort(db, dialect.server)
   let history = loadHistory(db)?

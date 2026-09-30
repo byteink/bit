@@ -183,6 +183,25 @@ export class Pool {
     return newSession(this)
   }
 
+  // Checks one physical connection out and hands it to `f` as an `Executor`
+  // for the whole call, returning it once `f` returns — on every path out
+  // via `fail`/`?` (SPEC §18.5), the same reach `defer` gives everywhere
+  // else in this file. UNLIKE `.tx()`/`.begin()`, THIS OPENS NO
+  // TRANSACTION: `f` may run any mix of statements on the one connection —
+  // including ones a transaction cannot carry, like MySQL DDL or Postgres's
+  // `CREATE INDEX CONCURRENTLY` — while still never sharing it with another
+  // caller for as long as `f` runs. This is rule 1's own pinning
+  // (`begin`, above), generalised to a caller that needs the pin without a
+  // SQL transaction wrapping it — a session-scoped server lock
+  // (`GET_LOCK`/`pg_advisory_lock`) is exactly that: the lock and every
+  // statement it protects have to land on the one connection that took it,
+  // or the lock protects nothing (#6328).
+  export pinned<T>(f: (Executor) => T!): T! {
+    let s = this.acquire()?
+    defer this.release(s)
+    return f(pinnedConn{ p = this, s = s })?
+  }
+
   // Closes every idle connection and fails every parked caller. Connections
   // still checked out are closed as they are returned. Idempotent. Also
   // closes every read replica's own pool (./replica.bit).
@@ -494,6 +513,58 @@ class borrowedRows {
     this.done = true
     this.inner.close()
     this.p.release(this.s)
+  }
+}
+
+// The `Executor` `Pool.pinned` hands its block: every statement runs
+// directly on `s`'s connection, with no BEGIN/COMMIT of its own — the block
+// controls its own transaction boundaries, or issues none.
+class pinnedConn {
+  p: Pool
+  s: slot
+  query(sqlText: string, params: []Value): Rows! {
+    let rows = this.s.inner.query(sqlText, params) catch e {
+      this.p.mark(this.s, e)
+      fail e
+    }
+    return pinnedRows{ p = this.p, s = this.s, inner = rows }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    let n = this.s.inner.exec(sqlText, params) catch e {
+      this.p.mark(this.s, e)
+      fail e
+    }
+    return n
+  }
+}
+
+// `pinnedConn.query`'s cursor. Closing it ends the cursor only — the
+// connection goes back to the pool when `Pool.pinned`'s own block returns,
+// never earlier, so a caller may still issue more statements on the same
+// connection after closing one `Rows`.
+class pinnedRows {
+  p: Pool
+  s: slot
+  inner: Rows
+  next(): bool! {
+    let more = this.inner.next() catch e {
+      this.p.mark(this.s, e)
+      fail e
+    }
+    return more
+  }
+
+  columns(): []string {
+    return this.inner.columns()
+  }
+
+  value(col: int): Value {
+    return this.inner.value(col)
+  }
+
+  close() {
+    this.inner.close()
   }
 }
 
