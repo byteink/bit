@@ -175,10 +175,7 @@ deploy.
 ## Sharp edges
 
 **Retries and the dead-letter list.** `enqueue`'s extra arguments are how
-many times to try before giving up. Its named-argument form is not
-available - `enqueue` is generic in the job's type, and a named argument
-on a generic call is a compile error for an inferred type parameter, so
-every call uses positional arguments:
+many times to try before giving up, passed positionally:
 
 ```bit
 fn enqueueWelcome(q: Queue, userId: i64): ()! {

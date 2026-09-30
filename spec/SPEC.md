@@ -3398,11 +3398,8 @@ the call site can see: the class's own declaration for a call on a class
 value or a static call through its class, and the *interface's* method
 signature for a call through an interface value, since dynamic dispatch is
 all that call site knows. A static call through a **bound generic type
-parameter** (`T.label()`, `T: Named`) is positional only, for the same
-reason a generic receiver is below - the checker can see only the
-constraint interface's declared names, while the call dispatches, after
-monomorphization, to the concrete implementation's, and the two may legally
-disagree.
+parameter** (`T.label()`, `T: Named`), which resolves against the constraint
+interface's signature (below).
 
 ```
 log.emit(count = 7, label = "hits")   // class receiver
@@ -3426,27 +3423,27 @@ The same holds for a func-typed class field, which is a function value reached
 through its owner. A builtin (§5.3) and a type conversion (§12.9) are
 positional only for the same reason: neither declares a parameter list at all.
 
-**Generic callees and receivers are positional only.** A named argument is a
-compile error when the callee is a generic function, when the receiver is a
-generic class or interface, or when the receiver is a type parameter:
+**Generic callees and receivers follow the same rule.** A name binds to a
+parameter of the signature the call site statically sees, *before* type
+checking, and the call is reordered into positional form; inference and
+checking then run exactly as for the positional call, so each argument is
+judged against the instantiated parameter type, never the open `T`, and an
+omitted defaulted parameter takes its default. A generic function or a method
+of a generic class binds against its *declaration's* parameter list (names do
+not depend on the type arguments). A **type-parameter receiver** binds against
+its constraint interface's signature - the rule already stated above for an
+interface value. Dispatch is positional, so an implementation whose parameter
+names differ still receives each value in the slot the interface's names bound
+it to (an implementation matches an interface by *type*, not by parameter name,
+§14.3).
 
 ```
-pick(b = 1, a = 2)    // error: pick<T> is generic
-box.set(x = 1)        // error: box is a GBox<int>
-shape.area(w = 3)     // error inside fn f<T: Shape>(shape: T)
-T.label(x = 1)        // error inside fn describe<T: Named>(), a static call
+pick(b = 1, a = 2)      // generic function: pick<T>(a: T, b: T), T = i64
+box.set(y = 1, x = 2)   // method of a generic class: box is a GBox<i64>
+shape.area(h = 4, w = 3)  // inside fn f<T: Shape>(shape: T): w and h are
+                          // Shape.area's names, whatever Rect calls its own
+T.label(n = 7)          // static call inside fn describe<T: Named>()
 ```
-
-A generic declaration's parameter *types* still mention its open type
-parameters, so an argument named against one would be checked against `T`
-itself rather than against the type this call instantiates `T` with. A type
-*parameter* receiver has a second reason of its own: the name would resolve
-against the constraint interface's parameter list, while the call is
-dispatched - after the generic is instantiated - to the concrete
-implementation's. An implementation matches an interface by *type*, not by
-parameter name (§14.3), so the two lists may legally disagree, and resolving a
-name against one while placing it by the other would silently fill the wrong
-slot.
 
 **Evaluation order.** Arguments evaluate left to right in the order they are
 *written*, exactly like any other argument list; only their *placement* into
