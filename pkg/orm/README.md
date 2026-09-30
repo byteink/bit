@@ -55,9 +55,9 @@ Reading rows through the find chain (`where`, `orderBy`, `limit`, `offset`,
 `after`, `with`) is [`docs/query.md`](docs/query.md). Inserting, updating,
 deleting and bulk writes (`insertAll`, `set().updateAll()`, `deleteAll`)
 and optimistic locking with `@version` is [`docs/write.md`](docs/write.md).
-`@hasMany`/`@belongsTo` and eager loading with `with()` is
+`@hasMany`/`@belongsTo` and how a relation loads when you read it is
 [`docs/relation.md`](docs/relation.md). Many-to-many relations - the join
-table's DDL, eager loading, and `link`/`unlink` - is
+table's DDL, loading, and `link`/`unlink` - is
 [`docs/manytomany.md`](docs/manytomany.md). Marking a row deleted instead
 of removing it is [`docs/softdelete.md`](docs/softdelete.md). Filling
 `createdAt`/`updatedAt` automatically is

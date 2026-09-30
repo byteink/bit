@@ -4,8 +4,8 @@
 direction. An `Article` and a `Tag` don't fit that shape: an article has
 many tags, a tag has many articles, and the fact that connects one to the
 other lives on neither table. That fact needs its own table, just two
-foreign keys wide - `@manyToMany`, `with()`, `link` and `unlink` are what
-this page covers.
+foreign keys wide - `@manyToMany`, `link` and `unlink` are what this page
+covers.
 
 ## Declare it, and name the join table yourself
 
@@ -32,25 +32,30 @@ import { Db, open } from "orm"
 reflection, so nothing here can guess whether the convention is
 `article_tags` or `tag_articles`; a guessed name that happens to be wrong
 doesn't fail, it just reads an empty table forever. `tags`/`articles` are
-the field names `with()` and `link`/`unlink` refer to below - the target
-type (`[]Tag`, `[]Article`) is what makes each side point at the other.
+the field names the compiler's load and `link`/`unlink` refer to below - the
+target type (`[]Tag`, `[]Article`) is what makes each side point at the
+other.
 
-## Eager loading with `with()`
+## Reading it: the compiler loads it
 
 ```bit
-fn articlesWithTags(db: Db): []Article! {
-  return db.table<Article>().with("tags").all()?
+fn printTagged(db: Db): ()! {
+  for article of db.table<Article>().orderBy("title").all()? {
+    println("${article.title}: ${len(article.tags)} tags")
+  }
 }
 ```
 
-`with("tags")` works exactly the way [Relations](relation.md)'s own
-`with("articles")` does: `articlesWithTags(db)` issues the parent `SELECT`
-plus one join through `article_tags`, never a query per article and never a
-separate pivot-only round trip - 200 articles is 2 statements, same as a
-`@hasMany` `with()`. An article with no tags gets `article.tags =
-[]Tag{}`, loaded and empty, not "never loaded" - reading `tags` without
-`.with("tags")` panics, the identical sharp edge [Relations](relation.md)
-documents for `@hasMany`.
+`@manyToMany` loads the way `@hasMany` does ([Relations](relation.md)):
+`printTagged` reads `article.tags`, so the compiler adds the relation to the
+query, and it is one join through `article_tags` rather than a query per
+article: 200 articles cost 2 statements, the parent `SELECT` plus the join,
+never a separate pivot-only round trip. An article with no
+tags gets `article.tags = []Tag{}`, loaded and empty. Where the compiler
+cannot follow the rows to a query, `bit check` fails with E0300 and names
+where to add `.with("tags")`, the same escape [Relations](relation.md)
+shows; rows from raw SQL carry no `tags` at all, so the build refuses a read
+of them too rather than hand you an empty list.
 
 ## Changing the set: `link` and `unlink`
 
@@ -79,8 +84,8 @@ either call spelling out which.
 
 ## The join table's own DDL
 
-`@manyToMany`'s compile-time wiring covers `with()`/`link`/`unlink`; it does
-not create the table. [Schema](schema.md) creates tables from a hand-written
+`@manyToMany`'s compile-time wiring covers the load and `link`/`unlink`; it
+does not create the table. [Schema](schema.md) creates tables from a hand-written
 `SchemaOp`, so the join table needs one too - `manyToManyTable` builds it
 from the identical `joinTable`/column names you already gave `@manyToMany`:
 
@@ -122,7 +127,7 @@ foreign key per column with `on delete cascade` so removing an `Article` or
 a `Tag` also removes its pairs, and an index on the target column so
 traversal from either side stays fast. `ManyToManyDesc` here is a second,
 hand-written copy of what `@manyToMany("article_tags")` already told the
-compiler - `with()`/`link`/`unlink` compute their own copy internally, so a
+compiler - the load and `link`/`unlink` compute their own copy internally, so a
 mismatch here (a wrong table or column name) breaks the DDL, never the
 runtime calls above.
 
@@ -168,8 +173,8 @@ see "The honest boundary" above.
 
 ## Where to go next
 
-[Relations](relation.md) covers `@hasMany` and the `with()`/eager-loading
-vocabulary this page builds on. [Schema](schema.md) and
+[Relations](relation.md) covers `@hasMany` and the rule for loading a relation
+that this page builds on. [Schema](schema.md) and
 [Dialect](dialect.md) cover the `SchemaOp`/`Table.primaryKey` vocabulary
 `manyToManyTable` uses and the DDL it renders to. [Write](write.md) covers
 `insert`/`update` on `Article`/`Tag` themselves, once their tags are wired

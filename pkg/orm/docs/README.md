@@ -13,7 +13,7 @@
 | [Write](write.md) | `insert`/`update`/`delete` on `Repo<T>`, bulk writes (`insertAll`, `set().updateAll()`, `deleteAll`), and `@version` optimistic locking with `StaleWriteError` |
 | [Timestamps](timestamps.md) | `@timestamps`: filling `createdAt` on INSERT and `updatedAt` on every write, single or bulk |
 | [Errors](errors.md) | Turning a driver's constraint-violation error into a typed, catchable cause via `classify`, decided from SQLSTATE, never message text |
-| [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` and eager loading via `with()`, batched so N parent rows never issue more than one extra query per relation |
+| [Relations](relation.md) | `hasMany`/`hasOne`/`belongsTo` a relation the compiler loads when you read it (explicit `with()` where it cannot trace the read), batched so N parent rows never issue more than one extra query per relation |
 | [Many-to-many](manytomany.md) | `@manyToMany` and `Repo<T>.link`/`unlink` on the join table |
 | [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withDeleted`/`restore`/`forceDelete` opt in |
 | [Row locking](locking.md) | `tx.table<T>().lock(mode)`/`LockMode`: `Update` blocks until a row is free, `SkipLocked`/`NoWait` return or fail immediately instead of waiting, only reachable from inside a transaction |
