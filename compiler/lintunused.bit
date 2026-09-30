@@ -159,6 +159,7 @@ fn lintAnalyzeUnused(tree: Tree, src: string, file: int, sm: SourceManager): Lin
   let mod = resolveModule(resolveDiags, m, stubs.mods, -1, false, true)
   let used = computeUsedSymbols(mod, collectWriteOnlyNodes(tree))
   markJsxDesugarUses(tree, src, mod, used)
+  markUnwalkedUses(tree, src, mod, used)
   return LintUnusedAnalysis{ mod = mod, used = used }
 }
 
@@ -201,6 +202,132 @@ fn jsxWordListHas(words: []string, name: string): bool {
     }
   }
   return false
+}
+
+// #6096, #6106, #6340: three parser-produced reference sites `resolveModule`
+// (this file's single-file stub-import resolve) never walks, so an import
+// consumed ONLY there never reaches `nodeSymbols` even though `bit check`
+// counts it as a real use. Same "text says used, `nodeSymbols` says not" gap
+// `markJsxDesugarUses` closes above, same lint-local fix shape: collect the
+// reference names by TEXT and mark every import bound to one of them.
+//
+//  - A field attribute (`@minLen(3)`, `@rule(onDelete = Cascade)`) is sugar
+//    for a call `minLen(this.name, 3)?` spliced in by classfieldattr.bit's
+//    `injectFieldValidators`, which only the full project pipeline
+//    (checkproject.bit's `resolveProject`) runs. The attribute's own name and
+//    every identifier in its arguments are references. Class and function
+//    attributes (`@json`, `@naked`, `@symbol`) name compiler-known marks, not
+//    imports, so only a `Tag.Field`'s attribute list counts.
+//  - A field's default value (`name: string = defaultName`) is checked by
+//    validateassign.bit's own constant folder, never by resolvebody.bit's
+//    `rResolveStructDecl`, which reads only the field's type kid.
+//  - A `trait { }` declaration is collected into the flat namespace by
+//    `rCollectTopDecl` but has no case in `rResolveTopDeclBody`
+//    (resolvebody.bit): its method signatures, bodies and field types are
+//    never walked, and neither is a `use Trait` statement's name list. What
+//    `bit check` type-checks is a USING class's own copy, spliced in by
+//    checktraitinject.bit's `cloneTraitMethod` before resolve runs. A real
+//    `Tag.TraitDecl` case in the shared resolver was tried and reverted: a
+//    trait body may name `Self` (substituted only at clone time) or a rejected
+//    `<T>` (E0021, dropped by the parser), and resolving either as an ordinary
+//    name added a second `E0040` beside the one `error_trait_decl_generics.bit`
+//    and `check_trait_generic_params.bit` pin.
+//
+// A name that is a declaration slot rather than a reference (a field's or a
+// trait method's own name, `.member`, a named argument's label) is skipped, so
+// a same-named import stays flagged. A local that shadows an import inside one
+// of these regions still counts the import as used: the walk is by text, so
+// it errs toward silence, never toward a false E0210.
+fn markUnwalkedUses(tree: Tree, source: string, mod: Module, used: []bool) {
+  let names = map<string, bool>{}
+  let i = 1
+  while (i < len(tree.nodes)) {
+    let tag = getNode(tree, i).tag
+    if (tag == Tag.TraitMethod) {
+      collectRefKids(tree, source, i, 1, names)
+    } else if (tag == Tag.UseStmt) {
+      collectRefKids(tree, source, i, 0, names)
+    } else if (tag == Tag.Field) {
+      collectFieldRefs(tree, source, i, names)
+    }
+    i = i + 1
+  }
+  i = 1
+  while (i < len(mod.symbols)) {
+    let s = mod.symbols[i]
+    let (_, referenced) = names[s.name]
+    if ((s.kind == SymbolKind.ImportItem || s.kind == SymbolKind.ImportNamespace) && referenced) {
+      used[i] = true
+    }
+    i = i + 1
+  }
+}
+
+// A `Tag.Field` is `[name, type, default_or_none, attrs_or_none]`: the type
+// and default are ordinary expressions/types (kid 0, the name, is a
+// declaration), the fourth kid is the attribute list.
+fn collectFieldRefs(tree: Tree, source: string, field: int, out: map<string, bool>) {
+  let k = kidsOf(tree, field)
+  let i = 1
+  while (i < len(k)) {
+    if (i == 3) {
+      collectAttrRefs(tree, source, k[i], out)
+    } else {
+      collectRefTexts(tree, source, k[i], out)
+    }
+    i = i + 1
+  }
+}
+
+// Every attribute in a `Tag.AttrList` (`0` when the field carries none):
+// `[name, arg...]`, the name a reference and each argument an expression.
+fn collectAttrRefs(tree: Tree, source: string, list: int, out: map<string, bool>) {
+  if (list == 0) {
+    return
+  }
+  let attrs = kidsOf(tree, list)
+  let i = 0
+  while (i < len(attrs)) {
+    let k = kidsOf(tree, attrs[i])
+    out[identText(tree, source, k[0])] = true
+    collectRefKids(tree, source, attrs[i], 1, out)
+    i = i + 1
+  }
+}
+
+// `collectRefTexts` over `node`'s kids from index `first` on.
+fn collectRefKids(tree: Tree, source: string, node: int, first: int, out: map<string, bool>) {
+  let kids = kidsOf(tree, node)
+  let i = first
+  while (i < len(kids)) {
+    collectRefTexts(tree, source, kids[i], out)
+    i = i + 1
+  }
+}
+
+// Every identifier text reachable from `node` that resolve.bit's own
+// `rResolveNode` would treat as a reference: a `Member`'s or `QualType`'s name
+// and a `FieldInit`'s or `NamedArg`'s label are not (only kid 0 / kid 1
+// respectively is). `node == 0` (an absent optional kid) is a no-op. Bounded
+// by the tree's own depth, like every other whole-subtree walk in this file.
+fn collectRefTexts(tree: Tree, source: string, node: int, out: map<string, bool>) {
+  if (node == 0) {
+    return
+  }
+  let tag = getNode(tree, node).tag
+  if (tag == Tag.Ident) {
+    out[identText(tree, source, node)] = true
+    return
+  }
+  if (tag == Tag.Member || tag == Tag.QualType) {
+    collectRefTexts(tree, source, kidsOf(tree, node)[0], out)
+    return
+  }
+  if (tag == Tag.FieldInit || tag == Tag.NamedArg) {
+    collectRefTexts(tree, source, kidsOf(tree, node)[1], out)
+    return
+  }
+  collectRefKids(tree, source, node, 0, out)
 }
 
 // E0210: an import binding (`ImportItem` or `ImportNamespace`) with no read
