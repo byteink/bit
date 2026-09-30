@@ -243,10 +243,12 @@
 #
 # #6045-closure-tuple-oracle-declines (`ir`/`iropt`, ONE file): the 0.33.0
 # oracle has #6045's bug (a closure returning two values into a generic call
-# fails to lower, E0092), so it emits no IR at all for
+# fails to lower, E0092) and its --dump-ir swallows that error: for
 # _tests_/cases/run_closure_multival_return_generic_call.bit, the fixture
-# proving the fix. Explained only for that file, only when the oracle dump is
-# empty and the tree's is not. Retires at the 0.34.0 repin.
+# proving the fix, it drops the functions it could not lower and emits the
+# broken closure with a valueless return. Explained only for that file, only
+# when every oracle function header is kept and the tree has more functions.
+# Retires at the 0.34.0 repin.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags>
 # Prints the name of the registered signature that explains the divergence
@@ -478,6 +480,19 @@ explainMismatch() {
     # Every oracle line appears in the tree in order, and every tree-only
     # line belongs to an inserted `func` block. Only declared for the one
     # corpus file that exercises it.
+    # funcHeadersKept (#6045) -- every oracle `func` header line is present in
+    # the tree, and the tree has more functions than the oracle. Bodies may
+    # differ: the oracle lowers the broken closure to an empty-valued return.
+    function funcHeadersKept(nA, linesA, nB, linesB,    i, j, seen, na, nb) {
+      na = 0; nb = 0
+      for (j = 1; j <= nB; j++) { if (linesB[j] ~ /^func /) { seen[linesB[j]] = 1; nb++ } }
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] !~ /^func /) { continue }
+        na++
+        if (!(linesA[i] in seen)) { return 0 }
+      }
+      return (na > 0 && nb > na) ? 1 : 0
+    }
     function pureFuncInsert(nA, linesA, nB, linesB,    i, j, infn, inserted) {
       i = 1; j = 1; infn = 0; inserted = 0
       while (j <= nB) {
@@ -542,7 +557,7 @@ explainMismatch() {
         if (file ~ /run_generic_closure_over_bound_self_static[.]bit$/ && pureFuncInsert(nA, linesA, nB, linesB)) {
           print "6265-closure-bound-static-insert"; exit 0
         }
-        if (file ~ /run_closure_multival_return_generic_call[.]bit$/ && (nA == 0 || (nA == 1 && linesA[1] == "")) && nB > 1) {
+        if (file ~ /run_closure_multival_return_generic_call[.]bit$/ && funcHeadersKept(nA, linesA, nB, linesB)) {
           print "6045-closure-tuple-oracle-declines"; exit 0
         }
       }
