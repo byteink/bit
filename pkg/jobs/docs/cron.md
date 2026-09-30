@@ -289,12 +289,15 @@ message, for what would otherwise misbehave hours later:
 ```text
 jobs: Options.pollInterval must be positive, got 0
 jobs: Options.visibilityTimeout must be positive, got -1
+jobs: the locker keeps 0 lease row(s) per schedule; it must keep at least 1 (newPostgresLocker(keep = ...))
 jobs: Missed.RunAll cap must be at least 1, got 0
 jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise newPostgresLocker(keep = ...)
 jobs: schedule 'nightly-digest|0 2 * * *|UTC' registered after start(); register schedules before start() or run()
 ```
 
-A zero `pollInterval` would spin the workers and the scheduler; a `RunAll` cap
+A zero `pollInterval` would spin the workers and the scheduler; a locker that
+keeps no lease rows (`newPostgresLocker(db, keep = 0)`) would forget every tick
+it wins, so `open` refuses it instead of quietly keeping one; a `RunAll` cap
 below 1 would drop ticks that are on time; a schedule registered after
 `start()` or `run()` would never be seen by the scheduler already running.
 Register every schedule right after `open`, before either call.
