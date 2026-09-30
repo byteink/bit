@@ -27,6 +27,9 @@ package; it does not restate this.
 
 `tools/build/` discovers packages from the filesystem: one `test-package-<name>`
 step per directory, plus `test-packages` for all of them. Nothing to register.
+Both run `bit test` at `BIT_WORKERS=4`: the runtime boots one worker by default,
+where two tasks never run at once and a race test passes without racing. A
+race test in a package must fail, not skip, below two workers.
 
 | the diff touches | what runs |
 |---|---|
