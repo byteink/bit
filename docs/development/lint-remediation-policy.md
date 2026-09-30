@@ -397,37 +397,14 @@ documented safe form - see compiler/linttx.bit's own header).
 `warn`, same as E0214 and everything else in this file - `bit lint`'s exit
 code is what a CI gate reads, never `bit build`'s.
 
-## E0218 `relation-unloaded-read` - NOT REMEDIATION DEBT, NOT A DEFAULT ERROR
+## E0218 `relation-unloaded-read` - RETIRED
 
-> `'${var}.${field}' reads relation field '${field}' on '${class}' with no
-> preceding '.with("${field}")' in this function`
-
-Added alongside `compiler/lintrelation.bit`, this is the compile-time half
-of the unloaded-relation runtime panic on the same misuse - the two are meant
-to be recognisable as the same mistake, so their wording agrees on naming the
-class, the field, and the exact `.with("field")` call that is missing.
-Scoped narrowly, on purpose: it only sees a local bound straight from a
-function literally named `find`, called with `<T>` written as an explicit
-type argument (needing no type inference the resolver cannot give it - see
-the file's own header), optionally chained through that value's other
-non-failable builder methods and `.with("field")` links, terminated by
-`.oneOrFail()`. It flags a read of that local's
-relation field, per `compiler/classrelationattr.bit`'s compiler-known
-predicate, later in the SAME function and not among the fields a
-`.with("field")` link already chained onto that same binding.
-
-**Covers `@hasMany`, `@hasOne` and `@belongsTo` alike.** The predicate this
-rule asks is the field's compiler-known relation attribute, never the
-field's own `[]T`/class-typed shape. This matters most for `@hasOne`/
-`@belongsTo`: the runtime sentinel only encodes "unloaded" for a `[]T`
-(`@hasMany`) field's zero value - a `@hasOne`/`@belongsTo` target is
-class-typed with no zero value that can carry it, so the runtime panic never
-fires for those two kinds (pkg/orm/relation.bit's own header). E0218 is
-their only protection, compile-time or run-time.
-
-Like E0217, there is no legacy debt to disposition:
-`grep -c '^warning\[E0218\]' "$LOG"` against `compiler` and `stdlib` is 0 at
-landing and is expected to stay 0.
-
-**Not added to any default-error escalation.** Severity=1 (warning) through
-`warn`, same as every other rule in this file.
+Was the compile-time half of the unloaded-relation runtime panic, scoped to
+a local bound straight from a function literally named `find<T>(...)`,
+chained through `.with("field")` links and terminated by `.oneOrFail()`.
+#6296 removed that API, so the rule fired on nothing. Retired rather than
+re-anchored: the compile-time build error E0300
+(`compiler/relationautoerr.bit`, epic #6298) now catches the same misuse
+before it compiles, for `@hasMany`/`@hasOne`/`@belongsTo` alike, without
+this rule's narrow chain-shape requirement. The code is never reused for a
+different rule (spec/LINT.md §4.4).
