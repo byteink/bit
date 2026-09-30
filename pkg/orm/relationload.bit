@@ -31,6 +31,49 @@
 
 const relationLoadChunk: int = 1000
 
+// A dotted `.with("author.posts")` path may nest at most this many levels
+// (#6318) — `pkg/orm/reporelations.bit`'s own `repoWith` asserts it ONCE,
+// before the path is queued, which bounds every recursive
+// `dispatchLoadRelation`/`RelationLoader` call this same string reaches
+// afterward (each strips at least one segment, so the recursion depth can
+// never exceed the segment count checked here) without re-checking at each
+// level. Real schemas bottom out in 2-3 hops; this exists only so a
+// pathological or cyclic one (`"author.posts.author.posts..."`) cannot
+// recurse without limit.
+const relationMaxPathDepth = 8
+
+// `path`'s own leading segment and everything after its first `.` — `""`
+// for the trailing (or only) segment. `dispatchLoadRelation` peels one
+// segment off per level; a `RelationLoader` that finds `rest` non-empty
+// recurses into its own `TChild`/`TParent`'s `__loadRelation` with it,
+// peeling the NEXT segment off in turn (`relation.bit`'s own header) — so
+// nesting to any depth needs no mechanism beyond this one split, called
+// once per level.
+fn relationSplitPath(path: string): (string, string) {
+  let i = 0
+  while (i < len(path)) {
+    if (path[i] == '.') {
+      return (path[0:i], path[i + 1:len(path)])
+    }
+    i = i + 1
+  }
+  return (path, "")
+}
+
+// The number of dot-separated segments in `path` — `repoWith`'s own bound
+// (#6318's own header, above).
+fn relationPathDepth(path: string): int {
+  let n = 1
+  let i = 0
+  while (i < len(path)) {
+    if (path[i] == '.') {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
 // One query per `relationLoadChunk`-sized chunk of `ids`, against `TChild`'s
 // own table, filtered by `TChild`'s Bit field named `keyField` (resolved to
 // its SQL column through `columnName`, never assumed to equal the Bit
@@ -146,13 +189,18 @@ fn relationFieldInt<T: Tabled>(r: T, fieldName: string): i64! {
 // one of these per `@hasMany`/`@hasOne`/`@belongsTo` field, so nothing here
 // or in the synthesized caller ever loops over `T`'s fields generically.
 
-// The `hasMany` side: `TParent`'s relation field is `[]TChild`.
+// The `hasMany` side: `TParent`'s relation field is `[]TChild`. `rest`
+// (#6318) is the dotted path past THIS relation's own segment — non-empty
+// only when a caller wrote `.with("thisField.more")` — recursed on the
+// FLAT, already-loaded `children` (every `TChild` row this level fetched,
+// across every parent), so the further load is still one batched query,
+// never one per parent.
 export fn hasManyRelation<TParent: Tabled, TChild: Tabled>(
   parentKeyOf: (TParent) => i64,
   childForeignKey: string,
   assign: (TParent, []TChild) => (),
 ): RelationLoader<TParent> {
-  let loader: RelationLoader<TParent> = (db, parents) => {
+  let loader: RelationLoader<TParent> = (db, parents, rest) => {
     if (len(parents) == 0) {
       return
     }
@@ -165,17 +213,22 @@ export fn hasManyRelation<TParent: Tabled, TChild: Tabled>(
     for p of parents {
       assign(p, grouped[parentKeyOf(p)])
     }
+    if (rest != "") {
+      TChild.__loadRelation(db, rest, children)?
+    }
   }
   return loader
 }
 
-// The `hasOne` side: `TParent`'s relation field is a single `TChild`.
+// The `hasOne` side: `TParent`'s relation field is a single `TChild`. `rest`
+// (#6318): see `hasManyRelation`'s own header — identical shape, recursed on
+// the same flat `children` list this level already fetched.
 export fn hasOneRelation<TParent: Tabled, TChild: Tabled>(
   parentKeyOf: (TParent) => i64,
   childForeignKey: string,
   assign: (TParent, TChild) => (),
 ): RelationLoader<TParent> {
-  let loader: RelationLoader<TParent> = (db, parents) => {
+  let loader: RelationLoader<TParent> = (db, parents, rest) => {
     if (len(parents) == 0) {
       return
     }
@@ -191,18 +244,23 @@ export fn hasOneRelation<TParent: Tabled, TChild: Tabled>(
         assign(p, vs[0])
       }
     }
+    if (rest != "") {
+      TChild.__loadRelation(db, rest, children)?
+    }
   }
   return loader
 }
 
 // The `belongsTo` side: `TChild`'s relation field is the single `TParent` it
 // points at. Queries the TARGET's own `@id` field generically
-// (`relationIdField`) — never assumed to be named "id".
+// (`relationIdField`) — never assumed to be named "id". `rest` (#6318): see
+// `hasManyRelation`'s own header — recursed on the flat `parents` list this
+// level already fetched.
 export fn belongsToRelation<TChild: Tabled, TParent: Tabled>(
   childForeignKeyOf: (TChild) => i64,
   assign: (TChild, TParent) => (),
 ): RelationLoader<TChild> {
-  let loader: RelationLoader<TChild> = (db, children) => {
+  let loader: RelationLoader<TChild> = (db, children, rest) => {
     if (len(children) == 0) {
       return
     }
@@ -219,24 +277,34 @@ export fn belongsToRelation<TChild: Tabled, TParent: Tabled>(
         assign(c, vs[0])
       }
     }
+    if (rest != "") {
+      TParent.__loadRelation(db, rest, parents)?
+    }
   }
   return loader
 }
 
-// The compiler-synthesized `__loadRelation`'s own tail: looks `name` up in
-// the class's own relation table (one `RelationLoader<T>` per
-// `@hasMany`/`@hasOne`/`@belongsTo` field, built with the three constructors
-// above) and runs it — an unknown name fails naming the class, the same
-// backstop `compiler/checkormquery.bit`'s literal check (#6271's `with`
-// rule) sits in front of at compile time.
+// The compiler-synthesized `__loadRelation`'s own tail: looks `name`'s own
+// FIRST dotted segment up in the class's own relation table (one
+// `RelationLoader<T>` per `@hasMany`/`@hasOne`/`@belongsTo` field, built
+// with the three constructors above) and runs it, handing it whatever comes
+// after that segment (#6318: `relationSplitPath`) — an unknown first
+// segment fails naming the class, the same backstop
+// `compiler/checkormquery.bit`'s literal check (#6271/#6318's `with` rule)
+// sits in front of at compile time. `T`'s own relation table only ever has
+// entries for its OWN direct fields, never a nested one, so only the first
+// segment is ever looked up here — recursion past it happens inside the
+// loader itself, against the target class's own table
+// (`hasManyRelation`/`hasOneRelation`/`belongsToRelation`'s own headers).
 export fn dispatchLoadRelation<T: Tabled>(
   db: Data, name: string, rows: []T, specs: map<string, RelationLoader<T>>,
 ): []T! {
-  let (loader, ok) = specs[name]
+  let (first, rest) = relationSplitPath(name)
+  let (loader, ok) = specs[first]
   if (!ok) {
-    fail newError("orm: '${T.__tableName()}' has no relation named '${name}'")
+    fail newError("orm: '${T.__tableName()}' has no relation named '${first}'")
   }
-  loader(db, rows)?
+  loader(db, rows, rest)?
   return rows
 }
 
