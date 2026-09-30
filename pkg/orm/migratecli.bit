@@ -1,0 +1,193 @@
+// pkg/orm/migratecli.bit — migrateMain(files, args): int (O3b, #6310): the
+// `bit migrate` / `bit migrate rollback` / `bit migrate status` entry point
+// O4 (#6313)'s generated `.bit/cmd/migrate/main.bit` calls, one line:
+//
+//   fn main(): int {
+//     return migrateMain(registry(), args())
+//   }
+//
+// `args` IS EXACTLY `std/os.args()` — index 0 is the program's own path
+// (`stdlib/os/os.bit`'s own doc: "args()[0] being the program name") and is
+// never inspected here; index 1 onward is the subcommand, if any, and
+// `--url <value>`, in either order:
+//
+//   bit migrate                       // args() = [prog]                        -> migrate
+//   bit migrate rollback              // args() = [prog, "rollback"]            -> rollback
+//   bit migrate status --url URL      // args() = [prog, "status", "--url", URL]
+//
+// NEVER THE DATABASE URL, ON ANY PATH — SUCCESS OR ERROR. `Datasource.uri`
+// (`stdlib/sql/config.bit`) may carry a password, so no line this file
+// prints ever includes it, and no error message echoes a raw argument
+// either: an unrecognized token could itself BE a stray URL a caller typed
+// instead of using `--url`.
+//
+// THE DISPATCH LAYER (`runMigrate`/`runRollback`/`runStatus` below) TAKES
+// AN ALREADY-OPEN `Data` + `RunnerDialect` — the identical shape
+// `runner.test.bit`'s `rnExecutor` already exercises `migrate`/`rollback`
+// through. `migratecli.test.bit` reuses that fake rather than opening a
+// real connection, so this file's own tests need no live database
+// (`./make test-package-orm`, not `-orm-live`). Only `migrateMain` itself —
+// the URL/subcommand wiring — ever calls the real `open`.
+// `env as osEnv`: `testenv.test.bit` already binds the bare name `env`
+// (test-file-only visible, SPEC §17.1), and a duplicate declaration is
+// E0042 regardless of which file is test-only — aliasing here, not there,
+// keeps the fix inside this file.
+import { env as osEnv } from "std/os"
+import { stderr } from "std/io"
+
+// `parseArgs`'s own result: the subcommand ("" migrate | "rollback" |
+// "status") and the raw `--url` value, if any ("" when absent — resolving
+// what URL to actually use, including the `DATABASE_URL` fallback, is
+// `resolveUrl`'s job below, not this parse step's).
+class cliArgs {
+  sub: string,
+  url: string,
+}
+
+export fn migrateMain(files: []MigrationFile, args: []string): int {
+  let parsed = parseArgs(args) catch e {
+    return reportErr(e.message())
+  }
+  let url = resolveUrl(parsed.url, osEnv("DATABASE_URL")) catch e {
+    return reportErr(e.message())
+  }
+  let conn = open(url) catch _ {
+    return reportErr("pkg/orm: migrate: could not connect to the database")
+  }
+  defer conn.pool.close()
+  let dialect = RunnerDialect{ render = renderDialectFor(url), server = conn.dialect }
+  let lines = dispatch(conn.pool, dialect, parsed.sub, files) catch e {
+    return reportErr(e.message())
+  }
+  for line of lines {
+    println(line)
+  }
+  return 0
+}
+
+// `args[1:]` (`args[0]` is the program name, this file's own header) into a
+// subcommand and an optional `--url` value. Never echoes an unrecognized
+// token back (this file's header) — every failure names only what it
+// expected, never what it got.
+fn parseArgs(args: []string): cliArgs! {
+  let sub = ""
+  let url = ""
+  let i = 1
+  while (i < len(args)) {
+    let a = args[i]
+    if (a == "--url") {
+      if (i + 1 >= len(args)) {
+        fail newError("pkg/orm: migrate: --url requires a value")
+      }
+      url = args[i + 1]
+      i = i + 2
+      continue
+    }
+    if (sub != "") {
+      fail newError("pkg/orm: migrate: too many arguments")
+    }
+    if (a != "rollback" && a != "status") {
+      fail newError("pkg/orm: migrate: unknown subcommand (want migrate, rollback or status)")
+    }
+    sub = a
+    i = i + 1
+  }
+  return cliArgs{ sub = sub, url = url }
+}
+
+// `flagUrl` (`--url`), else `envUrl` (the caller's own `DATABASE_URL`
+// read — kept OUT of this function so it stays a pure decision over two
+// already-read strings, testable with no real environment variable
+// involved: `migratecli.test.bit`'s "--url wins over DATABASE_URL" proof).
+// Fails naming both sources when neither is set — never a default.
+fn resolveUrl(flagUrl: string, envUrl: string): string! {
+  if (flagUrl != "") {
+    return flagUrl
+  }
+  if (envUrl != "") {
+    return envUrl
+  }
+  fail newError("pkg/orm: migrate: no database URL: pass --url or set DATABASE_URL")
+}
+
+// The `Dialect` DDL renderer matching `open`'s own scheme sniff (`db.bit`'s
+// `dialectFor`, unreachable from here since it returns `ServerDialect`, not
+// a renderer). `open`'s own `Db` hands back only `ServerDialect` (read here
+// as `conn.dialect` in `migrateMain`), never the renderer `migrate`/
+// `rollback` also need, so this file derives it from the same URL by the
+// same rule. `hasPrefix` is already bound package-wide by `foreignkey.bit`'s
+// own import — a second import of it here would be E0042 (SPEC §17.1).
+fn renderDialectFor(url: string): Dialect {
+  if (hasPrefix(url, "mysql://")) {
+    return Mysql{}
+  }
+  return Postgres{}
+}
+
+fn dispatch(db: Data, dialect: RunnerDialect, sub: string, files: []MigrationFile): []string! {
+  if (sub == "rollback") {
+    return runRollback(db, dialect, files)?
+  }
+  if (sub == "status") {
+    return runStatus(db, files)?
+  }
+  return runMigrate(db, dialect, files)?
+}
+
+// One `applied <name>` line per migration `migrate` actually ran, in the
+// order it ran them.
+fn runMigrate(db: Data, dialect: RunnerDialect, files: []MigrationFile): []string! {
+  let report = migrate(db, dialect, files, now())?
+  let lines = []string(0)
+  for a of report.applied {
+    lines = append(lines, "applied ${a.name}")
+  }
+  return lines
+}
+
+// One `rolled back <name>` line per migration `rollback` actually
+// reverted, newest file first — `rollback`'s own order (`runner.bit`).
+fn runRollback(db: Data, dialect: RunnerDialect, files: []MigrationFile): []string! {
+  let report = rollback(db, dialect, files)?
+  let lines = []string(0)
+  for r of report.reverted {
+    lines = append(lines, "rolled back ${r.name}")
+  }
+  return lines
+}
+
+// One line per file in `files`' own order: `applied  <name>  batch <n>` or
+// `pending  <name>`.
+fn runStatus(db: Data, files: []MigrationFile): []string! {
+  ensureHistoryTable(db)?
+  let history = loadHistory(db)?
+  let lines = []string(0)
+  for f of files {
+    let batch = batchFor(history, f.name)
+    if (batch > 0) {
+      lines = append(lines, "applied  ${f.name}  batch ${batch}")
+    } else {
+      lines = append(lines, "pending  ${f.name}")
+    }
+  }
+  return lines
+}
+
+// `history`'s recorded batch for `name`, or 0 — `maxBatch`'s own sentinel
+// (`history.bit`): a real batch starts at 1, `migrate`'s own `max+1`.
+fn batchFor(history: []HistoryEntry, name: string): int {
+  for h of history {
+    if (h.migration == name) {
+      return h.batch
+    }
+  }
+  return 0
+}
+
+// Writes `msg` to stderr (best effort — a failing stderr write must never
+// mask the real failure already being reported) and always returns 1, the
+// process exit code for every error path `migrateMain` has.
+fn reportErr(msg: string): int {
+  stderr().writeLine(msg) catch _ {}
+  return 1
+}
