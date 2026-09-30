@@ -138,6 +138,19 @@ deploy that removed a handler - it goes straight to the dead-letter list
 with the reason `no handler registered for '<name>'`, rather than being
 retried forever or dropped silently.
 
+## Sharp edge: bad options fail in `open`
+
+`open` checks the options before it returns a queue: `workers`,
+`pollInterval` and `visibilityTimeout` must all be positive. A zero
+`pollInterval` would make every idle worker spin on the store, so it fails
+at startup and names the value:
+
+```text
+jobs: Options.pollInterval must be positive, got 0
+```
+
+Leave a field out to get its default (4 workers, 500 ms, 30 s).
+
 ## Sharp edge: a panic is a failure, not a crash
 
 A handler that panics does not take the worker down. The panic is caught
