@@ -21,6 +21,15 @@
 // no `Locker` nothing durable exists: a schedule then starts at the first
 // tick after "now" and `Missed` covers only this scheduler's own stalls.
 //
+// A CLOCK THAT MOVES BACK CANNOT FREEZE A SCHEDULE (#6362). `next` only
+// moves forward, so a wall clock reset to the past, or a schedule registered
+// or synced under a clock that was ahead, would leave `next` years in the
+// future with nothing firing. Every pass `checkClock` compares `next` with
+// the first tick after now; a gap of `scheduleClockBackStep` (Vixie cron's
+// three hours) or more re-anchors the schedule at that tick, a smaller one
+// waits, and a `Locker.lastTick` that far in the future is ignored. Each of
+// these is logged, once.
+//
 // NO BUSY-WAIT: the loop sleeps until the earliest due tick, at most one
 // `pollInterval` at a time so `stop()` is never delayed longer than that.
 
@@ -63,12 +72,24 @@ class entry {
   fire: (int) => ()!,
   // True once `next` has been reconciled with the Locker's last tick.
   synced: bool,
+  // The `next` for which no note is owed: a clock that stepped back by less
+  // than `scheduleClockBackStep` leaves `next` ahead and is logged once per
+  // `next`, not on every pass (`checkClock`).
+  noted: int,
 }
 
 // A schedule whose first tick is the first one strictly after "now".
 fn newEntry(id: string, trig: trigger, missed: Missed, fire: (int) => ()!, clock: Clock): entry! {
   let first = trig.nextAfterNs(clock.nowNs())?
-  return entry{ id = id, trig = trig, missed = missed, next = first, fire = fire, synced = false }
+  return entry{
+    id = id,
+    trig = trig,
+    missed = missed,
+    next = first,
+    fire = fire,
+    synced = false,
+    noted = first,
+  }
 }
 
 // Registers `e`, refusing a duplicate: two identical schedules share one
@@ -119,18 +140,48 @@ fn fireTick(q: Queue, e: entry, tick: int, nowNs: int): ()! {
 // Moves `e.next` to the first tick after the newest one the fleet has
 // already enqueued, once per process. Ticks between that and "now" are then
 // due like any stall's. A failure leaves `synced` false, so the next pass
-// retries before `e` fires anything on a stale `next`.
-fn syncEntry(q: Queue, e: entry): ()! {
+// retries before `e` fires anything on a stale `next`. A last tick more than
+// `scheduleClockBackStep` after `nowNs` was written by an instance whose clock
+// was ahead: it is logged and ignored, or `e` would wait for it, not fire.
+fn syncEntry(q: Queue, e: entry, nowNs: int): ()! {
   if (e.synced) {
     return
   }
   if (q.locker != nil) {
     let last = q.locker.lastTick(e.id)?
-    if (last > 0) {
+    if (last - nowNs > scheduleClockBackStep) {
+      eprint(lastTickIgnoredMessage(e.id, last, last - nowNs))
+    } else if (last > 0) {
       e.next = e.trig.nextAfterNs(last)?
     }
   }
   e.synced = true
+}
+
+// Reconciles `e.next` with a clock that stepped back (an RTC reset, NTP
+// correcting a clock that ran ahead, a schedule registered under a clock
+// that was ahead). While the clock only moves forward `e.next` is never after
+// the first tick following `nowNs`; when it is, the clock moved back past at
+// least one tick. A step of `scheduleClockBackStep` or more is a correction:
+// `e` is re-anchored to the first tick after `nowNs`. A smaller one re-runs
+// nothing and `e` waits. Both return the line to log, "" when none is owed.
+fn checkClock(e: entry, nowNs: int): string! {
+  let expected = e.trig.nextAfterNs(nowNs)?
+  let gap = e.next - expected
+  if (gap <= 0) {
+    return ""
+  }
+  if (gap >= scheduleClockBackStep) {
+    let was = e.next
+    e.next = expected
+    e.noted = expected
+    return clockBackMessage(e.id, was, gap, true, expected)
+  }
+  if (e.noted == e.next) {
+    return ""
+  }
+  e.noted = e.next
+  return clockBackMessage(e.id, e.next, gap, false, expected)
 }
 
 // Handles every tick of `e` due at `nowNs`, per `planCatchUp`: the work is the
@@ -156,7 +207,11 @@ fn handleDue(q: Queue, e: entry, nowNs: int): ()! {
 }
 
 fn runEntry(q: Queue, e: entry, nowNs: int): ()! {
-  syncEntry(q, e)?
+  syncEntry(q, e, nowNs)?
+  let note = checkClock(e, nowNs)?
+  if (note != "") {
+    eprint(note)
+  }
   if (e.next <= nowNs) {
     handleDue(q, e, nowNs)?
   }

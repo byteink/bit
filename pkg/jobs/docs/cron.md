@@ -213,6 +213,32 @@ A schedule that never fired starts at its first tick after the app starts, and
 without a `Locker` there is nothing to read, so a restart starts each
 schedule at its first tick after it starts.
 
+### A clock that moves back
+
+The same device can be wrong in the other direction: its clock ran ahead, and
+something corrects it. A schedule is only ever moved forward, so one whose next
+tick was computed under the wrong clock would wait years for it. Every pass the
+scheduler compares the schedule's next tick with the first tick after the clock
+as it reads now, and acts on the gap:
+
+```text
+gap of 3 hours or more   the clock was corrected: the schedule is moved to
+                         the first tick after now, and the move is logged
+gap under 3 hours        a small step, like a daylight saving change: nothing
+                         runs twice, the schedule waits for its next tick, and
+                         the step is logged once
+```
+
+Three hours is Vixie cron's threshold: `man 8 cron` says "Time changes of more
+than 3 hours are considered to be corrections to the clock or the timezone,
+and the new time is used immediately." Nothing is caught up after a correction:
+the ticks between the old and the new time belong to a clock that was wrong.
+A schedule registered at a clock four years ahead and corrected a minute later
+fires at its first tick after the correction. A `Locker` whose newest tick is
+more than three hours ahead of the clock was written by an instance whose own
+clock was ahead; the scheduler ignores that tick at start, logs it, and begins
+at the first tick after now.
+
 ## The real use case: three copies of the app
 
 With three instances, all three reach 02:00 together. Give each a `Locker`
