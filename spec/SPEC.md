@@ -1794,9 +1794,9 @@ class SendWelcome { userId: i64 }
   runs. `@collection` on a class that does not also carry `@json` is
   **E0175** - the method it names is never synthesized without `@json`.
 - **The default name is snake_case of the class name, never pluralized**:
-  `User -> user`, `OrderLine -> order_line` (`.claude/kb/data-packages-dx.md`
-  rule 3) - the same conversion `pkg/orm`'s own table-name default uses,
-  minus that package's pluralization, which kv's target API drops.
+  `User -> user`, `OrderLine -> order_line` - the same conversion `pkg/orm`'s
+  own table-name default uses, minus that package's pluralization, which
+  kv's target API drops.
 - **`__collectionName` is a reserved name on every class, `@json` or not.** A
   class that declares a method by this name is **E0176** - the same rule,
   for the same reason, `__jobName`'s own reservation (E0168) above is: a
