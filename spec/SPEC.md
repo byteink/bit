@@ -5282,6 +5282,58 @@ or any other resolution step. This includes `"link"` (above): a fetched
 dependency's own `bit.json` may contain a `"link"` array, but only the
 project's own root manifest's `"link"` entries are ever linked.
 
+**Package commands.** A direct dependency's `cmd/<w1>/<w2>/.../main.bit`
+directory extends `bit`'s own subcommand set by convention - no `bit.json`
+key names it. `pkg/orm/cmd/migrate/main.bit` provides `bit migrate`;
+`pkg/orm/cmd/make/migration/main.bit` provides `bit make migration`. Only a
+project's DIRECT dependencies (the keys of its own `bit.json`
+`"dependencies"` map) contribute commands; a transitive dependency's `cmd/`
+directory is never consulted.
+
+A `cmd/<...>/` directory provides a command by holding `main.bit`, `gen.bit`,
+or both - a command whose `main.bit` is entirely generated (below) ships
+only `gen.bit`.
+
+`bit`'s own built-in subcommands always win: a package command is looked up
+only once every entry in `bit`'s own dispatch table has been tried and none
+matched the first argument. Among package commands, the LONGEST run of argv
+words that names an existing `cmd/<...>/` directory wins - `bit make migration
+foo` tries `cmd/make/migration/` before `cmd/make/`. Two
+direct dependencies shipping the identical command is a hard error naming
+both.
+
+The project root is the nearest ancestor of the current directory
+containing a `bit.json` (walking up). The command's `main.bit` is built
+against THAT project's `bit.lock` (this section's `lockRoot`), never the
+dependency's own - exactly like every other module the project imports.
+
+If a `gen.bit` sits beside `main.bit`, it is built and run FIRST, with the
+project root as its sole argument and as its own process's working
+directory; a nonzero exit stops here, before `main` is built at all. This is
+how `bit migrate` finds the project's `migrations/`: `gen.bit` is a small
+program that reads them and writes a fresh `.bit/cmd/migrate/main.bit`
+importing them, which is what actually gets built and run as `main` for
+this invocation. A dependency with no `gen.bit` builds `cmd/<...>/main.bit`
+directly, unchanged.
+
+The remaining argv - everything after the matched command words - is
+forwarded to `main` exactly as `bit run` forwards a program's own arguments;
+`main`'s stdin, stdout and stderr are the invoking `bit` process's own, and
+its exit code becomes `bit`'s own exit code.
+
+Built command binaries are cached under the project's own `.bit/` directory
+(`.bit/cmd/<w1>/<w2>/.../bin`), rebuilt only when a source file in
+`main.bit`'s own directory is newer than the cached binary - never inside a
+dependency's own tree, which may be a read-only, content-addressed cache
+shared by other projects. A project adds `.bit/` to its own `.gitignore`,
+the same as any other build output.
+
+This is the one place a dependency's own code runs without the project
+explicitly importing it - but it is still never automatic: it runs only
+when the project's own developer types the command by name, and only code
+already resolved through `bit.lock` (never an unlocked or unresolved
+dependency) is ever executed this way.
+
 ### 17.8 Documentation
 
 `bit doc [--json] [--fields] <module-dir>` prints a module's exported surface,
