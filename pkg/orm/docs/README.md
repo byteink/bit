@@ -17,7 +17,7 @@
 | [Many-to-many](manytomany.md) | `@manyToMany` and `Repo<T>.link`/`unlink` on the join table |
 | [Soft delete](softdelete.md) | `@softDelete`: `delete` marks a row instead of removing it, every ordinary read excludes it, `withDeleted`/`restore`/`forceDelete` opt in |
 | [Row locking](locking.md) | `tx.table<T>().lock(mode)`/`LockMode`: `Update` blocks until a row is free, `SkipLocked`/`NoWait` return or fail immediately instead of waiting, only reachable from inside a transaction |
-| [Apply migrations](migrate.md) | `up`/`status`/`sql`/`down`: applies a checked-in migration registry against a live database, one transaction per migration with the ledger row inside it, an advisory lock around the whole run |
+| [Apply migrations](migrate.md) | `bit make migration`/`bit migrate`/`bit migrate status`/`bit migrate rollback`: one file per migration under `migrations/`, applied against a live database in file-name order with no hand-written registry, one transaction per migration with the ledger row inside it, an advisory lock around the whole run |
 | [Check the schema in CI](check.md) | `check`: runs the identical diff `generate` runs and fails naming every disagreement, one line per line, instead of writing a file - column presence, type, and an enum column's CHECK drift |
 | [Sync your database automatically](sync.md) | `open(url, Options{ synchronize = true })`: adds any table or column your `@table` classes declare and the live database is missing, in any environment - never drops or renames, a removed field only warns |
 | [Testing](testing.md) | `withRollback`: run a test inside a transaction that always rolls back, even on success, so nothing it wrote is ever there to clean up; `make`/`create`/`Seq` build deterministic per-test rows |

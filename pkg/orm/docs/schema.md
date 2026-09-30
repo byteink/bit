@@ -44,6 +44,39 @@ This prints `people: 2 columns`. A dialect (not in this package - see
 "What this package does not do yet", below) will do the same kind of
 reading to produce DDL.
 
+## Inside a migration: `Schema`
+
+You rarely call `table`/`alter`/`drop` directly the way the two examples
+above do. A [migration](migrate.md)'s `up`/`down` methods each take a
+`Schema` instead, and call its `create`/`table`/`drop` methods - Laravel's
+own `Schema::create`/`Schema::table`/`Schema::drop` names. Each one wraps
+exactly the free function above and collects the result, so the tree it
+builds is identical either way:
+
+```bit
+import { Schema } from "orm"
+
+export class CreatePeople {
+  up(s: Schema): ()! {
+    s.create("people", (t) => {
+      t.id()
+      t.string("name", 100)
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("people")?
+  }
+}
+```
+
+`s.create` is `Schema.create` calling `table(...)` above and appending the
+result to `s.ops`; `s.table` calls `alter(...)` the same way, for changes
+to a table that already exists. The rest of this page keeps using the free
+functions directly, since that is the shortest way to show the tree each
+one builds - inside a real migration file, reach for `s.create`/`s.table`/
+`s.drop` instead.
+
 ## Growing the table: a unique column, an index, a foreign key
 
 `t.string(name, length)` returns the `Column` it just added, so a call
@@ -93,7 +126,7 @@ of silent money error a `decimal` type exists to rule out; unconstrained
 
 `AlterTable` carries the same column, under the same name `Table` uses -
 adding `salary` to a table that already exists is `decimal`, one method
-per concept (#6304), chainable like every other column method:
+per concept, chainable like every other column method:
 
 ```bit
 import { alter } from "orm"
@@ -216,19 +249,19 @@ is `""` and whose `refColumns` is empty. This package checks structure,
 never SQL semantics - the dialect that eventually renders the tree is where
 a missing target would surface, not here.
 
-## What this package does not do yet
+## What this chapter does not do
 
-This chapter builds and reads a tree; turning that tree into SQL is
-[Dialect](dialect.md)'s job, not this file's. Postgres is the first
-renderer; MySQL is separate, later work. There is still no runner to apply
-a rendered statement to a database. Use this package today to see the
-exact shape a migration will carry and, once you add a dialect, the exact
-DDL it renders to; do not expect `migrate up` yet.
+This chapter only builds and reads a tree; turning that tree into SQL is
+[Dialect](dialect.md)'s job, and actually running it against a database,
+tracking what already ran, and undoing it is [Apply
+migrations](migrate.md)'s.
 
 ## Where to go next
 
+[Apply migrations](migrate.md) covers `Schema` inside a real migration
+file, and `bit make migration`/`bit migrate` for writing and running one.
 [Dialect](dialect.md) turns the tree this chapter builds into real
-Postgres DDL. [Naming](naming.md) covers how a `@table` class's field
-names become the table and column names you write here by hand.
+Postgres or MySQL DDL. [Naming](naming.md) covers how a `@table` class's
+field names become the table and column names you write here by hand.
 [Write](write.md) covers the interface an ORM function takes to actually run
 something against a database, once there is something here to run.
