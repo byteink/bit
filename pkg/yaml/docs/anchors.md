@@ -135,6 +135,10 @@ fn main(): ()! {
 `yamlAnchorResolve` charges its running budgets against the SAME
 `AnchorTable` on every call for a whole document - never reset per anchor,
 per call, or per node - because a cap that resets cannot bound a
-multiplicative total the way the example above needs it to.
+multiplicative total the way the example above needs it to. The budgets are
+the alias count, the nodes the aliases stand for, and the string bytes they
+repeat (against `maxDocumentBytes`): twenty aliases to one 1 MB string are
+refused even though they are only twenty nodes, because any walk of the result
+would read 20 MB.
 
 Next: [Encoding](encoding.md), to write a `Yaml` value back out as text.
