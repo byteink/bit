@@ -73,7 +73,7 @@ BUILT_COMMIT="$(git rev-parse HEAD)"
 
 # --- preflight: the benchmark tables must have been regenerated for THIS release ---
 # (#4192). Owner ruled 2026-09-02 that bench/run.sh's README block is
-# regenerated every release; .claude/skills/bit-release/SKILL.md's step 0.5
+# regenerated every release; SKILL.md's step 0.5
 # said so in prose only, and prose is exactly what got silently skipped for
 # 0.6.0 and 0.7.0 - README.md kept advertising a snapshot from 2026-08-31
 # that predated 0.5.0's allocator fix, understating Bit's own numbers by
@@ -93,7 +93,7 @@ BENCH_COMMIT="$(git log -1 --format=%H -- bench/RESULTS.md 2>/dev/null || true)"
 }
 if [ -n "${BENCH_PREV_TAG}" ] && git merge-base --is-ancestor "${BENCH_COMMIT}" "${BENCH_PREV_TAG}"; then
 	echo "release.sh: bench/RESULTS.md was last regenerated at ${BENCH_COMMIT:0:8}, at or before ${BENCH_PREV_TAG} - the benchmark tables were not regenerated for this release" >&2
-	echo "  run: .claude/boxlock.sh solo bench/run.sh   (needs a quiet box: ps -eo comm= -A | grep -c make-driver == 0)" >&2
+	echo "  run: boxlock.sh solo bench/run.sh   (needs a quiet box: ps -eo comm= -A | grep -c make-driver == 0)" >&2
 	echo "  then: git add README.md bench/RESULTS.md bench/history.csv && git commit" >&2
 	echo "  then re-run: dist/release.sh ${VERSION}" >&2
 	exit 1
