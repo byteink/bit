@@ -127,10 +127,8 @@ of being retried again - visible in your store's `bit_jobs` table
 (`dead_lettered = true`, `dead_reason` set to the failure's message), for
 you to inspect and requeue by hand.
 
-`enqueue`'s named-argument form (`delay = 0, maxAttempts = 5`) is not
-available: it is generic in the job's type, and a named argument on a
-generic call is a compile error for an inferred type parameter. Positional
-works, and is what every example on this page uses.
+The arguments can also be named: `enqueue(SendWelcome{ userId = 1 },
+maxAttempts = 5)` leaves `delay` at its default of 0.
 
 ## Sharp edge: an unregistered job name is dead-lettered, loudly
 
