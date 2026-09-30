@@ -81,22 +81,44 @@ fn newLintModuleCache(): LintModuleCache {
 // of one file's, the same concatenation `SrcModule` itself uses to give every
 // sibling file one flat scope.
 //
-// #4228: an import re-declared by two sibling files (illegal per #2121's
-// E0042 once the directory really is one module) is now the signal this
-// function uses to tell a real multi-file module apart from a directory that
-// merely holds several UNRELATED single-file programs — `_tests_/cases/` is
-// exactly the latter: ~595 independent fixtures, several of which import the
-// same stdlib name for unrelated reasons (`_tests_/cases/lint_unused_import.bit`
+// #4228: a CONFLICTING top-level redeclaration between two sibling files
+// (still illegal per #2121's E0042 — #6326 only exempts an import identical
+// down to its resolved source and local name) is the signal this function
+// uses to tell a real multi-file module apart from a directory that merely
+// holds several UNRELATED single-file programs — `_tests_/cases/` is exactly
+// the latter: ~595 independent fixtures, several of which import the same
+// stdlib name for unrelated reasons (`_tests_/cases/lint_unused_import.bit`
 // leaves `foo` genuinely dead while its unrelated neighbour
 // `lint_unused_import_nested_use.bit` uses a same-named `foo`). Concatenating
 // such a directory produces duplicate-declaration errors (two `fn main`s, two
-// `import { foo } ...`) that a real module never would, since `bit check`
-// already rejects those; `resolveDiags.errorCount > 0` is read as "this
-// directory is not one module" and `usedNames` is left empty, so every E0210
-// finding in an incoherent directory stands exactly as computed per-file —
-// the same outcome the old argv-based `swept` cut gave `_tests_/cases/`, now
-// reached by asking what the directory actually contains instead of how it
-// was named on the command line.
+// DIFFERING `import { foo } from ...`s) that a real module never would, since
+// `bit check` already rejects those; `resolveDiags.errorCount > 0` is read as
+// "this directory is not one module" and `usedNames` is left empty, so every
+// E0210 finding in an incoherent directory stands exactly as computed
+// per-file — the same outcome the old argv-based `swept` cut gave
+// `_tests_/cases/`, now reached by asking what the directory actually
+// contains instead of how it was named on the command line.
+
+// Parallel per-file bookkeeping for the concatenated module source
+// (`fileOf`-compatible, project.bit's own `fileStarts` shape) plus each
+// file's OWN import names — one struct so `lintMarkIndependentUses` stays
+// under the repo's 5-param ceiling (spec/LINT.md).
+class ModuleFileMap {
+  names: []string,
+  starts: []int,
+  imports: map<string, map<string, bool>>,
+}
+
+// The resolved concatenated module plus which of its symbols are read
+// (`used`) and which nodes are write-only assignment targets (`writeOnly`,
+// never a "use") — bundled for the same reason as `ModuleFileMap`.
+class ResolvedModuleView {
+  mod: Module,
+  tree: Tree,
+  used: []bool,
+  writeOnly: []bool,
+}
+
 fn lintModuleUsedImportNames(cache: LintModuleCache, dir: string): map<string, bool> {
   let (hit, found) = cache.dirs[dir]
   if (found) {
@@ -104,10 +126,18 @@ fn lintModuleUsedImportNames(cache: LintModuleCache, dir: string): map<string, b
   }
   let names = listBitFiles(dir)
   let source = ""
+  let files = ModuleFileMap{
+    names = []string(0),
+    starts = []int(0),
+    imports = map<string, map<string, bool>>{},
+  }
   for name of names {
     let text = readFile(dir + "/" + name) catch _ {
       continue // unreadable sibling: skipped, like the project loader does
     }
+    files.names = append(files.names, name)
+    files.starts = append(files.starts, len(source))
+    files.imports[name] = fileImportNames(parseSource(text), text)
     source = source + text + "\n"
   }
   let tree = parseSource(source)
@@ -127,18 +157,89 @@ fn lintModuleUsedImportNames(cache: LintModuleCache, dir: string): map<string, b
   let mod = resolveModule(resolveDiags, m, stubs.mods, -1, false, true)
   let usedNames = map<string, bool>{}
   if (!lintHasDuplicateDeclaration(resolveDiags)) {
-    let used = computeUsedSymbols(mod, collectWriteOnlyNodes(tree))
-    let i = 1
-    while (i < len(mod.symbols)) {
-      let s = mod.symbols[i]
-      if ((s.kind == SymbolKind.ImportItem || s.kind == SymbolKind.ImportNamespace) && used[i]) {
-        usedNames[s.name] = true
-      }
-      i = i + 1
-    }
+    let writeOnly = collectWriteOnlyNodes(tree)
+    let used = computeUsedSymbols(mod, writeOnly)
+    let view = ResolvedModuleView{ mod = mod, tree = tree, used = used, writeOnly = writeOnly }
+    usedNames = lintMarkIndependentUses(view, files)
   }
   cache.dirs[dir] = usedNames
   return usedNames
+}
+
+// Every locally-bound import name one file's own tree declares — the alias
+// when present, else the imported name itself, matching `rCollectImport`'s
+// own binding rule (resolvecollect.bit). #6326 lets two files import the
+// same name identically, and once they do, `mod.symbols` alone cannot tell
+// them apart: the two sites merge into ONE symbol whose `decl` names only
+// the file that happened to be seen first. This reads each file's imports
+// straight from its own AST instead, so `lintMarkIndependentUses` can ask
+// "does THIS file already provide its own binding for this name" file by file.
+fn fileImportNames(tree: Tree, source: string): map<string, bool> {
+  let out = map<string, bool>{}
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d) // [body, path]
+    let bodyTag = getNode(tree, k[0]).tag
+    if (bodyTag == Tag.ImportNs || bodyTag == Tag.ImportStar) {
+      out[nodeText(tree, source, kidsOf(tree, k[0])[0])] = true
+    } else if (bodyTag == Tag.ImportGroup) {
+      for item of kidsOf(tree, k[0]) {
+        let ik = kidsOf(tree, item) // [name, alias_or_none]
+        let bindNode = ik[0]
+        if (ik[1] != 0) {
+          bindNode = ik[1]
+        }
+        out[nodeText(tree, source, bindNode)] = true
+      }
+    }
+  }
+  return out
+}
+
+// Marks `usedNames[name]` for every import name read by a node that sits in
+// a file NOT itself importing that name — the #2284 case this whole filter
+// exists for (a sibling's own reference, with no import of its own, relying
+// on another file's `import`). A read that lands in a file which ALSO wrote
+// its own `import` for the same name proves nothing about any OTHER file's
+// copy: that file already backs its own use, so it is deliberately left out
+// here, which is what lets `lintDropModuleUsedImports` still warn on a
+// second file's genuinely-unused copy of an import #6326 now allows to repeat.
+fn lintMarkIndependentUses(view: ResolvedModuleView, files: ModuleFileMap): map<string, bool> {
+  let usedNames = map<string, bool>{}
+  let i = 0
+  while (i < len(view.mod.nodeSymbols)) {
+    lintMarkIndependentUse(view, files, i, usedNames)
+    i = i + 1
+  }
+  return usedNames
+}
+
+// One `nodeSymbols[i]` slot of `lintMarkIndependentUses`' walk, split out
+// (E0203) so each rejection is an early return rather than another nested
+// `if` — a read of an import symbol, outside its own declaration and not a
+// write-only target, in a file that does not itself import that name.
+fn lintMarkIndependentUse(
+  view: ResolvedModuleView, files: ModuleFileMap, i: int, usedNames: map<string, bool>,
+) {
+  let sid = view.mod.nodeSymbols[i]
+  if (sid <= 0 || !view.used[sid] || i == view.mod.symbols[sid].decl || view.writeOnly[i]) {
+    return
+  }
+  let s = view.mod.symbols[sid]
+  if (s.kind != SymbolKind.ImportItem && s.kind != SymbolKind.ImportNamespace) {
+    return
+  }
+  let loc = fileOf(files.starts, getNode(view.tree, i).span.start)
+  if (loc.fileIdx >= len(files.names)) {
+    return
+  }
+  let (fileImports, _) = files.imports[files.names[loc.fileIdx]]
+  let (_, ownImport) = fileImports[s.name]
+  if (!ownImport) {
+    usedNames[s.name] = true
+  }
 }
 
 // #4295/#4293: whether the concatenated module produced a real E0042

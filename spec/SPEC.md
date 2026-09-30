@@ -4713,6 +4713,15 @@ An import bound only by a `.test.bit` file is visible only to other `.test.bit`
 files of the module; a non-test file that uses such a name is rejected even though
 `bit check`/`bit test` load the whole module, test files included, together.
 
+Because imports bind into the module's one flat namespace, two sibling files that
+both write the same `import` line are, by default, declaring the same name twice.
+An import identical to one a sibling already declared - the same resolved source
+module, the same imported name (or, for a namespace import, the same source module
+as a whole), and the same local name - binds the same symbol rather than
+conflicting; each file may repeat it and still read standalone. A same-named import
+that differs in source module, imported name, or local alias is still rejected as
+a duplicate declaration, naming both files.
+
 ### 17.2 Imports
 
 ```
