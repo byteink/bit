@@ -1,0 +1,409 @@
+// compiler/relationauto.bit — R1 (#6302, epic #6298, part of the relations
+// load themselves feature: `.claude/kb/data-packages-dx.md` "Relations load
+// themselves", `.claude/kb/orm-impl-plan-2026-09-30.md` Feature 3).
+//
+// SAME FUNCTION ONLY. This pass finds every read of a relation field
+// (`@hasMany`/`@hasOne`/`@belongsTo`) on a row that came from a
+// `Repo<T>`/`TxRepo<T>` query (`.all()`/`.find()`/`.first()`), tracked
+// through `let`, a trailing `?`, a `for-of` loop variable, indexing and
+// `.unwrap()` — but only within the ONE function the query call itself
+// appears in. Rows reaching a closure, a field, a map, a channel or another
+// function are simply not tracked here: R1 never reports a new error, so an
+// unprovable read keeps today's runtime panic (`classrelationattr.bit`'s
+// `relationUnloadedSentinel`) exactly as it does now. R2 (#TBD) extends this
+// across function boundaries; R3 turns an unprovable read the whole-program
+// version cannot resolve into a build error.
+//
+// OUTPUT: a side table on `Checker` (`relationAutoWith`, compiler/check.bit),
+// mapping a query CALL node to the relation names it needs — read by
+// `compiler/relationautosplice.bit` in the build path only.
+//
+// A KNOWN, ACCEPTED GAP (not a soundness problem): a relation already loaded
+// through an intermediate variable's OWN `.with(...)` — `let q =
+// posts.with("author")` in one statement, `q.all()` read in another — is not
+// seen by `relationautosplice.bit`'s syntactic existing-with walk, so this
+// pass may record a name the splice then adds again. The cost is one
+// harmless extra `__loadRelation` call, never a wrong answer — see
+// `relationAutoExistingWithNames`'s own header.
+
+// The Repo<T>/TxRepo<T> generic instance's own type argument `T`, or (0,
+// false) for anything else — `checkormrepokey.bit`'s `ormRepoTypeArg`
+// shape, extended to both repository classes since a query inside a
+// `db.tx((tx) => {...})` closure runs through `TxRepo<T>`, not `Repo<T>`.
+fn relationAutoRepoTypeArg(c: Checker, recvType: int): (int, bool) {
+  let idx = typeInstOfResult(c.ctx, recvType)
+  if (idx < 0) {
+    return (0, false)
+  }
+  let inst = c.ctx.typeInsts[idx]
+  if ((inst.name != "Repo" && inst.name != "TxRepo") || len(inst.args) != 1) {
+    return (0, false)
+  }
+  return (inst.args[0], true)
+}
+
+// One query's row class: the Checker that owns its declaration and the
+// declaration node itself — 0/`found=false` unless `recvType` is
+// `Repo<T>`/`TxRepo<T>` for a concrete `@table` class `T`.
+class RelationAutoClass {
+  found: bool,
+  oc: Checker,
+  decl: int,
+}
+
+fn relationAutoClassOf(c: Checker, recvType: int): RelationAutoClass {
+  let none = RelationAutoClass{ found = false, oc = c, decl = 0 }
+  let (argTy, ok) = relationAutoRepoTypeArg(c, recvType)
+  if (!ok || c.ctx.types[argTy].kind != TypeKind.Struct) {
+    return none
+  }
+  let oc = typeOwner(c, argTy)
+  let decl = structDeclOf(c, argTy)
+  if (decl == 0 || !classHasTable(oc.tree, oc.source, decl)) {
+    return none
+  }
+  return RelationAutoClass{ found = true, oc = oc, decl = decl }
+}
+
+// `Repo<T>`/`TxRepo<T>`'s three terminal methods that hand back real rows
+// (`pkg/orm/repo.bit`): `all(): []T!`, `find(id): T!`, `first(): Option<T>!`.
+// `first()`'s `Option<T>` is modelled here as the row `T` directly (never a
+// slice) — the only way source code can legally read a field off it is
+// through `.unwrap()` or a match, both of which this file's own
+// `relationAutoResolve` collapses back to the identical class/query pair, so
+// treating it as already-unwrapped changes no answer and needs no separate
+// Option-tracking state.
+fn relationAutoSourceMethodNames(): []string {
+  return ["all", "find", "first"]
+}
+
+class RelationAutoSource {
+  found: bool,
+  cls: RelationAutoClass,
+}
+
+// Whether `callNode` is a source query: `.all()`/`.find()`/`.first()` whose
+// receiver's own resolved type is `Repo<T>`/`TxRepo<T>` for a `@table`
+// class. The receiver's type comes from `checkExprType` (compiler/
+// checkexpr.bit), never `c.nodeTypes[recv]` directly: a bare identifier
+// reference (a parameter or local used as a method-call receiver) is never
+// written into `nodeTypes` by the ordinary per-node check sweep
+// (`checkmodule.bit`'s own tag dispatch only fills it for a DECL's name
+// node, not every USE) — `checkExprType`'s `Tag.Ident` arm resolves through
+// the RESOLVER's own node-keyed decl link (`declRefType`) instead of the
+// flat, unscoped `c.env`, so it is safe to call here, after every module has
+// already been checked, without picking up a stale same-named binding some
+// other function left in `c.env` last (checkexpr.bit's own #2947 comment).
+fn relationAutoSourceCall(c: Checker, callNode: int): RelationAutoSource {
+  let none = RelationAutoSource{
+    found = false,
+    cls = RelationAutoClass{ found = false, oc = c, decl = 0 },
+  }
+  if (getNode(c.tree, callNode).tag != Tag.Call) {
+    return none
+  }
+  let callee = kidsOf(c.tree, callNode)[0]
+  if (getNode(c.tree, callee).tag != Tag.Member) {
+    return none
+  }
+  let mk = kidsOf(c.tree, callee)
+  if (!ormNameIn(identText(c.tree, c.source, mk[1]), relationAutoSourceMethodNames())) {
+    return none
+  }
+  let recv = mk[0]
+  if (recv == 0) {
+    return none
+  }
+  let cls = relationAutoClassOf(c, checkExprType(c, recv))
+  if (!cls.found) {
+    return none
+  }
+  return RelationAutoSource{ found = true, cls = cls }
+}
+
+// One tracked local: the class/query pair it carries, and whether it holds
+// a whole slice of rows (`isSlice`, e.g. a `let`-bound `.all()` result) or
+// one row — a `for-of` binder and an indexed/`?`/`.unwrap()`-resolved value
+// are never slices. `afterOffset` mirrors `lintrelation.bit`'s own
+// `RelationBinding`: a read only counts past the binding's own source
+// position, so a `let`'s initializer expression is never mistaken for a
+// later read of itself.
+class RelationAutoBinding {
+  varName: string,
+  cls: RelationAutoClass,
+  queryCall: int,
+  isSlice: bool,
+  afterOffset: int,
+}
+
+class RelationAutoState {
+  bindings: []RelationAutoBinding,
+}
+
+class RelationAutoFlow {
+  found: bool,
+  cls: RelationAutoClass,
+  queryCall: int,
+  isSlice: bool,
+}
+
+fn relationAutoNoFlow(c: Checker): RelationAutoFlow {
+  return RelationAutoFlow{
+    found = false, cls = RelationAutoClass{ found = false, oc = c, decl = 0 }, queryCall = 0,
+    isSlice = false,
+  }
+}
+
+// Strips a trailing `?` — `db.table<Post>().all()?`'s own shape — so the
+// call underneath can be matched directly. Bounded: `?` cannot nest on
+// itself in valid Bit source (there is nothing left to unwrap a second
+// time), but the guard mirrors `ormChainRoot`'s own defensive bound anyway.
+fn relationAutoStripTry(c: Checker, node: int): int {
+  let n = node
+  let guard = 0
+  while (n != 0 && getNode(c.tree, n).tag == Tag.TryExpr && guard < 64) {
+    n = kidsOf(c.tree, n)[0]
+    guard = guard + 1
+  }
+  return n
+}
+
+// The most recent binding named `name` whose own `let`/binder position is
+// strictly before `atOffset` — shadowing resolves to the nearest enclosing
+// one, scanned back to front the same way `lintCheckRelationMemberRead`
+// scans `bindings` forward but keeps only the first match; back-to-front
+// here because `st.bindings` is a stack a block/loop pushes onto and pops
+// from (`relationAutoWalkBlock`/`relationAutoWalkForOf`, below).
+fn relationAutoLookupBinding(
+  c: Checker,
+  st: RelationAutoState,
+  name: string,
+  atOffset: int,
+): RelationAutoFlow {
+  let i = len(st.bindings) - 1
+  while (i >= 0) {
+    let b = st.bindings[i]
+    if (b.varName == name && atOffset > b.afterOffset) {
+      return RelationAutoFlow{
+        found = true,
+        cls = b.cls,
+        queryCall = b.queryCall,
+        isSlice = b.isSlice,
+      }
+    }
+    i = i - 1
+  }
+  return relationAutoNoFlow(c)
+}
+
+// What `node` resolves to: a source call directly, a `.unwrap()` on an
+// already-resolved row, a tracked local, or one element indexed out of a
+// tracked slice — `relationAutoNoFlow` for anything else (a map/field/
+// channel read, a call through a wrapper function, a value from another
+// function's parameter or return): exactly the "cannot prove" set this
+// ticket's own scope leaves for the runtime panic to keep catching.
+fn relationAutoResolve(c: Checker, node: int, st: RelationAutoState): RelationAutoFlow {
+  if (node == 0) {
+    return relationAutoNoFlow(c)
+  }
+  let n = relationAutoStripTry(c, node)
+  let tag = getNode(c.tree, n).tag
+  if (tag == Tag.Call) {
+    return relationAutoResolveCall(c, n, st)
+  }
+  if (tag == Tag.Ident) {
+    return relationAutoLookupBinding(
+      c,
+      st,
+      identText(c.tree, c.source, n),
+      getNode(c.tree, n).span.start,
+    )
+  }
+  if (tag == Tag.Index) {
+    let inner = relationAutoResolve(c, kidsOf(c.tree, n)[0], st)
+    if (inner.found && inner.isSlice) {
+      return RelationAutoFlow{
+        found = true,
+        cls = inner.cls,
+        queryCall = inner.queryCall,
+        isSlice = false,
+      }
+    }
+    return relationAutoNoFlow(c)
+  }
+  return relationAutoNoFlow(c)
+}
+
+fn relationAutoResolveCall(c: Checker, n: int, st: RelationAutoState): RelationAutoFlow {
+  let src = relationAutoSourceCall(c, n)
+  if (src.found) {
+    let mname = identText(c.tree, c.source, kidsOf(c.tree, kidsOf(c.tree, n)[0])[1])
+    return RelationAutoFlow{ found = true, cls = src.cls, queryCall = n, isSlice = mname == "all" }
+  }
+  let callee = kidsOf(c.tree, n)[0]
+  if (getNode(c.tree, callee).tag == Tag.Member) {
+    let mk = kidsOf(c.tree, callee)
+    if (identText(c.tree, c.source, mk[1]) == "unwrap") {
+      let inner = relationAutoResolve(c, mk[0], st)
+      if (inner.found && !inner.isSlice) {
+        return inner
+      }
+    }
+  }
+  return relationAutoNoFlow(c)
+}
+
+fn relationAutoRecordRead(c: Checker, queryCall: int, fieldName: string) {
+  let (names, ok) = c.relationAutoWith[queryCall]
+  if (!ok) {
+    names = []string(0)
+  }
+  if (!lintContainsString(names, fieldName)) {
+    names = append(names, fieldName)
+  }
+  c.relationAutoWith[queryCall] = names
+}
+
+// `node`'s own `Member` shape (`[recv, nameIdent]`): records a read when
+// `recv` resolves to a tracked ROW (never a slice — `posts.author` reads a
+// field off one element, not the slice itself) and the name it reads is a
+// relation field of that row's class.
+fn relationAutoCheckMemberRead(c: Checker, node: int, st: RelationAutoState) {
+  let k = kidsOf(c.tree, node)
+  let recv = k[0]
+  let nameIdx = k[1]
+  if (recv == 0 || nameIdx == 0) {
+    return
+  }
+  let flow = relationAutoResolve(c, recv, st)
+  if (!flow.found || flow.isSlice) {
+    return
+  }
+  let fieldName = identText(c.tree, c.source, nameIdx)
+  if (!lintFieldIsRelation(flow.cls.oc.tree, flow.cls.oc.source, flow.cls.decl, fieldName)) {
+    return
+  }
+  relationAutoRecordRead(c, flow.queryCall, fieldName)
+}
+
+// One `let`'s own bindings — `bindingKids = [pattern, type_or_none,
+// init_or_none]` (compiler/parsertype.bit's `parseOneBinding`, reused by
+// `lintrelation.bit`'s identical comment). The initializer is walked for
+// its OWN reads first, then the binding itself is pushed, so a `let`'s own
+// right-hand side is never treated as reading its own not-yet-bound name.
+fn relationAutoWalkLet(c: Checker, node: int, st: RelationAutoState) {
+  for b of kidsOf(c.tree, node) {
+    let bk = kidsOf(c.tree, b)
+    let pattern = bk[0]
+    let init = bk[2]
+    if (init != 0) {
+      relationAutoWalk(c, init, st)
+    }
+    if (pattern == 0 || init == 0 || getNode(c.tree, pattern).tag != Tag.Ident) {
+      continue
+    }
+    let flow = relationAutoResolve(c, init, st)
+    if (!flow.found) {
+      continue
+    }
+    st.bindings = append(
+      st.bindings,
+      RelationAutoBinding{
+        varName = identText(c.tree, c.source, pattern), cls = flow.cls, queryCall = flow.queryCall,
+        isSlice = flow.isSlice, afterOffset = getNode(c.tree, node).span.end,
+      },
+    )
+  }
+}
+
+// `kids = [binder, iter, body]` (parserstmt.bit's `ForOf`). The loop
+// variable is pushed only for a bare `Ident` binder over a tracked SLICE,
+// and popped once the body has been walked — a `for-of` var's scope is the
+// loop body alone, never a sibling statement after the loop.
+fn relationAutoWalkForOf(c: Checker, node: int, st: RelationAutoState) {
+  let k = kidsOf(c.tree, node)
+  relationAutoWalk(c, k[1], st)
+  let flow = relationAutoResolve(c, k[1], st)
+  let pushed = k[0] != 0 && getNode(c.tree, k[0]).tag == Tag.Ident && flow.found && flow.isSlice
+  if (pushed) {
+    st.bindings = append(
+      st.bindings,
+      RelationAutoBinding{
+        varName = identText(c.tree, c.source, k[0]), cls = flow.cls, queryCall = flow.queryCall,
+        isSlice = false, afterOffset = getNode(c.tree, k[0]).span.start,
+      },
+    )
+  }
+  relationAutoWalk(c, k[2], st)
+  if (pushed) {
+    st.bindings = st.bindings[0:len(st.bindings) - 1]
+  }
+}
+
+// A `Block`'s own lexical scope: every binding a statement inside it pushes
+// (a `let`, or a nested `for-of`'s own loop var for ITS body only) is
+// popped again once the block ends, so it is never visible to a sibling
+// statement after this block closes.
+fn relationAutoWalkBlock(c: Checker, node: int, st: RelationAutoState) {
+  let save = len(st.bindings)
+  for k of kidsOf(c.tree, node) {
+    relationAutoWalk(c, k, st)
+  }
+  st.bindings = st.bindings[0:save]
+}
+
+// The generic recursive walk: a nested `FuncDecl`/`ArrowFn` is its own
+// scope (`lintIsNestedFuncBoundary`, compiler/lintrelation.bit) — never
+// descended into from here, since `relationAutoAnalyzeModule` below already
+// visits it as its own separate entry with its own fresh `RelationAutoState`.
+fn relationAutoWalk(c: Checker, node: int, st: RelationAutoState) {
+  if (node == 0) {
+    return
+  }
+  let tag = getNode(c.tree, node).tag
+  if (lintIsNestedFuncBoundary(tag)) {
+    return
+  }
+  if (tag == Tag.Block) {
+    relationAutoWalkBlock(c, node, st)
+    return
+  }
+  if (tag == Tag.LetDecl) {
+    relationAutoWalkLet(c, node, st)
+    return
+  }
+  if (tag == Tag.ForOf) {
+    relationAutoWalkForOf(c, node, st)
+    return
+  }
+  if (tag == Tag.Member) {
+    relationAutoCheckMemberRead(c, node, st)
+  }
+  for k of kidsOf(c.tree, node) {
+    relationAutoWalk(c, k, st)
+  }
+}
+
+// Every `FuncDecl`/`ArrowFn` in the module, each its own independent
+// same-function scope — `lintCollectFuncs` (compiler/lintapply.bit) already
+// gives every one, nested closures included as their own entries, and
+// `lintFuncInfo` gives each one's own body node, so this file redeclares
+// neither.
+fn relationAutoAnalyzeModule(c: Checker) {
+  let fds = lintCollectFuncs(c.tree, c.tree.root, []int(0))
+  for fd of fds {
+    let st = RelationAutoState{ bindings = []RelationAutoBinding(0) }
+    relationAutoWalk(c, lintFuncInfo(c.tree, fd).body, st)
+  }
+}
+
+// Entry point, called from `checkResolved` (compiler/checkproject.bit) once
+// every module's `nodeTypes` is populated — a query's receiver type and a
+// relation field's own attribute are both needed before any read can be
+// judged, and both are only available after the ordinary per-module check
+// loop has finished.
+fn relationAutoAnalyzeProject(mods: []Checker) {
+  for c of mods {
+    relationAutoAnalyzeModule(c)
+  }
+}
