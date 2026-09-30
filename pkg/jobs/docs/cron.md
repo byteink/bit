@@ -82,10 +82,28 @@ the two are "or"ed: `0 9 15 * MON` fires on the 15th and on Mondays.
 `tz` is a zone name, read in the same `std/time` zone data as
 `zone(name)`, and it is checked when `schedule` is called: an unknown zone
 or a bad expression makes `schedule` fail at startup, not at 02:00. A
-daylight saving change follows the wall clock. A time that does not exist
-(02:30 on a spring-forward night) fires on the next day that has it, and a
-time that happens twice (01:30 on a fall-back night) fires once, at its
-first occurrence.
+daylight saving change follows the rule Vixie cron documents in `man 8
+cron`: a job that runs at a specific time runs once, and a job that runs
+every hour or more often keeps following the clock. Which one a job is
+depends on its minute and hour fields. If either is `*` (or a `*` step such
+as `*/15`, or the whole range), the job follows real time: on a fall-back
+night it fires in both passes through the repeated hour, and on a
+spring-forward night the skipped times do not exist, so it does not fire in
+them. If both are named (`30 1`, `0,30 2`), the job fires once per matching
+wall time: a time that happens twice fires at its first occurrence, and a
+time that does not exist fires once, at the first instant after the gap.
+
+For example, in New York, where 01:00 to 02:00 happens twice on 2026-11-01
+and 02:00 to 03:00 does not exist on 2026-03-08:
+
+```text
+30 1 * * *   on 2026-11-01: 01:30 EDT only, not 01:30 EST again
+0 * * * *    on 2026-11-01: 01:00 EDT, 01:00 EST, 02:00 EST
+30 2 * * *   on 2026-03-08: 03:00 EDT, once
+```
+
+The next tick is always later than the moment you ask from, even when you
+ask from the second 01:30 of a fall-back night.
 
 To see what an expression means before you ship it, `parseCron` gives you
 the same schedule the queue uses:

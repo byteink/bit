@@ -31,14 +31,36 @@
 // that is actually reachable in a test, and `cronMaxSearchSteps` below is
 // it.
 //
-// DST FALLS OUT OF `DateTime` ARITHMETIC FOR FREE: `addDays`/`addHours`
-// (stdlib/time/calarith.bit) re-resolve the zone on the WALL CLOCK after
-// each step, the same disambiguation `zonedFromWall` already documents
-// (spring gap pushed forward, fall-back overlap takes the earlier offset)
-// — this file adds no DST logic of its own, only calendar-field matching.
+// DAYLIGHT SAVING FOLLOWS VIXIE CRON (`man 8 cron`, "Daylight Saving Time and
+// other time changes"): "Local time changes of less than three hours ... are
+// handled specially. This only applies to jobs that run at a specific time
+// and jobs that are run with a granularity greater than one hour. Jobs that
+// run more frequently are scheduled normally. If time has moved forward,
+// those jobs that would have run in the interval that has been skipped will
+// be run immediately. Conversely, if time has moved backward, care is taken
+// to avoid running jobs twice." Vixie's source marks a job "wildcard" when
+// its minute or hour field starts with `*`; this file does the same, plus a
+// field whose mask covers its whole range (`0-59`). Then a tick is an
+// INSTANT, never a wall reading:
+//
+//   - realTime (minute or hour is `*`-like): every instant whose wall
+//     reading matches is a tick. A repeated hour ticks in both occurrences;
+//     a skipped wall time has no tick.
+//   - fixed (minute and hour both named): every matching wall time ticks
+//     once. In a repeated hour that is its FIRST occurrence; wall times
+//     inside a gap tick once, at the first instant after the gap.
+//
+// `nextAfter` therefore walks INSTANTS on days where the zone's offset
+// changes (`cronWalkDay`) and stays on the cheap wall-clock field search on
+// every other day. It assumes a zone changes offset at most once per
+// calendar day. Stepping the wall clock alone (the `DateTime` arithmetic of
+// stdlib/time/calarith.bit, which resolves a repeated wall time to its
+// EARLIER offset) returned an instant 59 minutes before `after` from the
+// second 01:30 of a fall-back day; `nextAfter` now fails rather than return
+// an instant that is not after `after`.
 
-import { DateTime } from "std/time"
-import { split, trimSpace, toUpper, parseInt } from "std/strings"
+import { DateTime, NaiveDateTime, Timestamp, Zone, Second } from "std/time"
+import { split, trimSpace, toUpper, parseInt, hasPrefix } from "std/strings"
 
 // The widest lookahead `nextAfter` will search before giving up — an
 // expression that can never match (`0 0 31 2 *`, day 31 in February) would
@@ -53,9 +75,15 @@ const cronMaxYearsAhead: int = 8
 // expression and only fires for one that can never match.
 const cronMaxSearchSteps: int = 20000
 
+// One calendar day's walk is at most this many minute steps (25 hours on a
+// fall-back day, 48 across a zone that skips a whole date); reaching it means
+// the zone data is not a day-long transition, so it fails instead of looping.
+const cronMaxWalkSteps: int = 4000
+
 // A parsed cron expression: one bitmask per field plus whether the
 // day-of-month/day-of-week fields were literally `*` in the source text
-// (this file's header: that decides AND vs. OR between them).
+// (this file's header: that decides AND vs. OR between them), and whether
+// the minute or hour field is `*`-like (`realTime`, the header's DST rule).
 export class CronSchedule {
   minutes: int
   hours: int
@@ -64,13 +92,17 @@ export class CronSchedule {
   dow: int
   domStar: bool
   dowStar: bool
+  realTime: bool
 
-  // The next wall-clock instant strictly after `after`, in `after`'s own
-  // zone, matching this schedule. Fails when nothing matches within
-  // `cronMaxYearsAhead` years (an impossible expression) or the search
-  // exceeds its step bound (should never happen for a possible one).
+  // The first instant strictly after `after`, in `after`'s own zone, whose
+  // wall reading matches this schedule, under the daylight-saving rule in
+  // this file's header. Fails when nothing matches within
+  // `cronMaxYearsAhead` years (an impossible expression), when the search
+  // exceeds its step bound (should never happen for a possible one), or when
+  // the answer would not be after `after` (a defect, never returned).
   export nextAfter(after: DateTime): DateTime! {
-    let cand = after.addMinutes(1).withSecond(0).withNanosecond(0)
+    let afterSec = cronFloorSecs(after.toTimestamp()?.ns)
+    let cand = cronAt(after.zone(), afterSec - after.second() + 60)
     let limitYear = after.year() + cronMaxYearsAhead
     let steps = 0
     while (steps < cronMaxSearchSteps) {
@@ -79,25 +111,187 @@ export class CronSchedule {
         fail newError("cron: no matching time within ${cronMaxYearsAhead} years after ${after.year()}-${after.month()}-${after.day()}")
       }
       if ((this.months & bitAt(cand.month())) == 0) {
-        cand = cand.withDay(1).addMonths(1).withHour(0).withMinute(0)
+        cand = cand.withDay(1).addMonths(1).withTime(0, 0, 0)
         continue
       }
       if (!cronDomDowMatches(this, cand.day(), isoToCronDow(cand.dayOfWeek()))) {
-        cand = cand.addDays(1).withHour(0).withMinute(0)
+        cand = cand.addDays(1).withTime(0, 0, 0)
         continue
       }
-      if ((this.hours & bitAt(cand.hour())) == 0) {
-        cand = cand.addHours(1).withMinute(0)
-        continue
+      let end = cand.addDays(1).withTime(0, 0, 0)
+      let (hit, found) = cronSearchDay(this, cand, end)?
+      if (found) {
+        return cronEnsureAfter(hit, after)?
       }
-      if ((this.minutes & bitAt(cand.minute())) == 0) {
-        cand = cand.addMinutes(1)
-        continue
-      }
-      return cand
+      cand = end
     }
     fail newError("cron: search exceeded ${cronMaxSearchSteps} steps")
   }
+}
+
+// `sec` seconds since the Unix epoch, read in `z`.
+fn cronAt(z: Zone, sec: int): DateTime {
+  return Timestamp{ ns = sec * Second }.inZone(z)
+}
+
+// Whole seconds at or before `ns`; plain `/` truncates toward zero, which
+// would round an instant before 1970 up.
+fn cronFloorSecs(ns: int): int {
+  let q = ns / Second
+  if (q * Second > ns) {
+    return q - 1
+  }
+  return q
+}
+
+// `dt`'s instant in whole seconds since the Unix epoch.
+fn cronSecs(dt: DateTime): int! {
+  let ts = dt.toTimestamp()?
+  return cronFloorSecs(ts.ns)
+}
+
+// The zone offset in force one second before `dt`'s instant.
+fn cronOffsetBefore(dt: DateTime): int! {
+  return cronAt(dt.zone(), cronSecs(dt)? - 1).offset()
+}
+
+// The invariant `nextAfterNs` (schedule.bit) and the scheduler rely on: a
+// tick is never at or before the instant it was asked to follow.
+fn cronEnsureAfter(got: DateTime, after: DateTime): DateTime! {
+  let g = got.toTimestamp()?
+  let a = after.toTimestamp()?
+  if (g.ns <= a.ns) {
+    fail newError("cron: next tick ${got.toString()} is not after ${after.toString()}")
+  }
+  return got
+}
+
+// The first tick on the calendar day that starts at wall midnight and ends
+// at `end` (the next wall midnight), at or after `cand` (a minute on that
+// day); `found` is false when the day has none. `cand`'s date already
+// matches. A day whose offset is the same throughout takes the wall-clock
+// search; any other day is walked by instant.
+fn cronSearchDay(cs: CronSchedule, cand: DateTime, end: DateTime): (DateTime, bool)! {
+  let start = cand.withTime(0, 0, 0)
+  if (cronOffsetBefore(start)? == cronOffsetBefore(end)?) {
+    return cronFastDay(cs, cand)
+  }
+  return cronWalkDay(cs, cand, start, end)?
+}
+
+// The first matching hour/minute at or after `cand` on its own day, for a
+// day with no offset change (every wall time then names exactly one
+// instant).
+fn cronFastDay(cs: CronSchedule, cand: DateTime): (DateTime, bool) {
+  let h = cand.hour()
+  let m0 = cand.minute()
+  while (h < 24) {
+    if ((cs.hours & bitAt(h)) != 0) {
+      let m = cronNextBit(cs.minutes, m0)
+      if (m >= 0) {
+        return (cand.withTime(h, m, 0), true)
+      }
+    }
+    h = h + 1
+    m0 = 0
+  }
+  return (cand, false)
+}
+
+// The lowest set bit of `mask` in `[from, 59]`, or -1.
+fn cronNextBit(mask: int, from: int): int {
+  let v = from
+  while (v <= 59) {
+    if ((mask & bitAt(v)) != 0) {
+      return v
+    }
+    v = v + 1
+  }
+  return -1
+}
+
+// What `cronWalkTick` remembers between minutes: the offset one minute ago,
+// and (fixed schedules) the instant a repeated stretch of wall time ends,
+// before which a wall match is the SECOND occurrence and does not tick.
+class cronWalk {
+  prevOff: int,
+  quietUntil: int,
+}
+
+// Walks the instants of one calendar day, `start` to `end` exclusive, a wall
+// minute at a time, from the day's start so the walk always knows whether it
+// is inside a repeated stretch; returns the first tick at or after `cand`.
+fn cronWalkDay(
+  cs: CronSchedule,
+  cand: DateTime,
+  start: DateTime,
+  end: DateTime,
+): (DateTime, bool)! {
+  let z = cand.zone()
+  let candSec = cronSecs(cand)?
+  let endSec = cronSecs(end)?
+  let tSec = cronSecs(start)?
+  let t = start
+  let w = cronWalk{ prevOff = cronOffsetBefore(start)?, quietUntil = 0 }
+  let steps = 0
+  while (tSec < endSec && steps < cronMaxWalkSteps) {
+    steps = steps + 1
+    if (cronWalkTick(cs, t, tSec, w) && tSec >= candSec) {
+      return (t, true)
+    }
+    tSec = tSec + 60 - t.second()
+    t = cronAt(z, tSec)
+  }
+  if (tSec < endSec) {
+    fail newError("cron: a day of ${cand.zone().name} did not end within ${cronMaxWalkSteps} minutes")
+  }
+  return (cand, false)
+}
+
+// Whether the instant `t` (`tSec`) is a tick, updating `w` for the offset
+// change it may be the first instant of.
+fn cronWalkTick(cs: CronSchedule, t: DateTime, tSec: int, w: cronWalk): bool {
+  let off = t.offset()
+  let gapTick = false
+  if (off < w.prevOff) {
+    w.quietUntil = tSec + (w.prevOff - off)
+  }
+  if (off > w.prevOff && !cs.realTime) {
+    gapTick = cronGapMatches(cs, t.naive(), (off - w.prevOff) / 60)
+  }
+  w.prevOff = off
+  if (gapTick) {
+    return true
+  }
+  if (!cs.realTime && tSec < w.quietUntil) {
+    return false
+  }
+  return cronWallMatches(cs, t.naive())
+}
+
+// Whether any of the `gapMinutes` wall minutes just before `first` (the
+// first wall reading after a gap) matches: those wall times do not exist, and
+// a fixed job owed one runs at `first`'s instant.
+fn cronGapMatches(cs: CronSchedule, first: NaiveDateTime, gapMinutes: int): bool {
+  let k = 1
+  while (k <= gapMinutes) {
+    if (cronWallMatches(cs, first.addMinutes(-k))) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+// Whether the wall reading `n` satisfies all five fields.
+fn cronWallMatches(cs: CronSchedule, n: NaiveDateTime): bool {
+  if ((cs.months & bitAt(n.month())) == 0) {
+    return false
+  }
+  if (!cronDomDowMatches(cs, n.day(), isoToCronDow(n.dayOfWeek()))) {
+    return false
+  }
+  return (cs.hours & bitAt(n.hour())) != 0 && (cs.minutes & bitAt(n.minute())) != 0
 }
 
 // Whether day `dom`/`dow` (cron's own 0=Sunday..6=Saturday numbering for
@@ -154,7 +348,14 @@ export fn parseCron(expr: string): CronSchedule! {
     dow = dow,
     domStar = fields[2] == "*",
     dowStar = fields[4] == "*",
+    realTime = cronCoversField(fields[0], minutes, 60) || cronCoversField(fields[1], hours, 24),
   }
+}
+
+// Whether a minute or hour field fires at every value of its `width`-value
+// range, or at a `*` step of it: Vixie cron's "wildcard" (this file's header).
+fn cronCoversField(text: string, mask: int, width: int): bool {
+  return hasPrefix(text, "*") || mask == bitAt(width) - 1
 }
 
 // Splits on runs of whitespace, dropping empty pieces — `strings.split`
