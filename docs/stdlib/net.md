@@ -345,8 +345,8 @@ fn echo(s: UdpSocket, n: int): ()! {
 
 ### `resolve(host: string): string!`
 
-Resolves a hostname to an IPv4 address (a dotted quad), using the first
-nameserver in `/etc/resolv.conf`. A dotted-quad argument comes back unchanged, so
+Resolves a hostname to an IPv4 address (a dotted quad), asking each nameserver
+in `/etc/resolv.conf` in turn until one answers. A dotted-quad argument comes back unchanged, so
 it is safe on an address that may already be numeric. A records only - no IPv6,
 no search domains, no caching. `dial` and `udpBind` take numeric addresses, so
 resolve first:
@@ -356,5 +356,21 @@ import { dial, resolve, Conn } from "std/net"
 
 fn connectByName(host: string, port: int): Conn! {
   return dial(resolve(host)?, port)?
+}
+```
+
+### `resolveBudgetMs(): int`
+
+The longest `resolve` can take on this machine, in milliseconds: each
+nameserver gets its full retry budget, so the figure grows with the number of
+nameservers. Code that races a lookup against its own timer adds this to the
+time it allows for connecting and transferring, so slow but successful DNS is
+not mistaken for a timeout:
+
+```bit
+import { resolveBudgetMs } from "std/net"
+
+fn fetchDeadlineMs(transferMs: int): int {
+  return resolveBudgetMs() + transferMs
 }
 ```
