@@ -33,6 +33,23 @@
 // `contains`/`toUpper` are not imported here - postgres.bit/query.test.bit
 // already import them and a Bit import binds package-wide (postgres.bit's
 // own header on this).
+//
+// O3c (#6311): `runner.bit`'s MySQL branch of `acquireLock`/
+// `releaseLockBestEffort` (`GET_LOCK('bit_migrate', -1)`/`RELEASE_LOCK`),
+// proved against a real server the same way `runner.test.bit`'s own last
+// test proves Postgres's `pg_advisory_lock` — direct connection, no spawned
+// subprocess, since `migrate`/`rollback` are declared IN this module
+// (`runner.test.bit`'s own header explains that distinction). `adapter`
+// (bare, unaliased) already names Postgres's own adapter package-wide
+// (`relationauto.test.bit`'s own import), and `mysqlAdapter` already names
+// MySQL's adapter package-wide too (`db.bit`'s own import) — both would be
+// E0042 re-imported here, so this file's own MySQL adapter import below
+// takes a third name, `mysqlLiveAdapter`. `pool`/`Datasource`/`Value`/
+// `env`/`Timestamp`/`MysqlVersion` are already bound package-wide
+// (`db.bit`, `write.bit`, `testenv.test.bit`, `timestamps.bit`,
+// `runner.test.bit`) and are not reimported here either.
+import { adapter as mysqlLiveAdapter } from "mysql"
+import { parseInt } from "std/strings"
 
 // Every `ColumnType` variant, a foreign key, an index and a raw()
 // passthrough in one `CreateTable` - the MySQL-spelled sibling of
@@ -388,4 +405,167 @@ test "mysqlEnumCheckAlter: adding a variant drops and recreates the CHECK naming
   assert(!stmt.transactional, "must render transactional: false, like every MySQL statement")
   assert(!contains(toUpper(stmt.sql), "CREATE TABLE"), "must not rewrite the table: ${stmt.sql}")
   assert(!contains(toUpper(stmt.sql), "ENUM("), "must not emit a native ENUM type: ${stmt.sql}")
+}
+
+// ---- O3c (#6311): the MySQL advisory lock, against a real server ----
+
+// A single-table migration, real DDL — the payload the two live tests
+// below apply through `migrate`, never a fake executor: the point of both
+// is a real `GET_LOCK`/`RELEASE_LOCK` round trip.
+class my6311CreateWidgets {
+  up(s: Schema): ()! {
+    s.create("mysql6311_widgets", (t) => {
+      t.id("id")
+      t.string("name", 50)
+    })?
+  }
+
+  down(s: Schema): ()! {
+    s.drop("mysql6311_widgets")?
+  }
+}
+
+// Always fails inside `up()`, before any statement is rendered - the
+// runner never reaches `db.exec` for this migration at all. Proves the
+// lock releases on the FAILING path, not just the happy one (this file's
+// header, O3c note; `runner.bit`'s own header, piece 1).
+class my6311AlwaysFails {
+  up(s: Schema): ()! {
+    fail newError("my6311AlwaysFails: forced failure")
+  }
+
+  down(s: Schema): ()! {}
+}
+
+fn my6311Dialect(): RunnerDialect {
+  return RunnerDialect{
+    render = Mysql{},
+    server = ServerDialect.Mysql(MysqlVersion{ major = 8, minor = 0 }),
+  }
+}
+
+// One `migrate` call run from inside a spawned green thread, its outcome
+// (never its error) sent back over `outcomes` - the same "encode the result
+// as a string, never let a failure propagate out of the spawned function"
+// shape `repo.test.bit`'s own `locker` uses for its live lock proof.
+fn my6311RunMigrate(db: Data, migrations: []MigrationFile, at: Timestamp, outcomes: chan<string>) {
+  let report = migrate(db, my6311Dialect(), migrations, at) catch e {
+    outcomes <- "error:${e.message()}"
+    return
+  }
+  outcomes <- "applied:${len(report.applied)}"
+}
+
+// THE LOCK MUST SERIALIZE TWO CONCURRENT RUNS OF THE SAME MIGRATION LIST:
+// exactly one of the two `migrate` calls below applies the single pending
+// migration; the other, blocked on `GET_LOCK('bit_migrate', -1)` until the
+// first releases it, finds nothing left pending and applies zero. Either
+// order is correct - `spawn` gives no ordering guarantee (SPEC §16) - so
+// this test sums outcomes rather than asserting which one "won".
+test "live: two concurrent MySQL migrate runs of the same migration - the lock serializes them, applied exactly once (#6311)" {
+  let uri = env("ORM_TEST_LIVE_MYSQL_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_MYSQL_URI is unset, no live server to talk to")
+    return
+  }
+  let db = pool(mysqlLiveAdapter(), Datasource{ uri = uri }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  db.exec("drop table if exists mysql6311_widgets", []Value(0)) catch e {
+    panic("drop mysql6311_widgets: ${e.message()}")
+  }
+  db.exec("drop table if exists migrations", []Value(0)) catch e {
+    panic("drop migrations: ${e.message()}")
+  }
+
+  let migrations = [MigrationFile{ name = "6311_create_widgets", m = my6311CreateWidgets{} }]
+  let outcomes = chan<string>(2)
+  spawn my6311RunMigrate(db, migrations, Timestamp{ ns = 1000 }, outcomes)
+  spawn my6311RunMigrate(db, migrations, Timestamp{ ns = 1000 }, outcomes)
+  let first = <- outcomes
+  let second = <- outcomes
+
+  assert(
+    !hasPrefix(first, "error:") && !hasPrefix(second, "error:"),
+    "LIVE PROOF FAILED: expected both runs to succeed, got '${first}' and '${second}'",
+  )
+  let appliedTotal = my6311AppliedCount(first) + my6311AppliedCount(second)
+  assert(
+    appliedTotal == 1,
+    "LIVE PROOF FAILED: expected exactly 1 applied across both runs, got '${first}' + '${second}'",
+  )
+
+  let history = loadHistory(db) catch e {
+    panic("loadHistory: ${e.message()}")
+  }
+  assert(len(history) == 1, "LIVE PROOF FAILED: expected 1 migrations row, got ${len(history)}")
+
+  db.exec("drop table if exists mysql6311_widgets", []Value(0)) catch e {
+    panic("cleanup mysql6311_widgets: ${e.message()}")
+  }
+  db.exec("drop table if exists migrations", []Value(0)) catch e {
+    panic("cleanup migrations: ${e.message()}")
+  }
+  db.close()
+}
+
+// Reads the `n` out of `my6311RunMigrate`'s own "applied:<n>" outcome
+// string - the two live tests in this file are the only callers. Panics
+// rather than propagating `int!`: both callers are inside a `test { }`
+// block, which is not itself fallible.
+fn my6311AppliedCount(outcome: string): int {
+  if (!hasPrefix(outcome, "applied:")) {
+    panic("my6311AppliedCount: not an 'applied:' outcome: ${outcome}")
+  }
+  return parseInt(outcome[8:]) catch e {
+    panic("my6311AppliedCount: bad integer in '${outcome}': ${e.message()}")
+  }
+}
+
+// THE MUTATION THIS TEST CATCHES: skip `RELEASE_LOCK` on the error path out
+// of `acquireLock`/`runOneMigration` and this test hangs instead of
+// failing, because the second `migrate` call below blocks forever on
+// `GET_LOCK('bit_migrate', -1)` - proving the lock releases specifically
+// when the migration itself fails, not just on the ordinary success path
+// the test above already covers.
+test "live: MySQL releases the lock even when a migration's up() fails, so a second migrate does not hang (#6311)" {
+  let uri = env("ORM_TEST_LIVE_MYSQL_URI")
+  if (uri == "") {
+    print("  skipped: ORM_TEST_LIVE_MYSQL_URI is unset, no live server to talk to")
+    return
+  }
+  let db = pool(mysqlLiveAdapter(), Datasource{ uri = uri }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  db.exec("drop table if exists migrations", []Value(0)) catch e {
+    panic("drop migrations: ${e.message()}")
+  }
+
+  let failing = [MigrationFile{ name = "6311_always_fails", m = my6311AlwaysFails{} }]
+  let sawFailure = false
+  migrate(db, my6311Dialect(), failing, Timestamp{ ns = 2000 }) catch e {
+    sawFailure = true
+    assert(
+      contains(e.message(), "6311_always_fails"),
+      "LIVE PROOF FAILED: error does not name the failing migration: ${e.message()}",
+    )
+    MigrateReport{ applied = []AppliedMigration(0) }
+  }
+  assert(
+    sawFailure,
+    "LIVE PROOF FAILED: my6311AlwaysFails.up() was expected to fail migrate, got success",
+  )
+
+  let report = migrate(db, my6311Dialect(), []MigrationFile(0), Timestamp{ ns = 3000 }) catch e {
+    panic(
+        "LIVE PROOF FAILED: a second migrate call could not acquire the lock after a failing " +
+        "run - RELEASE_LOCK was skipped on the error path: ${e.message()}",
+    )
+  }
+  assert(len(report.applied) == 0, "expected no pending migrations, got ${len(report.applied)}")
+
+  db.exec("drop table if exists migrations", []Value(0)) catch e {
+    panic("cleanup migrations: ${e.message()}")
+  }
+  db.close()
 }
