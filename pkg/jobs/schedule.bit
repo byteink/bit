@@ -28,18 +28,22 @@
 // instead of a real clock or `sleep` — this is the injectable-clock shape
 // the ticket's own tests need.
 //
-// A TICK IS MISSED BY HOW LATE IT IS REACHED, NOT BY HOW MANY ARE DUE
-// (#6354). The scheduler reaching a tick within `scheduleGracePolls` poll
-// intervals of its due time is the loop waking up normally: on time, always
-// enqueued, whatever `Missed` says. A tick reached later than that (the
-// process was down or stalled) is missed, and only those go through the
-// policy. So `Skip` over a 02:00 run the app slept through until 02:30
-// enqueues nothing. The grace is deliberately not an argument of
-// `schedule`/`every`: it absorbs wake-up jitter of the scheduler, which
-// `Options.pollInterval` already sets for the whole Queue, and a second
-// per-schedule knob would only duplicate it.
+// A TICK IS MISSED ONLY WHEN IT IS REACHED TOO LATE TO BE ON TIME (#6358,
+// after #6354). Tick `T`, whose next tick is `T2`, is missed iff
+// `now - T > min(scheduleMissedAfter, T2 - T)`: more than a minute late, or
+// late enough that the next tick is already due. Quartz's misfire threshold,
+// capped by the schedule's own period. A tick that is not missed is always
+// enqueued, whatever `Missed` says; only missed ones go through the policy.
+// So the newest due tick is dropped by `Skip` only when it is over a minute
+// late (`now < T2` always holds for it), a nightly tick whose store pass
+// failed at 02:00:00 and recovered at 02:00:40 still fires, and a deploy
+// that restarts the app 30 s after 02:00 still fires it, while a 02:00 run
+// the app slept through until 02:30 is dropped by `Skip`. The threshold is
+// deliberately not an argument of `schedule`/`every` nor an `Options`
+// field: it is one rule for every schedule, not a knob to set wrong. Every
+// tick the policy drops is logged (`missedMessage`), never silent.
 
-import { Timestamp, Zone } from "std/time"
+import { Minute, Timestamp, Zone } from "std/time"
 
 // How a schedule catches up after downtime: the `missed` argument of
 // `Queue.schedule`/`Queue.every`. `RunAll`'s payload is the cap: enqueue at
@@ -120,10 +124,11 @@ fn newCronTrigger(expr: string, tz: Zone): trigger! {
 // bug, not a real schedule) would ever reach it.
 const scheduleCatchUpScanCap: int = 100000
 
-// How many poll intervals late the scheduler may reach a tick and still have
-// it count as on time: one, the longest a healthy loop sleeps between two
-// looks at the clock.
-const scheduleGracePolls: int = 1
+// How late the scheduler may reach a tick and still have it on time, at
+// most: a minute, the slack a failed store pass or a restart needs to
+// recover. A schedule with a shorter period is capped by that period instead
+// (`tickMissed`).
+const scheduleMissedAfter: int = Minute
 
 // Every tick from `fromNs` (inclusive) up to and including `nowNs`, in
 // order, plus the first tick still in the future (bounded scan, constraint:
@@ -141,18 +146,59 @@ fn dueTicks(t: trigger, fromNs: int, nowNs: int): ([]int, int)! {
   return (ticks, next)
 }
 
-// The index in `ticks` (ascending, as `dueTicks` returns them) of the first
-// tick to enqueue at `nowNs`. A tick more than `scheduleGracePolls`
-// poll intervals past its due time is missed; the missed ones form a prefix
-// of `ticks` and `policy` keeps the newest `missedEnqueueCount` of them.
-// Every on-time tick after the prefix is kept whatever the policy.
-fn firstFiredTick(ticks: []int, nowNs: int, pollInterval: int, policy: Missed): int {
-  let graceNs = scheduleGracePolls * pollInterval
+// Whether tick `tick` is missed at `nowNs` when the tick after it is due at
+// `following`: later than `scheduleMissedAfter`, or than the period when that
+// is shorter (the next tick is then already due).
+fn tickMissed(tick: int, following: int, nowNs: int): bool {
+  let window = following - tick
+  if (window > scheduleMissedAfter) {
+    window = scheduleMissedAfter
+  }
+  return nowNs - tick > window
+}
+
+// How many of `ticks` (ascending, as `dueTicks` returns them, with `next`
+// the tick after the last) are missed at `nowNs`. The missed ones form a
+// prefix: `min(tick + scheduleMissedAfter, following)` grows with the tick.
+fn missedTickCount(ticks: []int, next: int, nowNs: int): int {
   let late = 0
-  while (late < len(ticks) && nowNs - ticks[late] > graceNs) {
+  while (late < len(ticks) && tickMissed(ticks[late], followingTick(ticks, next, late), nowNs)) {
     late = late + 1
   }
+  return late
+}
+
+// The tick after `ticks[i]`: `ticks[i + 1]`, or `next` for the last one.
+fn followingTick(ticks: []int, next: int, i: int): int {
+  if (i + 1 < len(ticks)) {
+    return ticks[i + 1]
+  }
+  return next
+}
+
+// The index in `ticks` of the first tick to enqueue at `nowNs`: the missed
+// prefix keeps its newest `missedEnqueueCount` ticks under `policy`, every
+// tick after the prefix is kept whatever the policy.
+fn firstFiredTick(ticks: []int, next: int, nowNs: int, policy: Missed): int {
+  let late = missedTickCount(ticks, next, nowNs)
   return late - missedEnqueueCount(late, policy)
+}
+
+// The `Missed.<Policy>` spelling used in the drop log.
+fn missedName(policy: Missed): string {
+  match (policy) {
+    Skip => return "Skip"
+    RunOnce => return "RunOnce"
+    RunAll(runAllCap) => return "RunAll(${runAllCap})"
+  }
+}
+
+// The line logged when `policy` drops missed ticks: `late` ticks were missed,
+// from `ticks[0]` to `ticks[late - 1]`, and `kept` of them were enqueued.
+fn missedMessage(id: string, ticks: []int, late: int, kept: int, policy: Missed): string {
+  let first = Timestamp{ ns = ticks[0] }.toString()
+  let last = Timestamp{ ns = ticks[late - 1] }.toString()
+  return "jobs: schedule '${id}' missed ${late} tick(s) from ${first} to ${last}; Missed.${missedName(policy)} enqueued ${kept}\n"
 }
 
 // How many catch-up jobs to enqueue for `missed` ticks that all came due
