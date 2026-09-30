@@ -496,6 +496,10 @@ explainMismatch() {
         if (pa == 0 || pa != pb) { return 0 }
         if (substr(linesA[i], 1, pa) != substr(linesB[i], 1, pb)) { return 0 }
         ta = substr(linesA[i], pa + 2); tb = substr(linesB[i], pb + 2)
+        # The oracle could not type the call at all (`<error>`, its E0128 on
+        # named arguments to a static), or left the own type parameter of a method
+        # unsubstituted (`U`): the tree types it.
+        if (ta == "<error>" || ta ~ /^[A-Z]$/) { hit = 1; continue }
         ea = ""; eb = ""
         if (match(ta, /![A-Za-z_][A-Za-z0-9_]*$/)) { ea = substr(ta, RSTART); ta = substr(ta, 1, RSTART - 1) }
         if (match(tb, /![A-Za-z_][A-Za-z0-9_]*$/)) { eb = substr(tb, RSTART); tb = substr(tb, 1, RSTART - 1) }
@@ -585,7 +589,7 @@ explainMismatch() {
         if (selfRebound(nA, linesA, nB, linesB)) {
           print "6265-closure-bound-static-self"; exit 0
         }
-        if (file ~ /run_generic_class_init_(written_args|inferred)[.]bit$/ && genericCtorTypeArgs(nA, linesA, nB, linesB)) {
+        if (file ~ /run_generic_class_(init_(written_args|inferred)|static_(make|own|tag))[.]bit$/ && genericCtorTypeArgs(nA, linesA, nB, linesB)) {
           print "6363-generic-ctor-type-args"; exit 0
         }
         exit 1
