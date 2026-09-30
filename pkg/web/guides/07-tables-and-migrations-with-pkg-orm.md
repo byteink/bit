@@ -49,12 +49,19 @@ each get their own constraint.
 A bare `table(...)` call only builds a tree in memory. A class implementing
 `Migration` - `up`/`down`, each taking a `Schema` - is what turns it into
 something you run once, safely, and record having run. `Schema.create`
-wraps the identical `table(...)` builder above:
+wraps the identical `table(...)` builder above. `bit make migration
+create_users` creates the file for you, named with the current time in
+UTC, and you fill in its `up`/`down`:
+
+```text
+$ bit make migration create_users
+created migrations/2026_01_01_000001_create_users.bit
+```
 
 ```bit
-import { Migration, Schema } from "orm"
+import { Schema } from "orm"
 
-class CreateUsers {
+export class CreateUsers {
   up(s: Schema): ()! {
     s.create("users", (t) => {
       t.id("id")
@@ -68,68 +75,57 @@ class CreateUsers {
   }
 
   down(s: Schema): ()! {
-    s.drop("users")?
+    s.table("users", (t) => {
+      t.dropColumn("role")
+    })?
   }
 }
 ```
 
-Interfaces are structural: `CreateUsers` satisfies `Migration` simply by
-declaring both methods, no `implements` clause needed. `up` describes the
-change forward, `down` describes its exact reverse - here, one
-`CREATE TABLE` and one `DROP TABLE`.
+`CreateUsers` needs no `implements Migration` clause - interfaces are
+structural, so declaring both methods is enough. `up` describes the change
+forward; `down` describes its own reverse, one column at a time, the exact
+opposite of whatever columns `up` added.
 
-Bit has no reflection, so nothing can scan a `migrations/` folder and
-discover what is in it. The registry is a plain list you write by hand,
-pairing each class with a file name - the string the ledger records, and
-the order migrations apply in:
-
-```bit
-import { Data, MigrationFile, Postgres, RunnerDialect, ServerDialect, migrate } from "orm"
-import { now } from "std/time"
-
-fn postgresDialect(): RunnerDialect {
-  return RunnerDialect{ render = Postgres{}, server = ServerDialect.Postgres }
-}
-
-fn deployUsersOnly(db: Data): ()! {
-  let files = [MigrationFile{ name = "0001_create_users", m = CreateUsers{} }]
-  migrate(db, postgresDialect(), files, now())?
-}
-```
-
-`migrate` takes an advisory lock (so two instances deploying at the same
-moment never race each other), then applies every migration not yet
-recorded in the ledger, in ascending file-name order, all as one new
-batch. Run `deployUsersOnly` against a fresh database and you get:
+Bit has no reflection, so nothing here scans `migrations/` itself and
+decides what to run - `bit migrate` does that for you, at build time, every
+time you run it. Applying `CreateUsers` alone:
 
 ```text
-inkwell: applied 5 migration(s)
+$ bit migrate --url postgres://localhost/inkwell
+applied 2026_01_01_000001_create_users
 ```
 
-Run it again and nothing pending is left - the report's `applied` list
-comes back empty, because `0001_create_users` is already in the ledger.
-(That transcript is from the fuller registry below, all five migrations at
-once; a database with only `CreateUsers` registered reports one.)
+Run it again and nothing is left pending - `bit migrate` prints nothing,
+because `2026_01_01_000001_create_users` is already recorded. You never
+write down which file goes with which class, or in what order: the file
+name is both, and `bit migrate` sorts `migrations/` by name to get the
+order right.
 
-## Grow the registry: articles, tags, comments, and the tags join table
+## Add the rest of the schema: articles, tags, comments, and the tags join table
 
-Inkwell needs four more tables. `articles` and `comments` each reference
-`users` with a foreign key; `tags` is a plain lookup table; and an article
-can have many tags while a tag can belong to many articles, which is a
-relationship [Relationships](09-relationships.md) covers in the app layer,
-but the join table itself belongs here, next to the rest of the schema:
+Inkwell needs four more tables, each its own file. `articles` and
+`comments` each reference `users` with a foreign key; `tags` is a plain
+lookup table; and an article can have many tags while a tag can belong to
+many articles, which is a relationship [Relationships](09-relationships.md)
+covers in the app layer, but the join table itself belongs here, next to
+the rest of the schema:
+
+```text
+$ bit make migration create_articles
+created migrations/2026_01_01_000002_create_articles.bit
+$ bit make migration create_tags
+created migrations/2026_01_01_000003_create_tags.bit
+$ bit make migration create_comments
+created migrations/2026_01_01_000004_create_comments.bit
+$ bit make migration create_article_tags
+created migrations/2026_01_01_000005_create_article_tags.bit
+```
 
 ```bit
-import { ManyToManyDesc, ReferentialAction, manyToManyTable } from "orm"
+import { ReferentialAction } from "orm"
 
-fn articleTagsDesc(): ManyToManyDesc {
-  return ManyToManyDesc{
-    joinTable = "article_tags", ownerColumn = "article_id", ownerTable = "articles",
-    ownerIdColumn = "id", targetColumn = "tag_id", targetTable = "tags", targetIdColumn = "id",
-  }
-}
-
-class CreateArticles {
+export class CreateArticles {
   up(s: Schema): ()! {
     s.create("articles", (t) => {
       t.id("id")
@@ -145,11 +141,15 @@ class CreateArticles {
   }
 
   down(s: Schema): ()! {
-    s.drop("articles")?
+    s.table("articles", (t) => {
+      t.dropColumn("slug")
+    })?
   }
 }
+```
 
-class CreateTags {
+```bit
+export class CreateTags {
   up(s: Schema): ()! {
     s.create("tags", (t) => {
       t.id("id")
@@ -158,11 +158,15 @@ class CreateTags {
   }
 
   down(s: Schema): ()! {
-    s.drop("tags")?
+    s.table("tags", (t) => {
+      t.dropColumn("name")
+    })?
   }
 }
+```
 
-class CreateComments {
+```bit
+export class CreateComments {
   up(s: Schema): ()! {
     s.create("comments", (t) => {
       t.id("id")
@@ -178,35 +182,34 @@ class CreateComments {
   }
 
   down(s: Schema): ()! {
-    s.drop("comments")?
+    s.table("comments", (t) => {
+      t.dropColumn("body")
+    })?
+  }
+}
+```
+
+The join table's own file builds its `SchemaOp` differently: no `Schema`
+method builds a join table directly, so it calls `manyToManyTable` - which
+already returns a full `SchemaOp` - and appends the result to `s.ops`
+itself:
+
+```bit
+import { ManyToManyDesc, manyToManyTable } from "orm"
+
+fn articleTagsDesc(): ManyToManyDesc {
+  return ManyToManyDesc{
+    joinTable = "article_tags", ownerColumn = "article_id", ownerTable = "articles",
+    ownerIdColumn = "id", targetColumn = "tag_id", targetTable = "tags", targetIdColumn = "id",
   }
 }
 
-// No `Schema` method builds a join table directly - `manyToManyTable`
-// already returns a full `SchemaOp`, so `up` appends it to `s.ops` (`export`
-// exactly so a prebuilt op can be added this way).
-class CreateArticleTags {
+export class CreateArticleTags {
   up(s: Schema): ()! {
     s.ops = append(s.ops, manyToManyTable(articleTagsDesc()))
   }
 
-  down(s: Schema): ()! {
-    s.drop("article_tags")?
-  }
-}
-
-export fn migrations(): []MigrationFile {
-  return [
-    MigrationFile{ name = "0001_create_users", m = CreateUsers{} },
-    MigrationFile{ name = "0002_create_articles", m = CreateArticles{} },
-    MigrationFile{ name = "0003_create_tags", m = CreateTags{} },
-    MigrationFile{ name = "0004_create_comments", m = CreateComments{} },
-    MigrationFile{ name = "0005_create_article_tags", m = CreateArticleTags{} },
-  ]
-}
-
-export fn applyMigrations(db: Data): ()! {
-  migrate(db, postgresDialect(), migrations(), now())?
+  down(s: Schema): ()! {}
 }
 ```
 
@@ -216,17 +219,20 @@ once, here, instead of being an accident of whichever query happens to run
 first. `manyToManyTable` builds `article_tags` with a composite primary key
 across both foreign keys and an index on the target column; [Many-to-many
 relations](../../orm/docs/manytomany.md) covers exactly what DDL that
-produces.
+produces. `articleTagsDesc` stays private to its own file - nothing else in
+the app builds this description by hand, so nothing else needs to import
+it.
 
-`applyMigrations` is the same call `bit migrate` makes for you once each
-migration lives in its own file under `migrations/` - Inkwell runs it that
-way, one file per step named `YYYY_MM_DD_HHMMSS_<name>.bit`, before the app
-ever starts, rather than reopening a second connection to apply its schema
-at boot. Running the registry above against a fresh database prints:
+Running `bit migrate` against a fresh database picks up all five files, in
+file-name order, as one batch:
 
 ```text
-postgres: connected with sslmode=disable - credentials and query results cross the network in the clear.
-inkwell: applied 5 migration(s)
+$ bit migrate --url postgres://localhost/inkwell
+applied 2026_01_01_000001_create_users
+applied 2026_01_01_000002_create_articles
+applied 2026_01_01_000003_create_tags
+applied 2026_01_01_000004_create_comments
+applied 2026_01_01_000005_create_article_tags
 ```
 
 and every table exists, verified against a real Postgres container:
@@ -244,29 +250,34 @@ create index "article_tags_tag_id_idx" on "article_tags" ("tag_id")
 
 ## The sharp edge: rolling back only ever undoes the last batch
 
-```bit
-import { rollback } from "orm"
-
-fn undoLastDeploy(db: Data): ()! {
-  rollback(db, postgresDialect(), migrations())?
-}
+```text
+$ bit migrate rollback --url postgres://localhost/inkwell
+rolled back 2026_01_01_000005_create_article_tags
+rolled back 2026_01_01_000004_create_comments
+rolled back 2026_01_01_000003_create_tags
+rolled back 2026_01_01_000002_create_articles
+rolled back 2026_01_01_000001_create_users
 ```
 
-`rollback(db, postgresDialect(), migrations())` undoes every migration
-applied by the MOST RECENT `migrate` call - the highest recorded batch,
-newest file first - and nothing older. [Apply
-migrations](../../orm/docs/migrate.md) covers the batch rule in full. A
-schema change that real writes now depend on is undone with a new,
-forward migration, never by rolling back an old one that shipped batches
-ago.
+`bit migrate rollback` undoes every migration applied by the MOST RECENT
+`bit migrate` run - the highest recorded batch, newest file first - and
+nothing older. [Apply migrations](../../orm/docs/migrate.md) covers the
+batch rule in full. Each file's own `down` only runs what it wrote above:
+`create_article_tags`'s `down` is empty, since nothing here undoes the join
+table, and the other four each drop back the one column their own `up`
+added last. A schema change that real writes now depend on is undone with
+a new, forward migration, never by rolling back an old one that shipped
+batches ago.
 
 ## What we built
 
-A migration registry covering `users`, `articles`, `tags`, `comments` and
-the `article_tags` join table, and the `migrate` call that applies it.
-Inkwell keeps one migration per file under `migrations/` and runs `bit
-migrate` before the app starts, rather than calling `migrate` from its own
-code at boot.
+Five migration files under `migrations/` - `users`, `articles`, `tags`,
+`comments` and the `article_tags` join table - one class per file, and
+`bit migrate` to apply them. Inkwell's own `pkg/web/guides/inkwell/
+migrations/` directory is these same five files; its build and test gate
+runs `bit migrate` once, against a throwaway Postgres, before the app or
+its tests ever start - the app itself opens one database connection and
+never calls `migrate` from its own code.
 
 Specification: [Schema](../../orm/docs/schema.md), [Apply
 migrations](../../orm/docs/migrate.md), [Many-to-many
