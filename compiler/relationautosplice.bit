@@ -1,0 +1,210 @@
+// compiler/relationautosplice.bit — R1 (#6302): the build-path half of
+// `compiler/relationauto.bit`'s analysis. For every query CALL node the
+// analysis recorded relation names against (`Checker.relationAutoWith`),
+// splices `.with("f")` into that call's own receiver chain, one link per
+// name, skipping any name the chain already names explicitly.
+//
+// BUILD PATH ONLY, called from `compiler/build.bit`'s `buildIr` after
+// `checkProject` succeeds and before lowering — never from `check`/`bit doc`/
+// the LSP, which reuse the parsed tree as-is (#2348): a mutated tree handed
+// back to an editor would desync from what the author actually typed.
+//
+// TEXT FOR THE NEW NODES. An identifier's or string literal's text is a
+// SLICE of the module source (`compiler/synthtext.bit`'s own header states
+// the same problem for synthesized class members), so `"with"` and each
+// quoted relation name are appended to `c.source` directly — `synthtext.bit`
+// itself works on a `SrcModule`, one step too early: this pass runs on
+// `Checker`s, built from a COPY of `SrcModule.source` taken before this
+// pass ever runs (`checkproject.bit`'s `resolveProject`), so appending onto
+// the `SrcModule` instead would never reach the `Checker`/`Tree` pair
+// lowering actually reads.
+//
+// TYPES FOR THE NEW NODES. `with(name: string): Repo<T>` (pkg/orm/repo.bit)
+// returns the identical type its own receiver carries — the fluent-chain
+// shape `where`/`orderBy`/`limit`/`offset` already have — so every new
+// `Member`/`Call` node this pass builds is stamped with the ORIGINAL
+// receiver's own resolved type, copied straight off `c.nodeTypes`, never
+// re-inferred. `c.nodeTypes` is sized to `len(c.tree.nodes)` once, at
+// `newChecker` (compiler/check.bit) — a new node's index is only ever valid
+// after `relationAutoGrowNodeTypes` pads the array back out to match.
+
+// Where this pass's own synthesized words live — `compiler/synthtext.bit`'s
+// `SynthText` shape, kept as its own tiny type rather than reused: that one
+// is keyed to a `SrcModule` append (`appendSynthText`'s own signature), and
+// this pass appends onto a `Checker`'s `source` instead (this file's header).
+class RelationAutoSynth {
+  file: int,
+  spans: map<string, Span>,
+}
+
+// `appendSynthText`'s own body (synthtext.bit), targeting `c.source`
+// instead of a `SrcModule`'s.
+fn relationAutoAppendWords(c: Checker, file: int, words: []string): RelationAutoSynth {
+  let st = RelationAutoSynth{ file = file, spans = map<string, Span>{} }
+  let base = len(c.source)
+  let buf = []byte(0)
+  for w of words {
+    let (_, dup) = st.spans[w]
+    if (dup) {
+      continue
+    }
+    let start = base + len(buf)
+    st.spans[w] = Span{ file = file, start = start, end = start + len(w) }
+    buf = append(buf, w)
+    buf = append(buf, " ")
+  }
+  c.source = c.source + string(buf)
+  return st
+}
+
+fn relationAutoSpan(st: RelationAutoSynth, word: string): Span {
+  let (sp, ok) = st.spans[word]
+  if (!ok) {
+    panic("relationautosplice: '${word}' was never appended to this module's source")
+  }
+  return sp
+}
+
+// `"f"` — a relation field name is a plain Bit identifier
+// (`[A-Za-z_][A-Za-z0-9_]*`), so no escaping is needed, the same guarantee
+// `desugarjsx.bit`'s `jsxQuoteWord` documents for a tag/attribute name.
+fn relationAutoQuote(name: string): string {
+  return "\"" + name + "\""
+}
+
+// Every distinct word this pass's own splices need appended, for every
+// query `mods` records at least one relation name against — `with` once if
+// any splice fires at all, plus each quoted relation name across the whole
+// module (`RelationAutoSynth`'s own dedup drops a repeat across different
+// queries in the same module for free).
+fn relationAutoWordsFor(c: Checker): []string {
+  let words = []string(0)
+  for (_, names) of c.relationAutoWith {
+    for n of names {
+      words = append(words, relationAutoQuote(n))
+    }
+  }
+  if (len(words) != 0) {
+    words = append(words, "with")
+  }
+  return words
+}
+
+fn relationAutoGrowNodeTypes(c: Checker) {
+  while (len(c.nodeTypes) < len(c.tree.nodes)) {
+    c.nodeTypes = append(c.nodeTypes, 0)
+  }
+}
+
+// Every relation name a `.with(...)` link ALREADY in `expr`'s own receiver
+// chain names, walking back through `ormChainMethodNames()`
+// (checkormquery.bit) the same shape `ormChainRoot` walks. Stops (returns
+// what it found so far) at the first link the walk cannot follow — a bound
+// variable, an unrelated call — which is this pass's own accepted false
+// negative: an already-loaded relation reached only through an intermediate
+// variable is not seen here and may be requested a second time, a harmless
+// extra `__loadRelation` call rather than a wrong one (this file's own
+// header, and `relationauto.bit`'s "A KNOWN, ACCEPTED GAP"). Bounded at 64
+// links, the same bound `ormChainRoot` uses.
+fn relationAutoExistingWithNames(tree: Tree, source: string, expr: int): []string {
+  let out = []string(0)
+  let cur = expr
+  let guard = 0
+  while (guard < 64) {
+    guard = guard + 1
+    if (cur == 0 || getNode(tree, cur).tag != Tag.Call) {
+      return out
+    }
+    let callee = kidsOf(tree, cur)[0]
+    if (getNode(tree, callee).tag != Tag.Member) {
+      return out
+    }
+    let mk = kidsOf(tree, callee)
+    let mname = identText(tree, source, mk[1])
+    if (mname == "with") {
+      let argNode = ormFirstArgExpr(tree, cur)
+      if (argNode != 0 && getNode(tree, argNode).tag == Tag.StringLit) {
+        out = append(out, stringLitText(source, getNode(tree, argNode).span))
+      }
+    } else if (!ormNameIn(mname, ormChainMethodNames())) {
+      return out
+    }
+    cur = mk[0]
+  }
+  return out
+}
+
+// Splices one `.with(name)` link between `recv` and whatever came after it,
+// `ty` copied onto both new nodes (this file's header). Returns the new
+// link's own `Call` node — the receiver the NEXT link (or the terminal
+// call) must point at.
+fn relationAutoSpliceOne(c: Checker, st: RelationAutoSynth, recv: int, name: string, ty: int): int {
+  let sp = getNode(c.tree, recv).span
+  let nameLit = addLeaf(c.tree, Tag.StringLit, relationAutoSpan(st, relationAutoQuote(name)))
+  let argsNode = addNode(c.tree, Tag.Args, sp, 0, [addNode(c.tree, Tag.Arg, sp, 0, [nameLit])])
+  let nameIdent = addLeaf(c.tree, Tag.Ident, relationAutoSpan(st, "with"))
+  let callee = addNode(c.tree, Tag.Member, sp, 0, [recv, nameIdent])
+  let call = addNode(c.tree, Tag.Call, sp, 0, [callee, 0, argsNode])
+  relationAutoGrowNodeTypes(c)
+  c.nodeTypes[callee] = ty
+  c.nodeTypes[call] = ty
+  c.nodeTypes[nameLit] = primType(c.ctx, 11) // "string", primName's own index (compiler/types.bit)
+  return call
+}
+
+// Rewrites `callNode`'s own receiver chain in place: `calleeKids` is a
+// VIEW into `tree.extra` (`ast.bit`'s own header on `kidsOf`), so writing
+// `calleeKids[0]` mutates the shared pool directly — `callNode` and its own
+// `Member` callee keep their original identity; only the receiver they
+// point at changes.
+fn relationAutoSpliceCall(c: Checker, st: RelationAutoSynth, callNode: int, names: []string) {
+  let callee = kidsOf(c.tree, callNode)[0]
+  if (getNode(c.tree, callee).tag != Tag.Member) {
+    return
+  }
+  let calleeKids = kidsOf(c.tree, callee)
+  let recv = calleeKids[0]
+  if (recv == 0) {
+    return
+  }
+  // `checkExprType`, not `c.nodeTypes[recv]` — see `relationauto.bit`'s
+  // `relationAutoSourceCall` header: a bare identifier receiver is never
+  // written into `nodeTypes` by the ordinary check sweep.
+  let ty = checkExprType(c, recv)
+  let already = relationAutoExistingWithNames(c.tree, c.source, recv)
+  for name of names {
+    if (ormNameIn(name, already)) {
+      continue
+    }
+    recv = relationAutoSpliceOne(c, st, recv, name, ty)
+  }
+  calleeKids[0] = recv
+}
+
+fn relationAutoSpliceModule(c: Checker) {
+  let words = relationAutoWordsFor(c)
+  if (len(words) == 0) {
+    return
+  }
+  let st = relationAutoAppendWords(c, 0, words)
+  for (callNode, names) of c.relationAutoWith {
+    relationAutoSpliceCall(c, st, callNode, names)
+  }
+}
+
+// Entry point: splices every auto `.with(...)` this build found, then
+// lowers — one call, so `buildIr` (compiler/build.bit) needs no line of its
+// own past the `lowerForTarget` call it already made (LINT.md's 80-line
+// ceiling: `buildIr` sits exactly at it). See this file's header for why
+// this only ever runs from the build path, never `check`/`bit doc`/the LSP.
+fn spliceAndLowerForTarget(
+  mods: []Checker,
+  root: int,
+  target: BuildTarget,
+  freestanding: bool,
+): IrModule {
+  for c of mods {
+    relationAutoSpliceModule(c)
+  }
+  return lowerForTarget(mods, root, target, freestanding)
+}
