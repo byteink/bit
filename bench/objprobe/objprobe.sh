@@ -63,7 +63,7 @@
 # bench/run.sh uses, with `BIT_GC_STATS` UNSET -- those counters cost a measured
 # +5.5% cycles on this exact workload (runtime/ABI.md SS8.2), so the counting run
 # and the timed runs are deliberately separate runs. Take the box first:
-#   .claude/boxlock.sh solo bench/objprobe/objprobe.sh ...
+#   boxlock.sh solo bench/objprobe/objprobe.sh ...
 # and check `ps -eo comm= -A | grep -c make-driver` is 0 before AND after.
 set -e
 
@@ -402,6 +402,6 @@ if [ -n "$BASELINE" ]; then
   echo "objprobe: NULL for this comparison, measured: two runs of the SAME tree and the same"
   echo "objprobe:   arm gave 1.003x, and three gave a 0.55% span. Read any ratio inside about"
   echo "objprobe:   0.5% as this instrument's noise, not as a result. Widen -r, or take the box"
-  echo "objprobe:   with '.claude/boxlock.sh solo', before claiming anything smaller."
+  echo "objprobe:   with 'boxlock.sh solo', before claiming anything smaller."
 fi
 notes

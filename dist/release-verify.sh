@@ -7,7 +7,7 @@
 # done out of order under pressure. 0.1.10 was cut, probed, un-drafted,
 # verified, brewed, imaged and repinned - and the website step was skipped,
 # because the repin jumped the queue, and the site silently kept serving the
-# previous release's docs. See .claude/skills/bit-release/SKILL.md §9 for the
+# previous release's docs. See SKILL.md §9 for the
 # checklist this script replaces.
 #
 # Silence + exit 0 means every surface serves <version>. Each failure prints
