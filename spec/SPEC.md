@@ -1721,14 +1721,20 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   anywhere in the project resolves to; and a row passed to a named function
   that reads the relation off its parameter when the argument cannot be
   traced to a query that loads it (the error lands on the argument at the
-  call). Assigning `x.f = ...` - directly, or as a composite-literal field
+  call); a parameter the call omits is its default expression, judged the same
+  way (the error lands on the default, once however many calls omit it).
+  Assigning `x.f = ...` - directly, or as a composite-literal field
   init a `let` binds straight to - earlier in the same function counts as
   loaded, source-order only (no branch-exact control-flow tracking); a
   callee that assigns `p.f` before reading it needs nothing loaded by its
   callers, so a call passing a row the compiler cannot trace builds. A
   value stored into a query's own rows - `rows[0] = v`, `rows = v`, through
   any alias - is held to the same standard as a field store: the read is
-  proven only when that value's own query loads the relation too.
+  proven only when that value's own query loads the relation too. The same
+  holds for a store into a parameter's own rows (`p = v`, `p[0] = v`, through
+  any alias): a read through that parameter, or through a closure that captures
+  it, is proven only when the stored value's own source loads the relation as
+  well as the callers' arguments doing so, and the error names the store.
 - **Following the error's advice always fixes it.** A row held in a struct
   field, a map value, or a local variable or parameter a closure captures
   (a parameter's stores are the arguments of every call to its function) is proven
@@ -1740,7 +1746,12 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   the rows. One store of a row this analysis cannot trace (raw SQL, a value
   from a parameter, a composite literal) leaves the holder unproven: a proof
   never rests on the stores that happen to be visible. Empty initialisers
-  (`[]T(0)`, `[]T{}`) store no rows.
+  (`[]T(0)`, `[]T{}`) store no rows. Rows from raw SQL are the one origin no
+  `.with(...)` can ever load, so their error does not ask for one: it says the
+  rows come from raw SQL and names what works - read the relation through
+  `db.table<T>().with("rel")`, or select its columns in the SQL and read them as
+  fields of the row class - and, when the rows were stored, the line of the
+  store.
 - There is no runtime lazy loading: every database access, and every error
   it can raise, happens at the query call's own `?`. Reading a relation
   field the compiler proved loaded is a plain memory read that cannot
