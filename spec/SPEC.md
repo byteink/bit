@@ -900,9 +900,9 @@ let a = Account(500)?
   is judged against `init`'s parameter type with the class's type arguments
   substituted (`first: i64`, `second: string`). The type-argument list must
   have exactly the class's own length (`E0058`, as in type position), and
-  a class that is not generic takes none. `Pair(7, "s")`, a generic class's
-  `init` with no type arguments written, names no instantiation and is also
-  `E0058`: the type arguments are not inferred from the arguments.
+  a class that is not generic takes none. With none written, `Pair(7, "s")`
+  and `Pair(second = "s", first = 7)` infer `Pair<i64, string>` from `init`'s
+  arguments as a generic call does (§15.3); a parameter none binds is `E0068`.
 - One `init` per class; a second is a compile error. Bit has no constructor
   overloading.
 - **A class declaring `init` may not be built with a composite literal
@@ -4671,6 +4671,12 @@ gets against a non-slice type.
   parameter is inferred by unifying parameter types with argument types. If any
   type parameter cannot be inferred, the call is an error and explicit type
   arguments are required (`f<T>(args)`, §12.7).
+- Constructing a generic class is such a call, unified against `init`'s
+  parameters, positional or named (§12.11): given `class Pair<A, B> { init(first:
+  A, second: B) }`, `Pair(7, "s")` is a `Pair<i64, string>`. A type parameter no
+  `init` parameter mentions cannot be inferred: `class Box<T> { init(n: i64) }`
+  called as `Box(3)` is `E0068`, "cannot infer type parameter 'T' of 'Box'; write
+  Box<T>(...)", and `Box<i64>(3)` constructs it.
 
 ### 15.4 Untyped Constants
 
