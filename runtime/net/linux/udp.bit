@@ -193,68 +193,31 @@ fn netRecvFromLoop(fd: int, gen: int, buf: *u8, bufCap: int, peer: *u8): int {
 // DNS
 // ---------------------------------------------------------------------------
 
-// Closes a DNS socket's fd directly, bypassing `netClose` (./sock.bit).
+// DNS I/O rides the same non-blocking socket + netpoller path TCP and UDP
+// use (#6341). A lookup used to be a raw blocking `sendto`/`recvfrom` with
+// SO_RCVTIMEO inside `@nosplit` code: the OS thread sat in the kernel for up
+// to `netDnsTimeoutMs` per attempt with no safepoint, so every stop-the-world
+// attempted meanwhile stalled, and the thread could do nothing else. Now the
+// resolving task parks on readability with the attempt's deadline
+// (`netAwaitReadyOrDeadline`, ./tcpdeadline.bit), the OS thread returns to the
+// scheduler, and the collector sees an ordinary parked task.
 //
-// #6338: `netDnsSocket` below never calls `netPollDescOpen`/`pdOpen` -- this
-// socket is deliberately raw and blocking (see its own header) and never
-// parks, so it has no poll-descriptor registration to unregister. `netClose`
-// assumes every fd it is given WAS `pdOpen`'d: it routes through
-// `pdFdMarkClosing`/`pdFdRelease` (../../sched/polldesc.bit), which marks
-// `pdRefWord[fd]`'s `closing`/`closed` bits and leaves them set until a
-// FUTURE `pdOpen` on that same fd number clears them. A DNS socket's fd is
-// never `pdOpen`'d going IN, so those bits are never cleared coming OUT
-// either -- the very next unrelated caller to inherit this fd number from
-// the kernel (observed on the darwin twin: `../netabi.bit`'s
-// `readResolvConf`, reading `/etc/resolv.conf` on the NEXT `resolve()` call,
-// via `netReadSock`'s own `netFdAcquire`) finds `closing` already set and is
-// refused before it issues a single syscall -- 9 of 10 real lookups failing
-// instantly after the first succeeded. `syscall(sysClose(), ...)` (the same
-// close primitive `../../sched/linux/poll.bit` uses for its own
-// never-`pdOpen`'d epoll fd) is the correct close for a resource that was
-// never registered with that bookkeeping in the first place.
-@nosplit fn netDnsCloseFd(fd: int) {
-  let _ = int(syscall(sysClose(), i64(fd)))
-}
+// The socket is registered with `pdOpen` (`netSysSocketFamily`, ./sock.bit)
+// and released with `netClose` like every other socket. That also retires the
+// raw-close workaround #6338 needed for its unregistered fd: `netClose`'s
+// closing/closed bits are cleared by the next `pdOpen` on the same fd number.
+//
+// NO RAW SCRATCH POINTER IS HELD ACROSS A PARK. `dnsBytes()`/`saBytes2()`/
+// `sa6Bytes()` are per-worker slots, and a task may resume on another worker
+// (or share its old worker with a second resolving task) after a park, so each
+// is re-derived at the point of use: the query is rebuilt and sent, and the
+// reply parsed, with no park between the buffer write and the syscall or
+// parse that consumes it.
 
-// A BLOCKING socket with SO_RCVTIMEO, ON PURPOSE, for `family` (`afInet()`
-// or `afInet6()`, #6338). DNS is an occasional millisecond cost, so a
-// bounded receive timeout buys a real error on packet loss without putting
-// timer-driven wakes on the poller. It blocks the calling worker for up to
-// `netDnsTimeoutMs` on a lost packet; move it onto the poller if resolution
-// ever sits on a hot path.
+// A non-blocking datagram socket for `family` (`afInet()` or `afInet6()`,
+// #6338), registered with the poller, or -1.
 @nosplit fn netDnsSocketFamily(family: int): int {
-  let fd = sysRc(
-    int(
-      syscall(
-        sysSocket(), i64(family),
-        i64(sockDgram() + sockCloExec()), 0,
-      ),
-    ),
-  )
-  if (fd < 0) {
-    return 0 - 1
-  }
-  // BOTH fields are 64 bits here, unlike Darwin's 32-bit `tv_usec`.
-  let k = 0
-  while (k < tvSize) {
-    putU8(tvBytes(), k, 0)
-    k = k + 1
-  }
-  putU64Le(tvBytes(), tvSecOff, netDnsTimeoutMs / 1000)
-  putU64Le(tvBytes(), tvUsecOff, netDnsTimeoutMs % 1000 * 1000)
-  if (sysRc(
-      int(
-        syscall(
-          sysSetSockOpt(), i64(fd), i64(solSocket()), i64(soRcvTimeo()),
-          i64(int(tvBytes())), i64(tvSize),
-        ),
-      ),
-    ) <
-    0) {
-    netDnsCloseFd(fd)
-    return 0 - 1
-  }
-  return fd
+  return netSysSocketFamily(family, true)
 }
 
 export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(): int {
@@ -269,42 +232,135 @@ export @symbol("bit_rt_port_net_dns_socket6") @nosplit fn netDnsSocket6(): int {
   return netDnsSocketFamily(afInet6())
 }
 
-// The receive timeout configured on `fd`, in milliseconds, or -1 if the query
-// fails. Zero means no timeout is set.
-//
-// EXISTS TO BE ASSERTED ON, and deliberately so — the same argument
-// runtime/park/linux's `parkTimerSlackNs` makes. `class timeval` is one of the
-// three real layout differences between this file and its twin (`tv_usec` is 32
-// bits on Darwin and 64 on Linux), and the ONLY behavioural guard for getting it
-// wrong is that a DNS query hangs instead of timing out. A guard whose failure
-// mode is a hang is not a guard: the harness reports a wedged suite rather than
-// a verdict, which is the trap this project has already hit once. Reading the
-// value back cannot hang and cannot flake.
-export @symbol("bit_rt_port_net_rcv_timeo_ms") @nosplit fn netRcvTimeoMs(fd: int): int {
-  let k = 0
-  while (k < tvSize) {
-    putU8(tvBytes(), k, 0)
-    k = k + 1
+// Points the datagram socket `fd` at the nameserver `ns` (four bytes, or
+// sixteen when `v6`) on `port`. A UDP `connect` is a local bookkeeping call
+// that never blocks, and it means every later send needs no address (so none
+// is held across a park) and the kernel drops replies from any other source.
+@nosplit fn netDnsConnect(fd: int, v6: bool, ns: *u8, port: int): bool {
+  if (v6) {
+    netFillSockAddr6(sa6Bytes(), ns, port)
+    return sysRc(int(syscall(sysConnect(), i64(fd), i64(int(sa6Bytes())), i64(sa6Len)))) >= 0
   }
-  putU32Le(lenBytes(), 0, tvSize)
-  if (sysRc(
+  netFillSockAddr(saBytes2(), ns, port)
+  return sysRc(int(syscall(sysConnect(), i64(fd), i64(int(saBytes2())), i64(saLen)))) >= 0
+}
+
+// Builds the query for `host` in this worker's `dnsBytes()` slot and sends it
+// on the connected `fd`. False when the name does not fit the wire format or
+// the kernel refuses the datagram.
+@nosplit fn netDnsSend(fd: int, host: *u8, hostLen: int): bool {
+  let query = dnsBytes()
+  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
+  if (qlen < 0) {
+    return false
+  }
+  return sysRc(int(syscall(sysSendTo(), i64(fd), i64(int(query)), i64(qlen), 0, 0, 0))) >= 0
+}
+
+// Waits for readability or the attempt's deadline. Returns the slice for the
+// next tick: the parked path leaves it alone, and the fallback (an unscheduled
+// caller, or no poller bound) sleeps or re-tries one slice, the same fallback
+// `netReadSockDeadlineLoop` (./tcpdeadline.bit) uses.
+@nosplit fn netDnsWait(fd: int, gen: int, deadline: int, slice: int): int {
+  if (netAwaitReadyOrDeadline(fd, pollRead, gen, deadline)) {
+    return slice
+  }
+  let _ = netAwaitDeadlineTick(deadline, slice)
+  return netDeadlineNextSliceNs(slice)
+}
+
+// One datagram into this worker's reply slot (`dnsBytes() + netMaxDnsMsg`),
+// waiting at most `netDnsTimeoutMs`. Returns its length, `netDeadlineTimedOut`
+// when nothing arrived in time, or -1 on a hard error. Bounded by
+// `netDeadlineMaxPolls` (Power of 10); the monotonic deadline is what ends a
+// real wait.
+@nosplit fn netDnsRecv(fd: int, gen: int): int {
+  let deadline = netClockNowNs() + netDnsTimeoutMs * 1000000
+  let slice = netDeadlineFastPollNs
+  let polls = 0
+  while (polls < netDeadlineMaxPolls) {
+    polls = polls + 1
+    let got = sysRc(
       int(
         syscall(
-          sysGetSockOpt(), i64(fd), i64(solSocket()), i64(soRcvTimeo()),
-          i64(int(tvBytes())), i64(int(lenBytes())),
+          sysRecvFrom(), i64(fd), i64(int(dnsBytes() + netMaxDnsMsg)),
+          i64(netMaxDnsMsg), 0, 0, 0,
         ),
       ),
-    ) <
-    0) {
+    )
+    if (got >= 0) {
+      return got
+    }
+    let e = lastErr()
+    if (e == eAgain()) {
+      if (netClockNowNs() >= deadline) {
+        return netDeadlineTimedOut
+      }
+      slice = netDnsWait(fd, gen, deadline, slice)
+    } else if (e != eIntr()) {
+      return 0 - 1
+    }
+  }
+  return netDeadlineTimedOut
+}
+
+// Up to `netDnsRetries` query/reply exchanges over the connected `fd`. A lost
+// or late reply, a failed send and a malformed answer (or one with no A
+// record) each cost an attempt and retransmit; a hard receive error, such as
+// the nameserver's port refusing the datagram, ends the lookup.
+@nosplit fn netDnsAttempts(fd: int, host: *u8, hostLen: int, out: *u8): bool {
+  let gen = *netFdGenAddr(fd)
+  let attempt = 0
+  // Bounded retransmits (Power of 10): a lost query is retried a fixed number
+  // of times and then reported, never waited on forever.
+  while (attempt < netDnsRetries) {
+    attempt = attempt + 1
+    if (netDnsSend(fd, host, hostLen)) {
+      let got = netDnsRecv(fd, gen)
+      if (got == 0 - 1) {
+        return false
+      }
+      if (got >= 0 && netParseAnswer(dnsBytes() + netMaxDnsMsg, got, netDnsId, out)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// A datagram socket connected to the nameserver, or -1 when the name cannot
+// be encoded (checked first, so no socket is opened for it) or the socket
+// cannot be made.
+@nosplit fn netDnsOpen(host: *u8, hostLen: int, ns: *u8, port: int, v6: bool): int {
+  if (netBuildQuery(dnsBytes(), netMaxDnsMsg, host, hostLen, netDnsId) < 0) {
     return 0 - 1
   }
-  // BOTH fields are 64 bits here.
-  return getU64Le(tvBytes(), tvSecOff) * 1000 + getU64Le(tvBytes(), tvUsecOff) / 1000
+  let family = afInet()
+  if (v6) {
+    family = afInet6()
+  }
+  let fd = netDnsSocketFamily(family)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  if (!netDnsConnect(fd, v6, ns, port)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  return fd
+}
+
+// Runs the exchange on `fd` and always closes it.
+@nosplit fn netDnsFinish(fd: int, host: *u8, hostLen: int, out: *u8): bool {
+  let ok = netDnsAttempts(fd, host, hostLen, out)
+  netClose(fd)
+  return ok
 }
 
 // Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
 // straight through; a hostname is queried against the nameserver at
-// `ns[0..4]:port`.
+// `ns[0..4]:port`. Each of the `netDnsRetries` attempts waits up to
+// `netDnsTimeoutMs`, parked on the poller.
 //
 // THE NAMESERVER IS A PARAMETER RATHER THAN READ FROM /etc/resolv.conf HERE.
 // The parse of that file is `netFirstNameserver` in ../net.bit, split out so it
@@ -328,64 +384,8 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
   if (netParseIpv4(host, hostLen, out)) {
     return true
   }
-  let query = dnsBytes()
-  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
-  if (qlen < 0) {
-    return false
-  }
-  let fd = netDnsSocket()
-  if (fd < 0) {
-    return false
-  }
-  let reply = dnsBytes() + netMaxDnsMsg
-  let attempt = 0
-  // Laid out INSIDE the loop rather than once before it: `saBuf2` is shared with
-  // `netSendTo`, so anything that ran in between may have overwritten it. The
-  // first draft filled it at the END of the body, which left the FIRST send
-  // aimed at whatever the previous caller had left there.
-  // Bounded retransmits (Power of 10): a lost query is retried a fixed number
-  // of times and then reported, never waited on forever.
-  while (attempt < netDnsRetries) {
-    netFillSockAddr(saBytes2(), ns, port)
-    if (sysRc(
-        int(
-          syscall(
-            sysSendTo(), i64(fd), i64(int(query)), i64(qlen), 0,
-            i64(int(saBytes2())), i64(saLen),
-          ),
-        ),
-      ) <
-      0) {
-      attempt = attempt + 1
-    } else {
-      let got = sysRc(
-        int(
-          syscall(
-            sysRecvFrom(), i64(fd), i64(int(reply)),
-            i64(netMaxDnsMsg), 0, 0, 0,
-          ),
-        ),
-      )
-      if (got < 0) {
-        // Timed out or interrupted: retransmit. Anything else is fatal.
-        let e = lastErr()
-        if (e != eAgain() && e != eIntr()) {
-          netDnsCloseFd(fd)
-          return false
-        }
-        attempt = attempt + 1
-      } else {
-        if (netParseAnswer(reply, got, netDnsId, out)) {
-          netDnsCloseFd(fd)
-          return true
-        }
-        // Malformed, or an answer with no A record: retry.
-        attempt = attempt + 1
-      }
-    }
-  }
-  netDnsCloseFd(fd)
-  return false
+  let fd = netDnsOpen(host, hostLen, ns, port, false)
+  return fd >= 0 && netDnsFinish(fd, host, hostLen, out)
 }
 
 // #6338: `netResolveHost`'s IPv6 twin -- `ns` is sixteen bytes (an address
@@ -402,54 +402,6 @@ export @symbol("bit_rt_port_net_resolve6") @nosplit fn netResolveHost6(
   if (netParseIpv4(host, hostLen, out)) {
     return true
   }
-  let query = dnsBytes()
-  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
-  if (qlen < 0) {
-    return false
-  }
-  let fd = netDnsSocket6()
-  if (fd < 0) {
-    return false
-  }
-  let reply = dnsBytes() + netMaxDnsMsg
-  let attempt = 0
-  while (attempt < netDnsRetries) {
-    netFillSockAddr6(sa6Bytes(), ns, 53)
-    if (sysRc(
-        int(
-          syscall(
-            sysSendTo(), i64(fd), i64(int(query)), i64(qlen), 0,
-            i64(int(sa6Bytes())), i64(sa6Len),
-          ),
-        ),
-      ) <
-      0) {
-      attempt = attempt + 1
-    } else {
-      let got = sysRc(
-        int(
-          syscall(
-            sysRecvFrom(), i64(fd), i64(int(reply)),
-            i64(netMaxDnsMsg), 0, 0, 0,
-          ),
-        ),
-      )
-      if (got < 0) {
-        let e = lastErr()
-        if (e != eAgain() && e != eIntr()) {
-          netDnsCloseFd(fd)
-          return false
-        }
-        attempt = attempt + 1
-      } else {
-        if (netParseAnswer(reply, got, netDnsId, out)) {
-          netDnsCloseFd(fd)
-          return true
-        }
-        attempt = attempt + 1
-      }
-    }
-  }
-  netDnsCloseFd(fd)
-  return false
+  let fd = netDnsOpen(host, hostLen, ns, 53, true)
+  return fd >= 0 && netDnsFinish(fd, host, hostLen, out)
 }

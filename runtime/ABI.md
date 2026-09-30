@@ -4167,10 +4167,11 @@ bit_rt_net_udp_sender_port()            -> port  // last recv's sender port, or 
 ```
 
 **DNS.** `resolve` returns the first A record for `host` as a dotted quad, or `""`
-on failure; a dotted-quad `host` passes straight back. Unlike the socket calls it
-uses a **blocking** UDP socket with `SO_RCVTIMEO` and bounded retransmits, not the
-netpoller — it blocks the calling worker for up to ~2s on a lost packet, the
-right trade for an occasional lookup (see the note in `runtime/net/net.bit`).
+on failure; a dotted-quad `host` passes straight back. It queries every
+nameserver in `/etc/resolv.conf` in order over a non-blocking UDP socket with
+bounded retransmits (3 attempts of 2 s each per nameserver). The calling task
+parks on the netpoller with the attempt's deadline, so a lost packet neither
+holds the OS thread nor delays a stop-the-world rendezvous.
 
 ```
 bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on failure

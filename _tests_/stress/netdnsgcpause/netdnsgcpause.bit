@@ -1,0 +1,144 @@
+// A task waiting on a DNS server that never answers must not hold up the
+// collector (#6341). `netResolveHost` used to sit in a `@nosplit` blocking
+// `recvfrom` for up to `netDnsTimeoutMs * netDnsRetries` = 6 s, so every
+// stop-the-world attempted meanwhile could not rendezvous with its thread and
+// was abandoned. Now the waiting task parks on the netpoller with a deadline,
+// and the collector treats it like any other parked task.
+//
+// The "server" is a local UDP socket that is bound and never read from, so the
+// query is delivered and nothing ever comes back; no packet leaves loopback.
+// The program:
+//
+//   1. starts a task that resolves a name against that socket, and waits for
+//      the query to land on it, which proves the resolver has sent and is
+//      about to wait (`netRecvFrom` parks main until the datagram arrives);
+//   2. churns 16 MiB through the collector, well past the 4 MiB default
+//      trigger, so at least one collection has to run while the resolver waits;
+//   3. reads the process-wide stop-the-world counters, the same ones the
+//      `BIT_GC_STATS` exit summary prints (`stwCollections`,
+//      `stwPauseMaxNs`, `runtime/stw/stwstats.bit`).
+//
+// Before the change the collection count does not advance (every attempt
+// abandons behind the resolver's thread) and, once it does, the longest pause
+// is measured in seconds; both lines below flip to false. The 50 ms budget
+// against a healthy pause of well under 1 ms is the margin.
+//
+// The resolver is still waiting when main finishes: the program ends with the
+// process, it does not sit out the 6 s.
+
+import { netBindUdp, netSockLocalPort, netRecvFrom, netResolveHost } from "../../../runtime/net/darwin"
+import { stwCollections, stwPauseMaxNs } from "../../../runtime/stw"
+import { sleep, Millisecond } from "std/time"
+
+const SLICE_WORDS = 65536 // 512 KiB per round
+const ROUNDS = 32         // 16 MiB in total, 4x the default 4 MiB min trigger
+const PAUSE_BUDGET_NS = 50000000
+
+// 1 once `netResolveHost` has returned. Written by the resolver task, read by
+// main: a plain word, since main only needs to see "not yet" while it churns.
+let resolverReturned: i64 = 0
+
+fn bytesAt(a: int): *u8 {
+  let z: *u8 = nil
+  return z + a
+}
+
+fn putByte(base: *u8, off: int, v: int) {
+  let p = base + off
+  *p = u8(v)
+}
+
+// "127.0.0.1", the stub's bind address and the nameserver address.
+fn writeLoopback(base: *u8): int {
+  putByte(base, 0, 49)
+  putByte(base, 1, 50)
+  putByte(base, 2, 55)
+  putByte(base, 3, 46)
+  putByte(base, 4, 48)
+  putByte(base, 5, 46)
+  putByte(base, 6, 48)
+  putByte(base, 7, 46)
+  putByte(base, 8, 49)
+  return 9
+}
+
+// "gc.test": a name `netParseIpv4` refuses, so the resolver must query.
+fn writeName(base: *u8): int {
+  putByte(base, 0, 103)
+  putByte(base, 1, 99)
+  putByte(base, 2, 46)
+  putByte(base, 3, 116)
+  putByte(base, 4, 101)
+  putByte(base, 5, 115)
+  putByte(base, 6, 116)
+  return 7
+}
+
+fn resolver(port: int) {
+  let hostBuf = []i64(2)
+  let nsBuf = []i64(1)
+  let outBuf = []i64(1)
+  let hostLen = writeName(bytesAt(int(ptrOf(hostBuf))))
+  let ns = bytesAt(int(ptrOf(nsBuf)))
+  putByte(ns, 0, 127)
+  putByte(ns, 1, 0)
+  putByte(ns, 2, 0)
+  putByte(ns, 3, 1)
+  let ok = netResolveHost(
+    bytesAt(int(ptrOf(hostBuf))),
+    hostLen,
+    ns,
+    port,
+    bytesAt(int(ptrOf(outBuf))),
+  )
+  keepAlive(hostBuf)
+  keepAlive(nsBuf)
+  keepAlive(outBuf)
+  resolverReturned = 1
+  if (ok) {
+    print("resolver: unexpected answer\n")
+  }
+}
+
+// Allocates and discards `ROUNDS` blocks so the collector has real garbage to
+// find; only a sum of the touched words survives each round.
+fn churn(): int {
+  let sum = 0
+  let r = 0
+  while (r < ROUNDS) {
+    let block = []i64(SLICE_WORDS)
+    block[0] = i64(r)
+    block[SLICE_WORDS - 1] = i64(r)
+    sum = sum + int(block[0]) + int(block[SLICE_WORDS - 1])
+    r = r + 1
+  }
+  return sum
+}
+
+fn main() {
+  let addrBuf = []i64(2)
+  let addrLen = writeLoopback(bytesAt(int(ptrOf(addrBuf))))
+  let stub = netBindUdp(bytesAt(int(ptrOf(addrBuf))), addrLen, 0)
+  let port = netSockLocalPort(stub)
+  spawn resolver(port)
+
+  // Parks main until the resolver's query arrives, then leaves the resolver a
+  // moment to reach its own park.
+  let queryBuf = []i64(64)
+  let none: *u8 = nil
+  let got = netRecvFrom(stub, bytesAt(int(ptrOf(queryBuf))), 512, none)
+  sleep(50 * Millisecond)
+
+  let before = stwCollections()
+  let sum = churn()
+  let after = stwCollections()
+  let pauseNs = stwPauseMaxNs()
+  keepAlive(addrBuf)
+  keepAlive(queryBuf)
+
+  print("query ${got > 0}\n")
+  print("churn ${sum}\n")
+  print("collected ${after > before}\n")
+  print("pause under 50ms ${pauseNs < PAUSE_BUDGET_NS}\n")
+  print("resolver still waiting ${resolverReturned == 0}\n")
+}
