@@ -895,6 +895,14 @@ let a = Account(500)?
   parameter list, since there is no ok type to write one before. A call to a
   fallible `init` is handled like any other fallible call - `?` or `catch`
   at the call site (§18.3).
+- **A generic class is constructed through a written instantiation**:
+  `Pair<i64, string>(7, "s")` builds a `Pair<i64, string>`, and each argument
+  is judged against `init`'s parameter type with the class's type arguments
+  substituted (`first: i64`, `second: string`). The type-argument list must
+  have exactly the class's own length (`E0058`, as in type position), and
+  a class that is not generic takes none. `Pair(7, "s")`, a generic class's
+  `init` with no type arguments written, names no instantiation and is also
+  `E0058`: the type arguments are not inferred from the arguments.
 - One `init` per class; a second is a compile error. Bit has no constructor
   overloading.
 - **A class declaring `init` may not be built with a composite literal
@@ -3466,6 +3474,8 @@ shape.area(h = 4, w = 3)  // inside fn f<T: Shape>(shape: T): w and h are
 T.label(n = 7)          // static call inside fn describe<T: Named>()
 Pair<i64, bool>.tag(p = "y", n = 2)  // static method through a written
                                      // instantiation of a generic class
+Pair<i64, string>(second = "s", first = 7)  // constructor through a written
+                                            // instantiation: names are init's
 store.put(value = v, key = k)  // store: Store<T>, a generic interface value:
                                // names are Store.put's, as for any interface
 ```
