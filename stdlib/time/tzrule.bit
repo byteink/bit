@@ -1,0 +1,284 @@
+// Bit standard library — time module: the TZif footer rule, parsing (#6375).
+//
+// RFC 8536 §3.3 puts a POSIX TZ string after the last transition of every
+// version 2+ file: "a rule for computing local time changes after the last
+// transition time stored in the version 2+ data block". Without it a zone
+// stops observing daylight saving after its last listed transition (2037 in
+// a fat file, 2007 in a slim one). This file turns that string into a
+// `TzRule`; ./tzrulefn.bit evaluates one. ./zoneif.bit hands the footer
+// text here, ./zone.bit applies the result.
+//
+// Grammar, POSIX.1-2024 Base Definitions §8.3 ("TZ"), with the version 3
+// extensions of RFC 8536 §3.3.1:
+//
+//   stdoffset[dst[offset][,start[/time],end[/time]]]
+//   std, dst  three or more alphabetic bytes, or `<` alphanumerics, `+` and
+//             `-` `>` (the quoted form)
+//   offset    [+-]hh[:mm[:ss]], hh 0..24, mm and ss 0..59; POSIX counts it
+//             WEST of UTC, so `EST5` is UTC-5. A `TzRule` stores offsets
+//             EAST of UTC, the sign every other offset in this module has
+//   date      Jn (1..365, Feb 29 never counted), n (0..365, leap days
+//             counted), Mm.w.d (month 1..12, week 1..5 where 5 is "the
+//             last", day 0..6 with 0 = Sunday)
+//   time      [+-]hh[:mm[:ss]], hh 0..167 (RFC 8536 §3.3.1: signed, past 24
+//             hours allowed), default 02:00:00
+//
+// A footer is one of: empty (no rule, RFC 8536 §3.3: "the corresponding
+// information is not available"), a fixed zone (`JST-9`), or a zone with
+// daylight saving. A DST name with no rule is POSIX "implementation-
+// defined"; it is rejected rather than guessed, because a guessed rule is a
+// silent wrong answer. Every other deviation — a leading `:`, a short name,
+// an out-of-range field, trailing bytes — is a named failure too.
+
+// One of the two yearly changes in a rule. `kind` selects the date form;
+// the other fields are read per kind: `Mm.w.d` uses `month`, `week` and
+// `day`; `Jn` and `n` use `day` for `n`. `secs` is the local wall-clock
+// time of the change in seconds, signed (negative counts back from
+// midnight).
+class TzDay {
+  kind: int,
+  month: int,
+  week: int,
+  day: int,
+  secs: int,
+}
+
+// A parsed footer. Offsets are seconds EAST of UTC. `hasDst` false means a
+// fixed zone: `start`/`end` are then zero-valued and never read.
+// `alwaysDst` is RFC 8536 §3.3.1's "daylight saving is in effect all year"
+// (`EST5EDT,0/0,J365/25`): start on January 1 at 00:00 and end on December
+// 31 at 24:00 plus the DST shift, which leaves no standard-time instant.
+class TzRule {
+  stdOff: int,
+  dstOff: int,
+  hasDst: bool,
+  alwaysDst: bool,
+  start: TzDay,
+  end: TzDay,
+}
+
+const tzrKindMonth: int = 0
+const tzrKindJulian1: int = 1
+const tzrKindZeroBased: int = 2
+const tzrDefaultSecs: int = 7200
+const tzrNameMax: int = 255
+
+// A read position over the footer text; the parse functions advance `i`.
+class TzCur {
+  s: string,
+  i: int,
+}
+
+// The zero-value rule slice: none. Bit has no optional type, so a `Zone`
+// holds its rule as a slice of zero or one `TzRule`, and a zone with no
+// footer allocates nothing for it (same reasoning as `zoneNoTransitions`,
+// ./zone.bit, #5588).
+fn zoneNoRule(): []TzRule {
+  let none: []TzRule
+  return none
+}
+
+// The byte at the cursor as an int, or -1 at the end.
+fn tzrPeek(c: TzCur): int {
+  if (c.i >= len(c.s)) {
+    return -1
+  }
+  return int(c.s[c.i])
+}
+
+fn tzrIsAlpha(b: int): bool {
+  return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+fn tzrIsDigit(b: int): bool {
+  return b >= '0' && b <= '9'
+}
+
+// Whether `b` may appear in a zone designation: alphabetic, plus digits,
+// `+` and `-` inside the quoted `<...>` form (POSIX §8.3).
+fn tzrNameByte(b: int, quoted: bool): bool {
+  if (tzrIsAlpha(b)) {
+    return true
+  }
+  return quoted && (tzrIsDigit(b) || b == '+' || b == '-')
+}
+
+// A zone designation (POSIX §8.3 `std`/`dst`). Returns its length; the
+// text itself is not kept — nothing in `std/time` exposes an abbreviation
+// from a rule — but it is validated, so a corrupt footer cannot pass as a
+// rule.
+fn tzrName(c: TzCur): int! {
+  let quoted = tzrPeek(c) == '<'
+  if (quoted) {
+    c.i = c.i + 1
+  }
+  let start = c.i
+  while (c.i < len(c.s) && tzrNameByte(tzrPeek(c), quoted)) {
+    c.i = c.i + 1
+  }
+  let n = c.i - start
+  if (quoted) {
+    if (tzrPeek(c) != '>') {
+      fail newError("tzif: malformed footer '${c.s}': unterminated '<' name")
+    }
+    c.i = c.i + 1
+  }
+  if (n < 3 || n > tzrNameMax) {
+    fail newError("tzif: malformed footer '${c.s}': zone name must be 3..255 bytes")
+  }
+  return n
+}
+
+// One or more decimal digits, at most `max`.
+fn tzrNum(c: TzCur, max: int): int! {
+  let start = c.i
+  let v = 0
+  while (tzrIsDigit(tzrPeek(c))) {
+    v = v * 10 + (tzrPeek(c) - '0')
+    if (v > max) {
+      fail newError("tzif: malformed footer '${c.s}': number above ${max}")
+    }
+    c.i = c.i + 1
+  }
+  if (c.i == start) {
+    fail newError("tzif: malformed footer '${c.s}': number expected at byte ${c.i}")
+  }
+  return v
+}
+
+// `hh[:mm[:ss]]` in seconds, `hh` at most `maxHours`; `mm` and `ss` are
+// 0..59 (POSIX §8.3). The sign is the caller's.
+fn tzrClock(c: TzCur, maxHours: int): int! {
+  let secs = tzrNum(c, maxHours)? * 3600
+  if (tzrPeek(c) != ':') {
+    return secs
+  }
+  c.i = c.i + 1
+  secs = secs + tzrNum(c, 59)? * 60
+  if (tzrPeek(c) != ':') {
+    return secs
+  }
+  c.i = c.i + 1
+  return secs + tzrNum(c, 59)?
+}
+
+// An optional `+` or `-` then a clock, as a signed number of seconds.
+fn tzrSigned(c: TzCur, maxHours: int): int! {
+  let sign = 1
+  if (tzrPeek(c) == '-') {
+    sign = -1
+    c.i = c.i + 1
+  } else if (tzrPeek(c) == '+') {
+    c.i = c.i + 1
+  }
+  return sign * tzrClock(c, maxHours)?
+}
+
+// The single byte `want`, spelled `what`, at the cursor.
+fn tzrExpect(c: TzCur, want: int, what: string): bool! {
+  if (tzrPeek(c) != want) {
+    fail newError("tzif: malformed footer '${c.s}': '${what}' expected at byte ${c.i}")
+  }
+  c.i = c.i + 1
+  return true
+}
+
+// `m.w.d` after the `M` of a `Mm.w.d` date.
+fn tzrMonthDay(c: TzCur, d: TzDay): bool! {
+  d.month = tzrNum(c, 12)?
+  tzrExpect(c, '.', ".")?
+  d.week = tzrNum(c, 5)?
+  tzrExpect(c, '.', ".")?
+  d.day = tzrNum(c, 6)?
+  if (d.month < 1 || d.week < 1) {
+    fail newError("tzif: malformed footer '${c.s}': Mm.w.d needs month 1..12 and week 1..5")
+  }
+  return true
+}
+
+// One `date[/time]`. `Jn` and `n` both keep `n` in `day`.
+fn tzrDay(c: TzCur): TzDay! {
+  let d = TzDay{ kind = tzrKindZeroBased, month = 0, week = 0, day = 0, secs = tzrDefaultSecs }
+  if (tzrPeek(c) == 'M') {
+    c.i = c.i + 1
+    d.kind = tzrKindMonth
+    tzrMonthDay(c, d)?
+  } else if (tzrPeek(c) == 'J') {
+    c.i = c.i + 1
+    d.kind = tzrKindJulian1
+    d.day = tzrNum(c, 365)?
+    if (d.day < 1) {
+      fail newError("tzif: malformed footer '${c.s}': Jn needs n in 1..365")
+    }
+  } else {
+    d.day = tzrNum(c, 365)?
+  }
+  if (tzrPeek(c) == '/') {
+    c.i = c.i + 1
+    d.secs = tzrSigned(c, 167)?
+  }
+  return d
+}
+
+// An offset in POSIX's sign (west positive), returned east positive.
+fn tzrOffset(c: TzCur): int! {
+  let west = tzrSigned(c, 24)?
+  return -west
+}
+
+// RFC 8536 §3.3.1: DST all year iff it starts January 1 at 00:00 and ends
+// December 31 at 24:00 plus the DST shift: `0/0` or `J1/0` to `J365/24+shift`.
+// Only that spelling is recognised; the `n`-form `365` names December 31 in
+// a leap year and January 1 in a common one, so it is not "all year" and
+// evaluates as an ordinary window.
+fn tzrIsAlwaysDst(start: TzDay, end: TzDay, shift: int): bool {
+  let startsJan1 = (start.kind == tzrKindJulian1 && start.day == 1) ||
+    (start.kind == tzrKindZeroBased && start.day == 0)
+  let endsDec31 = end.kind == tzrKindJulian1 && end.day == 365
+  return startsJan1 && start.secs == 0 && endsDec31 && end.secs == 86400 + shift
+}
+
+// The rule of footer text `s` (non-empty, no terminating newline).
+fn tzrParse(s: string): TzRule! {
+  if (len(s) > 0 && s[0] == ':') {
+    fail newError("tzif: malformed footer '${s}': leading ':' is implementation-defined")
+  }
+  let c = TzCur{ s = s, i = 0 }
+  tzrName(c)?
+  let std = tzrOffset(c)?
+  let empty = TzDay{ kind = 0, month = 0, week = 0, day = 0, secs = 0 }
+  let r = TzRule{
+    stdOff = std,
+    dstOff = std,
+    hasDst = false,
+    alwaysDst = false,
+    start = empty,
+    end = empty,
+  }
+  if (c.i < len(s)) {
+    tzrParseDst(c, r)?
+  }
+  if (c.i != len(s)) {
+    fail newError("tzif: malformed footer '${s}': unexpected '${s[c.i:len(s)]}' at byte ${c.i}")
+  }
+  return r
+}
+
+// The `dst[offset],start[/time],end[/time]` tail, filling `r`.
+fn tzrParseDst(c: TzCur, r: TzRule): bool! {
+  tzrName(c)?
+  r.hasDst = true
+  r.dstOff = r.stdOff + 3600
+  if (c.i < len(c.s) && tzrPeek(c) != ',') {
+    r.dstOff = tzrOffset(c)?
+  }
+  if (c.i >= len(c.s)) {
+    fail newError("tzif: malformed footer '${c.s}': DST name without a rule is implementation-defined")
+  }
+  tzrExpect(c, ',', ",")?
+  r.start = tzrDay(c)?
+  tzrExpect(c, ',', ",")?
+  r.end = tzrDay(c)?
+  r.alwaysDst = tzrIsAlwaysDst(r.start, r.end, r.dstOff - r.stdOff)
+  return true
+}

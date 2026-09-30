@@ -131,6 +131,30 @@ is never overridden by a bundled copy that has gone stale. It returns
 `false`, changing nothing, for a blob it cannot use, and for a second call
 once an extension is already installed.
 
+### How far into the future a zone is right
+
+A zone file lists every clock change up to some year (2037 in a full file,
+2007 in a compact one) and then ends with a **rule** - a POSIX TZ string such
+as `EST5EDT,M3.2.0,M11.1.0`, "the second Sunday of March, the first of
+November" - for every instant after the last listed change. `std/time` reads
+that rule, so a zone keeps observing daylight saving for as long as the rule
+stands: a mortgage schedule or a 2040 meeting in `America/New_York` lands on
+the right side of the March change, not an hour off.
+
+```bit
+import { zone, date, DateTime } from "std/time"
+
+fn summerMeeting(): DateTime! {
+  let newYork = zone("America/New_York")?
+  // July 2040 is past the last listed change: the rule says -04:00.
+  return date(2040, 7, 1)?.atTime(9, 0, 0)?.inZone(newYork)
+}
+```
+
+A gap or an overlap after the last listed change resolves exactly as it does
+before it (see below). A rule that is not a valid POSIX TZ string makes
+`zone` fail, naming the footer; it is never ignored.
+
 ### Daylight saving: the two awkward days
 
 Twice a year a zone that observes daylight saving moves its clocks, and on
@@ -1744,7 +1768,7 @@ An IANA time zone, identified by its canonical name, such as `Asia/Dubai`. Immut
 
 ### `zone(name: string): Zone!`
 
-Loads the zone named `name` from the host's zone database. Fails when the name is not a real zone, or when neither the host nor an installed extension has it. See [Zones](#zones).
+Loads the zone named `name` from the host's zone database. Fails when the name is not a real zone, or when neither the host nor an installed extension has it, or when the file found is malformed, including a rule after its last change that is not a valid POSIX TZ string. See [Zones](#zones).
 
 ### `localZone(): Zone`
 
