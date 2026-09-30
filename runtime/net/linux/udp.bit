@@ -193,16 +193,40 @@ fn netRecvFromLoop(fd: int, gen: int, buf: *u8, bufCap: int, peer: *u8): int {
 // DNS
 // ---------------------------------------------------------------------------
 
-// A BLOCKING socket with SO_RCVTIMEO, ON PURPOSE. DNS is an
-// occasional millisecond cost, so a bounded receive timeout buys a real error on
-// packet loss without putting timer-driven wakes on the poller. It blocks the
-// calling worker for up to `netDnsTimeoutMs` on a lost packet; move it onto the
-// poller if resolution ever sits on a hot path.
-export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(): int {
+// Closes a DNS socket's fd directly, bypassing `netClose` (./sock.bit).
+//
+// #6338: `netDnsSocket` below never calls `netPollDescOpen`/`pdOpen` -- this
+// socket is deliberately raw and blocking (see its own header) and never
+// parks, so it has no poll-descriptor registration to unregister. `netClose`
+// assumes every fd it is given WAS `pdOpen`'d: it routes through
+// `pdFdMarkClosing`/`pdFdRelease` (../../sched/polldesc.bit), which marks
+// `pdRefWord[fd]`'s `closing`/`closed` bits and leaves them set until a
+// FUTURE `pdOpen` on that same fd number clears them. A DNS socket's fd is
+// never `pdOpen`'d going IN, so those bits are never cleared coming OUT
+// either -- the very next unrelated caller to inherit this fd number from
+// the kernel (observed on the darwin twin: `../netabi.bit`'s
+// `readResolvConf`, reading `/etc/resolv.conf` on the NEXT `resolve()` call,
+// via `netReadSock`'s own `netFdAcquire`) finds `closing` already set and is
+// refused before it issues a single syscall -- 9 of 10 real lookups failing
+// instantly after the first succeeded. `syscall(sysClose(), ...)` (the same
+// close primitive `../../sched/linux/poll.bit` uses for its own
+// never-`pdOpen`'d epoll fd) is the correct close for a resource that was
+// never registered with that bookkeeping in the first place.
+@nosplit fn netDnsCloseFd(fd: int) {
+  let _ = int(syscall(sysClose(), i64(fd)))
+}
+
+// A BLOCKING socket with SO_RCVTIMEO, ON PURPOSE, for `family` (`afInet()`
+// or `afInet6()`, #6338). DNS is an occasional millisecond cost, so a
+// bounded receive timeout buys a real error on packet loss without putting
+// timer-driven wakes on the poller. It blocks the calling worker for up to
+// `netDnsTimeoutMs` on a lost packet; move it onto the poller if resolution
+// ever sits on a hot path.
+@nosplit fn netDnsSocketFamily(family: int): int {
   let fd = sysRc(
     int(
       syscall(
-        sysSocket(), i64(afInet()),
+        sysSocket(), i64(family),
         i64(sockDgram() + sockCloExec()), 0,
       ),
     ),
@@ -227,10 +251,22 @@ export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(): int {
       ),
     ) <
     0) {
-    netClose(fd)
+    netDnsCloseFd(fd)
     return 0 - 1
   }
   return fd
+}
+
+export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(): int {
+  return netDnsSocketFamily(afInet())
+}
+
+// #6338: the IPv6 twin, used when a nameserver's own address is IPv6 (e.g.
+// Tailscale MagicDNS's `fd7a:...` entry). Still only ever asks for an A
+// record — `../net.bit`'s DNS section header is explicit that AAAA answers
+// are out of scope — this only changes which TRANSPORT reaches the server.
+export @symbol("bit_rt_port_net_dns_socket6") @nosplit fn netDnsSocket6(): int {
+  return netDnsSocketFamily(afInet6())
 }
 
 // The receive timeout configured on `fd`, in milliseconds, or -1 if the query
@@ -267,7 +303,8 @@ export @symbol("bit_rt_port_net_rcv_timeo_ms") @nosplit fn netRcvTimeoMs(fd: int
 }
 
 // Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
-// straight through; a hostname is queried against the nameserver at `ns[0..4]`.
+// straight through; a hostname is queried against the nameserver at
+// `ns[0..4]:port`.
 //
 // THE NAMESERVER IS A PARAMETER RATHER THAN READ FROM /etc/resolv.conf HERE.
 // The parse of that file is `netFirstNameserver` in ../net.bit, split out so it
@@ -275,10 +312,17 @@ export @symbol("bit_rt_port_net_rcv_timeo_ms") @nosplit fn netRcvTimeoMs(fd: int
 // keeping it out of here means `netResolveHost` can be pointed at a nameserver in
 // the same process — which is the only way to test a resolver without depending
 // on the network being up.
+//
+// `port` IS ALSO A PARAMETER, NOT A LITERAL 53, for the same testability
+// reason (#6338): every real nameserver speaks port 53, which the ONE
+// caller (`../netabi.bit`'s `netAbiResolve`) passes, but binding port 53
+// for a local test stub needs root -- a stub would point this at an
+// ephemeral port instead (see the Darwin twin's own stress test).
 export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
   host: *u8,
   hostLen: int,
   ns: *u8,
+  port: int,
   out: *u8,
 ): bool {
   if (netParseIpv4(host, hostLen, out)) {
@@ -302,7 +346,7 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
   // Bounded retransmits (Power of 10): a lost query is retried a fixed number
   // of times and then reported, never waited on forever.
   while (attempt < netDnsRetries) {
-    netFillSockAddr(saBytes2(), ns, 53)
+    netFillSockAddr(saBytes2(), ns, port)
     if (sysRc(
         int(
           syscall(
@@ -326,13 +370,13 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
         // Timed out or interrupted: retransmit. Anything else is fatal.
         let e = lastErr()
         if (e != eAgain() && e != eIntr()) {
-          netClose(fd)
+          netDnsCloseFd(fd)
           return false
         }
         attempt = attempt + 1
       } else {
         if (netParseAnswer(reply, got, netDnsId, out)) {
-          netClose(fd)
+          netDnsCloseFd(fd)
           return true
         }
         // Malformed, or an answer with no A record: retry.
@@ -340,6 +384,72 @@ export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(
       }
     }
   }
-  netClose(fd)
+  netDnsCloseFd(fd)
+  return false
+}
+
+// #6338: `netResolveHost`'s IPv6 twin -- `ns` is sixteen bytes (an address
+// `../dns.bit`'s `netParseIpv6`, via `../netabi.bit`'s `netAbiResolve`,
+// already parsed) rather than four, and the socket dials AF_INET6/
+// `sockaddr_in6`. Still an A-record query: this only changes which
+// transport reaches the nameserver, not what it is asked for.
+export @symbol("bit_rt_port_net_resolve6") @nosplit fn netResolveHost6(
+  host: *u8,
+  hostLen: int,
+  ns: *u8,
+  out: *u8,
+): bool {
+  if (netParseIpv4(host, hostLen, out)) {
+    return true
+  }
+  let query = dnsBytes()
+  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
+  if (qlen < 0) {
+    return false
+  }
+  let fd = netDnsSocket6()
+  if (fd < 0) {
+    return false
+  }
+  let reply = dnsBytes() + netMaxDnsMsg
+  let attempt = 0
+  while (attempt < netDnsRetries) {
+    netFillSockAddr6(sa6Bytes(), ns, 53)
+    if (sysRc(
+        int(
+          syscall(
+            sysSendTo(), i64(fd), i64(int(query)), i64(qlen), 0,
+            i64(int(sa6Bytes())), i64(sa6Len),
+          ),
+        ),
+      ) <
+      0) {
+      attempt = attempt + 1
+    } else {
+      let got = sysRc(
+        int(
+          syscall(
+            sysRecvFrom(), i64(fd), i64(int(reply)),
+            i64(netMaxDnsMsg), 0, 0, 0,
+          ),
+        ),
+      )
+      if (got < 0) {
+        let e = lastErr()
+        if (e != eAgain() && e != eIntr()) {
+          netDnsCloseFd(fd)
+          return false
+        }
+        attempt = attempt + 1
+      } else {
+        if (netParseAnswer(reply, got, netDnsId, out)) {
+          netDnsCloseFd(fd)
+          return true
+        }
+        attempt = attempt + 1
+      }
+    }
+  }
+  netDnsCloseFd(fd)
   return false
 }
