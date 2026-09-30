@@ -1,0 +1,207 @@
+// pkg/jobs/scheduler.test.bit — `Queue.schedule`/`Queue.every` and the
+// scheduler pass behind them (scheduler.bit, #6083): each `Missed` policy
+// after a simulated stall, the lease that makes N instances enqueue each
+// tick once, zone and expression validation, and the start/stop loop. Time
+// is a `fakeClock` the test moves by hand, so nothing sleeps for a tick and
+// nothing depends on machine load.
+
+import { newMutex, Mutex, newAtomicI64, AtomicI64 } from "std/sync"
+import { sleep, Minute, Millisecond } from "std/time"
+
+@job("test-tick") @json class TickJob {
+  tag: string,
+}
+
+class fakeClock {
+  ns: AtomicI64
+
+  nowNs(): int {
+    return int(this.ns.load())
+  }
+
+  pause(d: int) {
+    sleep(Millisecond)
+  }
+
+  advance(d: int) {
+    this.ns.add(i64(d))
+  }
+}
+
+fn newFakeClock(startNs: int): fakeClock {
+  return fakeClock{ ns = newAtomicI64(i64(startNs)) }
+}
+
+// An in-memory Locker with the same contract as PostgresLocker: a key is
+// held until its expiry, and the holder itself always re-acquires.
+class fakeLocker {
+  holder: map<string, string>
+  expires: map<string, int>
+  mu: Mutex
+
+  tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (cur, has) = this.holder[key]
+    let (exp, _) = this.expires[key]
+    if (has && cur != holder && exp > nowNs) {
+      return false
+    }
+    this.holder[key] = holder
+    this.expires[key] = expiresAt
+    return true
+  }
+}
+
+fn newFakeLocker(): fakeLocker {
+  return fakeLocker{ holder = map<string, string>(), expires = map<string, int>(), mu = newMutex() }
+}
+
+fn queueOn(store: fakeStore, clock: fakeClock, locker: Locker, id: string): Queue {
+  let q = open(
+    store,
+    Options{
+      workers = 1,
+      pollInterval = 5 * Millisecond,
+      locker = locker,
+      clock = clock,
+      instanceId = id,
+    },
+  ) catch e {
+    panic("open: ${e.message()}")
+  }
+  return q
+}
+
+fn mustEvery(q: Queue, missed: Missed) {
+  q.every(Minute, TickJob{ tag = "t" }, missed = missed) catch e {
+    panic("every: ${e.message()}")
+  }
+}
+
+fn dueCount(store: fakeStore): int {
+  return len(store.rows)
+}
+
+// Epoch-aligned start, 30 seconds into a minute, so ticks fall on minutes.
+const t0: int = 1000 * Minute + 30 * Second
+
+test "a stall of five ticks: Skip enqueues none, RunOnce one, RunAll(3) three" {
+  let want = [0, 1, 3]
+  let policies = [Missed.Skip, Missed.RunOnce, Missed.RunAll(3)]
+  let i = 0
+  while (i < 3) {
+    let store = newFakeStore()
+    let clock = newFakeClock(t0)
+    let q = queueOn(store, clock, nil, "a")
+    mustEvery(q, policies[i])
+    clock.advance(5 * Minute)
+    runDue(q, clock.nowNs())
+    assert(
+      dueCount(store) == want[i],
+      "policy ${i}: want ${want[i]} enqueues, got ${dueCount(store)}",
+    )
+    i = i + 1
+  }
+}
+
+test "an on-time tick is never a miss, even under Skip" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let q = queueOn(store, clock, nil, "a")
+  mustEvery(q, Missed.Skip)
+  clock.advance(Minute)
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 1, "one due tick must fire, got ${dueCount(store)}")
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 1, "the same tick must not fire twice, got ${dueCount(store)}")
+}
+
+test "three instances sharing a locker enqueue each tick exactly once" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let locker = newFakeLocker()
+  let qs = [
+    queueOn(store, clock, locker, "a"),
+    queueOn(store, clock, locker, "b"),
+    queueOn(store, clock, locker, "c"),
+  ]
+  for q of qs {
+    mustEvery(q, Missed.RunAll(10))
+  }
+  let tick = 0
+  while (tick < 4) {
+    clock.advance(Minute)
+    for q of qs {
+      runDue(q, clock.nowNs())
+    }
+    tick = tick + 1
+  }
+  assert(dueCount(store) == 4, "want 4 enqueues for 4 ticks, got ${dueCount(store)}")
+}
+
+test "catch-up is exactly-once across instances too" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let locker = newFakeLocker()
+  let a = queueOn(store, clock, locker, "a")
+  let b = queueOn(store, clock, locker, "b")
+  mustEvery(a, Missed.RunAll(10))
+  mustEvery(b, Missed.RunAll(10))
+  clock.advance(6 * Minute)
+  runDue(a, clock.nowNs())
+  runDue(b, clock.nowNs())
+  assert(dueCount(store) == 6, "want 6 catch-up enqueues once, got ${dueCount(store)}")
+}
+
+test "a cron schedule enqueues at its tick" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let q = queueOn(store, clock, nil, "a")
+  q.schedule("*/2 * * * *", TickJob{ tag = "c" }, tz = "UTC") catch e {
+    panic("schedule: ${e.message()}")
+  }
+  clock.advance(2 * Minute)
+  runDue(q, clock.nowNs())
+  assert(dueCount(store) == 1, "want 1 enqueue, got ${dueCount(store)}")
+  assert(store.rows[0].name == "test-tick", "wrong job name ${store.rows[0].name}")
+}
+
+test "schedule rejects an unknown zone, a bad expression, a bad period and a duplicate" {
+  let store = newFakeStore()
+  let q = queueOn(store, newFakeClock(t0), nil, "a")
+  let bad = 0
+  q.schedule("0 2 * * *", TickJob{ tag = "z" }, tz = "Not/AZone") catch _ {
+    bad = bad + 1
+  }
+  q.schedule("nonsense", TickJob{ tag = "e" }) catch _ {
+    bad = bad + 1
+  }
+  q.every(0, TickJob{ tag = "p" }) catch _ {
+    bad = bad + 1
+  }
+  mustEvery(q, Missed.Skip)
+  q.every(Minute, TickJob{ tag = "t" }) catch _ {
+    bad = bad + 1
+  }
+  assert(bad == 4, "want 4 rejections, got ${bad}")
+}
+
+test "start() runs the scheduler loop and stop() ends it" {
+  let store = newFakeStore()
+  let clock = newFakeClock(t0)
+  let q = queueOn(store, clock, nil, "a")
+  mustEvery(q, Missed.RunOnce)
+  q.start()
+  clock.advance(Minute)
+  let waited = 0
+  while (dueCount(store) < 1 && waited < 5000) {
+    sleep(5 * Millisecond)
+    waited = waited + 5
+  }
+  q.stop()
+  assert(
+    dueCount(store) == 1,
+    "the loop must enqueue the tick exactly once, got ${dueCount(store)}",
+  )
+}

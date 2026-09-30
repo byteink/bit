@@ -47,6 +47,9 @@ it to route the job to the right handler.
 - [Getting started](docs/getting-started.md): the problem, `open`,
   `register`, `enqueue`, starting workers, retries and the dead-letter
   list, one running example (a welcome-email job).
+- [Scheduled jobs](docs/cron.md): `schedule` and `every`, cron
+  expressions and zones, missed-tick policies, leader election so three
+  instances enqueue each tick once.
 - [PostgreSQL](docs/postgres.md): `PostgresStore`, running the migration,
   writing your own `Store`, at-least-once delivery and idempotent
   handlers.

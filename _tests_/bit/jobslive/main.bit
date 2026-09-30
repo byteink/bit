@@ -11,15 +11,29 @@
 //
 // Proves, against a REAL server: N workers process every job exactly once
 // (no double-processing), a crashed worker's claim is reclaimed once its
-// visibility timeout elapses, and `stop()` drains an in-flight job before
-// returning. Prints `LIVE_PROOF_OK` and exits 0 only if every check passed.
+// visibility timeout elapses, `stop()` drains an in-flight job before
+// returning, and three schedulers (three Queues, three pools, one
+// PostgresLocker each) enqueue every tick of one schedule exactly once
+// while a stall they all suffer is caught up once between them. The
+// schedulers read a hand-moved clock, so the proof takes seconds. Prints `LIVE_PROOF_OK` and exits 0 only if every check passed.
 
 import { args } from "std/os"
-import { pool, Datasource } from "std/sql"
+import { pool, Pool, Datasource, Value, asInt } from "std/sql"
 import { adapter } from "postgres"
 import { sleep, Millisecond } from "std/time"
-import { newAtomicI64 } from "std/sync"
-import { PostgresStore, newPostgresStore, migrate, open, Options, ClaimedJob } from "jobs"
+import { newAtomicI64, AtomicI64 } from "std/sync"
+import { now, Minute } from "std/time"
+import {
+  PostgresStore,
+  newPostgresStore,
+  newPostgresLocker,
+  migrate,
+  open,
+  Options,
+  ClaimedJob,
+  Queue,
+  Missed,
+} from "jobs"
 
 import { Json } from "std/json"
 @job("live-echo") @json class LiveEchoJob {
@@ -127,10 +141,116 @@ fn proveGracefulDrain(store: PostgresStore) {
   }
 }
 
+@job("live-tick") @json class LiveTickJob {
+  tag: string,
+}
+
+// The clock every scheduler reads: real time at the start, then only what
+// `advance` adds. `pause` yields for a moment so the three loops interleave.
+class handClock {
+  ns: AtomicI64
+
+  nowNs(): int {
+    return int(this.ns.load())
+  }
+
+  pause(d: int) {
+    sleep(2 * Millisecond)
+  }
+
+  advance(d: int) {
+    this.ns.add(i64(d))
+  }
+}
+
+fn scheduledQueue(uri: string, clock: handClock, id: string, missed: Missed): Queue {
+  let db = pool(adapter(), Datasource{ uri = uri }) catch e {
+    panic("pool: ${e.message()}")
+  }
+  let q = open(
+    newPostgresStore(db),
+    Options{
+      workers = 1, pollInterval = 10 * Millisecond, locker = newPostgresLocker(db),
+      clock = clock, instanceId = id,
+    },
+  ) catch e {
+    panic("open: ${e.message()}")
+  }
+  q.every(Minute, LiveTickJob{ tag = "tick" }, missed = missed) catch e {
+    panic("every: ${e.message()}")
+  }
+  return q
+}
+
+fn tickRows(db: Pool): int {
+  let rows = db.query("SELECT count(*) FROM bit_jobs WHERE name = 'live-tick'", []Value(0)) catch e {
+    panic("count: ${e.message()}")
+  }
+  let has = rows.next() catch e {
+    panic("count next: ${e.message()}")
+  }
+  if (!has) {
+    panic("count: no row")
+  }
+  let n = asInt(rows.value(0)) catch e {
+    panic("count value: ${e.message()}")
+  }
+  rows.close()
+  return n
+}
+
+// Waits until the table holds `want` tick rows, then keeps watching a while
+// longer: a duplicate enqueue from a slower scheduler would show up here.
+fn expectTickRows(db: Pool, want: int, label: string) {
+  let waited = 0
+  while (tickRows(db) < want && waited < 15000) {
+    sleep(20 * Millisecond)
+    waited = waited + 20
+  }
+  sleep(300 * Millisecond)
+  let got = tickRows(db)
+  if (got != want) {
+    panic("LIVE PROOF FAILED: ${label}: expected exactly ${want} tick rows, got ${got}")
+  }
+}
+
+fn proveScheduledOnce(uri: string) {
+  let clock = handClock{ ns = newAtomicI64(i64(now().ns)) }
+  let qs = [
+    scheduledQueue(uri, clock, "sched-a", Missed.RunAll(10)),
+    scheduledQueue(uri, clock, "sched-b", Missed.RunAll(10)),
+    scheduledQueue(uri, clock, "sched-c", Missed.RunAll(10)),
+  ]
+  for q of qs {
+    q.start()
+  }
+  let db = requirePool(uri)
+  let tick = 1
+  while (tick <= 3) {
+    clock.advance(Minute)
+    expectTickRows(db, tick, "tick ${tick}")
+    tick = tick + 1
+  }
+  // A stall all three loops suffer at once: 4 ticks come due together and
+  // RunAll must enqueue each once between the three instances.
+  clock.advance(4 * Minute)
+  expectTickRows(db, 7, "catch-up")
+  for q of qs {
+    q.stop()
+  }
+}
+
+fn requirePool(uri: string): Pool {
+  return pool(adapter(), Datasource{ uri = uri }) catch e {
+    panic("pool(${uri}): ${e.message()}")
+  }
+}
+
 fn main() {
   let uri = args()[1]
   proveConcurrency(requireStore(uri))
   proveCrashReclaim(requireStore(uri))
   proveGracefulDrain(requireStore(uri))
+  proveScheduledOnce(uri)
   print("LIVE_PROOF_OK")
 }

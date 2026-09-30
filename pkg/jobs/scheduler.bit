@@ -1,0 +1,177 @@
+// pkg/jobs/scheduler.bit — the scheduler loop `Queue.start` spawns beside
+// the worker pool, the `Clock` it reads, and the per-tick lease that makes
+// three instances enqueue each tick exactly once (#6083, epic #4023).
+//
+// ONE LEASE PER TICK, NOT PER SCHEDULE. Every instance runs the same loop
+// over the same registered schedules and computes the same tick
+// boundaries (schedule.bit: interval ticks are epoch-anchored, cron ticks
+// are calendar arithmetic), so all of them reach "tick T is due" together.
+// `holdsLease` then asks the `Locker` for the lease named
+// "<schedule id>@<T>": exactly one instance is told yes, the rest skip the
+// tick. A lease per SCHEDULE would let a leader that dies right after
+// enqueueing tick T leave a follower that has never heard of T to fire it
+// again once the lease lapses; a lease per tick cannot, because the key
+// names the tick itself. With no `Locker` (a single instance) every tick
+// is ours.
+//
+// NO PERSISTED LAST-TICK. A process that restarts begins each schedule at
+// the first tick after "now", so the downtime the `Missed` policy covers is
+// THIS scheduler's own: a stalled loop, a paused process, a clock jump. A
+// fleet that was down as a whole across a tick does not replay it, because
+// nothing durable says the tick was never enqueued.
+//
+// NO BUSY-WAIT: the loop sleeps until the earliest due tick, at most one
+// `pollInterval` at a time so `stop()` is never delayed longer than that.
+
+import { jsonEncode } from "std/json"
+import { now, sleep, Hour } from "std/time"
+
+// How long a per-tick lease outlives the moment it was taken. Only needs to
+// exceed the skew between the fleet's clocks and the time an instance takes
+// to enqueue; an hour keeps the lease table small and is far beyond both.
+const scheduleLeaseTtl: int = Hour
+
+// The time source the scheduler reads and sleeps on. The default is the
+// wall clock; a test injects its own through `Options.clock` so a run
+// crosses hours of ticks in milliseconds and never depends on load.
+export interface Clock {
+  // The current time as nanoseconds since the Unix epoch.
+  nowNs(): int,
+  // Blocks the calling green thread for `ns` nanoseconds of this clock.
+  pause(ns: int),
+}
+
+class systemClock {
+  nowNs(): int {
+    return now().ns
+  }
+
+  pause(ns: int) {
+    sleep(ns)
+  }
+}
+
+// One registered schedule: what ticks it has, how it catches up, the next
+// tick not yet handled, and the closure that enqueues its job for a tick.
+class entry {
+  id: string,
+  trig: trigger,
+  missed: Missed,
+  next: int,
+  fire: (int) => ()!,
+}
+
+// A schedule whose first tick is the first one strictly after "now".
+fn newEntry(id: string, trig: trigger, missed: Missed, fire: (int) => ()!, clock: Clock): entry! {
+  let first = trig.nextAfterNs(clock.nowNs())?
+  return entry{ id = id, trig = trig, missed = missed, next = first, fire = fire }
+}
+
+// Registers `e`, refusing a duplicate: two identical schedules share one
+// lease key per tick, so the second would silently double-fire.
+fn addEntry(q: Queue, e: entry): ()! {
+  for have of q.entries {
+    if (have.id == e.id) {
+      fail newError("jobs: '${e.id}' is already scheduled")
+    }
+  }
+  q.entries = append(q.entries, e)
+}
+
+// A stable identity for a schedule across processes: the job's `@job` name,
+// what ticks it, and the zone it ticks in.
+fn scheduleId(name: string, spec: string, tz: string): string {
+  return "${name}|${spec}|${tz}"
+}
+
+// The closure that enqueues `job` for a tick. The payload is encoded once,
+// at registration, not on every tick. `availableAt` is the tick itself so
+// a catch-up burst is claimed oldest first.
+fn tickEnqueuer<T: Job>(store: Store, job: T, maxAttempts: int): (int) => ()! {
+  let name = T.__jobName()
+  let payload = jsonEncode(job.toJson())
+  let fire: (int) => ()! = (availableAt) => {
+    store.enqueue(name, payload, availableAt, maxAttempts)?
+  }
+  return fire
+}
+
+// How many of `count` due ticks to enqueue. A single due tick is the
+// schedule running on time, never a miss; only two or more are, and then
+// the policy decides.
+fn tickBudget(count: int, policy: Missed): int {
+  if (count <= 1) {
+    return count
+  }
+  return missedEnqueueCount(count, policy)
+}
+
+fn holdsLease(q: Queue, e: entry, tick: int, nowNs: int): bool! {
+  if (q.locker == nil) {
+    return true
+  }
+  let held = q.locker.tryAcquire("${e.id}@${tick}", q.instance, nowNs, nowNs + scheduleLeaseTtl)?
+  return held
+}
+
+fn fireTick(q: Queue, e: entry, tick: int, nowNs: int): ()! {
+  let lead = holdsLease(q, e, tick, nowNs)?
+  if (!lead) {
+    return
+  }
+  e.fire(tick)?
+}
+
+// Handles every tick of `e` due at `nowNs`. `e.next` advances tick by tick
+// as each is handled, so a failure part-way leaves `e.next` at the first
+// tick not yet handled and the retry cannot re-enqueue one that already ran.
+fn handleDue(q: Queue, e: entry, nowNs: int): ()! {
+  let (ticks, next) = dueTicks(e.trig, e.next, nowNs)?
+  let i = len(ticks) - tickBudget(len(ticks), e.missed)
+  while (i < len(ticks)) {
+    fireTick(q, e, ticks[i], nowNs)?
+    e.next = e.trig.nextAfterNs(ticks[i])?
+    i = i + 1
+  }
+  e.next = next
+}
+
+// One pass over every schedule at `nowNs`; returns the earliest tick still
+// pending (0 when there are no schedules). A failing schedule is logged
+// and retried on the next pass, never allowed to stop the others.
+fn runDue(q: Queue, nowNs: int): int {
+  let wake = 0
+  for e of q.entries {
+    if (e.next <= nowNs) {
+      handleDue(q, e, nowNs) catch err {
+        eprint("jobs: schedule '${e.id}' failed: ${err.message()}\n")
+      }
+    }
+    if (wake == 0 || e.next < wake) {
+      wake = e.next
+    }
+  }
+  return wake
+}
+
+// How long to sleep after a pass: until `wake`, but never longer than one
+// `pollInterval`. A `wake` already in the past means a schedule just failed;
+// waiting a full `pollInterval` is the retry backoff.
+fn sleepFor(q: Queue, nowNs: int, wake: int): int {
+  let d = wake - nowNs
+  if (wake == 0 || d <= 0 || d > q.opts.pollInterval) {
+    return q.opts.pollInterval
+  }
+  return d
+}
+
+// The scheduler's whole loop, run on its own green thread by `Queue.start`
+// until `Queue.stop` clears `running`.
+fn schedulerLoop(q: Queue) {
+  while (q.running.load() == 1) {
+    let nowNs = q.clock.nowNs()
+    let wake = runDue(q, nowNs)
+    q.clock.pause(sleepFor(q, nowNs, wake))
+  }
+  q.wg.done()
+}

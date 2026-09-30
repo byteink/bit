@@ -1,0 +1,144 @@
+// pkg/jobs/schedule.bit — `Missed`, `Locker` (leader election over the
+// store) and the pure catch-up arithmetic `Queue.schedule`/`Queue.every`
+// (jobs.bit) drive (#6083, epic #4023).
+//
+// TWO TRIGGER KINDS, ONE INTERFACE. `schedule("0 2 * * *", ...)` and
+// `every(15 * Minute, ...)` both produce a `trigger`: `cronTrigger` wraps a
+// `CronSchedule` (cron.bit) and a `Zone`, `intervalTrigger` is a fixed
+// nanosecond period anchored to the Unix epoch (`0`, never "when this
+// process started") so every instance in a fleet computes the SAME tick
+// boundaries independently — required for leader election to mean
+// anything: if the leader changes mid-run, the new leader must agree with
+// the old one about when the next tick falls, not restart its own clock.
+//
+// LEADER ELECTION IS A LEASE ROW, NOT A METHOD ON `Store`. `Locker` is its
+// own interface (this file's own contract, `PostgresLocker` lives in
+// postgres.bit) rather than added to `Store`,
+// the same separation pkg/web keeps between `SessionStore` and
+// `RateLimitStore` — a `Store` implementation that only ever runs
+// `enqueue`/`register` jobs, never `schedule`, should not have to
+// implement leader election it never uses. `Options.locker` has no
+// default expression (an interface's zero value is nil, store.bit's own
+// header) and nil means "always leader" — correct for a single instance,
+// documented as wrong for more than one.
+//
+// MISSED TICKS ARE COUNTED PURELY, NO CLOCK INVOLVED
+// (`dueTicks`/`missedEnqueueCount` below take plain nanosecond ints
+// and a `trigger`) so a test drives them with fixed numbers instead of a
+// real clock or `sleep` — this is the injectable-clock shape the ticket's
+// own tests need.
+
+import { Timestamp, Zone } from "std/time"
+
+// How a schedule catches up after downtime: the `missed` argument of
+// `Queue.schedule`/`Queue.every`. `RunAll`'s payload is the cap: enqueue at
+// most this many catch-up jobs, never unbounded (constraint).
+export enum Missed {
+  Skip,
+  RunOnce,
+  RunAll(int),
+}
+
+// Leader election over a shared store: exactly one instance in a fleet may
+// hold the lease named `key` at a time, so only that instance's scheduler
+// loop enqueues a tick (three schedulers, one enqueue per tick). The
+// scheduler names a lease per TICK, not per schedule, so a leader that
+// dies mid-tick cannot leave a follower double-firing a tick the leader
+// already enqueued.
+export interface Locker {
+  // Returns true if the caller holds the lease named `key` once this call
+  // returns — whether newly acquired, renewed because the caller already
+  // held it, or taken over because the previous holder's lease expired —
+  // and false when another holder's lease has not expired yet. `nowNs` is
+  // the caller's clock (Options.clock), so a lease is expired exactly when
+  // its `expiresAt <= nowNs`; an implementation never reads a clock of its
+  // own, which keeps a test's injected clock authoritative.
+  tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool!,
+}
+
+// A tick source: cron expression or fixed interval, both reduced to "the
+// next nanosecond timestamp strictly after `afterNs`" so the scheduler
+// loop (jobs.bit) never branches on which kind it has.
+interface trigger {
+  nextAfterNs(afterNs: int): int!,
+}
+
+// Wraps a parsed cron expression and the zone its fields are read in.
+class cronTrigger {
+  cron: CronSchedule
+  tz: Zone
+
+  nextAfterNs(afterNs: int): int! {
+    let after = Timestamp{ ns = afterNs }.inZone(this.tz)
+    let next = this.cron.nextAfter(after)?
+    let ts = next.toTimestamp()?
+    return ts.ns
+  }
+}
+
+// A fixed period, epoch-anchored: the next multiple of `periodNs` strictly
+// greater than `afterNs`. Never fails — a fixed period always has a next
+// multiple.
+class intervalTrigger {
+  periodNs: int
+
+  nextAfterNs(afterNs: int): int! {
+    return (afterNs / this.periodNs + 1) * this.periodNs
+  }
+}
+
+// Builds the `cronTrigger` for `schedule(expr, ...)` — split out of
+// `Queue.schedule` (jobs.bit) so that method stays a thin wrapper.
+fn newCronTrigger(expr: string, tz: Zone): trigger! {
+  let cs = parseCron(expr)?
+  return cronTrigger{ cron = cs, tz = tz }
+}
+
+// The widest lookahead `dueTicks` will scan before giving up on
+// finding the first still-future tick — bounded per Power of 10: a
+// schedule catching up after real downtime is at most a few thousand
+// ticks behind even at one-second resolution over a day, so this bound is
+// generous, not tight, and only a `trigger` that can never advance (a
+// bug, not a real schedule) would ever reach it.
+const scheduleCatchUpScanCap: int = 100000
+
+// Every tick from `fromNs` (inclusive) up to and including `nowNs`, in
+// order, plus the first tick still in the future (bounded scan, constraint:
+// bounded catch-up — a schedule that somehow stays due after
+// `scheduleCatchUpScanCap` ticks is picked up again by the next call).
+// Pure integer arithmetic over `t` — no clock, no store, nothing to inject
+// for a test beyond the two ints.
+fn dueTicks(t: trigger, fromNs: int, nowNs: int): ([]int, int)! {
+  let ticks = []int(0)
+  let next = fromNs
+  while (next <= nowNs && len(ticks) < scheduleCatchUpScanCap) {
+    ticks = append(ticks, next)
+    next = t.nextAfterNs(next)?
+  }
+  return (ticks, next)
+}
+
+// How many catch-up jobs to enqueue for `missed` ticks that all came due
+// at once (a scheduler restarting after downtime), per `policy` — pure,
+// no I/O. `Skip` drops every missed tick. `RunOnce` collapses them into a
+// single enqueue. `RunAll(cap)` enqueues one per missed tick, up to `cap`
+// — the trade-off this buys: catching up exactly reproduces every tick
+// that should have fired (correct against a ledger close that expects one
+// row per period), at the cost of a burst of `cap` jobs at once if the
+// scheduler was down a long time; `Skip`/`RunOnce` never burst, at the
+// cost of a gap (`Skip`) or a merged period (`RunOnce`) in that ledger.
+export fn missedEnqueueCount(missed: int, policy: Missed): int {
+  if (missed <= 0) {
+    return 0
+  }
+  match (policy) {
+    Skip => return 0
+    RunOnce => return 1
+    RunAll(runAllCap) => {
+      if (missed > runAllCap) {
+        return runAllCap
+      }
+      return missed
+    }
+  }
+}

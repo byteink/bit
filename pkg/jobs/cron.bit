@@ -1,0 +1,286 @@
+// pkg/jobs/cron.bit — a 5-field cron expression parser and its `nextAfter`
+// search, for `Queue.schedule` (schedule.bit, #6083, epic #4023).
+//
+// FIELD ORDER, standard cron: minute(0-59) hour(0-23) day-of-month(1-31)
+// month(1-12, or JAN-DEC) day-of-week(0-7, 0 and 7 both Sunday, or
+// SUN-SAT). Each field is a comma-separated list of `*`, a single value, a
+// range `a-b`, or a step `x/n` / `a-b/n` — the "ranges, steps, lists,
+// names" the ticket asks for. `L`/`W`/`#` (last day, weekday-nearest, Nth
+// weekday) are not implemented: no ticket has asked for them and they are
+// easy to add as more field-item kinds later without touching this file's
+// shape.
+//
+// EVERY FIELD IS A BITMASK, not a parsed list kept around: `int` already
+// has 64 bits, every field's range fits (minute needs 60, the widest), and
+// "does hour 14 match" becomes one shift-and-test instead of a linear scan
+// of a slice, so `nextAfter`'s search loop below stays cheap per step.
+//
+// DAY-OF-MONTH AND DAY-OF-WEEK ARE "OR", NOT "AND", THE MOMENT EITHER IS
+// RESTRICTED (Vixie cron's own rule, POSIX-inherited): "15 * * * 1"
+// ("15 past the hour, on Mondays") means every Monday, not never (which an
+// AND of "day 15" and "a Monday" would usually be). `domStar`/`dowStar`
+// record whether the field's SOURCE TEXT was the literal `*` — not whether
+// the resulting bitmask happens to be full, since `*/1` is textually
+// restricted even though it matches every day, matching every other cron
+// implementation's quirk here.
+//
+// NEXT-TICK SEARCH IS FIELD-CARRY, NOT MINUTE-BY-MINUTE: `nextAfter` skips
+// a whole non-matching month or day in one step rather than walking every
+// minute inside it, so a search across years stays a few thousand steps,
+// not tens of millions — POWER OF 10's bounded-loop rule needs a bound
+// that is actually reachable in a test, and `cronMaxSearchSteps` below is
+// it.
+//
+// DST FALLS OUT OF `DateTime` ARITHMETIC FOR FREE: `addDays`/`addHours`
+// (stdlib/time/calarith.bit) re-resolve the zone on the WALL CLOCK after
+// each step, the same disambiguation `zonedFromWall` already documents
+// (spring gap pushed forward, fall-back overlap takes the earlier offset)
+// — this file adds no DST logic of its own, only calendar-field matching.
+
+import { DateTime } from "std/time"
+import { split, trimSpace, toUpper, parseInt } from "std/strings"
+
+// The widest lookahead `nextAfter` will search before giving up — an
+// expression that can never match (`0 0 31 2 *`, day 31 in February) would
+// otherwise loop until the search step bound, below, kicks in first; this
+// bound exists so the failure names a sane reason instead of a raw step
+// count.
+const cronMaxYearsAhead: int = 8
+
+// Bounded per POWER OF 10: worst case is a handful of year-boundary
+// carries plus day-level carries across a leap-year/weekday combination
+// (at most a few thousand), so this bound is never reached by a real
+// expression and only fires for one that can never match.
+const cronMaxSearchSteps: int = 20000
+
+// A parsed cron expression: one bitmask per field plus whether the
+// day-of-month/day-of-week fields were literally `*` in the source text
+// (this file's header: that decides AND vs. OR between them).
+export class CronSchedule {
+  minutes: int
+  hours: int
+  dom: int
+  months: int
+  dow: int
+  domStar: bool
+  dowStar: bool
+
+  // The next wall-clock instant strictly after `after`, in `after`'s own
+  // zone, matching this schedule. Fails when nothing matches within
+  // `cronMaxYearsAhead` years (an impossible expression) or the search
+  // exceeds its step bound (should never happen for a possible one).
+  export nextAfter(after: DateTime): DateTime! {
+    let cand = after.addMinutes(1).withSecond(0).withNanosecond(0)
+    let limitYear = after.year() + cronMaxYearsAhead
+    let steps = 0
+    while (steps < cronMaxSearchSteps) {
+      steps = steps + 1
+      if (cand.year() > limitYear) {
+        fail newError("cron: no matching time within ${cronMaxYearsAhead} years after ${after.year()}-${after.month()}-${after.day()}")
+      }
+      if ((this.months & bitAt(cand.month())) == 0) {
+        cand = cand.withDay(1).addMonths(1).withHour(0).withMinute(0)
+        continue
+      }
+      if (!cronDomDowMatches(this, cand.day(), isoToCronDow(cand.dayOfWeek()))) {
+        cand = cand.addDays(1).withHour(0).withMinute(0)
+        continue
+      }
+      if ((this.hours & bitAt(cand.hour())) == 0) {
+        cand = cand.addHours(1).withMinute(0)
+        continue
+      }
+      if ((this.minutes & bitAt(cand.minute())) == 0) {
+        cand = cand.addMinutes(1)
+        continue
+      }
+      return cand
+    }
+    fail newError("cron: search exceeded ${cronMaxSearchSteps} steps")
+  }
+}
+
+// Whether day `dom`/`dow` (cron's own 0=Sunday..6=Saturday numbering for
+// `dow`) satisfies the day-of-month and day-of-week fields together, per
+// this file's header (OR once either is textually restricted).
+fn cronDomDowMatches(cs: CronSchedule, dom: int, dow: int): bool {
+  if (cs.domStar && cs.dowStar) {
+    return true
+  }
+  let domOk = (cs.dom & bitAt(dom)) != 0
+  let dowOk = (cs.dow & bitAt(dow)) != 0
+  if (cs.domStar) {
+    return dowOk
+  }
+  if (cs.dowStar) {
+    return domOk
+  }
+  return domOk || dowOk
+}
+
+// `DateTime.dayOfWeek()` is ISO 8601, 1=Monday..7=Sunday
+// (stdlib/time/zoned.bit). Cron's day-of-week field is 0=Sunday..6=Saturday
+// (with 7 also accepted for Sunday, folded in by `parseCron` below) — `% 7`
+// maps ISO 7 (Sunday) to cron 0 and leaves 1..6 (Monday..Saturday) alone.
+fn isoToCronDow(iso: int): int {
+  return iso % 7
+}
+
+fn bitAt(v: int): int {
+  return 1 << v
+}
+
+// Parses a standard 5-field cron expression. Fields are separated by any
+// run of spaces; each field is `*`, `*/step`, a comma-separated list of
+// values/ranges, optionally stepped (`a-b/step`). The month field also
+// accepts `JAN`..`DEC` and the day-of-week field `SUN`..`SAT`, case
+// insensitive.
+export fn parseCron(expr: string): CronSchedule! {
+  let fields = cronSplitFields(expr)
+  if (len(fields) != 5) {
+    fail newError("cron: expected 5 fields (minute hour day-of-month month day-of-week), got ${len(fields)} in '${expr}'")
+  }
+  let noNames = map<string, int>()
+  let minutes = cronParseField(fields[0], 0, 59, noNames)?
+  let hours = cronParseField(fields[1], 0, 23, noNames)?
+  let dom = cronParseField(fields[2], 1, 31, noNames)?
+  let months = cronParseField(fields[3], 1, 12, cronMonthNames())?
+  let dow = cronFoldSundaySeven(cronParseField(fields[4], 0, 7, cronDowNames())?)
+  return CronSchedule{
+    minutes = minutes,
+    hours = hours,
+    dom = dom,
+    months = months,
+    dow = dow,
+    domStar = fields[2] == "*",
+    dowStar = fields[4] == "*",
+  }
+}
+
+// Splits on runs of whitespace, dropping empty pieces — `strings.split`
+// alone would keep an empty piece between two adjacent spaces.
+fn cronSplitFields(expr: string): []string {
+  let out: []string = []string(0)
+  for raw of split(trimSpace(expr), " ") {
+    let f = trimSpace(raw)
+    if (len(f) > 0) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+// A comma-separated field into its combined bitmask.
+fn cronParseField(field: string, min: int, max: int, names: map<string, int>): int! {
+  let mask = 0
+  for item of split(field, ",") {
+    mask = mask | cronParseItem(item, min, max, names)?
+  }
+  return mask
+}
+
+// One list item: `*`, `*/step`, `a`, `a/step`, `a-b`, or `a-b/step`.
+fn cronParseItem(item: string, min: int, max: int, names: map<string, int>): int! {
+  let stepped = split(item, "/")
+  if (len(stepped) > 2) {
+    fail newError("cron: malformed field item '${item}'")
+  }
+  let step = 1
+  if (len(stepped) == 2) {
+    step = parseInt(stepped[1]) catch _ {
+      fail newError("cron: invalid step in '${item}'")
+    }
+    if (step <= 0) {
+      fail newError("cron: step must be positive in '${item}'")
+    }
+  }
+  let base = stepped[0]
+  if (base == "*") {
+    return cronRangeMask(min, max, step)
+  }
+  let range = split(base, "-")
+  if (len(range) == 1) {
+    let v = cronParseValue(range[0], min, max, names)?
+    if (step > 1) {
+      return cronRangeMask(v, max, step)
+    }
+    return bitAt(v)
+  }
+  if (len(range) != 2) {
+    fail newError("cron: malformed range '${base}'")
+  }
+  let lo = cronParseValue(range[0], min, max, names)?
+  let hi = cronParseValue(range[1], min, max, names)?
+  if (lo > hi) {
+    fail newError("cron: range start after end in '${base}'")
+  }
+  return cronRangeMask(lo, hi, step)
+}
+
+// `lo, lo+step, lo+2*step, ...` up to `hi` inclusive. Bounded: `v` strictly
+// increases by at least 1 each pass and `hi` is at most 59 (the widest
+// field), so this never loops more than 60 times.
+fn cronRangeMask(lo: int, hi: int, step: int): int {
+  let mask = 0
+  let v = lo
+  while (v <= hi) {
+    mask = mask | bitAt(v)
+    v = v + step
+  }
+  return mask
+}
+
+// A single field value: a name (month/day-of-week fields only) or a plain
+// integer, range-checked against `[min, max]`.
+fn cronParseValue(tok: string, min: int, max: int, names: map<string, int>): int! {
+  let (named, ok) = names[toUpper(tok)]
+  if (ok) {
+    return named
+  }
+  let v = parseInt(tok) catch _ {
+    fail newError("cron: invalid value '${tok}'")
+  }
+  if (v < min || v > max) {
+    fail newError("cron: value ${v} out of range [${min},${max}] in '${tok}'")
+  }
+  return v
+}
+
+// Bit 7 (the alternate spelling of Sunday) folded into bit 0, then masked
+// to bits 0..6 — the day-of-week field's actual usable range once folded.
+fn cronFoldSundaySeven(mask: int): int {
+  let folded = mask
+  if ((folded & bitAt(7)) != 0) {
+    folded = folded | bitAt(0)
+  }
+  return folded & (bitAt(7) - 1)
+}
+
+fn cronMonthNames(): map<string, int> {
+  let m = map<string, int>()
+  m["JAN"] = 1
+  m["FEB"] = 2
+  m["MAR"] = 3
+  m["APR"] = 4
+  m["MAY"] = 5
+  m["JUN"] = 6
+  m["JUL"] = 7
+  m["AUG"] = 8
+  m["SEP"] = 9
+  m["OCT"] = 10
+  m["NOV"] = 11
+  m["DEC"] = 12
+  return m
+}
+
+fn cronDowNames(): map<string, int> {
+  let m = map<string, int>()
+  m["SUN"] = 0
+  m["MON"] = 1
+  m["TUE"] = 2
+  m["WED"] = 3
+  m["THU"] = 4
+  m["FRI"] = 5
+  m["SAT"] = 6
+  return m
+}

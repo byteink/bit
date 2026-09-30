@@ -23,7 +23,8 @@
 // real job class satisfies the wider bound for free.
 
 import { Json, jsonEncode, jsonParse, jsonDecode } from "std/json"
-import { now, sleep, Millisecond } from "std/time"
+import { now, sleep, zone, Millisecond } from "std/time"
+import { uuidV4, format as uuidFormat } from "std/uuid"
 import { newWaitGroup, WaitGroup, newAtomicI64, AtomicI64 } from "std/sync"
 import { runRecovering } from "std/runtime"
 
@@ -47,6 +48,14 @@ export class Options {
   export workers: int = 4,
   export pollInterval: int = 500 * Millisecond,
   export visibilityTimeout: int = 30 * Second,
+  // Leader election for `schedule`/`every` across several instances (a
+  // `PostgresLocker`). nil means "always leader": correct for ONE instance,
+  // and every instance would enqueue every tick if more than one ran with it.
+  export locker: Locker,
+  // Names this instance in the lease table; empty picks a random one.
+  export instanceId: string = "",
+  // The scheduler's time source; nil is the wall clock. Tests inject one.
+  export clock: Clock,
 }
 
 fn requireOptions(opts: Options): Options! {
@@ -65,6 +74,10 @@ export class Queue {
   handlers: map<string, (string) => ()!>
   running: AtomicI64
   wg: WaitGroup
+  locker: Locker
+  clock: Clock
+  instance: string
+  entries: []entry
 
   // Decodes a claimed job's JSON payload as `T` and calls `handle` with it.
   // A second `register<T>` for the same name replaces the first — callers
@@ -100,6 +113,37 @@ export class Queue {
     this.store.enqueue(name, payload, availableAt, maxAttempts)?
   }
 
+  // Enqueues `job` on a cron schedule: `expr` is five fields (minute hour
+  // day-of-month month day-of-week) read in the zone named `tz`, which is
+  // resolved here, so an unknown zone or a bad expression fails now and not
+  // at 02:00. `missed` is the catch-up policy after a stall. Register
+  // schedules before `start()`/`run()`.
+  export schedule<T: Job>(
+    expr: string,
+    job: T,
+    missed: Missed = Missed.RunOnce,
+    tz: string = "UTC",
+  ): ()! {
+    let zn = zone(tz)?
+    let trig = newCronTrigger(expr, zn)?
+    let id = scheduleId(T.__jobName(), expr, zn.name)
+    let e = newEntry(id, trig, missed, tickEnqueuer<T>(this.store, job, 5), this.clock)?
+    addEntry(this, e)?
+  }
+
+  // Enqueues `job` every `period` nanoseconds (`15 * Minute`). Ticks are
+  // anchored to the Unix epoch, not to when this process started, so every
+  // instance agrees on them.
+  export every<T: Job>(period: int, job: T, missed: Missed = Missed.RunOnce): ()! {
+    if (period <= 0) {
+      fail newError("jobs: every: period must be positive, got ${period}")
+    }
+    let id = scheduleId(T.__jobName(), "every ${period}", "UTC")
+    let trig: trigger = intervalTrigger{ periodNs = period }
+    let e = newEntry(id, trig, missed, tickEnqueuer<T>(this.store, job, 5), this.clock)?
+    addEntry(this, e)?
+  }
+
   // Starts `opts.workers` worker green threads and returns immediately —
   // for in-process workers running alongside other work (a web server, for
   // example). Pair with `stop()` for a graceful drain.
@@ -110,6 +154,10 @@ export class Queue {
     while (i < this.opts.workers) {
       spawn workerLoop(this)
       i = i + 1
+    }
+    if (len(this.entries) > 0) {
+      this.wg.add(1)
+      spawn schedulerLoop(this)
     }
   }
 
@@ -141,7 +189,25 @@ export fn open(store: Store, opts: Options): Queue! {
     handlers = map<string, (string) => ()!>(),
     running = newAtomicI64(0),
     wg = newWaitGroup(),
+    locker = checked.locker,
+    clock = resolveClock(checked),
+    instance = resolveInstance(checked),
+    entries = []entry(0),
   }
+}
+
+fn resolveClock(opts: Options): Clock {
+  if (opts.clock == nil) {
+    return systemClock{}
+  }
+  return opts.clock
+}
+
+fn resolveInstance(opts: Options): string {
+  if (opts.instanceId == "") {
+    return uuidFormat(uuidV4())
+  }
+  return opts.instanceId
 }
 
 // One worker's whole loop: while running, claim at most one job and
