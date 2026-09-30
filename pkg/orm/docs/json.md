@@ -62,12 +62,13 @@ through the same column.
 
 ## Adding one to a table that already exists
 
-`AlterTable.addJson` is `Table.json`'s own sibling for `alter`:
+`AlterTable.json` is `Table.json`'s own sibling for `alter` - the same
+name, one method per concept (#6304):
 
 ```bit
 fn addMetaColumn(): SchemaOp {
   return alter("events", (t) => {
-    t.addJson("meta").nullable()
+    t.json("meta").nullable()
   })
 }
 ```
