@@ -137,10 +137,27 @@ fn ledgerBurst(): int {
 }
 ```
 
-The scheduler does not remember its last tick across a restart: a process
-starts each schedule at the first tick after it starts. The downtime that
-`missed` covers is the scheduler's own stalls, not a whole fleet that was
-down through a tick.
+The downtime can also be the whole app. With a `Locker` (next section) the
+scheduler asks it, when it starts, for the newest tick each schedule ever
+enqueued, and begins at the first tick after that. Every tick that came due
+while nothing was running is then handled by `missed` exactly like a stall.
+The nightly digest, with `Missed.RunAll(2)`:
+
+```text
+Thu 02:00  digest enqueued
+Thu 22:00  the app goes down
+Mon 09:00  the app starts: the last enqueued tick is Thu 02:00
+           ticks Fri, Sat, Sun and Mon 02:00 are due
+           RunAll(2) enqueues Sun and Mon; RunOnce would enqueue Mon only,
+           Skip nothing
+Tue 02:00  the next tick, on time
+```
+
+One missed tick is still "the schedule running on time": an app down across
+a single 02:00 and started at 02:30 runs that digest under every policy. A
+schedule that never fired starts at its first tick after the app starts, and
+without a `Locker` there is nothing to read, so a restart starts each
+schedule at its first tick after it starts.
 
 ## The real use case: three copies of the app
 
@@ -164,15 +181,28 @@ fn openOnEveryInstance(db: Pool, instance: string): Queue! {
 `instanceId` names the instance in the lease table and defaults to a random
 one. The lease is per tick, not per schedule, so if the instance that won
 tick 02:00 dies a second later, the others do not fire it again: the tick's
-lease is already taken. Leases expire after an hour and are deleted
-lazily.
+lease is already taken. A lease expires after an hour, which only lets
+another instance take that tick over. The rows are also how a restarted app
+learns its last tick, so they are never deleted by age: each schedule keeps
+its newest 1024 lease rows and the older ones are dropped as new ticks are
+won. Keep that above the biggest `Missed.RunAll` cap you use; `keep` changes it:
+
+```bit
+fn smallLeaseWindow(db: Pool): Locker {
+  return newPostgresLocker(db, keep = 200)
+}
+```
 
 Without a `locker`, every instance enqueues every tick. That is right for a
 single instance and wrong for two. To use another lock service, write a
-`Locker`: one method, `tryAcquire(key, holder, nowNs, expiresAt)`, that
-returns true when `holder` owns `key` after the call and false when someone
-else's lease has not expired. Compare `expiresAt` against the `nowNs` you
-are given, not your own clock.
+`Locker`: two methods.
+`tryAcquire(key, holder, nowNs, expiresAt)` returns true when `holder` owns
+`key` after the call and false when someone else's lease has not expired;
+compare `expiresAt` against the `nowNs` you are given, not your own clock.
+`lastTick(key)` returns the newest tick number won for the schedule `key`
+(a lease key is `key` then `@` then the tick), or 0 when there is none. A
+locker that forgets its ticks, like the one below, only loses the catch-up
+after downtime.
 
 ```bit
 import { Locker, Store } from "jobs"
@@ -180,6 +210,10 @@ import { Locker, Store } from "jobs"
 class singleHost {
   export tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
     return true
+  }
+
+  export lastTick(key: string): int! {
+    return 0
   }
 }
 
