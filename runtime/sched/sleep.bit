@@ -395,12 +395,21 @@ export const pollDrainWakeOnly: int = -1
 // audit would report as a miss whenever the host held the producer off a CPU).
 // The epoch cannot wrap: it moves once per worker-0 turn, 2^61 turns.
 //
-// Only worker 0's thread writes the epoch, and it does so while the state is 0
-// (disarm precedes every arm), when no producer can CAS the cell, so the plain
-// load below cannot lose an update.
-export @nosplit @symbol("bit_rt_port_sched_poller_arm") fn schedPollerArm(s: *i64) {
+// THIS CELL IS THE POLLER TOKEN (#6429). `state != 0` means some worker holds
+// the right to block in the process-wide poller (epoll/kqueue fd, one value in
+// `scPollFd`); 0 means the token is free. `schedPollerArm` is the take: a
+// compare-and-exchange from state 0, true for exactly one caller at a time.
+// The holder is whichever thread won; a producer's wake (`schedWakePoller`)
+// never names it, it claims the cell and triggers the descriptor, which ends
+// the wait of whoever is inside it. The epoch moves only on a successful take,
+// which happens only from state 0, so the arm that bumped it is the arm the
+// audit below names.
+export @nosplit @symbol("bit_rt_port_sched_poller_arm") fn schedPollerArm(s: *i64): bool {
   let v = atomicLoad(s + scPollWait)
-  atomicStore(s + scPollWait, v - (v & pollWaitStateMask) + pollWaitEpochStep + pollWaitArmed)
+  if ((v & pollWaitStateMask) != 0) {
+    return false
+  }
+  return atomicCmpxchg(s + scPollWait, v, v + pollWaitEpochStep + pollWaitArmed)
 }
 
 // Worker 0 is awake: it found work, or its wait has ended. Cleared
@@ -409,6 +418,34 @@ export @nosplit @symbol("bit_rt_port_sched_poller_arm") fn schedPollerArm(s: *i6
 export @nosplit @symbol("bit_rt_port_sched_poller_disarm") fn schedPollerDisarm(s: *i64) {
   let v = atomicLoad(s + scPollWait)
   atomicStore(s + scPollWait, v - (v & pollWaitStateMask))
+}
+
+// Whether anything needs a poller: a timer deadline is published or a netpoll
+// registration is armed. Plain loads, no lock; a stale answer costs one extra or
+// one missed hand-off, and the 100ms park backstop bounds the second.
+@nosplit fn schedPollerWanted(): bool {
+  if (atomicLoad(nextDeadlineAddr() + dlTasks) != 0) {
+    return true
+  }
+  if (atomicLoad(nextDeadlineAddr() + dlChans) != 0) {
+    return true
+  }
+  return schedPollPendingCount() > 0
+}
+
+// The token's hand-off (#6429). A holder that left the poller and is about to
+// RUN a task is not polling any more; if the token is free, something needs a
+// poller and a peer is parked, wake that peer so it takes the token instead of
+// the next deadline waiting out the park backstop (`idleParkMaxNs`). A no-op,
+// two loads, when the token is held, nobody is parked or nothing is pending.
+export @nosplit @symbol("bit_rt_port_sched_poller_handoff") fn schedPollerHandoff(s: *i64) {
+  if ((atomicLoad(s + scPollWait) & pollWaitStateMask) != 0) {
+    return
+  }
+  if (atomicLoad(s + scIdleCount) <= 0 || !schedPollerWanted()) {
+    return
+  }
+  let _ = schedWakeParkedPeer(s)
 }
 
 // `scPollWait` after a producer's claim (#5843): distinct from 0 so that the

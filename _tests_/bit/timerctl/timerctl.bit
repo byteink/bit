@@ -32,24 +32,37 @@
 // holding a woken thread off a CPU. Nothing outside the runtime can tell them
 // apart, so the runtime answers it itself, twice:
 //
-//   - A producer that publishes a deadline while worker 0 is armed must claim
-//     that wait (#6418), and `schedWakeAuditEnd` (`runtime/sched/sleep.bit`)
+//   - A producer that publishes a deadline while the poller token is held must
+//     claim that wait (#6418), and `schedWakeAuditEnd` (`runtime/sched/sleep.bit`)
 //     counts every producer that did not. `ok` fails on a non-zero count
 //     whatever the timings were, and the diag line prints it as `missedWake`.
-//   - Worker 0's blocking wait is traced (#6427, `runtime/sched/timertrace.bit`)
-//     with how late the OS returned its thread: the time the kernel had it
+//   - The poller holder's blocking wait (any worker, #6429) is traced (#6427,
+//     `runtime/sched/timertrace.bit`) with how late the OS returned its thread: the time the kernel had it
 //     runnable and did not run it, and the wait's overshoot of its own bound.
 //     That is the OS's lateness measured ON THE THREAD THAT WAITS, which the
 //     control (another thread, another moment) cannot see: under 2*ncpu CPU
 //     hogs a 2ms timer fired 63-91ms late with the control under 10ms because
-//     worker 0's `epoll_pwait2` came back that late. The verdict subtracts the
+//     the holder's `epoll_pwait2` came back that late. The verdict subtracts the
 //     larger of the control and this, as `osHeld`. A wake that was late with
 //     the thread asleep on a stale bound (the #5845 shape: nothing woke it)
 //     returns on time at that bound, so neither excuses it.
 //
+//   - A THIRD SHARE (#6429): a thread that fired the timer, or was woken to run
+//     the task, can be taken off its CPU AFTER the wait traced above has
+//     returned, with nothing in the trace to show it. On Linux each sample
+//     also snapshots every thread's `run_delay` (`/proc/self/task/*/schedstat`,
+//     the time the kernel had the thread runnable and did not run it) and
+//     takes the largest growth of any one thread across the sample as `osRun`,
+//     excused like the others. It is the kernel's own accounting of a thread
+//     that was ready and waiting for a CPU, which no scheduler fix can shorten;
+//     a lost wake leaves nobody runnable, so it cannot hide behind it.
+//
 // When a program fails, `dumpTrace` prints the events around the worst sample.
 
-import { monotonic, since, sleep, Millisecond } from "std/time"
+import { monotonic, since } from "std/time"
+import { open, readDir } from "std/fs"
+import { env } from "std/os"
+import { split, trimSpace, parseInt } from "std/strings"
 
 extern fn bit_rt_port_park_sleep_ns(ns: int, scratch: *i64)
 extern fn bit_rt_port_sched_timer_missed_wake(): int
@@ -57,6 +70,75 @@ extern fn bit_rt_port_sched_timer_trace_enable()
 extern fn bit_rt_port_sched_timer_trace_count(): int
 extern fn bit_rt_port_sched_timer_trace_at(n: int, field: int): int
 extern fn bit_rt_port_sched_timer_trace_os_held(t0: int, t1: int): int
+
+// Threads a snapshot can hold; a process with more threads than this reports the
+// growth of the first `maxThreads` only.
+const maxThreads: int = 64
+
+// Every thread's id and `run_delay` in ns at one moment (Linux; empty where
+// `/proc/self/task` does not exist).
+class Snap {
+  tids: []int,
+  delays: []int,
+  n: int,
+}
+
+// One thread's `run_delay` from its `schedstat` line "runtime run_delay slices",
+// or -1 when it cannot be read.
+fn runDelayOf(name: string): int {
+  // `read`, not `readFile`: a procfs file reports size 0, so `readAll` is empty.
+  let f = open("/proc/self/task/${name}/schedstat") catch _ {
+    return 0 - 1
+  }
+  let txt = f.read(128)
+  f.close()
+  let parts = split(trimSpace(txt), " ")
+  if (len(parts) < 2) {
+    return 0 - 1
+  }
+  let d = parseInt(parts[1]) catch _ {
+    return 0 - 1
+  }
+  return d
+}
+
+fn takeSnap(): Snap {
+  let s = Snap{ tids = []int(maxThreads), delays = []int(maxThreads), n = 0 }
+  let names = readDir("/proc/self/task") catch _ {
+    return s
+  }
+  let i = 0
+  while (i < len(names) && s.n < maxThreads) {
+    let tid = parseInt(names[i]) catch _ {
+      0 - 1
+    }
+    let d = runDelayOf(names[i])
+    if (tid >= 0 && d >= 0) {
+      s.tids[s.n] = tid
+      s.delays[s.n] = d
+      s.n = s.n + 1
+    }
+    i = i + 1
+  }
+  return s
+}
+
+// The largest `run_delay` growth of any one thread present in both snapshots.
+fn growth(a: Snap, b: Snap): int {
+  let worst = 0
+  let i = 0
+  while (i < b.n) {
+    let j = 0
+    while (j < a.n) {
+      if (a.tids[j] == b.tids[i] && b.delays[i] - a.delays[j] > worst) {
+        worst = b.delays[i] - a.delays[j]
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return worst
+}
 
 // How far before the worst sample's start the dump begins, so the arm or reset
 // that began it is in it.
@@ -71,6 +153,8 @@ export class Probe {
   worstStartNs: int
   worstEndNs: int
   worstTimerCtlNs: int
+  worstOsRunNs: int
+  prev: Snap
   ctlMaxNs: int
 
   // One plain OS sleep of `nominalNs`; returns how late it woke, never
@@ -90,6 +174,7 @@ export class Probe {
   // `startNs` is the wait's start on the monotonic clock; the end is now.
   export sample(startNs: int, overshootNs: int) {
     let endNs = monotonic().ns
+    let runDelayNs = growth(this.prev, takeSnap())
     let ctl = this.control()
     if (ctl > this.ctlMaxNs) {
       this.ctlMaxNs = ctl
@@ -100,24 +185,29 @@ export class Probe {
       this.worstStartNs = startNs
       this.worstEndNs = endNs
       this.worstTimerCtlNs = ctl
+      this.worstOsRunNs = runDelayNs
     }
+    this.prev = takeSnap()
     this.iters = this.iters + 1
   }
 
-  // How late the OS returned worker 0's thread from the waits that overlap the
+  // How late the OS returned the poller holder's thread from the waits that overlap the
   // worst sample's window (`runtime/sched/timertrace.bit`).
   export osHeldNs(): int {
     return bit_rt_port_sched_timer_trace_os_held(this.worstStartNs, this.worstEndNs)
   }
 
   // The worst timer overshoot beyond what the OS demonstrably did: the plain
-  // sleep's lateness or the OS's lateness returning worker 0's thread,
+  // sleep's lateness or the OS's lateness returning the poller holder's thread,
   // whichever is larger; 0 when the timer was no later than that.
   export excessNs(): int {
     let excused = this.ctlMaxNs
     let held = this.osHeldNs()
     if (held > excused) {
       excused = held
+    }
+    if (this.worstOsRunNs > excused) {
+      excused = this.worstOsRunNs
     }
     if (this.worstTimerNs <= excused) {
       return 0
@@ -127,7 +217,7 @@ export class Probe {
 
   // The runtime's trace around the worst sample, on stderr. Call it when `ok`
   // is false: the events say who armed or reset the timer, whether the wake
-  // claimed worker 0, how long worker 0's wait ran against its bound and how
+  // claimed the poller holder, how long the poller holder's wait ran against its bound and how
   // much of that the OS held its thread off a CPU, and when the due entry fired.
   export dumpTrace() {
     let total = bit_rt_port_sched_timer_trace_count()
@@ -162,38 +252,8 @@ export class Probe {
     return "${name} diag: iters=${this.iters} budget=${ms(budgetNs)}ms " +
       "worstTimer=${ms(this.worstTimerNs)}ms@${this.worstTimerAt} " +
       "controlThen=${ms(this.worstTimerCtlNs)}ms controlMax=${ms(this.ctlMaxNs)}ms " +
-      "osHeld=${ms(this.osHeldNs())}ms " +
+      "osHeld=${ms(this.osHeldNs())}ms osRun=${ms(this.worstOsRunNs)}ms " +
       "excess=${ms(this.excessNs())}ms missedWake=${bit_rt_port_sched_timer_missed_wake()}"
-  }
-}
-
-// Whether worker 0 has gone idle at least once since tracing was enabled.
-fn worker0Seen(): bool {
-  let total = bit_rt_port_sched_timer_trace_count()
-  let n = 0
-  while (n < total && n < traceKept) {
-    if (bit_rt_port_sched_timer_trace_at(n, 1) / 256 == 4) {
-      return true
-    }
-    n = n + 1
-  }
-  return false
-}
-
-// Worker 0 is the one thread that polls timers, and a thread the OS has not run
-// for the first time polls nothing: a timer armed before that is served only by
-// a parked peer's 100ms backstop (#6427: `wake` showed worker 0's wait cell never
-// armed, and the first sample fired 55-93ms late). That is a boot-time property
-// of a starved process, not what these programs measure, so they start timing
-// once worker 0 has been seen waiting. Bounded: a platform whose worker 0 never
-// reaches the traced wait costs `warmTries` sleeps and is judged as before.
-const warmTries: int = 100
-
-fn awaitWorker0() {
-  let i = 0
-  while (i < warmTries && !worker0Seen()) {
-    sleep(Millisecond)
-    i = i + 1
   }
 }
 
@@ -237,9 +297,18 @@ fn ms(ns: int): string {
   return "${us / 1000}.${pad}${frac}"
 }
 
+// The overshoot budget a program judges against (#6429): `budgetNs` under the
+// default collector, ten times that under `BIT_GC=stress`, which collects at
+// every safepoint and so adds collection pauses of its own to every timer.
+export fn budgetFor(budgetNs: int): int {
+  if (env("BIT_GC") == "stress") {
+    return budgetNs * 10
+  }
+  return budgetNs
+}
+
 export fn newProbe(nominalNs: int): Probe {
   bit_rt_port_sched_timer_trace_enable()
-  awaitWorker0()
   return Probe{
     nominalNs = nominalNs,
     scratch = []i64(2),
@@ -249,6 +318,8 @@ export fn newProbe(nominalNs: int): Probe {
     worstStartNs = 0,
     worstEndNs = 0,
     worstTimerCtlNs = 0,
+    worstOsRunNs = 0,
+    prev = takeSnap(),
     ctlMaxNs = 0,
   }
 }
