@@ -1,0 +1,280 @@
+// #6440 (§11.6): does an x64 `asm` payload contain a call?
+//
+// The payload is raw bytes, so finding a `call` means finding instruction
+// boundaries: `mov rax, rbp` is 48 89 E8, and that E8 is a ModRM byte, not a
+// `call rel32`. This decodes the integer subset the runtime writes (legacy and
+// REX prefixes, the one-byte opcodes, the common `0F` entries) exactly: each
+// instruction's length comes from its opcode's operand shape, then ModRM, SIB,
+// displacement and immediate. At the first instruction it cannot decode (an
+// opcode outside the tables, VEX/EVEX, a truncated tail) it stops claiming
+// exactness and falls back to the conservative rule for the rest of the
+// payload: any `E8`, or `FF` with a ModRM reg field of 2 or 3, counts as a call.
+// Exact where it can be, conservative where it cannot: it never misses a call
+// it did not decode.
+//
+// Split out of validateasmcall.bit; a sibling .bit file is the same module.
+
+// Operand shape of an opcode: the value of its table letter minus 'A'. Any
+// other result is negative ('.' in a table) and means "not decodable here".
+const xkNone = 0       // A
+const xkModrm = 1      // B
+const xkModrmImm8 = 2  // C
+const xkModrmImmZ = 3  // D
+const xkImm8 = 4       // E (also rel8)
+const xkImmZ = 5       // F
+const xkRel32 = 6      // G
+const xkCall = 7       // H, `E8`
+const xkMovImm = 8     // I, `B8`..`BF`
+const xkGroup3Byte = 9 // J, `F6`: ModRM, immediate only for reg 0/1
+const xkGroup3 = 10    // K, `F7`
+const xkGroup5 = 11    // L, `FF`: ModRM, reg 2/3 is a call
+const xkImm16 = 12     // M, `ret imm16`
+const xkPrefix = 15    // P, a legacy prefix
+const xkRex = 17       // R, a REX prefix
+
+// The one-byte opcode map, sixteen opcodes per row (row = opcode >> 4).
+fn xTableOneByte(): string {
+  return "BBBBEF..BBBBEF.." + // 00 ALU
+    "BBBBEF..BBBBEF.." +      // 10
+    "BBBBEFP.BBBBEFP." +      // 20 (26, 2E prefixes)
+    "BBBBEFP.BBBBEFP." +      // 30 (36, 3E prefixes)
+    "RRRRRRRRRRRRRRRR" +      // 40 REX
+    "AAAAAAAAAAAAAAAA" +      // 50 push/pop
+    "...BPPPPFDECAAAA" +      // 60 movsxd, 64-67 prefixes, push imm, imul
+    "EEEEEEEEEEEEEEEE" +      // 70 jcc rel8
+    "CD.CBBBBBBBBBBBB" +      // 80
+    "AAAAAAAAAA.AAAAA" +      // 90
+    "....AAAAEFAAAAAA" +      // A0 string ops, test imm
+    "EEEEEEEEIIIIIIII" +      // B0 mov imm
+    "CCMA..CD.A..AE.." +      // C0 shifts, ret, mov imm, int3
+    "BBBB....BBBBBBBB" +      // D0 shifts, x87
+    "EEEE....HG.E...." +      // E0 loop, call, jmp
+    "P.PPAAJKAAAAAABL"        // F0 prefixes, hlt, group 3, group 5
+}
+
+// The `0F` two-byte opcode map, same layout.
+fn xTable0F(): string {
+  return ".B...A.....A.B.." + // 00 syscall, ud2, prefetch
+    "BBBBBBBBB......B" +      // 10 SSE moves, nop
+    "........BBBBBBBB" +      // 20
+    ".A.............." +      // 30 rdtsc
+    "BBBBBBBBBBBBBBBB" +      // 40 cmovcc
+    "BBBBBBBBBBBBBBBB" +      // 50 SSE arithmetic
+    "..............BB" +      // 60 movd, movq
+    "..............BB" +      // 70
+    "GGGGGGGGGGGGGGGG" +      // 80 jcc rel32
+    "BBBBBBBBBBBBBBBB" +      // 90 setcc
+    "..ABCB.....BCBBB" +      // A0 cpuid, bt, shld, fences, imul
+    "BB.B..BB..CBBBBB" +      // B0 cmpxchg, movzx, bt group, bsf, movsx
+    "BB......AAAAAAAA" +      // C0 xadd, bswap
+    "......B........." +      // D0
+    "...............B" +      // E0 pxor
+    "................"        // F0
+}
+
+// Immediate bytes by operand shape, indexed A..M; '9' means "operand size":
+// 2 under a 66 prefix, else 4 (8 for `mov r64, imm64` under REX.W).
+fn xImmTable(): string {
+  return "0019194090002"
+}
+
+// A decoded instruction's prefix state: where its opcode starts, and the two
+// facts that change its immediate size.
+class XDec {
+  at: int,
+  opsz16: bool,
+  rexW: bool,
+}
+
+// An out-of-range literal is E0053's to report (`vAsmCode`); here it is simply
+// not decodable.
+fn xKindOf(table: string, op: int): int {
+  if (op < 0 || op > 255) {
+    return -1
+  }
+  return int(table[op]) - 65
+}
+
+// Skips legacy prefixes and one REX prefix from `b[start]`.
+fn xPrefixes(b: []int, start: int): XDec {
+  let tbl = xTableOneByte()
+  let d = XDec{ at = start, opsz16 = false, rexW = false }
+  while (d.at < len(b) && xKindOf(tbl, b[d.at]) == xkPrefix) {
+    d.opsz16 = d.opsz16 || b[d.at] == 0x66
+    d.at = d.at + 1
+  }
+  if (d.at < len(b) && xKindOf(tbl, b[d.at]) == xkRex) {
+    d.rexW = (b[d.at] & 8) != 0
+    d.at = d.at + 1
+  }
+  return d
+}
+
+// Bytes taken by ModRM + SIB + displacement for the ModRM byte at `b[i]`, or -1
+// when it runs past the payload.
+fn xModrmLen(b: []int, i: int): int {
+  if (i >= len(b)) {
+    return -1
+  }
+  let md = b[i] >> 6
+  if (md == 3) {
+    return 1
+  }
+  let n = 1
+  let base = b[i] & 7
+  if (base == 4) {
+    if (i + 1 >= len(b)) {
+      return -1
+    }
+    n = 2
+    base = b[i + 1] & 7
+  }
+  return n + xDispLen(md, base)
+}
+
+// Displacement bytes: `base` is the ModRM rm field, or the SIB base when a SIB
+// byte follows; mod 0 with base 5 is a bare disp32 either way.
+fn xDispLen(md: int, base: int): int {
+  if (md == 1) {
+    return 1
+  }
+  if (md == 2 || (md == 0 && base == 5)) {
+    return 4
+  }
+  return 0
+}
+
+fn xHasModrm(kind: int): bool {
+  return kind == xkModrm ||
+    kind == xkModrmImm8 ||
+    kind == xkModrmImmZ ||
+    kind == xkGroup3Byte ||
+    kind == xkGroup3 ||
+    kind == xkGroup5
+}
+
+// The ModRM reg field of a call: `/2` near, `/3` far.
+fn xIsCallReg(reg: int): bool {
+  return reg == 2 || reg == 3
+}
+
+// Group 3 carries an immediate only for `test` (reg 0 and 1); `not`, `neg`,
+// `mul` and `div` carry none. Every other shape is its own.
+fn xEffKind(kind: int, reg: int): int {
+  if (kind == xkGroup3Byte) {
+    if (reg < 2) {
+      return xkImm8
+    }
+    return xkNone
+  }
+  if (kind == xkGroup3) {
+    if (reg < 2) {
+      return xkImmZ
+    }
+    return xkNone
+  }
+  return kind
+}
+
+fn xImmLen(kind: int, d: XDec): int {
+  let n = int(xImmTable()[kind]) - 48
+  if (n != 9) {
+    return n
+  }
+  if (kind == xkMovImm && d.rexW) {
+    return 8
+  }
+  if (d.opsz16) {
+    return 2
+  }
+  return 4
+}
+
+// Opcode shape of the instruction whose opcode starts at `b[at]`, reading the
+// `0F` escape's second byte.
+fn xKindAt(b: []int, at: int): int {
+  if (b[at] != 0x0F) {
+    return xKindOf(xTableOneByte(), b[at])
+  }
+  if (at + 1 >= len(b)) {
+    return -1
+  }
+  return xKindOf(xTable0F(), b[at + 1])
+}
+
+// Length of the instruction starting at `b[start]`; -1 when it cannot be decoded
+// exactly, -2 when it is a call.
+fn xInsnLen(b: []int, start: int): int {
+  let d = xPrefixes(b, start)
+  if (d.at >= len(b)) {
+    return -1
+  }
+  let kind = xKindAt(b, d.at)
+  if (kind < 0 || kind == xkPrefix || kind == xkRex) {
+    return -1
+  }
+  if (kind == xkCall) {
+    return -2
+  }
+  d.at = d.at + 1
+  if (b[d.at - 1] == 0x0F) {
+    d.at = d.at + 1
+  }
+  return xInsnTail(b, start, d, kind)
+}
+
+// The ModRM and immediate part of an instruction whose opcode ends before
+// `b[d.at]`; the result is `xInsnLen`'s.
+fn xInsnTail(b: []int, start: int, d: XDec, kind: int): int {
+  let i = d.at
+  let reg = 0
+  if (xHasModrm(kind)) {
+    let m = xModrmLen(b, i)
+    if (m < 0) {
+      return -1
+    }
+    reg = (b[i] >> 3) & 7
+    if (kind == xkGroup5 && xIsCallReg(reg)) {
+      return -2
+    }
+    i = i + m
+  }
+  i = i + xImmLen(xEffKind(kind, reg), d)
+  if (i > len(b)) {
+    return -1
+  }
+  return i - start
+}
+
+// The conservative rule over `b[from..]`: any byte that COULD begin a call.
+fn xBytesMayCall(b: []int, from: int): bool {
+  let i = from
+  while (i < len(b)) {
+    if (b[i] == 0xE8) {
+      return true
+    }
+    if (b[i] == 0xFF && i + 1 < len(b) && xIsCallReg((b[i + 1] >> 3) & 7)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether the x64 payload may call: decode instruction by instruction; the first
+// call decoded answers yes, the first instruction not decodable hands the rest
+// of the payload to the conservative rule.
+fn asmX64MayCall(b: []int): bool {
+  let i = 0
+  while (i < len(b)) {
+    let n = xInsnLen(b, i)
+    if (n == -2) {
+      return true
+    }
+    if (n < 0) {
+      return xBytesMayCall(b, i)
+    }
+    i = i + n
+  }
+  return false
+}
