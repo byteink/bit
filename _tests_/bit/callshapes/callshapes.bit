@@ -1,0 +1,330 @@
+// #6394. For every receiver form x callee kind x argument shape the harness
+// writes one small program and asks the compiler twice, `bit check` and `bit
+// build`. The cell agrees when
+//   - `bit check` rejects it with a named diagnostic (`error[E....]`) that
+//     points into the cell's main.bit, or
+//   - `bit check` accepts it, `bit build` builds it, and the program prints 2
+//     (every callable in world.bit returns 2 for `(2, "x")`).
+// "Check passes, build fails" is always a failure: six of those reached main
+// one at a time (#6363, #6365, #6381, #6387, #6388, #6392), each found by luck.
+//
+// The programs are generated from the tables in cells.bit into $TMPDIR and
+// never committed. known.bit lists the cells that still disagree, each with its
+// ticket, and is asserted both ways. Prints `<agree> of <total> cells agree,
+// <known> on the known-failure list`.
+//
+// BIT_SELF_EXE is the compiler under test. Run from the repository root:
+//     BIT_SELF_EXE=./bit-out/bin/bit ./bit-out/bin/bit run _tests_/bit/callshapes
+import { env, envOr, exit } from "std/os"
+import { mkdir, readFile, writeFile } from "std/fs"
+import { contains, hasSuffix, parseInt, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+const defaultTimeoutS: int = 600
+const parallelism: int = 6
+const wantOut: string = "2\n"
+const minCells: int = 1000
+const logLines: int = 8
+
+// One cell's four exit codes; -1 is "that step did not run".
+class Result {
+  id: string,
+  check: int,
+  build: int,
+  run: int,
+}
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (len(v) == 0) {
+    panic("callshapes: ${name} is required and was not set")
+  }
+  if (contains(v, "'")) {
+    panic("callshapes: ${name} holds a single quote, which the generated shell cannot carry")
+  }
+  return v
+}
+
+fn requiredTmp(): string {
+  let t = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(t, "/")) {
+    return t[0:len(t) - 1]
+  }
+  return t
+}
+
+fn makeDir(dir: string) {
+  mkdir(dir) catch e {
+    panic("callshapes: cannot create ${dir}: ${e.message()}")
+  }
+}
+
+fn put(path: string, text: string) {
+  writeFile(path, text) catch e {
+    panic("callshapes: cannot write ${path}: ${e.message()}")
+  }
+}
+
+fn slurp(path: string): string {
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status.
+fn shell(scriptPath: string, script: string, ms: int): int {
+  put(scriptPath, script)
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    panic("callshapes: cannot make ${scriptPath} executable")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("callshapes: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("callshapes: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("callshapes: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn writeCells(work: string, all: []Cell) {
+  makeDir("${work}/lib")
+  put("${work}/lib/lib.bit", worldDecls())
+  makeDir("${work}/cells")
+  let ids = ""
+  for c of all {
+    makeDir("${work}/cells/${c.id}")
+    put("${work}/cells/${c.id}/main.bit", c.main)
+    ids = ids + c.id + "\n"
+  }
+  put("${work}/ids.txt", ids)
+}
+
+// One script runs one cell: check, then build only if check passed, then the
+// program only if it built, and appends `<id> <check> <build> <run>`.
+fn cellScript(bit: string, work: string): string {
+  let s = "#!/bin/sh\nid=\"$1\"\nd='${work}/cells/'\"$id\"\nb=-1\nr=-1\n"
+  s = s + "'${bit}' check \"$d\" > \"$d/check.log\" 2>&1\nc=$?\n"
+  s = s + "if [ \"$c\" -eq 0 ]; then\n"
+  s = s + "  '${bit}' build \"$d\" -o \"$d/prog\" > \"$d/build.log\" 2>&1\n  b=$?\n"
+  s = s + "  if [ \"$b\" -eq 0 ]; then\n"
+  s = s + "    \"$d/prog\" > \"$d/run.out\" 2> \"$d/run.err\"\n    r=$?\n  fi\nfi\n"
+  return s + "printf '%s %s %s %s\\n' \"$id\" \"$c\" \"$b\" \"$r\" >> '${work}/results.txt'\n"
+}
+
+fn runCells(bit: string, work: string, ms: int) {
+  put("${work}/one.sh", cellScript(bit, work))
+  let all = "#!/bin/sh\nxargs -n1 -P${parallelism} sh '${work}/one.sh' < '${work}/ids.txt'\n"
+  let rc = shell("${work}/run.sh", all, ms)
+  if (rc != 0) {
+    panic("callshapes: the cell fan-out exited ${rc}")
+  }
+}
+
+fn readResults(work: string): []Result {
+  let out = []Result(0)
+  for line of split(slurp("${work}/results.txt"), "\n") {
+    let p = split(line, " ")
+    if (len(p) != 4) {
+      continue
+    }
+    out = append(
+      out,
+      Result{
+        id = p[0],
+        check = intOr(p[1]),
+        build = intOr(p[2]),
+        run = intOr(p[3]),
+      },
+    )
+  }
+  return out
+}
+
+fn intOr(s: string): int {
+  return parseInt(s) catch _ {
+    -2
+  }
+}
+
+fn findResult(rs: []Result, id: string): Result {
+  for r of rs {
+    if (r.id == id) {
+      return r
+    }
+  }
+  panic("callshapes: cell ${id} produced no result line")
+}
+
+fn firstLines(text: string, n: int): string {
+  let out = ""
+  let k = 0
+  for line of split(text, "\n") {
+    if (k >= n) {
+      break
+    }
+    out = out + "      ${line}\n"
+    k = k + 1
+  }
+  return out
+}
+
+// A rejection is a named diagnostic that points into the cell's own main.bit,
+// so an error inside the shared lib.bit cannot make every cell "agree".
+fn namedDiagnostic(log: string): bool {
+  return contains(log, "error[E") && contains(log, "/main.bit:")
+}
+
+// "" when the cell agrees, else why it does not.
+fn disagreement(work: string, r: Result): string {
+  let dir = "${work}/cells/${r.id}"
+  if (r.check != 0) {
+    if (r.check > 1) {
+      return "bit check exited ${r.check}"
+    }
+    if (!namedDiagnostic(slurp("${dir}/check.log"))) {
+      return "bit check rejected it with no named diagnostic in main.bit\n${firstLines(
+        slurp("${dir}/check.log"),
+        logLines,
+      )}"
+    }
+    return ""
+  }
+  if (r.build != 0) {
+    return "bit check accepted it and bit build failed (exit ${r.build})\n${firstLines(
+      slurp("${dir}/build.log"),
+      logLines,
+    )}"
+  }
+  if (r.run != 0) {
+    return "built, and the program exited ${r.run}"
+  }
+  let got = slurp("${dir}/run.out")
+  if (got != wantOut) {
+    return "built, and printed ${got}, wanted 2"
+  }
+  return ""
+}
+
+// Cells that must be ACCEPTED, built and print 2. Without them a broken world
+// (every cell rejected for the same unrelated reason) would read as all agree.
+fn controls(): []string {
+  return [
+    "L-class-static-right",
+    "I-class-static-right",
+    "N-class-static-right",
+    "L-class-ctor-right",
+    "I-ginst-ctor-right",
+    "L-enum-variant-right",
+    "I-enum-tag-right",
+    "L-tparam-static-right",
+    "I-tparam-static-right",
+    "N-tparam-static-right",
+    "L-value-inst-right",
+    "N-value-ginst-right",
+    "N-class-gen-right",
+    "N-func-call-right",
+  ]
+}
+
+fn assertControls(work: string, rs: []Result) {
+  for id of controls() {
+    let r = findResult(rs, id)
+    if (r.check != 0 || disagreement(work, r) != "") {
+      panic("callshapes: control cell ${id} is not accepted and built (check ${r.check}, build ${r.build}, run ${r.run}); the world is broken, logs in ${work}")
+    }
+  }
+}
+
+fn knownTicket(id: string): string {
+  for k of knownFailures() {
+    if (k.id == id) {
+      return k.ticket
+    }
+  }
+  return ""
+}
+
+fn assertKnownListed(all: []Cell) {
+  for k of knownFailures() {
+    let found = false
+    for c of all {
+      if (c.id == k.id) {
+        found = true
+      }
+    }
+    if (!found) {
+      panic("callshapes: ${k.id} (${k.ticket}) is on the known-failure list but is no cell of the table; delete it from the list (its shape word, mode letter or rule in known.bit)")
+    }
+  }
+}
+
+// Judges every cell; returns how many disagree and are NOT on the list, and how
+// many are on the list.
+fn judgeAll(work: string, all: []Cell, rs: []Result): []int {
+  let fresh = 0
+  let known = 0
+  for c of all {
+    let why = disagreement(work, findResult(rs, c.id))
+    let ticket = knownTicket(c.id)
+    if (why == "" && ticket != "") {
+      eprint("callshapes: FAIL ${c.id}: agrees now, but is on the known-failure list as ${ticket}; delete it from the list (its shape word, mode letter or rule in known.bit)\n")
+      fresh = fresh + 1
+    } else if (why != "" && ticket == "") {
+      eprint("callshapes: FAIL ${c.id}: ${c.call}\n    ${why}\n")
+      fresh = fresh + 1
+    } else if (why != "") {
+      known = known + 1
+    }
+  }
+  return [fresh, known]
+}
+
+// Only on a pass: a failing run keeps every cell's logs to read.
+fn removeWork(work: string, ms: int) {
+  if (!contains(work, "/callshapes-")) {
+    panic("callshapes: refusing to remove ${work}")
+  }
+  if (shell("${work}.rm.sh", "#!/bin/sh\nrm -rf '${work}' '${work}.rm.sh'\n", ms) != 0) {
+    eprint("callshapes: could not remove ${work}\n")
+  }
+}
+
+fn main() {
+  let bit = requiredEnv("BIT_SELF_EXE")
+  let work = "${requiredTmp()}/callshapes-${uuidFormat(uuidV4())}"
+  let all = cells()
+  if (len(all) < minCells) {
+    panic("callshapes: only ${len(all)} cells, under the ${minCells} floor; a table lost a row")
+  }
+  assertKnownListed(all)
+  makeDir(work)
+  writeCells(work, all)
+  runCells(bit, work, timeoutMs())
+  let rs = readResults(work)
+  if (len(rs) != len(all)) {
+    panic("callshapes: ${len(rs)} result lines for ${len(all)} cells, logs in ${work}")
+  }
+  assertControls(work, rs)
+  let n = judgeAll(work, all, rs)
+  if (n[0] > 0) {
+    eprint("callshapes: FAIL -- ${n[0]} of ${len(all)} cells disagree off the list; logs in ${work}\n")
+    exit(1)
+  }
+  println("callshapes: PASS -- ${len(all) - n[1]} of ${len(all)} cells agree, ${n[1]} on the known-failure list")
+  removeWork(work, timeoutMs())
+}
