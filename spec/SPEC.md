@@ -1785,7 +1785,10 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   db.table<Post>().all()? { post.author.name }` issues exactly two
   round trips, as if `.with("author")` had been written by hand.
   `.with(...)` stays the explicit form for a chain this whole-program
-  reasoning cannot trace back to its own root.
+  reasoning cannot trace back to its own root. A `test` block and a
+  parameter's default value are code like any function body: a read written in
+  one is proven (and auto-loaded) or `E0300` the same way, under `bit check`,
+  `bit build` and `bit test` alike (#6406).
 - **When the compiler cannot prove a relation read's rows were loaded, that
   is `E0300`**, naming the field, the class, and where to add `.with(...)`
   when a specific query is nameable, or that the read's rows could not be
