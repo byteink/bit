@@ -253,6 +253,24 @@
 # _tests_/cases/run_generic_bound_store.bit and their fuzz truncations.
 # Retires at the first repin to a release containing #6396.
 #
+# #6428-bare-literal-instantiated (`types`): a bare generic class literal,
+# `Pair{ store = StrStore{..} }`, is now typed as its inferred instantiation
+# (`p: Pair<string, StrStore>`) where the 0.34.0 oracle types it as the bare
+# template (`p: Pair`) and every member read through it as `<error>`. Same
+# line count; every differing pair shares its `LINE:COL: <expr>` prefix and is
+# either a jsonAttrTypeResolved pair or the oracle's bare type `T` becoming
+# `T<...>` on the tree side; at least one must be the latter. Seen on
+# _tests_/cases/run_generic_class_literal_infer.bit. Retires at the first
+# repin to a release containing #6428.
+#
+# #6432-static-bound-oracle-declines (`ir`/`iropt`, ONE file): the 0.34.0
+# oracle refuses a static call through a later `&` bound (`T.tag()`), and its
+# `--dump-ir` silently drops that generic instantiation instead of failing.
+# Explained only for _tests_/cases/run_bound_static_amp.bit, only when every
+# oracle line appears in the tree in order and every tree-only line belongs
+# to a WHOLE added `func ... }` block (or is the blank line that follows
+# one). Retires at the next repin.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
@@ -396,6 +414,43 @@ explainMismatch() {
       for (; j <= nB; j++) { if (index(linesB[j], "<error>") > 0) { return 0 } }
       return 1
     }
+    # literalInstantiated (#6428) -- the oracle types a bare generic class
+    # literal as its template `T`, the tree as `T<...>`, at the same
+    # `LINE:COL: <expr>` prefix.
+    function literalInstantiated(a, b,    cutA, cutB, tyA, tyB) {
+      cutA = lastColonSpace(a); cutB = lastColonSpace(b)
+      if (cutA == 0 || cutB == 0) { return 0 }
+      if (substr(a, 1, cutA - 1) != substr(b, 1, cutB - 1)) { return 0 }
+      tyA = substr(a, cutA + 2); tyB = substr(b, cutB + 2)
+      if (tyA !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { return 0 }
+      return (substr(tyB, 1, length(tyA) + 1) == tyA "<" && tyB ~ />$/) ? 1 : 0
+    }
+    function bareLiteralTypes(nA, linesA, nB, linesB,    i, hit) {
+      if (nA != nB) { return 0 }
+      hit = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        if (literalInstantiated(linesA[i], linesB[i])) { hit = 1; continue }
+        if (!jsonAttrTypeResolved(linesA[i], linesB[i])) { return 0 }
+      }
+      return hit
+    }
+    # funcsAdded (#6432) -- every oracle line appears in the tree in order;
+    # every tree-only line lies inside a whole added `func ... }` block.
+    function funcsAdded(nA, linesA, nB, linesB,    i, j, inAdd, added, after) {
+      i = 1; j = 1; inAdd = 0; added = 0; after = 0
+      while (j <= nB) {
+        if (inAdd) {
+          if (linesB[j] == "}") { inAdd = 0; after = 1 }
+          j++; continue
+        }
+        if (i <= nA && linesA[i] == linesB[j]) { i++; j++; after = 0; continue }
+        if (after && linesB[j] == "") { j++; continue }
+        if (linesB[j] !~ /^func /) { return 0 }
+        inAdd = 1; added = 1; j++
+      }
+      return (i > nA && !inAdd && added) ? 1 : 0
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 { nA++; linesA[nA] = $0; next }
     { nB++; linesB[nB] = $0 }
@@ -408,6 +463,12 @@ explainMismatch() {
       }
       if (kind == "diags" && boundPresyntaxDiags(nA, linesA, nB, linesB)) {
         print "6396-generic-bound-type-args-presyntax"; exit 0
+      }
+      if (kind == "types" && bareLiteralTypes(nA, linesA, nB, linesB)) {
+        print "6428-bare-literal-instantiated"; exit 0
+      }
+      if ((kind == "ir" || kind == "iropt") && file ~ /run_bound_static_amp[.]bit$/ && funcsAdded(nA, linesA, nB, linesB)) {
+        print "6432-static-bound-oracle-declines"; exit 0
       }
       if ((kind == "ir" || kind == "iropt") && file ~ /run_shortcircuit_catch_assign[.]bit$/ && joinArgsThreaded(nA, linesA, nB, linesB)) {
         print "6415-catch-assign-join-args"; exit 0
@@ -435,8 +496,8 @@ declaredSignatureNames() {
   case "$kind" in
     ast|fmt|tokens) return ;;
     diags) printf '%s\n' "6396-generic-bound-type-args-presyntax"; return ;;
-    ir|iropt) printf '%s\n' "6415-catch-assign-join-args"; return ;;
-    types) printf '%s\n' "6244-json-attr-implicit-insert" "6396-generic-bound-type-args-presyntax"; return ;;
+    ir|iropt) printf '%s\n' "6415-catch-assign-join-args" "6432-static-bound-oracle-declines"; return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert" "6396-generic-bound-type-args-presyntax" "6428-bare-literal-instantiated"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6396-generic-bound-type-args-presyntax" "6415-catch-assign-join-args"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6396-generic-bound-type-args-presyntax" "6415-catch-assign-join-args" "6428-bare-literal-instantiated" "6432-static-bound-oracle-declines"
 }
