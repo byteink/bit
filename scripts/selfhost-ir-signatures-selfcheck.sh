@@ -90,8 +90,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
-  # diags and tokens declare nothing since #6395: an unrelated divergence on
-  # either kind must stay unexplained.
+  # tokens declares nothing since #6395 and diags only the #6396 presyntax
+  # signature: an unrelated divergence on either kind must stay unexplained.
   sigdu=$(explainMismatch 'error[E0040]: undefined name' 'error[E0041]: other' diags)
   sigtu=$(explainMismatch 'kw_from 20..24' 'ident 20..24' tokens)
   if [ -n "$sigdu" ] || [ -n "$sigtu" ]; then
@@ -178,6 +178,60 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       echo "FAIL: a non-#6415 delta was wrongly explained as #6415 (sig='$s15r')"; fail=1
     fi
   done
+
+  # #6396-generic-bound-type-args-presyntax (diags): POSITIVE, the shape of
+  # the real 0.34.0 dump of _tests_/cases/ir_generic_bound_direct_calls.bit --
+  # E0021 with its caret on the bound's `<`, then a cascade, against a clean
+  # tree (one empty line).
+  e96=$(printf 'error[E0021]: expected %s, found %s\n  --> m.bit:21:18\n   |\n21 | fn twice<S: Store<i64>>(s: S): i64 {\n   |                  ^\nerror[E0021]: expected %s, found end of file\n  --> m.bit:31:1\n   |\n31 | \n   | ^\n' "'>'" "'<'" "'}'")
+  s96=$(explainMismatch "$e96" "" diags)
+  if [ "$s96" != "6396-generic-bound-type-args-presyntax" ]; then
+    echo "FAIL: the #6396 presyntax diags shape was not explained (sig='$s96')"; fail=1
+  fi
+  # REJECTION: a tree checker error after the trigger, a caret on a
+  # parameter annotation `b: Box<int>` (not a generic bound), and a
+  # differing line before the trigger must each fail closed.
+  t96err=$(printf 'error[E0041]: mismatched types\n  --> m.bit:22:3\n')
+  e96ann=$(printf 'error[E0021]: expected x, found y\n  --> m.bit:1:21\n   |\n 1 | fn f(a: int, b: Box<int>) {\n   |                     ^\n')
+  e96pre=$(printf 'error[E0040]: undefined name\n  --> m.bit:2:1\n%s\n' "$e96")
+  t96pre=$(printf 'error[E0040]: other name\n  --> m.bit:2:1\n')
+  # (Called pair by pair: a diag dump is full of `|`, so no separator joins
+  # two of them safely.)
+  rej96() {
+    local r
+    r=$(explainMismatch "$1" "$2" "$3" "${4:-}")
+    if [ -n "$r" ]; then
+      echo "FAIL: a non-#6396 $3 delta was wrongly explained (sig='$r')"; fail=1
+    fi
+  }
+  rej96 "$e96" "$t96err" diags
+  rej96 "$e96ann" "" diags
+  rej96 "$e96pre" "$t96pre" diags
+
+  # #6396 (types): POSITIVE against a source file with the trigger at 3:18
+  # (a comment line above it mentions the syntax and must be skipped). The
+  # oracle has its garbage entry exactly there; the lines before it agree.
+  src96=$(mktemp "${TMPDIR:-/tmp}/sig6396.XXXXXX")
+  printf '// fn twice<S: Store<i64>> in a comment\nfn pre(): i64 { return 1 }\nfn twice<S: Store<i64>>(s: S): i64 {\n' >"$src96"
+  o96=$(printf '2:24: 1: i64\n3:18: <i64>>(s: S): i64 {\n  return s.get()\n: <error>\n')
+  b96=$(printf '2:24: 1: i64\n4:10: s.get(): i64\n')
+  s96t=$(explainMismatch "$o96" "$b96" types "$src96")
+  if [ "$s96t" != "6396-generic-bound-type-args-presyntax" ]; then
+    echo "FAIL: the #6396 presyntax types shape was not explained (sig='$s96t')"; fail=1
+  fi
+  # REJECTION: a tree `<error>` after the trigger, an oracle with no garbage
+  # entry at the trigger, a differing line before it, and no file at all.
+  b96err=$(printf '2:24: 1: i64\n4:10: s.label(): <error>\n')
+  o96noart=$(printf '2:24: 1: i64\n3:20: s: S\n')
+  b96pre=$(printf '2:24: 1: f64\n4:10: s.get(): i64\n')
+  rej96 "$o96" "$b96err" types "$src96"
+  rej96 "$o96noart" "$b96" types "$src96"
+  rej96 "$o96" "$b96pre" types "$src96"
+  s96nf=$(explainMismatch "$o96" "$b96" types)
+  if [ -n "$s96nf" ]; then
+    echo "FAIL: the #6396 types shape was explained with no source file (sig='$s96nf')"; fail=1
+  fi
+  rm -f "$src96"
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #

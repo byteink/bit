@@ -230,14 +230,37 @@
 # element but the last is dropped, and the tree side of each such line is
 # longer (it gained arguments, never lost one). Retires at the next repin.
 #
+# #6396-generic-bound-type-args-presyntax (`diags`, also consulted by
+# selfhost-fuzzdiff.sh; `types`): a type-parameter bound that takes type
+# arguments, `fn twice<S: Store<i64>>` or `fn load<T, S: Store<T>>`, is
+# syntax the 0.34.0 oracle cannot parse. Its parser reports E0021 at the
+# bound's own `<` and then recovers into garbage for the rest of the file:
+# a cascade of further E0021 blocks under `--dump-diags`, and under
+# `--dump-types` an entry AT that `<` whose expression text starts with the
+# type arguments (`21:18: <i64>>(s: S): i64 {`), followed by more of the
+# same. Nothing after the trigger can be compared, so the signature checks
+# everything BEFORE it and accepts the rest -- strictly more than the decline
+# (SKIP) a checker error would earn the whole file. `diags`: the trigger is
+# the first oracle E0021 block whose caret sits on a `<` that ends
+# `name<..., P: Bound<` in the quoted source line; every oracle line before
+# it equals the tree, and every line after it on BOTH sides is part of an
+# E0021 block (a tree checker error there fails closed). `types` (needs the
+# file): the trigger is the first such `<` in the source (comment lines
+# skipped); the oracle must have its garbage entry at exactly that position,
+# every line before the first entry at or past it is identical on both
+# sides, and the tree side has no `<error>` from there on. Seen on
+# _tests_/cases/ir_generic_bound_direct_calls.bit,
+# _tests_/cases/run_generic_bound_store.bit and their fuzz truncations.
+# Retires at the first repin to a release containing #6396.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
 # forks one fresh awk process, so all state below is per-call — no cross-file
-# leakage between corpus files. Only `types` carries a declared signature
-# now (`6244-json-attr-implicit-insert`, text compared line for line), and
-# `ir`/`iropt` one file-scoped signature (`6415-catch-assign-join-args`); every
-# other kind returns 1.
+# leakage between corpus files. `types` carries `6244-json-attr-implicit-insert`
+# (text compared line for line) and `6396-generic-bound-type-args-presyntax`,
+# `diags` the latter, and `ir`/`iropt` one file-scoped signature
+# (`6415-catch-assign-join-args`); every other kind returns 1.
 explainMismatch() {
   awk -v kind="$3" -v file="${4:-}" '
     function lastColonSpace(s,    i, n, found) {
@@ -299,12 +322,92 @@ explainMismatch() {
       }
       return grew
     }
+    # boundRe (#6396) -- a generic parameter list up to the `<` of a bound
+    # that takes type arguments: `name<` then any plain or bounded params,
+    # then `P: Bound<`. A parameter annotation `(a: int, b: Box<int>)` has
+    # no `name<` before it and never matches.
+    BEGIN {
+      boundRe = "[A-Za-z_][A-Za-z0-9_]*<([A-Za-z_][A-Za-z0-9_]*[ ]*(:[^<>,]*)?,[ ]*)*[A-Za-z_][A-Za-z0-9_]*[ ]*:[ ]*[A-Za-z_][A-Za-z0-9_.]*<"
+    }
+    # e21Line (#6396) -- a line of an E0021 block in `--dump-diags` text:
+    # its header, the `-->` location, a gutter or quoted source line, or the
+    # blank separator. Any other error code is not one.
+    function e21Line(s) {
+      return (s == "" || s ~ /^error\[E0021\]: / || s ~ /^ +--> / || s ~ /^ *[0-9]* *[|]/) ? 1 : 0
+    }
+    # boundCaret (#6396) -- the E0021 block whose header is lines[i] points
+    # its caret at the `<` of a bound with type arguments: the `-->` line
+    # gives LINE:COL, the quoted `LINE | src` line within the next three
+    # gives the source, and src up to COL must end with boundRe.
+    function boundCaret(lines, n, i,    loc, k, L, C, j, src) {
+      if (i + 1 > n || !match(lines[i + 1], /:[0-9]+:[0-9]+$/)) { return 0 }
+      loc = substr(lines[i + 1], RSTART + 1)
+      k = index(loc, ":"); L = substr(loc, 1, k - 1); C = substr(loc, k + 1) + 0
+      for (j = i + 2; j <= n && j <= i + 4; j++) {
+        if (lines[j] !~ ("^ *" L " [|] ")) { continue }
+        src = lines[j]; sub(/^ *[0-9]+ [|] /, "", src)
+        return (substr(src, 1, C) ~ (boundRe "$")) ? 1 : 0
+      }
+      return 0
+    }
+    # boundPresyntaxDiags (#6396) -- see the header above explainMismatch.
+    function boundPresyntaxDiags(nA, linesA, nB, linesB,    i, t) {
+      t = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] ~ /^error\[E0021\]: / && boundCaret(linesA, nA, i)) { t = i; break }
+      }
+      if (t == 0 || nB < t - 1) { return 0 }
+      for (i = 1; i < t; i++) { if (linesA[i] != linesB[i]) { return 0 } }
+      for (i = t; i <= nA; i++) { if (!e21Line(linesA[i])) { return 0 } }
+      for (i = t; i <= nB; i++) { if (!e21Line(linesB[i])) { return 0 } }
+      return 1
+    }
+    # boundTriggerPos (#6396) -- LINE*100000+COL of the first bound `<` in
+    # source file f, comment lines skipped; 0 when there is none or the file
+    # cannot be read.
+    function boundTriggerPos(f,    line, ln, pos) {
+      ln = 0; pos = 0
+      while ((getline line < f) > 0) {
+        ln++
+        if (line ~ /^[ \t]*\/\//) { continue }
+        if (match(line, boundRe)) { pos = ln * 100000 + RSTART + RLENGTH - 1; break }
+      }
+      close(f)
+      return pos
+    }
+    # entryPos (#6396) -- LINE*100000+COL of a `--dump-types` entry line
+    # `LINE:COL: expr: type`; -1 for a continuation line of a multi-line expr.
+    function entryPos(s,    k, L) {
+      if (s !~ /^[0-9]+:[0-9]+: /) { return -1 }
+      k = index(s, ":"); L = substr(s, 1, k - 1) + 0
+      s = substr(s, k + 1); k = index(s, ":")
+      return L * 100000 + substr(s, 1, k - 1)
+    }
+    # boundPresyntaxTypes (#6396) -- see the header above explainMismatch.
+    function boundPresyntaxTypes(nA, linesA, nB, linesB,    t, i, j, k, p) {
+      if (file == "") { return 0 }
+      t = boundTriggerPos(file)
+      if (t == 0) { return 0 }
+      for (i = 1; i <= nA; i++) { p = entryPos(linesA[i]); if (p >= t) { break } }
+      if (i > nA || p != t || linesA[i] !~ /^[0-9]+:[0-9]+: </) { return 0 }
+      for (j = 1; j <= nB; j++) { if (entryPos(linesB[j]) >= t) { break } }
+      if (i != j) { return 0 }
+      for (k = 1; k < i; k++) { if (linesA[k] != linesB[k]) { return 0 } }
+      for (; j <= nB; j++) { if (index(linesB[j], "<error>") > 0) { return 0 } }
+      return 1
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 { nA++; linesA[nA] = $0; next }
     { nB++; linesB[nB] = $0 }
     END {
       if (kind == "types" && jsonAttrImplicitInsert(nA, linesA, nB, linesB)) {
         print "6244-json-attr-implicit-insert"; exit 0
+      }
+      if (kind == "types" && boundPresyntaxTypes(nA, linesA, nB, linesB)) {
+        print "6396-generic-bound-type-args-presyntax"; exit 0
+      }
+      if (kind == "diags" && boundPresyntaxDiags(nA, linesA, nB, linesB)) {
+        print "6396-generic-bound-type-args-presyntax"; exit 0
       }
       if ((kind == "ir" || kind == "iropt") && file ~ /run_shortcircuit_catch_assign[.]bit$/ && joinArgsThreaded(nA, linesA, nB, linesB)) {
         print "6415-catch-assign-join-args"; exit 0
@@ -330,9 +433,10 @@ explainMismatch() {
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
-    ast|fmt|diags|tokens) return ;;
+    ast|fmt|tokens) return ;;
+    diags) printf '%s\n' "6396-generic-bound-type-args-presyntax"; return ;;
     ir|iropt) printf '%s\n' "6415-catch-assign-join-args"; return ;;
-    types) printf '%s\n' "6244-json-attr-implicit-insert"; return ;;
+    types) printf '%s\n' "6244-json-attr-implicit-insert" "6396-generic-bound-type-args-presyntax"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6415-catch-assign-join-args"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6396-generic-bound-type-args-presyntax" "6415-catch-assign-join-args"
 }
