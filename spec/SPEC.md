@@ -2496,6 +2496,38 @@ ordinary identifiers everywhere else. Only `asm` itself is reserved.
   block that restores another context (a context switch) leaves all of it
   holding the other side's values. A register the allocator never hands out
   (the code generator's scratch registers) adds nothing.
+- **A payload that calls out must declare the whole caller-saved file
+  (E0053).** A callee destroys every caller-saved register, so a block that
+  contains a call while naming only some of them lets the allocator keep a live
+  value in one of the rest across the block, and the program reads garbage at
+  exit 0. The block is rejected unless every register below is named in that
+  arch's `clobber` list or pinned by an `input` or `result` (both already
+  excluded from the allocator for the whole function), and the error lists the
+  ones missing. The required set is `rax rcx rdx rsi rdi r8`..`r11` on x64 and
+  `x0`..`x17` plus `x30` on arm64. The x64 set is the union of System V and
+  Win64 (Win64's is a subset), because the checker runs once for every target
+  and one `x64` payload serves them all. `x30` is there because `bl`/`blr`
+  overwrite it with the return address; `x18` is the platform register and is
+  not required. The one clobber-list entry `callerSaved` stands for the whole
+  set of its arch: `clobber x64 { callerSaved, memory }`. It names no register,
+  so an `input` or `result` cannot use it. A block inside a `@naked` function
+  (§10.3.1) is exempt: that function has no prologue and holds no
+  compiler-managed value, so its author already owns the whole register state
+  (`_start`, the safepoint stub).
+
+  What counts as a call. arm64 payloads are 32-bit instruction words, decoded
+  exactly: `bl`, `blr`, and the pointer-authenticating `blraa`/`blrab`/`blraaz`/
+  `blrabz`. x64 payloads are decoded instruction by instruction through the
+  integer subset the runtime uses (legacy and REX prefixes, the one-byte
+  opcodes, the common `0F` entries), so `mov rax, rbp` (`48 89 E8`) is a move,
+  not a `call rel32` whose opcode byte happens to be `E8`. A call is `E8`
+  (`call rel32`) or `FF` with a ModRM reg field of 2 or 3 (`call r/m64`, far
+  call). Decoding stops at the first instruction outside that subset (an
+  unlisted opcode, a VEX/EVEX prefix, a truncated tail); from there to the end
+  of the payload any `E8` byte, and any `FF` followed by a ModRM byte whose reg
+  field is 2 or 3, counts as a call whether it is an opcode or an operand. So
+  a payload using such an instruction must declare the full set even when its
+  own `E8`/`FF` bytes are only immediates.
 - `volatile` is accepted and documented for parity with the source being ported;
   an `asm` block is never dropped, hoisted, or deduplicated regardless.
 - An `input` value must be a register-width integer or a raw pointer (§11.4).
