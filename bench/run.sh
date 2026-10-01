@@ -5,7 +5,15 @@
 # measures runtime (CPU cycles + instructions retired, wall clock, peak RSS),
 # binary size, process startup, and Bit compile speed. Writes results into
 # README.md (between the BENCH markers), a standalone bench/RESULTS.md, and an
-# appended bench/history.csv.
+# appended bench/history.csv, and keeps the raw numbers in bench/last-run.dat.
+#
+#   bench/run.sh            measure, then render
+#   bench/run.sh --render   render only: rebuild the README block and
+#                           bench/RESULTS.md from bench/last-run.dat, no
+#                           measuring, no go/cc/bit needed (bench/render.sh)
+#
+# The README block is a verdict a reader takes in at a glance; every table and
+# method paragraph lives in bench/RESULTS.md (bench/render.sh).
 #
 # The published Bit/Go and Bit/C ratios come from CYCLES, not from wall clock.
 # /usr/bin/time reports `real` in hundredths of a second, and six of the ten C
@@ -41,9 +49,14 @@ RUNS=15                          # timed runs per case; see trimmean() for why 1
 CRUNS=3                          # compile-time samples per case; median reported
 STARTUP_ITERS=200                # exec count for startup timing
 
-command -v go >/dev/null || { echo "go not found on PATH" >&2; exit 1; }
-command -v cc >/dev/null || { echo "cc not found on PATH" >&2; exit 1; }
-[ -x "$BIT" ] || { echo "$BIT not built (run: ./make)" >&2; exit 1; }
+RENDER_ONLY=0
+[ "${1:-}" = "--render" ] && RENDER_ONLY=1
+
+if [ "$RENDER_ONLY" = 0 ]; then
+  command -v go >/dev/null || { echo "go not found on PATH" >&2; exit 1; }
+  command -v cc >/dev/null || { echo "cc not found on PATH" >&2; exit 1; }
+  [ -x "$BIT" ] || { echo "$BIT not built (run: ./make)" >&2; exit 1; }
+fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -55,6 +68,9 @@ GCRES="$WORK/gcres"  # bit lines: "<case> bit <pauses> <pausens_ms> <pausemaxns_
 : > "$GCRES"          # go lines:  "<case> go <gc_count> <stw_ms> <stwmax_ms> <share>"
 APW="$WORK/apwall"   # allocpar_W1/allocpar_W8 wall rows: "<case> <lang> <wall_ms>"
 : > "$APW"
+
+source bench/render.sh           # accessors over the files above, and renderAll
+if [ "$RENDER_ONLY" = 1 ]; then renderAll; exit 0; fi
 
 now()    { perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time()'; }
 median() { sort -n | awk '{a[NR]=$1} END{n=NR; if(n%2){print a[(n+1)/2]} else {printf "%.6f\n",(a[n/2]+a[n/2+1])/2}}'; }
@@ -75,11 +91,6 @@ median() { sort -n | awk '{a[NR]=$1} END{n=NR; if(n%2){print a[(n+1)/2]} else {p
 trimmean() { sort -n | awk '{a[NR]=$1} END{k=int(NR/5); if(k<1)k=1; n=NR-k;
                             for(i=1;i<=n;i++)s+=a[i]; printf "%.0f", s/n}'; }
 size()   { stat -f%z "$1"; }
-get()    { awk -v c="$1" -v l="$2" -v k="$3" '$1==c&&$2==l{print $(k)}' "$RES"; }  # k: 3=s 4=rss 5=bin 6=cyc 7=instr
-alc()    { awk -v c="$1" -v l="$2" '$1==c&&$2==l{print $3}' "$ALC"; }
-alcmd()  { n=$(alc "$1" "$2"); [ -n "$n" ] && echo "$n" || echo "n/a"; }
-apwget() { awk -v c="$1" -v l="$2" '$1==c&&$2==l{print $3}' "$APW"; }                       # <case>_W<n> lang -> wall ms
-gcget()  { awk -v c="$1" -v l="$2" -v k="$3" '$1==c&&$2==l{print $(k)}' "$GCRES"; }  # k: 3=count/pauses 4=ms 5=maxms 6=share
 
 # Heap allocations one run of a case performs, per language — the number that
 # proves the three sources still express the SAME data structure (#3934: the
@@ -303,7 +314,6 @@ for l in bit c go; do
   t0=$(now); i=0; while [ "$i" -lt "$STARTUP_ITERS" ]; do "$WORK/s.$l"; i=$((i+1)); done; t1=$(now)
   echo "$l $(awk -v a="$t0" -v b="$t1" -v n="$STARTUP_ITERS" 'BEGIN{printf "%.3f",(b-a)/n*1000}')" >> "$WORK/start"
 done
-sms() { awk -v l="$1" '$1==l{print $2}' "$WORK/start"; }
 
 # The same empty program, in cycles: the floor every case pays before its own
 # first instruction (dyld, runtime init, exit). It differs per language and is
@@ -339,17 +349,12 @@ STAMP=$(date -u +%FT%TZ)
 CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
 OSV=$(sw_vers -productVersion 2>/dev/null || uname -sr)
 
-ms1()  { awk -v x="$1" 'BEGIN{printf "%.1f", x*1000}'; }  # seconds (from $RES col 3) -> ms, one decimal
-mb()   { awk -v x="$1" 'BEGIN{printf "%.1f", x/1048576}'; }
-kb()   { awk -v x="$1" 'BEGIN{printf "%.0f", x/1024}'; }
-mil()  { awk -v x="$1" 'BEGIN{printf "%.1f", x/1000000}'; }
 # Startup-corrected counters for one case+language: the process total minus
 # that language's own empty-program floor. Clamped at 1 so no ratio can divide
 # by zero -- unlike the wall-clock column this replaces, which had to print "—"
 # for allocflat because its C median rounded to 0.000s.
 netcyc() { awk -v t="$(get "$1" "$2" 6)" -v b="$(scyc "$2")" 'BEGIN{v=t-b; if(v<1)v=1; print v}'; }
 netins() { awk -v t="$(get "$1" "$2" 7)" -v b="$(sins "$2")" 'BEGIN{v=t-b; if(v<1)v=1; print v}'; }
-ratio()  { awk -v a="$1" -v b="$2" 'BEGIN{if(b+0<=0){printf "n/a"}else{printf "%.2fx", a/b}}'; }
 
 STARTBASE=$(awk '{printf "%s%s %.1fM", (NR>1?", ":""), $1, $2/1000000} END{print ""}' "$WORK/startcyc")
 
@@ -378,153 +383,32 @@ for c in $CASES; do
   done
 done
 
-# --- peak-RSS reproducibility across regenerations (#4199) ------------------
-# The RSS this table publishes is already a MEDIAN of ${RUNS} in-process
-# samples, but #4068 found that median itself can swing between SEPARATE
-# regenerations -- Go's `strings` RSS was reported at "68.9-122 MB across
-# runs", which a single run's own ${RUNS} samples cannot show. history.csv is
-# the record of every regeneration this repo has ever committed, so it is
-# read here rather than re-measured.
-#
-# Scoped to the SAME four rows #4040 already flagged as noisy on the cycle
-# ratios (alloc, map, allocflat, strings) and to the go/c columns only. The
-# bit column is deliberately excluded: it legitimately swings across real
-# compiler/runtime changes over that history window (`strings` bit's own RSS
-# fell 952MB -> 131MB as the allocator improved, a 7x move with no bug and no
-# noise in it), and folding that into a noise disclosure would misreport a
-# real fix as instability.
-rssHistSpread() {  # case lang -> "min median max N" in MB, or empty if N<5
-  awk -F, -v c="$1" -v l="$2" '$3==c && $4==l && $6!="" {print $6}' "$hist" \
-    | sort -n | awk '{a[NR]=$1} END{
-        if (NR<5) exit 0
-        med = (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2
-        printf "%.1f %.1f %.1f %d", a[1]/1048576, med/1048576, a[NR]/1048576, NR
-      }'
-}
-RSSNOTE=""
-for c in alloc map allocflat strings; do
-  for l in go c; do
-    s=$(rssHistSpread "$c" "$l")
-    [ -n "$s" ] || continue
-    set -- $s
-    rlo=$1; rmed=$2; rhi=$3; rn=$4
-    # >10%, same order of magnitude as #4040's "read a change under ~3% as
-    # noise" for the loose cycle rows, scaled up for a cruder cross-run signal.
-    unstable=$(awk -v a="$rhi" -v b="$rlo" 'BEGIN{print (a > b*1.10) ? 1 : 0}')
-    [ "$unstable" = 1 ] && RSSNOTE="${RSSNOTE}${RSSNOTE:+; }\`$c\` $l: ${rlo}-${rhi} MB (median ${rmed} MB, N=${rn})"
-  done
-done
-
-md="$WORK/results.md"
+# --- record the raw numbers so the README can be re-rendered without a re-run ---
+# One flat file, the shape bench/render.sh reads back: counters already
+# startup-corrected, the pause and worker-count rows, startup, and the facts
+# about the machine. The next measured run overwrites it.
+data=bench/last-run.dat
 {
-  echo "_Full method and caveats below the tables._"
-  echo
-  echo "### Runtime: CPU cycles, lower is better"
-  echo
-  echo "| Benchmark | Bit | Go | C | Bit / Go | Bit / C |"
-  echo "|---|--:|--:|--:|--:|--:|"
+  echo "meta machine $CPU"
+  echo "meta os $OSV"
+  echo "meta sha $GITSHA"
+  echo "meta stamp $STAMP"
+  echo "meta go $(go version | awk '{print $3}')"
+  echo "meta cc $(cc --version | head -1)"
+  echo "meta startbase $STARTBASE"
+  echo "meta lps $lps"
+  echo "meta srclines $srclines"
+  echo "meta ncases $comp_n"
   for c in $CASES; do
-    bcy=$(netcyc "$c" bit); gcy=$(netcyc "$c" go); ccy=$(netcyc "$c" c)
-    echo "| $c | $(mil "$bcy") M | $(mil "$gcy") M | $(mil "$ccy") M |" \
-         "$(ratio "$bcy" "$gcy") | $(ratio "$bcy" "$ccy") |"
+    for l in bit c go; do
+      echo "res $c $l $(get "$c" "$l" 3) $(get "$c" "$l" 4) $(get "$c" "$l" 5) $(netcyc "$c" "$l") $(netins "$c" "$l")"
+    done
   done
-  echo
-  echo "### Instructions retired: work emitted, not time taken"
-  echo
-  echo "| Benchmark | Bit | Go | C |"
-  echo "|---|--:|--:|--:|"
-  for c in $CASES; do
-    echo "| $c | $(mil "$(netins "$c" bit)") M | $(mil "$(netins "$c" go)") M | $(mil "$(netins "$c" c)") M |"
-  done
-  echo
-  echo "### Wall clock: median of ${RUNS} runs, milliseconds"
-  echo
-  echo "| Benchmark | Bit | Go | C |"
-  echo "|---|--:|--:|--:|"
-  for c in $CASES; do
-    echo "| $c | $(ms1 "$(get "$c" bit 3)") ms | $(ms1 "$(get "$c" go 3)") ms | $(ms1 "$(get "$c" c 3)") ms |"
-  done
-  for w in 1 8; do
-    echo "| allocpar W$w | $(apwget "allocpar_W$w" bit) ms | $(apwget "allocpar_W$w" go) ms | $(apwget "allocpar_W$w" c) ms |"
-  done
-  echo
-  echo "### GC pauses: one untimed run per case, share of that run's own wall clock"
-  echo
-  echo "| Benchmark | Bit pauses | Bit pausens ms (share) | Bit pausemax ms | Go GCs | Go STW ms (share) | Go STW max ms | C |"
-  echo "|---|--:|--:|--:|--:|--:|--:|--:|"
-  for c in $CASES; do
-    bp=$(gcget "$c" bit 3); bms=$(gcget "$c" bit 4); bmax=$(gcget "$c" bit 5); bsh=$(gcget "$c" bit 6)
-    gp=$(gcget "$c" go 3);  gms=$(gcget "$c" go 4);  gmax=$(gcget "$c" go 5);  gsh=$(gcget "$c" go 6)
-    echo "| $c | $bp | $bms ms ($bsh) | $bmax ms | $gp | $gms ms ($gsh) | $gmax ms | n/a |"
-  done
-  for w in 1 8; do
-    bp=$(gcget "allocpar_W$w" bit 3); bms=$(gcget "allocpar_W$w" bit 4)
-    bmax=$(gcget "allocpar_W$w" bit 5); bsh=$(gcget "allocpar_W$w" bit 6)
-    gp=$(gcget "allocpar_W$w" go 3);  gms=$(gcget "allocpar_W$w" go 4)
-    gmax=$(gcget "allocpar_W$w" go 5);  gsh=$(gcget "allocpar_W$w" go 6)
-    echo "| allocpar W$w | $bp | $bms ms ($bsh) | $bmax ms | $gp | $gms ms ($gsh) | $gmax ms | n/a |"
-  done
-  echo
-  echo "### Peak memory: max RSS, lower is better"
-  echo
-  echo "| Benchmark | Bit | Go | C |"
-  echo "|---|--:|--:|--:|"
-  for c in $CASES; do
-    echo "| $c | $(mb "$(get "$c" bit 4)") MB | $(mb "$(get "$c" go 4)") MB | $(mb "$(get "$c" c 4)") MB |"
-  done
-  echo
-  echo "### Heap allocations per run: the equivalence check, not a score"
-  echo
-  echo "| Benchmark | Bit | Go | C |"
-  echo "|---|--:|--:|--:|"
-  for c in $CASES; do
-    echo "| $c | $(alcmd "$c" bit) | $(alcmd "$c" go) | $(alcmd "$c" c) |"
-  done
-  echo
-  echo "### Binary size: static, as emitted"
-  echo
-  echo "| Benchmark | Bit | Go | C |"
-  echo "|---|--:|--:|--:|"
-  for c in $CASES; do
-    echo "| $c | $(kb "$(get "$c" bit 5)") KB | $(kb "$(get "$c" go 5)") KB | $(kb "$(get "$c" c 5)") KB |"
-  done
-  echo
-  echo "### Startup & compile"
-  echo
-  echo "| Metric | Bit | Go | C |"
-  echo "|---|--:|--:|--:|"
-  echo "| Process startup (per exec) | $(sms bit) ms | $(sms go) ms | $(sms c) ms |"
-  echo
-  echo "Bit compile speed: **${lps} lines/sec** (${srclines} lines across ${comp_n} cases, warm)."
-  echo
-  echo "> Machine: ${CPU}, macOS ${OSV}. Bit @ \`${GITSHA}\`, Go $(go version | awk '{print $3}'), $(cc --version | head -1)."
-  echo "> Method: ${RUNS} runs per case per language. Cycles and instructions are a trimmed mean of those runs, meaning the mean after dropping the slowest fifth, which was the most reproducible of four estimators measured over 40 samples per series; wall clock and RSS are the median. C built \`cc ${CFLAGS}\`, Go \`go build\`, Bit \`bit build\`, each language's standard optimized build."
-  echo "> Mandelbrot: Bit and C agree to the last bit; Go differs by ~0.0002% because it contracts \`a*b+c\` to a hardware FMA. Not a bug: cross-compiler float bit-identity is not guaranteed."
-  echo "> alloc measures the ALLOCATOR: 10M short-lived nodes, each its own heap object in all three languages (Bit's element class has a reference field, Go holds \`[]*Node\`, C mallocs per node). allocflat measures DATA LAYOUT: the same 10M nodes and the same printed total, stored by value in one buffer per batch (Bit packs \`[]Node\` inline, Go holds \`[]Node\`, C mallocs the batch once). The gap between the two rows is what per-node heap allocation costs a language."
-  echo "> allocpar measures the allocator under CONTENTION: the identical 10M nodes and the identical printed total as alloc, partitioned across 8 concurrent workers (Bit \`spawn\`, Go goroutines, C pthreads), worker count fixed in all three sources and never read from the host core count. The gap between the alloc and allocpar rows is what a language's allocator costs when more than one thread is in it; every other case in this table is single-mutator, so that cost appears nowhere else."
-  echo "> The allocation table above is how those two claims are checked rather than asserted: same order of magnitude across a row means the three sources still express the same data structure, which is exactly what \`alloc\` silently lost for a day. Bit's count is \`swept+live\` from \`BIT_GC_STATS=1\`; Go's is \`runtime.MemStats.Mallocs\` and C's a \`malloc\` counter, both opt-in (\`BENCH_ALLOC_STATS\`, \`-DBENCH_ALLOC_STATS\`) and both absent from every timed binary."
-  echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows would be quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed. Cycles and instructions come from the same \`/usr/bin/time -l\` invocation that also produced the RSS; nothing extra is run and nothing extra is installed for those three. Wall clock is a separate one-decimal-millisecond measurement (\`wall_run()\`, one \`fork\`+\`exec\`+\`waitpid\` perl process per run, not \`/usr/bin/time\`'s own field) so it stays usable below \`/usr/bin/time\`'s 10ms floor; it still carries no ratio column and is kept as context."
-  echo "> GC pauses: one untimed run per case, separate from the timed runs above (BIT_GC_STATS/GODEBUG both add real overhead). Bit's fields are \`pausens=\`/\`pausemaxns=\`/\`pauses=\` from \`BIT_GC_STATS=1\`. Go's are parsed from one \`GODEBUG=gctrace=1\` run: each \`gc N @Ts P%: A+B+C ms clock\` line's A (sweep termination) and C (mark termination) are its two STW segments (\`go doc runtime\`, go1.27.1), summed for the STW total, maxed individually for the longest single pause; B (concurrent mark) is not a stop and is excluded. C has no collector (n/a). Share is that probe run's own \`wall_run()\` wall time, not the timed loop's median. \`allocpar W1\`/\`W8\` reruns the same probe with \`BIT_WORKERS\`/\`GOMAXPROCS\` set; C is unchanged (its worker count is a compile-time \`#define\`, never read from env) so its wall-table cell reuses the baseline \`allocpar\` row rather than a redundant rerun."
-  echo "> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (\`bench/cases/startup\`, ${STARTBASE}) subtracted, because dyld and runtime init differ per language and are a fifth of C's \`allocflat\` row. Every other table is raw."
-  echo
-  echo "> On \`matrix\`, read the Go column as the target and not the C one. The C side vectorises: it retires 2.06 instructions per inner-loop iteration against Go's 9.09, so the Bit:C ratio on this row compares a scalar loop against a vectorised one and is not a statement about codegen quality. A scalar \`cc -O2 -fno-vectorize\` control build of the same case retires 8.07, which is the like-for-like figure. Denominator for all three: \`trials * n^3 = 6 * 512^3 = 805,306,368\` inner iterations."
-  echo "> Reproducibility was measured rather than assumed: four independent regenerations of this table on this box held every ratio to 2.5% between adjacent runs and 8.5% at worst across all four. The loose rows are \`alloc\`, \`map\`, \`allocflat\` and \`strings\`, whose Go or C side is short enough that that language's own allocator and collector scheduling moves it by several percent from run to run; \`matrix\`, \`mandelbrot\`, \`fib\` and \`sort\` reproduce to about 1%. On those four loose rows, read a change under ~3% as noise."
-  if [ -n "${RSSNOTE}" ]; then
-    echo "> Peak RSS above is a within-run median like every other figure in that table, but it can still swing further ACROSS separate regenerations than one run shows. From every regeneration recorded in \`bench/history.csv\`, restricted to the same four loose rows above and to the Go/C columns (the Bit column reflects real compiler/runtime changes over that history, not noise): ${RSSNOTE}. Read that cell's published number as representative of the stated range, not a fixed constant."
-  fi
-  echo "> Instructions are published beside cycles because a cycle gap alone does not say whether it is work emitted or work stalled, and the two ratios differ a lot here: Bit retires roughly 4-7 instructions per cycle against C's 1.4-1.8, so its instruction ratio always overstates its cycle ratio. Cycles are the time; instructions are the reason."
-  echo "> Generated by \`bench/run.sh\` on ${STAMP}. Do not edit by hand."
-} > "$md"
+  sed 's/^/alc /' "$ALC"
+  sed 's/^/gc /' "$GCRES"
+  sed 's/^/apw /' "$APW"
+  sed 's/^/start /' "$WORK/start"
+} > "$data"
 
-# --- inject into README between markers ---
-awk -v f="$md" '
-  /<!-- BENCH:START -->/{print; while((getline line < f)>0) print line; skip=1; next}
-  /<!-- BENCH:END -->/{skip=0}
-  !skip
-' README.md > "$WORK/README.md" && mv "$WORK/README.md" README.md
-cp "$md" bench/RESULTS.md
-
-echo
-cat "$md"
-echo
-echo "Wrote README.md, bench/RESULTS.md, appended $hist."
+renderAll
+echo "Appended $hist and wrote $data."

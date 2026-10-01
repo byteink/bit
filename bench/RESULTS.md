@@ -1,4 +1,6 @@
-_Full method and caveats below the tables._
+# Benchmark results: full numbers and method
+
+The README carries the short version. This page keeps every table and the method behind it.
 
 ### Runtime: CPU cycles, lower is better
 
