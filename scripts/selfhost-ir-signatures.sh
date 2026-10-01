@@ -217,15 +217,29 @@
 # zero counts. Their derivations are preserved in git history at this
 # file's state before #6395.
 #
+# #6415-catch-assign-join-args (`ir`/`iropt`, ONE file): the 0.34.0 oracle
+# has #6415's bug -- a `catch` block in the rhs of `&&`/`||` or an arm of
+# `?:` reassigns an outer local and the join after it does not carry that
+# local, so the program reads a stale value at exit 0. The tree threads the
+# live locals through those joins, which for
+# _tests_/cases/run_shortcircuit_catch_assign.bit (the fixture proving the
+# fix) adds leading arguments to the affected branch targets and leading
+# parameters to their blocks, and renumbers the values after them. Explained
+# only for that file, only when both dumps have the same line count, every
+# differing line is equal once value ids are erased or once every list
+# element but the last is dropped, and the tree side of each such line is
+# longer (it gained arguments, never lost one). Retires at the next repin.
+#
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens>
 # Prints the name of the registered signature that explains the divergence
 # and returns 0, or prints nothing and returns 1 if none does. Each call
 # forks one fresh awk process, so all state below is per-call — no cross-file
 # leakage between corpus files. Only `types` carries a declared signature
-# now (`6244-json-attr-implicit-insert`, text compared line for line); every
+# now (`6244-json-attr-implicit-insert`, text compared line for line), and
+# `ir`/`iropt` one file-scoped signature (`6415-catch-assign-join-args`); every
 # other kind returns 1.
 explainMismatch() {
-  awk -v kind="$3" '
+  awk -v kind="$3" -v file="${4:-}" '
     function lastColonSpace(s,    i, n, found) {
       found = 0
       n = length(s) - 1
@@ -266,12 +280,34 @@ explainMismatch() {
       }
       return (i > nA) ? 1 : 0
     }
+    # joinArgsThreaded (#6415) -- see the header above explainMismatch.
+    # Same line count; a differing pair must agree once value ids are erased,
+    # or once every list element but the last is dropped, and the tree line
+    # must be the longer one. At least one line must have grown.
+    function joinArgsThreaded(nA, linesA, nB, linesB,    i, a, b, grew) {
+      if (nA != nB) { return 0 }
+      grew = 0
+      for (i = 1; i <= nA; i++) {
+        if (linesA[i] == linesB[i]) { continue }
+        a = linesA[i]; b = linesB[i]
+        gsub(/%[0-9]+/, "%", a); gsub(/%[0-9]+/, "%", b)
+        if (a == b) { continue }
+        if (length(b) <= length(a)) { return 0 }
+        gsub(/%(: [^,()]+)?, /, "", a); gsub(/%(: [^,()]+)?, /, "", b)
+        if (a != b) { return 0 }
+        grew = 1
+      }
+      return grew
+    }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
     side == 0 { nA++; linesA[nA] = $0; next }
     { nB++; linesB[nB] = $0 }
     END {
       if (kind == "types" && jsonAttrImplicitInsert(nA, linesA, nB, linesB)) {
         print "6244-json-attr-implicit-insert"; exit 0
+      }
+      if ((kind == "ir" || kind == "iropt") && file ~ /run_shortcircuit_catch_assign[.]bit$/ && joinArgsThreaded(nA, linesA, nB, linesB)) {
+        print "6415-catch-assign-join-args"; exit 0
       }
       exit 1
     }
@@ -294,8 +330,9 @@ explainMismatch() {
 declaredSignatureNames() {
   local kind=${1:-}
   case "$kind" in
-    ast|fmt|ir|iropt|diags|tokens) return ;;
+    ast|fmt|diags|tokens) return ;;
+    ir|iropt) printf '%s\n' "6415-catch-assign-join-args"; return ;;
     types) printf '%s\n' "6244-json-attr-implicit-insert"; return ;;
   esac
-  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert"
+  [ -n "$kind" ] || printf '%s\n' "6244-json-attr-implicit-insert" "6415-catch-assign-join-args"
 }
