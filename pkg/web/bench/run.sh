@@ -8,16 +8,23 @@
 # ../README.md between the BENCH markers.
 #
 # THE BLOCK IS GENERATED, NEVER HAND-EDITED, the same contract bench/run.sh
-# holds for the language benchmarks: the block says so itself, and the next
-# run of this script overwrites whatever is between the markers.
+# holds for the language benchmarks: the next run of this script overwrites
+# whatever is between the markers. The block is a short comparison a reader
+# takes in at a glance; every table and the method live in bench/RESULTS.md.
 #
 #   ./pkg/web/bench/run.sh              ship, build, measure, publish
 #   ./pkg/web/bench/run.sh --reuse      measure against the tree already there
 #   ./pkg/web/bench/run.sh --fetch      pull the box's last results, then publish
-#   ./pkg/web/bench/run.sh --report     re-render from out/ as it stands here
+#   ./pkg/web/bench/run.sh --report     re-collect out/ as it stands here, publish
+#   ./pkg/web/bench/run.sh --render     publish from recorded.json, measuring nothing
 #
-# --report renders whatever is in out/ WITHOUT going to the box, so it will
-# happily republish a stale or partial results.csv. Use --fetch after a run
+# recorded.json (committed) is the last measured run: the medians, the box and
+# the proofs. Every mode but --render rewrites it from out/; --render only
+# reads it, needs neither out/ nor the box, and is how the README and
+# RESULTS.md are rebuilt without a new measurement.
+#
+# --report collects whatever is in out/ WITHOUT going to the box, so it will
+# happily record a stale or partial results.csv. Use --fetch after a run
 # that was started by hand over there.
 #
 # Environment: BIT_X64_HOST and friends, resolved by scripts/x64host.sh.
@@ -36,8 +43,13 @@ BIT=$REPO/bit-out/bin/bit
 COMMIT=$(git -C "$REPO" rev-parse --short=9 HEAD)
 LABEL="$COMMIT (compiler and runtime built from that commit)"
 
-host=$(sh "$REPO/scripts/x64host.sh") || {
-  echo "no x86-64 Linux host configured; see scripts/x64host.sh" >&2; exit 1; }
+RECORDED=$HERE/recorded.json
+host=
+# --render touches no box, so it must not need one configured.
+if [ "$MODE" != --render ]; then
+  host=$(sh "$REPO/scripts/x64host.sh") || {
+    echo "no x86-64 Linux host configured; see scripts/x64host.sh" >&2; exit 1; }
+fi
 
 # A binary built from uncommitted sources is not the commit the table names.
 # Only the server's inputs count: the compiler, the runtime, the stdlib and
@@ -104,12 +116,14 @@ fetch() {
   done
 }
 
-# The commit and date in the block come from out/, not from here: --report can
-# run after HEAD has moved, and the block must name what was MEASURED.
+# The commit and date in the block come from recorded.json, not from here:
+# --report and --render can run after HEAD has moved, and the block must name
+# what was MEASURED.
 publish() {
-  local md=$HERE/out/block.md
-  python3 "$HERE/report.py" "$HERE/out" > "$md"
-  python3 - "$PKG/README.md" "$md" <<'PY'
+  local block=$HERE/out/block.md
+  mkdir -p "$HERE/out"
+  python3 "$HERE/report.py" block "$RECORDED" > "$block"
+  python3 - "$PKG/README.md" "$block" <<'PY'
 import sys
 readme, block = sys.argv[1], sys.argv[2]
 begin, end = "<!-- BENCH:START -->", "<!-- BENCH:END -->"
@@ -121,31 +135,26 @@ head, rest = text.split(begin, 1)
 _, tail = rest.split(end, 1)
 open(readme, "w").write("%s%s\n%s\n%s%s" % (head, begin, body, end, tail))
 PY
-  # RESULTS.md carries the block AND the transcript of the proof that ran
-  # before it, because out/ is generated and gitignored: without this the
-  # committed artefact would assert identical responses with nothing behind it.
-  {
-    cat "$md"
-    echo
-    echo "## Verification, exactly as it ran"
-    echo
-    echo '```'
-    cat "$HERE/out/verify.txt"
-    echo '```'
-    echo
-    echo "## Quiet checks, exactly as they ran"
-    echo
-    echo '```'
-    cat "$HERE/out/quiet.txt"
-    echo '```'
-  } > "$HERE/RESULTS.md"
+  # RESULTS.md carries every table, the method, and the transcript of the
+  # proof that ran before it, because out/ is generated and gitignored.
+  python3 "$HERE/report.py" results "$RECORDED" > "$HERE/RESULTS.md"
   echo "wrote pkg/web/README.md and pkg/web/bench/RESULTS.md"
 }
 
+# Collect into a temp file first so a failed collect never truncates the record.
+record() {
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/t5418-rec.XXXXXX")
+  python3 "$HERE/report.py" collect "$HERE/out" > "$tmp" || { rm -f "$tmp"; exit 1; }
+  mv "$tmp" "$RECORDED"
+}
+
 case $MODE in
+  --render) ;;
   --report) ;;
   --fetch)  fetch ;;
   --reuse)  measure; fetch ;;
   *)        build_bit; ship; measure; fetch ;;
 esac
+[ "$MODE" = --render ] || record
 publish

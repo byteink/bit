@@ -7,7 +7,8 @@ Core on TechEmpower's test types 1 (plaintext) and 2 (JSON).
 ```
 ./pkg/web/bench/run.sh            ship, build, measure, publish
 ./pkg/web/bench/run.sh --reuse    measure against the tree already on the box
-./pkg/web/bench/run.sh --report   re-render from the last results.csv
+./pkg/web/bench/run.sh --report   re-collect the last results.csv, then publish
+./pkg/web/bench/run.sh --render   publish from recorded.json, no box, no measuring
 ```
 
 `run.sh` runs on a developer machine and needs an x86-64 Linux host with
@@ -56,5 +57,10 @@ bare-metal published figures.
 `out/` is generated and gitignored: `results.csv` is every rep, `verify.txt`
 the identical-response and affinity proof, `quiet.txt` every quiet check,
 `env.txt` the box as measured at run time, `versions.txt` what each framework
-resolved to. `RESULTS.md` carries the published block with `verify.txt` and
-`quiet.txt` beneath it.
+resolved to. `report.py collect` boils `out/` down to `recorded.json`, which is
+committed: the medians, the box and the two proofs. Everything published is
+rendered from `recorded.json` alone, so `--render` rebuilds it without a
+measurement. The README block is the short comparison (a sentence, one table,
+two plain lines, the machine and date); `RESULTS.md` carries every table, the
+method, and `verify.txt` and `quiet.txt` beneath them. The block generator
+refuses to write any of the jargon that belongs in `RESULTS.md`.
