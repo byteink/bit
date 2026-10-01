@@ -2266,6 +2266,11 @@ bound          = type_name [ "<" type { "," type } ">" ] .
   parameter (`<T>`) admits any type and permits only operations valid for all
   types (assignment, passing, equality only if used at a comparable-constrained
   site).
+- A member written through a type parameter with several bounds (`S: A & B`)
+  resolves against the bounds in written order: the first bound that declares the
+  name is the one called. This holds for an instance member (`s.m()`) and for a
+  static one (`S.m()`, §10.4.1). A name no bound declares, and a name that two
+  bounds declare with different signatures, are each **E0057**.
 - Generics are resolved by **monomorphization** at compile time (§13.6); there is
   no runtime type erasure and no boxing of type parameters.
 - Call-site type arguments are usually inferred (§15.3); explicit arguments use
