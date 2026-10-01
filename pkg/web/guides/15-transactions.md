@@ -60,7 +60,7 @@ import { Ctx, Res } from "web"
 import { Db, TxHandle } from "orm"
 import { isSome, unwrap } from "std/core"
 
-// The `author`/`with("author")` side (part 9, "Relationships") is left out
+// The `author` side (part 9, "Relationships") is left out
 // here - this page's own transaction never reads it back, and a plain
 // `@manyToMany` field is all `Article` needs to be a full `Tabled` class.
 @table class Tag {

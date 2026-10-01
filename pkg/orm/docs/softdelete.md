@@ -126,18 +126,22 @@ program bug your own code can report, same as any other failed `?`.
   accounts: []Account
 }
 
-fn teamWithAccounts(db: Db, id: i64): Option<Team>! {
-  return db.table<Team>().where("id", id).with("accounts").first()?
+fn printRoster(db: Db, id: i64): ()! {
+  match (db.table<Team>().where("id", id).first()?) {
+    Some(team) => println("${len(team.accounts)} accounts")
+    None => println("not found")
+  }
 }
 ```
 
-`with("accounts")` loads every `Account` row whose `team_id` matches, by a
-plain `SELECT` that does not go through `Repo<Account>` at all - a banned
-account still turns up under `team.accounts`. [Relations](relation.md)'s
-`with()` and this page's own exclusion are two separate mechanisms today; if
-a team roster must never show a banned member, filter `deletedAt` out of
-`team.accounts` yourself after loading, rather than assume `with()` already
-did it.
+Reading `team.accounts` makes the compiler load it with the query
+([Relations](relation.md) explains the rule), and that load reads every
+`Account` row whose `team_id` matches, by a plain `SELECT` that does not go
+through `Repo<Account>` at all - a banned account still turns up under
+`team.accounts`. A relation load and this page's own exclusion are two
+separate mechanisms today; if a team roster must never show a banned
+member, filter `deletedAt` out of `team.accounts` yourself after loading,
+rather than assume the load already did it.
 
 ## When not to use this
 
@@ -161,6 +165,6 @@ this page is built to protect the row it just marked.
 ## Where to go next
 
 [Query](query.md) covers the plain `find`/`where`/`all` chain this page's
-exclusion sits on top of. [Relations](relation.md) covers `with()` and the
+exclusion sits on top of. [Relations](relation.md) covers how a relation loads and the
 sharp edge above in full. [Write](write.md) covers `insert`/`update`, which
 `@softDelete` never changes.

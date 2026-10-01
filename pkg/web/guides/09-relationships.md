@@ -4,10 +4,11 @@
 
 An article has an author, and it can carry any number of tags. Load them
 the naive way and a list of 20 articles costs 20 extra queries just for the
-authors, and 20 more for the tags. `pkg/orm`'s `with()` turns "one query per
-row" into "one query for the parent rows, plus one more per relation you
-asked for" - three statements total for this page's `GET /articles/:id`,
-no matter how many tags an article has.
+authors, and 20 more for the tags. `pkg/orm` turns "one query per row" into
+"one query for the parent rows, plus one more per relation you read" -
+three statements total for this page's `GET /articles/:id`, no matter how
+many tags an article has. You do not write those extra queries: read
+`article.author` or `article.tags` and the compiler loads the relation.
 
 ## The other two tables: User and Tag
 
@@ -51,21 +52,26 @@ import { isSome, unwrap } from "std/core"
 }
 
 fn findArticleById(db: Db, id: i64): Article! {
-  return db.table<Article>().with("author").with("tags").find(id)?
+  return db.table<Article>().find(id)?
 }
 ```
 
-`find()` eager-loads every queued `with()` the same way `all()`/`first()`
-do, and already fails naming the table if no row (or, on a primary key,
+`find()` already fails naming the table if no row (or, on a primary key,
 more than one) matches - no `where("id", ...).first()` workaround needed.
+The query says nothing about `author` or `tags`: `toArticleView`, below,
+reads `article.author` and `article.tags` from what `findArticleById`
+returns, and the compiler follows those rows back to this query and loads
+both there. If a build ever fails with `E0300` on such a read, the compiler
+could not trace the rows back to a query, and its message names the query
+to add `.with(...)` to; [Relations](../../orm/docs/relation.md) shows the
+error and the fix.
 
 `@belongsTo("authorId")` names the foreign key already on `Article` - the
 owning side. `@manyToMany("article_tags")` names the join table [chapter
 20](07-tables-and-migrations-with-pkg-orm.md) already migrated. Neither
 `author` nor `tags` needs a value in a composite literal that builds an
-`Article` without one: both start in a "not loaded" state that a bare read
-rejects, and `with("author")`/`with("tags")` are the only things that fill
-them in.
+`Article` without one: both start "not loaded", and a read of either makes
+the compiler fill it in from the query.
 
 Fetch an article that has an author and tags:
 
@@ -82,11 +88,14 @@ has:
 
 ```text
 select * from articles where id = $1 limit 2
-select * from users where id in ($1)
 select tags.*, article_tags.article_id as mtm_owner_id
   from tags join article_tags on tags.id = article_tags.tag_id
   where article_tags.article_id in ($1)
+select * from users where id in ($1)
 ```
+
+The two relation loads run in the order `toArticleView` reads them: `tags`
+first, then `author`.
 
 ## Rendering it
 
@@ -242,9 +251,9 @@ insert into article_tags (article_id, tag_id) values ($1, $2), ($3, $4)
 
 ## What we built
 
-`GET /articles/:id` eager-loads an article's author and tags in three
-queries through `with("author").with("tags")`, and `POST /articles` creates
-an article and attaches its tags - `insert()` for the row, `link()` for the
+`GET /articles/:id` loads an article's author and tags in three queries
+(because `toArticleView` reads them), and `POST /articles` creates an
+article and attaches its tags - `insert()` for the row, `link()` for the
 join table, not yet wrapped in a single transaction, which [chapter
 28](15-transactions.md) adds. `ArticleView` now carries `authorUsername`
 and `tags` alongside what [chapter 21](08-querying-and-crud.md) built.
