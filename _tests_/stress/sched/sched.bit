@@ -77,6 +77,19 @@
 //       task, so `schedSwitchAway`'s `schedCurrentTask()` lookup cannot run
 //       here. The wiring is proven by bench/cases/allocpar's collection count.
 //
+//   P6  Nothing lives in a caller-saved register across a switch (#6382). On
+//       resume every register the switch does not restore holds the WORKER's
+//       value, so `schedSwitch`'s clobber lists name the whole caller-saved file
+//       and the compiler treats the switch as a clobber point, like a call
+//       (SPEC §11.6). `liveAcrossSwitch` keeps eight ints and two floats live
+//       across a yield with no call in between, which is exactly the shape the
+//       allocator may put in x4..x15 / r8, r9 / d0..d7 / xmm0..xmm5 unless the
+//       switch declares them; `runWorker` poisons those registers before every
+//       switch into a task, so a value left in one reads back as the poison.
+//       12 checks, one per round. It is the only check that sees the allocator's
+//       side of the switch: P2 sees the switch's own saves. Before #6382 this
+//       count was 0 on both targets.
+//
 // WHY THE TASK BODIES ARE `@nosplit`. Codegen emits a safepoint at every loop
 // back-edge, and a safepoint on a task stack would have the collector scan a
 // range it knows nothing about — these stacks are module-level arrays, not
@@ -126,6 +139,7 @@ let disposition: i64 = 0
 let trace: i64 = 0
 let checksum: i64 = 0
 let cleared: i64 = 0
+let live: i64 = 0
 
 // The worker context's address, resolved once in `main`.
 //
@@ -252,6 +266,39 @@ const DISP_DONE: int = 1
   return 1
 }
 
+// P6: 1 when ten values held across a yield come back intact. No call sits
+// between their definition and their use, so nothing but the switch itself can
+// disturb them, and the allocator may keep them in any register the switch does
+// not declare destroyed. Each is derived from the task's own id and the
+// expectation is re-derived from memory AFTER the resume, so a value corrupted
+// in a register cannot corrupt the check with it.
+@nosplit fn liveAcrossSwitch(): int {
+  let id = *(taskAt(current) + taskArg)
+  let a = id + 11
+  let b = id * 3 + 12
+  let c = id * 5 + 13
+  let d = id * 7 + 14
+  let e = id * 9 + 15
+  let g = id * 11 + 16
+  let h = id * 13 + 17
+  let k = id * 15 + 18
+  let x = f64(id) + 0.25
+  let y = f64(id) * 2.0 + 0.5
+
+  disposition = DISP_YIELD
+  schedSwitch(taskAt(current), taskAt(workerCtxAddr))
+
+  let n = *(taskAt(current) + taskArg)
+  // 64n + 116: the coefficients 1+3+..+15 and the constants 11+..+18.
+  if (a + b + c + d + e + g + h + k != 64 * n + 116) {
+    return 0
+  }
+  if (x + y != f64(n) * 3.0 + 0.75) {
+    return 0
+  }
+  return 1
+}
+
 // Leave for good. Never returns: the worker sees `DISP_DONE` and never queues
 // this task again, so nothing will ever switch back to it.
 @nosplit fn finishTask() {
@@ -296,6 +343,10 @@ const DISP_DONE: int = 1
       checksum = checksum + 1
     }
     cleared = cleared + ctxClearCheck()
+    // Not `live = live + liveAcrossSwitch()`: other tasks bump `live` while this
+    // one is switched out, and the left operand would be read before the yield.
+    let ok = liveAcrossSwitch()
+    live = live + ok
     r = r + 1
   }
   finishTask()
@@ -305,8 +356,8 @@ const DISP_DONE: int = 1
 // the tail, take from the head) is what makes the interleave round-robin.
 //
 // Bounded by `STEP_LIMIT` rather than looping until the queue drains, so the
-// loop's termination is provable by reading it (Power of 10). TASKS*(ROUNDS+1)
-// = 16 switches are needed; the limit is comfortably above that, and a scheduler
+// loop's termination is provable by reading it (Power of 10). TASKS*(2*ROUNDS+1)
+// = 28 switches are needed (two yields a round, P2 and P6, plus the exit); the limit is comfortably above that, and a scheduler
 // that failed to retire its tasks would hit the bound and report a wrong trace
 // rather than hang.
 fn runWorker() {
@@ -347,6 +398,33 @@ fn runWorker() {
       }
       clobber arm64 { x19, x20, x21 }
       clobber x64 { rbx, r12, r13, rsi, rdi }
+    }
+
+    // P6: poison the caller-saved file too. x4..x8, x12..x15 (arm64) and r8, r9
+    // (x64) are the integer registers the allocator may hand out; d0..d7 / xmm0..
+    // xmm5 are filled from the first of them. `clobber` has no spelling for an FP
+    // register, so those are written undeclared: this function holds no float,
+    // and the stores are the last thing before the switch.
+    asm {
+      arm64 {
+        0xD280B4A4, 0xD280B4A5, 0xD280B4A6, 0xD280B4A7, // mov x4..x7, #0x5a5
+        0xD280B4A8, 0xD280B4AC, 0xD280B4AD, 0xD280B4AE, // mov x8, x12..x14
+        0xD280B4AF,                                     // mov x15, #0x5a5
+        0x9E670080, 0x9E670081, 0x9E670082, 0x9E670083, // fmov d0..d3, x4
+        0x9E670084, 0x9E670085, 0x9E670086, 0x9E670087, // fmov d4..d7, x4
+      }
+      x64 {
+        0x41, 0xB8, 0xA5, 0x05, 0x00, 0x00, // mov r8d, 0x5a5
+        0x41, 0xB9, 0xA5, 0x05, 0x00, 0x00, // mov r9d, 0x5a5
+        0x66, 0x49, 0x0F, 0x6E, 0xC0,       // movq xmm0, r8
+        0x66, 0x49, 0x0F, 0x6E, 0xC8,       // movq xmm1, r8
+        0x66, 0x49, 0x0F, 0x6E, 0xD0,       // movq xmm2, r8
+        0x66, 0x49, 0x0F, 0x6E, 0xD8,       // movq xmm3, r8
+        0x66, 0x49, 0x0F, 0x6E, 0xE0,       // movq xmm4, r8
+        0x66, 0x49, 0x0F, 0x6E, 0xE8,       // movq xmm5, r8
+      }
+      clobber arm64 { x4, x5, x6, x7, x8, x12, x13, x14, x15 }
+      clobber x64 { r8, r9 }
     }
 
     schedSwitch(ptrOf(workerCtx), taskAt(addr))
@@ -481,6 +559,6 @@ fn main() {
 
   runWorker()
 
-  // checksum and cleared: TASKS * ROUNDS = 12 checks each, all passing.
-  print("${trace} ${checksum} ${dequeProps()} ${globalProps()} ${cleared}\n")
+  // checksum, cleared and live: TASKS * ROUNDS = 12 checks each, all passing.
+  print("${trace} ${checksum} ${dequeProps()} ${globalProps()} ${cleared} ${live}\n")
 }
