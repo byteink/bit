@@ -30,16 +30,37 @@
 //
 // WHAT THE CONTROL CANNOT SEPARATE: one late wake under heavy load from the OS
 // holding a woken thread off a CPU. Nothing outside the runtime can tell them
-// apart, so the runtime answers it itself (#6418): a producer that publishes a
-// deadline while worker 0 is armed must claim that wait, and
-// `schedWakeAuditEnd` (`runtime/sched/sleep.bit`) counts every producer that did
-// not. `ok` fails on a non-zero count whatever the timings were, and the diag
-// line prints it as `missedWake`.
+// apart, so the runtime answers it itself, twice:
+//
+//   - A producer that publishes a deadline while worker 0 is armed must claim
+//     that wait (#6418), and `schedWakeAuditEnd` (`runtime/sched/sleep.bit`)
+//     counts every producer that did not. `ok` fails on a non-zero count
+//     whatever the timings were, and the diag line prints it as `missedWake`.
+//   - Worker 0's blocking wait is traced (#6427, `runtime/sched/timertrace.bit`)
+//     with how late the OS returned its thread: the time the kernel had it
+//     runnable and did not run it, and the wait's overshoot of its own bound.
+//     That is the OS's lateness measured ON THE THREAD THAT WAITS, which the
+//     control (another thread, another moment) cannot see: under 2*ncpu CPU
+//     hogs a 2ms timer fired 63-91ms late with the control under 10ms because
+//     worker 0's `epoll_pwait2` came back that late. The verdict subtracts the
+//     larger of the control and this, as `osHeld`. A wake that was late with
+//     the thread asleep on a stale bound (the #5845 shape: nothing woke it)
+//     returns on time at that bound, so neither excuses it.
+//
+// When a program fails, `dumpTrace` prints the events around the worst sample.
 
-import { monotonic, since } from "std/time"
+import { monotonic, since, sleep, Millisecond } from "std/time"
 
 extern fn bit_rt_port_park_sleep_ns(ns: int, scratch: *i64)
 extern fn bit_rt_port_sched_timer_missed_wake(): int
+extern fn bit_rt_port_sched_timer_trace_enable()
+extern fn bit_rt_port_sched_timer_trace_count(): int
+extern fn bit_rt_port_sched_timer_trace_at(n: int, field: int): int
+extern fn bit_rt_port_sched_timer_trace_os_held(t0: int, t1: int): int
+
+// How far before the worst sample's start the dump begins, so the arm or reset
+// that began it is in it.
+const dumpLeadNs: int = 3000000
 
 export class Probe {
   nominalNs: int
@@ -47,6 +68,8 @@ export class Probe {
   iters: int
   worstTimerNs: int
   worstTimerAt: int
+  worstStartNs: int
+  worstEndNs: int
   worstTimerCtlNs: int
   ctlMaxNs: int
 
@@ -64,7 +87,9 @@ export class Probe {
 
   // Records one timer wait's overshoot, then takes one control sleep. Call it
   // right after the wait returns, so the control is the same moment's.
-  export sample(overshootNs: int) {
+  // `startNs` is the wait's start on the monotonic clock; the end is now.
+  export sample(startNs: int, overshootNs: int) {
+    let endNs = monotonic().ns
     let ctl = this.control()
     if (ctl > this.ctlMaxNs) {
       this.ctlMaxNs = ctl
@@ -72,18 +97,58 @@ export class Probe {
     if (overshootNs > this.worstTimerNs) {
       this.worstTimerNs = overshootNs
       this.worstTimerAt = this.iters
+      this.worstStartNs = startNs
+      this.worstEndNs = endNs
       this.worstTimerCtlNs = ctl
     }
     this.iters = this.iters + 1
   }
 
-  // The worst timer overshoot beyond what a plain sleep of the same run did;
-  // 0 when the timer was no later than the control.
+  // How late the OS returned worker 0's thread from the waits that overlap the
+  // worst sample's window (`runtime/sched/timertrace.bit`).
+  export osHeldNs(): int {
+    return bit_rt_port_sched_timer_trace_os_held(this.worstStartNs, this.worstEndNs)
+  }
+
+  // The worst timer overshoot beyond what the OS demonstrably did: the plain
+  // sleep's lateness or the OS's lateness returning worker 0's thread,
+  // whichever is larger; 0 when the timer was no later than that.
   export excessNs(): int {
-    if (this.worstTimerNs <= this.ctlMaxNs) {
+    let excused = this.ctlMaxNs
+    let held = this.osHeldNs()
+    if (held > excused) {
+      excused = held
+    }
+    if (this.worstTimerNs <= excused) {
       return 0
     }
-    return this.worstTimerNs - this.ctlMaxNs
+    return this.worstTimerNs - excused
+  }
+
+  // The runtime's trace around the worst sample, on stderr. Call it when `ok`
+  // is false: the events say who armed or reset the timer, whether the wake
+  // claimed worker 0, how long worker 0's wait ran against its bound and how
+  // much of that the OS held its thread off a CPU, and when the due entry fired.
+  export dumpTrace() {
+    let total = bit_rt_port_sched_timer_trace_count()
+    let t0 = this.worstStartNs - dumpLeadNs
+    let t1 = this.worstEndNs + this.osHeldNs() + dumpLeadNs
+    eprint("trace: ${total} events; worst sample ${this.worstStartNs}..${this.worstEndNs}\n")
+    let n = 0
+    if (total > traceKept) {
+      n = total - traceKept
+    }
+    while (n < total) {
+      let at = bit_rt_port_sched_timer_trace_at(n, 0)
+      if (at >= t0 && at <= t1) {
+        let kw = bit_rt_port_sched_timer_trace_at(n, 1)
+        eprint(
+            "trace +${(at - this.worstStartNs) / 1000}us ${kindName(kw / 256)} worker=${kw % 256} " +
+            "a=${bit_rt_port_sched_timer_trace_at(n, 2)} b=${bit_rt_port_sched_timer_trace_at(n, 3)}\n",
+        )
+      }
+      n = n + 1
+    }
   }
 
   // Within budget AND no wake the runtime itself saw go missing.
@@ -97,8 +162,65 @@ export class Probe {
     return "${name} diag: iters=${this.iters} budget=${ms(budgetNs)}ms " +
       "worstTimer=${ms(this.worstTimerNs)}ms@${this.worstTimerAt} " +
       "controlThen=${ms(this.worstTimerCtlNs)}ms controlMax=${ms(this.ctlMaxNs)}ms " +
+      "osHeld=${ms(this.osHeldNs())}ms " +
       "excess=${ms(this.excessNs())}ms missedWake=${bit_rt_port_sched_timer_missed_wake()}"
   }
+}
+
+// Whether worker 0 has gone idle at least once since tracing was enabled.
+fn worker0Seen(): bool {
+  let total = bit_rt_port_sched_timer_trace_count()
+  let n = 0
+  while (n < total && n < traceKept) {
+    if (bit_rt_port_sched_timer_trace_at(n, 1) / 256 == 4) {
+      return true
+    }
+    n = n + 1
+  }
+  return false
+}
+
+// Worker 0 is the one thread that polls timers, and a thread the OS has not run
+// for the first time polls nothing: a timer armed before that is served only by
+// a parked peer's 100ms backstop (#6427: `wake` showed worker 0's wait cell never
+// armed, and the first sample fired 55-93ms late). That is a boot-time property
+// of a starved process, not what these programs measure, so they start timing
+// once worker 0 has been seen waiting. Bounded: a platform whose worker 0 never
+// reaches the traced wait costs `warmTries` sleeps and is judged as before.
+const warmTries: int = 100
+
+fn awaitWorker0() {
+  let i = 0
+  while (i < warmTries && !worker0Seen()) {
+    sleep(Millisecond)
+    i = i + 1
+  }
+}
+
+// The ring's capacity in events (`runtime/sched/timertrace.bit`'s `ttCap`).
+const traceKept: int = 16384
+
+// The event kinds of that file, by number.
+fn kindName(kind: int): string {
+  if (kind == 1) {
+    return "arm"
+  }
+  if (kind == 2) {
+    return "reset"
+  }
+  if (kind == 3) {
+    return "wake(cellBefore,cellAfter)"
+  }
+  if (kind == 4) {
+    return "w0Block(bound,runDelay)"
+  }
+  if (kind == 5) {
+    return "w0Return(drained,runDelay)"
+  }
+  if (kind == 6) {
+    return "fire(deadline,now)"
+  }
+  return "sent(1,slot)"
 }
 
 // Whole microseconds shown as a decimal millisecond figure, one place.
@@ -116,12 +238,16 @@ fn ms(ns: int): string {
 }
 
 export fn newProbe(nominalNs: int): Probe {
+  bit_rt_port_sched_timer_trace_enable()
+  awaitWorker0()
   return Probe{
     nominalNs = nominalNs,
     scratch = []i64(2),
     iters = 0,
     worstTimerNs = 0,
     worstTimerAt = 0,
+    worstStartNs = 0,
+    worstEndNs = 0,
     worstTimerCtlNs = 0,
     ctlMaxNs = 0,
   }

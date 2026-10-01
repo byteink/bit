@@ -1,0 +1,177 @@
+// A ring of the events a channel timer's wake passes through (#6427), so a timer
+// that fires late can be ATTRIBUTED instead of only measured: who armed or reset
+// it and when, whether that producer claimed worker 0, when worker 0's wait began
+// and ended and how long the OS held its thread off a CPU meanwhile, when the
+// sweep found the entry due, and when the send that readies the waiting task
+// returned. `_tests_/bit/timerctl` turns it on, prints the window around its
+// worst sample when a stress program fails, and subtracts the OS's share.
+//
+// WHAT IT FOUND (#6427). Under 2*ncpu CPU hogs a 2ms reset timer fired 55-93ms
+// late with the plain-sleep control under 12ms and no wake missed. Every such
+// sample had one of three shapes, and none of them was a lost wake:
+//   - worker 0's `epoll_pwait2` came back 65ms after its 2ms bound while the
+//     thread's `run_delay` grew by 4.6ms: the timeout expired and the kernel
+//     was late delivering it, the thread was not even runnable;
+//   - worker 0 was claimed and woken, then sat on a run queue for 125ms
+//     (`run_delay` +131ms), and the due entry fired at 83ms from an idle thread
+//     that was not worker 0 (a peer's `idleParkMaxNs` timeout);
+//   - the first sample of a run, before worker 0 had ever armed its wait (the
+//     `wake` event reads cell 0 before and after): nothing polls timers until
+//     that thread has run once, and a due entry waits for a peer's timeout.
+// The control could not see the first two because it sleeps on a different
+// thread at a different moment, so the verdict now uses worker 0's own waits.
+//
+// OFF BY DEFAULT, ONE LOAD WHEN OFF. `schedTimerTraceEnable` is called by the
+// programs that want attribution; every hook below returns on its first
+// statement until then, so a production process pays one seq-cst load per
+// producer call and per worker-0 wait and never touches the ring (it is zero
+// BSS: no page is mapped until the first event).
+//
+// ONE FIXED RING, process-global like the pool it describes. An event is four
+// words: a `CLOCK_MONOTONIC` reading (the clock `std/time`'s `monotonic()` and
+// every deadline use, so a test can place its own readings among these), the
+// kind with the recording thread's worker id (255 off a task), and two
+// kind-specific values. A slot is claimed with one `atomicAdd` and its time is
+// stored LAST, after clearing it, so a reader that races a recorder sees 0 and
+// skips the slot.
+
+const ttCap: int = 16384
+const ttWords: int = 4
+let ttRing: [65536]i64
+let ttNext: [1]i64
+let ttOn: [1]i64
+
+// Event kinds, with the meaning of the two values:
+//   ttArm, ttReset  deadline published, slot
+//   ttWake          worker 0's wait cell before the wake attempt (0: no wake
+//                   owed), the cell after
+//   ttW0Block       the bound worker 0 is about to block for, its thread's
+//                   run_delay then
+//   ttW0Return      what `pollDrain` returned, its thread's run_delay then
+//   ttFire          the deadline found due, the sweep's `now`
+//   ttSent          1 once the send returned, the slot
+export const ttArm: int = 1
+export const ttReset: int = 2
+export const ttWake: int = 3
+export const ttW0Block: int = 4
+export const ttW0Return: int = 5
+export const ttFire: int = 6
+export const ttSent: int = 7
+
+// `bit_rt_port_sched_thread_run_delay` (`./<os>/rundelay.bit`): ns the calling
+// thread was runnable and off a CPU; 0 where the OS offers no such counter.
+extern fn bit_rt_port_sched_thread_run_delay(): int
+
+export @nosplit @symbol("bit_rt_port_sched_timer_trace_enable") fn schedTimerTraceEnable() {
+  atomicStore(ptrOf(ttOn), 1)
+}
+
+// The recording thread: its worker's id, or 255 off a task (an idle worker's
+// own loop, a boot thread).
+@nosplit fn ttWho(): int {
+  let wAddr = schedCurrentWorker()
+  if (wAddr == 0) {
+    return 255
+  }
+  return *(taskAt(wAddr) + wkId)
+}
+
+@nosplit fn schedTimerTrace(kind: int, a: int, b: int) {
+  if (atomicLoad(ptrOf(ttOn)) == 0) {
+    return
+  }
+  let n = atomicAdd(ptrOf(ttNext), 1)
+  let e = ptrOf(ttRing) + n % ttCap * ttWords
+  *e = 0
+  *(e + 1) = kind * 256 + ttWho()
+  *(e + 2) = a
+  *(e + 3) = b
+  *e = monoNs()
+}
+
+// Worker 0's blocking wait, bracketed by `runtime/root/<os>/bootworker.bit`'s
+// `worker0Wait` around its `pollDrain`.
+export @nosplit @symbol("bit_rt_port_sched_w0_wait_begin") fn schedW0WaitBegin(boundNs: int) {
+  if (atomicLoad(ptrOf(ttOn)) == 0) {
+    return
+  }
+  schedTimerTrace(ttW0Block, boundNs, bit_rt_port_sched_thread_run_delay())
+}
+
+export @nosplit @symbol("bit_rt_port_sched_w0_wait_end") fn schedW0WaitEnd(drained: int) {
+  if (atomicLoad(ptrOf(ttOn)) == 0) {
+    return
+  }
+  schedTimerTrace(ttW0Return, drained, bit_rt_port_sched_thread_run_delay())
+}
+
+// How many events were ever recorded; the ring holds the last `ttCap`.
+export @nosplit @symbol("bit_rt_port_sched_timer_trace_count") fn schedTimerTraceCount(): int {
+  return atomicLoad(ptrOf(ttNext))
+}
+
+// Word `field` (0 time, 1 kind*256+worker, 2 and 3 the values) of event number
+// `n`, counted from the first ever recorded; 0 when `n` has been overwritten or
+// is not written yet.
+export @nosplit @symbol("bit_rt_port_sched_timer_trace_at") fn schedTimerTraceAt(
+  n: int,
+  field: int,
+): int {
+  let total = atomicLoad(ptrOf(ttNext))
+  if (n < 0 || n >= total || total - n > ttCap || field < 0 || field >= ttWords) {
+    return 0
+  }
+  return *(ptrOf(ttRing) + n % ttCap * ttWords + field)
+}
+
+// How late the OS returned worker 0's thread inside one blocking wait that
+// overlaps `[t0, t1]` on the monotonic clock: the larger of two, over those
+// waits.
+//   - the wait's run-queue delay: `run_delay` at its return minus at its
+//     start, the time the kernel had the thread runnable and did not run it;
+//   - the wait's overshoot: how long it lasted beyond the bound it was given,
+//     which the kernel owes to the nanosecond. A timeout that expired and
+//     whose thread was not even runnable (the timer interrupt itself late,
+//     a stalled virtual CPU) shows here and not in `run_delay`.
+// 0 when tracing is off or no wait overlapped.
+//
+// A WAIT THAT ENDS AFTER `t1` COUNTS, and that is the case that matters: the
+// timer was late because worker 0 had not come back yet. A wake that no
+// producer sent (#5845: worker 0 asleep on a bound that did not know the new
+// deadline) is neither: that wait returns on its own, on time, at its stale
+// bound, so it excuses nothing.
+export @nosplit @symbol("bit_rt_port_sched_timer_trace_os_held") fn schedTimerTraceOsHeld(
+  t0: int,
+  t1: int,
+): int {
+  let total = atomicLoad(ptrOf(ttNext))
+  let n = 0
+  if (total > ttCap) {
+    n = total - ttCap
+  }
+  let blockAt = 0
+  let blockBound = 0
+  let blockDelay = 0
+  let held = 0
+  while (n < total) {
+    let e = ptrOf(ttRing) + n % ttCap * ttWords
+    let kind = *(e + 1) / 256
+    if (kind == ttW0Block) {
+      blockAt = *e
+      blockBound = *(e + 2)
+      blockDelay = *(e + 3)
+    } else if (kind == ttW0Return && blockAt != 0 && blockAt <= t1 && *e >= t0) {
+      held = maxInt(held, *(e + 3) - blockDelay)
+      held = maxInt(held, *e - blockAt - blockBound)
+    }
+    n = n + 1
+  }
+  return held
+}
+
+@nosplit fn maxInt(a: int, b: int): int {
+  if (b > a) {
+    return b
+  }
+  return a
+}
