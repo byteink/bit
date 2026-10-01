@@ -1,0 +1,163 @@
+// GC-only helper threads (#6460): the gang members a collection gets when the
+// worker pool has nobody to lend it.
+//
+// WHAT WAS MISSING. The helper gang (#5837) is joined by mutators that park for
+// the stop and by idle workers `stwGangRecruit` wakes (#5842, ./stwstats.bit).
+// A program that never spawns keeps the boot pool of one worker
+// (`BIT_WORKERS` default, ../root/linux/boottail.bit step 4), so a pure parse
+// has neither: every pause ran on one thread and `BIT_GC_STATS` printed
+// `helpers=0`. The pool's size of one rests on nested parallelism, an argument
+// about threads that RUN TASKS. These threads never do: they wait `blocked`,
+// join the gang when woken, and go back to waiting once the stop clears, so
+// they change nothing about how tasks are scheduled.
+//
+// HOW MANY. The pool's other workers already help (they park for the stop and
+// join, or sleep and are woken), so helpers only top the gang up:
+// `min(cores - 1, stwGangIdleCap) - (workers - 1)`. Unknown cores (0) gives
+// none. A collection of a heap under `stwHelperFloorBytes` gets none either,
+// because its pause is shorter than the wakes would cost.
+//
+// WHEN THEY START. Lazily, from inside the first collection that wants them,
+// so a program that never collects a large heap creates no thread. A thread
+// started inside a stop claims its mutator slot at entry (the provider's
+// `bit_rt_gc_thread_enter`), finds the stop pending, parks for it and joins
+// the open gang (`mutatorSlot`, ../gc/gcworldsync.bit), so it helps the very
+// collection that started it. The start runs on the coordinator inside the
+// stop, which is why `bit_rt_port_thread_start` must neither allocate nor
+// poll: Darwin's and Windows's are `@nosplit`; Linux's reads only geometry
+// cached at boot, the argument its grow path (`tryGrowPool`) already rests on
+// (#3812). A failed start is final for the run: the coordinator never pays a
+// second refused create.
+//
+// HOW THEY WAIT. Each helper owns one park word, `wkPark`'s discipline
+// (../sched/sleep.bit): 1 armed, 0 claimed. It arms only while `blocked`, so
+// the rendezvous passes it; the coordinator claims it with a compare-and-swap
+// and wakes it. A wait with no timeout costs an idle program nothing, and no
+// wake can be lost: the kernel compares the word before it sleeps.
+
+import { gcBlockingBegin, gcBlockingEnd } from "../gc"
+import { scNWorkers } from "../sched"
+
+// `runtime/thread/<os>`'s start, reached by its pinned name: this module may
+// import no platform provider (the same reason ../sched/sleep.bit declares the
+// park pair below). Every target's provider defines all three.
+extern fn bit_rt_port_thread_start(start: *byte, arg: *byte, done: *i32): int
+extern fn bit_rt_port_park_wait(p: *i32, expected: i32, timeoutNs: i64, scratch: *i64): i64
+extern fn bit_rt_port_park_wake(p: *i32, all: bool): i64
+
+// The heap, in bytes in use when the collection opens, below which no helper
+// is recruited. 8 MiB is twice the default minimum trigger
+// (`gcDefaultMinTrigger`), so at default pacing a collection reaches it only
+// once the live set itself passed 4 MiB. `bench/cases/alloc` (133 pauses,
+// 0.28 ms mean, peak heap 5.1 MB) and `churn` (34 pauses, 0.29 ms, 4.5 MB) never
+// do; the measurements behind the choice are on #6460.
+const stwHelperFloorBytes = 8388608
+
+// Bound on one helper's wait-and-help turns (Power of 10): one turn per
+// collection it is woken for, or per spurious return of the wait.
+const stwHelperTurns = 1000000000000
+
+// The CPU count `runtime/root` read at boot (`stwBind`), 0 when unknown.
+let stwCores: i64 = 0
+
+// Helpers started so far, and whether a start was refused. Both written only
+// by the coordinator, under the world lock. Seven of each per-helper array:
+// `stwGangIdleCap` (./stwstats.bit) bounds the count.
+let stwHelpersUp: i64 = 0
+let stwHelpersRefused: i64 = 0
+let stwHelperPark: [7]i32
+let stwHelperDone: [7]i32
+let stwHelperScratch: [14]i64
+
+// Helper `i`'s park word.
+@nosplit fn stwHelperWord(i: int): *i32 {
+  let p: *i32 = ptrOf(stwHelperPark)
+  return p + i
+}
+
+// A helper thread's whole life. `arg` is its index. The provider's trampoline
+// has already claimed this thread's mutator slot, and releases it if this ever
+// returns.
+@nosplit fn stwHelperRun(arg: *byte): *byte {
+  let i = int(arg)
+  let p = stwHelperWord(i)
+  let scratch: *i64 = ptrOf(stwHelperScratch)
+  gcBlockingBegin()
+  atomicStore(p, i32(1))
+  let n = 0
+  while (n < stwHelperTurns) {
+    n = n + 1
+    let _ = bit_rt_port_park_wait(p, i32(1), 0, scratch + i * 2)
+    if (atomicLoad(p) == i32(0)) {
+      // Claimed: join the open gang, and wait out the stop in it.
+      gcBlockingEnd()
+      gcBlockingBegin()
+      atomicStore(p, i32(1))
+    }
+  }
+  let z: *byte = nil
+  return z
+}
+
+// Start helpers until `want` exist. Returns how many it started.
+@nosplit fn stwHelpersStart(want: int): int {
+  let started = 0
+  let bp: *byte = nil
+  let done: *i32 = ptrOf(stwHelperDone)
+  while (stwHelpersUp < want && stwHelpersRefused == 0) { // bounded: want <= 7
+    let i = stwHelpersUp
+    atomicStore(stwHelperWord(i), i32(0))
+    if (bit_rt_port_thread_start(entryOf(stwHelperRun), bp + i, done + i) == 0) {
+      stwHelpersRefused = 1
+      return started
+    }
+    stwHelpersUp = i + 1
+    started = started + 1
+  }
+  return started
+}
+
+// How many helpers the collection opening on `world` wants, given the pool
+// in `s` and the collector block `g`. 0 for a private World (a test driving
+// `stwPollOn` directly): helpers serve the process's own registry only.
+@nosplit fn stwHelpersWanted(g: *i64, world: *i64, s: *i64): int {
+  if (int(world) != worldAddr) {
+    return 0
+  }
+  let cap = stwCores - 1
+  if (cap > stwGangIdleCap) {
+    cap = stwGangIdleCap
+  }
+  let want = cap - (atomicLoad(s + scNWorkers) - 1)
+  if (want <= 0) {
+    return 0
+  }
+  let hNil: *i64 = nil
+  let hb = hNil + (*(g + gcHeapAddr) >> 3)
+  if (atomicLoad(hb + heapLiveWord) < stwHelperFloorBytes) {
+    return 0
+  }
+  return want
+}
+
+// Recruit helpers into the gang just opened on `world`: start any of the
+// wanted ones not yet running, wake the parked ones. Returns how many are on
+// their way. A helper still between its last turn and its next arm misses this
+// collection; nothing waits for one that does not come.
+@nosplit fn stwHelpersRecruit(g: *i64, world: *i64, s: *i64): int {
+  let want = stwHelpersWanted(g, world, s)
+  if (want == 0) {
+    return 0
+  }
+  let n = stwHelpersStart(want)
+  let i = 0
+  while (i < want && i < stwHelpersUp) { // bounded: want <= 7
+    let p = stwHelperWord(i)
+    if (atomicCmpxchg(p, i32(1), i32(0))) {
+      let _ = bit_rt_port_park_wake(p, false)
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
