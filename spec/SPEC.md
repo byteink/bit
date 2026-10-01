@@ -2255,7 +2255,8 @@ interface is a separate extension this section does not make.
 ```
 generic_params = "<" generic_param { "," generic_param } ">" .
 generic_param  = IDENT [ ":" constraint ] .
-constraint     = type_name { "&" type_name } .   (* one or more interface bounds *)
+constraint     = bound { "&" bound } .   (* one or more interface bounds *)
+bound          = type_name [ "<" type { "," type } ">" ] .
 ```
 
 - Type parameters may constrain to one or more interfaces with `&`. An unbounded
@@ -2272,9 +2273,21 @@ constraint     = type_name { "&" type_name } .   (* one or more interface bounds
   that takes none (a non-generic class, a predeclared type, a type parameter)
   takes no list, and a generic type written with none where a type is required
   (`let x: Pair`) is refused. Each is **E0058**.
-- A bound is an interface name and carries no type arguments, so a generic
-  interface cannot be a bound yet: `fn f<S: Store>(s: S)` for `interface
-  Store<T>` is **E0058**.
+- A bound that names a generic interface writes its type arguments:
+  `fn f<S: Store<i64>>(s: S)` for `interface Store<T>`. A type argument
+  satisfies the bound when it satisfies the interface instantiated at those
+  arguments (§14.3); one whose method set disagrees is **E0051** at the call,
+  naming the method whose type differs. Calls through `S` are monomorphized, so
+  they are direct calls, not interface dispatch; the value form `fn f(s:
+  Store<i64>)` is unchanged and dispatches at runtime. The bare `S: Store` and a
+  list of the wrong length, `S: Store<i64, i64>`, are **E0058**.
+- A bound's type arguments may name the generic's own type parameters,
+  siblings declared before or after it: `fn load<T, S: Store<T>>(s: S, k:
+  string): T`. A parameter that no value argument fixes is inferred from the
+  bounds of the others: `S` is bound by the argument, and `T` is whatever
+  `S`'s methods supply where `Store` declares `T` (§15.3). A bound read at an
+  argument that is itself unbound, or a parameter no bound decides, is E0068
+  as before.
 
 Example:
 
@@ -6429,7 +6442,8 @@ enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 
 generic_params= "<" generic_param { "," generic_param } ">" .
 generic_param = IDENT [ ":" constraint ] .
-constraint    = type_name { "&" type_name } .
+constraint    = bound { "&" bound } .
+bound         = type_name [ "<" type { "," type } ">" ] .
 
 type          = type_name | qual_type_name | slice_type | array_type | map_type
               | tuple_type | func_type | chan_type | generic_inst | "(" type ")" .
