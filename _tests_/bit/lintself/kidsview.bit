@@ -1,0 +1,380 @@
+// #6419: no index-assignment into a view of the AST pool, anywhere in compiler/.
+//
+// `kidsOf(t, idx)` (compiler/ast.bit) returns a SLICE of `t.extra`, the pool
+// every `addNode`/`addLeaf` appends to. An append that outgrows the pool's
+// capacity copies it, so a write through a view taken before that append lands
+// in the abandoned array and is silently lost: no error, and whether it fires
+// depends only on how many extras the module holds (#6404 miscompiled a program
+// at one tree size and not its neighbours). The only sanctioned write is
+// `setKid` (compiler/ast.bit), which reads `t.extra` at the moment of the write.
+//
+// WHY A TEXT SCAN, NOT A `bit lint` RULE. A lint rule sees syntax and types,
+// not that one particular function hands back an alias of a shared pool; the
+// provenance is project knowledge. So the scan follows it by name, per
+// function: a local bound from `kidsOf(...)`, from a slice of `X.extra` /
+// `X.nodes`, from another tainted local, or from a function whose own `return`
+// is such a view (found to a fixed point across the whole tree, so a helper
+// declared after its caller is still seen), is TAINTED, and `name[...] = v`
+// (also `.f = v` and `op=`) is a finding; so is `kidsOf(...)[i] = v`, and any
+// write to `X.extra` / `X.nodes` outside compiler/ast.bit. A write into a copy
+// (`let out = []int(n)`) is not a view and is left alone.
+//
+// LIMITS, stated rather than hoped away: statements are matched one per line
+// (the formatter's layout), a `//` inside a string literal ends the line early,
+// and a view handed to another function as a PARAMETER is not followed into it.
+// selfTestKidsGate pins what IS caught on a fixture, so a rule that stops
+// seeing a shape fails the harness instead of passing it.
+import { readFile } from "std/fs"
+import { hasPrefix, hasSuffix, indexOf, join, split, trimSpace } from "std/strings"
+
+const maxViewRounds: int = 8
+const astFile: string = "compiler/ast.bit"
+
+class ViewScan {
+  hits: []string,
+  found: []string,
+}
+
+fn isIdentByte(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn inList(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+// The leading run of identifier bytes and dots: `c.tree`, `kidsOf`, `t.extra`.
+fn pathHead(s: string): string {
+  let i = 0
+  while (i < len(s) && (isIdentByte(s[i]) || s[i] == '.')) {
+    i = i + 1
+  }
+  return s[:i]
+}
+
+// The offset just past the bracket closing the one at `open`, or -1.
+fn closeAt(s: string, open: int): int {
+  let depth = 0
+  let i = open
+  while (i < len(s)) {
+    if (s[i] == '(' || s[i] == '[') {
+      depth = depth + 1
+    } else if (s[i] == ')' || s[i] == ']') {
+      depth = depth - 1
+      if (depth == 0) {
+        return i + 1
+      }
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether `rest`, what follows an indexed place, assigns it: `= v`, `.f = v`
+// or `op= v`; never `==`, never a method call.
+fn assigns(rest0: string): bool {
+  let rest = trimSpace(rest0)
+  while (hasPrefix(rest, ".")) {
+    let j = 1
+    while (j < len(rest) && isIdentByte(rest[j])) {
+      j = j + 1
+    }
+    rest = trimSpace(rest[j:])
+  }
+  if (len(rest) == 0 || hasPrefix(rest, "==")) {
+    return false
+  }
+  if (rest[0] == '=') {
+    return true
+  }
+  return len(rest) > 1 && rest[1] == '=' && indexOf("+-*/%&|^", rest[0:1]) >= 0
+}
+
+// `t[at...]` opens an index whose result is then assigned.
+fn indexedWrite(t: string, at: int): bool {
+  if (at >= len(t) || t[at] != '[') {
+    return false
+  }
+  let e = closeAt(t, at)
+  return e > 0 && assigns(t[e:])
+}
+
+// A write to the pool itself, through any path: `X.extra[i] = v`, `X.extra = v`.
+fn poolWrite(t: string): bool {
+  for field of [".extra", ".nodes"] {
+    let head = pathHead(t)
+    let p = indexOf(head, field)
+    if (p <= 0 || p + len(field) != len(head)) {
+      continue
+    }
+    let after = len(head)
+    // `X.nodes = ...` alone is not flagged: other types (jsonparse.bit's
+    // parser) own a `nodes` field; an indexed write is the pool's shape.
+    if (indexedWrite(t, after) || (field == ".extra" && after < len(t) && assigns(t[after:]))) {
+      return true
+    }
+  }
+  return false
+}
+
+fn viewWrite(t: string, tainted: []string): bool {
+  for name of tainted {
+    if (hasPrefix(t, name) && indexedWrite(t, len(name))) {
+      return true
+    }
+  }
+  if (hasPrefix(t, "kidsOf(")) {
+    let e = closeAt(t, 6)
+    return e > 0 && indexedWrite(t, e)
+  }
+  return poolWrite(t)
+}
+
+// `[a:b]`, the whole of `s`: a slice expression.
+fn isSliceExpr(s: string): bool {
+  return hasPrefix(s, "[") && closeAt(s, 0) == len(s) && indexOf(s, ":") > 0
+}
+
+// Whether `rhs` evaluates to a slice that aliases the pool.
+fn isView(rhs: string, tainted: []string, viewFns: []string): bool {
+  let head = pathHead(rhs)
+  let tail = rhs[len(head):]
+  if (hasSuffix(head, ".extra") || hasSuffix(head, ".nodes")) {
+    return isSliceExpr(tail)
+  }
+  if (head == "kidsOf" || inList(viewFns, head)) {
+    let e = closeAt(rhs, len(head))
+    if (e < 0) {
+      return false
+    }
+    tail = rhs[e:]
+  } else if (!inList(tainted, head)) {
+    return false
+  }
+  tail = trimSpace(tail)
+  return len(tail) == 0 || isSliceExpr(tail)
+}
+
+// (name, rhs) of `let x = rhs`, `var x: T = rhs` or `x = rhs`; ("", "") otherwise.
+fn binding(t: string): (string, string) {
+  let s = t
+  if (hasPrefix(s, "let ") || hasPrefix(s, "var ")) {
+    s = s[4:]
+  }
+  let name = pathHead(s)
+  let rest = trimSpace(s[len(name):])
+  if (len(name) == 0 || indexOf(name, ".") >= 0 || len(rest) == 0) {
+    return ("", "")
+  }
+  if (rest[0] == ':') {
+    let eq = indexOf(rest, "= ")
+    if (eq < 0) {
+      return ("", "")
+    }
+    rest = rest[eq:]
+  }
+  if (hasPrefix(rest, "= ")) {
+    return (name, trimSpace(rest[1:]))
+  }
+  return ("", "")
+}
+
+// The local `t` binds to a view, else "".
+fn boundView(t: string, tainted: []string, viewFns: []string): string {
+  let (name, rhs) = binding(t)
+  if (name != "" && isView(rhs, tainted, viewFns)) {
+    return name
+  }
+  return ""
+}
+
+fn returnsView(t: string, tainted: []string, viewFns: []string): bool {
+  return hasPrefix(t, "return ") && isView(t[7:], tainted, viewFns)
+}
+
+fn isFnHead(t: string): bool {
+  return hasPrefix(t, "fn ") || hasPrefix(t, "export fn ")
+}
+
+fn fnName(t: string): string {
+  let s = t
+  if (hasPrefix(s, "export ")) {
+    s = s[7:]
+  }
+  return pathHead(s[3:])
+}
+
+fn codeOf(raw: string): string {
+  let t = trimSpace(raw)
+  let c = indexOf(t, "//")
+  if (c >= 0) {
+    return trimSpace(t[:c])
+  }
+  return t
+}
+
+fn hitMessage(file: string, line: int): string {
+  return "${file}:${line}: index-assignment into a view of the AST pool; write a child with setKid(t, idx, k, v) (compiler/ast.bit), never through a kidsOf result or X.extra, which a later addNode can orphan (#6404, #6419)"
+}
+
+// One file. `viewFns` are the functions already known to return a view; `found`
+// are the ones THIS file shows to (the caller iterates to a fixed point).
+fn scanViews(file: string, text: string, viewFns: []string): ViewScan {
+  let r = ViewScan{ hits = []string(0), found = []string(0) }
+  let tainted = []string(0)
+  let fname = ""
+  let retSlice = false
+  let lineNo = 0
+  for raw of split(text, "\n") {
+    lineNo = lineNo + 1
+    let t = codeOf(raw)
+    if (isFnHead(t)) {
+      tainted = []string(0)
+      fname = fnName(t)
+      retSlice = false
+    }
+    if (indexOf(t, "): []int") >= 0) {
+      retSlice = true
+    }
+    if (file != astFile && viewWrite(t, tainted)) {
+      r.hits = append(r.hits, hitMessage(file, lineNo))
+    }
+    let name = boundView(t, tainted, viewFns)
+    if (name != "") {
+      tainted = append(tainted, name)
+    }
+    if (retSlice && returnsView(t, tainted, viewFns)) {
+      r.found = append(r.found, fname)
+    }
+  }
+  return r
+}
+
+// Every finding over `names`/`texts`, after the set of view-returning
+// functions stops growing.
+fn scanAllViews(names: []string, texts: []string): []string {
+  let viewFns = []string(0)
+  let round = 0
+  while (round < maxViewRounds) {
+    let hits = []string(0)
+    let grew = false
+    let i = 0
+    while (i < len(names)) {
+      let r = scanViews(names[i], texts[i], viewFns)
+      for h of r.hits {
+        hits = append(hits, h)
+      }
+      for f of r.found {
+        if (!inList(viewFns, f)) {
+          viewFns = append(viewFns, f)
+          grew = true
+        }
+      }
+      i = i + 1
+    }
+    if (!grew) {
+      return hits
+    }
+    round = round + 1
+  }
+  panic("lintself: the set of kidsOf-returning functions did not settle in ${maxViewRounds} rounds")
+}
+
+// The shapes the scan must catch, on a fixture, so a rule that stops seeing one
+// fails the harness instead of passing it: a view held across an append, a view
+// written in place, a helper declared AFTER its caller, an alias, a compound op.
+fn selfTestKidsGate() {
+  let bad = join(
+    [
+      "fn stale(c: Checker, callee: int) {",
+      "  let kids = kidsOf(c.tree, callee)",
+      "  let n = addLeaf(c.tree, Tag.Ident, sp)",
+      "  kids[0] = n", // 4
+      "}",
+      "fn direct(t: Tree, i: int) {",
+      "  kidsOf(t, i)[1] = 0", // 7
+      "  t.extra[3] = 0",      // 8
+      "}",
+      "fn viaHelper(t: Tree, i: int) {",
+      "  let a = attrsOf(t, i)",
+      "  a[0] = 1", // 12
+      "}",
+      "fn attrsOf(t: Tree, i: int): []int {",
+      "  return kidsOf(t, i)",
+      "}",
+      "fn aliased(t: Tree, i: int) {",
+      "  let w = kidsOf(t, i)[0:2]",
+      "  let v = w",
+      "  v[1] += 1", // 20
+      "}",
+    ],
+    "\n",
+  )
+  let want = [4, 7, 8, 12, 20]
+  let hits = scanAllViews(["fixture.bit"], [bad])
+  if (len(hits) != len(want)) {
+    panic(
+      "lintself: kidsview fixture: want ${len(want)} findings, got ${len(hits)}: ${join(hits, " | ")}",
+    )
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (!hasPrefix(hits[i], "fixture.bit:${want[i]}: ") || indexOf(hits[i], "setKid") < 0) {
+      panic("lintself: kidsview fixture: finding ${i} should be line ${want[i]} naming setKid, got: ${hits[i]}")
+    }
+    i = i + 1
+  }
+  let ok = join(
+    [
+      "fn fine(t: Tree, i: int) {",
+      "  let kids = kidsOf(t, i)",
+      "  let first = kids[0]",
+      "  first = first + 1",
+      "  let out = []int(2)",
+      "  out[0] = kids[1]",
+      "  if (kids[0] == 1) {",
+      "    setKid(t, i, 0, addLeaf(t, Tag.Ident, sp))",
+      "  }",
+      "}",
+    ],
+    "\n",
+  )
+  let none = scanAllViews(["fixture.bit"], [ok])
+  if (len(none) != 0) {
+    panic("lintself: kidsview fixture: a clean function was flagged: ${join(none, " | ")}")
+  }
+}
+
+// Prints each finding over compiler/**; true when there is one.
+fn kidsViewGate(repo: string): bool {
+  selfTestKidsGate()
+  let names = []string(0)
+  let texts = []string(0)
+  for path of collectBitFiles("${repo}/compiler", maxScanDepth) {
+    names = append(
+      names,
+      stripRepoPrefix(path, repo) catch e {
+        panic("lintself: ${e.message()}")
+      },
+    )
+    texts = append(
+      texts,
+      readFile(path) catch e {
+        panic("lintself: cannot read ${path}: ${e.message()}")
+      },
+    )
+  }
+  if (!inList(names, astFile)) {
+    panic("lintself: ${astFile} was not walked; the kidsOf scan would be blind")
+  }
+  let hits = scanAllViews(names, texts)
+  for h of hits {
+    eprint("${h}\n")
+  }
+  return len(hits) > 0
+}
