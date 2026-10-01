@@ -384,20 +384,39 @@ export const pollDrainWakeOnly: int = -1
 
 // Worker 0 is about to look for work and will wait in the poller if it finds
 // none. MUST be called before its find-work pass, for `schedIdleArm`'s reason.
+//
+// `scPollWait` IS `epoch * 4 + state` (#6418): the low two bits are the state
+// (0 awake, `pollWaitArmed`, `pollWaitClaimed`) and everything above them counts
+// arms. Every arm bumps the epoch and no disarm or claim touches it, so one
+// value of the cell names ONE arm of ONE wait: a cell that reads the same value
+// before and after a wake attempt was not claimed, disarmed or re-armed in
+// between. `schedWakeAuditEnd` below needs exactly that, because the state
+// alone cannot tell "never claimed" from "claimed, woke, re-armed" (an ABA the
+// audit would report as a miss whenever the host held the producer off a CPU).
+// The epoch cannot wrap: it moves once per worker-0 turn, 2^61 turns.
+//
+// Only worker 0's thread writes the epoch, and it does so while the state is 0
+// (disarm precedes every arm), when no producer can CAS the cell, so the plain
+// load below cannot lose an update.
 export @nosplit @symbol("bit_rt_port_sched_poller_arm") fn schedPollerArm(s: *i64) {
-  atomicStore(s + scPollWait, 1)
+  let v = atomicLoad(s + scPollWait)
+  atomicStore(s + scPollWait, v - (v & pollWaitStateMask) + pollWaitEpochStep + pollWaitArmed)
 }
 
 // Worker 0 is awake: it found work, or its wait has ended. Cleared
 // unconditionally, whichever way the wait ended, exactly as `schedIdlePark`
 // clears `wkPark` on every exit path.
 export @nosplit @symbol("bit_rt_port_sched_poller_disarm") fn schedPollerDisarm(s: *i64) {
-  atomicStore(s + scPollWait, 0)
+  let v = atomicLoad(s + scPollWait)
+  atomicStore(s + scPollWait, v - (v & pollWaitStateMask))
 }
 
 // `scPollWait` after a producer's claim (#5843): distinct from 0 so that the
 // poller can tell "armed, then claimed" apart from "never armed".
 const pollWaitClaimed: int = 2
+const pollWaitArmed: int = 1
+const pollWaitStateMask: int = 3
+const pollWaitEpochStep: int = 4
 
 // How long a drain that already holds the poller may block: `timeoutNs`, or 0
 // once a producer has claimed worker 0's wait (#5843). Call it AFTER
@@ -422,7 +441,7 @@ export @nosplit @symbol("bit_rt_port_sched_poller_wait_ns") fn schedPollerWaitNs
   s: *i64,
   timeoutNs: int,
 ): int {
-  if (atomicLoad(s + scPollWait) == pollWaitClaimed) {
+  if ((atomicLoad(s + scPollWait) & pollWaitStateMask) == pollWaitClaimed) {
     return 0
   }
   return timeoutNs
@@ -462,10 +481,91 @@ export @nosplit @symbol("bit_rt_port_sched_poller_wait_ns") fn schedPollerWaitNs
   if (*(s + scPollFd) <= 0) {
     return false
   }
-  if (atomicLoad(s + scPollWait) != 1) {
+  let v = atomicLoad(s + scPollWait)
+  if ((v & pollWaitStateMask) != pollWaitArmed) {
     return false
   }
-  return atomicCmpxchg(s + scPollWait, 1, pollWaitClaimed)
+  return atomicCmpxchg(s + scPollWait, v, v - pollWaitArmed + pollWaitClaimed)
+}
+
+// ---------------------------------------------------------------------------
+// The missed-wake audit (#6418)
+// ---------------------------------------------------------------------------
+//
+// THE INVARIANT, and it needs no clock and no control. A producer that has just
+// published a deadline and then runs its wake attempt MUST leave worker 0's
+// cell changed if worker 0 was armed when the attempt began: the attempt claims
+// it (armed -> claimed), and the only other way the value moves is worker 0
+// itself disarming or re-arming, which changes the epoch too. So a cell that
+// holds the SAME value before and after an attempt, with the state armed, means
+// the attempt never claimed it, and worker 0 is asleep in `pollDrain` on a bound
+// that does not know about the deadline. That is #5845, observed at its cause
+// rather than at its 100ms symptom, and it is true under any host load: it
+// compares two reads of one word, not a latency against a budget.
+//
+// WHY IT IS RACE-FREE, case by case, for a producer P with `armed` read by
+// `schedWakeAuditBegin` (state armed, epoch e):
+//   - P's attempt reads the cell after `armed` was read. If it still holds
+//     `armed`, `schedClaimPoller` CASes it and the cell becomes
+//     `armed - 1 + 2`; the end read then differs, no count.
+//   - If the cell moved first (another producer claimed, or worker 0 woke), it
+//     can never return to `armed`: the epoch only grows, so the end read differs.
+//   - A cell still equal to `armed` at the end read was therefore untouched for
+//     the whole window, so the attempt did not run its CAS: `schedWakePoller`
+//     was not called, or returned before the exchange.
+// Arming is `atomicStore` and the CAS is sequentially consistent (SPEC "atomic
+// primitives"), so "armed before the attempt" and "unchanged after it" are
+// positions in one total order, not two threads' private views.
+//
+// WHAT IT DOES NOT COUNT, on purpose. A producer that finds worker 0 awake or
+// already claimed (`begin` returns 0) needs no wake: worker 0 re-arms and sweeps
+// strictly after, as `schedWakePoller`'s header argues. A scheduler with no
+// poller bound (`scPollFd <= 0`) has nowhere to send the wake and worker 0 is not
+// waiting in `pollDrain` (its `pollFd == 0` guard returns at once); Windows
+// never arms (`parkSleepNs` with a 1ms-capped bound), so it always reads 0 here.
+// The audit compares nothing to the wait's bound: a producer that does not claim
+// an armed worker 0 is the defect whatever its deadline, and a bound comparison
+// would need worker 0's bound published after the claim state, which re-opens
+// the race this avoids.
+//
+// COST, producer side: `begin` is one seq-cst load of a cell `schedClaimPoller`
+// reads next anyway (same cache line), one AND and one compare; the common
+// not-armed answer returns there and `end` is one compare against 0. Worker
+// side: `schedPollerArm`/`schedPollerDisarm` each gained one load and two
+// ALU ops.
+let schedMissedWakes: [1]i64
+
+// Waits whose producer failed to claim an armed worker 0, process-wide.
+// `_tests_/bit/timerctl` reads it and the channel-timer stress programs fail
+// when it is not 0.
+export @nosplit @symbol("bit_rt_port_sched_timer_missed_wake") fn schedTimerMissedWake(): int {
+  return atomicLoad(ptrOf(schedMissedWakes))
+}
+
+// The armed value to hand `schedWakeAuditEnd`, or 0 when no wake is owed:
+// worker 0 is awake or already claimed, or no poller is bound. Call it AFTER
+// the producer's publish and BEFORE its wake attempt.
+@nosplit fn schedWakeAuditBegin(s: *i64): int {
+  let v = atomicLoad(s + scPollWait)
+  if ((v & pollWaitStateMask) != pollWaitArmed) {
+    return 0
+  }
+  if (*(s + scPollFd) <= 0) {
+    return 0
+  }
+  return v
+}
+
+// Call it AFTER the wake attempt, with `schedWakeAuditBegin`'s answer. Counts
+// one miss when the cell still holds exactly the armed value. It must sit
+// OUTSIDE the function it audits, or a wake that is deleted deletes its audit.
+@nosplit fn schedWakeAuditEnd(s: *i64, armed: int) {
+  if (armed == 0) {
+    return
+  }
+  if (atomicLoad(s + scPollWait) == armed) {
+    atomicAdd(ptrOf(schedMissedWakes), 1)
+  }
 }
 
 // Work is now reachable by another worker: wake exactly one parked worker.
