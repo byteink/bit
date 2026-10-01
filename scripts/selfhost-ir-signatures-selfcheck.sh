@@ -12,9 +12,9 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # Self-check: run directly (not sourced) to assert explainMismatch rejects
 # unrelated text on every kind. `types` alone currently carries a declared
 # signature, `6244-json-attr-implicit-insert` (see scripts/selfhost-ir-
-# signatures.sh's header); `ir`/`iropt`/`ast`/`fmt` carry none (see that
-# file's Retirement history), so every arm below under those four kinds
-# must always return 1.
+# signatures.sh's header); `ir`/`iropt`/`ast`/`fmt`/`diags`/`tokens` carry
+# none (see that file's Retirement history), so every arm below under those
+# kinds must always return 1.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -46,7 +46,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # this self-check; removed with the arms they tested rather than kept as
   # tests for identities that no longer exist. Git history at this file's
   # state before #5914/#5957/#6187/#6245 has them, and scripts/selfhost-ir-
-  # signatures.sh's own header records why each went dead.
+  # signatures.sh's own header records why each went dead. The eleven
+  # signatures declared for #6254, #6255, #6264, #6265, #6269, #6045 and
+  # #6363 were RETIRED by the stage0 0.34.0 repin (#6395), with their
+  # positive and rejection fixtures; only #6244 stays.
 
   # An unrelated opcode-shaped delta must NOT be explained by anything
   # declared under `ir`/`iropt` -- no signature is currently declared for
@@ -83,6 +86,15 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   rcfu=$?
   if [ "$rcfu" -eq 0 ] || [ -n "$sigfu" ]; then
     echo "FAIL: an unrelated fmt delta was wrongly explained (rc=$rcfu sig='$sigfu')"
+    fail=1
+  fi
+
+  # diags and tokens declare nothing since #6395: an unrelated divergence on
+  # either kind must stay unexplained.
+  sigdu=$(explainMismatch 'error[E0040]: undefined name' 'error[E0041]: other' diags)
+  sigtu=$(explainMismatch 'kw_from 20..24' 'ident 20..24' tokens)
+  if [ -n "$sigdu" ] || [ -n "$sigtu" ]; then
+    echo "FAIL: a diags/tokens delta was wrongly explained (diags='$sigdu' tokens='$sigtu')"
     fail=1
   fi
 
@@ -125,201 +137,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fail=1
   fi
 
-  # #6255-table-row-synth-reposition: POSITIVE, the run_sql_row_persisted.bit
-  # shape -- inserted @table static lines plus find<T>'s mapper lines moved
-  # to another column of the same synthesized line (once duplicated).
-  oracle_6255=$(printf '2:1: a: int\n76:110: cols: []string\n76:248: __row: User\n')
-  bit2_6255=$(printf '2:1: a: int\n9:14: User: ()\n76:203: cols: []string\n76:203: cols: []string\n76:226: __row: User\n')
-  sig6255=$(explainMismatch "$oracle_6255" "$bit2_6255" types)
-  rc6255=$?
-  if [ "$rc6255" -ne 0 ] || [ "$sig6255" != "6255-table-row-synth-reposition" ]; then
-    echo "FAIL: the #6255 synthesized-mapper reposition shape was not explained (rc=$rc6255 sig='$sig6255')"
+  # #6244: POSITIVE, the post-0.34.0 shape that keeps the signature alive,
+  # _tests_/imports/nsstaticcall/main.bit (#6388): the oracle types a static
+  # call through a namespace-qualified class as `<error>`, the tree as its
+  # real type, at the same `LINE:COL: <expr>` prefix.
+  oracle_6388=$(printf '8:5: m: Counter\n9:19: m.Counter.scaled(3, "abcd"): <error>\n')
+  bit2_6388=$(printf '8:5: m: Counter\n9:19: m.Counter.scaled(3, "abcd"): i64\n')
+  sig6388=$(explainMismatch "$oracle_6388" "$bit2_6388" types)
+  if [ "$sig6388" != "6244-json-attr-implicit-insert" ]; then
+    echo "FAIL: the <error>-to-concrete-type shape was not explained (sig='$sig6388')"
     fail=1
-  fi
-  # #6255: POSITIVE, an empty oracle dump (one empty line) against a module
-  # holding only a @table class (_tests_/cases/table_registry_lib/account.bit).
-  oracle_6255e=""
-  bit2_6255e=$(printf '4:21: Account: []string\n5:10: id: i64!\n9:242: __row: Account\n')
-  sig6255e=$(explainMismatch "$oracle_6255e" "$bit2_6255e" types)
-  rc6255e=$?
-  if [ "$rc6255e" -ne 0 ] || [ "$sig6255e" != "6255-table-row-synth-reposition" ]; then
-    echo "FAIL: the #6255 empty-oracle insertion shape was not explained (rc=$rc6255e sig='$sig6255e')"
-    fail=1
-  fi
-  # #6255: REJECTION -- same line, same column shift, but a DIFFERENT type.
-  oracle_6255r=$(printf '76:110: cols: []string\n')
-  bit2_6255r=$(printf '76:203: cols: []int\n')
-  sig6255r=$(explainMismatch "$oracle_6255r" "$bit2_6255r" types)
-  rc6255r=$?
-  if [ "$rc6255r" -eq 0 ] || [ -n "$sig6255r" ]; then
-    echo "FAIL: a #6255-shaped column shift with a changed type was wrongly explained (rc=$rc6255r sig='$sig6255r')"
-    fail=1
-  fi
-
-  # #6254-collection-attr-presyntax: POSITIVE, the 0.33.0 oracle's E0136
-  # block for `@collection` is its ONLY extra output; the tree says nothing.
-  oracle_6254=$(printf "error[E0136]: '@collection' is not an attribute a class accepts\n  --> m.bit:20:7\n   |\n20 | @json @collection(\"sessions\") class Session {\n   |       ^^^^^^^^^^^^^^^^^^^^^^^ '@json', '@table' are the class attributes\n")
-  sig6254=$(explainMismatch "$oracle_6254" "" diags)
-  rc6254=$?
-  if [ "$rc6254" -ne 0 ] || [ "$sig6254" != "6254-collection-attr-presyntax" ]; then
-    echo "FAIL: the #6254 @collection presyntax shape was not explained (rc=$rc6254 sig='$sig6254')"
-    fail=1
-  fi
-  # #6254: REJECTION -- the same E0136 block plus any other oracle-only
-  # diagnostic, or a tree-only diagnostic, fails closed.
-  oracle_6254r=$(printf "error[E0136]: '@collection' is not an attribute a class accepts\n  --> m.bit:20:7\nerror[E0040]: undefined name 'x'\n  --> m.bit:30:1\n")
-  sig6254r=$(explainMismatch "$oracle_6254r" "" diags)
-  rc6254r=$?
-  if [ "$rc6254r" -eq 0 ] || [ -n "$sig6254r" ]; then
-    echo "FAIL: an extra oracle-only diagnostic beside the #6254 block was wrongly explained (rc=$rc6254r sig='$sig6254r')"
-    fail=1
-  fi
-  sig6254t=$(explainMismatch "" "error[E0040]: undefined name 'x'" diags)
-  rc6254t=$?
-  if [ "$rc6254t" -eq 0 ] || [ -n "$sig6254t" ]; then
-    echo "FAIL: a tree-only diagnostic was wrongly explained as #6254 (rc=$rc6254t sig='$sig6254t')"
-    fail=1
-  fi
-
-  # #6264-from-contextual-token: POSITIVE and REJECTION.
-  s64t=$(explainMismatch "$(printf 'kw_import 0..6\nkw_from 20..24\n')" "$(printf 'kw_import 0..6\nident 20..24\n')" tokens)
-  if [ "$s64t" != "6264-from-contextual-token" ]; then
-    echo "FAIL: the #6264 kw_from/ident token shape was not explained (sig='$s64t')"; fail=1
-  fi
-  s64tr=$(explainMismatch "$(printf 'kw_from 20..24\n')" "$(printf 'ident 20..25\n')" tokens)
-  if [ -n "$s64tr" ]; then
-    echo "FAIL: a kw_from/ident pair with a different span was wrongly explained (sig='$s64tr')"; fail=1
-  fi
-  # #6264-from-contextual-diags: the renamed token, and a reserved-word block.
-  s64d=$(explainMismatch "error[E0021]: expected a top-level declaration, found kw_from" "error[E0021]: expected a top-level declaration, found an identifier" diags)
-  if [ "$s64d" != "6264-from-contextual-diags" ]; then
-    echo "FAIL: the #6264 renamed-token diagnostic was not explained (sig='$s64d')"; fail=1
-  fi
-  s64b=$(explainMismatch "$(printf "error[E0021]: 'from' is a reserved keyword\n  --> m.bit:10:3\n   |\n10 |   from: int,\n")" "" diags)
-  if [ "$s64b" != "6264-from-contextual-diags" ]; then
-    echo "FAIL: the #6264 reserved-from block was not explained (sig='$s64b')"; fail=1
-  fi
-  s64dr=$(explainMismatch "error[E0021]: expected a top-level declaration, found kw_from" "error[E0021]: expected an expression, found an identifier" diags)
-  if [ -n "$s64dr" ]; then
-    echo "FAIL: a #6264-shaped diagnostic with a changed message was wrongly explained (sig='$s64dr')"; fail=1
-  fi
-  # #6264-from-contextual-types: nameless oracle entry vs a typed `from`.
-  s64y=$(explainMismatch "1:1: : i64" "23:7: from: i64" types)
-  if [ "$s64y" != "6264-from-contextual-types" ]; then
-    echo "FAIL: the #6264 from binding types shape was not explained (sig='$s64y')"; fail=1
-  fi
-  s64yr=$(explainMismatch "1:1: : i64" "23:7: from: string" types)
-  if [ -n "$s64yr" ]; then
-    echo "FAIL: a #6264 from binding with a different type was wrongly explained (sig='$s64yr')"; fail=1
-  fi
-
-  # #6269-default-id-attr: POSITIVE (post-opt shape, one class) and REJECTION
-  # (the same block without the "id" string, and with an extra call).
-  o69='%1 = const_nil'
-  b69=$(printf '%%1 = rt_call slice_new(%%2, %%2, %%2, %%3) []AttrDesc\n%%4 = gc_alloc size=16 ptrs=[%%0] AttrDesc\n%%5 = const_string "id"\n%%6 = field_get %%1[0] i64\nindex_set %%6[%%7] = %%4\n%%8 = const_nil\n')
-  s69=$(explainMismatch "$o69" "$b69" iropt)
-  if [ "$s69" != "6269-default-id-attr" ]; then
-    echo "FAIL: the #6269 default-id attribute block was not explained (sig='$s69')"; fail=1
-  fi
-  b69r=$(printf '%%1 = rt_call slice_new(%%2, %%2, %%2, %%3) []AttrDesc\n%%4 = gc_alloc size=16 ptrs=[%%0] AttrDesc\n%%5 = const_string "id"\n%%6 = field_get %%1[0] i64\nindex_set %%6[%%7] = %%4\n%%8 = const_nil\n%%9 = rt_call print(%%5)\n')
-  s69r=$(explainMismatch "$o69" "$b69r" iropt)
-  if [ -n "$s69r" ]; then
-    echo "FAIL: a #6269-shaped block with an extra call was wrongly explained (sig='$s69r')"; fail=1
-  fi
-
-  # #6265-closure-bound-static-self (types) and -insert (ir, one file only).
-  s65=$(explainMismatch "46:12: apply(x, f): Self!" "46:12: apply(x, f): T!" types)
-  if [ "$s65" != "6265-closure-bound-static-self" ]; then
-    echo "FAIL: the #6265 Self-to-T shape was not explained (sig='$s65')"; fail=1
-  fi
-  s65r=$(explainMismatch "46:12: apply(x, f): Self!" "46:12: apply(x, f): U!" types)
-  if [ -n "$s65r" ]; then
-    echo "FAIL: a Self rebound to the wrong parameter was wrongly explained (sig='$s65r')"; fail=1
-  fi
-  o65=$(printf 'func main() void {\n  ret\n}\n')
-  b65=$(printf 'func main() void {\n  ret\n}\n\nfunc apply$0(%%0: i64) i64 {\n  ret %%0\n}\n')
-  s65i=$(explainMismatch "$o65" "$b65" ir "_tests_/cases/run_generic_closure_over_bound_self_static.bit")
-  if [ "$s65i" != "6265-closure-bound-static-insert" ]; then
-    echo "FAIL: the #6265 inserted-function shape was not explained (sig='$s65i')"; fail=1
-  fi
-  s65o=$(explainMismatch "$o65" "$b65" ir "_tests_/cases/some_other_file.bit")
-  if [ -n "$s65o" ]; then
-    echo "FAIL: the #6265 inserted-function shape was explained for a file it is not declared for (sig='$s65o')"; fail=1
-  fi
-  o45=$(printf 'func f$0() void {\n  ret\n}\n')
-  b45=$(printf 'func main$fallible() void {\n  ret\n}\n\nfunc f$0() void {\n  ret\n}\n')
-  s45=$(explainMismatch "$o45" "$b45" ir "_tests_/cases/run_closure_multival_return_generic_call.bit")
-  if [ "$s45" != "6045-closure-tuple-oracle-declines" ]; then
-    echo "FAIL: the #6045 dropped-function shape was not explained (sig='$s45')"; fail=1
-  fi
-  s45o=$(explainMismatch "$o45" "$b45" ir "_tests_/cases/some_other_file.bit")
-  if [ -n "$s45o" ]; then
-    echo "FAIL: the #6045 dropped-function shape was explained for a file it is not declared for (sig='$s45o')"; fail=1
-  fi
-  s45n=$(explainMismatch "$(printf 'func g$0() void {\n  ret\n}\n')" "$b45" ir "_tests_/cases/run_closure_multival_return_generic_call.bit")
-  if [ -n "$s45n" ]; then
-    echo "FAIL: an oracle function missing from the tree was wrongly explained as #6045 (sig='$s45n')"; fail=1
-  fi
-  b65c=$(printf 'func main() void {\n  %%1 = const_int i64 1\n  ret\n}\n\nfunc apply$0(%%0: i64) i64 {\n  ret %%0\n}\n')
-  s65c=$(explainMismatch "$o65" "$b65c" ir "_tests_/cases/run_generic_closure_over_bound_self_static.bit")
-  if [ -n "$s65c" ]; then
-    echo "FAIL: a changed existing function beside an inserted one was wrongly explained (sig='$s65c')"; fail=1
-  fi
-
-  # #6363-generic-ctor-type-args (types) and -oracle-declines (ir), both
-  # declared only for the two run_generic_class_init_* corpus files.
-  f63="_tests_/cases/run_generic_class_init_written_args.bit"
-  o63=$(printf '63:7: p: Pair\n63:11: Pair<i64, string>(7, "s"): Pair\n64:3: print(p.a): void\n')
-  b63=$(printf '63:7: p: Pair<i64, string>\n63:11: Pair<i64, string>(7, "s"): Pair<i64, string>\n64:3: print(p.a): void\n')
-  s63=$(explainMismatch "$o63" "$b63" types "$f63")
-  if [ "$s63" != "6363-generic-ctor-type-args" ]; then
-    echo "FAIL: the #6363 template-to-instantiation type shape was not explained (sig='$s63')"; fail=1
-  fi
-  s63o=$(explainMismatch "$o63" "$b63" types "_tests_/cases/some_other_file.bit")
-  if [ -n "$s63o" ]; then
-    echo "FAIL: the #6363 type shape was explained for a file it is not declared for (sig='$s63o')"; fail=1
-  fi
-  b63r=$(printf '63:7: p: Pair<i64, string>\n63:11: Pair<i64, string>(7, "s"): Pair<i64, string>\n64:3: print(p.a): i64\n')
-  s63r=$(explainMismatch "$o63" "$b63r" types "$f63")
-  if [ -n "$s63r" ]; then
-    echo "FAIL: a #6363-shaped diff with another type change was wrongly explained (sig='$s63r')"; fail=1
-  fi
-  b63n=$(printf '63:7: p: Other<i64, string>\n63:11: Pair<i64, string>(7, "s"): Pair<i64, string>\n64:3: print(p.a): void\n')
-  s63n=$(explainMismatch "$o63" "$b63n" types "$f63")
-  if [ -n "$s63n" ]; then
-    echo "FAIL: a template typed as a different class was wrongly explained as #6363 (sig='$s63n')"; fail=1
-  fi
-  b63t=$(printf '63:7: s: Pair<string, i64>\n63:11: mk(): Checked<string>!Bad\n')
-  s63t=$(explainMismatch "$(printf '63:7: s: Pair<B, A>\n63:11: mk(): Checked!Bad\n')" "$b63t" types "$f63")
-  if [ "$s63t" != "6363-generic-ctor-type-args" ]; then
-    echo "FAIL: the #6363 template-parameter and fallible shapes were not explained (sig='$s63t')"; fail=1
-  fi
-  fs65="_tests_/cases/run_generic_class_static_own.bit"
-  s65u=$(explainMismatch "$(printf '36:28: Plain.own(u = "a"): U\n38:12: Box<bool>.own(3): <error>\n')" "$(printf '36:28: Plain.own(u = "a"): string\n38:12: Box<bool>.own(3): i64\n')" types "$fs65")
-  if [ "$s65u" != "6363-generic-ctor-type-args" ]; then
-    echo "FAIL: the #6365 unsubstituted-parameter and oracle-error shapes were not explained (sig='$s65u')"; fail=1
-  fi
-  s65v=$(explainMismatch "$(printf '36:28: Plain.own(u = "a"): string\n')" "$(printf '36:28: Plain.own(u = "a"): i64\n')" types "$fs65")
-  if [ -n "$s65v" ]; then
-    echo "FAIL: a concrete oracle type changed to another was wrongly explained as #6363 (sig='$s65v')"; fail=1
-  fi
-  s63e=$(explainMismatch "$(printf '63:11: mk(): Checked!Bad\n')" "$(printf '63:11: mk(): Checked<string>!Other\n')" types "$f63")
-  if [ -n "$s63e" ]; then
-    echo "FAIL: a #6363-shaped type with a changed error type was wrongly explained (sig='$s63e')"; fail=1
-  fi
-  o63i=$(printf 'func init$t93(%%0: Pair, %%1: i64) void {\n  ret\n}\n')
-  b63i=$(printf 'func main$fallible() void {\n  ret\n}\n\nfunc init$t108(%%0: Pair, %%1: i64) void {\n  ret\n}\n')
-  s63i=$(explainMismatch "$o63i" "$b63i" ir "$f63")
-  if [ "$s63i" != "6363-generic-ctor-oracle-declines" ]; then
-    echo "FAIL: the #6363 oracle-declines shape (renumbered instantiation) was not explained (sig='$s63i')"; fail=1
-  fi
-  s63m=$(explainMismatch "$(printf 'func init$t93(%%0: Pair, %%1: bool) void {\n  ret\n}\n')" "$b63i" ir "$f63")
-  if [ -n "$s63m" ]; then
-    echo "FAIL: an oracle instantiation missing from the tree was wrongly explained as #6363 (sig='$s63m')"; fail=1
-  fi
-  s63x=$(explainMismatch "$o63i" "$b63i" ir "_tests_/cases/some_other_file.bit")
-  if [ -n "$s63x" ]; then
-    echo "FAIL: the #6363 oracle-declines shape was explained for a file it is not declared for (sig='$s63x')"; fail=1
   fi
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
