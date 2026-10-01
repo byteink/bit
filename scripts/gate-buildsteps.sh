@@ -442,7 +442,10 @@ case "${BUCKET}" in
     # test-fmt-cases (#4447) declares BIT_FMTZERO_TREES=cases:_tests_/cases —
     # this bucket's own tree, by name — so a _tests_/cases/**-only change
     # owes it the same way it owes test-golden/test-fuzz above.
-    BUILD_STEPS=(test-golden test-fuzz test-fmt-cases)
+    #
+    # test-golden-ifchain (#5926) is the same corpus under BIT_IF_BRANCHCHAIN=1:
+    # a new `// ir` case whose `if` has `&&` / `||` needs its `.ifchain.expected`.
+    BUILD_STEPS=(test-golden test-golden-ifchain test-fuzz test-fmt-cases)
     ;;
   examples)
     # test-fmt's argv literally includes "${repoRoot()}/examples" alongside

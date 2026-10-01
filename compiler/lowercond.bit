@@ -3,7 +3,7 @@
 // both files under the 800-line lint limit. Sibling of lower.bit: same
 // module, so this needs no imports and no call-site changes. Unary and
 // relational operators, interface coercion, `&&`/`||` short-circuiting,
-// and `if`.
+// and `if` with its branch-chain condition (#5926).
 
 // A concrete value flowing into an interface-typed slot is relabelled to the
 // interface via `convert` (the pointer is unchanged; SPEC §14.3). `valTy` is the
@@ -376,6 +376,119 @@ fn lowerConditional(fc: FnCtx, node: int, hint: int): int {
   return builderAddParam(fc.b, ty)
 }
 
+// The open exits of a condition lowered by `lowerCondBr` (#5926): indices into
+// `fc.b.instrs` of the `br`s whose THEN edge still has to reach the condition's
+// true target (`trues`) and whose ELSE edge its false target (`falses`).
+class CondExits {
+  trues: []int,
+  falses: []int,
+}
+
+// Lowers an `if` condition as a branch chain: `a && b` / `a || b` become one
+// `br` per operand, so each compare feeds its own branch and #4393 fuses it
+// into the jump. `lowerShortCircuit` (the value form, kept for every other
+// position) instead joins a bool block param that the if then tests with a
+// second `br`, which leaves a compare whose only use is a block argument.
+// Evaluation order is unchanged and the rhs is lowered in its own block,
+// reached only on the edge where the lhs does not decide the result.
+//
+// The exits are returned open and patched by `patchCondExits` once the if has
+// created its then/join/else blocks, AFTER the condition is lowered. That keeps
+// the block numbering `lowerShortCircuit` gave: every block the condition
+// mints (the rhs block, a bounds check's panic and continuation) is numbered
+// below the arms, so no edge out of the condition points at a lower index.
+// `isBackEdge` reads indices, and such an edge would gain a safepoint poll.
+//
+// With `BIT_IF_BRANCHCHAIN` off every condition takes the leaf path below,
+// one `lowerExpr` and one `br`, which is the IR `lowerIf` emitted before.
+fn lowerCondBr(fc: FnCtx, node: int): CondExits {
+  let n = getNode(fc.c.tree, node)
+  let chain = n.tag == Tag.Binary && (n.main == int(Kind.AmpAmp) || n.main == int(Kind.PipePipe))
+  if (chain && ifBranchChainEnabled()) {
+    return lowerCondChain(fc, node, n.main == int(Kind.AmpAmp))
+  }
+  let exits = CondExits{ trues = []int(0), falses = []int(0) }
+  let cond = lowerExpr(fc, node)
+  if (fc.failed) {
+    return exits
+  }
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = -1
+  br.ival2 = -1
+  let at = builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  exits.trues = [at]
+  exits.falses = [at]
+  return exits
+}
+
+// Whether `lowerCondBr` lowers `&&` / `||` as a branch chain (#5926). Default
+// OFF: it changes the IR of every `if` whose condition has `&&` or `||`
+// against the pinned stage0 0.34.0, so it lands dark until the next repin
+// flips the default; this predicate and the leaf-only arm it selects are
+// deleted one release after that. TEMPORARY.
+fn ifBranchChainEnabled(): bool {
+  return envOr("BIT_IF_BRANCHCHAIN", "") == "1"
+}
+
+// The `&&` / `||` arm of `lowerCondBr`. For `a && b` the lhs's true exits open
+// the rhs block and its false exits are the whole condition's; `a || b` is the
+// mirror image.
+fn lowerCondChain(fc: FnCtx, node: int, isAnd: bool): CondExits {
+  let k = kidsOf(fc.c.tree, node)
+  let lhs = lowerCondBr(fc, k[0])
+  if (fc.failed) {
+    return lhs
+  }
+  let rhsBlk = builderNewBlock(fc.b)
+  if (isAnd) {
+    patchCondExits(fc, lhs.trues, true, rhsBlk, []int(0))
+  } else {
+    patchCondExits(fc, lhs.falses, false, rhsBlk, []int(0))
+  }
+  builderBeginBlock(fc.b, rhsBlk)
+  let rhs = lowerCondBr(fc, k[1])
+  if (isAnd) {
+    rhs.falses = concatInts(lhs.falses, rhs.falses)
+  } else {
+    rhs.trues = concatInts(lhs.trues, rhs.trues)
+  }
+  return rhs
+}
+
+// Points one side of each `br` in `brs` at `target` with `args`. Every `br`
+// gets its own copy of `args`, so no two instructions share an argument array.
+fn patchCondExits(fc: FnCtx, brs: []int, thenSide: bool, target: int, args: []int) {
+  let i = 0
+  while (i < len(brs)) {
+    let br = fc.b.instrs[brs[i]]
+    if (thenSide) {
+      br.ival = target
+      br.thenArgs = concatInts(args, []int(0))
+    } else {
+      br.ival2 = target
+      br.elseArgs = concatInts(args, []int(0))
+    }
+    i = i + 1
+  }
+}
+
+// A fresh array holding `a` followed by `b`; neither input is aliased.
+fn concatInts(a: []int, b: []int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(a) + len(b)) {
+    if (i < len(a)) {
+      out = append(out, a[i])
+    } else {
+      out = append(out, b[i - len(a)])
+    }
+    i = i + 1
+  }
+  return out
+}
+
 // Lowers an `if (cond) then [else]` to br + then/else/join blocks, threading the
 // live locals (env[0..preLen]) as join-block parameters — the seed's lowerIf.
 // The join block is left open for the following statements.
@@ -383,7 +496,7 @@ fn lowerIf(fc: FnCtx, node: int) {
   // #5670: only one arm runs (lowerkeepalive.bit's banner).
   clearPtrOfBindings(fc)
   let k = kidsOf(fc.c.tree, node)
-  let cond = lowerExpr(fc, k[0])
+  let exits = lowerCondBr(fc, k[0])
   if (fc.failed) {
     return
   }
@@ -396,20 +509,15 @@ fn lowerIf(fc: FnCtx, node: int) {
   if (hasElse) {
     elseBlk = builderNewBlock(fc.b)
   }
-  // Branch: then edge carries no args; a missing else sends the fall-through
-  // edge to the join with the live locals.
-  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
-  br.lhs = cond
-  br.ival = thenBlk
-  br.thenArgs = []int(0)
-  br.ival2 = elseBlk
-  if (hasElse) {
-    br.elseArgs = []int(0)
-  } else {
-    br.elseArgs = orig
+  // Then edges carry no args; a missing else sends every false edge to the join
+  // with the live locals. A condition assigns no local, so the one snapshot is
+  // the right value on each of those edges.
+  let elseArgs = []int(0)
+  if (!hasElse) {
+    elseArgs = orig
   }
-  builderEmit(fc.b, br)
-  builderEndBlock(fc.b)
+  patchCondExits(fc, exits.trues, true, thenBlk, []int(0))
+  patchCondExits(fc, exits.falses, false, elseBlk, elseArgs)
 
   builderBeginBlock(fc.b, thenBlk)
   fc.terminated = false
