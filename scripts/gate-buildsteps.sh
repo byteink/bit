@@ -341,7 +341,10 @@ case "${BUCKET}" in
     # asks `bit check` and `bit build` the same question, so a compiler/** diff
     # that lets the checker accept what lowering cannot emit is exactly what it
     # catches.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes)
+    # test-fmt-prec-matrix (#6417): every expression slot x form, parenthesized
+    # or not, formatted: `bit fmt` must keep the tree and reach its fixpoint, so
+    # a compiler/** diff in the formatter's paren decisions is what it catches.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes test-fmt-prec-matrix)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did

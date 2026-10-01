@@ -1,0 +1,447 @@
+// #6417. `bit fmt` drew its parentheses from a child's tag alone and turned
+// `f(1) catch (0 > 1 ? 11 : 9)` into `f(1) catch 0 > 1 ? 11 : 9`, which parses
+// as `(f(1) catch 0) > 1 ? 11 : 9`: the formatted program computed something
+// else and exited 0. test-fmt-roundtrip already demands `--dump-ast` survive
+// formatting, but its corpus had no file of that shape.
+//
+// This harness generates the shapes. For every expression slot x every
+// expression form x parenthesized or not x short or overflowing operands
+// (cells.bit) it writes one function into $TMPDIR, groups the functions of one
+// slot into one file, and requires of each cell
+//   1. `bit --dump-ast` of the formatted function equals that of the source, and
+//   2. a second `bit fmt` pass changes nothing (the one-pass fixpoint, #4752).
+// A source `bit fmt` refuses to parse is not a cell of the matrix: it is counted
+// and reported, and a slot whose plain-identifier control does not parse fails
+// the run, so a mistyped template cannot read as all agree.
+//
+// known.bit lists the cells that still disagree, each with its ticket, asserted
+// both ways. Prints `<agree> of <judged> cells agree ...` with the denominator.
+//
+// BIT_SELF_EXE is the compiler under test. Run from the repository root:
+//     BIT_SELF_EXE=./bit-out/bin/bit ./bit-out/bin/bit run _tests_/bit/fmtprecmatrix
+import { env, envOr, exit } from "std/os"
+import { mkdir, readFile, writeFile } from "std/fs"
+import { contains, hasPrefix, hasSuffix, parseInt, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+const defaultTimeoutS: int = 600
+const parallelism: int = 6
+const minCells: int = 5000
+const shown: int = 6
+
+// One run's exit codes: `--dump-ast` of the source, `bit fmt`, `--dump-ast` of
+// the formatted file, the second `bit fmt`.
+class Run {
+  group: string,
+  dumpSrc: int,
+  fmt: int,
+  dumpFmt: int,
+  fmtAgain: int,
+}
+
+// A run directory: its name and the cells its file holds, in file order.
+class Batch {
+  name: string,
+  cells: []Cell,
+}
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (len(v) == 0) {
+    panic("fmtprecmatrix: ${name} is required and was not set")
+  }
+  if (contains(v, "'")) {
+    panic("fmtprecmatrix: ${name} holds a single quote, which the generated shell cannot carry")
+  }
+  return v
+}
+
+fn requiredTmp(): string {
+  let t = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(t, "/")) {
+    return t[0:len(t) - 1]
+  }
+  return t
+}
+
+fn makeDir(dir: string) {
+  mkdir(dir) catch e {
+    panic("fmtprecmatrix: cannot create ${dir}: ${e.message()}")
+  }
+}
+
+fn put(path: string, text: string) {
+  writeFile(path, text) catch e {
+    panic("fmtprecmatrix: cannot write ${path}: ${e.message()}")
+  }
+}
+
+fn slurp(path: string): string {
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
+fn intOr(s: string): int {
+  return parseInt(s) catch _ {
+    -2
+  }
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status.
+fn shell(scriptPath: string, script: string, ms: int): int {
+  put(scriptPath, script)
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    panic("fmtprecmatrix: cannot make ${scriptPath} executable")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("fmtprecmatrix: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("fmtprecmatrix: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("fmtprecmatrix: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The batches of one file per slot-and-width group, in first-seen order.
+fn groupBatches(all: []Cell): []Batch {
+  let out = []Batch(0)
+  let at = map<string, int>{}
+  for c of all {
+    let (idx, seen) = at[c.group]
+    if (!seen) {
+      idx = len(out)
+      at[c.group] = idx
+      out = append(out, Batch{ name = c.group, cells = []Cell(0) })
+    }
+    out[idx].cells = append(out[idx].cells, c)
+  }
+  return out
+}
+
+fn fileText(b: Batch): string {
+  let s = ""
+  for c of b.cells {
+    s = s + c.src
+  }
+  return s
+}
+
+fn writeBatches(work: string, bs: []Batch) {
+  for b of bs {
+    makeDir("${work}/${b.name}")
+    put("${work}/${b.name}/in.bit", fileText(b))
+    put("${work}/ids.txt", slurp("${work}/ids.txt") + b.name + "\n")
+  }
+}
+
+// One script runs one batch directory: dump the source, format a copy, dump it,
+// format it again, and append `<dir> <four exit codes>`.
+fn batchScript(bit: string, work: string): string {
+  let s = "#!/bin/sh\ng=\"$1\"\nd='${work}/'\"$g\"\ncp \"$d/in.bit\" \"$d/f1.bit\"\n"
+  s = s + "'${bit}' --dump-ast \"$d/in.bit\" > \"$d/in.ast\" 2> \"$d/in.err\"\na=$?\n"
+  s = s + "'${bit}' fmt \"$d/f1.bit\" > \"$d/fmt1.log\" 2>&1\nf=$?\n"
+  s = s + "'${bit}' --dump-ast \"$d/f1.bit\" > \"$d/f1.ast\" 2> \"$d/f1.err\"\nb=$?\n"
+  s = s + "cp \"$d/f1.bit\" \"$d/f2.bit\"\n"
+  s = s + "'${bit}' fmt \"$d/f2.bit\" > \"$d/fmt2.log\" 2>&1\nc=$?\n"
+  return s +
+    "printf '%s %s %s %s %s\\n' \"$g\" \"$a\" \"$f\" \"$b\" \"$c\" >> '${work}/results.txt'\n"
+}
+
+fn runBatches(bit: string, work: string, bs: []Batch, ms: int) {
+  put("${work}/ids.txt", "")
+  writeBatches(work, bs)
+  put("${work}/results.txt", "")
+  put("${work}/one.sh", batchScript(bit, work))
+  let all = "#!/bin/sh\nxargs -n1 -P${parallelism} sh '${work}/one.sh' < '${work}/ids.txt'\n"
+  let rc = shell("${work}/run.sh", all, ms)
+  if (rc != 0) {
+    panic("fmtprecmatrix: the fan-out exited ${rc}")
+  }
+}
+
+fn readRuns(work: string): []Run {
+  let out = []Run(0)
+  for line of split(slurp("${work}/results.txt"), "\n") {
+    let p = split(line, " ")
+    if (len(p) != 5) {
+      continue
+    }
+    out = append(
+      out,
+      Run{
+        group = p[0],
+        dumpSrc = intOr(p[1]),
+        fmt = intOr(p[2]),
+        dumpFmt = intOr(p[3]),
+        fmtAgain = intOr(p[4]),
+      },
+    )
+  }
+  return out
+}
+
+fn findRun(rs: []Run, name: string): Run {
+  for r of rs {
+    if (r.group == name) {
+      return r
+    }
+  }
+  panic("fmtprecmatrix: ${name} produced no result line")
+}
+
+// The text of each cell in a dump or a formatted file, keyed by position: the
+// file is `fn f<k>() {...}` per cell, the dump `(func_decl _ f<k> ...)`.
+fn splitBy(text: string, sep: string): []string {
+  let parts = split(text, sep)
+  if (len(parts) == 0) {
+    return parts
+  }
+  return parts[1:len(parts)]
+}
+
+// The piece whose text opens with `name `, or "" when the file has none.
+fn pieceOf(pieces: []string, name: string): string {
+  for p of pieces {
+    if (hasPrefix(p, "${name} ") || hasPrefix(p, "${name}(")) {
+      return p
+    }
+  }
+  return ""
+}
+
+// Every cell of a batch that `bit fmt` accepted, judged from the four files the
+// script left. "" when the cell agrees, else why not, with both texts.
+class Verdict {
+  id: string,
+  why: string,
+}
+
+fn judgeBatch(work: string, b: Batch): []Verdict {
+  let d = "${work}/${b.name}"
+  let astIn = splitBy(slurp("${d}/in.ast"), "(func_decl _ ")
+  let astOut = splitBy(slurp("${d}/f1.ast"), "(func_decl _ ")
+  let fmt1 = splitBy("\n" + slurp("${d}/f1.bit"), "\nfn ")
+  let fmt2 = splitBy("\n" + slurp("${d}/f2.bit"), "\nfn ")
+  let out = []Verdict(0)
+  for c of b.cells {
+    out = append(out, Verdict{ id = c.id, why = judgeCell(c, astIn, astOut, fmt1, fmt2) })
+  }
+  return out
+}
+
+fn judgeCell(c: Cell, astIn: []string, astOut: []string, fmt1: []string, fmt2: []string): string {
+  let before = pieceOf(astIn, c.func)
+  let after = pieceOf(astOut, c.func)
+  let once = pieceOf(fmt1, c.func)
+  let twice = pieceOf(fmt2, c.func)
+  if (before == "" || after == "" || once == "") {
+    return "the function vanished from the dump or the formatted file\n    source:    ${c.src}"
+  }
+  if (before != after) {
+    return "the formatter changed the tree\n    source:    ${firstLine(c.src)}\n    formatted: ${firstLine(once)}\n    before:    ${before}\n    after:     ${after}"
+  }
+  if (once != twice) {
+    return "a second pass changes it\n    pass 1: ${once}\n    pass 2: ${twice}"
+  }
+  return ""
+}
+
+fn firstLine(text: string): string {
+  let lines = split(text, "\n")
+  if (len(lines) > 1) {
+    return lines[1]
+  }
+  return text
+}
+
+// The batch's own failure: `bit fmt` or the dump of its output went wrong.
+fn runFailure(r: Run): string {
+  if (r.dumpFmt != 0) {
+    return "--dump-ast of the formatted file exited ${r.dumpFmt}"
+  }
+  if (r.fmtAgain != 0) {
+    return "the second bit fmt exited ${r.fmtAgain}"
+  }
+  return ""
+}
+
+// The two halves of a batch, named after it so a directory is never reused.
+fn halves(b: Batch): []Batch {
+  let mid = len(b.cells) / 2
+  return [
+    Batch{ name = "${b.name}a", cells = b.cells[0:mid] },
+    Batch{ name = "${b.name}b", cells = b.cells[mid:len(b.cells)] },
+  ]
+}
+
+// Judges `bs`; a batch whose `bit fmt` was refused, or whose output did not
+// parse, is returned in `refused`: the caller halves it until one cell is left.
+class Judged {
+  verdicts: []Verdict,
+  refused: []Batch,
+}
+
+fn judgeRuns(work: string, bs: []Batch, rs: []Run): Judged {
+  let j = Judged{ verdicts = []Verdict(0), refused = []Batch(0) }
+  for b of bs {
+    let r = findRun(rs, b.name)
+    if (r.fmt != 0) {
+      j.refused = append(j.refused, b)
+      continue
+    }
+    let why = runFailure(r)
+    if (why != "" && len(b.cells) > 1) {
+      j.refused = append(j.refused, b)
+      continue
+    }
+    if (why != "") {
+      j.verdicts = append(
+        j.verdicts,
+        Verdict{
+          id = b.cells[0].id,
+          why = "${why}\n    source:    ${firstLine(b.cells[0].src)}\n    formatted:\n${slurp("${work}/${b.name}/f1.bit")}",
+        },
+      )
+      continue
+    }
+    j.verdicts = append(j.verdicts, ...judgeBatch(work, b))
+  }
+  return j
+}
+
+fn controlCell(c: Cell): bool {
+  return hasSuffix(c.id, "/ident/u/n")
+}
+
+fn knownTicket(id: string): string {
+  for k of knownFailures() {
+    if (k.id == id) {
+      return k.ticket
+    }
+  }
+  return ""
+}
+
+fn assertKnownListed(all: []Cell) {
+  for k of knownFailures() {
+    let found = false
+    for c of all {
+      if (c.id == k.id) {
+        found = true
+      }
+    }
+    if (!found) {
+      panic("fmtprecmatrix: ${k.id} (${k.ticket}) is on the known-failure list but is no cell of the table; delete it from the list")
+    }
+  }
+}
+
+// A control cell (the plain identifier in a slot) that `bit fmt` refuses means
+// the slot's template does not parse at all.
+fn assertControlsParse(refused: []Batch) {
+  for b of refused {
+    for c of b.cells {
+      if (controlCell(c)) {
+        panic("fmtprecmatrix: the slot ${c.id} does not parse; its template is wrong:\n${c.src}")
+      }
+    }
+  }
+}
+
+class Tally {
+  agree: int,
+  known: int,
+  fresh: int,
+}
+
+fn tally(vs: []Verdict): Tally {
+  let t = Tally{ agree = 0, known = 0, fresh = 0 }
+  for v of vs {
+    let ticket = knownTicket(v.id)
+    if (v.why == "" && ticket != "") {
+      eprint("fmtprecmatrix: FAIL ${v.id}: agrees now, but is on the known-failure list as ${ticket}; delete it from the list\n")
+      t.fresh = t.fresh + 1
+    } else if (v.why != "" && ticket == "") {
+      eprint("fmtprecmatrix: FAIL ${v.id}: ${v.why}\n")
+      t.fresh = t.fresh + 1
+    } else if (v.why != "") {
+      t.known = t.known + 1
+    } else {
+      t.agree = t.agree + 1
+    }
+  }
+  return t
+}
+
+// Only on a pass: a failing run keeps every file to read.
+fn removeWork(work: string, ms: int) {
+  if (!contains(work, "/fmtprecmatrix-")) {
+    panic("fmtprecmatrix: refusing to remove ${work}")
+  }
+  if (shell("${work}.rm.sh", "#!/bin/sh\nrm -rf '${work}' '${work}.rm.sh'\n", ms) != 0) {
+    eprint("fmtprecmatrix: could not remove ${work}\n")
+  }
+}
+
+fn main() {
+  let bit = requiredEnv("BIT_SELF_EXE")
+  let work = "${requiredTmp()}/fmtprecmatrix-${uuidFormat(uuidV4())}"
+  let all = cells()
+  if (len(all) < minCells) {
+    panic("fmtprecmatrix: only ${len(all)} cells, under the ${minCells} floor; a table lost a row")
+  }
+  assertKnownListed(all)
+  makeDir(work)
+  let first = groupBatches(all)
+  runBatches(bit, work, first, timeoutMs())
+  let j = judgeRuns(work, first, readRuns(work))
+  // A refused batch is halved and rerun until the cells whose OWN source does
+  // not parse stand alone: only those are skipped, never their neighbours.
+  let verdicts = j.verdicts
+  let pending = j.refused
+  let skipped = 0
+  while (len(pending) > 0) {
+    let next = []Batch(0)
+    for b of pending {
+      if (len(b.cells) == 1) {
+        assertControlsParse([b])
+        skipped = skipped + 1
+      } else {
+        next = append(next, ...halves(b))
+      }
+    }
+    pending = []Batch(0)
+    if (len(next) > 0) {
+      runBatches(bit, work, next, timeoutMs())
+      let jn = judgeRuns(work, next, readRuns(work))
+      verdicts = append(verdicts, ...jn.verdicts)
+      pending = jn.refused
+    }
+  }
+  let t = tally(verdicts)
+  if (len(verdicts) + skipped != len(all)) {
+    panic("fmtprecmatrix: ${len(verdicts)} judged + ${skipped} skipped != ${len(all)} generated")
+  }
+  if (t.fresh > 0) {
+    eprint("fmtprecmatrix: FAIL -- ${t.fresh} of ${len(verdicts)} judged cells disagree off the list; files in ${work}\n")
+    exit(1)
+  }
+  println("fmtprecmatrix: PASS -- ${t.agree} of ${len(verdicts)} judged cells agree, ${t.known} on the known-failure list, ${skipped} of ${len(all)} generated sources not parseable and skipped")
+  removeWork(work, timeoutMs())
+}
