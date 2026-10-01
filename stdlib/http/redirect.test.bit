@@ -1,0 +1,683 @@
+// stdlib/http/redirect.test.bit — redirect following (#6443, redirect.bit).
+//
+// Every network test runs two real local servers, A and B, on two ports of
+// 127.0.0.1, and records what each one SAW (the raw request header block, the
+// method, the body): "B never sees the token" is read off B's own log, not
+// inferred from the client. `Server`, `Request`, `Response`, `serve`,
+// `listenAndServeOn`, `respond`, `ok`, `header`, `newClient`, `newClientTls`,
+// `get`, `indexOf`, `itoa`, `toLower`, `Header`, `Url` and `resolveLocation`
+// are module siblings (SPEC §19); the TLS fixtures are tls.test.bit's.
+
+// What one server saw, one entry per request.
+class Seen {
+  raws: []string,
+  methods: []string,
+  paths: []string,
+  bodies: []string,
+}
+
+fn newSeen(): Seen {
+  return Seen{
+    raws = []string(0),
+    methods = []string(0),
+    paths = []string(0),
+    bodies = []string(0),
+  }
+}
+
+fn note(s: Seen, req: Request) {
+  s.raws = append(s.raws, toLower(req.headers))
+  s.methods = append(s.methods, req.method)
+  s.paths = append(s.paths, req.path)
+  s.bodies = append(s.bodies, req.body)
+}
+
+fn count(s: Seen): int {
+  return len(s.paths)
+}
+
+class Rig {
+  sa: Server
+  sb: Server
+  pa: int
+  pb: int
+  a: Seen
+  b: Seen
+
+  stop() {
+    this.sa.close()
+    this.sb.close()
+  }
+}
+
+fn bgServe(s: Server, h: (Request) => Response) {
+  listenAndServeOn(s, h) catch _ {
+    return
+  }
+}
+
+// A 3xx response pointing at `loc`.
+fn moved(status: int, loc: string): Response {
+  let r = respond(status, "moved")
+  r.headers = r.headers + "Location: ${loc}\r\n"
+  return r
+}
+
+// Starts A and B. Each handler gets the request and the rig, so it can name
+// the other server's port in a Location.
+fn startRig(ha: (Request, Rig) => Response, hb: (Request, Rig) => Response): Rig! {
+  let sa = serve("127.0.0.1", 0)?
+  let sb = serve("127.0.0.1", 0)?
+  let rig = Rig{
+    sa = sa,
+    sb = sb,
+    pa = sa.port()?,
+    pb = sb.port()?,
+    a = newSeen(),
+    b = newSeen(),
+  }
+  spawn bgServe(sa, (req) => {
+    note(rig.a, req)
+    return ha(req, rig)
+  })
+  spawn bgServe(sb, (req) => {
+    note(rig.b, req)
+    return hb(req, rig)
+  })
+  return rig
+}
+
+fn boot(ha: (Request, Rig) => Response, hb: (Request, Rig) => Response): Rig {
+  return startRig(ha, hb) catch e {
+    panic("startRig: ${e.message()}")
+  }
+}
+
+fn finalOk(req: Request, rig: Rig): Response {
+  return ok("final ${req.path}")
+}
+
+// A: /start goes to B's /final (another PORT, same host). B answers.
+fn startToB(req: Request, rig: Rig): Response {
+  if (req.path == "/start") {
+    return moved(302, "http://127.0.0.1:${itoa(rig.pb)}/final")
+  }
+  return ok("A ${req.path}")
+}
+
+fn secretClient(): Client {
+  let c = newClient()
+  c.setHeader("Authorization", "Bearer s3cret") catch _ {}
+  c.setHeader("Cookie", "sid=abc") catch _ {}
+  c.setHeader("Proxy-Authorization", "Basic cHJveHk=") catch _ {}
+  c.setHeader("WWW-Authenticate", "Basic realm=x") catch _ {}
+  c.setHeader("X-Plain", "keep-me") catch _ {}
+  return c
+}
+
+fn noCredentials(raw: string): bool {
+  return indexOf(raw, "authorization") < 0 &&
+    indexOf(raw, "cookie") < 0 &&
+    indexOf(raw, "www-authenticate") < 0
+}
+
+test "a same-origin redirect is followed, keeps the credentials, and reports the final URL" {
+  let rig = boot(
+    (req, r) => {
+      if (req.path == "/start") {
+        return moved(302, "/final")
+      }
+      return ok("final ${req.path}")
+    },
+    finalOk,
+  )
+  let res = secretClient().get("http://127.0.0.1:${itoa(rig.pa)}/start") catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(res.status == 200 && res.body == "final /final", "got ${itoa(res.status)} '${res.body}'")
+  assert(res.url == "http://127.0.0.1:${itoa(rig.pa)}/final", "url = ${res.url}")
+  assert(res.redirects == 1, "redirects = ${itoa(res.redirects)}")
+  assert(
+    count(rig.a) == 2 && count(rig.b) == 0,
+    "A saw ${itoa(count(rig.a))}, B ${itoa(count(rig.b))}",
+  )
+  assert(
+    indexOf(rig.a.raws[1], "authorization: bearer s3cret") >= 0,
+    "same-origin hop lost Authorization",
+  )
+  assert(indexOf(rig.a.raws[1], "x-plain: keep-me") >= 0, "same-origin hop lost a plain header")
+}
+
+test "a response that is not a redirect carries its own URL and zero hops" {
+  let rig = boot(finalOk, finalOk)
+  let url = "http://127.0.0.1:${itoa(rig.pa)}/plain"
+  let res = get(url) catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(res.url == url && res.redirects == 0, "url = ${res.url}, hops = ${itoa(res.redirects)}")
+}
+
+test "a cross-port redirect never shows server B any credential, setHeader defaults included" {
+  let rig = boot(startToB, finalOk)
+  let res = secretClient().get("http://127.0.0.1:${itoa(rig.pa)}/start") catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(res.status == 200 && res.body == "final /final", "got ${itoa(res.status)} '${res.body}'")
+  assert(count(rig.b) == 1, "B saw ${itoa(count(rig.b))} requests")
+  assert(noCredentials(rig.b.raws[0]), "B saw credentials:\n${rig.b.raws[0]}")
+  assert(indexOf(rig.b.raws[0], "proxy-authorization") < 0, "B saw Proxy-Authorization")
+  assert(
+    indexOf(rig.b.raws[0], "x-plain: keep-me") >= 0,
+    "a non-credential default header was dropped",
+  )
+  assert(indexOf(rig.a.raws[0], "authorization: bearer s3cret") >= 0, "A did not get the token")
+}
+
+test "a per-call credential header is stripped across ports as well" {
+  let rig = boot(startToB, finalOk)
+  let hs = [Header{ name = "Authorization", value = "Bearer call" }]
+  let res = newClient().requestWith("GET", "http://127.0.0.1:${itoa(rig.pa)}/start", hs, "") catch e {
+    rig.stop()
+    assert(false, "requestWith: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(res.status == 200, "status ${itoa(res.status)}")
+  assert(noCredentials(rig.b.raws[0]), "B saw credentials:\n${rig.b.raws[0]}")
+}
+
+// std/net dials dotted-quad literals only (net.bit), so a second HOST that
+// reaches a local server does not exist on every platform; the host change is
+// proven on `planHop`, the one place the strip decision is made, with the
+// port-change and return-to-origin cases above covering the wire.
+fn planFor(from: Url, loc: string): Hop {
+  let res = respond(302, "")
+  res.headers = "Location: ${loc}\r\n"
+  let block = "Authorization: a\r\nCookie: b\r\nX-Plain: 1\r\n"
+  let extras = newRequestExtras(defaultClientConfig(), block)
+  return planHop(res, from, "GET", "", extras) catch e {
+    panic("planHop: ${e.message()}")
+  }
+}
+
+test "a cross-host redirect strips the credentials, a same-host one keeps them" {
+  let from = Url{ host = "a.example", port = 80, path = "/x", https = false, h3 = false }
+  let other = planFor(from, "http://b.example/y")
+  assert(other.ok && other.url.host == "b.example", "no hop to b.example")
+  assert(noCredentials(toLower(other.extras.block)), "b.example got:\n${other.extras.block}")
+  assert(other.extras.block == "X-Plain: 1\r\n", "block = '${other.extras.block}'")
+  let same = planFor(from, "http://A.example/y")
+  assert(
+    same.ok && same.extras.block == "Authorization: a\r\nCookie: b\r\nX-Plain: 1\r\n",
+    "same host lost headers",
+  )
+  let scheme = planFor(from, "https://a.example/y")
+  assert(scheme.ok && scheme.extras.block == "X-Plain: 1\r\n", "a scheme change kept credentials")
+  let port = planFor(from, "http://a.example:8080/y")
+  assert(port.ok && port.extras.block == "X-Plain: 1\r\n", "a port change kept credentials")
+}
+
+test "credentials stripped on a hop are not restored by a later hop back to the origin" {
+  let rig = boot(
+    (req, r) => {
+      if (req.path == "/start") {
+        return moved(302, "http://127.0.0.1:${itoa(r.pb)}/hop")
+      }
+      return ok("A ${req.path}")
+    },
+    (req, r) => {
+      return moved(302, "http://127.0.0.1:${itoa(r.pa)}/back")
+    },
+  )
+  let res = secretClient().get("http://127.0.0.1:${itoa(rig.pa)}/start") catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(
+    res.status == 200 && res.redirects == 2,
+    "status ${itoa(res.status)}, hops ${itoa(res.redirects)}",
+  )
+  assert(count(rig.a) == 2, "A saw ${itoa(count(rig.a))} requests")
+  assert(indexOf(rig.a.raws[0], "authorization") >= 0, "the first request lost the token")
+  assert(noCredentials(rig.a.raws[1]), "the return to A got the token back:\n${rig.a.raws[1]}")
+  assert(noCredentials(rig.b.raws[0]), "B saw credentials:\n${rig.b.raws[0]}")
+}
+
+test "301, 302 and 303 turn a POST into a body-less GET and drop the body headers" {
+  let statuses = [301, 302, 303]
+  for status of statuses {
+    let rig = boot(
+      (req, r) => {
+        if (req.method == "POST") {
+          return moved(status, "http://127.0.0.1:${itoa(r.pb)}/done")
+        }
+        return ok("A")
+      },
+      finalOk,
+    )
+    let hs = [Header{ name = "Content-Type", value = "text/x-secret" }]
+    let res = newClient().requestWith(
+      "POST",
+      "http://127.0.0.1:${itoa(rig.pa)}/submit",
+      hs,
+      "payload",
+    ) catch e {
+      rig.stop()
+      assert(false, "${itoa(status)}: ${e.message()}")
+      return
+    }
+    rig.stop()
+    assert(res.status == 200, "${itoa(status)}: status ${itoa(res.status)}")
+    assert(rig.a.bodies[0] == "payload", "${itoa(status)}: A did not get the body")
+    assert(count(rig.b) == 1, "${itoa(status)}: B saw ${itoa(count(rig.b))}")
+    assert(rig.b.methods[0] == "GET", "${itoa(status)}: B got ${rig.b.methods[0]}")
+    assert(rig.b.bodies[0] == "", "${itoa(status)}: B got body '${rig.b.bodies[0]}'")
+    assert(indexOf(rig.b.raws[0], "content-type") < 0, "${itoa(status)}: B got Content-Type")
+    assert(indexOf(rig.b.raws[0], "content-length") < 0, "${itoa(status)}: B got Content-Length")
+  }
+}
+
+test "a 303 keeps HEAD a HEAD and every other method becomes GET" {
+  assert(redirectedMethod(303, "HEAD") == "HEAD", "HEAD")
+  assert(redirectedMethod(303, "PUT") == "GET", "PUT")
+  assert(redirectedMethod(301, "POST") == "GET", "301 POST")
+  assert(redirectedMethod(302, "PUT") == "PUT", "302 PUT")
+  assert(redirectedMethod(307, "POST") == "POST", "307 POST")
+  assert(redirectedMethod(308, "POST") == "POST", "308 POST")
+}
+
+test "a 307 and a 308 keep the method and body on the same origin" {
+  let statuses = [307, 308]
+  for status of statuses {
+    let rig = boot(
+      (req, r) => {
+        if (req.path == "/submit") {
+          return moved(status, "/again")
+        }
+        return ok("A")
+      },
+      finalOk,
+    )
+    let res = newClient().post("http://127.0.0.1:${itoa(rig.pa)}/submit", "payload") catch e {
+      rig.stop()
+      assert(false, "${itoa(status)}: ${e.message()}")
+      return
+    }
+    rig.stop()
+    assert(res.status == 200 && count(rig.a) == 2, "${itoa(status)}: status ${itoa(res.status)}")
+    assert(
+      rig.a.methods[1] == "POST" && rig.a.bodies[1] == "payload",
+      "${itoa(status)}: replay lost",
+    )
+  }
+}
+
+fn postTo307(req: Request, rig: Rig): Response {
+  if (req.path == "/submit") {
+    return moved(307, "http://127.0.0.1:${itoa(rig.pb)}/final")
+  }
+  return ok("A")
+}
+
+test "a 307 carrying a body to another origin is refused by default and B sees nothing" {
+  let rig = boot(postTo307, finalOk)
+  let res = secretClient().post("http://127.0.0.1:${itoa(rig.pa)}/submit", "payload") catch e {
+    rig.stop()
+    let m = e.message()
+    assert(indexOf(m, "replay") >= 0, "message = '${m}'")
+    assert(indexOf(m, "ReplayBody") >= 0, "message does not name the opt-in: '${m}'")
+    assert(count(rig.b) == 0, "B saw ${itoa(count(rig.b))} requests")
+    return
+  }
+  rig.stop()
+  assert(false, "followed to another origin with status ${itoa(res.status)}")
+}
+
+test "a 307 to another origin replays the body with the opt-in, credentials still stripped" {
+  let rig = boot(postTo307, finalOk)
+  let c = secretClient()
+  c.setRedirects(Redirects.FollowAllowing(10, RedirectAllow.ReplayBody))
+  let res = c.post("http://127.0.0.1:${itoa(rig.pa)}/submit", "payload") catch e {
+    rig.stop()
+    assert(false, "post: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(
+    res.status == 200 && count(rig.b) == 1,
+    "status ${itoa(res.status)}, B saw ${itoa(count(rig.b))}",
+  )
+  assert(
+    rig.b.methods[0] == "POST" && rig.b.bodies[0] == "payload",
+    "B got ${rig.b.methods[0]} '${rig.b.bodies[0]}'",
+  )
+  assert(noCredentials(rig.b.raws[0]), "B saw credentials:\n${rig.b.raws[0]}")
+}
+
+test "a body-less GET answered with a 308 to another origin is followed" {
+  let rig = boot(
+    (req, r) => {
+      return moved(308, "http://127.0.0.1:${itoa(r.pb)}/final")
+    },
+    finalOk,
+  )
+  let res = newClient().get("http://127.0.0.1:${itoa(rig.pa)}/x") catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(res.status == 200 && res.body == "final /final", "got ${itoa(res.status)} '${res.body}'")
+}
+
+fn chain(req: Request, rig: Rig): Response {
+  // /n/K redirects to /n/K-1 until /n/0.
+  let k = atoi(req.path[3:len(req.path)])
+  if (k <= 0) {
+    return ok("end")
+  }
+  return moved(302, "/n/${itoa(k - 1)}")
+}
+
+test "ten redirects are followed and the eleventh is an error naming the limit and the last URL" {
+  let rig = boot(chain, finalOk)
+  let base = "http://127.0.0.1:${itoa(rig.pa)}"
+  let ok10 = newClient().get("${base}/n/10") catch e {
+    rig.stop()
+    assert(false, "ten hops: ${e.message()}")
+    return
+  }
+  assert(
+    ok10.status == 200 && ok10.redirects == 10,
+    "status ${itoa(ok10.status)}, hops ${itoa(ok10.redirects)}",
+  )
+  let res = newClient().get("${base}/n/11") catch e {
+    rig.stop()
+    let m = e.message()
+    assert(indexOf(m, "limit is 10") >= 0, "message = '${m}'")
+    assert(indexOf(m, "${base}/n/1") >= 0, "message does not name the last URL: '${m}'")
+    return
+  }
+  rig.stop()
+  assert(false, "an eleventh redirect returned status ${itoa(res.status)}")
+}
+
+test "a redirect loop is stopped by the limit, and Follow(2) stops at two" {
+  let rig = boot((req, r) => moved(302, "/loop"), finalOk)
+  let c = newClient()
+  c.setRedirects(Redirects.Follow(2))
+  let res = c.get("http://127.0.0.1:${itoa(rig.pa)}/loop") catch e {
+    rig.stop()
+    assert(indexOf(e.message(), "limit is 2") >= 0, "message = '${e.message()}'")
+    assert(count(rig.a) == 3, "A saw ${itoa(count(rig.a))} requests")
+    return
+  }
+  rig.stop()
+  assert(false, "a loop returned status ${itoa(res.status)}")
+}
+
+test "Redirects.None returns the raw 3xx" {
+  let rig = boot(startToB, finalOk)
+  let c = newClient()
+  c.setRedirects(Redirects.None)
+  let url = "http://127.0.0.1:${itoa(rig.pa)}/start"
+  let res = c.get(url) catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(res.status == 302, "status ${itoa(res.status)}")
+  assert(indexOf(header(res.headers, "location"), "/final") >= 0, "Location lost")
+  assert(res.url == url && res.redirects == 0, "url ${res.url}, hops ${itoa(res.redirects)}")
+  assert(count(rig.b) == 0, "B saw ${itoa(count(rig.b))}")
+}
+
+test "a 3xx with no Location, or one that does not parse, is returned unchanged" {
+  let locs = ["", "http:///nohost", "http:path-only"]
+  for loc of locs {
+    let rig = boot(
+      (req, r) => {
+        let res = respond(302, "body")
+        if (len(loc) > 0) {
+          res.headers = res.headers + "Location: ${loc}\r\n"
+        }
+        return res
+      },
+      finalOk,
+    )
+    let res = newClient().get("http://127.0.0.1:${itoa(rig.pa)}/x") catch e {
+      rig.stop()
+      assert(false, "'${loc}': ${e.message()}")
+      return
+    }
+    rig.stop()
+    assert(
+      res.status == 302 && res.body == "body",
+      "'${loc}': got ${itoa(res.status)} '${res.body}'",
+    )
+    assert(res.redirects == 0, "'${loc}': hops ${itoa(res.redirects)}")
+  }
+}
+
+test "a Location with any scheme but http, https or https+h3 is an error" {
+  let locs = [
+    "ftp://example.com/x",
+    "javascript:alert(1)",
+    "file:///etc/passwd",
+    "data:text/plain,hi",
+  ]
+  for loc of locs {
+    let rig = boot((req, r) => moved(302, loc), finalOk)
+    let res = newClient().get("http://127.0.0.1:${itoa(rig.pa)}/x") catch e {
+      rig.stop()
+      assert(indexOf(e.message(), "not allowed") >= 0, "'${loc}': message = '${e.message()}'")
+      continue
+    }
+    rig.stop()
+    assert(false, "'${loc}' returned status ${itoa(res.status)}")
+  }
+}
+
+test "a redirect response's body is read within the body cap before the next hop" {
+  let rig = boot(
+    (req, r) => {
+      if (req.path == "/start") {
+        let res = moved(302, "/final")
+        res.body = repeat("x", 4096)
+        return res
+      }
+      return ok("final")
+    },
+    finalOk,
+  )
+  let c = newClient()
+  c.setMaxBodyBytes(1024)
+  let res = c.get("http://127.0.0.1:${itoa(rig.pa)}/start") catch e {
+    rig.stop()
+    assert(indexOf(e.message(), "exceeds 1024") >= 0, "message = '${e.message()}'")
+    return
+  }
+  rig.stop()
+  assert(false, "an over-cap redirect body was accepted: status ${itoa(res.status)}")
+}
+
+test "the package-level get and Client.getTimeout follow redirects too" {
+  let rig = boot(startToB, finalOk)
+  let url = "http://127.0.0.1:${itoa(rig.pa)}/start"
+  let one = get(url) catch e {
+    rig.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  let two = newClient().getTimeout(url, 5000) catch e {
+    rig.stop()
+    assert(false, "getTimeout: ${e.message()}")
+    return
+  }
+  rig.stop()
+  assert(
+    one.status == 200 && one.redirects == 1,
+    "get: ${itoa(one.status)}, hops ${itoa(one.redirects)}",
+  )
+  assert(
+    two.status == 200 && two.redirects == 1,
+    "getTimeout: ${itoa(two.status)}, hops ${itoa(two.redirects)}",
+  )
+}
+
+// ---------------------------------------------------------------------------
+// https to http
+// ---------------------------------------------------------------------------
+
+fn bgServeTls(l: TlsListener, h: (Request) => Response) {
+  serveTlsOn(l, h) catch _ {
+    return
+  }
+}
+
+// An https server T whose every answer is a 302 to the plain server A's
+// /landed, and A, which records what it sees.
+class Down {
+  sa: Server
+  l: TlsListener
+  pa: int
+  pt: int
+  seen: Seen
+
+  stop() {
+    this.sa.close()
+    this.l.close()
+  }
+}
+
+fn startDown(): Down! {
+  let seen = newSeen()
+  let sa = serve("127.0.0.1", 0)?
+  let pa = sa.port()?
+  let l = tlsListen("127.0.0.1", 0, tls5916ServerConfig())?
+  let pt = l.port()?
+  spawn bgServe(sa, (req) => {
+    note(seen, req)
+    return ok("plain")
+  })
+  spawn bgServeTls(l, (req) => moved(302, "http://127.0.0.1:${itoa(pa)}/landed"))
+  return Down{ sa = sa, l = l, pa = pa, pt = pt, seen = seen }
+}
+
+fn downClient(): Client {
+  let c = newClientTls(tls5916ClientConfig())
+  c.setHeader("Authorization", "Bearer s3cret") catch _ {}
+  return c
+}
+
+test "an https to http redirect is an error by default and the plain server sees nothing" {
+  let d = startDown() catch e {
+    assert(false, "startDown: ${e.message()}")
+    return
+  }
+  let res = downClient().get("https://127.0.0.1:${itoa(d.pt)}/start") catch e {
+    d.stop()
+    let m = e.message()
+    assert(indexOf(m, "downgrades https to http") >= 0, "message = '${m}'")
+    assert(indexOf(m, "RedirectAllow.Downgrade") >= 0, "message does not name the opt-in: '${m}'")
+    assert(count(d.seen) == 0, "the plain server saw ${itoa(count(d.seen))} requests")
+    return
+  }
+  d.stop()
+  assert(false, "a downgrade returned status ${itoa(res.status)}")
+}
+
+test "an https to http redirect is followed with the opt-in, credentials stripped" {
+  let d = startDown() catch e {
+    assert(false, "startDown: ${e.message()}")
+    return
+  }
+  let c = downClient()
+  c.setRedirects(Redirects.FollowAllowing(10, RedirectAllow.Downgrade))
+  let res = c.get("https://127.0.0.1:${itoa(d.pt)}/start") catch e {
+    d.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  d.stop()
+  assert(res.status == 200 && res.body == "plain", "got ${itoa(res.status)} '${res.body}'")
+  assert(count(d.seen) == 1, "the plain server saw ${itoa(count(d.seen))} requests")
+  assert(
+    noCredentials(d.seen.raws[0]),
+    "the downgraded hop carried credentials:\n${d.seen.raws[0]}",
+  )
+  assert(res.url == "http://127.0.0.1:${itoa(d.pa)}/landed", "url = ${res.url}")
+}
+
+// ---------------------------------------------------------------------------
+// Location resolution (RFC 3986 §5)
+// ---------------------------------------------------------------------------
+
+fn resolved(ref: string): string {
+  let base = Url{ host = "h", port = 80, path = "/a/b/c?q=1", https = false, h3 = false }
+  let t = resolveLocation(base, ref) catch e {
+    return "ERR ${e.message()}"
+  }
+  if (!t.ok) {
+    return "NONE"
+  }
+  return urlString(t.url)
+}
+
+test "a relative Location resolves against the current URL" {
+  assert(resolved("d") == "http://h/a/b/d", resolved("d"))
+  assert(resolved("./d") == "http://h/a/b/d", resolved("./d"))
+  assert(resolved("../d") == "http://h/a/d", resolved("../d"))
+  assert(resolved("../../../d") == "http://h/d", resolved("../../../d"))
+  assert(resolved("d/..") == "http://h/a/b/", resolved("d/.."))
+  assert(resolved("/x/./y/../z") == "http://h/x/z", resolved("/x/./y/../z"))
+  assert(resolved("?z=2") == "http://h/a/b/c?z=2", resolved("?z=2"))
+  assert(resolved("d?z=2#frag") == "http://h/a/b/d?z=2", resolved("d?z=2#frag"))
+  assert(resolved("//other:8080/p") == "http://other:8080/p", resolved("//other:8080/p"))
+  assert(resolved("HTTPS://x/y") == "https://x/y", resolved("HTTPS://x/y"))
+  assert(resolved("#only") == "NONE", resolved("#only"))
+  assert(resolved("") == "NONE", resolved(""))
+}
+
+test "an absolute Location with another scheme is refused, https+h3 is allowed" {
+  assert(indexOf(resolved("ftp://x/y"), "ERR") == 0, resolved("ftp://x/y"))
+  assert(resolved("https+h3://x/y") == "https+h3://x/y", resolved("https+h3://x/y"))
+}
+
+test "the credential strip is exactly the four credential headers" {
+  let block = "Authorization: a\r\nX-Keep: 1\r\ncookie: b\r\nProxy-Authorization: c\r\nwww-authenticate: d\r\nContent-Type: t\r\n"
+  assert(withoutCredentials(block) == "X-Keep: 1\r\nContent-Type: t\r\n", withoutCredentials(block))
+}
+
+test "two origins differ by scheme, host or port and nothing else" {
+  let a = Url{ host = "H", port = 80, path = "/a", https = false, h3 = false }
+  assert(
+    sameOrigin(a, Url{ host = "h", port = 80, path = "/b?x", https = false, h3 = false }),
+    "host case and path",
+  )
+  assert(
+    !sameOrigin(a, Url{ host = "h", port = 81, path = "/a", https = false, h3 = false }),
+    "port",
+  )
+  assert(
+    !sameOrigin(a, Url{ host = "g", port = 80, path = "/a", https = false, h3 = false }),
+    "host",
+  )
+  assert(
+    !sameOrigin(a, Url{ host = "h", port = 80, path = "/a", https = true, h3 = false }),
+    "scheme",
+  )
+  assert(!sameOrigin(a, Url{ host = "h", port = 80, path = "/a", https = true, h3 = true }), "h3")
+}
