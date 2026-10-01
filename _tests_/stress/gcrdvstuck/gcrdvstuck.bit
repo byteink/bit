@@ -1,0 +1,130 @@
+// One mutator that never reaches a safepoint must cost the world a bounded,
+// named stall, not a freeze that scales with load (#6423).
+//
+// Darwin-only by construction, hence the sibling `darwin-only` marker: it
+// drives the Darwin thread provider, whose `extern function`s the compiler
+// rejects on both Linux targets (the same reason as `../gcslotexitdarwin`).
+//
+// THE SHAPE IS #6412'S. A thread started through `threadStart` holds a mutator
+// slot that reads `running` for as long as it executes, and a kernel wait with
+// no `gcBlockingBegin`/`gcBlockingEnd` around it (the ABI.md section 5
+// contract) never reaches a safepoint. Here the child allocates once, which
+// claims its slot, and then sleeps in `parkSleepNs` unbracketed for
+// `childSleepNs`. Every collection the parent attempts in that window can only
+// give up. Before #6423 each attempt held every other thread stopped through
+// 64 rounds of a spin-count budget (360 ms idle, 20-24 s beside CPU hogs);
+// now `stwRetryRendezvous` ceilings the whole retry on the clock
+// (`stwRendezvousCeilingNs`, ../../../runtime/stw/stwretry.bit), says once on
+// stderr which slot never answered, and holds the next attempt off.
+//
+// The four lines printed are the four properties, in this order:
+//   stuck-abandoned  a collection WAS abandoned while the slot was stuck, so
+//                    the child really is the obstruction and not a bystander
+//   stuck-named      `stuck=` counted it: a named slot, not just an abandon
+//   pause-bounded    the longest stop was under two seconds. The ceiling is
+//                    250 ms; the margin is for a descheduled collector, and the
+//                    failure this pins was 15-24 s
+//   recovered        after the child woke and left, collections resumed: the
+//                    hold-off ends, it does not turn collection off
+import { threadStart, threadRelease } from "../../../runtime/thread/darwin"
+import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
+import { stwCollections, stwAbandonedCount, stwPauseMaxNs, stwStuckTotal } from "../../../runtime/stw"
+
+// How long the child stays out of Bit code. Longer than the 250 ms ceiling plus
+// the hold-off it starts (4x the wait), so the child is still asleep when the
+// parent has already given up once and been held off.
+const childSleepNs: int = 1500000000
+
+const pauseLimitNs: int = 2000000000
+
+// One churn's ceilings: iterations (512 words each, 4 KB) and wall time.
+const churnLimit: int = 100000
+const recoverBatch: int = 64
+const recoverBatches: int = 200
+const recoverPauseNs: int = 50000000
+const churnWindowNs: int = 5000000000
+
+let doneWords: [1]i32
+let readyWords: [1]i32
+let childScratch: [2]i64
+let sleepScratch: [2]i64
+
+fn sleepAdapt(ns: int) {
+  parkSleepNs(ns, ptrOf(sleepScratch))
+}
+
+// The stuck mutator. It allocates (that claims the slot), announces itself,
+// then waits in the kernel with the slot still `running`. NO LOOP, so it never
+// takes a safepoint of its own, and NO bracket, which is the whole point.
+export fn stuckChild(arg: *byte): *byte {
+  let keep = []i64(4)
+  keep[0] = 1
+  atomicStore(ptrOf(readyWords), i32(1))
+  parkSleepNs(childSleepNs, ptrOf(childScratch))
+  atomicStore(ptrOf(doneWords), i32(0))
+  return nil
+}
+
+// Garbage that makes every iteration an allocation and a back edge, which is a
+// collection ATTEMPT under `BIT_GC=stress` and crosses the byte trigger within
+// a thousand iterations without it. Returns when the abandoned count reaches
+// `abandonedAtLeast` (when positive) or the collection count passes
+// `collectionsAbove` (when not negative); bounded by `limit` iterations and
+// `churnWindowNs` of wall time, so a stuck world can neither loop it forever
+// nor let the heap grow without bound while collection is held off.
+fn churnUntil(limit: int, abandonedAtLeast: int, collectionsAbove: int): int {
+  let sink = 0
+  let deadline = parkMonoNs() + churnWindowNs
+  let i = 0
+  while (i < limit) {
+    let g = []i64(512)
+    g[0] = i64(i)
+    sink = sink + int(g[0])
+    if (abandonedAtLeast > 0 && stwAbandonedCount() >= abandonedAtLeast) {
+      return sink
+    }
+    if (collectionsAbove >= 0 && stwCollections() > collectionsAbove) {
+      return sink
+    }
+    if (i % 64 == 0 && parkMonoNs() >= deadline) {
+      return sink
+    }
+    i = i + 1
+  }
+  return sink
+}
+
+fn main() {
+  atomicStore(ptrOf(doneWords), i32(threadRunning))
+  atomicStore(ptrOf(readyWords), i32(0))
+  let bp: *byte = nil
+  let h = threadStart(entryOf(stuckChild), bp, ptrOf(doneWords))
+  while (atomicLoad(ptrOf(readyWords)) == i32(0)) {
+    parkSleepNs(1000000, ptrOf(sleepScratch))
+  }
+
+  let sink = churnUntil(churnLimit, 1, -1)
+  let abandoned = stwAbandonedCount()
+  print("stuck-abandoned ${abandoned >= 1}\n")
+  print("stuck-named ${stwStuckTotal() >= 1}\n")
+
+  let joined = threadJoin(ptrOf(doneWords), 60000000000, sleepAdapt, parkMonoNs) == threadJoinDone
+  let released = threadRelease(h)
+
+  // The join loop above polls, so it may itself have attempted (and abandoned)
+  // another collection once the hold-off lapsed while the child still slept.
+  // That restarts the hold-off, which is at most four times the wait, so
+  // recovery is polled for: small batches with a sleep between them, which
+  // lets the hold-off run out without growing the heap.
+  let before = stwCollections()
+  let sink2 = 0
+  let k = 0
+  while (k < recoverBatches && stwCollections() <= before) {
+    sink2 = sink2 + churnUntil(recoverBatch, 0, before)
+    sleepAdapt(recoverPauseNs)
+    k = k + 1
+  }
+  print("pause-bounded ${stwPauseMaxNs() < pauseLimitNs}\n")
+  print("recovered ${joined && released && stwCollections() > before && sink + sink2 > 0}\n")
+}

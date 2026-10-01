@@ -1,0 +1,67 @@
+// Rounds `stwPollOn`'s locked section retries a failed `worldRendezvous`
+// before truly abandoning the collection (#5322). Each round only has to
+// gather whatever stragglers the round before it did not — `worldRendezvous`
+// reuses the same epoch across rounds (see its own comment,
+// ../gc/gcworldstop.bit), so a round never re-collects an ack a prior round
+// already banked. Bounded (Power-of-10 rule 2), and sized generously against
+// the worst contention #5322 measured (up to 20 of 34 threads see comment 2
+// on that ticket) while still finite: a slot that genuinely never reaches a
+// safepoint (a leaked-registration bug, not contention) surfaces as an
+// abandoned, counted collection within a bounded number of rounds rather than
+// hanging forever.
+const stwRendezvousRetryBound = 64
+
+// The wall-clock ceiling on the WHOLE retry, all rounds together (#6423).
+//
+// The rounds above are bounded in spins, and a spin count is a bound in CPU
+// throughput, not in time: with one mutator that never reaches a safepoint (a
+// thread inside a kernel call no `gcBlockingBegin`/`gcBlockingEnd` brackets,
+// ABI.md section 5) the 64 rounds took 360 ms on an idle arm64 box and 20-24 s
+// beside 36 CPU hogs, with every other thread parked for all of it (#6412).
+// This turns that into a time bound that does not stretch with load.
+//
+// THE FIGURE IS MEASURED, NOT ARGUED. It has to sit above how long a mutator
+// that is merely descheduled, and live, needs to reach its next safepoint
+// under heavy oversubscription, because below that an ordinary collection is
+// abandoned for no reason (#2415's failure, `_tests_/stress/gcslotexitdarwin`
+// at 28 concurrent instances). See the ticket for the sweep it was read from.
+const stwRendezvousCeilingNs = 250000000
+
+// The retry loop itself, split out of `stwPollOn` so that function's own
+// complexity stays at its pre-#5322 count — see the call site's comment for
+// the mechanism this replaces. Same collector, same collector lock, held by
+// the caller for the whole loop: no other thread can start a competing
+// collection while this retries, which is what keeps a losing round from
+// turning into a fresh collector election instead of a continuation of this
+// one.
+//
+// THE STOP FLAG STAYS SET BETWEEN ROUNDS, AND THAT IS DELIBERATE (#6423).
+// Releasing it between rounds would let unrelated mutators run while the
+// collector waits for a straggler, but it cannot be done soundly without
+// giving back what #5322 fixed: `worldRestart` wakes every parked thread, each
+// of which then races for the collector lock, and the next round's fresh
+// stop bumps the epoch, which un-stops every slot that had already acked the
+// old one. That is the livelock (epoch climbing, collections frozen). Holding
+// the stop is what makes a round only gather the stragglers. The cost, every
+// other thread parked for the whole retry, is bounded by the ceiling above
+// rather than avoided, and `stwAfterAbandon` (./stwstats.bit) keeps the world
+// from paying it again at once.
+//
+// On giving up, `worldStuckNote` (../gc/gcworldstuck.bit) names the slot that
+// never answered; `stwFinishPause` prints it after the world is restarted.
+@nosplit fn stwRetryRendezvous(world: *i64, selfSlot: int): bool {
+  let t0 = gcTicks()
+  let deadline = t0 + stwRendezvousCeilingNs
+  let round = 0
+  while (round < stwRendezvousRetryBound) {
+    if (worldRendezvous(world, selfSlot, deadline)) {
+      return true
+    }
+    if (gcTicks() >= deadline) {
+      break
+    }
+    round = round + 1
+  }
+  worldStuckNote(world, selfSlot, gcTicks() - t0)
+  return false
+}
