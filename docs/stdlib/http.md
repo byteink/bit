@@ -151,6 +151,69 @@ client, and `Client.setMaxBodyBytes(n)` raises or lowers the 32 MiB response
 cap - there is no value meaning unlimited, so `0` refuses every body, the
 same rule `Server.setMaxBodyBytes` uses below.
 
+### Following redirects
+
+Inkwell's API answers an export request with a redirect to a CDN host that
+holds the file. You want the file, and you do not want the CDN to learn your
+API token. A `Client` follows redirects by default, up to 10 hops, and takes
+the token off the request the moment the next hop leaves the origin it was
+meant for.
+
+```bit
+import { newClient, Client, Redirects, RedirectAllow } from "std/http"
+
+fn inkwellClient(token: string): Client! {
+  let c = newClient()
+  c.setHeader("Authorization", "Bearer ${token}")?
+  return c
+}
+
+fn exportDraft(c: Client, id: string): string! {
+  let res = c.get("https://api.inkwell.example/drafts/${id}/export")?
+  // `res.url` is where the body came from; `res.redirects` is how many hops
+  // it took to get there. The CDN host never saw the Authorization header.
+  return "${res.url} after ${res.redirects} redirects: ${res.body}"
+}
+
+// The raw 3xx response, for a caller that wants to read `Location` itself.
+fn rawRedirects(c: Client) {
+  c.setRedirects(Redirects.None)
+}
+
+// A tighter limit than the default 10.
+fn threeHops(c: Client) {
+  c.setRedirects(Redirects.Follow(3))
+}
+
+// The two opt-ins, each named for what it permits: an https URL redirecting
+// to plain http, and a POST or PUT body sent again to another origin.
+fn trustedInternalHops(c: Client) {
+  c.setRedirects(Redirects.FollowAllowing(10, RedirectAllow.Downgrade))
+  c.setRedirects(Redirects.FollowAllowing(10, RedirectAllow.ReplayBody))
+  c.setRedirects(Redirects.FollowAllowing(10, RedirectAllow.Both))
+}
+```
+
+The package-level `get`, `post` and `request` follow redirects the same way,
+with the default policy. What happens on each hop:
+
+- A change of scheme, host or port removes `Authorization`, `Cookie`,
+  `Proxy-Authorization` and `WWW-Authenticate` from the request, including
+  the ones you set with `Client.setHeader`. A later hop that returns to the
+  original origin does not get them back.
+- A redirect from https to http fails, and the error names the opt-in. Only
+  `http`, `https` and `https+h3` targets are followed; any other scheme in
+  `Location` fails.
+- A `303`, and a `301` or `302` answering a `POST`, become a `GET` with no
+  body and no `Content-Type`; a `HEAD` stays a `HEAD`. A `307` or `308` keeps
+  the method and the body, and a request that still carries a body fails
+  rather than send it to another origin.
+- A `Location` can be relative (`../next`, `?page=2`, `//other.example/x`).
+  A missing or malformed one hands you the `3xx` response unchanged.
+- An eleventh redirect fails with the limit and the last URL in the message.
+- The body of a redirect response is read, within the body cap, before the
+  next hop. A `requestTimeout` deadline covers every hop together.
+
 ## Serving requests: the basics
 
 ```bit
@@ -224,6 +287,10 @@ starting from exactly the handler shown above.
 | a server that never answers, called with `get`/`post`/`request` | the call parks forever - use `*Timeout` |
 | setting `Accept-Encoding` yourself | `requestWith` fails - this stdlib has no response decompressor |
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
+| a redirect to another host, port or scheme | `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` are dropped, defaults included |
+| a redirect from `https` to `http` | the call fails - opt in with `RedirectAllow.Downgrade` |
+| a `307` or `308` with a body to another origin | the call fails - opt in with `RedirectAllow.ReplayBody` |
+| more redirects than the limit (10 default) | the call fails naming the limit and the last URL |
 | `Server.setMaxBodyBytes(0)` or a zero `Limits` field to `parseMultipart` | refuses every body - `0` never means unlimited |
 | a client offering ALPN `h2` against a server that shares no protocol | the handshake is aborted, never silently downgraded |
 | `req.peer` on a hand-built `Request`, or one whose connection died early | `""`, never a placeholder address |
@@ -252,7 +319,9 @@ header with `header(req.headers, name)`.
 ### `Response`
 
 An HTTP response: `status`, `contentType`, the raw `headers` block, and
-`body`. The server fills in `Content-Length` and `Connection` for you.
+`body`. The server fills in `Content-Length` and `Connection` for you. A
+response a client returns also carries `url`, the address it finally came
+from, and `redirects`, the number of redirects followed to get there.
 
 ### `header(block: string, name: string): string`
 
@@ -405,6 +474,23 @@ Sets a default header sent with every call this client makes from now on.
 
 Raises or lowers the response-size cap for this client, in bytes. There is
 no value meaning unlimited; `0` refuses every body.
+
+### `Redirects`
+
+How a `Client` treats a `3xx` response: `Redirects.None` returns it as is,
+`Redirects.Follow(n)` follows up to `n` redirects (the default is
+`Redirects.Follow(10)`), and `Redirects.FollowAllowing(n, allow)` follows up
+to `n` with the opt-ins in `allow`.
+
+### `RedirectAllow`
+
+What `Redirects.FollowAllowing` permits beyond the strict default:
+`RedirectAllow.Downgrade` (https to http), `RedirectAllow.ReplayBody` (a
+`307` or `308` body sent again to another origin) or `RedirectAllow.Both`.
+
+### `Client.setRedirects(policy: Redirects)`
+
+Sets how this client treats `3xx` responses from now on.
 
 ## Serving requests
 
