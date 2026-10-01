@@ -141,6 +141,11 @@ that rule, so a zone keeps observing daylight saving for as long as the rule
 stands: a mortgage schedule or a 2040 meeting in `America/New_York` lands on
 the right side of the March change, not an hour off.
 
+The rule has to agree with the file. Evaluated at the last listed change it
+must give that change's offset, daylight-saving flag and abbreviation; a file
+whose rule disagrees would jump at the end of its table, so `zone` fails when
+it loads it, naming the rule, the instant and the first field that differs.
+
 ```bit
 import { zone, date, DateTime } from "std/time"
 
@@ -1768,7 +1773,7 @@ An IANA time zone, identified by its canonical name, such as `Asia/Dubai`. Immut
 
 ### `zone(name: string): Zone!`
 
-Loads the zone named `name` from the host's zone database. Fails when the name is not a real zone, or when neither the host nor an installed extension has it, or when the file found is malformed, including a rule after its last change that is not a valid POSIX TZ string. See [Zones](#zones).
+Loads the zone named `name` from the host's zone database. Fails when the name is not a real zone, or when neither the host nor an installed extension has it, or when the file found is malformed, including a rule after its last change that is not a valid POSIX TZ string or that disagrees with the last change. See [Zones](#zones).
 
 ### `localZone(): Zone`
 
