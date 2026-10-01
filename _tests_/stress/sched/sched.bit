@@ -70,12 +70,14 @@
 //   P4  Global queue FIFO, including the empty-queue answer and the
 //       tail-reset-on-drain that a naive unlink gets wrong.
 //
-//   P5  `schedCtxClearRegs` (#6378) on the context a task was just resumed
-//       from: words 3..ctxWords-1 held the switch's save and read 0 after the
-//       clear, words 0..2 (sp, pc, fp) are untouched. 12 checks, one per
-//       resume. Called directly: this harness never sets the runtime's current
-//       task, so `schedSwitchAway`'s `schedCurrentTask()` lookup cannot run
-//       here. The wiring is proven by bench/cases/allocpar's collection count.
+//   P5  `schedSwitchAway` (#6378, #6386) zeroes the context a task was just
+//       resumed from: words 3..ctxWords-1 held the switch's save when the
+//       worker resumed it and read 0 once it runs, words 0..2 (sp, pc, fp) are
+//       untouched. 12 checks, one per resume. `clearYieldTask` switches
+//       through it, so this is the runtime's own resume path: the worker below
+//       resumes a task the way `schedWorkerStep` does, naming the task's block
+//       as `new`. Its own yield, not P2's: a call to `schedSwitchAway` passes its
+//       arguments in rdi/rsi under SysV, which are P2's x64 sentinels.
 //
 //   P6  Nothing lives in a caller-saved register across a switch (#6382). On
 //       resume every register the switch does not restore holds the WORKER's
@@ -104,7 +106,7 @@
 // 0123 0123 0123 base-4 = 0x1B1B1B = 1776411.
 
 import { schedSwitch, schedTaskInit, taskAt, taskArg, taskWords } from "../../../runtime/sched"
-import { ctxWords, schedCtxClearRegs } from "../../../runtime/sched"
+import { ctxWords, schedSwitchAway } from "../../../runtime/sched"
 import { dqCapacity, dqInit, dqPushBottom, dqPopBottom, dqSteal } from "../../../runtime/sched"
 import { gqInit, gqPush, gqPop } from "../../../runtime/sched"
 
@@ -112,7 +114,7 @@ const TASKS = 4
 const ROUNDS = 3
 const STACK_WORDS = 2048
 const STEP_LIMIT = 64
-// The first context word `schedCtxClearRegs` must zero: 0..2 are sp, pc, fp.
+// The first context word `schedSwitchAway` must zero: 0..2 are sp, pc, fp.
 const CTX_FIRST_REG = 3
 
 // Task stacks, one contiguous block carved into `TASKS` slices. Module state is
@@ -140,6 +142,12 @@ let trace: i64 = 0
 let checksum: i64 = 0
 let cleared: i64 = 0
 let live: i64 = 0
+
+// P5: what the worker saw in the context of the task it is about to resume.
+let preSet: i64 = 0
+let preSp: i64 = 0
+let prePc: i64 = 0
+let preFp: i64 = 0
 
 // The worker context's address, resolved once in `main`.
 //
@@ -245,22 +253,34 @@ const DISP_DONE: int = 1
   return n
 }
 
-// P5: 1 when `schedCtxClearRegs` zeroed the resumed task's register words and
-// kept sp, pc and fp. The words must hold the switch's save first (yieldTask's
-// sentinels, and arm64's x30), or a clear that does nothing would pass.
+// P5, worker side: what the context of the task about to be resumed holds.
+@nosplit fn ctxSnapshot(ctx: *i64) {
+  preSet = ctxRegsSet(ctx)
+  preSp = *ctx
+  prePc = *(ctx + 1)
+  preFp = *(ctx + 2)
+}
+
+// P5: yield through `schedSwitchAway`, which zeroes the saved register words
+// once this task is resumed.
+@nosplit fn clearYieldTask() {
+  disposition = DISP_YIELD
+  schedSwitchAway(taskAt(current), taskAt(workerCtxAddr))
+}
+
+// P5, task side: 1 when `clearYieldTask`'s `schedSwitchAway` zeroed this task's
+// register words on resume and kept sp, pc and fp. The words must have held
+// the switch's save when the worker resumed it (yieldTask's sentinels, and
+// arm64's x30), or a clear that does nothing would pass.
 @nosplit fn ctxClearCheck(): int {
   let ctx = taskAt(current)
-  let sp = *ctx
-  let pc = *(ctx + 1)
-  let fp = *(ctx + 2)
-  if (ctxRegsSet(ctx) == 0) {
+  if (preSet == 0) {
     return 0
   }
-  schedCtxClearRegs(ctx)
   if (ctxRegsSet(ctx) != 0) {
     return 0
   }
-  if (*ctx != sp || *(ctx + 1) != pc || *(ctx + 2) != fp) {
+  if (*ctx != preSp || *(ctx + 1) != prePc || *(ctx + 2) != preFp) {
     return 0
   }
   return 1
@@ -342,6 +362,7 @@ const DISP_DONE: int = 1
     if (yieldTask() == regsExpected()) {
       checksum = checksum + 1
     }
+    clearYieldTask()
     cleared = cleared + ctxClearCheck()
     // Not `live = live + liveAcrossSwitch()`: other tasks bump `live` while this
     // one is switched out, and the left operand would be read before the yield.
@@ -356,8 +377,8 @@ const DISP_DONE: int = 1
 // the tail, take from the head) is what makes the interleave round-robin.
 //
 // Bounded by `STEP_LIMIT` rather than looping until the queue drains, so the
-// loop's termination is provable by reading it (Power of 10). TASKS*(2*ROUNDS+1)
-// = 28 switches are needed (two yields a round, P2 and P6, plus the exit); the limit is comfortably above that, and a scheduler
+// loop's termination is provable by reading it (Power of 10). TASKS*(3*ROUNDS+1)
+// = 40 switches are needed (three yields a round, P2, P5 and P6, plus the exit); the limit is comfortably above that, and a scheduler
 // that failed to retire its tasks would hit the bound and report a wrong trace
 // rather than hang.
 fn runWorker() {
@@ -369,6 +390,7 @@ fn runWorker() {
       return
     }
     current = addr
+    ctxSnapshot(taskAt(addr))
 
     // Poison the probe registers before entering a task.
     //

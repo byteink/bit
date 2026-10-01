@@ -325,41 +325,78 @@ export @nosplit fn schedSwitch(old: *i64, new: *i64) {
   }
 }
 
-// The first saved word `schedCtxClearRegs` zeroes. Words 0..2 (sp, resume
-// address, frame register) stay: class 4 (`stwScanTasks`, ../stw/stwscan.bit)
-// starts a task's stack walk at `ctxSp`, and none of the three can be a heap
-// object base.
-const ctxFirstReg: int = 3
-
-// Zero the register words of a context its task has just resumed from (#6378).
+// `schedSwitch` for a TASK leaving the CPU when something will resume it. Once
+// it is resumed, its saved words 3..ctxWords-1 are zeroed, so class 7
+// (`stwScanCtx`, ../stw/stwscan.bit) only ever reads the context of a task that
+// is switched out (#6378). Those words copy state the task now holds in real
+// registers, which class 9 or 10 (or the collector's own snapshot) roots; left
+// in place they kept every reference of the task's LAST switch-away a root
+// until its next one, and #6374 measured each preempted x64 worker of
+// `bench/cases/allocpar` pinning a whole batch through its saved r15. Words
+// 0..2 (sp, resume address, frame register) stay: class 4 starts a task's stack
+// walk at `ctxSp`, and none of the three can be a heap object base.
 //
-// Once `schedSwitch` has restored them, those words copy state the task now
-// holds in real registers, which class 9 or 10 (or the collector's own
-// snapshot) roots. Left in place, class 7 (`stwScanCtx`) keeps rooting every
-// reference they held at the task's LAST switch-away until its next one: #6374
-// measured each preempted x64 worker of `bench/cases/allocpar` pinning a whole
-// batch through its saved r15. Bounded by `ctxWords`.
-export @nosplit fn schedCtxClearRegs(ctx: *i64) {
-  let i = ctxFirstReg
-  while (i < ctxWords) {
-    *(ctx + i) = 0
-    i = i + 1
-  }
-}
-
-// `schedSwitch` for a TASK leaving the CPU when something will resume it: the
-// saved register words are zeroed once it is resumed, so class 7 only ever
-// reads the context of a task that is switched out.
+// WHICH BLOCK TO CLEAR IS READ FROM THE RESUMER, NOT FROM `t` (#6386). The
+// allocator may keep `t` across the switch in a register the switch does not
+// restore; on resume that register holds the RESUMING side's value. But
+// `schedSwitch` returns only when a later switch names this context as its
+// `new`, and that switch jumps here with `new` still in x1 / rdx: the input
+// registers are excluded from allocation in the whole function (SPEC §11.6) and
+// nothing is emitted between the two blocks. So `new` IS the block just
+// restored, and it is in hand for free. #6378 looked it up through
+// `schedCurrentTask()` and cleared it in a loop: about 260 instructions a resume
+// on x64 under the pinned stage0's codegen, where this block is 21.
 //
-// The block to clear comes from `schedCurrentTask()` AFTER the switch, never
-// from `t`. `schedSwitch` is inlined, restores only the callee-saved file and
-// declares no caller-saved register clobbered, so the allocator may keep `t`
-// across it in one (#4343: an interval live across no call takes any
-// register). On resume that register holds the resuming worker's value, and a
-// clear through it would zero some other block's words.
-@nosplit fn schedSwitchAway(t: *i64, to: *i64) {
+// CHECKED, NOT TRUSTED: the switch has just set sp from word 0 of `new`, so
+// `*new == sp` holds exactly when the register still names the restored block.
+// If it ever does not (an edit to `schedSwitch` that reuses x1 / rdx before the
+// jump, a resumer that restores a copy, a backend that emits code between the
+// blocks), this traps on the first resume instead of zeroing someone else's
+// words.
+//
+// The stores name words 3..21 by offset, so they are bound to `ctxWords` == 22
+// by hand. _tests_/stress/sched's P5 asserts the bound: it resumes tasks through
+// this function and reads every word up to `ctxWords` as 0.
+export @nosplit fn schedSwitchAway(t: *i64, to: *i64) {
   schedSwitch(t, to)
-  schedCtxClearRegs(taskAt(schedCurrentTask()))
+  asm {
+    arm64 {
+      0xF9400022,                                     // ldr x2, [x1]       saved sp
+      0xEB2263FF,                                     // cmp sp, x2
+      0x54000040,                                     // b.eq +8
+      0xD4200000,                                     // brk #0
+      0xA901FC3F, 0xA902FC3F, 0xA903FC3F, 0xA904FC3F, // stp xzr, xzr: words 3..10
+      0xA905FC3F, 0xA906FC3F, 0xA907FC3F, 0xA908FC3F, // words 11..18
+      0xA909FC3F,                                     // words 19..20
+      0xF900543F,                                     // str xzr, word 21
+    }
+    x64 {
+      0x48, 0x39, 0x22,                                     // cmp [rdx], rsp
+      0x74, 0x02,                                           // je +2
+      0x0F, 0x0B,                                           // ud2
+      0x48, 0xC7, 0x42, 0x18, 0x00, 0x00, 0x00, 0x00,       // mov qword [rdx+24], 0
+      0x48, 0xC7, 0x42, 0x20, 0x00, 0x00, 0x00, 0x00,       // [rdx+32]
+      0x48, 0xC7, 0x42, 0x28, 0x00, 0x00, 0x00, 0x00,       // [rdx+40]
+      0x48, 0xC7, 0x42, 0x30, 0x00, 0x00, 0x00, 0x00,       // [rdx+48]
+      0x48, 0xC7, 0x42, 0x38, 0x00, 0x00, 0x00, 0x00,       // [rdx+56]
+      0x48, 0xC7, 0x42, 0x40, 0x00, 0x00, 0x00, 0x00,       // [rdx+64]
+      0x48, 0xC7, 0x42, 0x48, 0x00, 0x00, 0x00, 0x00,       // [rdx+72]
+      0x48, 0xC7, 0x42, 0x50, 0x00, 0x00, 0x00, 0x00,       // [rdx+80]
+      0x48, 0xC7, 0x42, 0x58, 0x00, 0x00, 0x00, 0x00,       // [rdx+88]
+      0x48, 0xC7, 0x42, 0x60, 0x00, 0x00, 0x00, 0x00,       // [rdx+96]
+      0x48, 0xC7, 0x42, 0x68, 0x00, 0x00, 0x00, 0x00,       // [rdx+104]
+      0x48, 0xC7, 0x42, 0x70, 0x00, 0x00, 0x00, 0x00,       // [rdx+112]
+      0x48, 0xC7, 0x42, 0x78, 0x00, 0x00, 0x00, 0x00,       // [rdx+120]
+      0x48, 0xC7, 0x82, 0x80, 0x00, 0x00, 0x00, 0, 0, 0, 0, // [rdx+128]
+      0x48, 0xC7, 0x82, 0x88, 0x00, 0x00, 0x00, 0, 0, 0, 0, // [rdx+136]
+      0x48, 0xC7, 0x82, 0x90, 0x00, 0x00, 0x00, 0, 0, 0, 0, // [rdx+144]
+      0x48, 0xC7, 0x82, 0x98, 0x00, 0x00, 0x00, 0, 0, 0, 0, // [rdx+152]
+      0x48, 0xC7, 0x82, 0xA0, 0x00, 0x00, 0x00, 0, 0, 0, 0, // [rdx+160]
+      0x48, 0xC7, 0x82, 0xA8, 0x00, 0x00, 0x00, 0, 0, 0, 0, // [rdx+168]
+    }
+    clobber arm64 { x2, memory }
+    clobber x64 { memory }
+  }
 }
 
 // Round `addr` DOWN to the arch's entry-time stack alignment.
