@@ -1,0 +1,237 @@
+// _tests_/bit/relshapes — `./make test-relation-shapes` (#6397). Relations load
+// themselves: E0300 fires only where the compiler cannot prove the load, and
+// following its hint fixes the build. Deleting the runtime unloaded-relation
+// panic (R4b, #6316) is only safe if that is true of EVERY way a row reaches a
+// read, and the proof had ten holes closed one at a time (#6344, #6352, #6366,
+// #6373, ...), each of which built cleanly and then read an unloaded relation.
+//
+// So the runtime panic is the oracle. For every relation x row source x flow in
+// cells.bit the harness writes one program against a throwaway PostgreSQL
+// (_tests_/bit/dockerlive, the pin ormlive.bit uses) and asks the compiler. The
+// cell agrees when
+//   - `bit check` rejects it with E0300, and the program rewritten the way the
+//     hint says (`.with("rel")` on the named query) checks, builds, and prints
+//     the loaded relation; or
+//   - it checks, builds, runs, and prints the loaded relation.
+// It FAILS when it builds and then panics "relation not loaded", or prints an
+// empty relation, or when `bit check` rejects it with anything but E0300.
+//
+// known.bit lists the cells that still fail, each with its ticket, asserted both
+// ways. Prints `<ok> of <total> cells`.
+//
+// ENV (`./make test-relation-shapes` sets both): BIT_REPO the repo root
+// (required), BIT_BIN the compiler under test (default bit-out/bin/bit).
+// ONE database per run, in one container labelled `bit.relshapes.live=1` and
+// removed on every path this process controls; every cell owns its tables.
+import { output } from "std/process"
+import { env, envOr, exit } from "std/os"
+import { mkdir, readFile, writeFile } from "std/fs"
+import { contains, hasSuffix, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { sleep, Millisecond } from "std/time"
+import {
+  dockerQuickTimeoutMs, dockerRun, hostPort, ownerLabelKey, requireDocker, selfPid, sweepOrphans,
+} from "../dockerlive"
+
+const pgImage: string = "postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"
+const runLabel: string = "bit.relshapes.live=1"
+const readyAttempts: int = 60
+const readyDelayMs: int = 1000
+const defaultTimeoutS: int = 1800
+const parallelism: int = 8
+const minCells: int = 350
+
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("relshapes: BIT_REPO is not set — run this through `./make test-relation-shapes`")
+  }
+  if (contains(r, "'")) {
+    panic("relshapes: BIT_REPO holds a single quote, which the generated shell cannot carry")
+  }
+  return r
+}
+
+fn tmpRoot(): string {
+  let t = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(t, "/")) {
+    return t[0:len(t) - 1]
+  }
+  return t
+}
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+fn put(path: string, text: string) {
+  writeFile(path, text) catch e {
+    panic("relshapes: cannot write ${path}: ${e.message()}")
+  }
+}
+
+fn makeDir(dir: string) {
+  mkdir(dir) catch e {
+    panic("relshapes: cannot create ${dir}: ${e.message()}")
+  }
+}
+
+fn slurp(path: string): string {
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
+// One database in one container; its port, or why it could not start.
+fn startPostgres(bin: string, name: string, ownerLabel: string): int! {
+  dockerRun(
+    bin,
+    [
+      "run", "--rm", "-d", "--name", name, "--label", runLabel, "--label", ownerLabel,
+      "-p", "127.0.0.1:0:5432", "-e", "POSTGRES_HOST_AUTH_METHOD=trust", pgImage,
+    ],
+  )?
+  let port = hostPort(bin, name, "5432/tcp")?
+  let i = 0
+  while (i < readyAttempts) {
+    let r = output(bin, ["exec", name, "pg_isready", "-U", "postgres"], dockerQuickTimeoutMs)
+    if (r.exitCode == 0 && contains(r.stdout, "accepting connections")) {
+      return port
+    }
+    sleep(readyDelayMs * Millisecond)
+    i = i + 1
+  }
+  fail newError("${name}: pg_isready never reported ready within ${readyAttempts * readyDelayMs}ms")
+}
+
+// Writes one program (and its modules) as a project of its own: a nested module
+// does not inherit an ancestor's bit.lock, so each directory carries one.
+fn writeProgram(dir: string, repo: string, p: Prog) {
+  makeDir(dir)
+  put("${dir}/bit.json", projectJson(repo))
+  put("${dir}/bit.lock", projectLock(repo))
+  put("${dir}/main.bit", p.main)
+  if (p.tests != "") {
+    put("${dir}/main.test.bit", p.tests)
+  }
+  if (p.world == "") {
+    return
+  }
+  makeDir("${dir}/world")
+  put("${dir}/world/bit.json", projectJson(repo))
+  put("${dir}/world/bit.lock", projectLock(repo))
+  put("${dir}/world/world.bit", p.world)
+  makeDir("${dir}/reader")
+  put("${dir}/reader/bit.json", projectJson(repo))
+  put("${dir}/reader/bit.lock", projectLock(repo))
+  put("${dir}/reader/reader.bit", p.reader)
+}
+
+fn writeCells(work: string, repo: string, all: []Cell) {
+  makeDir("${work}/cells")
+  let ids = ""
+  for c of all {
+    writeProgram("${work}/cells/${c.id}", repo, c.asIs)
+    writeProgram("${work}/cells/${c.id}.fix", repo, c.hinted)
+    ids = ids + c.id + "\n"
+  }
+  put("${work}/ids.txt", ids)
+}
+
+// variant.sh <dir> <test>: check, then build only if it checked, run only if it
+// built, `bit test` only for a cell with a test block; writes
+// `<check> <build> <run> <test>` to <dir>/rc.txt, -1 for a step that did not run.
+fn variantScript(bit: string, url: string): string {
+  let s = "#!/bin/sh\nd=\"$1\"\nt=\"$2\"\nexport RS_URL='${url}'\nb=-1\nr=-1\nx=-1\n"
+  s = s + "'${bit}' check \"$d\" > \"$d/check.log\" 2>&1\nc=$?\n"
+  s = s + "if [ \"$c\" -eq 0 ]; then\n"
+  s = s + "  '${bit}' build \"$d\" -o \"$d/prog\" > \"$d/build.log\" 2>&1\n  b=$?\n"
+  s = s + "  if [ \"$b\" -eq 0 ]; then\n"
+  s = s + "    \"$d/prog\" > \"$d/run.out\" 2> \"$d/run.err\"\n    r=$?\n"
+  s = s + "    if [ \"$t\" = 1 ]; then\n"
+  s = s + "      '${bit}' test \"$d\" > \"$d/test.log\" 2>&1\n      x=$?\n    fi\n"
+  s = s + "  fi\nfi\n"
+  return s + "printf '%s %s %s %s\\n' \"$c\" \"$b\" \"$r\" \"$x\" > \"$d/rc.txt\"\n"
+}
+
+// one.sh <id> <test>: the cell as written; when `bit check` rejects it, the
+// cell rewritten the way the hint says.
+fn cellScript(work: string): string {
+  let s = "#!/bin/sh\nid=\"$1\"\nt=\"$2\"\nd='${work}/cells/'\"$id\"\n"
+  s = s + "sh '${work}/variant.sh' \"$d\" \"$t\"\n"
+  s = s + "read c rest < \"$d/rc.txt\"\n"
+  s = s + "if [ \"$c\" -ne 0 ]; then\n  sh '${work}/variant.sh' \"$d.fix\" \"$t\"\nfi\n"
+  return s + "echo \"$id\" >> '${work}/done.txt'\n"
+}
+
+fn runCells(bit: string, url: string, work: string, all: []Cell, ms: int): int {
+  put("${work}/variant.sh", variantScript(bit, url))
+  put("${work}/one.sh", cellScript(work))
+  let jobs = ""
+  for c of all {
+    let t = 0
+    if (c.test) {
+      t = 1
+    }
+    jobs = jobs + "${c.id} ${t}\n"
+  }
+  put("${work}/jobs.txt", jobs)
+  let run = "#!/bin/sh\nxargs -L1 -P${parallelism} sh '${work}/one.sh' < '${work}/jobs.txt'\n"
+  put("${work}/run.sh", run)
+  if (fsChmod("${work}/run.sh", 448) != 0) { // 0o700
+    panic("relshapes: cannot make ${work}/run.sh executable")
+  }
+  return osRunBounded("${work}/run.sh", ms)
+}
+
+// Debugging aid: only the cells whose id contains `sub`.
+fn onlyMatching(all: []Cell, sub: string): []Cell {
+  let out = []Cell(0)
+  for c of all {
+    if (contains(c.id, sub)) {
+      out = append(out, c)
+    }
+  }
+  return out
+}
+
+fn main() {
+  let repo = repoRoot()
+  let bit = envOr("BIT_BIN", "${repo}/bit-out/bin/bit")
+  let all = cells()
+  if (len(all) < minCells) {
+    panic("relshapes: only ${len(all)} cells, under the ${minCells} floor; a table lost a row")
+  }
+  assertKnownListed(all)
+  let only = envOr("RELSHAPES_ONLY", "")
+  if (only != "") {
+    all = onlyMatching(all, only)
+  }
+  let dockerBin = requireDocker("relshapes")
+  sweepOrphans(dockerBin, runLabel)
+  let name = "bit-relshapes-${uuidFormat(uuidV4())}"
+  let pid = selfPid() catch e {
+    eprint("relshapes: ${e.message()}\n")
+    exit(1)
+    return
+  }
+  let port = startPostgres(dockerBin, name, "${ownerLabelKey}=${pid}") catch e {
+    eprint("relshapes: ${e.message()}\n")
+    output(dockerBin, ["rm", "-f", name], dockerQuickTimeoutMs)
+    exit(1)
+    return
+  }
+  let rc = judgeRun(bit, "postgres://postgres@127.0.0.1:${port}/postgres", repo, all)
+  output(dockerBin, ["rm", "-f", name], dockerQuickTimeoutMs)
+  if (only != "" && rc == 0) {
+    eprint("relshapes: RELSHAPES_ONLY=${only} ran ${len(all)} cells; a filtered run is a debugging aid, never a pass\n")
+    rc = 3
+  }
+  exit(rc)
+}
