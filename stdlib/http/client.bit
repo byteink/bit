@@ -255,11 +255,18 @@ fn defaultClientConfig(): TlsConfig {
 //              with `setMaxBodyBytes`. Read by the HTTP/1.1 path (#4585) and
 //              carried into the http2 engine's `Config.maxBodyBytes` on the
 //              `h2` leg (#4590, h2.bit).
+//   `redirects` how a 3xx response is treated (#6443, redirect.bit) —
+//              `Redirects.Follow(10)` unless a `Client` chose another with
+//              `setRedirects`.
+//   `deadline` the absolute `monotonic` deadline of a whole-request timeout
+//              (#2291), 0 for none; every hop of a followed redirect shares it.
 class RequestExtras {
   config: TlsConfig,
   block: string,
   h3Ports: map<string, int>,
   maxBody: int,
+  redirects: Redirects,
+  deadline: int,
 }
 
 // The extras a call with no `Client` behind it uses: `config` and `block` from
@@ -271,6 +278,8 @@ fn newRequestExtras(config: TlsConfig, block: string): RequestExtras {
     block = block,
     h3Ports = map<string, int>(),
     maxBody = defaultMaxBodyBytes,
+    redirects = defaultRedirects(),
+    deadline = 0,
   }
 }
 
@@ -281,8 +290,15 @@ fn newRequestExtras(config: TlsConfig, block: string): RequestExtras {
 // https leg's TLS and `extras.maxBody` as the response body budget.
 // `request` is exactly this with `extras.block` always "", so a caller
 // carrying no extra headers gets byte-identical wire output to before #2290.
+// A 3xx answer is followed per `extras.redirects` (`settle`, redirect.bit).
 fn requestBlock(method: string, url: string, body: string, extras: RequestExtras): Response! {
   let u = parseUrl(url)?
+  let res = exchangeBlock(method, u, body, extras)?
+  return settle(res, method, url, body, extras)?
+}
+
+// One exchange of `requestBlock`, with no redirect handling.
+fn exchangeBlock(method: string, u: Url, body: string, extras: RequestExtras): Response! {
   if (u.h3) {
     return h3Exchange(u, method, body, extras.block, extras.config)?
   }
@@ -425,9 +441,17 @@ fn requestTimeoutTls(
   timeoutMs: int,
   extras: RequestExtras,
 ): Response! {
-  let block = extras.block
   let u = parseUrl(url)?
   let deadline = monotonic().ns + timeoutMs * 1000000
+  let timed = withDeadline(extras, deadline)
+  let res = exchangeDeadline(method, u, body, timed)?
+  return settle(res, method, url, body, timed)?
+}
+
+// One exchange of `requestTimeoutTls` against `extras.deadline`, with no
+// redirect handling.
+fn exchangeDeadline(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  let deadline = extras.deadline
   if (u.h3) {
     return h3ExchangeDeadline(u, method, body, deadline, extras)?
   }
@@ -448,7 +472,7 @@ fn requestTimeoutTls(
     return res
   }
   let conn = dialDeadline(u.host, u.port, deadline)?
-  let req = buildRequest(method, u, block, body)
+  let req = buildRequest(method, u, extras.block, body)
   return exchangeOn(netStream{ conn = conn }, req, method, extras.maxBody)?
 }
 
@@ -523,6 +547,15 @@ export class Client {
   h3Ports: map<string, int>
   headers: []Header
   maxBody: int
+  redirects: Redirects
+
+  // How this client treats a 3xx response (#6443): `Redirects.Follow(10)` by
+  // default, `Redirects.None` for the raw 3xx, `Redirects.FollowAllowing(n,
+  // allow)` for the explicit opt-ins. See redirect.bit for every rule and
+  // `Response.url`/`Response.redirects` for where a followed request ended up.
+  export setRedirects(policy: Redirects) {
+    this.redirects = policy
+  }
 
   // Raise or lower the byte budget this client reads a response body under
   // (#4585). It defaults to `defaultMaxBodyBytes` (32 MiB, message.bit): a
@@ -579,6 +612,8 @@ export class Client {
       block = block,
       h3Ports = this.h3Ports,
       maxBody = this.maxBody,
+      redirects = this.redirects,
+      deadline = 0,
     }
   }
 
@@ -612,22 +647,8 @@ export class Client {
     let block = serializeHeaders(mergeHeaders(this.headers, headers))?
     let extras = this.extrasWith(block)
     let u = parseUrl(url)?
-    if (u.h3 || !u.https) {
-      return requestBlock(method, url, body, extras)?
-    }
-    let key = h2glueAuthority(u)
-    let cached = cachedH3Port(this.h3Ports, key)
-    if (cached != 0) {
-      let hu = Url{ host = u.host, port = cached, path = u.path, https = true, h3 = true }
-      return h3Exchange(hu, method, body, block, this.tls)?
-    }
-    let cfg = this.tls
-    if (len(cfg.alpn) == 0) {
-      cfg.alpn = ["h2", "http/1.1"]
-    }
-    let res = httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, extras)?
-    this.learnAltSvc(key, res)
-    return res
+    let res = exchangeClient(method, u, body, extras)?
+    return settle(res, method, url, body, extras)?
   }
 
   // GET `url` through this client (HTTP/3 when discovered, else TLS or cleartext).
@@ -687,7 +708,39 @@ export fn newClientTls(config: TlsConfig): Client {
     h3Ports = map<string, int>(),
     headers = []Header(0),
     maxBody = defaultMaxBodyBytes,
+    redirects = defaultRedirects(),
   }
+}
+
+// One exchange of `Client.requestWith` (an `https+h3://` or `http://` URL as
+// `exchangeBlock`; an `https://` one upgrading to a cached Alt-Svc endpoint,
+// and learning new ones), with no redirect handling.
+fn exchangeClient(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  if (u.h3 || !u.https) {
+    return exchangeBlock(method, u, body, extras)?
+  }
+  let key = h2glueAuthority(u)
+  let cached = cachedH3Port(extras.h3Ports, key)
+  if (cached != 0) {
+    let hu = Url{ host = u.host, port = cached, path = u.path, https = true, h3 = true }
+    return h3Exchange(hu, method, body, extras.block, extras.config)?
+  }
+  let cfg = extras.config
+  if (len(cfg.alpn) == 0) {
+    cfg.alpn = ["h2", "http/1.1"]
+  }
+  let res = httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, extras)?
+  learnAltSvcInto(extras.h3Ports, key, res)
+  return res
+}
+
+// One hop of a followed redirect: the deadline path when the request has a
+// whole-request deadline (`requestTimeout`), the client path otherwise.
+fn sendHop(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  if (extras.deadline != 0) {
+    return exchangeDeadline(method, u, body, extras)?
+  }
+  return exchangeClient(method, u, body, extras)?
 }
 
 // Cached h3 port for `key`, or 0 — read side shared by `requestWith`/`requestTimeoutTls` (#3522).

@@ -1,0 +1,427 @@
+// Bit standard library — http module: following redirects safely (#6443).
+//
+// A 3xx response used to be handed to the caller as is, so every caller wrote
+// its own loop and got the security wrong alone: PHP's HTTP wrapper re-sent
+// `Authorization`, `Cookie` and `Proxy-Authorization` across hosts and across
+// an https to http downgrade (CVE-2026-91766), curl fixed the same leak twice
+// (CVE-2018-1000007, CVE-2022-27776) and Go needed several fixes in the same
+// code (CVE-2024-45336 restored credentials on a later hop that returned to
+// the origin). This file is the one loop all three send paths share
+// (`requestBlock`, `requestTimeoutTls`, `Client.requestWith`, client.bit), so
+// there is exactly one place the rules live.
+//
+// The rules, each the strictest of Go, reqwest, curl and Java:
+//
+//   limit        up to the policy's hop count (`Redirects.Follow(10)` is the
+//                default); one redirect past it is an error naming the limit
+//                and the last URL.
+//   credentials  on ANY change of scheme, host or port the four credential
+//                headers are removed from the block, `setHeader` defaults
+//                included, and the filtered block is the one every later hop
+//                carries, so a hop back to the origin cannot restore them.
+//   downgrade    https (or https+h3) to http is an error unless the caller
+//                opted in with `RedirectAllow.Downgrade`.
+//   targets      only http, https and https+h3; any other scheme is an error.
+//   method       RFC 9110 §15.4: 303 becomes GET (HEAD stays HEAD), 301/302
+//                turn a POST into a GET, 307/308 keep both. A hop that drops
+//                the body also drops the body headers.
+//   replay       a redirect that still carries a body to ANOTHER origin is an
+//                error unless the caller opted in with
+//                `RedirectAllow.ReplayBody`: a replayed body is a data-leak
+//                and a duplicate-side-effect risk. A body-less request is
+//                not (the usual http to https 308 on a GET).
+//   Location     resolved per RFC 3986 §5; a missing or unparsable one hands
+//                the 3xx back unchanged, never an error.
+//
+// The body of a redirect response is already read, under the client's
+// `maxBody`, before `readResponse` returns, and every connection is
+// `Connection: close`, so nothing is left half-read between hops.
+import { lastIndexOf, join } from "std/strings"
+
+// The hop limit of the default policy, as Go and reqwest have it.
+const defaultRedirectLimit = 10
+
+// What a `Redirects.FollowAllowing` policy permits beyond the strict default.
+export enum RedirectAllow {
+  // Follow an https (or https+h3) URL to a plain http one.
+  Downgrade,
+  // Replay a request body to another origin on a 307/308.
+  ReplayBody,
+  // Both of the above.
+  Both,
+}
+
+// How a `Client` treats a 3xx response: the one typed policy option. The free
+// functions (`get`, `post`, `request`, ...) use `Redirects.Follow(10)`.
+export enum Redirects {
+  // Return the 3xx response unchanged.
+  None
+  // Follow up to this many redirects, strictly: no https to http, and a body
+  // is never replayed to another origin.
+  Follow(int)
+  // As `Follow`, with the named opt-ins.
+  FollowAllowing(int, RedirectAllow)
+
+  // The hop limit; 0 means do not follow.
+  limit(): int {
+    match (this) {
+      None => return 0
+      Follow(n) => return n
+      FollowAllowing(n, _) => return n
+    }
+  }
+
+  downgradeOk(): bool {
+    match (this) {
+      None => return false
+      Follow(_) => return false
+      FollowAllowing(_, allow) => return allow == RedirectAllow.Downgrade ||
+        allow == RedirectAllow.Both
+    }
+  }
+
+  replayOk(): bool {
+    match (this) {
+      None => return false
+      Follow(_) => return false
+      FollowAllowing(_, allow) => return allow == RedirectAllow.ReplayBody ||
+        allow == RedirectAllow.Both
+    }
+  }
+}
+
+fn defaultRedirects(): Redirects {
+  return Redirects.Follow(defaultRedirectLimit)
+}
+
+fn isRedirectStatus(status: int): bool {
+  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+
+// ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+
+fn schemeName(u: Url): string {
+  if (u.h3) {
+    return "https+h3"
+  }
+  if (u.https) {
+    return "https"
+  }
+  return "http"
+}
+
+// `u` as text: the scheme, the authority (port only when not the scheme's
+// default, `hostHeaderValue`, client.bit) and the path with its query.
+fn urlString(u: Url): string {
+  return "${schemeName(u)}://${hostHeaderValue(u)}${u.path}"
+}
+
+// Same scheme, host and port: the origin boundary credentials do not cross.
+fn sameOrigin(a: Url, b: Url): bool {
+  return a.https == b.https &&
+    a.h3 == b.h3 &&
+    a.port == b.port &&
+    toLower(a.host) == toLower(b.host)
+}
+
+fn isAlpha(c: byte): bool {
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  return c >= 'A' && c <= 'Z'
+}
+
+// True if `c` may appear in a scheme (RFC 3986 §3.1) at position `at`.
+fn schemeByte(c: byte, at: int): bool {
+  if (isAlpha(c)) {
+    return true
+  }
+  if (at == 0) {
+    return false
+  }
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  return c == '+' || c == '-' || c == '.'
+}
+
+// The index of the ':' ending a leading scheme in `ref`, or -1 when `ref`
+// does not begin with one (a relative reference).
+fn schemeEnd(ref: string): int {
+  let i = 0
+  while (i < len(ref)) {
+    if (ref[i] == ':') {
+      if (i == 0) {
+        return 0 - 1
+      }
+      return i
+    }
+    if (!schemeByte(ref[i], i)) {
+      return 0 - 1
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// RFC 3986 §5.2.4 on the path part of `p` (which starts with "/"); a query
+// is carried through untouched.
+fn removeDotSegments(p: string): string {
+  let q = indexOf(p, "?")
+  let path = p
+  let query = ""
+  if (q >= 0) {
+    path = p[0:q]
+    query = p[q:len(p)]
+  }
+  let parts = split(path, "/")
+  let out = []string(0)
+  let i = 1
+  while (i < len(parts)) {
+    let last = i == len(parts) - 1
+    let seg = parts[i]
+    if (seg == "." || seg == "..") {
+      if (seg == ".." && len(out) > 0) {
+        out = out[0:len(out) - 1]
+      }
+      if (last) {
+        out = append(out, "")
+      }
+    } else {
+      out = append(out, seg)
+    }
+    i = i + 1
+  }
+  return "/" + join(out, "/") + query
+}
+
+// RFC 3986 §5.2.3: the path a relative `ref` names against `basePath`.
+fn mergePath(basePath: string, ref: string): string {
+  if (ref[0] == '/') {
+    return removeDotSegments(ref)
+  }
+  let q = indexOf(basePath, "?")
+  let bp = basePath
+  if (q >= 0) {
+    bp = basePath[0:q]
+  }
+  if (ref[0] == '?') {
+    return bp + ref
+  }
+  return removeDotSegments(bp[0:lastIndexOf(bp, "/") + 1] + ref)
+}
+
+// A `Location` resolved to a `Url`, or `ok == false` when there is nothing to
+// follow (missing, empty or unparsable).
+class Target { ok: bool, url: Url }
+
+fn parsedTarget(base: Url, text: string): Target {
+  let u = parseUrl(text) catch _ {
+    return Target{ ok = false, url = base }
+  }
+  return Target{ ok = true, url = u }
+}
+
+// A `ref` with its own scheme: followed only for http, https and https+h3,
+// and only in the `scheme://` form; any other scheme is an error.
+fn absoluteTarget(base: Url, ref: string, colon: int): Target! {
+  let scheme = toLower(ref[0:colon])
+  if (scheme != "http" && scheme != "https" && scheme != "https+h3") {
+    fail newError("redirect to ${scheme}: is not allowed; only http, https and https+h3 targets are followed")
+  }
+  if (!hasPrefix(ref[colon + 1:len(ref)], "//")) {
+    return Target{ ok = false, url = base }
+  }
+  return parsedTarget(base, ref)
+}
+
+// `loc` resolved against `base` per RFC 3986 §5. The fragment is dropped (it
+// never goes on the wire).
+fn resolveLocation(base: Url, loc: string): Target! {
+  let ref = loc
+  let hash = indexOf(ref, "#")
+  if (hash >= 0) {
+    ref = ref[0:hash]
+  }
+  if (len(ref) == 0 || firstForbiddenUrlByte(ref) >= 0) {
+    return Target{ ok = false, url = base }
+  }
+  let colon = schemeEnd(ref)
+  if (colon >= 0) {
+    return absoluteTarget(base, ref, colon)?
+  }
+  if (hasPrefix(ref, "//")) {
+    return parsedTarget(base, schemeName(base) + ":" + ref)
+  }
+  let path = mergePath(base.path, ref)
+  return Target{
+    ok = true,
+    url = Url{ host = base.host, port = base.port, path = path, https = base.https, h3 = base.h3 },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One hop
+// ---------------------------------------------------------------------------
+
+// The request to send for a followed redirect.
+class Hop { ok: bool, url: Url, method: string, body: string, extras: RequestExtras }
+
+// The method a `status` redirect of a `method` request is sent with
+// (RFC 9110 §15.4).
+fn redirectedMethod(status: int, method: string): string {
+  if (status == 303) {
+    if (method == "HEAD") {
+      return "HEAD"
+    }
+    return "GET"
+  }
+  if (method != "POST") {
+    return method
+  }
+  if (status == 301 || status == 302) {
+    return "GET"
+  }
+  return method
+}
+
+// `block` without the headers that authenticate the origin it was built for.
+fn withoutCredentials(block: string): string {
+  let b = withoutHeaderLines(block, "Authorization")
+  b = withoutHeaderLines(b, "Cookie")
+  b = withoutHeaderLines(b, "Proxy-Authorization")
+  return withoutHeaderLines(b, "WWW-Authenticate")
+}
+
+// `block` without the headers that describe a body the next hop does not send.
+fn withoutBodyHeaders(block: string): string {
+  let b = withoutHeaderLines(block, "Content-Type")
+  b = withoutHeaderLines(b, "Content-Length")
+  b = withoutHeaderLines(b, "Content-Encoding")
+  return withoutHeaderLines(b, "Transfer-Encoding")
+}
+
+// `extras` for the next hop. Returns `extras` itself, no rebuild, when no
+// header has to change (same origin, body kept) — the common case.
+fn hopExtras(extras: RequestExtras, crossOrigin: bool, keepBody: bool): RequestExtras {
+  if (!crossOrigin && keepBody) {
+    return extras
+  }
+  let block = extras.block
+  if (crossOrigin) {
+    block = withoutCredentials(block)
+  }
+  if (!keepBody) {
+    block = withoutBodyHeaders(block)
+  }
+  return RequestExtras{
+    config = extras.config,
+    block = block,
+    h3Ports = extras.h3Ports,
+    maxBody = extras.maxBody,
+    redirects = extras.redirects,
+    deadline = extras.deadline,
+  }
+}
+
+// `extras` under the whole-request `deadline` of `requestTimeout`, which every
+// hop of a followed redirect shares.
+fn withDeadline(extras: RequestExtras, deadline: int): RequestExtras {
+  return RequestExtras{
+    config = extras.config,
+    block = extras.block,
+    h3Ports = extras.h3Ports,
+    maxBody = extras.maxBody,
+    redirects = extras.redirects,
+    deadline = deadline,
+  }
+}
+
+// What to send after `res`, a redirect to `cur`'s `method` request carrying
+// `body`: `ok == false` hands `res` back as is (no usable Location); an error
+// is a refused hop (downgrade, replayed body, scheme).
+fn planHop(res: Response, cur: Url, method: string, body: string, extras: RequestExtras): Hop! {
+  let policy = extras.redirects
+  let t = resolveLocation(cur, header(res.headers, "location"))?
+  if (!t.ok) {
+    return Hop{ ok = false, url = cur, method = method, body = body, extras = extras }
+  }
+  let next = t.url
+  if (cur.https && !next.https && !policy.downgradeOk()) {
+    fail newError("redirect from ${urlString(cur)} to ${urlString(next)} downgrades https to http; opt in with Redirects.FollowAllowing(n, RedirectAllow.Downgrade)")
+  }
+  let m = redirectedMethod(res.status, method)
+  let keepBody = m == method && res.status != 303
+  let sent = ""
+  if (keepBody) {
+    sent = body
+  }
+  let cross = !sameOrigin(cur, next)
+  if (cross && len(sent) > 0 && !policy.replayOk()) {
+    fail newError("redirect ${itoa(res.status)} from ${urlString(cur)} to ${urlString(next)} would replay the request body to another origin; opt in with Redirects.FollowAllowing(n, RedirectAllow.ReplayBody)")
+  }
+  return Hop{
+    ok = true,
+    url = next,
+    method = m,
+    body = sent,
+    extras = hopExtras(extras, cross, keepBody),
+  }
+}
+
+// Follows the redirects after `first`, the response to `method url`, under
+// `extras.redirects`, every hop under `extras.deadline`. The returned response
+// carries the final URL and the hop count.
+fn followRedirects(
+  first: Response,
+  method: string,
+  url: string,
+  body: string,
+  extras: RequestExtras,
+): Response! {
+  let limit = extras.redirects.limit()
+  let res = first
+  let cur = parseUrl(url)?
+  let curText = url
+  let m = method
+  let b = body
+  let ex = extras
+  let hops = 0
+  while (limit > 0 && isRedirectStatus(res.status)) {
+    let hop = planHop(res, cur, m, b, ex)?
+    if (!hop.ok) {
+      break
+    }
+    if (hops >= limit) {
+      fail newError("too many redirects: limit is ${itoa(limit)}, last URL ${curText}")
+    }
+    cur = hop.url
+    curText = urlString(cur)
+    m = hop.method
+    b = hop.body
+    ex = hop.extras
+    res = sendHop(m, cur, b, ex)?
+    hops = hops + 1
+  }
+  res.url = curText
+  res.redirects = hops
+  return res
+}
+
+// The one check every response passes: anything but a redirect status is
+// stamped with the URL it answered and returned, no allocation.
+fn settle(
+  res: Response,
+  method: string,
+  url: string,
+  body: string,
+  extras: RequestExtras,
+): Response! {
+  if (!isRedirectStatus(res.status)) {
+    res.url = url
+    return res
+  }
+  return followRedirects(res, method, url, body, extras)?
+}
