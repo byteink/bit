@@ -2241,6 +2241,9 @@ constraint     = type_name { "&" type_name } .   (* one or more interface bounds
   that takes none (a non-generic class, a predeclared type, a type parameter)
   takes no list, and a generic type written with none where a type is required
   (`let x: Pair`) is refused. Each is **E0058**.
+- A bound is an interface name and carries no type arguments, so a generic
+  interface cannot be a bound yet: `fn f<S: Store>(s: S)` for `interface
+  Store<T>` is **E0058**.
 
 Example:
 
