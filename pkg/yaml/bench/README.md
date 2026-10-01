@@ -10,7 +10,9 @@ arena first), and saphyr and yaml-rust2 in Rust.
 ./pkg/yaml/bench/run.sh             build, verify, measure, publish
 ./pkg/yaml/bench/run.sh --verify    build + prove every side agrees, no timing
 ./pkg/yaml/bench/run.sh --measure   build, verify, measure; publish nothing
-./pkg/yaml/bench/run.sh --report    re-render from out/ as it stands
+./pkg/yaml/bench/run.sh --report    record out/ as it stands into results.json, then render
+./pkg/yaml/bench/run.sh --render    rebuild the README block and RESULTS.md from the last
+                                    recorded results.json: no build, no docker, no timing
 ```
 
 `--measure` accepts a development compiler (`BIT=./bit-out/bin/bit`), because
