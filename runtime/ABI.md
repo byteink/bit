@@ -2595,6 +2595,56 @@ slot** — see `docs/context-propagation.md`'s decision: this is the primitive
 `std/trace` and later request-scoped mechanisms build on, not a
 finished feature.
 
+### 9.1 x86_64-windows: xmm6..xmm15 across a foreign-to-Bit entry (#6434)
+
+Win64 makes `xmm6`..`xmm15` nonvolatile: a function a foreign caller reaches must
+return all **128 bits** of each unchanged. Bit's backend uses `xmm14`/`xmm15` as
+its float scratch pair (`xFScratch1`/`xFScratch2`, `compiler/x64.bit`) on every
+target and allocates `xmm0`..`xmm13`, so the rule is stated once, here.
+
+**The rule.** On Win64 every Bit function preserves, in full, each nonvolatile
+XMM it can write, and nothing else is the entry's job:
+
+- `xBuildSavedXmm` (`compiler/x64compile.bit`) lists the registers a function
+  owes: the `xmm6`..`xmm13` its allocation placed a float in, plus `xmm14` and
+  `xmm15` whenever the function holds any float value (a spilled one included,
+  since every float load, convert and move cycle goes through the scratch pair).
+  A function with no float value saves nothing. SysV preserves no XMM and saves
+  none; its code is unchanged.
+- The save and the restore are `movups` into a 16-byte frame slot
+  (`xXmmSaveOffset`, `xMovUpsStore`/`xMovUpsLoad` in `compiler/x64frame.bit`),
+  never `movsd`: a `movsd` keeps 64 bits and its load ZEROES the upper 64.
+- Bit-to-Bit calls follow the same rule, so a foreign caller of any Bit function
+  gets its XMMs back whole without a trampoline. No entry below needs one.
+- The panic boundary (`bit_rt_panic_boundary_arm`/`take`, §12) is a non-local
+  return that skips epilogues, so it saves and restores the same registers in
+  full: the low halves with `movsd` in context words 10..19 and the high halves
+  with `movhpd` in `bndFpHi` (record words 59..68).
+- `schedSwitch` (`runtime/sched/switch.bit`) still saves only the low 64 bits.
+  That is sound because it switches between green tasks, whose stacks and entry
+  points are all Bit's own (`schedTaskInit`); no foreign frame is ever resumed
+  across it. A foreign thread calling a Bit `@symbol` export runs on its own
+  stack, not in a task.
+
+**Every foreign-to-Bit entry on x86_64-windows.** Found by listing every
+`entryOf(...)` handed to the OS and every `@symbol` export; a task entry
+(`mainTrampoline`, `winSpawnTrampoline`) and the `stwSafepoint` shim target are
+reached from Bit code only and are not foreign entries.
+
+| Entry | Called by | Preservation |
+| --- | --- | --- |
+| `winMain`, `@symbol("_start")` (`runtime/root/windows/boot.bit`) | the loader, as `AddressOfEntryPoint` | Never returns to its caller: it ends in `ExitProcess`. Preserved anyway by the rule above. |
+| `workerBody` (`runtime/root/windows/boot.bit`, `CreateThread` in `boot`) | the OS thread start thunk | Returns only into `RtlExitUserThread`, which does not return. The rule above holds for every frame it runs. |
+| `threadTrampoline` (`runtime/thread/windows/spawn.bit`, `CreateThread` in `threadStart`) | the OS thread start thunk | Same as `workerBody`. |
+| `vehHandler` (`runtime/root/windows/signal.bit`, `AddVectoredExceptionHandler` in `installFatalSignalHandlers`) | `ntdll` exception dispatch, which resumes after it returns | Returns to ntdll: preserved by the rule above (`movups` save of whatever it and its callees write). Fixed here; before #6434 it came back with `xmm14`/`xmm15` and the upper halves of `xmm6`..`xmm13` altered. |
+| `consoleCtrlHandler` (`runtime/root/windows/signal.bit`, `SetConsoleCtrlHandler` in `installConsoleCtrlHandler`) | the OS console-control thread | Same as `vehHandler`. |
+| any user `export @symbol` function | a C caller | Same rule: it is an ordinary Bit function. |
+
+`test-windows-smoke` runs `_tests_/stress/thread/winxmm/` on a real Win64 host: an asm stub
+acting as a C caller loads a known 128-bit pattern into `xmm15` and into `xmm6`
+with a distinct upper half, calls a Bit function doing float work, and checks
+both patterns afterwards.
+
 ### Exported C symbols (all `bit_rt_*`, one process-wide runtime instance)
 
 **This table is a selection, not a census.** Every row below is exported and
@@ -3067,8 +3117,9 @@ bit_rt_fatal(msg: *const RtBytes)               -> noreturn
   header and the copy of the bytes. **The inline capacity is 256 bytes and a
   longer message is TRUNCATED to it** — the copy runs inside a panic door and
   may not allocate a bigger destination. That capacity is why a record is
-  `bndWords` = 59 words (`runtime/sched/boundary.bit`): 22 context words,
-  `prev`/`code`/`msg`, the two-word header, then the 32 words of bytes. A
+  `bndWords` = 69 words (`runtime/sched/boundary.bit`): 22 context words,
+  `prev`/`code`/`msg`, the two-word header, the 32 words of bytes, then 10 words
+  holding the high 64 bits of `xmm6`..`xmm15` (x64 only; §9.1). A
   message-free door (§12.1) passes `msg` as 0, nothing is copied, and
   `bit_rt_panic_boundary_msg` answers 0.
 - `bit_rt_fatal` is the always-fatal door — today's `rootPanic` body verbatim
