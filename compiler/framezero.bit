@@ -1,0 +1,226 @@
+// #6410: the frame words a prologue zeroes, so class 8's conservative scan
+// (`stwScanTasks`, runtime/stw/stwscan.bit) never roots a word this
+// activation has not written. Sibling of both backends, same module.
+//
+// ## Why a word can be stale
+//
+// Class 8 scans the running task's stack from the live sp to its top, every
+// word, type-blind. A frame is only ever SCANNED while it is suspended at a
+// call, so the words that matter are the ones a suspended activation has not
+// written yet: an alignment pad nothing ever writes, a spill slot whose first
+// definition comes after the call, an outgoing-argument word wider than this
+// call's arguments. Each still holds whatever a dead frame left at that
+// address. bench/cases/strmap measured it: sliceKeys' pad slot still held
+// buildBlob's slice header, so a back-edge collection kept buildBlob's dead
+// 8 MiB buffer alive.
+//
+// ## What is zeroed, and why only that
+//
+// Every frame word the prologue does not write itself, minus the spill slots
+// the entry block provably writes before the first point at which the frame
+// can be scanned (`frameScanStart`). The entry block runs before anything
+// else on every path, so a slot it writes ahead of that point is written at
+// every scan of this activation; the rest are zeroed once per call, which is
+// the cheapest place: the first scan point may already be in the entry block.
+// A function with no scan point at all is never suspended where a scan can
+// see it, so it pays nothing.
+//
+// ## Why the prediction cannot drift silently
+//
+// `entryWrittenSlots` answers from the IR and the allocation, ahead of
+// emission. Each backend records the frame stores emission actually makes in
+// that same window and asserts the prediction is a subset (`zTrack`/`zWrote`
+// on A64Ctx and XCtx), and that no safepoint is recorded inside it. A claim
+// emission does not honour fails the build instead of leaving a stale root.
+
+// The first position of the entry block at which this activation's frame can
+// be scanned: a safepoint op (a call, an allocation, a closure), an `asm` or
+// a `syscall` block. The entry's terminator when the block holds none of
+// those: a back-edge poll is emitted there, after every other instruction.
+// -1 when nothing anywhere in `f` can expose the frame to a scan.
+fn frameScanStart(f: IrFunc): int {
+  if (!hasScanPoint(f)) {
+    return -1
+  }
+  let b = f.blocks[0]
+  let i = b.instsStart + b.paramCount
+  let last = b.instsStart + b.instsLen - 1
+  while (i < last) {
+    if (isScanOp(f.instrs[i].op)) {
+      return i
+    }
+    i = i + 1
+  }
+  return last
+}
+
+fn isScanOp(op: Op): bool {
+  return isSafepointOp(op) || op == Op.Asm || op == Op.Syscall
+}
+
+fn hasScanPoint(f: IrFunc): bool {
+  for ins of f.instrs {
+    if (isScanOp(ins.op)) {
+      return true
+    }
+  }
+  return hasBackEdgeSafepoint(f)
+}
+
+// What `entryWrittenSlots` reads: one function's IR, its allocation and
+// copy roots (`IntervalBuild.roots`), the allocator's slot count, and the two
+// sets of definitions the backend emits nothing for. `skipConst` is each
+// backend's own; `noDef` is arm64's fused compares, or x64's folded address
+// adds and fused compares. One per function compiled.
+class ZeroQuery {
+  ctx: TypeContext,
+  f: IrFunc,
+  locs: []RegLoc,
+  roots: []int,
+  numSlots: int,
+  skipConst: []bool,
+  noDef: []bool,
+}
+
+// Per allocator spill slot: does the entry block write it before `scanAt`?
+// A definition counts only when it is its own copy root (an alias writes no
+// slot of its own), owns a real slot (a remat constant has none), and its
+// emission writes a result at all (`arm64WritesResult` minus `noDef`). The
+// entry's params count: `bindIncomingArgs` and `xBindIncomingArgs` move
+// every one into its home before the body runs.
+fn entryWrittenSlots(q: ZeroQuery, scanAt: int): []bool {
+  let wrote = []bool(q.numSlots)
+  let v = q.f.blocks[0].instsStart
+  while (v < scanAt) {
+    let loc = q.locs[v]
+    if (loc.isSpill && loc.index >= 0 && q.roots[v] == v && writesSlot(q, v)) {
+      wrote[loc.index] = true
+    }
+    v = v + 1
+  }
+  return wrote
+}
+
+fn writesSlot(q: ZeroQuery, v: int): bool {
+  return !q.noDef[v] && arm64WritesResult(q.ctx, q.f, q.skipConst, v)
+}
+
+// arm64's plan, set on `cx` once it is built: which words the prologue zeroes
+// and the slots the guard holds emission to having stored first.
+fn a64PlanFrameZeroes(cx: A64Ctx, roots: []int) {
+  let q = ZeroQuery{
+    ctx = cx.module.ctx, f = cx.f, locs = cx.result.locations, roots = roots,
+    numSlots = cx.result.numSpillSlots, skipConst = cx.skipConst, noDef = cx.fuseCmp,
+  }
+  let scanAt = frameScanStart(cx.f)
+  let wrote = entryWrittenSlots(q, scanAt)
+  cx.frame.zeroOffs = a64FrameZeroOffs(cx.frame, wrote, scanAt)
+  cx.zScanAt = scanAt
+  cx.zClaims = claimedSlotOffs(wrote, cx.frame.outgoingBytes, 8)
+}
+
+// The window closes at `zScanAt`, which is always emitted (the entry block is
+// never dead), so the claims are checked there, against what it stored.
+fn closeZeroWindow(claims: []int, stored: []int, bi: int, idx: int, scanAt: int) {
+  if (bi == 0 && idx == scanAt) {
+    assertClaimsStored(claims, stored)
+  }
+}
+
+// The sp-relative words an AArch64 prologue zeroes, ascending: the outgoing
+// argument area (a call writes only its own arguments), every spill slot the
+// entry does not write first, and the alignment pad between the saved FPRs and
+// the frame record. The poll-address cache is not here: `emitPollCachePrefetch`
+// fills it before the body runs.
+fn a64FrameZeroOffs(fr: FrameInfo, wrote: []bool, scanAt: int): []int {
+  let offs = []int(0)
+  if (scanAt < 0 || fr.frameless) {
+    return offs
+  }
+  let off = 0
+  while (off < fr.outgoingBytes) {
+    offs = append(offs, off)
+    off = off + 8
+  }
+  offs = appendUnwrittenSlots(offs, wrote, fr.outgoingBytes, 8)
+  off = fprSaveOffset(fr, len(fr.savedFpr))
+  while (off < savedFpOffset(fr)) {
+    offs = append(offs, off)
+    off = off + 8
+  }
+  return offs
+}
+
+// The rbp-relative words an x86-64 prologue zeroes: every allocator spill slot
+// the entry does not write first, and the alignment pad at the frame's bottom.
+// The poll-address cache sits above the allocator's slots (`wrote` does not
+// reach it) and `xEmitPollCachePrefetch` fills it before the body runs. No
+// outgoing area: each call reserves its own (`xMarshalArgs`).
+fn xFrameZeroOffs(fr: XFrame, wrote: []bool, scanAt: int): []int {
+  let offs = []int(0)
+  if (scanAt < 0) {
+    return offs
+  }
+  offs = appendUnwrittenSlots(offs, wrote, xSpillOffset(fr, 0), -8)
+  let used = 8 * (len(fr.savedGpr) + fr.numSpillSlots + len(fr.savedXmm))
+  let off = -(8 * len(fr.savedGpr) + fr.frameSize)
+  while (off < -used) {
+    offs = append(offs, off)
+    off = off + 8
+  }
+  return offs
+}
+
+// The x86-64 prologue's half, after its XMM saves: one `movq $0` per word. It
+// moves no rsp, so it needs no Win64 unwind code.
+fn xEmitFrameZeroes(cx: XCtx) {
+  for off of cx.frame.zeroOffs {
+    xMovStoreImm(cx.buf, xMemB(XReg64.Rbp, off), 0)
+  }
+}
+
+// Slot `s` lives at `base + step * s` in both backends' layouts.
+fn appendUnwrittenSlots(offs: []int, wrote: []bool, base: int, step: int): []int {
+  let s = 0
+  while (s < len(wrote)) {
+    if (!wrote[s]) {
+      offs = append(offs, base + step * s)
+    }
+    s = s + 1
+  }
+  return offs
+}
+
+// The offsets `entryWrittenSlots` claims the window writes, in the same
+// frame-relative terms emission records them in.
+fn claimedSlotOffs(wrote: []bool, base: int, step: int): []int {
+  let offs = []int(0)
+  let s = 0
+  while (s < len(wrote)) {
+    if (wrote[s]) {
+      offs = append(offs, base + step * s)
+    }
+    s = s + 1
+  }
+  return offs
+}
+
+// The guard: every slot claimed written was stored by emission inside the
+// window. Linear in both lists, which are bounded by the entry block's size.
+fn assertClaimsStored(claims: []int, stored: []int) {
+  for c of claims {
+    assert(
+      intInList(stored, c),
+      "#6410: a slot claimed written before the first scan point was not stored",
+    )
+  }
+}
+
+fn intInList(xs: []int, x: int): bool {
+  for y of xs {
+    if (y == x) {
+      return true
+    }
+  }
+  return false
+}
