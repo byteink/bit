@@ -2412,7 +2412,9 @@ ordinary identifiers everywhere else. Only `asm` itself is reserved.
 - Every register named by `input` or `result`, and every **callee-saved**
   register named by `clobber`, is **excluded from the register allocator for
   the whole enclosing function**, so no value can be parked in a register the
-  block overwrites.
+  block overwrites. Callee-saved means callee-saved under *either* x64
+  convention (`rbx`, `rsi`, `rdi`, `r12`..`r15`), because one `x64` payload
+  serves every x64 target.
 - A **caller-saved** register named by `clobber` is a **clobber point at the
   block**, exactly as a call is one: no value that is live across the block may
   sit in a caller-saved register, and the register stays allocatable wherever no
