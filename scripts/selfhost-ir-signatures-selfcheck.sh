@@ -233,6 +233,38 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fi
   rm -f "$src96"
 
+  # #6428-bare-literal-instantiated: POSITIVE, the template becomes its
+  # instantiation and a member read through it resolves; REJECTION, the
+  # tree names a DIFFERENT class.
+  o28=$(printf '68:7: p: Pair\n69:11: p.first("y"): <error>\n')
+  b28=$(printf '68:7: p: Pair<string, StrStore>\n69:11: p.first("y"): string\n')
+  s28=$(explainMismatch "$o28" "$b28" types)
+  if [ "$s28" != "6428-bare-literal-instantiated" ]; then
+    echo "FAIL: the #6428 bare-literal shape was not explained (sig='$s28')"; fail=1
+  fi
+  s28r=$(explainMismatch "$o28" "$(printf '68:7: p: Box<i64>\n69:11: p.first("y"): string\n')" types)
+  if [ "$s28r" = "6428-bare-literal-instantiated" ]; then
+    echo "FAIL: a different class was explained as #6428 (sig='$s28r')"; fail=1
+  fi
+
+  # #6432-static-bound-oracle-declines: POSITIVE, the tree adds one whole
+  # function; REJECTION, an oracle line changed, or another file.
+  f32="_tests_/cases/run_bound_static_amp.bit"
+  o32=$(printf 'func bad() string {\n  ret %%0\n}\n\nfunc main() {\n}\n')
+  b32=$(printf 'func bad() string {\n  ret %%0\n}\n\nfunc both() string {\n  ret %%1\n}\n\nfunc main() {\n}\n')
+  s32=$(explainMismatch "$o32" "$b32" ir "$f32")
+  if [ "$s32" != "6432-static-bound-oracle-declines" ]; then
+    echo "FAIL: the #6432 added-function shape was not explained (sig='$s32')"; fail=1
+  fi
+  b32bad=$(printf 'func bad() string {\n  ret %%9\n}\n\nfunc both() string {\n  ret %%1\n}\n\nfunc main() {\n}\n')
+  s32r=$(explainMismatch "$o32" "$b32bad" ir "$f32")
+  s32f=$(explainMismatch "$o32" "$b32" ir "_tests_/cases/other.bit")
+  # An inserted line that does not open a function, closed by a stray `}`.
+  s32n=$(explainMismatch "$(printf 'func a() {\n}\n')" "$(printf 'func a() {\n  %%5 = const_int i64 1\n}\n}\n')" ir "$f32")
+  if [ -n "$s32r" ] || [ -n "$s32f" ] || [ -n "$s32n" ]; then
+    echo "FAIL: a non-#6432 IR delta was explained (changed='$s32r' otherfile='$s32f' nonfunc='$s32n')"; fail=1
+  fi
+
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
   # The retirement check in scripts/selfhost-diffdump.sh's run_ir() only ever
