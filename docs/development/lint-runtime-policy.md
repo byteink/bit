@@ -395,7 +395,7 @@ no longer exists: its counts were replaced with the named `<CODE>
 <repo-relative-path>` debt list in `tools/build/lint-debt.txt`, on the
 owner's 2026-09-10 ruling that a debt list is a paydown queue to zero and
 never a count. Read the two paragraphs below as history, not as the current
-mechanism - `_tests_/bit/lintself.bit`'s own header states that.
+mechanism - `_tests_/bit/lintself/lintself.bit`'s own header states that.
 
 Extending the settled count into a gate was originally deferred for two
 reasons: first, the immediate deliverable here was the decision, not the

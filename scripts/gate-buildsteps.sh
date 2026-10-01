@@ -233,7 +233,7 @@ case "${BUCKET}" in
     #
     # #4454's env-scope audit found nine more gates in the identical shape,
     # each with a compiler/** component to its scope: test-lint-self
-    # (_tests_/bit/lintself.bit scans compiler/+stdlib/+runtime/, #4448),
+    # (_tests_/bit/lintself scans compiler/+stdlib/+runtime/, #4448),
     # test-lint-complexity and test-lint-sweep (both scan the same
     # ["runtime","compiler","stdlib","tools","pkg"], #4448/#4449),
     # test-threadtokenbytes (compiler/arm64call.bit + compiler/x64call.bit +
