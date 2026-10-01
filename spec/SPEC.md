@@ -3261,6 +3261,27 @@ compile error.
 elements by index (the index is an `INT_LIT`, checked against the tuple arity).
 Method values are closures bound to their receiver.
 
+When the receiver is a **type name** rather than a value, `T.name` selects one
+of two things: a variant of the enum `T` (`E.A`, `E.C(1)`, §14.7), or a static
+method of the class `T`, which is only ever called (`K.f(1)`, §10.4.1). A class
+member that is not a static method has no receiver to read it from, so it is
+**E0057** naming what it is: `K.inst(1)` is "no static method 'inst' on 'K';
+'inst' is an instance method and needs a value receiver", a field likewise, and
+a name the class does not declare is the same E0057 without the clause. A static
+method is not a value (`let g = K.f` is E0057, "call it as K.f(...)"), because a
+method value is bound to its receiver. An enum has no variant of an unknown name:
+**E0070**, "no variant 'Z' on enum 'E'". A type parameter bound to an interface
+is judged the same way against that interface's static requirements.
+
+A type reached through a **namespace** (§17.2) keeps `qual_type_name`'s one
+position, a type (§11), plus the static call §10.4.1 gives it, `m.K.f(...)`. The
+rest are errors that name the spelling that works: `m.E.A` is E0070 (import the
+enum by name and write `E.A`), `m.K(1)` is E0049 (a type is not a constructor
+through its namespace; import `K` by name and write `K(1)`), a bare `m.K` as an
+operand is E0049, and `m.mk(1)` with `mk` a static method of `K` is E0046 with
+the hint "call it as m.K.mk(...)". A namespace exports only its module's
+top-level `export` declarations, never a class's exported members.
+
 **Tuple elements are read-only.** `t.0` may be read but never assigned, so `t.0 =
 x` (and `t.0++`, `t.0 += x`) is a compile error. A tuple is a fixed group of
 values produced whole - by a multi-value `return` (§13.1) - and read whole or by
