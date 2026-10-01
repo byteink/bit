@@ -972,6 +972,37 @@ fn main() {
   dispatch (§14.3) - a static method cannot be called through one, since an
   interface value carries no type to call a static method on, only an
   instance's method table.
+- A type parameter is **not constructible**: `T(...)` in call position, with
+  `T` a type parameter of the enclosing declaration, is **E0184**, "cannot
+  construct through the type parameter 'T'", whatever its arguments are. A
+  bound is an interface (§10.6) and an interface declares no `init`, so a
+  generic body has no constructor to call. What a bound can promise is a
+  static factory, which the body calls as above:
+
+  ```
+  interface Make {
+    static make(a: int): Self
+  }
+
+  class Box {
+    n: int
+
+    static make(a: int): Box {
+      return Box{ n = a * 3 }
+    }
+  }
+
+  fn build<T: Make>(): T {
+    return T.make(2)   // not T(2)
+  }
+
+  fn main() {
+    print("${build<Box>().n}")
+  }
+  ```
+
+  `[]T(n)` and `chan<T>(n)` are constructions of the slice and the channel,
+  not of `T`, and are unaffected.
 - A static method of a **generic class** called through the class's bare name
   infers the class's type arguments from its arguments as a generic call does
   (§15.3), positional or named (§12.11); a static method's own type
