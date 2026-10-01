@@ -2409,9 +2409,18 @@ ordinary identifiers everywhere else. Only `asm` itself is reserved.
 - **Register names** are the architecture's own: `rax`…`r15` (x64) and
   `x0`…`x30`, `sp`, `xzr` (arm64). `memory` is accepted in a `clobber` list as a
   compiler barrier; it names no register.
-- Every register named by `input`, `result`, or `clobber` is **excluded from the
-  register allocator for the whole enclosing function**, so no value can be
-  parked in a register the block overwrites.
+- Every register named by `input` or `result`, and every **callee-saved**
+  register named by `clobber`, is **excluded from the register allocator for
+  the whole enclosing function**, so no value can be parked in a register the
+  block overwrites.
+- A **caller-saved** register named by `clobber` is a **clobber point at the
+  block**, exactly as a call is one: no value that is live across the block may
+  sit in a caller-saved register, and the register stays allocatable wherever no
+  value spans the block. The point destroys the whole caller-saved file, integer
+  and floating point, because `clobber` has no spelling for an FP register and a
+  block that restores another context (a context switch) leaves all of it
+  holding the other side's values. A register the allocator never hands out
+  (the code generator's scratch registers) adds nothing.
 - `volatile` is accepted and documented for parity with the source being ported;
   an `asm` block is never dropped, hoisted, or deduplicated regardless.
 - An `input` value must be a register-width integer or a raw pointer (§11.4).
@@ -2430,6 +2439,20 @@ fn addAsm(a: int, b: int): int {
     input  arm64 x1 x64 rax = a
     input  arm64 x2 x64 rcx = b
   }
+}
+```
+
+```
+// `keep` is live across the block, so it is held in a callee-saved register or
+// a frame slot, never in x12 / r8. Nothing else in the function loses them.
+fn scribble(keep: int): int {
+  asm {
+    arm64 { 0xD2800FEC }                         // mov x12, #0x7f
+    x64   { 0x41, 0xB8, 0x7F, 0x00, 0x00, 0x00 } // mov r8d, 0x7f
+    clobber arm64 { x12 }
+    clobber x64   { r8 }
+  }
+  return keep + 1
 }
 ```
 
