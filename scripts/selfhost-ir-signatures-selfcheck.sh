@@ -12,9 +12,10 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # Self-check: run directly (not sourced) to assert explainMismatch rejects
 # unrelated text on every kind. `types` alone currently carries a declared
 # signature, `6244-json-attr-implicit-insert` (see scripts/selfhost-ir-
-# signatures.sh's header); `ir`/`iropt`/`ast`/`fmt`/`diags`/`tokens` carry
-# none (see that file's Retirement history), so every arm below under those
-# kinds must always return 1.
+# signatures.sh's header), and `ir`/`iropt` one, file-scoped:
+# `6415-catch-assign-join-args`. `ast`/`fmt`/`diags`/`tokens` carry none (see
+# that file's Retirement history), so every arm below under those kinds must
+# always return 1.
 # `bash scripts/selfhost-ir-signatures-selfcheck.sh`. Same pattern as
 # scripts/selfhost-ir-canon.sh's self-check.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -148,6 +149,35 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo "FAIL: the <error>-to-concrete-type shape was not explained (sig='$sig6388')"
     fail=1
   fi
+
+  # #6415-catch-assign-join-args: POSITIVE, lines taken from the real
+  # stage0-vs-tree --dump-ir diff of _tests_/cases/run_shortcircuit_catch_assign.bit:
+  # the tree threads two locals through the join (leading arguments and
+  # parameters) and every later value is renumbered.
+  o15=$(printf '  br %%9, bb4(), bb5(%%9)\nbb3(%%43: i64, %%44: i64):\nbb5(%%28: bool):\n  %%29 = const_string "and i="\n')
+  b15=$(printf '  br %%9, bb4(), bb5(%%3, %%4, %%9)\nbb3(%%45: i64, %%46: i64):\nbb5(%%30: i64, %%31: i64, %%28: bool):\n  %%31 = const_string "and i="\n')
+  f15="_tests_/cases/run_shortcircuit_catch_assign.bit"
+  for k in ir iropt; do
+    s15=$(explainMismatch "$o15" "$b15" "$k" "$f15")
+    if [ "$s15" != "6415-catch-assign-join-args" ]; then
+      echo "FAIL: the #6415 threaded-join shape was not explained under $k (sig='$s15')"; fail=1
+    fi
+  done
+  s15o=$(explainMismatch "$o15" "$b15" ir "_tests_/cases/some_other_file.bit")
+  if [ -n "$s15o" ]; then
+    echo "FAIL: the #6415 threaded-join shape was explained for a file it is not declared for (sig='$s15o')"; fail=1
+  fi
+  # REJECTION: an opcode change riding along, an argument the tree DROPPED,
+  # and an extra line must each fail closed.
+  b15op=$(printf '  br %%9, bb4(), bb5(%%3, %%4, %%9)\nbb3(%%45: i64, %%46: i64):\nbb5(%%30: i64, %%31: i64, %%28: bool):\n  %%31 = const_int i64 7\n')
+  b15drop=$(printf '  br %%9, bb4(), bb5()\nbb3(%%45: i64, %%46: i64):\nbb5(%%28: bool):\n  %%31 = const_string "and i="\n')
+  b15extra=$(printf '%s\n  ret\n' "$b15")
+  for bad in "$b15op" "$b15drop" "$b15extra"; do
+    s15r=$(explainMismatch "$o15" "$bad" ir "$f15")
+    if [ -n "$s15r" ]; then
+      echo "FAIL: a non-#6415 delta was wrongly explained as #6415 (sig='$s15r')"; fail=1
+    fi
+  done
 
   # --- declaredSignatureNames() stays in sync with explainMismatch (#5509) ---
   #
