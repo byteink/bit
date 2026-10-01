@@ -233,19 +233,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fi
   rm -f "$src96"
 
-  # #6428-bare-literal-instantiated: POSITIVE, the template becomes its
-  # instantiation and a member read through it resolves; REJECTION, the
-  # tree names a DIFFERENT class.
-  o28=$(printf '68:7: p: Pair\n69:11: p.first("y"): <error>\n')
-  b28=$(printf '68:7: p: Pair<string, StrStore>\n69:11: p.first("y"): string\n')
-  s28=$(explainMismatch "$o28" "$b28" types)
-  if [ "$s28" != "6428-bare-literal-instantiated" ]; then
-    echo "FAIL: the #6428 bare-literal shape was not explained (sig='$s28')"; fail=1
+  # #6396 (types), class-bound form, cut from the real 0.34.0 dump of
+  # run_generic_class_literal_infer.bit: the oracle's first entry past the
+  # trigger is an `<error>` at a position the tree never dumps. REJECTION:
+  # the tree dumps that same position, so the oracle entry is not garbage.
+  srcC=$(mktemp "${TMPDIR:-/tmp}/sig6396c.XXXXXX")
+  printf 'fn pre(): i64 { return 1 }\nclass Pair<K, S: Store<K>> {\n  store: S\n  first(k: string): K {\n    return this.store.get(k)\n  }\n}\n' >"$srcC"
+  oC=$(printf '1:24: 1: i64\n4:3: first(k:: <error>\n5:12: this.store.get(k): <error>\n9:7: p: Pair\n')
+  bC=$(printf '1:24: 1: i64\n5:12: this.store.get(k): K\n9:7: p: Pair<string, StrStore>\n')
+  sC=$(explainMismatch "$oC" "$bC" types "$srcC")
+  if [ "$sC" != "6396-generic-bound-type-args-presyntax" ]; then
+    echo "FAIL: the #6396 class-bound types shape was not explained (sig='$sC')"; fail=1
   fi
-  s28r=$(explainMismatch "$o28" "$(printf '68:7: p: Box<i64>\n69:11: p.first("y"): string\n')" types)
-  if [ "$s28r" = "6428-bare-literal-instantiated" ]; then
-    echo "FAIL: a different class was explained as #6428 (sig='$s28r')"; fail=1
-  fi
+  rej96 "$(printf '1:24: 1: i64\n5:12: this.store.get(k): <error>\n9:7: p: Pair\n')" "$bC" types "$srcC"
+  rm -f "$srcC"
 
   # #6432-static-bound-oracle-declines: POSITIVE, the tree adds one whole
   # function; REJECTION, an oracle line changed, or another file.
