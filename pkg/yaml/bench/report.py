@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record and render pkg/toml's benchmark results (#5488, #6438).
+"""Record and render pkg/yaml's benchmark results (#5501, #6049, #6438).
 
   report.py record OUT RESULTS_JSON COMMIT STAMP BITVER GOVER HOST RUNS TOOLS
       read the timed runs under OUT (written by run.sh) into RESULTS_JSON
@@ -15,7 +15,8 @@ in RESULTS.md, rendered from the same JSON. The block is checked against
 BANNED before it is written: a jargon word fails the run.
 
 The estimator is run.sh's trimmean(): drop the slowest fifth of the runs,
-average the rest.
+average the rest. The JSON schema and the renderer match pkg/yaml/bench/report.py;
+only the data this file reads (record_fixture) and the prose differ.
 """
 import json
 import os
@@ -24,31 +25,22 @@ import sys
 
 SUBJECT = "bit"
 SIDES = [
-    ("bit", "pkg/toml"),
-    ("burntsushi", "BurntSushi/toml"),
-    ("gotoml", "go-toml/v2 (pelletier)"),
-    ("rusttoml", "toml (Rust)"),
-    ("tomledit", "toml_edit (Rust)"),
-    ("tomlpp", "toml++ (C++)"),
-    ("tomlc17", "tomlc17 (C)"),
+    ("bit", "pkg/yaml"),
+    ("yamlv3", "go.yaml.in/yaml/v3 (Go)"),
+    ("goccy", "goccy/go-yaml (Go)"),
+    ("libyaml", "libyaml (C)"),
+    ("rapidyaml", "rapidyaml in place (C++)"),
+    ("rapidyamlarena", "rapidyaml arena copy (C++)"),
+    ("saphyr", "saphyr (Rust)"),
+    ("yamlrust2", "yaml-rust2 (Rust)"),
 ]
-# (file under bench/data, subdirectory of out/ holding its runs, plain title,
-# what is in it)
+# (file stem under bench/data and in out/, plain title, what is in it)
 FIXTURES = [
+    ("k8s-manifests", "Kubernetes manifests", "multi-document Kubernetes-manifest-shaped YAML"),
     (
-        "fixture.toml",
-        "",
-        "Cargo manifest",
-        "a Cargo-manifest shape scaled up with tables, arrays of tables, inline "
-        "tables, dotted keys, all four TOML 1.0.0 date-time forms and multi-line "
-        "strings",
-    ),
-    (
-        "config.toml",
-        "config",
-        "Service config",
-        "many small tables, escape-dense long strings and big integer and float "
-        "arrays",
+        "yaml-features",
+        "YAML features",
+        "anchors and aliases, block scalars, flow collections and escaped quoted scalars",
     ),
 ]
 BANNED = re.compile(
@@ -75,26 +67,23 @@ def read_runs(path):
 # ---------------------------------------------------------------- record
 
 
-def record_fixture(out_dir, data_dir, fname, sub, title, desc):
+def record_fixture(out_dir, data_dir, stem, title, desc):
+    fname = stem + ".yaml"
     bytes_ = os.path.getsize(os.path.join(data_dir, fname))
-    dir_ = os.path.join(out_dir, sub) if sub else out_dir
     sides = []
     for key, label in SIDES:
-        rs = read_runs(os.path.join(dir_, key + ".rs"))
-        ms = read_runs(os.path.join(dir_, key + ".ms"))
+        rs = read_runs(os.path.join(out_dir, f"{stem}.{key}.rs"))
+        ms = read_runs(os.path.join(out_dir, f"{stem}.{key}.ms"))
         if rs is None or ms is None:
             continue
-        secs = trimmean(rs)
-        side = {
-            "key": key,
-            "label": label,
-            "mb_s": round(bytes_ / secs / 1e6, 1),
-            "rss_mb": round(trimmean(ms) / 1048576, 1),
-        }
-        empty = read_runs(os.path.join(out_dir, "empty", key + ".rs"))
-        if empty is not None and trimmean(empty) < secs:
-            side["net_mb_s"] = round(bytes_ / (secs - trimmean(empty)) / 1e6, 1)
-        sides.append(side)
+        sides.append(
+            {
+                "key": key,
+                "label": label,
+                "mb_s": round(bytes_ / trimmean(rs) / 1e6, 2),
+                "rss_mb": round(trimmean(ms) / 1048576, 1),
+            }
+        )
     if not sides:
         return None
     return {"file": fname, "title": title, "desc": desc, "bytes": bytes_, "sides": sides}
@@ -129,7 +118,7 @@ def speed(side):
 
 
 def verdict(mine, theirs):
-    """pkg/toml against one parser: ('faster'|'slower'|'same', factor)."""
+    """pkg/yaml against one parser: ('faster'|'slower'|'same', factor)."""
     r = mine / theirs
     if abs(r - 1) <= SAME:
         return "same", 1.0
@@ -170,22 +159,22 @@ def summary(data):
     counts = {k: sum(1 for c in cs if c[2] == k) for k in ("faster", "same", "slower")}
     words = {"faster": "faster in", "same": "about the same in", "slower": "slower in"}
     parts = [f"{words[k]} {counts[k]}" for k in ("faster", "same", "slower") if counts[k]]
-    text = f"In {len(cs)} comparisons with other TOML parsers, pkg/toml is " + " and ".join(
+    text = f"In {len(cs)} comparisons with other YAML parsers, pkg/yaml is " + " and ".join(
         parts
     )
     worst = max((c for c in cs if c[2] == "slower"), key=lambda c: c[3], default=None)
     if worst:
-        text += f"; the biggest gap is {worst[1]}, {worst[3]:.1f}x faster than pkg/toml ({worst[0]})"
+        text += f"; the biggest gap is {worst[1]}, {worst[3]:.1f}x faster than pkg/yaml ({worst[0]})"
     return text + "."
 
 
 def table(data):
     cols = peers(data)
-    rows = ["| File | " + " | ".join(f"pkg/toml vs {c}" for c in cols) + " |"]
+    rows = ["| File | " + " | ".join(f"pkg/yaml vs {c}" for c in cols) + " |"]
     rows.append("|---|" + "|".join("---" for _ in cols) + "|")
     for fx in data["fixtures"]:
         by = {s["label"]: s for s in fx["sides"]}
-        mine = speed(by["pkg/toml"])
+        mine = speed(by["pkg/yaml"])
         cells = [
             cell(*verdict(mine, speed(by[c]))) if c in by else "not measured" for c in cols
         ]
@@ -205,7 +194,7 @@ def memory(data):
         for s in fx["sides"]:
             (mine if s["key"] == SUBJECT else others).append(s["rss_mb"])
     return (
-        f"Memory: pkg/toml needs {span(mine)} to parse these files; "
+        f"Memory: pkg/yaml needs {span(mine)} to parse these files; "
         f"the other parsers need {span(others)}."
     )
 
@@ -230,9 +219,9 @@ def block(data):
 def results_md(data):
     names = " and ".join(", ".join(peers(data)).rsplit(", ", 1))
     out = [
-        "# pkg/toml benchmark results",
+        "# pkg/yaml benchmark results",
         "",
-        "Generated by `pkg/toml/bench/run.sh` from `bench/results.json`. Do not edit by hand.",
+        "Generated by `pkg/yaml/bench/run.sh` from `bench/results.json`. Do not edit by hand.",
     ]
     if data.get("seeded_from"):
         out += ["", f"Recorded figures: {data['seeded_from']}."]
@@ -240,35 +229,24 @@ def results_md(data):
         "",
         "## Method",
         "",
-        f"Parse throughput of pkg/toml against {names}. Every parser reads the "
-        "same checked-in fixture and parses it to a byte-identical checksum "
-        "before anything is timed (entry count plus a CRC-32C fold over every "
-        "key and scalar value, sorted by key so an unordered Go map iterates "
-        "the same as pkg/toml's source-ordered table).",
+        f"Parse throughput of pkg/yaml against {names}, one process per timed "
+        f"run, trimmed mean of {data['runs']} runs (slowest fifth dropped, mean of the rest; see "
+        "run.sh's `trimmean` for the estimator). Every implementation is "
+        "proven to parse each fixture to the same document count, node count "
+        "and CRC-32C checksum before anything is timed; the transcript is at "
+        "the end of this file.",
         "",
-        f"Each figure is the trimmed mean (slowest fifth of {data['runs']} runs "
-        "dropped, mean of the rest) of one process invocation: read the "
-        "fixture, parse it once, print an entry count, exit. The checksum walk "
-        "is a separate, untimed mode of the same binary (folding and sorting "
-        "the whole tree on every timed run would measure parse+hash "
-        "throughput, not parse throughput). `vs pkg/toml` divides that "
-        "implementation's MB/s by pkg/toml's own. Where a run recorded the "
-        "empty-document control (process start, runtime init, reading a file "
-        "and exit, with nothing to parse), MB/s is startup-corrected: the "
-        "control's time is subtracted first.",
+        "Every competitor is cross-compiled for this host inside a throwaway "
+        "docker container (a Go image for Go, a cargo-zigbuild image for C, "
+        "C++ and Rust; CGO_ENABLED=0 for Go, both are pure Go) and then run "
+        "NATIVELY on the host, timed by the same `time_run` (a microsecond "
+        "wall clock around the process, peak RSS from `/usr/bin/time -l`) as "
+        "the Bit binary. No Go, C, C++ or Rust toolchain is installed on this "
+        "machine.",
         "",
-        "Peak RSS is the kernel's \"maximum resident set size\" for that same "
-        "process, trimmed the same way.",
-        "",
-        "Every competitor is cross-compiled for this host's own OS/arch inside "
-        "a throwaway `docker run` (never installed on the host) and then run "
-        "natively, exactly like pkg/toml's own binary. Nothing is timed from "
-        "inside the container, which would fold Docker Desktop's VM overhead "
-        "into one side of the comparison and not the other.",
-        "",
-        f"Versions: compiler {data['bit']} (released), {data['go']}, {data['tools']}.",
-        f"Host: {data['host']}.",
-        f"Generated from pkg/toml at `{data['commit']}` on {data['stamp']}.",
+        f"pkg/yaml at `{data['commit']}`, compiled by the released {data['bit']}. "
+        f"Go {data['go']}, {data['tools']}. Host: {data['host']}.",
+        f"Generated on {data['stamp']}.",
     ]
     for fx in data["fixtures"]:
         base = speed(sides_of(fx)[SUBJECT])
@@ -276,14 +254,14 @@ def results_md(data):
             "",
             f"## {fx['title']} (`bench/data/{fx['file']}`, {fx['bytes']:,} bytes)",
             "",
-            f"The fixture is {fx['desc']}. Checked in, never regenerated at run time.",
+            f"The fixture is {fx['desc']}. Checked in, never generated at run time.",
             "",
-            "| Implementation | MB/s | Peak RSS | vs pkg/toml |",
+            "| Implementation | MB/s | Peak RSS | vs pkg/yaml |",
             "|---|--:|--:|--:|",
         ]
         for s in fx["sides"]:
             out.append(
-                f"| {s['label']} | {speed(s):,.1f} | {s['rss_mb']:,.1f} MB | "
+                f"| {s['label']} | {speed(s):,.2f} | {s['rss_mb']:,.1f} MB | "
                 f"{speed(s) / base:.2f}x |"
             )
     if data["verification"]:

@@ -4,7 +4,9 @@
 #
 #   ./pkg/toml/bench/run.sh                ship, build, verify, measure, publish
 #   ./pkg/toml/bench/run.sh --verify-only   build + verify agreement, stop before timing
-#   ./pkg/toml/bench/run.sh --report        re-render from out/ as it stands, no rebuild
+#   ./pkg/toml/bench/run.sh --report        record out/ as it stands into results.json, then render
+#   ./pkg/toml/bench/run.sh --render        rebuild the README block and RESULTS.md from the
+#                                           last recorded results.json: no build, no docker, no timing
 #   ./pkg/toml/bench/run.sh --measure       build, verify, time every peer on both
 #                                           fixtures, print the tables; publishes nothing
 #
@@ -26,6 +28,11 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)      # pkg/toml/bench
 PKG=$(cd "$HERE/.." && pwd)              # pkg/toml
 REPO=$(cd "$HERE/../../.." && pwd)       # repo root
+# Render-only (#6438): needs nothing but python3, so it runs before every
+# check below that wants a compiler, docker or a built out/.
+if [ "${1:-}" = --render ]; then
+  exec python3 "$HERE/report.py" render "$HERE/results.json" "$PKG/README.md" "$HERE/RESULTS.md"
+fi
 BIT=${BIT:-$(command -v bit || true)}
 # The RELEASED toolchain, not this checkout's ./bit-out/bin/bit. A package
 # bench is a published claim about software a user installs, and that user has
@@ -195,19 +202,20 @@ pinned_version() {
 # measures nothing.
 verify() {
   local f side name bin out ref
+  : > "$HERE/out/verify.txt"
   for f in $FIXTURES; do
     ref=""
     for side in $SIDES; do
       name=${side%%:*}; bin=${side#*:}
       out=$("$HERE/out/bin/$bin" checksum "$f")
-      say "$(basename "$f") $name: $out"
+      say "$(basename "$f") $name: $out" | tee -a "$HERE/out/verify.txt"
       [ -n "$ref" ] || ref=$out
       if [ "$out" != "$ref" ]; then
         echo "toml bench: checksum mismatch - $name disagrees with pkg/toml on $f, refusing to time anything" >&2
         exit 1
       fi
     done
-    say "$(basename "$f"): every side agrees: $ref"
+    say "$(basename "$f"): every side agrees: $ref" | tee -a "$HERE/out/verify.txt"
   done
 }
 
@@ -288,31 +296,24 @@ table() {
 
 # ---------------------------------------------------------------- render
 
+# Version of crate $1 as locked in apps/rust/Cargo.lock (the build is --locked).
+crate_version() {
+  sed -n "/^name = \"$1\"\$/{n;s/^version = \"\([^+\"]*\).*/\1/p;}" "$HERE/apps/rust/Cargo.lock"
+}
+
+# Records out/ into results.json, then renders the README block and
+# RESULTS.md from it, exactly as --render does.
 publish() {
-  local commit stamp bitver goversion host bsver gtver
+  local commit stamp bitver goversion host tools
   commit=$(git -C "$REPO" rev-parse --short=8 HEAD 2>/dev/null || echo "?")
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   bitver=$("$BIT" --version 2>&1)
   goversion=$(docker run --rm "$GO_IMAGE" go version 2>&1)
   host=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
-  bsver=$(pinned_version burntsushi)
-  gtver=$(pinned_version gotoml)
-  local md=$HERE/out/block.md
-  python3 "$HERE/report.py" "$HERE/out" "$FIXTURE" "$commit" "$stamp" "$bitver" "$goversion" "$host" "$RUNS" "$bsver" "$gtver" > "$md"
-  python3 - "$PKG/README.md" "$md" <<'PY'
-import sys
-readme, block = sys.argv[1], sys.argv[2]
-begin, end = "<!-- BENCH:START -->", "<!-- BENCH:END -->"
-text = open(readme).read()
-body = open(block).read().rstrip("\n")
-if begin not in text or end not in text:
-    sys.exit("pkg/toml/README.md has no %s / %s pair to write into" % (begin, end))
-head, rest = text.split(begin, 1)
-_, tail = rest.split(end, 1)
-open(readme, "w").write("%s%s\n%s\n%s%s" % (head, begin, body, end, tail))
-PY
-  cp "$md" "$HERE/RESULTS.md"
-  say "wrote $PKG/README.md and $HERE/RESULTS.md"
+  tools="BurntSushi/toml $(pinned_version burntsushi), go-toml/v2 $(pinned_version gotoml), Rust toml $(crate_version toml), toml_edit $(crate_version toml_edit), toml++ $TOMLPP_TAG, tomlc17 $TOMLC17_TAG"
+  python3 "$HERE/report.py" record "$HERE/out" "$HERE/results.json" "$commit" "$stamp" "$bitver" "$goversion" "$host" "$RUNS" "$tools"
+  python3 "$HERE/report.py" render "$HERE/results.json" "$PKG/README.md" "$HERE/RESULTS.md"
+  say "wrote $PKG/README.md, $HERE/RESULTS.md and $HERE/results.json"
 }
 
 # ---------------------------------------------------------------- main
@@ -340,7 +341,7 @@ case $MODE in
     publish
     ;;
   *)
-    echo "usage: $0 [--verify-only|--measure|--report]" >&2
+    echo "usage: $0 [--verify-only|--measure|--report|--render]" >&2
     exit 1
     ;;
 esac

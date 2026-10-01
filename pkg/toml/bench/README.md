@@ -7,8 +7,13 @@ between the BENCH markers: pkg/toml against `github.com/BurntSushi/toml` and
 ```
 ./run.sh               build, verify, measure, publish
 ./run.sh --verify-only build + verify agreement, stop before timing
-./run.sh --report      re-render from out/ as it stands, no rebuild
+./run.sh --report      record out/ as it stands into results.json, then render
+./run.sh --render      rebuild the README block and RESULTS.md from the last
+                       recorded results.json: no build, no docker, no timing
 ```
+
+`results.json` is the recorded measurement (checked in); `report.py` renders
+both the README block and `RESULTS.md` from it.
 
 Needs `docker` (to cross-compile the two Go competitors without installing a
 Go toolchain on this machine) and a `bit-out/bin/bit` already built at the
