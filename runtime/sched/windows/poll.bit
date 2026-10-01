@@ -145,6 +145,7 @@
 
 import { taskAt, schedPollUnpark, scPollFd, pollRead } from "../../sched"
 import { schedPollTryEnter, schedPollLeave } from "../../sched"
+import { schedPollerWaitNs, pollDrainWakeOnly } from "../../sched"
 import { schedPollPendingInc, schedPollPendingDec, schedPollPendingCount } from "../../sched"
 
 // ---------------------------------------------------------------------------
@@ -165,7 +166,14 @@ extern fn GetQueuedCompletionStatusEx(
   timeoutMs: i32,
   alertable: i32,
 ): i32
+extern fn PostQueuedCompletionStatus(
+  port: *byte,
+  bytesTransferred: i32,
+  completionKey: i64,
+  overlapped: *byte,
+): i32
 extern fn CloseHandle(handle: *byte): i32
+extern fn Sleep(milliseconds: i32)
 extern fn GetLastError(): i32
 
 extern fn WSAStartup(versionRequested: i32, wsaData: *byte): i32
@@ -207,6 +215,13 @@ const winInvalidHandle: int = 0 - 1
 // wait.bit's `bytesOfI32`), duplicated here rather than imported: a provider
 // stays a leaf with no cross-module imports beyond ../../sched, matching both
 // siblings.
+@nosplit fn minInt(a: int, b: int): int {
+  if (b < a) {
+    return b
+  }
+  return a
+}
+
 @nosplit fn hAt(addr: int): *byte {
   let base: *byte = nil
   return base + addr
@@ -395,26 +410,20 @@ export @symbol("bit_rt_port_sched_poll_close") @nosplit fn pollClose(pollFd: int
   let _ = int(CloseHandle(hAt(pollFd)))
 }
 
-// The wake side of the poller, and on THIS platform there is nothing to wake
-// (#5744). `../sleep.bit`'s `schedWakePoller` declares
-// `bit_rt_port_sched_poll_wake` `extern` — it may import no provider — so every
-// target owes a definition or a Windows program fails at link with an undefined
-// symbol and no gate in this tree builds a Windows binary to notice.
-//
-// `false`, not a trigger, and it is the honest answer rather than a placeholder:
-// `../../root/windows/boot.bit`'s worker 0 waits in `parkSleepNs` on a ramped
-// backoff, never inside `pollDrain` (this file's own drain is called with
-// `timeoutMs == 0` from the worker loop — see `pollDrain`'s header). Nothing
-// there calls `schedPollerArm`, so the claim word is never 1 and
-// `schedWakePoller` returns before it ever reaches this call. A Windows worker
-// 0 that does start waiting in the completion port owes this a real
-// `PostQueuedCompletionStatus` and `pollDrain` a sentinel packet to skip; until
-// then, "this poller has no wake channel" is exactly what `false` means to the
-// one caller — the same answer both siblings give for a descriptor that was
-// never created.
+// The wake side of the poller (#6429): a packet posted to the completion port
+// with a NULL `OVERLAPPED`, which ends a blocked `GetQueuedCompletionStatusEx`
+// in whichever thread holds the poller token. `../sleep.bit`'s
+// `schedWakePoller` declares `bit_rt_port_sched_poll_wake` `extern` — it may
+// import no provider — so every target owes a definition. `pollDrain` below
+// skips the packet (a NULL `OVERLAPPED` names no slot) and reports it through
+// `pollDrainWakeOnly` when it was the only thing drained. A negative or zero
+// `pollFd` is "no port bound" and answers false, as both siblings do.
 export @symbol("bit_rt_port_sched_poll_wake") @nosplit fn pollWake(pollFd: int): bool {
-  let _ = pollFd
-  return false
+  if (pollFd <= 0) {
+    return false
+  }
+  let none: *byte = nil
+  return int(PostQueuedCompletionStatus(hAt(pollFd), i32(0), i64(0), none)) != 0
 }
 
 // Associate `fd` with `pollFd`, tolerating "already associated" (see the
@@ -680,6 +689,50 @@ fn pollFinishSlot(s: *i64, slot: int, byteCount: int, statusWord: int): int {
   return timeoutMs == 0 && schedPollPendingCount() == 0
 }
 
+// Hand out the `n` completion packets in `evBuf` (bounded by the batch, not by
+// the kernel's answer — Power of 10, the guard both siblings apply to their own
+// event count). Answers how many tasks were woken, or `pollDrainWakeOnly` when
+// the only packet was `pollWake`'s (a NULL `OVERLAPPED`, which names no slot).
+fn pollBatch(s: *i64, count: int): int {
+  let n = count
+  if (n > maxBatch) {
+    n = maxBatch
+  }
+  let woken = 0
+  let sawWake = false
+  let base = ovBase()
+  let i = 0
+  while (i < n) {
+    let overlappedAddr = int(evBuf[i * 4 + 1])
+    let slot = (overlappedAddr - base) / 32
+    if (slot >= 0 && slot < maxOutstanding) {
+      let byteCount = int(evBuf[i * 4 + 3])
+      let statusWord = int(evBuf[i * 4 + 2])
+      woken = woken + pollFinishSlot(s, slot, byteCount, statusWord)
+    }
+    if (overlappedAddr == 0) {
+      sawWake = true
+    }
+    i = i + 1
+  }
+  if (woken == 0 && sawWake) {
+    return pollDrainWakeOnly
+  }
+  return woken
+}
+
+// The poller token holder (#6429) can be blocked in the port with the lock
+// held, and `tcpdeadline.bit`'s loops count iterations of a wait this call is
+// expected to take. Returning at once would burn their whole iteration budget
+// in microseconds and time the operation out early, so a caller that asked to
+// wait waits its interval here, capped at 2ms: the loser of the (microsecond)
+// race with a peer's non-blocking drain loses at most that.
+@nosplit fn pollBusyWait(timeoutMs: int) {
+  if (timeoutMs > 0) {
+    Sleep(i32(minInt(timeoutMs, 2)))
+  }
+}
+
 // MILLISECONDS — the LONE remaining millisecond provider (#5718 widened
 // linux to nanoseconds, matching darwin's #5717; widening this file is
 // unplanned) — under the same exported linker name,
@@ -696,39 +749,26 @@ export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, time
     return 0
   }
   if (!schedPollTryEnter(s)) {
+    pollBusyWait(timeoutMs)
     return 0
   }
 
   let z: *byte = nil
   let entries = z + int(ptrOf(evBuf))
   removedCount = i32(0)
+  // A producer's claim on the token holder's wait (#5843) shortens it to a
+  // non-blocking drain, read under the poll lock exactly as the siblings do.
+  let waitMs = schedPollerWaitNs(s, timeoutMs)
   let ok = int(
     GetQueuedCompletionStatusEx(
       hAt(pollFd), entries, i32(maxBatch),
-      bytesOfI32(ptrOf(removedCount)), i32(timeoutMs), i32(0),
+      bytesOfI32(ptrOf(removedCount)), i32(waitMs), i32(0),
     ),
   )
-  let woken = 0
+  let answer = 0
   if (ok != 0) {
-    let n = int(removedCount)
-    // Bounded by the batch, not by the kernel's answer (Power of 10) — same
-    // guard both siblings apply to their own event count.
-    if (n > maxBatch) {
-      n = maxBatch
-    }
-    let base = ovBase()
-    let i = 0
-    while (i < n) {
-      let overlappedAddr = int(evBuf[i * 4 + 1])
-      let slot = (overlappedAddr - base) / 32
-      if (slot >= 0 && slot < maxOutstanding) {
-        let byteCount = int(evBuf[i * 4 + 3])
-        let statusWord = int(evBuf[i * 4 + 2])
-        woken = woken + pollFinishSlot(s, slot, byteCount, statusWord)
-      }
-      i = i + 1
-    }
+    answer = pollBatch(s, int(removedCount))
   }
   schedPollLeave(s)
-  return woken
+  return answer
 }

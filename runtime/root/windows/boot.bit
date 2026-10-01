@@ -135,6 +135,7 @@ import {
   taskSpawnEntry, wkSleepReq,
   schedIdleArm, schedIdleDisarm, schedIdlePark, schedSetPollFd,
   schedParkBoundNs, schedCurrentTask, taskLocal,
+  schedPollerArm, schedPollerDisarm, schedPollerHandoff, schedWorkPending,
 } from "../../sched"
 // The netpoller provider (#3339) and the spawn trampoline (#3503). `../../sched`
 // may not import either: IOCP against epoll/kqueue is the platform split the
@@ -144,7 +145,7 @@ import {
 // header for the full argument). Both bindings are made here, in the leaf
 // that is already per-platform, exactly as ../linux/boot.bit and
 // ../darwin/boot.bit bind their own netpoller twins at the same three points.
-import { pollCreate, pollClose, pollDrain, winSpawnTrampoline } from "../../sched/windows"
+import { pollCreate, pollClose, pollDrain, pollWake, winSpawnTrampoline } from "../../sched/windows"
 // `wkId`/`schedCurrentWorker`/`schedMaxWorkers` (from "../../sched") are
 // already imported into this module by ./io.bit — an import is per-MODULE,
 // not per-file, so a second import of any of them here would be E0042.
@@ -287,6 +288,36 @@ const chanReserveBytes: int = 1048576
 
 let bootSleepReq: [2]i64
 
+// The ceiling on the poller holder's wait when no deadline is armed (#6429),
+// the same 1s `../linux/bootworker.bit` and `../darwin/bootworker.bit` use. A
+// wake that is not wired costs at most this, never a hang.
+const holderWaitCeilingNs: int = 1000000000
+
+// One idle turn's wait (#6429), the Windows twin of `../linux/bootworker.bit`'s
+// `idleWait`: the worker that took the poller token blocks in
+// `GetQueuedCompletionStatusEx` until the next deadline, every other idle worker
+// parks on its own word. The holder disarms its park word first so a producer's
+// wake goes to a real parked peer, and `schedWorkPending` re-checks the queues
+// after the take because the take follows the failed find-work pass. The bound
+// is read after the take, so a deadline published before it is in the bound;
+// one published after finds the cell armed and posts the wake packet
+// (`pollWake`). Whole milliseconds rounded up, at least 1: the port's timeout
+// is in ms, and 0 would be the non-blocking drain.
+fn idleWait(s: *i64, w: *i64, holder: bool) {
+  gcBlockingBegin()
+  if (holder) {
+    schedIdleDisarm(w)
+    if (!schedWorkPending(w)) {
+      let bound = schedParkBoundNs(holderWaitCeilingNs, parkMonoNs(w + wkSleepReq))
+      let _ = pollDrain(int(s), (bound + 999999) / 1000000)
+    }
+    schedPollerDisarm(s)
+  } else {
+    schedIdlePark(s, w)
+  }
+  gcBlockingEnd()
+}
+
 // ---------------------------------------------------------------------------
 // The worker OS-thread entry — now the SAME worker-0-polls-the-rest-park
 // split ../linux and ../darwin's own `workerBody` uses (#3336). See
@@ -317,22 +348,18 @@ fn workerBody(arg: *byte): *byte {
   let w = taskAt(int(arg))
   let s: *i64 = ptrOf(schedBlock)
   let backoff = parkMinBackoffNs
-  // WORKER 0 POLLS, THE REST PARK (#1902 on ../linux/../darwin; #3336 here):
-  // worker 0 is the one that still drives the timer queue every turn (see
-  // `schedFindWorkAt`'s own comment on `schedTimerExpire`). `pollDrain`
-  // below (#3339) is called by EVERY idle worker regardless of `parks`,
-  // matching ../linux and ../darwin exactly — `schedPollTryEnter`'s try-lock
-  // is what arbitrates, not this split; the split only decides who parks
-  // between drains.
-  let parks = *(w + wkId) != 0
+  // ANY IDLE WORKER MAY POLL (#6429; was "worker 0 polls, the rest park", #1902
+  // and #3336): the poller role is the token `schedPollerArm` takes
+  // (`runtime/sched/sleep.bit`), exactly as on ../linux and ../darwin.
+  // `pollDrain` below (#3339) is still called non-blocking by every idle
+  // worker; `schedPollTryEnter`'s try-lock arbitrates it.
+  let owed = false
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     n = n + 1
     // ARM BEFORE LOOKING FOR WORK, never after — see runtime/sched/sleep.bit's
     // header for why the order is the correctness argument.
-    if (parks) {
-      schedIdleArm(w)
-    }
+    schedIdleArm(w)
     let addr = schedFindWorkAt(w, parkMonoNs(w + wkSleepReq))
     // Non-blocking drain (timeout 0) — a worker must never sit inside
     // `GetQueuedCompletionStatusEx` where it cannot answer the collector's
@@ -346,20 +373,20 @@ fn workerBody(arg: *byte): *byte {
       if (atomicLoad(s + scStopping) != 0) {
         break
       }
-      gcBlockingBegin()
-      if (parks) {
-        schedIdlePark(s, w)
-      } else {
-        parkSleepNs(schedParkBoundNs(backoff, parkMonoNs(w + wkSleepReq)), w + wkSleepReq)
-      }
-      gcBlockingEnd()
+      let holder = schedPollerArm(s)
+      idleWait(s, w, holder)
+      owed = holder
       backoff = parkNextBackoff(backoff)
       continue
     }
     // Running instead of parking: clear the arm so a producer does not
     // spend its one wake on a worker that is already busy.
-    if (parks) {
-      schedIdleDisarm(w)
+    schedIdleDisarm(w)
+    // Leaving the poller to run a task: hand the token to a parked peer if
+    // something still needs a poller (#6429).
+    if (owed) {
+      owed = false
+      schedPollerHandoff(s)
     }
     backoff = schedWorkerStepAt(w, addr, woke, backoff)
     let doneTask = *(w + wkLastDone)
@@ -384,6 +411,7 @@ fn workerBody(arg: *byte): *byte {
     }
   }
 
+  schedIdleDisarm(w)
   gcThreadExit()
   return nil
 }
@@ -696,6 +724,9 @@ fn boot(): int {
   //    WaitForSingleObject on its CreateThread HANDLE, bounded by
   //    `joinTimeoutNs`, natively OS-signaled rather than polled.
   schedShutdown(sched)
+  // The poller holder blocks in the completion port up to its ceiling;
+  // `schedWakeIdleAll` reaches only parked workers (#6429).
+  let _ = pollWake(bootPollFd)
   let joinTimeoutMs = i32(joinTimeoutNs / 1000000)
   let ji = 0
   while (ji < started) {
