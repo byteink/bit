@@ -1,0 +1,226 @@
+// compiler/lowercondchain.bit — split out of lowercond.bit (#6415) to keep both
+// files under the 800-line lint limit. Same module, so no imports and no
+// call-site changes. The `if` condition as a branch chain (#5926):
+// `lowerCondBr` and the exit patching `lowerIf` (lowercond.bit) performs.
+
+// The open exits of a condition lowered by `lowerCondBr` (#5926): indices into
+// `fc.b.instrs` of the `br`s whose THEN edge still has to reach the condition's
+// true target (`trues`) and whose ELSE edge its false target (`falses`).
+// `tSnaps`/`fSnaps` run parallel to them inside a chain: the env words each exit
+// was emitted with. An operand can reassign a local (`(f() catch e { x = ... })
+// == 0`), so the lhs's exits leave the locals as they were BEFORE the rhs ran
+// and the rhs's after it (#6415); the target of a differing exit takes the
+// locals as block params. Empty at the top level of a leaf condition, whose
+// every exit leaves the env as the whole condition did.
+class CondExits {
+  trues: []int,
+  falses: []int,
+  tSnaps: [][]int,
+  fSnaps: [][]int,
+}
+
+// Lowers an `if` condition as a branch chain: `a && b` / `a || b` become one
+// `br` per operand, so each compare feeds its own branch and #4393 fuses it
+// into the jump. `lowerShortCircuit` (the value form, kept for every other
+// position) instead joins a bool block param that the if then tests with a
+// second `br`, which leaves a compare whose only use is a block argument.
+// Evaluation order is unchanged and the rhs is lowered in its own block,
+// reached only on the edge where the lhs does not decide the result.
+//
+// The exits are returned open and patched by `patchCondEdges` once the if has
+// created its then/join/else blocks, AFTER the condition is lowered. That keeps
+// the block numbering `lowerShortCircuit` gave: every block the condition
+// mints (the rhs block, a bounds check's panic and continuation) is numbered
+// below the arms, so no edge out of the condition points at a lower index.
+// `isBackEdge` reads indices, and such an edge would gain a safepoint poll.
+//
+// With `BIT_IF_BRANCHCHAIN` off every condition takes the leaf path below,
+// one `lowerExpr` and one `br`, which is the IR `lowerIf` emitted before.
+fn lowerCondBr(fc: FnCtx, node: int): CondExits {
+  if (isCondChain(fc, node)) {
+    return lowerCondChain(fc, node)
+  }
+  return lowerCondLeaf(fc, node, false)
+}
+
+// Whether `node` is an `&&` / `||` that `lowerCondBr` lowers as a chain.
+fn isCondChain(fc: FnCtx, node: int): bool {
+  let n = getNode(fc.c.tree, node)
+  return n.tag == Tag.Binary &&
+    (n.main == int(Kind.AmpAmp) || n.main == int(Kind.PipePipe)) &&
+    ifBranchChainEnabled()
+}
+
+// One operand of a chain: a nested chain, or a leaf that records its env.
+fn lowerCondOperand(fc: FnCtx, node: int): CondExits {
+  if (isCondChain(fc, node)) {
+    return lowerCondChain(fc, node)
+  }
+  return lowerCondLeaf(fc, node, true)
+}
+
+// One `lowerExpr` and one `br` with both edges open. `record` stores the env
+// words the `br` was emitted with, for the chain that will patch it.
+fn lowerCondLeaf(fc: FnCtx, node: int, record: bool): CondExits {
+  let exits = CondExits{
+    trues = []int(0), falses = []int(0), tSnaps = [][]int(0), fSnaps = [][]int(0),
+  }
+  let cond = lowerExpr(fc, node)
+  if (fc.failed) {
+    return exits
+  }
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = -1
+  br.ival2 = -1
+  let at = builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  exits.trues = [at]
+  exits.falses = [at]
+  if (record) {
+    let words = snapshotValues(fc, len(fc.env))
+    exits.tSnaps = [words]
+    exits.fSnaps = [words]
+  }
+  return exits
+}
+
+// Whether `lowerCondBr` lowers `&&` / `||` as a branch chain (#5926). Default
+// OFF: it changes the IR of every `if` whose condition has `&&` or `||`
+// against the pinned stage0 0.34.0, so it lands dark until the next repin
+// flips the default; this predicate and the leaf-only arm it selects are
+// deleted one release after that. TEMPORARY.
+fn ifBranchChainEnabled(): bool {
+  return envOr("BIT_IF_BRANCHCHAIN", "") == "1"
+}
+
+// The `&&` / `||` arm of `lowerCondBr`. For `a && b` the lhs's true exits open
+// the rhs block and its false exits are the whole condition's; `a || b` is the
+// mirror image. When the lhs's exits left the locals differently from the env
+// the rhs starts from (a nested `||`'s rhs reassigned one), the rhs block takes
+// them as params.
+fn lowerCondChain(fc: FnCtx, node: int): CondExits {
+  let isAnd = getNode(fc.c.tree, node).main == int(Kind.AmpAmp)
+  let k = kidsOf(fc.c.tree, node)
+  let lhs = lowerCondOperand(fc, k[0])
+  if (fc.failed) {
+    return lhs
+  }
+  let rhsBlk = builderNewBlock(fc.b)
+  let preLen = len(fc.env)
+  let cur = snapshotValues(fc, preLen)
+  let threads = false
+  if (isAnd) {
+    threads = patchCondEdges(
+      fc,
+      CondEdges{ brs = lhs.trues, snaps = lhs.tSnaps, thenSide = true, cur = cur },
+      rhsBlk,
+      []int(0),
+    )
+  } else {
+    threads = patchCondEdges(
+      fc,
+      CondEdges{ brs = lhs.falses, snaps = lhs.fSnaps, thenSide = false, cur = cur },
+      rhsBlk,
+      []int(0),
+    )
+  }
+  builderBeginBlock(fc.b, rhsBlk)
+  if (threads) {
+    addJoinParams(fc, preLen)
+  }
+  let rhs = lowerCondOperand(fc, k[1])
+  if (isAnd) {
+    rhs.falses = concatInts(lhs.falses, rhs.falses)
+    rhs.fSnaps = concatSnaps(lhs.fSnaps, rhs.fSnaps)
+  } else {
+    rhs.trues = concatInts(lhs.trues, rhs.trues)
+    rhs.tSnaps = concatSnaps(lhs.tSnaps, rhs.tSnaps)
+  }
+  return rhs
+}
+
+// One side of a condition's exits, bundled for `patchCondEdges`: the `br`s,
+// the env words each was emitted with (empty at a top-level leaf), which edge
+// to patch, and the env the target block will be lowered from.
+class CondEdges {
+  brs: []int,
+  snaps: [][]int,
+  thenSide: bool,
+  cur: []int,
+}
+
+// Points one side of every exit at `target`. When no exit differs from `cur`
+// each carries `base`, as before #6415; otherwise each carries the env words it
+// was emitted with and the caller must give `target` the locals as block params
+// (the return value says so), because `cur` names values defined on only some
+// of the paths in.
+fn patchCondEdges(fc: FnCtx, e: CondEdges, target: int, base: []int): bool {
+  let i = 0
+  while (i < len(e.snaps)) {
+    if (!sameValues(e.snaps[i], e.cur)) {
+      return patchCondEdgesEach(fc, e, target)
+    }
+    i = i + 1
+  }
+  patchCondExits(fc, e.brs, e.thenSide, target, base)
+  return false
+}
+
+// The threading half of `patchCondEdges`: every exit passes its own words.
+fn patchCondEdgesEach(fc: FnCtx, e: CondEdges, target: int): bool {
+  let i = 0
+  while (i < len(e.brs)) {
+    patchCondExits(fc, [e.brs[i]], e.thenSide, target, e.snaps[i])
+    i = i + 1
+  }
+  return true
+}
+
+// Points one side of each `br` in `brs` at `target` with `args`. Every `br`
+// gets its own copy of `args`, so no two instructions share an argument array.
+fn patchCondExits(fc: FnCtx, brs: []int, thenSide: bool, target: int, args: []int) {
+  let i = 0
+  while (i < len(brs)) {
+    let br = fc.b.instrs[brs[i]]
+    if (thenSide) {
+      br.ival = target
+      br.thenArgs = concatInts(args, []int(0))
+    } else {
+      br.ival2 = target
+      br.elseArgs = concatInts(args, []int(0))
+    }
+    i = i + 1
+  }
+}
+
+// `a` followed by `b`, as `concatInts` does for one level.
+fn concatSnaps(a: [][]int, b: [][]int): [][]int {
+  let out = [][]int(0)
+  let i = 0
+  while (i < len(a)) {
+    out = append(out, a[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < len(b)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return out
+}
+
+// A fresh array holding `a` followed by `b`; neither input is aliased.
+fn concatInts(a: []int, b: []int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(a) + len(b)) {
+    if (i < len(a)) {
+      out = append(out, a[i])
+    } else {
+      out = append(out, b[i - len(a)])
+    }
+    i = i + 1
+  }
+  return out
+}
