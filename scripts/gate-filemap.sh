@@ -308,7 +308,7 @@ gates_for_file() {
     # directory module — the directive-name/dispatch helpers split into a
     # sibling to stay under the 800-line limit after `bit fmt`, the same
     # shape as _tests_/bit/fmtcitations/* above.
-    _tests_/bit/golden/*) printf 'test-golden\n'; return 0 ;;
+    _tests_/bit/golden/*) printf 'test-golden\ntest-golden-ifchain\n'; return 0 ;;
     # #3593 moved this from a single file (_tests_/bit/importsrun.bit) to a
     # directory module — the phase-C grading plus a new retry helper split
     # into a sibling to stay under the 800-line limit, the same shape as
