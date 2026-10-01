@@ -1007,6 +1007,17 @@ fn main() {
   parameter the method mentions that no argument binds cannot be inferred and
   is `E0068`, "cannot infer type parameter 'B' of 'Pair'; write
   Pair<A, B>.blank(...)", where `Pair<i64, bool>.blank(...)` names it.
+- A static method of a class imported through a **namespace** (§17.2) is called
+  through the class's qualified name, `m.K.f(...)`, the spelling §11's
+  `qual_type_name` gives the same class in a type position. It is judged and
+  lowered exactly as `K.f(...)` is after `import { K } from ...`: the same
+  arity (`E0050`), argument types (`E0041`) and named arguments (§12.11), and an
+  unexported class or method is `E0046`. A qualified name takes no type
+  arguments (§11), so a static method of a **generic class** that mentions the
+  class's type parameters cannot be called this way: it is `E0068`, "cannot
+  instantiate generic class 'm.G' through its namespace; import it by name and
+  write G<T>.f(...)". A static that mentions none of them (`m.G.tag(1)`) needs
+  no instantiation and is legal.
 
 ### 10.5 Class Declarations
 
