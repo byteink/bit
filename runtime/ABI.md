@@ -1662,13 +1662,19 @@ an individual expiry the collector retries it — *without* clearing the stop
 request or releasing any parked thread — reusing the same epoch, so an
 acknowledgement a prior round already collected stays valid and a round only
 has to gather whatever mutator has not yet reached `parked`. Only once
-`stwRendezvousRetryBound` (`runtime/stw/stwpoll.bit`) rounds have all expired
-does the collector clear the stop request, release every parked thread, and
-return *without* collecting. (Clearing the stop on every individual
+`stwRendezvousRetryBound` (`runtime/stw/stwretry.bit`) rounds have all expired,
+or the wall-clock ceiling on the whole retry (`stwRendezvousCeilingNs`, same
+file, 250 ms) has passed, whichever comes first, does the collector clear the
+stop request, release every parked thread, and return *without* collecting. (Clearing the stop on every individual
 expiry used to release the whole parked herd into a race for the collector
 lock, whose winner bumped the epoch again and discarded every acknowledgement
 the previous round had banked — a self-sustaining livelock under CPU
-oversubscription, epoch climbing while `collections` stayed frozen.) Skipping a
+oversubscription, epoch climbing while `collections` stayed frozen.) The stop is
+deliberately NOT released between rounds to spare the unrelated threads: that
+is the same herd release, and the ceiling bounds what holding it costs instead.
+An abandoned attempt holds the next one off for four times the time it waited
+(`stwShouldCollect`, `runtime/stw/stwstats.bit`), so a mutator that never
+answers costs at most a fifth of the world's time rather than all of it. Skipping a
 collection is always safe — the heap simply grows to the next trigger — so
 correctness never depends on the rendezvous succeeding, and no blocking mutator
 can deadlock the collector. Abandonments (a full exhaustion of the retry
@@ -2127,13 +2133,13 @@ pauses=<n> pausens=<n> pausemaxns=<n> rdvns=<n> rootsns=<n> drainns=<n> sweepns=
 | `pauses=` | rounds `stwPollOn` (`runtime/stw/stwpoll.bit`) stopped the world for — `gcShouldCollect` held under the world lock, success or ABANDON alike |
 | `pausens=` | summed wall nanoseconds the world was stopped, across every pause `pauses=` counts |
 | `pausemaxns=` | the single longest pause, in nanoseconds |
-| `rdvns=` | summed nanoseconds in the rendezvous (`stwRetryRendezvous`), success and ABANDON alike |
+| `rdvns=` | summed nanoseconds in the rendezvous (`stwRetryRendezvous`, `runtime/stw/stwretry.bit`), success and ABANDON alike |
 | `rootsns=` | summed nanoseconds scanning roots — `stwCollect`'s own span minus `drainns=`/`sweepns=` for the same collection |
 | `drainns=` | summed nanoseconds in `drain` + `recoverOverflow` (`runtime/gc/gccollect.bit`'s `gcDrainAndSweep`) |
 | `sweepns=` | summed nanoseconds in `sweep` (`gcDrainAndSweep`) |
 
 **`pauses=` is not always `collections=`.** An ABANDONED round (every
-`stwRendezvousRetryBound` retry expired, `abandoned=` above) stops the world
+`stwRendezvousRetryBound` retry or the wall-clock ceiling expired, `abandoned=` above) stops the world
 and restarts it without collecting, so it advances `pauses=`/`pausens=`/
 `pausemaxns=`/`rdvns=` but not `rootsns=`/`drainns=`/`sweepns=`, which stay at
 that round's 0. This is the rare, contention-bound exception
@@ -2200,7 +2206,7 @@ have taken this instead — the World block is the caller-owned one, and it is
 runtime-internal, appearing nowhere else in this document).
 
 **The protocol, in the order it runs.** Once `stwRetryRendezvous`
-(`runtime/stw/stwpoll.bit`) wins a full stop, the coordinator calls
+(`runtime/stw/stwretry.bit`) wins a full stop, the coordinator calls
 `worldGangOpen`: publish the collector block `g` a helper will read, store the
 stop's own epoch into `worldGangWord`, store **2** — not 1 — into
 `worldStopWord`, and wake every sleeper. Storing a value distinct from the
@@ -2276,6 +2282,31 @@ its wait while the gang it joined is still open ends the process
 `BIT_WORKERS=1` nobody is parked, so nothing is woken.
 
 ---
+
+### 8.5 A stuck mutator names itself (#6423)
+
+A thread that stops polling without saying so (a kernel wait or foreign call
+with no `bit_rt_gc_blocking_begin`/`_end` around it, §5) leaves its slot
+`running`, and every collection attempt waits for it. The wait is bounded by
+the wall-clock ceiling in §5, not by a spin count, and the first time it gives
+up the process says who, once, on stderr:
+
+```text
+[bit-gc] stop-the-world abandoned after 250 ms: slot 3 (thread token 6159986912) is still running (acked epoch 0, stop epoch 1) and never reached a safepoint; bracket kernel and foreign calls with gcBlockingBegin/gcBlockingEnd (ABI.md section 5)
+```
+
+| part | meaning |
+|---|---|
+| `after <n> ms` | how long the stop had been pending when the rendezvous gave up. A lower bound on how long the thread has been out of Bit code: the registry keeps no per-slot clock |
+| `slot <n>` | the first registry slot, other than the collector's own, that was not stopped for this epoch |
+| `thread token` | `gcThreadToken()` of the OS thread that owns the slot, the value the thread provider uses to find it |
+| `is still <state>` | the slot's last published state (`running` when the contract was broken; `parked` with an `acked epoch` older than the `stop epoch` is a thread still on its way out of an earlier stop) |
+
+`BIT_GC_STATS=1` adds a final field, `stuck=<n>`: how many abandoned
+rendezvous named a slot, over the whole run. The line itself is printed once
+per process, after the world is restarted (a blocked stderr must never hold the
+parked threads), so `stuck=` is the count and the line is the first witness.
+`runtime/gc/gcworldstuck.bit` composes both.
 
 ## 9. Program entry, boot, and spawn (`runtime/root`)
 
