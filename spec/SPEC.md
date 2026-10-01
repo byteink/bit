@@ -1776,9 +1776,9 @@ runtime one (#6302, #6305, #6318, #6322, #6308).**
   a non-generic named function's own parameters and return value, WHOLE
   PROJECT, resolved to a fixed point over the call graph - a call reached
   only through a value, a closure, an interface, or a generic type parameter
-  is not followed, and a `...` spread argument reaches only the variadic
-  tail, which is never tracked (the fixed parameters before it are matched
-  like any call's). A nested read
+  is not followed. A variadic parameter (`...xs: Post`) is a slice
+  parameter whose rows are every argument passed to it, a `...` spread's
+  slice included (#6405). A nested read
   (`post.author.posts`) is tracked as one dotted path, loading every level
   read. When a query's own rows are proven to reach a read this way, the
   compiler adds that relation to the query itself - `for post in

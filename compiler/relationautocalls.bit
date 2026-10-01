@@ -15,8 +15,9 @@
 // lowering will actually emit as a direct call. A call through a METHOD, a
 // closure value, or a generic function's own type parameter stays exactly
 // as unprovable as it was before this file existed, same as every other gap
-// `relationauto.bit`'s own header lists; a `...` spread argument stays
-// unprovable too (`relationAutoArgExprs`'s own header). Nested reads
+// `relationauto.bit`'s own header lists; a variadic parameter (`...xs: T`,
+// #6405) is a slice parameter filled by every positional argument past the
+// fixed ones and a `...` spread (`relationAutoVariadicArgs`). Nested reads
 // (`post.author.posts`, #6318) are left for a later ticket;
 // `RelationAutoBinding`'s `paramName` tag and this file's own per-parameter
 // summary shape are already dotted-path-ready — a further ticket only needs
@@ -60,6 +61,10 @@ class RelationAutoParamSummary {
   cls: RelationAutoClass,
   isSlice: bool,
   trackable: bool,
+  // `...name: T` (#6405): the body binds a `[]T`, and the call's arguments
+  // that fill it are not one slot but every positional argument past the fixed
+  // parameters plus a final `...spread` (`relationAutoVariadicArgs`).
+  variadic: bool,
   reads: []string,
 }
 
@@ -162,9 +167,7 @@ fn relationAutoBuildParamSummaries(c: Checker, decl: int): []RelationAutoParamSu
   let paramsNode = kidsOf(c.tree, decl)[3]
   let out = []RelationAutoParamSummary(0)
   for p of kidsOf(c.tree, paramsNode) {
-    if (getNode(c.tree, p).tag != Tag.Param) {
-      continue // ParamRest (variadic) — never a tracked row source
-    }
+    let tag = getNode(c.tree, p).tag
     let nameNode = kidsOf(c.tree, p)[0]
     let ptype = 0
     if (nameNode >= 0 && nameNode < len(c.declTypes)) {
@@ -175,7 +178,7 @@ fn relationAutoBuildParamSummaries(c: Checker, decl: int): []RelationAutoParamSu
       out,
       RelationAutoParamSummary{
         name = identText(c.tree, c.source, nameNode), cls = cls, isSlice = isSlice,
-        trackable = cls.found, reads = []string(0),
+        trackable = cls.found, variadic = tag == Tag.ParamRest, reads = []string(0),
       },
     )
   }
@@ -260,6 +263,7 @@ fn relationAutoMergedParams(
         cls = p.cls,
         isSlice = p.isSlice,
         trackable = p.trackable,
+        variadic = p.variadic,
         reads = merged,
       },
     )
@@ -388,26 +392,56 @@ fn relationAutoAnalyzeWholeProject(mods: []Checker): RelationAutoFuncSummaries {
 // only ever follow every positional one (SPEC §12.11's own ordering rule,
 // enforced by `namedargs.bit`'s `vNamedArgOrder` before this pass ever
 // runs), so a plain running position counter for the un-named prefix is
-// exact. A `Tag.ArgSpread` (`...xs`, #6352) is only ever the final argument
-// and only into the variadic parameter, which `params` does not list (the
-// positional prefix before it fills the fixed parameters exactly as in any
-// call): it occupies no slot, so nothing after it is placed by position.
+// exact. A variadic parameter (`...xs: T`, #6405) is never named (E-code
+// `ecNamedArgVariadic`) and is filled by MANY arguments, so its slot stays 0
+// here and `relationAutoVariadicArgs` lists what fills it: the positional
+// arguments past the fixed parameters and a `Tag.ArgSpread` (`...xs`, #6352),
+// which is only ever the final argument.
 fn relationAutoArgExprs(c: Checker, callNode: int, params: []RelationAutoParamSummary): []int {
   let out = []int(len(params))
   let posIdx = 0
-  let spread = false
+  let fixed = relationAutoFixedCount(params)
   for a of kidsOf(c.tree, kidsOf(c.tree, callNode)[2]) {
     let tag = getNode(c.tree, a).tag
-    if (tag == Tag.ArgSpread) {
-      spread = true
-    } else if (tag == Tag.NamedArg) {
+    if (tag == Tag.NamedArg) {
       let nk = kidsOf(c.tree, a)
       let pidx = relationAutoParamIndex(params, identText(c.tree, c.source, nk[0]))
-      if (pidx >= 0) {
+      if (pidx >= 0 && pidx < fixed) {
         out[pidx] = nk[1]
       }
-    } else if (posIdx < len(out) && !spread) {
+    } else if (tag == Tag.Arg && posIdx < fixed) {
       out[posIdx] = kidsOf(c.tree, a)[0]
+      posIdx = posIdx + 1
+    }
+  }
+  return out
+}
+
+// How many of `params` are fixed: all of them, or all but a trailing variadic.
+fn relationAutoFixedCount(params: []RelationAutoParamSummary): int {
+  if (len(params) > 0 && params[len(params) - 1].variadic) {
+    return len(params) - 1
+  }
+  return len(params)
+}
+
+// The expressions that fill `params`' variadic parameter at `callNode` (#6405):
+// every positional argument past the fixed parameters (each one row of the
+// variadic's rows) and a final `...spread`'s operand (a slice of them). Empty
+// when the callee has no variadic parameter or the call passes none.
+fn relationAutoVariadicArgs(c: Checker, callNode: int, params: []RelationAutoParamSummary): []int {
+  let out = []int(0)
+  let fixed = relationAutoFixedCount(params)
+  if (fixed == len(params)) {
+    return out
+  }
+  let posIdx = 0
+  for a of kidsOf(c.tree, kidsOf(c.tree, callNode)[2]) {
+    let tag = getNode(c.tree, a).tag
+    if (tag == Tag.ArgSpread || (tag == Tag.Arg && posIdx >= fixed)) {
+      out = append(out, kidsOf(c.tree, a)[0])
+    }
+    if (tag == Tag.Arg) {
       posIdx = posIdx + 1
     }
   }
@@ -486,18 +520,34 @@ fn relationAutoCheckCallArgs(c: Checker, node: int, st: RelationAutoState) {
     return
   }
   let args = relationAutoArgExprs(c, node, summary.params)
+  let fixed = relationAutoFixedCount(summary.params)
   let i = 0
-  while (i < len(args)) {
-    let reads = summary.params[i].reads
-    if (len(reads) != 0) {
-      let argFlow = relationAutoSlotFlow(relationAutoSlotOf(c, name, summary, args, i), st)
-      if (argFlow.found) {
-        for name2 of reads {
-          relationAutoRecordRead(c, st, argFlow, name2)
-        }
-      }
+  while (i < fixed) {
+    if (len(summary.params[i].reads) != 0) {
+      let slot = relationAutoSlotOf(c, name, summary, args, i)
+      relationAutoRecordParamReads(c, summary.params[i].reads, relationAutoSlotFlow(slot, st), st)
     }
     i = i + 1
+  }
+  if (fixed == len(summary.params) || len(summary.params[fixed].reads) == 0) {
+    return
+  }
+  for a of relationAutoVariadicArgs(c, node, summary.params) {
+    relationAutoRecordParamReads(c, summary.params[fixed].reads, relationAutoResolve(c, a, st), st)
+  }
+}
+
+// `reads` (a callee parameter's recorded relation names) recorded against
+// `argFlow`, the flow of the argument filling that parameter, when it traces
+// to a query or a parameter of the enclosing function.
+fn relationAutoRecordParamReads(
+  c: Checker, reads: []string, argFlow: RelationAutoFlow, st: RelationAutoState,
+) {
+  if (!argFlow.found) {
+    return
+  }
+  for r of reads {
+    relationAutoRecordRead(c, st, argFlow, r)
   }
 }
 
@@ -533,6 +583,26 @@ fn relationAutoWalkAssign(c: Checker, node: int, st: RelationAutoState) {
   }
   if (plain) {
     st.assigned = relationAutoMarkAssigned(c, targets, getNode(c.tree, node).span.end, st.assigned)
+  }
+}
+
+// A function returning its own variadic parameter (#6405) hands back whatever
+// its callers passed to it, many arguments across many calls: the parameter's
+// holder (`holder:P`, relationautoholder.bit), whose writers are exactly those
+// arguments (`relationAutoHolderNoteCall`).
+fn relationAutoVariadicReturn(
+  c: Checker,
+  name: string,
+  summary: RelationAutoFuncSummary,
+  ret: RelationAutoReturnSummary,
+  idx: int,
+): RelationAutoFlow {
+  let owner = declOwner(c, name)
+  let params = kidsOf(owner.tree, kidsOf(owner.tree, summary.decl)[3])
+  return RelationAutoFlow{
+    found = true, cls = ret.cls, queryCall = 0,
+    paramName = relationAutoParamHolderKey(owner.moduleId, kidsOf(owner.tree, params[idx])[0]),
+    isSlice = ret.isSlice, ownerModule = ret.ownerModule, path = ret.path,
   }
 }
 
@@ -575,6 +645,9 @@ fn relationAutoResolveNamedCall(
     }
   }
   let paramIdx = relationAutoParamIndex(summary.params, ret.viaParamName)
+  if (paramIdx >= 0 && summary.params[paramIdx].variadic) {
+    return relationAutoVariadicReturn(c, name, summary, ret, paramIdx)
+  }
   let args = relationAutoArgExprs(c, callNode, summary.params)
   if (paramIdx < 0 || paramIdx >= len(args)) {
     return relationAutoNoFlow(c)
