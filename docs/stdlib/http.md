@@ -206,8 +206,9 @@ with the default policy. What happens on each hop:
   `Location` fails.
 - A `303`, and a `301` or `302` answering a `POST`, become a `GET` with no
   body and no `Content-Type`; a `HEAD` stays a `HEAD`. A `307` or `308` keeps
-  the method and the body, and a request that still carries a body fails
-  rather than send it to another origin.
+  the method and the body. To another origin, a request with no body (a
+  plain `GET`) is followed with the credentials removed, and a request that
+  still carries a body fails rather than send it there.
 - A `Location` can be relative (`../next`, `?page=2`, `//other.example/x`).
   A missing or malformed one hands you the `3xx` response unchanged.
 - An eleventh redirect fails with the limit and the last URL in the message.
