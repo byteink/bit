@@ -1,3 +1,7 @@
+# pkg/web benchmark: full numbers and method
+
+The short version is in the [pkg/web README](../README.md#benchmarks). This file holds every table and the method behind it.
+
 ## Benchmarks
 
 TechEmpower's test types 1 and 2, the same two every framework here
