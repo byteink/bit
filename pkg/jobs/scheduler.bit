@@ -30,6 +30,17 @@
 // waits, and a `Locker.lastTick` that far in the future is ignored. Each of
 // these is logged, once.
 //
+// A CLOCK THAT DISAGREES WITH THE DATABASE FIRES NOTHING (#6368). A lease row
+// is stamped with the CALLER's clock, so an instance whose clock ran years
+// ahead would win the leases of ticks that are years away, enqueue those jobs
+// now, and leave rows that block every correct instance when the real clock
+// reaches them. With a `Locker` there is a second clock to ask: at most once
+// per `scheduleSkewCheckEvery` a pass compares `Clock.nowNs` with
+// `Locker.serverNowNs`, and while they differ by more than `scheduleMaxSkew`
+// the pass fires nothing. The workers run jobs regardless. A check that fails
+// is a failed pass: nothing fires on an unchecked clock, and the next pass
+// asks again. With no `Locker` there is no second clock and nothing changes.
+//
 // NO BUSY-WAIT: the loop sleeps until the earliest due tick, at most one
 // `pollInterval` at a time so `stop()` is never delayed longer than that.
 
@@ -217,10 +228,58 @@ fn runEntry(q: Queue, e: entry, nowNs: int): ()! {
   }
 }
 
+// Compares this instance's clock with the locker's, at most once per
+// `scheduleSkewCheckEvery` (a `nowNs` before the last check, a clock that
+// stepped back, asks again). Sets `q.skewed` and returns the line to log when
+// that state changed, "" otherwise; a failed read leaves the state as it was.
+fn checkSkew(q: Queue, nowNs: int): string! {
+  let since = nowNs - q.skewAt
+  if (q.skewKnown && since >= 0 && since < scheduleSkewCheckEvery) {
+    return ""
+  }
+  let server = q.locker.serverNowNs()?
+  q.skewAt = nowNs
+  q.skewKnown = true
+  let skew = nowNs - server
+  if (skew < 0) {
+    skew = 0 - skew
+  }
+  let bad = skew > scheduleMaxSkew
+  if (bad == q.skewed) {
+    return ""
+  }
+  q.skewed = bad
+  if (bad) {
+    return skewMessage(skew)
+  }
+  return skewClearedMessage()
+}
+
+// Whether this pass may fire ticks: true with no `Locker`, else when the
+// clocks agree (`checkSkew`).
+fn clocksAgree(q: Queue, nowNs: int): bool {
+  if (q.locker == nil) {
+    return true
+  }
+  let note = checkSkew(q, nowNs) catch err {
+    eprint("jobs: cannot read the database clock, not firing scheduled ticks: ${err.message()}\n")
+    return false
+  }
+  if (note != "") {
+    eprint(note)
+  }
+  return !q.skewed
+}
+
 // One pass over every schedule at `nowNs`; returns the earliest tick still
-// pending (0 when there are no schedules). A failing schedule is logged
+// pending (0 when there are no schedules, or when the pass fired nothing
+// because the clocks disagree or the check failed: `sleepFor` then waits one
+// `pollInterval`). A failing schedule is logged
 // and retried on the next pass, never allowed to stop the others.
 fn runDue(q: Queue, nowNs: int): int {
+  if (!clocksAgree(q, nowNs)) {
+    return 0
+  }
   let wake = 0
   for e of q.entries {
     runEntry(q, e, nowNs) catch err {

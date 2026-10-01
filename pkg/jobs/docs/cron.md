@@ -289,21 +289,46 @@ fn ledgerTooWide(q: Queue) {
 jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise newPostgresLocker(keep = ...)
 ```
 
+A lease is stamped with the clock of the instance that takes it, so one
+instance with a wrong clock could take the leases of ticks that are years away,
+enqueue those jobs now, and leave rows that block every correct instance when
+the real time reaches them. The scheduler therefore asks the `Locker` for the
+database's own clock, `serverNowNs()`, at most once a minute, and compares it
+with its own. `PostgresLocker` reads `clock_timestamp()`, the actual current
+time, and not `now()`, which PostgreSQL defines as the start of the current
+transaction ([Date/Time Functions](https://www.postgresql.org/docs/current/functions-datetime.html),
+section 9.9.5). When the two differ by more than 30 seconds, that instance
+fires no scheduled tick until they agree, and says so once:
+
+```text
+jobs: this instance's clock is 35064h0m0s away from the database clock; not firing scheduled ticks until they agree
+jobs: this instance's clock agrees with the database clock again; firing scheduled ticks
+```
+
+The first line is an instance whose clock is four years off. Its workers keep
+running jobs, and it fires again within a minute of the clock being corrected,
+with the ticks that came due handled by the `missed` policy. If the database
+cannot be asked, nothing fires on that pass and the next one asks again. With no
+`locker` there is no second clock, so there is no check.
+
 Without a `locker`, every instance enqueues every tick. That is right for a
 single instance and wrong for two. To use another lock service, write a
-`Locker`: three methods.
+`Locker`: four methods.
 `tryAcquire(key, holder, nowNs, expiresAt)` returns true when `holder` owns
 `key` after the call and false when someone else's lease has not expired;
 compare `expiresAt` against the `nowNs` you are given, not your own clock.
 `lastTick(key)` returns the newest tick number won for the schedule `key`
 (a lease key is `key` then `@` then the tick), or 0 when there is none. `window()` returns
 how many of the newest ticks of one schedule the locker still remembers, the
-cap `schedule` and `every` hold `Missed.RunAll` to. A locker that forgets its
+cap `schedule` and `every` hold `Missed.RunAll` to. `serverNowNs()` returns
+the lock service's own clock in nanoseconds since the Unix epoch, or an error
+when it cannot be read; it is the clock every instance is checked against. A locker that forgets its
 ticks, like the one below, only loses the catch-up after downtime, and it has
 no lease rows to prune, so its window is as large as you will allow.
 
 ```bit
 import { Locker, Store } from "jobs"
+import { now } from "std/time"
 
 class singleHost {
   export tryAcquire(key: string, holder: string, nowNs: int, expiresAt: int): bool! {
@@ -316,6 +341,10 @@ class singleHost {
 
   export window(): int {
     return 1000000
+  }
+
+  export serverNowNs(): int! {
+    return now().ns
   }
 }
 
