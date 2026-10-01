@@ -217,7 +217,7 @@ def block(data):
             summary(data),
             table(data),
             memory(data),
-            f"Measured on {data['host']} on {data['stamp'][:10]} with {data['bit']}.",
+            f"Measured on {data['host']}, {data['stamp'][:10]}, with {data['bit']}.",
             "Full numbers and method: [bench/RESULTS.md](bench/RESULTS.md)",
         ]
     )

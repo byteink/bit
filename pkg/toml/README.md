@@ -50,7 +50,7 @@ In 2 comparisons with other TOML parsers, pkg/toml is faster in 1 and slower in 
 
 Memory: pkg/toml needs 21 MB to parse these files; the other parsers need 20 to 29 MB.
 
-Measured on Apple M5 Max on 2026-09-19 with bit 0.21.0.
+Measured on Apple M5 Max, 2026-09-19, with bit 0.21.0.
 
 Full numbers and method: [bench/RESULTS.md](bench/RESULTS.md)
 <!-- BENCH:END -->
