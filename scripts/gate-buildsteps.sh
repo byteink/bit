@@ -337,7 +337,11 @@ case "${BUCKET}" in
     # can break how every published package resolves even though no package
     # imports compiler/ directly. Measured `./make test-package-tags` 0m24s
     # (4 of 4 published packages build) on this branch's own tip.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings)
+    # test-call-shapes (#6394): the matrix of receiver x callee x argument shape
+    # asks `bit check` and `bit build` the same question, so a compiler/** diff
+    # that lets the checker accept what lowering cannot emit is exactly what it
+    # catches.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-package-tags test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-decimalstress test-gc-retention test-fieldattrcollision test-checker-diag test-classkeyword test-no-warnings test-call-shapes)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
