@@ -21,11 +21,26 @@
 // backstop), which is slow to notice a datagram under `BIT_GC=stress`. A
 // genuinely blocking `recvfrom` (SO_RCVTIMEO) is a real kernel wait: it wakes
 // at OS scheduling latency the instant the datagram is there, never spinning.
+//
+// THE STUB'S KERNEL WAITS ARE BRACKETED (`gcBlockingBegin`/`gcBlockingEnd`,
+// runtime/ABI.md §5), and that is the fix for #6412, not a nicety. A thread
+// started through `threadStart` holds a mutator slot that reads `running` for
+// as long as it executes; the blocking `recvfrom` and the `nanosleep` have no
+// safepoint, so unbracketed they held the slot `running` until the datagram
+// arrived (up to its 30s bound). The client collects at every safepoint under
+// `BIT_GC=stress` and its first collection, BEFORE its query is sent, then
+// waited on the stub while the stub waited on the query: beside a CPU hog the
+// world stayed stopped 20-30s (`pausemaxns` 21.7s, `rdvns` 30s, measured),
+// the stub's recv timed out unanswered and the resolver reported
+// "fallback false" after 3 x 2000ms. The region holds no managed reference
+// (module words and raw buffers only), which is the bracket's precondition.
 
 import { netBindUdp, netSockLocalPort, netClose, netResolveHost } from "../../../runtime/net/darwin"
 import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
 import { threadStart, threadRelease } from "../../../runtime/thread/darwin"
 import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
+import { gcBlockingBegin, gcBlockingEnd } from "../../../runtime/gc"
+import { stwCollections, stwAbandonedCount, stwPauses, stwPauseMaxNs, stwRdvNs } from "../../../runtime/stw"
 
 extern fn socket(domain: i32, ty: i32, proto: i32): i32
 extern fn bind(fd: i32, sa: *u8, salen: i32): i32
@@ -59,6 +74,19 @@ let slowGoWords: [1]i32
 let slowDoneWords: [1]i32
 let slowRespFd: i64 = 0
 let slowWrote: i64 = 0
+
+// What a failure prints (`report`), so "fallback false" names its cause: the
+// per-attempt elapsed time, the stub's own receive-to-send delay and the
+// collector's rendezvous cost, instead of a bare verdict (#6412). Written by
+// `dnsFallbackProps` and the responder thread; read once, by `main`, after the
+// responder has been joined.
+let diagSlowNs: int = 0
+let diagDeadNs: int = 0
+let diagStubRecvNs: int = 0
+let diagStubSendNs: int = 0
+let diagSlowOk: bool = false
+let diagDeadOk: bool = false
+let diagJoined: bool = false
 
 fn bytesAt(a: int): *u8 {
   let z: *u8 = nil
@@ -150,12 +178,9 @@ fn rawPutI64Le(base: *u8, off: int, v: int) {
   }
 }
 
-// A blocking UDP socket, SO_RCVTIMEO 30 seconds, bound to 127.0.0.1 on a
-// kernel-chosen port. The bound must outlast every stall the CLIENT can take
-// before its query is sent: under `BIT_GC=stress` on a loaded box the client
-// abandons one ~65ms rendezvous per safepoint behind this thread's own
-// unbracketed `recvfrom`; a `pausemaxns` of 3.0009 s was observed there, the
-// collector waiting out the old 3-second bound, and the fallback then failed.
+// A blocking UDP socket, SO_RCVTIMEO 30 seconds (a backstop so a lost query
+// cannot hang the join forever, not an expected wait), bound to 127.0.0.1 on a
+// kernel-chosen port.
 // Returns `fd * 100000 + port` (a test-only packing -- both are small,
 // positive, and neither is a wire value), or -1 on any failure.
 fn rawUdpBind(): int {
@@ -280,12 +305,16 @@ fn slowDnsReply(fd: int, got: int, peerPort: int): int {
 
 export fn slowDnsResponderEntry(arg: *byte): *byte {
   slowDnsWaitForGo()
+  gcBlockingBegin()
   let got = rawRecvFrom(int(slowRespFd), dnsQueryBytes())
+  diagStubRecvNs = parkMonoNs()
   let peerPort = rawPeerPort()
   slowDnsDelay()
+  gcBlockingEnd()
   if (got > 0) {
     slowWrote = i64(slowDnsReply(int(slowRespFd), got, peerPort))
   }
+  diagStubSendNs = parkMonoNs()
   atomicStore(ptrOf(slowDoneWords), i32(0))
   let z: *byte = nil
   return z
@@ -334,11 +363,15 @@ fn dnsFallbackProps(hostLen: int, badLen: int): bool {
   putByte(ipBytes(), 3, 1)
 
   clear(octBytes(), 4)
+  let t0 = parkMonoNs()
   let slowResolved = netResolveHost(badHostBytes(), badLen, ipBytes(), slowPort, octBytes())
+  diagSlowNs = parkMonoNs() - t0
   let slowOk = packed >= 0 && slowResolved && isStubAnswer(octBytes())
 
   clear(octBytes(), 4)
+  let t1 = parkMonoNs()
   let deadOk = !netResolveHost(badHostBytes(), badLen, ipBytes(), deadPort, octBytes())
+  diagDeadNs = parkMonoNs() - t1
 
   let joined = threadJoin(
     ptrOf(slowDoneWords),
@@ -348,7 +381,26 @@ fn dnsFallbackProps(hostLen: int, badLen: int): bool {
   ) == threadJoinDone
   let released = threadRelease(h)
   let _ = int(bit_rt_fs_close(i64(slowFd)))
+  diagSlowOk = slowOk
+  diagDeadOk = deadOk
+  diagJoined = joined
   return deadOk && slowOk && h != 0 && joined && released && int(slowWrote) > 0
+}
+
+fn ms(ns: int): int {
+  return ns / 1000000
+}
+
+// The failure report. Everything needed to tell an OS stall from a collector
+// stall is here: if `slow resolve` ran long while `stub` shows the planned
+// ~150ms, the time went to the client, and `gc` says whether a stop-the-world
+// rendezvous took it (`pausemax`, `rdv`, `abandoned`). `netDnsTimeoutMs` is
+// 2000.
+fn report() {
+  println("slow resolve: ok=${diagSlowOk} elapsed=${ms(diagSlowNs)}ms (budget 2000ms per attempt)")
+  println("dead resolve: refused=${diagDeadOk} elapsed=${ms(diagDeadNs)}ms")
+  println("stub: receive-to-send=${ms(diagStubSendNs - diagStubRecvNs)}ms (planned ${ms(slowDelayMinNs)}ms) wrote=${slowWrote} joined=${diagJoined}")
+  println("gc: collections=${stwCollections()} pauses=${stwPauses()} abandoned=${stwAbandonedCount()} pausemax=${ms(stwPauseMaxNs())}ms rdvtotal=${ms(stwRdvNs())}ms")
 }
 
 fn main() {
@@ -356,4 +408,7 @@ fn main() {
   let badLen = writeHostname(badHostBytes())
   let fallback = dnsFallbackProps(hostLen, badLen)
   println("fallback ${fallback}")
+  if (!fallback) {
+    report()
+  }
 }
