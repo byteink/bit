@@ -42,14 +42,14 @@ import { TlsConn } from "std/tls"
 fn dispatchHijackable(app: App, ex: Exchange, req: Request): HijackOutcome {
   let split = splitTarget(req.path)
   let m = app.root.router.lookup(req.method, split.0) catch e {
-    let c = newCtx(req, nil, app.root.registry, app.config, "") catch ce {
+    let c = Ctx(req, nil, app.root.registry, app.config, "") catch ce {
       return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
     }
     c.exchange = Option.Some(ex)
     c.routeMiss = e
     return runHijackable(app, c, app.missHandler)
   }
-  let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
+  let c = Ctx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
     return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
   }
   c.exchange = Option.Some(ex)
@@ -108,14 +108,14 @@ fn saveSessionBestEffort(app: App, c: Ctx) {
 fn dispatchHijackableTls(app: App, ex: TlsExchange, req: Request): HijackOutcome {
   let split = splitTarget(req.path)
   let m = app.root.router.lookup(req.method, split.0) catch e {
-    let c = newCtx(req, nil, app.root.registry, app.config, "") catch ce {
+    let c = Ctx(req, nil, app.root.registry, app.config, "") catch ce {
       return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
     }
     c.tlsExchange = Option.Some(ex)
     c.routeMiss = e
     return runHijackable(app, c, app.missHandler)
   }
-  let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
+  let c = Ctx(req, m.params, app.root.registry, app.config, m.pattern) catch ce {
     return HijackOutcome.Answer(frame(app, failureRes(app, requestFailure(req, ce))))
   }
   c.tlsExchange = Option.Some(ex)
@@ -195,9 +195,31 @@ class tlsWire {
 // exactly the bytes it is given, once, straight onto the connection — no
 // internal buffer grows with the number or size of calls, so a multi-GB
 // stream costs this object nothing beyond the one chunk in flight.
+//
+// `Stream(c, status, contentType, headers)` hijacks `c`'s connection — plain or
+// TLS+HTTP/1.1 (#6152) — and writes the status line and headers, with
+// `Transfer-Encoding: chunked` appended after whatever `headers` names — a
+// caller-supplied `Transfer-Encoding` would otherwise contradict the framing
+// this writer commits to using. `headers` carries no `Content-Length` for the
+// same reason this doc comment gives: the constructor is exactly the site that
+// does not know one. `status` is always 200 today — nothing in this file
+// streams a failure — so the reason phrase is the one word RFC 9110's registry
+// gives 200, spelled here rather than through a status->phrase table this file
+// has no second entry for yet.
 export class Stream {
   conn: hijackWire
   closed: bool
+
+  init(c: Ctx, status: int, contentType: string, headers: []Header)! {
+    let wire = newStreamWire(c)?
+    let out = "HTTP/1.1 ${status} OK\r\n" + "Content-Type: ${contentType}\r\n"
+    for h of headers {
+      out = out + "${h.name}: ${h.value}\r\n"
+    }
+    wire.writeRaw(out + "Transfer-Encoding: chunked\r\n\r\n")?
+    this.conn = wire
+    this.closed = false
+  }
 
   // One chunk: its hex length prefix, the bytes, then the chunk's own
   // trailing CRLF (RFC 9112 §7.1.1). Refuses an empty write — a zero-length
@@ -227,7 +249,7 @@ export class Stream {
   }
 }
 
-// The guard `newStream` (below) needs for a TLS-served request, mirroring
+// The guard `Stream(...)` (above) needs for a TLS-served request, mirroring
 // `Ctx.takeExchange()`'s (ctx.bit) exact checks over `c.tlsExchange`
 // instead of `c.exchange` — module-private fields, not method-only (SPEC
 // §17.3), the same seam `dispatchHijackableTls` above already writes
@@ -245,27 +267,7 @@ fn takeTlsExchange(c: Ctx): TlsExchange! {
   return unwrap(c.tlsExchange)
 }
 
-// Hijacks `c`'s connection — plain or TLS+HTTP/1.1 (#6152) — and writes the
-// status line and headers, with `Transfer-Encoding: chunked` appended after
-// whatever `headers` names — a caller-supplied `Transfer-Encoding` would
-// otherwise contradict the framing this writer commits to using. `headers`
-// carries no `Content-Length` for the same reason `Stream`'s own doc
-// comment gives: this call is exactly the site that does not know one.
-// `status` is always 200 today — nothing in this file streams a failure —
-// so the reason phrase is the one word RFC 9110's registry gives 200,
-// spelled here rather than through a status->phrase table this file has no
-// second entry for yet.
-export fn newStream(c: Ctx, status: int, contentType: string, headers: []Header): Stream! {
-  let wire = newStreamWire(c)?
-  let out = "HTTP/1.1 ${status} OK\r\n" + "Content-Type: ${contentType}\r\n"
-  for h of headers {
-    out = out + "${h.name}: ${h.value}\r\n"
-  }
-  wire.writeRaw(out + "Transfer-Encoding: chunked\r\n\r\n")?
-  return Stream{ conn = wire, closed = false }
-}
-
-// `newStream`'s own transport pick: a TLS-served request (`c.tlsExchange`)
+// `Stream(...)`'s own transport pick: a TLS-served request (`c.tlsExchange`)
 // takes `tlsWire`, everything else (including an app with no hijackable
 // route at all, whose `c.hijack()` fails naming why) `plainWire`.
 fn newStreamWire(c: Ctx): hijackWire! {
@@ -295,13 +297,30 @@ fn hexChunkSize(n: int): string {
   return string(buf[i:16])
 }
 
+const sseStatusOk = 200
+
 // `text/event-stream` framing (WHATWG HTML §9.2.6) over a `Stream`: every
 // field ends in exactly one `\n`, and the blank line ending the event is
 // this writer's job, not the caller's — `send`/`sendData` never let a
 // handler forget it, which is the one mistake that hangs a browser's
 // `EventSource` waiting for an event that never completes.
+//
+// `SSE(c)` hijacks `c`'s connection and opens an SSE stream: `Content-Type:
+// text/event-stream`, `Cache-Control: no-cache` (RFC 9110 §5.2.2 — a
+// browser's `EventSource` reconnects and must never replay a cached event
+// stream), `Connection: keep-alive`. 200, always — an `EventSource` treats
+// anything else as a fatal connection error (WHATWG HTML §9.2.6) with no
+// retry, so there is no caller-supplied status to take here.
 export class SSE {
   s: Stream
+
+  init(c: Ctx)! {
+    let headers = []Header{
+      Header{ name = "Cache-Control", value = "no-cache" },
+      Header{ name = "Connection", value = "keep-alive" },
+    }
+    this.s = Stream(c, sseStatusOk, "text/event-stream", headers)?
+  }
 
   // A named event: `event: <event>\ndata: <line>\n...\n\n`. A multi-line
   // `data` is split on `\n` into one `data:` field per line (the spec's own
@@ -328,20 +347,4 @@ export class SSE {
   export close(): ()! {
     return this.s.close()?
   }
-}
-
-// Hijacks `c`'s connection and opens an SSE stream: `Content-Type:
-// text/event-stream`, `Cache-Control: no-cache` (RFC 9110 §5.2.2 — a
-// browser's `EventSource` reconnects and must never replay a cached event
-// stream), `Connection: keep-alive`. 200, always — an `EventSource` treats
-// anything else as a fatal connection error (WHATWG HTML §9.2.6) with no
-// retry, so there is no caller-supplied status to take here.
-const sseStatusOk = 200
-export fn newSSE(c: Ctx): SSE! {
-  let headers = []Header{
-    Header{ name = "Cache-Control", value = "no-cache" },
-    Header{ name = "Connection", value = "keep-alive" },
-  }
-  let s = newStream(c, sseStatusOk, "text/event-stream", headers)?
-  return SSE{ s = s }
 }

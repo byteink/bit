@@ -14,7 +14,7 @@ past that first reply, on the app's own terms.
 walks the framework off it for the rest of that connection's life. Nothing
 downstream runs again - no middleware, no `Res`, nothing this package would
 otherwise write for you. You take over the wire, so you write the response
-line and headers yourself from here, or use `wsUpgrade`/`newSSE`/`newStream`
+line and headers yourself from here, or use `wsUpgrade`/`SSE`/`Stream`
 below, which do it for you in the one shape each protocol needs.
 
 ## One serving path
@@ -30,7 +30,7 @@ fn main(): ()! {
   let app = App(Config{ secret = "change-me-in-production" })
   app.get("/ws/comments", (c) => {
     let conn = c.hijack()?
-    // ... talk to conn directly, or wrap it with wsUpgrade/newSSE/newStream ...
+    // ... talk to conn directly, or wrap it with wsUpgrade/SSE/Stream ...
     return c.noContent()
   }).hijackable()
   app.listen()?
@@ -43,8 +43,8 @@ connections exactly as before. The moment ANY route on the app is marked,
 `App.listen()`/`App.serve()` switch to `std/http`'s keep-alive-capable
 hijack primitive - still keep-alive for every connection, one request at a
 time, the same as an app with no hijackable route at all. Only the ONE
-connection whose request actually calls `c.hijack()`/`wsUpgrade`/`newSSE`/
-`newStream` stops serving further requests and is handed over for the rest
+connection whose request actually calls `c.hijack()`/`wsUpgrade`/`SSE`/
+`Stream` stops serving further requests and is handed over for the rest
 of its life; every other connection, on the same app and the same route
 table, keeps reusing itself across requests exactly as it always has. A
 mixed app - a high-throughput plain API next to a WebSocket/SSE/stream
@@ -143,10 +143,10 @@ is a feed rather than a conversation: a build's log lines, a job's progress,
 a dashboard's ticking numbers.
 
 ```bit
-import { Ctx, Res, newSSE } from "web"
+import { Ctx, Res, SSE } from "web"
 
 fn buildProgress(c: Ctx): Res! {
-  let sse = newSSE(c)?
+  let sse = SSE(c)?
   sse.send("status", "started")?
   sse.sendData("42%")?
   sse.send("status", "done")?
@@ -155,7 +155,7 @@ fn buildProgress(c: Ctx): Res! {
 }
 ```
 
-`newSSE` hijacks the connection and writes the response `text/event-stream`
+`SSE(c)` hijacks the connection and writes the response `text/event-stream`
 needs: `Content-Type: text/event-stream`, `Cache-Control: no-cache` (a
 reconnecting `EventSource` must never be served a cached stream) and
 `Connection: keep-alive`. `send(event, data)` frames a named event a
@@ -173,15 +173,15 @@ as it has something to report, and `close()` is what ends the client's
 A report, an export, a large file: building the whole body as one `string`
 first means holding all of it in memory before the first byte reaches the
 client, and it means the client waits for the whole thing before seeing
-any of it. `newStream` sends it as HTTP/1.1 chunked - a sequence of pieces,
+any of it. `Stream(c, status, contentType, headers)` sends it as HTTP/1.1 chunked - a sequence of pieces,
 each written and flushed the moment you call `write`, with no total length
 declared up front:
 
 ```bit
-import { Ctx, Res, Header, newStream } from "web"
+import { Ctx, Res, Header, Stream } from "web"
 
 fn exportRows(c: Ctx, rows: []string): Res! {
-  let stream = newStream(c, 200, "text/csv", []Header(0))?
+  let stream = Stream(c, 200, "text/csv", []Header(0))?
   for row of rows {
     stream.write(row + "\n")?
   }
@@ -193,7 +193,7 @@ fn exportRows(c: Ctx, rows: []string): Res! {
 `Stream` holds no buffer: `write` sends exactly the bytes you pass it, once,
 and forgets them. A loop that reads its rows from a database cursor or a
 file a chunk at a time, rather than loading `rows` into memory first, is
-what actually keeps a multi-gigabyte export's memory flat - `newStream`
+what actually keeps a multi-gigabyte export's memory flat - `Stream`
 only guarantees it will not make an already-bounded loop unbounded.
 
 ## Sharp edges
@@ -202,7 +202,7 @@ only guarantees it will not make an already-bounded loop unbounded.
 `Ctx` response helper builds a `Res` the framework would frame as an
 ordinary reply - but hijacking already took the connection over, so none of
 that reaches the wire. Do everything the client should see through the
-connection `hijack()`/`wsUpgrade`/`newSSE`/`newStream` gave you; the `c.
+connection `hijack()`/`wsUpgrade`/`SSE`/`Stream` gave you; the `c.
 noContent()` a hijacking handler returns exists only to satisfy `Res!`'s
 return type and is discarded.
 
@@ -218,12 +218,12 @@ A route that needs a check before it upgrades (an auth cookie, an
 
 **WebSocket, SSE and Stream all work over TLS+HTTP/1.1, and none of the
 three work over HTTP/2 or HTTP/3.** `App.listenTls()`/`App.serveTls()` (ALPN
-"http/1.1") give `wsUpgrade`/`newSSE`/`newStream` the same
+"http/1.1") give `wsUpgrade`/`SSE`/`Stream` the same
 keep-alive-or-hijack behavior `listen()`/`serve()` give them in plaintext -
 only the one connection that actually hijacks stops answering further
 requests; an ordinary route on the same app keeps its keep-alive connections
 either way. A request negotiated over HTTP/2 or HTTP/3 still cannot hijack at
-all - `c.hijack()`/`wsUpgrade`/`newSSE`/`newStream` on one of those fail,
+all - `c.hijack()`/`wsUpgrade`/`SSE`/`Stream` on one of those fail,
 naming why (a WebSocket over HTTP/2 needs RFC 8441, a separate mechanism; SSE
 and Stream over HTTP/2 and HTTP/3 need no hijack at all, being
 stream-multiplexed protocols, but this package does not implement either).
