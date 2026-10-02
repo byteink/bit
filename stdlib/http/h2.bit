@@ -33,11 +33,10 @@ fn h2glueConfig(maxBody: int): H2Config {
 
 // Adapt a `TlsConn` to the http2 engine's byte `Transport`. The engine's `read`
 // is not fallible — a read error is end-of-stream — so the shim maps any TLS read
-// failure to an empty slice, which the engine treats as a clean close. `TlsConn`
-// itself already recorded whether that failure was this side's own read
-// deadline elapsing (`readTimedOut()`, stdlib/tls/tls.bit, #3031) rather than
-// the peer closing, so nothing needs recording again here — `h2clientExchange`
-// reads it straight off `conn` once the round trip it was waiting on fails.
+// failure to an empty slice, which the engine treats as a clean close. A client
+// connection carries no read deadline of its own (`h2glueOpen`), so an empty
+// read there is always the peer or a teardown; a request's own timeout is the
+// round trip's (`h2clientExchange`).
 fn h2glueTransport(conn: TlsConn): H2Transport {
   return h2newTransport(
     (n) => {
@@ -65,9 +64,65 @@ fn h2glueWrite(conn: TlsConn, b: []byte) {
   }
 }
 
-// Run one request/response over the HTTP/2 engine on an h2-negotiated `TlsConn`,
-// then tear the connection down (this module is one request per connection). A
-// setup or round-trip failure closes the socket and propagates.
+// Open the shared HTTP/2 connection of `key` over an h2-negotiated `TlsConn`:
+// run the `std/http2` engine on it and return the `h2Entry` (h2pool.bit) that
+// owns it, created holding ONE reference for the request that dialed it. A
+// setup failure closes the socket and propagates. The connection's stream cap
+// is the lower of the peer's SETTINGS_MAX_CONCURRENT_STREAMS and
+// `PoolLimits.maxH2Streams`; a peer that allows no stream at all fails here,
+// loudly, rather than parking every request forever.
+//
+// No deadline stays on `tc`: whatever `dialTlsConn` armed is read off it, used
+// to bound the wait for the peer's opening SETTINGS (`h2connect`'s `deadlineNs`),
+// and cleared BEFORE the engine's reader starts, because that deadline is the
+// dialing request's own and a shared connection outlives it. Each request
+// bounds itself instead (`h2clientExchange`).
+fn h2glueOpen(tc: TlsConn, key: string, extras: RequestExtras): h2Entry! {
+  let dl = tc.deadlineNs()
+  tc.setDeadline(0)
+  let hc = h2connect(h2glueTransport(tc), h2glueConfig(extras.maxBody), dl) catch e {
+    tc.close()
+    fail e
+  }
+  let streams = hc.peerMaxStreams()
+  if (streams > extras.pool.limits.maxH2Streams) {
+    streams = extras.pool.limits.maxH2Streams
+  }
+  if (streams < 1) {
+    h2teardown(tc, hc)
+    fail newError("http2: ${key} allows no concurrent streams")
+  }
+  return h2Entry{
+    id = 0, key = key, tc = tc, hc = hc, slots = chan<int>(streams), streamCap = streams,
+    inflight = 1, lastUse = monotonic().ns, retired = false, torn = false,
+  }
+}
+
+// Run one request/response as a stream on the shared connection `e`, holding a
+// stream slot for its whole life and bounded by `extras.deadline` (0 = none).
+// The caller owns the reference on `e` and releases it (`h2Pool.release`).
+// Fails when the connection is at its stream cap for the whole deadline, or
+// when the round trip fails; the second case also retires `e`, because a
+// timed-out or reset stream leaves the engine's view of the connection
+// uncertain and the next request must dial a new one.
+fn h2clientExchange(
+  e: h2Entry,
+  method: string,
+  u: Url,
+  body: string,
+  extras: RequestExtras,
+): Response! {
+  e.acquire(extras.deadline)?
+  let res = e.hc.roundTrip(h2glueRequestOf(method, u, body, extras.block), extras.deadline) catch err {
+    e.free()
+    extras.pool.h2.retireEntry(e)
+    fail err
+  }
+  e.free()
+  return h2glueResponse(res)
+}
+
+// Tear a client connection down: the ONE place its transport is closed.
 //
 // `h2connect` spawns reader AND writer green threads (`stdlib/http2/conn.bit:311`)
 // that park on the transport (reader) or an empty command channel (writer) for
@@ -96,51 +151,12 @@ fn h2glueWrite(conn: TlsConn, b: []byte) {
 // reader's read fail (#4608), and then drains its reader and its writer before
 // returning the error — see `h2connAwaitReady` — so `conn.close()`
 // there is just as safe as the four-step teardown above, without needing this
-// function to repeat those waits for a `Conn` it never received. `conn.deadlineNs()`
-// carries `getTimeout`'s whole-request deadline down into that wait, so a dead
-// peer or one that never sends SETTINGS fails inside the caller's own
-// deadline instead of parking forever.
-fn h2clientExchange(
-  conn: TlsConn,
-  method: string,
-  u: Url,
-  body: string,
-  extras: RequestExtras,
-): Response! {
-  let cfg = h2glueConfig(extras.maxBody)
-  let hc = h2connect(h2glueTransport(conn), cfg, conn.deadlineNs()) catch e {
-    conn.close()
-    fail e
-  }
-  let res = hc.roundTrip(h2glueRequestOf(method, u, body, extras.block)) catch e {
-    conn.shutdown()
-    hc.waitReaderDone()
-    hc.waitWriterDone()
-    conn.close()
-    fail h2glueDeadlineRelabel(e, conn)
-  }
+// X
+fn h2teardown(conn: TlsConn, hc: H2Conn) {
   conn.shutdown()
   hc.waitReaderDone()
   hc.waitWriterDone()
   conn.close()
-  return h2glueResponse(res)
-}
-
-// Relabel a round-trip failure as a read timeout when the transport's
-// terminal read failed because THIS side's own deadline elapsed
-// (`conn.readTimedOut()`, stdlib/tls/tls.bit) rather than the peer closing or
-// resetting a stream — otherwise a deadline expiry and an ordinary mid-stream
-// peer close both arrive here as the identical generic message
-// (`h2connFailAll`'s `"http2: connection closed"`, stdlib/http2/events.bit),
-// and a caller cannot tell which one happened (#3031). `readTimedOut()` is
-// only ever true when the reader thread's own read hit the deadline sentinel,
-// so this never mislabels a genuine peer-driven failure (e.g. `RST_STREAM`,
-// stdlib/http2/streams.bit) — those leave the flag false and `e` unchanged.
-fn h2glueDeadlineRelabel(e: error, conn: TlsConn): error {
-  if (conn.readTimedOut()) {
-    return newError("http2: read timed out (${e.message()})")
-  }
-  return e
 }
 
 // Serve one h2-negotiated connection: run the http2 server engine and dispatch
@@ -169,7 +185,7 @@ fn h2glueDeadlineRelabel(e: error, conn: TlsConn): error {
 // `conn.shutdown()` immediately below — which comes FIRST on every path for
 // exactly this reason — is what makes its read fail. Either way
 // `hc.waitReaderDone()` here is a bounded join, not a fresh wait, matching
-// `h2clientExchange`'s teardown
+// `h2teardown`'s teardown
 // (`conn.shutdown()` -> `hc.waitReaderDone()` -> `hc.waitWriterDone()` ->
 // `conn.close()`, #3016, #3026). `hc.waitWriterDone()` is bounded the same way
 // `hc.waitReaderDone()` is: the same teardown that released `hc.serve()`

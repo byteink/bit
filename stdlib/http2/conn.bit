@@ -118,6 +118,11 @@ export fn getHeader(headers: []HeaderField, name: string): string {
 // on `replyCh` the same way `h2connAwaitReady` bounds the SETTINGS wait
 // (#3036).
 //
+// `peerMaxStreams` is the peer's SETTINGS_MAX_CONCURRENT_STREAMS from its
+// opening SETTINGS (2^32-1 when it named none), read through
+// `peerMaxStreams()`: a caller sharing this connection between requests caps
+// its own streams at it instead of finding out from the engine's refusal.
+//
 // `streamBodies` is `Config.streamBodies` as `connect`/`accept` received it, kept
 // here because `serve` is where it is read: it decides whether each handler is
 // spawned with its body already taken or takes it itself (#4624).
@@ -128,23 +133,27 @@ export class Conn {
   readerDone: chan<int>
   writerDone: chan<int>
   deadlineNs: int
+  peerStreams: int
   streamBodies: bool
 
   // Send `req` on a fresh stream and block until its full response arrives. Safe to
   // call from many green threads at once — each request rides its own stream,
-  // multiplexed over the one connection. Bounded by the same deadline
-  // `connect`/`accept` received (0 = no bound) — see `h2connAwaitReply` (#3036).
+  // multiplexed over the one connection. Bounded by `deadlineNs` when it is
+  // non-zero — an absolute `monotonic` deadline for this one request, which is
+  // what lets requests with different deadlines share a connection — else by
+  // the deadline `connect`/`accept` received (0 = no bound), see
+  // `h2connAwaitReply` (#3036).
   //
   // Refused outright under `Config.streamBodies`, which says the application
   // takes bodies itself: this method cannot hand the stream over, so honouring
   // the setting would mean either returning a body this call truncated or
   // buffering up to `maxBodyBytes` behind the setting's back. `roundTripStream`
   // below is what such a client calls (#4728).
-  export roundTrip(req: Request): Response! {
+  export roundTrip(req: Request, deadlineNs: int = 0): Response! {
     if (this.streamBodies) {
       fail newError("http2: Config.streamBodies is set — call roundTripStream instead")
     }
-    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.deadlineNs)?
+    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.boundOf(deadlineNs))?
     if (!msg.hasBody) {
       return msg.response
     }
@@ -173,12 +182,30 @@ export class Conn {
   // that carried no body at all is not a special case: the first read answers
   // `eof` with no bytes.
   //
-  // Bounded by the same deadline as `roundTrip`, and equally safe from many
+  // Bounded by `deadlineNs` exactly as `roundTrip` is, and equally safe from many
   // green threads — but exactly one thread reads one stream, which is the thread
   // this handed the `Stream` to.
-  export roundTripStream(req: Request): (Response, Stream)! {
-    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.deadlineNs)?
+  export roundTripStream(req: Request, deadlineNs: int = 0): (Response, Stream)! {
+    let msg = h2connOpenRoundTrip(this.cmdCh, req, this.boundOf(deadlineNs))?
     return (msg.response, Stream{ cmdCh = this.cmdCh, id = msg.streamId })
+  }
+
+  // The deadline a round trip waits under: the caller's own when it gave one,
+  // else the one this connection was started with.
+  boundOf(deadlineNs: int): int {
+    if (deadlineNs != 0) {
+      return deadlineNs
+    }
+    return this.deadlineNs
+  }
+
+  // The peer's SETTINGS_MAX_CONCURRENT_STREAMS as its opening SETTINGS stated
+  // it (2^32-1 when it stated none): the most streams this side may have open
+  // at once. A later SETTINGS can lower it; the engine then refuses the stream
+  // it must not open with an error, so a caller's own cap is a bound, not a
+  // promise.
+  export peerMaxStreams(): int {
+    return this.peerStreams
   }
 
   // Serve inbound requests, dispatching each to `handler` on its own green thread,
@@ -366,7 +393,7 @@ fn h2connStart(
   // window and frame-size limits are known before the first request is sent.
   // Bounded by `deadlineNs` and by the teardown path, not a bare receive —
   // see `h2connAwaitReady` (#3019).
-  h2connAwaitReady(t, readyCh, readerDoneCh, writerDoneCh, deadlineNs)?
+  let peerStreams = h2connAwaitReady(t, readyCh, readerDoneCh, writerDoneCh, deadlineNs)?
   return Conn{
     isClient = isClient,
     cmdCh = cmdCh,
@@ -374,11 +401,13 @@ fn h2connStart(
     readerDone = readerDoneCh,
     writerDone = writerDoneCh,
     deadlineNs = deadlineNs,
+    peerStreams = peerStreams,
     streamBodies = cfg.streamBodies,
   }
 }
 
-// Block until the loop signals `readyCh` (1 for the peer's opening SETTINGS,
+// Block until the loop signals `readyCh` (the peer's SETTINGS_MAX_CONCURRENT_STREAMS
+// plus one for its opening SETTINGS, which this returns without the one;
 // 0 for a teardown before that — the transport's EOF, or a connection error
 // this side raised, both in events.bit) or until `deadlineNs` elapses first
 // (0 = no bound). A channel receive has no timer of its own, unlike a socket
@@ -418,16 +447,19 @@ fn h2connAwaitReady(
   readerDoneCh: chan<int>,
   writerDoneCh: chan<int>,
   deadlineNs: int,
-): ()! {
+): int! {
   let timeoutCh = chan<int>(1)
   if (deadlineNs != 0) {
     spawn h2connArmDeadline(deadlineNs, timeoutCh)
   }
   let outcome = 0
+  let peerStreams = 0
   select {
     case sig = <- readyCh:
       if (sig == 0) {
         outcome = 1
+      } else {
+        peerStreams = sig - 1
       }
     case _ = <- timeoutCh:
       outcome = 2
@@ -446,7 +478,7 @@ fn h2connAwaitReady(
     outcome = 2
   }
   if (outcome == 0) {
-    return
+    return peerStreams
   }
   t.shutdown()
   <- readerDoneCh

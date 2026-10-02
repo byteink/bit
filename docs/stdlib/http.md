@@ -197,8 +197,57 @@ repeat its effect, and the call fails with the error instead.
 A pool belongs to one `Client` and one TLS configuration, so connections are
 never shared between clients. `requestTls` and the other package-level calls
 take a configuration per call and so never keep a connection past the call.
-HTTP/2 and HTTP/3 connections are not pooled yet: each call still opens its
-own.
+HTTP/3 connections are not pooled yet: each call still opens its own.
+
+#### Sharing one HTTP/2 connection
+
+Inkwell's export screen fetches forty drafts at once, one `get` per draft on
+its own green thread. An HTTP/1.1 connection carries one request at a time, so
+that is forty connections. An `https://` server that negotiates HTTP/2 carries
+many requests at once, so the `Client` keeps one connection per origin and
+every request becomes a stream on it: forty concurrent `get` calls make one
+TCP connect and one TLS handshake.
+
+```bit
+import { newClient, Client, PoolLimits } from "std/http"
+
+fn fetchDraft(c: Client, host: string, id: string, out: chan<int>) {
+  let res = c.get("https://${host}/drafts/${id}") catch _ {
+    out <- 0
+    return
+  }
+  out <- len(res.body)
+}
+
+fn exportDrafts(host: string, ids: []string): int! {
+  let c = newClient()
+  c.setPool(PoolLimits{ maxH2Streams = 20 })?
+  let out = chan<int>(len(ids))
+  for id of ids {
+    spawn fetchDraft(c, host, id, out)
+  }
+  let bytes = 0
+  for id of ids {
+    let n = <- out
+    bytes = bytes + n
+  }
+  c.close()
+  return bytes
+}
+```
+
+`maxH2Streams` (default 100) is the most requests in flight on the shared
+connection. The cap is the lower of it and the server's own
+`SETTINGS_MAX_CONCURRENT_STREAMS`; a request over the cap waits for a stream
+to finish, within its own timeout, instead of being refused or opening a
+second connection. `maxH2Streams` must be at least 1. The connection is closed
+when it has been idle for `idleTimeoutMs`, when `close()` or `setPool` retires
+it (requests already running on it finish first), and when a request on it
+fails, because a timed-out or reset stream leaves it in a state the next
+request should not share. `maxIdlePerHost = 0` turns sharing off here too:
+each request gets its own connection and closes it. Retrying follows the same
+rule as HTTP/1.1: a `GET` that fails on a shared connection is retried once on
+a new one, a `POST` is not.
 
 ### Following redirects
 
@@ -518,9 +567,10 @@ As `Client.request`, bounded by one deadline.
 
 ### `PoolLimits`
 
-The bounds of a `Client`'s idle HTTP/1.1 connections: `maxIdlePerHost: int`
-(2), `maxIdleTotal: int` (100) and `idleTimeoutMs: int` (90000). Every field has
-a default, so `PoolLimits{}` is the configuration `newClient` uses.
+The bounds of a `Client`'s connections: `maxIdlePerHost: int`
+(2), `maxIdleTotal: int` (100), `idleTimeoutMs: int` (90000) and
+`maxH2Streams: int` (100), the most requests in flight on one shared HTTP/2
+connection. Every field has a default, so `PoolLimits{}` is the configuration `newClient` uses.
 
 ### `Client.setPool(limits: PoolLimits): ()!`
 
