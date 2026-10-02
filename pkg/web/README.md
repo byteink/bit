@@ -18,12 +18,12 @@ this is stated here rather than enforced.
 
 ## Install
 
-`bit add bitlang.org/pkg/web@^0.8.0` writes:
+`bit add bitlang.org/pkg/web@^0.9.0` writes:
 
 ```json
 {
   "dependencies": {
-    "web": "bitlang.org/pkg/web@^0.8.0"
+    "web": "bitlang.org/pkg/web@^0.9.0"
   }
 }
 ```
