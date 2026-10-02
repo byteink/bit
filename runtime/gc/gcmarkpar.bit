@@ -137,26 +137,35 @@ const gcMkMapBytes = 8519808 // gcMkCtxOff + (maxMutators + 1) * gcMkCtxBytes
 const gcMkHelperParks = 16
 const gcMkParkNs = 1000000
 
+// A sleep that times out is a LATE WAKE (`gcMkLateWakes`) when termination was
+// published at least this long before the timeout could have fired. The cap
+// hides a lost wake from every gate (it costs one `gcMkParkNs`), so the count
+// is the only witness. The margin covers a timeout racing the publication,
+// whose wake is not lost.
+const gcMkLateSlackNs = 100000
+
 // The park pair, reached by its pinned name like ../stw/stwhelper.bit's:
 // every target's provider defines both (`runtime/park/<os>`).
 extern fn bit_rt_port_park_wait(p: *i32, expected: i32, timeoutNs: i64, scratch: *i64): i64
 extern fn bit_rt_port_park_wake(p: *i32, all: bool): i64
 
-let gcMkBase: i64 = 0   // the side mapping, 0 until first use
-let gcMkLock: i32 = 0   // M2
-let gcMkOwner: i64 = 0  // 1 while a coordinator holds the pool
-let gcMkOpen: i64 = 0   // 0, or the `g` whose phase is published
-let gcMkIn: i64 = 0     // helpers inside `gcMarkHelp`'s counted region (M5)
-let gcMkJoined: i64 = 0 // members in the phase, coordinator included (M2)
-let gcMkIdle: i64 = 0   // members with no work (M2)
-let gcMkFull: i64 = 0   // entries on the global list (M2)
-let gcMkFree: i64 = 0   // entries on the free list (M2)
-let gcMkSegs: i64 = 0   // segments carved from the mapping this phase (M2, M8)
-let gcMkDone: i64 = 0   // 1 once termination is decided (M3)
-let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
-let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
-let gcMkWake: i32 = 0   // bumped by a publish that a sleeper may need
-let gcMkAsleep: i64 = 0 // idle members inside `gcMkSleep`
+let gcMkBase: i64 = 0      // the side mapping, 0 until first use
+let gcMkLock: i32 = 0      // M2
+let gcMkOwner: i64 = 0     // 1 while a coordinator holds the pool
+let gcMkOpen: i64 = 0      // 0, or the `g` whose phase is published
+let gcMkIn: i64 = 0        // helpers inside `gcMarkHelp`'s counted region (M5)
+let gcMkJoined: i64 = 0    // members in the phase, coordinator included (M2)
+let gcMkIdle: i64 = 0      // members with no work (M2)
+let gcMkFull: i64 = 0      // entries on the global list (M2)
+let gcMkFree: i64 = 0      // entries on the free list (M2)
+let gcMkSegs: i64 = 0      // segments carved from the mapping this phase (M2, M8)
+let gcMkDone: i64 = 0      // 1 once termination is decided (M3)
+let gcMkBad: i64 = 0       // helpers' bad-offset counts, added on leaving
+let gcMkPhase: i64 = 0     // phases seeded so far; names the one open
+let gcMkWake: i32 = 0      // bumped by a publish that a sleeper may need
+let gcMkAsleep: i64 = 0    // idle members inside `gcMkSleep`
+let gcMkDoneTick: i64 = 0  // `gcTicks` when `gcMkDone` was set, stored before it
+let gcMkLateWakes: i64 = 0 // sleeps that timed out after termination, whole run
 
 @nosplit fn gcMkCtx(k: int): *i64 {
   return wordAt(gcMkBase + gcMkCtxOff + k * gcMkCtxBytes)
@@ -419,6 +428,7 @@ let gcMkAsleep: i64 = 0 // idle members inside `gcMkSleep`
   gcMkIdle = gcMkIdle + 1
   let last = gcMkIdle == gcMkJoined
   if (last) {
+    atomicStore(ptrOf(gcMkDoneTick), gcTicks())
     atomicStore(ptrOf(gcMkDone), 1)
   }
   spinRelease(ptrOf(gcMkLock))
@@ -480,6 +490,26 @@ let gcMkAsleep: i64 = 0 // idle members inside `gcMkSleep`
   let _ = bit_rt_port_park_wake(w, all)
 }
 
+// A sleep armed at `armed` (`gcTicks`) ended by timeout. Count it when
+// termination was already published `gcMkLateSlackNs` before the earliest
+// moment that timeout could fire, so the wake that should have ended the sleep
+// was lost. Reached only on a timeout: a mark that never sleeps pays nothing.
+@nosplit fn gcMkNoteTimeout(armed: int) {
+  if (atomicLoad(ptrOf(gcMkDone)) == 0) {
+    return
+  }
+  if (atomicLoad(ptrOf(gcMkDoneTick)) + gcMkLateSlackNs > armed + gcMkParkNs) {
+    return
+  }
+  let _ = atomicAdd(ptrOf(gcMkLateWakes), 1)
+}
+
+// `latewakes=` (BIT_GC_STATS): late wakes over the whole run. Nonzero means a
+// wake was lost and only the 1 ms cap kept the member moving.
+export @nosplit @symbol("bit_rt_port_gc_mark_late_wakes") fn gcStatLateWakes(): int {
+  return atomicLoad(ptrOf(gcMkLateWakes))
+}
+
 // One sleep of an idle member: arm, re-check, sleep at most `gcMkParkNs`
 // unless the re-check found work or termination, then check again. Same
 // result as `gcMkIdlePoll`. The load of `gcMkWake` precedes the arm, so a
@@ -490,8 +520,12 @@ let gcMkAsleep: i64 = 0 // idle members inside `gcMkSleep`
   let _ = atomicAdd(ptrOf(gcMkAsleep), 1)
   let r = gcMkIdlePoll(c)
   if (r < 0) {
-    let _ = bit_rt_port_park_wait(w, v, gcMkParkNs, c + gcMkCtxScratch)
+    let armed = gcTicks()
+    let timedOut = bit_rt_port_park_wait(w, v, gcMkParkNs, c + gcMkCtxScratch)
     r = gcMkIdlePoll(c)
+    if (timedOut != 0) {
+      gcMkNoteTimeout(armed)
+    }
   }
   let _ = atomicAdd(ptrOf(gcMkAsleep), 0 - 1)
   return r
