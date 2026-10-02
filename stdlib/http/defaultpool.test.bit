@@ -1,0 +1,145 @@
+// stdlib/http/defaultpool.test.bit — the process-wide pool behind the
+// package-level calls (#6482).
+//
+// Same module as client.bit (SPEC §19): `get`, `post`, `requestTimeout`,
+// `getTls`, `defaultPool`, `poolKey`, `tlsScope`, `Idle` and the helpers of
+// pool.test.bit (`startOrigin`, `urlOf`, `acceptsOf`, `isHit`, `startH2Origin`,
+// `tls5916ClientConfig`) are bound module-wide, so nothing is imported. Every
+// origin below listens on its own port, so the shared pool's keys never meet
+// across tests.
+
+test "five sequential package-level gets to one origin make one accept" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let i = 0
+  while (i < 5) {
+    let res = get(urlOf(o, "/p${i}")) catch e {
+      assert(false, "get ${i}: ${e.message()}")
+      return
+    }
+    assert(res.body == "GET /p${i}", "body ${i} = '${res.body}'")
+    i = i + 1
+  }
+  assert(acceptsOf(o) == 1, "accepts = ${acceptsOf(o)}, want 1")
+  // post and requestTimeout take their connection from the same pool.
+  let posted = post(urlOf(o, "/post"), "x") catch e {
+    assert(false, "post: ${e.message()}")
+    return
+  }
+  assert(posted.body == "POST /post", "post body = '${posted.body}'")
+  let timed = requestTimeout("GET", urlOf(o, "/t"), "", 5000) catch e {
+    assert(false, "requestTimeout: ${e.message()}")
+    return
+  }
+  assert(timed.body == "GET /t", "timeout body = '${timed.body}'")
+  assert(acceptsOf(o) == 1, "accepts after post and requestTimeout = ${acceptsOf(o)}, want 1")
+  o.l.close()
+}
+
+fn sharedGet(url: string, out: chan<string>) {
+  let res = get(url) catch e {
+    out <- "error: ${e.message()}"
+    return
+  }
+  out <- "${res.status} ${res.body}"
+}
+
+// Idle connections `defaultPool` holds for `key`, taken out and closed.
+fn drainIdle(key: string): int {
+  let n = 0
+  while (n < 100) {
+    match (defaultPool.take(key, monotonic().ns)) {
+      Hit(s) => {
+        s.shut()
+        n = n + 1
+      }
+      Miss => return n
+    }
+  }
+  return n
+}
+
+test "sixteen tasks calling get at once all succeed within the pool's limits" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let out = chan<string>(16)
+  let i = 0
+  while (i < 16) {
+    spawn sharedGet(urlOf(o, "/c${i}"), out)
+    i = i + 1
+  }
+  let good = 0
+  i = 0
+  while (i < 16) {
+    let got = <- out
+    if (hasPrefix(got, "200 GET /c")) {
+      good = good + 1
+    } else {
+      assert(false, "a concurrent get answered '${got}'")
+    }
+    i = i + 1
+  }
+  assert(good == 16, "${good} of 16 concurrent gets succeeded")
+  // One connection per request in flight at most, none past the burst.
+  assert(acceptsOf(o) <= 16, "accepts = ${acceptsOf(o)}, want at most 16")
+  // The pool parks no more than maxIdlePerHost of them and keeps at least one.
+  let before = acceptsOf(o)
+  let again = get(urlOf(o, "/after")) catch e {
+    assert(false, "get after burst: ${e.message()}")
+    return
+  }
+  assert(again.body == "GET /after", "body = '${again.body}'")
+  assert(acceptsOf(o) == before, "a get after the burst dialed again: ${before} -> ${acceptsOf(o)}")
+  let idle = drainIdle("http://127.0.0.1:${o.port}")
+  assert(idle >= 1 && idle <= defaultPool.limits.maxIdlePerHost, "idle = ${idle}, want 1..2")
+  o.l.close()
+}
+
+test "a pooled https connection is never shared across TLS configs" {
+  let o = startH2Origin() catch e {
+    assert(false, "startH2Origin: ${e.message()}")
+    return
+  }
+  let a = tls5916ClientConfig()
+  a.alpn = ["h2", "http/1.1"]
+  let b = tls5916ClientConfig()
+  b.alpn = ["h2", "http/1.1"]
+  b.serverName = "other.example"
+  let url = "https://127.0.0.1:${o.port}/s"
+  let calls = [a, a, b, b, a]
+  let i = 0
+  while (i < len(calls)) {
+    let res = getTls(url, calls[i]) catch e {
+      assert(false, "getTls ${i}: ${e.message()}")
+      return
+    }
+    assert(res.body == "h2 /s", "body ${i} = '${res.body}'")
+    i = i + 1
+  }
+  // Two configs, two handshakes; the repeat calls and the return to `a` ride theirs.
+  assert(int(o.accepts.load()) == 2, "handshakes = ${o.accepts.load()}, want 2")
+  o.l.close()
+}
+
+test "tlsScope tells configs apart by every field that changes the dial" {
+  let base = tls5916ClientConfig()
+  assert(tlsScope(base) == tlsScope(tls5916ClientConfig()), "equal configs gave different scopes")
+  let name = tls5916ClientConfig()
+  name.serverName = "x"
+  let verify = tls5916ClientConfig()
+  verify.insecureSkipVerify = false
+  let alpn = tls5916ClientConfig()
+  alpn.alpn = ["h2"]
+  let cert = tls5916ClientConfig()
+  cert.certPem = "c"
+  let others = [name, verify, alpn, cert]
+  let i = 0
+  while (i < len(others)) {
+    assert(tlsScope(others[i]) != tlsScope(base), "config ${i} shares the base scope")
+    i = i + 1
+  }
+}
