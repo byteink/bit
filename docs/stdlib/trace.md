@@ -18,10 +18,10 @@ carried through `std/runtime`'s task-local storage slot (`taskLocalGet`/
 under whatever span its caller opened.
 
 ```bit
-import { newTracer } from "std/trace"
+import { Tracer } from "std/trace"
 
 fn main() {
-  let tr = newTracer("http://localhost:4318/v1/traces", "my-service", 1.0)
+  let tr = Tracer("http://localhost:4318/v1/traces", "my-service", 1.0)
 
   let parent = tr.startSpan("handle-request")
   parent.setAttribute("http.method", "GET")
@@ -111,7 +111,7 @@ Formats a `traceparent` header value (version `00`) for an outgoing request.
 
 ### `Sampler`
 
-A head-based ratio sampler. Construct with `newSampler`, never directly.
+A head-based ratio sampler. Construct with `Sampler(ratio)`, never by field.
 
 ### `Sampler.shouldSample(): bool`
 
@@ -120,11 +120,20 @@ trace - a span whose parent context already carries a decision (an incoming
 valid `traceparent`, or a same-process parent span) inherits it instead, so
 every service on a trace agrees.
 
-### `newSampler(ratio: f64): Sampler`
+### `Sampler(ratio: f64)`
 
-A `Sampler` that samples the fraction `ratio` of fresh traces, clamped to
-`[0, 1]`. `0` samples nothing; `1` samples everything, exactly (not merely
-with overwhelming probability).
+The constructor: a `Sampler` that samples the fraction `ratio` of fresh
+traces, clamped to `[0, 1]`. `0` samples nothing; `1` samples everything,
+exactly (not merely with overwhelming probability).
+
+```bit
+import { Sampler } from "std/trace"
+
+fn main() {
+  let tenth = Sampler(0.1)
+  print("${tenth.shouldSample()}")
+}
+```
 
 ## The Tracer
 
@@ -132,11 +141,11 @@ with overwhelming probability).
 
 Holds the sampler, the OTLP export queue and its background task, and the
 set of currently-open sampled spans (needed so `shutdown` can force-close
-and export any left unfinished). Construct with `newTracer`.
+and export any left unfinished). Construct with `Tracer(...)`.
 
-### `newTracer(endpoint: string, scopeName: string, ratio: f64): Tracer`
+### `Tracer(endpoint: string, scopeName: string, ratio: f64)`
 
-A `Tracer` exporting OTLP/HTTP JSON to `endpoint` (e.g.
+The constructor: a `Tracer` exporting OTLP/HTTP JSON to `endpoint` (e.g.
 `"http://localhost:4318/v1/traces"`) at sampling ratio `ratio`. `scopeName`
 names the instrumentation scope OTLP attaches to every span this tracer
 exports. Spawns the background exporter task immediately.
@@ -215,15 +224,31 @@ True iff `s` is exactly `n` lowercase hex characters.
 Parses exactly 16 lowercase hex characters into a `uint`. Fails on a wrong
 length, an uppercase letter, or any non-hex byte.
 
-### `newTraceId(): (uint, uint)`
+### `TraceId`
 
-A fresh 128-bit trace id from the CSPRNG, as `(high, low)` `uint` halves.
-Never all-zero (W3C reserves that value).
+A 128-bit trace id as two `uint` halves, `hi` and `lo`.
 
-### `newSpanId(): uint`
+### `TraceId.random(): TraceId`
 
-A fresh 64-bit span id from the CSPRNG. Never zero (W3C reserves that
-value).
+A fresh trace id from the CSPRNG. Never all-zero (W3C reserves that value).
+
+### `SpanId`
+
+A 64-bit span id, in `value`.
+
+### `SpanId.random(): SpanId`
+
+A fresh span id from the CSPRNG. Never zero (W3C reserves that value).
+
+```bit
+import { TraceId, SpanId, formatTraceParent } from "std/trace"
+
+fn main() {
+  let t = TraceId.random()
+  let s = SpanId.random()
+  print(formatTraceParent(t.hi, t.lo, s.value, true))
+}
+```
 
 ### `encodeOtlpBatch(spans: []Span, scopeName: string): string`
 
