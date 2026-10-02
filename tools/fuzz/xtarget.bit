@@ -47,16 +47,18 @@
 //
 // For each seed: generate the program, cross-compile it for aarch64-macos
 // and for x86_64-linux, run the aarch64 binary locally, copy the x86_64
-// binary to the ssh alias `hl-master` and run it there, then compare stdout,
+// binary to the x86_64 host and run it there, then compare stdout,
 // stderr and exit code of the two runs. On the first mismatch, prints to
 // stderr exactly:
 //
 //   FAIL seed=<n> arm64exit=<a> x64exit=<b> repro: bit run tools/fuzz/genprog.bit -- --seed <n>
 //
 // and exits 1. On full success: `PASS: <count> programs, 0 target mismatches
-// (seed=<start>)`, exit 0. If `ssh hl-master true` fails before any work
-// starts, prints `SKIP: hl-master unreachable` to stdout and exits 0 — a
-// missing remote box is not a red gate.
+// (seed=<start>)`, exit 0. The host is the ssh alias `scripts/x64host.sh`
+// resolves (`BIT_X64_HOST`, or the machine-local candidate list). If none is
+// configured, or `ssh <host> true` fails before any work starts, prints
+// `SKIP: no x86_64 host reachable` to stdout and exits 0 — a missing remote
+// box is not a red gate.
 //
 // Every subprocess here — local and remote — is bounded (Power of 10 rule
 // 2), via the same `osRunBounded`-over-a-generated-`#!/bin/sh`-wrapper shape
@@ -69,7 +71,7 @@
 // Remote cleanup is best-effort: a failed `rm -rf` over a flaky ssh link
 // prints a warning but does not fail an otherwise-successful run. It is
 // attempted on every termination path that could have left the binary or
-// its output files on hl-master (both PASS and FAIL), so a fresh box is the
+// its output files on the remote host (both PASS and FAIL), so a fresh box is the
 // normal expectation, not a guarantee against a genuine network partition.
 //
 // Uses the compiler binary named by the `BIT` environment variable, falling
@@ -79,7 +81,7 @@
 
 import { args, envOr, exit } from "std/os"
 import { readFile, writeFile, mkdir } from "std/fs"
-import { parseInt, hasPrefix, split } from "std/strings"
+import { parseInt, hasPrefix, split, trimSpace } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 
 // --- bounds (Power of 10 rule 2: every loop and every subprocess wait below
@@ -96,8 +98,11 @@ const compileTimeoutMs: int = 60000
 // Running the aarch64-macos binary locally.
 const localRunTimeoutMs: int = 30000
 
-// The one-time `ssh hl-master true` reachability probe.
+// The one-time `ssh <host> true` reachability probe.
 const sshCheckTimeoutMs: int = 15000
+
+// scripts/x64host.sh probing each candidate host (8s apiece).
+const resolveTimeoutMs: int = 60000
 
 // scp in, scp out: plumbing, not the program under test.
 const remoteOpTimeoutMs: int = 30000
@@ -111,7 +116,7 @@ const remoteRunTimeoutMs: int = 45000
 
 const armTarget: string = "aarch64-macos"
 const x64Target: string = "x86_64-linux"
-const remoteHost: string = "hl-master"
+const hostResolver: string = "scripts/x64host.sh"
 
 // --- failure -----------------------------------------------------------------
 
@@ -201,30 +206,47 @@ fn writeExecScript(path: string, cmdLine: string) {
 
 // --- remote reachability -------------------------------------------------------
 
-// Ticket item: "When `ssh hl-master true` fails ... print SKIP ... and exit
-// 0." BatchMode/ConnectTimeout make the probe non-interactive and bounded
+// The ssh alias of the x86_64 box, or "" when none is configured.
+// `scripts/x64host.sh` owns the resolution order and prints the alias on
+// stdout; a non-zero exit means no host (its explanation goes to the log).
+fn resolveHost(workDir: string): string {
+  let script = "${workDir}/resolve-host.sh"
+  let out = "${workDir}/resolve-host.out"
+  writeExecScript(script, "sh ${hostResolver} >\"${out}\" 2>\"${workDir}/resolve-host.err\"")
+  if (osRunBounded(script, resolveTimeoutMs) != 0) {
+    return ""
+  }
+  let text = readFile(out) catch _ {
+    return ""
+  }
+  let lines = split(text, "\n")
+  return trimSpace(lines[0])
+}
+
+// When `ssh <host> true` fails the gate prints SKIP and exits 0.
+// BatchMode/ConnectTimeout make the probe non-interactive and bounded
 // without changing what is being tested.
-fn remoteReachable(workDir: string): bool {
+fn remoteReachable(workDir: string, host: string): bool {
   let script = "${workDir}/sshcheck.sh"
   let log = "${workDir}/sshcheck.log"
   writeExecScript(
     script,
-    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} true >\"${log}\" 2>&1",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${host} true >\"${log}\" 2>&1",
   )
   let rc = osRunBounded(script, sshCheckTimeoutMs)
   return rc == 0
 }
 
-fn remoteMkdirOrDie(workDir: string, remoteDir: string) {
+fn remoteMkdirOrDie(workDir: string, host: string, remoteDir: string) {
   let script = "${workDir}/remote-mkdir.sh"
   let log = "${workDir}/remote-mkdir.log"
   writeExecScript(
     script,
-    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} 'mkdir -p ${remoteDir}' >\"${log}\" 2>&1",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${host} 'mkdir -p ${remoteDir}' >\"${log}\" 2>&1",
   )
   let rc = osRunBounded(script, remoteOpTimeoutMs)
   if (rc != 0) {
-    die("xtarget: failed to create remote scratch dir ${remoteDir} on ${remoteHost} (rc=${rc}); see ${log}")
+    die("xtarget: failed to create remote scratch dir ${remoteDir} on ${host} (rc=${rc}); see ${log}")
   }
 }
 
@@ -235,6 +257,7 @@ fn remoteMkdirOrDie(workDir: string, remoteDir: string) {
 // so they are written once in setupPaths rather than once per seed —
 // matching selfcheck.bit's compileScript/runScript reuse.
 class Paths {
+  host: string,
   workDir: string,
   remoteDir: string,
   genExe: string,
@@ -279,8 +302,15 @@ fn buildGenerator(bin: string, workDir: string): string {
   return genExe
 }
 
-fn setupPaths(bin: string, workDir: string, genExe: string, remoteDir: string): Paths {
+fn setupPaths(
+  bin: string,
+  workDir: string,
+  host: string,
+  genExe: string,
+  remoteDir: string,
+): Paths {
   let p = Paths{
+    host = host,
     workDir = workDir,
     remoteDir = remoteDir,
     genExe = genExe,
@@ -322,7 +352,7 @@ fn writeStaticScripts(bin: string, p: Paths) {
   writeExecScript(p.armRunScript, "\"${p.armExePath}\" >\"${p.armOutPath}\" 2>\"${p.armErrPath}\"")
   writeExecScript(
     p.scpInScript,
-    "scp -o BatchMode=yes -o ConnectTimeout=8 \"${p.x64ExePath}\" ${remoteHost}:${p.remoteDir}/prog >\"${p.scpInLog}\" 2>&1",
+    "scp -o BatchMode=yes -o ConnectTimeout=8 \"${p.x64ExePath}\" ${p.host}:${p.remoteDir}/prog >\"${p.scpInLog}\" 2>&1",
   )
   // The remote command is one single-quoted argument to ssh so the LOCAL
   // shell never touches its `$?` — that must be expanded by the REMOTE
@@ -334,11 +364,11 @@ fn writeStaticScripts(bin: string, p: Paths) {
   let remoteCmd = "chmod +x ${p.remoteDir}/prog && ${p.remoteDir}/prog >${p.remoteDir}/prog.out 2>${p.remoteDir}/prog.err; echo \"XTARGETEXIT:$?\""
   writeExecScript(
     p.sshRunScript,
-    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} '${remoteCmd}' >\"${p.sshOutPath}\" 2>\"${p.sshErrPath}\"",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${p.host} '${remoteCmd}' >\"${p.sshOutPath}\" 2>\"${p.sshErrPath}\"",
   )
   writeExecScript(
     p.scpOutScript,
-    "scp -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost}:${p.remoteDir}/prog.out ${remoteHost}:${p.remoteDir}/prog.err \"${p.workDir}/\" >\"${p.scpOutLog}\" 2>&1",
+    "scp -o BatchMode=yes -o ConnectTimeout=8 ${p.host}:${p.remoteDir}/prog.out ${p.host}:${p.remoteDir}/prog.err \"${p.workDir}/\" >\"${p.scpOutLog}\" 2>&1",
   )
 }
 
@@ -351,17 +381,17 @@ fn remoteCleanupBestEffort(p: Paths) {
   let log = "${p.workDir}/remote-cleanup.log"
   writeExecScript(
     script,
-    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} 'rm -rf ${p.remoteDir}' >\"${log}\" 2>&1",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${p.host} 'rm -rf ${p.remoteDir}' >\"${log}\" 2>&1",
   )
   let rc = osRunBounded(script, remoteOpTimeoutMs)
   if (rc != 0) {
-    eprint("xtarget: warning: cleanup of ${p.remoteDir} on ${remoteHost} failed (rc=${rc}); see ${log}\n")
+    eprint("xtarget: warning: cleanup of ${p.remoteDir} on ${p.host} failed (rc=${rc}); see ${log}\n")
   }
 }
 
 // die(), but for a per-seed harness failure discovered after the remote
 // scratch dir was created — attempts remote cleanup first so a mid-run
-// abort does not leave a binary on hl-master.
+// abort does not leave a binary on the remote host.
 fn dieSeed(p: Paths, msg: string) {
   remoteCleanupBestEffort(p)
   die(msg)
@@ -445,7 +475,7 @@ fn runRemoteX64(p: Paths, seed: int): int {
   if (scpInRc != 0) {
     dieSeed(
       p,
-      "xtarget: seed ${seed}: scp to ${remoteHost} failed (rc=${scpInRc}); see ${p.scpInLog}",
+      "xtarget: seed ${seed}: scp to ${p.host} failed (rc=${scpInRc}); see ${p.scpInLog}",
     )
   }
   let sshRc = osRunBounded(p.sshRunScript, remoteRunTimeoutMs)
@@ -458,7 +488,7 @@ fn runRemoteX64(p: Paths, seed: int): int {
   if (scpOutRc != 0) {
     dieSeed(
       p,
-      "xtarget: seed ${seed}: scp from ${remoteHost} failed (rc=${scpOutRc}); see ${p.scpOutLog}",
+      "xtarget: seed ${seed}: scp from ${p.host} failed (rc=${scpOutRc}); see ${p.scpOutLog}",
     )
   }
   return x64Exit
@@ -504,16 +534,17 @@ fn main() {
     die("xtarget: mkdir ${workDir}: ${e.message()}")
   }
 
-  if (!remoteReachable(workDir)) {
-    print("SKIP: hl-master unreachable\n")
+  let host = resolveHost(workDir)
+  if (len(host) == 0 || !remoteReachable(workDir, host)) {
+    print("SKIP: no x86_64 host reachable\n")
     exit(0)
   }
 
   let remoteDir = "/tmp/bit-xtarget-${runId}"
-  remoteMkdirOrDie(workDir, remoteDir)
+  remoteMkdirOrDie(workDir, host, remoteDir)
 
   let genExe = buildGenerator(bin, workDir)
-  let p = setupPaths(bin, workDir, genExe, remoteDir)
+  let p = setupPaths(bin, workDir, host, genExe, remoteDir)
 
   let seed = a.seed
   let n = 0

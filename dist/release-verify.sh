@@ -40,6 +40,9 @@ BIT_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 # hardcoded username or path.
 MAIN_WORKTREE="$(git -C "$BIT_REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
 WS="${BIT_WORKSPACE_ROOT:-$(dirname "$MAIN_WORKTREE")}"
+# The website checkout this script verifies: a sibling of bit/ in the workspace.
+# The one place its directory name is written; override with BIT_WEBSITE_DIR.
+WEBSITE="${BIT_WEBSITE_DIR:-$WS/bit-website}"
 
 fails=0
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
@@ -137,16 +140,16 @@ total="${total:-0}"
 [ "$n" -ge 3 ] && [ "$n" = "$total" ] || fail "stage0 not repinned to $X ($n of $total digest line(s) are for $X, want all and at least 3)"
 
 # ---- 7. bitlang.org: both pins moved, committed, and pushed ----
-vb_head="$(git -C "$WS/bit-website/vendor/bit" rev-parse HEAD 2>/dev/null)"
+vb_head="$(git -C "$WEBSITE/vendor/bit" rev-parse HEAD 2>/dev/null)"
 tag_commit="$(git -C "$WS/bit" rev-parse "v$X^{commit}" 2>/dev/null)"
 if [ -z "$tag_commit" ]; then
   fail "v$X does not exist as a tag in $WS/bit"
 elif [ "$vb_head" != "$tag_commit" ]; then
   fail "vendor/bit is not at v$X"
 fi
-grep -q "ghcr.io/byteink/bit:$X" "$WS/bit-website/Dockerfile" 2>/dev/null || fail "Dockerfile pins another toolchain"
-[ -z "$(git -C "$WS/bit-website" status --porcelain 2>/dev/null)" ] || fail "website repository is uncommitted"
-[ -z "$(git -C "$WS/bit-website" log --oneline origin/main..HEAD 2>/dev/null)" ] || fail "website repository is not pushed"
+grep -q "ghcr.io/byteink/bit:$X" "$WEBSITE/Dockerfile" 2>/dev/null || fail "Dockerfile pins another toolchain"
+[ -z "$(git -C "$WEBSITE" status --porcelain 2>/dev/null)" ] || fail "website repository is uncommitted"
+[ -z "$(git -C "$WEBSITE" log --oneline origin/main..HEAD 2>/dev/null)" ] || fail "website repository is not pushed"
 
 # ---- 8. and the site is actually up ----
 code="$(curl -s -o /dev/null -w '%{http_code}' https://bitlang.org/ 2>/dev/null)"
