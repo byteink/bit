@@ -23,8 +23,8 @@ green thread.
 
 ```bit
 import {
-  connect, accept, Transport, defaultConfig, Request, Response, Stream, newRequest, newResponse,
-  errorRefusedStream,
+  connect, accept, Conn, Transport, defaultConfig, Request, Response, Stream, newRequest,
+  newResponse, errorRefusedStream,
 } from "std/http2"
 
 // Answer every request with its path echoed back - except "/elsewhere", which is
@@ -45,6 +45,17 @@ fn demo(client: Transport, server: Transport): Response! {
   return conn.roundTrip(newRequest("GET", "example.com", "/"))?
 }
 
+// How many of `n` requests to put on the wire at once. The server's opening
+// SETTINGS named how many streams it will hold open; asking for more is refused
+// stream by stream, so stay at or under `peerMaxStreams()`.
+fn batchSize(conn: Conn, n: int): int {
+  let limit = conn.peerMaxStreams()
+  if (n < limit) {
+    return n
+  }
+  return limit
+}
+
 fn serveOn(t: Transport) {
   let conn = accept(t, defaultConfig(), 0) catch e {
     return
@@ -55,7 +66,9 @@ fn serveOn(t: Transport) {
 }
 ```
 
-`roundTrip` blocks for the full response. For a large response, `roundTripStream`
+`roundTrip` blocks for the full response, and several green threads may call it on
+one `Conn` at once: each rides its own stream. `batchSize` shows the one number such
+a caller needs from the connection, `Conn.peerMaxStreams()`. For a large response, `roundTripStream`
 returns as soon as the headers arrive and hands you a `Stream` to read the body a
 chunk at a time - the same shape a `serve` handler uses under `Config.streamBodies`,
 below.
@@ -630,17 +643,33 @@ a malformed client preface.
 A live HTTP/2 connection. Safe to use from many green threads at once; every
 operation is a method that talks to its own background threads.
 
-### `Conn.roundTrip(req: Request): Response!`
+### `Conn.roundTrip(req: Request, deadlineNs: int = 0): Response!`
 
 Sends `req` on a fresh stream and blocks for the full response. Fails if the
 stream is reset, the connection is closing, or `Config.streamBodies` is set
 (use `roundTripStream` instead).
 
-### `Conn.roundTripStream(req: Request): (Response, Stream)!`
+`deadlineNs` is an absolute `monotonic` deadline for this one request, so
+requests with different deadlines can share a connection. `0`, the default, falls
+back to the deadline `connect` or `accept` received, where `0` means no bound.
+
+### `Conn.roundTripStream(req: Request, deadlineNs: int = 0): (Response, Stream)!`
 
 Sends `req` and returns as soon as the response headers arrive, with the body
 still to come on the returned `Stream`. Use this for a large response you
-want to read a chunk at a time instead of holding whole.
+want to read a chunk at a time instead of holding whole. `deadlineNs` bounds the
+wait exactly as it does for `roundTrip`.
+
+### `Conn.peerMaxStreams(): int`
+
+The most streams the peer will let this side keep open at once: its
+`SETTINGS_MAX_CONCURRENT_STREAMS` from the opening SETTINGS, or 2^32-1 when it
+named none. A caller sharing one `Conn` between many requests caps its own
+in-flight count at this number (as `batchSize` does in "Running a connection over
+your own transport") instead of finding out from a refused stream.
+
+The number is a bound, not a promise: a later SETTINGS from the peer can lower
+it, and a stream the engine then may not open fails with an error.
 
 ### `Conn.serve(handler: (Request, Stream) => Response): ()!`
 
