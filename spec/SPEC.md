@@ -2496,6 +2496,14 @@ ordinary identifiers everywhere else. Only `asm` itself is reserved.
   block that restores another context (a context switch) leaves all of it
   holding the other side's values. A register the allocator never hands out
   (the code generator's scratch registers) adds nothing.
+- **A block whose payload may call out is a clobber point whatever its
+  `clobber` list names.** A callee destroys the vector registers as well
+  (`xmm0`..`xmm13` on x64, `d0`..`d7` on arm64), the list has no spelling for
+  them, and a block can pin every caller-saved register it would otherwise name
+  as an `input`, which keeps them out of the list. So a value, a `f64` included,
+  that is live across such a block never sits in a caller-saved register of
+  either class. What counts as a call is the decoder below. A block inside a
+  `@naked` function (§10.3.1) is exempt, as there.
 - **A payload that calls out must declare the whole caller-saved file
   (E0053).** A callee destroys every caller-saved register, so a block that
   contains a call while naming only some of them lets the allocator keep a live
