@@ -63,16 +63,20 @@ fn xJumpLenAt(code: []u8, j: int): int {
 class XJumpCensus {
   jumps: int,
   fused: int,
+  prefixed: int,
 }
 
 // Asserts that no recorded jump, and no jcc together with the setter fused
-// with it, crosses or ends on a 32-byte boundary.
+// with it, crosses or ends on a 32-byte boundary, and that no padding prefix
+// sits on either (#5935).
 fn xCheckJumpPlacement(b: X64Buf, c: XJumpCensus) {
+  let starts = []int(0)
   for j of b.jumps {
     let n = xJumpLenAt(b.code, j)
     assert(n > 0)
     assert(!xSpansBoundary(j, j + n))
     c.jumps = c.jumps + 1
+    starts = append(starts, j)
     let s = 0
     if (n != 5) {
       s = xFusedSetterLen(b.code, j)
@@ -80,7 +84,23 @@ fn xCheckJumpPlacement(b: X64Buf, c: XJumpCensus) {
     if (s > 0) {
       assert(!xSpansBoundary(j - s, j + n))
       c.fused = c.fused + 1
+      starts = append(starts, j - s)
     }
+  }
+  xCheckPrefixes(b, starts, c)
+}
+
+// Every instruction xPadJump lengthened carries 1..xPadPrefixMax() prefixes
+// in all, CS ones first, and is neither a jump nor a fused setter.
+fn xCheckPrefixes(b: X64Buf, banned: []int, c: XJumpCensus) {
+  for p of b.prefixed {
+    let k = 0
+    while (b.code[p + k] == xPadPrefix()) {
+      k = k + 1
+    }
+    assert(k > 0 && k + xPrefixCount(b.code, p + k) <= xPadPrefixMax())
+    assert(!xIntIn(p + k, banned))
+    c.prefixed = c.prefixed + 1
   }
 }
 
@@ -96,7 +116,7 @@ fn xAlignBenchSrc(): string {
 fn checkX64BenchJumpPlacement() {
   let m = lowerSourceModule(xAlignBenchSrc())
   optimizeModule(m, false)
-  let c = XJumpCensus{ jumps = 0, fused = 0 }
+  let c = XJumpCensus{ jumps = 0, fused = 0, prefixed = 0 }
   for f of m.funcs {
     if (!emitsFunction(f, false)) {
       continue
@@ -107,8 +127,9 @@ fn checkX64BenchJumpPlacement() {
     assert(xEmitFuncBody(cx, f))
     xCheckJumpPlacement(cx.buf, c)
   }
-  // Not vacuous: the loops, bounds checks and polls above write dozens.
-  assert(c.jumps >= 40 && c.fused >= 20)
+  // Not vacuous: the loops, bounds checks and polls above write dozens, and
+  // their pads are partly prefixes.
+  assert(c.jumps >= 40 && c.fused >= 20 && c.prefixed >= 3)
 }
 
 // A fused cmp that would straddle moves forward whole, with the NOPs before
@@ -129,6 +150,75 @@ fn checkX64JumpPad() {
   let off = newX64Buf()
   xArithRR(off, XArith.Cmp, XReg64.Rax, XReg64.Rcx)
   assert(xPadJump(off, 6, true) == 3 && len(off.code) == 3)
+}
+
+// #5935: the pad goes into CS prefixes on the instructions before the fused
+// setter, one each, nearest first, and no NOP is written; the farthest, and
+// the setter itself, stay as they were.
+fn checkX64JumpPadPrefix() {
+  let b = newX64Buf()
+  b.align = true
+  xAppendNop1s(b, 17)
+  xMovRR(b, XReg64.Rax, XReg64.Rcx)               // 17
+  xMovRR(b, XReg64.Rdx, XReg64.Rbx)               // 20
+  xMovRR(b, XReg64.Rsi, XReg64.Rdi)               // 23
+  xMovRR(b, XReg64.R8, XReg64.R9)                 // 26
+  xArithRR(b, XArith.Cmp, XReg64.Rax, XReg64.Rcx) // 29..32, jcc would end at 38
+  assert(xPadJump(b, 6, true) == 29)
+  assert(len(b.code) == 35 && b.jumps[0] == 35 && b.padN == 0)
+  assert(xHex(xBufOf(b.code[17:35])) == "4889c8" + "2e4889da" + "2e4889fe" + "2e4d89c8" + "4839c8")
+  assert(len(b.prefixed) == 3 && b.prefixed[0] == 20 && b.prefixed[2] == 28)
+  // Rooms count REX, 66 and the 0F escape, and stop at 15 bytes.
+  assert(xPrefixRoom([u8(0x48), u8(0x89), u8(0xC8)], 0) == 4)
+  assert(xPrefixRoom([u8(0x8B), u8(0x45), u8(0x00)], 0) == 5)
+  assert(xPrefixRoom([u8(0x66), u8(0x41), u8(0x89), u8(0x00)], 0) == 3)
+  assert(xPrefixRoom([u8(0x48), u8(0x0F), u8(0xB6), u8(0xC0)], 0) == 3)
+  let wide = newX64Buf()
+  xMovStoreImm(wide, xMemBI(XReg64.Rax, XReg64.Rcx, 8, 0), 1) // 12 bytes
+  assert(len(wide.code) == 12 && xPrefixRoom(wide.code, 0) == 3)
+}
+
+// A label stops the search, and what prefixes cannot take is NOPs at the
+// setter: the one movable mov takes its 4, the 3 left are one NOP.
+fn checkX64JumpPadFallback() {
+  let b = newX64Buf()
+  b.align = true
+  xAppendNop1s(b, 19)
+  xMovRR(b, XReg64.Rax, XReg64.Rcx) // 19, before the label: never moves
+  xFuseBarrier(b)
+  xMovRR(b, XReg64.Rdx, XReg64.Rbx)               // 22
+  xArithRR(b, XArith.Cmp, XReg64.Rax, XReg64.Rcx) // 25..28
+  assert(xPadJump(b, 6, true) == 25 && len(b.code) == 35)
+  assert(xHex(xBufOf(b.code[19:35])) == "4889c8" + "2e2e2e2e4889da" + "0f1f00" + "4839c8")
+  let none = newX64Buf()
+  none.align = true
+  xAppendNop1s(none, 25)
+  xArithRR(none, XArith.Cmp, XReg64.Rax, XReg64.Rcx)
+  assert(xPadJump(none, 6, true) == 25 && len(none.prefixed) == 0)
+  assert(xHex(xBufOf(none.code[25:35])) == "0f1f8000000000" + "4839c8")
+}
+
+// What the context recorded past a prefix moves with its bytes; a row or a
+// return address naming the start of a lengthened instruction still names
+// it, with its prefixes in front.
+fn checkX64JumpPadMovesCtx() {
+  let cx = newXCtx(XCallConv.SysV)
+  cx.buf.align = true
+  cx.safepointCodeOffsets = []int(1)
+  xAppendNop1s(cx.buf, 18)
+  for pc of [18, 21, 26, 29] {
+    cx.dbgRows = append(cx.dbgRows, DebugLineRow{ pcOffset = pc, file = 0, line = pc })
+  }
+  xMovRR(cx.buf, XReg64.Rax, XReg64.Rcx) // 18
+  xCallReloc(cx, "f")                    // 21, field at 22, returns to 26
+  xRecordSafepoint(cx)
+  xMovRR(cx.buf, XReg64.Rdx, XReg64.Rbx)               // 26
+  xArithRR(cx.buf, XArith.Cmp, XReg64.Rax, XReg64.Rcx) // 29..32
+  xPadJumpCx(cx, 6, true)
+  assert(xHex(xBufOf(cx.buf.code[18:35])) == "2e4889c8" + "e800000000" + "2e2e4889da" + "4839c8")
+  assert(cx.relocs[0].offset == 23 && cx.safepointCodeOffsets[0] == 27)
+  assert(cx.dbgRows[0].pcOffset == 18 && cx.dbgRows[1].pcOffset == 22)
+  assert(cx.dbgRows[2].pcOffset == 27 && cx.dbgRows[3].pcOffset == 32)
 }
 
 // A loop header moves to the next 32-byte boundary whatever the pad, up to

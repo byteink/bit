@@ -7,17 +7,22 @@
 // holding it decodes through the legacy pipeline instead. Whether that
 // happens depended on unrelated code size: #5824 measured x97 DSB misses on
 // matrix from a change that cut 6% of its instructions. So every jump is
-// padded with Intel's NOPs (xNopBytes) until it and its fused setter sit
-// inside one 32-byte chunk, which is gcc/llvm's
-// -mbranches-within-32B-boundaries. The offsets are function-relative and
-// mean the same as absolute ones because xFuncAlign puts every entry on a
+// padded until it and its fused setter sit inside one 32-byte chunk, which is
+// gas's -mbranches-within-32B-boundaries. The offsets are function-relative
+// and mean the same as absolute ones because xFuncAlign puts every entry on a
 // 32-byte boundary.
+//
+// #5935: the pad is redundant CS prefixes on the instructions before the jump
+// first, as gas does, and Intel's NOPs (xNopBytes) only for what those cannot
+// take. A NOP on the fall-through retires on every pass (+2.6% instructions
+// on mandelbrot); a prefix adds no uop.
 //
 // Every jump here is a fixed-size form (rel32, or the one rel8 in
 // xEmitHeaderWordOrZero), so its length is known when it is written and the
 // padding is decided then: nothing after it can change its size, and no
-// fixpoint over displacements exists to run. Only the fused setter can move,
-// forward by the pad, and xPadJumpCx fixes what points past its start.
+// fixpoint over displacements exists to run. What moves is the straight-line
+// code since the last label or jump, forward by the pad, and xPadJumpCx fixes
+// what the context recorded in it.
 
 fn xBranchWindow(): int { return 32 }
 
@@ -45,17 +50,77 @@ fn xNoteFusible(b: X64Buf, start: int) {
   b.fuseEnd = len(b.code)
 }
 
-// A label bound at the current offset: whatever jumps here set its flags
-// elsewhere, so the setter before this point is no one's partner and must
-// not move.
+// A label bound at the current offset, or an offset read off the buffer for
+// later: whatever jumps here set its flags elsewhere, so the setter before
+// this point is no one's partner, and nothing before it may move, so no
+// instruction before it takes a prefix.
 fn xFuseBarrier(b: X64Buf) {
   b.fuseEnd = -1
+  b.padN = 0
+}
+
+// The most prefixes one instruction may carry, its own included: gas's
+// -malign-branch-prefix-size default, which Intel's JCC-erratum paper
+// (341810-001 §3.1) recommends. Some cores decode more than 3 slowly, so
+// xSpreadPrefixes spreads them thin.
+fn xPadPrefixMax(): int { return 5 }
+
+// CS, the padding prefix gas and llvm both use in 64-bit mode, where a CS
+// override is ignored. Never put on a branch, where it is a hint.
+fn xPadPrefix(): u8 { return u8(0x2E) }
+
+// #5935: records the instruction written from `start` as one xPadJump may
+// lengthen with prefixes. Only emitters whose form has no segment override,
+// no lock, no relocation and is no branch call this.
+fn xNotePad(b: X64Buf, start: int) {
+  if (!b.align || start == len(b.code)) {
+    return
+  }
+  let room = xPrefixRoom(b.code, start)
+  if (room <= 0) {
+    return
+  }
+  if (b.padN == len(b.padAt)) {
+    b.padAt = append(b.padAt, 0)
+    b.padRoom = append(b.padRoom, 0)
+  }
+  b.padAt[b.padN] = start
+  b.padRoom[b.padN] = room
+  b.padN = b.padN + 1
+}
+
+// How many prefixes the instruction from `start` to the end may still take:
+// xPadPrefixMax() in all, and at most 15 bytes long.
+fn xPrefixRoom(code: []u8, start: int): int {
+  let room = xPadPrefixMax() - xPrefixCount(code, start)
+  let fit = 15 - (len(code) - start)
+  if (fit < room) {
+    return fit
+  }
+  return room
+}
+
+// The prefixes a noted instruction starting at `start` has, counted as gas
+// counts them: its 66, its REX and its 0F escape.
+fn xPrefixCount(code: []u8, start: int): int {
+  let k = start
+  if (code[k] == 0x66) {
+    k = k + 1
+  }
+  if ((code[k] & 0xF0) == 0x40) {
+    k = k + 1
+  }
+  if (code[k] == 0x0F) {
+    k = k + 1
+  }
+  return k - start
 }
 
 // Pads before a jump of `n` bytes so that neither it nor, when `fused`, the
 // flag setter that ends where it starts crosses or ends on a 32-byte
-// boundary. The padding goes in before the setter, never between the two,
-// which would break the fusion. Returns the offset it went in at.
+// boundary. The padding goes in before the setter, never between the two or
+// on the setter, which could break the fusion. Returns the pre-pad offset of
+// the setter, or of the jump when there is none.
 fn xPadJump(b: X64Buf, n: int, fused: bool): int {
   let here = len(b.code)
   let at = here
@@ -63,20 +128,122 @@ fn xPadJump(b: X64Buf, n: int, fused: bool): int {
     at = b.fuseStart
   }
   b.fuseEnd = -1
+  b.moveN = 0
   if (b.align && xSpansBoundary(at, here + n)) {
-    xInsertNops(b, at, xBranchWindow() - at % xBranchWindow())
+    xPadBefore(b, at, xBranchWindow() - at % xBranchWindow())
   }
+  b.padN = 0
   b.jumps = append(b.jumps, len(b.code))
   return at
+}
+
+// Inserts `pad` bytes before `at`: prefixes on the noted instructions before
+// it (xSpreadPrefixes), then NOPs at `at` for the rest. Highest offset first,
+// so every insert lands at its pre-pad offset.
+fn xPadBefore(b: X64Buf, at: int, pad: int) {
+  let give = xSpreadPrefixes(b, at, pad)
+  let nops = pad
+  for g of give {
+    nops = nops - g
+  }
+  if (nops > 0) {
+    xInsertNops(b, at, nops)
+  }
+  let j = len(give) - 1
+  while (j >= 0) {
+    if (give[j] > 0) {
+      xInsertBytes(b, b.padAt[j], xPrefixRun(give[j]))
+    }
+    j = j - 1
+  }
+  xRecordMoves(b, give, at, nops)
+}
+
+// How many prefixes each noted instruction before `at` takes toward `pad`:
+// one each per round, nearest the jump first, so they spread thin rather
+// than stack on one instruction.
+fn xSpreadPrefixes(b: X64Buf, at: int, pad: int): []int {
+  let give = []int(b.padN)
+  let left = pad
+  let round = 1
+  while (left > 0 && round <= xPadPrefixMax()) {
+    let j = b.padN - 1
+    while (left > 0 && j >= 0) {
+      if (b.padAt[j] < at && b.padRoom[j] >= round) {
+        give[j] = round
+        left = left - 1
+      }
+      j = j - 1
+    }
+    round = round + 1
+  }
+  return give
+}
+
+fn xPrefixRun(n: int): []u8 {
+  let out = []u8(0)
+  let k = 0
+  while (k < n) {
+    out = append(out, xPadPrefix())
+    k = k + 1
+  }
+  return out
+}
+
+// Records the inserts xPadBefore made, ascending, in pre-pad offsets, and
+// where each lengthened instruction now starts.
+fn xRecordMoves(b: X64Buf, give: []int, at: int, nops: int) {
+  let moved = 0
+  let j = 0
+  while (j < len(give)) {
+    if (give[j] > 0) {
+      xNoteMove(b, b.padAt[j], give[j])
+      b.prefixed = append(b.prefixed, b.padAt[j] + moved)
+      moved = moved + give[j]
+    }
+    j = j + 1
+  }
+  if (nops > 0) {
+    xNoteMove(b, at, nops)
+  }
+}
+
+fn xNoteMove(b: X64Buf, at: int, n: int) {
+  if (b.moveN == len(b.moveAt)) {
+    b.moveAt = append(b.moveAt, 0)
+    b.moveLen = append(b.moveLen, 0)
+  }
+  b.moveAt[b.moveN] = at
+  b.moveLen[b.moveN] = n
+  b.moveN = b.moveN + 1
+}
+
+// Where the byte at pre-pad offset `o` is after the last pad. An insert AT
+// `o` goes in front of it, as part of the instruction starting there, so a
+// row or return address naming that start still names it.
+fn xMovedOffset(b: X64Buf, o: int): int {
+  let d = 0
+  let k = 0
+  while (k < b.moveN && b.moveAt[k] < o) {
+    d = d + b.moveLen[k]
+    k = k + 1
+  }
+  return o + d
 }
 
 // Inserts `pad` bytes of NOPs at `at`, moving the bytes after it forward.
 // Only a fused setter (at most seven bytes) is ever moved.
 fn xInsertNops(b: X64Buf, at: int, pad: int) {
+  assert(len(b.code) - at <= 7)
+  xInsertBytes(b, at, xNopBytes(pad))
+}
+
+// Inserts `bytes` at `at`, moving the bytes after it forward.
+fn xInsertBytes(b: X64Buf, at: int, bytes: []u8) {
   let old = len(b.code)
-  assert(at >= 0 && old - at <= 7 && pad > 0 && pad < xBranchWindow())
-  let nops = xNopBytes(pad)
-  for x of nops {
+  let pad = len(bytes)
+  assert(at >= 0 && at <= old && pad > 0 && pad < xBranchWindow())
+  for x of bytes {
     b.code = append(b.code, x)
   }
   let i = old - 1
@@ -86,29 +253,44 @@ fn xInsertNops(b: X64Buf, at: int, pad: int) {
   }
   let k = 0
   while (k < pad) {
-    b.code[at + k] = nops[k]
+    b.code[at + k] = bytes[k]
     k = k + 1
   }
 }
 
-// xPadJump for a function being compiled. A moved setter can only be a fused
-// icmp, whose `br` may have a debug row at its old end; that row moves with
-// it. Nothing else can point into it: it is one register-only instruction,
-// and a label bound after it would have been a barrier.
+// xPadJump for a function being compiled: every relocation, safepoint return
+// address and debug row recorded past the first insert moves with its bytes.
+// Nothing else can point there: fixups and jumps were all written before the
+// last label or jump, and every offset read off the buffer for later sits
+// behind an xFuseBarrier.
 fn xPadJumpCx(cx: XCtx, n: int, fused: bool) {
-  let here = len(cx.buf.code)
-  let at = xPadJump(cx.buf, n, fused)
-  let pad = len(cx.buf.code) - here
-  if (at == here || pad == 0) {
+  let _ = xPadJump(cx.buf, n, fused)
+  if (cx.buf.moveN == 0) {
     return
   }
-  let last = len(cx.relocs) - 1
-  assert(last < 0 || cx.relocs[last].offset < at)
-  assert(cx.nextSafepointIdx == 0 || cx.safepointCodeOffsets[cx.nextSafepointIdx - 1] <= at)
-  let r = len(cx.dbgRows) - 1
-  while (r >= 0 && cx.dbgRows[r].pcOffset > at) {
-    cx.dbgRows[r].pcOffset = cx.dbgRows[r].pcOffset + pad
+  let first = cx.buf.moveAt[0]
+  let f = len(cx.fixups) - 1
+  assert(f < 0 || cx.fixups[f].patchOffset < first)
+  let r = len(cx.relocs) - 1
+  while (r >= 0 && cx.relocs[r].offset > first) {
+    cx.relocs[r].offset = xMovedOffset(cx.buf, cx.relocs[r].offset)
     r = r - 1
+  }
+  xMoveCtxRows(cx, first)
+}
+
+// The safepoint return addresses and debug rows past `first`, which both
+// lists hold in ascending order.
+fn xMoveCtxRows(cx: XCtx, first: int) {
+  let s = cx.nextSafepointIdx - 1
+  while (s >= 0 && cx.safepointCodeOffsets[s] > first) {
+    cx.safepointCodeOffsets[s] = xMovedOffset(cx.buf, cx.safepointCodeOffsets[s])
+    s = s - 1
+  }
+  let d = len(cx.dbgRows) - 1
+  while (d >= 0 && cx.dbgRows[d].pcOffset > first) {
+    cx.dbgRows[d].pcOffset = xMovedOffset(cx.buf, cx.dbgRows[d].pcOffset)
+    d = d - 1
   }
 }
 
