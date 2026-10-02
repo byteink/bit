@@ -14,7 +14,7 @@ A session is `dial` (or `dialTls`), `ehlo`, optionally `startTls` and an `auth`
 mechanism, then one `send` per message, then `quit`.
 
 ```bit
-import { dial, newOptions, newMessage, Address, Client, Message } from "std/smtp"
+import { dial, Options, Address, Client, Message } from "std/smtp"
 
 // Submit `m` through a relay on the cleartext submission port, upgrading to TLS
 // before the credential is sent. `startTls` verifies the server's certificate
@@ -24,7 +24,7 @@ fn submit(host: string, user: string, pass: string, m: Message): ()! {
   let c = dial(host, 587)?
   defer c.close()
   c.ehlo("client.example.com")?
-  c.startTls(newOptions())?
+  c.startTls(Options())?
   c.ehlo("client.example.com")?
   c.authPlain(user, pass)?
   c.send(m)?
@@ -72,17 +72,17 @@ everything is validated at `render()`, so a message assembled from several
 places has one failure point with the whole message in view.
 
 ```bit
-import { newMessage, newAttachment, Address } from "std/smtp"
+import { Message, Attachment, Address } from "std/smtp"
 
 // A two-part message with an attachment: text, an HTML alternative, and a file.
 // The body comes out `multipart/mixed` wrapping a `multipart/alternative`.
 fn invoice(pdf: []byte): string! {
-  let m = newMessage(Address{ name = "Billing", email = "billing@example.com" })
+  let m = Message(Address{ name = "Billing", email = "billing@example.com" })
   m.addTo(Address{ name = "", email = "customer@example.net" })
   m.setSubject("Your invoice")
   m.setText("The invoice is attached.\n")
   m.setHtml("<p>The invoice is attached.</p>\n")
-  m.attach(newAttachment("invoice.pdf", "application/pdf", pdf))
+  m.attach(Attachment("invoice.pdf", "application/pdf", pdf))
   return m.render()?
 }
 ```
@@ -104,25 +104,18 @@ and `name` is a header value, rejected for CR/LF/NUL like any other. A name that
 is not printable ASCII, or that carries a quote or a backslash, is sent as an
 RFC 2047 encoded word rather than a quoted string.
 
-### `Attachment`
+### `Attachment(filename: string, contentType: string, data: []byte)`
 
 A file to attach: `filename`, `contentType` (empty means
 `application/octet-stream`) and `data`, the raw bytes. Attachments are always
 base64 - an attachment is opaque bytes, and choosing an encoding from a sample
 of them is how a binary file arrives corrupted.
 
-### `newAttachment(filename: string, contentType: string, data: []byte): Attachment`
+### `Message(sender: Address)`
 
-An attachment of `data` named `filename`, typed `contentType`.
-
-### `Message`
-
-One outgoing mail. Build it with `newMessage` and the setters below; nothing
-reaches the network until `Client.send`.
-
-### `newMessage(sender: Address): Message`
-
-A fresh message from `sender`, with no recipients, subject or body.
+One outgoing mail, built from its sender with no recipients, subject or body.
+Add those with the setters below; nothing reaches the network until
+`Client.send`.
 
 ### `Message.addTo(a: Address)`
 
@@ -174,10 +167,25 @@ the octet limit.
 
 ## Connecting
 
-### `Options`
+### `Options(insecureSkipVerify: bool = false, serverName: string = "", roots: TrustStore = ...)`
 
-How a TLS leg is set up. The zero value verifies, so a bare `Options{}` is as
-safe as `newOptions()`.
+How a TLS leg is set up. `Options()` is secure by default: verification on,
+system trust anchors, SNI taken from the dialed host. Each argument loosens or
+pins one thing, so the call site says exactly what it changed:
+
+```bit
+import { dial, dialTls, Options, Client } from "std/smtp"
+
+// The relay's certificate names the provider, not the host we dial through.
+fn viaPinnedName(host: string): Client! {
+  return dialTls(host, 465, Options(serverName = "smtp.mail.example.com"))?
+}
+
+// A local test server with a throwaway certificate: the one place to opt out.
+fn viaLabServer(port: int): Client! {
+  return dialTls("127.0.0.1", port, Options(insecureSkipVerify = true))?
+}
+```
 
 | Field | Meaning |
 |---|---|
@@ -188,11 +196,6 @@ safe as `newOptions()`.
 Setting `insecureSkipVerify` true means the connection proves nothing about who
 the peer is, and a credential sent over one is a credential given to whoever
 answered. It is for tests and pinned lab servers.
-
-### `newOptions(): Options`
-
-Secure-by-default TLS options: verification on, system trust anchors, SNI taken
-from the dialed host.
 
 ### `dial(host: string, port: int): Client!`
 
