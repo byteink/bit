@@ -796,7 +796,7 @@ as a planned interface, not a shipped one.
     stdout, stderr and exit code from both. It depends on the generator above.
   - **`test-fuzz-xtarget`** will compile each
     generated program for aarch64 and for x86_64, run both, and require the
-    two runs to agree. It is designed to print `SKIP: hl-master unreachable`
+    two runs to agree. It is designed to print `SKIP: x86-64 host unreachable`
     and exit 0 when the remote box is down, so a dead remote never reddens
     the gate. It also depends on the generator above.
   - The three modes above wire in as `test-fuzz-*` steps into `./make test`
@@ -967,7 +967,7 @@ Old notes and tickets will mislead you:
 
 ## Website
 
-**bitlang.org lives in a separate repository: `byteink/bit-website`.** It used to
+**bitlang.org lives in a separate repository, the website repository.** It used to
 be `website/` here. That repo consumes this one as a git submodule, because most
 of the site is generated *from* this tree - `docs/get-started.md`, `docs/book`, `docs/reference`, `docs/tools`,
 `docs/stdlib`, `docs/release/SUPPORT.md`, `stdlib/`, `examples/` and
@@ -985,7 +985,7 @@ Two consequences for work done **here**:
   `examples/`, because an example is a showcase, not a production dependency.
   Only this side is tested - the examples harness compiles and runs it, including
   a mutation-tested path-traversal check. **A fix to the traversal guard here
-  must be mirrored into `byteink/bit-website`, and vice versa.** Across two
+  must be mirrored into the website repository, and vice versa.** Across two
   repositories nothing mechanical will catch a divergence.
 
 Changing `docs/` or `examples/` does not publish anything by itself. The site
