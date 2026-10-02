@@ -1674,7 +1674,11 @@ deliberately NOT released between rounds to spare the unrelated threads: that
 is the same herd release, and the ceiling bounds what holding it costs instead.
 An abandoned attempt holds the next one off for four times the time it waited
 (`stwShouldCollect`, `runtime/stw/stwstats.bit`), so a mutator that never
-answers costs at most a fifth of the world's time rather than all of it. Skipping a
+answers costs at most a fifth of the world's time rather than all of it. The
+hold-off ends early once the slot the abandon named is no longer `running` or
+has a new owner (`worldStuckResponded`, `runtime/gc/gcworldstuck.bit`, #6464): a
+thread that left its unbracketed call and exited, or went into a bracketed
+wait, no longer justifies it. Skipping a
 collection is always safe — the heap simply grows to the next trigger — so
 correctness never depends on the rendezvous succeeding, and no blocking mutator
 can deadlock the collector. Abandonments (a full exhaustion of the retry
