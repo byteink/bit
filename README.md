@@ -78,28 +78,28 @@ twelve small programs. Reproduce with `bench/run.sh`; sources live in
 `bench/cases/`.
 
 <!-- BENCH:START -->
-Bit is faster than Go on 3 of 12 benchmarks, about the same on 0 and slower on 9 (up to 2.5x slower); against C it is faster on 0, about the same on 1 and slower on 11 (up to 12.4x slower).
+Bit is faster than Go on 3 of 12 benchmarks, about the same on 0 and slower on 9 (up to 2.4x slower); against C it is faster on 0, about the same on 1 and slower on 11 (up to 12.4x slower).
 
 | Benchmark | What it tests | vs Go | vs C |
 |---|---|--:|--:|
-| strings | building and slicing strings | 1.8x faster | 1.9x slower |
-| sort | sorting numbers and strings | 1.3x faster | about the same |
+| strings | building and slicing strings | 1.8x faster | 2.0x slower |
 | map | hash map with number keys | 1.2x faster | 1.8x slower |
+| sort | sorting numbers and strings | 1.2x faster | 1.1x slower |
 | fib | function calls | 1.1x slower | 1.6x slower |
 | mandelbrot | floating point math | 1.3x slower | 1.3x slower |
-| matrix | matrix multiplication | 1.5x slower | 3.5x slower |
+| matrix | matrix multiplication | 1.4x slower | 3.5x slower |
 | collatz | integer loops and branches | 1.5x slower | 2.2x slower |
-| strmap | hash map with string keys | 1.9x slower | 5.1x slower |
-| alloc | many small heap objects | 2.0x slower | 1.7x slower |
+| allocpar | heap objects on 8 threads | 1.8x slower | about the same |
+| alloc | many small heap objects | 1.8x slower | 1.6x slower |
+| strmap | hash map with string keys | 1.9x slower | 5.2x slower |
 | allocflat | many objects in one buffer | 2.0x slower | 12.4x slower |
-| allocpar | heap objects on 8 threads | 2.1x slower | 1.2x slower |
-| json | JSON parse and walk | 2.5x slower | 3.6x slower |
+| json | JSON parse and walk | 2.4x slower | 3.6x slower |
 
-Memory: Bit uses less than Go on 9 of 12 benchmarks. A typical run takes 11.2 MB in Bit, 13.6 MB in Go and 5.8 MB in C.
+Memory: Bit uses less than Go on 8 of 12 benchmarks. A typical run takes 9.9 MB in Bit, 13.4 MB in Go and 5.8 MB in C.
 
-Program size: about 332 KB in Bit, 2.3 MB in Go and 33 KB in C.
+Program size: about 359 KB in Bit, 2.3 MB in Go and 33 KB in C.
 
-Measured on Apple M5 Max, macOS 27.0.1, on 2026-10-01.
+Measured on Apple M5 Max, macOS 27.0.1, on 2026-10-02.
 
 Full numbers and method: [bench/RESULTS.md](bench/RESULTS.md)
 <!-- BENCH:END -->
