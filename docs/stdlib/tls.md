@@ -40,16 +40,15 @@ the connection. `client(conn, host, config)` does the same handshake over a
 
 ## Serve TLS
 
-`listen` takes a certificate and matching private key in PEM and runs the
+`listen` takes a `TlsServerConfig`, built from a certificate chain and its
+matching private key in PEM plus the ALPN protocols you support, and runs the
 server side of the handshake for every connection it accepts.
 
 ```bit
-import { listen, TlsConfig, emptyTrustStore } from "std/tls"
+import { listen, TlsServerConfig } from "std/tls"
 
 fn serveOnce(port: int, certPem: string, keyPem: string): ()! {
-  let cfg = TlsConfig(emptyTrustStore())
-  cfg.certPem = certPem
-  cfg.keyPem = keyPem
+  let cfg = TlsServerConfig(certPem, keyPem, ["h2", "http/1.1"])?
   let ln = listen("127.0.0.1", port, cfg)?
   let conn = ln.accept()?
   conn.write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))?
@@ -59,10 +58,13 @@ fn serveOnce(port: int, certPem: string, keyPem: string): ()! {
 }
 ```
 
-A server does not verify a client's identity, so its `TlsConfig` needs no
-trust store; `emptyTrustStore()` fills the field. Pass `alpn = [...]` to
-`TlsConfig` with the protocol names you support (`["h2", "http/1.1"]`, say)
-and read what the client picked back with `conn.alpnProtocol()`.
+A server does not verify a client's identity, so it has no trust store: the
+client side is `TlsConfig`, the server side is `TlsServerConfig`, and neither
+carries fields the other ignores. The third argument lists the protocol names
+you support, most preferred first (`[]` for none); read what the client picked
+back with `conn.alpnProtocol()`. `TlsServerConfig` reads the PEM when you build
+it, so a missing or malformed certificate or key fails there, not on the first
+connection.
 
 ## Trust stores and certificates
 
@@ -102,10 +104,9 @@ chain and hostname verification, so the connection is still encrypted but no
 longer proves who you are talking to; it exists for pinned replay and local
 testing, never for a shipped client.
 
-**Only TLS 1.3 is implemented.** `TlsConfig.minVersion` is a floor, not a
-ceiling: leave it at its default and a connection is always TLS 1.3, the
-version with no known downgrade or renegotiation attacks that plagued 1.2 and
-earlier.
+**Only TLS 1.3 is implemented.** There is no version setting: every
+connection is TLS 1.3, the version with no known downgrade or renegotiation
+attacks that plagued 1.2 and earlier.
 
 **Pin certificates with `fromPem`, not `insecureSkipVerify`.** If you need to
 trust one specific server rather than the public CA system, build a
@@ -121,8 +122,8 @@ just against a smaller trust set.
   TCP connection and then stalls only blocks its own connection, never your
   accept loop. Call `handshake()` yourself first if you need
   `alpnProtocol()`/`peerCertificates()` before your first read or write.
-- **`listen` fails immediately if `certPem` or `keyPem` is empty**, rather
-  than failing later on the first connection.
+- **`TlsServerConfig(...)` fails immediately if the certificate or key PEM is
+  empty or malformed**, rather than failing later on the first connection.
 - **A handshake failure surfaces from `read`/`write`/`handshake`, not from
   `dial`/`listen`/`accept`.** `dial` does run the handshake before returning,
   so a failed one does fail there; a server-side `accept()` cannot, since it
@@ -143,25 +144,25 @@ just against a smaller trust set.
 
 ## Connecting and serving
 
-`dial`, `listen`, `client`, `TlsConfig`, `TlsConn`, and `TlsListener` are the
+`dial`, `listen`, `client`, `TlsConfig`, `TlsServerConfig`, `TlsConn`, and `TlsListener` are the
 path almost every program needs; the rest of this reference is the TLS 1.3
 engine underneath them, exported for building custom tooling directly against
 the handshake.
 
 ### `TlsConfig`
 
-`roots`, `insecureSkipVerify`, `alpn`, `serverName`, `minVersion`, `nowUnix`, `certPem`, `keyPem`: shared by `dial` and `listen`.
+`roots`, `insecureSkipVerify`, `alpn`, `serverName`, `nowUnix`: the client side of a connection, taken by `dial`, `dialDeadline` and `client`. A server uses `TlsServerConfig`.
 
 ### `TlsConfig(roots: TrustStore, serverName: string = "", alpn: []string = ..., insecureSkipVerify: bool = false, nowUnix: int = 0)`
 
-A secure-by-default config: verification on, TLS 1.3. Name only the options
-you need: `TlsConfig(roots, serverName = host, alpn = ["h2"])` for a client. A
-server passes `emptyTrustStore()` and sets `certPem` and `keyPem` on the result;
-`minVersion` is a field too, left at TLS 1.3 unless you lower the floor.
+A secure-by-default client config: verification on, TLS 1.3. `roots` is
+required, and the rest are named only when you need them:
+`TlsConfig(roots, serverName = host, alpn = ["h2"])`.
 
 ### `emptyTrustStore(): TrustStore`
 
-A trust store with no roots, for a server config, which never verifies a peer.
+A trust store with no roots, for a deliberately unverified client
+(`insecureSkipVerify = true`).
 
 ### `dial(host: string, port: int, config: TlsConfig): TlsConn!`
 
@@ -229,9 +230,9 @@ Whether the last read stopped because the deadline passed.
 
 ### `TlsListener`
 
-A listening socket. `config.certPem`/`keyPem` are required to create one.
+A listening socket serving one `TlsServerConfig`.
 
-### `listen(host: string, port: int, config: TlsConfig): TlsListener!`
+### `listen(host: string, port: int, config: TlsServerConfig): TlsListener!`
 
 Binds a listening socket on `host:port` that runs the server handshake on every connection it accepts.
 
@@ -825,7 +826,7 @@ The handshake's derived secrets, once it has completed.
 
 ### `TlsServerConfig`
 
-The lower-level server configuration.
+The server configuration `listen` takes, and the one `tlsServerStart` drives the handshake from.
 
 ### `TlsServerConfig(certChainPem: string, keyPem: string, alpn: []string)!`
 
