@@ -19,10 +19,11 @@ strategy that would fail the first time someone tried to use it.
 
 ```bit
 import { OidcStrategy, microsoftStrategy } from "auth"
-import { newTlsConfig, newTrustStore } from "std/tls"
+import { TlsConfig } from "std/tls"
+import { fromPem } from "std/crypto"
 
 fn microsoft(tenantId: string, rootsPem: string): OidcStrategy! {
-  let tls = newTlsConfig(newTrustStore(rootsPem)?)
+  let tls = TlsConfig(fromPem(rootsPem)?)
   return microsoftStrategy(
     tenantId,
     "your-client-id",
@@ -50,7 +51,7 @@ no issuer transformation: point it at any provider that publishes a standard
 import { genericOidcStrategy } from "auth"
 
 fn okta(oktaDomain: string, rootsPem: string): OidcStrategy! {
-  let tls = newTlsConfig(newTrustStore(rootsPem)?)
+  let tls = TlsConfig(fromPem(rootsPem)?)
   return genericOidcStrategy(
     "https://${oktaDomain}",
     "your-client-id",
@@ -73,7 +74,7 @@ overriding a preset's:
 import { newOidcStrategy } from "auth"
 
 fn minimalScopeProvider(issuer: string, rootsPem: string): OidcStrategy! {
-  let tls = newTlsConfig(newTrustStore(rootsPem)?)
+  let tls = TlsConfig(fromPem(rootsPem)?)
   return newOidcStrategy(
     issuer,
     "your-client-id",

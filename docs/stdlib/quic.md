@@ -69,12 +69,12 @@ config, use `dialQuicTls` - the same `getTls`/`requestTls` shape
 
 ```bit
 import { dialQuicTls, Conn } from "std/quic"
-import { TlsConfig, newTlsConfig } from "std/tls"
+import { TlsConfig } from "std/tls"
 import { TrustStore } from "std/crypto"
 
 // Dial, pinning a specific CA instead of the system roots.
 fn dialPinned(host: string, port: int, trust: TrustStore): Conn! {
-  return dialQuicTls(host, port, host, newTlsConfig(trust))?
+  return dialQuicTls(host, port, host, TlsConfig(trust))?
 }
 ```
 
@@ -551,9 +551,9 @@ bytes each, ready to place in a packet.
 ### `CryptoAssembler`
 
 A reassembler for CRYPTO frames that may arrive out of order or overlap.
-Build one with `newCryptoAssembler`.
+Build one with `CryptoAssembler(maxLen)`.
 
-### `newCryptoAssembler(maxLen: int): CryptoAssembler`
+### `CryptoAssembler(maxLen: int)`
 
 A fresh assembler that accepts data up to `maxLen` bytes total.
 
