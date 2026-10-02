@@ -145,8 +145,8 @@ elif [ "$vb_head" != "$tag_commit" ]; then
   fail "vendor/bit is not at v$X"
 fi
 grep -q "ghcr.io/byteink/bit:$X" "$WS/bit-website/Dockerfile" 2>/dev/null || fail "Dockerfile pins another toolchain"
-[ -z "$(git -C "$WS/bit-website" status --porcelain 2>/dev/null)" ] || fail "bit-website is uncommitted"
-[ -z "$(git -C "$WS/bit-website" log --oneline origin/main..HEAD 2>/dev/null)" ] || fail "bit-website is not pushed"
+[ -z "$(git -C "$WS/bit-website" status --porcelain 2>/dev/null)" ] || fail "website repository is uncommitted"
+[ -z "$(git -C "$WS/bit-website" log --oneline origin/main..HEAD 2>/dev/null)" ] || fail "website repository is not pushed"
 
 # ---- 8. and the site is actually up ----
 code="$(curl -s -o /dev/null -w '%{http_code}' https://bitlang.org/ 2>/dev/null)"

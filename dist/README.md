@@ -182,7 +182,7 @@ is live on completion with no undraft step, so it stays out of
 the exact `docker buildx` invocation and the anonymous-pull verification.
 
 **Ordering constraint:** push the ghcr image before deploying bitlang.org.
-`bit-website/Dockerfile`'s build stage is `FROM ghcr.io/byteink/bit:<version>`
+The website repository's Dockerfile build stage is `FROM ghcr.io/byteink/bit:<version>`
 pinned to an exact tag, so a missing tag 404s that deploy.
 
 ## Version reporting
