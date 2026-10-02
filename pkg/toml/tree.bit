@@ -78,17 +78,19 @@ class WOpen { entry: TomlEntry, node: WNode }
 // `tomlMaxDepth` so `finalizeTable`'s recursion is bounded by a constant
 // rather than by how many dots a header or key chain contains.
 //
-// `index` maps every key in `entries` to its `open` position, or to
-// `keyLeaf` for a leaf, and exists exactly when the table holds at least
-// `keyIndexMin` entries (`indexed`). Below that it is the zero (nil) map
-// and `hasEntry`/`findOpen` scan: a narrow table never pays for a map.
-// Without it every key a table gains is compared against every key it
-// already has, so a table of N children costs N^2/2 string compares — the
-// 1000-wide `[service.*]` table in bench/data/config.toml spent 15% of
-// the whole parse in those compares (#6052). The map stores the handle of
-// the key string the `TomlEntry` already holds, never a copy of its bytes.
+// `slots` is the table's key index, an open-addressed hash table over
+// the keys in `entries`. It stays empty until a lookup finds the table
+// `keyIndexMin` wide (`useIndex`); below that `hasEntry`/`findOpen` scan,
+// and a narrow table never pays for an index. Without one every key a
+// table gains is compared against every key it already has, so a table
+// of N children costs N^2/2 string compares — the 1000-wide
+// `[service.*]` table in bench/data/config.toml spent 15% of the whole
+// parse in those compares (#6052). A slot is 0 when empty, `i + 1` for
+// the leaf `entries[i]` and `-(j + 1)` for the open child `open[j]`, so
+// one probe answers both `hasEntry` and `findOpen`. A slot holds no key:
+// a probe compares against the key the `TomlEntry` already holds.
 //
-// `depth` is an `i32` so it packs beside `explicit` and `index` still
+// `depth` is an `i32` so it packs beside `explicit` and `slots` still
 // fits a 32-byte object: as an `int` it pushed every table, wide or not,
 // into the next allocation size class, +1.2% bytes allocated and 3-5%
 // more cycles on bench/data/fixture.toml, whose tables never index.
@@ -97,22 +99,19 @@ class WTable {
   open: []WOpen,
   explicit: bool,
   depth: i32,
-  index: map<string, int>,
+  slots: []i32,
 }
 
-// The width at which a table starts keeping `index`. A scan costs one
-// string compare per key already present; the map costs one probe, but
-// also one insert per key plus its allocation. Building it costs a parse
-// of tables exactly this wide up to 16% more cycles at each threshold
-// tried (8, 16, 32, 64; 7-8% at 32) and breaks even near 1.5x the
-// threshold (#6052). At 32 the common 1..31-key table never pays it,
-// while a 64-wide one already parses 8-12% faster, a 128-wide one 18-23%
-// and a 256-wide one 31-42%; at 64 the 64-wide table pays the build
-// instead of that win.
+// The width from which a lookup builds and then uses `slots`. A scan
+// costs one string compare per key already present; the index costs one
+// hash and one probe per lookup, one more per new key, and one hash and
+// insert per key the table holds when it is built.
 const keyIndexMin = 32
 
-// `index`'s value for a key whose entry is a leaf rather than an open child.
-const keyLeaf = -1
+// The widest table `useIndex` builds an index for; a wider one scans. It
+// keeps a slot value, at most `keyIndexMax + 1` before growth drops the
+// index (`indexLast`), inside an `i32`.
+const keyIndexMax = 1 << 28
 
 // The value an open child's entry carries until its table closes. Never
 // observable: `finalizeTable` overwrites every one of them before the tree
@@ -144,9 +143,8 @@ fn newChildTable(parent: WTable, explicit: bool, offset: int): WTable! {
 // recursive). A bool, not an `Option<TomlEntry>`: this runs once per
 // key/value pair in the document and no caller needs the entry itself.
 fn hasEntry(t: WTable, key: string): bool {
-  if (indexed(t)) {
-    let (_, ok) = t.index[key]
-    return ok
+  if (len(t.entries) >= keyIndexMin && useIndex(t)) {
+    return t.slots[keySlot(t, key)] != 0
   }
   let i = 0
   while (i < len(t.entries)) {
@@ -161,12 +159,12 @@ fn hasEntry(t: WTable, key: string): bool {
 // The still-open child named `key`, or none — which means either no such
 // key at all or a key whose entry is a leaf; `hasEntry` tells those apart.
 fn findOpen(t: WTable, key: string): Option<WOpen> {
-  if (indexed(t)) {
-    let (at, ok) = t.index[key]
-    if (!ok || at == keyLeaf) {
+  if (len(t.entries) >= keyIndexMin && useIndex(t)) {
+    let v = t.slots[keySlot(t, key)]
+    if (v >= 0) {
       return Option<WOpen>.None
     }
-    return Option<WOpen>.Some(t.open[at])
+    return Option<WOpen>.Some(t.open[-int(v) - 1])
   }
   let i = 0
   while (i < len(t.open)) {
@@ -185,40 +183,119 @@ fn addOpen(t: WTable, key: string, node: WNode) {
   t.entries = append(t.entries, entry)
   t.open = append(t.open, WOpen{ entry = entry, node = node })
   if (indexed(t)) {
-    indexLast(t, key, len(t.open) - 1)
+    indexLast(t, key, -i32(len(t.open)))
   }
 }
 
 fn indexed(t: WTable): bool {
-  return len(t.entries) >= keyIndexMin
+  return len(t.slots) != 0
 }
 
-// Records `key`, the entry just appended to an `indexed` table — `at` is
-// its `open` position or `keyLeaf` — building the whole index on the
-// append that makes `t` `keyIndexMin` wide. Callers test `indexed` first,
-// so a narrow table's append pays one compare, not a call.
-fn indexLast(t: WTable, key: string, at: int) {
-  if (len(t.entries) == keyIndexMin) {
-    buildIndex(t)
-    return
+// Whether a lookup in `t`, already `keyIndexMin` wide, goes through
+// `slots`, building it first if `t` has none. Every append to a table is
+// preceded by a lookup in it, so the build replaces a scan over the same
+// entries: a table that stops growing at `keyIndexMin` never builds one,
+// and one that grows past it pays a hash per entry where it would have
+// paid a compare (#6471).
+fn useIndex(t: WTable): bool {
+  if (indexed(t)) {
+    return true
   }
-  t.index[key] = at
+  if (len(t.entries) > keyIndexMax) {
+    return false
+  }
+  let count = 4 * keyIndexMin
+  while (count < 2 * len(t.entries)) {
+    count = 2 * count
+  }
+  buildIndex(t, count)
+  return true
 }
 
-// Every key `t` holds so far. `entries` holds the open children too, so
-// each entry is recorded as a leaf first and each open child then
-// overwrites its own key with its `open` position.
-fn buildIndex(t: WTable) {
-  t.index = map<string, int>(2 * len(t.entries))
+// FNV-1a over `key`'s bytes, the high half folded into the low one so the
+// low bits a probe masks off depend on every byte.
+fn keyHash(key: string): int {
+  let h: u64 = 0xcbf29ce484222325
   let i = 0
-  while (i < len(t.entries)) {
-    t.index[t.entries[i].key] = keyLeaf
+  while (i < len(key)) {
+    h = (h ^ u64(key[i])) * 0x100000001b3
     i = i + 1
   }
+  return int(h ^ (h >> 32))
+}
+
+// The slot holding `key` in an `indexed` table, or the empty slot that
+// ends its probe run when `t` has no such key. `slots` is never more than
+// half full, so the run always ends inside one lap.
+fn keySlot(t: WTable, key: string): int {
+  let mask = len(t.slots) - 1
+  let i = keyHash(key) & mask
+  let n = 0
+  while (n <= mask) {
+    let v = t.slots[i]
+    if (v == 0 || slotKey(t, v) == key) {
+      return i
+    }
+    i = (i + 1) & mask
+    n = n + 1
+  }
+  panic("pkg/toml: key index has no empty slot")
+}
+
+// The key of the entry a non-empty slot names.
+fn slotKey(t: WTable, v: i32): string {
+  if (v > 0) {
+    return t.entries[int(v) - 1].key
+  }
+  return t.open[-int(v) - 1].entry.key
+}
+
+// The first empty slot on the probe run of hash `h`, where a key the table
+// does not hold yet goes.
+fn emptySlot(t: WTable, h: int): int {
+  let mask = len(t.slots) - 1
+  let i = h & mask
+  let n = 0
+  while (n <= mask) {
+    if (t.slots[i] == 0) {
+      return i
+    }
+    i = (i + 1) & mask
+    n = n + 1
+  }
+  panic("pkg/toml: key index has no empty slot")
+}
+
+// Records `key`, the entry just appended to an `indexed` table, as slot
+// value `v`. A record that would fill more than half the slots drops the
+// index instead, and the lookup that precedes the next append rebuilds it
+// at least twice as large. Callers test `indexed` first, so a narrow
+// table's append pays one compare, not a call.
+fn indexLast(t: WTable, key: string, v: i32) {
+  if (2 * len(t.entries) > len(t.slots)) {
+    t.slots = []i32(0)
+    return
+  }
+  t.slots[emptySlot(t, keyHash(key))] = v
+}
+
+// Every key `t` holds, in a fresh index of `count` slots. `open` holds the
+// open children in the order `entries` does, and a key occurs once per
+// table, so walking the two together tells a leaf from an open child with
+// one compare instead of a second probe.
+fn buildIndex(t: WTable, count: int) {
+  t.slots = []i32(count)
   let j = 0
-  while (j < len(t.open)) {
-    t.index[t.open[j].entry.key] = j
-    j = j + 1
+  let i = 0
+  while (i < len(t.entries)) {
+    let key = t.entries[i].key
+    let v = i32(i + 1)
+    if (j < len(t.open) && t.open[j].entry.key == key) {
+      v = -i32(j + 1)
+      j = j + 1
+    }
+    t.slots[emptySlot(t, keyHash(key))] = v
+    i = i + 1
   }
 }
 
@@ -320,7 +397,7 @@ fn setLeaf(t: WTable, name: string, offset: int, value: Toml): ()! {
   }
   t.entries = append(t.entries, TomlEntry{ key = name, value = value })
   if (indexed(t)) {
-    indexLast(t, name, keyLeaf)
+    indexLast(t, name, i32(len(t.entries)))
   }
   return
 }
