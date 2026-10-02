@@ -77,7 +77,42 @@ class WOpen { entry: TomlEntry, node: WNode }
 // this table's distance from the root, checked by `newChildTable` against
 // `tomlMaxDepth` so `finalizeTable`'s recursion is bounded by a constant
 // rather than by how many dots a header or key chain contains.
-class WTable { entries: []TomlEntry, open: []WOpen, explicit: bool, depth: int }
+//
+// `index` maps every key in `entries` to its `open` position, or to
+// `keyLeaf` for a leaf, and exists exactly when the table holds at least
+// `keyIndexMin` entries (`indexed`). Below that it is the zero (nil) map
+// and `hasEntry`/`findOpen` scan: a narrow table never pays for a map.
+// Without it every key a table gains is compared against every key it
+// already has, so a table of N children costs N^2/2 string compares — the
+// 1000-wide `[service.*]` table in bench/data/config.toml spent 15% of
+// the whole parse in those compares (#6052). The map stores the handle of
+// the key string the `TomlEntry` already holds, never a copy of its bytes.
+//
+// `depth` is an `i32` so it packs beside `explicit` and `index` still
+// fits a 32-byte object: as an `int` it pushed every table, wide or not,
+// into the next allocation size class, +1.2% bytes allocated and 3-5%
+// more cycles on bench/data/fixture.toml, whose tables never index.
+class WTable {
+  entries: []TomlEntry,
+  open: []WOpen,
+  explicit: bool,
+  depth: i32,
+  index: map<string, int>,
+}
+
+// The width at which a table starts keeping `index`. A scan costs one
+// string compare per key already present; the map costs one probe, but
+// also one insert per key plus its allocation. Building it costs a parse
+// of tables exactly this wide up to 16% more cycles at each threshold
+// tried (8, 16, 32, 64; 7-8% at 32) and breaks even near 1.5x the
+// threshold (#6052). At 32 the common 1..31-key table never pays it,
+// while a 64-wide one already parses 8-12% faster, a 128-wide one 18-23%
+// and a 256-wide one 31-42%; at 64 the 64-wide table pays the build
+// instead of that win.
+const keyIndexMin = 32
+
+// `index`'s value for a key whose entry is a leaf rather than an open child.
+const keyLeaf = -1
 
 // The value an open child's entry carries until its table closes. Never
 // observable: `finalizeTable` overwrites every one of them before the tree
@@ -94,7 +129,7 @@ fn newRootTable(): WTable {
 // `tomlMaxDepth` — the one place table depth is bounded, shared by dotted
 // keys, `[header]`, and `[[header]]` alike.
 fn newChildTable(parent: WTable, explicit: bool, offset: int): WTable! {
-  if (parent.depth + 1 > tomlMaxDepth) {
+  if (int(parent.depth) + 1 > tomlMaxDepth) {
     fail tomlParseError("table nesting exceeds maximum depth", offset)
   }
   return WTable{
@@ -109,6 +144,10 @@ fn newChildTable(parent: WTable, explicit: bool, offset: int): WTable! {
 // recursive). A bool, not an `Option<TomlEntry>`: this runs once per
 // key/value pair in the document and no caller needs the entry itself.
 fn hasEntry(t: WTable, key: string): bool {
+  if (indexed(t)) {
+    let (_, ok) = t.index[key]
+    return ok
+  }
   let i = 0
   while (i < len(t.entries)) {
     if (t.entries[i].key == key) {
@@ -122,6 +161,13 @@ fn hasEntry(t: WTable, key: string): bool {
 // The still-open child named `key`, or none — which means either no such
 // key at all or a key whose entry is a leaf; `hasEntry` tells those apart.
 fn findOpen(t: WTable, key: string): Option<WOpen> {
+  if (indexed(t)) {
+    let (at, ok) = t.index[key]
+    if (!ok || at == keyLeaf) {
+      return Option<WOpen>.None
+    }
+    return Option<WOpen>.Some(t.open[at])
+  }
   let i = 0
   while (i < len(t.open)) {
     if (t.open[i].entry.key == key) {
@@ -138,6 +184,42 @@ fn addOpen(t: WTable, key: string, node: WNode) {
   let entry = TomlEntry{ key = key, value = wPending() }
   t.entries = append(t.entries, entry)
   t.open = append(t.open, WOpen{ entry = entry, node = node })
+  if (indexed(t)) {
+    indexLast(t, key, len(t.open) - 1)
+  }
+}
+
+fn indexed(t: WTable): bool {
+  return len(t.entries) >= keyIndexMin
+}
+
+// Records `key`, the entry just appended to an `indexed` table — `at` is
+// its `open` position or `keyLeaf` — building the whole index on the
+// append that makes `t` `keyIndexMin` wide. Callers test `indexed` first,
+// so a narrow table's append pays one compare, not a call.
+fn indexLast(t: WTable, key: string, at: int) {
+  if (len(t.entries) == keyIndexMin) {
+    buildIndex(t)
+    return
+  }
+  t.index[key] = at
+}
+
+// Every key `t` holds so far. `entries` holds the open children too, so
+// each entry is recorded as a leaf first and each open child then
+// overwrites its own key with its `open` position.
+fn buildIndex(t: WTable) {
+  t.index = map<string, int>(2 * len(t.entries))
+  let i = 0
+  while (i < len(t.entries)) {
+    t.index[t.entries[i].key] = keyLeaf
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(t.open)) {
+    t.index[t.open[j].entry.key] = j
+    j = j + 1
+  }
 }
 
 // Descends one INTERMEDIATE path segment (never the terminal one) from `t`:
@@ -237,6 +319,9 @@ fn setLeaf(t: WTable, name: string, offset: int, value: Toml): ()! {
     fail tomlParseError("duplicate key '${name}'", offset)
   }
   t.entries = append(t.entries, TomlEntry{ key = name, value = value })
+  if (indexed(t)) {
+    indexLast(t, name, keyLeaf)
+  }
   return
 }
 
