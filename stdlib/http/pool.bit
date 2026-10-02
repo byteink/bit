@@ -18,6 +18,13 @@
 //                   `take`/`put` and by `closeAll`: there is no reaper thread,
 //                   so an idle pool costs nothing, and the other two bounds are
 //                   what cap what a quiet pool can hold.
+//   maxConnsPerHost connections open at once to one origin, idle or in use
+//                   (Go's `MaxConnsPerHost`; 0 = unlimited, the default). A
+//                   request over it waits for a connection to come back or
+//                   close, within its own deadline (`connPool.acquire`). It
+//                   governs HTTP/1.1 only: an h2 origin carries many requests
+//                   on one connection, so `maxH2Streams` is its cap, and a
+//                   request that finds the origin speaks h2 gives its slot back.
 //
 // A `Client` owns one pool (`Client.setPool` sets the bounds); a package-level
 // call such as `get` makes a pool for that call alone and retires it before it
@@ -65,6 +72,11 @@ export class PoolLimits {
   // and the peer's SETTINGS_MAX_CONCURRENT_STREAMS, and a request beyond it
   // waits for a stream to finish, within its own deadline.
   export maxH2Streams: int = 100,
+  // Most HTTP/1.1 connections open at once to one origin, idle ones included;
+  // 0 means no bound. A request over the cap waits for a connection to be
+  // parked or closed, within its own deadline, and then fails naming this
+  // field. Does not apply to HTTP/2, where `maxH2Streams` is the cap.
+  export maxConnsPerHost: int = 0,
 }
 
 // Rejects a `PoolLimits` that is a mistake rather than guessing what was meant.
@@ -81,6 +93,9 @@ fn validatePoolLimits(l: PoolLimits): ()! {
   if (l.maxH2Streams < 1) {
     fail newError("PoolLimits.maxH2Streams is ${l.maxH2Streams}; it must be at least 1")
   }
+  if (l.maxConnsPerHost < 0) {
+    fail newError("PoolLimits.maxConnsPerHost is ${l.maxConnsPerHost}; use 0 for no limit")
+  }
 }
 
 // One parked connection: `since` is the `monotonic` ns it went idle.
@@ -96,6 +111,32 @@ enum Idle {
   Miss,
 }
 
+// The slots of one origin under `maxConnsPerHost`: a counting semaphore with
+// one token per request holding a connection, and how many requests hold or
+// await one, so the entry is dropped when none do.
+class connCap {
+  key: string,
+  tokens: chan<int>,
+  users: int,
+}
+
+// One request's claim on its origin's `maxConnsPerHost` slot. `release` is
+// idempotent, so a request that gives the slot back early (it found the origin
+// speaks h2) and then unwinds through its `defer` releases once.
+class connSlot {
+  pool: connPool
+  key: string
+  held: bool
+
+  release() {
+    if (!this.held) {
+      return
+    }
+    this.held = false
+    this.pool.leaveCap(this.key, true)
+  }
+}
+
 // Idle connections, oldest first. Every method locks `mu`; a request's green
 // thread never holds it across I/O.
 class connPool {
@@ -103,6 +144,8 @@ class connPool {
   mu: Mutex
   idle: []idleConn
   closed: bool
+  // Origins with a request holding or awaiting a `maxConnsPerHost` slot.
+  caps: []connCap
   // The shared HTTP/2 connections (h2pool.bit), one per origin: an h2 origin
   // has no use for an idle list, its one connection carries every request.
   h2: h2Pool
@@ -141,6 +184,66 @@ class connPool {
       this.idle = withoutIdle(this.idle, 0)
     }
     this.idle = append(this.idle, idleConn{ key = key, stream = s, since = now })
+  }
+
+  // Claims a slot for a request to `key`: at once when `maxConnsPerHost` is 0
+  // or the origin is under it, else after a holder releases, but not past
+  // `deadlineNs` (0 = no bound). The caller must `release` the slot it got.
+  acquire(key: string, deadlineNs: int): connSlot! {
+    let slot = connSlot{ pool = this, key = key, held = false }
+    let limit = this.limits.maxConnsPerHost
+    if (limit == 0) {
+      return slot
+    }
+    let c = this.joinCap(key, limit)
+    acquireToken(
+      c.tokens,
+      deadlineNs,
+      "http: timed out waiting for a free connection",
+      "PoolLimits.maxConnsPerHost = ${limit} connections to ${key} already open",
+    ) catch e {
+      this.leaveCap(key, false)
+      fail e
+    }
+    slot.held = true
+    return slot
+  }
+
+  // The entry for `key`, made if absent, with one more user.
+  joinCap(key: string, limit: int): connCap {
+    this.mu.lock()
+    defer this.mu.unlock()
+    for old of this.caps {
+      if (old.key == key) {
+        old.users = old.users + 1
+        return old
+      }
+    }
+    let fresh = connCap{ key = key, tokens = chan<int>(limit), users = 1 }
+    this.caps = append(this.caps, fresh)
+    return fresh
+  }
+
+  // One user of `key` is done; `held` when it owned a token, which it gives
+  // back. The last user removes the entry, so `caps` holds only live origins.
+  leaveCap(key: string, held: bool) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let keep = []connCap(0)
+    for c of this.caps {
+      if (c.key != key) {
+        keep = append(keep, c)
+        continue
+      }
+      if (held) {
+        <- c.tokens
+      }
+      c.users = c.users - 1
+      if (c.users > 0) {
+        keep = append(keep, c)
+      }
+    }
+    this.caps = keep
   }
 
   // Closes every connection idle now. The pool stays usable.
@@ -205,7 +308,12 @@ fn withoutIdle(list: []idleConn, at: int): []idleConn {
 
 fn newConnPool(limits: PoolLimits): connPool {
   return connPool{
-    limits = limits, mu = newMutex(), idle = []idleConn(0), closed = false, h2 = newH2Pool(limits),
+    limits = limits,
+    mu = newMutex(),
+    idle = []idleConn(0),
+    closed = false,
+    caps = []connCap(0),
+    h2 = newH2Pool(limits),
   }
 }
 
@@ -296,7 +404,8 @@ fn poolKey(u: Url): string {
 
 // `method u` over HTTP/1.1 or, when an https origin negotiates it, h2: the
 // origin's shared h2 connection or a parked HTTP/1.1 one when the pool has one,
-// else a fresh dial. A reused connection that fails is retried once on a fresh
+// else a fresh dial. An HTTP/1.1 connection costs a `maxConnsPerHost` slot for
+// the exchange; an h2 stream does not (`maxH2Streams` bounds those). A reused connection that fails is retried once on a fresh
 // one for an idempotent method only; a POST fails with the error it got.
 fn exchangeOrigin(method: string, u: Url, body: string, extras: RequestExtras): Response! {
   if (u.https) {
@@ -316,14 +425,26 @@ fn reuseH2(e: h2Entry, method: string, u: Url, body: string, extras: RequestExtr
     if (!isIdempotent(method)) {
       fail err
     }
-    return exchangeFresh(method, u, body, extras)?
+    return exchangeCapped(method, u, body, extras)?
   }
   return res
 }
 
-// The HTTP/1.1 half of `exchangeOrigin`: a parked connection, else a dial.
+// `exchangeFresh` for a caller that holds no slot yet: claims one for the
+// exchange, which hands it back before a stream starts if the origin is h2.
+fn exchangeCapped(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  let slot = extras.pool.acquire(poolKey(u), extras.deadline)?
+  defer slot.release()
+  return exchangeFresh(method, u, body, extras, slot)?
+}
+
+// The HTTP/1.1 half of `exchangeOrigin`: a parked connection, else a dial. The
+// slot is claimed before the idle list is read, so a request that waited finds
+// the connection whose return woke it.
 fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): Response! {
   let key = poolKey(u)
+  let slot = extras.pool.acquire(key, extras.deadline)?
+  defer slot.release()
   match (extras.pool.take(key, monotonic().ns)) {
     Hit(s) => {
       let req = buildRequest(method, u, extras.block, body, false)
@@ -331,16 +452,24 @@ fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): 
         if (!isIdempotent(method)) {
           fail e
         }
-        return exchangeFresh(method, u, body, extras)?
+        return exchangeFresh(method, u, body, extras, slot)?
       }
       return res
     }
-    Miss => return exchangeFresh(method, u, body, extras)?
+    Miss => return exchangeFresh(method, u, body, extras, slot)?
   }
 }
 
 // `method u` on a connection dialed now, bounded by `extras.deadline` when set.
-fn exchangeFresh(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+// `slot` is the caller's `maxConnsPerHost` claim, released here when the dial
+// turns out to reach an h2 origin.
+fn exchangeFresh(
+  method: string,
+  u: Url,
+  body: string,
+  extras: RequestExtras,
+  slot: connSlot,
+): Response! {
   if (!u.https) {
     let conn = dialConn(u, extras.deadline)?
     let req = buildRequest(method, u, extras.block, body, false)
@@ -348,7 +477,10 @@ fn exchangeFresh(method: string, u: Url, body: string, extras: RequestExtras): R
   }
   let d = dialOrigin(poolKey(u), u, extras)?
   match (d) {
-    Shared(e) => return runH2(e, method, u, body, extras)?
+    Shared(e) => {
+      slot.release()
+      return runH2(e, method, u, body, extras)?
+    }
     Plain(tc) => {
       let req = buildRequest(method, u, extras.block, body, false)
       return runOn(tlsStream{ conn = tc }, poolKey(u), req, method, extras)?

@@ -160,15 +160,16 @@ Inkwell's sync job pulls a few hundred drafts from the API in a loop. With
 one `Client` the first request opens a connection and the rest ride it; a
 response is parked for reuse only when it ended exactly at a message
 boundary (HTTP/1.1, no `Connection: close`, a `Content-Length` or chunked
-body). Three bounds keep the idle list from growing without limit, and
-`PoolLimits` names them with Go's defaults:
+body). Three bounds keep the idle list from growing without limit, a fourth
+caps how many connections one host may have open at once, and `PoolLimits`
+names them with Go's defaults:
 
 ```bit
 import { newClient, PoolLimits } from "std/http"
 
 fn pullDrafts(host: string, ids: []string): int! {
   let c = newClient()
-  c.setPool(PoolLimits{ maxIdlePerHost = 4, idleTimeoutMs = 30000 })?
+  c.setPool(PoolLimits{ maxIdlePerHost = 4, idleTimeoutMs = 30000, maxConnsPerHost = 8 })?
   let bytes = 0
   for id of ids {
     let res = c.get("http://${host}/drafts/${id}")?
@@ -185,8 +186,24 @@ keep, `maxIdleTotal` (default 100) the same across every host, and
 is checked when the pool is next used, not by a background thread, so an idle
 `Client` costs nothing. `setPool` fails on a mistake - a negative
 `maxIdlePerHost`, a `maxIdleTotal` below it, an `idleTimeoutMs` that is not
-positive - and `maxIdlePerHost = 0` is how you turn reuse off. `close()` drops
-the connections that are idle now; the `Client` stays usable.
+positive, a negative `maxConnsPerHost` - and `maxIdlePerHost = 0` is how you
+turn reuse off. `close()` drops the connections that are idle now; the
+`Client` stays usable.
+
+The sync job above runs one request at a time, but the export screen runs
+dozens, and a `Client` shared by dozens of green threads would open a socket
+for each. `maxConnsPerHost` (default 0, no limit) caps the connections open at
+once to one host, idle ones included. With `maxConnsPerHost = 8`, the ninth
+concurrent `get` to a host waits until a request finishes and its connection
+is parked or closed, then runs on it. The wait ends at the request's own
+timeout (`getTimeout`, `requestTimeout`); a request with no timeout waits as
+long as it takes. A request that times out in the queue fails with `http:
+timed out waiting for a free connection (PoolLimits.maxConnsPerHost = 8
+connections to http://host:80 already open)`, so the cap is named, not guessed
+at. The cap is per host and per `Client`: another host has its own eight.
+It applies to HTTP/1.1 only. An HTTP/2 origin carries many requests on one
+connection, so `maxH2Streams` (below) is what limits it, and a request that
+finds the origin speaks HTTP/2 hands its slot back before its stream starts.
 
 A server may close an idle connection at any time, and the client learns
 that only when it next uses it. A `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`
@@ -570,13 +587,14 @@ As `Client.request`, bounded by one deadline.
 The bounds of a `Client`'s connections: `maxIdlePerHost: int`
 (2), `maxIdleTotal: int` (100), `idleTimeoutMs: int` (90000) and
 `maxH2Streams: int` (100), the most requests in flight on one shared HTTP/2
-connection. Every field has a default, so `PoolLimits{}` is the configuration `newClient` uses.
+connection, and `maxConnsPerHost: int` (0, unlimited), the most HTTP/1.1
+connections open at once to one host. Every field has a default, so `PoolLimits{}` is the configuration `newClient` uses.
 
 ### `Client.setPool(limits: PoolLimits): ()!`
 
 Replaces the client's pool bounds, closing the connections already idle. Fails
-on a negative `maxIdlePerHost`, a `maxIdleTotal` below it, or an `idleTimeoutMs`
-that is not positive.
+on a negative `maxIdlePerHost`, a `maxIdleTotal` below it, an `idleTimeoutMs`
+that is not positive, or a negative `maxConnsPerHost`.
 
 ### `Client.close()`
 
