@@ -1316,8 +1316,8 @@ its own debug-info entries needs no companion restriction.
 
 ### 4.3 Module-cell roots (#6481)
 
-A module-level `let` whose type the collector traces (a `string`, a slice, a
-class, ...) lives in the data section, where no stack map, object pointer map
+A module-level `let`, or a `const` set at startup, whose type the collector
+traces (a `string`, a slice, a class, ...) lives in the data section, where no stack map, object pointer map
 or task block names it. The compiler lists the cells' reference words in one
 table, the entry function hands the table to the runtime, and every collection
 marks from it after the stack, task and channel roots and before it drains.
@@ -1337,7 +1337,10 @@ table (a process-storage global, 8-aligned, one per program):
   rule.
 - **Registration.** The root module's `main`, in all four signatures of §10,
   starts with one call, `bit_rt_module_roots_register(table: usize) -> void`,
-  before any user code. A program with no traced module cell has no table and
+  before any user code, and before the module startup driver `bit$startup` runs
+  the cells' initializers, so an object an initializer allocates is rooted from
+  the moment it exists. The `bit test` dispatch `main` makes the same call first.
+  A program with no traced module cell has no table and
   makes no call; the collector then pays one load and a compare per collection.
   `--freestanding` emits neither: there is no managed runtime to hand it to.
 - **Why a call and not a symbol the runtime reads.** The runtime is built by the

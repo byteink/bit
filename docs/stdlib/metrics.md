@@ -6,9 +6,9 @@ production observability tool, not a profiler: for CPU sampling see
 `std/prof` instead.
 
 Metrics are held in an explicit `Registry` rather than a hidden global one:
-a module-level `let` in Bit may hold only plain scalars, fixed arrays of
-them, or raw pointers - never a class, slice or map - so there is no cell a
-default registry could live in. Construct one, keep it,
+a module-level `let` can hold a class, but a default registry would be shared
+by every caller whether it asked or not, so each owner constructs its own.
+Construct one, keep it,
 and call its methods - the same shape `std/sync`'s `Mutex`, `WaitGroup` and
 `std/rand`'s `Rand` already use.
 
