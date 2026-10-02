@@ -2424,9 +2424,10 @@ calls `boot`, and exits the process with `boot`'s returned code.
 claim below was checked directly against the source with the greps shown,
 not against a comment's stated intent.
 
-**The state module (`runtime/sched/preempt.bit`, landed).** No
-function in this file makes an OS call, and none of them reads a
-clock at all anymore: the budget is counted in SYSMON TICKS. `sysmonTick` bumps the
+**The state module (`runtime/sched/preempt.bit`, landed).** The only
+OS call in this file is the monitor's idle park and its wake (#6008, below),
+and none of its functions reads a clock at all anymore: the budget is
+counted in SYSMON TICKS. `sysmonTick` bumps the
 module's own `sysmonEpoch` counter once per call, `preemptTickNow()` reads it,
 and both the dispatch stamp and the over-budget comparison use that one value.
 It defines:
@@ -2504,16 +2505,23 @@ import that constant.
 
 **Wired: the monitor ticks the flag (darwin and linux, both
 landed).** `sysmonRun` is a `nanosleep`-then-`sysmonTick` loop, sleeping
-~2ms between ticks, bounded by `WORKER_MAX_STEPS`
+~2ms between ticks while any task is in flight. With none in flight it
+blocks in `sysmonIdleWait` on the `sysmonPark` word until `preemptStamp`
+wakes it (#6008): the stamp is stored before the word is read, the word
+before `startTick` is re-scanned, so one side always sees the other. The
+epoch stands still while parked, so a task stamped during the park is
+flagged by the same `preemptBudgetTicks` real ticks as one stamped while
+ticking. Windows starts no monitor thread at all (#6469). The loop is bounded by
+`WORKER_MAX_STEPS`
 (`runtime/sched/workerrun.bit:65`; 1e9 iterations at ~2ms is over 20 days,
 so in practice it runs for the life of the process) rather than looping
-unbounded: defined at `runtime/root/darwin/boot.bit:471` and started on its
-own OS thread at `runtime/root/darwin/boot.bit:673`; the linux twin is
-defined at `runtime/root/linux/sysmon.bit:76` and started at
-`runtime/root/linux/boottail.bit:423`. Both start next to the
+unbounded: defined at `runtime/root/darwin/boot.bit:380` and started on its
+own OS thread at `runtime/root/darwin/boot.bit:625`; the linux twin is
+defined at `runtime/root/linux/sysmon.bit:85` and started at
+`runtime/root/linux/boottail.bit:373`. Both start next to the
 `BIT_WORKERS` worker boot sequence above. The thread is deliberately never
 registered as a mutator with the collector — see the rationale already
-written at `runtime/root/darwin/boot.bit:412-470` (linux's `sysmon.bit`
+written at `runtime/root/darwin/boot.bit:325-379` (linux's `sysmon.bit`
 header makes the same argument rather than repeating it). So `requested` is
 set by a real, clock-driven tick on both platforms, not only by the
 dispatch-time stamp described above.

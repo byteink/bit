@@ -13,17 +13,19 @@
 // source, the safepoint wiring and the dispatch wiring can each be reviewed
 // and landed against a state module that is already fixed.
 //
-// NO OS CALLS HERE, AND SINCE #4736 NO CLOCK AT ALL. The budget is counted in
-// SYSMON TICKS rather than nanoseconds: `sysmonTick` bumps this file's own
-// `sysmonEpoch` counter once per call, and every stamp records that counter's
-// value, so neither the dispatch path nor the monitor thread reads a clock to
-// keep preemption working. #2578 stamped `monoNs()` at every dispatch, which
-// on Linux is a raw `clock_gettime` trap (`../park/linux/wait.bit`, no vDSO)
-// and cost +147 ns on every context switch -- 285 -> 423 ns/switch on the
-// arm64-linux `test-schedbench` gate (#4736). A single atomic load of a word
-// this file owns replaces it. `sysmonTick` still takes no clock reading as a
-// parameter either, so this file makes no kernel trap and declares nothing
-// foreign.
+// ONE OS CALL HERE, AND SINCE #4736 NO CLOCK AT ALL. The call is the park pair
+// behind `sysmonIdleWait` and `sysmonWake` (#6008), reached through
+// `./sleep.bit`'s two `extern` declarations; nothing else here traps. The
+// budget is counted in SYSMON TICKS rather than nanoseconds: `sysmonTick` bumps
+// this file's own `sysmonEpoch` counter once per call, and every stamp records
+// that counter's value, so neither the dispatch path nor the monitor thread
+// reads a clock to keep preemption working. #2578 stamped `monoNs()` at every
+// dispatch, which on Linux is a raw `clock_gettime` trap
+// (`../park/linux/wait.bit`, no vDSO) and cost +147 ns on every context switch
+// -- 285 -> 423 ns/switch on the arm64-linux `test-schedbench` gate (#4736). A
+// single atomic load of a word this file owns replaces it. `sysmonTick` still
+// takes no clock reading as a parameter either, and a dispatch traps only to
+// wake a parked monitor.
 //
 // Base-pointer arithmetic and deref rather than `startTick[worker]`: indexing
 // is forbidden in a `@nosplit` body (E0075 -- see `queue.bit`'s comment on
@@ -35,8 +37,9 @@
 // preempt request the next time `sysmonTick` runs. 10ms.
 export const preemptBudgetNs: i64 = 10000000
 
-// The monitor thread's sleep between two `sysmonTick` calls, and therefore the
-// unit the budget above is actually enforced in. BOTH monitor threads
+// The monitor thread's sleep between two `sysmonTick` calls while any task is
+// in flight (it parks otherwise, `sysmonIdleWait`), and therefore the unit the
+// budget above is actually enforced in. BOTH monitor threads
 // (`../root/linux/sysmon.bit`, `../root/darwin/boot.bit`) import this constant
 // and sleep exactly this long, rather than each repeating the literal they
 // used to: `preemptBudgetTicks` below is only meaningful if the period the
@@ -163,6 +166,33 @@ let sysmonEpoch: [1]i64
 // state without indexing (E0075).
 let anyRequested: [1]i64
 
+// The monitor thread's park word (#6008): 1 while `sysmonIdleWait` has, or is
+// about to, block on it; 0 otherwise. An idle process used to tick every
+// `sysmonPeriodNs` forever, ~465 `nanosleep` wakeups a second on an idle
+// pkg/web server (#6003), to age stamps no worker held.
+//
+// THE HANDSHAKE is `./sleep.bit`'s `wkPark` one, with `startTick` as the work:
+// the monitor stores 1 and THEN re-scans `startTick`; a dispatch stores its
+// stamp and THEN reads this word. Both are a seq-cst store followed by a load of
+// the other side's cell, so at least one side sees the other: either the re-scan
+// sees the stamp and the monitor does not block, or the dispatch reads 1 and
+// wakes it. A wake that lands before the monitor is inside the wait makes the
+// kernel's compare fail and the wait return at once.
+//
+// NO TIMEOUT ON THE WAIT, ON PURPOSE. Every path that can make a task overdue
+// goes through `preemptStamp`, which owes the wake; a backstop would only turn a
+// lost wake from a starved peer, which `_tests_/stress/schedpreemptidle` fails
+// on, into a slower preempt nothing would notice.
+//
+// An `[1]i32` because the futex compares 32 bits, as `wkPark` is.
+let sysmonPark: [1]i32
+
+// How many times the monitor has blocked on `sysmonPark` (#6008). Read only by
+// `_tests_/stress/schedpreemptidle`, which fails unless it moves while the
+// program is idle -- so a monitor that silently went back to ticking cannot
+// pass that program vacuously.
+let sysmonParks: [1]i64
+
 // `worker` must be `< preemptSlots` -- callers get that for free today
 // because the scheduler never hands out a worker id past `schedMaxWorkers`
 // (`sleep.bit`), which is in turn never above `preemptSlots` (see the
@@ -237,6 +267,11 @@ export @nosplit @symbol("bit_rt_port_sched_preempt_any_addr") fn preemptAnyAddr(
 // instead of waiting out a real budget.
 export @nosplit fn preemptStamp(worker: i64, startedTick: i64) {
   atomicStore(slotAddr(ptrOf(startTick), worker), startedTick)
+  // #6008: the dispatch half of `sysmonPark`'s handshake, read AFTER the stamp.
+  // Read here, beside the `requested` load below, so on arm64 it shares the one
+  // `ldar` drain the stamp's `stlr` already costs; the wake itself waits for the
+  // end of the function.
+  let parked = atomicLoad(ptrOf(sysmonPark))
   // The clear stays UNCONDITIONAL -- reading first and skipping the store when
   // the slot is already 0 would let a request `sysmonTick` sets between the
   // read and the store survive into the freshly dispatched task, which is the
@@ -250,6 +285,67 @@ export @nosplit fn preemptStamp(worker: i64, startedTick: i64) {
   if (had != 0) {
     refreshPreemptAny()
   }
+  if (parked != 0) {
+    sysmonWake()
+  }
+}
+
+// Wake the monitor parked in `sysmonIdleWait`. The exchange keeps concurrent
+// dispatches to one wake syscall per park, and makes a stale `parked` read
+// (the monitor already left) cost one failed exchange and nothing else.
+@nosplit fn sysmonWake() {
+  let p = ptrOf(sysmonPark)
+  if (atomicCmpxchg(p, 1, 0)) {
+    let _ = bit_rt_port_park_wake(p, false)
+  }
+}
+
+// Whether any worker has a task in flight: a nonzero `startTick` slot, the same
+// meaning `sysmonTick`'s scan gives it, under the same two bounds.
+@nosplit fn preemptInFlight(): bool {
+  let w: i64 = 0
+  while (w < schedMaxWorkers && w < preemptSlots) {
+    if (atomicLoad(slotAddr(ptrOf(startTick), w)) != 0) {
+      return true
+    }
+    w = w + 1
+  }
+  return false
+}
+
+// The monitor thread's idle park (#6008): block while no worker has a task in
+// flight, until a dispatch wakes it. Returns at once, false, when a task is in
+// flight; true after it blocked. `scratch` is the caller's two words for the
+// provider's timespec (`bit_rt_port_park_wait`'s contract; unused with no
+// timeout, passed so the contract holds anyway).
+//
+// THE PREEMPT BOUND IS KEPT. The epoch stands still while the monitor sleeps
+// here, so a task stamped during the park starts at age 0 when the monitor
+// resumes, and the next `preemptBudgetTicks` real ticks are what flag it: the
+// same 10-12ms after dispatch as before, plus the wake's own latency. Nothing
+// can be flagged early, since no tick is counted that did not sleep a period.
+//
+// The caller must hold no GC reference: both monitor threads are `blocked`
+// for their whole life, which is that precondition.
+export @nosplit @symbol("bit_rt_port_sched_sysmon_idle_wait") fn sysmonIdleWait(scratch: *i64): bool {
+  if (preemptInFlight()) {
+    return false
+  }
+  let p = ptrOf(sysmonPark)
+  atomicStore(p, 1)
+  if (preemptInFlight()) {
+    atomicStore(p, 0)
+    return false
+  }
+  atomicAdd(ptrOf(sysmonParks), 1)
+  let _ = bit_rt_port_park_wait(p, 1, 0, scratch)
+  atomicStore(p, 0)
+  return true
+}
+
+// `sysmonParks`, for `_tests_/stress/schedpreemptidle`.
+export @nosplit fn sysmonParkCount(): i64 {
+  return atomicLoad(ptrOf(sysmonParks))
 }
 
 // Record that `worker` no longer has a task in flight: `schedSwitch` just
