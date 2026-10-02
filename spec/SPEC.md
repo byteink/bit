@@ -3070,7 +3070,8 @@ fn main() {
 ```
 
 With `cfg` the module `const` above, `cfg.retries = 4` is allowed: it writes a
-field of the object the const holds. `cfg = Config{ retries = 5 }` is `E0185`:
+field of the object the const holds.
+`cfg = Config{ retries = 5 }` is `E0185`:
 it reassigns the const itself.
 
 A `const` that holds an array or other value type directly has no object to write
