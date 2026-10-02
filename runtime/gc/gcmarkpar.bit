@@ -32,12 +32,22 @@
 // that finds the free list empty carves the next segment out of the mapping
 // (`gcMkGrow`, #5955), the parallel form of `growMarkStack` (./gcmark.bit).
 //
-// AN IDLE HELPER SPINS BRIEFLY, THEN LEAVES (#5853). It polls for
-// `gcMkHelperIdleSpins` turns, leaves (`gcMkLeave`), and returns to its park
-// loop, which sleeps on `worldStopWord` until the next kick or
-// `stwWaitTimeoutUs`. While the phase it left is open it rejoins only when
-// the list holds work (`gcMkRejoin`), so a helper past its park loop's burst
-// does not cycle through the lock.
+// AN IDLE MEMBER SPINS BRIEFLY, THEN SLEEPS ON `gcMkWake` (#6462). It polls
+// for `stwSpinBurst` turns, then sleeps (`gcMkSleep`) until a publish or the
+// termination wakes it (`gcMkNotify`), each sleep capped at `gcMkParkNs`. A
+// helper leaves (`gcMkLeave`) after `gcMkHelperParks` sleeps with no work and
+// returns to its park loop, which sleeps on `worldStopWord` until the next
+// kick or `stwWaitTimeoutUs`. While the phase it left is open it rejoins only
+// when the list holds work (`gcMkRejoin`), so a helper past its park loop's
+// burst does not cycle through the lock.
+//
+// NO WAKE IS LOST: the same Dekker pair as `worldWaitForStop`
+// (./gcworldstop.bit). The sleeper loads `gcMkWake`, adds itself to
+// `gcMkAsleep`, then re-reads the list and `gcMkDone`; the publisher stores
+// the list or `gcMkDone`, then reads `gcMkAsleep`. Both sides are seq_cst,
+// so either the sleeper sees the work or the publisher sees the sleeper, bumps
+// `gcMkWake` and wakes it. The kernel's compare against the loaded value
+// catches a bump between the re-read and the sleep.
 //
 // ---------------------------------------------------------------------------
 // INVARIANTS, AND WHERE EACH IS ENFORCED
@@ -65,7 +75,9 @@
 //     of `gcSweepHelp`): either the helper reads `gcMkOpen != g` and does
 //     nothing, or the coordinator reads its increment and waits, fatal-or-zero
 //     (`worldDrainOrDie`). Every region counted in `gcMkIn` is bounded: a
-//     member's trace is bounded by M1, and its idle wait by a spin count.
+//     member's trace is bounded by M1, and its idle wait by a spin count plus
+//     `gcMkHelperParks` sleeps of at most `gcMkParkNs`. The member that sets
+//     `gcMkDone` wakes every sleeper (`gcMkNotify`), so none sleeps past it.
 // M6. Step 5 sees every helper's marks, pushes and counts. Each helper's last
 //     write precedes its seq-cst decrement of `gcMkIn`, which the
 //     coordinator's seq-cst load of 0 reads. A segment's entries are written
@@ -93,14 +105,16 @@ const gcMkSegMax = 4096   // gcMaxMarkStack / gcMkSegEntries
 
 // Member context: one per slot plus the coordinator's (index 0), padded to a
 // 128-byte line so two members never share one. Words: local segment base (0
-// when none), entries in it, bad offsets counted, the collector block, and
-// the last phase (`gcMkPhase`) this helper left idle.
+// when none), entries in it, bad offsets counted, the collector block, the
+// last phase (`gcMkPhase`) this helper left idle, and two words of scratch
+// for `bit_rt_port_park_wait` (Linux builds its timespec there).
 const gcMkCtxBytes = 128
 const gcMkCtxSeg = 0
 const gcMkCtxN = 1
 const gcMkCtxBad = 2
 const gcMkCtxG = 3
 const gcMkCtxLeft = 4
+const gcMkCtxScratch = 6
 
 // The roots are cut into at most this many segments (`gcMkSeed`), so every
 // member can start on a root of its own instead of waiting for the one member
@@ -114,10 +128,17 @@ const gcMkFreeOff = 8454144  // gcMkFullOff + gcMkSegMax * 16
 const gcMkCtxOff = 8486912   // gcMkFreeOff + gcMkSegMax * 8
 const gcMkMapBytes = 8519808 // gcMkCtxOff + (maxMutators + 1) * gcMkCtxBytes
 
-// Idle turns a helper spins before it leaves (`gcMkLeave`) and sleeps in its
-// park loop. Covers a busy member's next swap; the tail of a phase is longer
-// and is slept through (#5853, was 64000).
-const gcMkHelperIdleSpins = 2000
+// Sleeps an idle helper takes on `gcMkWake` with no work before it leaves
+// (`gcMkLeave`) for its park loop, and the cap on each. A sleeper is woken by
+// the next publish or by termination, so the cap only bounds a wait whose
+// wake never comes, which M5's drain rests on.
+const gcMkHelperParks = 16
+const gcMkParkNs = 1000000
+
+// The park pair, reached by its pinned name like ../stw/stwhelper.bit's:
+// every target's provider defines both (`runtime/park/<os>`).
+extern fn bit_rt_port_park_wait(p: *i32, expected: i32, timeoutNs: i64, scratch: *i64): i64
+extern fn bit_rt_port_park_wake(p: *i32, all: bool): i64
 
 let gcMkBase: i64 = 0   // the side mapping, 0 until first use
 let gcMkLock: i32 = 0   // M2
@@ -132,6 +153,8 @@ let gcMkSegs: i64 = 0   // segments carved from the mapping this phase (M2, M8)
 let gcMkDone: i64 = 0   // 1 once termination is decided (M3)
 let gcMkBad: i64 = 0    // helpers' bad-offset counts, added on leaving
 let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
+let gcMkWake: i32 = 0   // bumped by a publish that a sleeper may need
+let gcMkAsleep: i64 = 0 // idle members inside `gcMkSleep`
 
 @nosplit fn gcMkCtx(k: int): *i64 {
   return wordAt(gcMkBase + gcMkCtxOff + k * gcMkCtxBytes)
@@ -258,6 +281,7 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
   *(c + gcMkCtxSeg) = *gcMkFreeAt(gcMkFree)
   *(c + gcMkCtxN) = 0
   spinRelease(ptrOf(gcMkLock))
+  gcMkNotify(false)
   return true
 }
 
@@ -369,10 +393,14 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
     return true
   }
   gcMkIdle = gcMkIdle + 1
-  if (gcMkIdle == gcMkJoined) {
+  let last = gcMkIdle == gcMkJoined
+  if (last) {
     atomicStore(ptrOf(gcMkDone), 1)
   }
   spinRelease(ptrOf(gcMkLock))
+  if (last) {
+    gcMkNotify(true)
+  }
   if (helper) {
     return gcMkHelperWait(c)
   }
@@ -415,19 +443,51 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
   spinRelease(ptrOf(gcMkLock))
 }
 
+// Wake the members sleeping in `gcMkSleep`, after this thread stored the
+// list or `gcMkDone`: one for a published segment, every one for
+// termination. A no-op with nobody asleep, which is the common case: one
+// load of a line only a sleeper writes.
+@nosplit fn gcMkNotify(all: bool) {
+  if (atomicLoad(ptrOf(gcMkAsleep)) == 0) {
+    return
+  }
+  let w: *i32 = ptrOf(gcMkWake)
+  let _ = atomicAdd(w, i32(1))
+  let _ = bit_rt_port_park_wake(w, all)
+}
+
+// One sleep of an idle member: arm, re-check, sleep at most `gcMkParkNs`
+// unless the re-check found work or termination, then check again. Same
+// result as `gcMkIdlePoll`. The load of `gcMkWake` precedes the arm, so a
+// publish after the re-check changes the word and the kernel does not sleep.
+@nosplit fn gcMkSleep(c: *i64): int {
+  let w: *i32 = ptrOf(gcMkWake)
+  let v = atomicLoad(w)
+  let _ = atomicAdd(ptrOf(gcMkAsleep), 1)
+  let r = gcMkIdlePoll(c)
+  if (r < 0) {
+    let _ = bit_rt_port_park_wait(w, v, gcMkParkNs, c + gcMkCtxScratch)
+    r = gcMkIdlePoll(c)
+  }
+  let _ = atomicAdd(ptrOf(gcMkAsleep), 0 - 1)
+  return r
+}
+
 // A helper's idle wait: true with a segment taken, false once it must leave,
-// by termination or by its spin bound.
+// by termination or by its sleep bound.
 @nosplit fn gcMkHelperWait(c: *i64): bool {
   let spins = 0
-  while (spins < gcMkHelperIdleSpins) { // bounded: gcMkHelperIdleSpins
-    let r = gcMkIdlePoll(c)
+  while (spins < stwSpinBurst + gcMkHelperParks) { // bounded: see the condition
+    let r = 0
+    if (spins < stwSpinBurst) {
+      r = gcMkIdlePoll(c)
+    } else {
+      r = gcMkSleep(c)
+    }
     if (r >= 0) {
       return r == 1
     }
     spins = spins + 1
-    if (spins % stwSpinBurst == 0) {
-      worldYield()
-    }
   }
   gcMkLeave(c)
   return false
@@ -435,7 +495,8 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
 
 // The coordinator's idle wait. It cannot leave: it waits for termination, on
 // the same watched-time budget as `worldDrainOrDie`, because a helper still
-// tracing is bounded work (M1) and never finishing it is a runtime bug.
+// tracing is bounded work (M1) and never finishing it is a runtime bug. Past
+// the first burst every turn is one `gcMkSleep`.
 @nosplit fn gcMkCoordWait(c: *i64): bool {
   let last = gcTicks()
   let seen = 0
@@ -446,14 +507,17 @@ let gcMkPhase: i64 = 0  // phases seeded so far; names the one open
       return r == 1
     }
     spins = spins + 1
-    if (spins % stwSpinBurst == 0) {
+    if (spins >= stwSpinBurst) {
       let now = gcTicks()
       seen = seen + worldDrainStep(now - last)
       last = now
       if (seen > worldDrainBudgetNs) {
         break
       }
-      worldYield()
+      r = gcMkSleep(c)
+      if (r >= 0) {
+        return r == 1
+      }
     }
   }
   worldHelperFatal()
