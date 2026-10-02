@@ -86,6 +86,11 @@ diffdump_setup() {
   # #6435, together with constStringFoldEnabled (compiler/optparams.bit).
   export BIT_CONST_STRING_FOLD=0
 
+  # #6472's presence-only `let (_, ok) = m[k]` is the same story: on in the
+  # tree, absent from the pinned oracle. Delete this line at the repin that
+  # carries #6472, together with mapPresenceOnlyEnabled (compiler/lowermapaccess.bit).
+  export BIT_MAP_PRESENCE=0
+
   # #6000: IFACE_SIG, BCE_JOIN, JSON_APPEND, and (since #6192) the #5990
   # static-const closure-cell lowering are all gone as flags -- the pinned
   # ORACLE (>= 0.31.0, which carries #6000) already emits every one of them
