@@ -88,7 +88,7 @@ bit-import: bitlang.org/pkg/web git https://github.com/byteink/bit.git dir pkg/w
 
 `dir` (SPEC §17.7) is what makes a subfolder of this repository addressable.
 The website generates that document from `content/packages.txt` in the
-`bit-website` repository; one line per package:
+website repository; one line per package:
 
 ```
 web https://github.com/byteink/bit.git dir pkg/web
@@ -122,7 +122,7 @@ The consumer never sees the prefix: `@v0.1.0` in `bit.json` resolves
    so the language is already proven at that commit.
 2. `./make test-package-<name>` exits 0 on that commit.
 3. `bitlang.org/pkg/<name>` serves the vanity document, with the `dir` field.
-   If not, add the line to `content/packages.txt` in `bit-website`, regenerate
+   If not, add the line to `content/packages.txt` in the website repository, regenerate
    and deploy first.
 4. Classify the bump against the previous `<name>/v*` tag, per the rule above.
 5. Tag and push the tag only:
@@ -189,5 +189,5 @@ to navigate. Chapters give the site a table of contents to build from.
 
 Copy `pkg/redis/`'s shape: module directory, `.test.bit` beside each file,
 `README.md`, and a line in `bit.work`. The gate picks it up on the next `./make`. Add its line to
-`content/packages.txt` in `bit-website` when it is ready to be consumed, not
+`content/packages.txt` in the website repository when it is ready to be consumed, not
 before.

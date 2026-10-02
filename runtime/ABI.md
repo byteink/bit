@@ -3896,7 +3896,7 @@ finish together, in ~50ms, on one OS thread.
 On Linux both clocks (`bit_rt_time_mono_ns`, `bit_rt_time_unix_ns`, and the
 runtime's own `parkMonoNs`) call `parkClockRead`
 (`runtime/park/linux/vdso.bit`): the kernel vDSO's `clock_gettime` when boot
-resolved it, the raw syscall otherwise. Measured on hl-master (x86_64, kernel
+resolved it, the raw syscall otherwise. Measured on an x86_64 host (kernel
 7.0.14): 1015-1030 ns per `std/time` clock read through the syscall,
 26-34 ns through the vDSO; the pkg/web bench server made 8087
 `clock_gettime` syscalls over 2001 requests before, and none after.
@@ -3932,7 +3932,7 @@ vDSO can probe about a page (golang/go#20427). Bit has no small stacks: a task
 stack is 256 KiB (`schedStackBytes`) and worker, sysmon and `main` stacks are
 larger. No Bit frame checks its depth either, so the vDSO frame is one more leaf
 frame, and it is small: 6 pushes and two leaf calls, at most 72 bytes, on the
-hl-master x86_64 kernel; none at all on the aarch64 linuxkit 7.0.12 kernel
+x86_64 kernel; none at all on the aarch64 linuxkit 7.0.12 kernel
 (both read from the running kernels' images).
 
 **Signals.** The Linux runtime has no preemption signal: preemption is a flag

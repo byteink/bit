@@ -106,7 +106,7 @@ echo "release.sh: benchmark tables regenerated at ${BENCH_COMMIT:0:8}, after ${B
 # exists as a byte-copy publish target. THIS repo is the source of truth and
 # the mirror is a publish target like the brew tap or the ghcr image - the
 # same "change one, change both" shape as examples/staticserver vs
-# bit-website/server/, which has no mechanical check at all, which is why this
+# the website repository's server/, which has no mechanical check at all, which is why this
 # one exists. A fetch failure refuses too: an unreachable mirror is not
 # evidence of being in sync.
 #
