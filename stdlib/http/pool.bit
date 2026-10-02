@@ -1,0 +1,362 @@
+// Bit standard library — http module: the client's idle-connection pool (#6453).
+//
+// Every request used to dial, send `Connection: close` and tear the socket
+// down, so a loop of N requests to one host paid N TCP connects (and, for
+// https, N TLS handshakes). Go's `http.Transport`, hyper and .NET's
+// `SocketsHttpHandler` all keep a bounded list of idle connections per origin
+// instead; this file is that list for HTTP/1.1, with the same three bounds:
+//
+//   maxIdlePerHost  idle connections kept per origin (Go's
+//                   `MaxIdleConnsPerHost`, default 2).
+//   maxIdleTotal    idle connections kept across every origin (Go's
+//                   `MaxIdleConns`; 100). The oldest idle connection anywhere
+//                   is closed to make room.
+//   idleTimeoutMs   how long a connection may sit idle (Go's `IdleConnTimeout`,
+//                   90 s). Expired connections are closed lazily, on the next
+//                   `take`/`put` and by `closeAll`: there is no reaper thread,
+//                   so an idle pool costs nothing, and the other two bounds are
+//                   what cap what a quiet pool can hold.
+//
+// A `Client` owns one pool (`Client.setPool` sets the bounds); a package-level
+// call such as `get` makes a pool for that call alone and retires it before it
+// returns, so its redirect hops share a connection but nothing outlives it.
+// There is no process-wide default pool because module state cannot hold a
+// class (SPEC §11.11, rule 1).
+//
+// Safety, in order of how a pooled connection can go wrong:
+//
+//   framing     a connection is parked only when the response left it exactly
+//               at a message boundary (`keepsAlive`): HTTP/1.1, no
+//               `Connection: close`, a Content-Length or chunked body (or none
+//               by status), and no bytes past the declared end. Read-to-EOF
+//               and HTTP/1.0 responses close.
+//   staleness   a server may close an idle connection at any moment, and the
+//               client only finds out on the next use. A reused connection
+//               that fails is retried once on a fresh one, but only for an
+//               idempotent method (RFC 9110 §9.2.2): replaying a POST that may
+//               have been processed is the duplicate-side-effect bug, so it
+//               fails loudly instead.
+//   identity    the idle list is keyed by scheme, host and port. The TLS
+//               config is not part of the key because a pool belongs to one
+//               `Client`, and a `Client`'s config never changes; two configs
+//               therefore never share a connection.
+//   deadlines   a pooled connection carries the deadline of the request using
+//               it only (`setIdleDeadline`), cleared before it is parked, so
+//               one request's timeout never kills the next one's connection.
+//
+// `Mutex`/`newMutex` are shutdown.bit's imports and `monotonic` is client.bit's
+// (an import is per-module, SPEC §19).
+
+// The bounds of a `Client`'s idle pool. Every field has a default, so
+// `PoolLimits{}` is the complete configuration `newClient` uses.
+export class PoolLimits {
+  // Idle connections kept for one origin; 0 turns reuse off.
+  export maxIdlePerHost: int = 2,
+  // Idle connections kept across all origins; at least `maxIdlePerHost`.
+  export maxIdleTotal: int = 100,
+  // Milliseconds a connection may stay idle before it is closed instead of
+  // reused; positive.
+  export idleTimeoutMs: int = 90000,
+}
+
+// Rejects a `PoolLimits` that is a mistake rather than guessing what was meant.
+fn validatePoolLimits(l: PoolLimits): ()! {
+  if (l.maxIdlePerHost < 0) {
+    fail newError("PoolLimits.maxIdlePerHost is ${l.maxIdlePerHost}; use 0 to disable reuse")
+  }
+  if (l.maxIdleTotal < l.maxIdlePerHost) {
+    fail newError("PoolLimits.maxIdleTotal ${l.maxIdleTotal} is below maxIdlePerHost ${l.maxIdlePerHost}")
+  }
+  if (l.idleTimeoutMs <= 0) {
+    fail newError("PoolLimits.idleTimeoutMs is ${l.idleTimeoutMs}; it must be positive")
+  }
+}
+
+// One parked connection: `since` is the `monotonic` ns it went idle.
+class idleConn {
+  key: string,
+  stream: byteStream,
+  since: int,
+}
+
+// What `connPool.take` found.
+enum Idle {
+  Hit(byteStream),
+  Miss,
+}
+
+// Idle connections, oldest first. Every method locks `mu`; a request's green
+// thread never holds it across I/O.
+class connPool {
+  limits: PoolLimits
+  mu: Mutex
+  idle: []idleConn
+  closed: bool
+
+  // The most recently parked live connection for `key` (LIFO: the one most
+  // likely still open), or `Miss`. Expired connections are closed on the way.
+  take(key: string, now: int): Idle {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.pruneLocked(now)
+    let i = len(this.idle) - 1
+    while (i >= 0) {
+      if (this.idle[i].key == key) {
+        let s = this.idle[i].stream
+        this.idle = withoutIdle(this.idle, i)
+        return Idle.Hit(s)
+      }
+      i = i - 1
+    }
+    return Idle.Miss
+  }
+
+  // Parks `s` for `key`, or closes it when the pool is retired or the origin
+  // already holds `maxIdlePerHost` (Go closes the newcomer too). At
+  // `maxIdleTotal` the oldest idle connection anywhere makes room.
+  put(key: string, s: byteStream, now: int) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.pruneLocked(now)
+    if (this.closed || this.countLocked(key) >= this.limits.maxIdlePerHost) {
+      s.shut()
+      return
+    }
+    if (len(this.idle) >= this.limits.maxIdleTotal) {
+      this.idle[0].stream.shut()
+      this.idle = withoutIdle(this.idle, 0)
+    }
+    this.idle = append(this.idle, idleConn{ key = key, stream = s, since = now })
+  }
+
+  // Closes every connection idle now. The pool stays usable.
+  closeAll() {
+    this.mu.lock()
+    defer this.mu.unlock()
+    for c of this.idle {
+      c.stream.shut()
+    }
+    this.idle = []idleConn(0)
+  }
+
+  // `closeAll`, and from now on every connection handed back is closed: the
+  // pool's owner is gone, so nothing may park here and outlive it.
+  retire() {
+    this.closeAll()
+    this.mu.lock()
+    this.closed = true
+    this.mu.unlock()
+  }
+
+  // Idle connections currently parked for `key`; caller holds `mu`.
+  countLocked(key: string): int {
+    let n = 0
+    for c of this.idle {
+      if (c.key == key) {
+        n = n + 1
+      }
+    }
+    return n
+  }
+
+  // Closes every connection idle longer than `idleTimeoutMs`; caller holds `mu`.
+  pruneLocked(now: int) {
+    let limit = this.limits.idleTimeoutMs * 1000000
+    let keep = []idleConn(0)
+    for c of this.idle {
+      if (now - c.since < limit) {
+        keep = append(keep, c)
+      } else {
+        c.stream.shut()
+      }
+    }
+    this.idle = keep
+  }
+}
+
+// `list` without element `at`, order kept. Bounded by the pool's own size.
+fn withoutIdle(list: []idleConn, at: int): []idleConn {
+  let out = []idleConn(0)
+  let i = 0
+  while (i < len(list)) {
+    if (i != at) {
+      out = append(out, list[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn newConnPool(limits: PoolLimits): connPool {
+  return connPool{ limits = limits, mu = newMutex(), idle = []idleConn(0), closed = false }
+}
+
+// ---------------------------------------------------------------------------
+// Reading a response, and deciding whether its connection can be reused
+// ---------------------------------------------------------------------------
+
+// Whether a response to `method` with `status` carries no body whatever its
+// framing headers say (RFC 9112 §6.3): HEAD, 1xx, 204 and 304.
+fn bodyless(method: string, status: int): bool {
+  if (method == "HEAD" || status == 204 || status == 304) {
+    return true
+  }
+  return status >= 100 && status < 200
+}
+
+// Whether the connection a response came off is still at a message boundary
+// and may carry another request. `bodyStart` is what arrived with the headers
+// beyond them: more than the declared body means the peer sent something the
+// client did not ask for, and the next response would be read behind it.
+fn keepsAlive(
+  statusLine: string,
+  headers: string,
+  method: string,
+  status: int,
+  bodyStart: string,
+): bool {
+  if (!hasPrefix(statusLine, "HTTP/1.1") || status < 200) {
+    return false
+  }
+  if (indexOf(toLower(header(headers, "connection")), "close") >= 0) {
+    return false
+  }
+  if (bodyless(method, status)) {
+    return len(bodyStart) == 0
+  }
+  if (len(header(headers, "transfer-encoding")) > 0) {
+    return true
+  }
+  let cl = atoi(header(headers, "content-length"))
+  return cl >= 0 && len(bodyStart) <= cl
+}
+
+// One response to a request that used `method`, framed per
+// `readResponseBody` (client.bit), and whether its connection may be parked.
+fn readResponseKeep(s: byteStream, method: string, maxBodyBytes: int): (Response, bool)! {
+  let (headBlock, bodyStart) = readUntil(s, "", "\r\n\r\n")?
+
+  let eol = indexOf(headBlock, "\r\n")
+  let statusLine = headBlock
+  let headers = ""
+  if (eol >= 0) {
+    statusLine = headBlock[0:eol]
+    headers = headBlock[eol + 2:len(headBlock)]
+  }
+  let code = parseStatusCode(statusLine)?
+  let body = ""
+  if (!bodyless(method, code)) {
+    body = readResponseBody(s, bodyStart, headers, method, maxBodyBytes)?
+  }
+  let res = Response{
+    status = code,
+    contentType = header(headers, "content-type"),
+    headers = headers,
+    body = body,
+  }
+  return res, keepsAlive(statusLine, headers, method, code, bodyStart)
+}
+
+// ---------------------------------------------------------------------------
+// One exchange through the pool
+// ---------------------------------------------------------------------------
+
+// RFC 9110 §9.2.2: methods whose repetition has the same effect as one.
+fn isIdempotent(method: string): bool {
+  return method == "GET" ||
+    method == "HEAD" ||
+    method == "OPTIONS" ||
+    method == "TRACE" ||
+    method == "PUT" ||
+    method == "DELETE"
+}
+
+// The idle-list key of `u`'s origin.
+fn poolKey(u: Url): string {
+  return "${schemeName(u)}://${hostHeaderValue(u)}"
+}
+
+// `method u` over HTTP/1.1 or, when an https origin negotiates it, h2: a
+// parked connection when the pool has one, else a fresh dial. A parked
+// connection that fails is retried once on a fresh one for an idempotent
+// method only; a POST fails with the error it got.
+fn exchangeOrigin(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  let key = poolKey(u)
+  match (extras.pool.take(key, monotonic().ns)) {
+    Hit(s) => {
+      let req = buildRequest(method, u, extras.block, body, false)
+      let res = runOn(s, key, req, method, extras) catch e {
+        if (!isIdempotent(method)) {
+          fail e
+        }
+        return exchangeFresh(method, u, body, extras)?
+      }
+      return res
+    }
+    Miss => return exchangeFresh(method, u, body, extras)?
+  }
+}
+
+// `method u` on a connection dialed now, bounded by `extras.deadline` when set.
+fn exchangeFresh(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  if (!u.https) {
+    let conn = dialConn(u, extras.deadline)?
+    let req = buildRequest(method, u, extras.block, body, false)
+    return runOn(netStream{ conn = conn }, poolKey(u), req, method, extras)?
+  }
+  let cfg = extras.config
+  if (len(cfg.alpn) == 0) {
+    cfg.alpn = ["h2", "http/1.1"]
+  }
+  let tc = dialTlsConn(u, cfg, extras.deadline)?
+  if (tc.alpnProtocol() == "h2") {
+    return h2clientExchange(tc, method, u, body, extras)?
+  }
+  let req = buildRequest(method, u, extras.block, body, false)
+  return runOn(tlsStream{ conn = tc }, poolKey(u), req, method, extras)?
+}
+
+fn dialConn(u: Url, deadline: int): Conn! {
+  if (deadline == 0) {
+    return dial(u.host, u.port)?
+  }
+  return dialDeadline(u.host, u.port, deadline)?
+}
+
+fn dialTlsConn(u: Url, cfg: TlsConfig, deadline: int): TlsConn! {
+  if (deadline == 0) {
+    return tlsDial(u.host, u.port, cfg)?
+  }
+  return tlsDialDeadline(u.host, u.port, cfg, deadline)?
+}
+
+// Writes `req` on `s`, reads the response, and parks `s` in `extras.pool` when
+// it can carry another request, else closes it — on every exit, so a failed or
+// timed-out exchange never leaks the socket. A parked connection has its
+// deadline cleared first.
+fn runOn(
+  s: byteStream,
+  key: string,
+  req: string,
+  method: string,
+  extras: RequestExtras,
+): Response! {
+  s.setIdleDeadline(extras.deadline)
+  let (res, keep) = exchangeKeep(s, req, method, extras.maxBody) catch e {
+    s.shut()
+    fail e
+  }
+  if (!keep) {
+    s.shut()
+    return res
+  }
+  s.setIdleDeadline(0)
+  extras.pool.put(key, s, monotonic().ns)
+  return res
+}
+
+fn exchangeKeep(s: byteStream, req: string, method: string, maxBody: int): (Response, bool)! {
+  s.writeStr(req)?
+  let r = readResponseKeep(s, method, maxBody)?
+  return r
+}

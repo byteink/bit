@@ -1,0 +1,340 @@
+// stdlib/http/pool.test.bit — the client's idle-connection pool (#6453).
+//
+// Same module as client.bit (SPEC §19): `Client`, `newClient`, `get`, `post`,
+// `PoolLimits`, `connPool`, `newConnPool`, `Idle`, `readMessage`, `netStream`,
+// `Listener`, `Conn`, `listen`, `hasPrefix`, `atoi`, `sleep`, `Millisecond`
+// and `monotonic` are bound module-wide, so only `std/sync`'s atomic is
+// imported. A pool's value is only provable by counting what the server
+// accepts: `origin` below answers HTTP/1.1 keep-alive on a loopback listener
+// and counts every accepted connection, so "reused" means "the count did not
+// move" rather than "no error".
+import { AtomicI64, newAtomicI64 } from "std/sync"
+
+// One keep-alive origin. `closeAfter` > 0 closes each connection after that
+// many answers WITHOUT announcing it, which is exactly what an idle timeout on
+// a real server looks like to a client holding the connection.
+class origin {
+  l: Listener,
+  accepts: AtomicI64,
+  port: int,
+}
+
+fn answer(req: Request): string {
+  if (hasPrefix(req.path, "/hop")) {
+    let n = atoi(req.path[4:len(req.path)])
+    if (n > 0) {
+      return "HTTP/1.1 302 Found\r\nLocation: /hop${n - 1}\r\nContent-Length: 0\r\n\r\n"
+    }
+  }
+  let body = "${req.method} ${req.path}"
+  if (req.path == "/close") {
+    return "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ${len(body)}\r\n\r\n${body}"
+  }
+  return "HTTP/1.1 200 OK\r\nContent-Length: ${len(body)}\r\n\r\n${body}"
+}
+
+fn originConn(c: Conn, closeAfter: int) {
+  defer c.close()
+  let s = netStream{ conn = c }
+  let n = 0
+  while (true) {
+    let req = readMessage(s, 1048576) catch _ {
+      return
+    }
+    if (len(req.method) == 0) {
+      return
+    }
+    n = n + 1
+    s.writeStr(answer(req)) catch _ {
+      return
+    }
+    if (closeAfter > 0 && n >= closeAfter) {
+      return
+    }
+    if (req.path == "/close") {
+      return
+    }
+  }
+}
+
+fn originAccept(l: Listener, accepts: AtomicI64, closeAfter: int) {
+  while (true) {
+    let c = l.accept() catch _ {
+      return
+    }
+    accepts.add(1)
+    spawn originConn(c, closeAfter)
+  }
+}
+
+fn startOrigin(closeAfter: int): origin! {
+  let l = listen("127.0.0.1", 0)?
+  let port = l.port()?
+  let accepts = newAtomicI64(0)
+  spawn originAccept(l, accepts, closeAfter)
+  return origin{ l = l, accepts = accepts, port = port }
+}
+
+fn acceptsOf(o: origin): int {
+  return int(o.accepts.load())
+}
+
+fn urlOf(o: origin, path: string): string {
+  return "http://127.0.0.1:${o.port}${path}"
+}
+
+test "five sequential Client.get calls to one origin make one accept" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  let i = 0
+  while (i < 5) {
+    let res = c.get(urlOf(o, "/n${i}")) catch e {
+      assert(false, "get ${i}: ${e.message()}")
+      return
+    }
+    assert(res.body == "GET /n${i}", "body ${i} = '${res.body}'")
+    i = i + 1
+  }
+  assert(acceptsOf(o) == 1, "accepts = ${acceptsOf(o)}, want 1")
+  c.close()
+  o.l.close()
+}
+
+test "a same-origin redirect chain of three hops makes one accept" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  let res = c.get(urlOf(o, "/hop3")) catch e {
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  assert(res.status == 200 && res.redirects == 3, "status ${res.status} redirects ${res.redirects}")
+  assert(res.body == "GET /hop0", "body = '${res.body}'")
+  assert(acceptsOf(o) == 1, "accepts = ${acceptsOf(o)}, want 1")
+  c.close()
+  o.l.close()
+}
+
+test "a package-level get shares one connection across its redirect hops" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let res = get(urlOf(o, "/hop3")) catch e {
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  assert(res.body == "GET /hop0", "body = '${res.body}'")
+  assert(acceptsOf(o) == 1, "accepts = ${acceptsOf(o)}, want 1")
+  o.l.close()
+}
+
+test "a connection idle past idleTimeoutMs is not reused" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  c.setPool(PoolLimits{ idleTimeoutMs = 40 }) catch e {
+    assert(false, "setPool: ${e.message()}")
+    return
+  }
+  c.get(urlOf(o, "/a")) catch e {
+    assert(false, "get a: ${e.message()}")
+    return
+  }
+  sleep(120 * Millisecond)
+  c.get(urlOf(o, "/b")) catch e {
+    assert(false, "get b: ${e.message()}")
+    return
+  }
+  assert(acceptsOf(o) == 2, "accepts = ${acceptsOf(o)}, want 2")
+  c.close()
+  o.l.close()
+}
+
+test "maxIdlePerHost 0 turns reuse off" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  c.setPool(PoolLimits{ maxIdlePerHost = 0 }) catch e {
+    assert(false, "setPool: ${e.message()}")
+    return
+  }
+  c.get(urlOf(o, "/a")) catch e {
+    assert(false, "get a: ${e.message()}")
+    return
+  }
+  c.get(urlOf(o, "/b")) catch e {
+    assert(false, "get b: ${e.message()}")
+    return
+  }
+  assert(acceptsOf(o) == 2, "accepts = ${acceptsOf(o)}, want 2")
+  o.l.close()
+}
+
+test "a response with Connection: close is not pooled" {
+  let o = startOrigin(0) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  c.get(urlOf(o, "/close")) catch e {
+    assert(false, "get 1: ${e.message()}")
+    return
+  }
+  c.get(urlOf(o, "/close")) catch e {
+    assert(false, "get 2: ${e.message()}")
+    return
+  }
+  assert(acceptsOf(o) == 2, "accepts = ${acceptsOf(o)}, want 2")
+  o.l.close()
+}
+
+test "a GET on a connection the server closed while idle is retried on a fresh one" {
+  let o = startOrigin(1) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  let i = 0
+  while (i < 3) {
+    let res = c.get(urlOf(o, "/n${i}")) catch e {
+      assert(false, "get ${i} was not retried: ${e.message()}")
+      return
+    }
+    assert(res.body == "GET /n${i}", "body ${i} = '${res.body}'")
+    i = i + 1
+  }
+  assert(acceptsOf(o) == 3, "accepts = ${acceptsOf(o)}, want 3")
+  c.close()
+  o.l.close()
+}
+
+test "a POST on a connection the server closed while idle is not retried" {
+  let o = startOrigin(1) catch e {
+    assert(false, "startOrigin: ${e.message()}")
+    return
+  }
+  let c = newClient()
+  c.post(urlOf(o, "/a"), "x") catch e {
+    assert(false, "first post: ${e.message()}")
+    return
+  }
+  // Let the server's close land, so the parked connection is dead.
+  sleep(50 * Millisecond)
+  let res = c.post(urlOf(o, "/b"), "x") catch _ {
+    assert(
+      acceptsOf(o) == 1,
+      "accepts = ${acceptsOf(o)}: the POST was replayed on a new connection",
+    )
+    c.close()
+    o.l.close()
+    return
+  }
+  assert(false, "the POST on a dead connection returned ${res.status}")
+}
+
+// A stream whose only observable behaviour is whether it was closed.
+class fakeIdle {
+  closed: bool
+
+  readUp(n: int): string! { return "" }
+
+  writeStr(s: string): ()! {}
+
+  writeBytes(b: []byte): ()! {}
+
+  shut() { this.closed = true }
+
+  forceClose() {}
+
+  peer(): string { return "" }
+
+  unread(extra: string) {}
+
+  setIdleDeadline(deadlineNs: int) {}
+}
+
+fn isHit(i: Idle): bool {
+  match (i) {
+    Hit(_) => return true
+    Miss => return false
+  }
+}
+
+test "maxIdlePerHost caps one origin, closing the connection that does not fit" {
+  let p = newConnPool(PoolLimits{ maxIdlePerHost = 2 })
+  let a = fakeIdle{ closed = false }
+  let b = fakeIdle{ closed = false }
+  let c = fakeIdle{ closed = false }
+  p.put("http://h:1", a, 1)
+  p.put("http://h:1", b, 2)
+  p.put("http://h:1", c, 3)
+  assert(!a.closed && !b.closed, "the two that fit were closed")
+  assert(c.closed, "the third did not fit and stayed open")
+  assert(isHit(p.take("http://h:1", 4)) && isHit(p.take("http://h:1", 4)), "two hits expected")
+  assert(!isHit(p.take("http://h:1", 4)), "a third hit: the pool held more than 2")
+}
+
+test "maxIdleTotal closes the oldest idle connection across origins" {
+  let p = newConnPool(PoolLimits{ maxIdlePerHost = 2, maxIdleTotal = 2 })
+  let a = fakeIdle{ closed = false }
+  let b = fakeIdle{ closed = false }
+  let c = fakeIdle{ closed = false }
+  p.put("http://one:1", a, 1)
+  p.put("http://two:1", b, 2)
+  p.put("http://three:1", c, 3)
+  assert(a.closed, "the oldest connection was not evicted")
+  assert(!b.closed && !c.closed, "a newer connection was evicted")
+  assert(!isHit(p.take("http://one:1", 4)), "the evicted origin still hit")
+}
+
+test "take returns the most recently parked connection and closes expired ones" {
+  let p = newConnPool(PoolLimits{ idleTimeoutMs = 10 })
+  let old = fakeIdle{ closed = false }
+  let fresh = fakeIdle{ closed = false }
+  p.put("http://h:1", old, 0)
+  p.put("http://h:1", fresh, 5 * Millisecond)
+  // 12 ms in: `old` (idle 12 ms) has expired, `fresh` (idle 7 ms) has not.
+  assert(isHit(p.take("http://h:1", 12 * Millisecond)), "the live connection was not returned")
+  assert(old.closed, "the expired connection was not closed")
+  assert(!fresh.closed, "the live connection was closed")
+}
+
+test "a retired pool closes what is handed back to it" {
+  let p = newConnPool(PoolLimits{})
+  let a = fakeIdle{ closed = false }
+  let b = fakeIdle{ closed = false }
+  p.put("http://h:1", a, 1)
+  p.retire()
+  assert(a.closed, "retire left an idle connection open")
+  p.put("http://h:1", b, 2)
+  assert(b.closed, "a retired pool parked a connection")
+}
+
+test "setPool rejects limits that are a mistake" {
+  let c = newClient()
+  c.setPool(PoolLimits{ maxIdlePerHost = -1 }) catch e {
+    assert(indexOf(e.message(), "maxIdlePerHost") >= 0, "message = '${e.message()}'")
+    c.setPool(PoolLimits{ maxIdlePerHost = 5, maxIdleTotal = 4 }) catch e2 {
+      assert(indexOf(e2.message(), "maxIdleTotal") >= 0, "message = '${e2.message()}'")
+      c.setPool(PoolLimits{ idleTimeoutMs = 0 }) catch e3 {
+        assert(indexOf(e3.message(), "idleTimeoutMs") >= 0, "message = '${e3.message()}'")
+        return
+      }
+      assert(false, "idleTimeoutMs = 0 was accepted")
+      return
+    }
+    assert(false, "maxIdleTotal below maxIdlePerHost was accepted")
+    return
+  }
+  assert(false, "a negative maxIdlePerHost was accepted")
+}

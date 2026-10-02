@@ -123,9 +123,12 @@ refused.
 
 ### A client that reuses connections
 
-The package-level functions above dial a fresh connection every call. A
-`Client` reuses configuration - a pinned CA, a bearer token, a body-size
-limit - and remembers which servers have advertised HTTP/3, so a second
+The package-level functions above dial a fresh connection for each call
+(the hops of one call's redirect chain share one). A `Client` reuses
+configuration - a pinned CA, a bearer token, a body-size limit - and keeps
+its HTTP/1.1 connections open between calls, so a loop of requests to one
+host pays for one TCP connect and one TLS handshake instead of one per
+request. It also remembers which servers have advertised HTTP/3, so a second
 request to the same host can upgrade automatically.
 
 ```bit
@@ -150,6 +153,52 @@ functions; `Client.setHeader` sets a default sent with every call from this
 client, and `Client.setMaxBodyBytes(n)` raises or lowers the 32 MiB response
 cap - there is no value meaning unlimited, so `0` refuses every body, the
 same rule `Server.setMaxBodyBytes` uses below.
+
+### Keeping connections between requests
+
+Inkwell's sync job pulls a few hundred drafts from the API in a loop. With
+one `Client` the first request opens a connection and the rest ride it; a
+response is parked for reuse only when it ended exactly at a message
+boundary (HTTP/1.1, no `Connection: close`, a `Content-Length` or chunked
+body). Three bounds keep the idle list from growing without limit, and
+`PoolLimits` names them with Go's defaults:
+
+```bit
+import { newClient, PoolLimits } from "std/http"
+
+fn pullDrafts(host: string, ids: []string): int! {
+  let c = newClient()
+  c.setPool(PoolLimits{ maxIdlePerHost = 4, idleTimeoutMs = 30000 })?
+  let bytes = 0
+  for id of ids {
+    let res = c.get("http://${host}/drafts/${id}")?
+    bytes = bytes + len(res.body)
+  }
+  c.close()
+  return bytes
+}
+```
+
+`maxIdlePerHost` (default 2) is how many idle connections one host may
+keep, `maxIdleTotal` (default 100) the same across every host, and
+`idleTimeoutMs` (default 90000) how long a connection may sit unused. Each
+is checked when the pool is next used, not by a background thread, so an idle
+`Client` costs nothing. `setPool` fails on a mistake - a negative
+`maxIdlePerHost`, a `maxIdleTotal` below it, an `idleTimeoutMs` that is not
+positive - and `maxIdlePerHost = 0` is how you turn reuse off. `close()` drops
+the connections that are idle now; the `Client` stays usable.
+
+A server may close an idle connection at any time, and the client learns
+that only when it next uses it. A `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`
+or `TRACE` that fails on a reused connection is retried once on a new one. A
+`POST` is not: it may already have been processed, so replaying it would
+repeat its effect, and the call fails with the error instead.
+
+A pool belongs to one `Client` and one TLS configuration, so connections are
+never shared between clients. `requestTls` and the other package-level calls
+take a configuration per call and so never keep a connection past the call.
+HTTP/2 and HTTP/3 connections are not pooled yet: each call still opens its
+own.
 
 ### Following redirects
 
@@ -466,6 +515,23 @@ As `Client.post`, bounded by one deadline.
 ### `Client.requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
 
 As `Client.request`, bounded by one deadline.
+
+### `PoolLimits`
+
+The bounds of a `Client`'s idle HTTP/1.1 connections: `maxIdlePerHost: int`
+(2), `maxIdleTotal: int` (100) and `idleTimeoutMs: int` (90000). Every field has
+a default, so `PoolLimits{}` is the configuration `newClient` uses.
+
+### `Client.setPool(limits: PoolLimits): ()!`
+
+Replaces the client's pool bounds, closing the connections already idle. Fails
+on a negative `maxIdlePerHost`, a `maxIdleTotal` below it, or an `idleTimeoutMs`
+that is not positive.
+
+### `Client.close()`
+
+Closes every idle connection the client holds. A request in flight finishes
+and the client stays usable.
 
 ### `Client.setHeader(name: string, value: string): ()!`
 
