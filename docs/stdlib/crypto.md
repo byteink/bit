@@ -449,6 +449,10 @@ The BLAKE2b digest length in bytes.
 
 The BLAKE2b algorithm's internal block size in bytes.
 
+### `blake2b(data: []byte): []byte`
+
+The one-shot BLAKE2b hash of `data`, 64 bytes long.
+
 ### `Blake2s`
 
 BLAKE2b's sibling, tuned for 32-bit hardware. `Blake2s()` starts a 32-byte unkeyed hash; `Blake2s(outLen, key)` picks the output length (1 to 32 bytes) and an optional key (up to 32 bytes), and panics on an out-of-range length. The same shape as `Blake2b`: `write`/`sum`/`reset`.
