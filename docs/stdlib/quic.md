@@ -457,9 +457,9 @@ import {
   defaultTransportParameters, encodeTransportParameters, levelKeys, updateSecret,
   cryptoFrames, reassembleCryptoFrames, PacketKeys,
 } from "std/quic"
-import { Hash, newSha256 } from "std/crypto"
+import { Hash, Sha256 } from "std/crypto"
 
-fn sha256(): Hash { return newSha256() }
+fn sha256(): Hash { return Sha256() }
 
 // Our transport parameters, as the quic_transport_parameters extension body.
 fn myParameters(): []byte {
