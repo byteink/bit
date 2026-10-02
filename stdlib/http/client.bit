@@ -72,9 +72,9 @@ fn readContentLengthBody(s: byteStream, initial: string, cl: int): string! {
 // The response body, per RFC 9112 §6.3's framing precedence: item 1, a
 // response to a HEAD request, which ends at the header section whatever the
 // framing fields say; else chunked Transfer-Encoding, else an exact
-// Content-Length read, else read-to-EOF (the case 7 fallback — sound here because every request this client sends
-// carries `Connection: close`, so the peer closing is the terminator, not an
-// ambiguity). Fails if both framing headers are present. Split out of
+// Content-Length read, else read-to-EOF (the case 7 fallback — the peer closing
+// is the terminator, and `keepsAlive` (pool.bit) never pools such a
+// connection). Fails if both framing headers are present. Split out of
 // `readResponse` (#2448).
 //
 // All three framings are bounded by `maxBodyBytes` (#4585), the mirror of the
@@ -139,24 +139,11 @@ fn readResponseBody(
 }
 
 // One response to a request that used `method`, framed per `readResponseBody`.
+// The connection-reuse verdict `readResponseKeep` (pool.bit) also computes is
+// dropped here: the callers of this function close the stream afterwards.
 fn readResponse(s: byteStream, method: string, maxBodyBytes: int): Response! {
-  let (headBlock, bodyStart) = readUntil(s, "", "\r\n\r\n")?
-
-  let eol = indexOf(headBlock, "\r\n")
-  let statusLine = headBlock
-  let headers = ""
-  if (eol >= 0) {
-    statusLine = headBlock[0:eol]
-    headers = headBlock[eol + 2:len(headBlock)]
-  }
-  let code = parseStatusCode(statusLine)?
-  let body = readResponseBody(s, bodyStart, headers, method, maxBodyBytes)?
-  return Response{
-    status = code,
-    contentType = header(headers, "content-type"),
-    headers = headers,
-    body = body,
-  }
+  let (res, _) = readResponseKeep(s, method, maxBodyBytes)?
+  return res
 }
 
 // The `Host` field value for `u` per RFC 7230 §5.4 — the port appended unless
@@ -181,39 +168,33 @@ fn hostHeaderValue(u: Url): string {
   return "${u.host}:${itoa(u.port)}"
 }
 
-// The HTTP/1.1 request text for `method u.path` with `body`, asking the
-// server to close the connection so `readResponse` can fall back to
-// end-of-stream framing when neither Content-Length nor Transfer-Encoding is
-// present. `headerBlock` is extra request headers, already validated and
+// The HTTP/1.1 request text for `method u.path` with `body`. `closeAfter` adds
+// `Connection: close`, asking the server to end the connection after the
+// response so `readResponse` can fall back to end-of-stream framing when
+// neither Content-Length nor Transfer-Encoding is present; without it the
+// connection is persistent (RFC 9112 §9.3) and the pool (pool.bit) may reuse
+// it. `headerBlock` is extra request headers, already validated and
 // serialized by `serializeHeaders` (reqheader.bit, #2290) — inserted verbatim,
 // after the framing lines this function owns and before Content-Length, so a
 // caller can never override either by supplying a same-named header (those
 // names are rejected earlier, by `isReservedRequestHeader`).
-fn buildRequest(method: string, u: Url, headerBlock: string, body: string): string {
+fn buildRequest(
+  method: string,
+  u: Url,
+  headerBlock: string,
+  body: string,
+  closeAfter: bool,
+): string {
   let req = "${method} ${u.path} HTTP/1.1\r\n"
   req = req + "Host: ${hostHeaderValue(u)}\r\n"
-  req = req + "Connection: close\r\n"
+  if (closeAfter) {
+    req = req + "Connection: close\r\n"
+  }
   req = req + headerBlock
   if (len(body) > 0) {
     req = req + "Content-Length: ${itoa(len(body))}\r\n"
   }
   return req + "\r\n" + body
-}
-
-// Send `reqText` over `s`, read one framed response, and close — on EVERY
-// exit path, not only success. `defer` (SPEC §18.5) runs on a `?`
-// propagation same as a normal `return`, which matters now that a deadline
-// (#2291) makes "the read failed" a routine outcome rather than an edge
-// case: without this, a timed-out `getTimeout`/`requestTimeout` leaked the
-// underlying socket, since the old bare `s.shut()` below the `?` never ran.
-// `method` is the one `reqText`'s request line carries; the reader needs it to
-// frame a HEAD response (#4632) and re-parsing it back out of the text this
-// client just built would be the same fact derived twice.
-fn exchangeOn(s: byteStream, reqText: string, method: string, maxBodyBytes: int): Response! {
-  defer s.shut()
-  s.writeStr(reqText)?
-  let res = readResponse(s, method, maxBodyBytes)?
-  return res
 }
 
 // Default trust anchors for verifying servers: the operating-system store when
@@ -241,8 +222,8 @@ fn defaultClientConfig(): TlsConfig {
 // is no `Client`:
 //
 //   `config`   the TLS config for an https or https+h3 leg still to be dialed —
-//              read by `requestBlock` and `requestTimeoutTls` (both legs), not
-//              by `httpsExchange`, which receives an already-dialed connection.
+//              read by `requestBlock` and `requestTimeoutTls` (both legs) and,
+//              for the https leg, by `exchangeFresh` (pool.bit).
 //              #6235: the h3 leg now carries this through to `dialQuic`'s
 //              verification, the same as the https leg always has.
 //   `block`    this request's extra headers, already validated and serialized
@@ -260,6 +241,10 @@ fn defaultClientConfig(): TlsConfig {
 //              `setRedirects`.
 //   `deadline` the absolute `monotonic` deadline of a whole-request timeout
 //              (#2291), 0 for none; every hop of a followed redirect shares it.
+//   `pool`     the idle-connection pool this request and every redirect hop
+//              take their HTTP/1.1 connection from (pool.bit, #6453): the
+//              `Client`'s own, or for a package-level call one made for that
+//              call alone and retired when it returns.
 class RequestExtras {
   config: TlsConfig,
   block: string,
@@ -267,6 +252,7 @@ class RequestExtras {
   maxBody: int,
   redirects: Redirects,
   deadline: int,
+  pool: connPool,
 }
 
 // The extras a call with no `Client` behind it uses: `config` and `block` from
@@ -280,6 +266,7 @@ fn newRequestExtras(config: TlsConfig, block: string): RequestExtras {
     maxBody = defaultMaxBodyBytes,
     redirects = defaultRedirects(),
     deadline = 0,
+    pool = newConnPool(PoolLimits{}),
   }
 }
 
@@ -292,6 +279,7 @@ fn newRequestExtras(config: TlsConfig, block: string): RequestExtras {
 // carrying no extra headers gets byte-identical wire output to before #2290.
 // A 3xx answer is followed per `extras.redirects` (`settle`, redirect.bit).
 fn requestBlock(method: string, url: string, body: string, extras: RequestExtras): Response! {
+  defer extras.pool.retire()
   let u = parseUrl(url)?
   let res = exchangeBlock(method, u, body, extras)?
   return settle(res, method, url, body, extras)?
@@ -302,11 +290,7 @@ fn exchangeBlock(method: string, u: Url, body: string, extras: RequestExtras): R
   if (u.h3) {
     return h3Exchange(u, method, body, extras.block, extras.config)?
   }
-  if (u.https) {
-    return httpsExchange(tlsDial(u.host, u.port, extras.config)?, method, u, body, extras)?
-  }
-  let req = buildRequest(method, u, extras.block, body)
-  return exchangeOn(netStream{ conn = dial(u.host, u.port)? }, req, method, extras.maxBody)?
+  return exchangeOrigin(method, u, body, extras)?
 }
 
 // Send `method url` with an optional body and return the response. An `https://`
@@ -343,7 +327,7 @@ export fn requestWith(method: string, url: string, headers: []Header, body: stri
 // pinned `serverName`, `insecureSkipVerify` for tests). Fails if `url` is not
 // https — `u.https` is true for both `https://` and `https+h3://` (url.bit),
 // so this also covers the h3 leg (#6235: it used to fall straight through to
-// `tlsDial`/`httpsExchange` even for an `https+h3://` URL, silently trying a
+// `tlsDial` even for an `https+h3://` URL, silently trying a
 // TCP+TLS connection where there was never a TCP listener; delegating to
 // `requestBlock` — already the one place that switches on `u.h3` — is what
 // `request`/`requestWith` above do too). `config.alpn` defaults to `h2` then
@@ -451,33 +435,26 @@ fn requestTimeoutTls(
 // One exchange of `requestTimeoutTls` against `extras.deadline`, with no
 // redirect handling.
 fn exchangeDeadline(method: string, u: Url, body: string, extras: RequestExtras): Response! {
-  let deadline = extras.deadline
   if (u.h3) {
-    return h3ExchangeDeadline(u, method, body, deadline, extras)?
+    return h3ExchangeDeadline(u, method, body, extras.deadline, extras)?
   }
-  if (u.https) {
-    let key = h2glueAuthority(u)
-    let cached = cachedH3Port(extras.h3Ports, key)
-    if (cached != 0) {
-      let hu = Url{ host = u.host, port = cached, path = u.path, https = true, h3 = true }
-      return h3ExchangeDeadline(hu, method, body, deadline, extras)?
-    }
-    let cfg = extras.config
-    if (len(cfg.alpn) == 0) {
-      cfg.alpn = ["h2", "http/1.1"]
-    }
-    let tlsConn = tlsDialDeadline(u.host, u.port, cfg, deadline)?
-    let res = httpsExchange(tlsConn, method, u, body, extras)?
-    learnAltSvcInto(extras.h3Ports, key, res)
-    return res
+  if (!u.https) {
+    return exchangeOrigin(method, u, body, extras)?
   }
-  let conn = dialDeadline(u.host, u.port, deadline)?
-  let req = buildRequest(method, u, extras.block, body)
-  return exchangeOn(netStream{ conn = conn }, req, method, extras.maxBody)?
+  let key = h2glueAuthority(u)
+  let cached = cachedH3Port(extras.h3Ports, key)
+  if (cached != 0) {
+    let hu = Url{ host = u.host, port = cached, path = u.path, https = true, h3 = true }
+    return h3ExchangeDeadline(hu, method, body, extras.deadline, extras)?
+  }
+  let res = exchangeOrigin(method, u, body, extras)?
+  learnAltSvcInto(extras.h3Ports, key, res)
+  return res
 }
 
 export fn requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response! {
   let extras = newRequestExtras(defaultClientConfig(), "")
+  defer extras.pool.retire()
   return requestTimeoutTls(method, url, body, timeoutMs, extras)?
 }
 
@@ -548,6 +525,7 @@ export class Client {
   headers: []Header
   maxBody: int
   redirects: Redirects
+  pool: connPool
 
   // How this client treats a 3xx response (#6443): `Redirects.Follow(10)` by
   // default, `Redirects.None` for the raw 3xx, `Redirects.FollowAllowing(n,
@@ -580,6 +558,27 @@ export class Client {
   export setMaxBodyBytes(n: int) {
     this.maxBody = n
   }
+  // Bounds the idle HTTP/1.1 connections this client keeps for reuse (#6453).
+  // See `PoolLimits` (pool.bit) for each field and its default. Connections
+  // already idle are closed and any still in flight are closed when they
+  // finish, so the new bounds govern from the next request. Fails, before
+  // changing anything, on a limit that is a mistake: a negative
+  // `maxIdlePerHost`, a `maxIdleTotal` below it, or an `idleTimeoutMs` that
+  // is not positive. `maxIdlePerHost = 0` is the one way to turn reuse off.
+  export setPool(limits: PoolLimits): ()! {
+    validatePoolLimits(limits)?
+    this.pool.retire()
+    this.pool = newConnPool(limits)
+  }
+
+  // Closes every idle connection this client holds. A request still in flight
+  // finishes normally and parks its connection afterwards, and the client
+  // stays usable: this is the call for a program that is done with a host,
+  // not a destructor.
+  export close() {
+    this.pool.closeAll()
+  }
+
   // Sets a per-client default header sent with every `Client.request`/
   // `Client.requestWith`/`Client.requestTimeout`/`getTimeout`/`postTimeout` call
   // this client makes (#3484) — e.g. an `Authorization` token used across a
@@ -614,6 +613,7 @@ export class Client {
       maxBody = this.maxBody,
       redirects = this.redirects,
       deadline = 0,
+      pool = this.pool,
     }
   }
 
@@ -709,6 +709,7 @@ export fn newClientTls(config: TlsConfig): Client {
     headers = []Header(0),
     maxBody = defaultMaxBodyBytes,
     redirects = defaultRedirects(),
+    pool = newConnPool(PoolLimits{}),
   }
 }
 
@@ -725,11 +726,7 @@ fn exchangeClient(method: string, u: Url, body: string, extras: RequestExtras): 
     let hu = Url{ host = u.host, port = cached, path = u.path, https = true, h3 = true }
     return h3Exchange(hu, method, body, extras.block, extras.config)?
   }
-  let cfg = extras.config
-  if (len(cfg.alpn) == 0) {
-    cfg.alpn = ["h2", "http/1.1"]
-  }
-  let res = httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, extras)?
+  let res = exchangeOrigin(method, u, body, extras)?
   learnAltSvcInto(extras.h3Ports, key, res)
   return res
 }
