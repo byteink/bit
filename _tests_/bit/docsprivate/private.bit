@@ -1,33 +1,65 @@
 // The private-name scan `_tests_/bit/docs.bit` (`test-docs`) runs beside its
-// snippet typecheck (#6528).
+// snippet typecheck (#6528, widened to every tracked text file by #6530).
 //
-// The property: no public text names a private repository, host or tool. The
-// pages under `docs/`, `spec/`, `examples/`, `README.md`, `pkg/README.md`,
-// `dist/README.md`, `runtime/ABI.md` and each `pkg/<name>/README.md` are
-// published on bitlang.org and on GitHub, and a private repository name there
-// is a leak the owner forbade. Those files are the public text this gate owns; the forbidden tokens are `forbiddenNames`
-// below.
+// The property: no tracked text file names a private repository, host or tool.
+// The repository is public, and a private name in a code comment or a script is
+// the same leak as one in a doc page. Two token sets:
 //
-// There is no allowlist: no legitimate use of any token exists in these trees.
-// This file and its caller are the only places the tokens are written down, and
-// they live under `_tests_/`, which no scanned root contains.
+//   - `forbiddenNames` (`bit-website`, `bitlab`, `hl-master`, `smash`,
+//     `.claude/`) for the PUBLIC PROSE: `docs/`, `spec/`, `examples/`,
+//     `README.md`, `pkg/README.md`, `dist/README.md`, `runtime/ABI.md` and each
+//     `pkg/<name>/README.md`, which bitlang.org and GitHub publish verbatim.
+//   - `repoNames` (the first three) for EVERY other tracked text file. `smash`
+//     and `.claude/` are not repo-wide: `smash` is also an English verb, and
+//     source comments cite tickets by tracker name.
+//
+// The file set is `git grep -I -l -e ''` over the repo: tracked files only,
+// binaries dropped by git's own test, never a filesystem walk (a walk reads
+// gitignored build output).
+//
+// `allowedSites` is the whole allowlist: a file that may name a token, with its
+// one-line reason. The scanner's own source is on it because it writes the
+// tokens down. Every entry is asserted BOTH ways: a listed file that no longer
+// names a token is itself a finding, so the list cannot go stale.
 //
 // A scan that finds nothing is only worth something if it can find something,
 // so `privateNamesSelfTest` runs first and aborts on a scanner that misses a
 // planted token or flags a clean line; `scanPrivateNames` also returns how many
-// files it read, so a walk that silently covers nothing fails the caller's
-// floor instead of passing.
+// files it read, so a listing that silently covers nothing fails the caller's
+// floors instead of passing.
 
-import { exists, isDir, readDir, readFile, walk } from "std/fs"
-import { contains, hasSuffix, split, toLower } from "std/strings"
+import { readFile, remove, writeFile } from "std/fs"
+import { contains, hasPrefix, hasSuffix, split, toLower } from "std/strings"
 
-// Bounds on the walk, so the traversal is provably finite (Power of 10).
-const maxFilesPerTree: int = 1024
+// Bound on the one `git grep` child (Power of 10).
+const listTimeoutMs: i64 = 60000
 
-const maxPkgDirs: int = 256
+// A tracked file allowed to name a private token, and why.
+class AllowedSite {
+  path: string,
+  reason: string,
+}
+
+fn allowedSites(): []AllowedSite {
+  return [
+    AllowedSite{
+      path = "_tests_/bit/docsprivate/private.bit",
+      reason = "the scanner's own source writes the tokens it forbids",
+    },
+    AllowedSite{
+      path = "dist/release-verify.sh",
+      reason = "reads the website checkout beside bit/; its directory name is the one default of WEBSITE (BIT_WEBSITE_DIR overrides)",
+    },
+    AllowedSite{
+      path = "dist/stage0/SHA256SUMS",
+      reason = "historical release-pin comment lines, owned by the stage0 repin (#6527); delete this entry when it rewrites them",
+    },
+  ]
+}
 
 export class PrivateScan {
   export files: int,
+  export prose: int,
   export hits: []string,
 }
 
@@ -35,17 +67,15 @@ fn forbiddenNames(): []string {
   return ["bit-website", "bitlab", "hl-master", "smash", ".claude/"]
 }
 
-// The extensions of the text files the public trees carry. A built binary left
-// under `examples/` is not text and is not public prose.
-fn textSuffixes(): []string {
-  return [".md", ".bit", ".json", ".lock", ".toml", ".txt", ".sh", ".html"]
+fn repoNames(): []string {
+  return ["bit-website", "bitlab", "hl-master"]
 }
 
-// The first forbidden token `line` names, or "" when it is clean. Case is
+// The first of `names` that `line` names, or "" when it is clean. Case is
 // folded: `Smash` and `BitLab` leak the same name.
-export fn forbiddenIn(line: string): string {
+fn firstNameIn(line: string, names: []string): string {
   let low = toLower(line)
-  for name of forbiddenNames() {
+  for name of names {
     if (contains(low, name)) {
       return name
     }
@@ -53,13 +83,22 @@ export fn forbiddenIn(line: string): string {
   return ""
 }
 
-// One `path:line: token` entry per offending line of `text`.
-fn textHits(path: string, text: string): []string {
+export fn forbiddenIn(line: string): string {
+  return firstNameIn(line, forbiddenNames())
+}
+
+// One `path:line: token` entry per offending line of `text`. The whole text is
+// tested once first: nearly every file is clean, and this is the hot path over
+// ~40 MB of tracked text.
+fn textHits(path: string, text: string, names: []string): []string {
   let out = []string(0)
+  if (len(firstNameIn(text, names)) == 0) {
+    return out
+  }
   let lines = split(text, "\n")
   let i = 0
   while (i < len(lines)) {
-    let name = forbiddenIn(lines[i])
+    let name = firstNameIn(lines[i], names)
     if (len(name) > 0) {
       out = append(out, "${path}:${i + 1}: ${name}")
     }
@@ -68,95 +107,137 @@ fn textHits(path: string, text: string): []string {
   return out
 }
 
-fn isTextFile(path: string): bool {
-  for s of textSuffixes() {
-    if (hasSuffix(path, s)) {
+// `pkg/<name>/README.md`: three segments exactly, not a nested README.
+fn isPkgReadme(path: string): bool {
+  if (!hasPrefix(path, "pkg/") || !hasSuffix(path, "/README.md")) {
+    return false
+  }
+  return len(split(path, "/")) == 3
+}
+
+// The published prose: the files bitlang.org and GitHub render verbatim.
+fn isPublicProse(path: string): bool {
+  for dir of ["docs/", "spec/", "examples/"] {
+    if (hasPrefix(path, dir)) {
       return true
     }
   }
-  return false
+  for file of ["README.md", "pkg/README.md", "dist/README.md", "runtime/ABI.md"] {
+    if (path == file) {
+      return true
+    }
+  }
+  return isPkgReadme(path)
 }
 
-// Fold `path` into `acc`: one file counted, its offending lines appended.
-fn scanFile(acc: PrivateScan, path: string): PrivateScan {
-  let text = readFile(path) catch e {
+fn allowedIndex(path: string): int {
+  let sites = allowedSites()
+  let i = 0
+  while (i < len(sites)) {
+    if (sites[i].path == path) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The tracked text files under `root`, one path per entry.
+fn trackedTextFiles(root: string, scratch: string): []string! {
+  let list = "${scratch}/private-files.txt"
+  let script = "${scratch}/private-files.sh"
+  writeFile(script, "#!/bin/sh\ncd '${root}' || exit 97\nexec git grep -I -l -e '' > '${list}'\n")?
+  if (fsChmod(script, 448) != 0) {
+    fail newError("cannot make ${script} executable")
+  }
+  let rc = osRunBounded(script, listTimeoutMs)
+  if (rc != 0) {
+    fail newError("`git grep -I -l` exited ${rc}")
+  }
+  let text = readFile(list)?
+  // The caller's `teardown` removes the scratch directory non-recursively, so
+  // these two files must not outlive the listing.
+  remove(list)?
+  remove(script)?
+  let out = []string(0)
+  for line of split(text, "\n") {
+    if (len(line) > 0) {
+      out = append(out, line)
+    }
+  }
+  return out
+}
+
+// Fold one tracked file into `acc`. Prose files use the full token set, every
+// other file the repo-wide set; an allowlisted file is not a finding, but its
+// index in `used` is marked when it really names a token.
+fn scanFile(acc: PrivateScan, root: string, path: string, used: []bool): PrivateScan {
+  let text = readFile("${root}/${path}") catch e {
     return PrivateScan{
       files = acc.files,
+      prose = acc.prose,
       hits = append(acc.hits, "${path}: unreadable: ${e.message()}"),
     }
   }
-  let found = acc.hits
-  for h of textHits(path, text) {
-    found = append(found, h)
+  let prose = isPublicProse(path)
+  let names = repoNames()
+  if (prose) {
+    names = forbiddenNames()
   }
-  return PrivateScan{ files = acc.files + 1, hits = found }
+  let found = textHits(path, text, names)
+  let site = allowedIndex(path)
+  if (site >= 0) {
+    used[site] = len(found) > 0
+    found = []string(0)
+  }
+  let n = acc.prose
+  if (prose) {
+    n = n + 1
+  }
+  let hits = acc.hits
+  for h of found {
+    hits = append(hits, h)
+  }
+  return PrivateScan{ files = acc.files + 1, prose = n, hits = hits }
 }
 
-// Every text file under `root`, which must exist: a missing public tree is a
-// finding, never an empty pass.
-fn scanTree(acc: PrivateScan, root: string): PrivateScan {
-  let all = walk(root) catch e {
-    return PrivateScan{
-      files = acc.files,
-      hits = append(acc.hits, "${root}: cannot walk: ${e.message()}"),
+// One finding per allowlist entry whose file names nothing: a stale entry
+// would keep a hole open for the next mention.
+fn staleSites(acc: PrivateScan, used: []bool): PrivateScan {
+  let sites = allowedSites()
+  let out = acc.hits
+  let i = 0
+  while (i < len(sites)) {
+    if (!used[i]) {
+      out = append(
+        out,
+        "${sites[i].path}: allowlisted (${sites[i].reason}) but names no private token; delete the entry",
+      )
     }
+    i = i + 1
   }
-  if (len(all) > maxFilesPerTree) {
-    return PrivateScan{
-      files = acc.files,
-      hits = append(acc.hits, "${root}: ${len(all)} entries, over the bound of ${maxFilesPerTree}"),
-    }
-  }
-  let out = acc
-  for p of all {
-    if (isTextFile(p)) {
-      out = scanFile(out, p)
-    }
-  }
-  return out
+  return PrivateScan{ files = acc.files, prose = acc.prose, hits = out }
 }
 
-// `pkg/<name>/README.md` for every package directory: the READMEs only, the
-// packages' sources are not public prose.
-fn scanPkgReadmes(acc: PrivateScan, pkgDir: string): PrivateScan {
-  let names = readDir(pkgDir) catch e {
-    return PrivateScan{
-      files = acc.files,
-      hits = append(acc.hits, "${pkgDir}: cannot list: ${e.message()}"),
-    }
+// The scan over every tracked text file of the repo at `root`; `scratch` is a
+// writable directory the caller removes.
+export fn scanPrivateNames(root: string, scratch: string): PrivateScan {
+  let acc = PrivateScan{ files = 0, prose = 0, hits = []string(0) }
+  let paths = trackedTextFiles(root, scratch) catch e {
+    acc.hits = append(acc.hits, "${root}: cannot list tracked files: ${e.message()}")
+    return acc
   }
-  if (len(names) > maxPkgDirs) {
-    return PrivateScan{
-      files = acc.files,
-      hits = append(acc.hits, "${pkgDir}: ${len(names)} entries, over the bound of ${maxPkgDirs}"),
-    }
+  let used = []bool(len(allowedSites()))
+  for p of paths {
+    acc = scanFile(acc, root, p, used)
   }
-  let out = acc
-  for n of names {
-    let readme = "${pkgDir}/${n}/README.md"
-    if (isDir("${pkgDir}/${n}") && exists(readme)) {
-      out = scanFile(out, readme)
-    }
-  }
-  return out
+  return staleSites(acc, used)
 }
 
-// The scan over the public trees under repo root `root`.
-export fn scanPrivateNames(root: string): PrivateScan {
-  let acc = PrivateScan{ files = 0, hits = []string(0) }
-  acc = scanTree(acc, "${root}/docs")
-  acc = scanTree(acc, "${root}/spec")
-  acc = scanTree(acc, "${root}/examples")
-  acc = scanFile(acc, "${root}/README.md")
-  acc = scanFile(acc, "${root}/pkg/README.md")
-  acc = scanFile(acc, "${root}/dist/README.md")
-  acc = scanFile(acc, "${root}/runtime/ABI.md")
-  return scanPkgReadmes(acc, "${root}/pkg")
-}
-
-// The scanner against known-good and known-bad lines, one per forbidden token
-// plus a case-folded one and a clean one. Returns the failures, 0 when sound.
-export fn privateNamesSelfTest(): int {
+// The token matcher against known-good and known-bad lines, one per forbidden
+// token plus a case-folded one and a clean one, and the repo-wide set's
+// narrower reach. Returns the failures.
+fn tokenSelfTest(): int {
   let failed = 0
   for name of forbiddenNames() {
     if (forbiddenIn("see the ${name} repository") != name) {
@@ -169,35 +250,60 @@ export fn privateNamesSelfTest(): int {
   if (len(forbiddenIn("the website repository and bitlang.org")) != 0) {
     failed = failed + 1
   }
-  if (len(textHits("p.md", "clean\nx hl-master y\nclean")) != 1) {
+  if (len(textHits("p.md", "clean\nx hl-master y\nclean", repoNames())) != 1) {
+    failed = failed + 1
+  }
+  if (len(textHits("p.bit", "// smash #1 and .claude/x", repoNames())) != 0) {
     failed = failed + 1
   }
   return failed
 }
 
-// The files the scan must read: today's corpus is 199 text files, and a
-// walk that stopped descending would land far below this.
-const minScannedFiles: int = 190
+// The prose and allowlist classifiers. Returns the failures.
+fn classifierSelfTest(): int {
+  let failed = 0
+  if (!isPublicProse("pkg/web/README.md") ||
+    isPublicProse("pkg/web/docs/README.md") ||
+    isPublicProse("pkg/web/static.bit")) {
+    failed = failed + 1
+  }
+  if (allowedIndex("_tests_/bit/docsprivate/private.bit") < 0 ||
+    allowedIndex("stdlib/path/path.bit") >= 0) {
+    failed = failed + 1
+  }
+  return failed
+}
+
+// Both self-tests: 0 when the scanner is sound.
+export fn privateNamesSelfTest(): int {
+  return tokenSelfTest() + classifierSelfTest()
+}
+
+// The files the scan must read. Today's corpus is 7835 tracked text files, 199
+// of them public prose; a listing that came back short would land far below.
+const minScannedFiles: int = 7000
+
+const minProseFiles: int = 190
 
 // Run the self-test and the scan over `root`, print every finding, and return
-// how many there were: 0 means the public trees name nothing private.
-export fn reportPrivateNames(root: string): int {
+// how many there were: 0 means no tracked text file names anything private.
+export fn reportPrivateNames(root: string, scratch: string): int {
   let broken = privateNamesSelfTest()
   if (broken != 0) {
     eprint("docs: FAILED — the private-name scanner failed ${broken} self-test case(s)\n")
     return broken
   }
-  let scan = scanPrivateNames(root)
+  let scan = scanPrivateNames(root, scratch)
   for h of scan.hits {
     eprint("docs: FAIL ${h} names a private repository, host or tool\n")
   }
   let low = 0
-  if (scan.files < minScannedFiles) {
-    eprint("docs: FAILED — private-name scan read ${scan.files} file(s), under the floor of ${minScannedFiles}\n")
+  if (scan.files < minScannedFiles || scan.prose < minProseFiles) {
+    eprint("docs: FAILED — private-name scan read ${scan.files} file(s) (${scan.prose} prose), under the floors of ${minScannedFiles} (${minProseFiles})\n")
     low = 1
   }
   if (len(scan.hits) == 0 && low == 0) {
-    print("docs: private-name scan ok — ${scan.files} file(s) read\n")
+    print("docs: private-name scan ok — ${scan.files} file(s) read, ${scan.prose} of them public prose\n")
   }
   return len(scan.hits) + low
 }

@@ -236,7 +236,7 @@ atomicSignature() { # <objfile>
 # structurally smaller — one `xchg` per store there (two, `mov`+`mfence`,
 # before #5317) against one `stlr` on aarch64, and there are fewer RMW/CAS
 # sites overall — and
-# measured independently on hl-master at 126 (#3110); 100 is the same margin
+# measured independently on a native x86_64 host at 126 (#3110); 100 is the same margin
 # in spirit. #5317 added the `xchg` store form and with it the `AtomicRmwXchg`
 # sites this arm never saw, so the real corpus only grew (192 sites in
 # libbitrt-x86_64-linux.a on the tree build against 160 before); the floor is

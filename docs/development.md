@@ -796,8 +796,8 @@ as a planned interface, not a shipped one.
     stdout, stderr and exit code from both. It depends on the generator above.
   - **`test-fuzz-xtarget`** will compile each
     generated program for aarch64 and for x86_64, run both, and require the
-    two runs to agree. It is designed to print `SKIP: x86-64 host unreachable`
-    and exit 0 when the remote box is down, so a dead remote never reddens
+    two runs to agree. It is designed to print `SKIP: no x86_64 host reachable`
+    and exit 0 when `scripts/x64host.sh` resolves no remote box or it is down, so a dead remote never reddens
     the gate. It also depends on the generator above.
   - The three modes above wire in as `test-fuzz-*` steps into `./make test`
     once they land.

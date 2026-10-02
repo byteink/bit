@@ -9,7 +9,7 @@
 # target at each tick, `filtercalltree -invertCallTree` re-roots that tree at
 # the leaf frame, and the tool below sums each leaf's counts across however
 # many distinct call paths reached it. Both ship with macOS; nothing is
-# installed. Linux (mustafa-desktop-wsl, hl-master): `perf record` (no -g --
+# installed. Linux (a WSL box, a native x86_64 host): `perf record` (no -g --
 # see below) + `perf report`, if `perf` is on PATH; otherwise this prints one
 # line naming that and exits 2, which is a stated result, not a silent skip.
 #
@@ -227,7 +227,7 @@ else
   # report` sorted purely by symbol gives self-time directly with no
   # inversion step needed (unlike sample(1), which always walks the full
   # stack). This branch has not been exercised end to end: `perf` is absent
-  # on both mustafa-desktop-wsl and hl-master as of 2026-09-05 (`command -v
+  # on both a WSL box and a native x86_64 host as of 2026-09-05 (`command -v
   # perf` rc=1 on both, checked over ssh), so only the "perf missing" branch
   # above has been run against real hardware.
   set +e
