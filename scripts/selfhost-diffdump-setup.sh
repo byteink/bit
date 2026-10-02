@@ -86,6 +86,12 @@ diffdump_setup() {
   # #6435, together with constStringFoldEnabled (compiler/optparams.bit).
   export BIT_CONST_STRING_FOLD=0
 
+  # #6476's join-param box reuse is on by default in the tree and absent from
+  # the pinned oracle, so the tree is pinned to the oracle's behaviour here.
+  # The oracle ignores the variable. Delete this line at the repin that carries
+  # #6476, together with strBoxJoinEnabled (compiler/optparams.bit).
+  export BIT_STRBOX_JOIN=0
+
   # #6000: IFACE_SIG, BCE_JOIN, JSON_APPEND, and (since #6192) the #5990
   # static-const closure-cell lowering are all gone as flags -- the pinned
   # ORACLE (>= 0.31.0, which carries #6000) already emits every one of them
