@@ -184,7 +184,7 @@ compile-time panic (added after the bug shipped), caught by the existing
 build-failure branch below independent of anything in this section.
 
 x86-64 gets the SAME narrowed invariant now, verified on real
-x86_64-linux hardware (hl-master), not guessed. x86-64's TSO model has no
+x86_64-linux hardware (the x86-64 measurement host), not guessed. x86-64's TSO model has no
 single per-instruction acquire/release mnemonic the way aarch64's
 `ldar`/`stlr` do, so the signal is structurally different, found by
 disassembling all 23 `runtime/**` archive modules built by the pinned
@@ -228,7 +228,7 @@ v0.1.10 bug, following the same precedent as the aarch64 narrowing above.
 `xEmitAtomicStore`'s `xMovStore(cx.buf, xMemB(base, 0), val, w.bytes)`
 mutated to hardcode `8` (always emit a 64-bit store regardless of the
 pointee's declared width), rebuilt, and compared against the pinned oracle
-on hl-master (real x86_64 hardware):
+on the x86-64 measurement host (real x86_64 hardware):
 
 ```
   plain instruction COUNT:  0/23 modules differ  (bug NOT caught)
