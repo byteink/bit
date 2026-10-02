@@ -13,22 +13,22 @@ cloud bucket in production.
 ```json
 {
   "dependencies": {
-    "s3": "bitlang.org/pkg/s3@v0.1.0"
+    "s3": "bitlang.org/pkg/s3@v0.2.0"
   }
 }
 ```
 
 ## Uploading and reading a cover image
 
-`Config` names one bucket and one credential; `newClient` builds a `Client`
+`Config` names one bucket and one credential; `Client(config)` is the client
 against it. `put` sends the whole object in one request - the simplest
 thing that works for a cover image, which is a few hundred KB, not a video.
 
 ```bit
-import { Client, Config, list, newClient, presignGet, presignPut, UploadedPart } from "s3"
+import { Client, Config, list, presignGet, presignPut, UploadedPart } from "s3"
 
 fn main(): ()! {
-  let client = newClient(
+  let client = Client(
     Config{
       endpoint = "http://127.0.0.1:9000",
       region = "us-east-1",
