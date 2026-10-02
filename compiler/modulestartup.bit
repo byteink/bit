@@ -1,0 +1,400 @@
+// Traced module state, the checker half (#6479, epic #6477; owner ruling on
+// #6466). A module-level `let`/`const` outside `runtime/` may hold any type and
+// take any initializer. An initializer that cannot fold to a constant is MARKED
+// here, in `Checker.startupInit` (check.bit), for the startup pass of #6480.
+// Until that pass and the collector's root table (#6481) exist,
+// `refuseUnloweredModuleState` turns every such cell into a build-time
+// "cannot lower" error, so nothing miscompiles and nothing crashes.
+
+// E0185: a module `const` is set once, at startup or at compile time, and can
+// never be assigned. Its own code, not E0062 (resolve.bit): E0062 names a
+// function-local `const` and a write THROUGH a const table, and is blind to an
+// imported const, a namespace member and `++`/`--`, which this covers.
+const ecModuleConstAssign = 185
+
+// True iff `dir` is, or sits under, the compiler tree's `runtime/` directory:
+// an ancestor named `runtime` whose own parent also holds `stdlib/`. The
+// sibling test keeps `stdlib/runtime` (a hosted package) and a user project
+// that happens to live under some `runtime/` folder out of it. Bounded by the
+// path length: each step strips one component.
+fn isRuntimeModuleDir(dir: string): bool {
+  let a = dir
+  let steps = 0
+  while (steps <= len(dir)) {
+    let up = pathDir(a)
+    if (pathBase(a) == "runtime" && fsIsDir("${up}/stdlib")) {
+      return true
+    }
+    if (up == a) {
+      return false
+    }
+    a = up
+    steps = steps + 1
+  }
+  return false
+}
+
+// The `LetDecl` node holding `binding`, or 0. A module `let` is a direct child
+// of the tree root, optionally under `export`; bounded by the top-level count.
+fn vLetDeclOf(c: Checker, binding: int): int {
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let inner = d
+    if (getNode(c.tree, inner).tag == Tag.Export) {
+      inner = kidsOf(c.tree, inner)[0]
+    }
+    if (getNode(c.tree, inner).tag != Tag.LetDecl) {
+      continue
+    }
+    for b of kidsOf(c.tree, inner) {
+      if (b == binding) {
+        return inner
+      }
+    }
+  }
+  return 0
+}
+
+// Why `binding`'s cell keeps SPEC §11.11's strict rules (untraced type,
+// constant initializer), as the clause of the diagnostic, or "" when it takes
+// any type. Two cells are strict: any cell of a `runtime/` module, which cannot
+// be traced by the collector it implements, and an `@threadlocal` cell, which
+// the collector's root table does not cover (storage 1, see lowerglobal.bit).
+fn vStrictStateWhy(c: Checker, binding: int): string {
+  if (c.runtimeModule) {
+    return "at module scope in a runtime/ module"
+  }
+  let decl = vLetDeclOf(c, binding)
+  if (decl != 0 && getNode(c.tree, decl).main == 1) {
+    return "in a per-thread '@threadlocal' cell"
+  }
+  return ""
+}
+
+// A non-strict module `let` with an initializer. A constant that fits a static
+// byte image stays one; every other initializer (a call, a composite literal,
+// a traced type, an array) runs at startup, so the binding is marked.
+// An initializer whose constant value overflows i64 is still an error.
+fn vModuleStateInit(c: Checker, binding: int, ty: int, init: int) {
+  let cv = vConstEval(c, init, 0)
+  if (cv.overflow) {
+    vReportConstOverflow(c, init)
+    return
+  }
+  let isArray = c.ctx.types[ty].kind == TypeKind.Array
+  if (!cv.ok || isArray || !vUntracedType(c, ty, 0)) {
+    vMarkStartupInit(c, binding, init)
+  }
+}
+
+// Marks `binding` for the startup pass and runs the function-body validators
+// over its initializer: no function walk reaches a module-level expression, so
+// without this `Config{ nope = 1 }` or a bad argument count would be accepted
+// silently. The initializer runs inside the startup pass, which stops the
+// program on a failure, so `?` is legal in it (`error` is the sentinel
+// fallible type; `fail` cannot appear in an expression).
+fn vMarkStartupInit(c: Checker, binding: int, init: int) {
+  c.startupInit[binding] = true
+  let before = len(c.diags.list)
+  vStmt(
+    c,
+    VCtx{ result = c.ctx.voidId, brk = 0, loop = 0, fallibleTy = c.ctx.errorId, naked = false },
+    init,
+  )
+  vDropRepeatedDiags(c, before)
+}
+
+// Drops every diagnostic from `from` on that repeats one reported before it
+// (same code, span and message). The type nodes of a module binding were
+// already swept by checkModule's pre-pass 5 (`vTypeNodes`), and the body
+// validators sweep them again, so a bad type inside an initializer would
+// otherwise print twice; running the body walk first is not an option, it
+// would reorder them (§14.8).
+fn vDropRepeatedDiags(c: Checker, from: int) {
+  let kept = []Diagnostic(0)
+  let i = 0
+  while (i < len(c.diags.list)) {
+    if (i < from || !vSeenBefore(c, i, from)) {
+      kept = append(kept, c.diags.list[i])
+    } else if (c.diags.list[i].severity == 0) {
+      c.diags.errorCount = c.diags.errorCount - 1
+    }
+    i = i + 1
+  }
+  c.diags.list = kept
+}
+
+// Does `list[i]` repeat an earlier entry of `list[0:from]`?
+fn vSeenBefore(c: Checker, i: int, from: int): bool {
+  let d = c.diags.list[i]
+  let j = 0
+  while (j < from) {
+    let e = c.diags.list[j]
+    if (e.code == d.code &&
+      e.span.file == d.span.file &&
+      e.span.start == d.span.start &&
+      e.span.end == d.span.end &&
+      e.message == d.message) {
+      return true
+    }
+    j = j + 1
+  }
+  return false
+}
+
+// Does module cell `binding` need machinery that is not lowered yet: a startup
+// initializer, or a traced `let` that the collector must scan (#6480, #6481)?
+// Lowering must refuse it; a static byte image would be wrong for it.
+fn vNeedsStartup(c: Checker, binding: int, isLet: bool): bool {
+  let (marked, ok) = c.startupInit[binding]
+  if (ok && marked) {
+    return true
+  }
+  if (!isLet) {
+    return false
+  }
+  let pat = kidsOf(c.tree, binding)[0]
+  let ty = c.nodeTypes[pat]
+  return ty != 0 && !vUntracedType(c, ty, 0)
+}
+
+// Pass A0 guard: one E0092 per module cell that needs the startup pass or the
+// root table, pointing at the declaration. The cell is NOT registered as a
+// plain static, so no program built from it can run.
+fn refuseUnloweredModuleState(mods: []Checker, lowerer: Lowerer) {
+  for c of mods {
+    if (c.runtimeModule) {
+      continue
+    }
+    let i = 1
+    while (i < len(c.tree.nodes)) {
+      let tag = getNode(c.tree, i).tag
+      if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+        refuseUnloweredBindings(c, lowerer, i, tag == Tag.LetDecl)
+      }
+      i = i + 1
+    }
+  }
+}
+
+fn refuseUnloweredBindings(c: Checker, lowerer: Lowerer, decl: int, isLet: bool) {
+  for b of kidsOf(c.tree, decl) {
+    let pat = kidsOf(c.tree, b)[0]
+    if (getNode(c.tree, pat).tag != Tag.Ident) {
+      continue
+    }
+    // A function-local `let` is an SSA value, never a cell.
+    if (isLet && !isModuleStateBinding(c, b)) {
+      continue
+    }
+    if (!vNeedsStartup(c, b, isLet)) {
+      continue
+    }
+    let nm = vIdentText(c, pat)
+    lowerer.stubbed = append(
+      lowerer.stubbed,
+      StubbedFn{
+        name = nm, span = remapModuleSpan(c, getNode(c.tree, pat).span),
+        reason = "module-level '${nm}': a module cell that holds a traced type or runs a non-constant initializer at startup is checked but not lowered yet (#6480, #6481)",
+        note = "", noteSite = pointSpan(0, 0),
+      },
+    )
+  }
+}
+
+// The module `const` a node names, as its declaring name, or "": a bare name
+// declared here or imported, and a namespace member `ns.K`. A symbol-table
+// lookup only, so it needs the resolver's tables (empty in the dump entry
+// points, where it finds nothing).
+fn vModuleConstName(c: Checker, t: int): string {
+  let tag = getNode(c.tree, t).tag
+  if (tag == Tag.Member) {
+    return vNamespaceConstName(c, t)
+  }
+  if (tag == Tag.Ident && vSymIsModuleConst(c, vNodeSym(c, t))) {
+    return vIdentText(c, t)
+  }
+  return ""
+}
+
+// `ns.K`, where `ns` is a namespace import and `K` an exported module const of
+// the module it names; the dotted spelling, or "".
+fn vNamespaceConstName(c: Checker, t: int): string {
+  let kids = kidsOf(c.tree, t)
+  if (getNode(c.tree, kids[0]).tag != Tag.Ident) {
+    return ""
+  }
+  let ns = vNodeSym(c, kids[0])
+  if (ns == 0 || c.symbols[ns].kind != SymbolKind.ImportNamespace) {
+    return ""
+  }
+  let member = vIdentText(c, kids[1])
+  if (vExportsConst(c, c.symbols[ns].namespaceModule, member)) {
+    return "${vIdentText(c, kids[0])}.${member}"
+  }
+  return ""
+}
+
+// Does module `owner` export a module `const` called `name`?
+fn vExportsConst(c: Checker, owner: int, name: string): bool {
+  if (owner < 0 || owner >= len(c.mods)) {
+    return false
+  }
+  for s of c.mods[owner].symbols {
+    if (s.name == name && s.exported && s.kind == SymbolKind.ConstBinding && s.moduleScoped) {
+      return true
+    }
+  }
+  return false
+}
+
+// The symbol id the resolver bound to `node`, or 0.
+fn vNodeSym(c: Checker, node: int): int {
+  if (node < 0 || node >= len(c.nodeSymbols)) {
+    return 0
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return 0
+  }
+  return sid
+}
+
+// Is symbol `sid` a module-scope `const`, declared here or imported through an
+// `import { K }`?
+fn vSymIsModuleConst(c: Checker, sid: int): bool {
+  if (sid == 0) {
+    return false
+  }
+  let s = c.symbols[sid]
+  if (s.kind == SymbolKind.ConstBinding) {
+    return s.moduleScoped
+  }
+  if (s.kind != SymbolKind.ImportItem) {
+    return false
+  }
+  let m = s.importedFromModule
+  let o = s.importedFromSymbol
+  if (m < 0 || m >= len(c.mods) || o < 0 || o >= len(c.mods[m].symbols)) {
+    return false
+  }
+  let origin = c.mods[m].symbols[o]
+  return origin.kind == SymbolKind.ConstBinding && origin.moduleScoped
+}
+
+fn vModuleConstTarget(c: Checker, t: int) {
+  if (t == 0) {
+    return
+  }
+  // `(a, b) = ...` parses its left side as a tuple PATTERN, not expressions.
+  if (getNode(c.tree, t).tag == Tag.TuplePat) {
+    for e of kidsOf(c.tree, t) {
+      vModuleConstTarget(c, e)
+    }
+    return
+  }
+  let nm = vModuleConstName(c, t)
+  if (nm == "") {
+    return
+  }
+  report(
+    c.diags, ecModuleConstAssign, vSpan(c, t),
+    "cannot assign to module constant '${nm}'",
+    "a module 'const' is set once, when the program starts or at compile time; declare it 'let' to reassign it (§11.11)",
+  )
+}
+
+// E0185 over every target an assignment, compound assignment or `++`/`--` can
+// write: the same three node shapes `vAssignTargetString` walks.
+fn vAssignTargetModuleConst(c: Checker, node: int) {
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.IncStmt || t == Tag.DecStmt) {
+    vModuleConstTarget(c, kidsOf(c.tree, node)[0])
+    return
+  }
+  for target of kidsOf(c.tree, kidsOf(c.tree, node)[0]) {
+    vModuleConstTarget(c, target)
+  }
+}
+
+// Is the module `const` named `name` in `owner` marked for the startup pass?
+fn vStartupConstNamed(owner: Checker, name: string): bool {
+  for d of kidsOf(owner.tree, owner.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let inner = d
+    if (getNode(owner.tree, inner).tag == Tag.Export) {
+      inner = kidsOf(owner.tree, inner)[0]
+    }
+    if (getNode(owner.tree, inner).tag != Tag.ConstDecl) {
+      continue
+    }
+    for b of kidsOf(owner.tree, inner) {
+      let pat = kidsOf(owner.tree, b)[0]
+      let (marked, ok) = owner.startupInit[b]
+      if (ok && marked && vIdentText(owner, pat) == name) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// The hint for a compile-time-constant context (an array length) whose
+// operand is a bare module `const` that is set at startup, or "". Such a const
+// holds a value only the running program can build, so no constant expression
+// may use it (#6479); the generic message would not say why a `const` is not
+// constant.
+fn vStartupConstHint(c: Checker, node: int): string {
+  if (getNode(c.tree, node).tag != Tag.Ident) {
+    return ""
+  }
+  let sid = vNodeSym(c, node)
+  if (!vSymIsModuleConst(c, sid)) {
+    return ""
+  }
+  let s = c.symbols[sid]
+  let owner = c
+  let name = vIdentText(c, node)
+  if (s.kind == SymbolKind.ImportItem) {
+    owner = c.mods[s.importedFromModule]
+    name = owner.symbols[s.importedFromSymbol].name
+  }
+  if (!vStartupConstNamed(owner, name)) {
+    return ""
+  }
+  return "'${name}' is a module const initialized at startup, so its value does not exist at compile time (§11.11); use a literal or a const folded from literals"
+}
+
+// E0064 for an array length that does not fold: with the startup hint when the
+// operand is a module const set at startup, bare otherwise.
+fn vArrayLengthNotConst(c: Checker, node: int) {
+  let hint = vStartupConstHint(c, node)
+  if (hint == "") {
+    reportNoHint(
+      c.diags, ecNonConstantExpr, vSpan(c, node),
+      "array length must be a compile-time constant integer",
+    )
+    return
+  }
+  report(
+    c.diags, ecNonConstantExpr, vSpan(c, node),
+    "array length must be a compile-time constant integer",
+    hint,
+  )
+}
+
+// `moduleGlobalImage` (lowerglobal.bit) for a module `let`, except that a cell
+// `refuseUnloweredModuleState` already refuses gets a zeroed placeholder: its
+// references keep lowering, so that one error is the only one the build prints
+// for it. The build fails either way; the image is never emitted.
+fn moduleGlobalImageOrStartup(c: Checker, binding: int, ty: int): GlobalImage {
+  let img = moduleGlobalImage(c, ty, kidsOf(c.tree, binding)[2])
+  if (!img.ok && vNeedsStartup(c, binding, true)) {
+    return GlobalImage{ ok = true, bytes = []int(moduleGlobalSize(c.ctx, ty)) }
+  }
+  return img
+}
