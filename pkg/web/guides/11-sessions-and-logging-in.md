@@ -51,7 +51,7 @@ username, the stored Argon2id hash and whatever you want to remember about
 the user afterward. That is a `Lookup`:
 
 ```bit
-import { Lookup, LookupResult, Strategy, newPasswordStrategy } from "auth"
+import { Lookup, LookupResult, Strategy, PasswordStrategy } from "auth"
 import { Db } from "orm"
 import { Json, JsonEntry } from "std/json"
 
@@ -87,7 +87,7 @@ fn userLookup(db: Db): Lookup {
 }
 ```
 
-`newPasswordStrategy(userLookup(db))` wraps that into a `Strategy`: given a
+`PasswordStrategy(userLookup(db))` wraps that into a `Strategy`: given a
 request, it reads a `{"username": ..., "password": ...}` JSON body, calls
 your lookup, and verifies the password against the stored Argon2id hash with
 the same algorithm [chapter 23](10-registering-users-and-hashing-passwords.md)
@@ -193,7 +193,7 @@ fn showMe(c: Ctx, db: Db): Res! {
 }
 
 export fn mountAuth(app: App, db: Db) {
-  let strategy = newPasswordStrategy(userLookup(db))
+  let strategy = PasswordStrategy(userLookup(db))
   app.post("/auth/login", (c) => login(c, strategy))
   app.post("/auth/logout", (c) => logout(c))
   app.get("/me", (c) => showMe(c, db))

@@ -18,7 +18,7 @@ import { App, Config, MemoryStore, unauthorized } from "web"
 import {
   Identity, Lookup, LookupResult, OidcStrategy, Strategy,
   beginAuthorization, currentIdentity, googleStrategy, handleCallback,
-  newPasswordStrategy, requireAuth, withScopes,
+  PasswordStrategy, requireAuth, withScopes,
 } from "auth"
 import { TlsConfig } from "std/tls"
 import { fromPem } from "std/crypto"
@@ -54,7 +54,7 @@ fn build(rootsPem: string): App! {
   let oidc = google(rootsPem)?
 
   let login = app.group("/login")
-  login.use(requireAuth([]Strategy{ newPasswordStrategy(lookup) }))
+  login.use(requireAuth([]Strategy{ PasswordStrategy(lookup) }))
   login.post("/", (c) => c.text("welcome"))
 
   app.get("/auth/google", (c) => beginAuthorization(oidc, c))

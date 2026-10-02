@@ -37,8 +37,8 @@ function: `beginAuthorization` and `handleCallback` are the two calls
 ```bit
 import { App, Config, MemoryStore } from "web"
 import {
-  OidcConfig, OidcStrategy, TokenFetch,
-  beginAuthorization, handleCallback, newJwksCacheFromJwks,
+  JwksCache, JwksSource, OidcConfig, OidcSource, OidcStrategy, TokenFetch,
+  beginAuthorization, handleCallback,
 } from "auth"
 import { Request } from "std/http"
 import { emptyTrustStore, TlsConfig } from "std/tls"
@@ -63,9 +63,9 @@ fn fakeTokenFetch(box: TokenBox): TokenFetch {
   return f
 }
 
-// Everything a real `discover()`/`newJwksCache()` would have fetched over
+// Everything a real `discover()`/`JwksCache(...)` would have fetched over
 // HTTPS, written by hand instead: `OidcConfig`'s fields are already public
-// data, and `newJwksCacheFromJwks` wraps an already-parsed `Jwks` - built
+// data, and `JwksSource.Parsed` wraps an already-parsed `Jwks` - built
 // with `std/jwt`'s own `parseJwks` - with no HTTP call at all, not even to
 // a local server. `tokenFetch` is the one field production code always
 // leaves `nil`.
@@ -83,15 +83,14 @@ fn buildFakeStrategy(box: TokenBox): OidcStrategy! {
     encodeBase64Url(fakeSecret()) +
     "\"}]}"
   let jwks = parseJwks(jwksDoc)?
-  return OidcStrategy{
-    config = config,
-    clientId = fakeClientId,
-    clientSecret = "test-client-secret",
-    redirectUri = "https://app.example.com/auth/google/callback",
-    jwks = newJwksCacheFromJwks(config.jwksUri, tls, jwks, nil),
-    scopes = ["openid"],
+  let cache = JwksCache(config.jwksUri, tls, JwksSource.Parsed(jwks))?
+  return OidcStrategy(
+    OidcSource.Given(config, cache),
+    fakeClientId,
+    "test-client-secret",
+    "https://app.example.com/auth/google/callback",
     tokenFetch = fakeTokenFetch(box),
-  }
+  )?
 }
 
 // A signed ID token naming `nonce` - `std/jwt`'s own `sign` never writes a
@@ -188,8 +187,8 @@ with the wrong issuer or an expired `exp` fails exactly as a real one would.
 Setting `tokenFetch` or building a `JwksCache` from a hand-parsed `Jwks`
 skips no check; it only decides where the bytes came from.
 
-`newJwksCacheFromJwks` still enforces the rate-limited refetch-on-miss that
-`newJwksCache` does (a `kid` your fake JWKS never listed refetches through
+A `JwksCache` built from `JwksSource.Parsed` still enforces the rate-limited
+refetch-on-miss that one built from `JwksSource.Remote` does (a `kid` your fake JWKS never listed refetches through
 whatever `fetch` you pass it, `nil` included) - a fake key set is not
 exempt from the cooldown that protects a real JWKS endpoint.
 
