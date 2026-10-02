@@ -23,8 +23,8 @@ green thread.
 
 ```bit
 import {
-  connect, accept, Conn, Transport, defaultConfig, Request, Response, Stream, newRequest,
-  newResponse, errorRefusedStream,
+  connect, accept, Conn, Transport, defaultConfig, Request, Response, Stream,
+  errorRefusedStream,
 } from "std/http2"
 
 // Answer every request with its path echoed back - except "/elsewhere", which is
@@ -32,9 +32,9 @@ import {
 fn echo(req: Request, s: Stream): Response {
   if (req.path == "/elsewhere") {
     s.reset(errorRefusedStream)
-    return newResponse(0, []byte(0))
+    return Response(0, []byte(0))
   }
-  return newResponse(200, []byte("you asked for " + req.path))
+  return Response(200, []byte("you asked for " + req.path))
 }
 
 // `client` and `server` are the two ends of one byte stream. Serve one end and
@@ -42,7 +42,7 @@ fn echo(req: Request, s: Stream): Response {
 fn demo(client: Transport, server: Transport): Response! {
   spawn serveOn(server)
   let conn = connect(client, defaultConfig(), 0)?
-  return conn.roundTrip(newRequest("GET", "example.com", "/"))?
+  return conn.roundTrip(Request("GET", "example.com", "/"))?
 }
 
 // How many of `n` requests to put on the wire at once. The server's opening
@@ -82,7 +82,7 @@ uploads larger than 32 MiB raises `maxBodyBytes`; a server whose handlers want t
 body as it arrives, rather than complete, sets `streamBodies`:
 
 ```bit
-import { Config, defaultConfig, Request, Response, Stream, newResponse } from "std/http2"
+import { Config, defaultConfig, Request, Response, Stream } from "std/http2"
 
 // Count a request body without ever holding it whole. `streamBodies` calls the
 // handler as soon as the headers are in, with `req.body` empty; each `Stream.read`
@@ -92,11 +92,11 @@ fn count(_req: Request, s: Stream): Response {
   let n = 0
   while (true) {
     let c = s.read() catch e {
-      return newResponse(500, []byte(e.message()))
+      return Response(500, []byte(e.message()))
     }
     n = n + len(c.data)
     if (c.eof) {
-      return newResponse(200, []byte("${n} bytes"))
+      return Response(200, []byte("${n} bytes"))
     }
   }
 }
@@ -149,20 +149,31 @@ One header field: a `name`, a `value`, and a `sensitive` flag. Set `sensitive`
 on a field such as a cookie or a bearer token to force it to be sent without
 ever entering the dynamic table.
 
-### `newEncoder(): Encoder`
-
-An encoder with the default 4096-byte dynamic table and Huffman coding on.
-
-### `newEncoderConfig(maxTableSize: int, huffman: bool): Encoder`
-
-An encoder with an explicit table size and Huffman on/off, for matching a
-table size the peer negotiated.
-
-### `Encoder`
+### `Encoder(maxTableSize: int = 4096, huffman: bool = true)`
 
 The stateful HPACK encoder. It picks the smallest representation for each
 field and keeps its dynamic table current as it encodes. Reuse one across a
 connection.
+
+`Encoder()` has the default 4096-byte dynamic table and Huffman coding on.
+`maxTableSize` and `huffman` match a table size the peer negotiated or switch
+Huffman off:
+
+```bit
+import { Encoder, Decoder, HeaderField } from "std/http2"
+
+// A connection whose peer advertised a 1 KiB header table and asked for plain
+// string literals. The decoder's limit is the table size it advertised.
+fn roundTrip(fields: []HeaderField): []HeaderField! {
+  let enc = Encoder(maxTableSize = 1024, huffman = false)
+  let dec = Decoder(maxTableSize = 1024)
+  return dec.decode(enc.encode(fields))?
+}
+
+fn defaults(fields: []HeaderField): []byte {
+  return Encoder().encode(fields)
+}
+```
 
 ### `Encoder.encode(fields: []HeaderField): []byte`
 
@@ -186,20 +197,14 @@ The number of entries currently in the encoder's dynamic table.
 The dynamic-table entry at index `i`, newest first. Fails if `i` is out of
 range.
 
-### `newDecoder(): Decoder`
-
-A decoder with the default 4096-byte table limit.
-
-### `newDecoderConfig(maxTableSize: int): Decoder`
-
-A decoder with an explicit table-size limit, matching what was advertised to
-the peer.
-
-### `Decoder`
+### `Decoder(maxTableSize: int = 4096)`
 
 The stateful HPACK decoder. It keeps its dynamic table current as it decodes
 and rejects a peer size update above its limit. Reuse one across a
 connection.
+
+`Decoder()` has the default 4096-byte table limit. `Decoder(maxTableSize = n)`
+sets the limit to what was advertised to the peer.
 
 ### `Decoder.decode(block: []byte): []HeaderField!`
 
@@ -583,15 +588,24 @@ them to work over a live connection: it runs the handshake, tracks streams,
 paces bodies against flow control, and multiplexes many requests over one
 transport.
 
-### `Transport`
+### `Transport(read: (int) => []byte, write: ([]byte) => ()!, shutdown: () => ())`
 
 A bidirectional byte stream: `read`, `write`, and `shutdown` function values.
 Any stream, such as a `std/net` connection or an in-memory pipe, can satisfy
 this by supplying the three functions.
 
-### `newTransport(read: (int) => []byte, write: ([]byte) => ()!, shutdown: () => ()): Transport`
+`Transport(read, write, shutdown)` bundles the three functions:
 
-Bundles the three functions into a `Transport`.
+```bit
+import { Transport } from "std/http2"
+
+// A transport that never delivers a byte: reads return end of stream and
+// writes are dropped. Useful for exercising a `Conn` that must not touch the
+// network.
+fn silent(): Transport {
+  return Transport((n) => []byte(0), (b) => {}, () => {})
+}
+```
 
 ### `Config`
 
@@ -605,23 +619,17 @@ limits" above.
 A `Config` with the RFC default limits: see "Tuning limits" above for the
 exact numbers.
 
-### `Request`
+### `Request(method: string, authority: string, path: string)`
 
 An HTTP/2 request: `method`, `scheme`, `authority`, `path`, `headers`, and
-`body`.
+`body`. The constructor makes one with the `https` scheme, no extra headers,
+and no body; set `headers` and `body` afterwards when the request needs them.
 
-### `Response`
+### `Response(status: int, body: []byte)`
 
-An HTTP/2 response: `status`, `headers`, and `body`. A `status` of 0 returned
-from a `serve` handler aborts the stream instead of sending a response.
-
-### `newRequest(method: string, authority: string, path: string): Request`
-
-A request with the `https` scheme, no extra headers, and no body.
-
-### `newResponse(status: int, body: []byte): Response`
-
-A response with a status and a body and no extra headers.
+An HTTP/2 response: `status`, `headers`, and `body`. The constructor makes one
+with a status and a body and no extra headers. A `status` of 0 returned from a
+`serve` handler aborts the stream instead of sending a response.
 
 ### `getHeader(headers: []HeaderField, name: string): string`
 

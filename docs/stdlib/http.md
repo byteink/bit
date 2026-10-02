@@ -132,10 +132,10 @@ request. It also remembers which servers have advertised HTTP/3, so a second
 request to the same host can upgrade automatically.
 
 ```bit
-import { newClient, Client, Response } from "std/http"
+import { Client, Response } from "std/http"
 
 fn authedClient(token: string): Client! {
-  let c = newClient()
+  let c = Client()
   c.setHeader("Authorization", "Bearer ${token}")?
   return c
 }
@@ -145,10 +145,20 @@ fn fetchWith(c: Client, url: string): Response! {
 }
 ```
 
-`newClient()` is secure by default (verification on, system roots, HTTP/2
-offered). `newClientTls(config: TlsConfig)` takes an explicit `std/tls`
-config for the same reasons `getTls` does. `Client.request` /
-`requestWith` / `get` / `post` / `*Timeout` mirror the package-level
+`Client()` is secure by default (verification on, system roots, HTTP/2
+offered). `Client(tls = config)` takes an explicit `std/tls` config for the
+same reasons `getTls` does, such as Inkwell's staging API behind a private CA:
+
+```bit
+import { Client } from "std/http"
+import { TlsConfig } from "std/tls"
+
+fn stagingClient(pinned: TlsConfig): Client {
+  return Client(tls = pinned)
+}
+```
+
+`Client.request` / `requestWith` / `get` / `post` / `*Timeout` mirror the package-level
 functions; `Client.setHeader` sets a default sent with every call from this
 client, and `Client.setMaxBodyBytes(n)` raises or lowers the 32 MiB response
 cap - there is no value meaning unlimited, so `0` refuses every body, the
@@ -165,10 +175,10 @@ caps how many connections one host may have open at once, and `PoolLimits`
 names them with Go's defaults:
 
 ```bit
-import { newClient, PoolLimits } from "std/http"
+import { Client, PoolLimits } from "std/http"
 
 fn pullDrafts(host: string, ids: []string): int! {
-  let c = newClient()
+  let c = Client()
   c.setPool(PoolLimits{ maxIdlePerHost = 4, idleTimeoutMs = 30000, maxConnsPerHost = 8 })?
   let bytes = 0
   for id of ids {
@@ -226,7 +236,7 @@ every request becomes a stream on it: forty concurrent `get` calls make one
 TCP connect and one TLS handshake.
 
 ```bit
-import { newClient, Client, PoolLimits } from "std/http"
+import { Client, PoolLimits } from "std/http"
 
 fn fetchDraft(c: Client, host: string, id: string, out: chan<int>) {
   let res = c.get("https://${host}/drafts/${id}") catch _ {
@@ -237,7 +247,7 @@ fn fetchDraft(c: Client, host: string, id: string, out: chan<int>) {
 }
 
 fn exportDrafts(host: string, ids: []string): int! {
-  let c = newClient()
+  let c = Client()
   c.setPool(PoolLimits{ maxH2Streams = 20 })?
   let out = chan<int>(len(ids))
   for id of ids {
@@ -275,10 +285,10 @@ the token off the request the moment the next hop leaves the origin it was
 meant for.
 
 ```bit
-import { newClient, Client, Redirects, RedirectAllow } from "std/http"
+import { Client, Redirects, RedirectAllow } from "std/http"
 
 fn inkwellClient(token: string): Client! {
-  let c = newClient()
+  let c = Client()
   c.setHeader("Authorization", "Bearer ${token}")?
   return c
 }
@@ -538,19 +548,14 @@ for `requestWithStreamingBody`; `""` marks the end.
 A function `(string) => ()!` that receives one chunk of a response body at a
 time for `getStreaming`, called repeatedly until the body is exhausted.
 
-### `Client`
+### `Client(tls: TlsConfig = ...)`
 
 An HTTP client that reuses its configuration and connections across calls,
 and remembers which servers have advertised HTTP/3.
 
-### `newClient(): Client`
-
-A `Client` that is secure by default: TLS verification on, system trust
-roots, HTTP/2 offered.
-
-### `newClientTls(config: TlsConfig): Client`
-
-A `Client` with an explicit TLS configuration for its `https://` calls.
+`Client()` is secure by default: TLS verification on, system trust roots,
+HTTP/2 offered. `Client(tls = config)` takes an explicit TLS configuration
+for its `https://` calls, such as a pinned CA or a fixed server name.
 
 ### `Client.get(url: string): Response!`
 
@@ -588,7 +593,7 @@ The bounds of a `Client`'s connections: `maxIdlePerHost: int`
 (2), `maxIdleTotal: int` (100), `idleTimeoutMs: int` (90000) and
 `maxH2Streams: int` (100), the most requests in flight on one shared HTTP/2
 connection, and `maxConnsPerHost: int` (0, unlimited), the most HTTP/1.1
-connections open at once to one host. Every field has a default, so `PoolLimits{}` is the configuration `newClient` uses.
+connections open at once to one host. Every field has a default, so `PoolLimits{}` is the configuration `Client()` uses.
 
 ### `Client.setPool(limits: PoolLimits): ()!`
 
@@ -868,14 +873,73 @@ As `serveHijackableTlsOn`, run in the background.
 The transport-agnostic read/write interface a hijacked connection speaks,
 whether it came from a plain or a TLS connection.
 
-### `newByteStream(c: Conn): byteStream`
+### `ByteStream(conn: Option<Conn> = None, tls: Option<TlsConn> = None): ByteStream!`
 
-Wraps a plain [`std/net`](net.md) connection you already hold as a
-`byteStream`.
+Wraps a connection you already hold as a `byteStream`, for code that has no
+`Exchange` to ask for one. `ByteStream(conn = Option.Some(c))?` takes a plain
+[`std/net`](net.md) connection and `ByteStream(tls = Option.Some(t))?` a
+`std/tls` one. Give exactly one: passing both, or neither, fails with an error
+instead of picking one for you.
 
-### `newTlsByteStream(c: TlsConn): byteStream`
+```bit
+import { ByteStream, byteStream } from "std/http"
+import { dial } from "std/net"
+import { TlsConn } from "std/tls"
 
-As `newByteStream`, for a TLS connection.
+fn ping(s: byteStream): string! {
+  s.writeStr("PING\r\n")?
+  return s.readUp(64)?
+}
+
+fn pingPlain(host: string, port: int): string! {
+  let s = ByteStream(conn = Option.Some(dial(host, port)?))?
+  defer s.shut()
+  return ping(s)?
+}
+
+fn pingTls(c: TlsConn): string! {
+  let s = ByteStream(tls = Option.Some(c))?
+  defer s.shut()
+  return ping(s)?
+}
+```
+
+### `ByteStream.readUp(n: int): string!`
+
+Reads up to `n` bytes, or returns `""` at end of stream. Bytes given back with
+`unread` come out first.
+
+### `ByteStream.writeStr(s: string): ()!`
+
+Writes all of `s` to the connection.
+
+### `ByteStream.writeBytes(b: []byte): ()!`
+
+As `writeStr`, for bytes you already hold, with no conversion to a string.
+
+### `ByteStream.shut()`
+
+Closes the connection.
+
+### `ByteStream.forceClose()`
+
+Interrupts a read parked on another green thread, which sees an orderly end of
+stream. Never blocks.
+
+### `ByteStream.peer(): string`
+
+The peer's IPv4 address in dotted form, or `""` when the connection cannot name
+one.
+
+### `ByteStream.unread(extra: string)`
+
+Puts `extra` back in front of whatever the stream returns next, for a reader
+that took more bytes than the message it was parsing.
+
+### `ByteStream.setIdleDeadline(deadlineNs: int)`
+
+Bounds the next read, and everything read to complete the message it starts, by
+an absolute monotonic deadline in nanoseconds. `0` clears it.
 
 ```bit
 import { Server, Exchange, Request, HijackOutcome, ok, serve, serveHijackableOn } from "std/http"

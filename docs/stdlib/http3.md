@@ -106,7 +106,7 @@ request/handler API over HTTP/1.1, HTTP/2, and HTTP/3 alike.
 
 ## QPACK
 
-`newEncoder`/`Encoder` and `newDecoder`/`Decoder` each own a dynamic table. Unlike
+`Encoder` and `Decoder` each own a dynamic table. Unlike
 HPACK, table growth is explicit: the encoder emits instructions on a separate
 encoder stream, and the decoder must apply them (`applyEncoderStream`) before it
 can decode a section that references the new entries.
@@ -115,17 +115,30 @@ can decode a section that references the new entries.
 
 One header field: a `name`, its `value`, and a `sensitive` flag. Set `sensitive` to force a never-index literal, so an authorization token or cookie is never copied into the dynamic table, where a compression side channel could recover it. A decoder sets it on any field it received that way.
 
-### `newEncoder(): Encoder`
-
-A fresh encoder with a 4096-byte dynamic table and Huffman string literals enabled.
-
-### `newEncoderConfig(capacity: int, huffman: bool): Encoder`
-
-An encoder with an explicit initial table `capacity` and `huffman` choice. Pass `capacity` 0 to start with no dynamic table, then raise it with `setCapacity`.
-
-### `Encoder`
+### `Encoder(capacity: int = 4096, huffman: bool = true)`
 
 A stateful QPACK encoder. It owns its dynamic table and tracks its outstanding field sections. Reuse one encoder per connection so its table tracks the peer decoder.
+
+`Encoder()` starts with a 4096-byte dynamic table and Huffman string literals enabled. `capacity` is the initial table capacity and `huffman` the string-literal choice. Pass `capacity = 0` to start with no dynamic table, then raise it with `setCapacity`:
+
+```bit
+import { Encoder, Decoder, HeaderField } from "std/http3"
+
+// An encoder that starts with no dynamic table and plain string literals, and
+// the decoder that will accept a table up to 4096 bytes when the encoder
+// raises it.
+fn startPlain(fields: []HeaderField, streamId: int): []HeaderField! {
+  let enc = Encoder(capacity = 0, huffman = false)
+  let dec = Decoder(limit = 4096)
+  dec.applyEncoderStream(enc.setCapacity(4096))?
+  let section = enc.encodeFieldSection(streamId, 0, fields)
+  return dec.decodeFieldSection(section)?
+}
+
+fn startDefault(fields: []HeaderField, streamId: int): []byte {
+  return Encoder().encodeFieldSection(streamId, 0, fields)
+}
+```
 
 ### `Encoder.setCapacity(capacity: int): []byte`
 
@@ -171,17 +184,11 @@ The current dynamic-table capacity in bytes.
 
 How many of this encoder's insertions the peer decoder has acknowledged.
 
-### `newDecoder(): Decoder`
-
-A fresh decoder with no dynamic table yet, willing to accept a capacity up to the 4096-byte default.
-
-### `newDecoderConfig(limit: int): Decoder`
-
-A decoder with an explicit capacity `limit`; a peer that tries to grow the table past it is rejected.
-
-### `Decoder`
+### `Decoder(limit: int = 4096)`
 
 A stateful QPACK decoder. It owns its dynamic table and enforces the capacity limit it advertised. Reuse one decoder per connection so its table tracks the peer encoder.
+
+`Decoder()` has no dynamic table yet and is willing to accept a capacity up to the 4096-byte default. `Decoder(limit = n)` sets that ceiling; a peer that tries to grow the table past it is rejected.
 
 ### `Decoder.applyEncoderStream(data: []byte): int!`
 
