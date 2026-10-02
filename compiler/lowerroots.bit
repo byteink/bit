@@ -1,0 +1,141 @@
+// The module-root table (#6481, epic #6477; owner ruling on #6466): which words
+// of a module `let` cell the collector must read as roots.
+//
+// A traced module cell lives in the data section, where no stack map, object
+// pointer map or task block names it, so the compiler lists its reference words
+// in one table and the entry function hands the table to the runtime
+// (`bit_rt_module_roots_register`, runtime/ABI.md §4.3; marked from
+// `stwScanModuleRoots`, runtime/stw/stwscan.bit).
+//
+// The table is an ordinary process-storage global, so every object writer
+// already emits it: the abs64 fixups of a static closure cell (`staticClosureAddr`,
+// lowerstaticconst.bit) are the same mechanism, and dyld rebases them under PIE.
+// Nothing here is Mach-O, ELF or PE specific, which is the point of reusing it.
+//
+// The runtime is built by the pinned stage0, which has no builtin that names a
+// compiler-defined data symbol, and a program built by stage0 links THIS tree's
+// runtime. So the program hands the table over by CALLING the runtime, never by
+// the runtime requiring a symbol the program must define.
+
+const moduleRootsSym: string = "__bit_module_roots"
+
+// Whether a module cell of type `ty` is one collector reference: the same answer
+// `fieldLayoutFor` gives a class field (a C-like enum is a bare tag, a raw `*T`
+// is never followed), narrowed by `vUntracedType`. A fixed array has none: E0072
+// refuses an array of reference-typed elements, so every `[N]U` cell is untraced.
+// Any other traced type is one handle word, so a cell lists at most one word.
+fn cellIsRef(c: Checker, ty: int): bool {
+  return !vUntracedType(c, ty, 0) && fieldLayoutFor(c.ctx, ty).isPtr
+}
+
+// The table's fixups for module `c`: one per traced, registered process-wide
+// cell, pointing at the cell's symbol. `firstWord` is the table word index of
+// the first fixup, 0-based after the count. Top-level declarations only: a local
+// `let` is a stack slot the stack scan already sees, and a `const` has a cell
+// only when its initializer runs at startup (`registerStartupConsts`).
+fn moduleRootRelocs(c: Checker, lowerer: Lowerer, firstWord: int): []IrGlobalReloc {
+  let out = []IrGlobalReloc(0)
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let decl = d
+    if (getNode(c.tree, decl).tag == Tag.Export) {
+      decl = kidsOf(c.tree, decl)[0]
+    }
+    let tag = getNode(c.tree, decl).tag
+    // `@threadlocal` (storage 1) cells are untraced by rule (`vStrictStateWhy`).
+    let isCell = (tag == Tag.LetDecl && getNode(c.tree, decl).main == 0) || tag == Tag.ConstDecl
+    if (!isCell) {
+      continue
+    }
+    for b of kidsOf(c.tree, decl) {
+      let sym = tracedCellSym(c, lowerer, b)
+      if (sym != "") {
+        out = append(
+          out,
+          IrGlobalReloc{ offset = 8 * (firstWord + len(out) + 1), symbol = sym, addend = 0 },
+        )
+      }
+    }
+  }
+  return out
+}
+
+// The symbol of binding `b`'s cell when it is a registered, traced module cell,
+// else "". A `const` that folds to a value has no cell, so it is never found.
+fn tracedCellSym(c: Checker, lowerer: Lowerer, b: int): string {
+  let bk = kidsOf(c.tree, b)
+  let pat = getNode(c.tree, bk[0])
+  if (pat.tag != Tag.Ident) {
+    return ""
+  }
+  let ty = c.nodeTypes[bk[0]]
+  let (sym, ok) = lowerer.globalSyms["${c.moduleId}\$${c.source[pat.span.start:pat.span.end]}"]
+  if (ty == 0 || !ok || !cellIsRef(c, ty)) {
+    return ""
+  }
+  return sym
+}
+
+// Pass A0'': registers the table as one process-storage global, `[N, a_1 .. a_N]`
+// with each `a_i` an abs64 fixup to a reference word. Registers NOTHING when no
+// cell has one, so a program without traced module state carries no table, makes
+// no registration call and pays one load per collection. Skipped under
+// `--freestanding`: that object has no managed runtime to hand the table to, and
+// refuses every managed allocation (`refuseManagedMetadata`, emit.bit).
+fn registerModuleRoots(mods: []Checker, lowerer: Lowerer, freestanding: bool) {
+  if (freestanding) {
+    return
+  }
+  let relocs = []IrGlobalReloc(0)
+  for c of mods {
+    for r of moduleRootRelocs(c, lowerer, len(relocs)) {
+      relocs = append(relocs, r)
+    }
+  }
+  if (len(relocs) == 0) {
+    return
+  }
+  let bytes = []int(8 * (len(relocs) + 1))
+  let j = 0
+  // Word 0 is the count, little-endian like every static image (`moduleGlobalImage`).
+  while (j < 8) {
+    bytes[j] = (len(relocs) >> (j * 8)) & 255
+    j = j + 1
+  }
+  lowerer.globals = append(
+    lowerer.globals,
+    IrGlobal{
+      name = moduleRootsSym, bytes = bytes, align = 8, storage = 0, relocs = relocs,
+      inRootModule = true,
+    },
+  )
+}
+
+// First instructions of the program's entry `main`: hand the table to the runtime.
+// A no-op for a program that registered none.
+fn emitModuleRootsRegistration(fc: FnCtx) {
+  if (!staticCellKnown(fc.lowerer, moduleRootsSym)) {
+    return
+  }
+  let call = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  call.name = "module_roots_register"
+  call.args = [emitGlobalAddrVal(fc, moduleRootsSym)]
+  emitRtCall(fc, call)
+}
+
+// The same registration at the start of the `bit test` dispatch `main`
+// (testgen.bit), which replaces the program's `main` as the entry. Only when the
+// module registered a table.
+fn emitDispatchRoots(b: IrBuilder, i64ty: int, voidty: int, hasTable: bool) {
+  if (!hasTable) {
+    return
+  }
+  let ga = mkInstr(Op.GlobalAddr, i64ty)
+  ga.name = moduleRootsSym
+  let call = mkInstr(Op.RtCall, voidty)
+  call.name = "module_roots_register"
+  call.args = [builderEmit(b, ga)]
+  builderEmit(b, call)
+}

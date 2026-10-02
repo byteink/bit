@@ -1314,6 +1314,46 @@ debug-info entry is consulted only during an already-terminating panic walk,
 never during ordinary execution, so a freestanding archive member emitting
 its own debug-info entries needs no companion restriction.
 
+### 4.3 Module-cell roots (#6481)
+
+A module-level `let` whose type the collector traces (a `string`, a slice, a
+class, ...) lives in the data section, where no stack map, object pointer map
+or task block names it. The compiler lists the cells' reference words in one
+table, the entry function hands the table to the runtime, and every collection
+marks from it after the stack, task and channel roots and before it drains.
+
+```text
+table (a process-storage global, 8-aligned, one per program):
+  u64 count                 N, the number of entries
+  u64 cell_addr[N]          abs reloc -> one traced module cell's reference word
+```
+
+- **One entry per reference word.** A traced cell is one handle word, so a
+  `string`, a slice, a class or a function value is one entry. A fixed array
+  never has one: E0072 refuses an array of reference-typed elements, so every
+  `[N]U` cell is untraced. A `*T` or a C-like enum is a bare word the collector
+  never follows and is not listed. A `runtime/` cell never is: the checker
+  refuses a traced type there, and `@threadlocal` cells are untraced by the same
+  rule.
+- **Registration.** The root module's `main`, in all four signatures of §10,
+  starts with one call, `bit_rt_module_roots_register(table: usize) -> void`,
+  before any user code. A program with no traced module cell has no table and
+  makes no call; the collector then pays one load and a compare per collection.
+  `--freestanding` emits neither: there is no managed runtime to hand it to.
+- **Why a call and not a symbol the runtime reads.** The runtime is built by the
+  pinned stage0, which has no spelling for a data symbol only the program
+  defines, and a program built by stage0 links this tree's runtime, so a symbol
+  the runtime required of every program would not link. A call reaches only
+  programs built by a compiler that emits it, and the symbol is always defined.
+- **Marking.** `stwScanModuleRoots` (`runtime/stw/stwscan.bit`) is root class 11:
+  for each entry it loads the word at the address and passes it to
+  `gcMarkConservative`, which marks it only if it is a live heap object. A cell
+  that still holds its zero image (null) costs one probe.
+- **All three emitters.** The table is an ordinary process-storage global with
+  abs64 fixups, the mechanism a static closure cell already uses, so the Mach-O
+  (rebased by dyld under PIE), ELF (RELA) and PE/COFF object writers emit it
+  without a format-specific case.
+
 ---
 
 ## 5. Safepoints and stop-the-world
@@ -2717,6 +2757,7 @@ defined exactly once).
 | `bit_rt_gc_alloc`     | `(info: *const TypeInfo) -> *u8` (§6)                  |
 | `bit_rt_iface_lookup` | `(info: *const TypeInfo, id: u64) -> *const anyopaque` (§2.1) |
 | `bit_rt_safepoint`    | `() -> void` (§6)                                      |
+| `bit_rt_module_roots_register` | `(table: usize) -> void` (§4.3, called first by the entry `main` when the program has a traced module cell) |
 | `bit_rt_spawn`        | `(fn_ptr: TaskFn, arg: ?*anyopaque) -> void`            |
 | `bit_rt_chan_make`    | `(capacity: usize, is_ref: bool) -> *anyopaque` (§11)  |
 | `bit_rt_chan_send`    | `(ch: ?*anyopaque, value: u64) -> void` (§11)          |
