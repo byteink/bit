@@ -41,13 +41,13 @@ CA or another custom TLS config, use `h3DialTls`:
 
 ```bit
 import { h3DialTls, H3Request, H3Response, HeaderField } from "std/http3"
-import { TlsConfig, newTlsConfig } from "std/tls"
+import { TlsConfig } from "std/tls"
 import { TrustStore } from "std/crypto"
 
 // Dial an HTTP/3 server, pinning a specific CA instead of the system roots -
 // the shape std/http's `getTls`/`requestTls` use for the same reason.
 fn getIndexPinned(trust: TrustStore): H3Response! {
-  let conn = h3DialTls("127.0.0.1", 443, "example.com", newTlsConfig(trust))?
+  let conn = h3DialTls("127.0.0.1", 443, "example.com", TlsConfig(trust))?
   let req = H3Request{
     method = "GET",
     scheme = "https",

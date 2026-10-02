@@ -19,7 +19,8 @@ call them yourself.
 
 ```bit
 import { OidcConfig, JwksCache, discover, newJwksCache, verifyIdToken } from "auth"
-import { newTlsConfig, newTrustStore } from "std/tls"
+import { TlsConfig } from "std/tls"
+import { fromPem } from "std/crypto"
 import { defaultClaimsOptions } from "std/jwt"
 import { Json, jsonEncode } from "std/json"
 import { now, Second } from "std/time"
@@ -31,7 +32,7 @@ class TokenVerifier {
 }
 
 fn newTokenVerifier(issuer: string, clientId: string, rootsPem: string): TokenVerifier! {
-  let tls = newTlsConfig(newTrustStore(rootsPem)?)
+  let tls = TlsConfig(fromPem(rootsPem)?)
   let config = discover(issuer, tls)?
   let jwks = newJwksCache(config.jwksUri, tls)?
   return TokenVerifier{ config = config, jwks = jwks, clientId = clientId }

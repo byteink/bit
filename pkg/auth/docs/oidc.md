@@ -20,7 +20,8 @@ import {
   beginAuthorization, currentIdentity, googleStrategy, handleCallback,
   newPasswordStrategy, requireAuth, withScopes,
 } from "auth"
-import { newTlsConfig, newTrustStore } from "std/tls"
+import { TlsConfig } from "std/tls"
+import { fromPem } from "std/crypto"
 import { Json } from "std/json"
 
 fn users(username: string): LookupResult! {
@@ -35,9 +36,9 @@ fn users(username: string): LookupResult! {
 }
 
 // `rootsPem` is your deployment's trusted CA bundle - this package never
-// guesses one; see std/tls's `newTrustStore`.
+// guesses one; see `fromPem` in std/crypto.
 fn google(rootsPem: string): OidcStrategy! {
-  let tls = newTlsConfig(newTrustStore(rootsPem)?)
+  let tls = TlsConfig(fromPem(rootsPem)?)
   let s = googleStrategy(
     "your-client-id.apps.googleusercontent.com",
     "your-client-secret",

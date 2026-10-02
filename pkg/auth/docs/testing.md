@@ -41,7 +41,7 @@ import {
   beginAuthorization, handleCallback, newJwksCacheFromJwks,
 } from "auth"
 import { Request } from "std/http"
-import { emptyTrustStore, newTlsConfig } from "std/tls"
+import { emptyTrustStore, TlsConfig } from "std/tls"
 import { encodeBase64Url, hmac, Sha256 } from "std/crypto"
 import { Json, JsonEntry, jsonEncode } from "std/json"
 import { parseJwks } from "std/jwt"
@@ -70,7 +70,7 @@ fn fakeTokenFetch(box: TokenBox): TokenFetch {
 // a local server. `tokenFetch` is the one field production code always
 // leaves `nil`.
 fn buildFakeStrategy(box: TokenBox): OidcStrategy! {
-  let tls = newTlsConfig(emptyTrustStore())
+  let tls = TlsConfig(emptyTrustStore())
   let config = OidcConfig{
     issuer = fakeIssuer,
     authorizationEndpoint = fakeIssuer + "/authorize",

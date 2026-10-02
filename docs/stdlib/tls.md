@@ -15,14 +15,14 @@ the server's certificate chain against a trust store and checking its name
 matches the host you asked for.
 
 ```bit
-import { dial, newTlsConfig } from "std/tls"
+import { dial, TlsConfig } from "std/tls"
 import { systemRoots, bundled } from "std/crypto"
 
 fn fetchHomepage(host: string): string! {
   let roots = systemRoots() catch _ {
     bundled()
   }
-  let cfg = newTlsConfig(roots)
+  let cfg = TlsConfig(roots)
   let conn = dial(host, 443, cfg)?
   conn.write([]byte("GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n"))?
   let reply = conn.read(4096)?
@@ -44,10 +44,10 @@ the connection. `client(conn, host, config)` does the same handshake over a
 server side of the handshake for every connection it accepts.
 
 ```bit
-import { listen, newTlsConfig, emptyTrustStore } from "std/tls"
+import { listen, TlsConfig, emptyTrustStore } from "std/tls"
 
 fn serveOnce(port: int, certPem: string, keyPem: string): ()! {
-  let cfg = newTlsConfig(emptyTrustStore())
+  let cfg = TlsConfig(emptyTrustStore())
   cfg.certPem = certPem
   cfg.keyPem = keyPem
   let ln = listen("127.0.0.1", port, cfg)?
@@ -60,28 +60,28 @@ fn serveOnce(port: int, certPem: string, keyPem: string): ()! {
 ```
 
 A server does not verify a client's identity, so its `TlsConfig` needs no
-trust store; `emptyTrustStore()` fills the field. Set `cfg.alpn` to the
-protocol names you support (`["h2", "http/1.1"]`, say) and read what the
-client picked back with `conn.alpnProtocol()`.
+trust store; `emptyTrustStore()` fills the field. Pass `alpn = [...]` to
+`TlsConfig` with the protocol names you support (`["h2", "http/1.1"]`, say)
+and read what the client picked back with `conn.alpnProtocol()`.
 
 ## Trust stores and certificates
 
 A trust store is the set of certificate authorities you are willing to
 believe. `std/crypto` builds one three ways: `systemRoots()` (the OS bundle),
 `bundled()` (a built-in fallback), or `fromPem(pem)` (your own pinned roots,
-for a private PKI or a test fixture). Pass whichever one fits into
-`newTlsConfig`.
+for a private PKI or a test fixture). Pass whichever one fits to
+`TlsConfig(roots)`.
 
 Once connected, inspect who you are actually talking to with
 `peerCertificates()`, which returns the chain as raw DER, end-entity
 certificate first:
 
 ```bit
-import { dial, newTlsConfig } from "std/tls"
+import { dial, TlsConfig } from "std/tls"
 import { systemRoots, x509Parse } from "std/crypto"
 
 fn peerSubject(host: string, port: int): string! {
-  let cfg = newTlsConfig(systemRoots()?)
+  let cfg = TlsConfig(systemRoots()?)
   let conn = dial(host, port, cfg)?
   let chain = conn.peerCertificates()
   conn.close()
@@ -152,9 +152,12 @@ the handshake.
 
 `roots`, `insecureSkipVerify`, `alpn`, `serverName`, `minVersion`, `nowUnix`, `certPem`, `keyPem`: shared by `dial` and `listen`.
 
-### `newTlsConfig(roots: TrustStore): TlsConfig`
+### `TlsConfig(roots: TrustStore, serverName: string = "", alpn: []string = ..., insecureSkipVerify: bool = false, nowUnix: int = 0)`
 
-A secure-by-default client config: verification on, TLS 1.3.
+A secure-by-default config: verification on, TLS 1.3. Name only the options
+you need: `TlsConfig(roots, serverName = host, alpn = ["h2"])` for a client. A
+server passes `emptyTrustStore()` and sets `certPem` and `keyPem` on the result;
+`minVersion` is a field too, left at TLS 1.3 unless you lower the floor.
 
 ### `emptyTrustStore(): TrustStore`
 
@@ -326,9 +329,11 @@ Convert to and from the IANA wire code point.
 
 A running hash over every handshake message seen so far.
 
-### `newTranscript(newHash: () => Hash): TranscriptHash`
+### `TranscriptHash(newHash: () => Hash)`
 
-A running hash over every handshake message seen so far.
+A running hash over every handshake message seen so far, built from the suite's
+hash constructor; its digest before any `update` is the hash of the empty
+string.
 
 ### `TranscriptHash.update(data: []byte)`
 
@@ -614,9 +619,11 @@ The three TLS record content-type codes.
 
 The AEAD, key, and IV for one direction of record protection.
 
-### `newRecordKeys(suite: CipherSuite, secret: []byte): RecordKeys!`
+### `RecordKeys(suite: CipherSuite, secret: []byte)!`
 
-The AEAD, key, and IV for one direction of record protection.
+The AEAD, key, and IV for one direction of record protection, derived from the
+direction's traffic secret. Fails only if the suite rejects the derived key
+length.
 
 ### `RecordKeys.seal(plaintext: []byte, contentType: int): []byte!`
 
@@ -652,17 +659,18 @@ One pre_shared_key entry offered by a resuming client.
 
 A server-side store of issued tickets, keyed by ticket bytes.
 
-### `newTicketStore(): TlsTicketStore`
+### `TlsTicketStore()`
 
-A server-side store of issued tickets, keyed by ticket bytes.
+An empty server-side store of issued tickets, keyed by ticket bytes.
 
 ### `SessionTicket`
 
 A client-side ticket saved after a connection closes.
 
-### `newSessionTicket(nst: NewSessionTicket, conn: TlsClientConn): SessionTicket`
+### `SessionTicket(nst: NewSessionTicket, conn: TlsClientConn)`
 
-A client-side ticket saved after a connection closes.
+A client-side ticket saved after a connection closes, built from the
+NewSessionTicket message and the connection it arrived on.
 
 ### `tlsClientStartResume(config: TlsClientConfig, session: SessionTicket, earlyData: []byte): TlsClientHandshake!`
 
@@ -728,11 +736,8 @@ The handshake's derived secrets, once it has completed.
 
 ### `TlsClientConfig`
 
-The lower-level client configuration and a PEM-to-trust-store helper.
-
-### `newTrustStore(rootsPem: string): TrustStore!`
-
-The lower-level client configuration and a PEM-to-trust-store helper.
+The lower-level client configuration. Its trust store is `std/crypto`'s
+`TrustStore`; build one from PEM with `fromPem(pem)`.
 
 ### `TlsClientStep`
 
@@ -820,11 +825,13 @@ The handshake's derived secrets, once it has completed.
 
 ### `TlsServerConfig`
 
-The lower-level server configuration and its PEM-loading constructor.
+The lower-level server configuration.
 
-### `newTlsServerConfig(certChainPem: string, keyPem: string, alpn: []string): TlsServerConfig!`
+### `TlsServerConfig(certChainPem: string, keyPem: string, alpn: []string)!`
 
-The lower-level server configuration and its PEM-loading constructor.
+Loads the certificate chain and RSA private key from PEM. Fails on malformed
+PEM, an empty chain, or a key it cannot read; groups and suites default to the
+full supported sets.
 
 ### `TlsServerStep`
 
