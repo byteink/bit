@@ -200,13 +200,17 @@ ssh "${X64_HOST}" "docker image inspect ${GATE_IMAGE_REMOTE}" >/dev/null 2>&1 ||
 echo "release.sh: gate images present (${GATE_IMAGE_LOCAL} local, ${GATE_IMAGE_REMOTE} on ${X64_HOST})"
 
 # Resolved once, here, same reasoning as X64_HOST above: fail before ~11
-# minutes of cross-builds, not at the smoke step. No probing script for a
-# second host - BIT_WINDOWS_HOST/mustafa-desktop-win is already the one
-# hardcoded name this repo uses for its single Windows box
-# (_tests_/bit/windowssmoke.bit's windowsHost()) - reused verbatim rather than
-# inventing a second resolution mechanism for a fleet of one.
+# minutes of cross-builds, not at the smoke step. `x64host.sh --windows` owns
+# the resolution ($BIT_WINDOWS_HOST, $BIT_WINDOWS_HOSTS, machine-local
+# winhosts file) and probes reachability, so no alias is named in this repo.
+WINDOWS_HOST="$(sh scripts/x64host.sh --windows 2>/dev/null | head -1 || true)"
+if [ -z "${WINDOWS_HOST}" ]; then
+	echo "release.sh: no Windows host configured - cannot verify x86_64-windows" >&2
+	echo "release.sh: refusing to publish an unverified release" >&2
+	exit 1
+fi
+# An explicit $BIT_WINDOWS_HOST is trusted by the resolver, not probed.
 # `</dev/null`: an ssh probe inherits stdin and can drain it (#3899).
-WINDOWS_HOST="${BIT_WINDOWS_HOST:-mustafa-desktop-win}"
 ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 "${WINDOWS_HOST}" 'exit 0' </dev/null >/dev/null 2>&1 || {
 	echo "release.sh: ${WINDOWS_HOST} is unreachable over SSH - cannot verify x86_64-windows" >&2
 	echo "release.sh: refusing to publish an unverified release" >&2
@@ -531,7 +535,7 @@ else
 	exit 1
 fi
 
-# --- verify the Windows artifact, on mustafa-desktop-win over SSH -----------
+# --- verify the Windows artifact, on the Windows host over SSH --------------
 #
 # Same shape as the x86_64-linux block above (ship a fresh remote name, run,
 # assert, clean up) with two differences forced by the target: there is no

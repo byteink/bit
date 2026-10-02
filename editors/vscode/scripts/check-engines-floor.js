@@ -2,7 +2,7 @@
 'use strict';
 
 // Checks that editors/vscode's declared `engines.vscode` floor is >= every
-// runtime dependency's own `engines.vscode` requirement (smash #5582).
+// runtime dependency's own `engines.vscode` requirement (#5582).
 // #5574 raised the floor by hand after it drifted silently across the
 // vscode-languageclient 9->10 bump: the dependency started requiring
 // ^1.91.0 while the extension still declared ^1.75.0, so a user on
