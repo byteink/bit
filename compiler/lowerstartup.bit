@@ -1,0 +1,356 @@
+// Module startup initializers (#6480, epic #6477; owner ruling on #6466).
+//
+// The checker marks every module `let`/`const` whose initializer cannot fold to
+// a static byte image (`Checker.startupInit`, modulestartup.bit). This file
+// lowers them: one fallible `()!` init function per marked cell, and one
+// driver, `bit$startup`, that calls them in program order and stops the program
+// before `main` when one fails.
+//
+// ORDER. Modules in id order, which is dependency order (a module's id is
+// greater than every id it imports, `loadModuleAt` in project.bit; a cycle is
+// E0044), then the cells of each module top to bottom. Total and deterministic.
+//
+// WHERE IT RUNS. The driver is called first thing from the root `main`
+// (`emitEntryStartup`, from `lowerFuncNamed`) and from the synthesized
+// `bit test` dispatch `main` (`buildDispatch`, testgen.bit). `main` runs as the
+// first green task, so the scheduler and the collector are up: an initializer
+// may allocate, spawn and block. No target-specific entry code is involved, so
+// darwin, linux and windows all take this one path.
+//
+// FAILURE. An initializer that returns an error leaves it in the error slot
+// (the same channel `?` uses). The driver reads it after each call and, on
+// error, writes one line to fd 2 and exits with `startupFailExit`:
+//
+//   error: module <path> failed to start: <message> (<file>:<line>)
+//
+// `<path>` is the module's import path as its first importer spelled it, or its
+// directory for the root; `<line>` is the line the failing declaration starts
+// on. The exit goes through `os_exit` (ABI.md §19): deferred calls do not run,
+// and `main` is never entered.
+
+// The process exit code of a failed startup initializer: 0 is success, 1 is a
+// fallible `main`'s error (§17.4), 2 is a panic (§18.4), so a failed start gets
+// its own value and a caller can tell the three apart.
+const startupFailExit = 3
+
+// The IR name of the driver `main` calls.
+const startupDriverName: string = "bit\$startup"
+
+// One startup-initialized module cell, in program order.
+class StartupCell {
+  mod: int,
+  binding: int,
+  name: string,
+  isLet: bool,
+}
+
+fn startupInitName(cell: StartupCell): string {
+  return "bit\$init\$${cell.mod}\$${cell.name}"
+}
+
+// Every module cell the startup pass runs, in program order: modules in id
+// order, then top-level declarations in source order. A cell
+// `vStartupUnlowered` still refuses is left out, so the build fails on it
+// instead (`refuseUnloweredModuleState`).
+fn startupCells(mods: []Checker): []StartupCell {
+  let out = []StartupCell(0)
+  for c of mods {
+    if (c.runtimeModule) {
+      continue
+    }
+    for d of kidsOf(c.tree, c.tree.root) {
+      if (d == 0) {
+        continue
+      }
+      out = appendStartupDecl(c, d, out)
+    }
+  }
+  return out
+}
+
+// `out` plus the startup cells declared by top-level declaration `d` (which may
+// be an `export` wrapper), in binding order.
+fn appendStartupDecl(c: Checker, d: int, out: []StartupCell): []StartupCell {
+  let decl = d
+  if (getNode(c.tree, decl).tag == Tag.Export) {
+    decl = kidsOf(c.tree, decl)[0]
+  }
+  let tag = getNode(c.tree, decl).tag
+  if (tag != Tag.LetDecl && tag != Tag.ConstDecl) {
+    return out
+  }
+  for b of kidsOf(c.tree, decl) {
+    let pat = kidsOf(c.tree, b)[0]
+    let (marked, ok) = c.startupInit[b]
+    if (getNode(c.tree, pat).tag != Tag.Ident || !ok || !marked) {
+      continue
+    }
+    if (vStartupUnlowered(c, b, tag == Tag.LetDecl) != "") {
+      continue
+    }
+    out = append(
+      out,
+      StartupCell{
+        mod = c.moduleId, binding = b, name = vIdentText(c, pat),
+        isLet = tag == Tag.LetDecl,
+      },
+    )
+  }
+  return out
+}
+
+// The startup cells of a whole project, or of the one module the dump entry
+// points check alone (their `Checker.mods` is empty).
+fn startupCellsOf(c: Checker): []StartupCell {
+  if (len(c.mods) == 0) {
+    return startupCells([c])
+  }
+  return startupCells(c.mods)
+}
+
+// Pass A0'': a writable, zeroed process-wide cell for every startup `const`.
+// A startup `let` already got its cell from `registerGlobals`, which holds the
+// zero image for any cell `vNeedsStartup` names (`moduleGlobalImageOrStartup`).
+// A `const` is a cell here only because its value does not exist until the
+// program runs; every other `const` stays a value inlined at its uses.
+fn registerStartupConsts(mods: []Checker, lowerer: Lowerer) {
+  for cell of startupCells(mods) {
+    if (cell.isLet) {
+      continue
+    }
+    let c = mods[cell.mod]
+    let ty = c.nodeTypes[kidsOf(c.tree, cell.binding)[0]]
+    let sym = "__bitg_${cell.mod}_${cell.name}"
+    lowerer.globals = append(
+      lowerer.globals,
+      IrGlobal{
+        name = sym,
+        bytes = []int(moduleGlobalSize(c.ctx, ty)), align = moduleStateAlign, storage = 0,
+        relocs = []IrGlobalReloc(0),
+        inRootModule = cell.mod == lowerer.root,
+      },
+    )
+    lowerer.globalSyms["${cell.mod}\$${cell.name}"] = sym
+  }
+}
+
+// A body context for a synthesized startup function: fallible with a void ok
+// type and the `error` sentinel as its error type, which is what the checker
+// validated a marked initializer against (`vMarkStartupInit`).
+fn startupFnCtx(c: Checker, b: IrBuilder, lowerer: Lowerer): FnCtx {
+  return FnCtx{
+    c = c, b = b, env = []LocalBind(0), failed = false,
+    failSpan = pointSpan(0, 0), failReason = "", terminated = false,
+    loops = []LoopFrame(0), moduleConsts = collectModuleConsts(c), lowerer = lowerer,
+    defers = []DeferCall(0), fallibleOk = c.ctx.voidId, fallibleErr = c.ctx.errorId,
+    genEnv = emptyTypeEnv(), resultTy = c.ctx.voidId, boxedNames = []string(0),
+  }
+}
+
+// Evaluates the cell's initializer and stores it into the cell. The cell's
+// address is taken AFTER the value exists: an initializer may allocate and
+// reach a safepoint, and the address needs no protection either way.
+fn lowerStartupStore(fc: FnCtx, cell: StartupCell, ty: int, init: int) {
+  let v = lowerExprH(fc, init, ty)
+  if (fc.failed) {
+    return
+  }
+  let rhsTy = defaultType(fc.c, nodeType(fc, init))
+  let sym = fc.lowerer.globalSyms["${cell.mod}\$${cell.name}"]
+  let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  st.lhs = emitGlobalAddrVal(fc, sym)
+  st.ival = 0
+  st.rhs = coerceToIface(fc, v, rhsTy, ty)
+  st.ival2 = ty
+  builderEmit(fc.b, st)
+  clearErr(fc)
+  builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+}
+
+// Lowers one cell's initializer to `bit$init$<mod>$<name>`, a `()!` function.
+// A body the lowerer cannot express is stubbed like any other function, and a
+// build with a stub is refused.
+fn lowerStartupInit(mods: []Checker, cell: StartupCell, lowerer: Lowerer): IrFunc {
+  let c = mods[cell.mod]
+  lowerer.modPrefix = modulePrefix(cell.mod, lowerer.root)
+  lowerer.curModule = cell.mod
+  let bk = kidsOf(c.tree, cell.binding) // [pattern, type_or_none, init]
+  let b = newBuilder()
+  builderBeginBlock(b, builderNewBlock(b))
+  let fc = startupFnCtx(c, b, lowerer)
+  let ty = c.nodeTypes[bk[0]]
+  let scan = boxedLocalNames(c, bk[2], []string(0))
+  fc.boxedNames = scan.names
+  if (scan.overflow || ty == 0) {
+    fcFail(fc, getNode(c.tree, bk[0]).span, "a module initializer the lowerer cannot box or type")
+  } else {
+    lowerStartupStore(fc, cell, ty, bk[2])
+  }
+  builderEndBlock(fc.b)
+  let name = startupInitName(cell)
+  if (fc.failed) {
+    lowerer.stubbed = append(
+      lowerer.stubbed,
+      StubbedFn{
+        name = cell.name, span = remapModuleSpan(c, fc.failSpan), reason = fc.failReason,
+        note = "", noteSite = pointSpan(0, 0),
+      },
+    )
+    return signatureOnlyFunc(c, name, []int(0), c.ctx.voidId)
+  }
+  return IrFunc{
+    name = name, paramTypes = []int(0), result = c.ctx.voidId,
+    blocks = fc.b.blocks, instrs = fc.b.instrs, isFallible = true, isNaked = false,
+    isNosplit = false, inRootModule = cell.mod == lowerer.root, keepAlive = fc.b.keepAlive,
+  }
+}
+
+// The text a module is named by in the failure line: the import path its first
+// importer wrote (smallest such text, so the choice does not depend on map
+// order), else its directory — the root has no importer.
+fn startupModulePath(mods: []Checker, c: Checker): string {
+  let best = ""
+  let mi = c.moduleId + 1
+  while (mi < len(mods)) {
+    for (p, id) of mods[mi].importPaths {
+      if (id == c.moduleId && (best == "" || p < best)) {
+        best = p
+      }
+    }
+    if (best != "") {
+      return best
+    }
+    mi = mi + 1
+  }
+  return pathDir(declFilePath(c, getNode(c.tree, c.tree.root).span))
+}
+
+// The 1-based line of `span` within the file it falls in.
+fn startupLine(c: Checker, span: Span): int {
+  let from = c.fileStarts[fileOf(c.fileStarts, span.start).fileIdx]
+  let line = 1
+  let i = from
+  while (i < span.start) {
+    if (c.source[i] == 10) {
+      line = line + 1
+    }
+    i = i + 1
+  }
+  return line
+}
+
+// The failure arm for `cell`: print the line, exit `startupFailExit`. `errv` is
+// the pending error, already read from the slot.
+fn emitStartupFailure(fc: FnCtx, mods: []Checker, cell: StartupCell, errv: int) {
+  let c = mods[cell.mod]
+  let stringTy = primType(fc.c.ctx, 11)
+  let pat = getNode(c.tree, kidsOf(c.tree, cell.binding)[0])
+  let head = "error: module ${startupModulePath(mods, c)} failed to start: "
+  let tail = " (${declFilePath(c, pat.span)}:${startupLine(c, pat.span)})\n"
+  let line = concatStrings(fc, stringTy, constString(fc, stringTy, head), errorMessageOf(fc, errv))
+  emitEprint(fc, concatStrings(fc, stringTy, line, constString(fc, stringTy, tail)))
+  let code = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+  code.ival = startupFailExit
+  let ex = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  ex.name = "os_exit"
+  ex.args = [builderEmit(fc.b, code)]
+  emitRtCall(fc, ex)
+  builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+}
+
+// One driver step: call `cell`'s init function, then branch on the error slot
+// to its failure block; returns the block the next step continues in.
+fn emitStartupStep(fc: FnCtx, mods: []Checker, cell: StartupCell): int {
+  let errTy = fc.c.ctx.errorId
+  let call = mkInstr(Op.Call, fc.c.ctx.voidId)
+  call.name = startupInitName(cell)
+  call.args = []int(0)
+  builderEmit(fc.b, call)
+  let errv = getErr(fc, errTy)
+  let failBlk = builderNewBlock(fc.b)
+  let nextBlk = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = neNil(fc, errv, errTy)
+  br.ival = failBlk
+  br.thenArgs = []int(0)
+  br.ival2 = nextBlk
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, failBlk)
+  emitStartupFailure(fc, mods, cell, errv)
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, nextBlk)
+  return nextBlk
+}
+
+// `bit$startup`: every init function in program order, each followed by its
+// failure check. Returns normally only when every initializer succeeded.
+fn lowerStartupDriver(mods: []Checker, cells: []StartupCell, lowerer: Lowerer): IrFunc {
+  let c = mods[lowerer.root]
+  lowerer.modPrefix = modulePrefix(lowerer.root, lowerer.root)
+  lowerer.curModule = lowerer.root
+  let b = newBuilder()
+  builderBeginBlock(b, builderNewBlock(b))
+  let fc = startupFnCtx(c, b, lowerer)
+  for cell of cells {
+    let _ = emitStartupStep(fc, mods, cell)
+  }
+  builderEmit(b, mkInstr(Op.Ret, c.ctx.voidId))
+  builderEndBlock(b)
+  return IrFunc{
+    name = startupDriverName, paramTypes = []int(0), result = c.ctx.voidId,
+    blocks = b.blocks, instrs = b.instrs, isFallible = false, isNaked = false,
+    isNosplit = false, inRootModule = true, keepAlive = b.keepAlive,
+  }
+}
+
+// Pass A2': the init function of every startup cell, then the driver. Empty for
+// a program with no startup cell, so it adds nothing to one. BEFORE the method
+// pass (`lowerProjectMethods`), whose reachability sweep must see the calls an
+// initializer makes.
+fn lowerStartupFuncs(mods: []Checker, lowerer: Lowerer): []IrFunc {
+  let out = []IrFunc(0)
+  let cells = startupCells(mods)
+  if (len(cells) == 0) {
+    return out
+  }
+  for cell of cells {
+    out = append(out, lowerStartupInit(mods, cell, lowerer))
+  }
+  return append(out, lowerStartupDriver(mods, cells, lowerer))
+}
+
+// A function's statements, preceded by the startup pass when this is the entry
+// `main`: the function whose link name is `main` in the root module (the root's
+// names are bare, every other module's carry an `m<id>$` prefix), which is the
+// symbol the entry trampoline calls. A no-op prologue for every other function
+// and for a program with no startup cell.
+fn lowerFuncBody(fc: FnCtx, name: string, body: int) {
+  if (name == "main" && len(startupCellsOf(fc.c)) != 0) {
+    emitStartupCall(fc)
+  }
+  lowerStmtList(fc, body)
+}
+
+// A call to the startup driver; the driver exits the process itself on failure,
+// so there is no error to check here.
+fn emitStartupCall(fc: FnCtx) {
+  let call = mkInstr(Op.Call, fc.c.ctx.voidId)
+  call.name = startupDriverName
+  call.args = []int(0)
+  builderEmit(fc.b, call)
+}
+
+// The start of the `bit test` dispatch `main` (testgen.bit): the same startup
+// call, so a test sees the cells a program would. Only when the module defines
+// a driver.
+fn emitDispatchStartup(b: IrBuilder, voidty: int, hasStartupDriver: bool) {
+  if (!hasStartupDriver) {
+    return
+  }
+  let call = mkInstr(Op.Call, voidty)
+  call.name = startupDriverName
+  call.args = []int(0)
+  builderEmit(b, call)
+}

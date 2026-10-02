@@ -2932,6 +2932,34 @@ whatever was left there.
 This row did not always exist in code: `fail` used to set the slot with
 nothing reading it, and a failed `main` exited 0 with an empty stderr.
 
+### Module startup initializers (#6480)
+
+A module `let`/`const` whose initializer is not a compile-time constant is
+initialized by the program, not by the object file. `compiler/lowerstartup.bit`
+emits one `()!` function per such cell, `bit$init$<module id>$<name>`, and one
+driver, **`bit$startup`**, that calls them in program order: modules in id order
+(a module's id is greater than every id it imports, so dependencies run first),
+then the cells of a module top to bottom. The root `main`'s first statement is a
+call to `bit$startup`, and so is the first statement of the `bit test` dispatch
+`main`; no per-target entry code is involved. The driver therefore runs on the
+first green task, after `boot` has brought up the scheduler and the collector, so
+an initializer may allocate, spawn and block.
+
+The driver reads the §7 error slot after each init function. A pending error
+writes one line to fd 2 through `bit_rt_eprint` and ends the process through
+`bit_rt_os_exit`:
+
+```
+error: module <path> failed to start: <message> (<file>:<line>)
+```
+
+`<path>` is the module's import path as its first importer wrote it (the module
+directory for the root), `<message>` is `error.message()`, `<file>:<line>` is the
+declaration the initializer belongs to (the line it starts on). The exit code is
+**3**: `0` is success, `1` a fallible `main`'s error, `2` a panic (§12), so a
+failed start is distinguishable from both. Deferred calls do not run and `main`
+is never entered. No new runtime symbol is involved.
+
 ---
 
 ## 11. Channels (`runtime/chan` + `runtime/root`)
