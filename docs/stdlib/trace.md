@@ -129,9 +129,9 @@ exactly (not merely with overwhelming probability).
 ```bit
 import { Sampler } from "std/trace"
 
-fn main() {
+fn sampleOneTenth(): bool {
   let tenth = Sampler(0.1)
-  print("${tenth.shouldSample()}")
+  return tenth.shouldSample()
 }
 ```
 
@@ -243,10 +243,10 @@ A fresh span id from the CSPRNG. Never zero (W3C reserves that value).
 ```bit
 import { TraceId, SpanId, formatTraceParent } from "std/trace"
 
-fn main() {
+fn freshTraceParent(): string {
   let t = TraceId.random()
   let s = SpanId.random()
-  print(formatTraceParent(t.hi, t.lo, s.value, true))
+  return formatTraceParent(t.hi, t.lo, s.value, true)
 }
 ```
 
