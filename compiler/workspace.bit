@@ -1,0 +1,191 @@
+// #6491: package workspace (SPEC §17.8). Inside a directory tree that carries
+// a `bit.work`, a dependency whose `bit.lock` entry names a workspace member
+// resolves to that member's directory in the tree instead of to the released
+// tag in `~/.bit/pkg` — Go's `go.work` and Cargo's `[workspace]`, for the same
+// reason: without it a stdlib API change cannot reach `pkg/*` until a new
+// package tag exists, and that tag needs the stdlib change released first.
+//
+// The mechanism is an in-memory rewrite of `loadLockEntries`'s result
+// (projectpkg.bit): a member's entry gets `localPath` set to the member's
+// absolute directory, and `resolvePackageImportUncached` already resolves a
+// `localPath` entry live, with no cache, git or network. `bit.lock` on disk
+// is never read differently by the rewrite's consumers beyond that, and never
+// written: `commit`, `version` and `tag` are left untouched, so the
+// bit.json/bit.lock consistency check (`manifestLockProblem`) still judges the
+// lock as released.
+//
+// Scope, as in Go: the workspace applies to a project whose lock root is
+// inside the `bit.work` directory (found by walking up from the lock root); a
+// consumer's app elsewhere never sees it. `BIT_WORKSPACE=off` disables it, and
+// `BIT_WORKSPACE=verbose` prints each rewritten dependency on stderr.
+
+const workspaceFileName: string = "bit.work"
+const workspaceEnvVar: string = "BIT_WORKSPACE"
+const workspaceMaxDepth: int = 64 // filesystem depth ceiling — bounds the walk up
+
+// What `bit.work` resolved to for one lock root. `file == ""` means no
+// workspace applies (none found, or `BIT_WORKSPACE=off`).
+class Workspace {
+  file: string,
+  // Import name as `bit.lock` records it (an entry's `vanity`) -> the
+  // member's absolute directory.
+  members: map<string, string>,
+  verbose: bool,
+}
+
+fn noWorkspace(): Workspace {
+  return Workspace{ file = "", members = map<string, string>{}, verbose = false }
+}
+
+// `lockRoot` as an absolute, lexically resolved directory.
+fn workspaceAbsDir(lockRoot: string): (string, string) {
+  if (startsWith(lockRoot, "/")) {
+    return pathResolve(lockRoot), ""
+  }
+  let here = cwd() catch e {
+    return "", "${workspaceFileName}: cannot determine the working directory: ${e.message()}"
+  }
+  return pathJoinResolve(here, lockRoot), ""
+}
+
+// The nearest `bit.work` in `dir` or an ancestor, or "".
+fn findWorkspaceFile(dir: string): string {
+  let d = dir
+  let depth = 0
+  while (depth < workspaceMaxDepth) {
+    let candidate = "${d}/${workspaceFileName}"
+    if (fsExists(candidate)) {
+      return candidate
+    }
+    let parent = pathDir(d)
+    if (parent == d) {
+      return ""
+    }
+    d = parent
+    depth = depth + 1
+  }
+  return ""
+}
+
+// `bit.work`: `{"members": {"<import name>": "<dir relative to bit.work>"}}`.
+// A member naming a directory that does not exist is an error, not a skip: a
+// typo here would otherwise resolve that package to its released tag in
+// silence, the exact thing the workspace exists to prevent.
+fn readWorkspaceMembers(file: string): (map<string, string>, string) {
+  let members = map<string, string>{}
+  let src = readFile(file) catch e {
+    return members, "${file}: ${e.message()}"
+  }
+  let d = jsonParse(src)
+  if (!d.ok || jsonKindOf(d, d.root) != JsonKind.Obj) {
+    return members, "${file}: malformed JSON, want an object with a \"members\" object"
+  }
+  let list = jsonGet(d, d.root, "members")
+  if (!jsonHas(d, list) || jsonKindOf(d, list) != JsonKind.Obj) {
+    return members, "${file}: missing \"members\" object (import name -> directory)"
+  }
+  let i = 0
+  while (i < jsonLen(d, list)) {
+    let name = jsonKeyAt(d, list, i)
+    let err = addWorkspaceMember(members, file, name, jsonGet(d, list, name), d)
+    if (err != "") {
+      return members, err
+    }
+    i = i + 1
+  }
+  return members, ""
+}
+
+// One `"<import name>": "<dir>"` pair of `bit.work`, validated and recorded.
+fn addWorkspaceMember(
+  members: map<string, string>, file: string, name: string, node: int, d: JsonDoc,
+): string {
+  let rel = jsonStrOf(d, node)
+  if (!jsonHas(d, node) || jsonKindOf(d, node) != JsonKind.Str || rel == "") {
+    return "${file}: member \"${name}\" must name a directory string"
+  }
+  let dir = pathJoinResolve(pathDir(file), rel)
+  if (!fsIsDir(dir)) {
+    return "${file}: member \"${name}\" names directory \"${rel}\", which does not exist (${dir})"
+  }
+  members[name] = dir
+  return ""
+}
+
+// The workspace governing `lockRoot`, or an error describing a broken
+// `BIT_WORKSPACE` value or `bit.work`. Read per call: three small stats and
+// one file read, and every caller of `loadLockEntries` wants the same answer.
+fn loadWorkspace(lockRoot: string): (Workspace, string) {
+  let mode = envOr(workspaceEnvVar, "")
+  if (mode == "off") {
+    return noWorkspace(), ""
+  }
+  if (mode != "" && mode != "verbose") {
+    return noWorkspace(), "${workspaceEnvVar}=\"${mode}\": want unset, \"off\" or \"verbose\""
+  }
+  let (abs, absErr) = workspaceAbsDir(lockRoot)
+  if (absErr != "") {
+    return noWorkspace(), absErr
+  }
+  let file = findWorkspaceFile(abs)
+  if (file == "") {
+    return noWorkspace(), ""
+  }
+  let (members, err) = readWorkspaceMembers(file)
+  if (err != "") {
+    return noWorkspace(), err
+  }
+  return Workspace{ file = file, members = members, verbose = mode == "verbose" }, ""
+}
+
+// Entry names whose `vanity` is a workspace member, sorted: the dependencies
+// this workspace redirects. An entry already pointing at a local path is left
+// alone — it is the tree already.
+fn workspaceRedirects(entries: map<string, LockEntry>, ws: Workspace): []string {
+  let out = []string(0)
+  if (ws.file == "") {
+    return out
+  }
+  for (name, entry) of entries {
+    let (_, isMember) = ws.members[entry.vanity]
+    if (isMember && entry.localPath == "") {
+      out = append(out, name)
+    }
+  }
+  sortInPlace(out, (a: string, b: string) => a < b)
+  return out
+}
+
+// `rootDir`'s `bit.lock` entries with the workspace applied: each redirected
+// entry's `localPath` becomes its member directory, and `commit`/`version`/
+// `tag` stay as locked (see the file header). `report` (the loader's own
+// call, once per build, `loadLockEntriesReported`) prints one `BIT_WORKSPACE=
+// verbose` line per redirected dependency. A broken `bit.work` is returned
+// in the error slot exactly as a malformed `bit.lock` is; `manifestLockProblem`
+// (projectpkg.bit) refuses it eagerly too, so a project that imports no
+// package still fails.
+fn loadLockEntriesIn(rootDir: string, report: bool): (map<string, LockEntry>, string) {
+  let (out, lockErr) = readLockEntries(rootDir)
+  if (lockErr != "") {
+    return out, lockErr
+  }
+  let (ws, wsErr) = loadWorkspace(rootDir)
+  if (wsErr != "") {
+    return out, wsErr
+  }
+  for name of workspaceRedirects(out, ws) {
+    let entry = out[name]
+    entry.localPath = ws.members[entry.vanity]
+    out[name] = entry
+    if (report && ws.verbose) {
+      eprint("bit: workspace ${ws.file}: ${name} (${entry.vanity}) -> ${entry.localPath}\n")
+    }
+  }
+  return out, ""
+}
+
+// The workspace error alone, for `manifestLockProblem`'s eager refusal.
+fn workspaceProblem(rootDir: string): string {
+  let (_, err) = loadWorkspace(rootDir)
+  return err
+}

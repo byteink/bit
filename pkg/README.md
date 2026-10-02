@@ -41,6 +41,25 @@ Neither step is part of `./make test`, on purpose: a package is a leaf, so a
 gates. The language can break a package, so a compiler change owes
 `test-packages` on top of its own gate.
 
+## Workspace
+
+`pkg/bit.work` makes the packages in this directory one workspace (SPEC
+§17.9). Inside it, `bitlang.org/pkg/<name>` resolves to `pkg/<name>` in the
+tree, not to the released tag in `~/.bit/pkg`, for every package and every
+guide app under one. A package that depends on another one (`pkg/auth` on
+`web`, `pkg/orm` on `mysql`) therefore builds against the sibling as it stands
+in the same commit, so a change to the standard library reaches every package
+at once and `./make test-packages` needs no new tag to go green. The lock is
+never rewritten by this; a consumer outside the repository sees only tags.
+
+- `BIT_WORKSPACE=off` resolves the released tags, as a consumer does. Use it to
+  prove a package still builds against what it was last released with.
+- `BIT_WORKSPACE=verbose` prints which dependencies came from the tree.
+- A new package directory is added to `pkg/bit.work` (`"bitlang.org/pkg/<name>":
+  "<name>"`); `test-packages` fails when one is missing, since an unlisted
+  package would silently resolve to its release. A member naming a directory
+  that does not exist fails every build under `pkg/`.
+
 ## Consuming a package
 
 ```json
@@ -169,6 +188,6 @@ to navigate. Chapters give the site a table of contents to build from.
 ## Adding a package
 
 Copy `pkg/redis/`'s shape: module directory, `.test.bit` beside each file,
-`README.md`. The gate picks it up on the next `./make`. Add its line to
+`README.md`, and a line in `bit.work`. The gate picks it up on the next `./make`. Add its line to
 `content/packages.txt` in `bit-website` when it is ready to be consumed, not
 before.

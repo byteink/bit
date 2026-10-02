@@ -5878,6 +5878,52 @@ fields, in declaration order, as the extra kind `field` with name `Recv.field`
 (for example `Point.x`); it changes neither form's shape for a module whose
 classes report no fields this way.
 
+### 17.9 Package Workspace
+
+A repository that holds packages together with the code that consumes them
+cannot resolve those packages to released tags: a change to the standard
+library would break every package until a new package tag exists, and that tag
+needs the standard library change released first. A **workspace** breaks the
+cycle. Inside it, a dependency on a member package resolves to the member's
+directory in the tree; outside it, `bit.lock` and the tags apply exactly as
+§17.7 describes. The file is named `bit.work` after Go's `go.work`: like it, it
+sits at the root of the tree it governs and lists directories, and it is
+found by walking up from the project, not named on a command line.
+
+```json
+{
+  "members": {
+    "bitlang.org/pkg/web": "web",
+    "bitlang.org/pkg/auth": "auth"
+  }
+}
+```
+
+- `members` maps an import name, exactly as a `bit.lock` entry's `vanity` field
+  records it, to a directory relative to the `bit.work` file.
+- The workspace governing a build is the nearest `bit.work` in the lock root
+  (§17.7: the directory whose `bit.lock` the build reads) or an ancestor. A
+  project outside that directory never sees it. The lock root need not be a
+  member: an application under a member resolves through the same file.
+- A dependency is redirected only when `bit.lock` already lists it and the
+  entry's `vanity` names a member. The entry's source becomes the member
+  directory, read live like a local-path entry (§17.7), with no cache, git or
+  network; it is never a copy. A dependency `bit.lock` does not list is still
+  refused, and an entry that already is a local path is left as it is.
+- The redirect exists only in memory. `bit.lock` and `bit.json` are never
+  written by it, the entry's locked `commit`, `version` and `tag` are not
+  changed, and the `bit.json` against `bit.lock` consistency check of §17.7
+  still judges the lock as released.
+- `BIT_WORKSPACE=off` ignores every `bit.work`, so a build resolves the released
+  tags as a consumer would (Go's `GOWORK=off`). `BIT_WORKSPACE=verbose` keeps
+  the workspace and prints one line on stderr per redirected dependency,
+  `bit: workspace <file>: <name> (<import name>) -> <directory>`. Any other
+  value is refused.
+- A `bit.work` that is not the shape above, or a member naming a directory that
+  does not exist, is an error that fails `bit build`, `run`, `test` and
+  `check` whether or not the project imports a package; it never falls back to
+  the released tag.
+
 ---
 
 ## 18. Error Handling
