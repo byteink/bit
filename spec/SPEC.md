@@ -3022,8 +3022,8 @@ modules is total. Within one module the initializers run in source order.
 
 An initializer that is fallible (§18.2) may propagate with `?` or recover with
 `catch`. A failure that reaches the top of an initializer stops the program before
-`main`: it prints one line to stderr and exits with a **non-zero exit code
-distinct from a panic's** (§18.4). `main` never runs.
+`main`: it prints one line to stderr and exits with **exit code 3**,
+distinct from a fallible `main`'s 1 and a panic's 2 (§18.4). `main` never runs.
 
 ```bit
 import { readFile } from "std/fs"
