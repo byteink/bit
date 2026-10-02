@@ -18,12 +18,12 @@ anything else in your app - and needs one table, created by
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { newPostgresStore, migrate, open, Options } from "jobs"
+import { PostgresStore, migrate, open, Options } from "jobs"
 
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
   migrate(db)?
-  let store = newPostgresStore(db)
+  let store = PostgresStore(db)
   let q = open(store, Options{ workers = 4 })?
   q.run()?
   return

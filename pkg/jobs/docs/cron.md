@@ -22,7 +22,7 @@ Both go on the same `Queue` as `register`, before `run`:
 ```bit
 import { pool, Pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { newPostgresStore, migrate, open, Options, Missed, Queue } from "jobs"
+import { PostgresStore, migrate, open, Options, Missed, Queue } from "jobs"
 import { Json } from "std/json"
 import { Minute } from "std/time"
 
@@ -37,7 +37,7 @@ import { Minute } from "std/time"
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/inkwell" })?
   migrate(db)?
-  let q = open(newPostgresStore(db), Options{ workers = 4 })?
+  let q = open(PostgresStore(db), Options{ workers = 4 })?
   q.register<NightlyDigest>((job: NightlyDigest) => {
     sendDigest(job.list)?
   })
@@ -246,12 +246,12 @@ and only one of them enqueues the tick. `PostgresLocker` keeps a lease row
 per tick in the same database as the queue (`migrate` creates its table):
 
 ```bit
-import { newPostgresLocker } from "jobs"
+import { PostgresLocker } from "jobs"
 
 fn openOnEveryInstance(db: Pool, instance: string): Queue! {
   let q = open(
-    newPostgresStore(db),
-    Options{ workers = 4, locker = newPostgresLocker(db), instanceId = instance },
+    PostgresStore(db),
+    Options{ workers = 4, locker = PostgresLocker(db), instanceId = instance },
   )?
   q.schedule("0 2 * * *", NightlyDigest{ list = "readers" }, tz = "America/New_York")?
   return q
@@ -275,7 +275,7 @@ the schedule is registered:
 
 ```bit
 fn smallLeaseWindow(db: Pool): Locker {
-  return newPostgresLocker(db, keep = 200)
+  return PostgresLocker(db, keep = 200)
 }
 
 fn ledgerTooWide(q: Queue) {
@@ -286,7 +286,7 @@ fn ledgerTooWide(q: Queue) {
 ```
 
 ```text
-jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise newPostgresLocker(keep = ...)
+jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise PostgresLocker(keep = ...)
 ```
 
 A lease is stamped with the clock of the instance that takes it, so one
@@ -389,14 +389,14 @@ message, for what would otherwise misbehave hours later:
 ```text
 jobs: Options.pollInterval must be positive, got 0
 jobs: Options.visibilityTimeout must be positive, got -1
-jobs: the locker keeps 0 lease row(s) per schedule; it must keep at least 1 (newPostgresLocker(keep = ...))
+jobs: the locker keeps 0 lease row(s) per schedule; it must keep at least 1 (PostgresLocker(keep = ...))
 jobs: Missed.RunAll cap must be at least 1, got 0
-jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise newPostgresLocker(keep = ...)
+jobs: Missed.RunAll(500) exceeds the locker's lease window of 200; raise PostgresLocker(keep = ...)
 jobs: schedule 'nightly-digest|0 2 * * *|UTC' registered after start(); register schedules before start() or run()
 ```
 
 A zero `pollInterval` would spin the workers and the scheduler; a locker that
-keeps no lease rows (`newPostgresLocker(db, keep = 0)`) would forget every tick
+keeps no lease rows (`PostgresLocker(db, keep = 0)`) would forget every tick
 it wins, so `open` refuses it instead of quietly keeping one; a `RunAll` cap
 below 1 would drop ticks that are on time; a schedule registered after
 `start()` or `run()` would never be seen by the scheduler already running.
