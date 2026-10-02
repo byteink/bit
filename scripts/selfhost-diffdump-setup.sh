@@ -80,26 +80,11 @@ diffdump_setup() {
   BIT_STDLIB="$(pwd)/stdlib"
   export BIT_STDLIB
 
-  # #6435's const-string fold is on by default in the tree and absent from the
-  # pinned oracle, so the tree is pinned to the oracle's behaviour here. The
-  # oracle ignores the variable. Delete this line at the repin that carries
-  # #6435, together with constStringFoldEnabled (compiler/optparams.bit).
-  export BIT_CONST_STRING_FOLD=0
-
-  # #6472's presence-only `let (_, ok) = m[k]` is the same story: on in the
-  # tree, absent from the pinned oracle. Delete this line at the repin that
-  # carries #6472, together with mapPresenceOnlyEnabled (compiler/lowermapaccess.bit).
-  export BIT_MAP_PRESENCE=0
-
-  # #6476's join-param box reuse is on by default in the tree and absent from
-  # the pinned oracle, so the tree is pinned to the oracle's behaviour here.
-  # The oracle ignores the variable. Delete this line at the repin that carries
-  # #6476, together with strBoxJoinEnabled (compiler/optparams.bit).
-  export BIT_STRBOX_JOIN=0
-
   # #6000: IFACE_SIG, BCE_JOIN, JSON_APPEND, and (since #6192) the #5990
   # static-const closure-cell lowering are all gone as flags -- the pinned
   # ORACLE (>= 0.31.0, which carries #6000) already emits every one of them
   # unconditionally, same as this tree. So are MAPLIT, STATIC_METHODS,
   # GENERIC_EXPLODE, DCE_PARAMS and DCE_METHODS since the 0.33.0 repin (#6245).
+  # So are CONST_STRING_FOLD, MAP_PRESENCE and STRBOX_JOIN since the 0.35.0
+  # repin (#6527).
 }
