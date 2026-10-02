@@ -1,0 +1,464 @@
+// Bit standard library — http module: the client's shared HTTP/2 connections (#6465).
+//
+// An HTTP/1.1 connection carries one request at a time, so `pool.bit` parks
+// idle ones and hands each to one request. An HTTP/2 connection carries many
+// at once, so the pool keeps ONE live connection per origin and every request
+// to that origin opens a stream on it: 8 concurrent `Client.get` calls to one
+// h2 server make one TCP connect and one TLS handshake, not 8. Go's
+// `http2.Transport`, hyper and .NET's `SocketsHttpHandler` share the same way.
+//
+// The bounds, all explicit:
+//
+//   streams     at most `min(peer's SETTINGS_MAX_CONCURRENT_STREAMS,
+//               PoolLimits.maxH2Streams)` requests are in flight on a
+//               connection (`h2Entry.slots`, a counting semaphore). A request
+//               beyond that waits for a slot, within its own deadline, rather
+//               than being refused by the engine (`h2connCmdOpen`,
+//               stdlib/http2/commands.bit) or opening a second connection.
+//   idle time   a connection with no request in flight for `idleTimeoutMs` is
+//               closed, lazily, like `connPool`'s idle list.
+//   count       at most `maxIdleTotal` shared connections, one per origin; the
+//               longest-idle one is closed to make room, and when every one is
+//               busy the newcomer is used by its own request and closed after.
+//               `maxIdlePerHost = 0` turns sharing off the same way.
+//   protocol    the first dial to an origin learns whether it negotiates h2
+//               (`h2Origin.proto`). Until it is known, and for an origin known
+//               to speak h2 whose connection died, dials are single-flight
+//               (`h2Origin.dialTok`, bounded by the request's own deadline) so a burst of requests dials once; an
+//               origin known to speak HTTP/1.1 dials in parallel as before.
+//
+// Teardown. A connection is retired when its owner closes it, it fails a round
+// trip, it goes idle too long, or it is evicted. Retiring removes it from the
+// pool at once, so no new request takes it, but its transport is torn down
+// only when the last request using it has released it (`h2Pool.release`):
+// closing under a request in flight would fail that request for nothing. The
+// teardown is the four steps `h2clientExchange` (h2.bit) documents.
+//
+// Deadlines. The shared `TlsConn` carries NO deadline once the handshake is
+// done (`h2glueOpen`, h2.bit): a deadline left on it would be one request's,
+// and would kill the reader for everyone. Each request instead passes its own
+// to `Conn.roundTrip`.
+
+// What an origin's first dial found.
+const originUnknown: int = 0
+const originH1: int = 1
+const originH2: int = 2
+
+// One live h2 connection and the bookkeeping that decides when it may close.
+// `inflight`, `lastUse`, `retired` and `torn` are guarded by `h2Pool.mu`.
+class h2Entry {
+  id: int
+  key: string
+  tc: TlsConn
+  hc: H2Conn
+  // A counting semaphore: a request holds one token for the life of its
+  // stream. Capacity is the stream cap, so a send blocks at the cap.
+  slots: chan<int>
+  streamCap: int
+  // Requests holding a reference: the stream cap's holders and the ones
+  // waiting for a slot. The transport is torn down only at zero.
+  inflight: int
+  lastUse: int
+  retired: bool
+  torn: bool
+
+  // Takes a stream slot, waiting while the connection is at its cap, but not
+  // past `deadlineNs` (0 = no bound).
+  acquire(deadlineNs: int): ()! {
+    acquireToken(this.slots, deadlineNs, "${this.streamCap} streams in flight")?
+  }
+
+  // Gives a slot taken by `acquire` back.
+  free() {
+    <- this.slots
+  }
+}
+
+// Puts one token in `tokens` (a counting semaphore: capacity is the number
+// that may hold one), waiting while it is full but not past `deadlineNs` (0 =
+// no bound); `what` names the full resource in the timeout error.
+fn acquireToken(tokens: chan<int>, deadlineNs: int, what: string): ()! {
+  select {
+    case tokens <- 1:
+      return
+    default:
+  }
+  if (deadlineNs == 0) {
+    tokens <- 1
+    return
+  }
+  let timeoutCh = chan<int>(1)
+  spawn h2armTokenDeadline(deadlineNs, timeoutCh)
+  select {
+    case tokens <- 1:
+      return
+    case _ = <- timeoutCh:
+      fail newError("http2: timed out waiting for a free slot (${what})")
+  }
+}
+
+// Sends once on `timeoutCh` when `deadlineNs` has passed. Its own green thread
+// so `acquireToken`'s `select` can race it; `timeoutCh` holds one, so the send
+// never blocks even after the token won.
+fn h2armTokenDeadline(deadlineNs: int, timeoutCh: chan<int>) {
+  let remaining = deadlineNs - monotonic().ns
+  if (remaining > 0) {
+    sleep(remaining)
+  }
+  timeoutCh <- 1
+}
+
+// What one origin is known to speak, and its shared connection if it has one.
+// `dialTok` is the single-flight token (capacity 1) a dial holds, a channel
+// rather than a `Mutex` so a request waiting behind another's dial gives up at
+// its own deadline. `dialing` counts requests inside `dialSerial`, so the
+// origin is not pruned under a dial that is about to record into it.
+class h2Origin {
+  key: string,
+  proto: int,
+  dialTok: chan<int>,
+  conn: []h2Entry,
+  dialing: int,
+  since: int,
+}
+
+// What `h2Pool.take` found.
+enum H2Take {
+  Shared(h2Entry),
+  None,
+}
+
+// What a fresh dial to an https origin produced.
+enum Dialed {
+  Shared(h2Entry),
+  Plain(TlsConn),
+}
+
+// The shared connections of one `connPool`, per origin. Every method locks
+// `mu` and never holds it across I/O; a connection to tear down is collected
+// under the lock and torn down after it.
+class h2Pool {
+  limits: PoolLimits
+  mu: Mutex
+  origins: []h2Origin
+  closed: bool
+  seq: int
+
+  // The live connection for `key`, with its `inflight` incremented for the
+  // caller (who must `release` it), or `None`. Expired connections are closed
+  // on the way.
+  take(key: string, now: int): H2Take {
+    this.mu.lock()
+    let doomed = this.pruneLocked(now)
+    let got = this.takeLocked(key, now)
+    this.mu.unlock()
+    h2teardownAll(doomed)
+    return got
+  }
+
+  takeLocked(key: string, now: int): H2Take {
+    let i = this.indexLocked(key)
+    if (i < 0 || len(this.origins[i].conn) == 0) {
+      return H2Take.None
+    }
+    let o = this.origins[i]
+    o.since = now
+    let e = o.conn[0]
+    e.inflight = e.inflight + 1
+    return H2Take.Shared(e)
+  }
+
+  // Whether the first dial to `key` found it speaks HTTP/1.1, so a dial to it
+  // needs no single-flight.
+  knownH1(key: string): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let i = this.indexLocked(key)
+    return i >= 0 && this.origins[i].proto == originH1
+  }
+
+  // Records that `key` negotiated HTTP/1.1.
+  noteH1(key: string, now: int) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let o = this.originLocked(key, now)
+    o.proto = originH1
+    o.since = now
+  }
+
+  // Joins the single-flight for `key`, waiting for the dial in progress but
+  // not past `deadlineNs`. `leave` must follow a success.
+  enter(key: string, now: int, deadlineNs: int): h2Origin! {
+    this.mu.lock()
+    let o = this.originLocked(key, now)
+    o.dialing = o.dialing + 1
+    this.mu.unlock()
+    acquireToken(o.dialTok, deadlineNs, "another dial to ${key} in progress") catch e {
+      this.leaveCount(o)
+      fail e
+    }
+    return o
+  }
+
+  leave(o: h2Origin) {
+    <- o.dialTok
+    this.leaveCount(o)
+  }
+
+  leaveCount(o: h2Origin) {
+    this.mu.lock()
+    o.dialing = o.dialing - 1
+    this.mu.unlock()
+  }
+
+  // Makes `e` (created holding one reference) the shared connection for its
+  // origin, or marks it retired when it may not be shared: the pool is
+  // closed, sharing is off, the origin already has one, or `maxIdleTotal`
+  // connections are all busy. The creating request uses it either way.
+  install(e: h2Entry, now: int) {
+    this.mu.lock()
+    this.seq = this.seq + 1
+    e.id = this.seq
+    let o = this.originLocked(e.key, now)
+    o.proto = originH2
+    o.since = now
+    let doomed = []h2Entry(0)
+    if (this.closed || this.limits.maxIdlePerHost == 0 || len(o.conn) > 0) {
+      e.retired = true
+    } else {
+      doomed = this.makeRoomLocked()
+      if (this.liveLocked() >= this.limits.maxIdleTotal) {
+        e.retired = true
+      } else {
+        o.conn = [e]
+      }
+    }
+    this.mu.unlock()
+    h2teardownAll(doomed)
+  }
+
+  // Marks `e` unusable for new requests; its transport closes when the last
+  // request holding it releases it. Called by a request whose round trip failed.
+  retireEntry(e: h2Entry) {
+    this.mu.lock()
+    let last = this.retireLocked(e)
+    this.mu.unlock()
+    if (last) {
+      h2teardownAll([e])
+    }
+  }
+
+  // Drops the caller's reference to `e`, closing it when it was retired and
+  // nobody else holds it.
+  release(e: h2Entry, now: int) {
+    this.mu.lock()
+    e.inflight = e.inflight - 1
+    e.lastUse = now
+    let doomed = []h2Entry(0)
+    if (e.retired && e.inflight == 0 && !e.torn) {
+      e.torn = true
+      doomed = [e]
+    }
+    this.mu.unlock()
+    h2teardownAll(doomed)
+  }
+
+  // Retires every shared connection; the pool stays usable.
+  closeAll() {
+    this.mu.lock()
+    let doomed = []h2Entry(0)
+    for o of this.origins {
+      if (len(o.conn) > 0) {
+        let e = o.conn[0]
+        if (this.retireLocked(e)) {
+          doomed = append(doomed, e)
+        }
+      }
+    }
+    this.mu.unlock()
+    h2teardownAll(doomed)
+  }
+
+  // `closeAll`, and from now on nothing new is shared: the owner is gone.
+  retire() {
+    this.mu.lock()
+    this.closed = true
+    this.mu.unlock()
+    this.closeAll()
+  }
+
+  // Removes `e` from its origin and marks it retired; true when it is idle now
+  // and so must be torn down by the caller. Caller holds `mu`.
+  retireLocked(e: h2Entry): bool {
+    e.retired = true
+    let i = this.indexLocked(e.key)
+    if (i >= 0 && len(this.origins[i].conn) > 0 && this.origins[i].conn[0].id == e.id) {
+      this.origins[i].conn = []h2Entry(0)
+    }
+    if (e.inflight == 0 && !e.torn) {
+      e.torn = true
+      return true
+    }
+    return false
+  }
+
+  // Index of `key` in `origins`, or -1; caller holds `mu`.
+  indexLocked(key: string): int {
+    let i = 0
+    while (i < len(this.origins)) {
+      if (this.origins[i].key == key) {
+        return i
+      }
+      i = i + 1
+    }
+    return -1
+  }
+
+  // The record for `key`, made if absent; caller holds `mu`.
+  originLocked(key: string, now: int): h2Origin {
+    let i = this.indexLocked(key)
+    if (i >= 0) {
+      return this.origins[i]
+    }
+    let o = h2Origin{
+      key = key, proto = originUnknown, dialTok = chan<int>(1), conn = []h2Entry(0), dialing = 0, since = now,
+    }
+    this.origins = append(this.origins, o)
+    return o
+  }
+
+  // Shared connections right now; caller holds `mu`.
+  liveLocked(): int {
+    let n = 0
+    for o of this.origins {
+      n = n + len(o.conn)
+    }
+    return n
+  }
+
+  // At `maxIdleTotal`, retires the connection idle longest (never a busy one);
+  // caller holds `mu`.
+  makeRoomLocked(): []h2Entry {
+    if (this.liveLocked() < this.limits.maxIdleTotal) {
+      return []h2Entry(0)
+    }
+    let best = -1
+    let i = 0
+    while (i < len(this.origins)) {
+      let c = this.origins[i].conn
+      if (len(c) > 0 &&
+        c[0].inflight == 0 &&
+        (best < 0 || c[0].lastUse < this.origins[best].conn[0].lastUse)) {
+        best = i
+      }
+      i = i + 1
+    }
+    if (best < 0) {
+      return []h2Entry(0)
+    }
+    let e = this.origins[best].conn[0]
+    if (this.retireLocked(e)) {
+      return [e]
+    }
+    return []h2Entry(0)
+  }
+
+  // Retires every connection idle longer than `idleTimeoutMs` and forgets
+  // origins untouched that long with nothing live or dialing, so the list is
+  // bounded by what was used recently; caller holds `mu`.
+  pruneLocked(now: int): []h2Entry {
+    let limit = this.limits.idleTimeoutMs * 1000000
+    let doomed = []h2Entry(0)
+    let keep = []h2Origin(0)
+    for o of this.origins {
+      if (len(o.conn) > 0 && o.conn[0].inflight == 0 && now - o.conn[0].lastUse >= limit) {
+        let e = o.conn[0]
+        if (this.retireLocked(e)) {
+          doomed = append(doomed, e)
+        }
+      }
+      if (len(o.conn) > 0 || o.dialing > 0 || now - o.since < limit) {
+        keep = append(keep, o)
+      }
+    }
+    this.origins = keep
+    return doomed
+  }
+}
+
+fn newH2Pool(limits: PoolLimits): h2Pool {
+  return h2Pool{
+    limits = limits,
+    mu = newMutex(),
+    origins = []h2Origin(0),
+    closed = false,
+    seq = 0,
+  }
+}
+
+// The four-step teardown (`h2clientExchange`, h2.bit) of every entry in `list`.
+fn h2teardownAll(list: []h2Entry) {
+  for e of list {
+    h2teardown(e.tc, e.hc)
+  }
+}
+
+// The next connection to an https origin: single-flight unless the origin is
+// known to speak HTTP/1.1, where parallel dials are the right thing. Returns a
+// reference to the origin's shared h2 connection, or a plain TLS connection.
+fn dialOrigin(key: string, u: Url, extras: RequestExtras): Dialed! {
+  if (extras.pool.h2.knownH1(key)) {
+    return dialTlsOrigin(key, u, extras)?
+  }
+  return dialSerial(key, u, extras)?
+}
+
+// Dials under the origin's token, after checking whether the dial that held it
+// before this one left a shared connection to use instead.
+fn dialSerial(key: string, u: Url, extras: RequestExtras): Dialed! {
+  let hp = extras.pool.h2
+  let o = hp.enter(key, monotonic().ns, extras.deadline)?
+  let d = dialHeld(key, u, extras) catch e {
+    hp.leave(o)
+    fail e
+  }
+  hp.leave(o)
+  return d
+}
+
+fn dialHeld(key: string, u: Url, extras: RequestExtras): Dialed! {
+  match (extras.pool.h2.take(key, monotonic().ns)) {
+    Shared(e) => return Dialed.Shared(e)
+    None => return dialTlsOrigin(key, u, extras)?
+  }
+}
+
+// One TLS dial to `u`: an HTTP/1.1 connection handed back as it is, an h2 one
+// opened (`h2glueOpen`, h2.bit) and made the origin's shared connection.
+fn dialTlsOrigin(key: string, u: Url, extras: RequestExtras): Dialed! {
+  let cfg = extras.config
+  if (len(cfg.alpn) == 0) {
+    cfg.alpn = ["h2", "http/1.1"]
+  }
+  let tc = dialTlsConn(u, cfg, extras.deadline)?
+  let hp = extras.pool.h2
+  if (tc.alpnProtocol() != "h2") {
+    hp.noteH1(key, monotonic().ns)
+    return Dialed.Plain(tc)
+  }
+  let e = h2glueOpen(tc, key, extras)?
+  hp.install(e, monotonic().ns)
+  return Dialed.Shared(e)
+}
+
+// One request on the shared connection `e`, whose reference the caller holds:
+// released on every exit, so a failed request never pins the transport open.
+fn runH2(e: h2Entry, method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  let hp = extras.pool.h2
+  let res = h2clientExchange(e, method, u, body, extras) catch err {
+    hp.release(e, monotonic().ns)
+    fail err
+  }
+  hp.release(e, monotonic().ns)
+  return res
+}

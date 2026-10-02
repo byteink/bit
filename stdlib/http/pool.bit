@@ -4,7 +4,9 @@
 // down, so a loop of N requests to one host paid N TCP connects (and, for
 // https, N TLS handshakes). Go's `http.Transport`, hyper and .NET's
 // `SocketsHttpHandler` all keep a bounded list of idle connections per origin
-// instead; this file is that list for HTTP/1.1, with the same three bounds:
+// instead; this file is that list for HTTP/1.1, with the same three bounds. An
+// origin that negotiates HTTP/2 needs no list: h2pool.bit keeps ONE connection
+// for it and every request is a stream on it (#6465), under `maxH2Streams`.
 //
 //   maxIdlePerHost  idle connections kept per origin (Go's
 //                   `MaxIdleConnsPerHost`, default 2).
@@ -55,8 +57,14 @@ export class PoolLimits {
   // Idle connections kept across all origins; at least `maxIdlePerHost`.
   export maxIdleTotal: int = 100,
   // Milliseconds a connection may stay idle before it is closed instead of
-  // reused; positive.
+  // reused; positive. Applies to HTTP/2 connections too, by time since their
+  // last request finished.
   export idleTimeoutMs: int = 90000,
+  // Most requests in flight at once on the one shared HTTP/2 connection per
+  // origin (h2pool.bit); at least 1. The effective cap is the lower of this
+  // and the peer's SETTINGS_MAX_CONCURRENT_STREAMS, and a request beyond it
+  // waits for a stream to finish, within its own deadline.
+  export maxH2Streams: int = 100,
 }
 
 // Rejects a `PoolLimits` that is a mistake rather than guessing what was meant.
@@ -69,6 +77,9 @@ fn validatePoolLimits(l: PoolLimits): ()! {
   }
   if (l.idleTimeoutMs <= 0) {
     fail newError("PoolLimits.idleTimeoutMs is ${l.idleTimeoutMs}; it must be positive")
+  }
+  if (l.maxH2Streams < 1) {
+    fail newError("PoolLimits.maxH2Streams is ${l.maxH2Streams}; it must be at least 1")
   }
 }
 
@@ -92,6 +103,9 @@ class connPool {
   mu: Mutex
   idle: []idleConn
   closed: bool
+  // The shared HTTP/2 connections (h2pool.bit), one per origin: an h2 origin
+  // has no use for an idle list, its one connection carries every request.
+  h2: h2Pool
 
   // The most recently parked live connection for `key` (LIFO: the one most
   // likely still open), or `Miss`. Expired connections are closed on the way.
@@ -131,6 +145,7 @@ class connPool {
 
   // Closes every connection idle now. The pool stays usable.
   closeAll() {
+    this.h2.closeAll()
     this.mu.lock()
     defer this.mu.unlock()
     for c of this.idle {
@@ -142,6 +157,7 @@ class connPool {
   // `closeAll`, and from now on every connection handed back is closed: the
   // pool's owner is gone, so nothing may park here and outlive it.
   retire() {
+    this.h2.retire()
     this.closeAll()
     this.mu.lock()
     this.closed = true
@@ -188,7 +204,9 @@ fn withoutIdle(list: []idleConn, at: int): []idleConn {
 }
 
 fn newConnPool(limits: PoolLimits): connPool {
-  return connPool{ limits = limits, mu = newMutex(), idle = []idleConn(0), closed = false }
+  return connPool{
+    limits = limits, mu = newMutex(), idle = []idleConn(0), closed = false, h2 = newH2Pool(limits),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,11 +294,35 @@ fn poolKey(u: Url): string {
   return "${schemeName(u)}://${hostHeaderValue(u)}"
 }
 
-// `method u` over HTTP/1.1 or, when an https origin negotiates it, h2: a
-// parked connection when the pool has one, else a fresh dial. A parked
-// connection that fails is retried once on a fresh one for an idempotent
-// method only; a POST fails with the error it got.
+// `method u` over HTTP/1.1 or, when an https origin negotiates it, h2: the
+// origin's shared h2 connection or a parked HTTP/1.1 one when the pool has one,
+// else a fresh dial. A reused connection that fails is retried once on a fresh
+// one for an idempotent method only; a POST fails with the error it got.
 fn exchangeOrigin(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  if (u.https) {
+    match (extras.pool.h2.take(poolKey(u), monotonic().ns)) {
+      Shared(e) => return reuseH2(e, method, u, body, extras)?
+      None => return exchangeParked(method, u, body, extras)?
+    }
+  }
+  return exchangeParked(method, u, body, extras)?
+}
+
+// `exchangeOrigin` for a request whose origin has a live shared h2 connection
+// `e` (reference held for the caller): a stream on it, retried once on a fresh
+// connection when the stream failed and `method` may be repeated.
+fn reuseH2(e: h2Entry, method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  let res = runH2(e, method, u, body, extras) catch err {
+    if (!isIdempotent(method)) {
+      fail err
+    }
+    return exchangeFresh(method, u, body, extras)?
+  }
+  return res
+}
+
+// The HTTP/1.1 half of `exchangeOrigin`: a parked connection, else a dial.
+fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): Response! {
   let key = poolKey(u)
   match (extras.pool.take(key, monotonic().ns)) {
     Hit(s) => {
@@ -304,16 +346,14 @@ fn exchangeFresh(method: string, u: Url, body: string, extras: RequestExtras): R
     let req = buildRequest(method, u, extras.block, body, false)
     return runOn(netStream{ conn = conn }, poolKey(u), req, method, extras)?
   }
-  let cfg = extras.config
-  if (len(cfg.alpn) == 0) {
-    cfg.alpn = ["h2", "http/1.1"]
+  let d = dialOrigin(poolKey(u), u, extras)?
+  match (d) {
+    Shared(e) => return runH2(e, method, u, body, extras)?
+    Plain(tc) => {
+      let req = buildRequest(method, u, extras.block, body, false)
+      return runOn(tlsStream{ conn = tc }, poolKey(u), req, method, extras)?
+    }
   }
-  let tc = dialTlsConn(u, cfg, extras.deadline)?
-  if (tc.alpnProtocol() == "h2") {
-    return h2clientExchange(tc, method, u, body, extras)?
-  }
-  let req = buildRequest(method, u, extras.block, body, false)
-  return runOn(tlsStream{ conn = tc }, poolKey(u), req, method, extras)?
 }
 
 fn dialConn(u: Url, deadline: int): Conn! {
