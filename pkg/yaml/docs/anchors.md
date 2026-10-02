@@ -114,10 +114,10 @@ template system building shared defaults at runtime, say - that wants the
 same alias-safe substitution without writing YAML text first:
 
 ```bit
-import { Yaml, newAnchorTable, yamlAnchorDefine, yamlAnchorResolve, yamlAsInt, yamlDefaultLimits } from "yaml"
+import { Yaml, AnchorTable, yamlAnchorDefine, yamlAnchorResolve, yamlAsInt, yamlDefaultLimits } from "yaml"
 
 fn main(): ()! {
-  let t = newAnchorTable()
+  let t = AnchorTable()
   yamlAnchorDefine(t, "shared", Yaml.YamlInt(1))?
   let resolved = yamlAnchorResolve(t, "shared", yamlDefaultLimits())?
   assert(unwrap(yamlAsInt(resolved)) == 1, "resolve gave back exactly what define stored")
