@@ -3049,8 +3049,8 @@ fallback.
 `readonly` do. Assigning a module `const` is `E0185`, however it is spelled: `=`,
 a compound assignment, `++` or `--`, a tuple assignment, a `const` imported by
 name, or one reached through a namespace (`ns.limit`). Writing a **field** of the
-class object a `const` holds is allowed. A `let` can be reassigned anywhere in its
-module.
+class object a `const` holds, or an entry or element of a map or slice it holds,
+is allowed. A `let` can be reassigned anywhere in its module.
 
 ```bit
 class Config {
@@ -3066,13 +3066,13 @@ fn tune() {
 
 fn main() {
   tune()
+  cfg.retries = 4 // allowed: writes a field of the object cfg holds
 }
 ```
 
-With `cfg` the module `const` above, `cfg.retries = 4` is allowed: it writes a
-field of the object the const holds.
-`cfg = Config{ retries = 5 }` is `E0185`:
-it reassigns the const itself.
+`cfg = Config{ retries = 5 }` in `main` is `E0185`: it reassigns the const itself.
+A function-local `const` follows the same rule, except that reassigning it is
+`E0062`.
 
 A `const` that holds an array or other value type directly has no object to write
 through: its elements are part of the binding, so `K[i] = v` stays rejected
