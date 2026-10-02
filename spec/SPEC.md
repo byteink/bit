@@ -537,14 +537,18 @@ tuple_pat  = "(" pat { "," pat } ")" .
 pat        = IDENT | "_" | tuple_pat .
 ```
 
-- `const` bindings must have an initializer and are immutable; their value must be
-  a **compile-time constant expression** (§15.4) at top level, or any expression
-  inside a function (a function-local `const` is an immutable single-assignment
-  binding, not required to be compile-time constant). A top-level `const` may also
-  bind a **constant `[N]T` composite literal** (`[N]T{...}` whose every element is
-  a compile-time constant scalar); it is materialized once into the read-only
-  class (§11.11) - a `.rodata` image, not a per-reference allocation - and, being
-  read-only, a write through it (`K[i] = v`) is rejected.
+- `const` bindings must have an initializer and are immutable; a function-local
+  `const` takes any expression (an immutable single-assignment binding, not
+  required to be compile-time constant). A top-level `const` whose initializer is
+  a **compile-time constant expression** (§15.4) is folded and inlined at each
+  use; any other top-level `const` is set once at startup, before `main` (§11.11),
+  except in a `runtime/` module, where it must fold (`E0064`). Assigning a module
+  `const` is `E0185`; writing a field of the object it holds is allowed (§11.11).
+  A top-level `const` may also bind a **constant `[N]T` composite literal**
+  (`[N]T{...}` whose every element is a compile-time constant scalar); it is
+  materialized once into the read-only class (§11.11) - a `.rodata` image, not a
+  per-reference allocation - and, being read-only, a write through it
+  (`K[i] = v`) is rejected.
 - `let` bindings are mutable. A `let` without an initializer is set to the **zero
   value** (§13.4) of its declared type; the type annotation is then required.
 - If both `:` type and `=` initializer are present, the initializer must be
@@ -1085,7 +1089,8 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   convenience, and every construction of the type agrees on them.
 - For a field whose own type is not a class, the initializer is a
   **constant expression** (§15.4), folded at compile time. It may name a
-  module-level `const`, including an imported one, and is evaluated in the
+  module-level `const` that folds, including an imported one (a `const` set at
+  startup, §11.11, does not fold), and is evaluated in the
   module that declares the field - never in the module that constructs the
   value. A non-constant initializer is `E0064`; one that folds but does not
   fit `i64` is `E0084`; one that folds to the wrong type is `E0041`. Because
@@ -2237,11 +2242,12 @@ interface is a separate extension this section does not make.
 - **Array** `[N]T`: fixed length `N` (a compile-time constant), value type, copied
   on assignment. Built with an array literal or zero-valued via `let a: [N]T`.
   `N` is a `const_expr`: an integer literal, a module-level `const` of integer
-  type, or an expression over those (`[rows * cols]i64`). It is folded at compile
-  time; a length that does not fold to a non-negative integer is E0064, and a
-  function-local `let` is not a constant however evident its value. Note the
-  type-prefixed literal form `[N]T{...}` (§12.3) still requires a literal length,
-  because `[x]` there is ambiguous with a one-element slice literal.
+  type that folds to a constant, or an expression over those
+  (`[rows * cols]i64`). It is folded at compile time; a length that does not fold
+  to a non-negative integer is E0064, and neither a function-local `let` nor a
+  module `const` set at startup (§15.4) is a constant however evident its value.
+  Note the type-prefixed literal form `[N]T{...}` (§12.3) still requires a
+  literal length, because `[x]` there is ambiguous with a one-element slice literal.
 - **Map** `map<K,V>`: hash map; reference type; `K` must be a comparable type
   (§14.6). Built with `map<K,V>()`, `map<K,V>(n)` (a capacity hint for about n
   entries, ADVISORY: it never changes the map's contents or behavior, only how
@@ -2935,83 +2941,210 @@ independent, so the loader slides the whole image and absolute addresses differ
 between runs. In both, `entryOf(f)` is invariant *within* a run and
 `int(entryOf(g)) - int(entryOf(f))` is invariant *across* runs.
 
-### 11.11 Module-Level State (unmanaged subset)
+### 11.11 Module-Level State
 
-A `let` at module scope declares **mutable state that outlives every call**:
+A `let` or `const` at module scope declares **state that outlives every call**:
+one cell for the whole program, whose value is in place before `main` begins.
 
+```bit
+class Config {
+  retries: int,
+}
+
+let liveBytes: int = 0                          // mutable; a constant, so a static image
+const retries: int = 3                          // folded at compile time, inlined at each use
+const cfg: Config = Config{ retries = 3 }       // a class: built at startup, set once
+let seen: map<string, int> = map<string, int>() // a traced type: the collector scans it
+
+fn main() {}
 ```
-let liveBytes: i64 = 0        // one cell for the whole program
-let freeHeads: [37]*u8        // zero-valued; an inline array of raw pointers
-let lockWord: i32 = 0         // addressable: ptrOf(lockWord) is a *i32
+
+Five rules say what a module cell may hold, when it is initialized, what happens
+when that fails, what `const` and `let` mean, and who may name it. Two kinds of
+cell keep stricter rules than these, listed after them under "Strict cells".
+
+**1. A module cell may hold any type; the collector scans it exactly when its
+type is traced.** An *untraced* type is an integer, float, or bool; a raw pointer
+`*T` (§11.4); or a fixed array `[N]U` of those. Such a cell is never scanned, so a
+raw pointer in it is never mistaken for a reference. Every other type - `string`,
+`[]T`, `map`, `chan`, a class, an interface, a payload-carrying enum, a function
+value, a tuple - is *traced*: the cell is a root, and what it refers to stays
+alive for the life of the program.
+
+```bit
+class Pool {
+  size: int,
+}
+
+let pool: Pool = Pool{ size = 4 } // traced: scanned, so the Pool is never collected
+let live: int = 0                 // untraced: never scanned
+let heads: [37]i64                // untraced: a fixed array of integers
+
+fn main() {}
 ```
 
-This is the storage the runtime is built out of - the collector's heap counters,
-the allocator's free-list heads, the scheduler's run queue. `const` at module
-scope is unrelated: a `const` is a compile-time value inlined at each use and has
-no address, whereas a `let` is a real cell with a stable address.
+No marker keyword says "traced": the type already carries that fact, so the
+syntax is the plain `let`/`const` that Go, Java, C#, Node and Rust use for the
+same thing. A cell of an untraced type costs the collector nothing.
 
-**The collector never scans module state.** That is the central decision, and
-these are the rules that make it sound:
+**2. An initializer may be any expression.** A call, a composite literal, a
+fallible call with `?` or `catch` (§18.3) are all accepted. Two shapes exist:
 
-1. **The type must be untraced**: an integer, float, or bool; a raw pointer `*T`
-   (§11.4); or a fixed array `[N]U` of those. Anything the collector would trace -
-`string`, `[]T`, `map`, `chan`, a class, an interface, a payload-carrying
-   enum, a function value - is a **compile error**, not a silent hazard.
-2. **The initializer must be a compile-time constant** (§15.4), or absent, in
-   which case the cell is zero-valued (§13.4). An array-typed `let` takes no
-   initializer at all.
-3. **The binding is a single name.** Destructuring has no meaning for a
-   statically laid out cell.
+- A **constant initializer** (§15.4) on a cell of an untraced type ships as a
+  **static byte image** in the object file. It costs no startup work, and the
+  cell holds its value before any startup initializer runs.
+- **Every other initializer runs at startup**, before `main`: a call or any other
+  non-constant expression, and any initializer on a cell of a traced type. An
+  initializer allocates and calls like any function body, because it runs on the
+  main task with the allocator, collector and scheduler up.
 
-Every module-level cell is **16-byte aligned**, whatever its type. This is a
-guarantee, not an artifact of layout: rule 1 admits a fixed array `[N]U` so the
-runtime can carve its own memory out of one, and a green-thread stack is exactly
-that use. Both supported ABIs require a 16-byte-aligned stack pointer - AAPCS64
-faults on a misaligned `sp`, SysV x86-64 requires it at call boundaries - so
-aligning to the element type instead would place an array at `addr % 16 == 8`
-for some declaration orders and not others, making the fault depend on the order
-of unrelated declarations. That is the silent, order-dependent hazard rule 1
-exists to rule out, so the alignment is uniform rather than natural. The cost is
-at most 8 bytes of padding per cell.
+A `let` with no initializer is zero-valued (§13.4), and its type annotation is
+then required. A `const` always has one.
 
-Rule 1 is what makes not scanning correct rather than merely cheap. The obvious
-alternative - trace module state as a GC root - is *actively wrong* for the first
-real consumers: the allocator's free-list heads point into unmanaged `mmap` span
-memory that carries no object header, and the scheduler's run queue holds
-runtime-owned `Task` pointers. Walking either as an object reference would decode
-arbitrary bytes as a header. The collector's own bookkeeping cannot be traced by
-the collector either, without circularity. So module state is defined as the
-place references *cannot* go, and the checker enforces it.
+```bit
+fn defaultRetries(): int {
+  return 3
+}
 
-Loosening rule 1 later is a pure relaxation: any program valid today stays valid
-if a traced module-state form is ever added. It would have to be **explicitly**
-marked as traced, never traced by default, for the reason above.
+let limit: int = 8 * 1024                  // constant, untraced: a static image
+let retries: int = defaultRetries()        // a call: runs at startup
+let names: []string = []string{ "a", "b" } // traced type: runs at startup
+let scratch: [64]int                       // no initializer: zero-valued
 
-Module state is **private to the module that declares it**, even when `export`ed:
-a `const` has a cross-module form because it is a value inlined at each use, but
-a `let` is one cell, and another module cannot name it. Referencing one from
+fn main() {}
+```
+
+**3. Startup runs imported modules first, then top to bottom, and a failure stops
+the program before `main`.** Every module's startup initializers run to completion
+before the first statement of `main`. A module's imports run before the module,
+and a cycle of imports is already rejected (`E0044`, §17.2), so the order of
+modules is total. Within one module the initializers run in source order.
+
+An initializer that is fallible (§18.2) may propagate with `?` or recover with
+`catch`. A failure that reaches the top of an initializer stops the program before
+`main`: it prints one line to stderr and exits with a **non-zero exit code
+distinct from a panic's** (§18.4). `main` never runs.
+
+```bit
+import { readFile } from "std/fs"
+
+const motd: string = readFile("motd.txt") catch "welcome" // a failure falls back
+const secret: string = readFile("secret.key")?            // a failure stops the program
+
+fn main() {}
+```
+
+If `secret.key` cannot be read, the program prints
+
+```text
+error: module <path> failed to start: <message> (<file>:<line>)
+```
+
+with `<path>` the module's import path, `<message>` the error's `message()`, and
+`<file>:<line>` the failing initializer. `catch` on the line is the explicit
+fallback.
+
+**4. A `const` is set once; a `let` can be reassigned.** `const` fixes the
+*binding*, not the object it refers to, as JavaScript `const`, Java `final` and C#
+`readonly` do. Assigning a module `const` is `E0185`, however it is spelled: `=`,
+a compound assignment, `++` or `--`, a tuple assignment, a `const` imported by
+name, or one reached through a namespace (`ns.limit`). Writing a **field** of the
+class object a `const` holds is allowed. A `let` can be reassigned anywhere in its
+module.
+
+```bit
+class Config {
+  retries: int,
+}
+
+const cfg: Config = Config{ retries = 3 }
+let attempts: int = 0
+
+fn tune() {
+  attempts = attempts + 1 // allowed: a let is reassigned
+}
+
+fn main() {
+  tune()
+}
+```
+
+```text
+cfg.retries = 4               // allowed: a field of the object the const holds
+cfg = Config{ retries = 5 }   // E0185: cannot assign to module constant 'cfg'
+```
+
+A `const` that holds an array or other value type directly has no object to write
+through: its elements are part of the binding, so `K[i] = v` stays rejected
+(`E0062`). Synchronizing a field write is the programmer's job, as is
+synchronizing a `let`'s reassignment: two tasks that write one cell concurrently
+are a data race (§13.7), as with a Go package-level `var`.
+
+**5. A module cell is private to the module that declares it, and binds one
+name.** This holds even when the declaration is `export`ed: a `const` that folds
+to a constant has a cross-module form because it is a value inlined at each use,
+but a `let` is one cell, and another module cannot name it. Referencing one from
 outside its module is a compile error. Expose it through exported functions
-instead - which is how the runtime is structured anyway, and works today:
+instead:
 
-```
+```bit
 // counters.bit
-let hits: i64 = 0
-export fn recordHit(): i64 {
+let hits: int = 0
+
+export fn recordHit(): int {
   hits = hits + 1
   return hits
 }
 ```
 
-Because the initial value is a constant, each cell ships as a static byte image
-in the object file. There is **no run-time initialization pass**, and therefore no
-initialization-order question: every cell holds its declared value before `main`
-begins, whatever order the declarations appear in, across modules. Initializers
-cannot call functions or run arbitrary code - that is what makes this true.
+Destructuring (`let (a, b) = ...`) has no meaning for a statically laid out cell,
+so a module `let` binds a single name (`E0082`).
 
-Reaching module state is **pure address arithmetic** - no load of a descriptor, no
-allocation, no safepoint - so it is legal inside a `@nosplit` body (§10.3.1), and
-`ptrOf` (§11.5) yields its address for the atomic builtins. Those two properties
-are what the free lists and the run queue actually require.
+#### Strict cells
+
+Two kinds of cell keep the narrower rules this section had before traced module
+state existed, because the collector cannot scan them:
+
+- **Every cell in a module under the compiler tree's `runtime/` directory.** The
+  collector cannot trace its own bookkeeping, and the first real consumers hold
+  memory it must not walk: the allocator's free-list heads point into unmanaged
+  `mmap` span memory that carries no object header, and the scheduler's run queue
+  holds runtime-owned `Task` pointers. Walking either as an object reference
+  would decode arbitrary bytes as a header.
+- **Every `@threadlocal` cell**, below: the root table covers process-wide cells,
+  not one copy per thread.
+
+In a strict cell the type must be untraced (otherwise `E0082`), and the
+initializer must be a compile-time constant (§15.4) or absent, in which case the
+cell is zero-valued (§13.4); a non-constant one is `E0064`. An array-typed `let`
+takes no initializer at all (`E0082`). A `const` in a `runtime/` module must fold,
+as every top-level `const` did (`E0064`). Because the initializer is constant,
+each strict cell ships as a static byte image, so there is no startup work for it
+and no initialization-order question.
+
+```text
+// in a module under runtime/
+let heads: [37]*u8       // ok: untraced, zero-valued
+let queue: []Task        // E0082: only untraced types may live at module scope in a runtime/ module
+let n: int = count()     // E0064: module-level 'let' initializer must be a compile-time constant expression
+```
+
+Every module-level cell is **16-byte aligned**, whatever its type. This is a
+guarantee, not an artifact of layout: the untraced-type rule admits a fixed array
+`[N]U` so the runtime can carve its own memory out of one, and a green-thread
+stack is exactly that use. Both supported ABIs require a 16-byte-aligned stack
+pointer - AAPCS64 faults on a misaligned `sp`, SysV x86-64 requires it at call
+boundaries - so aligning to the element type instead would place an array at
+`addr % 16 == 8` for some declaration orders and not others, making the fault
+depend on the order of unrelated declarations. That is the silent,
+order-dependent hazard the untraced-type rule exists to rule out, so the
+alignment is uniform rather than natural. The cost is at most 8 bytes of padding
+per cell.
+
+Reaching a module cell is **pure address arithmetic** - no load of a descriptor,
+no allocation, no safepoint - so it is legal inside a `@nosplit` body (§10.3.1),
+and `ptrOf` (§11.5) yields its address for the atomic builtins. Those two
+properties are what the free lists and the run queue actually require.
 
 #### Storage classes
 
@@ -3023,12 +3156,14 @@ Module state is a *storage class*, not a single feature. Three are specified:
 | `@threadlocal let x: T` | one per **OS thread** | yes      | implemented on ELF; Mach-O is rejected at emission |
 | read-only static data   | one per **process**   | **no**   | mechanism implemented, every target; no surface syntax yet |
 
-Rules 1–3 apply identically to all three - the type and initializer restrictions
-come from "the collector does not scan this cell", which is equally true
-per-thread. They differ in how many cells exist, whether the loader maps them
-writable, and how the address is materialized: process-wide state is a plain data
-symbol, per-thread state needs a thread-local section and TLS relocations, and
-read-only state is a plain symbol in a non-writable section.
+The strict rules above apply to the per-thread and read-only classes - the type
+and initializer restrictions come from "the collector does not scan this cell",
+which is equally true per-thread. A process-wide cell outside `runtime/` is the
+general case of rules 1-5. The classes differ in how many cells exist, whether
+the loader maps them writable, and how the address is materialized:
+process-wide state is a plain data symbol, per-thread state needs a
+thread-local section and TLS relocations, and read-only state is a plain symbol
+in a non-writable section.
 
 **The read-only class** places one image for the program in `.rodata` (ELF) or
 `__TEXT,__const` (Mach-O), so the loader maps it without write permission. It
@@ -3036,7 +3171,7 @@ exists for **static tables** - SHA round constants, AES S-boxes, SHA-3 round
 constants - which otherwise have to be spelled as a private function returning a
 literal, costing one GC allocation on every call, i.e. per hash block.
 
-Not scanning it is sound for a second, simpler reason than rules 1–3: a read-only
+Not scanning it is sound for a second, simpler reason than the strict rules: a read-only
 image cannot be mutated, so it can never come to hold a pointer to a moved
 object. This is the one class that may carry **link-time relocations**, and only
 one kind: a 64-bit absolute pointer, which is what a `[]T` slice header's `buf`
@@ -3052,7 +3187,9 @@ change.
 
 `@threadlocal` attaches to a module-level `let` only. It is the sole attribute a
 `let` accepts, it takes no argument, and it is rejected on a local `let`, on a
-`const`, and on anything else.
+`const`, and on anything else. A `@threadlocal` cell keeps the strict rules
+(§11.11, "Strict cells"): an untraced type and a constant initializer, whatever
+module it is in.
 
 The access sequence is where the two classes stop being symmetric, and the
 difference is normative. Process-wide state is reached by pure address
@@ -3079,7 +3216,7 @@ The *linker* half is already done on every target - `PT_TLS` and local-exec
 relocations on both ELF arches, TLV descriptors on Mach-O - and the runtime
 boots a thread pointer for the main thread.
 
-A per-thread cell obeys rules 1–3 above, so it likewise ships as a static byte
+A per-thread cell is a strict cell, so it likewise ships as a static byte
 image: the image is the *template* every thread's copy is initialized from, which
 is why the initializer must still be a compile-time constant. A thread created
 outside the runtime's own spawn path gets a correct copy only if its thread
@@ -4918,6 +5055,31 @@ default (`i64`) - one whose value needs bit 63, e.g. `0xFFFFFFFFFFFFFFFF` or
 `18446744073709551615` - takes `u64` instead. A negative literal (`-1`) keeps
 the signed default regardless of magnitude.
 
+A module-level `const` is a constant expression only when its initializer
+**folds** at compile time. One whose initializer does not fold - a call, a class
+composite literal, any value only the running program can build - is set once at
+startup (§11.11): it has a type, but no value at compile time, so it is not an
+untyped constant and cannot appear where a constant expression is required.
+Using one as an array length is `E0064`, with a hint that names the cause. A
+`const` computed from a startup `const` is itself set at startup.
+
+```bit
+fn measure(): int {
+  return 8
+}
+
+const fixed = 8            // folds: a constant, usable as an array length
+const measured = measure() // a call: set at startup, so not a constant
+
+fn main() {
+  let a: [fixed]int // ok
+}
+```
+
+```text
+let b: [measured]int   // E0064: array length must be a compile-time constant integer
+```
+
 ---
 
 ## 16. Concurrency
@@ -5100,6 +5262,10 @@ fn main(): int { ... }     // returned int is the process exit code
 fn main(): ()! { ... }     // a returned error prints to stderr, exit code 1
 fn main(): int! { ... }    // on ok the int is the exit code; on error, as above
 ```
+
+Before `main` runs, the program's module-level startup initializers have run, in
+import order, and a failure in one stops the program without entering `main`
+(§11.11).
 
 `main` takes no parameters; command-line arguments and environment are read via
 the standard library (`std/os`). A non-executable (library) module has no `main`.
