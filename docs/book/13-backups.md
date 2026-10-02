@@ -47,11 +47,11 @@ encrypts and appends an authentication tag; `open` recomputes that tag and
 produces plaintext:
 
 ```bit
-import { newGcm, randomBytes } from "std/crypto"
+import { randomBytes, AesGcm } from "std/crypto"
 
 fn roundTrip(key: []byte, plaintext: []byte): []byte! {
   let nonce = randomBytes(12)
-  let cipher = newGcm(key)?
+  let cipher = AesGcm(key)?
   let ciphertext = cipher.seal(nonce, plaintext, []byte(0))
   return cipher.open(nonce, ciphertext, []byte(0))?
 }
@@ -126,7 +126,7 @@ export class Draft {
 }
 
 import { crc32c } from "std/hash"
-import { newGcm } from "std/crypto"
+import { AesGcm } from "std/crypto"
 import { gzip } from "std/compress"
 
 // Appends `s` as a 4-byte big-endian length followed by its bytes.
@@ -201,7 +201,7 @@ export fn deserializeDrafts(data: []byte): []Draft! {
 // then the ciphertext itself. `key` is 16 or 32 bytes (AES-128/256-GCM) and
 // `nonce` must never repeat under the same key.
 export fn backupDrafts(drafts: []Draft, key: []byte, nonce: []byte): []byte! {
-  let cipher = newGcm(key)?
+  let cipher = AesGcm(key)?
   let ciphertext = cipher.seal(nonce, serializeDrafts(drafts), []byte(0))
   let sum = crc32c(ciphertext)
   let out = []byte(0)
@@ -229,7 +229,7 @@ export fn restoreDrafts(blob: []byte, key: []byte): []Draft! {
   if (crc32c(ciphertext) != want) {
     fail newError("backup: corrupted (checksum mismatch)")
   }
-  let cipher = newGcm(key)?
+  let cipher = AesGcm(key)?
   let plaintext = cipher.open(nonce, ciphertext, []byte(0))?
   return deserializeDrafts(plaintext)?
 }
@@ -345,7 +345,7 @@ this book covers.
 
 ## Sharp edges
 
-- `newGcm` accepts a 16- or 32-byte key only, and `seal`/`open` need a
+- `AesGcm(key)` accepts a 16- or 32-byte key only, and `seal`/`open` need a
   12-byte nonce - a wrong length panics. Generate both with
   `std/crypto.randomBytes` (never a hand-picked value like the fixed key
   above, which exists here only so this page's output does not change on

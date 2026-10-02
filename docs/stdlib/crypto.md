@@ -13,10 +13,10 @@ who wrote it, or generating an id nobody can guess.
 | Task | Use |
 | --- | --- |
 | Store and check a password | `argon2Hash` / `argon2Verify` |
-| Encrypt data so only the key holder can read it | `newXChaChaPoly` or `newGcm` (both AEAD ciphers, see [Encrypt and decrypt data](#encrypt-and-decrypt-data)) |
+| Encrypt data so only the key holder can read it | `XChaChaPoly` or `AesGcm` (both AEAD ciphers, see [Encrypt and decrypt data](#encrypt-and-decrypt-data)) |
 | Sign data so anyone can verify who wrote it | `ed25519Sign` / `ed25519Verify` |
 | Generate an unguessable id or token | `randomBytes` |
-| Fingerprint content to detect changes | `newSha256` + `digest` |
+| Fingerprint content to detect changes | `Sha256` + `digest` |
 | Compare two secrets (a token, a MAC) | `ctEq`, never `==` |
 
 ## Hash a password
@@ -65,7 +65,7 @@ messages per key to stay unique - see [Sharp edges](#sharp-edges)). Reach for
 `XChaChaPoly` unless you specifically need AES.
 
 ```bit
-import { randomBytes, newXChaChaPoly } from "std/crypto"
+import { randomBytes, XChaChaPoly } from "std/crypto"
 
 // The nonce travels with the ciphertext; only the 32-byte key is secret.
 class Sealed {
@@ -74,14 +74,14 @@ class Sealed {
 }
 
 fn encryptDraft(key: []byte, body: string): Sealed! {
-  let cipher = newXChaChaPoly(key)?
+  let cipher = XChaChaPoly(key)?
   let nonce = randomBytes(24)
   let ciphertext = cipher.seal(nonce, []byte(body), []byte(0))
   return Sealed{ nonce = nonce, ciphertext = ciphertext }
 }
 
 fn decryptDraft(key: []byte, sealed: Sealed): string! {
-  let cipher = newXChaChaPoly(key)?
+  let cipher = XChaChaPoly(key)?
   let plaintext = cipher.open(sealed.nonce, sealed.ciphertext, []byte(0))?
   return string(plaintext)
 }
@@ -148,21 +148,61 @@ since it was last saved, not to protect a password (see
 [Hash a password](#hash-a-password)).
 
 ```bit
-import { newSha256, digest } from "std/crypto"
+import { digest, Sha256 } from "std/crypto"
 
 fn contentHash(body: string): []byte {
-  return digest(newSha256(), []byte(body))
+  return digest(Sha256(), []byte(body))
 }
 ```
 
-`newSha256` returns a `Hash`, the streaming interface every digest in this
-module satisfies: call `write` any number of times and `sum` when you are
-done, or use `digest` for the common single-buffer case. `Blake3`
-(`newBlake3`/`blake3Hash`) is faster on large inputs and also supports keyed
+`Sha256()` builds a hasher that satisfies `Hash`, the streaming interface every
+digest in this module satisfies: call `write` any number of times and `sum` when
+you are done, or use `digest` for the common single-buffer case. Every digest is
+a class built by calling its name: `Sha256(Sha256Bits.B224)` is SHA-224,
+`Sha512(Sha512Bits.B384)` is SHA-384, `Sha3(Sha3Bits.B512)` is SHA3-512. `Blake3`
+(`Blake3()`/`blake3Hash`) is faster on large inputs and also supports keyed
 hashing and a variable-length output; `Blake2b`, SHA-512, SHA-3, and the
 legacy SHA-1 and MD5 (interop only, never for anything security-relevant) are
 also available. Content hashes are not secret, so comparing them with `==` is
 fine; a MAC or password hash is different (see below).
+
+Another width, or another algorithm in the same family, is an option on the same
+constructor, never a different function name:
+
+```bit
+import {
+  digest, encodeHex, Md5, Sha1, Sha256, Sha256Bits, Sha512, Sha512Bits, Sha3, Sha3Bits,
+  Shake, ShakeSecurity, Blake2b, Blake2s, Blake3, Blake3Mode,
+} from "std/crypto"
+
+// A cache validator for an exported draft: nobody attacks it, so the cheap,
+// legacy MD5 is enough. Anything a stranger could forge needs SHA-256 or better.
+fn etag(body: string): string {
+  return encodeHex(digest(Md5(), []byte(body)))
+}
+
+// Each variant is the same call with one option.
+fn variants(body: string): []string! {
+  let data = []byte(body)
+  let author = []byte("32 bytes of secret key material!")
+  let keyed = Blake3(Blake3Mode.Keyed(author))?
+  let sketch = Shake(ShakeSecurity.S256)
+  sketch.absorb(data)
+  return []string{
+    encodeHex(digest(Sha1(), data)),
+    encodeHex(digest(Sha256(Sha256Bits.B224), data)),
+    encodeHex(digest(Sha512(Sha512Bits.B384), data)),
+    encodeHex(digest(Sha3(Sha3Bits.B512), data)),
+    encodeHex(digest(Blake2b(32, []byte(0)), data)),
+    encodeHex(digest(Blake2s(16, []byte(0)), data)),
+    encodeHex(digest(keyed, data)),
+    encodeHex(sketch.squeeze(16)),
+  }
+}
+```
+
+`Blake3(Blake3Mode.Keyed(key))` is the one fallible digest constructor, because
+BLAKE3 keys must be exactly 32 bytes; use `?` or `catch` on it.
 
 ## Security notes
 
@@ -173,10 +213,10 @@ token one byte at a time. `ctEq` (and `hmacEqual`, an alias for it) always
 scans the full length before deciding:
 
 ```bit
-import { newSha256, digest, ctEq } from "std/crypto"
+import { digest, ctEq, Sha256 } from "std/crypto"
 
 fn sameSecret(a: []byte, b: []byte): bool {
-  return ctEq(digest(newSha256(), a), digest(newSha256(), b))
+  return ctEq(digest(Sha256(), a), digest(Sha256(), b))
 }
 ```
 
@@ -197,8 +237,8 @@ almost never be reached for directly; use an AEAD cipher instead.
   authentication key and breaks confidentiality for every message that used
   it. `XChaChaPoly`'s 24-byte nonce is wide enough that a random draw is safe
   at any realistic volume.
-- **A wrong key or nonce length panics, not fails.** `newXChaChaPoly`,
-  `newGcm`, and friends validate the key length and return `T!` (fail on a
+- **A wrong key or nonce length panics, not fails.** `XChaChaPoly(key)`,
+  `AesGcm(key)`, and friends validate the key length and return `T!` (fail on a
   bad key you got from outside your program, such as a config file); but
   `seal`/`open` panic on a wrong nonce length, because that is always a
   programming error, not bad external data.
@@ -237,17 +277,13 @@ The streaming digest interface every hash in this module satisfies: `write` any 
 
 Resets `h`, writes `data` once, and returns `h.sum()`. The convenience call for hashing one buffer in a single line.
 
-### `newSha256(): Hash`
-
-Starts a new SHA-256 hash.
-
-### `newSha224(): Hash`
-
-Starts a new SHA-224 hash, SHA-256's shorter sibling.
-
 ### `Sha256`
 
-The concrete type `newSha256`/`newSha224` return as a `Hash`. You rarely name it directly; use `newSha256()` and the `Hash` interface.
+A SHA-256 or SHA-224 hasher. `Sha256()` starts a new SHA-256 hash; `Sha256(Sha256Bits.B224)` starts SHA-224, SHA-256's shorter sibling. It satisfies `Hash`.
+
+### `Sha256Bits`
+
+Which SHA-2 digest a `Sha256` computes: `B256` (the default) or `B224`.
 
 ### `Sha256.write(data: []byte)`
 
@@ -269,29 +305,89 @@ The SHA-256/SHA-224 digest length in bytes.
 
 The SHA-256/SHA-224 algorithm's internal block size in bytes.
 
-### `newSha1(): Hash`
+### `Sha1`
 
-Starts a new SHA-1 hash. Kept for reading data written by older systems; do not use it to protect anything new.
+A SHA-1 hasher: `Sha1()` starts a new hash. Kept for reading data written by older systems; do not use it to protect anything new. It satisfies `Hash`.
 
-### `newMd5(): Hash`
+### `Sha1.write(data: []byte)`
 
-Starts a new MD5 hash. Kept for reading data written by older systems; do not use it to protect anything new.
+Feeds more data into the running SHA-1 state. Call it any number of times before `sum`.
 
-### `newSha512(): Hash`
+### `Sha1.sum(): []byte`
 
-Starts a new SHA-512 hash.
+Returns the SHA-1 digest for everything written so far, without resetting the state.
 
-### `newSha384(): Hash`
+### `Sha1.reset()`
 
-Starts a new SHA-384 hash, SHA-512's shorter sibling.
+Returns this SHA-1 hash to its empty starting state, so the same value can hash another message.
 
-### `newSha512_256(): Hash`
+### `Sha1.size(): int`
 
-Starts a new SHA-512/256 hash: SHA-512's internal state truncated to a 256-bit output.
+The SHA-1 digest length in bytes.
+
+### `Sha1.blockSize(): int`
+
+The SHA-1 algorithm's internal block size in bytes.
+
+### `Md5`
+
+An MD5 hasher: `Md5()` starts a new hash. Kept for reading data written by older systems; do not use it to protect anything new. It satisfies `Hash`.
+
+### `Md5.write(data: []byte)`
+
+Feeds more data into the running MD5 state. Call it any number of times before `sum`.
+
+### `Md5.sum(): []byte`
+
+Returns the MD5 digest for everything written so far, without resetting the state.
+
+### `Md5.reset()`
+
+Returns this MD5 hash to its empty starting state, so the same value can hash another message.
+
+### `Md5.size(): int`
+
+The MD5 digest length in bytes.
+
+### `Md5.blockSize(): int`
+
+The MD5 algorithm's internal block size in bytes.
+
+### `Sha512`
+
+A SHA-512-family hasher. `Sha512()` starts a new SHA-512 hash; `Sha512(Sha512Bits.B384)` starts SHA-384, SHA-512's shorter sibling; `Sha512(Sha512Bits.B256)` starts SHA-512/256, SHA-512's internal state truncated to a 256-bit output. It satisfies `Hash`.
+
+### `Sha512Bits`
+
+Which SHA-512-family digest a `Sha512` computes: `B512` (the default), `B384`, or `B256` for SHA-512/256.
+
+### `Sha512.write(data: []byte)`
+
+Feeds more data into the running SHA-512 state. Call it any number of times before `sum`.
+
+### `Sha512.sum(): []byte`
+
+Returns the SHA-512 digest for everything written so far, without resetting the state.
+
+### `Sha512.reset()`
+
+Returns this SHA-512 hash to its empty starting state, so the same value can hash another message.
+
+### `Sha512.size(): int`
+
+The SHA-512 digest length in bytes.
+
+### `Sha512.blockSize(): int`
+
+The SHA-512 algorithm's internal block size in bytes.
 
 ### `Sha3`
 
-The concrete SHA-3 type. Build one with `newSha3_256` and friends below, then use it through `write`/`sum` like any `Hash`.
+A SHA-3 hasher. `Sha3()` starts SHA3-256; pass a `Sha3Bits` for another width, for example `Sha3(Sha3Bits.B512)`. Use it through `write`/`sum` like any `Hash`.
+
+### `Sha3Bits`
+
+The SHA-3 digest width: `B224`, `B256` (the default), `B384`, or `B512`.
 
 ### `Sha3.write(data: []byte)`
 
@@ -313,25 +409,9 @@ The SHA-3 digest length in bytes.
 
 The SHA-3 algorithm's internal block size in bytes.
 
-### `newSha3_224(): Sha3`
-
-Starts a new SHA3-224 hash.
-
-### `newSha3_256(): Sha3`
-
-Starts a new SHA3-256 hash.
-
-### `newSha3_384(): Sha3`
-
-Starts a new SHA3-384 hash.
-
-### `newSha3_512(): Sha3`
-
-Starts a new SHA3-512 hash.
-
 ### `Shake`
 
-SHAKE, a hash whose output length you choose: `absorb` input, then `squeeze(n)` as many times as you like for `n` more bytes of output.
+SHAKE, a hash whose output length you choose (`Shake()` is SHAKE128, `Shake(ShakeSecurity.S256)` is SHAKE256): `absorb` input, then `squeeze(n)` as many times as you like for `n` more bytes of output.
 
 ### `Shake.absorb(data: []byte)`
 
@@ -341,17 +421,13 @@ Feeds more data into the running SHAKE state. Call `squeeze` once you are done a
 
 Draws `n` more bytes of output from this SHAKE state. Call it again for more output; the stream continues from where the last call left off.
 
-### `newShake128(): Shake`
+### `ShakeSecurity`
 
-Starts a new SHAKE128 hash.
-
-### `newShake256(): Shake`
-
-Starts a new SHAKE256 hash.
+The SHAKE security level: `S128` (the default) or `S256`.
 
 ### `Blake2b`
 
-The concrete BLAKE2b type. Build one with `newBlake2b`, then use it through `write`/`sum` like any `Hash`; it can also be keyed, for use as a MAC.
+A BLAKE2b hasher. `Blake2b()` starts a 64-byte unkeyed hash; `Blake2b(outLen, key)` picks the output length (1 to 64 bytes) and an optional key (up to 64 bytes) for use as a MAC, and panics on an out-of-range length. Use it through `write`/`sum` like any `Hash`.
 
 ### `Blake2b.write(data: []byte)`
 
@@ -373,17 +449,13 @@ The BLAKE2b digest length in bytes.
 
 The BLAKE2b algorithm's internal block size in bytes.
 
-### `newBlake2b(outLen: int, key: []byte): Blake2b`
-
-Starts a new BLAKE2b hash with output length `outLen` bytes, keyed with `key` (pass an empty slice for an unkeyed hash).
-
 ### `blake2b(data: []byte): []byte`
 
-The one-shot BLAKE2b hash of `data`, 32 bytes long.
+The one-shot BLAKE2b hash of `data`, 64 bytes long.
 
 ### `Blake2s`
 
-BLAKE2b's sibling, tuned for 32-bit hardware. The same shape: `write`/`sum`/`reset`, and an optional key.
+BLAKE2b's sibling, tuned for 32-bit hardware. `Blake2s()` starts a 32-byte unkeyed hash; `Blake2s(outLen, key)` picks the output length (1 to 32 bytes) and an optional key (up to 32 bytes), and panics on an out-of-range length. The same shape as `Blake2b`: `write`/`sum`/`reset`.
 
 ### `Blake2s.write(data: []byte)`
 
@@ -405,13 +477,13 @@ The BLAKE2s digest length in bytes.
 
 The BLAKE2s algorithm's internal block size in bytes.
 
-### `newBlake2s(outLen: int, key: []byte): Blake2s`
-
-Starts a new BLAKE2s hash with output length `outLen` bytes, keyed with `key` (pass an empty slice for an unkeyed hash).
-
 ### `Blake3`
 
-The concrete BLAKE3 type. Fast on large inputs; build one with `newBlake3` for plain hashing, or with the keyed and key-derivation constructors below.
+A BLAKE3 hasher, fast on large inputs. `Blake3()` is the plain hash; `Blake3(Blake3Mode.Keyed(key))?` is a MAC under a 32-byte key and fails on any other key length; `Blake3(Blake3Mode.DeriveKey(context))?` derives keys for the given context string. The constructor is fallible, so call it with `?` or `catch`.
+
+### `Blake3Mode`
+
+How a `Blake3` hasher is keyed: `Hash` (the default, unkeyed), `Keyed(key)` or `DeriveKey(context)`. One constructor takes exactly one mode, so a hasher cannot be both keyed and derive-key.
 
 ### `Blake3.write(data: []byte)`
 
@@ -437,21 +509,9 @@ The BLAKE3 algorithm's internal block size in bytes.
 
 Draws `n` bytes of output from this BLAKE3 state, beyond the default 32-byte `sum()`. Call it again for more output from the same point.
 
-### `newBlake3(): Blake3`
-
-Starts a new, unkeyed BLAKE3 hash.
-
-### `newBlake3Keyed(key: []byte): Blake3!`
-
-Starts a new BLAKE3 hash keyed with `key` (32 bytes), for use as a MAC. Fails if `key` is not 32 bytes.
-
 ### `blake3KeyedHash(key: []byte, data: []byte): []byte!`
 
 The one-shot keyed BLAKE3 hash of `data` under `key`. Fails if `key` is not 32 bytes.
-
-### `newBlake3DeriveKey(context: string): Blake3`
-
-Starts a BLAKE3 hash in key-derivation mode for the given `context` string, so its output is a key rather than a message digest.
 
 ### `blake3DeriveKey(context: string, keyMaterial: []byte): []byte`
 
@@ -469,7 +529,7 @@ The one-shot, unkeyed BLAKE3 hash of `data`, 32 bytes long.
 
 ### `hmac(newHash: () => Hash, key: []byte, msg: []byte): []byte`
 
-The HMAC of `msg` under `key`, using the hash `newHash` builds (for example `newSha256`). Use it to prove a message came from someone who holds `key`.
+The HMAC of `msg` under `key`, using the hash `newHash` builds (for example `() => Sha256()`). Use it to prove a message came from someone who holds `key`.
 
 ### `hmacEqual(a: []byte, b: []byte): bool`
 
@@ -613,49 +673,41 @@ Overwrites `b` with zeros through a barrier the compiler cannot optimize away, u
 
 The interface `seal`, `open`, `nonceSize`, and `overhead` every AEAD cipher below satisfies. See [Encrypt and decrypt data](#encrypt-and-decrypt-data).
 
-### `AesCipher`
+### `Aes`
 
-A key-scheduled AES block cipher (128, 192, or 256-bit key). It enciphers one 16-byte block at a time; use a mode below (`AesGcm`, `ctr`, `cbcEncrypt`) rather than this alone.
+A key-scheduled AES block cipher. `Aes(key)` builds one from a 16, 24, or 32-byte key (AES-128, -192 or -256) and fails on any other length. It enciphers one 16-byte block at a time; use a mode below (`AesGcm`, `ctr`, `cbcEncrypt`) rather than this alone.
 
-### `newAes(key: []byte): AesCipher!`
-
-Builds an `AesCipher` from `key` (128, 192, or 256-bit AES key). Fails on a wrong key length.
-
-### `AesCipher.encryptBlock(block: []byte): []byte`
+### `Aes.encryptBlock(block: []byte): []byte`
 
 Enciphers one 16-byte `block`, returning a fresh 16-byte ciphertext block.
 
-### `AesCipher.decryptBlock(block: []byte): []byte`
+### `Aes.decryptBlock(block: []byte): []byte`
 
 Deciphers one 16-byte `block`, the inverse of `encryptBlock` under the same key.
 
-### `AesCipher.encryptBlockInto(dst: []byte, block: []byte)`
+### `Aes.encryptBlockInto(dst: []byte, block: []byte)`
 
 Like `encryptBlock`, writing into the caller-owned buffer `dst` instead of returning a new one - for a hot loop that cannot allocate per block.
 
-### `ctr(cipher: AesCipher, iv: []byte, data: []byte): []byte`
+### `ctr(cipher: Aes, iv: []byte, data: []byte): []byte`
 
 AES-CTR mode: encrypts or decrypts `data` under `cipher` with initialization vector `iv`. Not authenticated; prefer `AesGcm` unless you specifically need CTR.
 
-### `cbcEncrypt(cipher: AesCipher, iv: []byte, data: []byte): []byte`
+### `cbcEncrypt(cipher: Aes, iv: []byte, data: []byte): []byte`
 
 AES-CBC mode encryption of `data` under `cipher` with initialization vector `iv`. Not authenticated; prefer `AesGcm` unless you specifically need CBC.
 
-### `cbcDecrypt(cipher: AesCipher, iv: []byte, data: []byte): []byte!`
+### `cbcDecrypt(cipher: Aes, iv: []byte, data: []byte): []byte!`
 
 AES-CBC mode decryption, the inverse of `cbcEncrypt`. Fails on a malformed ciphertext length.
 
-### `ecbEncryptBlock(cipher: AesCipher, block: []byte): []byte`
+### `ecbEncryptBlock(cipher: Aes, block: []byte): []byte`
 
 Raw, single-block ECB encryption. Leaks patterns in the plaintext; almost never the right call directly - use an AEAD cipher instead.
 
 ### `AesGcm`
 
-AES-GCM, an AEAD cipher with a 12-byte nonce. Build one with `newGcm`. See [Sharp edges](#sharp-edges) for its nonce requirement.
-
-### `newGcm(key: []byte): AesGcm!`
-
-Builds an `AesGcm` cipher from `key` (128 or 256-bit AES key). Fails on a wrong key length.
+AES-GCM, an AEAD cipher with a 12-byte nonce. `AesGcm(key)` builds one from a 16, 24, or 32-byte key and fails on any other length. See [Sharp edges](#sharp-edges) for its nonce requirement.
 
 ### `AesGcm.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
 
@@ -675,11 +727,7 @@ The number of extra bytes `seal` adds beyond the plaintext length.
 
 ### `AesGcmSiv`
 
-AES-GCM-SIV, an AEAD cipher that stays safe even if a nonce repeats, at a performance cost over plain `AesGcm`. Build one with `newAesGcmSiv`.
-
-### `newAesGcmSiv(key: []byte): AesGcmSiv!`
-
-Builds an `AesGcmSiv` cipher from `key` (128 or 256-bit AES key). Fails on a wrong key length.
+AES-GCM-SIV, an AEAD cipher that stays safe even if a nonce repeats, at a performance cost over plain `AesGcm`. `AesGcmSiv(key)` builds one from a 16 or 32-byte key and fails on any other length.
 
 ### `AesGcmSiv.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
 
@@ -699,11 +747,7 @@ The number of extra bytes `seal` adds beyond the plaintext length.
 
 ### `ChaChaPoly`
 
-ChaCha20-Poly1305, an AEAD cipher with a 12-byte nonce. Build one with `newChaChaPoly`; prefer `XChaChaPoly` unless you specifically need a 12-byte nonce.
-
-### `newChaChaPoly(key: []byte): ChaChaPoly!`
-
-Builds a `ChaChaPoly` cipher from `key` (32 bytes). Fails on a wrong key length.
+ChaCha20-Poly1305, an AEAD cipher with a 12-byte nonce. `ChaChaPoly(key)` builds one from a 32-byte key and fails on any other length; prefer `XChaChaPoly` unless you specifically need a 12-byte nonce.
 
 ### `ChaChaPoly.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
 
@@ -723,11 +767,7 @@ The number of extra bytes `seal` adds beyond the plaintext length.
 
 ### `XChaChaPoly`
 
-XChaCha20-Poly1305, an AEAD cipher with a 24-byte nonce, safe to pick at random. Build one with `newXChaChaPoly`. See [Encrypt and decrypt data](#encrypt-and-decrypt-data).
-
-### `newXChaChaPoly(key: []byte): XChaChaPoly!`
-
-Builds an `XChaChaPoly` cipher from `key` (32 bytes). Fails on a wrong key length.
+XChaCha20-Poly1305, an AEAD cipher with a 24-byte nonce, safe to pick at random. `XChaChaPoly(key)` builds one from a 32-byte key and fails on any other length. See [Encrypt and decrypt data](#encrypt-and-decrypt-data).
 
 ### `XChaChaPoly.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
 
