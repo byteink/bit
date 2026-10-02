@@ -3069,10 +3069,9 @@ fn main() {
 }
 ```
 
-```text
-cfg.retries = 4               // allowed: a field of the object the const holds
-cfg = Config{ retries = 5 }   // E0185: cannot assign to module constant 'cfg'
-```
+With `cfg` the module `const` above, `cfg.retries = 4` is allowed: it writes a
+field of the object the const holds. `cfg = Config{ retries = 5 }` is `E0185`:
+it reassigns the const itself.
 
 A `const` that holds an array or other value type directly has no object to write
 through: its elements are part of the binding, so `K[i] = v` stays rejected
