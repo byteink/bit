@@ -2306,11 +2306,22 @@ up the process says who, once, on stderr:
 | `thread token` | `gcThreadToken()` of the OS thread that owns the slot, the value the thread provider uses to find it |
 | `is still <state>` | the slot's last published state (`running` when the contract was broken; `parked` with an `acked epoch` older than the `stop epoch` is a thread still on its way out of an earlier stop) |
 
-`BIT_GC_STATS=1` adds a final field, `stuck=<n>`: how many abandoned
+`BIT_GC_STATS=1` adds a field, `stuck=<n>`: how many abandoned
 rendezvous named a slot, over the whole run. The line itself is printed once
 per process, after the world is restarted (a blocked stderr must never hold the
 parked threads), so `stuck=` is the count and the line is the first witness.
 `runtime/gc/gcworldstuck.bit` composes both.
+
+The last field is `latewakes=<n>` (#6474): idle parallel-mark members whose
+sleep on `gcMkWake` ended by timeout although termination had been published
+at least 100 us before that timeout could fire, over the whole run
+(`gcStatLateWakes`, `runtime/gc/gcmarkpar.bit`, forwarded by `stwLateWakes`,
+`runtime/stw/stwstats.bit`). A sleeper is meant to be woken by termination, and
+each sleep is capped at 1 ms, so a lost wake costs 1 ms and no run time shows
+it; this counter is the witness and a correct build reads `latewakes=0`. It is
+touched only when a sleep times out, never per marked object. The line is now
+`... sweepns=<n> helpers=<n> stuck=<n> latewakes=<n>`; consumers read fields by
+name (`_tests_/bit/stress/verify.bit`'s `statsField`).
 
 ## 9. Program entry, boot, and spawn (`runtime/root`)
 
