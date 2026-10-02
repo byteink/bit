@@ -29,9 +29,10 @@ import { runningSentinel } from "../../thread"
 // a C function pointer, which is exactly what `entryOf` (§11.10) yields.
 //
 // `pthread_t` is an opaque pointer, taken here as `*i64` — the out-parameter is
-// one pointer-width word and a `[]i64(1)` element IS eight contiguous bytes,
-// unlike a `[]u8`, which a Bit slice stores one byte per 8-byte word (§11.8).
-// That distinction has already produced two silent bugs in this runtime port.
+// one pointer-width word, written into the start's own trampoline cell
+// (`trampClaim`), never into a `[]u8`, which a Bit slice stores one byte per
+// 8-byte word (§11.8). That distinction has already produced two silent bugs
+// in this runtime port.
 extern fn pthread_create(th: *i64, attr: *u8, start: *byte, arg: *byte): i32
 
 // `pthread_join(pthread_t thread, void **value_ptr) -> int`
@@ -173,11 +174,18 @@ extern fn bit_rt_gc_thread_enter()
 // provider is a leaf with no allocator to call, and a static pool keeps this off
 // the "no unbounded allocation after startup" list.
 //
-// Three words per cell, and WORD 0 IS THE CLAIM FLAG — a cell is free exactly
-// when its entry word is 0, which no real `entryOf` ever is. That removes the
-// fourth word an explicit in-use flag would need and makes claiming a single CAS.
+// Five words per cell, and WORD 0 IS THE CLAIM FLAG — a cell is free exactly
+// when its entry word is 0, which no real `entryOf` ever is, so claiming is a
+// single CAS. Word 3 is `pthread_create`'s `pthread_t` out-parameter and word 4
+// counts the two parties still reading the cell (#6460): the parent until it
+// has read word 3 back, the child until it has read words 0-2. Whichever
+// finishes last frees it (`trampDrop`). The child alone could not: it may run
+// and free the cell before `pthread_create` has written word 3, and a start
+// that claimed the cell in between would then have its handle overwritten.
+// Keeping the out-parameter here is what lets `threadStart` allocate nothing.
 const trampMax: int = 64
-let trampCells: [192]i64
+const trampWords: int = 5
+let trampCells: [320]i64
 
 // Reserve a cell for `(start, arg, done)`, returning its address or 0 when the
 // pool is full. Bounded by `trampMax`.
@@ -198,12 +206,15 @@ let trampCells: [192]i64
   let p: *i64 = ptrOf(trampCells)
   let i = 0
   while (i < trampMax) {
-    if (atomicCmpxchg(p + i * 3, 0, start)) {
-      // Safe unsynchronised: the CAS above makes this cell ours until the child
-      // releases it, and the child cannot run before `pthread_create`.
-      *(p + i * 3 + 1) = arg
-      *(p + i * 3 + 2) = done
-      return int(p) + i * 24
+    let c = p + i * trampWords
+    if (atomicCmpxchg(c, 0, start)) {
+      // Safe unsynchronised: the CAS above makes this cell ours until both
+      // parties drop it, and the child cannot run before `pthread_create`.
+      *(c + 1) = arg
+      *(c + 2) = done
+      *(c + 3) = 0
+      atomicStore(c + 4, 2)
+      return int(c)
     }
     i = i + 1
   }
@@ -215,6 +226,13 @@ let trampCells: [192]i64
 @nosplit fn trampRelease(cell: int, start: int) {
   let p = wordsAt(cell)
   atomicCmpxchg(p, start, 0)
+}
+
+// One party is done with the cell; the last of the two releases it.
+@nosplit fn trampDrop(cell: int, start: int) {
+  if (atomicSub(wordsAt(cell) + 4, 1) == 1) {
+    trampRelease(cell, start)
+  }
 }
 
 // Every OS thread this provider starts enters here, not at the caller's body.
@@ -258,7 +276,7 @@ let trampCells: [192]i64
   // releasing the cell makes it eligible for a concurrent `trampClaim` to
   // overwrite before this function reads it again.
   let done = *(p + 2)
-  trampRelease(addr, start)
+  trampDrop(addr, start)
   invokeRaw(start, arg)
   // Release this thread's mutator slot first, then clear `done` as the very
   // last Bit code this thread runs — same order as ../linux/spawn.bit's
@@ -284,14 +302,14 @@ let trampCells: [192]i64
 // The handle is the `pthread_t`. That is what actually has to be released on
 // this platform — see ../thread.bit on why the handle is opaque and why a
 // caller must not read meaning into the number.
-export @symbol("bit_rt_port_thread_start") fn threadStart(
+//
+// `@nosplit` (#6460): it allocates nothing, so the collector can start its
+// helper threads from inside a stop (`../../stw/stwhelper.bit`).
+export @nosplit @symbol("bit_rt_port_thread_start") fn threadStart(
   start: *byte,
   arg: *byte,
   done: *i32,
 ): int {
-  let slot = []i64(1)
-  slot[0] = 0
-
   // Armed BEFORE the create, not after: the child can run to completion and
   // clear this word before `pthread_create` has even returned. Arming it
   // afterwards would overwrite the child's 0 with 1 and strand every joiner
@@ -311,7 +329,7 @@ export @symbol("bit_rt_port_thread_start") fn threadStart(
   }
 
   let noattr: *u8 = nil
-  let rc = int(pthread_create(ptrOf(slot), noattr, entryOf(threadTrampoline), bytesAt(cell)))
+  let rc = int(pthread_create(wordsAt(cell + 24), noattr, entryOf(threadTrampoline), bytesAt(cell)))
   if (rc != 0) {
     // No thread exists, so nothing will ever clear `done`. Disarm it so a
     // caller that joins anyway gets `threadJoinDone` immediately instead of
@@ -322,7 +340,8 @@ export @symbol("bit_rt_port_thread_start") fn threadStart(
     return 0
   }
 
-  let handle = int(slot[0])
+  let handle = *(wordsAt(cell) + 3)
+  trampDrop(cell, int(start))
   if (handle == 0) {
     // pthread_create reported success, so a thread is running and its `done`
     // word will be cleared; only the handle is unusable. Reporting 0 here would
