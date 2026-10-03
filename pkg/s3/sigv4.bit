@@ -15,6 +15,12 @@
 //   3. signingKey          — HMAC-SHA256 chained through date/region/
 //      service/"aws4_request", keyed from "AWS4" + the secret key
 //   4. signature            — HMAC-SHA256(signingKey, stringToSign), hex
+//
+// Two flavours share them: `signV4` puts the result in an `Authorization`
+// header, `presignV4` puts it in the query string (a URL anyone can use until
+// it expires). Both follow @smithy/signature-v4 (smithy-typescript commit
+// 5d104567b7180c8a4055eb2f04c91854026a01c2: SignatureV4.ts, moveHeadersToQuery.ts,
+// getCanonicalHeaders.ts, getCanonicalQuery.ts, getPayloadHash.ts).
 
 import { digest, encodeHex, hmac, HashAlg, Sha256 } from "std/crypto"
 import { Builder, contains, hasPrefix, toLower } from "std/strings"
@@ -28,6 +34,14 @@ export class SigHeader {
 
 fn sha256Hex(s: string): string {
   return encodeHex(digest(Sha256(), []byte(s)))
+}
+
+// A caller mistake caught before anything is signed. The `InvalidInput` prefix
+// is the error kind the S3 error type will carry (`ErrorKind.InvalidInput`);
+// every client-side validation failure in this file goes through here so that
+// is a one-line change. A message names the offending field, never a secret.
+fn invalidInput(msg: string): error {
+  return newError("s3: InvalidInput: ${msg}")
 }
 
 // True for the RFC 3986 unreserved set — the only bytes SigV4 leaves
@@ -187,6 +201,19 @@ export fn signedHeaders(headers: []SigHeader): string {
   return out
 }
 
+// `X-Amz-Signature` is never part of what it signs (getCanonicalQuery.ts drops
+// it by lowercase name), so a query that already carries one canonicalizes the
+// same as one without.
+fn withoutSignature(params: [](string, string)): [](string, string) {
+  let out = [](string, string)(0)
+  for p of params {
+    if (toLower(p.0) != "x-amz-signature") {
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
 // AWS's step 1: method, canonical URI, canonical query string, canonical
 // headers, signed-header list, and the hex SHA-256 of the payload — one
 // per line, per the algorithm's own layout.
@@ -201,7 +228,7 @@ export fn canonicalRequest(
     "\n" +
     canonicalUri(path) +
     "\n" +
-    canonicalQueryString(queryParams) +
+    canonicalQueryString(withoutSignature(queryParams)) +
     "\n" +
     canonicalHeaders(headers) +
     "\n" +
@@ -261,16 +288,43 @@ export fn authorizationHeader(
 // Headers a signed request never signs, comma-delimited so one `contains`
 // answers membership: the SDK's ALWAYS_UNSIGNABLE_HEADERS list
 // (@smithy/signature-v4 constants.ts). `proxy-*` and `sec-*` are matched by
-// prefix in `isUnsignableHeader`. These are the headers an intermediary or
+// prefix in `isAlwaysUnsignable`. These are the headers an intermediary or
 // the transport rewrites after signing; signing them makes a valid request
 // fail with SignatureDoesNotMatch.
 const unsignableHeaders: string = ",authorization,cache-control,connection,expect,from,keep-alive,max-forwards,pragma,referer,te,trailer,transfer-encoding,upgrade,user-agent,x-amzn-trace-id,"
 
-fn isUnsignableHeader(name: string): bool {
+fn isAlwaysUnsignable(name: string): bool {
   if (hasPrefix(name, "proxy-") || hasPrefix(name, "sec-")) {
     return true
   }
   return contains(unsignableHeaders, ",${name},")
+}
+
+// Case-insensitive membership in a caller's name list (the SDK's `Set`s are
+// compared against lowercase names, so a mixed-case entry there silently never
+// matches; here it does).
+fn listHas(names: []string, lname: string): bool {
+  for n of names {
+    if (toLower(n) == lname) {
+      return true
+    }
+  }
+  return false
+}
+
+// Which header names are signed. `unsignable` adds to the always-unsignable
+// set; `signable` wins over both, which is how a caller signs `user-agent` or
+// `expect` after all (getCanonicalHeaders.ts).
+class HeaderRules {
+  unsignable: []string,
+  signable: []string,
+}
+
+fn isUnsignableHeader(name: string, rules: HeaderRules): bool {
+  if (listHas(rules.signable, name)) {
+    return false
+  }
+  return isAlwaysUnsignable(name) || listHas(rules.unsignable, name)
 }
 
 // RFC 9110 `tchar` beyond the unreserved set (letters, digits, `-_.~`): the
@@ -285,13 +339,13 @@ fn isTokenByte(c: byte): bool {
 
 fn checkHeaderName(name: string): ()! {
   if (len(name) == 0) {
-    fail newError("s3: sigv4: empty header name")
+    fail invalidInput("sigv4: empty header name")
   }
   let b = []byte(name)
   let i = 0
   while (i < len(b)) {
     if (!isTokenByte(b[i])) {
-      fail newError("s3: sigv4: invalid byte in header name '${name}'")
+      fail invalidInput("sigv4: invalid byte in header name '${name}'")
     }
     i = i + 1
   }
@@ -341,12 +395,12 @@ fn mergeSameName(sorted: []SigHeader): []SigHeader {
 // values collapsed, unsignable headers and every name in `replaced` (the ones
 // the signer generates itself) dropped, same-name headers merged, sorted by
 // name.
-fn signableHeaders(raw: []SigHeader, replaced: string): []SigHeader! {
+fn signableHeaders(raw: []SigHeader, replaced: string, rules: HeaderRules): []SigHeader! {
   let kept = []SigHeader(0)
   for h of raw {
     let name = toLower(h.name)
     checkHeaderName(name)?
-    if (!isUnsignableHeader(name) && !contains(replaced, ",${name},")) {
+    if (!isUnsignableHeader(name, rules) && !contains(replaced, ",${name},")) {
       kept = append(kept, SigHeader{ name = name, value = collapseValue(h.value) })
     }
   }
@@ -374,7 +428,7 @@ export class SigV4Config {
 // `//` collapsing, which is S3's rule. `headers` is every header the
 // transport will send, in any case and whitespace, `host` included.
 // `payloadHash` is the lowercase hex SHA-256 of the body, `unsignedPayload`,
-// or a `STREAMING-` marker.
+// or one of the documented markers (`isPayloadHash`).
 export class SigV4Request {
   export method: string,
   export path: string,
@@ -411,7 +465,7 @@ fn isDigits(s: string, from: int, to: int): bool {
 fn checkAmzDate(amzDate: string): ()! {
   let ok = len(amzDate) == 16 && amzDate[8] == 'T' && amzDate[15] == 'Z'
   if (!ok || !isDigits(amzDate, 0, 8) || !isDigits(amzDate, 9, 15)) {
-    fail newError("s3: sigv4: signing date must be yyyymmddThhmmssZ, got '${amzDate}'")
+    fail invalidInput("sigv4: signing date must be yyyymmddThhmmssZ, got '${amzDate}'")
   }
 }
 
@@ -430,20 +484,55 @@ fn isHexDigest(s: string): bool {
   return true
 }
 
-fn checkSigV4Inputs(cfg: SigV4Config, req: SigV4Request): ()! {
+// The payload-hash spellings AWS documents for `x-amz-content-sha256` besides
+// a hex digest. `unsignedPayload` is the body-not-hashed marker; the
+// `STREAMING-` ones announce an aws-chunked body (the chunk encoder is
+// chunked.bit's job, this file only signs the headers that announce it).
+// `STREAMING-UNSIGNED-PAYLOAD-TRAILER` is the only one the SDK sends: unsigned
+// chunks followed by a trailing checksum.
+export const streamingUnsignedTrailer: string = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+export const streamingSigned: string = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+export const streamingSignedTrailer: string = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+export const streamingSigV4a: string = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"
+export const streamingSigV4aTrailer: string = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER"
+
+fn isPayloadMarker(h: string): bool {
+  if (h == unsignedPayload || h == streamingUnsignedTrailer) {
+    return true
+  }
+  if (h == streamingSigned || h == streamingSignedTrailer) {
+    return true
+  }
+  return h == streamingSigV4a || h == streamingSigV4aTrailer
+}
+
+// True for a payload hash S3 accepts in `x-amz-content-sha256`: one of the
+// documented markers or 64 lowercase hex digits.
+export fn isPayloadHash(h: string): bool {
+  return isPayloadMarker(h) || isHexDigest(h)
+}
+
+fn checkPayloadHash(h: string): ()! {
+  if (!isPayloadHash(h)) {
+    fail invalidInput("sigv4: payload hash must be 64 lowercase hex digits or a payload marker, got '${h}'")
+  }
+}
+
+fn checkSigner(cfg: SigV4Config, method: string): ()! {
   if (cfg.accessKeyId == "" || cfg.secretKey == "") {
-    fail newError("s3: sigv4: access key id and secret key must be set")
+    fail invalidInput("sigv4: access key id and secret key must be set")
   }
   if (cfg.region == "" || cfg.service == "") {
-    fail newError("s3: sigv4: region and service must be set")
+    fail invalidInput("sigv4: region and service must be set")
   }
-  if (req.method == "") {
-    fail newError("s3: sigv4: request method must be set")
+  if (method == "") {
+    fail invalidInput("sigv4: request method must be set")
   }
-  let marker = req.payloadHash == unsignedPayload || hasPrefix(req.payloadHash, "STREAMING-")
-  if (!marker && !isHexDigest(req.payloadHash)) {
-    fail newError("s3: sigv4: payload hash must be 64 lowercase hex digits or a payload marker, got '${req.payloadHash}'")
-  }
+}
+
+fn checkSigV4Inputs(cfg: SigV4Config, req: SigV4Request): ()! {
+  checkSigner(cfg, req.method)?
+  checkPayloadHash(req.payloadHash)?
 }
 
 // Names the signer generates and so replaces when a caller already set them.
@@ -488,9 +577,9 @@ export fn signV4(cfg: SigV4Config, req: SigV4Request, amzDate: string): SigV4Sig
   checkSigV4Inputs(cfg, req)?
   checkAmzDate(amzDate)?
   let generated = generatedHeaders(cfg, req, amzDate)
-  let own = signableHeaders(req.headers, generatedNames(cfg))?
+  let own = signableHeaders(req.headers, generatedNames(cfg), HeaderRules{})?
   if (!hasHost(own)) {
-    fail newError("s3: sigv4: the request has no host header")
+    fail invalidInput("sigv4: the request has no host header")
   }
   let signed = sortHeaders(append(own, ...generated))
   let creq = canonicalRequest(req.method, req.path, req.query, signed, req.payloadHash)
@@ -505,5 +594,177 @@ export fn signV4(cfg: SigV4Config, req: SigV4Request, amzDate: string): SigV4Sig
     signature = sig,
     authorization = authz,
     headers = append(generated, SigHeader{ name = "authorization", value = authz }),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Presigning: the signature travels in the query string.
+// ---------------------------------------------------------------------------
+
+// The longest a presigned URL can live: 7 days (MAX_PRESIGNED_TTL).
+export const maxPresignExpiry: int = 604800
+
+// Options of `presignV4`. The four header lists hold lowercase-insensitive
+// header names.
+export class PresignOptions {
+  // Seconds the URL stays valid, 1..604800. The default is the S3 presigner's
+  // 900 (S3RequestPresigner), not the 3600 of the bare signer.
+  export expiresIn: int = 900,
+  // Names signed although they would be unsignable (`user-agent`, `expect`...).
+  export signableHeaders: []string,
+  // Names never signed, on top of the always-unsignable set.
+  export unsignableHeaders: []string,
+  // Names moved to the query although they do not start with `x-amz-`.
+  export hoistableHeaders: []string,
+  // `x-amz-*` names that stay headers (and are signed) instead of moving to
+  // the query. Loses to `hoistableHeaders` for a name in both.
+  export unhoistableHeaders: []string,
+}
+
+// The outcome of `presignV4`: what the URL's query carries, and the headers
+// the caller must still send.
+export class SigV4Presigned {
+  export canonicalRequest: string,
+  export stringToSign: string,
+  export signature: string,
+  // Every query pair of the URL as the SDK builds it: the caller's own, the
+  // hoisted headers, then token, algorithm, credential, date, expires,
+  // signed headers and signature. Raw, not yet percent-encoded.
+  export query: [](string, string),
+  // The same pairs percent-encoded and key-sorted, ready to follow `?`; the
+  // order carries no meaning to S3.
+  export queryString: string,
+  // The request headers left after hoisting, names as given: the transport
+  // sends these (the signed ones among them include `host`).
+  export headers: []SigHeader,
+}
+
+// Replaces any pair with this exact key, then appends: the SDK's
+// `query[key] = value` on a plain object.
+fn setQuery(q: [](string, string), key: string, value: string): [](string, string) {
+  let out = [](string, string)(0)
+  for p of q {
+    if (p.0 != key) {
+      out = append(out, p)
+    }
+  }
+  return append(out, (key, value))
+}
+
+// moveHeadersToQuery.ts: an `x-amz-` header moves to the query unless it is
+// unhoistable, and a hoistable one moves whatever its name. Raw value, raw
+// name: the query key keeps the header's own case (`X-Amz-Content-Sha256`).
+fn hoists(lname: string, opts: PresignOptions): bool {
+  if (listHas(opts.hoistableHeaders, lname)) {
+    return true
+  }
+  return hasPrefix(lname, "x-amz-") && !listHas(opts.unhoistableHeaders, lname)
+}
+
+class Hoisted {
+  headers: []SigHeader,
+  query: [](string, string),
+}
+
+// prepareRequest.ts + moveHeadersToQuery.ts: `authorization`, `x-amz-date` and
+// `date` are generated, so a caller's copy is dropped; the rest either stay or
+// move to the query.
+fn hoistHeaders(raw: []SigHeader, query: [](string, string), opts: PresignOptions): Hoisted! {
+  let kept = []SigHeader(0)
+  let q = query
+  for h of raw {
+    let lname = toLower(h.name)
+    checkHeaderName(lname)?
+    if (lname == "authorization" || lname == "x-amz-date" || lname == "date") {
+      continue
+    }
+    if (hoists(lname, opts)) {
+      q = setQuery(q, h.name, h.value)
+    } else {
+      kept = append(kept, h)
+    }
+  }
+  return Hoisted{ headers = kept, query = q }
+}
+
+// getPayloadHash.ts: a caller's `x-amz-content-sha256` header wins over the
+// hash computed from the body.
+fn payloadFor(headers: []SigHeader, fallback: string): string {
+  for h of headers {
+    if (toLower(h.name) == "x-amz-content-sha256") {
+      return h.value
+    }
+  }
+  return fallback
+}
+
+fn checkExpiry(expiresIn: int): ()! {
+  if (expiresIn < 1 || expiresIn > maxPresignExpiry) {
+    fail invalidInput("sigv4: presign expiresIn must be 1..${maxPresignExpiry} seconds, got ${expiresIn}")
+  }
+}
+
+// The credential and timing parameters, in the order SignatureV4.presign adds
+// them (the signed-headers list and the signature follow once known).
+fn presignParams(
+  cfg: SigV4Config,
+  query: [](string, string),
+  amzDate: string,
+  expiresIn: int,
+): [](string, string) {
+  let q = query
+  if (cfg.sessionToken != "") {
+    q = setQuery(q, "X-Amz-Security-Token", cfg.sessionToken)
+  }
+  let scope = credentialScope(amzDate[0:8], cfg.region, cfg.service)
+  q = setQuery(q, "X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+  q = setQuery(q, "X-Amz-Credential", "${cfg.accessKeyId}/${scope}")
+  q = setQuery(q, "X-Amz-Date", amzDate)
+  return setQuery(q, "X-Amz-Expires", "${expiresIn}")
+}
+
+// Signs `req` with the query-string flavour of SigV4 (SignatureV4.presign):
+// the URL carries `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`,
+// `X-Amz-Expires`, `X-Amz-SignedHeaders`, `X-Amz-Signature` and, for a session
+// credential, `X-Amz-Security-Token`; `x-amz-*` headers hoist into it
+// (`PresignOptions`). The payload hash is `req.payloadHash` unless the request
+// has an `x-amz-content-sha256` header, which wins; S3's presigner sets that
+// header to `UNSIGNED-PAYLOAD`. `cfg.contentSha256Header` is not used: a
+// presigned request signs no generated header. `amzDate` is the signing time,
+// passed in so a test pins it.
+export fn presignV4(
+  cfg: SigV4Config,
+  req: SigV4Request,
+  amzDate: string,
+  opts: PresignOptions = PresignOptions{},
+): SigV4Presigned! {
+  checkSigner(cfg, req.method)?
+  checkAmzDate(amzDate)?
+  checkExpiry(opts.expiresIn)?
+  let payload = payloadFor(req.headers, req.payloadHash)
+  checkPayloadHash(payload)?
+  let moved = hoistHeaders(req.headers, req.query, opts)?
+  let rules = HeaderRules{ unsignable = opts.unsignableHeaders, signable = opts.signableHeaders }
+  let own = signableHeaders(moved.headers, "", rules)?
+  if (!hasHost(own)) {
+    fail invalidInput("sigv4: the request has no signed host header")
+  }
+  let q = setQuery(
+    presignParams(cfg, moved.query, amzDate, opts.expiresIn),
+    "X-Amz-SignedHeaders",
+    signedHeaders(own),
+  )
+  let creq = canonicalRequest(req.method, req.path, q, own, payload)
+  let dateStamp = amzDate[0:8]
+  let sts = stringToSign(amzDate, credentialScope(dateStamp, cfg.region, cfg.service), creq)
+  let sig = signature(signingKey(cfg.secretKey, dateStamp, cfg.region, cfg.service), sts)
+  let signedQuery = setQuery(q, "X-Amz-Signature", sig)
+  return SigV4Presigned{
+    canonicalRequest = creq,
+    stringToSign = sts,
+    signature = sig,
+    query = signedQuery,
+    queryString = canonicalQueryString(signedQuery),
+    headers = moved.headers,
   }
 }
