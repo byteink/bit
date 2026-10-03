@@ -65,11 +65,18 @@ if [ "${needs_build}" -eq 1 ]; then
   # Refuse rather than fall back to a stale driver: running yesterday's build
   # logic against today's tree is exactly the silent-wrong-answer class this
   # driver is being written to avoid.
-  "${STAGE0}" build "${SRC}" -o "${DRIVER}" || {
+  #
+  # Build beside the driver and rename() over it (#6697): `build -o` overwrites
+  # in place, and macOS SIGKILLs the next exec of a signed binary rewritten
+  # under a cached vnode signature (rc=137, empty output).
+  TMP_DRIVER="${DRIVER}.new.$$"
+  trap 'rm -f "${TMP_DRIVER}"' EXIT
+  "${STAGE0}" build "${SRC}" -o "${TMP_DRIVER}" || {
     echo "make: cannot build the driver from ${SRC}" >&2
     exit 2
   }
-  chmod +x "${DRIVER}"
+  chmod +x "${TMP_DRIVER}"
+  mv -f "${TMP_DRIVER}" "${DRIVER}"
 fi
 
 exec "${DRIVER}" "$@"
