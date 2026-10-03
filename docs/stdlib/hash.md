@@ -215,7 +215,7 @@ nonzero seed) at every length: the one-shot and the streaming hasher are both
 checked against the reference's own 8322 sanity vectors (every length 0 to
 4160, two seeds), seeds with high bits set, and 1 MiB buffers.
 
-The 128-bit XXH3 will be `xxh3x128`; `xxh3` is always the 64-bit one.
+The 128-bit XXH3 is `xxh3x128`, below; `xxh3` is always the 64-bit one.
 
 ### `xxh3(data: []byte, seed: u64 = 0): u64`
 
@@ -285,5 +285,126 @@ fn streamedMatchesOneShot(chunks: [][]byte, whole: []byte): bool {
     h.update(chunk)
   }
   return h.digest() == xxh3(whole, 42)
+}
+```
+
+## XXH3-128
+
+Inkwell's backup tool deduplicates drafts by content: two drafts with the same
+hash are stored once. At a few thousand drafts a 64-bit hash is plenty, but a
+backup that holds every draft of every library is the kind of set where a
+64-bit collision stops being a rounding error, and the S3 `XXHASH128` checksum
+algorithm names the 128-bit hash outright. XXH3-128, from the same
+[xxHash](https://github.com/Cyan4973/xxHash) library as `xxh3`, is that hash:
+the same four length paths and the same stripe loop, producing two 64-bit
+halves instead of one. Like `xxh3` it is **not** for detecting tampering -
+a wider result does not make it collision resistant, and anyone who knows the
+seed can build colliding inputs; use `std/crypto` for that. Its result is bit-for-bit the reference library's `XXH3_128bits` (and
+`XXH3_128bits_withSeed`, also called `XXH128`, for a nonzero seed) at every
+length: the one-shot and the streaming hasher are both checked against the
+reference's own 12483 sanity vectors (every length 0 to 4160, three seeds),
+seeds with high bits set, and 1 MiB buffers.
+
+Neither half of the result is the 64-bit `xxh3` of the same input, in general,
+so the two are separate functions: pick one and keep it.
+
+### `Hash128`
+
+A 128-bit hash value, the reference's `XXH128_hash_t`. Only `xxh3x128` and
+`Xxh3x128.digest` produce one, and its fields are read-only. Compare two with
+`equals`: `==` on a class compares identity, not contents.
+
+### `Hash128.hi: u64`
+
+The high 64 bits (the reference's `high64`). The empty input under seed `0` has
+`hi` `0x99AA06D3014798D8`.
+
+### `Hash128.lo: u64`
+
+The low 64 bits (the reference's `low64`). The empty input under seed `0` has
+`lo` `0x6001C324468D497F`.
+
+### `Hash128.bytes(): []byte`
+
+The 16 bytes of the reference's canonical form (`XXH128_canonicalFromHash`):
+`hi` big-endian, then `lo` big-endian. This is the form the S3 `XXHASH128`
+checksum and every tool that prints an XXH128 digest as hex use, so the empty
+input under seed `0` is the bytes of `99aa06d3014798d86001c324468d497f`.
+
+### `Hash128.equals(other: Hash128): bool`
+
+Whether `other` holds the same 128 bits.
+
+### `xxh3x128(data: []byte, seed: u64 = 0): Hash128`
+
+The XXH3 128-bit hash of `data` under `seed`. The seed is the full 64 bits and
+defaults to `0`. Any length hashes, including a 1 MiB body.
+
+```bit
+import { xxh3x128 } from "std/hash"
+
+// Two drafts are the same draft when all 128 bits agree.
+fn sameDraft(a: string, b: string): bool {
+  return xxh3x128([]byte(a)).equals(xxh3x128([]byte(b)))
+}
+
+// The 16-byte digest the backup manifest stores for a draft.
+fn manifestEntry(body: []byte): []byte {
+  return xxh3x128(body).bytes()
+}
+
+// A per-library seed keeps two libraries' dedup indexes unrelated.
+fn titleKey128(title: string, librarySeed: u64): u64 {
+  return xxh3x128([]byte(title), librarySeed).lo
+}
+```
+
+### `Xxh3x128(seed: u64 = 0)`
+
+A streaming hasher, for a body that arrives in chunks and should not be
+concatenated first. `Xxh3x128()` starts a hash under seed `0`; `Xxh3x128(seed)`
+under that seed. Whatever the chunking - one byte at a time, chunks of 63, 64
+or 65 bytes, a split in the middle of a 1 KiB block, empty chunks in between -
+the result equals `xxh3x128` of the concatenation, so a streamed S3 upload and
+a one-shot hash of the same object agree.
+
+### `Xxh3x128.update(data: []byte)`
+
+Absorbs `data`. The hasher keeps the first 240 bytes (the short paths need
+them all at once) and one 64-byte stripe, so no call allocates per chunk.
+
+### `Xxh3x128.digest(): Hash128`
+
+The hash of everything absorbed so far. It does not consume the hasher: call
+it after every chunk for a running value, and keep calling `update` after.
+
+### `Xxh3x128.reset()`
+
+Rewinds to the empty input under the same seed, so one hasher can hash many
+drafts in turn.
+
+```bit
+import { Xxh3x128, Hash128, xxh3x128 } from "std/hash"
+
+// Hash a draft that is read in chunks, then reuse the hasher for the next.
+fn hashChunkedDrafts128(first: [][]byte, second: [][]byte): bool {
+  let h = Xxh3x128()
+  for chunk of first {
+    h.update(chunk)
+  }
+  let firstHash: Hash128 = h.digest()
+  h.reset()
+  for chunk of second {
+    h.update(chunk)
+  }
+  return !firstHash.equals(h.digest())
+}
+
+fn streamedMatchesOneShot128(chunks: [][]byte, whole: []byte): bool {
+  let h = Xxh3x128(42)
+  for chunk of chunks {
+    h.update(chunk)
+  }
+  return h.digest().equals(xxh3x128(whole, 42))
 }
 ```
