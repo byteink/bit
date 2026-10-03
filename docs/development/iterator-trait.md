@@ -1,102 +1,208 @@
-# The iterator trait (design)
+# Looping over your own types
 
 <!-- doctest: per-block -->
 
-## Status of this document
+Inkwell keeps every `Draft` in memory, so `for d of drafts` over a
+`[]Draft` just works. A store that reads drafts from a database, or holds
+more of them than fit in memory, cannot hand back a slice. It wants to hand
+them back one at a time, computed when asked for, and the caller still wants
+to write a `for` loop. This page shows how a class opts in, and what changes
+when fetching the next draft can fail.
 
-This is a design document, not a feature guide. Nothing on this page is
-implemented yet. `for x of` accepts exactly four shapes today (slice,
-array, map, channel) and every other iterable, including every user
-class, is rejected at lowering with `E0092`. This page settles the
-protocol, reports the allocation and inlining evidence the protocol
-depends on, and answers the protocol's open questions. Once
-the trait lands, this page is rewritten into a normal guide page under
-`bit/docs/STYLE.md`, the way `docs/stdlib/time.md` was rewritten from
-design doc to shipped reference once std/time landed.
+## The loop you write by hand today
 
-## The problem
-
-A `Store` that keeps every `Link` in memory can hand back a `[]Link` and
-`for l of links` just works. A `Store` backed by a database, or one that
-holds more links than fit in memory at once, cannot. It wants to hand
-back links one at a time, computed lazily, without building the whole
-slice first. There is no way to write that in Bit today: `for` only
-accepts a slice, an array, a map or a channel, so a store's own type
-cannot be ranged over at all.
+Without help, every caller of a lazy store writes the same loop:
 
 ```bit
-class Link {
-  export url: string,
-  export created: i64,
-  export hits: int,
+class Draft {
+  export title: string,
 }
 
-class LinkPage {
+class DraftPage {
   n: i64
-  next(): Option<Link> {
+  next(): Option<Draft> {
     if (this.n <= 0) {
       return Option.None
     }
     this.n = this.n - 1
-    return Option.Some(Link{ url = "https://example.com", created = 0, hits = 0 })
+    return Option.Some(Draft{ title = "draft ${this.n}" })
   }
 }
 
 fn main() {
-  let page = LinkPage{ n = 3 }
+  let page = DraftPage{ n = 3 }
   let count = 0
   while (true) {
     match (page.next()) {
-      Some(l) => count = count + 1
+      Some(d) => count = count + 1
       None => break
     }
   }
-  println("saw ${count} links")
+  println("saw ${count} drafts")
 }
-// saw 3 links
+// saw 3 drafts
 ```
 
-That `while (true) { match ... }` loop is what every caller of `LinkPage`
-has to write by hand, forever, because `for l of page` does not compile:
+## Give the class a `next()`
 
-```bit ignore
-for l of page { }
-// error[E0092]: cannot lower a `for … of` whose iterable is not a
-// slice, array, map or channel
-```
+A class opts in by declaring `next(): Option<T>` with no parameters. No `use`
+and no interface declaration is needed: like any interface, the shape is
+enough. `for` then runs the loop above for you.
 
-The trait closes that gap: any class that supplies `next(): Option<T>`
-becomes something `for` can range over, the same way `use`-ing a trait
-today lets a class supply one method and be handed the rest (see
-[Traits](traits.md)).
-
-## The protocol
-
-```bit ignore
-trait Iterator<T> {
-  next(): Option<T>,
+```bit
+class Draft {
+  export title: string,
 }
+
+class DraftPage {
+  n: i64
+  next(): Option<Draft> {
+    if (this.n <= 0) {
+      return Option.None
+    }
+    this.n = this.n - 1
+    return Option.Some(Draft{ title = "draft ${this.n}" })
+  }
+}
+
+fn main() {
+  let page = DraftPage{ n = 3 }
+  let count = 0
+  for d of page {
+    println(d.title)
+    count = count + 1
+  }
+  println("saw ${count} drafts")
+}
+// draft 2
+// draft 1
+// draft 0
+// saw 3 drafts
 ```
 
-A class opts in the same way it opts into any interface: by declaring a
-`next(): Option<T>` method with a matching signature, no `use` required.
-`Iterator<T>` names the shape; a class satisfies it structurally, exactly
-as it satisfies any other interface (see [Interfaces](interfaces.md)).
-`for l of page` then desugars to the loop written out above: call `next`,
-`match` the result, bind `Some`'s payload as the loop variable, `break` on
-`None`.
+Each pass calls `next()`. A `Some` binds its payload to the loop variable and
+runs the body; `None` ends the loop. `break`, `continue` and `return` work in
+the body as they do in every other loop, and none of them touches the
+iterator again. The same holds when the variable's type is an interface that
+declares `next(): Option<T>`: the call goes through the interface.
 
-**Why `Option<T>`, not a Go-style `yield func(T) bool`.** Bit already has
-`Option` and already uses it for exactly this shape, a lookup that may or
-may not produce a value: `Regex.find()` returns `Option<Match>`,
-`yamlAsBool`/`yamlAsInt`/`yamlAsString` all return `Option`. A callback
-protocol would be a second, inverted control-flow idiom living next to the
-one Bit already has, and it changes what `break` and an early `return`
-mean inside `for … of`. `next(): Option<T>` is also the industry-standard
-shape: it is Rust's `Iterator::next() -> Option<Item>` exactly.
+## When fetching the next draft can fail
 
-This page's own earlier draft rejected `Option<T>` on allocation grounds.
-That measurement is stale; see below.
+A store backed by a database reads each page over the network, and a read can
+fail. Declare `next(): Option<Draft>!` and the iterator can say so. A `for`
+over it is written with a `?` after the iterable:
+
+```bit
+class Draft {
+  export title: string,
+}
+
+class DraftFeed {
+  n: i64
+  reads: i64
+  next(): Option<Draft>! {
+    this.reads = this.reads + 1
+    if (this.reads == 3) {
+      fail newError("read ${this.reads} failed")
+    }
+    if (this.n <= 0) {
+      return Option.None
+    }
+    this.n = this.n - 1
+    return Option.Some(Draft{ title = "draft ${this.n}" })
+  }
+}
+
+fn listTitles(feed: DraftFeed): int! {
+  let count = 0
+  for d of feed? {
+    println(d.title)
+    count = count + 1
+  }
+  return count
+}
+
+fn main() {
+  let feed = DraftFeed{ n = 5, reads = 0 }
+  let count = listTitles(feed) catch e {
+    println("stopped: ${e.message()}")
+    -1
+  }
+  println("count ${count}")
+}
+// draft 4
+// draft 3
+// stopped: read 3 failed
+// count -1
+```
+
+The `?` says what it says everywhere else in Bit: if this fails, leave and
+hand the error to the caller. Here that means a failed `next()` ends the loop
+and `listTitles` returns the error. The body ran twice, for the two drafts
+that were read before the third read failed. Because the error is returned,
+the function holding the loop has to be fallible itself (`int!` above), the
+same rule as any other `?`.
+
+## Sharp edges
+
+Both mistakes are compile errors, so a failure is never dropped and a `?`
+never promises something that cannot happen.
+
+Leaving the `?` off an iterable whose `next()` can fail:
+
+```text
+error[E0186]: 'DraftFeed' has a fallible next(), so a for-of over it needs '?' on the iterable
+  hint: write 'for x of it? { }'; a failed next() returns its error from the enclosing fallible function
+```
+
+Writing a `?` on an iterable whose `next()` cannot fail, a slice for
+instance:
+
+```text
+error[E0187]: '?' on a for-of iterable whose next() cannot fail: '[]i64' is not a 'next(): Option<T>!' iterable
+  hint: remove the '?'
+```
+
+If the expression you iterate is itself fallible, `for d of openFeed()?`
+unwraps it the way `?` always does. When the value it returns also has a
+fallible `next()`, write `for d of openFeed()??`: the first `?` unwraps the
+call, the second is the loop's.
+
+## When not to use it
+
+Slices, arrays, maps and channels keep their own loops and do not go through
+`next()`. A slice is a block of memory with a length, so a counted loop over
+it is as cheap as a loop gets. Reach for `next()` when the elements are
+computed lazily or come from somewhere that can fail, and keep a `[]Draft`
+when you already have one.
+
+A type that should be ranged over as pairs declares `next(): Option<(K, V)>`
+and binds with `for (k, v) of it`, the same tuple binder a map uses.
+
+## Where to go next
+
+[Traits](../reference/traits.md) and [Interfaces](../reference/interfaces.md) cover the structural
+rules a class follows to satisfy `next()`. [Errors](../reference/errors.md) covers
+`fail`, `?` and `catch`.
+
+## How it compiles
+
+The rest of this page is for people working on the compiler. A `for x of it`
+over a `next()` iterable lowers to the same `while (true) { match
+(it.next()) ... }` the first example writes out, in `compiler/lowerforiter.bit`.
+For the fallible form the loop header calls `next()`, branches on the error
+slot with the same `propagateErr` that `?` uses (`compiler/lowerfail.bit`),
+and reads the `Some` tag only on the ok edge. `compiler/validateloop.bit`
+(`vForOfFallible`) reports E0186 and E0187.
+
+## Why `Option<T>` and not a callback
+
+`next(): Option<T>` is Rust's `Iterator::next() -> Option<Item>`, and Bit
+already uses `Option` for a lookup that may or may not produce a value
+(`Regex.find()` returns `Option<Match>`). A Go-style `yield func(T) bool`
+would be a second, inverted control-flow idiom next to that one, and it
+changes what `break` and an early `return` mean inside `for … of`. The
+measurements below are why the per-element `Option` costs nothing.
 
 ## The allocation story
 
@@ -194,7 +300,7 @@ code elsewhere in the file. It does not have to be re-verified here; it
 already removed the dependency this feature would otherwise have
 reintroduced.
 
-## Do the four built-ins migrate to the trait?
+## Why slices, maps and channels do not use `next()`
 
 **No. They stay special.** Slice and array iteration is in every hot loop
 in the tree, and today it lowers to a bare counted loop, no call, no
@@ -238,23 +344,6 @@ A user type that wants to be ranged over as pairs declares
 `next(): Option<(K, V)>` and gets the same binder for free; nothing about
 the trait needs a second binder rule for it.
 
-## Open questions for the children
-
-This document answers the protocol, the allocation cost and the inlining
-story with measurements. What it does not settle, because settling it
-needs code to measure against:
-
-- The exact trait declaration syntax and whether `for` requires the
-  `Iterator<T>` name or accepts any class with a matching `next()`
-  structurally (Bit's traits are `use`-based opt-in; interfaces are
-  structural, and this decides which discipline governs `for`).
-- Whether a `for … of` over a trait-typed value needs a new diagnostic
-  when `next()`'s return type does not unify to `Option<T>` for a single
-  `T`, and what error code that gets.
-- Whether early `return`/`break` inside the loop body need anything beyond
-  what today's four built-in lowerings already do (they do not consume
-  the iterator further, so likely nothing, but this needs a fixture, not
-  an assertion).
 ## Measured cost of the three loop shapes
 
 **Measured on `4a208905`**, drained box under `boxlock.sh solo`,
@@ -293,8 +382,3 @@ The interface arm is the one worth knowing about: **~4.7x the instructions
 and ~4x the cycles** of a slice loop, because every element pays a dynamic
 dispatch that cannot inline. A concrete-typed iterator is close enough to
 a raw loop to be uninteresting; an interface-typed one is not.
-
-## Specification
-
-`for … of` today: SPEC §12.6. `for … in`: owner decision 2026-08-10,
-SPEC §12.6. Traits: SPEC.
