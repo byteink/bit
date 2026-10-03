@@ -201,43 +201,89 @@ fn matchesOneShot(chunks: [][]byte, whole: []byte): bool {
 ## XXH3-64
 
 Inkwell's backup tool also shards short keys - a draft title is a dozen bytes
-and a tag list a few dozen. XXH3, the hash the S3 `XXHASH3` checksum
-algorithm names, is the newer hash from the same
-[xxHash](https://github.com/Cyan4973/xxHash) library: it picks one of
-several straight-line paths by input length (0 to 16, 17 to 128, 129 to 240
-bytes) instead of looping over stripes, which is what makes it suit short
-keys.
+and a tag list a few dozen - and the S3 `XXHASH3` checksum algorithm names a
+hash other than `xxhash64`. XXH3, from the same
+[xxHash](https://github.com/Cyan4973/xxHash) library, is that hash: it picks
+one of several straight-line paths by input length (0 to 16, 17 to 128 and
+129 to 240 bytes) and runs a stripe loop over eight accumulators for anything
+longer, so one function covers a tag and a whole object.
 Like `xxhash64` it is **not** for detecting tampering - the 17 to 240 byte
 path has documented collision weaknesses, and anyone who knows the seed can
 build colliding inputs; use `std/crypto` for that. Its result is bit-for-bit
 the reference library's `XXH3_64bits` (and `XXH3_64bits_withSeed` for a
-nonzero seed).
+nonzero seed) at every length: the one-shot and the streaming hasher are both
+checked against the reference's own 8322 sanity vectors (every length 0 to
+4160, two seeds), seeds with high bits set, and 1 MiB buffers.
 
-### `xxh3_64(data: []byte, seed: u64 = 0): u64`
+The 128-bit XXH3 will be `xxh3x128`; `xxh3` is always the 64-bit one.
+
+### `xxh3(data: []byte, seed: u64 = 0): u64`
 
 The XXH3 64-bit hash of `data` under `seed`. The seed is the full 64 bits and
 defaults to `0`. The empty slice hashes to `0x2D06800538D394C2` under seed
-`0`, and `xxh3_64([]byte("abc"))` is `0x78AF5F94892F3950`. The hash is
-checked against the reference's own sanity vectors for every length from 0
-to 240 under two seeds (482 vectors), plus seeds with high bits set.
-
-Inputs of 241 bytes or more are not supported yet: `xxh3_64` panics with a
-message naming the ticket that adds them, rather than return a hash that
-would disagree with the reference. Hash only drafts that fit, or fall back to
-`xxhash64`, until then.
+`0`, and `xxh3([]byte("abc"))` is `0x78AF5F94892F3950`. Any length hashes,
+including a 1 MiB body.
 
 ```bit
-import { xxh3_64 } from "std/hash"
+import { xxh3 } from "std/hash"
 
-// Which of `shards` backup shards stores this tag list. Tag lists are short,
-// so they take XXH3's constant-time path.
+// Which of `shards` backup shards stores this tag list.
 fn tagShardFor(tags: string, shards: int): int {
-  return int(xxh3_64([]byte(tags)) % u64(shards))
+  return int(xxh3([]byte(tags)) % u64(shards))
 }
 
-// A draft title is at most 240 bytes, so it always fits; a per-library seed
-// keeps two libraries' hash tables unrelated.
+// A per-library seed keeps two libraries' hash tables unrelated.
 fn titleKey(title: string, librarySeed: u64): u64 {
-  return xxh3_64([]byte(title), librarySeed)
+  return xxh3([]byte(title), librarySeed)
+}
+```
+
+### `Xxh3(seed: u64 = 0)`
+
+A streaming hasher, for a body that arrives in chunks and should not be
+concatenated first. `Xxh3()` starts a hash under seed `0`; `Xxh3(seed)` under
+that seed. Whatever the chunking - one byte at a time, chunks of 63, 64 or 65
+bytes, a split in the middle of a 1 KiB block, empty chunks in between - the
+result equals `xxh3` of the concatenation, so a streamed S3 upload and a
+one-shot hash of the same object agree.
+
+### `Xxh3.update(data: []byte)`
+
+Absorbs `data`. The hasher keeps the first 240 bytes (the short paths need
+them all at once) and one 64-byte stripe, so no call allocates per chunk.
+
+### `Xxh3.digest(): u64`
+
+The hash of everything absorbed so far. It does not consume the hasher: call
+it after every chunk for a running value, and keep calling `update` after.
+
+### `Xxh3.reset()`
+
+Rewinds to the empty input under the same seed, so one hasher can hash many
+drafts in turn.
+
+```bit
+import { Xxh3, xxh3 } from "std/hash"
+
+// Hash a draft that is read in chunks, then reuse the hasher for the next.
+fn hashChunkedDrafts(first: [][]byte, second: [][]byte): bool {
+  let h = Xxh3()
+  for chunk of first {
+    h.update(chunk)
+  }
+  let firstHash = h.digest()
+  h.reset()
+  for chunk of second {
+    h.update(chunk)
+  }
+  return firstHash != h.digest()
+}
+
+fn streamedMatchesOneShot(chunks: [][]byte, whole: []byte): bool {
+  let h = Xxh3(42)
+  for chunk of chunks {
+    h.update(chunk)
+  }
+  return h.digest() == xxh3(whole, 42)
 }
 ```
