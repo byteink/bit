@@ -182,215 +182,37 @@
 # `boundPresyntaxDiags`/`boundPresyntaxTypes`, `funcsAdded`) are preserved in
 # git history at this file's state before #6527.
 #
-# --- Declared signatures (each retires at the repin that brings the fix in) ---
+# #6679-generic-join-param-retype (`ir`, `iropt`), #6570-fail-zero-decimal-box
+# (`ir`, `iropt`) and #6564-arrow-ctor-seeded (`types`, `ir`, `iropt`) were
+# retired by the stage0 0.36.0 repin (#6788), declared by #6711, #6712 and #6713
+# against the 0.35.0 oracle. 0.36.0 contains #6564, #6570 and #6679, so it is
+# the first oracle that agrees with the tree on every corpus file they
+# explained. Confirmed against the 0.36.0 pin (this tree at the #6788 repin,
+# aarch64-macos): `--dump-ir`, `--dump-ir-pre` and `--dump-types` of the nine
+# files those signatures named (ir_generic_match_join_type, generic_option_
+# containers, generic_option_string_field, decimal_fallible_return,
+# run_arrow_arg_ctor_init, stdlib/decimal/decimal.bit and the three
+# _tests_/imports http2e2e/httpgracefulh2/httpgracefultls mains) are
+# byte-identical between the oracle and the tree with no signature consulted.
+# Their derivations (`joinParamRetype`, `decimalZeroBox`/`boxHunk`,
+# `arrowTypeSeeded`/`arrowIrSeeded`/`invalidFilled`) are preserved in git
+# history at this file's state before #6788.
 #
-# 6679-generic-join-param-retype (`ir`, `iropt`). The merge of #6679 ("lower:
-# scope a body's checker rebinds to that body") fixed a generic instance's
-# `match` join block param being typed from the PREVIOUS instance. The pinned
-# 0.35.0 oracle still has the bug (`pick<Node>` gets `bb3(%8: Node, %9: i64)`)
-# and refuses to build generic_option_containers.bit and
-# generic_option_string_field.bit. The files affected are
-# _tests_/cases/ir_generic_match_join_type.bit,
-# _tests_/cases/generic_option_containers.bit and
-# _tests_/cases/generic_option_string_field.bit. The identity: same line
-# count, and every differing line pair is a block header `bbN(...)` on both
-# sides with the same label and the same %id list in the same order, so only
-# the param TYPES differ. Retires at the first repin to a release containing
-# #6679.
-#
-# 6570-fail-zero-decimal-box (`ir`, `iropt`). The merge of #6570 added
-# `zeroDecimal` (compiler/lowerslicefill.bit), which materializes the §13.4
-# decimal zero as a real 16-byte box; a `decimal!` function's failing-path
-# return uses it, where the 0.35.0 oracle returns `const_int decimal 0`. The
-# files affected are _tests_/cases/decimal_fallible_return.bit and
-# stdlib/decimal/decimal.bit. The identity, on text with every %id erased:
-# each oracle line `const_int decimal 0` is replaced by 0, 1 or 2 lines
-# `const_int i64 0`, then `gc_alloc size=16 ptrs=[] (i64, i64)` and the two
-# `field_set` of offsets 0 and 8 on that allocation; every other line is equal.
-# Retires at the first repin to a release containing #6570.
-#
-# 6564-arrow-ctor-seeded (`types`, `ir`, `iropt`). The merge of #6564 makes the
-# checker seed an arrow argument's expected type from a class `init`'s
-# parameters. The 0.35.0 oracle types those arrow params `<error>`/`<invalid>`
-# and then lowers the `([]byte) => ()!` argument as a non-fallible
-# `fn(<invalid>) void` closure with no `err_set` (a latent 0.35.0
-# miscompile). The files affected are _tests_/cases/run_arrow_arg_ctor_init.bit
-# (`types` only), _tests_/imports/http2e2e/main.bit,
-# _tests_/imports/httpgracefulh2/main.bit and
-# _tests_/imports/httpgracefultls/main.bit. `types` identity: same line
-# count; every differing pair shares its `LINE:COL: name` prefix, the oracle
-# type is exactly `<error>` and the tree type is not; at least one pair. `ir`
-# identity (SSA ids unchanged): every oracle-side differing line contains
-# `<invalid>` and its tree line equals it with each `<invalid>` replaced by one
-# concrete type token, `void!error` read as `void`; the only tree-only lines
-# are one `const_nil` plus `rt_call err_set` of it inside a closure whose tree
-# signature ends `void!error` and whose oracle signature ends `void`. Retires
-# at the first repin to a release containing #6564.
-#
-# The input protocol is the text the awk body reads: the oracle's dump, a line
-# `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file as
-# `-v` variables. A new entry must satisfy the rules in the header: an exact
-# identity, derived from FULL dumps (the oracle's from `sh scripts/stage0.sh`,
-# the tree's from `bit-out/bin/bit`), never an excerpt.
+# NO SIGNATURE IS DECLARED. `explainMismatch` below is the empty table every
+# caller still consults, so the next lowering change that outruns the oracle
+# adds its entry there instead of re-plumbing the callers. The input protocol
+# is the text the awk body of the previous revision read: the oracle's dump,
+# a line `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file
+# as `-v` variables. A new entry must satisfy the rules in the header: an
+# exact identity, derived from FULL dumps (the oracle's from
+# `sh scripts/stage0.sh`, the tree's from `bit-out/bin/bit`), never an excerpt.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does.
+# and returns 0, or prints nothing and returns 1 if none does. No signature is
+# registered, so it returns 1 for every kind.
 explainMismatch() {
-  awk -v kind="$3" -v file="${4:-}" '
-    # canonT -- rewrite every `$t<N>` of arr[1..n] to `$c<idx>` in first-
-    # appearance order, the same canonicalization scripts/selfhost-ir-canon.sh
-    # applies, so interning-order numbering never hides an identity.
-    function canonT(arr, n,    i, line, out, tok, cnt, map) {
-      cnt = 0
-      for (i = 1; i <= n; i++) {
-        line = arr[i]; out = ""
-        while (match(line, /\$t[0-9]+/)) {
-          tok = substr(line, RSTART, RLENGTH)
-          if (!(tok in map)) { map[tok] = "$c" cnt++ }
-          out = out substr(line, 1, RSTART - 1) map[tok]
-          line = substr(line, RSTART + RLENGTH)
-        }
-        arr[i] = out line
-      }
-    }
-    function isHeader(s) { return (s ~ /^bb[0-9]+\(.*\):$/) ? 1 : 0 }
-    # hdrKey -- a block header with its param types dropped: the label, then
-    # every %id in order.
-    function hdrKey(s,    k) {
-      k = substr(s, 1, index(s, "("))
-      while (match(s, /%[0-9]+/)) { k = k substr(s, RSTART, RLENGTH) ","; s = substr(s, RSTART + RLENGTH) }
-      return k
-    }
-    # joinParamRetype (#6679) -- see the header above explainMismatch.
-    function joinParamRetype(nA, linesA, nB, linesB,    i, n) {
-      if (nA != nB) { return 0 }
-      n = 0
-      for (i = 1; i <= nA; i++) {
-        if (linesA[i] == linesB[i]) { continue }
-        if (!isHeader(linesA[i]) || !isHeader(linesB[i])) { return 0 }
-        if (hdrKey(linesA[i]) != hdrKey(linesB[i])) { return 0 }
-        n++
-      }
-      return (n > 0) ? 1 : 0
-    }
-    function erased(s) { gsub(/%[0-9]+/, "%_", s); return s }
-    # idOf -- the %id a line defines (`  %N = ...`), "" when it defines none.
-    function idOf(s) { return match(s, /^  %[0-9]+ = /) ? substr(s, 3, RLENGTH - 5) : "" }
-    # boxHunk -- tree lines B[j..] are 0-2 `const_int i64 0`, a 16-byte
-    # gc_alloc and the two field_set of offsets 0 and 8 on that allocation.
-    # Returns the index after the hunk, 0 when it is not one.
-    function boxHunk(nB, linesB, j,    c, id) {
-      for (c = 0; c < 2 && j <= nB && erased(linesB[j]) == "  %_ = const_int i64 0"; c++) { j++ }
-      if (j + 2 > nB || erased(linesB[j]) != "  %_ = gc_alloc size=16 ptrs=[] (i64, i64)") { return 0 }
-      id = idOf(linesB[j])
-      if (index(linesB[j + 1], "  field_set " id "[0] = ") != 1) { return 0 }
-      if (index(linesB[j + 2], "  field_set " id "[8] = ") != 1) { return 0 }
-      return j + 3
-    }
-    # decimalZeroBox (#6570) -- see the header above explainMismatch.
-    function decimalZeroBox(nA, linesA, nB, linesB,    i, j, hunks, e) {
-      i = 1; j = 1; hunks = 0
-      while (i <= nA && j <= nB) {
-        if (erased(linesA[i]) == erased(linesB[j])) { i++; j++; continue }
-        if (erased(linesA[i]) != "  %_ = const_int decimal 0") { return 0 }
-        e = boxHunk(nB, linesB, j)
-        if (e == 0) { return 0 }
-        i++; j = e; hunks++
-      }
-      return (i > nA && j > nB && hunks > 0) ? 1 : 0
-    }
-    function lastColonSpace(s,    i, n, found) {
-      found = 0
-      n = length(s) - 1
-      for (i = 1; i <= n; i++) {
-        if (substr(s, i, 2) == ": ") { found = i }
-      }
-      return found
-    }
-    # arrowTypeSeeded (#6564, `types`) -- see the header above explainMismatch.
-    function arrowTypeSeeded(nA, linesA, nB, linesB,    i, n, cA, cB, tyB) {
-      if (nA != nB) { return 0 }
-      n = 0
-      for (i = 1; i <= nA; i++) {
-        if (linesA[i] == linesB[i]) { continue }
-        cA = lastColonSpace(linesA[i]); cB = lastColonSpace(linesB[i])
-        if (cA == 0 || cB == 0 || substr(linesA[i], 1, cA) != substr(linesB[i], 1, cB)) { return 0 }
-        tyB = substr(linesB[i], cB + 2)
-        if (substr(linesA[i], cA + 2) != "<error>" || tyB == "" || index(tyB, "<error>") > 0) { return 0 }
-        n++
-      }
-      return (n > 0) ? 1 : 0
-    }
-    # invalidFilled -- tree line b is oracle line a with each `<invalid>`
-    # replaced by one concrete type token (no space, comma or paren), after
-    # `void!error` is read as `void`.
-    function invalidFilled(a, b,    np, parts, k, pos, nx, gap) {
-      gsub(/void!error/, "void", b)
-      np = split(a, parts, "<invalid>")
-      if (np < 2 || substr(b, 1, length(parts[1])) != parts[1]) { return 0 }
-      pos = length(parts[1]) + 1
-      for (k = 2; k <= np; k++) {
-        if (k == np) {
-          nx = length(b) - length(parts[k]) + 1
-          if (nx <= pos || substr(b, nx) != parts[k]) { return 0 }
-        } else {
-          nx = index(substr(b, pos + 1), parts[k])
-          if (nx == 0) { return 0 }
-          nx += pos
-        }
-        gap = substr(b, pos, nx - pos)
-        if (gap !~ /^[^ ,()]+$/) { return 0 }
-        pos = nx + length(parts[k])
-      }
-      return 1
-    }
-    # errSetPair -- tree lines B[j], B[j+1] are `const_nil` and the `err_set`
-    # call on that value.
-    function errSetPair(nB, linesB, j,    id) {
-      if (j + 1 > nB) { return 0 }
-      id = idOf(linesB[j])
-      if (id == "" || linesB[j] != "  " id " = const_nil") { return 0 }
-      return (linesB[j + 1] ~ /^  %[0-9]+ = rt_call err_set\(/ && index(linesB[j + 1], "err_set(" id ") void") > 0) ? 1 : 0
-    }
-    # arrowIrSeeded (#6564, `ir`/`iropt`) -- see the header above
-    # explainMismatch. errOk is 1 inside a closure whose signature gained
-    # `!error` and that has not yet received its one err_set pair.
-    function arrowIrSeeded(nA, linesA, nB, linesB,    i, j, n, errOk) {
-      i = 1; j = 1; n = 0; errOk = 0
-      while (i <= nA || j <= nB) {
-        if (i <= nA && j <= nB && linesA[i] == linesB[j]) {
-          if (linesA[i] ~ /^func /) { errOk = 0 }
-          i++; j++; continue
-        }
-        if (errOk && j <= nB && errSetPair(nB, linesB, j)) { errOk = 0; j += 2; continue }
-        if (i > nA || j > nB || index(linesA[i], "<invalid>") == 0 || !invalidFilled(linesA[i], linesB[j])) { return 0 }
-        if (linesA[i] ~ /^func / && linesA[i] ~ / void [{]$/ && linesB[j] ~ / void!error [{]$/) { errOk = 1 }
-        i++; j++; n++
-      }
-      return (n > 0) ? 1 : 0
-    }
-    side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
-    side == 0 { nA++; linesA[nA] = $0; next }
-    { nB++; linesB[nB] = $0 }
-    END {
-      if (kind == "types" && arrowTypeSeeded(nA, linesA, nB, linesB)) {
-        print "6564-arrow-ctor-seeded"; exit 0
-      }
-      if (kind != "ir" && kind != "iropt") { exit 1 }
-      canonT(linesA, nA); canonT(linesB, nB)
-      if (joinParamRetype(nA, linesA, nB, linesB)) {
-        print "6679-generic-join-param-retype"; exit 0
-      }
-      if (decimalZeroBox(nA, linesA, nB, linesB)) {
-        print "6570-fail-zero-decimal-box"; exit 0
-      }
-      if (arrowIrSeeded(nA, linesA, nB, linesB)) {
-        print "6564-arrow-ctor-seeded"; exit 0
-      }
-      exit 1
-    }
-  ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
+  return 1
 }
 
 # declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
@@ -400,14 +222,8 @@ explainMismatch() {
 # function does not list can never be checked for going dead, and one it lists
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
-# the list matches the `print "..."` statements in this file (with the kind
-# argument omitted there: "does this name exist at all").
+# the list matches the `print "..."` statements in this file. None are
+# declared, so it prints nothing for every kind.
 declaredSignatureNames() {
-  local kind=${1:-}
-  case "$kind" in
-    ast|fmt|tokens|diags) return ;;
-    ir|iropt) printf '%s\n' "6564-arrow-ctor-seeded" "6570-fail-zero-decimal-box" "6679-generic-join-param-retype"; return ;;
-    types) printf '%s\n' "6564-arrow-ctor-seeded"; return ;;
-  esac
-  [ -n "$kind" ] || printf '%s\n' "6564-arrow-ctor-seeded" "6570-fail-zero-decimal-box" "6679-generic-join-param-retype"
+  return 0
 }
