@@ -14,7 +14,7 @@ because it is implemented as a channel operation, and channel operations
 already park the caller instead of spinning.
 
 ```bit ignore
-import { newMutex, newWaitGroup, newRWMutex, newOnce, newAtomicI64 } from "std/sync"
+import { Mutex, WaitGroup, RWMutex, Once, AtomicI64 } from "std/sync"
 ```
 
 <!-- doctest: per-block -->
@@ -25,10 +25,9 @@ import { newMutex, newWaitGroup, newRWMutex, newOnce, newAtomicI64 } from "std/s
 
 Mutual exclusion lock. A class, so it is a reference type: every holder of the
 same `Mutex` value contends for the same lock. The zero-valued `Mutex` (never
-constructed with `newMutex`) is not usable - always construct with
-`newMutex()`.
+built with `Mutex()`) is not usable - always construct with `Mutex()`.
 
-### `newMutex(): Mutex`
+### `Mutex()`
 
 A `Mutex` ready to use, unlocked.
 
@@ -43,7 +42,7 @@ Releases the lock. Unlocking a `Mutex` the caller does not hold is a caller
 bug, same as Go's `sync.Mutex` - it is not detected.
 
 ```bit
-import { Mutex, newMutex, WaitGroup, newWaitGroup } from "std/sync"
+import { Mutex, WaitGroup } from "std/sync"
 
 // N spawned tasks incrementing a shared counter under a Mutex land on an
 // exact total - the same shape as this module's directory KAT
@@ -69,9 +68,9 @@ fn bump(counter: []i64, mu: Mutex, wg: WaitGroup) {
 ### `RWMutex`
 
 A reader/writer lock: any number of readers may hold it at once, but a writer
-excludes everyone. Construct with `newRWMutex()`.
+excludes everyone. Construct with `RWMutex()`.
 
-### `newRWMutex(): RWMutex`
+### `RWMutex()`
 
 An `RWMutex` ready to use, unlocked.
 
@@ -92,7 +91,7 @@ Acquires the lock for writing, excluding both readers and other writers.
 Releases a write lock acquired by `lock()`.
 
 ```bit
-import { RWMutex, newRWMutex } from "std/sync"
+import { RWMutex } from "std/sync"
 
 fn readCached(cache: []i64, mu: RWMutex): i64 {
   mu.rLock()
@@ -117,7 +116,7 @@ at the end of each, `wait()` in the coordinator. Single-use - construct a
 fresh `WaitGroup` per fan-out round rather than reusing one after `wait()`
 returns.
 
-### `newWaitGroup(): WaitGroup`
+### `WaitGroup()`
 
 A fresh `WaitGroup` with a zero counter.
 
@@ -137,10 +136,10 @@ Decrements the counter by one. The call that brings it to zero unblocks every
 Blocks until the counter reaches zero.
 
 ```bit
-import { WaitGroup, newWaitGroup } from "std/sync"
+import { WaitGroup } from "std/sync"
 
 fn fanIn(n: int): int {
-  let wg = newWaitGroup()
+  let wg = WaitGroup()
   wg.add(n)
   let i = 0
   while (i < n) {
@@ -161,9 +160,9 @@ fn finish(wg: WaitGroup) {
 ### `Once`
 
 Runs a function exactly once, however many green threads call `do`
-concurrently. Construct with `newOnce()`.
+concurrently. Construct with `Once()`.
 
-### `newOnce(): Once`
+### `Once()`
 
 A fresh `Once`, not yet run.
 
@@ -173,7 +172,7 @@ Runs `f` on the first call only. Every call - concurrent or not - blocks
 until that first run has completed.
 
 ```bit
-import { Once, newOnce } from "std/sync"
+import { Once } from "std/sync"
 
 fn initOnce(o: Once, ready: []i64) {
   o.do(() => {
@@ -193,7 +192,7 @@ Bit's generic constraints are interface bounds only, so there is no single
 class per width in common use, the same shape as
 Go's `sync/atomic.Int64`.
 
-### `newAtomicI64(v: i64): AtomicI64`
+### `AtomicI64(v: i64)`
 
 An `AtomicI64` initialized to `v`.
 
@@ -224,7 +223,7 @@ Stores `v` and returns the previous value.
 
 The `u64` counterpart of `AtomicI64`, for unsigned counters.
 
-### `newAtomicU64(v: u64): AtomicU64`
+### `AtomicU64(v: u64)`
 
 An `AtomicU64` initialized to `v`.
 
@@ -250,10 +249,10 @@ otherwise leaves it unchanged and returns `false`.
 Stores `v` and returns the previous value.
 
 ```bit
-import { newAtomicI64 } from "std/sync"
+import { AtomicI64 } from "std/sync"
 
 fn raceFreeCounter(n: i64): i64 {
-  let counter = newAtomicI64(0)
+  let counter = AtomicI64(0)
   let i = 0
   while (i < n) {
     counter.add(1)
@@ -306,7 +305,7 @@ A snapshot from `Pool.stats()`: `open` (resources that exist), `idle`
 (parked and ready), `checkedOut` (out with a caller) and `waiting` (callers
 queued for one).
 
-### `newPool<T>(open: () => T!, close: (T) => (), healthy: (T) => bool, opts: PoolOptions): Pool<T>`
+### `Pool<T>(open: () => T!, close: (T) => (), healthy: (T) => bool, opts: PoolOptions)`
 
 Builds a pool that opens resources through `open`, closes them through
 `close`, and validates one before reuse through `healthy`. Nothing opens
@@ -340,7 +339,7 @@ checked out is closed as it comes back. Safe to call more than once.
 A point-in-time snapshot of how the pool is doing.
 
 ```bit
-import { Pool, Lease, PoolOptions, PoolStats, newPool } from "std/sync"
+import { Pool, Lease, PoolOptions, PoolStats } from "std/sync"
 
 // A toy resource standing in for anything expensive to open - a database or
 // a Redis connection, in a real program.
@@ -367,7 +366,7 @@ fn widgetHealthy(c: widgetConn): bool {
 
 fn newWidgetPool(): Pool<widgetConn> {
   let counter = widgetCounter{}
-  return newPool<widgetConn>(
+  return Pool<widgetConn>(
     () => openWidget(counter),
     closeWidget,
     widgetHealthy,

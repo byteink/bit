@@ -13,10 +13,10 @@ and call its methods - the same shape `std/sync`'s `Mutex`, `WaitGroup` and
 `std/rand`'s `Rand` already use.
 
 ```bit
-import { newRegistry } from "std/metrics"
+import { Registry } from "std/metrics"
 
 fn main() {
-  let reg = newRegistry(1000) // max distinct label-value combinations PER metric
+  let reg = Registry(1000) // max distinct label-value combinations PER metric
   let hits = reg.counter("http_requests_total", "Total HTTP requests.", ["method", "code"])
   hits.inc(["GET", "200"])
   print(reg.exposition())
@@ -42,7 +42,7 @@ alongside your own metrics) increments by one.
 Holds every metric registered on it and renders them as one Prometheus
 text-format exposition body.
 
-### `newRegistry(capMax: i64): Registry`
+### `Registry(capMax: i64)`
 
 A fresh, empty registry. `capMax` bounds the number of distinct
 label-value combinations EACH metric registered on it may accumulate, and

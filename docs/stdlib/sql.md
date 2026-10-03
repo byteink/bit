@@ -291,7 +291,7 @@ program reaches for directly when it wants one connection with no pool at
 all, including `Stmt` for a query prepared once and run many times:
 
 ```bit
-import { Registry, newRegistry, Driver, Conn, Value } from "std/sql"
+import { Registry, Driver, Conn, Value } from "std/sql"
 
 fn queryOnce(reg: Registry, driverName: string, dsn: string, id: string): ()! {
   let conn = reg.open(driverName, dsn)?
@@ -444,10 +444,10 @@ section above for why.
 ### `Registry`
 
 The driver registry a program builds once and shares. Build one with
-`newRegistry()`, have every driver's own setup code call `register` on it,
+`Registry()`, have every driver's own setup code call `register` on it,
 and pass it to `open` wherever a connection is needed.
 
-### `newRegistry(): Registry`
+### `Registry()`
 
 An empty `Registry`, ready for `register` calls.
 

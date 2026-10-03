@@ -10,15 +10,15 @@ or when you press Ctrl-C - instead of leaving work half done.
 ## Waiting on a timer without blocking forever
 
 `select` waits on more than one channel at once and runs whichever case is
-ready first. `newTimer(d)` returns a `Timer` whose `c` receives once, `d`
+ready first. `Timer(d)` returns a `Timer` whose `c` receives once, `d`
 nanoseconds from now - the building block for "do this, but not more often
 than every `d`":
 
 ```bit
-import { newTimer, Millisecond } from "std/time"
+import { Timer, Millisecond } from "std/time"
 
 fn tickThreeTimes() {
-  let timer = newTimer(5 * Millisecond)
+  let timer = Timer(5 * Millisecond)
   let count = 0
   while (count < 3) {
     let _ = <- timer.c
@@ -45,10 +45,10 @@ so the loop reacts to a stop signal within one tick instead of only between
 whole polling cycles:
 
 ```bit
-import { newTimer, Millisecond } from "std/time"
+import { Timer, Millisecond } from "std/time"
 
 fn pollUntilStopped(stop: chan<bool>, ticks: chan<int>) {
-  let timer = newTimer(2 * Millisecond)
+  let timer = Timer(2 * Millisecond)
   let n = 0
   let running = true
   while (running) {
@@ -127,7 +127,7 @@ export class Draft {
   export updated: i64,
 }
 
-import { newTimer } from "std/time"
+import { Timer } from "std/time"
 
 // The ids of every draft in `drafts` whose `updated` is newer than what
 // `seen` last recorded for it (including ids `seen` has never recorded).
@@ -161,7 +161,7 @@ export fn watchLoop(
   changes: chan<string>,
 ) {
   let seen = map<string, i64>()
-  let timer = newTimer(interval)
+  let timer = Timer(interval)
   let running = true
   while (running) {
     select {

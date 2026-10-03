@@ -19,7 +19,7 @@ Concatenating in a loop copies the whole string every time, which turns an
 An append-only string buffer. A class, so it is a reference type: its methods
 mutate it in place, and they also return it so calls can chain.
 
-### `newBuilder(): Builder`
+### `Builder()`
 
 An empty `Builder`.
 
@@ -40,10 +40,10 @@ The accumulated string. The builder stays usable.
 Bytes accumulated so far.
 
 ```bit
-import { newBuilder } from "std/strings"
+import { Builder } from "std/strings"
 
 fn csv(xs: []string): string {
-  let b = newBuilder()
+  let b = Builder()
   let first = true
   for x of xs {
     if (!first) {

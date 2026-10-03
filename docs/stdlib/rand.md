@@ -19,7 +19,7 @@ than a "fast mode" inside `std/crypto`.
 The algorithm is SplitMix64 (Steele, Lea & Flood, 2014). Two `Rand`s built
 from the same seed produce a byte-identical sequence from every method
 below, forever - the property that makes a failing randomized test
-reproducible: print the seed on failure, replay with `newRand(thatSeed)`.
+reproducible: print the seed on failure, replay with `Rand(thatSeed)`.
 
 <!-- doctest: per-block -->
 
@@ -30,16 +30,16 @@ reproducible: print the seed on failure, replay with `newRand(thatSeed)`.
 A seedable, non-cryptographic pseudo-random generator. See the warning
 above: never use this for anything security-sensitive.
 
-### `newRand(seed: uint): Rand`
+### `Rand(seed: uint)`
 
 A generator seeded with `seed`. Two `Rand`s built from the same seed produce
 an identical sequence from every method below.
 
 ```bit
-import { newRand } from "std/rand"
+import { Rand } from "std/rand"
 
 fn reproducibleRoll(seed: uint): int {
-  let r = newRand(seed)
+  let r = Rand(seed)
   return r.intn(6) + 1
 }
 ```
@@ -55,7 +55,7 @@ A uniformly random value in `[0, n)`, free of modulo bias via rejection
 sampling. Panics if `n` is not positive.
 
 ```bit
-import { newRand, Rand } from "std/rand"
+import { Rand } from "std/rand"
 
 fn pickIndex(r: Rand, len: int): int {
   return r.intn(len)
@@ -74,7 +74,7 @@ A uniformly random value in `[0.0, 1.0)`, built from the top 53 bits of a
 draw so every representable outcome is equally likely.
 
 ```bit
-import { newRand, Rand } from "std/rand"
+import { Rand } from "std/rand"
 
 // Jittered backoff: a randomized delay so retrying clients don't all retry
 // at once (the classic anti-thundering-herd measure).
@@ -89,7 +89,7 @@ Shuffles `xs` in place with Fisher-Yates: uniformly random among all
 `len(xs)!` orderings, O(n) draws, no extra allocation.
 
 ```bit
-import { newRand, Rand } from "std/rand"
+import { Rand } from "std/rand"
 
 fn shuffledCopy(r: Rand, xs: []int): []int {
   let out = []int(len(xs))
@@ -114,7 +114,7 @@ One shared generator, lazily seeded from `std/crypto`'s OS entropy, for
 quick one-off use with no `Rand` to manage. It shares one unsynchronized
 state across every caller in the process - **not** safe to call from more
 than one worker thread at a time. A program drawing from multiple workers
-concurrently must give each worker its own `newRand(seed)`.
+concurrently must give each worker its own `Rand(seed)`.
 
 ### `intn(n: int): int`
 
