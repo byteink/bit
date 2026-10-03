@@ -433,4 +433,13 @@ fi
 if [ "$fail" -eq 0 ] && [ "$inconc" -eq 0 ] && [ "$timeout" -eq 0 ]; then
   echo "diffall: GREEN — every differential in the family agrees."
 fi
-diffexit "diffall" -f "$fail" -t "constituent(s)=$((inconc + timeout))"
+# An exit-2 constituent decided nothing for its own reason (a refused
+# precondition, an observation that saw nothing), not because the alarm fired;
+# diffexit's UNDECIDED line says "timed out ... raise the timeout", which sent
+# the reader after the wrong cause (#6675). Name it here; real divergence still wins.
+if [ "$fail" -eq 0 ] && [ "$inconc" -gt 0 ]; then
+  echo "UNDECIDED: diffall: $inconc constituent(s) could not decide (exit 2) and $timeout timed out."
+  echo "           This is not a pass. Read the UNDECIDED constituents' kept logs for the reason."
+  exit 2
+fi
+diffexit "diffall" -f "$fail" -t "constituent(s)=$timeout"
