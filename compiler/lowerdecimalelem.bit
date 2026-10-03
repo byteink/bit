@@ -1,0 +1,240 @@
+// compiler/lowerdecimalelem.bit — #6570: a `decimal` as a slice, array or map
+// element. Sibling of lowerdecimal.bit: same module, so this needs no imports.
+//
+// THE LAYOUT. A slice or array element is 16 inline bytes: word 0 (`lo`) at
+// byte 0 and word 1 (`hi`) at byte 8, the pair `decimalFieldWords` reads out of
+// a class field (lowerdecimal.bit's banner has the word encoding). A `[]decimal`
+// buffer is therefore a PACKED, non-reference buffer of stride 16
+// (`sliceElemSizeFor`, lowerlayout.bit; ABI.md §2, "Element storage"): the
+// collector never scans it and the runtime's `slice_get`/`slice_set` — word
+// valued, FATAL above 8 bytes — are never called with it.
+//
+// ONE ELEMENT = TWO WORD SLOTS of an ordinary `index_get`/`index_set`. Element
+// `slot` of a base `b` is words `2*slot` and `2*slot + 1` of the same base, so
+// the base stays an operand of the access itself (no derived pointer is minted)
+// and both backends only ever see 8-byte loads and stores. A single
+// `index_set` at prim 12 would ask a backend for a 16-byte store, which falls
+// off the 1/2/4/8 switch on purpose (`widthOf`, #3981) — before this file it
+// was `xs[0] = 3.5` that reached it silently.
+//
+// A MAP VALUE IS NOT INLINE: maps are word-per-value (ABI.md §15), so a
+// decimal value is the pointer to its boxed `decimalTupleType` record, exactly
+// as an enum payload holds one (`enumPayloadSlotIsPtr`, #5420), and the map is
+// created with `val_is_ref` set so the collector traces that pointer
+// (`lowerMapMake`, lowermapctor.bit). The tuple is immutable (ABI.md §1.1), so
+// a shared box is indistinguishable from a copy. A miss reads as the null word,
+// which `emitMapMiss` (lowermapaccess.bit) turns into decimal zero.
+
+// The value type an element read of `ty` carries in the IR: a decimal's two
+// words are the tuple every decimal expression carries, never prim 12 itself.
+fn elemIrType(ctx: TypeContext, ty: int): int {
+  if (isDecimalPrim(ctx, ty)) {
+    return decimalTupleType(ctx)
+  }
+  return ty
+}
+
+// `2 * slot + extra`: word `extra` (0 or 1) of the decimal at element `slot`.
+fn decimalWordSlot(fc: FnCtx, slot: int, extra: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let one = mkInstr(Op.ConstInt, i64ty)
+  one.ival = 1
+  let shl = mkInstr(Op.Shl, i64ty)
+  shl.lhs = slot
+  shl.rhs = builderEmit(fc.b, one)
+  let base = builderEmit(fc.b, shl)
+  if (extra == 0) {
+    return base
+  }
+  let inc = mkInstr(Op.Add, i64ty)
+  inc.lhs = base
+  inc.rhs = builderEmit(fc.b, one)
+  return builderEmit(fc.b, inc)
+}
+
+// The decimal at element `slot` of the 16-byte-strided block `base`, as the
+// two-word tuple. No bounds test: the caller owes one (or the proof it needs
+// none).
+fn decimalLoadAt(fc: FnCtx, base: int, slot: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let lo = mkInstr(Op.IndexGet, i64ty)
+  lo.lhs = base
+  lo.rhs = decimalWordSlot(fc, slot, 0)
+  let loV = builderEmit(fc.b, lo)
+  let hi = mkInstr(Op.IndexGet, i64ty)
+  hi.lhs = base
+  hi.rhs = decimalWordSlot(fc, slot, 1)
+  let hiV = builderEmit(fc.b, hi)
+  return buildTuple(fc, decimalTupleType(fc.c.ctx), [loV, hiV])
+}
+
+// The store twin of `decimalLoadAt`. `val`'s words are read out BEFORE the
+// address arithmetic so nothing between the bounds test and the stores can
+// allocate.
+fn decimalStoreAt(fc: FnCtx, base: int, slot: int, val: int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let words = explodeValueWords(fc.c.ctx, fc.b, val, decimalWordTypes(fc.c.ctx))
+  let lo = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+  lo.lhs = base
+  lo.rhs = decimalWordSlot(fc, slot, 0)
+  lo.ival = words[0]
+  lo.ival2 = i64ty
+  builderEmit(fc.b, lo)
+  let hi = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+  hi.lhs = base
+  hi.rhs = decimalWordSlot(fc, slot, 1)
+  hi.ival = words[1]
+  hi.ival2 = i64ty
+  builderEmit(fc.b, hi)
+}
+
+// `[N]T` element read: the ordinary one-word `index_get`, or, for a decimal,
+// its two word slots. The raw access with NO bounds test, for the sites that
+// already hold an in-range index (`cloneArray`, `lowerArrayElems`, ...).
+fn emitArrayElemGet(fc: FnCtx, base: int, idx: int, ty: int): int {
+  if (isDecimalPrim(fc.c.ctx, ty)) {
+    return decimalLoadAt(fc, base, idx)
+  }
+  let ig = mkInstr(Op.IndexGet, ty)
+  ig.lhs = base
+  ig.rhs = idx
+  return builderEmit(fc.b, ig)
+}
+
+// `[N]T` element write, the twin of `emitArrayElemGet`.
+fn emitArrayElemSet(fc: FnCtx, base: int, idx: int, val: int, ty: int) {
+  if (isDecimalPrim(fc.c.ctx, ty)) {
+    decimalStoreAt(fc, base, idx, val)
+    return
+  }
+  let is = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+  is.lhs = base
+  is.rhs = idx
+  is.ival = val
+  is.ival2 = ty
+  builderEmit(fc.b, is)
+}
+
+// An index a decimal element access can use: integer-classed, because the
+// bounds compare and the word-slot arithmetic read an INTEGER register
+// (`lowerIndex` states the same for every inline access). The checker has no
+// rule against `xs[1.5]`, and the runtime fallback the other element types take
+// would FATAL on a 16-byte stride, so refuse it here with a span.
+fn decimalIndexOk(fc: FnCtx, idx: int, span: Span): bool {
+  if (regClassOf(fc.c.ctx, fc.b.instrs[idx].ty) == RegClass.Int) {
+    return true
+  }
+  fcFail(fc, span, "an index into a 'decimal' collection that is not an integer")
+  return false
+}
+
+// The receiver, index and shape of one `xs[idx]` over a slice or fixed array,
+// bundled to keep the accessors under E0202's five parameters. `arrayLen` is
+// read only when `!isSlice`.
+class ElemTarget {
+  isSlice: bool,
+  arrayLen: int,
+  recv: int,
+  idx: int,
+}
+
+// `xs[idx]` over a slice or fixed array whose element is a decimal, bounds
+// tested. A map receiver does not come here: its value is a word, read by
+// `emitMapGet`.
+fn decimalIndexGet(fc: FnCtx, t: ElemTarget, span: Span): int {
+  if (!decimalIndexOk(fc, t.idx, span)) {
+    return 0
+  }
+  if (t.isSlice) {
+    let e = emitInlineSliceElem(fc, t.recv, t.idx)
+    return decimalLoadAt(fc, e.buf, e.slot)
+  }
+  emitArrayBoundsCheckIfNeeded(fc, t.idx, t.arrayLen)
+  return decimalLoadAt(fc, t.recv, t.idx)
+}
+
+// `xs[idx] = val` over a slice or fixed array whose element is a decimal.
+// `t.recv`, `t.idx` and `val` are all lowered before this runs.
+fn decimalIndexSet(fc: FnCtx, t: ElemTarget, val: int, span: Span) {
+  if (!decimalIndexOk(fc, t.idx, span)) {
+    return
+  }
+  if (t.isSlice) {
+    let e = emitInlineSliceElem(fc, t.recv, t.idx)
+    decimalStoreAt(fc, e.buf, e.slot, val)
+    return
+  }
+  emitArrayBoundsCheckIfNeeded(fc, t.idx, t.arrayLen)
+  decimalStoreAt(fc, t.recv, t.idx, val)
+}
+
+// The `ElemTarget` of a resolved element lvalue (lowerassign.bit), for the
+// Elem arms of `readLvalue`/`writeLvalue`: `xs[i] += v` reads and writes the
+// same element `xs[i]` and `xs[i] = v` do.
+fn lvalueElemTarget(lv: Lvalue): ElemTarget {
+  return ElemTarget{ isSlice = lv.isSlice, arrayLen = lv.arrayLen, recv = lv.recv, idx = lv.index }
+}
+
+// The decimal zero (§13.4): both words zero, mantissa 0 at scale 0. What a map
+// miss and `zeroValue` (lowerslicefill.bit) hand back for a decimal.
+fn zeroDecimal(fc: FnCtx): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let lo = builderEmit(fc.b, mkInstr(Op.ConstInt, i64ty))
+  let hi = builderEmit(fc.b, mkInstr(Op.ConstInt, i64ty))
+  return buildTuple(fc, decimalTupleType(fc.c.ctx), [lo, hi])
+}
+
+// Fills a freshly allocated `[]decimal` literal (`lowerSliceElems`, lowerlit.bit):
+// each element is lowered FIRST, then stored at its own 16-byte slot. No bounds
+// test, on the argument `fillSliceLitElems` gives: `s` is the private header of
+// the `slice_new(len, len, ...)` emitted just above, `len` is `len(items)` and
+// every index is a constant below it. The element address is re-read from `s`
+// for every element, so `s` is a use after any allocation an element's own
+// lowering made — the buffer cannot be collected between the allocation and the
+// store.
+fn fillDecimalSliceLitElems(fc: FnCtx, s: int, elemTy: int, items: []int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let i = 0
+  while (i < len(items)) {
+    let a = items[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    let v = lowerExprH(fc, a, elemTy)
+    if (fc.failed) {
+      return 0
+    }
+    let idxI = mkInstr(Op.ConstInt, i64ty)
+    idxI.ival = i
+    let e = emitSliceElemAddr(fc, s, builderEmit(fc.b, idxI))
+    decimalStoreAt(fc, e.buf, e.slot, v)
+    i = i + 1
+  }
+  return s
+}
+
+// `a[i]` of decimal type, from `lowerIndex` (loweraccess.bit): a slice or array
+// element at its two word slots, a map value through the ordinary map read
+// (boxed, `emitMapGet`). Any other receiver cannot hold a decimal element and
+// the checker has already refused it, so it fails here with a span rather than
+// reading raw words off whatever it is.
+fn lowerDecimalIndex(fc: FnCtx, rd: Type, recv: int, idx: int, node: int): int {
+  let span = getNode(fc.c.tree, node).span
+  if (rd.kind == TypeKind.Map) {
+    return emitMapGet(fc, rd.mapVal, recv, idx, MapGetMiss{ panics = true, span = span })
+  }
+  if (rd.kind != TypeKind.Slice && rd.kind != TypeKind.Array) {
+    fcFail(
+      fc,
+      span,
+      "an indexed read of a 'decimal' from a value that is not a slice, array or map",
+    )
+    return 0
+  }
+  let isSlice = rd.kind == TypeKind.Slice
+  return decimalIndexGet(
+    fc,
+    ElemTarget{ isSlice = isSlice, arrayLen = rd.arrayLen, recv = recv, idx = idx },
+    span,
+  )
+}

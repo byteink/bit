@@ -492,7 +492,7 @@ holds — see the fabricated-header bug at `runtime/root/slices.bit:443-451`
 element's own byte stride (`elem_size`, §9) — `1` for `[]u8` (a non-ref,
 1-byte element, `elem_size = 1`), or a class `T`'s own body size
 (`elem_size = layout.size`) when EVERY field of `T` is a non-reference scalar
-(`ptr_offsets` empty). `elem_size` is a per-call-site
+(`ptr_offsets` empty), or `16` for a `decimal` (#6570). `elem_size` is a per-call-site
 compile-time constant, never runtime state, and travels as an explicit
 argument to every slice entry point below — the collector needs no change to
 support it: a packed, non-ref buffer keeps the LEAF `slice_buf_info`
@@ -2790,7 +2790,7 @@ defined exactly once).
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_parse_float`  | `(s: *const RtBytes) -> f64` (§2, correctly-rounded text->f64; the inverse of `bit_rt_string_from_float`) |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
-| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, a class's own body size for a packed all-scalar `T`, `8` for every other element type) |
+| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, a class's own body size for a packed all-scalar `T`, `16` for a `decimal`, `8` for every other element type) |
 | `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `is_ref`/`elem_size` are the static element type's — a null `h` has no header to read them from; for `elem_size > 8` writes only the element's low word, since the payload is one `u64` — the caller fills the rest at its own computed offset) |
 | `bit_rt_slice_append_str` | `(h: ?*SliceHeader, s: ?*const RtBytes) -> *SliceHeader` (§2 — appends the string's BYTES to a `[]u8` in one call, the shape `append(dst, s)` lowers to when `dst`'s element is `u8`. Stride and `is_ref` are fixed at `1`/`0` by that operand rule, so neither travels. A null `h` allocates a fresh header exactly as `bit_rt_slice_append` does; a null `s` is the empty string (§2's null-header contract) and appends nothing. Grows ONCE to `max(2 * cap, len + n)`, so a long string costs one allocation rather than one per doubling. Same aliasing contract as `bit_rt_slice_append`.) |
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2; FATAL for a packed, non-ref buffer with `elem_size` neither `1` nor `8` — one `u64` cannot represent a wider element without truncating) |
@@ -3755,7 +3755,7 @@ hold a zero key/value word, which `markRoot` skips.
 the handle of a string CONSTANT, which is static for the life of the process.
 
 - **Word model.** A key or value is one word, same as slice elements (§2): a
-  scalar by value, a `string` as its `*RtBytes` object base, a wider `V` boxed.
+  scalar by value, a `string` as its `*RtBytes` object base, a wider `V` boxed (a `decimal`: its tuple pointer, `val_is_ref` set, #6570).
 - **Hash / equality.** `key_desc` picks the strategy: `0` hashes the word with a
   splitmix64 finalizer (so low-entropy integer keys avalanche) and compares by
   word; `1` Wyhashes a string key over its bytes and compares byte-wise; anything

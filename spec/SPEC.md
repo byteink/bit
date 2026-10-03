@@ -4842,6 +4842,9 @@ See §15.4.
   comparable - a documented runtime condition).
 - Map keys (`K`) must be a comparable type; a non-comparable key type is a compile
   error.
+  A `decimal` is not accepted as a map key either (E0052): equal decimals can
+  differ in scale (`1.0` and `1.00`), so they would be two entries. A `decimal`
+  is an ordinary slice, array and map VALUE.
 
 ### 14.7 Enum Types
 
