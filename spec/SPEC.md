@@ -4163,7 +4163,25 @@ type it is applied to, so no single spelling has two readings.
 | `map<K,V>`     | the `(K, V)` pair                        | the **key** (`K`)                 |
 | `string`       | out of scope for v0.1 (§21)              | **rejected**                      |
 | `chan<T>`      | the received value, until closed (§16.2) | **rejected** - a stream has no position |
+| class or interface declaring `next(): Option<T>` | the `T` of each `Some`, until `None` | **rejected** |
+| class or interface declaring `next(): Option<T>!` | the `T` of each `Some`, until `None`; written `for x of it?` | **rejected** |
 | anything else  | **rejected**                             | **rejected**                      |
+
+**Iterators.** A class or interface opts into `for_of` structurally, by
+declaring a zero-parameter `next()` whose result is `Option<T>` for a single
+`T` (no `use` required). The loop calls `next()` before every iteration,
+binds the payload of a `Some` as the loop variable, and ends on `None`;
+`break`, `continue` and `return` in the body behave as in every other loop.
+
+If `next()` is fallible, `next(): Option<T>!`, the loop is written with a
+postfix `?` on the iterable expression: `for x of it? { }`. A failed `next()`
+leaves the loop and returns its error from the enclosing function exactly as
+`?` does (§18.3), so that function must itself be fallible (**E0061**). Both
+mismatches are compile errors: a fallible `next()` ranged over without the `?`
+is **E0186**, and a `?` on an iterable whose `next()` cannot fail is **E0187**.
+The `?` is the loop's own marker only when its operand is not fallible; when
+the operand is, the `?` is the ordinary one that unwraps the iterable
+(`for x of f()?` with `f(): []int!`), and `for x of f()??` spells both.
 
 A `tuple_pat` binder over `for_of` destructures the value above, and nothing
 else: its arity is the **value's** arity, not a fixed two, and the value must
@@ -6815,7 +6833,7 @@ if_stmt       = "if" "(" expression ")" block [ "else" ( if_stmt | block ) ] .
 while_stmt    = "while" "(" expression ")" block .
 for_stmt      = "for" ( for_c | for_of | for_in | (* empty -> infinite *) ) block .
 for_c         = "(" [ value_decl | assign_stmt ] ";" [ expression ] ";" [ inc_dec_stmt | assign_stmt ] ")" .
-for_of        = ( IDENT | tuple_pat | field_pat ) "of" expression .   (* the pattern splits the VALUE; §12.6 *)
+for_of        = ( IDENT | tuple_pat | field_pat ) "of" expression .   (* the pattern splits the VALUE; §12.6; a trailing `?` marks a fallible next() *)
 for_in        = ( IDENT | "(" pat "," pat ")" ) "in" expression .   (* pair binder: §12.6 *)
 field_pat     = "{" IDENT { "," IDENT } "}" .   (* for-of field-name binder; §12.6 *)
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
