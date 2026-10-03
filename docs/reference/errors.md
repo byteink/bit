@@ -161,6 +161,14 @@ A fallible value is not the value it wraps:
 let d: Draft = store.load("d1") // error[E0041]: expected 'Draft', found 'Draft!'
 ```
 
+The same holds wherever the value is used, not only in an annotated `let`.
+A fallible call in an `if` or `while` condition is E0041 (`expected 'bool',
+found 'bool!'`), and one used as an index, a receiver or an iterable, bound by
+a bare `let`, or left as a statement on its own is E0190. Each says to add `?`
+or `catch`. `let _ = save(d)` is the written way to drop a result on purpose,
+and `defer` and `spawn` accept a fallible call because no caller is left to
+hand its error to.
+
 `?` only works inside a function whose own return type is fallible; you
 cannot propagate a failure out of `fn main() { }`, only out of a function
 declared to return `T!`.

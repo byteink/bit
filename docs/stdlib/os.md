@@ -117,8 +117,9 @@ import { stdout } from "std/io"
 
 fn die(msg: string) {
   let w = stdout()
-  w.writeLine("fatal: ${msg}")
-  w.flush() // exit will not do this for us
+  // Nowhere better to report a failed write than the stream that just failed.
+  w.writeLine("fatal: ${msg}") catch _ {}
+  w.flush() catch _ {} // exit will not do this for us
   exit(1)
 }
 ```

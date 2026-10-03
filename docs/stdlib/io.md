@@ -58,18 +58,18 @@ Writes everything buffered to the descriptor. A no-op when nothing is pending.
 import { stdout, stderr } from "std/io"
 
 // One syscall for the whole report, not one per line.
-fn report(lines: []string) {
+fn report(lines: []string): ()! {
   let w = stdout()
   for line of lines {
-    w.writeLine(line)
+    w.writeLine(line)?
   }
-  w.flush()
+  w.flush()?
 }
 
-fn warn(msg: string) {
+fn warn(msg: string): ()! {
   let w = stderr()
-  w.writeLine("warning: ${msg}")
-  w.flush()
+  w.writeLine("warning: ${msg}")?
+  w.flush()?
 }
 ```
 
@@ -100,14 +100,14 @@ Everything still unread, to end of input.
 import { stdin, stdout } from "std/io"
 
 // `None` means end of input - the only way the loop terminates.
-fn echoLines() {
+fn echoLines(): ()! {
   let r = stdin()
   let w = stdout()
   while (true) {
     match (r.readLine()) {
-      Some(line) => { w.writeLine(line) }
+      Some(line) => { w.writeLine(line)? }
       None => {
-        w.flush()
+        w.flush()?
         return
       }
     }
