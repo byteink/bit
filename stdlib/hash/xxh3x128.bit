@@ -1,0 +1,248 @@
+// Bit standard library — hash module, XXH3-128.
+//
+// XXH3-128 IS A NON-CRYPTOGRAPHIC HASH, NOT AN INTEGRITY OR SECURITY
+// PRIMITIVE, for the reasons xxh3.bit's header gives: wider output does not
+// make the 17..240 byte path collision resistant, and anyone who knows the
+// seed can construct colliding inputs. For that use `std/crypto`.
+//
+// THE ALGORITHM is Yann Collet's XXH3 128-bit variant (github.com/Cyan4973/
+// xxHash, xxhash.h, the `XXH3_128bits` and `XXH3_128bits_withSeed` entry
+// points, also spelled `XXH128`), little-endian reads, 64-bit seed, the same
+// 192-byte default secret as the 64-bit hash. The same four length paths
+// apply, each producing two halves instead of one:
+//   0..16     a doubled copy of the 64-bit mix per sub-range, with different
+//             constants; the two halves come from different secret words
+//   17..128   the 64-bit windows, in pairs, one from each end; every pair
+//             also xors the other end's words into the opposite half
+//   129..240  the same pairs over the whole input
+//   over 240  the 64-bit long path (xxh3long.bit), merged twice: the low half
+//             is the 64-bit hash's merge, the high half merges the same
+//             accumulators at secret byte 117 from the complement of
+//             `n * PRIME64_2`
+// Neither half of the 128-bit result equals the 64-bit hash of the same input
+// in general (only for the 1..3 byte and the long inputs does `lo` coincide),
+// so `xxh3x128` is its own function, not a widening of `xxh3`.
+//
+// THE RESULT is a `Hash128`: the reference's `XXH128_hash_t`, whose `low64`
+// is `lo` and `high64` is `hi`.
+//
+// Lanes are read byte by byte (`xxRead64`, `xxRead32` in xxhash64.bit) until
+// the stage0 repin lets this switch to `loadU64` (#6790).
+//
+// Correctness is pinned by the reference implementation's own sanity vectors
+// (see xxh3x128.test.bit), none of which come from this file.
+
+// A 128-bit hash value: `hi` is the reference's `high64`, `lo` its `low64`.
+// The fields are read-only, so the only way to obtain one is `xxh3x128` or
+// `Xxh3x128.digest`.
+export class Hash128 {
+  export readonly hi: u64
+  export readonly lo: u64
+
+  // The 16 bytes of the reference's canonical form (`XXH128_canonicalFromHash`,
+  // what `XXH128_hashFromCanonical` reads back and what the S3 `XXHASH128`
+  // checksum encodes): `hi` big-endian, then `lo` big-endian. So the empty
+  // input under seed 0 is the bytes of `99aa06d3014798d86001c324468d497f`.
+  export bytes(): []byte {
+    let out: []byte = []byte(16)
+    let i = 0
+    while (i < 8) {
+      let shift = u64(56 - 8 * i)
+      out[i] = byte(this.hi >> shift)
+      out[8 + i] = byte(this.lo >> shift)
+      i = i + 1
+    }
+    return out
+  }
+
+  // Whether `other` is the same 128-bit value. Use this, not `==`, which on a
+  // class compares reference identity rather than contents.
+  export equals(other: Hash128): bool {
+    return this.hi == other.hi && this.lo == other.lo
+  }
+}
+
+// The state of a 17..240 byte hash: the input and the two running halves,
+// updated in place.
+class Xxh3Mid {
+  data: []byte,
+  lo: u64,
+  hi: u64,
+}
+
+// PRIME32_2 - 1: the 9..16 byte path adds the last word's low half times this
+// to the high product, on top of the word itself.
+const xxh3Prime32Minus: u64 = 0x85ebca76
+
+// Rotate the u32 held in the low half of `x` left by 13 (the high half must be 0).
+fn xxh3Rotl32By13(x: u64): u64 {
+  return ((x << 13) | (x >> 19)) & 0xffffffff
+}
+
+// 1..3 bytes: the 64-bit hash's combined word, once as is and once byte-swapped
+// and rotated, each keyed by its own pair of secret words.
+fn xxh3x128Len1to3(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  let c1 = u64(data[0])
+  let c2 = u64(data[n >> 1])
+  let c3 = u64(data[n - 1])
+  let combinedLo = (c1 << 16) | (c2 << 24) | c3 | (u64(n) << 8)
+  let combinedHi = xxh3Rotl32By13(xxh3Swap32(combinedLo))
+  let flipLo = (xxh3Sec32(0) ^ xxh3Sec32(4)) + seed
+  let flipHi = (xxh3Sec32(8) ^ xxh3Sec32(12)) - seed
+  return Hash128{
+    hi = xxh3Avalanche64(combinedHi ^ flipHi),
+    lo = xxh3Avalanche64(combinedLo ^ flipLo),
+  }
+}
+
+// 4..8 bytes: the first and last 4, one 64x64->128 multiply whose halves are
+// then mixed into each other.
+fn xxh3x128Len4to8(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  let s = seed ^ (xxh3Swap32(seed & 0xffffffff) << 32)
+  let flip = (xxh3Sec64(16) ^ xxh3Sec64(24)) + s
+  let in64 = xxRead32(data, 0) + (xxRead32(data, n - 4) << 32)
+  let keyed = in64 ^ flip
+  let mul = xxP1 + (u64(n) << 2)
+  let mhi = xxh3MulHi(keyed, mul)
+  let mlo = keyed * mul
+  mhi = mhi + (mlo << 1)
+  mlo = mlo ^ (mhi >> 3)
+  mlo = mlo ^ (mlo >> 35)
+  mlo = mlo * xxh3MixPrime2
+  mlo = mlo ^ (mlo >> 28)
+  return Hash128{ hi = xxh3Avalanche(mhi), lo = mlo }
+}
+
+// 9..16 bytes: the first and last 8, a 64x64->128 product, then a 128x64
+// product by PRIME64_2 of the halves mixed together.
+fn xxh3x128Len9to16(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  let flipLo = (xxh3Sec64(32) ^ xxh3Sec64(40)) - seed
+  let flipHi = (xxh3Sec64(48) ^ xxh3Sec64(56)) + seed
+  let inLo = xxRead64(data, 0)
+  let inHi = xxRead64(data, n - 8)
+  let keyed = inLo ^ inHi ^ flipLo
+  let mhi = xxh3MulHi(keyed, xxP1)
+  let mlo = keyed * xxP1 + (u64(n - 1) << 54)
+  inHi = inHi ^ flipHi
+  mhi = mhi + inHi + (inHi & 0xffffffff) * xxh3Prime32Minus
+  mlo = mlo ^ xxh3Swap64(mhi)
+  let hhi = xxh3MulHi(mlo, xxP2) + mhi * xxP2
+  return Hash128{ hi = xxh3Avalanche(hhi), lo = xxh3Avalanche(mlo * xxP2) }
+}
+
+// 0..16 bytes. The empty input hashes the secret alone, so it is the only
+// length whose result depends on nothing but the seed.
+fn xxh3x128Len0to16(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  if (n > 8) {
+    return xxh3x128Len9to16(data, seed)
+  }
+  if (n >= 4) {
+    return xxh3x128Len4to8(data, seed)
+  }
+  if (n > 0) {
+    return xxh3x128Len1to3(data, seed)
+  }
+  return Hash128{
+    hi = xxh3Avalanche64(seed ^ (xxh3Sec64(80) ^ xxh3Sec64(88))),
+    lo = xxh3Avalanche64(seed ^ (xxh3Sec64(64) ^ xxh3Sec64(72))),
+  }
+}
+
+// One pair of 16-byte windows of `acc.data` into `acc`: the window at `a` keyed by the
+// secret at `s` feeds the low half and is itself xored (as two summed words)
+// into the high half; the window at `b`, keyed at `s + 16`, does the reverse.
+// Unlike the 64-bit hash's plain sum this survives a multiply by zero.
+fn xxh3Mix32(acc: Xxh3Mid, a: int, b: int, s: int, seed: u64) {
+  acc.lo = acc.lo + xxh3Mix16(acc.data, a, s, seed)
+  acc.lo = acc.lo ^ (xxRead64(acc.data, b) + xxRead64(acc.data, b + 8))
+  acc.hi = acc.hi + xxh3Mix16(acc.data, b, s + 16, seed)
+  acc.hi = acc.hi ^ (xxRead64(acc.data, a) + xxRead64(acc.data, a + 8))
+}
+
+// Converges the two halves of a 17..240 byte hash of `n` bytes.
+fn xxh3x128MidFinish(acc: Xxh3Mid, n: int, seed: u64): Hash128 {
+  let lo = acc.lo + acc.hi
+  let hi = acc.lo * xxP1 + acc.hi * xxP4 + (u64(n) - seed) * xxP2
+  return Hash128{ hi = 0 - xxh3Avalanche(hi), lo = xxh3Avalanche(lo) }
+}
+
+// 17..128 bytes: pairs of windows, one from each end, working inward. The
+// reference unrolls this; the loop runs the same pairs in the same order (the
+// xor between them makes the order matter).
+fn xxh3x128Len17to128(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  let acc = Xxh3Mid{ data = data, lo = u64(n) * xxP1, hi = 0 }
+  let i = (n - 1) / 32
+  while (i >= 0) {
+    xxh3Mix32(acc, 16 * i, n - 16 * (i + 1), 32 * i, seed)
+    i = i - 1
+  }
+  return xxh3x128MidFinish(acc, n, seed)
+}
+
+// 129..240 bytes: the first 128 bytes as four pairs, avalanched, then the rest
+// in 32-byte steps against the secret shifted by 3, and the last 32 bytes, in
+// swapped order and under the negated seed, against the secret's tail.
+fn xxh3x128Len129to240(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  let acc = Xxh3Mid{ data = data, lo = u64(n) * xxP1, hi = 0 }
+  let i = 0
+  while (i < 4) {
+    xxh3Mix32(acc, 32 * i, 32 * i + 16, 32 * i, seed)
+    i = i + 1
+  }
+  acc.lo = xxh3Avalanche(acc.lo)
+  acc.hi = xxh3Avalanche(acc.hi)
+  // `<=` repeats the final 32 bytes when `n` is a multiple of 32; the
+  // reference does too, and the result depends on it.
+  while (32 * i + 32 <= n) {
+    xxh3Mix32(acc, 32 * i, 32 * i + 16, 3 + 32 * (i - 4), seed)
+    i = i + 1
+  }
+  xxh3Mix32(acc, n - 16, n - 32, 136 - 17 - 16, 0 - seed)
+  return xxh3x128MidFinish(acc, n, seed)
+}
+
+// Converges the long path's accumulators into both halves: the 64-bit hash's
+// merge for `lo`, the same accumulators at secret byte 117 from the complement
+// of `n * PRIME64_2` for `hi`. `acc` is already the final stripe's.
+fn xxh3x128Merge(acc: []u64, key: []u64, n: u64): Hash128 {
+  return Hash128{
+    hi = xxh3Merge(acc, key, xxh3MergeOff128, ~(n * xxP2)),
+    lo = xxh3Merge(acc, key, xxh3MergeOff, n * xxP1),
+  }
+}
+
+// Finishes the 128-bit hash of `n` bytes from the final stripe `last[i..i+64]`.
+fn xxh3Finish128(c: Xxh3Core, last: []byte, i: int, n: u64): Hash128 {
+  return xxh3x128Merge(xxh3FinalAcc(c, last, i), c.key, n)
+}
+
+// XXH3-128 of `data`, which must be longer than 240 bytes, under `seed`.
+fn xxh3Long128(data: []byte, seed: u64): Hash128 {
+  let n = len(data)
+  return xxh3Finish128(xxh3Absorb(data, seed), data, n - xxh3Stripe, u64(n))
+}
+
+// XXH3-128 of `data` under `seed`, for any length. With the default seed 0 it
+// equals the reference `XXH3_128bits(data, len)`; with another it equals
+// `XXH3_128bits_withSeed(data, len, seed)` (`XXH128`). The empty slice hashes
+// to `99aa06d3014798d86001c324468d497f` (`hi` then `lo`) under seed 0. The seed
+// is the full 64 bits.
+export fn xxh3x128(data: []byte, seed: u64 = 0): Hash128 {
+  let n = len(data)
+  if (n <= 16) {
+    return xxh3x128Len0to16(data, seed)
+  }
+  if (n <= 128) {
+    return xxh3x128Len17to128(data, seed)
+  }
+  if (n <= xxh3MidMax) {
+    return xxh3x128Len129to240(data, seed)
+  }
+  return xxh3Long128(data, seed)
+}
