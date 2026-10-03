@@ -8,7 +8,8 @@ memory with a few hundred bytes of nested entities. `std/xml` is a pull
 tokenizer for XML 1.0 that has neither problem: it decodes what documents
 legitimately contain, and it refuses the rest, loudly, with the position.
 The same module writes XML with a `Writer` that cannot produce a malformed
-document.
+document, and reads it into an `Element` tree you can ask for
+`child("Name")` and `text()`.
 
 You create a `Tokenizer` over the document bytes and call `next()` until it
 returns `Eof`. Each call gives you one `Token`: a start tag, an empty tag,
@@ -196,8 +197,9 @@ is `"refused: DOCTYPE at byte 0"`. A document that nests `<a>` 257 deep gives
   7` means an `</a>` arrived while `<b>` was the open element.
 - **The whole document is in memory.** `Tokenizer` takes the bytes of a
   document you already hold, up to `maxInput`. It is not a streaming reader.
-- **There is no schema, no namespace resolution and no validation.** A
-  document that is well formed is accepted whatever its element names.
+- **The tokenizer has no schema, no namespace resolution and no validation.**
+  A document that is well formed is accepted whatever its element names, and
+  `s3:Key` is the name `s3:Key`. Namespaces are resolved by `parse`, below.
 
 ## Writing XML
 
@@ -297,11 +299,132 @@ prefix to an empty namespace; those fail with `BadAttribute`.
 and how many attributes one element carries; going over fails with `TooDeep`
 or `TooManyAttributes`. A limit below 1 fails with `BadLimit`.
 
-## When not to use std/xml
+## Reading a document as a tree
 
-If you want a tree you can ask for `child("Name")` and `text()`, build it on
-top of the tokens; this module is the layer below that. For JSON use
-[std/json](json.md).
+Inkwell stores its drafts in an S3 bucket and lists them with a
+`ListBucketResult`. Pulling tokens and tracking which element you are in is
+the wrong shape for that: you want "the `Key` of every `Contents`". `parse`
+reads the whole document into an `Element`, with the namespaces resolved and
+the entities decoded, and you walk it with `child`, `children` and `text`.
+
+```bit
+import { parse, Element } from "std/xml"
+
+fn draftKeys(body: string): []string! {
+  let root = parse([]byte(body))?
+  let keys = []string(0)
+  let items = root.children("Contents")
+  let i = 0
+  while (i < len(items)) {
+    match (items[i].child("Key")) {
+      Some(k) => keys = append(keys, k.text())
+      None => {}
+    }
+    i = i + 1
+  }
+  return keys
+}
+```
+
+For a body whose root is `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`
+holding two `<Contents><Key>...</Key></Contents>`, `draftKeys` returns the two
+keys. A key stored as `a&#13;b` comes back as `a`, CR, `b`, because the
+decoding is the tokenizer's. The default namespace on the root is inherited by
+every element under it, and `child("Key")` still finds `Key` there: a name you
+pass is a local name, and matches in whatever namespace the child is in.
+
+`parse(src: []byte, maxDepth = 256, maxAttrs = 256, maxInput = 67108864,
+maxName = 1024): Element!` takes the same limits as `Tokenizer(...)`, and
+refuses everything it refuses, with the same `XmlError` kinds. The tree is
+built with a stack, so a deep document costs memory, never call stack.
+
+### What an element holds
+
+An `Element` has the qualified `name` as written (`s3:Key`), its `local` part
+(`Key`), the namespace URI `space` the name resolves to (`""` for none), its
+`attrs` as written, and its `nodes`: the content in document order, each a
+`Node` that is either `Node.Elem(Element)` or `Node.Text(string)`. Comments
+and processing instructions are not in the tree, and a CDATA section is text.
+Adjacent text and CDATA are one `Node.Text`. White space between elements is
+kept, because only you know whether it matters; `child` and `children` skip
+it, and `text()` is the join of an element's own text nodes, so for
+`<a>x<b>y</b>z</a>` it is `xz`.
+
+Because `attrs` and `name` are kept as written, an element can be handed back
+to a `Writer` and come out as it went in:
+
+```bit
+import { parse, Element, Node, Writer } from "std/xml"
+
+fn copyTo(w: Writer, e: Element): ()! {
+  w.start(e.name, e.attrs)?
+  let i = 0
+  while (i < len(e.nodes)) {
+    match (e.nodes[i]) {
+      Elem(c) => copyTo(w, c)?
+      Text(s) => w.text(s)?
+    }
+    i = i + 1
+  }
+  w.end()?
+}
+
+fn normalise(body: string): string! {
+  let w = Writer()?
+  copyTo(w, parse([]byte(body))?)?
+  return string(w.finish()?)
+}
+```
+
+`normalise` drops the `<?xml ?>` line and comments and writes an empty element
+as `<a></a>`; everything else, the indentation included, comes back byte for
+byte. The four S3 bodies the tests pin (`ListBucketResult`, `Error`,
+`CompleteMultipartUploadResult`, `LifecycleConfiguration`) do.
+
+### Namespaces and attributes
+
+An element's namespace is the one its prefix is bound to, or the default
+namespace (`xmlns="..."`) when it has no prefix, scoped to the element that
+declares it and everything inside. `xmlns=""` takes the default away again. An
+attribute without a prefix is in no namespace; it does not inherit the default
+one. That is why S3's `<Grantee xsi:type="Group">` is read with the namespace
+named, and an `id` with none:
+
+```bit
+import { parse, Element } from "std/xml"
+
+fn granteeType(body: string): string! {
+  let xsi = "http://www.w3.org/2001/XMLSchema-instance"
+  let root = parse([]byte(body))?
+  match (root.child("Grantee")) {
+    Some(g) => {
+      match (g.attr("type", xsi)) {
+        Some(t) => return t
+        None => return unwrapOr(g.attr("id"), "none")
+      }
+    }
+    None => return "no grantee"
+  }
+}
+```
+
+`child(name, space)` and `children(name, space)` take the namespace as a typed
+option, the same method either way: `child("Key")` matches any namespace and
+`child("Key", Option<string>.Some(uri))` only `uri`, with `Some("")` meaning
+no namespace. `attr(name, space = "")` matches the namespace exactly, so
+`attr("type")` does not find `xsi:type`. A name that is empty or has a colon
+can never be a local name, so `child`, `children` and `attr` panic on one:
+that is a mistake in your code, not something a document can cause.
+
+### What `parse` refuses beyond the tokenizer
+
+Namespaces are checked, not assumed. A prefix with no declaration in scope
+(`<p:a/>`) fails with `BadName` instead of producing an element in no
+namespace; so does a name with two colons or an empty side. Two attributes with
+the same namespace and local name fail with `DuplicateAttribute` even under
+different prefixes. `xmlns` is never bound, `xml` only to its own namespace,
+and no prefix to an empty one; those fail with `BadAttribute`. The `XmlError`
+offset is the start of the tag that broke the rule.
 
 ## Where to go next
 
@@ -384,3 +507,41 @@ element.
 
 `finish(): []byte!` returns the finished document, and takes no more input
 afterwards.
+
+### `parse`
+
+`parse(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput: int =
+67108864, maxName: int = 1024): Element!` reads the document `src` into its
+root `Element`. Fails with what `Tokenizer(...)` and `Tokenizer.next` fail
+with, and with the namespace errors above.
+
+### `Element`
+
+One element: `name`, `local`, `space`, `attrs` (a `[]Attr` as written, `xmlns`
+declarations included) and `nodes` (a `[]Node`).
+
+### `Node`
+
+One unit of an element's content: `Elem(Element)` or `Text(string)`.
+
+### `Element.child`
+
+`child(name: string, space: Option<string> = None): Option<Element>` is the
+first child element whose local name is `name`, in any namespace when `space`
+is `None`. Panics for a `name` that is empty or has a colon.
+
+### `Element.children`
+
+`children(name: string, space: Option<string> = None): []Element` is every
+such child in document order; empty when there are none.
+
+### `Element.text`
+
+`text(): string` is the element's own text nodes joined, child elements left
+out.
+
+### `Element.attr`
+
+`attr(name: string, space: string = ""): Option<string>` is the value of the
+attribute with local name `name` in namespace `space`; the empty `space` means
+no namespace.
