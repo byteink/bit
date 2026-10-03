@@ -665,9 +665,48 @@ fi
 # regardless of the bug — and `f1(x)` inside `build`'s body is the first
 # generic call in the file (`build(5)` inside `main` is swept second). So
 # `_f1$0` is always the raw, unbound-`<T>` ledger entry; the bug is only
-# which entry CODEGEN's call instruction is made to target. A `BRANCH`
-# relocation naming `_f1$0` in __text is therefore the exact, deterministic
+# which entry CODEGEN's call instruction is made to target. A code-section
+# relocation naming `f1$0` (`_f1$0` in Mach-O) is therefore the exact, deterministic
 # signature of the reverted bug for this fixture — not a heuristic.
+# insttargets: `objdump -r` text on stdin -> every f1$N referenced from the code
+# section, one per line, normalised to `f1$N`. Mach-O names the section
+# `__text` and prefixes symbols with `_`; ELF names it `.text`, has no prefix,
+# and x86-64 prints the addend as `f1$1-0x...` (#6674). No relocation-type
+# filter: GNU objdump prints UNKNOWN for a foreign arch, and the fixture never
+# takes `f1` as a value, so any code-section reference to an instance is a call.
+insttargets() {
+  awk '
+    /RELOCATION RECORDS FOR \[(__text|\.text)\]/ { intext=1; next }
+    /RELOCATION RECORDS FOR/                      { intext=0 }
+    intext {
+      sym=$NF; sub(/^_/, "", sym); sub(/[+-]0x[0-9a-fA-F]+$/, "", sym)
+      if (sym ~ /^f1\$[0-9]+$/) print sym
+    }
+  '
+}
+# Self-test: both object formats, and a reference outside the code section.
+instparsecheck() { # $1=name $2=want $3=objdump text
+  local got
+  got=$(printf '%s\n' "$3" | insttargets | tr '\n' ' ')
+  if [ "$got" != "$2" ]; then
+    echo "FATAL: insttargets self-test '$1': got '$got', want '$2'" >&2
+    exit 2
+  fi
+}
+instparsecheck "mach-o arm64" 'f1$1 ' 'RELOCATION RECORDS FOR [__text]:
+0000000000000010 ARM64_RELOC_BRANCH26 _f1$1'
+instparsecheck "elf x86-64 addend" 'f1$1 ' 'RELOCATION RECORDS FOR [.text]:
+0000000000000015 R_X86_64_PC32     f1$1-0x0000000000000004'
+instparsecheck "elf arm64" 'f1$0 ' 'RELOCATION RECORDS FOR [.text]:
+0000000000000008 R_AARCH64_CALL26  f1$0'
+instparsecheck "foreign-arch UNKNOWN type" 'f1$2 ' 'RELOCATION RECORDS FOR [.text]:
+0000000000000008 UNKNOWN  f1$2'
+instparsecheck "data section is not a call" '' 'RELOCATION RECORDS FOR [.data]:
+0000000000000000 R_X86_64_64  f1$0
+RELOCATION RECORDS FOR [.text]:
+0000000000000004 R_X86_64_PC32  g$0-0x4'
+echo "self-test: instantiation-target parser — 5 rows"
+
 instcheck() { # $1=compiler $2=outobj -> prints verdict; sets $INSTCHECK_RC (0 pass, 1 fail, 2 could-not-decide)
   local fixture="_tests_/cases/run_generic_call_via_param.bit" calls rc side
   [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
@@ -683,24 +722,20 @@ instcheck() { # $1=compiler $2=outobj -> prints verdict; sets $INSTCHECK_RC (0 p
     INSTCHECK_RC=2
     return
   fi
-  calls=$(objdump -r "$2" 2>/dev/null | awk '
-    /RELOCATION RECORDS FOR \[__text\]/ { intext=1; next }
-    /RELOCATION RECORDS FOR/            { intext=0 }
-    intext && /BRANCH/ && $NF ~ /^_f1\$[0-9]+$/ { print $NF }
-  ')
+  calls=$(objdump -r "$2" 2>/dev/null | insttargets)
   if [ -z "$calls" ]; then
     echo "instcheck: found no call to any f1\$N instance in $fixture's object — the check observed nothing" >&2
     INSTCHECK_RC=2
     return
   fi
-  if printf '%s\n' "$calls" | grep -qxF '_f1$0'; then
-    echo "INSTANTIATION TARGET DIVERGENCE: main calls the DEGENERATE instance _f1\$0"
+  if printf '%s\n' "$calls" | grep -qxF 'f1$0'; then
+    echo "INSTANTIATION TARGET DIVERGENCE: main calls the DEGENERATE instance f1\$0"
     echo "  (resolveCallTarget did not substitute genericTypeArgs through fc.genEnv — #3068)"
-    echo "  call target(s) found in __text: $(printf '%s ' $calls)"
+    echo "  call target(s) found in the code section: $(printf '%s ' $calls)"
     INSTCHECK_RC=1
     return
   fi
-  echo "instcheck: main targets the concrete instance ($(printf '%s ' $calls)), not the degenerate _f1\$0"
+  echo "instcheck: main targets the concrete instance ($(printf '%s ' $calls)), not the degenerate f1\$0"
   INSTCHECK_RC=0
 }
 
