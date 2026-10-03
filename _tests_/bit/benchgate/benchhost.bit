@@ -2,9 +2,38 @@
 // regression gate: the descheduled-time check (#5196) and, since #6413, the
 // host-speed reference workload. Sibling of `benchgate.bit` in the same
 // directory module: no `import`, one shared scope. `wasDescheduled`,
-// `checkCpu` and `cpuReport` moved here VERBATIM from `benchgate.bit`, which
-// was at 787 of its 800 lines; see that file's header for the design
-// rationale.
+// `checkCpu` and `cpuReport` moved here from `benchgate.bit`, which was at
+// 787 of its 800 lines; see that file's header for the design rationale.
+//
+// WHY A REFERENCE WORKLOAD (#6413). `wasDescheduled` reads contention as time
+// off a core. On Apple Silicon under heavy load it often is not: the work
+// migrates to efficiency cores and slower clocks, so USER CPU inflates while
+// the descheduled gap reads ~0. Push gate on main 828758f02 (load 67-110):
+// mandelbrot 85cs against 46cs with 5cs descheduled, a FAIL; the same sha
+// passed on a quiet host. And again on main 605d91f9a: matrix 51-60cs against
+// 30cs with mandelbrot, fib and collatz all inflated, binaries proven
+// byte-identical by a five-compiler interleaved A/B. The fix is a second
+// instrument: a fixed workload run in the SAME window as each rep (one
+// reading just before it, one just after, the lower kept), whose own
+// inflation over its floor says how much slower this host is right now. A
+// case may then exceed its ceiling by that factor and report INCONCLUSIVE;
+// past ceiling x inflation it is a FAIL. A real r-times slowdown multiplies
+// with the host factor and so still crosses ceiling x inflation whenever r
+// exceeds the 1.5x bar, loaded or not -- the verdict is relative, no
+// ceiling or baseline moved. The descheduled gap (#5196) is kept: it is printed
+// on every case line and judges alone when no reference reading exists; see
+// `hostExplains` for why it no longer forgives beside a reference.
+//
+// WHY AWK, NOT A BIT PROGRAM. The reference must not be built by the compiler
+// under test: a codegen regression would inflate the reference and every
+// case by the same factor and the verdict would forgive exactly the 4-5x
+// breakage this gate exists to catch. `awk` is the host's own, fixed in
+// every run. Its speed differs per host and awk, so the floor is the lower of
+// `refBaselineFor` (macOS/arm64 only: other targets are not calibrated, -1)
+// and the lowest reading seen so far this run. An uncalibrated target thus
+// only forgives inflation relative to its own best window, which under a
+// uniformly loaded run is no forgiveness at all: it degrades to today's
+// verdict, never past it.
 
 // #5196: `gap` is the wall-clock time this rep's process spent off a core
 // (real minus total CPU, from the SAME `/usr/bin/time -l` reading or Linux
@@ -60,17 +89,13 @@ fn checkCpu(b: Baseline, m: CaseMetrics, t: Tally) {
   if (m.minCpu <= cpuCeil) {
     return
   }
-  // #5196: contention can only ever inflate user CPU (see WHY USER CPU IS
-  // NOT IMMUNE TO CONTENTION above), so an over-ceiling reading taken on a
-  // rep the SAME measurement shows was descheduled for longer than it ran
-  // cannot be told apart from a real regression — report INCONCLUSIVE,
-  // naming the gap, and do not fail the gate for it. A reading whose own
-  // rep ran without interruption is unchanged: FAIL.
-  if (wasDescheduled(m.gapAtMin, m.minCpu)) {
+  let hostCeil = refCeiling(cpuCeil, m.refCs, m.refFloor)
+  if (hostExplains(m, hostCeil)) {
     markInconclusive(
       t,
         "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
         "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%), " +
+        "host-scaled ceiling ${hostCeil}cs (${refReport(m)}), " +
         "descheduled ${m.gapAtMin}cs of wall time on that rep — " +
         "host contention or a genuine regression; re-run on a quiet host to tell them apart",
     )
@@ -79,8 +104,34 @@ fn checkCpu(b: Baseline, m: CaseMetrics, t: Tally) {
   markFail(
     t,
       "${b.name} user CPU regressed: ${m.minCpu}cs (min of ${reps}), " +
-      "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%)",
+      "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%), " +
+      "host-scaled ceiling ${hostCeil}cs (${refReport(m)}), " +
+      "descheduled ${m.gapAtMin}cs of wall time on that rep",
   )
+}
+
+// Whether host contention explains an over-ceiling CPU reading.
+//
+// #5196: contention can only ever inflate user CPU (see WHY USER CPU IS NOT
+// IMMUNE TO CONTENTION in benchgate.bit), so an over-ceiling reading cannot
+// be told from a real regression on that evidence alone; INCONCLUSIVE names
+// the gap and does not fail the gate. A reading that ran without interruption
+// and has no reference reading is unchanged: FAIL.
+//
+// #6413: with a reference reading the REFERENCE decides: the reading must sit
+// within `hostCeil`, the ceiling scaled by the reference's own inflation. The
+// descheduled gap (#5196) decides only when no reference reading exists
+// (awk missing, or the Linux counters unreadable). It cannot also be an
+// independent way to forgive: under a 2 x ncpu `yes` hog a matrix built to
+// run 2x longer read 88cs against a 48cs ceiling with 70cs descheduled, and
+// the gap alone called a real slowdown INCONCLUSIVE. Descheduled time says
+// the process waited, not that its CPU got dearer; the reference measures the
+// second directly.
+fn hostExplains(m: CaseMetrics, hostCeil: int): bool {
+  if (m.refCs > 0) {
+    return m.minCpu <= hostCeil
+  }
+  return wasDescheduled(m.gapAtMin, m.minCpu)
 }
 
 // The `cpu=` field of the per-case line below, which prints for every case
@@ -91,4 +142,134 @@ fn cpuReport(b: Baseline, minCpu: int): string {
     return "cpu=${minCpu}cs (NOT GATED — see cpuCentis in baselinesdefs.bit)"
   }
   return "cpu=${minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeiling(b)}cs)"
+}
+
+// --- the host-speed reference (#6413) ------------------------------------
+
+// A dependent chain of multiply/modulo steps: no allocation, no memory
+// traffic, nothing for an optimiser to fold. ~14cs of user CPU on the
+// calibration host, long enough that the 1cs reading granularity is under 10%.
+const refIters: int = 3000000
+
+// The floor every reading is judged against, centiseconds, per hostTarget()
+// ordinal (see platformName in baselinesdefs.bit); -1 means not calibrated.
+// macOS/arm64: 14, the minimum of 25 `/usr/bin/time -l awk` runs of
+// refScriptBody()'s program at 3000000 iterations (Apple awk 20200816), read
+// at 14-15 on a host at load 5; the gate's own readings under `boxlock solo`
+// (main aa377e926, 2026-10-03) put its in-run floor at 13-14. A reading below
+// this lowers the floor for the rest of the run (lowerFloor). Never raised to
+// match a slow day: a floor above the true one forgives a real regression.
+fn refBaselineFor(target: int): int {
+  if (target == 2) {
+    return 14
+  }
+  return 0 - 1
+}
+
+// Sentinel above any reading the gate could see, same shape as runCase's
+// minCpu: the first valid reading replaces it.
+const refFloorSentinel: int = 1000000000
+
+fn initialRefFloor(target: int): int {
+  let pinned = refBaselineFor(target)
+  if (pinned > 0) {
+    return pinned
+  }
+  return refFloorSentinel
+}
+
+// The reference's script. `exec` keeps it one process, so /usr/bin/time (or
+// the Linux /proc poll) measures awk itself, through the same wrapper every
+// benchmark rep goes through.
+fn refScriptBody(): string {
+  return "#!/bin/sh\nexec awk 'BEGIN{x=1;for(i=0;i<${refIters};i++){" +
+    "x=(x*1103515245+12345)%2147483648};print x}'\n"
+}
+
+// Writes the reference script under `root` and returns its path, "" when it
+// cannot be made (the gate then runs without a reference: every verdict is
+// the pre-#6413 one, and the per-case line says ref=unavailable).
+fn setupRef(root: string): string {
+  let path = root + "/ref.sh"
+  writeFile(path, refScriptBody()) catch _ {
+    return ""
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700
+    return ""
+  }
+  return path
+}
+
+// One reference reading, user CPU centiseconds; -1 when unavailable. Goes
+// through runRepOnce() so it is measured exactly as a benchmark rep is.
+// `slot` names its scratch files (run<slot>.*) apart from the case's reps.
+fn refReading(refPath: string, scratch: string, slot: int): int {
+  if (refPath == "") {
+    return 0 - 1
+  }
+  let rr = runRepOnce(refPath, scratch, slot, 0)
+  if (!rr.launched) {
+    return 0 - 1
+  }
+  let m = parseMeasured(rr.resText, rr.outText)
+  if (!m.ok || m.exitCode != 0 || m.cpuCentis <= 0) {
+    return 0 - 1
+  }
+  return m.cpuCentis
+}
+
+// The lower of two readings, ignoring an unavailable one (-1 when both are).
+fn lowerReading(a: int, b: int): int {
+  if (a <= 0) {
+    return b
+  }
+  if (b <= 0) {
+    return a
+  }
+  return minInt(a, b)
+}
+
+// A rep and the host-speed reading of its window.
+class Window { rr: RepRun, refCs: int }
+
+// One rep bracketed by two reference readings. The LOWER is kept: a window
+// that was only half loaded forgives half as much, never more.
+fn runRepWindowed(
+  binPath: string,
+  refPath: string,
+  caseScratch: string,
+  rep: int,
+  gcMinKb: int,
+): Window {
+  let before = refReading(refPath, caseScratch, 100)
+  let rr = runRepOnce(binPath, caseScratch, rep, gcMinKb)
+  let after = refReading(refPath, caseScratch, 101)
+  return Window{ rr = rr, refCs = lowerReading(before, after) }
+}
+
+// The floor after seeing `refCs`.
+fn lowerFloor(floor: int, refCs: int): int {
+  if (refCs > 0 && refCs < floor) {
+    return refCs
+  }
+  return floor
+}
+
+// `cpuCeil` scaled by the reference's inflation `refCs / floor`: how far this
+// window's host was slower than at its best. Unscaled (== cpuCeil) when the
+// reference is unavailable or not above its floor -- never lower than cpuCeil,
+// so the reference can only forgive, never tighten.
+fn refCeiling(cpuCeil: int, refCs: int, floor: int): int {
+  if (refCs <= floor || floor <= 0) {
+    return cpuCeil
+  }
+  return cpuCeil * refCs / floor
+}
+
+// The `ref=` field of the per-case line.
+fn refReport(m: CaseMetrics): string {
+  if (m.refCs <= 0) {
+    return "ref=unavailable"
+  }
+  return "ref=${m.refCs}cs (floor ${m.refFloor}cs)"
 }
