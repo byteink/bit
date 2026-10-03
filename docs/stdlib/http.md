@@ -159,14 +159,47 @@ a connection that closes before its `Content-Length` bytes, or before the
 final chunk, fails the read. Content-Length, chunked and read-to-close bodies
 all work.
 
-A reader owns its connection until the body ends. It closes it when `read`
-returns the empty slice, when a read fails, and when you call `close()`; call
-`close()` for any body you stop reading early or never start, such as the 404
-above. The connection is closed, never kept for another request. A streamed
-request is HTTP/1.1 only, is not redirected (a 3xx comes back as it is), takes
-a connection of its own that counts against `maxConnsPerHost` until the reader
-is done, and is not limited by `setMaxBodyBytes`: you bound it by how much you
-read.
+A reader owns its connection until the body ends. When `read` returns the
+empty slice (or the last byte of a `Content-Length` body), the connection goes
+back to the client's pool for the next request, provided the response left it
+at a message boundary: HTTP/1.1, no `Connection: close`, a `Content-Length` or
+chunked body with its final chunk and trailers consumed, and nothing after the
+end. When you call `close()` before that, or a read fails or times out, the
+connection is shut instead and never reused, because the rest of the body is
+still on the wire. Call `close()` for any body you stop reading early or never
+start, such as the 404 above. A streamed request is HTTP/1.1 only, is not
+redirected (a 3xx comes back as it is), takes a pooled connection or dials one
+and counts against `maxConnsPerHost` until the reader is done, and is not
+limited by `setMaxBodyBytes`: you bound it by how much you read.
+
+A response whose framing is ambiguous is refused before any body is read:
+`Content-Length` fields that differ, a `Content-Length` together with
+`Transfer-Encoding`, or a repeated `Transfer-Encoding` (RFC 9112 section 6.3).
+The buffered client and the server refuse the same messages.
+
+Set `timeoutMs` on the request to bound the connect, the response head and each
+`read`. A stall fails with a `TimeoutError`, which you tell from other errors
+with `e.(TimeoutError)`:
+
+```bit
+import { Client, ClientRequest, TimeoutError } from "std/http"
+
+// The first `n` bytes of `url`'s body, or "" when the server stalled for
+// more than two seconds between reads.
+fn head(c: Client, url: string, n: int): string! {
+  let res = c.send(ClientRequest{ url = url, timeoutMs = 2000 }, stream = true)?
+  let body = unwrap(res.reader)
+  defer body.close()
+  let piece = body.read(n) catch e {
+    let (te, ok) = e.(TimeoutError)
+    if (ok && te.op == "read") {
+      return ""
+    }
+    fail e
+  }
+  return string(piece)
+}
+```
 
 ### A client that reuses connections
 
@@ -461,6 +494,7 @@ starting from exactly the handler shown above.
 | setting `Accept-Encoding` yourself | `requestWith` fails - this stdlib has no response decompressor |
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
 | a `BodyReader` neither read to the end nor closed | its connection and its `maxConnsPerHost` slot stay held - `close()` it |
+| a `BodyReader` closed after a partial read | its connection is shut, never reused |
 | a redirect to another host, port or scheme | `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` are dropped, defaults included |
 | a redirect from `https` to `http` | the call fails - opt in with `RedirectAllow.Downgrade` |
 | a `307` or `308` with a body to another origin | the call fails - opt in with `RedirectAllow.ReplayBody` |
@@ -641,8 +675,20 @@ As `Client.request`, bounded by one deadline.
 ### `ClientRequest`
 
 A request for `Client.send`: `method` (`"GET"` by default), `url`, `headers`
-(`[]Header`, layered onto the client's own as `Client.requestWith` does) and
-`body` (`""` by default).
+(`[]Header`, layered onto the client's own as `Client.requestWith` does),
+`body` (`""` by default) and `timeoutMs` (`0`, no bound, by default): the bound
+in milliseconds on the connect, the response head and each body `read` of a
+streamed response.
+
+### `TimeoutError`
+
+The error a streamed request fails with when `timeoutMs` ran out: `op` is
+`"send"` (connect, request, head) or `"read"` (one `BodyReader.read`) and `ms`
+the bound.
+
+### `TimeoutError.message(): string`
+
+`"http: send timed out after 500 ms"` or `"http: read timed out after 500 ms"`.
 
 ### `Client.send(req: ClientRequest, stream: bool = false): Response!`
 
@@ -662,13 +708,14 @@ open connection until the body ends, a read fails or `close()` is called.
 Up to `max` bytes of the body, at least one, at most 65536; an empty slice only
 at the end of the body, and again on every call after it. Fails, and closes the
 connection, when the connection ends or breaks before the body does or the
-framing is malformed; every later call fails too. Fails after `close()`, and
+framing is malformed, and on a read deadline (`TimeoutError`); every later call fails too. Fails after `close()`, and
 for a `max` below 1 (leaving the reader as it was).
 
 ### `BodyReader.close()`
 
-Closes the connection if the body has not ended and makes every later `read`
-fail. Calling it again does nothing.
+Shuts the connection if the body has not ended and makes every later `read`
+fail. After a full read the connection is already back in the pool and `close()`
+leaves it there. Calling it again does nothing.
 
 ### `PoolLimits`
 

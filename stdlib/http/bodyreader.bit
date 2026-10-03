@@ -14,10 +14,15 @@
 //   * every failure is an error, never a short body that looks complete: a
 //     connection that closes before its Content-Length or before the final
 //     chunk fails the read that hit it;
-//   * a connection is shut on the first read error, at the end of the body, and
-//     on `close()`; it is NEVER handed back to the pool here. Every request
-//     this file sends says `Connection: close`, so nothing could reuse it
-//     (reuse after a full read is #6596's, and only after a full read);
+//   * a connection goes back to the client's idle pool (pool.bit) ONLY when the
+//     body was read to its end and the response left it exactly at a message
+//     boundary: HTTP/1.1, no `Connection: close`, a Content-Length or chunked
+//     body (the final chunk and its trailer section consumed) or none by
+//     status, and no byte past the end. A reader abandoned with `close()` after
+//     a partial read, a failed read, a read deadline and a body that ends at
+//     the connection closing all SHUT the connection instead: the unread rest
+//     of the body is still on the wire, and the next request would read it as
+//     its own response;
 //   * a streamed exchange holds its origin's `maxConnsPerHost` slot (pool.bit)
 //     until the connection is shut, so a caller that never reads cannot
 //     exceed the cap it configured.
@@ -27,12 +32,13 @@
 // for is what it holds. It speaks HTTP/1.1 only (ALPN `http/1.1`); an
 // `https+h3://` URL is refused.
 //
-// `byteStream`, `connSlot`, `Url`, `Header`, `Response`, `RequestExtras`,
-// `buildRequest`, `parseUrl`, `parseStatusCode`, `bodyless`, `header`,
-// `hexToInt`, `trimSpace`, `dialConn`, `dialTlsConn`, `poolKey`,
-// `maxHeaderBytes`, `netStream`, `tlsStream`, `TlsConfig`, `newError`, `atoi`,
-// `indexOf`, `toLower` and `hasPrefix` are siblings or module-wide imports
-// (SPEC §19): nothing is imported here.
+// `byteStream`, `connSlot`, `connPool`, `Idle`, `Url`, `Header`, `Response`,
+// `RequestExtras`, `buildRequest`, `parseUrl`, `parseStatusCode`, `bodyless`,
+// `header`, `hexToInt`, `trimSpace`, `dialConn`, `dialTlsConn`, `poolKey`,
+// `isIdempotent`, `withDeadline`, `monotonic`, `maxHeaderBytes`, `netStream`,
+// `tlsStream`, `TlsConfig`, `newError`, `atoi`, `indexOf`, `toLower` and
+// `hasPrefix` are siblings or module-wide imports (SPEC §19): nothing is
+// imported here.
 
 // The most bytes one `BodyReader.read` returns, whatever `max` asks for.
 const maxReadBytes: int = 65536
@@ -60,6 +66,61 @@ export class ClientRequest {
   export url: string = "",
   export headers: []Header,
   export body: string = "",
+  // Milliseconds bounding the connect, the response head, and EACH `read` of
+  // the body (a read that waits longer fails with a `TimeoutError`); 0 means
+  // no bound.
+  export timeoutMs: int = 0,
+}
+
+// The error a streamed request returns when `ClientRequest.timeoutMs` ran out:
+// `op` is "send" (connect, request and response head) or "read" (one
+// `BodyReader.read`), `ms` the bound. A caller tells it from any other failure
+// with `e.(TimeoutError)`.
+export class TimeoutError {
+  export op: string
+  export ms: int
+
+  export message(): string {
+    return "http: ${this.op} timed out after ${this.ms} ms"
+  }
+}
+
+// A `byteStream` that counts the bytes `unread` put back and the reads have not
+// taken yet. A body that ends with such bytes left was followed by data nobody
+// asked for, and the connection under it must not carry another request. The
+// pool's streams have no way to say what they hold back, so the count is kept
+// here, where every `unread` of a streamed response is made.
+class countedStream {
+  inner: byteStream
+  buffered: int
+
+  readUp(n: int): string! {
+    let piece = this.inner.readUp(n)?
+    // A stream serves what was pushed back before it touches the wire.
+    let used = len(piece)
+    if (used > this.buffered) {
+      used = this.buffered
+    }
+    this.buffered = this.buffered - used
+    return piece
+  }
+
+  writeStr(s: string): ()! { this.inner.writeStr(s)? }
+
+  writeBytes(b: []byte): ()! { this.inner.writeBytes(b)? }
+
+  shut() { this.inner.shut() }
+
+  forceClose() { this.inner.forceClose() }
+
+  peer(): string { return this.inner.peer() }
+
+  unread(extra: string) {
+    this.buffered = this.buffered + len(extra)
+    this.inner.unread(extra)
+  }
+
+  setIdleDeadline(deadlineNs: int) { this.inner.setIdleDeadline(deadlineNs) }
 }
 
 // How the body of one response is delimited (RFC 9112 §6.3).
@@ -72,12 +133,15 @@ enum BodyFraming {
 
 // What the head of a final response said: the status, the raw header block, and
 // the framing of the body behind it (`length` is the Content-Length for
-// `Length`, else 0).
+// `Length`, else 0), and `keep`: whether the head allows the connection to carry
+// another request once the body is read (HTTP/1.1, no `Connection: close`, a
+// body that is delimited by something other than the connection closing).
 class streamHead {
   status: int,
   headers: string,
   framing: BodyFraming,
   length: int,
+  keep: bool,
 }
 
 // The body of a streamed response, pulled by `read` until it returns an empty
@@ -87,7 +151,7 @@ class streamHead {
 // Content-Length bytes are all read): until then it owns an open connection.
 // Nothing frees an abandoned reader for you.
 export class BodyReader {
-  stream: byteStream
+  stream: countedStream
   slot: connSlot
   framing: BodyFraming
   // Bytes left in the Content-Length body, or in the current chunk.
@@ -95,13 +159,22 @@ export class BodyReader {
   // The CRLF that ends a chunk's data is still to be consumed.
   crlf: bool
   state: int
+  // The response head allowed another request on this connection.
+  keep: bool
+  // The bound on each `read` in ms (0 = none), and the monotonic deadline the
+  // read in progress was armed with.
+  timeoutMs: int
+  armed: int
 
   // Up to `max` bytes of the body, at least 1; an EMPTY slice only at the clean
   // end of the body, and again on every later call. May return fewer than
   // `max` (never more than 65536 whatever `max` is): loop until it is empty.
   // Fails, and closes the connection, when the connection ends or breaks before
-  // the body does, when the framing is malformed, and on a read deadline;
-  // later calls fail too. Fails after `close()`. `max` below 1 is an error.
+  // the body does, when the framing is malformed, and on a read deadline (a
+  // `TimeoutError`, when `ClientRequest.timeoutMs` is set); later calls fail
+  // too. Fails after `close()`. `max` below 1 is an error. The call that
+  // returns the last byte (or the empty slice) hands the connection back to
+  // the pool when it can carry another request.
   export read(max: int): []byte! {
     if (max < 1) {
       fail newError("BodyReader.read: max is ${max}; it must be at least 1")
@@ -119,9 +192,10 @@ export class BodyReader {
     if (want > maxReadBytes) {
       want = maxReadBytes
     }
+    this.arm()
     let piece = this.pull(want) catch e {
       this.finish(readerFailed)
-      fail e
+      fail this.asTimeout(e)
     }
     if (len(piece) == 0 || this.drained()) {
       this.finish(readerEof)
@@ -129,8 +203,9 @@ export class BodyReader {
     return []byte(piece)
   }
 
-  // Shuts the connection if the body was not read to its end, and makes every
-  // later `read` fail. Safe to call any number of times.
+  // Shuts the connection if the body was not read to its end (it goes to the
+  // pool only from a full read), and makes every later `read` fail. Safe to
+  // call any number of times.
   export close() {
     if (this.state == readerOpen) {
       this.finish(readerClosed)
@@ -145,8 +220,43 @@ export class BodyReader {
       Empty => return ""
       Length => return this.pullSized(n)?
       Chunked => return this.pullChunked(n)?
-      UntilClose => return this.stream.readUp(n)?
+      UntilClose => return this.pullUntilClose(n)?
     }
+  }
+
+  // Starts the clock of one `read`: the transport's deadline is now plus
+  // `timeoutMs`, so a server that stalls mid-body fails the read that waits.
+  arm() {
+    if (this.timeoutMs <= 0) {
+      return
+    }
+    this.armed = monotonic().ns + this.timeoutMs * 1000000
+    this.stream.setIdleDeadline(this.armed)
+  }
+
+  // Whether the read in progress has outlived its deadline.
+  expired(): bool {
+    return this.timeoutMs > 0 && monotonic().ns >= this.armed
+  }
+
+  // `e`, or the `TimeoutError` it is when the deadline had passed.
+  asTimeout(e: error): error {
+    if (this.expired()) {
+      return TimeoutError{ op = "read", ms = this.timeoutMs }
+    }
+    return e
+  }
+
+  // A read to the connection's close. A TLS read that hits its deadline comes
+  // back EMPTY, the same as the peer closing (`TlsConn.readTimedOut`, std/tls),
+  // so an empty read past the deadline is a timeout and never the end of the
+  // body: otherwise a stalled server would look like a complete response.
+  pullUntilClose(n: int): string! {
+    let piece = this.stream.readUp(n)?
+    if (len(piece) == 0 && this.expired()) {
+      fail TimeoutError{ op = "read", ms = this.timeoutMs }
+    }
+    return piece
   }
 
   // Up to `n` of the `left` bytes still owed; the connection closing first is
@@ -236,12 +346,24 @@ export class BodyReader {
     }
   }
 
-  // Leaves `Open`: shuts the connection and frees the origin's slot. Called
-  // once, from `Open` only.
+  // Leaves `Open`: hands the connection back to the pool when the body ended
+  // cleanly on a connection that may carry another request, else shuts it;
+  // then frees the origin's slot, after the connection is parked so a request
+  // that waited for the slot finds it. Called once, from `Open` only.
   finish(next: int) {
     this.state = next
-    this.stream.shut()
+    if (next == readerEof && this.keep && this.stream.buffered == 0) {
+      this.park()
+    } else {
+      this.stream.shut()
+    }
     this.slot.release()
+  }
+
+  // The connection goes idle in the pool, with no deadline of this request on it.
+  park() {
+    this.stream.setIdleDeadline(0)
+    this.slot.pool.put(this.slot.key, this.stream.inner, monotonic().ns)
   }
 }
 
@@ -322,22 +444,23 @@ fn parseLength(text: string): int {
 
 // How the body of a response with `headers` to `method` ends, per RFC 9112
 // §6.3: nothing for HEAD and for 204/304, chunked, Content-Length, else the
-// connection closing. Both framing fields together are refused outright.
+// connection closing. Both framing fields together, a repeated Transfer-Encoding
+// and differing Content-Length fields are refused outright (`checkFraming`,
+// message.bit).
 fn framingOf(headers: string, method: string, status: int): streamHead! {
   let head = streamHead{
     status = status,
     headers = headers,
     framing = BodyFraming.Empty,
     length = 0,
+    keep = false,
   }
   if (bodyless(method, status)) {
     return head
   }
+  checkFraming(headers, "response")?
   let clText = header(headers, "content-length")
   let teText = toLower(header(headers, "transfer-encoding"))
-  if (len(clText) > 0 && len(teText) > 0) {
-    fail newError("response: Content-Length and Transfer-Encoding both present")
-  }
   if (len(teText) > 0) {
     if (teText != "chunked") {
       fail newError("response: unsupported Transfer-Encoding")
@@ -374,7 +497,11 @@ fn parseHeadBlock(block: string, method: string): streamHead! {
   if (status == 101) {
     fail newError("response: 101 Switching Protocols on a streamed request")
   }
-  return framingOf(headers, method, status)?
+  let head = framingOf(headers, method, status)?
+  head.keep = hasPrefix(statusLine, "HTTP/1.1") &&
+    !connectionCloses(headers) &&
+    head.framing != BodyFraming.UntilClose
+  return head
 }
 
 // The final response's head, after skipping interim 1xx responses.
@@ -412,18 +539,29 @@ fn dialStream(u: Url, extras: RequestExtras): byteStream! {
 }
 
 // Writes `req` on `s` and reads the response head, returning it with the reader
-// over its body. A response with no body is finished here: its connection is
-// shut and its slot freed before the caller sees it.
-fn startStream(s: byteStream, slot: connSlot, req: string, method: string): Response! {
-  s.writeStr(req)?
-  let head = readStreamHead(s, method)?
+// over its body; `timeoutMs` is the bound on each of the reader's reads. A
+// response with no body is finished here: its connection is parked or shut and
+// its slot freed before the caller sees it.
+fn startStream(
+  s: byteStream,
+  slot: connSlot,
+  req: string,
+  method: string,
+  timeoutMs: int,
+): Response! {
+  let cs = countedStream{ inner = s, buffered = 0 }
+  cs.writeStr(req)?
+  let head = readStreamHead(cs, method)?
   let reader = BodyReader{
-    stream = s,
+    stream = cs,
     slot = slot,
     framing = head.framing,
     left = head.length,
     crlf = false,
     state = readerOpen,
+    keep = head.keep,
+    timeoutMs = timeoutMs,
+    armed = 0,
   }
   if (reader.drained()) {
     reader.finish(readerEof)
@@ -437,23 +575,98 @@ fn startStream(s: byteStream, slot: connSlot, req: string, method: string): Resp
   }
 }
 
+// One streamed exchange: where it goes (`u`), the origin's `slot`, the request
+// text and its `method`, how it dials (`extras`) and the per-read bound.
+class streamCall {
+  u: Url,
+  slot: connSlot,
+  req: string,
+  method: string,
+  extras: RequestExtras,
+  timeoutMs: int,
+}
+
+// `call` on a connection dialed now: the slot and the connection are released
+// on every failure here.
+fn startFresh(call: streamCall): Response! {
+  let s = dialStream(call.u, call.extras) catch e {
+    call.slot.release()
+    fail e
+  }
+  let res = startStream(s, call.slot, call.req, call.method, call.timeoutMs) catch e {
+    s.shut()
+    call.slot.release()
+    fail e
+  }
+  return res
+}
+
+// `startFresh`'s twin on the connection `s`, parked by an earlier exchange. A
+// parked connection the server closed meanwhile fails here, before the caller
+// has seen anything, so an idempotent method is retried once on a fresh
+// connection, as `exchangeParked` (pool.bit) does; a POST fails with the error
+// it got.
+fn startParked(s: byteStream, call: streamCall): Response! {
+  s.setIdleDeadline(call.extras.deadline)
+  let res = startStream(s, call.slot, call.req, call.method, call.timeoutMs) catch e {
+    s.shut()
+    if (!isIdempotent(call.method)) {
+      call.slot.release()
+      fail e
+    }
+    return startFresh(call)?
+  }
+  return res
+}
+
 // `method u` with `body`, answered by a response whose body has not been read:
-// a fresh connection (never a pooled one) under the origin's
-// `maxConnsPerHost` slot, both released on every failure here and by the
-// returned reader otherwise.
-fn openStream(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+// a connection the client's pool parked for the origin, else a fresh one, under
+// the origin's `maxConnsPerHost` slot, both released on every failure here and
+// by the returned reader otherwise. The request does not say `Connection:
+// close`, so the connection can go back to the pool after a full read.
+fn openStreamOn(
+  method: string,
+  u: Url,
+  body: string,
+  extras: RequestExtras,
+  timeoutMs: int,
+): Response! {
   if (u.h3) {
     fail newError("send: https+h3:// cannot stream a response")
   }
-  let slot = extras.pool.acquire(poolKey(u), extras.deadline)?
-  let s = dialStream(u, extras) catch e {
-    slot.release()
-    fail e
+  let key = poolKey(u)
+  let call = streamCall{
+    u = u,
+    slot = extras.pool.acquire(key, extras.deadline)?,
+    req = buildRequest(method, u, extras.block, body, false),
+    method = method,
+    extras = extras,
+    timeoutMs = timeoutMs,
   }
-  let req = buildRequest(method, u, extras.block, body, true)
-  let res = startStream(s, slot, req, method) catch e {
-    s.shut()
-    slot.release()
+  match (extras.pool.take(key, monotonic().ns)) {
+    Hit(s) => return startParked(s, call)?
+    Miss => return startFresh(call)?
+  }
+}
+
+// `openStreamOn` under `timeoutMs` (0 = unbounded) for the connect, the request
+// and the response head; a failure that came after the bound passed is a
+// `TimeoutError`.
+fn openStream(
+  method: string,
+  u: Url,
+  body: string,
+  extras: RequestExtras,
+  timeoutMs: int,
+): Response! {
+  if (timeoutMs <= 0) {
+    return openStreamOn(method, u, body, extras, 0)?
+  }
+  let deadline = monotonic().ns + timeoutMs * 1000000
+  let res = openStreamOn(method, u, body, withDeadline(extras, deadline), timeoutMs) catch e {
+    if (monotonic().ns >= deadline) {
+      fail TimeoutError{ op = "send", ms = timeoutMs }
+    }
     fail e
   }
   return res

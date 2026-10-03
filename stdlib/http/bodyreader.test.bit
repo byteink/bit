@@ -84,7 +84,7 @@ fn watch(data: string, maxPerRead: int): watchedStream {
 // `startStream` over `st`, with a slot that frees nothing (no origin cap).
 fn openOver(st: watchedStream, method: string): Response! {
   let slot = connSlot{ pool = newConnPool(PoolLimits{}), key = "k", held = false }
-  return startStream(st, slot, "${method} /x HTTP/1.1\r\nConnection: close\r\n\r\n", method)?
+  return startStream(st, slot, "${method} /x HTTP/1.1\r\n\r\n", method, 0)?
 }
 
 fn readerOf(res: Response): BodyReader! {
@@ -124,7 +124,6 @@ test "a Content-Length body reads byte-exact in 7-byte reads off 5-byte transpor
   assert(res.status == 200, "status = ${res.status}")
   assert(res.contentType == "text/plain", "contentType = '${res.contentType}'")
   assert(res.body == "", "body is '${res.body}', want it left for the reader")
-  assert(indexOf(st.wrote, "Connection: close") >= 0, "request was:\n${st.wrote}")
   let r = readerOf(res) catch e {
     assert(false, "${e.message()}")
     return
@@ -134,7 +133,8 @@ test "a Content-Length body reads byte-exact in 7-byte reads off 5-byte transpor
     return
   }
   assert(got == body, "got ${len(got)} bytes, want ${len(body)} identical")
-  assert(st.shuts == 1, "shuts = ${st.shuts}")
+  assert(st.shuts == 0, "shuts = ${st.shuts}: a fully read body's connection is parked, not shut")
+  assert(len(r.slot.pool.idle) == 1, "idle = ${len(r.slot.pool.idle)}")
 }
 
 test "the head is returned before any body byte is read" {
@@ -170,7 +170,8 @@ test "a chunked body reads byte-exact, with extensions, a trailer and one-byte t
     return
   }
   assert(got == "hello0123456789!", "got '${got}'")
-  assert(st.shuts == 1, "shuts = ${st.shuts}")
+  assert(st.shuts == 0, "shuts = ${st.shuts}: a fully read chunked body's connection is parked")
+  assert(len(r.slot.pool.idle) == 1, "idle = ${len(r.slot.pool.idle)}")
 }
 
 test "a body with neither framing header ends where the connection does" {
@@ -212,7 +213,7 @@ test "a 404 exposes its status and headers, and its body still reads" {
   assert(got == "no such k", "got '${got}'")
 }
 
-test "HEAD, 204 and 304 have an empty reader and shut the connection at once" {
+test "HEAD, 204 and 304 have an empty reader and park the connection at once" {
   let cases = ["HEAD", "GET", "GET"]
   let heads = [
     "HTTP/1.1 200 OK\r\nContent-Length: 4294967296\r\n\r\n",
@@ -226,11 +227,12 @@ test "HEAD, 204 and 304 have an empty reader and shut the connection at once" {
       assert(false, "open ${i}: ${e.message()}")
       return
     }
-    assert(st.shuts == 1, "case ${i}: shuts = ${st.shuts}")
+    assert(st.shuts == 0, "case ${i}: shuts = ${st.shuts}")
     let r = readerOf(res) catch e {
       assert(false, "${e.message()}")
       return
     }
+    assert(len(r.slot.pool.idle) == 1, "case ${i}: idle = ${len(r.slot.pool.idle)}")
     let first = r.read(10) catch e {
       assert(false, "case ${i} read: ${e.message()}")
       return
@@ -483,7 +485,9 @@ test "close after the end of the body is a no-op for the connection" {
   }
   assert(got == "abc", "got '${got}'")
   r.close()
-  assert(st.shuts == 1, "shuts = ${st.shuts}")
+  r.close()
+  assert(st.shuts == 0, "close() shut a connection the pool already holds: shuts = ${st.shuts}")
+  assert(len(r.slot.pool.idle) == 1, "idle = ${len(r.slot.pool.idle)}")
 }
 
 test "a head with a bad Content-Length fails the open" {
@@ -513,4 +517,74 @@ test "http1Only offers HTTP/1.1 alone and leaves the client's own config as it w
     h.serverName == "x.test" && h.insecureSkipVerify && h.nowUnix == 77,
     "other fields were not carried over",
   )
+}
+
+test "a body that ends on a connection that cannot carry another request is shut, not parked" {
+  let heads = [
+    "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+    "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+    "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+    "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcEXTRA",
+    "HTTP/1.1 200 OK\r\n\r\nabc",
+  ]
+  let i = 0
+  while (i < len(heads)) {
+    let st = watch(heads[i], 64)
+    let res = openOver(st, "GET") catch e {
+      assert(false, "open ${i}: ${e.message()}")
+      return
+    }
+    let r = readerOf(res) catch e {
+      assert(false, "${e.message()}")
+      return
+    }
+    let got = drain(r, 8) catch e {
+      assert(false, "drain ${i}: ${e.message()}")
+      return
+    }
+    assert(len(got) >= 3, "case ${i}: got '${got}'")
+    assert(st.shuts == 1, "case ${i}: shuts = ${st.shuts}")
+    assert(len(r.slot.pool.idle) == 0, "case ${i}: idle = ${len(r.slot.pool.idle)}")
+    i = i + 1
+  }
+}
+
+test "close after a partial read, and a failed read, park nothing" {
+  let st = watch(head200("Content-Length: 100\r\n") + repeat("z", 100), 64)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let one = r.read(1) catch e {
+    assert(false, "read: ${e.message()}")
+    return
+  }
+  assert(len(one) == 1, "read returned ${len(one)} bytes")
+  r.close()
+  assert(
+    st.shuts == 1 && len(r.slot.pool.idle) == 0,
+    "shuts ${st.shuts}, idle ${len(r.slot.pool.idle)}",
+  )
+
+  let cut = watch(head200("Content-Length: 100\r\n") + "short", 64)
+  let res2 = openOver(cut, "GET") catch e {
+    assert(false, "open 2: ${e.message()}")
+    return
+  }
+  let r2 = readerOf(res2) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  drain(r2, 64) catch _ {
+    assert(
+      cut.shuts == 1 && len(r2.slot.pool.idle) == 0,
+      "shuts ${cut.shuts}, idle ${len(r2.slot.pool.idle)}",
+    )
+    return
+  }
+  assert(false, "a body cut short ended cleanly")
 }
