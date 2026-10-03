@@ -5,7 +5,7 @@ fresh `Adapter` per pool, with URI parsing, TLS, authentication and the wire
 protocol behind it, so swapping this package for another database's driver
 changes one line.
 
-Install with `bit add bitlang.org/pkg/postgres@v0.1.1`.
+Install with `bit add bitlang.org/pkg/postgres@v0.1.4`.
 
 ```bit
 import { pool, Datasource, Value } from "std/sql"

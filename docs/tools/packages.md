@@ -37,7 +37,7 @@ is optional.
 {
   "name": "inkwell",
   "dependencies": {
-    "web": "bitlang.org/pkg/web@^0.8.0"
+    "web": "bitlang.org/pkg/web@^0.9.0"
   }
 }
 ```
@@ -63,9 +63,9 @@ Adds or updates one dependency.
 
 ```
 $ bit add bitlang.org/pkg/web
-bit add: web -> bitlang.org/pkg/web@^0.8.0 (945fa57bcecbb5446737669d43fd8eae3b0f7caa)
-$ bit add bitlang.org/pkg/web@0.8.0
-bit add: web -> bitlang.org/pkg/web@0.8.0 (945fa57bcecbb5446737669d43fd8eae3b0f7caa)
+bit add: web -> bitlang.org/pkg/web@^0.9.0 (61f779e0e5adc8034e6ae4852cf5b3beeb4939f8)
+$ bit add bitlang.org/pkg/web@0.9.0
+bit add: web -> bitlang.org/pkg/web@0.9.0 (61f779e0e5adc8034e6ae4852cf5b3beeb4939f8)
 ```
 
 Naming no version resolves the newest tag and writes a caret constraint;
@@ -164,7 +164,7 @@ it from scratch.
     "vanity": "bitlang.org/pkg/web",
     "dir": "pkg/web",
     "url": "https://github.com/byteink/bit.git",
-    "commit": "945fa57bcecbb5446737669d43fd8eae3b0f7caa",
+    "commit": "61f779e0e5adc8034e6ae4852cf5b3beeb4939f8",
     "version": "0.8.0",
     "tag": "web/v0.8.0",
     "requires": {}

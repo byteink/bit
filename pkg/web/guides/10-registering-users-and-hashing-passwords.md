@@ -14,7 +14,7 @@ text you could read back.
 [chapter 14](01-first-endpoint.md):
 
 ```text
-$ bit add bitlang.org/pkg/auth@v0.3.0
+$ bit add bitlang.org/pkg/auth@v0.4.0
 bit add: auth -> bitlang.org/pkg/auth@0.3.0 (1129117b17ba208e23792843d5f1c87dbfaefeff)
 ```
 

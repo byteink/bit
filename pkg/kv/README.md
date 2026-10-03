@@ -15,12 +15,12 @@ stated here rather than enforced.
 
 ## Install
 
-`bit add bitlang.org/pkg/kv@v0.1.1` writes:
+`bit add bitlang.org/pkg/kv@v0.2.1` writes:
 
 ```json
 {
   "dependencies": {
-    "kv": "bitlang.org/pkg/kv@v0.1.1"
+    "kv": "bitlang.org/pkg/kv@v0.2.1"
   }
 }
 ```
