@@ -1,0 +1,274 @@
+// tools/gens3 — shape and model loading for model.bit (#6604): members,
+// shapes, the service, then the integrity pass (every target resolves, every
+// operation is on the service and the service lists no stranger).
+
+const unitShape: string = "smithy.api#Unit"
+
+// `owner`'s member `name` from {"target": ..., "traits": {...}}.
+fn loadMember(owner: string, name: string, j: Json): Member! {
+  let at = "${owner}.${name}"
+  onlyKeys(needObject(j, at)?, ["target", "traits"], at)?
+  let m = Member{ name = name, target = needNonEmpty(needKey(j, "target", at)?, at)? }
+  if (hasKey(j, "traits")) {
+    for t of needObject(optKey(j, "traits"), at)? {
+      applyMemberTrait(m, t.key, t.value, "${at}: trait ${t.key}")?
+    }
+  }
+  if (locationCount(m) > 1) {
+    fail newError("${at}: more than one wire location (header, query, label, payload, prefix headers, query params, response code)")
+  }
+  return m
+}
+
+// The kinds that hold members.
+fn aggregateKind(name: string): Option<ShapeKind> {
+  if (name == "structure") {
+    return Option.Some(ShapeKind.Structure)
+  }
+  if (name == "union") {
+    return Option.Some(ShapeKind.Union)
+  }
+  if (name == "enum") {
+    return Option.Some(ShapeKind.Enum)
+  }
+  if (name == "list") {
+    return Option.Some(ShapeKind.List)
+  }
+  if (name == "map") {
+    return Option.Some(ShapeKind.Map)
+  }
+  return Option.None
+}
+
+fn simpleKind(name: string): Option<ShapeKind> {
+  if (name == "string") {
+    return Option.Some(ShapeKind.String)
+  }
+  if (name == "blob") {
+    return Option.Some(ShapeKind.Blob)
+  }
+  if (name == "boolean") {
+    return Option.Some(ShapeKind.Boolean)
+  }
+  if (name == "integer") {
+    return Option.Some(ShapeKind.Integer)
+  }
+  if (name == "long") {
+    return Option.Some(ShapeKind.Long)
+  }
+  if (name == "timestamp") {
+    return Option.Some(ShapeKind.Timestamp)
+  }
+  return Option.None
+}
+
+fn kindOf(name: string, id: string): ShapeKind! {
+  match (aggregateKind(name)) {
+    Some(k) => return k
+    None => {}
+  }
+  match (simpleKind(name)) {
+    Some(k) => return k
+    None => fail newError("${id}: shape type \"${name}\" is not one the generator reads")
+  }
+}
+
+// The JSON keys a shape of this kind may carry besides `type` and `traits`.
+fn memberKeys(kind: ShapeKind): []string {
+  return match (kind) {
+    Structure => ["members"]
+    Union => ["members"]
+    Enum => ["members"]
+    List => ["member"]
+    Map => ["key", "value"]
+    _ => []string(0)
+  }
+}
+
+fn loadNamedMembers(id: string, j: Json): []Member! {
+  let out = []Member(0)
+  for e of needObject(needKey(j, "members", id)?, id)? {
+    out = append(out, loadMember(id, e.key, e.value)?)
+  }
+  return out
+}
+
+// The members of a shape: named ones, a list's "member", a map's "key" and
+// "value".
+fn loadMembers(id: string, kind: ShapeKind, j: Json): []Member! {
+  let out = []Member(0)
+  match (kind) {
+    Structure => return loadNamedMembers(id, j)?
+    Union => return loadNamedMembers(id, j)?
+    Enum => return loadNamedMembers(id, j)?
+    List => out = append(out, loadMember(id, "member", needKey(j, "member", id)?)?)
+    Map => {
+      out = append(out, loadMember(id, "key", needKey(j, "key", id)?)?)
+      out = append(out, loadMember(id, "value", needKey(j, "value", id)?)?)
+    }
+    _ => {}
+  }
+  return out
+}
+
+fn loadShape(id: string, j: Json): Shape! {
+  let entries = needObject(j, id)?
+  let kind = kindOf(needString(needKey(j, "type", id)?, id)?, id)?
+  let keys = ["type", "traits"]
+  for k of memberKeys(kind) {
+    keys = append(keys, k)
+  }
+  onlyKeys(entries, keys, id)?
+  let s = Shape{ id = id, kind = kind, members = loadMembers(id, kind, j)? }
+  if (hasKey(j, "traits")) {
+    for t of needObject(optKey(j, "traits"), id)? {
+      applyShapeTrait(s, t.key, t.value, "${id}: trait ${t.key}")?
+    }
+  }
+  if (kind == ShapeKind.Enum) {
+    for m of s.members {
+      if (m.enumValue == "") {
+        fail newError("${id}.${m.name}: enum member without smithy.api#enumValue")
+      }
+    }
+  }
+  return s
+}
+
+// What `loadService` returns; the service is not a Shape.
+class ServiceInfo { version: string, xmlNsUri: string, operations: []string }
+
+fn loadService(id: string, j: Json): ServiceInfo! {
+  onlyKeys(needObject(j, id)?, ["type", "version", "operations", "traits"], id)?
+  let info = ServiceInfo{ version = needNonEmpty(needKey(j, "version", id)?, id)? }
+  info.operations = readTargets(needKey(j, "operations", id)?, "${id}: operations")?
+  for t of needObject(needKey(j, "traits", id)?, id)? {
+    let what = "${id}: trait ${t.key}"
+    if (t.key == "smithy.api#xmlNamespace") {
+      info.xmlNsUri = readXmlNs(t.value, what)?.uri
+    } else if (!isUnreadShapeTrait(t.key)) {
+      fail newError("${what}: ${unknownTraitHint}")
+    }
+  }
+  return info
+}
+
+// Every id appears once; `ids` is sorted.
+fn checkUnique(ids: []string): ()! {
+  let i = 1
+  while (i < len(ids)) {
+    if (ids[i - 1] == ids[i]) {
+      fail newError("${ids[i]}: defined twice")
+    }
+    i = i + 1
+  }
+}
+
+// A target resolves to a shape of the model or to the Smithy unit type.
+fn checkTarget(m: Model, target: string, at: string): ()! {
+  if (target == unitShape) {
+    return
+  }
+  match (findShape(m, target)) {
+    Some(_) => return
+    None => fail newError("${at}: target ${target} is not in the model")
+  }
+}
+
+fn checkShapeTargets(m: Model, s: Shape): ()! {
+  for mem of s.members {
+    checkTarget(m, mem.target, "${s.id}.${mem.name}")?
+  }
+}
+
+fn checkOperationTargets(m: Model, op: Operation): ()! {
+  checkTarget(m, op.input, "${op.id}: input")?
+  checkTarget(m, op.output, "${op.id}: output")?
+  for e of op.errors {
+    checkTarget(m, e, "${op.id}: errors")?
+  }
+}
+
+// The service's operation list and the operation shapes are the same set.
+fn checkServiceOperations(m: Model): ()! {
+  for id of m.serviceOperations {
+    match (findOperation(m, id)) {
+      Some(_) => {}
+      None => fail newError("${m.serviceId}: lists ${id}, which is not an operation shape")
+    }
+  }
+  if (len(m.serviceOperations) != len(m.operations)) {
+    fail newError("${m.serviceId}: lists ${len(m.serviceOperations)} operations, the model has ${len(m.operations)}")
+  }
+}
+
+fn checkIntegrity(m: Model): ()! {
+  for s of m.shapes {
+    checkShapeTargets(m, s)?
+  }
+  for op of m.operations {
+    checkOperationTargets(m, op)?
+  }
+  checkServiceOperations(m)?
+}
+
+fn shapeIds(m: Model): []string {
+  let ids = []string(0)
+  for s of m.shapes {
+    ids = append(ids, s.id)
+  }
+  for op of m.operations {
+    ids = append(ids, op.id)
+  }
+  sortInPlace(ids, (a, b) => a < b)
+  return ids
+}
+
+// Sort the shapes and operations by id, so `findShape` can bisect.
+fn sortModel(m: Model) {
+  sortInPlace(m.shapes, (a, b) => a.id < b.id)
+  sortInPlace(m.operations, (a, b) => a.id < b.id)
+}
+
+// Route every entry of "shapes" to its loader.
+fn loadShapes(m: Model, shapes: []JsonEntry): ()! {
+  let services = 0
+  for e of shapes {
+    let typeName = needString(needKey(e.value, "type", e.key)?, e.key)?
+    if (typeName == "operation") {
+      m.operations = append(m.operations, loadOperation(e.key, e.value)?)
+    } else if (typeName == "service") {
+      let info = loadService(e.key, e.value)?
+      m.serviceId = e.key
+      m.serviceVersion = info.version
+      m.serviceXmlNsUri = info.xmlNsUri
+      m.serviceOperations = info.operations
+      services = services + 1
+    } else {
+      m.shapes = append(m.shapes, loadShape(e.key, e.value)?)
+    }
+  }
+  if (services != 1) {
+    fail newError("the model has ${services} services, want exactly 1")
+  }
+}
+
+// The typed model of the trimmed Smithy JSON text `src`.
+fn loadModel(src: string): Model! {
+  let root = jsonParse(src)?
+  onlyKeys(needObject(root, "model")?, ["smithy", "metadata", "shapes"], "model")?
+  let version = needString(needKey(root, "smithy", "model")?, "model: smithy")?
+  if (version != "2.0") {
+    fail newError("model: smithy version ${version}, the loader reads 2.0")
+  }
+  let m = Model{}
+  loadShapes(m, needObject(needKey(root, "shapes", "model")?, "model: shapes")?)?
+  checkUnique(shapeIds(m))?
+  sortModel(m)
+  checkIntegrity(m)?
+  return m
+}
+
+fn loadModelFile(path: string): Model! {
+  return loadModel(readFile(path)?)?
+}
