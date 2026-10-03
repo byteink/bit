@@ -15,7 +15,7 @@ text you could read back.
 
 ```text
 $ bit add bitlang.org/pkg/auth@v0.4.0
-bit add: auth -> bitlang.org/pkg/auth@0.3.0 (1129117b17ba208e23792843d5f1c87dbfaefeff)
+bit add: auth -> bitlang.org/pkg/auth@0.4.0 (e226b95b834239d577cc67a44cab93305821166c)
 ```
 
 ## Why you never store the plain password
