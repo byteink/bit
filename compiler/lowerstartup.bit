@@ -142,11 +142,81 @@ fn startupFnCtx(c: Checker, b: IrBuilder, lowerer: Lowerer): FnCtx {
   }
 }
 
+// The longest array a startup copy unrolls. Past it the copy is a counted loop,
+// so the init function's size stops growing with N (#6673). Measured as the
+// emitted size of `bit$init$<mod>$<cell>` for a `[N]int` cell (one call, one
+// store): unrolled costs 12 bytes per element on aarch64-macos and 24 on
+// x86_64-linux, the loop a flat 208 and 320 bytes, so the two meet at N = 12 on
+// both. The loop is the smaller form from 13 up.
+const startupCopyUnrollMax = 12
+
+// Copies the `[N]T` value at `src` into the array cell at `dst`, a process-wide
+// global. Unrolled up to `startupCopyUnrollMax` elements, a counted loop above.
+//
+// The cell is static data, never a heap interior pointer, so the loop's back-edge
+// safepoint cannot strand it; `src` is the heap block (or another global) and is
+// threaded through the header as a parameter, so the stack map keeps it live.
+// Elements are scalars (E0072 refuses a reference-typed array element), so no
+// store needs a write barrier. `copyArrayInto` stays unrolled for its other
+// caller, a class field, whose destination IS a heap interior pointer.
+fn copyArrayCell(fc: FnCtx, dst: int, src: int, arrayTy: int) {
+  if (fc.c.ctx.types[arrayTy].arrayLen <= startupCopyUnrollMax) {
+    copyArrayInto(fc, dst, src, arrayTy)
+    return
+  }
+  let i64ty = primType(fc.c.ctx, 3)
+  let header = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let exit = builderNewBlock(fc.b)
+  let zero = mkInstr(Op.ConstInt, i64ty)
+  zero.ival = 0
+  emitJump(fc, header, [dst, src, builderEmit(fc.b, zero)])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, header)
+  let hDst = builderAddParam(fc.b, fc.b.instrs[dst].ty)
+  let hSrc = builderAddParam(fc.b, fc.b.instrs[src].ty)
+  let hI = builderAddParam(fc.b, i64ty)
+  let n = mkInstr(Op.ConstInt, i64ty)
+  n.ival = fc.c.ctx.types[arrayTy].arrayLen
+  let lt = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
+  lt.lhs = hI
+  lt.rhs = builderEmit(fc.b, n)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, lt)
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = exit
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  let elemTy = fc.c.ctx.types[arrayTy].elem
+  let ig = mkInstr(Op.IndexGet, elemTy)
+  ig.lhs = hSrc
+  ig.rhs = hI
+  let st = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+  st.lhs = hDst
+  st.rhs = hI
+  st.ival = builderEmit(fc.b, ig)
+  st.ival2 = elemTy
+  builderEmit(fc.b, st)
+  let one = mkInstr(Op.ConstInt, i64ty)
+  one.ival = 1
+  let next = mkInstr(Op.Add, i64ty)
+  next.lhs = hI
+  next.rhs = builderEmit(fc.b, one)
+  emitJump(fc, header, [hDst, hSrc, builderEmit(fc.b, next)])
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, exit)
+}
+
 // Evaluates the cell's initializer and stores it into the cell. The cell's
 // address is taken AFTER the value exists: an initializer may allocate and
 // reach a safepoint, and the address needs no protection either way. An array
 // cell is its own base address, so the value is copied into it element by
-// element (`copyArrayInto`, bounded by N), never stored as a pointer.
+// element (`copyArrayCell`), never stored as a pointer.
 fn lowerStartupStore(fc: FnCtx, cell: StartupCell, ty: int, init: int) {
   // No initializer: the §13.4 zero value of a built record (`vModuleState`).
   let v = 0
@@ -162,7 +232,7 @@ fn lowerStartupStore(fc: FnCtx, cell: StartupCell, ty: int, init: int) {
   }
   let sym = fc.lowerer.globalSyms["${cell.mod}\$${cell.name}"]
   if (fc.c.ctx.types[ty].kind == TypeKind.Array) {
-    copyArrayInto(fc, emitGlobalAddrVal(fc, sym), v, ty)
+    copyArrayCell(fc, emitGlobalAddrVal(fc, sym), v, ty)
   } else if (isDecimalPrim(fc.c.ctx, ty)) {
     decimalCellStore(fc, emitGlobalAddrVal(fc, sym), 0, v)
   } else {
