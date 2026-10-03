@@ -5110,6 +5110,22 @@ nothing; there is no thread handle in v0.1 (coordinate via channels).
 The number of OS worker threads is chosen by the runtime at startup and is fixed
 thereafter (no unbounded thread creation, per the resource-predictability rule).
 
+A spawned thread has no caller to receive an error, so `spawn` of a call whose
+result is fallible (`T!E`, §18.2) is a compile error, E0190, the same as a bare
+call statement (§13.1, §18.3): the error would be lost with no trace. `spawn`
+takes only a call, not a block or a closure, so the error is handled in a
+function that is itself infallible, and that function is what is spawned:
+
+```
+fn serveLoop(s: Server) {
+  serve(s) catch e {
+    print("serve failed: ${e.message()}")
+  }
+}
+
+spawn serveLoop(s)
+```
+
 ### 16.2 Channels
 
 ```
@@ -6016,9 +6032,10 @@ E0041 (`expected 'T', found 'T!'`), and where there is no declared type to
 compare (a receiver, an index or slice bound, a `for ... of` iterable, a
 compound assignment's right-hand side, an unannotated `let`, a bare slice, map
 or tuple element, a call statement) it is E0190; both say to add `?` or `catch`.
-Three forms stay open because each already says the result is dropped:
-`let _ = f()`, `defer f()` and `spawn f()` (§16.1, §18.5 - there is no caller
-left to hand the error to).
+One form stays open because it says the result is dropped: `let _ = f()`.
+`defer f()` and `spawn f()` of a fallible call are E0190 too (§16.1, §18.5):
+the call runs with no caller to hand the error to, so it is handled inside a
+wrapper function that is itself infallible.
 
 Example:
 
@@ -6108,6 +6125,21 @@ those frames go away - releasing a lock, deleting a temp file - has to run
 explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
 deterministic resource release without finalizers on every path that returns.
+
+A deferred call has no caller to receive an error either, so `defer` of a call
+whose result is fallible (`T!E`, §18.2) is a compile error, E0190, the same as
+a bare call statement (§18.3). `defer` takes only a call, so the error is
+handled in an infallible wrapper function, and the wrapper is what is deferred:
+
+```
+fn closeLogged(f: File) {
+  f.close() catch e {
+    print("close failed: ${e.message()}")
+  }
+}
+
+defer closeLogged(f)
+```
 
 ### 18.6 Caller Location and Stack Traces
 
