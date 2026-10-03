@@ -111,7 +111,7 @@ cat >"$workdir/spawn.bit" <<'BITEOF'
 // workerbench spawn probe: four CPU-bound tasks (trial-division prime
 // counting), each writing its own results slot so no lock is needed and the
 // workload stays purely CPU-bound rather than contended.
-import { WaitGroup, newWaitGroup } from "std/sync"
+import { WaitGroup} from "std/sync"
 
 const tasks = 4
 // Sized from a measured single-task wall-clock, not a round multiplier
@@ -150,7 +150,7 @@ fn burn(id: int, results: []i64, wg: WaitGroup) {
 
 fn main() {
   let results = []i64(tasks)
-  let wg = newWaitGroup()
+  let wg = WaitGroup()
   wg.add(tasks)
   let i = 0
   while (i < tasks) {
