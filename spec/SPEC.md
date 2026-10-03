@@ -2998,8 +2998,8 @@ fallible call with `?` or `catch` (§18.3) are all accepted. Two shapes exist:
   on the main task with the allocator, collector and scheduler up, so it allocates
   and calls like any function body. A `[N]T` cell is filled by copying the value.
 
-A `let` with no initializer is zero-valued (§13.4), and its type annotation is
-then required. A `const` always has one.
+A `let` with no initializer is zero-valued (§13.4) and needs a type annotation; a
+type with no zero value is `E0083`. A `const` needs an initializer (`E0086`).
 
 ```bit
 fn defaultRetries(): int {
