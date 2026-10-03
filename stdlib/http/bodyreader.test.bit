@@ -1,0 +1,516 @@
+// stdlib/http/bodyreader.test.bit — pull-style streaming responses (#6580).
+//
+// Same module as bodyreader.bit (SPEC §19): `startStream`, `BodyReader`,
+// `ClientRequest`, `connSlot`, `newConnPool`, `PoolLimits`, `Client`, `listen`,
+// `Listener`, `Conn`, `AtomicI64` (pool.test.bit's import), `Builder`, `repeat`,
+// `indexOf`, `itoa` and message.test.bit's `chunk` are bound module-wide, so
+// nothing is imported here.
+//
+// The framing and the failure cases run over a scripted stream with no socket,
+// because only a double can count what was read and how often the connection
+// was shut. The wire cases, a real `Client` against a loopback origin, are in
+// bodyreaderwire.test.bit.
+
+// A `byteStream` over a fixed script, like message.test.bit's `scriptedStream`
+// but counting `shut()` and keeping what was written, which is what "the
+// connection was closed exactly once" and "the request said Connection:
+// close" are asserted from.
+class watchedStream {
+  data: string
+  pos: int
+  maxPerRead: int
+  pending: string
+  shuts: int
+  wrote: string
+
+  readUp(n: int): string! {
+    if (len(this.pending) > 0) {
+      let take = n
+      if (take > len(this.pending)) {
+        take = len(this.pending)
+      }
+      let out = this.pending[0:take]
+      this.pending = this.pending[take:len(this.pending)]
+      return out
+    }
+    if (this.pos >= len(this.data)) {
+      return ""
+    }
+    let want = n
+    if (want > this.maxPerRead) {
+      want = this.maxPerRead
+    }
+    let end = this.pos + want
+    if (end > len(this.data)) {
+      end = len(this.data)
+    }
+    let out = this.data[this.pos:end]
+    this.pos = end
+    return out
+  }
+
+  writeStr(data: string): ()! {
+    this.wrote = this.wrote + data
+  }
+
+  writeBytes(b: []byte): ()! {
+    fail newError("watchedStream: unexpected writeBytes")
+  }
+
+  shut() {
+    this.shuts = this.shuts + 1
+  }
+
+  forceClose() {}
+
+  peer(): string { return "" }
+
+  unread(extra: string) { this.pending = extra + this.pending }
+
+  setIdleDeadline(deadlineNs: int) {}
+}
+
+fn watch(data: string, maxPerRead: int): watchedStream {
+  return watchedStream{
+    data = data,
+    pos = 0,
+    maxPerRead = maxPerRead,
+    pending = "",
+    shuts = 0,
+    wrote = "",
+  }
+}
+
+// `startStream` over `st`, with a slot that frees nothing (no origin cap).
+fn openOver(st: watchedStream, method: string): Response! {
+  let slot = connSlot{ pool = newConnPool(PoolLimits{}), key = "k", held = false }
+  return startStream(st, slot, "${method} /x HTTP/1.1\r\nConnection: close\r\n\r\n", method)?
+}
+
+fn readerOf(res: Response): BodyReader! {
+  if (!isSome(res.reader)) {
+    fail newError("response has no reader")
+  }
+  return unwrap(res.reader)
+}
+
+// Every byte of the body, pulled `max` at a time until the empty read. Bounded:
+// a reader that never ends fails the test rather than hanging it.
+fn drain(r: BodyReader, max: int): string! {
+  let out = Builder()
+  let reads = 0
+  while (reads < 10000000) {
+    reads = reads + 1
+    let piece = r.read(max)?
+    if (len(piece) == 0) {
+      return out.toString()
+    }
+    out.write(string(piece))
+  }
+  fail newError("drain: no end of body after ${reads} reads")
+}
+
+fn head200(extra: string): string {
+  return "HTTP/1.1 200 OK\r\n${extra}\r\n"
+}
+
+test "a Content-Length body reads byte-exact in 7-byte reads off 5-byte transport reads" {
+  let body = repeat("0123456789abcdef", 40)
+  let st = watch(head200("Content-Length: ${len(body)}\r\nContent-Type: text/plain\r\n") + body, 5)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}")
+  assert(res.contentType == "text/plain", "contentType = '${res.contentType}'")
+  assert(res.body == "", "body is '${res.body}', want it left for the reader")
+  assert(indexOf(st.wrote, "Connection: close") >= 0, "request was:\n${st.wrote}")
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 7) catch e {
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  assert(got == body, "got ${len(got)} bytes, want ${len(body)} identical")
+  assert(st.shuts == 1, "shuts = ${st.shuts}")
+}
+
+test "the head is returned before any body byte is read" {
+  let st = watch(head200("Content-Length: 1048576\r\n") + repeat("x", 1048576), 4096)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}")
+  // The head fits in the first transport read; the body is a megabyte. Had the
+  // body been read, `pos` would be the whole script.
+  assert(st.pos <= 4096, "pos = ${st.pos}: more than the first read was consumed")
+  assert(st.shuts == 0, "the connection was shut before the body was read")
+}
+
+test "a chunked body reads byte-exact, with extensions, a trailer and one-byte transport reads" {
+  let wire = head200("Transfer-Encoding: chunked\r\n") +
+    chunk("5;ext=1", "hello") +
+    chunk("A", "0123456789") +
+    chunk("1", "!") +
+    "0\r\nX-Sum: 1\r\nX-Two: 2\r\n\r\n"
+  let st = watch(wire, 1)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 3) catch e {
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  assert(got == "hello0123456789!", "got '${got}'")
+  assert(st.shuts == 1, "shuts = ${st.shuts}")
+}
+
+test "a body with neither framing header ends where the connection does" {
+  let st = watch(head200("") + "until close", 4)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 100) catch e {
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  assert(got == "until close", "got '${got}'")
+}
+
+test "a 404 exposes its status and headers, and its body still reads" {
+  let st = watch(
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nX-Request-Id: abc\r\n\r\nno such k",
+    64,
+  )
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  assert(res.status == 404, "status = ${res.status}")
+  assert(header(res.headers, "x-request-id") == "abc", "headers = '${res.headers}'")
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 4) catch e {
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  assert(got == "no such k", "got '${got}'")
+}
+
+test "HEAD, 204 and 304 have an empty reader and shut the connection at once" {
+  let cases = ["HEAD", "GET", "GET"]
+  let heads = [
+    "HTTP/1.1 200 OK\r\nContent-Length: 4294967296\r\n\r\n",
+    "HTTP/1.1 204 No Content\r\n\r\n",
+    "HTTP/1.1 304 Not Modified\r\nContent-Length: 12\r\n\r\n",
+  ]
+  let i = 0
+  while (i < len(cases)) {
+    let st = watch(heads[i], 64)
+    let res = openOver(st, cases[i]) catch e {
+      assert(false, "open ${i}: ${e.message()}")
+      return
+    }
+    assert(st.shuts == 1, "case ${i}: shuts = ${st.shuts}")
+    let r = readerOf(res) catch e {
+      assert(false, "${e.message()}")
+      return
+    }
+    let first = r.read(10) catch e {
+      assert(false, "case ${i} read: ${e.message()}")
+      return
+    }
+    assert(len(first) == 0, "case ${i}: read returned ${len(first)} bytes")
+    i = i + 1
+  }
+}
+
+test "interim 1xx responses are skipped, 101 is refused" {
+  let st = watch(
+    "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: x\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    16,
+  )
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}")
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 8) catch e {
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  assert(got == "ok", "got '${got}'")
+
+  let up = watch("HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n", 64)
+  openOver(up, "GET") catch e {
+    assert(indexOf(e.message(), "101") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "a 101 was accepted")
+}
+
+test "a Content-Length body cut short fails the read, shuts the connection, and stays failed" {
+  let st = watch(head200("Content-Length: 10\r\n") + "abcd", 64)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let first = r.read(100) catch e {
+    assert(false, "first read: ${e.message()}")
+    return
+  }
+  assert(string(first) == "abcd", "first = '${string(first)}'")
+  r.read(100) catch e {
+    assert(indexOf(e.message(), "6 bytes of the body unread") >= 0, "message = '${e.message()}'")
+    assert(st.shuts == 1, "shuts = ${st.shuts}")
+    r.read(100) catch e2 {
+      assert(indexOf(e2.message(), "earlier read failed") >= 0, "second = '${e2.message()}'")
+      return
+    }
+    assert(false, "a read after a failed read succeeded")
+    return
+  }
+  assert(false, "a truncated Content-Length body ended cleanly")
+}
+
+test "a chunked body cut short, or missing its final chunk, is an error and not an end" {
+  let cuts = [
+    head200("Transfer-Encoding: chunked\r\n") + "5\r\nhel",
+    head200("Transfer-Encoding: chunked\r\n") + chunk("5", "hello"),
+    head200("Transfer-Encoding: chunked\r\n") + chunk("5", "hello") + "0\r\nX: 1\r\n",
+    head200("Transfer-Encoding: chunked\r\n") + "5\r\nhelloXX",
+  ]
+  let i = 0
+  while (i < len(cuts)) {
+    let st = watch(cuts[i], 3)
+    let res = openOver(st, "GET") catch e {
+      assert(false, "open ${i}: ${e.message()}")
+      return
+    }
+    let r = readerOf(res) catch e {
+      assert(false, "${e.message()}")
+      return
+    }
+    drain(r, 4) catch _ {
+      assert(st.shuts == 1, "case ${i}: shuts = ${st.shuts}")
+      i = i + 1
+      continue
+    }
+    assert(false, "case ${i} ended cleanly")
+    return
+  }
+}
+
+test "malformed framing is refused: bad chunk size, huge chunk size line, endless trailers" {
+  let bad = [
+    head200("Transfer-Encoding: chunked\r\n") + "zz\r\nab\r\n0\r\n\r\n",
+    head200("Transfer-Encoding: chunked\r\n") + "ffffffffffffffffff\r\n",
+    head200("Transfer-Encoding: chunked\r\n") + repeat("a", 5000) + "\r\n",
+    head200("Transfer-Encoding: chunked\r\n") + "0\r\n" + repeat("X: 1\r\n", 100) + "\r\n",
+  ]
+  let i = 0
+  while (i < len(bad)) {
+    let st = watch(bad[i], 4096)
+    let res = openOver(st, "GET") catch e {
+      assert(false, "open ${i}: ${e.message()}")
+      return
+    }
+    let r = readerOf(res) catch e {
+      assert(false, "${e.message()}")
+      return
+    }
+    drain(r, 64) catch _ {
+      i = i + 1
+      continue
+    }
+    assert(false, "case ${i} was accepted")
+    return
+  }
+}
+
+test "a bad head is refused: Content-Length forms, both framings, a non-HTTP line, an endless head" {
+  let bad = [
+    head200("Content-Length: -1\r\n"),
+    head200("Content-Length: +5\r\n"),
+    head200("Content-Length: 5, 5\r\n"),
+    head200("Content-Length: abc\r\n"),
+    head200("Content-Length: 99999999999999999999\r\n"),
+    head200("Content-Length: 5\r\nTransfer-Encoding: chunked\r\n"),
+    head200("Transfer-Encoding: gzip\r\n"),
+    "SSH-2.0-OpenSSH\r\n\r\n",
+    "HTTP/1.1 abc\r\n\r\n",
+  ]
+  let i = 0
+  while (i < len(bad)) {
+    let st = watch(bad[i], 4096)
+    openOver(st, "GET") catch _ {
+      i = i + 1
+      continue
+    }
+    assert(false, "head ${i} was accepted")
+    return
+  }
+
+  // 1 MiB of header bytes and no blank line: refused after maxHeaderBytes plus
+  // one transport read, not after buffering the megabyte.
+  let long = watch("HTTP/1.1 200 OK\r\n" + repeat("X-Pad: aaaaaaaaaaaaaaaa\r\n", 45000), 4096)
+  openOver(long, "GET") catch e {
+    assert(indexOf(e.message(), "head exceeds") >= 0, "message = '${e.message()}'")
+    assert(long.pos <= 65536 + 2 * 4096, "consumed ${long.pos} bytes before refusing")
+    return
+  }
+  assert(false, "an endless head was accepted")
+}
+
+test "a head of exactly maxHeaderBytes is accepted, one byte more is refused" {
+  // "HTTP/1.1 200 OK" is 15 bytes, "X: " 3, the two CRLFs inside the block 2.
+  let fits = "HTTP/1.1 200 OK\r\nX: " + repeat("a", maxHeaderBytes - 20) + "\r\n\r\n"
+  let tooLong = "HTTP/1.1 200 OK\r\nX: " + repeat("a", maxHeaderBytes - 19) + "\r\n\r\n"
+  let reads = [1, 4096, 100000]
+  let i = 0
+  while (i < len(reads)) {
+    let ok = openOver(watch(fits, reads[i]), "GET") catch e {
+      assert(false, "a ${maxHeaderBytes}-byte head with ${reads[i]}-byte reads: ${e.message()}")
+      return
+    }
+    assert(ok.status == 200, "status = ${ok.status}")
+    let over = openOver(watch(tooLong, reads[i]), "GET") catch e {
+      assert(indexOf(e.message(), "head exceeds") >= 0, "message = '${e.message()}'")
+      i = i + 1
+      continue
+    }
+    assert(false, "a head of ${maxHeaderBytes + 1} bytes was accepted: status ${over.status}")
+    return
+  }
+}
+
+test "a read returns at most 65536 bytes, whatever max asks" {
+  let st = watch(head200("Content-Length: 200000\r\n") + repeat("y", 200000), 1000000)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let piece = r.read(1000000000) catch e {
+    assert(false, "read: ${e.message()}")
+    return
+  }
+  assert(len(piece) <= 65536 && len(piece) > 0, "read returned ${len(piece)} bytes")
+}
+
+test "a max below 1 is an error and leaves the reader usable" {
+  let st = watch(head200("Content-Length: 3\r\n") + "abc", 64)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  r.read(0) catch e {
+    assert(indexOf(e.message(), "at least 1") >= 0, "message = '${e.message()}'")
+    assert(st.shuts == 0, "a rejected max shut the connection")
+    return
+  }
+  assert(false, "read(0) succeeded")
+}
+
+test "close after a partial read shuts the connection once, later closes and reads do nothing wrong" {
+  let st = watch(head200("Content-Length: 100\r\n") + repeat("z", 100), 64)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let one = r.read(1) catch e {
+    assert(false, "read: ${e.message()}")
+    return
+  }
+  assert(len(one) == 1, "read returned ${len(one)} bytes")
+  r.close()
+  r.close()
+  assert(st.shuts == 1, "shuts = ${st.shuts}")
+  r.read(1) catch e {
+    assert(indexOf(e.message(), "closed") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "a read after close succeeded")
+}
+
+test "close after the end of the body is a no-op for the connection" {
+  let st = watch(head200("Content-Length: 3\r\n") + "abc", 64)
+  let res = openOver(st, "GET") catch e {
+    assert(false, "open: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 10) catch e {
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  assert(got == "abc", "got '${got}'")
+  r.close()
+  assert(st.shuts == 1, "shuts = ${st.shuts}")
+}
+
+test "a head with a bad Content-Length fails the open" {
+  let st = watch("HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n", 64)
+  openOver(st, "GET") catch e {
+    assert(indexOf(e.message(), "invalid Content-Length") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "a bad Content-Length opened")
+}
+
+test "http1Only offers HTTP/1.1 alone and leaves the client's own config as it was" {
+  let cfg = TlsConfig(
+    defaultRoots(),
+    serverName = "x.test",
+    alpn = ["h2", "http/1.1"],
+    insecureSkipVerify = true,
+    nowUnix = 77,
+  )
+  let h = http1Only(cfg)
+  assert(len(h.alpn) == 1 && h.alpn[0] == "http/1.1", "alpn has ${len(h.alpn)} entries")
+  assert(
+    len(cfg.alpn) == 2 && cfg.alpn[0] == "h2",
+    "the original now offers ${len(cfg.alpn)} protocols",
+  )
+  assert(
+    h.serverName == "x.test" && h.insecureSkipVerify && h.nowUnix == 77,
+    "other fields were not carried over",
+  )
+}
