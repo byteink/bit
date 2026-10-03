@@ -204,6 +204,34 @@ fn variants(body: string): []string! {
 `Blake3(Blake3Mode.Keyed(key))` is the one fallible digest constructor, because
 BLAKE3 keys must be exactly 32 bytes; use `?` or `catch` on it.
 
+### Name the hash with a `HashAlg`
+
+`hmac`, `hkdf`, `pbkdf2` and `ecdsaSign` take the hash as a `HashAlg` value, the
+way Node's `createHmac("sha256", key)` and .NET's `HashAlgorithmName` do, so a
+call reads `hmac(HashAlg.Sha256, key, msg)`. The variants are `Md5`, `Sha1`,
+`Sha224`, `Sha256`, `Sha384`, `Sha512`, `Sha512_256` and `Blake3`. A value picked
+at run time (for example a protocol's negotiated cipher suite) is passed along
+unchanged, and `make()` builds a fresh hasher of that algorithm when you want
+to hash directly:
+
+```bit
+import { HashAlg, digest, hmac, hkdf, encodeHex } from "std/crypto"
+
+// The same API for every digest: only the `HashAlg` value changes.
+fn tag(alg: HashAlg, key: []byte, body: string): string {
+  return encodeHex(hmac(alg, key, []byte(body)))
+}
+
+// HashAlg.Sha384.make() is Sha512(Sha512Bits.B384); both satisfy `Hash`.
+fn fingerprint(body: string): string {
+  return encodeHex(digest(HashAlg.Sha384.make(), []byte(body)))
+}
+
+fn sessionKey(secret: []byte, context: string): []byte! {
+  return hkdf(HashAlg.Sha256, []byte(0), secret, []byte(context), 32)?
+}
+```
+
 ## Security notes
 
 **Compare secrets in constant time.** `==` on two byte slices can return as
@@ -272,6 +300,14 @@ signature of something you already know you need.
 ### `Hash`
 
 The streaming digest interface every hash in this module satisfies: `write` any number of times, then `sum` when you are done. `reset` starts over, `size` is the digest length in bytes, and `blockSize` is the algorithm's internal block size.
+
+### `HashAlg`
+
+Names a hash algorithm as a value: `Md5`, `Sha1`, `Sha224`, `Sha256`, `Sha384`, `Sha512`, `Sha512_256` or `Blake3`. `hmac`, `hkdf`, `pbkdf2` and `ecdsaSign` take one, and `HashAlg.Sha256.make()` builds a fresh `Hash` of that algorithm.
+
+### `HashAlg.make(): Hash`
+
+Builds a new, empty hasher for this algorithm: `HashAlg.Sha384.make()` is `Sha512(Sha512Bits.B384)`.
 
 ### `digest(h: Hash, data: []byte): []byte`
 
@@ -527,29 +563,29 @@ The one-shot, unkeyed BLAKE3 hash of `data`, 32 bytes long.
 
 ## MACs and key derivation
 
-### `hmac(newHash: () => Hash, key: []byte, msg: []byte): []byte`
+### `hmac(alg: HashAlg, key: []byte, msg: []byte): []byte`
 
-The HMAC of `msg` under `key`, using the hash `newHash` builds (for example `() => Sha256()`). Use it to prove a message came from someone who holds `key`.
+The HMAC of `msg` under `key`, using the hash `alg` names (for example `HashAlg.Sha256`). Use it to prove a message came from someone who holds `key`.
 
 ### `hmacEqual(a: []byte, b: []byte): bool`
 
 Compares two MAC tags in constant time (an alias for `ctEq`, see [Compare secrets in constant time](#security-notes)). Always use this, never `==`, to check a MAC.
 
-### `hkdf(newHash: () => Hash, salt: []byte, ikm: []byte, info: []byte, outLen: int): []byte!`
+### `hkdf(alg: HashAlg, salt: []byte, ikm: []byte, info: []byte, outLen: int): []byte!`
 
 RFC 5869 HKDF: derives `outLen` bytes of key material from `ikm`, in one call. `salt` may be empty; `info` binds the output to how it will be used, so two different purposes never share a key.
 
-### `hkdfExtract(newHash: () => Hash, salt: []byte, ikm: []byte): []byte`
+### `hkdfExtract(alg: HashAlg, salt: []byte, ikm: []byte): []byte`
 
 HKDF's extract step alone: turns `ikm` into a single fixed-length pseudorandom key. Most programs call `hkdf` instead of this and `hkdfExpand` separately.
 
-### `hkdfExpand(newHash: () => Hash, prk: []byte, info: []byte, outLen: int): []byte!`
+### `hkdfExpand(alg: HashAlg, prk: []byte, info: []byte, outLen: int): []byte!`
 
 HKDF's expand step alone: stretches an already-extracted key `prk` into `outLen` bytes bound to `info`. Most programs call `hkdf` instead.
 
-### `pbkdf2(newHash: () => Hash, password: []byte, salt: []byte, iters: int, outLen: int): []byte`
+### `pbkdf2(alg: HashAlg, password: []byte, salt: []byte, iters: int, outLen: int): []byte`
 
-PBKDF2 key derivation: stretches `password` and `salt` over `iters` rounds of the hash `newHash` builds, into `outLen` bytes. Prefer `argon2Hash` for new passwords; PBKDF2 is for interop.
+PBKDF2 key derivation: stretches `password` and `salt` over `iters` rounds of the hash `alg` names, into `outLen` bytes. Prefer `argon2Hash` for new passwords; PBKDF2 is for interop.
 
 ## Password hashing
 
@@ -839,9 +875,9 @@ Builds an `EcdsaPublicKey` on `curve` from raw point bytes. Fails on an invalid 
 
 Builds an `EcdsaPrivateKey` on `curve` from a raw scalar. Fails on an invalid scalar.
 
-### `ecdsaSign(priv: EcdsaPrivateKey, hash: []byte, newHash: () => Hash): EcdsaSignature!`
+### `ecdsaSign(priv: EcdsaPrivateKey, hash: []byte, alg: HashAlg): EcdsaSignature!`
 
-Signs a pre-hashed `hash` with `priv`, using `newHash` for the signature's internal randomness. Fails only on an unusable key.
+Signs a pre-hashed `hash` with `priv`, using `alg` for the signature's internal randomness. Fails only on an unusable key.
 
 ### `ecdsaVerify(pub: EcdsaPublicKey, hash: []byte, sig: EcdsaSignature): bool`
 
@@ -863,27 +899,27 @@ An RSA public key: its modulus and public exponent.
 
 An RSA private key.
 
-### `rsaSignPkcs1v15(priv: RsaPrivateKey, newHash: () => Hash, digestInfoPrefix: []byte, message: []byte): []byte!`
+### `rsaSignPkcs1v15(priv: RsaPrivateKey, alg: HashAlg, digestInfoPrefix: []byte, message: []byte): []byte!`
 
-Signs `message` with `priv` using PKCS#1 v1.5 padding and the hash `newHash` builds. `digestInfoPrefix` identifies the hash algorithm in the signature - use `rsaDigestInfoSha256()` and friends below.
+Signs `message` with `priv` using PKCS#1 v1.5 padding and the hash `alg` names. `digestInfoPrefix` identifies the hash algorithm in the signature - use `rsaDigestInfoSha256()` and friends below.
 
-### `rsaVerifyPkcs1v15(pub: RsaPublicKey, newHash: () => Hash, digestInfoPrefix: []byte, message: []byte, sig: []byte): bool`
+### `rsaVerifyPkcs1v15(pub: RsaPublicKey, alg: HashAlg, digestInfoPrefix: []byte, message: []byte, sig: []byte): bool`
 
 Checks a PKCS#1 v1.5 signature `sig` of `message` under public key `pub`, for the hash identified by `digestInfoPrefix`.
 
-### `rsaSignPss(priv: RsaPrivateKey, newHash: () => Hash, message: []byte, saltLen: int): []byte!`
+### `rsaSignPss(priv: RsaPrivateKey, alg: HashAlg, message: []byte, saltLen: int): []byte!`
 
-Signs `message` with `priv` using PSS padding and the hash `newHash` builds, with a `saltLen`-byte salt. PSS is the modern choice over PKCS#1 v1.5 for new signatures.
+Signs `message` with `priv` using PSS padding and the hash `alg` names, with a `saltLen`-byte salt. PSS is the modern choice over PKCS#1 v1.5 for new signatures.
 
-### `rsaVerifyPss(pub: RsaPublicKey, newHash: () => Hash, message: []byte, sig: []byte, saltLen: int): bool`
+### `rsaVerifyPss(pub: RsaPublicKey, alg: HashAlg, message: []byte, sig: []byte, saltLen: int): bool`
 
 Checks a PSS signature `sig` of `message` under public key `pub`, with a `saltLen`-byte salt.
 
-### `rsaEncryptOaep(pub: RsaPublicKey, newHash: () => Hash, message: []byte, label: []byte): []byte!`
+### `rsaEncryptOaep(pub: RsaPublicKey, alg: HashAlg, message: []byte, label: []byte): []byte!`
 
-Encrypts `message` to public key `pub` using OAEP padding and the hash `newHash` builds. `label` binds the ciphertext to a context; pass an empty slice when there is none. Prefer an AEAD cipher for new data; RSA encryption is for interop or wrapping a small key.
+Encrypts `message` to public key `pub` using OAEP padding and the hash `alg` names. `label` binds the ciphertext to a context; pass an empty slice when there is none. Prefer an AEAD cipher for new data; RSA encryption is for interop or wrapping a small key.
 
-### `rsaDecryptOaep(priv: RsaPrivateKey, newHash: () => Hash, ciphertext: []byte, label: []byte): []byte!`
+### `rsaDecryptOaep(priv: RsaPrivateKey, alg: HashAlg, ciphertext: []byte, label: []byte): []byte!`
 
 Decrypts `ciphertext` with private key `priv` using OAEP padding, the inverse of `rsaEncryptOaep`. Fails on a mismatched `label` or malformed ciphertext.
 
