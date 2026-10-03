@@ -1,0 +1,435 @@
+// Bit standard library — time module, RFC 3339 and epoch-seconds
+// timestamps (#6574).
+//
+// `parseRfc3339` reads the `date-time` production of RFC 3339 section 5.6 and
+// `parseEpochSeconds` reads Smithy's `epoch-seconds` (a decimal number of
+// seconds since 1970-01-01T00:00:00Z, fraction and sign allowed). Both
+// return a `Timestamp` (./time.bit). What already existed, and why this is a
+// separate reader: `DateTime.toString` and `Timestamp.toString` WRITE RFC
+// 3339; `parseDateTime` (./ldmlparse.bit) reads only the shape those write,
+// strictly: no lowercase `t`/`z`, no leap second, at most nine fraction
+// digits, a `DateTime` rather than an instant. The grammar RFC 3339 gives a
+// receiver is wider, and it is what an S3 XML body and every other service
+// writes, so it is read here.
+//
+// THE GRAMMAR IS RFC 3339 5.6, EXACTLY: `YYYY-MM-DD`, `T` or `t`,
+// `HH:MM:SS`, an optional `.` and one or more digits, then `Z`, `z`, or
+// `+HH:MM` / `-HH:MM`. Anything else (a space instead of `T`, `+0530`,
+// leading or trailing whitespace, a bare date) is `Syntax`.
+//
+// EVERY FIELD IS BOUNDED as the RFC's ABNF bounds it: month 1..12, day 1 to
+// the month's length (leap years included), hour 0..23, minute 0..59, second
+// 0..60, offset hour 0..23, offset minute 0..59. A value the ABNF has but no
+// calendar does (`2023-02-29`, offset `+25:00`) is `Range`.
+//
+// FRACTIONS OF ANY LENGTH ARE READ, and a `Timestamp` holds nanoseconds, so
+// digits past the ninth are TRUNCATED, never rounded: the result is the
+// latest representable instant not after the one written, the same direction
+// `formatHttpDate` drops a fraction (./httpdate.bit). `.9999999999` is
+// `.999999999`, not the next second.
+//
+// `-00:00` IS ACCEPTED, as `+00:00`. RFC 3339 section 4.3 gives it the
+// meaning "the offset is unknown" and section 5.6 puts it in the grammar;
+// nothing there lets a reader refuse it, and an instant is all a `Timestamp`
+// holds.
+//
+// THE LEAP SECOND RULE. `Timestamp` counts POSIX time, which has no second
+// 60. `:60` is accepted only where a leap second can exist: when the instant,
+// after the offset is applied, is 23:59:60 UTC on the last day of a month
+// (RFC 3339 section 5.7 and Appendix D). It is read as POSIX does: the same
+// instant as the following second, 00:00:00 UTC of the next day. Any other
+// `:60` (`12:00:60Z`, or `23:59:60+01:00` whose UTC time is 22:59:60) is
+// `Range`.
+//
+// EPOCH SECONDS take an optional `-`, digits, an optional `.` and digits,
+// and an optional exponent (`1.7E9`, as JSON writers in several languages
+// print it). Negative values and any digit count are read without integer
+// overflow: the digits are placed by position, never multiplied into one
+// number. As with RFC 3339, digits past the ninth fractional one are
+// truncated toward the past, so `-0.0000000001` is one nanosecond before the
+// epoch, not the epoch.
+//
+// A `Timestamp` holds an i64 of nanoseconds, about the years 1677 to 2262; an
+// instant outside that is `Range`, never a wrapped value.
+//
+// Sibling of ./civil.bit, ./httpdate.bit and ./time.bit, same module
+// (SPEC §17.1): `Timestamp`, `civilDaysFromCivil`, `civilDaysInMonth`,
+// `civilFromSeconds`, `civilFloorDiv`, `civilSecondNs`, `hdDigits` and
+// `hdMask` are used here unqualified. Every private helper is prefixed `rfc`.
+
+// The last whole second a `Timestamp` holds is 9223372036 plus 854775807
+// nanoseconds; the first is -9223372037 plus 145224192 (i64 max and min).
+const rfcMaxSecs: int = 9223372036
+const rfcMaxNanos: int = 854775807
+const rfcMinSecs: int = -9223372037
+const rfcMinNanos: int = 145224192
+
+// "2024-01-02T03:04:05", the shortest date-time before its offset, and the
+// six characters of `+HH:MM`.
+const rfcWallLen: int = 19
+const rfcOffsetLen: int = 6
+
+// Digits of a fraction a `Timestamp` keeps.
+const rfcNanoDigits: int = 9
+
+// An epoch-seconds exponent is clamped here while it is read: any exponent
+// this large is out of range already, and clamping keeps the read free of
+// overflow for an input of any length.
+const rfcExpCap: int = 100000
+
+// Which of the two things went wrong: `Syntax` or `Range`.
+export enum TimestampParseCause {
+  // The input is not an RFC 3339 date-time (or not an epoch-seconds number).
+  Syntax,
+  // A field the grammar allows but no calendar or clock has, an invalid leap
+  // second, or an instant a `Timestamp` cannot hold.
+  Range,
+}
+
+// The error `parseRfc3339` and `parseEpochSeconds` produce. `input` is the
+// text that was refused, whole.
+export class TimestampParseError {
+  export cause: TimestampParseCause
+  export input: string
+
+  // Satisfies the predeclared `error` interface (SPEC §10.6, §18.3), one
+  // sentence per cause. The input is not quoted: it is caller-controlled and
+  // unbounded, and the caller holds it already as `input`.
+  export message(): string {
+    match (this.cause) {
+      Syntax => return "timestamp: not an RFC 3339 date-time or an epoch-seconds number"
+      Range => return "timestamp: a field is out of range, or the instant is outside the Timestamp range"
+    }
+  }
+}
+
+fn rfcErr(cause: TimestampParseCause, input: string): TimestampParseError {
+  return TimestampParseError{ cause = cause, input = input }
+}
+
+// The fields of a date-time as read, before any range check. `off` is the
+// offset in seconds east of UTC.
+class RfcFields {
+  y: int,
+  mo: int,
+  d: int,
+  h: int,
+  mi: int,
+  s: int,
+  nanos: int,
+  off: int,
+}
+
+fn rfcIsDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+// The instant for `secs` whole seconds (floored) and `nanos` in 0..999999999
+// after them, or `Range` when a `Timestamp` cannot hold it. The bound is
+// checked on the pair, before `secs * 1e9`, so nothing wraps.
+fn rfcInstant(input: string, secs: int, nanos: int): Timestamp! {
+  if (secs > rfcMaxSecs || (secs == rfcMaxSecs && nanos > rfcMaxNanos)) {
+    fail rfcErr(TimestampParseCause.Range, input)
+  }
+  if (secs < rfcMinSecs || (secs == rfcMinSecs && nanos < rfcMinNanos)) {
+    fail rfcErr(TimestampParseCause.Range, input)
+  }
+  return Timestamp{ ns = secs * civilSecondNs + nanos }
+}
+
+// --- RFC 3339 ---------------------------------------------------------------
+
+// The index just past the run of digits starting at `at`.
+fn rfcDigitsEnd(s: string, at: int): int {
+  let i = at
+  while (i < len(s) && rfcIsDigit(s[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+// The nanoseconds in the fraction digits `s[at:end]`: the first nine, zero
+// padded on the right; the rest are dropped.
+fn rfcNanos(s: string, at: int, end: int): int {
+  let v = 0
+  let i = 0
+  while (i < rfcNanoDigits) {
+    v = v * 10
+    if (at + i < end) {
+      v = v + i64(s[at + i] - '0')
+    }
+    i = i + 1
+  }
+  return v
+}
+
+// Whether `s[at:]` has the shape `+HH:MM` or `-HH:MM`, filling the input.
+fn rfcOffsetShape(s: string, at: int): bool {
+  if (len(s) - at != rfcOffsetLen || (s[at] != '+' && s[at] != '-')) {
+    return false
+  }
+  return s[at + 3] == ':'
+}
+
+// The offset in seconds east of UTC of the zone `s[at:]`: `Z`, `z`, or
+// `+HH:MM` / `-HH:MM` filling the rest of the input. `Range` for an hour
+// above 23 or a minute above 59.
+fn rfcZone(s: string, at: int): int! {
+  if (at + 1 == len(s) && (s[at] == 'Z' || s[at] == 'z')) {
+    return 0
+  }
+  if (!rfcOffsetShape(s, at)) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  let h = hdDigits(s, at + 1, 2)
+  let m = hdDigits(s, at + 4, 2)
+  if (h < 0 || m < 0) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  if (h > 23 || m > 59) {
+    fail rfcErr(TimestampParseCause.Range, s)
+  }
+  let off = h * 3600 + m * 60
+  if (s[at] == '-') {
+    return -off
+  }
+  return off
+}
+
+// The wall-clock fields of `s[0:19]`, grammar only: `T` or `t`, digits where
+// the RFC has digits, the fixed punctuation. The zone and fraction are
+// `rfcRead`'s.
+fn rfcWall(s: string): RfcFields! {
+  if (!hdMask(s, 0, "____-__-_____:__:__") || (s[10] != 'T' && s[10] != 't')) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  let f = RfcFields{
+    y = hdDigits(s, 0, 4), mo = hdDigits(s, 5, 2), d = hdDigits(s, 8, 2),
+    h = hdDigits(s, 11, 2), mi = hdDigits(s, 14, 2), s = hdDigits(s, 17, 2),
+    nanos = 0, off = 0,
+  }
+  if (f.y < 0 || f.mo < 0 || f.d < 0 || f.h < 0 || f.mi < 0 || f.s < 0) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  return f
+}
+
+// The index just past the optional fraction at `p`: `p` itself when there is
+// none, else past the `.` and its digits (`Syntax` when no digit follows).
+fn rfcFractionEnd(s: string, p: int): int! {
+  if (p >= len(s) || s[p] != '.') {
+    return p
+  }
+  let end = rfcDigitsEnd(s, p + 1)
+  if (end == p + 1) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  return end
+}
+
+// Every field of the date-time `s`, grammar only; the values are not yet
+// range-checked.
+fn rfcRead(s: string): RfcFields! {
+  let f = rfcWall(s)?
+  let end = rfcFractionEnd(s, rfcWallLen)?
+  if (end > rfcWallLen) {
+    f.nanos = rfcNanos(s, rfcWallLen + 1, end)
+  }
+  if (end >= len(s)) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  f.off = rfcZone(s, end)?
+  return f
+}
+
+// The UTC second a leap second `:60` stands for: valid only when the wall
+// clock, read as `:59` and moved to UTC by `off`, is the last second of a
+// month; the result is the second after it (the rule in the header).
+fn rfcLeap(s: string, utc59: int): int! {
+  let c = civilFromSeconds(utc59 + 1, 0)
+  if (c.day != 1 || c.hour != 0 || c.minute != 0 || c.second != 0) {
+    fail rfcErr(TimestampParseCause.Range, s)
+  }
+  return utc59 + 1
+}
+
+// The instant `f` names, or the first range violation in it.
+fn rfcBuild(s: string, f: RfcFields): Timestamp! {
+  if (f.mo < 1 || f.mo > 12 || f.d < 1 || f.h > 23 || f.mi > 59 || f.s > 60) {
+    fail rfcErr(TimestampParseCause.Range, s)
+  }
+  if (f.d > civilDaysInMonth(f.y, f.mo)) {
+    fail rfcErr(TimestampParseCause.Range, s)
+  }
+  let days = civilDaysFromCivil(f.y, f.mo, f.d)
+  let sec = f.s
+  if (sec == 60) {
+    sec = 59
+  }
+  let utc = days * 86400 + f.h * 3600 + f.mi * 60 + sec - f.off
+  if (f.s == 60) {
+    utc = rfcLeap(s, utc)?
+  }
+  return rfcInstant(s, utc, f.nanos)?
+}
+
+// The instant the RFC 3339 `date-time` `s` names (the grammar, bounds,
+// fraction, `-00:00` and leap-second rules are in this file's header).
+// Fails with a `TimestampParseError`, whose `cause` is `Syntax` or `Range`.
+export fn parseRfc3339(s: string): Timestamp! {
+  return rfcBuild(s, rfcRead(s)?)?
+}
+
+// --- epoch seconds ----------------------------------------------------------
+
+// An epoch-seconds number split into what positions need: `digits` is the
+// integer and fraction digits run together (leading zeros stripped), and the
+// decimal point sits `point` digits into it (negative: that many zeros after
+// the point come first).
+class RfcNumber {
+  neg: bool,
+  digits: string,
+  point: int,
+}
+
+// `digits[i]` as a number, or 0 outside the string: the digits before the
+// first and after the last are zeros.
+fn rfcDigitAt(digits: string, i: int): int {
+  if (i < 0 || i >= len(digits)) {
+    return 0
+  }
+  return i64(digits[i] - '0')
+}
+
+// The value of the digits `s[at:]`, clamped to `rfcExpCap`.
+fn rfcExpValue(s: string, at: int): int {
+  let e = 0
+  let i = at
+  while (i < len(s)) {
+    e = e * 10 + i64(s[i] - '0')
+    if (e > rfcExpCap) {
+      e = rfcExpCap
+    }
+    i = i + 1
+  }
+  return e
+}
+
+// The exponent in `s[at:]` (`E`, an optional sign, digits, reaching the end
+// of the input), or 0 when there is none. Clamped to `rfcExpCap`.
+fn rfcExponent(s: string, at: int): int! {
+  if (at == len(s)) {
+    return 0
+  }
+  if (s[at] != 'e' && s[at] != 'E') {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  let i = at + 1
+  let sign = 1
+  if (i < len(s) && (s[i] == '-' || s[i] == '+')) {
+    if (s[i] == '-') {
+      sign = -1
+    }
+    i = i + 1
+  }
+  if (i == len(s) || rfcDigitsEnd(s, i) != len(s)) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  return sign * rfcExpValue(s, i)
+}
+
+// Split `s` into sign, digits and decimal point: `-?digits(.digits)?([eE][+-]?digits)?`.
+fn rfcSplit(s: string): RfcNumber! {
+  let neg = len(s) > 0 && s[0] == '-'
+  let start = 0
+  if (neg) {
+    start = 1
+  }
+  let intEnd = rfcDigitsEnd(s, start)
+  if (intEnd == start) {
+    fail rfcErr(TimestampParseCause.Syntax, s)
+  }
+  let digits = s[start:intEnd]
+  let end = intEnd
+  if (end < len(s) && s[end] == '.') {
+    let fracEnd = rfcDigitsEnd(s, end + 1)
+    if (fracEnd == end + 1) {
+      fail rfcErr(TimestampParseCause.Syntax, s)
+    }
+    digits = digits + s[end + 1:fracEnd]
+    end = fracEnd
+  }
+  let point = intEnd - start + rfcExponent(s, end)?
+  // Leading zeros carry no value; stripping them moves the point with them.
+  let z = 0
+  while (z < len(digits) && digits[z] == '0') {
+    z = z + 1
+  }
+  return RfcNumber{ neg = neg, digits = digits[z:], point = point - z }
+}
+
+// Whether any digit past the ninth fractional one is nonzero.
+fn rfcInexact(n: RfcNumber): bool {
+  let i = n.point + rfcNanoDigits
+  if (i < 0) {
+    i = 0
+  }
+  while (i < len(n.digits)) {
+    if (n.digits[i] != '0') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The instant for the magnitude `ms` seconds, `mn` nanoseconds, negated when
+// `neg`, and `inexact` when the written value has more digits past `mn`.
+// Truncation is toward the past, so a negative inexact value is one
+// nanosecond further back.
+fn rfcSigned(s: string, neg: bool, ms: int, mn: int, inexact: bool): Timestamp! {
+  if (!neg) {
+    return rfcInstant(s, ms, mn)?
+  }
+  let frac = mn
+  let whole = ms
+  if (inexact) {
+    frac = frac + 1
+  }
+  if (frac == civilSecondNs) {
+    whole = whole + 1
+    frac = 0
+  }
+  if (frac == 0) {
+    return rfcInstant(s, -whole, 0)?
+  }
+  return rfcInstant(s, -whole - 1, civilSecondNs - frac)?
+}
+
+// The instant for the epoch-seconds number `s`: `-?digits(.digits)?([eE][+-]?digits)?`
+// (header). Fails with a `TimestampParseError`, `Syntax` for any other
+// text and `Range` for an instant a `Timestamp` cannot hold.
+export fn parseEpochSeconds(s: string): Timestamp! {
+  let n = rfcSplit(s)?
+  if (len(n.digits) == 0) {
+    return Timestamp{ ns = 0 }
+  }
+  // 9223372036 has ten digits; eleven integer digits is already out of range,
+  // and stopping there keeps the whole-second accumulation inside an i64.
+  if (n.point > 11) {
+    fail rfcErr(TimestampParseCause.Range, s)
+  }
+  let ms = 0
+  let i = 0
+  while (i < n.point) {
+    ms = ms * 10 + rfcDigitAt(n.digits, i)
+    i = i + 1
+  }
+  let mn = 0
+  i = 0
+  while (i < rfcNanoDigits) {
+    mn = mn * 10 + rfcDigitAt(n.digits, n.point + i)
+    i = i + 1
+  }
+  return rfcSigned(s, n.neg, ms, mn, rfcInexact(n))?
+}
