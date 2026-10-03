@@ -1,0 +1,346 @@
+// Bit standard library — time module, HTTP-date (#6573).
+//
+// `formatHttpDate` writes, and `parseHttpDate` reads, the timestamp RFC 9110
+// section 5.6.7 puts in `Date`, `Last-Modified`, `Expires` and
+// `If-Modified-Since`. The sender writes one form, IMF-fixdate
+// (`Sun, 06 Nov 1994 08:49:37 GMT`); a recipient MUST read all three, so
+// `parseHttpDate` also reads the obsolete RFC 850 form
+// (`Sunday, 06-Nov-94 08:49:37 GMT`) and the asctime form
+// (`Sun Nov  6 08:49:37 1994`).
+//
+// PARSING IS STRICT, DELIBERATELY, in the way ./ldmlparse.bit is. The
+// grammar is case sensitive and takes no extra whitespace (RFC 9110 5.6.7:
+// "HTTP-date is case sensitive"). Anything else fails with an
+// `HttpDateError` naming one of four causes, never a guess:
+//   Syntax   the input is none of the three shapes
+//   Range    a field no calendar has (day 32, hour 24, second 60, 30
+//            February), or an instant outside `Timestamp`'s range
+//   Zone     a zone other than `GMT` (`UTC`, `+0000`, `PST`)
+//   Weekday  the day name disagrees with the date, as `parseWith` rejects
+//
+// An RFC 850 date has a two-digit year. RFC 9110 5.6.7 fixes how to read
+// it: a date more than 50 years after `now` is the most recent year in the
+// past with the same last two digits. That needs a clock, so `parseHttpDate`
+// takes the reference instant as a defaulted parameter, evaluated at the
+// call site; a test (or a replay of a stored response) passes its own.
+//
+// Sibling of ./civil.bit, ./time.bit and ./ldmlparse.bit, same module
+// (SPEC §17.1): `Timestamp`, `now`, `civilDaysFromCivil`, `civilWeekday`,
+// `civilFromSeconds`, `civilFloorDiv`, `civilDaysInMonth`, `fmtPad`,
+// `ldmlMonthNames`, `ldmlDayNames`, `ldmlpHasAt` and `ldmlpSep` are used
+// here unqualified. Every private helper is prefixed `hd`.
+
+// `Timestamp.ns` holds an i64, so the whole seconds it can carry are
+// -9223372036 to 9223372036 (about the years 1677 to 2262). A date outside
+// that fails with `Range` instead of wrapping to the wrong instant.
+const hdMinSeconds: int = -9223372036
+const hdMaxSeconds: int = 9223372036
+
+// "Sun, 06 Nov 1994 08:49:37" is 25 bytes before its " GMT"; the RFC 850
+// body after "<day>, " is "06-Nov-94 08:49:37", 18 bytes; asctime is
+// "Sun Nov  6 08:49:37 1994", 24 bytes.
+const hdImfLen: int = 25
+const hdRfc850Len: int = 18
+const hdAsctimeLen: int = 24
+
+// Which of the four things went wrong: `Syntax`, `Range`, `Zone` or
+// `Weekday`.
+export enum HttpDateCause {
+  // The input is none of the three HTTP-date shapes.
+  Syntax,
+  // A field no calendar has, or an instant `Timestamp` cannot hold.
+  Range,
+  // A zone other than `GMT`.
+  Zone,
+  // The day name does not match the date.
+  Weekday,
+}
+
+// The error every `parseHttpDate` failure produces. `input` is the text
+// that was refused, whole.
+export class HttpDateError {
+  export cause: HttpDateCause
+  export input: string
+
+  // Satisfies the predeclared `error` interface (SPEC §10.6, §18.3) with one
+  // sentence per cause. The input is not quoted: it is caller-controlled and
+  // unbounded, and the caller holds it already as `input`.
+  export message(): string {
+    match (this.cause) {
+      Syntax => return "httpdate: not an IMF-fixdate, RFC 850 or asctime timestamp"
+      Range => return "httpdate: a field is out of range, or the instant is outside the Timestamp range"
+      Zone => return "httpdate: the zone must be GMT"
+      Weekday => return "httpdate: the day name does not match the date"
+    }
+  }
+}
+
+// A date read off the input, before any range check. `wd` is the day name's
+// index in `ldmlDayNames` (0 is Monday), and `y` is still two digits for an
+// RFC 850 date.
+class HdFields {
+  y: int,
+  mo: int,
+  d: int,
+  h: int,
+  mi: int,
+  s: int,
+  wd: int,
+}
+
+fn hdErr(cause: HttpDateCause, input: string): HttpDateError {
+  return HttpDateError{ cause = cause, input = input }
+}
+
+// Exactly `n` decimal digits at `s[at]`, as a nonnegative int, or -1 on a
+// short input or the first non-digit: there is no sign and no space.
+fn hdDigits(s: string, at: int, n: int): int {
+  if (at < 0 || at + n > len(s)) {
+    return -1
+  }
+  let v = 0
+  let i = 0
+  while (i < n) {
+    let c = s[at + i]
+    if (c < '0' || c > '9') {
+      return -1
+    }
+    v = v * 10 + i64(c - '0')
+    i = i + 1
+  }
+  return v
+}
+
+// The index in `names` of the entry `s` carries at `at`, written in full
+// when `abbrev` is false and as its first three letters when true; -1 when
+// none matches. Names are case sensitive.
+fn hdName(s: string, at: int, names: []string, abbrev: bool): int {
+  let i = 0
+  while (i < len(names)) {
+    let want = names[i]
+    if (abbrev) {
+      want = want[0:3]
+    }
+    if (ldmlpHasAt(s, at, want)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether `s` at `at` carries `mask`'s punctuation: every byte of `mask`
+// other than `_` must match exactly, and each `_` stands for any byte (the
+// field parsers below then accept only digits or names there). The three
+// shapes are written once each, as a mask, so a separator cannot be
+// forgotten in one of them.
+fn hdMask(s: string, at: int, mask: string): bool {
+  if (at < 0 || at + len(mask) > len(s)) {
+    return false
+  }
+  let i = 0
+  while (i < len(mask)) {
+    if (mask[i] != '_' && s[at + i] != mask[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The `HH:MM:SS` digits at `s[at]` into `f`. The colons are the mask's;
+// the values are range-checked by `hdBuild`.
+fn hdClock(s: string, at: int, f: HdFields) {
+  f.h = hdDigits(s, at, 2)
+  f.mi = hdDigits(s, at + 3, 2)
+  f.s = hdDigits(s, at + 6, 2)
+}
+
+// False when any field a parser read is -1 (a non-digit, or a name not in
+// its table).
+fn hdRead(f: HdFields): bool {
+  return f.y >= 0 && f.mo >= 0 && f.d >= 0 && f.h >= 0 && f.mi >= 0 && f.s >= 0 && f.wd >= 0
+}
+
+fn hdEmpty(): HdFields {
+  return HdFields{ y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0, wd = 0 }
+}
+
+// The error for a tail that is not " GMT": `Zone` for one other space-led
+// token (" UTC", " +0000", " PST"), `Syntax` for anything else, including
+// nothing. The prefix has already matched, so a zone is the only thing a
+// well-shaped date can be wrong about here.
+fn hdTailErr(s: string, at: int): HttpDateError {
+  let tail = s[at:]
+  if (len(tail) < 2 || tail[0] != ' ') {
+    return hdErr(HttpDateCause.Syntax, s)
+  }
+  // A zone is one run of visible ASCII; a space, a control byte (a stray
+  // CRLF) or a non-ASCII byte is not a zone name.
+  let i = 1
+  while (i < len(tail)) {
+    if (tail[i] <= ' ' || tail[i] > '~') {
+      return hdErr(HttpDateCause.Syntax, s)
+    }
+    i = i + 1
+  }
+  return hdErr(HttpDateCause.Zone, s)
+}
+
+// `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn hdParseImf(s: string): HdFields! {
+  if (!hdMask(s, 0, "___, __ ___ ____ __:__:__")) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  let f = hdEmpty()
+  f.wd = hdName(s, 0, ldmlDayNames(), true)
+  f.d = hdDigits(s, 5, 2)
+  f.mo = hdName(s, 8, ldmlMonthNames(), true)
+  f.y = hdDigits(s, 12, 4)
+  hdClock(s, 17, f)
+  if (!hdRead(f)) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  if (s[hdImfLen:] != " GMT") {
+    fail hdTailErr(s, hdImfLen)
+  }
+  return f
+}
+
+// `Sunday, 06-Nov-94 08:49:37 GMT`. The day name is written in full, so
+// the body starts after it. `f.y` is left as the two digits read; the
+// caller resolves the century (`hdYear850`).
+fn hdParse850(s: string): HdFields! {
+  let f = hdEmpty()
+  f.wd = hdName(s, 0, ldmlDayNames(), false)
+  if (f.wd < 0) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  let p = len(ldmlDayNames()[f.wd])
+  if (!ldmlpSep(s, p, ',') || !hdMask(s, p + 1, " __-___-__ __:__:__")) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  let b = p + 2
+  f.d = hdDigits(s, b, 2)
+  f.mo = hdName(s, b + 3, ldmlMonthNames(), true)
+  f.y = hdDigits(s, b + 7, 2)
+  hdClock(s, b + 10, f)
+  if (!hdRead(f)) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  if (s[b + hdRfc850Len:] != " GMT") {
+    fail hdTailErr(s, b + hdRfc850Len)
+  }
+  return f
+}
+
+// `Sun Nov  6 08:49:37 1994`. The day is two characters, a space standing in
+// for a missing tens digit. The form has no zone, so any suffix is a
+// syntax error.
+fn hdParseAsctime(s: string): HdFields! {
+  if (len(s) != hdAsctimeLen || !hdMask(s, 0, "___ ___ __ __:__:__ ____")) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  let f = hdEmpty()
+  f.wd = hdName(s, 0, ldmlDayNames(), true)
+  f.mo = hdName(s, 4, ldmlMonthNames(), true)
+  f.d = hdDigits(s, 8, 2)
+  if (s[8] == ' ') {
+    f.d = hdDigits(s, 9, 1)
+  }
+  hdClock(s, 11, f)
+  f.y = hdDigits(s, 20, 4)
+  if (!hdRead(f)) {
+    fail hdErr(HttpDateCause.Syntax, s)
+  }
+  return f
+}
+
+// A number that sorts calendar tuples (year, month, day, second of day) the
+// way the tuples sort. Used only to compare, never converted back, so the
+// day of month never needs to be valid in it and a February 29 cannot
+// overflow into March.
+fn hdKey(y: int, mo: int, d: int, secOfDay: int): int {
+  return ((y * 13 + mo) * 32 + d) * 86400 + secOfDay
+}
+
+// RFC 9110 5.6.7: an RFC 850 timestamp "that appears to be more than 50
+// years in the future" is "the most recent year in the past that had the
+// same last two digits". Read it in the reference's own century; when that
+// lands past the reference plus 50 years, it is the century before.
+fn hdYear850(f: HdFields, reference: Timestamp) {
+  let c = civilFromSeconds(civilFloorDiv(reference.ns, civilSecondNs), 0)
+  let limit = hdKey(c.year + 50, c.month, c.day, c.hour * 3600 + c.minute * 60 + c.second)
+  let y = c.year / 100 * 100 + f.y
+  if (hdKey(y, f.mo + 1, f.d, f.h * 3600 + f.mi * 60 + f.s) > limit) {
+    y = y - 100
+  }
+  f.y = y
+}
+
+// The instant `f` names, or the first thing wrong with it. Range is judged
+// before the weekday, so `Mon, 32 Nov` is a bad day, not a bad weekday.
+fn hdBuild(s: string, f: HdFields): Timestamp! {
+  let mo = f.mo + 1
+  if (f.y < 1 || f.d < 1 || f.h > 23 || f.mi > 59 || f.s > 59) {
+    fail hdErr(HttpDateCause.Range, s)
+  }
+  if (f.d > civilDaysInMonth(f.y, mo)) {
+    fail hdErr(HttpDateCause.Range, s)
+  }
+  let days = civilDaysFromCivil(f.y, mo, f.d)
+  // `wd` counts from Monday, `civilWeekday` from Sunday.
+  if (civilWeekday(days) != (f.wd + 1) % 7) {
+    fail hdErr(HttpDateCause.Weekday, s)
+  }
+  let secs = days * 86400 + f.h * 3600 + f.mi * 60 + f.s
+  if (secs < hdMinSeconds || secs > hdMaxSeconds) {
+    fail hdErr(HttpDateCause.Range, s)
+  }
+  return Timestamp{ ns = secs * civilSecondNs }
+}
+
+// The index of the first `,` in `s`, or -1. Its position tells the three
+// forms apart: after a three-letter day name (IMF-fixdate), after a full
+// one (RFC 850), or absent (asctime).
+fn hdComma(s: string): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == ',') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// `t` as an IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`, the only form
+// RFC 9110 lets a sender write. A fraction of a second is dropped, toward
+// the past, so `.999999999` past a second still prints that second.
+export fn formatHttpDate(t: Timestamp): string {
+  let c = civilFromSeconds(civilFloorDiv(t.ns, civilSecondNs), 0)
+  let wd = ldmlDayNames()[(c.weekday + 6) % 7][0:3]
+  let mon = ldmlMonthNames()[c.month - 1][0:3]
+  return "${wd}, ${fmtPad(c.day, 2)} ${mon} ${fmtPad(c.year, 4)} " +
+    "${fmtPad(c.hour, 2)}:${fmtPad(c.minute, 2)}:${fmtPad(c.second, 2)} GMT"
+}
+
+// The instant `s` names, read as an IMF-fixdate, an RFC 850 date or an
+// asctime date. Fails with an `HttpDateError`, whose `cause` is `Syntax`,
+// `Range`, `Zone` or `Weekday`, on anything else.
+//
+// `reference` is only read for an RFC 850 date, to place its two-digit year
+// by the 50-year rule; it defaults to `now()`, evaluated at the call.
+export fn parseHttpDate(s: string, reference: Timestamp = now()): Timestamp! {
+  let comma = hdComma(s)
+  if (comma == 3) {
+    return hdBuild(s, hdParseImf(s)?)?
+  }
+  if (comma > 3) {
+    let f = hdParse850(s)?
+    hdYear850(f, reference)
+    return hdBuild(s, f)?
+  }
+  return hdBuild(s, hdParseAsctime(s)?)?
+}
+
