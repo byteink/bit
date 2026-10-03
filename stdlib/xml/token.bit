@@ -1,0 +1,700 @@
+// Bit standard library — xml module, a pull tokenizer for XML 1.0 documents.
+//
+// `Tokenizer(src)` reads a whole document held in memory and hands back one
+// `Token` per `next()`: a start, empty or end tag, a run of text, a CDATA
+// section, and finally `Eof`. Comments and processing instructions are read and
+// dropped. The five predefined entities and decimal and hex character
+// references are decoded, so a `Text` or an attribute value holds characters,
+// never `&...;`.
+//
+// SAFE AGAINST A HOSTILE DOCUMENT BY CONSTRUCTION, not by a list of checks:
+//
+//   - There is no DTD machinery to attack. `<!DOCTYPE` is refused the moment it
+//     is seen, so an external entity (XXE) and an entity defined in terms of
+//     other entities (billion laughs) are not features this tokenizer has
+//     switched off — it has no code to define one. The five predefined entities
+//     each decode to one character, so output is never longer than input.
+//   - Nothing is skipped or repaired. Any malformed byte is an `XmlError`, and
+//     once one has been returned every later `next()` returns that same error:
+//     a caller that ignores a failure and keeps pulling cannot read a partial
+//     document as a whole one.
+//   - Element nesting, attributes per element and total input are bounded
+//     (`Tokenizer`'s options), and every loop below advances the read position
+//     or ends, so a document costs time and memory linear in its length.
+//
+// Line ends follow XML 1.0 §2.11: a literal CR LF or lone CR reads as LF; only
+// the character reference `&#13;` yields a CR. Attribute values follow §3.3.3:
+// a literal tab, CR or LF reads as one space; `&#10;` stays a line feed.
+//
+// Namespaces are not interpreted here: `a:b` is the name `a:b`.
+
+import { toLower } from "std/strings"
+
+// One `name="value"` pair, the value already decoded and normalised.
+export class Attr {
+  export name: string,
+  export value: string,
+}
+
+// What a start or empty tag carries: the element name and its attributes in
+// document order, with no duplicate names.
+export class Tag {
+  export name: string,
+  export attrs: []Attr,
+}
+
+// One unit of a document, in the order it appears in. `Start` and `End` bracket
+// an element's content; `Empty` is `<a/>` on its own, with no `End` after it.
+// `Text` is decoded character data (it may be only white space between
+// elements; the tokenizer never decides that is insignificant). `CData` is the
+// text of a `<![CDATA[...]]>` section, undecoded since it has no markup. `Eof`
+// is returned once the root element has closed and the input is spent, and on
+// every call after that.
+export enum Token {
+  Start(Tag),
+  Empty(Tag),
+  End(string),
+  Text(string),
+  CData(string),
+  Eof,
+}
+
+// Reads one document. A class, so a reference type (§13.3): `next()` advances
+// it in place.
+export class Tokenizer {
+  src: []byte
+  pos: int
+  stack: []string
+  buf: []byte
+  maxDepth: int
+  maxAttrs: int
+  started: bool
+  rootDone: bool
+  failure: Option<XmlError>
+
+  // `src` is the document. `maxDepth` bounds how deeply elements nest,
+  // `maxAttrs` the attributes on one element, `maxInput` the bytes of `src`.
+  // Fails with `BadLimit` for a limit below 1 and with `TooLarge` for an input
+  // over `maxInput`, before any scanning.
+  init(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput: int = 67108864)! {
+    this.src = src
+    this.pos = 0
+    this.stack = []string(0)
+    this.buf = []byte(0)
+    this.maxDepth = maxDepth
+    this.maxAttrs = maxAttrs
+    this.started = false
+    this.rootDone = false
+    this.failure = Option<XmlError>.None
+    if (maxDepth < 1 || maxAttrs < 1 || maxInput < 1) {
+      fail this.bad(XmlErrorKind.BadLimit, 0, "a limit must be at least 1")
+    }
+    if (len(src) > maxInput) {
+      fail this.bad(
+        XmlErrorKind.TooLarge,
+        maxInput,
+        "input is ${len(src)} bytes, the limit is ${maxInput}",
+      )
+    }
+  }
+
+  // The next token, or the `XmlError` that ended the document.
+  export next(): Token! {
+    match (this.failure) {
+      Some(e) => fail e
+      None => return this.advance()?
+    }
+  }
+
+  // Records `kind` at `offset`, explained by `reason`, as the document's
+  // failure and returns it. The one place an `XmlError` is built, so no failure
+  // can skip being remembered.
+  bad(kind: XmlErrorKind, offset: int, reason: string): XmlError {
+    let (line, column) = xmlLocate(this.src, offset)
+    let e = XmlError{ kind = kind, offset = offset, line = line, column = column, reason = reason }
+    this.failure = Option<XmlError>.Some(e)
+    return e
+  }
+
+  // The byte at `i`, or 0 past the end. A real NUL byte never reaches a caller
+  // that treats 0 as the end: it is outside the Char production and refused
+  // wherever bytes are consumed.
+  at(i: int): byte {
+    if (i < 0 || i >= len(this.src)) {
+      return 0
+    }
+    return this.src[i]
+  }
+
+  // Whether the input at `i` begins with `lit`.
+  hasAt(i: int, lit: string): bool {
+    if (i + len(lit) > len(this.src)) {
+      return false
+    }
+    let k = 0
+    while (k < len(lit)) {
+      if (this.src[i + k] != lit[k]) {
+        return false
+      }
+      k = k + 1
+    }
+    return true
+  }
+
+  // Consumes white space; whether there was any.
+  skipWs(): bool {
+    let from = this.pos
+    while (this.pos < len(this.src) && xmlIsWs(this.src[this.pos])) {
+      this.pos = this.pos + 1
+    }
+    return this.pos > from
+  }
+
+  // Consumes the byte `c`, or fails with `kind` (`UnexpectedEof` at the end);
+  // `what` names what was expected, for the message.
+  expect(c: byte, kind: XmlErrorKind, what: string): ()! {
+    if (this.pos >= len(this.src)) {
+      fail this.bad(
+        XmlErrorKind.UnexpectedEof,
+        this.pos,
+        "unexpected end of input, expected ${what}",
+      )
+    }
+    if (this.src[this.pos] != c) {
+      fail this.bad(kind, this.pos, "expected ${what}")
+    }
+    this.pos = this.pos + 1
+  }
+
+  // Consumes a quote character, `"` or `'`, and returns it.
+  quote(kind: XmlErrorKind, what: string): byte! {
+    let q = this.at(this.pos)
+    if (this.pos >= len(this.src)) {
+      fail this.bad(
+        XmlErrorKind.UnexpectedEof,
+        this.pos,
+        "unexpected end of input, expected ${what}",
+      )
+    }
+    if (q != '"' && q != '\'') {
+      fail this.bad(kind, this.pos, "expected ${what}")
+    }
+    this.pos = this.pos + 1
+    return q
+  }
+
+  readName(): string! {
+    let start = this.pos
+    if (start >= len(this.src)) {
+      fail this.bad(XmlErrorKind.UnexpectedEof, start, "unexpected end of input, expected a name")
+    }
+    if (!xmlNameStart(this.src[start])) {
+      fail this.bad(XmlErrorKind.BadName, start, "a name cannot start with this byte")
+    }
+    let i = start + 1
+    while (i < len(this.src) && xmlNameChar(this.src[i])) {
+      i = i + 1
+    }
+    this.pos = i
+    return string(this.src[start:i])
+  }
+
+  advance(): Token! {
+    if (!this.started) {
+      this.started = true
+      this.prolog()?
+    }
+    while (this.pos < len(this.src)) {
+      let b = this.src[this.pos]
+      if (b == '<') {
+        let t = this.markup()?
+        if (isSome(t)) {
+          return unwrap(t)
+        }
+        continue
+      }
+      if (len(this.stack) > 0) {
+        return Token.Text(this.chars('<', false)?)
+      }
+      if (!xmlIsWs(b)) {
+        fail this.bad(XmlErrorKind.Syntax, this.pos, "text outside the root element")
+      }
+      this.pos = this.pos + 1
+    }
+    if (len(this.stack) > 0 || !this.rootDone) {
+      fail this.bad(
+        XmlErrorKind.UnexpectedEof,
+        this.pos,
+        "unexpected end of input before the root element closed",
+      )
+    }
+    return Token.Eof
+  }
+
+  // The construct at `<`. None for one that yields no token (comment, PI).
+  markup(): Option<Token>! {
+    let c = this.at(this.pos + 1)
+    if (c == '/') {
+      return Option<Token>.Some(this.endTag()?)
+    }
+    if (c == '?') {
+      this.pi()?
+      return Option<Token>.None
+    }
+    if (c == '!') {
+      return this.bang()?
+    }
+    return Option<Token>.Some(this.startTag()?)
+  }
+
+  // `<!` ... : a comment, a CDATA section, or the refused DOCTYPE.
+  bang(): Option<Token>! {
+    if (this.hasAt(this.pos, "<!--")) {
+      this.comment()?
+      return Option<Token>.None
+    }
+    if (this.hasAt(this.pos, "<![CDATA[")) {
+      return Option<Token>.Some(this.cdata()?)
+    }
+    if (this.hasAt(this.pos, "<!DOCTYPE")) {
+      fail this.bad(
+        XmlErrorKind.Doctype,
+        this.pos,
+        "DOCTYPE is not accepted (no DTD, no external entities)",
+      )
+    }
+    fail this.bad(XmlErrorKind.Syntax, this.pos, "unknown '<!' construct")
+  }
+
+  startTag(): Token! {
+    let start = this.pos
+    this.pos = start + 1
+    let name = this.readName()?
+    if (len(this.stack) == 0 && this.rootDone) {
+      fail this.bad(XmlErrorKind.Syntax, start, "content after the root element")
+    }
+    if (len(this.stack) >= this.maxDepth) {
+      fail this.bad(
+        XmlErrorKind.TooDeep,
+        start,
+        "elements nest deeper than the limit of ${this.maxDepth}",
+      )
+    }
+    let tag = Tag{ name = name, attrs = this.readAttrs()? }
+    if (this.src[this.pos] == '>') {
+      this.pos = this.pos + 1
+      this.stack = append(this.stack, name)
+      return Token.Start(tag)
+    }
+    this.pos = this.pos + 1
+    this.expect('>', XmlErrorKind.Syntax, "'>' after '/'")?
+    if (len(this.stack) == 0) {
+      this.rootDone = true
+    }
+    return Token.Empty(tag)
+  }
+
+  // Reads attributes up to, not including, the `>` or `/` that ends the tag.
+  readAttrs(): []Attr! {
+    let attrs = []Attr(0)
+    let spaced = this.skipWs()
+    while (this.pos < len(this.src)) {
+      let c = this.src[this.pos]
+      if (c == '>' || c == '/') {
+        return attrs
+      }
+      if (!spaced) {
+        fail this.bad(XmlErrorKind.BadAttribute, this.pos, "no space before the attribute")
+      }
+      if (len(attrs) >= this.maxAttrs) {
+        fail this.bad(
+          XmlErrorKind.TooManyAttributes,
+          this.pos,
+          "more than ${this.maxAttrs} attributes on one element",
+        )
+      }
+      let start = this.pos
+      let a = this.attr()?
+      if (xmlHasAttr(attrs, a.name)) {
+        fail this.bad(XmlErrorKind.DuplicateAttribute, start, "duplicate attribute '${a.name}'")
+      }
+      attrs = append(attrs, a)
+      spaced = this.skipWs()
+    }
+    fail this.bad(XmlErrorKind.UnexpectedEof, this.pos, "unexpected end of input inside a tag")
+  }
+
+  attr(): Attr! {
+    let name = this.readName()?
+    this.skipWs()
+    this.expect('=', XmlErrorKind.BadAttribute, "'=' after the attribute name")?
+    this.skipWs()
+    let q = this.quote(XmlErrorKind.BadAttribute, "a quote around the attribute value")?
+    let value = this.chars(q, true)?
+    this.expect(q, XmlErrorKind.BadAttribute, "the closing quote of the attribute value")?
+    return Attr{ name = name, value = value }
+  }
+
+  endTag(): Token! {
+    let start = this.pos
+    this.pos = start + 2
+    let name = this.readName()?
+    if (len(this.stack) == 0) {
+      fail this.bad(XmlErrorKind.MismatchedTag, start, "end tag </${name}> with no element open")
+    }
+    let open = this.stack[len(this.stack) - 1]
+    if (open != name) {
+      fail this.bad(
+        XmlErrorKind.MismatchedTag,
+        start,
+        "end tag </${name}> does not close <${open}>",
+      )
+    }
+    this.skipWs()
+    this.expect('>', XmlErrorKind.Syntax, "'>' to end the end tag")?
+    this.stack = this.stack[0:len(this.stack) - 1]
+    if (len(this.stack) == 0) {
+      this.rootDone = true
+    }
+    return Token.End(name)
+  }
+
+  // Character data from the read position up to `stop` (left unread) or the end
+  // of input. `attr` selects attribute-value rules: white space normalises to a
+  // space and `<` is an error; in text, `]]>` is the error.
+  chars(stop: byte, attr: bool): string! {
+    this.buf = this.buf[0:0]
+    while (this.pos < len(this.src)) {
+      let from = this.pos
+      let i = from
+      while (i < len(this.src) && xmlPlain(this.src[i], stop, attr)) {
+        i = i + 1
+      }
+      this.buf = append(this.buf, ...this.src[from:i])
+      this.pos = i
+      if (i >= len(this.src) || this.src[i] == stop) {
+        break
+      }
+      this.special(attr)?
+    }
+    return string(this.buf)
+  }
+
+  // One byte `chars` cannot copy as it is.
+  special(attr: bool): ()! {
+    let b = this.src[this.pos]
+    if (b == '&') {
+      this.reference()?
+      return
+    }
+    if (b == '<') {
+      fail this.bad(XmlErrorKind.BadAttribute, this.pos, "'<' in an attribute value")
+    }
+    if (b == ']') {
+      if (!attr && this.hasAt(this.pos, "]]>")) {
+        fail this.bad(XmlErrorKind.Syntax, this.pos, "']]>' in text")
+      }
+      this.buf = append(this.buf, b)
+      this.pos = this.pos + 1
+      return
+    }
+    if (b == '\r' || b == '\n' || b == '\t') {
+      this.lineEnd(b, attr)
+      return
+    }
+    fail this.bad(XmlErrorKind.BadChar, this.pos, "byte ${int(b)} is not allowed in XML")
+  }
+
+  // XML 1.0 §2.11 and §3.3.3 for the white-space byte `b` at the read position.
+  lineEnd(b: byte, attr: bool) {
+    let out = b
+    if (attr) {
+      out = ' '
+    } else if (b == '\r') {
+      out = '\n'
+    }
+    this.pos = this.pos + 1
+    if (b == '\r' && this.at(this.pos) == '\n') {
+      this.pos = this.pos + 1
+    }
+    this.buf = append(this.buf, out)
+  }
+
+  // `&...;` at the read position, decoded into `buf`.
+  reference(): ()! {
+    let start = this.pos
+    this.pos = start + 1
+    let r = 0
+    if (this.at(this.pos) == '#') {
+      this.pos = this.pos + 1
+      r = this.numericRef(start)?
+    } else {
+      r = this.namedRef(start)?
+    }
+    this.putRune(r)
+  }
+
+  // Appends code point `r`, a legal XML character, to `buf` as UTF-8.
+  putRune(r: int) {
+    if (r < 0x80) {
+      this.buf = append(this.buf, byte(r))
+      return
+    }
+    if (r < 0x800) {
+      this.buf = append(this.buf, byte(0xC0 | (r >> 6)))
+    } else if (r < 0x10000) {
+      this.buf = append(this.buf, byte(0xE0 | (r >> 12)))
+      this.buf = append(this.buf, byte(0x80 | ((r >> 6) & 0x3F)))
+    } else {
+      this.buf = append(this.buf, byte(0xF0 | (r >> 18)))
+      this.buf = append(this.buf, byte(0x80 | ((r >> 12) & 0x3F)))
+      this.buf = append(this.buf, byte(0x80 | ((r >> 6) & 0x3F)))
+    }
+    this.buf = append(this.buf, byte(0x80 | (r & 0x3F)))
+  }
+
+  // The code point of `&#N;` or `&#xH;`, read position just past `#`.
+  numericRef(start: int): int! {
+    let base = 10
+    if (this.at(this.pos) == 'x') {
+      base = 16
+      this.pos = this.pos + 1
+    }
+    let v = 0
+    let digits = 0
+    while (this.pos < len(this.src)) {
+      let d = xmlDigit(this.src[this.pos], base)
+      if (d < 0) {
+        break
+      }
+      v = v * base + d
+      if (v > 0x10FFFF) {
+        fail this.bad(XmlErrorKind.BadReference, start, "character reference out of range")
+      }
+      digits = digits + 1
+      this.pos = this.pos + 1
+    }
+    if (digits == 0 || this.at(this.pos) != ';' || !xmlLegalRune(v)) {
+      fail this.bad(XmlErrorKind.BadReference, start, "not a legal character reference")
+    }
+    this.pos = this.pos + 1
+    return v
+  }
+
+  // The code point of `&lt;`, `&gt;`, `&amp;`, `&quot;` or `&apos;`, read
+  // position just past `&`. Any other name is an error: no DTD declares one.
+  namedRef(start: int): int! {
+    let from = this.pos
+    let i = from
+    while (i < len(this.src) && i - from < 5 && xmlNameChar(this.src[i])) {
+      i = i + 1
+    }
+    let r = -1
+    if (this.at(i) == ';') {
+      r = xmlPredefined(string(this.src[from:i]))
+    }
+    if (r < 0) {
+      fail this.bad(
+        XmlErrorKind.BadReference,
+        start,
+        "unknown entity, only lt, gt, amp, quot and apos are defined",
+      )
+    }
+    this.pos = i + 1
+    return r
+  }
+
+  cdata(): Token! {
+    let start = this.pos
+    if (len(this.stack) == 0) {
+      fail this.bad(XmlErrorKind.Syntax, start, "CDATA outside the root element")
+    }
+    this.pos = start + 9
+    this.buf = this.buf[0:0]
+    while (this.pos < len(this.src)) {
+      let from = this.pos
+      let i = from
+      while (i < len(this.src) && xmlPlainCData(this.src[i])) {
+        i = i + 1
+      }
+      this.buf = append(this.buf, ...this.src[from:i])
+      this.pos = i
+      if (i >= len(this.src)) {
+        break
+      }
+      let closed = this.cdataStep()?
+      if (closed) {
+        return Token.CData(string(this.buf))
+      }
+    }
+    fail this.bad(XmlErrorKind.UnexpectedEof, start, "unterminated CDATA section")
+  }
+
+  // One non-plain byte inside CDATA; whether it was the closing `]]>`.
+  cdataStep(): bool! {
+    let b = this.src[this.pos]
+    if (b == ']' && this.hasAt(this.pos, "]]>")) {
+      this.pos = this.pos + 3
+      return true
+    }
+    if (b == ']') {
+      this.buf = append(this.buf, b)
+      this.pos = this.pos + 1
+      return false
+    }
+    if (b == '\r') {
+      this.lineEnd(b, false)
+      return false
+    }
+    fail this.bad(XmlErrorKind.BadChar, this.pos, "byte ${int(b)} is not allowed in XML")
+  }
+
+  comment(): ()! {
+    let start = this.pos
+    let i = start + 4
+    while (i < len(this.src)) {
+      let b = this.src[i]
+      if (b == '-' && this.at(i + 1) == '-') {
+        if (this.at(i + 2) != '>') {
+          fail this.bad(XmlErrorKind.BadComment, i, "'--' is not allowed inside a comment")
+        }
+        this.pos = i + 3
+        return
+      }
+      if (!xmlLegalByte(b)) {
+        fail this.bad(XmlErrorKind.BadChar, i, "byte ${int(b)} is not allowed in XML")
+      }
+      i = i + 1
+    }
+    fail this.bad(XmlErrorKind.UnexpectedEof, start, "unterminated comment")
+  }
+
+  // A processing instruction, dropped. The target `xml` in any case is reserved
+  // (XML 1.0 §2.6); the one XML declaration is consumed by `prolog`.
+  pi(): ()! {
+    let start = this.pos
+    this.pos = start + 2
+    let target = this.readName()?
+    if (len(target) == 3 && toLower(target) == "xml") {
+      fail this.bad(XmlErrorKind.Syntax, start, "the XML declaration must open the document")
+    }
+    if (this.hasAt(this.pos, "?>")) {
+      this.pos = this.pos + 2
+      return
+    }
+    if (this.pos >= len(this.src)) {
+      fail this.bad(XmlErrorKind.UnexpectedEof, start, "unterminated processing instruction")
+    }
+    if (!this.skipWs()) {
+      fail this.bad(XmlErrorKind.Syntax, this.pos, "malformed processing instruction")
+    }
+    let i = this.pos
+    while (i < len(this.src)) {
+      if (this.src[i] == '?' && this.at(i + 1) == '>') {
+        this.pos = i + 2
+        return
+      }
+      if (!xmlLegalByte(this.src[i])) {
+        fail this.bad(XmlErrorKind.BadChar, i, "byte ${int(this.src[i])} is not allowed in XML")
+      }
+      i = i + 1
+    }
+    fail this.bad(XmlErrorKind.UnexpectedEof, start, "unterminated processing instruction")
+  }
+
+  // The byte-order mark and XML declaration, only at the very start.
+  prolog(): ()! {
+    if (this.hasAt(0, "\xEF\xBB\xBF")) {
+      this.pos = 3
+    }
+    if (this.hasAt(0, "\xFE\xFF") || this.hasAt(0, "\xFF\xFE")) {
+      fail this.bad(
+        XmlErrorKind.Unsupported,
+        0,
+        "UTF-16 is not supported, the document must be UTF-8",
+      )
+    }
+    if (this.hasAt(this.pos, "<?xml") && xmlIsWs(this.at(this.pos + 5))) {
+      this.decl()?
+    }
+  }
+
+  // `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`, with the last
+  // two optional. Only a document these bytes already are is accepted: version
+  // 1.0, UTF-8 or US-ASCII.
+  decl(): ()! {
+    let start = this.pos
+    this.pos = start + 5
+    if (this.pseudo("version")? != "1.0") {
+      fail this.bad(XmlErrorKind.Unsupported, start, "only XML version 1.0 is supported")
+    }
+    if (this.wordAhead("encoding")) {
+      let enc = toLower(this.pseudo("encoding")?)
+      if (enc != "utf-8" && enc != "us-ascii") {
+        fail this.bad(
+          XmlErrorKind.Unsupported,
+          start,
+          "encoding ${enc} is not supported, the document must be UTF-8 or US-ASCII",
+        )
+      }
+    }
+    if (this.wordAhead("standalone")) {
+      let sa = this.pseudo("standalone")?
+      if (sa != "yes" && sa != "no") {
+        fail this.bad(XmlErrorKind.Syntax, start, "standalone must be yes or no")
+      }
+    }
+    this.skipWs()
+    if (!this.hasAt(this.pos, "?>")) {
+      fail this.bad(XmlErrorKind.Syntax, this.pos, "malformed XML declaration")
+    }
+    this.pos = this.pos + 2
+  }
+
+  // Whether `word` follows, after white space.
+  wordAhead(word: string): bool {
+    let i = this.pos
+    while (i < len(this.src) && xmlIsWs(this.src[i])) {
+      i = i + 1
+    }
+    return this.hasAt(i, word)
+  }
+
+  // ` name = "value"` inside the XML declaration; the value.
+  pseudo(name: string): string! {
+    if (!this.skipWs() || !this.hasAt(this.pos, name)) {
+      fail this.bad(XmlErrorKind.Syntax, this.pos, "malformed XML declaration")
+    }
+    this.pos = this.pos + len(name)
+    this.skipWs()
+    this.expect('=', XmlErrorKind.Syntax, "'=' in the XML declaration")?
+    this.skipWs()
+    let q = this.quote(XmlErrorKind.Syntax, "a quote in the XML declaration")?
+    let from = this.pos
+    let i = from
+    while (i < len(this.src) && this.src[i] != q) {
+      i = i + 1
+    }
+    if (i >= len(this.src)) {
+      fail this.bad(
+        XmlErrorKind.UnexpectedEof,
+        from,
+        "unexpected end of input inside the XML declaration",
+      )
+    }
+    this.pos = i + 1
+    return string(this.src[from:i])
+  }
+}
+
+// Whether `attrs` already has an attribute named `name`.
+fn xmlHasAttr(attrs: []Attr, name: string): bool {
+  let i = 0
+  while (i < len(attrs)) {
+    if (attrs[i].name == name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
