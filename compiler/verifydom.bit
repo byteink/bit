@@ -1,0 +1,246 @@
+// compiler/verifydom.bit — the IR's SSA dominance invariant, checked (#6719).
+//
+// THE RULE. Every operand's defining block dominates the block that reads it,
+// and inside one block the definition comes first. A block parameter is defined
+// at its block's start. An edge argument is an operand of the terminator that
+// carries it, so "the argument dominates the end of the predecessor" is this
+// same rule applied to that terminator; there is no separate phi check.
+//
+// Why it is here: `stripMine` (optstripemit.bit) once left a post-loop block
+// reading the inner header's copy of a constant. That header does not dominate
+// the block, so on the path that skips it the value was never defined, and
+// register allocation (whose intervals are linear) handed its register to
+// something else. The program ran, exit 0, and passed `npoly = 1280` for 5.
+// `verifyIrFunc` (verify.bit) only knows loops, so nothing refused the IR.
+//
+// Dominators by Cooper, Harvey and Kennedy, "A Simple, Fast Dominance
+// Algorithm": iterate idom over reverse postorder until nothing moves. The
+// dominance QUERY is O(1): the dominator tree is numbered in preorder with
+// subtree sizes, so D dominates B iff pos[D] <= pos[B] < pos[D] + size[D].
+// Unreachable blocks are skipped as readers; reading from one is reported.
+//
+// Every loop is bounded by the block or instruction count, fixed before this
+// runs; the idom fixpoint only ever moves a node to a smaller reverse-postorder
+// number, so it stops after at most blocks * blocks moves and in practice two
+// or three passes.
+
+class DomTree {
+  rpo: []int,   // block -> reverse postorder number, -1 when unreachable
+  order: []int, // reverse postorder number -> block
+  idom: []int,  // block -> immediate dominator block, -1 when unreachable
+  pos: []int,   // block -> preorder number in the dominator tree
+  size: []int,  // block -> size of its dominator subtree
+}
+
+// Block ids reachable from the entry, in postorder. Iterative DFS with an
+// explicit stack and a per-block cursor into the (at most two) successors.
+fn domPostorder(f: IrFunc): []int {
+  let n = len(f.blocks)
+  let seen = []bool(n)
+  let cursor = []int(n)
+  let post = []int(0)
+  let stack = [0]
+  seen[0] = true
+  while (len(stack) > 0) {
+    let b = stack[len(stack) - 1]
+    let succ = domSuccs(f, b)
+    if (cursor[b] < len(succ)) {
+      let t = succ[cursor[b]]
+      cursor[b] = cursor[b] + 1
+      if (t >= 0 && t < n && !seen[t]) {
+        seen[t] = true
+        stack = append(stack, t)
+      }
+      continue
+    }
+    post = append(post, b)
+    stack = stack[0:len(stack) - 1]
+  }
+  return post
+}
+
+fn domSuccs(f: IrFunc, b: int): []int {
+  let blk = f.blocks[b]
+  if (blk.instsLen == 0) {
+    return []int(0)
+  }
+  return terminatorTargets(f, blk.instsStart + blk.instsLen - 1)
+}
+
+// The CHK `intersect`: walk both fingers up the current tree to their meeting
+// block. `idom[x]` always has a smaller reverse postorder number than `x`.
+fn domIntersect(t: DomTree, a0: int, b0: int): int {
+  let a = a0
+  let b = b0
+  while (a != b) {
+    while (t.rpo[a] > t.rpo[b]) {
+      a = t.idom[a]
+    }
+    while (t.rpo[b] > t.rpo[a]) {
+      b = t.idom[b]
+    }
+  }
+  return a
+}
+
+// One sweep in reverse postorder: every block's idom becomes the intersection
+// of its already-processed predecessors. True when anything moved.
+fn domSweep(t: DomTree, preds: [][]int): bool {
+  let moved = false
+  let i = 1
+  while (i < len(t.order)) {
+    let b = t.order[i]
+    let cur = -1
+    for p of preds[b] {
+      if (t.rpo[p] < 0 || t.idom[p] < 0) {
+        continue
+      }
+      if (cur < 0) {
+        cur = p
+      } else {
+        cur = domIntersect(t, cur, p)
+      }
+    }
+    if (cur != t.idom[b]) {
+      t.idom[b] = cur
+      moved = true
+    }
+    i = i + 1
+  }
+  return moved
+}
+
+// Predecessor lists over reachable blocks only.
+fn domPreds(f: IrFunc, t: DomTree): [][]int {
+  let preds = [][]int(0)
+  let k = 0
+  while (k < len(f.blocks)) {
+    preds = append(preds, []int(0))
+    k = k + 1
+  }
+  for b of t.order {
+    for s of domSuccs(f, b) {
+      if (s >= 0 && s < len(f.blocks)) {
+        preds[s] = append(preds[s], b)
+      }
+    }
+  }
+  return preds
+}
+
+// Preorder numbers and subtree sizes of the dominator tree, from the idom
+// array alone: sizes accumulate in reverse RPO (a child is after its parent),
+// then each child takes the next free slot after its parent in RPO order.
+fn domNumber(t: DomTree) {
+  let n = len(t.idom)
+  let next = []int(n)
+  let i = len(t.order) - 1
+  while (i >= 0) {
+    let b = t.order[i]
+    t.size[b] = t.size[b] + 1
+    if (i > 0) {
+      t.size[t.idom[b]] = t.size[t.idom[b]] + t.size[b]
+    }
+    i = i - 1
+  }
+  i = 0
+  while (i < len(t.order)) {
+    let b = t.order[i]
+    if (i > 0) {
+      let p = t.idom[b]
+      t.pos[b] = next[p]
+      next[p] = next[p] + t.size[b]
+    }
+    next[b] = t.pos[b] + 1
+    i = i + 1
+  }
+}
+
+fn buildDomTree(f: IrFunc): DomTree {
+  let n = len(f.blocks)
+  let t = DomTree{
+    rpo = []int(n), order = []int(0), idom = []int(n), pos = []int(n), size = []int(n),
+  }
+  let post = domPostorder(f)
+  let b = 0
+  while (b < n) {
+    t.rpo[b] = -1
+    t.idom[b] = -1
+    b = b + 1
+  }
+  let i = len(post) - 1
+  while (i >= 0) {
+    t.rpo[post[i]] = len(t.order)
+    t.order = append(t.order, post[i])
+    i = i - 1
+  }
+  t.idom[0] = 0
+  let preds = domPreds(f, t)
+  while (domSweep(t, preds)) {}
+  domNumber(t)
+  return t
+}
+
+fn domDominates(t: DomTree, d: int, b: int): bool {
+  return t.pos[d] <= t.pos[b] && t.pos[b] < t.pos[d] + t.size[d]
+}
+
+// Block id owning each instruction slot, -1 for a slot in no block.
+fn domBlockOf(f: IrFunc): []int {
+  let owner = []int(len(f.instrs))
+  let i = 0
+  while (i < len(owner)) {
+    owner[i] = -1
+    i = i + 1
+  }
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    let k = blk.instsStart
+    while (k < blk.instsStart + blk.instsLen) {
+      owner[k] = b
+      k = k + 1
+    }
+    b = b + 1
+  }
+  return owner
+}
+
+// True when the value defined at slot `v` may be read by slot `i`.
+fn domReadable(t: DomTree, owner: []int, v: int, i: int): bool {
+  let db = owner[v]
+  let ub = owner[i]
+  if (db == ub) {
+    return v < i
+  }
+  return t.rpo[db] >= 0 && domDominates(t, db, ub)
+}
+
+// Every operand read in `f` whose definition does not dominate the read.
+// Empty is the expected result for every function this compiler emits.
+fn domEscapesInFunc(f: IrFunc): []string {
+  let out = []string(0)
+  if (len(f.blocks) == 0) {
+    return out
+  }
+  let t = buildDomTree(f)
+  let owner = domBlockOf(f)
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (owner[i] < 0 || t.rpo[owner[i]] < 0) {
+      i = i + 1
+      continue
+    }
+    for v of instrOperands(f, i) {
+      if (v < 0 || v >= len(f.instrs) || owner[v] < 0 || domReadable(t, owner, v, i)) {
+        continue
+      }
+      out = append(
+        out,
+        "${f.name}: %${i} (${opName(f.instrs[i].op)}) in bb${owner[i]} reads %${v}, defined in bb${owner[v]}, which does not dominate it",
+      )
+    }
+    i = i + 1
+  }
+  return out
+}
