@@ -4116,8 +4116,8 @@ return_stmt   = "return" [ expression { "," expression } ] .
 fail_stmt     = "fail" expression .
 break_stmt    = "break" .
 continue_stmt = "continue" .
-spawn_stmt    = "spawn" postfix .                (* postfix must be a call *)
-defer_stmt    = "defer" postfix .                (* postfix must be a call *)
+spawn_stmt    = "spawn" ( postfix | block ) .    (* postfix must be a call; a block is a closure called at once *)
+defer_stmt    = "defer" ( postfix | block ) .    (* postfix must be a call; a block is a closure called at once *)
 ```
 
 - Multi-assignment `a, b = b, a` evaluates all right-hand sides before assigning
@@ -5110,21 +5110,32 @@ nothing; there is no thread handle in v0.1 (coordinate via channels).
 The number of OS worker threads is chosen by the runtime at startup and is fixed
 thereafter (no unbounded thread creation, per the resource-predictability rule).
 
+`spawn` also takes a **block**, `spawn { stmts }`, which is `spawn (() => { stmts })()`:
+a closure with no parameters (§12.8), called at once on the new thread. The same
+holds for any call whose callee is a function value, such as
+`spawn ((a, b) => { ... })(x, y)`: the callee value and the arguments are
+evaluated on the spawning thread, and only the call runs on the new one. The
+block captures the enclosing function's variables as every arrow function does
+(§12.8): they are shared, not copied, so §13.7 governs what the block may touch
+while the spawner runs on. A `return` in the block leaves the block, a value it
+returns is discarded, and `break`, `continue` and `?` have nothing to refer to
+outside it. A `defer` inside the block runs when the block ends.
+
 A spawned thread has no caller to receive an error, so `spawn` of a call whose
 result is fallible (`T!E`, §18.2) is a compile error, E0190, the same as a bare
-call statement (§13.1, §18.3): the error would be lost with no trace. `spawn`
-takes only a call, not a block or a closure, so the error is handled in a
-function that is itself infallible, and that function is what is spawned:
+call statement (§13.1, §18.3): the error would be lost with no trace. The error
+is handled at the site, in a block, and the block is infallible:
 
 ```
-fn serveLoop(s: Server) {
+spawn {
   serve(s) catch e {
     print("serve failed: ${e.message()}")
   }
 }
-
-spawn serveLoop(s)
 ```
+
+Inside the block a fallible call is held to the same rule: a bare call
+statement is E0190, and the block has no caller for `?` to return to.
 
 ### 16.2 Channels
 
@@ -6035,7 +6046,7 @@ or tuple element, a call statement) it is E0190; both say to add `?` or `catch`.
 One form stays open because it says the result is dropped: `let _ = f()`.
 `defer f()` and `spawn f()` of a fallible call are E0190 too (§16.1, §18.5):
 the call runs with no caller to hand the error to, so it is handled inside a
-wrapper function that is itself infallible.
+`defer { ... }` or `spawn { ... }` block, which is itself infallible.
 
 Example:
 
@@ -6126,20 +6137,29 @@ explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
 deterministic resource release without finalizers on every path that returns.
 
-A deferred call has no caller to receive an error either, so `defer` of a call
-whose result is fallible (`T!E`, §18.2) is a compile error, E0190, the same as
-a bare call statement (§18.3). `defer` takes only a call, so the error is
-handled in an infallible wrapper function, and the wrapper is what is deferred:
+`defer` also takes a **block**, `defer { stmts }`, which is
+`defer (() => { stmts })()`: a closure with no parameters (§12.8), called at
+function exit. The closure value is created at the `defer` statement, and it
+captures the enclosing function's variables as every arrow function does: they
+are shared, not copied, so a deferred block sees a variable as it stands when
+the function exits, whereas the arguments of `defer ((a) => ...)(x)` (any call
+whose callee is a function value) are evaluated at the `defer` statement like
+any other deferred call's. Blocks and calls share one stack: they run in
+last-in-first-out order together. A `return` in the block leaves the block, not
+the function, and a value it returns is discarded.
 
 ```
-fn closeLogged(f: File) {
+defer {
   f.close() catch e {
     print("close failed: ${e.message()}")
   }
 }
-
-defer closeLogged(f)
 ```
+
+A deferred call has no caller to receive an error either, so `defer` of a call
+whose result is fallible (`T!E`, §18.2) is a compile error, E0190, the same as
+a bare call statement (§18.3). The error is handled in the block above, and the
+block is infallible: inside it a fallible call is held to the same rule.
 
 ### 18.6 Caller Location and Stack Traces
 
@@ -6788,8 +6808,8 @@ return_stmt   = "return" [ expression { "," expression } ] .
 fail_stmt     = "fail" expression .
 break_stmt    = "break" .
 continue_stmt = "continue" .
-spawn_stmt    = "spawn" postfix .          (* postfix must be a call *)
-defer_stmt    = "defer" postfix .          (* postfix must be a call *)
+spawn_stmt    = "spawn" ( postfix | block ) .    (* postfix must be a call; a block is a closure called at once *)
+defer_stmt    = "defer" ( postfix | block ) .    (* postfix must be a call; a block is a closure called at once *)
 
 if_stmt       = "if" "(" expression ")" block [ "else" ( if_stmt | block ) ] .
 while_stmt    = "while" "(" expression ")" block .
