@@ -457,9 +457,7 @@ import {
   defaultTransportParameters, encodeTransportParameters, levelKeys, updateSecret,
   cryptoFrames, reassembleCryptoFrames, PacketKeys,
 } from "std/quic"
-import { Hash, Sha256 } from "std/crypto"
-
-fn sha256(): Hash { return Sha256() }
+import { HashAlg } from "std/crypto"
 
 // Our transport parameters, as the quic_transport_parameters extension body.
 fn myParameters(): []byte {
@@ -471,11 +469,11 @@ fn myParameters(): []byte {
 
 // The 1-RTT packet keys for one direction, and the next secret after a key update.
 fn oneRttKeys(secret: []byte): PacketKeys {
-  return levelKeys(sha256, secret, 16)
+  return levelKeys(HashAlg.Sha256, secret, 16)
 }
 
 fn rollForward(secret: []byte): []byte {
-  return updateSecret(sha256, secret)
+  return updateSecret(HashAlg.Sha256, secret)
 }
 
 // Carry a handshake message in CRYPTO frames and reassemble it in order.
@@ -519,7 +517,7 @@ The three packet-protection levels a connection passes through: `Initial`,
 The long-header packet type that carries `level`. Returns -1 for `OneRtt`,
 which uses a short header instead.
 
-### `levelKeys(newHash: () => Hash, secret: []byte, keyLen: int): PacketKeys`
+### `levelKeys(alg: HashAlg, secret: []byte, keyLen: int): PacketKeys`
 
 The packet-protection keys for a non-Initial level, derived from a TLS
 traffic `secret`.
@@ -529,12 +527,12 @@ traffic `secret`.
 Both directions' keys for one non-Initial encryption level: `client` and
 `server`.
 
-### `levelKeyPair(newHash: () => Hash, clientSecret: []byte, serverSecret: []byte, keyLen: int): LevelKeyPair`
+### `levelKeyPair(alg: HashAlg, clientSecret: []byte, serverSecret: []byte, keyLen: int): LevelKeyPair`
 
 Both directions' keys for one level, derived from the client and server TLS
 traffic secrets.
 
-### `updateSecret(newHash: () => Hash, secret: []byte): []byte`
+### `updateSecret(alg: HashAlg, secret: []byte): []byte`
 
 The next-generation 1-RTT secret for a key update. The header-protection key
 is not updated; re-derive only the AEAD key and iv from the result.

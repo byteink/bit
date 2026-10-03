@@ -285,9 +285,9 @@ The suites this module offers, strongest first.
 
 Build the live cipher or hash for a suite.
 
-### `tlsSuiteNewHash(suite: CipherSuite): Hash`
+### `tlsSuiteHash(suite: CipherSuite): HashAlg`
 
-Build the live cipher or hash for a suite.
+The suite's transcript and HKDF digest as a `HashAlg` (`HashAlg.Sha384` for TLS_AES_256_GCM_SHA384, `HashAlg.Sha256` for the other two). Every key-schedule function below takes it.
 
 ## Key exchange groups
 
@@ -329,10 +329,10 @@ Convert to and from the IANA wire code point.
 
 A running hash over every handshake message seen so far.
 
-### `TranscriptHash(newHash: () => Hash)`
+### `TranscriptHash(alg: HashAlg)`
 
 A running hash over every handshake message seen so far, built from the suite's
-hash constructor; its digest before any `update` is the hash of the empty
+hash (`HashAlg`); its digest before any `update` is the hash of the empty
 string.
 
 ### `TranscriptHash.update(data: []byte)`
@@ -343,79 +343,79 @@ Absorb a message; read the transcript hash so far.
 
 Absorb a message; read the transcript hash so far.
 
-### `hkdfExpandLabel(newHash: () => Hash, secret: []byte, label: string, context: []byte, len: int): []byte`
+### `hkdfExpandLabel(alg: HashAlg, secret: []byte, label: string, context: []byte, len: int): []byte`
 
 The two HKDF-Expand-Label building blocks every secret below is derived with.
 
-### `deriveSecret(newHash: () => Hash, secret: []byte, label: string, transcriptHash: []byte): []byte`
+### `deriveSecret(alg: HashAlg, secret: []byte, label: string, transcriptHash: []byte): []byte`
 
 The two HKDF-Expand-Label building blocks every secret below is derived with.
 
-### `earlySecret(newHash: () => Hash, psk: []byte): []byte`
+### `earlySecret(alg: HashAlg, psk: []byte): []byte`
 
 The three key-schedule stages, in order.
 
-### `handshakeSecret(newHash: () => Hash, early: []byte, ecdhe: []byte): []byte`
+### `handshakeSecret(alg: HashAlg, early: []byte, ecdhe: []byte): []byte`
 
 The three key-schedule stages, in order.
 
-### `masterSecret(newHash: () => Hash, handshake: []byte): []byte`
+### `masterSecret(alg: HashAlg, handshake: []byte): []byte`
 
 The three key-schedule stages, in order.
 
-### `clientHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte`
+### `clientHandshakeTrafficSecret(alg: HashAlg, handshake: []byte, transcriptHash: []byte): []byte`
 
 The traffic and exporter secrets derived from the handshake and master secrets.
 
-### `serverHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte`
+### `serverHandshakeTrafficSecret(alg: HashAlg, handshake: []byte, transcriptHash: []byte): []byte`
 
 The traffic and exporter secrets derived from the handshake and master secrets.
 
-### `clientApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+### `clientApplicationTrafficSecret(alg: HashAlg, master: []byte, transcriptHash: []byte): []byte`
 
 The traffic and exporter secrets derived from the handshake and master secrets.
 
-### `serverApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+### `serverApplicationTrafficSecret(alg: HashAlg, master: []byte, transcriptHash: []byte): []byte`
 
 The traffic and exporter secrets derived from the handshake and master secrets.
 
-### `exporterMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+### `exporterMasterSecret(alg: HashAlg, master: []byte, transcriptHash: []byte): []byte`
 
 The traffic and exporter secrets derived from the handshake and master secrets.
 
-### `resumptionMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
+### `resumptionMasterSecret(alg: HashAlg, master: []byte, transcriptHash: []byte): []byte`
 
 The traffic and exporter secrets derived from the handshake and master secrets.
 
-### `trafficKey(newHash: () => Hash, secret: []byte, keyLen: int): []byte`
+### `trafficKey(alg: HashAlg, secret: []byte, keyLen: int): []byte`
 
 The AEAD key and IV derived from a traffic secret.
 
-### `trafficIV(newHash: () => Hash, secret: []byte, ivLen: int): []byte`
+### `trafficIV(alg: HashAlg, secret: []byte, ivLen: int): []byte`
 
 The AEAD key and IV derived from a traffic secret.
 
-### `finishedKey(newHash: () => Hash, baseKey: []byte): []byte`
+### `finishedKey(alg: HashAlg, baseKey: []byte): []byte`
 
 The Finished message MAC.
 
-### `finishedMac(newHash: () => Hash, baseKey: []byte, transcriptHash: []byte): []byte`
+### `finishedMac(alg: HashAlg, baseKey: []byte, transcriptHash: []byte): []byte`
 
 The Finished message MAC.
 
-### `binderKey(newHash: () => Hash, early: []byte): []byte`
+### `binderKey(alg: HashAlg, early: []byte): []byte`
 
 The 0-RTT / PSK resumption secrets.
 
-### `clientEarlyTrafficSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
+### `clientEarlyTrafficSecret(alg: HashAlg, early: []byte, clientHello1Hash: []byte): []byte`
 
 The 0-RTT / PSK resumption secrets.
 
-### `earlyExporterMasterSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
+### `earlyExporterMasterSecret(alg: HashAlg, early: []byte, clientHello1Hash: []byte): []byte`
 
 The 0-RTT / PSK resumption secrets.
 
-### `resumptionPsk(newHash: () => Hash, resumptionMasterSecret: []byte, ticketNonce: []byte): []byte`
+### `resumptionPsk(alg: HashAlg, resumptionMasterSecret: []byte, ticketNonce: []byte): []byte`
 
 The 0-RTT / PSK resumption secrets.
 
