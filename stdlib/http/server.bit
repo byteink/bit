@@ -487,6 +487,12 @@ export fn listenAndServe(host: string, port: int, handler: (Request) => Response
 // the same per-connection bundle for the same E0202 reason as the rest of
 // `drainSlot`.
 class drainSlot {
+  // 1 while a request is between "fully read" and "response written", else 0
+  // (waiting for the next request). `drainRun`'s step-3 `goaway` hook reads it
+  // to force-close a connection idling on keep-alive, which `connEntry.active`
+  // cannot tell apart from one inside `handler`: that flag never goes back to
+  // false after a connection's first request (#6815).
+  busy: AtomicI64,
   d: drainState,
   id: int,
   marked: bool,
@@ -503,16 +509,24 @@ class drainSlot {
 const maxReusableResponseBuf = 16384
 
 fn serveOne(s: byteStream, handler: (Request) => Response, opts: connOpts, d: drainState) {
+  let busy = AtomicI64(0)
   let id = drainRegister(
     d,
     () => {
       s.forceClose()
     },
-    () => {},
+    () => {
+      // Step 3 of shutdown: an h1 connection has no GOAWAY to send, but one
+      // idling between keep-alive requests has nothing to finish, so it is
+      // closed now rather than held for `timeoutMs` (#6815).
+      if (busy.load() == 0) {
+        s.forceClose()
+      }
+    },
   )
   defer drainDeregister(d, id)
   let slot = drainSlot{
-    d = d, id = id, marked = false, buf = []byte(0), first = false, atLimit = false,
+    busy = busy, d = d, id = id, marked = false, buf = []byte(0), first = false, atLimit = false,
   }
   let n = 0
   while (n < opts.maxRequests) {
@@ -550,6 +564,7 @@ fn answerOne(
     s.shut()
     return false
   }
+  slot.busy.store(1)
   if (!slot.marked) {
     drainMarkActive(slot.d, slot.id)
     slot.marked = true
@@ -560,7 +575,7 @@ fn answerOne(
   }
   // Named `mustClose`, not `close`: `close` is a predeclared identifier
   // (E0048).
-  let mustClose = slot.atLimit || req.closeAsked
+  let mustClose = closesAfter(req, slot)
   // No bare `defer s.shut()` (unlike the old one-shot `answer`): a connection
   // that stays open (`mustClose` false, write succeeded) must NOT be shut
   // before its next request, so every exit path shuts explicitly instead — a
@@ -587,6 +602,28 @@ fn answerOne(
     slot.buf = []byte(0)
   }
   if (mustClose) {
+    s.shut()
+    return false
+  }
+  return parkIdle(s, slot)
+}
+
+// Whether the response to `req` ends the connection: the client asked, this is
+// the last request the connection may answer, or a shutdown has begun, in
+// which case the response says `Connection: close` rather than promise a
+// keep-alive that is about to be cut (#6815).
+fn closesAfter(req: Request, slot: drainSlot): bool {
+  return slot.atLimit || req.closeAsked || drainShuttingDown(slot.d)
+}
+
+// The connection is idle from here until the next request is read. Publish
+// that BEFORE re-reading the shutdown flag: a `drainRun` that began after
+// `closesAfter` was evaluated either sees `busy == 0` in its `goaway` sweep or
+// is seen here, so the connection is never left parked on a read that
+// shutdown will wait out (#6815). Returns whether the connection stays open.
+fn parkIdle(s: byteStream, slot: drainSlot): bool {
+  slot.busy.store(0)
+  if (drainShuttingDown(slot.d)) {
     s.shut()
     return false
   }
