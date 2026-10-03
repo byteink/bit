@@ -168,8 +168,15 @@ a bare `let`, or left as a statement on its own is E0190. Each says to add `?`
 or `catch`. `let _ = save(d)` is the written way to drop a result on purpose.
 `defer` and `spawn` refuse a fallible call too (E0190): they run it with no
 caller to hand its error to, and take no `?` or `catch`, so the error is
-handled inside a small infallible function and that function is what you defer
-or spawn.
+handled in place, in a block that is itself infallible:
+
+```bit ignore
+defer {
+  conn.close() catch e {
+    print("close failed: ${e.message()}")
+  }
+}
+```
 
 `?` only works inside a function whose own return type is fallible; you
 cannot propagate a failure out of `fn main() { }`, only out of a function

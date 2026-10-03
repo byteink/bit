@@ -40,6 +40,19 @@ its own `tags`, not a variable a later iteration will change. There is no
 handle to a spawned task and nothing to join; the only way to find out what
 it did, or that it finished, is a channel.
 
+When the work is a few statements rather than one call, spawn a block:
+`spawn { ... }` runs the statements on the new thread, and it reads the
+enclosing function's variables the way an arrow function does (shared, not
+copied). It is also where a fallible call's error is handled, since a spawned
+task has no caller to return it to:
+
+```bit ignore
+spawn {
+  let n = countTags(tags) catch e { 0 }
+  counts <- n
+}
+```
+
 ## Channels: send, receive, close
 
 `chan<int>(n)` above is buffered with room for `n` values, so every send
