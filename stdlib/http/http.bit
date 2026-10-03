@@ -37,6 +37,7 @@ import {
   connect as h2connect, accept as h2accept, defaultConfig as h2defaultConfig, Config as H2Config,
   Transport as H2Transport, Conn as H2Conn,
   Request as H2Request, Response as H2Response, HeaderField as H2HeaderField,
+  errorProtocolError as h2ErrProtocolError,
 } from "std/http2"
 import {
   h3DialTls, h3DialTlsDeadline, h3Listen, H3Conn, H3Listener, H3Request, H3Response, HeaderField,
@@ -407,7 +408,22 @@ fn isTokenByte(c: byte): bool {
   if (c >= '0' && c <= '9') {
     return true
   }
-  return indexOf(tokenExtraBytes, string([]byte{ c })) >= 0
+  return isTokenPunct(c)
+}
+
+// True if `c` is one of `tokenExtraBytes`. A bounded scan of that constant
+// rather than `indexOf(tokenExtraBytes, string([]byte{ c }))`, which built a
+// one-byte string per call: `-` and `_` are in most field names, so every
+// header line of a request paid an allocation here (#6729).
+fn isTokenPunct(c: byte): bool {
+  let k = 0
+  while (k < len(tokenExtraBytes)) {
+    if (tokenExtraBytes[k] == c) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
 }
 
 // True if `name` is non-empty and every byte is a token character.
@@ -434,12 +450,68 @@ fn hasForbiddenValueByte(value: string): bool {
   let i = 0
   while (i < len(value)) {
     let c = value[i]
-    if (c == '\r' || c == '\n' || c == '\0') {
+    // One compare clears every printable byte; the three exact tests run only
+    // for the few bytes at or below CR.
+    if (c <= '\r' && (c == '\r' || c == '\n' || c == '\0')) {
       return true
     }
     i = i + 1
   }
   return false
+}
+
+// True if `name` is a legal HTTP/2 or HTTP/3 field name as a peer sends it
+// (RFC 9113 §8.2.1, RFC 9114 §4.2): non-empty, every byte a token character
+// (`isTokenByte`, what `validHeaderName` tests), and no uppercase letter, which
+// those protocols forbid on the wire. One pass, no allocation. A leading ':'
+// is not a token byte, so a pseudo-header the engine did not consume (an unknown
+// one, or one that is not a request's) is refused here too.
+fn lowerFieldName(name: string): bool {
+  if (len(name) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(name)) {
+    let c = name[i]
+    // Lower-case letters are nearly every byte of a real name; skip
+    // `isTokenByte`'s chain for them.
+    if ((c < 'a' || c > 'z') && ((c >= 'A' && c <= 'Z') || !isTokenByte(c))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// True if `name` (lower-case) is a connection-specific field, which an HTTP/2
+// or HTTP/3 message must not carry (RFC 9113 §8.2.2, RFC 9114 §4.2). Content-
+// Length is not one: it is legal there, and each glue drops it separately.
+fn connectionSpecificField(name: string): bool {
+  // The five names are 7, 10, 10, 16 and 17 bytes: most fields are none of
+  // those, so one length test spares them five string compares.
+  let n = len(name)
+  if (n != 7 && n != 10 && n != 16 && n != 17) {
+    return false
+  }
+  return name == "connection" ||
+    name == "keep-alive" ||
+    name == "proxy-connection" ||
+    name == "transfer-encoding" ||
+    name == "upgrade"
+}
+
+// True if a request field a peer sent over HTTP/2 or HTTP/3 makes the request
+// malformed (RFC 9113 §8.2.1, §8.2.2, RFC 9114 §4.2): a name `lowerFieldName`
+// rejects, a connection-specific field, `te` with any value but "trailers", or
+// a value with a CR, LF or NUL. HPACK and QPACK carry fields as length-prefixed
+// binary, so nothing in the decoder stops these; serialised into the text block
+// `header()` reads, one would become a second field line (#6729). Shared by
+// `h2glueRequestIn` and `h3glueRequestIn`.
+fn peerFieldMalformed(name: string, value: string): bool {
+  return !lowerFieldName(name) ||
+    connectionSpecificField(name) ||
+    (name == "te" && value != "trailers") ||
+    hasForbiddenValueByte(value)
 }
 
 // The [start, end) byte range of `name`'s header line in `block` (a
