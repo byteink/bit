@@ -137,11 +137,13 @@ const gcMkMapBytes = 8519808 // gcMkCtxOff + (maxMutators + 1) * gcMkCtxBytes
 const gcMkHelperParks = 16
 const gcMkParkNs = 1000000
 
-// A sleep that times out is a LATE WAKE (`gcMkLateWakes`) when termination was
-// published at least this long before the timeout could have fired. The cap
+// A sleep that times out is a LATE WAKE (`gcMkLateWakes`) when the termination
+// notify had COMPLETED (`gcMkWakeTick`) at least this long before the timeout
+// could have fired: the wake was delivered, yet the sleeper slept on. The cap
 // hides a lost wake from every gate (it costs one `gcMkParkNs`), so the count
-// is the only witness. The margin covers a timeout racing the publication,
-// whose wake is not lost.
+// is the only witness. A notifier descheduled before it reaches the wake leaves
+// `gcMkWakeTick` unset or recent, so a delayed wake is not counted. The margin
+// covers a timeout racing the notify's completion.
 const gcMkLateSlackNs = 100000
 
 // The park pair, reached by its pinned name like ../stw/stwhelper.bit's:
@@ -164,7 +166,7 @@ let gcMkBad: i64 = 0       // helpers' bad-offset counts, added on leaving
 let gcMkPhase: i64 = 0     // phases seeded so far; names the one open
 let gcMkWake: i32 = 0      // bumped by a publish that a sleeper may need
 let gcMkAsleep: i64 = 0    // idle members inside `gcMkSleep`
-let gcMkDoneTick: i64 = 0  // `gcTicks` when `gcMkDone` was set, stored before it
+let gcMkWakeTick: i64 = 0  // `gcTicks` when the termination notify completed, 0 = not yet
 let gcMkLateWakes: i64 = 0 // sleeps that timed out after termination, whole run
 
 @nosplit fn gcMkCtx(k: int): *i64 {
@@ -291,6 +293,7 @@ let gcMkLateWakes: i64 = 0 // sleeps that timed out after termination, whole run
   gcMkIdle = 0
   atomicStore(ptrOf(gcMkBad), 0)
   atomicStore(ptrOf(gcMkDone), 0)
+  atomicStore(ptrOf(gcMkWakeTick), 0)
 }
 
 // Publish a full local and take a free segment in its place. False, with the
@@ -428,7 +431,6 @@ let gcMkLateWakes: i64 = 0 // sleeps that timed out after termination, whole run
   gcMkIdle = gcMkIdle + 1
   let last = gcMkIdle == gcMkJoined
   if (last) {
-    atomicStore(ptrOf(gcMkDoneTick), gcTicks())
     atomicStore(ptrOf(gcMkDone), 1)
   }
   spinRelease(ptrOf(gcMkLock))
@@ -479,26 +481,40 @@ let gcMkLateWakes: i64 = 0 // sleeps that timed out after termination, whole run
 
 // Wake the members sleeping in `gcMkSleep`, after this thread stored the
 // list or `gcMkDone`: one for a published segment, every one for
-// termination. A no-op with nobody asleep, which is the common case: one
-// load of a line only a sleeper writes.
+// termination. With nobody asleep, the common case, it costs one load of a
+// line only a sleeper writes. A termination notify then stamps
+// `gcMkWakeTick` on both paths, so a miss in the asleep check is still caught.
 @nosplit fn gcMkNotify(all: bool) {
-  if (atomicLoad(ptrOf(gcMkAsleep)) == 0) {
-    return
+  if (atomicLoad(ptrOf(gcMkAsleep)) != 0) {
+    let w: *i32 = ptrOf(gcMkWake)
+    let _ = atomicAdd(w, i32(1))
+    let _ = bit_rt_port_park_wake(w, all)
   }
-  let w: *i32 = ptrOf(gcMkWake)
-  let _ = atomicAdd(w, i32(1))
-  let _ = bit_rt_port_park_wake(w, all)
+  if (all) {
+    let now = gcTicks()
+    if (now == 0) {
+      worldHelperFatal() // 0 means "unset" in gcMkWakeTick; the clock never reads it after boot
+    }
+    atomicStore(ptrOf(gcMkWakeTick), now)
+  }
 }
 
-// A sleep armed at `armed` (`gcTicks`) ended by timeout. Count it when
-// termination was already published `gcMkLateSlackNs` before the earliest
+// After every member has left: a termination notify that exists has completed,
+// so `gcMkDone` set with `gcMkWakeTick` unset is a notify that never ran, and
+// a sleeper may have waited out its cap for it. Needs no timing.
+@nosplit fn gcMkCheckNotified() {
+  if (atomicLoad(ptrOf(gcMkDone)) != 0 && atomicLoad(ptrOf(gcMkWakeTick)) == 0) {
+    let _ = atomicAdd(ptrOf(gcMkLateWakes), 1)
+  }
+}
+
+// A sleep armed at `armed` (`gcTicks`) ended by timeout. Count it when the
+// termination notify had completed `gcMkLateSlackNs` before the earliest
 // moment that timeout could fire, so the wake that should have ended the sleep
 // was lost. Reached only on a timeout: a mark that never sleeps pays nothing.
 @nosplit fn gcMkNoteTimeout(armed: int) {
-  if (atomicLoad(ptrOf(gcMkDone)) == 0) {
-    return
-  }
-  if (atomicLoad(ptrOf(gcMkDoneTick)) + gcMkLateSlackNs > armed + gcMkParkNs) {
+  let wake = atomicLoad(ptrOf(gcMkWakeTick))
+  if (wake == 0 || wake + gcMkLateSlackNs > armed + gcMkParkNs) {
     return
   }
   let _ = atomicAdd(ptrOf(gcMkLateWakes), 1)
@@ -667,6 +683,7 @@ export @nosplit @symbol("bit_rt_port_gc_mark_late_wakes") fn gcStatLateWakes(): 
   gcMkWork(c, false)
   atomicStore(ptrOf(gcMkOpen), 0)
   worldDrainOrDie(ptrOf(gcMkIn))
+  gcMkCheckNotified()
   *(g + gcStBadOffset) = *(g + gcStBadOffset) + *(c + gcMkCtxBad) + atomicLoad(ptrOf(gcMkBad))
   atomicStore(ptrOf(gcMkOwner), 0)
   return true
