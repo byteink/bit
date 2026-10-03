@@ -4126,7 +4126,11 @@ defer_stmt    = "defer" postfix .                (* postfix must be a call *)
   alone: a function call, a channel receive, an error-propagation chain (`?`), or
   a `catch` (deliberate error handling - its ok value is intentionally discarded,
   or is `void`; §18.3). A bare `a + b` statement is a compile error (guards
-  against mistakes).
+  against mistakes). A call whose result is fallible is not one that can stand
+  alone: it is E0190, and needs `?` or `catch` (§18.3).
+- An `if`, `while` or `for` condition, and each operand of `&&`, `||` and `!`,
+  must be `bool` - no truthiness, as for the conditional expression (§12). A
+  condition of any other type, a fallible `bool!` included, is E0041.
 - `return` with multiple expressions constructs a tuple result matching the tuple
   result type. The tuple is built as a single value and returned as one (see
   `runtime/ABI.md` §1.1); the arity and element types must match the declared
@@ -6000,6 +6004,18 @@ catch_expr = binary [ "catch" ( expression | IDENT block ) ] .
     not only when it is `()`. A `catch e { ... }` whose value IS used - bound
     by a `let`, returned, passed as an argument, or any other non-statement
     position - still requires a value or diverted control for a non-void `T`.
+
+A fallible value is consumed only by `?` or `catch`. Any other use of a call
+whose result is `T!E` is a compile error, because the error half would be dropped
+and the program would carry on as if the call had succeeded: against a declared
+type (an argument, an annotated `let`, a `return`, a field, an operand) it is
+E0041 (`expected 'T', found 'T!'`), and where there is no declared type to
+compare (a receiver, an index or slice bound, a `for ... of` iterable, a
+compound assignment's right-hand side, an unannotated `let`, a bare slice, map
+or tuple element, a call statement) it is E0190; both say to add `?` or `catch`.
+Three forms stay open because each already says the result is dropped:
+`let _ = f()`, `defer f()` and `spawn f()` (§16.1, §18.5 - there is no caller
+left to hand the error to).
 
 Example:
 

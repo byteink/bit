@@ -1,0 +1,267 @@
+// Self-host: a fallible value (`T!E`, §18.2) is consumed only by `?` or `catch`
+// (§18.3), and a condition is consumed only as `bool` (§12, no truthiness).
+// #6677: `if (this.cdataStep())` with `cdataStep(): bool!` compiled clean and the
+// loop spun forever, because nothing judged an `if`/`while`/`for` condition or a
+// `&&`/`||` operand at all, and a handful of other positions (a receiver, an
+// index, a for-of iterable, a compound-assign right-hand side, an unannotated
+// `let`) took the unhandled `T!` as if it were the `T`.
+//
+// ONE sweep over the arena, run once at the end of `checkModule`
+// (checkmodule.bit) like `vSweepContainerLits` (validateexpr.bit): it visits
+// every node whatever its context, and names the positions the validator's own
+// walk leaves silent. Every other position already refuses the value with E0041
+// through `vExpectExpr` (an argument, a `return`, an annotated `let`, a field
+// initializer, an assignment, a `!` operand) or E0053/E0073 (an arithmetic or
+// comparison operand, an interpolation), and is deliberately not repeated here,
+// so one expression never carries two diagnostics.
+//
+// The bool positions go through `vExpectExpr` so they read exactly like the
+// ternary's (`vConditional`, validateoperator.bit): `expected 'bool', found
+// 'bool!'`. The value positions have no declared target to name, so they take
+// their own code, `ecUnhandledFallible`.
+
+// First free code in 186..199: 200+ is the lint range and 1xx below it is taken
+// (`tools/build` registry check, compiler/eccodescheck.bit).
+const ecUnhandledFallible = 190
+
+// What the fix is, shared by both diagnostics so the wording cannot drift.
+fn vFallibleHint(): string {
+  return "add '?' to propagate the error, or 'catch' to handle it (§18.3)"
+}
+
+// Does `ty` hold a fallible value anywhere a stored value could keep one? A
+// `Func` is NOT descended: `() => i64!` is a function that returns a result, a
+// legitimate value; `[]i64!` and `(i64!, i64)` are a result stored as data.
+fn vMentionsFallible(c: Checker, ty: int, depth: int): bool {
+  if (ty == 0 || depth >= 32) {
+    return false
+  }
+  let t = c.ctx.types[ty]
+  let k = t.kind
+  if (k == TypeKind.Fallible) {
+    return true
+  }
+  if (k == TypeKind.Slice || k == TypeKind.Array || k == TypeKind.Chan) {
+    return vMentionsFallible(c, t.elem, depth + 1)
+  }
+  if (k == TypeKind.Map) {
+    return vMentionsFallible(c, t.mapKey, depth + 1) || vMentionsFallible(c, t.mapVal, depth + 1)
+  }
+  return k == TypeKind.Tuple && vAnyMentionsFallible(c, t.members, depth + 1)
+}
+
+fn vAnyMentionsFallible(c: Checker, members: []int, depth: int): bool {
+  for m of members {
+    if (vMentionsFallible(c, m, depth)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Has this expression already been refused, by the validator's own walk as a
+// type mismatch (an argument or a field initializer against a concrete
+// parameter/field type is E0041 on exactly this span) or by this sweep (a
+// slice element is visited as the element and as its `Arg`)? The sweep stays
+// silent then, so one expression carries one diagnostic.
+fn vRefusedAt(c: Checker, span: Span): bool {
+  for d of c.diags.list {
+    let ours = d.code == ecTypeMismatch || d.code == ecUnhandledFallible
+    let same = d.span.file == span.file && d.span.start == span.start && d.span.end == span.end
+    if (ours && same) {
+      return true
+    }
+  }
+  return false
+}
+
+// E0190 on `node` when it is a CALL whose result is fallible. Only a call can
+// produce a `T!` out of nothing (a fallible value never reaches a variable, a
+// field or an element: the positions that could hold one are refused where the
+// value would enter them), so the cached type of a `Call` node is the whole
+// question and no expression is re-typed.
+fn vNoFallible(c: Checker, node: int) {
+  if (node == 0 || getNode(c.tree, node).tag != Tag.Call) {
+    return
+  }
+  let ty = c.nodeTypes[node]
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Fallible) {
+    return
+  }
+  if (vRefusedAt(c, vSpan(c, node))) {
+    return
+  }
+  report(
+    c.diags, ecUnhandledFallible, vSpan(c, node),
+    "unhandled fallible value of type '${typeName(c.ctx, ty)}'", vFallibleHint(),
+  )
+}
+
+// A bool position: `node` must be `bool`. An undecided type is skipped, as
+// everywhere in this validator (`vExpectExpr` -> `vAssignableNode` answers yes
+// for 0), so a cascade from an earlier error stays one diagnostic.
+fn vBoolOperand(c: Checker, node: int) {
+  vExpectExpr(c, node, primType(c.ctx, 10))
+}
+
+// `if`, `while`, `for(;cond;)` conditions, `!`'s operand and the two logical
+// operators' operands.
+fn vUseBool(c: Checker, node: int, t: Tag) {
+  if (t == Tag.IfStmt || t == Tag.WhileStmt) {
+    vBoolOperand(c, vKid(c, node, 0))
+  }
+  if (t == Tag.ForC) {
+    vBoolOperand(c, vKid(c, node, 1))
+  }
+  if (t == Tag.Unary && getNode(c.tree, node).main == int(Kind.Bang)) {
+    vBoolOperand(c, vKid(c, node, 0))
+  }
+  if (t == Tag.Binary && vIsLogicalOp(getNode(c.tree, node).main)) {
+    vBoolOperand(c, vKid(c, node, 0))
+    vBoolOperand(c, vKid(c, node, 1))
+  }
+}
+
+// Kid `i` of `node`, 0 when the node has fewer: a partial tree must not index
+// out of range here, and 0 is what every consumer already skips.
+fn vKid(c: Checker, node: int, i: int): int {
+  let kids = kidsOf(c.tree, node)
+  if (i >= len(kids)) {
+    return 0
+  }
+  return kids[i]
+}
+
+fn vIsLogicalOp(op: int): bool {
+  return op == int(Kind.AmpAmp) || op == int(Kind.PipePipe)
+}
+
+// A subject-less `switch` tests each label as a `bool` condition (§13.1).
+fn vUseSwitchLabels(c: Checker, node: int) {
+  if (vKid(c, node, 0) != 0) {
+    return
+  }
+  for cs of kidsOf(c.tree, vKid(c, node, 1)) {
+    for label of kidsOf(c.tree, vKid(c, cs, 0)) {
+      vBoolOperand(c, label)
+    }
+  }
+}
+
+// A bare container literal no declared type reached (`containerLitTargeted`,
+// check.bit: a targeted one is judged element by element against its element
+// type, E0041, already).
+fn vUseLiteral(c: Checker, node: int, t: Tag) {
+  if (c.containerLitTargeted[node]) {
+    return
+  }
+  for e of kidsOf(c.tree, node) {
+    if (t == Tag.MapLit && getNode(c.tree, e).tag == Tag.MapEntry) {
+      for part of kidsOf(c.tree, e) {
+        vNoFallible(c, part)
+      }
+    } else if (getNode(c.tree, e).tag == Tag.Arg) {
+      vNoFallible(c, vKid(c, e, 0))
+    } else {
+      vNoFallible(c, e)
+    }
+  }
+}
+
+// An unannotated `let`: its type IS the initializer's, so a `T!` (or a tuple
+// holding one) would be bound to a name and never handled. Only the two
+// initializer shapes nothing else judges are asked: a call (every other shape
+// that can carry a `T!` is an operand error, E0041/E0053, already) and a tuple
+// literal (a bare slice/map literal is `vUseLiteral`'s, element by element).
+fn vUseBinding(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pat, annotation, init]
+  if (len(kids) < 3 || kids[1] != 0 || kids[2] == 0) {
+    return
+  }
+  if (getNode(c.tree, kids[0]).tag == Tag.TuplePat) {
+    return // vLetDestructure's
+  }
+  if (nodeText(c.tree, c.source, kids[0]) == "_") {
+    return // `let _ = f()`: the written, greppable discard (spec/LINT.md §4.3)
+  }
+  let initTag = getNode(c.tree, kids[2]).tag
+  if (initTag != Tag.Call && initTag != Tag.TupleLit) {
+    return
+  }
+  let ty = checkExprType(c, kids[2])
+  if (!vMentionsFallible(c, ty, 0)) {
+    return
+  }
+  report(
+    c.diags, ecUnhandledFallible, vSpan(c, kids[2]),
+    "unhandled fallible value of type '${typeName(c.ctx, ty)}'", vFallibleHint(),
+  )
+}
+
+// Positions that take a value and look INTO it: a for-of iterable, a member
+// receiver, an index, a slice bound, a compound assignment's right-hand side,
+// and a bare call statement (its result, error half included, has nowhere to
+// go). (`for ... in` over a `T!` is E0091 already.) `defer call` and
+// `spawn call` are not here: they run the call with no caller to hand its
+// error to, which is their defined shape (§18.5, §16.1), so they stay open.
+fn vUseValue(c: Checker, node: int, t: Tag) {
+  if (t == Tag.ForOf || t == Tag.Index) {
+    vNoFallible(c, vKid(c, node, 1))
+  }
+  if (t == Tag.Member || t == Tag.ExprStmt) {
+    vNoFallible(c, vKid(c, node, 0))
+  }
+  if (t == Tag.SliceExpr) {
+    vNoFallible(c, vKid(c, node, 1))
+    vNoFallible(c, vKid(c, node, 2))
+  }
+  if (t == Tag.Assign && getNode(c.tree, node).main != int(Kind.Eq)) {
+    for r of kidsOf(c.tree, vKid(c, node, 1)) {
+      vNoFallible(c, r)
+    }
+  }
+}
+
+// Positions that DO have a declared target, and so are E0041 already when the
+// callee/field/channel is concrete. (`return` is not here: an arrow whose
+// result is fallible may `return` a fallible call, `vArrowFallibleReturns`,
+// validatecall.bit, and a function's own is E0041 already.) A generic parameter is not: a
+// `T` binds to the `i64!` itself and `keep(n())` was accepted, so the same
+// expression is asked here and `vRefusedAt` keeps the concrete ones single.
+fn vUseTargeted(c: Checker, node: int, t: Tag) {
+  if (t == Tag.Arg) {
+    vNoFallible(c, vKid(c, node, 0))
+  }
+  if (t == Tag.NamedArg || t == Tag.FieldInit || t == Tag.SendStmt) {
+    vNoFallible(c, vKid(c, node, 1))
+  }
+}
+
+fn vFallibleUse(c: Checker, node: int) {
+  let t = getNode(c.tree, node).tag
+  vUseBool(c, node, t)
+  vUseValue(c, node, t)
+  vUseTargeted(c, node, t)
+  if (t == Tag.SwitchStmt) {
+    vUseSwitchLabels(c, node)
+  }
+  if (t == Tag.SliceLit || t == Tag.MapLit) {
+    vUseLiteral(c, node, t)
+  }
+  if (t == Tag.Binding) {
+    vUseBinding(c, node)
+  }
+}
+
+// The sweep, once per module. A node the compiler synthesized (an attribute's
+// generated `if`, a derived decoder) carries a span the author never wrote, and
+// its conditions are built from checked parts, so it is skipped.
+fn vSweepFallibleUses(c: Checker) {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (!isSynth(c.tree, i)) {
+      vFallibleUse(c, i)
+    }
+    i = i + 1
+  }
+}
