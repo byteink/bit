@@ -1,0 +1,197 @@
+// tools/gens3 — trims the pinned upstream S3 Smithy model into
+// `tools/gens3/model/s3.json`, the file every later generator stage reads
+// (#6581, epic #6565).
+//
+// Upstream: github.com/aws/api-models-aws at commit
+// 7eb6ab98cd5f1e5dc6dd90ea1bdc625f9ae308ba,
+// models/s3/service/2006-03-01/s3-2006-03-01.json. `model/PIN` records that
+// commit and the sha256 of the FULL upstream file; this tool refuses an input
+// that does not hash to it, so the vendored copy can only come from the
+// pinned bytes.
+//
+// Run (from the repo root):
+//
+//   bit run tools/gens3/trim.bit -- <upstream-model.json> [out-file]
+//
+// `out-file` defaults to `tools/gens3/model/s3.json`; a test points it at a
+// scratch path.
+//
+// What is removed: every `smithy.api#documentation` and `smithy.api#examples`
+// trait (prose, 307 + 53 of them), and the three endpoint-rules traits
+// `smithy.rules#endpointRuleSet`, `#endpointBdd` and `#endpointTests`, which
+// the endpoint generator takes from their own pinned files (G12), not from
+// this one. Nothing else is touched: structure, members, targets and every
+// other trait stay as upstream has them.
+//
+// Output is deterministic: every object's keys sorted bytewise, arrays kept
+// in upstream order (their order is meaning: an operation's error list, a
+// service's operation list), two-space indent, one trailing newline. A
+// duplicate key in an object is an error, never a silent last-wins.
+
+import { Json, JsonEntry, jsonGet, jsonParse, jsonEncodePretty } from "std/json"
+import { Sha256, encodeHex, digest } from "std/crypto"
+import { sortInPlace } from "std/sort"
+import { split, trimSpace, hasPrefix } from "std/strings"
+import { readFile, writeFile } from "std/fs"
+import { args, exit } from "std/os"
+
+const defaultOutPath: string = "tools/gens3/model/s3.json"
+const pinPath: string = "tools/gens3/model/PIN"
+
+// Trait keys dropped from every `traits` object.
+fn isStrippedTrait(key: string): bool {
+  return key == "smithy.api#documentation" ||
+    key == "smithy.api#examples" ||
+    key == "smithy.rules#endpointRuleSet" ||
+    key == "smithy.rules#endpointBdd" ||
+    key == "smithy.rules#endpointTests"
+}
+
+fn dropStrippedTraits(entries: []JsonEntry): []JsonEntry {
+  let out = []JsonEntry(0)
+  for e of entries {
+    if (!isStrippedTrait(e.key)) {
+      out = append(out, e)
+    }
+  }
+  return out
+}
+
+// `entries` sorted by key; two equal keys are an error.
+fn sortedEntries(entries: []JsonEntry): []JsonEntry! {
+  sortInPlace(entries, (a, b) => a.key < b.key)
+  let i = 1
+  while (i < len(entries)) {
+    if (entries[i - 1].key == entries[i].key) {
+      fail newError("duplicate key \"${entries[i].key}\" in an object")
+    }
+    i = i + 1
+  }
+  return entries
+}
+
+fn trimObject(entries: []JsonEntry): Json! {
+  let out = []JsonEntry(0)
+  for e of entries {
+    let value = e.value
+    if (e.key == "traits") {
+      value = match (value) {
+        JsonObject(traits) => Json.JsonObject(dropStrippedTraits(traits))
+        _ => value
+      }
+    }
+    out = append(out, JsonEntry{ key = e.key, value = trimTree(value)? })
+  }
+  return Json.JsonObject(sortedEntries(out)?)
+}
+
+fn trimArray(items: []Json): Json! {
+  let out = []Json(0)
+  for it of items {
+    out = append(out, trimTree(it)?)
+  }
+  return Json.JsonArray(out)
+}
+
+// `j` with the stripped traits removed and every object's keys sorted.
+fn trimTree(j: Json): Json! {
+  return match (j) {
+    JsonObject(entries) => trimObject(entries)?
+    JsonArray(items) => trimArray(items)?
+    _ => j
+  }
+}
+
+// The pretty-printed, trimmed form of the upstream model text `src`.
+fn trimModel(src: string): string! {
+  let tree = jsonParse(src)?
+  let trimmed = trimTree(tree)?
+  return jsonEncodePretty(trimmed, "  ") + "\n"
+}
+
+// What a model holds, counted the way epic #6565 states it: operations are
+// shapes of type "operation"; members are the members of structure and
+// union shapes (enum members are values, not members).
+class modelCounts { operations: int, members: int }
+
+fn entriesOf(j: Json): []JsonEntry {
+  return match (j) {
+    JsonObject(entries) => entries
+    _ => []JsonEntry(0)
+  }
+}
+
+fn stringOf(j: Json): string {
+  return match (j) {
+    JsonString(s) => s
+    _ => ""
+  }
+}
+
+fn field(j: Json, key: string): Json {
+  return match (jsonGet(j, key)) {
+    Some(v) => v
+    None => Json.JsonNull
+  }
+}
+
+fn countModel(model: Json): modelCounts {
+  let operations = 0
+  let members = 0
+  for shape of entriesOf(field(model, "shapes")) {
+    let kind = stringOf(field(shape.value, "type"))
+    if (kind == "operation") {
+      operations = operations + 1
+    }
+    if (kind == "structure" || kind == "union") {
+      members = members + len(entriesOf(field(shape.value, "members")))
+    }
+  }
+  return modelCounts{ operations = operations, members = members }
+}
+
+// The value of `key=` in PIN text; `#` lines are comments.
+fn pinValue(pin: string, key: string): string! {
+  for line of split(pin, "\n") {
+    let l = trimSpace(line)
+    if (hasPrefix(l, key + "=")) {
+      return l[len(key) + 1:len(l)]
+    }
+  }
+  fail newError("PIN has no ${key}= line")
+}
+
+fn sha256Hex(data: string): string {
+  return encodeHex(digest(Sha256(), []byte(data)))
+}
+
+fn run(inPath: string, outPath: string): modelCounts! {
+  let src = readFile(inPath)?
+  let want = pinValue(readFile(pinPath)?, "sha256")?
+  let got = sha256Hex(src)
+  if (got != want) {
+    fail newError("${inPath} hashes to ${got}, PIN wants ${want}: not the pinned upstream file")
+  }
+  let out = trimModel(src)?
+  writeFile(outPath, out)?
+  return countModel(jsonParse(out)?)
+}
+
+fn main() {
+  let a = args()
+  if (len(a) < 2 || len(a) > 3) {
+    eprint("usage: trim <upstream-model.json> [out-file]\n")
+    exit(2)
+    return
+  }
+  let out = defaultOutPath
+  if (len(a) == 3) {
+    out = a[2]
+  }
+  let counts = run(a[1], out) catch e {
+    eprint("gens3 trim: ${e.message()}\n")
+    exit(1)
+    return
+  }
+  eprint("gens3 trim: operations=${counts.operations} members=${counts.members}\n")
+}
