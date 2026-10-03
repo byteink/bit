@@ -10,7 +10,7 @@ in-memory queue silently loses every pending job on deploy.
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { newPostgresStore, migrate, open, Options } from "jobs"
+import { PostgresStore, migrate, open, Options } from "jobs"
 import { Json } from "std/json"
 
 @job("send-welcome") @json class SendWelcome {
@@ -20,7 +20,7 @@ import { Json } from "std/json"
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
   migrate(db)?
-  let store = newPostgresStore(db)
+  let store = PostgresStore(db)
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?
@@ -40,7 +40,7 @@ Dispatch goes through the class, never a typed string:
 `register<T: Job>` and `enqueue<T: Job>` both read `T`'s `@job` name and use
 it to route the job to the right handler.
 
-`bit add bitlang.org/pkg/jobs@v0.1.0` adds it to your project.
+`bit add bitlang.org/pkg/jobs@v0.3.0` adds it to your project.
 
 ## Docs
 

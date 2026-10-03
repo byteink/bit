@@ -39,12 +39,12 @@ A job is a class with a stable name and a JSON-shaped payload. `open`
 builds a queue over a `Store`; `register` tells it what to do with a job
 type; `enqueue` adds one. `jobs` ships no default store (this package's own
 README), so every runnable example on this page opens a `PostgresStore` -
-see [PostgreSQL](postgres.md) for what `migrate` and `newPostgresStore` do.
+see [PostgreSQL](postgres.md) for what `migrate` and `PostgresStore` do.
 
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { newPostgresStore, migrate, open, Options, Store } from "jobs"
+import { PostgresStore, migrate, open, Options, Store } from "jobs"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,
@@ -53,7 +53,7 @@ import { newPostgresStore, migrate, open, Options, Store } from "jobs"
 fn main(): ()! {
   let db = pool(adapter(), Datasource{ uri = "postgres://localhost/myapp" })?
   migrate(db)?
-  let store = newPostgresStore(db)
+  let store = PostgresStore(db)
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?

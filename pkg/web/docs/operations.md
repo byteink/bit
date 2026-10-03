@@ -124,10 +124,10 @@ explicitly - `std/trace` ships no hidden default.
 
 ```bit
 import { App, tracing } from "web"
-import { newTracer } from "std/trace"
+import { Tracer } from "std/trace"
 
 fn mount(app: App) {
-  app.use(tracing(newTracer("", "myapp", 1.0)))
+  app.use(tracing(Tracer("", "myapp", 1.0)))
 }
 ```
 

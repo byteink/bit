@@ -72,7 +72,7 @@ to notice that happened.
 
 A full second-factor login is two requests, both routes [Getting
 started](getting-started.md) already showed you how to add to an `App`: the
-password step (`requireAuth([]Strategy{ newPasswordStrategy(users) })`)
+password step (`requireAuth([]Strategy{ PasswordStrategy(users) })`)
 succeeds and marks the session "awaiting 2FA" rather than fully
 authenticated - `c.session()?.set("2fa:pending", currentIdentity(c)?.id)?` -
 and a second route, `POST /login/totp`, reads that pending id back, calls

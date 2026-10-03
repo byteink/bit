@@ -7,12 +7,12 @@ Cloud Storage's XML API.
 
 ## Install
 
-`bit add bitlang.org/pkg/s3@v0.1.0` writes:
+`bit add bitlang.org/pkg/s3@v0.2.0` writes:
 
 ```json
 {
   "dependencies": {
-    "s3": "bitlang.org/pkg/s3@v0.1.0"
+    "s3": "bitlang.org/pkg/s3@v0.2.0"
   }
 }
 ```
@@ -20,10 +20,10 @@ Cloud Storage's XML API.
 ## Usage
 
 ```bit
-import { Config, list, newClient } from "s3"
+import { Client, Config, list } from "s3"
 
 fn main(): ()! {
-  let client = newClient(
+  let client = Client(
     Config{
       endpoint = "http://127.0.0.1:9000",
       region = "us-east-1",

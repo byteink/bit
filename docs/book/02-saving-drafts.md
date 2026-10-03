@@ -60,7 +60,7 @@ import { format, uuidV7 } from "std/uuid"
 import path from "std/path"
 
 // A fresh, time-ordered id for a new draft.
-export fn newId(): string {
+export fn randomId(): string {
   return format(uuidV7())
 }
 
@@ -207,7 +207,7 @@ fn usage() {
 fn cmdNew(title: string, body: string): ()! {
   let n = now().ns / 1_000_000_000
   let d = Draft{
-    id = newId(),
+    id = randomId(),
     title = title,
     body = body,
     tags = []string(0),

@@ -65,22 +65,21 @@ fn okta(oktaDomain: string, rootsPem: string): OidcStrategy! {
 ## Building a strategy with no preset scopes
 
 Every preset above widens the scope list with `withScopes` before handing
-the strategy back. `newOidcStrategy` is what they are built on: the same
-discovery and JWKS setup, but its default scope list is `openid` alone. Call
-it directly when you want to choose your scopes from a blank slate instead of
+the strategy back. `OidcStrategy(OidcSource.Discover(issuer, tls), ...)` is what they are built
+on: the same discovery and JWKS setup, but its default scope list is `openid`
+alone. Call it directly when you want to choose your scopes from a blank slate instead of
 overriding a preset's:
 
 ```bit
-import { newOidcStrategy } from "auth"
+import { OidcSource, OidcStrategy } from "auth"
 
 fn minimalScopeProvider(issuer: string, rootsPem: string): OidcStrategy! {
   let tls = TlsConfig(fromPem(rootsPem)?)
-  return newOidcStrategy(
-    issuer,
+  return OidcStrategy(
+    OidcSource.Discover(issuer, tls),
     "your-client-id",
     "your-client-secret",
     "https://app.example.com/auth/callback",
-    tls,
   )?
 }
 ```

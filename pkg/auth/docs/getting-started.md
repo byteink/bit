@@ -26,7 +26,7 @@ A `Lookup` is a function from username to a `LookupResult` - the stored hash,
 plus whatever you want to identify the user by afterward. `pkg/auth` holds no
 user table of its own; this is the only place it asks your app for data.
 
-`newPasswordStrategy(lookup)` wraps that into a `Strategy`, the interface
+`PasswordStrategy(lookup)` wraps that into a `Strategy`, the interface
 every authentication method in this package implements: a `name()` and an
 `authenticate(c)` that either returns an `Identity` or fails.
 
@@ -38,7 +38,7 @@ import {
   LookupResult,
   Strategy,
   currentIdentity,
-  newPasswordStrategy,
+  PasswordStrategy,
   requireAuth,
 } from "auth"
 import { Json } from "std/json"
@@ -59,7 +59,7 @@ fn build(): App {
   let lookup: Lookup = users
 
   let login = app.group("/login")
-  login.use(requireAuth([]Strategy{ newPasswordStrategy(lookup) }))
+  login.use(requireAuth([]Strategy{ PasswordStrategy(lookup) }))
   login.post("/", (c) => c.text("welcome"))
 
   app.get("/me", (c) => {

@@ -47,7 +47,7 @@ queue over a store, `register` tells it what to do with a job type, and
 ```bit
 import { pool, Datasource } from "std/sql"
 import { adapter } from "postgres"
-import { newPostgresStore, migrate, open, Options, Queue } from "jobs"
+import { PostgresStore, migrate, open, Options, Queue } from "jobs"
 
 @job("send-welcome") @json class SendWelcome {
   userId: i64,
@@ -61,7 +61,7 @@ fn sendWelcomeEmail(userId: i64): ()! {
 fn openJobQueue(databaseUrl: string): Queue! {
   let db = pool(adapter(), Datasource{ uri = databaseUrl })?
   migrate(db)?
-  let store = newPostgresStore(db)
+  let store = PostgresStore(db)
   let q = open(store, Options{ workers = 4 })?
   q.register<SendWelcome>((job: SendWelcome) => {
     sendWelcomeEmail(job.userId)?

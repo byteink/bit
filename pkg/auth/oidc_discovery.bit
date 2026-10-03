@@ -2,7 +2,7 @@
 // key-rotation and a rate-limited refetch-on-miss, independent of
 // `PasswordStrategy`.
 //
-// `discover`/`newJwksCache` both take an explicit `TlsConfig` rather than
+// `discover`/`JwksCache` both take an explicit `TlsConfig` rather than
 // reaching for a package default: `stdlib/http/client.bit`'s own
 // `defaultClientConfig`/`defaultRoots` are module-private, and nothing in
 // `std/http`/`std/tls` exports a way to build a secure-by-default config from
@@ -27,20 +27,19 @@
 // means "the real one" (`httpsGetTls`, which calls `std/http`'s `getTls`),
 // and a test substitutes a call-counting fake so the rate limiter and the
 // HTTP-call counts in this file's tests are provable with NO real network
-// and no TLS handshake. `discoverFetch`/`newJwksCacheFetch` themselves stay
-// module-private — see #6150's revision below for why the exported seam
-// lives elsewhere.
+// and no TLS handshake. `discoverFetch` itself stays module-private — see
+// #6150's revision below for why the exported seam lives elsewhere.
 //
-// #6150, REVISED: exporting `discoverFetch`/`newJwksCacheFetch`/
-// `handleCallbackFetch` (oidc_callback.bit) directly made a downstream
+// #6150, REVISED: exporting `discoverFetch`/`handleCallbackFetch`
+// (oidc_callback.bit) directly made a downstream
 // app's callback ROUTE call a different function in a test than in
 // production (`handleCallbackFetch` vs `handleCallback`) — exactly the
 // per-request ceremony a seam should remove; a route's own code must be
 // byte-for-byte identical in both. `HttpFetch` stays exported (a downstream
 // test still needs to name the type to write a fake), but the injection
-// point moves to construction time: `newJwksCacheFromJwks` (below) builds a
-// `JwksCache` from an already-known `Jwks` — no network call, real or
-// local, at all — and `OidcStrategy.tokenFetch` (oidc_authorize.bit) carries
+// point moves to construction time: `JwksCache(..., JwksSource.Parsed(jwks))`
+// (below) builds a `JwksCache` from an already-known `Jwks` — no network
+// call, real or local, at all — and `OidcStrategy.tokenFetch` (oidc_authorize.bit) carries
 // the callback's own seam on the STRATEGY VALUE, so `handleCallback(s, c)`
 // is the one call site in both production and a downstream app's test; only
 // how `s` was built differs, the same way `googleStrategy(...)` in
@@ -168,8 +167,25 @@ fn parseOidcConfig(body: string, issuer: string): OidcConfig! {
   }
 }
 
+// Where a `JwksCache` gets its first key set: `Remote` fetches `jwksUri`
+// over TLS under `tls` and parses it, `Parsed(jwks)` takes an already-known
+// `Jwks` with no HTTP call, real or local, at all.
+export enum JwksSource { Remote, Parsed(Jwks) }
+
 // A `Jwks` (`std/jwt`) kept fresh across key rotation, with a rate-limited
 // refetch on a `kid` miss (#5772's security requirement).
+//
+// `JwksCache(jwksUri, tls)` fetches `jwksUri` over TLS under `tls` and parses
+// it into a cache ready for `find`. `JwksCache(jwksUri, tls,
+// JwksSource.Parsed(jwks))` builds one already holding `jwks` — the exported
+// seam #6150 asks for: a downstream app's own test parses a canned JWKS body
+// with `std/jwt`'s public `parseJwks` and passes the result straight in, so
+// building a fake provider's key set needs no network access at all, not even
+// to a local server. Either way a future cache miss refetches through `fetch`
+// (`nil` meaning the real network, exactly like every other `HttpFetch` in
+// this file), and `find`/`doRefetch` (below) treat the result identically —
+// the rate-limited refetch-on-miss logic (#5772, #5788) is not a different
+// code path for a hand-built cache.
 //
 // BOUNDED: exactly one `Jwks` is ever held — `doRefetch` REPLACES `this.jwks`
 // wholesale, never appends to it — so the cache's size is the size of one
@@ -212,6 +228,23 @@ export class JwksCache {
   lastError: string
   refetchLock: Mutex
   fetch: HttpFetch
+
+  init(
+    jwksUri: string,
+    tls: TlsConfig,
+    source: JwksSource = JwksSource.Remote,
+    fetch: HttpFetch = nil,
+  )! {
+    this.jwksUri = jwksUri
+    this.tls = tls
+    this.jwks = initialJwks(jwksUri, tls, source, fetch)?
+    this.jwksLock = RWMutex()
+    this.hasRefetched = false
+    this.lastRefetch = Mono{ ns = 0 }
+    this.lastError = ""
+    this.refetchLock = Mutex()
+    this.fetch = fetch
+  }
 
   // The key for `kid`: a cache hit returns it with no HTTP call; a miss
   // refetches at most once per `jwksRefetchCooldownNs`.
@@ -268,50 +301,18 @@ export class JwksCache {
   }
 }
 
-// Fetches `jwksUri` over TLS under `tls` and parses it into a `JwksCache`
-// ready for `find`.
-export fn newJwksCache(jwksUri: string, tls: TlsConfig): JwksCache! {
-  return newJwksCacheFetch(jwksUri, tls, nil)?
-}
-
-// `newJwksCache` against an injected `HttpFetch` — the test seam. Module-
-// private, for the identical reason `discoverFetch` is: a downstream test
-// builds a `JwksCache` through `newJwksCacheFromJwks` instead.
-fn newJwksCacheFetch(jwksUri: string, tls: TlsConfig, fetch: HttpFetch): JwksCache! {
-  let body = fetchGet(fetch, tls, jwksUri) catch e {
-    fail newError("auth: newJwksCache(): fetching ${jwksUri}: ${e.message()}")
-  }
-  let jwks = parseJwks(body) catch e {
-    fail newError("auth: newJwksCache(): parsing ${jwksUri}: ${e.message()}")
-  }
-  return newJwksCacheFromJwks(jwksUri, tls, jwks, fetch)
-}
-
-// Builds a `JwksCache` already holding `jwks` — no HTTP call, real or local,
-// happens here — refetching through `fetch` on a future cache miss (`nil`
-// meaning the real network, exactly like every other `HttpFetch` in this
-// file). This is the exported seam #6150 asks for: a downstream app's own
-// test parses a canned JWKS body with `std/jwt`'s public `parseJwks` and
-// passes the result straight in, so building a fake provider's key set
-// needs no network access at all, not even to a local server. `find`/
-// `doRefetch` (below) treat the result identically to one `newJwksCache`
-// populated over the wire — the rate-limited refetch-on-miss logic (#5772,
-// #5788) is not a different code path for a hand-built cache.
-export fn newJwksCacheFromJwks(
-  jwksUri: string,
-  tls: TlsConfig,
-  jwks: Jwks,
-  fetch: HttpFetch,
-): JwksCache {
-  return JwksCache{
-    jwksUri = jwksUri,
-    tls = tls,
-    jwks = jwks,
-    jwksLock = RWMutex(),
-    hasRefetched = false,
-    lastRefetch = Mono{ ns = 0 },
-    lastError = "",
-    refetchLock = Mutex(),
-    fetch = fetch,
+// The key set `JwksCache`'s `init` starts from: `source`'s own `Jwks`, or the
+// document at `jwksUri` fetched through `fetch` and parsed.
+fn initialJwks(jwksUri: string, tls: TlsConfig, source: JwksSource, fetch: HttpFetch): Jwks! {
+  match (source) {
+    Parsed(jwks) => return jwks
+    Remote => {
+      let body = fetchGet(fetch, tls, jwksUri) catch e {
+        fail newError("auth: JwksCache(): fetching ${jwksUri}: ${e.message()}")
+      }
+      return parseJwks(body) catch e {
+        fail newError("auth: JwksCache(): parsing ${jwksUri}: ${e.message()}")
+      }
+    }
   }
 }

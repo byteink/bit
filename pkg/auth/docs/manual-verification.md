@@ -10,15 +10,15 @@ call them yourself.
 ## The three pieces
 
 - `discover(issuer, tls)` fetches the provider's discovery document into an
-  `OidcConfig` - the same first step `newOidcStrategy` takes.
-- `newJwksCache(jwksUri, tls)` builds a `JwksCache` that keeps the provider's
+  `OidcConfig` - the same first step `OidcStrategy`'s constructor takes.
+- `JwksCache(jwksUri, tls)` builds a `JwksCache` that keeps the provider's
   signing keys fresh, refetching on an unrecognized key id.
 - `verifyIdToken(token, config, jwks, nonce, opts)` checks the signature
   against the right key, the issuer, the audience, expiry, and the nonce, and
   returns the verified claims.
 
 ```bit
-import { OidcConfig, JwksCache, discover, newJwksCache, verifyIdToken } from "auth"
+import { OidcConfig, JwksCache, discover, verifyIdToken } from "auth"
 import { TlsConfig } from "std/tls"
 import { fromPem } from "std/crypto"
 import { defaultClaimsOptions } from "std/jwt"
@@ -34,7 +34,7 @@ class TokenVerifier {
 fn newTokenVerifier(issuer: string, clientId: string, rootsPem: string): TokenVerifier! {
   let tls = TlsConfig(fromPem(rootsPem)?)
   let config = discover(issuer, tls)?
-  let jwks = newJwksCache(config.jwksUri, tls)?
+  let jwks = JwksCache(config.jwksUri, tls)?
   return TokenVerifier{ config = config, jwks = jwks, clientId = clientId }
 }
 
@@ -48,7 +48,7 @@ fn verifyMobileToken(v: TokenVerifier, idToken: string, expectedNonce: string): 
 }
 ```
 
-`newJwksCache` fetches the key set once, up front, so a verifier built at
+`JwksCache(...)` fetches the key set once, up front, so a verifier built at
 startup is ready for the first request with no extra round trip; a later
 request for an unrecognized key id triggers at most one refetch per minute,
 so a burst of tokens signed with a just-rotated key costs one HTTP call, not

@@ -31,7 +31,7 @@ other in the response.
 
 ## The session id is regenerated on every successful login
 
-Both `newPasswordStrategy`'s strategy and `handleCallback` call
+Both `PasswordStrategy`'s strategy and `handleCallback` call
 `Session.regenerate()` (`pkg/web`) the moment they have a verified identity,
 before storing it. This closes session fixation: without it, a session id an
 attacker set on a victim before login stays valid after login, so the
@@ -50,7 +50,7 @@ satisfied by a document served under one of those aliases.
 
 ## Scopes default to `openid`, and stay that way
 
-`newOidcStrategy` requests `openid` alone unless you widen it.
+`OidcStrategy`'s constructor requests `openid` alone unless you widen it.
 `withScopes(s, scopes)` replaces a strategy's scope list outright, and
 refuses any list missing `openid` - every strategy this package builds is
 doing OpenID Connect, never bare OAuth2, so a scope list that drops the one
@@ -69,7 +69,7 @@ fn rejectsMissingOpenid(s: OidcStrategy): bool {
 
 ## What this package cannot check: your TLS roots
 
-`discover`, `newJwksCache` and the token exchange all take an explicit
+`discover`, `JwksCache` and the token exchange all take an explicit
 `TlsConfig` (`std/tls`) rather than a package default, because nothing in
 `std/tls` or this package exports a way to build a secure-by-default trust
 store from outside those modules. Supplying `insecureSkipVerify: true`, or a

@@ -8,13 +8,13 @@ needs to know which one ran.
 
 ## Install
 
-`bit add bitlang.org/pkg/auth@^0.3.0` (and `bitlang.org/pkg/web@^0.8.0`, which
+`bit add bitlang.org/pkg/auth@^0.4.0` (and `bitlang.org/pkg/web@^0.8.0`, which
 it runs on) writes:
 
 ```json
 {
   "dependencies": {
-    "auth": "bitlang.org/pkg/auth@^0.3.0",
+    "auth": "bitlang.org/pkg/auth@^0.4.0",
     "web": "bitlang.org/pkg/web@^0.8.0"
   }
 }
@@ -30,7 +30,7 @@ import {
   LookupResult,
   Strategy,
   currentIdentity,
-  newPasswordStrategy,
+  PasswordStrategy,
   requireAuth,
 } from "auth"
 import { Json } from "std/json"
@@ -51,7 +51,7 @@ fn build(): App {
   let lookup: Lookup = users
 
   let login = app.group("/login")
-  login.use(requireAuth([]Strategy{ newPasswordStrategy(lookup) }))
+  login.use(requireAuth([]Strategy{ PasswordStrategy(lookup) }))
   login.post("/", (c) => c.text("welcome"))
 
   app.get("/me", (c) => {
@@ -75,20 +75,20 @@ protected route that is not itself doing the authenticating just reads
   and what a successful one produces.
 - `requireAuth`, `currentIdentity` - the middleware that runs a `Strategy`
   list, and the accessor a protected route reads the result with.
-- `hashPassword`, `Lookup`, `LookupResult`, `newPasswordStrategy` - a
+- `hashPassword`, `Lookup`, `LookupResult`, `PasswordStrategy` - a
   password `Strategy` over your own user lookup, Argon2id underneath.
-- `OidcStrategy`, `newOidcStrategy`, `withScopes`, `beginAuthorization`,
+- `OidcStrategy`, `OidcSource`, `withScopes`, `beginAuthorization`,
   `handleCallback` - the OpenID Connect authorization-code flow with PKCE.
 - `googleStrategy`, `microsoftStrategy`, `genericOidcStrategy` - provider
-  presets over `newOidcStrategy`.
-- `OidcConfig`, `discover`, `JwksCache`, `newJwksCache`, `verifyIdToken` - the
+  presets over `OidcStrategy`'s constructor.
+- `OidcConfig`, `discover`, `JwksCache`, `JwksSource`, `verifyIdToken` - the
   discovery document and key set `OidcStrategy` is built from, and the ID
   token verifier, for a client that already holds a token and skips the
   redirect flow.
-- `HttpFetch`, `TokenFetch`, `newJwksCacheFromJwks`, `OidcStrategy.tokenFetch`
+- `HttpFetch`, `TokenFetch`, `JwksSource.Parsed`, `OidcSource.Given`, `OidcStrategy.tokenFetch`
   - the seam for testing your own callback route: `tokenFetch` on a strategy
   you build is `handleCallback`'s fake token-exchange endpoint, and
-  `newJwksCacheFromJwks` wraps an already-parsed `Jwks` with no network call
+  `JwksSource.Parsed` wraps an already-parsed `Jwks` with no network call
   - so `beginAuthorization`/`handleCallback` run unmodified against a fake
   provider; see [Testing your sign-in routes](docs/testing.md).
 - `Secret`, `generateSecret`, `parseSecret`, `provisioningUri`,
