@@ -137,11 +137,21 @@ tokenizer is built so that it does not matter:
 - After the first error, every later `next()` returns that same error. A
   caller that ignores a failure cannot go on to read a partial document as a
   whole one.
-- Depth, attributes per element and input size are bounded. The options of
-  `Tokenizer(...)` set them: `maxDepth` (default 256), `maxAttrs` (default
-  256) and `maxInput` (default 64 MiB). A document over a bound fails with
-  `TooDeep`, `TooManyAttributes` or `TooLarge`; a bound below 1 fails
-  construction with `BadLimit`.
+- Depth, attributes per element, name length and input size are bounded. The
+  options of `Tokenizer(...)` set them: `maxDepth` (default 256), `maxAttrs`
+  (default 256), `maxInput` (default 64 MiB) and `maxName` (default 1024
+  bytes, for an element or attribute name). A document over a bound fails
+  with `TooDeep`, `TooManyAttributes`, `TooLarge` or `NameTooLong`; a bound
+  below 1 fails construction with `BadLimit`. `TooLarge` is raised by
+  `Tokenizer(...)` itself, before a byte is read; the others by the `next()`
+  that reaches the offender.
+- The bytes must be well-formed UTF-8 and every character in the XML 1.0
+  `Char` range. A stray continuation byte, a truncated or overlong sequence,
+  a surrogate or a value above U+10FFFF fails with `BadEncoding`; U+FFFE,
+  U+FFFF and the control characters other than tab, line feed and carriage
+  return fail with `BadChar`. The same check covers text, attribute values,
+  comments, CDATA sections, processing instructions and names, and a name's
+  non-ASCII characters must be ones XML 1.0 (fifth edition) allows in a name.
 - A document whose bytes the tokenizer would misread is refused rather than
   guessed at: an XML declaration for a version other than 1.0, an encoding
   other than UTF-8 or US-ASCII, or a UTF-16 byte-order mark all fail with

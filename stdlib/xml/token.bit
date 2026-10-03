@@ -18,9 +18,14 @@
 //     once one has been returned every later `next()` returns that same error:
 //     a caller that ignores a failure and keeps pulling cannot read a partial
 //     document as a whole one.
-//   - Element nesting, attributes per element and total input are bounded
-//     (`Tokenizer`'s options), and every loop below advances the read position
-//     or ends, so a document costs time and memory linear in its length.
+//   - Element nesting, attributes per element, name length and total input are
+//     bounded (`Tokenizer`'s options), and every loop below advances the read
+//     position or ends, so a document costs time and memory linear in its
+//     length.
+//   - The input must be well-formed UTF-8 in the XML 1.0 Char range, checked
+//     wherever bytes are consumed (text, attribute values, comments, CDATA,
+//     processing instructions, names): `BadEncoding` for malformed UTF-8,
+//     `BadChar` for a character XML forbids.
 //
 // Line ends follow XML 1.0 §2.11: a literal CR LF or lone CR reads as LF; only
 // the character reference `&#13;` yields a CR. Attribute values follow §3.3.3:
@@ -68,25 +73,34 @@ export class Tokenizer {
   buf: []byte
   maxDepth: int
   maxAttrs: int
+  maxName: int
   started: bool
   rootDone: bool
   failure: Option<XmlError>
 
   // `src` is the document. `maxDepth` bounds how deeply elements nest,
-  // `maxAttrs` the attributes on one element, `maxInput` the bytes of `src`.
-  // Fails with `BadLimit` for a limit below 1 and with `TooLarge` for an input
-  // over `maxInput`, before any scanning.
-  init(src: []byte, maxDepth: int = 256, maxAttrs: int = 256, maxInput: int = 67108864)! {
+  // `maxAttrs` the attributes on one element, `maxInput` the bytes of `src`,
+  // `maxName` the bytes of one element or attribute name. Fails with
+  // `BadLimit` for a limit below 1 and with `TooLarge` for an input over
+  // `maxInput`, before any scanning.
+  init(
+    src: []byte,
+    maxDepth: int = 256,
+    maxAttrs: int = 256,
+    maxInput: int = 67108864,
+    maxName: int = 1024,
+  )! {
     this.src = src
     this.pos = 0
     this.stack = []string(0)
     this.buf = []byte(0)
     this.maxDepth = maxDepth
     this.maxAttrs = maxAttrs
+    this.maxName = maxName
     this.started = false
     this.rootDone = false
     this.failure = Option<XmlError>.None
-    if (maxDepth < 1 || maxAttrs < 1 || maxInput < 1) {
+    if (maxDepth < 1 || maxAttrs < 1 || maxInput < 1 || maxName < 1) {
       fail this.bad(XmlErrorKind.BadLimit, 0, "a limit must be at least 1")
     }
     if (len(src) > maxInput) {
@@ -183,20 +197,75 @@ export class Tokenizer {
     return q
   }
 
+  // A Name at the read position (XML 1.0 §2.3), at most `maxName` bytes. The
+  // loop reads ASCII inline: this is the hottest loop of a typical document.
   readName(): string! {
     let start = this.pos
     if (start >= len(this.src)) {
       fail this.bad(XmlErrorKind.UnexpectedEof, start, "unexpected end of input, expected a name")
     }
-    if (!xmlNameStart(this.src[start])) {
+    let i = start
+    let b = this.src[start]
+    if (b >= 0x80) {
+      i = this.nameRuneAt(start, true)?
+    } else if (xmlNameStart(b)) {
+      i = start + 1
+    } else {
       fail this.bad(XmlErrorKind.BadName, start, "a name cannot start with this byte")
     }
-    let i = start + 1
-    while (i < len(this.src) && xmlNameChar(this.src[i])) {
-      i = i + 1
+    while (i < len(this.src)) {
+      b = this.src[i]
+      if (b >= 0x80) {
+        i = this.nameRuneAt(i, false)?
+      } else if (xmlNameChar(b)) {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+    if (i - start > this.maxName) {
+      fail this.bad(
+        XmlErrorKind.NameTooLong,
+        start,
+        "a name is longer than the limit of ${this.maxName} bytes",
+      )
     }
     this.pos = i
     return string(this.src[start:i])
+  }
+
+  // The index just past the non-ASCII name character at `i`; `first` selects
+  // the start-of-name class.
+  nameRuneAt(i: int, first: bool): int! {
+    let r = this.runeAt(i)?
+    let ok = xmlNameRune(r)
+    if (first) {
+      ok = xmlNameStartRune(r)
+    }
+    if (!ok) {
+      fail this.bad(XmlErrorKind.BadName, i, "this character cannot be part of a name")
+    }
+    return i + xmlRuneLen(r)
+  }
+
+  // The code point of the non-ASCII character at `i`: the bytes must be
+  // well-formed UTF-8 and the code point in the XML Char production.
+  runeAt(i: int): int! {
+    let r = xmlDecode(this.src, i)
+    if (r < 0) {
+      fail this.bad(XmlErrorKind.BadEncoding, i, "the input is not well-formed UTF-8")
+    }
+    if (!xmlLegalRune(r)) {
+      fail this.bad(XmlErrorKind.BadChar, i, "code point ${r} is not allowed in XML")
+    }
+    return r
+  }
+
+  // Copies the non-ASCII character at the read position into `buf`.
+  copyHigh(): ()! {
+    let n = xmlRuneLen(this.runeAt(this.pos)?)
+    this.buf = append(this.buf, ...this.src[this.pos:this.pos + n])
+    this.pos = this.pos + n
   }
 
   advance(): Token! {
@@ -402,6 +471,10 @@ export class Tokenizer {
       this.lineEnd(b, attr)
       return
     }
+    if (b >= 0x80) {
+      this.copyHigh()?
+      return
+    }
     fail this.bad(XmlErrorKind.BadChar, this.pos, "byte ${int(b)} is not allowed in XML")
   }
 
@@ -546,6 +619,10 @@ export class Tokenizer {
       this.lineEnd(b, false)
       return false
     }
+    if (b >= 0x80) {
+      this.copyHigh()?
+      return false
+    }
     fail this.bad(XmlErrorKind.BadChar, this.pos, "byte ${int(b)} is not allowed in XML")
   }
 
@@ -560,6 +637,10 @@ export class Tokenizer {
         }
         this.pos = i + 3
         return
+      }
+      if (b >= 0x80) {
+        i = i + xmlRuneLen(this.runeAt(i)?)
+        continue
       }
       if (!xmlLegalByte(b)) {
         fail this.bad(XmlErrorKind.BadChar, i, "byte ${int(b)} is not allowed in XML")
@@ -593,6 +674,10 @@ export class Tokenizer {
       if (this.src[i] == '?' && this.at(i + 1) == '>') {
         this.pos = i + 2
         return
+      }
+      if (this.src[i] >= 0x80) {
+        i = i + xmlRuneLen(this.runeAt(i)?)
+        continue
       }
       if (!xmlLegalByte(this.src[i])) {
         fail this.bad(XmlErrorKind.BadChar, i, "byte ${int(this.src[i])} is not allowed in XML")
