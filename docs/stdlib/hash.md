@@ -108,3 +108,92 @@ fn matchesWhole(chunks: [][]byte, whole: []byte): bool {
   return streamedChecksum(chunks) == crc64nvme(whole)
 }
 ```
+
+## xxHash64
+
+Inkwell stores every draft under a key, and the backup tool wants to know
+whether two drafts are identical without comparing them byte for byte - and
+to spread them across shards. A CRC is the wrong tool for that: it is built to
+catch corruption in a channel, not to mix its input evenly. xxHash64 is Yann
+Collet's non-cryptographic 64-bit hash (the XXH64 of the
+[xxHash](https://github.com/Cyan4973/xxHash) library): well mixed, faster than
+`crc64nvme`, and the S3 `XXHASH64` checksum algorithm.
+Like the CRCs it is **not** for detecting tampering - anyone who knows the
+seed can build colliding inputs; use `std/crypto` for that. Its result is
+bit-for-bit the reference library's `XXH64`: the one-shot and the streaming
+hasher are both checked against the reference's own 8322 sanity vectors
+(every length 0 to 4160, two seeds) and a 1 MiB buffer.
+
+### `xxhash64(data: []byte, seed: u64 = 0): u64`
+
+The xxHash64 of `data` under `seed`. The seed is the full 64 bits and defaults
+to `0`. The empty slice hashes to `0xEF46DB3751D8E999` under seed `0`, and
+`xxhash64([]byte("abc"))` is `0x44BC2CF5AD770999`. Different seeds give
+unrelated hashes of the same bytes, which is how to derive several
+independent hash functions from one.
+
+```bit
+import { xxhash64 } from "std/hash"
+
+// Which of `shards` backup shards stores this draft.
+fn shardFor(draftKey: string, shards: int): int {
+  return int(xxhash64([]byte(draftKey)) % u64(shards))
+}
+
+// Two drafts are the same text with overwhelming probability when their
+// hashes match; compare the bytes only on a match.
+fn probablySame(a: []byte, b: []byte): bool {
+  return xxhash64(a) == xxhash64(b)
+}
+```
+
+### `Xxhash64(seed: u64 = 0)`
+
+A streaming hasher, for a body that arrives in chunks and should not be
+concatenated first. `Xxhash64()` starts a hash under seed `0`;
+`Xxhash64(seed)` under that seed. Whatever the chunking - one byte at a time,
+chunks of 7, 32 or 33 bytes, empty chunks in between - the result equals
+`xxhash64` of the concatenation, so a streamed S3 upload and a one-shot hash
+of the same object agree.
+
+### `Xxhash64.update(data: []byte)`
+
+Absorbs `data`. Bytes that do not yet fill a 32-byte stripe wait inside the
+hasher, so no call allocates per chunk.
+
+### `Xxhash64.digest(): u64`
+
+The hash of everything absorbed so far. It does not consume the hasher: call
+it after every chunk for a running value, and keep calling `update` after.
+
+### `Xxhash64.reset()`
+
+Rewinds to the empty input under the same seed, so one hasher can hash many
+drafts in turn.
+
+```bit
+import { Xxhash64, xxhash64 } from "std/hash"
+
+// Hash a draft that is read in chunks, then reuse the hasher for the next.
+fn hashDrafts(first: [][]byte, second: [][]byte): bool {
+  let h = Xxhash64()
+  for chunk of first {
+    h.update(chunk)
+  }
+  let firstHash = h.digest()
+  h.reset()
+  for chunk of second {
+    h.update(chunk)
+  }
+  let secondHash = h.digest()
+  return firstHash != secondHash
+}
+
+fn matchesOneShot(chunks: [][]byte, whole: []byte): bool {
+  let h = Xxhash64(42)
+  for chunk of chunks {
+    h.update(chunk)
+  }
+  return h.digest() == xxhash64(whole, 42)
+}
+```
