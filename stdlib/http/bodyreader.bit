@@ -1,0 +1,460 @@
+// stdlib/http/bodyreader.bit — pull-style streaming responses (#6580).
+//
+// `Client.send(req, stream = true)` (client.bit) returns the status line and
+// headers of a response BEFORE any body byte is read, with the body behind a
+// `BodyReader` the caller pulls from. Memory is O(one read), never O(body):
+// a 5 GiB object streams through a 64 KiB window. It replaces the sink
+// callback `getStreaming` (streambody.bit) for new code, which stays as it is.
+//
+// Rules this file keeps, because the device it runs on has no human to fix it:
+//
+//   * every read is bounded: by the caller's `max`, by `maxReadBytes`, and the
+//     head and every framing line by their own byte limits, so a hostile
+//     server cannot make this process buffer more than a few tens of KiB;
+//   * every failure is an error, never a short body that looks complete: a
+//     connection that closes before its Content-Length or before the final
+//     chunk fails the read that hit it;
+//   * a connection is shut on the first read error, at the end of the body, and
+//     on `close()`; it is NEVER handed back to the pool here. Every request
+//     this file sends says `Connection: close`, so nothing could reuse it
+//     (reuse after a full read is #6596's, and only after a full read);
+//   * a streamed exchange holds its origin's `maxConnsPerHost` slot (pool.bit)
+//     until the connection is shut, so a caller that never reads cannot
+//     exceed the cap it configured.
+//
+// A streamed response is not redirected: the 3xx is returned as it came, with
+// its `Location` header, because the body of the response the caller asked
+// for is what it holds. It speaks HTTP/1.1 only (ALPN `http/1.1`); an
+// `https+h3://` URL is refused.
+//
+// `byteStream`, `connSlot`, `Url`, `Header`, `Response`, `RequestExtras`,
+// `buildRequest`, `parseUrl`, `parseStatusCode`, `bodyless`, `header`,
+// `hexToInt`, `trimSpace`, `dialConn`, `dialTlsConn`, `poolKey`,
+// `maxHeaderBytes`, `netStream`, `tlsStream`, `TlsConfig`, `newError`, `atoi`,
+// `indexOf`, `toLower` and `hasPrefix` are siblings or module-wide imports
+// (SPEC §19): nothing is imported here.
+
+// The most bytes one `BodyReader.read` returns, whatever `max` asks for.
+const maxReadBytes: int = 65536
+
+// The longest chunk-size line or trailer field line accepted.
+const maxFramingLine: int = 4096
+
+// Trailer field lines accepted after the final chunk.
+const maxTrailerLines: int = 64
+
+// Interim (1xx, other than 101) responses skipped before the final one.
+const maxInterimResponses: int = 8
+
+// The states of a `BodyReader`. `Open` is the only one that holds a connection.
+const readerOpen: int = 0
+const readerEof: int = 1
+const readerClosed: int = 2
+const readerFailed: int = 3
+
+// A request for `Client.send` (client.bit): `method` and `url` as `Client.request`
+// takes them, `headers` layered onto the client's own defaults exactly as
+// `Client.requestWith` layers them, `body` sent whole with a Content-Length.
+export class ClientRequest {
+  export method: string = "GET",
+  export url: string = "",
+  export headers: []Header,
+  export body: string = "",
+}
+
+// How the body of one response is delimited (RFC 9112 §6.3).
+enum BodyFraming {
+  Empty,
+  Length,
+  Chunked,
+  UntilClose,
+}
+
+// What the head of a final response said: the status, the raw header block, and
+// the framing of the body behind it (`length` is the Content-Length for
+// `Length`, else 0).
+class streamHead {
+  status: int,
+  headers: string,
+  framing: BodyFraming,
+  length: int,
+}
+
+// The body of a streamed response, pulled by `read` until it returns an empty
+// slice. Obtained from `Response.reader` after `Client.send(req, stream = true)`.
+//
+// Close it with `close()` unless `read` has returned an empty slice (or the
+// Content-Length bytes are all read): until then it owns an open connection.
+// Nothing frees an abandoned reader for you.
+export class BodyReader {
+  stream: byteStream
+  slot: connSlot
+  framing: BodyFraming
+  // Bytes left in the Content-Length body, or in the current chunk.
+  left: int
+  // The CRLF that ends a chunk's data is still to be consumed.
+  crlf: bool
+  state: int
+
+  // Up to `max` bytes of the body, at least 1; an EMPTY slice only at the clean
+  // end of the body, and again on every later call. May return fewer than
+  // `max` (never more than 65536 whatever `max` is): loop until it is empty.
+  // Fails, and closes the connection, when the connection ends or breaks before
+  // the body does, when the framing is malformed, and on a read deadline;
+  // later calls fail too. Fails after `close()`. `max` below 1 is an error.
+  export read(max: int): []byte! {
+    if (max < 1) {
+      fail newError("BodyReader.read: max is ${max}; it must be at least 1")
+    }
+    if (this.state == readerClosed) {
+      fail newError("BodyReader.read: the reader is closed")
+    }
+    if (this.state == readerFailed) {
+      fail newError("BodyReader.read: an earlier read failed")
+    }
+    if (this.state == readerEof) {
+      return []byte(0)
+    }
+    let want = max
+    if (want > maxReadBytes) {
+      want = maxReadBytes
+    }
+    let piece = this.pull(want) catch e {
+      this.finish(readerFailed)
+      fail e
+    }
+    if (len(piece) == 0 || this.drained()) {
+      this.finish(readerEof)
+    }
+    return []byte(piece)
+  }
+
+  // Shuts the connection if the body was not read to its end, and makes every
+  // later `read` fail. Safe to call any number of times.
+  export close() {
+    if (this.state == readerOpen) {
+      this.finish(readerClosed)
+      return
+    }
+    this.state = readerClosed
+  }
+
+  // One bounded read of the body: "" at its clean end.
+  pull(n: int): string! {
+    match (this.framing) {
+      Empty => return ""
+      Length => return this.pullSized(n)?
+      Chunked => return this.pullChunked(n)?
+      UntilClose => return this.stream.readUp(n)?
+    }
+  }
+
+  // Up to `n` of the `left` bytes still owed; the connection closing first is
+  // an error, not an end.
+  pullSized(n: int): string! {
+    if (this.left == 0) {
+      return ""
+    }
+    let want = n
+    if (want > this.left) {
+      want = this.left
+    }
+    let piece = this.stream.readUp(want)?
+    if (len(piece) == 0) {
+      fail newError("response: connection closed with ${this.left} bytes of the body unread")
+    }
+    if (len(piece) > want) {
+      fail newError("response: ${len(piece)} bytes arrived for a read of ${want}")
+    }
+    this.left = this.left - len(piece)
+    return piece
+  }
+
+  // As `pullSized` for a chunked body: the next chunk's header is read when the
+  // current chunk is spent, and a size of 0 (the final chunk, its trailer
+  // section consumed) is the end.
+  pullChunked(n: int): string! {
+    if (this.left == 0) {
+      this.left = this.nextChunk()?
+    }
+    if (this.left == 0) {
+      return ""
+    }
+    let piece = this.pullSized(n)?
+    if (this.left == 0) {
+      this.crlf = true
+    }
+    return piece
+  }
+
+  // The size of the next chunk, after the CRLF that closed the previous one; 0
+  // after the final chunk's trailer section has been read up to its blank line.
+  nextChunk(): int! {
+    if (this.crlf) {
+      this.crlf = false
+      let _ = readLineBounded(this.stream, 0, "chunk terminator")?
+    }
+    let line = readLineBounded(this.stream, maxFramingLine, "chunk size line")?
+    let token = line
+    let semi = indexOf(line, ";")
+    if (semi >= 0) {
+      token = line[0:semi]
+    }
+    let size = hexToInt(trimSpace(token))
+    if (size < 0) {
+      fail newError("response: bad chunk size '${token}'")
+    }
+    if (size > 0) {
+      return size
+    }
+    this.skipTrailers()?
+    return 0
+  }
+
+  // Consumes the trailer section after the final chunk, up to and including
+  // its blank line: at most `maxTrailerLines` lines of `maxFramingLine` bytes.
+  skipTrailers(): ()! {
+    let seen = 0
+    while (seen <= maxTrailerLines) {
+      seen = seen + 1
+      let field = readLineBounded(this.stream, maxFramingLine, "trailer field")?
+      if (len(field) == 0) {
+        return
+      }
+    }
+    fail newError("response: more than ${maxTrailerLines} trailer fields")
+  }
+
+  // Whether the whole Content-Length body has been handed out, so the
+  // connection can go without waiting for a read that returns empty.
+  drained(): bool {
+    match (this.framing) {
+      Length => return this.left == 0
+      Empty => return true
+      Chunked => return false
+      UntilClose => return false
+    }
+  }
+
+  // Leaves `Open`: shuts the connection and frees the origin's slot. Called
+  // once, from `Open` only.
+  finish(next: int) {
+    this.state = next
+    this.stream.shut()
+    this.slot.release()
+  }
+}
+
+// The text before the first CRLF the stream delivers, which must come within
+// `limit` bytes; bytes past that CRLF go back to the stream for the next read.
+// `what` names the line in the error.
+fn readLineBounded(s: byteStream, limit: int, what: string): string! {
+  let acc = ""
+  let reads = 0
+  // Each pass adds at least one byte, so `limit + 3` passes either find the CRLF
+  // or leave `acc` past `limit` for the check below to refuse.
+  while (reads <= limit + 3) {
+    reads = reads + 1
+    let at = indexOf(acc, "\r\n")
+    if (at >= 0) {
+      if (at > limit) {
+        fail newError("response: ${what} exceeds ${limit} bytes")
+      }
+      s.unread(acc[at + 2:len(acc)])
+      return acc[0:at]
+    }
+    // A CRLF that starts at or before `limit` ends at `limit + 1` at the latest.
+    if (len(acc) >= limit + 2) {
+      fail newError("response: ${what} exceeds ${limit} bytes")
+    }
+    let piece = s.readUp(maxFramingLine)?
+    if (len(piece) == 0) {
+      fail newError("response: connection closed inside the ${what}")
+    }
+    acc = acc + piece
+  }
+  fail newError("response: ${what} exceeds ${limit} bytes")
+}
+
+// The head of a response: everything before the blank line, which must come
+// within `maxHeaderBytes`; bytes past it (the start of the body) go back to the
+// stream.
+fn readHeadBlock(s: byteStream): string! {
+  let acc = ""
+  let reads = 0
+  while (reads <= maxHeaderBytes + 5) {
+    reads = reads + 1
+    let at = indexOf(acc, "\r\n\r\n")
+    if (at > maxHeaderBytes) {
+      fail newError("response: head exceeds ${maxHeaderBytes} bytes")
+    }
+    if (at >= 0) {
+      s.unread(acc[at + 4:len(acc)])
+      return acc[0:at]
+    }
+    if (len(acc) >= maxHeaderBytes + 4) {
+      fail newError("response: head exceeds ${maxHeaderBytes} bytes")
+    }
+    let piece = s.readUp(maxFramingLine)?
+    if (len(piece) == 0) {
+      fail newError("response: connection closed inside the head")
+    }
+    acc = acc + piece
+  }
+  fail newError("response: head exceeds ${maxHeaderBytes} bytes")
+}
+
+// A Content-Length: decimal digits only, at most 18 of them; -1 for anything
+// else, a sign, a list ("5, 5"), a space inside, an empty value.
+fn parseLength(text: string): int {
+  if (len(text) == 0 || len(text) > 18) {
+    return -1
+  }
+  let i = 0
+  while (i < len(text)) {
+    if (text[i] < '0' || text[i] > '9') {
+      return -1
+    }
+    i = i + 1
+  }
+  return atoi(text)
+}
+
+// How the body of a response with `headers` to `method` ends, per RFC 9112
+// §6.3: nothing for HEAD and for 204/304, chunked, Content-Length, else the
+// connection closing. Both framing fields together are refused outright.
+fn framingOf(headers: string, method: string, status: int): streamHead! {
+  let head = streamHead{
+    status = status,
+    headers = headers,
+    framing = BodyFraming.Empty,
+    length = 0,
+  }
+  if (bodyless(method, status)) {
+    return head
+  }
+  let clText = header(headers, "content-length")
+  let teText = toLower(header(headers, "transfer-encoding"))
+  if (len(clText) > 0 && len(teText) > 0) {
+    fail newError("response: Content-Length and Transfer-Encoding both present")
+  }
+  if (len(teText) > 0) {
+    if (teText != "chunked") {
+      fail newError("response: unsupported Transfer-Encoding")
+    }
+    head.framing = BodyFraming.Chunked
+    return head
+  }
+  if (len(clText) == 0) {
+    head.framing = BodyFraming.UntilClose
+    return head
+  }
+  head.length = parseLength(clText)
+  if (head.length < 0) {
+    fail newError("response: invalid Content-Length '${clText}'")
+  }
+  head.framing = BodyFraming.Length
+  return head
+}
+
+// The status of the head block `block`, which must open with an HTTP/1.x
+// status line, and the header lines after it.
+fn parseHeadBlock(block: string, method: string): streamHead! {
+  let eol = indexOf(block, "\r\n")
+  let statusLine = block
+  let headers = ""
+  if (eol >= 0) {
+    statusLine = block[0:eol]
+    headers = block[eol + 2:len(block)]
+  }
+  if (!hasPrefix(statusLine, "HTTP/1.")) {
+    fail newError("response: not an HTTP/1.x status line")
+  }
+  let status = parseStatusCode(statusLine)?
+  if (status == 101) {
+    fail newError("response: 101 Switching Protocols on a streamed request")
+  }
+  return framingOf(headers, method, status)?
+}
+
+// The final response's head, after skipping interim 1xx responses.
+fn readStreamHead(s: byteStream, method: string): streamHead! {
+  let seen = 0
+  while (seen <= maxInterimResponses) {
+    seen = seen + 1
+    let head = parseHeadBlock(readHeadBlock(s)?, method)?
+    if (head.status < 100 || head.status >= 200) {
+      return head
+    }
+  }
+  fail newError("response: more than ${maxInterimResponses} interim responses")
+}
+
+// A TLS config like `cfg` that offers HTTP/1.1 only: a streamed response is
+// read by this file's HTTP/1.1 framing, so ALPN must never pick h2. A copy,
+// because `cfg` is the client's own and stays as it is.
+fn http1Only(cfg: TlsConfig): TlsConfig {
+  return TlsConfig(
+    cfg.roots,
+    serverName = cfg.serverName,
+    alpn = ["http/1.1"],
+    insecureSkipVerify = cfg.insecureSkipVerify,
+    nowUnix = cfg.nowUnix,
+  )
+}
+
+// A connection to `u`'s origin, over TLS for https, bounded by `extras.deadline`.
+fn dialStream(u: Url, extras: RequestExtras): byteStream! {
+  if (u.https) {
+    return tlsStream{ conn = dialTlsConn(u, http1Only(extras.config), extras.deadline)? }
+  }
+  return netStream{ conn = dialConn(u, extras.deadline)? }
+}
+
+// Writes `req` on `s` and reads the response head, returning it with the reader
+// over its body. A response with no body is finished here: its connection is
+// shut and its slot freed before the caller sees it.
+fn startStream(s: byteStream, slot: connSlot, req: string, method: string): Response! {
+  s.writeStr(req)?
+  let head = readStreamHead(s, method)?
+  let reader = BodyReader{
+    stream = s,
+    slot = slot,
+    framing = head.framing,
+    left = head.length,
+    crlf = false,
+    state = readerOpen,
+  }
+  if (reader.drained()) {
+    reader.finish(readerEof)
+  }
+  return Response{
+    status = head.status,
+    contentType = header(head.headers, "content-type"),
+    headers = head.headers,
+    body = "",
+    reader = Option.Some(reader),
+  }
+}
+
+// `method u` with `body`, answered by a response whose body has not been read:
+// a fresh connection (never a pooled one) under the origin's
+// `maxConnsPerHost` slot, both released on every failure here and by the
+// returned reader otherwise.
+fn openStream(method: string, u: Url, body: string, extras: RequestExtras): Response! {
+  if (u.h3) {
+    fail newError("send: https+h3:// cannot stream a response")
+  }
+  let slot = extras.pool.acquire(poolKey(u), extras.deadline)?
+  let s = dialStream(u, extras) catch e {
+    slot.release()
+    fail e
+  }
+  let req = buildRequest(method, u, extras.block, body, true)
+  let res = startStream(s, slot, req, method) catch e {
+    s.shut()
+    slot.release()
+    fail e
+  }
+  return res
+}

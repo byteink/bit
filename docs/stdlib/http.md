@@ -121,6 +121,53 @@ bounds the memory the *server's* declared length can force, not what this
 call buffers. Both cover `http://` and `https://` only; `https+h3://` is
 refused.
 
+### Reading a body as it arrives
+
+`getStreaming` pushes a body into a callback. `Client.send` with
+`stream = true` is the pull form: it returns as soon as the status line and
+headers have arrived, and the body stays on the wire until you ask for it, so
+a 404 is visible before its error document is read and a 5 GiB object never
+sits in memory.
+
+```bit
+import { Client, ClientRequest } from "std/http"
+
+// The size of `url`'s body, or -1 for any status but 200. Holds one
+// 64 KiB read at a time, however large the body is.
+fn download(c: Client, url: string): int! {
+  let res = c.send(ClientRequest{ url = url }, stream = true)?
+  let body = unwrap(res.reader)
+  if (res.status != 200) {
+    body.close()
+    return 0 - 1
+  }
+  let total = 0
+  while (true) {
+    let piece = body.read(65536)?
+    if (len(piece) == 0) {
+      return total
+    }
+    total = total + len(piece)
+  }
+}
+```
+
+`res.reader` is the `BodyReader`; `res.body` is `""`. `read(max)` returns at
+least one byte and at most `max` (never more than 65536), and an empty slice
+only at the end of the body. It never reports a truncated body as complete:
+a connection that closes before its `Content-Length` bytes, or before the
+final chunk, fails the read. Content-Length, chunked and read-to-close bodies
+all work.
+
+A reader owns its connection until the body ends. It closes it when `read`
+returns the empty slice, when a read fails, and when you call `close()`; call
+`close()` for any body you stop reading early or never start, such as the 404
+above. The connection is closed, never kept for another request. A streamed
+request is HTTP/1.1 only, is not redirected (a 3xx comes back as it is), takes
+a connection of its own that counts against `maxConnsPerHost` until the reader
+is done, and is not limited by `setMaxBodyBytes`: you bound it by how much you
+read.
+
 ### A client that reuses connections
 
 The package-level functions above dial a fresh connection for each call
@@ -413,6 +460,7 @@ starting from exactly the handler shown above.
 | a server that never answers, called with `get`/`post`/`request` | the call parks forever - use `*Timeout` |
 | setting `Accept-Encoding` yourself | `requestWith` fails - this stdlib has no response decompressor |
 | a response over the body-size budget (32 MiB default) | the call fails before the bytes are read |
+| a `BodyReader` neither read to the end nor closed | its connection and its `maxConnsPerHost` slot stay held - `close()` it |
 | a redirect to another host, port or scheme | `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` are dropped, defaults included |
 | a redirect from `https` to `http` | the call fails - opt in with `RedirectAllow.Downgrade` |
 | a `307` or `308` with a body to another origin | the call fails - opt in with `RedirectAllow.ReplayBody` |
@@ -447,7 +495,10 @@ header with `header(req.headers, name)`.
 An HTTP response: `status`, `contentType`, the raw `headers` block, and
 `body`. The server fills in `Content-Length` and `Connection` for you. A
 response a client returns also carries `url`, the address it finally came
-from, and `redirects`, the number of redirects followed to get there.
+from, and `redirects`, the number of redirects followed to get there. One
+returned by `Client.send(req, stream = true)` has `reader`, an
+`Option<BodyReader>` holding the unread body, and `body == ""`; on every other
+response `reader` is `None`.
 
 ### `header(block: string, name: string): string`
 
@@ -586,6 +637,38 @@ As `Client.post`, bounded by one deadline.
 ### `Client.requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
 
 As `Client.request`, bounded by one deadline.
+
+### `ClientRequest`
+
+A request for `Client.send`: `method` (`"GET"` by default), `url`, `headers`
+(`[]Header`, layered onto the client's own as `Client.requestWith` does) and
+`body` (`""` by default).
+
+### `Client.send(req: ClientRequest, stream: bool = false): Response!`
+
+As `Client.requestWith` for `req`. With `stream = true` it returns once the
+response head has arrived: `status` and `headers` are set, `body` is `""` and
+`reader` holds the `BodyReader` the body is pulled from. See [Reading a body
+as it arrives](#reading-a-body-as-it-arrives) for what a streamed request
+does and does not do.
+
+### `BodyReader`
+
+The unread body of a streamed response, from `Response.reader`. It owns an
+open connection until the body ends, a read fails or `close()` is called.
+
+### `BodyReader.read(max: int): []byte!`
+
+Up to `max` bytes of the body, at least one, at most 65536; an empty slice only
+at the end of the body, and again on every call after it. Fails, and closes the
+connection, when the connection ends or breaks before the body does or the
+framing is malformed; every later call fails too. Fails after `close()`, and
+for a `max` below 1 (leaving the reader as it was).
+
+### `BodyReader.close()`
+
+Closes the connection if the body has not ended and makes every later `read`
+fail. Calling it again does nothing.
 
 ### `PoolLimits`
 

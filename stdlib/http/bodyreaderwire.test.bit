@@ -1,0 +1,350 @@
+// stdlib/http/bodyreaderwire.test.bit — `Client.send(req, stream = true)` over a
+// real loopback connection (#6580), the wire half of bodyreader.test.bit,
+// whose `readerOf` and `drain` helpers it uses; same module (SPEC §19), so
+// nothing is imported.
+
+// ---------------------------------------------------------------------------
+// A real Client against a raw loopback origin
+// ---------------------------------------------------------------------------
+
+// What every connection to a `srOrigin` is answered with. `head` is written
+// first; then, when `gated`, the origin waits for a value on `gate`; then the
+// body: `big` bytes of `srByte` pattern if `big` > 0, else `body`. The
+// connection is closed after the body, as `Connection: close` asked.
+class srPlan {
+  head: string,
+  body: string,
+  big: int,
+  gated: bool,
+  gate: chan<int>,
+}
+
+class srOrigin {
+  l: Listener,
+  accepts: AtomicI64,
+  port: int,
+}
+
+// The byte at offset `i` of the pattern body: not constant, and with a period
+// (251) that no power-of-two transport size lines up with.
+fn srByte(i: int): int {
+  return (i * 31 + 7) % 251
+}
+
+fn srPattern(): string {
+  let b = []byte(251 * 261)
+  let i = 0
+  while (i < len(b)) {
+    b[i] = byte(srByte(i))
+    i = i + 1
+  }
+  return string(b)
+}
+
+// Writes `total` pattern bytes: write `k` is the slice of the repeated pattern
+// that starts at the offset `srByte` expects, so the stream is the pattern.
+fn srWriteBig(c: Conn, total: int) {
+  let pat = srPattern()
+  let sent = 0
+  while (sent < total) {
+    let off = sent % 251
+    let n = 65000
+    if (n > total - sent) {
+      n = total - sent
+    }
+    c.write(pat[off:off + n]) catch _ {
+      return
+    }
+    sent = sent + n
+  }
+}
+
+fn srConn(c: Conn, plan: srPlan) {
+  defer c.close()
+  let req = ""
+  while (indexOf(req, "\r\n\r\n") < 0) {
+    let piece = c.read(4096)
+    if (len(piece) == 0) {
+      return
+    }
+    req = req + piece
+  }
+  c.write(plan.head) catch _ {
+    return
+  }
+  if (plan.gated) {
+    <- plan.gate
+  }
+  if (plan.big > 0) {
+    srWriteBig(c, plan.big)
+    return
+  }
+  c.write(plan.body) catch _ {
+    return
+  }
+}
+
+fn srAccept(o: srOrigin, plan: srPlan) {
+  while (true) {
+    let c = o.l.accept() catch _ {
+      return
+    }
+    o.accepts.add(1)
+    spawn srConn(c, plan)
+  }
+}
+
+fn srStart(plan: srPlan): srOrigin! {
+  let l = listen("127.0.0.1", 0)?
+  let o = srOrigin{ l = l, accepts = AtomicI64(0), port = l.port()? }
+  spawn srAccept(o, plan)
+  return o
+}
+
+fn srPlanOf(head: string, body: string): srPlan {
+  return srPlan{ head = head, body = body, big = 0, gated = false, gate = chan<int>(1) }
+}
+
+fn srReq(o: srOrigin): ClientRequest {
+  return ClientRequest{ url = "http://127.0.0.1:${o.port}/obj" }
+}
+
+test "send with stream = true returns the head of a gated 404 before its 1 MiB body is sent" {
+  let plan = srPlanOf(
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 1048576\r\n\r\n",
+    repeat("n", 1048576),
+  )
+  plan.gated = true
+  let o = srStart(plan) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  // The origin writes the body only after `gate` is released, below. A `send`
+  // that waited for the body would never return here.
+  let res = c.send(srReq(o), stream = true) catch e {
+    o.l.close()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  assert(res.status == 404, "status = ${res.status}")
+  assert(header(res.headers, "content-length") == "1048576", "headers = '${res.headers}'")
+  assert(res.url == "http://127.0.0.1:${o.port}/obj", "url = '${res.url}'")
+  plan.gate <- 1
+  let r = readerOf(res) catch e {
+    o.l.close()
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 8192) catch e {
+    o.l.close()
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  o.l.close()
+  assert(got == repeat("n", 1048576), "got ${len(got)} bytes")
+}
+
+test "send with stream = false is Client.requestWith: the whole body, no reader" {
+  let o = srStart(srPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "whole")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let res = c.send(srReq(o)) catch e {
+    o.l.close()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  o.l.close()
+  assert(res.status == 200 && res.body == "whole", "status ${res.status}, body '${res.body}'")
+  assert(!isSome(res.reader), "a buffered response carries a reader")
+}
+
+test "a chunked response streams through a real Client" {
+  let wire = chunk("6", "abcdef") + chunk("3", "ghi") + "0\r\n\r\n"
+  let o = srStart(srPlanOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", wire)) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let res = c.send(srReq(o), stream = true) catch e {
+    o.l.close()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    o.l.close()
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r, 4) catch e {
+    o.l.close()
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  o.l.close()
+  assert(got == "abcdefghi", "got '${got}'")
+}
+
+test "a server that closes mid-body fails the read" {
+  let o = srStart(srPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", "only ten b")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let res = c.send(srReq(o), stream = true) catch e {
+    o.l.close()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    o.l.close()
+    assert(false, "${e.message()}")
+    return
+  }
+  drain(r, 64) catch e {
+    o.l.close()
+    assert(indexOf(e.message(), "bytes of the body unread") >= 0, "message = '${e.message()}'")
+    return
+  }
+  o.l.close()
+  assert(false, "a body cut at 10 of 100 bytes ended cleanly")
+}
+
+test "a streamed exchange holds its maxConnsPerHost slot until the body ends or the reader closes" {
+  let o = srStart(srPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", "abcd")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  c.setPool(PoolLimits{ maxConnsPerHost = 1 }) catch e {
+    o.l.close()
+    assert(false, "setPool: ${e.message()}")
+    return
+  }
+  let first = c.send(srReq(o), stream = true) catch e {
+    o.l.close()
+    assert(false, "send 1: ${e.message()}")
+    return
+  }
+  assert(len(c.pool.caps) == 1, "caps = ${len(c.pool.caps)} while the first reader is open")
+  let r1 = readerOf(first) catch e {
+    o.l.close()
+    assert(false, "${e.message()}")
+    return
+  }
+  r1.close()
+  assert(len(c.pool.caps) == 0, "caps = ${len(c.pool.caps)} after close")
+
+  let second = c.send(srReq(o), stream = true) catch e {
+    o.l.close()
+    assert(false, "send 2: ${e.message()}")
+    return
+  }
+  let r2 = readerOf(second) catch e {
+    o.l.close()
+    assert(false, "${e.message()}")
+    return
+  }
+  let got = drain(r2, 16) catch e {
+    o.l.close()
+    assert(false, "drain: ${e.message()}")
+    return
+  }
+  o.l.close()
+  assert(got == "abcd", "got '${got}'")
+  assert(len(c.pool.caps) == 0, "caps = ${len(c.pool.caps)} after the body ended")
+}
+
+test "a streamed connection is never parked: ten full reads make ten accepts and no idle connection" {
+  let o = srStart(srPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", "ok")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let i = 0
+  while (i < 10) {
+    let res = c.send(srReq(o), stream = true) catch e {
+      o.l.close()
+      assert(false, "send ${i}: ${e.message()}")
+      return
+    }
+    let r = readerOf(res) catch e {
+      o.l.close()
+      assert(false, "${e.message()}")
+      return
+    }
+    let got = drain(r, 16) catch e {
+      o.l.close()
+      assert(false, "drain ${i}: ${e.message()}")
+      return
+    }
+    assert(got == "ok", "got '${got}'")
+    i = i + 1
+  }
+  o.l.close()
+  assert(int(o.accepts.load()) == 10, "accepts = ${o.accepts.load()}")
+  assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+}
+
+test "https+h3 cannot stream" {
+  let c = Client()
+  c.send(ClientRequest{ url = "https+h3://127.0.0.1:1/x" }, stream = true) catch e {
+    assert(indexOf(e.message(), "https+h3") >= 0, "message = '${e.message()}'")
+    return
+  }
+  assert(false, "an https+h3 URL streamed")
+}
+
+test "a bad URL fails before any connection" {
+  let c = Client()
+  c.send(ClientRequest{ url = "not a url" }, stream = true) catch _ {
+    return
+  }
+  assert(false, "a bad URL streamed")
+}
+
+test "300 MiB streams through the reader byte-exact" {
+  let total = 300 * 1024 * 1024
+  let plan = srPlanOf("HTTP/1.1 200 OK\r\nContent-Length: ${total}\r\n\r\n", "")
+  plan.big = total
+  let o = srStart(plan) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let res = c.send(srReq(o), stream = true) catch e {
+    o.l.close()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    o.l.close()
+    assert(false, "${e.message()}")
+    return
+  }
+  let pos = 0
+  while (true) {
+    let piece = r.read(65536) catch e {
+      o.l.close()
+      assert(false, "read at ${pos}: ${e.message()}")
+      return
+    }
+    if (len(piece) == 0) {
+      break
+    }
+    let i = 0
+    while (i < len(piece)) {
+      if (int(piece[i]) != srByte(pos + i)) {
+        o.l.close()
+        assert(false, "byte ${pos + i} is ${piece[i]}, want ${srByte(pos + i)}")
+        return
+      }
+      i = i + 1
+    }
+    pos = pos + len(piece)
+  }
+  o.l.close()
+  assert(pos == total, "read ${pos} bytes, want ${total}")
+}
