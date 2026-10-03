@@ -45,7 +45,7 @@ import { splitN, split, parseInt, join } from "std/strings"
 import { format, uuidV7 } from "std/uuid"
 import path from "std/path"
 
-export fn newId(): string {
+export fn randomId(): string {
   return format(uuidV7())
 }
 

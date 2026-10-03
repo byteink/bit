@@ -26,7 +26,7 @@ one.
 ## Write something and run it
 
 Inkwell will end up doing a lot, but the smallest real piece of it is
-`newId`: a function that hands out a fresh, time-ordered id for a new
+`randomId`: a function that hands out a fresh, time-ordered id for a new
 draft, from [`docs/book/ink/store.bit`](ink/store.bit).
 
 Create `main.bit`:
@@ -35,12 +35,12 @@ Create `main.bit`:
 import { format, uuidV7 } from "std/uuid"
 
 // A fresh, time-ordered id for a new draft.
-export fn newId(): string {
+export fn randomId(): string {
   return format(uuidV7())
 }
 
 fn main() {
-  println("ink is ready: ${newId()}")
+  println("ink is ready: ${randomId()}")
 }
 ```
 
