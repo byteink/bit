@@ -1,0 +1,640 @@
+// pkg/s3/sts.bit — the STS client the credential providers assume roles with:
+// AssumeRole (SigV4 signed with the caller's credentials) and
+// AssumeRoleWithWebIdentity (unsigned, the web identity token is the proof).
+//
+// Followed, not paraphrased: @aws-sdk/client-sts 3.1146.0, aws-sdk-js-v3 commit
+// 054298b1520fc45a7017966674a5ac3aa6f32a04 (2026-10-02).
+//   - Wire format: `AwsQueryProtocol.serializeRequest` and `QueryShapeSerializer`
+//     (packages-internal/core/src/submodules/protocols/query/): a form-encoded
+//     POST to `/`, body `Action=<op>&Version=2011-06-15` and then the input
+//     members in the order of the schema (clients/client-sts/src/schemas/
+//     schemas_0.ts, `AssumeRoleRequest$` and `AssumeRoleWithWebIdentityRequest$`),
+//     every key and value percent-encoded as `extendedEncodeURIComponent` does,
+//     lists as `Name.member.N`, a list of structures as `Name.member.N.Field`,
+//     and an empty list as `Name=`. A member that is not set is not written.
+//   - Response: `AwsQueryProtocol.deserializeResponse` reads
+//     `<Op>Response/<Op>Result`; an error status reads `Errors/Error` or `Error`
+//     under the root (`loadQueryErrorCode`, `loadQueryErrorMessage`), the code
+//     falling back to `NotFound` for a 404 and `Unknown` otherwise.
+//   - Result: `getDefaultRoleAssumer` and `getDefaultRoleAssumerWithWebIdentity`
+//     (src/defaultStsRoleAssumers.ts): a response without an access key id or a
+//     secret is an error; the account id is the fifth `:` field of the assumed
+//     role user's ARN.
+//   - Endpoint: `endpoint/bdd.ts`. Regional `https://sts.<region>.<dnsSuffix>`,
+//     `sts-fips`, the dual-stack suffix, and the legacy global endpoint
+//     `https://sts.amazonaws.com` (signed for us-east-1) for `aws-global`, and
+//     for the sixteen regions the BDD names when `useGlobalEndpoint` is set. The
+//     SDK reads no AWS_STS_REGIONAL_ENDPOINTS: `useGlobalEndpoint` is its only
+//     legacy switch, and so it is here. The region default (AWS_REGION, the
+//     profile region, us-east-1) is the caller's, see `stsRegionDefaultResolver`.
+//
+// Rules this file keeps, for a process that runs unattended:
+//   - A mistake in an input (an empty role ARN, a session name STS rejects, a
+//     duration outside 900..43200) fails in `check()` before any request is
+//     made, never as a request that answers 400 at 02:00.
+//   - The secret key, the session token and the web identity token appear in no
+//     error text: a failure names the field, never the value.
+//   - A response that parses but carries no credentials is an error, not an
+//     empty credential.
+
+import { Client as HttpClient, Response, header as httpHeader, percentEncode } from "std/http"
+import { contains, join, parseInt, split, trimSpace } from "std/strings"
+import { Timestamp, parseRfc3339 } from "std/time"
+import { Element, parse } from "std/xml"
+
+// The API version every request names (the service model's `version`).
+const stsVersion: string = "2011-06-15"
+
+// The signing name of the service.
+const stsService: string = "sts"
+
+// How long one STS call may take, connect to last byte.
+const stsTimeoutMs: int = 30000
+
+const formContentType: string = "application/x-www-form-urlencoded"
+
+// Longest error text kept; a hostile or broken endpoint cannot fill a log.
+const maxDetail: int = 1024
+
+// --- inputs ------------------------------------------------------------------
+
+// One session tag (`Tag$`: Key and Value, both required).
+class StsTag {
+  key: string,
+  value: string,
+}
+
+// One provided context (`ProvidedContext$`).
+class StsProvidedContext {
+  providerArn: Option<string>,
+  contextAssertion: Option<string>,
+}
+
+fn isAlnum(c: byte): bool {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+}
+
+// The characters of `roleSessionNameType`: `[\w+=,.@-]`.
+fn isSessionNameByte(c: byte): bool {
+  return isAlnum(c) || contains("_+=,.@-", string([c]))
+}
+
+// Fails, naming the field and never the value, when STS would refuse `name` as
+// a RoleSessionName: 2 to 64 characters of `[\w+=,.@-]`.
+fn checkSessionName(name: string): ()! {
+  if (len(name) < 2 || len(name) > 64) {
+    fail newError("s3: sts: RoleSessionName must be 2 to 64 characters, got ${len(name)}")
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (!isSessionNameByte(name[i])) {
+      fail newError("s3: sts: RoleSessionName has a character outside [\\w+=,.@-] at byte ${i}")
+    }
+    i = i + 1
+  }
+}
+
+// The members the two operations share, checked once.
+fn checkCommon(roleArn: string, sessionName: string, duration: Option<int>): ()! {
+  if (roleArn == "") {
+    fail newError("s3: sts: RoleArn must not be empty")
+  }
+  checkSessionName(sessionName)?
+  match (duration) {
+    Some(d) => {
+      if (d < 900 || d > 43200) {
+        fail newError("s3: sts: DurationSeconds must be 900 to 43200, got ${d}")
+      }
+    }
+    None => {}
+  }
+}
+
+// The input of AssumeRole (`AssumeRoleRequest$`, schemas_0.ts). A member that is
+// not set is left out of a literal: `AssumeRoleInput{ roleArn = ..., roleSessionName = ... }`.
+// `check()` runs before any request and fails on a mistake.
+class AssumeRoleInput {
+  roleArn: string
+  roleSessionName: string
+  policyArns: Option<[]string>
+  policy: Option<string>
+  durationSeconds: Option<int>
+  tags: Option<[]StsTag>
+  transitiveTagKeys: Option<[]string>
+  externalId: Option<string>
+  serialNumber: Option<string>
+  tokenCode: Option<string>
+  sourceIdentity: Option<string>
+  providedContexts: Option<[]StsProvidedContext>
+  minimumSessionTokenSize: Option<int>
+
+  check(): ()! {
+    checkCommon(this.roleArn, this.roleSessionName, this.durationSeconds)?
+  }
+}
+
+// The input of AssumeRoleWithWebIdentity (`AssumeRoleWithWebIdentityRequest$`).
+class AssumeRoleWithWebIdentityInput {
+  roleArn: string
+  roleSessionName: string
+  webIdentityToken: string
+  providerId: Option<string>
+  policyArns: Option<[]string>
+  policy: Option<string>
+  durationSeconds: Option<int>
+  minimumSessionTokenSize: Option<int>
+
+  check(): ()! {
+    checkCommon(this.roleArn, this.roleSessionName, this.durationSeconds)?
+    if (this.webIdentityToken == "") {
+      fail newError("s3: sts: WebIdentityToken must not be empty")
+    }
+  }
+}
+
+// --- request body ------------------------------------------------------------
+
+// The form body under construction: `key=value` pairs, already percent-encoded.
+class formBody {
+  pairs: []string
+
+  init(action: string) {
+    this.pairs = []string(0)
+    this.pairs = append(this.pairs, "Action=" + action)
+    this.pairs = append(this.pairs, "Version=" + stsVersion)
+  }
+
+  put(key: string, value: string) {
+    this.pairs = append(this.pairs, percentEncode(key) + "=" + percentEncode(value))
+  }
+
+  putText(key: string, v: Option<string>) {
+    match (v) {
+      Some(s) => this.put(key, s)
+      None => {}
+    }
+  }
+
+  putInt(key: string, v: Option<int>) {
+    match (v) {
+      Some(n) => this.put(key, "${n}")
+      None => {}
+    }
+  }
+
+  // A list that is set and empty is `Name=` (the SDK's `serializeEmptyLists`).
+  putEmpty(key: string, n: int) {
+    if (n == 0) {
+      this.put(key, "")
+    }
+  }
+
+  // `Name.member.N` per item.
+  putList(key: string, v: Option<[]string>) {
+    match (v) {
+      Some(items) => {
+        this.putEmpty(key, len(items))
+        let i = 0
+        while (i < len(items)) {
+          this.put("${key}.member.${i + 1}", items[i])
+          i = i + 1
+        }
+      }
+      None => {}
+    }
+  }
+
+  // `PolicyArns.member.N.arn` (`PolicyDescriptorType$` has the one member).
+  putPolicyArns(v: Option<[]string>) {
+    match (v) {
+      Some(items) => {
+        this.putEmpty("PolicyArns", len(items))
+        let i = 0
+        while (i < len(items)) {
+          this.put("PolicyArns.member.${i + 1}.arn", items[i])
+          i = i + 1
+        }
+      }
+      None => {}
+    }
+  }
+
+  putTags(v: Option<[]StsTag>) {
+    match (v) {
+      Some(tags) => {
+        this.putEmpty("Tags", len(tags))
+        let i = 0
+        while (i < len(tags)) {
+          this.put("Tags.member.${i + 1}.Key", tags[i].key)
+          this.put("Tags.member.${i + 1}.Value", tags[i].value)
+          i = i + 1
+        }
+      }
+      None => {}
+    }
+  }
+
+  putContexts(v: Option<[]StsProvidedContext>) {
+    match (v) {
+      Some(items) => {
+        this.putEmpty("ProvidedContexts", len(items))
+        let i = 0
+        while (i < len(items)) {
+          this.putText("ProvidedContexts.member.${i + 1}.ProviderArn", items[i].providerArn)
+          this.putText(
+            "ProvidedContexts.member.${i + 1}.ContextAssertion",
+            items[i].contextAssertion,
+          )
+          i = i + 1
+        }
+      }
+      None => {}
+    }
+  }
+
+  text(): string {
+    return join(this.pairs, "&")
+  }
+}
+
+// The body of AssumeRole, members in schema order.
+fn assumeRoleBody(i: AssumeRoleInput): string {
+  let b = formBody("AssumeRole")
+  b.put("RoleArn", i.roleArn)
+  b.put("RoleSessionName", i.roleSessionName)
+  b.putPolicyArns(i.policyArns)
+  b.putText("Policy", i.policy)
+  b.putInt("DurationSeconds", i.durationSeconds)
+  b.putTags(i.tags)
+  b.putList("TransitiveTagKeys", i.transitiveTagKeys)
+  b.putText("ExternalId", i.externalId)
+  b.putText("SerialNumber", i.serialNumber)
+  b.putText("TokenCode", i.tokenCode)
+  b.putText("SourceIdentity", i.sourceIdentity)
+  b.putContexts(i.providedContexts)
+  b.putInt("MinimumSessionTokenSize", i.minimumSessionTokenSize)
+  return b.text()
+}
+
+// The body of AssumeRoleWithWebIdentity, members in schema order.
+fn webIdentityBody(i: AssumeRoleWithWebIdentityInput): string {
+  let b = formBody("AssumeRoleWithWebIdentity")
+  b.put("RoleArn", i.roleArn)
+  b.put("RoleSessionName", i.roleSessionName)
+  b.put("WebIdentityToken", i.webIdentityToken)
+  b.putText("ProviderId", i.providerId)
+  b.putPolicyArns(i.policyArns)
+  b.putText("Policy", i.policy)
+  b.putInt("DurationSeconds", i.durationSeconds)
+  b.putInt("MinimumSessionTokenSize", i.minimumSessionTokenSize)
+  return b.text()
+}
+
+// --- response ----------------------------------------------------------------
+
+// What a successful call returns. `credentials` carries the expiry and, as the
+// SDK derives it from the assumed role user's ARN, the account id. The members
+// after `sourceIdentity` are the response members the model has beyond
+// `Credentials`; the last three are set by AssumeRoleWithWebIdentity only.
+class AssumedRole {
+  credentials: AwsCredential,
+  assumedRoleArn: Option<string>,
+  assumedRoleId: Option<string>,
+  packedPolicySize: Option<int>,
+  sourceIdentity: Option<string>,
+  sessionTokenUtilization: Option<int>,
+  sessionTokenSize: Option<int>,
+  subjectFromWebIdentityToken: Option<string>,
+  provider: Option<string>,
+  audience: Option<string>,
+  requestId: string,
+}
+
+// What STS answered when it refused: the awsQuery `Error` element
+// (`Type`, `Code`, `Message`) and the request id. `errorType` is "Sender" or
+// "Receiver", "" when the body had none. Match on `code`, which is the service's
+// wire code (`ExpiredToken`, `IDPCommunicationError`, `AccessDenied`, ...).
+class StsError {
+  status: int
+  code: string
+  errorType: string
+  detail: string
+  requestId: string
+
+  message(): string {
+    return "s3: sts: ${this.code}: ${this.detail} (status ${this.status}, request id ${this.requestId})"
+  }
+}
+
+// The trimmed text of the child `name` of `e`, None when there is no such child.
+fn childText(e: Element, name: string): Option<string> {
+  match (e.child(name)) {
+    Some(c) => return Option<string>.Some(trimSpace(c.text()))
+    None => return Option<string>.None
+  }
+}
+
+fn textOr(e: Element, name: string, fallback: string): string {
+  match (childText(e, name)) {
+    Some(s) => return s
+    None => return fallback
+  }
+}
+
+fn requiredText(e: Element, name: string): string! {
+  match (childText(e, name)) {
+    Some(s) => return s
+    None => fail newError("s3: sts: the response has no ${name}")
+  }
+}
+
+fn optionalInt(e: Element, name: string): Option<int>! {
+  match (childText(e, name)) {
+    Some(s) => {
+      let n = parseInt(s) catch _ {
+        fail newError("s3: sts: ${name} in the response is not an integer")
+      }
+      return Option<int>.Some(n)
+    }
+    None => return Option<int>.None
+  }
+}
+
+// The fifth `:` field of an ARN, the account id, as `getAccountIdFromAssumedRoleUser`.
+fn accountIdOf(arn: Option<string>): Option<string> {
+  match (arn) {
+    Some(a) => {
+      let fields = split(a, ":")
+      if (len(fields) > 4 && fields[4] != "") {
+        return Option<string>.Some(fields[4])
+      }
+      return Option<string>.None
+    }
+    None => return Option<string>.None
+  }
+}
+
+fn expirationOf(c: Element): Timestamp! {
+  let text = requiredText(c, "Expiration")?
+  return parseRfc3339(text) catch _ {
+    fail newError("s3: sts: Expiration in the response is not an RFC 3339 timestamp")
+  }
+}
+
+// The `Credentials` element of `result` as an `AwsCredential`. A missing key id,
+// secret or token is the SDK's "Invalid response from STS" error; `AwsCredential`
+// then refuses a malformed value, naming the field.
+fn parseCredentials(result: Element, account: Option<string>): AwsCredential! {
+  match (result.child("Credentials")) {
+    Some(cred) => {
+      return AwsCredential(
+        accessKeyId = requiredText(cred, "AccessKeyId")?,
+        secretAccessKey = requiredText(cred, "SecretAccessKey")?,
+        sessionToken = Option<string>.Some(requiredText(cred, "SessionToken")?),
+        expiration = Option<Timestamp>.Some(expirationOf(cred)?),
+        accountId = account,
+      )?
+    }
+    None => fail newError("s3: sts: the response has no Credentials")
+  }
+}
+
+fn parseRoot(body: string): Element! {
+  return parse([]byte(body)) catch e {
+    fail newError("s3: sts: the response is not well-formed XML: ${e.message()}")
+  }
+}
+
+// `<Op>Response/<Op>Result`, the element the members are read from.
+fn resultOf(root: Element, op: string): Element! {
+  if (root.local != op + "Response") {
+    fail newError("s3: sts: expected <${op}Response>, the body starts with <${root.local}>")
+  }
+  match (root.child(op + "Result")) {
+    Some(r) => return r
+    None => fail newError("s3: sts: the response has no ${op}Result")
+  }
+}
+
+fn userText(user: Option<Element>, name: string): Option<string> {
+  match (user) {
+    Some(u) => return childText(u, name)
+    None => return Option<string>.None
+  }
+}
+
+// The request id: the `x-amzn-requestid` header, else the body's.
+fn requestIdOf(res: Response, root: Element): string {
+  let h = httpHeader(res.headers, "x-amzn-requestid")
+  if (h != "") {
+    return h
+  }
+  let top = textOr(root, "RequestId", "")
+  if (top != "") {
+    return top
+  }
+  match (root.child("ResponseMetadata")) {
+    Some(m) => return textOr(m, "RequestId", "")
+    None => return ""
+  }
+}
+
+// A successful `res` of operation `op` as an `AssumedRole`.
+fn parseAssumed(op: string, res: Response): AssumedRole! {
+  let root = parseRoot(res.body)?
+  let result = resultOf(root, op)?
+  let user = result.child("AssumedRoleUser")
+  let arn = userText(user, "Arn")
+  return AssumedRole{
+    credentials = parseCredentials(result, accountIdOf(arn))?,
+    assumedRoleArn = arn,
+    assumedRoleId = userText(user, "AssumedRoleId"),
+    packedPolicySize = optionalInt(result, "PackedPolicySize")?,
+    sourceIdentity = childText(result, "SourceIdentity"),
+    sessionTokenUtilization = optionalInt(result, "SessionTokenUtilization")?,
+    sessionTokenSize = optionalInt(result, "SessionTokenSize")?,
+    subjectFromWebIdentityToken = childText(result, "SubjectFromWebIdentityToken"),
+    provider = childText(result, "Provider"),
+    audience = childText(result, "Audience"),
+    requestId = requestIdOf(res, root),
+  }
+}
+
+// `Errors/Error`, else `Error`, under the root (`loadQueryError`).
+fn errorElement(root: Element): Option<Element> {
+  match (root.child("Errors")) {
+    Some(list) => {
+      let nested = list.child("Error")
+      match (nested) {
+        Some(_) => return nested
+        None => {}
+      }
+    }
+    None => {}
+  }
+  return root.child("Error")
+}
+
+fn clip(s: string): string {
+  if (len(s) > maxDetail) {
+    return s[0:maxDetail]
+  }
+  return s
+}
+
+// The code of an error response that names none (`loadQueryErrorCode`).
+fn defaultCode(status: int): string {
+  if (status == 404) {
+    return "NotFound"
+  }
+  return "Unknown"
+}
+
+// The `StsError` for a response with a status outside 2xx. Never fails: a body
+// that is not the XML STS sends still yields an error with the status and a
+// description of what was wrong, so the caller always has the status to go on.
+fn stsErrorOf(res: Response): StsError {
+  let headerId = httpHeader(res.headers, "x-amzn-requestid")
+  let root = parse([]byte(res.body)) catch e {
+    return StsError{
+      status = res.status,
+      code = defaultCode(res.status),
+      errorType = "",
+      detail = clip("the error body is not well-formed XML: ${e.message()}"),
+      requestId = headerId,
+    }
+  }
+  let err = errorElement(root)
+  let code = ""
+  let kind = ""
+  let detail = textOr(root, "Message", "Unknown")
+  match (err) {
+    Some(e) => {
+      code = textOr(e, "Code", "")
+      kind = textOr(e, "Type", "")
+      detail = textOr(e, "Message", detail)
+    }
+    None => {}
+  }
+  if (code == "") {
+    code = defaultCode(res.status)
+  }
+  return StsError{
+    status = res.status,
+    code = code,
+    errorType = kind,
+    detail = clip(detail),
+    requestId = requestIdOf(res, root),
+  }
+}
+
+// --- client ------------------------------------------------------------------
+
+fn currentAmzDate(): string {
+  let (_, amz) = amzTimestamps()
+  return amz
+}
+
+// What an `StsClient` is built from: the SDK's STSClient endpoint options
+// (`region`, `endpoint`, `useFipsEndpoint`, `useDualstackEndpoint`,
+// `useGlobalEndpoint`) and `timeoutMs`, the longest one call may take, zero for
+// the default of 30 seconds.
+class StsOptions {
+  region: string,
+  endpoint: Option<string>,
+  useFips: bool,
+  useDualStack: bool,
+  useGlobalEndpoint: bool,
+  timeoutMs: int,
+}
+
+// STS for one region (or one custom endpoint). Built with
+// `StsClient(StsOptions{ region = "eu-west-1" })`; fails on a combination the
+// endpoint rules reject, at construction.
+class StsClient {
+  endpoint: StsEndpoint
+  timeoutMs: int
+  // The signing time, `yyyymmddThhmmssZ`; replaced in tests.
+  amzDate: () => string
+
+  init(o: StsOptions)! {
+    if (o.region == "") {
+      fail newError("s3: sts: a region is required, it scopes the signature")
+    }
+    if (o.timeoutMs < 0) {
+      fail newError("s3: sts: timeoutMs must not be negative, got ${o.timeoutMs}")
+    }
+    this.endpoint = resolveStsEndpoint(
+      o.region,
+      o.endpoint,
+      o.useFips,
+      o.useDualStack,
+      o.useGlobalEndpoint,
+    )?
+    this.timeoutMs = o.timeoutMs
+    if (o.timeoutMs == 0) {
+      this.timeoutMs = stsTimeoutMs
+    }
+    this.amzDate = currentAmzDate
+  }
+
+  // AssumeRole, signed with `creds`. Fails with an `StsError` when STS refuses.
+  assumeRole(creds: AwsCredential, input: AssumeRoleInput): AssumedRole! {
+    input.check()?
+    let res = this.post(assumeRoleBody(input), Option<AwsCredential>.Some(creds))?
+    return this.settle("AssumeRole", res)?
+  }
+
+  // AssumeRoleWithWebIdentity, unsigned: the token in the body is the proof.
+  assumeRoleWithWebIdentity(input: AssumeRoleWithWebIdentityInput): AssumedRole! {
+    input.check()?
+    let res = this.post(webIdentityBody(input), Option<AwsCredential>.None)?
+    return this.settle("AssumeRoleWithWebIdentity", res)?
+  }
+
+  settle(op: string, res: Response): AssumedRole! {
+    if (res.status < 200 || res.status > 299) {
+      fail stsErrorOf(res)
+    }
+    return parseAssumed(op, res)?
+  }
+
+  // One POST of `body` to `/`; signed when `creds` is set.
+  post(body: string, creds: Option<AwsCredential>): Response! {
+    let parts = parseEndpoint(this.endpoint.url)?
+    let http = HttpClient()
+    http.setHeader("Content-Type", formContentType)?
+    match (creds) {
+      Some(k) => {
+        for h of this.signedHeaders(k, signedHostValue(parts), body)? {
+          http.setHeader(h.name, h.value)?
+        }
+      }
+      None => {}
+    }
+    let res = http.requestTimeout("POST", this.endpoint.url + "/", body, this.timeoutMs) catch e {
+      http.close()
+      fail e
+    }
+    http.close()
+    return res
+  }
+
+  // The SigV4 headers (lowercase names) for a POST of `body` to `/` on `host`.
+  // STS does not take `x-amz-content-sha256`, which is S3's.
+  signedHeaders(k: AwsCredential, host: string, body: string): []SigHeader! {
+    let cfg = k.sigV4Config(this.endpoint.signingRegion, stsService)
+    cfg.contentSha256Header = false
+    let req = SigV4Request{
+      method = "POST",
+      path = "/",
+      query = [](string, string)(0),
+      headers = [
+        SigHeader{ name = "host", value = host },
+        SigHeader{ name = "content-type", value = formContentType },
+      ],
+      payloadHash = sha256Hex(body),
+    }
+    return signV4(cfg, req, this.amzDate())?.headers
+  }
+}
