@@ -1,0 +1,269 @@
+// _tests_/bit/execreplace/execreplace.bit -- `bit build -o` installs an
+// executable by rename, never by rewriting the existing file (#6733, the
+// guard #6697 left behind).
+//
+// macOS caches a code signature per vnode and SIGKILLs (rc=137, empty
+// output) the next exec of a signed Mach-O whose pages were overwritten in
+// place. #6697 made `writeExeBytes` (compiler/build.bit) go through
+// `writeFileAtomic` (compiler/buildrun.bit): write a `.tmp-<nonce>` sibling,
+// chmod it, rename() it over the target. Nothing else asserted that, so a
+// future writer that truncates in place would pass every gate on a Linux
+// box and fail only on a developer's Mac. This gate pins the observable
+// contract:
+//
+//   1. `bit build A.bit -o X` produces an X that execs with rc=0.
+//   2. `bit build B.bit -o X` over it gives X a NEW inode (an in-place
+//      rewrite keeps it), and the new X execs with rc=0 and B's output.
+//   3. No `X.tmp-*` sibling is left behind.
+//   4. `bit build A.bit -o <directory>` exits 1 with "cannot replace" and
+//      leaves the directory untouched and no temp file beside it.
+//
+// The inode is read with `ls -i` because std/fs's FileInfo carries none.
+// ANTI-VACUITY: every command's exit code is read straight from
+// `osRunBounded`; the first build's output is exec'd and its stdout compared
+// before the second build runs, so "inode changed" cannot be satisfied by
+// "X never existed"; and the final line prints how many checks ran.
+//
+// Run from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/execreplace
+// `BIT_SELF_EXE` overrides which `bit` is exercised.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, remove, writeFile } from "std/fs"
+import { contains, indexOf, join, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+class Run { code: int, out: string, err: string }
+
+class Tally { checks: int, failures: int }
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ {
+      return
+    }
+  }
+}
+
+// Runs `body` through /bin/sh from `dir`, stdout and stderr captured into
+// `scratch`. The exit code is `osRunBounded`'s, i.e. the last command's.
+// Negative returns are its mechanism channel (ABI.md §19), never a status an
+// assertion could consume, so each is a named panic.
+fn sh(scratch: string, dir: string, body: string, ms: int): Run! {
+  let outPath = "${scratch}/out.txt"
+  let errPath = "${scratch}/err.txt"
+  let script = "${scratch}/step.sh"
+  clear(outPath)
+  clear(errPath)
+  writeFile(
+    script,
+    "#!/bin/sh\ncd '${dir}' || exit 99\nexec > '${outPath}' 2> '${errPath}'\n${body}\n",
+  )?
+  if (fsChmod(script, 448) != 0) { // 0o700
+    fail newError("execreplace: cannot make script executable: ${script}")
+  }
+  let code = osRunBounded(script, ms)
+  if (code == -2) {
+    panic("execreplace: TIMED OUT after ${ms}ms running: ${body}")
+  }
+  if (code == -1) {
+    panic("execreplace: could not spawn: ${body}")
+  }
+  if (code <= -100) {
+    panic("execreplace: died on signal ${-100 - code}: ${body}")
+  }
+  return Run{ code = code, out = readFile(outPath)?, err = readFile(errPath)? }
+}
+
+// The `bit` under test: `BIT_SELF_EXE`, else the dev-tree artifact under the
+// working directory. Never returns "".
+fn bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("execreplace: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let r = sh(scratch, ".", "pwd", ms)?
+  let candidate = "${trimWs(r.out)}/bit-out/bin/bit"
+  if (r.code != 0 || !exists(candidate)) {
+    fail newError("execreplace: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// X's inode number, or -1 when `ls -i` could not read it.
+fn inodeOf(scratch: string, dir: string, name: string, ms: int): int! {
+  let r = sh(scratch, dir, "ls -i '${name}'", ms)?
+  if (r.code != 0) {
+    return -1
+  }
+  let line = trimWs(r.out)
+  let sp = indexOf(line, " ")
+  if (sp < 0) {
+    return -1
+  }
+  return parseInt(line[0:sp]) catch _ {
+    -1
+  }
+}
+
+fn hasTmp(names: []string): bool {
+  for n of names {
+    if (contains(n, ".tmp-")) {
+      return true
+    }
+  }
+  return false
+}
+
+// What every step needs: the compiler under test, the directory the build runs
+// in, and the directory its captured streams go to (kept apart so the work
+// directory's listing is exactly what `bit build` produced).
+class Env { bit: string, capd: string, dir: string, ms: int }
+
+fn buildAndRun(t: Tally, e: Env, src: string, want: string, label: string): int! {
+  let b = sh(e.capd, e.dir, "'${e.bit}' build ${src} -o x", e.ms)?
+  check(t, b.code == 0, "${label}: build exit ${b.code}, want 0: ${b.err}")
+  let r = sh(e.capd, e.dir, "./x", e.ms)?
+  check(
+    t,
+    r.code == 0,
+    "${label}: exec x exit ${r.code}, want 0 (137 = SIGKILLed rewritten binary)",
+  )
+  check(t, r.out == want, "${label}: x printed '${r.out}', want '${want}'")
+  return inodeOf(e.capd, e.dir, "x", e.ms)?
+}
+
+fn checkReplace(t: Tally, e: Env): ()! {
+  writeFile("${e.dir}/a.bit", "fn main() { print(\"alpha\\n\") }\n")?
+  writeFile("${e.dir}/b.bit", "fn main() { print(\"beta\\n\") }\n")?
+  let ino1 = buildAndRun(t, e, "a.bit", "alpha\n", "first build")?
+  check(t, ino1 > 0, "first build: cannot read x's inode")
+  let ino2 = buildAndRun(t, e, "b.bit", "beta\n", "second build")?
+  check(t, ino2 > 0, "second build: cannot read x's inode")
+  check(
+    t, ino1 != ino2,
+    "second build: x kept inode ${ino1}: it was rewritten in place, not replaced by rename",
+  )
+  let names = readDir(e.dir)?
+  check(t, !hasTmp(names), "no temp file may remain after a replace, found ${join(names, ",")}")
+  check(t, len(names) == 3, "want exactly a.bit b.bit x, found ${join(names, ",")}")
+}
+
+// `-o <directory>`: rename() onto a directory fails, so the build must say so,
+// exit 1, remove its temp sibling and leave the directory as it was.
+fn checkDirectoryTarget(t: Tally, e: Env): ()! {
+  let out = "${e.dir}/outdir"
+  mkdir(out)?
+  mkdir("${out}/d")?
+  let r = sh(e.capd, e.dir, "'${e.bit}' build a.bit -o outdir/d", e.ms)?
+  check(t, r.code == 1, "-o <dir>: exit ${r.code}, want 1")
+  check(t, contains(r.err, "cannot replace"), "-o <dir>: stderr lacks 'cannot replace': ${r.err}")
+  check(t, isDir("${out}/d"), "-o <dir>: the directory is gone")
+  let inside = readDir("${out}/d")?
+  check(t, len(inside) == 0, "-o <dir>: the directory gained entries ${join(inside, ",")}")
+  let beside = readDir(out)?
+  check(t, !hasTmp(beside), "-o <dir>: temp file left behind: ${join(beside, ",")}")
+  check(
+    t,
+    len(beside) == 1,
+    "-o <dir>: unexpected entries beside the directory: ${join(beside, ",")}",
+  )
+}
+
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let bit = bitBinary(scratch, ms) catch e {
+    eprint("${e.message()}\n")
+    t.failures = t.failures + 1
+    return
+  }
+  let capd = "${scratch}/capd"
+  let work = "${scratch}/w"
+  mkdir(capd) catch e {
+    eprint("FAIL: ${e.message()}\n")
+    t.failures = t.failures + 1
+    return
+  }
+  mkdir(work) catch e {
+    eprint("FAIL: ${e.message()}\n")
+    t.failures = t.failures + 1
+    return
+  }
+  checkReplace(t, Env{ bit = bit, capd = capd, dir = work, ms = ms }) catch e {
+    eprint("FAIL: ${e.message()}\n")
+    t.failures = t.failures + 1
+    return
+  }
+  checkDirectoryTarget(t, Env{ bit = bit, capd = capd, dir = work, ms = ms }) catch e {
+    eprint("FAIL: ${e.message()}\n")
+    t.failures = t.failures + 1
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = envOr("TMPDIR", "/tmp")
+  let scratch = "${tmp}/bit-execreplace-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks = 0, failures = 0 }
+
+  mkdir(scratch) catch e {
+    panic("execreplace: cannot create ${scratch}: ${e.message()}")
+  }
+  runAll(t, scratch, ms)
+
+  // 4 per build x 2 + 1 inode change + 2 listing + 6 directory = 17.
+  if (t.checks < 17) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 17\n")
+    t.failures = t.failures + 1
+  }
+  teardown(scratch, ms)
+  if (t.failures > 0) {
+    println("execreplace: FAIL, ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("execreplace: PASS, ${t.checks} checks")
+}
+
+// std/fs has no recursive remove. `exit()` does not run defers (#3694), so
+// teardown is called explicitly before either exit.
+fn teardown(scratch: string, ms: int) {
+  let rm = "/bin/rm"
+  sh(scratch, "/", "${rm} -rf '${scratch}'", ms) catch _ {
+    return
+  }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
