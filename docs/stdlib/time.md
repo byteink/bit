@@ -526,7 +526,7 @@ genuinely wanted.
 | `Time` | `09:00:00`, `.` and nine digits if nonzero | `parseTime(s): Time!` |
 | `NaiveDateTime` | `2026-09-01T09:00:00` | `parseNaiveDateTime(s): NaiveDateTime!` |
 | `DateTime` | `2026-09-01T09:00:00+04:00` | `parseDateTime(s): DateTime!` |
-| `Timestamp` | `2026-09-01T05:00:00Z` | see [Clocks](#clocks) |
+| `Timestamp` | `2026-09-01T05:00:00Z` | `parseRfc3339(s): Timestamp!`, see [RFC 3339 and epoch timestamps](#rfc-3339-and-epoch-timestamps) |
 | any | whatever `pattern` describes | `parseWith(pattern, s): NaiveDateTime!` |
 
 Parsing is **strict**: the input must match exactly and reach the end of
@@ -595,6 +595,80 @@ years in the future as the most recent past year with the same last two
 digits, so the answer depends on today's date. `parseHttpDate(s, reference)`
 takes that date as a second argument, defaulting to `now()`; pass a stored
 response's own timestamp to read it as it was read then.
+
+## RFC 3339 and epoch timestamps
+
+A feed that Inkwell imports articles from stamps each one `published`
+with whatever its server writes: `2024-01-02T03:04:05.5+05:30` from one,
+`2024-01-02t03:04:05z` from another, `1704164645.5` as a JSON number from a
+third. `parseDateTime` reads only the exact shape `toString()` writes, so none
+of them parse with it. `parseRfc3339` reads everything RFC 3339 section 5.6
+allows, and `parseEpochSeconds` reads a number of seconds since the epoch.
+Both return the instant as a `Timestamp`.
+
+```bit
+import {
+  Timestamp, TimestampParseCause, TimestampParseError,
+  parseEpochSeconds, parseRfc3339,
+} from "std/time"
+
+fn publishedAt(field: string): Timestamp! {
+  return parseRfc3339(field)?
+  // "1996-12-19T16:39:57-08:00" is the instant 851042397 seconds
+}
+
+fn updatedAt(field: string): Timestamp! {
+  return parseEpochSeconds(field)?
+  // "1700000000.123" is 1700000000123000000 nanoseconds
+}
+
+fn explain(field: string): string {
+  let t = parseRfc3339(field) catch e {
+    let pe = e.(TimestampParseError)
+    match (pe.cause) {
+      Syntax => return "not an RFC 3339 date-time: ${pe.input}"
+      Range => return "no such instant: ${pe.input}"
+    }
+  }
+  return "ok, ${t.ns} ns since the epoch"
+}
+```
+
+What `parseRfc3339` takes, exactly as the RFC's grammar has it:
+
+| Part | Accepted |
+|---|---|
+| Separator | `T` or `t` (a space is not RFC 3339 and fails) |
+| Zone | `Z`, `z`, `+hh:mm`, `-hh:mm` (the colon is required) |
+| Fraction | `.` and one or more digits, any number of them |
+| `-00:00` | read as UTC; RFC 3339 4.3 means "offset unknown" and an instant has no use for the difference |
+| Bounds | month 1 to 12, day 1 to the month's length (leap years included), hour 0 to 23, minute 0 to 59, second 0 to 60, offset hour 0 to 23, offset minute 0 to 59 |
+
+A fraction is stored as nanoseconds, so digits past the ninth are
+**truncated**, never rounded: `.9999999999` is `.999999999`, the same
+direction `formatHttpDate` drops a fraction.
+
+A `Timestamp` has no second 60. `parseRfc3339` accepts `:60` only where a leap
+second can exist, 23:59:60 UTC on the last day of a month once the offset is
+applied, and reads it as the second after it: `1990-12-31T23:59:60Z` is the
+same instant as `1991-01-01T00:00:00Z`, and so is `1990-12-31T15:59:60-08:00`.
+Any other `:60` fails with `Range`.
+
+`parseEpochSeconds` reads `-?digits`, an optional `.digits`, and an optional
+exponent (`1.7E9`, how some JSON writers print a large number). A negative
+value is read as a negative number of seconds, so `-1.5` is one and a half
+seconds before the epoch. Digits past the ninth fractional one are truncated
+toward the past: `-0.0000000001` is one nanosecond before the epoch. A
+leading `+`, `.5`, `5.`, `NaN` and surrounding space fail with `Syntax`.
+
+Both functions fail with a `TimestampParseError`: `Syntax` when the text is
+not the grammar, `Range` for a field no calendar has (month 13, `2023-02-29`,
+offset `+25:00`, an invalid leap second) and for an instant outside a
+`Timestamp`'s roughly 1677 to 2262 span, such as `9999-12-31T23:59:59Z` or an
+epoch value of `1e12`. Nothing wraps: the bound is checked before the seconds
+are turned into nanoseconds, down to the last nanosecond
+(`9223372036.854775807` fits, `9223372036.854775808` fails). The error's
+`input` is the refused text.
 
 ## Hijri dates
 
@@ -820,6 +894,10 @@ run so a daylight saving transition is absorbed.
 | `hijri()` outside 1300-1500 AH | fails, tables do not cover it |
 | `parseHttpDate` on `Sun, 06 Nov 1994 08:49:37 UTC` | fails, `Zone`: only `GMT` |
 | `parseHttpDate` on a date after year 2262 | fails, `Range`: a `Timestamp` cannot hold it |
+| `parseRfc3339` on `2024-01-02 03:04:05Z` | fails, `Syntax`: a space is not `T` or `t` |
+| `parseRfc3339` on `...05.9999999999Z` | `.999999999`, extra digits truncate |
+| `parseRfc3339` on `12:00:60Z` | fails, `Range`: `:60` only at a UTC month end |
+| `parseEpochSeconds` on `1e12` | fails, `Range`: a `Timestamp` cannot hold it |
 
 ## Date reference
 
@@ -1966,6 +2044,26 @@ Which of the four things went wrong: `Syntax`, `Range`, `Zone` or `Weekday`.
 The error every `parseHttpDate` failure produces: `cause`, and `input`, the text that was refused. Reach the fields with `e.(HttpDateError)`.
 
 ### `HttpDateError.message`
+
+A fixed one-sentence summary of the cause, without the input; the same text the caught `error` reports.
+
+### `parseRfc3339(s: string): Timestamp!`
+
+Reads an RFC 3339 section 5.6 `date-time` to the instant it names: `T` or `t`, `Z`, `z` or a `+hh:mm` / `-hh:mm` offset (`-00:00` is UTC), a fraction of any length (digits past the ninth are truncated), and `:60` only at a UTC month end (read as the next second). Fails with a `TimestampParseError`: `Syntax` for any other text, `Range` for a field out of bounds or an instant a `Timestamp` cannot hold.
+
+### `parseEpochSeconds(s: string): Timestamp!`
+
+Reads a decimal number of seconds since the epoch, `-?digits(.digits)?([eE][+-]?digits)?`, to the instant it names. Negative values and any digit count are read without overflow; digits past the ninth fractional one are truncated toward the past. Fails with a `TimestampParseError`: `Syntax` for any other text, `Range` for an instant a `Timestamp` cannot hold.
+
+### `TimestampParseCause`
+
+Which of the two things went wrong: `Syntax` or `Range`.
+
+### `TimestampParseError`
+
+The error `parseRfc3339` and `parseEpochSeconds` produce: `cause`, and `input`, the text that was refused. Reach the fields with `e.(TimestampParseError)`.
+
+### `TimestampParseError.message`
 
 A fixed one-sentence summary of the cause, without the input; the same text the caught `error` reports.
 
