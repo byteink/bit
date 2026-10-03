@@ -374,3 +374,37 @@ fn fetchDeadlineMs(transferMs: int): int {
   return resolveBudgetMs() + transferMs
 }
 ```
+
+## Address literals
+
+### `isIpv4Literal(s: string): bool`
+
+Inkwell lets an operator point it at a storage endpoint, and a numeric host needs
+different handling from a name (no virtual-host style bucket names, no
+certificate name match). `isIpv4Literal` says whether `s` is an IPv4 address in
+strict dotted-quad form: four decimal octets, 0 to 255, no leading zeros. The
+shorthand forms `inet_aton` accepts (`"127.1"`, `"0x7f.0.0.1"`, `"0177.0.0.1"`,
+`"2130706433"`) are not addresses here, so a host that is not canonical is never
+silently treated as one.
+
+### `isIpv6Literal(s: string): bool`
+
+Whether `s` is an IPv6 address in RFC 4291 text form: eight groups of 1 to 4 hex
+digits, or fewer with one `::` for the zeros, optionally ending in an IPv4 quad
+(`"::ffff:192.0.2.1"`). Brackets and zone ids are not part of the address: strip
+the `[` `]` of a URL host first, and a `"%eth0"` suffix is rejected.
+
+```bit
+import { isIpv4Literal, isIpv6Literal } from "std/net"
+
+fn isNumericHost(host: string): bool {
+  return isIpv4Literal(host) || isIpv6Literal(host)
+}
+
+fn storageUrl(host: string, bucket: string): string {
+  if (isNumericHost(host)) {
+    return "https://${host}/${bucket}"
+  }
+  return "https://${bucket}.${host}"
+}
+```
