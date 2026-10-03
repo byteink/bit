@@ -1,0 +1,336 @@
+// Bit standard library — xml module, a writer that cannot produce malformed XML.
+//
+// `Writer()` builds one XML 1.0 document in memory. Elements are opened with
+// `start` (or written whole with `empty`), filled with `text`, closed with
+// `end`, and the bytes come out of `finish`.
+//
+// MALFORMED OUTPUT IS IMPOSSIBLE BY CONSTRUCTION, not by caller discipline:
+//
+//   - Every string is checked before a byte of it is written. A name must be a
+//     Name (§2.3); text and attribute values must be well-formed UTF-8 made of
+//     legal XML characters (§2.2), so a NUL or another forbidden control byte
+//     is an error, never output (a reference like `&#0;` cannot carry it
+//     either). Nothing is repaired or replaced.
+//   - Text escapes `&`, `<`, `>` and CR; an attribute value also escapes `"`,
+//     tab and LF as character references, so what a parser reads back is exactly
+//     what was written (§2.11 line ends, §3.3.3 attribute normalisation).
+//   - The element stack is the Writer's own: `end` closes the open element and
+//     fails with none open, text outside the root and a second root fail, and
+//     `finish` fails while an element is open. There is no way to name the
+//     element `end` closes, so a mismatched tag is not expressible.
+//   - Namespaces are checked, not just spelled. `xmlns` and `xmlns:p` are
+//     declarations; a prefixed element or attribute name must use a prefix in
+//     scope; two attributes with the same expanded name are refused even under
+//     different prefixes; the reserved `xml` and `xmlns` prefixes and their URIs
+//     are bound only the way Namespaces in XML 1.0 §3 allows.
+//   - The first failure is final. The failed call writes nothing, and every
+//     later call, `finish` included, returns that same error, so output
+//     cannot be read as complete after an ignored failure.
+//   - Depth and attributes per element are bounded (`Writer`'s options).
+//
+// No XML declaration and no indentation are written: the output is the
+// document and only the document, which is the form a signed request body
+// needs. Add a declaration by writing it before the bytes of `finish`.
+//
+// Failures are the same `XmlError` the Tokenizer raises. Its `offset` is the
+// number of bytes already written when the call failed.
+
+const xmlNsUri = "http://www.w3.org/XML/1998/namespace"
+const xmlnsNsUri = "http://www.w3.org/2000/xmlns/"
+
+// Whether `name` declares a namespace: `xmlns` or `xmlns:prefix`.
+fn xmlIsDecl(name: string): bool {
+  if (name == "xmlns") {
+    return true
+  }
+  return len(name) > 6 && name[0:6] == "xmlns:"
+}
+
+// Builds one document. A class, so a reference type (§13.3): calls advance it
+// in place.
+export class Writer {
+  out: []byte
+  names: []string
+  marks: []int
+  prefixes: []string
+  uris: []string
+  maxDepth: int
+  maxAttrs: int
+  rootDone: bool
+  failure: Option<XmlError>
+
+  // `maxDepth` bounds how deeply elements nest and `maxAttrs` the attributes on
+  // one element. Fails with `BadLimit` for a limit below 1.
+  init(maxDepth: int = 256, maxAttrs: int = 256)! {
+    this.out = []byte(0)
+    this.names = []string(0)
+    this.marks = []int(0)
+    this.prefixes = []string(0)
+    this.uris = []string(0)
+    this.maxDepth = maxDepth
+    this.maxAttrs = maxAttrs
+    this.rootDone = false
+    this.failure = Option<XmlError>.None
+    if (maxDepth < 1 || maxAttrs < 1) {
+      fail this.bad(XmlErrorKind.BadLimit, "a limit must be at least 1")
+    }
+  }
+
+  // Opens the element `name` with `attrs` in document order. Namespace
+  // declarations are attributes: `Attr{ name = "xmlns", value = uri }` and
+  // `Attr{ name = "xmlns:xsi", value = uri }`, and they are in scope for this
+  // element's own name and attributes.
+  export start(name: string, attrs: []Attr = []Attr(0)): ()! {
+    this.open(name, attrs, false)?
+  }
+
+  // Writes `<name .../>`: an element with no content, closed at once.
+  export empty(name: string, attrs: []Attr = []Attr(0)): ()! {
+    this.open(name, attrs, true)?
+  }
+
+  // Writes character data inside the open element, escaped. An empty string
+  // writes nothing. Fails outside the root element.
+  export text(s: string): ()! {
+    this.live()?
+    if (len(this.names) == 0) {
+      fail this.bad(XmlErrorKind.Syntax, "text outside the root element")
+    }
+    let at = xmlBadAt(s)
+    if (at >= 0) {
+      fail this.bad(XmlErrorKind.BadChar, "text has a character XML cannot carry at byte ${at}")
+    }
+    this.out = xmlEscape(this.out, s, false)
+  }
+
+  // Closes the open element. Fails with `MismatchedTag` when none is open.
+  export end(): ()! {
+    this.live()?
+    let depth = len(this.names)
+    if (depth == 0) {
+      fail this.bad(XmlErrorKind.MismatchedTag, "end() with no element open")
+    }
+    this.out = append(this.out, "</")
+    this.out = append(this.out, this.names[depth - 1])
+    this.out = append(this.out, ">")
+    this.close(this.marks[depth - 1])
+  }
+
+  // The finished document. Fails with `UnexpectedEof` while an element is open
+  // or before any root element was written, and with the first failure if one
+  // happened. The Writer takes no more input afterwards.
+  export finish(): []byte! {
+    this.live()?
+    if (len(this.names) > 0) {
+      fail this.bad(
+        XmlErrorKind.UnexpectedEof,
+        "'${this.names[len(this.names) - 1]}' is still open",
+      )
+    }
+    if (!this.rootDone) {
+      fail this.bad(XmlErrorKind.UnexpectedEof, "no root element was written")
+    }
+    return this.out
+  }
+
+  // Records `kind` at the current output position, explained by `reason`, as
+  // the document's failure and returns it. The one place an `XmlError` is
+  // built, so no failure can skip being remembered.
+  bad(kind: XmlErrorKind, reason: string): XmlError {
+    let offset = len(this.out)
+    let (line, column) = xmlLocate(this.out, offset)
+    let e = XmlError{ kind = kind, offset = offset, line = line, column = column, reason = reason }
+    this.failure = Option<XmlError>.Some(e)
+    return e
+  }
+
+  // Fails with the remembered failure, if there is one.
+  live(): ()! {
+    match (this.failure) {
+      Some(e) => fail e
+      None => return
+    }
+  }
+
+  // Leaves the element opened at scope mark `mark`: its declarations go out of
+  // scope, and finishing the outermost element finishes the document.
+  close(mark: int) {
+    this.prefixes = this.prefixes[0:mark]
+    this.uris = this.uris[0:mark]
+    this.names = this.names[0:len(this.names) - 1]
+    this.marks = this.marks[0:len(this.marks) - 1]
+    if (len(this.names) == 0) {
+      this.rootDone = true
+    }
+  }
+
+  // The one path both `start` and `empty` take: everything is checked before
+  // anything is written.
+  open(name: string, attrs: []Attr, whole: bool): ()! {
+    this.live()?
+    if (len(this.names) == 0 && this.rootDone) {
+      fail this.bad(XmlErrorKind.Syntax, "a second root element")
+    }
+    if (len(this.names) >= this.maxDepth) {
+      fail this.bad(XmlErrorKind.TooDeep, "elements nest deeper than ${this.maxDepth}")
+    }
+    if (len(attrs) > this.maxAttrs) {
+      fail this.bad(XmlErrorKind.TooManyAttributes, "more than ${this.maxAttrs} attributes")
+    }
+    let mark = len(this.prefixes)
+    this.declareAll(attrs)?
+    this.checkName(name)?
+    this.checkAttrs(attrs)?
+    this.emit(name, attrs, whole)
+    if (whole) {
+      this.prefixes = this.prefixes[0:mark]
+      this.uris = this.uris[0:mark]
+      this.rootDone = this.rootDone || len(this.names) == 0
+      return
+    }
+    this.names = append(this.names, name)
+    this.marks = append(this.marks, mark)
+  }
+
+  // Writes the start tag; every part of it has been checked.
+  emit(name: string, attrs: []Attr, whole: bool) {
+    this.out = append(this.out, "<")
+    this.out = append(this.out, name)
+    let i = 0
+    while (i < len(attrs)) {
+      this.out = append(this.out, " ")
+      this.out = append(this.out, attrs[i].name)
+      this.out = append(this.out, "=\"")
+      this.out = xmlEscape(this.out, attrs[i].value, true)
+      this.out = append(this.out, "\"")
+      i = i + 1
+    }
+    if (whole) {
+      this.out = append(this.out, "/>")
+      return
+    }
+    this.out = append(this.out, ">")
+  }
+
+  // The URI `prefix` is bound to here, or "" when it is not bound.
+  uriOf(prefix: string): string {
+    if (prefix == "xml") {
+      return xmlNsUri
+    }
+    let i = len(this.prefixes) - 1
+    while (i >= 0) {
+      if (this.prefixes[i] == prefix) {
+        return this.uris[i]
+      }
+      i = i - 1
+    }
+    return ""
+  }
+
+  // `name` must be a Name with at most one colon, and its prefix, if it has
+  // one, must be in scope.
+  checkName(name: string): ()! {
+    this.checkSyntax(name)?
+    let (prefix, _, _) = xmlSplitName(name)
+    if (prefix != "" && this.uriOf(prefix) == "") {
+      fail this.bad(XmlErrorKind.BadName, "the prefix of '${name}' is not declared")
+    }
+  }
+
+  // `name` must be a Name Namespaces in XML allows, whatever is in scope.
+  checkSyntax(name: string): ()! {
+    let problem = xmlNameProblem(name)
+    if (problem != "") {
+      fail this.bad(XmlErrorKind.BadName, problem)
+    }
+    let (_, _, ok) = xmlSplitName(name)
+    if (!ok) {
+      fail this.bad(XmlErrorKind.BadName, "'${name}' is not a qualified name")
+    }
+  }
+
+  // Puts every namespace declaration among `attrs` in scope, before any name
+  // on the element is resolved.
+  declareAll(attrs: []Attr): ()! {
+    let i = 0
+    while (i < len(attrs)) {
+      this.checkSyntax(attrs[i].name)?
+      if (xmlIsDecl(attrs[i].name)) {
+        this.bind(attrs[i])?
+      }
+      i = i + 1
+    }
+  }
+
+  // One declaration, held to Namespaces in XML 1.0 §3: `xmlns` is never bound,
+  // `xml` only to its own URI and nothing else to that URI, nothing to the
+  // `xmlns` URI, and a prefix never to the empty string.
+  bind(a: Attr): ()! {
+    let uri = a.value
+    let prefix = ""
+    if (a.name != "xmlns") {
+      prefix = a.name[6:len(a.name)]
+    }
+    if (prefix == "xmlns" || uri == xmlnsNsUri) {
+      fail this.bad(XmlErrorKind.BadAttribute, "the xmlns prefix and namespace cannot be bound")
+    }
+    if (prefix == "xml" != (uri == xmlNsUri)) {
+      fail this.bad(XmlErrorKind.BadAttribute, "the xml prefix and its namespace go together")
+    }
+    if (prefix != "" && uri == "") {
+      fail this.bad(XmlErrorKind.BadAttribute, "a prefix cannot be bound to an empty namespace")
+    }
+    if (prefix == "" || prefix == "xml") {
+      return
+    }
+    this.prefixes = append(this.prefixes, prefix)
+    this.uris = append(this.uris, uri)
+  }
+
+  // Every attribute after the declarations are in scope: its prefix is bound,
+  // its expanded name is new on this element, its value can be written.
+  checkAttrs(attrs: []Attr): ()! {
+    let keys = []string(0)
+    let i = 0
+    while (i < len(attrs)) {
+      let key = this.keyOf(attrs[i].name)?
+      let k = 0
+      while (k < len(keys)) {
+        if (keys[k] == key) {
+          fail this.bad(
+            XmlErrorKind.DuplicateAttribute,
+            "attribute '${attrs[i].name}' appears twice",
+          )
+        }
+        k = k + 1
+      }
+      keys = append(keys, key)
+      let at = xmlBadAt(attrs[i].value)
+      if (at >= 0) {
+        fail this.bad(
+          XmlErrorKind.BadChar,
+          "the value of '${attrs[i].name}' has a character XML cannot carry at byte ${at}",
+        )
+      }
+      i = i + 1
+    }
+  }
+
+  // The identity of attribute `name` on one element: its name, or the pair of
+  // namespace URI and local part, so `a:x` and `b:x` clash when `a` and `b`
+  // name the same namespace.
+  keyOf(name: string): string! {
+    if (xmlIsDecl(name)) {
+      return name
+    }
+    let (prefix, local, _) = xmlSplitName(name)
+    if (prefix == "") {
+      return name
+    }
+    let uri = this.uriOf(prefix)
+    if (uri == "") {
+      fail this.bad(XmlErrorKind.BadName, "the prefix of '${name}' is not declared")
+    }
+    return "{${uri}}${local}"
+  }
+}

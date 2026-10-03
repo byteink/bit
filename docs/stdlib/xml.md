@@ -7,6 +7,8 @@ holds `&amp;` or a CDATA section, and a real XML parser that follows
 memory with a few hundred bytes of nested entities. `std/xml` is a pull
 tokenizer for XML 1.0 that has neither problem: it decodes what documents
 legitimately contain, and it refuses the rest, loudly, with the position.
+The same module writes XML with a `Writer` that cannot produce a malformed
+document.
 
 You create a `Tokenizer` over the document bytes and call `next()` until it
 returns `Eof`. Each call gives you one `Token`: a start tag, an empty tag,
@@ -187,6 +189,102 @@ is `"refused: DOCTYPE at byte 0"`. A document that nests `<a>` 257 deep gives
 - **There is no schema, no namespace resolution and no validation.** A
   document that is well formed is accepted whatever its element names.
 
+## Writing XML
+
+Inkwell also sends XML: a multipart upload to S3 ends with a
+`CompleteMultipartUpload` body listing every part. Building that body with
+string concatenation works until an ETag or a title holds `&`, `<` or a
+control character, and then the server rejects the request, or reads
+something other than what you wrote. A `Writer` makes that impossible: it
+escapes what must be escaped and refuses what no escape can fix.
+
+You create a `Writer`, open elements with `start`, write character data
+with `text`, close with `end`, write an element with no content with
+`empty`, and take the bytes from `finish`.
+
+```bit
+import { Writer, Attr } from "std/xml"
+
+fn completeBody(etags: []string): string! {
+  let w = Writer()?
+  let ns = append([]Attr(0), Attr{ name = "xmlns", value = "http://s3.amazonaws.com/doc/2006-03-01/" })
+  w.start("CompleteMultipartUpload", ns)?
+  let i = 0
+  while (i < len(etags)) {
+    w.start("Part")?
+    w.start("PartNumber")?
+    w.text("${i + 1}")?
+    w.end()?
+    w.start("ETag")?
+    w.text(etags[i])?
+    w.end()?
+    w.end()?
+    i = i + 1
+  }
+  w.end()?
+  return string(w.finish()?)
+}
+```
+
+`completeBody(["\"a54357aff0632cce46d942af68356b38\""])` returns
+`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><PartNumber>1</PartNumber><ETag>"a54357aff0632cce46d942af68356b38"</ETag></Part></CompleteMultipartUpload>`.
+There is no indentation and no XML declaration: the output is the document
+and nothing else, the form a signed request body needs.
+
+### Escaping
+
+Text escapes `&`, `<` and `>` (so `]]>` can never appear) and carriage
+return, which a parser would otherwise read as a line feed. An attribute
+value also escapes `"`, and writes tab, line feed and carriage return as
+`&#9;`, `&#10;` and `&#13;`, because a parser turns a literal one into a
+space. What the `Tokenizer` reads back is exactly what you wrote.
+
+### What it refuses
+
+A string with a character XML cannot carry, a NUL or another control
+character, `U+FFFE`, or bytes that are not valid UTF-8, fails with
+`BadChar`, and nothing of it is written: a character reference cannot carry
+those characters either, so there is nothing to escape them to. A name that
+is not an XML name fails with `BadName`. `end()` with nothing open fails with
+`MismatchedTag`. Text outside the root, or a second root, fails with
+`Syntax`. `finish()` while an element is still open, or before a root was
+written, fails with `UnexpectedEof`. A repeated attribute fails with
+`DuplicateAttribute`.
+
+Like the tokenizer, the first failure is final: every later call returns the
+same error, so an ignored failure cannot turn into a finished document.
+`offset` in the `XmlError` is the number of bytes written when it happened.
+
+### Namespaces
+
+A namespace declaration is an attribute named `xmlns` or `xmlns:prefix`, in
+scope for the element that carries it, its own name and attributes included,
+and for everything inside it.
+
+```bit
+import { Writer, Attr } from "std/xml"
+
+fn grantee(): string! {
+  let w = Writer()?
+  let attrs = append([]Attr(0), Attr{ name = "xmlns:xsi", value = "http://www.w3.org/2001/XMLSchema-instance" })
+  attrs = append(attrs, Attr{ name = "xsi:type", value = "Group" })
+  w.empty("Grantee", attrs)?
+  return string(w.finish()?)
+}
+```
+
+A prefixed name must use a prefix that is in scope, or the call fails with
+`BadName`; `xml` is always in scope. Two attributes with the same namespace
+and local name are refused even under different prefixes. The reserved
+`xmlns` prefix is never bound, `xml` only to its own namespace, and no
+prefix to an empty namespace; those fail with `BadAttribute`.
+
+### Limits
+
+`Writer(maxDepth = 256, maxAttrs = 256)` bounds how deeply elements nest
+and how many attributes one element carries; going over fails with `TooDeep`
+or `TooManyAttributes`. A limit below 1 fails with `BadLimit`.
+
 ## When not to use std/xml
 
 If you want a tree you can ask for `child("Name")` and `text()`, build it on
@@ -246,3 +344,31 @@ and `reason`, one phrase saying what was wrong. Reach the fields with
 
 The one-sentence summary the caught `error` reports, callable on the
 narrowed value too.
+
+### `Writer`
+
+`Writer(maxDepth: int = 256, maxAttrs: int = 256)` starts an empty document.
+Fails with `BadLimit` for a limit below 1.
+
+### `Writer.start`
+
+`start(name: string, attrs: []Attr = [])!` opens the element `name`. The
+namespace declarations among `attrs` are in scope for the element itself.
+
+### `Writer.empty`
+
+`empty(name: string, attrs: []Attr = [])!` writes `<name .../>`.
+
+### `Writer.text`
+
+`text(s: string)!` writes `s` as escaped character data inside the open
+element.
+
+### `Writer.end`
+
+`end()!` closes the open element.
+
+### `Writer.finish`
+
+`finish(): []byte!` returns the finished document, and takes no more input
+afterwards.
