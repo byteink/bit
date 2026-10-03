@@ -1,0 +1,376 @@
+// tools/gens3 — renders the S3 error table, `pkg/s3/gen_errors.bit` (#6615,
+// epic #6565). Run: bit run tools/gens3 -- errors
+//
+// An S3 error reaches the caller as a `<Code>` string. The file this renders
+// turns it into something a caller can `match`: an `ErrorKind` variant, with
+// the HTTP status the service documents for it and the retry class the AWS SDK
+// for JavaScript v3 gives it (@smithy/service-error-classification 4.6.2).
+//
+// Where the codes come from:
+//
+//   - the error shapes of the pinned Smithy model (`smithy.api#error`, 21 of
+//     them): the code is the shape's name, the status its `httpError`;
+//   - tools/gens3/unmodeled.txt: the codes of the S3 API reference's "List of
+//     error codes" table that the model does not model, extracted from the
+//     pinned page (its header names the pin). A code that is also a model error
+//     shape is an error, so a model bump that starts modeling one stops here;
+//   - the kinds the client raises itself (`clientKinds`), which no response
+//     carries a code for.
+//
+// Output is a pure function of the model, unmodeled.txt and the pin. The rows
+// are sorted by code, so `lookupError` is a binary search; a row is written on
+// one line when it fits the formatter's 100 columns and wrapped one argument
+// per line when it does not, exactly as `bit fmt` leaves it.
+
+import { Builder, split, trimSpace, hasPrefix, parseInt } from "std/strings"
+
+const errorsFileName: string = "gen_errors.bit"
+const errorsFmtWidth: int = 100
+
+// One row of the table. `retry` is the name of a `RetryClass` variant; a
+// client kind has no code (""), so it has no wire row.
+class ErrRow {
+  code: string,
+  variant: string,
+  status: int,
+  retry: string,
+  modeled: bool,
+}
+
+// @smithy/service-error-classification 4.6.2: THROTTLING_ERROR_CODES and
+// TRANSIENT_ERROR_CODES. The statuses it treats as transient are 500, 502,
+// 503 and 504 (`isTransientStatus`); 429 is throttling.
+const throttlingCodes: []string = [
+  "BandwidthLimitExceeded",
+  "EC2ThrottledException",
+  "LimitExceededException",
+  "PriorRequestNotComplete",
+  "ProvisionedThroughputExceededException",
+  "RequestLimitExceeded",
+  "RequestThrottled",
+  "RequestThrottledException",
+  "SlowDown",
+  "ThrottledException",
+  "Throttling",
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "TransactionInProgressException",
+]
+const transientCodes: []string = ["TimeoutError", "RequestTimeout", "RequestTimeoutException"]
+
+// The variants a payload carries: a message the client built, a code the table does not name.
+const payloadKinds: []string = ["InvalidInput(string)", "Unknown(string)"]
+
+fn inList(list: []string, s: string): bool {
+  for x of list {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+fn isTransientStatus(status: int): bool {
+  return status == 500 || status == 502 || status == 503 || status == 504
+}
+
+// The `RetryClass` variant the SDK would classify a response with this code
+// and status as. Only Throttling and Transient are retried.
+fn retryClassName(code: string, status: int): string {
+  if (status == 429 || inList(throttlingCodes, code)) {
+    return "Throttling"
+  }
+  if (inList(transientCodes, code) || isTransientStatus(status)) {
+    return "Transient"
+  }
+  if (status >= 500) {
+    return "Server"
+  }
+  return "Client"
+}
+
+// The kinds the client raises: a deadline or a dropped connection is retried
+// as the SDK retries ETIMEDOUT and ECONNRESET, the rest is the caller's to fix.
+fn clientRow(variant: string, retry: string): ErrRow {
+  return ErrRow{ code = "", variant = variant, status = 0, retry = retry, modeled = false }
+}
+
+fn clientRows(): []ErrRow {
+  return [
+    clientRow("Timeout", "Transient"),
+    clientRow("Connection", "Transient"),
+    clientRow("Tls", "Client"),
+    clientRow("ChecksumMismatch", "Client"),
+    clientRow("Cancelled", "Client"),
+    clientRow("Credentials", "Client"),
+    clientRow("Endpoint", "Client"),
+  ]
+}
+
+// The code as a variant name: the code itself, a `.` dropped (`KMS.NotFoundException`
+// -> `KMSNotFoundException`). An error when that is not a PascalCase identifier.
+fn errorVariant(code: string): string! {
+  let b = Builder()
+  let i = 0
+  while (i < len(code)) {
+    let c = code[i]
+    if (c != '.') {
+      if (!isUpperByte(c) && !isLowerByte(c) && !isDigitByte(c)) {
+        fail newError("error code \"${code}\" has a character a variant name cannot hold")
+      }
+      b.write(code[i:i + 1])
+    }
+    i = i + 1
+  }
+  let v = b.toString()
+  if (len(v) == 0 || !isUpperByte(v[0])) {
+    fail newError("error code \"${code}\" does not make a PascalCase variant name")
+  }
+  return v
+}
+
+fn errRow(code: string, status: int, modeled: bool): ErrRow! {
+  if (status != 0 && (status < 100 || status > 599)) {
+    fail newError("error ${code}: HTTP status ${status} out of range")
+  }
+  let v = errorVariant(code)?
+  return ErrRow{
+    code = code,
+    variant = v,
+    status = status,
+    retry = retryClassName(code, status),
+    modeled = modeled,
+  }
+}
+
+// The model's error shapes: code = shape name, status = its httpError (0 when
+// the model gives none: NotFound is the status of a HEAD, not of a body).
+fn modeledRows(m: Model): []ErrRow! {
+  let rows = []ErrRow(0)
+  for s of m.shapes {
+    if (s.errorKind != "") {
+      rows = append(rows, errRow(shortName(s.id), s.httpError, true)?)
+    }
+  }
+  return rows
+}
+
+fn unmodeledLine(line: string, n: int): ErrRow! {
+  let parts = split(line, " ")
+  if (len(parts) != 2) {
+    fail newError("unmodeled.txt line ${n}: want \"<Code> <HTTP status>\", got \"${line}\"")
+  }
+  let status = parseInt(parts[1]) catch _ {
+    fail newError("unmodeled.txt line ${n}: status \"${parts[1]}\" is not a number")
+  }
+  return errRow(parts[0], status, false)?
+}
+
+// The rows of unmodeled.txt: `#` lines and blank lines are comments.
+fn unmodeledRows(text: string): []ErrRow! {
+  let rows = []ErrRow(0)
+  let n = 0
+  for raw of split(text, "\n") {
+    n = n + 1
+    let line = trimSpace(raw)
+    if (len(line) > 0 && !hasPrefix(line, "#")) {
+      rows = append(rows, unmodeledLine(line, n)?)
+    }
+  }
+  return rows
+}
+
+// Insertion sort by code (the rows are ~150), in place.
+fn sortErrRows(rows: []ErrRow) {
+  let i = 1
+  while (i < len(rows)) {
+    let j = i
+    while (j > 0 && rows[j].code < rows[j - 1].code) {
+      let t = rows[j]
+      rows[j] = rows[j - 1]
+      rows[j - 1] = t
+      j = j - 1
+    }
+    i = i + 1
+  }
+}
+
+// Two rows may not share a code or a variant, and no variant may be one of the
+// client kinds or the payload kinds' names.
+fn checkErrRows(rows: []ErrRow, client: []ErrRow): ()! {
+  let seen = []string(0)
+  for r of rows {
+    if (inList(seen, r.code)) {
+      fail newError("error code ${r.code} is listed twice (a code of unmodeled.txt that the model also models?)")
+    }
+    seen = append(seen, r.code)
+  }
+  let names = []string(0)
+  for c of client {
+    names = append(names, c.variant)
+  }
+  names = append(names, "Unknown")
+  names = append(names, "InvalidInput")
+  for r of rows {
+    if (inList(names, r.variant)) {
+      fail newError("error code ${r.code}: the variant ${r.variant} is taken")
+    }
+    names = append(names, r.variant)
+  }
+}
+
+// The wire rows of the model plus unmodeled.txt, sorted by code.
+fn wireRows(m: Model, unmodeled: string): []ErrRow! {
+  let rows = modeledRows(m)?
+  for r of unmodeledRows(unmodeled)? {
+    rows = append(rows, r)
+  }
+  checkErrRows(rows, clientRows())?
+  sortErrRows(rows)
+  return rows
+}
+
+fn tableRow(r: ErrRow): string {
+  let one = "  ErrorInfo(\"${r.code}\", ErrorKind.${r.variant}, ${r.status}, RetryClass.${r.retry}),\n"
+  if (len(one) - 1 <= errorsFmtWidth) {
+    return one
+  }
+  return "  ErrorInfo(\n    \"${r.code}\",\n    ErrorKind.${r.variant},\n    ${r.status},\n    RetryClass.${r.retry},\n  ),\n"
+}
+
+fn writeKinds(b: Builder, rows: []ErrRow, client: []ErrRow) {
+  b.write("// What went wrong, as a value a caller matches on. The first group is the error\n")
+  b.write("// shapes of the S3 model, the second the codes the S3 API reference documents\n")
+  b.write("// that the model does not model, the third what the client raises itself, with\n")
+  b.write("// Unknown for a code this table does not name.\n")
+  b.write("export enum ErrorKind {\n")
+  b.write("  // Error shapes of the S3 model.\n")
+  for r of rows {
+    if (r.modeled) {
+      b.write("  ${r.variant},\n")
+    }
+  }
+  b.write("  // Codes of the S3 API reference the model does not model.\n")
+  for r of rows {
+    if (!r.modeled) {
+      b.write("  ${r.variant},\n")
+    }
+  }
+  b.write("  // Raised by the client itself.\n")
+  for c of client {
+    b.write("  ${c.variant},\n")
+  }
+  for p of payloadKinds {
+    b.write("  ${p},\n")
+  }
+  b.write("}\n")
+}
+
+fn writeTables(b: Builder, rows: []ErrRow, client: []ErrRow) {
+  b.write("\n// Every code of the table, sorted by code.\n")
+  b.write("const wireErrors: []ErrorInfo = [\n")
+  for r of rows {
+    b.write(tableRow(r))
+  }
+  b.write("]\n")
+  b.write("\n// The kinds the client raises; they carry no code.\n")
+  b.write("const clientErrors: []ErrorInfo = [\n")
+  for c of client {
+    b.write(tableRow(c))
+  }
+  b.write("]\n")
+}
+
+// The part of the file that does not depend on the data.
+const errorLookups: string = `
+// How a response with this code is classified, as the AWS SDK for JavaScript
+// v3 does: only Throttling and Transient are retried.
+export enum RetryClass {
+  Client,
+  Server,
+  Throttling,
+  Transient,
+}
+
+// One row of the table: the wire code, its kind, the documented HTTP status
+// (0 when the service documents none) and its retry class.
+export class ErrorInfo {
+  export code: string
+  export kind: ErrorKind
+  export status: int
+  export retry: RetryClass
+
+  init(code: string, kind: ErrorKind, status: int, retry: RetryClass) {
+    this.code = code
+    this.kind = kind
+    this.status = status
+    this.retry = retry
+  }
+}
+
+// The row for a wire code, by binary search over the sorted table.
+export fn lookupError(code: string): Option<ErrorInfo> {
+  let lo = 0
+  let hi = len(wireErrors)
+  while (lo < hi) {
+    let mid = lo + (hi - lo) / 2
+    let row = wireErrors[mid]
+    if (row.code == code) {
+      return Option.Some(row)
+    }
+    if (row.code < code) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return Option.None
+}
+
+// The kind of a wire code; a code the table does not name is Unknown(code).
+export fn kindForCode(code: string): ErrorKind {
+  return match (lookupError(code)) {
+    Some(row) => row.kind
+    None => ErrorKind.Unknown(code)
+  }
+}
+
+fn rowForKind(rows: []ErrorInfo, kind: ErrorKind): Option<ErrorInfo> {
+  for row of rows {
+    if (row.kind == kind) {
+      return Option.Some(row)
+    }
+  }
+  return Option.None
+}
+
+// The retry class of a kind. InvalidInput and Unknown (a code with no row) are
+// the caller's to fix, so they are Client.
+export fn retryClassOf(kind: ErrorKind): RetryClass {
+  for rows of [wireErrors, clientErrors] {
+    match (rowForKind(rows, kind)) {
+      Some(row) => return row.retry
+      None => {}
+    }
+  }
+  return RetryClass.Client
+}
+`
+
+fn errorsHeader(commit: string, sha: string, unmodeled: string): string {
+  return headerLines("errors", commit, sha) +
+    "// Unmodeled codes: tools/gens3/unmodeled.txt (sha256 ${sha256Hex(unmodeled)}).\n\n"
+}
+
+// `gen_errors.bit`. `commit` and `sha` are the model pin, `unmodeled` the text
+// of tools/gens3/unmodeled.txt.
+fn renderErrors(m: Model, unmodeled: string, commit: string, sha: string): GenFile! {
+  let rows = wireRows(m, unmodeled)?
+  let client = clientRows()
+  let b = Builder()
+  b.write(errorsHeader(commit, sha, unmodeled))
+  writeKinds(b, rows, client)
+  b.write(errorLookups)
+  writeTables(b, rows, client)
+  return GenFile{ name = errorsFileName, text = b.toString() }
+}
