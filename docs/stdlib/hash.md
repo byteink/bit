@@ -1,7 +1,7 @@
 # std/hash
 
-CRC-32 (IEEE 802.3, the zlib polynomial) and CRC-32C (Castagnoli) - fast
-checksums for detecting accidental corruption: a torn write, a flipped bit on
+CRC-32 (IEEE 802.3, the zlib polynomial), CRC-32C (Castagnoli) and CRC-64/NVME -
+fast checksums for detecting accidental corruption: a torn write, a flipped bit on
 the wire. **Not a tool for detecting tampering**
 - CRC is linear, so anyone able to modify the data can trivially recompute a
 matching checksum. For anything that must resist a tamperer, use
@@ -17,6 +17,13 @@ the one gzip, PNG, ZIP, Ethernet and the S3 `CRC32` checksum algorithm use.
 Slicing-by-8, software only. The two are different functions that give
 different values for the same input, so pick the one your peer or file format
 names.
+
+`crc64nvme` is the 64-bit NVMe polynomial (0xAD93D23594C93659, reflected
+0x9A6C9329AC4BC9B5, init and xorout all-ones) - the one the NVMe end-to-end
+protection CRC, the Linux kernel's `lib/crc64.c` and the S3 `CRC64NVME`
+checksum algorithm use. Slicing-by-8, software only. It is the CRC RevEng
+catalogue's CRC-64/NVME, not CRC-64/XZ or CRC-64/ECMA-182, which give
+different values.
 
 ### `crc32(data: []byte): u32`
 
@@ -67,5 +74,37 @@ fn pageChecksum(header: []byte, body: []byte): u32 {
 
 fn wholeBufferChecksum(buf: []byte): u32 {
   return crc32c(buf)
+}
+```
+
+### `crc64nvme(data: []byte): u64`
+
+The CRC-64/NVME of `data`, seeded fresh. Matches the published check value:
+`crc64nvme` of the nine ASCII bytes `"123456789"` is `0xAE8B14860A799888`.
+The empty slice checksums to `0`. S3 sends the value as the big-endian
+8 bytes of the `u64`, base64-encoded (`"123456789"` is `rosUhgp5mIg=`).
+
+### `crc64nvmeUpdate(seed: u64, data: []byte): u64`
+
+Extends a running CRC-64/NVME by `data`. `seed` is the previous call's
+result - or `0` to start a fresh checksum - so
+`crc64nvmeUpdate(crc64nvmeUpdate(0, a), b)` equals `crc64nvme(a ++ b)` for
+any split, including empty halves.
+
+```bit
+import { crc64nvme, crc64nvmeUpdate } from "std/hash"
+
+// An object checksum accumulated while a body streams in chunks, then
+// compared with the one-shot value over the whole buffer.
+fn streamedChecksum(chunks: [][]byte): u64 {
+  let crc: u64 = 0
+  for chunk of chunks {
+    crc = crc64nvmeUpdate(crc, chunk)
+  }
+  return crc
+}
+
+fn matchesWhole(chunks: [][]byte, whole: []byte): bool {
+  return streamedChecksum(chunks) == crc64nvme(whole)
 }
 ```
