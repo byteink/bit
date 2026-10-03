@@ -66,6 +66,46 @@ fn isDebug(): bool {
 }
 ```
 
+## The home directory
+
+### `homeDir(): string!`
+
+Inkwell keeps its drafts folder and its credentials under the user's home, so it
+needs to know where that is on every OS. `homeDir` looks, in this order, at
+`HOME`, then `USERPROFILE`, then `HOMEDRIVE` + `HOMEPATH` (just `HOMEPATH`
+is taken to be on `C:`), then the OS user database (`/etc/passwd`, matched by the
+real uid, else by `USER`/`LOGNAME`). The first non-empty answer wins, which is
+the order the AWS SDKs use to find `~/.aws`.
+
+When none of them names a home it fails with `HomeDirError`; it never returns
+`""`, so a path built from the result cannot silently land in the current
+directory.
+
+```bit
+import { homeDir, HomeDirError } from "std/os"
+
+fn draftsDir(): string! {
+  return "${homeDir()?}/.inkwell/drafts"
+}
+
+fn describeHome(): string {
+  let h = homeDir() catch e {
+    let he = e.(HomeDirError)
+    return he.message()
+  }
+  return h
+}
+```
+
+### `HomeDirError`
+
+The error `homeDir` fails with.
+
+### `HomeDirError.message(): string`
+
+One sentence naming the sources that were empty: `HOME`, `USERPROFILE`,
+`HOMEDRIVE` + `HOMEPATH` and the user database.
+
 ## The running executable
 
 ### `selfExe(): string`
