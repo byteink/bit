@@ -11,7 +11,7 @@ fn connect(url: string): Pool! {
 }
 ```
 
-Install with `bit add bitlang.org/pkg/mysql@v0.1.1`, which writes the
+Install with `bit add bitlang.org/pkg/mysql@v0.2.3`, which writes the
 dependency into `bit.lock` under the key `mysql` - the vanity path's last
 segment, which is also the name every import above uses.
 
