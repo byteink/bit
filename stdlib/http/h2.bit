@@ -222,14 +222,22 @@ fn h2glueServe(conn: TlsConn, handler: (Request) => Response, opts: connOpts, d:
     },
   )
   defer drainDeregister(d, id)
-  // The `Stream` the engine hands each handler (#4616) is dropped here: this
-  // module's own handler type is `(Request) => Response` and is shared by
-  // http/1.1, h2 and h3, so an http2-only stream handle has no place in it —
-  // two of the three could not honour it. A `std/http` handler that needs to
-  // abort a stream needs a protocol-agnostic shape, which is not this one.
-  hc.serve((r, _s) => {
+  // The `Stream` the engine hands each handler (#4616) is never passed on to
+  // `handler`: this module's own handler type is `(Request) => Response` and is
+  // shared by http/1.1, h2 and h3, so an http2-only stream handle has no place
+  // in it — two of the three could not honour it. A `std/http` handler that
+  // needs to abort a stream needs a protocol-agnostic shape, which is not this
+  // one. The glue itself uses it once, to refuse a malformed request.
+  hc.serve((r, s) => {
     drainMarkActive(d, id)
-    return h2glueResponseOutAlt(handler(h2glueRequestIn(r, peer)), opts.altPort)
+    let req = h2glueRequestIn(r, peer) catch _ {
+      // A malformed request is a stream error PROTOCOL_ERROR (RFC 9113
+      // §8.1.1): reset it and never reach the handler. The `Response`
+      // returned is discarded by the engine after a reset (`Stream.reset`).
+      s.reset(h2ErrProtocolError)
+      return H2Response(0, []byte(0))
+    }
+    return h2glueResponseOutAlt(handler(req), opts.altPort)
   }) catch _ {
     conn.shutdown()
     hc.waitReaderDone()
@@ -279,12 +287,7 @@ fn h2glueRequestOf(method: string, u: Url, body: string, block: string): H2Reque
 // an HTTP/2 stream (RFC 9113 §8.2.2). Content-Length is dropped too — the engine
 // frames the body, so an explicit length is redundant.
 fn h2glueHopByHop(name: string): bool {
-  return name == "connection" ||
-    name == "keep-alive" ||
-    name == "proxy-connection" ||
-    name == "transfer-encoding" ||
-    name == "upgrade" ||
-    name == "content-length"
+  return name == "content-length" || connectionSpecificField(name)
 }
 
 // Serialize an http2 header-field list into this module's raw "Name: value\r\n"
@@ -292,6 +295,22 @@ fn h2glueHopByHop(name: string): bool {
 fn h2glueBlock(fields: []H2HeaderField): string {
   let block = ""
   for f of fields {
+    block = block + "${f.name}: ${f.value}\r\n"
+  }
+  return block
+}
+
+// `h2glueBlock` for a request a peer sent: fails, with no block, on the first field
+// `peerFieldMalformed` refuses, since a name or value carrying SP, ':', CR, LF or
+// NUL would otherwise come out as extra or altered lines in the block (RFC 9113
+// §8.2.1, #6729). The check is in the same loop as the serialisation, so a
+// request is walked once.
+fn h2glueRequestBlock(fields: []H2HeaderField): string! {
+  let block = ""
+  for f of fields {
+    if (peerFieldMalformed(f.name, f.value)) {
+      fail newError("http2: malformed request: bad header field")
+    }
     block = block + "${f.name}: ${f.value}\r\n"
   }
   return block
@@ -346,13 +365,15 @@ fn h2glueResponse(res: H2Response): Response {
 }
 
 // Map an http2 request to this module's `Request`, flattening the header fields to
-// a raw header block. `peer` is the connection's client address, read once by
+// a raw header block. Fails when a field makes the request malformed
+// (`peerFieldMalformed`, #6729), which `h2glueServe` answers by resetting the
+// stream. `peer` is the connection's client address, read once by
 // `h2glueServe` and the same for every stream on that connection.
-fn h2glueRequestIn(req: H2Request, peer: string): Request {
+fn h2glueRequestIn(req: H2Request, peer: string): Request! {
   return Request{
     method = req.method,
     path = req.path,
-    headers = h2glueBlock(req.headers),
+    headers = h2glueRequestBlock(req.headers)?,
     body = string(req.body),
     peer = peer,
   }
