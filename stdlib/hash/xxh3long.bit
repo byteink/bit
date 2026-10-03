@@ -1,0 +1,183 @@
+// Bit standard library — hash module, XXH3-64 for inputs over 240 bytes.
+//
+// THE ALGORITHM (xxhash.h, `XXH3_hashLong_64b_internal`): eight 64-bit
+// accumulators start at fixed constants. Each 64-byte stripe adds its eight
+// lanes in: lane `l` xors the data word with a secret word, adds the product
+// of that value's two 32-bit halves to accumulator `l`, and adds the raw data
+// word to the neighbour `l ^ 1`. Stripe `s` of a 1024-byte block (16 stripes)
+// reads the secret 8 bytes further along per stripe, and a full block ends
+// with a scramble of every accumulator. The final stripe is always the last 64
+// bytes of the input, which overlaps the previous stripe unless the length is a
+// multiple of 64, and reads the secret at byte 121. The accumulators then
+// merge, pairwise, through the same 64x64->128 multiply fold the short paths
+// use, and avalanche.
+//
+// A stripe is consumed only when at least one byte follows it, so the stripe
+// count is `(len - 1) / 64`; the streaming hasher (xxh3stream.bit) keeps its
+// last stripe back for the same reason.
+//
+// THE SECRET is a "key" of 24 words: the default secret for seed 0 and the
+// default secret with the seed added to every even word and subtracted from
+// every odd one otherwise (`XXH3_initCustomSecret`; for seed 0 that is the
+// identity, so one derivation serves both).
+
+const xxh3Lanes: int = 8
+
+// Bytes per stripe: one 8-byte data word per lane.
+const xxh3Stripe: int = 64
+
+// Stripes per block: (192 secret bytes - 64) / 8 bytes per stripe.
+const xxh3BlockStripes: int = 16
+
+// Bytes per block.
+const xxh3Block: int = 1024
+
+// Word of the key that scrambles the accumulators (secret byte 128).
+const xxh3ScrambleWord: int = 16
+
+// Secret byte offset for the last stripe, and for merging the accumulators.
+const xxh3LastOff: int = 121
+const xxh3MergeOff: int = 11
+
+// The scramble multiplier, PRIME32_1.
+const xxh3Prime32: u64 = 0x9e3779b1
+
+// The 24-word key for `seed`: the default secret moved by the seed.
+fn xxh3Key(seed: u64): []u64 {
+  let key = []u64(24)
+  let i = 0
+  while (i < 24) {
+    key[i] = xxh3Secret[i] + seed
+    key[i + 1] = xxh3Secret[i + 1] - seed
+    i = i + 2
+  }
+  return key
+}
+
+// The eight accumulators at the start of a hash: PRIME32_3, PRIME64_1,
+// PRIME64_2, PRIME64_3, PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1.
+fn xxh3Acc(): []u64 {
+  let acc = []u64(8)
+  acc[0] = 0xc2b2ae3d
+  acc[1] = xxP1
+  acc[2] = xxP2
+  acc[3] = xxP3
+  acc[4] = xxP4
+  acc[5] = 0x85ebca77
+  acc[6] = xxP5
+  acc[7] = 0x9e3779b1
+  return acc
+}
+
+// The state both the one-shot and the streaming hash run the stripe loop on:
+// the eight accumulators and the 24-word key for the seed.
+class Xxh3Core {
+  acc: []u64
+  key: []u64
+
+  init(seed: u64) {
+    this.acc = xxh3Acc()
+    this.key = xxh3Key(seed)
+  }
+}
+
+// Little-endian u64 of the key's bytes `off..off+8`, for offsets that are not
+// multiples of 8 (the last stripe's 121 and the merge's 11).
+fn xxh3KeyAt(key: []u64, off: int): u64 {
+  let k = off / 8
+  let r = u64(off % 8) * 8
+  if (r == 0) {
+    return key[k]
+  }
+  return (key[k] >> r) | (key[k + 1] << (64 - r))
+}
+
+// One stripe: the 64 bytes of `data` at `i` into `acc`, against key words
+// `kw..kw+8`.
+fn xxh3Round(acc: []u64, data: []byte, i: int, key: []u64, kw: int) {
+  let lane = 0
+  while (lane < xxh3Lanes) {
+    let dv = xxRead64(data, i + 8 * lane)
+    let dk = dv ^ key[kw + lane]
+    acc[lane ^ 1] = acc[lane ^ 1] + dv
+    acc[lane] = acc[lane] + (dk & 0xffffffff) * (dk >> 32)
+    lane = lane + 1
+  }
+}
+
+// `count` consecutive stripes from `data[from..]` into `c`, the first against
+// key words starting at `kw` and each next one 8 bytes (one word) further.
+fn xxh3Stripes(c: Xxh3Core, data: []byte, from: int, count: int, kw: int) {
+  let acc = c.acc
+  let key = c.key
+  let s = 0
+  while (s < count) {
+    xxh3Round(acc, data, from + xxh3Stripe * s, key, kw + s)
+    s = s + 1
+  }
+}
+
+// The block-end scramble of every accumulator.
+fn xxh3Scramble(acc: []u64, key: []u64) {
+  let lane = 0
+  while (lane < xxh3Lanes) {
+    let a = acc[lane]
+    a = a ^ (a >> 47)
+    a = a ^ key[xxh3ScrambleWord + lane]
+    acc[lane] = a * xxh3Prime32
+    lane = lane + 1
+  }
+}
+
+// The final stripe, `data[i..i+64]`, against the key at byte 121. That offset
+// is not word aligned, so its eight words are lifted into a scratch key first.
+fn xxh3LastStripe(acc: []u64, data: []byte, i: int, key: []u64) {
+  let ks = []u64(8)
+  let lane = 0
+  while (lane < xxh3Lanes) {
+    ks[lane] = xxh3KeyAt(key, xxh3LastOff + 8 * lane)
+    lane = lane + 1
+  }
+  xxh3Round(acc, data, i, ks, 0)
+}
+
+// Converges the eight accumulators of a hash over `n` bytes into 64 bits.
+fn xxh3Merge(acc: []u64, key: []u64, n: u64): u64 {
+  let h = n * xxP1
+  let i = 0
+  while (i < 4) {
+    let off = xxh3MergeOff + 16 * i
+    h = h + xxh3MulFold(acc[2 * i] ^ xxh3KeyAt(key, off), acc[2 * i + 1] ^ xxh3KeyAt(key, off + 8))
+    i = i + 1
+  }
+  return xxh3Avalanche(h)
+}
+
+// Finishes the hash of `n` bytes: folds the final stripe, `last[i..i+64]`, into
+// a copy of the accumulators (so `c` stays usable) and converges them.
+fn xxh3Finish(c: Xxh3Core, last: []byte, i: int, n: u64): u64 {
+  let acc = []u64(8)
+  let lane = 0
+  while (lane < xxh3Lanes) {
+    acc[lane] = c.acc[lane]
+    lane = lane + 1
+  }
+  xxh3LastStripe(acc, last, i, c.key)
+  return xxh3Merge(acc, c.key, n)
+}
+
+// XXH3-64 of `data`, which must be longer than 240 bytes, under `seed`.
+fn xxh3Long64(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  let c = Xxh3Core(seed)
+  let blocks = (n - 1) / xxh3Block
+  let b = 0
+  while (b < blocks) {
+    xxh3Stripes(c, data, b * xxh3Block, xxh3BlockStripes, 0)
+    xxh3Scramble(c.acc, c.key)
+    b = b + 1
+  }
+  let rest = (n - 1 - xxh3Block * blocks) / xxh3Stripe
+  xxh3Stripes(c, data, blocks * xxh3Block, rest, 0)
+  return xxh3Finish(c, data, n - xxh3Stripe, u64(n))
+}

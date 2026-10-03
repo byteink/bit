@@ -1,0 +1,223 @@
+// Bit standard library — hash module, XXH3-64.
+//
+// XXH3 IS A NON-CRYPTOGRAPHIC HASH, NOT AN INTEGRITY OR SECURITY PRIMITIVE.
+// It is fast and well mixed, which makes it right for hash tables, sharding,
+// deduplication and the S3 `XXHASH3` checksum algorithm, and wrong for
+// anything an adversary may influence: the 17..240 byte path has documented
+// collision weaknesses (github.com/Cyan4973/xxHash issue 1127), and anyone
+// who knows the seed can construct colliding inputs. For that use
+// `std/crypto`'s SHA-256 or HMAC (see crc32.bit's header for why checksums
+// live in `std/hash`).
+//
+// THE ALGORITHM is Yann Collet's XXH3 64-bit variant (github.com/Cyan4973/xxHash,
+// xxhash.h, the `XXH3_64bits` and `XXH3_64bits_withSeed` entry points),
+// little-endian reads, 64-bit seed, 64-bit result, the 192-byte default
+// secret below. Four paths cover the input by length:
+//   0..16     one constant-time mix per sub-range: 0, 1..3, 4..8, 9..16
+//   17..128   16-byte windows from both ends, each a 64x64->128 multiply
+//             whose halves are xored, summed and avalanched
+//   129..240  the same windows over the whole input, in two accumulators
+//   over 240  64-byte stripes into eight accumulators, scrambled every 16
+//             stripes, merged at the end (xxh3long.bit)
+// A seed other than 0 is mixed into the short windows directly; only the
+// long path derives a seed-dependent secret.
+//
+// THE LONG PATH lives in xxh3long.bit (`xxh3Long64`) and the streaming
+// hasher in xxh3stream.bit (`Xxh3`); both share this file's secret and
+// avalanche.
+//
+// Lanes are read byte by byte (`xxRead64`, `xxRead32` in xxhash64.bit) until
+// the stage0 repin lets this switch to `loadU64` (#6790).
+//
+// Correctness is pinned by the reference implementation's own sanity vectors
+// (see xxh3.test.bit), none of which come from this file.
+
+// The default secret `kSecret` (XXH3_kSecret in xxhash.h): 192 bytes, held as
+// 24 little-endian words. The short paths read it at byte offsets through
+// `xxh3Sec64`; the long path copies it into a key (`xxh3Key`) first.
+const xxh3Secret: [24]u64 = [24]u64{
+  0xbe4ba423396cfeb8, 0x1cad21f72c81017c, 0xdb979083e96dd4de,
+  0x1f67b3b7a4a44072, 0x78e5c0cc4ee679cb, 0x2172ffcc7dd05a82,
+  0x8e2443f7744608b8, 0x4c263a81e69035e0, 0xcb00c391bb52283c,
+  0xa32e531b8b65d088, 0x4ef90da297486471, 0xd8acdea946ef1938,
+  0x3f349ce33f76faa8, 0x1d4f0bc7c7bbdcf9, 0x3159b4cd4be0518a,
+  0x647378d9c97e9fc8, 0xc3ebd33483acc5ea, 0xeb6313faffa081c5,
+  0x49daf0b751dd0d17, 0x9e68d429265516d3, 0xfca1477d58be162b,
+  0xce31d07ad1b8f88f, 0x280416958f3acb45, 0x7e404bbbcafbd7af,
+}
+
+const xxh3MixPrime1: u64 = 0x165667919e3779f9
+const xxh3MixPrime2: u64 = 0x9fb21c651e98df25
+
+// Inputs of at most this many bytes take a short path, longer ones the long path.
+const xxh3MidMax: int = 240
+
+// Little-endian u64 of the default secret's bytes `i..i+8`. Offsets that are
+// not multiples of 8 (the 129..240 path reads at 3 and 119) straddle two words.
+fn xxh3Sec64(i: int): u64 {
+  let k = i / 8
+  let r = u64(i % 8) * 8
+  if (r == 0) {
+    return xxh3Secret[k]
+  }
+  return (xxh3Secret[k] >> r) | (xxh3Secret[k + 1] << (64 - r))
+}
+
+// Little-endian u32 of the default secret's bytes `i..i+4`, widened.
+fn xxh3Sec32(i: int): u64 {
+  return xxh3Sec64(i) & 0xffffffff
+}
+
+// Byte-reversed u32 held in the low half of `x` (the high half must be 0).
+fn xxh3Swap32(x: u64): u64 {
+  return ((x & 0xff) << 24) | ((x & 0xff00) << 8) | ((x >> 8) & 0xff00) | (x >> 24)
+}
+
+// Byte-reversed u64.
+fn xxh3Swap64(x: u64): u64 {
+  return (xxh3Swap32(x & 0xffffffff) << 32) | xxh3Swap32(x >> 32)
+}
+
+// The 128-bit product `a * b`, low half xor high half. There is no u128, so
+// the high half is built from 32-bit limbs (`t2` folds the two cross terms so
+// nothing overflows a u64); the low half is the wrapping product.
+fn xxh3MulFold(a: u64, b: u64): u64 {
+  let aLo = a & 0xffffffff
+  let aHi = a >> 32
+  let bLo = b & 0xffffffff
+  let bHi = b >> 32
+  let t0 = aLo * bLo
+  let t1 = aHi * bLo + (t0 >> 32)
+  let t2 = aLo * bHi + (t1 & 0xffffffff)
+  let hi = aHi * bHi + (t1 >> 32) + (t2 >> 32)
+  return (a * b) ^ hi
+}
+
+// XXH64's final avalanche, for inputs too short to have been mixed.
+fn xxh3Avalanche64(x: u64): u64 {
+  let h = (x ^ (x >> 33)) * xxP2
+  h = (h ^ (h >> 29)) * xxP3
+  return h ^ (h >> 32)
+}
+
+// XXH3's fast avalanche, for sums that are already mixed.
+fn xxh3Avalanche(x: u64): u64 {
+  let h = (x ^ (x >> 37)) * xxh3MixPrime1
+  return h ^ (h >> 32)
+}
+
+// The stronger avalanche (after Pelle Evensen's rrmxmx) for 4..8 byte inputs.
+fn xxh3Rrmxmx(x: u64, n: u64): u64 {
+  let h = x ^ xxRotl(x, 49) ^ xxRotl(x, 24)
+  h = h * xxh3MixPrime2
+  h = (h ^ ((h >> 35) + n)) * xxh3MixPrime2
+  return h ^ (h >> 28)
+}
+
+// 1..3 bytes: first, middle and last byte plus the length, in one u32.
+fn xxh3Len1to3(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  let c1 = u64(data[0])
+  let c2 = u64(data[n >> 1])
+  let c3 = u64(data[n - 1])
+  let combined = (c1 << 16) | (c2 << 24) | c3 | (u64(n) << 8)
+  let flip = (xxh3Sec32(0) ^ xxh3Sec32(4)) + seed
+  return xxh3Avalanche64(combined ^ flip)
+}
+
+// 4..8 bytes: the first and last 4, which overlap when the length is under 8.
+fn xxh3Len4to8(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  let s = seed ^ (xxh3Swap32(seed & 0xffffffff) << 32)
+  let flip = (xxh3Sec64(8) ^ xxh3Sec64(16)) - s
+  let in64 = xxRead32(data, n - 4) + (xxRead32(data, 0) << 32)
+  return xxh3Rrmxmx(in64 ^ flip, u64(n))
+}
+
+// 9..16 bytes: the first and last 8, which overlap when the length is under 16.
+fn xxh3Len9to16(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  let flip1 = (xxh3Sec64(24) ^ xxh3Sec64(32)) + seed
+  let flip2 = (xxh3Sec64(40) ^ xxh3Sec64(48)) - seed
+  let lo = xxRead64(data, 0) ^ flip1
+  let hi = xxRead64(data, n - 8) ^ flip2
+  return xxh3Avalanche(u64(n) + xxh3Swap64(lo) + hi + xxh3MulFold(lo, hi))
+}
+
+// 0..16 bytes. The empty input hashes the secret alone, so it is the only
+// length whose result depends on nothing but the seed.
+fn xxh3Len0to16(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  if (n > 8) {
+    return xxh3Len9to16(data, seed)
+  }
+  if (n >= 4) {
+    return xxh3Len4to8(data, seed)
+  }
+  if (n > 0) {
+    return xxh3Len1to3(data, seed)
+  }
+  return xxh3Avalanche64(seed ^ (xxh3Sec64(56) ^ xxh3Sec64(64)))
+}
+
+// One 16-byte window of `data` at `i`, keyed by the secret at `s`: both
+// 8-byte halves xor a secret word moved by the seed, multiplied and folded.
+fn xxh3Mix16(data: []byte, i: int, s: int, seed: u64): u64 {
+  let lo = xxRead64(data, i)
+  let hi = xxRead64(data, i + 8)
+  return xxh3MulFold(lo ^ (xxh3Sec64(s) + seed), hi ^ (xxh3Sec64(s + 8) - seed))
+}
+
+// 17..128 bytes: pairs of windows, one from each end, working inward. The
+// reference unrolls this; the loop adds the same terms (mod 2^64, so the
+// order is free).
+fn xxh3Len17to128(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  let acc = u64(n) * xxP1
+  let i = (n - 1) / 32
+  while (i >= 0) {
+    acc = acc + xxh3Mix16(data, 16 * i, 32 * i, seed)
+    acc = acc + xxh3Mix16(data, n - 16 * (i + 1), 32 * i + 16, seed)
+    i = i - 1
+  }
+  return xxh3Avalanche(acc)
+}
+
+// 129..240 bytes: the first 128 bytes as eight windows, avalanched, then the
+// rest in 16-byte windows against the secret shifted by 3, and the last 16
+// bytes against the secret's tail.
+fn xxh3Len129to240(data: []byte, seed: u64): u64 {
+  let n = len(data)
+  let acc = u64(n) * xxP1
+  let i = 0
+  while (i < 8) {
+    acc = acc + xxh3Mix16(data, 16 * i, 16 * i, seed)
+    i = i + 1
+  }
+  acc = xxh3Avalanche(acc)
+  let tail = xxh3Mix16(data, n - 16, 136 - 17, seed)
+  let rounds = n / 16
+  while (i < rounds) {
+    tail = tail + xxh3Mix16(data, 16 * i, 16 * (i - 8) + 3, seed)
+    i = i + 1
+  }
+  return xxh3Avalanche(acc + tail)
+}
+
+// XXH3-64 of `data` under `seed`, for any length. With the default seed 0 it
+// equals the reference `XXH3_64bits(data, len)`; with another it equals
+// `XXH3_64bits_withSeed(data, len, seed)`. The empty slice hashes to
+// `0x2D06800538D394C2` under seed 0. The seed is the full 64 bits.
+export fn xxh3(data: []byte, seed: u64 = 0): u64 {
+  let n = len(data)
+  if (n <= 16) {
+    return xxh3Len0to16(data, seed)
+  }
+  if (n <= 128) {
+    return xxh3Len17to128(data, seed)
+  }
+  if (n <= xxh3MidMax) {
+    return xxh3Len129to240(data, seed)
+  }
+  return xxh3Long64(data, seed)
+}
