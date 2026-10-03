@@ -19,10 +19,14 @@
 // The 128-bit hash (xxh3x128.bit) runs this same loop and merges the same
 // accumulators twice, once at each offset, for its two halves.
 //
-// THE SECRET is a "key" of 24 words: the default secret for seed 0 and the
+// THE SECRET is a 192-byte "key": the default secret for seed 0 and the
 // default secret with the seed added to every even word and subtracted from
 // every odd one otherwise (`XXH3_initCustomSecret`; for seed 0 that is the
-// identity, so one derivation serves both).
+// identity, so one derivation serves both). It is held as bytes so every key
+// word, word aligned or not (121, 11, 117), is one unaligned `loadU64`.
+//
+// The stripe loop reads data and key words with unchecked `loadU64`; each
+// caller's range is checked once per call (`xxSpan`, xxhash64.bit).
 
 const xxh3Lanes: int = 8
 
@@ -32,11 +36,14 @@ const xxh3Stripe: int = 64
 // Stripes per block: (192 secret bytes - 64) / 8 bytes per stripe.
 const xxh3BlockStripes: int = 16
 
+// Bytes in the key.
+const xxh3KeyLen: int = 192
+
 // Bytes per block.
 const xxh3Block: int = 1024
 
-// Word of the key that scrambles the accumulators (secret byte 128).
-const xxh3ScrambleWord: int = 16
+// Key byte that scrambles the accumulators.
+const xxh3ScrambleOff: int = 128
 
 // Secret byte offset for the last stripe, and for merging the accumulators.
 const xxh3LastOff: int = 121
@@ -48,16 +55,25 @@ const xxh3MergeOff128: int = 117
 // The scramble multiplier, PRIME32_1.
 const xxh3Prime32: u64 = 0x9e3779b1
 
-// The 24-word key for `seed`: the default secret moved by the seed.
-fn xxh3Key(seed: u64): []u64 {
-  let key = []u64(24)
+// The 192-byte key for `seed`: the default secret moved by the seed.
+fn xxh3Key(seed: u64): []byte {
+  let key = []byte(xxh3KeyLen)
   let i = 0
   while (i < 24) {
-    key[i] = xxh3Secret[i] + seed
-    key[i + 1] = xxh3Secret[i + 1] - seed
+    xxh3PutWord(key, 8 * i, xxh3Secret[i] + seed)
+    xxh3PutWord(key, 8 * i + 8, xxh3Secret[i + 1] - seed)
     i = i + 2
   }
   return key
+}
+
+// Stores `w` little-endian at `key[off..off+8]`.
+fn xxh3PutWord(key: []byte, off: int, w: u64) {
+  let b = 0
+  while (b < 8) {
+    key[off + b] = byte(w >> u64(8 * b))
+    b = b + 1
+  }
 }
 
 // The eight accumulators at the start of a hash: PRIME32_3, PRIME64_1,
@@ -76,10 +92,10 @@ fn xxh3Acc(): []u64 {
 }
 
 // The state both the one-shot and the streaming hash run the stripe loop on:
-// the eight accumulators and the 24-word key for the seed.
+// the eight accumulators and the 192-byte key for the seed.
 class Xxh3Core {
   acc: []u64
-  key: []u64
+  key: []byte
 
   init(seed: u64) {
     this.acc = xxh3Acc()
@@ -87,64 +103,84 @@ class Xxh3Core {
   }
 }
 
-// Little-endian u64 of the key's bytes `off..off+8`, for offsets that are not
-// multiples of 8 (the last stripe's 121 and the merge's 11).
-fn xxh3KeyAt(key: []u64, off: int): u64 {
-  let k = off / 8
-  let r = u64(off % 8) * 8
-  if (r == 0) {
-    return key[k]
-  }
-  return (key[k] >> r) | (key[k + 1] << (64 - r))
+// Little-endian u64 of the key's bytes `off..off+8`.
+fn xxh3KeyAt(key: []byte, off: int): u64 {
+  return xxRead64(key, off)
 }
 
-// One stripe: the 64 bytes of `data` at `i` into `acc`, against key words
-// `kw..kw+8`.
-fn xxh3Round(acc: []u64, data: []byte, i: int, key: []u64, kw: int) {
-  let lane = 0
-  while (lane < xxh3Lanes) {
-    let dv = xxRead64(data, i + 8 * lane)
-    let dk = dv ^ key[kw + lane]
-    acc[lane ^ 1] = acc[lane ^ 1] + dv
-    acc[lane] = acc[lane] + (dk & 0xffffffff) * (dk >> 32)
-    lane = lane + 1
+// One lane's accumulator step: `a` plus its neighbour lane's data word `nb`
+// plus the product of the two 32-bit halves of its own keyed word `dk`.
+fn xxh3Lane(a: u64, nb: u64, dk: u64): u64 {
+  return a + nb + (dk & 0xffffffff) * (dk >> 32)
+}
+
+// `count` consecutive 64-byte stripes from `data[from..]` into `acc`, the
+// first keyed at key byte `ko` and each next one 8 bytes further. The eight
+// accumulators run in locals, the lanes are raw loads, and both ranges are
+// checked once here.
+fn xxh3Run(acc: []u64, data: []byte, from: int, count: int, key: []byte, ko: int) {
+  xxSpan(data, from, from + xxh3Stripe * count)
+  xxSpan(key, ko, ko + 8 * count + 56)
+  let a0 = acc[0]
+  let a1 = acc[1]
+  let a2 = acc[2]
+  let a3 = acc[3]
+  let a4 = acc[4]
+  let a5 = acc[5]
+  let a6 = acc[6]
+  let a7 = acc[7]
+  let d = ptrOf(data) + from
+  let k = ptrOf(key) + ko
+  let s = 0
+  while (s < count) {
+    let x0 = loadU64(d)
+    let x1 = loadU64(d + 8)
+    a0 = xxh3Lane(a0, x1, x0 ^ loadU64(k))
+    a1 = xxh3Lane(a1, x0, x1 ^ loadU64(k + 8))
+    let x2 = loadU64(d + 16)
+    let x3 = loadU64(d + 24)
+    a2 = xxh3Lane(a2, x3, x2 ^ loadU64(k + 16))
+    a3 = xxh3Lane(a3, x2, x3 ^ loadU64(k + 24))
+    let x4 = loadU64(d + 32)
+    let x5 = loadU64(d + 40)
+    a4 = xxh3Lane(a4, x5, x4 ^ loadU64(k + 32))
+    a5 = xxh3Lane(a5, x4, x5 ^ loadU64(k + 40))
+    let x6 = loadU64(d + 48)
+    let x7 = loadU64(d + 56)
+    a6 = xxh3Lane(a6, x7, x6 ^ loadU64(k + 48))
+    a7 = xxh3Lane(a7, x6, x7 ^ loadU64(k + 56))
+    d = d + xxh3Stripe
+    k = k + 8
+    s = s + 1
   }
+  keepAlive(data)
+  keepAlive(key)
+  acc[0] = a0
+  acc[1] = a1
+  acc[2] = a2
+  acc[3] = a3
+  acc[4] = a4
+  acc[5] = a5
+  acc[6] = a6
+  acc[7] = a7
 }
 
 // `count` consecutive stripes from `data[from..]` into `c`, the first against
-// key words starting at `kw` and each next one 8 bytes (one word) further.
+// key word `kw` (key byte `8 * kw`) and each next one a word further.
 fn xxh3Stripes(c: Xxh3Core, data: []byte, from: int, count: int, kw: int) {
-  let acc = c.acc
-  let key = c.key
-  let s = 0
-  while (s < count) {
-    xxh3Round(acc, data, from + xxh3Stripe * s, key, kw + s)
-    s = s + 1
-  }
+  xxh3Run(c.acc, data, from, count, c.key, 8 * kw)
 }
 
 // The block-end scramble of every accumulator.
-fn xxh3Scramble(acc: []u64, key: []u64) {
+fn xxh3Scramble(acc: []u64, key: []byte) {
   let lane = 0
   while (lane < xxh3Lanes) {
     let a = acc[lane]
     a = a ^ (a >> 47)
-    a = a ^ key[xxh3ScrambleWord + lane]
+    a = a ^ xxh3KeyAt(key, xxh3ScrambleOff + 8 * lane)
     acc[lane] = a * xxh3Prime32
     lane = lane + 1
   }
-}
-
-// The final stripe, `data[i..i+64]`, against the key at byte 121. That offset
-// is not word aligned, so its eight words are lifted into a scratch key first.
-fn xxh3LastStripe(acc: []u64, data: []byte, i: int, key: []u64) {
-  let ks = []u64(8)
-  let lane = 0
-  while (lane < xxh3Lanes) {
-    ks[lane] = xxh3KeyAt(key, xxh3LastOff + 8 * lane)
-    lane = lane + 1
-  }
-  xxh3Round(acc, data, i, ks, 0)
 }
 
 // Converges the eight accumulators of a hash into 64 bits: `init` plus the
@@ -152,7 +188,7 @@ fn xxh3LastStripe(acc: []u64, data: []byte, i: int, key: []u64) {
 // folded through the 64x64->128 multiply, then avalanched. The 64-bit hash
 // merges at `xxh3MergeOff` from `n * PRIME64_1`; the 128-bit hash's high half
 // merges at `xxh3MergeOff128` from `~(n * PRIME64_2)`.
-fn xxh3Merge(acc: []u64, key: []u64, off: int, init: u64): u64 {
+fn xxh3Merge(acc: []u64, key: []byte, off: int, init: u64): u64 {
   let h = init
   let i = 0
   while (i < 4) {
@@ -172,7 +208,7 @@ fn xxh3FinalAcc(c: Xxh3Core, last: []byte, i: int): []u64 {
     acc[lane] = c.acc[lane]
     lane = lane + 1
   }
-  xxh3LastStripe(acc, last, i, c.key)
+  xxh3Run(acc, last, i, 1, c.key, xxh3LastOff)
   return acc
 }
 
