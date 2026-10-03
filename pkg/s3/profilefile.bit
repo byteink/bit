@@ -1,0 +1,594 @@
+// pkg/s3/profilefile.bit — the shared AWS config and credentials files
+// (`~/.aws/config`, `~/.aws/credentials`) and the static-keys profile read
+// out of them.
+//
+// The parser, the section-name rules, the config-file normalisation and the
+// merge follow `@smithy/shared-ini-file-loader` (smithy-typescript
+// packages/core/src/submodules/config/shared-ini-file-loader: parseIni,
+// getConfigData, mergeConfigFiles, getConfigFilepath, getCredentialsFilepath,
+// getProfileName) line for line, quirks included, because a file the AWS CLI
+// and the SDKs read must read the same here:
+//   - `[default]`, `[profile x]` (config file) and `[x]` (credentials file);
+//     `[sso-session x]` and `[services x]` in either. A section is stored as
+//     "<prefix>.<name>"; the config file drops the "profile." prefix again.
+//   - Comments start at `#` or `;` at the start of a line or after
+//     whitespace; `key=value#x` keeps the `#`.
+//   - `key =` with an empty value opens a sub-property block: the indented
+//     `name = value` lines after it are stored as "key.name". An unindented
+//     `name = value` line closes the block. An indented line with no `=` is
+//     ignored (the SDK has no continuation lines).
+//   - A section with no key stored is absent. A line before any section, a
+//     line with no `=`, and a section whose prefix is none of `profile`,
+//     `sso-session`, `services` are skipped.
+//   - The credentials file wins over the config file for the same key.
+//
+// Where this differs from the SDK, on purpose: the SDK swallows every read
+// and parse failure and carries on with an empty file. Here a missing file is
+// not an error, but an unreadable, oversized or malformed one fails with a
+// `ProfileFileError` naming file and line, because a credentials file that
+// silently reads empty turns a typo into an anonymous request at 02:00.
+// No error text carries a line of the file: a value is never echoed.
+
+import { exists, readFile, stat } from "std/fs"
+import { env, homeDir } from "std/os"
+import { join as pathJoin } from "std/path"
+import { decodeRuneAt, hasPrefix, indexOf } from "std/strings"
+
+// The environment variables and defaults of the file locations and the
+// profile (SDK getConfigFilepath, getCredentialsFilepath, getProfileName).
+const envConfigFile: string = "AWS_CONFIG_FILE"
+const envCredentialsFile: string = "AWS_SHARED_CREDENTIALS_FILE"
+const envProfile: string = "AWS_PROFILE"
+const defaultConfigFile: string = "~/.aws/config"
+const defaultCredentialsFile: string = "~/.aws/credentials"
+const defaultProfile: string = "default"
+
+// Real files are a few KiB; anything past this is not a config file.
+const maxFileBytes: int = 4 * 1024 * 1024
+
+// The separator between a section prefix, or a sub-property name, and what
+// follows it (SDK CONFIG_PREFIX_SEPARATOR).
+const sep: string = "."
+
+// Why a shared file could not be used. `line` is 1-based, 0 when the whole
+// file is at fault (unreadable, oversized, no home directory to resolve `~`).
+export class ProfileFileError {
+  export path: string
+  export line: int
+  export reason: string
+
+  export message(): string {
+    if (this.line > 0) {
+      return "s3: shared config: ${this.path}:${this.line}: ${this.reason}"
+    }
+    return "s3: shared config: ${this.path}: ${this.reason}"
+  }
+}
+
+// Parsed sections, in the order each first got a key. The order matters in
+// one case only: two section names that normalise to the same name (see
+// `configData`) resolve in favour of the later one, as in the SDK.
+class IniData {
+  order: []string
+  sections: map<string, map<string, string>>
+
+  init() {
+    this.order = []string(0)
+    this.sections = map<string, map<string, string>>()
+  }
+
+  // Sets `key` in `section`, creating the section on first use.
+  set(section: string, key: string, value: string) {
+    let (m, ok) = this.sections[section]
+    if (!ok) {
+      m = map<string, string>()
+      this.put(section, m)
+    }
+    m[key] = value
+  }
+
+  // Stores `m` as `section`: replaces an existing one in place, else appends.
+  put(section: string, m: map<string, string>) {
+    let (_, ok) = this.sections[section]
+    if (!ok) {
+      this.order = append(this.order, section)
+    }
+    this.sections[section] = m
+  }
+
+  // The keys of `section`, if it exists.
+  get(section: string): Option<map<string, string>> {
+    let (m, ok) = this.sections[section]
+    if (!ok) {
+      return Option<map<string, string>>.None
+    }
+    return Option<map<string, string>>.Some(m)
+  }
+}
+
+// --- whitespace, as JavaScript's `\s` and `trim()` see it -----------------
+
+fn isJsSpace(cp: int): bool {
+  if (cp < 0xA0) {
+    return cp == 32 || (cp >= 9 && cp <= 13)
+  }
+  return cp == 0xA0 || cp == 0x1680 || cp == 0x202F || cp == 0x205F || isWideSpace(cp)
+}
+
+fn isWideSpace(cp: int): bool {
+  return cp == 0x3000 ||
+    cp == 0xFEFF ||
+    cp == 0x2028 ||
+    cp == 0x2029 ||
+    (cp >= 0x2000 && cp <= 0x200A)
+}
+
+// The byte length of the whitespace character at `s[i]`, 0 when there is none.
+fn spaceAt(s: string, i: int): int {
+  if (i >= len(s)) {
+    return 0
+  }
+  let (cp, n) = decodeRuneAt(s, i)
+  if (isJsSpace(int(cp))) {
+    return n
+  }
+  return 0
+}
+
+// The byte length of the whitespace character ending at `s[end]` (exclusive)
+// and starting at or after `floor`, 0 when there is none.
+fn spaceBefore(s: string, end: int, floor: int): int {
+  if (end <= floor) {
+    return 0
+  }
+  let start = end - 1
+  let back = 0
+  while (start > floor && back < 3 && s[start] >= 0x80 && s[start] < 0xC0) {
+    start = start - 1
+    back = back + 1
+  }
+  let (cp, n) = decodeRuneAt(s, start)
+  if (start + n == end && isJsSpace(int(cp))) {
+    return n
+  }
+  return 0
+}
+
+fn trimJs(s: string): string {
+  let lo = 0
+  let n = spaceAt(s, lo)
+  while (n > 0) {
+    lo = lo + n
+    n = spaceAt(s, lo)
+  }
+  let hi = len(s)
+  n = spaceBefore(s, hi, lo)
+  while (n > 0) {
+    hi = hi - n
+    n = spaceBefore(s, hi, lo)
+  }
+  return s[lo:hi]
+}
+
+// `line` up to the first `#` or `;` that starts it or follows whitespace.
+fn stripComment(line: string): string {
+  let i = 0
+  while (i < len(line)) {
+    if (line[i] == '#' || line[i] == ';') {
+      if (i == 0) {
+        return ""
+      }
+      let w = spaceBefore(line, i, 0)
+      if (w > 0) {
+        return line[0:i - w]
+      }
+    }
+    i = i + 1
+  }
+  return line
+}
+
+// --- section names ---------------------------------------------------------
+
+fn isWordByte(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// The bytes of a section name after its prefix: `[\w-@+.%:/]`.
+fn isNameByte(c: byte): bool {
+  return isWordByte(c) ||
+    c == '-' ||
+    c == '@' ||
+    c == '+' ||
+    c == '.' ||
+    c == '%' ||
+    c == ':' ||
+    c == '/'
+}
+
+fn isSectionType(prefix: string): bool {
+  return prefix == "profile" || prefix == "sso-session" || prefix == "services"
+}
+
+// The end of the prefix run `[\w-]*` at the start of `s`.
+fn prefixEnd(s: string): int {
+  let i = 0
+  while (i < len(s) && (isWordByte(s[i]) || s[i] == '-')) {
+    i = i + 1
+  }
+  return i
+}
+
+// The end of the run of name bytes in `s` starting at `from`.
+fn nameEnd(s: string, from: int): int {
+  let i = from
+  while (i < len(s) && isNameByte(s[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+// The quote byte at `s[at]`, 0 when there is none.
+fn quoteAt(s: string, at: int): int {
+  if (at < len(s) && (s[at] == '"' || s[at] == '\'')) {
+    return int(s[at])
+  }
+  return 0
+}
+
+// The end of a name that stops at `to`, past its closing quote when `quote`
+// opened it; -1 when the closing quote is missing.
+fn closedAt(s: string, to: int, quote: int): int {
+  if (quote == 0) {
+    return to
+  }
+  if (to < len(s) && int(s[to]) == quote) {
+    return to + 1
+  }
+  return -1
+}
+
+// `name` against the SDK's `^([\w-]+)\s(["'])?([\w-@+.%:/]+)\2$`: the prefix,
+// the name and whether it matched. One whitespace character separates them;
+// an opening quote must be closed by the same quote.
+fn splitPrefixed(name: string): (string, string, bool) {
+  let none = ""
+  let pEnd = prefixEnd(name)
+  let w = spaceAt(name, pEnd)
+  if (pEnd == 0 || w == 0) {
+    return none, none, false
+  }
+  let from = pEnd + w
+  let quote = quoteAt(name, from)
+  if (quote != 0) {
+    from = from + 1
+  }
+  let to = nameEnd(name, from)
+  if (to == from || closedAt(name, to, quote) != len(name)) {
+    return none, none, false
+  }
+  return name[0:pEnd], name[from:to], true
+}
+
+// --- the parser ------------------------------------------------------------
+
+class IniParser {
+  path: string
+  data: IniData
+  // "" = no section is open: before the first header, or a skipped one. The
+  // SDK tests the name for truthiness, so a `[]` section is skipped too.
+  section: string
+  // "" = no sub-property block is open.
+  block: string
+
+  init(path: string) {
+    this.path = path
+    this.data = IniData()
+    this.section = ""
+    this.block = ""
+  }
+
+  // Opens the section named by the header line `[...]`.
+  header(line: string, lineNo: int): ()!ProfileFileError {
+    this.section = ""
+    this.block = ""
+    let name = line[1:len(line) - 1]
+    if (name == "__proto__" || name == "profile __proto__") {
+      fail ProfileFileError{
+        path = this.path,
+        line = lineNo,
+        reason = "invalid profile name \"${name}\"",
+      }
+    }
+    let (prefix, rest, ok) = splitPrefixed(name)
+    if (!ok) {
+      this.section = name
+      return
+    }
+    if (isSectionType(prefix)) {
+      this.section = prefix + sep + rest
+    }
+  }
+
+  // Stores the `name = value` line `trimmed` (`raw` is the line as read, to
+  // see its indentation) in the open section, or opens a sub-property block.
+  assign(raw: string, trimmed: string) {
+    let eq = indexOf(trimmed, "=")
+    if (this.section == "" || eq <= 0) {
+      return
+    }
+    let name = trimJs(trimmed[0:eq])
+    let value = trimJs(trimmed[eq + 1:len(trimmed)])
+    if (value == "") {
+      this.block = name
+      return
+    }
+    if (this.block != "" && spaceAt(raw, 0) == 0) {
+      this.block = ""
+    }
+    if (this.block != "") {
+      name = this.block + sep + name
+    }
+    this.data.set(this.section, name, value)
+  }
+
+  line(raw: string, lineNo: int): ()!ProfileFileError {
+    let trimmed = trimJs(stripComment(raw))
+    if (len(trimmed) >= 2 && trimmed[0] == '[' && trimmed[len(trimmed) - 1] == ']') {
+      this.header(trimmed, lineNo)?
+      return
+    }
+    this.assign(raw, trimmed)
+  }
+}
+
+// `text` split on "\n", a "\r" before it dropped (the SDK's /\r?\n/).
+fn parseIni(path: string, text: string): IniData!ProfileFileError {
+  let p = IniParser(path)
+  let start = 0
+  let lineNo = 1
+  while (start <= len(text)) {
+    let rel = indexOf(text[start:len(text)], "\n")
+    let end = len(text)
+    if (rel >= 0) {
+      end = start + rel
+    }
+    let stop = end
+    if (rel >= 0 && stop > start && text[stop - 1] == '\r') {
+      stop = stop - 1
+    }
+    p.line(text[start:stop], lineNo)?
+    start = end + 1
+    lineNo = lineNo + 1
+  }
+  return p.data
+}
+
+// --- config-file normalisation and merge -----------------------------------
+
+// The config file's view of `data` (SDK getConfigData): `[default]`, then
+// every `profile.x`, `sso-session.x` and `services.x` section, the `profile.`
+// prefix dropped. Anything else is not a config-file section.
+fn configData(data: IniData): IniData {
+  let out = IniData()
+  let d = data.get(defaultProfile)
+  match (d) {
+    Some(m) => out.put(defaultProfile, m)
+    None => {}
+  }
+  for name of data.order {
+    let dot = indexOf(name, sep)
+    if (dot < 0 || !isSectionType(name[0:dot])) {
+      continue
+    }
+    let key = name
+    if (name[0:dot] == "profile") {
+      key = name[dot + 1:len(name)]
+    }
+    match (data.get(name)) {
+      Some(m) => out.put(key, m)
+      None => {}
+    }
+  }
+  return out
+}
+
+// `files` folded left to right into one set of sections (SDK
+// mergeConfigFiles): a key present in several files takes the last file's
+// value. Sections are copied, so no file's data is altered.
+fn mergeFiles(files: []IniData): IniData {
+  let out = IniData()
+  for file of files {
+    for name of file.order {
+      match (file.get(name)) {
+        Some(m) => {
+          for (k, v) of m {
+            out.set(name, k, v)
+          }
+        }
+        None => {}
+      }
+    }
+  }
+  return out
+}
+
+// --- locating and reading the files ----------------------------------------
+
+// `path` with a leading "~/" replaced by the home directory (SDK
+// loadSharedConfigFiles). The home directory is looked up only then.
+fn expandHome(path: string): string!ProfileFileError {
+  if (!hasPrefix(path, "~/")) {
+    return path
+  }
+  let home = homeDir() catch e {
+    fail ProfileFileError{ path = path, line = 0, reason = e.message() }
+  }
+  return pathJoin(home, path[2:len(path)])
+}
+
+// `value` when set, else `fallback` (the SDK's `env || default`: an empty
+// variable reads as unset), `~/` expanded.
+fn locate(value: string, fallback: string): string!ProfileFileError {
+  if (value == "") {
+    return expandHome(fallback)?
+  }
+  return expandHome(value)?
+}
+
+// The config file: AWS_CONFIG_FILE, else ~/.aws/config.
+fn configFilePath(): string!ProfileFileError {
+  return locate(env(envConfigFile), defaultConfigFile)?
+}
+
+// The credentials file: AWS_SHARED_CREDENTIALS_FILE, else ~/.aws/credentials.
+fn credentialsFilePath(): string!ProfileFileError {
+  return locate(env(envCredentialsFile), defaultCredentialsFile)?
+}
+
+// The profile to use: `explicit` when non-empty, else AWS_PROFILE, else
+// "default" (SDK getProfileName).
+fn profileNameFor(explicit: string, fromEnv: string): string {
+  if (explicit != "") {
+    return explicit
+  }
+  if (fromEnv != "") {
+    return fromEnv
+  }
+  return defaultProfile
+}
+
+fn profileName(explicit: string = ""): string {
+  return profileNameFor(explicit, env(envProfile))
+}
+
+// The text of `path`, "" when there is no such file. Fails when the file
+// exists and cannot be read, or is larger than `maxFileBytes`.
+fn readIniText(path: string): string!ProfileFileError {
+  let info = stat(path) catch e {
+    if (!exists(path)) {
+      return ""
+    }
+    fail ProfileFileError{ path = path, line = 0, reason = "cannot be read: ${e.message()}" }
+  }
+  if (info.size > maxFileBytes) {
+    fail ProfileFileError{ path = path, line = 0, reason = "is larger than ${maxFileBytes} bytes" }
+  }
+  return readFile(path) catch e {
+    fail ProfileFileError{ path = path, line = 0, reason = "cannot be read: ${e.message()}" }
+  }
+}
+
+// Both files merged into profiles by name: the config file's sections
+// normalised (`configData`), the credentials file's as written, the
+// credentials file winning per key.
+fn loadProfiles(configPath: string, credentialsPath: string): IniData!ProfileFileError {
+  let config = parseIni(configPath, readIniText(configPath)?)?
+  let credentials = parseIni(credentialsPath, readIniText(credentialsPath)?)?
+  return mergeFiles([configData(config), credentials])
+}
+
+// `loadProfiles` for the files the environment names (or `~/.aws`).
+fn loadSharedProfiles(): IniData!ProfileFileError {
+  return loadProfiles(configFilePath()?, credentialsFilePath()?)?
+}
+
+// --- the static-keys profile ------------------------------------------------
+
+// The value of `key` in `profile`, None when absent. An empty value never
+// reaches a profile (`key =` opens a sub-property block), so None and "" do
+// not need telling apart.
+fn profileKey(profile: map<string, string>, key: string): Option<string> {
+  let (v, ok) = profile[key]
+  if (!ok) {
+    return Option<string>.None
+  }
+  return Option<string>.Some(v)
+}
+
+fn hasKey(profile: map<string, string>, key: string): bool {
+  let (_, ok) = profile[key]
+  return ok
+}
+
+// What a profile that is not static credentials asks for, as a message:
+// the keys the SDK's fromIni checks after the static keys, in its order, each
+// naming the ticket that implements it. "" when none is present.
+fn unsupportedProfile(profile: map<string, string>): string {
+  if (hasKey(profile, "web_identity_token_file") && hasKey(profile, "role_arn")) {
+    return "assumes a role with a web identity token file (#6625)"
+  }
+  if (hasKey(profile, "credential_process")) {
+    return "uses credential_process (#6616)"
+  }
+  let sso = ["sso_start_url", "sso_account_id", "sso_session", "sso_region", "sso_role_name"]
+  for k of sso {
+    if (hasKey(profile, k)) {
+      return "uses AWS SSO (#6617)"
+    }
+  }
+  if (hasKey(profile, "login_session")) {
+    return "uses a login_session"
+  }
+  return ""
+}
+
+// Whether the profile assumes a role (SDK isAssumeRoleProfile): `role_arn`
+// with exactly one of `source_profile` and `credential_source`.
+fn assumesRole(profile: map<string, string>): bool {
+  if (!hasKey(profile, "role_arn")) {
+    return false
+  }
+  return hasKey(profile, "source_profile") != hasKey(profile, "credential_source")
+}
+
+fn staticCredential(
+  name: string,
+  profile: map<string, string>,
+  id: string,
+  secret: string,
+): AwsCredential! {
+  return AwsCredential(
+    accessKeyId = id,
+    secretAccessKey = secret,
+    sessionToken = profileKey(profile, "aws_session_token"),
+    accountId = profileKey(profile, "aws_account_id"),
+  ) catch e {
+    fail newError("s3: credentials: profile [${name}]: ${e.message()}")
+  }
+}
+
+// The credentials of profile `name`, from the profiles `profiles` (the
+// config and credentials files merged). Only a profile holding
+// `aws_access_key_id` and `aws_secret_access_key` (and optionally
+// `aws_session_token`, `aws_account_id`) resolves here; the SDK's other
+// profile kinds fail with the ticket that implements them, in the SDK's
+// order: role assumption first, then static keys, web identity, process,
+// SSO, login. A role-assuming profile with static keys assumes the role, as
+// in the SDK.
+fn credentialsOf(name: string, profiles: IniData): AwsCredential! {
+  let (profile, found) = profiles.sections[name]
+  if (!found) {
+    fail newError("s3: credentials: profile [${name}] is in neither the shared config file nor the shared credentials file")
+  }
+  if (assumesRole(profile)) {
+    fail newError("s3: credentials: profile [${name}] assumes a role (role_arn with source_profile or credential_source), which needs profile role chains (#6626)")
+  }
+  let (id, hasId) = profile["aws_access_key_id"]
+  let (secret, hasSecret) = profile["aws_secret_access_key"]
+  if (hasId && hasSecret) {
+    return staticCredential(name, profile, id, secret)?
+  }
+  let why = unsupportedProfile(profile)
+  if (why != "") {
+    fail newError("s3: credentials: profile [${name}] ${why}, which this build does not resolve yet")
+  }
+  fail newError("s3: credentials: profile [${name}] has no aws_access_key_id and aws_secret_access_key pair and no role, web identity, process or SSO settings")
+}
+
+// The credentials of the profile `name` in the shared files the environment
+// names (AWS_CONFIG_FILE, AWS_SHARED_CREDENTIALS_FILE, else `~/.aws`).
+// Re-reads the files on every call.
+fn profileCredentials(name: string): AwsCredential! {
+  return credentialsOf(name, loadSharedProfiles()?)?
+}
