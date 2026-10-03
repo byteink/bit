@@ -17,7 +17,7 @@ separate type carrying only what a client is allowed to set:
 
 ```bit
 import { App, Config, Ctx, Res, minLen, notFound } from "web"
-import { newBuilder, parseInt } from "std/strings"
+import { Builder, parseInt } from "std/strings"
 import { Json } from "std/json"
 
 @json class Article {
@@ -30,7 +30,7 @@ import { Json } from "std/json"
 // A stable, lowercase, hyphenated slug: only a-z and 0-9 survive, every
 // other byte becomes one dash, and runs of dashes collapse to one.
 fn slugify(title: string): string {
-  let b = newBuilder()
+  let b = Builder()
   let lastDash = false
   let i = 0
   while (i < len(title)) {

@@ -700,7 +700,7 @@ and hand it to every caller, rather than each recomputing
 ## Timer channels
 
 ```bit
-import { after, newTimer, newTicker, tick, Millisecond } from "std/time"
+import { after, Ticker, tick, Millisecond } from "std/time"
 
 fn waitForWork(work: chan<int>): int {
   select {
@@ -712,7 +712,7 @@ fn waitForWork(work: chan<int>): int {
 }
 
 fn pollFiveTimes(): int {
-  let t = newTicker(50 * Millisecond)
+  let t = Ticker(50 * Millisecond)
   let n = 0
   while (n < 5) {
     let v = <- t.c
@@ -726,14 +726,14 @@ fn pollFiveTimes(): int {
 | Symbol | Meaning |
 |---|---|
 | `after(d: int): chan<bool>` | receives `true` once, `d` nanoseconds from now - the idiomatic `select` timeout arm |
-| `Timer` / `newTimer(d): Timer` | one-shot timer; `.c` receives `true` once when it fires |
+| `Timer(d: int)` | one-shot timer; `.c` receives `true` once when it fires |
 | `Timer.stop(): bool` | cancels; `true` if it was still pending. Does not drain `.c` |
 | `Timer.reset(d): bool` | re-arms; `false`, with no effect, if it already fired |
-| `Ticker` / `newTicker(d): Ticker` | repeating timer; `.c` receives `true` every `d` nanoseconds until stopped |
+| `Ticker(d: int)` | repeating timer; `.c` receives `true` every `d` nanoseconds until stopped |
 | `Ticker.stop(): bool` | cancels; after this, `.c` receives no further ticks |
-| `tick(d: int): chan<bool>` | receives `true` every `d` nanoseconds, forever - there is no way to stop it, so its slot leaks for the program's life; prefer `newTicker` when it must ever stop |
+| `tick(d: int): chan<bool>` | receives `true` every `d` nanoseconds, forever - there is no way to stop it, so its slot leaks for the program's life; prefer `Ticker(d)` when it must ever stop |
 
-In a loop, prefer `newTimer` and `Timer.reset` over a fresh `after` each
+In a loop, prefer `Timer(d)` and `Timer.reset` over a fresh `after` each
 iteration, which otherwise accumulates one live slot per iteration between
 fires.
 
@@ -1851,11 +1851,11 @@ Parks the calling green thread for at least `d` nanoseconds without blocking an 
 
 Parks the calling green thread until `deadlineNs` on the `monotonic()` clock, an absolute instant rather than a duration. Useful when several callers must wake at the exact same moment. See [Sleeping](#sleeping).
 
-### `newTimer(d: i64): Timer`
+### `Timer(d: i64)`
 
 Starts a one-shot `Timer` that fires `d` nanoseconds from now.
 
-### `newTicker(d: i64): Ticker`
+### `Ticker(d: i64)`
 
 Starts a `Ticker` that ticks every `d` nanoseconds.
 
@@ -1865,7 +1865,7 @@ A channel that receives `true` once, `d` nanoseconds from now: the idiomatic `se
 
 ### `tick(d: i64): chan<bool>`
 
-A channel that receives `true` every `d` nanoseconds, forever. There is no way to stop it, so prefer `newTicker` when the ticker must ever be stopped.
+A channel that receives `true` every `d` nanoseconds, forever. There is no way to stop it, so prefer `Ticker(d)` when the ticker must ever be stopped.
 
 ## Formatting, parsing and Hijri dates reference
 

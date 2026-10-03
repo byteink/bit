@@ -159,7 +159,7 @@ second, explicit step: `link()` writes the join rows.
 ```bit
 import { UniqueViolation, classify } from "orm"
 import { minLen } from "web"
-import { newBuilder } from "std/strings"
+import { Builder } from "std/strings"
 import { now } from "std/time"
 
 export @json class CreateArticleInput {
@@ -174,7 +174,7 @@ export @json class CreateArticleInput {
 }
 
 fn slugify(title: string): string {
-  let b = newBuilder()
+  let b = Builder()
   let i = 0
   while (i < len(title)) {
     let ch = title[i]
