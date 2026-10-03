@@ -1,0 +1,473 @@
+// stdlib/http/bodyreaderpool.test.bit — a streamed response's connection and
+// the client's idle pool (#6596): it goes back only after the body was read to
+// its end, never after an abandon, a failed read, a read deadline or a refused
+// head, over cleartext and over TLS.
+//
+// Same module as bodyreader.bit (SPEC §19): `Client`, `ClientRequest`,
+// `TimeoutError`, `listen`, `Listener`, `AtomicI64`, `byteStream`, `netStream`,
+// `tlsStream`, `tlsListen`, `TlsListener`, `monotonic`, `indexOf`, `toLower`,
+// `repeat`, `itoa`, message.test.bit's `chunk`, bodyreader.test.bit's `drain`
+// and tls.test.bit's `tls5916ServerConfig`/`tls5916ClientConfig` are bound
+// module-wide, so nothing is imported here.
+//
+// The oracle is the origin's own count of accepted connections: a reused
+// connection is a request that did not cause an accept.
+
+// What every request to a `kaOrigin` is answered with. The origin keeps a
+// connection open for more requests (HTTP/1.1 keep-alive) until `perConn`
+// requests have been served on it (0 = no limit) or the client closes it.
+//   `head`    written first, terminated by the blank line;
+//   `body`    written after it; with `part` >= 0 only its first `part` bytes
+//             are written and the origin then waits for `gate`, which no test
+//             releases until it is done (a server that stalls mid-body);
+//   `silent`  the origin reads the request and never answers (waits for `gate`).
+class kaPlan {
+  head: string,
+  body: string,
+  part: int,
+  silent: bool,
+  perConn: int,
+  gate: chan<int>,
+}
+
+class kaOrigin {
+  accepts: AtomicI64
+  requests: AtomicI64
+  // Requests that said `Connection: close`.
+  closes: AtomicI64
+  port: int
+  quit: chan<int>
+  plan: kaPlan
+
+  // Stops accepting and releases a stalled connection. Idempotent enough for a
+  // test's end: the quit channel holds one value.
+  stop() {
+    this.quit <- 1
+    this.plan.gate <- 1
+  }
+}
+
+fn kaPlanOf(head: string, body: string): kaPlan {
+  return kaPlan{
+    head = head,
+    body = body,
+    part = 0 - 1,
+    silent = false,
+    perConn = 0,
+    gate = chan<int>(1),
+  }
+}
+
+// A 200 with a `Content-Length` body.
+fn kaFixed(body: string): kaPlan {
+  return kaPlanOf("HTTP/1.1 200 OK\r\nContent-Length: ${len(body)}\r\n\r\n", body)
+}
+
+// The text of one request head off `st`, or "" when the peer is gone.
+fn kaReadHead(st: byteStream): string {
+  let req = ""
+  let reads = 0
+  while (indexOf(req, "\r\n\r\n") < 0 && reads < 100) {
+    reads = reads + 1
+    let piece = st.readUp(4096) catch _ {
+      return ""
+    }
+    if (len(piece) == 0) {
+      return ""
+    }
+    req = req + piece
+  }
+  return req
+}
+
+fn kaAnswer(st: byteStream, plan: kaPlan): bool {
+  if (plan.part >= 0) {
+    st.writeStr(plan.head + plan.body[0:plan.part]) catch _ {
+      return false
+    }
+    <- plan.gate
+    return false
+  }
+  st.writeStr(plan.head + plan.body) catch _ {
+    return false
+  }
+  return true
+}
+
+// Serves requests on `st` until the client goes, `perConn` is reached or the
+// plan says to stop.
+fn kaServe(st: byteStream, o: kaOrigin) {
+  defer st.shut()
+  let served = 0
+  while (served < 1000 && (o.plan.perConn == 0 || served < o.plan.perConn)) {
+    let req = kaReadHead(st)
+    if (req == "") {
+      return
+    }
+    served = served + 1
+    o.requests.add(1)
+    if (indexOf(toLower(req), "connection: close") >= 0) {
+      o.closes.add(1)
+    }
+    if (o.plan.silent) {
+      <- o.plan.gate
+      return
+    }
+    if (!kaAnswer(st, o.plan)) {
+      return
+    }
+  }
+}
+
+fn kaAcceptPlain(l: Listener, o: kaOrigin) {
+  while (true) {
+    let c = l.accept() catch _ {
+      return
+    }
+    o.accepts.add(1)
+    spawn kaServe(netStream{ conn = c }, o)
+  }
+}
+
+fn kaClosePlain(l: Listener, quit: chan<int>) {
+  <- quit
+  l.close()
+}
+
+fn kaAcceptTls(l: TlsListener, o: kaOrigin) {
+  while (true) {
+    let c = l.accept() catch _ {
+      return
+    }
+    o.accepts.add(1)
+    spawn kaServe(tlsStream{ conn = c }, o)
+  }
+}
+
+fn kaCloseTls(l: TlsListener, quit: chan<int>) {
+  <- quit
+  l.close()
+}
+
+fn kaOriginOf(plan: kaPlan, port: int): kaOrigin {
+  return kaOrigin{
+    accepts = AtomicI64(0),
+    requests = AtomicI64(0),
+    closes = AtomicI64(0),
+    port = port,
+    quit = chan<int>(1),
+    plan = plan,
+  }
+}
+
+fn kaStart(plan: kaPlan): kaOrigin! {
+  let l = listen("127.0.0.1", 0)?
+  let o = kaOriginOf(plan, l.port()?)
+  spawn kaAcceptPlain(l, o)
+  spawn kaClosePlain(l, o.quit)
+  return o
+}
+
+fn kaStartTls(plan: kaPlan): kaOrigin! {
+  let l = tlsListen("127.0.0.1", 0, tls5916ServerConfig()?)?
+  let o = kaOriginOf(plan, l.port()?)
+  spawn kaAcceptTls(l, o)
+  spawn kaCloseTls(l, o.quit)
+  return o
+}
+
+fn kaUrl(o: kaOrigin): string {
+  return "http://127.0.0.1:${o.port}/obj"
+}
+
+// One streamed GET, read to its end.
+fn kaGet(c: Client, url: string, max: int): string! {
+  let res = c.send(ClientRequest{ url = url }, stream = true)?
+  let r = readerOf(res)?
+  return drain(r, max)?
+}
+
+// One streamed GET read for `n` bytes and then abandoned with `close()`.
+fn kaAbandon(c: Client, url: string, n: int): ()! {
+  let res = c.send(ClientRequest{ url = url }, stream = true)?
+  let r = readerOf(res)?
+  let piece = r.read(n)?
+  if (len(piece) != n) {
+    fail newError("read ${n} returned ${len(piece)} bytes")
+  }
+  r.close()
+}
+
+test "ten sequential fully-read streamed GETs use one accepted connection" {
+  let body = repeat("0123456789", 500)
+  let o = kaStart(kaFixed(body)) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let i = 0
+  while (i < 10) {
+    let got = kaGet(c, kaUrl(o), 4096) catch e {
+      o.stop()
+      assert(false, "get ${i}: ${e.message()}")
+      return
+    }
+    assert(got == body, "get ${i}: ${len(got)} bytes, want ${len(body)} identical")
+    i = i + 1
+  }
+  o.stop()
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}")
+  assert(o.requests.load() == 10, "requests = ${o.requests.load()}")
+  assert(o.closes.load() == 0, "${o.closes.load()} requests said Connection: close")
+  assert(len(c.pool.idle) == 1, "idle = ${len(c.pool.idle)}")
+}
+
+test "ten sequential fully-read chunked streamed GETs use one accepted connection" {
+  let wire = chunk("5", "hello") + chunk("1", "!") + "0\r\nX-Trailer: t\r\n\r\n"
+  let o = kaStart(kaPlanOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", wire)) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let i = 0
+  while (i < 10) {
+    let got = kaGet(c, kaUrl(o), 3) catch e {
+      o.stop()
+      assert(false, "get ${i}: ${e.message()}")
+      return
+    }
+    assert(got == "hello!", "get ${i}: '${got}'")
+    i = i + 1
+  }
+  o.stop()
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}")
+  assert(len(c.pool.idle) == 1, "idle = ${len(c.pool.idle)}")
+}
+
+test "ten streamed GETs each abandoned after one byte use ten connections and park none" {
+  let o = kaStart(kaFixed(repeat("x", 4000))) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let i = 0
+  while (i < 10) {
+    kaAbandon(c, kaUrl(o), 1) catch e {
+      o.stop()
+      assert(false, "abandon ${i}: ${e.message()}")
+      return
+    }
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)} after abandon ${i}")
+    i = i + 1
+  }
+  o.stop()
+  assert(o.accepts.load() == 10, "accepts = ${o.accepts.load()}")
+  assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+}
+
+test "a request after an abandon reads its own body, never the abandoned one's rest" {
+  let o = kaStart(kaFixed("0123456789")) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  kaAbandon(c, kaUrl(o), 3) catch e {
+    o.stop()
+    assert(false, "abandon: ${e.message()}")
+    return
+  }
+  let got = kaGet(c, kaUrl(o), 64) catch e {
+    o.stop()
+    assert(false, "get: ${e.message()}")
+    return
+  }
+  o.stop()
+  assert(got == "0123456789", "got '${got}'")
+  assert(o.accepts.load() == 2, "accepts = ${o.accepts.load()}")
+}
+
+test "a response that says Connection: close is read and its connection is not reused" {
+  let plan = kaPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n", "ok")
+  plan.perConn = 1
+  let o = kaStart(plan) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let i = 0
+  while (i < 3) {
+    let got = kaGet(c, kaUrl(o), 16) catch e {
+      o.stop()
+      assert(false, "get ${i}: ${e.message()}")
+      return
+    }
+    assert(got == "ok", "get ${i}: '${got}'")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)} after get ${i}")
+    i = i + 1
+  }
+  o.stop()
+  assert(o.accepts.load() == 3, "accepts = ${o.accepts.load()}")
+}
+
+test "a connection the server closed while it was parked is replaced for a GET and fails a POST" {
+  let plan = kaFixed("pong")
+  plan.perConn = 1
+  let o = kaStart(plan) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let first = kaGet(c, kaUrl(o), 16) catch e {
+    o.stop()
+    assert(false, "get 1: ${e.message()}")
+    return
+  }
+  let second = kaGet(c, kaUrl(o), 16) catch e {
+    o.stop()
+    assert(false, "get 2 on a stale connection was not retried: ${e.message()}")
+    return
+  }
+  assert(first == "pong" && second == "pong", "bodies '${first}' '${second}'")
+  assert(o.accepts.load() == 2, "accepts = ${o.accepts.load()}")
+  // The pool now holds the second GET's connection, which the origin closed
+  // after answering it; a POST on it must fail, not be replayed.
+  let req = ClientRequest{ method = "POST", url = kaUrl(o), body = "x" }
+  let before = o.requests.load()
+  c.send(req, stream = true) catch _ {
+    o.stop()
+    assert(o.requests.load() == before, "the origin saw the POST that failed")
+    return
+  }
+  o.stop()
+  assert(false, "a POST on a connection the server closed succeeded")
+}
+
+test "a server that stalls mid-body fails the read within the timeout, typed, and shuts the connection" {
+  let plan = kaPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", repeat("s", 100))
+  plan.part = 10
+  let o = kaStart(plan) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let res = c.send(ClientRequest{ url = kaUrl(o), timeoutMs = 1500 }, stream = true) catch e {
+    o.stop()
+    assert(false, "send: ${e.message()}")
+    return
+  }
+  let r = readerOf(res) catch e {
+    o.stop()
+    assert(false, "${e.message()}")
+    return
+  }
+  let first = r.read(64) catch e {
+    o.stop()
+    assert(false, "first read: ${e.message()}")
+    return
+  }
+  assert(len(first) == 10, "first read returned ${len(first)} bytes")
+  let t0 = monotonic().ns
+  r.read(64) catch e {
+    let ms = (monotonic().ns - t0) / 1000000
+    o.stop()
+    let (te, ok) = e.(TimeoutError)
+    assert(ok, "the stall failed with '${e.message()}', not a TimeoutError")
+    assert(te.op == "read" && te.ms == 1500, "op '${te.op}', ms ${te.ms}")
+    assert(ms >= 1450 && ms <= 1650, "failed after ${ms} ms, want 1500 + 10%")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    r.read(1) catch e2 {
+      assert(indexOf(e2.message(), "earlier read failed") >= 0, "message = '${e2.message()}'")
+      return
+    }
+    assert(false, "a read after the timeout succeeded")
+    return
+  }
+  o.stop()
+  assert(false, "a stalled body read returned")
+}
+
+test "a server that never answers fails the send with a TimeoutError" {
+  let plan = kaFixed("never")
+  plan.silent = true
+  let o = kaStart(plan) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  let t0 = monotonic().ns
+  c.send(ClientRequest{ url = kaUrl(o), timeoutMs = 500 }, stream = true) catch e {
+    let ms = (monotonic().ns - t0) / 1000000
+    o.stop()
+    let (te, ok) = e.(TimeoutError)
+    assert(ok, "failed with '${e.message()}', not a TimeoutError")
+    assert(te.op == "send" && te.ms == 500, "op '${te.op}', ms ${te.ms}")
+    assert(ms >= 450 && ms <= 650, "failed after ${ms} ms, want 500 + slack")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    return
+  }
+  o.stop()
+  assert(false, "a silent server answered")
+}
+
+test "a response with differing Content-Length fields is refused and its connection is not parked" {
+  let o = kaStart(
+    kaPlanOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n", "hello"),
+  ) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client()
+  c.send(ClientRequest{ url = kaUrl(o) }, stream = true) catch e {
+    o.stop()
+    assert(indexOf(e.message(), "conflicting Content-Length") >= 0, "message = '${e.message()}'")
+    assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)}")
+    return
+  }
+  o.stop()
+  assert(false, "differing Content-Length fields were accepted")
+}
+
+test "an https streamed origin is reused: three streamed GETs and a buffered one on one connection" {
+  let body = repeat("tls-body-", 300)
+  let o = kaStartTls(kaFixed(body)) catch e {
+    assert(false, "start: ${e.message()}")
+    return
+  }
+  let c = Client(tls = tls5916ClientConfig())
+  let url = "https://127.0.0.1:${o.port}/obj"
+  let i = 0
+  while (i < 3) {
+    let got = kaGet(c, url, 1000) catch e {
+      o.stop()
+      assert(false, "get ${i}: ${e.message()}")
+      return
+    }
+    assert(got == body, "get ${i}: ${len(got)} bytes, want ${len(body)} identical")
+    assert(len(c.pool.idle) == 1, "idle = ${len(c.pool.idle)} after get ${i}")
+    i = i + 1
+  }
+  let buffered = c.get(url) catch e {
+    o.stop()
+    assert(false, "buffered get on the pooled TLS connection: ${e.message()}")
+    return
+  }
+  assert(buffered.status == 200 && buffered.body == body, "buffered status ${buffered.status}")
+  assert(o.accepts.load() == 1, "accepts = ${o.accepts.load()}")
+  assert(o.requests.load() == 4, "requests = ${o.requests.load()}")
+  // An abandoned TLS reader parks nothing: the next request dials again.
+  c.pool.closeAll()
+  kaAbandon(c, url, 1) catch e {
+    o.stop()
+    assert(false, "abandon: ${e.message()}")
+    return
+  }
+  assert(len(c.pool.idle) == 0, "idle = ${len(c.pool.idle)} after an abandoned TLS reader")
+  let again = kaGet(c, url, 1000) catch e {
+    o.stop()
+    assert(false, "get after the abandon: ${e.message()}")
+    return
+  }
+  o.stop()
+  assert(again == body, "get after the abandon: ${len(again)} bytes")
+  assert(o.accepts.load() == 3, "accepts = ${o.accepts.load()}")
+}
