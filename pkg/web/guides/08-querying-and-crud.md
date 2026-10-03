@@ -117,10 +117,10 @@ Content-Type: application/json
 ```bit
 import { minLen } from "web"
 import { now } from "std/time"
-import { newBuilder } from "std/strings"
+import { Builder } from "std/strings"
 
 fn slugify(title: string): string {
-  let b = newBuilder()
+  let b = Builder()
   let lastDash = false
   let i = 0
   while (i < len(title)) {

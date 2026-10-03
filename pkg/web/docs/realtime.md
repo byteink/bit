@@ -85,7 +85,7 @@ registry is your app's, the same way a `SessionStore` is:
 ```bit
 import { Ctx, Res, wsUpgrade } from "web"
 import { Conn as WsConn, defaultLimits, MessageClose } from "std/websocket"
-import { Mutex, newMutex } from "std/sync"
+import { Mutex } from "std/sync"
 
 class Room {
   mu: Mutex,
@@ -93,7 +93,7 @@ class Room {
 }
 
 fn newRoom(): Room {
-  return Room{ mu = newMutex(), conns = []WsConn(0) }
+  return Room{ mu = Mutex(), conns = []WsConn(0) }
 }
 
 fn join(r: Room, c: WsConn) {
