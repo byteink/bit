@@ -207,8 +207,9 @@ import { Writer, Attr } from "std/xml"
 
 fn completeBody(etags: []string): string! {
   let w = Writer()?
-  let ns = append([]Attr(0), Attr{ name = "xmlns", value = "http://s3.amazonaws.com/doc/2006-03-01/" })
-  w.start("CompleteMultipartUpload", ns)?
+  let ns = "http://s3.amazonaws.com/doc/2006-03-01/"
+  let root = append([]Attr(0), Attr{ name = "xmlns", value = ns })
+  w.start("CompleteMultipartUpload", root)?
   let i = 0
   while (i < len(etags)) {
     w.start("Part")?
@@ -266,7 +267,8 @@ import { Writer, Attr } from "std/xml"
 
 fn grantee(): string! {
   let w = Writer()?
-  let attrs = append([]Attr(0), Attr{ name = "xmlns:xsi", value = "http://www.w3.org/2001/XMLSchema-instance" })
+  let xsi = "http://www.w3.org/2001/XMLSchema-instance"
+  let attrs = append([]Attr(0), Attr{ name = "xmlns:xsi", value = xsi })
   attrs = append(attrs, Attr{ name = "xsi:type", value = "Group" })
   w.empty("Grantee", attrs)?
   return string(w.finish()?)
