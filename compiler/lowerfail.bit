@@ -20,6 +20,140 @@ fn clearErr(fc: FnCtx) {
   setErr(fc, builderEmit(fc.b, nl))
 }
 
+// ---- #6686: the error as the LAST RETURN WORD (BIT_ERR_REG) ----------------
+//
+// A plain free function that returns its error in a register hands back its ok
+// words followed by one error word typed `errSlotTy`; every direct caller binds
+// that word with a trailing `Op.CallWord` and tests it, so the per-task slot is
+// not read. During the rollout the slot is ALSO still written (`setErr` /
+// `clearErr` stay), so a consumer not yet converted reads the right answer;
+// #6690 removes that dual publish. Decided from the declaration alone, like
+// `explodesParams`, because the callee's `ret` and every call site are lowered
+// in different functions and must agree.
+
+// The rollout flag. Default off: until the stage0 pin carries the word
+// convention, a stage0-built compiler would still call `err_get` for it.
+fn errRegEnabled(): bool {
+  return envOr("BIT_ERR_REG", "0") != "0"
+}
+
+// Windows keeps the slot until `multiWordRet` is on there (#5875).
+fn errInReg(lo: Lowerer): bool {
+  return lo.multiWordRet && errRegEnabled()
+}
+
+// The `T!E` type `decl` declares when it returns its error as a word, else 0.
+// Plain free functions only: no receiver and not generic. A fallible `main` is
+// excluded because `emitFallibleMainWrapper` (lowerentry.bit) reads its ok value
+// from a bare `call` and still reads the slot; #6687 converts it.
+fn errWordRaw(c: Checker, decl: int, lo: Lowerer): int {
+  if (!errInReg(lo) || decl == 0) {
+    return 0
+  }
+  let kids = kidsOf(c.tree, decl)
+  if (kids[0] != 0 || kids[4] == 0 || isGenericFuncDecl(c, decl)) {
+    return 0
+  }
+  let nm = getNode(c.tree, kids[1])
+  if (c.source[nm.span.start:nm.span.end] == "main") {
+    return 0
+  }
+  let raw = typeFromNode(c, kids[4])
+  if (raw == 0 || c.ctx.types[raw].kind != TypeKind.Fallible) {
+    return 0
+  }
+  return raw
+}
+
+fn errWordDecl(c: Checker, decl: int, lo: Lowerer): bool {
+  return errWordRaw(c, decl, lo) != 0
+}
+
+// Whether a fallible result's ok words, plus the one Int word the error takes,
+// fit the return registers (`declPlainResultType`, lowerexplode.bit). With the
+// flag off the error needs no register and only the ok words are asked.
+fn fallibleOkWordsAdmitted(ctx: TypeContext, ok: int): bool {
+  let words = fallibleOkWordTypes(ctx, ok)
+  if (len(words) == 0) {
+    return false
+  }
+  if (!errRegEnabled()) {
+    return true
+  }
+  let withErr = []int(0)
+  for w of words {
+    withErr = append(withErr, w)
+  }
+  return retWordsFitRegisters(ctx, append(withErr, primType(ctx, 3)))
+}
+
+// `nil` of the error slot representation: the error word an ok `ret` carries.
+fn okErrWord(fc: FnCtx): int {
+  return builderEmit(fc.b, mkInstr(Op.ConstNil, errSlotTy(fc, fc.fallibleErr)))
+}
+
+// Appends the ok path's error word (`nil`) to `r`, an `Op.Ret`, when this body
+// returns its error as a word.
+fn publishOkErr(fc: FnCtx, r: IrInstr) {
+  if (fc.errReg) {
+    r.args = append(r.args, okErrWord(fc))
+  }
+}
+
+// A `ret` with no ok value: `()`'s ok return, a bare `return`, falling off the end.
+fn emitBareOkRet(fc: FnCtx) {
+  let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
+  publishOkErr(fc, r)
+  builderEmit(fc.b, r)
+}
+
+// The call's trailing `Op.CallWord` carrying the callee's error word, after
+// `nOk` ok words (ival), emitted into `b`; returns its value id, or -1 for a
+// callee on the slot convention. A void-ok callee has no ok word: its `Op.Call`
+// IS the error word (typed by `errWordCallTy`), so nothing is appended. It must
+// directly follow the ok words' run (`callWordPlaced`, verify.bit).
+fn emitErrWord(fc: FnCtx, b: IrBuilder, raw: int, call: int, nOk: int): int {
+  if (raw == 0) {
+    return -1
+  }
+  if (fc.c.ctx.types[raw].result == fc.c.ctx.voidId) {
+    return call
+  }
+  let w = mkInstr(Op.CallWord, errSlotTy(fc, fc.c.ctx.types[raw].errTy))
+  w.args = [call]
+  w.ival = nOk
+  return builderEmit(b, w)
+}
+
+// `emitErrWord` for a call lowered into `fc.b`: records the word as
+// `pendingErr` for the `?`/`catch` that consumes the call (`takeCallErr`).
+fn appendErrWord(fc: FnCtx, raw: int, call: int, nOk: int) {
+  if (raw != 0) {
+    fc.pendingErr = emitErrWord(fc, fc.b, raw, call, nOk)
+  }
+}
+
+// The IR type of the `Op.Call` itself: the error word's when the callee's ok
+// type is void, else `ty` (the ok type or word 0).
+fn errWordCallTy(fc: FnCtx, raw: int, ty: int): int {
+  if (raw != 0 && fc.c.ctx.types[raw].result == fc.c.ctx.voidId) {
+    return errSlotTy(fc, fc.c.ctx.types[raw].errTy)
+  }
+  return ty
+}
+
+// The error the fallible call just lowered returned: its word when the producer
+// appended one, else the slot. `pendingErr` is reset BEFORE each operand is
+// lowered (`lowerTryExpr`, `lowerCatch`), so it is never stale here.
+fn takeCallErr(fc: FnCtx, errTy: int): int {
+  if (fc.pendingErr >= 0) {
+    let w = fc.pendingErr
+    fc.pendingErr = -1
+    return w
+  }
+  return getErr(fc, errTy)
+}
+
 // #2939: the err slot is one machine word tested against `nil` (`neNil`),
 // sound only when every `errTy` value is a reachable pointer — true for any
 // reference-shaped type (codegen.bit's `isRefType`: `error`/interface, class,
@@ -143,14 +277,15 @@ fn neNil(fc: FnCtx, errv: int, slotTy: int): int {
 // `(A, B)!` body whose result `explodedRetWords` (lowerexplode.bit) returns in
 // W words gives every `ret` W operands (`fallibleZeroArgs`), and the zero BITS
 // of each word are enough for the same reason the nil is: nothing reads them.
-fn emitFallibleZeroRet(fc: FnCtx, span: Span) {
-  if (fc.fallibleOk == fc.c.ctx.voidId) {
-    builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
-    fc.terminated = true
-    return
-  }
+fn emitFallibleZeroRet(fc: FnCtx, span: Span, errv: int) {
   let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
-  r.args = fallibleZeroArgs(fc, span)
+  if (fc.fallibleOk != fc.c.ctx.voidId) {
+    r.args = fallibleZeroArgs(fc, span)
+  }
+  // #6686: `errv` is the failure in slot representation, the last return word.
+  if (fc.errReg) {
+    r.args = append(r.args, errv)
+  }
   builderEmit(fc.b, r)
   fc.terminated = true
 }
@@ -188,8 +323,9 @@ fn lowerFail(fc: FnCtx, node: int) {
     return
   }
   runDefers(fc)
-  setErr(fc, boxErrForSlot(fc, errv, fc.fallibleErr))
-  emitFallibleZeroRet(fc, getNode(fc.c.tree, node).span)
+  let slotv = boxErrForSlot(fc, errv, fc.fallibleErr)
+  setErr(fc, slotv)
+  emitFallibleZeroRet(fc, getNode(fc.c.tree, node).span, slotv)
 }
 
 // Right after a fallible call: branch on the error slot. On error propagate
@@ -198,9 +334,14 @@ fn lowerFail(fc: FnCtx, node: int) {
 // produced flows in without a block param. Shared by `?` (`lowerTryExpr`) and
 // the fallible `for x of it?` header (`lowerForOfIterHeader`, lowerforiter.bit).
 fn propagateErr(fc: FnCtx, errTy: int, span: Span) {
+  propagateErrWord(fc, getErr(fc, errTy), errTy, span)
+}
+
+// `propagateErr` over an error word the caller already holds: `getErr`'s, or
+// the callee's own returned word (`takeCallErr`).
+fn propagateErrWord(fc: FnCtx, errv: int, errTy: int, span: Span) {
   // `errv` is already in slot representation; `setErr` below re-publishes it
   // as-is, no reboxing per `?` hop.
-  let errv = getErr(fc, errTy)
   let isErr = neNil(fc, errv, errSlotTy(fc, errTy))
   let prop = builderNewBlock(fc.b)
   let cont = builderNewBlock(fc.b)
@@ -216,7 +357,7 @@ fn propagateErr(fc: FnCtx, errTy: int, span: Span) {
   fc.terminated = false
   runDefers(fc)
   setErr(fc, errv)
-  emitFallibleZeroRet(fc, span)
+  emitFallibleZeroRet(fc, span, errv)
   builderEndBlock(fc.b)
   builderBeginBlock(fc.b, cont)
   fc.terminated = false
@@ -229,6 +370,7 @@ fn lowerTryExpr(fc: FnCtx, node: int): int {
   let operand = kidsOf(fc.c.tree, node)[0]
   let fty = nodeType(fc, operand)
   let errTy = fc.c.ctx.types[fty].errTy
+  fc.pendingErr = -1
   let okv = lowerExpr(fc, operand)
   if (fc.failed) {
     return 0
@@ -237,7 +379,7 @@ fn lowerTryExpr(fc: FnCtx, node: int): int {
   let okTy = fc.c.ctx.types[fty].result
   let words = joinOkWords(fc, okTy, okv)
   let okWords = explodeValueWords(fc.c.ctx, fc.b, okv, words)
-  propagateErr(fc, errTy, getNode(fc.c.tree, node).span)
+  propagateErrWord(fc, takeCallErr(fc, errTy), errTy, getNode(fc.c.tree, node).span)
   // `cont` has a single predecessor (dominated by the branch), so the ok value
   // flows in directly — no block param. So do its words, and the aggregate is
   // rebuilt from them HERE, in the block its consumer's reads sit in.
@@ -390,6 +532,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool, valueUsed: bool): int {
   let okTy = fc.c.ctx.types[fty].result
   let errTy = fc.c.ctx.types[fty].errTy
   let isVoid = okTy == fc.c.ctx.voidId
+  fc.pendingErr = -1
   let okv = coerceToIface(fc, lowerExpr(fc, k[0]), fty, okTy)
   if (fc.failed) {
     return 0
@@ -400,7 +543,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool, valueUsed: bool): int {
   let words = joinOkWords(fc, okTy, okv)
   let okEdge = catchJoinArgs(fc, orig, okv, words, isVoid)
   // `errv` is in slot representation, unboxed below only where needed.
-  let errv = getErr(fc, errTy)
+  let errv = takeCallErr(fc, errTy)
   let isErr = neNil(fc, errv, errSlotTy(fc, errTy))
   let errBlk = builderNewBlock(fc.b)
   let join = builderNewBlock(fc.b)
