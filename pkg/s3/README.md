@@ -52,7 +52,7 @@ fn main(): ()! {
 Addressing is path-style only (`${endpoint}/${bucket}/${key}`), which every
 target this package is built for accepts. Requests are signed with AWS
 Signature Version 4, checked against AWS's own published test suite
-(`pkg/s3/sigv4.test.bit`).
+(`pkg/s3/sigv4.test.bit`, `pkg/s3/sigv4suite.test.bit`).
 
 The full method surface (put/get/head/delete, `list`'s paginated iterator,
 multipart upload, `presignGet`/`presignPut`), streaming large objects, and

@@ -1,0 +1,307 @@
+// pkg/s3/sigv4suite.test.bit — signV4 (sigv4.bit) against AWS's own
+// published SigV4 test suite, vendored at
+// _tests_/corpus/aws-sig-v4-test-suite (awslabs/aws-c-auth, commit
+// c4bc791ac6985eedb503e882cd450cc5b344c2f2, Apache-2.0; #6582).
+//
+// Every case's request goes through `signV4` and four things are compared with
+// the suite's own files, byte for byte: canonical request, string to sign,
+// signature, and the `Authorization` header of the signed request. None of
+// the expected values is computed by this package.
+//
+// BIT_REPO IS REQUIRED, never ".": a "." fallback resolves against the test
+// runner's cwd, not the repo, and a walk over the wrong directory finds zero
+// cases, which the final assertion treats as a failure, never a silent green.
+//
+// SKIPS, each named with its reason, each proven real below (the expected
+// canonical request really differs from what S3 signing produces, or the
+// mode really is one this signer does not offer): a skip list that does not
+// skip anything would hide a case that quietly stopped being run.
+
+import { env } from "std/os"
+import { readFile, readDir } from "std/fs"
+import { jsonDecode, jsonParse } from "std/json"
+import { hasPrefix, indexOf, join, split, splitN } from "std/strings"
+import { percentDecode } from "std/http"
+
+@json class SuiteCreds {
+  export access_key_id: string,
+  export secret_access_key: string,
+  export token: Option<string>,
+}
+
+@json class SuiteContext {
+  export credentials: SuiteCreds,
+  export expiration_in_seconds: int,
+  export normalize: bool,
+  export region: string,
+  export service: string,
+  export sign_body: bool,
+  export timestamp: string,
+  export omit_session_token: Option<bool>,
+}
+
+class SuiteSkip {
+  name: string,
+  reason: string,
+}
+
+const dotsReason: string = "normalize=true removes dot segments and collapses slashes in the canonical path; S3 signs the path verbatim (signingEscapePath=false), so the unnormalized twin of this case is the one that applies"
+
+// A slice literal is not a const_expr, so the list is a function.
+fn suiteSkips(): []SuiteSkip {
+  return [
+    SuiteSkip{ name = "get-relative-normalized", reason = dotsReason },
+    SuiteSkip{ name = "get-relative-relative-normalized", reason = dotsReason },
+    SuiteSkip{ name = "get-slash-dot-slash-normalized", reason = dotsReason },
+    SuiteSkip{ name = "get-slash-normalized", reason = dotsReason },
+    SuiteSkip{ name = "get-slash-pointless-dot-normalized", reason = dotsReason },
+    SuiteSkip{ name = "get-slashes-normalized", reason = dotsReason },
+    SuiteSkip{
+      name = "post-sts-header-after",
+      reason = "signs without the session token (omit_session_token) and attaches it afterwards, an STS-era mode; signV4 always signs x-amz-security-token, as the SDK does",
+    },
+  ]
+}
+
+fn skipReason(name: string): string {
+  for s of suiteSkips() {
+    if (s.name == name) {
+      return s.reason
+    }
+  }
+  return ""
+}
+
+fn suiteRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("sigv4 suite: BIT_REPO is not set — run this through `./make test-package-s3`")
+  }
+  return "${r}/_tests_/corpus/aws-sig-v4-test-suite/v4"
+}
+
+fn suiteFile(name: string, file: string): string {
+  let text = readFile("${suiteRoot()}/${name}/${file}") catch e {
+    panic("sigv4 suite: cannot read ${name}/${file}: ${e.message()}")
+  }
+  return text
+}
+
+class SuiteRequest {
+  method: string,
+  path: string,
+  query: [](string, string),
+  headers: []SigHeader,
+  body: string,
+}
+
+fn suiteQuery(raw: string): [](string, string) {
+  let out = [](string, string)(0)
+  if (raw == "") {
+    return out
+  }
+  for pair of split(raw, "&") {
+    let kv = splitN(pair, "=", 2)
+    let v = ""
+    if (len(kv) == 2) {
+      v = kv[1]
+    }
+    out = append(out, (percentDecode(kv[0]), percentDecode(v)))
+  }
+  return out
+}
+
+// `Name:value` lines; a line that starts with a space or tab continues the
+// previous value (obs-fold), the newline kept so `signV4` has to collapse it.
+fn parseHeaderLines(lines: []string, stop: int): []SigHeader {
+  let out = []SigHeader(0)
+  let i = 1
+  while (i < stop) {
+    let line = lines[i]
+    let last = len(out) - 1
+    if (last >= 0 && (hasPrefix(line, " ") || hasPrefix(line, "\t"))) {
+      out[last] = SigHeader{ name = out[last].name, value = out[last].value + "\n" + line }
+    } else {
+      let nv = splitN(line, ":", 2)
+      out = append(out, SigHeader{ name = nv[0], value = nv[1] })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The first empty line ends the header block; everything after it is the body.
+fn blankLine(lines: []string): int {
+  let i = 1
+  while (i < len(lines)) {
+    if (lines[i] == "") {
+      return i
+    }
+    i = i + 1
+  }
+  return len(lines)
+}
+
+fn parseRequest(text: string): SuiteRequest {
+  let lines = split(text, "\n")
+  let first = lines[0]
+  let sp = indexOf(first, " ")
+  let method = first[0:sp]
+  // The target may itself hold a space (get-space-*): it ends at the LAST one.
+  let target = first[sp + 1:lastSpace(first)]
+  let q = indexOf(target, "?")
+  let path = target
+  let rawQuery = ""
+  if (q >= 0) {
+    path = target[0:q]
+    rawQuery = target[q + 1:len(target)]
+  }
+  let stop = blankLine(lines)
+  let body = ""
+  if (stop + 1 < len(lines)) {
+    body = join(lines[stop + 1:len(lines)], "\n")
+  }
+  return SuiteRequest{
+    method = method,
+    path = path,
+    query = suiteQuery(rawQuery),
+    headers = parseHeaderLines(lines, stop),
+    body = body,
+  }
+}
+
+fn lastSpace(s: string): int {
+  let i = len(s) - 1
+  while (i >= 0 && s[i] != ' ') {
+    i = i - 1
+  }
+  return i
+}
+
+// `2015-08-30T12:36:00Z` -> `20150830T123600Z`.
+fn suiteAmzDate(timestamp: string): string {
+  let out = ""
+  for c of []byte(timestamp) {
+    if (c != '-' && c != ':') {
+      out = out + string([c])
+    }
+  }
+  return out
+}
+
+fn suiteContext(name: string): SuiteContext {
+  let ctx = jsonDecode<SuiteContext>(
+    jsonParse(suiteFile(name, "context.json")) catch e {
+      panic("sigv4 suite: ${name}/context.json: ${e.message()}")
+    },
+  ) catch e {
+    panic("sigv4 suite: ${name}/context.json: ${e.message()}")
+  }
+  return ctx
+}
+
+fn tokenOf(ctx: SuiteContext): string {
+  match (ctx.credentials.token) {
+    Some(t) => { return t }
+    None => { return "" }
+  }
+}
+
+fn configOf(ctx: SuiteContext): SigV4Config {
+  return SigV4Config{
+    accessKeyId = ctx.credentials.access_key_id,
+    secretKey = ctx.credentials.secret_access_key,
+    sessionToken = tokenOf(ctx),
+    region = ctx.region,
+    service = ctx.service,
+    contentSha256Header = ctx.sign_body,
+  }
+}
+
+// The `Authorization` line of the suite's signed request.
+fn expectedAuthorization(signedRequest: string): string {
+  for line of split(signedRequest, "\n") {
+    if (hasPrefix(line, "Authorization:")) {
+      return line[len("Authorization:"):len(line)]
+    }
+  }
+  return ""
+}
+
+// "" when every comparison holds, otherwise what differed.
+fn compareCase(name: string, got: SigV4Signed): string {
+  let creq = suiteFile(name, "header-canonical-request.txt")
+  if (got.canonicalRequest != creq) {
+    return "canonical request:\n${got.canonicalRequest}\n--- want:\n${creq}"
+  }
+  let sts = suiteFile(name, "header-string-to-sign.txt")
+  if (got.stringToSign != sts) {
+    return "string to sign:\n${got.stringToSign}\n--- want:\n${sts}"
+  }
+  let sig = suiteFile(name, "header-signature.txt")
+  if (got.signature != sig) {
+    return "signature ${got.signature}, want ${sig}"
+  }
+  let authz = expectedAuthorization(suiteFile(name, "header-signed-request.txt"))
+  if (got.authorization != authz) {
+    return "authorization ${got.authorization}, want ${authz}"
+  }
+  return ""
+}
+
+fn signCase(name: string): SigV4Signed! {
+  let ctx = suiteContext(name)
+  let req = parseRequest(suiteFile(name, "request.txt"))
+  let signed = signV4(
+    configOf(ctx),
+    SigV4Request{
+      method = req.method,
+      path = req.path,
+      query = req.query,
+      headers = req.headers,
+      payloadHash = sha256Hex(req.body),
+    },
+    suiteAmzDate(ctx.timestamp),
+  )?
+  return signed
+}
+
+// "" on success, otherwise the failure.
+fn runCase(name: string): string {
+  let got = signCase(name) catch e {
+    return "signV4 failed: ${e.message()}"
+  }
+  return compareCase(name, got)
+}
+
+// A skipped case must really differ, or its skip hides a case that now passes.
+fn skipHolds(name: string): bool {
+  return runCase(name) != ""
+}
+
+test "aws-sig-v4-test-suite: every header case matches AWS's published signature" {
+  let names = readDir(suiteRoot()) catch e {
+    panic("sigv4 suite: cannot list ${suiteRoot()}: ${e.message()}")
+  }
+  let passed = 0
+  let skipped = 0
+  let failures = ""
+  for name of names {
+    if (skipReason(name) != "") {
+      skipped = skipped + 1
+      assert(skipHolds(name), "skip '${name}' is no longer needed: the case passes")
+      print("sigv4 suite: skipped ${name}: ${skipReason(name)}\n")
+    } else {
+      let why = runCase(name)
+      if (why == "") {
+        passed = passed + 1
+      } else {
+        failures = failures + "\n== ${name}\n${why}\n"
+      }
+    }
+  }
+  print("aws-sig-v4-test-suite: ${passed}/${len(names) - skipped} passed, ${skipped} skipped of ${len(names)} cases\n")
+  assert(len(names) == 38, "expected 38 vendored cases, found ${len(names)}")
+  assert(skipped == len(suiteSkips()), "a skip names a case that is not in the corpus")
+  assert(failures == "", failures)
+}
