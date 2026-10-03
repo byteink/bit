@@ -42,7 +42,7 @@ import {
 } from "auth"
 import { Request } from "std/http"
 import { emptyTrustStore, TlsConfig } from "std/tls"
-import { encodeBase64Url, hmac, Sha256 } from "std/crypto"
+import { encodeBase64Url, hmac, HashAlg } from "std/crypto"
 import { Json, JsonEntry, jsonEncode } from "std/json"
 import { parseJwks } from "std/jwt"
 import { now, Second } from "std/time"
@@ -121,7 +121,7 @@ fn fakeIdToken(nonce: string): string {
     ),
   )
   let signingInput = encodeBase64Url([]byte(header)) + "." + encodeBase64Url([]byte(payload))
-  let sig = hmac(() => Sha256(), fakeSecret(), []byte(signingInput))
+  let sig = hmac(HashAlg.Sha256, fakeSecret(), []byte(signingInput))
   return signingInput + "." + encodeBase64Url(sig)
 }
 
