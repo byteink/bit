@@ -1,0 +1,354 @@
+// Bit standard library — xml module, an element tree built on the Tokenizer.
+//
+// `parse(src)` reads a whole document into an `Element`: its name, the
+// namespace URI the name resolves to, its attributes, and its content as
+// `Node`s in document order. `child`, `children`, `text` and `attr` answer the
+// questions a response body is read with.
+//
+// Everything the Tokenizer refuses is refused here, with the same `XmlError`
+// and the same limits (`maxDepth`, `maxAttrs`, `maxInput`, `maxName`), because
+// the tree is built from its tokens and nothing else. What the tree adds is
+// Namespaces in XML 1.0, held to the rules the Writer enforces:
+//
+//   - A prefix must be declared. `<a:b/>` with no `xmlns:a` in scope is
+//     `BadName`, never an element whose namespace is silently empty.
+//   - A name has at most one colon, with something on each side.
+//   - `xmlns`, `xml` and the two reserved URIs are bound only the way §3
+//     allows (`xmlBindProblem`); a violation is `BadAttribute`.
+//   - Two attributes with the same expanded name are `DuplicateAttribute`
+//     even under different prefixes (§6.3).
+//
+// The tree is built with a stack, not recursion, so the depth `maxDepth`
+// allows costs memory and never call stack. Time and memory are linear in the
+// input: entities are already decoded one character each, and a declaration is
+// scoped by truncating two arrays, not by copying a table.
+//
+// Comments and processing instructions are not in the tree. CDATA sections are
+// text. Adjacent text and CDATA are one `Node.Text`; a run of white space
+// between elements is kept, because only the caller knows whether it matters.
+
+// One unit of an element's content: a child element, or a run of decoded text.
+export enum Node {
+  Elem(Element),
+  Text(string),
+}
+
+// One element. `name` is the qualified name as written (`s3:Key`), `local` the
+// part after the colon and `space` the namespace URI the name resolves to ("" for
+// none). `attrs` are the attributes as written, `xmlns` declarations included,
+// so an element can be written back with the `Writer` exactly as it was read.
+// A class, so a reference type (§13.3).
+export class Element {
+  export name: string
+  export local: string
+  export space: string
+  export attrs: []Attr
+  export nodes: []Node
+  attrSpaces: []string
+
+  // The first child element named `name`, or None. `name` is a local name
+  // (`Key`, not `s3:Key`); `space` None matches whatever namespace the child is
+  // in and `Some(uri)` only that one, `Some("")` meaning no namespace. A `name`
+  // that is empty or has a colon can never match a local name, so it panics:
+  // that is the caller's mistake, not a property of the document.
+  export child(name: string, space: Option<string> = Option<string>.None): Option<Element> {
+    xmlCheckLocal(name)
+    let i = 0
+    while (i < len(this.nodes)) {
+      match (this.nodes[i]) {
+        Elem(e) => {
+          if (e.matches(name, space)) {
+            return Option<Element>.Some(e)
+          }
+        }
+        Text(_) => {}
+      }
+      i = i + 1
+    }
+    return Option<Element>.None
+  }
+
+  // Every child element named `name`, in document order, with the matching
+  // rules of `child`. Empty when there are none.
+  export children(name: string, space: Option<string> = Option<string>.None): []Element {
+    xmlCheckLocal(name)
+    let out = []Element(0)
+    let i = 0
+    while (i < len(this.nodes)) {
+      match (this.nodes[i]) {
+        Elem(e) => {
+          if (e.matches(name, space)) {
+            out = append(out, e)
+          }
+        }
+        Text(_) => {}
+      }
+      i = i + 1
+    }
+    return out
+  }
+
+  // The element's own text: its text nodes joined, with the text of child
+  // elements left out. `<a>x<b>y</b>z</a>` is `xz`; `<a/>` is "".
+  export text(): string {
+    let out = []byte(0)
+    let i = 0
+    while (i < len(this.nodes)) {
+      match (this.nodes[i]) {
+        Text(s) => out = append(out, s)
+        Elem(_) => {}
+      }
+      i = i + 1
+    }
+    return string(out)
+  }
+
+  // The value of the attribute whose local name is `name` in namespace `space`,
+  // or None. An attribute without a prefix is in no namespace (it does not
+  // inherit the default one), so the default `space` "" finds `id` in `<a id="1"/>`
+  // and `xsi:type` is `attr("type", "http://www.w3.org/2001/XMLSchema-instance")`.
+  // Panics, like `child`, for a `name` that is empty or has a colon.
+  export attr(name: string, space: string = ""): Option<string> {
+    xmlCheckLocal(name)
+    let i = 0
+    while (i < len(this.attrs)) {
+      let (_, local, _) = xmlSplitName(this.attrs[i].name)
+      if (local == name && this.attrSpaces[i] == space) {
+        return Option<string>.Some(this.attrs[i].value)
+      }
+      i = i + 1
+    }
+    return Option<string>.None
+  }
+
+  matches(name: string, space: Option<string>): bool {
+    if (this.local != name) {
+      return false
+    }
+    match (space) {
+      Some(uri) => return this.space == uri
+      None => return true
+    }
+  }
+}
+
+// Panics unless `name` can be a local name: not empty, no colon.
+fn xmlCheckLocal(name: string) {
+  let (prefix, _, ok) = xmlSplitName(name)
+  if (name == "" || prefix != "" || !ok) {
+    panic("xml: '${name}' is not a local name; pass the part after the colon and the namespace separately")
+  }
+}
+
+// Reads one document into its root element. Fails with the `XmlError` the
+// Tokenizer would for the same bytes and options, or for a namespace the
+// document breaks (see above); `BadLimit` and `TooLarge` come before any byte
+// is read.
+export fn parse(
+  src: []byte,
+  maxDepth: int = 256,
+  maxAttrs: int = 256,
+  maxInput: int = 67108864,
+  maxName: int = 1024,
+): Element! {
+  let b = xmlBuilder{
+    tz = Tokenizer(src, maxDepth, maxAttrs, maxInput, maxName)?,
+    open = []Element(0),
+    marks = []int(0),
+    prefixes = []string(0),
+    uris = []string(0),
+    pending = []byte(0),
+    root = Option<Element>.None,
+  }
+  return b.run()?
+}
+
+// The state of one `parse`: the open elements, the namespace declarations in
+// scope (parallel arrays, newest last; `marks[i]` is how many were in scope
+// before `open[i]` was entered), and text not yet attached to its element.
+class xmlBuilder {
+  tz: Tokenizer
+  open: []Element
+  marks: []int
+  prefixes: []string
+  uris: []string
+  pending: []byte
+  root: Option<Element>
+
+  // Every token but `Eof` consumes at least one byte, so `len(src)` + 1 pulls
+  // end the document; the bound only makes that visible.
+  run(): Element! {
+    let n = 0
+    let done = false
+    while (!done && n <= len(this.tz.src)) {
+      match (this.tz.next()?) {
+        Start(tag) => this.begin(tag, false)?
+        Empty(tag) => this.begin(tag, true)?
+        End(_) => this.leave()
+        Text(s) => this.pending = append(this.pending, s)
+        CData(s) => this.pending = append(this.pending, s)
+        Eof => done = true
+      }
+      n = n + 1
+    }
+    match (this.root) {
+      Some(e) => return e
+      None => fail this.tz.bad(XmlErrorKind.UnexpectedEof, 0, "no root element")
+    }
+  }
+
+  // Attaches text gathered since the last tag to the open element.
+  flush() {
+    if (len(this.pending) == 0) {
+      return
+    }
+    let top = this.open[len(this.open) - 1]
+    top.nodes = append(top.nodes, Node.Text(string(this.pending)))
+    this.pending = this.pending[0:0]
+  }
+
+  // Closes the open element: its declarations go out of scope.
+  leave() {
+    this.flush()
+    let mark = this.marks[len(this.marks) - 1]
+    this.prefixes = this.prefixes[0:mark]
+    this.uris = this.uris[0:mark]
+    this.open = this.open[0:len(this.open) - 1]
+    this.marks = this.marks[0:len(this.marks) - 1]
+  }
+
+  // A start or empty tag: declarations first, so the element's own name and
+  // attributes see them, then the names are resolved and the element attached.
+  begin(tag: Tag, whole: bool): ()! {
+    this.flush()
+    let mark = len(this.prefixes)
+    this.declare(tag.attrs)?
+    let (prefix, local, ok) = xmlSplitName(tag.name)
+    if (!ok) {
+      fail this.tz.bad(XmlErrorKind.BadName, this.tz.tagAt, "'${tag.name}' is not a qualified name")
+    }
+    let el = Element{
+      name = tag.name,
+      local = local,
+      space = this.resolve(prefix, tag.name)?,
+      attrs = tag.attrs,
+      nodes = []Node(0),
+      attrSpaces = this.attrSpaces(tag.attrs)?,
+    }
+    this.attach(el)
+    if (whole) {
+      this.prefixes = this.prefixes[0:mark]
+      this.uris = this.uris[0:mark]
+      return
+    }
+    this.open = append(this.open, el)
+    this.marks = append(this.marks, mark)
+  }
+
+  // Makes `el` a child of the open element, or the root.
+  attach(el: Element) {
+    if (len(this.open) == 0) {
+      this.root = Option<Element>.Some(el)
+      return
+    }
+    let top = this.open[len(this.open) - 1]
+    top.nodes = append(top.nodes, Node.Elem(el))
+  }
+
+  // Puts every `xmlns` and `xmlns:p` among `attrs` in scope, after checking
+  // that every attribute name is a qualified name.
+  declare(attrs: []Attr): ()! {
+    let i = 0
+    while (i < len(attrs)) {
+      let (_, _, ok) = xmlSplitName(attrs[i].name)
+      if (!ok) {
+        fail this.tz.bad(
+          XmlErrorKind.BadName,
+          this.tz.tagAt,
+          "'${attrs[i].name}' is not a qualified name",
+        )
+      }
+      if (xmlIsDecl(attrs[i].name)) {
+        this.bind(attrs[i])?
+      }
+      i = i + 1
+    }
+  }
+
+  bind(a: Attr): ()! {
+    let prefix = ""
+    if (a.name != "xmlns") {
+      prefix = a.name[6:len(a.name)]
+    }
+    let problem = xmlBindProblem(prefix, a.value)
+    if (problem != "") {
+      fail this.tz.bad(XmlErrorKind.BadAttribute, this.tz.tagAt, problem)
+    }
+    if (prefix == "xml") {
+      return
+    }
+    this.prefixes = append(this.prefixes, prefix)
+    this.uris = append(this.uris, a.value)
+  }
+
+  // The URI `prefix` is bound to here. "" is the default namespace, which is
+  // empty until a declaration says otherwise; any other prefix must be bound.
+  resolve(prefix: string, name: string): string! {
+    if (prefix == "xml") {
+      return xmlNsUri
+    }
+    let i = len(this.prefixes) - 1
+    while (i >= 0) {
+      if (this.prefixes[i] == prefix) {
+        return this.uris[i]
+      }
+      i = i - 1
+    }
+    if (prefix != "") {
+      fail this.tz.bad(
+        XmlErrorKind.BadName,
+        this.tz.tagAt,
+        "the prefix of '${name}' is not declared",
+      )
+    }
+    return ""
+  }
+
+  // The namespace URI of each attribute, parallel to `attrs`: declarations are
+  // in the `xmlns` namespace, an unprefixed attribute in none, and no two share
+  // an expanded name.
+  attrSpaces(attrs: []Attr): []string! {
+    let spaces = []string(0)
+    let i = 0
+    while (i < len(attrs)) {
+      let space = this.attrSpace(attrs[i].name)?
+      let (_, local, _) = xmlSplitName(attrs[i].name)
+      let k = 0
+      while (k < i) {
+        let (_, other, _) = xmlSplitName(attrs[k].name)
+        if (other == local && spaces[k] == space) {
+          fail this.tz.bad(
+            XmlErrorKind.DuplicateAttribute,
+            this.tz.tagAt,
+            "attributes '${attrs[k].name}' and '${attrs[i].name}' are the same name",
+          )
+        }
+        k = k + 1
+      }
+      spaces = append(spaces, space)
+      i = i + 1
+    }
+    return spaces
+  }
+
+  attrSpace(name: string): string! {
+    if (xmlIsDecl(name)) {
+      return xmlnsNsUri
+    }
+    let (prefix, _, _) = xmlSplitName(name)
+    if (prefix == "") {
+      return ""
+    }
+    return this.resolve(prefix, name)?
+  }
+}
