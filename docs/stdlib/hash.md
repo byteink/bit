@@ -197,3 +197,47 @@ fn matchesOneShot(chunks: [][]byte, whole: []byte): bool {
   return h.digest() == xxhash64(whole, 42)
 }
 ```
+
+## XXH3-64
+
+Inkwell's backup tool also shards short keys - a draft title is a dozen bytes
+and a tag list a few dozen. XXH3, the hash the S3 `XXHASH3` checksum
+algorithm names, is the newer hash from the same
+[xxHash](https://github.com/Cyan4973/xxHash) library: it picks one of
+several straight-line paths by input length (0 to 16, 17 to 128, 129 to 240
+bytes) instead of looping over stripes, which is what makes it suit short
+keys.
+Like `xxhash64` it is **not** for detecting tampering - the 17 to 240 byte
+path has documented collision weaknesses, and anyone who knows the seed can
+build colliding inputs; use `std/crypto` for that. Its result is bit-for-bit
+the reference library's `XXH3_64bits` (and `XXH3_64bits_withSeed` for a
+nonzero seed).
+
+### `xxh3_64(data: []byte, seed: u64 = 0): u64`
+
+The XXH3 64-bit hash of `data` under `seed`. The seed is the full 64 bits and
+defaults to `0`. The empty slice hashes to `0x2D06800538D394C2` under seed
+`0`, and `xxh3_64([]byte("abc"))` is `0x78AF5F94892F3950`. The hash is
+checked against the reference's own sanity vectors for every length from 0
+to 240 under two seeds (482 vectors), plus seeds with high bits set.
+
+Inputs of 241 bytes or more are not supported yet: `xxh3_64` panics with a
+message naming the ticket that adds them, rather than return a hash that
+would disagree with the reference. Hash only drafts that fit, or fall back to
+`xxhash64`, until then.
+
+```bit
+import { xxh3_64 } from "std/hash"
+
+// Which of `shards` backup shards stores this tag list. Tag lists are short,
+// so they take XXH3's constant-time path.
+fn tagShardFor(tags: string, shards: int): int {
+  return int(xxh3_64([]byte(tags)) % u64(shards))
+}
+
+// A draft title is at most 240 bytes, so it always fits; a per-library seed
+// keeps two libraries' hash tables unrelated.
+fn titleKey(title: string, librarySeed: u64): u64 {
+  return xxh3_64([]byte(title), librarySeed)
+}
+```
