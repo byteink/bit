@@ -203,13 +203,14 @@ fn head(c: Client, url: string, n: int): string! {
 
 ### A client that reuses connections
 
-The package-level functions above dial a fresh connection for each call
-(the hops of one call's redirect chain share one). A `Client` reuses
-configuration - a pinned CA, a bearer token, a body-size limit - and keeps
-its HTTP/1.1 connections open between calls, so a loop of requests to one
-host pays for one TCP connect and one TLS handshake instead of one per
-request. It also remembers which servers have advertised HTTP/3, so a second
-request to the same host can upgrade automatically.
+The package-level functions above share one connection pool for the whole
+process, so a loop of plain `http.get` calls to one host already pays for one
+TCP connect and one TLS handshake, not one per call (the hops of a redirect
+chain ride the same connection). A `Client` adds what a shared pool cannot
+hold: its own configuration - a pinned CA, a bearer token, a body-size
+limit - and a pool with bounds of its own (`setPool`). It also remembers which
+servers have advertised HTTP/3, so a second request to the same host can
+upgrade automatically.
 
 ```bit
 import { Client, Response } from "std/http"
@@ -301,10 +302,14 @@ or `TRACE` that fails on a reused connection is retried once on a new one. A
 `POST` is not: it may already have been processed, so replaying it would
 repeat its effect, and the call fails with the error instead.
 
-A pool belongs to one `Client` and one TLS configuration, so connections are
-never shared between clients. `requestTls` and the other package-level calls
-take a configuration per call and so never keep a connection past the call.
-HTTP/3 connections are not pooled yet: each call still opens its own.
+Each `Client` has a pool of its own and one TLS configuration, so connections
+are never shared between clients. The package-level calls (`get`, `post`,
+`request`, `requestTimeout` and the `Tls` variants) share one process-wide
+pool with the default `PoolLimits`, which `setPool` and `close` cannot reach.
+An `https://` connection in it is keyed by the whole TLS configuration the call
+passed - roots, `serverName`, `insecureSkipVerify`, `alpn` and the rest - so a
+`getTls` with a pinned CA never rides a connection another configuration
+dialed. HTTP/3 connections are not pooled yet: each call still opens its own.
 
 #### Sharing one HTTP/2 connection
 

@@ -26,11 +26,12 @@
 //                   on one connection, so `maxH2Streams` is its cap, and a
 //                   request that finds the origin speaks h2 gives its slot back.
 //
-// A `Client` owns one pool (`Client.setPool` sets the bounds); a package-level
-// call such as `get` makes a pool for that call alone and retires it before it
-// returns, so its redirect hops share a connection but nothing outlives it.
-// There is no process-wide default pool because module state cannot hold a
-// class (SPEC §11.11, rule 1).
+// A `Client` owns one pool (`Client.setPool` sets the bounds). Every
+// package-level call (`get`, `post`, `request`, `requestTimeout` and the Tls
+// variants) shares `defaultPool`, one per process under the default
+// `PoolLimits`, so a loop of plain `http.get` calls reuses its connections
+// like a `Client` loop does (#6482). It is never retired: nothing owns it, and
+// an idle connection costs a bounded slot (`maxIdleTotal`) until it expires.
 //
 // Safety, in order of how a pooled connection can go wrong:
 //
@@ -45,10 +46,13 @@
 //               idempotent method (RFC 9110 §9.2.2): replaying a POST that may
 //               have been processed is the duplicate-side-effect bug, so it
 //               fails loudly instead.
-//   identity    the idle list is keyed by scheme, host and port. The TLS
-//               config is not part of the key because a pool belongs to one
-//               `Client`, and a `Client`'s config never changes; two configs
-//               therefore never share a connection.
+//   identity    the idle list is keyed by scheme, host and port. A `Client`'s
+//               pool needs no more: its config never changes. `defaultPool`
+//               is shared by callers with different configs, so an https key
+//               also carries `RequestExtras.scope` (`tlsScope`), a digest of
+//               the whole config: two configs never share a connection, and a
+//               pinned-roots caller can never be handed a connection that
+//               `insecureSkipVerify` dialed.
 //   deadlines   a pooled connection carries the deadline of the request using
 //               it only (`setIdleDeadline`), cleared before it is parked, so
 //               one request's timeout never kills the next one's connection.
@@ -317,6 +321,40 @@ fn newConnPool(limits: PoolLimits): connPool {
   }
 }
 
+// One length-prefixed field of a config digest, so no two field lists hash alike.
+fn scopeField(h: Sha256, b: []byte) {
+  h.write([]byte("${len(b)}:"))
+  h.write(b)
+}
+
+// A digest of every field of `cfg` that changes who a connection trusts or how
+// it was dialed: the roots (each certificate's DER), `insecureSkipVerify`,
+// `alpn`, `serverName`, `minVersion`, `nowUnix` and the client certificate and
+// key. It is `RequestExtras.scope` for a `requestTls` call, the part of a
+// `defaultPool` key that keeps one config's connection from serving another.
+fn tlsScope(cfg: TlsConfig): string {
+  let h = Sha256()
+  scopeField(h, []byte("${len(cfg.roots.roots)}|${len(cfg.alpn)}"))
+  for c of cfg.roots.roots {
+    scopeField(h, c.raw)
+  }
+  scopeField(
+    h,
+    []byte("${cfg.insecureSkipVerify}|${cfg.serverName}|${cfg.minVersion}|${cfg.nowUnix}"),
+  )
+  for a of cfg.alpn {
+    scopeField(h, []byte(a))
+  }
+  scopeField(h, []byte(cfg.certPem))
+  scopeField(h, []byte(cfg.keyPem))
+  return encodeHex(h.sum())
+}
+
+// The pool every package-level call shares (#6482), built at startup before
+// `main` (SPEC §11.11). Safe for concurrent tasks because every `connPool` and
+// `h2Pool` method locks its own `mu` and no request holds one across I/O.
+const defaultPool: connPool = newConnPool(PoolLimits{})
+
 // ---------------------------------------------------------------------------
 // Reading a response, and deciding whether its connection can be reused
 // ---------------------------------------------------------------------------
@@ -414,9 +452,15 @@ fn isIdempotent(method: string): bool {
     method == "DELETE"
 }
 
-// The idle-list key of `u`'s origin.
-fn poolKey(u: Url): string {
-  return "${schemeName(u)}://${hostHeaderValue(u)}"
+// The idle-list key of `u`'s origin under `extras`: scheme, host and port, and
+// for an https origin the TLS scope of the config the connection is dialed
+// with ("" for a `Client`, whose pool has one config).
+fn poolKey(u: Url, extras: RequestExtras): string {
+  let origin = "${schemeName(u)}://${hostHeaderValue(u)}"
+  if (u.https && len(extras.scope) > 0) {
+    return "${origin}#${extras.scope}"
+  }
+  return origin
 }
 
 // `method u` over HTTP/1.1 or, when an https origin negotiates it, h2: the
@@ -426,7 +470,7 @@ fn poolKey(u: Url): string {
 // one for an idempotent method only; a POST fails with the error it got.
 fn exchangeOrigin(method: string, u: Url, body: string, extras: RequestExtras): Response! {
   if (u.https) {
-    match (extras.pool.h2.take(poolKey(u), monotonic().ns)) {
+    match (extras.pool.h2.take(poolKey(u, extras), monotonic().ns)) {
       Shared(e) => return reuseH2(e, method, u, body, extras)?
       None => return exchangeParked(method, u, body, extras)?
     }
@@ -450,7 +494,7 @@ fn reuseH2(e: h2Entry, method: string, u: Url, body: string, extras: RequestExtr
 // `exchangeFresh` for a caller that holds no slot yet: claims one for the
 // exchange, which hands it back before a stream starts if the origin is h2.
 fn exchangeCapped(method: string, u: Url, body: string, extras: RequestExtras): Response! {
-  let slot = extras.pool.acquire(poolKey(u), extras.deadline)?
+  let slot = extras.pool.acquire(poolKey(u, extras), extras.deadline)?
   defer slot.release()
   return exchangeFresh(method, u, body, extras, slot)?
 }
@@ -459,7 +503,7 @@ fn exchangeCapped(method: string, u: Url, body: string, extras: RequestExtras): 
 // slot is claimed before the idle list is read, so a request that waited finds
 // the connection whose return woke it.
 fn exchangeParked(method: string, u: Url, body: string, extras: RequestExtras): Response! {
-  let key = poolKey(u)
+  let key = poolKey(u, extras)
   let slot = extras.pool.acquire(key, extras.deadline)?
   defer slot.release()
   match (extras.pool.take(key, monotonic().ns)) {
@@ -490,9 +534,9 @@ fn exchangeFresh(
   if (!u.https) {
     let conn = dialConn(u, extras.deadline)?
     let req = buildRequest(method, u, extras.block, body, false)
-    return runOn(netStream{ conn = conn }, poolKey(u), req, method, extras)?
+    return runOn(netStream{ conn = conn }, poolKey(u, extras), req, method, extras)?
   }
-  let d = dialOrigin(poolKey(u), u, extras)?
+  let d = dialOrigin(poolKey(u, extras), u, extras)?
   match (d) {
     Shared(e) => {
       slot.release()
@@ -500,7 +544,7 @@ fn exchangeFresh(
     }
     Plain(tc) => {
       let req = buildRequest(method, u, extras.block, body, false)
-      return runOn(tlsStream{ conn = tc }, poolKey(u), req, method, extras)?
+      return runOn(tlsStream{ conn = tc }, poolKey(u, extras), req, method, extras)?
     }
   }
 }
