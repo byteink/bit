@@ -492,9 +492,7 @@ holds — see the fabricated-header bug at `runtime/root/slices.bit:443-451`
 element's own byte stride (`elem_size`, §9) — `1` for `[]u8` (a non-ref,
 1-byte element, `elem_size = 1`), or a class `T`'s own body size
 (`elem_size = layout.size`) when EVERY field of `T` is a non-reference scalar
-(`ptr_offsets` empty), or `16` for a `decimal` (two `i64` words, `lo` at +0 and
-`hi` at +8; the compiler reads and writes both with two 8-byte accesses, #6570).
-`elem_size` is a per-call-site
+(`ptr_offsets` empty), or `16` for a `decimal` (#6570). `elem_size` is a per-call-site
 compile-time constant, never runtime state, and travels as an explicit
 argument to every slice entry point below — the collector needs no change to
 support it: a packed, non-ref buffer keeps the LEAF `slice_buf_info`
@@ -3757,10 +3755,7 @@ hold a zero key/value word, which `markRoot` skips.
 the handle of a string CONSTANT, which is static for the life of the process.
 
 - **Word model.** A key or value is one word, same as slice elements (§2): a
-  scalar by value, a `string` as its `*RtBytes` object base, a wider `V` boxed
-  (a `decimal` is the pointer to its two-word tuple with `val_is_ref` set, so
-  the value word is traced and a miss's zero word reads as decimal zero, #6570;
-  a `decimal` KEY is refused by the checker, E0052).
+  scalar by value, a `string` as its `*RtBytes` object base, a wider `V` boxed (a `decimal`: its tuple pointer, `val_is_ref` set, #6570).
 - **Hash / equality.** `key_desc` picks the strategy: `0` hashes the word with a
   splitmix64 finalizer (so low-entropy integer keys avalanche) and compares by
   word; `1` Wyhashes a string key over its bytes and compares byte-wise; anything
