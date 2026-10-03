@@ -198,21 +198,198 @@
 # `arrowTypeSeeded`/`arrowIrSeeded`/`invalidFilled`) are preserved in git
 # history at this file's state before #6788.
 #
-# NO SIGNATURE IS DECLARED. `explainMismatch` below is the empty table every
-# caller still consults, so the next lowering change that outruns the oracle
-# adds its entry there instead of re-plumbing the callers. The input protocol
-# is the text the awk body of the previous revision read: the oracle's dump,
-# a line `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file
-# as `-v` variables. A new entry must satisfy the rules in the header: an
-# exact identity, derived from FULL dumps (the oracle's from
-# `sh scripts/stage0.sh`, the tree's from `bit-out/bin/bit`), never an excerpt.
+# --- Declared signatures (each retires at the repin that brings the fix in) ---
+#
+# 6730-fallible-enum-words (`ir`, `iropt`). #6730 returns a fallible enum ok
+# value (`next(): Option<T>!`) in its two words {tag, payload} instead of one
+# box (`fallibleOkWordTypes`, compiler/lowerfail.bit). The 0.36.0 oracle
+# predates it. Files affected: _tests_/cases/run_sql_row_find.bit,
+# _tests_/cases/run_forof_iterator_fail.bit,
+# _tests_/cases/run_forof_iterator_done.bit and stdlib/fs/secure/secure.bit.
+# The identity, walked line by line under ONE oracle-to-tree %id bijection per
+# function (every unchanged line must agree under it, so a wrong operand
+# anywhere fails), with only these hunks allowed:
+#   call site: `%c = call @F(args) T` becomes `%c2 = call @F(args) i64` and
+#     `%w = call_word %c2[1] P` (exactly two words), then either the rebuilt
+#     box `%b = gc_alloc size=16 ptrs=[..] T`, `field_set %b[0] = %c2`,
+#     `field_set %b[8] = %w` standing for %c, or no box, and %c is then used
+#     only by oracle reads `field_get %c[0] i64` / `field_get %c[8] P`, which
+#     are deleted and stand for %c2 / %w;
+#   callee return: `ret %h` becomes `ret %r0, %r1`, where either the tree
+#     inserted `%r0 = field_get %x[0] i64`, `%r1 = field_get %x[8] P` and %x
+#     stands for %h, or the oracle's `%h = gc_alloc size=16` and its two
+#     `field_set %h[0|8]` are deleted and %r0, %r1 stand for their values.
+# Every deleted box must be returned, every inserted read pair consumed by the
+# next `ret`. Retires at the first repin after 0.36.0.
+#
+# The input protocol is the text the awk body reads: the oracle's dump, a line
+# `@@@BIT2@@@`, then the tree's dump, with the kind and the corpus file as
+# `-v` variables. A new entry must satisfy the rules in the header: an exact
+# identity, derived from FULL dumps (the oracle's from `sh scripts/stage0.sh`,
+# the tree's from `bit-out/bin/bit`), never an excerpt.
 #
 # explainMismatch <oracle_text> <bit2_text> <kind: ir|iropt|ast|fmt|types|diags|tokens> [file]
 # Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. No signature is
-# registered, so it returns 1 for every kind.
+# and returns 0, or prints nothing and returns 1 if none does.
 explainMismatch() {
-  return 1
+  awk -v kind="$3" -v file="${4:-}" '
+    # canonT -- rewrite every `$t<N>` of arr[1..n] to `$c<idx>` in first-
+    # appearance order, the same canonicalization scripts/selfhost-ir-canon.sh
+    # applies, so interning-order numbering never hides an identity.
+    function canonT(arr, n,    i, line, out, tok, cnt, map) {
+      cnt = 0
+      for (i = 1; i <= n; i++) {
+        line = arr[i]; out = ""
+        while (match(line, /\$t[0-9]+/)) {
+          tok = substr(line, RSTART, RLENGTH)
+          if (!(tok in map)) { map[tok] = "$c" cnt++ }
+          out = out substr(line, 1, RSTART - 1) map[tok]
+          line = substr(line, RSTART + RLENGTH)
+        }
+        arr[i] = out line
+      }
+    }
+    function idList(s, arr,    n) {
+      n = 0
+      while (match(s, /%[0-9]+/)) { arr[++n] = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH) }
+      return n
+    }
+    function skel(s) { gsub(/%[0-9]+/, "%", s); return s }
+    # idOf -- the %id a line defines (`  %N = ...`), "" when it defines none.
+    function idOf(s) { return match(s, /^  %[0-9]+ = /) ? substr(s, 3, RLENGTH - 5) : "" }
+    function lastTok(s,    n, p) { n = split(s, p, " "); return p[n] }
+    # same -- oracle line a and tree line b agree under the bijection M/R,
+    # binding ids seen for the first time; binds nothing when it fails.
+    function same(a, b,    n, xa, xb, k, tM, tR) {
+      if (skel(a) != skel(b)) { return 0 }
+      n = idList(a, xa); idList(b, xb)
+      for (k = 1; k <= n; k++) {
+        if (xa[k] in M) { if (M[xa[k]] != xb[k]) { return 0 } continue }
+        if (xa[k] in tM) { if (tM[xa[k]] != xb[k]) { return 0 } continue }
+        if (xb[k] in tR) { return 0 }
+        if ((xb[k] in R) && (R[xb[k]] != "<new>" || fwdRead(xa[k]) != xb[k])) { return 0 }
+        tM[xa[k]] = xb[k]; tR[xb[k]] = xa[k]
+      }
+      for (k in tM) { M[k] = tM[k]; R[tM[k]] = k }
+      return 1
+    }
+    function reset() { split("", M); split("", R); split("", C2); split("", W); split("", WT); split("", D); split("", Z0); split("", Z8); pend = ""; boxes = 0 }
+    # isBox -- `%h = gc_alloc size=16 ptrs=[..] T`, T given or any named type.
+    function isBox(s, T) {
+      if (s !~ /^  %[0-9]+ = gc_alloc size=16 ptrs=\[(%[0-9]+)?\] [A-Za-z_]/) { return 0 }
+      return (T == "" || lastTok(s) == T) ? 1 : 0
+    }
+    # callHunk -- the call-site hunk at A[i], B[j]; the next j, or 0.
+    function callHunk(i, j,    a, b, T, c, c2, w) {
+      a = linesA[i]; b = linesB[j]
+      if (a !~ /^  %[0-9]+ = call @/ || b !~ /^  %[0-9]+ = call @/ || lastTok(b) != "i64") { return 0 }
+      T = lastTok(a)
+      if (T == "i64" || j + 1 > nB) { return 0 }
+      c = idOf(a); c2 = idOf(b); w = idOf(linesB[j + 1])
+      if (c in M || c2 in R || w == "" || w in R) { return 0 }
+      if (!same(substr(a, length(c) + 6, length(a) - length(c) - 5 - length(T)), substr(b, length(c2) + 6, length(b) - length(c2) - 8))) { return 0 }
+      if (index(linesB[j + 1], "  " w " = call_word " c2 "[1] ") != 1) { return 0 }
+      if (j + 2 <= nB && index(linesB[j + 2], " = call_word " c2 "[") > 0) { return 0 }
+      R[c2] = "<new>"; R[w] = "<new>"; C2[c] = c2; W[c] = w; WT[c] = lastTok(linesB[j + 1])
+      if (j + 4 <= nB && isBox(linesB[j + 2], T) && linesB[j + 3] == "  field_set " idOf(linesB[j + 2]) "[0] = " c2 && linesB[j + 4] == "  field_set " idOf(linesB[j + 2]) "[8] = " w) {
+        M[c] = idOf(linesB[j + 2]); R[M[c]] = c
+        return j + 5
+      }
+      M[c] = "<gone>"
+      return j + 2
+    }
+    # readWord -- the tree word an oracle read `field_get %c[0] i64` or
+    # `field_get %c[8] P` of a call-hunk handle %c stands for, else "".
+    function readWord(s,    t, c) {
+      if (!match(s, /^  %[0-9]+ = field_get %[0-9]+\[(0|8)\] /)) { return "" }
+      t = idOf(s); c = substr(s, length(t) + 16); c = substr(c, 1, index(c, "[") - 1)
+      if (!(c in C2)) { return "" }
+      if (s == "  " t " = field_get " c "[0] i64") { return C2[c] }
+      if (s == "  " t " = field_get " c "[8] " WT[c]) { return W[c] }
+      return ""
+    }
+    # fwdRead -- readWord of the line defining oracle %x in this function,
+    # for a use printed before its definition (a block laid out earlier).
+    function fwdRead(x,    k) {
+      for (k = fnStart; k <= nA; k++) {
+        if (k > fnStart && linesA[k] ~ /^func /) { return "" }
+        if (index(linesA[k], "  " x " = ") == 1) { return readWord(linesA[k]) }
+      }
+      return ""
+    }
+    # readDel -- oracle A[i] is a deleted read of a call-hunk handle.
+    function readDel(s,    t, w) {
+      w = readWord(s); t = idOf(s)
+      if (w == "" || ((t in M) && M[t] != w)) { return 0 }
+      M[t] = w
+      return 1
+    }
+    # boxDel -- oracle A[i] is a deleted enum box or one of its two stores.
+    function boxDel(s,    h, v) {
+      if (isBox(s, "") && lastTok(s) !~ /^(string|\()/) {
+        h = idOf(s)
+        if (h in M) { return 0 }
+        M[h] = "<deleted>"; D[h] = 1; boxes++
+        return 1
+      }
+      if (!match(s, /^  field_set %[0-9]+\[(0|8)\] = %[0-9]+$/)) { return 0 }
+      h = substr(s, 13); h = substr(h, 1, index(h, "[") - 1); v = lastTok(s)
+      if (!(h in D)) { return 0 }
+      if (index(s, "[0] = ") > 0 && !(h in Z0)) { Z0[h] = v; return 1 }
+      if (index(s, "[8] = ") > 0 && !(h in Z8)) { Z8[h] = v; return 1 }
+      return 0
+    }
+    # readIns -- tree B[j], B[j+1] read a returned box`s two words.
+    function readIns(j,    x, r0, r1) {
+      if (pend != "" || j + 1 > nB || !match(linesB[j], /^  %[0-9]+ = field_get %[0-9]+\[0\] i64$/)) { return 0 }
+      r0 = idOf(linesB[j]); r1 = idOf(linesB[j + 1]); x = substr(linesB[j], length(r0) + 16)
+      x = substr(x, 1, index(x, "[") - 1)
+      if (!(x in R) || R[x] == "<new>" || r1 == "" || index(linesB[j + 1], "  " r1 " = field_get " x "[8] ") != 1) { return 0 }
+      R[r0] = "<new>"; R[r1] = "<new>"; pend = x " " r0 " " r1
+      return 1
+    }
+    # retHunk -- oracle `ret %h`, tree `ret %a, %b`.
+    function retHunk(a, b,    h, p) {
+      if (a !~ /^  ret %[0-9]+$/ || b !~ /^  ret %[0-9]+, %[0-9]+$/) { return 0 }
+      h = substr(a, 7); split(substr(b, 7), p, ", ")
+      if ((h in D) && (h in Z0) && (h in Z8)) {
+        if (M[Z0[h]] != p[1] || M[Z8[h]] != p[2]) { return 0 }
+        delete D[h]; boxes--
+        return 1
+      }
+      if (pend == "" || pend != M[h] " " p[1] " " p[2]) { return 0 }
+      pend = ""
+      return 1
+    }
+    # enumWords (#6730) -- see the header above explainMismatch.
+    function enumWords(    i, j, n, e) {
+      i = 1; j = 1; n = 0; fnStart = 0; reset()
+      while (i <= nA || j <= nB) {
+        if (i <= nA && i != fnStart && linesA[i] ~ /^func /) {
+          if (pend != "" || boxes != 0) { return 0 }
+          reset(); fnStart = i
+        }
+        if (i <= nA && j <= nB && same(linesA[i], linesB[j])) { i++; j++; continue }
+        if (i <= nA && j <= nB && (e = callHunk(i, j)) > 0) { i++; j = e; n++; continue }
+        if (j <= nB && readIns(j)) { j += 2; continue }
+        if (i <= nA && j <= nB && retHunk(linesA[i], linesB[j])) { i++; j++; n++; continue }
+        if (i <= nA && (readDel(linesA[i]) || boxDel(linesA[i]))) { i++; continue }
+        return 0
+      }
+      return (n > 0 && pend == "" && boxes == 0) ? 1 : 0
+    }
+    side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
+    side == 0 { nA++; linesA[nA] = $0; next }
+    { nB++; linesB[nB] = $0 }
+    END {
+      if (kind != "ir" && kind != "iropt") { exit 1 }
+      canonT(linesA, nA); canonT(linesB, nB)
+      if (enumWords()) {
+        print "6730-fallible-enum-words"; exit 0
+      }
+      exit 1
+    }
+  ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
 }
 
 # declaredSignatureNames [ir|iropt|ast|fmt|types|diags] -- every name explainMismatch
@@ -222,8 +399,12 @@ explainMismatch() {
 # function does not list can never be checked for going dead, and one it lists
 # that explainMismatch no longer prints would make that check fail on every
 # run. Kept in sync by hand, and selfhost-ir-signatures-selfcheck.sh asserts
-# the list matches the `print "..."` statements in this file. None are
-# declared, so it prints nothing for every kind.
+# the list matches the `print "..."` statements in this file.
 declaredSignatureNames() {
-  return 0
+  local kind=${1:-}
+  case "$kind" in
+    ast|fmt|tokens|diags|types) return ;;
+    ir|iropt) printf '%s\n' "6730-fallible-enum-words"; return ;;
+  esac
+  [ -n "$kind" ] || printf '%s\n' "6730-fallible-enum-words"
 }
