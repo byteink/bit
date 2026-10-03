@@ -2994,9 +2994,9 @@ fallible call with `?` or `catch` (§18.3) are all accepted. Two shapes exist:
   **static byte image** in the object file. It costs no startup work, and the
   cell holds its value before any startup initializer runs.
 - **Every other initializer runs at startup**, before `main`: a call or any other
-  non-constant expression, and any initializer on a cell of a traced type. An
-  initializer allocates and calls like any function body, because it runs on the
-  main task with the allocator, collector and scheduler up.
+  non-constant expression, and any initializer on a cell of a traced type. It runs
+  on the main task with the allocator, collector and scheduler up, so it allocates
+  and calls like any function body. A `[N]T` cell is filled by copying the value.
 
 A `let` with no initializer is zero-valued (§13.4), and its type annotation is
 then required. A `const` always has one.
