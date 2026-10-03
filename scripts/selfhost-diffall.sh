@@ -219,7 +219,7 @@ pass=0 fail=0 inconc=0 timeout=0 absent=0
 # silently falls back to ncpu=4 (proven on this exact host by stubbing
 # `nproc`+`sysctl` on PATH, 2026-08-27 -- macOS has no `nproc`, which is
 # exactly why that flat form looked fine here and would have shipped
-# 14x-under-subscribed to mustafa-desktop-wsl's 28 cores). An explicit
+# 14x-under-subscribed to the WSL x64 host's 28 cores). An explicit
 # if/elif runs exactly one probe.
 if command -v nproc >/dev/null 2>&1; then
   ncpu=$(nproc)

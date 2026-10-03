@@ -105,7 +105,7 @@
 #      quieter.
 #   5  the resolved plan (BUCKET_PRE/BUCKET_POST/BUILD_STEPS) includes a
 #      scripts/selfhost-*.sh differential or the bare `test` step, and $PWD is
-#      under .claude/worktrees/ (GATE_RESULT=WORKTREE_REFUSED, #5618). NOTHING
+#      under a worktrees/ checkout (GATE_RESULT=WORKTREE_REFUSED, #5618). NOTHING
 #      RAN. `scripts/gate.sh` on its own can print this same plan (the "gate:
 #      plan:" lines below) from a worktree with zero enforcement — the hook
 #      that refuses `./make test`/`./make test-differentials` only matches
@@ -663,7 +663,7 @@ fi
 # re-derive a bucket it cannot compute without running this file.
 WORKTREE_HIT=""
 case "${PWD}" in
-  */.claude/worktrees/task-*)
+  */worktrees/task-*)
     for s in ${PRE_SCRIPTS} ${POST_SCRIPTS}; do
       case "${s}" in scripts/selfhost-*.sh) WORKTREE_HIT="${WORKTREE_HIT}${s} " ;; esac
     done
@@ -742,7 +742,7 @@ for s in ${POST_SCRIPTS}; do run_step bash "${s}"; done
 # bit-out/bin/bit already built, exactly like the selfhost-diffruntime.sh POST
 # script above under --x64/--arm64 (see the note printed above). Deliberately
 # NOT _tests_/bit/windowssmoke.bit — that needs the reachable
-# mustafa-desktop-win host and stays a manual `./make test-windows-smoke` step.
+# Windows test host and stays a manual `./make test-windows-smoke` step.
 if [ "${has_windows}" -eq 1 ]; then
   WIN_SCRATCH="$(mktemp -d)"
   run_step scripts/g2archive.sh x86_64-windows "${WIN_SCRATCH}/libbitrt-windows-gate.a"
