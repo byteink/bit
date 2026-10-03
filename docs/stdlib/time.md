@@ -538,6 +538,64 @@ not the zone identity, since `+04:00` does not say which zone it came from;
 the result's `zone()` is a fixed-offset zone, so call `.withZone(z)` when
 the real zone is known from elsewhere.
 
+## HTTP dates
+
+A `Date`, `Last-Modified` or `Expires` header carries a timestamp in the
+format RFC 9110 section 5.6.7 calls HTTP-date, and a server that signs
+requests (an S3 client, for one) compares it with its own clock. It is not
+RFC 3339: `Sun, 06 Nov 1994 08:49:37 GMT`, always GMT, English day and month
+names, to the second.
+
+```bit
+import {
+  HttpDateCause, HttpDateError, Timestamp, formatHttpDate, parseHttpDate,
+} from "std/time"
+
+fn stamp(t: Timestamp): string {
+  return formatHttpDate(t)
+  // "Sun, 06 Nov 1994 08:49:37 GMT"
+}
+
+fn clockSkew(header: string, local: Timestamp): string {
+  let server = parseHttpDate(header) catch e {
+    let he = e.(HttpDateError)
+    match (he.cause) {
+      Zone => return "the server stamped a zone other than GMT"
+      Syntax => return "not an HTTP-date: ${he.input}"
+      Range => return "an impossible date"
+      Weekday => return "the day name and the date disagree"
+    }
+  }
+  return "server is ${(server.ns - local.ns) / 1000000000}s ahead"
+}
+```
+
+`formatHttpDate(t)` writes the one form a sender may write, IMF-fixdate. A
+fraction of a second is dropped toward the past.
+
+`parseHttpDate(s)` reads all three forms a recipient must accept, and the
+same instant comes back from each:
+
+| Form | Example |
+|---|---|
+| IMF-fixdate | `Sun, 06 Nov 1994 08:49:37 GMT` |
+| RFC 850 (obsolete) | `Sunday, 06-Nov-94 08:49:37 GMT` |
+| asctime (obsolete) | `Sun Nov  6 08:49:37 1994` |
+
+It is strict, like the other parsers: the grammar is case sensitive and takes
+no extra whitespace. Everything else fails with an `HttpDateError`, whose
+`cause` says why: `Syntax` for none of the three shapes, `Range` for a field
+no calendar has (day 32, hour 24, second 60, 30 February) or an instant
+outside a `Timestamp`'s roughly 1677 to 2262 span, `Zone` for anything but
+`GMT` (`UTC`, `+0000`), and `Weekday` when the day name disagrees with the
+date. The error's `input` is the refused text.
+
+An RFC 850 year has two digits. RFC 9110 reads one that lands more than 50
+years in the future as the most recent past year with the same last two
+digits, so the answer depends on today's date. `parseHttpDate(s, reference)`
+takes that date as a second argument, defaulting to `now()`; pass a stored
+response's own timestamp to read it as it was read then.
+
 ## Hijri dates
 
 A display conversion, not a second calendar system: values are stored and
@@ -760,6 +818,8 @@ run so a daylight saving transition is absorbed.
 | `Date.toTimestamp()` on year 1600 | fails, outside the instant range |
 | `zone("Asia/Dubai")` with no host zone data | fails - see [Zones](#zones) |
 | `hijri()` outside 1300-1500 AH | fails, tables do not cover it |
+| `parseHttpDate` on `Sun, 06 Nov 1994 08:49:37 UTC` | fails, `Zone`: only `GMT` |
+| `parseHttpDate` on a date after year 2262 | fails, `Range`: a `Timestamp` cannot hold it |
 
 ## Date reference
 
@@ -1888,6 +1948,26 @@ Reads back a `DateTime.toString()` result: a wall clock plus `Z` or a `+HH:MM`/`
 ### `parseWith(pattern: string, s: string): NaiveDateTime!`
 
 Reads `s` against the LDML pattern `pattern`, the same pattern language `format` writes. A field the pattern does not name keeps its default. See [Formatting and parsing](#formatting-and-parsing).
+
+### `formatHttpDate(t: Timestamp): string`
+
+Writes `t` as an IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`, the only form RFC 9110 lets a sender write. A fraction of a second is dropped toward the past. See [HTTP dates](#http-dates).
+
+### `parseHttpDate(s: string, reference: Timestamp = now()): Timestamp!`
+
+Reads an IMF-fixdate, an RFC 850 date or an asctime date to the instant it names. Fails with an `HttpDateError` on any other text, a field out of range, a zone other than `GMT`, or a day name that does not match the date. `reference` places an RFC 850 two-digit year by the 50-year rule and is read for no other form.
+
+### `HttpDateCause`
+
+Which of the four things went wrong: `Syntax`, `Range`, `Zone` or `Weekday`.
+
+### `HttpDateError`
+
+The error every `parseHttpDate` failure produces: `cause`, and `input`, the text that was refused. Reach the fields with `e.(HttpDateError)`.
+
+### `HttpDateError.message`
+
+A fixed one-sentence summary of the cause, without the input; the same text the caught `error` reports.
 
 ### `hijriDate(year: i64, month: i64, day: i64): HijriDate!`
 
