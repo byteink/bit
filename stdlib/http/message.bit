@@ -175,13 +175,18 @@ fn decodeChunkedBody(s: byteStream, buffered: string, maxBodyBytes: int): string
 //
 // `clAt`, `teAt` and `connAt` are where the first Content-Length,
 // Transfer-Encoding and Connection field lines begin in `headBlock`, -1 when
-// absent, and all -1 when `breaks` is. Every HTTP/1 request needs all three
+// absent, and all -1 when `breaks` is negative: -1 for a bare control byte
+// above, -2 (`fieldSyntaxBad`) for a malformed field line (`fieldNameEnd`:
+// empty name, obs-fold, SP/HTAB in the name or before the colon). Every
+// HTTP/1 request needs all three
 // before its handler runs. Once the block is accepted, every `\n` closes a
 // CRLF, so the byte after each one is exactly a line start `headerLineStart`
 // (http.bit) would test; testing it here, on the walk that already visits
 // every `\n`, replaced a second walk that found each line end again with
 // `indexOfFrom` (#5970). The request line itself is never tested: no `\n`
 // precedes it, and `headerLineStart` runs on `headers`, which starts after it.
+// The line-start test also resumes the walk at the end of the field name, so
+// the name bytes are read once, by `fieldNameEnd`, not again by this loop.
 // Ints rather than values because a multi-value return of strings boxes each
 // one on the heap, which four ints do not.
 fn headerBlockScan(headBlock: string): (int, int, int, int) {
@@ -205,36 +210,83 @@ fn headerBlockScan(headBlock: string): (int, int, int, int) {
     i = i + 1
     if (c == '\n') {
       breaks = breaks + 1
-      let (cl, te, conn) = framingLinesAt(headBlock, i, clAt, teAt, connAt)
+      let (next, cl, te, conn) = framingLinesAt(headBlock, i, clAt, teAt, connAt)
+      i = next
       clAt = cl
       teAt = te
       connAt = conn
     }
   }
+  if (clAt == fieldSyntaxBad) {
+    return fieldSyntaxBad, 0 - 1, 0 - 1, 0 - 1
+  }
   return breaks, clAt, teAt, connAt
 }
 
+// The scan's verdict when a field line is malformed (`fieldNameEnd`), in
+// `headerBlockScan`'s `clAt` slot: it ends the walk, and the walk's caller
+// turns it into the third return value's -2. -1 stays "absent".
+const fieldSyntaxBad = 0 - 2
+
+// Where the field-name scan of the line beginning at `at` stops: the ':' that
+// ends a name, or the first CR, LF or NUL (or the end of `block`), which
+// `headerBlockScan`'s byte loop then judges itself. -1 when the line is not a
+// field line a front proxy and this parser must read the same way: an empty
+// name, a line that opens with SP or HTAB (obs-fold, RFC 9112 §5.2: a
+// continuation of the previous field to one parser, a new field to another),
+// or SP/HTAB inside the name, which includes between the name and the colon
+// (§5.1: "Transfer-Encoding : chunked" is not a Transfer-Encoding field here
+// but is one to a proxy that trims it, the TE.CL smuggling shape, #6710).
+// One compare per name byte; `headerBlockScan` resumes at the returned index,
+// so no byte of a name is read twice.
+fn fieldNameEnd(block: string, at: int): int {
+  let j = at
+  while (j < len(block)) {
+    let c = block[j]
+    if (c == ':') {
+      return j > at ? j : 0 - 1
+    }
+    if (c <= ' ') {
+      return c == ' ' || c == '\t' ? 0 - 1 : j
+    }
+    j = j + 1
+  }
+  return j
+}
+
 // `clAt`, `teAt` and `connAt` with the line starting at `at` tested for each
-// field name that has not matched yet. A separate function so
-// `headerBlockScan`'s loop body stays flat: an `if` nested in its LF test
-// gives the loop's back edge a join the bounds-check pass (compiler/optbce.bit)
-// cannot see through (#5969, #5971). One call, not three inlined tests, also
-// keeps the name constants out of the byte loop, so on x86_64 the byte `c`
-// stays in a register across it instead of a stack slot.
-fn framingLinesAt(headBlock: string, at: int, clAt: int, teAt: int, connAt: int): (int, int, int) {
-  let cl = firstLineAt(headBlock, at, clAt, "content-length")
-  let te = firstLineAt(headBlock, at, teAt, "transfer-encoding")
-  return cl, te, firstLineAt(headBlock, at, connAt, "connection")
+// field name that has not matched yet, and the index at which the byte loop
+// resumes (`fieldNameEnd`). A malformed field line returns `len(headBlock)`,
+// which ends the loop, with `fieldSyntaxBad` in the first slot. A separate
+// function so `headerBlockScan`'s loop body stays flat: an `if` nested in its
+// LF test gives the loop's back edge a join the bounds-check pass
+// (compiler/optbce.bit) cannot see through (#5969, #5971). One call, not three
+// inlined tests, also keeps the name constants out of the byte loop, so on
+// x86_64 the byte `c` stays in a register across it instead of a stack slot.
+fn framingLinesAt(
+  headBlock: string,
+  at: int,
+  clAt: int,
+  teAt: int,
+  connAt: int,
+): (int, int, int, int) {
+  let e = fieldNameEnd(headBlock, at)
+  if (e < 0) {
+    return len(headBlock), fieldSyntaxBad, teAt, connAt
+  }
+  let cl = firstLineAt(headBlock, at, e, clAt, "content-length")
+  let te = firstLineAt(headBlock, at, e, teAt, "transfer-encoding")
+  return e, cl, te, firstLineAt(headBlock, at, e, connAt, "connection")
 }
 
 // `found` when a `name` line was already seen (>= 0), else `at` when a `name`
-// field line begins there, else -1: the first line wins, as in
-// `headerLineStart` (http.bit).
-fn firstLineAt(headBlock: string, at: int, found: int, name: string): int {
-  if (found >= 0 || !fieldLineAt(headBlock, at, name)) {
+// field line begins there (its name ends at `e`, on a ':'), else -1: the first
+// line wins, as in `headerLineStart` (http.bit).
+fn firstLineAt(headBlock: string, at: int, e: int, found: int, name: string): int {
+  if (found >= 0 || e - at != len(name) || e >= len(headBlock) || headBlock[e] != ':') {
     return found
   }
-  return at
+  return headerNameAt(headBlock, at, name) ? at : found
 }
 
 // True when `c`, the byte at `i`, is a NUL, an LF with no CR before it, or a
@@ -443,8 +495,25 @@ fn checkFramingAt(block: string, clAt: int, teAt: int, who: string): ()! {
   }
 }
 
-// `checkFramingAt` for a block no scan has indexed yet (the client side).
+// The wire-syntax half of `checkFraming` for a block of header lines (the
+// client side: a response's, starting at its first field line, no status
+// line): a bare CR, LF or NUL, an empty field name, obs-fold, and whitespace
+// before the colon each refuse it (RFC 9112 §5, #6710). `headerBlockScan`
+// never tests the line at offset 0, so that one is tested here.
+fn checkFieldSyntax(block: string, who: string): ()! {
+  let (breaks, _, _, _) = headerBlockScan(block)
+  if (breaks == fieldSyntaxBad || fieldNameEnd(block, 0) < 0) {
+    fail newError("${who}: malformed header field line")
+  }
+  if (breaks < 0) {
+    fail newError("${who}: control character in header block")
+  }
+}
+
+// `checkFramingAt` for a block no scan has indexed yet (the client side),
+// after `checkFieldSyntax`.
 fn checkFraming(block: string, who: string): ()! {
+  checkFieldSyntax(block, who)?
   checkFramingAt(
     block,
     headerLineStart(block, "content-length"),
@@ -554,6 +623,18 @@ fn checkRequestFraming(s: byteStream, headBlock: string, clAt: int, teAt: int): 
   }
 }
 
+// The error for a `headerBlockScan` count that is negative: -2 a malformed
+// field line, -1 a bare control byte. Split out of `readMessage` to keep it
+// under the lint line ceiling.
+fn checkScanVerdict(headerLines: int): ()! {
+  if (headerLines == fieldSyntaxBad) {
+    fail newError("readMessage: malformed header field line")
+  }
+  if (headerLines < 0) {
+    fail newError("readMessage: control character in header block")
+  }
+}
+
 fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   // Before the first read, not after it: the address is read off the socket
   // with `getpeername`, which stops answering once the connection is torn
@@ -572,9 +653,7 @@ fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   let headBlock = raw[0:sep]
   let bodyStart = raw[sep + 4:len(raw)]
   let (headerLines, clAt, teAt, connAt) = headerBlockScan(headBlock)
-  if (headerLines < 0) {
-    fail newError("readMessage: control character in header block")
-  }
+  checkScanVerdict(headerLines)?
 
   // Split the request line off the top of the header block.
   let eol = indexOf(headBlock, "\r\n")
