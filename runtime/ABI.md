@@ -2356,13 +2356,18 @@ parked threads), so `stuck=` is the count and the line is the first witness.
 `runtime/gc/gcworldstuck.bit` composes both.
 
 The last field is `latewakes=<n>` (#6474): idle parallel-mark members whose
-sleep on `gcMkWake` ended by timeout although termination had been published
-at least 100 us before that timeout could fire, over the whole run
+sleep on `gcMkWake` ended by timeout although the termination notify had
+completed at least 100 us before that timeout could fire (`gcMkWakeTick`, the
+`gcTicks` reading stored when `gcMkNotify(true)` finishes), plus one for a
+phase whose termination was decided but whose notify never completed, checked
+once every member has left; both over the whole run
 (`gcStatLateWakes`, `runtime/gc/gcmarkpar.bit`, forwarded by `stwLateWakes`,
 `runtime/stw/stwstats.bit`). A sleeper is meant to be woken by termination, and
 each sleep is capped at 1 ms, so a lost wake costs 1 ms and no run time shows
-it; this counter is the witness and a correct build reads `latewakes=0`. It is
-touched only when a sleep times out, never per marked object. The line is now
+it; this counter is the witness and a correct build reads `latewakes=0`. A
+notifier descheduled before it reaches the wake delays the wake without losing
+it and is not counted. It is touched only when a sleep times out and once per
+mark phase, never per marked object. The line is now
 `... sweepns=<n> helpers=<n> stuck=<n> latewakes=<n>`; consumers read fields by
 name (`_tests_/bit/stress/verify.bit`'s `statsField`).
 
