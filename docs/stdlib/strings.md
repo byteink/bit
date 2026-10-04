@@ -389,3 +389,45 @@ fn moneyLabel(cents: f64): string {
   return "$" + groupDigits(formatFloat(cents, 2), ",")
 }
 ```
+
+## Punycode
+
+IDNA writes a non-ASCII domain label as `xn--` plus its Punycode form (RFC
+3492), so `bücher` travels as `xn--bcher-kva`. These two functions are the
+Punycode step only; the `xn--` prefix, case mapping and label-length limits
+belong to the caller.
+
+### `punycodeEncode(s: string): string!`
+
+The Punycode form of UTF-8 text `s`: the ASCII characters first, then `-` when
+there is at least one, then the rest as base-36 deltas (`"bücher"` is
+`"bcher-kva"`, `"abc"` is `"abc-"`). Fails with `punycode: invalid UTF-8` when
+`s` is not well-formed UTF-8, and with `punycode: overflow` when a value would
+pass 2³² - 1 (RFC 3492 §6.4).
+
+### `punycodeDecode(s: string): string!`
+
+The text `s` encodes. Digits may be upper or lower case. Fails with
+`punycode: invalid input at <i>` (`i` is a byte index) for a non-ASCII byte, a
+character that is not a digit, input that stops inside a number, or a number
+that is not a Unicode scalar value, and with `punycode: overflow` when a value
+would pass 2³² - 1. Malformed input is an error, never a panic.
+
+```bit
+import { punycodeEncode, punycodeDecode } from "std/strings"
+
+fn asciiLabel(label: string): string! {
+  let p = punycodeEncode(label)?
+  if (p == label + "-") {
+    return label
+  }
+  return "xn--" + p
+}
+
+fn unicodeLabel(label: string): string! {
+  if (len(label) > 4 && label[0:4] == "xn--") {
+    return punycodeDecode(label[4:])?
+  }
+  return label
+}
+```
