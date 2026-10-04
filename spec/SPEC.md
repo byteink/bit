@@ -3440,6 +3440,22 @@ map<string,string>)` parameter both construct one); anywhere else - including
 with no expected type reachable at all - it is ill-typed, the same treatment an
 empty `[]` against a non-slice type gets (§15.2).
 
+A bare `{ k: v, ... }` entry list whose expected type is `Where<T>` (std/where,
+a class `T`) is a **condition literal**, not a map. Each key is then a bare
+identifier naming a field of `T` (a name no scope binds is not an E0040 there),
+and each value is compared with that field for equality. Every key must be a
+field of `T`, else **E0301** naming `T`, the key and the nearest field name; a
+field of another module's class must be `export`ed (E0046, as for a read, §10.5).
+Every value must be assignable to its field's type, else **E0302** naming the
+field and both types: an `Option<X>` field also accepts an `X`, and `nil` is
+a value only for an `Option` field. `{}` is the empty condition. An operator
+object (`{ age: { gte: 18 } }`), an `and`, `or` or `not` key and a `related(...)`
+value are not covered yet and are **E0303**, never mis-checked. The expected
+type alone makes the literal a condition; with any other expected type, or none,
+the entry list is a map and an unbound key is the ordinary E0040. A condition
+literal is checked but not yet lowered: building a program that contains one is
+refused at lowering until it lowers to std/where's constructors.
+
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
 annotation, parameter, or result - `let a: [2]f32 = [4.5, 4.5]` is an error
