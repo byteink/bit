@@ -128,9 +128,11 @@ If `deliver` fails, the link it was about to send is revoked too, because nobody
 has it, and `send` returns the failure for you to log. Do not show it to the
 visitor.
 
-Two `send` calls at the same instant for one user can both survive, and Ada
-holds two live links to the same address. Neither is stronger than the other,
-and the next `send` revokes both.
+Two `send` calls at the same instant for one user, a double click or two tabs,
+still leave Ada exactly one live link: `send` issues with `Live.One`, so the
+earlier links die in the same atomic step that saves the new one, and the last
+step to run wins. A `OneTimeStore` of your own has to keep that promise in its
+`replace` method; the chapter on account tokens says how.
 
 ## Without telling anyone which addresses exist
 
