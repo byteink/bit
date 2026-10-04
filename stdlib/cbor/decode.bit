@@ -1,0 +1,365 @@
+// Bit standard library — cbor module, the decoder.
+//
+// A forward cursor over the input. Every length a head declares is checked
+// against the bytes that remain BEFORE anything is allocated, so a header that
+// claims 2^63 bytes costs one comparison. Every loop either consumes at least
+// one input byte per iteration or returns, so each is bounded by `len(data)`.
+
+import { isValidUtf8 } from "std/strings"
+
+// The cursor plus the limits of one decode. `info` and `arg` hold the head just
+// read by `readHead`: its additional-information field (31 means indefinite)
+// and its argument. Keeping them here avoids a tuple per head.
+class Reader {
+  data: []byte,
+  pos: int,
+  items: int,
+  bytes: int,
+  maxDepth: int,
+  maxItems: int,
+  maxBytes: int,
+  strict: bool,
+  info: int,
+  arg: u64,
+}
+
+fn newReader(data: []byte, opts: DecodeOptions): Reader {
+  return Reader{
+    data = data,
+    pos = 0,
+    items = 0,
+    bytes = 0,
+    maxDepth = opts.maxDepth,
+    maxItems = opts.maxItems,
+    maxBytes = opts.maxBytes,
+    strict = opts.strict,
+    info = 0,
+    arg = 0,
+  }
+}
+
+fn truncated(): error {
+  return newError("cbor: unexpected end of input")
+}
+
+// Whether an argument spelled in the `info` form (24 to 27) has a shorter form.
+fn nonShortest(info: int, arg: u64): bool {
+  if (info == 24) {
+    return arg < 24
+  }
+  if (info == 25) {
+    return arg < 256
+  }
+  if (info == 26) {
+    return arg < 65536
+  }
+  return arg < 4294967296
+}
+
+// Reads the argument bytes of a head with `info` 24 to 27 into `r.arg`.
+fn readArg(r: Reader, info: int): ()! {
+  let width = 1 << (info - 24)
+  if (len(r.data) - r.pos < width) {
+    fail truncated()
+  }
+  let v: u64 = 0
+  let i = 0
+  while (i < width) {
+    v = (v << 8) | u64(r.data[r.pos + i])
+    i = i + 1
+  }
+  r.pos = r.pos + width
+  r.arg = v
+}
+
+// Reads one head and returns its major type; `r.info` and `r.arg` describe the
+// rest. Reserved additional information (28 to 30) is always an error. For
+// major types 0 to 6 a non-shortest argument is an error in strict mode; major
+// type 7 is exempt because its argument bytes are a float or a simple value.
+fn readHead(r: Reader): int! {
+  if (r.pos >= len(r.data)) {
+    fail truncated()
+  }
+  let b = r.data[r.pos]
+  r.pos = r.pos + 1
+  let major = int(b >> 5)
+  let info = int(b & 0x1f)
+  r.info = info
+  r.arg = 0
+  if (info < 24) {
+    r.arg = u64(info)
+    return major
+  }
+  if (info > 27 && info < 31) {
+    fail newError("cbor: reserved additional information ${info}")
+  }
+  if (info == 31) {
+    return major
+  }
+  readArg(r, info)?
+  if (r.strict && major != 7 && nonShortest(info, r.arg)) {
+    fail newError("cbor: integer or length not in shortest form")
+  }
+  return major
+}
+
+// A copy of `n` input bytes at the cursor, after checking that many remain and
+// that the string budget allows them. `n` is a u64 so a 2^64 - 1 claim is
+// compared as itself, never truncated to an int.
+fn takeBytes(r: Reader, n: u64): []byte! {
+  if (n > u64(len(r.data) - r.pos)) {
+    fail newError("cbor: declared length ${n} exceeds the remaining input")
+  }
+  if (n > u64(r.maxBytes - r.bytes)) {
+    fail newError("cbor: string bytes exceed the limit of ${r.maxBytes}")
+  }
+  let size = int(n)
+  let out = append([]byte(0), ...r.data[r.pos:r.pos + size])
+  r.pos = r.pos + size
+  r.bytes = r.bytes + size
+  return out
+}
+
+fn checkText(b: []byte): string! {
+  let s = string(b)
+  if (!isValidUtf8(s)) {
+    fail newError("cbor: text string is not valid UTF-8")
+  }
+  return s
+}
+
+// An indefinite-length byte or text string: definite chunks of the same major
+// type up to a break. Each text chunk is valid UTF-8 on its own.
+fn readChunked(r: Reader, major: int): Cbor! {
+  if (r.strict) {
+    fail newError("cbor: indefinite length in strict mode")
+  }
+  let acc = []byte(0)
+  while (r.pos <= len(r.data)) {
+    if (r.pos >= len(r.data)) {
+      fail truncated()
+    }
+    if (r.data[r.pos] == 0xff) {
+      r.pos = r.pos + 1
+      if (major == 2) {
+        return Cbor.Bytes(acc)
+      }
+      return Cbor.Text(checkText(acc)?)
+    }
+    let m = readHead(r)?
+    if (m != major || r.info == 31) {
+      fail newError("cbor: a chunk of an indefinite string must be a definite string of the same type")
+    }
+    let chunk = takeBytes(r, r.arg)?
+    if (major == 3) {
+      checkText(chunk)?
+    }
+    acc = append(acc, ...chunk)
+  }
+  fail truncated()
+}
+
+fn readString(r: Reader, major: int): Cbor! {
+  if (r.info == 31) {
+    return readChunked(r, major)?
+  }
+  let b = takeBytes(r, r.arg)?
+  if (major == 2) {
+    return Cbor.Bytes(b)
+  }
+  return Cbor.Text(checkText(b)?)
+}
+
+fn enter(r: Reader, depth: int): ()! {
+  if (depth >= r.maxDepth) {
+    fail newError("cbor: nesting deeper than ${r.maxDepth}")
+  }
+}
+
+// The element count a definite array or map head declares, checked against the
+// input before any allocation: every element is at least `perItem` bytes
+// (1 for an array element, 2 for a map entry) and the item budget applies.
+fn declaredCount(r: Reader, perItem: int): int! {
+  if (r.arg > u64(len(r.data) - r.pos) / u64(perItem)) {
+    fail newError("cbor: declared count ${r.arg} exceeds the remaining input")
+  }
+  if (r.arg > u64(r.maxItems)) {
+    fail newError("cbor: declared count ${r.arg} exceeds the limit of ${r.maxItems}")
+  }
+  return int(r.arg)
+}
+
+// Positions the cursor for the next element of a container: false at its end.
+// A definite container ends after `n` elements, an indefinite one at a break.
+fn moreElements(r: Reader, indef: bool, done: int, n: int): bool! {
+  if (!indef) {
+    return done < n
+  }
+  if (r.pos >= len(r.data)) {
+    fail truncated()
+  }
+  if (r.data[r.pos] == 0xff) {
+    r.pos = r.pos + 1
+    return false
+  }
+  return true
+}
+
+fn readArray(r: Reader, depth: int): Cbor! {
+  enter(r, depth)?
+  let indef = r.info == 31
+  if (indef && r.strict) {
+    fail newError("cbor: indefinite length in strict mode")
+  }
+  let n = 0
+  if (!indef) {
+    n = declaredCount(r, 1)?
+  }
+  let items = []Cbor(0, n)
+  while (moreElements(r, indef, len(items), n)?) {
+    items = append(items, decodeItem(r, depth + 1)?)
+  }
+  return Cbor.Array(items)
+}
+
+// Strict mode: the key encoding at [ks, ke) must sort strictly after the
+// previous key's at [ps, pe). Strict input is shortest-form, so the input bytes
+// are the canonical encodings the comparison needs.
+fn checkKeyOrder(r: Reader, ps: int, pe: int, ks: int, ke: int): ()! {
+  let i = 0
+  let a = pe - ps
+  let b = ke - ks
+  while (i < a && i < b) {
+    let x = r.data[ps + i]
+    let y = r.data[ks + i]
+    if (x < y) {
+      return
+    }
+    if (x > y) {
+      fail newError("cbor: map keys are not in bytewise order")
+    }
+    i = i + 1
+  }
+  if (a < b) {
+    return
+  }
+  if (a == b) {
+    fail newError("cbor: duplicate map key")
+  }
+  fail newError("cbor: map keys are not in bytewise order")
+}
+
+fn readMap(r: Reader, depth: int): Cbor! {
+  enter(r, depth)?
+  let indef = r.info == 31
+  if (indef && r.strict) {
+    fail newError("cbor: indefinite length in strict mode")
+  }
+  let n = 0
+  if (!indef) {
+    n = declaredCount(r, 2)?
+  }
+  let entries = []CborEntry(0, n)
+  let ps = 0
+  let pe = 0
+  while (moreElements(r, indef, len(entries), n)?) {
+    let ks = r.pos
+    let k = decodeItem(r, depth + 1)?
+    if (r.strict && len(entries) > 0) {
+      checkKeyOrder(r, ps, pe, ks, r.pos)?
+    }
+    ps = ks
+    pe = r.pos
+    let v = decodeItem(r, depth + 1)?
+    entries = append(entries, CborEntry{ key = k, value = v })
+  }
+  return Cbor.Map(entries)
+}
+
+fn readTag(r: Reader, depth: int): Cbor! {
+  enter(r, depth)?
+  let tag = r.arg
+  if (r.info == 31) {
+    fail newError("cbor: tag with indefinite length")
+  }
+  return Cbor.Tag(tag, decodeItem(r, depth + 1)?)
+}
+
+// A float whose argument bytes `readHead` left in `r.arg`, `info` 25 to 27 for
+// half, single and double. Strict mode accepts only the width `encode` picks.
+fn readFloat(r: Reader, info: int): Cbor! {
+  let f = bitsToFloat(r.arg)
+  if (info == 25) {
+    f = halfToF64(r.arg)
+  }
+  if (info == 26) {
+    f = singleToF64(r.arg)
+  }
+  if (r.strict) {
+    let form = shortestFloat(floatBits(f))
+    if (form.width != (1 << (info - 24)) || form.bits != r.arg) {
+      fail newError("cbor: float not in shortest form")
+    }
+  }
+  return Cbor.Float(f)
+}
+
+// Major type 7: simple values, floats, and the break stop code (which is only
+// valid inside an indefinite container, where the container loop consumes it,
+// so reaching it here is always misplaced).
+fn readSimple(r: Reader): Cbor! {
+  if (r.info == 31) {
+    fail newError("cbor: unexpected break")
+  }
+  if (r.info >= 25) {
+    return readFloat(r, r.info)?
+  }
+  let v = r.arg
+  if (r.info == 24 && v < 32) {
+    fail newError("cbor: two-byte simple value ${v} below 32")
+  }
+  if (v == 20) {
+    return Cbor.Bool(false)
+  }
+  if (v == 21) {
+    return Cbor.Bool(true)
+  }
+  if (v == 22) {
+    return Cbor.Null
+  }
+  if (v == 23) {
+    return Cbor.Undefined
+  }
+  return Cbor.Simple(u8(v))
+}
+
+// One data item at the cursor, nested `depth` containers deep.
+fn decodeItem(r: Reader, depth: int): Cbor! {
+  r.items = r.items + 1
+  if (r.items > r.maxItems) {
+    fail newError("cbor: more than ${r.maxItems} items")
+  }
+  let major = readHead(r)?
+  if (major <= 1) {
+    if (r.info == 31) {
+      fail newError("cbor: indefinite length on an integer")
+    }
+    if (major == 0) {
+      return Cbor.Uint(r.arg)
+    }
+    return Cbor.Negative(r.arg)
+  }
+  if (major <= 3) {
+    return readString(r, major)?
+  }
+  if (major == 4) {
+    return readArray(r, depth)?
+  }
+  if (major == 5) {
+    return readMap(r, depth)?
+  }
+  if (major == 6) {
+    return readTag(r, depth)?
+  }
+  return readSimple(r)?
+}
