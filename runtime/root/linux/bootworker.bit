@@ -247,16 +247,57 @@ import { parkLowerTimerSlack } from "../../park/linux"
 // `schedMaxWorkers`; a non-zero value is the explicit `BIT_WORKERS` ceiling.
 //
 // DECLARED ABOVE ITS CALLER, same reason `spinForWork` above is.
-fn tryGrowPool(sched: *i64) {
-  let startArg = schedGrowArm(sched, ptrOf(startArgs), ptrOf(startDones), workersCeiling)
+//
+// THE BODY IS `tryGrowPoolAt`, `@nosplit`, because the monitor thread runs it too
+// (#7128, `sysmonRetake`): that thread is permanently `blocked` and `@nosplit`
+// end to end, and a safepoint poll on it would move its registry slot out of
+// `blocked`. It takes the ceiling as a parameter because a retake passes
+// `workersCeiling` plus the workers blocked in the kernel.
+// `threadStart` itself is not `@nosplit` (`../../thread/linux/spawn.bit`), so a
+// `@nosplit` caller reaches it by its pinned symbol, which SPEC 11.7 allows. That
+// is sound here for the reason `../../thread/linux/tls.bit` documents (#3812):
+// every loop the call can reach (`getauxval`'s walk, `cacheTlsGeometry`) runs
+// once and is cached before this function can: boot's own first `threadStart`
+// and `initLinuxTls` fill the caches, and the monitor thread starts after both.
+// What remains is straight-line code, which carries no back-edge poll.
+extern fn bit_rt_port_thread_start(entry: *byte, arg: *byte, done: *i32): int
+
+@nosplit fn threadStartNoSplit(entry: *byte, arg: *byte, done: *i32): int {
+  return bit_rt_port_thread_start(entry, arg, done)
+}
+
+@nosplit fn tryGrowPoolAt(sched: *i64, ceiling: int) {
+  let startArg = schedGrowArm(sched, ptrOf(startArgs), ptrOf(startDones), ceiling)
   if (int(startArg) == 0) {
     return
   }
   let block = taskAt(int(startArg))
   let doneWordAddr = *(block + 1)
   let dz: *i32 = nil
-  let h = threadStart(entryOf(workerBody), startArg, dz + doneWordAddr / 4)
+  let h = threadStartNoSplit(entryOf(workerBody), startArg, dz + doneWordAddr / 4)
   schedGrowCommit(sched, ptrOf(startHandles), h)
+}
+
+fn tryGrowPool(sched: *i64) {
+  tryGrowPoolAt(sched, workersCeiling)
+}
+
+// The monitor thread's retake (#7128, `../../sched/retake.bit`): when a worker
+// has sat in a syscall bracket past the budget with work queued behind it, start
+// one more worker through the same recipe. `BIT_WORKERS` bounds RUNNING workers,
+// so the explicit ceiling is widened by the number of blocked ones; 0 (no
+// explicit ceiling) stays 0.
+@nosplit fn sysmonRetake() {
+  let s: *i64 = ptrOf(schedBlock)
+  let blocked = rootRetakeScan(s)
+  if (blocked == 0) {
+    return
+  }
+  let ceiling = workersCeiling
+  if (ceiling > 0) {
+    ceiling = ceiling + blocked
+  }
+  tryGrowPoolAt(s, ceiling)
 }
 
 // The ceiling on worker 0's idle wait (#5723, epic #3913) — see `worker0Wait`
@@ -568,6 +609,8 @@ fn workerBody(arg: *byte): *byte {
   let doneAddr = *(block + 1)
 
   let w = taskAt(workerAddr)
+  // Record this thread's registry slot for the monitor's retake scan (#7128).
+  *(w + wkSlot) = currentMutator(0)
   let s: *i64 = ptrOf(schedBlock)
   let backoff = parkMinBackoffNs
   // ANY IDLE WORKER MAY POLL (#6429, was "worker 0 polls, the rest park",
