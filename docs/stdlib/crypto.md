@@ -923,6 +923,24 @@ Signs `msg` with the private seed `priv`. See [Sign and verify data](#sign-and-v
 
 Checks that `sig` is a valid Ed25519 signature of `msg` under public key `pub`.
 
+### `ed25519ParsePrivateKey(der: []byte): []byte!`
+
+Reads the 32-byte seed out of a PKCS#8 Ed25519 private key (RFC 8410, RFC 5958 `OneAsymmetricKey`), the `PRIVATE KEY` PEM that `openssl genpkey -algorithm ed25519` writes. DER is read strictly: trailing data, an OID other than 1.3.101.112 (`ed25519: not an Ed25519 private key`), algorithm parameters, a key that is not 32 bytes, and a version above 1 all fail. A version 1 key may carry attributes and an embedded public key; if the public key is present it must be the one derived from the seed, else the call fails with `ed25519: the embedded public key does not match`. Error text never contains key bytes.
+
+```bit
+import { pemDecode, ed25519ParsePrivateKey, ed25519Sign } from "std/crypto"
+
+// pem is the text of a key file made by `openssl genpkey -algorithm ed25519`.
+fn signWithPemKey(pem: string, msg: []byte): []byte! {
+  let blocks = pemDecode(pem)?
+  if (len(blocks) != 1 || blocks[0].label != "PRIVATE KEY") {
+    fail newError("expected one PRIVATE KEY block")
+  }
+  let seed = ed25519ParsePrivateKey(blocks[0].der)?
+  return ed25519Sign(seed, msg)
+}
+```
+
 ### `EcdsaPublicKey`
 
 An ECDSA public key on a given `Curve`.
