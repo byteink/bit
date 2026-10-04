@@ -1,0 +1,231 @@
+// tools/gens3 — renders the restXml request BODY vectors as generated test
+// files, `pkg/s3/gen_xmlservec_NN.test.bit` (#6621, epic #6565).
+//
+// The vectors are the httpRequestTests of smithy-aws-protocol-tests
+// (smithy-lang/smithy, commit in tools/gens3/model/restxml-xmlser-vectors.json)
+// whose input has an XML body, filtered to what the S3 model has (the file's
+// `filter`, and every test it drops with its reason in `excluded`). The file
+// holds the input shapes of those tests as a Smithy model, every name prefixed
+// `Xs` so it cannot meet a name of the S3 model or of the other generated test
+// files. This emitter plans that model the way emitshapes.bit does and writes,
+// into the generated test files, its types (emitshapes.bit), its enum writers
+// (emitreq.bit) and its XML body serializers (emitxmlser.bit: the SAME
+// renderers pkg/s3 is generated with), then one test per vector: it builds the
+// input from the vector's params, runs the generated `serialize<Op>Body` and
+// compares the document it set as the request body with the vector's expected
+// body as an XML tree (`vecXmlBody`, pkg/s3/xmlser.test.bit).
+
+import { Builder } from "std/strings"
+import { Json, jsonParse } from "std/json"
+import { sortInPlace } from "std/sort"
+
+const xmlserVecFile: string = "tools/gens3/model/restxml-xmlser-vectors.json"
+const xmlserVecStem: string = "gen_xmlservec_"
+
+// What the input builders share: the plan, the `let` statements written so
+// far, and a counter for the names they bind.
+class BindCtx {
+  p: Plan,
+  b: Builder,
+  n: int,
+}
+
+fn bindFresh(c: BindCtx, stem: string): string {
+  c.n = c.n + 1
+  return "${stem}${c.n}"
+}
+
+// `  let name = expr`, which must fit one line: the formatter cannot break it.
+fn bindLine(c: BindCtx, name: string, expr: string, at: string): ()! {
+  let line = "  let ${name} = ${expr}"
+  if (len(line) > respMaxWidth) {
+    fail newError("${at}: the value is wider than ${respMaxWidth} columns")
+  }
+  c.b.write(line + "\n")
+}
+
+// The Bit expression of the param `v` of member `mem`, aggregates bound to a
+// name first.
+fn paramValue(c: BindCtx, mem: Member, v: Json, at: string): string! {
+  let i = shapeIndex(c.p.m, mem.target)
+  let s = c.p.m.shapes[i]
+  return match (s.kind) {
+    List => listParam(c, s, v, at)?
+    Map => mapParam(c, s, v, at)?
+    Structure => structParam(c, i, v, bindFresh(c, "s"), at)?
+    Union => unionParam(c, i, v, at)?
+    _ => scalarLiteral(c.p, s, i, v, at)?
+  }
+}
+
+fn listParam(c: BindCtx, s: Shape, v: Json, at: string): string! {
+  let t = typeExpr(c.p, Role.Input, s.id)?
+  let items = []string(0)
+  for x of needArray(v, at)? {
+    items = append(items, paramValue(c, s.members[0], x, at)?)
+  }
+  let name = bindFresh(c, "l")
+  if (len(items) == 0) {
+    bindLine(c, name, "${t}(0)", at)?
+    return name
+  }
+  bindLine(c, name, bracketList(items), at)?
+  return name
+}
+
+fn mapParam(c: BindCtx, s: Shape, v: Json, at: string): string! {
+  let t = typeExpr(c.p, Role.Input, s.id)?
+  let pairs = []string(0)
+  for e of needObject(v, at)? {
+    pairs = append(pairs, "${vecString(e.key)}: ${paramValue(c, s.members[1], e.value, at)?}")
+  }
+  let name = bindFresh(c, "m")
+  if (len(pairs) == 0) {
+    bindLine(c, name, "${t}{}", at)?
+    return name
+  }
+  bindLine(c, name, "${t}{ ${commaList(pairs)} }", at)?
+  return name
+}
+
+// A structure bound to `name`, one field per line.
+fn structParam(c: BindCtx, i: int, v: Json, name: string, at: string): string! {
+  let s = c.p.m.shapes[i]
+  let fields = []string(0)
+  for e of needObject(v, at)? {
+    if (!jsonIsNull(e.value)) {
+      let mem = shapeMember(s, e.key, at)?
+      let value = paramValue(c, mem, e.value, "${at}.${e.key}")?
+      fields = append(fields, "${fieldName(mem.name)} = ${someOf(mem, value)}")
+    }
+  }
+  let t = c.p.names[i]
+  if (len(fields) == 0) {
+    c.b.write("  let ${name} = ${t}{}\n")
+    return name
+  }
+  c.b.write("  let ${name} = ${t}{\n")
+  for f of fields {
+    c.b.write("    ${f},\n")
+  }
+  c.b.write("  }\n")
+  return name
+}
+
+// A union bound to a name: the one member that is set.
+fn unionParam(c: BindCtx, i: int, v: Json, at: string): string! {
+  let s = c.p.m.shapes[i]
+  let entries = needObject(v, at)?
+  if (len(entries) != 1) {
+    fail newError("${at}: a union param names ${len(entries)} members, want 1")
+  }
+  let mem = shapeMember(s, entries[0].key, at)?
+  let value = paramValue(c, mem, entries[0].value, at)?
+  let name = bindFresh(c, "u")
+  bindLine(c, name, "${c.p.names[i]}.${unionVariant(mem.name, at)?}(${value})", at)?
+  return name
+}
+
+// The names map entries are written under (`entry`, or a flattened member's
+// name): the order of those siblings is the map's, not the document's, so the
+// comparison does not hold it.
+fn entryNames(p: Plan): []string {
+  let out = []string(0)
+  for s of p.m.shapes {
+    if (s.kind != ShapeKind.Enum) {
+      out = append(out, ...mapEntryNames(p, s))
+    }
+  }
+  sortInPlace(out, (a: string, b: string) => a < b)
+  return dedupe(out)
+}
+
+// The entry names of the map members of `s`.
+fn mapEntryNames(p: Plan, s: Shape): []string {
+  let names = []string(0)
+  for mem of s.members {
+    if (p.m.shapes[shapeIndex(p.m, mem.target)].kind == ShapeKind.Map) {
+      names = append(names, mapEntryName(mem))
+    }
+  }
+  return names
+}
+
+fn mapEntryName(mem: Member): string {
+  if (mem.xmlFlattened) {
+    return xmlMemberName(mem)
+  }
+  return "entry"
+}
+
+// The values of the sorted `xs`, each once.
+fn dedupe(xs: []string): []string {
+  let out = []string(0)
+  for x of xs {
+    if (len(out) == 0 || out[len(out) - 1] != x) {
+      out = append(out, x)
+    }
+  }
+  return out
+}
+
+// `xsEntryNames()`: the list above, as a generated function.
+fn entryNamesBlock(p: Plan): string {
+  let lits = []string(0)
+  for n of entryNames(p) {
+    lits = append(lits, vecString(n))
+  }
+  let head = "// The element names a map's entries are written under.\n"
+  return head + "fn xsEntryNames(): []string {\n  return ${bracketList(lits)}\n}\n"
+}
+
+fn bodyVectorTest(p: Plan, cs: Json, n: int, total: int): string! {
+  let id = needString(vecKey(cs, "id", "case")?, "case id")?
+  let at = "vector ${id}"
+  let opName = needString(vecKey(cs, "operation", at)?, at)?
+  let u = inputOf(p, opName)?
+  let c = BindCtx{ p = p, b = Builder(), n = 0 }
+  structParam(c, shapeIndex(p.m, u.shape.id), vecKey(cs, "params", at)?, "input", at)?
+  let expected = vecString(needString(vecKey(cs, "body", at)?, at)?)
+  let b = Builder()
+  b.write("test \"restXml body request vector ${n} of ${total}: ${id} (${opName})\" {\n")
+  b.write(c.b.toString())
+  b.write("  let req = requestHead(\"PUT\")\n")
+  b.write("  serialize${opName}Body(req, input) catch e {\n")
+  b.write("    panic(\"${id}: " + interpolation + "\")\n  }\n")
+  b.write("  let want = ${expected}\n  vecXmlBody(req, want, xsEntryNames())\n")
+  b.write("  println(\"restXml body request vector ${n} of ${total}: ${id}\")\n}\n")
+  return b.toString()
+}
+
+// The vector model's types, enum writers and body serializers, as blocks.
+fn serVectorCode(p: Plan): []string! {
+  let blocks = []string(0)
+  for u of p.units {
+    blocks = append(blocks, renderUnit(p, u)?)
+  }
+  for e of enumWireBlocks(p)? {
+    blocks = append(blocks, e)
+  }
+  blocks = append(blocks, entryNamesBlock(p))
+  for x of serBlocks(p)? {
+    blocks = append(blocks, x)
+  }
+  return blocks
+}
+
+// Every `gen_xmlservec_NN.test.bit` for the vector file text `src` and the S3
+// model pin.
+fn renderXmlSerVectors(src: string, commit: string, sha: string): []GenFile! {
+  let root = jsonParse(src)?
+  let p = planShapes(vectorModel(root)?)?
+  let cases = needArray(needKey(root, "cases", "vectors")?, "vectors: cases")?
+  let tests = []string(0)
+  let n = 1
+  for cs of cases {
+    tests = append(tests, bodyVectorTest(p, cs, n, len(cases))?)
+    n = n + 1
+  }
+  let head = xmlVectorHeader("xmlservec", root, commit, sha)?
+  return packVectorFiles(xmlserVecStem, head, serVectorCode(p)?, tests)?
+}

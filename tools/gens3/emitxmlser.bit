@@ -1,0 +1,636 @@
+// tools/gens3 — renders the XML request body serializers of the pinned S3 model
+// as Bit source (#6621, epic #6565): `pkg/s3/gen_xmlser_NN.bit`. The runtime
+// they are written against is pkg/s3/xmlser.bit (std/xml's Writer, one writer
+// per scalar, the list, map and attribute shapes, the body hand-off).
+//
+// What is emitted, for the operations whose input body is XML (the blocks
+// emitreq.bit marks `body: xml`):
+//
+//   - `serialize<Op>Body(req, input)`: writes the body member of the input as
+//     one document and sets `req.body` and the Content-Type. An input with an
+//     `httpPayload` structure or union writes that member under its `xmlName`
+//     (else its shape's); an input with members bound to no HTTP location
+//     (SelectObjectContent) writes them under the input shape's own name. The
+//     root carries the namespace of the member or its shape, else the
+//     service's (`http://s3.amazonaws.com/doc/2006-03-01/`).
+//   - `xmlPut<Shape>(w, name, attrs, v)` for every structure, union and list or
+//     map shape an XML body reaches, and for an enum that is a list item, a map
+//     value or a union member. An enum member is written by the enum's
+//     `wire<Enum>` (gen_req_enums_*.bit): emitreq.bit writes one for every enum
+//     a body reaches, so a value the model does not name is its `Unknown(v)`.
+//
+// Per member, by its Smithy traits: the element is `xmlName` or the member
+// name; a list is wrapped (the member's element holds items named by the
+// list's member `xmlName`, `member` when it has none) or `xmlFlattened` (one
+// element per item, named by the member); a map is wrapped (`entry` elements)
+// or flattened, each entry holding a `key` and a `value` child named by those
+// members' `xmlName`; an `xmlAttribute` member is an attribute of the
+// structure's element (`xsi:type` on a Grantee); an `xmlNamespace` on a member
+// or shape declares `xmlns` or `xmlns:prefix` on its element. A timestamp is
+// `date-time` unless the member or its target says otherwise. A member that is
+// unset writes nothing; one that is required or has a default always writes.
+// Members are written in the model's order.
+//
+// A shape the generator cannot write (a streaming blob in a body, an attribute
+// that is not a string or an enum, a map not keyed by strings, a union over the
+// complexity ceiling) is an error, so a model bump that brings one stops here.
+
+import { Builder, contains, split } from "std/strings"
+
+const serFilePrefix: string = "gen_xmlser_"
+
+// Lines of member statements in one generated function: the lint ceiling is 80,
+// the signature, the start tag and the end take the rest.
+const serChunkLines: int = 60
+
+// Whether member `mem` of an input is part of its XML body.
+fn isReqBodyMember(mem: Member): bool {
+  return !isHttpBound(mem) && !mem.hostLabel
+}
+
+// The operations whose input is an XML body.
+fn xmlSerOps(p: Plan): []Operation! {
+  let ops = []Operation(0)
+  for op of p.m.operations {
+    if (reqBodyKind(p, inputUnit(p, op)?)? == ReqBody.Xml) {
+      ops = append(ops, op)
+    }
+  }
+  return ops
+}
+
+// The payload member of input `u`, None when its body is the unbound members.
+fn payloadOf(u: Unit): Option<Member> {
+  for mem of u.shape.members {
+    if (mem.payload) {
+      return Option.Some(mem)
+    }
+  }
+  return Option.None
+}
+
+// Marks the targets of the body members of reached shape `i`. An enum's members
+// are values, not shapes.
+fn markBodyMembers(p: Plan, set: XmlSet, i: int) {
+  let s = p.m.shapes[i]
+  if (s.kind == ShapeKind.Enum) {
+    return
+  }
+  for mem of s.members {
+    if (isReqBodyMember(mem)) {
+      markShape(p, set, shapeIndex(p.m, mem.target), s.kind != ShapeKind.Structure)
+    }
+  }
+}
+
+// The shapes the XML bodies of `ops` reach, to a fixed point over members.
+fn reachedBodyShapes(p: Plan, ops: []Operation): XmlSet! {
+  let n = len(p.m.shapes)
+  let set = XmlSet{ seen = []bool(n), asItem = []bool(n), stack = []int(0) }
+  for op of ops {
+    match (payloadOf(inputUnit(p, op)?)) {
+      Some(mem) => markShape(p, set, shapeIndex(p.m, mem.target), false)
+      None => markShape(p, set, shapeIndex(p.m, op.input), false)
+    }
+  }
+  while (len(set.stack) > 0) {
+    let i = set.stack[len(set.stack) - 1]
+    set.stack = set.stack[0:len(set.stack) - 1]
+    markBodyMembers(p, set, i)
+  }
+  return set
+}
+
+// Which shapes (by index) are enums an XML body writes: emitreq.bit gives each
+// a `wire<Enum>`.
+fn xmlBodyEnums(p: Plan): []bool! {
+  let set = reachedBodyShapes(p, xmlSerOps(p)?)?
+  let out = []bool(len(p.m.shapes))
+  let i = 0
+  while (i < len(p.m.shapes)) {
+    out[i] = set.seen[i] && p.m.shapes[i].kind == ShapeKind.Enum
+    i = i + 1
+  }
+  return out
+}
+
+// A namespace an element declares: `xmlns` for an empty prefix, else
+// `xmlns:prefix`. An empty `uri` is none.
+class Ns {
+  prefix: string,
+  uri: string,
+}
+
+// The `xmlNs(prefix, uri)` call declaring `ns`, `xmlNoAttrs()` for none.
+fn nsExpr(ns: Ns, at: string): string! {
+  if (ns.uri == "") {
+    return "xmlNoAttrs()"
+  }
+  return "xmlNs(${lit(ns.prefix, at)?}, ${lit(ns.uri, at)?})"
+}
+
+// The namespace declared on the element of member `mem`: its own. A namespace
+// on a shape applies to the root element only (Smithy: "ignored since it's not
+// at the top-level"), see `rootNsOf`.
+fn memberNsOf(mem: Member): Ns {
+  return Ns{ prefix = mem.xmlNsPrefix, uri = mem.xmlNsUri }
+}
+
+fn memberNs(p: Plan, mem: Member, at: string): string! {
+  return nsExpr(memberNsOf(mem), at)?
+}
+
+// The writer of timestamp text for the format `f` ("" is `date-time`).
+fn serStampWriter(f: string, at: string): string! {
+  if (f == "" || f == "date-time") {
+    return "xmlPutDateTime"
+  }
+  if (f == "epoch-seconds") {
+    return "xmlPutEpoch"
+  }
+  if (f == "http-date") {
+    return "xmlPutHttpDate"
+  }
+  fail newError("${at}: timestamp format ${f} is not one the generator writes")
+}
+
+// The function writing an element as the target of `mem`.
+fn elementPut(p: Plan, mem: Member, at: string): string! {
+  let i = shapeIndex(p.m, mem.target)
+  let s = p.m.shapes[i]
+  if (s.kind == ShapeKind.Blob && s.streaming) {
+    fail newError("${at}: a streaming blob in an XML body is not one the generator writes")
+  }
+  return match (s.kind) {
+    String => "xmlPutStr"
+    Integer => "xmlPutInt"
+    Long => "xmlPutInt"
+    Boolean => "xmlPutBool"
+    Blob => "xmlPutBlob"
+    Timestamp => serStampWriter(firstNonEmpty(mem.timestampFormat, s.timestampFormat), at)?
+    _ => "xmlPut${readerName(p, i)}"
+  }
+}
+
+// The comment and signature of a generated function over the parameters `params`
+// (`name: type`), wrapped one per line when wider than `respMaxWidth`, as
+// `bit fmt` writes it.
+fn signature(id: string, fnName: string, params: []string): string {
+  let one = "fn ${fnName}(${commaList(params)}): ()! {"
+  if (len(one) <= respMaxWidth) {
+    return "// ${id}\n${one}\n"
+  }
+  let b = Builder()
+  b.write("// ${id}\nfn ${fnName}(\n")
+  for q of params {
+    b.write("  ${q},\n")
+  }
+  b.write("): ()! {\n")
+  return b.toString()
+}
+
+// The signature of the writer of element `name` holding a value of type `t`.
+fn writerHead(id: string, fnName: string, t: string): string {
+  return signature(id, fnName, ["w: Writer", "name: string", "attrs: []Attr", "v: ${t}"])
+}
+
+// `  fn(args)?` for a statement of a generated function.
+fn putStmt(fnName: string, args: []string): string! {
+  return callLine("  ", "", fnName, args, "?")?
+}
+
+// The attribute members of `s`: each added to `at`, a string or an enum.
+fn attributeStmt(p: Plan, owner: string, mem: Member): string! {
+  let at = "${owner}.${mem.name}"
+  let i = shapeIndex(p.m, mem.target)
+  let k = p.m.shapes[i].kind
+  let name = lit(xmlMemberName(mem), at)?
+  let field = "v.${fieldName(mem.name)}"
+  if (k == ShapeKind.String && isOptionalMember(mem)) {
+    return "  at = xmlAttrOpt(at, ${name}, ${field})\n"
+  }
+  if (k == ShapeKind.String) {
+    return "  at = xmlAttrAdd(at, ${name}, ${field})\n"
+  }
+  if (k == ShapeKind.Enum && isOptionalMember(mem)) {
+    return "  at = xmlAttrPutEnumOpt(at, ${name}, ${field}, ${wireName(p, i)})\n"
+  }
+  if (k == ShapeKind.Enum) {
+    return "  at = xmlAttrPutEnum(at, ${name}, ${field}, ${wireName(p, i)})\n"
+  }
+  fail newError("${at}: an attribute of this kind is not one the generator writes")
+}
+
+// A list member: wrapped (`xmlPutList`) or flattened (`xmlPutFlat`).
+fn listStmt(p: Plan, owner: string, mem: Member): string! {
+  let at = "${owner}.${mem.name}"
+  let item = targetShape(p, mem).members[0]
+  let put = elementPut(p, item, at)?
+  let value = valueOption(mem)
+  let name = lit(xmlMemberName(mem), at)?
+  if (mem.xmlFlattened) {
+    return putStmt("xmlPutFlat", ["w", name, memberNs(p, mem, at)?, value, put])?
+  }
+  let itemName = lit(xmlPartName(item, "member"), at)?
+  let tag = tagExpr(name, memberNs(p, mem, at)?)
+  let itemTag = tagExpr(itemName, memberNs(p, item, at)?)
+  return putStmt("xmlPutList", ["w", tag, itemTag, value, put])?
+}
+
+// `xmlTag(name, attrs)`: an element's name with its namespace declaration.
+fn tagExpr(name: string, attrs: string): string {
+  return "xmlTag(${name}, ${attrs})"
+}
+
+// `v.<field>` as the `Option` the list and map writers take.
+fn valueOption(mem: Member): string {
+  if (isOptionalMember(mem)) {
+    return "v.${fieldName(mem.name)}"
+  }
+  return "Option.Some(v.${fieldName(mem.name)})"
+}
+
+fn checkSerMapKey(p: Plan, m: Shape, at: string): ()! {
+  if (p.m.shapes[shapeIndex(p.m, m.members[0].target)].kind != ShapeKind.String) {
+    fail newError("${at}: a map in an XML body must be keyed by strings")
+  }
+}
+
+// `xmlMapNames(entry, key, value)` for map shape `m`, as the arguments of the call.
+fn mapNamesArgs(p: Plan, m: Shape, at: string): []string! {
+  return [
+    tagExpr(lit("entry", at)?, "xmlNoAttrs()"),
+    tagExpr(lit(xmlPartName(m.members[0], "key"), at)?, memberNs(p, m.members[0], at)?),
+    tagExpr(lit(xmlPartName(m.members[1], "value"), at)?, memberNs(p, m.members[1], at)?),
+  ]
+}
+
+// A map member: its names bound first, then wrapped (`xmlPutMap`) or
+// flattened (`xmlPutFlatMap`).
+fn mapStmt(p: Plan, owner: string, mem: Member): string! {
+  let at = "${owner}.${mem.name}"
+  let m = targetShape(p, mem)
+  checkSerMapKey(p, m, at)?
+  let names = "${fieldName(mem.name)}Names"
+  let b = Builder()
+  b.write(callLine("  ", "let ${names} = ", "xmlMapNames", mapNamesArgs(p, m, at)?, "")?)
+  let put = elementPut(p, m.members[1], at)?
+  let name = lit(xmlMemberName(mem), at)?
+  let fnName = "xmlPutMap"
+  if (mem.xmlFlattened) {
+    fnName = "xmlPutFlatMap"
+  }
+  let tag = tagExpr(name, memberNs(p, mem, at)?)
+  b.write(putStmt(fnName, ["w", tag, names, valueOption(mem), put])?)
+  return b.toString()
+}
+
+// An enum member, by the enum's wire writer.
+fn enumStmt(p: Plan, owner: string, mem: Member): string! {
+  let at = "${owner}.${mem.name}"
+  let wire = wireName(p, shapeIndex(p.m, mem.target))
+  let name = lit(xmlMemberName(mem), at)?
+  let field = "v.${fieldName(mem.name)}"
+  let ns = memberNs(p, mem, at)?
+  if (isOptionalMember(mem)) {
+    return putStmt("xmlPutEnumSome", ["w", name, ns, field, wire])?
+  }
+  return putStmt("xmlPutEnum", ["w", name, ns, field, wire])?
+}
+
+// A scalar, structure or union member.
+fn valueStmt(p: Plan, owner: string, mem: Member): string! {
+  let at = "${owner}.${mem.name}"
+  let name = lit(xmlMemberName(mem), at)?
+  let ns = memberNs(p, mem, at)?
+  let put = elementPut(p, mem, at)?
+  let field = "v.${fieldName(mem.name)}"
+  if (isOptionalMember(mem)) {
+    return putStmt("xmlPutSome", ["w", name, ns, field, put])?
+  }
+  return putStmt(put, ["w", name, ns, field])?
+}
+
+// The statement(s) writing member `mem` as a child element.
+fn memberStmt(p: Plan, owner: string, mem: Member): string! {
+  return match (targetShape(p, mem).kind) {
+    List => listStmt(p, owner, mem)?
+    Map => mapStmt(p, owner, mem)?
+    Enum => enumStmt(p, owner, mem)?
+    _ => valueStmt(p, owner, mem)?
+  }
+}
+
+// The body members of `s` that are attributes / elements.
+fn bodyMembers(s: Shape, attribute: bool): []Member {
+  let out = []Member(0)
+  for mem of s.members {
+    if (isReqBodyMember(mem) && mem.xmlAttribute == attribute) {
+      out = append(out, mem)
+    }
+  }
+  return out
+}
+
+// The start tag: the structure's attributes, if any, are added to `attrs`.
+fn startLines(p: Plan, s: Shape): string! {
+  let owner = shortName(s.id)
+  let attrs = bodyMembers(s, true)
+  if (len(attrs) == 0) {
+    return "  w.start(name, attrs)?\n"
+  }
+  let b = Builder()
+  b.write("  let at = attrs\n")
+  for mem of attrs {
+    b.write(attributeStmt(p, owner, mem)?)
+  }
+  b.write("  w.start(name, at)?\n")
+  return b.toString()
+}
+
+// The statements of `stmts` cut into runs of at most `serChunkLines` lines, in
+// order; one statement over the limit is an error.
+fn chunkStatements(owner: string, stmts: []string): []string! {
+  let chunks = []string(0)
+  let cur = Builder()
+  let lines = 0
+  for st of stmts {
+    let n = countLines(st)
+    if (n > serChunkLines) {
+      fail newError("${owner}: a member takes ${n} lines, a function holds ${serChunkLines}")
+    }
+    if (lines > 0 && lines + n > serChunkLines) {
+      chunks = append(chunks, cur.toString())
+      cur = Builder()
+      lines = 0
+    }
+    cur.write(st)
+    lines = lines + n
+  }
+  return append(chunks, cur.toString())
+}
+
+// The helper `xmlPut<Struct>Members<k>(w, v)` writing the members of run `k`.
+fn membersHelper(s: Shape, n: string, k: int, body: string): string {
+  let head = signature(
+    "${s.id}: members, part ${k}",
+    "xmlPut${n}Members${k}",
+    ["w: Writer", "v: ${n}"],
+  )
+  return head + body + "}\n"
+}
+
+// `xmlPut<Struct>(w, name, attrs, v)`: its members written inline, those over
+// the function size by helpers.
+fn renderStructWriter(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  let n = readerName(p, i)
+  let stmts = []string(0)
+  for mem of bodyMembers(s, false) {
+    stmts = append(stmts, memberStmt(p, shortName(s.id), mem)?)
+  }
+  let chunks = chunkStatements(s.id, stmts)?
+  let b = Builder()
+  b.write(writerHead(s.id, "xmlPut${n}", n) + startLines(p, s)? + chunks[0])
+  let k = 1
+  while (k < len(chunks)) {
+    b.write("  xmlPut${n}Members${k + 1}(w, v)?\n")
+    k = k + 1
+  }
+  b.write("  w.end()?\n}\n")
+  k = 1
+  while (k < len(chunks)) {
+    b.write("\n" + membersHelper(s, n, k + 1, chunks[k]))
+    k = k + 1
+  }
+  return b.toString()
+}
+
+// One arm of a union writer: the member that is set, as its own element, on one
+// line when it fits, as `bit fmt` writes it.
+fn unionArm(p: Plan, owner: string, mem: Member): string! {
+  let at = "${owner}.${mem.name}"
+  let v = unionVariant(mem.name, owner)?
+  let put = elementPut(p, mem, at)?
+  let name = lit(xmlMemberName(mem), at)?
+  return armLines("${v}(x)", callLine("", "", put, ["w", name, memberNs(p, mem, at)?, "x"], "?")?)
+}
+
+// `    pattern => { call }`, the call being one line or several.
+fn armLines(pattern: string, call: string): string {
+  let one = "    ${pattern} => { ${call[0:len(call) - 1]} }"
+  if (!contains(call[0:len(call) - 1], "\n") && len(one) <= respMaxWidth) {
+    return one + "\n"
+  }
+  let b = Builder()
+  b.write("    ${pattern} => {\n")
+  for line of split(call, "\n") {
+    if (line != "") {
+      b.write("      ${line}\n")
+    }
+  }
+  b.write("    }\n")
+  return b.toString()
+}
+
+// `xmlPut<Union>(w, name, attrs, v)`: the element holding the member that is set.
+fn renderUnionWriter(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  let n = readerName(p, i)
+  if (len(s.members) > xmlMaxUnionMembers) {
+    fail newError("${s.id}: ${len(s.members)} members, a union writer holds ${xmlMaxUnionMembers}")
+  }
+  let b = Builder()
+  b.write(writerHead(s.id, "xmlPut${n}", n))
+  b.write("  w.start(name, attrs)?\n  match (v) {\n")
+  for mem of s.members {
+    b.write(unionArm(p, n, mem)?)
+  }
+  b.write(armLines("Unknown(m)", "xmlUnknownMember(\"${n}\", m)?\n"))
+  b.write("  }\n  w.end()?\n}\n")
+  return b.toString()
+}
+
+// `xmlPut<List>(w, name, attrs, v)`: a list that is itself an item or a value.
+fn renderListWriter(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  let item = s.members[0]
+  let at = s.id
+  let t = typeExpr(p, Role.Input, s.id)?
+  let itemTag = tagExpr(lit(xmlPartName(item, "member"), at)?, memberNs(p, item, at)?)
+  let args = ["w", tagExpr("name", "attrs"), itemTag, "Option.Some(v)", elementPut(p, item, at)?]
+  let head = writerHead(s.id, "xmlPut${readerName(p, i)}", t)
+  return head + putStmt("xmlPutList", args)? + "}\n"
+}
+
+// `xmlPut<Map>(w, name, attrs, v)`: a map that is itself an item or a value.
+fn renderMapWriter(p: Plan, i: int): string! {
+  let s = p.m.shapes[i]
+  checkSerMapKey(p, s, s.id)?
+  let t = typeExpr(p, Role.Input, s.id)?
+  let b = Builder()
+  b.write(writerHead(s.id, "xmlPut${readerName(p, i)}", t))
+  b.write(callLine("  ", "let names = ", "xmlMapNames", mapNamesArgs(p, s, s.id)?, "")?)
+  let put = elementPut(p, s.members[1], s.id)?
+  b.write(putStmt("xmlPutMap", ["w", tagExpr("name", "attrs"), "names", "Option.Some(v)", put])?)
+  b.write("}\n")
+  return b.toString()
+}
+
+// `xmlPut<Enum>(w, name, attrs, v)`: an enum as the item of a list, the value
+// of a map or a union member.
+fn renderEnumPut(p: Plan, i: int): string {
+  let n = p.names[i]
+  let head = writerHead(p.m.shapes[i].id, "xmlPut${n}", n)
+  return head + "  xmlPutEnum(w, name, attrs, v, ${wireName(p, i)})?\n}\n"
+}
+
+fn renderWriter(p: Plan, set: XmlSet, i: int): string! {
+  return match (p.m.shapes[i].kind) {
+    Structure => renderStructWriter(p, i)?
+    Union => renderUnionWriter(p, i)?
+    List => renderListWriter(p, i)?
+    Map => renderMapWriter(p, i)?
+    Enum => renderEnumItem(p, set, i)
+    _ => ""
+  }
+}
+
+// An enum is written by its own function only as an element of a list, a map
+// or a union.
+fn renderEnumItem(p: Plan, set: XmlSet, i: int): string {
+  if (set.asItem[i]) {
+    return renderEnumPut(p, i)
+  }
+  return ""
+}
+
+// A list or a map is written by its own function only as an element of a list
+// or a map, the others by `xmlPutList` and `xmlPutMap` in place.
+fn isWrittenShape(p: Plan, set: XmlSet, i: int): bool {
+  let k = p.m.shapes[i].kind
+  if (k == ShapeKind.List || k == ShapeKind.Map) {
+    return set.asItem[i]
+  }
+  return set.seen[i]
+}
+
+// The name of the root element of an input body: the payload member's
+// `xmlName`, else its target's, else the target's name; for an input with no
+// payload, the input shape's `xmlName` or its name.
+fn rootName(p: Plan, u: Unit, payload: Option<Member>): string {
+  let s = u.shape
+  match (payload) {
+    Some(mem) => {
+      if (mem.xmlName != "") {
+        return mem.xmlName
+      }
+      s = targetShape(p, mem)
+    }
+    None => {}
+  }
+  if (s.xmlName != "") {
+    return s.xmlName
+  }
+  return shortName(s.id)
+}
+
+// The namespace the root declares: its member's, else its shape's (the payload
+// target, or the input itself without a payload), else the service's.
+fn rootNsOf(p: Plan, u: Unit, payload: Option<Member>): Ns {
+  let own = Ns{ prefix = u.shape.xmlNsPrefix, uri = u.shape.xmlNsUri }
+  match (payload) {
+    Some(mem) => {
+      let s = targetShape(p, mem)
+      own = Ns{ prefix = s.xmlNsPrefix, uri = s.xmlNsUri }
+      if (mem.xmlNsUri != "") {
+        own = memberNsOf(mem)
+      }
+    }
+    None => {}
+  }
+  if (own.uri != "") {
+    return own
+  }
+  return Ns{ prefix = "", uri = p.m.serviceXmlNsUri }
+}
+
+// The body of `serialize<Op>Body` that writes the document from `put`'s call.
+fn rootStatements(indent: string, rootArgs: []string, put: string): string! {
+  let call = callLine(indent, "", put, rootArgs, "?")?
+  return "${indent}let w = xmlWriter()?\n${call}${indent}xmlSetBody(req, w)?\n"
+}
+
+// `serialize<Op>Body(req, input)`.
+fn renderBodyOp(p: Plan, op: Operation): string! {
+  let u = inputUnit(p, op)?
+  let payload = payloadOf(u)
+  let at = "${u.shape.id}: ${op.id}"
+  let name = lit(rootName(p, u, payload), at)?
+  let head = signature(at, "serialize${op.name}Body", ["req: RequestHead", "input: ${u.name}"])
+  let ns = nsExpr(rootNsOf(p, u, payload), at)?
+  match (payload) {
+    None => {
+      let put = "xmlPut${u.name}"
+      return head + rootStatements("  ", ["w", name, ns, "input"], put)? + "}\n"
+    }
+    Some(mem) => {
+      let put = elementPut(p, mem, at)?
+      if (!isOptionalMember(mem)) {
+        let args = ["w", name, ns, "input.${fieldName(mem.name)}"]
+        return head + rootStatements("  ", args, put)? + "}\n"
+      }
+      let inner = rootStatements("      ", ["w", name, ns, "v"], put)?
+      let arms = "    Some(v) => {\n${inner}    }\n    None => {}\n"
+      return head + "  match (input.${fieldName(mem.name)}) {\n${arms}  }\n}\n"
+    }
+  }
+}
+
+// Every block: the writers of the reached shapes, then the operations.
+fn serBlocks(p: Plan): []string! {
+  let ops = xmlSerOps(p)?
+  let set = reachedBodyShapes(p, ops)?
+  let blocks = []string(0)
+  let i = 0
+  while (i < len(p.m.shapes)) {
+    if (isWrittenShape(p, set, i)) {
+      let text = renderWriter(p, set, i)?
+      if (text != "") {
+        blocks = append(blocks, text)
+      }
+    }
+    i = i + 1
+  }
+  for op of ops {
+    blocks = append(blocks, renderBodyOp(p, op)?)
+  }
+  return blocks
+}
+
+// Every `gen_xmlser_*.bit`. `commit` and `sha` are the model pin.
+fn renderXmlSer(m: Model, commit: string, sha: string): []GenFile! {
+  return renderXmlSerFrom(planShapes(m)?, commit, sha)?
+}
+
+// The files for an already planned model (the vector model is planned the same way).
+fn renderXmlSerFrom(p: Plan, commit: string, sha: string): []GenFile! {
+  let head = headerLines("xmlser", commit, sha) + "\n"
+  let files = []GenFile(0)
+  for f of packRespFiles(serFilePrefix, head, serBlocks(p)?) {
+    files = append(files, withWriterImport(f, head))
+  }
+  return files
+}
+
+// `f` with the `Writer` and `Attr` import after its header when a writer names them.
+fn withWriterImport(f: GenFile, head: string): GenFile {
+  if (!contains(f.text, "w: Writer")) {
+    return f
+  }
+  let rest = f.text[len(head):len(f.text)]
+  return GenFile{
+    name = f.name,
+    text = head + "import { Attr, Writer } from \"std/xml\"\n\n" + rest,
+  }
+}
