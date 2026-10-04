@@ -24,7 +24,7 @@ import { Cbor, decode } from "std/cbor"
 
 fn main() {
   // {"words": 412}
-  let data = []byte([0xa1, 0x65, 0x77, 0x6f, 0x72, 0x64, 0x73, 0x19, 0x01, 0x9c])
+  let data: []byte = [0xa1, 0x65, 0x77, 0x6f, 0x72, 0x64, 0x73, 0x19, 0x01, 0x9c]
   let v = decode(data) catch e {
     println("bad cbor: ${e.message()}")
     return
@@ -193,22 +193,28 @@ are not valid items), and on a value nested more than 1024 deep.
 ```bit
 import { Cbor, CborEntry, encode } from "std/cbor"
 
+fn field(name: string, value: Cbor): CborEntry {
+  return CborEntry{ key = Cbor.Text(name), value = value }
+}
+
 // An Inkwell draft summary as CBOR. Key order does not matter: the bytes
 // are the same whichever way round the entries are listed.
 fn summary(title: string, words: uint): []byte! {
-  let draft = Cbor.Map([
-    CborEntry{ key = Cbor.Text("words"), value = Cbor.Uint(words) },
-    CborEntry{ key = Cbor.Text("title"), value = Cbor.Text(title) },
-    CborEntry{ key = Cbor.Text("tags"), value = Cbor.Array([Cbor.Text("notes")]) },
-    CborEntry{ key = Cbor.Text("public"), value = Cbor.Bool(false) },
-    CborEntry{ key = Cbor.Text("edited"), value = Cbor.Null },
-    CborEntry{ key = Cbor.Text("delta"), value = Cbor.Negative(0) },
-    CborEntry{ key = Cbor.Text("ratio"), value = Cbor.Float(0.5) },
-    CborEntry{ key = Cbor.Text("cover"), value = Cbor.Bytes([]byte([1, 2, 3])) },
-    CborEntry{ key = Cbor.Text("stamp"), value = Cbor.Tag(1, Cbor.Uint(1363896240)) },
-    CborEntry{ key = Cbor.Text("mark"), value = Cbor.Simple(16) },
-    CborEntry{ key = Cbor.Text("scratch"), value = Cbor.Undefined },
-  ])
+  let draft = Cbor.Map(
+    [
+      field("words", Cbor.Uint(words)),
+      field("title", Cbor.Text(title)),
+      field("tags", Cbor.Array([Cbor.Text("notes")])),
+      field("public", Cbor.Bool(false)),
+      field("edited", Cbor.Null),
+      field("delta", Cbor.Negative(0)),
+      field("ratio", Cbor.Float(0.5)),
+      field("cover", Cbor.Bytes([]byte("abc"))),
+      field("stamp", Cbor.Tag(1, Cbor.Uint(1363896240))),
+      field("mark", Cbor.Simple(16)),
+      field("scratch", Cbor.Undefined),
+    ],
+  )
   return encode(draft)?
 }
 ```
