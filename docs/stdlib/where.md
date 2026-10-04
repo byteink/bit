@@ -187,6 +187,53 @@ that is not one string literal is E0303.
 A program that contains a condition literal type-checks but is not yet built:
 lowering it to the clauses above is the next step.
 
+## Naming the class once
+
+A policy check reads best when the class is named once and the condition follows
+it: `can("edit", Article, { authorId: userId })`. Bit has no class-as-value in
+general, so `Class<T>` is the one exception, an empty class from this module. A
+parameter declared `Class<T>` takes a bare class name, infers `T` from it, and
+every parameter after it is checked against that `T`, left to right:
+
+```bit
+import { Class, Where } from "std/where"
+
+class Article {
+  authorId: i64,
+  status: string,
+}
+
+class Comment {
+  body: string,
+}
+
+class Policy {
+  can<T>(action: string, res: Class<T>, where: Where<T>): bool {
+    return true
+  }
+}
+
+fn rules(p: Policy, userId: i64) {
+  let edit = p.can("edit", Article, { authorId: userId })
+  let reply = p.can("reply", Comment, { body: "hi" })
+}
+```
+
+The literal in the first call is a condition on `Article`, and the one in the
+second is a condition on `Comment`, because each follows its own class name. A
+key that is not a field of the class named is E0301, so `p.can("edit",
+Comment, { authorId: userId })` fails naming `Comment`. The compiler lowers the
+name to `Class<Article>{}`, so the callee receives an ordinary value.
+
+A class name is a value only here. Given to a parameter of any other type it is
+E0041, and a typed value that is not a class name given to a `Class<T>`
+parameter is E0041 too:
+
+```text
+error[E0041]: expected 'i64', found the class name 'Article'
+error[E0041]: expected a class name for a `Class<T>` parameter, found 'Article'
+```
+
 ## Or, nested and negated
 
 `Join.Or` makes a node match when any of its clauses or children match. Nesting
@@ -277,6 +324,27 @@ fn rejectsTwo(): bool {
     refused = true
   }
   return refused
+}
+```
+
+### `Class<T>`
+
+An empty marker class. A parameter of this type takes a bare class name, infers
+`T` from it and lowers the name to `Class<T>{}`; see "Naming the class once".
+
+```bit
+import { Class } from "std/where"
+
+class Draft {
+  title: string,
+}
+
+fn named<T>(res: Class<T>): string {
+  return "class"
+}
+
+fn useIt(): string {
+  return named(Draft)
 }
 ```
 

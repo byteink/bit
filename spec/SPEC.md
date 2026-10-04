@@ -3501,6 +3501,17 @@ the ordinary E0040. A condition literal is checked but not yet lowered:
 building a program that contains one is refused at lowering until it lowers to
 std/where's constructors.
 
+std/where also declares the empty class `Class<T>`, the one place a class name
+is a value. Where a parameter is declared `Class<T>` and the argument is a bare
+identifier naming a class `C` (not a local, a function or an enum), the checker
+infers `T` as `C` and lowers the argument to `Class<C>{}`. Arguments are bound
+left to right, so a later parameter written in terms of `T` is checked against
+`C`: for `can<T>(action: string, res: Class<T>, where: Where<T>)`,
+`p.can("read", Article, { authorId: user.id })` checks the literal against
+`Article`. A class name against any other expected type is **E0041**, as is a
+typed value that is not a class name given to a `Class<T>` parameter; a class
+name with no expected type (`let x = Article`) still has no value.
+
 A bare element list is a slice literal **in every context, including where an
 array type is expected**. It is therefore ill-typed against an `[N]T`
 annotation, parameter, or result - `let a: [2]f32 = [4.5, 4.5]` is an error
