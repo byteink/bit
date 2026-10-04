@@ -281,15 +281,13 @@ the return-register budget (`retWordsFitRegisters`; a return word past the
 fifth int or sixth float word has no path).
 
 **A fallible result** `T!E` is decided on its ok type and one more int word
-(#6693): the error is the LAST return word (§13), so the ok words plus that one
-int word must fit the budget above, and a fallible ok type gets at most 4 int
-words. An ok type that is a tuple of words (`tupleWordTypes`) returns in words
-under the rules here, followed by the error word, and every err-path `ret`
-carries one zero constant per ok word (`fallibleZeroArgs`,
-`compiler/lowerfail.bit`) before the error. A `string`, `decimal` or enum ok
-type keeps one handle, and so does every method whose name an interface declares
-with a fallible result. On `x86_64-windows` and under `BIT_ERR_REG=0` the error
-is not a return word and rides §13's per-task slot instead.
+(#6693): the error is the LAST return word (§13), so a fallible ok type gets at
+most 4 int words. A tuple-of-words ok type (`tupleWordTypes`) returns in words
+followed by the error word; every err-path `ret` carries one zero constant per
+ok word (`fallibleZeroArgs`, `compiler/lowerfail.bit`) before the error. A
+`string`, `decimal` or enum ok type keeps one handle, as does every method an
+interface declares fallible. On `x86_64-windows` and under `BIT_ERR_REG=0` the
+error rides §13's per-task slot instead.
 
 **A method reached only by a direct `call`** returns its result in words when
 `methodRetExplodes` (`compiler/lowerexplodemethod.bit`) admits it: the same
