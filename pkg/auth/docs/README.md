@@ -11,6 +11,7 @@ The chapters below, in reading order.
 | [Verifying a token directly](manual-verification.md) | A mobile or single-page client that already holds an ID token, with no redirect. |
 | [Two-factor authentication with TOTP](totp.md) | A second login step with an authenticator app: enrollment, verifying a code, skew and replay protection. |
 | [Slow down password guessing](brute-force.md) | Throttle failed logins per account and per address: backoff, lockout, reset on success, an audit trail. |
+| [One-time tokens for account emails](account-tokens.md) | The token behind password reset, email verification and magic links: hashed at rest, single use, expiring, one purpose each. |
 | [Security model](security.md) | What this package checks for you, and the one thing it cannot: your token exchange TLS roots. |
 
 For install and the exported surface, see [`pkg/auth/README.md`](../README.md).
