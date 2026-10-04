@@ -43,14 +43,15 @@ STEP="${STEP:-test}"
 
 # Environment does NOT cross an ssh plus `docker run` boundary on its own, so a
 # knob set on the Mac is silently ignored inside the container unless it is
-# named here. `_tests_/bit/stress/stress.bit` documents BIT_STRESSGATE_ONLY and
-# BIT_STRESSGATE_DIR as the way to narrow a stress run for debugging, and
+# named here (BIT_ERR_REG too, #6690: without it an x86-64 gate cannot run the
+# error-word convention at all). `_tests_/bit/stress/stress.bit` documents
+# BIT_STRESSGATE_ONLY and BIT_STRESSGATE_DIR as the way to narrow a stress run for debugging, and
 # neither reached the gate before this: the filter read as accepted and the
 # full corpus ran anyway, which looks exactly like the filter matching
 # everything. Add a variable here to make it forwardable, and keep the quoting
 # so an unset one expands to nothing rather than to an empty assignment.
 GATE_ENV=""
-for v in BIT_STRESSGATE_ONLY BIT_STRESSGATE_DIR; do
+for v in BIT_STRESSGATE_ONLY BIT_STRESSGATE_DIR BIT_ERR_REG; do
   eval "val=\${$v-}"
   [ -z "$val" ] || GATE_ENV="$GATE_ENV $v=$val"
 done
